@@ -157,7 +157,7 @@ async fn serve(
         }
     });
 
-    let state = api::AppState { store, live, tx: live_tx, started: store::now_ts(), source: source_desc };
+    let state = api::AppState { store, engine: in_tx.clone(), live, tx: live_tx, started: store::now_ts(), source: source_desc };
     let app = api::router(state);
     let listener = tokio::net::TcpListener::bind(listen).await.with_context(|| format!("binding {listen}"))?;
     tracing::info!("web UI and API on http://{listen}");

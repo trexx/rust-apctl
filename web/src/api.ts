@@ -69,7 +69,12 @@ export interface ClientView {
   first_seen: number;
   last_seen: number;
   ap_name?: string | null;
+  alias?: string | null;
+  note?: string | null;
 }
+
+/** The name to show for a client: the user's alias, else its hostname, else its MAC. */
+export const displayName = (c: ClientView) => c.alias || c.sample.hostname || c.sample.mac;
 
 export interface VapSample {
   bssid: string;
@@ -171,6 +176,28 @@ export interface Status {
   clients_connected: number;
   counters: Record<string, number>;
 }
+
+async function send<T>(method: string, path: string, body: unknown): Promise<T> {
+  const res = await fetch(path, {
+    method,
+    // The server requires this header on writes (CSRF protection).
+    headers: { "Content-Type": "application/json", "X-Requested-With": "apctl" },
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) {
+    let msg = `${res.status} ${res.statusText}`;
+    try {
+      msg = (await res.json()).error ?? msg;
+    } catch {
+      /* not JSON */
+    }
+    throw new Error(msg);
+  }
+  return res.json() as Promise<T>;
+}
+
+export const setAlias = (mac: Mac, alias: string, note: string) =>
+  send<{ ok: boolean }>("PUT", `/api/clients/${mac}/alias`, { alias, note });
 
 async function get<T>(path: string): Promise<T> {
   const res = await fetch(path);

@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { Link, useParams } from "react-router-dom";
-import { useClients, useDevice, useDevices, useEvents, useLogs, useSeries } from "../api";
+import { displayName, useClients, useDevice, useDevices, useEvents, useLogs, useSeries } from "../api";
 import type { RadioSample, VapSample } from "../api";
 import { COLORS, Chart, RangePicker } from "../components/Chart";
 import { Dot, ErrorNote, EventList, Loading, LogList, Signal, Stat, clientNames, deviceNames } from "../components/common";
@@ -77,7 +77,7 @@ export function Device() {
               .map((c) => (
                 <tr key={c.sample.mac}>
                   <td>
-                    <Link to={`/clients/${c.sample.mac}`}>{c.sample.hostname ?? c.sample.mac}</Link>
+                    <Link to={`/clients/${c.sample.mac}`}>{displayName(c)}</Link>
                   </td>
                   <td>{c.sample.essid}</td>
                   <td>

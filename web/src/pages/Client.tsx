@@ -1,6 +1,7 @@
 import { useState } from "react";
 import { Link, useParams } from "react-router-dom";
-import { useClients, useClient, useDevices, useEvents, useSeries } from "../api";
+import { useMutation, useQueryClient } from "@tanstack/react-query";
+import { setAlias, useClients, useClient, useDevices, useEvents, useSeries } from "../api";
 import { COLORS, Chart, RangePicker } from "../components/Chart";
 import { Dot, ErrorNote, EventList, Loading, Signal, Stat, clientNames, deviceNames } from "../components/common";
 import { ago, band, bitrate, bytes, duration, phy } from "../format";
@@ -11,7 +12,10 @@ export function Client() {
   const client = useClient(mac);
   const devices = useDevices();
   const names = deviceNames(devices.data);
-  const cnames = clientNames(useClients().data);
+  const clients = useClients();
+  const cnames = clientNames(clients.data);
+  // Clients not seen in this run still have their stored name and alias in the list.
+  const listed = clients.data?.find((x) => x.sample.mac === mac);
   const events = useEvents({ client: mac, limit: 100 });
   const series = useSeries("client", mac, range);
 
@@ -25,10 +29,13 @@ export function Client() {
   return (
     <div className="page">
       <div className="page-head">
-        <h1>
-          {c && <Dot ok={c.connected} />} {s?.hostname ?? mac}
-        </h1>
-        <span className="muted mono">{mac}</span>
+        <AliasHeader
+          mac={mac}
+          connected={c?.connected}
+          alias={c?.alias ?? listed?.alias ?? null}
+          note={c?.note ?? listed?.note ?? null}
+          hostname={s?.hostname ?? listed?.sample.hostname ?? null}
+        />
         <span className="spacer" />
         <RangePicker value={range} onChange={setRange} />
       </div>
@@ -102,6 +109,75 @@ export function Client() {
 
       <h2>Timeline</h2>
       <div className="panel">{events.data ? <EventList events={events.data} names={names} clientNames={cnames} /> : <Loading />}</div>
+    </div>
+  );
+}
+
+/** The client's name with an inline editor for its alias and note. */
+function AliasHeader(p: { mac: string; connected?: boolean; alias: string | null; note: string | null; hostname: string | null }) {
+  const qc = useQueryClient();
+  const [editing, setEditing] = useState(false);
+  const [alias, setAliasText] = useState("");
+  const [note, setNote] = useState("");
+  const save = useMutation({
+    mutationFn: (v: { alias: string; note: string }) => setAlias(p.mac, v.alias, v.note),
+    onSuccess: () => {
+      setEditing(false);
+      // The engine applies the change asynchronously; the live socket also refreshes.
+      window.setTimeout(() => void qc.invalidateQueries({ queryKey: ["client", p.mac] }), 300);
+      window.setTimeout(() => void qc.invalidateQueries({ queryKey: ["clients"] }), 300);
+    },
+  });
+  const start = () => {
+    setAliasText(p.alias ?? "");
+    setNote(p.note ?? "");
+    save.reset();
+    setEditing(true);
+  };
+
+  if (editing) {
+    return (
+      <form
+        className="alias-form"
+        onSubmit={(e) => {
+          e.preventDefault();
+          save.mutate({ alias, note });
+        }}
+      >
+        <input
+          autoFocus
+          className="search"
+          maxLength={64}
+          placeholder={p.hostname ?? "Name for this device"}
+          value={alias}
+          onChange={(e) => setAliasText(e.target.value)}
+          aria-label="Alias"
+        />
+        <input className="search" maxLength={500} placeholder="Note (optional)" value={note} onChange={(e) => setNote(e.target.value)} aria-label="Note" />
+        <button type="submit" className="btn primary" disabled={save.isPending}>
+          Save
+        </button>
+        <button type="button" className="btn" onClick={() => setEditing(false)}>
+          Cancel
+        </button>
+        {save.error && <span className="error small">{save.error.message}</span>}
+        <span className="muted small">Leave both empty to remove the alias.</span>
+      </form>
+    );
+  }
+  return (
+    <div className="alias-head">
+      <h1>
+        {p.connected !== undefined && <Dot ok={p.connected} />} {p.alias || p.hostname || p.mac}
+        <button className="btn small" onClick={start} title="Give this device a name you recognise">
+          {p.alias ? "Rename" : "Add name"}
+        </button>
+      </h1>
+      <div className="muted small">
+        {p.alias && p.hostname ? <>{p.hostname} · </> : null}
+        <span className="mono">{p.mac}</span>
+        {p.note ? <> · {p.note}</> : null}
+      </div>
     </div>
   );
 }

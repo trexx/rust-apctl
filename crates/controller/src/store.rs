@@ -160,6 +160,8 @@ CREATE TABLE IF NOT EXISTS events (
 CREATE INDEX IF NOT EXISTS events_ts ON events (ts);
 CREATE INDEX IF NOT EXISTS events_device ON events (device_mac, ts);
 CREATE INDEX IF NOT EXISTS events_client ON events (client_mac, ts);
+CREATE TABLE IF NOT EXISTS client_aliases (
+    mac TEXT PRIMARY KEY, alias TEXT, note TEXT, updated INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS device_config (
     mac TEXT PRIMARY KEY, ts INTEGER, cfgversion TEXT, mgmt_cfg TEXT, system_cfg TEXT);
 ";

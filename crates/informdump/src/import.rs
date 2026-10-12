@@ -20,6 +20,9 @@ const DEVICE_FIELDS: &[&str] = &[
     "wlangroup_id_ng", "config_network", "mgmt_network_id",
 ];
 
+/// Client fields: the names and notes people gave their devices.
+const USER_FIELDS: &[&str] = &["mac", "name", "note", "noted", "hostname", "oui", "first_seen", "last_seen", "is_wired"];
+
 pub async fn run(uri: &str, db: &str, out: &Path) -> Result<()> {
     let mut opts = ClientOptions::parse(uri).await.context("parsing MongoDB URI")?;
     opts.direct_connection = Some(true);
@@ -38,14 +41,17 @@ pub async fn run(uri: &str, db: &str, out: &Path) -> Result<()> {
     let config_meta = find_all(&db, "config_meta", doc! {}).await?;
     let projection: Document = DEVICE_FIELDS.iter().map(|f| (f.to_string(), Bson::Int32(1))).collect();
     let devices = find_all(&db, "device", projection).await?;
+    let user_projection: Document = USER_FIELDS.iter().map(|f| (f.to_string(), Bson::Int32(1))).collect();
+    let users = find_all(&db, "user", user_projection).await?;
+    let named = users.iter().filter(|u| u.get("name").and_then(Value::as_str).is_some_and(|n| !n.is_empty())).count();
 
     let with_key = devices.iter().filter(|d| d.get("x_authkey").is_some_and(Value::is_string)).count();
     let aps = devices.iter().filter(|d| d.get("type").and_then(Value::as_str) == Some("uap")).count();
     eprintln!(
         "read {} sites, {} WLANs, {} WLAN groups, {} AP groups, {} networks, {} settings, {} config_meta, \
-         {} devices ({} APs, {} with authkeys)",
+         {} devices ({} APs, {} with authkeys), {} clients ({} named)",
         sites.len(), wlans.len(), wlangroups.len(), apgroups.len(), networks.len(), settings.len(),
-        config_meta.len(), devices.len(), aps, with_key
+        config_meta.len(), devices.len(), aps, with_key, users.len(), named
     );
 
     let snapshot = json!({
@@ -58,6 +64,7 @@ pub async fn run(uri: &str, db: &str, out: &Path) -> Result<()> {
         "apgroup": apgroups,
         "config_meta": config_meta,
         "devices": devices,
+        "clients": users,
     });
     write_private(out, &serde_json::to_vec_pretty(&snapshot)?)?;
     eprintln!("wrote {} (mode 0600; contains secrets, keep it out of git)", out.display());

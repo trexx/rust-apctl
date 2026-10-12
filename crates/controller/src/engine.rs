@@ -27,6 +27,9 @@ const DEFAULT_INTERVAL: Ts = 15;
 
 pub enum Input {
     Inform { ts: Ts, peer: String, decoded: Decoded },
+    /// Set or clear a client's alias and note (None clears). `only_if_unset`
+    /// leaves existing aliases alone (for bulk imports).
+    SetAlias { ts: Ts, mac: Mac, alias: Option<String>, note: Option<String>, only_if_unset: bool },
     /// A syslog datagram from an AP (captured in shadow mode or received directly).
     Datagram { ts: Ts, src_ip: String, payload: Vec<u8> },
     Reply { ts: Ts, mac: Mac, decoded: Decoded },
@@ -97,9 +100,18 @@ pub struct Counters {
     pub events: u64,
 }
 
+/// A name and note the user gave a client.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct Alias {
+    pub alias: Option<String>,
+    pub note: Option<String>,
+}
+
 #[derive(Default, Serialize)]
 pub struct Live {
     pub devices: BTreeMap<Mac, DeviceView>,
+    /// User-given client names, including clients not seen in this run.
+    pub aliases: HashMap<Mac, Alias>,
     pub clients: BTreeMap<Mac, ClientView>,
     pub counters: Counters,
     /// For attributing syslog: an AP's `hash_id` and IP address.
@@ -153,7 +165,7 @@ impl Engine {
     /// Loads APs and clients remembered from previous runs, so a restart does
     /// not report every client as newly connected.
     pub fn restore(&mut self, store: &store::Store) -> anyhow::Result<()> {
-        let (devices, clients) = store.read(Db::Config, |c| {
+        let (devices, clients, aliases) = store.read(Db::Config, |c| {
             let mut stmt = c.prepare("SELECT mac, first_seen, last_seen, uptime, version, hash_id, ip FROM devices")?;
             let devices = stmt
                 .query_map([], |r| {
@@ -176,7 +188,11 @@ impl Engine {
                     ))
                 })?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
-            Ok((devices, clients))
+            let mut stmt = c.prepare("SELECT mac, alias, note FROM client_aliases")?;
+            let aliases = stmt
+                .query_map([], |r| Ok((r.get::<_, String>(0)?, Alias { alias: r.get(1)?, note: r.get(2)? })))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok((devices, clients, aliases))
         })?;
         let mut live = self.live.write().unwrap();
         for (mac, known, hash_id, ip) in devices {
@@ -195,7 +211,16 @@ impl Engine {
             let sample = ClientSample { mac, ap_mac, bssid: bssid.unwrap_or_default(), essid, radio, hostname, ip, ..Default::default() };
             live.clients.insert(mac, ClientView { sample, connected, first_seen: first_seen.unwrap_or(0), last_seen: last_seen.unwrap_or(0) });
         }
-        tracing::info!("restored {} APs and {n_clients} clients from the database", live.known_devices.len());
+        for (mac, alias) in aliases {
+            if let Ok(mac) = mac.parse::<Mac>() {
+                live.aliases.insert(mac, alias);
+            }
+        }
+        tracing::info!(
+            "restored {} APs, {n_clients} clients and {} aliases from the database",
+            live.known_devices.len(),
+            live.aliases.len()
+        );
         Ok(())
     }
 
@@ -206,6 +231,7 @@ impl Engine {
             Input::Datagram { ts, src_ip, payload } => self.datagram(ts, src_ip, &payload),
             Input::Tick(now) => self.tick(now),
             Input::DecodeError => self.live.write().unwrap().counters.decode_errors += 1,
+            Input::SetAlias { ts, mac, alias, note, only_if_unset } => self.set_alias(ts, mac, alias, note, only_if_unset),
         }
     }
 
@@ -440,6 +466,36 @@ impl Engine {
             d.last_config_push = Some(ts);
         }
         self.emit(&mut live, ev(ts, "config_pushed", Some(mac), None, Value::Object(data)));
+    }
+
+    fn set_alias(&mut self, ts: Ts, mac: Mac, alias: Option<String>, note: Option<String>, only_if_unset: bool) {
+        let clean = |v: Option<String>| v.map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+        let (alias, note) = (clean(alias), clean(note));
+        let mut live = self.live.write().unwrap();
+        let old = live.aliases.get(&mac).cloned().unwrap_or_default();
+        if only_if_unset && old.alias.is_some() {
+            return;
+        }
+        if old.alias == alias && old.note == note {
+            return;
+        }
+        if alias.is_none() && note.is_none() {
+            live.aliases.remove(&mac);
+            self.writer.exec(Db::Config, "DELETE FROM client_aliases WHERE mac = ?1", vec![Sql::Text(mac.to_string())]);
+        } else {
+            live.aliases.insert(mac, Alias { alias: alias.clone(), note: note.clone() });
+            self.writer.exec(
+                Db::Config,
+                "INSERT OR REPLACE INTO client_aliases (mac, alias, note, updated) VALUES (?1, ?2, ?3, ?4)",
+                vec![Sql::Text(mac.to_string()), opt_text(alias.clone()), opt_text(note.clone()), Sql::Integer(ts)],
+            );
+        }
+        if old.alias != alias {
+            let ap = live.clients.get(&mac).map(|c| c.sample.ap_mac);
+            self.emit(&mut live, ev(ts, "client_renamed", ap, Some(mac), json!({ "from": old.alias, "to": alias })));
+        }
+        drop(live);
+        let _ = self.tx.send(LiveMsg::Clients);
     }
 
     fn datagram(&mut self, ts: Ts, src_ip: String, payload: &[u8]) {
@@ -762,6 +818,26 @@ mod tests {
             .collect();
         assert!(kinds.is_empty(), "{kinds:?}");
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn aliases_are_set_cleared_and_imported_without_overwriting() {
+        let mut h = harness();
+        let mac: Mac = C1.parse().unwrap();
+        let set = |h: &mut Harness, alias: Option<&str>, only_if_unset: bool| {
+            h.engine.handle(Input::SetAlias { ts: 1, mac, alias: alias.map(str::to_string), note: None, only_if_unset });
+        };
+        set(&mut h, Some("  Kitchen speaker "), false);
+        assert_eq!(h.live.read().unwrap().aliases[&mac].alias.as_deref(), Some("Kitchen speaker"));
+        set(&mut h, Some("Imported name"), true); // bulk import must not overwrite
+        assert_eq!(h.live.read().unwrap().aliases[&mac].alias.as_deref(), Some("Kitchen speaker"));
+        set(&mut h, Some(""), false); // empty clears
+        assert!(!h.live.read().unwrap().aliases.contains_key(&mac));
+        let renames: Vec<_> = std::iter::from_fn(|| h.rx.try_recv().ok())
+            .filter_map(|m| match m { LiveMsg::Event(e) if e.kind == "client_renamed" => Some(e.data), _ => None })
+            .collect();
+        assert_eq!(renames.len(), 2, "{renames:?}");
+        assert_eq!(renames[1]["from"], "Kitchen speaker");
     }
 
     #[test]

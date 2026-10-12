@@ -23,6 +23,8 @@ use crate::store::{self, Db, Store};
 #[derive(Clone)]
 pub struct AppState {
     pub store: Arc<Store>,
+    /// Commands for the engine (e.g. setting aliases).
+    pub engine: tokio::sync::mpsc::Sender<crate::engine::Input>,
     pub live: SharedLive,
     pub tx: broadcast::Sender<LiveMsg>,
     pub started: Ts,
@@ -36,6 +38,8 @@ pub fn router(state: AppState) -> Router {
         .route("/api/devices/{mac}", get(device))
         .route("/api/clients", get(clients))
         .route("/api/clients/{mac}", get(client))
+        .route("/api/clients/{mac}/alias", axum::routing::put(set_alias))
+        .route("/api/clients/aliases", axum::routing::post(import_aliases))
         .route("/api/series/{table}", get(series))
         .route("/api/events", get(events))
         .route("/api/logs", get(logs))
@@ -131,17 +135,23 @@ async fn device(State(s): State<AppState>, Path(mac): Path<String>) -> ApiResult
 }
 
 async fn clients(State(s): State<AppState>) -> ApiResult {
-    let live_clients: BTreeMap<String, Value> = {
+    let (live_clients, aliases): (BTreeMap<String, Value>, BTreeMap<String, Value>) = {
         let live = s.live.read().unwrap();
-        live.clients
+        let clients = live
+            .clients
             .iter()
             .map(|(mac, c)| {
                 let ap_name = live.devices.get(&c.sample.ap_mac).and_then(|d| d.snapshot.ap.hostname.clone());
                 let mut v = serde_json::to_value(c).unwrap_or_default();
                 v["ap_name"] = json!(ap_name);
+                let a = live.aliases.get(mac).cloned().unwrap_or_default();
+                v["alias"] = json!(a.alias);
+                v["note"] = json!(a.note);
                 (mac.to_string(), v)
             })
-            .collect()
+            .collect();
+        let aliases = live.aliases.iter().map(|(m, a)| (m.to_string(), serde_json::to_value(a).unwrap_or_default())).collect();
+        (clients, aliases)
     };
     // Clients known from before this process started, not yet seen again.
     let known: Vec<Value> = read(&s.store, Db::Config, |c| {
@@ -160,8 +170,13 @@ async fn clients(State(s): State<AppState>) -> ApiResult {
     .await?;
     let mut out: Vec<Value> = live_clients.values().cloned().collect();
     for k in known {
-        if !live_clients.contains_key(k["mac"].as_str().unwrap_or("")) {
-            out.push(json!({ "connected": false, "first_seen": k["first_seen"], "last_seen": k["last_seen"], "sample": k }));
+        let mac = k["mac"].as_str().unwrap_or("").to_string();
+        if !live_clients.contains_key(&mac) {
+            let a = aliases.get(&mac).cloned().unwrap_or_default();
+            out.push(json!({
+                "connected": false, "first_seen": k["first_seen"], "last_seen": k["last_seen"], "sample": k,
+                "alias": a["alias"], "note": a["note"],
+            }));
         }
     }
     Ok(Json(Value::Array(out)))
@@ -169,11 +184,99 @@ async fn clients(State(s): State<AppState>) -> ApiResult {
 
 async fn client(State(s): State<AppState>, Path(mac): Path<String>) -> ApiResult {
     let mac = parse_mac(&mac)?;
-    let live = s.live.read().unwrap();
-    match live.clients.get(&mac) {
-        Some(c) => Ok(Json(serde_json::to_value(c).unwrap_or_default())),
+    let found = {
+        let live = s.live.read().unwrap();
+        let a = live.aliases.get(&mac).cloned().unwrap_or_default();
+        live.clients.get(&mac).map(|c| {
+            let mut v = serde_json::to_value(c).unwrap_or_default();
+            v["alias"] = json!(a.alias);
+            v["note"] = json!(a.note);
+            v
+        })
+    };
+    match found {
+        Some(v) => Ok(Json(v)),
         None => Err(ApiError(StatusCode::NOT_FOUND, "unknown client".into())),
     }
+}
+
+/// Mutations must carry this header. Browsers cannot add custom headers to
+/// cross-site requests without a CORS preflight, which this server never
+/// approves, so another website cannot make a visitor's browser change data.
+fn check_csrf(headers: &axum::http::HeaderMap) -> Result<(), ApiError> {
+    match headers.get("x-requested-with").and_then(|v| v.to_str().ok()) {
+        Some("apctl") => Ok(()),
+        _ => Err(ApiError(StatusCode::FORBIDDEN, "missing X-Requested-With: apctl header".into())),
+    }
+}
+
+#[derive(Deserialize)]
+struct AliasBody {
+    alias: Option<String>,
+    note: Option<String>,
+}
+
+const MAX_ALIAS: usize = 64;
+const MAX_NOTE: usize = 500;
+
+fn validate(alias: &Option<String>, note: &Option<String>) -> Result<(), ApiError> {
+    if alias.as_ref().is_some_and(|a| a.chars().count() > MAX_ALIAS) {
+        return Err(bad(format!("alias longer than {MAX_ALIAS} characters")));
+    }
+    if note.as_ref().is_some_and(|n| n.chars().count() > MAX_NOTE) {
+        return Err(bad(format!("note longer than {MAX_NOTE} characters")));
+    }
+    Ok(())
+}
+
+/// Sets (or, with empty values, clears) a client's alias and note.
+async fn set_alias(
+    State(s): State<AppState>,
+    Path(mac): Path<String>,
+    headers: axum::http::HeaderMap,
+    Json(body): Json<AliasBody>,
+) -> ApiResult {
+    check_csrf(&headers)?;
+    let mac = parse_mac(&mac)?;
+    validate(&body.alias, &body.note)?;
+    let input = crate::engine::Input::SetAlias { ts: store::now_ts(), mac, alias: body.alias, note: body.note, only_if_unset: false };
+    s.engine.send(input).await.map_err(|_| ApiError(StatusCode::SERVICE_UNAVAILABLE, "engine stopped".into()))?;
+    Ok(Json(json!({ "ok": true })))
+}
+
+#[derive(Deserialize)]
+struct ImportEntry {
+    mac: String,
+    alias: Option<String>,
+    note: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct ImportQuery {
+    #[serde(default)]
+    overwrite: bool,
+}
+
+/// Bulk-sets aliases (e.g. names from another controller). By default an
+/// alias already set in apctl is kept.
+async fn import_aliases(
+    State(s): State<AppState>,
+    Query(q): Query<ImportQuery>,
+    headers: axum::http::HeaderMap,
+    Json(entries): Json<Vec<ImportEntry>>,
+) -> ApiResult {
+    check_csrf(&headers)?;
+    let mut parsed = Vec::with_capacity(entries.len());
+    for e in entries {
+        validate(&e.alias, &e.note)?;
+        parsed.push((parse_mac(&e.mac)?, e.alias, e.note));
+    }
+    let n = parsed.len();
+    for (mac, alias, note) in parsed {
+        let input = crate::engine::Input::SetAlias { ts: store::now_ts(), mac, alias, note, only_if_unset: !q.overwrite };
+        s.engine.send(input).await.map_err(|_| ApiError(StatusCode::SERVICE_UNAVAILABLE, "engine stopped".into()))?;
+    }
+    Ok(Json(json!({ "submitted": n })))
 }
 
 #[derive(Deserialize)]

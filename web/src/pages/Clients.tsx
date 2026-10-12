@@ -1,13 +1,13 @@
 import { useMemo, useState } from "react";
 import { Link } from "react-router-dom";
-import { useClients } from "../api";
+import { displayName, useClients } from "../api";
 import type { ClientView } from "../api";
 import { ErrorNote, Loading, Signal } from "../components/common";
 import { ago, band, duration, phy } from "../format";
 
 type SortKey = "name" | "ap" | "essid" | "signal" | "rate" | "uptime" | "last_seen";
 
-const name = (c: ClientView) => c.sample.hostname ?? c.sample.mac;
+const name = displayName;
 
 function value(c: ClientView, key: SortKey): string | number {
   switch (key) {
@@ -41,7 +41,9 @@ export function Clients() {
       .filter(
         (c) =>
           !f ||
-          [c.sample.hostname, c.sample.mac, c.sample.ip, c.sample.essid, c.ap_name].some((v) => v?.toLowerCase().includes(f)),
+          [c.alias, c.note, c.sample.hostname, c.sample.mac, c.sample.ip, c.sample.essid, c.ap_name].some((v) =>
+            v?.toLowerCase().includes(f),
+          ),
       )
       .sort((a, b) => {
         const [x, y] = [value(a, sort.key), value(b, sort.key)];
@@ -72,7 +74,7 @@ export function Clients() {
         <label className="check">
           <input type="checkbox" checked={showGone} onChange={(e) => setShowGone(e.target.checked)} /> include disconnected
         </label>
-        <input className="search" placeholder="Filter by name, MAC, IP, SSID or AP" value={filter} onChange={(e) => setFilter(e.target.value)} />
+        <input className="search" placeholder="Filter by name, note, MAC, IP, SSID or AP" value={filter} onChange={(e) => setFilter(e.target.value)} />
       </div>
       <div className="panel">
         <table className="table">
@@ -94,8 +96,13 @@ export function Clients() {
             {rows.map((c) => (
               <tr key={c.sample.mac} className={c.connected ? "" : "dim"}>
                 <td>
-                  <Link to={`/clients/${c.sample.mac}`}>{name(c)}</Link>
-                  {c.sample.hostname && <div className="mono small muted">{c.sample.mac}</div>}
+                  <Link to={`/clients/${c.sample.mac}`} title={c.note ?? undefined}>
+                    {name(c)}
+                  </Link>
+                  <div className="small muted">
+                    {c.alias && c.sample.hostname ? `${c.sample.hostname} · ` : ""}
+                    {(c.alias || c.sample.hostname) && <span className="mono">{c.sample.mac}</span>}
+                  </div>
                 </td>
                 <td className="mono">{c.sample.ip ?? "—"}</td>
                 <td>{c.sample.ap_mac ? <Link to={`/devices/${c.sample.ap_mac}`}>{c.ap_name ?? c.sample.ap_mac}</Link> : "—"}</td>

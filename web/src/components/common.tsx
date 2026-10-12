@@ -1,4 +1,5 @@
 import { Link } from "react-router-dom";
+import { displayName } from "../api";
 import type { AppEvent, ClientView, DeviceSummary, LogLine } from "../api";
 import { band, clock, duration, signalClass } from "../format";
 
@@ -41,9 +42,9 @@ export function ErrorNote({ error }: { error: unknown }) {
 /** Names devices by MAC for event and log rows. */
 export type DeviceNames = Map<string, string>;
 
-/** Client hostnames by MAC, for event rows. */
+/** Client display names (alias, else hostname) by MAC, for event rows. */
 export function clientNames(clients: ClientView[] | undefined): Map<string, string> {
-  return new Map((clients ?? []).filter((c) => c.sample.hostname).map((c) => [c.sample.mac, c.sample.hostname as string]));
+  return new Map((clients ?? []).filter((c) => c.alias || c.sample.hostname).map((c) => [c.sample.mac, displayName(c)]));
 }
 
 export function deviceNames(devices: DeviceSummary[] | undefined): DeviceNames {
@@ -67,6 +68,7 @@ const EVENT_LABELS: Record<string, string> = {
   client_connected: "Client connected",
   client_disconnected: "Client disconnected",
   client_roamed: "Client roamed",
+  client_renamed: "Client renamed",
 };
 
 function eventTone(kind: string): string {
@@ -100,6 +102,8 @@ function describe(e: AppEvent, names: DeviceNames): React.ReactNode {
       return `uptime ${duration(d.uptime)}`;
     case "ap_seen":
       return [d.model, d.version, d.ip].filter(Boolean).join(" · ");
+    case "client_renamed":
+      return d.to ? `${d.from ? `"${d.from}" → ` : ""}"${d.to}"` : `alias "${d.from}" removed`;
     case "ap_firmware_changed":
       return `${d.from} → ${d.to}`;
     default:
