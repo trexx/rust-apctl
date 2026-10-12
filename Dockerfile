@@ -19,9 +19,10 @@ RUN cargo build --release --locked -p controller && strip target/release/apctl
 # --- capture sidecar for shadow mode: tcpdump writing pcap into a FIFO ---
 FROM docker.io/library/alpine:3.22 AS capture
 RUN apk add --no-cache tcpdump
-# The FIFO must be readable by the non-root controller, and tcpdump must keep
-# root (-Z root) to write it.
-ENTRYPOINT ["/bin/sh", "-c", "[ -p \"$FIFO\" ] || mkfifo -m 644 \"$FIFO\"; exec tcpdump -Z root -i any -U -s 0 -w \"$FIFO\" \"$FILTER\""]
+# The FIFO must be readable by the non-root controller. Alpine's tcpdump keeps
+# its user (no -Z), which matters: switching user needs CAP_SETUID, and the pod
+# only grants NET_RAW and NET_ADMIN. -p: the "any" device has no promiscuous mode.
+ENTRYPOINT ["/bin/sh", "-c", "[ -p \"$FIFO\" ] || mkfifo -m 644 \"$FIFO\"; exec tcpdump -p -i any -U -s 0 -w \"$FIFO\" \"$FILTER\""]
 
 # --- runtime ---
 FROM gcr.io/distroless/cc-debian12:nonroot AS runtime
