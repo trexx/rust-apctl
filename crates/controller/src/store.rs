@@ -160,6 +160,8 @@ CREATE TABLE IF NOT EXISTS events (
 CREATE INDEX IF NOT EXISTS events_ts ON events (ts);
 CREATE INDEX IF NOT EXISTS events_device ON events (device_mac, ts);
 CREATE INDEX IF NOT EXISTS events_client ON events (client_mac, ts);
+CREATE TABLE IF NOT EXISTS sessions (
+    token_hash TEXT PRIMARY KEY, username TEXT NOT NULL, created INTEGER NOT NULL, expires INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS client_aliases (
     mac TEXT PRIMARY KEY, alias TEXT, note TEXT, updated INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS device_config (
@@ -370,6 +372,7 @@ fn maintenance(conns: &mut BTreeMap<u8, Connection>, now: Ts) -> Result<()> {
     delete_before(logs, "logs", now - LOG_RETENTION)?;
     let config = conns.get_mut(&(Db::Config as u8)).unwrap();
     delete_before(config, "events", now - 365 * 86400)?;
+    config.execute("DELETE FROM sessions WHERE expires < ?1", [now])?;
     Ok(())
 }
 

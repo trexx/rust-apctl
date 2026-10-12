@@ -3,7 +3,9 @@ import type { ReactNode } from "react";
 import { createRoot } from "react-dom/client";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { BrowserRouter, NavLink, Route, Routes, useLocation } from "react-router-dom";
-import { useLiveUpdates, useStatus } from "./api";
+import { useEffect, useState } from "react";
+import { useQueryClient } from "@tanstack/react-query";
+import { login, logout, useLiveUpdates, useMe, useStatus } from "./api";
 import { Overview } from "./pages/Overview";
 import { Device } from "./pages/Device";
 import { Clients } from "./pages/Clients";
@@ -31,8 +33,65 @@ class ErrorBoundary extends Component<{ children: ReactNode; resetKey: string },
   }
 }
 
-function Shell() {
+function Login() {
+  const qc = useQueryClient();
+  const [username, setUsername] = useState("");
+  const [password, setPassword] = useState("");
+  const [error, setError] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
+  return (
+    <div className="login">
+      <form
+        className="panel login-box"
+        onSubmit={async (e) => {
+          e.preventDefault();
+          setBusy(true);
+          setError(null);
+          try {
+            await login(username, password);
+            await qc.invalidateQueries();
+          } catch (err) {
+            setError(err instanceof Error ? err.message : String(err));
+          } finally {
+            setBusy(false);
+          }
+        }}
+      >
+        <div className="brand">apctl</div>
+        <label>
+          Username
+          <input className="search" autoFocus autoComplete="username" value={username} onChange={(e) => setUsername(e.target.value)} />
+        </label>
+        <label>
+          Password
+          <input className="search" type="password" autoComplete="current-password" value={password} onChange={(e) => setPassword(e.target.value)} />
+        </label>
+        {error && <div className="error small">{error}</div>}
+        <button className="btn primary" type="submit" disabled={busy || !username || !password}>
+          {busy ? "Signing in…" : "Sign in"}
+        </button>
+      </form>
+    </div>
+  );
+}
+
+/** Shows the login page when a session is required and missing. */
+function Gate() {
+  const qc = useQueryClient();
+  const me = useMe();
+  useEffect(() => {
+    const onUnauthorized = () => void qc.invalidateQueries({ queryKey: ["me"] });
+    window.addEventListener("apctl:unauthorized", onUnauthorized);
+    return () => window.removeEventListener("apctl:unauthorized", onUnauthorized);
+  }, [qc]);
+  if (me.isLoading) return null;
+  if (me.data && me.data.auth && !me.data.user) return <Login />;
+  return <Shell user={me.data?.user ?? null} readOnly={me.data?.read_only ?? false} />;
+}
+
+function Shell({ user, readOnly }: { user: string | null; readOnly: boolean }) {
   useLiveUpdates();
+  const qc = useQueryClient();
   const status = useStatus();
   const location = useLocation();
   return (
@@ -51,6 +110,27 @@ function Shell() {
         {status.data && (
           <span className="mode" title={status.data.source}>
             {status.data.mode} mode
+          </span>
+        )}
+        {readOnly && (
+          <span className="mode" title="No users are configured, so changes are disabled">
+            read-only
+          </span>
+        )}
+        {user && (
+          <span className="user">
+            {user}
+            <button
+              className="btn small"
+              onClick={async () => {
+                await logout().catch(() => undefined);
+                // Show the login page at once, and drop everything cached for this user.
+                qc.setQueryData(["me"], { auth: true, user: null });
+                qc.removeQueries({ predicate: (q) => q.queryKey[0] !== "me" });
+              }}
+            >
+              Sign out
+            </button>
           </span>
         )}
       </header>
@@ -75,7 +155,7 @@ createRoot(document.getElementById("root")!).render(
   <StrictMode>
     <QueryClientProvider client={queryClient}>
       <BrowserRouter>
-        <Shell />
+        <Gate />
       </BrowserRouter>
     </QueryClientProvider>
   </StrictMode>,

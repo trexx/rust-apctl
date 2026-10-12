@@ -30,4 +30,5 @@ COPY --from=build /src/target/release/apctl /usr/local/bin/apctl
 USER nonroot
 ENV APCTL_DATA_DIR=/data APCTL_LISTEN=0.0.0.0:8090
 EXPOSE 8090
-ENTRYPOINT ["/usr/local/bin/apctl", "serve"]
+ENTRYPOINT ["/usr/local/bin/apctl"]
+CMD ["serve"]

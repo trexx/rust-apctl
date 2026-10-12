@@ -177,6 +177,14 @@ export interface Status {
   counters: Record<string, number>;
 }
 
+/** Raised for 401s; the app shell then shows the login page. */
+export class AuthError extends Error {}
+
+function unauthorized(): never {
+  window.dispatchEvent(new Event("apctl:unauthorized"));
+  throw new AuthError("login required");
+}
+
 async function send<T>(method: string, path: string, body: unknown): Promise<T> {
   const res = await fetch(path, {
     method,
@@ -184,6 +192,7 @@ async function send<T>(method: string, path: string, body: unknown): Promise<T> 
     headers: { "Content-Type": "application/json", "X-Requested-With": "apctl" },
     body: JSON.stringify(body),
   });
+  if (res.status === 401 && path !== "/api/login") unauthorized();
   if (!res.ok) {
     let msg = `${res.status} ${res.statusText}`;
     try {
@@ -201,6 +210,7 @@ export const setAlias = (mac: Mac, alias: string, note: string) =>
 
 async function get<T>(path: string): Promise<T> {
   const res = await fetch(path);
+  if (res.status === 401) unauthorized();
   if (!res.ok) {
     let msg = `${res.status} ${res.statusText}`;
     try {
@@ -221,6 +231,28 @@ function qs(params: Record<string, string | number | undefined | null>): string 
   const s = p.toString();
   return s ? `?${s}` : "";
 }
+
+export interface Me {
+  auth: boolean;
+  user: string | null;
+  read_only?: boolean;
+}
+
+/** The logged-in user. `user` is null when a login is required. */
+export const useMe = () =>
+  useQuery({
+    queryKey: ["me"],
+    queryFn: async (): Promise<Me> => {
+      const res = await fetch("/api/me");
+      if (res.status === 401) return { auth: true, user: null };
+      if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+      return res.json() as Promise<Me>;
+    },
+    staleTime: 60_000,
+  });
+
+export const login = (username: string, password: string) => send<{ user: string }>("POST", "/api/login", { username, password });
+export const logout = () => send<{ ok: boolean }>("POST", "/api/logout", {});
 
 export const useStatus = () => useQuery({ queryKey: ["status"], queryFn: () => get<Status>("/api/status"), refetchInterval: 15_000 });
 

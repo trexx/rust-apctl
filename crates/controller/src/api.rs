@@ -23,6 +23,7 @@ use crate::store::{self, Db, Store};
 #[derive(Clone)]
 pub struct AppState {
     pub store: Arc<Store>,
+    pub auth: crate::auth::SharedAuth,
     /// Commands for the engine (e.g. setting aliases).
     pub engine: tokio::sync::mpsc::Sender<crate::engine::Input>,
     pub live: SharedLive,
@@ -32,7 +33,11 @@ pub struct AppState {
 }
 
 pub fn router(state: AppState) -> Router {
-    Router::new()
+    let public = Router::new()
+        .route("/api/login", axum::routing::post(crate::auth::login))
+        .route("/api/logout", axum::routing::post(crate::auth::logout))
+        .route("/api/me", get(crate::auth::me));
+    let protected = Router::new()
         .route("/api/status", get(status))
         .route("/api/devices", get(devices))
         .route("/api/devices/{mac}", get(device))
@@ -44,8 +49,8 @@ pub fn router(state: AppState) -> Router {
         .route("/api/events", get(events))
         .route("/api/logs", get(logs))
         .route("/api/ws", get(ws))
-        .fallback(crate::web::handler)
-        .with_state(state)
+        .route_layer(axum::middleware::from_fn_with_state(state.clone(), crate::auth::require_login));
+    public.merge(protected).fallback(crate::web::handler).with_state(state)
 }
 
 pub struct ApiError(StatusCode, String);

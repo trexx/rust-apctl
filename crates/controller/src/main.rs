@@ -4,6 +4,7 @@
 //! another controller's traffic and never talks to the APs itself.
 
 mod api;
+mod auth;
 mod engine;
 mod model;
 mod shadow;
@@ -34,30 +35,9 @@ struct Cli {
 #[derive(Subcommand)]
 enum Cmd {
     /// Run the controller.
-    Serve {
-        /// Directory for config.db, metrics.db and logs.db.
-        #[arg(long, env = "APCTL_DATA_DIR", default_value = "data")]
-        data_dir: PathBuf,
-        /// Device keys: an `informdump import` snapshot or a MAC->key JSON map.
-        #[arg(long, env = "APCTL_KEYS")]
-        keys: Option<String>,
-        /// Shadow mode: pcap stream to read ("-" for stdin, or a file/FIFO path).
-        #[arg(long, env = "APCTL_SHADOW", conflicts_with = "shadow_cmd")]
-        shadow: Option<String>,
-        /// Shadow mode: command whose stdout is a pcap stream (restarted if it exits).
-        #[arg(long, env = "APCTL_SHADOW_CMD")]
-        shadow_cmd: Option<String>,
-        /// Inform port(s) in the capture.
-        #[arg(long = "inform-port", env = "APCTL_INFORM_PORT", default_value = "8080")]
-        inform_ports: Vec<u16>,
-        /// Address for the web UI and API.
-        #[arg(long, env = "APCTL_LISTEN", default_value = "127.0.0.1:8090")]
-        listen: SocketAddr,
-        /// UDP address to receive AP syslog on (e.g. 0.0.0.0:5514). Shadow mode also
-        /// picks syslog sent to the other controller out of the capture.
-        #[arg(long, env = "APCTL_SYSLOG_LISTEN")]
-        syslog_listen: Option<SocketAddr>,
-    },
+    Serve(ServeArgs),
+    /// Read a password from stdin and print its Argon2id hash for the users file.
+    HashPassword,
     /// Decode AP syslog datagrams in a pcap file by trying each known syslog key.
     DebugSyslog {
         pcap: String,
@@ -68,28 +48,57 @@ enum Cmd {
     },
 }
 
+#[derive(clap::Args)]
+struct ServeArgs {
+    /// Directory for config.db, metrics.db and logs.db.
+    #[arg(long, env = "APCTL_DATA_DIR", default_value = "data")]
+    pub data_dir: PathBuf,
+    /// Device keys: an `informdump import` snapshot or a MAC->key JSON map.
+    #[arg(long, env = "APCTL_KEYS")]
+    pub keys: Option<String>,
+    /// Shadow mode: pcap stream to read ("-" for stdin, or a file/FIFO path).
+    #[arg(long, env = "APCTL_SHADOW", conflicts_with = "shadow_cmd")]
+    pub shadow: Option<String>,
+    /// Shadow mode: command whose stdout is a pcap stream (restarted if it exits).
+    #[arg(long, env = "APCTL_SHADOW_CMD")]
+    pub shadow_cmd: Option<String>,
+    /// Inform port(s) in the capture.
+    #[arg(long = "inform-port", env = "APCTL_INFORM_PORT", default_value = "8080")]
+    pub inform_ports: Vec<u16>,
+    /// Address for the web UI and API.
+    #[arg(long, env = "APCTL_LISTEN", default_value = "127.0.0.1:8090")]
+    pub listen: SocketAddr,
+    /// UDP address to receive AP syslog on (e.g. 0.0.0.0:5514). Shadow mode also
+    /// picks syslog sent to the other controller out of the capture.
+    #[arg(long, env = "APCTL_SYSLOG_LISTEN")]
+    pub syslog_listen: Option<SocketAddr>,
+    /// File of `username:argon2-hash` lines (see `apctl hash-password`).
+    /// Without it apctl is read-only and needs no login.
+    #[arg(long, env = "APCTL_USERS_FILE")]
+    pub users_file: Option<PathBuf>,
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")))
         .init();
     match Cli::parse().cmd {
-        Cmd::Serve { data_dir, keys, shadow, shadow_cmd, inform_ports, listen, syslog_listen } => {
-            serve(data_dir, keys, shadow, shadow_cmd, inform_ports, listen, syslog_listen).await
+        Cmd::Serve(args) => serve(args).await,
+        Cmd::HashPassword => {
+            let mut line = String::new();
+            std::io::stdin().read_line(&mut line)?;
+            let password = line.trim_end_matches(['\n', '\r']);
+            anyhow::ensure!(password.chars().count() >= 8, "use a password of at least 8 characters");
+            println!("{}", auth::hash_password(password)?);
+            Ok(())
         }
         Cmd::DebugSyslog { pcap, keys, port } => debug_syslog(&pcap, &keys, port),
     }
 }
 
-async fn serve(
-    data_dir: PathBuf,
-    keys: Option<String>,
-    shadow: Option<String>,
-    shadow_cmd: Option<String>,
-    inform_ports: Vec<u16>,
-    listen: SocketAddr,
-    syslog_listen: Option<SocketAddr>,
-) -> Result<()> {
+async fn serve(args: ServeArgs) -> Result<()> {
+    let ServeArgs { data_dir, keys, shadow, shadow_cmd, inform_ports, listen, syslog_listen, users_file } = args;
     let keys = match &keys {
         Some(p) => KeyStore::load(p)?,
         None => KeyStore::default(),
@@ -139,7 +148,7 @@ async fn serve(
     }
 
     // The engine owns all mutable state and processes inputs in order.
-    let mut engine = Engine::new(writer, keys.clone(), live.clone(), live_tx.clone());
+    let mut engine = Engine::new(writer.clone(), keys.clone(), live.clone(), live_tx.clone());
     engine.restore(&store)?;
     let tick_tx = in_tx.clone();
     tokio::spawn(async move {
@@ -157,11 +166,21 @@ async fn serve(
         }
     });
 
-    let state = api::AppState { store, engine: in_tx.clone(), live, tx: live_tx, started: store::now_ts(), source: source_desc };
+    let users = match &users_file {
+        Some(p) => auth::Users::load(p)?,
+        None => auth::Users::default(),
+    };
+    if users.is_empty() {
+        tracing::warn!("no users configured: the API is read-only and needs no login");
+    } else {
+        tracing::info!("login enabled for {} user(s)", users.len());
+    }
+    let auth = Arc::new(auth::Auth::new(users, &store, writer.clone())?);
+    let state = api::AppState { store, auth, engine: in_tx.clone(), live, tx: live_tx, started: store::now_ts(), source: source_desc };
     let app = api::router(state);
     let listener = tokio::net::TcpListener::bind(listen).await.with_context(|| format!("binding {listen}"))?;
     tracing::info!("web UI and API on http://{listen}");
-    axum::serve(listener, app).with_graceful_shutdown(shutdown()).await?;
+    axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>()).with_graceful_shutdown(shutdown()).await?;
     Ok(())
 }
 

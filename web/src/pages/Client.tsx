@@ -1,7 +1,7 @@
 import { useState } from "react";
 import { Link, useParams } from "react-router-dom";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
-import { setAlias, useClients, useClient, useDevices, useEvents, useSeries } from "../api";
+import { setAlias, useClients, useClient, useDevices, useEvents, useMe, useSeries } from "../api";
 import { COLORS, Chart, RangePicker } from "../components/Chart";
 import { Dot, ErrorNote, EventList, Loading, Signal, Stat, clientNames, deviceNames } from "../components/common";
 import { ago, band, bitrate, bytes, duration, phy } from "../format";
@@ -116,6 +116,7 @@ export function Client() {
 /** The client's name with an inline editor for its alias and note. */
 function AliasHeader(p: { mac: string; connected?: boolean; alias: string | null; note: string | null; hostname: string | null }) {
   const qc = useQueryClient();
+  const readOnly = useMe().data?.read_only ?? false;
   const [editing, setEditing] = useState(false);
   const [alias, setAliasText] = useState("");
   const [note, setNote] = useState("");
@@ -169,9 +170,11 @@ function AliasHeader(p: { mac: string; connected?: boolean; alias: string | null
     <div className="alias-head">
       <h1>
         {p.connected !== undefined && <Dot ok={p.connected} />} {p.alias || p.hostname || p.mac}
-        <button className="btn small" onClick={start} title="Give this device a name you recognise">
-          {p.alias ? "Rename" : "Add name"}
-        </button>
+        {!readOnly && (
+          <button className="btn small" onClick={start} title="Give this device a name you recognise">
+            {p.alias ? "Rename" : "Add name"}
+          </button>
+        )}
       </h1>
       <div className="muted small">
         {p.alias && p.hostname ? <>{p.hostname} · </> : null}
