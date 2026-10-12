@@ -34,6 +34,8 @@ pub struct AppState {
 
 pub fn router(state: AppState) -> Router {
     let public = Router::new()
+        // For Kubernetes probes: no login, no data.
+        .route("/healthz", get(|| async { "ok" }))
         .route("/api/login", axum::routing::post(crate::auth::login))
         .route("/api/logout", axum::routing::post(crate::auth::logout))
         .route("/api/me", get(crate::auth::me));
