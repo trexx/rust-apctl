@@ -4,15 +4,41 @@ A lightweight, open-source controller for Ubiquiti access points. It is written 
 stores everything in SQLite and adds the metrics, logs and event timelines the official
 Network application lacks. It has no affiliation with Ubiquiti.
 
-Status: **milestone 1, the protocol foundation.** See the plan in
-`~/.claude/plans/i-would-like-to-vast-rain.md`.
+Status: **milestone 2: monitoring in shadow mode.** apctl runs next to an existing
+controller and learns everything from a capture of its traffic: APs, clients, radio
+metrics, events and AP syslog. It never talks to the APs. Configuring APs comes in
+milestone 3.
 
 ## Crates
 
 | Crate | What it is |
 |---|---|
 | `crates/inform` | Codec for the inform protocol: TNBU framing, AES-128-CBC/GCM, zlib/snappy. No I/O. |
+| `crates/wire` | Capture reading (pcap, TCP/HTTP reassembly, UDP), request/reply pairing, decryption, config diffs. |
 | `crates/informdump` | A CLI that decodes inform traffic from pcap files or live tcpdump output, diffs config pushes and imports keys from an existing controller. |
+| `crates/controller` | `apctl`: the controller. SQLite storage, event engine, syslog, REST/WebSocket API and the embedded web UI. |
+| `web/` | The web UI (React, TypeScript, Vite, uPlot). |
+
+## apctl
+
+```sh
+# Build the UI (no local npm needed), then the controller.
+podman run --rm -v $PWD/web:/app:Z -w /app docker.io/library/node:24-slim sh -c "npm ci && npm run build"
+cargo build --release -p controller
+
+# Shadow mode from any pcap stream, e.g. tcpdump on the node running the other controller.
+apctl serve --data-dir data --keys import.json \
+  --shadow-cmd "ssh node sudo tcpdump -i any -U -s0 -w - 'tcp port 8080 or udp port 5514'"
+# then open http://127.0.0.1:8090
+```
+
+Data lives in three SQLite files under `--data-dir`:
+- `config.db` holds devices, clients, events and the redacted last config per AP.
+- `metrics.db` holds the time series: raw for 48 h, 5-minute averages for 30 days and hourly for a year.
+- `logs.db` holds AP syslog for 14 days, with full-text search. Secrets that APs log are masked on arrival.
+
+In Kubernetes, `deploy/k8s/shadow.yaml` runs apctl with a tcpdump sidecar on the host
+network of the node that runs the other controller.
 
 ## informdump
 
