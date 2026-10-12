@@ -1,0 +1,9 @@
+/target
+# Never commit captures, keys or data imported from a live controller.
+*.pcap
+*.pcapng
+/captures/
+/secrets/
+*.keys.json
+import*.json
+/data/

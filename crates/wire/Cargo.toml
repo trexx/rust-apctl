@@ -1,0 +1,18 @@
+[package]
+name = "wire"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+anyhow = "1.0.104"
+etherparse = "0.21.0"
+hex = "0.4.3"
+httparse = "1.10.1"
+inform = { version = "0.1.0", path = "../inform" }
+pcap-parser = "0.17.0"
+serde_json = "1.0.154"
+
+[dev-dependencies]
+serde_json = "1.0.154"

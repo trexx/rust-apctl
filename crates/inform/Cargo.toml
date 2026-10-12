@@ -1,0 +1,16 @@
+[package]
+name = "inform"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+aes = "0.9.3"
+aes-gcm = "0.11.1"
+cbc = { version = "0.2.1", features = ["alloc"] }
+flate2 = "1.1.10"
+hex = "0.4.3"
+serde = "1.0.229"
+serde_json = "1.0.154"
+snap = "1.1.2"
+thiserror = "2.0.21"
+
