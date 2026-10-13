@@ -740,13 +740,23 @@ pub struct RestoreBody {
 }
 
 /// POST /api/backups/upload: checks an uploaded backup and stages it (not applied yet).
-pub async fn upload(State(s): State<AppState>, headers: HeaderMap, body: axum::body::Bytes) -> Result<Json<Value>, ApiError> {
+/// The body is streamed to disk, so large backups need no memory.
+pub async fn upload(State(s): State<AppState>, headers: HeaderMap, body: Body) -> Result<Json<Value>, ApiError> {
+    use futures_util::StreamExt;
+    use tokio::io::AsyncWriteExt;
     crate::api::check_csrf(&headers)?;
     let b = backups(&s)?;
-    let res = tokio::task::spawn_blocking(move || -> Result<(String, Manifest)> {
-        fs::create_dir_all(b.staging())?;
-        let tmp = b.staging().join(format!("upload-{}.apb", store::now_ts()));
-        fs::write(&tmp, &body)?;
+    tokio::fs::create_dir_all(b.staging()).await.map_err(|e| ApiError::internal(e.to_string()))?;
+    let tmp = b.staging().join(format!("upload-{}.apb", store::now_ts()));
+    let mut file = tokio::fs::File::create(&tmp).await.map_err(|e| ApiError::internal(e.to_string()))?;
+    let mut stream = body.into_data_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|e| ApiError(StatusCode::BAD_REQUEST, format!("upload interrupted: {e}")))?;
+        file.write_all(&chunk).await.map_err(|e| ApiError::internal(e.to_string()))?;
+    }
+    file.flush().await.map_err(|e| ApiError::internal(e.to_string()))?;
+    drop(file);
+    let res = tokio::task::spawn_blocking(move || {
         let r = stage(&b, &tmp);
         let _ = fs::remove_file(&tmp);
         r
