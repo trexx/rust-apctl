@@ -13,6 +13,7 @@ mod model;
 mod shadow;
 mod store;
 mod syslog;
+mod threats;
 mod vendor;
 mod web;
 
@@ -266,6 +267,7 @@ async fn serve(args: ServeArgs) -> Result<()> {
         tracing::info!("login enabled for {} user(s)", users.len());
     }
     let auth = Arc::new(auth::Auth::new(users, &store, writer.clone())?);
+    threats::watch(store.clone(), live.clone(), in_tx.clone());
     let state = api::AppState { store, vendors: Arc::new(vendors), renderer, auth, engine: in_tx.clone(), live, tx: live_tx, started: store::now_ts(), source: source_desc };
     let app = api::router(state);
     let listener = tokio::net::TcpListener::bind(listen).await.with_context(|| format!("binding {listen}"))?;

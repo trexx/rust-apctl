@@ -41,6 +41,11 @@ pub enum Input {
     Reply { ts: Ts, mac: Mac, decoded: Decoded },
     Tick(Ts),
     DecodeError,
+    /// A suspicious network found for the first time: record it, and report it
+    /// as an event unless it was already acknowledged.
+    ThreatFound { ts: Ts, kind: &'static str, bssid: String, device_mac: Option<Mac>, data: Value, notify: bool },
+    /// Acknowledge a finding with an optional note (`Some`), or withdraw the acknowledgement (`None`).
+    AckThreat { ts: Ts, kind: &'static str, bssid: String, note: Option<Option<String>> },
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -276,6 +281,29 @@ impl Engine {
             Input::DecodeError => self.live.write().unwrap().counters.decode_errors += 1,
             Input::SetAlias { ts, mac, alias, note, only_if_unset } => self.set_alias(ts, mac, alias, note, only_if_unset),
             Input::SetState { ts, state } => self.set_state(ts, state),
+            Input::ThreatFound { ts, kind, bssid, device_mac, data, notify } => {
+                self.writer.exec(
+                    Db::Config,
+                    "INSERT OR IGNORE INTO network_threats (kind, bssid, first_reported) VALUES (?1, ?2, ?3)",
+                    vec![Sql::Text(kind.into()), Sql::Text(bssid), Sql::Integer(ts)],
+                );
+                if notify {
+                    let mut live = self.live.write().unwrap();
+                    self.emit(&mut live, ev(ts, "network_threat", device_mac, None, data));
+                }
+            }
+            Input::AckThreat { ts, kind, bssid, note } => match note {
+                Some(note) => self.writer.exec(
+                    Db::Config,
+                    "INSERT OR REPLACE INTO network_acks (kind, bssid, note, ts) VALUES (?1, ?2, ?3, ?4)",
+                    vec![Sql::Text(kind.into()), Sql::Text(bssid), opt_text(note), Sql::Integer(ts)],
+                ),
+                None => self.writer.exec(
+                    Db::Config,
+                    "DELETE FROM network_acks WHERE kind = ?1 AND bssid = ?2",
+                    vec![Sql::Text(kind.into()), Sql::Text(bssid)],
+                ),
+            },
         }
     }
 

@@ -62,6 +62,8 @@ pub fn router(state: AppState) -> Router {
         .route("/api/rf/radios", get(crate::insights::radios))
         .route("/api/rf/neighbors", get(crate::insights::neighbors))
         .route("/api/rf/channel-plan", get(crate::insights::channel_plan))
+        .route("/api/rf/threats", get(crate::threats::list))
+        .route("/api/rf/threats/ack", axum::routing::put(crate::threats::ack))
         .route("/api/series/{table}", get(series))
         .route("/api/events", get(events))
         .route("/api/logs", get(logs))
@@ -70,7 +72,7 @@ pub fn router(state: AppState) -> Router {
     public.merge(protected).fallback(crate::web::handler).with_state(state)
 }
 
-pub struct ApiError(StatusCode, String);
+pub struct ApiError(pub StatusCode, pub String);
 
 impl ApiError {
     pub fn internal(msg: impl Into<String>) -> Self {
@@ -356,7 +358,7 @@ async fn dryrun(State(s): State<AppState>) -> ApiResult {
 /// Mutations must carry this header. Browsers cannot add custom headers to
 /// cross-site requests without a CORS preflight, which this server never
 /// approves, so another website cannot make a visitor's browser change data.
-fn check_csrf(headers: &axum::http::HeaderMap) -> Result<(), ApiError> {
+pub fn check_csrf(headers: &axum::http::HeaderMap) -> Result<(), ApiError> {
     match headers.get("x-requested-with").and_then(|v| v.to_str().ok()) {
         Some("apctl") => Ok(()),
         _ => Err(ApiError(StatusCode::FORBIDDEN, "missing X-Requested-With: apctl header".into())),

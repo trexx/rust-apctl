@@ -1,16 +1,22 @@
 import { useMemo, useState } from "react";
-import { Link } from "react-router-dom";
+import { Link, useSearchParams } from "react-router-dom";
 import { useChannelPlan, useNeighbors, useRadios } from "../api";
 import type { Neighbor, RadioOverview } from "../api";
 import { ago, bytes } from "../format";
 import { BandPicker } from "../components/Insights";
+import { ThreatList } from "../components/Threats";
 import { ErrorNote, Loading, Meter, Signal } from "../components/common";
 
 const BAND_NAME: Record<string, string> = { ng: "2.4 GHz", na: "5 GHz" };
 
 /** Centre frequency (MHz) of a channel of the given width. */
-function centre(channel: number, width: number | null, radio: string | null): number {
-  if (radio === "ng" || channel <= 14) return channel === 14 ? 2484 : 2407 + 5 * channel;
+function centre(
+  channel: number,
+  width: number | null,
+  radio: string | null,
+): number {
+  if (radio === "ng" || channel <= 14)
+    return channel === 14 ? 2484 : 2407 + 5 * channel;
   const w = width && width > 20 ? width : 20;
   const group = w / 5;
   const base = channel >= 149 ? 149 : 36;
@@ -39,23 +45,50 @@ function Spectrum({ band, shapes }: { band: "ng" | "na"; shapes: Shape[] }) {
   const W = 900;
   const H = 220;
   const pad = { l: 36, r: 8, t: 8, b: 24 };
-  const x = (f: number) => pad.l + ((f - ax.from) / (ax.to - ax.from)) * (W - pad.l - pad.r);
-  const y = (s: number) => pad.t + ((-20 - Math.max(-100, Math.min(-20, s))) / 80) * (H - pad.t - pad.b);
+  const x = (f: number) =>
+    pad.l + ((f - ax.from) / (ax.to - ax.from)) * (W - pad.l - pad.r);
+  const y = (s: number) =>
+    pad.t +
+    ((-20 - Math.max(-100, Math.min(-20, s))) / 80) * (H - pad.t - pad.b);
   const floor = H - pad.b;
   // Quiet ones first, so the loud ones and our own APs are drawn on top.
-  const sorted = [...shapes].sort((a, b) => Number(a.own) - Number(b.own) || a.signal - b.signal);
+  const sorted = [...shapes].sort(
+    (a, b) => Number(a.own) - Number(b.own) || a.signal - b.signal,
+  );
   return (
-    <svg viewBox={`0 0 ${W} ${H}`} className="spectrum" role="img" aria-label={`${BAND_NAME[band]} channel occupancy`}>
+    <svg
+      viewBox={`0 0 ${W} ${H}`}
+      className="spectrum"
+      role="img"
+      aria-label={`${BAND_NAME[band]} channel occupancy`}
+    >
       {[-30, -50, -70, -90].map((s) => (
         <g key={s}>
-          <line x1={pad.l} x2={W - pad.r} y1={y(s)} y2={y(s)} className="spectrum-grid" />
-          <text x={pad.l - 4} y={y(s) + 4} textAnchor="end" className="spectrum-label">
+          <line
+            x1={pad.l}
+            x2={W - pad.r}
+            y1={y(s)}
+            y2={y(s)}
+            className="spectrum-grid"
+          />
+          <text
+            x={pad.l - 4}
+            y={y(s) + 4}
+            textAnchor="end"
+            className="spectrum-label"
+          >
             {s}
           </text>
         </g>
       ))}
       {ax.ticks.map((c) => (
-        <text key={c} x={x(centre(c, 20, band))} y={H - 6} textAnchor="middle" className="spectrum-label">
+        <text
+          key={c}
+          x={x(centre(c, 20, band))}
+          y={H - 6}
+          textAnchor="middle"
+          className="spectrum-label"
+        >
           {c}
         </text>
       ))}
@@ -87,7 +120,13 @@ function Spectrum({ band, shapes }: { band: "ng" | "na"; shapes: Shape[] }) {
   );
 }
 
-function ChannelPlan({ band, radios }: { band: "ng" | "na"; radios: RadioOverview[] }) {
+function ChannelPlan({
+  band,
+  radios,
+}: {
+  band: "ng" | "na";
+  radios: RadioOverview[];
+}) {
   const [dfs, setDfs] = useState(false);
   const plan = useChannelPlan(band, dfs);
   return (
@@ -97,13 +136,20 @@ function ChannelPlan({ band, radios }: { band: "ng" | "na"; radios: RadioOvervie
         <span className="spacer" />
         {band === "na" && (
           <label className="small">
-            <input type="checkbox" checked={dfs} onChange={(e) => setDfs(e.target.checked)} /> Consider DFS channels
+            <input
+              type="checkbox"
+              checked={dfs}
+              onChange={(e) => setDfs(e.target.checked)}
+            />{" "}
+            Consider DFS channels
           </label>
         )}
       </div>
       <p className="muted small">
-        Scores each channel your AP is allowed to use by how loudly it hears other networks and your other APs there (lower is better). A change is only
-        suggested when it is clearly better. Applying a plan needs active mode.
+        Scores each channel your AP is allowed to use by how loudly it hears
+        other networks and your other APs there (lower is better). A change is
+        only suggested when it is clearly better. Applying a plan needs active
+        mode.
       </p>
       {plan.error && <ErrorNote error={plan.error} />}
       {!plan.data ? (
@@ -122,7 +168,9 @@ function ChannelPlan({ band, radios }: { band: "ng" | "na"; radios: RadioOvervie
             </thead>
             <tbody>
               {plan.data.plan.map((p) => {
-                const r = radios.find((x) => x.mac === p.mac && x.radio === band);
+                const r = radios.find(
+                  (x) => x.mac === p.mac && x.radio === band,
+                );
                 return (
                   <tr key={p.mac}>
                     <td>
@@ -131,22 +179,40 @@ function ChannelPlan({ band, radios }: { band: "ng" | "na"; radios: RadioOvervie
                     </td>
                     <td className="nowrap">
                       {p.current_channel ?? "—"}
-                      <span className="muted small"> / {r?.bw ?? p.width} MHz</span>
+                      <span className="muted small">
+                        {" "}
+                        / {r?.bw ?? p.width} MHz
+                      </span>
                     </td>
                     <td>{p.current_score ?? "—"}</td>
                     <td className="nowrap">
                       {p.change ? (
                         <b className="suggest">
-                          → {p.suggested_channel} <span className="muted small">(score {p.suggested_score})</span>
+                          → {p.suggested_channel}{" "}
+                          <span className="muted small">
+                            (score {p.suggested_score})
+                          </span>
                         </b>
                       ) : (
                         <span className="muted">keep</span>
                       )}
                     </td>
                     <td className="small">
-                      {(p.current_reasons ?? []).length > 0 && <div>Now hears {(p.current_reasons ?? []).join(", ")}</div>}
-                      {p.change && p.suggested_reasons.length > 0 && <div className="muted">There: {p.suggested_reasons.join(", ")}</div>}
-                      {p.change && p.suggested_reasons.length === 0 && <div className="muted">Nothing heard on {p.suggested_channel}</div>}
+                      {(p.current_reasons ?? []).length > 0 && (
+                        <div>
+                          Now hears {(p.current_reasons ?? []).join(", ")}
+                        </div>
+                      )}
+                      {p.change && p.suggested_reasons.length > 0 && (
+                        <div className="muted">
+                          There: {p.suggested_reasons.join(", ")}
+                        </div>
+                      )}
+                      {p.change && p.suggested_reasons.length === 0 && (
+                        <div className="muted">
+                          Nothing heard on {p.suggested_channel}
+                        </div>
+                      )}
                     </td>
                   </tr>
                 );
@@ -185,7 +251,10 @@ function RadioTable({ radios }: { radios: RadioOverview[] }) {
           </thead>
           <tbody>
             {radios.map((r) => (
-              <tr key={r.mac + r.radio} className={r.channel === null ? "dim" : ""}>
+              <tr
+                key={r.mac + r.radio}
+                className={r.channel === null ? "dim" : ""}
+              >
                 <td>
                   <Link to={`/devices/${r.mac}`}>{r.name ?? r.mac}</Link>
                 </td>
@@ -201,7 +270,10 @@ function RadioTable({ radios }: { radios: RadioOverview[] }) {
                       <span className="muted small"> / {r.bw ?? "?"} MHz</span>
                     </td>
                     <td className="nowrap">
-                      {r.tx_power ?? "—"} dBm{r.eirp !== null && <span className="muted small"> ({r.eirp} EIRP)</span>}
+                      {r.tx_power ?? "—"} dBm
+                      {r.eirp !== null && (
+                        <span className="muted small"> ({r.eirp} EIRP)</span>
+                      )}
                     </td>
                   </>
                 )}
@@ -209,9 +281,25 @@ function RadioTable({ radios }: { radios: RadioOverview[] }) {
                 <td>
                   <Meter value={r.avg_utilization} />
                 </td>
-                <td>{r.avg_interference === null ? "—" : `${r.avg_interference.toFixed(0)}%`}</td>
-                <td className={r.tx_retry_pct !== null && r.tx_retry_pct >= 15 ? "warn" : ""}>{r.tx_retry_pct === null ? "—" : `${r.tx_retry_pct.toFixed(1)}%`}</td>
-                <td className="nowrap">{r.noise_floor === null ? "—" : `${r.noise_floor} dBm`}</td>
+                <td>
+                  {r.avg_interference === null
+                    ? "—"
+                    : `${r.avg_interference.toFixed(0)}%`}
+                </td>
+                <td
+                  className={
+                    r.tx_retry_pct !== null && r.tx_retry_pct >= 15
+                      ? "warn"
+                      : ""
+                  }
+                >
+                  {r.tx_retry_pct === null
+                    ? "—"
+                    : `${r.tx_retry_pct.toFixed(1)}%`}
+                </td>
+                <td className="nowrap">
+                  {r.noise_floor === null ? "—" : `${r.noise_floor} dBm`}
+                </td>
                 <td>
                   <Signal dbm={r.avg_client_signal} />
                 </td>
@@ -256,7 +344,10 @@ function Environment() {
       out.push({
         key: nb.bssid + nb.ap_mac,
         label: nb.essid || "hidden network",
-        freq: nb.center_freq && nb.bw && nb.bw > 20 ? nb.center_freq : centre(nb.channel, w, nb.radio),
+        freq:
+          nb.center_freq && nb.bw && nb.bw > 20
+            ? nb.center_freq
+            : centre(nb.channel, w, nb.radio),
         width: w,
         signal: nb.best_signal ?? nb.signal,
         own: false,
@@ -280,7 +371,13 @@ function Environment() {
   const list = useMemo(() => {
     const term = q.trim().toLowerCase();
     return (n.data?.neighbors ?? [])
-      .filter((x) => !term || [x.essid, x.bssid, x.vendor, x.nearest_ap].some((v) => v?.toLowerCase().includes(term)))
+      .filter(
+        (x) =>
+          !term ||
+          [x.essid, x.bssid, x.vendor, x.nearest_ap].some((v) =>
+            v?.toLowerCase().includes(term),
+          ),
+      )
       .sort((a, b) => (b.best_signal ?? -200) - (a.best_signal ?? -200));
   }, [n.data, q]);
 
@@ -296,18 +393,29 @@ function Environment() {
       <div className="panel">
         <div className="panel-head">
           <b>Channel occupancy</b>
-          <BandPicker value={band} onChange={(b) => setBand(b as "ng" | "na")} all={false} />
+          <BandPicker
+            value={band}
+            onChange={(b) => setBand(b as "ng" | "na")}
+            all={false}
+          />
           <span className="spacer" />
           <label className="small">
-            <input type="checkbox" checked={showOwn} onChange={(e) => setShowOwn(e.target.checked)} /> Include your APs as heard by each other
+            <input
+              type="checkbox"
+              checked={showOwn}
+              onChange={(e) => setShowOwn(e.target.checked)}
+            />{" "}
+            Include your APs as heard by each other
           </label>
         </div>
         {!n.data ? <Loading /> : <Spectrum band={band} shapes={shapes} />}
         <div className="legend small">
-          <span className="swatch own" /> your APs <span className="swatch" /> neighbouring networks (strongest signal seen in the last 7 days)
+          <span className="swatch own" /> your APs <span className="swatch" />{" "}
+          neighbouring networks (strongest signal seen in the last 7 days)
         </div>
         <p className="muted small">
-          Neighbours come from the APs' background scans, which they run on their own every so often. An on-demand scan needs active mode.
+          Neighbours come from the APs' background scans, which they run on
+          their own every so often. An on-demand scan needs active mode.
         </p>
       </div>
 
@@ -316,12 +424,19 @@ function Environment() {
           <b>Neighbouring networks</b>
           <span className="muted small">{unique.length} seen</span>
           <span className="spacer" />
-          <input className="search" placeholder="Filter by name, BSSID, vendor…" value={q} onChange={(e) => setQ(e.target.value)} />
+          <input
+            className="search"
+            placeholder="Filter by name, BSSID, vendor…"
+            value={q}
+            onChange={(e) => setQ(e.target.value)}
+          />
         </div>
         {!n.data ? (
           <Loading />
         ) : unique.length === 0 ? (
-          <div className="muted small">Nothing heard yet on {BAND_NAME[band]}.</div>
+          <div className="muted small">
+            Nothing heard yet on {BAND_NAME[band]}.
+          </div>
         ) : (
           <div className="table-wrap">
             <table className="table">
@@ -341,7 +456,9 @@ function Environment() {
                   <tr key={x.bssid}>
                     <td>
                       {x.essid || <span className="muted">hidden</span>}
-                      {x.is_unifi && x.ap_name && <span className="tag">your AP {x.ap_name}</span>}
+                      {x.is_unifi && x.ap_name && (
+                        <span className="tag">your AP {x.ap_name}</span>
+                      )}
                       <div className="muted small mono">{x.bssid}</div>
                     </td>
                     <td className="nowrap">
@@ -366,22 +483,40 @@ function Environment() {
   );
 }
 
+const TABS = [
+  ["channels", "Channels"],
+  ["environment", "Environment"],
+  ["rogue", "Rogue networks"],
+] as const;
+
 export function Radios() {
-  const [tab, setTab] = useState<"channels" | "environment">("channels");
+  const [params, setParams] = useSearchParams();
+  const tab = TABS.find(([k]) => k === params.get("tab"))?.[0] ?? "channels";
   return (
     <div className="page">
       <div className="page-head">
         <h1>Radios</h1>
         <div className="segmented" role="tablist">
-          <button className={tab === "channels" ? "active" : ""} onClick={() => setTab("channels")}>
-            Channels
-          </button>
-          <button className={tab === "environment" ? "active" : ""} onClick={() => setTab("environment")}>
-            Environment
-          </button>
+          {TABS.map(([k, label]) => (
+            <button
+              key={k}
+              role="tab"
+              aria-selected={tab === k}
+              className={tab === k ? "active" : ""}
+              onClick={() => setParams(k === "channels" ? {} : { tab: k })}
+            >
+              {label}
+            </button>
+          ))}
         </div>
       </div>
-      {tab === "channels" ? <Channels /> : <Environment />}
+      {tab === "channels" ? (
+        <Channels />
+      ) : tab === "environment" ? (
+        <Environment />
+      ) : (
+        <ThreatList />
+      )}
     </div>
   );
 }

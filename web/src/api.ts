@@ -416,6 +416,34 @@ export interface PlanEntry {
   change: boolean;
 }
 
+export interface ThreatFinding {
+  kind: "spoofed_bssid" | "impersonation" | "lookalike" | "bridged" | "new_nearby";
+  severity: "high" | "medium" | "low";
+  bssid: string;
+  essid: string | null;
+  security: string | null;
+  channel: number | null;
+  radio: string | null;
+  best_signal: number | null;
+  heard_by: { mac: Mac; name: string | null; signal: number | null; last_seen: number }[];
+  first_seen: number;
+  last_seen: number;
+  target: string | null;
+  detail: string;
+  first_reported: number | null;
+  acknowledged: { note: string | null; ts: number } | null;
+  vendor: string | null;
+}
+
+export const useThreats = () =>
+  useQuery({
+    queryKey: ["threats"],
+    queryFn: () => get<{ watching_since: number; findings: ThreatFinding[] }>("/api/rf/threats"),
+    refetchInterval: 60_000,
+  });
+
+export const ackThreat = (kind: string, bssid: string, ack: boolean, note?: string) => send("PUT", "/api/rf/threats/ack", { kind, bssid, ack, note });
+
 const bandParam = (band: string) => (band === "all" ? undefined : band);
 
 /** A chart time range: the last N seconds (follows the clock), or a fixed window. */

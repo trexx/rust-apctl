@@ -915,3 +915,73 @@ td.warn {
 .chart-plot .u-select {
   background: rgba(47, 111, 223, 0.15);
 }
+
+.page > .panel + .threat,
+.page > .threat + .threat,
+.page > .threat + .panel {
+  margin-top: 12px;
+}
+.threat {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-left: 4px solid var(--poor);
+  border-radius: var(--radius);
+  padding: 12px 14px;
+}
+.threat-medium {
+  border-left-color: var(--fair);
+}
+.threat-low {
+  border-left-color: var(--accent);
+}
+.threat-acked {
+  border-left-color: var(--border);
+  opacity: 0.75;
+}
+.threat-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.threat-detail {
+  margin: 6px 0;
+}
+.threat-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 2px 14px;
+}
+.threat-ack {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-top: 8px;
+}
+.threat-ack input {
+  flex: 1;
+  min-width: 200px;
+}
+.sev {
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+  border-radius: 6px;
+  padding: 1px 6px;
+  color: #fff;
+  background: var(--poor);
+}
+.sev-medium {
+  background: var(--fair);
+}
+.sev-low {
+  background: var(--accent);
+}
+.stats + .banner {
+  margin: 12px 0 0;
+}
+.banner-high {
+  background: var(--bad-bg);
+}

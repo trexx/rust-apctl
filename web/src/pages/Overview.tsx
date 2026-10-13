@@ -3,6 +3,7 @@ import { useClients, useDevices, useEvents, useStatus } from "../api";
 import { Dot, ErrorNote, EventList, Loading, Meter, Stat, clientNames, deviceNames } from "../components/common";
 import { ago, band, duration, pct } from "../format";
 import { ApDensity, Connectivity, RetryBuckets, SiteActivity, TopTalkers } from "../components/Insights";
+import { ThreatBanner } from "../components/Threats";
 
 export function Overview() {
   const devices = useDevices();
@@ -37,6 +38,7 @@ export function Overview() {
         />
       </div>
 
+      <ThreatBanner />
       <h2>Activity</h2>
       <SiteActivity />
       <div className="grid2">

@@ -3,7 +3,15 @@ import { displayName } from "../api";
 import type { AppEvent, ClientView, DeviceSummary, LogLine } from "../api";
 import { band, clock, duration, signalClass } from "../format";
 
-export function Stat({ label, value, sub }: { label: string; value: React.ReactNode; sub?: React.ReactNode }) {
+export function Stat({
+  label,
+  value,
+  sub,
+}: {
+  label: string;
+  value: React.ReactNode;
+  sub?: React.ReactNode;
+}) {
   return (
     <div className="stat">
       <div className="stat-label">{label}</div>
@@ -14,19 +22,47 @@ export function Stat({ label, value, sub }: { label: string; value: React.ReactN
 }
 
 export function Dot({ ok, warn }: { ok: boolean; warn?: boolean }) {
-  return <span className={`dot ${warn ? "dot-warn" : ok ? "dot-ok" : "dot-bad"}`} aria-hidden />;
+  return (
+    <span
+      className={`dot ${warn ? "dot-warn" : ok ? "dot-ok" : "dot-bad"}`}
+      aria-hidden
+    />
+  );
 }
 
 export function Signal({ dbm }: { dbm: number | null | undefined }) {
-  return <span className={`signal signal-${signalClass(dbm)}`}>{dbm === null || dbm === undefined ? "—" : `${Math.round(dbm)} dBm`}</span>;
+  return (
+    <span className={`signal signal-${signalClass(dbm)}`}>
+      {dbm === null || dbm === undefined ? "—" : `${Math.round(dbm)} dBm`}
+    </span>
+  );
 }
 
-export function Meter({ value, max = 100 }: { value: number | null | undefined; max?: number }) {
-  const v = value === null || value === undefined ? 0 : Math.min(100, (value / max) * 100);
+export function Meter({
+  value,
+  max = 100,
+}: {
+  value: number | null | undefined;
+  max?: number;
+}) {
+  const v =
+    value === null || value === undefined
+      ? 0
+      : Math.min(100, (value / max) * 100);
   const level = v >= 80 ? "high" : v >= 50 ? "mid" : "low";
   return (
-    <span className="meter" title={value === null || value === undefined ? "unknown" : `${Math.round(value)}`}>
-      <span className={`meter-fill meter-${level}`} style={{ width: `${v}%` }} />
+    <span
+      className="meter"
+      title={
+        value === null || value === undefined
+          ? "unknown"
+          : `${Math.round(value)}`
+      }
+    >
+      <span
+        className={`meter-fill meter-${level}`}
+        style={{ width: `${v}%` }}
+      />
     </span>
   );
 }
@@ -36,22 +72,38 @@ export function Loading() {
 }
 
 export function ErrorNote({ error }: { error: unknown }) {
-  return <div className="error pad">{error instanceof Error ? error.message : String(error)}</div>;
+  return (
+    <div className="error pad">
+      {error instanceof Error ? error.message : String(error)}
+    </div>
+  );
 }
 
 /** Names devices by MAC for event and log rows. */
 export type DeviceNames = Map<string, string>;
 
 /** Client display names (alias, else hostname) by MAC, for event rows. */
-export function clientNames(clients: ClientView[] | undefined): Map<string, string> {
-  return new Map((clients ?? []).filter((c) => c.alias || c.sample.hostname).map((c) => [c.sample.mac, displayName(c)]));
+export function clientNames(
+  clients: ClientView[] | undefined,
+): Map<string, string> {
+  return new Map(
+    (clients ?? [])
+      .filter((c) => c.alias || c.sample.hostname)
+      .map((c) => [c.sample.mac, displayName(c)]),
+  );
 }
 
 export function deviceNames(devices: DeviceSummary[] | undefined): DeviceNames {
   return new Map((devices ?? []).map((d) => [d.mac, d.name ?? d.mac]));
 }
 
-export function DeviceLink({ mac, names }: { mac: string | null; names: DeviceNames }) {
+export function DeviceLink({
+  mac,
+  names,
+}: {
+  mac: string | null;
+  names: DeviceNames;
+}) {
   if (!mac) return <span className="muted">—</span>;
   return <Link to={`/devices/${mac}`}>{names.get(mac) ?? mac}</Link>;
 }
@@ -68,7 +120,8 @@ const EVENT_LABELS: Record<string, string> = {
   config_applied: "Config applied",
   client_connect_failed: "Connection failed",
   dfs_radar: "Radar detected (DFS)",
-  rogue_ap: "Rogue AP",
+  rogue_ap: "Rogue AP (reported by AP)",
+  network_threat: "Suspicious network",
   ap_scan_done: "Scan finished",
   ap_event: "AP event",
   radio_changed: "Radio settings changed",
@@ -81,10 +134,21 @@ const EVENT_LABELS: Record<string, string> = {
   settings_imported: "Settings imported",
 };
 
-function eventTone(kind: string): string {
+function eventTone(kind: string, d?: Record<string, unknown>): string {
   if (kind === "ap_offline" || kind === "ap_restarted") return "bad";
-  if (kind === "client_disconnected" || kind === "client_connect_failed" || kind === "dfs_radar") return "warn";
+  if (
+    kind === "client_disconnected" ||
+    kind === "client_connect_failed" ||
+    kind === "dfs_radar"
+  )
+    return "warn";
   if (kind === "rogue_ap") return "bad";
+  if (kind === "network_threat")
+    return d?.severity === "low"
+      ? "info"
+      : d?.severity === "medium"
+        ? "warn"
+        : "bad";
   if (kind.startsWith("client")) return "info";
   return "neutral";
 }
@@ -103,19 +167,40 @@ function describe(e: AppEvent, names: DeviceNames): React.ReactNode {
     case "config_pushed": {
       const s = d.system_cfg;
       if (!s) return "";
-      return s.baseline ? `baseline captured (${s.lines} lines)` : `${s.added} added, ${s.removed} removed, ${s.changed} changed`;
+      return s.baseline
+        ? `baseline captured (${s.lines} lines)`
+        : `${s.added} added, ${s.removed} removed, ${s.changed} changed`;
     }
     case "config_applied":
-      return d.seconds_after_push !== null && d.seconds_after_push !== undefined ? `${d.seconds_after_push}s after the push` : "";
+      return d.seconds_after_push !== null && d.seconds_after_push !== undefined
+        ? `${d.seconds_after_push}s after the push`
+        : "";
     case "client_connect_failed":
-      return [d.essid, d.reason ? `reason: ${d.reason}` : null, d.rssi ? `${d.rssi} dBm` : null].filter(Boolean).join(" · ");
+      return [
+        d.essid,
+        d.reason ? `reason: ${d.reason}` : null,
+        d.rssi ? `${d.rssi} dBm` : null,
+      ]
+        .filter(Boolean)
+        .join(" · ");
     case "dfs_radar":
       return d.channel ? `channel ${d.channel}` : "";
+    case "network_threat":
+      return [d.essid ? `"${d.essid}"` : "hidden network", d.detail]
+        .filter(Boolean)
+        .join(" · ");
     case "rogue_ap":
-      return [d.essid, d.rogue_channel ? `channel ${d.rogue_channel}` : null, d.signal_strength ? `${d.signal_strength} dBm` : null].filter(Boolean).join(" · ");
+      return [
+        d.essid,
+        d.rogue_channel ? `channel ${d.rogue_channel}` : null,
+        d.signal_strength ? `${d.signal_strength} dBm` : null,
+      ]
+        .filter(Boolean)
+        .join(" · ");
     case "ap_config_applied": {
       const secs = `in ${d.seconds}s`;
-      if (d.reconnected > 0) return `${secs}, ${d.reconnected} of ${d.clients_before} clients had to reconnect`;
+      if (d.reconnected > 0)
+        return `${secs}, ${d.reconnected} of ${d.clients_before} clients had to reconnect`;
       return d.clients_before > 0 ? `${secs}, no clients dropped` : secs;
     }
     case "ap_offline":
@@ -128,11 +213,15 @@ function describe(e: AppEvent, names: DeviceNames): React.ReactNode {
       return [d.model, d.version, d.ip].filter(Boolean).join(" · ");
     case "dryrun_compared":
       if (d.error) return `generator error: ${d.error}`;
-      return d.matches ? "apctl would have pushed the identical config" : `differs: ${d.system_cfg?.added ?? 0} extra, ${d.system_cfg?.removed ?? 0} missing, ${d.system_cfg?.changed ?? 0} different lines`;
+      return d.matches
+        ? "apctl would have pushed the identical config"
+        : `differs: ${d.system_cfg?.added ?? 0} extra, ${d.system_cfg?.removed ?? 0} missing, ${d.system_cfg?.changed ?? 0} different lines`;
     case "settings_imported":
       return `${(d.wlans ?? []).length} SSIDs, ${(d.networks ?? []).length} networks`;
     case "client_renamed":
-      return d.to ? `${d.from ? `"${d.from}" → ` : ""}"${d.to}"` : `alias "${d.from}" removed`;
+      return d.to
+        ? `${d.from ? `"${d.from}" → ` : ""}"${d.to}"`
+        : `alias "${d.from}" removed`;
     case "ap_firmware_changed":
       return `${d.from} → ${d.to}`;
     default:
@@ -151,18 +240,24 @@ export function EventList({
   clientNames?: Map<string, string>;
   showDevice?: boolean;
 }) {
-  if (events.length === 0) return <div className="muted pad">No events yet</div>;
+  if (events.length === 0)
+    return <div className="muted pad">No events yet</div>;
   return (
     <ul className="events">
       {events.map((e, i) => (
-        <li key={`${e.ts}-${e.kind}-${i}`} className={`event event-${eventTone(e.kind)}`}>
+        <li
+          key={`${e.ts}-${e.kind}-${i}`}
+          className={`event event-${eventTone(e.kind, e.data as Record<string, unknown>)}`}
+        >
           <span className="event-time">{clock(e.ts)}</span>
           <span className="event-kind">{EVENT_LABELS[e.kind] ?? e.kind}</span>
           <span className="event-what">
             {e.client_mac && (
               <>
                 {clientNames?.get(e.client_mac) ? (
-                  <Link to={`/clients/${e.client_mac}`}>{clientNames.get(e.client_mac)}</Link>
+                  <Link to={`/clients/${e.client_mac}`}>
+                    {clientNames.get(e.client_mac)}
+                  </Link>
                 ) : (
                   <Link to={`/clients/${e.client_mac}`} className="mono">
                     {e.client_mac}
@@ -170,18 +265,22 @@ export function EventList({
                 )}{" "}
               </>
             )}
-            {showDevice && e.device_mac && !e.kind.startsWith("client_roamed") && (
-              <>
-                <DeviceLink mac={e.device_mac} names={names} />{" "}
-              </>
-            )}
+            {showDevice &&
+              e.device_mac &&
+              !e.kind.startsWith("client_roamed") && (
+                <>
+                  <DeviceLink mac={e.device_mac} names={names} />{" "}
+                </>
+              )}
             <span className="muted">{describe(e, names)}</span>
-            {e.kind === "config_pushed" && typeof (e.data as any)?.system_cfg?.diff === "string" && (e.data as any).system_cfg.diff && (
-              <details>
-                <summary>diff</summary>
-                <pre className="diff">{(e.data as any).system_cfg.diff}</pre>
-              </details>
-            )}
+            {e.kind === "config_pushed" &&
+              typeof (e.data as any)?.system_cfg?.diff === "string" &&
+              (e.data as any).system_cfg.diff && (
+                <details>
+                  <summary>diff</summary>
+                  <pre className="diff">{(e.data as any).system_cfg.diff}</pre>
+                </details>
+              )}
           </span>
         </li>
       ))}
@@ -189,9 +288,26 @@ export function EventList({
   );
 }
 
-const SEVERITY = ["emerg", "alert", "crit", "error", "warn", "notice", "info", "debug"];
+const SEVERITY = [
+  "emerg",
+  "alert",
+  "crit",
+  "error",
+  "warn",
+  "notice",
+  "info",
+  "debug",
+];
 
-export function LogList({ logs, names, showDevice = true }: { logs: LogLine[]; names: DeviceNames; showDevice?: boolean }) {
+export function LogList({
+  logs,
+  names,
+  showDevice = true,
+}: {
+  logs: LogLine[];
+  names: DeviceNames;
+  showDevice?: boolean;
+}) {
   if (logs.length === 0) return <div className="muted pad">No log lines</div>;
   return (
     <div className={showDevice ? "logs" : "logs logs-no-device"}>
@@ -203,7 +319,9 @@ export function LogList({ logs, names, showDevice = true }: { logs: LogLine[]; n
               <DeviceLink mac={l.device_mac} names={names} />
             </span>
           )}
-          <span className="log-sev">{l.severity !== null ? SEVERITY[l.severity] : ""}</span>
+          <span className="log-sev">
+            {l.severity !== null ? SEVERITY[l.severity] : ""}
+          </span>
           <span className="log-prog">{l.program ?? ""}</span>
           <span className="log-msg">{l.msg}</span>
         </div>

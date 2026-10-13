@@ -165,6 +165,10 @@ CREATE TABLE IF NOT EXISTS neighbors (
     security TEXT, signal INTEGER, best_signal INTEGER, noise INTEGER, is_unifi INTEGER NOT NULL DEFAULT 0, ap_name TEXT,
     model TEXT, first_seen INTEGER NOT NULL, last_seen INTEGER NOT NULL, PRIMARY KEY (bssid, ap_mac)) WITHOUT ROWID;
 CREATE INDEX IF NOT EXISTS neighbors_seen ON neighbors (last_seen);
+CREATE TABLE IF NOT EXISTS network_acks (
+    kind TEXT NOT NULL, bssid TEXT NOT NULL, note TEXT, ts INTEGER NOT NULL, PRIMARY KEY (kind, bssid)) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS network_threats (
+    kind TEXT NOT NULL, bssid TEXT NOT NULL, first_reported INTEGER NOT NULL, PRIMARY KEY (kind, bssid)) WITHOUT ROWID;
 CREATE TABLE IF NOT EXISTS spectrum (
     ap_mac TEXT NOT NULL, radio TEXT NOT NULL, channel INTEGER NOT NULL, width INTEGER, utilization INTEGER,
     interference INTEGER, other_bss_count INTEGER, ts INTEGER NOT NULL, PRIMARY KEY (ap_mac, radio, channel)) WITHOUT ROWID;
