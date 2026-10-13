@@ -223,14 +223,12 @@ export function TopTalkers() {
       <TopList
         title="Clients"
         link="clients"
-        items={t.data.clients
-          .slice(0, 15)
-          .map((c) => ({
-            mac: c.mac,
-            name: c.name,
-            sub: c.vendor,
-            total: total(c),
-          }))}
+        items={t.data.clients.slice(0, 15).map((c) => ({
+          mac: c.mac,
+          name: c.name,
+          sub: c.vendor,
+          total: total(c),
+        }))}
       />
     </div>
   );
@@ -500,79 +498,87 @@ export function MulticastPanel({
           </button>
         </div>
       </div>
-      <Chart
-        title={`Packets per second by type, ${dir === "tx" ? "delivered to clients" : "sent by clients"}`}
-        ts={m.data.ts}
-        height={160}
-        min={0}
-        format={(v) => `${v.toFixed(v < 10 ? 1 : 0)}/s`}
-        series={kinds.map(([k, v]) => ({
-          label: MCAST_LABEL[k] ?? k,
-          values: v[`${dir}_pps`],
-          color: MCAST_COLORS[k] ?? COLORS.teal,
-        }))}
-      />
-      <div className="mcast-types small">
-        {kinds.map(([k, v]) => (
-          <span key={k}>
-            <i
-              className="swatch"
-              style={{
-                background: MCAST_COLORS[k] ?? COLORS.teal,
-                borderColor: MCAST_COLORS[k] ?? COLORS.teal,
-              }}
-            />{" "}
-            {MCAST_LABEL[k] ?? k} <b>{count(v[`${dir}_pkts`])}</b>
-          </span>
-        ))}
-      </div>
-      {m.data.clients.length > 0 && (
-        <table className="table">
-          <thead>
-            <tr>
-              <th>Client</th>
-              <th>Sent</th>
-              <th>Received</th>
-              <th>Services</th>
-              <th>Delivery</th>
-            </tr>
-          </thead>
-          <tbody>
-            {m.data.clients.slice(0, 10).map((c) => (
-              <tr key={c.mac}>
-                <td>
-                  <Link to={`/clients/${c.mac}`}>{c.name ?? c.mac}</Link>
-                  <div className="muted small">
-                    {[c.vendor, !mac && c.ap].filter(Boolean).join(" · ")}
-                  </div>
-                </td>
-                <td className="nowrap">{count(c.rx_pkts)} pkts</td>
-                <td className="nowrap">{count(c.tx_pkts)} pkts</td>
-                <td className="small">
-                  {c.services.length
-                    ? serviceNames(c.services).slice(0, 3).join(", ")
-                    : "—"}
-                </td>
-                <td
-                  className="small"
-                  title={
-                    c.delivery === "flooding"
-                      ? "Joined groups are flooded to every client"
-                      : c.delivery === "optimized"
-                        ? "Only sent to clients that joined"
-                        : undefined
-                  }
-                >
-                  {c.delivery ?? "—"}
-                  {c.memberships > 0 && (
-                    <span className="muted"> · {c.memberships} groups</span>
-                  )}
-                </td>
-              </tr>
+      <div className="mcast-layout">
+        <div>
+          <Chart
+            title={`Packets per second by type, ${dir === "tx" ? "delivered to clients" : "sent by clients"}`}
+            ts={m.data.ts}
+            height={160}
+            min={0}
+            format={(v) => `${v.toFixed(v < 10 ? 1 : 0)}/s`}
+            series={kinds.map(([k, v]) => ({
+              label: MCAST_LABEL[k] ?? k,
+              values: v[`${dir}_pps`],
+              color: MCAST_COLORS[k] ?? COLORS.teal,
+            }))}
+          />
+          <div className="mcast-types small">
+            {kinds.map(([k, v]) => (
+              <span key={k}>
+                <i
+                  className="swatch"
+                  style={{
+                    background: MCAST_COLORS[k] ?? COLORS.teal,
+                    borderColor: MCAST_COLORS[k] ?? COLORS.teal,
+                  }}
+                />{" "}
+                {MCAST_LABEL[k] ?? k} <b>{count(v[`${dir}_pkts`])}</b>
+              </span>
             ))}
-          </tbody>
-        </table>
-      )}
+          </div>
+        </div>
+        {m.data.clients.length > 0 && (
+          <table className="table mcast-clients">
+            <thead>
+              <tr>
+                <th>Client</th>
+                <th title="Multicast and broadcast packets the client sent">
+                  Sent
+                </th>
+                <th title="Multicast and broadcast packets its network delivered while it was connected">
+                  Received
+                </th>
+                <th>Services</th>
+                <th>Delivery</th>
+              </tr>
+            </thead>
+            <tbody>
+              {m.data.clients.slice(0, 8).map((c) => (
+                <tr key={c.mac}>
+                  <td>
+                    <Link to={`/clients/${c.mac}`}>{c.name ?? c.mac}</Link>
+                    <div className="muted small">
+                      {[c.vendor, !mac && c.ap].filter(Boolean).join(" · ")}
+                    </div>
+                  </td>
+                  <td className="nowrap">{count(c.rx_pkts)} pkts</td>
+                  <td className="nowrap">{count(c.tx_pkts)} pkts</td>
+                  <td className="small">
+                    {c.services.length
+                      ? serviceNames(c.services).slice(0, 3).join(", ")
+                      : "—"}
+                  </td>
+                  <td
+                    className="small"
+                    title={
+                      c.delivery === "flooding"
+                        ? "Joined groups are flooded to every client"
+                        : c.delivery === "optimized"
+                          ? "Only sent to clients that joined"
+                          : undefined
+                    }
+                  >
+                    {c.delivery ?? "—"}
+                    {c.memberships > 0 && (
+                      <span className="muted"> · {c.memberships} groups</span>
+                    )}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        )}
+      </div>
     </div>
   );
 }

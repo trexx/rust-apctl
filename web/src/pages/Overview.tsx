@@ -73,15 +73,15 @@ export function Overview() {
       <ThreatBanner />
       <h2>Activity</h2>
       <SiteActivity />
-      <div className="grid2">
+      <div className="grid2 align-top">
         <TopTalkers />
         <div className="stack">
           <RetryBuckets />
           <Connectivity />
+          <DeploymentDensity />
         </div>
       </div>
-      <div className="grid2 align-top">
-        <DeploymentDensity />
+      <div className="grid1">
         <SiteMulticast />
       </div>
 

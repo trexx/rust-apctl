@@ -1034,3 +1034,28 @@ td.warn {
 .grid2.align-top {
   align-items: start;
 }
+
+.event-what {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+.event-subject {
+  font-weight: 500;
+}
+.event-detail {
+  color: var(--text-muted);
+  font-size: 12px;
+}
+
+.mcast-layout {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  gap: 16px;
+  align-items: start;
+}
+@media (max-width: 1000px) {
+  .mcast-layout {
+    grid-template-columns: 1fr;
+  }
+}

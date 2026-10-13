@@ -157,11 +157,18 @@ function describe(e: AppEvent, names: DeviceNames): React.ReactNode {
   const d = (e.data ?? {}) as Record<string, any>;
   switch (e.kind) {
     case "client_connected":
-      return `to ${d.essid ?? "?"} on ${band(d.radio)} ch ${d.channel ?? "?"}, ${d.signal ?? "?"} dBm${d.new ? " (first time)" : ""}`;
+      return [
+        d.essid,
+        `${band(d.radio)} channel ${d.channel ?? "?"}`,
+        d.signal !== undefined && d.signal !== null ? `${d.signal} dBm` : null,
+        d.new ? "first time seen" : null,
+      ]
+        .filter(Boolean)
+        .join(" · ");
     case "client_disconnected":
       return `${d.reason === "ap_offline" ? "AP went offline" : "no longer seen"}${d.connected_for ? ` after ${duration(d.connected_for)}` : ""}${d.last_signal ? `, last ${d.last_signal} dBm` : ""}`;
     case "client_roamed":
-      return `${names.get(d.from?.ap) ?? "?"} ${band(d.from?.radio)} (${d.from?.signal ?? "?"} dBm) → ${names.get(d.to?.ap) ?? "?"} ${band(d.to?.radio)} (${d.to?.signal ?? "?"} dBm)`;
+      return `from ${names.get(d.from?.ap) ?? "?"} (${band(d.from?.radio)}, ${d.from?.signal ?? "?"} dBm) to ${names.get(d.to?.ap) ?? "?"} (${band(d.to?.radio)}, ${d.to?.signal ?? "?"} dBm)`;
     case "radio_changed":
       return `${band(d.radio)}: ch ${d.from?.channel}/${d.from?.bw} MHz/${d.from?.tx_power} dBm → ch ${d.to?.channel}/${d.to?.bw} MHz/${d.to?.tx_power} dBm`;
     case "config_pushed": {
@@ -186,9 +193,7 @@ function describe(e: AppEvent, names: DeviceNames): React.ReactNode {
     case "dfs_radar":
       return d.channel ? `channel ${d.channel}` : "";
     case "network_threat":
-      return [d.essid ? `"${d.essid}"` : "hidden network", d.detail]
-        .filter(Boolean)
-        .join(" · ");
+      return d.detail ?? "";
     case "rogue_ap":
       return [
         d.essid,
@@ -252,27 +257,38 @@ export function EventList({
           <span className="event-time">{clock(e.ts)}</span>
           <span className="event-kind">{EVENT_LABELS[e.kind] ?? e.kind}</span>
           <span className="event-what">
-            {e.client_mac && (
-              <>
-                {clientNames?.get(e.client_mac) ? (
-                  <Link to={`/clients/${e.client_mac}`}>
-                    {clientNames.get(e.client_mac)}
-                  </Link>
-                ) : (
-                  <Link to={`/clients/${e.client_mac}`} className="mono">
-                    {e.client_mac}
-                  </Link>
-                )}{" "}
-              </>
-            )}
-            {showDevice &&
-              e.device_mac &&
-              !e.kind.startsWith("client_roamed") && (
+            <span className="event-subject">
+              {e.kind === "network_threat" && (
                 <>
-                  <DeviceLink mac={e.device_mac} names={names} />{" "}
+                  {(e.data as any)?.essid
+                    ? `"${(e.data as any).essid}"`
+                    : "Hidden network"}
+                  <span className="muted"> heard by </span>
                 </>
               )}
-            <span className="muted">{describe(e, names)}</span>
+              {e.client_mac && (
+                <Link
+                  to={`/clients/${e.client_mac}`}
+                  className={clientNames?.get(e.client_mac) ? "" : "mono"}
+                >
+                  {clientNames?.get(e.client_mac) ?? e.client_mac}
+                </Link>
+              )}
+              {showDevice &&
+                e.device_mac &&
+                !e.kind.startsWith("client_roamed") && (
+                  <>
+                    {e.client_mac && <span className="muted"> on </span>}
+                    <DeviceLink mac={e.device_mac} names={names} />
+                  </>
+                )}
+            </span>
+            {(() => {
+              const detail = describe(e, names);
+              return detail ? (
+                <span className="event-detail">{detail}</span>
+              ) : null;
+            })()}
             {e.kind === "config_pushed" &&
               typeof (e.data as any)?.system_cfg?.diff === "string" &&
               (e.data as any).system_cfg.diff && (
