@@ -71,6 +71,8 @@ const EVENT_LABELS: Record<string, string> = {
   client_disconnected: "Client disconnected",
   client_roamed: "Client roamed",
   client_renamed: "Client renamed",
+  dryrun_compared: "Dry run",
+  settings_imported: "Settings imported",
 };
 
 function eventTone(kind: string): string {
@@ -109,6 +111,11 @@ function describe(e: AppEvent, names: DeviceNames): React.ReactNode {
       return `uptime ${duration(d.uptime)}`;
     case "ap_seen":
       return [d.model, d.version, d.ip].filter(Boolean).join(" · ");
+    case "dryrun_compared":
+      if (d.error) return `generator error: ${d.error}`;
+      return d.matches ? "apctl would have pushed the identical config" : `differs: ${d.system_cfg?.added ?? 0} extra, ${d.system_cfg?.removed ?? 0} missing, ${d.system_cfg?.changed ?? 0} different lines`;
+    case "settings_imported":
+      return `${(d.wlans ?? []).length} SSIDs, ${(d.networks ?? []).length} networks`;
     case "client_renamed":
       return d.to ? `${d.from ? `"${d.from}" → ` : ""}"${d.to}"` : `alias "${d.from}" removed`;
     case "ap_firmware_changed":

@@ -254,6 +254,42 @@ export const useMe = () =>
 export const login = (username: string, password: string) => send<{ user: string }>("POST", "/api/login", { username, password });
 export const logout = () => send<{ ok: boolean }>("POST", "/api/logout", {});
 
+export interface StateSummary {
+  imported_at: number | null;
+  summary: { sites: number; wlans: string[]; networks: string[]; ap_groups: string[]; devices: number; clients: number; settings: number } | null;
+}
+
+export const useSettingsState = () => useQuery({ queryKey: ["settings-state"], queryFn: () => get<StateSummary>("/api/settings/state") });
+
+export const importState = (snapshot: unknown) => send<{ ok: boolean }>("POST", "/api/settings/state", snapshot);
+
+export interface FieldComparison {
+  expected_lines: number;
+  actual_lines: number;
+  identical: boolean;
+  same_content: boolean;
+  added: number;
+  removed: number;
+  changed: number;
+  diff: string;
+}
+
+export interface DryRun {
+  generator: boolean;
+  settings_imported_at: number | null;
+  devices: {
+    mac: Mac;
+    name: string | null;
+    status: "match" | "differs" | "error" | "no_generator" | "no_settings" | "no_config_seen";
+    comparison?: { mgmt_cfg: FieldComparison; system_cfg: FieldComparison };
+    against_redacted?: boolean;
+    error?: string;
+  }[];
+  history: { ts: number; mac: Mac; cfgversion: string | null; matches: boolean; comparison: { system_cfg?: FieldComparison; error?: string } | null }[];
+}
+
+export const useDryRun = () => useQuery({ queryKey: ["dryrun"], queryFn: () => get<DryRun>("/api/dryrun"), refetchInterval: 30_000 });
+
 export const useStatus = () => useQuery({ queryKey: ["status"], queryFn: () => get<Status>("/api/status"), refetchInterval: 15_000 });
 
 export const useDevices = () => useQuery({ queryKey: ["devices"], queryFn: () => get<DeviceSummary[]>("/api/devices") });
@@ -331,6 +367,10 @@ export function useLiveUpdates(): void {
             break;
           case "event":
             invalidate("events");
+            if (msg.kind === "dryrun_compared" || msg.kind === "settings_imported") {
+              invalidate("dryrun");
+              invalidate("settings-state");
+            }
             break;
           case "log":
             invalidate("logs");

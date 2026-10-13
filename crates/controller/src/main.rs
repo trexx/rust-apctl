@@ -5,6 +5,7 @@
 
 mod api;
 mod auth;
+mod dryrun;
 mod engine;
 mod model;
 mod shadow;
@@ -150,6 +151,11 @@ async fn serve(args: ServeArgs) -> Result<()> {
     // The engine owns all mutable state and processes inputs in order.
     let mut engine = Engine::new(writer.clone(), keys.clone(), live.clone(), live_tx.clone());
     engine.restore(&store)?;
+    // The config generator is plugged in here once available (dry run).
+    let renderer: Option<dryrun::RenderFn> = None;
+    if let Some(r) = &renderer {
+        engine.set_renderer(r.clone());
+    }
     let tick_tx = in_tx.clone();
     tokio::spawn(async move {
         let mut every = tokio::time::interval(Duration::from_secs(5));
@@ -176,7 +182,7 @@ async fn serve(args: ServeArgs) -> Result<()> {
         tracing::info!("login enabled for {} user(s)", users.len());
     }
     let auth = Arc::new(auth::Auth::new(users, &store, writer.clone())?);
-    let state = api::AppState { store, auth, engine: in_tx.clone(), live, tx: live_tx, started: store::now_ts(), source: source_desc };
+    let state = api::AppState { store, renderer, auth, engine: in_tx.clone(), live, tx: live_tx, started: store::now_ts(), source: source_desc };
     let app = api::router(state);
     let listener = tokio::net::TcpListener::bind(listen).await.with_context(|| format!("binding {listen}"))?;
     tracing::info!("web UI and API on http://{listen}");

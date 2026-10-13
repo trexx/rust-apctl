@@ -27,6 +27,8 @@ const DEFAULT_INTERVAL: Ts = 15;
 
 pub enum Input {
     Inform { ts: Ts, peer: String, decoded: Decoded },
+    /// Replace the imported controller settings (an `informdump import` snapshot).
+    SetState { ts: Ts, state: Value },
     /// Set or clear a client's alias and note (None clears). `only_if_unset`
     /// leaves existing aliases alone (for bulk imports).
     SetAlias { ts: Ts, mac: Mac, alias: Option<String>, note: Option<String>, only_if_unset: bool },
@@ -142,6 +144,17 @@ pub struct Live {
     /// APs known from the database before their first inform in this process.
     #[serde(skip)]
     pub known_devices: HashMap<Mac, KnownDevice>,
+    /// Imported controller settings (contain secrets: never serialised).
+    #[serde(skip)]
+    pub state: Option<Arc<Value>>,
+    #[serde(skip)]
+    pub state_imported_at: Option<Ts>,
+    /// Latest full inform per AP (capabilities and radios, for rendering).
+    #[serde(skip)]
+    pub raw_informs: HashMap<Mac, Arc<Value>>,
+    /// Last config pushed to each AP by the other controller, unredacted.
+    #[serde(skip)]
+    pub last_config: HashMap<Mac, (String, String, Option<String>)>,
 }
 
 /// What the database remembers about an AP from a previous run.
@@ -168,6 +181,7 @@ struct RadioTrack {
 pub struct Engine {
     writer: Writer,
     keys: Arc<KeyStore>,
+    renderer: Option<crate::dryrun::RenderFn>,
     live: SharedLive,
     tx: broadcast::Sender<LiveMsg>,
     /// Full (unredacted) last config per AP, for diffs. Only kept in memory.
@@ -179,13 +193,18 @@ pub struct Engine {
 
 impl Engine {
     pub fn new(writer: Writer, keys: Arc<KeyStore>, live: SharedLive, tx: broadcast::Sender<LiveMsg>) -> Self {
-        Engine { writer, keys, live, tx, configs: HashMap::new(), radios: HashMap::new() }
+        Engine { writer, keys, renderer: None, live, tx, configs: HashMap::new(), radios: HashMap::new() }
+    }
+
+    /// Enables dry-run comparisons of every captured config push.
+    pub fn set_renderer(&mut self, renderer: crate::dryrun::RenderFn) {
+        self.renderer = Some(renderer);
     }
 
     /// Loads APs and clients remembered from previous runs, so a restart does
     /// not report every client as newly connected.
     pub fn restore(&mut self, store: &store::Store) -> anyhow::Result<()> {
-        let (devices, clients, aliases) = store.read(Db::Config, |c| {
+        let (devices, clients, aliases, state) = store.read(Db::Config, |c| {
             let mut stmt = c.prepare("SELECT mac, first_seen, last_seen, uptime, version, hash_id, ip FROM devices")?;
             let devices = stmt
                 .query_map([], |r| {
@@ -208,11 +227,14 @@ impl Engine {
                     ))
                 })?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
+            let state: Option<(String, i64)> = c
+                .query_row("SELECT json, imported_at FROM controller_state WHERE id = 1", [], |r| Ok((r.get(0)?, r.get(1)?)))
+                .ok();
             let mut stmt = c.prepare("SELECT mac, alias, note FROM client_aliases")?;
             let aliases = stmt
                 .query_map([], |r| Ok((r.get::<_, String>(0)?, Alias { alias: r.get(1)?, note: r.get(2)? })))?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
-            Ok((devices, clients, aliases))
+            Ok((devices, clients, aliases, state))
         })?;
         let mut live = self.live.write().unwrap();
         for (mac, known, hash_id, ip) in devices {
@@ -230,6 +252,15 @@ impl Engine {
             let (Ok(mac), Some(Ok(ap_mac))) = (mac.parse::<Mac>(), ap_mac.map(|a| a.parse::<Mac>())) else { continue };
             let sample = ClientSample { mac, ap_mac, bssid: bssid.unwrap_or_default(), essid, radio, hostname, ip, ..Default::default() };
             live.clients.insert(mac, ClientView { sample, connected, first_seen: first_seen.unwrap_or(0), last_seen: last_seen.unwrap_or(0) });
+        }
+        if let Some((json, at)) = state {
+            match serde_json::from_str::<Value>(&json) {
+                Ok(v) => {
+                    live.state = Some(Arc::new(v));
+                    live.state_imported_at = Some(at);
+                }
+                Err(e) => tracing::warn!("stored controller settings are unreadable: {e}"),
+            }
         }
         for (mac, alias) in aliases {
             if let Ok(mac) = mac.parse::<Mac>() {
@@ -252,6 +283,7 @@ impl Engine {
             Input::Tick(now) => self.tick(now),
             Input::DecodeError => self.live.write().unwrap().counters.decode_errors += 1,
             Input::SetAlias { ts, mac, alias, note, only_if_unset } => self.set_alias(ts, mac, alias, note, only_if_unset),
+            Input::SetState { ts, state } => self.set_state(ts, state),
         }
     }
 
@@ -282,6 +314,9 @@ impl Engine {
         };
         let mac = snap.ap.mac;
         self.write_metrics(&snap);
+        if snap.has_vap_table {
+            self.live.write().unwrap().raw_informs.insert(mac, Arc::new(decoded.payload.clone()));
+        }
 
         let mut live = self.live.write().unwrap();
         live.counters.informs += 1;
@@ -509,7 +544,49 @@ impl Engine {
         if let Some(d) = live.devices.get_mut(&mac) {
             d.last_config_push = Some(ts);
         }
+        let cfgversion = p["cfgversion"].as_str().map(str::to_string);
+        let (mgmt, system) = (p["mgmt_cfg"].as_str().unwrap_or("").to_string(), p["system_cfg"].as_str().unwrap_or("").to_string());
+        live.last_config.insert(mac, (mgmt.clone(), system.clone(), cfgversion.clone()));
         self.emit(&mut live, ev(ts, "config_pushed", Some(mac), None, Value::Object(data)));
+
+        // Dry run: what would apctl have pushed for the same AP at this moment?
+        if let (Some(render), Some(state)) = (&self.renderer, live.state.clone()) {
+            let inform = live.raw_informs.get(&mac).cloned();
+            let req = crate::dryrun::RenderRequest {
+                state: &state,
+                device_mac: &mac.to_string(),
+                inform: inform.as_deref(),
+                cfgversion: cfgversion.as_deref().unwrap_or(""),
+            };
+            let result = render(&req).map(|ours| crate::dryrun::compare(&ours, &mgmt, &system, false));
+            let (matches, payload) = match &result {
+                Ok(c) => (c.matches(), serde_json::to_value(c).unwrap_or_default()),
+                Err(e) => (false, json!({ "error": format!("{e:#}") })),
+            };
+            self.writer.exec(
+                Db::Config,
+                "INSERT INTO dryrun_results (ts, mac, cfgversion, matches, comparison) VALUES (?1, ?2, ?3, ?4, ?5)",
+                vec![Sql::Integer(ts), Sql::Text(mac.to_string()), opt_text(cfgversion), Sql::Integer(matches as i64), Sql::Text(payload.to_string())],
+            );
+            let summary = match &result {
+                Ok(c) => json!({ "matches": matches, "system_cfg": { "added": c.system_cfg.added, "removed": c.system_cfg.removed, "changed": c.system_cfg.changed, "same_content": c.system_cfg.same_content } }),
+                Err(e) => json!({ "matches": false, "error": format!("{e:#}") }),
+            };
+            self.emit(&mut live, ev(ts, "dryrun_compared", Some(mac), None, summary));
+        }
+    }
+
+    fn set_state(&mut self, ts: Ts, state: Value) {
+        self.writer.exec(
+            Db::Config,
+            "INSERT OR REPLACE INTO controller_state (id, json, imported_at) VALUES (1, ?1, ?2)",
+            vec![Sql::Text(state.to_string()), Sql::Integer(ts)],
+        );
+        let summary = crate::dryrun::summarize_state(&state);
+        let mut live = self.live.write().unwrap();
+        live.state = Some(Arc::new(state));
+        live.state_imported_at = Some(ts);
+        self.emit(&mut live, ev(ts, "settings_imported", None, None, summary));
     }
 
     fn set_alias(&mut self, ts: Ts, mac: Mac, alias: Option<String>, note: Option<String>, only_if_unset: bool) {
@@ -941,6 +1018,32 @@ mod tests {
             .collect();
         assert_eq!(applied.len(), 1, "{applied:?}");
         assert_eq!(applied[0].data["seconds"], 34, "from the first burst (10) to the final return (44)");
+    }
+
+    #[test]
+    fn dry_run_compares_each_push_with_the_generator() {
+        let mut h = harness();
+        let mac: Mac = AP1.parse().unwrap();
+        let push = |cfg: &str| decoded(json!({ "_type": "setparam", "cfgversion": "abc", "system_cfg": cfg, "mgmt_cfg": "cfgversion=abc" }));
+        // A stand-in generator that renders "hide_ssid=false" and a fixed PSK.
+        let render: crate::dryrun::RenderFn = Arc::new(|req: &crate::dryrun::RenderRequest| {
+            assert_eq!(req.cfgversion, "abc", "rendered for the pushed cfgversion");
+            assert!(req.state["wlanconf"].is_array());
+            Ok((format!("cfgversion={}", req.cfgversion), "aaa.1.hide_ssid=false\naaa.1.wpa.psk=pw".to_string()))
+        });
+        h.engine.set_renderer(render);
+        // No settings imported yet: no comparison.
+        h.engine.handle(Input::Reply { ts: 1, mac, decoded: push("aaa.1.hide_ssid=false\naaa.1.wpa.psk=pw") });
+        h.engine.handle(Input::SetState { ts: 2, state: json!({ "sites": [], "wlanconf": [], "networkconf": [], "setting": [], "devices": [] }) });
+        h.engine.handle(Input::Reply { ts: 3, mac, decoded: push("aaa.1.hide_ssid=false\naaa.1.wpa.psk=pw") });
+        h.engine.handle(Input::Reply { ts: 4, mac, decoded: push("aaa.1.hide_ssid=true\naaa.1.wpa.psk=pw") });
+        let results: Vec<_> = std::iter::from_fn(|| h.rx.try_recv().ok())
+            .filter_map(|m| match m { LiveMsg::Event(e) if e.kind == "dryrun_compared" => Some(e.data), _ => None })
+            .collect();
+        assert_eq!(results.len(), 2, "{results:?}");
+        assert_eq!(results[0]["matches"], true);
+        assert_eq!(results[1]["matches"], false);
+        assert_eq!(results[1]["system_cfg"]["changed"], 1);
     }
 
     #[test]

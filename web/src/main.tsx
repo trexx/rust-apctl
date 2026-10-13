@@ -12,6 +12,8 @@ import { Clients } from "./pages/Clients";
 import { Client } from "./pages/Client";
 import { Events } from "./pages/Events";
 import { Logs } from "./pages/Logs";
+import { DryRunPage } from "./pages/DryRun";
+import { Settings } from "./pages/Settings";
 import "./styles.css";
 
 const queryClient = new QueryClient({
@@ -105,6 +107,8 @@ function Shell({ user, readOnly }: { user: string | null; readOnly: boolean }) {
           <NavLink to="/clients">Clients</NavLink>
           <NavLink to="/events">Events</NavLink>
           <NavLink to="/logs">Logs</NavLink>
+          <NavLink to="/dryrun">Dry run</NavLink>
+          <NavLink to="/settings">Settings</NavLink>
         </nav>
         <span className="spacer" />
         {status.data && (
@@ -143,6 +147,8 @@ function Shell({ user, readOnly }: { user: string | null; readOnly: boolean }) {
           <Route path="/clients/:mac" element={<Client />} />
           <Route path="/events" element={<Events />} />
           <Route path="/logs" element={<Logs />} />
+          <Route path="/dryrun" element={<DryRunPage />} />
+          <Route path="/settings" element={<Settings />} />
           <Route path="*" element={<div className="pad muted">Page not found</div>} />
         </Routes>
         </ErrorBoundary>

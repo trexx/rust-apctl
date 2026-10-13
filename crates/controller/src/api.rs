@@ -23,6 +23,8 @@ use crate::store::{self, Db, Store};
 #[derive(Clone)]
 pub struct AppState {
     pub store: Arc<Store>,
+    /// The config generator, when available (for on-demand dry runs).
+    pub renderer: Option<crate::dryrun::RenderFn>,
     pub auth: crate::auth::SharedAuth,
     /// Commands for the engine (e.g. setting aliases).
     pub engine: tokio::sync::mpsc::Sender<crate::engine::Input>,
@@ -47,6 +49,11 @@ pub fn router(state: AppState) -> Router {
         .route("/api/clients/{mac}", get(client))
         .route("/api/clients/{mac}/alias", axum::routing::put(set_alias))
         .route("/api/clients/aliases", axum::routing::post(import_aliases))
+        .route(
+            "/api/settings/state",
+            get(state_summary).post(import_state).layer(axum::extract::DefaultBodyLimit::max(8 << 20)),
+        )
+        .route("/api/dryrun", get(dryrun))
         .route("/api/series/{table}", get(series))
         .route("/api/events", get(events))
         .route("/api/logs", get(logs))
@@ -205,6 +212,105 @@ async fn client(State(s): State<AppState>, Path(mac): Path<String>) -> ApiResult
         Some(v) => Ok(Json(v)),
         None => Err(ApiError(StatusCode::NOT_FOUND, "unknown client".into())),
     }
+}
+
+async fn state_summary(State(s): State<AppState>) -> ApiResult {
+    let live = s.live.read().unwrap();
+    Ok(Json(json!({
+        "imported_at": live.state_imported_at,
+        "summary": live.state.as_deref().map(crate::dryrun::summarize_state),
+    })))
+}
+
+/// Replaces the imported controller settings with an `informdump import` snapshot.
+async fn import_state(State(s): State<AppState>, headers: axum::http::HeaderMap, Json(state): Json<Value>) -> ApiResult {
+    check_csrf(&headers)?;
+    crate::dryrun::validate_state(&state).map_err(|e| bad(format!("{e:#}")))?;
+    let summary = crate::dryrun::summarize_state(&state);
+    s.engine
+        .send(crate::engine::Input::SetState { ts: store::now_ts(), state })
+        .await
+        .map_err(|_| ApiError(StatusCode::SERVICE_UNAVAILABLE, "engine stopped".into()))?;
+    Ok(Json(json!({ "ok": true, "summary": summary })))
+}
+
+/// Dry-run status: for each AP, what apctl would push now compared with the last
+/// config the other controller pushed; plus the comparisons made at each push.
+async fn dryrun(State(s): State<AppState>) -> ApiResult {
+    // Redacted last configs from the database, for APs not pushed to since start.
+    let stored: BTreeMap<String, (String, String, Option<String>)> = read(&s.store, Db::Config, |c| {
+        let mut stmt = c.prepare("SELECT mac, mgmt_cfg, system_cfg, cfgversion FROM device_config")?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    (r.get::<_, Option<String>>(1)?.unwrap_or_default(), r.get::<_, Option<String>>(2)?.unwrap_or_default(), r.get(3)?),
+                ))
+            })?
+            .collect::<rusqlite::Result<BTreeMap<_, _>>>()?;
+        Ok(rows)
+    })
+    .await?;
+    let history: Vec<Value> = read(&s.store, Db::Config, |c| {
+        let mut stmt = c.prepare("SELECT ts, mac, cfgversion, matches, comparison FROM dryrun_results ORDER BY ts DESC LIMIT 100")?;
+        let rows = stmt
+            .query_map([], |r| {
+                let comparison: String = r.get(4)?;
+                Ok(json!({
+                    "ts": r.get::<_, i64>(0)?, "mac": r.get::<_, String>(1)?, "cfgversion": r.get::<_, Option<String>>(2)?,
+                    "matches": r.get::<_, i64>(3)? != 0,
+                    "comparison": serde_json::from_str::<Value>(&comparison).unwrap_or(Value::Null),
+                }))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    })
+    .await?;
+
+    let live = s.live.read().unwrap();
+    let mut devices = Vec::new();
+    for (mac, d) in &live.devices {
+        let name = d.snapshot.ap.hostname.clone();
+        let entry = |status: &str, extra: Value| {
+            let mut v = json!({ "mac": mac, "name": name, "status": status });
+            if let Value::Object(m) = extra {
+                v.as_object_mut().unwrap().extend(m);
+            }
+            v
+        };
+        let (Some(render), Some(state)) = (&s.renderer, live.state.as_deref()) else {
+            devices.push(entry(if s.renderer.is_none() { "no_generator" } else { "no_settings" }, json!({})));
+            continue;
+        };
+        // Prefer the unredacted config seen in this run; fall back to the stored redacted copy.
+        let (actual, redacted) = match (live.last_config.get(mac), stored.get(&mac.to_string())) {
+            (Some(c), _) => (c.clone(), false),
+            (None, Some(c)) => (c.clone(), true),
+            (None, None) => {
+                devices.push(entry("no_config_seen", json!({})));
+                continue;
+            }
+        };
+        let req = crate::dryrun::RenderRequest {
+            state,
+            device_mac: &mac.to_string(),
+            inform: live.raw_informs.get(mac).map(|v| v.as_ref()),
+            cfgversion: actual.2.as_deref().unwrap_or(""),
+        };
+        match render(&req) {
+            Ok(ours) => {
+                let c = crate::dryrun::compare(&ours, &actual.0, &actual.1, redacted);
+                devices.push(entry(if c.matches() { "match" } else { "differs" }, json!({ "comparison": c, "against_redacted": redacted })));
+            }
+            Err(e) => devices.push(entry("error", json!({ "error": format!("{e:#}") }))),
+        }
+    }
+    Ok(Json(json!({
+        "generator": s.renderer.is_some(),
+        "settings_imported_at": live.state_imported_at,
+        "devices": devices,
+        "history": history,
+    })))
 }
 
 /// Mutations must carry this header. Browsers cannot add custom headers to

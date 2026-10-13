@@ -613,3 +613,24 @@ input.search {
   min-width: 0;
   width: 100%;
 }
+
+.ok {
+  color: var(--good);
+}
+.kv-wide {
+  grid-template-columns: 130px 1fr;
+}
+.import {
+  margin-top: 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  align-items: flex-start;
+}
+.import code {
+  font-size: 12px;
+}
+.dr-field {
+  font-size: 13px;
+  margin-top: 6px;
+}
