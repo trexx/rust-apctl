@@ -40,6 +40,19 @@ enum Cmd {
     Serve(Box<ServeArgs>),
     /// Read a password from stdin and print its Argon2id hash for the users file.
     HashPassword,
+    /// Print the config apctl would generate for one AP (for debugging the generator).
+    DebugRender {
+        /// Settings snapshot (`informdump import` output).
+        #[arg(long)]
+        state: PathBuf,
+        /// The AP's latest inform payload as JSON (e.g. from `informdump pcap --save`).
+        #[arg(long)]
+        inform: PathBuf,
+        #[arg(long)]
+        mac: String,
+        #[arg(long, default_value = "0000000000000000")]
+        cfgversion: String,
+    },
     /// Decode AP syslog datagrams in a pcap file by trying each known syslog key.
     DebugSyslog {
         pcap: String,
@@ -107,6 +120,15 @@ async fn main() -> Result<()> {
             Ok(())
         }
         Cmd::DebugSyslog { pcap, keys, port } => debug_syslog(&pcap, &keys, port),
+        Cmd::DebugRender { state, inform, mac, cfgversion } => {
+            let state: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&state)?)?;
+            let inform: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&inform)?)?;
+            let render = dryrun::apcfg_renderer("10.6.106".into());
+            let req = dryrun::RenderRequest { state: &state, device_mac: &mac, inform: Some(&inform), cfgversion: &cfgversion, previous_system_cfg: None };
+            let (mgmt, system) = render(&req)?;
+            println!("# mgmt_cfg\n{mgmt}\n# system_cfg\n{system}");
+            Ok(())
+        }
     }
 }
 
