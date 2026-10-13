@@ -9,6 +9,8 @@ mod alerts;
 mod api;
 mod auth;
 mod backup;
+mod channelai;
+mod clock;
 mod connections;
 mod dryrun;
 mod engine;
@@ -289,6 +291,7 @@ async fn serve(args: ServeArgs) -> Result<()> {
     backup::schedule(backups.clone(), store.clone());
     firmware::schedule(writer.clone());
     let state = api::AppState { backups: Some(backups), active, writer: Some(writer.clone()), store, vendors: Arc::new(vendors), renderer, auth, engine: in_tx.clone(), live, tx: live_tx, started: store::now_ts(), source: source_desc };
+    channelai::schedule(state.clone());
     let app = api::router(state);
     let listener = tokio::net::TcpListener::bind(listen).await.with_context(|| format!("binding {listen}"))?;
     tracing::info!("web UI and API on http://{listen}");

@@ -27,7 +27,7 @@ pub type Apply = fn(&mut Value, &Value) -> Result<String, String>;
 
 /// Previews or saves `apply(state, body)`. `apply` validates, edits, and
 /// returns what changed in words (for the event and the config history).
-async fn change(s: &AppState, headers: &HeaderMap, q: &PreviewQuery, apply: Apply, body: Value) -> Result<Json<Value>, ApiError> {
+pub(crate) async fn change(s: &AppState, headers: &HeaderMap, q: &PreviewQuery, apply: Apply, body: Value) -> Result<Json<Value>, ApiError> {
     crate::api::check_csrf(headers)?;
     let current = s.live.read().unwrap().state.clone().ok_or_else(|| ApiError(StatusCode::CONFLICT, "no settings imported yet".into()))?;
     let mut edited = (*current).clone();
@@ -95,7 +95,7 @@ pub fn site_id(state: &Value) -> Option<String> {
     state["devices"].as_array()?.iter().find_map(|d| d["site_id"].as_str().map(str::to_string))
 }
 
-fn docs<'a>(state: &'a Value, collection: &str) -> impl Iterator<Item = &'a Value> {
+pub(crate) fn docs<'a>(state: &'a Value, collection: &str) -> impl Iterator<Item = &'a Value> {
     let site = site_id(state);
     state[collection].as_array().into_iter().flatten().filter(move |d| site.is_none() || d["site_id"].as_str().is_none_or(|s| Some(s) == site.as_deref()))
 }
@@ -203,7 +203,7 @@ const ETSI: &[i64] = &[
 const FCC: &[i64] = &[840, 124];
 
 /// The site's country (ISO 3166 numeric), from the `country` setting.
-fn country(state: &Value) -> Option<i64> {
+pub(crate) fn country(state: &Value) -> Option<i64> {
     let c = docs(state, "setting").find(|s| s["key"].as_str() == Some("country"))?;
     c["code"].as_i64().or_else(|| c["code"].as_str()?.parse().ok())
 }
@@ -243,7 +243,7 @@ pub fn legal_channels(country: Option<i64>, band: &str, width: i64, outdoor: boo
 }
 
 /// Whether outdoor channel rules apply to an AP (its own override, else the site's).
-fn outdoor(state: &Value, d: &Value) -> bool {
+pub(crate) fn outdoor(state: &Value, d: &Value) -> bool {
     match d["outdoor_mode_override"].as_str() {
         Some("on") => true,
         Some("off") => false,
@@ -271,7 +271,7 @@ fn new_id() -> String {
     hex::encode(b)
 }
 
-fn is_mac(s: &str) -> bool {
+pub(crate) fn is_mac(s: &str) -> bool {
     s.parse::<inform::Mac>().is_ok()
 }
 

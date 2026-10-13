@@ -487,10 +487,14 @@ export interface PlanEntry {
   current_channel: number | null;
   current_score: number | null;
   current_reasons: string[] | null;
-  suggested_channel: number;
-  suggested_score: number;
+  suggested_channel: number | null;
+  suggested_score: number | null;
   suggested_reasons: string[];
   change: boolean;
+  /** Kept as is: excluded, on a wireless uplink, or being upgraded. */
+  pinned?: boolean;
+  /** Its channel is not one Channel AI may use, so it moves regardless. */
+  not_allowed?: boolean;
 }
 
 export interface ThreatFinding {
@@ -838,7 +842,7 @@ export const useNeighbors = (range: number, band: string) =>
 export const useChannelPlan = (band: string, dfs: boolean) =>
   useQuery({
     queryKey: ["rf-plan", band, dfs],
-    queryFn: () => get<{ band: string; dfs: boolean; plan: PlanEntry[] }>(`/api/rf/channel-plan${qs({ band, dfs: dfs ? "true" : undefined })}`),
+    queryFn: () => get<ChannelPlanResult>(`/api/rf/channel-plan${qs({ band, dfs: dfs ? "true" : undefined })}`),
   });
 
 export const useStatus = () => useQuery({ queryKey: ["status"], queryFn: () => get<Status>("/api/status"), refetchInterval: 15_000 });
@@ -1041,3 +1045,35 @@ export function changeSettings<T>(target: SettingsTarget, patch: Record<string, 
   if (target.id === null) return send<T>("POST", `/api/settings/wlans${q}`, { patch });
   return send<T>("PUT", `/api/settings/wlans/${target.id}${q}`, { patch });
 }
+
+// ---- Channel AI ----
+
+export interface ChannelPlanResult {
+  band: string;
+  dfs: boolean;
+  /** The channels the plan could use (from the Channel AI settings); null: any. */
+  allowed: number[] | null;
+  plan: PlanEntry[];
+  current_total: number;
+  suggested_total: number;
+  /** The plan is worth applying (clearly better, or an AP must move). */
+  accepted: boolean;
+}
+
+export interface ChannelAiStatus {
+  active: boolean;
+  has_settings: boolean;
+  settings: { enabled: boolean; hour: number; minute: number; radios: string[]; dfs: boolean; exclude_devices: Mac[] };
+  timezone: string | null;
+  next_run: number | null;
+  running: boolean;
+  scans: { mac: Mac; band: string; started: number }[];
+  allowed: { ng: number[] | null; na: number[] | null };
+}
+
+export const useChannelAi = () => useQuery({ queryKey: ["channel-ai"], queryFn: () => get<ChannelAiStatus>("/api/rf/channel-ai"), refetchInterval: 5_000 });
+export const startScan = (band: string) => send<{ scanning: Mac[] }>("POST", "/api/rf/scan", { band });
+export const runChannelAi = (bands?: string[]) => send<{ started: boolean }>("POST", "/api/rf/channel-ai/run", { bands });
+export const applyChannelPlan = (band: string, changes: { mac: Mac; name: string | null; from: number | null; to: number | null }[]) =>
+  send<{ applied: number }>("POST", "/api/rf/channel-plan/apply", { band, changes });
+export const saveChannelAi = (patch: Record<string, unknown>) => send<{ saved: boolean; what: string }>("PUT", "/api/rf/channel-ai", { patch });

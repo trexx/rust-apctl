@@ -964,15 +964,45 @@ fn candidates(radio: &str, width: i64, dfs: bool, available: Option<&[i64]>) -> 
     out
 }
 
+/// Candidate blocks made only of `allowed` channels (every 20 MHz part of a
+/// wide block must be allowed), one per block.
+fn allowed_blocks(radio: &str, width: i64, allowed: &[i64]) -> Vec<Block> {
+    if radio == "ng" {
+        return allowed.iter().map(|c| block("ng", *c, 20)).collect();
+    }
+    let mut out: Vec<Block> = Vec::new();
+    for c in allowed {
+        let b = block(radio, *c, width);
+        let first = ((b.lo + 10.0 - 5000.0) / 5.0).round() as i64;
+        let parts: Vec<i64> = (0..(width / 20).max(1)).map(|i| first + 4 * i).collect();
+        if parts.iter().all(|p| allowed.contains(p)) && !out.iter().any(|o| (o.lo - b.lo).abs() < 1.0) {
+            out.push(block(radio, first, width));
+        }
+    }
+    out
+}
+
 /// GET /api/rf/channel-plan: a suggested channel per AP for one band, from
 /// the networks each AP hears, our APs' signal to each other, and measured
 /// interference. Suggestions only: nothing is applied.
 pub async fn channel_plan(State(s): State<AppState>, Query(q): Query<PlanQuery>) -> Result<Json<Value>, ApiError> {
     let radio = q.band.clone().unwrap_or_else(|| "na".into());
     let dfs = q.dfs.unwrap_or(false);
+    let (allowed, pinned) = {
+        let live = s.live.read().unwrap();
+        (crate::channelai::allowed(live.state.as_deref(), &radio, dfs), crate::channelai::pinned(&live))
+    };
+    Ok(Json(compute_plan(&s, radio, dfs, allowed, pinned).await?))
+}
+
+/// The channel plan for one band. `allowed` limits the channels (the Channel
+/// AI settings; `None`: every channel the AP or the band offers), `pinned`
+/// APs keep their channel. A plan only moves APs when it is clearly better
+/// overall (by more than 10%), or when an AP is on a channel no longer allowed.
+pub async fn compute_plan(s: &AppState, radio: String, dfs: bool, allowed: Option<Vec<i64>>, pinned: Vec<String>) -> Result<Value, ApiError> {
     let since = store::now_ts() - 7 * 86400;
     let r2 = radio.clone();
-    let (neigh, spectrum) = read(&s, Db::Config, move |c| {
+    let (neigh, spectrum) = read(s, Db::Config, move |c| {
         let mut stmt = c.prepare("SELECT ap_mac, bssid, essid, center_freq, bw, signal FROM neighbors WHERE radio = ?1 AND last_seen >= ?2")?;
         let n = stmt
             .query_map(rusqlite::params![r2, since], |r| {
@@ -1068,43 +1098,67 @@ pub async fn channel_plan(State(s): State<AppState>, Query(q): Query<PlanQuery>)
         reasons.sort_by(|a, b| b.0.total_cmp(&a.0));
         (total, reasons.into_iter().take(4).map(|r| r.1).collect())
     };
+    let cands = |ap: &Ap| match &allowed {
+        Some(a) => allowed_blocks(&radio, ap.width, a),
+        None => candidates(&radio, ap.width, dfs, ap.available.as_deref()),
+    };
+    let is_pinned = |ap: &Ap| pinned.contains(&ap.mac);
     // Greedy: busiest AP first, then a second pass with everyone placed.
-    let mut order: Vec<&Ap> = aps.iter().collect();
+    let mut order: Vec<&Ap> = aps.iter().filter(|a| !is_pinned(a)).collect();
     order.sort_by_key(|a| -a.clients);
-    let mut assigned: HashMap<String, Block> = aps.iter().filter_map(|a| a.current.map(|c| (a.mac.clone(), c))).collect();
+    let current: HashMap<String, Block> = aps.iter().filter_map(|a| a.current.map(|c| (a.mac.clone(), c))).collect();
+    let mut assigned = current.clone();
     for _ in 0..2 {
         for ap in &order {
-            let best = candidates(&radio, ap.width, dfs, ap.available.as_deref())
-                .into_iter()
-                .map(|b| (cost(ap, &b, &assigned).0, b))
-                .min_by(|a, b| a.0.total_cmp(&b.0));
+            let best = cands(ap).into_iter().map(|b| (cost(ap, &b, &assigned).0, b)).min_by(|a, b| a.0.total_cmp(&b.0));
             if let Some((_, b)) = best {
                 assigned.insert(ap.mac.clone(), b);
             }
         }
     }
+    let without = |m: &HashMap<String, Block>, mac: &str| -> HashMap<String, Block> { m.iter().filter(|(k, _)| k.as_str() != mac).map(|(k, b)| (k.clone(), *b)).collect() };
+    // Which APs move: on a channel no longer allowed, or clearly better off elsewhere.
+    let mut evict: HashMap<String, bool> = HashMap::new();
+    let mut fin = current.clone();
+    for ap in &aps {
+        let (Some(cur), Some(sug)) = (ap.current, assigned.get(&ap.mac).copied()) else { continue };
+        if is_pinned(ap) || cur.primary == sug.primary {
+            continue;
+        }
+        let ev = !cands(ap).iter().any(|b| (b.lo - cur.lo).abs() < 1.0 && (b.hi - cur.hi).abs() < 1.0);
+        let others = without(&assigned, &ap.mac);
+        if ev || cost(ap, &sug, &others).0 + 5.0 < cost(ap, &cur, &others).0 * 0.8 {
+            fin.insert(ap.mac.clone(), sug);
+            evict.insert(ap.mac.clone(), ev);
+        }
+    }
+    let total = |m: &HashMap<String, Block>| -> f64 { aps.iter().filter_map(|ap| m.get(&ap.mac).map(|b| cost(ap, b, &without(m, &ap.mac)).0)).sum() };
+    let (current_total, final_total) = (total(&current), total(&fin));
+    let accepted = evict.values().any(|e| *e) || (!evict.is_empty() && final_total * 1.1 < current_total);
+    if !accepted {
+        fin = current.clone();
+        evict.clear();
+    }
     let plan: Vec<Value> = aps
         .iter()
         .map(|ap| {
-            let others: HashMap<String, Block> = assigned.iter().filter(|(m, _)| *m != &ap.mac).map(|(m, b)| (m.clone(), *b)).collect();
-            let current = ap.current.map(|b| cost(ap, &b, &others));
-            let suggested = assigned[&ap.mac];
-            let (s_cost, s_reasons) = cost(ap, &suggested, &others);
-            let cur_cost = current.as_ref().map_or(f64::MAX, |c| c.0);
-            // Only worth a change when clearly better (avoid churn for small gains).
-            let change = ap.current.is_some_and(|c| c.primary != suggested.primary) && s_cost + 5.0 < cur_cost * 0.8;
+            let cur = ap.current.map(|b| cost(ap, &b, &without(&current, &ap.mac)));
+            let change = evict.contains_key(&ap.mac);
+            let sug = fin.get(&ap.mac).map(|b| (b.primary, cost(ap, b, &without(&fin, &ap.mac))));
             json!({
                 "mac": ap.mac, "name": ap.name, "width": ap.width, "clients": ap.clients,
-                "current_channel": ap.current.map(|c| c.primary), "current_score": current.as_ref().map(|c| c.0.round()),
-                "current_reasons": current.map(|c| c.1),
-                "suggested_channel": if change { suggested.primary } else { ap.current.map_or(suggested.primary, |c| c.primary) },
-                "suggested_score": if change { s_cost.round() } else { cur_cost.round() },
-                "suggested_reasons": if change { s_reasons } else { vec![] },
-                "change": change,
+                "current_channel": ap.current.map(|c| c.primary), "current_score": cur.as_ref().map(|c| c.0.round()),
+                "current_reasons": cur.map(|c| c.1),
+                "suggested_channel": sug.as_ref().map(|s| s.0), "suggested_score": sug.as_ref().map(|s| s.1.0.round()),
+                "suggested_reasons": if change { sug.map(|s| s.1.1).unwrap_or_default() } else { vec![] },
+                "change": change, "pinned": is_pinned(ap), "not_allowed": evict.get(&ap.mac).copied().unwrap_or(false),
             })
         })
         .collect();
-    Ok(Json(json!({ "band": radio, "dfs": dfs, "plan": plan })))
+    Ok(json!({
+        "band": radio, "dfs": dfs, "allowed": allowed, "plan": plan,
+        "current_total": current_total.round(), "suggested_total": final_total.round(), "accepted": accepted,
+    }))
 }
 
 #[cfg(test)]
@@ -1128,6 +1182,13 @@ mod tests {
         let eu = [36, 52, 100, 116];
         assert_eq!(candidates("na", 80, false, Some(&eu)).iter().map(|b| b.primary).collect::<Vec<_>>(), vec![36]);
         assert_eq!(candidates("na", 80, true, Some(&eu)).len(), 4);
+        // Allowed lists (Channel AI): a wide block needs every 20 MHz part allowed.
+        let low = [36, 40, 44, 48];
+        assert_eq!(allowed_blocks("na", 40, &low).iter().map(|b| b.primary).collect::<Vec<_>>(), vec![36, 44]);
+        assert_eq!(allowed_blocks("na", 80, &low).iter().map(|b| b.primary).collect::<Vec<_>>(), vec![36]);
+        assert!(allowed_blocks("na", 160, &low).is_empty(), "36-64 needs 52-64 too");
+        assert_eq!(allowed_blocks("na", 80, &[36, 40, 44]).len(), 0);
+        assert_eq!(allowed_blocks("ng", 20, &[1, 6, 11]).len(), 3);
     }
 
     #[test]

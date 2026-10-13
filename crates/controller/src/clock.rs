@@ -1,0 +1,141 @@
+//! Local time for schedules set in the site's time zone (e.g. the nightly
+//! channel optimisation at 05:00). The image has no zoneinfo, so the zone's
+//! POSIX rule (`apcfg::tz`, the same table the APs get) is evaluated here.
+
+use crate::model::Ts;
+
+/// Days since 1970-01-01 of a civil date.
+fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let doy = (153 * (m + if m > 2 { -3 } else { 9 }) + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146097 + doe - 719468
+}
+
+/// Civil date (year, month, day) of a day number.
+pub fn civil_from_days(z: i64) -> (i64, i64, i64) {
+    let z = z + 719468;
+    let era = z.div_euclid(146097);
+    let doe = z - era * 146097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    (if m <= 2 { yoe + era * 400 + 1 } else { yoe + era * 400 }, m, d)
+}
+
+fn days_in_month(y: i64, m: i64) -> i64 {
+    days_from_civil(if m == 12 { y + 1 } else { y }, if m == 12 { 1 } else { m + 1 }, 1) - days_from_civil(y, m, 1)
+}
+
+/// `[+-]hh[:mm[:ss]]` in seconds.
+fn hms(s: &str) -> Option<i64> {
+    let (sign, rest) = match s.as_bytes().first()? {
+        b'-' => (-1, &s[1..]),
+        b'+' => (1, &s[1..]),
+        _ => (1, s),
+    };
+    let mut total = 0;
+    for (i, part) in rest.split(':').enumerate() {
+        total += part.parse::<i64>().ok()? * [3600, 60, 1].get(i)?;
+    }
+    Some(sign * total)
+}
+
+/// Splits a zone name (`CET` or `<+03>`) off the front.
+fn name(s: &str) -> Option<(&str, &str)> {
+    if let Some(rest) = s.strip_prefix('<') {
+        let end = rest.find('>')?;
+        return Some((&rest[..end], &rest[end + 1..]));
+    }
+    let end = s.find(|c: char| !c.is_ascii_alphabetic()).unwrap_or(s.len());
+    (end >= 3).then(|| (&s[..end], &s[end..]))
+}
+
+/// Splits an offset off the front.
+fn offset(s: &str) -> (Option<i64>, &str) {
+    let end = s.find(|c: char| !(c.is_ascii_digit() || c == ':' || c == '+' || c == '-')).unwrap_or(s.len());
+    (hms(&s[..end]), &s[end..])
+}
+
+/// A `Mm.w.d[/time]` rule: seconds after local midnight of the change day,
+/// as a local day number and time.
+fn rule_day(rule: &str, year: i64) -> Option<(i64, i64)> {
+    let (date, time) = rule.split_once('/').map_or((rule, None), |(d, t)| (d, Some(t)));
+    let mut parts = date.strip_prefix('M')?.split('.').map(|p| p.parse::<i64>().ok());
+    let (m, w, d) = (parts.next()??, parts.next()??, parts.next()??);
+    let first = days_from_civil(year, m, 1);
+    let first_wd = (first + 4).rem_euclid(7); // 1970-01-01 was a Thursday
+    let mut day = 1 + (d - first_wd).rem_euclid(7) + (w - 1) * 7;
+    while day > days_in_month(year, m) {
+        day -= 7;
+    }
+    Some((first + day - 1, time.map_or(Some(7200), hms)?))
+}
+
+/// The UTC offset (seconds east) a POSIX TZ rule gives at a UTC time.
+pub fn utc_offset(tz: &str, at: Ts) -> Option<i64> {
+    let (_, rest) = name(tz)?;
+    let (std, rest) = offset(rest);
+    let std = -std?;
+    if rest.is_empty() {
+        return Some(std);
+    }
+    let (_, rest) = name(rest)?;
+    let (dst, rest) = offset(rest);
+    let dst = dst.map_or(std + 3600, |o| -o);
+    let mut rules = rest.strip_prefix(',')?.split(',');
+    let (start, end) = (rules.next()?, rules.next()?);
+    let year = civil_from_days((at + std).div_euclid(86400)).0;
+    // A change happens at local wall time: the start in standard time, the end in summer time.
+    let (sd, st) = rule_day(start, year)?;
+    let (ed, et) = rule_day(end, year)?;
+    let start_utc = sd * 86400 + st - std;
+    let end_utc = ed * 86400 + et - dst;
+    let summer = if start_utc < end_utc { at >= start_utc && at < end_utc } else { at >= start_utc || at < end_utc };
+    Some(if summer { dst } else { std })
+}
+
+/// Local (day number, minute of the day) at a UTC time in an Olson zone;
+/// unknown zones are treated as UTC.
+pub fn local(olson: Option<&str>, at: Ts) -> (i64, i64) {
+    let off = olson.and_then(apcfg::tz::posix).and_then(|tz| utc_offset(tz, at)).unwrap_or(0);
+    let t = at + off;
+    (t.div_euclid(86400), t.rem_euclid(86400) / 60)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ts(y: i64, m: i64, d: i64, h: i64, min: i64) -> Ts {
+        days_from_civil(y, m, d) * 86400 + h * 3600 + min * 60
+    }
+
+    #[test]
+    fn european_summer_time_starts_and_ends_on_the_right_sundays() {
+        let cet = apcfg::tz::posix("Europe/Berlin").unwrap();
+        // 2026: last Sunday of March (29th) and of October (25th), at 01:00 UTC.
+        assert_eq!(utc_offset(cet, ts(2026, 3, 29, 0, 59)), Some(3600));
+        assert_eq!(utc_offset(cet, ts(2026, 3, 29, 1, 0)), Some(7200));
+        assert_eq!(utc_offset(cet, ts(2026, 10, 25, 0, 59)), Some(7200));
+        assert_eq!(utc_offset(cet, ts(2026, 10, 25, 1, 0)), Some(3600));
+        assert_eq!(local(Some("Europe/Berlin"), ts(2026, 7, 1, 3, 0)).1, 5 * 60, "05:00 local in summer is 03:00 UTC");
+        assert_eq!(local(Some("Europe/Berlin"), ts(2026, 12, 1, 4, 0)).1, 5 * 60);
+    }
+
+    #[test]
+    fn other_hemispheres_and_plain_offsets() {
+        let us = apcfg::tz::posix("America/New_York").unwrap();
+        assert_eq!(utc_offset(us, ts(2026, 3, 8, 6, 59)), Some(-5 * 3600));
+        assert_eq!(utc_offset(us, ts(2026, 3, 8, 7, 0)), Some(-4 * 3600));
+        assert_eq!(utc_offset("AEST-10AEDT,M10.1.0,M4.1.0/3", ts(2026, 1, 15, 0, 0)), Some(11 * 3600), "summer in January");
+        assert_eq!(utc_offset("AEST-10AEDT,M10.1.0,M4.1.0/3", ts(2026, 6, 15, 0, 0)), Some(10 * 3600));
+        assert_eq!(utc_offset("<+0530>-5:30", 0), Some(5 * 3600 + 1800));
+        assert_eq!(local(Some("Nowhere/Unknown"), ts(2026, 1, 1, 5, 7)).1, 5 * 60 + 7);
+        assert_eq!(civil_from_days(days_from_civil(2024, 2, 29)), (2024, 2, 29));
+    }
+}

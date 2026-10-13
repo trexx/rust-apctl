@@ -145,6 +145,7 @@ const EVENT_LABELS: Record<string, string> = {
   dryrun_compared: "Dry run",
   settings_imported: "Settings imported",
   settings_changed: "Settings changed",
+  channel_plan: "Channel AI",
   ap_restart_requested: "Restart requested",
   ap_provision_requested: "Config re-send requested",
   client_reconnect_requested: "Reconnect requested",
@@ -310,6 +311,23 @@ function describe(e: AppEvent, names: DeviceNames): React.ReactNode {
       return `${(d.wlans ?? []).length} SSIDs, ${(d.networks ?? []).length} networks`;
     case "settings_changed":
       return String(d.what ?? "");
+    case "channel_plan": {
+      const band =
+        d.band === "ng" ? "2.4 GHz" : d.band === "na" ? "5 GHz" : d.band;
+      const moves = (d.changes ?? []) as {
+        name?: string;
+        mac: string;
+        from?: number;
+        to: number;
+      }[];
+      return `${band} (${d.trigger}): ${
+        moves.length === 0
+          ? "nothing to move"
+          : moves
+              .map((m) => `${m.name ?? m.mac} ${m.from ?? "?"} → ${m.to}`)
+              .join(", ")
+      }${moves.length > 0 && !d.applied ? " (not applied)" : ""}`;
+    }
     case "client_renamed":
       return d.to
         ? `${d.from ? `"${d.from}" → ` : ""}"${d.to}"`

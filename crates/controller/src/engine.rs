@@ -53,6 +53,8 @@ pub enum Input {
     Note { ts: Ts, kind: &'static str, mac: Mac, data: Value },
     /// Record a client event raised elsewhere (e.g. blocked from the UI).
     ClientNote { ts: Ts, kind: &'static str, client: Mac, data: Value },
+    /// Record a site-wide event raised elsewhere (e.g. a channel plan applied).
+    SiteNote { ts: Ts, kind: &'static str, data: Value },
     /// Change the settings (apctl's copy of the controller settings), store
     /// them, and record the change; `done` gets the result.
     EditState { ts: Ts, what: String, edit: StateEdit, done: tokio::sync::oneshot::Sender<Result<(), String>> },
@@ -174,6 +176,9 @@ pub struct Live {
     /// APs to send their config again on the next inform.
     #[serde(skip)]
     pub reprovision: std::collections::HashSet<Mac>,
+    /// Quick scans (RF environment) asked of each AP and not finished yet.
+    #[serde(skip)]
+    pub scans: HashMap<Mac, crate::channelai::Scan>,
     /// Last config pushed to each AP by the other controller, unredacted.
     #[serde(skip)]
     pub last_config: HashMap<Mac, (String, String, Option<String>)>,
@@ -338,6 +343,10 @@ impl Engine {
             Input::ClientNote { ts, kind, client, data } => {
                 let mut live = self.live.write().unwrap();
                 self.emit(&mut live, ev(ts, kind, None, Some(client), data));
+            }
+            Input::SiteNote { ts, kind, data } => {
+                let mut live = self.live.write().unwrap();
+                self.emit(&mut live, ev(ts, kind, None, None, data));
             }
             Input::EditState { ts, what, edit, done } => {
                 let _ = done.send(self.edit_state(ts, what, edit));

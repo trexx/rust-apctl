@@ -24,7 +24,7 @@ mod meta;
 mod mgmt;
 mod net;
 mod system;
-mod tz;
+pub mod tz;
 mod wlan;
 
 use anyhow::{Context, Result, bail};

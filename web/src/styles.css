@@ -1405,3 +1405,13 @@ input.search.num-input {
     gap: 4px;
   }
 }
+
+.plain-list {
+  list-style: none;
+  margin: 4px 0 0;
+  padding: 0;
+}
+
+.plain-list li {
+  padding: 2px 0;
+}

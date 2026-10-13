@@ -7,6 +7,7 @@ import { ApSpacing, BandPicker } from "../components/Insights";
 import { ThreatList } from "../components/Threats";
 import { RoamingView } from "../components/RoamingView";
 import { ErrorNote, Loading, Meter, Signal } from "../components/common";
+import { ChannelAiPanel, PlanActions } from "../components/ChannelAi";
 
 const BAND_NAME: Record<string, string> = { ng: "2.4 GHz", na: "5 GHz" };
 
@@ -147,11 +148,14 @@ function ChannelPlan({
         )}
       </div>
       <p className="muted small">
-        Scores each channel your AP is allowed to use by how loudly it hears
-        other networks and your other APs there (lower is better). A change is
-        only suggested when it is clearly better. Applying a plan needs active
-        mode.
+        Scores each channel your AP may use by how loudly it hears other
+        networks and your other APs there (lower is better). APs only move when
+        the plan as a whole is clearly better (by more than 10%), or when an AP
+        is on a channel it may no longer use.
+        {plan.data?.allowed &&
+          ` Channels allowed: ${plan.data.allowed.join(", ")}.`}
       </p>
+      <PlanActions band={band} plan={plan.data} />
       {plan.error && <ErrorNote error={plan.error} />}
       {!plan.data ? (
         <Loading />
@@ -176,7 +180,10 @@ function ChannelPlan({
                   <tr key={p.mac}>
                     <td>
                       <Link to={`/devices/${p.mac}`}>{p.name ?? p.mac}</Link>
-                      <div className="muted small">{p.clients} clients</div>
+                      <div className="muted small">
+                        {p.clients} clients
+                        {p.pinned && " · kept as is"}
+                      </div>
                     </td>
                     <td className="nowrap">
                       {p.current_channel ?? "—"}
@@ -187,7 +194,14 @@ function ChannelPlan({
                     </td>
                     <td>{p.current_score ?? "—"}</td>
                     <td className="nowrap">
-                      {p.change ? (
+                      {p.change && p.not_allowed ? (
+                        <b className="suggest">
+                          → {p.suggested_channel}{" "}
+                          <span className="muted small">
+                            (now on a channel it may not use)
+                          </span>
+                        </b>
+                      ) : p.change ? (
                         <b className="suggest">
                           → {p.suggested_channel}{" "}
                           <span className="muted small">
@@ -321,6 +335,7 @@ function Channels() {
   return (
     <>
       <RadioTable radios={r.data} />
+      <ChannelAiPanel />
       <div className="grid2">
         <ChannelPlan band="na" radios={r.data} />
         <ChannelPlan band="ng" radios={r.data} />
@@ -416,7 +431,8 @@ function Environment() {
         </div>
         <p className="muted small">
           Neighbours come from the APs' background scans, which they run on
-          their own every so often. An on-demand scan needs active mode.
+          their own every so often, and from Scan now on the Channels tab
+          (active mode).
         </p>
       </div>
 
