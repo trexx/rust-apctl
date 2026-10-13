@@ -25,7 +25,7 @@ import { ThreatBanner } from "../components/Threats";
 export function Overview() {
   const devices = useDevices();
   const clients = useClients();
-  const events = useEvents({ limit: 30 });
+  const events = useEvents({ limit: 12 });
   const status = useStatus();
   const names = deviceNames(devices.data);
   const cnames = clientNames(clients.data);
@@ -71,22 +71,8 @@ export function Overview() {
       </div>
 
       <ThreatBanner />
-      <h2>Activity</h2>
-      <SiteActivity />
-      <div className="grid2 align-top">
-        <TopTalkers />
-        <div className="stack">
-          <RetryBuckets />
-          <Connectivity />
-          <DeploymentDensity />
-        </div>
-      </div>
-      <div className="grid1">
-        <SiteMulticast />
-      </div>
-
       <h2>Access points</h2>
-      <div className="cards">
+      <div className="cards cards-fill">
         {list.map((d) => (
           <Link key={d.mac} to={`/devices/${d.mac}`} className="card card-link">
             <div className="card-head">
@@ -138,7 +124,26 @@ export function Overview() {
         ))}
       </div>
 
-      <h2>Recent events</h2>
+      <h2>Activity</h2>
+      <SiteActivity />
+      <div className="grid3">
+        <RetryBuckets />
+        <Connectivity />
+        <DeploymentDensity />
+      </div>
+      <div className="grid1">
+        <TopTalkers />
+      </div>
+      <div className="grid1">
+        <SiteMulticast />
+      </div>
+
+      <h2>
+        Recent events{" "}
+        <Link to="/events" className="small">
+          all events →
+        </Link>
+      </h2>
       <div className="panel">
         {events.data ? (
           <EventList events={events.data} names={names} clientNames={cnames} />

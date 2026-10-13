@@ -1059,3 +1059,36 @@ td.warn {
     grid-template-columns: 1fr;
   }
 }
+
+.cards-fill {
+  grid-template-columns: repeat(auto-fit, minmax(min(390px, 100%), 1fr));
+}
+.grid3 {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 12px;
+  margin-top: 12px;
+}
+@media (max-width: 1100px) {
+  .grid3 {
+    grid-template-columns: 1fr;
+  }
+}
+.top-split {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 3fr);
+  gap: 16px;
+}
+.top-split .top-list + .top-list {
+  margin-top: 0;
+}
+@media (max-width: 800px) {
+  .top-split {
+    grid-template-columns: 1fr;
+  }
+}
+.mcast-stack {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}

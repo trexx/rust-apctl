@@ -220,25 +220,27 @@ export function TopTalkers() {
         <b>Top traffic</b>
         <span className="muted small">{spanText(span)}</span>
       </div>
-      <TopList
-        title="Access points"
-        link="devices"
-        items={t.data.aps.map((a) => ({
-          mac: a.mac,
-          name: a.name,
-          total: total(a),
-        }))}
-      />
-      <TopList
-        title="Clients"
-        link="clients"
-        items={t.data.clients.slice(0, 15).map((c) => ({
-          mac: c.mac,
-          name: c.name,
-          sub: c.vendor,
-          total: total(c),
-        }))}
-      />
+      <div className="top-split">
+        <TopList
+          title="Access points"
+          link="devices"
+          items={t.data.aps.map((a) => ({
+            mac: a.mac,
+            name: a.name,
+            total: total(a),
+          }))}
+        />
+        <TopList
+          title="Clients"
+          link="clients"
+          items={t.data.clients.slice(0, 15).map((c) => ({
+            mac: c.mac,
+            name: c.name,
+            sub: c.vendor,
+            total: total(c),
+          }))}
+        />
+      </div>
     </div>
   );
 }
@@ -507,7 +509,7 @@ export function MulticastPanel({
           </button>
         </div>
       </div>
-      <div className="mcast-layout">
+      <div className="mcast-stack">
         <div>
           <SpanContext.Provider value={span}>
             <Chart
