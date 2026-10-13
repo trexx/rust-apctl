@@ -860,8 +860,32 @@ impl Engine {
                     Sql::Text(v.bssid.clone()), mac(), opt_text(v.essid.clone()), opt_text(v.radio.clone()),
                     i(v.num_sta), i(v.ccq), i(v.satisfaction), i(v.avg_client_signal), i(v.latency_avg),
                     i(v.rx_bytes), i(v.tx_bytes), i(v.rx_packets), i(v.tx_packets), i(v.tx_retries), i(v.tx_dropped),
+                    i(v.tx_mcast), i(v.rx_mcast),
                 ],
             });
+        }
+        for n in &s.neighbors {
+            self.writer.exec(
+                Db::Config,
+                "INSERT INTO neighbors (bssid, ap_mac, radio, essid, channel, bw, center_freq, security, signal, best_signal, noise, is_unifi, ap_name, model, first_seen, last_seen)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9, ?10, ?11, ?12, ?13, ?14, ?14)
+                 ON CONFLICT (bssid, ap_mac) DO UPDATE SET radio = excluded.radio, essid = excluded.essid, channel = excluded.channel,
+                   bw = excluded.bw, center_freq = excluded.center_freq, security = excluded.security, signal = excluded.signal,
+                   best_signal = MAX(COALESCE(best_signal, -200), COALESCE(excluded.signal, -200)), noise = excluded.noise,
+                   is_unifi = excluded.is_unifi, ap_name = excluded.ap_name, model = excluded.model, last_seen = excluded.last_seen",
+                vec![
+                    Sql::Text(n.bssid.clone()), mac(), opt_text(n.radio.clone()), opt_text(n.essid.clone()), i(n.channel), i(n.bw),
+                    i(n.center_freq), opt_text(n.security.clone()), i(n.signal), i(n.noise), Sql::Integer(n.is_unifi as i64),
+                    opt_text(n.ap_name.clone()), opt_text(n.model.clone()), Sql::Integer(ts),
+                ],
+            );
+        }
+        for c in &s.spectrum {
+            self.writer.exec(
+                Db::Config,
+                "INSERT OR REPLACE INTO spectrum (ap_mac, radio, channel, width, utilization, interference, other_bss_count, ts) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                vec![mac(), Sql::Text(c.radio.clone()), Sql::Integer(c.channel), i(c.width), i(c.utilization), i(c.interference), i(c.other_bss_count), Sql::Integer(ts)],
+            );
         }
         for c in &s.clients {
             self.writer.send(Write::Metric {

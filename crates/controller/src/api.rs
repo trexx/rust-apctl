@@ -23,6 +23,8 @@ use crate::store::{self, Db, Store};
 #[derive(Clone)]
 pub struct AppState {
     pub store: Arc<Store>,
+    /// Manufacturer names by MAC prefix (IEEE registry).
+    pub vendors: Arc<crate::vendor::Vendors>,
     /// The config generator, when available (for on-demand dry runs).
     pub renderer: Option<crate::dryrun::RenderFn>,
     pub auth: crate::auth::SharedAuth,
@@ -54,6 +56,12 @@ pub fn router(state: AppState) -> Router {
             get(state_summary).post(import_state).layer(axum::extract::DefaultBodyLimit::max(8 << 20)),
         )
         .route("/api/dryrun", get(dryrun))
+        .route("/api/site/activity", get(crate::insights::activity))
+        .route("/api/site/top", get(crate::insights::top))
+        .route("/api/site/connectivity", get(crate::insights::connectivity))
+        .route("/api/rf/radios", get(crate::insights::radios))
+        .route("/api/rf/neighbors", get(crate::insights::neighbors))
+        .route("/api/rf/channel-plan", get(crate::insights::channel_plan))
         .route("/api/series/{table}", get(series))
         .route("/api/events", get(events))
         .route("/api/logs", get(logs))
@@ -63,6 +71,12 @@ pub fn router(state: AppState) -> Router {
 }
 
 pub struct ApiError(StatusCode, String);
+
+impl ApiError {
+    pub fn internal(msg: impl Into<String>) -> Self {
+        ApiError(StatusCode::INTERNAL_SERVER_ERROR, msg.into())
+    }
+}
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
@@ -161,6 +175,7 @@ async fn clients(State(s): State<AppState>) -> ApiResult {
                 let a = live.aliases.get(mac).cloned().unwrap_or_default();
                 v["alias"] = json!(a.alias);
                 v["note"] = json!(a.note);
+                v["vendor"] = json!(s.vendors.lookup(mac));
                 (mac.to_string(), v)
             })
             .collect();
@@ -189,7 +204,7 @@ async fn clients(State(s): State<AppState>) -> ApiResult {
             let a = aliases.get(&mac).cloned().unwrap_or_default();
             out.push(json!({
                 "connected": false, "first_seen": k["first_seen"], "last_seen": k["last_seen"], "sample": k,
-                "alias": a["alias"], "note": a["note"],
+                "alias": a["alias"], "note": a["note"], "vendor": s.vendors.lookup_str(&mac),
             }));
         }
     }
@@ -205,6 +220,7 @@ async fn client(State(s): State<AppState>, Path(mac): Path<String>) -> ApiResult
             let mut v = serde_json::to_value(c).unwrap_or_default();
             v["alias"] = json!(a.alias);
             v["note"] = json!(a.note);
+            v["vendor"] = json!(s.vendors.lookup(&mac));
             v
         })
     };

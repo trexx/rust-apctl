@@ -8,10 +8,12 @@ mod api;
 mod auth;
 mod dryrun;
 mod engine;
+mod insights;
 mod model;
 mod shadow;
 mod store;
 mod syslog;
+mod vendor;
 mod web;
 
 use std::net::SocketAddr;
@@ -99,6 +101,9 @@ struct ServeArgs {
     /// cannot be combined with shadow mode.
     #[arg(long, env = "APCTL_ACTIVE", conflicts_with_all = ["shadow", "shadow_cmd"])]
     pub active: bool,
+    /// IEEE MAC prefix registry (oui.csv) for manufacturer names; optional.
+    #[arg(long, env = "APCTL_OUI_FILE", default_value = "/usr/share/apctl/oui.csv")]
+    pub oui_file: PathBuf,
     /// Where to receive informs in active mode.
     #[arg(long, env = "APCTL_INFORM_LISTEN", default_value = "0.0.0.0:8080")]
     pub inform_listen: SocketAddr,
@@ -135,7 +140,18 @@ async fn main() -> Result<()> {
 async fn serve(args: ServeArgs) -> Result<()> {
     let ServeArgs {
         data_dir, keys, shadow, shadow_cmd, inform_ports, listen, syslog_listen, users_file, emulate_version, active, inform_listen,
+        oui_file,
     } = args;
+    let vendors = match vendor::Vendors::load(&oui_file) {
+        Ok(v) => {
+            tracing::info!("loaded {} manufacturer prefixes from {}", v.len(), oui_file.display());
+            v
+        }
+        Err(e) => {
+            tracing::warn!("no manufacturer names: {e:#}");
+            vendor::Vendors::default()
+        }
+    };
     let keys = match &keys {
         Some(p) => KeyStore::load(p)?,
         None => KeyStore::default(),
@@ -250,7 +266,7 @@ async fn serve(args: ServeArgs) -> Result<()> {
         tracing::info!("login enabled for {} user(s)", users.len());
     }
     let auth = Arc::new(auth::Auth::new(users, &store, writer.clone())?);
-    let state = api::AppState { store, renderer, auth, engine: in_tx.clone(), live, tx: live_tx, started: store::now_ts(), source: source_desc };
+    let state = api::AppState { store, vendors: Arc::new(vendors), renderer, auth, engine: in_tx.clone(), live, tx: live_tx, started: store::now_ts(), source: source_desc };
     let app = api::router(state);
     let listener = tokio::net::TcpListener::bind(listen).await.with_context(|| format!("binding {listen}"))?;
     tracing::info!("web UI and API on http://{listen}");

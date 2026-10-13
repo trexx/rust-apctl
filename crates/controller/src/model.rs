@@ -67,7 +67,12 @@ pub struct RadioSample {
     pub noise_floor: Option<i64>,
     pub tx_packets: Option<i64>,
     pub tx_retries: Option<i64>,
+    pub rx_packets: Option<i64>,
     pub num_sta: i64,
+    /// Built-in antenna gain in dBi (EIRP = transmit power + gain).
+    pub antenna_gain: Option<i64>,
+    pub min_txpower: Option<i64>,
+    pub max_txpower: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -89,6 +94,41 @@ pub struct VapSample {
     pub avg_client_signal: Option<i64>,
     /// Moving average of Wi-Fi TX latency in ms, when the AP reports it.
     pub latency_avg: Option<i64>,
+    pub tx_mcast: Option<i64>,
+    pub rx_mcast: Option<i64>,
+    pub tx_bcast: Option<i64>,
+    pub rx_bcast: Option<i64>,
+    pub rx_dropped: Option<i64>,
+    pub tx_errors: Option<i64>,
+}
+
+/// A network heard by one of the AP's radios in a background scan.
+#[derive(Debug, Clone, Serialize)]
+pub struct NeighborSample {
+    pub radio: Option<String>,
+    pub bssid: String,
+    pub essid: Option<String>,
+    pub channel: Option<i64>,
+    pub bw: Option<i64>,
+    pub center_freq: Option<i64>,
+    pub security: Option<String>,
+    pub signal: Option<i64>,
+    pub noise: Option<i64>,
+    /// A Ubiquiti AP (possibly one of ours: see `ap_name`).
+    pub is_unifi: bool,
+    pub ap_name: Option<String>,
+    pub model: Option<String>,
+}
+
+/// One channel from a spectrum (channel survey) scan.
+#[derive(Debug, Clone, Serialize)]
+pub struct SpectrumSample {
+    pub radio: String,
+    pub channel: i64,
+    pub width: Option<i64>,
+    pub utilization: Option<i64>,
+    pub interference: Option<i64>,
+    pub other_bss_count: Option<i64>,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -133,6 +173,9 @@ pub struct Snapshot {
     pub radios: Vec<RadioSample>,
     pub vaps: Vec<VapSample>,
     pub clients: Vec<ClientSample>,
+    pub neighbors: Vec<NeighborSample>,
+    /// Only channels with survey samples (empty until a spectrum scan runs).
+    pub spectrum: Vec<SpectrumSample>,
     /// False for the short informs sent while radios restart: the absence of
     /// clients then says nothing about whether they are still connected.
     pub has_vap_table: bool,
@@ -200,6 +243,12 @@ pub fn parse(ts: Ts, p: &Value) -> anyhow::Result<Snapshot> {
             satisfaction: int(&v["satisfaction"]),
             avg_client_signal: int(&v["avg_client_signal"]),
             latency_avg: int(&v["wifi_tx_latency_mov"]["avg"]),
+            tx_mcast: int(&v["tx_mcast"]),
+            rx_mcast: int(&v["rx_mcast"]),
+            tx_bcast: int(&v["tx_bcast"]),
+            rx_bcast: int(&v["rx_bcast"]),
+            rx_dropped: int(&v["rx_dropped"]),
+            tx_errors: int(&v["tx_errors"]),
         });
         if usage != "user" {
             continue;
@@ -264,11 +313,52 @@ pub fn parse(ts: Ts, p: &Value) -> anyhow::Result<Snapshot> {
                 noise_floor: int(&ath["noise_floor"]),
                 tx_packets: int(&ath["n_tx_pkts"]),
                 tx_retries: int(&ath["n_tx_retries"]),
+                rx_packets: int(&ath["n_rx_pkts"]),
+                antenna_gain: int(&r["builtin_ant_gain"]),
+                min_txpower: int(&r["min_txpower"]),
+                max_txpower: int(&r["max_txpower"]),
                 num_sta: clients.iter().filter(|c| c.radio.as_deref() == Some(radio.as_str())).count() as i64,
                 radio,
             })
         })
         .collect();
+
+    let mut neighbors = Vec::new();
+    let mut spectrum = Vec::new();
+    for r in p["radio_table"].as_array().into_iter().flatten() {
+        let radio = string(&r["radio"]);
+        for n in r["scan_table"].as_array().into_iter().flatten() {
+            let Some(bssid) = string(&n["bssid"]) else { continue };
+            neighbors.push(NeighborSample {
+                radio: string(&n["band"]).or(radio.clone()),
+                bssid: bssid.to_ascii_lowercase(),
+                essid: string(&n["essid"]),
+                channel: int(&n["channel"]),
+                bw: int(&n["bw"]),
+                center_freq: int(&n["center_freq"]),
+                security: string(&n["security"]),
+                signal: int(&n["signal"]),
+                noise: int(&n["noise"]),
+                is_unifi: n["is_unifi"].as_bool() == Some(true) || n["is_ubnt"].as_bool() == Some(true),
+                ap_name: string(&n["ap_name"]),
+                model: string(&n["model"]),
+            });
+        }
+        for c in r["spectrum_table"].as_array().into_iter().flatten() {
+            let (Some(radio), Some(channel)) = (radio.clone(), int(&c["channel"])) else { continue };
+            if int(&c["total_samples"]).unwrap_or(0) == 0 {
+                continue; // no survey has run for this channel
+            }
+            spectrum.push(SpectrumSample {
+                radio,
+                channel,
+                width: int(&c["width"]),
+                utilization: int(&c["utilization"]),
+                interference: int(&c["interference"]),
+                other_bss_count: int(&c["other_bss_count"]),
+            });
+        }
+    }
 
     // The uplink is the interface named by `uplink` (eth0 for wired APs).
     let uplink_name = p["uplink"].as_str().unwrap_or("eth0");
@@ -317,7 +407,7 @@ pub fn parse(ts: Ts, p: &Value) -> anyhow::Result<Snapshot> {
         num_sta: has_vap_table.then_some(clients.len() as i64),
     };
 
-    Ok(Snapshot { ap, uplink, radios, vaps, clients, has_vap_table })
+    Ok(Snapshot { ap, uplink, radios, vaps, clients, neighbors, spectrum, has_vap_table })
 }
 
 #[cfg(test)]
@@ -354,6 +444,8 @@ mod tests {
         let up = s.uplink.as_ref().unwrap();
         assert_eq!(up.ifname, "eth0");
         assert!(up.rx_bytes.unwrap() > 0);
+        assert!(s.vaps.iter().all(|v| v.tx_mcast.is_some()));
+        assert!(na.antenna_gain.is_some());
     }
 
     #[test]

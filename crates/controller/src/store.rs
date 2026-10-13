@@ -127,7 +127,7 @@ pub const VAP: Table = Table {
     keys: &["bssid"],
     texts: &["ap_mac", "essid", "radio"],
     gauges: &["num_sta", "ccq", "satisfaction", "avg_client_signal", "latency_avg"],
-    counters: &["rx_bytes", "tx_bytes", "rx_packets", "tx_packets", "tx_retries", "tx_dropped"],
+    counters: &["rx_bytes", "tx_bytes", "rx_packets", "tx_packets", "tx_retries", "tx_dropped", "tx_mcast", "rx_mcast"],
 };
 pub const CLIENT: Table = Table {
     name: "client_stats",
@@ -160,6 +160,14 @@ CREATE TABLE IF NOT EXISTS events (
 CREATE INDEX IF NOT EXISTS events_ts ON events (ts);
 CREATE INDEX IF NOT EXISTS events_device ON events (device_mac, ts);
 CREATE INDEX IF NOT EXISTS events_client ON events (client_mac, ts);
+CREATE TABLE IF NOT EXISTS neighbors (
+    bssid TEXT NOT NULL, ap_mac TEXT NOT NULL, radio TEXT, essid TEXT, channel INTEGER, bw INTEGER, center_freq INTEGER,
+    security TEXT, signal INTEGER, best_signal INTEGER, noise INTEGER, is_unifi INTEGER NOT NULL DEFAULT 0, ap_name TEXT,
+    model TEXT, first_seen INTEGER NOT NULL, last_seen INTEGER NOT NULL, PRIMARY KEY (bssid, ap_mac)) WITHOUT ROWID;
+CREATE INDEX IF NOT EXISTS neighbors_seen ON neighbors (last_seen);
+CREATE TABLE IF NOT EXISTS spectrum (
+    ap_mac TEXT NOT NULL, radio TEXT NOT NULL, channel INTEGER NOT NULL, width INTEGER, utilization INTEGER,
+    interference INTEGER, other_bss_count INTEGER, ts INTEGER NOT NULL, PRIMARY KEY (ap_mac, radio, channel)) WITHOUT ROWID;
 CREATE TABLE IF NOT EXISTS connections (
     id INTEGER PRIMARY KEY, ts INTEGER NOT NULL, ap_mac TEXT NOT NULL, client_mac TEXT NOT NULL, vap TEXT, essid TEXT,
     radio TEXT, event_type TEXT NOT NULL, auth_algo TEXT, assoc_ms INTEGER, auth_ms INTEGER, ip_ms INTEGER,
@@ -222,7 +230,19 @@ fn migrate(dir: &Path) -> Result<()> {
     metrics.execute_batch("CREATE TABLE IF NOT EXISTS rollup_state (name TEXT PRIMARY KEY, upto INTEGER NOT NULL)")?;
     for t in TABLES {
         for (suffix, ..) in TIERS {
+            let name = format!("{}{suffix}", t.name);
             metrics.execute_batch(&t.create_sql(suffix))?;
+            // Columns added in later versions (CREATE IF NOT EXISTS keeps old tables as they are).
+            let existing: Vec<String> = metrics
+                .prepare(&format!("SELECT name FROM pragma_table_info('{name}')"))?
+                .query_map([], |r| r.get(0))?
+                .collect::<rusqlite::Result<_>>()?;
+            for c in t.texts.iter().chain(t.gauges).chain(t.counters) {
+                if !existing.iter().any(|e| e == c) {
+                    let ty = if t.texts.contains(c) { "TEXT" } else { "REAL" };
+                    metrics.execute_batch(&format!("ALTER TABLE {name} ADD COLUMN {c} {ty}"))?;
+                }
+            }
         }
     }
     Ok(())
@@ -392,6 +412,7 @@ fn maintenance(conns: &mut BTreeMap<u8, Connection>, now: Ts) -> Result<()> {
     config.execute("DELETE FROM sessions WHERE expires < ?1", [now])?;
     delete_before(config, "dryrun_results", now - 90 * 86400)?;
     delete_before(config, "connections", now - 90 * 86400)?;
+    config.execute("DELETE FROM neighbors WHERE last_seen < ?1", [now - 30 * 86400])?;
     Ok(())
 }
 
