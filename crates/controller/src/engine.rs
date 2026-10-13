@@ -87,25 +87,10 @@ pub struct DeviceView {
     pub reconfiguring: bool,
     /// When the current reconfiguration began.
     pub reconfiguring_since: Option<Ts>,
-    /// A config application being tracked until the AP has been stable for a while.
-    #[serde(skip)]
-    pub applying: Option<Applying>,
+    /// Time of the last inform that included the client list.
+    pub last_full_inform: Ts,
     pub last_config_push: Option<Ts>,
 }
-
-/// One config application: an AP may alternate short and full informs for a
-/// while (e.g. several bursts during a channel change), so it is reported once,
-/// after the AP has been stable for `APPLY_SETTLE_SECS`.
-#[derive(Debug, Clone)]
-pub struct Applying {
-    since: Ts,
-    /// First full inform after the last short one.
-    returned: Option<Ts>,
-    /// Clients connected to the AP when the application began.
-    before: Vec<Mac>,
-}
-
-pub const APPLY_SETTLE_SECS: Ts = 30;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct ClientView {
@@ -118,6 +103,7 @@ pub struct ClientView {
 #[derive(Debug, Default, Clone, Serialize)]
 pub struct Counters {
     pub informs: u64,
+    pub notifications: u64,
     pub log_errors: u64,
     pub replies: u64,
     pub config_pushes: u64,
@@ -310,6 +296,13 @@ impl Engine {
     }
 
     fn inform(&mut self, ts: Ts, peer: String, decoded: Decoded) {
+        // Notifications are short informs sent between regular ones: a config
+        // acknowledgement or an event (client connection tracking, radar, scans).
+        // They carry no client data and must not update the AP's status.
+        if decoded.payload["inform_as_notif"].as_bool() == Some(true) {
+            self.notification(ts, &decoded.payload);
+            return;
+        }
         let snap = match model::parse(ts, &decoded.payload) {
             Ok(s) => s,
             Err(e) => {
@@ -361,33 +354,6 @@ impl Engine {
                 events.push(ev(ts, "ap_firmware_changed", Some(mac), None, json!({ "from": p.snapshot.ap.version, "to": snap.ap.version })));
             }
         }
-        // While an AP applies a config push it sends short informs without client
-        // data. Whether clients were affected is only known once it is back:
-        // clients that had to reconnect show a session shorter than the gap.
-        let reconfiguring_since = match (&prev, snap.has_vap_table) {
-            (_, true) => None,
-            (Some(p), false) if p.reconfiguring => p.reconfiguring_since,
-            _ => Some(ts),
-        };
-        let mut applying = prev.as_ref().and_then(|p| p.applying.clone());
-        if !snap.has_vap_table {
-            match &mut applying {
-                Some(a) => a.returned = None, // another burst of the same application
-                None => {
-                    let before = live.clients.values().filter(|c| c.connected && c.sample.ap_mac == mac).map(|c| c.sample.mac).collect();
-                    applying = Some(Applying { since: ts, returned: None, before });
-                }
-            }
-        } else if let Some(a) = &mut applying {
-            match a.returned {
-                None => a.returned = Some(ts),
-                Some(r) if ts - r >= APPLY_SETTLE_SECS => {
-                    events.push(config_applied(mac, a, ts, Some(&snap.clients)));
-                    applying = None;
-                }
-                Some(_) => {}
-            }
-        }
         if snap.has_vap_table {
             for r in &snap.radios {
                 let now = (r.channel, r.bw, r.tx_power);
@@ -423,9 +389,9 @@ impl Engine {
             last_seen: ts,
             peer,
             interval: prev.as_ref().map_or(DEFAULT_INTERVAL, |p| p.interval),
-            reconfiguring: !snap.has_vap_table,
-            reconfiguring_since,
-            applying,
+            reconfiguring: false,
+            reconfiguring_since: None,
+            last_full_inform: if snap.has_vap_table { ts } else { prev.as_ref().map_or(0, |p| p.last_full_inform) },
             last_config_push: prev.as_ref().and_then(|p| p.last_config_push),
         };
         self.writer.exec(
@@ -656,6 +622,92 @@ impl Engine {
         let _ = self.tx.send(LiveMsg::Clients);
     }
 
+    fn notification(&mut self, ts: Ts, p: &Value) {
+        let Some(mac) = p["mac"].as_str().and_then(|m| m.parse::<Mac>().ok()) else { return };
+        let mut live = self.live.write().unwrap();
+        live.counters.notifications += 1;
+        if let Some(d) = live.devices.get_mut(&mac) {
+            d.last_seen = ts; // proof of life, but not a status report
+        }
+        match p["notif_reason"].as_str() {
+            // The AP confirms it applied a pushed config.
+            Some("setparam") => {
+                let since_push = live.devices.get(&mac).and_then(|d| d.last_config_push).map(|t| ts - t);
+                let data = json!({ "cfgversion": p["cfgversion"], "seconds_after_push": since_push });
+                self.emit(&mut live, ev(ts, "config_applied", Some(mac), None, data));
+            }
+            Some("event") => {
+                let n = &p["notif_payload"];
+                if n["message_type"].as_str() == Some("STA_ASSOC_TRACKER") {
+                    self.connection_event(&mut live, ts, mac, n);
+                } else if let Some(kind) = n["event_string"].as_str() {
+                    // AP events: radar (DFS), rogue APs, scan completion, process restarts...
+                    let k = match kind {
+                        "EVT_AP_RadarDetected" => "dfs_radar",
+                        "EVT_AP_DetectRogueAP" => "rogue_ap",
+                        "EVT_AP_QuickScanEvent" | "EVT_AP_AcsTriggerComplete" => "ap_scan_done",
+                        _ => "ap_event",
+                    };
+                    self.emit(&mut live, ev(ts, k, Some(mac), None, n.clone()));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// A client connection-tracking event (`STA_ASSOC_TRACKER`): association,
+    /// success (with association, WPA, IP and DNS timings), soft failure,
+    /// roam, leave. Durations arrive in microseconds and are stored in ms.
+    fn connection_event(&self, live: &mut Live, ts: Ts, ap: Mac, n: &Value) {
+        let Some(client) = n["mac"].as_str().and_then(|m| m.parse::<Mac>().ok()) else { return };
+        let num = |k: &str| n[k].as_str().and_then(|v| v.parse::<f64>().ok()).or_else(|| n[k].as_f64());
+        let ms = |k: &str| num(k).map(|us| (us / 1000.0).round() as i64);
+        let text = |k: &str| n[k].as_str().map(str::to_string);
+        let vap = text("vap");
+        let (essid, radio) = live
+            .devices
+            .get(&ap)
+            .and_then(|d| d.snapshot.vaps.iter().find(|v| v.name.as_deref() == vap.as_deref()))
+            .map(|v| (v.essid.clone(), v.radio.clone()))
+            .unwrap_or((None, None));
+        let event_type = text("event_type").unwrap_or_default();
+        self.writer.exec(
+            Db::Config,
+            "INSERT INTO connections (ts, ap_mac, client_mac, vap, essid, radio, event_type, auth_algo, assoc_ms, auth_ms, ip_ms, \
+             ip_assign_type, dns_responses, dns_timeouts, rssi, reason) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+            vec![
+                Sql::Integer(ts),
+                Sql::Text(ap.to_string()),
+                Sql::Text(client.to_string()),
+                opt_text(vap),
+                opt_text(essid.clone()),
+                opt_text(radio),
+                Sql::Text(event_type.clone()),
+                opt_text(text("auth_algo")),
+                opt_int(ms("assoc_delta")),
+                opt_int(ms("wpa_auth_delta")),
+                opt_int(ms("ip_delta")),
+                opt_text(text("ip_assign_type")),
+                opt_int(num("dns_responses").map(|v| v as i64)),
+                opt_int(num("dns_timeouts").map(|v| v as i64)),
+                opt_int(num("avg_rssi").or_else(|| num("auth_rssi")).map(|v| v as i64)),
+                opt_text(text("sta_dc_reason")),
+            ],
+        );
+        // Failed attempts are worth an event; the rest stay in the connection log.
+        if event_type.contains("failure") {
+            let data = json!({ "essid": essid, "reason": n["sta_dc_reason"], "auth_algo": n["auth_algo"], "rssi": num("auth_rssi") });
+            let e = ev(ts, "client_connect_failed", Some(ap), Some(client), data);
+            live.counters.events += 1;
+            self.writer.exec(
+                Db::Config,
+                "INSERT INTO events (ts, kind, device_mac, client_mac, data) VALUES (?1, ?2, ?3, ?4, ?5)",
+                vec![Sql::Integer(e.ts), Sql::Text(e.kind.into()), Sql::Text(ap.to_string()), Sql::Text(client.to_string()), Sql::Text(e.data.to_string())],
+            );
+            let _ = self.tx.send(LiveMsg::Event(e));
+        }
+    }
+
     fn datagram(&mut self, ts: Ts, src_ip: String, payload: &[u8]) {
         let (by_hash, by_ip) = {
             let live = self.live.read().unwrap();
@@ -721,20 +773,12 @@ impl Engine {
                 self.writer.exec(Db::Config, "UPDATE devices SET online = 0 WHERE mac = ?1", vec![Sql::Text(mac.to_string())]);
             }
         }
-        // Report config applications whose AP has been stable long enough.
-        for (mac, d) in live.devices.iter_mut() {
-            if let Some(a) = &d.applying
-                && a.returned.is_some_and(|r| now - r >= APPLY_SETTLE_SECS) {
-                    events.push(config_applied(*mac, a, now, None));
-                    d.applying = None;
-                }
-        }
         // A client is gone when its AP has reported a full client list since it was
         // last seen and the grace period has passed, or when its AP went offline.
         let ap_last_full: HashMap<Mac, (Ts, bool)> = live
             .devices
             .iter()
-            .map(|(m, d)| (*m, (if d.reconfiguring { 0 } else { d.last_seen }, d.online)))
+            .map(|(m, d)| (*m, (d.last_full_inform, d.online)))
             .collect();
         let mut changed = false;
         for (cmac, c) in live.clients.iter_mut() {
@@ -831,26 +875,6 @@ impl Engine {
             });
         }
     }
-}
-
-/// The single event for a finished config application. `clients` is the AP's
-/// current client list when known (from an inform), for spotting reconnects.
-fn config_applied(mac: Mac, a: &Applying, ts: Ts, clients: Option<&[ClientSample]>) -> Event {
-    let took = a.returned.unwrap_or(ts) - a.since;
-    let window = ts - a.since + 5;
-    let (after, reconnected) = match clients {
-        Some(list) => (
-            Some(list.len()),
-            list.iter().filter(|c| a.before.contains(&c.mac) && c.uptime.is_some_and(|u| u <= window)).count(),
-        ),
-        None => (None, 0),
-    };
-    ev(a.returned.unwrap_or(ts), "ap_config_applied", Some(mac), None, json!({
-        "seconds": took.max(1),
-        "clients_before": a.before.len(),
-        "clients_after": after,
-        "reconnected": reconnected,
-    }))
 }
 
 fn ev(ts: Ts, kind: &'static str, device_mac: Option<Mac>, client_mac: Option<Mac>, data: Value) -> Event {
@@ -968,32 +992,20 @@ mod tests {
     }
 
     #[test]
-    fn short_informs_during_radio_restart_do_not_disconnect_clients() {
+    fn informs_without_a_client_list_do_not_disconnect_clients() {
         let mut h = harness();
         h.engine.handle(Input::Inform { ts: 0, peer: "x".into(), decoded: decoded(inform(AP1, 1000, &[(C1, "b1")])) });
         events(&mut h);
-        // 2 minutes of short informs (no vap_table), as seen after a config push.
+        // Two minutes of informs that carry no client list (notifications, or any
+        // short inform): nothing proves the client left.
         for ts in (5..120).step_by(5) {
-            h.engine.handle(Input::Inform { ts, peer: "x".into(), decoded: decoded(json!({ "mac": AP1, "uptime": 1000 + ts })) });
+            let d = if ts % 10 == 0 { notif(AP1, "event", json!({})) } else { decoded(json!({ "mac": AP1, "uptime": 1000 + ts })) };
+            h.engine.handle(Input::Inform { ts, peer: "x".into(), decoded: d });
             h.engine.handle(Input::Tick(ts));
         }
         let evs = events(&mut h);
-        assert!(evs.is_empty(), "nothing is known until the AP is back: {evs:?}");
+        assert!(evs.is_empty(), "{evs:?}");
         assert!(h.live.read().unwrap().clients[&C1.parse().unwrap()].connected);
-
-        // Back with full informs: the client kept its session (uptime 1120 s),
-        // so this was a config change without a radio restart.
-        for ts in [120, 125, 160] {
-            let mut full = inform(AP1, 1000 + ts, &[(C1, "b1")]);
-            full["vap_table"][0]["sta_table"][0]["uptime"] = json!(1000 + ts);
-            h.engine.handle(Input::Inform { ts, peer: "x".into(), decoded: decoded(full) });
-        }
-        let applied: Vec<_> = std::iter::from_fn(|| h.rx.try_recv().ok())
-            .filter_map(|m| match m { LiveMsg::Event(e) if e.kind == "ap_config_applied" => Some(e.data), _ => None })
-            .collect();
-        assert_eq!(applied.len(), 1);
-        assert_eq!(applied[0]["seconds"], 115, "from the first short inform to the AP's return");
-        assert_eq!(applied[0]["reconnected"], 0);
     }
 
     #[test]
@@ -1040,77 +1052,31 @@ mod tests {
         assert_eq!(renames[1]["from"], "Kitchen speaker");
     }
 
-    #[test]
-    fn bursts_of_short_informs_are_one_config_application() {
-        let mut h = harness();
-        let full = |ts: i64| decoded(inform(AP1, 1000 + ts, &[(C1, "b1")]));
-        let short = |ts: i64| decoded(json!({ "mac": AP1, "uptime": 1000 + ts }));
-        // Pattern seen during a channel change: short, full, short, full, ...
-        for (ts, is_full) in [(0, true), (10, false), (12, true), (20, false), (25, true), (40, false), (44, true), (60, true), (80, true)] {
-            let d = if is_full { full(ts) } else { short(ts) };
-            h.engine.handle(Input::Inform { ts, peer: "x".into(), decoded: d });
-        }
-        let applied: Vec<_> = std::iter::from_fn(|| h.rx.try_recv().ok())
-            .filter_map(|m| match m { LiveMsg::Event(e) if e.kind == "ap_config_applied" => Some(e), _ => None })
-            .collect();
-        assert_eq!(applied.len(), 1, "{applied:?}");
-        assert_eq!(applied[0].data["seconds"], 34, "from the first burst (10) to the final return (44)");
+    fn notif(ap: &str, reason: &str, payload: Value) -> Decoded {
+        decoded(json!({ "mac": ap, "inform_as_notif": true, "notif_reason": reason, "notif_payload": payload, "cfgversion": "abc" }))
     }
 
     #[test]
-    fn dry_run_compares_each_push_with_the_generator() {
+    fn notifications_are_events_not_status() {
         let mut h = harness();
-        let mac: Mac = AP1.parse().unwrap();
-        let push = |cfg: &str| decoded(json!({ "_type": "setparam", "cfgversion": "abc", "system_cfg": cfg, "mgmt_cfg": "cfgversion=abc" }));
-        // A stand-in generator that renders "hide_ssid=false" and a fixed PSK.
-        let render: crate::dryrun::RenderFn = Arc::new(|req: &crate::dryrun::RenderRequest| {
-            assert_eq!(req.cfgversion, "abc", "rendered for the pushed cfgversion");
-            assert!(req.state["wlanconf"].is_array());
-            Ok((format!("cfgversion={}", req.cfgversion), "aaa.1.hide_ssid=false\naaa.1.wpa.psk=pw".to_string()))
-        });
-        h.engine.set_renderer(render);
-        // No settings imported yet: no comparison.
-        h.engine.handle(Input::Reply { ts: 1, mac, decoded: push("aaa.1.hide_ssid=false\naaa.1.wpa.psk=pw") });
-        h.engine.handle(Input::SetState { ts: 2, state: json!({ "sites": [], "wlanconf": [], "networkconf": [], "setting": [], "devices": [] }) });
-        h.engine.handle(Input::Reply { ts: 3, mac, decoded: push("aaa.1.hide_ssid=false\naaa.1.wpa.psk=pw") });
-        h.engine.handle(Input::Reply { ts: 4, mac, decoded: push("aaa.1.hide_ssid=true\naaa.1.wpa.psk=pw") });
-        let results: Vec<_> = std::iter::from_fn(|| h.rx.try_recv().ok())
-            .filter_map(|m| match m { LiveMsg::Event(e) if e.kind == "dryrun_compared" => Some(e.data), _ => None })
-            .collect();
-        assert_eq!(results.len(), 2, "{results:?}");
-        assert_eq!(results[0]["matches"], true);
-        assert_eq!(results[1]["matches"], false);
-        assert_eq!(results[1]["system_cfg"]["changed"], 1);
-    }
-
-    #[test]
-    fn management_only_pushes_keep_the_last_full_config() {
-        let mut h = harness();
-        let mac: Mac = AP1.parse().unwrap();
-        let render: crate::dryrun::RenderFn = Arc::new(|req: &crate::dryrun::RenderRequest| {
-            Ok((format!("cfgversion={}\nled_enabled=false", req.cfgversion), "a=1".to_string()))
-        });
-        h.engine.set_renderer(render);
-        h.engine.handle(Input::SetState { ts: 1, state: json!({ "sites": [], "wlanconf": [], "networkconf": [], "setting": [], "devices": [] }) });
-        // An LED change: mgmt_cfg only, no system_cfg and no top-level cfgversion.
-        let mgmt_only = decoded(json!({ "_type": "setparam", "mgmt_cfg": "cfgversion=abc\nled_enabled=true" }));
-        h.engine.handle(Input::Reply { ts: 2, mac, decoded: mgmt_only });
-        assert!(
-            std::iter::from_fn(|| h.rx.try_recv().ok()).all(|m| !matches!(m, LiveMsg::Event(e) if e.kind == "dryrun_compared")),
-            "no comparison without a known system_cfg"
+        h.engine.handle(Input::Inform { ts: 0, peer: "x".into(), decoded: decoded(inform(AP1, 1000, &[(C1, "b1")])) });
+        events(&mut h);
+        // Config acknowledgement and a connection-tracker success: no client changes.
+        h.engine.handle(Input::Inform { ts: 5, peer: "x".into(), decoded: notif(AP1, "setparam", Value::Null) });
+        let success = json!({ "message_type": "STA_ASSOC_TRACKER", "event_type": "success", "mac": C1, "vap": "wifi1ap0",
+            "assoc_delta": "40000", "wpa_auth_delta": "80000", "ip_delta": "100000", "dns_responses": "1", "dns_timeouts": "0", "avg_rssi": "-61" });
+        h.engine.handle(Input::Inform { ts: 6, peer: "x".into(), decoded: notif(AP1, "event", success) });
+        let failure = json!({ "message_type": "STA_ASSOC_TRACKER", "event_type": "soft failure", "mac": C1, "vap": "wifi1ap0", "sta_dc_reason": "roam", "auth_rssi": "-81" });
+        h.engine.handle(Input::Inform { ts: 7, peer: "x".into(), decoded: notif(AP1, "event", failure) });
+        h.engine.handle(Input::Inform { ts: 8, peer: "x".into(), decoded: notif(AP1, "event", json!({ "event_string": "EVT_AP_RadarDetected", "channel": 52 })) });
+        assert_eq!(
+            events(&mut h),
+            vec![("config_applied", None), ("client_connect_failed", Some(C1.into())), ("dfs_radar", None)]
         );
-        let full = decoded(json!({ "_type": "setparam", "cfgversion": "abc", "mgmt_cfg": "cfgversion=abc\nled_enabled=false", "system_cfg": "a=1" }));
-        h.engine.handle(Input::Reply { ts: 3, mac, decoded: full });
-        let mgmt_only = decoded(json!({ "_type": "setparam", "mgmt_cfg": "cfgversion=abc\nled_enabled=false" }));
-        h.engine.handle(Input::Reply { ts: 4, mac, decoded: mgmt_only });
-        let last = h.live.read().unwrap().last_config[&mac].clone();
-        assert_eq!(last.1, "a=1", "system_cfg survives a management-only push");
-        assert_eq!(last.2.as_deref(), Some("abc"), "cfgversion read from mgmt_cfg");
-        let results: Vec<_> = std::iter::from_fn(|| h.rx.try_recv().ok())
-            .filter_map(|m| match m { LiveMsg::Event(e) if e.kind == "dryrun_compared" => Some(e.data), _ => None })
-            .collect();
-        assert_eq!(results.len(), 2);
-        assert!(results.iter().all(|r| r["matches"] == true), "{results:?}");
+        let live = h.live.read().unwrap();
+        assert!(live.clients[&C1.parse().unwrap()].connected);
+        assert_eq!(live.counters.notifications, 4);
+        assert_eq!(live.devices[&AP1.parse().unwrap()].last_full_inform, 0, "notifications are not client lists");
     }
 
     #[test]

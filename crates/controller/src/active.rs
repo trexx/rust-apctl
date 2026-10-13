@@ -144,6 +144,11 @@ impl Active {
                 "include_blocks": ["multicast", "pathmon"], "server_time_in_utc": server_time,
             })
         };
+        // Notifications (config acknowledgements, events) get a bare noop: no
+        // interval, and never a config push.
+        if payload["inform_as_notif"].as_bool() == Some(true) {
+            return json!({ "_type": "noop", "server_time_in_utc": server_time });
+        }
         let (state, last_push) = {
             let live = self.live.read().unwrap();
             (live.state.clone(), live.last_config.get(&mac).cloned())
@@ -493,6 +498,18 @@ mod tests {
         inform_as_ap(&rig, &ap_payload("1"), KEY, GCM_ZLIB).await;
         let (status, _) = inform_as_ap(&rig, &ap_payload("1"), KEY, Flags::ENCRYPTED).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn notifications_get_a_bare_noop() {
+        let rig = rig(true, None);
+        let mut p = ap_payload("1111111111111111"); // out of date, yet no push
+        p["inform_as_notif"] = json!(true);
+        p["notif_reason"] = json!("event");
+        let (_, reply) = inform_as_ap(&rig, &p, KEY, GCM_ZLIB).await;
+        let reply = reply.unwrap().1;
+        assert_eq!(reply["_type"], "noop");
+        assert!(reply.get("interval").is_none());
     }
 
     #[tokio::test]

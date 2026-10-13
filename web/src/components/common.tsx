@@ -65,6 +65,12 @@ const EVENT_LABELS: Record<string, string> = {
   // Older events (before 0.3.2) guessed a restart; it was a config being applied.
   ap_radios_restarting: "Applying configuration",
   ap_config_applied: "Configuration applied",
+  config_applied: "Config applied",
+  client_connect_failed: "Connection failed",
+  dfs_radar: "Radar detected (DFS)",
+  rogue_ap: "Rogue AP",
+  ap_scan_done: "Scan finished",
+  ap_event: "AP event",
   radio_changed: "Radio settings changed",
   config_pushed: "Config pushed",
   client_connected: "Client connected",
@@ -77,7 +83,8 @@ const EVENT_LABELS: Record<string, string> = {
 
 function eventTone(kind: string): string {
   if (kind === "ap_offline" || kind === "ap_restarted") return "bad";
-  if (kind === "client_disconnected") return "warn";
+  if (kind === "client_disconnected" || kind === "client_connect_failed" || kind === "dfs_radar") return "warn";
+  if (kind === "rogue_ap") return "bad";
   if (kind.startsWith("client")) return "info";
   return "neutral";
 }
@@ -98,6 +105,14 @@ function describe(e: AppEvent, names: DeviceNames): React.ReactNode {
       if (!s) return "";
       return s.baseline ? `baseline captured (${s.lines} lines)` : `${s.added} added, ${s.removed} removed, ${s.changed} changed`;
     }
+    case "config_applied":
+      return d.seconds_after_push !== null && d.seconds_after_push !== undefined ? `${d.seconds_after_push}s after the push` : "";
+    case "client_connect_failed":
+      return [d.essid, d.reason ? `reason: ${d.reason}` : null, d.rssi ? `${d.rssi} dBm` : null].filter(Boolean).join(" · ");
+    case "dfs_radar":
+      return d.channel ? `channel ${d.channel}` : "";
+    case "rogue_ap":
+      return [d.essid, d.rogue_channel ? `channel ${d.rogue_channel}` : null, d.signal_strength ? `${d.signal_strength} dBm` : null].filter(Boolean).join(" · ");
     case "ap_config_applied": {
       const secs = `in ${d.seconds}s`;
       if (d.reconnected > 0) return `${secs}, ${d.reconnected} of ${d.clients_before} clients had to reconnect`;

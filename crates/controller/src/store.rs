@@ -160,6 +160,12 @@ CREATE TABLE IF NOT EXISTS events (
 CREATE INDEX IF NOT EXISTS events_ts ON events (ts);
 CREATE INDEX IF NOT EXISTS events_device ON events (device_mac, ts);
 CREATE INDEX IF NOT EXISTS events_client ON events (client_mac, ts);
+CREATE TABLE IF NOT EXISTS connections (
+    id INTEGER PRIMARY KEY, ts INTEGER NOT NULL, ap_mac TEXT NOT NULL, client_mac TEXT NOT NULL, vap TEXT, essid TEXT,
+    radio TEXT, event_type TEXT NOT NULL, auth_algo TEXT, assoc_ms INTEGER, auth_ms INTEGER, ip_ms INTEGER,
+    ip_assign_type TEXT, dns_responses INTEGER, dns_timeouts INTEGER, rssi INTEGER, reason TEXT);
+CREATE INDEX IF NOT EXISTS connections_ts ON connections (ts);
+CREATE INDEX IF NOT EXISTS connections_client ON connections (client_mac, ts);
 CREATE TABLE IF NOT EXISTS controller_state (
     id INTEGER PRIMARY KEY CHECK (id = 1), json TEXT NOT NULL, imported_at INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS dryrun_results (
@@ -385,6 +391,7 @@ fn maintenance(conns: &mut BTreeMap<u8, Connection>, now: Ts) -> Result<()> {
     delete_before(config, "events", now - 365 * 86400)?;
     config.execute("DELETE FROM sessions WHERE expires < ?1", [now])?;
     delete_before(config, "dryrun_results", now - 90 * 86400)?;
+    delete_before(config, "connections", now - 90 * 86400)?;
     Ok(())
 }
 
