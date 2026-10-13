@@ -680,6 +680,7 @@ fn render_wireless(c: &mut Cfg, ctx: &Ctx, radios: &[Radio], vaps: &[Vap], i: us
     if bit(caps.wifi, 6) {
         c.set(k("bga_filter"), "enabled");
     }
+    schedule(c, w, &k, bit(caps.fw, 22), bit(caps.fw, 12));
     let dtim = if r.band == "ng" && b(w, "iot_dtim_lock") {
         3
     } else if str_of(w, "dtim_mode") == Some("custom") {
@@ -751,4 +752,139 @@ fn gateway_macs(ctx: &Ctx) -> Vec<String> {
         .filter_map(|d| str_of(d, "mac"))
         .map(str::to_ascii_lowercase)
         .collect()
+}
+
+const DAYS: [&str; 7] = ["sun", "mon", "tue", "wed", "thu", "fri", "sat"];
+
+/// The blackout blocks (minutes from midnight, end exclusive: 1440 is midnight) per weekday
+/// (0 = Sunday) of a WLAN's `schedule_with_duration`. Each entry is a period
+/// the WLAN is off: from each start day at the start time, for its duration,
+/// across midnight (and days) as needed. Blocks that overlap or touch merge.
+pub fn blackout_blocks(w: &Value) -> [Vec<(i64, i64)>; 7] {
+    let mut days: [Vec<(i64, i64)>; 7] = Default::default();
+    for e in arr(w, "schedule_with_duration") {
+        let start = int_of(e, "start_hour").unwrap_or(0) * 60 + int_of(e, "start_minute").unwrap_or(0);
+        let end = start + int_of(e, "duration_minutes").unwrap_or(0);
+        if end <= start {
+            continue;
+        }
+        for day in str_list(e, "start_days_of_week") {
+            let Some(d) = DAYS.iter().position(|x| x.eq_ignore_ascii_case(day)) else { continue };
+            let mut k = 0;
+            // An entry ending exactly at midnight leaves nothing on the next day.
+            while start.max(k * 1440) < end {
+                let from = start.max(k * 1440) - k * 1440;
+                let to = (end - k * 1440).min(1440);
+                days[(d + k as usize) % 7].push((from, to));
+                k += 1;
+            }
+        }
+    }
+    for blocks in &mut days {
+        blocks.sort();
+        let mut merged: Vec<(i64, i64)> = Vec::new();
+        for (s, e) in blocks.drain(..) {
+            match merged.last_mut() {
+                Some(last) if s <= last.1 => last.1 = last.1.max(e),
+                _ => merged.push((s, e)),
+            }
+        }
+        *blocks = merged;
+    }
+    days
+}
+
+/// `HHMM`; midnight at the end of a day is written 2359.
+fn hhmm(m: i64) -> String {
+    let m = m.min(1439);
+    format!("{:02}{:02}", m / 60, m % 60)
+}
+
+/// The schedule lines of a VAP: blackout blocks when the firmware takes them
+/// inverted (`invert`), else the times the WLAN is on; one key per block when
+/// it takes several (`multi`), else the day's key repeated.
+fn schedule(c: &mut Cfg, w: &Value, k: &dyn Fn(&str) -> String, invert: bool, multi: bool) {
+    if arr(w, "schedule_with_duration").is_empty() {
+        return;
+    }
+    let off = blackout_blocks(w);
+    if invert {
+        c.set(k("schedule_invert"), "enabled");
+    }
+    for (d, blocks) in off.iter().enumerate() {
+        let blocks: Vec<(i64, i64)> = if invert {
+            blocks.clone()
+        } else {
+            // The gaps between blackouts.
+            let mut on = Vec::new();
+            let mut from = 0;
+            for (s, e) in blocks {
+                if *s > from {
+                    on.push((from, *s));
+                }
+                from = *e;
+            }
+            if from < 1440 {
+                on.push((from, 1440));
+            }
+            on
+        };
+        for (i, (s, e)) in blocks.iter().enumerate() {
+            let key = if multi { format!("schedule_{}.{i}", DAYS[d]) } else { format!("schedule_{}", DAYS[d]) };
+            c.set(k(&key), format!("{}-{}", hhmm(*s), hhmm(*e)));
+        }
+    }
+}
+
+#[cfg(test)]
+mod schedule_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn lines(w: &Value, invert: bool, multi: bool) -> Vec<String> {
+        let mut c = Cfg::default();
+        schedule(&mut c, w, &|s: &str| format!("wireless.1.{s}"), invert, multi);
+        c.finish().lines().map(str::to_string).collect()
+    }
+
+    #[test]
+    fn blackouts_cross_midnight_and_merge() {
+        let w = json!({ "schedule_with_duration": [
+            { "start_days_of_week": ["mon", "tue"], "start_hour": 22, "start_minute": 0, "duration_minutes": 480 },
+            { "start_days_of_week": ["sat"], "start_hour": 23, "start_minute": 0, "duration_minutes": 120 },
+            { "start_days_of_week": ["wed"], "start_hour": 5, "start_minute": 30, "duration_minutes": 60 },
+        ]});
+        assert_eq!(
+            lines(&w, true, true),
+            vec![
+                "wireless.1.schedule_invert=enabled",
+                "wireless.1.schedule_sun.0=0000-0100",
+                "wireless.1.schedule_mon.0=2200-2359",
+                "wireless.1.schedule_tue.0=0000-0600",
+                "wireless.1.schedule_tue.1=2200-2359",
+                // 00:00-06:00 from Tuesday night and 05:30-06:30 overlap.
+                "wireless.1.schedule_wed.0=0000-0630",
+                "wireless.1.schedule_sat.0=2300-2359",
+            ]
+        );
+    }
+
+    #[test]
+    fn older_firmware_gets_the_on_times() {
+        let w = json!({ "schedule_with_duration": [
+            { "start_days_of_week": ["mon"], "start_hour": 22, "start_minute": 0, "duration_minutes": 120 },
+            { "start_days_of_week": ["fri"], "start_hour": 0, "start_minute": 0, "duration_minutes": 1440 },
+        ]});
+        let l = lines(&w, false, true);
+        assert!(!l.iter().any(|x| x.contains("invert")));
+        assert!(l.contains(&"wireless.1.schedule_mon.0=0000-2200".to_string()));
+        assert_eq!(l.iter().filter(|x| x.contains("schedule_mon")).count(), 1, "nothing after the blackout to 23:59");
+        assert!(l.contains(&"wireless.1.schedule_sun.0=0000-2359".to_string()), "a day without blackout is on all day");
+        assert!(!l.iter().any(|x| x.contains("schedule_fri")), "a whole-day blackout has no on time");
+        // An entry ending at midnight leaves the next day alone.
+        let w = json!({ "schedule_with_duration": [{ "start_days_of_week": ["mon"], "start_hour": 23, "start_minute": 0, "duration_minutes": 60 }] });
+        let b = blackout_blocks(&w);
+        assert_eq!((b[1].clone(), b[2].len()), (vec![(1380, 1440)], 0));
+        assert_eq!(lines(&w, true, false), vec!["wireless.1.schedule_invert=enabled", "wireless.1.schedule_mon=2300-2359"]);
+    }
 }

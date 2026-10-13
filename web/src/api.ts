@@ -93,6 +93,8 @@ export interface ClientView {
   blocked?: boolean;
   /** From the settings: the only AP the client may connect to. */
   locked_to?: Mac | null;
+  /** From the settings: the client's own speed limit (user group). */
+  usergroup_id?: string | null;
 }
 
 /** The name to show for a client: the user's alias, else its hostname, else its MAC. */
@@ -1031,7 +1033,10 @@ export interface SettingsPreview {
   aps: { mac: Mac; name: string | null; error?: string; system_cfg?: Record<string, unknown>; mgmt_cfg?: Record<string, unknown>; labels?: Record<string, string> }[];
 }
 
-export type SettingsTarget = { kind: "wlan"; id: string | null; remove?: boolean } | { kind: "device"; mac: Mac };
+export type SettingsTarget =
+  | { kind: "wlan"; id: string | null; remove?: boolean }
+  | { kind: "device"; mac: Mac }
+  | { kind: "usergroup"; id: string | null; remove?: boolean };
 
 export const useWlanSettings = () => useQuery({ queryKey: ["settings", "wlans"], queryFn: () => get<WlanSettingsList>("/api/settings/wlans") });
 export const useDeviceSettings = (mac: Mac) => useQuery({ queryKey: ["settings", "device", mac], queryFn: () => get<DeviceSettings>(`/api/settings/devices/${mac}`), retry: false });
@@ -1041,6 +1046,11 @@ export const wlanPassphrase = (id: string) => get<{ passphrase: string | null }>
 export function changeSettings<T>(target: SettingsTarget, patch: Record<string, unknown>, save: boolean): Promise<T> {
   const q = save ? "" : "?preview=true";
   if (target.kind === "device") return send<T>("PUT", `/api/settings/devices/${target.mac}${q}`, { patch });
+  if (target.kind === "usergroup") {
+    if (target.remove) return send<T>("DELETE", `/api/settings/usergroups/${target.id}${q}`, {});
+    if (target.id === null) return send<T>("POST", `/api/settings/usergroups${q}`, { patch });
+    return send<T>("PUT", `/api/settings/usergroups/${target.id}${q}`, { patch });
+  }
   if (target.remove) return send<T>("DELETE", `/api/settings/wlans/${target.id}${q}`, {});
   if (target.id === null) return send<T>("POST", `/api/settings/wlans${q}`, { patch });
   return send<T>("PUT", `/api/settings/wlans/${target.id}${q}`, { patch });
@@ -1077,3 +1087,22 @@ export const runChannelAi = (bands?: string[]) => send<{ started: boolean }>("PO
 export const applyChannelPlan = (band: string, changes: { mac: Mac; name: string | null; from: number | null; to: number | null }[]) =>
   send<{ applied: number }>("POST", "/api/rf/channel-plan/apply", { band, changes });
 export const saveChannelAi = (patch: Record<string, unknown>) => send<{ saved: boolean; what: string }>("PUT", "/api/rf/channel-ai", { patch });
+
+// ---- Speed limits ----
+
+export interface UserGroup {
+  id: string;
+  name: string;
+  default: boolean;
+  /** kbps; -1: no limit. */
+  qos_rate_max_down: number | null;
+  qos_rate_max_up: number | null;
+  /** SSIDs and clients using it. */
+  used_by: string[];
+}
+
+export const useUserGroups = () => useQuery({ queryKey: ["settings", "usergroups"], queryFn: () => get<{ active: boolean; groups: UserGroup[] }>("/api/settings/usergroups") });
+export const setClientSpeedLimit = (mac: Mac, usergroup_id: string | null) => send<{ saved: boolean; what: string }>("PUT", `/api/clients/${mac}/speed-limit`, { usergroup_id });
+
+/** A limit for people: "5 Mbps", or "none". */
+export const speed = (kbps: number | null | undefined) => (kbps && kbps > 0 ? `${kbps >= 1000 ? `${+(kbps / 1000).toFixed(2)} Mbps` : `${kbps} kbps`}` : "none");

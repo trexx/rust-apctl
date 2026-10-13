@@ -7,8 +7,11 @@ import {
   locateAp,
   provisionAp,
   restartAp,
+  setClientSpeedLimit,
+  speed,
   useMe,
   useStatus,
+  useUserGroups,
 } from "../api";
 import type { DeviceSummary, Mac } from "../api";
 
@@ -136,6 +139,7 @@ export function ClientActions({
   blocked,
   lockedTo,
   aps,
+  usergroupId,
 }: {
   mac: Mac;
   name: string;
@@ -143,9 +147,15 @@ export function ClientActions({
   blocked: boolean;
   lockedTo: Mac | null;
   aps: DeviceSummary[];
+  usergroupId: string | null;
 }) {
   const { can, why } = useCanAct();
-  const { busy, msg, run } = useAction([["client", mac], ["clients"]]);
+  const { busy, msg, run } = useAction([
+    ["client", mac],
+    ["clients"],
+    ["settings"],
+  ]);
+  const groups = (useUserGroups().data?.groups ?? []).filter((g) => !g.default);
   if (!can && !why) return null;
   const off = !can || busy;
   return (
@@ -205,6 +215,32 @@ export function ClientActions({
             ))}
           </select>
         </label>
+        {groups.length > 0 && (
+          <label className="small">
+            Speed limit{" "}
+            <select
+              disabled={off}
+              value={usergroupId ?? ""}
+              onChange={(e) => {
+                const g = e.target.value || null;
+                void run(
+                  () => setClientSpeedLimit(mac, g),
+                  g
+                    ? "Limited: its AP gets the limit within a few seconds while it is connected."
+                    : "Its own limit is removed: the SSID's limit applies again.",
+                );
+              }}
+            >
+              <option value="">Same as its SSID</option>
+              {groups.map((g) => (
+                <option key={g.id} value={g.id}>
+                  {g.name} (down {speed(g.qos_rate_max_down)}, up{" "}
+                  {speed(g.qos_rate_max_up)})
+                </option>
+              ))}
+            </select>
+          </label>
+        )}
       </div>
       <Outcome msg={msg} why={why} />
     </div>

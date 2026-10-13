@@ -47,8 +47,7 @@ pub fn render(ctx: &Ctx) -> Result<(String, Value)> {
             c.set(format!("mark.{i}.location"), location);
         }
     }
-    c.header("qos");
-    c.set("qos.status", "disabled");
+    qos(&mut c, ctx, &radios, &vaps);
     net::render_netconf(&mut c, ctx, &net, &radios, &vaps, &mut meta);
     mac_acl(&mut c, ctx, &vaps);
     addressing(&mut c, ctx);
@@ -585,6 +584,84 @@ fn mdns(c: &mut Cfg, ctx: &Ctx, vaps: &[Vap], net: &Net) {
 /// 5 GHz channels that need radar detection (DFS).
 fn is_dfs_channel(ch: i64) -> bool {
     (52..=144).contains(&ch)
+}
+
+/// A user group's limits (kbps; -1 or missing: unlimited).
+fn limits(g: &Value) -> (i64, i64) {
+    (int_of(g, "qos_rate_max_down").unwrap_or(-1), int_of(g, "qos_rate_max_up").unwrap_or(-1))
+}
+
+/// The most a radio can carry (Mbps), the ceiling used for "unlimited". The
+/// official controller takes it from its model table; this estimates it per
+/// spatial stream (150 at 2.4 GHz, 600 for Wi-Fi 6 / 433 for Wi-Fi 5 at
+/// 5 GHz), which gives the table's 300 and 2400 for a U6-Mesh.
+fn radio_max_mbps(r: &Radio) -> i64 {
+    let nss = int_of(r.doc, "nss").unwrap_or(2).max(1);
+    let per_stream = match r.band.as_str() {
+        "ng" => 150,
+        _ if flag(r.doc, "is_11ax", false) => 600,
+        _ => 433,
+    };
+    per_stream * nss
+}
+
+/// Speed limits (user groups). On only when some group on the site limits
+/// anything: each VAP is shaped to its WLAN's group (the default group when
+/// it has none), downlink on the VAP and uplink on each wired uplink. Per-client
+/// limits are not here: they go to the AP as `rate-update` commands.
+fn qos(c: &mut Cfg, ctx: &Ctx, radios: &[Radio], vaps: &[Vap]) {
+    c.header("qos");
+    let groups: Vec<&Value> = ctx.site_docs("usergroup").collect();
+    if !groups.iter().any(|g| limits(g) != (-1, -1)) || vaps.is_empty() {
+        c.set("qos.status", "disabled");
+        return;
+    }
+    c.set("qos.status", "enabled");
+    c.set("qos.mode", 1);
+    // Wired uplinks: the AP's ports, else the interface it reports as its uplink.
+    let mut uplinks: Vec<String> = ctx
+        .inform
+        .and_then(|p| p["port_table"].as_array())
+        .into_iter()
+        .flatten()
+        .filter_map(|p| str_of(p, "ifname").map(str::to_string))
+        .collect();
+    if uplinks.is_empty() {
+        uplinks.push(ctx.inform_str("uplink").filter(|u| u.starts_with("eth")).unwrap_or("eth0").to_string());
+    }
+    let mut k = 0;
+    for u in &uplinks {
+        k += 1;
+        c.set(format!("qos.if.{k}.devname"), u);
+        c.set(format!("qos.if.{k}.devspeed"), 1000);
+        c.set(format!("qos.if.{k}.type"), "uplink");
+    }
+    for v in vaps {
+        k += 1;
+        c.set(format!("qos.if.{k}.devname"), v.dev());
+        c.set(format!("qos.if.{k}.devspeed"), radio_max_mbps(&radios[v.radio]));
+    }
+    let default = groups.iter().find(|g| str_of(g, "attr_hidden_id") == Some("Default")).copied();
+    for (i, v) in vaps.iter().enumerate() {
+        let m = i + 1;
+        let group = str_of(&v.w, "usergroup_id").and_then(|id| groups.iter().find(|g| crate::json::oid(g).as_deref() == Some(id)).copied()).or(default);
+        let (down, up) = group.map_or((-1, -1), limits);
+        let ceiling = radio_max_mbps(&radios[v.radio]);
+        c.set(format!("qos.vap.{m}.id"), m);
+        c.set(format!("qos.vap.{m}.devname"), v.dev());
+        c.set(format!("qos.vap.{m}.dwnlink.minspeed"), if down > 0 { down } else { ceiling });
+        if down > 0 {
+            c.set(format!("qos.vap.{m}.dwnlink.maxspeed"), down);
+        }
+        for (j, u) in uplinks.iter().enumerate() {
+            let j = j + 1;
+            c.set(format!("qos.vap.{m}.uplink.{j}.devname"), u);
+            c.set(format!("qos.vap.{m}.uplink.{j}.minspeed"), if up > 0 { up } else { ceiling });
+            if up > 0 {
+                c.set(format!("qos.vap.{m}.uplink.{j}.maxspeed"), up);
+            }
+        }
+    }
 }
 
 fn cron(c: &mut Cfg, ctx: &Ctx, radios: &[Radio], vaps: &[Vap]) {

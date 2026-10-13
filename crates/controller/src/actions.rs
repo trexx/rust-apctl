@@ -71,13 +71,15 @@ fn same_mac(c: &Value, mac: &str) -> bool {
     c["mac"].as_str().is_some_and(|m| m.eq_ignore_ascii_case(mac))
 }
 
-/// Adds a client's `blocked` and `locked_to` (from the settings) to its view.
+/// Adds a client's `blocked`, `locked_to` and own speed limit (`usergroup_id`)
+/// from the settings to its view.
 pub fn add_controls(v: &mut Value, state: Option<&Value>, mac: &str) {
     let entry = state.and_then(|s| s["clients"].as_array()).and_then(|l| l.iter().find(|c| same_mac(c, mac)));
     let blocked = entry.and_then(|c| c["blocked"].as_bool()).unwrap_or(false);
     let locked_to = entry.filter(|c| c["fixed_ap_enabled"].as_bool() == Some(true)).and_then(|c| c["fixed_ap_mac"].as_str());
     v["blocked"] = json!(blocked);
     v["locked_to"] = json!(locked_to.map(str::to_ascii_lowercase));
+    v["usergroup_id"] = entry.map_or(Value::Null, |c| c["usergroup_id"].clone());
 }
 
 fn require_active(s: &AppState) -> Result<(), ApiError> {

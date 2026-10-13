@@ -25,6 +25,8 @@ const USER_FIELDS: &[&str] = &[
     "mac", "name", "note", "noted", "hostname", "oui", "first_seen", "last_seen", "is_wired",
     // used when rendering AP config: lock-to-AP, blocked clients, guests
     "fixed_ap_enabled", "fixed_ap_mac", "blocked", "is_guest",
+    // speed limit (user group) of the client
+    "usergroup_id",
 ];
 
 pub async fn run(uri: &str, db: &str, out: &Path) -> Result<()> {
@@ -43,6 +45,8 @@ pub async fn run(uri: &str, db: &str, out: &Path) -> Result<()> {
     // per-AP wireless/aaa indices and VAP names across edits.
     let apgroups = find_all(&db, "apgroup", doc! {}).await?;
     let config_meta = find_all(&db, "config_meta", doc! {}).await?;
+    // User groups are the speed limits of SSIDs and clients.
+    let usergroups = find_all(&db, "usergroup", doc! {}).await?;
     let projection: Document = DEVICE_FIELDS.iter().map(|f| (f.to_string(), Bson::Int32(1))).collect();
     let devices = find_all(&db, "device", projection).await?;
     let user_projection: Document = USER_FIELDS.iter().map(|f| (f.to_string(), Bson::Int32(1))).collect();
@@ -53,9 +57,9 @@ pub async fn run(uri: &str, db: &str, out: &Path) -> Result<()> {
     let aps = devices.iter().filter(|d| d.get("type").and_then(Value::as_str) == Some("uap")).count();
     eprintln!(
         "read {} sites, {} WLANs, {} WLAN groups, {} AP groups, {} networks, {} settings, {} config_meta, \
-         {} devices ({} APs, {} with authkeys), {} clients ({} named)",
+         {} user groups, {} devices ({} APs, {} with authkeys), {} clients ({} named)",
         sites.len(), wlans.len(), wlangroups.len(), apgroups.len(), networks.len(), settings.len(),
-        config_meta.len(), devices.len(), aps, with_key, users.len(), named
+        config_meta.len(), usergroups.len(), devices.len(), aps, with_key, users.len(), named
     );
 
     let snapshot = json!({
@@ -67,6 +71,7 @@ pub async fn run(uri: &str, db: &str, out: &Path) -> Result<()> {
         "setting": settings,
         "apgroup": apgroups,
         "config_meta": config_meta,
+        "usergroup": usergroups,
         "devices": devices,
         "clients": users,
     });

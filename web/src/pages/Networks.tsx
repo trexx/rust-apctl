@@ -12,7 +12,10 @@ import {
 } from "../components/Chart";
 import { ErrorNote, Loading, Signal } from "../components/common";
 import { spanText } from "../components/Insights";
-import { WlanSettingsPanel } from "../components/SettingsEditor";
+import {
+  SpeedLimitsPanel,
+  WlanSettingsPanel,
+} from "../components/SettingsEditor";
 
 /** Experience bands as the official controller colours them: 90+ excellent, 70+ good. */
 const uxTone = (v: number | null) =>
@@ -189,6 +192,7 @@ export function Networks() {
             <RangePicker value={span} onChange={setSpan} />
           </div>
           <WlanSettingsPanel />
+          <SpeedLimitsPanel />
           {w.error && <ErrorNote error={w.error} />}
           {!w.data ? (
             <Loading />

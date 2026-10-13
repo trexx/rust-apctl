@@ -74,3 +74,42 @@ fn missing_device_is_an_error() {
     let input = apcfg::Input { state: &state, device_mac: "02:00:00:00:99:99", inform: None, cfgversion: "x", controller: &controller };
     assert!(apcfg::render(&input).is_err());
 }
+
+/// Neither feature is in the captures, so these check the shape of the lines
+/// (as the official controller writes them), not a byte-for-byte golden copy.
+#[test]
+fn speed_limits_shape_each_vap_to_its_wlans_group() {
+    let mut state = state();
+    let unlimited = render(&state, AP_B, "x").rendered.system_cfg;
+    assert!(unlimited.contains("qos.status=disabled"));
+    let site = state["wlanconf"][0]["site_id"].clone();
+    state["usergroup"] = serde_json::json!([
+        { "_id": "g-default", "name": "Default", "attr_hidden_id": "Default", "qos_rate_max_down": -1, "qos_rate_max_up": -1, "site_id": site },
+        { "_id": "g-slow", "name": "Slow", "qos_rate_max_down": 5000, "qos_rate_max_up": 1000, "site_id": site },
+    ]);
+    // Only defined: QoS is on (any group limits), but no VAP uses the slow group yet.
+    let cfg = render(&state, AP_B, "x").rendered.system_cfg;
+    assert!(cfg.contains("qos.status=enabled\nqos.mode=1\n"));
+    assert!(cfg.contains("qos.if.1.type=uplink"));
+    assert!(!cfg.contains("maxspeed"), "nobody is limited yet");
+    for w in state["wlanconf"].as_array_mut().unwrap() {
+        w["usergroup_id"] = serde_json::json!("g-slow");
+    }
+    let cfg = render(&state, AP_B, "x").rendered.system_cfg;
+    assert!(cfg.contains("qos.vap.1.dwnlink.maxspeed=5000"), "{cfg}");
+    assert!(cfg.contains("qos.vap.1.uplink.1.maxspeed=1000"));
+}
+
+#[test]
+fn schedules_reach_the_vaps() {
+    let mut state = state();
+    for w in state["wlanconf"].as_array_mut().unwrap() {
+        w["schedule_with_duration"] = serde_json::json!([{ "start_days_of_week": ["mon"], "start_hour": 1, "start_minute": 0, "duration_minutes": 300 }]);
+    }
+    let cfg = render(&state, AP_B, "x").rendered.system_cfg;
+    assert!(cfg.contains(".schedule_enabled=enabled"));
+    assert!(cfg.contains("syswrapper.sh schedule-action"));
+    // The fixture APs report both capabilities: inverted blocks, one key per block.
+    assert!(cfg.contains(".schedule_invert=enabled"), "{cfg}");
+    assert!(cfg.contains(".schedule_mon.0=0100-0600"));
+}

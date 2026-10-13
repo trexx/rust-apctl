@@ -13,9 +13,13 @@
 //!
 //! Not implemented, because nothing in our data exercises it yet: wireless meshing
 //! (vport uplinks and mesh downlink VAPs when `connectivity` is enabled), a tagged
-//! management VLAN (rejected with an error), guest portal / guest ebtables chains and
-//! QoS, OWE transition companions, RadSec, Hotspot 2.0, WLAN schedules, 6 GHz `freq`,
-//! site `config.properties` overrides and the `mdns_sd` "auto" service list.
+//! management VLAN (rejected with an error), guest portal / guest ebtables chains,
+//! QoS mark rules for APs without mark bits, OWE transition companions, RadSec,
+//! Hotspot 2.0, 6 GHz `freq`, site `config.properties` overrides and the `mdns_sd`
+//! "auto" service list.
+//!
+//! Written from the official logic but not yet checked against a capture (none of
+//! our data uses them): WLAN schedules (`schedule_*` lines) and speed limits (`qos`).
 
 mod cfg;
 mod javahash;

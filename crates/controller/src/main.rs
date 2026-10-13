@@ -18,6 +18,7 @@ mod firmware;
 mod insights;
 mod logevents;
 mod model;
+mod ratelimit;
 mod settings;
 mod shadow;
 mod store;
@@ -292,6 +293,7 @@ async fn serve(args: ServeArgs) -> Result<()> {
     firmware::schedule(writer.clone());
     let state = api::AppState { backups: Some(backups), active, writer: Some(writer.clone()), store, vendors: Arc::new(vendors), renderer, auth, engine: in_tx.clone(), live, tx: live_tx, started: store::now_ts(), source: source_desc };
     channelai::schedule(state.clone());
+    ratelimit::spawn(state.clone());
     let app = api::router(state);
     let listener = tokio::net::TcpListener::bind(listen).await.with_context(|| format!("binding {listen}"))?;
     tracing::info!("web UI and API on http://{listen}");

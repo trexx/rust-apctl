@@ -80,6 +80,7 @@ const WLAN_FIELDS: &[&str] = &[
     "mcastenhance_enabled", "multicast_suppressor_mode", "bc_filter_enabled", "bc_filter_list", "l2_isolation", "minrate_setting_preference",
     "minrate_ng_enabled", "minrate_ng_data_rate_kbps", "minrate_na_enabled", "minrate_na_data_rate_kbps", "dtim_mode", "dtim_ng", "dtim_na",
     "group_rekey", "mac_filter_enabled", "mac_filter_policy", "mac_filter_list", "is_guest", "networkconf_id", "country_beacon",
+    "usergroup_id", "schedule_with_duration",
 ];
 
 /// The id of a settings document (plain or `{"$oid": ...}`).
@@ -628,6 +629,19 @@ pub fn apply_wlan(state: &mut Value, body: &Value) -> Result<String, String> {
         w["mac_filter_list"] = json!(list);
     }
 
+    // Speed limit: a user group; empty means the default group (no limit).
+    if let Some(g) = p["usergroup_id"].as_str() {
+        let id = if g.is_empty() { ensure_default_usergroup(state) } else { g.to_string() };
+        if !docs(state, "usergroup").any(|x| id_of(x).as_deref() == Some(id.as_str())) {
+            return Err("unknown speed limit".into());
+        }
+        w["usergroup_id"] = json!(id);
+    }
+    // Blackout schedule: periods the SSID is off.
+    if !p["schedule_with_duration"].is_null() {
+        w["schedule_with_duration"] = json!(check_schedule(&p["schedule_with_duration"])?);
+    }
+
     // Network.
     if let Some(n) = p["networkconf_id"].as_str() {
         if !docs(state, "networkconf").any(|x| id_of(x).as_deref() == Some(n)) {
@@ -656,6 +670,56 @@ pub fn apply_wlan(state: &mut Value, body: &Value) -> Result<String, String> {
     Ok(if changed.is_empty() { format!("SSID \"{name}\": nothing changed") } else { format!("SSID \"{name}\": {}", changed.join(", ")) })
 }
 
+const DAY_NAMES: [&str; 7] = ["sun", "mon", "tue", "wed", "thu", "fri", "sat"];
+
+/// Checks blackout periods: days `sun`..`sat`, a start time, and a duration of
+/// at least a minute (apctl caps it at a week; the official controller has no cap).
+fn check_schedule(v: &Value) -> Result<Vec<Value>, String> {
+    let list = v.as_array().ok_or("the schedule must be a list")?;
+    if list.len() > 50 {
+        return Err("at most 50 blackout periods".into());
+    }
+    let mut out = Vec::new();
+    for e in list {
+        let days: Vec<String> = e["start_days_of_week"].as_array().into_iter().flatten().filter_map(|d| d.as_str().map(str::to_ascii_lowercase)).collect();
+        if days.is_empty() || days.iter().any(|d| !DAY_NAMES.contains(&d.as_str())) {
+            return Err("each blackout period needs its days (sun to sat)".into());
+        }
+        let hour = int_field(e, "start_hour", 0, 23)?.ok_or("each blackout period needs a start hour")?;
+        let minute = int_field(e, "start_minute", 0, 59)?.unwrap_or(0);
+        let duration = int_field(e, "duration_minutes", 1, 7 * 1440)?.ok_or("each blackout period needs a duration")?;
+        let mut entry = json!({ "start_days_of_week": days, "start_hour": hour, "start_minute": minute, "duration_minutes": duration });
+        if let Some(n) = e["name"].as_str().filter(|n| !n.is_empty()) {
+            entry["name"] = json!(n.chars().take(64).collect::<String>());
+        }
+        out.push(entry);
+    }
+    Ok(out)
+}
+
+/// The default user group, created when the settings have none (imports made
+/// before apctl read user groups). It keeps the id the SSIDs already point at.
+pub fn ensure_default_usergroup(state: &mut Value) -> String {
+    if let Some(id) = default_usergroup(state) {
+        return id;
+    }
+    let id = docs(state, "wlanconf").find_map(|w| w["usergroup_id"].as_str().filter(|g| !g.is_empty()).map(str::to_string)).unwrap_or_else(new_id);
+    let mut doc = json!({ "_id": id, "name": "Default", "attr_hidden_id": "Default", "attr_no_delete": true, "qos_rate_max_down": -1, "qos_rate_max_up": -1 });
+    if let Some(site) = site_id(state) {
+        doc["site_id"] = json!(site);
+    }
+    if !state["usergroup"].is_array() {
+        state["usergroup"] = json!([]);
+    }
+    state["usergroup"].as_array_mut().unwrap().push(doc);
+    id
+}
+
+/// The id of the site's default user group (no speed limit).
+pub fn default_usergroup(state: &Value) -> Option<String> {
+    docs(state, "usergroup").find(|g| g["attr_hidden_id"].as_str() == Some("Default")).and_then(id_of)
+}
+
 /// Site-wide list limits: 256 broadcast-filter addresses in all, 512 MAC-filter
 /// addresses over SSIDs on the same APs.
 fn check_list_limits(state: &Value) -> Result<(), String> {
@@ -680,8 +744,7 @@ pub fn create_wlan(state: &mut Value, body: &Value) -> Result<String, String> {
     let site = site_id(state).ok_or("the settings have no APs")?;
     let all = default_group(state).ok_or("the settings have no default AP group")?;
     let network = docs(state, "networkconf").find(|n| n["attr_hidden_id"].as_str() == Some("LAN")).or_else(|| docs(state, "networkconf").next()).and_then(id_of);
-    // The user group (speed limits) of the existing SSIDs; empty means the default.
-    let usergroup = docs(state, "wlanconf").find_map(|w| w["usergroup_id"].as_str().map(str::to_string)).unwrap_or_default();
+    let usergroup = ensure_default_usergroup(state);
     let short_id = docs(state, "wlanconf").filter_map(|w| w["short_id"].as_i64()).max().unwrap_or(0) + 1;
     let id = new_id();
     let mut iapp = [0u8; 16];
@@ -1036,5 +1099,217 @@ mod tests {
         s["wlanconf"][0]["iot_channel_lock"] = json!(true);
         assert!(dev(&mut s, json!({ "radios": [{ "radio": "ng", "channel": 6 }] })).unwrap_err().contains("IoT"));
         dev(&mut s, json!({ "radios": [{ "radio": "ng", "tx_power_mode": "low" }] })).unwrap();
+    }
+}
+
+// ---- Speed limits (user groups) -----------------------------------------------
+
+/// A limit in kbps: -1 (none) or 2 to 100000, as the official controller allows.
+fn rate(v: &Value, what: &str) -> Result<i64, String> {
+    match v.as_i64() {
+        Some(-1) => Ok(-1),
+        Some(n) if (2..=100_000).contains(&n) => Ok(n),
+        _ => Err(format!("the {what} limit must be 2 to 100000 kbps, or -1 for none")),
+    }
+}
+
+/// Who uses a user group: SSID and client names.
+fn group_users(state: &Value, id: &str) -> Vec<String> {
+    let mut out: Vec<String> = docs(state, "wlanconf").filter(|w| w["usergroup_id"].as_str() == Some(id)).map(|w| format!("SSID {}", w["name"].as_str().unwrap_or("?"))).collect();
+    out.extend(
+        state["clients"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|c| c["usergroup_id"].as_str() == Some(id))
+            .map(|c| format!("client {}", c["name"].as_str().or(c["hostname"].as_str()).or(c["mac"].as_str()).unwrap_or("?"))),
+    );
+    out
+}
+
+/// Creates (`body.id` null), edits or deletes (`body.delete`) a user group.
+pub fn apply_usergroup(state: &mut Value, body: &Value) -> Result<String, String> {
+    ensure_default_usergroup(state);
+    let id = body["id"].as_str().map(str::to_string);
+    if body["delete"].as_bool() == Some(true) {
+        let id = id.ok_or("which speed limit?")?;
+        let g = docs(state, "usergroup").find(|g| id_of(g).as_deref() == Some(id.as_str())).ok_or("unknown speed limit")?.clone();
+        if g["attr_no_delete"].as_bool() == Some(true) {
+            return Err("the default speed limit cannot be deleted".into());
+        }
+        let users = group_users(state, &id);
+        if !users.is_empty() {
+            return Err(format!("still used by {}", users.join(", ")));
+        }
+        state["usergroup"].as_array_mut().unwrap().retain(|x| id_of(x).as_deref() != Some(id.as_str()));
+        return Ok(format!("deleted speed limit \"{}\"", g["name"].as_str().unwrap_or("?")));
+    }
+    let p = &body["patch"];
+    let name = p["name"].as_str().map(str::trim);
+    if name.is_some_and(|n| n.is_empty() || n.chars().count() > 128) {
+        return Err("the name must be 1 to 128 characters".into());
+    }
+    let down = if p["qos_rate_max_down"].is_null() { None } else { Some(rate(&p["qos_rate_max_down"], "download")?) };
+    let up = if p["qos_rate_max_up"].is_null() { None } else { Some(rate(&p["qos_rate_max_up"], "upload")?) };
+    if let Some(n) = name
+        && docs(state, "usergroup").any(|g| g["name"].as_str() == Some(n) && id_of(g) != id)
+    {
+        return Err(format!("another speed limit is called \"{n}\""));
+    }
+    let site = site_id(state);
+    let list = state["usergroup"].as_array_mut().unwrap();
+    let (g, created) = match &id {
+        Some(id) => (list.iter_mut().find(|g| id_of(g).as_deref() == Some(id.as_str())).ok_or("unknown speed limit")?, false),
+        None => {
+            let n = name.ok_or("the new speed limit needs a name")?;
+            let mut doc = json!({ "_id": new_id(), "name": n, "qos_rate_max_down": -1, "qos_rate_max_up": -1 });
+            if let Some(s) = site {
+                doc["site_id"] = json!(s);
+            }
+            list.push(doc);
+            (list.last_mut().unwrap(), true)
+        }
+    };
+    if let Some(n) = name {
+        g["name"] = json!(n);
+    }
+    if let Some(d) = down {
+        g["qos_rate_max_down"] = json!(d);
+    }
+    if let Some(u) = up {
+        g["qos_rate_max_up"] = json!(u);
+    }
+    let show = |v: &Value| match v.as_i64() {
+        Some(n) if n > 0 => format!("{} Mbps", n as f64 / 1000.0),
+        _ => "none".into(),
+    };
+    Ok(format!(
+        "{} speed limit \"{}\": down {}, up {}",
+        if created { "added" } else { "changed" },
+        g["name"].as_str().unwrap_or("?"),
+        show(&g["qos_rate_max_down"]),
+        show(&g["qos_rate_max_up"])
+    ))
+}
+
+/// Sets a client's own speed limit (`body.mac`, `body.usergroup_id`; null or
+/// empty removes it, so the SSID's applies).
+pub fn apply_client_group(state: &mut Value, body: &Value) -> Result<String, String> {
+    let mac = body["mac"].as_str().ok_or("which client?")?.to_ascii_lowercase();
+    if !is_mac(&mac) {
+        return Err("invalid MAC address".into());
+    }
+    let group = body["usergroup_id"].as_str().filter(|g| !g.is_empty()).map(str::to_string);
+    let name = match &group {
+        Some(g) => docs(state, "usergroup").find(|x| id_of(x).as_deref() == Some(g.as_str())).ok_or("unknown speed limit")?["name"].as_str().unwrap_or("?").to_string(),
+        None => String::new(),
+    };
+    crate::actions::edit_client(state, &mac, &[("usergroup_id", group.clone().map_or(Value::Null, Value::String))])?;
+    Ok(match group {
+        Some(_) => format!("client {mac}: speed limit \"{name}\""),
+        None => format!("client {mac}: no own speed limit"),
+    })
+}
+
+/// GET /api/settings/usergroups
+pub async fn usergroups(State(s): State<AppState>) -> Result<Json<Value>, ApiError> {
+    let state = s.live.read().unwrap().state.clone();
+    let Some(state) = state else { return Ok(Json(json!({ "active": s.active, "groups": [] }))) };
+    let mut with_default = (*state).clone();
+    ensure_default_usergroup(&mut with_default);
+    let groups: Vec<Value> = docs(&with_default, "usergroup")
+        .map(|g| {
+            let id = id_of(g).unwrap_or_default();
+            json!({
+                "id": id, "name": g["name"], "default": g["attr_hidden_id"].as_str() == Some("Default"),
+                "qos_rate_max_down": g["qos_rate_max_down"], "qos_rate_max_up": g["qos_rate_max_up"], "used_by": group_users(&with_default, &id),
+            })
+        })
+        .collect();
+    Ok(Json(json!({ "active": s.active, "groups": groups })))
+}
+
+/// POST /api/settings/usergroups {patch}
+pub async fn post_usergroup(State(s): State<AppState>, headers: HeaderMap, Query(q): Query<PreviewQuery>, Json(b): Json<Patch>) -> Result<Json<Value>, ApiError> {
+    change(&s, &headers, &q, apply_usergroup, json!({ "patch": b.patch })).await
+}
+
+/// PUT /api/settings/usergroups/{id} {patch}
+pub async fn put_usergroup(State(s): State<AppState>, headers: HeaderMap, Path(id): Path<String>, Query(q): Query<PreviewQuery>, Json(b): Json<Patch>) -> Result<Json<Value>, ApiError> {
+    change(&s, &headers, &q, apply_usergroup, json!({ "id": id, "patch": b.patch })).await
+}
+
+/// DELETE /api/settings/usergroups/{id}
+pub async fn delete_usergroup(State(s): State<AppState>, headers: HeaderMap, Path(id): Path<String>, Query(q): Query<PreviewQuery>) -> Result<Json<Value>, ApiError> {
+    change(&s, &headers, &q, apply_usergroup, json!({ "id": id, "delete": true })).await
+}
+
+#[derive(Deserialize)]
+pub struct ClientGroupBody {
+    usergroup_id: Option<String>,
+}
+
+/// PUT /api/clients/{mac}/speed-limit {usergroup_id}
+pub async fn put_client_group(State(s): State<AppState>, headers: HeaderMap, Path(mac): Path<String>, Query(q): Query<PreviewQuery>, Json(b): Json<ClientGroupBody>) -> Result<Json<Value>, ApiError> {
+    change(&s, &headers, &q, apply_client_group, json!({ "mac": mac, "usergroup_id": b.usergroup_id })).await
+}
+
+#[cfg(test)]
+mod speed_and_schedule_tests {
+    use super::*;
+
+    fn state() -> Value {
+        json!({
+            "devices": [{ "mac": "02:00:00:00:00:01", "site_id": "s1", "radio_table": [] }],
+            "apgroup": [{ "_id": "g0", "attr_hidden_id": "default", "site_id": "s1" }],
+            "wlanconf": [{ "_id": "w1", "site_id": "s1", "name": "Home", "security": "open", "wlan_bands": ["5g"], "ap_group_ids": ["g0"], "usergroup_id": "ug-imported" }],
+            "clients": [{ "mac": "aa:bb:cc:00:00:01", "name": "tv" }],
+        })
+    }
+
+    #[test]
+    fn the_default_group_keeps_the_id_the_ssids_use() {
+        let mut s = state();
+        assert_eq!(ensure_default_usergroup(&mut s), "ug-imported");
+        assert_eq!(ensure_default_usergroup(&mut s), "ug-imported", "made once");
+        assert_eq!(s["usergroup"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn speed_limits_are_checked_and_not_deleted_while_used() {
+        let mut s = state();
+        let what = apply_usergroup(&mut s, &json!({ "patch": { "name": "Kids", "qos_rate_max_down": 5000, "qos_rate_max_up": -1 } })).unwrap();
+        assert!(what.contains("down 5 Mbps, up none"), "{what}");
+        let id = id_of(s["usergroup"].as_array().unwrap().iter().find(|g| g["name"] == "Kids").unwrap()).unwrap();
+        assert!(apply_usergroup(&mut s, &json!({ "id": id, "patch": { "qos_rate_max_down": 1 } })).is_err(), "0 and 1 kbps are not allowed");
+        assert!(apply_usergroup(&mut s, &json!({ "patch": { "name": "Kids" } })).is_err(), "names are unique");
+        apply_client_group(&mut s, &json!({ "mac": "AA:BB:CC:00:00:01", "usergroup_id": id })).unwrap();
+        let err = apply_usergroup(&mut s, &json!({ "id": id, "delete": true })).unwrap_err();
+        assert!(err.contains("client tv"), "{err}");
+        apply_client_group(&mut s, &json!({ "mac": "aa:bb:cc:00:00:01", "usergroup_id": null })).unwrap();
+        apply_usergroup(&mut s, &json!({ "id": id, "delete": true })).unwrap();
+        assert!(apply_usergroup(&mut s, &json!({ "id": "ug-imported", "delete": true })).is_err(), "the default stays");
+        // An SSID back to "no limit" points at the default group.
+        apply_wlan(&mut s, &json!({ "id": "w1", "patch": { "usergroup_id": "" } })).unwrap();
+        assert_eq!(s["wlanconf"][0]["usergroup_id"], "ug-imported");
+        assert!(apply_wlan(&mut s, &json!({ "id": "w1", "patch": { "usergroup_id": "nope" } })).is_err());
+    }
+
+    #[test]
+    fn blackout_schedules_are_checked() {
+        let mut s = state();
+        let ok = json!([{ "start_days_of_week": ["Mon", "tue"], "start_hour": 22, "start_minute": 30, "duration_minutes": 480, "name": "night" }]);
+        apply_wlan(&mut s, &json!({ "id": "w1", "patch": { "schedule_with_duration": ok } })).unwrap();
+        assert_eq!(s["wlanconf"][0]["schedule_with_duration"][0]["start_days_of_week"], json!(["mon", "tue"]));
+        for bad in [
+            json!([{ "start_days_of_week": [], "start_hour": 1, "duration_minutes": 10 }]),
+            json!([{ "start_days_of_week": ["mon"], "start_hour": 24, "duration_minutes": 10 }]),
+            json!([{ "start_days_of_week": ["mon"], "start_hour": 1, "duration_minutes": 0 }]),
+            json!([{ "start_days_of_week": ["funday"], "start_hour": 1, "duration_minutes": 10 }]),
+        ] {
+            assert!(apply_wlan(&mut s, &json!({ "id": "w1", "patch": { "schedule_with_duration": bad } })).is_err(), "{bad}");
+        }
+        apply_wlan(&mut s, &json!({ "id": "w1", "patch": { "schedule_with_duration": [] } })).unwrap();
+        assert_eq!(s["wlanconf"][0]["schedule_with_duration"], json!([]));
     }
 }

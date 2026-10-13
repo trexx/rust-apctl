@@ -84,6 +84,7 @@ export function Client() {
             blocked={c?.blocked ?? listed?.blocked ?? false}
             lockedTo={c?.locked_to ?? listed?.locked_to ?? null}
             aps={devices.data ?? []}
+            usergroupId={c?.usergroup_id ?? listed?.usergroup_id ?? null}
           />
           {(c?.blocked ?? listed?.blocked) && (
             <div className="banner">

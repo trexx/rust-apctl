@@ -4,7 +4,9 @@ import { useQueryClient } from "@tanstack/react-query";
 import {
   changeSettings,
   useDeviceSettings,
+  speed,
   useMe,
+  useUserGroups,
   useWlanSettings,
   wlanPassphrase,
 } from "../api";
@@ -13,6 +15,7 @@ import type {
   RadioSettings,
   SettingsPreview,
   SettingsTarget,
+  UserGroup,
   WlanSettings,
   WlanSettingsList,
 } from "../api";
@@ -383,6 +386,14 @@ export function WlanEditor({
           </select>
         </Row>
       )}
+      <SpeedLimitRow
+        value={f.usergroup_id}
+        onChange={(v) => set("usergroup_id", v)}
+      />
+      <ScheduleEditor
+        value={f.schedule_with_duration}
+        onChange={(v) => set("schedule_with_duration", v)}
+      />
       <details>
         <summary>Roaming</summary>
         <Row label="Fast roaming" hint="802.11r">
@@ -622,6 +633,351 @@ export function WlanEditor({
           {nothing ? "No changes" : "Review changes"}
         </button>
       </div>
+    </div>
+  );
+}
+
+/** The SSID's speed limit: a user group; the default group means none. */
+function SpeedLimitRow({
+  value,
+  onChange,
+}: {
+  value: unknown;
+  onChange: (v: string) => void;
+}) {
+  const groups = useUserGroups().data?.groups ?? [];
+  const def = groups.find((g) => g.default);
+  const current = typeof value === "string" && value !== def?.id ? value : "";
+  return (
+    <Row label="Speed limit" hint="per client on this SSID">
+      <select value={current} onChange={(e) => onChange(e.target.value)}>
+        <option value="">No limit</option>
+        {groups
+          .filter((g) => !g.default)
+          .map((g) => (
+            <option key={g.id} value={g.id}>
+              {g.name} (down {speed(g.qos_rate_max_down)}, up{" "}
+              {speed(g.qos_rate_max_up)})
+            </option>
+          ))}
+      </select>
+      {groups.length <= 1 && (
+        <span className="muted small">add limits under Speed limits below</span>
+      )}
+    </Row>
+  );
+}
+
+const WEEK = ["sun", "mon", "tue", "wed", "thu", "fri", "sat"] as const;
+const WEEK_LABEL: Record<string, string> = {
+  sun: "Su",
+  mon: "Mo",
+  tue: "Tu",
+  wed: "We",
+  thu: "Th",
+  fri: "Fr",
+  sat: "Sa",
+};
+
+interface Blackout {
+  start_days_of_week: string[];
+  start_hour: number;
+  start_minute: number;
+  duration_minutes: number;
+  name?: string;
+}
+
+const time = (m: number) =>
+  `${String(Math.floor(m / 60) % 24).padStart(2, "0")}:${String(m % 60).padStart(2, "0")}`;
+const minutes = (t: string) => {
+  const [h, m] = t.split(":").map(Number);
+  return (h || 0) * 60 + (m || 0);
+};
+
+/** Blackout periods: when the SSID is off. An end at or before the start runs past midnight. */
+function ScheduleEditor({
+  value,
+  onChange,
+}: {
+  value: unknown;
+  onChange: (v: Blackout[]) => void;
+}) {
+  const list = (Array.isArray(value) ? value : []) as Blackout[];
+  const update = (i: number, e: Partial<Blackout>) =>
+    onChange(list.map((x, j) => (j === i ? { ...x, ...e } : x)));
+  return (
+    <details open={list.length > 0}>
+      <summary>
+        Schedule
+        {list.length > 0
+          ? ` (${list.length} off period${list.length === 1 ? "" : "s"})`
+          : ": always on"}
+      </summary>
+      <p className="muted small">
+        Times this SSID is off, in the site's time zone. The APs follow it on
+        their own clock.
+      </p>
+      {list.map((e, i) => {
+        const start = e.start_hour * 60 + e.start_minute;
+        const end = (start + e.duration_minutes) % 1440;
+        const days = Math.floor((start + e.duration_minutes - 1) / 1440);
+        return (
+          <div key={i} className="form-row">
+            <div className="form-label">
+              <input
+                className="search"
+                placeholder="Name (optional)"
+                value={e.name ?? ""}
+                onChange={(ev) => update(i, { name: ev.target.value })}
+              />
+            </div>
+            <div className="form-control">
+              {WEEK.map((d) => (
+                <label key={d} className="check">
+                  <input
+                    type="checkbox"
+                    checked={e.start_days_of_week.includes(d)}
+                    onChange={(ev) =>
+                      update(i, {
+                        start_days_of_week: ev.target.checked
+                          ? [...e.start_days_of_week, d]
+                          : e.start_days_of_week.filter((x) => x !== d),
+                      })
+                    }
+                  />
+                  {WEEK_LABEL[d]}
+                </label>
+              ))}
+              <label className="small">
+                off from{" "}
+                <input
+                  type="time"
+                  className="search time-input"
+                  value={time(start)}
+                  onChange={(ev) => {
+                    const s = minutes(ev.target.value);
+                    update(i, {
+                      start_hour: Math.floor(s / 60),
+                      start_minute: s % 60,
+                      duration_minutes: (end - s + 1440) % 1440 || 1440,
+                    });
+                  }}
+                />
+              </label>
+              <label className="small">
+                until{" "}
+                <input
+                  type="time"
+                  className="search time-input"
+                  value={time(end)}
+                  onChange={(ev) =>
+                    update(i, {
+                      duration_minutes:
+                        (minutes(ev.target.value) - start + 1440) % 1440 ||
+                        1440,
+                    })
+                  }
+                />
+                {days > 0 && <span className="muted"> next day</span>}
+              </label>
+              <button
+                className="btn small"
+                onClick={() => onChange(list.filter((_, j) => j !== i))}
+              >
+                Remove
+              </button>
+            </div>
+          </div>
+        );
+      })}
+      <button
+        className="btn small"
+        onClick={() =>
+          onChange([
+            ...list,
+            {
+              start_days_of_week: ["mon", "tue", "wed", "thu", "fri"],
+              start_hour: 0,
+              start_minute: 0,
+              duration_minutes: 360,
+            },
+          ])
+        }
+      >
+        Add off period
+      </button>
+    </details>
+  );
+}
+
+function SpeedLimitEditor({
+  group,
+  onClose,
+  active,
+}: {
+  group: UserGroup | null;
+  onClose: () => void;
+  active: boolean;
+}) {
+  const mbps = (k: number | null | undefined) =>
+    k && k > 0 ? String(k / 1000) : "";
+  const [name, setName] = useState(group?.name ?? "");
+  const [down, setDown] = useState(mbps(group?.qos_rate_max_down));
+  const [up, setUp] = useState(mbps(group?.qos_rate_max_up));
+  const [review, setReview] = useState<Fields | null>(null);
+  const kbps = (v: string) =>
+    v.trim() === "" ? -1 : Math.round(Number(v) * 1000);
+  const patch: Fields = {
+    name,
+    qos_rate_max_down: kbps(down),
+    qos_rate_max_up: kbps(up),
+  };
+  if (review)
+    return (
+      <Review
+        target={{ kind: "usergroup", id: group?.id ?? null }}
+        patch={review}
+        active={active}
+        onBack={() => setReview(null)}
+        onSaved={onClose}
+      />
+    );
+  return (
+    <div className="settings-form">
+      {!group?.default && (
+        <Row label="Name">
+          <input
+            className="search"
+            maxLength={128}
+            value={name}
+            onChange={(e) => setName(e.target.value)}
+          />
+        </Row>
+      )}
+      <Row label="Download" hint="Mbps per client; empty for no limit">
+        <input
+          className="search num-input"
+          type="number"
+          min={0.002}
+          max={100}
+          step="any"
+          value={down}
+          onChange={(e) => setDown(e.target.value)}
+        />
+      </Row>
+      <Row label="Upload" hint="Mbps per client; empty for no limit">
+        <input
+          className="search num-input"
+          type="number"
+          min={0.002}
+          max={100}
+          step="any"
+          value={up}
+          onChange={(e) => setUp(e.target.value)}
+        />
+      </Row>
+      <div className="actions-row">
+        <button className="btn" onClick={onClose}>
+          Cancel
+        </button>
+        <button
+          className="btn primary"
+          disabled={!name.trim()}
+          onClick={() =>
+            setReview(
+              group?.default
+                ? { qos_rate_max_down: kbps(down), qos_rate_max_up: kbps(up) }
+                : patch,
+            )
+          }
+        >
+          Review changes
+        </button>
+      </div>
+    </div>
+  );
+}
+
+/** Speed limits (user groups): used by SSIDs and by single clients. */
+export function SpeedLimitsPanel() {
+  const g = useUserGroups();
+  const readOnly = useMe().data?.read_only ?? true;
+  const [editing, setEditing] = useState<string | "new" | null>(null);
+  const [removing, setRemoving] = useState<UserGroup | null>(null);
+  if (!g.data) return null;
+  const { active, groups } = g.data;
+  const current = groups.find((x) => x.id === editing) ?? null;
+  return (
+    <div className="panel">
+      <div className="panel-head">
+        <b>Speed limits</b>
+        <span className="muted small">
+          per client, for an SSID or a single device
+        </span>
+        <span className="spacer" />
+        {!readOnly && editing === null && !removing && (
+          <button className="btn small" onClick={() => setEditing("new")}>
+            Add speed limit
+          </button>
+        )}
+      </div>
+      {removing ? (
+        <Review
+          target={{ kind: "usergroup", id: removing.id, remove: true }}
+          patch={{}}
+          active={active}
+          onBack={() => setRemoving(null)}
+          onSaved={() => setRemoving(null)}
+        />
+      ) : editing !== null ? (
+        <SpeedLimitEditor
+          key={editing}
+          group={editing === "new" ? null : current}
+          active={active}
+          onClose={() => setEditing(null)}
+        />
+      ) : (
+        <div className="table-wrap">
+          <table className="table">
+            <tbody>
+              {groups.map((x) => (
+                <tr key={x.id}>
+                  <td>
+                    <b>{x.default ? "No limit (default)" : x.name}</b>
+                  </td>
+                  <td className="small">
+                    down {speed(x.qos_rate_max_down)} · up{" "}
+                    {speed(x.qos_rate_max_up)}
+                  </td>
+                  <td className="muted small">
+                    {x.used_by.length ? x.used_by.join(", ") : "unused"}
+                  </td>
+                  <td className="nowrap">
+                    {!readOnly && !x.default && (
+                      <>
+                        <button
+                          className="btn small"
+                          onClick={() => setEditing(x.id)}
+                        >
+                          Edit
+                        </button>{" "}
+                        <button
+                          className="btn small"
+                          disabled={x.used_by.length > 0}
+                          title={x.used_by.length ? "still in use" : ""}
+                          onClick={() => setRemoving(x)}
+                        >
+                          Delete
+                        </button>
+                      </>
+                    )}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
     </div>
   );
 }
