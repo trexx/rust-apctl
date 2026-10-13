@@ -699,6 +699,65 @@ export const useWlans = (span: TimeSpan) =>
     placeholderData: (p) => p,
   });
 
+export interface BackupSettings {
+  enabled: boolean;
+  frequency: "daily" | "weekly" | "monthly";
+  minute_utc: number;
+  weekday: number;
+  monthday: number;
+  keep: number;
+  days: number;
+}
+
+export interface BackupMeta {
+  name: string;
+  kind: "auto" | "manual" | "pre-restore";
+  version: string;
+  created: number;
+  days: number;
+  size: number;
+  encrypted: boolean;
+}
+
+export interface BackupManifest {
+  version: string;
+  created: number;
+  days: number;
+  files: Record<string, { size: number; sha256: string }>;
+}
+
+export const useBackups = () =>
+  useQuery({
+    queryKey: ["backups"],
+    queryFn: () =>
+      get<{ encrypted: boolean; version: string; settings: BackupSettings; next_run: number | null; backups: BackupMeta[]; restore_pending: boolean }>("/api/backups"),
+  });
+
+export const saveBackupSettings = (s: BackupSettings) => send("PUT", "/api/backups/settings", s);
+export const createBackup = (days: number) => send<BackupMeta>("POST", "/api/backups", { days });
+export const deleteBackup = (name: string) => send("DELETE", `/api/backups/file/${encodeURIComponent(name)}`, {});
+export const restoreBackup = (target: { name?: string; staged?: string }) => send<{ ok: boolean }>("POST", "/api/backups/restore", target);
+
+/** Uploads a backup file to be checked and staged (not restored yet). */
+export async function uploadBackup(file: File): Promise<{ staged: string; manifest: BackupManifest }> {
+  const res = await fetch("/api/backups/upload", {
+    method: "POST",
+    headers: { "Content-Type": "application/octet-stream", "X-Requested-With": "apctl" },
+    body: file,
+  });
+  if (res.status === 401) unauthorized();
+  if (!res.ok) {
+    let msg = `${res.status} ${res.statusText}`;
+    try {
+      msg = (await res.json()).error ?? msg;
+    } catch {
+      /* not JSON */
+    }
+    throw new Error(msg);
+  }
+  return res.json();
+}
+
 export const useMulticast = (span: TimeSpan, mac?: Mac) =>
   useQuery({
     queryKey: ["multicast", span, mac],

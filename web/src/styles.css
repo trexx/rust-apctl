@@ -1287,3 +1287,35 @@ td .tag {
   align-items: baseline;
   font-size: 13px;
 }
+
+.backup-form {
+  display: grid;
+  gap: 8px;
+  margin-bottom: 12px;
+}
+.backup-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.backup-actions {
+  margin: 4px 0 10px;
+  padding-top: 10px;
+  border-top: 1px solid var(--border);
+}
+input.search.time-input {
+  width: 120px;
+  min-width: 0;
+}
+input.search.num-input {
+  width: 70px;
+  min-width: 0;
+}
+.upload-btn {
+  cursor: pointer;
+}
+.restore-confirm {
+  display: grid;
+  gap: 8px;
+}

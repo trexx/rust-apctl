@@ -46,6 +46,8 @@ pub enum Input {
     ThreatFound { ts: Ts, kind: &'static str, bssid: String, device_mac: Option<Mac>, data: Value, notify: bool },
     /// Mark every alert read.
     AlertsRead,
+    /// Store the automatic-backup settings (JSON).
+    SaveBackupSettings(String),
     /// Acknowledge a finding with an optional note (`Some`), or withdraw the acknowledgement (`None`).
     AckThreat { ts: Ts, kind: &'static str, bssid: String, note: Option<Option<String>> },
 }
@@ -303,6 +305,9 @@ impl Engine {
                 }
             }
             Input::AlertsRead => self.writer.exec(Db::Config, "UPDATE alerts SET read = 1 WHERE read = 0", vec![]),
+            Input::SaveBackupSettings(json) => {
+                self.writer.exec(Db::Config, "INSERT OR REPLACE INTO backup_settings (id, json) VALUES (1, ?1)", vec![Sql::Text(json)])
+            }
             Input::AckThreat { ts, kind, bssid, note } => match note {
                 Some(note) => self.writer.exec(
                     Db::Config,

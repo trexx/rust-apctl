@@ -3,6 +3,7 @@ import { useQueryClient } from "@tanstack/react-query";
 import { importState, useMe, useSettingsState } from "../api";
 import { ErrorNote, Loading } from "../components/common";
 import { NotificationSettings } from "../components/Alerts";
+import { BackupSection } from "../components/Backups";
 import { ago, clock } from "../format";
 
 export function Settings() {
@@ -46,6 +47,9 @@ export function Settings() {
       </div>
       <h2>Notifications</h2>
       <NotificationSettings />
+
+      <h2>Backups</h2>
+      <BackupSection />
 
       <h2>Controller settings</h2>
       <div className="panel">

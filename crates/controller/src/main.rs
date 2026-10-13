@@ -7,6 +7,7 @@ mod active;
 mod alerts;
 mod api;
 mod auth;
+mod backup;
 mod connections;
 mod dryrun;
 mod engine;
@@ -110,6 +111,10 @@ struct ServeArgs {
     /// Where to receive informs in active mode.
     #[arg(long, env = "APCTL_INFORM_LISTEN", default_value = "0.0.0.0:8080")]
     pub inform_listen: SocketAddr,
+    /// File holding the 64-hex-character key that encrypts backups (e.g. from a
+    /// SealedSecret). Without it backups are written unencrypted.
+    #[arg(long, env = "APCTL_BACKUP_KEY")]
+    pub backup_key: Option<PathBuf>,
 }
 
 #[tokio::main]
@@ -143,7 +148,7 @@ async fn main() -> Result<()> {
 async fn serve(args: ServeArgs) -> Result<()> {
     let ServeArgs {
         data_dir, keys, shadow, shadow_cmd, inform_ports, listen, syslog_listen, users_file, emulate_version, active, inform_listen,
-        oui_file,
+        oui_file, backup_key,
     } = args;
     let vendors = match vendor::Vendors::load(&oui_file) {
         Ok(v) => {
@@ -162,6 +167,12 @@ async fn serve(args: ServeArgs) -> Result<()> {
     tracing::info!("loaded {} device keys and {} syslog keys", keys.len(), keys.syslog_len());
     let keys = Arc::new(keys);
 
+    let backups = backup::Backups { data_dir: data_dir.clone(), key: backup_key.as_deref().map(backup::load_key).transpose()? };
+    if backups.key.is_none() {
+        tracing::warn!("no --backup-key: backups are written unencrypted");
+    }
+    // A restore chosen in the UI is applied now, before the databases are opened.
+    backup::apply_pending(&backups)?;
     let (store, writer) = store::Store::open(&data_dir)?;
     let live: SharedLive = Default::default();
     let (live_tx, _) = broadcast::channel(4096);
@@ -271,7 +282,8 @@ async fn serve(args: ServeArgs) -> Result<()> {
     let auth = Arc::new(auth::Auth::new(users, &store, writer.clone())?);
     threats::watch(store.clone(), live.clone(), in_tx.clone());
     alerts::spawn(store.clone(), writer.clone(), live.clone(), live_tx.clone());
-    let state = api::AppState { store, vendors: Arc::new(vendors), renderer, auth, engine: in_tx.clone(), live, tx: live_tx, started: store::now_ts(), source: source_desc };
+    backup::schedule(backups.clone(), store.clone());
+    let state = api::AppState { backups: Some(backups), store, vendors: Arc::new(vendors), renderer, auth, engine: in_tx.clone(), live, tx: live_tx, started: store::now_ts(), source: source_desc };
     let app = api::router(state);
     let listener = tokio::net::TcpListener::bind(listen).await.with_context(|| format!("binding {listen}"))?;
     tracing::info!("web UI and API on http://{listen}");

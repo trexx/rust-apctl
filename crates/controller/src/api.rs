@@ -34,6 +34,7 @@ pub struct AppState {
     pub tx: broadcast::Sender<LiveMsg>,
     pub started: Ts,
     pub source: String,
+    pub backups: Option<crate::backup::Backups>,
 }
 
 pub fn router(state: AppState) -> Router {
@@ -60,6 +61,11 @@ pub fn router(state: AppState) -> Router {
         .route("/api/site/top", get(crate::insights::top))
         .route("/api/site/connectivity", get(crate::connections::connectivity))
         .route("/api/connections", get(crate::connections::list))
+        .route("/api/backups", get(crate::backup::index).post(crate::backup::create_now))
+        .route("/api/backups/settings", axum::routing::put(crate::backup::put_settings))
+        .route("/api/backups/file/{name}", get(crate::backup::download).delete(crate::backup::delete))
+        .route("/api/backups/upload", axum::routing::post(crate::backup::upload).layer(axum::extract::DefaultBodyLimit::max(1 << 30)))
+        .route("/api/backups/restore", axum::routing::post(crate::backup::restore))
         .route("/api/alerts", get(crate::alerts::list))
         .route("/api/alerts/read", axum::routing::post(crate::alerts::mark_read))
         .route("/api/wlans", get(crate::insights::wlans))
