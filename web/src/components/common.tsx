@@ -123,6 +123,7 @@ const EVENT_LABELS: Record<string, string> = {
   rogue_ap: "Rogue AP (reported by AP)",
   network_threat: "Suspicious network",
   client_kicked: "Client kicked",
+  client_wrong_password: "Wrong password?",
   client_steered: "Client steering",
   client_experience: "Poor experience",
   ap_crash: "AP crash",
@@ -153,7 +154,8 @@ function eventTone(kind: string, d?: Record<string, unknown>): string {
   if (
     kind === "client_kicked" ||
     kind === "client_experience" ||
-    kind === "ap_process_restarted"
+    kind === "ap_process_restarted" ||
+    kind === "client_wrong_password"
   )
     return "warn";
   if (kind === "network_threat")
@@ -205,6 +207,8 @@ function describe(e: AppEvent, names: DeviceNames): React.ReactNode {
         .join(" · ");
     case "dfs_radar":
       return d.channel ? `channel ${d.channel}` : "";
+    case "client_wrong_password":
+      return `failed the Wi-Fi handshake: the password it used is probably wrong${d.vap ? ` · ${d.vap}` : ""}`;
     case "client_kicked":
       return [
         d.reason ? `reason: ${d.reason}` : null,

@@ -8,6 +8,9 @@
 //!   candidate APs, and the client's answer (status 0 accepts);
 //! - `mcad` `log_sta_anomalies()`: why a client's experience is poor,
 //!   reported when the reasons change, not on every line;
+//! - `hostapd`: `AP-STA-POSSIBLE-PSK-MISMATCH <client>`, upstream hostapd's
+//!   report of a client failing the handshake with what looks like a wrong
+//!   password (not yet seen from these APs; matched strictly);
 //! - crashes, as the official controller detects them in netconsole output:
 //!   kernel oopses and panics, and processes killed by faults.
 
@@ -199,6 +202,17 @@ impl LogEvents {
             return out;
         }
 
+        if prog == "hostapd"
+            && let Some(rest) = msg.split("AP-STA-POSSIBLE-PSK-MISMATCH ").nth(1)
+            && let Some(c) = rest.split_whitespace().next().and_then(mac)
+        {
+            let vap = msg.split(':').next().filter(|v| v.starts_with("wifi")).map(str::to_string);
+            if self.fresh("client_wrong_password", &c.to_string(), line.ts, 600) {
+                out.push(Found { kind: "client_wrong_password", device: line.device_mac, client: Some(c), data: json!({ "vap": vap }) });
+            }
+            return out;
+        }
+
         if prog == "mcad" && msg.contains("log_sta_anomalies") {
             let client = field(msg, "sta=").and_then(mac);
             // A comma-separated list: read up to the next space.
@@ -311,6 +325,12 @@ mod tests {
         // A kernel panic is reported at once.
         let f = l.feed(&line(300, "kernel", "Kernel panic - not syncing: Fatal exception"));
         assert_eq!(f[0].data["kind"], "kernel panic");
+        // A wrong password, once per 10 minutes per client.
+        let f = l.feed(&line(500, "hostapd", "wifi1ap0: AP-STA-POSSIBLE-PSK-MISMATCH 0e:00:00:00:00:02"));
+        assert_eq!((f[0].kind, f[0].data["vap"].as_str()), ("client_wrong_password", Some("wifi1ap0")));
+        assert!(l.feed(&line(510, "hostapd", "wifi1ap0: AP-STA-POSSIBLE-PSK-MISMATCH 0e:00:00:00:00:02")).is_empty());
+        // Normal handshake lines are not mistaken for it.
+        assert!(l.feed(&line(520, "hostapd", "wifi1ap0: STA 0e:00:00:00:00:02 WPA: pairwise key handshake completed (RSN)")).is_empty());
         // Unrelated lines produce nothing.
         assert!(l.feed(&line(400, "dnsmasq", "query[A] example.com")).is_empty());
     }
