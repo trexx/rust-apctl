@@ -123,9 +123,12 @@ impl Sanitizer {
     fn field(&mut self, key: &str, value: &str) -> String {
         let k = key.to_ascii_lowercase();
         let last = k.rsplit('.').next().unwrap_or(&k);
+        // A bare `key` field names a settings document (`"key": "country"`); only
+        // dotted config keys ending in `.key` hold secrets.
+        let is_secret = cfgdiff::is_secret(&k) && k != "key";
         if value.is_empty() {
             value.to_string()
-        } else if cfgdiff::is_secret(&k)
+        } else if is_secret
             // The device SSH account name (stored as x_ssh_username in the controller).
             || (k.starts_with("users.") && last == "name")
             || (k.starts_with("cron.") && last == "user")
@@ -152,16 +155,19 @@ impl Sanitizer {
     }
 
     pub fn json(&mut self, v: &Value) -> Value {
-        self.json_at("", v)
+        self.json_at("", "", v)
     }
 
-    fn json_at(&mut self, key: &str, v: &Value) -> Value {
+    /// `parent` is the key of the enclosing object or array (e.g. `clients`).
+    fn json_at(&mut self, parent: &str, key: &str, v: &Value) -> Value {
         match v {
-            Value::Object(m) => {
-                Value::Object(m.iter().map(|(k, v)| (k.clone(), self.json_at(k, v))).collect())
-            }
-            Value::Array(a) => Value::Array(a.iter().map(|x| self.json_at(key, x)).collect()),
+            Value::Object(m) => Value::Object(m.iter().map(|(k, v)| (k.clone(), self.json_at(key, k, v))).collect()),
+            Value::Array(a) => Value::Array(a.iter().map(|x| self.json_at(parent, key, x)).collect()),
             Value::String(s) if key.ends_with("_cfg") => Value::String(self.cfg(s)),
+            // Names people gave their devices in the other controller.
+            Value::String(s) if key == "name" && (parent == "clients" || parent == "user") && !s.is_empty() => {
+                Value::String(self.fake("alias", s, |n| format!("alias-{n}")))
+            }
             Value::String(s) => Value::String(self.field(key, s)),
             other => other.clone(),
         }
@@ -177,13 +183,27 @@ impl Sanitizer {
         let lower = text.to_ascii_lowercase();
         for (kind, map) in &self.maps {
             for original in map.keys() {
-                if contains_value(&lower, &original.to_ascii_lowercase()) {
+                // Names and SSIDs under 4 characters ("tv", "Mac") collide with
+                // ordinary words such as the JSON key "mac"; they identify nothing.
+                if *kind != "secret" && original.chars().count() < 4 {
+                    continue;
+                }
+                let original = original.to_ascii_lowercase();
+                let found = if *kind == "secret" { contains_value(&lower, &original) } else { contains_word(&lower, &original) };
+                if found {
                     bail!("{what}: a {kind} value ({} chars) survived sanitising", original.len());
                 }
             }
         }
         Ok(())
     }
+}
+
+/// Whole-word match: names inside longer identifiers (a hostname inside an
+/// mDNS service code) are not leaks.
+fn contains_word(text: &str, value: &str) -> bool {
+    let is_word = |c: Option<char>| c.is_some_and(|c| c.is_ascii_alphanumeric());
+    text.match_indices(value).any(|(i, _)| !is_word(text[..i].chars().next_back()) && !is_word(text[i + value.len()..].chars().next()))
 }
 
 /// Substring match for long values; short values (e.g. an SSID called "test")
@@ -290,6 +310,10 @@ mod tests {
         s.check_clean(&text, "test").unwrap();
         assert!(s.check_clean("contains hunter22", "leak").is_err());
         assert_eq!(s.file_name("t_7845583c52bc_x.json"), "t_020000000001_x.json");
+        assert_eq!(s.json(&json!({ "key": "country" }))["key"], "country", "a settings document's name");
+        let v = s.json(&json!({ "clients": [{ "name": "Dad's phone" }], "wlanconf": [{ "name": "x" }] }));
+        assert_eq!(v["clients"][0]["name"], "alias-1");
+        assert!(contains_word("ssid=chromecast", "chromecast") && !contains_word("_googlecast._tcp", "googlecas"));
         assert_eq!(s.scrub("host kitchen-tv.lan"), "host name-1.lan");
         assert!(contains_value("ssid=test\n", "test") && !contains_value("testdata/x", "test"));
     }
