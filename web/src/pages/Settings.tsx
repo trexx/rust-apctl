@@ -8,7 +8,9 @@ export function Settings() {
   const qc = useQueryClient();
   const state = useSettingsState();
   const readOnly = useMe().data?.read_only ?? false;
-  const [message, setMessage] = useState<{ ok: boolean; text: string } | null>(null);
+  const [message, setMessage] = useState<{ ok: boolean; text: string } | null>(
+    null,
+  );
   const [busy, setBusy] = useState(false);
 
   const onFile = async (file: File | undefined) => {
@@ -19,9 +21,15 @@ export function Settings() {
       const snapshot = JSON.parse(await file.text());
       await importState(snapshot);
       setMessage({ ok: true, text: `Imported ${file.name}.` });
-      window.setTimeout(() => void qc.invalidateQueries({ queryKey: ["settings-state"] }), 500);
+      window.setTimeout(
+        () => void qc.invalidateQueries({ queryKey: ["settings-state"] }),
+        500,
+      );
     } catch (e) {
-      setMessage({ ok: false, text: e instanceof Error ? e.message : String(e) });
+      setMessage({
+        ok: false,
+        text: e instanceof Error ? e.message : String(e),
+      });
     } finally {
       setBusy(false);
     }
@@ -55,19 +63,33 @@ export function Settings() {
             <span>{s.clients}</span>
           </div>
         ) : (
-          <p className="muted">No settings imported yet. The dry run needs them to know what apctl should push.</p>
+          <p className="muted">
+            No settings imported yet. The dry run needs them to know what apctl
+            should push.
+          </p>
         )}
         {!readOnly && (
           <div className="import">
             <p className="muted small">
-              Import a snapshot of the existing controller's settings, made with <code>informdump import</code>. It replaces the current
-              settings and contains Wi-Fi passwords, so keep the file private.
+              Import a snapshot of the existing controller's settings, made with{" "}
+              <code>informdump import</code>. It replaces the current settings
+              and contains Wi-Fi passwords, so keep the file private.
             </p>
             <label className="btn">
               {busy ? "Importing…" : "Choose snapshot file…"}
-              <input type="file" accept="application/json,.json" hidden disabled={busy} onChange={(e) => void onFile(e.target.files?.[0])} />
+              <input
+                type="file"
+                accept="application/json,.json"
+                hidden
+                disabled={busy}
+                onChange={(e) => void onFile(e.target.files?.[0])}
+              />
             </label>
-            {message && <div className={message.ok ? "ok small" : "error small"}>{message.text}</div>}
+            {message && (
+              <div className={message.ok ? "ok small" : "error small"}>
+                {message.text}
+              </div>
+            )}
           </div>
         )}
       </div>

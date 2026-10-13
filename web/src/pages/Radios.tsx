@@ -5,6 +5,7 @@ import type { Neighbor, RadioOverview } from "../api";
 import { ago, bytes } from "../format";
 import { ApSpacing, BandPicker } from "../components/Insights";
 import { ThreatList } from "../components/Threats";
+import { RoamingView } from "../components/RoamingView";
 import { ErrorNote, Loading, Meter, Signal } from "../components/common";
 
 const BAND_NAME: Record<string, string> = { ng: "2.4 GHz", na: "5 GHz" };
@@ -489,6 +490,7 @@ function Environment() {
 const TABS = [
   ["channels", "Channels"],
   ["environment", "Environment"],
+  ["roaming", "Roaming"],
   ["rogue", "Rogue networks"],
 ] as const;
 
@@ -517,6 +519,8 @@ export function Radios() {
         <Channels />
       ) : tab === "environment" ? (
         <Environment />
+      ) : tab === "roaming" ? (
+        <RoamingView />
       ) : (
         <ThreatList />
       )}

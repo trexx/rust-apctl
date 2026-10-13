@@ -567,6 +567,137 @@ export const useDensity = (span: TimeSpan) =>
     placeholderData: (p) => p,
   });
 
+export interface Timings {
+  association: number | null;
+  authentication: number | null;
+  dhcp: number | null;
+  dns: number | null;
+  total: number | null;
+}
+
+export interface ConnAttempt {
+  ts: number;
+  client: Mac;
+  ap: Mac;
+  essid: string | null;
+  radio: string | null;
+  channel: number | null;
+  bw: number | null;
+  success: boolean;
+  stage: number;
+  failure: string | null;
+  rssi: number | null;
+  timings: Timings;
+  roam: boolean;
+  fixed_up: boolean;
+  reason: string | null;
+}
+
+export interface RoamEnd {
+  ap: Mac;
+  essid: string | null;
+  radio: string | null;
+  channel: number | null;
+  bw: number | null;
+  rssi: number | null;
+}
+
+export interface Roam {
+  ts: number;
+  client: Mac;
+  from: RoamEnd;
+  to: RoamEnd;
+  success: boolean;
+  gap_s: number | null;
+  fast: boolean;
+  min_rssi: boolean;
+  assistant: boolean;
+}
+
+export interface RoamDir {
+  attempts: number;
+  successes: number;
+  fast: number;
+  assistant: number;
+  min_rssi: number;
+}
+
+export interface Roaming {
+  from: number;
+  to: number;
+  roams: Roam[];
+  pairs: {
+    ap_1: Mac;
+    ap_2: Mac;
+    attempts: number;
+    successes: number;
+    success_pct: number;
+    forward: RoamDir;
+    backward: RoamDir;
+    top_clients: { mac: Mac; roams: number }[];
+  }[];
+  clients: { mac: Mac; roams: number; failed: number; fast: number; avg_leave_rssi: number | null; to_weaker: number; quick_returns: number }[];
+  ap_names: Record<string, string>;
+  client_names: Record<string, string>;
+}
+
+export interface Wlan {
+  essid: string;
+  settings: {
+    enabled: boolean;
+    security: string;
+    hidden: boolean;
+    guest: boolean;
+    network: string | null;
+    vlan: string | number | null;
+    bands: string[] | null;
+    fast_roaming: boolean;
+    bss_transition: boolean;
+    pmf: string | null;
+  } | null;
+  security_on_air: string | null;
+  broadcast: { ap: Mac; name: string | null; radio: string | null; channel: number | null; bssid: string; clients: number | null; online: boolean }[];
+  bands: string[];
+  ap_count: number;
+  clients: number;
+  peak_clients: number;
+  satisfaction: number | null;
+  satisfaction_avg: number | null;
+  signal_avg: number | null;
+  download_bytes: number;
+  upload_bytes: number;
+  tx_retry_pct: number | null;
+  multicast_pct: number | null;
+  series: { ts: number[]; clients: number[]; download_bps: number[]; upload_bps: number[] };
+}
+
+export const useConnections = (span: TimeSpan, opts: { client?: Mac; failed?: boolean } = {}) =>
+  useQuery({
+    queryKey: ["connections", span, opts],
+    queryFn: () =>
+      get<{ attempts: ConnAttempt[]; roams: Roam[]; ap_names: Record<string, string>; client_names: Record<string, string> }>(
+        `/api/connections${qs({ ...spanParams(span), client: opts.client, failed: opts.failed ? "true" : undefined })}`,
+      ),
+    refetchInterval: refreshFor(span, 60_000),
+    placeholderData: (p) => p,
+  });
+
+export const useRoaming = (span: TimeSpan) =>
+  useQuery({
+    queryKey: ["roaming", span],
+    queryFn: () => get<Roaming>(`/api/roaming${qs(spanParams(span))}`),
+    refetchInterval: refreshFor(span, 60_000),
+    placeholderData: (p) => p,
+  });
+
+export const useWlans = (span: TimeSpan) =>
+  useQuery({
+    queryKey: ["wlans", span],
+    queryFn: () => get<{ bucket: number; wlans: Wlan[] }>(`/api/wlans${qs(spanParams(span))}`),
+    refetchInterval: refreshFor(span, 60_000),
+    placeholderData: (p) => p,
+  });
+
 export const useMulticast = (span: TimeSpan, mac?: Mac) =>
   useQuery({
     queryKey: ["multicast", span, mac],

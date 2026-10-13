@@ -13,6 +13,8 @@ import { Client } from "./pages/Client";
 import { Events } from "./pages/Events";
 import { Logs } from "./pages/Logs";
 import { DryRunPage } from "./pages/DryRun";
+import { Config } from "./pages/Config";
+import { Networks } from "./pages/Networks";
 import { Settings } from "./pages/Settings";
 import { Radios } from "./pages/Radios";
 import "./styles.css";
@@ -106,10 +108,11 @@ function Shell({ user, readOnly }: { user: string | null; readOnly: boolean }) {
             Overview
           </NavLink>
           <NavLink to="/clients">Clients</NavLink>
+          <NavLink to="/networks">Networks</NavLink>
           <NavLink to="/radios">Radios</NavLink>
           <NavLink to="/events">Events</NavLink>
           <NavLink to="/logs">Logs</NavLink>
-          <NavLink to="/dryrun">Dry run</NavLink>
+          <NavLink to="/config">Config</NavLink>
           <NavLink to="/settings">Settings</NavLink>
         </nav>
         <span className="spacer" />
@@ -151,6 +154,8 @@ function Shell({ user, readOnly }: { user: string | null; readOnly: boolean }) {
           <Route path="/events" element={<Events />} />
           <Route path="/logs" element={<Logs />} />
           <Route path="/dryrun" element={<DryRunPage />} />
+          <Route path="/config" element={<Config />} />
+          <Route path="/networks" element={<Networks />} />
           <Route path="/settings" element={<Settings />} />
           <Route path="*" element={<div className="pad muted">Page not found</div>} />
         </Routes>

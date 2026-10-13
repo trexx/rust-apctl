@@ -25,7 +25,8 @@ function FieldResult({ label, c }: { label: string; c: FieldComparison }) {
   const ok = c.identical || c.equivalent;
   return (
     <div className="dr-field">
-      <span className={ok ? "ok" : "error"}>{ok ? "✓" : "✗"}</span> <b>{label}</b>{" "}
+      <span className={ok ? "ok" : "error"}>{ok ? "✓" : "✗"}</span>{" "}
+      <b>{label}</b>{" "}
       <span className="muted">
         {verdict} · ours {c.expected_lines} lines, actual {c.actual_lines}
       </span>
@@ -39,7 +40,7 @@ function FieldResult({ label, c }: { label: string; c: FieldComparison }) {
   );
 }
 
-export function DryRunPage() {
+export function DryRunPage({ embedded = false }: { embedded?: boolean }) {
   const dr = useDryRun();
   const devices = useDevices();
   const names = deviceNames(devices.data);
@@ -51,13 +52,18 @@ export function DryRunPage() {
   return (
     <div className="page">
       <div className="page-head">
-        <h1>Dry run</h1>
-        <span className="muted">what apctl would push, compared with what the current controller pushes. Nothing is sent to APs.</span>
+        {!embedded && <h1>Dry run</h1>}
+        <span className="muted">
+          what apctl would push, compared with what the current controller
+          pushes. Nothing is sent to APs.
+        </span>
       </div>
       {d.devices.some((x) => x.settings_stale) && (
         <div className="banner">
-          The current controller has pushed new config since the settings were imported, so differences below may just be those
-          changes. <Link to="/settings">Re-import the settings</Link> to compare against what is configured now.
+          The current controller has pushed new config since the settings were
+          imported, so differences below may just be those changes.{" "}
+          <Link to="/settings">Re-import the settings</Link> to compare against
+          what is configured now.
         </div>
       )}
       <h2>Now</h2>
@@ -65,7 +71,9 @@ export function DryRunPage() {
         {d.devices.map((x) => (
           <div key={x.mac} className="card">
             <div className="card-head">
-              <span className={`dot ${x.status === "match" || x.status === "equivalent" ? "dot-ok" : x.status === "differs" || x.status === "error" ? "dot-bad" : "dot-warn"}`} />
+              <span
+                className={`dot ${x.status === "match" || x.status === "equivalent" ? "dot-ok" : x.status === "differs" || x.status === "error" ? "dot-bad" : "dot-warn"}`}
+              />
               <span className="card-title">{x.name ?? x.mac}</span>
               <span className="muted">{STATUS[x.status] ?? x.status}</span>
             </div>
@@ -73,20 +81,34 @@ export function DryRunPage() {
               <>
                 <FieldResult label="mgmt_cfg" c={x.comparison.mgmt_cfg} />
                 <FieldResult label="system_cfg" c={x.comparison.system_cfg} />
-                {x.against_redacted && <div className="muted small">Compared with a stored copy where passwords are masked.</div>}
+                {x.against_redacted && (
+                  <div className="muted small">
+                    Compared with a stored copy where passwords are masked.
+                  </div>
+                )}
               </>
             )}
             {x.error && <div className="error small">{x.error}</div>}
-            {x.settings_stale && <div className="muted small">Settings changed on the current controller since the import.</div>}
+            {x.settings_stale && (
+              <div className="muted small">
+                Settings changed on the current controller since the import.
+              </div>
+            )}
           </div>
         ))}
       </div>
       <h2>
-        At each config push <span className="muted small">{total ? `${matched} of ${total} identical` : ""}</span>
+        At each config push{" "}
+        <span className="muted small">
+          {total ? `${matched} of ${total} identical` : ""}
+        </span>
       </h2>
       <div className="panel">
         {total === 0 ? (
-          <div className="muted pad">No config pushes compared yet. They happen when the current controller changes an AP's config.</div>
+          <div className="muted pad">
+            No config pushes compared yet. They happen when the current
+            controller changes an AP's config.
+          </div>
         ) : (
           <table className="table">
             <thead>
@@ -102,7 +124,13 @@ export function DryRunPage() {
                 <tr key={`${h.ts}-${i}`}>
                   <td>{clock(h.ts)}</td>
                   <td>{names.get(h.mac) ?? h.mac}</td>
-                  <td className={h.matches ? "ok" : "error"}>{h.matches ? (h.comparison?.system_cfg?.identical === false ? "equivalent" : "identical") : "differs"}</td>
+                  <td className={h.matches ? "ok" : "error"}>
+                    {h.matches
+                      ? h.comparison?.system_cfg?.identical === false
+                        ? "equivalent"
+                        : "identical"
+                      : "differs"}
+                  </td>
                   <td className="muted">
                     {h.comparison?.error ??
                       (h.comparison?.system_cfg

@@ -30,6 +30,7 @@ import {
 } from "../components/common";
 import { ago, band, bitrate, bytes, duration, phy } from "../format";
 import { serviceNames } from "../components/Insights";
+import { ConnectionLog } from "../components/Connections";
 import type { ClientView, Multicast } from "../api";
 
 export function Client() {
@@ -207,6 +208,11 @@ export function Client() {
               all={clients.data ?? []}
             />
           )}
+
+          <h2>Connection log</h2>
+          <div className="panel">
+            <ConnectionLog client={mac} span={range} />
+          </div>
 
           <h2>Timeline</h2>
           <div className="panel">

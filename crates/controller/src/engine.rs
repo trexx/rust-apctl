@@ -526,6 +526,8 @@ impl Engine {
         let mut data = serde_json::Map::new();
         data.insert("cfgversion".into(), p["cfgversion"].clone());
         let known = self.configs.entry(mac).or_default();
+        // Sections removed by this push are only named in the previous config.
+        let old_system = known.get("system_cfg").cloned();
         for field in ["mgmt_cfg", "system_cfg"] {
             let Some(new) = p[field].as_str() else { continue };
             let summary = match known.get(field) {
@@ -542,7 +544,9 @@ impl Engine {
         // config history can say what a change was about.
         if let Some(cfg) = known.get("system_cfg") {
             let radios = live.devices.get(&mac).map(|d| d.snapshot.radios.clone()).unwrap_or_default();
-            data.insert("labels".into(), Value::Object(section_labels(cfg, &radios)));
+            let mut labels = old_system.map(|o| section_labels(&o, &radios)).unwrap_or_default();
+            labels.extend(section_labels(cfg, &radios));
+            data.insert("labels".into(), Value::Object(labels));
         }
         // A push can be management-only (e.g. after an LED change): it carries
         // mgmt_cfg alone, and the AP keeps its last full system_cfg.

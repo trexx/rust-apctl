@@ -704,7 +704,10 @@ pub async fn wlans(State(s): State<AppState>, Query(q): Query<RangeQuery>) -> Re
                 let peak = cl.iter().copied().fold(0.0, f64::max);
                 (ts, cl, dn, up, peak)
             });
-            let retry = agg.and_then(|a| retry_totals(&a.retry, from).into_values().reduce(|x, y| [x[0] + y[0], x[1] + y[1], x[2] + y[2]])).map(retry_pct);
+            let retry = agg
+                .and_then(|a| retry_totals(&a.retry, from).into_values().reduce(|x, y| [x[0] + y[0], x[1] + y[1], x[2] + y[2]]))
+                .filter(|t| t.iter().sum::<f64>() > 0.0)
+                .map(retry_pct);
             let heard = bss.iter().find_map(|b| b["bssid"].as_str().and_then(|x| on_air.get(x)).cloned());
             json!({
                 "essid": essid,
