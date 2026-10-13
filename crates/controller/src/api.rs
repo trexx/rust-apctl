@@ -301,7 +301,14 @@ async fn dryrun(State(s): State<AppState>) -> ApiResult {
         match render(&req) {
             Ok(ours) => {
                 let c = crate::dryrun::compare(&ours, &actual.0, &actual.1, redacted);
-                devices.push(entry(if c.matches() { "match" } else { "differs" }, json!({ "comparison": c, "against_redacted": redacted })));
+                let status = if c.mgmt_cfg.identical && c.system_cfg.identical {
+                    "match"
+                } else if c.matches() {
+                    "equivalent"
+                } else {
+                    "differs"
+                };
+                devices.push(entry(status, json!({ "comparison": c, "against_redacted": redacted })));
             }
             Err(e) => devices.push(entry("error", json!({ "error": format!("{e:#}") }))),
         }

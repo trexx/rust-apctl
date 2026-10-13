@@ -5,6 +5,7 @@ import { clock } from "../format";
 
 const STATUS: Record<string, string> = {
   match: "Identical",
+  equivalent: "Equivalent",
   differs: "Differs",
   error: "Generator error",
   no_generator: "Generator not available yet",
@@ -13,10 +14,17 @@ const STATUS: Record<string, string> = {
 };
 
 function FieldResult({ label, c }: { label: string; c: FieldComparison }) {
-  const verdict = c.identical ? "identical" : c.same_content ? "same lines, different order" : `${c.added} extra, ${c.removed} missing, ${c.changed} different`;
+  const verdict = c.identical
+    ? "identical"
+    : c.equivalent
+      ? "equivalent: only the order of unordered lists differs (the current controller doesn't keep it stable)"
+      : c.same_content
+        ? "same lines, different order"
+        : `${c.added} extra, ${c.removed} missing, ${c.changed} different`;
+  const ok = c.identical || c.equivalent;
   return (
     <div className="dr-field">
-      <span className={c.identical ? "ok" : "error"}>{c.identical ? "✓" : "✗"}</span> <b>{label}</b>{" "}
+      <span className={ok ? "ok" : "error"}>{ok ? "✓" : "✗"}</span> <b>{label}</b>{" "}
       <span className="muted">
         {verdict} · ours {c.expected_lines} lines, actual {c.actual_lines}
       </span>
@@ -50,7 +58,7 @@ export function DryRunPage() {
         {d.devices.map((x) => (
           <div key={x.mac} className="card">
             <div className="card-head">
-              <span className={`dot ${x.status === "match" ? "dot-ok" : x.status === "differs" || x.status === "error" ? "dot-bad" : "dot-warn"}`} />
+              <span className={`dot ${x.status === "match" || x.status === "equivalent" ? "dot-ok" : x.status === "differs" || x.status === "error" ? "dot-bad" : "dot-warn"}`} />
               <span className="card-title">{x.name ?? x.mac}</span>
               <span className="muted">{STATUS[x.status] ?? x.status}</span>
             </div>
@@ -86,7 +94,7 @@ export function DryRunPage() {
                 <tr key={`${h.ts}-${i}`}>
                   <td>{clock(h.ts)}</td>
                   <td>{names.get(h.mac) ?? h.mac}</td>
-                  <td className={h.matches ? "ok" : "error"}>{h.matches ? "identical" : "differs"}</td>
+                  <td className={h.matches ? "ok" : "error"}>{h.matches ? (h.comparison?.system_cfg?.identical === false ? "equivalent" : "identical") : "differs"}</td>
                   <td className="muted">
                     {h.comparison?.error ??
                       (h.comparison?.system_cfg

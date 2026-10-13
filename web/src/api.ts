@@ -268,6 +268,7 @@ export interface FieldComparison {
   actual_lines: number;
   identical: boolean;
   same_content: boolean;
+  equivalent?: boolean;
   added: number;
   removed: number;
   changed: number;
@@ -280,7 +281,7 @@ export interface DryRun {
   devices: {
     mac: Mac;
     name: string | null;
-    status: "match" | "differs" | "error" | "no_generator" | "no_settings" | "no_config_seen";
+    status: "match" | "equivalent" | "differs" | "error" | "no_generator" | "no_settings" | "no_config_seen";
     comparison?: { mgmt_cfg: FieldComparison; system_cfg: FieldComparison };
     against_redacted?: boolean;
     error?: string;

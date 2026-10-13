@@ -62,6 +62,9 @@ pub struct FieldComparison {
     pub identical: bool,
     /// Same key=value pairs, ignoring order.
     pub same_content: bool,
+    /// Identical once lists whose order the other controller does not keep
+    /// stable are compared as sets (see `normalise_unordered`).
+    pub equivalent: bool,
     pub added: usize,
     pub removed: usize,
     pub changed: usize,
@@ -76,9 +79,46 @@ pub struct Comparison {
 }
 
 impl Comparison {
+    /// Identical, or differing only in the order of unordered lists.
     pub fn matches(&self) -> bool {
-        self.mgmt_cfg.identical && self.system_cfg.identical
+        self.mgmt_cfg.equivalent && self.system_cfg.equivalent
     }
+}
+
+/// Lists the other controller writes in an arbitrary order that can change
+/// between its restarts (they come from unordered sets): the services of an
+/// mDNS filter, a VAP's broadcast-filter MACs, and lock-to-AP MAC entries.
+/// Their values are sorted within each list, keeping the line positions.
+fn normalise_unordered(lines: &[&str]) -> Vec<String> {
+    let mut out: Vec<String> = lines.iter().map(|l| l.to_string()).collect();
+    let mut groups: std::collections::BTreeMap<String, Vec<usize>> = Default::default();
+    let lock2ap: std::collections::HashSet<String> = lines
+        .iter()
+        .filter_map(|l| l.strip_suffix(".type=lock2ap"))
+        .map(|k| format!("{k}.mac"))
+        .collect();
+    for (i, line) in lines.iter().enumerate() {
+        let key = line.split_once('=').map_or(*line, |(k, _)| k);
+        let parts: Vec<&str> = key.split('.').collect();
+        let group = match parts[..] {
+            ["mdns_sd", "filter", n, "service", _, "name"] => Some(format!("mdns {n}")),
+            ["wireless", n, "bcfilt", _, "mac"] => Some(format!("bcfilt {n}")),
+            ["macacl", k, "acl", _, "mac"] if lock2ap.contains(key) => Some(format!("lock2ap {k}")),
+            _ => None,
+        };
+        if let Some(g) = group {
+            groups.entry(g).or_default().push(i);
+        }
+    }
+    for idx in groups.values() {
+        let mut values: Vec<String> = idx.iter().map(|&i| out[i].split_once('=').map_or("", |(_, v)| v).to_string()).collect();
+        values.sort();
+        for (&i, v) in idx.iter().zip(values) {
+            let key = out[i].split_once('=').map_or(out[i].clone(), |(k, _)| k.to_string());
+            out[i] = format!("{key}={v}");
+        }
+    }
+    out
 }
 
 fn lines(s: &str) -> Vec<&str> {
@@ -97,6 +137,7 @@ pub fn compare_field(ours: &str, actual: &str, redacted: bool) -> FieldCompariso
         actual_lines: a.len(),
         identical: o == a,
         same_content: d.is_empty(),
+        equivalent: o == a || normalise_unordered(&o) == normalise_unordered(&a),
         added: d.added.len(),
         removed: d.removed.len(),
         changed: d.changed.len(),
@@ -152,6 +193,14 @@ mod tests {
         let different = compare_field("a=1\nb=3\naaa.1.wpa.psk=other\nc=4", actual, false);
         assert_eq!((different.added, different.removed, different.changed), (1, 0, 2));
         assert!(!different.diff.contains("hunter2") && !different.diff.contains("other"), "{}", different.diff);
+
+        // The other controller's mDNS service order changes between its restarts.
+        let cast_zone = "mdns_sd.filter.2.service.1.name=_googlecast._tcp.local\nmdns_sd.filter.2.service.2.name=_googlezone._tcp.local";
+        let zone_cast = "mdns_sd.filter.2.service.1.name=_googlezone._tcp.local\nmdns_sd.filter.2.service.2.name=_googlecast._tcp.local";
+        let swapped = compare_field(zone_cast, cast_zone, false);
+        assert!(!swapped.identical && !swapped.same_content && swapped.equivalent);
+        let real_change = compare_field("mdns_sd.filter.2.service.1.name=_airplay._tcp.local", "mdns_sd.filter.2.service.1.name=_googlecast._tcp.local", false);
+        assert!(!real_change.equivalent);
 
         // Against a redacted copy, secret values cannot differ.
         let r = compare_field("a=1\nb=2\naaa.1.wpa.psk=other", &cfgdiff::redact(actual), true);
