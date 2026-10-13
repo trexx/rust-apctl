@@ -149,6 +149,13 @@ impl Active {
         if payload["inform_as_notif"].as_bool() == Some(true) {
             return json!({ "_type": "noop", "server_time_in_utc": server_time });
         }
+        // A queued command (restart, locate, kick...) goes before anything else.
+        if let Some(mut cmd) = crate::actions::next(&mut self.live.write().unwrap(), &mac) {
+            cmd["server_time_in_utc"] = json!(server_time);
+            tracing::info!("{mac}: sending {} {}", cmd["_type"], cmd["cmd"]);
+            return cmd;
+        }
+        let force = self.live.write().unwrap().reprovision.remove(&mac);
         let (state, last_push) = {
             let live = self.live.read().unwrap();
             (live.state.clone(), live.last_config.get(&mac).cloned())
@@ -180,7 +187,7 @@ impl Active {
         let (current, changed) = {
             let devices = self.devices.lock().unwrap();
             let d = devices.get(&mac);
-            (d.and_then(|d| d.cfgversion.clone()), d.and_then(|d| d.content.as_deref()) != Some(content.as_str()))
+            (d.and_then(|d| d.cfgversion.clone()), force || d.and_then(|d| d.content.as_deref()) != Some(content.as_str()))
         };
         let cfgversion = if !changed {
             current.unwrap_or_default()
@@ -458,6 +465,57 @@ mod tests {
         let (_, reply) = inform_as_ap(&rig, &ap_payload(&version), KEY, GCM_ZLIB).await;
         assert_eq!(reply.unwrap().1["_type"], "noop");
         assert_eq!(rig.live.read().unwrap().firmware.current.as_ref().map(|j| j.state), Some("sent"));
+    }
+
+    #[tokio::test]
+    async fn sends_queued_commands_one_per_inform_before_the_config() {
+        let rig = rig(true, None);
+        let ap: Mac = AP.parse().unwrap();
+        {
+            let mut live = rig.live.write().unwrap();
+            crate::actions::queue(&mut live, ap, json!({ "_type": "cmd", "cmd": "set-locate" }));
+            crate::actions::queue(&mut live, ap, json!({ "_type": "reboot", "reboot_type": "soft" }));
+        }
+        let (_, reply) = inform_as_ap(&rig, &ap_payload("1111111111111111"), KEY, GCM_ZLIB).await;
+        let reply = reply.unwrap().1;
+        assert_eq!((reply["_type"].as_str(), reply["cmd"].as_str()), (Some("cmd"), Some("set-locate")));
+        assert!(reply["server_time_in_utc"].is_string());
+        let (_, reply) = inform_as_ap(&rig, &ap_payload("1111111111111111"), KEY, GCM_ZLIB).await;
+        assert_eq!(reply.unwrap().1["reboot_type"], "soft");
+        let (_, reply) = inform_as_ap(&rig, &ap_payload("1111111111111111"), KEY, GCM_ZLIB).await;
+        assert_eq!(reply.unwrap().1["_type"], "setparam");
+    }
+
+    #[tokio::test]
+    async fn resends_the_config_when_asked() {
+        let rig = rig(true, None);
+        let (_, reply) = inform_as_ap(&rig, &ap_payload("1111111111111111"), KEY, GCM_ZLIB).await;
+        let version = reply.unwrap().1["cfgversion"].as_str().unwrap().to_string();
+        let (_, reply) = inform_as_ap(&rig, &ap_payload(&version), KEY, GCM_ZLIB).await;
+        assert_eq!(reply.unwrap().1["_type"], "noop");
+        rig.live.write().unwrap().reprovision.insert(AP.parse().unwrap());
+        let (_, reply) = inform_as_ap(&rig, &ap_payload(&version), KEY, GCM_ZLIB).await;
+        let reply = reply.unwrap().1;
+        assert_eq!(reply["_type"], "setparam");
+        assert_ne!(reply["cfgversion"].as_str(), Some(version.as_str()), "a new version, so the AP applies it");
+        assert!(rig.live.read().unwrap().reprovision.is_empty());
+    }
+
+    #[tokio::test]
+    async fn blocking_a_client_changes_the_config() {
+        let rig = rig(true, None);
+        let (_, reply) = inform_as_ap(&rig, &ap_payload("1111111111111111"), KEY, GCM_ZLIB).await;
+        let version = reply.unwrap().1["cfgversion"].as_str().unwrap().to_string();
+        {
+            let mut live = rig.live.write().unwrap();
+            let mut state = live.state.as_deref().cloned().unwrap();
+            crate::actions::edit_client(&mut state, "aa:bb:cc:00:00:09", &[("blocked", json!(true))]).unwrap();
+            live.state = Some(Arc::new(state));
+        }
+        let (_, reply) = inform_as_ap(&rig, &ap_payload(&version), KEY, GCM_ZLIB).await;
+        let reply = reply.unwrap().1;
+        assert_eq!(reply["_type"], "setparam");
+        assert!(reply["blocked_sta"].as_str().unwrap().split('\n').any(|m| m == "aa:bb:cc:00:00:09"));
     }
 
     #[tokio::test]

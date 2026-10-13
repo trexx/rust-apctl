@@ -1319,3 +1319,23 @@ input.search.num-input {
   display: grid;
   gap: 8px;
 }
+
+/* Device and client actions under a page heading. */
+.actions {
+  margin: -8px 0 16px;
+}
+
+.actions-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+
+.actions-row select {
+  margin-left: 4px;
+}
+
+.actions .small {
+  margin-top: 6px;
+}

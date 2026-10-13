@@ -25,6 +25,9 @@ pub const CLIENT_GRACE_SECS: Ts = 60;
 pub const OFFLINE_INTERVALS: Ts = 4;
 const DEFAULT_INTERVAL: Ts = 15;
 
+/// A change to the settings, applied by the engine.
+pub type StateEdit = Box<dyn FnOnce(&mut Value) -> Result<(), String> + Send>;
+
 pub enum Input {
     Inform { ts: Ts, peer: String, decoded: Decoded },
     /// Replace the imported controller settings (an `informdump import` snapshot).
@@ -48,6 +51,11 @@ pub enum Input {
     AlertsRead,
     /// Record an event raised elsewhere (e.g. active mode sending an upgrade).
     Note { ts: Ts, kind: &'static str, mac: Mac, data: Value },
+    /// Record a client event raised elsewhere (e.g. blocked from the UI).
+    ClientNote { ts: Ts, kind: &'static str, client: Mac, data: Value },
+    /// Change the settings (apctl's copy of the controller settings), store
+    /// them, and record the change; `done` gets the result.
+    EditState { ts: Ts, what: String, edit: StateEdit, done: tokio::sync::oneshot::Sender<Result<(), String>> },
     /// Store the automatic-backup settings (JSON).
     SaveBackupSettings(String),
     /// Acknowledge a finding with an optional note (`Some`), or withdraw the acknowledgement (`None`).
@@ -157,6 +165,15 @@ pub struct Live {
     /// Firmware upgrades queued or in progress (one AP at a time).
     #[serde(skip)]
     pub firmware: crate::firmware::Jobs,
+    /// Commands waiting for each AP's next inform (restart, locate, kick...).
+    #[serde(skip)]
+    pub commands: HashMap<Mac, std::collections::VecDeque<Value>>,
+    /// APs told to flash their LED.
+    #[serde(skip)]
+    pub locating: std::collections::HashSet<Mac>,
+    /// APs to send their config again on the next inform.
+    #[serde(skip)]
+    pub reprovision: std::collections::HashSet<Mac>,
     /// Last config pushed to each AP by the other controller, unredacted.
     #[serde(skip)]
     pub last_config: HashMap<Mac, (String, String, Option<String>)>,
@@ -317,6 +334,13 @@ impl Engine {
             Input::Note { ts, kind, mac, data } => {
                 let mut live = self.live.write().unwrap();
                 self.emit(&mut live, ev(ts, kind, Some(mac), None, data));
+            }
+            Input::ClientNote { ts, kind, client, data } => {
+                let mut live = self.live.write().unwrap();
+                self.emit(&mut live, ev(ts, kind, None, Some(client), data));
+            }
+            Input::EditState { ts, what, edit, done } => {
+                let _ = done.send(self.edit_state(ts, what, edit));
             }
             Input::SaveBackupSettings(json) => {
                 self.writer.exec(Db::Config, "INSERT OR REPLACE INTO backup_settings (id, json) VALUES (1, ?1)", vec![Sql::Text(json)])
@@ -664,6 +688,21 @@ impl Engine {
         live.state = Some(Arc::new(state));
         live.state_imported_at = Some(ts);
         self.emit(&mut live, ev(ts, "settings_imported", None, None, summary));
+    }
+
+    fn edit_state(&mut self, ts: Ts, what: String, edit: StateEdit) -> Result<(), String> {
+        let mut live = self.live.write().unwrap();
+        let mut state = live.state.as_deref().cloned().ok_or("no settings imported yet")?;
+        edit(&mut state)?;
+        let imported_at = live.state_imported_at.unwrap_or(ts);
+        self.writer.exec(
+            Db::Config,
+            "INSERT OR REPLACE INTO controller_state (id, json, imported_at) VALUES (1, ?1, ?2)",
+            vec![Sql::Text(state.to_string()), Sql::Integer(imported_at)],
+        );
+        live.state = Some(Arc::new(state));
+        self.emit(&mut live, ev(ts, "settings_changed", None, None, json!({ "what": what })));
+        Ok(())
     }
 
     fn set_alias(&mut self, ts: Ts, mac: Mac, alias: Option<String>, note: Option<String>, only_if_unset: bool) {
@@ -1370,6 +1409,24 @@ mod tests {
             .collect();
         assert_eq!(renames.len(), 2, "{renames:?}");
         assert_eq!(renames[1]["from"], "Kitchen speaker");
+    }
+
+    #[test]
+    fn settings_edits_are_applied_recorded_or_refused() {
+        let mut h = harness();
+        let edit = |h: &mut Harness, f: StateEdit| {
+            let (tx, mut rx) = tokio::sync::oneshot::channel();
+            h.engine.handle(Input::EditState { ts: 5, what: "blocked client".into(), edit: f, done: tx });
+            rx.try_recv().unwrap()
+        };
+        assert!(edit(&mut h, Box::new(|_| Ok(()))).is_err(), "nothing to edit before an import");
+        h.engine.handle(Input::SetState { ts: 1, state: json!({ "clients": [] }) });
+        edit(&mut h, Box::new(|s| crate::actions::edit_client(s, C1, &[("blocked", json!(true))]))).unwrap();
+        assert_eq!(h.live.read().unwrap().state.as_ref().unwrap()["clients"][0]["blocked"], true);
+        assert_eq!(h.live.read().unwrap().state_imported_at, Some(1), "an edit is not an import");
+        assert_eq!(edit(&mut h, Box::new(|_| Err("no".into()))), Err("no".into()));
+        let kinds: Vec<_> = events(&mut h).into_iter().map(|e| e.0).collect();
+        assert_eq!(kinds, ["settings_imported", "settings_changed"]);
     }
 
     fn notif(ap: &str, reason: &str, payload: Value) -> Decoded {

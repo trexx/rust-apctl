@@ -144,6 +144,12 @@ const EVENT_LABELS: Record<string, string> = {
   client_renamed: "Client renamed",
   dryrun_compared: "Dry run",
   settings_imported: "Settings imported",
+  settings_changed: "Settings changed",
+  ap_restart_requested: "Restart requested",
+  ap_provision_requested: "Config re-send requested",
+  client_reconnect_requested: "Reconnect requested",
+  client_blocked: "Client blocked",
+  client_unblocked: "Client unblocked",
 };
 
 function eventTone(kind: string, d?: Record<string, unknown>): string {
@@ -163,6 +169,7 @@ function eventTone(kind: string, d?: Record<string, unknown>): string {
     return "bad";
   if (
     kind === "client_kicked" ||
+    kind === "client_blocked" ||
     kind === "client_experience" ||
     kind === "ap_process_restarted" ||
     kind === "client_wrong_password"
@@ -301,6 +308,8 @@ function describe(e: AppEvent, names: DeviceNames): React.ReactNode {
         : `differs: ${d.system_cfg?.added ?? 0} extra, ${d.system_cfg?.removed ?? 0} missing, ${d.system_cfg?.changed ?? 0} different lines`;
     case "settings_imported":
       return `${(d.wlans ?? []).length} SSIDs, ${(d.networks ?? []).length} networks`;
+    case "settings_changed":
+      return String(d.what ?? "");
     case "client_renamed":
       return d.to
         ? `${d.from ? `"${d.from}" → ` : ""}"${d.to}"`

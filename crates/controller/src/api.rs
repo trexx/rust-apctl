@@ -55,6 +55,12 @@ pub fn router(state: AppState) -> Router {
         .route("/api/clients/{mac}", get(client))
         .route("/api/clients/{mac}/alias", axum::routing::put(set_alias))
         .route("/api/clients/aliases", axum::routing::post(import_aliases))
+        .route("/api/devices/{mac}/restart", axum::routing::post(crate::actions::restart))
+        .route("/api/devices/{mac}/locate", axum::routing::post(crate::actions::locate))
+        .route("/api/devices/{mac}/provision", axum::routing::post(crate::actions::provision))
+        .route("/api/clients/{mac}/kick", axum::routing::post(crate::actions::kick))
+        .route("/api/clients/{mac}/block", axum::routing::post(crate::actions::block))
+        .route("/api/clients/{mac}/lock", axum::routing::post(crate::actions::lock))
         .route(
             "/api/settings/state",
             get(state_summary).post(import_state).layer(axum::extract::DefaultBodyLimit::max(8 << 20)),
@@ -141,7 +147,7 @@ async fn status(State(s): State<AppState>) -> ApiResult {
     let live = s.live.read().unwrap();
     Ok(Json(json!({
         "version": env!("CARGO_PKG_VERSION"),
-        "mode": "shadow",
+        "mode": if s.active { "active" } else { "shadow" },
         "source": s.source,
         "started": s.started,
         "now": store::now_ts(),
@@ -202,6 +208,7 @@ async fn devices(State(s): State<AppState>) -> ApiResult {
                     "cu_total": r.cu_total, "noise_floor": r.noise_floor, "clients": r.num_sta,
                 })).collect::<Vec<_>>(),
                 "last_config_push": d.last_config_push,
+                "locating": live.locating.contains(mac),
             })
         })
         .collect();
@@ -226,7 +233,7 @@ async fn device(State(s): State<AppState>, Path(mac): Path<String>) -> ApiResult
         let live = s.live.read().unwrap();
         if let Some(d) = live.devices.get(&mac) {
             let clients: Vec<_> = live.clients.values().filter(|c| c.connected && c.sample.ap_mac == mac).collect();
-            return Ok(Json(json!({ "device": d, "clients": clients })));
+            return Ok(Json(json!({ "device": d, "clients": clients, "locating": live.locating.contains(&mac) })));
         }
     }
     // Known but not reporting since apctl started: offline, with what we stored.
@@ -236,7 +243,8 @@ async fn device(State(s): State<AppState>, Path(mac): Path<String>) -> ApiResult
 }
 
 async fn clients(State(s): State<AppState>) -> ApiResult {
-    let (live_clients, aliases): (BTreeMap<String, Value>, BTreeMap<String, Value>) = {
+    #[allow(clippy::type_complexity)]
+    let (live_clients, aliases, state): (BTreeMap<String, Value>, BTreeMap<String, Value>, Option<Arc<Value>>) = {
         let live = s.live.read().unwrap();
         let clients = live
             .clients
@@ -249,11 +257,12 @@ async fn clients(State(s): State<AppState>) -> ApiResult {
                 v["alias"] = json!(a.alias);
                 v["note"] = json!(a.note);
                 v["vendor"] = json!(s.vendors.lookup(mac));
+                crate::actions::add_controls(&mut v, live.state.as_deref(), &mac.to_string());
                 (mac.to_string(), v)
             })
             .collect();
         let aliases = live.aliases.iter().map(|(m, a)| (m.to_string(), serde_json::to_value(a).unwrap_or_default())).collect();
-        (clients, aliases)
+        (clients, aliases, live.state.clone())
     };
     // Clients known from before this process started, not yet seen again.
     let known: Vec<Value> = read(&s.store, Db::Config, |c| {
@@ -275,10 +284,12 @@ async fn clients(State(s): State<AppState>) -> ApiResult {
         let mac = k["mac"].as_str().unwrap_or("").to_string();
         if !live_clients.contains_key(&mac) {
             let a = aliases.get(&mac).cloned().unwrap_or_default();
-            out.push(json!({
+            let mut v = json!({
                 "connected": false, "first_seen": k["first_seen"], "last_seen": k["last_seen"], "sample": k,
                 "alias": a["alias"], "note": a["note"], "vendor": s.vendors.lookup_str(&mac),
-            }));
+            });
+            crate::actions::add_controls(&mut v, state.as_deref(), &mac);
+            out.push(v);
         }
     }
     Ok(Json(Value::Array(out)))
@@ -294,6 +305,7 @@ async fn client(State(s): State<AppState>, Path(mac): Path<String>) -> ApiResult
             v["alias"] = json!(a.alias);
             v["note"] = json!(a.note);
             v["vendor"] = json!(s.vendors.lookup(&mac));
+            crate::actions::add_controls(&mut v, live.state.as_deref(), &mac.to_string());
             v
         })
     };

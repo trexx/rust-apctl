@@ -33,6 +33,7 @@ import {
 } from "../components/common";
 import { ago, band, bitrate, bytes, duration, pct, phy } from "../format";
 import { MulticastPanel } from "../components/Insights";
+import { DeviceActions } from "../components/Actions";
 
 export function Device() {
   const { mac = "" } = useParams();
@@ -66,6 +67,12 @@ export function Device() {
             <span className="spacer" />
             <RangePicker value={range} onChange={setRange} />
           </div>
+          <DeviceActions
+            mac={mac}
+            name={ap.hostname ?? mac}
+            online={d.online}
+            locating={detail.data.locating ?? false}
+          />
           {d.reconfiguring && (
             <div className="banner">
               Applying a configuration change. Client data resumes in a moment.

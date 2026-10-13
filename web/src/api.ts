@@ -33,6 +33,7 @@ export interface DeviceSummary {
   uplink: { speed: number | null; up: boolean | null; full_duplex: boolean | null } | null;
   radios: RadioSummary[];
   last_config_push: number | null;
+  locating?: boolean;
 }
 
 export interface ClientSample {
@@ -88,6 +89,10 @@ export interface ClientView {
   vendor?: string | null;
   alias?: string | null;
   note?: string | null;
+  /** From the settings: blocked from every SSID. */
+  blocked?: boolean;
+  /** From the settings: the only AP the client may connect to. */
+  locked_to?: Mac | null;
 }
 
 /** The name to show for a client: the user's alias, else its hostname, else its MAC. */
@@ -187,6 +192,7 @@ export interface DeviceDetail {
     stored_only?: boolean;
   };
   clients: ClientView[];
+  locating?: boolean;
 }
 
 export interface Series {
@@ -256,6 +262,14 @@ async function send<T>(method: string, path: string, body: unknown): Promise<T> 
 
 export const setAlias = (mac: Mac, alias: string, note: string) =>
   send<{ ok: boolean }>("PUT", `/api/clients/${mac}/alias`, { alias, note });
+
+// Device and client actions (active mode only): each goes to the AP with its next report.
+export const restartAp = (mac: Mac) => send("POST", `/api/devices/${mac}/restart`, {});
+export const locateAp = (mac: Mac, on: boolean) => send("POST", `/api/devices/${mac}/locate`, { on });
+export const provisionAp = (mac: Mac) => send("POST", `/api/devices/${mac}/provision`, {});
+export const kickClient = (mac: Mac) => send("POST", `/api/clients/${mac}/kick`, {});
+export const blockClient = (mac: Mac, blocked: boolean) => send("POST", `/api/clients/${mac}/block`, { blocked });
+export const lockClient = (mac: Mac, ap: Mac | null) => send("POST", `/api/clients/${mac}/lock`, { ap });
 
 async function get<T>(path: string): Promise<T> {
   const res = await fetch(path);

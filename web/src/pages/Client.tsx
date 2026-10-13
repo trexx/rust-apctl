@@ -31,6 +31,7 @@ import {
 import { ago, band, bitrate, bytes, duration, phy } from "../format";
 import { serviceNames } from "../components/Insights";
 import { ConnectionLog } from "../components/Connections";
+import { ClientActions } from "../components/Actions";
 import type { ClientView, Multicast } from "../api";
 
 export function Client() {
@@ -70,6 +71,34 @@ export function Client() {
             <span className="spacer" />
             <RangePicker value={range} onChange={setRange} />
           </div>
+          <ClientActions
+            mac={mac}
+            name={
+              c?.alias ||
+              s?.hostname ||
+              listed?.alias ||
+              listed?.sample.hostname ||
+              mac
+            }
+            connected={c?.connected ?? false}
+            blocked={c?.blocked ?? listed?.blocked ?? false}
+            lockedTo={c?.locked_to ?? listed?.locked_to ?? null}
+            aps={devices.data ?? []}
+          />
+          {(c?.blocked ?? listed?.blocked) && (
+            <div className="banner">
+              Blocked: no AP lets this device join any SSID.
+            </div>
+          )}
+          {(c?.locked_to ?? listed?.locked_to) && (
+            <div className="banner">
+              Locked to{" "}
+              {names.get((c?.locked_to ?? listed?.locked_to)!) ??
+                c?.locked_to ??
+                listed?.locked_to}
+              : the other APs refuse it.
+            </div>
+          )}
           {client.error && (
             <div className="banner">
               Not seen since the controller started; showing stored history

@@ -31,7 +31,7 @@ fn post(url: &str, body: &[u8]) -> Result<(u16, Vec<u8>)> {
     Ok((status, resp[head_end + 4..].to_vec()))
 }
 
-pub fn run(pcap: &str, keys: &KeyStore, url: &str, limit: usize) -> Result<()> {
+pub fn run(pcap: &str, keys: &KeyStore, url: &str, limit: usize, every: f64) -> Result<()> {
     if !(url.contains("127.0.0.1") || url.contains("localhost")) {
         bail!("refusing to simulate APs against {url}: only local controllers (127.0.0.1/localhost)");
     }
@@ -48,7 +48,10 @@ pub fn run(pcap: &str, keys: &KeyStore, url: &str, limit: usize) -> Result<()> {
     // What each simulated AP currently runs (it adopts pushed versions).
     let mut running: HashMap<Mac, String> = HashMap::new();
     let mut counts: HashMap<String, usize> = HashMap::new();
-    for mut payload in informs.into_iter().take(limit) {
+    for (i, mut payload) in informs.into_iter().take(limit).enumerate() {
+        if i > 0 && every > 0.0 {
+            std::thread::sleep(Duration::from_secs_f64(every));
+        }
         let mac: Mac = payload["mac"].as_str().context("inform without mac")?.parse()?;
         let key = *keys.get(&mac).with_context(|| format!("no key for {mac}"))?;
         if let Some(v) = running.get(&mac) {
@@ -72,6 +75,8 @@ pub fn run(pcap: &str, keys: &KeyStore, url: &str, limit: usize) -> Result<()> {
                     format!("cfgversion {v}, system_cfg {lines} lines, flags {:?}", pkt.header.flags)
                 }
                 "noop" => format!("interval {}", reply["interval"]),
+                "cmd" => format!("{} {}", reply["cmd"].as_str().unwrap_or("?"), reply["mac"].as_str().unwrap_or("")),
+                "reboot" => reply["reboot_type"].as_str().unwrap_or("").to_string(),
                 _ => String::new(),
             };
             format!("{kind} {detail}")

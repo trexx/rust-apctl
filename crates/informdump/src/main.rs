@@ -90,6 +90,9 @@ enum Cmd {
         /// Maximum number of informs to send.
         #[arg(long, default_value = "40")]
         limit: usize,
+        /// Seconds to wait between informs (0: as fast as the controller answers).
+        #[arg(long, default_value = "0")]
+        every: f64,
     },
     /// Follow a live capture on stdin and print config pushes and new devices as they happen.
     Watch {
@@ -159,7 +162,7 @@ fn main() -> Result<()> {
         }
         Cmd::Pcap { file, common, all } => run_capture(&file, common, all),
         Cmd::Watch { common, all } => run_capture("-", common, all),
-        Cmd::Simulate { pcap, keys, url, limit } => simulate::run(&pcap, &load_keys(Some(&keys))?, &url, limit),
+        Cmd::Simulate { pcap, keys, url, limit, every } => simulate::run(&pcap, &load_keys(Some(&keys))?, &url, limit, every),
         Cmd::Sanitize { input, output, domains, devices, files } => {
             sanitize::run(&input, &output, &files, domains, &devices)
         }

@@ -3,6 +3,7 @@
 //! Milestone 2 runs in shadow mode: it learns everything from a capture of
 //! another controller's traffic and never talks to the APs itself.
 
+mod actions;
 mod active;
 mod alerts;
 mod api;
