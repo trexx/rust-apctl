@@ -122,6 +122,12 @@ const EVENT_LABELS: Record<string, string> = {
   dfs_radar: "Radar detected (DFS)",
   rogue_ap: "Rogue AP (reported by AP)",
   network_threat: "Suspicious network",
+  client_kicked: "Client kicked",
+  client_steered: "Client steering",
+  client_experience: "Poor experience",
+  ap_crash: "AP crash",
+  ap_process_restarted: "Process restarted",
+  ap_isolated: "AP isolated",
   ap_scan_done: "Scan finished",
   ap_event: "AP event",
   radio_changed: "Radio settings changed",
@@ -142,7 +148,14 @@ function eventTone(kind: string, d?: Record<string, unknown>): string {
     kind === "dfs_radar"
   )
     return "warn";
-  if (kind === "rogue_ap") return "bad";
+  if (kind === "rogue_ap" || kind === "ap_crash" || kind === "ap_isolated")
+    return "bad";
+  if (
+    kind === "client_kicked" ||
+    kind === "client_experience" ||
+    kind === "ap_process_restarted"
+  )
+    return "warn";
   if (kind === "network_threat")
     return d?.severity === "low"
       ? "info"
@@ -192,6 +205,43 @@ function describe(e: AppEvent, names: DeviceNames): React.ReactNode {
         .join(" · ");
     case "dfs_radar":
       return d.channel ? `channel ${d.channel}` : "";
+    case "client_kicked":
+      return [
+        d.reason ? `reason: ${d.reason}` : null,
+        d.signal != null ? `signal ${d.signal} dBm` : null,
+        d.vap,
+      ]
+        .filter(Boolean)
+        .join(" · ");
+    case "client_steered":
+      return [
+        `asked to move (802.11v)${d.signal != null ? ` at ${d.signal} dBm` : ""}`,
+        d.result,
+        (d.candidates ?? []).length
+          ? `offered ${(d.candidates as { bssid: string; channel: number | null }[]).map((c) => `${c.bssid}${c.channel ? ` ch ${c.channel}` : ""}`).join(", ")}`
+          : null,
+      ]
+        .filter(Boolean)
+        .join(" · ");
+    case "client_experience":
+      return [
+        (d.anomalies ?? []).map((a: string) => a.replace(/_/g, " ")).join(", "),
+        d.satisfaction != null ? `experience ${d.satisfaction}` : null,
+        d.signal != null ? `signal ${d.signal} dBm` : null,
+      ]
+        .filter(Boolean)
+        .join(" · ");
+    case "ap_crash":
+      return [
+        d.process ? `${d.process}: ${d.kind}` : d.kind,
+        (d.lines ?? [])[0],
+      ]
+        .filter(Boolean)
+        .join(" · ");
+    case "ap_process_restarted":
+      return `${d.proc ?? "a process"} exited with code ${d.exit_status ?? "?"} and was restarted by ${d.caller ?? "the system"}`;
+    case "ap_isolated":
+      return `its beacon says it lost its uplink${d.heard_by ? ` (heard by ${names.get(d.heard_by) ?? d.heard_by})` : ""}`;
     case "network_threat":
       return d.detail ?? "";
     case "rogue_ap":

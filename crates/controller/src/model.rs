@@ -119,6 +119,8 @@ pub struct NeighborSample {
     pub noise: Option<i64>,
     /// A Ubiquiti AP (possibly one of ours: see `ap_name`).
     pub is_unifi: bool,
+    /// A Ubiquiti AP's beacon saying it has lost its uplink (isolated).
+    pub is_isolated: bool,
     pub ap_name: Option<String>,
     pub model: Option<String>,
 }
@@ -444,6 +446,7 @@ pub fn parse(ts: Ts, p: &Value) -> anyhow::Result<Snapshot> {
                 signal: int(&n["signal"]),
                 noise: int(&n["noise"]),
                 is_unifi: n["is_unifi"].as_bool() == Some(true) || n["is_ubnt"].as_bool() == Some(true),
+                is_isolated: n["is_isolated"].as_bool() == Some(true),
                 ap_name: string(&n["ap_name"]),
                 model: string(&n["model"]),
             });

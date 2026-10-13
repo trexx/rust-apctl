@@ -12,6 +12,7 @@ mod connections;
 mod dryrun;
 mod engine;
 mod insights;
+mod logevents;
 mod model;
 mod shadow;
 mod store;

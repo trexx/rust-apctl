@@ -196,11 +196,15 @@ pub struct Engine {
     /// Each BSSID's last "delivered to clients" counters. The AP reports these
     /// per network, repeated identically in every client's block.
     bss_prev: HashMap<String, (Ts, McastTypes)>,
+    /// Events found in syslog lines.
+    logevents: crate::logevents::LogEvents,
+    /// When each AP was last reported isolated.
+    isolated: HashMap<Mac, Ts>,
 }
 
 impl Engine {
     pub fn new(writer: Writer, keys: Arc<KeyStore>, live: SharedLive, tx: broadcast::Sender<LiveMsg>) -> Self {
-        Engine { writer, keys, renderer: None, live, tx, configs: HashMap::new(), radios: HashMap::new(), mcast_prev: HashMap::new(), bss_prev: HashMap::new() }
+        Engine { writer, keys, renderer: None, live, tx, configs: HashMap::new(), radios: HashMap::new(), mcast_prev: HashMap::new(), bss_prev: HashMap::new(), logevents: Default::default(), isolated: HashMap::new() }
     }
 
     /// Enables dry-run comparisons of every captured config push.
@@ -357,6 +361,7 @@ impl Engine {
         };
         let mac = snap.ap.mac;
         self.write_metrics(&snap);
+        self.check_isolated(ts, &snap);
         if snap.has_vap_table {
             self.live.write().unwrap().raw_informs.insert(mac, Arc::new(decoded.payload.clone()));
         }
@@ -700,10 +705,25 @@ impl Engine {
                         "EVT_AP_RadarDetected" => "dfs_radar",
                         "EVT_AP_DetectRogueAP" => "rogue_ap",
                         "EVT_AP_QuickScanEvent" | "EVT_AP_AcsTriggerComplete" => "ap_scan_done",
+                        // "{proc} exited with code {exit_status} and restarted by {caller}"
+                        "EVT_AP_RestartProc" => "ap_process_restarted",
                         _ => "ap_event",
                     };
                     self.emit(&mut live, ev(ts, k, Some(mac), None, n.clone()));
                 }
+            }
+            // A crash or recovery report: base64 text from the AP's crash store.
+            Some(reason @ ("crashlog" | "recovery")) => {
+                use base64::Engine as _;
+                let raw = p["notif_payload"].as_str().unwrap_or_default();
+                let text = base64::engine::general_purpose::STANDARD
+                    .decode(raw.trim())
+                    .map(|b| String::from_utf8_lossy(&b).into_owned())
+                    .unwrap_or_else(|_| raw.to_string());
+                let lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
+                let tail: Vec<&str> = lines.iter().rev().take(200).rev().copied().collect();
+                let kind = if reason == "recovery" { "recovered after a crash" } else { "crash report" };
+                self.emit(&mut live, ev(ts, "ap_crash", Some(mac), None, json!({ "kind": kind, "source": reason, "lines": tail })));
             }
             _ => {}
         }
@@ -803,7 +823,41 @@ impl Engine {
         }
     }
 
+    /// Another AP's beacon flagged "isolated" (lost its uplink) that belongs to one
+    /// of our APs: reported at most once an hour per AP.
+    fn check_isolated(&mut self, ts: Ts, s: &Snapshot) {
+        let num = |m: &str| -> Option<u64> {
+            let m: Mac = m.parse().ok()?;
+            let mut b = m.0;
+            b[0] &= !0x02;
+            Some(b.iter().fold(0u64, |a, x| (a << 8) | u64::from(*x)))
+        };
+        let flagged: Vec<&crate::model::NeighborSample> = s.neighbors.iter().filter(|n| n.is_isolated).collect();
+        if flagged.is_empty() {
+            return;
+        }
+        let mut live = self.live.write().unwrap();
+        let ours: Vec<(Mac, u64)> = live.devices.keys().filter_map(|m| num(&m.to_string()).map(|n| (*m, n))).collect();
+        for n in flagged {
+            let Some(b) = num(&n.bssid) else { continue };
+            let Some((ap, _)) = ours.iter().find(|(_, x)| x.abs_diff(b) <= 16) else { continue };
+            if self.isolated.get(ap).is_some_and(|t| ts - t < 3600) {
+                continue;
+            }
+            self.isolated.insert(*ap, ts);
+            let data = json!({ "heard_by": s.ap.mac.to_string(), "bssid": n.bssid, "signal": n.signal });
+            self.emit(&mut live, ev(ts, "ap_isolated", Some(*ap), None, data));
+        }
+    }
+
     fn log(&mut self, line: LogLine) {
+        let found = self.logevents.feed(&line);
+        if !found.is_empty() {
+            let mut live = self.live.write().unwrap();
+            for f in found {
+                self.emit(&mut live, ev(line.ts, f.kind, f.device, f.client, f.data));
+            }
+        }
         self.live.write().unwrap().counters.logs += 1;
         self.writer.exec(
             Db::Logs,
@@ -824,6 +878,13 @@ impl Engine {
     /// Time-based transitions: APs going quiet and clients disappearing.
     fn tick(&mut self, now: Ts) {
         self.mcast_prev.retain(|_, (ts, ..)| *ts > now - 3600);
+        let found = self.logevents.tick(now);
+        if !found.is_empty() {
+            let mut live = self.live.write().unwrap();
+            for f in found {
+                self.emit(&mut live, ev(now, f.kind, f.device, f.client, f.data));
+            }
+        }
         self.bss_prev.retain(|_, (ts, _)| *ts > now - 3600);
         let mut live = self.live.write().unwrap();
         let mut events = Vec::new();
