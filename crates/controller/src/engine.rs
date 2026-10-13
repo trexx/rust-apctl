@@ -46,6 +46,8 @@ pub enum Input {
     ThreatFound { ts: Ts, kind: &'static str, bssid: String, device_mac: Option<Mac>, data: Value, notify: bool },
     /// Mark every alert read.
     AlertsRead,
+    /// Record an event raised elsewhere (e.g. active mode sending an upgrade).
+    Note { ts: Ts, kind: &'static str, mac: Mac, data: Value },
     /// Store the automatic-backup settings (JSON).
     SaveBackupSettings(String),
     /// Acknowledge a finding with an optional note (`Some`), or withdraw the acknowledgement (`None`).
@@ -152,6 +154,9 @@ pub struct Live {
     /// Latest full inform per AP (capabilities and radios, for rendering).
     #[serde(skip)]
     pub raw_informs: HashMap<Mac, Arc<Value>>,
+    /// Firmware upgrades queued or in progress (one AP at a time).
+    #[serde(skip)]
+    pub firmware: crate::firmware::Jobs,
     /// Last config pushed to each AP by the other controller, unredacted.
     #[serde(skip)]
     pub last_config: HashMap<Mac, (String, String, Option<String>)>,
@@ -309,6 +314,10 @@ impl Engine {
                 }
             }
             Input::AlertsRead => self.writer.exec(Db::Config, "UPDATE alerts SET read = 1 WHERE read = 0", vec![]),
+            Input::Note { ts, kind, mac, data } => {
+                let mut live = self.live.write().unwrap();
+                self.emit(&mut live, ev(ts, kind, Some(mac), None, data));
+            }
             Input::SaveBackupSettings(json) => {
                 self.writer.exec(Db::Config, "INSERT OR REPLACE INTO backup_settings (id, json) VALUES (1, ?1)", vec![Sql::Text(json)])
             }
@@ -465,6 +474,12 @@ impl Engine {
             ],
         );
         live.devices.insert(mac, view);
+        // An upgrade we sent has landed: the AP reports the new version.
+        if let Some(v) = &snap.ap.version
+            && let Some(j) = live.firmware.version_seen(&mac.to_string(), v)
+        {
+            events.push(ev(ts, "ap_upgraded", Some(mac), None, json!({ "from": j.from, "to": v, "custom": j.custom })));
+        }
         for e in events {
             self.emit(&mut live, e);
         }
@@ -707,10 +722,18 @@ impl Engine {
                         "EVT_AP_QuickScanEvent" | "EVT_AP_AcsTriggerComplete" => "ap_scan_done",
                         // "{proc} exited with code {exit_status} and restarted by {caller}"
                         "EVT_AP_RestartProc" => "ap_process_restarted",
+                        "Upgrade" => {
+                            self.upgrade_notice(&mut live, ts, mac, n);
+                            return;
+                        }
                         _ => "ap_event",
                     };
                     self.emit(&mut live, ev(ts, k, Some(mac), None, n.clone()));
                 }
+            }
+            // The AP starts an upgrade (ours, or one run on the AP itself).
+            Some(r @ ("cmd-upgrade" | "cli-upgrade")) => {
+                self.emit(&mut live, ev(ts, "ap_upgrade_started", Some(mac), None, json!({ "by": if r == "cli-upgrade" { "the AP's command line" } else { "the controller" } })));
             }
             // A crash or recovery report: base64 text from the AP's crash store.
             Some(reason @ ("crashlog" | "recovery")) => {
@@ -823,6 +846,39 @@ impl Engine {
         }
     }
 
+    /// Upgrade progress from the AP: downloading, writing, or an error.
+    fn upgrade_notice(&self, live: &mut Live, ts: Ts, mac: Mac, n: &Value) {
+        let s = |k: &str| n[k].as_str().unwrap_or_default().to_string();
+        let key = mac.to_string();
+        match (n["up_type"].as_str(), n["up_stage"].as_str()) {
+            (Some("UpgradeReady"), stage) => {
+                let step = match stage {
+                    Some("FWDownloading") => "downloading",
+                    Some("FWCheckOK") => "writing",
+                    _ => "preparing",
+                };
+                if let Some(j) = live.firmware.current_for(&key) {
+                    j.state = step;
+                    // Re-arm the deadline as the official controller does on each step.
+                    j.expires = Some(ts + 450);
+                }
+                self.emit(live, ev(ts, "ap_upgrade_progress", Some(mac), None, json!({ "step": step })));
+            }
+            (Some("UpgradeError"), _) => {
+                let reason = s("reason");
+                let detail = match reason.as_str() {
+                    "FirmwareDownloadFailed" => format!("download failed (error: curl:{}, http:{})", n["curl_rc"], n["http_rc"]),
+                    "FirmwareCheckFailed" => format!("firmware check failed (error: {})", n["rc"]),
+                    "FWWriteFailed" => "writing the firmware failed".into(),
+                    r => format!("failed ({r})"),
+                };
+                live.firmware.failed(&key, &detail);
+                self.emit(live, ev(ts, "ap_upgrade_failed", Some(mac), None, json!({ "reason": reason, "detail": detail })));
+            }
+            _ => {}
+        }
+    }
+
     /// Another AP's beacon flagged "isolated" (lost its uplink) that belongs to one
     /// of our APs: reported at most once an hour per AP.
     fn check_isolated(&mut self, ts: Ts, s: &Snapshot) {
@@ -878,6 +934,15 @@ impl Engine {
     /// Time-based transitions: APs going quiet and clients disappearing.
     fn tick(&mut self, now: Ts) {
         self.mcast_prev.retain(|_, (ts, ..)| *ts > now - 3600);
+        {
+            let mut live = self.live.write().unwrap();
+            if let Some(mac) = live.firmware.expired(now)
+                && let Some(j) = live.firmware.failed(&mac, "it did not come back with the new firmware in time")
+            {
+                let data = json!({ "reason": "timed out", "detail": "it did not come back with the new firmware in time", "target": j.target });
+                self.emit(&mut live, ev(now, "ap_upgrade_failed", mac.parse().ok(), None, data));
+            }
+        }
         let found = self.logevents.tick(now);
         if !found.is_empty() {
             let mut live = self.live.write().unwrap();

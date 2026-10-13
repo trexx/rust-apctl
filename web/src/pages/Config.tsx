@@ -3,6 +3,7 @@ import { Link, useSearchParams } from "react-router-dom";
 import { useDevices, useEvents } from "../api";
 import type { AppEvent } from "../api";
 import { DryRunPage } from "./DryRun";
+import { FirmwarePanel } from "../components/Firmware";
 import { Loading, deviceNames } from "../components/common";
 import { clock } from "../format";
 
@@ -99,7 +100,9 @@ function Push({ e, ap }: { e: AppEvent; ap: React.ReactNode }) {
     (x) => typeof x === "string" && x,
   ) as string[];
   // The version stamp changes with every push; it says nothing about the settings.
-  const changes = diffs.flatMap(parseDiff).filter((c) => c.key !== "cfgversion");
+  const changes = diffs
+    .flatMap(parseDiff)
+    .filter((c) => c.key !== "cfgversion");
   const groups = group(changes, labels);
   const summary = s.baseline
     ? `first config seen (${s.lines} lines)`
@@ -238,7 +241,12 @@ function History() {
 
 export function Config() {
   const [params, setParams] = useSearchParams();
-  const tab = params.get("tab") === "dryrun" ? "dryrun" : "history";
+  const tab =
+    params.get("tab") === "dryrun"
+      ? "dryrun"
+      : params.get("tab") === "firmware"
+        ? "firmware"
+        : "history";
   return (
     <div className="page">
       <div className="page-head">
@@ -260,9 +268,23 @@ export function Config() {
           >
             Dry run
           </button>
+          <button
+            role="tab"
+            aria-selected={tab === "firmware"}
+            className={tab === "firmware" ? "active" : ""}
+            onClick={() => setParams({ tab: "firmware" })}
+          >
+            Firmware
+          </button>
         </div>
       </div>
-      {tab === "history" ? <History /> : <DryRunPage embedded />}
+      {tab === "history" ? (
+        <History />
+      ) : tab === "firmware" ? (
+        <FirmwarePanel />
+      ) : (
+        <DryRunPage embedded />
+      )}
     </div>
   );
 }

@@ -758,6 +758,51 @@ export async function uploadBackup(file: File): Promise<{ staged: string; manife
   return res.json();
 }
 
+export interface FirmwareRelease {
+  platform: string;
+  version: string;
+  url: string;
+  md5: string | null;
+  sha256: string | null;
+  size: number | null;
+  created: string | null;
+}
+
+export interface FirmwareJob {
+  mac: Mac;
+  name: string | null;
+  from: string | null;
+  target: string;
+  custom: boolean;
+  state: "queued" | "sent" | "downloading" | "writing";
+  sent_at: number | null;
+  expires: number | null;
+}
+
+export interface FirmwareInfo {
+  checked: number | null;
+  error: string | null;
+  channel: string;
+  active: boolean;
+  aps: {
+    mac: Mac;
+    name: string | null;
+    model: string | null;
+    platform: string | null;
+    version: string | null;
+    online: boolean;
+    release: FirmwareRelease | null;
+    status: "update_available" | "up_to_date" | "ahead" | "unknown";
+  }[];
+  jobs: { current: FirmwareJob | null; queue: FirmwareJob[]; stopped: string | null };
+}
+
+export const useFirmware = () => useQuery({ queryKey: ["firmware"], queryFn: () => get<FirmwareInfo>("/api/firmware"), refetchInterval: 10_000 });
+export const checkFirmware = () => send<{ platforms: number }>("POST", "/api/firmware/check", {});
+export const upgradeFirmware = (macs: Mac[]) => send<{ queued: number; skipped: { mac: Mac; why: string }[] }>("POST", "/api/firmware/upgrade", { macs });
+export const upgradeFirmwareUrl = (mac: Mac, url: string) => send("POST", "/api/firmware/upgrade-url", { mac, url });
+export const cancelFirmware = () => send<{ cancelled: number }>("POST", "/api/firmware/cancel", {});
+
 export const useMulticast = (span: TimeSpan, mac?: Mac) =>
   useQuery({
     queryKey: ["multicast", span, mac],

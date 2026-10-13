@@ -35,6 +35,9 @@ pub struct AppState {
     pub started: Ts,
     pub source: String,
     pub backups: Option<crate::backup::Backups>,
+    /// Active mode: apctl answers the APs (and can upgrade them).
+    pub active: bool,
+    pub writer: Option<crate::store::Writer>,
 }
 
 pub fn router(state: AppState) -> Router {
@@ -61,6 +64,11 @@ pub fn router(state: AppState) -> Router {
         .route("/api/site/top", get(crate::insights::top))
         .route("/api/site/connectivity", get(crate::connections::connectivity))
         .route("/api/connections", get(crate::connections::list))
+        .route("/api/firmware", get(crate::firmware::index))
+        .route("/api/firmware/check", axum::routing::post(crate::firmware::check_now))
+        .route("/api/firmware/upgrade", axum::routing::post(crate::firmware::upgrade))
+        .route("/api/firmware/upgrade-url", axum::routing::post(crate::firmware::upgrade_url))
+        .route("/api/firmware/cancel", axum::routing::post(crate::firmware::cancel))
         .route("/api/backups", get(crate::backup::index).post(crate::backup::create_now))
         .route("/api/backups/settings", axum::routing::put(crate::backup::put_settings))
         .route("/api/backups/file/{name}", get(crate::backup::download).delete(crate::backup::delete))

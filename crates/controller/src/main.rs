@@ -11,6 +11,7 @@ mod backup;
 mod connections;
 mod dryrun;
 mod engine;
+mod firmware;
 mod insights;
 mod logevents;
 mod model;
@@ -284,7 +285,8 @@ async fn serve(args: ServeArgs) -> Result<()> {
     threats::watch(store.clone(), live.clone(), in_tx.clone());
     alerts::spawn(store.clone(), writer.clone(), live.clone(), live_tx.clone());
     backup::schedule(backups.clone(), store.clone());
-    let state = api::AppState { backups: Some(backups), store, vendors: Arc::new(vendors), renderer, auth, engine: in_tx.clone(), live, tx: live_tx, started: store::now_ts(), source: source_desc };
+    firmware::schedule(writer.clone());
+    let state = api::AppState { backups: Some(backups), active, writer: Some(writer.clone()), store, vendors: Arc::new(vendors), renderer, auth, engine: in_tx.clone(), live, tx: live_tx, started: store::now_ts(), source: source_desc };
     let app = api::router(state);
     let listener = tokio::net::TcpListener::bind(listen).await.with_context(|| format!("binding {listen}"))?;
     tracing::info!("web UI and API on http://{listen}");

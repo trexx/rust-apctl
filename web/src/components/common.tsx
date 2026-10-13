@@ -123,6 +123,11 @@ const EVENT_LABELS: Record<string, string> = {
   rogue_ap: "Rogue AP (reported by AP)",
   network_threat: "Suspicious network",
   client_kicked: "Client kicked",
+  ap_upgrade_sent: "Update sent",
+  ap_upgrade_started: "Update started",
+  ap_upgrade_progress: "Updating",
+  ap_upgrade_failed: "Update failed",
+  ap_upgraded: "Firmware updated",
   client_wrong_password: "Wrong password?",
   client_steered: "Client steering",
   client_experience: "Poor experience",
@@ -149,7 +154,12 @@ function eventTone(kind: string, d?: Record<string, unknown>): string {
     kind === "dfs_radar"
   )
     return "warn";
-  if (kind === "rogue_ap" || kind === "ap_crash" || kind === "ap_isolated")
+  if (
+    kind === "rogue_ap" ||
+    kind === "ap_crash" ||
+    kind === "ap_isolated" ||
+    kind === "ap_upgrade_failed"
+  )
     return "bad";
   if (
     kind === "client_kicked" ||
@@ -244,6 +254,20 @@ function describe(e: AppEvent, names: DeviceNames): React.ReactNode {
         .join(" · ");
     case "ap_process_restarted":
       return `${d.proc ?? "a process"} exited with code ${d.exit_status ?? "?"} and was restarted by ${d.caller ?? "the system"}`;
+    case "ap_upgrade_sent":
+      return `to ${d.target ?? "?"}`;
+    case "ap_upgrade_started":
+      return d.by ? `started by ${d.by}` : "";
+    case "ap_upgrade_progress":
+      return d.step === "downloading"
+        ? "downloading the firmware"
+        : d.step === "writing"
+          ? "checked; writing it to flash"
+          : String(d.step ?? "");
+    case "ap_upgrade_failed":
+      return String(d.detail ?? d.reason ?? "");
+    case "ap_upgraded":
+      return `${d.from ?? "?"} → ${d.to ?? "?"}${d.custom ? " (custom firmware)" : ""}`;
     case "ap_isolated":
       return `its beacon says it lost its uplink${d.heard_by ? ` (heard by ${names.get(d.heard_by) ?? d.heard_by})` : ""}`;
     case "network_threat":

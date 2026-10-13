@@ -215,6 +215,23 @@ impl Active {
         };
 
         if reported == cfgversion {
+            // Config is current: is it this AP's turn for a firmware upgrade?
+            let cmd = crate::firmware::command(&mut self.live.write().unwrap().firmware, &mac.to_string(), payload, ts);
+            match cmd {
+                Some(Ok(cmd)) => {
+                    tracing::warn!("{mac}: sending firmware upgrade to {}", cmd["version"]);
+                    let data = json!({ "target": cmd["version"], "url": cmd["url"] });
+                    let _ = self.engine.try_send(Input::Note { ts, kind: "ap_upgrade_sent", mac, data });
+                    return cmd;
+                }
+                Some(Err(why)) => {
+                    let failed = self.live.write().unwrap().firmware.failed(&mac.to_string(), why);
+                    if failed.is_some() {
+                        let _ = self.engine.try_send(Input::Note { ts, kind: "ap_upgrade_failed", mac, data: json!({ "reason": "no internet", "detail": why }) });
+                    }
+                }
+                None => {}
+            }
             return noop(self.interval());
         }
         match self.render(&state, mac, payload, &cfgversion) {
@@ -410,6 +427,38 @@ mod tests {
     }
 
     const GCM_ZLIB: u16 = Flags::ENCRYPTED | Flags::GCM | Flags::ZLIB;
+
+    #[tokio::test]
+    async fn sends_a_queued_upgrade_once_the_config_is_current() {
+        let rig = rig(true, None);
+        let (_, reply) = inform_as_ap(&rig, &ap_payload("1111111111111111"), KEY, GCM_ZLIB).await;
+        let version = reply.unwrap().1["cfgversion"].as_str().unwrap().to_string();
+        rig.live.write().unwrap().firmware.enqueue(vec![crate::firmware::Job {
+            mac: AP.into(),
+            name: None,
+            from: Some("8.8.11.20161".into()),
+            target: "8.8.12.20200".into(),
+            url: "https://fw-download.example/U6M-8.8.12.bin".into(),
+            md5: Some("abc".into()),
+            sha256: None,
+            custom: false,
+            state: "queued",
+            sent_at: None,
+            expires: None,
+        }]);
+        // An AP whose config is out of date gets the config first.
+        let (_, reply) = inform_as_ap(&rig, &ap_payload("1111111111111111"), KEY, GCM_ZLIB).await;
+        assert_eq!(reply.unwrap().1["_type"], "setparam");
+        // Config current: now the upgrade.
+        let (_, reply) = inform_as_ap(&rig, &ap_payload(&version), KEY, GCM_ZLIB).await;
+        let reply = reply.unwrap().1;
+        assert_eq!((reply["_type"].as_str(), reply["version"].as_str(), reply["md5sum"].as_str()), (Some("upgrade"), Some("8.8.12.20200"), Some("abc")));
+        assert_eq!(reply["url"], "https://fw-download.example/U6M-8.8.12.bin");
+        // Sent once: the next inform is a heartbeat.
+        let (_, reply) = inform_as_ap(&rig, &ap_payload(&version), KEY, GCM_ZLIB).await;
+        assert_eq!(reply.unwrap().1["_type"], "noop");
+        assert_eq!(rig.live.read().unwrap().firmware.current.as_ref().map(|j| j.state), Some("sent"));
+    }
 
     #[tokio::test]
     async fn provisions_once_then_heartbeats() {

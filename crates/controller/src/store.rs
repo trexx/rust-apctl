@@ -178,6 +178,9 @@ CREATE TABLE IF NOT EXISTS neighbors (
     security TEXT, signal INTEGER, best_signal INTEGER, noise INTEGER, is_unifi INTEGER NOT NULL DEFAULT 0, ap_name TEXT,
     model TEXT, first_seen INTEGER NOT NULL, last_seen INTEGER NOT NULL, PRIMARY KEY (bssid, ap_mac)) WITHOUT ROWID;
 CREATE INDEX IF NOT EXISTS neighbors_seen ON neighbors (last_seen);
+CREATE TABLE IF NOT EXISTS firmware_releases (
+    platform TEXT PRIMARY KEY, version TEXT NOT NULL, url TEXT NOT NULL, md5 TEXT, sha256 TEXT, size INTEGER, created TEXT, checked INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS firmware_check (id INTEGER PRIMARY KEY CHECK (id = 1), ts INTEGER NOT NULL, error TEXT);
 CREATE TABLE IF NOT EXISTS backup_settings (id INTEGER PRIMARY KEY CHECK (id = 1), json TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS alerts (
     id TEXT PRIMARY KEY, ts INTEGER NOT NULL, key TEXT NOT NULL, category TEXT NOT NULL, severity TEXT NOT NULL, entity TEXT NOT NULL,
