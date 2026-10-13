@@ -51,7 +51,7 @@ pub struct UplinkSample {
     pub tx_dropped: Option<i64>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Default, Serialize)]
 pub struct RadioSample {
     /// Band code as the AP reports it: `ng` (2.4 GHz), `na` (5 GHz), `6e` (6 GHz).
     pub radio: String,

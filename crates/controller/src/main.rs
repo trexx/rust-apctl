@@ -6,6 +6,7 @@
 mod active;
 mod api;
 mod auth;
+mod connections;
 mod dryrun;
 mod engine;
 mod insights;

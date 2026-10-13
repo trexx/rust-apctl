@@ -538,6 +538,12 @@ impl Engine {
             data.insert(field.into(), summary);
             known.insert(field, new.to_string());
         }
+        // Names for numbered sections ("aaa.3" -> "Home WiFi (5 GHz)"), so the
+        // config history can say what a change was about.
+        if let Some(cfg) = known.get("system_cfg") {
+            let radios = live.devices.get(&mac).map(|d| d.snapshot.radios.clone()).unwrap_or_default();
+            data.insert("labels".into(), Value::Object(section_labels(cfg, &radios)));
+        }
         // A push can be management-only (e.g. after an LED change): it carries
         // mgmt_cfg alone, and the AP keeps its last full system_cfg.
         let cfgversion = p["cfgversion"].as_str().map(str::to_string).or_else(|| {
@@ -699,12 +705,16 @@ impl Engine {
         let ms = |k: &str| num(k).map(|us| (us / 1000.0).round() as i64);
         let text = |k: &str| n[k].as_str().map(str::to_string);
         let vap = text("vap");
-        let (essid, radio) = live
-            .devices
-            .get(&ap)
-            .and_then(|d| d.snapshot.vaps.iter().find(|v| v.name.as_deref() == vap.as_deref()))
-            .map(|v| (v.essid.clone(), v.radio.clone()))
-            .unwrap_or((None, None));
+        let dev = live.devices.get(&ap);
+        let vap_info = dev.and_then(|d| d.snapshot.vaps.iter().find(|v| v.name.as_deref() == vap.as_deref()));
+        let (essid, radio) = vap_info.map(|v| (v.essid.clone(), v.radio.clone())).unwrap_or((None, None));
+        // Channel and width at the time, for the connection log and roaming views.
+        let mut detail = n.clone();
+        if let Some(v) = vap_info {
+            let bw = dev.and_then(|d| d.snapshot.radios.iter().find(|r| Some(&r.radio) == v.radio.as_ref())).and_then(|r| r.bw);
+            detail["x_channel"] = json!(v.channel);
+            detail["x_bw"] = json!(bw);
+        }
         let event_type = text("event_type").unwrap_or_default();
         self.writer.exec(
             Db::Config,
@@ -728,7 +738,7 @@ impl Engine {
                 opt_int(num("avg_rssi").or_else(|| num("auth_rssi")).map(|v| v as i64)),
                 opt_text(text("sta_dc_reason")),
                 // The whole notification: failure counters and stage flags for connectivity stats.
-                Sql::Text(n.to_string()),
+                Sql::Text(detail.to_string()),
             ],
         );
         // Failed attempts are worth an event; the rest stay in the connection log.
@@ -993,6 +1003,48 @@ impl Engine {
     }
 }
 
+/// Human names for numbered config sections: SSIDs (with band) for `aaa.N` and
+/// `wireless.N`, the band for `radio.N`.
+fn section_labels(cfg: &str, radios: &[crate::model::RadioSample]) -> serde_json::Map<String, Value> {
+    let kv: HashMap<&str, &str> = cfg.lines().filter_map(|l| l.split_once('=')).collect();
+    let band_of_phy = |phy: &str| {
+        radios.iter().find(|r| r.name.as_deref() == Some(phy)).map(|r| match r.radio.as_str() {
+            "ng" => "2.4 GHz",
+            "na" => "5 GHz",
+            "6e" => "6 GHz",
+            other => other,
+        })
+    };
+    // Interface (e.g. wifi1ap1) -> band, from the wireless sections' parent radio.
+    let mut band_of_dev: HashMap<&str, &str> = HashMap::new();
+    for (k, v) in &kv {
+        if let Some(n) = k.strip_prefix("wireless.").and_then(|r| r.strip_suffix(".devname"))
+            && let Some(b) = kv.get(format!("wireless.{n}.parent").as_str()).and_then(|p| band_of_phy(p))
+        {
+            band_of_dev.insert(v, b);
+        }
+    }
+    let mut out = serde_json::Map::new();
+    for (k, v) in &kv {
+        for section in ["aaa", "wireless"] {
+            if let Some(n) = k.strip_prefix(&format!("{section}.")).and_then(|r| r.strip_suffix(".ssid")) {
+                let band = kv.get(format!("{section}.{n}.devname").as_str()).and_then(|d| band_of_dev.get(d));
+                let label = match band {
+                    Some(b) => format!("{v} ({b})"),
+                    None => v.to_string(),
+                };
+                out.insert(format!("{section}.{n}"), json!(label));
+            }
+        }
+        if let Some(n) = k.strip_prefix("radio.").and_then(|r| r.strip_suffix(".phyname"))
+            && let Some(b) = band_of_phy(v)
+        {
+            out.insert(format!("radio.{n}"), json!(format!("{b} radio")));
+        }
+    }
+    out
+}
+
 fn ev(ts: Ts, kind: &'static str, device_mac: Option<Mac>, client_mac: Option<Mac>, data: Value) -> Event {
     Event { ts, kind, device_mac, client_mac, data }
 }
@@ -1015,6 +1067,19 @@ fn opt_text(v: Option<String>) -> Sql {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn config_sections_get_names() {
+        let cfg = "radio.1.phyname=wifi0\nradio.2.phyname=wifi1\naaa.1.devname=wifi0ap0\naaa.1.ssid=Home IoT\nwireless.1.devname=wifi0ap0\n\
+                   wireless.1.ssid=Home IoT\nwireless.1.parent=wifi0\naaa.2.devname=wifi1ap1\naaa.2.ssid=Home\nwireless.2.devname=wifi1ap1\n\
+                   wireless.2.ssid=Home\nwireless.2.parent=wifi1\n";
+        let radio = |name: &str, band: &str| crate::model::RadioSample { radio: band.into(), name: Some(name.into()), ..Default::default() };
+        let l = section_labels(cfg, &[radio("wifi0", "ng"), radio("wifi1", "na")]);
+        assert_eq!(l["aaa.1"], "Home IoT (2.4 GHz)");
+        assert_eq!(l["wireless.2"], "Home (5 GHz)");
+        assert_eq!(l["radio.2"], "5 GHz radio");
+    }
+
     use super::*;
     use inform::{Flags, Header};
     use wire::decode::KeyUsed;

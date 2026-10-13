@@ -58,7 +58,10 @@ pub fn router(state: AppState) -> Router {
         .route("/api/dryrun", get(dryrun))
         .route("/api/site/activity", get(crate::insights::activity))
         .route("/api/site/top", get(crate::insights::top))
-        .route("/api/site/connectivity", get(crate::insights::connectivity))
+        .route("/api/site/connectivity", get(crate::connections::connectivity))
+        .route("/api/connections", get(crate::connections::list))
+        .route("/api/wlans", get(crate::insights::wlans))
+        .route("/api/roaming", get(crate::connections::roaming))
         .route("/api/site/density", get(crate::insights::density))
         .route("/api/site/retries", get(crate::insights::retries))
         .route("/api/site/multicast", get(crate::insights::multicast))
@@ -530,9 +533,16 @@ async fn events(State(s): State<AppState>, Query(q): Query<EventQuery>) -> ApiRe
         cond.push(format!("client_mac = ?{}", params.len()));
     }
     if let Some(k) = &q.kind {
-        // Prefix match, so `client` selects all client events.
-        params.push(Sql::Text(format!("{k}%")));
-        cond.push(format!("kind LIKE ?{}", params.len()));
+        // Prefix match, so `client` selects all client events; several kinds
+        // can be given separated by commas.
+        let mut any = Vec::new();
+        for k in k.split(',').map(str::trim).filter(|k| !k.is_empty()).take(10) {
+            params.push(Sql::Text(format!("{k}%")));
+            any.push(format!("kind LIKE ?{}", params.len()));
+        }
+        if !any.is_empty() {
+            cond.push(format!("({})", any.join(" OR ")));
+        }
     }
     if let Some(b) = q.before {
         params.push(Sql::Integer(b));
