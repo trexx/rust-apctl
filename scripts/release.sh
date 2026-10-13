@@ -39,7 +39,13 @@ fi
 
 if [ $test = 1 ]; then
   echo "== tests"
-  cargo test -q --workspace 2>&1 | grep -E "^test result|FAILED|panicked" | grep -v " 0 failed" && { echo "tests failed" >&2; exit 1; } || true
+  log=$(mktemp)
+  if ! cargo test -q --workspace >"$log" 2>&1; then
+    grep -E "FAILED|panicked|error" "$log" | head -20 >&2
+    echo "tests failed (full output: $log)" >&2
+    exit 1
+  fi
+  rm -f "$log"
 fi
 
 echo "== building $IMAGE:$version"
