@@ -14,6 +14,7 @@ import { Events } from "./pages/Events";
 import { Logs } from "./pages/Logs";
 import { DryRunPage } from "./pages/DryRun";
 import { Settings } from "./pages/Settings";
+import { Radios } from "./pages/Radios";
 import "./styles.css";
 
 const queryClient = new QueryClient({
@@ -105,6 +106,7 @@ function Shell({ user, readOnly }: { user: string | null; readOnly: boolean }) {
             Overview
           </NavLink>
           <NavLink to="/clients">Clients</NavLink>
+          <NavLink to="/radios">Radios</NavLink>
           <NavLink to="/events">Events</NavLink>
           <NavLink to="/logs">Logs</NavLink>
           <NavLink to="/dryrun">Dry run</NavLink>
@@ -144,6 +146,7 @@ function Shell({ user, readOnly }: { user: string | null; readOnly: boolean }) {
           <Route path="/" element={<Overview />} />
           <Route path="/devices/:mac" element={<Device />} />
           <Route path="/clients" element={<Clients />} />
+          <Route path="/radios" element={<Radios />} />
           <Route path="/clients/:mac" element={<Client />} />
           <Route path="/events" element={<Events />} />
           <Route path="/logs" element={<Logs />} />

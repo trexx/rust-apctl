@@ -21,6 +21,8 @@ pub struct RangeQuery {
     range: Option<Ts>,
     /// `ng`, `na` or `6e`; all bands when absent.
     band: Option<String>,
+    /// One AP only (activity).
+    mac: Option<String>,
 }
 
 fn window(q: &RangeQuery) -> (Ts, Ts, usize) {
@@ -119,27 +121,37 @@ pub async fn activity(State(s): State<AppState>, Query(q): Query<RangeQuery>) ->
     let (from, to, tier) = window(&q);
     let bucket = bucket_for(to - from, tier);
     let band = q.band.clone();
+    let ap = q.mac.as_ref().map(|m| m.to_ascii_lowercase());
     let result = read(&s, Db::Metrics, move |c| {
-        // VAP counters: bytes, packets, retries, multicast; gauges: clients.
-        let vaps = load(c, Spec { table: "vap_stats", key: "bssid", extra: &["radio"], cols: &["tx_bytes", "rx_bytes", "tx_packets", "rx_packets", "tx_retries", "tx_mcast", "rx_mcast", "num_sta"] }, tier, from, to)?;
+        let ap_ok = |mac: &str| ap.as_deref().is_none_or(|a| a == mac);
+        // VAP counters: bytes, packets, retries, multicast, drops; gauge: clients.
+        let vaps = load(
+            c,
+            Spec { table: "vap_stats", key: "bssid", extra: &["radio", "ap_mac"], cols: &["tx_bytes", "rx_bytes", "tx_packets", "rx_packets", "tx_retries", "tx_mcast", "rx_mcast", "tx_dropped", "num_sta"] },
+            tier,
+            from,
+            to,
+        )?;
         // bucket -> per-bssid accumulators
         #[derive(Default, Clone)]
         struct Acc {
             down: f64,
             up: f64,
             pkts: f64,
+            rx_pkts: f64,
             retries: f64,
+            dropped: f64,
             mcast: f64,
             clients: f64,
             n: f64,
         }
         let mut per: BTreeMap<Ts, HashMap<String, Acc>> = BTreeMap::new();
         for (bssid, (ex, samples)) in &vaps {
-            if !band_ok(&band, &ex[0]) {
+            if !band_ok(&band, &ex[0]) || !ap_ok(&ex[1]) {
                 continue;
             }
-            let r = rates(&samples.iter().map(|(t, v)| (*t, v[..7].to_vec())).collect::<Vec<_>>());
-            let clients: HashMap<Ts, f64> = samples.iter().filter_map(|(t, v)| v[7].map(|n| (*t, n))).collect();
+            let r = rates(&samples.iter().map(|(t, v)| (*t, v[..8].to_vec())).collect::<Vec<_>>());
+            let clients: HashMap<Ts, f64> = samples.iter().filter_map(|(t, v)| v[8].map(|n| (*t, n))).collect();
             for (t, _, v) in r.points.iter().filter(|p| p.0 >= from) {
                 let b = t - t % bucket;
                 let a = per.entry(b).or_default().entry(bssid.clone()).or_default();
@@ -147,20 +159,26 @@ pub async fn activity(State(s): State<AppState>, Query(q): Query<RangeQuery>) ->
                 a.down += g(0);
                 a.up += g(1);
                 a.pkts += g(2);
+                a.rx_pkts += g(3);
                 a.retries += g(4);
                 a.mcast += g(5) + g(6);
+                a.dropped += g(7);
                 a.clients += clients.get(t).copied().unwrap_or(0.0);
                 a.n += 1.0;
-                let _ = g(3);
             }
         }
         let mut ts = Vec::new();
         let (mut down, mut up, mut retry, mut clients, mut mcast) = (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        let (mut tx_pps, mut rx_pps, mut dropped) = (Vec::new(), Vec::new(), Vec::new());
         for (b, m) in &per {
             ts.push(*b);
             // Average per VAP within the bucket, then sum across VAPs.
             let sum = |f: &dyn Fn(&Acc) -> f64| m.values().map(|a| f(a) / a.n.max(1.0)).sum::<f64>();
             let (d, u, p, r, mc, cl) = (sum(&|a| a.down), sum(&|a| a.up), sum(&|a| a.pkts), sum(&|a| a.retries), sum(&|a| a.mcast), sum(&|a| a.clients));
+            let (rp, dr) = (sum(&|a| a.rx_pkts), sum(&|a| a.dropped));
+            tx_pps.push(p);
+            rx_pps.push(rp);
+            dropped.push(if p + dr > 0.0 { Some(100.0 * dr / (p + dr)) } else { None });
             down.push(d * 8.0);
             up.push(u * 8.0);
             retry.push(if p > 0.0 { Some(100.0 * r / (p + r)) } else { None });
@@ -169,10 +187,10 @@ pub async fn activity(State(s): State<AppState>, Query(q): Query<RangeQuery>) ->
         }
 
         // Airtime from the radios: averages across radios per bucket.
-        let radios = load(c, Spec { table: "radio_stats", key: "mac || '/' || radio", extra: &["radio"], cols: &["cu_total", "cu_interf", "cu_self_rx", "cu_self_tx"] }, tier, from, to)?;
+        let radios = load(c, Spec { table: "radio_stats", key: "mac || '/' || radio", extra: &["radio", "mac"], cols: &["cu_total", "cu_interf", "cu_self_rx", "cu_self_tx"] }, tier, from, to)?;
         let mut air: BTreeMap<Ts, Vec<[f64; 4]>> = BTreeMap::new();
         for (ex, samples) in radios.values() {
-            if !band_ok(&band, &ex[0]) {
+            if !band_ok(&band, &ex[0]) || !ap_ok(&ex[1]) {
                 continue;
             }
             for (t, v) in samples.iter().filter(|p| p.0 >= from) {
@@ -185,11 +203,16 @@ pub async fn activity(State(s): State<AppState>, Query(q): Query<RangeQuery>) ->
         let avg = |i: usize| -> Vec<f64> { air.values().map(|v| v.iter().map(|x| x[i]).sum::<f64>() / v.len().max(1) as f64).collect() };
         let total = avg(0);
         let external = avg(1);
-        let internal: Vec<f64> = avg(2).iter().zip(avg(3)).map(|(a, b)| a + b).collect();
+        let own_rx = avg(2);
+        let own_tx = avg(3);
+        let internal: Vec<f64> = own_rx.iter().zip(&own_tx).map(|(a, b)| a + b).collect();
         Ok(json!({
             "bucket": bucket,
-            "activity": { "ts": ts, "download_bps": down, "upload_bps": up, "tx_retry_pct": retry, "clients": clients, "multicast_pct": mcast },
-            "airtime": { "ts": air_ts, "total": total, "external_interference": external, "own_traffic": internal },
+            "activity": {
+                "ts": ts, "download_bps": down, "upload_bps": up, "tx_retry_pct": retry, "clients": clients, "multicast_pct": mcast,
+                "tx_pps": tx_pps, "rx_pps": rx_pps, "tx_dropped_pct": dropped,
+            },
+            "airtime": { "ts": air_ts, "total": total, "external_interference": external, "own_traffic": internal, "own_rx": own_rx, "own_tx": own_tx },
         }))
     })
     .await?;
@@ -205,6 +228,7 @@ fn totals(samples: &[(Ts, Vec<Option<f64>>)], from: Ts) -> (f64, f64) {
 /// GET /api/site/top: APs and clients by traffic over the window.
 pub async fn top(State(s): State<AppState>, Query(q): Query<RangeQuery>) -> Result<Json<Value>, ApiError> {
     let (from, to, tier) = window(&q);
+    let ap = q.mac.as_ref().map(|m| m.to_ascii_lowercase());
     let (aps, clients) = read(&s, Db::Metrics, move |c| {
         let vaps = load(c, Spec { table: "vap_stats", key: "bssid", extra: &["ap_mac"], cols: &["tx_bytes", "rx_bytes"] }, tier, from, to)?;
         let mut aps: HashMap<String, (f64, f64)> = HashMap::new();
@@ -214,11 +238,20 @@ pub async fn top(State(s): State<AppState>, Query(q): Query<RangeQuery>) -> Resu
             e.0 += d;
             e.1 += u;
         }
-        let cl = load(c, Spec { table: "client_stats", key: "mac", extra: &[], cols: &["tx_bytes", "rx_bytes"] }, tier, from, to)?;
-        let clients: Vec<(String, f64, f64)> = cl.iter().map(|(m, (_, s))| {
+        // Per client and AP, so a client's traffic counts towards the AP it was on.
+        let cl = load(c, Spec { table: "client_stats", key: "mac || '/' || coalesce(ap_mac, '')", extra: &[], cols: &["tx_bytes", "rx_bytes"] }, tier, from, to)?;
+        let mut per_client: HashMap<String, (f64, f64)> = HashMap::new();
+        for (k, (_, s)) in &cl {
+            let (mac, on) = k.split_once('/').unwrap_or((k, ""));
+            if ap.as_deref().is_some_and(|a| a != on) {
+                continue;
+            }
             let (d, u) = totals(s, from);
-            (m.clone(), d, u)
-        }).collect();
+            let e = per_client.entry(mac.to_string()).or_default();
+            e.0 += d;
+            e.1 += u;
+        }
+        let clients: Vec<(String, f64, f64)> = per_client.into_iter().map(|(m, (d, u))| (m, d, u)).collect();
         Ok((aps, clients))
     })
     .await?;

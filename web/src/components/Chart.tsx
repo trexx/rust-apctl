@@ -17,6 +17,10 @@ export interface ChartSeries {
   color: string;
   /** Fill the area under the line (use for one series per chart at most). */
   fill?: boolean;
+  /** Plot against the right-hand axis (formatted with `formatRight`). */
+  right?: boolean;
+  /** Dashed line, for secondary measures. */
+  dashed?: boolean;
 }
 
 interface Props {
@@ -24,6 +28,8 @@ interface Props {
   ts: number[];
   series: ChartSeries[];
   format: (v: number) => string;
+  formatRight?: (v: number) => string;
+  rightMax?: number;
   height?: number;
   min?: number;
   max?: number;
@@ -34,12 +40,13 @@ function cssVar(name: string): string {
 }
 
 /** A compact time-series chart with a live legend. */
-export function Chart({ title, ts, series, format, height = 180, min, max }: Props) {
+export function Chart({ title, ts, series, format, formatRight, rightMax, height = 180, min, max }: Props) {
   const box = useRef<HTMLDivElement>(null);
   const plot = useRef<uPlot | null>(null);
 
   // Rebuild when the shape changes; otherwise only push new data.
-  const shape = series.map((s) => s.label + s.color).join("|") + `|${min}|${max}|${height}`;
+  const shape = series.map((s) => s.label + s.color + (s.right ? "r" : "")).join("|") + `|${min}|${max}|${height}|${rightMax}`;
+  const hasRight = series.some((s) => s.right);
 
   useEffect(() => {
     const el = box.current;
@@ -58,10 +65,17 @@ export function Chart({ title, ts, series, format, height = 180, min, max }: Pro
       padding: [8, 8, 0, 0],
       cursor: { points: { size: 6 } },
       legend: { show: true, live: true },
-      scales: { x: { time: true }, y: { range: (_u, lo, hi) => [min ?? Math.min(0, lo), max ?? (hi > 0 ? hi * 1.1 : 1)] } },
+      scales: {
+        x: { time: true },
+        y: { range: (_u, lo, hi) => [min ?? Math.min(0, lo), max ?? (hi > 0 ? hi * 1.1 : 1)] },
+        r: { range: (_u, _lo, hi) => [0, rightMax ?? (hi > 0 ? hi * 1.1 : 1)] },
+      },
       axes: [
         axis(),
         { ...axis(), size: 64, values: (_u, vals) => vals.map((v) => (v === null ? "" : format(v))) },
+        ...(hasRight
+          ? [{ ...axis(), scale: "r", side: 1 as const, grid: { show: false }, size: 52, values: (_u: uPlot, vals: number[]) => vals.map((v) => (v === null ? "" : (formatRight ?? format)(v))) }]
+          : []),
       ],
       series: [
         {},
@@ -69,10 +83,12 @@ export function Chart({ title, ts, series, format, height = 180, min, max }: Pro
           label: s.label,
           stroke: s.color,
           width: 1.5,
+          scale: s.right ? "r" : "y",
+          dash: s.dashed ? [4, 3] : undefined,
           fill: s.fill ? `${s.color}22` : undefined,
           spanGaps: false,
           points: { show: false },
-          value: (_u: uPlot, v: number | null) => (v === null || v === undefined ? "—" : format(v)),
+          value: (_u: uPlot, v: number | null) => (v === null || v === undefined ? "—" : (s.right ? (formatRight ?? format) : format)(v)),
         })),
       ],
     };

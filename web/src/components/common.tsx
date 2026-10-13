@@ -18,7 +18,7 @@ export function Dot({ ok, warn }: { ok: boolean; warn?: boolean }) {
 }
 
 export function Signal({ dbm }: { dbm: number | null | undefined }) {
-  return <span className={`signal signal-${signalClass(dbm)}`}>{dbm === null || dbm === undefined ? "—" : `${dbm} dBm`}</span>;
+  return <span className={`signal signal-${signalClass(dbm)}`}>{dbm === null || dbm === undefined ? "—" : `${Math.round(dbm)} dBm`}</span>;
 }
 
 export function Meter({ value, max = 100 }: { value: number | null | undefined; max?: number }) {

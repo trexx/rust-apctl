@@ -69,6 +69,7 @@ export interface ClientView {
   first_seen: number;
   last_seen: number;
   ap_name?: string | null;
+  vendor?: string | null;
   alias?: string | null;
   note?: string | null;
 }
@@ -87,6 +88,19 @@ export interface VapSample {
   satisfaction: number | null;
   avg_client_signal: number | null;
   latency_avg: number | null;
+  /** Counters since the AP started. */
+  rx_bytes: number | null;
+  tx_bytes: number | null;
+  rx_packets: number | null;
+  tx_packets: number | null;
+  tx_retries: number | null;
+  tx_dropped: number | null;
+  tx_mcast: number | null;
+  rx_mcast: number | null;
+  tx_bcast: number | null;
+  rx_bcast: number | null;
+  rx_dropped: number | null;
+  tx_errors: number | null;
 }
 
 export interface RadioSample {
@@ -101,6 +115,12 @@ export interface RadioSample {
   cu_interf: number | null;
   noise_floor: number | null;
   num_sta: number;
+  /** Counters since the AP started. */
+  tx_packets: number | null;
+  rx_packets: number | null;
+  antenna_gain: number | null;
+  min_txpower: number | null;
+  max_txpower: number | null;
 }
 
 export interface DeviceDetail {
@@ -124,7 +144,16 @@ export interface DeviceDetail {
         mem_used: number | null;
         satisfaction: number | null;
       };
-      uplink: { ifname: string; speed: number | null; up: boolean | null; full_duplex: boolean | null } | null;
+      uplink: {
+        ifname: string;
+        speed: number | null;
+        up: boolean | null;
+        full_duplex: boolean | null;
+        rx_bytes: number | null;
+        tx_bytes: number | null;
+        rx_packets: number | null;
+        tx_packets: number | null;
+      } | null;
       radios: RadioSample[];
       vaps: VapSample[];
       has_vap_table: boolean;
@@ -292,6 +321,140 @@ export interface DryRun {
 }
 
 export const useDryRun = () => useQuery({ queryKey: ["dryrun"], queryFn: () => get<DryRun>("/api/dryrun"), refetchInterval: 30_000 });
+
+export interface SiteActivity {
+  bucket: number;
+  activity: {
+    ts: number[];
+    download_bps: number[];
+    upload_bps: number[];
+    tx_retry_pct: (number | null)[];
+    clients: number[];
+    multicast_pct: (number | null)[];
+    tx_pps: number[];
+    rx_pps: number[];
+    tx_dropped_pct: (number | null)[];
+  };
+  airtime: { ts: number[]; total: number[]; external_interference: number[]; own_traffic: number[]; own_rx: number[]; own_tx: number[] };
+}
+
+export interface TopEntry {
+  mac: Mac;
+  name: string | null;
+  vendor?: string | null;
+  connected?: boolean;
+  download_bytes: number;
+  upload_bytes: number;
+}
+
+export interface Stage {
+  stage: string;
+  ok: number;
+  failed: number;
+  success_pct: number | null;
+  median_ms: number | null;
+}
+
+export interface RadioOverview {
+  mac: Mac;
+  name: string | null;
+  radio: string;
+  channel: number | null;
+  bw: number | null;
+  tx_power: number | null;
+  eirp: number | null;
+  clients: number;
+  cu_total_now: number | null;
+  noise_floor: number | null;
+  avg_utilization: number | null;
+  avg_interference: number | null;
+  tx_retry_pct: number | null;
+  usage_bytes: number;
+  avg_client_signal: number | null;
+  spectrum: { channel: number; width: number | null; utilization: number | null; interference: number | null; ts: number }[];
+}
+
+export interface Neighbor {
+  bssid: string;
+  ap_mac: Mac;
+  radio: string | null;
+  essid: string | null;
+  channel: number | null;
+  bw: number | null;
+  center_freq: number | null;
+  security: string | null;
+  signal: number | null;
+  best_signal: number | null;
+  is_unifi: boolean;
+  ap_name: string | null;
+  last_seen: number;
+  first_seen: number;
+  vendor: string | null;
+  nearest_ap: string | null;
+}
+
+export interface OwnLink {
+  from: Mac;
+  from_name: string | null;
+  to: Mac;
+  to_name: string | null;
+  radio: string | null;
+  signal: number | null;
+}
+
+export interface PlanEntry {
+  mac: Mac;
+  name: string | null;
+  width: number;
+  clients: number;
+  current_channel: number | null;
+  current_score: number | null;
+  current_reasons: string[] | null;
+  suggested_channel: number;
+  suggested_score: number;
+  suggested_reasons: string[];
+  change: boolean;
+}
+
+const bandParam = (band: string) => (band === "all" ? undefined : band);
+
+export const useSiteActivity = (range: number, band: string, mac?: Mac) =>
+  useQuery({
+    queryKey: ["site-activity", range, band, mac],
+    queryFn: () => get<SiteActivity>(`/api/site/activity${qs({ range, band: bandParam(band), mac })}`),
+    refetchInterval: 60_000,
+    placeholderData: (p) => p,
+  });
+
+export const useSiteTop = (range: number, mac?: Mac) =>
+  useQuery({
+    queryKey: ["site-top", range, mac],
+    queryFn: () => get<{ aps: TopEntry[]; clients: TopEntry[] }>(`/api/site/top${qs({ range, mac })}`),
+    refetchInterval: 60_000,
+  });
+
+export const useConnectivity = (range: number, band: string) =>
+  useQuery({
+    queryKey: ["connectivity", range, band],
+    queryFn: () => get<{ stages: Stage[] }>(`/api/site/connectivity${qs({ range, band: bandParam(band) })}`),
+    refetchInterval: 60_000,
+  });
+
+export const useRadios = (range: number) =>
+  useQuery({ queryKey: ["rf-radios", range], queryFn: () => get<RadioOverview[]>(`/api/rf/radios${qs({ range })}`), refetchInterval: 60_000 });
+
+export const useNeighbors = (range: number, band: string) =>
+  useQuery({
+    queryKey: ["rf-neighbors", range, band],
+    queryFn: () => get<{ neighbors: Neighbor[]; own_links: OwnLink[] }>(`/api/rf/neighbors${qs({ range, band: bandParam(band) })}`),
+    refetchInterval: 60_000,
+  });
+
+export const useChannelPlan = (band: string, dfs: boolean) =>
+  useQuery({
+    queryKey: ["rf-plan", band, dfs],
+    queryFn: () => get<{ band: string; dfs: boolean; plan: PlanEntry[] }>(`/api/rf/channel-plan${qs({ band, dfs: dfs ? "true" : undefined })}`),
+  });
 
 export const useStatus = () => useQuery({ queryKey: ["status"], queryFn: () => get<Status>("/api/status"), refetchInterval: 15_000 });
 

@@ -2,6 +2,7 @@ import { Link } from "react-router-dom";
 import { useClients, useDevices, useEvents, useStatus } from "../api";
 import { Dot, ErrorNote, EventList, Loading, Meter, Stat, clientNames, deviceNames } from "../components/common";
 import { ago, band, duration, pct } from "../format";
+import { ApDensity, Connectivity, RetryBuckets, SiteActivity, TopTalkers } from "../components/Insights";
 
 export function Overview() {
   const devices = useDevices();
@@ -34,6 +35,19 @@ export function Overview() {
           value={status.data ? status.data.counters.informs : "—"}
           sub={status.data ? `informs since start, ${status.data.counters.decode_errors} errors` : ""}
         />
+      </div>
+
+      <h2>Activity</h2>
+      <SiteActivity />
+      <div className="grid2">
+        <TopTalkers />
+        <div className="stack">
+          <RetryBuckets />
+          <Connectivity />
+        </div>
+      </div>
+      <div className="grid1">
+        <ApDensity />
       </div>
 
       <h2>Access points</h2>
