@@ -21,7 +21,11 @@ const DEVICE_FIELDS: &[&str] = &[
 ];
 
 /// Client fields: the names and notes people gave their devices.
-const USER_FIELDS: &[&str] = &["mac", "name", "note", "noted", "hostname", "oui", "first_seen", "last_seen", "is_wired"];
+const USER_FIELDS: &[&str] = &[
+    "mac", "name", "note", "noted", "hostname", "oui", "first_seen", "last_seen", "is_wired",
+    // used when rendering AP config: lock-to-AP, blocked clients, guests
+    "fixed_ap_enabled", "fixed_ap_mac", "blocked", "is_guest",
+];
 
 pub async fn run(uri: &str, db: &str, out: &Path) -> Result<()> {
     let mut opts = ClientOptions::parse(uri).await.context("parsing MongoDB URI")?;

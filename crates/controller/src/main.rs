@@ -77,6 +77,10 @@ struct ServeArgs {
     /// Without it apctl is read-only and needs no login.
     #[arg(long, env = "APCTL_USERS_FILE")]
     pub users_file: Option<PathBuf>,
+    /// Controller version to emulate in rendered configs (`unifi.version`). The dry run
+    /// compares with the existing controller, so this should match its version.
+    #[arg(long, env = "APCTL_EMULATE_VERSION", default_value = "10.6.106")]
+    pub emulate_version: String,
 }
 
 #[tokio::main]
@@ -99,7 +103,7 @@ async fn main() -> Result<()> {
 }
 
 async fn serve(args: ServeArgs) -> Result<()> {
-    let ServeArgs { data_dir, keys, shadow, shadow_cmd, inform_ports, listen, syslog_listen, users_file } = args;
+    let ServeArgs { data_dir, keys, shadow, shadow_cmd, inform_ports, listen, syslog_listen, users_file, emulate_version } = args;
     let keys = match &keys {
         Some(p) => KeyStore::load(p)?,
         None => KeyStore::default(),
@@ -151,8 +155,8 @@ async fn serve(args: ServeArgs) -> Result<()> {
     // The engine owns all mutable state and processes inputs in order.
     let mut engine = Engine::new(writer.clone(), keys.clone(), live.clone(), live_tx.clone());
     engine.restore(&store)?;
-    // The config generator is plugged in here once available (dry run).
-    let renderer: Option<dryrun::RenderFn> = None;
+    // The config generator, for dry runs.
+    let renderer: Option<dryrun::RenderFn> = Some(dryrun::apcfg_renderer(emulate_version));
     if let Some(r) = &renderer {
         engine.set_renderer(r.clone());
     }

@@ -296,6 +296,7 @@ async fn dryrun(State(s): State<AppState>) -> ApiResult {
             device_mac: &mac.to_string(),
             inform: live.raw_informs.get(mac).map(|v| v.as_ref()),
             cfgversion: actual.2.as_deref().unwrap_or(""),
+            previous_system_cfg: Some(&actual.1),
         };
         match render(&req) {
             Ok(ours) => {

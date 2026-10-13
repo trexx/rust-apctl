@@ -557,6 +557,7 @@ impl Engine {
                 device_mac: &mac.to_string(),
                 inform: inform.as_deref(),
                 cfgversion: cfgversion.as_deref().unwrap_or(""),
+                previous_system_cfg: Some(&system),
             };
             let result = render(&req).map(|ours| crate::dryrun::compare(&ours, &mgmt, &system, false));
             let (matches, payload) = match &result {
