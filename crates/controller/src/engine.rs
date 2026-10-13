@@ -29,6 +29,10 @@ pub enum Input {
     Inform { ts: Ts, peer: String, decoded: Decoded },
     /// Replace the imported controller settings (an `informdump import` snapshot).
     SetState { ts: Ts, state: Value },
+    /// Active mode: the section numbering a render allocated for an AP.
+    SetConfigMeta { mac: Mac, meta: Value },
+    /// Active mode: apctl itself pushed this `setparam` to an AP.
+    ConfigPushed { ts: Ts, mac: Mac, payload: Value },
     /// Set or clear a client's alias and note (None clears). `only_if_unset`
     /// leaves existing aliases alone (for bulk imports).
     SetAlias { ts: Ts, mac: Mac, alias: Option<String>, note: Option<String>, only_if_unset: bool },
@@ -278,7 +282,9 @@ impl Engine {
     pub fn handle(&mut self, input: Input) {
         match input {
             Input::Inform { ts, peer, decoded } => self.inform(ts, peer, decoded),
-            Input::Reply { ts, mac, decoded } => self.reply(ts, mac, decoded),
+            Input::Reply { ts, mac, decoded } => self.reply(ts, mac, &decoded.payload, true),
+            Input::ConfigPushed { ts, mac, payload } => self.reply(ts, mac, &payload, false),
+            Input::SetConfigMeta { mac, meta } => self.set_config_meta(mac, meta),
             Input::Datagram { ts, src_ip, payload } => self.datagram(ts, src_ip, &payload),
             Input::Tick(now) => self.tick(now),
             Input::DecodeError => self.live.write().unwrap().counters.decode_errors += 1,
@@ -504,8 +510,9 @@ impl Engine {
         let _ = self.tx.send(LiveMsg::Clients);
     }
 
-    fn reply(&mut self, ts: Ts, mac: Mac, decoded: Decoded) {
-        let p = &decoded.payload;
+    /// A reply sent to an AP: by the other controller (shadow mode, compared in
+    /// a dry run) or by apctl itself (active mode).
+    fn reply(&mut self, ts: Ts, mac: Mac, p: &Value, dry_run: bool) {
         let mut live = self.live.write().unwrap();
         live.counters.replies += 1;
         if let (Some(interval), Some(d)) = (p["interval"].as_i64(), live.devices.get_mut(&mac)) {
@@ -550,7 +557,7 @@ impl Engine {
         self.emit(&mut live, ev(ts, "config_pushed", Some(mac), None, Value::Object(data)));
 
         // Dry run: what would apctl have pushed for the same AP at this moment?
-        if let (Some(render), Some(state)) = (&self.renderer, live.state.clone()) {
+        if let (true, Some(render), Some(state)) = (dry_run, &self.renderer, live.state.clone()) {
             let inform = live.raw_informs.get(&mac).cloned();
             let req = crate::dryrun::RenderRequest {
                 state: &state,
@@ -575,6 +582,27 @@ impl Engine {
             };
             self.emit(&mut live, ev(ts, "dryrun_compared", Some(mac), None, summary));
         }
+    }
+
+    /// Stores an AP's section numbering in the settings, so later renders keep it.
+    fn set_config_meta(&mut self, mac: Mac, meta: Value) {
+        let mut live = self.live.write().unwrap();
+        let Some(state) = live.state.clone() else { return };
+        let mac_s = mac.to_string();
+        let same_mac = |m: &Value| m["mac"].as_str().is_some_and(|x| x.eq_ignore_ascii_case(&mac_s));
+        let current = state["config_meta"].as_array().and_then(|a| a.iter().find(|m| same_mac(m)));
+        if current == Some(&meta) {
+            return;
+        }
+        let mut next = (*state).clone();
+        if !next["config_meta"].is_array() {
+            next["config_meta"] = json!([]);
+        }
+        let list = next["config_meta"].as_array_mut().unwrap();
+        list.retain(|m| !same_mac(m));
+        list.push(meta);
+        self.writer.exec(Db::Config, "UPDATE controller_state SET json = ?1 WHERE id = 1", vec![Sql::Text(next.to_string())]);
+        live.state = Some(Arc::new(next));
     }
 
     fn set_state(&mut self, ts: Ts, state: Value) {

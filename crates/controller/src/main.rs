@@ -3,6 +3,7 @@
 //! Milestone 2 runs in shadow mode: it learns everything from a capture of
 //! another controller's traffic and never talks to the APs itself.
 
+mod active;
 mod api;
 mod auth;
 mod dryrun;
@@ -36,7 +37,7 @@ struct Cli {
 #[derive(Subcommand)]
 enum Cmd {
     /// Run the controller.
-    Serve(ServeArgs),
+    Serve(Box<ServeArgs>),
     /// Read a password from stdin and print its Argon2id hash for the users file.
     HashPassword,
     /// Decode AP syslog datagrams in a pcap file by trying each known syslog key.
@@ -81,6 +82,13 @@ struct ServeArgs {
     /// compares with the existing controller, so this should match its version.
     #[arg(long, env = "APCTL_EMULATE_VERSION", default_value = "10.6.106")]
     pub emulate_version: String,
+    /// Active mode: answer the APs' informs and push config. Off by default;
+    /// cannot be combined with shadow mode.
+    #[arg(long, env = "APCTL_ACTIVE", conflicts_with_all = ["shadow", "shadow_cmd"])]
+    pub active: bool,
+    /// Where to receive informs in active mode.
+    #[arg(long, env = "APCTL_INFORM_LISTEN", default_value = "0.0.0.0:8080")]
+    pub inform_listen: SocketAddr,
 }
 
 #[tokio::main]
@@ -89,7 +97,7 @@ async fn main() -> Result<()> {
         .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")))
         .init();
     match Cli::parse().cmd {
-        Cmd::Serve(args) => serve(args).await,
+        Cmd::Serve(args) => serve(*args).await,
         Cmd::HashPassword => {
             let mut line = String::new();
             std::io::stdin().read_line(&mut line)?;
@@ -103,7 +111,9 @@ async fn main() -> Result<()> {
 }
 
 async fn serve(args: ServeArgs) -> Result<()> {
-    let ServeArgs { data_dir, keys, shadow, shadow_cmd, inform_ports, listen, syslog_listen, users_file, emulate_version } = args;
+    let ServeArgs {
+        data_dir, keys, shadow, shadow_cmd, inform_ports, listen, syslog_listen, users_file, emulate_version, active, inform_listen,
+    } = args;
     let keys = match &keys {
         Some(p) => KeyStore::load(p)?,
         None => KeyStore::default(),
@@ -129,6 +139,7 @@ async fn serve(args: ServeArgs) -> Result<()> {
             let syslog_port = syslog_listen.map_or(5514, |a| a.port());
             shadow::spawn(src, inform_ports, syslog_port, keys.clone(), in_tx.clone());
         }
+        None if active => {}
         None => tracing::warn!("no shadow source configured: nothing will be ingested"),
     }
 
@@ -156,7 +167,7 @@ async fn serve(args: ServeArgs) -> Result<()> {
     let mut engine = Engine::new(writer.clone(), keys.clone(), live.clone(), live_tx.clone());
     engine.restore(&store)?;
     // The config generator, for dry runs.
-    let renderer: Option<dryrun::RenderFn> = Some(dryrun::apcfg_renderer(emulate_version));
+    let renderer: Option<dryrun::RenderFn> = Some(dryrun::apcfg_renderer(emulate_version.clone()));
     if let Some(r) = &renderer {
         engine.set_renderer(r.clone());
     }
@@ -175,6 +186,37 @@ async fn serve(args: ServeArgs) -> Result<()> {
             engine.handle(input);
         }
     });
+
+    if active {
+        // The other controller's installation ID, so rendered configs stay identical
+        // to what the APs run; a new one only when none was ever seen.
+        let reporter: Option<String> = store.read(store::Db::Config, |c| {
+            let cfgs: Vec<String> =
+                c.prepare("SELECT system_cfg FROM device_config")?.query_map([], |r| r.get::<_, Option<String>>(0))?.flatten().flatten().collect();
+            Ok(cfgs.iter().find_map(|cfg| cfg.lines().find_map(|l| l.strip_prefix("unifi.reporterid=")).map(str::to_string)))
+        })?;
+        let controller = apcfg::Controller {
+            inform_url: format!("http://unifi:{}/inform", inform_listen.port()),
+            mgmt_url: "https://unifi:8443".into(),
+            stun_url: "stun://unifi:3478/".into(),
+            syslog_ip: None,
+            version: emulate_version,
+            reporter_uuid: reporter.unwrap_or_else(|| {
+                let b: [u8; 16] = { let mut b = [0u8; 16]; getrandom::fill(&mut b).expect("random"); b };
+                let h = hex::encode(b);
+                format!("{}-{}-4{}-a{}-{}", &h[0..8], &h[8..12], &h[13..16], &h[17..20], &h[20..32])
+            }),
+        };
+        let active_state = Arc::new(active::Active::new(&store, writer.clone(), live.clone(), keys.clone(), in_tx.clone(), controller)?);
+        let inform_app = axum::Router::new().route("/inform", axum::routing::post(active::inform)).with_state(active_state);
+        let inform_socket = tokio::net::TcpListener::bind(inform_listen).await.with_context(|| format!("binding {inform_listen}"))?;
+        tracing::warn!("ACTIVE MODE: answering AP informs on http://{inform_listen}/inform and pushing config");
+        tokio::spawn(async move {
+            if let Err(e) = axum::serve(inform_socket, inform_app.into_make_service_with_connect_info::<SocketAddr>()).await {
+                tracing::error!("inform server stopped: {e}");
+            }
+        });
+    }
 
     let users = match &users_file {
         Some(p) => auth::Users::load(p)?,

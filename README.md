@@ -40,6 +40,22 @@ Data lives in three SQLite files under `--data-dir`:
 In Kubernetes, `deploy/k8s/shadow.yaml` runs apctl with a tcpdump sidecar on the host
 network of the node that runs the other controller.
 
+### Dry run and active mode
+
+- With settings imported (Settings page, from `informdump import`), every config push the other
+  controller makes is compared with what apctl would generate (`crates/apcfg`); see the Dry run
+  page.
+- `apctl serve --active` answers the APs' informs itself. It decrypts with each AP's key, replies
+  `setparam` when the AP's `cfgversion` differs and `noop` otherwise, and adopts the running
+  config at cutover when it is identical. It is off by default and cannot be combined with
+  shadow mode.
+- Rehearse against a local instance only (the command refuses other hosts):
+
+  ```sh
+  apctl serve --active --inform-listen 127.0.0.1:18180 --listen 127.0.0.1:18101 ...
+  informdump simulate capture.pcap --keys import.json --url http://127.0.0.1:18180/inform
+  ```
+
 ## informdump
 
 ```sh

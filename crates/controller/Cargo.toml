@@ -31,3 +31,6 @@ wire = { version = "0.1.0", path = "../wire" }
 [[bin]]
 name = "apctl"
 path = "src/main.rs"
+
+[dev-dependencies]
+tower = { version = "0.5.3", features = ["util"] }

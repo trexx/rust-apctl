@@ -9,6 +9,7 @@
 mod import;
 mod report;
 mod sanitize;
+mod simulate;
 
 use std::path::PathBuf;
 
@@ -76,6 +77,19 @@ enum Cmd {
         devices: Vec<String>,
         /// File names inside --input to sanitise.
         files: Vec<String>,
+    },
+    /// Rehearse against a LOCAL controller: replay the informs in a capture as the
+    /// APs (re-encrypted with their keys), adopting pushed configs like an AP.
+    Simulate {
+        pcap: String,
+        #[arg(long)]
+        keys: String,
+        /// Inform URL of a local controller, e.g. http://127.0.0.1:18180/inform.
+        #[arg(long)]
+        url: String,
+        /// Maximum number of informs to send.
+        #[arg(long, default_value = "40")]
+        limit: usize,
     },
     /// Follow a live capture on stdin and print config pushes and new devices as they happen.
     Watch {
@@ -145,6 +159,7 @@ fn main() -> Result<()> {
         }
         Cmd::Pcap { file, common, all } => run_capture(&file, common, all),
         Cmd::Watch { common, all } => run_capture("-", common, all),
+        Cmd::Simulate { pcap, keys, url, limit } => simulate::run(&pcap, &load_keys(Some(&keys))?, &url, limit),
         Cmd::Sanitize { input, output, domains, devices, files } => {
             sanitize::run(&input, &output, &files, domains, &devices)
         }
