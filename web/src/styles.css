@@ -181,7 +181,8 @@ main {
 
 .cards {
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(340px, 1fr));
+  /* min() keeps a single column usable on narrow phones */
+  grid-template-columns: repeat(auto-fill, minmax(min(390px, 100%), 1fr));
   gap: 12px;
 }
 .card {
@@ -204,16 +205,33 @@ main {
 .card-title {
   font-weight: 600;
   flex: 1;
+  min-width: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.card-head > .muted {
+  white-space: nowrap;
 }
 .card-foot {
   margin-top: 10px;
   font-size: 12px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 .kv {
   display: grid;
   grid-template-columns: 90px 1fr;
   gap: 4px 12px;
   font-size: 13px;
+}
+.kv > span {
+  /* card rows stay on one line; long values end in an ellipsis (full text in the tooltip) */
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  min-width: 0;
 }
 .kv > span:nth-child(odd) {
   color: var(--text-muted);
@@ -288,6 +306,14 @@ main {
   display: flex;
   align-items: center;
   gap: 8px;
+  white-space: nowrap;
+}
+.meter-row > .meter {
+  flex: none;
+}
+.meter-row > .meter-text {
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .signal-good {
@@ -479,8 +505,17 @@ input.search {
 
 @media (max-width: 700px) {
   .top {
-    padding: 0 16px;
-    gap: 12px;
+    padding: 8px 16px;
+    gap: 6px 12px;
+    height: auto;
+    flex-wrap: wrap;
+  }
+  .top .spacer {
+    display: none;
+  }
+  .segmented {
+    flex-wrap: wrap;
+    max-width: 100%;
   }
   main {
     padding: 16px;

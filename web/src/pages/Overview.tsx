@@ -42,7 +42,9 @@ export function Overview() {
           <Link key={d.mac} to={`/devices/${d.mac}`} className="card card-link">
             <div className="card-head">
               <Dot ok={d.online} warn={d.reconfiguring} />
-              <span className="card-title">{d.name ?? d.mac}</span>
+              <span className="card-title" title={d.name ?? d.mac}>
+                {d.name ?? d.mac}
+              </span>
               <span className="muted">{d.model_display ?? d.model}</span>
             </div>
             <div className="kv">
@@ -66,7 +68,7 @@ export function Overview() {
               <span>Uptime</span>
               <span>{duration(d.uptime)}</span>
             </div>
-            <div className="card-foot muted">
+            <div className="card-foot muted" title={`${d.version} · ${d.ip}`}>
               {d.version} · {d.ip} · {d.online ? `seen ${ago(d.last_seen)}` : `offline since ${ago(d.last_seen)}`}
             </div>
           </Link>
@@ -83,8 +85,11 @@ function RadioRow(p: { band: string; channel: number | null; bw: number | null; 
   return (
     <>
       <span>{p.band}</span>
-      <span className="meter-row" title="Channel utilisation">
-        <Meter value={p.util} /> ch {p.channel} · {p.bw} MHz · {p.clients} clients
+      <span className="meter-row" title={`Channel utilisation ${p.util ?? "?"}% · channel ${p.channel}, ${p.bw} MHz · ${p.clients} clients`}>
+        <Meter value={p.util} />
+        <span className="meter-text">
+          ch {p.channel} · {p.bw} MHz · {p.clients} {p.clients === 1 ? "client" : "clients"}
+        </span>
       </span>
     </>
   );

@@ -33,7 +33,7 @@ export function Device() {
         <span className="spacer" />
         <RangePicker value={range} onChange={setRange} />
       </div>
-      {d.reconfiguring && <div className="banner">Radios are restarting after a configuration change. Client data resumes shortly.</div>}
+      {d.reconfiguring && <div className="banner">Applying a configuration change. Client data resumes in a moment.</div>}
 
       <div className="stats">
         <Stat label="Status" value={d.online ? "Online" : "Offline"} sub={`seen ${ago(d.last_seen)}, every ~${d.interval}s`} />

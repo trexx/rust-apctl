@@ -62,7 +62,9 @@ const EVENT_LABELS: Record<string, string> = {
   ap_offline: "AP offline",
   ap_restarted: "AP restarted",
   ap_firmware_changed: "Firmware changed",
-  ap_radios_restarting: "Radios restarting",
+  // Older events (before 0.3.2) guessed a restart; it was a config being applied.
+  ap_radios_restarting: "Applying configuration",
+  ap_config_applied: "Configuration applied",
   radio_changed: "Radio settings changed",
   config_pushed: "Config pushed",
   client_connected: "Client connected",
@@ -73,7 +75,7 @@ const EVENT_LABELS: Record<string, string> = {
 
 function eventTone(kind: string): string {
   if (kind === "ap_offline" || kind === "ap_restarted") return "bad";
-  if (kind === "client_disconnected" || kind === "ap_radios_restarting") return "warn";
+  if (kind === "client_disconnected") return "warn";
   if (kind.startsWith("client")) return "info";
   return "neutral";
 }
@@ -93,6 +95,11 @@ function describe(e: AppEvent, names: DeviceNames): React.ReactNode {
       const s = d.system_cfg;
       if (!s) return "";
       return s.baseline ? `baseline captured (${s.lines} lines)` : `${s.added} added, ${s.removed} removed, ${s.changed} changed`;
+    }
+    case "ap_config_applied": {
+      const secs = `in ${d.seconds}s`;
+      if (d.reconnected > 0) return `${secs}, ${d.reconnected} of ${d.clients_before} clients had to reconnect`;
+      return d.clients_before > 0 ? `${secs}, no clients dropped` : secs;
     }
     case "ap_offline":
       return `last seen ${clock(d.last_seen)}`;

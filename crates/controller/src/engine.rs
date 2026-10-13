@@ -76,10 +76,30 @@ pub struct DeviceView {
     pub peer: String,
     /// Inform interval most recently requested by the controller.
     pub interval: Ts,
-    /// True while the AP sends short informs after a radio restart.
+    /// True while the AP sends short informs (no client data) after a config
+    /// push, i.e. while it applies the new configuration.
     pub reconfiguring: bool,
+    /// When the current reconfiguration began.
+    pub reconfiguring_since: Option<Ts>,
+    /// A config application being tracked until the AP has been stable for a while.
+    #[serde(skip)]
+    pub applying: Option<Applying>,
     pub last_config_push: Option<Ts>,
 }
+
+/// One config application: an AP may alternate short and full informs for a
+/// while (e.g. several bursts during a channel change), so it is reported once,
+/// after the AP has been stable for `APPLY_SETTLE_SECS`.
+#[derive(Debug, Clone)]
+pub struct Applying {
+    since: Ts,
+    /// First full inform after the last short one.
+    returned: Option<Ts>,
+    /// Clients connected to the AP when the application began.
+    before: Vec<Mac>,
+}
+
+pub const APPLY_SETTLE_SECS: Ts = 30;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct ClientView {
@@ -300,10 +320,32 @@ impl Engine {
                 events.push(ev(ts, "ap_firmware_changed", Some(mac), None, json!({ "from": p.snapshot.ap.version, "to": snap.ap.version })));
             }
         }
-        // Only the first short inform of a restart is an event.
-        let restart_began = !snap.has_vap_table && prev.as_ref().is_some_and(|p| !p.reconfiguring);
-        if restart_began {
-            events.push(ev(ts, "ap_radios_restarting", Some(mac), None, json!({})));
+        // While an AP applies a config push it sends short informs without client
+        // data. Whether clients were affected is only known once it is back:
+        // clients that had to reconnect show a session shorter than the gap.
+        let reconfiguring_since = match (&prev, snap.has_vap_table) {
+            (_, true) => None,
+            (Some(p), false) if p.reconfiguring => p.reconfiguring_since,
+            _ => Some(ts),
+        };
+        let mut applying = prev.as_ref().and_then(|p| p.applying.clone());
+        if !snap.has_vap_table {
+            match &mut applying {
+                Some(a) => a.returned = None, // another burst of the same application
+                None => {
+                    let before = live.clients.values().filter(|c| c.connected && c.sample.ap_mac == mac).map(|c| c.sample.mac).collect();
+                    applying = Some(Applying { since: ts, returned: None, before });
+                }
+            }
+        } else if let Some(a) = &mut applying {
+            match a.returned {
+                None => a.returned = Some(ts),
+                Some(r) if ts - r >= APPLY_SETTLE_SECS => {
+                    events.push(config_applied(mac, a, ts, Some(&snap.clients)));
+                    applying = None;
+                }
+                Some(_) => {}
+            }
         }
         if snap.has_vap_table {
             for r in &snap.radios {
@@ -341,6 +383,8 @@ impl Engine {
             peer,
             interval: prev.as_ref().map_or(DEFAULT_INTERVAL, |p| p.interval),
             reconfiguring: !snap.has_vap_table,
+            reconfiguring_since,
+            applying,
             last_config_push: prev.as_ref().and_then(|p| p.last_config_push),
         };
         self.writer.exec(
@@ -563,6 +607,14 @@ impl Engine {
                 self.writer.exec(Db::Config, "UPDATE devices SET online = 0 WHERE mac = ?1", vec![Sql::Text(mac.to_string())]);
             }
         }
+        // Report config applications whose AP has been stable long enough.
+        for (mac, d) in live.devices.iter_mut() {
+            if let Some(a) = &d.applying
+                && a.returned.is_some_and(|r| now - r >= APPLY_SETTLE_SECS) {
+                    events.push(config_applied(*mac, a, now, None));
+                    d.applying = None;
+                }
+        }
         // A client is gone when its AP has reported a full client list since it was
         // last seen and the grace period has passed, or when its AP went offline.
         let ap_last_full: HashMap<Mac, (Ts, bool)> = live
@@ -665,6 +717,26 @@ impl Engine {
             });
         }
     }
+}
+
+/// The single event for a finished config application. `clients` is the AP's
+/// current client list when known (from an inform), for spotting reconnects.
+fn config_applied(mac: Mac, a: &Applying, ts: Ts, clients: Option<&[ClientSample]>) -> Event {
+    let took = a.returned.unwrap_or(ts) - a.since;
+    let window = ts - a.since + 5;
+    let (after, reconnected) = match clients {
+        Some(list) => (
+            Some(list.len()),
+            list.iter().filter(|c| a.before.contains(&c.mac) && c.uptime.is_some_and(|u| u <= window)).count(),
+        ),
+        None => (None, 0),
+    };
+    ev(a.returned.unwrap_or(ts), "ap_config_applied", Some(mac), None, json!({
+        "seconds": took.max(1),
+        "clients_before": a.before.len(),
+        "clients_after": after,
+        "reconnected": reconnected,
+    }))
 }
 
 fn ev(ts: Ts, kind: &'static str, device_mac: Option<Mac>, client_mac: Option<Mac>, data: Value) -> Event {
@@ -792,8 +864,22 @@ mod tests {
             h.engine.handle(Input::Tick(ts));
         }
         let evs = events(&mut h);
-        assert_eq!(evs, vec![("ap_radios_restarting", None)], "{evs:?}");
+        assert!(evs.is_empty(), "nothing is known until the AP is back: {evs:?}");
         assert!(h.live.read().unwrap().clients[&C1.parse().unwrap()].connected);
+
+        // Back with full informs: the client kept its session (uptime 1120 s),
+        // so this was a config change without a radio restart.
+        for ts in [120, 125, 160] {
+            let mut full = inform(AP1, 1000 + ts, &[(C1, "b1")]);
+            full["vap_table"][0]["sta_table"][0]["uptime"] = json!(1000 + ts);
+            h.engine.handle(Input::Inform { ts, peer: "x".into(), decoded: decoded(full) });
+        }
+        let applied: Vec<_> = std::iter::from_fn(|| h.rx.try_recv().ok())
+            .filter_map(|m| match m { LiveMsg::Event(e) if e.kind == "ap_config_applied" => Some(e.data), _ => None })
+            .collect();
+        assert_eq!(applied.len(), 1);
+        assert_eq!(applied[0]["seconds"], 115, "from the first short inform to the AP's return");
+        assert_eq!(applied[0]["reconnected"], 0);
     }
 
     #[test]
@@ -838,6 +924,23 @@ mod tests {
             .collect();
         assert_eq!(renames.len(), 2, "{renames:?}");
         assert_eq!(renames[1]["from"], "Kitchen speaker");
+    }
+
+    #[test]
+    fn bursts_of_short_informs_are_one_config_application() {
+        let mut h = harness();
+        let full = |ts: i64| decoded(inform(AP1, 1000 + ts, &[(C1, "b1")]));
+        let short = |ts: i64| decoded(json!({ "mac": AP1, "uptime": 1000 + ts }));
+        // Pattern seen during a channel change: short, full, short, full, ...
+        for (ts, is_full) in [(0, true), (10, false), (12, true), (20, false), (25, true), (40, false), (44, true), (60, true), (80, true)] {
+            let d = if is_full { full(ts) } else { short(ts) };
+            h.engine.handle(Input::Inform { ts, peer: "x".into(), decoded: d });
+        }
+        let applied: Vec<_> = std::iter::from_fn(|| h.rx.try_recv().ok())
+            .filter_map(|m| match m { LiveMsg::Event(e) if e.kind == "ap_config_applied" => Some(e), _ => None })
+            .collect();
+        assert_eq!(applied.len(), 1, "{applied:?}");
+        assert_eq!(applied[0].data["seconds"], 34, "from the first burst (10) to the final return (44)");
     }
 
     #[test]
