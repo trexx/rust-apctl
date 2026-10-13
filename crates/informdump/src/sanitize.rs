@@ -202,7 +202,8 @@ impl Sanitizer {
 /// Whole-word match: names inside longer identifiers (a hostname inside an
 /// mDNS service code) are not leaks.
 fn contains_word(text: &str, value: &str) -> bool {
-    let is_word = |c: Option<char>| c.is_some_and(|c| c.is_ascii_alphanumeric());
+    // `_` joins identifier parts (`google_chromecast` is one word).
+    let is_word = |c: Option<char>| c.is_some_and(|c| c.is_ascii_alphanumeric() || c == '_');
     text.match_indices(value).any(|(i, _)| !is_word(text[..i].chars().next_back()) && !is_word(text[i + value.len()..].chars().next()))
 }
 
@@ -314,6 +315,7 @@ mod tests {
         let v = s.json(&json!({ "clients": [{ "name": "Dad's phone" }], "wlanconf": [{ "name": "x" }] }));
         assert_eq!(v["clients"][0]["name"], "alias-1");
         assert!(contains_word("ssid=chromecast", "chromecast") && !contains_word("_googlecast._tcp", "googlecas"));
+        assert!(!contains_word("code: google_chromecast", "chromecast"));
         assert_eq!(s.scrub("host kitchen-tv.lan"), "host name-1.lan");
         assert!(contains_value("ssid=test\n", "test") && !contains_value("testdata/x", "test"));
     }
