@@ -19,17 +19,27 @@ use crate::store::{self, Db, TIERS};
 pub struct RangeQuery {
     /// Seconds back from now (default one day).
     range: Option<Ts>,
+    /// An explicit window instead of `range` (Unix seconds).
+    from: Option<Ts>,
+    to: Option<Ts>,
     /// `ng`, `na` or `6e`; all bands when absent.
     band: Option<String>,
     /// One AP only (activity).
     mac: Option<String>,
 }
 
+/// The requested window, at least ten minutes and at most 400 days long,
+/// ending no later than now; and the storage tier to read it from.
 fn window(q: &RangeQuery) -> (Ts, Ts, usize) {
     let now = store::now_ts();
-    let range = q.range.unwrap_or(86400).clamp(600, 400 * 86400);
-    let from = now - range;
-    (from, now, store::tier_for(from, now, now))
+    let (from, to) = match (q.from, q.to) {
+        (Some(from), to) => {
+            let to = to.unwrap_or(now).min(now);
+            (from.clamp(to - 400 * 86400, to - 600), to)
+        }
+        _ => (now - q.range.unwrap_or(86400).clamp(600, 400 * 86400), now),
+    };
+    (from, to, store::tier_for(from, to, now))
 }
 
 /// Bucket width for charts: a few hundred points whatever the range.
@@ -284,14 +294,14 @@ pub async fn top(State(s): State<AppState>, Query(q): Query<RangeQuery>) -> Resu
 
 /// GET /api/site/connectivity: share of connection attempts that passed each stage.
 pub async fn connectivity(State(s): State<AppState>, Query(q): Query<RangeQuery>) -> Result<Json<Value>, ApiError> {
-    let (from, _, _) = window(&q);
+    let (from, to, _) = window(&q);
     let band = q.band.clone();
     let rows = read(&s, Db::Config, move |c| {
         let mut stmt = c.prepare(
-            "SELECT event_type, radio, ip_assign_type, ip_ms, dns_responses, dns_timeouts, reason, auth_ms, assoc_ms FROM connections WHERE ts >= ?1",
+            "SELECT event_type, radio, ip_assign_type, ip_ms, dns_responses, dns_timeouts, reason, auth_ms, assoc_ms FROM connections WHERE ts >= ?1 AND ts <= ?2",
         )?;
         let rows = stmt
-            .query_map([from], |r| {
+            .query_map([from, to], |r| {
                 Ok((
                     r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?, r.get::<_, Option<String>>(2)?, r.get::<_, Option<i64>>(3)?,
                     r.get::<_, Option<i64>>(4)?, r.get::<_, Option<i64>>(5)?, r.get::<_, Option<String>>(6)?, r.get::<_, Option<i64>>(7)?,
@@ -754,5 +764,23 @@ mod tests {
         let eu = [36, 52, 100, 116];
         assert_eq!(candidates("na", 80, false, Some(&eu)).iter().map(|b| b.primary).collect::<Vec<_>>(), vec![36]);
         assert_eq!(candidates("na", 80, true, Some(&eu)).len(), 4);
+    }
+
+    #[test]
+    fn windows_are_clamped() {
+        let q = |range, from, to| RangeQuery { range, from, to, band: None, mac: None };
+        let now = store::now_ts();
+        let (f, t, _) = window(&q(Some(3600), None, None));
+        assert!(t - f == 3600 && t >= now);
+        // An explicit window wins over `range`, and cannot end in the future.
+        let (f, t, _) = window(&q(Some(3600), Some(now - 7200), Some(now + 999)));
+        assert_eq!(t - f, 7200);
+        assert!(t <= store::now_ts());
+        // Too short a window is widened backwards to ten minutes.
+        let (f, t, _) = window(&q(None, Some(now - 100), Some(now - 60)));
+        assert_eq!((t, t - f), (now - 60, 600));
+        // A week ago reads the five-minute tier; a day 60 days back reads hourly.
+        assert_eq!(window(&q(None, Some(now - 7 * 86400), Some(now - 6 * 86400))).2, 1);
+        assert_eq!(window(&q(None, Some(now - 60 * 86400), Some(now - 59 * 86400))).2, 2);
     }
 }

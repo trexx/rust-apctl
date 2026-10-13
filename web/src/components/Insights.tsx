@@ -1,16 +1,38 @@
 import { useState } from "react";
 import { Link } from "react-router-dom";
-import { useConnectivity, useNeighbors, useRadios, useSiteActivity, useSiteTop } from "../api";
+import {
+  useConnectivity,
+  useNeighbors,
+  useRadios,
+  useSiteActivity,
+  useSiteTop,
+} from "../api";
 import { bitrate, bytes } from "../format";
-import { COLORS, Chart, RangePicker } from "./Chart";
+import { COLORS, Chart, RangePicker, ZoomContext, useTimeSpan } from "./Chart";
 import { Loading } from "./common";
 
-export function BandPicker({ value, onChange, all = true }: { value: string; onChange: (b: string) => void; all?: boolean }) {
-  const bands = [...(all ? [["all", "All radios"]] : []), ["ng", "2.4 GHz"], ["na", "5 GHz"]];
+export function BandPicker({
+  value,
+  onChange,
+  all = true,
+}: {
+  value: string;
+  onChange: (b: string) => void;
+  all?: boolean;
+}) {
+  const bands = [
+    ...(all ? [["all", "All radios"]] : []),
+    ["ng", "2.4 GHz"],
+    ["na", "5 GHz"],
+  ];
   return (
     <div className="segmented" role="group" aria-label="Band">
       {bands.map(([v, l]) => (
-        <button key={v} className={value === v ? "active" : ""} onClick={() => onChange(v)}>
+        <button
+          key={v}
+          className={value === v ? "active" : ""}
+          onClick={() => onChange(v)}
+        >
           {l}
         </button>
       ))}
@@ -21,102 +43,183 @@ export function BandPicker({ value, onChange, all = true }: { value: string; onC
 /** Site-wide Wi-Fi activity and airtime, the first thing on the overview. */
 export function SiteActivity() {
   const [view, setView] = useState<"activity" | "airtime">("activity");
-  const [range, setRange] = useState(86400);
+  const [range, setRange] = useTimeSpan(86400);
   const [band, setBand] = useState("all");
   const a = useSiteActivity(range, band);
   return (
-    <div className="panel">
-      <div className="panel-head">
-        <div className="segmented" role="group" aria-label="View">
-          <button className={view === "activity" ? "active" : ""} onClick={() => setView("activity")}>
-            Activity
-          </button>
-          <button className={view === "airtime" ? "active" : ""} onClick={() => setView("airtime")}>
-            Airtime
-          </button>
+    <ZoomContext.Provider value={(from, to) => setRange({ from, to })}>
+      <div className="panel">
+        <div className="panel-head">
+          <div className="segmented" role="group" aria-label="View">
+            <button
+              className={view === "activity" ? "active" : ""}
+              onClick={() => setView("activity")}
+            >
+              Activity
+            </button>
+            <button
+              className={view === "airtime" ? "active" : ""}
+              onClick={() => setView("airtime")}
+            >
+              Airtime
+            </button>
+          </div>
+          <BandPicker value={band} onChange={setBand} />
+          <span className="spacer" />
+          <RangePicker value={range} onChange={setRange} />
         </div>
-        <BandPicker value={band} onChange={setBand} />
-        <span className="spacer" />
-        <RangePicker value={range} onChange={setRange} />
-      </div>
-      {!a.data ? (
-        <Loading />
-      ) : view === "activity" ? (
-        <>
+        {!a.data ? (
+          <Loading />
+        ) : view === "activity" ? (
+          <>
+            <Chart
+              title="Wi-Fi traffic"
+              ts={a.data.activity.ts}
+              height={200}
+              format={(v) => bitrate(v / 8)}
+              formatRight={(v) => `${Math.round(v)}`}
+              series={[
+                {
+                  label: "Download",
+                  values: a.data.activity.download_bps,
+                  color: COLORS.blue,
+                  fill: true,
+                },
+                {
+                  label: "Upload",
+                  values: a.data.activity.upload_bps,
+                  color: COLORS.purple,
+                },
+                {
+                  label: "Clients",
+                  values: a.data.activity.clients,
+                  color: COLORS.green,
+                  right: true,
+                  dashed: true,
+                },
+              ]}
+            />
+            <Chart
+              title="TX retries and multicast"
+              ts={a.data.activity.ts}
+              height={120}
+              min={0}
+              format={(v) => `${v.toFixed(0)}%`}
+              series={[
+                {
+                  label: "TX retries",
+                  values: a.data.activity.tx_retry_pct,
+                  color: COLORS.orange,
+                },
+                {
+                  label: "Multicast share",
+                  values: a.data.activity.multicast_pct,
+                  color: COLORS.teal,
+                  dashed: true,
+                },
+              ]}
+            />
+          </>
+        ) : (
           <Chart
-            title="Wi-Fi traffic"
-            ts={a.data.activity.ts}
-            height={200}
-            format={(v) => bitrate(v / 8)}
-            formatRight={(v) => `${Math.round(v)}`}
-            series={[
-              { label: "Download", values: a.data.activity.download_bps, color: COLORS.blue, fill: true },
-              { label: "Upload", values: a.data.activity.upload_bps, color: COLORS.purple },
-              { label: "Clients", values: a.data.activity.clients, color: COLORS.green, right: true, dashed: true },
-            ]}
-          />
-          <Chart
-            title="TX retries and multicast"
-            ts={a.data.activity.ts}
-            height={120}
+            title="Airtime (channel utilisation, average across radios)"
+            ts={a.data.airtime.ts}
+            height={240}
             min={0}
             format={(v) => `${v.toFixed(0)}%`}
             series={[
-              { label: "TX retries", values: a.data.activity.tx_retry_pct, color: COLORS.orange },
-              { label: "Multicast share", values: a.data.activity.multicast_pct, color: COLORS.teal, dashed: true },
+              {
+                label: "Total",
+                values: a.data.airtime.total,
+                color: COLORS.orange,
+                fill: true,
+              },
+              {
+                label: "Own traffic",
+                values: a.data.airtime.own_traffic,
+                color: COLORS.blue,
+              },
+              {
+                label: "External interference",
+                values: a.data.airtime.external_interference,
+                color: COLORS.red,
+              },
             ]}
           />
-        </>
-      ) : (
-        <Chart
-          title="Airtime (channel utilisation, average across radios)"
-          ts={a.data.airtime.ts}
-          height={240}
-          min={0}
-          format={(v) => `${v.toFixed(0)}%`}
-          series={[
-            { label: "Total", values: a.data.airtime.total, color: COLORS.orange, fill: true },
-            { label: "Own traffic", values: a.data.airtime.own_traffic, color: COLORS.blue },
-            { label: "External interference", values: a.data.airtime.external_interference, color: COLORS.red },
-          ]}
-        />
-      )}
-    </div>
+        )}
+      </div>
+    </ZoomContext.Provider>
   );
 }
 
-function TopList({ title, items, link }: { title: string; items: { mac: string; name: string | null; sub?: string | null; total: number }[]; link: string }) {
+function TopList({
+  title,
+  items,
+  link,
+}: {
+  title: string;
+  items: {
+    mac: string;
+    name: string | null;
+    sub?: string | null;
+    total: number;
+  }[];
+  link: string;
+}) {
   return (
     <div className="top-list">
       <div className="muted small">{title}</div>
       <div className="chips">
         {items.map((i) => (
-          <Link key={i.mac} to={`/${link}/${i.mac}`} className="chip" title={i.sub ?? undefined}>
+          <Link
+            key={i.mac}
+            to={`/${link}/${i.mac}`}
+            className="chip"
+            title={i.sub ?? undefined}
+          >
             <span className="chip-name">{i.name ?? i.mac}</span>
             <span className="muted small">{bytes(i.total)}</span>
           </Link>
         ))}
-        {items.length === 0 && <span className="muted small">No traffic in this range</span>}
+        {items.length === 0 && (
+          <span className="muted small">No traffic in this range</span>
+        )}
       </div>
     </div>
   );
 }
 
-export function TopTalkers({ range = 86400 }: { range?: number }) {
-  const t = useSiteTop(range);
+export function TopTalkers() {
+  const t = useSiteTop({ last: 86400 });
   if (!t.data) return <Loading />;
-  const total = (x: { download_bytes: number; upload_bytes: number }) => x.download_bytes + x.upload_bytes;
+  const total = (x: { download_bytes: number; upload_bytes: number }) =>
+    x.download_bytes + x.upload_bytes;
   return (
     <div className="panel">
       <div className="panel-head">
         <b>Top traffic</b>
         <span className="muted small">last 24 hours</span>
       </div>
-      <TopList title="Access points" link="devices" items={t.data.aps.map((a) => ({ mac: a.mac, name: a.name, total: total(a) }))} />
+      <TopList
+        title="Access points"
+        link="devices"
+        items={t.data.aps.map((a) => ({
+          mac: a.mac,
+          name: a.name,
+          total: total(a),
+        }))}
+      />
       <TopList
         title="Clients"
         link="clients"
-        items={t.data.clients.slice(0, 15).map((c) => ({ mac: c.mac, name: c.name, sub: c.vendor, total: total(c) }))}
+        items={t.data.clients
+          .slice(0, 15)
+          .map((c) => ({
+            mac: c.mac,
+            name: c.name,
+            sub: c.vendor,
+            total: total(c),
+          }))}
       />
     </div>
   );
@@ -136,7 +239,9 @@ export function RetryBuckets() {
   const [band, setBand] = useState("na");
   const r = useRadios(86400);
   if (!r.data) return <Loading />;
-  const radios = r.data.filter((x) => x.radio === band && x.tx_retry_pct !== null);
+  const radios = r.data.filter(
+    (x) => x.radio === band && x.tx_retry_pct !== null,
+  );
   return (
     <div className="panel">
       <div className="panel-head">
@@ -148,11 +253,19 @@ export function RetryBuckets() {
       <div className="buckets">
         {RETRY_BUCKETS.map(([min, label], i) => {
           const upper = i === 0 ? Infinity : RETRY_BUCKETS[i - 1][0];
-          const inBucket = radios.filter((x) => (x.tx_retry_pct ?? 0) >= min && (x.tx_retry_pct ?? 0) < upper);
+          const inBucket = radios.filter(
+            (x) =>
+              (x.tx_retry_pct ?? 0) >= min && (x.tx_retry_pct ?? 0) < upper,
+          );
           const tone = min >= 25 ? "bad" : min >= 15 ? "warn" : "good";
           return (
             <div key={label} className="bucket">
-              <div className={`bucket-bar ${inBucket.length ? `bucket-${tone}` : ""}`} title={inBucket.map((x) => `${x.name}: ${x.tx_retry_pct?.toFixed(1)}%`).join("\n")}>
+              <div
+                className={`bucket-bar ${inBucket.length ? `bucket-${tone}` : ""}`}
+                title={inBucket
+                  .map((x) => `${x.name}: ${x.tx_retry_pct?.toFixed(1)}%`)
+                  .join("\n")}
+              >
                 {inBucket.length || ""}
               </div>
               <div className="muted small">{label}</div>
@@ -164,7 +277,12 @@ export function RetryBuckets() {
   );
 }
 
-const STAGE_LABELS: Record<string, string> = { association: "Association", authentication: "Authentication", dhcp: "DHCP", dns: "DNS" };
+const STAGE_LABELS: Record<string, string> = {
+  association: "Association",
+  authentication: "Authentication",
+  dhcp: "DHCP",
+  dns: "DNS",
+};
 
 export function Connectivity() {
   const c = useConnectivity(86400, "all");
@@ -178,20 +296,33 @@ export function Connectivity() {
         <span className="muted small">last 24 hours</span>
       </div>
       {!any ? (
-        <div className="muted small">No connection attempts recorded yet. They come from the APs' connection-tracking notifications.</div>
+        <div className="muted small">
+          No connection attempts recorded yet. They come from the APs'
+          connection-tracking notifications.
+        </div>
       ) : (
         <div className="stages">
           {stages.map((s) => {
             const pct = s.success_pct;
-            const tone = pct === null ? "" : pct >= 98 ? "good" : pct >= 90 ? "warn" : "bad";
+            const tone =
+              pct === null
+                ? ""
+                : pct >= 98
+                  ? "good"
+                  : pct >= 90
+                    ? "warn"
+                    : "bad";
             return (
               <div key={s.stage} className="stage">
-                <div className={`stage-bar stage-${tone}`}>{STAGE_LABELS[s.stage] ?? s.stage}</div>
+                <div className={`stage-bar stage-${tone}`}>
+                  {STAGE_LABELS[s.stage] ?? s.stage}
+                </div>
                 <div className="small">
                   {pct === null ? "—" : `${pct.toFixed(pct >= 99.95 ? 0 : 1)}%`}
                   <span className="muted">
                     {" "}
-                    · {s.ok + s.failed} attempts{s.median_ms !== null ? ` · median ${s.median_ms} ms` : ""}
+                    · {s.ok + s.failed} attempts
+                    {s.median_ms !== null ? ` · median ${s.median_ms} ms` : ""}
                   </span>
                 </div>
               </div>
@@ -208,14 +339,24 @@ export function ApDensity() {
   const n = useNeighbors(7 * 86400, "all");
   if (!n.data) return <Loading />;
   const links = n.data.own_links.filter((l) => l.signal !== null);
-  const pos = (s: number) => `${Math.min(100, Math.max(0, ((s + 90) / 60) * 100))}%`;
+  const pos = (s: number) =>
+    `${Math.min(100, Math.max(0, ((s + 90) / 60) * 100))}%`;
   const worst = links.reduce((m, l) => Math.max(m, l.signal ?? -100), -100);
-  const verdict = links.length === 0 ? "No AP-to-AP measurements yet" : worst > -55 ? "APs may be too close" : worst > -65 ? "AP density is fine" : "AP density is good";
+  const verdict =
+    links.length === 0
+      ? "No AP-to-AP measurements yet"
+      : worst > -55
+        ? "APs may be too close"
+        : worst > -65
+          ? "AP density is fine"
+          : "AP density is good";
   return (
     <div className="panel">
       <div className="panel-head">
         <b>{verdict}</b>
-        <span className="muted small">how loudly your APs hear each other (from background scans)</span>
+        <span className="muted small">
+          how loudly your APs hear each other (from background scans)
+        </span>
       </div>
       <div className="density">
         <div className="density-scale" />

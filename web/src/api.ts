@@ -418,19 +418,39 @@ export interface PlanEntry {
 
 const bandParam = (band: string) => (band === "all" ? undefined : band);
 
-export const useSiteActivity = (range: number, band: string, mac?: Mac) =>
+/** A chart time range: the last N seconds (follows the clock), or a fixed window. */
+export type TimeSpan = { last: number } | { from: number; to: number };
+
+export const isFixed = (s: TimeSpan): s is { from: number; to: number } => "from" in s;
+
+/** [from, to] in Unix seconds, as of now. */
+export function spanBounds(s: TimeSpan): [number, number] {
+  if (isFixed(s)) return [s.from, s.to];
+  const now = Math.floor(Date.now() / 1000);
+  return [now - s.last, now];
+}
+
+const spanParams = (s: TimeSpan) => (isFixed(s) ? { from: s.from, to: s.to } : { range: s.last });
+
+const spanLength = (s: TimeSpan) => (isFixed(s) ? s.to - s.from : s.last);
+
+/** Live ranges refresh; fixed windows in the past don't change. */
+const refreshFor = (s: TimeSpan, live: number) => (isFixed(s) && s.to < Date.now() / 1000 - 600 ? false : live);
+
+export const useSiteActivity = (span: TimeSpan, band: string, mac?: Mac) =>
   useQuery({
-    queryKey: ["site-activity", range, band, mac],
-    queryFn: () => get<SiteActivity>(`/api/site/activity${qs({ range, band: bandParam(band), mac })}`),
-    refetchInterval: 60_000,
+    queryKey: ["site-activity", span, band, mac],
+    queryFn: () => get<SiteActivity>(`/api/site/activity${qs({ ...spanParams(span), band: bandParam(band), mac })}`),
+    refetchInterval: refreshFor(span, 60_000),
     placeholderData: (p) => p,
   });
 
-export const useSiteTop = (range: number, mac?: Mac) =>
+export const useSiteTop = (span: TimeSpan, mac?: Mac) =>
   useQuery({
-    queryKey: ["site-top", range, mac],
-    queryFn: () => get<{ aps: TopEntry[]; clients: TopEntry[] }>(`/api/site/top${qs({ range, mac })}`),
-    refetchInterval: 60_000,
+    queryKey: ["site-top", span, mac],
+    queryFn: () => get<{ aps: TopEntry[]; clients: TopEntry[] }>(`/api/site/top${qs({ ...spanParams(span), mac })}`),
+    refetchInterval: refreshFor(span, 60_000),
+    placeholderData: (p) => p,
   });
 
 export const useConnectivity = (range: number, band: string) =>
@@ -468,15 +488,15 @@ export const useClients = () => useQuery({ queryKey: ["clients"], queryFn: () =>
 export const useClient = (mac: Mac) =>
   useQuery({ queryKey: ["client", mac], queryFn: () => get<ClientView>(`/api/clients/${mac}`), retry: false });
 
-/** Time-series for one entity. `range` is in seconds back from now. */
-export const useSeries = (table: string, key: string, range: number) =>
+/** Time-series for one entity over a time span. */
+export const useSeries = (table: string, key: string, span: TimeSpan) =>
   useQuery({
-    queryKey: ["series", table, key, range],
+    queryKey: ["series", table, key, span],
     queryFn: () => {
-      const to = Math.floor(Date.now() / 1000);
-      return get<Series>(`/api/series/${table}${qs({ key, from: to - range, to })}`);
+      const [from, to] = spanBounds(span);
+      return get<Series>(`/api/series/${table}${qs({ key, from, to })}`);
     },
-    refetchInterval: range <= 6 * 3600 ? 15_000 : 300_000,
+    refetchInterval: refreshFor(span, spanLength(span) <= 6 * 3600 ? 15_000 : 300_000),
     placeholderData: (prev) => prev,
   });
 

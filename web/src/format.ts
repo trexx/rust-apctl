@@ -86,3 +86,26 @@ export function signalClass(dbm: number | null | undefined): "good" | "fair" | "
 }
 
 export const shortMac = (mac: string) => mac.slice(-8);
+
+const spanDayFmt = formatter({ day: "numeric", month: "short" });
+const spanTimeFmt = formatter({ hour: "2-digit", minute: "2-digit" });
+
+/** "13 Oct 06:00 – 09:00", or with both dates when the window spans days. */
+export function spanLabel(from: number, to: number): string {
+  const f = new Date(from * 1000);
+  const t = new Date(to * 1000);
+  const start = `${spanDayFmt.format(f)} ${spanTimeFmt.format(f)}`;
+  return f.toDateString() === t.toDateString() ? `${start} – ${spanTimeFmt.format(t)}` : `${start} – ${spanDayFmt.format(t)} ${spanTimeFmt.format(t)}`;
+}
+
+/** Value for an <input type="datetime-local"> in the browser's time zone. */
+export function toLocalInput(ts: number): string {
+  const d = new Date(ts * 1000);
+  const p = (n: number) => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}T${p(d.getHours())}:${p(d.getMinutes())}`;
+}
+
+export function fromLocalInput(v: string): number | null {
+  const t = new Date(v).getTime();
+  return Number.isFinite(t) ? Math.floor(t / 1000) : null;
+}
