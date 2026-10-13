@@ -283,7 +283,8 @@ async fn dryrun(State(s): State<AppState>) -> ApiResult {
             continue;
         };
         // Prefer the unredacted config seen in this run; fall back to the stored redacted copy.
-        let (actual, redacted) = match (live.last_config.get(mac), stored.get(&mac.to_string())) {
+        // Only full configs count: a management-only push says nothing about system_cfg.
+        let (actual, redacted) = match (live.last_config.get(mac).filter(|c| !c.1.is_empty()), stored.get(&mac.to_string()).filter(|c| !c.1.is_empty())) {
             (Some(c), _) => (c.clone(), false),
             (None, Some(c)) => (c.clone(), true),
             (None, None) => {

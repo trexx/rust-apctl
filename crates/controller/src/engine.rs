@@ -537,13 +537,20 @@ impl Engine {
             data.insert(field.into(), summary);
             known.insert(field, new.to_string());
         }
+        // A push can be management-only (e.g. after an LED change): it carries
+        // mgmt_cfg alone, and the AP keeps its last full system_cfg.
+        let cfgversion = p["cfgversion"].as_str().map(str::to_string).or_else(|| {
+            p["mgmt_cfg"].as_str().and_then(|m| m.lines().find_map(|l| l.strip_prefix("cfgversion=")).map(str::to_string))
+        });
         self.writer.exec(
             Db::Config,
-            "INSERT OR REPLACE INTO device_config (mac, ts, cfgversion, mgmt_cfg, system_cfg) VALUES (?1, ?2, ?3, ?4, ?5)",
+            "INSERT INTO device_config (mac, ts, cfgversion, mgmt_cfg, system_cfg) VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT (mac) DO UPDATE SET ts = excluded.ts, cfgversion = COALESCE(excluded.cfgversion, cfgversion),
+               mgmt_cfg = COALESCE(excluded.mgmt_cfg, mgmt_cfg), system_cfg = COALESCE(excluded.system_cfg, system_cfg)",
             vec![
                 Sql::Text(mac.to_string()),
                 Sql::Integer(ts),
-                opt_text(p["cfgversion"].as_str().map(str::to_string)),
+                opt_text(cfgversion.clone()),
                 opt_text(p["mgmt_cfg"].as_str().map(cfgdiff::redact)),
                 opt_text(p["system_cfg"].as_str().map(cfgdiff::redact)),
             ],
@@ -551,13 +558,14 @@ impl Engine {
         if let Some(d) = live.devices.get_mut(&mac) {
             d.last_config_push = Some(ts);
         }
-        let cfgversion = p["cfgversion"].as_str().map(str::to_string);
-        let (mgmt, system) = (p["mgmt_cfg"].as_str().unwrap_or("").to_string(), p["system_cfg"].as_str().unwrap_or("").to_string());
+        let previous = live.last_config.get(&mac).cloned();
+        let mgmt = p["mgmt_cfg"].as_str().map(str::to_string).or_else(|| previous.as_ref().map(|x| x.0.clone())).unwrap_or_default();
+        let system = p["system_cfg"].as_str().map(str::to_string).or_else(|| previous.as_ref().map(|x| x.1.clone())).unwrap_or_default();
         live.last_config.insert(mac, (mgmt.clone(), system.clone(), cfgversion.clone()));
         self.emit(&mut live, ev(ts, "config_pushed", Some(mac), None, Value::Object(data)));
 
         // Dry run: what would apctl have pushed for the same AP at this moment?
-        if let (true, Some(render), Some(state)) = (dry_run, &self.renderer, live.state.clone()) {
+        if let (true, false, Some(render), Some(state)) = (dry_run, system.is_empty(), &self.renderer, live.state.clone()) {
             let inform = live.raw_informs.get(&mac).cloned();
             let req = crate::dryrun::RenderRequest {
                 state: &state,
@@ -1073,6 +1081,36 @@ mod tests {
         assert_eq!(results[0]["matches"], true);
         assert_eq!(results[1]["matches"], false);
         assert_eq!(results[1]["system_cfg"]["changed"], 1);
+    }
+
+    #[test]
+    fn management_only_pushes_keep_the_last_full_config() {
+        let mut h = harness();
+        let mac: Mac = AP1.parse().unwrap();
+        let render: crate::dryrun::RenderFn = Arc::new(|req: &crate::dryrun::RenderRequest| {
+            Ok((format!("cfgversion={}\nled_enabled=false", req.cfgversion), "a=1".to_string()))
+        });
+        h.engine.set_renderer(render);
+        h.engine.handle(Input::SetState { ts: 1, state: json!({ "sites": [], "wlanconf": [], "networkconf": [], "setting": [], "devices": [] }) });
+        // An LED change: mgmt_cfg only, no system_cfg and no top-level cfgversion.
+        let mgmt_only = decoded(json!({ "_type": "setparam", "mgmt_cfg": "cfgversion=abc\nled_enabled=true" }));
+        h.engine.handle(Input::Reply { ts: 2, mac, decoded: mgmt_only });
+        assert!(
+            std::iter::from_fn(|| h.rx.try_recv().ok()).all(|m| !matches!(m, LiveMsg::Event(e) if e.kind == "dryrun_compared")),
+            "no comparison without a known system_cfg"
+        );
+        let full = decoded(json!({ "_type": "setparam", "cfgversion": "abc", "mgmt_cfg": "cfgversion=abc\nled_enabled=false", "system_cfg": "a=1" }));
+        h.engine.handle(Input::Reply { ts: 3, mac, decoded: full });
+        let mgmt_only = decoded(json!({ "_type": "setparam", "mgmt_cfg": "cfgversion=abc\nled_enabled=false" }));
+        h.engine.handle(Input::Reply { ts: 4, mac, decoded: mgmt_only });
+        let last = h.live.read().unwrap().last_config[&mac].clone();
+        assert_eq!(last.1, "a=1", "system_cfg survives a management-only push");
+        assert_eq!(last.2.as_deref(), Some("abc"), "cfgversion read from mgmt_cfg");
+        let results: Vec<_> = std::iter::from_fn(|| h.rx.try_recv().ok())
+            .filter_map(|m| match m { LiveMsg::Event(e) if e.kind == "dryrun_compared" => Some(e.data), _ => None })
+            .collect();
+        assert_eq!(results.len(), 2);
+        assert!(results.iter().all(|r| r["matches"] == true), "{results:?}");
     }
 
     #[test]

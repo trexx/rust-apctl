@@ -195,14 +195,17 @@ const LOG_RETENTION: i64 = 14 * 86400;
 
 fn open_rw(path: &Path) -> Result<Connection> {
     let conn = Connection::open(path).with_context(|| format!("opening {}", path.display()))?;
-    conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA busy_timeout=5000;")?;
+    // temp_store=MEMORY: SQLite's temporary files (sorters, statement journals)
+    // stay in memory. The container's root filesystem is read-only, so there is
+    // no writable temp directory (SQLITE_IOERR_GETTEMPPATH, error 6410).
+    conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA busy_timeout=5000; PRAGMA temp_store=MEMORY;")?;
     Ok(conn)
 }
 
 fn open_ro(path: &Path) -> Result<Connection> {
     let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX)
         .with_context(|| format!("opening {} read-only", path.display()))?;
-    conn.execute_batch("PRAGMA busy_timeout=5000;")?;
+    conn.execute_batch("PRAGMA busy_timeout=5000; PRAGMA temp_store=MEMORY;")?;
     Ok(conn)
 }
 
