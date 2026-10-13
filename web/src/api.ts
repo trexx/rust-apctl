@@ -1106,3 +1106,33 @@ export const setClientSpeedLimit = (mac: Mac, usergroup_id: string | null) => se
 
 /** A limit for people: "5 Mbps", or "none". */
 export const speed = (kbps: number | null | undefined) => (kbps && kbps > 0 ? `${kbps >= 1000 ? `${+(kbps / 1000).toFixed(2)} Mbps` : `${kbps} kbps`}` : "none");
+
+// ---- Adoption ----
+
+export interface PendingAp {
+  mac: Mac;
+  ip: string | null;
+  model: string | null;
+  model_display: string | null;
+  version: string | null;
+  hostname: string | null;
+  serial: string | null;
+  /** apctl managed it before: it was reset. */
+  known: boolean;
+  first_seen: number;
+  last_seen: number;
+}
+
+export interface AdoptionStatus {
+  active: boolean;
+  pending: PendingAp[];
+  adopting: { mac: Mac; since: number }[];
+  forgetting: { mac: Mac; since: number }[];
+  ssh: { possible: boolean; inform_url: string | null };
+}
+
+export const useAdoption = () => useQuery({ queryKey: ["adoption"], queryFn: () => get<AdoptionStatus>("/api/devices/pending"), refetchInterval: 5_000 });
+export const adoptAp = (mac: Mac) => send<{ adopting: boolean }>("POST", `/api/devices/${mac}/adopt`, {});
+export const adoptOverSsh = (ip: string, username: string, password: string) =>
+  send<{ adopting: boolean; mac: Mac }>("POST", "/api/devices/adopt-ssh", { ip, username: username || null, password: password || null });
+export const forgetAp = (mac: Mac) => send<{ forgetting?: boolean; forgotten?: boolean }>("POST", `/api/devices/${mac}/forget`, {});

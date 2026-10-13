@@ -45,17 +45,26 @@ pub fn run(pcap: &str, keys: &KeyStore, url: &str, limit: usize, every: f64) -> 
     })?;
     eprintln!("replaying {} of {} informs to {url}", limit.min(informs.len()), informs.len());
 
-    // What each simulated AP currently runs (it adopts pushed versions).
+    // What each simulated AP currently runs (it adopts pushed versions), and
+    // the key it uses: its own, the factory key after a reset (`setdefault`),
+    // then whatever key an adoption hands it (`authkey=` in mgmt_cfg).
     let mut running: HashMap<Mac, String> = HashMap::new();
+    let mut keys_now: HashMap<Mac, [u8; 16]> = HashMap::new();
     let mut counts: HashMap<String, usize> = HashMap::new();
     for (i, mut payload) in informs.into_iter().take(limit).enumerate() {
         if i > 0 && every > 0.0 {
             std::thread::sleep(Duration::from_secs_f64(every));
         }
         let mac: Mac = payload["mac"].as_str().context("inform without mac")?.parse()?;
-        let key = *keys.get(&mac).with_context(|| format!("no key for {mac}"))?;
+        let key = match keys_now.get(&mac) {
+            Some(k) => *k,
+            None => *keys.get(&mac).with_context(|| format!("no key for {mac}"))?,
+        };
         if let Some(v) = running.get(&mac) {
             payload["cfgversion"] = Value::from(v.clone());
+        }
+        if key == inform::DEFAULT_KEY {
+            payload["default"] = Value::from(true);
         }
         let mut iv = [0u8; 16];
         iv.iter_mut().enumerate().for_each(|(i, b)| *b = (i as u8).wrapping_mul(31) ^ (counts.values().sum::<usize>() as u8));
@@ -69,10 +78,23 @@ pub fn run(pcap: &str, keys: &KeyStore, url: &str, limit: usize, every: f64) -> 
             let kind = reply["_type"].as_str().unwrap_or("?").to_string();
             let detail = match kind.as_str() {
                 "setparam" => {
-                    let v = reply["cfgversion"].as_str().unwrap_or("").to_string();
+                    let mgmt = reply["mgmt_cfg"].as_str().unwrap_or("");
+                    if let Some(k) = mgmt.lines().find_map(|l| l.strip_prefix("authkey=")).and_then(|k| hex::decode(k).ok()).and_then(|k| <[u8; 16]>::try_from(k).ok()) {
+                        keys_now.insert(mac, k);
+                    }
+                    let v = reply["cfgversion"].as_str().or_else(|| mgmt.lines().find_map(|l| l.strip_prefix("cfgversion="))).unwrap_or("").to_string();
                     let lines = reply["system_cfg"].as_str().map_or(0, |s| s.lines().count());
-                    running.insert(mac, v.clone());
-                    format!("cfgversion {v}, system_cfg {lines} lines, flags {:?}", pkt.header.flags)
+                    if reply["system_cfg"].is_string() {
+                        running.insert(mac, v.clone());
+                    }
+                    let adopted = if mgmt.contains("authkey=") { ", new key (adopted)" } else { "" };
+                    format!("cfgversion {v}, system_cfg {lines} lines, flags {:?}{adopted}", pkt.header.flags)
+                }
+                "setdefault" => {
+                    // Factory reset: the factory key and no config.
+                    keys_now.insert(mac, inform::DEFAULT_KEY);
+                    running.remove(&mac);
+                    "factory reset".to_string()
                 }
                 "noop" => format!("interval {}", reply["interval"]),
                 "cmd" => format!("{} {}", reply["cmd"].as_str().unwrap_or("?"), reply["mac"].as_str().unwrap_or("")),

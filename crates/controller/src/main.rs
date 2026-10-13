@@ -4,6 +4,7 @@
 //! another controller's traffic and never talks to the APs itself.
 
 mod actions;
+mod adopt;
 mod active;
 mod alerts;
 mod api;
@@ -21,6 +22,8 @@ mod model;
 mod ratelimit;
 mod settings;
 mod shadow;
+mod ssh;
+mod stun;
 mod store;
 mod syslog;
 mod threats;
@@ -118,6 +121,14 @@ struct ServeArgs {
     /// Where to receive informs in active mode.
     #[arg(long, env = "APCTL_INFORM_LISTEN", default_value = "0.0.0.0:8080")]
     pub inform_listen: SocketAddr,
+    /// The URL APs should inform to, given to APs adopted over SSH (e.g.
+    /// http://unifi.example:8080/inform). Defaults to the one the managed APs use.
+    #[arg(long, env = "APCTL_INFORM_URL")]
+    pub inform_url: Option<String>,
+    /// Where to answer STUN in active mode (the APs' `stun_url`; also used to
+    /// ask APs to inform right away).
+    #[arg(long, env = "APCTL_STUN_LISTEN", default_value = "0.0.0.0:3478")]
+    pub stun_listen: SocketAddr,
     /// File holding the 64-hex-character key that encrypts backups (e.g. from a
     /// SealedSecret). Without it backups are written unencrypted.
     #[arg(long, env = "APCTL_BACKUP_KEY")]
@@ -155,7 +166,7 @@ async fn main() -> Result<()> {
 async fn serve(args: ServeArgs) -> Result<()> {
     let ServeArgs {
         data_dir, keys, shadow, shadow_cmd, inform_ports, listen, syslog_listen, users_file, emulate_version, active, inform_listen,
-        oui_file, backup_key,
+        oui_file, backup_key, inform_url, stun_listen,
     } = args;
     let vendors = match vendor::Vendors::load(&oui_file) {
         Ok(v) => {
@@ -254,8 +265,15 @@ async fn serve(args: ServeArgs) -> Result<()> {
                 c.prepare("SELECT system_cfg FROM device_config")?.query_map([], |r| r.get::<_, Option<String>>(0))?.flatten().flatten().collect();
             Ok(cfgs.iter().find_map(|cfg| cfg.lines().find_map(|l| l.strip_prefix("unifi.reporterid=")).map(str::to_string)))
         })?;
+        if let Some(u) = &inform_url {
+            ssh::set_inform_url(u.clone());
+        }
+        let advertised = inform_url.as_deref().and_then(|u| u.split("://").nth(1)?.split([':', '/']).next()?.parse().ok());
+        if let Err(e) = stun::serve(stun_listen, advertised).await {
+            tracing::warn!("STUN not available on {stun_listen}: {e}");
+        }
         let controller = apcfg::Controller {
-            inform_url: format!("http://unifi:{}/inform", inform_listen.port()),
+            inform_url: inform_url.clone().unwrap_or_else(|| format!("http://unifi:{}/inform", inform_listen.port())),
             mgmt_url: "https://unifi:8443".into(),
             stun_url: "stun://unifi:3478/".into(),
             syslog_ip: None,
@@ -294,6 +312,7 @@ async fn serve(args: ServeArgs) -> Result<()> {
     let state = api::AppState { backups: Some(backups), active, writer: Some(writer.clone()), store, vendors: Arc::new(vendors), renderer, auth, engine: in_tx.clone(), live, tx: live_tx, started: store::now_ts(), source: source_desc };
     channelai::schedule(state.clone());
     ratelimit::spawn(state.clone());
+    adopt::spawn(state.clone());
     let app = api::router(state);
     let listener = tokio::net::TcpListener::bind(listen).await.with_context(|| format!("binding {listen}"))?;
     tracing::info!("web UI and API on http://{listen}");

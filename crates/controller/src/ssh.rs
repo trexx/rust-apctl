@@ -1,0 +1,265 @@
+//! Adopting an AP over SSH ("adopt by IP"), for an AP that informs somewhere
+//! else (e.g. a reset AP whose "unifi" DNS name points at another controller).
+//!
+//! As the official controller does it: log in with the given credentials
+//! (else the site's device credentials, else the factory ones), and run
+//! `/usr/bin/syswrapper.sh set-adopt <inform url> <key>`: the AP then informs
+//! here with its new key. apctl first reads the AP's MAC (and model) so it can
+//! create its record and key. The host key is accepted the first time and
+//! kept (`x_ssh_hostkey_fingerprint`).
+
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use axum::Json;
+use axum::extract::State;
+use axum::http::{HeaderMap, StatusCode};
+use inform::Mac;
+use serde::Deserialize;
+use serde_json::{Value, json};
+
+use crate::api::{ApiError, AppState};
+use crate::engine::Input;
+use crate::store;
+
+/// The URL APs should inform to: `--inform-url`, else the one the managed APs use.
+pub fn inform_url(s: &AppState) -> Option<String> {
+    if let Some(u) = INFORM_URL.get() {
+        return Some(u.clone());
+    }
+    let live = s.live.read().unwrap();
+    live.state.as_deref()?["devices"].as_array()?.iter().find_map(|d| d["inform_url"].as_str().filter(|u| u.starts_with("http")).map(str::to_string))
+}
+
+static INFORM_URL: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// Sets `--inform-url`.
+pub fn set_inform_url(url: String) {
+    let _ = INFORM_URL.set(url);
+}
+
+/// Whether adopting over SSH can work: active mode and an inform URL to give.
+pub fn available(s: &AppState) -> Value {
+    json!({ "possible": s.active && inform_url(s).is_some(), "inform_url": inform_url(s) })
+}
+
+struct Client {
+    /// The fingerprint the server must present, if known.
+    expected: Option<String>,
+    seen: Arc<Mutex<Option<String>>>,
+}
+
+impl russh::client::Handler for Client {
+    type Error = russh::Error;
+
+    async fn check_server_key(&mut self, key: &russh::keys::PublicKeyOrCertificate) -> Result<bool, Self::Error> {
+        let fp = match key {
+            russh::keys::PublicKeyOrCertificate::PublicKey { key, .. } => key.fingerprint(russh::keys::HashAlg::Sha256).to_string(),
+            // APs present plain keys; a certificate is identified by its public key.
+            russh::keys::PublicKeyOrCertificate::Certificate(c) => c.public_key().fingerprint(russh::keys::HashAlg::Sha256).to_string(),
+        };
+        *self.seen.lock().unwrap() = Some(fp.clone());
+        Ok(self.expected.as_ref().is_none_or(|e| *e == fp))
+    }
+}
+
+/// Why an SSH adoption failed, as the official controller tells them apart.
+#[derive(Debug, PartialEq)]
+pub enum Failure {
+    Unreachable(String),
+    Login,
+    HostKey,
+    Command(String),
+}
+
+impl std::fmt::Display for Failure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Failure::Unreachable(e) => write!(f, "could not reach the AP over SSH: {e}"),
+            Failure::Login => write!(f, "the AP refused the username and password"),
+            Failure::HostKey => write!(f, "the AP's SSH host key changed since last time"),
+            Failure::Command(e) => write!(f, "the command failed on the AP: {e}"),
+        }
+    }
+}
+
+/// An SSH session to an AP.
+struct Session {
+    handle: russh::client::Handle<Client>,
+    fingerprint: Option<String>,
+}
+
+async fn connect(ip: &str, port: u16, logins: &[(String, String)], expected: Option<String>) -> Result<Session, Failure> {
+    let config = Arc::new(russh::client::Config { inactivity_timeout: Some(Duration::from_secs(20)), ..Default::default() });
+    let mut last = Failure::Login;
+    for (user, pass) in logins {
+        let seen = Arc::new(Mutex::new(None));
+        let client = Client { expected: expected.clone(), seen: seen.clone() };
+        let connecting = russh::client::connect(config.clone(), (ip, port), client);
+        let mut handle = match tokio::time::timeout(Duration::from_secs(5), connecting).await {
+            Err(_) => return Err(Failure::Unreachable("timed out".into())),
+            Ok(Err(russh::Error::UnknownKey)) => return Err(Failure::HostKey),
+            Ok(Err(e)) => return Err(Failure::Unreachable(e.to_string())),
+            Ok(Ok(h)) => h,
+        };
+        match handle.authenticate_password(user, pass).await {
+            Ok(r) if r.success() => {
+                let fingerprint = seen.lock().unwrap().clone();
+                return Ok(Session { handle, fingerprint });
+            }
+            Ok(_) => last = Failure::Login,
+            Err(e) => last = Failure::Unreachable(e.to_string()),
+        }
+    }
+    Err(last)
+}
+
+impl Session {
+    /// Runs a command and returns what it printed.
+    async fn run(&mut self, cmd: &str) -> Result<String, Failure> {
+        let mut ch = self.handle.channel_open_session().await.map_err(|e| Failure::Command(e.to_string()))?;
+        ch.exec(true, cmd).await.map_err(|e| Failure::Command(e.to_string()))?;
+        let mut out = Vec::new();
+        let read = async {
+            while let Some(msg) = ch.wait().await {
+                match msg {
+                    russh::ChannelMsg::Data { data } => out.extend_from_slice(&data),
+                    russh::ChannelMsg::Eof | russh::ChannelMsg::Close => break,
+                    _ => {}
+                }
+            }
+        };
+        let _ = tokio::time::timeout(Duration::from_secs(15), read).await;
+        Ok(String::from_utf8_lossy(&out).into_owned())
+    }
+}
+
+/// A MAC written with or without separators.
+fn parse_mac(text: &str) -> Option<Mac> {
+    let hex: String = text.trim().chars().filter(char::is_ascii_hexdigit).collect();
+    if hex.len() != 12 || text.trim().chars().any(|c| !(c.is_ascii_hexdigit() || c == ':' || c == '-')) {
+        return None;
+    }
+    let pairs: Vec<&str> = (0..6).map(|i| &hex[i * 2..i * 2 + 2]).collect();
+    pairs.join(":").to_ascii_lowercase().parse().ok()
+}
+
+/// `key=value` lines (as in /etc/board.info).
+fn board_value<'a>(text: &'a str, key: &str) -> Option<&'a str> {
+    text.lines().find_map(|l| l.trim().strip_prefix(key)?.strip_prefix('=')).map(str::trim).filter(|v| !v.is_empty())
+}
+
+/// The usernames and passwords to try: the ones given, else the site's device
+/// login, then the factory ones.
+fn logins(state: Option<&Value>, given: Option<(String, String)>) -> Vec<(String, String)> {
+    if let Some(g) = given {
+        return vec![g];
+    }
+    let mut out: Vec<(String, String)> = Vec::new();
+    if let Some(m) = state.and_then(|st| crate::settings::docs(st, "setting").find(|x| x["key"].as_str() == Some("mgmt")))
+        && let (Some(u), Some(p)) = (m["x_ssh_username"].as_str(), m["x_ssh_password"].as_str())
+    {
+        out.push((u.to_string(), p.to_string()));
+    }
+    for (u, p) in [("ubnt", "ubnt"), ("ui", "ui")] {
+        out.push((u.to_string(), p.to_string()));
+    }
+    out.dedup();
+    out
+}
+
+#[derive(Deserialize)]
+pub struct AdoptBody {
+    ip: String,
+    #[serde(default)]
+    port: Option<u16>,
+    #[serde(default)]
+    username: Option<String>,
+    #[serde(default)]
+    password: Option<String>,
+}
+
+/// POST /api/devices/adopt-ssh {ip, port?, username?, password?}
+pub async fn adopt(State(s): State<AppState>, headers: HeaderMap, Json(b): Json<AdoptBody>) -> Result<Json<Value>, ApiError> {
+    crate::api::check_csrf(&headers)?;
+    if !s.active {
+        return Err(ApiError(StatusCode::CONFLICT, "adoption needs active mode".into()));
+    }
+    let url = inform_url(&s).ok_or_else(|| ApiError(StatusCode::CONFLICT, "apctl doesn't know the URL APs should inform to: set --inform-url".into()))?;
+    if b.ip.parse::<std::net::IpAddr>().is_err() {
+        return Err(ApiError(StatusCode::BAD_REQUEST, "enter the AP's IP address".into()));
+    }
+    let state = s.live.read().unwrap().state.clone();
+    let given = match (b.username.filter(|u| !u.is_empty()), b.password) {
+        (Some(u), Some(p)) => Some((u, p)),
+        _ => None,
+    };
+    let bad = |f: Failure| ApiError(StatusCode::BAD_GATEWAY, f.to_string());
+    // A known AP keeps its host key; a new one is trusted the first time.
+    let mut session = connect(&b.ip, b.port.unwrap_or(22), &logins(state.as_deref(), given.clone()), None).await.map_err(bad)?;
+    let board = session.run("cat /etc/board.info").await.unwrap_or_default();
+    let eth0 = session.run("cat /sys/class/net/eth0/address").await.unwrap_or_default();
+    let mac = parse_mac(&eth0)
+        .or_else(|| board_value(&board, "board.hwaddr").and_then(parse_mac))
+        .ok_or_else(|| ApiError(StatusCode::BAD_GATEWAY, "could not read the AP's MAC address: is this a UniFi AP?".into()))?;
+    let known = state.as_deref().and_then(|st| crate::adopt::device_doc(st, &mac).cloned());
+    if let (Some(k), Some(seen)) = (known.as_ref().and_then(|d| d["x_ssh_hostkey_fingerprint"].as_str()), &session.fingerprint)
+        && k != seen
+    {
+        let _ = s.engine.send(Input::Note { ts: store::now_ts(), kind: "ap_host_key_mismatch", mac, data: json!({ "ip": b.ip }) }).await;
+        return Err(bad(Failure::HostKey));
+    }
+    // Its record (and key), unless apctl has it already.
+    let payload = json!({
+        "mac": mac.to_string(), "ip": b.ip, "model": board_value(&board, "board.shortname").or(board_value(&board, "board.name")),
+        "hostname": board_value(&board, "board.name"), "inform_url": url,
+    });
+    let fingerprint = session.fingerprint.clone();
+    let body = json!({ "mac": mac.to_string(), "payload": payload });
+    crate::actions::edit_settings(&s, format!("adopting {mac} over SSH"), move |st| {
+        crate::adopt::add_device(st, &body)?;
+        let d = st["devices"].as_array_mut().and_then(|l| l.iter_mut().find(|d| d["mac"].as_str().is_some_and(|m| m.eq_ignore_ascii_case(body["mac"].as_str().unwrap_or_default())))).ok_or("no record")?;
+        d["inform_url"] = body["payload"]["inform_url"].clone();
+        if let Some(fp) = &fingerprint
+            && d["x_ssh_hostkey_fingerprint"].is_null()
+        {
+            d["x_ssh_hostkey_fingerprint"] = json!(fp);
+        }
+        Ok(())
+    })
+    .await?;
+    let key = {
+        let live = s.live.read().unwrap();
+        live.state.as_deref().and_then(|st| crate::adopt::device_doc(st, &mac)).and_then(|d| d["x_authkey"].as_str().map(str::to_string))
+    }
+    .ok_or_else(|| ApiError::internal("the new record has no key"))?;
+    let out = session.run(&format!("/usr/bin/syswrapper.sh set-adopt {url} {key}")).await.map_err(bad)?;
+    s.live.write().unwrap().adoption.adopting.insert(mac, store::now_ts());
+    let _ = s.engine.send(Input::Note { ts: store::now_ts(), kind: "ap_adopting", mac, data: json!({ "ip": b.ip, "via": "ssh" }) }).await;
+    tracing::info!("{mac}: set-adopt {url} sent over SSH ({})", out.trim());
+    Ok(Json(json!({ "adopting": true, "mac": mac, "inform_url": url })))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn credentials_are_tried_given_then_site_then_factory() {
+        let state = json!({ "devices": [{ "site_id": "s1" }], "setting": [{ "key": "mgmt", "site_id": "s1", "x_ssh_username": "admin", "x_ssh_password": "pw" }] });
+        assert_eq!(logins(Some(&state), Some(("me".into(), "mine".into()))), vec![("me".to_string(), "mine".to_string())], "given: only that");
+        let users: Vec<String> = logins(Some(&state), None).into_iter().map(|x| x.0).collect();
+        assert_eq!(users, ["admin", "ubnt", "ui"]);
+        assert_eq!(logins(None, None).len(), 2);
+    }
+
+    #[test]
+    fn board_info_values() {
+        let text = "board.sysid=0xa611\nboard.name=U6-Mesh\nboard.shortname=U6M\nboard.hwaddr=02:00:00:00:00:09\n";
+        assert_eq!((board_value(text, "board.shortname"), board_value(text, "board.name")), (Some("U6M"), Some("U6-Mesh")));
+        assert_eq!(board_value(text, "board.missing"), None);
+        assert_eq!(parse_mac("02AB0000009A").map(|m| m.to_string()).as_deref(), Some("02:ab:00:00:00:9a"));
+        assert_eq!(parse_mac("02:ab:00:00:00:9a\n").map(|m| m.to_string()).as_deref(), Some("02:ab:00:00:00:9a"));
+        assert!(parse_mac("cat: no such file").is_none());
+    }
+}

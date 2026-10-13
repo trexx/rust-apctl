@@ -2,6 +2,7 @@ import { useState } from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import {
   blockClient,
+  forgetAp,
   kickClient,
   lockClient,
   locateAp,
@@ -24,8 +25,9 @@ function useAction(refresh: unknown[][]) {
     setBusy(true);
     setMsg(null);
     try {
-      await fn();
-      setMsg({ ok: true, text: done });
+      // A message from the action itself wins over the fixed one.
+      const r = await fn();
+      setMsg({ ok: true, text: typeof r === "string" && r ? r : done });
     } catch (e) {
       setMsg({ ok: false, text: e instanceof Error ? e.message : String(e) });
     } finally {
@@ -125,6 +127,24 @@ export function DeviceActions({
           }
         >
           Restart
+        </button>
+        <button
+          className="btn small"
+          disabled={!can || busy}
+          title="Remove this AP from apctl; if it is online it resets to factory defaults"
+          onClick={() =>
+            window.confirm(
+              `Forget ${name}? apctl stops managing it${online ? ", and it resets to factory defaults (its clients drop off)" : ""}. To use it again, adopt it.`,
+            ) &&
+            void run(async () => {
+              const r = await forgetAp(mac);
+              return r.forgetting
+                ? "It resets with its next report and is then removed."
+                : "Removed.";
+            }, "")
+          }
+        >
+          Forget
         </button>
       </div>
       <Outcome msg={msg} why={why} />

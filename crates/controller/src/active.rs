@@ -135,6 +135,32 @@ impl Active {
         apcfg::render_with_meta(&input)
     }
 
+    /// The reply that adopts an AP: only `mgmt_cfg`, which carries its own key
+    /// (it still informs with the factory key). Its full config follows once
+    /// it informs with that key.
+    fn adoption_reply(&self, ts: Ts, mac: Mac, payload: &Value) -> Value {
+        let server_time = (ts * 1000).to_string();
+        let Some(mut state) = self.live.read().unwrap().state.as_deref().cloned() else {
+            return json!({ "_type": "noop", "interval": self.interval(), "server_time_in_utc": server_time });
+        };
+        let m = mac.to_string();
+        let mut cfgversion = new_cfgversion();
+        if let Some(d) = state["devices"].as_array_mut().and_then(|l| l.iter_mut().find(|d| d["mac"].as_str().is_some_and(|x| x.eq_ignore_ascii_case(&m)))) {
+            // The key it used, so mgmt_cfg includes `authkey`.
+            d["x_inform_authkey"] = json!(hex::encode(DEFAULT_KEY));
+            if let Some(v) = d["cfgversion"].as_str() {
+                cfgversion = v.to_string();
+            }
+        }
+        match self.render(&state, mac, payload, &cfgversion) {
+            Ok(out) => json!({ "_type": "setparam", "mgmt_cfg": out.rendered.mgmt_cfg, "server_time_in_utc": server_time }),
+            Err(e) => {
+                tracing::error!("{mac}: cannot render the adoption config: {e:#}");
+                json!({ "_type": "noop", "interval": self.interval(), "server_time_in_utc": server_time })
+            }
+        }
+    }
+
     /// Decides the reply to an AP's inform.
     fn reply(&self, ts: Ts, mac: Mac, payload: &Value) -> Value {
         let server_time = (ts * 1000).to_string();
@@ -164,6 +190,29 @@ impl Active {
             tracing::warn!("{mac}: no settings imported, replying noop");
             return noop(self.interval());
         };
+        // An AP adopted over SSH has no radio settings yet: take them from this inform first.
+        let has_radios = crate::adopt::device_doc(&state, &mac).is_some_and(|d| d["radio_table"].as_array().is_some_and(|t| !t.is_empty()));
+        if !has_radios && payload["radio_table"].is_array() {
+            let (tx, _rx) = tokio::sync::oneshot::channel();
+            let p = payload.clone();
+            let edit: crate::engine::StateEdit = Box::new(move |st: &mut Value| {
+                let table = crate::adopt::radio_table(st, &p);
+                let m = p["mac"].as_str().unwrap_or_default().to_string();
+                let d = st["devices"].as_array_mut().and_then(|l| l.iter_mut().find(|d| d["mac"].as_str().is_some_and(|x| x.eq_ignore_ascii_case(&m)))).ok_or("no record")?;
+                d["radio_table"] = json!(table);
+                for k in ["model", "version", "serial", "ip"] {
+                    if !p[k].is_null() {
+                        d[k] = p[k].clone();
+                    }
+                }
+                if d["name"].is_null() {
+                    d["name"] = p["hostname"].clone();
+                }
+                Ok(())
+            });
+            let _ = self.engine.try_send(Input::EditState { ts, what: format!("radio settings for new AP {mac}"), edit, done: tx });
+            return noop(self.interval());
+        }
         let reported = payload["cfgversion"].as_str().unwrap_or("").to_string();
 
         // What would we push, ignoring the cfgversion token?
@@ -279,8 +328,9 @@ pub async fn inform(
     let mac = pkt.header.mac;
     let gcm = pkt.header.flags.has(Flags::GCM);
 
-    // Which keys may this AP use?
-    let device_key = active.keys.get(&mac).copied();
+    // Which keys may this AP use? Its own if apctl manages it; the factory key always.
+    let state = active.live.read().unwrap().state.clone();
+    let device_key = crate::adopt::device_key(state.as_deref(), &active.keys, &mac);
     let mut attempts: Vec<(KeyUsed, [u8; 16])> = Vec::new();
     if let Some(k) = device_key {
         attempts.push((KeyUsed::Device, k));
@@ -293,15 +343,52 @@ pub async fn inform(
         tracing::warn!("{mac}: inform from {} could not be decrypted", peer.ip());
         return status(StatusCode::BAD_REQUEST);
     };
-    if device_key.is_none() {
-        // Not adopted by us: the official controller answers 404 and lists the
-        // device as pending. Adoption comes later.
-        tracing::info!("{mac}: unadopted device informing from {}", peer.ip());
-        return status(StatusCode::NOT_FOUND);
-    }
     if payload["mac"].as_str().and_then(|m| m.parse::<Mac>().ok()) != Some(mac) {
         tracing::warn!("{mac}: header and payload MACs differ");
         return status(StatusCode::BAD_REQUEST);
+    }
+    let ts_now = ts;
+    if device_key.is_none() || used == KeyUsed::Default {
+        let known = device_key.is_some();
+        let adopting = active.live.read().unwrap().adoption.adopting.contains_key(&mac);
+        if known && adopting {
+            // Adopt pressed: hand the AP its own key (in mgmt_cfg), with the factory key.
+            let reply = active.adoption_reply(ts_now, mac, &payload);
+            tracing::info!("{mac}: adoption: sending its key");
+            let flags = Flags(Flags::ENCRYPTED | if gcm { Flags::GCM } else { 0 });
+            let packet = inform::seal(mac, flags, random_bytes::<16>(), &key, reply.to_string().as_bytes());
+            return ([(header::CONTENT_TYPE, "application/x-binary")], packet).into_response();
+        }
+        // Not ours, or ours but reset: answered 404 and listed for adoption.
+        // Whatever apctl remembered about it (e.g. AES-GCM) no longer holds.
+        active.devices.lock().unwrap().remove(&mac);
+        let new = crate::adopt::note_pending(&mut active.live.write().unwrap(), &payload, known, ts_now);
+        if new {
+            tracing::info!("{mac}: {} informing from {}", if known { "reset AP (adoption required)" } else { "AP waiting for adoption" }, peer.ip());
+            let data = json!({ "model": payload["model"], "ip": payload["ip"], "known": known });
+            let _ = active.engine.send(Input::Note { ts: ts_now, kind: "ap_pending", mac, data }).await;
+        }
+        return status(StatusCode::NOT_FOUND);
+    }
+    // Its own key: an adoption is complete; a forgotten AP is told to reset.
+    let (was_adopting, forgetting) = {
+        let mut live = active.live.write().unwrap();
+        live.adoption.pending.remove(&mac);
+        (live.adoption.adopting.remove(&mac).is_some(), live.adoption.forgetting.contains_key(&mac))
+    };
+    if was_adopting {
+        let data = json!({ "model": payload["model"], "ip": payload["ip"], "version": payload["version"] });
+        let _ = active.engine.send(Input::Note { ts: ts_now, kind: "ap_adopted", mac, data }).await;
+    }
+    if forgetting {
+        tracing::warn!("{mac}: forgotten: telling it to reset");
+        let engine = active.engine.clone();
+        tokio::spawn(async move { crate::adopt::finish_forget(&engine, mac, true).await });
+        active.devices.lock().unwrap().remove(&mac);
+        let reply = json!({ "_type": "setdefault", "server_time_in_utc": (ts_now * 1000).to_string() });
+        let flags = Flags(Flags::ENCRYPTED | if gcm { Flags::GCM } else { 0 });
+        let packet = inform::seal(mac, flags, random_bytes::<16>(), &key, reply.to_string().as_bytes());
+        return ([(header::CONTENT_TYPE, "application/x-binary")], packet).into_response();
     }
     {
         let mut devices = active.devices.lock().unwrap();
@@ -592,6 +679,55 @@ mod tests {
         stranger["mac"] = json!("02:00:00:00:00:77");
         let (status, _) = inform_as_ap(&rig, &stranger, DEFAULT_KEY, Flags::ENCRYPTED | Flags::GCM).await;
         assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn adopts_a_new_ap_then_forgets_it() {
+        let rig = rig(true, None);
+        let new: Mac = "02:00:00:00:00:09".parse().unwrap();
+        let mut payload = ap_payload("1");
+        payload["mac"] = json!(new.to_string());
+        payload["default"] = json!(true);
+        // Factory key, unknown AP: 404 and listed as pending.
+        let (status, _) = inform_as_ap(&rig, &payload, DEFAULT_KEY, GCM_ZLIB).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert!(rig.live.read().unwrap().adoption.pending.get(&new).is_some_and(|p| !p.known));
+        // Adopt: a record with its own key, and the AP is expected back.
+        {
+            let mut live = rig.live.write().unwrap();
+            let mut state = live.state.as_deref().cloned().unwrap();
+            crate::adopt::add_device(&mut state, &json!({ "mac": new.to_string(), "payload": payload })).unwrap();
+            live.state = Some(Arc::new(state));
+            live.adoption.adopting.insert(new, 0);
+        }
+        let key_hex = crate::adopt::device_doc(rig.live.read().unwrap().state.as_deref().unwrap(), &new).unwrap()["x_authkey"].as_str().unwrap().to_string();
+        let key: [u8; 16] = hex::decode(&key_hex).unwrap().try_into().unwrap();
+        // Still on the factory key: only mgmt_cfg, carrying its key.
+        let (_, reply) = inform_as_ap(&rig, &payload, DEFAULT_KEY, GCM_ZLIB).await;
+        let reply = reply.unwrap().1;
+        assert_eq!(reply["_type"], "setparam");
+        assert!(reply["mgmt_cfg"].as_str().unwrap().contains(&format!("authkey={key_hex}")));
+        assert!(reply["system_cfg"].is_null());
+        // Back with its own key: adopted, and its full config follows.
+        let (_, reply) = inform_as_ap(&rig, &payload, key, GCM_ZLIB).await;
+        let reply = reply.unwrap().1;
+        assert_eq!(reply["_type"], "setparam");
+        assert!(reply["system_cfg"].as_str().unwrap().lines().count() > 100);
+        assert!(!reply["mgmt_cfg"].as_str().unwrap().contains("authkey="), "no key once it uses its own");
+        assert!(rig.live.read().unwrap().adoption.adopting.is_empty());
+        // Forget: its next inform tells it to reset.
+        rig.live.write().unwrap().adoption.forgetting.insert(new, 0);
+        let (_, reply) = inform_as_ap(&rig, &payload, key, GCM_ZLIB).await;
+        assert_eq!(reply.unwrap().1["_type"], "setdefault");
+    }
+
+    #[tokio::test]
+    async fn a_reset_ap_is_listed_for_adoption_again() {
+        let rig = rig(true, None);
+        // AP is ours (it has a key), but informs with the factory key: it was reset.
+        let (status, _) = inform_as_ap(&rig, &ap_payload("1"), DEFAULT_KEY, GCM_ZLIB).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert!(rig.live.read().unwrap().adoption.pending.get(&AP.parse().unwrap()).is_some_and(|p| p.known));
     }
 
     #[tokio::test]

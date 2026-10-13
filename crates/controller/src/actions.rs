@@ -31,6 +31,7 @@ pub fn queue(live: &mut Live, mac: Mac, cmd: Value) {
     if q.back() != Some(&cmd) {
         q.push_back(cmd);
     }
+    crate::stun::poke(live, &mac);
 }
 
 /// The next queued command for an AP, if any.

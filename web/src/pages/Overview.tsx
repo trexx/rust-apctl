@@ -21,6 +21,7 @@ import {
 } from "../components/Insights";
 import { useTimeSpan } from "../components/Chart";
 import { ThreatBanner } from "../components/Threats";
+import { AdoptionPanel } from "../components/Adoption";
 
 export function Overview() {
   const devices = useDevices();
@@ -71,6 +72,7 @@ export function Overview() {
       </div>
 
       <ThreatBanner />
+      <AdoptionPanel />
       <h2>Access points</h2>
       <div className="cards cards-fill">
         {list.map((d) => (

@@ -55,6 +55,8 @@ pub enum Input {
     ClientNote { ts: Ts, kind: &'static str, client: Mac, data: Value },
     /// Record a site-wide event raised elsewhere (e.g. a channel plan applied).
     SiteNote { ts: Ts, kind: &'static str, data: Value },
+    /// Drop everything apctl keeps about a forgotten AP.
+    Forget { mac: Mac },
     /// Change the settings (apctl's copy of the controller settings), store
     /// them, and record the change; `done` gets the result.
     EditState { ts: Ts, what: String, edit: StateEdit, done: tokio::sync::oneshot::Sender<Result<(), String>> },
@@ -179,6 +181,9 @@ pub struct Live {
     /// Quick scans (RF environment) asked of each AP and not finished yet.
     #[serde(skip)]
     pub scans: HashMap<Mac, crate::channelai::Scan>,
+    /// APs waiting for adoption, being adopted or being forgotten.
+    #[serde(skip)]
+    pub adoption: crate::adopt::Adoption,
     /// Last config pushed to each AP by the other controller, unredacted.
     #[serde(skip)]
     pub last_config: HashMap<Mac, (String, String, Option<String>)>,
@@ -348,6 +353,7 @@ impl Engine {
                 let mut live = self.live.write().unwrap();
                 self.emit(&mut live, ev(ts, kind, None, None, data));
             }
+            Input::Forget { mac } => self.forget(mac),
             Input::EditState { ts, what, edit, done } => {
                 let _ = done.send(self.edit_state(ts, what, edit));
             }
@@ -711,7 +717,22 @@ impl Engine {
         );
         live.state = Some(Arc::new(state));
         self.emit(&mut live, ev(ts, "settings_changed", None, None, json!({ "what": what })));
+        // The APs pick the change up now rather than at their next interval.
+        crate::stun::poke_all(&live);
         Ok(())
+    }
+
+    fn forget(&mut self, mac: Mac) {
+        let mut live = self.live.write().unwrap();
+        live.devices.remove(&mac);
+        live.raw_informs.remove(&mac);
+        live.last_config.remove(&mac);
+        live.adoption.forgetting.remove(&mac);
+        live.adoption.adopting.remove(&mac);
+        self.configs.remove(&mac);
+        for sql in ["DELETE FROM devices WHERE mac = ?1", "DELETE FROM managed_devices WHERE mac = ?1", "DELETE FROM device_config WHERE mac = ?1"] {
+            self.writer.exec(Db::Config, sql, vec![Sql::Text(mac.to_string())]);
+        }
     }
 
     fn set_alias(&mut self, ts: Ts, mac: Mac, alias: Option<String>, note: Option<String>, only_if_unset: bool) {
