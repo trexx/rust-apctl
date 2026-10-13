@@ -975,3 +975,69 @@ export function useLiveUpdates(): void {
     };
   }, [qc]);
 }
+
+// ---- Settings editor ----
+
+export interface WlanSettings {
+  id: string;
+  name: string;
+  editable: boolean;
+  protection: "wpa2" | "wpa2_wpa3" | "wpa3" | "open" | null;
+  has_passphrase: boolean;
+  /** null: broadcast from every AP. */
+  aps: Mac[] | null;
+  [field: string]: unknown;
+}
+
+export interface WlanSettingsList {
+  active: boolean;
+  wlans: WlanSettings[];
+  networks: { id: string; name: string; vlan: number | null; purpose: string | null }[];
+  aps: { mac: Mac; name: string | null }[];
+}
+
+export interface RadioSettings {
+  radio: string;
+  name: string;
+  channel: number | "auto";
+  ht: number;
+  tx_power_mode: string;
+  tx_power: number | string | null;
+  min_rssi_enabled: boolean | null;
+  min_rssi: number | null;
+  hard_noise_floor_enabled: boolean | null;
+  has_blocker: boolean;
+  caps: { min_txpower: number | null; max_txpower: number | null; has_ht160: boolean | null } | null;
+  /** Legal channels by width (MHz) in the site's country. */
+  channels: Record<string, number[]>;
+}
+
+export interface DeviceSettings {
+  active: boolean;
+  mac: Mac;
+  name: string | null;
+  model: string | null;
+  led_override: "default" | "on" | "off" | null;
+  radios: RadioSettings[];
+}
+
+/** What a settings change would send each AP (the shape of a config push). */
+export interface SettingsPreview {
+  what: string;
+  aps: { mac: Mac; name: string | null; error?: string; system_cfg?: Record<string, unknown>; mgmt_cfg?: Record<string, unknown>; labels?: Record<string, string> }[];
+}
+
+export type SettingsTarget = { kind: "wlan"; id: string | null; remove?: boolean } | { kind: "device"; mac: Mac };
+
+export const useWlanSettings = () => useQuery({ queryKey: ["settings", "wlans"], queryFn: () => get<WlanSettingsList>("/api/settings/wlans") });
+export const useDeviceSettings = (mac: Mac) => useQuery({ queryKey: ["settings", "device", mac], queryFn: () => get<DeviceSettings>(`/api/settings/devices/${mac}`), retry: false });
+export const wlanPassphrase = (id: string) => get<{ passphrase: string | null }>(`/api/settings/wlans/${id}/passphrase`);
+
+/** Previews (or, with `save`, saves) a change to an SSID or an AP. */
+export function changeSettings<T>(target: SettingsTarget, patch: Record<string, unknown>, save: boolean): Promise<T> {
+  const q = save ? "" : "?preview=true";
+  if (target.kind === "device") return send<T>("PUT", `/api/settings/devices/${target.mac}${q}`, { patch });
+  if (target.remove) return send<T>("DELETE", `/api/settings/wlans/${target.id}${q}`, {});
+  if (target.id === null) return send<T>("POST", `/api/settings/wlans${q}`, { patch });
+  return send<T>("PUT", `/api/settings/wlans/${target.id}${q}`, { patch });
+}

@@ -1183,7 +1183,7 @@ impl Engine {
 
 /// Human names for numbered config sections: SSIDs (with band) for `aaa.N` and
 /// `wireless.N`, the band for `radio.N`.
-fn section_labels(cfg: &str, radios: &[crate::model::RadioSample]) -> serde_json::Map<String, Value> {
+pub(crate) fn section_labels(cfg: &str, radios: &[crate::model::RadioSample]) -> serde_json::Map<String, Value> {
     let kv: HashMap<&str, &str> = cfg.lines().filter_map(|l| l.split_once('=')).collect();
     let band_of_phy = |phy: &str| {
         radios.iter().find(|r| r.name.as_deref() == Some(phy)).map(|r| match r.radio.as_str() {

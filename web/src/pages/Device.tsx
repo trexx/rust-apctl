@@ -34,6 +34,7 @@ import {
 import { ago, band, bitrate, bytes, duration, pct, phy } from "../format";
 import { MulticastPanel } from "../components/Insights";
 import { DeviceActions } from "../components/Actions";
+import { DeviceSettingsPanel } from "../components/SettingsEditor";
 
 export function Device() {
   const { mac = "" } = useParams();
@@ -73,6 +74,7 @@ export function Device() {
             online={d.online}
             locating={detail.data.locating ?? false}
           />
+          <DeviceSettingsPanel mac={mac} />
           {d.reconfiguring && (
             <div className="banner">
               Applying a configuration change. Client data resumes in a moment.

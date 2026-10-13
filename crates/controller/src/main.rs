@@ -16,6 +16,7 @@ mod firmware;
 mod insights;
 mod logevents;
 mod model;
+mod settings;
 mod shadow;
 mod store;
 mod syslog;

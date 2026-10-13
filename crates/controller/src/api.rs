@@ -65,6 +65,10 @@ pub fn router(state: AppState) -> Router {
             "/api/settings/state",
             get(state_summary).post(import_state).layer(axum::extract::DefaultBodyLimit::max(8 << 20)),
         )
+        .route("/api/settings/wlans", get(crate::settings::wlans).post(crate::settings::post_wlan))
+        .route("/api/settings/wlans/{id}", axum::routing::put(crate::settings::put_wlan).delete(crate::settings::delete_wlan_route))
+        .route("/api/settings/wlans/{id}/passphrase", get(crate::settings::passphrase))
+        .route("/api/settings/devices/{mac}", get(crate::settings::device).put(crate::settings::put_device))
         .route("/api/dryrun", get(dryrun))
         .route("/api/site/activity", get(crate::insights::activity))
         .route("/api/site/top", get(crate::insights::top))

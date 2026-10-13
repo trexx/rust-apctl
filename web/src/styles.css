@@ -1339,3 +1339,69 @@ input.search.num-input {
 .actions .small {
   margin-top: 6px;
 }
+
+/* Settings editor. */
+.settings-form {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.form-row {
+  display: grid;
+  grid-template-columns: minmax(140px, 220px) 1fr;
+  gap: 12px;
+  align-items: start;
+  padding: 6px 0;
+  border-bottom: 1px solid var(--border);
+}
+
+.form-label {
+  padding-top: 6px;
+}
+
+.form-control {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 16px;
+  min-width: 0;
+}
+
+.form-control input.search {
+  min-width: 0;
+  max-width: 100%;
+}
+
+.form-control textarea {
+  width: 100%;
+  max-width: 360px;
+}
+
+.settings-form details {
+  margin-top: 8px;
+}
+
+.settings-form summary {
+  cursor: pointer;
+  font-weight: 600;
+  padding: 6px 0;
+}
+
+.settings-form .actions-row,
+.review .actions-row {
+  margin-top: 12px;
+}
+
+.review {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+@media (max-width: 600px) {
+  .form-row {
+    grid-template-columns: 1fr;
+    gap: 4px;
+  }
+}
