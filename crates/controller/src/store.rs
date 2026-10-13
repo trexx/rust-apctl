@@ -139,8 +139,9 @@ pub const CLIENT: Table = Table {
     gauges: &["rssi", "signal", "noise", "tx_rate", "rx_rate", "satisfaction", "latency_avg", "channel"],
     counters: &["tx_bytes", "rx_bytes", "tx_packets", "rx_packets", "tx_retries", "mcast_tx_pkts", "mcast_rx_pkts", "mcast_tx_bytes", "mcast_rx_bytes"],
 };
-/// Multicast and broadcast per AP and traffic type, as rates summed over the
-/// AP's clients (`tx` to clients, `rx` from them).
+/// Multicast and broadcast per AP and traffic type, as rates: `tx` delivered
+/// to clients (once per network), `rx` sent by clients (summed), and how many
+/// clients sent that type.
 pub const MCAST: Table = Table {
     name: "mcast_stats",
     keys: &["mac", "type"],

@@ -322,7 +322,7 @@ pub fn parse(ts: Ts, p: &Value) -> anyhow::Result<Snapshot> {
     let mut clients = Vec::new();
     for v in vap_table.into_iter().flatten() {
         let Some(bssid) = string(&v["bssid"]) else { continue };
-        // Only user-facing VAPs carry clients we care about; mesh/uplink VAPs are skipped.
+        // Clients come from user and guest VAPs; mesh uplink/downlink VAPs are skipped.
         let usage = v["usage"].as_str().unwrap_or("user");
         let essid = string(&v["essid"]);
         let radio = string(&v["radio"]);
@@ -353,7 +353,7 @@ pub fn parse(ts: Ts, p: &Value) -> anyhow::Result<Snapshot> {
             wifi_tx_attempts: int(&v["wifi_tx_attempts"]),
             wifi_tx_dropped: int(&v["wifi_tx_dropped"]),
         });
-        if usage != "user" {
+        if !matches!(usage, "user" | "guest") {
             continue;
         }
         for s in v["sta_table"].as_array().into_iter().flatten() {

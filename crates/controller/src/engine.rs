@@ -163,6 +163,8 @@ pub struct KnownDevice {
 
 pub type SharedLive = Arc<RwLock<Live>>;
 
+type McastTypes = std::collections::BTreeMap<String, crate::model::McastCounts>;
+
 /// Channel, width and power of one radio.
 type RadioSettings = (Option<i64>, Option<i64>, Option<i64>);
 
@@ -184,13 +186,16 @@ pub struct Engine {
     /// Debounced radio settings: right after a restart an AP briefly reports
     /// transient values (e.g. full transmit power) before settling.
     radios: HashMap<(Mac, String), RadioTrack>,
-    /// Each client's last multicast counters, for per-AP rates.
-    mcast_prev: HashMap<Mac, (Ts, std::collections::BTreeMap<String, crate::model::McastCounts>)>,
+    /// Each client's last multicast counters and the BSSID they came from.
+    mcast_prev: HashMap<Mac, (Ts, String, McastTypes)>,
+    /// Each BSSID's last "delivered to clients" counters. The AP reports these
+    /// per network, repeated identically in every client's block.
+    bss_prev: HashMap<String, (Ts, McastTypes)>,
 }
 
 impl Engine {
     pub fn new(writer: Writer, keys: Arc<KeyStore>, live: SharedLive, tx: broadcast::Sender<LiveMsg>) -> Self {
-        Engine { writer, keys, renderer: None, live, tx, configs: HashMap::new(), radios: HashMap::new(), mcast_prev: HashMap::new() }
+        Engine { writer, keys, renderer: None, live, tx, configs: HashMap::new(), radios: HashMap::new(), mcast_prev: HashMap::new(), bss_prev: HashMap::new() }
     }
 
     /// Enables dry-run comparisons of every captured config push.
@@ -795,7 +800,8 @@ impl Engine {
 
     /// Time-based transitions: APs going quiet and clients disappearing.
     fn tick(&mut self, now: Ts) {
-        self.mcast_prev.retain(|_, (ts, _)| *ts > now - 3600);
+        self.mcast_prev.retain(|_, (ts, ..)| *ts > now - 3600);
+        self.bss_prev.retain(|_, (ts, _)| *ts > now - 3600);
         let mut live = self.live.write().unwrap();
         let mut events = Vec::new();
         let mut offline = Vec::new();
@@ -922,8 +928,13 @@ impl Engine {
                 vec![mac(), Sql::Text(c.radio.clone()), Sql::Integer(c.channel), i(c.width), i(c.utilization), i(c.interference), i(c.other_bss_count), Sql::Integer(ts)],
             );
         }
-        // Per traffic type: rates summed over clients, and how many clients had any.
+        // Per traffic type: [to clients pps, from clients pps, to bytes/s, from bytes/s], and
+        // how many clients sent any. "To clients" is counted once per network (BSSID),
+        // "from clients" per client; only increases count (a client moving to another
+        // network, or a restarted counter, adds nothing rather than its whole total).
         let mut mcast: std::collections::BTreeMap<String, ([f64; 4], i64)> = std::collections::BTreeMap::new();
+        let rate = |c: i64, p: i64, dt: f64| (c - p).max(0) as f64 / dt;
+        let mut bss_done: std::collections::HashSet<&str> = std::collections::HashSet::new();
         for c in &s.clients {
             let m = c.multicast.as_ref();
             let t = m.map(|m| m.total());
@@ -938,26 +949,39 @@ impl Engine {
                 ],
             });
             let Some(m) = m else { continue };
-            if let Some((pts, prev)) = self.mcast_prev.get(&c.mac)
+            if bss_done.insert(c.bssid.as_str()) {
+                if let Some((pts, prev)) = self.bss_prev.get(&c.bssid)
+                    && ts > *pts
+                    && ts - pts <= 120
+                {
+                    let dt = (ts - pts) as f64;
+                    for (kind, cur) in &m.types {
+                        let p = prev.get(kind).copied().unwrap_or(*cur);
+                        let e = mcast.entry(kind.clone()).or_default();
+                        e.0[0] += rate(cur.tx_pkts, p.tx_pkts, dt);
+                        e.0[2] += rate(cur.tx_bytes, p.tx_bytes, dt);
+                    }
+                }
+                self.bss_prev.insert(c.bssid.clone(), (ts, m.types.clone()));
+            }
+            if let Some((pts, bssid, prev)) = self.mcast_prev.get(&c.mac)
+                && *bssid == c.bssid
                 && ts > *pts
                 && ts - pts <= 120
             {
                 let dt = (ts - pts) as f64;
                 for (kind, cur) in &m.types {
-                    let p = prev.get(kind).copied().unwrap_or_default();
-                    // A smaller value means the counters restarted (reconnect, roam).
-                    let d = |c: i64, p: i64| (if c >= p { c - p } else { c }) as f64 / dt;
-                    let r = [d(cur.tx_pkts, p.tx_pkts), d(cur.rx_pkts, p.rx_pkts), d(cur.tx_bytes, p.tx_bytes), d(cur.rx_bytes, p.rx_bytes)];
+                    let p = prev.get(kind).copied().unwrap_or(*cur);
+                    let (pk, by) = (rate(cur.rx_pkts, p.rx_pkts, dt), rate(cur.rx_bytes, p.rx_bytes, dt));
                     let e = mcast.entry(kind.clone()).or_default();
-                    for (a, b) in e.0.iter_mut().zip(r) {
-                        *a += b;
-                    }
-                    if r.iter().any(|x| *x > 0.0) {
+                    e.0[1] += pk;
+                    e.0[3] += by;
+                    if pk > 0.0 {
                         e.1 += 1;
                     }
                 }
             }
-            self.mcast_prev.insert(c.mac, (ts, m.types.clone()));
+            self.mcast_prev.insert(c.mac, (ts, c.bssid.clone(), m.types.clone()));
         }
         for (kind, (r, n)) in mcast {
             self.writer.send(Write::Metric {

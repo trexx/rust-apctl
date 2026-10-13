@@ -604,21 +604,28 @@ pub async fn multicast(State(s): State<AppState>, Query(q): Query<RangeQuery>) -
             .collect::<rusqlite::Result<Vec<_>>>()?;
         let cl = load(
             c,
-            Spec { table: "client_stats", key: "mac || '/' || coalesce(ap_mac, '')", extra: &[], cols: &["mcast_tx_pkts", "mcast_rx_pkts", "mcast_tx_bytes", "mcast_rx_bytes"] },
+            // Per client, AP and network: counters restart when a client moves.
+            Spec {
+                table: "client_stats",
+                key: "mac || '/' || coalesce(ap_mac, '') || '/' || coalesce(bssid, '')",
+                extra: &[],
+                cols: &["mcast_tx_pkts", "mcast_rx_pkts", "mcast_tx_bytes", "mcast_rx_bytes"],
+            },
             tier,
             from,
             to,
         )?;
         let mut per: HashMap<String, [f64; 4]> = HashMap::new();
         for (k, (_, smp)) in &cl {
-            let (mac, on) = k.split_once('/').unwrap_or((k, ""));
+            let mut parts = k.split('/');
+            let (mac, on) = (parts.next().unwrap_or_default(), parts.next().unwrap_or_default());
             if ap2.as_deref().is_some_and(|a| a != on) {
                 continue;
             }
             let e = per.entry(mac.to_string()).or_default();
-            for (_, dt, v) in rates(smp).points.iter().filter(|p| p.0 >= from) {
-                for i in 0..4 {
-                    e[i] += v[i].unwrap_or(0.0) * dt;
+            for (_, d) in increases(smp, from) {
+                for (a, b) in e.iter_mut().zip(&d) {
+                    *a += b.unwrap_or(0.0);
                 }
             }
         }
