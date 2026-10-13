@@ -11,7 +11,14 @@ import {
 } from "../api";
 import type { TimeSpan } from "../api";
 import { bitrate, bytes, duration, spanLabel } from "../format";
-import { COLORS, Chart, RangePicker, ZoomContext, useTimeSpan } from "./Chart";
+import {
+  COLORS,
+  Chart,
+  RangePicker,
+  SpanContext,
+  ZoomContext,
+  useTimeSpan,
+} from "./Chart";
 import { Loading } from "./common";
 
 export function BandPicker({
@@ -51,106 +58,108 @@ export function SiteActivity() {
   const a = useSiteActivity(range, band);
   return (
     <ZoomContext.Provider value={(from, to) => setRange({ from, to })}>
-      <div className="panel">
-        <div className="panel-head">
-          <div className="segmented" role="group" aria-label="View">
-            <button
-              className={view === "activity" ? "active" : ""}
-              onClick={() => setView("activity")}
-            >
-              Activity
-            </button>
-            <button
-              className={view === "airtime" ? "active" : ""}
-              onClick={() => setView("airtime")}
-            >
-              Airtime
-            </button>
+      <SpanContext.Provider value={range}>
+        <div className="panel">
+          <div className="panel-head">
+            <div className="segmented" role="group" aria-label="View">
+              <button
+                className={view === "activity" ? "active" : ""}
+                onClick={() => setView("activity")}
+              >
+                Activity
+              </button>
+              <button
+                className={view === "airtime" ? "active" : ""}
+                onClick={() => setView("airtime")}
+              >
+                Airtime
+              </button>
+            </div>
+            <BandPicker value={band} onChange={setBand} />
+            <span className="spacer" />
+            <RangePicker value={range} onChange={setRange} />
           </div>
-          <BandPicker value={band} onChange={setBand} />
-          <span className="spacer" />
-          <RangePicker value={range} onChange={setRange} />
-        </div>
-        {!a.data ? (
-          <Loading />
-        ) : view === "activity" ? (
-          <>
+          {!a.data ? (
+            <Loading />
+          ) : view === "activity" ? (
+            <>
+              <Chart
+                title="Wi-Fi traffic"
+                ts={a.data.activity.ts}
+                height={200}
+                format={(v) => bitrate(v / 8)}
+                formatRight={(v) => `${Math.round(v)}`}
+                series={[
+                  {
+                    label: "Download",
+                    values: a.data.activity.download_bps,
+                    color: COLORS.blue,
+                    fill: true,
+                  },
+                  {
+                    label: "Upload",
+                    values: a.data.activity.upload_bps,
+                    color: COLORS.purple,
+                  },
+                  {
+                    label: "Clients",
+                    values: a.data.activity.clients,
+                    color: COLORS.green,
+                    right: true,
+                    dashed: true,
+                  },
+                ]}
+              />
+              <Chart
+                title="TX retries and multicast"
+                ts={a.data.activity.ts}
+                height={120}
+                min={0}
+                format={(v) => `${v.toFixed(0)}%`}
+                series={[
+                  {
+                    label: "TX retries",
+                    values: a.data.activity.tx_retry_pct,
+                    color: COLORS.orange,
+                  },
+                  {
+                    label: "Multicast + broadcast share",
+                    values: a.data.activity.multicast_pct,
+                    color: COLORS.teal,
+                    dashed: true,
+                  },
+                ]}
+              />
+            </>
+          ) : (
             <Chart
-              title="Wi-Fi traffic"
-              ts={a.data.activity.ts}
-              height={200}
-              format={(v) => bitrate(v / 8)}
-              formatRight={(v) => `${Math.round(v)}`}
-              series={[
-                {
-                  label: "Download",
-                  values: a.data.activity.download_bps,
-                  color: COLORS.blue,
-                  fill: true,
-                },
-                {
-                  label: "Upload",
-                  values: a.data.activity.upload_bps,
-                  color: COLORS.purple,
-                },
-                {
-                  label: "Clients",
-                  values: a.data.activity.clients,
-                  color: COLORS.green,
-                  right: true,
-                  dashed: true,
-                },
-              ]}
-            />
-            <Chart
-              title="TX retries and multicast"
-              ts={a.data.activity.ts}
-              height={120}
+              title="Airtime (channel utilisation, average across radios)"
+              ts={a.data.airtime.ts}
+              height={240}
               min={0}
               format={(v) => `${v.toFixed(0)}%`}
               series={[
                 {
-                  label: "TX retries",
-                  values: a.data.activity.tx_retry_pct,
+                  label: "Total",
+                  values: a.data.airtime.total,
                   color: COLORS.orange,
+                  fill: true,
                 },
                 {
-                  label: "Multicast + broadcast share",
-                  values: a.data.activity.multicast_pct,
-                  color: COLORS.teal,
-                  dashed: true,
+                  label: "Own traffic",
+                  values: a.data.airtime.own_traffic,
+                  color: COLORS.blue,
+                },
+                {
+                  label: "External interference",
+                  values: a.data.airtime.external_interference,
+                  color: COLORS.red,
                 },
               ]}
             />
-          </>
-        ) : (
-          <Chart
-            title="Airtime (channel utilisation, average across radios)"
-            ts={a.data.airtime.ts}
-            height={240}
-            min={0}
-            format={(v) => `${v.toFixed(0)}%`}
-            series={[
-              {
-                label: "Total",
-                values: a.data.airtime.total,
-                color: COLORS.orange,
-                fill: true,
-              },
-              {
-                label: "Own traffic",
-                values: a.data.airtime.own_traffic,
-                color: COLORS.blue,
-              },
-              {
-                label: "External interference",
-                values: a.data.airtime.external_interference,
-                color: COLORS.red,
-              },
-            ]}
-          />
-        )}
-      </div>
+          )}
+        </div>
+      </SpanContext.Provider>
     </ZoomContext.Provider>
   );
 }
@@ -500,18 +509,20 @@ export function MulticastPanel({
       </div>
       <div className="mcast-layout">
         <div>
-          <Chart
-            title={`Packets per second by type, ${dir === "tx" ? "delivered to clients" : "sent by clients"}`}
-            ts={m.data.ts}
-            height={160}
-            min={0}
-            format={(v) => `${v.toFixed(v < 10 ? 1 : 0)}/s`}
-            series={kinds.map(([k, v]) => ({
-              label: MCAST_LABEL[k] ?? k,
-              values: v[`${dir}_pps`],
-              color: MCAST_COLORS[k] ?? COLORS.teal,
-            }))}
-          />
+          <SpanContext.Provider value={span}>
+            <Chart
+              title={`Packets per second by type, ${dir === "tx" ? "delivered to clients" : "sent by clients"}`}
+              ts={m.data.ts}
+              height={160}
+              min={0}
+              format={(v) => `${v.toFixed(v < 10 ? 1 : 0)}/s`}
+              series={kinds.map(([k, v]) => ({
+                label: MCAST_LABEL[k] ?? k,
+                values: v[`${dir}_pps`],
+                color: MCAST_COLORS[k] ?? COLORS.teal,
+              }))}
+            />
+          </SpanContext.Provider>
           <div className="mcast-types small">
             {kinds.map(([k, v]) => (
               <span key={k}>

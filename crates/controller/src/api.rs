@@ -133,9 +133,39 @@ async fn status(State(s): State<AppState>) -> ApiResult {
     })))
 }
 
+/// APs in the database, as views shaped like a live one but offline: shown
+/// after a restart until each AP reports again.
+async fn stored_devices(store: &Arc<Store>, only: Option<String>) -> Result<Vec<Value>, ApiError> {
+    read(store, Db::Config, move |c| {
+        let mut stmt = c.prepare(
+            "SELECT mac, COALESCE(name, hostname), model, model_display, version, ip, serial, first_seen, last_seen, uptime FROM devices WHERE ?1 IS NULL OR mac = ?1",
+        )?;
+        let rows = stmt
+            .query_map([only.as_deref()], |r| {
+                Ok(json!({
+                    "snapshot": {
+                        "ap": {
+                            "mac": r.get::<_, String>(0)?, "hostname": r.get::<_, Option<String>>(1)?, "model": r.get::<_, Option<String>>(2)?,
+                            "model_display": r.get::<_, Option<String>>(3)?, "version": r.get::<_, Option<String>>(4)?, "ip": r.get::<_, Option<String>>(5)?,
+                            "serial": r.get::<_, Option<String>>(6)?, "uptime": null, "cpu": null, "mem": null, "load1": null, "load5": null,
+                            "load15": null, "mem_total": null, "mem_used": null, "satisfaction": null,
+                        },
+                        "uplink": null, "radios": [], "vaps": [], "clients": [], "has_vap_table": false,
+                    },
+                    "online": false, "first_seen": r.get::<_, Option<i64>>(7)?.unwrap_or(0), "last_seen": r.get::<_, Option<i64>>(8)?.unwrap_or(0),
+                    "peer": "", "interval": 0, "reconfiguring": false, "last_config_push": null, "stored_only": true,
+                }))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    })
+    .await
+}
+
 async fn devices(State(s): State<AppState>) -> ApiResult {
+    let stored = stored_devices(&s.store, None).await?;
     let live = s.live.read().unwrap();
-    let list: Vec<Value> = live
+    let mut list: Vec<Value> = live
         .devices
         .iter()
         .map(|(mac, d)| {
@@ -156,15 +186,34 @@ async fn devices(State(s): State<AppState>) -> ApiResult {
             })
         })
         .collect();
+    for d in stored {
+        let ap = &d["snapshot"]["ap"];
+        if ap["mac"].as_str().and_then(|m| m.parse().ok()).is_some_and(|m| live.devices.contains_key(&m)) {
+            continue;
+        }
+        list.push(json!({
+            "mac": ap["mac"], "name": ap["hostname"], "model": ap["model"], "model_display": ap["model_display"], "version": ap["version"],
+            "ip": ap["ip"], "online": false, "reconfiguring": false, "first_seen": d["first_seen"], "last_seen": d["last_seen"], "uptime": null,
+            "cpu": null, "mem": null, "load1": null, "satisfaction": null, "clients": 0, "uplink": null, "radios": [], "last_config_push": null,
+            "stored_only": true,
+        }));
+    }
     Ok(Json(Value::Array(list)))
 }
 
 async fn device(State(s): State<AppState>, Path(mac): Path<String>) -> ApiResult {
     let mac = parse_mac(&mac)?;
-    let live = s.live.read().unwrap();
-    let d = live.devices.get(&mac).ok_or_else(|| ApiError(StatusCode::NOT_FOUND, "unknown device".into()))?;
-    let clients: Vec<_> = live.clients.values().filter(|c| c.connected && c.sample.ap_mac == mac).collect();
-    Ok(Json(json!({ "device": d, "clients": clients })))
+    {
+        let live = s.live.read().unwrap();
+        if let Some(d) = live.devices.get(&mac) {
+            let clients: Vec<_> = live.clients.values().filter(|c| c.connected && c.sample.ap_mac == mac).collect();
+            return Ok(Json(json!({ "device": d, "clients": clients })));
+        }
+    }
+    // Known but not reporting since apctl started: offline, with what we stored.
+    let stored = stored_devices(&s.store, Some(mac.to_string())).await?;
+    let d = stored.into_iter().next().ok_or_else(|| ApiError(StatusCode::NOT_FOUND, "unknown device".into()))?;
+    Ok(Json(json!({ "device": d, "clients": [] })))
 }
 
 async fn clients(State(s): State<AppState>) -> ApiResult {

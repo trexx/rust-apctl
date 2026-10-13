@@ -13,6 +13,31 @@ import { isFixed, spanBounds } from "../api";
 import type { TimeSpan } from "../api";
 import { duration, fromLocalInput, spanLabel, toLocalInput } from "../format";
 
+/** The page's time span: charts show exactly this window, gaps included. */
+export const SpanContext = createContext<TimeSpan | null>(null);
+
+/** Breaks lines where samples are missing for much longer than usual (an AP
+ *  offline, apctl not running) by inserting a point with no values. */
+function withGaps(ts: number[], cols: (number | null)[][]): uPlot.AlignedData {
+  if (ts.length < 3) return [ts, ...cols] as uPlot.AlignedData;
+  const steps = ts
+    .slice(1)
+    .map((t, i) => t - ts[i])
+    .sort((a, b) => a - b);
+  const typical = steps[Math.floor(steps.length / 2)];
+  const outTs: number[] = [ts[0]];
+  const out = cols.map((c) => [c[0]]);
+  for (let i = 1; i < ts.length; i++) {
+    if (ts[i] - ts[i - 1] > Math.max(3 * typical, 120)) {
+      outTs.push(Math.round((ts[i] + ts[i - 1]) / 2));
+      out.forEach((c) => c.push(null));
+    }
+    outTs.push(ts[i]);
+    out.forEach((c, j) => c.push(cols[j][i]));
+  }
+  return [outTs, ...out] as uPlot.AlignedData;
+}
+
 /** When provided, dragging across a chart selects that time window for the whole page. */
 export const ZoomContext = createContext<
   ((from: number, to: number) => void) | null
@@ -53,7 +78,9 @@ interface Props {
 
 /** Axis width that fits its longest tick label (11px font). */
 const fitLabels = (_u: uPlot, values: string[] | null) =>
-  values && values.length ? Math.max(36, Math.max(...values.map((v) => v.length)) * 6.6 + 16) : 48;
+  values && values.length
+    ? Math.max(36, Math.max(...values.map((v) => v.length)) * 6.6 + 16)
+    : 48;
 
 function cssVar(name: string): string {
   return getComputedStyle(document.documentElement)
@@ -76,6 +103,9 @@ export function Chart({
   const box = useRef<HTMLDivElement>(null);
   const plot = useRef<uPlot | null>(null);
   const zoom = useContext(ZoomContext);
+  const span = useContext(SpanContext);
+  const spanRef = useRef(span);
+  spanRef.current = span;
   const zoomRef = useRef(zoom);
   zoomRef.current = zoom;
 
@@ -122,7 +152,12 @@ export function Chart({
         : {},
       legend: { show: true, live: true },
       scales: {
-        x: { time: true },
+        x: {
+          time: true,
+          // The selected window, so charts line up and missing data shows as a gap.
+          range: (_u, lo, hi) =>
+            spanRef.current ? spanBounds(spanRef.current) : [lo, hi],
+        },
         y: {
           range: (_u, lo, hi) => [
             min ?? Math.min(0, lo),
@@ -172,7 +207,10 @@ export function Chart({
         })),
       ],
     };
-    const data = [ts, ...series.map((s) => s.values)] as uPlot.AlignedData;
+    const data = withGaps(
+      ts,
+      series.map((s) => s.values),
+    );
     plot.current = new uPlot(opts, data, el);
     const ro = new ResizeObserver(() =>
       plot.current?.setSize({ width: el.clientWidth, height }),
@@ -187,11 +225,13 @@ export function Chart({
   }, [shape]);
 
   useEffect(() => {
-    plot.current?.setData([
-      ts,
-      ...series.map((s) => s.values),
-    ] as uPlot.AlignedData);
-  }, [ts, series]);
+    plot.current?.setData(
+      withGaps(
+        ts,
+        series.map((s) => s.values),
+      ),
+    );
+  }, [ts, series, span]);
 
   const empty = ts.length === 0;
   return (

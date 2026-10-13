@@ -183,6 +183,8 @@ export interface DeviceDetail {
     interval: number;
     reconfiguring: boolean;
     last_config_push: number | null;
+    /** Known from the database only: hasn't reported since apctl started. */
+    stored_only?: boolean;
   };
   clients: ClientView[];
 }

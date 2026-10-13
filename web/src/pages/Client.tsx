@@ -14,6 +14,7 @@ import {
   COLORS,
   Chart,
   RangePicker,
+  SpanContext,
   ZoomContext,
   useTimeSpan,
 } from "../components/Chart";
@@ -55,163 +56,172 @@ export function Client() {
 
   return (
     <ZoomContext.Provider value={(from, to) => setRange({ from, to })}>
-      <div className="page">
-        <div className="page-head">
-          <AliasHeader
-            mac={mac}
-            connected={c?.connected}
-            alias={c?.alias ?? listed?.alias ?? null}
-            note={c?.note ?? listed?.note ?? null}
-            hostname={s?.hostname ?? listed?.sample.hostname ?? null}
-          />
-          <span className="spacer" />
-          <RangePicker value={range} onChange={setRange} />
-        </div>
-        {client.error && (
-          <div className="banner">
-            Not seen since the controller started; showing stored history only.
+      <SpanContext.Provider value={range}>
+        <div className="page">
+          <div className="page-head">
+            <AliasHeader
+              mac={mac}
+              connected={c?.connected}
+              alias={c?.alias ?? listed?.alias ?? null}
+              note={c?.note ?? listed?.note ?? null}
+              hostname={s?.hostname ?? listed?.sample.hostname ?? null}
+            />
+            <span className="spacer" />
+            <RangePicker value={range} onChange={setRange} />
           </div>
-        )}
-
-        {s && c && (
-          <div className="stats">
-            <Stat
-              label="Connected to"
-              value={
-                c.connected ? (
-                  <Link to={`/devices/${s.ap_mac}`}>
-                    {names.get(s.ap_mac) ?? s.ap_mac}
-                  </Link>
-                ) : (
-                  "Disconnected"
-                )
-              }
-              sub={
-                c.connected
-                  ? `${s.essid} · ${band(s.radio)} ch ${s.channel}`
-                  : `last seen ${ago(c.last_seen)}`
-              }
-            />
-            <Stat
-              label="Signal"
-              value={<Signal dbm={s.signal} />}
-              sub={`noise ${s.noise ?? "—"} dBm`}
-            />
-            <Stat
-              label="Rate (down/up)"
-              value={`${phy(s.tx_rate)} / ${phy(s.rx_rate)}`}
-              sub={
-                s.wifi_gen ? `802.11${s.wifi_gen}, ${s.nss ?? "?"} streams` : ""
-              }
-            />
-            <Stat
-              label="Session"
-              value={duration(s.uptime)}
-              sub={`${bytes(s.tx_bytes)} down · ${bytes(s.rx_bytes)} up · satisfaction ${s.satisfaction ?? "—"}`}
-            />
-          </div>
-        )}
-
-        {!series.data ? (
-          series.error ? (
-            <ErrorNote error={series.error} />
-          ) : (
-            <Loading />
-          )
-        ) : (
-          <div className="grid2">
-            <div className="panel">
-              <Chart
-                title="Signal and noise"
-                ts={ts}
-                format={(v) => `${Math.round(v)} dBm`}
-                min={-100}
-                max={-20}
-                series={[
-                  {
-                    label: "Signal",
-                    values: f!.signal,
-                    color: COLORS.blue,
-                    fill: true,
-                  },
-                  { label: "Noise", values: f!.noise, color: COLORS.red },
-                ]}
-              />
-              <Chart
-                title="PHY rate"
-                ts={ts}
-                format={(v) => `${Math.round(v)} Mbps`}
-                series={[
-                  {
-                    label: "Down (AP→client)",
-                    values: mbps(f!.tx_rate),
-                    color: COLORS.green,
-                  },
-                  {
-                    label: "Up (client→AP)",
-                    values: mbps(f!.rx_rate),
-                    color: COLORS.purple,
-                  },
-                ]}
-              />
+          {client.error && (
+            <div className="banner">
+              Not seen since the controller started; showing stored history
+              only.
             </div>
-            <div className="panel">
-              <Chart
-                title="Throughput"
-                ts={ts}
-                format={(v) => bitrate(v / 8)}
-                series={[
-                  {
-                    label: "Down",
-                    values: bits(f!.tx_bytes),
-                    color: COLORS.blue,
-                    fill: true,
-                  },
-                  {
-                    label: "Up",
-                    values: bits(f!.rx_bytes),
-                    color: COLORS.purple,
-                  },
-                ]}
-              />
-              <Chart
-                title="Retries and latency"
-                ts={ts}
-                format={(v) => v.toFixed(v < 10 ? 1 : 0)}
-                series={[
-                  {
-                    label: "TX retries/s",
-                    values: f!.tx_retries,
-                    color: COLORS.orange,
-                  },
-                  {
-                    label: "Latency (ms)",
-                    values: f!.latency_avg,
-                    color: COLORS.teal,
-                  },
-                ]}
-              />
-            </div>
-          </div>
-        )}
-
-        {s?.multicast && (
-          <ClientMulticast mac={mac} m={s.multicast} all={clients.data ?? []} />
-        )}
-
-        <h2>Timeline</h2>
-        <div className="panel">
-          {events.data ? (
-            <EventList
-              events={events.data}
-              names={names}
-              clientNames={cnames}
-            />
-          ) : (
-            <Loading />
           )}
+
+          {s && c && (
+            <div className="stats">
+              <Stat
+                label="Connected to"
+                value={
+                  c.connected ? (
+                    <Link to={`/devices/${s.ap_mac}`}>
+                      {names.get(s.ap_mac) ?? s.ap_mac}
+                    </Link>
+                  ) : (
+                    "Disconnected"
+                  )
+                }
+                sub={
+                  c.connected
+                    ? `${s.essid} · ${band(s.radio)} ch ${s.channel}`
+                    : `last seen ${ago(c.last_seen)}`
+                }
+              />
+              <Stat
+                label="Signal"
+                value={<Signal dbm={s.signal} />}
+                sub={`noise ${s.noise ?? "—"} dBm`}
+              />
+              <Stat
+                label="Rate (down/up)"
+                value={`${phy(s.tx_rate)} / ${phy(s.rx_rate)}`}
+                sub={
+                  s.wifi_gen
+                    ? `802.11${s.wifi_gen}, ${s.nss ?? "?"} streams`
+                    : ""
+                }
+              />
+              <Stat
+                label="Session"
+                value={duration(s.uptime)}
+                sub={`${bytes(s.tx_bytes)} down · ${bytes(s.rx_bytes)} up · satisfaction ${s.satisfaction ?? "—"}`}
+              />
+            </div>
+          )}
+
+          {!series.data ? (
+            series.error ? (
+              <ErrorNote error={series.error} />
+            ) : (
+              <Loading />
+            )
+          ) : (
+            <div className="grid2">
+              <div className="panel">
+                <Chart
+                  title="Signal and noise"
+                  ts={ts}
+                  format={(v) => `${Math.round(v)} dBm`}
+                  min={-100}
+                  max={-20}
+                  series={[
+                    {
+                      label: "Signal",
+                      values: f!.signal,
+                      color: COLORS.blue,
+                      fill: true,
+                    },
+                    { label: "Noise", values: f!.noise, color: COLORS.red },
+                  ]}
+                />
+                <Chart
+                  title="PHY rate"
+                  ts={ts}
+                  format={(v) => `${Math.round(v)} Mbps`}
+                  series={[
+                    {
+                      label: "Down (AP→client)",
+                      values: mbps(f!.tx_rate),
+                      color: COLORS.green,
+                    },
+                    {
+                      label: "Up (client→AP)",
+                      values: mbps(f!.rx_rate),
+                      color: COLORS.purple,
+                    },
+                  ]}
+                />
+              </div>
+              <div className="panel">
+                <Chart
+                  title="Throughput"
+                  ts={ts}
+                  format={(v) => bitrate(v / 8)}
+                  series={[
+                    {
+                      label: "Down",
+                      values: bits(f!.tx_bytes),
+                      color: COLORS.blue,
+                      fill: true,
+                    },
+                    {
+                      label: "Up",
+                      values: bits(f!.rx_bytes),
+                      color: COLORS.purple,
+                    },
+                  ]}
+                />
+                <Chart
+                  title="Retries and latency"
+                  ts={ts}
+                  format={(v) => v.toFixed(v < 10 ? 1 : 0)}
+                  series={[
+                    {
+                      label: "TX retries/s",
+                      values: f!.tx_retries,
+                      color: COLORS.orange,
+                    },
+                    {
+                      label: "Latency (ms)",
+                      values: f!.latency_avg,
+                      color: COLORS.teal,
+                    },
+                  ]}
+                />
+              </div>
+            </div>
+          )}
+
+          {s?.multicast && (
+            <ClientMulticast
+              mac={mac}
+              m={s.multicast}
+              all={clients.data ?? []}
+            />
+          )}
+
+          <h2>Timeline</h2>
+          <div className="panel">
+            {events.data ? (
+              <EventList
+                events={events.data}
+                names={names}
+                clientNames={cnames}
+              />
+            ) : (
+              <Loading />
+            )}
+          </div>
         </div>
-      </div>
+      </SpanContext.Provider>
     </ZoomContext.Provider>
   );
 }
