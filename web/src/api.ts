@@ -377,7 +377,8 @@ export interface Connectivity {
   dns_pct: number | null;
   success_pct: number | null;
   failed_at: Record<string, number>;
-  median_ms: { association: number | null; authentication: number | null; dhcp: number | null };
+  /** Average milliseconds per stage, over the attempts that have it. */
+  latency_ms: { association: number | null; authentication: number | null; dhcp: number | null; dns: number | null; total: number | null };
 }
 
 export interface RadioRetries {

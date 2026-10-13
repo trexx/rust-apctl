@@ -358,8 +358,8 @@ export function Connectivity() {
                 .filter(([, n]) => n > 0)
                 .map(([k, n]) => `${k} ${n}`)
                 .join(", ")})`}
-            {d.median_ms.dhcp !== null &&
-              ` · typical: associate ${d.median_ms.association ?? "—"} ms, authenticate ${d.median_ms.authentication ?? "—"} ms, DHCP ${d.median_ms.dhcp} ms`}
+            {d.latency_ms?.total != null &&
+              ` · average time to connect ${d.latency_ms.total} ms (associate ${d.latency_ms.association ?? "—"}, authenticate ${d.latency_ms.authentication ?? "—"}, DHCP ${d.latency_ms.dhcp ?? "—"}, DNS ${d.latency_ms.dns ?? "—"})`}
           </div>
         </>
       )}
