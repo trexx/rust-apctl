@@ -278,6 +278,21 @@ async fn dryrun(State(s): State<AppState>) -> ApiResult {
             }
             v
         };
+        // The snapshot records the cfgversion the other controller expected for
+        // each AP at import time. If the AP now runs another one, that controller
+        // has pushed new config since: the settings are probably out of date.
+        let snapshot_version = live.state.as_deref().and_then(|st| {
+            st["devices"].as_array()?.iter().find(|x| x["mac"].as_str().is_some_and(|m| m.eq_ignore_ascii_case(&mac.to_string())))?["cfgversion"]
+                .as_str()
+                .map(str::to_string)
+        });
+        let running_version = d.snapshot.ap.cfgversion.clone();
+        let settings_stale = matches!((&snapshot_version, &running_version), (Some(a), Some(b)) if a != b);
+        let entry = |status: &str, extra: Value| {
+            let mut v = entry(status, extra);
+            v["settings_stale"] = json!(settings_stale);
+            v
+        };
         let (Some(render), Some(state)) = (&s.renderer, live.state.as_deref()) else {
             devices.push(entry(if s.renderer.is_none() { "no_generator" } else { "no_settings" }, json!({})));
             continue;

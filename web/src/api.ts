@@ -285,6 +285,8 @@ export interface DryRun {
     comparison?: { mgmt_cfg: FieldComparison; system_cfg: FieldComparison };
     against_redacted?: boolean;
     error?: string;
+    /** The AP runs a different config version than when the settings were imported. */
+    settings_stale?: boolean;
   }[];
   history: { ts: number; mac: Mac; cfgversion: string | null; matches: boolean; comparison: { system_cfg?: FieldComparison; error?: string } | null }[];
 }

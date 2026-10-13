@@ -1,3 +1,4 @@
+import { Link } from "react-router-dom";
 import { useDevices, useDryRun } from "../api";
 import type { FieldComparison } from "../api";
 import { ErrorNote, Loading, deviceNames } from "../components/common";
@@ -53,6 +54,12 @@ export function DryRunPage() {
         <h1>Dry run</h1>
         <span className="muted">what apctl would push, compared with what the current controller pushes. Nothing is sent to APs.</span>
       </div>
+      {d.devices.some((x) => x.settings_stale) && (
+        <div className="banner">
+          The current controller has pushed new config since the settings were imported, so differences below may just be those
+          changes. <Link to="/settings">Re-import the settings</Link> to compare against what is configured now.
+        </div>
+      )}
       <h2>Now</h2>
       <div className="cards">
         {d.devices.map((x) => (
@@ -70,6 +77,7 @@ export function DryRunPage() {
               </>
             )}
             {x.error && <div className="error small">{x.error}</div>}
+            {x.settings_stale && <div className="muted small">Settings changed on the current controller since the import.</div>}
           </div>
         ))}
       </div>
