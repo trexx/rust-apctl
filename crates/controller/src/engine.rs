@@ -44,6 +44,8 @@ pub enum Input {
     /// A suspicious network found for the first time: record it, and report it
     /// as an event unless it was already acknowledged.
     ThreatFound { ts: Ts, kind: &'static str, bssid: String, device_mac: Option<Mac>, data: Value, notify: bool },
+    /// Mark every alert read.
+    AlertsRead,
     /// Acknowledge a finding with an optional note (`Some`), or withdraw the acknowledgement (`None`).
     AckThreat { ts: Ts, kind: &'static str, bssid: String, note: Option<Option<String>> },
 }
@@ -76,6 +78,7 @@ pub enum LiveMsg {
     Clients,
     Event(Event),
     Log(LogLine),
+    Alert(crate::alerts::AlertMsg),
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -299,6 +302,7 @@ impl Engine {
                     self.emit(&mut live, ev(ts, "network_threat", device_mac, None, data));
                 }
             }
+            Input::AlertsRead => self.writer.exec(Db::Config, "UPDATE alerts SET read = 1 WHERE read = 0", vec![]),
             Input::AckThreat { ts, kind, bssid, note } => match note {
                 Some(note) => self.writer.exec(
                     Db::Config,

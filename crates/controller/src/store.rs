@@ -178,6 +178,10 @@ CREATE TABLE IF NOT EXISTS neighbors (
     security TEXT, signal INTEGER, best_signal INTEGER, noise INTEGER, is_unifi INTEGER NOT NULL DEFAULT 0, ap_name TEXT,
     model TEXT, first_seen INTEGER NOT NULL, last_seen INTEGER NOT NULL, PRIMARY KEY (bssid, ap_mac)) WITHOUT ROWID;
 CREATE INDEX IF NOT EXISTS neighbors_seen ON neighbors (last_seen);
+CREATE TABLE IF NOT EXISTS alerts (
+    id TEXT PRIMARY KEY, ts INTEGER NOT NULL, key TEXT NOT NULL, category TEXT NOT NULL, severity TEXT NOT NULL, entity TEXT NOT NULL,
+    title TEXT NOT NULL, message TEXT NOT NULL, link TEXT, tag TEXT NOT NULL, resolved_ts INTEGER, read INTEGER NOT NULL DEFAULT 0);
+CREATE INDEX IF NOT EXISTS alerts_ts ON alerts (ts);
 CREATE TABLE IF NOT EXISTS network_acks (
     kind TEXT NOT NULL, bssid TEXT NOT NULL, note TEXT, ts INTEGER NOT NULL, PRIMARY KEY (kind, bssid)) WITHOUT ROWID;
 CREATE TABLE IF NOT EXISTS network_threats (

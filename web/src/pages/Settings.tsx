@@ -2,6 +2,7 @@ import { useState } from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import { importState, useMe, useSettingsState } from "../api";
 import { ErrorNote, Loading } from "../components/common";
+import { NotificationSettings } from "../components/Alerts";
 import { ago, clock } from "../format";
 
 export function Settings() {
@@ -43,6 +44,9 @@ export function Settings() {
       <div className="page-head">
         <h1>Settings</h1>
       </div>
+      <h2>Notifications</h2>
+      <NotificationSettings />
+
       <h2>Controller settings</h2>
       <div className="panel">
         {s ? (

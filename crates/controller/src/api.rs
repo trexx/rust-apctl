@@ -60,6 +60,8 @@ pub fn router(state: AppState) -> Router {
         .route("/api/site/top", get(crate::insights::top))
         .route("/api/site/connectivity", get(crate::connections::connectivity))
         .route("/api/connections", get(crate::connections::list))
+        .route("/api/alerts", get(crate::alerts::list))
+        .route("/api/alerts/read", axum::routing::post(crate::alerts::mark_read))
         .route("/api/wlans", get(crate::insights::wlans))
         .route("/api/roaming", get(crate::connections::roaming))
         .route("/api/site/density", get(crate::insights::density))

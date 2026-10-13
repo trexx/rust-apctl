@@ -758,7 +758,30 @@ type LiveMsg =
   | { type: "clients" }
   | ({ type: "event" } & AppEvent)
   | ({ type: "log" } & LogLine)
+  | ({ type: "alert"; action: "raised" | "resolved" } & AlertItem)
   | { type: "resync" };
+
+export type AlertCategory = "ap_status" | "security" | "health" | "changes";
+
+export interface AlertItem {
+  id: string;
+  ts: number;
+  key: string;
+  category: AlertCategory;
+  severity: "high" | "medium" | "low" | "info";
+  entity: string;
+  title: string;
+  message: string;
+  link: string | null;
+  tag: string;
+  resolved_ts: number | null;
+  read?: boolean;
+}
+
+export const useAlerts = () =>
+  useQuery({ queryKey: ["alerts"], queryFn: () => get<{ alerts: AlertItem[]; unread: number }>("/api/alerts?limit=50"), refetchInterval: 120_000 });
+
+export const markAlertsRead = () => send("POST", "/api/alerts/read", {});
 
 /**
  * Keeps queries fresh from the server's WebSocket: device and client changes
@@ -807,6 +830,13 @@ export function useLiveUpdates(): void {
             break;
           case "log":
             invalidate("logs");
+            break;
+          case "alert":
+            invalidate("alerts");
+            // The server stores alerts within a second of announcing them: look again then.
+            window.setTimeout(() => void qc.invalidateQueries({ queryKey: ["alerts"] }), 1500);
+            // The notifier decides whether this browser shows it.
+            window.dispatchEvent(new CustomEvent("apctl:alert", { detail: msg }));
             break;
           case "resync":
             void qc.invalidateQueries();

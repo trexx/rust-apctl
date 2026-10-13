@@ -2,7 +2,13 @@ import { Component, StrictMode } from "react";
 import type { ReactNode } from "react";
 import { createRoot } from "react-dom/client";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { BrowserRouter, NavLink, Route, Routes, useLocation } from "react-router-dom";
+import {
+  BrowserRouter,
+  NavLink,
+  Route,
+  Routes,
+  useLocation,
+} from "react-router-dom";
 import { useEffect, useState } from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import { login, logout, useLiveUpdates, useMe, useStatus } from "./api";
@@ -15,6 +21,7 @@ import { Logs } from "./pages/Logs";
 import { DryRunPage } from "./pages/DryRun";
 import { Config } from "./pages/Config";
 import { Networks } from "./pages/Networks";
+import { AlertBell, useNotifier } from "./components/Alerts";
 import { Settings } from "./pages/Settings";
 import { Radios } from "./pages/Radios";
 import "./styles.css";
@@ -24,16 +31,25 @@ const queryClient = new QueryClient({
 });
 
 /** Shows a failing page's error instead of unmounting the whole app. */
-class ErrorBoundary extends Component<{ children: ReactNode; resetKey: string }, { error: Error | null }> {
+class ErrorBoundary extends Component<
+  { children: ReactNode; resetKey: string },
+  { error: Error | null }
+> {
   state = { error: null as Error | null };
   static getDerivedStateFromError(error: Error) {
     return { error };
   }
   componentDidUpdate(prev: { resetKey: string }) {
-    if (prev.resetKey !== this.props.resetKey && this.state.error) this.setState({ error: null });
+    if (prev.resetKey !== this.props.resetKey && this.state.error)
+      this.setState({ error: null });
   }
   render() {
-    if (this.state.error) return <div className="error pad">This page failed to render: {this.state.error.message}</div>;
+    if (this.state.error)
+      return (
+        <div className="error pad">
+          This page failed to render: {this.state.error.message}
+        </div>
+      );
     return this.props.children;
   }
 }
@@ -65,14 +81,30 @@ function Login() {
         <div className="brand">apctl</div>
         <label>
           Username
-          <input className="search" autoFocus autoComplete="username" value={username} onChange={(e) => setUsername(e.target.value)} />
+          <input
+            className="search"
+            autoFocus
+            autoComplete="username"
+            value={username}
+            onChange={(e) => setUsername(e.target.value)}
+          />
         </label>
         <label>
           Password
-          <input className="search" type="password" autoComplete="current-password" value={password} onChange={(e) => setPassword(e.target.value)} />
+          <input
+            className="search"
+            type="password"
+            autoComplete="current-password"
+            value={password}
+            onChange={(e) => setPassword(e.target.value)}
+          />
         </label>
         {error && <div className="error small">{error}</div>}
-        <button className="btn primary" type="submit" disabled={busy || !username || !password}>
+        <button
+          className="btn primary"
+          type="submit"
+          disabled={busy || !username || !password}
+        >
           {busy ? "Signing in…" : "Sign in"}
         </button>
       </form>
@@ -85,17 +117,25 @@ function Gate() {
   const qc = useQueryClient();
   const me = useMe();
   useEffect(() => {
-    const onUnauthorized = () => void qc.invalidateQueries({ queryKey: ["me"] });
+    const onUnauthorized = () =>
+      void qc.invalidateQueries({ queryKey: ["me"] });
     window.addEventListener("apctl:unauthorized", onUnauthorized);
-    return () => window.removeEventListener("apctl:unauthorized", onUnauthorized);
+    return () =>
+      window.removeEventListener("apctl:unauthorized", onUnauthorized);
   }, [qc]);
   if (me.isLoading) return null;
   if (me.data && me.data.auth && !me.data.user) return <Login />;
-  return <Shell user={me.data?.user ?? null} readOnly={me.data?.read_only ?? false} />;
+  return (
+    <Shell
+      user={me.data?.user ?? null}
+      readOnly={me.data?.read_only ?? false}
+    />
+  );
 }
 
 function Shell({ user, readOnly }: { user: string | null; readOnly: boolean }) {
   useLiveUpdates();
+  useNotifier();
   const qc = useQueryClient();
   const status = useStatus();
   const location = useLocation();
@@ -116,13 +156,17 @@ function Shell({ user, readOnly }: { user: string | null; readOnly: boolean }) {
           <NavLink to="/settings">Settings</NavLink>
         </nav>
         <span className="spacer" />
+        <AlertBell />
         {status.data && (
           <span className="mode" title={status.data.source}>
             {status.data.mode} mode
           </span>
         )}
         {readOnly && (
-          <span className="mode" title="No users are configured, so changes are disabled">
+          <span
+            className="mode"
+            title="No users are configured, so changes are disabled"
+          >
             read-only
           </span>
         )}
@@ -145,20 +189,23 @@ function Shell({ user, readOnly }: { user: string | null; readOnly: boolean }) {
       </header>
       <main>
         <ErrorBoundary resetKey={location.pathname}>
-        <Routes>
-          <Route path="/" element={<Overview />} />
-          <Route path="/devices/:mac" element={<Device />} />
-          <Route path="/clients" element={<Clients />} />
-          <Route path="/radios" element={<Radios />} />
-          <Route path="/clients/:mac" element={<Client />} />
-          <Route path="/events" element={<Events />} />
-          <Route path="/logs" element={<Logs />} />
-          <Route path="/dryrun" element={<DryRunPage />} />
-          <Route path="/config" element={<Config />} />
-          <Route path="/networks" element={<Networks />} />
-          <Route path="/settings" element={<Settings />} />
-          <Route path="*" element={<div className="pad muted">Page not found</div>} />
-        </Routes>
+          <Routes>
+            <Route path="/" element={<Overview />} />
+            <Route path="/devices/:mac" element={<Device />} />
+            <Route path="/clients" element={<Clients />} />
+            <Route path="/radios" element={<Radios />} />
+            <Route path="/clients/:mac" element={<Client />} />
+            <Route path="/events" element={<Events />} />
+            <Route path="/logs" element={<Logs />} />
+            <Route path="/dryrun" element={<DryRunPage />} />
+            <Route path="/config" element={<Config />} />
+            <Route path="/networks" element={<Networks />} />
+            <Route path="/settings" element={<Settings />} />
+            <Route
+              path="*"
+              element={<div className="pad muted">Page not found</div>}
+            />
+          </Routes>
         </ErrorBoundary>
       </main>
     </div>
