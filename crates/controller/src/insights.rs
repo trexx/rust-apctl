@@ -137,7 +137,15 @@ pub async fn activity(State(s): State<AppState>, Query(q): Query<RangeQuery>) ->
         // VAP counters: bytes, packets, retries, multicast, drops; gauge: clients.
         let vaps = load(
             c,
-            Spec { table: "vap_stats", key: "bssid", extra: &["radio", "ap_mac"], cols: &["tx_bytes", "rx_bytes", "tx_packets", "rx_packets", "tx_retries", "tx_mcast", "rx_mcast", "tx_dropped", "num_sta"] },
+            Spec {
+                table: "vap_stats",
+                key: "bssid",
+                extra: &["radio", "ap_mac"],
+                cols: &[
+                    "tx_bytes", "rx_bytes", "tx_packets", "rx_packets", "tx_retries", "tx_mcast", "rx_mcast", "tx_dropped", "num_sta", "tx_bcast", "rx_bcast",
+                    "wifi_tx_attempts", "wifi_tx_dropped",
+                ],
+            },
             tier,
             from,
             to,
@@ -150,6 +158,8 @@ pub async fn activity(State(s): State<AppState>, Query(q): Query<RangeQuery>) ->
             pkts: f64,
             rx_pkts: f64,
             retries: f64,
+            attempts: f64,
+            wifi_dropped: f64,
             dropped: f64,
             mcast: f64,
             clients: f64,
@@ -160,9 +170,12 @@ pub async fn activity(State(s): State<AppState>, Query(q): Query<RangeQuery>) ->
             if !band_ok(&band, &ex[0]) || !ap_ok(&ex[1]) {
                 continue;
             }
-            let r = rates(&samples.iter().map(|(t, v)| (*t, v[..8].to_vec())).collect::<Vec<_>>());
+            let counters = |v: &Vec<Option<f64>>| [&v[..8], &v[9..]].concat();
+            let r = rates(&samples.iter().map(|(t, v)| (*t, counters(v))).collect::<Vec<_>>());
+            // Retries need positive increases only (a restarted counter adds nothing).
+            let inc: HashMap<Ts, Vec<Option<f64>>> = increases(&samples.iter().map(|(t, v)| (*t, vec![v[4], v[11], v[12]])).collect::<Vec<_>>(), from).into_iter().collect();
             let clients: HashMap<Ts, f64> = samples.iter().filter_map(|(t, v)| v[8].map(|n| (*t, n))).collect();
-            for (t, _, v) in r.points.iter().filter(|p| p.0 >= from) {
+            for (t, dt, v) in r.points.iter().filter(|p| p.0 >= from) {
                 let b = t - t % bucket;
                 let a = per.entry(b).or_default().entry(bssid.clone()).or_default();
                 let g = |i: usize| v[i].unwrap_or(0.0);
@@ -170,9 +183,16 @@ pub async fn activity(State(s): State<AppState>, Query(q): Query<RangeQuery>) ->
                 a.up += g(1);
                 a.pkts += g(2);
                 a.rx_pkts += g(3);
-                a.retries += g(4);
-                a.mcast += g(5) + g(6);
+                // Multicast and broadcast, both directions.
+                a.mcast += g(5) + g(6) + g(8) + g(9);
                 a.dropped += g(7);
+                if let Some(d) = inc.get(t)
+                    && let (Some(r), Some(at)) = (d[0], d[1])
+                {
+                    a.retries += r / dt;
+                    a.attempts += at / dt;
+                    a.wifi_dropped += d[2].unwrap_or(0.0) / dt;
+                }
                 a.clients += clients.get(t).copied().unwrap_or(0.0);
                 a.n += 1.0;
             }
@@ -186,13 +206,15 @@ pub async fn activity(State(s): State<AppState>, Query(q): Query<RangeQuery>) ->
             let sum = |f: &dyn Fn(&Acc) -> f64| m.values().map(|a| f(a) / a.n.max(1.0)).sum::<f64>();
             let (d, u, p, r, mc, cl) = (sum(&|a| a.down), sum(&|a| a.up), sum(&|a| a.pkts), sum(&|a| a.retries), sum(&|a| a.mcast), sum(&|a| a.clients));
             let (rp, dr) = (sum(&|a| a.rx_pkts), sum(&|a| a.dropped));
+            let (at, wd) = (sum(&|a| a.attempts), sum(&|a| a.wifi_dropped));
             tx_pps.push(p);
             rx_pps.push(rp);
             dropped.push(if p + dr > 0.0 { Some(100.0 * dr / (p + dr)) } else { None });
             down.push(d * 8.0);
             up.push(u * 8.0);
-            retry.push(if p > 0.0 { Some(100.0 * r / (p + r)) } else { None });
-            mcast.push(if p > 0.0 { Some((100.0 * mc / p).min(100.0)) } else { None });
+            // Same definitions as the retry buckets and the AP pages.
+            retry.push(if r + at + wd > 0.0 { Some(100.0 * r / (r + at + wd)) } else { None });
+            mcast.push(if p + rp > 0.0 { Some((100.0 * mc / (p + rp)).min(100.0)) } else { None });
             clients.push(cl);
         }
 
@@ -292,86 +314,374 @@ pub async fn top(State(s): State<AppState>, Query(q): Query<RangeQuery>) -> Resu
     Ok(Json(json!({ "aps": ap_list, "clients": cl_list })))
 }
 
-/// GET /api/site/connectivity: share of connection attempts that passed each stage.
+/// Connection stages in the order a client passes them.
+const STAGES: [&str; 6] = ["association", "authentication", "dhcp", "dns", "traffic", "success"];
+
+/// One connection-tracking notification from an AP.
+#[derive(Debug, Clone)]
+pub struct ConnEvent {
+    pub ts: Ts,
+    pub ap: String,
+    pub client: String,
+    pub radio: Option<String>,
+    pub event_type: String,
+    pub n: Value,
+}
+
+fn num_of(n: &Value, k: &str) -> Option<f64> {
+    n[k].as_f64().or_else(|| n[k].as_str().and_then(|v| v.parse().ok()))
+}
+
+/// How far an attempt got: 1 association .. 5 traffic, 6 success; None when it
+/// tells nothing (or failed on a signal too weak to blame the network).
+fn stage_reached(e: &ConnEvent) -> Option<usize> {
+    let n = &e.n;
+    let pos = |k: &str| num_of(n, k).is_some_and(|v| v > 0.0);
+    let is = |k: &str, v: &str| n[k].as_str() == Some(v);
+    let t = e.event_type.as_str();
+    let success = t != "failure"
+        && ((t == "soft failure" && n["ip_assign_type"].as_str().is_some_and(|v| v.starts_with("roam")))
+            || (n.get("traffic_delta").is_none() && is("dns_resp_seen", "yes"))
+            || (pos("traffic_delta") && pos("dns_responses")));
+    let failed = [
+        pos("assoc_failures"),
+        pos("auth_failures") || pos("wpa_auth_failures") || is("radius_auth_status", "failure"),
+        pos("ip_failures"),
+        pos("dns_timeouts") || is("dns_resp_seen", "no"),
+        pos("traffic_failures"),
+    ];
+    if success {
+        return Some(6);
+    }
+    let rssi = num_of(n, "auth_rssi").or_else(|| num_of(n, "avg_rssi"));
+    if rssi.is_some_and(|r| r < -75.0) {
+        return None;
+    }
+    failed.iter().rposition(|f| *f).map(|i| i + 1)
+}
+
+/// Connection success per client: each client counts once, at the furthest
+/// stage any of its attempts reached. A later "fixup" for the same attempt
+/// (AP, client and event id, within ten minutes) replaces the failure.
+pub fn connectivity_stats(mut events: Vec<ConnEvent>, band: Option<&str>) -> Value {
+    events.retain(|e| matches!(e.event_type.as_str(), "failure" | "soft failure" | "success" | "fixup"));
+    events.retain(|e| band.is_none_or(|b| e.radio.as_deref() == Some(b)));
+    events.sort_by_key(|e| e.ts);
+    let mut merged: Vec<ConnEvent> = Vec::new();
+    for e in events {
+        if e.event_type == "fixup"
+            && let Some(id) = e.n.get("event_id").filter(|v| !v.is_null())
+            && let Some(prev) = merged.iter_mut().rev().find(|p| {
+                p.ap == e.ap && p.client == e.client && p.n.get("event_id") == Some(id) && e.ts - p.ts <= 600 && p.event_type.contains("failure")
+            })
+        {
+            if let (Some(a), Some(b)) = (prev.n.as_object_mut(), e.n.as_object()) {
+                for (k, v) in b {
+                    a.insert(k.clone(), v.clone());
+                }
+            }
+            prev.event_type = "fixup".into();
+            continue;
+        }
+        merged.push(e);
+    }
+    let mut attempts = 0u64;
+    let mut furthest: BTreeMap<&str, usize> = BTreeMap::new();
+    let mut timings: [Vec<f64>; 3] = Default::default();
+    for e in &merged {
+        let Some(stage) = stage_reached(e) else { continue };
+        attempts += 1;
+        let f = furthest.entry(e.client.as_str()).or_insert(0);
+        *f = (*f).max(stage);
+        if stage == 6 {
+            for (i, k) in ["assoc_delta", "wpa_auth_delta", "ip_delta"].iter().enumerate() {
+                if let Some(us) = num_of(&e.n, k).filter(|v| *v > 0.0) {
+                    timings[i].push(us / 1000.0);
+                }
+            }
+        }
+    }
+    let clients = furthest.len();
+    let pct = |past: usize| (clients > 0).then(|| (100.0 * furthest.values().filter(|s| **s > past).count() as f64 / clients as f64).round());
+    let median = |v: &mut Vec<f64>| {
+        v.sort_by(f64::total_cmp);
+        v.get(v.len() / 2).map(|x| x.round())
+    };
+    let [mut a, mut b, mut c] = timings;
+    json!({
+        "attempts": attempts,
+        "clients": clients,
+        "failed_clients": furthest.values().filter(|s| **s < 6).count(),
+        "association_pct": pct(1), "authentication_pct": pct(2), "dhcp_pct": pct(3), "dns_pct": pct(4),
+        "success_pct": pct(5),
+        "failed_at": STAGES.iter().take(5).enumerate().map(|(i, k)| (k.to_string(), json!(furthest.values().filter(|s| **s == i + 1).count()))).collect::<serde_json::Map<_, _>>(),
+        "median_ms": { "association": median(&mut a), "authentication": median(&mut b), "dhcp": median(&mut c) },
+    })
+}
+
+/// GET /api/site/connectivity: connection success per client and stage, for
+/// all bands and each band.
 pub async fn connectivity(State(s): State<AppState>, Query(q): Query<RangeQuery>) -> Result<Json<Value>, ApiError> {
     let (from, to, _) = window(&q);
-    let band = q.band.clone();
-    let rows = read(&s, Db::Config, move |c| {
+    let events = read(&s, Db::Config, move |c| {
         let mut stmt = c.prepare(
-            "SELECT event_type, radio, ip_assign_type, ip_ms, dns_responses, dns_timeouts, reason, auth_ms, assoc_ms FROM connections WHERE ts >= ?1 AND ts <= ?2",
+            "SELECT ts, ap_mac, client_mac, radio, event_type, detail, ip_assign_type, dns_responses, dns_timeouts, rssi FROM connections WHERE ts >= ?1 AND ts <= ?2",
         )?;
         let rows = stmt
             .query_map([from, to], |r| {
-                Ok((
-                    r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?, r.get::<_, Option<String>>(2)?, r.get::<_, Option<i64>>(3)?,
-                    r.get::<_, Option<i64>>(4)?, r.get::<_, Option<i64>>(5)?, r.get::<_, Option<String>>(6)?, r.get::<_, Option<i64>>(7)?,
-                    r.get::<_, Option<i64>>(8)?,
-                ))
+                let detail: Option<String> = r.get(5)?;
+                // Rows from before the full notification was kept: rebuild what we can.
+                let n = detail.and_then(|d| serde_json::from_str(&d).ok()).unwrap_or_else(|| {
+                    json!({
+                        "ip_assign_type": r.get::<_, Option<String>>(6).ok().flatten(),
+                        "dns_responses": r.get::<_, Option<i64>>(7).ok().flatten(),
+                        "dns_timeouts": r.get::<_, Option<i64>>(8).ok().flatten(),
+                        "avg_rssi": r.get::<_, Option<i64>>(9).ok().flatten(),
+                    })
+                });
+                Ok(ConnEvent { ts: r.get(0)?, ap: r.get(1)?, client: r.get(2)?, radio: r.get(3)?, event_type: r.get(4)?, n })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
     })
     .await?;
-    // (ok, failed) per stage. Successful attempts pass every stage they report;
-    // failures count against the stage their reason names.
-    let mut stages: BTreeMap<&str, (u64, u64)> = ["association", "authentication", "dhcp", "dns"].into_iter().map(|k| (k, (0, 0))).collect();
-    let mut timings: BTreeMap<&str, Vec<i64>> = BTreeMap::new();
-    for (event, radio, ip_type, ip_ms, dns_ok, dns_to, reason, auth_ms, assoc_ms) in rows {
-        if radio.as_deref().is_some_and(|r| !band_ok(&band, r)) {
-            continue;
-        }
-        let reason = reason.unwrap_or_default().to_ascii_lowercase();
-        match event.as_str() {
-            "success" => {
-                for k in ["association", "authentication"] {
-                    stages.get_mut(k).unwrap().0 += 1;
-                }
-                if ip_type.as_deref() == Some("dhcp") {
-                    stages.get_mut("dhcp").unwrap().0 += 1;
-                }
-                if dns_ok.unwrap_or(0) > 0 || dns_to == Some(0) {
-                    stages.get_mut("dns").unwrap().0 += 1;
-                }
-                if dns_to.unwrap_or(0) > 0 {
-                    stages.get_mut("dns").unwrap().1 += 1;
-                }
-                for (k, v) in [("association", assoc_ms), ("authentication", auth_ms), ("dhcp", ip_ms)] {
-                    if let Some(v) = v {
-                        timings.entry(k).or_default().push(v);
-                    }
-                }
-            }
-            e if e.contains("failure") && !reason.contains("roam") => {
-                let stage = if reason.contains("auth") || reason.contains("key") || reason.contains("psk") {
-                    "authentication"
-                } else if reason.contains("dhcp") || reason.contains("ip") {
-                    "dhcp"
-                } else if reason.contains("dns") {
-                    "dns"
-                } else {
-                    "association"
-                };
-                stages.get_mut(stage).unwrap().1 += 1;
-            }
-            _ => {}
+    let mut bands = serde_json::Map::new();
+    for b in [None, Some("ng"), Some("na"), Some("6e")] {
+        let v = connectivity_stats(events.clone(), b);
+        if b.is_none() || v["attempts"].as_u64().unwrap_or(0) > 0 {
+            bands.insert(b.unwrap_or("all").into(), v);
         }
     }
-    let median = |v: &mut Vec<i64>| -> Option<i64> {
-        v.sort();
-        v.get(v.len() / 2).copied()
+    Ok(Json(json!({ "bands": bands })))
+}
+
+/// Increases between consecutive samples, per field; a counter that went down
+/// (restarted) contributes nothing, and nothing is counted across long gaps.
+fn increases(samples: &[(Ts, Vec<Option<f64>>)], from: Ts) -> Vec<(Ts, Vec<Option<f64>>)> {
+    samples
+        .windows(2)
+        .filter(|w| w[1].0 >= from && w[1].0 > w[0].0 && w[1].0 - w[0].0 <= 2 * 3600)
+        .map(|w| (w[1].0, w[1].1.iter().zip(&w[0].1).map(|(c, p)| c.zip(*p).map(|(c, p)| (c - p).max(0.0))).collect()))
+        .collect()
+}
+
+/// Retries, attempts and drops summed per (AP, band) from SSID counters.
+/// Intervals without attempt counters (data from older versions) are skipped.
+fn retry_totals(vaps: &Loaded, from: Ts) -> HashMap<(String, String), [f64; 3]> {
+    let mut out: HashMap<(String, String), [f64; 3]> = HashMap::new();
+    for (ex, samples) in vaps.values() {
+        for (_, d) in increases(samples, from) {
+            if let (Some(r), Some(a)) = (d[0], d[1]) {
+                let e = out.entry((ex[0].clone(), ex[1].clone())).or_default();
+                e[0] += r;
+                e[1] += a;
+                e[2] += d[2].unwrap_or(0.0);
+            }
+        }
+    }
+    out
+}
+
+/// TX retry rate as the share of all transmissions: retries / (retries + attempts + dropped).
+fn retry_pct([r, a, d]: [f64; 3]) -> f64 {
+    let all = r + a + d;
+    if all > 0.0 { 100.0 * r / all } else { 0.0 }
+}
+
+const RETRY_COLS: &[&str] = &["tx_retries", "wifi_tx_attempts", "wifi_tx_dropped"];
+
+/// GET /api/site/density: how well each AP's weakest clients hear it. Per
+/// report, the average signal of the weaker half of an AP's clients (per
+/// band and overall), averaged over the window.
+pub async fn density(State(s): State<AppState>, Query(q): Query<RangeQuery>) -> Result<Json<Value>, ApiError> {
+    let (from, to, tier) = window(&q);
+    let suffix = TIERS[tier].0;
+    let (signals, vaps) = read(&s, Db::Metrics, move |c| {
+        let mut stmt = c.prepare(&format!("SELECT ts, ap_mac, radio, signal FROM client_stats{suffix} WHERE ts >= ?1 AND ts <= ?2 AND signal < 0 AND ap_mac IS NOT NULL"))?;
+        let rows = stmt
+            .query_map([from, to], |r| Ok((r.get::<_, Ts>(0)?, r.get::<_, String>(1)?, r.get::<_, Option<String>>(2)?, r.get::<_, f64>(3)?)))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let mut cols = vec!["tx_bytes", "rx_bytes"];
+        cols.extend_from_slice(RETRY_COLS);
+        let v = load(c, Spec { table: "vap_stats", key: "bssid", extra: &["ap_mac", "radio"], cols: &cols }, tier, from, to)?;
+        Ok((rows, v))
+    })
+    .await?;
+    // (ap, band) -> per report time -> client signals
+    let mut per: BTreeMap<(String, String), BTreeMap<Ts, Vec<f64>>> = BTreeMap::new();
+    for (ts, ap, radio, sig) in signals {
+        per.entry((ap.clone(), "all".into())).or_default().entry(ts).or_default().push(sig);
+        if let Some(r) = radio {
+            per.entry((ap, r)).or_default().entry(ts).or_default().push(sig);
+        }
+    }
+    // Traffic share per band among APs, and retries.
+    let mut bytes: HashMap<(String, String), f64> = HashMap::new();
+    for (ex, samples) in vaps.values() {
+        let (d, u) = totals(&samples.iter().map(|(t, v)| (*t, v[..2].to_vec())).collect::<Vec<_>>(), from);
+        for band in ["all", ex[1].as_str()] {
+            *bytes.entry((ex[0].clone(), band.to_string())).or_default() += d + u;
+        }
+    }
+    let retries = {
+        let only: Loaded = vaps.iter().map(|(k, (ex, smp))| (k.clone(), (ex.clone(), smp.iter().map(|(t, v)| (*t, v[2..5].to_vec())).collect()))).collect();
+        let mut r = retry_totals(&only, from);
+        let all: Vec<((String, String), [f64; 3])> = r.iter().map(|(k, v)| (k.clone(), *v)).collect();
+        for ((ap, _), v) in all {
+            let e = r.entry((ap, "all".into())).or_default();
+            for i in 0..3 {
+                e[i] += v[i];
+            }
+        }
+        r
     };
-    let out: Vec<Value> = stages
-        .iter()
-        .map(|(k, (ok, fail))| {
-            let total = ok + fail;
+    let mut band_total: HashMap<String, f64> = HashMap::new();
+    for ((_, b), v) in &bytes {
+        *band_total.entry(b.clone()).or_default() += v;
+    }
+    let live = s.live.read().unwrap();
+    let name_of = |mac: &str| mac.parse().ok().and_then(|m| live.devices.get(&m)).and_then(|d| d.snapshot.ap.hostname.clone());
+    let mut aps: BTreeMap<String, Vec<Value>> = BTreeMap::new();
+    for ((ap, band), reports) in &per {
+        let weakest: Vec<f64> = reports
+            .values()
+            .map(|sigs| {
+                let mut v = sigs.clone();
+                v.sort_by(f64::total_cmp);
+                let n = (v.len() / 2).max(1);
+                v[..n].iter().sum::<f64>() / n as f64
+            })
+            .collect();
+        let all: Vec<f64> = reports.values().flatten().copied().collect();
+        let clients = reports.values().map(Vec::len).sum::<usize>() as f64 / reports.len().max(1) as f64;
+        let traffic = bytes.get(&(ap.clone(), band.clone())).copied().unwrap_or(0.0);
+        let total = band_total.get(band).copied().unwrap_or(0.0);
+        aps.entry(ap.clone()).or_default().push(json!({
+            "band": band,
+            "weakest_signal": (weakest.iter().sum::<f64>() / weakest.len().max(1) as f64).round(),
+            "signal_avg": (all.iter().sum::<f64>() / all.len().max(1) as f64).round(),
+            "clients": (clients * 10.0).round() / 10.0,
+            "traffic_pct": if total > 0.0 { 100.0 * traffic / total } else { 0.0 },
+            "tx_retry_pct": retries.get(&(ap.clone(), band.clone())).map(|r| retry_pct(*r)),
+        }));
+    }
+    let list: Vec<Value> = aps.into_iter().map(|(mac, groups)| json!({ "mac": mac, "name": name_of(&mac), "bands": groups })).collect();
+    Ok(Json(json!({ "aps": list })))
+}
+
+/// GET /api/site/retries: each AP radio's TX retry rate over the window.
+pub async fn retries(State(s): State<AppState>, Query(q): Query<RangeQuery>) -> Result<Json<Value>, ApiError> {
+    let (from, to, tier) = window(&q);
+    let vaps = read(&s, Db::Metrics, move |c| load(c, Spec { table: "vap_stats", key: "bssid", extra: &["ap_mac", "radio"], cols: RETRY_COLS }, tier, from, to)).await?;
+    let totals = retry_totals(&vaps, from);
+    let live = s.live.read().unwrap();
+    let mut out: Vec<Value> = totals
+        .into_iter()
+        .map(|((ap, band), t)| {
+            let name = ap.parse().ok().and_then(|m| live.devices.get(&m)).and_then(|d| d.snapshot.ap.hostname.clone());
+            json!({ "mac": ap, "name": name, "radio": band, "tx_retry_pct": retry_pct(t), "retries": t[0], "attempts": t[1], "dropped": t[2] })
+        })
+        .collect();
+    out.sort_by(|a, b| a["mac"].as_str().cmp(&b["mac"].as_str()).then(a["radio"].as_str().cmp(&b["radio"].as_str())));
+    Ok(Json(Value::Array(out)))
+}
+
+/// GET /api/site/multicast: multicast and broadcast by traffic type over time
+/// (all APs, or one with `mac`), and the clients by multicast traffic. `tx` is
+/// what the APs delivered to clients, `rx` what clients sent.
+pub async fn multicast(State(s): State<AppState>, Query(q): Query<RangeQuery>) -> Result<Json<Value>, ApiError> {
+    let (from, to, tier) = window(&q);
+    let bucket = bucket_for(to - from, tier);
+    let ap = q.mac.as_ref().map(|m| m.to_ascii_lowercase());
+    let ap2 = ap.clone();
+    let (samples, clients) = read(&s, Db::Metrics, move |c| {
+        let suffix = TIERS[tier].0;
+        let mut stmt = c.prepare(&format!("SELECT mac, type, ts, tx_pps, rx_pps, tx_bytes_ps, rx_bytes_ps FROM mcast_stats{suffix} WHERE ts >= ?1 AND ts <= ?2"))?;
+        let rows = stmt
+            .query_map([from, to], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, Ts>(2)?, [0, 1, 2, 3].map(|i| r.get::<_, Option<f64>>(3 + i).ok().flatten().unwrap_or(0.0))))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let cl = load(
+            c,
+            Spec { table: "client_stats", key: "mac || '/' || coalesce(ap_mac, '')", extra: &[], cols: &["mcast_tx_pkts", "mcast_rx_pkts", "mcast_tx_bytes", "mcast_rx_bytes"] },
+            tier,
+            from,
+            to,
+        )?;
+        let mut per: HashMap<String, [f64; 4]> = HashMap::new();
+        for (k, (_, smp)) in &cl {
+            let (mac, on) = k.split_once('/').unwrap_or((k, ""));
+            if ap2.as_deref().is_some_and(|a| a != on) {
+                continue;
+            }
+            let e = per.entry(mac.to_string()).or_default();
+            for (_, dt, v) in rates(smp).points.iter().filter(|p| p.0 >= from) {
+                for i in 0..4 {
+                    e[i] += v[i].unwrap_or(0.0) * dt;
+                }
+            }
+        }
+        Ok((rows, per))
+    })
+    .await?;
+    // type -> bucket -> AP -> (sum of rates, samples)
+    type PerAp = HashMap<String, ([f64; 4], f64)>;
+    let mut acc: BTreeMap<String, BTreeMap<Ts, PerAp>> = BTreeMap::new();
+    for (mac, kind, ts, r) in samples {
+        if ap.as_deref().is_some_and(|a| a != mac) || ts < from {
+            continue;
+        }
+        let e = acc.entry(kind).or_default().entry(ts - ts % bucket).or_default().entry(mac).or_default();
+        for (a, b) in e.0.iter_mut().zip(r) {
+            *a += b;
+        }
+        e.1 += 1.0;
+    }
+    let ts: Vec<Ts> = acc.values().flat_map(|b| b.keys().copied()).collect::<std::collections::BTreeSet<_>>().into_iter().collect();
+    let mut types = serde_json::Map::new();
+    for (kind, buckets) in &acc {
+        let mut series = [Vec::new(), Vec::new()];
+        let mut total = [0.0f64; 4];
+        for t in &ts {
+            // Average per AP within the bucket, summed over APs.
+            let sum = |i: usize| buckets.get(t).map_or(0.0, |aps| aps.values().map(|(r, n)| r[i] / n.max(1.0)).sum::<f64>());
+            series[0].push(sum(0));
+            series[1].push(sum(1));
+            for (i, x) in total.iter_mut().enumerate() {
+                *x += sum(i) * bucket as f64;
+            }
+        }
+        types.insert(
+            kind.clone(),
+            json!({ "tx_pps": series[0], "rx_pps": series[1], "tx_pkts": total[0].round(), "rx_pkts": total[1].round(), "tx_bytes": total[2].round(), "rx_bytes": total[3].round() }),
+        );
+    }
+    let live = s.live.read().unwrap();
+    let mut list: Vec<Value> = clients
+        .into_iter()
+        .filter(|(_, t)| t[0] + t[1] > 0.0)
+        .map(|(mac, t)| {
+            let m: Option<inform::Mac> = mac.parse().ok();
+            let view = m.and_then(|m| live.clients.get(&m));
+            let alias = m.and_then(|m| live.aliases.get(&m)).and_then(|a| a.alias.clone());
+            let mc = view.and_then(|v| v.sample.multicast.as_ref());
+            let ap_name = view.and_then(|v| live.devices.get(&v.sample.ap_mac)).and_then(|d| d.snapshot.ap.hostname.clone());
             json!({
-                "stage": k, "ok": ok, "failed": fail,
-                "success_pct": if total > 0 { Some(100.0 * *ok as f64 / total as f64) } else { None },
-                "median_ms": timings.get_mut(*k).and_then(median),
+                "mac": mac, "name": alias.or(view.and_then(|c| c.sample.hostname.clone())), "vendor": s.vendors.lookup_str(&mac),
+                "connected": view.is_some_and(|c| c.connected), "ap": ap_name, "radio": view.and_then(|c| c.sample.radio.clone()),
+                "tx_pkts": t[0].round(), "rx_pkts": t[1].round(), "tx_bytes": t[2].round(), "rx_bytes": t[3].round(),
+                "services": mc.map(|m| m.services.clone()).unwrap_or_default(),
+                "delivery": mc.and_then(|m| m.delivery()),
+                "memberships": mc.map_or(0, |m| m.memberships.len()),
             })
         })
         .collect();
-    Ok(Json(json!({ "stages": out })))
+    list.sort_by(|a, b| {
+        let t = |x: &Value| x["tx_pkts"].as_f64().unwrap_or(0.0) + x["rx_pkts"].as_f64().unwrap_or(0.0);
+        t(b).total_cmp(&t(a))
+    });
+    Ok(Json(json!({ "bucket": bucket, "ts": ts, "types": types, "clients": list })))
 }
 
 /// GET /api/rf/radios: each AP radio with its settings now and its averages
@@ -383,7 +693,12 @@ pub async fn radios(State(s): State<AppState>, Query(q): Query<RangeQuery>) -> R
         // Retries come from the VAPs: the radio-level counters stay at 0 on some models.
         let v = load(
             c,
-            Spec { table: "vap_stats", key: "bssid", extra: &["ap_mac", "radio"], cols: &["tx_bytes", "rx_bytes", "tx_packets", "tx_retries", "avg_client_signal"] },
+            Spec {
+                table: "vap_stats",
+                key: "bssid",
+                extra: &["ap_mac", "radio"],
+                cols: &["tx_bytes", "rx_bytes", "avg_client_signal", "tx_retries", "wifi_tx_attempts", "wifi_tx_dropped"],
+            },
             tier,
             from,
             to,
@@ -404,6 +719,10 @@ pub async fn radios(State(s): State<AppState>, Query(q): Query<RangeQuery>) -> R
         Ok(rows)
     })
     .await?;
+    let retry: HashMap<(String, String), [f64; 3]> = {
+        let only: Loaded = vstats.iter().map(|(k, (ex, smp))| (k.clone(), (ex.clone(), smp.iter().map(|(t, v)| (*t, v[3..6].to_vec())).collect()))).collect();
+        retry_totals(&only, from)
+    };
     let live = s.live.read().unwrap();
     let mut out = Vec::new();
     for (mac, d) in &live.devices {
@@ -420,21 +739,19 @@ pub async fn radios(State(s): State<AppState>, Query(q): Query<RangeQuery>) -> R
                 }
                 None => (None, None),
             };
-            let (mut usage, mut packets, mut retries) = (0.0, 0.0, 0.0);
+            let mut usage = 0.0;
             let mut signals = Vec::new();
             for (ex, samples) in vstats.values() {
                 if ex[0] == mac.to_string() && ex[1] == r.radio {
-                    let rr = rates(&samples.iter().map(|(t, v)| (*t, v[..4].to_vec())).collect::<Vec<_>>());
+                    let rr = rates(&samples.iter().map(|(t, v)| (*t, v[..2].to_vec())).collect::<Vec<_>>());
                     for (_, dt, v) in rr.points.iter().filter(|x| x.0 >= from) {
                         usage += (v[0].unwrap_or(0.0) + v[1].unwrap_or(0.0)) * dt;
-                        packets += v[2].unwrap_or(0.0) * dt;
-                        retries += v[3].unwrap_or(0.0) * dt;
                     }
                     // The AP reports 0 or -1 when no client is connected.
-                    signals.extend(samples.iter().filter(|p| p.0 >= from).filter_map(|p| p.1[4]).filter(|v| *v < -10.0));
+                    signals.extend(samples.iter().filter(|p| p.0 >= from).filter_map(|p| p.1[2]).filter(|v| *v < -10.0));
                 }
             }
-            let retry_pct = (packets > 0.0).then(|| 100.0 * retries / (packets + retries));
+            let retry_pct = retry.get(&(mac.to_string(), r.radio.clone())).map(|t| retry_pct(*t));
             let spec: Vec<&Value> = spectrum_rows.iter().filter(|(m, rd, _)| *m == mac.to_string() && *rd == r.radio).map(|x| &x.2).collect();
             out.push(json!({
                 "mac": mac, "name": d.snapshot.ap.hostname, "radio": r.radio, "channel": r.channel, "bw": r.bw,
@@ -782,5 +1099,66 @@ mod tests {
         // A week ago reads the five-minute tier; a day 60 days back reads hourly.
         assert_eq!(window(&q(None, Some(now - 7 * 86400), Some(now - 6 * 86400))).2, 1);
         assert_eq!(window(&q(None, Some(now - 60 * 86400), Some(now - 59 * 86400))).2, 2);
+    }
+
+    fn conn(ts: Ts, client: &str, event_type: &str, n: Value) -> ConnEvent {
+        ConnEvent { ts, ap: "ap".into(), client: client.into(), radio: Some("na".into()), event_type: event_type.into(), n }
+    }
+
+    #[test]
+    fn connectivity_counts_clients_at_their_furthest_stage() {
+        let ok = json!({ "traffic_delta": 120000, "dns_responses": 1, "dns_resp_seen": "yes" });
+        let events = vec![
+            // a: failed DHCP, then connected: counts as a success.
+            conn(10, "a", "failure", json!({ "ip_failures": 1, "auth_rssi": -60 })),
+            conn(20, "a", "success", ok.clone()),
+            // b: failed at DNS only.
+            conn(10, "b", "failure", json!({ "dns_timeouts": 2, "auth_rssi": -60 })),
+            // c: a roam reported as a soft failure is a success.
+            conn(10, "c", "soft failure", json!({ "ip_assign_type": "roamed" })),
+            // d: failed authentication on a weak signal: not the network's fault, ignored.
+            conn(10, "d", "failure", json!({ "auth_failures": 1, "auth_rssi": -82 })),
+            // e: association events are not attempts.
+            conn(10, "e", "association", json!({})),
+        ];
+        let v = connectivity_stats(events, None);
+        assert_eq!(v["attempts"], 4);
+        assert_eq!(v["clients"], 3);
+        assert_eq!(v["failed_clients"], 1);
+        assert_eq!((v["association_pct"].as_f64(), v["dhcp_pct"].as_f64(), v["dns_pct"].as_f64()), (Some(100.0), Some(100.0), Some(67.0)));
+        assert_eq!(v["success_pct"].as_f64(), Some(67.0));
+        assert_eq!(v["failed_at"]["dns"], 1);
+    }
+
+    #[test]
+    fn a_fixup_turns_a_failure_into_a_success() {
+        let fail = conn(100, "a", "failure", json!({ "event_id": 7, "dns_timeouts": 1, "auth_rssi": -50 }));
+        let fixup = conn(160, "a", "fixup", json!({ "event_id": 7, "dns_timeouts": 0, "dns_responses": 3, "traffic_delta": 90000 }));
+        let v = connectivity_stats(vec![fail.clone(), fixup.clone()], None);
+        assert_eq!((v["attempts"].as_u64(), v["success_pct"].as_f64()), (Some(1), Some(100.0)));
+        // Too late (over ten minutes) to merge: the failure stands, the fixup is its own success.
+        let mut late = fixup;
+        late.ts = 1000;
+        let v = connectivity_stats(vec![fail, late], None);
+        assert_eq!(v["attempts"], 2);
+        // Band filter.
+        assert_eq!(connectivity_stats(vec![conn(1, "a", "success", json!({ "dns_resp_seen": "yes" }))], Some("ng"))["clients"], 0);
+    }
+
+    #[test]
+    fn retries_use_attempts_and_ignore_counter_restarts() {
+        let s = |t, r, a, d| (t, vec![Some(r), Some(a), Some(d)]);
+        let samples = vec![s(0, 100.0, 1000.0, 0.0), s(10, 130.0, 1100.0, 10.0), s(20, 5.0, 20.0, 0.0), s(30, 25.0, 120.0, 0.0)];
+        let mut vaps: Loaded = BTreeMap::new();
+        vaps.insert("bss".into(), (vec!["ap".into(), "na".into()], samples));
+        let t = retry_totals(&vaps, 0)[&("ap".to_string(), "na".to_string())];
+        // 30+20 retries, 100+100 attempts, 10 dropped; the restart at t=20 adds nothing.
+        assert_eq!(t, [50.0, 200.0, 10.0]);
+        assert!((retry_pct(t) - 100.0 * 50.0 / 260.0).abs() < 1e-9);
+        assert_eq!(retry_pct([0.0, 0.0, 0.0]), 0.0);
+        // Older rows without attempt counters are left out rather than read as 100 %.
+        let mut vaps: Loaded = BTreeMap::new();
+        vaps.insert("bss".into(), (vec!["ap".into(), "na".into()], vec![(0, vec![Some(1.0), None, None]), (10, vec![Some(9.0), None, None])]));
+        assert!(retry_totals(&vaps, 0).is_empty());
     }
 }

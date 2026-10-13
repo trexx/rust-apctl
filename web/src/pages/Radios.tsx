@@ -3,7 +3,7 @@ import { Link, useSearchParams } from "react-router-dom";
 import { useChannelPlan, useNeighbors, useRadios } from "../api";
 import type { Neighbor, RadioOverview } from "../api";
 import { ago, bytes } from "../format";
-import { BandPicker } from "../components/Insights";
+import { ApSpacing, BandPicker } from "../components/Insights";
 import { ThreatList } from "../components/Threats";
 import { ErrorNote, Loading, Meter, Signal } from "../components/common";
 
@@ -478,6 +478,9 @@ function Environment() {
             </table>
           </div>
         )}
+      </div>
+      <div className="grid1">
+        <ApSpacing />
       </div>
     </>
   );

@@ -184,11 +184,13 @@ pub struct Engine {
     /// Debounced radio settings: right after a restart an AP briefly reports
     /// transient values (e.g. full transmit power) before settling.
     radios: HashMap<(Mac, String), RadioTrack>,
+    /// Each client's last multicast counters, for per-AP rates.
+    mcast_prev: HashMap<Mac, (Ts, std::collections::BTreeMap<String, crate::model::McastCounts>)>,
 }
 
 impl Engine {
     pub fn new(writer: Writer, keys: Arc<KeyStore>, live: SharedLive, tx: broadcast::Sender<LiveMsg>) -> Self {
-        Engine { writer, keys, renderer: None, live, tx, configs: HashMap::new(), radios: HashMap::new() }
+        Engine { writer, keys, renderer: None, live, tx, configs: HashMap::new(), radios: HashMap::new(), mcast_prev: HashMap::new() }
     }
 
     /// Enables dry-run comparisons of every captured config push.
@@ -702,7 +704,7 @@ impl Engine {
         self.writer.exec(
             Db::Config,
             "INSERT INTO connections (ts, ap_mac, client_mac, vap, essid, radio, event_type, auth_algo, assoc_ms, auth_ms, ip_ms, \
-             ip_assign_type, dns_responses, dns_timeouts, rssi, reason) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+             ip_assign_type, dns_responses, dns_timeouts, rssi, reason, detail) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
             vec![
                 Sql::Integer(ts),
                 Sql::Text(ap.to_string()),
@@ -720,10 +722,14 @@ impl Engine {
                 opt_int(num("dns_timeouts").map(|v| v as i64)),
                 opt_int(num("avg_rssi").or_else(|| num("auth_rssi")).map(|v| v as i64)),
                 opt_text(text("sta_dc_reason")),
+                // The whole notification: failure counters and stage flags for connectivity stats.
+                Sql::Text(n.to_string()),
             ],
         );
         // Failed attempts are worth an event; the rest stay in the connection log.
-        if event_type.contains("failure") {
+        // A roam is reported as a "soft failure" but is a normal, successful move.
+        let roamed = n["ip_assign_type"].as_str().is_some_and(|t| t.starts_with("roam"));
+        if event_type == "failure" || (event_type == "soft failure" && !roamed) {
             let data = json!({ "essid": essid, "reason": n["sta_dc_reason"], "auth_algo": n["auth_algo"], "rssi": num("auth_rssi") });
             let e = ev(ts, "client_connect_failed", Some(ap), Some(client), data);
             live.counters.events += 1;
@@ -789,6 +795,7 @@ impl Engine {
 
     /// Time-based transitions: APs going quiet and clients disappearing.
     fn tick(&mut self, now: Ts) {
+        self.mcast_prev.retain(|_, (ts, _)| *ts > now - 3600);
         let mut live = self.live.write().unwrap();
         let mut events = Vec::new();
         let mut offline = Vec::new();
@@ -851,7 +858,7 @@ impl Engine {
         }
     }
 
-    fn write_metrics(&self, s: &Snapshot) {
+    fn write_metrics(&mut self, s: &Snapshot) {
         let ts = s.ap.ts;
         let mac = || Sql::Text(s.ap.mac.to_string());
         let a = &s.ap;
@@ -888,7 +895,7 @@ impl Engine {
                     Sql::Text(v.bssid.clone()), mac(), opt_text(v.essid.clone()), opt_text(v.radio.clone()),
                     i(v.num_sta), i(v.ccq), i(v.satisfaction), i(v.avg_client_signal), i(v.latency_avg),
                     i(v.rx_bytes), i(v.tx_bytes), i(v.rx_packets), i(v.tx_packets), i(v.tx_retries), i(v.tx_dropped),
-                    i(v.tx_mcast), i(v.rx_mcast),
+                    i(v.tx_mcast), i(v.rx_mcast), i(v.wifi_tx_attempts), i(v.wifi_tx_dropped), i(v.tx_bcast), i(v.rx_bcast),
                 ],
             });
         }
@@ -915,7 +922,11 @@ impl Engine {
                 vec![mac(), Sql::Text(c.radio.clone()), Sql::Integer(c.channel), i(c.width), i(c.utilization), i(c.interference), i(c.other_bss_count), Sql::Integer(ts)],
             );
         }
+        // Per traffic type: rates summed over clients, and how many clients had any.
+        let mut mcast: std::collections::BTreeMap<String, ([f64; 4], i64)> = std::collections::BTreeMap::new();
         for c in &s.clients {
+            let m = c.multicast.as_ref();
+            let t = m.map(|m| m.total());
             self.writer.send(Write::Metric {
                 table: &store::CLIENT,
                 ts,
@@ -923,7 +934,36 @@ impl Engine {
                     Sql::Text(c.mac.to_string()), mac(), Sql::Text(c.bssid.clone()), opt_text(c.essid.clone()), opt_text(c.radio.clone()),
                     i(c.rssi), i(c.signal), i(c.noise), i(c.tx_rate), i(c.rx_rate), i(c.satisfaction), i(c.latency_avg), i(c.channel),
                     i(c.tx_bytes), i(c.rx_bytes), i(c.tx_packets), i(c.rx_packets), i(c.tx_retries),
+                    i(t.map(|t| t.tx_pkts)), i(t.map(|t| t.rx_pkts)), i(t.map(|t| t.tx_bytes)), i(t.map(|t| t.rx_bytes)),
                 ],
+            });
+            let Some(m) = m else { continue };
+            if let Some((pts, prev)) = self.mcast_prev.get(&c.mac)
+                && ts > *pts
+                && ts - pts <= 120
+            {
+                let dt = (ts - pts) as f64;
+                for (kind, cur) in &m.types {
+                    let p = prev.get(kind).copied().unwrap_or_default();
+                    // A smaller value means the counters restarted (reconnect, roam).
+                    let d = |c: i64, p: i64| (if c >= p { c - p } else { c }) as f64 / dt;
+                    let r = [d(cur.tx_pkts, p.tx_pkts), d(cur.rx_pkts, p.rx_pkts), d(cur.tx_bytes, p.tx_bytes), d(cur.rx_bytes, p.rx_bytes)];
+                    let e = mcast.entry(kind.clone()).or_default();
+                    for (a, b) in e.0.iter_mut().zip(r) {
+                        *a += b;
+                    }
+                    if r.iter().any(|x| *x > 0.0) {
+                        e.1 += 1;
+                    }
+                }
+            }
+            self.mcast_prev.insert(c.mac, (ts, m.types.clone()));
+        }
+        for (kind, (r, n)) in mcast {
+            self.writer.send(Write::Metric {
+                table: &store::MCAST,
+                ts,
+                values: vec![mac(), Sql::Text(kind), Sql::Real(r[0]), Sql::Real(r[1]), Sql::Real(r[2]), Sql::Real(r[3]), Sql::Integer(n)],
             });
         }
     }

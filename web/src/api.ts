@@ -61,6 +61,22 @@ export interface ClientSample {
   vlan_id: number | null;
   latency_avg: number | null;
   is_11r: boolean | null;
+  multicast: Multicast | null;
+}
+
+/** `tx` is what the AP delivered to the client, `rx` what the client sent. */
+export interface McastCounts {
+  tx_pkts: number;
+  tx_bytes: number;
+  rx_pkts: number;
+  rx_bytes: number;
+}
+
+export interface Multicast {
+  types: Record<string, McastCounts>;
+  groups: (McastCounts & { group_ip: string; dst_port: number | null; type: string | null })[];
+  memberships: string[];
+  services: { name: string; pkts: number; bytes: number }[];
 }
 
 export interface ClientView {
@@ -101,6 +117,8 @@ export interface VapSample {
   rx_bcast: number | null;
   rx_dropped: number | null;
   tx_errors: number | null;
+  wifi_tx_attempts: number | null;
+  wifi_tx_dropped: number | null;
 }
 
 export interface RadioSample {
@@ -347,12 +365,54 @@ export interface TopEntry {
   upload_bytes: number;
 }
 
-export interface Stage {
-  stage: string;
-  ok: number;
-  failed: number;
+export interface Connectivity {
+  attempts: number;
+  clients: number;
+  failed_clients: number;
+  association_pct: number | null;
+  authentication_pct: number | null;
+  dhcp_pct: number | null;
+  dns_pct: number | null;
   success_pct: number | null;
-  median_ms: number | null;
+  failed_at: Record<string, number>;
+  median_ms: { association: number | null; authentication: number | null; dhcp: number | null };
+}
+
+export interface RadioRetries {
+  mac: Mac;
+  name: string | null;
+  radio: string;
+  tx_retry_pct: number;
+  retries: number;
+  attempts: number;
+  dropped: number;
+}
+
+export interface DensityAp {
+  mac: Mac;
+  name: string | null;
+  bands: { band: string; weakest_signal: number; signal_avg: number; clients: number; traffic_pct: number; tx_retry_pct: number | null }[];
+}
+
+export interface SiteMulticast {
+  bucket: number;
+  ts: number[];
+  types: Record<string, { tx_pps: number[]; rx_pps: number[]; tx_pkts: number; rx_pkts: number; tx_bytes: number; rx_bytes: number }>;
+  clients: {
+    mac: Mac;
+    name: string | null;
+    vendor: string | null;
+    connected: boolean;
+    ap: string | null;
+    radio: string | null;
+    tx_pkts: number;
+    rx_pkts: number;
+    tx_bytes: number;
+    rx_bytes: number;
+    services: { name: string; pkts: number; bytes: number }[];
+    delivery: "optimized" | "flooding" | null;
+    memberships: number;
+  }[];
 }
 
 export interface RadioOverview {
@@ -481,11 +541,36 @@ export const useSiteTop = (span: TimeSpan, mac?: Mac) =>
     placeholderData: (p) => p,
   });
 
-export const useConnectivity = (range: number, band: string) =>
+export const useConnectivity = (span: TimeSpan) =>
   useQuery({
-    queryKey: ["connectivity", range, band],
-    queryFn: () => get<{ stages: Stage[] }>(`/api/site/connectivity${qs({ range, band: bandParam(band) })}`),
-    refetchInterval: 60_000,
+    queryKey: ["connectivity", span],
+    queryFn: () => get<{ bands: Record<string, Connectivity> }>(`/api/site/connectivity${qs(spanParams(span))}`),
+    refetchInterval: refreshFor(span, 60_000),
+    placeholderData: (p) => p,
+  });
+
+export const useRetries = (span: TimeSpan) =>
+  useQuery({
+    queryKey: ["retries", span],
+    queryFn: () => get<RadioRetries[]>(`/api/site/retries${qs(spanParams(span))}`),
+    refetchInterval: refreshFor(span, 60_000),
+    placeholderData: (p) => p,
+  });
+
+export const useDensity = (span: TimeSpan) =>
+  useQuery({
+    queryKey: ["density", span],
+    queryFn: () => get<{ aps: DensityAp[] }>(`/api/site/density${qs(spanParams(span))}`),
+    refetchInterval: refreshFor(span, 60_000),
+    placeholderData: (p) => p,
+  });
+
+export const useMulticast = (span: TimeSpan, mac?: Mac) =>
+  useQuery({
+    queryKey: ["multicast", span, mac],
+    queryFn: () => get<SiteMulticast>(`/api/site/multicast${qs({ ...spanParams(span), mac })}`),
+    refetchInterval: refreshFor(span, 60_000),
+    placeholderData: (p) => p,
   });
 
 export const useRadios = (range: number) =>

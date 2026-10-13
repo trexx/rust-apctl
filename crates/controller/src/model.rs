@@ -100,6 +100,9 @@ pub struct VapSample {
     pub rx_bcast: Option<i64>,
     pub rx_dropped: Option<i64>,
     pub tx_errors: Option<i64>,
+    /// Transmit attempts and frames given up on (retries = attempts - successes).
+    pub wifi_tx_attempts: Option<i64>,
+    pub wifi_tx_dropped: Option<i64>,
 }
 
 /// A network heard by one of the AP's radios in a background scan.
@@ -164,6 +167,104 @@ pub struct ClientSample {
     pub vlan_id: Option<i64>,
     pub latency_avg: Option<i64>,
     pub is_11r: Option<bool>,
+    /// Multicast and broadcast traffic by type, when the AP reports it.
+    pub multicast: Option<Multicast>,
+}
+
+/// Packet and byte counters. `tx` is what the AP delivered to the client,
+/// `rx` what the client sent.
+#[derive(Debug, Clone, Copy, Default, Serialize, PartialEq)]
+pub struct McastCounts {
+    pub tx_pkts: i64,
+    pub tx_bytes: i64,
+    pub rx_pkts: i64,
+    pub rx_bytes: i64,
+}
+
+impl McastCounts {
+    fn parse(v: &Value) -> McastCounts {
+        let n = |k: &str| v[k].as_i64().unwrap_or(0);
+        McastCounts { tx_pkts: n("tx_pkts"), tx_bytes: n("tx_bytes"), rx_pkts: n("rx_pkts"), rx_bytes: n("rx_bytes") }
+    }
+
+    pub fn add(&mut self, o: &McastCounts) {
+        self.tx_pkts += o.tx_pkts;
+        self.tx_bytes += o.tx_bytes;
+        self.rx_pkts += o.rx_pkts;
+        self.rx_bytes += o.rx_bytes;
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct McastGroup {
+    pub group_ip: String,
+    pub dst_port: Option<i64>,
+    /// Traffic type: mdns, ssdp, igmp, stream, dhcp, arp...
+    #[serde(rename = "type")]
+    pub kind: Option<String>,
+    #[serde(flatten)]
+    pub counts: McastCounts,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct Multicast {
+    /// Counters per traffic type (arp, dhcp, dhcpv6, igmp, ipv6_nd, mdns, mld, ssdp, stream, other).
+    pub types: std::collections::BTreeMap<String, McastCounts>,
+    /// Destination groups the client's traffic used.
+    pub groups: Vec<McastGroup>,
+    /// Groups the client has joined.
+    pub memberships: Vec<String>,
+    /// mDNS service types the client's traffic concerned (e.g. `_googlecast._tcp.local`).
+    pub services: Vec<McastService>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct McastService {
+    pub name: String,
+    pub pkts: i64,
+    pub bytes: i64,
+}
+
+impl Multicast {
+    fn parse(v: &Value) -> Option<Multicast> {
+        let types = v["types"].as_object()?.iter().map(|(k, x)| (k.clone(), McastCounts::parse(x))).collect();
+        let groups = v["groups"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|g| {
+                Some(McastGroup { group_ip: g["group_ip"].as_str()?.to_string(), dst_port: g["dst_port"].as_i64(), kind: string(&g["type"]), counts: McastCounts::parse(g) })
+            })
+            .collect();
+        let memberships = v["memberships"].as_array().into_iter().flatten().filter_map(|m| m["group_ip"].as_str().map(str::to_string)).collect();
+        let services = v["services"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|x| Some(McastService { name: x["name"].as_str()?.to_string(), pkts: x["pkts"].as_i64().unwrap_or(0), bytes: x["bytes"].as_i64().unwrap_or(0) }))
+            .collect();
+        Some(Multicast { types, groups, memberships, services })
+    }
+
+    /// "optimized" when the client joined groups and the AP tracks them,
+    /// "flooding" when it joined groups the AP floods to everyone.
+    pub fn delivery(&self) -> Option<&'static str> {
+        if self.memberships.is_empty() {
+            None
+        } else if self.groups.is_empty() {
+            Some("flooding")
+        } else {
+            Some("optimized")
+        }
+    }
+
+    pub fn total(&self) -> McastCounts {
+        let mut t = McastCounts::default();
+        for c in self.types.values() {
+            t.add(c);
+        }
+        t
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -249,6 +350,8 @@ pub fn parse(ts: Ts, p: &Value) -> anyhow::Result<Snapshot> {
             rx_bcast: int(&v["rx_bcast"]),
             rx_dropped: int(&v["rx_dropped"]),
             tx_errors: int(&v["tx_errors"]),
+            wifi_tx_attempts: int(&v["wifi_tx_attempts"]),
+            wifi_tx_dropped: int(&v["wifi_tx_dropped"]),
         });
         if usage != "user" {
             continue;
@@ -285,6 +388,7 @@ pub fn parse(ts: Ts, p: &Value) -> anyhow::Result<Snapshot> {
                 vlan_id: int(&s["vlan_id"]),
                 latency_avg: int(&s["wifi_tx_latency_mov"]["avg"]),
                 is_11r: s["is_11r"].as_bool(),
+                multicast: Multicast::parse(&s["multicast"]),
             });
         }
     }

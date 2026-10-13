@@ -985,3 +985,52 @@ td.warn {
 .banner-high {
   background: var(--bad-bg);
 }
+
+.bucket-empty {
+  opacity: 0.12;
+  color: transparent;
+}
+.buckets {
+  grid-template-columns: repeat(6, 1fr);
+}
+.bucket-edges {
+  display: flex;
+  justify-content: space-between;
+  margin: 2px 0 6px;
+}
+.stage-success {
+  align-self: center;
+  font-size: 13px;
+}
+.tone-good {
+  color: var(--good);
+}
+.tone-warn {
+  color: var(--fair);
+}
+.tone-bad {
+  color: var(--poor);
+}
+.density-mark.quiet {
+  border-color: var(--text-muted);
+  opacity: 0.6;
+}
+.density-mark.warn {
+  border-color: var(--fair);
+}
+.density-mark.bad {
+  border-color: var(--poor);
+}
+.mcast-types {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 14px;
+  margin: 6px 0 10px;
+}
+.mcast-types .swatch {
+  margin-left: 0;
+}
+
+.grid2.align-top {
+  align-items: start;
+}

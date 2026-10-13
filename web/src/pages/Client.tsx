@@ -28,6 +28,8 @@ import {
   deviceNames,
 } from "../components/common";
 import { ago, band, bitrate, bytes, duration, phy } from "../format";
+import { serviceNames } from "../components/Insights";
+import type { ClientView, Multicast } from "../api";
 
 export function Client() {
   const { mac = "" } = useParams();
@@ -193,6 +195,10 @@ export function Client() {
           </div>
         )}
 
+        {s?.multicast && (
+          <ClientMulticast mac={mac} m={s.multicast} all={clients.data ?? []} />
+        )}
+
         <h2>Timeline</h2>
         <div className="panel">
           {events.data ? (
@@ -308,5 +314,131 @@ function AliasHeader(p: {
         {p.note ? <> · {p.note}</> : null}
       </div>
     </div>
+  );
+}
+
+const TYPE_LABEL: Record<string, string> = {
+  mdns: "mDNS (device discovery)",
+  ssdp: "SSDP / UPnP",
+  arp: "ARP",
+  igmp: "IGMP (group joins)",
+  mld: "MLD (IPv6 group joins)",
+  stream: "Streams (video, audio)",
+  dhcp: "DHCP",
+  dhcpv6: "DHCPv6",
+  ipv6_nd: "IPv6 neighbour discovery",
+  other: "Other",
+};
+
+const n = (x: number) =>
+  new Intl.NumberFormat("en-GB", { notation: "compact" }).format(x);
+
+/** What this client sends and receives as multicast/broadcast, from the AP's latest report. */
+function ClientMulticast({
+  mac,
+  m,
+  all,
+}: {
+  mac: string;
+  m: Multicast;
+  all: ClientView[];
+}) {
+  const types = Object.entries(m.types)
+    .filter(([, c]) => c.tx_pkts + c.rx_pkts > 0)
+    .sort(
+      (a, b) => b[1].rx_pkts + b[1].tx_pkts - (a[1].rx_pkts + a[1].tx_pkts),
+    );
+  // Other clients that joined the same groups.
+  const peers = (group: string) =>
+    all
+      .filter(
+        (c) =>
+          c.sample.mac !== mac &&
+          c.sample.multicast?.memberships.includes(group),
+      )
+      .map((c) => c.alias || c.sample.hostname || c.sample.mac);
+  const services = serviceNames(m.services);
+  return (
+    <>
+      <h2>Multicast</h2>
+      <div className="grid2">
+        <div className="panel">
+          <div className="panel-head">
+            <b>By type</b>
+            <span className="muted small">packets since it connected</span>
+          </div>
+          {types.length === 0 ? (
+            <div className="muted small">None.</div>
+          ) : (
+            <table className="table">
+              <thead>
+                <tr>
+                  <th>Type</th>
+                  <th>Sent</th>
+                  <th>Received</th>
+                </tr>
+              </thead>
+              <tbody>
+                {types.map(([k, c]) => (
+                  <tr key={k}>
+                    <td>{TYPE_LABEL[k] ?? k}</td>
+                    <td>{n(c.rx_pkts)}</td>
+                    <td>{n(c.tx_pkts)}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          )}
+          {services.length > 0 && (
+            <p className="small">
+              <span className="muted">Services it uses or announces: </span>
+              {services.join(", ")}
+            </p>
+          )}
+        </div>
+        <div className="panel">
+          <div className="panel-head">
+            <b>Groups joined</b>
+            <span className="muted small">
+              {m.memberships.length === 0
+                ? "none"
+                : m.groups.length
+                  ? "delivered only to members"
+                  : "flooded to everyone"}
+            </span>
+          </div>
+          {m.memberships.length === 0 ? (
+            <div className="muted small">
+              This client hasn't joined any multicast groups.
+            </div>
+          ) : (
+            <table className="table">
+              <thead>
+                <tr>
+                  <th>Group</th>
+                  <th>Also joined by</th>
+                </tr>
+              </thead>
+              <tbody>
+                {m.memberships.map((g) => {
+                  const p = peers(g);
+                  return (
+                    <tr key={g}>
+                      <td className="mono">{g}</td>
+                      <td className="small">
+                        {p.length
+                          ? p.slice(0, 4).join(", ") +
+                            (p.length > 4 ? ` and ${p.length - 4} more` : "")
+                          : "—"}
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          )}
+        </div>
+      </div>
+    </>
   );
 }

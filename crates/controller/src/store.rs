@@ -127,17 +127,29 @@ pub const VAP: Table = Table {
     keys: &["bssid"],
     texts: &["ap_mac", "essid", "radio"],
     gauges: &["num_sta", "ccq", "satisfaction", "avg_client_signal", "latency_avg"],
-    counters: &["rx_bytes", "tx_bytes", "rx_packets", "tx_packets", "tx_retries", "tx_dropped", "tx_mcast", "rx_mcast"],
+    counters: &[
+        "rx_bytes", "tx_bytes", "rx_packets", "tx_packets", "tx_retries", "tx_dropped", "tx_mcast", "rx_mcast", "wifi_tx_attempts", "wifi_tx_dropped", "tx_bcast",
+        "rx_bcast",
+    ],
 };
 pub const CLIENT: Table = Table {
     name: "client_stats",
     keys: &["mac"],
     texts: &["ap_mac", "bssid", "essid", "radio"],
     gauges: &["rssi", "signal", "noise", "tx_rate", "rx_rate", "satisfaction", "latency_avg", "channel"],
-    counters: &["tx_bytes", "rx_bytes", "tx_packets", "rx_packets", "tx_retries"],
+    counters: &["tx_bytes", "rx_bytes", "tx_packets", "rx_packets", "tx_retries", "mcast_tx_pkts", "mcast_rx_pkts", "mcast_tx_bytes", "mcast_rx_bytes"],
+};
+/// Multicast and broadcast per AP and traffic type, as rates summed over the
+/// AP's clients (`tx` to clients, `rx` from them).
+pub const MCAST: Table = Table {
+    name: "mcast_stats",
+    keys: &["mac", "type"],
+    texts: &[],
+    gauges: &["tx_pps", "rx_pps", "tx_bytes_ps", "rx_bytes_ps", "clients"],
+    counters: &[],
 };
 
-pub const TABLES: [&Table; 5] = [&AP, &UPLINK, &RADIO, &VAP, &CLIENT];
+pub const TABLES: [&Table; 6] = [&AP, &UPLINK, &RADIO, &VAP, &CLIENT, &MCAST];
 
 pub fn table(name: &str) -> Option<&'static Table> {
     TABLES.iter().copied().find(|t| t.name == name || t.name.trim_end_matches("_stats") == name)
@@ -175,7 +187,7 @@ CREATE TABLE IF NOT EXISTS spectrum (
 CREATE TABLE IF NOT EXISTS connections (
     id INTEGER PRIMARY KEY, ts INTEGER NOT NULL, ap_mac TEXT NOT NULL, client_mac TEXT NOT NULL, vap TEXT, essid TEXT,
     radio TEXT, event_type TEXT NOT NULL, auth_algo TEXT, assoc_ms INTEGER, auth_ms INTEGER, ip_ms INTEGER,
-    ip_assign_type TEXT, dns_responses INTEGER, dns_timeouts INTEGER, rssi INTEGER, reason TEXT);
+    ip_assign_type TEXT, dns_responses INTEGER, dns_timeouts INTEGER, rssi INTEGER, reason TEXT, detail TEXT);
 CREATE INDEX IF NOT EXISTS connections_ts ON connections (ts);
 CREATE INDEX IF NOT EXISTS connections_client ON connections (client_mac, ts);
 CREATE TABLE IF NOT EXISTS controller_state (
@@ -227,8 +239,19 @@ fn open_ro(path: &Path) -> Result<Connection> {
     Ok(conn)
 }
 
+/// Columns added to config tables after their first release.
+const CONFIG_COLUMNS: [(&str, &str, &str); 1] = [("connections", "detail", "TEXT")];
+
 fn migrate(dir: &Path) -> Result<()> {
-    open_rw(&dir.join(Db::Config.file()))?.execute_batch(CONFIG_SCHEMA)?;
+    let config = open_rw(&dir.join(Db::Config.file()))?;
+    config.execute_batch(CONFIG_SCHEMA)?;
+    for (table, col, ty) in CONFIG_COLUMNS {
+        let has: bool = config.query_row(&format!("SELECT COUNT(*) FROM pragma_table_info('{table}') WHERE name = ?1"), [col], |r| r.get::<_, i64>(0))? > 0;
+        if !has {
+            config.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {col} {ty}"))?;
+        }
+    }
+    drop(config);
     open_rw(&dir.join(Db::Logs.file()))?.execute_batch(LOGS_SCHEMA)?;
     let metrics = open_rw(&dir.join(Db::Metrics.file()))?;
     metrics.execute_batch("CREATE TABLE IF NOT EXISTS rollup_state (name TEXT PRIMARY KEY, upto INTEGER NOT NULL)")?;

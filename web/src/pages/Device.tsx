@@ -31,6 +31,7 @@ import {
   deviceNames,
 } from "../components/common";
 import { ago, band, bitrate, bytes, duration, pct, phy } from "../format";
+import { MulticastPanel } from "../components/Insights";
 
 export function Device() {
   const { mac = "" } = useParams();
@@ -130,6 +131,13 @@ export function Device() {
         </div>
         <div className="grid1">
           <ActiveClients mac={mac} range={range} />
+        </div>
+        <div className="grid1">
+          <MulticastPanel
+            mac={mac}
+            span={range}
+            title="Multicast and broadcast on this AP"
+          />
         </div>
 
         <h2>SSIDs</h2>
@@ -373,7 +381,11 @@ function RadioPanel({
     vaps.reduce((a, v) => a + ((v[k] as number | null) ?? 0), 0);
   const txPkts = sum("tx_packets");
   const retries = sum("tx_retries");
+  const attempts = sum("wifi_tx_attempts");
   const dropped = sum("tx_dropped");
+  const mcast =
+    sum("tx_mcast") + sum("rx_mcast") + sum("tx_bcast") + sum("rx_bcast");
+  const mcastShare = (100 * mcast) / Math.max(1, txPkts + sum("rx_packets"));
   const eirp =
     radio.tx_power !== null && radio.antenna_gain !== null
       ? radio.tx_power + radio.antenna_gain
@@ -418,13 +430,22 @@ function RadioPanel({
           {count(sum("rx_packets"))} packets · {bytes(sum("rx_bytes"))}
         </dd>
         <dt>TX retries</dt>
-        <dd>{share(retries, txPkts + retries)}</dd>
+        <dd>{share(retries, retries + attempts + sum("wifi_tx_dropped"))}</dd>
         <dt>TX dropped</dt>
         <dd>{share(dropped, txPkts + dropped)}</dd>
         <dt>Multicast / broadcast</dt>
         <dd>
-          ↑ {count(sum("tx_mcast") + sum("tx_bcast"))} · ↓{" "}
-          {count(sum("rx_mcast") + sum("rx_bcast"))} packets
+          <span
+            className={mcastShare >= 30 ? "tone-warn" : ""}
+            title="Share of all packets on this radio"
+          >
+            {mcastShare.toFixed(1)}% of packets
+          </span>
+          <span className="muted">
+            {" "}
+            · to clients {count(sum("tx_mcast") + sum("tx_bcast"))}, from
+            clients {count(sum("rx_mcast") + sum("rx_bcast"))}
+          </span>
         </dd>
         <dt>Clients ({clients.length})</dt>
         <dd>
@@ -525,7 +546,7 @@ function RadioActivity({
           { label: "TX packets", values: x.tx_pps, color: COLORS.blue },
           { label: "RX packets", values: x.rx_pps, color: COLORS.purple },
           {
-            label: "Multicast share",
+            label: "Multicast + broadcast share",
             values: x.multicast_pct,
             color: COLORS.teal,
             right: true,
