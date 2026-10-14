@@ -738,6 +738,10 @@ input.search {
   background: linear-gradient(90deg, var(--poor) 0%, var(--fair) 25%, var(--good) 45%, var(--good) 75%, var(--fair) 90%, var(--poor) 100%);
   opacity: 0.35;
 }
+/* AP spacing: quiet is fine, loud (APs very close) is not; -55 dBm sits at 58%. */
+.density-scale.reverse {
+  background: linear-gradient(90deg, var(--good) 0%, var(--good) 50%, var(--fair) 58%, var(--poor) 100%);
+}
 .density-mark {
   position: absolute;
   top: 8px;

@@ -623,47 +623,71 @@ export function serviceNames(
   return [...out.entries()].sort((a, b) => b[1] - a[1]).map(([n]) => n);
 }
 
-/** Our APs' signal to each other: too strong means they crowd each other. */
-/** How loudly our APs hear each other in their scans: too loud means they crowd each other. */
+/**
+ * AP spacing (apctl's own, not an official metric): how loudly our APs hear
+ * each other in their background scans. Very loud means they overlap a lot
+ * (more co-channel contention, clients clinging to the wrong AP).
+ */
 export function ApSpacing() {
   const n = useNeighbors(7 * 86400, "all");
   if (!n.data) return <Loading />;
   const links = n.data.own_links.filter((l) => l.signal !== null);
   const pos = (s: number) =>
-    `${Math.min(100, Math.max(0, ((s + 90) / 60) * 100))}%`;
-  const worst = links.reduce((m, l) => Math.max(m, l.signal ?? -100), -100);
+    `${((Math.min(-30, Math.max(-90, s)) + 90) / 60) * 100}%`;
+  const loudest = links.reduce((m, l) => Math.max(m, l.signal ?? -100), -100);
   const verdict =
     links.length === 0
-      ? "No AP-to-AP measurements yet"
-      : worst > -55
+      ? null
+      : loudest > -55
         ? "APs may be too close"
-        : worst > -65
-          ? "AP density is fine"
-          : "AP density is good";
+        : "APs are well spaced";
+  // Pins in the same 3 dB step stack upwards, as in deployment density.
+  const stack = new Map<number, number>();
   return (
     <div className="panel">
       <div className="panel-head">
-        <b>{verdict}</b>
-        <span className="muted small">
-          how loudly your APs hear each other (from background scans)
-        </span>
+        {verdict ? (
+          <b className={verdict.endsWith("spaced") ? "tone-good" : "tone-warn"}>
+            {verdict}
+          </b>
+        ) : (
+          <b>AP spacing</b>
+        )}
+        <span className="muted small">last 7 days</span>
+      </div>
+      <div className="muted small">
+        How loudly your APs hear each other in their scans (not clients, so it
+        differs from deployment density). Louder than −55 dBm means they overlap
+        a lot.
       </div>
       <div className="density">
-        <div className="density-scale" />
-        {links.map((l, i) => (
-          <div
-            key={i}
-            className="density-mark"
-            style={{ left: pos(l.signal ?? -90) }}
-            title={`${l.from_name} hears ${l.to_name} at ${l.signal} dBm (${l.radio === "ng" ? "2.4 GHz" : "5 GHz"})`}
-          />
-        ))}
+        <div className="density-scale reverse" />
+        {links.map((l, i) => {
+          const s = l.signal ?? -90;
+          const step = Math.round(s / 3);
+          const level = stack.get(step) ?? 0;
+          stack.set(step, level + 1);
+          return (
+            <div
+              key={i}
+              className={`density-mark ${s > -55 ? "warn" : ""}`}
+              style={{ left: pos(s), top: 8 - level * 14 }}
+              title={`${l.from_name} hears ${l.to_name} at ${s} dBm (${l.radio === "ng" ? "2.4 GHz" : "5 GHz"})`}
+            />
+          );
+        })}
         <div className="density-axis muted small">
           {[-90, -80, -70, -60, -50, -40, -30].map((v) => (
             <span key={v}>{v}</span>
           ))}
         </div>
       </div>
+      {links.length === 0 && (
+        <div className="muted small">
+          No AP-to-AP measurements yet: they come from the APs' background
+          scans.
+        </div>
+      )}
     </div>
   );
 }

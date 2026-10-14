@@ -3,7 +3,11 @@ import { Link, useSearchParams } from "react-router-dom";
 import { useChannelPlan, useNeighbors, useRadios } from "../api";
 import type { Neighbor, RadioOverview } from "../api";
 import { ago, bytes } from "../format";
-import { ApSpacing, BandPicker } from "../components/Insights";
+import {
+  ApSpacing,
+  BandPicker,
+  DeploymentDensity,
+} from "../components/Insights";
 import { ThreatList } from "../components/Threats";
 import { RoamingView } from "../components/RoamingView";
 import { ErrorNote, Loading, Meter, Signal } from "../components/common";
@@ -496,7 +500,8 @@ function Environment() {
           </div>
         )}
       </div>
-      <div className="grid1">
+      <div className="grid2 align-top">
+        <DeploymentDensity />
         <ApSpacing />
       </div>
     </>
