@@ -60,6 +60,13 @@ impl Sanitizer {
         self.fake("mac", &lower, |n| format!("02:00:00:00:{:02x}:{:02x}", n >> 8, n & 0xff))
     }
 
+    /// A MAC written without colons (as in serial numbers), keeping its case.
+    fn fake_bare_mac(&mut self, bare: &str) -> String {
+        let colon: String = bare.to_ascii_lowercase().as_bytes().chunks(2).map(|c| std::str::from_utf8(c).unwrap()).collect::<Vec<_>>().join(":");
+        let fake = self.fake_mac(&colon).replace(':', "");
+        if bare.chars().any(|c| c.is_ascii_uppercase()) { fake.to_ascii_uppercase() } else { fake }
+    }
+
     /// Rewrites identifiers that can appear inside any string value.
     fn scrub(&mut self, s: &str) -> String {
         let mut out = s.to_string();
@@ -87,20 +94,8 @@ impl Sanitizer {
         // A bare 12-hex string is only treated as a MAC when we already know that MAC
         // (serial numbers on these APs are the MAC without colons).
         out = replace_all(&self.mac_bare.clone(), &out, |m| {
-            let colon: String = m
-                .to_ascii_lowercase()
-                .as_bytes()
-                .chunks(2)
-                .map(|c| std::str::from_utf8(c).unwrap())
-                .collect::<Vec<_>>()
-                .join(":");
-            match self.maps.get("mac").and_then(|mm| mm.get(&colon)).cloned() {
-                Some(fake) => {
-                    let bare = fake.replace(':', "");
-                    if m.chars().any(|c| c.is_ascii_uppercase()) { bare.to_ascii_uppercase() } else { bare }
-                }
-                None => m.to_string(),
-            }
+            let colon: String = m.to_ascii_lowercase().as_bytes().chunks(2).map(|c| std::str::from_utf8(c).unwrap()).collect::<Vec<_>>().join(":");
+            if self.maps.get("mac").is_some_and(|mm| mm.contains_key(&colon)) { self.fake_bare_mac(m) } else { m.to_string() }
         });
         out = replace_all(&self.hex.clone(), &out, |m| {
             let len = m.len();
@@ -134,6 +129,21 @@ impl Sanitizer {
             || (k.starts_with("cron.") && last == "user")
         {
             self.fake("secret", value, |n| format!("secret-{n}"))
+        } else if matches!(last, "serial" | "serialno" | "serial_no") && self.mac_bare.is_match(value) && value.len() == 12 {
+            // Serial numbers are the device's MAC without colons, including those
+            // of neighbouring APs in scan results: their real BSSIDs follow from them.
+            self.fake_bare_mac(value)
+        } else if last == "fingerprint" {
+            // SSH host key fingerprints identify the device.
+            self.fake("fingerprint", value, |n| format!("SHA256:fingerprint-{n}"))
+        } else if last == "qrid" {
+            self.fake("qrid", value, |n| format!("qrid-{n}"))
+        } else if last == "oui" {
+            // Manufacturer names of clients profile the household.
+            self.fake("vendor", value, |n| format!("vendor-{n}"))
+        } else if last == "base64" {
+            // Binary UUIDs (`external_id`) as MongoDB exports them.
+            self.fake("uuid64", value, |n| format!("{n:0>22}=="))
         } else if last == "ssid" || last == "essid" {
             self.fake("ssid", value, |n| format!("ssid-{n}"))
         } else if last == "hostname" {
@@ -168,6 +178,11 @@ impl Sanitizer {
             Value::String(s) if key == "name" && (parent == "clients" || parent == "user") && !s.is_empty() => {
                 Value::String(self.fake("alias", s, |n| format!("alias-{n}")))
             }
+            // mDNS services a client announced: device IDs hide in their names
+            // (`_FC9F5ED42C8A._tcp.local`); plain service types are kept.
+            Value::String(s) if key == "name" && parent == "services" && !is_service_type(s) => {
+                Value::String(self.fake("service", s, |n| format!("_service-{n}._tcp.local")))
+            }
             Value::String(s) => Value::String(self.field(key, s)),
             other => other.clone(),
         }
@@ -190,6 +205,8 @@ impl Sanitizer {
                 }
                 let original = original.to_ascii_lowercase();
                 let found = if *kind == "secret" { contains_value(&lower, &original) } else { contains_word(&lower, &original) };
+                // MACs also appear without colons (serial numbers, file names).
+                let found = found || (*kind == "mac" && lower.contains(&original.replace(':', "")));
                 if found {
                     bail!("{what}: a {kind} value ({} chars) survived sanitising", original.len());
                 }
@@ -197,6 +214,17 @@ impl Sanitizer {
         }
         Ok(())
     }
+}
+
+/// A plain mDNS service type such as `_googlecast._tcp.local`, with no device ID in it.
+fn is_service_type(name: &str) -> bool {
+    let labels: Vec<&str> = name.trim_end_matches('.').split('.').collect();
+    let id_like = |l: &str| {
+        let l = l.trim_start_matches('_');
+        l.len() >= 6 && l.chars().all(|c| c.is_ascii_hexdigit())
+    };
+    matches!(labels.as_slice(), [service, proto, "local"] if service.starts_with('_') && matches!(*proto, "_tcp" | "_udp"))
+        && labels.iter().all(|l| !id_like(l) && *l == l.to_ascii_lowercase())
 }
 
 /// Whole-word match: names inside longer identifiers (a hostname inside an
@@ -291,7 +319,13 @@ mod tests {
             "inform_url": "http://unifi.home.example.org:8080/inform",
             "x_authkey": "00112233445566778899aabbccddeeff",
             "system_cfg": "users.1.name=admin42\ncron.1.user=admin42\naaa.1.ssid=My Home\naaa.1.wpa.psk=hunter22\nwireless.1.bcfilt.1.mac=ff:ff:ff:ff:ff:ff\nwireless.2.bcfilt.1.mac=78:45:58:3c:52:bc\nunifi.siteid=6a1b2c3d4e5f60718293a4b5",
-            "vap_table": [{"essid": "My Home", "sta_table": [{"mac": "AA:BB:CC:DD:EE:FF"}]}],
+            "vap_table": [{"essid": "My Home", "sta_table": [{"mac": "AA:BB:CC:DD:EE:FF", "multicast": {"services": [
+                {"name": "_googlecast._tcp.local"}, {"name": "_A1B2C3D4E5F6._tcp.local"}, {"name": "_77AB12CD._sub._googlecast._tcp"}]}}]}],
+            "radio_table": [{"scan_table": [{"bssid": "f6:92:bf:22:33:44", "serialno": "F492BF223344"}]}],
+            "fingerprint": "SHA256:abcdefghijklmnopqrstuvwxyz0123456789ABCDEFG",
+            "qrid": "Xy7Qa",
+            "clients": [{ "oui": "Example Devices Ltd", "mac": "00:11:22:33:44:55" }],
+            "external_id": { "$binary": { "base64": "qR9+x3ytPgeIyDW5NH4lkw==", "subType": "04" } },
         });
         let out = s.json(&v);
         let text = out.to_string();
@@ -308,6 +342,16 @@ mod tests {
         assert!(cfg.contains("bcfilt.1.mac=ff:ff:ff:ff:ff:ff"));
         assert!(cfg.contains("bcfilt.1.mac=02:00:00:00:00:01"));
         assert!(!cfg.contains("6a1b2c3d"));
+        let services = &out["vap_table"][0]["sta_table"][0]["multicast"]["services"];
+        assert_eq!(services[0]["name"], "_googlecast._tcp.local", "a plain service type is kept");
+        assert_eq!(services[1]["name"], "_service-1._tcp.local");
+        assert_eq!(services[2]["name"], "_service-2._tcp.local");
+        let serial = out["radio_table"][0]["scan_table"][0]["serialno"].as_str().unwrap();
+        assert!(serial.starts_with("020000000") && serial.chars().all(|c| !c.is_ascii_lowercase()), "a neighbour's serial: {serial}");
+        assert_eq!(out["fingerprint"], "SHA256:fingerprint-1");
+        assert_eq!(out["qrid"], "qrid-1");
+        assert_eq!(out["clients"][0]["oui"], "vendor-1");
+        assert_ne!(out["external_id"]["$binary"]["base64"], "qR9+x3ytPgeIyDW5NH4lkw==");
         s.check_clean(&text, "test").unwrap();
         assert!(s.check_clean("contains hunter22", "leak").is_err());
         assert_eq!(s.file_name("t_7845583c52bc_x.json"), "t_020000000001_x.json");
