@@ -1,7 +1,7 @@
 # Protocol observations from real captures
 
 Everything here was seen on the wire between the official controller (10.6.106) and two
-U6-Mesh APs on firmware 8.8.11. Evidence is in `testdata/captures/2026-10-12-u6m-8.8.11/`.
+U6-Mesh APs on firmware 8.8.11. The captures behind it are described in [captures.md](captures.md).
 Anything we only infer, rather than observe, is marked *inferred*.
 
 ## Transport

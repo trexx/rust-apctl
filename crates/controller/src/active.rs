@@ -436,11 +436,7 @@ mod tests {
     const AP: &str = "02:00:00:00:00:01";
     const KEY: [u8; 16] = [0x42; 16];
 
-    fn fixture(part: &str) -> Value {
-        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../testdata/captures/2026-10-12-u6m-8.8.11");
-        let file = std::fs::read_dir(&dir).unwrap().map(|e| e.unwrap().path()).find(|p| p.to_string_lossy().contains(part)).unwrap();
-        serde_json::from_str(&std::fs::read_to_string(file).unwrap()).unwrap()
-    }
+    use crate::model::tests::{fixture, fixtures};
 
     struct Rig {
         app: axum::Router,
@@ -524,6 +520,7 @@ mod tests {
 
     #[tokio::test]
     async fn sends_a_queued_upgrade_once_the_config_is_current() {
+        let Some(_) = fixtures() else { return };
         let rig = rig(true, None);
         let (_, reply) = inform_as_ap(&rig, &ap_payload("1111111111111111"), KEY, GCM_ZLIB).await;
         let version = reply.unwrap().1["cfgversion"].as_str().unwrap().to_string();
@@ -556,6 +553,7 @@ mod tests {
 
     #[tokio::test]
     async fn sends_queued_commands_one_per_inform_before_the_config() {
+        let Some(_) = fixtures() else { return };
         let rig = rig(true, None);
         let ap: Mac = AP.parse().unwrap();
         {
@@ -575,6 +573,7 @@ mod tests {
 
     #[tokio::test]
     async fn resends_the_config_when_asked() {
+        let Some(_) = fixtures() else { return };
         let rig = rig(true, None);
         let (_, reply) = inform_as_ap(&rig, &ap_payload("1111111111111111"), KEY, GCM_ZLIB).await;
         let version = reply.unwrap().1["cfgversion"].as_str().unwrap().to_string();
@@ -590,6 +589,7 @@ mod tests {
 
     #[tokio::test]
     async fn blocking_a_client_changes_the_config() {
+        let Some(_) = fixtures() else { return };
         let rig = rig(true, None);
         let (_, reply) = inform_as_ap(&rig, &ap_payload("1111111111111111"), KEY, GCM_ZLIB).await;
         let version = reply.unwrap().1["cfgversion"].as_str().unwrap().to_string();
@@ -607,6 +607,7 @@ mod tests {
 
     #[tokio::test]
     async fn provisions_once_then_heartbeats() {
+        let Some(_) = fixtures() else { return };
         let rig = rig(true, None);
         let (status, reply) = inform_as_ap(&rig, &ap_payload("1111111111111111"), KEY, GCM_ZLIB).await;
         assert_eq!(status, StatusCode::OK);
@@ -634,6 +635,7 @@ mod tests {
 
     #[tokio::test]
     async fn adopts_the_running_config_at_cutover_instead_of_repushing() {
+        let Some(_) = fixtures() else { return };
         // The last push we saw from the other controller is exactly what we render
         // with the AP's token: render it once to get that push.
         let probe = rig(true, None);
@@ -651,6 +653,7 @@ mod tests {
 
     #[tokio::test]
     async fn adopts_from_the_stored_masked_push_after_a_restart() {
+        let Some(_) = fixtures() else { return };
         let probe = rig(true, None);
         let payload = ap_payload("abcdefabcdefabcd");
         let out = probe.active.render(&probe.live.read().unwrap().state.clone().unwrap(), AP.parse().unwrap(), &payload, "abcdefabcdefabcd").unwrap();
@@ -661,6 +664,7 @@ mod tests {
 
     #[tokio::test]
     async fn rejects_what_the_official_controller_rejects() {
+        let Some(_) = fixtures() else { return };
         let rig = rig(true, None);
         // Wrong key.
         let (status, _) = inform_as_ap(&rig, &ap_payload("1"), [9; 16], GCM_ZLIB).await;
@@ -683,6 +687,7 @@ mod tests {
 
     #[tokio::test]
     async fn adopts_a_new_ap_then_forgets_it() {
+        let Some(_) = fixtures() else { return };
         let rig = rig(true, None);
         let new: Mac = "02:00:00:00:00:09".parse().unwrap();
         let mut payload = ap_payload("1");
@@ -723,6 +728,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_reset_ap_is_listed_for_adoption_again() {
+        let Some(_) = fixtures() else { return };
         let rig = rig(true, None);
         // AP is ours (it has a key), but informs with the factory key: it was reset.
         let (status, _) = inform_as_ap(&rig, &ap_payload("1"), DEFAULT_KEY, GCM_ZLIB).await;
@@ -732,6 +738,7 @@ mod tests {
 
     #[tokio::test]
     async fn no_cbc_after_gcm_and_cbc_replies_for_cbc_devices() {
+        let Some(_) = fixtures() else { return };
         let rig = rig(true, None);
         // A CBC-only exchange is answered in CBC.
         let (status, reply) = inform_as_ap(&rig, &ap_payload("1"), KEY, Flags::ENCRYPTED).await;
@@ -745,6 +752,7 @@ mod tests {
 
     #[tokio::test]
     async fn notifications_get_a_bare_noop() {
+        let Some(_) = fixtures() else { return };
         let rig = rig(true, None);
         let mut p = ap_payload("1111111111111111"); // out of date, yet no push
         p["inform_as_notif"] = json!(true);
@@ -757,6 +765,7 @@ mod tests {
 
     #[tokio::test]
     async fn without_settings_it_only_heartbeats() {
+        let Some(_) = fixtures() else { return };
         let rig = rig(false, None);
         let (_, reply) = inform_as_ap(&rig, &ap_payload("1"), KEY, GCM_ZLIB).await;
         assert_eq!(reply.unwrap().1["_type"], "noop", "never push a config it cannot render");

@@ -16,8 +16,19 @@ use serde_json::{Value, json};
 pub const AP_B: &str = "02:00:00:00:00:01";
 pub const AP_U: &str = "02:00:00:00:00:02";
 
+/// The capture fixtures (sanitised real captures, kept outside the repository):
+/// `$APCTL_TESTDATA/2026-10-12-u6m-8.8.11`. Tests that need them skip without it.
+pub fn fixtures() -> Option<PathBuf> {
+    let dir = PathBuf::from(std::env::var_os("APCTL_TESTDATA")?).join("2026-10-12-u6m-8.8.11");
+    if !dir.is_dir() {
+        eprintln!("skipped: no capture fixtures in {}", dir.display());
+        return None;
+    }
+    Some(dir)
+}
+
 pub fn dir() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../testdata/captures/2026-10-12-u6m-8.8.11")
+    fixtures().expect("capture fixtures")
 }
 
 pub fn load(file: &str) -> Value {

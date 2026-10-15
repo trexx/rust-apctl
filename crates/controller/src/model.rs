@@ -518,12 +518,22 @@ pub fn parse(ts: Ts, p: &Value) -> anyhow::Result<Snapshot> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::path::PathBuf;
 
-    fn fixture(name_part: &str) -> Value {
-        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../testdata/captures/2026-10-12-u6m-8.8.11");
+    /// The sanitised captures, kept outside the repository: `$APCTL_TESTDATA/2026-10-12-u6m-8.8.11`.
+    pub fn fixtures() -> Option<PathBuf> {
+        let dir = PathBuf::from(std::env::var_os("APCTL_TESTDATA")?).join("2026-10-12-u6m-8.8.11");
+        if !dir.is_dir() {
+            eprintln!("skipped: no capture fixtures in {}", dir.display());
+            return None;
+        }
+        Some(dir)
+    }
+
+    pub fn fixture(name_part: &str) -> Value {
+        let dir = fixtures().expect("capture fixtures");
         let file = std::fs::read_dir(&dir)
             .unwrap()
             .map(|e| e.unwrap().path())
@@ -534,6 +544,7 @@ mod tests {
 
     #[test]
     fn parses_a_full_inform_from_a_u6_mesh() {
+        let Some(_) = fixtures() else { return };
         let s = parse(1000, &fixture("000001_020000000001_inform")).unwrap();
         assert!(s.has_vap_table);
         assert_eq!(s.ap.mac.to_string(), "02:00:00:00:00:01");
@@ -557,6 +568,7 @@ mod tests {
 
     #[test]
     fn short_inform_during_radio_restart_has_no_client_information() {
+        let Some(_) = fixtures() else { return };
         let s = parse(1000, &fixture("000593_020000000002_inform")).unwrap();
         assert!(!s.has_vap_table);
         assert!(s.clients.is_empty());

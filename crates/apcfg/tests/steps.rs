@@ -168,6 +168,7 @@ fn check_expectation(ctx: &str, expect: &Value, d: &cfgdiff::Diff) {
 
 #[test]
 fn every_step_renders_like_the_capture() {
+    let Some(_) = common::fixtures() else { return };
     let mut s = state();
     // The session started before the test SSID existed: start from the final state
     // (step 10 deleted the SSID again, steps 12-15 only touch AP U's 5 GHz radio, and
@@ -204,6 +205,7 @@ fn every_step_renders_like_the_capture() {
 /// adds instead (the README's "baseline" line counts are whole-config sizes).
 #[test]
 fn step_one_adds_the_test_ssid_on_both_bands() {
+    let Some(_) = common::fixtures() else { return };
     let mut s = state();
     let before = render(&s, AP_B, "0").rendered.system_cfg;
     apply(1, &mut s);

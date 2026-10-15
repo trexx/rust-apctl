@@ -27,17 +27,20 @@ fn golden(ap: &str) {
 
 #[test]
 fn ap_b_matches_the_last_push() {
+    let Some(_) = common::fixtures() else { return };
     golden(AP_B);
 }
 
 #[test]
 fn ap_u_matches_the_last_push() {
+    let Some(_) = common::fixtures() else { return };
     golden(AP_U);
 }
 
 /// With nothing changed, the allocation written back equals the stored `config_meta`.
 #[test]
 fn config_meta_round_trips() {
+    let Some(_) = common::fixtures() else { return };
     let state = state();
     for ap in [AP_B, AP_U] {
         let out = render(&state, ap, "0");
@@ -57,6 +60,7 @@ fn config_meta_round_trips() {
 
 #[test]
 fn blocked_sta_lists_blocked_clients() {
+    let Some(_) = common::fixtures() else { return };
     let mut state = state();
     assert_eq!(apcfg::blocked_sta(&state, "00000000000000000000001e"), "");
     // The import does not export the `blocked` flag; the captured `blocked_sta` says
@@ -69,6 +73,7 @@ fn blocked_sta_lists_blocked_clients() {
 
 #[test]
 fn missing_device_is_an_error() {
+    let Some(_) = common::fixtures() else { return };
     let state = state();
     let controller = common::controller();
     let input = apcfg::Input { state: &state, device_mac: "02:00:00:00:99:99", inform: None, cfgversion: "x", controller: &controller };
@@ -79,6 +84,7 @@ fn missing_device_is_an_error() {
 /// (as the official controller writes them), not a byte-for-byte golden copy.
 #[test]
 fn speed_limits_shape_each_vap_to_its_wlans_group() {
+    let Some(_) = common::fixtures() else { return };
     let mut state = state();
     let unlimited = render(&state, AP_B, "x").rendered.system_cfg;
     assert!(unlimited.contains("qos.status=disabled"));
@@ -102,6 +108,7 @@ fn speed_limits_shape_each_vap_to_its_wlans_group() {
 
 #[test]
 fn schedules_reach_the_vaps() {
+    let Some(_) = common::fixtures() else { return };
     let mut state = state();
     for w in state["wlanconf"].as_array_mut().unwrap() {
         w["schedule_with_duration"] = serde_json::json!([{ "start_days_of_week": ["mon"], "start_hour": 1, "start_minute": 0, "duration_minutes": 300 }]);

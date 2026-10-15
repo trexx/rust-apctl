@@ -1,6 +1,6 @@
 [package]
 name = "controller"
-description = "Controller for Ubiquiti access points (working title apctl)"
+description = "Controller for UniFi access points"
 version = "0.15.1"
 edition.workspace = true
 license.workspace = true

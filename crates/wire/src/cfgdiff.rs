@@ -129,8 +129,18 @@ mod capture_fixtures {
     use std::collections::HashMap;
     use std::path::PathBuf;
 
+    /// The sanitised captures, kept outside the repository: `$APCTL_TESTDATA/2026-10-12-u6m-8.8.11`.
+    fn fixtures() -> Option<PathBuf> {
+        let dir = PathBuf::from(std::env::var_os("APCTL_TESTDATA")?).join("2026-10-12-u6m-8.8.11");
+        if !dir.is_dir() {
+            eprintln!("skipped: no capture fixtures in {}", dir.display());
+            return None;
+        }
+        Some(dir)
+    }
+
     fn dir() -> PathBuf {
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../testdata/captures/2026-10-12-u6m-8.8.11")
+        fixtures().expect("capture fixtures")
     }
 
     fn system_cfg(file: &str) -> String {
@@ -145,6 +155,7 @@ mod capture_fixtures {
 
     #[test]
     fn each_labelled_change_produces_the_observed_diff() {
+        let Some(_) = fixtures() else { return };
         let manifest: Value =
             serde_json::from_str(&std::fs::read_to_string(dir().join("manifest.json")).unwrap()).unwrap();
         let mut previous: HashMap<String, String> = HashMap::new();
@@ -182,6 +193,7 @@ mod capture_fixtures {
 
     #[test]
     fn wpa3_transition_duplicates_the_psk_line() {
+        let Some(_) = fixtures() else { return };
         // Step 2 on AP B: section 3 is the 2.4 GHz copy of the test SSID.
         let before = system_cfg("2026-10-12T184539.445Z_000026_020000000001_reply-setparam.json");
         let after = system_cfg("2026-10-12T184900.729Z_000094_020000000001_reply-setparam.json");
