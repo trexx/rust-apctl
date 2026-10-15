@@ -44,7 +44,7 @@ use wire::keys::KeyStore;
 use engine::{Engine, Input, SharedLive};
 
 #[derive(Parser)]
-#[command(version, about = "Controller for Ubiquiti access points")]
+#[command(version, about = "Controller for UniFi access points")]
 struct Cli {
     #[command(subcommand)]
     cmd: Cmd,
@@ -202,12 +202,13 @@ async fn serve(args: ServeArgs) -> Result<()> {
         (None, Some(c)) => Some(shadow::Source::Command(c)),
         (None, None) => None,
     };
+    let replaying = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let source_desc = source.as_ref().map_or("none".to_string(), |s| s.to_string());
     match source {
         Some(src) => {
             tracing::info!("shadow mode: reading inform traffic from {src}");
             let syslog_port = syslog_listen.map_or(5514, |a| a.port());
-            shadow::spawn(src, inform_ports, syslog_port, keys.clone(), in_tx.clone());
+            shadow::spawn(src, inform_ports, syslog_port, keys.clone(), in_tx.clone(), replaying.clone());
         }
         None if active => {}
         None => tracing::warn!("no shadow source configured: nothing will be ingested"),
@@ -246,6 +247,10 @@ async fn serve(args: ServeArgs) -> Result<()> {
         let mut every = tokio::time::interval(Duration::from_secs(5));
         loop {
             every.tick().await;
+            // A replaying capture ticks in its own time (see `shadow::spawn`).
+            if replaying.load(std::sync::atomic::Ordering::Relaxed) {
+                continue;
+            }
             if tick_tx.send(Input::Tick(store::now_ts())).await.is_err() {
                 return;
             }

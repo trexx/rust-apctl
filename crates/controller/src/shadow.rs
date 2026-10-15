@@ -9,6 +9,7 @@ use std::io::Read;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use tokio::sync::mpsc;
@@ -35,7 +36,17 @@ impl std::fmt::Display for Source {
     }
 }
 
-pub fn spawn(source: Source, ports: Vec<u16>, syslog_port: u16, keys: Arc<KeyStore>, tx: mpsc::Sender<Input>) {
+/// Informs this far behind the wall clock come from a capture being replayed
+/// (a saved file, or a backlog).
+const REPLAY_LAG_SECS: i64 = 120;
+/// How often a replay ticks the engine, in capture time.
+const REPLAY_TICK_SECS: i64 = 5;
+
+/// `replaying` is set while the capture runs behind the wall clock. The engine's
+/// clock then follows the capture: the capture sends the ticks (in capture
+/// time) and the wall-clock ticks pause, or every AP and client would look gone
+/// between two replayed informs.
+pub fn spawn(source: Source, ports: Vec<u16>, syslog_port: u16, keys: Arc<KeyStore>, tx: mpsc::Sender<Input>, replaying: Arc<AtomicBool>) {
     std::thread::Builder::new()
         .name("shadow-capture".into())
         .spawn(move || {
@@ -43,13 +54,14 @@ pub fn spawn(source: Source, ports: Vec<u16>, syslog_port: u16, keys: Arc<KeySto
             loop {
                 let started = std::time::Instant::now();
                 let result = match &source {
-                    Source::Stdin => run_once(std::io::stdin(), &ports, syslog_port, &keys, &tx),
+                    Source::Stdin => run_once(std::io::stdin(), &ports, syslog_port, &keys, &tx, &replaying),
                     Source::Path(p) => match std::fs::File::open(p) {
-                        Ok(f) => run_once(std::io::BufReader::new(f), &ports, syslog_port, &keys, &tx),
+                        Ok(f) => run_once(std::io::BufReader::new(f), &ports, syslog_port, &keys, &tx, &replaying),
                         Err(e) => Err(anyhow::anyhow!("opening {}: {e}", p.display())),
                     },
-                    Source::Command(cmd) => run_command(cmd, &ports, syslog_port, &keys, &tx),
+                    Source::Command(cmd) => run_command(cmd, &ports, syslog_port, &keys, &tx, &replaying),
                 };
+                replaying.store(false, Ordering::Relaxed);
                 match result {
                     Ok(()) => tracing::warn!("shadow capture from {source} ended"),
                     Err(e) => tracing::warn!("shadow capture from {source} failed: {e:#}"),
@@ -70,11 +82,11 @@ pub fn spawn(source: Source, ports: Vec<u16>, syslog_port: u16, keys: Arc<KeySto
         .expect("spawning the capture thread");
 }
 
-fn run_command(cmd: &str, ports: &[u16], syslog_port: u16, keys: &KeyStore, tx: &mpsc::Sender<Input>) -> anyhow::Result<()> {
+fn run_command(cmd: &str, ports: &[u16], syslog_port: u16, keys: &KeyStore, tx: &mpsc::Sender<Input>, replaying: &AtomicBool) -> anyhow::Result<()> {
     tracing::info!("starting shadow capture: {cmd}");
     let mut child = Command::new("sh").arg("-c").arg(cmd).stdout(Stdio::piped()).stderr(Stdio::inherit()).spawn()?;
     let stdout = child.stdout.take().expect("piped stdout");
-    let result = run_once(stdout, ports, syslog_port, keys, tx);
+    let result = run_once(stdout, ports, syslog_port, keys, tx, replaying);
     let _ = child.kill();
     let _ = child.wait();
     result
@@ -86,8 +98,10 @@ fn run_once<R: Read + Send>(
     syslog_port: u16,
     keys: &KeyStore,
     tx: &mpsc::Sender<Input>,
+    replaying: &AtomicBool,
 ) -> anyhow::Result<()> {
     let mut pairer = Pairer::default();
+    let mut last_tick = 0;
     capture::run_with_udp(input, ports, &[syslog_port], |event| {
         // AP syslog sent to the other controller's address.
         if let capture::HttpEvent::Datagram { ts, src, payload, .. } = event {
@@ -95,9 +109,17 @@ fn run_once<R: Read + Send>(
             return;
         }
         let Some(ev) = pairer.handle(keys, event) else { return };
+        let mut tick = None;
         let input = match ev {
             InformEvent::Inform { ts, peer, decoded: Ok(decoded), .. } => {
-                Some(Input::Inform { ts: ts / 1_000_000, peer, decoded })
+                let ts = ts / 1_000_000;
+                let behind = ts < crate::store::now_ts() - REPLAY_LAG_SECS;
+                replaying.store(behind, Ordering::Relaxed);
+                if behind && ts >= last_tick + REPLAY_TICK_SECS {
+                    last_tick = ts;
+                    tick = Some(Input::Tick(ts));
+                }
+                Some(Input::Inform { ts, peer, decoded })
             }
             InformEvent::Inform { decoded: Err(e), mac, .. } => {
                 tracing::debug!("undecodable inform from {mac:?}: {e:#}");
@@ -111,6 +133,9 @@ fn run_once<R: Read + Send>(
         if let Some(input) = input {
             // Blocks when the engine is behind, which back-pressures the capture.
             let _ = tx.blocking_send(input);
+        }
+        if let Some(tick) = tick {
+            let _ = tx.blocking_send(tick);
         }
     })
 }
