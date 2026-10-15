@@ -1,0 +1,35 @@
+name: 'Build capture sidecar'
+
+# The tcpdump sidecar for shadow mode (the Dockerfile's `capture` stage) is
+# versioned on its own: push a tag like capture-0.1.2 to publish
+# ghcr.io/trexx/apctl-capture:0.1.2 and :latest.
+on:
+  push:
+    tags: [ 'capture-[0-9]+.[0-9]+.[0-9]+' ]
+
+jobs:
+  build:
+    runs-on: 'ubuntu-26.04'
+    timeout-minutes: 10
+    permissions:
+      contents: 'read'
+      packages: 'write'
+    steps:
+      - uses: 'docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069' # v4.4.1
+      - uses: 'docker/login-action@dbcb813823bdd20940b903addbd779551569679f' # v4.6.0
+        with:
+          registry: 'ghcr.io'
+          username: '${{ github.repository_owner }}'
+          password: '${{ secrets.GITHUB_TOKEN }}'
+      - id: 'meta'
+        uses: 'docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302' # v6.2.0
+        with:
+          images: 'ghcr.io/${{ github.repository }}-capture'
+          tags: 'type=match,pattern=capture-(.*),group=1'
+          flavor: 'latest=true'
+      - uses: 'docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc' # v7.4.0
+        with:
+          push: true
+          target: 'capture'
+          tags: '${{ steps.meta.outputs.tags }}'
+          labels: '${{ steps.meta.outputs.labels }}'

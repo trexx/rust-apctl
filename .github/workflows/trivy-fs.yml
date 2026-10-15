@@ -1,0 +1,17 @@
+name: 'Trivy FS'
+
+# Scans Cargo.lock and web/package-lock.json. The image scan cannot see the
+# crates inside the stripped apctl binary, so dependencies are checked here.
+on:
+  schedule:
+    - cron: '47 12 * * *'
+  workflow_dispatch:
+
+jobs:
+  scan:
+    uses: 'trexx/actions/.github/workflows/trivy-fs.yml@9cbae3f30592d8d7f4ca8ed3714f64ef8dc06567' # main
+    secrets: 'inherit'
+    permissions:
+      contents: 'read'
+      security-events: 'write'
+      actions: 'read'

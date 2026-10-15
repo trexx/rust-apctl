@@ -1,0 +1,60 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "dependencyDashboard": true,
+  "extends": [
+    "docker:enableMajor",
+    "docker:pinDigests",
+    "helpers:pinGitHubActionDigests",
+    "default:automergeDigest",
+    "default:automergeMinor"
+  ],
+  "enabledManagers": [
+    "cargo",
+    "dockerfile",
+    "github-actions",
+    "npm"
+  ],
+  "packageRules": [
+    {
+      "enabled": false,
+      "matchDepTypes": [
+        "stage"
+      ]
+    },
+    {
+      "description": "One PR for all non-major Rust crate updates",
+      "groupName": "Rust crates",
+      "matchManagers": [
+        "cargo"
+      ],
+      "matchUpdateTypes": [
+        "minor",
+        "patch"
+      ]
+    },
+    {
+      "description": "One PR for all non-major web UI package updates",
+      "groupName": "web UI packages",
+      "matchManagers": [
+        "npm"
+      ],
+      "matchUpdateTypes": [
+        "minor",
+        "patch"
+      ]
+    },
+    {
+      "description": "The 3.x driver cannot talk to the MongoDB 3.6 that the official controller ships (informdump import)",
+      "matchManagers": [
+        "cargo"
+      ],
+      "matchPackageNames": [
+        "mongodb"
+      ],
+      "matchUpdateTypes": [
+        "major"
+      ],
+      "enabled": false
+    }
+  ]
+}

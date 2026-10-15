@@ -1,0 +1,17 @@
+name: 'Trivy'
+
+# Scans the published image (OS packages of the distroless base).
+on:
+  schedule:
+    - cron: '37 12 * * *'
+  workflow_dispatch:
+
+jobs:
+  scan:
+    uses: 'trexx/actions/.github/workflows/trivy.yml@9cbae3f30592d8d7f4ca8ed3714f64ef8dc06567' # main
+    secrets: 'inherit'
+    permissions:
+      packages: 'read'
+      contents: 'read'
+      security-events: 'write'
+      actions: 'read'

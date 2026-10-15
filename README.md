@@ -1,98 +1,124 @@
-# AP controller (working title)
+# apctl
 
-A lightweight, open-source controller for Ubiquiti access points. It is written in Rust,
-stores everything in SQLite and adds the metrics, logs and event timelines the official
-Network application lacks. It has no affiliation with Ubiquiti.
+A lightweight, self-hosted controller for **UniFi access points**. It replaces the UniFi
+Network Application on sites that only have UniFi APs. apctl is a single Rust binary with
+an embedded web UI and stores everything in SQLite. It speaks the APs' own inform protocol,
+so the APs need no changes.
 
-Status: **milestone 2: monitoring in shadow mode.** apctl runs next to an existing
-controller and learns everything from a capture of its traffic: APs, clients, radio
-metrics, events and AP syslog. It never talks to the APs. Configuring APs comes in
-milestone 3.
+> Not affiliated with Ubiquiti Inc. UniFi is a trademark of Ubiquiti Inc.
 
-## Crates
+![Overview](docs/screenshots/overview.png)
 
-| Crate | What it is |
+## Features
+
+- Monitoring of APs, radios, networks and clients, with a year of history
+- Events, browser alerts, a connection log with per-stage timings, and roaming analysis
+- AP syslog with full-text search
+- Neighbouring networks, channel planning and nightly auto-channel
+- An SSID and radio settings editor with per-AP previews, plus schedules and speed limits
+- Adoption, firmware upgrades, device and client actions, and encrypted backups
+
+Tested with U6-Mesh APs on firmware 8.8, against Network Application 10.6.
+
+| | |
 |---|---|
-| `crates/inform` | Codec for the inform protocol: TNBU framing, AES-128-CBC/GCM, zlib/snappy. No I/O. |
-| `crates/wire` | Capture reading (pcap, TCP/HTTP reassembly, UDP), request/reply pairing, decryption, config diffs. |
-| `crates/informdump` | A CLI that decodes inform traffic from pcap files or live tcpdump output, diffs config pushes and imports keys from an existing controller. |
-| `crates/controller` | `apctl`: the controller. SQLite storage, event engine, syslog, REST/WebSocket API and the embedded web UI. |
-| `web/` | The web UI (React, TypeScript, Vite, uPlot). |
+| ![AP](docs/screenshots/device.png) | ![Client](docs/screenshots/client.png) |
+| ![Clients](docs/screenshots/clients.png) | ![Networks](docs/screenshots/networks.png) |
+| ![Radios](docs/screenshots/radios.png) | ![Events](docs/screenshots/events.png) |
 
-## apctl
+These screenshots use mock data from `informdump demo`.
+
+## Modes
+
+- **Shadow** (default): learns everything from a packet capture of an existing
+  controller's traffic and never talks to the APs. A dry run compares that controller's
+  config pushes with apctl's.
+- **Active** (`--active`): apctl is the controller. It uses 8080/tcp (inform),
+  5514/udp (syslog) and 3478/udp (STUN), and takes over the APs' keys from
+  `informdump import`.
+
+## Run
 
 ```sh
-# Build the UI (no local npm needed), then the controller.
+printf '%s' 'a long password' | docker run --rm -i ghcr.io/trexx/apctl hash-password | sed 's/^/admin:/' > users
+docker run -d -v apctl-data:/data -v $PWD/users:/users:ro -e APCTL_USERS_FILE=/users \
+  -e APCTL_SYSLOG_LISTEN=0.0.0.0:5514 -p 8090:8090 -p 8080:8080 -p 5514:5514/udp -p 3478:3478/udp \
+  ghcr.io/trexx/apctl serve --active --keys /data/import.json
+```
+
+On Kubernetes (active mode), with the APs' ports on the node and the data on local storage:
+
+```yaml
+# kubectl create secret generic apctl --from-file=import.json --from-file=users
+apiVersion: apps/v1
+kind: StatefulSet
+metadata: { name: apctl }
+spec:
+  serviceName: apctl
+  selector: { matchLabels: { app: apctl } }
+  template:
+    metadata: { labels: { app: apctl } }
+    spec:
+      securityContext: { fsGroup: 65532 }
+      containers:
+        - name: apctl
+          image: ghcr.io/trexx/apctl:0.15.1
+          args: [serve, --active, --keys, /secret/import.json, --users-file, /secret/users]
+          env:
+            - { name: APCTL_SYSLOG_LISTEN, value: "0.0.0.0:5514" }
+          ports:
+            - { name: http, containerPort: 8090 }
+            - { name: inform, containerPort: 8080, hostPort: 8080 }
+            - { name: syslog, containerPort: 5514, hostPort: 5514, protocol: UDP }
+            - { name: stun, containerPort: 3478, hostPort: 3478, protocol: UDP }
+          readinessProbe: { httpGet: { path: /healthz, port: http } }
+          volumeMounts:
+            - { name: data, mountPath: /data }
+            - { name: secret, mountPath: /secret, readOnly: true }
+      volumes:
+        - { name: secret, secret: { secretName: apctl } }
+  volumeClaimTemplates:
+    - metadata: { name: data }
+      spec: { accessModes: [ReadWriteOnce], resources: { requests: { storage: 2Gi } } }
+```
+
+Expose port 8090 with a Service for the web UI. For shadow mode, drop `--active` and the
+host ports, and feed it a capture with `--shadow` or `--shadow-cmd`; the
+`ghcr.io/trexx/apctl-capture` image is a tcpdump sidecar for that. `apctl serve --help`
+lists every option.
+
+## Demo
+
+Try the UI without any APs. The demo is a made-up site with three APs and about twenty clients:
+
+```sh
+cargo build --release -p informdump -p controller
+target/release/informdump demo-state > demo.json
+target/release/apctl serve --data-dir demo-data --keys demo.json \
+  --shadow-cmd "target/release/informdump demo --live"   # charts fill in after a minute or two
+# Optional: upload demo.json on the Settings page for SSIDs and the settings editor.
+```
+
+## Build
+
+```sh
 podman run --rm -v $PWD/web:/app:Z -w /app docker.io/library/node:24-slim sh -c "npm ci && npm run build"
-cargo build --release -p controller
-
-# Shadow mode from any pcap stream, e.g. tcpdump on the node running the other controller.
-apctl serve --data-dir data --keys import.json \
-  --shadow-cmd "ssh node sudo tcpdump -i any -U -s0 -w - 'tcp port 8080 or udp port 5514'"
-# then open http://127.0.0.1:8090
+cargo build --release -p controller   # or: podman build --target runtime .
 ```
 
-Data lives in three SQLite files under `--data-dir`:
-- `config.db` holds devices, clients, events and the redacted last config per AP.
-- `metrics.db` holds the time series: raw for 48 h, 5-minute averages for 30 days and hourly for a year.
-- `logs.db` holds AP syslog for 14 days, with full-text search. Secrets that APs log are masked on arrival.
+`crates/informdump` decodes, imports, sanitises and simulates inform traffic. Run
+`informdump --help` for its commands. Pushing a version tag (e.g. `0.15.1`) publishes the
+image.
 
-In Kubernetes, `deploy/k8s/shadow.yaml` runs apctl with a tcpdump sidecar on the host
-network of the node that runs the other controller.
+## Contributing
 
-### Dry run and active mode
+Never commit secrets or captures: import snapshots and pcaps hold AP keys and
+passphrases. Tests that replay real captures read them from `$APCTL_TESTDATA` (see
+[docs/captures.md](docs/captures.md)), and `informdump sanitize` makes them shareable.
 
-- With settings imported (Settings page, from `informdump import`), every config push the other
-  controller makes is compared with what apctl would generate (`crates/apcfg`); see the Dry run
-  page.
-- `apctl serve --active` answers the APs' informs itself. It decrypts with each AP's key, replies
-  `setparam` when the AP's `cfgversion` differs and `noop` otherwise, and adopts the running
-  config at cutover when it is identical. It is off by default and cannot be combined with
-  shadow mode.
-- Rehearse against a local instance only (the command refuses other hosts):
+The official application may be decompiled as a reference for interoperability. Its code
+and assets never go in this repository.
 
-  ```sh
-  apctl serve --active --inform-listen 127.0.0.1:18180 --listen 127.0.0.1:18101 ...
-  informdump simulate capture.pcap --keys import.json --url http://127.0.0.1:18180/inform
-  ```
+## License
 
-## informdump
-
-```sh
-cargo build --release -p informdump
-
-# 1. Snapshot device authkeys, sites and WLANs from the existing controller (read-only).
-kubectl -n unifi-controller port-forward pod/unifi-controller-0 27117:27117 &
-informdump import --out ~/.local/share/apctl/import.json
-
-# 2. Watch live traffic on the node running the controller. Shows new devices and config
-#    pushes, with a diff of system_cfg and mgmt_cfg against the previous push.
-sudo tcpdump -i any -U -w - 'tcp port 8080' | informdump watch --keys ~/.local/share/apctl/import.json
-
-# 3. Or decode a saved capture, showing everything and saving the decoded payloads.
-informdump pcap capture.pcap --keys import.json --all --save decoded/
-
-# 4. Turn decoded payloads into shareable fixtures (fake MACs, SSIDs, names, IDs and secrets).
-#    It refuses to write anything if an original value survives.
-informdump sanitize --input decoded/ --output testdata/captures/<session> --domain example.org FILE...
-```
-
-`--json` prints one JSON object per message, and `--full` prints the complete payloads.
-Printed output masks passwords, PSKs and keys unless you pass `--no-redact`. Files written
-with `--save` are not masked.
-
-## Documentation
-
-- `docs/protocol-observations.md` lists what we have seen on the wire, with evidence in `testdata/`.
-- `testdata/captures/*/` holds sanitised real captures, each with a labelled `manifest.json`.
-
-## Rules for this repository
-
-- **No secrets or captures in git.** Import snapshots, keys and pcaps hold device authkeys
-  and WLAN passphrases. Fixtures in `testdata/` must be sanitised, with fake MACs, keys and
-  SSIDs.
-- **Interoperability, not copying.** The official application may be decompiled as a
-  reference for interoperability. The decompiled output stays outside this repository, and
-  what we learn from it is written up in our own words. Never copy its code or assets in
-  here. Wire captures are the source of truth: a rule taken from the decompile is relied on
-  only once a capture confirms it.
+AGPL-3.0-or-later
