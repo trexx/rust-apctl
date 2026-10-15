@@ -6,6 +6,7 @@
 //! tcpdump -i any -U -w - 'tcp port 8080' | informdump watch --keys keys.json
 //! ```
 
+mod demo;
 mod import;
 mod report;
 mod sanitize;
@@ -94,6 +95,20 @@ enum Cmd {
         #[arg(long, default_value = "0")]
         every: f64,
     },
+    /// Write a made-up site's capture (three APs, their clients, syslog) as pcap to
+    /// stdout, for demos and screenshots: `apctl serve --keys <demo-state output>
+    /// --shadow-cmd "informdump demo --live"`.
+    Demo {
+        /// Hours of history before now.
+        #[arg(long, default_value = "24")]
+        hours: f64,
+        /// Keep reporting in real time after the history.
+        #[arg(long)]
+        live: bool,
+    },
+    /// Print the made-up site's controller settings and AP keys (for `apctl serve
+    /// --keys` and the Settings page) that go with `informdump demo`.
+    DemoState,
     /// Follow a live capture on stdin and print config pushes and new devices as they happen.
     Watch {
         #[command(flatten)]
@@ -162,6 +177,11 @@ fn main() -> Result<()> {
         }
         Cmd::Pcap { file, common, all } => run_capture(&file, common, all),
         Cmd::Watch { common, all } => run_capture("-", common, all),
+        Cmd::Demo { hours, live } => demo::run(hours, live, std::io::BufWriter::new(std::io::stdout().lock())),
+        Cmd::DemoState => {
+            println!("{}", serde_json::to_string_pretty(&demo::state()?)?);
+            Ok(())
+        }
         Cmd::Simulate { pcap, keys, url, limit, every } => simulate::run(&pcap, &load_keys(Some(&keys))?, &url, limit, every),
         Cmd::Sanitize { input, output, domains, devices, files } => {
             sanitize::run(&input, &output, &files, domains, &devices)

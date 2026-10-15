@@ -1,0 +1,1150 @@
+{
+ "apgroup": [
+  {
+   "_id": {
+    "$oid": "00000000000000000000003c"
+   },
+   "attr_hidden_id": "default",
+   "attr_no_delete": true,
+   "name": "All APs",
+   "site_id": "00000000000000000000001e"
+  },
+  {
+   "_id": {
+    "$oid": "00000000000000000000003e"
+   },
+   "attr_no_delete": false,
+   "device_macs": [
+    "02:00:00:00:00:01"
+   ],
+   "for_wlanconf": true,
+   "name": "devices_ap_group",
+   "site_id": "00000000000000000000001e"
+  }
+ ],
+ "clients": [],
+ "config_meta": [],
+ "devices": [
+  {
+   "_id": {
+    "$oid": "00000000000000000000006b"
+   },
+   "adopted": true,
+   "config_network": {
+    "bonding_enabled": false,
+    "type": "dhcp"
+   },
+   "led_override": "off",
+   "mgmt_network_id": "00000000000000000000003b",
+   "model": "U6M",
+   "radio_table": [
+    {
+     "antenna_gain": 0,
+     "antenna_id": -1,
+     "builtin_ant_gain": 0,
+     "builtin_antenna": true,
+     "channel": "auto",
+     "current_antenna_gain": 0,
+     "has_dfs": true,
+     "has_fccdfs": true,
+     "ht": 20,
+     "is_11ac": true,
+     "is_11ax": true,
+     "max_txpower": 22,
+     "min_rssi_enabled": false,
+     "min_txpower": 6,
+     "name": "wifi0",
+     "nss": 2,
+     "radio": "ng",
+     "radio_caps": 16404,
+     "radio_caps2": 31,
+     "sens_level_enabled": false,
+     "tx_power": 20,
+     "tx_power_mode": "disabled",
+     "vwire_enabled": true
+    },
+    {
+     "antenna_gain": 5,
+     "antenna_id": -1,
+     "builtin_ant_gain": 5,
+     "builtin_antenna": true,
+     "channel": 44,
+     "current_antenna_gain": 0,
+     "hard_noise_floor_enabled": false,
+     "has_dfs": true,
+     "has_fccdfs": true,
+     "has_ht160": true,
+     "ht": 80,
+     "is_11ac": true,
+     "is_11ax": true,
+     "max_txpower": 26,
+     "min_rssi_enabled": false,
+     "min_txpower": 6,
+     "name": "wifi1",
+     "nss": 4,
+     "radio": "na",
+     "radio_caps": 201474052,
+     "radio_caps2": 31,
+     "sens_level_enabled": false,
+     "tx_power": 9,
+     "tx_power_mode": "custom",
+     "vwire_enabled": true
+    }
+   ],
+   "site_id": "00000000000000000000001e",
+   "type": "uap",
+   "version": "8.8.11.20161",
+   "wlangroup_id_na": "00000000000000000000003f",
+   "wlangroup_id_ng": "00000000000000000000003f",
+   "x_aes_gcm": true,
+   "x_authkey": "demo-secret"
+  }
+ ],
+ "networkconf": [
+  {
+   "_id": {
+    "$oid": "00000000000000000000003b"
+   },
+   "attr_hidden_id": "LAN",
+   "attr_no_delete": true,
+   "auto_scale_enabled": true,
+   "dhcp_relay_enabled": false,
+   "dhcp_relay_servers": [],
+   "dhcpd_boot_enabled": false,
+   "dhcpd_conflict_checking": true,
+   "dhcpd_dns_enabled": false,
+   "dhcpd_enabled": false,
+   "dhcpd_gateway_enabled": false,
+   "dhcpd_ip_1": "192.168.1.1",
+   "dhcpd_ip_2": "",
+   "dhcpd_ip_3": "",
+   "dhcpd_leasetime": 86400,
+   "dhcpd_ntp_enabled": false,
+   "dhcpd_start": "192.168.1.6",
+   "dhcpd_stop": "192.168.1.254",
+   "dhcpd_tftp_server": "",
+   "dhcpd_time_offset_enabled": false,
+   "dhcpd_unifi_controller": "",
+   "dhcpd_wins_1": "",
+   "dhcpd_wins_2": "",
+   "dhcpd_wins_enabled": false,
+   "dhcpd_wpad_url": "",
+   "dhcpdv6_dns_auto": true,
+   "dhcpdv6_leasetime": 86400,
+   "dhcpdv6_start": "::2",
+   "dhcpdv6_stop": "::7d1",
+   "dhcpguard_enabled": true,
+   "domain_name": "localdomain",
+   "enabled": true,
+   "gateway_type": "default",
+   "igmp_fastleave": true,
+   "igmp_snooping": false,
+   "internet_access_enabled": true,
+   "ip_aliases": [],
+   "ip_subnet": "192.168.1.1/24",
+   "ipv6_aliases": [],
+   "ipv6_client_address_assignment": "slaac",
+   "ipv6_enabled": true,
+   "ipv6_interface_type": "none",
+   "ipv6_pd_interface": "wan",
+   "ipv6_pd_start": "::2",
+   "ipv6_pd_stop": "::7d1",
+   "ipv6_ra_enabled": true,
+   "ipv6_ra_preferred_lifetime": 14400,
+   "ipv6_ra_priority": "high",
+   "ipv6_setting_preference": "auto",
+   "is_nat": true,
+   "lte_lan_enabled": true,
+   "mdns_enabled": false,
+   "name": "Default",
+   "nat_outbound_ip_addresses": [],
+   "networkgroup": "LAN",
+   "purpose": "corporate",
+   "setting_preference": "manual",
+   "site_id": "00000000000000000000001e",
+   "upnp_lan_enabled": false,
+   "vlan_enabled": false,
+   "wan_dhcpv6_pd_size_auto": false
+  }
+ ],
+ "setting": [
+  {
+   "_id": {
+    "$oid": "000000000000000000000043"
+   },
+   "enabled": false,
+   "key": "connectivity",
+   "mlo_mesh_enabled": false,
+   "site_id": "00000000000000000000001e",
+   "uplink_type": "gateway",
+   "x_mesh_essid": "demo-secret",
+   "x_mesh_psk": "demo-secret"
+  },
+  {
+   "_id": {
+    "$oid": "000000000000000000000044"
+   },
+   "enabled": false,
+   "key": "element_adopt",
+   "site_id": "00000000000000000000001e",
+   "x_element_essid": "demo-secret",
+   "x_element_psk": "demo-secret"
+  },
+  {
+   "_id": {
+    "$oid": "000000000000000000000045"
+   },
+   "auth": "none",
+   "ec_enabled": true,
+   "expire": 480,
+   "expire_number": 8,
+   "expire_unit": 60,
+   "key": "guest_access",
+   "portal_customized": false,
+   "portal_customized_authentication_text": "Select Your authentication method",
+   "portal_customized_bg_color": "#005ED9",
+   "portal_customized_bg_image_enabled": false,
+   "portal_customized_bg_type": "color",
+   "portal_customized_box_color": "#FFFFFF",
+   "portal_customized_box_opacity": 100,
+   "portal_customized_box_radius": 25,
+   "portal_customized_box_text_color": "#000000",
+   "portal_customized_button_color": "#006FFF",
+   "portal_customized_button_text": "Login",
+   "portal_customized_button_text_color": "#FFFFFF",
+   "portal_customized_languages": [
+    "en"
+   ],
+   "portal_customized_link_color": "#006FFF",
+   "portal_customized_logo_position": "center",
+   "portal_customized_logo_size": 128,
+   "portal_customized_success_text": "Welcome to UniFi Guest WiFi Hotspot",
+   "portal_customized_text_color": "#232326",
+   "portal_customized_title": "UniFi Guest WiFi",
+   "portal_customized_welcome_text": "Welcome to UniFi Guest WiFi Hotspot",
+   "portal_enabled": false,
+   "portal_use_hostname": false,
+   "redirect_enabled": false,
+   "redirect_https": true,
+   "redirect_to_https": false,
+   "restricted_subnet_1": "192.168.1.0/16",
+   "restricted_subnet_2": "172.16.0.0/12",
+   "restricted_subnet_3": "10.0.0.0/8",
+   "site_id": "00000000000000000000001e",
+   "template_engine": "angular"
+  },
+  {
+   "_id": {
+    "$oid": "000000000000000000000046"
+   },
+   "key": "ntp",
+   "ntp_server_1": "0.ubnt.pool.ntp.org",
+   "ntp_server_2": "1.ubnt.pool.ntp.org",
+   "ntp_server_3": "2.ubnt.pool.ntp.org",
+   "ntp_server_4": "3.ubnt.pool.ntp.org",
+   "setting_preference": "auto",
+   "site_id": "00000000000000000000001e"
+  },
+  {
+   "_id": {
+    "$oid": "000000000000000000000047"
+   },
+   "advanced_feature_enabled": true,
+   "alert_enabled": false,
+   "auto_upgrade": false,
+   "auto_upgrade_hour": 5,
+   "debug_tools_enabled": false,
+   "key": "mgmt",
+   "led_enabled": true,
+   "site_id": "00000000000000000000001e",
+   "unifi_idp_enabled": true,
+   "wifiman_enabled": true,
+   "x_api_token": "demo-secret",
+   "x_mgmt_key": "demo-secret",
+   "x_ssh_auth_password_enabled": true,
+   "x_ssh_bind_wildcard": false,
+   "x_ssh_enabled": false,
+   "x_ssh_keys": [],
+   "x_ssh_password": "demo-secret",
+   "x_ssh_sha512passwd": "demo-secret",
+   "x_ssh_username": "demo-secret"
+  },
+  {
+   "_id": {
+    "$oid": "000000000000000000000048"
+   },
+   "enabled": false,
+   "fingerprintingEnabled": false,
+   "key": "dpi",
+   "site_id": "00000000000000000000001e"
+  },
+  {
+   "_id": {
+    "$oid": "000000000000000000000049"
+   },
+   "brightness": 80,
+   "enabled": true,
+   "idle_timeout": 300,
+   "key": "lcm",
+   "site_id": "00000000000000000000001e",
+   "sync": true,
+   "touch_event": true
+  },
+  {
+   "_id": {
+    "$oid": "00000000000000000000004a"
+   },
+   "broadcast_ping": false,
+   "dns_verification": {
+    "domain": "ui.com",
+    "primary_dns_server": "1.1.1.1",
+    "secondary_dns_server": "8.8.8.8",
+    "setting_preference": "auto"
+   },
+   "ftp_module": false,
+   "gre_module": false,
+   "h323_module": false,
+   "icmp_timeout": 30,
+   "key": "usg",
+   "mss_clamp": "auto",
+   "offload_accounting": true,
+   "offload_l2_blocking": true,
+   "offload_sch": true,
+   "other_timeout": 600,
+   "pptp_module": false,
+   "receive_redirects": false,
+   "send_redirects": false,
+   "sip_module": false,
+   "site_id": "00000000000000000000001e",
+   "syn_cookies": false,
+   "tcp_close_timeout": 10,
+   "tcp_close_wait_timeout": 60,
+   "tcp_established_timeout": 7440,
+   "tcp_fin_wait_timeout": 120,
+   "tcp_last_ack_timeout": 30,
+   "tcp_syn_recv_timeout": 60,
+   "tcp_syn_sent_timeout": 120,
+   "tcp_time_wait_timeout": 120,
+   "tftp_module": false,
+   "timeout_setting_preference": "auto",
+   "udp_other_timeout": 30,
+   "udp_stream_timeout": 180,
+   "upnp_enabled": false,
+   "upnp_nat_pmp_enabled": true,
+   "upnp_secure_mode": true
+  },
+  {
+   "_id": {
+    "$oid": "00000000000000000000004b"
+   },
+   "debug": false,
+   "enabled": true,
+   "ip": "",
+   "key": "rsyslogd",
+   "log_all_contents": true,
+   "netconsole_enabled": false,
+   "netconsole_host": "",
+   "netconsole_port": "514",
+   "port": "514",
+   "site_id": "00000000000000000000001e",
+   "this_controller": true,
+   "this_controller_encrypted_only": false
+  },
+  {
+   "_id": {
+    "$oid": "00000000000000000000004c"
+   },
+   "auto_adjust_channels_to_country": true,
+   "auto_channel_presets_type": "conservative",
+   "auto_enabled": false,
+   "channels_6e": [
+    "1",
+    "5",
+    "9",
+    "13",
+    "17",
+    "21",
+    "25",
+    "29",
+    "33",
+    "37",
+    "41",
+    "45",
+    "49",
+    "53",
+    "57",
+    "61",
+    "65",
+    "69",
+    "73",
+    "77",
+    "81",
+    "85",
+    "89",
+    "93"
+   ],
+   "channels_blacklist": [
+    {
+     "channel": "2",
+     "channel_width": "20",
+     "radio": "ng"
+    },
+    {
+     "channel": "3",
+     "channel_width": "20",
+     "radio": "ng"
+    },
+    {
+     "channel": "4",
+     "channel_width": "20",
+     "radio": "ng"
+    },
+    {
+     "channel": "5",
+     "channel_width": "20",
+     "radio": "ng"
+    },
+    {
+     "channel": "7",
+     "channel_width": "20",
+     "radio": "ng"
+    },
+    {
+     "channel": "8",
+     "channel_width": "20",
+     "radio": "ng"
+    },
+    {
+     "channel": "9",
+     "channel_width": "20",
+     "radio": "ng"
+    },
+    {
+     "channel": "10",
+     "channel_width": "20",
+     "radio": "ng"
+    },
+    {
+     "channel": "12",
+     "channel_width": "20",
+     "radio": "ng"
+    },
+    {
+     "channel": "13",
+     "channel_width": "20",
+     "radio": "ng"
+    },
+    {
+     "channel": "14",
+     "channel_width": "20",
+     "radio": "ng"
+    },
+    {
+     "channel": "100",
+     "channel_width": "20",
+     "radio": "na"
+    },
+    {
+     "channel": "104",
+     "channel_width": "20",
+     "radio": "na"
+    },
+    {
+     "channel": "108",
+     "channel_width": "20",
+     "radio": "na"
+    },
+    {
+     "channel": "112",
+     "channel_width": "20",
+     "radio": "na"
+    },
+    {
+     "channel": "116",
+     "channel_width": "20",
+     "radio": "na"
+    },
+    {
+     "channel": "120",
+     "channel_width": "20",
+     "radio": "na"
+    },
+    {
+     "channel": "124",
+     "channel_width": "20",
+     "radio": "na"
+    },
+    {
+     "channel": "128",
+     "channel_width": "20",
+     "radio": "na"
+    },
+    {
+     "channel": "132",
+     "channel_width": "20",
+     "radio": "na"
+    },
+    {
+     "channel": "136",
+     "channel_width": "20",
+     "radio": "na"
+    },
+    {
+     "channel": "52",
+     "channel_width": "20",
+     "radio": "na"
+    },
+    {
+     "channel": "56",
+     "channel_width": "20",
+     "radio": "na"
+    },
+    {
+     "channel": "60",
+     "channel_width": "20",
+     "radio": "na"
+    },
+    {
+     "channel": "64",
+     "channel_width": "20",
+     "radio": "na"
+    },
+    {
+     "channel": "140",
+     "channel_width": "20",
+     "radio": "na"
+    }
+   ],
+   "channels_na": [
+    "36",
+    "40",
+    "44",
+    "48"
+   ],
+   "channels_ng": [
+    "1",
+    "6",
+    "11"
+   ],
+   "cron_expr": "0 5 * * *",
+   "default": true,
+   "enabled": true,
+   "exclude_devices": [],
+   "ht_modes_na": [
+    "20",
+    "40"
+   ],
+   "ht_modes_ng": [
+    "20"
+   ],
+   "key": "radio_ai",
+   "optimize": [
+    "channel"
+   ],
+   "radios": [
+    "ng",
+    "na"
+   ],
+   "radios_configuration": [
+    {
+     "channel_width": 40,
+     "dfs": false,
+     "radio": "na"
+    },
+    {
+     "channel_width": 20,
+     "dfs": false,
+     "radio": "ng"
+    },
+    {
+     "channel_width": 160,
+     "dfs": false,
+     "radio": "6e"
+    }
+   ],
+   "setting_preference": "auto",
+   "site_id": "00000000000000000000001e"
+  },
+  {
+   "_id": {
+    "$oid": "00000000000000000000004e"
+   },
+   "code": "826",
+   "key": "country",
+   "site_id": "00000000000000000000001e"
+  },
+  {
+   "_id": {
+    "$oid": "00000000000000000000004f"
+   },
+   "key": "locale",
+   "site_id": "00000000000000000000001e",
+   "timezone": "UTC"
+  },
+  {
+   "_id": {
+    "$oid": "000000000000000000000050"
+   },
+   "enabled": true,
+   "key": "teleport",
+   "site_id": "00000000000000000000001e"
+  },
+  {
+   "_id": {
+    "$oid": "000000000000000000000051"
+   },
+   "acl_device_isolation": [],
+   "acl_l3_isolation": [],
+   "auto_stp_edge_detection_enabled": false,
+   "dhcp_snoop": false,
+   "dot1x_fallback_networkconf_id": "",
+   "dot1x_portctrl_enabled": false,
+   "flood_known_protocols": true,
+   "flowctrl_enabled": false,
+   "forward_unknown_mcast_router_ports": true,
+   "jumboframe_enabled": false,
+   "key": "global_switch",
+   "link_debounce": 0,
+   "poe_staging_delay_msec": 200,
+   "radiusprofile_id": "000000000000000000000052",
+   "site_id": "00000000000000000000001e",
+   "stp_version": "disabled",
+   "switch_exclusions": []
+  },
+  {
+   "_id": {
+    "$oid": "000000000000000000000053"
+   },
+   "advanced_filtering_preference": "disabled",
+   "content_filtering_blocking_page_enabled": true,
+   "dns_filtering": false,
+   "dns_filters": [],
+   "enabled_categories": [],
+   "honeypot": [],
+   "honeypot_enabled": false,
+   "ips_mode": "disabled",
+   "key": "ips",
+   "memory_optimized": true,
+   "site_id": "00000000000000000000001e"
+  },
+  {
+   "_id": {
+    "$oid": "000000000000000000000054"
+   },
+   "enabled": true,
+   "key": "magic_site_to_site_vpn",
+   "site_id": "00000000000000000000001e"
+  },
+  {
+   "_id": {
+    "$oid": "000000000000000000000055"
+   },
+   "key": "doh",
+   "server_names": [
+    "cloudflare",
+    "google"
+   ],
+   "site_id": "00000000000000000000001e",
+   "state": "off"
+  },
+  {
+   "_id": {
+    "$oid": "000000000000000000000056"
+   },
+   "key": "ether_lighting",
+   "network_defaults": [
+    {
+     "key": "00000000000000000000003b",
+     "raw_color_hex": "0544ff"
+    },
+    {
+     "key": "none",
+     "raw_color_hex": "ffffff"
+    }
+   ],
+   "network_overrides": [],
+   "site_id": "00000000000000000000001e",
+   "speed_defaults": [
+    {
+     "key": "10M",
+     "raw_color_hex": "FFC105"
+    },
+    {
+     "key": "FE",
+     "raw_color_hex": "FFC105"
+    },
+    {
+     "key": "GbE",
+     "raw_color_hex": "FFFFFF"
+    },
+    {
+     "key": "2.5GbE",
+     "raw_color_hex": "0515FF"
+    },
+    {
+     "key": "5GbE",
+     "raw_color_hex": "FF6305"
+    },
+    {
+     "key": "10GbE",
+     "raw_color_hex": "FFFFFF"
+    },
+    {
+     "key": "25GbE",
+     "raw_color_hex": "0572FF"
+    },
+    {
+     "key": "40GbE",
+     "raw_color_hex": "5305FF"
+    },
+    {
+     "key": "100GbE",
+     "raw_color_hex": "32FFD9"
+    }
+   ],
+   "speed_overrides": []
+  },
+  {
+   "_id": {
+    "$oid": "000000000000000000000057"
+   },
+   "key": "openvpn",
+   "site_id": "00000000000000000000001e",
+   "x_pregenerated_dh_key": "demo-secret"
+  },
+  {
+   "_id": {
+    "$oid": "000000000000000000000058"
+   },
+   "key": "peer_to_peer",
+   "psk": "secret-24",
+   "site_id": "00000000000000000000001e",
+   "ssid": "ssid-10"
+  },
+  {
+   "_id": {
+    "$oid": "000000000000000000000059"
+   },
+   "key": "ssl_inspection",
+   "site_id": "00000000000000000000001e",
+   "state": "off"
+  },
+  {
+   "_id": {
+    "$oid": "00000000000000000000005a"
+   },
+   "key": "dashboard",
+   "layout_preference": "manual",
+   "site_id": "00000000000000000000001e",
+   "widgets": [
+    {
+     "enabled": true,
+     "name": "cybersecure"
+    },
+    {
+     "enabled": true,
+     "name": "most_active_aps_clients"
+    },
+    {
+     "enabled": true,
+     "name": "wifi_tx_retries"
+    },
+    {
+     "enabled": true,
+     "name": "wifi_connectivity"
+    },
+    {
+     "enabled": true,
+     "name": "ap_radio_density"
+    }
+   ]
+  },
+  {
+   "_id": {
+    "$oid": "00000000000000000000005b"
+   },
+   "excluded_network_ids": [],
+   "key": "global_nat",
+   "mode": "auto",
+   "site_id": "00000000000000000000001e"
+  },
+  {
+   "_id": {
+    "$oid": "00000000000000000000005c"
+   },
+   "auto_engine_id_enabled": true,
+   "enabled": false,
+   "export_frequency": 5,
+   "key": "netflow",
+   "port": 2055,
+   "refresh_rate": 20,
+   "site_id": "00000000000000000000001e",
+   "version": 10
+  },
+  {
+   "_id": {
+    "$oid": "00000000000000000000005d"
+   },
+   "custom_services": [],
+   "enabled_for": "none",
+   "enabled_for_network_ids": [],
+   "key": "mdns",
+   "mode": "all",
+   "predefined_services": [],
+   "site_id": "00000000000000000000001e"
+  },
+  {
+   "_id": {
+    "$oid": "00000000000000000000005e"
+   },
+   "default_security_posture": "ALLOW_ALL",
+   "key": "global_network",
+   "site_id": "00000000000000000000001e"
+  },
+  {
+   "_id": {
+    "$oid": "000000000000000000000062"
+   },
+   "auto_unknown_traffic_handling": false,
+   "enabled": true,
+   "failover_querier": "",
+   "fastleave_for_network_ids": [
+    "00000000000000000000003b"
+   ],
+   "flood_known_protocols": true,
+   "flood_unknown_multicast_for_network_ids": [],
+   "forward_unknown_mcast_router_ports": false,
+   "key": "igmp_snooping",
+   "network_ids": [
+    "00000000000000000000003b"
+   ],
+   "primary_querier": "",
+   "querier_addresses": [],
+   "querier_mode": "OFF",
+   "querier_subscription_mode": "ALL",
+   "querier_switches": [],
+   "site_id": "00000000000000000000001e",
+   "subscription_mode": "ALL",
+   "switches": []
+  },
+  {
+   "_id": {
+    "$oid": "000000000000000000000063"
+   },
+   "alerts": [],
+   "key": "ips_suppression",
+   "site_id": "00000000000000000000001e",
+   "whitelist": []
+  },
+  {
+   "_id": {
+    "$oid": "000000000000000000000064"
+   },
+   "ip_filtering": {
+    "action": "block",
+    "countries": "",
+    "enabled": false,
+    "traffic_direction": "both"
+   },
+   "key": "usg_geo",
+   "site_id": "00000000000000000000001e"
+  },
+  {
+   "_id": {
+    "$oid": "000000000000000000000065"
+   },
+   "global_supervision_enabled": false,
+   "heartbeat_interval_seconds": 60,
+   "key": "device_supervision",
+   "power_off_duration_seconds": 120,
+   "silence_threshold_seconds": 900,
+   "site_id": "00000000000000000000001e"
+  },
+  {
+   "_id": {
+    "$oid": "000000000000000000000066"
+   },
+   "ikev2_reauthentication_method": "make-before-break",
+   "key": "ipsec",
+   "site_id": "00000000000000000000001e"
+  }
+ ],
+ "sites": [
+  {
+   "_id": {
+    "$oid": "00000000000000000000001e"
+   },
+   "attr_hidden_id": "default",
+   "attr_no_delete": true,
+   "desc": "Default",
+   "name": "default"
+  }
+ ],
+ "source": "unifi-network-application",
+ "wlanconf": [
+  {
+   "_id": {
+    "$oid": "000000000000000000000039"
+   },
+   "advertise_device_name_in_beacon": false,
+   "ap_group_ids": [
+    "00000000000000000000003c"
+   ],
+   "ap_group_mode": "all",
+   "auth_cache": false,
+   "b_supported": false,
+   "bc_filter_enabled": true,
+   "bc_filter_list": [
+    "02:00:00:00:00:1d",
+    "02:00:00:00:00:03",
+    "02:00:00:00:00:20",
+    "02:00:00:00:00:0f",
+    "02:00:00:00:00:21",
+    "02:00:00:00:00:0a",
+    "02:00:00:00:00:1f",
+    "02:00:00:00:00:15",
+    "02:00:00:00:00:1b",
+    "02:00:00:00:00:0b",
+    "02:00:00:00:00:1e"
+   ],
+   "broadcasting_aps": [],
+   "bss_transition": true,
+   "country_beacon": true,
+   "dns_assistance_mode": "manual",
+   "dns_assistance_servers": [
+    "192.168.1.1"
+   ],
+   "dpi_enabled": false,
+   "dtim_6e": 3,
+   "dtim_mode": "default",
+   "dtim_na": 3,
+   "dtim_ng": 1,
+   "element_adopt": false,
+   "enabled": true,
+   "enhanced_iot": false,
+   "fast_roaming_enabled": true,
+   "group_rekey": 10800,
+   "hide_ssid": false,
+   "hotspot2conf_enabled": false,
+   "iapp_enabled": true,
+   "iot_channel_lock": false,
+   "iot_dtim_lock": false,
+   "is_guest": false,
+   "l2_isolation": false,
+   "mac_filter_enabled": false,
+   "mac_filter_list": [],
+   "mac_filter_policy": "allow",
+   "mcastenhance_enabled": true,
+   "mdns_proxy_custom": [
+    {
+     "ap_scope_mode": "all",
+     "custom_services": [],
+     "networkconf_ids": [],
+     "predefined_services": [
+      {
+       "code": "google_chromecast"
+      },
+      {
+       "code": "spotify_connect"
+      }
+     ],
+     "services_mode": "specific"
+    }
+   ],
+   "mdns_proxy_mode": "custom",
+   "minrate_na_advertising_rates": false,
+   "minrate_na_data_rate_kbps": 6000,
+   "minrate_na_enabled": false,
+   "minrate_ng_advertising_rates": false,
+   "minrate_ng_data_rate_kbps": 1000,
+   "minrate_ng_enabled": true,
+   "minrate_setting_preference": "auto",
+   "mlo_enabled": false,
+   "multicast_suppressor_mode": "aggressive",
+   "name": "Homestead",
+   "name_combine_enabled": false,
+   "networkconf_id": "00000000000000000000003b",
+   "no2ghz_oui": false,
+   "p2p": false,
+   "p2p_cross_connect": false,
+   "passphrase_autogenerated": false,
+   "pmf_cipher": "auto",
+   "pmf_mode": "optional",
+   "private_preshared_keys": [],
+   "private_preshared_keys_enabled": false,
+   "proxy_arp": true,
+   "radius_das_enabled": false,
+   "radius_mac_auth_enabled": false,
+   "radius_macacl_empty_password": false,
+   "radius_macacl_format": "none_lower",
+   "roaming_assistant_6e_enabled": false,
+   "roaming_assistant_na_enabled": true,
+   "roaming_assistant_na_rssi": -75,
+   "rrm_enabled": false,
+   "sae_anti_clogging": 5,
+   "sae_groups": [],
+   "sae_psk": [],
+   "sae_sync": 5,
+   "schedule": [],
+   "schedule_enabled": false,
+   "schedule_with_duration": [],
+   "security": "wpapsk",
+   "setting_preference": "manual",
+   "short_id": 2,
+   "site_id": "00000000000000000000001e",
+   "tdls_prohibit": false,
+   "uapsd_enabled": true,
+   "usergroup_id": "00000000000000000000003a",
+   "vlan_enabled": false,
+   "wep_idx": 1,
+   "wlan_band": "both",
+   "wlan_bands": [
+    "2g",
+    "5g"
+   ],
+   "wpa3_enhanced_192": false,
+   "wpa3_fast_roaming": true,
+   "wpa3_support": true,
+   "wpa3_transition": true,
+   "wpa_enc": "ccmp",
+   "wpa_mode": "wpa2",
+   "x_iapp_key": "demo-secret",
+   "x_passphrase": "demo-secret"
+  },
+  {
+   "_id": {
+    "$oid": "00000000000000000000003d"
+   },
+   "advertise_device_name_in_beacon": false,
+   "ap_group_ids": [
+    "00000000000000000000003e"
+   ],
+   "ap_group_mode": "devices",
+   "auth_cache": true,
+   "bc_filter_enabled": true,
+   "bc_filter_list": [
+    "02:00:00:00:00:0f",
+    "02:00:00:00:00:0b",
+    "02:00:00:00:00:03",
+    "02:00:00:00:00:1b",
+    "02:00:00:00:00:15",
+    "02:00:00:00:00:13"
+   ],
+   "broadcasting_aps": [
+    "02:00:00:00:00:01"
+   ],
+   "bss_transition": false,
+   "country_beacon": true,
+   "dns_assistance_mode": "manual",
+   "dns_assistance_servers": [
+    "192.168.1.1"
+   ],
+   "dtim_6e": 3,
+   "dtim_mode": "default",
+   "dtim_na": 3,
+   "dtim_ng": 1,
+   "enabled": true,
+   "enhanced_iot": false,
+   "fast_roaming_enabled": false,
+   "group_rekey": 3600,
+   "hide_ssid": false,
+   "hotspot2conf_enabled": false,
+   "iapp_enabled": true,
+   "iot_channel_lock": false,
+   "iot_dtim_lock": false,
+   "is_guest": false,
+   "l2_isolation": false,
+   "mac_filter_enabled": true,
+   "mac_filter_list": [
+    "02:00:00:00:00:11",
+    "02:00:00:00:00:22",
+    "02:00:00:00:00:12",
+    "02:00:00:00:00:14",
+    "02:00:00:00:00:10",
+    "02:00:00:00:00:13",
+    "02:00:00:00:00:23",
+    "02:00:00:00:00:15",
+    "02:00:00:00:00:0e",
+    "02:00:00:00:00:0c",
+    "02:00:00:00:00:0f",
+    "02:00:00:00:00:24"
+   ],
+   "mac_filter_policy": "allow",
+   "mcastenhance_enabled": true,
+   "mdns_proxy_custom": [
+    {
+     "ap_scope_mode": "all",
+     "networkconf_ids": [],
+     "services_mode": "none"
+    }
+   ],
+   "mdns_proxy_mode": "custom",
+   "minrate_na_advertising_rates": false,
+   "minrate_na_data_rate_kbps": 6000,
+   "minrate_na_enabled": false,
+   "minrate_ng_advertising_rates": false,
+   "minrate_ng_data_rate_kbps": 1000,
+   "minrate_ng_enabled": true,
+   "minrate_setting_preference": "auto",
+   "mlo_enabled": false,
+   "multicast_suppressor_mode": "aggressive",
+   "name": "Homestead IoT",
+   "networkconf_id": "00000000000000000000003b",
+   "no2ghz_oui": false,
+   "passphrase_autogenerated": false,
+   "pmf_cipher": "auto",
+   "pmf_mode": "optional",
+   "private_preshared_keys": [],
+   "private_preshared_keys_enabled": false,
+   "proxy_arp": true,
+   "radius_das_enabled": false,
+   "radius_mac_auth_enabled": false,
+   "roaming_assistant_6e_enabled": false,
+   "roaming_assistant_na_enabled": false,
+   "sae_anti_clogging": 5,
+   "sae_sync": 5,
+   "schedule_enabled": false,
+   "schedule_with_duration": [],
+   "security": "wpapsk",
+   "setting_preference": "manual",
+   "short_id": 3,
+   "site_id": "00000000000000000000001e",
+   "uapsd_enabled": true,
+   "usergroup_id": "00000000000000000000003a",
+   "wep_idx": 1,
+   "wlan_band": "2g",
+   "wlan_bands": [
+    "2g"
+   ],
+   "wpa3_enhanced_192": false,
+   "wpa3_support": true,
+   "wpa3_transition": true,
+   "wpa_enc": "ccmp",
+   "wpa_mode": "wpa2",
+   "x_iapp_key": "demo-secret",
+   "x_passphrase": "demo-secret"
+  }
+ ],
+ "wlangroup": [
+  {
+   "_id": {
+    "$oid": "00000000000000000000003f"
+   },
+   "attr_hidden_id": "Default",
+   "attr_no_delete": true,
+   "name": "Default",
+   "site_id": "00000000000000000000001e"
+  },
+  {
+   "_id": {
+    "$oid": "000000000000000000000040"
+   },
+   "attr_hidden": true,
+   "attr_hidden_id": "Off",
+   "attr_no_delete": true,
+   "attr_no_edit": true,
+   "name": "Off",
+   "site_id": "00000000000000000000001e"
+  }
+ ]
+}
