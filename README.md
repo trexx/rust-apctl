@@ -110,15 +110,6 @@ cargo build --release -p controller   # or: podman build --target runtime .
 `informdump --help` for its commands. Pushing a version tag (e.g. `0.15.1`) publishes the
 image.
 
-## Contributing
-
-Never commit secrets or captures: import snapshots and pcaps hold AP keys and
-passphrases. Tests that replay real captures read them from `$APCTL_TESTDATA` (see
-[docs/captures.md](docs/captures.md)), and `informdump sanitize` makes them shareable.
-
-The official application may be decompiled as a reference for interoperability. Its code
-and assets never go in this repository.
-
 ## License
 
 [MIT](LICENSE)
