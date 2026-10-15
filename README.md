@@ -1,4 +1,4 @@
-# apctl
+# rust-apctl
 
 A lightweight, self-hosted controller for **UniFi access points**. It replaces the UniFi
 Network Application on sites that only have UniFi APs. apctl is a single Rust binary with
