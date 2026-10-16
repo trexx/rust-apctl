@@ -19,7 +19,7 @@ futures-util = { workspace = true, optional = true }
 getrandom.workspace = true
 hex.workspace = true
 inform.workspace = true
-mongodb = { version = "2.8", optional = true }
+mongodb = { workspace = true, optional = true }
 regex.workspace = true
 # Keys keep their order in everything informdump prints and writes (decoded
 # payloads, --save, sanitised fixtures, demo-state), as when bson enabled it.

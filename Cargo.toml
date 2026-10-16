@@ -9,19 +9,26 @@ publish = false
 
 # Shared versions. Members add the features they need.
 [workspace.dependencies]
+aes = "0.9.3"
 aes-gcm = "0.11.1"
 anyhow = "1.0.104"
 apcfg = { version = "0.1.0", path = "crates/apcfg" }
+cbc = "0.2.1"
 clap = "4.6.7"
 etherparse = "0.21.0"
 flate2 = "1.1.10"
 futures-util = "0.3.34"
 getrandom = "0.4.3"
 hex = "0.4.3"
+httparse = "1.10.1"
 inform = { version = "0.1.0", path = "crates/inform" }
+mongodb = "2.8"
+pcap-parser = "0.17.0"
 regex = "1.13.1"
 serde = "1.0.229"
 serde_json = "1.0.154"
+snap = "1.1.2"
+thiserror = "2.0.21"
 tokio = "1.53.2"
 wire = { version = "0.1.0", path = "crates/wire" }
 
