@@ -36,8 +36,13 @@ import { ConnectionLog } from "../components/Connections";
 import { ClientActions } from "../components/Actions";
 import type { ClientView, Multicast } from "../api";
 
+/** Keyed by MAC: nothing typed or shown for one client carries over to the next. */
 export function Client() {
   const { mac = "" } = useParams();
+  return <ClientPage key={mac} mac={mac} />;
+}
+
+function ClientPage({ mac }: { mac: string }) {
   const [range, setRange] = useTimeSpan(6 * 3600);
   const client = useClient(mac);
   const devices = useDevices();

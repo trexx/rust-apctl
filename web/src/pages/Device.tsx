@@ -54,8 +54,13 @@ const DeviceSettingsPanel = lazyNamed(
   "DeviceSettingsPanel",
 );
 
+/** Keyed by MAC: nothing typed or shown for one AP carries over to the next. */
 export function Device() {
   const { mac = "" } = useParams();
+  return <DevicePage key={mac} mac={mac} />;
+}
+
+function DevicePage({ mac }: { mac: string }) {
   const [range, setRange] = useTimeSpan(6 * 3600);
   const detail = useDevice(mac);
 
