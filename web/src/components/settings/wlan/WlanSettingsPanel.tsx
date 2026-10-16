@@ -27,6 +27,7 @@ export function WlanSettingsPanel() {
       items={list.wlans}
       active={list.active}
       readOnly={readOnly}
+      gone="This SSID was deleted meanwhile."
       editor={(wlan, onClose) => (
         <>
           <div className="small">

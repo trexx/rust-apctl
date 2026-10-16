@@ -84,6 +84,7 @@ export function SpeedLimitsPanel() {
       items={groups}
       active={active}
       readOnly={readOnly}
+      gone="This speed limit was deleted meanwhile."
       editor={(group, onClose) => (
         <SpeedLimitEditor group={group} active={active} onClose={onClose} />
       )}

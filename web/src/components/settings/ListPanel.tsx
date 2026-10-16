@@ -15,6 +15,7 @@ export function ListPanel<T extends { id: string }>({
   items,
   active,
   readOnly,
+  gone,
   editor,
   rows,
 }: {
@@ -26,6 +27,8 @@ export function ListPanel<T extends { id: string }>({
   items: T[];
   active: boolean;
   readOnly: boolean;
+  /** Said when the one being edited was deleted meanwhile. */
+  gone: string;
   /** The editor for `item`, or for a new one when it is null. */
   editor: (item: T | null, onClose: () => void) => ReactNode;
   /** The table rows, with the actions their buttons take. */
@@ -46,8 +49,18 @@ export function ListPanel<T extends { id: string }>({
         onSaved={() => setRemoving(null)}
       />
     );
-  else if (editing !== null)
+  else if (editing === "new" || current)
     body = <Fragment key={editing}>{editor(current, close)}</Fragment>;
+  else if (editing !== null)
+    // Saving an editor whose item is gone would create it anew.
+    body = (
+      <div className="form-warn">
+        {gone}{" "}
+        <button className="btn small" onClick={close}>
+          Close
+        </button>
+      </div>
+    );
   else
     body = (
       <div className="table-wrap">
