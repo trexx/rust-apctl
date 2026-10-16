@@ -196,7 +196,7 @@ async fn serve(args: ServeArgs) -> Result<()> {
     tracing::info!("loaded {} device keys and {} syslog keys", keys.len(), keys.syslog_len());
     let keys = Arc::new(keys);
 
-    let backups = backup::Backups { data_dir: data_dir.clone(), key: backup_key.as_deref().map(backup::load_key).transpose()? };
+    let backups = backup::Backups::new(data_dir.clone(), backup_key.as_deref().map(backup::load_key).transpose()?);
     if backups.key.is_none() {
         tracing::warn!("no --backup-key: backups are written unencrypted");
     }

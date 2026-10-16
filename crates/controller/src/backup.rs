@@ -57,9 +57,49 @@ const MAX_RATIO: u64 = 100;
 pub struct Backups {
     pub data_dir: PathBuf,
     pub key: Option<[u8; 32]>,
+    /// The schedule and the newest automatic backup, read once and then kept
+    /// here by what changes them, rather than read again every minute.
+    known: Arc<Mutex<Known>>,
+}
+
+#[derive(Default)]
+struct Known {
+    settings: Option<Settings>,
+    /// When the newest automatic backup was made (0: none).
+    last_auto: Option<Ts>,
 }
 
 impl Backups {
+    pub fn new(data_dir: PathBuf, key: Option<[u8; 32]>) -> Self {
+        Backups { data_dir, key, known: Default::default() }
+    }
+
+    fn known(&self) -> std::sync::MutexGuard<'_, Known> {
+        self.known.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// The backup settings: the stored ones, read once (the defaults when
+    /// none are stored, or, with a warning, while they cannot be read).
+    fn settings(&self, store: &store::Store) -> Settings {
+        let mut k = self.known();
+        if let Some(s) = &k.settings {
+            return s.clone();
+        }
+        match load_settings(store) {
+            Ok(s) => k.settings.insert(s).clone(),
+            Err(e) => {
+                tracing::warn!("the backup settings could not be read, the defaults apply: {e:#}");
+                Settings::default()
+            }
+        }
+    }
+
+    /// When the newest automatic backup was made (0: none).
+    fn last_auto(&self) -> Ts {
+        let mut k = self.known();
+        *k.last_auto.get_or_insert_with(|| list(self).iter().filter(|m| m.kind == Kind::Auto).map(|m| m.created).max().unwrap_or(0))
+    }
+
     pub fn dir(&self) -> PathBuf {
         self.data_dir.join("backups")
     }
@@ -451,6 +491,11 @@ pub fn create(b: &Backups, src_dir: &Path, kind: Kind, days: i64) -> Result<Meta
         let size = fs::metadata(dir.join(&name))?.len();
         let meta = Meta { name: name.clone(), kind, version: VERSION.into(), created: now, days, size, encrypted: b.key.is_some() };
         fs::write(dir.join(format!("{name}.json")), serde_json::to_vec_pretty(&meta)?)?;
+        if kind == Kind::Auto
+            && let Some(last) = &mut b.known().last_auto
+        {
+            *last = (*last).max(now);
+        }
         Ok(meta)
     })();
     if result.is_err() {
@@ -766,17 +811,10 @@ impl Settings {
     }
 }
 
-/// The backup settings; the defaults when none are stored, or (with a
-/// warning) when they cannot be read.
-fn load_settings(store: &store::Store) -> Settings {
-    let stored = store.read(Db::Config, |c| Ok(c.query_row("SELECT json FROM backup_settings WHERE id = 1", [], |r| r.get::<_, String>(0)).optional()?));
-    match stored.and_then(|s| s.map(|s| serde_json::from_str::<Settings>(&s)).transpose().map_err(Into::into)) {
-        Ok(s) => s.unwrap_or_default(),
-        Err(e) => {
-            tracing::warn!("the backup settings could not be read, the defaults apply: {e:#}");
-            Settings::default()
-        }
-    }
+/// The stored backup settings; the defaults when none are stored.
+fn load_settings(store: &store::Store) -> Result<Settings> {
+    let stored = store.read(Db::Config, |c| Ok(c.query_row("SELECT json FROM backup_settings WHERE id = 1", [], |r| r.get::<_, String>(0)).optional()?))?;
+    Ok(stored.map(|s| serde_json::from_str::<Settings>(&s)).transpose()?.unwrap_or_default())
 }
 
 /// Backups in the directory, newest first.
@@ -796,6 +834,8 @@ pub fn list(b: &Backups) -> Vec<Meta> {
 fn remove(b: &Backups, name: &str) {
     let _ = fs::remove_file(b.dir().join(name));
     let _ = fs::remove_file(b.dir().join(format!("{name}.json")));
+    // It may have been the newest automatic one: found again when next needed.
+    b.known().last_auto = None;
 }
 
 /// How many pre-restore backups are kept.
@@ -820,8 +860,7 @@ pub fn schedule(b: Backups, store: Arc<store::Store>) {
             let (b2, st) = (b.clone(), store.clone());
             let checked = tokio::task::spawn_blocking(move || {
                 clean_staging(&b2);
-                let last = list(&b2).iter().filter(|m| m.kind == Kind::Auto).map(|m| m.created).max().unwrap_or(0);
-                (load_settings(&st), last)
+                (b2.settings(&st), b2.last_auto())
             });
             let Ok((s, last)) = checked.await else { continue };
             if !s.enabled {
@@ -865,7 +904,7 @@ pub async fn index(State(s): State<AppState>) -> Result<Json<Value>, ApiError> {
     let store = s.store.clone();
     let (settings, list, staged, failed) = tokio::task::spawn_blocking(move || {
         let staged = b.staging().join("pending").exists();
-        (load_settings(&store), list(&b), staged, fs::read_to_string(b.staging().join("pending.failed")).ok())
+        (b.settings(&store), list(&b), staged, fs::read_to_string(b.staging().join("pending.failed")).ok())
     })
     .await?;
     let next = settings.enabled.then(|| settings.next_due(store::now_ts()));
@@ -878,7 +917,13 @@ pub async fn index(State(s): State<AppState>) -> Result<Json<Value>, ApiError> {
 /// PUT /api/backups/settings
 pub async fn put_settings(State(s): State<AppState>, Json(body): Json<Settings>) -> Result<Json<Value>, ApiError> {
     body.validate().map_err(|e| ApiError(StatusCode::BAD_REQUEST, e))?;
-    s.send(crate::engine::Input::SaveBackupSettings(serde_json::to_string(&body).unwrap_or_default())).await?;
+    let json = serde_json::to_string(&body).map_err(anyhow::Error::from)?;
+    // Queued for storing and in effect at once, under the lock so that two
+    // saves are stored in the order they take effect.
+    let mut k = s.backups.known();
+    s.writer.exec(Db::Config, "INSERT OR REPLACE INTO backup_settings (id, json) VALUES (1, ?1)", vec![rusqlite::types::Value::Text(json)]);
+    k.settings = Some(body);
+    drop(k);
     Ok(Json(json!({ "ok": true })))
 }
 
@@ -1111,7 +1156,7 @@ mod tests {
     #[test]
     fn encrypted_round_trip_with_history_filter() {
         let src = data("rt");
-        let b = Backups { data_dir: src.clone(), key: Some([7u8; 32]) };
+        let b = Backups::new(src.clone(), Some([7u8; 32]));
         let m = create(&b, &src, Kind::Manual, 7).unwrap();
         assert!(m.encrypted && m.days == 7);
         let raw = fs::read(b.dir().join(&m.name)).unwrap();
@@ -1134,7 +1179,7 @@ mod tests {
     #[test]
     fn settings_only_and_unencrypted() {
         let src = data("so");
-        let b = Backups { data_dir: src.clone(), key: None };
+        let b = Backups::new(src.clone(), None);
         let m = create(&b, &src, Kind::Auto, 0).unwrap();
         assert!(!m.encrypted && m.name.starts_with("apctl-auto-"));
         let out = dir("so-out");
@@ -1147,7 +1192,7 @@ mod tests {
     #[test]
     fn tampering_and_truncation_are_detected() {
         let src = data("tamper");
-        let b = Backups { data_dir: src.clone(), key: Some([1u8; 32]) };
+        let b = Backups::new(src.clone(), Some([1u8; 32]));
         let m = create(&b, &src, Kind::Manual, -1).unwrap();
         let path = b.dir().join(&m.name);
         let good = fs::read(&path).unwrap();
@@ -1163,7 +1208,7 @@ mod tests {
     #[test]
     fn staged_restore_is_applied_on_start_with_a_pre_restore_copy() {
         let src = data("apply");
-        let b = Backups { data_dir: src.clone(), key: Some([3u8; 32]) };
+        let b = Backups::new(src.clone(), Some([3u8; 32]));
         let m = create(&b, &src, Kind::Manual, -1).unwrap();
         // Change the live data after the backup.
         Connection::open(src.join("config.db")).unwrap().execute_batch("DELETE FROM client_aliases;").unwrap();
@@ -1180,7 +1225,7 @@ mod tests {
     #[test]
     fn unfinished_backups_are_cleared_at_start() {
         let src = data("unfinished");
-        let b = Backups { data_dir: src.clone(), key: None };
+        let b = Backups::new(src.clone(), None);
         let m = create(&b, &src, Kind::Manual, 0).unwrap();
         // What a backup cut off by a crash leaves behind.
         fs::create_dir_all(b.dir().join(".tmp-1-2-ab")).unwrap();
@@ -1195,7 +1240,7 @@ mod tests {
     #[test]
     fn a_restore_keeps_three_pre_restore_copies() {
         let src = data("prune");
-        let b = Backups { data_dir: src.clone(), key: None };
+        let b = Backups::new(src.clone(), None);
         let m = create(&b, &src, Kind::Manual, 0).unwrap();
         for _ in 0..3 {
             create(&b, &src, Kind::PreRestore, 0).unwrap();
@@ -1211,7 +1256,7 @@ mod tests {
     #[test]
     fn a_restore_cut_off_part_way_is_finished_on_the_next_start() {
         let src = data("resume");
-        let b = Backups { data_dir: src.clone(), key: None };
+        let b = Backups::new(src.clone(), None);
         let m = create(&b, &src, Kind::Manual, -1).unwrap();
         Connection::open(src.join("config.db")).unwrap().execute_batch("DELETE FROM client_aliases;").unwrap();
         let (id, _) = stage(&b, &b.dir().join(&m.name)).unwrap();
@@ -1231,7 +1276,7 @@ mod tests {
     #[test]
     fn backups_at_the_same_moment_get_their_own_names() {
         let src = data("same");
-        let b = Backups { data_dir: src.clone(), key: None };
+        let b = Backups::new(src.clone(), None);
         let names: Vec<String> = std::thread::scope(|sc| {
             let hs: Vec<_> = (0..3).map(|_| sc.spawn(|| create(&b, &src, Kind::Manual, 0).unwrap().name)).collect();
             hs.into_iter().map(|h| h.join().unwrap()).collect()
@@ -1251,7 +1296,7 @@ mod tests {
     #[test]
     fn a_failed_restore_is_set_aside_and_apctl_starts() {
         let src = data("failed");
-        let b = Backups { data_dir: src.clone(), key: None };
+        let b = Backups::new(src.clone(), None);
         fs::create_dir_all(b.staging()).unwrap();
         fs::write(b.staging().join("pending"), "r123").unwrap();
         apply_pending(&b);
@@ -1312,7 +1357,7 @@ mod tests {
     #[test]
     fn sessions_never_travel_even_with_all_history() {
         let src = data("sessions");
-        let b = Backups { data_dir: src.clone(), key: None };
+        let b = Backups::new(src.clone(), None);
         let m = create(&b, &src, Kind::Manual, -1).unwrap();
         let out = dir("sessions-out");
         unpack(&b.dir().join(&m.name), None, &out).unwrap();
@@ -1335,8 +1380,8 @@ mod tests {
     #[test]
     fn with_a_key_only_sealed_backups_are_restored() {
         let src = data("plain");
-        let plain = create(&Backups { data_dir: src.clone(), key: None }, &src, Kind::Manual, 0).unwrap();
-        let b = Backups { data_dir: src, key: Some([5u8; 32]) };
+        let plain = create(&Backups::new(src.clone(), None), &src, Kind::Manual, 0).unwrap();
+        let b = Backups::new(src, Some([5u8; 32]));
         let err = unpack(&b.dir().join(&plain.name), b.key.as_ref(), &dir("plain-out")).unwrap_err();
         assert!(err.to_string().contains("not encrypted"), "{err:#}");
     }
@@ -1352,7 +1397,7 @@ mod tests {
         }
         // Nor can a staged manifest, when the restore is applied.
         let src = data("names-apply");
-        let b = Backups { data_dir: src, key: None };
+        let b = Backups::new(src, None);
         fs::create_dir_all(b.staging().join("r1")).unwrap();
         fs::write(b.staging().join("r1").join("manifest.json"), serde_json::to_vec(&manifest(&[("../config.db", 1)])).unwrap()).unwrap();
         fs::write(b.staging().join("pending"), "r1").unwrap();
@@ -1363,7 +1408,7 @@ mod tests {
     #[test]
     fn left_over_staging_is_cleared() {
         let src = dir("clean");
-        let b = Backups { data_dir: src, key: None };
+        let b = Backups::new(src, None);
         fs::create_dir_all(b.staging().join("r1")).unwrap();
         fs::create_dir_all(b.staging().join("r2")).unwrap();
         fs::write(b.staging().join("upload-1-x.apb"), "x").unwrap();

@@ -894,7 +894,7 @@ mod tests {
         let (engine, engine_rx) = tokio::sync::mpsc::channel(1);
         let (tx, _) = broadcast::channel(1);
         let state = AppState {
-            backups: crate::backup::Backups { data_dir: dir, key: None },
+            backups: crate::backup::Backups::new(dir, None),
             store, vendors: Default::default(), renderer: crate::dryrun::apcfg_renderer(crate::EMULATE_VERSION.into()), auth, engine, live: Default::default(), tx, started: 0, source: "none".into(),
             active: false, writer,
         };
@@ -1047,13 +1047,39 @@ mod tests {
         assert_eq!(app.clone().oneshot(req).await.unwrap().status(), StatusCode::OK);
     }
 
-    #[tokio::test]
-    async fn backups_download_with_their_length_and_uncompressed() {
-        let (mut state, _engine) = state();
+    /// The app's state with one user, and that user's session cookie.
+    fn logged_in() -> (AppState, tokio::sync::mpsc::Receiver<crate::engine::Input>, String) {
+        let (mut state, engine) = state();
         let file = state.backups.data_dir.join("users");
         std::fs::write(&file, format!("admin:{}\n", crate::auth::hash_password("x").unwrap())).unwrap();
         state.auth = Arc::new(crate::auth::Auth::new(crate::auth::Users::load(&file).unwrap(), &state.store, state.writer.clone(), Default::default()).unwrap());
         let cookie = format!("{}={}", crate::auth::COOKIE, state.auth.create("admin").unwrap());
+        (state, engine, cookie)
+    }
+
+    #[tokio::test]
+    async fn saved_backup_settings_are_in_effect_at_once() {
+        let (state, _engine, cookie) = logged_in();
+        let app = router(state);
+        let body = json!({ "enabled": false, "frequency": "weekly", "minute_utc": 60, "weekday": 2, "monthday": 1, "keep": 5, "days": 7 });
+        let req = Request::put("/api/backups/settings")
+            .header(header::COOKIE, &cookie)
+            .header("x-requested-with", "apctl")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        assert_eq!(app.clone().oneshot(req).await.unwrap().status(), StatusCode::OK);
+        // Read back straight away, before the writer has committed anything.
+        let req = Request::get("/api/backups").header(header::COOKIE, &cookie).body(Body::empty()).unwrap();
+        let res = app.clone().oneshot(req).await.unwrap();
+        let index: Value = serde_json::from_slice(&axum::body::to_bytes(res.into_body(), 1 << 20).await.unwrap()).unwrap();
+        assert_eq!(index["settings"], body);
+        assert!(index["next_run"].is_null(), "automatic backups are off");
+    }
+
+    #[tokio::test]
+    async fn backups_download_with_their_length_and_uncompressed() {
+        let (state, _engine, cookie) = logged_in();
         let m = crate::backup::create(&state.backups, &state.backups.data_dir, crate::backup::Kind::Manual, 0).unwrap();
         let raw = std::fs::read(state.backups.dir().join(&m.name)).unwrap();
         let app = router(state);
