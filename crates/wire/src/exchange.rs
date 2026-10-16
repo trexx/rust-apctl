@@ -29,6 +29,8 @@ const MAX_IN_FLIGHT: usize = 256;
 /// How long a request may wait for its response before it is forgotten (a
 /// response the capture missed, a connection that died).
 const MAX_WAIT: Micros = 300_000_000;
+/// Stale requests are looked for at most this often (capture time), not on every new connection.
+const SWEEP_EVERY: Micros = 10_000_000;
 
 #[derive(Default)]
 pub struct Pairer {
@@ -36,11 +38,13 @@ pub struct Pairer {
     /// with the time of the latest one. A connection leaves the map when its queue
     /// empties, so a long-running shadow mode does not keep one entry per connection.
     in_flight: HashMap<ConnId, (Micros, VecDeque<Pending>)>,
+    last_sweep: Micros,
 }
 
 impl Pairer {
     fn push(&mut self, conn: ConnId, ts: Micros, p: Pending) {
-        if self.in_flight.len() >= MAX_IN_FLIGHT && !self.in_flight.contains_key(&conn) {
+        if self.in_flight.len() >= MAX_IN_FLIGHT && ts.abs_diff(self.last_sweep) >= SWEEP_EVERY as u64 && !self.in_flight.contains_key(&conn) {
+            self.last_sweep = ts;
             self.in_flight.retain(|_, (last, _)| ts - *last < MAX_WAIT);
         }
         let (last, queue) = self.in_flight.entry(conn).or_default();
@@ -124,5 +128,12 @@ mod tests {
             p.handle(&keys, get(conn(port), Micros::from(port) * 10_000_000));
         }
         assert!(p.in_flight.len() <= MAX_IN_FLIGHT + 1, "{}", p.in_flight.len());
+        // Many live connections at once: the map is not rescanned for every new one.
+        let mut p = Pairer::default();
+        for port in 0..1000 {
+            p.handle(&keys, get(conn(port), 20_000_000 + Micros::from(port)));
+        }
+        assert_eq!(p.in_flight.len(), 1000);
+        assert_eq!(p.last_sweep, 20_000_000 + Micros::from(MAX_IN_FLIGHT as u16), "one sweep, when the map filled up");
     }
 }
