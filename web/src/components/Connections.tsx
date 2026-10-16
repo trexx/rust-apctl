@@ -90,8 +90,26 @@ const where = (
     .join(" ");
 
 type Item =
-  | { kind: "attempt"; ts: number; a: ConnAttempt }
-  | { kind: "roam"; ts: number; r: Roam };
+  | { kind: "attempt"; ts: number; a: ConnAttempt; key: string }
+  | { kind: "roam"; ts: number; r: Roam; key: string };
+
+/** Keys from what identifies each row, numbered when two rows share one. */
+function stableKeys<T>(rows: T[], id: (row: T) => string): string[] {
+  const seen = new Map<string, number>();
+  return rows.map((row) => {
+    const k = id(row);
+    const n = seen.get(k) ?? 0;
+    seen.set(k, n + 1);
+    return n ? `${k}#${n}` : k;
+  });
+}
+
+const attemptId = (a: ConnAttempt) => `a-${a.ts}-${a.client}-${a.ap}`;
+
+/** Rows a client's log shows (attempts and roams merged, newest first). */
+const LOG_ROWS = 100;
+/** Rows the site's attempt list shows. */
+const ATTEMPT_ROWS = 200;
 
 /** One client's connection attempts and roams, newest first. */
 export function ConnectionLog({
@@ -101,7 +119,7 @@ export function ConnectionLog({
   client: string;
   span: TimeSpan;
 }) {
-  const c = useConnections(span, { client });
+  const c = useConnections(span, { client, limit: LOG_ROWS });
   return (
     <QueryState q={c}>{(data) => <ConnectionTable data={data} />}</QueryState>
   );
@@ -114,15 +132,33 @@ function ConnectionTable({
 }) {
   const ap = (m: string) => data.ap_names[m] ?? m;
   // A roam also shows up as the attempt on the new AP; keep just the roam.
-  const roams = data.roams;
+  const roamsTo = new Map<string, number[]>();
+  for (const r of data.roams) {
+    const times = roamsTo.get(r.to.ap);
+    if (times) times.push(r.ts);
+    else roamsTo.set(r.to.ap, [r.ts]);
+  }
   const isRoamJoin = (a: ConnAttempt) =>
-    a.roam &&
-    roams.some((r) => r.to.ap === a.ap && Math.abs(r.ts - a.ts) <= 15);
+    a.roam && !!roamsTo.get(a.ap)?.some((ts) => Math.abs(ts - a.ts) <= 15);
+  const attempts = data.attempts.filter((a) => !isRoamJoin(a));
+  const attemptKeys = stableKeys(attempts, attemptId);
+  const roamKeys = stableKeys(
+    data.roams,
+    (r) => `r-${r.ts}-${r.client}-${r.from.ap}-${r.to.ap}`,
+  );
   const items: Item[] = [
-    ...data.attempts
-      .filter((a) => !isRoamJoin(a))
-      .map((a) => ({ kind: "attempt" as const, ts: a.ts, a })),
-    ...data.roams.map((r) => ({ kind: "roam" as const, ts: r.ts, r })),
+    ...attempts.map((a, i) => ({
+      kind: "attempt" as const,
+      ts: a.ts,
+      a,
+      key: attemptKeys[i]!,
+    })),
+    ...data.roams.map((r, i) => ({
+      kind: "roam" as const,
+      ts: r.ts,
+      r,
+      key: roamKeys[i]!,
+    })),
   ].sort((x, y) => y.ts - x.ts);
   if (items.length === 0)
     return (
@@ -144,9 +180,9 @@ function ConnectionTable({
         </tr>
       </thead>
       <tbody>
-        {items.slice(0, 100).map((it, i) =>
+        {items.slice(0, LOG_ROWS).map((it) =>
           it.kind === "attempt" ? (
-            <tr key={`a${i}`}>
+            <tr key={it.key}>
               <td className="nowrap small">{clock(it.ts)}</td>
               <td>
                 <Result a={it.a} />
@@ -171,7 +207,7 @@ function ConnectionTable({
               </td>
             </tr>
           ) : (
-            <tr key={`r${i}`}>
+            <tr key={it.key}>
               <td className="nowrap small">{clock(it.ts)}</td>
               <td>
                 <span
@@ -217,7 +253,7 @@ function ConnectionTable({
 /** Connection attempts across the site, newest first. */
 export function AttemptList({ span }: { span: TimeSpan }) {
   const [failed, setFailed] = useState(false);
-  const c = useConnections(span, { failed });
+  const c = useConnections(span, { failed, limit: ATTEMPT_ROWS });
   return (
     <div className="panel">
       <div className="panel-head">
@@ -250,56 +286,65 @@ export function AttemptList({ span }: { span: TimeSpan }) {
                 : "No attempts in this range."}
             </div>
           ) : (
-            <div className="table-wrap">
-              <table className="table">
-                <thead>
-                  <tr>
-                    <th>Time</th>
-                    <th>Client</th>
-                    <th>Result</th>
-                    <th>Access point</th>
-                    <th>Network</th>
-                    <th>Signal</th>
-                    <th>Time to connect</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {data.attempts.slice(0, 200).map((a, i) => (
-                    <tr key={i}>
-                      <td className="nowrap small">{clock(a.ts)}</td>
-                      <td>
-                        <Link to={`/clients/${a.client}`}>
-                          {data.client_names[a.client] ?? a.client}
-                        </Link>
-                      </td>
-                      <td>
-                        <Result a={a} />
-                      </td>
-                      <td>
-                        <Link to={`/devices/${a.ap}`}>
-                          {data.ap_names[a.ap] ?? a.ap}
-                        </Link>
-                      </td>
-                      <td className="small">
-                        {a.essid ?? "—"}
-                        <div className="muted">
-                          {where(a.radio, a.channel, a.bw)}
-                        </div>
-                      </td>
-                      <td>
-                        <Signal dbm={a.rssi} />
-                      </td>
-                      <td>
-                        <TimingBar t={a.timings} />
-                      </td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
+            <AttemptTable data={data} />
           )
         }
       </QueryState>
+    </div>
+  );
+}
+
+function AttemptTable({
+  data,
+}: {
+  data: NonNullable<ReturnType<typeof useConnections>["data"]>;
+}) {
+  const keys = stableKeys(data.attempts, attemptId);
+  return (
+    <div className="table-wrap">
+      <table className="table">
+        <thead>
+          <tr>
+            <th>Time</th>
+            <th>Client</th>
+            <th>Result</th>
+            <th>Access point</th>
+            <th>Network</th>
+            <th>Signal</th>
+            <th>Time to connect</th>
+          </tr>
+        </thead>
+        <tbody>
+          {data.attempts.map((a, i) => (
+            <tr key={keys[i]}>
+              <td className="nowrap small">{clock(a.ts)}</td>
+              <td>
+                <Link to={`/clients/${a.client}`}>
+                  {data.client_names[a.client] ?? a.client}
+                </Link>
+              </td>
+              <td>
+                <Result a={a} />
+              </td>
+              <td>
+                <Link to={`/devices/${a.ap}`}>
+                  {data.ap_names[a.ap] ?? a.ap}
+                </Link>
+              </td>
+              <td className="small">
+                {a.essid ?? "—"}
+                <div className="muted">{where(a.radio, a.channel, a.bw)}</div>
+              </td>
+              <td>
+                <Signal dbm={a.rssi} />
+              </td>
+              <td>
+                <TimingBar t={a.timings} />
+              </td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
     </div>
   );
 }

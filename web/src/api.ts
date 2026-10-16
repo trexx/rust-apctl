@@ -824,12 +824,13 @@ export interface Wlan {
   series: { ts: number[]; clients: number[]; download_bps: number[]; upload_bps: number[] };
 }
 
-export const useConnections = (span: TimeSpan, opts: { client?: Mac; failed?: boolean } = {}) =>
+/** Connection attempts and roams, newest first: at most `limit` of each (the server's default is 500). */
+export const useConnections = (span: TimeSpan, opts: { client?: Mac; failed?: boolean; limit?: number } = {}) =>
   useSpanQuery<{ attempts: ConnAttempt[]; roams: Roam[]; ap_names: Record<string, string>; client_names: Record<string, string> }>(
     keys.connections(span, opts),
     "/api/connections",
     span,
-    { client: opts.client, failed: opts.failed ? "true" : undefined },
+    { client: opts.client, failed: opts.failed ? "true" : undefined, limit: opts.limit },
   );
 
 export const useRoaming = (span: TimeSpan) => useSpanQuery<Roaming>(keys.roaming(span), "/api/roaming", span);
