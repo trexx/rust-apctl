@@ -201,7 +201,7 @@ async fn serve(args: ServeArgs) -> Result<()> {
         tracing::warn!("no --backup-key: backups are written unencrypted");
     }
     // A restore chosen in the UI is applied now, before the databases are opened.
-    backup::apply_pending(&backups)?;
+    backup::apply_pending(&backups);
     let (store, writer) = store::Store::open(&data_dir)?;
     let live: SharedLive = Default::default();
     let (live_tx, _) = broadcast::channel(4096);

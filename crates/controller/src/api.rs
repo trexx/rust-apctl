@@ -11,7 +11,7 @@ use axum::{Json, Router};
 use inform::Mac;
 use rusqlite::types::Value as Sql;
 use rusqlite::params_from_iter;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::sync::broadcast;
 
@@ -137,17 +137,21 @@ impl IntoResponse for ApiError {
     }
 }
 
+/// An unexpected failure: the details (paths, SQL) go to the log, not to the browser.
 impl From<anyhow::Error> for ApiError {
     fn from(e: anyhow::Error) -> Self {
-        ApiError(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}"))
+        tracing::error!("request failed: {e:#}");
+        ApiError::internal(INTERNAL)
     }
 }
 
 impl From<std::io::Error> for ApiError {
     fn from(e: std::io::Error) -> Self {
-        ApiError::internal(e.to_string())
+        ApiError::from(anyhow::Error::from(e))
     }
 }
+
+const INTERNAL: &str = "internal error (the details are in apctl's log)";
 
 /// A blocking task that panicked or was cancelled.
 impl From<tokio::task::JoinError> for ApiError {
@@ -237,14 +241,59 @@ impl StoredDevice {
     }
 
     /// Its row in the device list.
-    fn row(&self) -> Value {
-        json!({
-            "mac": self.mac, "name": self.name, "model": self.model, "model_display": self.model_display, "version": self.version,
-            "ip": self.ip, "online": false, "reconfiguring": false, "first_seen": self.first_seen, "last_seen": self.last_seen, "uptime": null,
-            "cpu": null, "mem": null, "load1": null, "satisfaction": null, "clients": 0, "uplink": null, "radios": [], "last_config_push": null,
-            "stored_only": true,
-        })
+    fn row(self) -> DeviceRow {
+        DeviceRow {
+            mac: self.mac, name: self.name, model: self.model, model_display: self.model_display, version: self.version, ip: self.ip,
+            online: false, reconfiguring: false, first_seen: self.first_seen, last_seen: self.last_seen, uptime: None, cpu: None, mem: None,
+            load1: None, satisfaction: None, clients: 0, uplink: None, radios: vec![], last_config_push: None, locating: None, stored_only: true,
+        }
     }
+}
+
+/// An AP in the device list.
+#[derive(Serialize)]
+struct DeviceRow {
+    mac: String,
+    name: Option<String>,
+    model: Option<String>,
+    model_display: Option<String>,
+    version: Option<String>,
+    ip: Option<String>,
+    online: bool,
+    reconfiguring: bool,
+    first_seen: Ts,
+    last_seen: Ts,
+    uptime: Option<i64>,
+    cpu: Option<f64>,
+    mem: Option<f64>,
+    load1: Option<f64>,
+    satisfaction: Option<i64>,
+    clients: usize,
+    uplink: Option<UplinkRow>,
+    radios: Vec<RadioRow>,
+    last_config_push: Option<Ts>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    locating: Option<bool>,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    stored_only: bool,
+}
+
+#[derive(Serialize)]
+struct UplinkRow {
+    speed: Option<i64>,
+    up: Option<bool>,
+    full_duplex: Option<bool>,
+}
+
+#[derive(Serialize)]
+struct RadioRow {
+    radio: String,
+    channel: Option<i64>,
+    bw: Option<i64>,
+    tx_power: Option<i64>,
+    cu_total: Option<i64>,
+    noise_floor: Option<i64>,
+    clients: i64,
 }
 
 /// APs in the database (all, or `only` this one).
@@ -266,43 +315,42 @@ async fn stored_devices(store: &Arc<Store>, only: Option<String>) -> Result<Vec<
     .await
 }
 
-async fn devices(State(s): State<AppState>) -> ApiResult {
+async fn devices(State(s): State<AppState>) -> Result<Json<Vec<DeviceRow>>, ApiError> {
     let stored = stored_devices(&s.store, None).await?;
-    let live = s.live.read().unwrap();
-    // Connected clients per AP, counted in one pass.
-    let mut per_ap: std::collections::HashMap<Mac, usize> = std::collections::HashMap::new();
-    for c in live.clients.values().filter(|c| c.connected) {
-        *per_ap.entry(c.sample.ap_mac).or_default() += 1;
-    }
-    let mut list: Vec<Value> = live
-        .devices
-        .iter()
-        .map(|(mac, d)| {
-            let a = &d.snapshot.ap;
-            let clients = per_ap.get(mac).copied().unwrap_or(0);
-            json!({
-                "mac": mac, "name": a.hostname, "model": a.model, "model_display": a.model_display,
-                "version": a.version, "ip": a.ip, "online": d.online, "reconfiguring": d.reconfiguring,
-                "first_seen": d.first_seen, "last_seen": d.last_seen, "uptime": a.uptime,
-                "cpu": a.cpu, "mem": a.mem, "load1": a.load1, "satisfaction": a.satisfaction,
-                "clients": clients,
-                "uplink": d.snapshot.uplink.as_ref().map(|u| json!({ "speed": u.speed, "up": u.up, "full_duplex": u.full_duplex })),
-                "radios": d.snapshot.radios.iter().map(|r| json!({
-                    "radio": r.radio, "channel": r.channel, "bw": r.bw, "tx_power": r.tx_power,
-                    "cu_total": r.cu_total, "noise_floor": r.noise_floor, "clients": r.num_sta,
-                })).collect::<Vec<_>>(),
-                "last_config_push": d.last_config_push,
-                "locating": live.locating.contains(mac),
-            })
-        })
-        .collect();
-    for d in stored {
-        if d.mac.parse().is_ok_and(|m: Mac| live.devices.contains_key(&m)) {
-            continue;
+    // The rows are copied out under the lock (a few short strings each) and
+    // serialised after it.
+    let list = {
+        let live = s.live.read().unwrap();
+        // Connected clients per AP, counted in one pass.
+        let mut per_ap: std::collections::HashMap<Mac, usize> = std::collections::HashMap::new();
+        for c in live.clients.values().filter(|c| c.connected) {
+            *per_ap.entry(c.sample.ap_mac).or_default() += 1;
         }
-        list.push(d.row());
-    }
-    Ok(Json(Value::Array(list)))
+        let mut list: Vec<DeviceRow> = live
+            .devices
+            .iter()
+            .map(|(mac, d)| {
+                let a = &d.snapshot.ap;
+                DeviceRow {
+                    mac: mac.to_string(), name: a.hostname.clone(), model: a.model.clone(), model_display: a.model_display.clone(),
+                    version: a.version.clone(), ip: a.ip.clone(), online: d.online, reconfiguring: d.reconfiguring,
+                    first_seen: d.first_seen, last_seen: d.last_seen, uptime: a.uptime, cpu: a.cpu, mem: a.mem, load1: a.load1,
+                    satisfaction: a.satisfaction, clients: per_ap.get(mac).copied().unwrap_or(0),
+                    uplink: d.snapshot.uplink.as_ref().map(|u| UplinkRow { speed: u.speed, up: u.up, full_duplex: u.full_duplex }),
+                    radios: d.snapshot.radios.iter().map(|r| RadioRow {
+                        radio: r.radio.clone(), channel: r.channel, bw: r.bw, tx_power: r.tx_power, cu_total: r.cu_total,
+                        noise_floor: r.noise_floor, clients: r.num_sta,
+                    }).collect(),
+                    last_config_push: d.last_config_push,
+                    locating: Some(live.locating.contains(mac)),
+                    stored_only: false,
+                }
+            })
+            .collect();
+        list.extend(stored.into_iter().filter(|d| !d.mac.parse().is_ok_and(|m: Mac| live.devices.contains_key(&m))).map(StoredDevice::row));
+        list
+    };
+    Ok(Json(list))
 }
 
 async fn device(State(s): State<AppState>, Path(mac): Path<String>) -> ApiResult {
@@ -327,12 +375,29 @@ async fn device(State(s): State<AppState>, Path(mac): Path<String>) -> ApiResult
 /// Every client: the ones seen in this run and the ones restored from the
 /// database at start (`Engine::restore` loads them all, so the live view is
 /// the whole list).
-async fn clients(State(s): State<AppState>) -> ApiResult {
+/// A client as the client list and page show it: its view, plus its name,
+/// manufacturer and controls.
+#[derive(Serialize)]
+struct ClientRow<'a> {
+    #[serde(flatten)]
+    view: &'a crate::engine::ClientView,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ap_name: Option<Option<&'a str>>,
+    alias: Option<&'a str>,
+    note: Option<&'a str>,
+    vendor: Option<&'a str>,
+    #[serde(flatten)]
+    controls: crate::actions::Controls<'a>,
+}
+
+type ClientCopy = (Mac, crate::engine::ClientView, Option<String>, Option<crate::engine::Alias>);
+
+async fn clients(State(s): State<AppState>) -> Response {
     // What each client's entry needs, copied under the lock (the samples are
     // shared, the rest is small); the serialising happens after it.
     let (state, list) = {
         let live = s.live.read().unwrap();
-        let list: Vec<(Mac, crate::engine::ClientView, Option<String>, Option<crate::engine::Alias>)> = live
+        let list: Vec<ClientCopy> = live
             .clients
             .iter()
             .map(|(mac, c)| {
@@ -343,39 +408,36 @@ async fn clients(State(s): State<AppState>) -> ApiResult {
         (live.state.clone(), list)
     };
     let controls = crate::actions::ClientControls::new(state.as_deref());
-    let out: Vec<Value> = list
-        .into_iter()
-        .map(|(mac, c, ap_name, alias)| {
-            let mut v = serde_json::to_value(&c).unwrap_or_default();
-            v["ap_name"] = json!(ap_name);
-            v["alias"] = json!(alias.as_ref().and_then(|a| a.alias.as_ref()));
-            v["note"] = json!(alias.as_ref().and_then(|a| a.note.as_ref()));
-            v["vendor"] = json!(s.vendors.lookup(&mac));
-            controls.add(&mut v, &mac.to_string());
-            v
+    let rows: Vec<ClientRow> = list
+        .iter()
+        .map(|(mac, view, ap_name, alias)| ClientRow {
+            view,
+            ap_name: Some(ap_name.as_deref()),
+            alias: alias.as_ref().and_then(|a| a.alias.as_deref()),
+            note: alias.as_ref().and_then(|a| a.note.as_deref()),
+            vendor: s.vendors.lookup(mac),
+            controls: controls.get(mac),
         })
         .collect();
-    Ok(Json(Value::Array(out)))
+    Json(rows).into_response()
 }
 
-async fn client(State(s): State<AppState>, Path(mac): Path<String>) -> ApiResult {
+async fn client(State(s): State<AppState>, Path(mac): Path<String>) -> Result<Response, ApiError> {
     let mac = parse_mac(&mac)?;
-    let found = {
+    let (view, alias, state) = {
         let live = s.live.read().unwrap();
-        let a = live.aliases.get(&mac).cloned().unwrap_or_default();
-        live.clients.get(&mac).map(|c| {
-            let mut v = serde_json::to_value(c).unwrap_or_default();
-            v["alias"] = json!(a.alias);
-            v["note"] = json!(a.note);
-            v["vendor"] = json!(s.vendors.lookup(&mac));
-            crate::actions::add_controls(&mut v, live.state.as_deref(), &mac.to_string());
-            v
-        })
+        let view = live.clients.get(&mac).cloned().ok_or_else(|| ApiError(StatusCode::NOT_FOUND, "unknown client".into()))?;
+        (view, live.aliases.get(&mac).cloned().unwrap_or_default(), live.state.clone())
     };
-    match found {
-        Some(v) => Ok(Json(v)),
-        None => Err(ApiError(StatusCode::NOT_FOUND, "unknown client".into())),
-    }
+    let row = ClientRow {
+        view: &view,
+        ap_name: None,
+        alias: alias.alias.as_deref(),
+        note: alias.note.as_deref(),
+        vendor: s.vendors.lookup(&mac),
+        controls: crate::actions::controls(state.as_deref(), &mac),
+    };
+    Ok(Json(row).into_response())
 }
 
 async fn state_summary(State(s): State<AppState>) -> ApiResult {
@@ -401,11 +463,33 @@ async fn import_state(State(s): State<AppState>, headers: axum::http::HeaderMap,
 /// Dry-run status: for each AP, what apctl would push now compared with the last
 /// config the other controller pushed; plus the comparisons made at each push.
 async fn dryrun(State(s): State<AppState>) -> ApiResult {
-    // Redacted last configs from the database, for APs not pushed to since start.
-    let stored = read(&s.store, Db::Config, |c| Ok(crate::engine::stored_pushes(c)?)).await?;
-    let history: Vec<Value> = read(&s.store, Db::Config, |c| {
+    // What each AP's render needs, copied under a short lock: the unredacted
+    // config seen in this run when there is one. Only full configs count: a
+    // management-only push says nothing about system_cfg.
+    let (state, imported_at, aps) = {
+        let live = s.live.read().unwrap();
+        let aps: Vec<_> = live
+            .devices
+            .iter()
+            .map(|(mac, d)| {
+                let seen = live.last_config.get(mac).filter(|c| !c.system_cfg.is_empty()).cloned();
+                (*mac, d.snapshot.ap.hostname.clone(), d.snapshot.ap.cfgversion.clone(), seen, live.raw_informs.get(mac).cloned())
+            })
+            .collect();
+        (live.state.clone(), live.state_imported_at, aps)
+    };
+    // Then from the database, in one go: the stored redacted copy for APs not
+    // pushed to since start, and the comparisons made at each push.
+    let need: Vec<Mac> = aps.iter().filter(|a| a.3.is_none()).map(|a| a.0).collect();
+    let (stored, history) = read(&s.store, Db::Config, move |c| {
+        let mut stored = std::collections::HashMap::new();
+        for mac in need {
+            if let Some(p) = crate::engine::stored_push(c, &mac)?.filter(|p| !p.system_cfg.is_empty()) {
+                stored.insert(mac, p);
+            }
+        }
         let mut stmt = c.prepare("SELECT ts, mac, cfgversion, matches, comparison FROM dryrun_results ORDER BY ts DESC LIMIT 100")?;
-        let rows = stmt
+        let history = stmt
             .query_map([], |r| {
                 let comparison: String = r.get(4)?;
                 Ok(json!({
@@ -415,39 +499,29 @@ async fn dryrun(State(s): State<AppState>) -> ApiResult {
                 }))
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
-        Ok(rows)
+        Ok((stored, history))
     })
     .await?;
 
-    // What each AP's render needs, copied under a short lock; the renders run
-    // on the blocking pool.
-    let (state, imported_at, aps) = {
-        let live = s.live.read().unwrap();
-        let aps: Vec<_> = live
-            .devices
-            .iter()
-            .map(|(mac, d)| {
-                // Prefer the unredacted config seen in this run; fall back to the stored redacted copy.
-                // Only full configs count: a management-only push says nothing about system_cfg.
-                let actual = match (live.last_config.get(mac).filter(|c| !c.system_cfg.is_empty()), stored.get(mac).filter(|c| !c.system_cfg.is_empty())) {
-                    (Some(c), _) => Some((c.clone(), false)),
-                    (None, Some(c)) => Some((c.clone(), true)),
-                    (None, None) => None,
-                };
-                (*mac, d.snapshot.ap.hostname.clone(), d.snapshot.ap.cfgversion.clone(), actual, live.raw_informs.get(mac).cloned())
-            })
-            .collect();
-        (live.state.clone(), live.state_imported_at, aps)
-    };
+    // The renders run on the blocking pool.
     let renderer = s.renderer.clone();
     let devices = tokio::task::spawn_blocking(move || {
+        // The settings' AP records by MAC, looked up once (the first for a MAC counts).
+        let mut docs: std::collections::HashMap<Mac, &Value> = std::collections::HashMap::new();
+        for d in state.as_deref().and_then(|st| st["devices"].as_array()).into_iter().flatten() {
+            if let Some(mac) = d["mac"].as_str().and_then(|m| m.parse().ok()) {
+                docs.entry(mac).or_insert(d);
+            }
+        }
+        let mut stored = stored;
         let mut devices = Vec::new();
-        for (mac, name, running_version, actual, inform) in aps {
+        for (mac, name, running_version, seen, inform) in aps {
+            let actual = seen.map(|c| (c, false)).or_else(|| stored.remove(&mac).map(|c| (c, true)));
             // The snapshot records the cfgversion the other controller expected for
             // each AP at import time. If the AP now runs another one, that controller
             // has pushed new config since: the settings are probably out of date.
-            let snapshot_version = state.as_deref().and_then(|st| crate::adopt::device_doc(st, &mac)?["cfgversion"].as_str().map(str::to_string));
-            let settings_stale = matches!((&snapshot_version, &running_version), (Some(a), Some(b)) if a != b);
+            let snapshot_version = docs.get(&mac).and_then(|d| d["cfgversion"].as_str());
+            let settings_stale = matches!((snapshot_version, &running_version), (Some(a), Some(b)) if a != b);
             let entry = |status: &str, extra: Value| {
                 let mut v = json!({ "mac": mac, "name": name, "status": status, "settings_stale": settings_stale });
                 if let Value::Object(m) = extra {
@@ -596,49 +670,87 @@ async fn series(State(s): State<AppState>, Path(table): Path<String>, Query(q): 
     Ok(Json(read(&s.store, Db::Metrics, move |c| store::series(c, t, &keys, from, to, tier)).await?))
 }
 
+/// A WHERE clause made of optional filters, with numbered parameters.
+#[derive(Default)]
+struct Where {
+    cond: Vec<String>,
+    params: Vec<Sql>,
+}
+
+impl Where {
+    /// Adds a condition; its `?` stands for `value`.
+    fn and(&mut self, sql: &str, value: Sql) {
+        self.params.push(value);
+        self.cond.push(sql.replace('?', &format!("?{}", self.params.len())));
+    }
+
+    fn sql(&self) -> String {
+        if self.cond.is_empty() { "1 = 1".into() } else { self.cond.join(" AND ") }
+    }
+}
+
 #[derive(Deserialize)]
 struct EventQuery {
     device: Option<String>,
     client: Option<String>,
     kind: Option<String>,
-    /// Only events strictly before this time (for paging backwards).
-    before: Option<Ts>,
     limit: Option<i64>,
 }
 
+/// The event kinds starting with `prefix`, read from the kind index one kind
+/// at a time (a handful of lookups, however many events there are).
+fn kinds_with_prefix(c: &rusqlite::Connection, prefix: &str) -> rusqlite::Result<Vec<String>> {
+    let mut stmt = c.prepare_cached(
+        "WITH RECURSIVE k(kind) AS (
+            SELECT (SELECT MIN(kind) FROM events WHERE kind >= ?1 AND kind < ?2)
+            UNION ALL SELECT (SELECT MIN(kind) FROM events WHERE kind > k.kind AND kind < ?2) FROM k WHERE k.kind IS NOT NULL)
+         SELECT kind FROM k WHERE kind IS NOT NULL",
+    )?;
+    stmt.query_map((prefix, format!("{prefix}{}", char::MAX)), |r| r.get(0))?.collect()
+}
+
 async fn events(State(s): State<AppState>, Query(q): Query<EventQuery>) -> ApiResult {
-    let mut cond = vec!["1 = 1".to_string()];
-    let mut params: Vec<Sql> = Vec::new();
+    let mut w = Where::default();
     if let Some(d) = &q.device {
-        params.push(Sql::Text(parse_mac(d)?.to_string()));
-        cond.push(format!("device_mac = ?{}", params.len()));
+        w.and("device_mac = ?", Sql::Text(parse_mac(d)?.to_string()));
     }
     if let Some(c) = &q.client {
-        params.push(Sql::Text(parse_mac(c)?.to_string()));
-        cond.push(format!("client_mac = ?{}", params.len()));
+        w.and("client_mac = ?", Sql::Text(parse_mac(c)?.to_string()));
     }
-    if let Some(k) = &q.kind {
-        // Prefix match, so `client` selects all client events; several kinds
-        // can be given separated by commas.
-        let mut any = Vec::new();
-        for k in k.split(',').map(str::trim).filter(|k| !k.is_empty()).take(10) {
-            params.push(Sql::Text(format!("{k}%")));
-            any.push(format!("kind LIKE ?{}", params.len()));
-        }
-        if !any.is_empty() {
-            cond.push(format!("({})", any.join(" OR ")));
-        }
-    }
-    if let Some(b) = q.before {
-        params.push(Sql::Integer(b));
-        cond.push(format!("ts < ?{}", params.len()));
-    }
+    // Prefix match, so `client` selects all client events; several kinds
+    // can be given separated by commas.
+    let prefixes: Vec<String> = q.kind.iter().flat_map(|k| k.split(',')).map(|k| k.trim().to_ascii_lowercase()).filter(|k| !k.is_empty()).take(10).collect();
     let limit = q.limit.unwrap_or(200).clamp(1, 2000);
-    let sql = format!("SELECT ts, kind, device_mac, client_mac, data, id FROM events WHERE {} ORDER BY ts DESC, id DESC LIMIT {limit}", cond.join(" AND "));
+    const COLUMNS: &str = "ts, kind, device_mac, client_mac, data, id";
     let rows = read(&s.store, Db::Config, move |c| {
+        let sql = if prefixes.is_empty() {
+            format!("SELECT {COLUMNS} FROM events WHERE {} ORDER BY ts DESC, id DESC LIMIT {limit}", w.sql())
+        } else {
+            // The newest of each matching kind from the (kind, ts) index, then
+            // the newest of those: a rare kind is found without walking every
+            // event, and a common one reads no more than the limit.
+            let mut kinds: Vec<String> = Vec::new();
+            for p in &prefixes {
+                kinds.extend(kinds_with_prefix(c, p)?);
+            }
+            kinds.sort();
+            kinds.dedup();
+            if kinds.is_empty() {
+                return Ok(vec![]);
+            }
+            let filters = w.sql();
+            let parts: Vec<String> = kinds
+                .into_iter()
+                .map(|k| {
+                    w.params.push(Sql::Text(k));
+                    format!("SELECT * FROM (SELECT {COLUMNS} FROM events WHERE {filters} AND kind = ?{} ORDER BY ts DESC, id DESC LIMIT {limit})", w.params.len())
+                })
+                .collect();
+            format!("{} ORDER BY ts DESC, id DESC LIMIT {limit}", parts.join(" UNION ALL "))
+        };
         let mut stmt = c.prepare(&sql)?;
         let rows = stmt
-            .query_map(params_from_iter(params), |r| {
+            .query_map(params_from_iter(w.params), |r| {
                 let data: Option<String> = r.get(4)?;
                 Ok(json!({
                     "id": r.get::<_, i64>(5)?, "ts": r.get::<_, i64>(0)?, "kind": r.get::<_, String>(1)?,
@@ -658,36 +770,28 @@ struct LogQuery {
     device: Option<String>,
     /// Full-text query (SQLite FTS5 syntax).
     q: Option<String>,
-    before: Option<Ts>,
     limit: Option<i64>,
 }
 
 async fn logs(State(s): State<AppState>, Query(q): Query<LogQuery>) -> ApiResult {
-    let mut cond = vec!["1 = 1".to_string()];
-    let mut params: Vec<Sql> = Vec::new();
+    let mut w = Where::default();
     if let Some(d) = &q.device {
-        params.push(Sql::Text(parse_mac(d)?.to_string()));
-        cond.push(format!("l.device_mac = ?{}", params.len()));
+        w.and("l.device_mac = ?", Sql::Text(parse_mac(d)?.to_string()));
     }
     if let Some(text) = q.q.as_deref().filter(|t| !t.trim().is_empty()) {
         // Quote each word so user input cannot break FTS syntax; words are ANDed.
         let fts: Vec<String> = text.split_whitespace().map(|w| format!("\"{}\"", w.replace('"', "\"\""))).collect();
-        params.push(Sql::Text(fts.join(" ")));
-        cond.push(format!("l.id IN (SELECT rowid FROM logs_fts WHERE logs_fts MATCH ?{})", params.len()));
-    }
-    if let Some(b) = q.before {
-        params.push(Sql::Integer(b));
-        cond.push(format!("l.ts < ?{}", params.len()));
+        w.and("l.id IN (SELECT rowid FROM logs_fts WHERE logs_fts MATCH ?)", Sql::Text(fts.join(" ")));
     }
     let limit = q.limit.unwrap_or(500).clamp(1, 5000);
     let sql = format!(
         "SELECT l.ts, l.device_mac, l.src_ip, l.facility, l.severity, l.program, l.msg, l.id FROM logs l WHERE {} ORDER BY l.ts DESC, l.id DESC LIMIT {limit}",
-        cond.join(" AND ")
+        w.sql()
     );
     let rows = read(&s.store, Db::Logs, move |c| {
         let mut stmt = c.prepare(&sql)?;
         let rows = stmt
-            .query_map(params_from_iter(params), |r| {
+            .query_map(params_from_iter(w.params), |r| {
                 Ok(json!({
                     "id": r.get::<_, i64>(7)?, "ts": r.get::<_, i64>(0)?, "device_mac": r.get::<_, Option<String>>(1)?, "src_ip": r.get::<_, Option<String>>(2)?,
                     "facility": r.get::<_, Option<i64>>(3)?, "severity": r.get::<_, Option<i64>>(4)?,
@@ -771,7 +875,7 @@ mod tests {
         let (engine, engine_rx) = tokio::sync::mpsc::channel(1);
         let (tx, _) = broadcast::channel(1);
         let state = AppState {
-            backups: crate::backup::Backups { data_dir: dir.clone(), key: None },
+            backups: crate::backup::Backups { data_dir: dir, key: None },
             store, vendors: Default::default(), renderer: crate::dryrun::apcfg_renderer(crate::EMULATE_VERSION.into()), auth, engine, live: Default::default(), tx, started: 0, source: "none".into(),
             active: false, writer,
         };
@@ -819,6 +923,11 @@ mod tests {
         let clients = get_json(&app, "/api/clients").await;
         assert_eq!((clients[0]["ap_name"].as_str(), clients[0]["connected"].as_bool(), clients[0]["sample"]["essid"].as_str()), (Some("Hall"), Some(true), Some("Home")));
         assert!(clients[0]["alias"].is_null() && clients[0].get("blocked").is_some(), "{}", clients[0]);
+        let keys = |v: &Value| v.as_object().unwrap().keys().cloned().collect::<Vec<_>>().join(",");
+        assert_eq!(keys(&clients[0]), "alias,ap_name,blocked,connected,first_seen,last_seen,locked_to,note,sample,usergroup_id,vendor");
+        let one = get_json(&app, "/api/clients/02:00:00:00:01:01").await;
+        assert_eq!(keys(&one), "alias,blocked,connected,first_seen,last_seen,locked_to,note,sample,usergroup_id,vendor", "no ap_name, as before");
+        assert_eq!(one["sample"], clients[0]["sample"]);
     }
 
     async fn get(app: &Router, path: &str) -> Response {
@@ -848,6 +957,52 @@ mod tests {
         typed.send(LiveMsg::Device { mac: ap }).unwrap();
         assert_eq!(socket.recv().await.unwrap().as_str(), r#"{"type":"log","device_mac":"02:00:00:00:00:01"}"#);
         assert_eq!(socket.recv().await.unwrap().as_str(), r#"{"type":"device","mac":"02:00:00:00:00:01"}"#);
+    }
+
+    #[tokio::test]
+    async fn dry_run_reads_stored_pushes_and_history() {
+        let (s, _engine) = state();
+        let (tx, _) = broadcast::channel(16);
+        let mut engine = crate::engine::Engine::new(s.writer.clone(), Default::default(), s.live.clone(), tx);
+        let header = inform::Header { packet_version: 0, mac: Mac([0; 6]), flags: inform::Flags(0), iv: [0; 16], payload_version: 1, payload_len: 0 };
+        let payload = json!({ "mac": "02:00:00:00:00:01", "hostname": "Hall", "uptime": 100 });
+        engine.handle(crate::engine::Input::Inform { ts: 50, peer: "x".into(), decoded: wire::decode::Decoded { header, key: wire::decode::KeyUsed::Device, payload } });
+        s.writer.exec(Db::Config, "INSERT INTO device_config (mac, ts, mgmt_cfg, system_cfg) VALUES ('02:00:00:00:00:01', 1, 'a=1', 'b=2')", vec![]);
+        s.writer.exec(Db::Config, "INSERT INTO dryrun_results (ts, mac, matches, comparison) VALUES (7, '02:00:00:00:00:01', 1, '{}')", vec![]);
+        assert!(s.writer.flush(std::time::Duration::from_secs(5)));
+        let app = router(s);
+        let d = get_json(&app, "/api/dryrun").await;
+        assert_eq!((d["devices"][0]["status"].as_str(), d["history"][0]["ts"].as_i64()), (Some("no_settings"), Some(7)));
+    }
+
+    #[tokio::test]
+    async fn events_by_kind_prefix_newest_first() {
+        let (s, _engine) = state();
+        let rows = [
+            (1, "client_connected", Some("02:00:00:00:00:01")), (2, "ap_online", Some("02:00:00:00:00:01")), (3, "client_roamed", Some("02:00:00:00:00:02")),
+            (4, "client_connected", Some("02:00:00:00:00:02")), (5, "config_pushed", Some("02:00:00:00:00:01")), (6, "client_connected", None),
+        ];
+        for (ts, kind, dev) in rows {
+            s.writer.exec(Db::Config, "INSERT INTO events (ts, kind, device_mac, data) VALUES (?1, ?2, ?3, '{}')", vec![Sql::Integer(ts), Sql::Text(kind.into()), dev.map_or(Sql::Null, |d| Sql::Text(d.into()))]);
+        }
+        assert!(s.writer.flush(std::time::Duration::from_secs(5)));
+        let app = router(s);
+        let ts = |v: Value| v.as_array().unwrap().iter().map(|e| e["ts"].as_i64().unwrap()).collect::<Vec<_>>();
+        assert_eq!(ts(get_json(&app, "/api/events?kind=client").await), vec![6, 4, 3, 1]);
+        assert_eq!(ts(get_json(&app, "/api/events?kind=client&limit=2").await), vec![6, 4]);
+        assert_eq!(ts(get_json(&app, "/api/events?kind=CLIENT_CONN,config").await), vec![6, 5, 4, 1], "any case, several prefixes");
+        assert_eq!(ts(get_json(&app, "/api/events?kind=client&device=02:00:00:00:00:02").await), vec![4, 3]);
+        assert_eq!(ts(get_json(&app, "/api/events?kind=nothing").await), Vec::<i64>::new());
+        assert_eq!(ts(get_json(&app, "/api/events?limit=3").await), vec![6, 5, 4]);
+    }
+
+    #[tokio::test]
+    async fn read_only_mode_keeps_secrets() {
+        // No users: read-only, without a login.
+        let (app, _engine) = app();
+        assert_eq!(get(&app, "/api/status").await.status(), StatusCode::OK);
+        assert_eq!(get(&app, "/api/settings/wlans/w1/passphrase").await.status(), StatusCode::FORBIDDEN);
+        assert_eq!(get(&app, "/api/backups/file/apctl-0.1.0-20260101-000000.apb").await.status(), StatusCode::FORBIDDEN);
     }
 
     #[tokio::test]

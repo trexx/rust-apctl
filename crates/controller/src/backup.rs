@@ -45,6 +45,12 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 const UPLOAD_LIMIT: u64 = 1 << 30;
 /// Staged restores and uploads not used within this long are deleted.
 const STAGING_TTL: Duration = Duration::from_secs(3600);
+/// The files a backup may hold besides its manifest: never paths.
+const DATABASES: [&str; 3] = ["config.db", "metrics.db", "logs.db"];
+/// A backup's databases may unpack to at most this many times the size of
+/// the backup file (or 64 MiB): SQLite files compress well, but nowhere near
+/// as well as a crafted archive.
+const MAX_RATIO: u64 = 100;
 
 /// Where backups live and how they are sealed.
 #[derive(Clone)]
@@ -205,6 +211,10 @@ fn open_payload(path: &Path, key: Option<&[u8; 32]>) -> Result<Box<dyn Read>> {
         let mut header = head.to_vec();
         header.extend_from_slice(&prefix);
         Box::new(OpenReader { inp: f, cipher: Aes256Gcm::new(key.into()), header, prefix, counter: 0, plain: vec![], pos: 0, ahead: None, done: false })
+    } else if key.is_some() {
+        // With a key, only what was sealed with it is trusted: anyone who can
+        // put a file in front of apctl could otherwise have it restored.
+        bail!("this backup is not encrypted, but a backup key is configured: apctl only restores backups sealed with its key");
     } else {
         Box::new(f)
     };
@@ -318,7 +328,12 @@ fn snapshot(src: &Path, dst: &Path) -> Result<()> {
 /// device configs and acknowledgements; login sessions never travel.
 fn trim(dir: &Path, cutoff: Option<Ts>) -> Result<()> {
     let mut c = scratch(&dir.join("config.db"))?;
-    // The deletes in one transaction, then one rewrite to drop the pages they freed.
+    // The deletes in one transaction, then one rewrite to drop the pages they
+    // freed. With nothing else to drop, the few session rows are overwritten
+    // in place instead of rewriting the whole file again.
+    if cutoff.is_none() {
+        c.execute_batch("PRAGMA secure_delete=ON;")?;
+    }
     let tx = c.transaction()?;
     tx.execute_batch("DELETE FROM sessions;")?;
     if let Some(t) = cutoff {
@@ -328,7 +343,9 @@ fn trim(dir: &Path, cutoff: Option<Ts>) -> Result<()> {
         tx.execute("DELETE FROM clients WHERE COALESCE(last_seen, 0) < ?1 AND mac NOT IN (SELECT mac FROM client_aliases)", [t])?;
     }
     tx.commit()?;
-    c.execute_batch("VACUUM;")?;
+    if cutoff.is_some() {
+        c.execute_batch("VACUUM;")?;
+    }
     drop(c);
     if let Some(t) = cutoff {
         // Every metric table in every tier, and the logs (whose full-text index follows by trigger).
@@ -475,6 +492,7 @@ impl Write for Sink {
 
 /// Unpacks a backup into `dest`, checking every file against the manifest.
 pub fn unpack(path: &Path, key: Option<&[u8; 32]>, dest: &Path) -> Result<Manifest> {
+    let limit = fs::metadata(path)?.len().saturating_mul(MAX_RATIO).max(64 << 20);
     fs::create_dir_all(dest)?;
     let mut ar = tar::Archive::new(open_payload(path, key)?);
     let mut manifest: Option<Manifest> = None;
@@ -487,16 +505,22 @@ pub fn unpack(path: &Path, key: Option<&[u8; 32]>, dest: &Path) -> Result<Manife
             }
             let mut s = String::new();
             e.read_to_string(&mut s)?;
-            manifest = Some(serde_json::from_str(&s).context("the backup's manifest is unreadable")?);
+            let m: Manifest = serde_json::from_str(&s).context("the backup's manifest is unreadable")?;
+            check_names(&m)?;
+            if m.files.values().fold(0u64, |n, f| n.saturating_add(f.size)) > limit {
+                bail!("the backup's contents are far larger than the file: it is damaged");
+            }
+            manifest = Some(m);
             continue;
         }
         // Only the known database files, never paths.
-        if !["config.db", "metrics.db", "logs.db"].contains(&name.as_str()) {
+        if !DATABASES.contains(&name.as_str()) {
             bail!("unexpected file in backup: {name}");
         }
         let m = manifest.as_ref().ok_or_else(|| anyhow!("the backup has no manifest"))?;
         let expected = m.files.get(&name).ok_or_else(|| anyhow!("{name} is not listed in the manifest"))?;
-        // Checked before anything is written, so an oversized entry cannot fill the disk.
+        // Checked before anything is written: with the manifest's total checked
+        // against the file's size, a crafted archive cannot fill the disk.
         if e.header().size()? != expected.size {
             bail!("{name} does not match its checksum: the backup is damaged");
         }
@@ -520,6 +544,15 @@ pub fn unpack(path: &Path, key: Option<&[u8; 32]>, dest: &Path) -> Result<Manife
     Ok(m)
 }
 
+/// The manifest names files to restore by their place in the data directory:
+/// only the known databases, so a crafted one cannot reach outside it.
+fn check_names(m: &Manifest) -> Result<()> {
+    match m.files.keys().find(|n| !DATABASES.contains(&n.as_str())) {
+        Some(n) => bail!("unexpected file in backup: {n}"),
+        None => Ok(()),
+    }
+}
+
 /// Whether a backup made by `theirs` can be restored on `ours` (no newer backups).
 pub fn version_ok(theirs: &str, ours: &str) -> bool {
     let parse = |v: &str| v.split('.').map(|x| x.parse::<u64>().unwrap_or(0)).collect::<Vec<_>>();
@@ -540,7 +573,7 @@ fn valid_id(id: &str) -> bool {
 /// A restore that fails is logged and set aside (`pending.failed`, shown on
 /// the backups page) and apctl starts with the data it has, rather than
 /// failing on every start. Also clears out staging left behind.
-pub fn apply_pending(b: &Backups) -> Result<()> {
+pub fn apply_pending(b: &Backups) {
     let marker = b.staging().join("pending");
     if let Ok(id) = fs::read_to_string(&marker) {
         match apply(b, id.trim()) {
@@ -559,7 +592,6 @@ pub fn apply_pending(b: &Backups) -> Result<()> {
         }
     }
     clean_staging(b);
-    Ok(())
 }
 
 fn apply(b: &Backups, id: &str) -> Result<()> {
@@ -568,6 +600,7 @@ fn apply(b: &Backups, id: &str) -> Result<()> {
     }
     let staged = b.staging().join(id);
     let manifest: Manifest = serde_json::from_slice(&fs::read(staged.join("manifest.json")).context("staged restore has no manifest")?)?;
+    check_names(&manifest)?;
     tracing::warn!("restoring the backup made {} by apctl {} (history: {} days)", manifest.created, manifest.version, manifest.days);
     if b.data_dir.join("config.db").exists() {
         let pre = create(b, &b.data_dir, Kind::PreRestore, -1).context("saving the current state before restoring")?;
@@ -817,9 +850,7 @@ pub async fn create_now(State(s): State<AppState>, headers: HeaderMap, Json(body
     }
     let b = s.backups.clone();
     let dir = b.data_dir.clone();
-    let meta = tokio::task::spawn_blocking(move || create(&b, &dir, Kind::Manual, body.days))
-        .await?
-        .map_err(|e| ApiError::internal(format!("{e:#}")))?;
+    let meta = tokio::task::spawn_blocking(move || create(&b, &dir, Kind::Manual, body.days)).await??;
     Ok(Json(json!(meta)))
 }
 
@@ -918,8 +949,21 @@ pub async fn upload(State(s): State<AppState>, headers: HeaderMap, body: Body) -
         r
     })
     .await?
-    .map_err(|e| ApiError(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
+    .map_err(refused)?;
     Ok(Json(json!({ "staged": res.0, "manifest": res.1 })))
+}
+
+/// Why a backup could not be staged or restored. Most reasons are the
+/// backup's (damaged, wrong key, too new: 400, with the reason), a missing one
+/// is 404, and apctl's own trouble (a full disk, permissions) is a 500.
+fn refused(e: anyhow::Error) -> ApiError {
+    use io::ErrorKind::*;
+    let kind = e.chain().find_map(|c| c.downcast_ref::<io::Error>()).map(io::Error::kind);
+    match kind {
+        Some(NotFound) => ApiError(StatusCode::NOT_FOUND, format!("{e:#}")),
+        Some(StorageFull | QuotaExceeded | PermissionDenied | ReadOnlyFilesystem | OutOfMemory) => ApiError::from(e),
+        _ => ApiError(StatusCode::BAD_REQUEST, format!("{e:#}")),
+    }
 }
 
 /// A file deleted when dropped, so an upload cut off half way leaves nothing behind.
@@ -937,7 +981,13 @@ pub async fn restore(State(s): State<AppState>, headers: HeaderMap, Json(body): 
     let b = s.backups.clone();
     let (id, m) = tokio::task::spawn_blocking(move || -> Result<(String, Manifest)> {
         let (id, m) = match (body.name, body.staged) {
-            (Some(name), _) if valid_name(&name) => stage(&b, &b.dir().join(&name))?,
+            (Some(name), _) if valid_name(&name) => {
+                let path = b.dir().join(&name);
+                if !path.exists() {
+                    return Err(io::Error::new(io::ErrorKind::NotFound, "no such backup").into());
+                }
+                stage(&b, &path)?
+            }
             (_, Some(id)) if valid_id(&id) => {
                 let m: Manifest = serde_json::from_slice(&fs::read(b.staging().join(&id).join("manifest.json")).context("that upload has expired")?)?;
                 (id, m)
@@ -954,7 +1004,7 @@ pub async fn restore(State(s): State<AppState>, headers: HeaderMap, Json(body): 
         Ok((id, m))
     })
     .await?
-    .map_err(|e| ApiError(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
+    .map_err(refused)?;
     tracing::warn!("restore of backup from {} staged as {id}; restarting", m.created);
     // Answer first, then exit, and the restore is applied on the next start. The
     // exit status is 75 (EX_TEMPFAIL), a failure, so that a restart policy of
@@ -996,7 +1046,7 @@ mod tests {
             "INSERT INTO events (ts, kind, data) VALUES ({old}, 'old', '{{}}'), ({now}, 'new', '{{}}');
              INSERT INTO clients (mac, hostname, last_seen) VALUES ('aa:aa:aa:aa:aa:01', 'gone', {old}), ('aa:aa:aa:aa:aa:02', 'named', {old}), ('aa:aa:aa:aa:aa:03', 'recent', {now});
              INSERT INTO client_aliases (mac, alias, updated) VALUES ('aa:aa:aa:aa:aa:02', 'Printer', {now});
-             INSERT INTO sessions (token_hash, username, created, expires) VALUES ('x', 'u', {now}, {now});",
+             INSERT INTO sessions (token_hash, username, created, expires) VALUES ('5e55107-hash-of-a-token', 'u', {now}, {now});",
             old = now - 40 * 86400
         ))
         .unwrap();
@@ -1070,12 +1120,12 @@ mod tests {
         Connection::open(src.join("config.db")).unwrap().execute_batch("DELETE FROM client_aliases;").unwrap();
         let (id, _) = stage(&b, &b.dir().join(&m.name)).unwrap();
         fs::write(b.staging().join("pending"), &id).unwrap();
-        apply_pending(&b).unwrap();
+        apply_pending(&b);
         assert_eq!(count(&src.join("config.db"), "SELECT COUNT(*) FROM client_aliases"), 1, "restored");
         assert!(!b.staging().join("pending").exists());
         assert!(list(&b).iter().any(|x| x.kind == Kind::PreRestore), "the replaced state was saved");
         // Nothing pending: nothing happens.
-        apply_pending(&b).unwrap();
+        apply_pending(&b);
     }
 
     #[test]
@@ -1104,31 +1154,40 @@ mod tests {
         let b = Backups { data_dir: src.clone(), key: None };
         fs::create_dir_all(b.staging()).unwrap();
         fs::write(b.staging().join("pending"), "r123").unwrap();
-        apply_pending(&b).unwrap();
+        apply_pending(&b);
         assert!(!b.staging().join("pending").exists());
         assert!(fs::read_to_string(b.staging().join("pending.failed")).unwrap().contains("no manifest"));
         assert_eq!(count(&src.join("config.db"), "SELECT COUNT(*) FROM client_aliases"), 1, "the current data is kept");
         // A marker naming no staged backup.
         fs::write(b.staging().join("pending"), "../config.db").unwrap();
-        apply_pending(&b).unwrap();
+        apply_pending(&b);
         assert!(src.join("config.db").exists() && !b.staging().join("pending").exists());
     }
 
-    #[test]
-    fn oversized_entries_are_refused_before_they_are_written() {
-        let d = dir("oversized");
-        let mut manifest = Manifest { format: 1, app: "apctl".into(), version: VERSION.into(), created: 0, days: 0, files: Default::default() };
-        manifest.files.insert("config.db".into(), FileInfo { size: 4, sha256: "00".into() });
+    /// A manifest listing `files`, for hand-made backups.
+    fn manifest(files: &[(&str, u64)]) -> Manifest {
+        let files = files.iter().map(|(n, size)| (n.to_string(), FileInfo { size: *size, sha256: "00".into() })).collect();
+        Manifest { format: 1, app: "apctl".into(), version: VERSION.into(), created: 0, days: 0, files }
+    }
+
+    /// Writes an unencrypted backup holding `manifest` and then `entries`, as given.
+    fn hand_made(path: &Path, manifest: &Manifest, entries: &[(&str, Vec<u8>)]) {
         let mut file = MAGIC.to_vec();
         file.push(0);
         let mut tar = tar::Builder::new(flate2::write::GzEncoder::new(file, flate2::Compression::default()));
-        for (name, data) in [("manifest.json", serde_json::to_vec(&manifest).unwrap()), ("config.db", vec![0u8; 4096])] {
+        for (name, data) in std::iter::once(("manifest.json", serde_json::to_vec(manifest).unwrap())).chain(entries.iter().map(|(n, d)| (*n, d.clone()))) {
             let mut h = tar::Header::new_gnu();
             h.set_size(data.len() as u64);
             h.set_cksum();
             tar.append_data(&mut h, name, data.as_slice()).unwrap();
         }
-        fs::write(d.join("x.apb"), tar.into_inner().unwrap().finish().unwrap()).unwrap();
+        fs::write(path, tar.into_inner().unwrap().finish().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn oversized_entries_are_refused_before_they_are_written() {
+        let d = dir("oversized");
+        hand_made(&d.join("x.apb"), &manifest(&[("config.db", 4)]), &[("config.db", vec![0u8; 4096])]);
         let out = d.join("out");
         let err = unpack(&d.join("x.apb"), None, &out).unwrap_err();
         assert!(err.to_string().contains("damaged"), "{err:#}");
@@ -1136,9 +1195,60 @@ mod tests {
     }
 
     #[test]
+    fn sessions_never_travel_even_with_all_history() {
+        let src = data("sessions");
+        let b = Backups { data_dir: src.clone(), key: None };
+        let m = create(&b, &src, Kind::Manual, -1).unwrap();
+        let out = dir("sessions-out");
+        unpack(&b.dir().join(&m.name), None, &out).unwrap();
+        assert_eq!(count(&out.join("config.db"), "SELECT COUNT(*) FROM sessions"), 0);
+        // Not even in the pages the delete freed.
+        let raw = fs::read(out.join("config.db")).unwrap();
+        assert!(!raw.windows(23).any(|w| w == b"5e55107-hash-of-a-token"));
+        assert_eq!(count(&out.join("config.db"), "SELECT COUNT(*) FROM events"), 2, "all history kept");
+    }
+
+    #[test]
+    fn contents_far_larger_than_the_file_are_refused() {
+        let d = dir("bomb");
+        // A 4 GiB database claimed by a file of a few hundred bytes.
+        hand_made(&d.join("x.apb"), &manifest(&[("config.db", 4 << 30)]), &[]);
+        let err = unpack(&d.join("x.apb"), None, &d.join("out")).unwrap_err();
+        assert!(err.to_string().contains("far larger"), "{err:#}");
+    }
+
+    #[test]
+    fn with_a_key_only_sealed_backups_are_restored() {
+        let src = data("plain");
+        let plain = create(&Backups { data_dir: src.clone(), key: None }, &src, Kind::Manual, 0).unwrap();
+        let b = Backups { data_dir: src, key: Some([5u8; 32]) };
+        let err = unpack(&b.dir().join(&plain.name), b.key.as_ref(), &dir("plain-out")).unwrap_err();
+        assert!(err.to_string().contains("not encrypted"), "{err:#}");
+    }
+
+    #[test]
+    fn a_manifest_cannot_name_files_outside_the_data_directory() {
+        let d = dir("names");
+        // Listed, but never in the archive: the name alone must be refused.
+        for name in ["../../config.db", "/tmp/x.db", "other.db"] {
+            hand_made(&d.join("x.apb"), &manifest(&[(name, 1)]), &[]);
+            let err = unpack(&d.join("x.apb"), None, &d.join("out")).unwrap_err();
+            assert!(err.to_string().contains("unexpected file"), "{name}: {err:#}");
+        }
+        // Nor can a staged manifest, when the restore is applied.
+        let src = data("names-apply");
+        let b = Backups { data_dir: src, key: None };
+        fs::create_dir_all(b.staging().join("r1")).unwrap();
+        fs::write(b.staging().join("r1").join("manifest.json"), serde_json::to_vec(&manifest(&[("../config.db", 1)])).unwrap()).unwrap();
+        fs::write(b.staging().join("pending"), "r1").unwrap();
+        apply_pending(&b);
+        assert!(fs::read_to_string(b.staging().join("pending.failed")).unwrap().contains("unexpected file"));
+    }
+
+    #[test]
     fn left_over_staging_is_cleared() {
         let src = dir("clean");
-        let b = Backups { data_dir: src.clone(), key: None };
+        let b = Backups { data_dir: src, key: None };
         fs::create_dir_all(b.staging().join("r1")).unwrap();
         fs::create_dir_all(b.staging().join("r2")).unwrap();
         fs::write(b.staging().join("upload-1-x.apb"), "x").unwrap();
@@ -1150,6 +1260,17 @@ mod tests {
         clean_staging(&b);
         let left: Vec<String> = fs::read_dir(b.staging()).unwrap().flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect();
         assert!(left.contains(&"r2".to_string()) && left.contains(&"pending".to_string()) && left.len() == 2, "{left:?}");
+    }
+
+    #[test]
+    fn a_bad_backup_is_the_requests_fault_a_full_disk_is_not() {
+        let status = |e: anyhow::Error| refused(e).0;
+        assert_eq!(status(anyhow!("the backup is damaged")), StatusCode::BAD_REQUEST);
+        assert_eq!(status(anyhow::Error::from(io::Error::from(io::ErrorKind::InvalidData)).context("reading")), StatusCode::BAD_REQUEST);
+        assert_eq!(status(io::Error::new(io::ErrorKind::NotFound, "no such backup").into()), StatusCode::NOT_FOUND);
+        let full = refused(anyhow::Error::from(io::Error::from(io::ErrorKind::StorageFull)).context("writing /data/restore/r1/config.db"));
+        assert_eq!(full.0, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(!full.1.contains("/data"), "paths stay in the log: {}", full.1);
     }
 
     #[test]
