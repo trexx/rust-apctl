@@ -658,49 +658,87 @@ async fn series(State(s): State<AppState>, Path(table): Path<String>, Query(q): 
     Ok(Json(read(&s.store, Db::Metrics, move |c| store::series(c, t, &keys, from, to, tier)).await?))
 }
 
+/// A WHERE clause made of optional filters, with numbered parameters.
+#[derive(Default)]
+struct Where {
+    cond: Vec<String>,
+    params: Vec<Sql>,
+}
+
+impl Where {
+    /// Adds a condition; its `?` stands for `value`.
+    fn and(&mut self, sql: &str, value: Sql) {
+        self.params.push(value);
+        self.cond.push(sql.replace('?', &format!("?{}", self.params.len())));
+    }
+
+    fn sql(&self) -> String {
+        if self.cond.is_empty() { "1 = 1".into() } else { self.cond.join(" AND ") }
+    }
+}
+
 #[derive(Deserialize)]
 struct EventQuery {
     device: Option<String>,
     client: Option<String>,
     kind: Option<String>,
-    /// Only events strictly before this time (for paging backwards).
-    before: Option<Ts>,
     limit: Option<i64>,
 }
 
+/// The event kinds starting with `prefix`, read from the kind index one kind
+/// at a time (a handful of lookups, however many events there are).
+fn kinds_with_prefix(c: &rusqlite::Connection, prefix: &str) -> rusqlite::Result<Vec<String>> {
+    let mut stmt = c.prepare_cached(
+        "WITH RECURSIVE k(kind) AS (
+            SELECT (SELECT MIN(kind) FROM events WHERE kind >= ?1 AND kind < ?2)
+            UNION ALL SELECT (SELECT MIN(kind) FROM events WHERE kind > k.kind AND kind < ?2) FROM k WHERE k.kind IS NOT NULL)
+         SELECT kind FROM k WHERE kind IS NOT NULL",
+    )?;
+    stmt.query_map((prefix, format!("{prefix}{}", char::MAX)), |r| r.get(0))?.collect()
+}
+
 async fn events(State(s): State<AppState>, Query(q): Query<EventQuery>) -> ApiResult {
-    let mut cond = vec!["1 = 1".to_string()];
-    let mut params: Vec<Sql> = Vec::new();
+    let mut w = Where::default();
     if let Some(d) = &q.device {
-        params.push(Sql::Text(parse_mac(d)?.to_string()));
-        cond.push(format!("device_mac = ?{}", params.len()));
+        w.and("device_mac = ?", Sql::Text(parse_mac(d)?.to_string()));
     }
     if let Some(c) = &q.client {
-        params.push(Sql::Text(parse_mac(c)?.to_string()));
-        cond.push(format!("client_mac = ?{}", params.len()));
+        w.and("client_mac = ?", Sql::Text(parse_mac(c)?.to_string()));
     }
-    if let Some(k) = &q.kind {
-        // Prefix match, so `client` selects all client events; several kinds
-        // can be given separated by commas.
-        let mut any = Vec::new();
-        for k in k.split(',').map(str::trim).filter(|k| !k.is_empty()).take(10) {
-            params.push(Sql::Text(format!("{k}%")));
-            any.push(format!("kind LIKE ?{}", params.len()));
-        }
-        if !any.is_empty() {
-            cond.push(format!("({})", any.join(" OR ")));
-        }
-    }
-    if let Some(b) = q.before {
-        params.push(Sql::Integer(b));
-        cond.push(format!("ts < ?{}", params.len()));
-    }
+    // Prefix match, so `client` selects all client events; several kinds
+    // can be given separated by commas.
+    let prefixes: Vec<String> = q.kind.iter().flat_map(|k| k.split(',')).map(|k| k.trim().to_ascii_lowercase()).filter(|k| !k.is_empty()).take(10).collect();
     let limit = q.limit.unwrap_or(200).clamp(1, 2000);
-    let sql = format!("SELECT ts, kind, device_mac, client_mac, data, id FROM events WHERE {} ORDER BY ts DESC, id DESC LIMIT {limit}", cond.join(" AND "));
+    const COLUMNS: &str = "ts, kind, device_mac, client_mac, data, id";
     let rows = read(&s.store, Db::Config, move |c| {
+        let sql = if prefixes.is_empty() {
+            format!("SELECT {COLUMNS} FROM events WHERE {} ORDER BY ts DESC, id DESC LIMIT {limit}", w.sql())
+        } else {
+            // The newest of each matching kind from the (kind, ts) index, then
+            // the newest of those: a rare kind is found without walking every
+            // event, and a common one reads no more than the limit.
+            let mut kinds: Vec<String> = Vec::new();
+            for p in &prefixes {
+                kinds.extend(kinds_with_prefix(c, p)?);
+            }
+            kinds.sort();
+            kinds.dedup();
+            if kinds.is_empty() {
+                return Ok(vec![]);
+            }
+            let filters = w.sql();
+            let parts: Vec<String> = kinds
+                .into_iter()
+                .map(|k| {
+                    w.params.push(Sql::Text(k));
+                    format!("SELECT * FROM (SELECT {COLUMNS} FROM events WHERE {filters} AND kind = ?{} ORDER BY ts DESC, id DESC LIMIT {limit})", w.params.len())
+                })
+                .collect();
+            format!("{} ORDER BY ts DESC, id DESC LIMIT {limit}", parts.join(" UNION ALL "))
+        };
         let mut stmt = c.prepare(&sql)?;
         let rows = stmt
-            .query_map(params_from_iter(params), |r| {
+            .query_map(params_from_iter(w.params), |r| {
                 let data: Option<String> = r.get(4)?;
                 Ok(json!({
                     "id": r.get::<_, i64>(5)?, "ts": r.get::<_, i64>(0)?, "kind": r.get::<_, String>(1)?,
@@ -720,36 +758,28 @@ struct LogQuery {
     device: Option<String>,
     /// Full-text query (SQLite FTS5 syntax).
     q: Option<String>,
-    before: Option<Ts>,
     limit: Option<i64>,
 }
 
 async fn logs(State(s): State<AppState>, Query(q): Query<LogQuery>) -> ApiResult {
-    let mut cond = vec!["1 = 1".to_string()];
-    let mut params: Vec<Sql> = Vec::new();
+    let mut w = Where::default();
     if let Some(d) = &q.device {
-        params.push(Sql::Text(parse_mac(d)?.to_string()));
-        cond.push(format!("l.device_mac = ?{}", params.len()));
+        w.and("l.device_mac = ?", Sql::Text(parse_mac(d)?.to_string()));
     }
     if let Some(text) = q.q.as_deref().filter(|t| !t.trim().is_empty()) {
         // Quote each word so user input cannot break FTS syntax; words are ANDed.
         let fts: Vec<String> = text.split_whitespace().map(|w| format!("\"{}\"", w.replace('"', "\"\""))).collect();
-        params.push(Sql::Text(fts.join(" ")));
-        cond.push(format!("l.id IN (SELECT rowid FROM logs_fts WHERE logs_fts MATCH ?{})", params.len()));
-    }
-    if let Some(b) = q.before {
-        params.push(Sql::Integer(b));
-        cond.push(format!("l.ts < ?{}", params.len()));
+        w.and("l.id IN (SELECT rowid FROM logs_fts WHERE logs_fts MATCH ?)", Sql::Text(fts.join(" ")));
     }
     let limit = q.limit.unwrap_or(500).clamp(1, 5000);
     let sql = format!(
         "SELECT l.ts, l.device_mac, l.src_ip, l.facility, l.severity, l.program, l.msg, l.id FROM logs l WHERE {} ORDER BY l.ts DESC, l.id DESC LIMIT {limit}",
-        cond.join(" AND ")
+        w.sql()
     );
     let rows = read(&s.store, Db::Logs, move |c| {
         let mut stmt = c.prepare(&sql)?;
         let rows = stmt
-            .query_map(params_from_iter(params), |r| {
+            .query_map(params_from_iter(w.params), |r| {
                 Ok(json!({
                     "id": r.get::<_, i64>(7)?, "ts": r.get::<_, i64>(0)?, "device_mac": r.get::<_, Option<String>>(1)?, "src_ip": r.get::<_, Option<String>>(2)?,
                     "facility": r.get::<_, Option<i64>>(3)?, "severity": r.get::<_, Option<i64>>(4)?,
@@ -915,6 +945,27 @@ mod tests {
         typed.send(LiveMsg::Device { mac: ap }).unwrap();
         assert_eq!(socket.recv().await.unwrap().as_str(), r#"{"type":"log","device_mac":"02:00:00:00:00:01"}"#);
         assert_eq!(socket.recv().await.unwrap().as_str(), r#"{"type":"device","mac":"02:00:00:00:00:01"}"#);
+    }
+
+    #[tokio::test]
+    async fn events_by_kind_prefix_newest_first() {
+        let (s, _engine) = state();
+        let rows = [
+            (1, "client_connected", Some("02:00:00:00:00:01")), (2, "ap_online", Some("02:00:00:00:00:01")), (3, "client_roamed", Some("02:00:00:00:00:02")),
+            (4, "client_connected", Some("02:00:00:00:00:02")), (5, "config_pushed", Some("02:00:00:00:00:01")), (6, "client_connected", None),
+        ];
+        for (ts, kind, dev) in rows {
+            s.writer.exec(Db::Config, "INSERT INTO events (ts, kind, device_mac, data) VALUES (?1, ?2, ?3, '{}')", vec![Sql::Integer(ts), Sql::Text(kind.into()), dev.map_or(Sql::Null, |d| Sql::Text(d.into()))]);
+        }
+        assert!(s.writer.flush(std::time::Duration::from_secs(5)));
+        let app = router(s);
+        let ts = |v: Value| v.as_array().unwrap().iter().map(|e| e["ts"].as_i64().unwrap()).collect::<Vec<_>>();
+        assert_eq!(ts(get_json(&app, "/api/events?kind=client").await), vec![6, 4, 3, 1]);
+        assert_eq!(ts(get_json(&app, "/api/events?kind=client&limit=2").await), vec![6, 4]);
+        assert_eq!(ts(get_json(&app, "/api/events?kind=CLIENT_CONN,config").await), vec![6, 5, 4, 1], "any case, several prefixes");
+        assert_eq!(ts(get_json(&app, "/api/events?kind=client&device=02:00:00:00:00:02").await), vec![4, 3]);
+        assert_eq!(ts(get_json(&app, "/api/events?kind=nothing").await), Vec::<i64>::new());
+        assert_eq!(ts(get_json(&app, "/api/events?limit=3").await), vec![6, 5, 4]);
     }
 
     #[tokio::test]
