@@ -53,14 +53,17 @@ pub fn spawn(source: Source, ports: Vec<u16>, syslog_port: u16, keys: Arc<KeySto
             let mut backoff = Duration::from_secs(1);
             loop {
                 let started = std::time::Instant::now();
-                let result = match &source {
+                // A panic in the capture reader ends this run like an error does,
+                // rather than shadow mode for good.
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match &source {
                     Source::Stdin => run_once(std::io::stdin(), &ports, syslog_port, &keys, &tx, &replaying),
                     Source::Path(p) => match std::fs::File::open(p) {
                         Ok(f) => run_once(std::io::BufReader::new(f), &ports, syslog_port, &keys, &tx, &replaying),
                         Err(e) => Err(anyhow::anyhow!("opening {}: {e}", p.display())),
                     },
                     Source::Command(cmd) => run_command(cmd, &ports, syslog_port, &keys, &tx, &replaying),
-                };
+                }))
+                .unwrap_or_else(|_| Err(anyhow::anyhow!("the capture reader panicked")));
                 replaying.store(false, Ordering::Relaxed);
                 match result {
                     Ok(()) => tracing::warn!("shadow capture from {source} ended"),
@@ -86,10 +89,11 @@ fn run_command(cmd: &str, ports: &[u16], syslog_port: u16, keys: &KeyStore, tx: 
     tracing::info!("starting shadow capture: {cmd}");
     let mut child = Command::new("sh").arg("-c").arg(cmd).stdout(Stdio::piped()).stderr(Stdio::inherit()).spawn()?;
     let stdout = child.stdout.take().expect("piped stdout");
-    let result = run_once(stdout, ports, syslog_port, keys, tx, replaying);
+    // The command is stopped even when the reader panics.
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run_once(stdout, ports, syslog_port, keys, tx, replaying)));
     let _ = child.kill();
     let _ = child.wait();
-    result
+    result.unwrap_or_else(|_| Err(anyhow::anyhow!("the capture reader panicked")))
 }
 
 fn run_once<R: Read + Send>(
@@ -108,7 +112,17 @@ fn run_once<R: Read + Send>(
             let _ = tx.blocking_send(Input::Datagram { ts: ts / 1_000_000, src_ip: src.ip().to_string(), payload });
             return;
         }
-        let Some(ev) = pairer.handle(keys, event) else { return };
+        // A message the decoder cannot cope with is skipped, not the whole capture:
+        // the pairer starts afresh, as its half-paired exchanges may be inconsistent.
+        let ev = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| pairer.handle(keys, event))) {
+            Ok(Some(ev)) => ev,
+            Ok(None) => return,
+            Err(_) => {
+                tracing::warn!("skipped a captured message the decoder panicked on");
+                pairer = Pairer::default();
+                return;
+            }
+        };
         let mut tick = None;
         let input = match ev {
             InformEvent::Inform { ts, peer, decoded: Ok(decoded), .. } => {
