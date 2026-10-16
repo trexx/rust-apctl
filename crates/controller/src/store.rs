@@ -412,7 +412,8 @@ fn writer_loop(dir: &Path, rx: Receiver<Write>) -> Result<()> {
     let mut pending: Vec<Write> = Vec::new();
     let mut acks: Vec<Sender<()>> = Vec::new();
     let mut last_flush = Instant::now();
-    let mut last_maintenance = Instant::now() - Duration::from_secs(240);
+    // The first maintenance a minute after start.
+    let mut last_maintenance = Instant::now().checked_sub(Duration::from_secs(240)).unwrap_or_else(Instant::now);
     loop {
         match rx.recv_timeout(Duration::from_millis(250)) {
             Ok(Write::Flush(ack)) => acks.push(ack),
