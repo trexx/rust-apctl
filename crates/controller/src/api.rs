@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::sync::broadcast;
 
-use crate::engine::{AliasEdit, LiveMsg, SharedLive};
+use crate::engine::{AliasEdit, DeviceView, LiveMsg, SharedLive};
 use crate::model::Ts;
 use crate::store::{self, Db, Store};
 
@@ -390,23 +390,40 @@ async fn devices(State(s): State<AppState>) -> Result<Json<Vec<DeviceRow>>, ApiE
     Ok(Json(list))
 }
 
-async fn device(State(s): State<AppState>, Path(mac): Path<String>) -> ApiResult {
+/// An AP's page: its view, its connected clients, and whether it is blinking to be found.
+#[derive(Serialize)]
+struct DeviceDetail<'a> {
+    device: DeviceOut<'a>,
+    clients: &'a [crate::engine::ClientView],
+    locating: bool,
+}
+
+#[derive(Serialize)]
+struct DeviceOut<'a> {
+    #[serde(flatten)]
+    view: &'a DeviceView,
+    /// Known from the database only: it has not reported since apctl started.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    stored_only: bool,
+}
+
+async fn device(State(s): State<AppState>, Path(mac): Path<String>) -> Result<Response, ApiError> {
     let mac = parse_mac(&mac)?;
+    // Copied out under the lock (the clients' samples are shared), and serialised after it.
     let found = {
         let live = s.live.read().unwrap();
         live.devices.get(&mac).map(|d| {
-            // The clients are copied out (shared samples) and serialised after the lock.
             let clients: Vec<_> = live.clients.values().filter(|c| c.connected && c.sample.ap_mac == mac).cloned().collect();
-            (serde_json::to_value(d).unwrap_or_default(), clients, live.locating.contains(&mac))
+            (d.clone(), clients, live.locating.contains(&mac))
         })
     };
-    if let Some((device, clients, locating)) = found {
-        return Ok(Json(json!({ "device": device, "clients": clients, "locating": locating })));
+    if let Some((view, clients, locating)) = found {
+        return Ok(Json(DeviceDetail { device: DeviceOut { view: &view, stored_only: false }, clients: &clients, locating }).into_response());
     }
     // Known but not reporting since apctl started: offline, with what we stored.
     let stored = stored_devices(&s.store, Some(mac.to_string())).await?;
     let d = stored.into_iter().next().ok_or_else(|| ApiError(StatusCode::NOT_FOUND, "unknown device".into()))?;
-    Ok(Json(json!({ "device": d.view(), "clients": [] })))
+    Ok(Json(json!({ "device": d.view(), "clients": [] })).into_response())
 }
 
 /// Every client: the ones seen in this run and the ones restored from the
