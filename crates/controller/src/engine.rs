@@ -35,8 +35,9 @@ pub enum Input {
     SetState { ts: Ts, state: Value },
     /// Active mode: the section numbering a render allocated for an AP.
     SetConfigMeta { mac: Mac, meta: Value },
-    /// Active mode: apctl itself pushed this `setparam` to an AP.
-    ConfigPushed { ts: Ts, mac: Mac, payload: Value },
+    /// Active mode: apctl itself sent this reply to an AP (a `setparam`, or a
+    /// reply that sets its inform interval).
+    Replied { ts: Ts, mac: Mac, payload: Value },
     /// Set or clear clients' aliases and notes (None clears): one, or a bulk
     /// import. `only_if_unset` leaves existing aliases alone (for imports).
     SetAliases { ts: Ts, entries: Vec<AliasEdit>, only_if_unset: bool },
@@ -433,7 +434,7 @@ impl Engine {
         match input {
             Input::Inform { ts, peer, decoded } => self.inform(ts, peer, decoded),
             Input::Reply { ts, mac, decoded } => self.reply(ts, mac, &decoded.payload, true),
-            Input::ConfigPushed { ts, mac, payload } => self.reply(ts, mac, &payload, false),
+            Input::Replied { ts, mac, payload } => self.reply(ts, mac, &payload, false),
             Input::SetConfigMeta { mac, meta } => self.set_config_meta(mac, meta),
             Input::Datagram { ts, src_ip, payload } => self.datagram(ts, src_ip, &payload),
             Input::Tick(now) => self.tick(now),

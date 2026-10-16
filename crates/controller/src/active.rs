@@ -465,11 +465,14 @@ pub async fn inform(
     if active.engine.send(Input::Inform { ts, peer: peer_ip, decoded }).await.is_err() {
         return status(StatusCode::SERVICE_UNAVAILABLE);
     }
-    if reply["_type"] == "setparam" {
-        let _ = active.engine.send(Input::ConfigPushed { ts, mac, payload: reply.clone() }).await;
+    let response = sealed(mac, gcm, &key, &reply);
+    // The engine follows the interval it asked for (or the AP would be called
+    // offline on a site where informs come more than a minute apart) and
+    // records each push.
+    if reply["_type"] == "setparam" || reply.get("interval").is_some() {
+        let _ = active.engine.send(Input::Replied { ts, mac, payload: reply }).await;
     }
-
-    sealed(mac, gcm, &key, &reply)
+    response
 }
 
 /// A reply in the request's encryption mode, never compressed, with a fresh IV.
@@ -495,7 +498,7 @@ mod tests {
     struct Rig {
         app: axum::Router,
         live: SharedLive,
-        _rx: mpsc::Receiver<Input>,
+        rx: mpsc::Receiver<Input>,
         active: Arc<Active>,
     }
 
@@ -538,7 +541,7 @@ mod tests {
         };
         let active = Arc::new(Active::new(&store, writer, live.clone(), Arc::new(keys), tx, controller, Default::default()).unwrap());
         let app = axum::Router::new().route("/inform", axum::routing::post(inform)).with_state(active.clone());
-        Rig { app, live, _rx: rx, active }
+        Rig { app, live, rx, active }
     }
 
     /// The AP's own inform (sanitised capture), with a chosen cfgversion.
@@ -685,6 +688,28 @@ mod tests {
         // Until it applies a push, an AP still reporting the old version gets it again.
         let (_, reply) = inform_as_ap(&rig, &ap_payload("1111111111111111"), KEY, GCM_ZLIB).await;
         assert_eq!(reply.unwrap().1["cfgversion"], version.as_str());
+    }
+
+    #[tokio::test]
+    async fn the_engine_hears_the_interval_and_each_push() {
+        let Some(_) = fixtures() else { return };
+        let mut rig = rig(true, None);
+        let replied = |rig: &mut Rig| {
+            std::iter::from_fn(|| rig.rx.try_recv().ok()).filter_map(|i| if let Input::Replied { payload, .. } = i { Some(payload) } else { None }).collect::<Vec<_>>()
+        };
+        let (_, reply) = inform_as_ap(&rig, &ap_payload("1111111111111111"), KEY, GCM_ZLIB).await;
+        let version = reply.unwrap().1["cfgversion"].as_str().unwrap().to_string();
+        assert_eq!(replied(&mut rig).iter().map(|p| p["_type"].as_str()).collect::<Vec<_>>(), [Some("setparam")]);
+        // A heartbeat sets the interval: the engine must know it to tell when the AP is gone.
+        inform_as_ap(&rig, &ap_payload(&version), KEY, GCM_ZLIB).await;
+        let r = replied(&mut rig);
+        assert_eq!((r.len(), r[0]["_type"].as_str()), (1, Some("noop")));
+        assert!(r[0]["interval"].as_i64().is_some());
+        // A notification's bare noop sets nothing.
+        let mut notif = ap_payload(&version);
+        notif["inform_as_notif"] = json!(true);
+        inform_as_ap(&rig, &notif, KEY, GCM_ZLIB).await;
+        assert!(replied(&mut rig).is_empty());
     }
 
     #[tokio::test]
