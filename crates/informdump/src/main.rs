@@ -216,7 +216,7 @@ fn main() -> Result<()> {
             let mut store = load_keys(keys.as_deref())?;
             if let Some(k) = key {
                 let mac = inform::Header::parse(&body)?.mac;
-                store.insert(&mac.to_string(), &k)?;
+                store.insert_for(mac, &k)?;
             }
             let d = wire::decode::decode(&body, &store, None)?;
             eprintln!("{:#?}\nkey used: {:?}", d.header, d.key);

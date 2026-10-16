@@ -721,11 +721,7 @@ mod tests {
 
     #[test]
     fn capture_decodes_with_the_state_keys() {
-        let state = state().unwrap();
-        let path = std::env::temp_dir().join(format!("demo-state-{}.json", std::process::id()));
-        std::fs::write(&path, state.to_string()).unwrap();
-        let keys = wire::keys::KeyStore::load(path.to_str().unwrap()).unwrap();
-        std::fs::remove_file(&path).ok();
+        let keys = wire::keys::KeyStore::from_value(&state().unwrap());
         let mut buf = Vec::new();
         run(0.5, false, &mut buf).unwrap();
         let mut pairer = wire::exchange::Pairer::default();
