@@ -1043,9 +1043,17 @@ impl Engine {
         let mut changed = false;
         let mut live = self.live.write().unwrap();
         for AliasEdit { mac, alias, note } in entries {
-            let (alias, note) = (clean(alias), clean(note));
+            let (alias, mut note) = (clean(alias), clean(note));
             let old = live.aliases.get(&mac).cloned().unwrap_or_default();
-            if (only_if_unset && old.alias.is_some()) || (old.alias == alias && old.note == note) {
+            // An import only adds names: an entry without one, or for a client
+            // already named, changes nothing, and a note it lacks is kept.
+            if only_if_unset {
+                if alias.is_none() || old.alias.is_some() {
+                    continue;
+                }
+                note = note.or(old.note.clone());
+            }
+            if old.alias == alias && old.note == note {
                 continue;
             }
             changed = true;
@@ -1925,6 +1933,21 @@ mod tests {
         let lists = msgs.iter().filter(|m| matches!(m, LiveMsg::Clients)).count();
         assert_eq!((renames, lists), (2, 1), "{msgs:?}");
         assert_eq!(h.live.read().unwrap().aliases.len(), 2);
+    }
+
+    #[test]
+    fn an_import_keeps_notes_of_clients_without_a_name() {
+        let mut h = harness();
+        let (c2, c3): (Mac, Mac) = ("02:00:00:00:01:02".parse().unwrap(), "02:00:00:00:01:03".parse().unwrap());
+        let edit = |mac: Mac, alias: Option<&str>, note: Option<&str>| AliasEdit { mac, alias: alias.map(str::to_string), note: note.map(str::to_string) };
+        let entries = vec![edit(c2, None, Some("behind the TV")), edit(c3, None, Some("guest laptop"))];
+        h.engine.handle(Input::SetAliases { ts: 1, entries, only_if_unset: false });
+        // One import entry names a client that only has a note; another has no name at all.
+        let entries = vec![edit(c2, Some("TV"), None), edit(c3, Some(""), None)];
+        h.engine.handle(Input::SetAliases { ts: 2, entries, only_if_unset: true });
+        let live = h.live.read().unwrap();
+        assert_eq!((live.aliases[&c2].alias.as_deref(), live.aliases[&c2].note.as_deref()), (Some("TV"), Some("behind the TV")));
+        assert_eq!((live.aliases[&c3].alias.as_deref(), live.aliases[&c3].note.as_deref()), (None, Some("guest laptop")));
     }
 
     #[test]
