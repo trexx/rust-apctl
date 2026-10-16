@@ -238,7 +238,8 @@ async fn serve(args: ServeArgs) -> Result<()> {
             loop {
                 match socket.recv_from(&mut buf).await {
                     Ok((n, src)) => {
-                        let input = Input::Datagram { ts: store::now_ts(), src_ip: src.ip().to_string(), payload: buf[..n].to_vec() };
+                        // An IPv4 AP on a dual-stack socket goes by its IPv4 address, as its informs report it.
+                        let input = Input::Datagram { ts: store::now_ts(), src_ip: src.ip().to_canonical().to_string(), payload: buf[..n].to_vec() };
                         match tx.try_send(input) {
                             Ok(()) => {}
                             Err(mpsc::error::TrySendError::Full(_)) => {
@@ -251,7 +252,11 @@ async fn serve(args: ServeArgs) -> Result<()> {
                             Err(mpsc::error::TrySendError::Closed(_)) => return,
                         }
                     }
-                    Err(e) => tracing::warn!("syslog socket: {e}"),
+                    Err(e) => {
+                        // A socket that keeps failing must not spin a core and flood the log.
+                        tracing::warn!("syslog socket: {e}");
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                    }
                 }
             }
         });
