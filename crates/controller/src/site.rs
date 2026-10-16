@@ -9,29 +9,7 @@ use axum::http::{HeaderMap, StatusCode};
 use serde_json::{Value, json};
 
 use crate::api::{ApiError, AppState};
-use crate::settings::{COUNTRY_NAMES, PreviewQuery, docs, legal_channels, outdoor, site_id};
-
-/// The site's setting document with this key, created when missing.
-fn setting_mut<'a>(state: &'a mut Value, key: &str) -> Result<&'a mut Value, String> {
-    let site = site_id(state);
-    if !state["setting"].is_array() {
-        state["setting"] = json!([]);
-    }
-    let list = state["setting"].as_array_mut().unwrap();
-    let i = match list.iter().position(|s| s["key"].as_str() == Some(key) && (site.is_none() || s["site_id"].as_str().is_none_or(|x| Some(x) == site.as_deref()))) {
-        Some(i) => i,
-        None => {
-            list.push(json!({ "key": key, "site_id": site }));
-            list.len() - 1
-        }
-    };
-    Ok(&mut list[i])
-}
-
-fn setting<'a>(state: &'a Value, key: &str) -> &'a Value {
-    static NULL: Value = Value::Null;
-    docs(state, "setting").find(|s| s["key"].as_str() == Some(key)).unwrap_or(&NULL)
-}
+use crate::settings::{COUNTRY_NAMES, PreviewQuery, band_name, country, dedup_in_order, docs_mut, legal_channels, mgmt_flag, num, outdoor_with, setting, setting_mut};
 
 /// A host name or IPv4 address, as NTP and syslog targets take (the official
 /// controller refuses IPv6 there).
@@ -48,7 +26,7 @@ const NTP_POOL: [&str; 4] = ["0.ubnt.pool.ntp.org", "1.ubnt.pool.ntp.org", "2.ub
 fn port(v: &Value, what: &str) -> Result<Option<i64>, String> {
     match v {
         Value::Null => Ok(None),
-        v => match v.as_i64().or_else(|| v.as_str()?.parse().ok()) {
+        v => match num(v) {
             Some(n) if (1..=65535).contains(&n) => Ok(Some(n)),
             _ => Err(format!("{what} must be a port from 1 to 65535")),
         },
@@ -70,21 +48,20 @@ fn bools(p: &Value, doc: &mut Value, keys: &[&str]) -> Result<(), String> {
 /// mode no longer allow back to auto, as the official controller does when
 /// the country changes. Returns them as "AP 5 GHz channel 44" lines.
 fn reset_illegal_channels(state: &mut Value) -> Vec<String> {
-    let c = crate::settings::country(state);
-    let modes: Vec<bool> = docs(state, "devices").map(|d| outdoor(state, d)).collect();
-    let site = site_id(state);
+    let c = country(state);
+    let site_outdoor = mgmt_flag(state, "outdoor_mode_enabled");
     let mut out = Vec::new();
-    let devices = state["devices"].as_array_mut().into_iter().flatten().filter(|d| site.is_none() || d["site_id"].as_str().is_none_or(|x| Some(x) == site.as_deref()));
-    for (d, o) in devices.zip(modes) {
+    for d in docs_mut(state, "devices") {
+        let o = outdoor_with(d, site_outdoor);
         let name = d["name"].as_str().or(d["mac"].as_str()).unwrap_or("?").to_string();
         for r in d["radio_table"].as_array_mut().into_iter().flatten() {
             let band = r["radio"].as_str().unwrap_or("").to_string();
-            let width = r["ht"].as_i64().or_else(|| r["ht"].as_str()?.parse().ok()).unwrap_or(20);
-            if let Some(ch) = r["channel"].as_i64().or_else(|| r["channel"].as_str()?.parse().ok())
-                && !legal_channels(c, &band, width, o).contains(&ch)
+            let width = num(&r["ht"]).unwrap_or(20);
+            if let Some(ch) = num(&r["channel"])
+                && legal_channels(c, &band, width, o).is_some_and(|l| !l.contains(&ch))
             {
                 r["channel"] = json!("auto");
-                out.push(format!("AP {name} {} channel {ch} → auto", if band == "ng" { "2.4 GHz" } else { "5 GHz" }));
+                out.push(format!("AP {name} {} channel {ch} → auto", band_name(&band)));
             }
         }
     }
@@ -93,15 +70,15 @@ fn reset_illegal_channels(state: &mut Value) -> Vec<String> {
 
 const SECRETS: &[&str] = &["x_ssh_password", "x_ssh_sha512passwd", "x_ssh_md5passwd", "x_password"];
 
-/// Applies `body.patch`: `{ mgmt: {...}, rsyslogd: {...}, snmp: {...}, ntp: {...}, country, timezone }`.
-pub fn apply_site(state: &mut Value, body: &Value) -> Result<String, String> {
-    let p = &body["patch"];
+/// Applies a patch: `{ mgmt: {...}, rsyslogd: {...}, snmp: {...}, ntp: {...}, country, timezone }`.
+pub fn apply_site(state: &mut Value, p: &Value) -> Result<String, String> {
     let before = state["setting"].clone();
+    let rules_before = (country(state), mgmt_flag(state, "outdoor_mode_enabled"));
     let mut notes: Vec<String> = Vec::new();
 
     let m = &p["mgmt"];
     if !m.is_null() {
-        let doc = setting_mut(state, "mgmt")?;
+        let doc = setting_mut(state, "mgmt");
         bools(m, doc, &["led_enabled", "outdoor_mode_enabled", "x_ssh_enabled", "x_ssh_auth_password_enabled", "x_ssh_bind_wildcard"])?;
         // The official controller turns this on with every save of these settings; the
         // features it gates (band steering, minimum signal and more) need it.
@@ -130,7 +107,7 @@ pub fn apply_site(state: &mut Value, body: &Value) -> Result<String, String> {
 
     let r = &p["rsyslogd"];
     if !r.is_null() {
-        let doc = setting_mut(state, "rsyslogd")?;
+        let doc = setting_mut(state, "rsyslogd");
         bools(r, doc, &["debug", "netconsole_enabled"])?;
         // Off, to apctl ("Network Application"), or to a server, saved as the official UI does.
         match r["mode"].as_str() {
@@ -184,7 +161,7 @@ pub fn apply_site(state: &mut Value, body: &Value) -> Result<String, String> {
 
     let n = &p["ntp"];
     if !n.is_null() {
-        let doc = setting_mut(state, "ntp")?;
+        let doc = setting_mut(state, "ntp");
         let was_manual = doc["setting_preference"].as_str() == Some("manual");
         match n["setting_preference"].as_str() {
             None => {}
@@ -220,7 +197,7 @@ pub fn apply_site(state: &mut Value, body: &Value) -> Result<String, String> {
 
     let sn = &p["snmp"];
     if !sn.is_null() {
-        let doc = setting_mut(state, "snmp")?;
+        let doc = setting_mut(state, "snmp");
         bools(sn, doc, &["enabled", "enabledV3"])?;
         if let Some(c) = sn["community"].as_str() {
             if c.is_empty() || c.len() > 256 || c.contains(char::is_whitespace) {
@@ -251,24 +228,28 @@ pub fn apply_site(state: &mut Value, body: &Value) -> Result<String, String> {
     }
 
     if !p["country"].is_null() {
-        let code = p["country"].as_i64().or_else(|| p["country"].as_str()?.parse().ok()).ok_or("country must be an ISO 3166 numeric code")?;
+        let code = num(&p["country"]).ok_or("country must be an ISO 3166 numeric code")?;
         if !COUNTRY_NAMES.iter().any(|(c, _)| *c == code) {
             return Err(format!("country {code} is not one apctl has channel rules for"));
         }
-        setting_mut(state, "country")?["code"] = json!(code.to_string());
+        setting_mut(state, "country")["code"] = json!(code.to_string());
     }
     if let Some(tz) = p["timezone"].as_str() {
         if !apcfg::tz::names().any(|n| n == tz) {
             return Err(format!("{tz} is not a time zone apctl knows"));
         }
-        setting_mut(state, "locale")?["timezone"] = json!(tz);
+        setting_mut(state, "locale")["timezone"] = json!(tz);
     }
 
-    // The country and the outdoor default decide which fixed channels are legal.
-    notes.extend(reset_illegal_channels(state));
-    if !p["country"].is_null() && docs(state, "setting").any(|s| s["key"].as_str() == Some("radio_ai")) {
+    // The country and the outdoor default decide which fixed channels are legal:
+    // when either changes, fixed channels no longer allowed go back to auto.
+    // Other saves leave the channels alone.
+    if (country(state), mgmt_flag(state, "outdoor_mode_enabled")) != rules_before {
+        notes.extend(reset_illegal_channels(state));
+    }
+    if !p["country"].is_null() && !setting(state, "radio_ai").is_null() {
         // Channel AI's channel lists follow the country.
-        crate::channelai::apply_settings(state, &json!({ "patch": {} }))?;
+        crate::channelai::apply_settings(state, &json!({}))?;
     }
 
     let mut changed: Vec<String> = Vec::new();
@@ -284,7 +265,7 @@ pub fn apply_site(state: &mut Value, body: &Value) -> Result<String, String> {
         }
     }
     changed.extend(notes);
-    changed.dedup();
+    dedup_in_order(&mut changed);
     Ok(if changed.is_empty() { "site settings: nothing changed".into() } else { format!("site settings: {}", changed.join(", ")) })
 }
 
@@ -322,7 +303,7 @@ fn ssh_keys(v: &Value) -> Result<Vec<Value>, String> {
             o => (o["type"].as_str().unwrap_or("").to_string(), o["key"].as_str().unwrap_or("").to_string(), o["comment"].as_str().unwrap_or("").to_string()),
         };
         if !TYPES.contains(&kind.as_str()) || key.len() < 32 || !key.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '/' | '=')) {
-            return Err(format!("not an SSH public key: {}", if key.is_empty() { kind } else { format!("{kind} {}…", &key[..key.len().min(12)]) }));
+            return Err(format!("not an SSH public key: {}", if key.is_empty() { kind } else { format!("{kind} {}…", key.chars().take(12).collect::<String>()) }));
         }
         let name = k["name"].as_str().filter(|n| !n.is_empty()).map(str::to_string).unwrap_or_else(|| if comment.is_empty() { kind.clone() } else { comment.clone() });
         if !out.iter().any(|o: &Value| o["key"] == json!(key)) {
@@ -362,7 +343,7 @@ pub async fn get_site(State(s): State<AppState>) -> Result<Json<Value>, ApiError
     });
     Ok(Json(json!({
         "active": s.active, "mgmt": mgmt, "rsyslogd": rsyslogd, "ntp": ntp, "snmp": snmp,
-        "country": crate::settings::country(&state), "timezone": setting(&state, "locale")["timezone"],
+        "country": country(&state), "timezone": setting(&state, "locale")["timezone"],
         "countries": COUNTRY_NAMES.iter().map(|(c, n)| json!({ "code": c, "name": n })).collect::<Vec<_>>(),
         "timezones": apcfg::tz::names().collect::<Vec<_>>(),
     })))
@@ -370,7 +351,7 @@ pub async fn get_site(State(s): State<AppState>) -> Result<Json<Value>, ApiError
 
 /// PUT /api/settings/site {patch} (`?preview=true` to see the effect)
 pub async fn put_site(State(s): State<AppState>, headers: HeaderMap, Query(q): Query<PreviewQuery>, Json(b): Json<Value>) -> Result<Json<Value>, ApiError> {
-    crate::settings::change(&s, &headers, &q, apply_site, json!({ "patch": b["patch"] })).await
+    crate::settings::change(&s, &headers, &q, apply_site, b["patch"].clone()).await
 }
 
 #[cfg(test)]
@@ -388,7 +369,7 @@ mod tests {
     }
 
     fn edit(s: &mut Value, patch: Value) -> Result<String, String> {
-        apply_site(s, &json!({ "patch": patch }))
+        apply_site(s, &patch)
     }
 
     #[test]
@@ -426,6 +407,33 @@ mod tests {
         edit(&mut s, json!({ "country": 208, "timezone": "Europe/Copenhagen" })).unwrap();
         assert_eq!((setting(&s, "country")["code"].as_str(), setting(&s, "locale")["timezone"].as_str()), (Some("208"), Some("Europe/Copenhagen")));
         assert!(edit(&mut s, json!({ "timezone": "Mars/Olympus" })).is_err());
+    }
+
+    #[test]
+    fn other_saves_leave_fixed_channels_alone() {
+        // An imported country apctl has no rules for, and a 6 GHz radio: nothing to judge.
+        let mut s = state();
+        s["setting"][0]["code"] = json!("392");
+        s["devices"][0]["radio_table"].as_array_mut().unwrap().push(json!({ "radio": "6e", "channel": "37", "ht": "160" }));
+        s["devices"][0]["radio_table"][0]["channel"] = json!(149);
+        edit(&mut s, json!({ "mgmt": { "outdoor_mode_enabled": true } })).unwrap();
+        assert_eq!((s["devices"][0]["radio_table"][0]["channel"].as_i64(), s["devices"][0]["radio_table"][2]["channel"].as_str()), (Some(149), Some("37")));
+        // Only a change of country or outdoor default resets channels; an NTP save does not.
+        let mut s = state();
+        s["devices"][0]["radio_table"][0]["channel"] = json!(149);
+        let what = edit(&mut s, json!({ "ntp": { "setting_preference": "auto" } })).unwrap();
+        assert!(!what.contains("auto,") && s["devices"][0]["radio_table"][0]["channel"] == 149, "{what}");
+        let what = edit(&mut s, json!({ "country": 276 })).unwrap();
+        assert!(!what.contains("→"), "the same country: {what}");
+        let what = edit(&mut s, json!({ "country": 840 })).unwrap();
+        assert!(what.contains("2.4 GHz channel 13 → auto") && !what.contains("5 GHz"), "149 is fine in the US: {what}");
+    }
+
+    #[test]
+    fn a_bad_key_with_wide_characters_is_refused_not_a_panic() {
+        let mut s = state();
+        let err = edit(&mut s, json!({ "mgmt": { "x_ssh_keys": [format!("ssh-ed25519 {}", "é".repeat(40))] } })).unwrap_err();
+        assert!(err.contains("éééééééééééé…"), "{err}");
     }
 
     #[test]

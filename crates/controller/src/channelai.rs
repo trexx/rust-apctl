@@ -25,7 +25,7 @@ use serde_json::{Value, json};
 use crate::api::{ApiError, AppState};
 use crate::engine::{Input, Live};
 use crate::model::Ts;
-use crate::settings::{country, docs, legal_channels};
+use crate::settings::{band_channels, country, device_macs, legal_channels, num, setting, setting_mut};
 use crate::store;
 
 /// Bands Channel AI handles (6 GHz needs hardware apctl has not seen).
@@ -55,7 +55,7 @@ pub struct Settings {
 }
 
 fn radio_ai(state: &Value) -> Option<&Value> {
-    docs(state, "setting").find(|s| s["key"].as_str() == Some("radio_ai"))
+    Some(setting(state, "radio_ai")).filter(|r| !r.is_null())
 }
 
 /// `M H * * *` (the only form the official UI writes); 03:00 otherwise, its default.
@@ -79,7 +79,8 @@ pub fn settings(state: Option<&Value>) -> Settings {
     Settings { enabled: r.and_then(|r| r["enabled"].as_bool()).unwrap_or(false), hour, minute, radios, dfs, exclude_devices: list("exclude_devices") }
 }
 
-fn is_dfs(ch: i64) -> bool {
+/// Whether a 5 GHz channel is a DFS one (radar can force the AP off it).
+pub(crate) fn is_dfs(ch: i64) -> bool {
     (52..=144).contains(&ch)
 }
 
@@ -87,18 +88,15 @@ fn is_dfs(ch: i64) -> bool {
 /// official controller as the country's channels minus the blacklist, and
 /// minus DFS unless allowed), within what is legal here. `with_dfs` adds the
 /// legal DFS channels (to try a plan with them). `None` without a setting.
+/// In a country apctl has no rules for, the list is taken as it is.
 pub fn allowed(state: Option<&Value>, band: &str, with_dfs: bool) -> Option<Vec<i64>> {
     let state = state?;
     let r = radio_ai(state)?;
     let legal = legal_channels(country(state), band, 20, false);
-    let mut list: Vec<i64> = r[format!("channels_{band}")]
-        .as_array()?
-        .iter()
-        .filter_map(|v| v.as_i64().or_else(|| v.as_str()?.parse().ok()))
-        .filter(|c| legal.contains(c))
-        .collect();
+    let mut list: Vec<i64> = r[format!("channels_{band}")].as_array()?.iter().filter_map(num).filter(|c| legal.as_ref().is_none_or(|l| l.contains(c))).collect();
     if with_dfs && band == "na" {
-        let extra: Vec<i64> = legal.iter().copied().filter(|c| is_dfs(*c) && !list.contains(c)).collect();
+        let all = legal.unwrap_or_else(|| band_channels(band, 20));
+        let extra: Vec<i64> = all.into_iter().filter(|c| is_dfs(*c) && !list.contains(c)).collect();
         list.extend(extra);
     }
     list.sort();
@@ -212,8 +210,8 @@ pub fn set_channels(state: &mut Value, changes: &[(String, String, i64)]) -> Res
         let d = devices.iter().position(|d| d["mac"].as_str().is_some_and(|m| m.eq_ignore_ascii_case(mac))).ok_or_else(|| format!("{mac} is not in the settings"))?;
         let outdoor = crate::settings::outdoor(state, &state["devices"][d]);
         let r = state["devices"][d]["radio_table"].as_array_mut().and_then(|t| t.iter_mut().find(|r| r["radio"].as_str() == Some(band))).ok_or_else(|| format!("{mac} has no {band} radio"))?;
-        let width = r["ht"].as_i64().or_else(|| r["ht"].as_str()?.parse().ok()).unwrap_or(20);
-        if !legal_channels(c, band, width, outdoor).contains(ch) {
+        let width = num(&r["ht"]).unwrap_or(20);
+        if legal_channels(c, band, width, outdoor).is_some_and(|l| !l.contains(ch)) {
             return Err(format!("channel {ch} is not allowed at {width} MHz here"));
         }
         if allowed_here.is_some_and(|a| !a.contains(ch)) {
@@ -298,7 +296,7 @@ pub fn schedule(s: AppState) {
             let (cfg, tz) = {
                 let live = s.live.read().unwrap();
                 let st = live.state.as_deref();
-                let tz = st.and_then(|st| docs(st, "setting").find(|x| x["key"].as_str() == Some("locale"))?["timezone"].as_str().map(str::to_string));
+                let tz = st.and_then(crate::settings::timezone).map(str::to_string);
                 (settings(st), tz)
             };
             let (day, minute) = crate::clock::local(tz.as_deref(), store::now_ts());
@@ -342,7 +340,7 @@ pub async fn status(State(s): State<AppState>) -> Result<Json<Value>, ApiError> 
     let mut live = s.live.write().unwrap();
     check_scans(&mut live, store::now_ts());
     let st = live.state.as_deref();
-    let tz = st.and_then(|st| docs(st, "setting").find(|x| x["key"].as_str() == Some("locale"))?["timezone"].as_str().map(str::to_string));
+    let tz = st.and_then(crate::settings::timezone).map(str::to_string);
     let cfg = settings(st);
     let scans: Vec<Value> = live.scans.iter().map(|(m, sc)| json!({ "mac": m, "band": sc.band, "started": sc.started })).collect();
     Ok(Json(json!({
@@ -408,30 +406,27 @@ pub async fn apply_plan(State(s): State<AppState>, headers: HeaderMap, Json(b): 
     Ok(Json(json!({ "applied": b.changes.len() })))
 }
 
-/// Edits the `radio_ai` setting (`body.patch`: enabled, hour, radios, dfs,
-/// exclude_devices). The channel lists are recomputed as the official
-/// controller does: the country's channels minus the blacklist, minus DFS
-/// unless allowed.
-pub fn apply_settings(state: &mut Value, body: &Value) -> Result<String, String> {
-    let p = &body["patch"];
+/// Edits the `radio_ai` setting (`patch`: enabled, hour, radios, dfs,
+/// exclude_devices), creating it with the official defaults when missing. The
+/// channel lists are recomputed as the official controller does: the
+/// country's channels minus the blacklist, minus DFS unless allowed (every
+/// channel of the band in a country apctl has no rules for).
+pub fn apply_settings(state: &mut Value, p: &Value) -> Result<String, String> {
     let c = country(state);
-    let known: Vec<String> = docs(state, "devices").filter_map(|d| d["mac"].as_str().map(str::to_ascii_lowercase)).collect();
-    let site = crate::settings::site_id(state);
-    let list = state["setting"].as_array_mut().ok_or("the settings have no site settings")?;
-    let i = match list.iter().position(|x| x["key"].as_str() == Some("radio_ai")) {
-        Some(i) => i,
-        None => {
-            let blacklist: Vec<Value> = [2, 3, 4, 5, 7, 8, 9, 10, 12, 13, 14].iter().map(|c| json!({ "radio": "ng", "channel": c.to_string(), "channel_width": "20" })).collect();
-            list.push(json!({
-                "key": "radio_ai", "site_id": site, "enabled": false, "cron_expr": "0 3 * * *", "radios": ["ng", "na"],
-                "channels_blacklist": blacklist,
-                "radios_configuration": [{ "radio": "ng", "channel_width": 20, "dfs": false }, { "radio": "na", "channel_width": 40, "dfs": false }],
-                "exclude_devices": [],
-            }));
-            list.len() - 1
+    let known = device_macs(state);
+    let missing = radio_ai(state).is_none();
+    let r = setting_mut(state, "radio_ai");
+    if missing {
+        let blacklist: Vec<Value> = [2, 3, 4, 5, 7, 8, 9, 10, 12, 13, 14].iter().map(|c| json!({ "radio": "ng", "channel": c.to_string(), "channel_width": "20" })).collect();
+        let defaults = json!({
+            "enabled": false, "cron_expr": "0 3 * * *", "radios": ["ng", "na"], "channels_blacklist": blacklist,
+            "radios_configuration": [{ "radio": "ng", "channel_width": 20, "dfs": false }, { "radio": "na", "channel_width": 40, "dfs": false }],
+            "exclude_devices": [],
+        });
+        if let (Some(r), Value::Object(d)) = (r.as_object_mut(), defaults) {
+            r.extend(d);
         }
-    };
-    let r = &mut list[i];
+    }
     let before = r.clone();
     if let Some(b) = p["enabled"].as_bool() {
         r["enabled"] = json!(b);
@@ -466,12 +461,12 @@ pub fn apply_settings(state: &mut Value, body: &Value) -> Result<String, String>
     let blacklist = r["channels_blacklist"].as_array().cloned().unwrap_or_default();
     let blacklisted = |band: &str, ch: i64| {
         blacklist.iter().any(|b| {
-            b["radio"].as_str() == Some(band) && b["channel"].as_i64().or_else(|| b["channel"].as_str()?.parse().ok()) == Some(ch) && b["channel_width"].as_str().is_none_or(|w| w == "20")
+            b["radio"].as_str() == Some(band) && num(&b["channel"]) == Some(ch) && b["channel_width"].as_str().is_none_or(|w| w == "20")
         })
     };
     let dfs = r["radios_configuration"].as_array().and_then(|l| l.iter().find(|c| c["radio"].as_str() == Some("na"))).and_then(|c| c["dfs"].as_bool()).unwrap_or(false);
     for band in BANDS {
-        let chans: Vec<String> = legal_channels(c, band, 20, false).into_iter().filter(|ch| !blacklisted(band, *ch) && (dfs || !is_dfs(*ch))).map(|ch| ch.to_string()).collect();
+        let chans: Vec<String> = legal_channels(c, band, 20, false).unwrap_or_else(|| band_channels(band, 20)).into_iter().filter(|ch| !blacklisted(band, *ch) && (dfs || !is_dfs(*ch))).map(|ch| ch.to_string()).collect();
         r[format!("channels_{band}")] = json!(chans);
     }
     let changed: Vec<&str> = ["enabled", "cron_expr", "radios", "radios_configuration", "exclude_devices", "channels_ng", "channels_na"].into_iter().filter(|k| before[*k] != r[*k]).collect();
@@ -480,7 +475,7 @@ pub fn apply_settings(state: &mut Value, body: &Value) -> Result<String, String>
 
 /// PUT /api/rf/channel-ai {patch} (`?preview=true` to see the effect)
 pub async fn put_settings(State(s): State<AppState>, headers: HeaderMap, Query(q): Query<crate::settings::PreviewQuery>, Json(b): Json<Value>) -> Result<Json<Value>, ApiError> {
-    crate::settings::change(&s, &headers, &q, apply_settings, json!({ "patch": b["patch"] })).await
+    crate::settings::change(&s, &headers, &q, apply_settings, b["patch"].clone()).await
 }
 
 #[cfg(test)]
@@ -515,15 +510,15 @@ mod tests {
     #[test]
     fn editing_settings_recomputes_the_channels() {
         let mut s = state();
-        apply_settings(&mut s, &json!({ "patch": { "dfs": true, "hour": 4 } })).unwrap();
+        apply_settings(&mut s, &json!({ "dfs": true, "hour": 4 })).unwrap();
         let r = radio_ai(&s).unwrap();
         assert_eq!(r["cron_expr"], "0 4 * * *");
         assert!(r["channels_na"].as_array().unwrap().iter().any(|c| c == "100"));
         // ng: Germany's 1-13 minus the blacklist (2 and 13 here).
         assert_eq!(r["channels_ng"].as_array().unwrap().len(), 11);
-        assert!(apply_settings(&mut s, &json!({ "patch": { "hour": 24 } })).is_err());
-        assert!(apply_settings(&mut s, &json!({ "patch": { "exclude_devices": ["02:00:00:00:00:99"] } })).is_err());
-        apply_settings(&mut s, &json!({ "patch": { "exclude_devices": ["02:00:00:00:00:01"] } })).unwrap();
+        assert!(apply_settings(&mut s, &json!({ "hour": 24 })).is_err());
+        assert!(apply_settings(&mut s, &json!({ "exclude_devices": ["02:00:00:00:00:99"] })).is_err());
+        apply_settings(&mut s, &json!({ "exclude_devices": ["02:00:00:00:00:01"] })).unwrap();
         assert_eq!(settings(Some(&s)).exclude_devices, vec!["02:00:00:00:00:01"]);
     }
 
