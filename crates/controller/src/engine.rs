@@ -166,7 +166,7 @@ pub enum LiveMsg {
     Clients,
     /// An event was stored: `{"type":"event","kind":...,"device_mac":...,"client_mac":...}`.
     /// The UI refetches the event lists that show it, so the rest is not sent along.
-    Event(#[serde(serialize_with = "event_head")] Event),
+    Event(EventHead),
     /// Syslog lines were stored: `{"type":"log","device_mac":...}`, at most
     /// once a second per AP. The UI refetches the lines it shows, so the text
     /// is not sent along.
@@ -174,15 +174,13 @@ pub enum LiveMsg {
     Alert(crate::alerts::AlertMsg),
 }
 
-/// What the UI is told of an event (see `LiveMsg::Event`).
-fn event_head<S: serde::Serializer>(e: &Event, s: S) -> Result<S::Ok, S::Error> {
-    #[derive(Serialize)]
-    struct Head {
-        kind: EventKind,
-        device_mac: Option<Mac>,
-        client_mac: Option<Mac>,
-    }
-    Head { kind: e.kind, device_mac: e.device_mac, client_mac: e.client_mac }.serialize(s)
+/// What the UI is told of an event (see `LiveMsg::Event`). Without the data,
+/// which can be large (a crash dump), as every subscriber gets its own copy.
+#[derive(Debug, Clone, Copy, Serialize)]
+pub struct EventHead {
+    pub kind: EventKind,
+    pub device_mac: Option<Mac>,
+    pub client_mac: Option<Mac>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -616,7 +614,7 @@ impl Engine {
         if let Some(a) = &self.alerts {
             a.offer(&ev);
         }
-        let _ = self.tx.send(LiveMsg::Event(ev));
+        let _ = self.tx.send(LiveMsg::Event(EventHead { kind: ev.kind, device_mac: ev.device_mac, client_mac: ev.client_mac }));
     }
 
     fn inform(&mut self, ts: Ts, peer: String, decoded: Decoded) {
@@ -1742,15 +1740,30 @@ mod tests {
         engine: Engine,
         live: SharedLive,
         rx: broadcast::Receiver<LiveMsg>,
+        store: Arc<store::Store>,
+        writer: Writer,
         _dir: std::path::PathBuf,
     }
 
     fn harness() -> Harness {
         let dir = std::env::temp_dir().join(format!("apctl-engine-{}-{}", std::process::id(), rand_suffix()));
-        let (_store, writer) = store::Store::open(&dir).unwrap();
+        let (store, writer) = store::Store::open(&dir).unwrap();
         let live: SharedLive = Default::default();
         let (tx, rx) = broadcast::channel(1024);
-        Harness { engine: Engine::new(writer, Default::default(), live.clone(), tx), live, rx, _dir: dir }
+        Harness { engine: Engine::new(writer.clone(), Default::default(), live.clone(), tx), live, rx, store, writer, _dir: dir }
+    }
+
+    /// The data of the stored events of one kind, oldest first (the live
+    /// messages only say that an event was stored).
+    fn stored(h: &Harness, kind: EventKind) -> Vec<Value> {
+        assert!(h.writer.flush(std::time::Duration::from_secs(5)));
+        h.store
+            .read(Db::Config, |c| {
+                let mut stmt = c.prepare("SELECT data FROM events WHERE kind = ?1 ORDER BY id")?;
+                let rows = stmt.query_map([kind.as_str()], |r| r.get::<_, String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
+                Ok(rows.iter().map(|d| serde_json::from_str(d).unwrap()).collect())
+            })
+            .unwrap()
     }
 
     fn rand_suffix() -> u64 {
@@ -1908,9 +1921,7 @@ mod tests {
         assert_eq!(h.live.read().unwrap().aliases[&mac].alias.as_deref(), Some("Kitchen speaker"));
         set(&mut h, Some(""), false); // empty clears
         assert!(!h.live.read().unwrap().aliases.contains_key(&mac));
-        let renames: Vec<_> = std::iter::from_fn(|| h.rx.try_recv().ok())
-            .filter_map(|m| match m { LiveMsg::Event(e) if e.kind == EventKind::ClientRenamed => Some(e.data), _ => None })
-            .collect();
+        let renames = stored(&h, EventKind::ClientRenamed);
         assert_eq!(renames.len(), 2, "{renames:?}");
         assert_eq!(renames[1]["from"], "Kitchen speaker");
     }
@@ -2040,9 +2051,9 @@ mod tests {
         let logs = std::iter::from_fn(|| h.rx.try_recv().ok()).filter(|m| matches!(m, LiveMsg::Log { .. })).count();
         assert_eq!(logs, 1, "nothing more to announce");
         // An event's data is not sent to the browsers.
-        let e = Event::device(1, EventKind::ApCrash, AP1.parse().unwrap(), json!({ "lines": ["a long crash dump"] }));
-        let text = serde_json::to_string(&LiveMsg::Event(e)).unwrap();
-        assert_eq!(text, r#"{"type":"event","kind":"ap_crash","device_mac":"02:00:00:00:00:01","client_mac":null}"#);
+        h.engine.emit(Event::device(1, EventKind::ApCrash, AP1.parse().unwrap(), json!({ "lines": ["a long crash dump"] })));
+        let text = std::iter::from_fn(|| h.rx.try_recv().ok()).find(|m| matches!(m, LiveMsg::Event(_))).map(|m| serde_json::to_string(&m).unwrap());
+        assert_eq!(text.as_deref(), Some(r#"{"type":"event","kind":"ap_crash","device_mac":"02:00:00:00:00:01","client_mac":null}"#));
     }
 
     #[test]
@@ -2112,9 +2123,7 @@ mod tests {
         feed(&mut h, with(36, 9)); // real change...
         feed(&mut h, with(36, 9)); // ...confirmed
         feed(&mut h, with(36, 9));
-        let changes: Vec<_> = std::iter::from_fn(|| h.rx.try_recv().ok())
-            .filter_map(|m| match m { LiveMsg::Event(e) if e.kind == EventKind::RadioChanged => Some(e.data), _ => None })
-            .collect();
+        let changes = stored(&h, EventKind::RadioChanged);
         assert_eq!(changes.len(), 1, "{changes:?}");
         assert_eq!(changes[0]["from"]["channel"], 44);
         assert_eq!(changes[0]["to"]["channel"], 36);
@@ -2136,12 +2145,7 @@ mod tests {
         let push = |cfg: &str| decoded(json!({ "_type": "setparam", "cfgversion": "x", "system_cfg": cfg, "mgmt_cfg": "a=1" }));
         h.engine.handle(Input::Reply { ts: 210, mac, decoded: push("aaa.1.hide_ssid=false\naaa.1.wpa.psk=old") });
         h.engine.handle(Input::Reply { ts: 220, mac, decoded: push("aaa.1.hide_ssid=true\naaa.1.wpa.psk=new") });
-        let mut pushes = Vec::new();
-        while let Ok(m) = h.rx.try_recv() {
-            if let LiveMsg::Event(e) = m {
-                pushes.push(e.data);
-            }
-        }
+        let pushes = stored(&h, EventKind::ConfigPushed);
         assert_eq!(pushes[0]["system_cfg"]["baseline"], true);
         let diff = pushes[1]["system_cfg"]["diff"].as_str().unwrap();
         assert!(diff.contains("~ aaa.1.hide_ssid: false -> true"), "{diff}");
