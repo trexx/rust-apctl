@@ -14,7 +14,7 @@ fn string_hash(s: &str) -> u32 {
 
 /// Deduplicates `items` (first occurrence wins) and returns them in the order a
 /// default-constructed `HashSet` filled one element at a time would iterate them.
-pub fn hash_set_order<S: AsRef<str>>(items: &[S]) -> Vec<String> {
+pub fn hash_set_order<S: AsRef<str>>(items: &[S]) -> Vec<&str> {
     let mut unique: Vec<&str> = Vec::new();
     for s in items {
         if !unique.contains(&s.as_ref()) {
@@ -30,9 +30,8 @@ pub fn hash_set_order<S: AsRef<str>>(items: &[S]) -> Vec<String> {
         let h = string_hash(s);
         ((h ^ (h >> 16)) as usize) & (capacity - 1)
     };
-    let mut ordered: Vec<(usize, &str)> = unique.iter().map(|s| (bucket(s), *s)).collect();
-    ordered.sort_by_key(|(b, _)| *b); // stable: insertion order within a bucket
-    ordered.into_iter().map(|(_, s)| s.to_string()).collect()
+    unique.sort_by_key(|s| bucket(s)); // stable: insertion order within a bucket
+    unique
 }
 
 #[cfg(test)]

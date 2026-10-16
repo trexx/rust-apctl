@@ -369,10 +369,12 @@ fn b(w: &Value, key: &str) -> bool {
 
 /// The VLAN of a network (1 for an untagged one).
 pub fn network_vlan(ctx: &Ctx, network_id: Option<&str>) -> i64 {
-    network_id
-        .and_then(|id| ctx.network(id))
-        .filter(|n| b(n, "vlan_enabled"))
-        .map_or(1, |n| int_of(n, "vlan").unwrap_or(2))
+    network_id.and_then(|id| ctx.network(id)).and_then(tagged_vlan).unwrap_or(1)
+}
+
+/// The VLAN a network document tags its traffic with, if it is tagged.
+pub fn tagged_vlan(network: &Value) -> Option<i64> {
+    b(network, "vlan_enabled").then(|| int_of(network, "vlan").unwrap_or(2))
 }
 
 fn radius_profile<'a>(ctx: &Ctx<'a>, w: &Value) -> Option<&'a Value> {

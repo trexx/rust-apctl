@@ -20,7 +20,7 @@ pub fn render(ctx: &Ctx) -> Result<(String, Value)> {
     let mut meta = Meta::load(ctx, i64::from(qca_v2));
     let radios = wlan::radios(ctx);
     let wanted = wlan::deploy(ctx, &radios);
-    let keys: Vec<(String, String)> = wanted.iter().map(|(w, r)| (wlan_id(w).to_string(), radios[*r].name.to_string())).collect();
+    let keys: Vec<(String, &str)> = wanted.iter().map(|(w, r)| (wlan_id(w).to_string(), radios[*r].name)).collect();
     let slots = meta.wireless(&keys, |radio, k| if qca_v2 { format!("{radio}ap{k}") } else { format!("ath{k}") });
     let vaps: Vec<Vap> =
         wanted.into_iter().zip(slots).zip(keys).map(|(((w, radio), slot), (id, _))| Vap { id, w, radio, slot }).collect();
@@ -239,7 +239,7 @@ fn bandsteering(c: &mut Cfg, ctx: &Ctx, radios: &[Radio], vaps: &[Vap]) {
 }
 
 /// One VAP's MAC ACL: device, policy and `(mac, type)` entries.
-type AclBlock<'a> = (&'a str, &'a str, Vec<(String, &'static str)>);
+type AclBlock<'a> = (&'a str, &'a str, Vec<(Cow<'a, str>, &'static str)>);
 
 fn mac_acl(c: &mut Cfg, ctx: &Ctx, vaps: &[Vap]) {
     // Clients pinned ("lock to AP") to some other AP may not join this one.
@@ -258,20 +258,20 @@ fn mac_acl(c: &mut Cfg, ctx: &Ctx, vaps: &[Vap]) {
             continue;
         }
         let policy = if filtering { str_of(&v.w, "mac_filter_policy").unwrap_or("deny") } else { "deny" };
-        let mut entries: Vec<(String, &'static str)> = Vec::new();
+        let mut entries: Vec<(Cow<str>, &'static str)> = Vec::new();
         if filtering {
             entries.extend(
                 str_list(&v.w, "mac_filter_list")
                     .iter()
                     .map(|m| m.to_ascii_lowercase())
-                    .filter(|m| policy != "allow" || !locked_elsewhere.contains(m))
-                    .map(|m| (m, "user")),
+                    .filter(|m| policy != "allow" || !locked_elsewhere.contains(&m.as_str()))
+                    .map(|m| (Cow::Owned(m), "user")),
             );
         }
         if policy == "deny" {
-            for m in &locked_elsewhere {
+            for &m in &locked_elsewhere {
                 if !entries.iter().any(|(e, _)| e == m) {
-                    entries.push((m.clone(), "lock2ap"));
+                    entries.push((Cow::Borrowed(m), "lock2ap"));
                 }
             }
         }

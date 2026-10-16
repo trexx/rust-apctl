@@ -1,6 +1,8 @@
 //! Bridges, VLAN subinterfaces, `netconf` and the ebtables rules that keep tagged
 //! frames off untagged VAPs.
 
+use std::borrow::Cow;
+
 use anyhow::{Result, bail};
 use serde_json::Value;
 
@@ -8,7 +10,7 @@ use crate::Ctx;
 use crate::cfg::{Cfg, Prefix};
 use crate::json::{flag, int_of, oid, str_of};
 use crate::meta::Meta;
-use crate::wlan::{Radio, Vap, dynamic_vlan, network_vlan};
+use crate::wlan::{Radio, Vap, dynamic_vlan, tagged_vlan};
 
 pub struct Bridge {
     pub name: String,
@@ -37,9 +39,8 @@ fn wlan_vlan(ctx: &Ctx, vap: &Vap) -> Option<i64> {
     if matches!(str_of(w, "security"), Some("wpaeap")) && dynamic_vlan(ctx, w) != 0 {
         return None;
     }
-    let net = str_of(w, "networkconf_id").and_then(|id| ctx.network(id));
-    if net.is_some_and(|n| flag(n, "vlan_enabled", false)) {
-        return Some(network_vlan(ctx, str_of(w, "networkconf_id")));
+    if let Some(vlan) = str_of(w, "networkconf_id").and_then(|id| ctx.network(id)).and_then(tagged_vlan) {
+        return Some(vlan);
     }
     if flag(w, "vlan_enabled", false) {
         return int_of(w, "vlan");
@@ -125,7 +126,7 @@ pub fn render_bridge(c: &mut Cfg, net: &Net, meta: &mut Meta) {
         return;
     }
     c.set("bridge.status", "enabled");
-    let names: Vec<String> = net.bridges.iter().map(|b| b.name.clone()).collect();
+    let names: Vec<&str> = net.bridges.iter().map(|b| b.name.as_str()).collect();
     let indices = meta.bridges(&names);
     for (b, i) in net.bridges.iter().zip(indices) {
         c.set(format_args!("bridge.{i}.devname"), &b.name);
@@ -146,9 +147,9 @@ pub fn render_netconf(c: &mut Cfg, ctx: &Ctx, net: &Net, radios: &[Radio], vaps:
         Vap { disabled: bool },
         Sub,
     }
-    let mut ifaces: Vec<(String, Kind)> = Vec::new();
-    ifaces.extend(net.bridges.iter().map(|b| (b.name.clone(), Kind::Bridge)));
-    ifaces.extend(net.eth.iter().map(|e| (e.clone(), Kind::Eth)));
+    let mut ifaces: Vec<(Cow<str>, Kind)> = Vec::new();
+    ifaces.extend(net.bridges.iter().map(|b| (Cow::Borrowed(b.name.as_str()), Kind::Bridge)));
+    ifaces.extend(net.eth.iter().map(|e| (Cow::Borrowed(e.as_str()), Kind::Eth)));
     // A VAP shows as disabled only while the AP still reports it (stored vap_table) and
     // its radio is switched off.
     let reported = |dev: &str| {
@@ -159,12 +160,12 @@ pub fn render_netconf(c: &mut Cfg, ctx: &Ctx, net: &Net, radios: &[Radio], vaps:
     };
     for v in vaps {
         let disabled = radios[v.radio].disabled && reported(v.dev());
-        ifaces.push((v.dev().to_string(), Kind::Vap { disabled }));
+        ifaces.push((Cow::Borrowed(v.dev()), Kind::Vap { disabled }));
     }
     for v in &net.vlans {
-        ifaces.extend(net.eth.iter().map(|e| (format!("{e}.{v}"), Kind::Sub)));
+        ifaces.extend(net.eth.iter().map(|e| (Cow::Owned(format!("{e}.{v}")), Kind::Sub)));
     }
-    let names: Vec<String> = ifaces.iter().map(|(n, _)| n.clone()).collect();
+    let names: Vec<&str> = ifaces.iter().map(|(n, _)| n.as_ref()).collect();
     let indices = meta.netconf(&names);
     let static_ip = static_ip(ctx);
     // VAPs are brought up by hostapd on APs that run it for every SSID.

@@ -49,7 +49,7 @@ pub struct Meta {
 /// The lowest number from `min` up that is not in `used` (one of the first `used.len() + 1`).
 fn lowest_free(used: impl Iterator<Item = u32>, min: u32) -> u32 {
     let used: HashSet<u32> = used.collect();
-    (min..).find(|n| !used.contains(n)).unwrap_or(min)
+    (min..=min.saturating_add(used.len() as u32)).find(|n| !used.contains(n)).unwrap_or(min)
 }
 
 fn num(v: &Value, key: &str) -> u32 {
@@ -95,11 +95,11 @@ impl Meta {
 
     /// Allocates the VAPs `(wlan id, radio name)` in deploy order. `name` builds an
     /// interface name from radio name and global VAP index.
-    pub fn wireless(&mut self, wanted: &[(String, String)], name: impl Fn(&str, u32) -> String) -> Vec<WifiSlot> {
+    pub fn wireless(&mut self, wanted: &[(String, &str)], name: impl Fn(&str, u32) -> String) -> Vec<WifiSlot> {
         let mut kept: Vec<Option<Wifi>> = wanted
             .iter()
             .map(|(id, radio)| {
-                let pos = self.old_wifi.iter().position(|w| &w.id == id && &w.radio == radio)?;
+                let pos = self.old_wifi.iter().position(|w| &w.id == id && w.radio == *radio)?;
                 Some(self.old_wifi.remove(pos))
             })
             .collect();
@@ -110,10 +110,10 @@ impl Meta {
             }
             let section = lowest_free(taken.iter().map(|w| w.section), 1);
             let vap_index = lowest_free(taken.iter().map(|w| w.vap_index), 0);
-            let on_radio = lowest_free(taken.iter().filter(|w| &w.radio == radio).map(|w| w.on_radio), 0);
+            let on_radio = lowest_free(taken.iter().filter(|w| w.radio == *radio).map(|w| w.on_radio), 0);
             let w = Wifi {
                 id: id.clone(),
-                radio: radio.clone(),
+                radio: radio.to_string(),
                 device_name: name(radio, vap_index),
                 vap_index,
                 on_radio,
@@ -135,9 +135,9 @@ impl Meta {
             .collect()
     }
 
-    fn keyed(old: &[(String, u32)], names: &[String]) -> Vec<(String, u32)> {
+    fn keyed(old: &[(String, u32)], names: &[&str]) -> Vec<(String, u32)> {
         let mut out: Vec<(String, Option<u32>)> =
-            names.iter().map(|n| (n.clone(), old.iter().find(|(o, _)| o == n).map(|(_, i)| *i))).collect();
+            names.iter().map(|&n| (n.to_string(), old.iter().find(|(o, _)| o == n).map(|(_, i)| *i))).collect();
         for i in 0..out.len() {
             if out[i].1.is_none() {
                 let free = lowest_free(out.iter().filter_map(|(_, i)| *i), 1);
@@ -148,13 +148,13 @@ impl Meta {
     }
 
     /// `netconf.N` indices for interfaces in output order.
-    pub fn netconf(&mut self, names: &[String]) -> Vec<u32> {
+    pub fn netconf(&mut self, names: &[&str]) -> Vec<u32> {
         self.netconf = Self::keyed(&self.old_netconf, names);
         self.netconf.iter().map(|(_, i)| *i).collect()
     }
 
     /// `bridge.N` indices for bridges in output order.
-    pub fn bridges(&mut self, names: &[String]) -> Vec<u32> {
+    pub fn bridges(&mut self, names: &[&str]) -> Vec<u32> {
         self.bridges = Self::keyed(&self.old_bridges, names);
         self.bridges.iter().map(|(_, i)| *i).collect()
     }
