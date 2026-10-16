@@ -81,7 +81,9 @@ export function group(
       ? `${area} — ${labels[section] ?? `#${second}`}`
       : area;
     const field = parts.slice(numbered ? 2 : 1).join(".") || top;
-    groups.set(title, [...(groups.get(title) ?? []), { ...c, field }]);
+    const list = groups.get(title);
+    if (list) list.push({ ...c, field });
+    else groups.set(title, [{ ...c, field }]);
   }
   return [...groups.entries()];
 }
