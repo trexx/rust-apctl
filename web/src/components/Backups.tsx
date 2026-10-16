@@ -47,34 +47,50 @@ const fromLocal = (text: string) => {
   return (((h * 60 + m - offsetMin()) % 1440) + 1440) % 1440;
 };
 
-/** Whether apctl answers its health check. */
-const healthy = () =>
-  fetch("/healthz", { cache: "no-store" }).then(
-    (r) => r.ok,
-    () => false,
+/**
+ * Which apctl process answers: when it started, "signed out" when it no
+ * longer knows this session (as after a restore), null when none answers.
+ */
+const whoAnswers = () =>
+  fetch("/api/status", { cache: "no-store" }).then(
+    async (r): Promise<string | null> => {
+      if (r.status === 401) return "signed out";
+      return r.ok ? String((await r.json()).started) : null;
+    },
+    () => null,
   );
 
-/** Waits for apctl to come back after a restore, then reloads the page. */
-function useRestartWatch(active: boolean) {
+/**
+ * Waits for apctl to come back after a restore, then reloads the page: once
+ * another process answers than the one that took the restore (`before`), or
+ * any process after none did. The old one answers for a few seconds more,
+ * while it stores what is queued. Returns whether it gave up waiting.
+ */
+function useRestartWatch(restart: { before: string | null } | null) {
+  const [gaveUp, setGaveUp] = useState(false);
   useEffect(() => {
-    if (!active) return;
+    if (!restart) return;
     let stop = false;
     const started = Date.now();
     const poll = async () => {
+      let down = false;
       while (!stop && Date.now() - started < 5 * 60_000) {
-        await new Promise((r) => setTimeout(r, 2000));
-        // Not answering yet: still restarting.
-        if ((await healthy()) && Date.now() - started > 4000) {
+        await new Promise((r) => setTimeout(r, 1000));
+        const now = await whoAnswers();
+        if (now === null) down = true;
+        else if (down || (restart.before !== null && now !== restart.before)) {
           window.location.reload();
           return;
         }
       }
+      if (!stop) setGaveUp(true);
     };
     void poll();
     return () => {
       stop = true;
     };
-  }, [active]);
+  }, [restart]);
+  return gaveUp;
 }
 
 function Schedule({
@@ -254,11 +270,21 @@ export function BackupSection() {
     manifest: BackupManifest;
     file: string;
   } | null>(null);
-  const [restarting, setRestarting] = useState(false);
-  useRestartWatch(restarting);
+  const [restarting, setRestarting] = useState<{
+    before: string | null;
+  } | null>(null);
+  const gaveUp = useRestartWatch(restarting);
 
   if (b.error) return <ErrorNote error={b.error} />;
   if (!b.data) return <Loading />;
+  if (restarting && gaveUp)
+    return (
+      <div className="panel">
+        <b>apctl has not come back after 5 minutes.</b> Check that it is running
+        and its log; if the restore failed, apctl started with the data it had
+        before. Reload this page once it answers again.
+      </div>
+    );
   if (restarting)
     return (
       <div className="panel">
@@ -384,11 +410,12 @@ export function BackupSection() {
           onCancel={() => setConfirm(null)}
           onConfirm={() =>
             void run(async () => {
+              const before = await whoAnswers();
               await restoreBackup({
                 name: confirm.name,
                 staged: confirm.staged,
               });
-              setRestarting(true);
+              setRestarting({ before });
             })
           }
         />
