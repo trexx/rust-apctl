@@ -1,7 +1,7 @@
 import { useState } from "react";
 import type { ReactNode } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { changeSettings } from "../../api";
+import { changeSettings, keys } from "../../api";
 import type { SettingsPreview, SettingsTarget } from "../../api";
 import { ChangeGroups, summarise } from "../ConfigDiff";
 import { Loading } from "../common";
@@ -27,7 +27,7 @@ export function Review({
   const qc = useQueryClient();
   // The preview is asked for once, when the review opens, and forgotten when it closes.
   const preview = useQuery({
-    queryKey: ["settings-preview", target, patch],
+    queryKey: keys.settingsPreview(target, patch),
     queryFn: () => changeSettings<SettingsPreview>(target, patch, false),
     gcTime: 0,
     staleTime: Infinity,
@@ -37,9 +37,9 @@ export function Review({
   const save = useMutation({
     mutationFn: () => changeSettings(target, patch, true),
     onSuccess: async () => {
-      await qc.invalidateQueries({ queryKey: ["settings"] });
-      void qc.invalidateQueries({ queryKey: ["wlans"] });
-      void qc.invalidateQueries({ queryKey: ["events"] });
+      await qc.invalidateQueries({ queryKey: keys.settings() });
+      void qc.invalidateQueries({ queryKey: keys.wlans() });
+      void qc.invalidateQueries({ queryKey: keys.events() });
       onSaved();
     },
   });

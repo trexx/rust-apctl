@@ -1,4 +1,5 @@
-import { speed, useUserGroups } from "../../../api";
+import { useUserGroups } from "../../../api";
+import { speed } from "../../../format";
 import { Row } from "../form";
 
 /** The SSID's speed limit: a user group; the default group means none. */

@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { useMe, useSiteSettings } from "../../../api";
+import { useCanEdit, useSiteSettings } from "../../../api";
 import type { SiteSettings } from "../../../api";
 import { ErrorNote, Loading } from "../../common";
 import { useSettingsForm } from "../form";
@@ -62,7 +62,7 @@ function SiteEditor({ d, onClose }: { d: SiteSettings; onClose: () => void }) {
 /** Site-wide device settings: LED, outdoor, SSH, syslog, NTP, country, time zone. */
 export function SiteSettingsPanel() {
   const q = useSiteSettings();
-  const readOnly = useMe().data?.read_only ?? false;
+  const readOnly = !useCanEdit();
   const [editing, setEditing] = useState(false);
   if (q.isLoading) return <Loading />;
   if (q.error) return <ErrorNote error={q.error} />;

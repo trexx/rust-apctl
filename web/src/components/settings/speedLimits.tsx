@@ -1,5 +1,6 @@
 import { useState } from "react";
-import { speed, useMe, useUserGroups } from "../../api";
+import { useCanEdit, useUserGroups } from "../../api";
+import { speed } from "../../format";
 import type { UserGroup } from "../../api";
 import { Row } from "./form";
 import type { Fields } from "./form";
@@ -72,7 +73,7 @@ function SpeedLimitEditor({
 /** Speed limits (user groups): used by SSIDs and by single clients. */
 export function SpeedLimitsPanel() {
   const g = useUserGroups();
-  const readOnly = useMe().data?.read_only ?? true;
+  const readOnly = !useCanEdit();
   if (!g.data) return null;
   const { active, groups } = g.data;
   return (

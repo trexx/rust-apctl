@@ -64,12 +64,13 @@ export function DeviceEditor({
   const [radios0] = useState(() => d.radios.map(radioForm));
   const [radios, setRadios] = useState(radios0);
   const has = (f: string) => d.features.includes(f);
-  const missing = [
+  const optional: [string, string][] = [
     ["band_steering", "band steering"],
     ["airtime_fairness", "airtime fairness"],
     ["green_ap", "Green AP"],
     ["led_color", "LED colour"],
-  ].filter(([f]) => !has(f));
+  ];
+  const missing = optional.filter(([f]) => !has(f));
   const isOutdoor = (o: DeviceForm["outdoor_mode_override"]) =>
     o === "on" || (o === "default" && d.site_outdoor);
   const outdoor = isOutdoor(form.outdoor_mode_override);
@@ -77,13 +78,18 @@ export function DeviceEditor({
   const setOutdoor = (o: DeviceForm["outdoor_mode_override"]) => {
     set("outdoor_mode_override", o);
     setRadios((all) =>
-      all.map((x, i) => keepAllowed(d.radios[i], x, isOutdoor(o))),
+      all.map((x, i) => {
+        const r = d.radios[i];
+        return r ? keepAllowed(r, x, isOutdoor(o)) : x;
+      }),
     );
   };
   const patch: Fields = changes();
   const r = d.radios
     .map((x, i) => {
-      const c = changed(radios0[i], radios[i]);
+      const before = radios0[i];
+      const after = radios[i];
+      const c = before && after ? changed(before, after) : {};
       return Object.keys(c).length ? { radio: x.radio, ...c } : null;
     })
     .filter(Boolean);
@@ -237,20 +243,25 @@ export function DeviceEditor({
           Not supported by this AP: {missing.map(([, l]) => l).join(", ")}.
         </div>
       )}
-      {d.radios.map((r, i) => (
-        <details key={r.radio} open>
-          <summary>{band(r.radio)} radio</summary>
-          <RadioFields
-            r={r}
-            d={d}
-            outdoor={outdoor}
-            form={radios[i]}
-            onChange={(x) =>
-              setRadios((all) => all.map((y, j) => (j === i ? x : y)))
-            }
-          />
-        </details>
-      ))}
+      {d.radios.map((r, i) => {
+        const f = radios[i];
+        return (
+          f && (
+            <details key={r.radio} open>
+              <summary>{band(r.radio)} radio</summary>
+              <RadioFields
+                r={r}
+                d={d}
+                outdoor={outdoor}
+                form={f}
+                onChange={(x) =>
+                  setRadios((all) => all.map((y, j) => (j === i ? x : y)))
+                }
+              />
+            </details>
+          )
+        );
+      })}
     </EditorShell>
   );
 }

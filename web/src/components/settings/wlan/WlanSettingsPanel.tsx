@@ -1,4 +1,4 @@
-import { useMe, useWlanSettings } from "../../../api";
+import { useCanEdit, useWlanSettings } from "../../../api";
 import { band } from "../../../format";
 import { ErrorNote, Loading } from "../../common";
 import { ListPanel } from "../ListPanel";
@@ -8,7 +8,7 @@ import { WlanEditor } from "./WlanEditor";
 /** The Networks page's settings section: every SSID, editable. */
 export function WlanSettingsPanel() {
   const s = useWlanSettings();
-  const readOnly = useMe().data?.read_only ?? true;
+  const readOnly = !useCanEdit();
   if (s.error) return <ErrorNote error={s.error} />;
   if (!s.data) return <Loading />;
   const list = s.data;

@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { useDeviceSettings, useMe } from "../../../api";
+import { useCanEdit, useDeviceSettings } from "../../../api";
 import type { RadioSettings } from "../../../api";
 import { band } from "../../../format";
 import { DeviceEditor } from "./DeviceEditor";
@@ -10,7 +10,7 @@ const radioSummary = (r: RadioSettings) =>
 
 function DevicePanel({ mac }: { mac: string }) {
   const s = useDeviceSettings(mac);
-  const readOnly = useMe().data?.read_only ?? true;
+  const readOnly = !useCanEdit();
   const [editing, setEditing] = useState(false);
   if (!s.data || readOnly) return null;
   const d = s.data;

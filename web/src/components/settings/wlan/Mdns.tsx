@@ -8,7 +8,7 @@ type CustomService = { address: string; name?: string };
 /** Own service types, one per line: `_service._tcp.local` and an optional name. */
 const parseServices = (text: string): CustomService[] =>
   lines(text).map((l) => {
-    const [address, ...name] = l.split(/\s+/);
+    const [address = "", ...name] = l.split(/\s+/);
     return name.length ? { address, name: name.join(" ") } : { address };
   });
 

@@ -438,6 +438,7 @@ export const keys = {
   adoption: family("adoption"),
   /** The settings editor's data: `settings("site")`, `settings("device", mac)`, … */
   settings: family<[what: "site" | "wlans" | "device" | "usergroups", mac: Mac]>("settings"),
+  settingsPreview: family<[target: SettingsTarget, patch: unknown]>("settings-preview"),
 };
 
 export interface Me {
@@ -1365,7 +1366,6 @@ export const useUserGroups = () =>
 export const setClientSpeedLimit = (mac: Mac, usergroup_id: string | null) => send<{ saved: boolean; what: string }>("PUT", `/api/clients/${mac}/speed-limit`, { usergroup_id });
 
 // Moved to format.ts; still exported here for the settings editor until it imports it from there.
-export { speed } from "./format";
 
 // ---- Adoption ----
 

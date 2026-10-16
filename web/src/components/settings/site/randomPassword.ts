@@ -6,8 +6,9 @@ export function randomPassword(n = 24): string {
   while (out.length < n) {
     crypto.getRandomValues(buf);
     // Rejection sampling keeps every character equally likely.
-    if (buf[0] < Math.floor(2 ** 32 / alphabet.length) * alphabet.length)
-      out.push(alphabet[buf[0] % alphabet.length]);
+    const v = buf[0] ?? 0;
+    if (v < Math.floor(2 ** 32 / alphabet.length) * alphabet.length)
+      out.push(alphabet.charAt(v % alphabet.length));
   }
   return out.join("");
 }
