@@ -1,5 +1,5 @@
 import { hhmm as time } from "../../../format";
-import type { Blackout } from "./form";
+import type { Blackout } from "../../../api";
 
 const WEEK = ["sun", "mon", "tue", "wed", "thu", "fri", "sat"] as const;
 const WEEK_LABEL: Record<string, string> = {

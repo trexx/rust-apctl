@@ -47,7 +47,7 @@ export function WlanSettingsPanel() {
               {PROTECTION.find((p) => p[0] === w.protection)?.[1] ??
                 "other security"}{" "}
               ·{" "}
-              {((w.wlan_bands as string[] | null) ?? [])
+              {(w.wlan_bands ?? [])
                 .map((b) => band(BAND_RADIO[b] ?? b))
                 .join(" + ")}{" "}
               · {w.aps === null ? "all APs" : w.aps.map(apName).join(", ")}

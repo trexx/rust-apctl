@@ -74,11 +74,18 @@ export interface McastCounts {
   rx_bytes: number;
 }
 
+/** Traffic to or from one multicast service (mDNS, SSDP, …). */
+export interface ServiceCount {
+  name: string;
+  pkts: number;
+  bytes: number;
+}
+
 export interface Multicast {
   types: Record<string, McastCounts>;
   groups: (McastCounts & { group_ip: string; dst_port: number | null; type: string | null })[];
   memberships: string[];
-  services: { name: string; pkts: number; bytes: number }[];
+  services: ServiceCount[];
 }
 
 export interface ClientView {
@@ -232,11 +239,8 @@ interface RadioLevels {
   tx_power?: number | null;
 }
 
-interface RoamEndData {
-  ap?: Mac;
-  radio?: string | null;
-  signal?: number | null;
-}
+/** One end of a roam as its event records it: the connection log's fields, and the signal. */
+type RoamEndData = Partial<Pick<RoamEnd, "ap" | "radio">> & { signal?: number | null };
 
 /** A config push's payload, also the shape of a settings preview's per-AP entry. */
 export interface ConfigPushed {
@@ -544,7 +548,7 @@ export interface Connectivity {
   success_pct: number | null;
   failed_at: Record<string, number>;
   /** Average milliseconds per stage, over the attempts that have it. */
-  latency_ms: { association: number | null; authentication: number | null; dhcp: number | null; dns: number | null; total: number | null };
+  latency_ms: Timings;
 }
 
 export interface RadioRetries {
@@ -578,7 +582,7 @@ export interface SiteMulticast {
     rx_pkts: number;
     tx_bytes: number;
     rx_bytes: number;
-    services: { name: string; pkts: number; bytes: number }[];
+    services: ServiceCount[];
     delivery: "optimized" | "flooding" | null;
     memberships: number;
   }[];
@@ -720,6 +724,7 @@ export const useRetries = (span: TimeSpan) => useSpanQuery<RadioRetries[]>(keys.
 
 export const useDensity = (span: TimeSpan) => useSpanQuery<{ aps: DensityAp[] }>(keys.density(span), "/api/site/density", span);
 
+/** Milliseconds each stage of joining took. */
 export interface Timings {
   association: number | null;
   authentication: number | null;
@@ -1211,15 +1216,94 @@ export function useLiveUpdates(): void {
 
 // ---- Settings editor ----
 
-export interface WlanSettings {
-  id: string;
+/** A time an SSID is off: from a start on some days, for a while. */
+export interface Blackout {
+  start_days_of_week: string[];
+  start_hour: number;
+  start_minute: number;
+  duration_minutes: number;
+  name?: string;
+}
+
+/**
+ * An SSID's settings fields, as the server sends them (null when unset) and
+ * the editor changes them; the protection and APs are worked out from them.
+ */
+export interface WlanFields {
   name: string;
-  editable: boolean;
+  enabled?: boolean | null;
+  hide_ssid?: boolean | null;
   protection: "wpa2" | "wpa2_wpa3" | "wpa3" | "open" | null;
-  has_passphrase: boolean;
+  /** Unset: the server derives it from the protection. */
+  pmf_mode?: "disabled" | "optional" | "required" | null;
+  wlan_bands?: string[] | null;
   /** null: broadcast from every AP. */
   aps: Mac[] | null;
-  [field: string]: unknown;
+  networkconf_id?: string | null;
+  usergroup_id?: string | null;
+  schedule_with_duration?: Blackout[] | null;
+
+  fast_roaming_enabled?: boolean | null;
+  wpa3_fast_roaming?: boolean | null;
+  rrm_enabled?: boolean | null;
+  bss_transition?: boolean | null;
+  roaming_assistant_na_enabled?: boolean | null;
+  roaming_assistant_na_rssi?: number | null;
+  no2ghz_oui?: boolean | null;
+
+  enhanced_iot?: boolean | null;
+  iot_channel_lock?: boolean | null;
+  iot_dtim_lock?: boolean | null;
+
+  mdns_proxy_mode?: "off" | "auto" | "custom" | null;
+  mdns_proxy_custom?: MdnsRule[] | null;
+
+  mcastenhance_enabled?: boolean | null;
+  multicast_suppressor_mode?: "off" | "conservative" | "aggressive" | null;
+  bc_filter_enabled?: boolean | null;
+  bc_filter_list?: string[] | null;
+  proxy_arp?: boolean | null;
+
+  dns_assistance_mode?: "off" | "auto" | "manual" | null;
+  dns_assistance_servers?: string[] | null;
+  advertise_device_name_in_beacon?: boolean | null;
+  l2_isolation?: boolean | null;
+  is_guest?: boolean | null;
+  uapsd_enabled?: boolean | null;
+  country_beacon?: boolean | null;
+  minrate_setting_preference?: "auto" | "manual" | null;
+  minrate_ng_enabled?: boolean | null;
+  minrate_ng_data_rate_kbps?: number | null;
+  minrate_na_enabled?: boolean | null;
+  minrate_na_data_rate_kbps?: number | null;
+  dtim_mode?: "default" | "custom" | null;
+  dtim_ng?: number | null;
+  dtim_na?: number | null;
+  group_rekey?: number | null;
+  sae_anti_clogging?: number | null;
+  sae_sync?: number | null;
+  tdls_prohibit?: boolean | null;
+  p2p?: boolean | null;
+  p2p_cross_connect?: boolean | null;
+  log_level?: number | null;
+  mac_filter_enabled?: boolean | null;
+  mac_filter_policy?: "allow" | "deny" | null;
+  mac_filter_list?: string[] | null;
+
+  // Sent and kept as they are: the protection stands for these.
+  security?: string | null;
+  wpa_mode?: string | null;
+  wpa3_support?: boolean | null;
+  wpa3_transition?: boolean | null;
+  ap_group_mode?: string | null;
+}
+
+/** An SSID in the settings editor's list. */
+export interface WlanSettings extends WlanFields {
+  id: string;
+  /** False for SSIDs the settings mark as not editable. */
+  editable: boolean;
+  has_passphrase: boolean;
 }
 
 export interface WlanSettingsList {
@@ -1424,8 +1508,6 @@ export interface UserGroup {
 export const useUserGroups = () =>
   useQuery({ queryKey: keys.settings("usergroups"), queryFn: ({ signal }) => get<{ active: boolean; groups: UserGroup[] }>("/api/settings/usergroups", signal) });
 export const setClientSpeedLimit = (mac: Mac, usergroup_id: string | null) => send<{ saved: boolean; what: string }>("PUT", `/api/clients/${mac}/speed-limit`, { usergroup_id });
-
-// Moved to format.ts; still exported here for the settings editor until it imports it from there.
 
 // ---- Adoption ----
 
