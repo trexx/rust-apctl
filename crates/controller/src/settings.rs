@@ -11,7 +11,7 @@ use axum::Json;
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -705,6 +705,7 @@ fn check_mdns_rules(state: &Value, v: &Value) -> Result<Vec<Value>, String> {
 /// adoption). Disabled SSIDs count too.
 fn check_wlan_limits(state: &Value) -> Result<(), String> {
     let setting_on = |key: &str, default: bool| setting(state, key)["enabled"].as_bool().unwrap_or(default);
+    let (meshing, element_adopt) = (setting_on("connectivity", true), setting_on("element_adopt", false));
     // Each SSID's bands and the APs it goes to, worked out once.
     let wlans: Vec<(Vec<&str>, Vec<String>)> =
         docs(state, "wlanconf").map(|w| (w["wlan_bands"].as_array().into_iter().flatten().filter_map(Value::as_str).collect(), deployed_to(state, w))).collect();
@@ -716,9 +717,9 @@ fn check_wlan_limits(state: &Value) -> Result<(), String> {
             if radios.is_empty() {
                 continue;
             }
-            let limit = if setting_on("connectivity", true) && radios.iter().all(|r| r["vwire_enabled"].as_bool() != Some(false)) {
+            let limit = if meshing && radios.iter().all(|r| r["vwire_enabled"].as_bool() != Some(false)) {
                 4
-            } else if setting_on("element_adopt", false) {
+            } else if element_adopt {
                 7
             } else {
                 8
@@ -735,7 +736,7 @@ fn check_wlan_limits(state: &Value) -> Result<(), String> {
 /// What Force Wi-Fi 4 (`enhanced_iot`) holds an SSID to, with each field's
 /// name for errors: the official controller's IoT template, plus the features
 /// its UI clears and its validation refuses alongside it.
-fn iot_template() -> Vec<(&'static str, Value, &'static str)> {
+static IOT_TEMPLATE: LazyLock<Vec<(&str, Value, &str)>> = LazyLock::new(|| {
     vec![
         ("wlan_bands", json!(["2g"]), "a band other than 2.4 GHz"),
         ("wpa3_support", json!(false), "WPA3"),
@@ -755,7 +756,7 @@ fn iot_template() -> Vec<(&'static str, Value, &'static str)> {
         ("dns_assistance_mode", json!("off"), "DNS Assistance"),
         ("roaming_assistant_na_enabled", json!(false), "the roaming assistant"),
     ]
-}
+});
 
 /// How a plain field of a patch is checked before it is copied.
 #[derive(Clone, Copy)]
@@ -816,8 +817,8 @@ pub fn apply_wlan(state: &mut Value, e: &WlanEdit) -> Result<String, String> {
     copy_fields(p, &mut w, &[("enhanced_iot", Bool)])?;
     let iot = w["enhanced_iot"].as_bool() == Some(true);
     if iot && !was_iot {
-        for (k, v, _) in iot_template() {
-            w[k] = v;
+        for (k, v, _) in IOT_TEMPLATE.iter() {
+            w[*k] = v.clone();
         }
     }
     let iot_base = w.clone();
@@ -852,13 +853,13 @@ pub fn apply_wlan(state: &mut Value, e: &WlanEdit) -> Result<String, String> {
     wlan_links(state, p, &mut w)?;
 
     if iot {
-        for (k, v, what) in iot_template() {
-            if w[k] != v {
+        for (k, v, what) in IOT_TEMPLATE.iter() {
+            if w[*k] != *v {
                 // The edit asked for it: refuse. Otherwise the stored value just goes.
-                if w[k] != iot_base[k] {
+                if w[*k] != iot_base[*k] {
                     return Err(format!("{what} is not available with Force Wi-Fi 4"));
                 }
-                w[k] = v;
+                w[*k] = v.clone();
             }
         }
         w["wlan_band"] = json!("2g");
