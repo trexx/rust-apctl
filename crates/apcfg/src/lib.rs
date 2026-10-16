@@ -68,6 +68,21 @@ pub struct Input<'a> {
     pub controller: &'a Controller,
 }
 
+/// The fields of a `devices` document a render reads (the radios' settings are inside
+/// `radio_table`). Whatever imports device documents must keep at least these.
+pub const DEVICE_KEYS: &[&str] = &[
+    "mac", "site_id", "type", "name", "disabled", "radio_table", "inform_url", "migrate_inform_url", "x_authkey", "x_inform_authkey",
+    "syslog_key", "config_network", "mgmt_network_id", "led_override", "led_override_color", "led_override_color_brightness",
+    "outdoor_mode_override", "bandsteering_mode", "atf_enabled", "green_ap_enabled", "resetbtn_enabled", "jumboframe_enabled",
+    "switch_vlan_enabled", "ethernet_table", "port_overrides", "snmp_location", "snmp_contact", "mesh_uplink_1", "mesh_uplink_2",
+    // Capability bits, used until the AP's first inform.
+    "fw_caps", "fw2_caps", "fw3_caps", "wifi_caps", "wifi_caps2", "hw_caps",
+];
+
+/// The fields of a `clients` (user) document a render reads: blocked clients and
+/// clients locked to an AP.
+pub const CLIENT_KEYS: &[&str] = &["mac", "site_id", "blocked", "fixed_ap_enabled", "fixed_ap_mac"];
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Rendered {
     pub mgmt_cfg: String,
@@ -120,22 +135,15 @@ pub(crate) struct Caps {
 
 impl Caps {
     fn read(inform: Option<&Value>, device: &Value) -> Caps {
-        let get = |k: &str| {
-            inform
-                .and_then(|i| json::int_of(i, k))
-                .or_else(|| json::int_of(device, k))
-                .unwrap_or(0) as u64
-        };
-        Caps {
-            fw: get("fw_caps"),
-            fw2: get("fw2_caps"),
-            fw3: get("fw3_caps"),
-            wifi: get("wifi_caps"),
-            wifi2: get("wifi_caps2"),
-            hw: get("hw_caps"),
-        }
+        let [fw, fw2, fw3, wifi, wifi2, hw] =
+            CAP_KEYS.map(|k| inform.and_then(|i| json::int_of(i, k)).or_else(|| json::int_of(device, k)).unwrap_or(0) as u64);
+        Caps { fw, fw2, fw3, wifi, wifi2, hw }
     }
 }
+
+/// The capability fields behind [`Caps`], in its field order: from the AP's inform,
+/// else from its device document.
+const CAP_KEYS: [&str; 6] = ["fw_caps", "fw2_caps", "fw3_caps", "wifi_caps", "wifi_caps2", "hw_caps"];
 
 pub(crate) fn bit(v: u64, n: u32) -> bool {
     v >> n & 1 == 1
@@ -326,5 +334,26 @@ mod tests {
         assert_eq!(dev, ["airtime_fairness", "green_ap"]);
         let old = json!({ "fw_caps": 1, "fw3_caps": 0, "wifi_caps2": 0 });
         assert!(ssid_feature_support(&device, Some(&old)).unwrap().iter().all(|(f, ok)| !ok || *f == "wpa3_fast_roaming"));
+    }
+
+    /// Every device field the sources read (an accessor on `ctx.device` or `device`
+    /// with a literal key, and the capability fields) is in `DEVICE_KEYS`, so an
+    /// import that keeps those loses nothing a render needs.
+    #[test]
+    fn device_keys_cover_every_field_read() {
+        let sources = [include_str!("lib.rs"), include_str!("mgmt.rs"), include_str!("net.rs"), include_str!("system.rs"), include_str!("wlan.rs"), include_str!("meta.rs")];
+        let mut read: Vec<&str> = CAP_KEYS.to_vec();
+        for src in sources {
+            for pattern in ["ctx.device, \"", "ctx.device.get(\"", "(device, \""] {
+                for (at, _) in src.match_indices(pattern) {
+                    let rest = &src[at + pattern.len()..];
+                    read.push(&rest[..rest.find('"').unwrap()]);
+                }
+            }
+        }
+        assert!(read.len() > 30, "the patterns still find the reads: {read:?}");
+        for key in read {
+            assert!(DEVICE_KEYS.contains(&key), "`{key}` is read from the device document but missing from DEVICE_KEYS");
+        }
     }
 }

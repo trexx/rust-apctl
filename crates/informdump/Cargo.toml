@@ -9,10 +9,11 @@ publish.workspace = true
 # `informdump import` (reads a controller's MongoDB). Off by default: the 2.x
 # driver, needed for the MongoDB 3.6 the official application bundles, pulls in
 # an old TLS and DNS stack.
-mongo = ["dep:mongodb", "dep:tokio", "dep:futures-util"]
+mongo = ["dep:mongodb", "dep:tokio", "dep:futures-util", "dep:apcfg"]
 
 [dependencies]
 anyhow.workspace = true
+apcfg = { workspace = true, optional = true }
 clap = { workspace = true, features = ["derive"] }
 etherparse.workspace = true
 futures-util = { workspace = true, optional = true }

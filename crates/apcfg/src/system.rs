@@ -456,14 +456,13 @@ fn switch(c: &mut Cfg, ctx: &Ctx) {
     if !bit(ctx.caps.fw, 4) {
         return;
     }
-    let d = ctx.device;
     c.set("switch.status", "disabled");
-    c.set("switch.vlan.status", on_off(flag(d, "switch_vlan_enabled", false)));
-    c.set("switch.jumboframes", on_off(flag(d, "jumboframe_enabled", false)));
+    c.set("switch.vlan.status", on_off(flag(ctx.device, "switch_vlan_enabled", false)));
+    c.set("switch.jumboframes", on_off(flag(ctx.device, "jumboframe_enabled", false)));
     c.set("switch.dot1x.status", "disabled");
-    let ports: i64 = arr(d, "ethernet_table").iter().filter_map(|e| int_of(e, "num_port")).sum();
+    let ports: i64 = arr(ctx.device, "ethernet_table").iter().filter_map(|e| int_of(e, "num_port")).sum();
     for i in 1..=ports.max(1) {
-        let name = arr(d, "port_overrides")
+        let name = arr(ctx.device, "port_overrides")
             .iter()
             .find(|p| int_of(p, "port_idx") == Some(i))
             .and_then(|p| str_of(p, "name"))

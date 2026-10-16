@@ -12,18 +12,16 @@ use mongodb::bson::{Bson, Document, doc};
 use mongodb::options::{ClientOptions, FindOptions};
 use serde_json::{Value, json};
 
-/// Device fields worth carrying over. Everything else (stats caches, etc.) is skipped.
+/// Device fields worth carrying over besides the ones rendering reads
+/// ([`apcfg::DEVICE_KEYS`]). Everything else (stats caches, etc.) is skipped.
 const DEVICE_FIELDS: &[&str] = &[
-    "mac", "name", "model", "type", "version", "serial", "ip", "site_id", "adopted",
-    "x_authkey", "syslog_key", "x_aes_gcm", "cfgversion", "inform_url", "led_override", "radio_table", "wlangroup_id_na",
-    "wlangroup_id_ng", "config_network", "mgmt_network_id",
+    "model", "version", "serial", "ip", "adopted", "x_aes_gcm", "cfgversion", "wlangroup_id_na", "wlangroup_id_ng",
 ];
 
-/// Client fields: the names and notes people gave their devices.
+/// Client fields besides the ones rendering reads ([`apcfg::CLIENT_KEYS`]): the
+/// names and notes people gave their devices.
 const USER_FIELDS: &[&str] = &[
-    "mac", "name", "note", "noted", "hostname", "oui", "first_seen", "last_seen", "is_wired",
-    // used when rendering AP config: lock-to-AP, blocked clients, guests
-    "fixed_ap_enabled", "fixed_ap_mac", "blocked", "is_guest",
+    "name", "note", "noted", "hostname", "oui", "first_seen", "last_seen", "is_wired", "is_guest",
     // speed limit (user group) of the client
     "usergroup_id",
 ];
@@ -46,9 +44,10 @@ pub async fn run(uri: &str, db: &str, out: &Path) -> Result<()> {
     let config_meta = find_all(&db, "config_meta", doc! {}).await?;
     // User groups are the speed limits of SSIDs and clients.
     let usergroups = find_all(&db, "usergroup", doc! {}).await?;
-    let projection: Document = DEVICE_FIELDS.iter().map(|f| (f.to_string(), Bson::Int32(1))).collect();
+    let keep = |fields: &[&[&str]]| -> Document { fields.concat().into_iter().map(|f| (f.to_string(), Bson::Int32(1))).collect() };
+    let projection = keep(&[apcfg::DEVICE_KEYS, DEVICE_FIELDS]);
     let devices = find_all(&db, "device", projection).await?;
-    let user_projection: Document = USER_FIELDS.iter().map(|f| (f.to_string(), Bson::Int32(1))).collect();
+    let user_projection = keep(&[apcfg::CLIENT_KEYS, USER_FIELDS]);
     let users = find_all(&db, "user", user_projection).await?;
     let named = users.iter().filter(|u| u.get("name").and_then(Value::as_str).is_some_and(|n| !n.is_empty())).count();
 
