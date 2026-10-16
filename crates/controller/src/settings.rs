@@ -925,19 +925,27 @@ fn wlan_security(p: &Value, w: &mut Value, changed: &mut Vec<&str>) -> Result<()
     // `wpa3_fast_roaming`: fast roaming for WPA3 clients of a WPA2/WPA3 SSID (the official UI never sets it).
     copy_fields(p, w, &[("sae_anti_clogging", Int(1, 60)), ("sae_sync", Int(1, 60)), ("wpa3_fast_roaming", Bool)])?;
 
-    if let Some(pass) = p["passphrase"].as_str() {
+    let given = p["passphrase"].as_str();
+    if psk && given.is_none() && w["x_passphrase"].as_str().is_none_or(str::is_empty) {
+        return Err("a password is needed for WPA2/WPA3".into());
+    }
+    // A kept password is checked against the new protection too: WPA3 allows
+    // up to 255 characters, and a longer one kept for WPA2 would reach the APs
+    // as a key they cannot use.
+    if given.is_some() || psk && !p["protection"].is_null() {
+        let pass = given.or(w["x_passphrase"].as_str()).unwrap_or_default();
         let printable = pass.chars().all(|c| (' '..='~').contains(&c));
         let hex64 = pass.len() == 64 && pass.chars().all(|c| c.is_ascii_hexdigit());
         let wpa3_only = wpa3 && !transition;
         let ok = if wpa3_only { printable && (8..=255).contains(&pass.len()) } else { hex64 || printable && (8..=63).contains(&pass.len()) };
         if !ok {
-            return Err(if wpa3_only { "the password must be 8 to 255 printable ASCII characters" } else { "the password must be 8 to 63 printable ASCII characters (or 64 hex digits)" }.into());
+            let rule = if wpa3_only { "the password must be 8 to 255 printable ASCII characters" } else { "the password must be 8 to 63 printable ASCII characters (or 64 hex digits)" };
+            return Err(if given.is_some() { rule.into() } else { format!("{rule}: enter a new one for this protection") });
         }
+    }
+    if let Some(pass) = given {
         w["x_passphrase"] = json!(pass);
         changed.push("password");
-    }
-    if psk && w["x_passphrase"].as_str().is_none_or(str::is_empty) {
-        return Err("a password is needed for WPA2/WPA3".into());
     }
     Ok(())
 }
@@ -1761,6 +1769,14 @@ mod tests {
         assert!(edit(&mut s, json!({ "name": "ææææææææææææææææææ" })).is_err(), "32 bytes, not characters");
         let what = edit(&mut s, json!({ "passphrase": "another secret" })).unwrap();
         assert!(what.contains("password") && !what.contains("another secret"), "{what}");
+        // A long WPA3 password is not kept when the protection becomes one that cannot use it.
+        edit(&mut s, json!({ "protection": "wpa3", "passphrase": "p".repeat(100) })).unwrap();
+        for protection in ["wpa2", "wpa2_wpa3"] {
+            assert!(edit(&mut s, json!({ "protection": protection })).unwrap_err().contains("enter a new one"), "{protection}");
+            edit(&mut s.clone(), json!({ "protection": protection, "passphrase": "short enough" })).unwrap();
+        }
+        assert_eq!(s["wlanconf"][0]["x_passphrase"].as_str().map(str::len), Some(100));
+        edit(&mut s, json!({ "protection": "open" })).unwrap();
     }
 
     #[test]
