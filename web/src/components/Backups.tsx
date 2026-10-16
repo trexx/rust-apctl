@@ -202,10 +202,12 @@ function Schedule({
 
 function ConfirmRestore({
   what,
+  busy,
   onConfirm,
   onCancel,
 }: {
   what: React.ReactNode;
+  busy: boolean;
   onConfirm: () => void;
   onCancel: () => void;
 }) {
@@ -218,8 +220,12 @@ function ConfirmRestore({
         need to sign in again.
       </div>
       <div className="backup-row">
-        <button className="btn small primary" onClick={onConfirm}>
-          Restore and restart
+        <button
+          className="btn small primary"
+          disabled={busy}
+          onClick={onConfirm}
+        >
+          {busy ? "Restoring…" : "Restore and restart"}
         </button>
         <button className="btn small" onClick={onCancel}>
           Cancel
@@ -371,6 +377,7 @@ export function BackupSection() {
       {confirm && (
         <ConfirmRestore
           what={confirm.label}
+          busy={busy}
           onCancel={() => setConfirm(null)}
           onConfirm={() =>
             void run(async () => {
