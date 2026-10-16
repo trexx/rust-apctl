@@ -1090,7 +1090,11 @@ impl Engine {
         // The live view is written for this alone, and only read (or, for an
         // upgrade notice, written) again where the notification needs it.
         let since_push = self.live.write().unwrap().devices.get_mut(&mac).and_then(|d| {
-            d.last_seen = ts; // proof of life, but not a status report
+            // Proof of life, but not a status report. An AP reported offline
+            // keeps the time it went quiet, which its return reports.
+            if d.online {
+                d.last_seen = ts;
+            }
             d.last_config_push.map(|t| ts - t)
         });
         match p["notif_reason"].as_str() {
@@ -2154,9 +2158,12 @@ mod tests {
         events(&mut h);
         h.engine.handle(Input::Tick(100));
         assert_eq!(events(&mut h), vec![("ap_offline", None), ("client_disconnected", Some(C1.into()))]);
+        // A notification while offline does not shorten the time reported offline.
+        h.engine.handle(Input::Inform { ts: 150, peer: "x".into(), decoded: notif(AP1, "event", json!({})) });
         // Back with a low uptime: online again and restarted.
         h.engine.handle(Input::Inform { ts: 200, peer: "x".into(), decoded: decoded(inform(AP1, 50, &[])) });
         assert_eq!(events(&mut h), vec![("ap_online", None), ("ap_restarted", None)]);
+        assert_eq!(stored(&h, EventKind::ApOnline)[0]["offline_for"], 200);
 
         let mac: Mac = AP1.parse().unwrap();
         let push = |cfg: &str| decoded(json!({ "_type": "setparam", "cfgversion": "x", "system_cfg": cfg, "mgmt_cfg": "a=1" }));
