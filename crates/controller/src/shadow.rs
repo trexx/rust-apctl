@@ -9,7 +9,7 @@ use std::io::Read;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::time::Duration;
 
 use tokio::sync::mpsc;
@@ -18,6 +18,7 @@ use wire::exchange::{InformEvent, Pairer};
 use wire::keys::KeyStore;
 
 use crate::engine::Input;
+use crate::model::Ts;
 
 #[derive(Debug, Clone)]
 pub enum Source {
@@ -42,11 +43,39 @@ const REPLAY_LAG_SECS: i64 = 120;
 /// How often a replay ticks the engine, in capture time.
 const REPLAY_TICK_SECS: i64 = 5;
 
-/// `replaying` is set while the capture runs behind the wall clock. The engine's
-/// clock then follows the capture: the capture sends the ticks (in capture
-/// time) and the wall-clock ticks pause, or every AP and client would look gone
-/// between two replayed informs.
-pub fn spawn(source: Source, ports: Vec<u16>, syslog_port: u16, keys: Arc<KeyStore>, tx: mpsc::Sender<Input>, replaying: Arc<AtomicBool>) {
+/// The engine's clock in shadow mode, which follows the capture's: how far the
+/// capture runs behind the wall clock, as of its latest inform.
+///
+/// A live capture can lag (tcpdump buffering, a slow pipe): the wall-clock
+/// ticks are moved back by the lag, or an AP would look gone between two of
+/// its informs. A capture further behind than `REPLAY_LAG_SECS` is a replay:
+/// it sends the ticks itself, in capture time, and the wall-clock ticks pause.
+#[derive(Debug, Default)]
+pub struct Clock {
+    lag: AtomicI64,
+}
+
+impl Clock {
+    /// The engine's time now, or `None` while a replay ticks in its own time.
+    pub fn now(&self) -> Option<Ts> {
+        let lag = self.lag.load(Ordering::Relaxed);
+        (lag <= REPLAY_LAG_SECS).then(|| crate::store::now_ts() - lag)
+    }
+
+    /// Notes an inform's capture time; true if the capture is being replayed.
+    fn observe(&self, ts: Ts) -> bool {
+        let lag = (crate::store::now_ts() - ts).max(0);
+        self.lag.store(lag, Ordering::Relaxed);
+        lag > REPLAY_LAG_SECS
+    }
+
+    fn reset(&self) {
+        self.lag.store(0, Ordering::Relaxed);
+    }
+}
+
+/// `clock` follows the capture (see [`Clock`]).
+pub fn spawn(source: Source, ports: Vec<u16>, syslog_port: u16, keys: Arc<KeyStore>, tx: mpsc::Sender<Input>, clock: Arc<Clock>) {
     std::thread::Builder::new()
         .name("shadow-capture".into())
         .spawn(move || {
@@ -56,15 +85,15 @@ pub fn spawn(source: Source, ports: Vec<u16>, syslog_port: u16, keys: Arc<KeySto
                 // A panic in the capture reader ends this run like an error does,
                 // rather than shadow mode for good.
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match &source {
-                    Source::Stdin => run_once(std::io::stdin(), &ports, syslog_port, &keys, &tx, &replaying),
+                    Source::Stdin => run_once(std::io::stdin(), &ports, syslog_port, &keys, &tx, &clock),
                     Source::Path(p) => match std::fs::File::open(p) {
-                        Ok(f) => run_once(std::io::BufReader::new(f), &ports, syslog_port, &keys, &tx, &replaying),
+                        Ok(f) => run_once(std::io::BufReader::new(f), &ports, syslog_port, &keys, &tx, &clock),
                         Err(e) => Err(anyhow::anyhow!("opening {}: {e}", p.display())),
                     },
-                    Source::Command(cmd) => run_command(cmd, &ports, syslog_port, &keys, &tx, &replaying),
+                    Source::Command(cmd) => run_command(cmd, &ports, syslog_port, &keys, &tx, &clock),
                 }))
                 .unwrap_or_else(|_| Err(anyhow::anyhow!("the capture reader panicked")));
-                replaying.store(false, Ordering::Relaxed);
+                clock.reset();
                 match result {
                     Ok(()) => tracing::warn!("shadow capture from {source} ended"),
                     Err(e) => tracing::warn!("shadow capture from {source} failed: {e:#}"),
@@ -85,12 +114,12 @@ pub fn spawn(source: Source, ports: Vec<u16>, syslog_port: u16, keys: Arc<KeySto
         .expect("spawning the capture thread");
 }
 
-fn run_command(cmd: &str, ports: &[u16], syslog_port: u16, keys: &KeyStore, tx: &mpsc::Sender<Input>, replaying: &AtomicBool) -> anyhow::Result<()> {
+fn run_command(cmd: &str, ports: &[u16], syslog_port: u16, keys: &KeyStore, tx: &mpsc::Sender<Input>, clock: &Clock) -> anyhow::Result<()> {
     tracing::info!("starting shadow capture: {cmd}");
     let mut child = Command::new("sh").arg("-c").arg(cmd).stdout(Stdio::piped()).stderr(Stdio::inherit()).spawn()?;
     let stdout = child.stdout.take().expect("piped stdout");
     // The command is stopped even when the reader panics.
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run_once(stdout, ports, syslog_port, keys, tx, replaying)));
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run_once(stdout, ports, syslog_port, keys, tx, clock)));
     let _ = child.kill();
     let _ = child.wait();
     result.unwrap_or_else(|_| Err(anyhow::anyhow!("the capture reader panicked")))
@@ -102,7 +131,7 @@ fn run_once<R: Read + Send>(
     syslog_port: u16,
     keys: &KeyStore,
     tx: &mpsc::Sender<Input>,
-    replaying: &AtomicBool,
+    clock: &Clock,
 ) -> anyhow::Result<()> {
     let mut pairer = Pairer::default();
     let mut last_tick = 0;
@@ -127,9 +156,7 @@ fn run_once<R: Read + Send>(
         let input = match ev {
             InformEvent::Inform { ts, peer, decoded: Ok(decoded), .. } => {
                 let ts = ts / 1_000_000;
-                let behind = ts < crate::store::now_ts() - REPLAY_LAG_SECS;
-                replaying.store(behind, Ordering::Relaxed);
-                if behind && ts >= last_tick + REPLAY_TICK_SECS {
+                if clock.observe(ts) && ts >= last_tick + REPLAY_TICK_SECS {
                     last_tick = ts;
                     tick = Some(Input::Tick(ts));
                 }
@@ -152,4 +179,24 @@ fn run_once<R: Read + Send>(
             let _ = tx.blocking_send(tick);
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_clock_follows_a_lagging_capture_and_pauses_for_a_replay() {
+        let clock = Clock::default();
+        let now = crate::store::now_ts();
+        assert!(clock.now().is_some_and(|t| (now..now + 2).contains(&t)), "no capture yet: the wall clock");
+        // A live capture 90 s behind: ticks in its time, or every AP would look offline.
+        assert!(!clock.observe(now - 90));
+        assert!(clock.now().is_some_and(|t| (now - 90..now - 88).contains(&t)));
+        // A replay sends its own ticks.
+        assert!(clock.observe(now - 3600));
+        assert_eq!(clock.now(), None);
+        clock.reset();
+        assert!(clock.now().is_some());
+    }
 }
