@@ -1063,12 +1063,22 @@ struct OwnLink {
 pub async fn neighbors(State(s): State<AppState>, Query(q): Query<NeighborQuery>) -> Result<Json<Value>, ApiError> {
     let since = store::now_ts() - q.range.unwrap_or(86400).clamp(600, 30 * 86400);
     let band = q.band.clone();
+    // Our APs' signal to each other only: the rows of our own BSSIDs (the table's key) are enough.
+    let only: Option<Vec<Sql>> = q.links_only.then(|| s.live.read().unwrap().devices.values().flat_map(|d| d.snapshot.vaps.iter().map(|v| Sql::Text(v.bssid.clone()))).collect());
     let rows = read(&s.store, Db::Config, move |c| {
+        if only.as_ref().is_some_and(Vec::is_empty) {
+            return Ok(Vec::new());
+        }
         let mut cond = "last_seen >= ?1".to_string();
         let mut params = vec![Sql::Integer(since)];
         if let Some(b) = band.filter(|b| b != "all") {
             params.push(Sql::Text(b));
             cond.push_str(" AND radio = ?2");
+        }
+        if let Some(own) = only {
+            let marks: Vec<String> = (params.len() + 1..=params.len() + own.len()).map(|i| format!("?{i}")).collect();
+            cond.push_str(&format!(" AND bssid IN ({})", marks.join(", ")));
+            params.extend(own);
         }
         let sql = format!(
             "SELECT bssid, ap_mac, radio, essid, channel, bw, center_freq, security, signal, best_signal, is_unifi, ap_name, model, first_seen, last_seen FROM neighbors WHERE {cond}"
