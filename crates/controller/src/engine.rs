@@ -287,7 +287,8 @@ pub struct Live {
     pub adoption: crate::adopt::Adoption,
     /// Last config pushed to each AP (by the other controller or by apctl),
     /// unredacted. Only kept in memory; the database has a redacted copy.
-    pub last_config: HashMap<Mac, PushedConfig>,
+    /// Shared, so readers copy a pointer under the lock, not the config.
+    pub last_config: HashMap<Mac, Arc<PushedConfig>>,
 }
 
 /// A config pushed to an AP.
@@ -904,7 +905,7 @@ impl Engine {
         if let Some(d) = live.devices.get_mut(&mac) {
             d.last_config_push = Some(ts);
         }
-        live.last_config.insert(mac, PushedConfig { mgmt_cfg: mgmt, system_cfg: system, cfgversion });
+        live.last_config.insert(mac, Arc::new(PushedConfig { mgmt_cfg: mgmt, system_cfg: system, cfgversion }));
         self.emit(ev(ts, EventKind::ConfigPushed, Some(mac), None, Value::Object(data)));
         if let Some(summary) = dry {
             self.emit(ev(ts, EventKind::DryrunCompared, Some(mac), None, summary));

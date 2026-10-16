@@ -292,7 +292,10 @@ impl Active {
             // A resend asked for is always a push.
             let adopt = !force && current.is_none() && {
                 let last_push = self.live.read().unwrap().last_config.get(&mac).cloned();
-                let candidate = last_push.map(|p| (p, false)).or_else(|| self.stored_pushes.get(&mac).cloned().map(|p| (p, true)));
+                let candidate = match &last_push {
+                    Some(p) => Some((&**p, false)),
+                    None => self.stored_pushes.get(&mac).map(|p| (p, true)),
+                };
                 candidate.is_some_and(|(p, redacted)| {
                     p.cfgversion.as_deref() == Some(reported.as_str())
                         && crate::dryrun::equivalent(&with_cfgversion(&out.rendered.mgmt_cfg, &reported), &p.mgmt_cfg, redacted)
@@ -535,7 +538,7 @@ mod tests {
                 l.state = Some(Arc::new(fixture("controller-state.json")));
             }
             if let Some((mgmt_cfg, system_cfg, cfgversion)) = last_push {
-                l.last_config.insert(AP.parse().unwrap(), PushedConfig { mgmt_cfg, system_cfg, cfgversion });
+                l.last_config.insert(AP.parse().unwrap(), Arc::new(PushedConfig { mgmt_cfg, system_cfg, cfgversion }));
             }
         }
         let mut keys = KeyStore::default();
