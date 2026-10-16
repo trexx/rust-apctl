@@ -23,7 +23,7 @@ use tokio::sync::broadcast;
 
 use crate::api::{ApiError, AppState};
 use crate::engine::{LiveMsg, SharedLive};
-use crate::insights::{RETRY_COLS, Spec, retry_pct, retry_totals};
+use crate::insights::{RETRY_AT, RETRY_COLS, Spec, retry_pct, retry_totals};
 use crate::model::Ts;
 use crate::settings::band_name;
 use crate::store::{self, Db, Store, Writer};
@@ -357,9 +357,9 @@ async fn radio_health(store: &Arc<Store>, now: Ts) -> anyhow::Result<HashMap<(St
                 }
             }
             // Retries from the SSIDs' counters, counted as the other views count them.
-            let spec = Spec { table: "vap_stats", key: "bssid", extra: &["ap_mac", "radio"], cols: RETRY_COLS };
+            let spec = Spec { table: "vap_stats", key: "bssid", extra: &["ap_mac", "radio"], cols: &RETRY_COLS, only: None };
             let vaps = crate::insights::load(c, spec, 0, from, now)?;
-            for (k, t) in retry_totals(&vaps, from) {
+            for (k, t) in retry_totals(&vaps, RETRY_AT, from) {
                 let h = out.entry(k).or_default();
                 h.attempts = t[1];
                 if t.iter().sum::<f64>() > 0.0 {
