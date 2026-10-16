@@ -4,12 +4,16 @@ import type { ChangeEvent, Dispatch, ReactNode, SetStateAction } from "react";
 /** A settings patch, as sent to the server. */
 export type Fields = Record<string, unknown>;
 
-/** The fields of `form` that differ from `original`. */
+/**
+ * The fields of `form` that differ from `original`. An undefined field is
+ * left out: JSON drops it, so it would look like a change that sends nothing.
+ */
 export function changed<F extends object>(original: F, form: F): Partial<F> {
   const out: Partial<F> = {};
   for (const k of Object.keys(form) as (keyof F)[]) {
     const v = form[k];
-    if (JSON.stringify(v) !== JSON.stringify(original[k])) out[k] = v;
+    if (v !== undefined && JSON.stringify(v) !== JSON.stringify(original[k]))
+      out[k] = v;
   }
   return out;
 }

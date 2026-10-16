@@ -4,7 +4,7 @@ import { useSettingsForm } from "../form";
 import type { Fields } from "../form";
 import { EditorShell } from "../Review";
 import { wlanForm } from "./form";
-import type { Protection } from "./form";
+import type { Protection, WlanForm } from "./form";
 import { Advanced } from "./Advanced";
 import { Basics } from "./Basics";
 import { Iot } from "./Iot";
@@ -24,31 +24,47 @@ export function WlanEditor({
   onClose: () => void;
 }) {
   const w = useSettingsForm(() => wlanForm(wlan));
-  const { form, setForm, bind } = w;
+  const { original, form, setForm, bind } = w;
   const [password, setPassword] = useState("");
+  /**
+   * The server derives PMF from the protection when the save changes it (or
+   * turns Force Wi-Fi 4 on, or creates the SSID); otherwise an unset PMF is
+   * no change at all.
+   */
+  const pmfDerives = (x: WlanForm) =>
+    !wlan ||
+    x.protection !== original.protection ||
+    (x.enhanced_iot === true && original.enhanced_iot !== true);
+  /** An unset PMF that the server wouldn't derive keeps what it was, so the form shows the truth. */
+  const settle = (x: WlanForm): WlanForm =>
+    x.pmf_mode === undefined && !pmfDerives(x)
+      ? { ...x, pmf_mode: original.pmf_mode }
+      : x;
   const setProtection = (p: Protection) =>
-    setForm((x) => ({ ...x, protection: p, pmf_mode: undefined }));
+    setForm((x) => settle({ ...x, protection: p, pmf_mode: undefined }));
   /** Force Wi-Fi 4 clears what it can't be combined with, as the official UI does. */
   const setIot = (on: boolean) =>
-    setForm((x) => ({
-      ...x,
-      enhanced_iot: on,
-      ...(on && {
-        wlan_bands: ["2g"],
-        protection: x.protection === "open" ? "open" : "wpa2",
-        pmf_mode: undefined,
-        fast_roaming_enabled: false,
-        wpa3_fast_roaming: false,
-        bss_transition: false,
-        proxy_arp: false,
-        no2ghz_oui: false,
-        group_rekey: 0,
-        dtim_mode: "default",
-        advertise_device_name_in_beacon: false,
-        dns_assistance_mode: "off",
-        roaming_assistant_na_enabled: false,
+    setForm((x) =>
+      settle({
+        ...x,
+        enhanced_iot: on,
+        ...(on && {
+          wlan_bands: ["2g"],
+          protection: x.protection === "open" ? "open" : "wpa2",
+          pmf_mode: undefined,
+          fast_roaming_enabled: false,
+          wpa3_fast_roaming: false,
+          bss_transition: false,
+          proxy_arp: false,
+          no2ghz_oui: false,
+          group_rekey: 0,
+          dtim_mode: "default",
+          advertise_device_name_in_beacon: false,
+          dns_assistance_mode: "off",
+          roaming_assistant_na_enabled: false,
+        }),
       }),
-    }));
+    );
   const patch: Fields = wlan ? w.changes() : { ...form };
   if (password) patch.passphrase = password;
   const section = { w, list };
@@ -71,7 +87,7 @@ export function WlanEditor({
       <Iot w={w} setIot={setIot} />
       <Mdns {...section} />
       <Multicast {...section} />
-      <Advanced {...section} />
+      <Advanced {...section} pmfDerives={pmfDerives(form)} />
     </EditorShell>
   );
 }

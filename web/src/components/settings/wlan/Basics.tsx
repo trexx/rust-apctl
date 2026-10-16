@@ -9,17 +9,24 @@ import { SpeedLimitRow } from "./SpeedLimitRow";
 /** The stored passphrase, fetched when asked for. */
 function ShowPassphrase({ id }: { id: string }) {
   const [shown, setShown] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
   if (shown !== null) return <span className="mono small">{shown}</span>;
   return (
     <>
       <button
         className="btn small"
-        onClick={() =>
-          void wlanPassphrase(id).then((r) => setShown(r.passphrase ?? ""))
-        }
+        onClick={() => {
+          setError(null);
+          wlanPassphrase(id)
+            .then((r) => setShown(r.passphrase ?? ""))
+            .catch((e: unknown) =>
+              setError(e instanceof Error ? e.message : String(e)),
+            );
+        }}
       >
         Show current
       </button>
+      {error && <span className="error small">{error}</span>}
     </>
   );
 }

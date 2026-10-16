@@ -19,6 +19,21 @@ const formatServices = (v: CustomService[]) =>
     )
     .join("\n");
 
+/**
+ * A client-side id for each rule, so a rule keeps its row (and the text in
+ * it) when one before it is removed. Never sent to the server.
+ */
+const ruleIds = new WeakMap<MdnsRule, number>();
+let nextRuleId = 0;
+function ruleId(r: MdnsRule): number {
+  let id = ruleIds.get(r);
+  if (id === undefined) {
+    id = nextRuleId++;
+    ruleIds.set(r, id);
+  }
+  return id;
+}
+
 /** Custom mDNS rules: where each applies and which services pass. */
 function MdnsRules({
   value,
@@ -31,13 +46,20 @@ function MdnsRules({
 }) {
   const services = list.mdns_services ?? [];
   const update = (i: number, r: Partial<MdnsRule>) =>
-    onChange(value.map((x, j) => (j === i ? { ...x, ...r } : x)));
+    onChange(
+      value.map((x, j) => {
+        if (j !== i) return x;
+        const next = { ...x, ...r };
+        ruleIds.set(next, ruleId(x));
+        return next;
+      }),
+    );
   return (
     <>
       {value.map((r, i) => {
         const codes = (r.predefined_services ?? []).map((s) => s.code);
         return (
-          <div key={i} className="form-row">
+          <div key={ruleId(r)} className="form-row">
             <div className="form-label">
               Rule {i + 1}
               <div>

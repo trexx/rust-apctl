@@ -5,7 +5,7 @@ import { Row, Select, Toggle, changed, useSettingsForm } from "../form";
 import type { Fields } from "../form";
 import { EditorShell } from "../Review";
 import { AddressFields } from "./AddressFields";
-import { RadioFields, radioForm } from "./RadioFields";
+import { RadioFields, keepAllowed, radioForm } from "./RadioFields";
 
 type NonNull<T, K extends keyof T> = NonNullable<T[K]>;
 
@@ -73,6 +73,13 @@ export function DeviceEditor({
   const isOutdoor = (o: DeviceForm["outdoor_mode_override"]) =>
     o === "on" || (o === "default" && d.site_outdoor);
   const outdoor = isOutdoor(form.outdoor_mode_override);
+  /** Outdoor mode changes which channels are allowed: a fixed one that no longer is falls back to auto. */
+  const setOutdoor = (o: DeviceForm["outdoor_mode_override"]) => {
+    set("outdoor_mode_override", o);
+    setRadios((all) =>
+      all.map((x, i) => keepAllowed(d.radios[i], x, isOutdoor(o))),
+    );
+  };
   const patch: Fields = changes();
   const r = d.radios
     .map((x, i) => {
@@ -143,7 +150,8 @@ export function DeviceEditor({
       </Row>
       <Row label="Outdoor mode" hint="changes which channels are allowed">
         <Select
-          {...bind("outdoor_mode_override")}
+          value={form.outdoor_mode_override}
+          onChange={setOutdoor}
           options={[
             [
               "default",

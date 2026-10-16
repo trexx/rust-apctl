@@ -41,8 +41,8 @@ export function radioForm(r: RadioSettings): RadioForm {
 const allowed = (r: RadioSettings, outdoor: boolean, ht: number) =>
   (outdoor ? r.channels_outdoor : r.channels)[String(ht)] ?? [];
 
-/** A fixed channel not allowed at the new width falls back to auto. */
-const keepAllowed = (
+/** A fixed channel that isn't allowed (at this width, indoors or out) falls back to auto. */
+export const keepAllowed = (
   r: RadioSettings,
   f: RadioForm,
   outdoor: boolean,
@@ -83,6 +83,9 @@ export function RadioFields({
   const legal = allowed(r, outdoor, form.ht);
   const lo = r.caps?.min_txpower ?? 1;
   const hi = r.caps?.max_txpower ?? 30;
+  // A setting the lists don't offer is still shown as it is, not as the first choice.
+  const strayWidth = !widths.includes(form.ht);
+  const strayChannel = form.channel !== "auto" && !legal.includes(form.channel);
   return (
     <>
       <Row label="Channel">
@@ -91,12 +94,18 @@ export function RadioFields({
           onChange={(w) =>
             onChange(keepAllowed(r, { ...form, ht: w }, outdoor))
           }
-          options={widths.map((w) => [w, `${w} MHz`] as const)}
+          options={[
+            ...(strayWidth ? [[form.ht, `${form.ht} MHz`] as const] : []),
+            ...widths.map((w) => [w, `${w} MHz`] as const),
+          ]}
         />
         <Select
           {...bind("channel")}
           options={[
             ["auto", "Auto"],
+            ...(strayChannel
+              ? [[form.channel, `${form.channel} (not allowed here)`] as const]
+              : []),
             ...legal.map(
               (c) => [c, `${c}${c >= 52 && c <= 144 ? " (DFS)" : ""}`] as const,
             ),

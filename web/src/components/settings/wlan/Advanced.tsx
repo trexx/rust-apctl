@@ -27,7 +27,14 @@ const LOG_LEVELS: Option<number>[] = [
   [4, "4 (warning)"],
 ];
 
-export function Advanced({ w, list }: WlanSection) {
+export function Advanced({
+  w,
+  list,
+  pmfDerives,
+}: WlanSection & {
+  /** "(from the security choice)" can be sent: the server derives PMF on this save. */
+  pmfDerives: boolean;
+}) {
   const { form: f, set, bind } = w;
   const iot = f.enhanced_iot === true;
   const wpa3 = f.protection === "wpa3" || f.protection === "wpa2_wpa3";
@@ -89,7 +96,12 @@ export function Advanced({ w, list }: WlanSection) {
           value={f.pmf_mode ?? ""}
           disabled={iot}
           onChange={(v) => set("pmf_mode", v || undefined)}
-          options={[["", "(from the security choice)"], ...pmf]}
+          options={
+            // Leaving it to the security choice only works when that is part of the save.
+            pmfDerives || !f.pmf_mode
+              ? [["", "(from the security choice)"], ...pmf]
+              : pmf
+          }
         />
       </Row>
       <Row label="Client isolation" hint="clients can't reach each other">
