@@ -1568,7 +1568,6 @@ dependencies = [
  "flate2",
  "hex",
  "serde",
- "serde_json",
  "snap",
  "thiserror 2.0.21",
 ]
