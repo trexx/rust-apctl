@@ -363,19 +363,20 @@ pub async fn login(
     // turned away unchecked does not count against its address.
     static VERIFYING: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(2);
     let _permit = match tokio::time::timeout(std::time::Duration::from_secs(5), VERIFYING.acquire()).await {
-        Ok(Ok(p)) => p,
-        Ok(Err(_)) => return json_error(StatusCode::SERVICE_UNAVAILABLE, "shutting down"),
+        Ok(p) => p.expect("the semaphore is never closed"),
         Err(_) => {
             auth.refund(ip);
             return json_error(StatusCode::SERVICE_UNAVAILABLE, "too many logins at once, try again shortly");
         }
     };
-    let (user, pass) = (body.username, body.password);
-    let check = auth.clone();
-    let user2 = user.clone();
-    let ok = tokio::task::spawn_blocking(move || check.users.verify(&user2, &pass)).await.unwrap_or(false);
+    let verifier = auth.clone();
+    let Ok((ok, user)) = tokio::task::spawn_blocking(move || (verifier.users.verify(&body.username, &body.password), body.username)).await else {
+        return json_error(StatusCode::INTERNAL_SERVER_ERROR, "the password check failed");
+    };
     if !ok {
-        tracing::warn!("failed login for {user:?} from {ip}");
+        // The name is the client's, up to the whole body: the log gets its start.
+        let shown = &user[..user.floor_char_boundary(64)];
+        tracing::warn!("failed login for {shown:?}{} from {ip}", if shown.len() < user.len() { "…" } else { "" });
         return json_error(StatusCode::UNAUTHORIZED, "wrong username or password");
     }
     auth.refund(ip);
