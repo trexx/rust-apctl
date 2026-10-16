@@ -38,13 +38,15 @@ pub struct Reporter {
     pairer: Pairer,
     devices: HashMap<Mac, DeviceState>,
     seq: u64,
+    /// The `--save` directory exists (it is created on the first save).
+    save_dir_ready: bool,
 }
 
 const CFG_FIELDS: [&str; 2] = ["mgmt_cfg", "system_cfg"];
 
 impl Reporter {
     pub fn new(keys: KeyStore, opts: Options) -> Self {
-        Reporter { keys, opts, pairer: Pairer::default(), devices: HashMap::new(), seq: 0 }
+        Reporter { keys, opts, pairer: Pairer::default(), devices: HashMap::new(), seq: 0, save_dir_ready: false }
     }
 
     pub fn handle(&mut self, ev: HttpEvent) {
@@ -73,7 +75,7 @@ impl Reporter {
         state.seen = true;
         self.save(ts, mac, "inform", &d.payload);
         if self.opts.json {
-            return self.emit_json(ts, mac, "inform", &d, None);
+            return self.emit_json(ts, mac, "inform", d, None);
         }
         if !(self.opts.all || first) {
             return;
@@ -107,16 +109,16 @@ impl Reporter {
         self.save(ts, mac, &format!("reply-{kind}"), &d.payload);
 
         // Config diffs are tracked even when the message itself is not printed.
-        let mut diffs = Vec::new();
         let state = self.devices.entry(mac).or_default();
-        for field in CFG_FIELDS {
-            if let Some(new) = d.payload.get(field).and_then(Value::as_str) {
-                let diff = state.cfg.get(field).map(|old| cfgdiff::diff(old, new));
-                let lines = new.lines().count();
-                state.cfg.insert(field.to_string(), new.to_string());
-                diffs.push((field, diff, lines));
-            }
-        }
+        let configs: Vec<(&str, Option<String>, &str)> = CFG_FIELDS
+            .iter()
+            .filter_map(|&field| {
+                let new = d.payload.get(field).and_then(Value::as_str)?;
+                Some((field, state.cfg.insert(field.to_string(), new.to_string()), new))
+            })
+            .collect();
+        let diffs: Vec<_> =
+            configs.iter().map(|(field, old, new)| (*field, old.as_deref().map(|old| cfgdiff::diff(old, new)), new.lines().count())).collect();
 
         if self.opts.json {
             let rendered: Value = diffs
@@ -124,7 +126,7 @@ impl Reporter {
                 .filter_map(|(f, diff, _)| diff.as_ref().map(|d| (f.to_string(), json!(d.render("", self.opts.redact)))))
                 .collect::<serde_json::Map<_, _>>()
                 .into();
-            return self.emit_json(ts, mac, &format!("reply-{kind}"), &d, Some(rendered));
+            return self.emit_json(ts, mac, &format!("reply-{kind}"), d, Some(rendered));
         }
         if kind == "noop" && !self.opts.all {
             return;
@@ -167,14 +169,14 @@ impl Reporter {
         if self.opts.redact { pretty(&redact_json(v)) } else { pretty(v) }
     }
 
-    fn emit_json(&self, ts: Micros, mac: Mac, kind: &str, d: &Decoded, diffs: Option<Value>) {
+    fn emit_json(&self, ts: Micros, mac: Mac, kind: &str, d: Decoded, diffs: Option<Value>) {
         let mut obj = json!({
             "ts": format_ts(ts),
             "mac": mac.to_string(),
             "kind": kind,
             "flags": format!("{:?}", d.header.flags),
             "key": format!("{:?}", d.key),
-            "payload": if self.opts.redact { redact_json(&d.payload) } else { d.payload.clone() },
+            "payload": if self.opts.redact { redact_json(&d.payload) } else { d.payload },
         });
         if let Some(diffs) = diffs {
             obj["diffs"] = diffs;
@@ -188,9 +190,9 @@ impl Reporter {
         self.seq += 1;
         let name = format!("{}_{:06}_{}_{}.json", format_ts(ts).replace(':', ""), self.seq, mac.to_string().replace(':', ""), kind);
         let path = dir.join(name);
-        let result = crate::create_private_dir(dir)
-            .and_then(|_| crate::write_private(&path, pretty(payload).as_bytes()))
-            .with_context(|| format!("saving {}", path.display()));
+        // If it cannot be created, writing the file says why.
+        self.save_dir_ready = self.save_dir_ready || crate::create_private_dir(dir).is_ok();
+        let result = crate::write_private(&path, pretty(payload).as_bytes()).with_context(|| format!("saving {}", path.display()));
         if let Err(e) = result {
             eprintln!("warning: {e:#}");
         }

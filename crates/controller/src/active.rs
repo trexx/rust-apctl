@@ -56,29 +56,12 @@ struct Render {
     /// Arc; the Weak keeps the address from being reused by another version
     /// without keeping old settings alive for an AP that went quiet.
     state: Weak<Value>,
-    /// What the generator reads from the inform (`render_inputs`).
+    /// What the generator reads from the inform (`apcfg::inform_inputs`).
     inputs: Value,
     out: apcfg::Output,
     blocked: String,
     /// Both configs and the blocked clients, as compared with `Managed::content`.
     content: Arc<str>,
-}
-
-/// The parts of an inform the config generator reads: the capability bits
-/// (apcfg `Caps::read`), `has_eth1` and the names in `vap_table` (net.rs),
-/// `inform_ip`, the `port_table` interface names and `uplink` (system.rs).
-/// Informs that agree on these render the same config from the same settings,
-/// so the rest (counters, uptime, clients) need not cause a render. Raw values
-/// are compared, which is stricter than what apcfg parses from them. Keep in
-/// step with apcfg when it reads more of the inform.
-fn render_inputs(p: &Value) -> Value {
-    let names = |table: &str, key: &str| p[table].as_array().map(|t| t.iter().map(|x| x[key].clone()).collect::<Vec<_>>());
-    let caps = ["fw_caps", "fw2_caps", "fw3_caps", "wifi_caps", "wifi_caps2", "hw_caps"].map(|k| p[k].clone());
-    json!({
-        "caps": caps,
-        "has_eth1": p["has_eth1"], "inform_ip": p["inform_ip"], "uplink": p["uplink"],
-        "vap_table": names("vap_table", "name"), "port_table": names("port_table", "ifname"),
-    })
 }
 
 pub struct Active {
@@ -178,7 +161,7 @@ impl Active {
     /// neither the settings nor what it read of the inform changed (most
     /// informs), else a new one. The lock is not held while rendering.
     fn placeholder_render(&self, state: &Arc<Value>, mac: Mac, payload: &Value) -> anyhow::Result<Arc<Render>> {
-        let inputs = render_inputs(payload);
+        let inputs = apcfg::inform_inputs(payload);
         let last = self.devices.lock().unwrap().get(&mac).and_then(|d| d.render.clone());
         if let Some(r) = last.filter(|r| std::ptr::eq(r.state.as_ptr(), Arc::as_ptr(state)) && r.inputs == inputs) {
             return Ok(r);

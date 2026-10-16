@@ -2,12 +2,13 @@
 //! and `wireless.N.*` blocks.
 
 use std::borrow::Cow;
+use std::fmt::Write;
 
 use serde_json::Value;
 
 use crate::cfg::{Cfg, Prefix};
 use crate::javahash::hash_set_order;
-use crate::json::{arr, as_text, bool_of, flag, int_of, mac_eq, oid, on_off, str_list, str_of, text_of};
+use crate::json::{Text, arr, as_text, bool_of, flag, int_of, mac_eq, oid, on_off, str_list, str_of, text_of};
 use crate::meta::WifiSlot;
 use crate::{Ctx, bit};
 
@@ -49,6 +50,17 @@ impl<'a> Band<'a> {
             Band::Na => "na",
             Band::Six => "6e",
             Band::Other(name) => name,
+        }
+    }
+
+    /// This band's one of a field's per-band names, given for `ng`, `na` and `6e`
+    /// (`["dtim_ng", "dtim_na", "dtim_6e"]`); none for another band.
+    fn key(self, keys: [&'static str; 3]) -> Option<&'static str> {
+        match self {
+            Band::Ng => Some(keys[0]),
+            Band::Na => Some(keys[1]),
+            Band::Six => Some(keys[2]),
+            Band::Other(_) => None,
         }
     }
 
@@ -130,9 +142,15 @@ pub fn ap_groups<'a>(ctx: &Ctx<'a>) -> Vec<&'a str> {
 }
 
 /// Sets a field of the WLAN, copying the document first if it is still the original.
+/// A field that already has the value leaves the document alone (most WPA3, open and
+/// enterprise WLANs already hold the values `adapt` writes).
 fn set(w: &mut Cow<Value>, key: &str, v: impl Into<Value>) {
+    let v = v.into();
+    if w.get(key) == Some(&v) {
+        return;
+    }
     if let Some(o) = w.to_mut().as_object_mut() {
-        o.insert(key.to_string(), v.into());
+        o.insert(key.to_string(), v);
     }
 }
 
@@ -283,9 +301,9 @@ pub fn render_radios(c: &mut Cfg, ctx: &Ctx, radios: &[Radio], vaps: &[Vap]) -> 
         c.set(k.at("antenna.gain"), int_of(d, "antenna_gain").unwrap_or(6));
         c.set(k.at("antenna"), int_of(d, "antenna_id").unwrap_or(-1));
         c.set(k.at("txpower_mode"), str_of(d, "tx_power_mode").unwrap_or("auto").to_ascii_lowercase());
-        c.set(k.at("txpower"), text_of(d, "tx_power").unwrap_or_else(|| "auto".into()));
-        let channel = text_of(d, "channel").unwrap_or_else(|| "0".into());
-        c.set(k.at("channel"), &channel);
+        c.set(k.at("txpower"), text_of(d, "tx_power").unwrap_or(Text::Str("auto")));
+        let channel = text_of(d, "channel").unwrap_or(Text::Str("0"));
+        c.set(k.at("channel"), channel);
         let g = if r.band == Band::Ng { "g" } else { "a" };
         c.set(k.at("ieee_mode"), format_args!("11n{g}ht{width}"));
         let acs_dfs = bit(ctx.caps.wifi2, 4);
@@ -293,7 +311,7 @@ pub fn render_radios(c: &mut Cfg, ctx: &Ctx, radios: &[Radio], vaps: &[Vap]) -> 
             let dfs = ctx.radio_ai_config(Band::Na).is_some_and(|c| flag(c, "dfs", false));
             c.set(k.at("acsdfs"), on_off(dfs));
         }
-        if channel == "auto" && acs_dfs {
+        if channel.is("auto") && acs_dfs {
             let blocked: Vec<&str> = arr(ctx.radio_ai, "channels_blacklist")
                 .iter()
                 .filter(|b| str_of(b, "radio") == Some(r.band.as_str()))
@@ -363,10 +381,12 @@ fn b(w: &Value, key: &str) -> bool {
 
 /// The VLAN of a network (1 for an untagged one).
 pub fn network_vlan(ctx: &Ctx, network_id: Option<&str>) -> i64 {
-    network_id
-        .and_then(|id| ctx.network(id))
-        .filter(|n| b(n, "vlan_enabled"))
-        .map_or(1, |n| int_of(n, "vlan").unwrap_or(2))
+    network_id.and_then(|id| ctx.network(id)).and_then(tagged_vlan).unwrap_or(1)
+}
+
+/// The VLAN a network document tags its traffic with, if it is tagged.
+pub fn tagged_vlan(network: &Value) -> Option<i64> {
+    b(network, "vlan_enabled").then(|| int_of(network, "vlan").unwrap_or(2))
 }
 
 fn radius_profile<'a>(ctx: &Ctx<'a>, w: &Value) -> Option<&'a Value> {
@@ -418,7 +438,10 @@ fn wep_key(w: &Value) -> (String, &'static str) {
     let key = str_of(w, "x_wep").unwrap_or_default();
     let is_hex = key.chars().all(|ch| ch.is_ascii_hexdigit());
     let hex = if !is_hex && (key.len() == 5 || key.len() == 13) {
-        key.bytes().map(|b| format!("{b:02x}")).collect()
+        key.bytes().fold(String::with_capacity(2 * key.len()), |mut hex, b| {
+            let _ = write!(hex, "{b:02x}");
+            hex
+        })
     } else {
         key.to_string()
     };
@@ -451,7 +474,7 @@ pub fn render_vap(c: &mut Cfg, ctx: &Ctx, radios: &[Radio], vaps: &[Vap], i: usi
     let wpa3 = b(w, "wpa3_support");
     let transition = b(w, "wpa3_transition");
     let ssid = str_of(w, "name").unwrap_or_default();
-    let id = text_of(w, "short_id").unwrap_or_default();
+    let id = text_of(w, "short_id").unwrap_or(Text::Str(""));
     let is_guest = b(w, "is_guest");
 
     let pmf = match str_of(w, "pmf_mode") {
@@ -482,7 +505,7 @@ pub fn render_vap(c: &mut Cfg, ctx: &Ctx, radios: &[Radio], vaps: &[Vap], i: usi
         c.set(a.at("driver"), "madwifi");
         c.set(a.at("ssid"), ssid);
         c.set(a.at("status"), on_off(bit(ctx.caps.wifi, 13) && !r.disabled));
-        c.set(a.at("id"), &id);
+        c.set(a.at("id"), id);
         c.set(a.at("verbose"), 2);
         common_tail(c);
         if security == "open" && wpa3 && !transition {
@@ -512,7 +535,7 @@ pub fn render_vap(c: &mut Cfg, ctx: &Ctx, radios: &[Radio], vaps: &[Vap], i: usi
         c.set(a.at("eapol_version"), if wpa_mode == "wpa1" { 1 } else { 2 });
         c.set(a.at("wpa.group_rekey"), int_of(w, "group_rekey").unwrap_or(3600));
         common_tail(c);
-        c.set(a.at("id"), &id);
+        c.set(a.at("id"), id);
         if wpa3 || is_6e {
             c.set(a.at("wpa3.support"), "enabled");
             c.set(a.at("wpa3.transition"), on_off(transition));
@@ -706,7 +729,7 @@ fn render_wireless(c: &mut Cfg, ctx: &Ctx, radios: &[Radio], vaps: &[Vap], i: us
     if suppress_cap && matches!(suppressor, Some("conservative" | "aggressive")) {
         c.set(k.at("multicast.suppressor"), "enabled");
     }
-    c.set(k.at("mcastrate"), text_of(w, "mcast_rate").unwrap_or_else(|| "auto".into()));
+    c.set(k.at("mcastrate"), text_of(w, "mcast_rate").unwrap_or(Text::Str("auto")));
     if bit(caps.wifi, 6) {
         c.set(k.at("bga_filter"), "enabled");
     }
@@ -715,7 +738,7 @@ fn render_wireless(c: &mut Cfg, ctx: &Ctx, radios: &[Radio], vaps: &[Vap], i: us
     let dtim = if ng && b(w, "iot_dtim_lock") {
         3
     } else if str_of(w, "dtim_mode") == Some("custom") {
-        int_of(w, &format!("dtim_{}", r.band)).unwrap_or(if ng { 1 } else { 3 })
+        r.band.key(["dtim_ng", "dtim_na", "dtim_6e"]).and_then(|key| int_of(w, key)).unwrap_or(if ng { 1 } else { 3 })
     } else if ng {
         1
     } else {
@@ -738,7 +761,7 @@ fn render_wireless(c: &mut Cfg, ctx: &Ctx, radios: &[Radio], vaps: &[Vap], i: us
         if ng {
             c.set(k.at("minrate_cck_rates.status"), allows_11b(rate));
         }
-        if b(w, &format!("minrate_{}_advertising_rates", r.band)) {
+        if r.band.key(["minrate_ng_advertising_rates", "minrate_na_advertising_rates", "minrate_6e_advertising_rates"]).is_some_and(|key| b(w, key)) {
             c.set(k.at("minrate_below_disable"), "true");
         }
     }
@@ -882,6 +905,16 @@ mod schedule_tests {
         let mut c = Cfg::default();
         schedule(&mut c, w, Prefix::new("wireless", 1), invert, multi);
         c.finish().lines().map(str::to_string).collect()
+    }
+
+    #[test]
+    fn a_wlan_is_copied_only_for_a_real_change() {
+        let w = json!({ "security": "open", "fast_roaming_enabled": false });
+        let mut c = Cow::Borrowed(&w);
+        set(&mut c, "fast_roaming_enabled", false);
+        assert!(matches!(c, Cow::Borrowed(_)));
+        set(&mut c, "wpa_mode", "wpa2");
+        assert_eq!((matches!(c, Cow::Owned(_)), &c["wpa_mode"]), (true, &json!("wpa2")));
     }
 
     #[test]

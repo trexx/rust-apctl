@@ -81,6 +81,31 @@ pub const DEVICE_KEYS: &[&str] = &[
     "fw_caps", "fw2_caps", "fw3_caps", "wifi_caps", "wifi_caps2", "hw_caps",
 ];
 
+/// The top-level inform fields a render reads: the capability bits ([`Caps`]; until the
+/// first inform they come from the device document), `has_eth1` (net.rs), `inform_ip`
+/// and `uplink` (system.rs). [`INFORM_TABLE_KEYS`] lists what it reads from the tables.
+pub const INFORM_KEYS: &[&str] = &["fw_caps", "fw2_caps", "fw3_caps", "wifi_caps", "wifi_caps2", "hw_caps", "has_eth1", "inform_ip", "uplink"];
+
+/// The inform tables a render reads, each with the one field it reads from their rows:
+/// the VAP names (net.rs) and the port interface names (system.rs).
+pub const INFORM_TABLE_KEYS: &[(&str, &str)] = &[("vap_table", "name"), ("port_table", "ifname")];
+
+/// The parts of an inform a render reads ([`INFORM_KEYS`], [`INFORM_TABLE_KEYS`]).
+/// Informs that agree on these render the same config from the same settings, so the
+/// rest (counters, uptime, clients) need not cause a new render. Raw values are
+/// compared, which is stricter than what a render makes of them.
+pub fn inform_inputs(inform: &Value) -> Value {
+    let mut out = serde_json::Map::new();
+    for &k in INFORM_KEYS {
+        out.insert(k.to_string(), inform[k].clone());
+    }
+    for &(table, key) in INFORM_TABLE_KEYS {
+        let rows = inform[table].as_array().map(|t| t.iter().map(|row| row[key].clone()).collect());
+        out.insert(table.to_string(), rows.map_or(Value::Null, Value::Array));
+    }
+    Value::Object(out)
+}
+
 /// The fields of a `clients` (user) document a render reads: blocked clients and
 /// clients locked to an AP.
 pub const CLIENT_KEYS: &[&str] = &["mac", "site_id", "blocked", "fixed_ap_enabled", "fixed_ap_mac"];
@@ -281,7 +306,7 @@ impl<'a> Ctx<'a> {
             mgmt: setting(state, site_id, "mgmt"),
             super_mgmt: setting(state, site_id, "super_mgmt"),
             radio_ai: setting(state, site_id, "radio_ai"),
-            country: json::text_of(setting(state, site_id, "country"), "code").unwrap_or_else(|| "840".to_string()),
+            country: json::text_of(setting(state, site_id, "country"), "code").map_or_else(|| "840".to_string(), |c| c.to_string()),
         })
     }
 
@@ -383,5 +408,39 @@ mod tests {
         for key in read {
             assert!(DEVICE_KEYS.contains(&key), "`{key}` is read from the device document but missing from DEVICE_KEYS");
         }
+    }
+
+    /// Every inform field the sources read (`inform_str`, and every quoted name in an
+    /// expression on `ctx.inform`) is in `inform_inputs`, so the controller's render
+    /// cache, keyed on it, never reuses a config made from an inform that differed.
+    #[test]
+    fn inform_inputs_cover_every_field_read() {
+        let sources = [include_str!("lib.rs"), include_str!("mgmt.rs"), include_str!("net.rs"), include_str!("system.rs"), include_str!("wlan.rs"), include_str!("meta.rs")];
+        let known = |k: &str| INFORM_KEYS.contains(&k) || INFORM_TABLE_KEYS.iter().any(|(t, f)| *t == k || *f == k);
+        let mut read: Vec<&str> = CAP_KEYS.to_vec();
+        for src in sources {
+            // Not the tests: their own patterns would match.
+            let src = src.split("#[cfg(test)]").next().unwrap();
+            for (at, _) in src.match_indices("inform_str(\"") {
+                let rest = &src[at + "inform_str(\"".len()..];
+                read.push(&rest[..rest.find('"').unwrap()]);
+            }
+            // `ctx.inform`, also split over lines (`ctx\n    .inform`).
+            for (at, _) in src.match_indices(".inform") {
+                let rest = &src[at + ".inform".len()..];
+                if !src[..at].trim_end().ends_with("ctx") || rest.starts_with(|c: char| c.is_alphanumeric() || c == '_') {
+                    continue;
+                }
+                // Up to the end of the statement, or of an `if` condition.
+                let statement = &rest[..rest.find([';', '{']).unwrap_or(rest.len())];
+                read.extend(statement.split('"').skip(1).step_by(2));
+            }
+        }
+        assert!(read.len() > 10, "the patterns still find the reads: {read:?}");
+        for key in read {
+            assert!(known(key), "`{key}` is read from the inform but missing from INFORM_KEYS / INFORM_TABLE_KEYS");
+        }
+        let inputs = inform_inputs(&json!({ "fw_caps": 1, "uptime": 5, "vap_table": [{ "name": "ath0", "tx_bytes": 9 }] }));
+        assert_eq!((inputs["fw_caps"].as_i64(), inputs.get("uptime"), &inputs["vap_table"]), (Some(1), None, &json!(["ath0"])));
     }
 }

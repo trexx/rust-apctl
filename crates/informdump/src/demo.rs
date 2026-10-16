@@ -159,12 +159,12 @@ fn bssid(ap: &Ap, radio: &str, vap: u8) -> String {
     b[0] |= 0x02;
     b[3] = b[3].wrapping_add(if radio == "na" { 0x20 } else { 0x10 });
     b[5] = b[5].wrapping_add(vap * 8);
-    b.iter().map(|x| format!("{x:02x}")).collect::<Vec<_>>().join(":")
+    Mac(b).to_string()
 }
 
 fn hex_key(seed: &str, bytes: usize) -> String {
     let mut r = Rng(seed.bytes().fold(0xcbf2_9ce4_8422_2325u64, |h, b| (h ^ b as u64).wrapping_mul(0x100_0000_01b3)));
-    (0..bytes).map(|_| format!("{:02x}", r.next() as u8)).collect()
+    hex::encode((0..bytes).map(|_| r.next() as u8).collect::<Vec<u8>>())
 }
 
 fn authkey(ap: &Ap) -> [u8; 16] {
@@ -721,11 +721,7 @@ mod tests {
 
     #[test]
     fn capture_decodes_with_the_state_keys() {
-        let state = state().unwrap();
-        let path = std::env::temp_dir().join(format!("demo-state-{}.json", std::process::id()));
-        std::fs::write(&path, state.to_string()).unwrap();
-        let keys = wire::keys::KeyStore::load(path.to_str().unwrap()).unwrap();
-        std::fs::remove_file(&path).ok();
+        let keys = wire::keys::KeyStore::from_value(&state().unwrap());
         let mut buf = Vec::new();
         run(0.5, false, &mut buf).unwrap();
         let mut pairer = wire::exchange::Pairer::default();

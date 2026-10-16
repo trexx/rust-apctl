@@ -4,7 +4,8 @@
 //! (tolerating duplicates, which `tcpdump -i any` produces, and reordering),
 //! then HTTP/1.1 requests and responses are cut out of each byte stream.
 
-use std::collections::HashMap;
+use std::collections::btree_map::Entry;
+use std::collections::{BTreeMap, HashMap};
 use std::io::Read;
 use std::net::{IpAddr, SocketAddr};
 
@@ -23,8 +24,10 @@ pub struct ConnId {
 
 #[derive(Debug)]
 pub enum HttpEvent {
-    Request { conn: ConnId, ts: Micros, method: String, path: String, headers: Vec<(String, String)>, body: Vec<u8> },
-    Response { conn: ConnId, ts: Micros, status: u16, headers: Vec<(String, String)>, body: Vec<u8> },
+    /// A request: `inform` for a POST to `/inform`. `forwarded_for` is its
+    /// X-Forwarded-For header, the only header anything reads.
+    Request { conn: ConnId, ts: Micros, inform: bool, forwarded_for: Option<String>, body: Vec<u8> },
+    Response { conn: ConnId, ts: Micros, status: u16, body: Vec<u8> },
     /// A UDP datagram to one of the watched UDP ports (e.g. AP syslog on 5514).
     Datagram { ts: Micros, src: SocketAddr, dst: SocketAddr, payload: Vec<u8> },
 }
@@ -206,12 +209,8 @@ impl Tracker {
 
         while let Some(msg) = half.take_http(to_server) {
             on_event(match msg {
-                Parsed::Request { method, path, headers, body } => {
-                    HttpEvent::Request { conn: conn_id, ts, method, path, headers, body }
-                }
-                Parsed::Response { status, headers, body } => {
-                    HttpEvent::Response { conn: conn_id, ts, status, headers, body }
-                }
+                Parsed::Request { inform, forwarded_for, body } => HttpEvent::Request { conn: conn_id, ts, inform, forwarded_for, body },
+                Parsed::Response { status, body } => HttpEvent::Response { conn: conn_id, ts, status, body },
             });
         }
         // Both sides closed and nothing is missing: release the buffers. The
@@ -238,8 +237,12 @@ impl Tracker {
 #[derive(Default)]
 struct HalfStream {
     next_seq: Option<u32>,
-    /// Segments that arrived ahead of `next_seq`, and their total size.
-    pending: Vec<(u32, Vec<u8>)>,
+    /// Where `next_seq` lies in the stream, counted in bytes from where tracking
+    /// started: unlike sequence numbers it does not wrap, so it can order `pending`.
+    pos: i64,
+    /// Segments that arrived ahead of `next_seq`, by stream position (one per
+    /// position: a duplicate is kept once), and their total size.
+    pending: BTreeMap<i64, Vec<u8>>,
     pending_bytes: usize,
     /// Since when the stream has been waiting for the bytes before `pending`.
     gap_since: Option<Micros>,
@@ -262,25 +265,30 @@ const MAX_BUFFER: usize = 8 << 20;
 impl HalfStream {
     fn segment(&mut self, ts: Micros, seq: u32, syn: bool, payload: &[u8]) {
         if syn {
-            self.next_seq = Some(seq.wrapping_add(1));
-            self.pending.clear();
-            self.pending_bytes = 0;
-            self.gap_since = None;
-            self.buf.clear();
-            self.fin = false;
+            *self = HalfStream { next_seq: Some(seq.wrapping_add(1)), ..HalfStream::default() };
             return;
         }
         if payload.is_empty() {
             return;
         }
         let next = *self.next_seq.get_or_insert(seq);
-        let offset = seq.wrapping_sub(next) as i32;
-        if offset > 0 {
-            self.pending_bytes += payload.len();
-            self.pending.push((seq, payload.to_vec()));
+        let at = self.pos + i64::from(seq.wrapping_sub(next) as i32);
+        if at > self.pos {
+            match self.pending.entry(at) {
+                Entry::Vacant(e) => {
+                    self.pending_bytes += payload.len();
+                    e.insert(payload.to_vec());
+                }
+                // A copy (`-i any` captures each segment twice), or a resend that carries more.
+                Entry::Occupied(mut e) if e.get().len() < payload.len() => {
+                    self.pending_bytes += payload.len() - e.get().len();
+                    e.insert(payload.to_vec());
+                }
+                Entry::Occupied(_) => {}
+            }
             self.gap_since.get_or_insert(ts);
         } else {
-            self.append(seq, payload);
+            self.append(at, payload);
             self.apply_pending(ts);
         }
         while self.pending.len() > MAX_PENDING
@@ -294,12 +302,12 @@ impl HalfStream {
     /// Applies the queued segments that are now contiguous.
     fn apply_pending(&mut self, ts: Micros) {
         let mut progress = false;
-        loop {
-            let next = self.next_seq.unwrap();
-            let Some(i) = self.pending.iter().position(|(s, _)| s.wrapping_sub(next) as i32 <= 0) else { break };
-            let (s, p) = self.pending.swap_remove(i);
+        while let Some(e) = self.pending.first_entry()
+            && *e.key() <= self.pos
+        {
+            let (at, p) = e.remove_entry();
             self.pending_bytes -= p.len();
-            self.append(s, &p);
+            self.append(at, &p);
             progress = true;
         }
         if self.pending.is_empty() {
@@ -313,13 +321,13 @@ impl HalfStream {
     /// The message they belonged to is lost, so the partial one in `buf` goes too;
     /// `take_http` then resynchronises on the next message start.
     fn skip_gap(&mut self, ts: Micros) {
-        let next = self.next_seq.unwrap_or(0);
-        let Some(&(lowest, _)) = self.pending.iter().min_by_key(|(s, _)| s.wrapping_sub(next)) else {
+        let Some(&lowest) = self.pending.keys().next() else {
             self.gap_since = None;
             return;
         };
         self.buf.clear();
-        self.next_seq = Some(lowest);
+        self.next_seq = self.next_seq.map(|next| next.wrapping_add((lowest - self.pos) as u32));
+        self.pos = lowest;
         self.apply_pending(ts);
     }
 
@@ -331,15 +339,15 @@ impl HalfStream {
     /// Frees the buffers but keeps `next_seq`.
     fn release(&mut self) {
         self.buf = Vec::new();
-        self.pending = Vec::new();
+        self.pending = BTreeMap::new();
         self.pending_bytes = 0;
         self.gap_since = None;
     }
 
-    /// Appends the part of a segment that lies at or beyond `next_seq` (skips retransmitted bytes).
-    fn append(&mut self, seq: u32, payload: &[u8]) {
-        let next = self.next_seq.unwrap();
-        let skip = next.wrapping_sub(seq) as usize;
+    /// Appends the part of a segment starting at stream position `at` (at or before
+    /// `pos`) that lies beyond `pos`: retransmitted bytes are skipped.
+    fn append(&mut self, at: i64, payload: &[u8]) {
+        let skip = (self.pos - at) as usize;
         if skip >= payload.len() {
             return;
         }
@@ -348,12 +356,13 @@ impl HalfStream {
             self.buf.clear();
         }
         self.buf.extend_from_slice(fresh);
-        self.next_seq = Some(next.wrapping_add(fresh.len() as u32));
+        self.pos += fresh.len() as i64;
+        self.next_seq = self.next_seq.map(|next| next.wrapping_add(fresh.len() as u32));
     }
 
     fn take_http(&mut self, request: bool) -> Option<Parsed> {
         loop {
-            match parse_http(&self.buf, request) {
+            match parse_http(&self.buf, request, self.closed()) {
                 ParseResult::Complete(msg, used) => {
                     self.buf.drain(..used);
                     return Some(msg);
@@ -379,8 +388,8 @@ impl HalfStream {
 
 #[derive(Debug)]
 enum Parsed {
-    Request { method: String, path: String, headers: Vec<(String, String)>, body: Vec<u8> },
-    Response { status: u16, headers: Vec<(String, String)>, body: Vec<u8> },
+    Request { inform: bool, forwarded_for: Option<String>, body: Vec<u8> },
+    Response { status: u16, body: Vec<u8> },
 }
 
 enum ParseResult {
@@ -389,24 +398,29 @@ enum ParseResult {
     Garbage,
 }
 
-fn parse_http(buf: &[u8], request: bool) -> ParseResult {
+/// Cuts the first message out of `buf`. `closed`: its sender closed the stream with
+/// every byte received, which is what ends a response that has no length.
+fn parse_http(buf: &[u8], request: bool, closed: bool) -> ParseResult {
     if buf.is_empty() {
         return ParseResult::Partial;
     }
     // Until the whole message is there this runs again on every segment, so nothing
     // is copied before it is complete.
     let mut storage = [httparse::EMPTY_HEADER; 64];
-    let (head_len, headers, start): (usize, &[httparse::Header<'_>], _) = if request {
+    let (head_len, headers, inform, status): (usize, &[httparse::Header<'_>], _, _) = if request {
         let mut req = httparse::Request::new(&mut storage);
         match req.parse(buf) {
-            Ok(httparse::Status::Complete(n)) => (n, req.headers, (req.method.unwrap_or(""), req.path.unwrap_or(""), 0)),
+            Ok(httparse::Status::Complete(n)) => {
+                let inform = req.method == Some("POST") && req.path.is_some_and(|p| p.starts_with("/inform"));
+                (n, req.headers, inform, 0)
+            }
             Ok(httparse::Status::Partial) => return ParseResult::Partial,
             Err(_) => return ParseResult::Garbage,
         }
     } else {
         let mut resp = httparse::Response::new(&mut storage);
         match resp.parse(buf) {
-            Ok(httparse::Status::Complete(n)) => (n, resp.headers, ("", "", resp.code.unwrap_or(0))),
+            Ok(httparse::Status::Complete(n)) => (n, resp.headers, false, resp.code.unwrap_or(0)),
             Ok(httparse::Status::Partial) => return ParseResult::Partial,
             Err(_) => return ParseResult::Garbage,
         }
@@ -426,19 +440,28 @@ fn parse_http(buf: &[u8], request: bool) -> ParseResult {
             Chunked::Garbage => return ParseResult::Garbage,
         }
     } else {
-        let len = header("content-length").and_then(|v| std::str::from_utf8(v).ok()?.trim().parse::<usize>().ok()).unwrap_or(0);
+        let len = match header("content-length") {
+            Some(v) => match std::str::from_utf8(v).ok().and_then(|v| v.trim().parse::<usize>().ok()) {
+                Some(len) => len,
+                None => return ParseResult::Garbage,
+            },
+            // No length: a request has no body, nor has a response that never carries
+            // one; any other response runs until the connection closes.
+            None if request || status / 100 == 1 || status == 204 || status == 304 => 0,
+            None if closed => rest.len(),
+            None => return ParseResult::Partial,
+        };
         if rest.len() < len {
             return ParseResult::Partial;
         }
         (rest[..len].to_vec(), len)
     };
 
-    let headers = headers.iter().map(|h| (h.name.to_string(), String::from_utf8_lossy(h.value).into_owned())).collect();
-    let (method, path, status) = start;
     let msg = if request {
-        Parsed::Request { method: method.to_string(), path: path.to_string(), headers, body }
+        let forwarded_for = header("x-forwarded-for").map(|v| String::from_utf8_lossy(v).into_owned());
+        Parsed::Request { inform, forwarded_for, body }
     } else {
-        Parsed::Response { status, headers, body }
+        Parsed::Response { status, body }
     };
     ParseResult::Complete(msg, head_len + body_len)
 }
@@ -517,6 +540,15 @@ mod tests {
         h.fin = true;
         h.segment(0, 9000, true, b"");
         assert!(!h.closed() && h.buf.is_empty());
+        // Sequence numbers that wrap around, out of order.
+        let mut h = HalfStream::default();
+        h.segment(0, u32::MAX - 4, true, b"");
+        h.segment(0, 2, false, b"cd");
+        h.segment(0, 1, false, b"b");
+        h.segment(0, u32::MAX - 3, false, b"aaaa");
+        assert_eq!(h.buf, b"aaaa");
+        h.segment(0, 0, false, b"_");
+        assert_eq!((&h.buf[..], h.pending.len(), h.next_seq), (&b"aaaa_bcd"[..], 0, Some(4)));
     }
 
     #[test]
@@ -532,7 +564,7 @@ mod tests {
         assert!(h.take_http(true).is_none());
         // Still waiting while a retransmission may come ...
         h.segment(5_000_000, at, false, &second);
-        assert_eq!(h.pending_bytes, 2 * second.len());
+        assert_eq!(h.pending_bytes, second.len(), "the copy is queued once");
         // ... then gives up on it and carries on with the second message.
         h.segment(12_000_000, at, false, &second);
         assert!(matches!(h.take_http(true), Some(Parsed::Request { body, .. }) if body == b"next"));
@@ -559,8 +591,8 @@ mod tests {
     fn parses_content_length_and_chunked_messages() {
         let mut h = HalfStream { buf: b"POST /inform HTTP/1.1\r\nContent-Length: 3\r\n\r\nabcPOST /inform HTTP/1.1\r\nContent-Le".to_vec(), ..Default::default() };
         match h.take_http(true) {
-            Some(Parsed::Request { path, body, .. }) => {
-                assert_eq!(path, "/inform");
+            Some(Parsed::Request { inform, body, .. }) => {
+                assert!(inform);
                 assert_eq!(body, b"abc");
             }
             other => panic!("{other:?}"),
@@ -615,6 +647,26 @@ mod tests {
     }
 
     #[test]
+    fn messages_without_a_usable_length() {
+        // An unreadable Content-Length is skipped to the next message, not read as empty.
+        let mut h = HalfStream { buf: b"POST /inform HTTP/1.1\r\nContent-Length: x1\r\n\r\nabcPOST /inform HTTP/1.1\r\nContent-Length: 1\r\nX-Forwarded-For: 10.0.0.9\r\n\r\nz".to_vec(), ..Default::default() };
+        match h.take_http(true) {
+            Some(Parsed::Request { inform: true, forwarded_for, body }) => assert_eq!((forwarded_for.as_deref(), &body[..]), (Some("10.0.0.9"), &b"z"[..])),
+            other => panic!("{other:?}"),
+        }
+        // A GET without a length has no body, and is not an inform.
+        let mut h = HalfStream { buf: b"GET /status HTTP/1.1\r\n\r\n".to_vec(), ..Default::default() };
+        assert!(matches!(h.take_http(true), Some(Parsed::Request { inform: false, body, .. }) if body.is_empty()));
+        // A response without one runs until the connection closes.
+        let mut h = HalfStream { buf: b"HTTP/1.0 200 OK\r\n\r\nall of it".to_vec(), ..Default::default() };
+        assert!(h.take_http(false).is_none());
+        h.fin = true;
+        assert!(matches!(h.take_http(false), Some(Parsed::Response { status: 200, body }) if body == b"all of it"));
+        let mut h = HalfStream { buf: b"HTTP/1.1 204 No Content\r\n\r\n".to_vec(), ..Default::default() };
+        assert!(matches!(h.take_http(false), Some(Parsed::Response { status: 204, body }) if body.is_empty()));
+    }
+
+    #[test]
     fn resynchronises_after_starting_mid_message() {
         let mut h = HalfStream { buf: b"tail of an old body\x00\x01POST /inform HTTP/1.1\r\nContent-Length: 1\r\n\r\nx".to_vec(), ..Default::default() };
         assert!(matches!(h.take_http(true), Some(Parsed::Request { .. })));
@@ -629,6 +681,7 @@ pub mod sample {
     use std::path::PathBuf;
 
     use etherparse::PacketBuilder;
+    use serde_json::Value;
 
     use super::Micros;
 
@@ -646,6 +699,39 @@ pub mod sample {
             return None;
         }
         Some(dir)
+    }
+
+    /// A JSON file of the capture fixtures (a decoded inform or reply, the manifest).
+    pub fn load(file: &str) -> Value {
+        let dir = fixtures().expect("capture fixtures");
+        let text = std::fs::read_to_string(dir.join(file)).unwrap_or_else(|e| panic!("{file}: {e}"));
+        serde_json::from_str(&text).unwrap_or_else(|e| panic!("{file}: {e}"))
+    }
+
+    /// The fixtures' `manifest.json`: the capture session's steps, each with the pushes
+    /// it caused and, after the baselines, what each push changed (`expect`).
+    pub fn manifest() -> Value {
+        load("manifest.json")
+    }
+
+    /// How many pushes in the manifest carry an `expect` (all but the two baselines).
+    pub const EXPECTED_PUSHES: usize = 22;
+
+    /// Checks a diff against a manifest push's `expect`: either `counts` ([added,
+    /// removed, changed]) or the keys `added`, `removed` and `changed`.
+    pub fn check_expectation(ctx: &str, expect: &Value, d: &crate::cfgdiff::Diff) {
+        if let Some(counts) = expect.get("counts") {
+            let want: Vec<usize> = counts.as_array().unwrap().iter().map(|n| n.as_u64().unwrap() as usize).collect();
+            assert_eq!(d.counts().to_vec(), want, "{ctx}: [added, removed, changed]");
+            return;
+        }
+        let list = |name: &str| -> Vec<&str> { expect.get(name).and_then(Value::as_array).map(|a| a.iter().map(|s| s.as_str().unwrap()).collect()).unwrap_or_default() };
+        let changed: Vec<&str> = d.changed.iter().map(|(k, ..)| *k).collect();
+        let added: Vec<&str> = d.added.iter().map(|(k, _)| *k).collect();
+        let removed: Vec<&str> = d.removed.iter().map(|(k, _)| *k).collect();
+        assert_eq!(changed, list("changed"), "{ctx}: changed keys");
+        assert_eq!(added, list("added"), "{ctx}: added keys");
+        assert_eq!(removed, list("removed"), "{ctx}: removed keys");
     }
 
     /// The header of a legacy pcap (microsecond timestamps) of Ethernet frames.

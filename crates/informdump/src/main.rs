@@ -97,6 +97,9 @@ enum Cmd {
         /// Seconds to wait between informs (0: as fast as the controller answers).
         #[arg(long, default_value = "0")]
         every: f64,
+        /// Server ports carrying inform traffic in the capture.
+        #[arg(long = "port", default_value = "8080")]
+        ports: Vec<u16>,
     },
     /// Write a made-up site's capture (three APs, their clients, syslog) as pcap to
     /// stdout, for demos and screenshots: `apctl serve --keys <demo-state output>
@@ -171,7 +174,9 @@ pub fn random_iv() -> [u8; 16] {
     iv
 }
 
-/// Writes a file only its owner can read (mode 0600): it holds secrets.
+/// Writes a file only its owner can read (mode 0600): it holds secrets. A file that
+/// was already there is made private too before anything is written to it (the mode
+/// given when opening only applies to a new file).
 pub fn write_private(path: &Path, data: &[u8]) -> Result<()> {
     let mut opts = std::fs::OpenOptions::new();
     opts.write(true).create(true).truncate(true);
@@ -181,11 +186,18 @@ pub fn write_private(path: &Path, data: &[u8]) -> Result<()> {
         opts.mode(0o600);
     }
     let mut f = opts.open(path).with_context(|| format!("creating {}", path.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        f.set_permissions(std::fs::Permissions::from_mode(0o600)).with_context(|| format!("making {} private", path.display()))?;
+    }
     f.write_all(data)?;
     Ok(())
 }
 
-/// Creates a directory (and its parents) only its owner can enter (mode 0700).
+/// Creates a directory (and its parents) only its owner can enter (mode 0700). One
+/// that is already there keeps its mode (it may be a shared one, such as /tmp): the
+/// files written into it are private themselves.
 pub fn create_private_dir(dir: &Path) -> Result<()> {
     let mut builder = std::fs::DirBuilder::new();
     builder.recursive(true);
@@ -204,7 +216,7 @@ fn main() -> Result<()> {
             let mut store = load_keys(keys.as_deref())?;
             if let Some(k) = key {
                 let mac = inform::Header::parse(&body)?.mac;
-                store.insert(&mac.to_string(), &k)?;
+                store.insert_for(mac, &k)?;
             }
             let d = wire::decode::decode(&body, &store, None)?;
             eprintln!("{:#?}\nkey used: {:?}", d.header, d.key);
@@ -218,7 +230,7 @@ fn main() -> Result<()> {
             println!("{}", serde_json::to_string_pretty(&demo::state()?)?);
             Ok(())
         }
-        Cmd::Simulate { pcap, keys, url, limit, every } => simulate::run(&pcap, &load_keys(Some(&keys))?, &url, limit, every),
+        Cmd::Simulate { pcap, keys, url, limit, every, ports } => simulate::run(&pcap, &ports, &load_keys(Some(&keys))?, &url, limit, every),
         Cmd::Sanitize { input, output, domains, devices, files } => {
             sanitize::run(&input, &output, &files, domains, &devices)
         }
@@ -231,5 +243,22 @@ fn main() -> Result<()> {
         Cmd::Import { .. } => anyhow::bail!(
             "this informdump was built without MongoDB support; rebuild it with `cargo build --release -p informdump --features mongo`"
         ),
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn an_existing_file_is_made_private() {
+        let path = std::env::temp_dir().join(format!("informdump-private-{}", std::process::id()));
+        std::fs::write(&path, "old").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        super::write_private(&path, b"secret").unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        let text = std::fs::read_to_string(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+        assert_eq!((mode, text.as_str()), (0o600, "secret"));
     }
 }

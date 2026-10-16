@@ -1,7 +1,10 @@
 //! Diffs `system_cfg` / `mgmt_cfg` blobs, which are newline-separated `key=value` lines.
 
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::fmt::Write;
+
+use serde_json::{Value, json};
 
 /// The values of each key, in order (a key can repeat), borrowed from `cfg`.
 fn parse(cfg: &str) -> BTreeMap<&str, Vec<&str>> {
@@ -17,22 +20,36 @@ fn parse(cfg: &str) -> BTreeMap<&str, Vec<&str>> {
     map
 }
 
+/// What changed between two configs, borrowed from them. A key's value is its line's
+/// value, or the values of a repeated key joined with ` | `.
 #[derive(Debug, Default, PartialEq)]
-pub struct Diff {
-    pub added: Vec<(String, String)>,
-    pub removed: Vec<(String, String)>,
-    pub changed: Vec<(String, String, String)>,
+pub struct Diff<'a> {
+    pub added: Vec<(&'a str, Cow<'a, str>)>,
+    pub removed: Vec<(&'a str, Cow<'a, str>)>,
+    pub changed: Vec<(&'a str, Cow<'a, str>, Cow<'a, str>)>,
 }
 
-impl Diff {
+impl Diff<'_> {
     pub fn is_empty(&self) -> bool {
         self.added.is_empty() && self.removed.is_empty() && self.changed.is_empty()
+    }
+
+    /// How many keys were added, removed and changed.
+    pub fn counts(&self) -> [usize; 3] {
+        [self.added.len(), self.removed.len(), self.changed.len()]
+    }
+
+    /// The counts and the redacted rendering, as config history and previews show a
+    /// change: `{"added", "removed", "changed", "diff"}`.
+    pub fn summary(&self) -> Value {
+        let [added, removed, changed] = self.counts();
+        json!({ "added": added, "removed": removed, "changed": changed, "diff": self.render("", true) })
     }
 
     /// Renders the diff with `+`, `-` and `~` markers, one key per line, sorted by key.
     /// With `redact`, values of secret-looking keys are masked.
     pub fn render(&self, indent: &str, redact: bool) -> String {
-        let show = |k: &str, v: &str| if redact && is_secret(k) { "<redacted>".to_string() } else { v.to_string() };
+        let show = |k: &str, v: &str| (if redact && is_secret(k) { "<redacted>" } else { v }).to_string();
         let mut lines: Vec<(&str, String)> = Vec::new();
         for (k, v) in &self.added {
             lines.push((k, format!("{indent}+ {k}={}", show(k, v))));
@@ -89,20 +106,20 @@ pub fn redact(cfg: &str) -> String {
     out
 }
 
-pub fn diff(old: &str, new: &str) -> Diff {
+pub fn diff<'a>(old: &'a str, new: &'a str) -> Diff<'a> {
     let (old, new) = (parse(old), parse(new));
     let mut d = Diff::default();
-    let join = |v: &Vec<&str>| v.join(" | ");
-    for (k, nv) in &new {
+    let join = |v: &[&'a str]| -> Cow<'a, str> { if let [one] = v { Cow::Borrowed(*one) } else { Cow::Owned(v.join(" | ")) } };
+    for (&k, nv) in &new {
         match old.get(k) {
-            None => d.added.push((k.to_string(), join(nv))),
-            Some(ov) if ov != nv => d.changed.push((k.to_string(), join(ov), join(nv))),
+            None => d.added.push((k, join(nv))),
+            Some(ov) if ov != nv => d.changed.push((k, join(ov), join(nv))),
             _ => {}
         }
     }
-    for (k, ov) in &old {
+    for (&k, ov) in &old {
         if !new.contains_key(k) {
-            d.removed.push((k.to_string(), join(ov)));
+            d.removed.push((k, join(ov)));
         }
     }
     d
@@ -117,10 +134,15 @@ mod tests {
         let old = "aaa.1.ssid=Home\nwireless.1.security=wpa2\nradio.1.channel=36\n";
         let new = "aaa.1.ssid=Home\nwireless.1.security=wpa3\nwireless.2.ssid=Test\n";
         let d = diff(old, new);
-        assert_eq!(d.added, vec![("wireless.2.ssid".into(), "Test".into())]);
-        assert_eq!(d.removed, vec![("radio.1.channel".into(), "36".into())]);
-        assert_eq!(d.changed, vec![("wireless.1.security".into(), "wpa2".into(), "wpa3".into())]);
+        assert_eq!(d.added, vec![("wireless.2.ssid", "Test".into())]);
+        assert_eq!(d.removed, vec![("radio.1.channel", "36".into())]);
+        assert_eq!(d.changed, vec![("wireless.1.security", "wpa2".into(), "wpa3".into())]);
         assert!(diff(old, old).is_empty());
+        assert!(matches!(d.added[0].1, Cow::Borrowed(_)), "single values are borrowed");
+        let repeated = diff("a=1\n", "a=1\na=2\n");
+        assert_eq!(repeated.changed, vec![("a", "1".into(), Cow::Owned::<str>("1 | 2".into()))]);
+        assert_eq!(d.counts(), [1, 1, 1]);
+        assert_eq!(diff("x.psk=a", "x.psk=b").summary(), serde_json::json!({ "added": 0, "removed": 0, "changed": 1, "diff": "~ x.psk: <redacted> -> <redacted>\n" }));
         let rendered = d.render("", true);
         assert!(rendered.starts_with("- radio.1.channel=36\n"));
         let secret = diff("aaa.1.wpa.psk=old", "aaa.1.wpa.psk=new").render("", true);
@@ -143,61 +165,34 @@ mod tests {
 #[cfg(test)]
 mod capture_fixtures {
     use super::*;
-    use crate::capture::sample::fixtures;
-    use serde_json::Value;
+    use crate::capture::sample::{EXPECTED_PUSHES, check_expectation, fixtures, load, manifest};
     use std::collections::HashMap;
-    use std::path::PathBuf;
-
-    fn dir() -> PathBuf {
-        fixtures().expect("capture fixtures")
-    }
 
     fn system_cfg(file: &str) -> String {
-        let v: Value = serde_json::from_str(&std::fs::read_to_string(dir().join(file)).unwrap()).unwrap();
+        let v = load(file);
         assert_eq!(v["_type"], "setparam", "{file}");
         v["system_cfg"].as_str().unwrap().to_string()
-    }
-
-    fn keys(v: &[(String, String)]) -> Vec<&str> {
-        v.iter().map(|(k, _)| k.as_str()).collect()
     }
 
     #[test]
     fn each_labelled_change_produces_the_observed_diff() {
         let Some(_) = fixtures() else { return };
-        let manifest: Value =
-            serde_json::from_str(&std::fs::read_to_string(dir().join("manifest.json")).unwrap()).unwrap();
         let mut previous: HashMap<String, String> = HashMap::new();
         let mut checked = 0;
-        for step in manifest["steps"].as_array().unwrap() {
+        for step in manifest()["steps"].as_array().unwrap() {
             let label = step["label"].as_str().unwrap();
             for push in step["pushes"].as_array().unwrap() {
                 let ap = push["ap"].as_str().unwrap().to_string();
                 let cfg = system_cfg(push["file"].as_str().unwrap());
                 if let Some(expect) = push.get("expect") {
                     let d = diff(previous.get(&ap).expect("baseline first"), &cfg);
-                    let ctx = format!("step {} ({label}) on AP {ap}", step["step"]);
-                    if let Some(c) = expect.get("counts") {
-                        let got = [d.added.len(), d.removed.len(), d.changed.len()];
-                        let want: Vec<usize> = c.as_array().unwrap().iter().map(|n| n.as_u64().unwrap() as usize).collect();
-                        assert_eq!(got.to_vec(), want, "{ctx}: [added, removed, changed]");
-                    } else {
-                        let list = |name: &str| -> Vec<String> {
-                            expect.get(name).and_then(Value::as_array).map(|a| {
-                                a.iter().map(|s| s.as_str().unwrap().to_string()).collect()
-                            }).unwrap_or_default()
-                        };
-                        let changed: Vec<&str> = d.changed.iter().map(|(k, ..)| k.as_str()).collect();
-                        assert_eq!(changed, list("changed"), "{ctx}: changed");
-                        assert_eq!(keys(&d.added), list("added"), "{ctx}: added");
-                        assert_eq!(keys(&d.removed), list("removed"), "{ctx}: removed");
-                    }
+                    check_expectation(&format!("step {} ({label}) on AP {ap}", step["step"]), expect, &d);
                     checked += 1;
                 }
                 previous.insert(ap, cfg);
             }
         }
-        assert_eq!(checked, 22, "every push after the two baselines is checked");
+        assert_eq!(checked, EXPECTED_PUSHES, "every push after the two baselines is checked");
     }
 
     #[test]

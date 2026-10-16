@@ -36,19 +36,46 @@ pub fn as_int(v: &Value) -> Option<i64> {
     }
 }
 
+/// A scalar as it appears in a config line (`9`, `auto`, `true`), borrowed: it is
+/// written straight into the output.
+#[derive(Clone, Copy, Debug)]
+pub enum Text<'a> {
+    /// A string, number or boolean from a document.
+    Value(&'a Value),
+    /// A default.
+    Str(&'a str),
+}
+
+impl Text<'_> {
+    /// Whether this is the string `s` (a number never is).
+    pub fn is(self, s: &str) -> bool {
+        match self {
+            Text::Value(Value::String(v)) => v == s,
+            Text::Str(v) => v == s,
+            Text::Value(_) => false,
+        }
+    }
+}
+
+impl std::fmt::Display for Text<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match *self {
+            Text::Value(Value::String(s)) => f.write_str(s),
+            Text::Str(s) => f.write_str(s),
+            // Numbers and booleans display as in JSON: `9`, `-1.5`, `true`.
+            Text::Value(v) => write!(f, "{v}"),
+        }
+    }
+}
+
 /// A scalar rendered the way it appears in a config line (`9`, `auto`, `true`).
-pub fn text_of(v: &Value, key: &str) -> Option<String> {
+pub fn text_of<'a>(v: &'a Value, key: &str) -> Option<Text<'a>> {
     as_text(v.get(key)?)
 }
 
 /// [`text_of`] for a value at hand (an array element).
-pub fn as_text(v: &Value) -> Option<String> {
-    match v {
-        Value::String(s) => Some(s.clone()),
-        Value::Number(n) => Some(n.to_string()),
-        Value::Bool(b) => Some(b.to_string()),
-        _ => None,
-    }
+pub fn as_text(v: &Value) -> Option<Text<'_>> {
+    matches!(v, Value::String(_) | Value::Number(_) | Value::Bool(_)).then_some(Text::Value(v))
 }
 
 pub fn arr<'a>(v: &'a Value, key: &str) -> &'a [Value] {
@@ -83,4 +110,18 @@ pub fn on_off(b: bool) -> &'static str {
 
 pub fn mac_eq(a: &str, b: &str) -> bool {
     a.eq_ignore_ascii_case(b)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn scalars_read_as_config_text() {
+        let v = json!({ "s": "auto", "n": 9, "f": -1.5, "b": true, "o": {} });
+        let text = |k| text_of(&v, k).map(|t| t.to_string());
+        assert_eq!([text("s"), text("n"), text("f"), text("b"), text("o"), text("x")], [Some("auto".into()), Some("9".into()), Some("-1.5".into()), Some("true".into()), None, None]);
+        assert!(text_of(&v, "s").unwrap().is("auto") && !text_of(&json!({ "n": 6 }), "n").unwrap().is("6") && Text::Str("0").is("0"));
+    }
 }
