@@ -307,9 +307,11 @@ async fn serve(args: ServeArgs) -> Result<()> {
         // The other controller's installation ID, so rendered configs stay identical
         // to what the APs run; a new one only when none was ever seen.
         let reporter: Option<String> = store.read(store::Db::Config, |c| {
-            let cfgs: Vec<String> =
-                c.prepare("SELECT system_cfg FROM device_config")?.query_map([], |r| r.get::<_, Option<String>>(0))?.flatten().flatten().collect();
-            Ok(cfgs.iter().find_map(|cfg| cfg.lines().find_map(|l| l.strip_prefix("unifi.reporterid=")).map(str::to_string)))
+            use rusqlite::OptionalExtension;
+            let cfg: Option<String> = c
+                .query_row("SELECT system_cfg FROM device_config WHERE instr(system_cfg, 'unifi.reporterid=') > 0 LIMIT 1", [], |r| r.get(0))
+                .optional()?;
+            Ok(cfg.and_then(|cfg| cfg.lines().find_map(|l| l.strip_prefix("unifi.reporterid=")).map(str::to_string)))
         })?;
         if let Some(u) = &inform_url {
             ssh::set_inform_url(u.clone());
