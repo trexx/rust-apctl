@@ -942,7 +942,12 @@ impl Engine {
     /// Stores an AP's section numbering in the settings, so later renders keep it.
     fn set_config_meta(&self, mac: Mac, meta: Value) {
         // Copied and serialised without the lock, as in `edit_state`.
-        let Some(state) = self.live.read().unwrap().state.clone() else { return };
+        let Some((state, imported_at)) = ({
+            let live = self.live.read().unwrap();
+            live.state.clone().zip(live.state_imported_at)
+        }) else {
+            return;
+        };
         let mac_s = mac.to_string();
         let same_mac = |m: &Value| m["mac"].as_str().is_some_and(|x| x.eq_ignore_ascii_case(&mac_s));
         let current = state["config_meta"].as_array().and_then(|a| a.iter().find(|m| same_mac(m)));
@@ -956,22 +961,27 @@ impl Engine {
         let list = next["config_meta"].as_array_mut().unwrap();
         list.retain(|m| !same_mac(m));
         list.push(meta);
-        self.writer.exec(Db::Config, "UPDATE controller_state SET json = ?1 WHERE id = 1", vec![Sql::Text(next.to_string())]);
-        self.live.write().unwrap().state = Some(Arc::new(next));
+        self.store_state(next, imported_at);
     }
 
-    fn set_state(&mut self, ts: Ts, state: Value) {
+    /// Stores the settings, then swaps them into the live view. Serialised
+    /// before the lock is taken.
+    fn store_state(&self, state: Value, imported_at: Ts) {
         self.writer.exec(
             Db::Config,
             "INSERT OR REPLACE INTO controller_state (id, json, imported_at) VALUES (1, ?1, ?2)",
-            vec![Sql::Text(state.to_string()), Sql::Integer(ts)],
+            vec![Sql::Text(state.to_string()), Sql::Integer(imported_at)],
         );
-        let summary = crate::dryrun::summarize_state(&state);
-        // The new settings may hold the syslog key of an AP given up on.
-        self.syslog_unknown.clear();
         let mut live = self.live.write().unwrap();
         live.state = Some(Arc::new(state));
-        live.state_imported_at = Some(ts);
+        live.state_imported_at = Some(imported_at);
+    }
+
+    fn set_state(&mut self, ts: Ts, state: Value) {
+        let summary = crate::dryrun::summarize_state(&state);
+        self.store_state(state, ts);
+        // The new settings may hold the syslog key of an AP given up on.
+        self.syslog_unknown.clear();
         self.emit(ev(ts, EventKind::SettingsImported, None, None, summary));
     }
 
@@ -985,12 +995,7 @@ impl Engine {
         };
         let mut state = current.as_deref().cloned().ok_or("no settings imported yet")?;
         let what = edit(&mut state)?;
-        self.writer.exec(
-            Db::Config,
-            "INSERT OR REPLACE INTO controller_state (id, json, imported_at) VALUES (1, ?1, ?2)",
-            vec![Sql::Text(state.to_string()), Sql::Integer(imported_at)],
-        );
-        self.live.write().unwrap().state = Some(Arc::new(state));
+        self.store_state(state, imported_at);
         self.syslog_unknown.clear();
         self.emit(ev(ts, EventKind::SettingsChanged, None, None, json!({ "what": what })));
         // The APs pick the change up now rather than at their next interval.
