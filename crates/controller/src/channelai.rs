@@ -26,7 +26,7 @@ use crate::api::{ApiError, AppState};
 use crate::engine::{Event, Input, Live};
 use crate::model::Ts;
 use crate::adopt::{device_doc, device_doc_mut};
-use crate::settings::{band_channels, country, device_macs, inform_radio, legal_channels, num, setting, setting_mut, uplink};
+use crate::settings::{band_channels, country, device_macs, inform_radio, is_legal, legal_channels, num, setting, setting_mut, uplink};
 use crate::store;
 
 /// Bands Channel AI handles (6 GHz needs hardware apctl has not seen).
@@ -209,7 +209,7 @@ pub fn set_channels(state: &mut Value, changes: &[(String, String, i64)]) -> Res
         let d = device_doc_mut(state, &m).expect("found above");
         let r = d["radio_table"].as_array_mut().and_then(|t| t.iter_mut().find(|r| r["radio"].as_str() == Some(band))).ok_or_else(|| format!("{mac} has no {band} radio"))?;
         let width = num(&r["ht"]).unwrap_or(20);
-        if legal_channels(c, band, width, outdoor).is_some_and(|l| !l.contains(ch)) {
+        if is_legal(c, band, width, outdoor, *ch) == Some(false) {
             return Err(format!("channel {ch} is not allowed at {width} MHz here"));
         }
         if allowed_here.is_some_and(|a| !a.contains(ch)) {

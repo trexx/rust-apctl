@@ -273,9 +273,9 @@ impl Active {
                 if d["name"].is_null() {
                     d["name"] = p["hostname"].clone();
                 }
-                Ok(())
+                Ok(format!("radio settings for new AP {mac}"))
             });
-            let _ = self.engine.blocking_send(Input::EditState { ts, what: format!("radio settings for new AP {mac}"), edit, done: tx });
+            let _ = self.engine.blocking_send(Input::EditState { ts, edit, done: tx });
             return noop(interval(n_devices));
         }
         let reported = payload["cfgversion"].as_str().unwrap_or("").to_string();
@@ -311,8 +311,9 @@ impl Active {
                 let last_push = self.live.read().unwrap().last_config.get(&mac).cloned();
                 let candidate = last_push.map(|p| (p, false)).or_else(|| self.stored_pushes.get(&mac).cloned().map(|p| (p, true)));
                 candidate.is_some_and(|(p, redacted)| {
-                    let ours = (with_cfgversion(&out.rendered.mgmt_cfg, &reported), out.rendered.system_cfg.clone());
-                    p.cfgversion.as_deref() == Some(reported.as_str()) && crate::dryrun::compare(&ours, &p.mgmt_cfg, &p.system_cfg, redacted).matches()
+                    p.cfgversion.as_deref() == Some(reported.as_str())
+                        && crate::dryrun::equivalent(&with_cfgversion(&out.rendered.mgmt_cfg, &reported), &p.mgmt_cfg, redacted)
+                        && crate::dryrun::equivalent(&out.rendered.system_cfg, &p.system_cfg, redacted)
                 })
             };
             let version = if adopt { reported.clone() } else { new_cfgversion() };
@@ -679,7 +680,7 @@ mod tests {
         {
             let mut live = rig.live.write().unwrap();
             let mut state = live.state.as_deref().cloned().unwrap();
-            crate::actions::edit_client(&mut state, "aa:bb:cc:00:00:09", &[("blocked", json!(true))]).unwrap();
+            crate::actions::edit_client(&mut state, "aa:bb:cc:00:00:09", &[("blocked", json!(true))]);
             live.state = Some(Arc::new(state));
         }
         let (_, reply) = inform_as_ap(&rig, &ap_payload(&version), KEY, GCM_ZLIB).await;

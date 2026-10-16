@@ -354,8 +354,8 @@ pub async fn forget(State(s): State<AppState>, headers: HeaderMap, Path(mac): Pa
 /// Removes a forgotten AP from the settings and apctl's records.
 pub async fn finish_forget(engine: &tokio::sync::mpsc::Sender<Input>, mac: Mac, reset: bool) {
     let (tx, rx) = tokio::sync::oneshot::channel();
-    let edit: crate::engine::StateEdit = Box::new(move |state: &mut Value| remove_device(state, &mac).map(|_| ()));
-    let _ = engine.send(Input::EditState { ts: store::now_ts(), what: format!("forgot AP {mac}"), edit, done: tx }).await;
+    let edit: crate::engine::StateEdit = Box::new(move |state: &mut Value| remove_device(state, &mac).map(|_| format!("forgot AP {mac}")));
+    let _ = engine.send(Input::EditState { ts: store::now_ts(), edit, done: tx }).await;
     let _ = rx.await;
     let _ = engine.send(Input::Forget { ts: store::now_ts(), mac }).await;
     let _ = engine.send(Input::Note(Event::device(store::now_ts(), "ap_forgotten", mac, json!({ "reset": reset })))).await;

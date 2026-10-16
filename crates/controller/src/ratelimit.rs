@@ -48,7 +48,8 @@ impl Groups {
         }
         for w in docs(state, "wlanconf") {
             if let Some(name) = w["name"].as_str() {
-                g.ssid.entry(name.to_string()).or_insert_with(|| w["usergroup_id"].as_str().map(str::to_string));
+                // No group (or an empty id, as imports can have) is the Default group.
+                g.ssid.entry(name.to_string()).or_insert_with(|| w["usergroup_id"].as_str().filter(|id| !id.is_empty()).map(str::to_string));
             }
         }
         for u in docs(state, "usergroup") {
@@ -68,11 +69,11 @@ impl Groups {
         if own.is_none() && !before {
             return None;
         }
-        let ssid_group = self.ssid.get(essid).cloned().flatten().or_else(|| self.default.clone());
+        let ssid_group = self.ssid.get(essid).and_then(Option::as_deref).or(self.default.as_deref());
         match own {
-            Some(g) if Some(g) != ssid_group.as_deref() => self.limits.get(g).copied(),
+            Some(g) if Some(g) != ssid_group => self.limits.get(g).copied(),
             // Back to the SSID's limit, but only to undo an earlier command.
-            _ if before => Some(ssid_group.and_then(|g| self.limits.get(&g).copied()).unwrap_or((-1, -1))),
+            _ if before => Some(ssid_group.and_then(|g| self.limits.get(g).copied()).unwrap_or((-1, -1))),
             _ => None,
         }
     }
@@ -203,6 +204,22 @@ mod tests {
         assert_eq!((cmds.len(), cmds[0]["dl_max"].as_i64()), (1, Some(-1)));
         tick(&mut live, &mut sent);
         assert!(sent_to(&mut live, AP1).is_empty());
+    }
+
+    #[test]
+    fn an_ssid_with_an_empty_group_has_the_default_groups_limit() {
+        let mut live = live(Some("slow"));
+        let mut state = (**live.state.as_ref().unwrap()).clone();
+        state["usergroup"][0]["qos_rate_max_down"] = json!(8000);
+        state["wlanconf"][0]["usergroup_id"] = json!("");
+        live.state = Some(std::sync::Arc::new(state.clone()));
+        let mut sent = Limits::default();
+        tick(&mut live, &mut sent);
+        sent_to(&mut live, AP1);
+        state["clients"][0]["usergroup_id"] = Value::Null;
+        live.state = Some(std::sync::Arc::new(state));
+        tick(&mut live, &mut sent);
+        assert_eq!(sent_to(&mut live, AP1)[0]["dl_max"].as_i64(), Some(8000));
     }
 
     #[test]
