@@ -738,17 +738,21 @@ impl Engine {
     ///
     /// The diffs and the dry-run render take a while, so the live view is only
     /// locked to read what they need and then to store the results.
-    fn reply(&mut self, ts: Ts, mac: Mac, p: &Value, dry_run: bool) {
-        let (radios, previous, state, inform) = {
-            let mut live = self.live.write().unwrap();
-            bump(&self.counters.replies);
-            if let (Some(interval), Some(d)) = (p["interval"].as_i64(), live.devices.get_mut(&mac)) {
+    fn reply(&self, ts: Ts, mac: Mac, p: &Value, dry_run: bool) {
+        bump(&self.counters.replies);
+        // Nearly every reply repeats the interval the AP already has.
+        if let Some(interval) = p["interval"].as_i64() {
+            let changed = self.live.read().unwrap().devices.get(&mac).is_some_and(|d| d.interval != interval);
+            if changed && let Some(d) = self.live.write().unwrap().devices.get_mut(&mac) {
                 d.interval = interval;
             }
-            if p["_type"].as_str() != Some("setparam") {
-                return;
-            }
-            bump(&self.counters.config_pushes);
+        }
+        if p["_type"].as_str() != Some("setparam") {
+            return;
+        }
+        bump(&self.counters.config_pushes);
+        let (radios, previous, state, inform) = {
+            let live = self.live.read().unwrap();
             // The last push (unredacted), for the diffs; empty fields if none was seen.
             let previous = live.last_config.get(&mac).cloned().unwrap_or_default();
             let radios = live.devices.get(&mac).map(|d| d.snapshot.radios.clone()).unwrap_or_default();
@@ -840,7 +844,7 @@ impl Engine {
     }
 
     /// Stores an AP's section numbering in the settings, so later renders keep it.
-    fn set_config_meta(&mut self, mac: Mac, meta: Value) {
+    fn set_config_meta(&self, mac: Mac, meta: Value) {
         // Copied and serialised without the lock, as in `edit_state`.
         let Some(state) = self.live.read().unwrap().state.clone() else { return };
         let mac_s = mac.to_string();
@@ -952,7 +956,7 @@ impl Engine {
 
     /// Each rename is its own event (a client's history shows it); the client
     /// list is announced once for the lot.
-    fn set_aliases(&mut self, ts: Ts, entries: Vec<AliasEdit>, only_if_unset: bool) {
+    fn set_aliases(&self, ts: Ts, entries: Vec<AliasEdit>, only_if_unset: bool) {
         let clean = |v: Option<String>| v.map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
         let mut changed = false;
         let mut live = self.live.write().unwrap();
@@ -985,7 +989,7 @@ impl Engine {
         }
     }
 
-    fn notification(&mut self, ts: Ts, p: &Value) {
+    fn notification(&self, ts: Ts, p: &Value) {
         let Some(mac) = p["mac"].as_str().and_then(|m| m.parse::<Mac>().ok()) else { return };
         let mut live = self.live.write().unwrap();
         bump(&self.counters.notifications);
@@ -1002,7 +1006,7 @@ impl Engine {
             Some("event") => {
                 let n = &p["notif_payload"];
                 if n["message_type"].as_str() == Some("STA_ASSOC_TRACKER") {
-                    self.connection_event(&mut live, ts, mac, n);
+                    self.connection_event(&live, ts, mac, n);
                 } else if let Some(kind) = n["event_string"].as_str() {
                     // AP events: radar (DFS), rogue APs, scan completion, process restarts...
                     let k = match kind {
@@ -1044,7 +1048,7 @@ impl Engine {
     /// A client connection-tracking event (`STA_ASSOC_TRACKER`): association,
     /// success (with association, WPA, IP and DNS timings), soft failure,
     /// roam, leave. Durations arrive in microseconds and are stored in ms.
-    fn connection_event(&self, live: &mut Live, ts: Ts, ap: Mac, n: &Value) {
+    fn connection_event(&self, live: &Live, ts: Ts, ap: Mac, n: &Value) {
         let Some(client) = n["mac"].as_str().and_then(|m| m.parse::<Mac>().ok()) else { return };
         let num = |k: &str| n[k].as_str().and_then(|v| v.parse::<f64>().ok()).or_else(|| n[k].as_f64());
         let ms = |k: &str| num(k).map(|us| (us / 1000.0).round() as i64);
@@ -1528,14 +1532,14 @@ pub(crate) fn section_labels(cfg: &str, radios: &[crate::model::RadioSample]) ->
     }
     let mut out = serde_json::Map::new();
     for (k, v) in &kv {
-        for section in ["aaa", "wireless"] {
-            if let Some(n) = k.strip_prefix(&format!("{section}.")).and_then(|r| r.strip_suffix(".ssid")) {
-                let band = kv.get(format!("{section}.{n}.devname").as_str()).and_then(|d| band_of_dev.get(d));
+        for section in ["aaa.", "wireless."] {
+            if let Some(n) = k.strip_prefix(section).and_then(|r| r.strip_suffix(".ssid")) {
+                let band = kv.get(format!("{section}{n}.devname").as_str()).and_then(|d| band_of_dev.get(d));
                 let label = match band {
                     Some(b) => format!("{v} ({b})"),
                     None => v.to_string(),
                 };
-                out.insert(format!("{section}.{n}"), json!(label));
+                out.insert(format!("{section}{n}"), json!(label));
             }
         }
         if let Some(n) = k.strip_prefix("radio.").and_then(|r| r.strip_suffix(".phyname"))
