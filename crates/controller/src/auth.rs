@@ -172,7 +172,7 @@ impl Auth {
         let mut f = self.failures.lock().unwrap();
         // Forget windows that have passed, so the map stays small.
         f.retain(|_, (_, since)| now - *since < FAILURE_WINDOW);
-        let e = f.entry(ip).or_insert((0, now));
+        let e = f.entry(throttled(ip)).or_insert((0, now));
         if e.0 >= MAX_FAILURES {
             return false;
         }
@@ -180,11 +180,21 @@ impl Auth {
         true
     }
 
-    /// A successful login does not count against the address.
-    fn succeeded(&self, ip: IpAddr) {
-        if let Some(e) = self.failures.lock().unwrap().get_mut(&ip) {
+    /// An attempt that does not count against the address: a successful
+    /// login, or one never checked.
+    fn refund(&self, ip: IpAddr) {
+        if let Some(e) = self.failures.lock().unwrap().get_mut(&throttled(ip)) {
             e.0 = e.0.saturating_sub(1);
         }
+    }
+}
+
+/// What login attempts are counted by: the address, or for IPv6 its /64 (one
+/// host usually has a whole /64 to pick addresses from).
+fn throttled(ip: IpAddr) -> IpAddr {
+    match ip.to_canonical() {
+        IpAddr::V6(a) => IpAddr::V6((u128::from(a) & !u128::from(u64::MAX)).into()),
+        v4 => v4,
     }
 }
 
@@ -307,9 +317,18 @@ pub async fn login(
         return json_error(StatusCode::TOO_MANY_REQUESTS, "too many failed attempts, try again in a few minutes");
     }
     // Argon2 is deliberately slow and takes about 19 MiB per check: keep it off
-    // the async workers, and run at most two at a time.
+    // the async workers, and run at most two at a time. A queue kept full (by
+    // many addresses) makes the others wait a few seconds at most, and a login
+    // turned away unchecked does not count against its address.
     static VERIFYING: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(2);
-    let Ok(_permit) = VERIFYING.acquire().await else { return json_error(StatusCode::SERVICE_UNAVAILABLE, "shutting down") };
+    let _permit = match tokio::time::timeout(std::time::Duration::from_secs(5), VERIFYING.acquire()).await {
+        Ok(Ok(p)) => p,
+        Ok(Err(_)) => return json_error(StatusCode::SERVICE_UNAVAILABLE, "shutting down"),
+        Err(_) => {
+            auth.refund(ip);
+            return json_error(StatusCode::SERVICE_UNAVAILABLE, "too many logins at once, try again shortly");
+        }
+    };
     let (user, pass) = (body.username, body.password);
     let check = auth.clone();
     let user2 = user.clone();
@@ -318,7 +337,7 @@ pub async fn login(
         tracing::warn!("failed login for {user:?} from {ip}");
         return json_error(StatusCode::UNAUTHORIZED, "wrong username or password");
     }
-    auth.succeeded(ip);
+    auth.refund(ip);
     match auth.create(&user) {
         Ok(token) => {
             tracing::info!("{user} logged in from {ip}");
@@ -405,6 +424,12 @@ mod tests {
         auth.failures.lock().unwrap().get_mut(&ip).unwrap().1 -= FAILURE_WINDOW;
         assert!(auth.attempt("10.0.0.11".parse().unwrap()));
         assert!(!auth.failures.lock().unwrap().contains_key(&ip));
+        // IPv6 counts by /64: a host cannot step through its own addresses.
+        for i in 0..MAX_FAILURES {
+            assert!(auth.attempt(format!("2001:db8:1:2::{i:x}").parse().unwrap()));
+        }
+        assert!(!auth.attempt("2001:db8:1:2:ffff::1".parse().unwrap()));
+        assert!(auth.attempt("2001:db8:1:3::1".parse().unwrap()));
         std::fs::remove_dir_all(&dir).ok();
     }
 
