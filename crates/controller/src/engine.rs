@@ -1157,11 +1157,8 @@ impl Engine {
         // The live view is read for the VAP alone; the row is built without the lock.
         let vap_info = {
             let live = self.live.read().unwrap();
-            let dev = live.devices.get(&ap);
-            dev.and_then(|d| d.snapshot.vaps.iter().find(|v| v.name.as_deref() == vap.as_deref())).map(|v| {
-                let bw = dev.and_then(|d| d.snapshot.radios.iter().find(|r| Some(&r.radio) == v.radio.as_ref())).and_then(|r| r.bw);
-                (v.essid.clone(), v.radio.clone(), v.channel, bw)
-            })
+            let vap = live.devices.get(&ap).and_then(|d| d.snapshot.vaps.iter().find(|v| v.name.as_deref() == vap.as_deref()));
+            vap.map(|v| (v.essid.clone(), v.radio.clone(), v.channel, v.bw))
         };
         // Channel and width at the time, for the connection log and roaming views.
         let mut detail = n.clone();
