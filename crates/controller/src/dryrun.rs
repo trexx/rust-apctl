@@ -95,8 +95,8 @@ impl Comparison {
 /// between its restarts (they come from unordered sets): the services of an
 /// mDNS filter, a VAP's broadcast-filter MACs, and lock-to-AP MAC entries.
 /// Their values are sorted within each list, keeping the line positions.
-fn normalise_unordered(lines: &[&str]) -> Vec<String> {
-    let mut out: Vec<String> = lines.iter().map(|l| l.to_string()).collect();
+fn normalise_unordered<'a>(lines: &[&'a str]) -> Vec<Cow<'a, str>> {
+    let mut out: Vec<Cow<str>> = lines.iter().map(|l| Cow::Borrowed(*l)).collect();
     let mut groups: std::collections::BTreeMap<String, Vec<usize>> = Default::default();
     let lock2ap: std::collections::HashSet<String> = lines
         .iter()
@@ -117,14 +117,30 @@ fn normalise_unordered(lines: &[&str]) -> Vec<String> {
         }
     }
     for idx in groups.values() {
-        let mut values: Vec<String> = idx.iter().map(|&i| out[i].split_once('=').map_or("", |(_, v)| v).to_string()).collect();
-        values.sort();
+        let mut values: Vec<&str> = idx.iter().map(|&i| lines[i].split_once('=').map_or("", |(_, v)| v)).collect();
+        values.sort_unstable();
         for (&i, v) in idx.iter().zip(values) {
-            let key = out[i].split_once('=').map_or(out[i].clone(), |(k, _)| k.to_string());
-            out[i] = format!("{key}={v}");
+            let (key, old) = lines[i].split_once('=').unwrap_or((lines[i], ""));
+            if old != v {
+                out[i] = Cow::Owned(format!("{key}={v}"));
+            }
         }
     }
     out
+}
+
+/// Line by line the same, or the same once [`normalise_unordered`] sorted the unordered lists.
+fn equivalent_lines(o: &[&str], a: &[&str]) -> bool {
+    o == a || o.len() == a.len() && normalise_unordered(o) == normalise_unordered(a)
+}
+
+/// What [`Comparison::matches`] says of one config, without making the diff.
+pub fn equivalent(ours: &str, actual: &str, redacted: bool) -> bool {
+    if ours == actual {
+        return true;
+    }
+    let (ours, actual): (Cow<str>, Cow<str>) = if redacted { (cfgdiff::redact(ours).into(), cfgdiff::redact(actual).into()) } else { (ours.into(), actual.into()) };
+    equivalent_lines(&lines(&ours), &lines(&actual))
 }
 
 fn lines(s: &str) -> Vec<&str> {
@@ -143,7 +159,7 @@ pub fn compare_field(ours: &str, actual: &str, redacted: bool) -> FieldCompariso
         actual_lines: a.len(),
         identical: o == a,
         same_content: d.is_empty(),
-        equivalent: o == a || normalise_unordered(&o) == normalise_unordered(&a),
+        equivalent: equivalent_lines(&o, &a),
         added: d.added.len(),
         removed: d.removed.len(),
         changed: d.changed.len(),
@@ -211,6 +227,11 @@ mod tests {
         // Against a redacted copy, secret values cannot differ.
         let r = compare_field("a=1\nb=2\naaa.1.wpa.psk=other", &cfgdiff::redact(actual), true);
         assert!(r.identical);
+
+        // The quick check agrees with the full comparison.
+        for (ours, theirs, redacted) in [(zone_cast, cast_zone, false), ("mdns_sd.filter.2.service.1.name=_airplay._tcp.local", cast_zone, false), ("a=1\nb=2\naaa.1.wpa.psk=other", actual, true), ("a=1\nb=3", "a=1\nb=2", false)] {
+            assert_eq!(equivalent(ours, theirs, redacted), compare_field(ours, theirs, redacted).equivalent, "{ours:?}");
+        }
     }
 
     #[test]

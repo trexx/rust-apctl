@@ -305,8 +305,9 @@ impl Active {
                 let last_push = self.live.read().unwrap().last_config.get(&mac).cloned();
                 let candidate = last_push.map(|p| (p, false)).or_else(|| self.stored_pushes.get(&mac).cloned().map(|p| (p, true)));
                 candidate.is_some_and(|(p, redacted)| {
-                    let ours = (with_cfgversion(&out.rendered.mgmt_cfg, &reported), out.rendered.system_cfg.clone());
-                    p.cfgversion.as_deref() == Some(reported.as_str()) && crate::dryrun::compare(&ours, &p.mgmt_cfg, &p.system_cfg, redacted).matches()
+                    p.cfgversion.as_deref() == Some(reported.as_str())
+                        && crate::dryrun::equivalent(&with_cfgversion(&out.rendered.mgmt_cfg, &reported), &p.mgmt_cfg, redacted)
+                        && crate::dryrun::equivalent(&out.rendered.system_cfg, &p.system_cfg, redacted)
                 })
             };
             let version = if adopt { reported.clone() } else { new_cfgversion() };
