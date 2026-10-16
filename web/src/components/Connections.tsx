@@ -3,7 +3,7 @@ import { Link } from "react-router-dom";
 import { useConnections } from "../api";
 import type { ConnAttempt, Roam, TimeSpan, Timings } from "../api";
 import { band, clock } from "../format";
-import { QueryState, Signal } from "./common";
+import { QueryState, Segmented, Signal } from "./common";
 
 const STAGE_NAME = [
   "",
@@ -250,6 +250,11 @@ function ConnectionTable({
   );
 }
 
+const WHICH = [
+  [false, "All"],
+  [true, "Failed only"],
+] as const;
+
 /** Connection attempts across the site, newest first. */
 export function AttemptList({ span }: { span: TimeSpan }) {
   const [failed, setFailed] = useState(false);
@@ -262,20 +267,12 @@ export function AttemptList({ span }: { span: TimeSpan }) {
           from the APs' connection-tracking reports
         </span>
         <span className="spacer" />
-        <div className="segmented" role="group" aria-label="Which attempts">
-          <button
-            className={!failed ? "active" : ""}
-            onClick={() => setFailed(false)}
-          >
-            All
-          </button>
-          <button
-            className={failed ? "active" : ""}
-            onClick={() => setFailed(true)}
-          >
-            Failed only
-          </button>
-        </div>
+        <Segmented
+          label="Which attempts"
+          options={WHICH}
+          value={failed}
+          onChange={setFailed}
+        />
       </div>
       <QueryState q={c}>
         {(data) =>

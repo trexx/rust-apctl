@@ -1,5 +1,9 @@
 import type { TimeSpan } from "../../api";
 import { band, duration, spanLabel } from "../../format";
+import { Segmented } from "../common";
+
+const RADIOS = (["ng", "na"] as const).map((b) => [b, band(b)] as const);
+const BANDS = [["all", "All radios"] as const, ...RADIOS];
 
 export function BandPicker({
   value,
@@ -10,22 +14,13 @@ export function BandPicker({
   onChange: (b: string) => void;
   all?: boolean;
 }) {
-  const bands = [
-    ...(all ? [["all", "All radios"]] : []),
-    ...["ng", "na"].map((b) => [b, band(b)]),
-  ];
   return (
-    <div className="segmented" role="group" aria-label="Band">
-      {bands.map(([v, l]) => (
-        <button
-          key={v}
-          className={value === v ? "active" : ""}
-          onClick={() => onChange(v!)}
-        >
-          {l}
-        </button>
-      ))}
-    </div>
+    <Segmented
+      label="Band"
+      options={all ? BANDS : RADIOS}
+      value={value}
+      onChange={onChange}
+    />
   );
 }
 

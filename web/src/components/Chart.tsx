@@ -13,6 +13,7 @@ import "uplot/dist/uPlot.min.css";
 import { isFixed, spanBounds } from "../api";
 import type { TimeSpan } from "../api";
 import { duration, fromLocalInput, spanLabel, toLocalInput } from "../format";
+import { Segmented, useDismiss, useSetParams } from "./common";
 
 /** The page's time span: charts show exactly this window, gaps included. */
 export const SpanContext = createContext<TimeSpan | null>(null);
@@ -317,6 +318,8 @@ export const RANGES: { label: string; seconds: number }[] = [
   { label: "30d", seconds: 30 * 86400 },
 ];
 
+const RANGE_OPTIONS = RANGES.map((r) => [r.seconds, r.label] as const);
+
 const MAX_AGE = 400 * 86400;
 
 /** The first day of the week in the browser's locale (1 = Monday … 7 = Sunday), Monday where it can't tell. */
@@ -337,7 +340,8 @@ function firstDayOfWeek(): number {
 export function useTimeSpan(
   defaultLast: number,
 ): [TimeSpan, (s: TimeSpan) => void] {
-  const [params, setParams] = useSearchParams();
+  const [params] = useSearchParams();
+  const setUrl = useSetParams();
   const from = Number(params.get("from"));
   const to = Number(params.get("to"));
   const range = Number(params.get("range"));
@@ -351,17 +355,15 @@ export function useTimeSpan(
     [from, to, range, defaultLast],
   );
   const set = (s: TimeSpan) =>
-    setParams((prev) => {
-      const next = new URLSearchParams(prev);
-      for (const k of ["range", "from", "to"]) next.delete(k);
-      if (isFixed(s)) {
-        next.set("from", String(s.from));
-        next.set("to", String(s.to));
-      } else if (s.last !== defaultLast) {
-        next.set("range", String(s.last));
-      }
-      return next;
-    });
+    setUrl(
+      isFixed(s)
+        ? { range: null, from: String(s.from), to: String(s.to) }
+        : {
+            range: s.last !== defaultLast ? String(s.last) : null,
+            from: null,
+            to: null,
+          },
+    );
   return [span, set];
 }
 
@@ -378,17 +380,7 @@ function CustomRange({
   const [from, setFrom] = useState(toLocalInput(f0));
   const [to, setTo] = useState(toLocalInput(t0));
   const box = useRef<HTMLDivElement>(null);
-  useEffect(() => {
-    const outside = (e: MouseEvent) =>
-      box.current && !box.current.contains(e.target as Node) && onClose();
-    const esc = (e: KeyboardEvent) => e.key === "Escape" && onClose();
-    document.addEventListener("mousedown", outside);
-    document.addEventListener("keydown", esc);
-    return () => {
-      document.removeEventListener("mousedown", outside);
-      document.removeEventListener("keydown", esc);
-    };
-  }, [onClose]);
+  useDismiss(box, onClose);
   // "Now" as of opening the picker, so rendering stays pure.
   const [now] = useState(() => Math.floor(Date.now() / 1000));
   const f = fromLocalInput(from);
@@ -521,16 +513,12 @@ export function RangePicker({
       >
         ›
       </button>
-      <div className="segmented" role="group" aria-label="Time range">
-        {RANGES.map((r) => (
-          <button
-            key={r.label}
-            className={!fixed && r.seconds === value.last ? "active" : ""}
-            onClick={() => onChange({ last: r.seconds })}
-          >
-            {r.label}
-          </button>
-        ))}
+      <Segmented
+        label="Time range"
+        options={RANGE_OPTIONS}
+        value={fixed ? null : value.last}
+        onChange={(last) => onChange({ last })}
+      >
         <button
           className={preset ? "" : "active"}
           onClick={() => setOpen((o) => !o)}
@@ -543,7 +531,7 @@ export function RangePicker({
               ? "Custom…"
               : `Last ${duration(len)}`}
         </button>
-      </div>
+      </Segmented>
       {open && (
         <CustomRange
           value={value}

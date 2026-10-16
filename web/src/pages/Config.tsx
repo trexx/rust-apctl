@@ -5,7 +5,12 @@ import { eventData, useDeviceNames, useEvents } from "../api";
 import type { AppEvent } from "../api";
 import { DryRunPage } from "./DryRun";
 import { FirmwarePanel } from "../components/Firmware";
-import { ApSelect, QueryState, Tabs, useUrlTab } from "../components/common";
+import {
+  ApSelect,
+  QueryState,
+  Segmented,
+  useUrlTab,
+} from "../components/common";
 import { band, clock } from "../format";
 import { ChangeGroups, summarise } from "../components/ConfigDiff";
 
@@ -138,7 +143,7 @@ export function Config() {
     <div className="page">
       <div className="page-head">
         <h1>Config</h1>
-        <Tabs tabs={TABS} value={tab} onChange={setTab} />
+        <Segmented tabs options={TABS} value={tab} onChange={setTab} />
       </div>
       {tab === "history" ? (
         <History />

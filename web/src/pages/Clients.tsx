@@ -8,7 +8,7 @@ import {
   ErrorNote,
   Loading,
   Signal,
-  Tabs,
+  Segmented,
   useUrlTab,
 } from "../components/common";
 import { ago, band, duration, phy } from "../format";
@@ -44,7 +44,7 @@ const TABS = [
 
 export function Clients() {
   const [tab, setTab] = useUrlTab(TABS);
-  const tabs = <Tabs tabs={TABS} value={tab} onChange={setTab} />;
+  const tabs = <Segmented tabs options={TABS} value={tab} onChange={setTab} />;
   return tab === "attempts" ? (
     <Attempts tabs={tabs} />
   ) : (

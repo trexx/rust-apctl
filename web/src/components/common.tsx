@@ -1,5 +1,5 @@
-import { memo, useState } from "react";
-import type { ReactNode } from "react";
+import { memo, useEffect, useEffectEvent, useState } from "react";
+import type { ReactNode, RefObject } from "react";
 import { Link, useSearchParams } from "react-router-dom";
 import { useQueryClient } from "@tanstack/react-query";
 import type { QueryKey } from "@tanstack/react-query";
@@ -172,30 +172,91 @@ export function useUrlTab<K extends string>(
   return [tab, (k: K) => setParams(k === first ? {} : { tab: k })];
 }
 
-export function Tabs<K extends string>({
-  tabs,
+/**
+ * Sets URL search parameters, keeping the others; an empty value removes one.
+ * With `replace`, the change doesn't add a history entry.
+ */
+export function useSetParams() {
+  const [, setParams] = useSearchParams();
+  return (
+    changes: Record<string, string | null | undefined>,
+    { replace = false } = {},
+  ) =>
+    setParams(
+      (prev) => {
+        const next = new URLSearchParams(prev);
+        for (const [k, v] of Object.entries(changes)) {
+          if (v) next.set(k, v);
+          else next.delete(k);
+        }
+        return next;
+      },
+      { replace },
+    );
+}
+
+/**
+ * A row of buttons picking one of `options` (none when `value` matches none);
+ * `children`, more buttons, follow them. With `tabs`, it switches the page's
+ * tabs.
+ */
+export function Segmented<K extends string | number | boolean>({
+  options,
   value,
   onChange,
+  label,
+  tabs = false,
+  children,
 }: {
-  tabs: readonly (readonly [K, string])[];
-  value: K;
+  options: readonly (readonly [K, ReactNode])[];
+  value: K | null;
   onChange: (k: K) => void;
+  label?: string;
+  tabs?: boolean;
+  children?: ReactNode;
 }) {
   return (
-    <div className="segmented" role="tablist">
-      {tabs.map(([k, label]) => (
+    <div
+      className="segmented"
+      role={tabs ? "tablist" : "group"}
+      aria-label={label}
+    >
+      {options.map(([k, text]) => (
         <button
-          key={k}
-          role="tab"
-          aria-selected={value === k}
+          key={String(k)}
+          role={tabs ? "tab" : undefined}
+          aria-selected={tabs ? value === k : undefined}
+          aria-pressed={tabs ? undefined : value === k}
           className={value === k ? "active" : ""}
           onClick={() => onChange(k)}
         >
-          {label}
+          {text}
         </button>
       ))}
+      {children}
     </div>
   );
+}
+
+/** Calls `onClose` on a mouse press outside `ref`'s element or on Escape, while `active`. */
+export function useDismiss(
+  ref: RefObject<HTMLElement | null>,
+  onClose: () => void,
+  active = true,
+) {
+  const close = useEffectEvent(onClose);
+  useEffect(() => {
+    if (!active) return;
+    const outside = (e: MouseEvent) =>
+      ref.current && !ref.current.contains(e.target as Node) && close();
+    const esc = (e: KeyboardEvent) => e.key === "Escape" && close();
+    document.addEventListener("mousedown", outside);
+    document.addEventListener("keydown", esc);
+    return () => {
+      document.removeEventListener("mousedown", outside);
+      document.removeEventListener("keydown", esc);
+    };
+  }, [ref, active]);
 }
 
 /** Picks one AP, or "" for all of them. */

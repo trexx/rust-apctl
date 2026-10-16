@@ -1,10 +1,16 @@
-import { useEffect, useState } from "react";
+import { useEffect, useEffectEvent, useState } from "react";
 import { useSearchParams } from "react-router-dom";
 import { useDeviceNames, useLogs } from "../api";
-import { ApSelect, LogList, QueryState } from "../components/common";
+import {
+  ApSelect,
+  LogList,
+  QueryState,
+  useSetParams,
+} from "../components/common";
 
 export function Logs() {
-  const [params, setParams] = useSearchParams();
+  const [params] = useSearchParams();
+  const setUrl = useSetParams();
   const device = params.get("device") ?? "";
   const q = params.get("q") ?? "";
   const [text, setText] = useState(q);
@@ -22,24 +28,16 @@ export function Logs() {
   });
 
   // Search as you type, debounced.
+  const search = useEffectEvent((t: string) =>
+    setUrl({ q: t }, { replace: true }),
+  );
   useEffect(() => {
-    const t = window.setTimeout(() => {
-      if (text !== q) {
-        const next = new URLSearchParams(params);
-        if (text) next.set("q", text);
-        else next.delete("q");
-        setParams(next, { replace: true });
-      }
-    }, 300);
+    if (text === q) return;
+    const t = window.setTimeout(() => search(text), 300);
     return () => window.clearTimeout(t);
-  }, [text, q, params, setParams]);
+  }, [text, q]);
 
-  const setDevice = (mac: string) => {
-    const next = new URLSearchParams(params);
-    if (mac) next.set("device", mac);
-    else next.delete("device");
-    setParams(next, { replace: true });
-  };
+  const setDevice = (mac: string) => setUrl({ device: mac }, { replace: true });
 
   return (
     <div className="page">

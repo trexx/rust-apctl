@@ -4,8 +4,13 @@ import { useMulticast } from "../../api";
 import type { SiteMulticast, TimeSpan } from "../../api";
 import { compact } from "../../format";
 import { COLORS, Chart, SpanContext } from "../Chart";
-import { QueryState } from "../common";
+import { QueryState, Segmented } from "../common";
 import { spanText } from "./shared";
+
+const DIRECTIONS = [
+  ["tx", "To clients"],
+  ["rx", "From clients"],
+] as const;
 
 const MCAST_COLORS: Record<string, string> = {
   mdns: COLORS.blue,
@@ -85,20 +90,12 @@ function MulticastView({
         <b>{title}</b>
         <span className="muted small">{spanText(span)}</span>
         <span className="spacer" />
-        <div className="segmented" role="group" aria-label="Direction">
-          <button
-            className={dir === "tx" ? "active" : ""}
-            onClick={() => setDir("tx")}
-          >
-            To clients
-          </button>
-          <button
-            className={dir === "rx" ? "active" : ""}
-            onClick={() => setDir("rx")}
-          >
-            From clients
-          </button>
-        </div>
+        <Segmented
+          label="Direction"
+          options={DIRECTIONS}
+          value={dir}
+          onChange={setDir}
+        />
       </div>
       <div className="mcast-stack">
         <div>

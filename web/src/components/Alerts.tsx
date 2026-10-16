@@ -3,7 +3,7 @@ import { Link, useNavigate } from "react-router-dom";
 import { keys, markAlertsRead, useAlerts } from "../api";
 import type { AlertCategory, AlertItem } from "../api";
 import { clock } from "../format";
-import { useRunner } from "./common";
+import { useDismiss, useRunner } from "./common";
 
 export const CATEGORIES: [AlertCategory, string, string][] = [
   [
@@ -128,18 +128,7 @@ export function AlertBell() {
   const { run } = useRunner([keys.alerts()], 800);
   const [open, setOpen] = useState(false);
   const box = useRef<HTMLDivElement>(null);
-  useEffect(() => {
-    if (!open) return;
-    const outside = (e: MouseEvent) =>
-      box.current && !box.current.contains(e.target as Node) && setOpen(false);
-    const esc = (e: KeyboardEvent) => e.key === "Escape" && setOpen(false);
-    document.addEventListener("mousedown", outside);
-    document.addEventListener("keydown", esc);
-    return () => {
-      document.removeEventListener("mousedown", outside);
-      document.removeEventListener("keydown", esc);
-    };
-  }, [open]);
+  useDismiss(box, () => setOpen(false), open);
   const unread = a.data?.unread ?? 0;
   const list = a.data?.alerts ?? [];
   const openNow = list.filter((x) => x.resolved_ts === null);

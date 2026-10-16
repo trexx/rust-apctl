@@ -9,8 +9,13 @@ import {
   ZoomContext,
   useTimeSpan,
 } from "../Chart";
-import { QueryState } from "../common";
+import { QueryState, Segmented } from "../common";
 import { BandPicker } from "./shared";
+
+const VIEWS = [
+  ["activity", "Activity"],
+  ["airtime", "Airtime"],
+] as const;
 
 /** Site-wide Wi-Fi activity and airtime, the first thing on the overview. */
 export function SiteActivity() {
@@ -23,20 +28,12 @@ export function SiteActivity() {
       <SpanContext.Provider value={range}>
         <div className="panel">
           <div className="panel-head">
-            <div className="segmented" role="group" aria-label="View">
-              <button
-                className={view === "activity" ? "active" : ""}
-                onClick={() => setView("activity")}
-              >
-                Activity
-              </button>
-              <button
-                className={view === "airtime" ? "active" : ""}
-                onClick={() => setView("airtime")}
-              >
-                Airtime
-              </button>
-            </div>
+            <Segmented
+              label="View"
+              options={VIEWS}
+              value={view}
+              onChange={setView}
+            />
             <BandPicker value={band} onChange={setBand} />
             <span className="spacer" />
             <RangePicker value={range} onChange={setRange} />

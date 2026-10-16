@@ -12,7 +12,7 @@ import {
   Meter,
   QueryState,
   Signal,
-  Tabs,
+  Segmented,
   useUrlTab,
 } from "../components/common";
 import { ChannelAiPanel, PlanActions } from "../components/ChannelAi";
@@ -527,7 +527,7 @@ export function Radios() {
     <div className="page">
       <div className="page-head">
         <h1>Radios</h1>
-        <Tabs tabs={TABS} value={tab} onChange={setTab} />
+        <Segmented tabs options={TABS} value={tab} onChange={setTab} />
       </div>
       {tab === "channels" ? (
         <Channels />
