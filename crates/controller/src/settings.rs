@@ -1218,18 +1218,23 @@ pub fn default_usergroup(state: &Value) -> Option<String> {
 }
 
 /// Site-wide list limits: 256 broadcast-filter addresses in all, 512 MAC-filter
-/// addresses over SSIDs on the same APs.
+/// addresses over the SSIDs sharing an AP group.
 fn check_list_limits(state: &Value) -> Result<(), String> {
     let len = |w: &Value, k: &str| w[k].as_array().map_or(0, Vec::len);
     let bc: usize = docs(state, "wlanconf").filter(|w| w["bc_filter_enabled"].as_bool() == Some(true)).map(|w| len(w, "bc_filter_list")).sum();
     if bc > 256 {
         return Err(format!("{bc} broadcast-filter addresses in all; the limit is 256"));
     }
-    let wlans: Vec<&Value> = docs(state, "wlanconf").filter(|w| w["mac_filter_enabled"].as_bool() == Some(true)).collect();
-    for w in &wlans {
-        let total: usize = wlans.iter().filter(|o| o["ap_group_ids"] == w["ap_group_ids"]).map(|o| len(o, "mac_filter_list")).sum();
+    // As the official controller counts: the SSIDs sharing an AP group with
+    // one (the default group counts as a group like any other).
+    let wlans: Vec<(Vec<&str>, usize)> = docs(state, "wlanconf")
+        .filter(|w| w["mac_filter_enabled"].as_bool() == Some(true))
+        .map(|w| (w["ap_group_ids"].as_array().into_iter().flatten().filter_map(Value::as_str).collect(), len(w, "mac_filter_list")))
+        .collect();
+    for (g, _) in &wlans {
+        let total: usize = wlans.iter().filter(|(o, _)| o.iter().any(|x| g.contains(x))).map(|(_, n)| n).sum();
         if total > 512 {
-            return Err(format!("{total} MAC-filter addresses on the same APs; the limit is 512"));
+            return Err(format!("{total} MAC-filter addresses on SSIDs sharing an AP group; the limit is 512"));
         }
     }
     Ok(())
@@ -1958,6 +1963,16 @@ mod tests {
         s["wlanconf"].as_array_mut().unwrap().truncate(5);
         s["setting"][0]["enabled"] = json!(true);
         assert_eq!(check_wlan_limits(&s).unwrap_err(), "Hall would have 5 SSIDs on its 2.4 GHz radio; it supports 4");
+    }
+
+    #[test]
+    fn mac_filter_addresses_add_up_over_ssids_sharing_an_ap_group() {
+        let list = |n: usize| (0..n).map(|i| format!("02:00:00:00:{:02x}:{:02x}", i / 256, i % 256)).collect::<Vec<_>>();
+        let wlan = |groups: &[&str], n: usize| json!({ "mac_filter_enabled": true, "ap_group_ids": groups, "mac_filter_list": list(n) });
+        let s = json!({ "wlanconf": [wlan(&["a", "b"], 300), wlan(&["b"], 300)] });
+        assert!(check_list_limits(&s).unwrap_err().contains("600 MAC-filter"));
+        let s = json!({ "wlanconf": [wlan(&["a"], 300), wlan(&["c"], 300), wlan(&["c"], 212)] });
+        check_list_limits(&s).unwrap();
     }
 
     #[test]
