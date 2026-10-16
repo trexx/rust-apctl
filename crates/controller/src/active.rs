@@ -28,7 +28,7 @@ use inform::{DEFAULT_KEY, Flags, Mac, Packet};
 use rusqlite::types::Value as Sql;
 use serde_json::{Value, json};
 use tokio::sync::mpsc;
-use wire::decode::{Decoded, KeyUsed};
+use wire::decode::{Decoded, KeyUsed, open_with};
 use wire::keys::KeyStore;
 
 use crate::engine::{Input, PushedConfig, SharedLive};
@@ -390,15 +390,8 @@ pub async fn inform(
     // Which keys may this AP use? Its own if apctl manages it; the factory key always.
     let state = active.live.read().unwrap().state.clone();
     let device_key = crate::adopt::device_key(state.as_deref(), &active.keys, &mac);
-    let mut attempts: Vec<(KeyUsed, [u8; 16])> = Vec::new();
-    if let Some(k) = device_key {
-        attempts.push((KeyUsed::Device, k));
-    }
-    attempts.push((KeyUsed::Default, DEFAULT_KEY));
-    let opened = attempts
-        .iter()
-        .find_map(|(used, key)| pkt.open(key).ok().and_then(|p| serde_json::from_slice::<Value>(&p).ok()).map(|v| (*used, *key, v)));
-    let Some((used, key, payload)) = opened else {
+    let attempts = device_key.map(|k| (KeyUsed::Device, k)).into_iter().chain([(KeyUsed::Default, DEFAULT_KEY)]);
+    let Ok((used, key, payload)) = open_with(&pkt, attempts) else {
         tracing::warn!("{mac}: inform from {} could not be decrypted", peer.ip());
         return status(StatusCode::BAD_REQUEST);
     };
