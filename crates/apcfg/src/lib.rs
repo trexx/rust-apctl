@@ -37,6 +37,8 @@ mod wlan;
 use anyhow::{Context, Result, bail};
 use serde_json::Value;
 
+use crate::wlan::Band;
+
 /// Facts about the controller itself that the settings snapshot does not hold.
 pub struct Controller {
     /// The controller's inform URL, e.g. `http://unifi.example.net:8080/inform`. Its host
@@ -112,9 +114,7 @@ pub fn render_with_meta(input: &Input) -> Result<Output> {
 /// The `blocked_sta` value of a provisioning reply: MACs of the site's blocked clients,
 /// one per line, no trailing newline.
 pub fn blocked_sta(state: &Value, site_id: &str) -> String {
-    json::arr(state, "clients")
-        .iter()
-        .filter(|c| json::str_of(c, "site_id").is_none_or(|s| s == site_id))
+    site_docs(state, site_id, "clients")
         .filter(|c| json::flag(c, "blocked", false))
         .filter_map(|c| json::str_of(c, "mac"))
         .map(str::to_ascii_lowercase)
@@ -138,6 +138,11 @@ impl Caps {
         let [fw, fw2, fw3, wifi, wifi2, hw] =
             CAP_KEYS.map(|k| inform.and_then(|i| json::int_of(i, k)).or_else(|| json::int_of(device, k)).unwrap_or(0) as u64);
         Caps { fw, fw2, fw3, wifi, wifi2, hw }
+    }
+
+    /// Whether any capability bits are known: from an inform, or stored with the device.
+    fn is_known(&self) -> bool {
+        [self.fw, self.fw2, self.fw3, self.wifi, self.wifi2, self.hw] != [0; 6]
     }
 }
 
@@ -208,7 +213,7 @@ pub const SSID_FEATURES: &[&str] = &feature_names(SSID_FEATURE_CAPS);
 /// settings hold no capability bits for it.
 pub fn ssid_feature_support(device: &Value, inform: Option<&Value>) -> Option<Vec<(&'static str, bool)>> {
     let caps = Caps::read(inform, device);
-    if caps.fw == 0 && caps.fw2 == 0 && caps.fw3 == 0 && caps.wifi == 0 && caps.wifi2 == 0 {
+    if !caps.is_known() {
         return None;
     }
     let radios = json::arr(device, "radio_table");
@@ -220,16 +225,32 @@ pub fn ssid_feature_support(device: &Value, inform: Option<&Value>) -> Option<Ve
 pub(crate) struct Ctx<'a> {
     pub state: &'a Value,
     pub site: &'a Value,
-    pub site_id: String,
+    pub site_id: &'a str,
     pub device: &'a Value,
     pub mac: String,
     pub inform: Option<&'a Value>,
     pub caps: Caps,
     pub controller: &'a Controller,
     pub cfgversion: &'a str,
+    /// The settings read most often (see [`Ctx::setting`]).
+    pub mgmt: &'a Value,
+    pub super_mgmt: &'a Value,
+    pub radio_ai: &'a Value,
+    /// The radios' country code (`setting[country].code`, US when unset).
+    pub country: String,
 }
 
 static NULL: Value = Value::Null;
+
+/// Documents of a collection that belong to a site (or carry no site at all).
+fn site_docs<'a, 's>(state: &'a Value, site_id: &'s str, collection: &str) -> impl Iterator<Item = &'a Value> + use<'a, 's> {
+    json::arr(state, collection).iter().filter(move |d| json::str_of(d, "site_id").is_none_or(|id| id == site_id))
+}
+
+/// The `setting` document with this key: site-scoped, or global for `super_*` keys.
+fn setting<'a>(state: &'a Value, site_id: &str, key: &str) -> &'a Value {
+    site_docs(state, site_id, "setting").find(|s| json::str_of(s, "key") == Some(key)).unwrap_or(&NULL)
+}
 
 impl<'a> Ctx<'a> {
     fn new(input: &Input<'a>) -> Result<Ctx<'a>> {
@@ -239,10 +260,10 @@ impl<'a> Ctx<'a> {
             .iter()
             .find(|d| json::str_of(d, "mac").is_some_and(|m| json::mac_eq(m, &mac)))
             .with_context(|| format!("device {mac} is not in the state"))?;
-        let site_id = json::str_of(device, "site_id").context("device has no site_id")?.to_string();
+        let site_id = json::str_of(device, "site_id").context("device has no site_id")?;
         let site = json::arr(state, "sites")
             .iter()
-            .find(|s| json::oid(s) == Some(site_id.as_str()))
+            .find(|s| json::oid(s) == Some(site_id))
             .with_context(|| format!("site {site_id} is not in the state"))?;
         if json::str_of(device, "type").is_some_and(|t| t != "uap") {
             bail!("device {mac} is not an access point");
@@ -257,25 +278,22 @@ impl<'a> Ctx<'a> {
             caps: Caps::read(input.inform, device),
             controller: input.controller,
             cfgversion: input.cfgversion,
+            mgmt: setting(state, site_id, "mgmt"),
+            super_mgmt: setting(state, site_id, "super_mgmt"),
+            radio_ai: setting(state, site_id, "radio_ai"),
+            country: json::text_of(setting(state, site_id, "country"), "code").unwrap_or_else(|| "840".to_string()),
         })
     }
 
     /// The `setting` document with this key: site-scoped, or global for `super_*` keys.
+    /// `mgmt`, `super_mgmt` and `radio_ai` are at hand as fields.
     pub fn setting(&self, key: &str) -> &'a Value {
-        json::arr(self.state, "setting")
-            .iter()
-            .find(|s| {
-                json::str_of(s, "key") == Some(key)
-                    && json::str_of(s, "site_id").is_none_or(|id| id == self.site_id)
-            })
-            .unwrap_or(&NULL)
+        setting(self.state, self.site_id, key)
     }
 
     /// Documents of a collection that belong to this site (or carry no site at all).
     pub fn site_docs(&self, collection: &str) -> impl Iterator<Item = &'a Value> + '_ {
-        json::arr(self.state, collection)
-            .iter()
-            .filter(|d| json::str_of(d, "site_id").is_none_or(|id| id == self.site_id))
+        site_docs(self.state, self.site_id, collection)
     }
 
     pub fn network(&self, id: &str) -> Option<&'a Value> {
@@ -283,12 +301,17 @@ impl<'a> Ctx<'a> {
     }
 
     /// SSH account name: also the user cron jobs run as.
-    pub fn ssh_username(&self) -> String {
-        json::str_of(self.setting("mgmt"), "x_ssh_username").unwrap_or("ubnt").to_string()
+    pub fn ssh_username(&self) -> &'a str {
+        json::str_of(self.mgmt, "x_ssh_username").unwrap_or("ubnt")
     }
 
     pub fn inform_str(&self, key: &str) -> Option<&'a str> {
         self.inform.and_then(|i| json::str_of(i, key))
+    }
+
+    /// The `radio_ai` settings for one band (`radios_configuration`).
+    pub fn radio_ai_config(&self, band: Band) -> Option<&'a Value> {
+        json::arr(self.radio_ai, "radios_configuration").iter().find(|c| json::str_of(c, "radio") == Some(band.as_str()))
     }
 }
 
@@ -310,7 +333,7 @@ pub const DEVICE_FEATURES: &[&str] = &feature_names(DEVICE_FEATURE_CAPS);
 /// [`ssid_feature_support`]).
 pub fn device_feature_support(device: &Value, inform: Option<&Value>) -> Option<Vec<(&'static str, bool)>> {
     let caps = Caps::read(inform, device);
-    if caps.fw == 0 && caps.wifi == 0 && caps.hw == 0 {
+    if !caps.is_known() {
         return None;
     }
     Some(DEVICE_FEATURE_CAPS.iter().map(|&(f, needs)| (f, needs.iter().any(|n| n.met(&caps, false)))).collect())
@@ -334,6 +357,11 @@ mod tests {
         assert_eq!(dev, ["airtime_fairness", "green_ap"]);
         let old = json!({ "fw_caps": 1, "fw3_caps": 0, "wifi_caps2": 0 });
         assert!(ssid_feature_support(&device, Some(&old)).unwrap().iter().all(|(f, ok)| !ok || *f == "wpa3_fast_roaming"));
+        // Any capability field at all makes the support known, for both lists.
+        for partial in [json!({ "hw_caps": 2 }), json!({ "fw3_caps": 8 })] {
+            assert!(ssid_feature_support(&device, Some(&partial)).is_some() && device_feature_support(&device, Some(&partial)).is_some(), "{partial}");
+        }
+        assert_eq!(device_feature_support(&json!({ "wifi_caps2": 4 }), None).unwrap().iter().filter(|(_, ok)| *ok).map(|(f, _)| *f).collect::<Vec<_>>(), ["green_ap"]);
     }
 
     /// Every device field the sources read (an accessor on `ctx.device` or `device`

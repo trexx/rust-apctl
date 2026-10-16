@@ -5,7 +5,7 @@ use serde_json::Value;
 
 use crate::cfg::{Cfg, Prefix};
 use crate::javahash::hash_set_order;
-use crate::json::{arr, flag, int_of, mac_eq, on_off, str_list, str_of, text_of};
+use crate::json::{arr, flag, int_of, mac_eq, on_off, override_of, str_list, str_of, text_of};
 use crate::meta::Meta;
 use crate::net::{self, Net};
 use crate::wlan::{self, Band, Radio, Vap, network_vlan, wlan_id};
@@ -82,18 +82,18 @@ pub fn render(ctx: &Ctx) -> Result<(String, Value)> {
     cron(&mut c, ctx, &radios, &vaps);
     c.header("DPI Fingerprint");
     c.header("misc");
-    Ok((c.finish(), meta.to_doc(&ctx.site_id, &ctx.mac)))
+    Ok((c.finish(), meta.to_doc(ctx.site_id, &ctx.mac)))
 }
 
 fn unifi(c: &mut Cfg, ctx: &Ctx) {
     let ctl = ctx.controller;
-    let mgmt = ctx.setting("mgmt");
+    let mgmt = ctx.mgmt;
     c.header("unifi");
     c.set("unifi.version", &ctl.version);
     c.set("unifi.anonymous_controller_id", &ctl.reporter_uuid);
     c.opt("unifi.anonymous_site_id", str_of(ctx.site, "anonymous_id"));
     c.set("unifi.reporterid", &ctl.reporter_uuid);
-    c.set("unifi.siteid", &ctx.site_id);
+    c.set("unifi.siteid", ctx.site_id);
     let idp = flag(mgmt, "unifi_idp_enabled", true);
     c.set("unifi.idp", on_off(idp));
     if idp {
@@ -113,7 +113,7 @@ fn unifi(c: &mut Cfg, ctx: &Ctx) {
 
 fn system(c: &mut Cfg, ctx: &Ctx) {
     c.header("system");
-    let analytics = flag(ctx.setting("super_mgmt"), "enable_analytics", true);
+    let analytics = flag(ctx.super_mgmt, "enable_analytics", true);
     c.set("system.analytics.status", on_off(analytics));
     let zone = str_of(ctx.setting("locale"), "timezone").unwrap_or("UTC");
     if let Some(posix) = tz::posix(zone) {
@@ -126,7 +126,7 @@ fn system(c: &mut Cfg, ctx: &Ctx) {
 }
 
 fn users(c: &mut Cfg, ctx: &Ctx) -> Result<()> {
-    let mgmt = ctx.setting("mgmt");
+    let mgmt = ctx.mgmt;
     // The crypt(3) hash is random-salted, so it is an input: the controller stores it
     // next to the password (as the official one caches it in the same field).
     let field = if bit(ctx.caps.fw, 10) { "x_ssh_sha512passwd" } else { "x_ssh_md5passwd" };
@@ -173,14 +173,10 @@ fn wireless(c: &mut Cfg, ctx: &Ctx, radios: &[Radio], vaps: &[Vap], net: &Net) {
         c.header("no wlan provisioned as no radio found");
     } else {
         c.set("radio.status", "enabled");
-        c.set("radio.countrycode", wlan::country(ctx));
+        c.set("radio.countrycode", &ctx.country);
         c.set("aaa.status", "enabled");
         c.set("wireless.status", "enabled");
-        let outdoor = match str_of(ctx.device, "outdoor_mode_override") {
-            Some("on") => true,
-            Some("off") => false,
-            _ => flag(ctx.setting("mgmt"), "outdoor_mode_enabled", false),
-        };
+        let outdoor = override_of(ctx.device, "outdoor_mode_override", flag(ctx.mgmt, "outdoor_mode_enabled", false));
         c.set("radio.outdoor", on_off(outdoor));
         any_stamgr = wlan::render_radios(c, ctx, radios, vaps);
         for i in 0..vaps.len() {
@@ -219,7 +215,7 @@ fn wireless(c: &mut Cfg, ctx: &Ctx, radios: &[Radio], vaps: &[Vap], net: &Net) {
 fn bandsteering(c: &mut Cfg, ctx: &Ctx, radios: &[Radio], vaps: &[Vap]) {
     c.header("bandsteering");
     let mode = str_of(ctx.device, "bandsteering_mode").unwrap_or("off");
-    if !flag(ctx.setting("mgmt"), "advanced_feature_enabled", false) || mode == "off" {
+    if !flag(ctx.mgmt, "advanced_feature_enabled", false) || mode == "off" {
         c.set("bandsteering.status", "disabled");
         return;
     }
@@ -244,9 +240,8 @@ type AclBlock<'a> = (&'a str, &'a str, Vec<(String, &'static str)>);
 
 fn mac_acl(c: &mut Cfg, ctx: &Ctx, vaps: &[Vap]) {
     // Clients pinned ("lock to AP") to some other AP may not join this one.
-    let locked_elsewhere: Vec<String> = arr(ctx.state, "clients")
-        .iter()
-        .filter(|u| str_of(u, "site_id").is_none_or(|s| s == ctx.site_id))
+    let locked_elsewhere: Vec<String> = ctx
+        .site_docs("clients")
         .filter(|u| flag(u, "fixed_ap_enabled", false))
         .filter(|u| str_of(u, "fixed_ap_mac").is_some_and(|m| !mac_eq(m, &ctx.mac)))
         .filter_map(|u| str_of(u, "mac"))
@@ -385,7 +380,7 @@ fn syslog(c: &mut Cfg, ctx: &Ctx) {
 }
 
 fn sshd(c: &mut Cfg, ctx: &Ctx) {
-    let mgmt = ctx.setting("mgmt");
+    let mgmt = ctx.mgmt;
     c.header("sshd");
     if !flag(mgmt, "x_ssh_enabled", true) {
         c.set("sshd.status", "disabled");
@@ -738,8 +733,7 @@ fn qos(c: &mut Cfg, ctx: &Ctx, radios: &[Radio], vaps: &[Vap]) {
 
 fn cron(c: &mut Cfg, ctx: &Ctx, radios: &[Radio], vaps: &[Vap]) {
     let schedules = vaps.iter().any(|v| !arr(&v.w, "schedule_with_duration").is_empty());
-    let country = wlan::country(ctx);
-    let fcc = country == "840" || country == "124";
+    let fcc = ctx.country == "840" || ctx.country == "124";
     let dfs = radios.iter().any(|r| {
         r.band == Band::Na
             && flag(r.doc, if fcc { "has_fccdfs" } else { "has_dfs" }, false)

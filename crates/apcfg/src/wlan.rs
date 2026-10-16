@@ -234,12 +234,7 @@ fn width(ctx: &Ctx, r: &Radio) -> i64 {
         _ => 320,
     };
     let configured = int_of(r.doc, "ht")
-        .or_else(|| {
-            arr(ctx.setting("radio_ai"), "radios_configuration")
-                .iter()
-                .find(|c| str_of(c, "radio") == Some(r.band.as_str()))
-                .and_then(|c| int_of(c, "channel_width"))
-        })
+        .or_else(|| ctx.radio_ai_config(r.band).and_then(|c| int_of(c, "channel_width")))
         .unwrap_or(match r.band {
             Band::Ng => 20,
             Band::Na => 80,
@@ -260,15 +255,9 @@ fn width(ctx: &Ctx, r: &Radio) -> i64 {
     country_max.min(configured).min(capable)
 }
 
-pub fn country(ctx: &Ctx) -> String {
-    text_of(ctx.setting("country"), "code").unwrap_or_else(|| "840".to_string())
-}
-
 /// `radio.R.*` for every radio. Returns whether any radio wrote a `stamgr.R` block.
 pub fn render_radios(c: &mut Cfg, ctx: &Ctx, radios: &[Radio], vaps: &[Vap]) -> bool {
-    let mgmt = ctx.setting("mgmt");
-    let advanced = flag(mgmt, "advanced_feature_enabled", false);
-    let country = country(ctx);
+    let advanced = flag(ctx.mgmt, "advanced_feature_enabled", false);
     let mut any_stamgr = false;
     for (ri, r) in radios.iter().enumerate() {
         let d = r.doc;
@@ -280,7 +269,7 @@ pub fn render_radios(c: &mut Cfg, ctx: &Ctx, radios: &[Radio], vaps: &[Vap]) -> 
         c.set(k.at("acktimeout"), 64);
         c.set(k.at("ampdu.status"), "enabled");
         c.set(k.at("clksel"), 1);
-        c.set(k.at("countrycode"), &country);
+        c.set(k.at("countrycode"), &ctx.country);
         c.set(k.at("cwm.enable"), 0);
         c.set(k.at("cwm.mode"), u8::from(r.band == Band::Ng && width != 20));
         c.set(k.at("forbiasauto"), 0);
@@ -300,16 +289,12 @@ pub fn render_radios(c: &mut Cfg, ctx: &Ctx, radios: &[Radio], vaps: &[Vap]) -> 
         let g = if r.band == Band::Ng { "g" } else { "a" };
         c.set(k.at("ieee_mode"), format_args!("11n{g}ht{width}"));
         let acs_dfs = bit(ctx.caps.wifi2, 4);
-        let radio_ai = ctx.setting("radio_ai");
         if r.band == Band::Na && acs_dfs {
-            let dfs = arr(radio_ai, "radios_configuration")
-                .iter()
-                .find(|c| str_of(c, "radio") == Some("na"))
-                .is_some_and(|c| flag(c, "dfs", false));
+            let dfs = ctx.radio_ai_config(Band::Na).is_some_and(|c| flag(c, "dfs", false));
             c.set(k.at("acsdfs"), on_off(dfs));
         }
         if channel == "auto" && acs_dfs {
-            let blocked: Vec<&str> = arr(radio_ai, "channels_blacklist")
+            let blocked: Vec<&str> = arr(ctx.radio_ai, "channels_blacklist")
                 .iter()
                 .filter(|b| str_of(b, "radio") == Some(r.band.as_str()))
                 .filter_map(|b| str_of(b, "channel"))
@@ -445,6 +430,15 @@ fn wep_key(w: &Value) -> (String, &'static str) {
     (hex, kind)
 }
 
+/// A WEP WLAN's key lines, the same in its `aaa.N` and `wireless.N` sections.
+fn wep(c: &mut Cfg, p: Prefix, w: &Value) {
+    let (key, kind) = wep_key(w);
+    let idx = int_of(w, "wep_idx").unwrap_or(1);
+    c.set(p.at("security"), kind);
+    c.set(format_args!("{p}security.{idx}.key"), key);
+    c.set(p.at("security.default_key"), idx);
+}
+
 /// `aaa.N.*` and `wireless.N.*` for one VAP. `bridge` is the bridge the VAP is a port of.
 pub fn render_vap(c: &mut Cfg, ctx: &Ctx, radios: &[Radio], vaps: &[Vap], i: usize, bridge: &str) {
     let v = &vaps[i];
@@ -497,11 +491,7 @@ pub fn render_vap(c: &mut Cfg, ctx: &Ctx, radios: &[Radio], vaps: &[Vap], i: usi
             c.set(a.at("wpa.key.1.mgmt"), "OWE");
         }
         if security == "wep" {
-            let (key, kind) = wep_key(w);
-            let idx = int_of(w, "wep_idx").unwrap_or(1);
-            c.set(a.at("security"), kind);
-            c.set(format_args!("{a}security.{idx}.key"), key);
-            c.set(a.at("security.default_key"), idx);
+            wep(c, a, w);
         }
     } else {
         let wpa_mode = str_of(w, "wpa_mode").unwrap_or("auto");
@@ -679,11 +669,7 @@ fn render_wireless(c: &mut Cfg, ctx: &Ctx, radios: &[Radio], vaps: &[Vap], i: us
     c.set(k.at("l2_isolation"), on_off(bool_of(w, "l2_isolation").unwrap_or(is_guest)));
     c.set(k.at("is_guest"), is_guest);
     if security == "wep" {
-        let (key, kind) = wep_key(w);
-        let idx = int_of(w, "wep_idx").unwrap_or(1);
-        c.set(k.at("security"), kind);
-        c.set(format_args!("{k}security.{idx}.key"), key);
-        c.set(k.at("security.default_key"), idx);
+        wep(c, k, w);
     } else {
         c.set(k.at("security"), "none");
     }
