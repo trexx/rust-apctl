@@ -129,6 +129,24 @@ impl ApiError {
     pub fn internal(msg: impl Into<String>) -> Self {
         ApiError(StatusCode::INTERNAL_SERVER_ERROR, msg.into())
     }
+
+    /// The engine thread is gone (it ended, or panicked).
+    pub fn engine_stopped() -> Self {
+        ApiError(StatusCode::SERVICE_UNAVAILABLE, "engine stopped".into())
+    }
+}
+
+impl AppState {
+    /// Hands the engine an input.
+    pub async fn send(&self, input: crate::engine::Input) -> Result<(), ApiError> {
+        self.engine.send(input).await.map_err(|_| ApiError::engine_stopped())
+    }
+
+    /// Hands the engine an input that answers on `rx`, and waits for the answer.
+    pub async fn ask<T>(&self, input: crate::engine::Input, rx: tokio::sync::oneshot::Receiver<T>) -> Result<T, ApiError> {
+        self.send(input).await?;
+        rx.await.map_err(|_| ApiError::engine_stopped())
+    }
 }
 
 impl IntoResponse for ApiError {
@@ -452,10 +470,7 @@ async fn state_summary(State(s): State<AppState>) -> ApiResult {
 async fn import_state(State(s): State<AppState>, Json(state): Json<Value>) -> ApiResult {
     crate::dryrun::validate_state(&state).map_err(|e| bad(format!("{e:#}")))?;
     let summary = crate::dryrun::summarize_state(&state);
-    s.engine
-        .send(crate::engine::Input::SetState { ts: store::now_ts(), state })
-        .await
-        .map_err(|_| ApiError(StatusCode::SERVICE_UNAVAILABLE, "engine stopped".into()))?;
+    s.send(crate::engine::Input::SetState { ts: store::now_ts(), state }).await?;
     Ok(Json(json!({ "ok": true, "summary": summary })))
 }
 
@@ -597,7 +612,7 @@ async fn set_alias(
     validate(&body.alias, &body.note)?;
     let entries = vec![AliasEdit { mac, alias: body.alias, note: body.note }];
     let input = crate::engine::Input::SetAliases { ts: store::now_ts(), entries, only_if_unset: false };
-    s.engine.send(input).await.map_err(|_| ApiError(StatusCode::SERVICE_UNAVAILABLE, "engine stopped".into()))?;
+    s.send(input).await?;
     Ok(Json(json!({ "ok": true })))
 }
 
@@ -629,7 +644,7 @@ async fn import_aliases(
     let n = parsed.len();
     // All in one message: one pass of the engine, one client-list update.
     let input = crate::engine::Input::SetAliases { ts: store::now_ts(), entries: parsed, only_if_unset: !q.overwrite };
-    s.engine.send(input).await.map_err(|_| ApiError(StatusCode::SERVICE_UNAVAILABLE, "engine stopped".into()))?;
+    s.send(input).await?;
     Ok(Json(json!({ "submitted": n })))
 }
 

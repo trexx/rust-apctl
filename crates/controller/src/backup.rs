@@ -828,10 +828,7 @@ pub async fn index(State(s): State<AppState>) -> Result<Json<Value>, ApiError> {
 /// PUT /api/backups/settings
 pub async fn put_settings(State(s): State<AppState>, Json(body): Json<Settings>) -> Result<Json<Value>, ApiError> {
     body.validate().map_err(|e| ApiError(StatusCode::BAD_REQUEST, e))?;
-    s.engine
-        .send(crate::engine::Input::SaveBackupSettings(serde_json::to_string(&body).unwrap_or_default()))
-        .await
-        .map_err(|_| ApiError(StatusCode::SERVICE_UNAVAILABLE, "engine stopped".into()))?;
+    s.send(crate::engine::Input::SaveBackupSettings(serde_json::to_string(&body).unwrap_or_default())).await?;
     Ok(Json(json!({ "ok": true })))
 }
 

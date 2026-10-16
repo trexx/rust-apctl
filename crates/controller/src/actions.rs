@@ -267,11 +267,7 @@ pub async fn apply_edit(s: &AppState, edit: crate::engine::StateEdit) -> Result<
         return Err(ApiError(StatusCode::CONFLICT, "no settings imported yet".into()));
     }
     let (tx, rx) = tokio::sync::oneshot::channel();
-    s.engine
-        .send(Input::EditState { ts: store::now_ts(), edit, done: tx })
-        .await
-        .map_err(|_| ApiError(StatusCode::SERVICE_UNAVAILABLE, "engine stopped".into()))?;
-    rx.await.map_err(|_| ApiError(StatusCode::SERVICE_UNAVAILABLE, "engine stopped".into()))?.map_err(|e| ApiError(StatusCode::BAD_REQUEST, e))
+    s.ask(Input::EditState { ts: store::now_ts(), edit, done: tx }, rx).await?.map_err(|e| ApiError(StatusCode::BAD_REQUEST, e))
 }
 
 #[cfg(test)]

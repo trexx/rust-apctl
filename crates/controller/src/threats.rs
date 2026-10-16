@@ -736,7 +736,7 @@ pub async fn ack(State(s): State<AppState>, Json(b): Json<AckBody>) -> Result<Js
     let (ts, bssid) = (store::now_ts(), bssid.to_string());
     let ack = b.ack.then(|| Ack { note: note.clone(), ts });
     let input = Input::AckThreat { ts, kind: kind.as_str(), bssid: bssid.clone(), note: if b.ack { Some(note) } else { None } };
-    s.engine.send(input).await.map_err(|_| ApiError(StatusCode::SERVICE_UNAVAILABLE, "engine stopped".into()))?;
+    s.send(input).await?;
     // The findings served from memory show it at once.
     if let Some(l) = latest().as_mut() {
         for f in l.findings.iter_mut().filter(|f| f.kind == kind && f.bssid == bssid) {

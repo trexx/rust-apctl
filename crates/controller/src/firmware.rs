@@ -276,9 +276,7 @@ impl Op {
 /// Has the engine change the queue.
 async fn change_queue(s: &AppState, op: Op) -> Result<usize, ApiError> {
     let (done, rx) = tokio::sync::oneshot::channel();
-    let stopped = || ApiError(StatusCode::SERVICE_UNAVAILABLE, "engine stopped".into());
-    s.engine.send(crate::engine::Input::Firmware { op, done }).await.map_err(|_| stopped())?;
-    rx.await.map_err(|_| stopped())
+    s.ask(crate::engine::Input::Firmware { op, done }, rx).await
 }
 
 /// The upgrade command for an AP's inform reply, if its turn has come. Marks
