@@ -47,7 +47,8 @@ export function parseDiff(diff: string): Change[] {
   for (const line of diff.split("\n")) {
     const m = line.match(/^([~+-]) (.*)$/);
     if (!m) continue;
-    const [, op, rest] = m;
+    const op = m[1]!;
+    const rest = m[2]!;
     if (op === "~") {
       const i = rest.indexOf(": ");
       const [before, after] = rest.slice(i + 2).split(" -> ");
@@ -72,13 +73,14 @@ export function group(
   const groups = new Map<string, (Change & { field: string })[]>();
   for (const c of changes) {
     const parts = c.key.split(".");
-    const area = AREA[parts[0]] ?? parts[0];
-    const numbered = parts.length > 2 && /^\d+$/.test(parts[1]);
-    const section = numbered ? `${parts[0]}.${parts[1]}` : parts[0];
+    const [top = "", second = ""] = parts;
+    const area = AREA[top] ?? top;
+    const numbered = parts.length > 2 && /^\d+$/.test(second);
+    const section = numbered ? `${top}.${second}` : top;
     const title = numbered
-      ? `${area} — ${labels[section] ?? `#${parts[1]}`}`
+      ? `${area} — ${labels[section] ?? `#${second}`}`
       : area;
-    const field = parts.slice(numbered ? 2 : 1).join(".") || parts[0];
+    const field = parts.slice(numbered ? 2 : 1).join(".") || top;
     groups.set(title, [...(groups.get(title) ?? []), { ...c, field }]);
   }
   return [...groups.entries()];

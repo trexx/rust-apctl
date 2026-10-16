@@ -23,18 +23,20 @@ function withGaps(ts: number[], cols: (number | null)[][]): uPlot.AlignedData {
   if (ts.length < 3) return [ts, ...cols] as uPlot.AlignedData;
   const steps = ts
     .slice(1)
-    .map((t, i) => t - ts[i])
+    .map((t, i) => t - ts[i]!)
     .sort((a, b) => a - b);
-  const typical = steps[Math.floor(steps.length / 2)];
-  const outTs: number[] = [ts[0]];
-  const out = cols.map((c) => [c[0]]);
+  const typical = steps[Math.floor(steps.length / 2)]!;
+  const outTs: number[] = [ts[0]!];
+  const out = cols.map((c) => [c[0] ?? null]);
   for (let i = 1; i < ts.length; i++) {
-    if (ts[i] - ts[i - 1] > Math.max(3 * typical, 120)) {
-      outTs.push(Math.round((ts[i] + ts[i - 1]) / 2));
+    const t = ts[i]!;
+    const prev = ts[i - 1]!;
+    if (t - prev > Math.max(3 * typical, 120)) {
+      outTs.push(Math.round((t + prev) / 2));
       out.forEach((c) => c.push(null));
     }
-    outTs.push(ts[i]);
-    out.forEach((c, j) => c.push(cols[j][i]));
+    outTs.push(t);
+    out.forEach((c, j) => c.push(cols[j]![i] ?? null));
   }
   return [outTs, ...out] as uPlot.AlignedData;
 }
@@ -387,7 +389,8 @@ function CustomRange({
       document.removeEventListener("keydown", esc);
     };
   }, [onClose]);
-  const now = Math.floor(Date.now() / 1000);
+  // "Now" as of opening the picker, so rendering stays pure.
+  const [now] = useState(() => Math.floor(Date.now() / 1000));
   const f = fromLocalInput(from);
   const t = fromLocalInput(to);
   const error =
@@ -406,8 +409,9 @@ function CustomRange({
     d.setDate(d.getDate() - daysAgo);
     return Math.floor(d.getTime() / 1000);
   };
-  // Days since the week started (1 = Monday … 7 = Sunday, like firstDayOfWeek).
-  const intoWeek = ((new Date().getDay() || 7) - firstDayOfWeek() + 7) % 7;
+  // Midnight on the first day of this week (days numbered 1 = Monday … 7 = Sunday, as in firstDayOfWeek).
+  const weekStart = () =>
+    midnight(((new Date().getDay() || 7) - firstDayOfWeek() + 7) % 7);
   return (
     <div
       className="range-pop panel"
@@ -430,7 +434,7 @@ function CustomRange({
         </button>
         <button
           className="btn small"
-          onClick={() => onApply({ from: midnight(intoWeek), to: now })}
+          onClick={() => onApply({ from: weekStart(), to: now })}
         >
           This week so far
         </button>

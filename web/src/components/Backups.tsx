@@ -54,7 +54,7 @@ const toLocal = (utcMin: number) => {
   return `${String(Math.floor(m / 60)).padStart(2, "0")}:${String(m % 60).padStart(2, "0")}`;
 };
 const fromLocal = (hhmm: string) => {
-  const [h, m] = hhmm.split(":").map(Number);
+  const [h = 0, m = 0] = hhmm.split(":").map(Number);
   return (((h * 60 + m - offsetMin()) % 1440) + 1440) % 1440;
 };
 

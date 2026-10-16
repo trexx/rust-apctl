@@ -144,7 +144,8 @@ export function ThreatList() {
   if (!t.data) return <Loading />;
   const open = t.data.findings.filter((f) => !f.acknowledged);
   const acked = t.data.findings.filter((f) => f.acknowledged);
-  const watched = Date.now() / 1000 - t.data.watching_since;
+  // As of the last fetch (it refreshes every minute).
+  const watched = t.dataUpdatedAt / 1000 - t.data.watching_since;
   return (
     <>
       <div className="panel">
@@ -195,8 +196,8 @@ export function ThreatBanner() {
   const open = (t.data?.findings ?? []).filter(
     (f) => !f.acknowledged && f.severity !== "low",
   );
-  if (open.length === 0) return null;
   const worst = open[0];
+  if (!worst) return null;
   return (
     <div className={`banner banner-${worst.severity}`}>
       <b>
