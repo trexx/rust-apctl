@@ -1,34 +1,24 @@
 import { useState } from "react";
-import { useQueryClient } from "@tanstack/react-query";
-import { adoptAp, adoptOverSsh, useAdoption, useMe } from "../api";
+import { adoptAp, adoptOverSsh, keys, useAdoption, useCanEdit } from "../api";
 import { ago } from "../format";
+import { Outcome, useRunner } from "./common";
 
 /** APs waiting for adoption, and adopting one by IP over SSH (active mode). */
 export function AdoptionPanel() {
-  const a = useAdoption();
-  const readOnly = useMe().data?.read_only ?? true;
-  const qc = useQueryClient();
+  const canEdit = useCanEdit();
+  // Read-only users never see the panel, so don't fetch (or poll) for them.
+  const a = useAdoption(canEdit);
   const [form, setForm] = useState(false);
   const [ip, setIp] = useState("");
   const [user, setUser] = useState("");
   const [pass, setPass] = useState("");
-  const [busy, setBusy] = useState(false);
-  const [msg, setMsg] = useState<{ ok: boolean; text: string } | null>(null);
-  if (!a.data || !a.data.active || readOnly) return null;
+  const { busy, msg, run } = useRunner([
+    keys.adoption(),
+    keys.devices(),
+    keys.events(),
+  ]);
+  if (!a.data || !a.data.active || !canEdit) return null;
   const d = a.data;
-  const run = async (fn: () => Promise<string>) => {
-    setBusy(true);
-    setMsg(null);
-    try {
-      setMsg({ ok: true, text: await fn() });
-    } catch (e) {
-      setMsg({ ok: false, text: e instanceof Error ? e.message : String(e) });
-    } finally {
-      setBusy(false);
-      for (const k of ["adoption", "devices", "events"])
-        void qc.invalidateQueries({ queryKey: [k] });
-    }
-  };
   const nothing = d.pending.length === 0 && d.adopting.length === 0;
   return (
     <div className="panel">
@@ -135,6 +125,8 @@ export function AdoptionPanel() {
                 void run(async () => {
                   const r = await adoptOverSsh(ip.trim(), user, pass);
                   setForm(false);
+                  // Don't keep the AP's password around once it has been used.
+                  setPass("");
                   return `${r.mac} is being adopted: it should report here within a minute.`;
                 })
               }
@@ -150,11 +142,7 @@ export function AdoptionPanel() {
           </div>
         </div>
       )}
-      {msg && (
-        <div className={`small ${msg.ok ? "tone-good" : "error"}`}>
-          {msg.text}
-        </div>
-      )}
+      <Outcome msg={msg} />
     </div>
   );
 }

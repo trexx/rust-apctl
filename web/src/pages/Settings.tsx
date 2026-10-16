@@ -1,41 +1,21 @@
-import { useState } from "react";
-import { useQueryClient } from "@tanstack/react-query";
-import { importState, useMe, useSettingsState } from "../api";
-import { ErrorNote, Loading } from "../components/common";
+import { importState, keys, useCanEdit, useSettingsState } from "../api";
+import { ErrorNote, Loading, Outcome, useRunner } from "../components/common";
 import { NotificationSettings } from "../components/Alerts";
 import { BackupSection } from "../components/Backups";
 import { SiteSettingsPanel } from "../components/SettingsEditor";
 import { ago, clock } from "../format";
 
 export function Settings() {
-  const qc = useQueryClient();
   const state = useSettingsState();
-  const readOnly = useMe().data?.read_only ?? false;
-  const [message, setMessage] = useState<{ ok: boolean; text: string } | null>(
-    null,
-  );
-  const [busy, setBusy] = useState(false);
+  const canEdit = useCanEdit();
+  const { busy, msg, run } = useRunner([keys.settingsState()], 500);
 
-  const onFile = async (file: File | undefined) => {
+  const onFile = (file: File | undefined) => {
     if (!file) return;
-    setBusy(true);
-    setMessage(null);
-    try {
-      const snapshot = JSON.parse(await file.text());
-      await importState(snapshot);
-      setMessage({ ok: true, text: `Imported ${file.name}.` });
-      window.setTimeout(
-        () => void qc.invalidateQueries({ queryKey: ["settings-state"] }),
-        500,
-      );
-    } catch (e) {
-      setMessage({
-        ok: false,
-        text: e instanceof Error ? e.message : String(e),
-      });
-    } finally {
-      setBusy(false);
-    }
+    void run(async () => {
+      await importState(JSON.parse(await file.text()));
+      return `Imported ${file.name}.`;
+    });
   };
 
   if (state.isLoading) return <Loading />;
@@ -80,7 +60,7 @@ export function Settings() {
             should push.
           </p>
         )}
-        {!readOnly && (
+        {canEdit && (
           <div className="import">
             <p className="muted small">
               Import a snapshot of the existing controller's settings, made with{" "}
@@ -94,14 +74,15 @@ export function Settings() {
                 accept="application/json,.json"
                 hidden
                 disabled={busy}
-                onChange={(e) => void onFile(e.target.files?.[0])}
+                onChange={(e) => {
+                  const file = e.target.files?.[0];
+                  // Lets the same file be chosen again, e.g. after a failed import.
+                  e.target.value = "";
+                  onFile(file);
+                }}
               />
             </label>
-            {message && (
-              <div className={message.ok ? "ok small" : "error small"}>
-                {message.text}
-              </div>
-            )}
+            <Outcome msg={msg} />
           </div>
         )}
       </div>

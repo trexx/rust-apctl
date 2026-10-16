@@ -1,10 +1,16 @@
 import { useMemo, useState } from "react";
-import { Link, useSearchParams } from "react-router-dom";
+import { Link } from "react-router-dom";
 import { AttemptList } from "../components/Connections";
 import { RangePicker, SpanContext, useTimeSpan } from "../components/Chart";
 import { displayName, useClients } from "../api";
 import type { ClientView } from "../api";
-import { ErrorNote, Loading, Signal } from "../components/common";
+import {
+  ErrorNote,
+  Loading,
+  Signal,
+  Tabs,
+  useUrlTab,
+} from "../components/common";
 import { ago, band, duration, phy } from "../format";
 
 type SortKey =
@@ -31,29 +37,14 @@ function value(c: ClientView, key: SortKey): string | number {
   }
 }
 
+const TABS = [
+  ["clients", "Clients"],
+  ["attempts", "Connection attempts"],
+] as const;
+
 export function Clients() {
-  const [params, setParams] = useSearchParams();
-  const tab = params.get("tab") === "attempts" ? "attempts" : "clients";
-  const tabs = (
-    <div className="segmented" role="tablist">
-      <button
-        role="tab"
-        aria-selected={tab === "clients"}
-        className={tab === "clients" ? "active" : ""}
-        onClick={() => setParams({})}
-      >
-        Clients
-      </button>
-      <button
-        role="tab"
-        aria-selected={tab === "attempts"}
-        className={tab === "attempts" ? "active" : ""}
-        onClick={() => setParams({ tab: "attempts" })}
-      >
-        Connection attempts
-      </button>
-    </div>
-  );
+  const [tab, setTab] = useUrlTab(TABS);
+  const tabs = <Tabs tabs={TABS} value={tab} onChange={setTab} />;
   return tab === "attempts" ? (
     <Attempts tabs={tabs} />
   ) : (

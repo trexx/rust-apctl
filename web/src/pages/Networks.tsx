@@ -1,3 +1,4 @@
+import { Suspense, lazy } from "react";
 import { Link } from "react-router-dom";
 import { useWlans } from "../api";
 import type { Wlan } from "../api";
@@ -10,12 +11,20 @@ import {
   ZoomContext,
   useTimeSpan,
 } from "../components/Chart";
-import { ErrorNote, Loading, Signal } from "../components/common";
-import { spanText } from "../components/Insights";
-import {
-  SpeedLimitsPanel,
-  WlanSettingsPanel,
-} from "../components/SettingsEditor";
+import { QueryState, Signal } from "../components/common";
+import { spanText } from "../components/insights/shared";
+
+// The settings editor is large: load it on demand.
+const WlanSettingsPanel = lazy(() =>
+  import("../components/SettingsEditor").then((m) => ({
+    default: m.WlanSettingsPanel,
+  })),
+);
+const SpeedLimitsPanel = lazy(() =>
+  import("../components/SettingsEditor").then((m) => ({
+    default: m.SpeedLimitsPanel,
+  })),
+);
 
 /** Experience bands as the official controller colours them: 90+ excellent, 70+ good. */
 const uxTone = (v: number | null) =>
@@ -191,20 +200,23 @@ export function Networks() {
             <span className="spacer" />
             <RangePicker value={span} onChange={setSpan} />
           </div>
-          <WlanSettingsPanel />
-          <SpeedLimitsPanel />
-          {w.error && <ErrorNote error={w.error} />}
-          {!w.data ? (
-            <Loading />
-          ) : w.data.wlans.length === 0 ? (
-            <div className="muted">No networks seen yet.</div>
-          ) : (
-            <div className="stack">
-              {w.data.wlans.map((x) => (
-                <WlanPanel key={x.essid} w={x} />
-              ))}
-            </div>
-          )}
+          <Suspense fallback={null}>
+            <WlanSettingsPanel />
+            <SpeedLimitsPanel />
+          </Suspense>
+          <QueryState q={w}>
+            {({ wlans }) =>
+              wlans.length === 0 ? (
+                <div className="muted">No networks seen yet.</div>
+              ) : (
+                <div className="stack">
+                  {wlans.map((x) => (
+                    <WlanPanel key={x.essid} w={x} />
+                  ))}
+                </div>
+              )
+            }
+          </QueryState>
         </div>
       </SpanContext.Provider>
     </ZoomContext.Provider>

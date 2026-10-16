@@ -1,17 +1,17 @@
 import { useEffect, useState } from "react";
-import { useQueryClient } from "@tanstack/react-query";
 import {
   createBackup,
   deleteBackup,
+  keys,
   restoreBackup,
   saveBackupSettings,
   uploadBackup,
   useBackups,
-  useMe,
+  useCanEdit,
 } from "../api";
 import type { BackupManifest, BackupMeta, BackupSettings } from "../api";
 import { ago, bytes } from "../format";
-import { ErrorNote, Loading } from "./common";
+import { ErrorNote, Loading, Outcome, useRunner } from "./common";
 
 const HISTORY: [number, string][] = [
   [0, "Settings only"],
@@ -94,22 +94,10 @@ function Schedule({
   readOnly: boolean;
   nextRun: number | null;
 }) {
-  const qc = useQueryClient();
   const [s, setS] = useState(initial);
-  const [msg, setMsg] = useState<{ ok: boolean; text: string } | null>(null);
+  const { msg, run } = useRunner([keys.backups()], 1200);
   const dirty = JSON.stringify(s) !== JSON.stringify(initial);
-  const save = async () => {
-    try {
-      await saveBackupSettings(s);
-      setMsg({ ok: true, text: "Saved." });
-      setTimeout(
-        () => void qc.invalidateQueries({ queryKey: ["backups"] }),
-        1200,
-      );
-    } catch (e) {
-      setMsg({ ok: false, text: e instanceof Error ? e.message : String(e) });
-    }
-  };
+  const save = () => void run(() => saveBackupSettings(s), "Saved.");
   return (
     <div className="backup-form">
       <label className="check">
@@ -215,11 +203,7 @@ function Schedule({
             Save
           </button>
         )}
-        {msg && (
-          <span className={`small ${msg.ok ? "tone-good" : "error"}`}>
-            {msg.text}
-          </span>
-        )}
+        <Outcome msg={msg} inline />
       </div>
       {initial.enabled && nextRun && (
         <div className="muted small">
@@ -260,12 +244,11 @@ function ConfirmRestore({
 }
 
 export function BackupSection() {
-  const qc = useQueryClient();
   const b = useBackups();
-  const readOnly = useMe().data?.read_only ?? false;
+  const readOnly = !useCanEdit();
   const [days, setDays] = useState(0);
-  const [busy, setBusy] = useState(false);
-  const [error, setError] = useState<string | null>(null);
+  // Only failures are reported; success shows in the list.
+  const { busy, msg, run } = useRunner([keys.backups()], 300);
   const [confirm, setConfirm] = useState<{
     name?: string;
     staged?: string;
@@ -278,20 +261,6 @@ export function BackupSection() {
   } | null>(null);
   const [restarting, setRestarting] = useState(false);
   useRestartWatch(restarting);
-  const refresh = () =>
-    setTimeout(() => void qc.invalidateQueries({ queryKey: ["backups"] }), 300);
-  const run = async (f: () => Promise<unknown>) => {
-    setBusy(true);
-    setError(null);
-    try {
-      await f();
-      refresh();
-    } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
-    } finally {
-      setBusy(false);
-    }
-  };
 
   if (b.error) return <ErrorNote error={b.error} />;
   if (!b.data) return <Loading />;
@@ -384,7 +353,7 @@ export function BackupSection() {
           </label>
         </div>
       )}
-      {error && <div className="error small">{error}</div>}
+      <Outcome msg={msg} />
       {uploaded && !confirm && (
         <div className="banner">
           <b>{uploaded.file}</b> checks out: made{" "}

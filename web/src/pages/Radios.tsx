@@ -1,19 +1,21 @@
 import { useMemo, useState } from "react";
-import { Link, useSearchParams } from "react-router-dom";
+import { Link } from "react-router-dom";
 import { useChannelPlan, useNeighbors, useRadios } from "../api";
 import type { Neighbor, RadioOverview } from "../api";
-import { ago, bytes } from "../format";
-import {
-  ApSpacing,
-  BandPicker,
-  DeploymentDensity,
-} from "../components/Insights";
+import { ago, band as bandName, bytes } from "../format";
+import { ApSpacing } from "../components/insights/ApSpacing";
+import { DeploymentDensity } from "../components/insights/DeploymentDensity";
+import { BandPicker } from "../components/insights/shared";
 import { ThreatList } from "../components/Threats";
 import { RoamingView } from "../components/RoamingView";
-import { ErrorNote, Loading, Meter, Signal } from "../components/common";
+import {
+  Meter,
+  QueryState,
+  Signal,
+  Tabs,
+  useUrlTab,
+} from "../components/common";
 import { ChannelAiPanel, PlanActions } from "../components/ChannelAi";
-
-const BAND_NAME: Record<string, string> = { ng: "2.4 GHz", na: "5 GHz" };
 
 /** Centre frequency (MHz) of a channel of the given width. */
 function centre(
@@ -66,7 +68,7 @@ function Spectrum({ band, shapes }: { band: "ng" | "na"; shapes: Shape[] }) {
       viewBox={`0 0 ${W} ${H}`}
       className="spectrum"
       role="img"
-      aria-label={`${BAND_NAME[band]} channel occupancy`}
+      aria-label={`${bandName(band)} channel occupancy`}
     >
       {[-30, -50, -70, -90].map((s) => (
         <g key={s}>
@@ -138,7 +140,7 @@ function ChannelPlan({
   return (
     <div className="panel">
       <div className="panel-head">
-        <b>Channel plan, {BAND_NAME[band]}</b>
+        <b>Channel plan, {bandName(band)}</b>
         <span className="spacer" />
         {band === "na" && (
           <label className="small">
@@ -160,86 +162,85 @@ function ChannelPlan({
           ` Channels allowed: ${plan.data.allowed.join(", ")}.`}
       </p>
       <PlanActions band={band} plan={plan.data} />
-      {plan.error && <ErrorNote error={plan.error} />}
-      {!plan.data ? (
-        <Loading />
-      ) : (
-        <div className="table-wrap">
-          <table className="table">
-            <thead>
-              <tr>
-                <th>AP</th>
-                <th>Now</th>
-                <th>Score</th>
-                <th>Suggested</th>
-                <th>Why</th>
-              </tr>
-            </thead>
-            <tbody>
-              {plan.data.plan.map((p) => {
-                const r = radios.find(
-                  (x) => x.mac === p.mac && x.radio === band,
-                );
-                return (
-                  <tr key={p.mac}>
-                    <td>
-                      <Link to={`/devices/${p.mac}`}>{p.name ?? p.mac}</Link>
-                      <div className="muted small">
-                        {p.clients} clients
-                        {p.pinned && " · kept as is"}
-                      </div>
-                    </td>
-                    <td className="nowrap">
-                      {p.current_channel ?? "—"}
-                      <span className="muted small">
-                        {" "}
-                        / {r?.bw ?? p.width} MHz
-                      </span>
-                    </td>
-                    <td>{p.current_score ?? "—"}</td>
-                    <td className="nowrap">
-                      {p.change && p.not_allowed ? (
-                        <b className="suggest">
-                          → {p.suggested_channel}{" "}
-                          <span className="muted small">
-                            (now on a channel it may not use)
-                          </span>
-                        </b>
-                      ) : p.change ? (
-                        <b className="suggest">
-                          → {p.suggested_channel}{" "}
-                          <span className="muted small">
-                            (score {p.suggested_score})
-                          </span>
-                        </b>
-                      ) : (
-                        <span className="muted">keep</span>
-                      )}
-                    </td>
-                    <td className="small">
-                      {(p.current_reasons ?? []).length > 0 && (
-                        <div>
-                          Now hears {(p.current_reasons ?? []).join(", ")}
+      <QueryState q={plan}>
+        {(data) => (
+          <div className="table-wrap">
+            <table className="table">
+              <thead>
+                <tr>
+                  <th>AP</th>
+                  <th>Now</th>
+                  <th>Score</th>
+                  <th>Suggested</th>
+                  <th>Why</th>
+                </tr>
+              </thead>
+              <tbody>
+                {data.plan.map((p) => {
+                  const r = radios.find(
+                    (x) => x.mac === p.mac && x.radio === band,
+                  );
+                  return (
+                    <tr key={p.mac}>
+                      <td>
+                        <Link to={`/devices/${p.mac}`}>{p.name ?? p.mac}</Link>
+                        <div className="muted small">
+                          {p.clients} clients
+                          {p.pinned && " · kept as is"}
                         </div>
-                      )}
-                      {p.change && p.suggested_reasons.length > 0 && (
-                        <div className="muted">
-                          There: {p.suggested_reasons.join(", ")}
-                        </div>
-                      )}
-                      {p.change && p.suggested_reasons.length === 0 && (
-                        <div className="muted">
-                          Nothing heard on {p.suggested_channel}
-                        </div>
-                      )}
-                    </td>
-                  </tr>
-                );
-              })}
-            </tbody>
-          </table>
-        </div>
-      )}
+                      </td>
+                      <td className="nowrap">
+                        {p.current_channel ?? "—"}
+                        <span className="muted small">
+                          {" "}
+                          / {r?.bw ?? p.width} MHz
+                        </span>
+                      </td>
+                      <td>{p.current_score ?? "—"}</td>
+                      <td className="nowrap">
+                        {p.change && p.not_allowed ? (
+                          <b className="suggest">
+                            → {p.suggested_channel}{" "}
+                            <span className="muted small">
+                              (now on a channel it may not use)
+                            </span>
+                          </b>
+                        ) : p.change ? (
+                          <b className="suggest">
+                            → {p.suggested_channel}{" "}
+                            <span className="muted small">
+                              (score {p.suggested_score})
+                            </span>
+                          </b>
+                        ) : (
+                          <span className="muted">keep</span>
+                        )}
+                      </td>
+                      <td className="small">
+                        {(p.current_reasons ?? []).length > 0 && (
+                          <div>
+                            Now hears {(p.current_reasons ?? []).join(", ")}
+                          </div>
+                        )}
+                        {p.change && p.suggested_reasons.length > 0 && (
+                          <div className="muted">
+                            There: {p.suggested_reasons.join(", ")}
+                          </div>
+                        )}
+                        {p.change && p.suggested_reasons.length === 0 && (
+                          <div className="muted">
+                            Nothing heard on {p.suggested_channel}
+                          </div>
+                        )}
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </QueryState>
     </div>
   );
 }
@@ -277,7 +278,7 @@ function RadioTable({ radios }: { radios: RadioOverview[] }) {
                 <td>
                   <Link to={`/devices/${r.mac}`}>{r.name ?? r.mac}</Link>
                 </td>
-                <td className="nowrap">{BAND_NAME[r.radio] ?? r.radio}</td>
+                <td className="nowrap">{bandName(r.radio)}</td>
                 {r.channel === null ? (
                   <td colSpan={2} className="muted small">
                     not in use (no SSIDs on this band)
@@ -334,17 +335,19 @@ function RadioTable({ radios }: { radios: RadioOverview[] }) {
 
 function Channels() {
   const r = useRadios(86400);
-  if (r.error) return <ErrorNote error={r.error} />;
-  if (!r.data) return <Loading />;
   return (
-    <>
-      <RadioTable radios={r.data} />
-      <ChannelAiPanel />
-      <div className="grid2">
-        <ChannelPlan band="na" radios={r.data} />
-        <ChannelPlan band="ng" radios={r.data} />
-      </div>
-    </>
+    <QueryState q={r}>
+      {(radios) => (
+        <>
+          <RadioTable radios={radios} />
+          <ChannelAiPanel />
+          <div className="grid2">
+            <ChannelPlan band="na" radios={radios} />
+            <ChannelPlan band="ng" radios={radios} />
+          </div>
+        </>
+      )}
+    </QueryState>
   );
 }
 
@@ -428,7 +431,9 @@ function Environment() {
             Include your APs as heard by each other
           </label>
         </div>
-        {!n.data ? <Loading /> : <Spectrum band={band} shapes={shapes} />}
+        <QueryState q={n}>
+          {() => <Spectrum band={band} shapes={shapes} />}
+        </QueryState>
         <div className="legend small">
           <span className="swatch own" /> your APs <span className="swatch" />{" "}
           neighbouring networks (strongest signal seen in the last 7 days)
@@ -452,53 +457,58 @@ function Environment() {
             onChange={(e) => setQ(e.target.value)}
           />
         </div>
-        {!n.data ? (
-          <Loading />
-        ) : unique.length === 0 ? (
-          <div className="muted small">
-            Nothing heard yet on {BAND_NAME[band]}.
-          </div>
-        ) : (
-          <div className="table-wrap">
-            <table className="table">
-              <thead>
-                <tr>
-                  <th>Network</th>
-                  <th>Channel</th>
-                  <th>Signal</th>
-                  <th>Security</th>
-                  <th>Vendor</th>
-                  <th>Heard best by</th>
-                  <th>Last seen</th>
-                </tr>
-              </thead>
-              <tbody>
-                {unique.map((x) => (
-                  <tr key={x.bssid}>
-                    <td>
-                      {x.essid || <span className="muted">hidden</span>}
-                      {x.is_unifi && x.ap_name && (
-                        <span className="tag">your AP {x.ap_name}</span>
-                      )}
-                      <div className="muted small mono">{x.bssid}</div>
-                    </td>
-                    <td className="nowrap">
-                      {x.channel ?? "—"}
-                      <span className="muted small"> / {x.bw ?? 20} MHz</span>
-                    </td>
-                    <td>
-                      <Signal dbm={x.best_signal ?? x.signal} />
-                    </td>
-                    <td className="small">{x.security ?? "—"}</td>
-                    <td className="small">{x.vendor ?? "—"}</td>
-                    <td className="small">{x.nearest_ap ?? "—"}</td>
-                    <td className="small nowrap">{ago(x.last_seen)}</td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
-        )}
+        <QueryState q={n}>
+          {() =>
+            unique.length === 0 ? (
+              <div className="muted small">
+                Nothing heard yet on {bandName(band)}.
+              </div>
+            ) : (
+              <div className="table-wrap">
+                <table className="table">
+                  <thead>
+                    <tr>
+                      <th>Network</th>
+                      <th>Channel</th>
+                      <th>Signal</th>
+                      <th>Security</th>
+                      <th>Vendor</th>
+                      <th>Heard best by</th>
+                      <th>Last seen</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {unique.map((x) => (
+                      <tr key={x.bssid}>
+                        <td>
+                          {x.essid || <span className="muted">hidden</span>}
+                          {x.is_unifi && x.ap_name && (
+                            <span className="tag">your AP {x.ap_name}</span>
+                          )}
+                          <div className="muted small mono">{x.bssid}</div>
+                        </td>
+                        <td className="nowrap">
+                          {x.channel ?? "—"}
+                          <span className="muted small">
+                            {" "}
+                            / {x.bw ?? 20} MHz
+                          </span>
+                        </td>
+                        <td>
+                          <Signal dbm={x.best_signal ?? x.signal} />
+                        </td>
+                        <td className="small">{x.security ?? "—"}</td>
+                        <td className="small">{x.vendor ?? "—"}</td>
+                        <td className="small">{x.nearest_ap ?? "—"}</td>
+                        <td className="small nowrap">{ago(x.last_seen)}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            )
+          }
+        </QueryState>
       </div>
       <div className="grid2 align-top">
         <DeploymentDensity />
@@ -516,25 +526,12 @@ const TABS = [
 ] as const;
 
 export function Radios() {
-  const [params, setParams] = useSearchParams();
-  const tab = TABS.find(([k]) => k === params.get("tab"))?.[0] ?? "channels";
+  const [tab, setTab] = useUrlTab(TABS);
   return (
     <div className="page">
       <div className="page-head">
         <h1>Radios</h1>
-        <div className="segmented" role="tablist">
-          {TABS.map(([k, label]) => (
-            <button
-              key={k}
-              role="tab"
-              aria-selected={tab === k}
-              className={tab === k ? "active" : ""}
-              onClick={() => setParams(k === "channels" ? {} : { tab: k })}
-            >
-              {label}
-            </button>
-          ))}
-        </div>
+        <Tabs tabs={TABS} value={tab} onChange={setTab} />
       </div>
       {tab === "channels" ? (
         <Channels />

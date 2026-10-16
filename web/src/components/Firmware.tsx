@@ -1,17 +1,17 @@
 import { useState } from "react";
 import { Link } from "react-router-dom";
-import { useQueryClient } from "@tanstack/react-query";
 import {
   cancelFirmware,
   checkFirmware,
+  keys,
   upgradeFirmware,
   upgradeFirmwareUrl,
+  useCanEdit,
   useFirmware,
-  useMe,
 } from "../api";
 import type { FirmwareInfo } from "../api";
 import { ago, bytes, clock } from "../format";
-import { ErrorNote, Loading } from "./common";
+import { ErrorNote, Loading, Outcome, useRunner } from "./common";
 
 const STATUS: Record<FirmwareInfo["aps"][number]["status"], [string, string]> =
   {
@@ -29,28 +29,12 @@ const STEP: Record<string, string> = {
 };
 
 export function FirmwarePanel() {
-  const qc = useQueryClient();
   const f = useFirmware();
-  const readOnly = useMe().data?.read_only ?? false;
-  const [busy, setBusy] = useState(false);
-  const [msg, setMsg] = useState<{ ok: boolean; text: string } | null>(null);
+  const readOnly = !useCanEdit();
   const [urlFor, setUrlFor] = useState<string | null>(null);
   const [url, setUrl] = useState("");
-  const run = async (fn: () => Promise<string>) => {
-    setBusy(true);
-    setMsg(null);
-    try {
-      setMsg({ ok: true, text: await fn() });
-    } catch (e) {
-      setMsg({ ok: false, text: e instanceof Error ? e.message : String(e) });
-    } finally {
-      setBusy(false);
-      setTimeout(
-        () => void qc.invalidateQueries({ queryKey: ["firmware"] }),
-        1200,
-      );
-    }
-  };
+  // The engine updates the job list a moment after each request.
+  const { busy, msg, run } = useRunner([keys.firmware()], 1200);
   if (f.error) return <ErrorNote error={f.error} />;
   if (!f.data) return <Loading />;
   const d = f.data;
@@ -111,11 +95,7 @@ export function FirmwarePanel() {
             Updating from apctl works after the cutover.
           </p>
         )}
-        {msg && (
-          <div className={`small ${msg.ok ? "tone-good" : "error"}`}>
-            {msg.text}
-          </div>
-        )}
+        <Outcome msg={msg} />
         <div className="table-wrap">
           <table className="table">
             <thead>

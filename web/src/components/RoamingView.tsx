@@ -1,9 +1,10 @@
 import { Link } from "react-router-dom";
 import { useRoaming } from "../api";
+import type { Roaming } from "../api";
 import { band, clock } from "../format";
 import { RangePicker, useTimeSpan } from "./Chart";
-import { ErrorNote, Loading, Signal, Stat } from "./common";
-import { spanText } from "./Insights";
+import { QueryState, Signal, Stat } from "./common";
+import { spanText } from "./insights/shared";
 
 /** Same colours as the official roaming map: green above 67 %, orange above 33 %. */
 const healthTone = (pct: number) =>
@@ -23,19 +24,14 @@ export function RoamingView() {
           <span className="spacer" />
           <RangePicker value={span} onChange={setSpan} />
         </div>
-        {r.error && <ErrorNote error={r.error} />}
-        {!r.data ? <Loading /> : <Summary data={r.data} />}
+        <QueryState q={r}>{(data) => <Summary data={data} />}</QueryState>
       </div>
       {r.data && r.data.roams.length > 0 && <Details data={r.data} />}
     </>
   );
 }
 
-function Summary({
-  data,
-}: {
-  data: NonNullable<ReturnType<typeof useRoaming>["data"]>;
-}) {
+function Summary({ data }: { data: Roaming }) {
   const n = data.roams.length;
   if (n === 0)
     return (
@@ -78,11 +74,7 @@ function Summary({
   );
 }
 
-function Details({
-  data,
-}: {
-  data: NonNullable<ReturnType<typeof useRoaming>["data"]>;
-}) {
+function Details({ data }: { data: Roaming }) {
   const ap = (m: string) => data.ap_names[m] ?? m;
   const client = (m: string) => data.client_names[m] ?? m;
   return (

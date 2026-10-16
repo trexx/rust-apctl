@@ -1,70 +1,32 @@
-import { useState } from "react";
-import { useQueryClient } from "@tanstack/react-query";
 import {
   blockClient,
   forgetAp,
+  keys,
   kickClient,
   lockClient,
   locateAp,
   provisionAp,
   restartAp,
   setClientSpeedLimit,
-  speed,
-  useMe,
+  useCanEdit,
   useStatus,
   useUserGroups,
 } from "../api";
 import type { DeviceSummary, Mac } from "../api";
-
-/** Runs one action at a time and shows its outcome under the buttons. */
-function useAction(refresh: unknown[][]) {
-  const qc = useQueryClient();
-  const [busy, setBusy] = useState(false);
-  const [msg, setMsg] = useState<{ ok: boolean; text: string } | null>(null);
-  const run = async (fn: () => Promise<unknown>, done: string) => {
-    setBusy(true);
-    setMsg(null);
-    try {
-      // A message from the action itself wins over the fixed one.
-      const r = await fn();
-      setMsg({ ok: true, text: typeof r === "string" && r ? r : done });
-    } catch (e) {
-      setMsg({ ok: false, text: e instanceof Error ? e.message : String(e) });
-    } finally {
-      setBusy(false);
-      for (const key of refresh) void qc.invalidateQueries({ queryKey: key });
-    }
-  };
-  return { busy, msg, run };
-}
+import { speed } from "../format";
+import { Outcome, useRunner } from "./common";
 
 /** Whether actions can be used: active mode, signed in. */
 function useCanAct(): { can: boolean; why: string | null } {
   const status = useStatus().data;
-  const me = useMe().data;
-  if (me?.read_only ?? true) return { can: false, why: null };
+  const canEdit = useCanEdit();
+  if (!canEdit) return { can: false, why: null };
   if (status && status.mode !== "active")
     return {
       can: false,
       why: "Actions work after the cutover: in shadow mode apctl never talks to the APs.",
     };
   return { can: !!status, why: null };
-}
-
-function Outcome({
-  msg,
-  why,
-}: {
-  msg: { ok: boolean; text: string } | null;
-  why: string | null;
-}) {
-  if (msg)
-    return (
-      <div className={`small ${msg.ok ? "tone-good" : "error"}`}>
-        {msg.text}
-      </div>
-    );
-  return why ? <div className="small muted">{why}</div> : null;
 }
 
 export function DeviceActions({
@@ -79,7 +41,7 @@ export function DeviceActions({
   locating: boolean;
 }) {
   const { can, why } = useCanAct();
-  const { busy, msg, run } = useAction([["device", mac], ["devices"]]);
+  const { busy, msg, run } = useRunner([keys.device(mac), keys.devices()]);
   if (!can && !why) return null;
   const off = !can || busy || !online;
   return (
@@ -170,10 +132,10 @@ export function ClientActions({
   usergroupId: string | null;
 }) {
   const { can, why } = useCanAct();
-  const { busy, msg, run } = useAction([
-    ["client", mac],
-    ["clients"],
-    ["settings"],
+  const { busy, msg, run } = useRunner([
+    keys.client(mac),
+    keys.clients(),
+    keys.settings(),
   ]);
   const groups = (useUserGroups().data?.groups ?? []).filter((g) => !g.default);
   if (!can && !why) return null;

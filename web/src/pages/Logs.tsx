@@ -1,13 +1,24 @@
 import { useEffect, useState } from "react";
 import { useSearchParams } from "react-router-dom";
 import { useDevices, useLogs } from "../api";
-import { ErrorNote, Loading, LogList, deviceNames } from "../components/common";
+import {
+  ApSelect,
+  LogList,
+  QueryState,
+  deviceNames,
+} from "../components/common";
 
 export function Logs() {
   const [params, setParams] = useSearchParams();
   const device = params.get("device") ?? "";
   const q = params.get("q") ?? "";
   const [text, setText] = useState(q);
+  // When the URL's search changes from outside (the Logs link, Back), show it.
+  const [shown, setShown] = useState(q);
+  if (q !== shown) {
+    setShown(q);
+    setText(q);
+  }
   const devices = useDevices();
   const names = deviceNames(devices.data);
   const logs = useLogs({
@@ -44,18 +55,7 @@ export function Logs() {
           {logs.data ? `${logs.data.length} lines` : ""}
         </span>
         <span className="spacer" />
-        <select
-          value={device}
-          onChange={(e) => setDevice(e.target.value)}
-          aria-label="Access point"
-        >
-          <option value="">All APs</option>
-          {(devices.data ?? []).map((d) => (
-            <option key={d.mac} value={d.mac}>
-              {d.name ?? d.mac}
-            </option>
-          ))}
-        </select>
+        <ApSelect value={device} onChange={setDevice} />
         <input
           className="search"
           placeholder="Search log text (all words must match)"
@@ -64,13 +64,9 @@ export function Logs() {
         />
       </div>
       <div className="panel">
-        {logs.error ? (
-          <ErrorNote error={logs.error} />
-        ) : logs.data ? (
-          <LogList logs={logs.data} names={names} />
-        ) : (
-          <Loading />
-        )}
+        <QueryState q={logs}>
+          {(data) => <LogList logs={data} names={names} />}
+        </QueryState>
       </div>
     </div>
   );

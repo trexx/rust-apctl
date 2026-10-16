@@ -1,4 +1,5 @@
 import type { ReactNode } from "react";
+import type { ConfigPushed } from "../api";
 
 /** What each top-level section of an AP's config is about. */
 const AREA: Record<string, string> = {
@@ -84,13 +85,13 @@ export function group(
 }
 
 /** The settings changes in a config push (or a preview of one), grouped by section. */
-export function summarise(d: Record<string, any>): {
+export function summarise(d: ConfigPushed): {
   changes: Change[];
   groups: ReturnType<typeof group>;
 } {
   const diffs = [d.system_cfg?.diff, d.mgmt_cfg?.diff].filter(
-    (x) => typeof x === "string" && x,
-  ) as string[];
+    (x): x is string => typeof x === "string" && !!x,
+  );
   // The version stamp changes with every push; it says nothing about the settings.
   const changes = diffs
     .flatMap(parseDiff)

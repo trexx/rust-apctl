@@ -1,0 +1,215 @@
+import { useState } from "react";
+import { Link } from "react-router-dom";
+import { useMulticast } from "../../api";
+import type { SiteMulticast, TimeSpan } from "../../api";
+import { compact } from "../../format";
+import { COLORS, Chart, SpanContext } from "../Chart";
+import { QueryState } from "../common";
+import { spanText } from "./shared";
+
+const MCAST_COLORS: Record<string, string> = {
+  mdns: COLORS.blue,
+  ssdp: COLORS.purple,
+  arp: COLORS.orange,
+  igmp: COLORS.green,
+  mld: "#7a9a3a",
+  stream: COLORS.red,
+  dhcp: COLORS.teal,
+  dhcpv6: "#4a8fa0",
+  ipv6_nd: "#b07ab0",
+  other: "#8a8f98",
+};
+
+const MCAST_LABEL: Record<string, string> = {
+  mdns: "mDNS",
+  ssdp: "SSDP",
+  arp: "ARP",
+  igmp: "IGMP",
+  mld: "MLD",
+  stream: "Streams",
+  dhcp: "DHCP",
+  dhcpv6: "DHCPv6",
+  ipv6_nd: "IPv6 ND",
+  other: "Other",
+};
+
+/** Multicast and broadcast by traffic type, and the clients behind it. */
+export function MulticastPanel({
+  mac,
+  span,
+  title = "Multicast and broadcast",
+}: {
+  mac?: string;
+  span: TimeSpan;
+  title?: string;
+}) {
+  const [dir, setDir] = useState<"tx" | "rx">("tx");
+  const m = useMulticast(span, mac);
+  return (
+    <QueryState q={m} panel>
+      {(data) => (
+        <MulticastView
+          data={data}
+          mac={mac}
+          span={span}
+          title={title}
+          dir={dir}
+          setDir={setDir}
+        />
+      )}
+    </QueryState>
+  );
+}
+
+function MulticastView({
+  data,
+  mac,
+  span,
+  title,
+  dir,
+  setDir,
+}: {
+  data: SiteMulticast;
+  mac?: string;
+  span: TimeSpan;
+  title: string;
+  dir: "tx" | "rx";
+  setDir: (d: "tx" | "rx") => void;
+}) {
+  const kinds = Object.entries(data.types)
+    .filter(([, v]) => v.tx_pkts + v.rx_pkts > 0)
+    .sort((a, b) => b[1][`${dir}_pkts`] - a[1][`${dir}_pkts`]);
+  return (
+    <div className="panel">
+      <div className="panel-head">
+        <b>{title}</b>
+        <span className="muted small">{spanText(span)}</span>
+        <span className="spacer" />
+        <div className="segmented" role="group" aria-label="Direction">
+          <button
+            className={dir === "tx" ? "active" : ""}
+            onClick={() => setDir("tx")}
+          >
+            To clients
+          </button>
+          <button
+            className={dir === "rx" ? "active" : ""}
+            onClick={() => setDir("rx")}
+          >
+            From clients
+          </button>
+        </div>
+      </div>
+      <div className="mcast-stack">
+        <div>
+          <SpanContext.Provider value={span}>
+            <Chart
+              title={`Packets per second by type, ${dir === "tx" ? "delivered to clients" : "sent by clients"}`}
+              ts={data.ts}
+              height={160}
+              min={0}
+              format={(v) => `${v.toFixed(v < 10 ? 1 : 0)}/s`}
+              series={kinds.map(([k, v]) => ({
+                label: MCAST_LABEL[k] ?? k,
+                values: v[`${dir}_pps`],
+                color: MCAST_COLORS[k] ?? COLORS.teal,
+              }))}
+            />
+          </SpanContext.Provider>
+          <div className="mcast-types small">
+            {kinds.map(([k, v]) => (
+              <span key={k}>
+                <i
+                  className="swatch"
+                  style={{
+                    background: MCAST_COLORS[k] ?? COLORS.teal,
+                    borderColor: MCAST_COLORS[k] ?? COLORS.teal,
+                  }}
+                />{" "}
+                {MCAST_LABEL[k] ?? k} <b>{compact(v[`${dir}_pkts`])}</b>
+              </span>
+            ))}
+          </div>
+        </div>
+        {data.clients.length > 0 && (
+          <table className="table mcast-clients">
+            <thead>
+              <tr>
+                <th>Client</th>
+                <th title="Multicast and broadcast packets the client sent">
+                  Sent
+                </th>
+                <th title="Multicast and broadcast packets its network delivered while it was connected">
+                  Received
+                </th>
+                <th>Services</th>
+                <th>Delivery</th>
+              </tr>
+            </thead>
+            <tbody>
+              {data.clients.slice(0, 8).map((c) => (
+                <tr key={c.mac}>
+                  <td>
+                    <Link to={`/clients/${c.mac}`}>{c.name ?? c.mac}</Link>
+                    <div className="muted small">
+                      {[c.vendor, !mac && c.ap].filter(Boolean).join(" · ")}
+                    </div>
+                  </td>
+                  <td className="nowrap">{compact(c.rx_pkts)} pkts</td>
+                  <td className="nowrap">{compact(c.tx_pkts)} pkts</td>
+                  <td className="small">
+                    {c.services.length
+                      ? serviceNames(c.services).slice(0, 3).join(", ")
+                      : "—"}
+                  </td>
+                  <td
+                    className="small"
+                    title={
+                      c.delivery === "flooding"
+                        ? "Joined groups are flooded to every client"
+                        : c.delivery === "optimized"
+                          ? "Only sent to clients that joined"
+                          : undefined
+                    }
+                  >
+                    {c.delivery ?? "—"}
+                    {c.memberships > 0 && (
+                      <span className="muted"> · {c.memberships} groups</span>
+                    )}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        )}
+      </div>
+    </div>
+  );
+}
+
+const SERVICES: [RegExp, string][] = [
+  [/_airplay|_raop/, "AirPlay"],
+  [/_googlecast|_googlezone/, "Chromecast"],
+  [/_ipp|_printer|_pdl-datastream|_scanner|_uscan/, "Printers"],
+  [/_spotify/, "Spotify Connect"],
+  [/_homekit|_hap\./, "HomeKit"],
+  [/_companion-link|_rdlink|_apple-mobdev|_sleep-proxy/, "Apple devices"],
+  [/_androidtvremote|_amzn|_nvstream/, "TV remotes"],
+  [/_smb|_afpovertcp|_nfs/, "File sharing"],
+  [/_matter/, "Matter"],
+  [/_hue|_homeconnect|_miio|_esphomelib/, "Smart home"],
+];
+
+/** Friendly names for the mDNS service types a client used. */
+export function serviceNames(
+  services: { name: string; pkts: number }[],
+): string[] {
+  const out = new Map<string, number>();
+  for (const s of services) {
+    const name =
+      SERVICES.find(([re]) => re.test(s.name))?.[1] ??
+      (s.name.startsWith("_services._dns-sd") ? null : "Others");
+    if (name) out.set(name, (out.get(name) ?? 0) + s.pkts);
+  }
+  return [...out.entries()].sort((a, b) => b[1] - a[1]).map(([n]) => n);
+}

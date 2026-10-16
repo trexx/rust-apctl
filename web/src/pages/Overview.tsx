@@ -6,19 +6,18 @@ import {
   EventList,
   Loading,
   Meter,
+  QueryState,
   Stat,
   clientNames,
   deviceNames,
 } from "../components/common";
-import { ago, band, duration, pct } from "../format";
-import {
-  Connectivity,
-  DeploymentDensity,
-  MulticastPanel,
-  RetryBuckets,
-  SiteActivity,
-  TopTalkers,
-} from "../components/Insights";
+import { SIGNAL, ago, band, dbm, duration, pct } from "../format";
+import { Connectivity } from "../components/insights/Connectivity";
+import { DeploymentDensity } from "../components/insights/DeploymentDensity";
+import { MulticastPanel } from "../components/insights/Multicast";
+import { RetryBuckets } from "../components/insights/RetryBuckets";
+import { SiteActivity } from "../components/insights/SiteActivity";
+import { TopTalkers } from "../components/insights/TopTalkers";
 import { useTimeSpan } from "../components/Chart";
 import { ThreatBanner } from "../components/Threats";
 import { AdoptionPanel } from "../components/Adoption";
@@ -41,7 +40,9 @@ export function Overview() {
       band(c.sample.radio),
       (byBand.get(band(c.sample.radio)) ?? 0) + 1,
     );
-  const weak = connected.filter((c) => (c.sample.signal ?? 0) < -75).length;
+  const weak = connected.filter(
+    (c) => (c.sample.signal ?? 0) < SIGNAL.fair,
+  ).length;
 
   return (
     <div className="page">
@@ -59,7 +60,11 @@ export function Overview() {
             "none connected"
           }
         />
-        <Stat label="Weak signal" value={weak} sub="clients below −75 dBm" />
+        <Stat
+          label="Weak signal"
+          value={weak}
+          sub={`clients below ${dbm(SIGNAL.fair)}`}
+        />
         <Stat
           label="Shadow feed"
           value={status.data ? status.data.counters.informs : "—"}
@@ -147,11 +152,11 @@ export function Overview() {
         </Link>
       </h2>
       <div className="panel">
-        {events.data ? (
-          <EventList events={events.data} names={names} clientNames={cnames} />
-        ) : (
-          <Loading />
-        )}
+        <QueryState q={events}>
+          {(data) => (
+            <EventList events={data} names={names} clientNames={cnames} />
+          )}
+        </QueryState>
       </div>
     </div>
   );

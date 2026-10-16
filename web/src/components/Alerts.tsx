@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { Link, useNavigate } from "react-router-dom";
 import { useQueryClient } from "@tanstack/react-query";
-import { markAlertsRead, useAlerts } from "../api";
+import { keys, markAlertsRead, useAlerts } from "../api";
 import type { AlertCategory, AlertItem } from "../api";
 import { clock } from "../format";
 
@@ -145,7 +145,7 @@ export function AlertBell() {
   const readAll = async () => {
     await markAlertsRead().catch(() => undefined);
     window.setTimeout(
-      () => void qc.invalidateQueries({ queryKey: ["alerts"] }),
+      () => void qc.invalidateQueries({ queryKey: keys.alerts() }),
       800,
     );
   };

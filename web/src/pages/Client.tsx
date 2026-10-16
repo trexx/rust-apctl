@@ -2,12 +2,15 @@ import { useState } from "react";
 import { Link, useParams } from "react-router-dom";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import {
+  HttpError,
+  displayName,
+  keys,
   setAlias,
+  useCanEdit,
   useClients,
   useClient,
   useDevices,
   useEvents,
-  useMe,
   useSeries,
 } from "../api";
 import {
@@ -22,14 +25,14 @@ import {
   Dot,
   ErrorNote,
   EventList,
-  Loading,
+  QueryState,
   Signal,
   Stat,
   clientNames,
   deviceNames,
 } from "../components/common";
-import { ago, band, bitrate, bytes, duration, phy } from "../format";
-import { serviceNames } from "../components/Insights";
+import { ago, band, bitrate, bytes, compact, duration, phy } from "../format";
+import { serviceNames } from "../components/insights/Multicast";
 import { ConnectionLog } from "../components/Connections";
 import { ClientActions } from "../components/Actions";
 import type { ClientView, Multicast } from "../api";
@@ -49,12 +52,10 @@ export function Client() {
 
   const c = client.data;
   const s = c?.sample;
-  const f = series.data?.fields;
-  const ts = series.data?.ts ?? [];
-  const bits = (a: (number | null)[] | undefined) =>
-    (a ?? []).map((v) => (v === null ? null : v * 8));
-  const mbps = (a: (number | null)[] | undefined) =>
-    (a ?? []).map((v) => (v === null ? null : v / 1000));
+  // The live view when there is one, else the stored one from the list.
+  const v = c ?? listed;
+  const unknown =
+    client.error instanceof HttpError && client.error.status === 404;
 
   return (
     <ZoomContext.Provider value={(from, to) => setRange({ from, to })}>
@@ -64,47 +65,40 @@ export function Client() {
             <AliasHeader
               mac={mac}
               connected={c?.connected}
-              alias={c?.alias ?? listed?.alias ?? null}
-              note={c?.note ?? listed?.note ?? null}
-              hostname={s?.hostname ?? listed?.sample.hostname ?? null}
+              alias={v?.alias ?? null}
+              note={v?.note ?? null}
+              hostname={v?.sample.hostname ?? null}
             />
             <span className="spacer" />
             <RangePicker value={range} onChange={setRange} />
           </div>
           <ClientActions
             mac={mac}
-            name={
-              c?.alias ||
-              s?.hostname ||
-              listed?.alias ||
-              listed?.sample.hostname ||
-              mac
-            }
+            name={v ? displayName(v) : mac}
             connected={c?.connected ?? false}
-            blocked={c?.blocked ?? listed?.blocked ?? false}
-            lockedTo={c?.locked_to ?? listed?.locked_to ?? null}
+            blocked={v?.blocked ?? false}
+            lockedTo={v?.locked_to ?? null}
             aps={devices.data ?? []}
-            usergroupId={c?.usergroup_id ?? listed?.usergroup_id ?? null}
+            usergroupId={v?.usergroup_id ?? null}
           />
-          {(c?.blocked ?? listed?.blocked) && (
+          {v?.blocked && (
             <div className="banner">
               Blocked: no AP lets this device join any SSID.
             </div>
           )}
-          {(c?.locked_to ?? listed?.locked_to) && (
+          {v?.locked_to && (
             <div className="banner">
-              Locked to{" "}
-              {names.get((c?.locked_to ?? listed?.locked_to)!) ??
-                c?.locked_to ??
-                listed?.locked_to}
-              : the other APs refuse it.
+              Locked to {names.get(v.locked_to) ?? v.locked_to}: the other APs
+              refuse it.
             </div>
           )}
-          {client.error && (
+          {unknown ? (
             <div className="banner">
               Not seen since the controller started; showing stored history
               only.
             </div>
+          ) : (
+            client.error && <ErrorNote error={client.error} />
           )}
 
           {s && c && (
@@ -148,88 +142,88 @@ export function Client() {
             </div>
           )}
 
-          {!series.data ? (
-            series.error ? (
-              <ErrorNote error={series.error} />
-            ) : (
-              <Loading />
-            )
-          ) : (
-            <div className="grid2">
-              <div className="panel">
-                <Chart
-                  title="Signal and noise"
-                  ts={ts}
-                  format={(v) => `${Math.round(v)} dBm`}
-                  min={-100}
-                  max={-20}
-                  series={[
-                    {
-                      label: "Signal",
-                      values: f!.signal,
-                      color: COLORS.blue,
-                      fill: true,
-                    },
-                    { label: "Noise", values: f!.noise, color: COLORS.red },
-                  ]}
-                />
-                <Chart
-                  title="PHY rate"
-                  ts={ts}
-                  format={(v) => `${Math.round(v)} Mbps`}
-                  series={[
-                    {
-                      label: "Down (AP→client)",
-                      values: mbps(f!.tx_rate),
-                      color: COLORS.green,
-                    },
-                    {
-                      label: "Up (client→AP)",
-                      values: mbps(f!.rx_rate),
-                      color: COLORS.purple,
-                    },
-                  ]}
-                />
+          <QueryState q={series}>
+            {({ ts, fields: f }) => (
+              <div className="grid2">
+                <div className="panel">
+                  <Chart
+                    title="Signal and noise"
+                    ts={ts}
+                    format={(v) => `${Math.round(v)} dBm`}
+                    min={-100}
+                    max={-20}
+                    series={[
+                      {
+                        label: "Signal",
+                        values: f.signal,
+                        color: COLORS.blue,
+                        fill: true,
+                      },
+                      { label: "Noise", values: f.noise, color: COLORS.red },
+                    ]}
+                  />
+                  <Chart
+                    title="PHY rate"
+                    ts={ts}
+                    format={(v) => `${Math.round(v)} Mbps`}
+                    series={[
+                      {
+                        label: "Down (AP→client)",
+                        values: f.tx_rate,
+                        scale: 1 / 1000,
+                        color: COLORS.green,
+                      },
+                      {
+                        label: "Up (client→AP)",
+                        values: f.rx_rate,
+                        scale: 1 / 1000,
+                        color: COLORS.purple,
+                      },
+                    ]}
+                  />
+                </div>
+                <div className="panel">
+                  <Chart
+                    title="Throughput"
+                    ts={ts}
+                    format={(v) => bitrate(v / 8)}
+                    series={[
+                      {
+                        label: "Down",
+                        values: f.tx_bytes,
+                        scale: 8,
+                        color: COLORS.blue,
+                        fill: true,
+                      },
+                      {
+                        label: "Up",
+                        values: f.rx_bytes,
+                        scale: 8,
+                        color: COLORS.purple,
+                      },
+                    ]}
+                  />
+                  <Chart
+                    title="Retries and latency"
+                    ts={ts}
+                    format={(v) => v.toFixed(v < 10 ? 1 : 0)}
+                    series={[
+                      {
+                        label: "TX retries/s",
+                        values: f.tx_retries,
+                        color: COLORS.orange,
+                      },
+                      {
+                        label: "Latency (ms)",
+                        values: f.latency_avg,
+                        color: COLORS.teal,
+                      },
+                    ]}
+                  />
+                </div>
               </div>
-              <div className="panel">
-                <Chart
-                  title="Throughput"
-                  ts={ts}
-                  format={(v) => bitrate(v / 8)}
-                  series={[
-                    {
-                      label: "Down",
-                      values: bits(f!.tx_bytes),
-                      color: COLORS.blue,
-                      fill: true,
-                    },
-                    {
-                      label: "Up",
-                      values: bits(f!.rx_bytes),
-                      color: COLORS.purple,
-                    },
-                  ]}
-                />
-                <Chart
-                  title="Retries and latency"
-                  ts={ts}
-                  format={(v) => v.toFixed(v < 10 ? 1 : 0)}
-                  series={[
-                    {
-                      label: "TX retries/s",
-                      values: f!.tx_retries,
-                      color: COLORS.orange,
-                    },
-                    {
-                      label: "Latency (ms)",
-                      values: f!.latency_avg,
-                      color: COLORS.teal,
-                    },
-                  ]}
-                />
-              </div>
-            </div>
-          )}
+            )}
+          </QueryState>
 
           {s?.multicast && (
             <ClientMulticast
@@ -246,15 +240,11 @@ export function Client() {
 
           <h2>Timeline</h2>
           <div className="panel">
-            {events.data ? (
-              <EventList
-                events={events.data}
-                names={names}
-                clientNames={cnames}
-              />
-            ) : (
-              <Loading />
-            )}
+            <QueryState q={events}>
+              {(data) => (
+                <EventList events={data} names={names} clientNames={cnames} />
+              )}
+            </QueryState>
           </div>
         </div>
       </SpanContext.Provider>
@@ -271,7 +261,7 @@ function AliasHeader(p: {
   hostname: string | null;
 }) {
   const qc = useQueryClient();
-  const readOnly = useMe().data?.read_only ?? false;
+  const canEdit = useCanEdit();
   const [editing, setEditing] = useState(false);
   const [alias, setAliasText] = useState("");
   const [note, setNote] = useState("");
@@ -281,14 +271,10 @@ function AliasHeader(p: {
     onSuccess: () => {
       setEditing(false);
       // The engine applies the change asynchronously; the live socket also refreshes.
-      window.setTimeout(
-        () => void qc.invalidateQueries({ queryKey: ["client", p.mac] }),
-        300,
-      );
-      window.setTimeout(
-        () => void qc.invalidateQueries({ queryKey: ["clients"] }),
-        300,
-      );
+      window.setTimeout(() => {
+        void qc.invalidateQueries({ queryKey: keys.client(p.mac) });
+        void qc.invalidateQueries({ queryKey: keys.clients() });
+      }, 300);
     },
   });
   const start = () => {
@@ -344,7 +330,7 @@ function AliasHeader(p: {
       <h1>
         {p.connected !== undefined && <Dot ok={p.connected} />}{" "}
         {p.alias || p.hostname || p.mac}
-        {!readOnly && (
+        {canEdit && (
           <button
             className="btn small"
             onClick={start}
@@ -376,9 +362,6 @@ const TYPE_LABEL: Record<string, string> = {
   other: "Other",
 };
 
-const n = (x: number) =>
-  new Intl.NumberFormat("en-GB", { notation: "compact" }).format(x);
-
 /** What this client sends and receives as multicast/broadcast, from the AP's latest report. */
 function ClientMulticast({
   mac,
@@ -402,7 +385,7 @@ function ClientMulticast({
           c.sample.mac !== mac &&
           c.sample.multicast?.memberships.includes(group),
       )
-      .map((c) => c.alias || c.sample.hostname || c.sample.mac);
+      .map(displayName);
   const services = serviceNames(m.services);
   return (
     <>
@@ -428,8 +411,8 @@ function ClientMulticast({
                 {types.map(([k, c]) => (
                   <tr key={k}>
                     <td>{TYPE_LABEL[k] ?? k}</td>
-                    <td>{n(c.rx_pkts)}</td>
-                    <td>{n(c.tx_pkts)}</td>
+                    <td>{compact(c.rx_pkts)}</td>
+                    <td>{compact(c.tx_pkts)}</td>
                   </tr>
                 ))}
               </tbody>

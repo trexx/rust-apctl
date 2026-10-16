@@ -1,40 +1,26 @@
-import { useState } from "react";
-import { useQueryClient } from "@tanstack/react-query";
 import {
   applyChannelPlan,
+  eventData,
+  keys,
   runChannelAi,
   saveChannelAi,
   startScan,
+  useCanEdit,
   useChannelAi,
   useDevices,
   useEvents,
-  useMe,
 } from "../api";
 import type { ChannelPlanResult } from "../api";
-import { clock } from "../format";
-import { ErrorNote, Loading } from "./common";
+import { band as bandName, clock } from "../format";
+import { ErrorNote, Loading, Outcome, QueryState, useRunner } from "./common";
 
-const BAND: Record<string, string> = { ng: "2.4 GHz", na: "5 GHz" };
-
-function useRun() {
-  const qc = useQueryClient();
-  const [busy, setBusy] = useState(false);
-  const [msg, setMsg] = useState<{ ok: boolean; text: string } | null>(null);
-  const run = async (fn: () => Promise<string>) => {
-    setBusy(true);
-    setMsg(null);
-    try {
-      setMsg({ ok: true, text: await fn() });
-    } catch (e) {
-      setMsg({ ok: false, text: e instanceof Error ? e.message : String(e) });
-    } finally {
-      setBusy(false);
-      for (const k of ["channel-ai", "rf-plan", "events", "radios"])
-        void qc.invalidateQueries({ queryKey: [k] });
-    }
-  };
-  return { busy, msg, run };
-}
+/**
+ * Runs Channel AI actions. The settings checkboxes each send a patch built
+ * from the current settings, so `busy` lasts until the refetched settings are
+ * in: a second click can't send a patch built from stale ones.
+ */
+const useRun = () =>
+  useRunner([keys.channelAi(), keys.rfPlan(), keys.events(), keys.rfRadios()]);
 
 /** Scan now / Apply plan for one band's channel plan. */
 export function PlanActions({
@@ -45,9 +31,9 @@ export function PlanActions({
   plan: ChannelPlanResult | undefined;
 }) {
   const ai = useChannelAi();
-  const readOnly = useMe().data?.read_only ?? true;
+  const canEdit = useCanEdit();
   const { busy, msg, run } = useRun();
-  if (readOnly || !ai.data) return null;
+  if (!canEdit || !ai.data) return null;
   const active = ai.data.active;
   const scanning = ai.data.scans.filter((s) => s.band === band);
   const changes = (plan?.plan ?? [])
@@ -92,17 +78,10 @@ export function PlanActions({
           Apply plan
         </button>
       </div>
-      {msg ? (
-        <div className={`small ${msg.ok ? "tone-good" : "error"}`}>
-          {msg.text}
-        </div>
-      ) : (
-        !active && (
-          <div className="small muted">
-            Scanning and applying work after the cutover.
-          </div>
-        )
-      )}
+      <Outcome
+        msg={msg}
+        why={active ? null : "Scanning and applying work after the cutover."}
+      />
     </div>
   );
 }
@@ -113,14 +92,14 @@ const HOURS = Array.from({ length: 24 }, (_, h) => h);
 export function ChannelAiPanel() {
   const ai = useChannelAi();
   const devices = useDevices();
-  const readOnly = useMe().data?.read_only ?? true;
+  const canEdit = useCanEdit();
   const runs = useEvents({ kind: "channel_plan", limit: 10 });
   const { busy, msg, run } = useRun();
   if (ai.error) return <ErrorNote error={ai.error} />;
   if (!ai.data) return <Loading />;
   const d = ai.data;
   const s = d.settings;
-  const can = d.active && !readOnly && !busy;
+  const can = d.active && canEdit && !busy;
   const save = (patch: Record<string, unknown>) =>
     void run(async () => (await saveChannelAi(patch)).what);
   const name = (mac: string) =>
@@ -136,7 +115,7 @@ export function ChannelAiPanel() {
           {d.active && d.next_run ? ` · next ${clock(d.next_run)}` : ""}
         </span>
         <span className="spacer" />
-        {!readOnly && (
+        {canEdit && (
           <button
             className="btn small"
             disabled={!can || d.running}
@@ -201,7 +180,7 @@ export function ChannelAiPanel() {
                     })
                   }
                 />
-                {BAND[b]}
+                {bandName(b)}
               </label>
             ))}
           </div>
@@ -248,40 +227,40 @@ export function ChannelAiPanel() {
           </div>
         </div>
       </div>
-      {msg && (
-        <div className={`small ${msg.ok ? "tone-good" : "error"}`}>
-          {msg.text}
-        </div>
-      )}
+      <Outcome msg={msg} />
       <div className="small">
         <b>Recent runs</b>
-        {!runs.data ? (
-          <Loading />
-        ) : runs.data.length === 0 ? (
-          <div className="muted">None yet.</div>
-        ) : (
-          <ul className="plain-list">
-            {runs.data.map((e, i) => {
-              const r = (e.data ?? {}) as Record<string, any>;
-              const changes = (r.changes ?? []) as Record<string, any>[];
-              return (
-                <li key={i}>
-                  <span className="muted nowrap">{clock(e.ts)}</span>{" "}
-                  {BAND[r.band] ?? r.band} ({r.trigger}):{" "}
-                  {changes.length === 0
-                    ? "no clearly better plan, nothing moved"
-                    : changes
-                        .map(
-                          (c) =>
-                            `${c.name ?? name(c.mac)} ${c.from ?? "?"} → ${c.to}`,
-                        )
-                        .join(", ") +
-                      (r.applied ? "" : ` (not applied: ${r.error ?? "?"})`)}
-                </li>
-              );
-            })}
-          </ul>
-        )}
+        <QueryState q={runs}>
+          {(data) =>
+            data.length === 0 ? (
+              <div className="muted">None yet.</div>
+            ) : (
+              <ul className="plain-list">
+                {data.map((e) => {
+                  const r = eventData<"channel_plan">(e);
+                  const changes = r.changes ?? [];
+                  return (
+                    <li key={e.id}>
+                      <span className="muted nowrap">{clock(e.ts)}</span>{" "}
+                      {r.band ? bandName(r.band) : r.band} ({r.trigger}):{" "}
+                      {changes.length === 0
+                        ? "no clearly better plan, nothing moved"
+                        : changes
+                            .map(
+                              (c) =>
+                                `${c.name ?? name(c.mac)} ${c.from ?? "?"} → ${c.to}`,
+                            )
+                            .join(", ") +
+                          (r.applied
+                            ? ""
+                            : ` (not applied: ${r.error ?? "?"})`)}
+                    </li>
+                  );
+                })}
+              </ul>
+            )
+          }
+        </QueryState>
       </div>
     </div>
   );

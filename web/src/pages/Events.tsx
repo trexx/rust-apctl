@@ -1,9 +1,9 @@
-import { useState } from "react";
+import { useSearchParams } from "react-router-dom";
 import { useClients, useDevices, useEvents } from "../api";
 import {
-  ErrorNote,
+  ApSelect,
   EventList,
-  Loading,
+  QueryState,
   clientNames,
   deviceNames,
 } from "../components/common";
@@ -19,8 +19,20 @@ const KINDS: { value: string; label: string }[] = [
 ];
 
 export function Events() {
-  const [kind, setKind] = useState("");
-  const [device, setDevice] = useState("");
+  // Filters live in the URL (`?kind=&device=`), as on the Logs page.
+  const [params, setParams] = useSearchParams();
+  const kind = params.get("kind") ?? "";
+  const device = params.get("device") ?? "";
+  const set = (key: string, value: string) =>
+    setParams(
+      (prev) => {
+        const next = new URLSearchParams(prev);
+        if (value) next.set(key, value);
+        else next.delete(key);
+        return next;
+      },
+      { replace: true },
+    );
   const devices = useDevices();
   const names = deviceNames(devices.data);
   const cnames = clientNames(useClients().data);
@@ -35,24 +47,13 @@ export function Events() {
       <div className="page-head">
         <h1>Events</h1>
         <span className="spacer" />
-        <select
-          value={device}
-          onChange={(e) => setDevice(e.target.value)}
-          aria-label="Access point"
-        >
-          <option value="">All APs</option>
-          {(devices.data ?? []).map((d) => (
-            <option key={d.mac} value={d.mac}>
-              {d.name ?? d.mac}
-            </option>
-          ))}
-        </select>
+        <ApSelect value={device} onChange={(mac) => set("device", mac)} />
         <div className="segmented" role="group" aria-label="Event type">
           {KINDS.map((k) => (
             <button
               key={k.value}
               className={kind === k.value ? "active" : ""}
-              onClick={() => setKind(k.value)}
+              onClick={() => set("kind", k.value)}
             >
               {k.label}
             </button>
@@ -60,13 +61,11 @@ export function Events() {
         </div>
       </div>
       <div className="panel">
-        {events.error ? (
-          <ErrorNote error={events.error} />
-        ) : events.data ? (
-          <EventList events={events.data} names={names} clientNames={cnames} />
-        ) : (
-          <Loading />
-        )}
+        <QueryState q={events}>
+          {(data) => (
+            <EventList events={data} names={names} clientNames={cnames} />
+          )}
+        </QueryState>
       </div>
     </div>
   );

@@ -1,7 +1,7 @@
 import { useState } from "react";
 import { Link } from "react-router-dom";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
-import { ackThreat, useMe, useThreats } from "../api";
+import { ackThreat, keys, useCanEdit, useThreats } from "../api";
 import type { ThreatFinding } from "../api";
 import { ago, band, duration } from "../format";
 import { ErrorNote, Loading, Signal } from "./common";
@@ -27,7 +27,7 @@ function Finding({ f, readOnly }: { f: ThreatFinding; readOnly: boolean }) {
       setNoting(false);
       // The engine writes asynchronously: refresh once it has.
       setTimeout(
-        () => void qc.invalidateQueries({ queryKey: ["threats"] }),
+        () => void qc.invalidateQueries({ queryKey: keys.threats() }),
         1500,
       );
     },
@@ -138,13 +138,12 @@ function Finding({ f, readOnly }: { f: ThreatFinding; readOnly: boolean }) {
 
 export function ThreatList() {
   const t = useThreats();
-  const me = useMe();
+  const readOnly = !useCanEdit();
   const [showAcked, setShowAcked] = useState(false);
   if (t.error) return <ErrorNote error={t.error} />;
   if (!t.data) return <Loading />;
   const open = t.data.findings.filter((f) => !f.acknowledged);
   const acked = t.data.findings.filter((f) => f.acknowledged);
-  const readOnly = me.data?.read_only ?? false;
   const watched = Date.now() / 1000 - t.data.watching_since;
   return (
     <>

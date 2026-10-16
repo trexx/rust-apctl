@@ -1,18 +1,28 @@
-import { useState } from "react";
-import { Link, useSearchParams } from "react-router-dom";
-import { useDevices, useEvents } from "../api";
+import { useMemo, useState } from "react";
+import type { ReactNode } from "react";
+import { Link } from "react-router-dom";
+import { eventData, useDevices, useEvents } from "../api";
 import type { AppEvent } from "../api";
 import { DryRunPage } from "./DryRun";
 import { FirmwarePanel } from "../components/Firmware";
-import { Loading, deviceNames } from "../components/common";
-import { clock } from "../format";
+import {
+  ApSelect,
+  QueryState,
+  Tabs,
+  deviceNames,
+  useUrlTab,
+} from "../components/common";
+import { band, clock } from "../format";
 import { ChangeGroups, summarise } from "../components/ConfigDiff";
 
-function Push({ e, ap }: { e: AppEvent; ap: React.ReactNode }) {
+function Push({ e, ap }: { e: AppEvent; ap: ReactNode }) {
   const [open, setOpen] = useState(false);
-  const d = (e.data ?? {}) as Record<string, any>;
+  const d = eventData<"config_pushed">(e);
   const s = d.system_cfg ?? {};
-  const { changes, groups } = summarise(d);
+  const { changes, groups } = useMemo(
+    () => summarise(eventData<"config_pushed">(e)),
+    [e],
+  );
   const summary = s.baseline
     ? `first config seen (${s.lines} lines)`
     : changes.length === 0
@@ -38,6 +48,40 @@ function Push({ e, ap }: { e: AppEvent; ap: React.ReactNode }) {
   );
 }
 
+/** One line for the other configuration events: its title and what happened. */
+function describe(e: AppEvent): [string, string] {
+  switch (e.kind) {
+    case "config_applied": {
+      const d = eventData<"config_applied">(e);
+      return [
+        "Applied",
+        d.seconds_after_push !== undefined && d.seconds_after_push !== null
+          ? `applied it ${d.seconds_after_push}s later`
+          : "applied it",
+      ];
+    }
+    case "radio_changed": {
+      const d = eventData<"radio_changed">(e);
+      return [
+        "Radio changed",
+        `${band(d.radio)}: channel ${d.from?.channel} → ${d.to?.channel}, ${d.from?.bw} → ${d.to?.bw} MHz, ${d.from?.tx_power} → ${d.to?.tx_power} dBm`,
+      ];
+    }
+    case "settings_changed":
+      return [
+        "Settings changed",
+        String(eventData<"settings_changed">(e).what ?? ""),
+      ];
+    default: {
+      const d = eventData<"settings_imported">(e);
+      return [
+        "Settings imported",
+        `settings imported: ${(d.wlans ?? []).length} SSIDs, ${(d.networks ?? []).length} networks`,
+      ];
+    }
+  }
+}
+
 function History() {
   const [device, setDevice] = useState("");
   const devices = useDevices();
@@ -58,103 +102,50 @@ function History() {
           stored
         </span>
         <span className="spacer" />
-        <select
-          value={device}
-          onChange={(e) => setDevice(e.target.value)}
-          aria-label="Access point"
-        >
-          <option value="">All APs</option>
-          {(devices.data ?? []).map((d) => (
-            <option key={d.mac} value={d.mac}>
-              {d.name ?? d.mac}
-            </option>
-          ))}
-        </select>
+        <ApSelect value={device} onChange={setDevice} />
       </div>
-      {!ev.data ? (
-        <Loading />
-      ) : ev.data.length === 0 ? (
-        <div className="muted small">Nothing recorded yet.</div>
-      ) : (
-        <div>
-          {ev.data.map((e, i) => {
-            const d = (e.data ?? {}) as Record<string, any>;
-            if (e.kind === "config_pushed")
-              return <Push key={i} e={e} ap={ap(e.device_mac)} />;
-            const text =
-              e.kind === "config_applied"
-                ? d.seconds_after_push !== undefined &&
-                  d.seconds_after_push !== null
-                  ? `applied it ${d.seconds_after_push}s later`
-                  : "applied it"
-                : e.kind === "radio_changed"
-                  ? `${d.radio === "ng" ? "2.4 GHz" : d.radio === "na" ? "5 GHz" : d.radio}: channel ${d.from?.channel} → ${d.to?.channel}, ${d.from?.bw} → ${d.to?.bw} MHz, ${d.from?.tx_power} → ${d.to?.tx_power} dBm`
-                  : e.kind === "settings_changed"
-                    ? String(d.what ?? "")
-                    : `settings imported: ${(d.wlans ?? []).length} SSIDs, ${(d.networks ?? []).length} networks`;
-            const title =
-              e.kind === "config_applied"
-                ? "Applied"
-                : e.kind === "radio_changed"
-                  ? "Radio changed"
-                  : e.kind === "settings_changed"
-                    ? "Settings changed"
-                    : "Settings imported";
-            return (
-              <div key={i} className="cfg-entry">
-                <div className="cfg-head">
-                  <span className="muted small nowrap">{clock(e.ts)}</span>
-                  <b className="muted">{title}</b>
-                  {e.device_mac && <span>{ap(e.device_mac)}</span>}
-                  <span className="muted small">{text}</span>
-                </div>
-              </div>
-            );
-          })}
-        </div>
-      )}
+      <QueryState q={ev}>
+        {(events) =>
+          events.length === 0 ? (
+            <div className="muted small">Nothing recorded yet.</div>
+          ) : (
+            <div>
+              {events.map((e) => {
+                if (e.kind === "config_pushed")
+                  return <Push key={e.id} e={e} ap={ap(e.device_mac)} />;
+                const [title, text] = describe(e);
+                return (
+                  <div key={e.id} className="cfg-entry">
+                    <div className="cfg-head">
+                      <span className="muted small nowrap">{clock(e.ts)}</span>
+                      <b className="muted">{title}</b>
+                      {e.device_mac && <span>{ap(e.device_mac)}</span>}
+                      <span className="muted small">{text}</span>
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          )
+        }
+      </QueryState>
     </div>
   );
 }
 
+const TABS = [
+  ["history", "History"],
+  ["dryrun", "Dry run"],
+  ["firmware", "Firmware"],
+] as const;
+
 export function Config() {
-  const [params, setParams] = useSearchParams();
-  const tab =
-    params.get("tab") === "dryrun"
-      ? "dryrun"
-      : params.get("tab") === "firmware"
-        ? "firmware"
-        : "history";
+  const [tab, setTab] = useUrlTab(TABS);
   return (
     <div className="page">
       <div className="page-head">
         <h1>Config</h1>
-        <div className="segmented" role="tablist">
-          <button
-            role="tab"
-            aria-selected={tab === "history"}
-            className={tab === "history" ? "active" : ""}
-            onClick={() => setParams({})}
-          >
-            History
-          </button>
-          <button
-            role="tab"
-            aria-selected={tab === "dryrun"}
-            className={tab === "dryrun" ? "active" : ""}
-            onClick={() => setParams({ tab: "dryrun" })}
-          >
-            Dry run
-          </button>
-          <button
-            role="tab"
-            aria-selected={tab === "firmware"}
-            className={tab === "firmware" ? "active" : ""}
-            onClick={() => setParams({ tab: "firmware" })}
-          >
-            Firmware
-          </button>
-        </div>
+        <Tabs tabs={TABS} value={tab} onChange={setTab} />
       </div>
       {tab === "history" ? (
         <History />
