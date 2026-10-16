@@ -2,6 +2,7 @@ import {
   createContext,
   useContext,
   useEffect,
+  useLayoutEffect,
   useMemo,
   useRef,
   useState,
@@ -54,7 +55,8 @@ export const COLORS = {
 
 export interface ChartSeries {
   label: string;
-  values: (number | null)[];
+  /** Missing (a field the server didn't send) draws nothing. */
+  values: (number | null)[] | undefined;
   color: string;
   /** Fill the area under the line (use for one series per chart at most). */
   fill?: boolean;
@@ -62,6 +64,44 @@ export interface ChartSeries {
   right?: boolean;
   /** Dashed line, for secondary measures. */
   dashed?: boolean;
+  /** Multiplies every value (8 for bytes to bits), so callers can pass the
+   *  query's own arrays and the chart only redraws when those change. */
+  scale?: number;
+}
+
+const NO_VALUES: (number | null)[] = [];
+
+const scaled = (s: ChartSeries) =>
+  s.scale === undefined || s.scale === 1
+    ? (s.values ?? NO_VALUES)
+    : (s.values ?? NO_VALUES).map((v) => (v === null ? null : v * s.scale!));
+
+/** What was last drawn: the chart skips drawing the same arrays again. */
+interface Drawn {
+  ts: number[];
+  values: ((number | null)[] | undefined)[];
+  scales: (number | undefined)[];
+  span: TimeSpan | null;
+}
+
+const sameData = (a: Drawn | null, b: Drawn) =>
+  !!a &&
+  a.ts === b.ts &&
+  a.span === b.span &&
+  a.values.length === b.values.length &&
+  a.values.every((v, i) => v === b.values[i] && a.scales[i] === b.scales[i]);
+
+/** Whether the page is in dark mode now, following changes. */
+function useDarkMode(): boolean {
+  const query = "(prefers-color-scheme: dark)";
+  const [dark, setDark] = useState(() => window.matchMedia(query).matches);
+  useEffect(() => {
+    const m = window.matchMedia(query);
+    const on = () => setDark(m.matches);
+    m.addEventListener("change", on);
+    return () => m.removeEventListener("change", on);
+  }, []);
+  return dark;
 }
 
 interface Props {
@@ -102,18 +142,33 @@ export function Chart({
 }: Props) {
   const box = useRef<HTMLDivElement>(null);
   const plot = useRef<uPlot | null>(null);
+  const drawn = useRef<Drawn | null>(null);
   const zoom = useContext(ZoomContext);
   const span = useContext(SpanContext);
+  const dark = useDarkMode();
+  // Read by uPlot's callbacks, which are only set up when the chart is built.
   const spanRef = useRef(span);
-  spanRef.current = span;
   const zoomRef = useRef(zoom);
-  zoomRef.current = zoom;
+  const formatRef = useRef(format);
+  const formatRightRef = useRef(formatRight);
+  useLayoutEffect(() => {
+    spanRef.current = span;
+    zoomRef.current = zoom;
+    formatRef.current = format;
+    formatRightRef.current = formatRight;
+  });
 
-  // Rebuild when the shape changes; otherwise only push new data.
+  // Rebuild when the shape (or the colour scheme, for the axes) changes; otherwise only push new data.
   const shape =
     series.map((s) => s.label + s.color + (s.right ? "r" : "")).join("|") +
-    `|${min}|${max}|${height}|${rightMax}|${!!zoom}`;
+    `|${min}|${max}|${height}|${rightMax}|${!!zoom}|${dark}`;
   const hasRight = series.some((s) => s.right);
+  const current = (): Drawn => ({
+    ts,
+    values: series.map((s) => s.values),
+    scales: series.map((s) => s.scale),
+    span,
+  });
 
   useEffect(() => {
     const el = box.current;
@@ -171,7 +226,8 @@ export function Chart({
         {
           ...axis(),
           size: fitLabels,
-          values: (_u, vals) => vals.map((v) => (v === null ? "" : format(v))),
+          values: (_u, vals) =>
+            vals.map((v) => (v === null ? "" : formatRef.current(v))),
         },
         ...(hasRight
           ? [
@@ -183,7 +239,9 @@ export function Chart({
                 size: fitLabels,
                 values: (_u: uPlot, vals: number[]) =>
                   vals.map((v) =>
-                    v === null ? "" : (formatRight ?? format)(v),
+                    v === null
+                      ? ""
+                      : (formatRightRef.current ?? formatRef.current)(v),
                   ),
               },
             ]
@@ -203,15 +261,14 @@ export function Chart({
           value: (_u: uPlot, v: number | null) =>
             v === null || v === undefined
               ? "—"
-              : (s.right ? (formatRight ?? format) : format)(v),
+              : (s.right
+                  ? (formatRightRef.current ?? formatRef.current)
+                  : formatRef.current)(v),
         })),
       ],
     };
-    const data = withGaps(
-      ts,
-      series.map((s) => s.values),
-    );
-    plot.current = new uPlot(opts, data, el);
+    drawn.current = current();
+    plot.current = new uPlot(opts, withGaps(ts, series.map(scaled)), el);
     const ro = new ResizeObserver(() =>
       plot.current?.setSize({ width: el.clientWidth, height }),
     );
@@ -220,18 +277,20 @@ export function Chart({
       ro.disconnect();
       plot.current?.destroy();
       plot.current = null;
+      drawn.current = null;
     };
+    // Everything else it reads is either part of `shape` or read through a ref.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [shape]);
 
+  // Callers build `series` on every render: only draw when the data arrays
+  // themselves (or the span) change, not on every parent render.
   useEffect(() => {
-    plot.current?.setData(
-      withGaps(
-        ts,
-        series.map((s) => s.values),
-      ),
-    );
-  }, [ts, series, span]);
+    const now = current();
+    if (sameData(drawn.current, now)) return;
+    drawn.current = now;
+    plot.current?.setData(withGaps(ts, series.map(scaled)));
+  });
 
   const empty = ts.length === 0;
   return (
@@ -257,6 +316,19 @@ export const RANGES: { label: string; seconds: number }[] = [
 ];
 
 const MAX_AGE = 400 * 86400;
+
+/** The first day of the week in the browser's locale (1 = Monday … 7 = Sunday), Monday where it can't tell. */
+function firstDayOfWeek(): number {
+  try {
+    const locale = new Intl.Locale(navigator.language) as Intl.Locale & {
+      getWeekInfo?: () => { firstDay: number };
+      weekInfo?: { firstDay: number };
+    };
+    return (locale.getWeekInfo?.() ?? locale.weekInfo)?.firstDay ?? 1;
+  } catch {
+    return 1;
+  }
+}
 
 /** The page's time span, kept in the URL (`?range=` or `?from=&to=`) so reloads,
  *  links and the Back button keep it. */
@@ -334,6 +406,8 @@ function CustomRange({
     d.setDate(d.getDate() - daysAgo);
     return Math.floor(d.getTime() / 1000);
   };
+  // Days since the week started (1 = Monday … 7 = Sunday, like firstDayOfWeek).
+  const intoWeek = ((new Date().getDay() || 7) - firstDayOfWeek() + 7) % 7;
   return (
     <div
       className="range-pop panel"
@@ -356,7 +430,7 @@ function CustomRange({
         </button>
         <button
           className="btn small"
-          onClick={() => onApply({ from: midnight(7), to: now })}
+          onClick={() => onApply({ from: midnight(intoWeek), to: now })}
         >
           This week so far
         </button>

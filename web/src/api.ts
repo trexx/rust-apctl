@@ -1,5 +1,6 @@
 import { useEffect } from "react";
-import { useQuery, useQueryClient } from "@tanstack/react-query";
+import { keepPreviousData, useQuery, useQueryClient } from "@tanstack/react-query";
+import type { QueryKey } from "@tanstack/react-query";
 
 export type Mac = string;
 
@@ -205,6 +206,8 @@ export interface Series {
 }
 
 export interface AppEvent {
+  /** The row's id: stable, and newer events have larger ones. */
+  id: number;
   ts: number;
   kind: string;
   device_mac: Mac | null;
@@ -212,7 +215,102 @@ export interface AppEvent {
   data: Record<string, unknown> | null;
 }
 
+/** What a config push records for one config file (system_cfg or mgmt_cfg). */
+export interface CfgChange {
+  diff?: string;
+  /** The first config seen for the AP: nothing to compare with. */
+  baseline?: boolean;
+  lines?: number;
+  added?: number;
+  removed?: number;
+  changed?: number;
+}
+
+interface RadioLevels {
+  channel?: number | null;
+  bw?: number | null;
+  tx_power?: number | null;
+}
+
+interface RoamEndData {
+  ap?: Mac;
+  radio?: string | null;
+  signal?: number | null;
+}
+
+/** A config push's payload, also the shape of a settings preview's per-AP entry. */
+export interface ConfigPushed {
+  system_cfg?: CfgChange;
+  mgmt_cfg?: CfgChange;
+  /** Names for numbered config sections ("wireless.3" → "Home (5 GHz)"). */
+  labels?: Record<string, string>;
+}
+
+export interface ChannelPlanRun {
+  band?: string;
+  trigger?: string;
+  changes?: { mac: Mac; name?: string | null; from?: number | null; to: number | null }[];
+  applied?: boolean;
+  error?: string | null;
+}
+
+/** Event payloads by kind: the fields the UI reads (all optional; older events may lack some). */
+export interface EventPayloads {
+  ap_seen: { model?: string | null; version?: string | null; ip?: string | null };
+  ap_online: { offline_for?: number | null };
+  ap_offline: { last_seen?: number };
+  ap_restarted: { uptime?: number | null };
+  ap_firmware_changed: { from?: string | null; to?: string | null };
+  ap_radios_restarting: object;
+  ap_config_applied: { seconds?: number; reconnected?: number; clients_before?: number };
+  config_applied: { seconds_after_push?: number | null };
+  client_connect_failed: { essid?: string | null; reason?: string | null; rssi?: number | null };
+  dfs_radar: { channel?: number | null };
+  rogue_ap: { essid?: string | null; rogue_channel?: number | null; signal_strength?: number | null };
+  network_threat: { essid?: string | null; detail?: string; severity?: "high" | "medium" | "low" };
+  client_kicked: { reason?: string | null; signal?: number | null; vap?: string | null };
+  ap_upgrade_sent: { target?: string | null };
+  ap_upgrade_started: { by?: string | null };
+  ap_upgrade_progress: { step?: string | null };
+  ap_upgrade_failed: { detail?: string | null; reason?: string | null };
+  ap_upgraded: { from?: string | null; to?: string | null; custom?: boolean };
+  client_wrong_password: { vap?: string | null };
+  client_steered: { signal?: number | null; result?: string | null; candidates?: { bssid: string; channel: number | null }[] };
+  client_experience: { anomalies?: string[]; satisfaction?: number | null; signal?: number | null };
+  ap_crash: { process?: string | null; kind?: string | null; lines?: string[] };
+  ap_process_restarted: { proc?: string | null; exit_status?: number | null; caller?: string | null };
+  ap_isolated: { heard_by?: Mac | null };
+  ap_scan_done: object;
+  ap_event: object;
+  radio_changed: { radio?: string | null; from?: RadioLevels; to?: RadioLevels };
+  config_pushed: ConfigPushed;
+  client_connected: { essid?: string | null; radio?: string | null; channel?: number | null; signal?: number | null; new?: boolean };
+  client_disconnected: { reason?: string | null; connected_for?: number | null; last_signal?: number | null };
+  client_roamed: { from?: RoamEndData; to?: RoamEndData };
+  client_renamed: { from?: string | null; to?: string | null };
+  dryrun_compared: { error?: string | null; matches?: boolean; system_cfg?: CfgChange };
+  settings_imported: { wlans?: unknown[]; networks?: unknown[] };
+  settings_changed: { what?: string };
+  channel_plan: ChannelPlanRun;
+  ap_pending: object;
+  ap_adopting: object;
+  ap_adopted: object;
+  ap_forgotten: object;
+  ap_host_key_mismatch: object;
+  ap_restart_requested: object;
+  ap_provision_requested: object;
+  client_reconnect_requested: object;
+  client_blocked: object;
+  client_unblocked: object;
+}
+
+export type EventKind = keyof EventPayloads;
+
+/** An event's payload as its kind's type: `eventData<"config_pushed">(e)`. */
+export const eventData = <K extends EventKind>(e: AppEvent) => (e.data ?? {}) as Partial<EventPayloads[K]>;
+
 export interface LogLine {
+  id: number;
   ts: number;
   device_mac: Mac | null;
   src_ip: string | null;
@@ -237,9 +335,33 @@ export interface Status {
 /** Raised for 401s; the app shell then shows the login page. */
 export class AuthError extends Error {}
 
+/** A failed request, with the server's message and the HTTP status. */
+export class HttpError extends Error {
+  readonly status: number;
+  constructor(status: number, message: string) {
+    super(message);
+    this.status = status;
+  }
+}
+
 function unauthorized(): never {
   window.dispatchEvent(new Event("apctl:unauthorized"));
   throw new AuthError("login required");
+}
+
+/** Throws for a failed response: AuthError for a 401 (unless the caller handles those), else HttpError with the server's message. */
+async function check(res: Response, handles401 = false): Promise<Response> {
+  if (res.status === 401 && !handles401) unauthorized();
+  if (!res.ok) {
+    let msg = `${res.status} ${res.statusText}`;
+    try {
+      msg = (await res.json()).error ?? msg;
+    } catch {
+      /* not JSON */
+    }
+    throw new HttpError(res.status, msg);
+  }
+  return res;
 }
 
 async function send<T>(method: string, path: string, body: unknown): Promise<T> {
@@ -249,17 +371,7 @@ async function send<T>(method: string, path: string, body: unknown): Promise<T> 
     headers: { "Content-Type": "application/json", "X-Requested-With": "apctl" },
     body: JSON.stringify(body),
   });
-  if (res.status === 401 && path !== "/api/login") unauthorized();
-  if (!res.ok) {
-    let msg = `${res.status} ${res.statusText}`;
-    try {
-      msg = (await res.json()).error ?? msg;
-    } catch {
-      /* not JSON */
-    }
-    throw new Error(msg);
-  }
-  return res.json() as Promise<T>;
+  return (await check(res, path === "/api/login")).json() as Promise<T>;
 }
 
 export const setAlias = (mac: Mac, alias: string, note: string) =>
@@ -273,19 +385,9 @@ export const kickClient = (mac: Mac) => send("POST", `/api/clients/${mac}/kick`,
 export const blockClient = (mac: Mac, blocked: boolean) => send("POST", `/api/clients/${mac}/block`, { blocked });
 export const lockClient = (mac: Mac, ap: Mac | null) => send("POST", `/api/clients/${mac}/lock`, { ap });
 
-async function get<T>(path: string): Promise<T> {
-  const res = await fetch(path);
-  if (res.status === 401) unauthorized();
-  if (!res.ok) {
-    let msg = `${res.status} ${res.statusText}`;
-    try {
-      msg = (await res.json()).error ?? msg;
-    } catch {
-      /* not JSON */
-    }
-    throw new Error(msg);
-  }
-  return res.json() as Promise<T>;
+/** GETs JSON; `signal` (React Query's) cancels it when nothing needs the answer any more. */
+async function get<T>(path: string, signal?: AbortSignal): Promise<T> {
+  return (await check(await fetch(path, { signal }))).json() as Promise<T>;
 }
 
 function qs(params: Record<string, string | number | undefined | null>): string {
@@ -297,24 +399,71 @@ function qs(params: Record<string, string | number | undefined | null>): string 
   return s ? `?${s}` : "";
 }
 
+/** A family of query keys: `f()` is the prefix that matches all of them (for invalidation), `f(a, b)` one query. */
+const family = <A extends unknown[] = []>(root: string) => (...args: Partial<A>): QueryKey => [root, ...args];
+
+/**
+ * Every query key, used by the hooks below and by everything that invalidates
+ * them, so the two can't drift apart.
+ */
+export const keys = {
+  me: family("me"),
+  status: family("status"),
+  devices: family("devices"),
+  device: family<[mac: Mac]>("device"),
+  clients: family("clients"),
+  client: family<[mac: Mac]>("client"),
+  series: family<[table: string, key: string, span: TimeSpan]>("series"),
+  events: family<[filter: object]>("events"),
+  logs: family<[filter: object]>("logs"),
+  alerts: family("alerts"),
+  settingsState: family("settings-state"),
+  dryrun: family("dryrun"),
+  threats: family("threats"),
+  siteActivity: family<[span: TimeSpan, band: string, mac: Mac | undefined]>("site-activity"),
+  siteTop: family<[span: TimeSpan, mac: Mac | undefined]>("site-top"),
+  connectivity: family<[span: TimeSpan]>("connectivity"),
+  retries: family<[span: TimeSpan]>("retries"),
+  density: family<[span: TimeSpan]>("density"),
+  connections: family<[span: TimeSpan, opts: object]>("connections"),
+  roaming: family<[span: TimeSpan]>("roaming"),
+  wlans: family<[span: TimeSpan]>("wlans"),
+  multicast: family<[span: TimeSpan, mac: Mac | undefined]>("multicast"),
+  backups: family("backups"),
+  firmware: family("firmware"),
+  rfRadios: family<[range: number]>("rf-radios"),
+  rfNeighbors: family<[range: number, band: string]>("rf-neighbors"),
+  rfPlan: family<[band: string, dfs: boolean]>("rf-plan"),
+  channelAi: family("channel-ai"),
+  adoption: family("adoption"),
+  /** The settings editor's data: `settings("site")`, `settings("device", mac)`, … */
+  settings: family<[what: "site" | "wlans" | "device" | "usergroups", mac: Mac]>("settings"),
+};
+
 export interface Me {
   auth: boolean;
   user: string | null;
-  read_only?: boolean;
+  /** Changes are refused: no users are configured. */
+  read_only: boolean;
 }
+
+/** What /api/me says while nobody is signed in (it answers 401). */
+export const SIGNED_OUT: Me = { auth: true, user: null, read_only: true };
 
 /** The logged-in user. `user` is null when a login is required. */
 export const useMe = () =>
   useQuery({
-    queryKey: ["me"],
-    queryFn: async (): Promise<Me> => {
-      const res = await fetch("/api/me");
-      if (res.status === 401) return { auth: true, user: null };
-      if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
-      return res.json() as Promise<Me>;
+    queryKey: keys.me(),
+    queryFn: async ({ signal }): Promise<Me> => {
+      const res = await fetch("/api/me", { signal });
+      if (res.status === 401) return SIGNED_OUT;
+      return (await check(res, true)).json() as Promise<Me>;
     },
     staleTime: 60_000,
   });
+
+/** Whether this user may change things: false until /api/me has answered. */
+export const useCanEdit = () => useMe().data?.read_only === false;
 
 export const login = (username: string, password: string) => send<{ user: string }>("POST", "/api/login", { username, password });
 export const logout = () => send<{ ok: boolean }>("POST", "/api/logout", {});
@@ -324,7 +473,7 @@ export interface StateSummary {
   summary: { sites: number; wlans: string[]; networks: string[]; ap_groups: string[]; devices: number; clients: number; settings: number } | null;
 }
 
-export const useSettingsState = () => useQuery({ queryKey: ["settings-state"], queryFn: () => get<StateSummary>("/api/settings/state") });
+export const useSettingsState = () => useQuery({ queryKey: keys.settingsState(), queryFn: ({ signal }) => get<StateSummary>("/api/settings/state", signal) });
 
 export const importState = (snapshot: unknown) => send<{ ok: boolean }>("POST", "/api/settings/state", snapshot);
 
@@ -356,7 +505,7 @@ export interface DryRun {
   history: { ts: number; mac: Mac; cfgversion: string | null; matches: boolean; comparison: { system_cfg?: FieldComparison; error?: string } | null }[];
 }
 
-export const useDryRun = () => useQuery({ queryKey: ["dryrun"], queryFn: () => get<DryRun>("/api/dryrun"), refetchInterval: 30_000 });
+export const useDryRun = () => useQuery({ queryKey: keys.dryrun(), queryFn: ({ signal }) => get<DryRun>("/api/dryrun", signal), refetchInterval: 30_000 });
 
 export interface SiteActivity {
   bucket: number;
@@ -520,8 +669,8 @@ export interface ThreatFinding {
 
 export const useThreats = () =>
   useQuery({
-    queryKey: ["threats"],
-    queryFn: () => get<{ watching_since: number; findings: ThreatFinding[] }>("/api/rf/threats"),
+    queryKey: keys.threats(),
+    queryFn: ({ signal }) => get<{ watching_since: number; findings: ThreatFinding[] }>("/api/rf/threats", signal),
     refetchInterval: 60_000,
   });
 
@@ -548,45 +697,27 @@ const spanLength = (s: TimeSpan) => (isFixed(s) ? s.to - s.from : s.last);
 /** Live ranges refresh; fixed windows in the past don't change. */
 const refreshFor = (s: TimeSpan, live: number) => (isFixed(s) && s.to < Date.now() / 1000 - 600 ? false : live);
 
-export const useSiteActivity = (span: TimeSpan, band: string, mac?: Mac) =>
-  useQuery({
-    queryKey: ["site-activity", span, band, mac],
-    queryFn: () => get<SiteActivity>(`/api/site/activity${qs({ ...spanParams(span), band: bandParam(band), mac })}`),
+/** A query over a time span: refreshes while the span is live, and keeps the old data on screen while a new span loads. */
+function useSpanQuery<T>(key: QueryKey, path: string, span: TimeSpan, extra: Record<string, string | number | undefined> = {}) {
+  return useQuery({
+    queryKey: key,
+    queryFn: ({ signal }) => get<T>(`${path}${qs({ ...spanParams(span), ...extra })}`, signal),
     refetchInterval: refreshFor(span, 60_000),
-    placeholderData: (p) => p,
+    placeholderData: keepPreviousData,
   });
+}
+
+export const useSiteActivity = (span: TimeSpan, band: string, mac?: Mac) =>
+  useSpanQuery<SiteActivity>(keys.siteActivity(span, band, mac), "/api/site/activity", span, { band: bandParam(band), mac });
 
 export const useSiteTop = (span: TimeSpan, mac?: Mac) =>
-  useQuery({
-    queryKey: ["site-top", span, mac],
-    queryFn: () => get<{ aps: TopEntry[]; clients: TopEntry[] }>(`/api/site/top${qs({ ...spanParams(span), mac })}`),
-    refetchInterval: refreshFor(span, 60_000),
-    placeholderData: (p) => p,
-  });
+  useSpanQuery<{ aps: TopEntry[]; clients: TopEntry[] }>(keys.siteTop(span, mac), "/api/site/top", span, { mac });
 
-export const useConnectivity = (span: TimeSpan) =>
-  useQuery({
-    queryKey: ["connectivity", span],
-    queryFn: () => get<{ bands: Record<string, Connectivity> }>(`/api/site/connectivity${qs(spanParams(span))}`),
-    refetchInterval: refreshFor(span, 60_000),
-    placeholderData: (p) => p,
-  });
+export const useConnectivity = (span: TimeSpan) => useSpanQuery<{ bands: Record<string, Connectivity> }>(keys.connectivity(span), "/api/site/connectivity", span);
 
-export const useRetries = (span: TimeSpan) =>
-  useQuery({
-    queryKey: ["retries", span],
-    queryFn: () => get<RadioRetries[]>(`/api/site/retries${qs(spanParams(span))}`),
-    refetchInterval: refreshFor(span, 60_000),
-    placeholderData: (p) => p,
-  });
+export const useRetries = (span: TimeSpan) => useSpanQuery<RadioRetries[]>(keys.retries(span), "/api/site/retries", span);
 
-export const useDensity = (span: TimeSpan) =>
-  useQuery({
-    queryKey: ["density", span],
-    queryFn: () => get<{ aps: DensityAp[] }>(`/api/site/density${qs(spanParams(span))}`),
-    refetchInterval: refreshFor(span, 60_000),
-    placeholderData: (p) => p,
-  });
+export const useDensity = (span: TimeSpan) => useSpanQuery<{ aps: DensityAp[] }>(keys.density(span), "/api/site/density", span);
 
 export interface Timings {
   association: number | null;
@@ -693,31 +824,16 @@ export interface Wlan {
 }
 
 export const useConnections = (span: TimeSpan, opts: { client?: Mac; failed?: boolean } = {}) =>
-  useQuery({
-    queryKey: ["connections", span, opts],
-    queryFn: () =>
-      get<{ attempts: ConnAttempt[]; roams: Roam[]; ap_names: Record<string, string>; client_names: Record<string, string> }>(
-        `/api/connections${qs({ ...spanParams(span), client: opts.client, failed: opts.failed ? "true" : undefined })}`,
-      ),
-    refetchInterval: refreshFor(span, 60_000),
-    placeholderData: (p) => p,
-  });
+  useSpanQuery<{ attempts: ConnAttempt[]; roams: Roam[]; ap_names: Record<string, string>; client_names: Record<string, string> }>(
+    keys.connections(span, opts),
+    "/api/connections",
+    span,
+    { client: opts.client, failed: opts.failed ? "true" : undefined },
+  );
 
-export const useRoaming = (span: TimeSpan) =>
-  useQuery({
-    queryKey: ["roaming", span],
-    queryFn: () => get<Roaming>(`/api/roaming${qs(spanParams(span))}`),
-    refetchInterval: refreshFor(span, 60_000),
-    placeholderData: (p) => p,
-  });
+export const useRoaming = (span: TimeSpan) => useSpanQuery<Roaming>(keys.roaming(span), "/api/roaming", span);
 
-export const useWlans = (span: TimeSpan) =>
-  useQuery({
-    queryKey: ["wlans", span],
-    queryFn: () => get<{ bucket: number; wlans: Wlan[] }>(`/api/wlans${qs(spanParams(span))}`),
-    refetchInterval: refreshFor(span, 60_000),
-    placeholderData: (p) => p,
-  });
+export const useWlans = (span: TimeSpan) => useSpanQuery<{ bucket: number; wlans: Wlan[] }>(keys.wlans(span), "/api/wlans", span);
 
 export interface BackupSettings {
   enabled: boolean;
@@ -748,9 +864,9 @@ export interface BackupManifest {
 
 export const useBackups = () =>
   useQuery({
-    queryKey: ["backups"],
-    queryFn: () =>
-      get<{ encrypted: boolean; version: string; settings: BackupSettings; next_run: number | null; backups: BackupMeta[]; restore_pending: boolean }>("/api/backups"),
+    queryKey: keys.backups(),
+    queryFn: ({ signal }) =>
+      get<{ encrypted: boolean; version: string; settings: BackupSettings; next_run: number | null; backups: BackupMeta[]; restore_pending: boolean }>("/api/backups", signal),
   });
 
 export const saveBackupSettings = (s: BackupSettings) => send("PUT", "/api/backups/settings", s);
@@ -765,17 +881,7 @@ export async function uploadBackup(file: File): Promise<{ staged: string; manife
     headers: { "Content-Type": "application/octet-stream", "X-Requested-With": "apctl" },
     body: file,
   });
-  if (res.status === 401) unauthorized();
-  if (!res.ok) {
-    let msg = `${res.status} ${res.statusText}`;
-    try {
-      msg = (await res.json()).error ?? msg;
-    } catch {
-      /* not JSON */
-    }
-    throw new Error(msg);
-  }
-  return res.json();
+  return (await check(res)).json();
 }
 
 export interface FirmwareRelease {
@@ -817,71 +923,72 @@ export interface FirmwareInfo {
   jobs: { current: FirmwareJob | null; queue: FirmwareJob[]; stopped: string | null };
 }
 
-export const useFirmware = () => useQuery({ queryKey: ["firmware"], queryFn: () => get<FirmwareInfo>("/api/firmware"), refetchInterval: 10_000 });
+export const useFirmware = () => useQuery({ queryKey: keys.firmware(), queryFn: ({ signal }) => get<FirmwareInfo>("/api/firmware", signal), refetchInterval: 10_000 });
 export const checkFirmware = () => send<{ platforms: number }>("POST", "/api/firmware/check", {});
 export const upgradeFirmware = (macs: Mac[]) => send<{ queued: number; skipped: { mac: Mac; why: string }[] }>("POST", "/api/firmware/upgrade", { macs });
 export const upgradeFirmwareUrl = (mac: Mac, url: string) => send("POST", "/api/firmware/upgrade-url", { mac, url });
 export const cancelFirmware = () => send<{ cancelled: number }>("POST", "/api/firmware/cancel", {});
 
-export const useMulticast = (span: TimeSpan, mac?: Mac) =>
-  useQuery({
-    queryKey: ["multicast", span, mac],
-    queryFn: () => get<SiteMulticast>(`/api/site/multicast${qs({ ...spanParams(span), mac })}`),
-    refetchInterval: refreshFor(span, 60_000),
-    placeholderData: (p) => p,
-  });
+export const useMulticast = (span: TimeSpan, mac?: Mac) => useSpanQuery<SiteMulticast>(keys.multicast(span, mac), "/api/site/multicast", span, { mac });
 
 export const useRadios = (range: number) =>
-  useQuery({ queryKey: ["rf-radios", range], queryFn: () => get<RadioOverview[]>(`/api/rf/radios${qs({ range })}`), refetchInterval: 60_000 });
+  useQuery({
+    queryKey: keys.rfRadios(range),
+    queryFn: ({ signal }) => get<RadioOverview[]>(`/api/rf/radios${qs({ range })}`, signal),
+    refetchInterval: 60_000,
+    placeholderData: keepPreviousData,
+  });
 
 export const useNeighbors = (range: number, band: string) =>
   useQuery({
-    queryKey: ["rf-neighbors", range, band],
-    queryFn: () => get<{ neighbors: Neighbor[]; own_links: OwnLink[] }>(`/api/rf/neighbors${qs({ range, band: bandParam(band) })}`),
+    queryKey: keys.rfNeighbors(range, band),
+    queryFn: ({ signal }) => get<{ neighbors: Neighbor[]; own_links: OwnLink[] }>(`/api/rf/neighbors${qs({ range, band: bandParam(band) })}`, signal),
     refetchInterval: 60_000,
+    placeholderData: keepPreviousData,
   });
 
 export const useChannelPlan = (band: string, dfs: boolean) =>
   useQuery({
-    queryKey: ["rf-plan", band, dfs],
-    queryFn: () => get<ChannelPlanResult>(`/api/rf/channel-plan${qs({ band, dfs: dfs ? "true" : undefined })}`),
+    queryKey: keys.rfPlan(band, dfs),
+    queryFn: ({ signal }) => get<ChannelPlanResult>(`/api/rf/channel-plan${qs({ band, dfs: dfs ? "true" : undefined })}`, signal),
   });
 
-export const useStatus = () => useQuery({ queryKey: ["status"], queryFn: () => get<Status>("/api/status"), refetchInterval: 15_000 });
+export const useStatus = () => useQuery({ queryKey: keys.status(), queryFn: ({ signal }) => get<Status>("/api/status", signal), refetchInterval: 15_000 });
 
-export const useDevices = () => useQuery({ queryKey: ["devices"], queryFn: () => get<DeviceSummary[]>("/api/devices") });
+export const useDevices = () => useQuery({ queryKey: keys.devices(), queryFn: ({ signal }) => get<DeviceSummary[]>("/api/devices", signal) });
 
 export const useDevice = (mac: Mac) =>
-  useQuery({ queryKey: ["device", mac], queryFn: () => get<DeviceDetail>(`/api/devices/${mac}`) });
+  useQuery({ queryKey: keys.device(mac), queryFn: ({ signal }) => get<DeviceDetail>(`/api/devices/${mac}`, signal) });
 
-export const useClients = () => useQuery({ queryKey: ["clients"], queryFn: () => get<ClientView[]>("/api/clients") });
+export const useClients = () => useQuery({ queryKey: keys.clients(), queryFn: ({ signal }) => get<ClientView[]>("/api/clients", signal) });
 
+/** One client; a 404 (HttpError) means it hasn't been seen since apctl started. */
 export const useClient = (mac: Mac) =>
-  useQuery({ queryKey: ["client", mac], queryFn: () => get<ClientView>(`/api/clients/${mac}`), retry: false });
+  useQuery({ queryKey: keys.client(mac), queryFn: ({ signal }) => get<ClientView>(`/api/clients/${mac}`, signal), retry: false });
 
 /** Time-series for one entity over a time span. */
 export const useSeries = (table: string, key: string, span: TimeSpan) =>
   useQuery({
-    queryKey: ["series", table, key, span],
-    queryFn: () => {
+    queryKey: keys.series(table, key, span),
+    queryFn: ({ signal }) => {
       const [from, to] = spanBounds(span);
-      return get<Series>(`/api/series/${table}${qs({ key, from, to })}`);
+      return get<Series>(`/api/series/${table}${qs({ key, from, to })}`, signal);
     },
     refetchInterval: refreshFor(span, spanLength(span) <= 6 * 3600 ? 15_000 : 300_000),
-    placeholderData: (prev) => prev,
+    placeholderData: keepPreviousData,
   });
 
 export const useEvents = (filter: { device?: Mac; client?: Mac; kind?: string; limit?: number }) =>
-  useQuery({ queryKey: ["events", filter], queryFn: () => get<AppEvent[]>(`/api/events${qs(filter)}`) });
+  useQuery({ queryKey: keys.events(filter), queryFn: ({ signal }) => get<AppEvent[]>(`/api/events${qs(filter)}`, signal) });
 
 export const useLogs = (filter: { device?: Mac; q?: string; limit?: number }) =>
-  useQuery({ queryKey: ["logs", filter], queryFn: () => get<LogLine[]>(`/api/logs${qs(filter)}`) });
+  useQuery({ queryKey: keys.logs(filter), queryFn: ({ signal }) => get<LogLine[]>(`/api/logs${qs(filter)}`, signal) });
 
 type LiveMsg =
   | { type: "device"; mac: Mac }
   | { type: "clients" }
-  | ({ type: "event" } & AppEvent)
-  | ({ type: "log" } & LogLine)
+  | ({ type: "event" } & Omit<AppEvent, "id">)
+  | ({ type: "log" } & Omit<LogLine, "id">)
   | ({ type: "alert"; action: "raised" | "resolved" } & AlertItem)
   | { type: "resync" };
 
@@ -903,73 +1010,129 @@ export interface AlertItem {
 }
 
 export const useAlerts = () =>
-  useQuery({ queryKey: ["alerts"], queryFn: () => get<{ alerts: AlertItem[]; unread: number }>("/api/alerts?limit=50"), refetchInterval: 120_000 });
+  useQuery({ queryKey: keys.alerts(), queryFn: ({ signal }) => get<{ alerts: AlertItem[]; unread: number }>("/api/alerts?limit=50", signal), refetchInterval: 120_000 });
 
 export const markAlertsRead = () => send("POST", "/api/alerts/read", {});
+
+/** Event kinds that change what the adoption panel shows. */
+const ADOPTION_EVENTS = new Set(["ap_pending", "ap_adopting", "ap_adopted", "ap_forgotten"]);
 
 /**
  * Keeps queries fresh from the server's WebSocket: device and client changes
  * invalidate the cached lists, new events and logs refetch their lists.
- * Invalidations are batched so a burst of messages causes one refetch.
+ *
+ * Invalidations are batched (a burst of messages causes one refetch), the busy
+ * lists are refreshed at most every few seconds, and nothing is refetched while
+ * the tab is hidden: what was missed is caught up when it shows again. After a
+ * reconnect everything is refetched, since messages sent meanwhile are lost.
  */
 export function useLiveUpdates(): void {
   const qc = useQueryClient();
   useEffect(() => {
     let ws: WebSocket | null = null;
     let closed = false;
+    let dropped = false;
     let retry = 1000;
-    const pending = new Set<string>();
+    let reconnectTimer: number | undefined;
+    let alertTimer: number | undefined;
     let flushTimer: number | undefined;
-    const invalidate = (key: string) => {
-      pending.add(key);
-      flushTimer ??= window.setTimeout(() => {
-        flushTimer = undefined;
-        for (const k of pending) void qc.invalidateQueries({ queryKey: [k] });
-        pending.clear();
-      }, 750);
+    let flushAt = Infinity;
+    // Waiting invalidations by key, each with the earliest time it may run.
+    const pending = new Map<string, { key: QueryKey; due: number }>();
+    // When each key was last invalidated, for the minimum gaps.
+    const last = new Map<string, number>();
+
+    const flush = () => {
+      flushTimer = undefined;
+      flushAt = Infinity;
+      if (document.hidden) return;
+      const now = Date.now();
+      for (const [id, p] of pending) {
+        if (p.due > now) continue;
+        pending.delete(id);
+        last.set(id, now);
+        void qc.invalidateQueries({ queryKey: p.key });
+      }
+      schedule();
+    };
+    // One timer, for the earliest due invalidation.
+    const schedule = () => {
+      if (pending.size === 0 || document.hidden) return;
+      const due = Math.min(...[...pending.values()].map((p) => p.due));
+      if (due >= flushAt) return;
+      window.clearTimeout(flushTimer);
+      flushAt = due;
+      flushTimer = window.setTimeout(flush, Math.max(0, due - Date.now()));
+    };
+    /** Invalidates `key` within 750 ms, but no sooner than `gap` ms after the last time. */
+    const invalidate = (key: QueryKey, gap = 0) => {
+      const id = JSON.stringify(key);
+      if (pending.has(id)) return;
+      pending.set(id, { key, due: Math.max(Date.now() + 750, (last.get(id) ?? 0) + gap) });
+      schedule();
+    };
+    const onVisible = () => {
+      if (!document.hidden) schedule();
+    };
+    document.addEventListener("visibilitychange", onVisible);
+
+    const onMessage = (m: MessageEvent) => {
+      let msg: LiveMsg;
+      try {
+        msg = JSON.parse(m.data as string) as LiveMsg;
+      } catch {
+        return;
+      }
+      switch (msg.type) {
+        case "device":
+          invalidate(keys.devices(), 4000);
+          invalidate(keys.device(msg.mac));
+          break;
+        case "clients":
+          // The message doesn't say which clients changed; at most one client page is open.
+          invalidate(keys.clients(), 4000);
+          invalidate(keys.client(), 4000);
+          break;
+        case "event":
+          invalidate(keys.events(), 2000);
+          if (msg.kind === "dryrun_compared" || msg.kind === "settings_imported") {
+            invalidate(keys.dryrun());
+            invalidate(keys.settingsState());
+          }
+          if (ADOPTION_EVENTS.has(msg.kind)) invalidate(keys.adoption());
+          break;
+        case "log":
+          invalidate(keys.logs(), 3000);
+          break;
+        case "alert":
+          invalidate(keys.alerts());
+          // The server stores alerts within a second of announcing them: look again then.
+          window.clearTimeout(alertTimer);
+          alertTimer = window.setTimeout(() => void qc.invalidateQueries({ queryKey: keys.alerts() }), 1500);
+          // The notifier decides whether this browser shows it.
+          window.dispatchEvent(new CustomEvent("apctl:alert", { detail: msg }));
+          break;
+        case "resync":
+          void qc.invalidateQueries();
+          break;
+      }
     };
     const connect = () => {
+      reconnectTimer = undefined;
+      if (closed) return;
       const proto = location.protocol === "https:" ? "wss" : "ws";
-      ws = new WebSocket(`${proto}://${location.host}/api/ws`);
-      ws.onopen = () => {
+      const socket = new WebSocket(`${proto}://${location.host}/api/ws`);
+      ws = socket;
+      socket.onopen = () => {
         retry = 1000;
+        // Whatever changed while disconnected (e.g. during a restart) was never announced.
+        if (dropped) void qc.invalidateQueries();
       };
-      ws.onmessage = (m) => {
-        const msg = JSON.parse(m.data as string) as LiveMsg;
-        switch (msg.type) {
-          case "device":
-            invalidate("devices");
-            invalidate("device");
-            break;
-          case "clients":
-            invalidate("clients");
-            invalidate("client");
-            break;
-          case "event":
-            invalidate("events");
-            if (msg.kind === "dryrun_compared" || msg.kind === "settings_imported") {
-              invalidate("dryrun");
-              invalidate("settings-state");
-            }
-            break;
-          case "log":
-            invalidate("logs");
-            break;
-          case "alert":
-            invalidate("alerts");
-            // The server stores alerts within a second of announcing them: look again then.
-            window.setTimeout(() => void qc.invalidateQueries({ queryKey: ["alerts"] }), 1500);
-            // The notifier decides whether this browser shows it.
-            window.dispatchEvent(new CustomEvent("apctl:alert", { detail: msg }));
-            break;
-          case "resync":
-            void qc.invalidateQueries();
-            break;
-        }
-      };
-      ws.onclose = () => {
+      socket.onmessage = onMessage;
+      socket.onclose = () => {
         if (closed) return;
-        window.setTimeout(connect, retry);
+        dropped = true;
+        reconnectTimer = window.setTimeout(connect, retry);
         retry = Math.min(retry * 2, 30_000);
       };
     };
@@ -977,7 +1140,10 @@ export function useLiveUpdates(): void {
     return () => {
       closed = true;
       ws?.close();
-      if (flushTimer) window.clearTimeout(flushTimer);
+      window.clearTimeout(reconnectTimer);
+      window.clearTimeout(flushTimer);
+      window.clearTimeout(alertTimer);
+      document.removeEventListener("visibilitychange", onVisible);
     };
   }, [qc]);
 }
@@ -1125,24 +1291,22 @@ export interface SiteSettings {
   timezones: string[];
 }
 
-export const useSiteSettings = () => useQuery({ queryKey: ["settings", "site"], queryFn: () => get<SiteSettings>("/api/settings/site"), retry: false });
-export const useWlanSettings = () => useQuery({ queryKey: ["settings", "wlans"], queryFn: () => get<WlanSettingsList>("/api/settings/wlans") });
-export const useDeviceSettings = (mac: Mac) => useQuery({ queryKey: ["settings", "device", mac], queryFn: () => get<DeviceSettings>(`/api/settings/devices/${mac}`), retry: false });
+export const useSiteSettings = () => useQuery({ queryKey: keys.settings("site"), queryFn: ({ signal }) => get<SiteSettings>("/api/settings/site", signal), retry: false });
+export const useWlanSettings = () => useQuery({ queryKey: keys.settings("wlans"), queryFn: ({ signal }) => get<WlanSettingsList>("/api/settings/wlans", signal) });
+export const useDeviceSettings = (mac: Mac) =>
+  useQuery({ queryKey: keys.settings("device", mac), queryFn: ({ signal }) => get<DeviceSettings>(`/api/settings/devices/${mac}`, signal), retry: false });
 export const wlanPassphrase = (id: string) => get<{ passphrase: string | null }>(`/api/settings/wlans/${id}/passphrase`);
 
-/** Previews (or, with `save`, saves) a change to an SSID or an AP. */
+/** Previews (or, with `save`, saves) a change to an SSID, a speed limit, an AP or the site. */
 export function changeSettings<T>(target: SettingsTarget, patch: Record<string, unknown>, save: boolean): Promise<T> {
   const q = save ? "" : "?preview=true";
   if (target.kind === "device") return send<T>("PUT", `/api/settings/devices/${target.mac}${q}`, { patch });
   if (target.kind === "site") return send<T>("PUT", `/api/settings/site${q}`, { patch });
-  if (target.kind === "usergroup") {
-    if (target.remove) return send<T>("DELETE", `/api/settings/usergroups/${target.id}${q}`, {});
-    if (target.id === null) return send<T>("POST", `/api/settings/usergroups${q}`, { patch });
-    return send<T>("PUT", `/api/settings/usergroups/${target.id}${q}`, { patch });
-  }
-  if (target.remove) return send<T>("DELETE", `/api/settings/wlans/${target.id}${q}`, {});
-  if (target.id === null) return send<T>("POST", `/api/settings/wlans${q}`, { patch });
-  return send<T>("PUT", `/api/settings/wlans/${target.id}${q}`, { patch });
+  // SSIDs and speed limits (user groups): create, change or remove.
+  const base = `/api/settings/${target.kind === "usergroup" ? "usergroups" : "wlans"}`;
+  if (target.remove) return send<T>("DELETE", `${base}/${target.id}${q}`, {});
+  if (target.id === null) return send<T>("POST", `${base}${q}`, { patch });
+  return send<T>("PUT", `${base}/${target.id}${q}`, { patch });
 }
 
 // ---- Channel AI ----
@@ -1170,7 +1334,13 @@ export interface ChannelAiStatus {
   allowed: { ng: number[] | null; na: number[] | null };
 }
 
-export const useChannelAi = () => useQuery({ queryKey: ["channel-ai"], queryFn: () => get<ChannelAiStatus>("/api/rf/channel-ai"), refetchInterval: 5_000 });
+/** Polls quickly while a run or a scan is under way. */
+export const useChannelAi = () =>
+  useQuery({
+    queryKey: keys.channelAi(),
+    queryFn: ({ signal }) => get<ChannelAiStatus>("/api/rf/channel-ai", signal),
+    refetchInterval: (q) => (q.state.data?.running || q.state.data?.scans.length ? 5_000 : 60_000),
+  });
 export const startScan = (band: string) => send<{ scanning: Mac[] }>("POST", "/api/rf/scan", { band });
 export const runChannelAi = (bands?: string[]) => send<{ started: boolean }>("POST", "/api/rf/channel-ai/run", { bands });
 export const applyChannelPlan = (band: string, changes: { mac: Mac; name: string | null; from: number | null; to: number | null }[]) =>
@@ -1190,11 +1360,12 @@ export interface UserGroup {
   used_by: string[];
 }
 
-export const useUserGroups = () => useQuery({ queryKey: ["settings", "usergroups"], queryFn: () => get<{ active: boolean; groups: UserGroup[] }>("/api/settings/usergroups") });
+export const useUserGroups = () =>
+  useQuery({ queryKey: keys.settings("usergroups"), queryFn: ({ signal }) => get<{ active: boolean; groups: UserGroup[] }>("/api/settings/usergroups", signal) });
 export const setClientSpeedLimit = (mac: Mac, usergroup_id: string | null) => send<{ saved: boolean; what: string }>("PUT", `/api/clients/${mac}/speed-limit`, { usergroup_id });
 
-/** A limit for people: "5 Mbps", or "none". */
-export const speed = (kbps: number | null | undefined) => (kbps && kbps > 0 ? `${kbps >= 1000 ? `${+(kbps / 1000).toFixed(2)} Mbps` : `${kbps} kbps`}` : "none");
+// Moved to format.ts; still exported here for the settings editor until it imports it from there.
+export { speed } from "./format";
 
 // ---- Adoption ----
 
@@ -1220,7 +1391,17 @@ export interface AdoptionStatus {
   ssh: { possible: boolean; inform_url: string | null };
 }
 
-export const useAdoption = () => useQuery({ queryKey: ["adoption"], queryFn: () => get<AdoptionStatus>("/api/devices/pending"), refetchInterval: 5_000 });
+/** APs waiting for adoption (only fetched when `enabled`); polls quickly while one is waiting, adopting or being forgotten. */
+export const useAdoption = (enabled = true) =>
+  useQuery({
+    queryKey: keys.adoption(),
+    queryFn: ({ signal }) => get<AdoptionStatus>("/api/devices/pending", signal),
+    enabled,
+    refetchInterval: (q) => {
+      const d = q.state.data;
+      return d && (d.pending.length || d.adopting.length || d.forgetting.length) ? 5_000 : 60_000;
+    },
+  });
 export const adoptAp = (mac: Mac) => send<{ adopting: boolean }>("POST", `/api/devices/${mac}/adopt`, {});
 export const adoptOverSsh = (ip: string, username: string, password: string) =>
   send<{ adopting: boolean; mac: Mac }>("POST", "/api/devices/adopt-ssh", { ip, username: username || null, password: password || null });

@@ -1,7 +1,18 @@
-import { Component, StrictMode } from "react";
+import {
+  Component,
+  StrictMode,
+  Suspense,
+  lazy,
+  useEffect,
+  useState,
+} from "react";
 import type { ReactNode } from "react";
 import { createRoot } from "react-dom/client";
-import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import {
+  QueryClient,
+  QueryClientProvider,
+  useQueryClient,
+} from "@tanstack/react-query";
 import {
   BrowserRouter,
   NavLink,
@@ -9,25 +20,52 @@ import {
   Routes,
   useLocation,
 } from "react-router-dom";
-import { useEffect, useState } from "react";
-import { useQueryClient } from "@tanstack/react-query";
-import { login, logout, useLiveUpdates, useMe, useStatus } from "./api";
+import {
+  AuthError,
+  SIGNED_OUT,
+  keys,
+  login,
+  logout,
+  useLiveUpdates,
+  useMe,
+  useStatus,
+} from "./api";
 import { Overview } from "./pages/Overview";
 import { Device } from "./pages/Device";
 import { Clients } from "./pages/Clients";
 import { Client } from "./pages/Client";
 import { Events } from "./pages/Events";
 import { Logs } from "./pages/Logs";
-import { DryRunPage } from "./pages/DryRun";
-import { Config } from "./pages/Config";
 import { Networks } from "./pages/Networks";
 import { AlertBell, useNotifier } from "./components/Alerts";
-import { Settings } from "./pages/Settings";
-import { Radios } from "./pages/Radios";
+import { Loading, Outcome, useRunner } from "./components/common";
 import "./styles.css";
 
+// Pages that are seldom opened load on demand.
+const Settings = lazy(() =>
+  import("./pages/Settings").then((m) => ({ default: m.Settings })),
+);
+const Radios = lazy(() =>
+  import("./pages/Radios").then((m) => ({ default: m.Radios })),
+);
+const Config = lazy(() =>
+  import("./pages/Config").then((m) => ({ default: m.Config })),
+);
+const DryRunPage = lazy(() =>
+  import("./pages/DryRun").then((m) => ({ default: m.DryRunPage })),
+);
+
 const queryClient = new QueryClient({
-  defaultOptions: { queries: { staleTime: 5_000, refetchOnWindowFocus: true } },
+  defaultOptions: {
+    queries: {
+      // The live socket refreshes what changes; this only limits refetches on
+      // focus and remount (hooks that need fresher data set their own).
+      staleTime: 30_000,
+      refetchOnWindowFocus: true,
+      // A missing login won't fix itself: show the login page at once.
+      retry: (n, e) => !(e instanceof AuthError) && n < 3,
+    },
+  },
 });
 
 /** Shows a failing page's error instead of unmounting the whole app. */
@@ -58,24 +96,17 @@ function Login() {
   const qc = useQueryClient();
   const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
-  const [error, setError] = useState<string | null>(null);
-  const [busy, setBusy] = useState(false);
+  const { busy, msg, run } = useRunner();
   return (
     <div className="login">
       <form
         className="panel login-box"
-        onSubmit={async (e) => {
+        onSubmit={(e) => {
           e.preventDefault();
-          setBusy(true);
-          setError(null);
-          try {
+          void run(async () => {
             await login(username, password);
             await qc.invalidateQueries();
-          } catch (err) {
-            setError(err instanceof Error ? err.message : String(err));
-          } finally {
-            setBusy(false);
-          }
+          });
         }}
       >
         <div className="brand">apctl</div>
@@ -99,7 +130,7 @@ function Login() {
             onChange={(e) => setPassword(e.target.value)}
           />
         </label>
-        {error && <div className="error small">{error}</div>}
+        <Outcome msg={msg} />
         <button
           className="btn primary"
           type="submit"
@@ -118,7 +149,7 @@ function Gate() {
   const me = useMe();
   useEffect(() => {
     const onUnauthorized = () =>
-      void qc.invalidateQueries({ queryKey: ["me"] });
+      void qc.invalidateQueries({ queryKey: keys.me() });
     window.addEventListener("apctl:unauthorized", onUnauthorized);
     return () =>
       window.removeEventListener("apctl:unauthorized", onUnauthorized);
@@ -128,7 +159,7 @@ function Gate() {
   return (
     <Shell
       user={me.data?.user ?? null}
-      readOnly={me.data?.read_only ?? false}
+      readOnly={me.data?.read_only === true}
     />
   );
 }
@@ -178,8 +209,10 @@ function Shell({ user, readOnly }: { user: string | null; readOnly: boolean }) {
               onClick={async () => {
                 await logout().catch(() => undefined);
                 // Show the login page at once, and drop everything cached for this user.
-                qc.setQueryData(["me"], { auth: true, user: null });
-                qc.removeQueries({ predicate: (q) => q.queryKey[0] !== "me" });
+                qc.setQueryData(keys.me(), SIGNED_OUT);
+                qc.removeQueries({
+                  predicate: (q) => q.queryKey[0] !== keys.me()[0],
+                });
               }}
             >
               Sign out
@@ -189,23 +222,25 @@ function Shell({ user, readOnly }: { user: string | null; readOnly: boolean }) {
       </header>
       <main>
         <ErrorBoundary resetKey={location.pathname}>
-          <Routes>
-            <Route path="/" element={<Overview />} />
-            <Route path="/devices/:mac" element={<Device />} />
-            <Route path="/clients" element={<Clients />} />
-            <Route path="/radios" element={<Radios />} />
-            <Route path="/clients/:mac" element={<Client />} />
-            <Route path="/events" element={<Events />} />
-            <Route path="/logs" element={<Logs />} />
-            <Route path="/dryrun" element={<DryRunPage />} />
-            <Route path="/config" element={<Config />} />
-            <Route path="/networks" element={<Networks />} />
-            <Route path="/settings" element={<Settings />} />
-            <Route
-              path="*"
-              element={<div className="pad muted">Page not found</div>}
-            />
-          </Routes>
+          <Suspense fallback={<Loading />}>
+            <Routes>
+              <Route path="/" element={<Overview />} />
+              <Route path="/devices/:mac" element={<Device />} />
+              <Route path="/clients" element={<Clients />} />
+              <Route path="/radios" element={<Radios />} />
+              <Route path="/clients/:mac" element={<Client />} />
+              <Route path="/events" element={<Events />} />
+              <Route path="/logs" element={<Logs />} />
+              <Route path="/dryrun" element={<DryRunPage />} />
+              <Route path="/config" element={<Config />} />
+              <Route path="/networks" element={<Networks />} />
+              <Route path="/settings" element={<Settings />} />
+              <Route
+                path="*"
+                element={<div className="pad muted">Page not found</div>}
+              />
+            </Routes>
+          </Suspense>
         </ErrorBoundary>
       </main>
     </div>
