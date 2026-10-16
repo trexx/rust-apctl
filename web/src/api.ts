@@ -505,7 +505,8 @@ export interface DryRun {
   history: { ts: number; mac: Mac; cfgversion: string | null; matches: boolean; comparison: { system_cfg?: FieldComparison; error?: string } | null }[];
 }
 
-export const useDryRun = () => useQuery({ queryKey: keys.dryrun(), queryFn: ({ signal }) => get<DryRun>("/api/dryrun", signal), refetchInterval: 30_000 });
+/** Refreshed by the live socket when a comparison is recorded or settings are imported. */
+export const useDryRun = () => useQuery({ queryKey: keys.dryrun(), queryFn: ({ signal }) => get<DryRun>("/api/dryrun", signal) });
 
 export interface SiteActivity {
   bucket: number;
@@ -923,7 +924,13 @@ export interface FirmwareInfo {
   jobs: { current: FirmwareJob | null; queue: FirmwareJob[]; stopped: string | null };
 }
 
-export const useFirmware = () => useQuery({ queryKey: keys.firmware(), queryFn: ({ signal }) => get<FirmwareInfo>("/api/firmware", signal), refetchInterval: 10_000 });
+/** Polls quickly while an upgrade is under way or queued. */
+export const useFirmware = () =>
+  useQuery({
+    queryKey: keys.firmware(),
+    queryFn: ({ signal }) => get<FirmwareInfo>("/api/firmware", signal),
+    refetchInterval: (q) => (q.state.data?.jobs.current || q.state.data?.jobs.queue.length ? 5_000 : 60_000),
+  });
 export const checkFirmware = () => send<{ platforms: number }>("POST", "/api/firmware/check", {});
 export const upgradeFirmware = (macs: Mac[]) => send<{ queued: number; skipped: { mac: Mac; why: string }[] }>("POST", "/api/firmware/upgrade", { macs });
 export const upgradeFirmwareUrl = (mac: Mac, url: string) => send("POST", "/api/firmware/upgrade-url", { mac, url });
@@ -953,7 +960,9 @@ export const useChannelPlan = (band: string, dfs: boolean) =>
     queryFn: ({ signal }) => get<ChannelPlanResult>(`/api/rf/channel-plan${qs({ band, dfs: dfs ? "true" : undefined })}`, signal),
   });
 
-export const useStatus = () => useQuery({ queryKey: keys.status(), queryFn: ({ signal }) => get<Status>("/api/status", signal), refetchInterval: 15_000 });
+/** The server's status; only the overview's counters need it to `poll`. */
+export const useStatus = (poll = false) =>
+  useQuery({ queryKey: keys.status(), queryFn: ({ signal }) => get<Status>("/api/status", signal), refetchInterval: poll ? 15_000 : false });
 
 const devicesQuery = queryOptions({ queryKey: keys.devices(), queryFn: ({ signal }) => get<DeviceSummary[]>("/api/devices", signal) });
 const clientsQuery = queryOptions({ queryKey: keys.clients(), queryFn: ({ signal }) => get<ClientView[]>("/api/clients", signal) });
@@ -1147,6 +1156,7 @@ export function useLiveUpdates(): void {
             invalidate(keys.settingsState());
           }
           if (ADOPTION_EVENTS.has(msg.kind)) invalidate(keys.adoption());
+          if (msg.kind.startsWith("ap_upgrade")) invalidate(keys.firmware());
           break;
         }
         case "log": {

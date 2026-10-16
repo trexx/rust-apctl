@@ -46,7 +46,7 @@ export function Overview() {
   const devices = useDevices();
   const counts = useClientsSelect(clientCounts).data;
   const events = useEvents({ limit: 12 });
-  const status = useStatus();
+  const status = useStatus(true);
   const names = useDeviceNames();
   const cnames = useClientNames();
 
