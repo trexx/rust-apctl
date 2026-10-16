@@ -29,7 +29,8 @@ pub struct Options {
 #[derive(Default)]
 struct DeviceState {
     seen: bool,
-    cfg: HashMap<String, String>,
+    /// The last value of each of `CFG_FIELDS`.
+    cfg: [Option<String>; CFG_FIELDS.len()],
 }
 
 pub struct Reporter {
@@ -112,9 +113,10 @@ impl Reporter {
         let state = self.devices.entry(mac).or_default();
         let configs: Vec<(&str, Option<String>, &str)> = CFG_FIELDS
             .iter()
-            .filter_map(|&field| {
+            .zip(&mut state.cfg)
+            .filter_map(|(&field, last)| {
                 let new = d.payload.get(field).and_then(Value::as_str)?;
-                Some((field, state.cfg.insert(field.to_string(), new.to_string()), new))
+                Some((field, last.replace(new.to_string()), new))
             })
             .collect();
         let diffs: Vec<_> =
