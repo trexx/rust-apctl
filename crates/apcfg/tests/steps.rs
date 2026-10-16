@@ -245,3 +245,35 @@ fn snmp_lines_follow_sshd() {
     assert!(order.windows(2).all(|w| at(w[0]) < at(w[1])), "snmp lines out of order");
     assert!(after.contains("snmp.version=all\n"));
 }
+
+/// mDNS "auto" filters the SSID's VLAN for every predefined service type, and a
+/// custom rule scoped to specific APs applies only on those (written from the
+/// decompile; the capture only has custom rules for all APs).
+#[test]
+fn mdns_auto_list_and_ap_scope() {
+    let Some(_) = common::fixtures() else { return };
+    let mut s = state();
+    let main = s["wlanconf"].as_array_mut().unwrap().iter_mut().find(|w| w["mdns_proxy_mode"] == "custom" && w["mdns_proxy_custom"][0]["services_mode"] == "specific").unwrap();
+    main["mdns_proxy_mode"] = json!("auto");
+    let cfg = render(&s, AP_B, "0").rendered.system_cfg;
+    let expected: usize = apcfg::MDNS_SERVICES.iter().map(|(_, _, t)| t.len()).sum();
+    let filter = cfg.lines().filter(|l| l.contains(".service.") && l.starts_with("mdns_sd.filter.")).map(|l| l.split('.').nth(2).unwrap().to_string()).collect::<Vec<_>>();
+    let first = filter.first().cloned().unwrap();
+    assert_eq!(filter.iter().filter(|f| **f == first).count(), expected, "one service line per type, duplicates kept");
+    assert!(cfg.contains(&format!("mdns_sd.filter.{first}.service.1.name=_amazonecho-remote._tcp\n")), "sorted within a code, codes in table order");
+
+    let mut s = state();
+    for w in s["wlanconf"].as_array_mut().unwrap() {
+        for e in w["mdns_proxy_custom"].as_array_mut().into_iter().flatten() {
+            e["ap_scope_mode"] = json!("specific");
+            e["ap_macs"] = json!([AP_U]);
+        }
+    }
+    let on_b = render(&s, AP_B, "0").rendered.system_cfg;
+    let on_u = render(&s, AP_U, "0").rendered.system_cfg;
+    // With no rule applying the official controller still writes the SSID's own merged
+    // filter, just without services.
+    let services = |cfg: &str| cfg.lines().filter(|l| l.starts_with("mdns_sd.filter.") && l.contains(".service.")).count();
+    assert!(on_b.contains("mdns_sd.filter.1.vlan") && services(&on_b) == 0, "nothing proxied on AP B");
+    assert_eq!(services(&on_u), 3, "Chromecast (2 types) and Spotify on AP U");
+}

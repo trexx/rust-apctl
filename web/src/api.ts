@@ -1004,6 +1004,19 @@ export interface WlanSettingsList {
   unsupported?: Record<string, Mac[]>;
   /** APs whose feature support is not known yet (no inform). */
   unknown?: Mac[];
+  /** The predefined mDNS service codes. */
+  mdns_services?: { code: string; name: string }[];
+}
+
+export interface MdnsRule {
+  ap_scope_mode: "all" | "specific" | "group";
+  ap_macs?: Mac[];
+  ap_group_ids?: string[];
+  services_mode: "all" | "specific" | "none";
+  predefined_services?: { code: string }[];
+  custom_services?: { address: string; name?: string }[];
+  networkconf_ids?: string[];
+  isolation_enabled?: boolean;
 }
 
 export interface RadioSettings {

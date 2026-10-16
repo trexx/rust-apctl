@@ -15,12 +15,12 @@
 //! (vport uplinks and mesh downlink VAPs when `connectivity` is enabled), a tagged
 //! management VLAN (rejected with an error), guest portal / guest ebtables chains,
 //! QoS mark rules for APs without mark bits, OWE transition companions, RadSec,
-//! Hotspot 2.0, 6 GHz `freq`, site `config.properties` overrides and the `mdns_sd`
-//! "auto" service list.
+//! Hotspot 2.0, 6 GHz `freq`, site `config.properties` overrides, and extra VLAN
+//! bridges for mDNS custom rules that bridge networks no SSID on the AP uses.
 //!
 //! Written from the official logic but not yet checked against a capture (none of
-//! our data uses them): WLAN schedules (`schedule_*` lines), speed limits (`qos`) and
-//! SNMP (`snmp.*`).
+//! our data uses them): WLAN schedules (`schedule_*` lines), speed limits (`qos`),
+//! SNMP (`snmp.*`) and the mDNS service codes other than Chromecast and Spotify.
 
 mod cfg;
 mod javahash;
@@ -30,6 +30,8 @@ mod mgmt;
 mod net;
 mod system;
 pub mod tz;
+
+pub use system::MDNS_SERVICES;
 mod wlan;
 
 use anyhow::{Context, Result, bail};
@@ -142,14 +144,14 @@ pub(crate) fn bit(v: u64, n: u32) -> bool {
 /// Optional SSID features that depend on what the AP supports, with the
 /// capability bit `render` checks for each one. An AP without it gets the SSID
 /// without the feature (no config lines), as the official controller does.
-pub const SSID_FEATURES: &[&str] = &["dns_assistance", "advertise_ap_name", "roaming_assistant", "multicast_suppression", "wpa3_fast_roaming"];
+pub const SSID_FEATURES: &[&str] = &["dns_assistance", "advertise_ap_name", "roaming_assistant", "multicast_suppression", "wpa3_fast_roaming", "mdns_proxy"];
 
 /// Which of [`SSID_FEATURES`] the AP supports, as `(feature, supported)`, or
 /// `None` while that is unknown: the AP has not sent an inform and the
 /// settings hold no capability bits for it.
 pub fn ssid_feature_support(device: &Value, inform: Option<&Value>) -> Option<Vec<(&'static str, bool)>> {
     let caps = Caps::read(inform, device);
-    if caps.fw == 0 && caps.fw3 == 0 && caps.wifi == 0 && caps.wifi2 == 0 {
+    if caps.fw == 0 && caps.fw2 == 0 && caps.fw3 == 0 && caps.wifi == 0 && caps.wifi2 == 0 {
         return None;
     }
     let radios = json::arr(device, "radio_table");
@@ -163,6 +165,7 @@ pub fn ssid_feature_support(device: &Value, inform: Option<&Value>) -> Option<Ve
                     "advertise_ap_name" => bit(caps.wifi2, 6),
                     "roaming_assistant" => bit(caps.wifi2, 5),
                     "multicast_suppression" => bit(caps.wifi2, 22),
+                    "mdns_proxy" => bit(caps.fw2, 28),
                     _ => ft,
                 };
                 (f, ok)
@@ -287,7 +290,7 @@ mod tests {
         let device = json!({ "radio_table": [{ "radio": "ng", "radio_caps2": 31 }, { "radio": "na", "radio_caps2": 1 }] });
         assert_eq!(ssid_feature_support(&device, None), None);
         // The bits a U6-Mesh on 8.8.11 reports.
-        let inform = json!({ "fw_caps": 3892117055u64, "fw3_caps": 206, "wifi_caps": 2709438173u64, "wifi_caps2": 4206576, "hw_caps": 2050 });
+        let inform = json!({ "fw_caps": 3892117055u64, "fw2_caps": 1481179136u64, "fw3_caps": 206, "wifi_caps": 2709438173u64, "wifi_caps2": 4206576, "hw_caps": 2050 });
         let got = ssid_feature_support(&device, Some(&inform)).unwrap();
         let missing: Vec<&str> = got.iter().filter(|(_, ok)| !ok).map(|(f, _)| *f).collect();
         assert_eq!(missing, ["wpa3_fast_roaming"]);

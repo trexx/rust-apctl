@@ -145,6 +145,13 @@ main {
   margin-bottom: 16px;
 }
 
+.mdns-services {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(190px, 1fr));
+  gap: 2px 12px;
+  flex-basis: 100%;
+}
+
 .form-warn {
   background: var(--warn-bg);
   color: var(--text);

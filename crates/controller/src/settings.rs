@@ -82,7 +82,7 @@ const WLAN_FIELDS: &[&str] = &[
     "group_rekey", "mac_filter_enabled", "mac_filter_policy", "mac_filter_list", "is_guest", "networkconf_id", "country_beacon",
     "usergroup_id", "schedule_with_duration", "dns_assistance_mode", "dns_assistance_servers", "no2ghz_oui", "advertise_device_name_in_beacon",
     "enhanced_iot", "iot_channel_lock", "iot_dtim_lock", "wpa3_fast_roaming", "sae_anti_clogging", "sae_sync", "rrm_enabled", "tdls_prohibit", "p2p",
-    "p2p_cross_connect", "log_level",
+    "p2p_cross_connect", "log_level", "mdns_proxy_mode", "mdns_proxy_custom",
 ];
 
 /// The id of a settings document (plain or `{"$oid": ...}`).
@@ -142,7 +142,8 @@ pub async fn wlans(State(s): State<AppState>) -> Result<Json<Value>, ApiError> {
     let networks: Vec<Value> = docs(&state, "networkconf").map(|n| json!({ "id": id_of(n), "name": n["name"], "vlan": n["vlan"], "purpose": n["purpose"] })).collect();
     let aps: Vec<Value> = docs(&state, "devices").map(|d| json!({ "mac": d["mac"].as_str().map(str::to_ascii_lowercase), "name": d["name"] })).collect();
     let (unsupported, unknown) = feature_support(&state, &informs);
-    Ok(Json(json!({ "active": s.active, "wlans": list, "networks": networks, "aps": aps, "unsupported": unsupported, "unknown": unknown })))
+    let mdns: Vec<Value> = apcfg::MDNS_SERVICES.iter().map(|(code, name, _)| json!({ "code": code, "name": name })).collect();
+    Ok(Json(json!({ "active": s.active, "wlans": list, "networks": networks, "aps": aps, "unsupported": unsupported, "unknown": unknown, "mdns_services": mdns })))
 }
 
 /// For each optional SSID feature, the APs that would broadcast the SSID
@@ -475,6 +476,84 @@ fn deployed_to(state: &Value, w: &Value) -> Vec<String> {
     }
 }
 
+/// mDNS proxy rules: where each applies (all APs, specific ones, AP groups),
+/// which services pass (all, chosen ones, none), and the networks it bridges.
+fn check_mdns_rules(state: &Value, v: &Value) -> Result<Vec<Value>, String> {
+    let rules = v.as_array().ok_or("mdns_proxy_custom must be a list")?;
+    if rules.len() > 16 {
+        return Err("at most 16 mDNS rules".into());
+    }
+    let aps: Vec<String> = docs(state, "devices").filter_map(|d| d["mac"].as_str().map(str::to_ascii_lowercase)).collect();
+    let groups: Vec<String> = docs(state, "apgroup").filter_map(id_of).collect();
+    let networks: Vec<String> = docs(state, "networkconf").filter_map(id_of).collect();
+    let mut out = Vec::new();
+    for (i, r) in rules.iter().enumerate() {
+        let n = i + 1;
+        let scope = enum_field(r, "ap_scope_mode", &["all", "specific", "group"])?.unwrap_or("all");
+        let services = enum_field(r, "services_mode", &["all", "specific", "none"])?.unwrap_or("all");
+        let mut rule = json!({ "ap_scope_mode": scope, "services_mode": services, "isolation_enabled": bool_field(r, "isolation_enabled")?.unwrap_or(false) });
+        let ids = |key: &str| -> Vec<String> { r[key].as_array().into_iter().flatten().filter_map(|x| x.as_str().map(str::to_string)).collect() };
+        let nets = ids("networkconf_ids");
+        if let Some(bad) = nets.iter().find(|x| !networks.contains(x)) {
+            return Err(format!("mDNS rule {n}: {bad} is not a network"));
+        }
+        rule["networkconf_ids"] = json!(nets);
+        match scope {
+            "specific" => {
+                let macs: Vec<String> = ids("ap_macs").iter().map(|m| m.to_ascii_lowercase()).collect();
+                if macs.is_empty() || macs.iter().any(|m| !aps.contains(m)) {
+                    return Err(format!("mDNS rule {n}: choose the APs it applies on"));
+                }
+                rule["ap_macs"] = json!(macs);
+            }
+            "group" => {
+                let g = ids("ap_group_ids");
+                if g.is_empty() || g.iter().any(|x| !groups.contains(x)) {
+                    return Err(format!("mDNS rule {n}: choose the AP groups it applies on"));
+                }
+                rule["ap_group_ids"] = json!(g);
+            }
+            _ => {}
+        }
+        if services == "specific" {
+            let mut codes: Vec<String> = Vec::new();
+            for c in r["predefined_services"].as_array().into_iter().flatten() {
+                let code = c["code"].as_str().or(c.as_str()).unwrap_or("");
+                if !apcfg::MDNS_SERVICES.iter().any(|(k, _, _)| *k == code) {
+                    return Err(format!("mDNS rule {n}: {code} is not a known service"));
+                }
+                if !codes.iter().any(|x| x == code) {
+                    codes.push(code.to_string());
+                }
+            }
+            let mut custom = Vec::new();
+            for c in r["custom_services"].as_array().into_iter().flatten() {
+                let address = c["address"].as_str().unwrap_or("").trim();
+                let parts: Vec<&str> = address.split('.').collect();
+                let ok = parts.len() == 3
+                    && parts[0].len() > 1
+                    && parts[0].len() <= 64
+                    && parts[0].starts_with('_')
+                    && parts[0][1..].chars().all(|ch| ch.is_ascii_alphanumeric() || ch == '-' || ch == '_')
+                    && matches!(parts[1], "_tcp" | "_udp")
+                    && parts[2] == "local";
+                if !ok {
+                    return Err(format!("mDNS rule {n}: {address} is not a service like _service._tcp.local"));
+                }
+                let name = c["name"].as_str().map(str::trim).filter(|x| !x.is_empty()).unwrap_or(address);
+                custom.push(json!({ "address": address, "name": name.chars().take(64).collect::<String>() }));
+            }
+            if codes.is_empty() && custom.is_empty() {
+                return Err(format!("mDNS rule {n}: choose at least one service"));
+            }
+            rule["predefined_services"] = json!(codes.iter().map(|c| json!({ "code": c })).collect::<Vec<_>>());
+            rule["custom_services"] = json!(custom);
+        }
+        out.push(rule);
+    }
+    Ok(out)
+}
+
 /// The official limit of SSIDs per radio band on an AP: 4 when wireless
 /// meshing is on (the radios keep slots for it), else 8 (7 with element
 /// adoption). Disabled SSIDs count too.
@@ -731,6 +810,18 @@ pub fn apply_wlan(state: &mut Value, body: &Value) -> Result<String, String> {
     }
     if w["dns_assistance_mode"].as_str() == Some("manual") && w["dns_assistance_servers"].as_array().is_none_or(Vec::is_empty) {
         return Err("DNS Assistance set to manual needs at least one server".into());
+    }
+
+    // mDNS proxy: off, auto (the standard services within the SSID's own VLAN) or
+    // custom rules.
+    if let Some(m) = enum_field(p, "mdns_proxy_mode", &["off", "auto", "custom"])? {
+        w["mdns_proxy_mode"] = json!(m);
+    }
+    if !p["mdns_proxy_custom"].is_null() {
+        w["mdns_proxy_custom"] = json!(check_mdns_rules(state, &p["mdns_proxy_custom"])?);
+    }
+    if w["mdns_proxy_mode"].as_str() == Some("custom") && w["mdns_proxy_custom"].as_array().is_none_or(Vec::is_empty) {
+        return Err("custom mDNS needs at least one rule".into());
     }
 
     // Multicast and broadcast. The suppression mode decides the broadcast filter.
@@ -1436,6 +1527,24 @@ mod tests {
         assert!(edit(&mut s, json!({ "sae_sync": 61 })).is_err());
         edit(&mut s, json!({ "sae_sync": 10 })).unwrap();
         assert!(edit(&mut s, json!({ "dns_assistance_mode": "manual", "dns_assistance_servers": ["1.1.1.1", "8.8.8.8", "9.9.9.9"] })).is_err());
+    }
+
+    #[test]
+    fn mdns_rules_are_checked() {
+        let mut s = state();
+        assert!(edit(&mut s, json!({ "mdns_proxy_mode": "custom" })).unwrap_err().contains("at least one rule"));
+        let rule = json!({ "ap_scope_mode": "specific", "ap_macs": [AP2.to_uppercase()], "services_mode": "specific",
+            "predefined_services": [{ "code": "apple_airPlay" }, { "code": "apple_airPlay" }], "custom_services": [{ "address": "_myapp._tcp.local" }] });
+        edit(&mut s, json!({ "mdns_proxy_mode": "custom", "mdns_proxy_custom": [rule] })).unwrap();
+        let r = &s["wlanconf"][0]["mdns_proxy_custom"][0];
+        assert_eq!((r["ap_macs"][0].as_str(), r["predefined_services"].as_array().unwrap().len()), (Some(AP2), 1));
+        assert_eq!(r["custom_services"][0]["name"], "_myapp._tcp.local");
+        let bad = |r: Value| edit(&mut state(), json!({ "mdns_proxy_mode": "custom", "mdns_proxy_custom": [r] })).is_err();
+        assert!(bad(json!({ "services_mode": "specific", "predefined_services": [{ "code": "telnet" }] })));
+        assert!(bad(json!({ "services_mode": "specific", "custom_services": [{ "address": "myapp.local" }] })));
+        assert!(bad(json!({ "services_mode": "specific" })), "no services chosen");
+        assert!(bad(json!({ "ap_scope_mode": "specific", "ap_macs": ["02:00:00:00:00:99"] })), "unknown AP");
+        edit(&mut s, json!({ "mdns_proxy_mode": "auto" })).unwrap();
     }
 
     #[test]

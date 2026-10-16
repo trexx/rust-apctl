@@ -472,14 +472,68 @@ fn switch(c: &mut Cfg, ctx: &Ctx) {
     }
 }
 
-/// DNS-SD service types behind the controller's predefined mDNS service codes. Only
-/// codes seen in captures are listed; others are skipped.
+/// The predefined mDNS service codes and the DNS-SD service types behind each, in
+/// the official controller's order (the "auto" list follows it). Within a code the
+/// official order comes from a Java set and can change between its restarts; the AP
+/// does not care. Two-type codes are listed the way the captured controller iterated
+/// them (Chromecast), larger ones sorted.
+pub const MDNS_SERVICES: &[(&str, &str, &[&str])] = &[
+    ("amazon_devices", "Amazon devices", &["_amazonecho-remote._tcp", "_amzn-wplay._tcp.local", "_workstation._tcp.local"]),
+    ("android_tv_remote", "Android TV Remote", &["_androidtvremote._tcp.local"]),
+    ("apple_airDrop", "Apple AirDrop", &["_airdrop._tcp.local"]),
+    ("apple_airPlay", "Apple AirPlay", &["_airplay._tcp.local", "_appletv-v2._tcp.local", "_companion-link._tcp.local", "_raop._tcp.local"]),
+    ("apple_file_sharing", "Apple file sharing", &["_afpovertcp._tcp.local"]),
+    ("apple_iChat", "Apple iChat", &["_ichat._tcp.local", "_presence._tcp.local"]),
+    (
+        "apple_iTunes",
+        "Apple iTunes",
+        &["_apple-mobdev._tcp.local", "_apple-mobdev2._tcp.local", "_atc._tcp.local", "_daap._tcp.local", "_dacp._tcp.local", "_home-sharing._tcp.local"],
+    ),
+    ("aqara", "Aqara", &["_aqara._tcp.local", "_aqara-setup._tcp.local"]),
+    ("bose", "Bose", &["_bose._tcp.local"]),
+    ("dns_service_discovery", "DNS service discovery", &["_dns-sd._udp.local"]),
+    ("ftp_servers", "FTP servers", &["_sftp-ssh._tcp.local", "_ftp._tcp.local"]),
+    ("google_chromecast", "Google Chromecast", &["_googlezone._tcp.local", "_googlecast._tcp.local"]),
+    ("homeKit", "HomeKit", &["_hap._tcp.local", "_homekit._tcp.local"]),
+    ("matter_network", "Matter", &["_matter._tcp", "_matter_gateway._tcp", "_matterc._udp", "_matterd._udp"]),
+    ("philips_hue", "Philips Hue", &["_philipshue._tcp.local"]),
+    (
+        "printers",
+        "Printers",
+        &[
+            "_canon-bjnp1._tcp.local", "_fax-ipp._tcp.local", "_http._tcp.local", "_http_alt._tcp.local", "_ica-networking._tcp.local",
+            "_ica-networking2._tcp.local", "_ipp._tcp.local", "_ipp-tls._tcp.local", "_ipps._tcp.local", "_ippusb._tcp.local",
+            "_pdl-datastream._tcp.local", "_printer._tcp.local", "_ptp._tcp.local", "_riousbprint._tcp.local", "_scan-target._tcp.local",
+            "_scanner._tcp.local",
+        ],
+    ),
+    ("roku", "Roku", &["_rsp._tcp.local", "_roku._tcp.local"]),
+    ("scanners", "Scanners", &["_scan-target._tcp.local", "_scanner._tcp", "_uscan._tcp.local", "_uscans._tcp.local"]),
+    ("shelly", "Shelly", &["_shelly._tcp.local"]),
+    ("sonos", "Sonos", &["_sonos._tcp.local"]),
+    ("spotify_connect", "Spotify Connect", &["_spotify-connect._tcp.local"]),
+    ("ssh_servers", "SSH servers", &["_ssh._tcp.local"]),
+    ("time_capsule", "Time Capsule", &["_adisk._tcp.local"]),
+    ("web_servers", "Web servers", &["_https._tcp.local", "_http._tcp.local"]),
+    ("windows_file_sharing_samba", "Windows file sharing (Samba)", &["_smbdirect._tcp.local", "_smb._tcp.local"]),
+];
+
 fn mdns_services(code: &str) -> &'static [&'static str] {
-    match code {
-        "google_chromecast" => &["_googlezone._tcp.local", "_googlecast._tcp.local"],
-        "spotify_connect" => &["_spotify-connect._tcp.local"],
-        _ => &[],
-    }
+    MDNS_SERVICES.iter().find(|(c, _, _)| *c == code).map_or(&[], |(_, _, s)| s)
+}
+
+/// What "auto" mode filters for: every code's types, each code's sorted, in table
+/// order (a type in two codes is listed twice, as the official controller does).
+fn mdns_auto_services() -> Vec<String> {
+    MDNS_SERVICES
+        .iter()
+        .flat_map(|(_, _, types)| {
+            let mut t: Vec<&str> = types.to_vec();
+            t.sort_unstable();
+            t
+        })
+        .map(str::to_string)
+        .collect()
 }
 
 struct MdnsEntry {
@@ -513,8 +567,8 @@ fn mdns(c: &mut Cfg, ctx: &Ctx, vaps: &[Vap], net: &Net) {
         .collect();
     let applies = |e: &Value| match str_of(e, "ap_scope_mode").unwrap_or("all") {
         "all" => true,
-        "devices" => str_list(e, "ap_macs").iter().any(|m| mac_eq(m, &ctx.mac)),
-        "groups" => str_list(e, "ap_group_ids").iter().any(|g| groups.iter().any(|m| m == g)),
+        "specific" => str_list(e, "ap_macs").iter().any(|m| mac_eq(m, &ctx.mac)),
+        "group" => str_list(e, "ap_group_ids").iter().any(|g| groups.iter().any(|m| m == g)),
         _ => false,
     };
     let mut seen: Vec<String> = Vec::new();
@@ -571,8 +625,7 @@ fn mdns(c: &mut Cfg, ctx: &Ctx, vaps: &[Vap], net: &Net) {
                 services: entry_services(e),
             }));
         } else {
-            // The "auto" mode's built-in service list is not known to us.
-            entries.push(MdnsEntry { networks: vec![own.clone()], mode: "specific".into(), services: Vec::new() });
+            entries.push(MdnsEntry { networks: vec![own.clone()], mode: "specific".into(), services: mdns_auto_services() });
         }
         let own_bridge = bridge_of_vlan(network_vlan(ctx, own.as_deref()));
         for e in entries {
