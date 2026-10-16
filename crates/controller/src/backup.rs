@@ -47,6 +47,10 @@ const UPLOAD_LIMIT: u64 = 1 << 30;
 const STAGING_TTL: Duration = Duration::from_secs(3600);
 /// The files a backup may hold besides its manifest: never paths.
 const DATABASES: [&str; 3] = ["config.db", "metrics.db", "logs.db"];
+/// A backup's databases may unpack to at most this many times the size of
+/// the backup file (or 64 MiB): SQLite files compress well, but nowhere near
+/// as well as a crafted archive.
+const MAX_RATIO: u64 = 100;
 
 /// Where backups live and how they are sealed.
 #[derive(Clone)]
@@ -207,6 +211,10 @@ fn open_payload(path: &Path, key: Option<&[u8; 32]>) -> Result<Box<dyn Read>> {
         let mut header = head.to_vec();
         header.extend_from_slice(&prefix);
         Box::new(OpenReader { inp: f, cipher: Aes256Gcm::new(key.into()), header, prefix, counter: 0, plain: vec![], pos: 0, ahead: None, done: false })
+    } else if key.is_some() {
+        // With a key, only what was sealed with it is trusted: anyone who can
+        // put a file in front of apctl could otherwise have it restored.
+        bail!("this backup is not encrypted, but a backup key is configured: apctl only restores backups sealed with its key");
     } else {
         Box::new(f)
     };
@@ -320,7 +328,12 @@ fn snapshot(src: &Path, dst: &Path) -> Result<()> {
 /// device configs and acknowledgements; login sessions never travel.
 fn trim(dir: &Path, cutoff: Option<Ts>) -> Result<()> {
     let mut c = scratch(&dir.join("config.db"))?;
-    // The deletes in one transaction, then one rewrite to drop the pages they freed.
+    // The deletes in one transaction, then one rewrite to drop the pages they
+    // freed. With nothing else to drop, the few session rows are overwritten
+    // in place instead of rewriting the whole file again.
+    if cutoff.is_none() {
+        c.execute_batch("PRAGMA secure_delete=ON;")?;
+    }
     let tx = c.transaction()?;
     tx.execute_batch("DELETE FROM sessions;")?;
     if let Some(t) = cutoff {
@@ -330,7 +343,9 @@ fn trim(dir: &Path, cutoff: Option<Ts>) -> Result<()> {
         tx.execute("DELETE FROM clients WHERE COALESCE(last_seen, 0) < ?1 AND mac NOT IN (SELECT mac FROM client_aliases)", [t])?;
     }
     tx.commit()?;
-    c.execute_batch("VACUUM;")?;
+    if cutoff.is_some() {
+        c.execute_batch("VACUUM;")?;
+    }
     drop(c);
     if let Some(t) = cutoff {
         // Every metric table in every tier, and the logs (whose full-text index follows by trigger).
@@ -477,6 +492,7 @@ impl Write for Sink {
 
 /// Unpacks a backup into `dest`, checking every file against the manifest.
 pub fn unpack(path: &Path, key: Option<&[u8; 32]>, dest: &Path) -> Result<Manifest> {
+    let limit = fs::metadata(path)?.len().saturating_mul(MAX_RATIO).max(64 << 20);
     fs::create_dir_all(dest)?;
     let mut ar = tar::Archive::new(open_payload(path, key)?);
     let mut manifest: Option<Manifest> = None;
@@ -491,6 +507,9 @@ pub fn unpack(path: &Path, key: Option<&[u8; 32]>, dest: &Path) -> Result<Manife
             e.read_to_string(&mut s)?;
             let m: Manifest = serde_json::from_str(&s).context("the backup's manifest is unreadable")?;
             check_names(&m)?;
+            if m.files.values().fold(0u64, |n, f| n.saturating_add(f.size)) > limit {
+                bail!("the backup's contents are far larger than the file: it is damaged");
+            }
             manifest = Some(m);
             continue;
         }
@@ -500,7 +519,8 @@ pub fn unpack(path: &Path, key: Option<&[u8; 32]>, dest: &Path) -> Result<Manife
         }
         let m = manifest.as_ref().ok_or_else(|| anyhow!("the backup has no manifest"))?;
         let expected = m.files.get(&name).ok_or_else(|| anyhow!("{name} is not listed in the manifest"))?;
-        // Checked before anything is written, so an oversized entry cannot fill the disk.
+        // Checked before anything is written: with the manifest's total checked
+        // against the file's size, a crafted archive cannot fill the disk.
         if e.header().size()? != expected.size {
             bail!("{name} does not match its checksum: the backup is damaged");
         }
@@ -1010,7 +1030,7 @@ mod tests {
             "INSERT INTO events (ts, kind, data) VALUES ({old}, 'old', '{{}}'), ({now}, 'new', '{{}}');
              INSERT INTO clients (mac, hostname, last_seen) VALUES ('aa:aa:aa:aa:aa:01', 'gone', {old}), ('aa:aa:aa:aa:aa:02', 'named', {old}), ('aa:aa:aa:aa:aa:03', 'recent', {now});
              INSERT INTO client_aliases (mac, alias, updated) VALUES ('aa:aa:aa:aa:aa:02', 'Printer', {now});
-             INSERT INTO sessions (token_hash, username, created, expires) VALUES ('x', 'u', {now}, {now});",
+             INSERT INTO sessions (token_hash, username, created, expires) VALUES ('5e55107-hash-of-a-token', 'u', {now}, {now});",
             old = now - 40 * 86400
         ))
         .unwrap();
@@ -1156,6 +1176,38 @@ mod tests {
         let err = unpack(&d.join("x.apb"), None, &out).unwrap_err();
         assert!(err.to_string().contains("damaged"), "{err:#}");
         assert!(!out.join("config.db").exists());
+    }
+
+    #[test]
+    fn sessions_never_travel_even_with_all_history() {
+        let src = data("sessions");
+        let b = Backups { data_dir: src.clone(), key: None };
+        let m = create(&b, &src, Kind::Manual, -1).unwrap();
+        let out = dir("sessions-out");
+        unpack(&b.dir().join(&m.name), None, &out).unwrap();
+        assert_eq!(count(&out.join("config.db"), "SELECT COUNT(*) FROM sessions"), 0);
+        // Not even in the pages the delete freed.
+        let raw = fs::read(out.join("config.db")).unwrap();
+        assert!(!raw.windows(23).any(|w| w == b"5e55107-hash-of-a-token"));
+        assert_eq!(count(&out.join("config.db"), "SELECT COUNT(*) FROM events"), 2, "all history kept");
+    }
+
+    #[test]
+    fn contents_far_larger_than_the_file_are_refused() {
+        let d = dir("bomb");
+        // A 4 GiB database claimed by a file of a few hundred bytes.
+        hand_made(&d.join("x.apb"), &manifest(&[("config.db", 4 << 30)]), &[]);
+        let err = unpack(&d.join("x.apb"), None, &d.join("out")).unwrap_err();
+        assert!(err.to_string().contains("far larger"), "{err:#}");
+    }
+
+    #[test]
+    fn with_a_key_only_sealed_backups_are_restored() {
+        let src = data("plain");
+        let plain = create(&Backups { data_dir: src.clone(), key: None }, &src, Kind::Manual, 0).unwrap();
+        let b = Backups { data_dir: src.clone(), key: Some([5u8; 32]) };
+        let err = unpack(&b.dir().join(&plain.name), b.key.as_ref(), &dir("plain-out")).unwrap_err();
+        assert!(err.to_string().contains("not encrypted"), "{err:#}");
     }
 
     #[test]
