@@ -1041,7 +1041,7 @@ const logMatches = (f: LogFilter, device: Mac | null) => sameMac(f.device, devic
 type LiveMsg =
   | { type: "device"; mac: Mac }
   | { type: "clients" }
-  | ({ type: "event" } & Omit<AppEvent, "id">)
+  | ({ type: "event" } & Pick<AppEvent, "kind" | "device_mac" | "client_mac">)
   | { type: "log"; device_mac: Mac | null }
   | ({ type: "alert"; action: "raised" | "resolved" } & AlertItem)
   | { type: "resync" };
