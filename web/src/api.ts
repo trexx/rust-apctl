@@ -681,11 +681,12 @@ export interface ThreatFinding {
   vendor: string | null;
 }
 
+/** A new finding is announced (as a network_threat event); the slow poll catches the ones that go away. */
 export const useThreats = () =>
   useQuery({
     queryKey: keys.threats(),
     queryFn: getting<{ watching_since: number; findings: ThreatFinding[] }>("/api/rf/threats"),
-    refetchInterval: 60_000,
+    refetchInterval: 300_000,
   });
 
 export const ackThreat = (kind: string, bssid: string, ack: boolean, note?: string) => send("PUT", "/api/rf/threats/ack", { kind, bssid, ack, note });
@@ -1151,6 +1152,9 @@ export const markAlertsRead = () => send("POST", "/api/alerts/read", {});
 /** Event kinds that change what the adoption panel shows. */
 const ADOPTION_EVENTS = new Set(["ap_pending", "ap_adopting", "ap_adopted", "ap_forgotten"]);
 
+/** Event kinds that change the channel plan and the RF views. */
+const RF_EVENTS = new Set(["ap_scan_done", "channel_plan", "radio_changed"]);
+
 /**
  * Keeps queries fresh from the server's WebSocket: device and client changes
  * invalidate the cached lists, new events and logs refetch the lists whose
@@ -1248,6 +1252,12 @@ export function useLiveUpdates(): void {
           }
           if (ADOPTION_EVENTS.has(msg.kind)) invalidate(keys.adoption());
           if (msg.kind.startsWith("ap_upgrade")) invalidate(keys.firmware());
+          if (RF_EVENTS.has(msg.kind)) {
+            // A scan, a plan run or a channel change can change the plan, and what the radios hear.
+            for (const key of [keys.rfPlan(), keys.rfRadios(), keys.rfNeighbors(), keys.rfLinks()]) invalidate(key, 5000);
+          }
+          if (msg.kind === "channel_plan") invalidate(keys.channelAi());
+          if (msg.kind === "network_threat") invalidate(keys.threats());
           if (msg.kind === "client_renamed") invalidate(keys.clientNames());
           // A client without a name may have reported one as it connected.
           else if (msg.kind === "client_connected" && msg.client_mac && !qc.getQueryData<Names>(keys.clientNames())?.[msg.client_mac])
