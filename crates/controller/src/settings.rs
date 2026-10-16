@@ -485,7 +485,12 @@ fn enum_field<'a>(patch: &'a Value, key: &str, allowed: &[&str]) -> Result<Optio
 }
 
 fn mac_list(patch: &Value, key: &str) -> Result<Option<Vec<String>>, String> {
-    match &patch[key] {
+    mac_list_value(&patch[key], key)
+}
+
+/// [`mac_list`] for the value itself (`key` names it in errors).
+fn mac_list_value(v: &Value, key: &str) -> Result<Option<Vec<String>>, String> {
+    match v {
         Value::Null => Ok(None),
         Value::Array(a) => {
             let mut out = Vec::new();
@@ -542,7 +547,11 @@ const MINRATE_NG: &[i64] = &[1000, 2000, 5500, 6000, 9000, 11000, 12000, 18000, 
 const MINRATE_NA: &[i64] = &[6000, 9000, 12000, 18000, 24000, 36000, 48000, 54000];
 
 fn find_wlan<'a>(state: &'a mut Value, id: &str) -> Option<&'a mut Value> {
-    state["wlanconf"].as_array_mut()?.iter_mut().find(|w| id_of(w).as_deref() == Some(id))
+    state["wlanconf"].as_array_mut()?.iter_mut().find(|w| apcfg::json::oid(w) == Some(id))
+}
+
+fn wlan<'a>(state: &'a Value, id: &str) -> Option<&'a Value> {
+    state["wlanconf"].as_array()?.iter().find(|w| apcfg::json::oid(w) == Some(id))
 }
 
 fn default_group(state: &Value) -> Option<String> {
@@ -861,7 +870,7 @@ pub fn apply_wlan(state: &mut Value, e: &WlanEdit) -> Result<String, String> {
     if p.get("aps").is_some() {
         let aps = match &p["aps"] {
             Value::Null => None,
-            v => Some(mac_list(&json!({ "aps": v }), "aps")?.unwrap_or_default()),
+            v => mac_list_value(v, "aps")?,
         };
         set_wlan_aps(state, id, aps)?;
     }
@@ -869,14 +878,14 @@ pub fn apply_wlan(state: &mut Value, e: &WlanEdit) -> Result<String, String> {
     check_list_limits(state)?;
     let channels = apply_channel_locks(state, &locked_aps_before);
 
-    let after = find_wlan(state, id).ok_or("unknown SSID")?.clone();
+    let after = wlan(state, id).ok_or("unknown SSID")?;
     let mut keys: Vec<&str> = after.as_object().map(|o| o.keys().map(String::as_str).collect()).unwrap_or_default();
     keys.retain(|k| *k != "x_passphrase" && before[*k] != after[*k]);
     changed.extend(keys);
     let name = after["name"].as_str().unwrap_or("?");
     let mut what = if changed.is_empty() { format!("SSID \"{name}\": nothing changed") } else { format!("SSID \"{name}\": {}", changed.join(", ")) };
     if !channels.is_empty() {
-        what.push_str(&format!("; {}", channels.join("; ")));
+        what = format!("{what}; {}", channels.join("; "));
     }
     Ok(what)
 }
@@ -1271,17 +1280,17 @@ pub fn create_wlan(state: &mut Value, patch: &Value) -> Result<String, String> {
 
 /// Deletes an SSID and its own AP group.
 pub fn delete_wlan(state: &mut Value, id: &str) -> Result<String, String> {
-    let w = find_wlan(state, id).ok_or("unknown SSID")?.clone();
+    let w = wlan(state, id).ok_or("unknown SSID")?;
     if w["attr_no_delete"].as_bool() == Some(true) {
         return Err("this SSID cannot be deleted".into());
     }
-    let released = if w["iot_channel_lock"].as_bool() == Some(true) { deployed_to(state, &w) } else { Vec::new() };
-    array_mut(state, "wlanconf").retain(|x| id_of(x).as_deref() != Some(id));
+    let released = if w["iot_channel_lock"].as_bool() == Some(true) { deployed_to(state, w) } else { Vec::new() };
+    let mut what = format!("deleted SSID \"{}\"", w["name"].as_str().unwrap_or("?"));
+    array_mut(state, "wlanconf").retain(|x| apcfg::json::oid(x) != Some(id));
     prune_groups(state);
     let channels = apply_channel_locks(state, &released);
-    let mut what = format!("deleted SSID \"{}\"", w["name"].as_str().unwrap_or("?"));
     if !channels.is_empty() {
-        what.push_str(&format!("; {}", channels.join("; ")));
+        what = format!("{what}; {}", channels.join("; "));
     }
     Ok(what)
 }
@@ -1330,7 +1339,6 @@ pub fn apply_device(state: &mut Value, e: &DeviceEdit) -> Result<String, String>
             }
         }
     }
-    *crate::adopt::device_doc_mut(state, &m).expect("found above") = d.clone();
     let name = d["name"].as_str().unwrap_or(&mac).to_string();
     let mut changed: Vec<String> = Vec::new();
     for k in DEVICE_FIELDS {
@@ -1338,13 +1346,16 @@ pub fn apply_device(state: &mut Value, e: &DeviceEdit) -> Result<String, String>
             changed.push(k.replace('_', " "));
         }
     }
-    let radios = |v: &Value| v["radio_table"].as_array().cloned().unwrap_or_default();
-    for (b, a) in radios(&before).iter().zip(radios(&d).iter()) {
+    fn radios(v: &Value) -> &[Value] {
+        v["radio_table"].as_array().map_or(&[], Vec::as_slice)
+    }
+    for (b, a) in radios(&before).iter().zip(radios(&d)) {
         let keys: Vec<&str> = RADIO_FIELDS.iter().copied().filter(|k| b[*k] != a[*k]).collect();
         if !keys.is_empty() {
             changed.push(format!("{} radio: {}", band_name(a["radio"].as_str().unwrap_or("")), keys.join(", ")));
         }
     }
+    *crate::adopt::device_doc_mut(state, &m).expect("found above") = d;
     Ok(if changed.is_empty() { format!("AP {name}: nothing changed") } else { format!("AP {name}: {}", changed.join("; ")) })
 }
 
