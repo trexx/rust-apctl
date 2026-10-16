@@ -1,5 +1,3 @@
-# syntax=docker/dockerfile:1
-
 # --- web UI ---
 FROM docker.io/library/node:24-slim AS web
 WORKDIR /web
