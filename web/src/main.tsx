@@ -9,6 +9,7 @@ import {
 import {
   BrowserRouter,
   NavLink,
+  Navigate,
   Route,
   Routes,
   useLocation,
@@ -39,7 +40,6 @@ const Client = lazyNamed(() => import("./pages/Client"), "Client");
 const Settings = lazyNamed(() => import("./pages/Settings"), "Settings");
 const Radios = lazyNamed(() => import("./pages/Radios"), "Radios");
 const Config = lazyNamed(() => import("./pages/Config"), "Config");
-const DryRunPage = lazyNamed(() => import("./pages/DryRun"), "DryRunPage");
 
 const queryClient = new QueryClient({
   defaultOptions: {
@@ -217,7 +217,11 @@ function Shell({ user, readOnly }: { user: string | null; readOnly: boolean }) {
               <Route path="/clients/:mac" element={<Client />} />
               <Route path="/events" element={<Events />} />
               <Route path="/logs" element={<Logs />} />
-              <Route path="/dryrun" element={<DryRunPage />} />
+              {/* The dry run is a tab of the Config page now. */}
+              <Route
+                path="/dryrun"
+                element={<Navigate to="/config?tab=dryrun" replace />}
+              />
               <Route path="/config" element={<Config />} />
               <Route path="/networks" element={<Networks />} />
               <Route path="/settings" element={<Settings />} />

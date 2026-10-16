@@ -39,7 +39,8 @@ function FieldResult({ label, c }: { label: string; c: FieldComparison }) {
   );
 }
 
-export function DryRunPage({ embedded }: { embedded?: boolean }) {
+/** The Config page's Dry run tab. */
+export function DryRun() {
   const dr = useDryRun();
   const names = useDeviceNames();
   if (dr.isLoading) return <Loading />;
@@ -48,9 +49,8 @@ export function DryRunPage({ embedded }: { embedded?: boolean }) {
   const total = d.history.length;
   const matched = d.history.filter((h) => h.matches).length;
   return (
-    <div className="page">
+    <>
       <div className="page-head">
-        {!embedded && <h1>Dry run</h1>}
         <span className="muted">
           what apctl would push, compared with what the current controller
           pushes. Nothing is sent to APs.
@@ -141,6 +141,6 @@ export function DryRunPage({ embedded }: { embedded?: boolean }) {
           </table>
         )}
       </div>
-    </div>
+    </>
   );
 }
