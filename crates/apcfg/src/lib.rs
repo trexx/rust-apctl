@@ -306,7 +306,7 @@ impl<'a> Ctx<'a> {
             mgmt: setting(state, site_id, "mgmt"),
             super_mgmt: setting(state, site_id, "super_mgmt"),
             radio_ai: setting(state, site_id, "radio_ai"),
-            country: json::text_of(setting(state, site_id, "country"), "code").unwrap_or_else(|| "840".to_string()),
+            country: json::text_of(setting(state, site_id, "country"), "code").map_or_else(|| "840".to_string(), |c| c.to_string()),
         })
     }
 

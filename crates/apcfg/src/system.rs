@@ -8,7 +8,7 @@ use serde_json::Value;
 
 use crate::cfg::{Cfg, Prefix};
 use crate::javahash::hash_set_order;
-use crate::json::{arr, flag, int_of, mac_eq, on_off, override_of, str_list, str_of, text_of};
+use crate::json::{Text, arr, flag, int_of, mac_eq, on_off, override_of, str_list, str_of, text_of};
 use crate::meta::Meta;
 use crate::net::{self, Net};
 use crate::wlan::{self, Band, Radio, Vap, network_vlan, wlan_id};
@@ -328,8 +328,8 @@ fn addressing(c: &mut Cfg, ctx: &Ctx) {
     c.set("resolv.status", "enabled");
     let name = str_of(ctx.device, "name").map(hostname).filter(|h| !h.is_empty());
     c.opt("resolv.host.1.name", name);
-    for i in 1..=2 {
-        let dns = cn(&format!("dns{i}")).filter(|d| !d.is_empty());
+    for (i, key) in [(1, "dns1"), (2, "dns2")] {
+        let dns = cn(key).filter(|d| !d.is_empty());
         match dns {
             Some(ip) => c.set(format_args!("resolv.nameserver.{i}.ip"), ip),
             None => c.set(format_args!("resolv.nameserver.{i}.status"), "disabled"),
@@ -362,7 +362,7 @@ fn syslog(c: &mut Cfg, ctx: &Ctx) {
     }
     if enabled {
         let (ip, port) = if this {
-            (controller_ip.clone(), Some("5514".to_string()))
+            (controller_ip.clone(), Some(Text::Str("5514")))
         } else {
             (str_of(s, "ip").map(str::to_string), text_of(s, "port"))
         };
@@ -372,7 +372,7 @@ fn syslog(c: &mut Cfg, ctx: &Ctx) {
     }
     if this || flag(s, "netconsole_enabled", false) {
         let (host, port) = if this {
-            (controller_ip, Some("5514".to_string()))
+            (controller_ip, Some(Text::Str("5514")))
         } else {
             (str_of(s, "netconsole_host").map(str::to_string), text_of(s, "netconsole_port"))
         };
@@ -437,7 +437,7 @@ fn ntp(c: &mut Cfg, ctx: &Ctx) {
     let looks_like_host =
         |h: &&str| !h.is_empty() && h.chars().all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '-' | ':'));
     let servers: Vec<&str> =
-        (1..=4).filter_map(|i| str_of(s, &format!("ntp_server_{i}"))).filter(looks_like_host).collect();
+        ["ntp_server_1", "ntp_server_2", "ntp_server_3", "ntp_server_4"].iter().filter_map(|k| str_of(s, k)).filter(looks_like_host).collect();
     c.header("ntpclient");
     if servers.is_empty() {
         c.set("ntpclient.status", "disabled");
