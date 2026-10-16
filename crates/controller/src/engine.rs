@@ -1006,9 +1006,7 @@ impl Engine {
         let clients = &mut live.clients;
         self.connected.retain(|cmac| {
             let Some(c) = clients.get_mut(cmac).filter(|c| c.sample.ap_mac == mac) else { return true };
-            c.connected = false;
-            events.push(disconnected_event(ts, *cmac, c, "ap_forgotten"));
-            self.writer.exec(Db::Config, "UPDATE clients SET connected = 0 WHERE mac = ?1", vec![Sql::Text(cmac.to_string())]);
+            events.push(disconnect(&self.writer, ts, *cmac, c, "ap_forgotten"));
             false
         });
         drop(live);
@@ -1390,10 +1388,8 @@ impl Engine {
                 Some(d) => (now - c.last_seen > CLIENT_GRACE_SECS && d.last_full_inform > c.last_seen).then_some("not_seen"),
             };
             let Some(reason) = reason else { return true };
-            c.connected = false;
             changed = true;
-            events.push(disconnected_event(now, *cmac, c, reason));
-            self.writer.exec(Db::Config, "UPDATE clients SET connected = 0 WHERE mac = ?1", vec![Sql::Text(cmac.to_string())]);
+            events.push(disconnect(&self.writer, now, *cmac, c, reason));
             false
         });
         for e in events {
@@ -1656,7 +1652,11 @@ fn connected_event(ts: Ts, c: &ClientSample, new: bool) -> Event {
     }))
 }
 
-fn disconnected_event(ts: Ts, mac: Mac, c: &ClientView, reason: &str) -> Event {
+/// Marks a client disconnected, in the live view and the database, and
+/// returns the event that says so, for the caller to emit.
+fn disconnect(writer: &Writer, ts: Ts, mac: Mac, c: &mut ClientView, reason: &str) -> Event {
+    c.connected = false;
+    writer.exec(Db::Config, "UPDATE clients SET connected = 0 WHERE mac = ?1", vec![Sql::Text(mac.to_string())]);
     ev(ts, EventKind::ClientDisconnected, Some(c.sample.ap_mac), Some(mac), json!({
         "reason": reason, "last_seen": c.last_seen, "essid": c.sample.essid,
         "connected_for": c.sample.uptime, "last_signal": c.sample.signal,
