@@ -985,7 +985,7 @@ export const useClients = (enabled = true) => useQuery({ ...clientsQuery, enable
  * Something derived from the client list, re-rendering only when it changes.
  * `select` must be a module-level function, so it runs once per fetch.
  */
-export const useClientsSelect = <T>(select: (clients: ClientView[]) => T) => useQuery({ ...clientsQuery, select });
+export const useClientsSelect = <T>(select: (clients: ClientView[]) => T, enabled = true) => useQuery({ ...clientsQuery, select, enabled });
 
 /** Names by MAC, for links. */
 export type Names = Readonly<Record<Mac, string>>;
@@ -1505,8 +1505,8 @@ export interface UserGroup {
   used_by: string[];
 }
 
-export const useUserGroups = () =>
-  useQuery({ queryKey: keys.settings("usergroups"), queryFn: ({ signal }) => get<{ active: boolean; groups: UserGroup[] }>("/api/settings/usergroups", signal) });
+export const useUserGroups = (enabled = true) =>
+  useQuery({ queryKey: keys.settings("usergroups"), queryFn: ({ signal }) => get<{ active: boolean; groups: UserGroup[] }>("/api/settings/usergroups", signal), enabled });
 export const setClientSpeedLimit = (mac: Mac, usergroup_id: string | null) => send<{ saved: boolean; what: string }>("PUT", `/api/clients/${mac}/speed-limit`, { usergroup_id });
 
 // ---- Adoption ----

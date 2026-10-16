@@ -12,7 +12,7 @@ import {
   useStatus,
   useUserGroups,
 } from "../api";
-import type { DeviceSummary, Mac } from "../api";
+import type { Mac, Names } from "../api";
 import { speed } from "../format";
 import { Outcome, useRunner } from "./common";
 
@@ -128,16 +128,20 @@ export function ClientActions({
   connected: boolean;
   blocked: boolean;
   lockedTo: Mac | null;
-  aps: DeviceSummary[];
+  /** AP names by MAC, for the lock. */
+  aps: Names;
   usergroupId: string | null;
 }) {
   const { can, why } = useCanAct();
+  // A speed limit also changes who uses each group.
   const { busy, msg, run } = useRunner([
     keys.client(mac),
     keys.clients(),
-    keys.settings(),
+    keys.settings("usergroups"),
   ]);
-  const groups = (useUserGroups().data?.groups ?? []).filter((g) => !g.default);
+  const groups = (useUserGroups(can).data?.groups ?? []).filter(
+    (g) => !g.default,
+  );
   if (!can && !why) return null;
   const off = !can || busy;
   return (
@@ -190,9 +194,9 @@ export function ClientActions({
             }}
           >
             <option value="">Any AP</option>
-            {aps.map((a) => (
-              <option key={a.mac} value={a.mac}>
-                {a.name ?? a.mac}
+            {Object.entries(aps).map(([ap, apName]) => (
+              <option key={ap} value={ap}>
+                {apName}
               </option>
             ))}
           </select>
