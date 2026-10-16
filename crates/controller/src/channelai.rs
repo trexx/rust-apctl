@@ -354,14 +354,6 @@ fn next_run(cfg: &Settings, tz: Option<&str>, now: Ts) -> Option<Ts> {
 
 // ---- API ------------------------------------------------------------------
 
-fn require_active(s: &AppState) -> Result<(), ApiError> {
-    if s.active {
-        Ok(())
-    } else {
-        Err(ApiError(StatusCode::CONFLICT, "this needs active mode: in shadow mode apctl never talks to the APs".into()))
-    }
-}
-
 /// GET /api/rf/channel-ai
 pub async fn status(State(s): State<AppState>) -> Result<Json<Value>, ApiError> {
     // Finished scans are cleared under the write lock; the rest needs only a copy.
@@ -389,7 +381,7 @@ pub struct BandBody {
 /// POST /api/rf/scan {band}
 pub async fn scan(State(s): State<AppState>, headers: HeaderMap, Json(b): Json<BandBody>) -> Result<Json<Value>, ApiError> {
     crate::api::check_csrf(&headers)?;
-    require_active(&s)?;
+    crate::api::require_active(&s, "this needs")?;
     if !BANDS.contains(&b.band.as_str()) {
         return Err(ApiError(StatusCode::BAD_REQUEST, "band must be ng or na".into()));
     }
@@ -408,7 +400,7 @@ pub struct RunBody {
 /// POST /api/rf/channel-ai/run {bands?}: scan, plan and apply now.
 pub async fn run_now(State(s): State<AppState>, headers: HeaderMap, Json(b): Json<RunBody>) -> Result<Json<Value>, ApiError> {
     crate::api::check_csrf(&headers)?;
-    require_active(&s)?;
+    crate::api::require_active(&s, "this needs")?;
     if RUNNING.load(Ordering::SeqCst) {
         return Err(ApiError(StatusCode::CONFLICT, "Channel AI is already running".into()));
     }
@@ -428,7 +420,7 @@ pub struct ApplyBody {
 /// Every change must be complete (a malformed one refuses the whole plan).
 pub async fn apply_plan(State(s): State<AppState>, headers: HeaderMap, Json(b): Json<Value>) -> Result<Json<Value>, ApiError> {
     crate::api::check_csrf(&headers)?;
-    require_active(&s)?;
+    crate::api::require_active(&s, "this needs")?;
     let b: ApplyBody = serde_json::from_value(b).map_err(|e| ApiError(StatusCode::BAD_REQUEST, format!("not a plan: {e}")))?;
     if b.changes.is_empty() {
         return Err(ApiError(StatusCode::BAD_REQUEST, "the plan changes nothing".into()));

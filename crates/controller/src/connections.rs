@@ -27,7 +27,8 @@ use serde_json::{Value, json};
 
 use crate::api::{ApiError, AppState};
 use crate::engine::Live;
-use crate::insights::{RangeQuery, read, window};
+use crate::api::read;
+use crate::insights::{RangeQuery, window};
 use crate::model::Ts;
 use crate::store::Db;
 
@@ -400,7 +401,7 @@ pub fn roam_clients(roams: &[Roam]) -> Vec<Value> {
 
 /// Loads the notifications in a window (optionally one client's).
 async fn load(s: &AppState, from: Ts, to: Ts, client: Option<String>) -> Result<Vec<ConnEvent>, ApiError> {
-    read(s, Db::Config, move |c| {
+    read(&s.store, Db::Config, move |c| {
         const COLUMNS: &str = "SELECT ts, ap_mac, client_mac, vap, essid, radio, event_type, detail, ip_assign_type, dns_responses, dns_timeouts, rssi FROM connections";
         // Two statements: `(?3 IS NULL OR client_mac = ?3)` would keep SQLite off the per-client index.
         let mut stmt = match client {
@@ -481,7 +482,7 @@ impl Names {
 
 /// Display names for APs and clients (aliases first), for the ones that have one.
 async fn names(s: &AppState) -> Result<(HashMap<String, String>, HashMap<String, String>), ApiError> {
-    let mut names = read(s, Db::Config, |c| Ok(Names::load(c)?)).await?;
+    let mut names = read(&s.store, Db::Config, |c| Ok(Names::load(c)?)).await?;
     names.add_live(&s.live.read().unwrap());
     let named = |m: HashMap<String, Option<String>>| m.into_iter().filter_map(|(mac, n)| n.map(|n| (mac, n))).collect();
     Ok((named(names.aps), named(names.clients)))

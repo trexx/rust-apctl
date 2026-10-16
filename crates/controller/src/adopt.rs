@@ -140,9 +140,9 @@ fn random_hex(bytes: usize) -> String {
 /// channel, the site's default width, auto power.
 pub fn radio_table(state: &Value, payload: &Value) -> Vec<Value> {
     let width = |band: &str| {
-        crate::settings::docs(state, "setting")
-            .find(|s| s["key"].as_str() == Some("radio_ai"))
-            .and_then(|r| r["radios_configuration"].as_array()?.iter().find(|c| c["radio"].as_str() == Some(band))?["channel_width"].as_i64())
+        crate::settings::setting(state, "radio_ai")["radios_configuration"]
+            .as_array()
+            .and_then(|l| l.iter().find(|c| c["radio"].as_str() == Some(band))?["channel_width"].as_i64())
             .unwrap_or(if band == "ng" { 20 } else { 80 })
     };
     payload["radio_table"]
@@ -209,13 +209,6 @@ pub fn adopt_device(state: &mut Value, mac: &Mac, payload: &Value) -> Result<Str
     Ok(format!("adopted AP {} ({mac})", payload["hostname"].as_str().or(payload["model"].as_str()).unwrap_or("new")))
 }
 
-/// `adopt_device` with `{mac, payload}`, as active.rs's tests call it.
-#[cfg(test)]
-pub fn add_device(state: &mut Value, body: &Value) -> Result<String, String> {
-    let mac: Mac = body["mac"].as_str().and_then(|m| m.parse().ok()).ok_or("which AP?")?;
-    adopt_device(state, &mac, &body["payload"])
-}
-
 /// Removes an AP from the settings and everything that names it.
 pub fn remove_device(state: &mut Value, mac: &Mac) -> Result<String, String> {
     let mac = mac.to_string();
@@ -277,14 +270,6 @@ pub fn spawn(s: AppState) {
 
 // ---- API ------------------------------------------------------------------
 
-fn require_active(s: &AppState) -> Result<(), ApiError> {
-    if s.active {
-        Ok(())
-    } else {
-        Err(ApiError(StatusCode::CONFLICT, "adoption needs active mode: in shadow mode apctl never answers the APs".into()))
-    }
-}
-
 /// GET /api/devices/pending
 pub async fn pending(State(s): State<AppState>) -> Json<Value> {
     // Before taking the lock below: it reads the settings too.
@@ -302,8 +287,8 @@ pub async fn pending(State(s): State<AppState>) -> Json<Value> {
 /// POST /api/devices/{mac}/adopt: adopt a pending AP.
 pub async fn adopt(State(s): State<AppState>, headers: HeaderMap, Path(mac): Path<String>) -> Result<Json<Value>, ApiError> {
     crate::api::check_csrf(&headers)?;
-    require_active(&s)?;
-    let mac = crate::actions::parse_mac(&mac)?;
+    crate::api::require_active(&s, "adoption needs")?;
+    let mac = crate::api::parse_mac(&mac)?;
     let payload = s.live.read().unwrap().adoption.pending.get(&mac).map(|p| p.payload.clone()).ok_or_else(|| ApiError(StatusCode::NOT_FOUND, "this AP is not waiting for adoption".into()))?;
     let inform = payload.clone();
     crate::actions::edit_settings(&s, format!("adopting {mac}"), move |state| adopt_device(state, &mac, &inform).map(|_| ())).await?;
@@ -319,8 +304,8 @@ pub async fn adopt(State(s): State<AppState>, headers: HeaderMap, Path(mac): Pat
 /// POST /api/devices/{mac}/forget: remove an AP; if it reports again it resets itself.
 pub async fn forget(State(s): State<AppState>, headers: HeaderMap, Path(mac): Path<String>) -> Result<Json<Value>, ApiError> {
     crate::api::check_csrf(&headers)?;
-    require_active(&s)?;
-    let mac = crate::actions::parse_mac(&mac)?;
+    crate::api::require_active(&s, "adoption needs")?;
+    let mac = crate::api::parse_mac(&mac)?;
     let online = {
         let live = s.live.read().unwrap();
         if live.state.as_deref().and_then(|st| device_doc(st, &mac)).is_none() {

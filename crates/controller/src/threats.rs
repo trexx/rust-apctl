@@ -570,8 +570,7 @@ async fn findings(s: &AppState) -> Result<(Vec<Finding>, Ts), ApiError> {
         let a = gather(&store, &live, store::now_ts())?;
         Ok::<_, anyhow::Error>((assess(&a), a.watching_since))
     })
-    .await
-    .map_err(|e| ApiError::internal(e.to_string()))?
+    .await?
     .map_err(ApiError::from)
 }
 

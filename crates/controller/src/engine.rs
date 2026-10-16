@@ -1241,12 +1241,7 @@ impl Engine {
 pub(crate) fn section_labels(cfg: &str, radios: &[crate::model::RadioSample]) -> serde_json::Map<String, Value> {
     let kv: HashMap<&str, &str> = cfg.lines().filter_map(|l| l.split_once('=')).collect();
     let band_of_phy = |phy: &str| {
-        radios.iter().find(|r| r.name.as_deref() == Some(phy)).map(|r| match r.radio.as_str() {
-            "ng" => "2.4 GHz",
-            "na" => "5 GHz",
-            "6e" => "6 GHz",
-            other => other,
-        })
+        radios.iter().find(|r| r.name.as_deref() == Some(phy)).map(|r| crate::settings::band_name(&r.radio))
     };
     // Interface (e.g. wifi1ap1) -> band, from the wireless sections' parent radio.
     let mut band_of_dev: HashMap<&str, &str> = HashMap::new();

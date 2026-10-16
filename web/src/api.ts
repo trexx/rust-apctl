@@ -491,12 +491,11 @@ export interface FieldComparison {
 }
 
 export interface DryRun {
-  generator: boolean;
   settings_imported_at: number | null;
   devices: {
     mac: Mac;
     name: string | null;
-    status: "match" | "equivalent" | "differs" | "error" | "no_generator" | "no_settings" | "no_config_seen";
+    status: "match" | "equivalent" | "differs" | "error" | "no_settings" | "no_config_seen";
     comparison?: { mgmt_cfg: FieldComparison; system_cfg: FieldComparison };
     against_redacted?: boolean;
     error?: string;

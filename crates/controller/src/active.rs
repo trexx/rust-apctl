@@ -158,9 +158,8 @@ impl Active {
         let Some(mut state) = self.live.read().unwrap().state.as_deref().cloned() else {
             return json!({ "_type": "noop", "interval": self.interval(), "server_time_in_utc": server_time });
         };
-        let m = mac.to_string();
         let mut cfgversion = new_cfgversion();
-        if let Some(d) = state["devices"].as_array_mut().and_then(|l| l.iter_mut().find(|d| d["mac"].as_str().is_some_and(|x| x.eq_ignore_ascii_case(&m)))) {
+        if let Some(d) = crate::adopt::device_doc_mut(&mut state, &mac) {
             // The key it used, so mgmt_cfg includes `authkey`.
             d["x_inform_authkey"] = json!(hex::encode(DEFAULT_KEY));
             if let Some(v) = d["cfgversion"].as_str() {
@@ -213,8 +212,7 @@ impl Active {
             let p = payload.clone();
             let edit: crate::engine::StateEdit = Box::new(move |st: &mut Value| {
                 let table = crate::adopt::radio_table(st, &p);
-                let m = p["mac"].as_str().unwrap_or_default().to_string();
-                let d = st["devices"].as_array_mut().and_then(|l| l.iter_mut().find(|d| d["mac"].as_str().is_some_and(|x| x.eq_ignore_ascii_case(&m)))).ok_or("no record")?;
+                let d = crate::adopt::device_doc_mut(st, &mac).ok_or("no record")?;
                 d["radio_table"] = json!(table);
                 for k in ["model", "version", "serial", "ip"] {
                     if !p[k].is_null() {
@@ -765,7 +763,7 @@ mod tests {
         {
             let mut live = rig.live.write().unwrap();
             let mut state = live.state.as_deref().cloned().unwrap();
-            crate::adopt::add_device(&mut state, &json!({ "mac": new.to_string(), "payload": payload })).unwrap();
+            crate::adopt::adopt_device(&mut state, &new, &payload).unwrap();
             live.state = Some(Arc::new(state));
             live.adoption.adopting.insert(new, 0);
         }

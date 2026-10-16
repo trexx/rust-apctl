@@ -83,11 +83,8 @@ pub fn add_controls(v: &mut Value, state: Option<&Value>, mac: &str) {
 }
 
 /// The settings' client entries by lowercase MAC, built once for a list of clients.
-// Not used yet: /api/clients (api.rs) is to build one per request instead of calling `add_controls` per client.
-#[allow(dead_code)]
 pub struct ClientControls<'a>(HashMap<String, &'a Value>);
 
-#[allow(dead_code)]
 impl<'a> ClientControls<'a> {
     pub fn new(state: Option<&'a Value>) -> Self {
         let list = state.and_then(|s| s["clients"].as_array()).map(Vec::as_slice).unwrap_or_default();
@@ -115,19 +112,6 @@ fn set_controls(v: &mut Value, entry: Option<&Value>) {
     v["usergroup_id"] = entry.map_or(Value::Null, |c| c["usergroup_id"].clone());
 }
 
-fn require_active(s: &AppState) -> Result<(), ApiError> {
-    if s.active {
-        Ok(())
-    } else {
-        Err(ApiError(StatusCode::CONFLICT, "this needs active mode: in shadow mode apctl never talks to the APs".into()))
-    }
-}
-
-/// A MAC address from the URL or body; 400 when it isn't one.
-pub fn parse_mac(mac: &str) -> Result<Mac, ApiError> {
-    mac.parse().map_err(|_| ApiError(StatusCode::BAD_REQUEST, "invalid MAC address".into()))
-}
-
 fn known_ap(s: &AppState, mac: &Mac) -> Result<(), ApiError> {
     if s.live.read().unwrap().devices.contains_key(mac) {
         Ok(())
@@ -143,8 +127,8 @@ async fn note(s: &AppState, kind: &'static str, mac: Mac, data: Value) {
 /// POST /api/devices/{mac}/restart
 pub async fn restart(State(s): State<AppState>, headers: HeaderMap, Path(mac): Path<String>) -> Result<Json<Value>, ApiError> {
     crate::api::check_csrf(&headers)?;
-    require_active(&s)?;
-    let mac = parse_mac(&mac)?;
+    crate::api::require_active(&s, "this needs")?;
+    let mac = crate::api::parse_mac(&mac)?;
     known_ap(&s, &mac)?;
     queue(&mut s.live.write().unwrap(), mac, json!({ "_type": "reboot", "reboot_type": "soft" }));
     note(&s, "ap_restart_requested", mac, json!({})).await;
@@ -159,8 +143,8 @@ pub struct LocateBody {
 /// POST /api/devices/{mac}/locate {on}
 pub async fn locate(State(s): State<AppState>, headers: HeaderMap, Path(mac): Path<String>, Json(b): Json<LocateBody>) -> Result<Json<Value>, ApiError> {
     crate::api::check_csrf(&headers)?;
-    require_active(&s)?;
-    let mac = parse_mac(&mac)?;
+    crate::api::require_active(&s, "this needs")?;
+    let mac = crate::api::parse_mac(&mac)?;
     known_ap(&s, &mac)?;
     let mut live = s.live.write().unwrap();
     queue(&mut live, mac, json!({ "_type": "cmd", "cmd": if b.on { "set-locate" } else { "unset-locate" } }));
@@ -175,8 +159,8 @@ pub async fn locate(State(s): State<AppState>, headers: HeaderMap, Path(mac): Pa
 /// POST /api/devices/{mac}/provision: send the AP its config again.
 pub async fn provision(State(s): State<AppState>, headers: HeaderMap, Path(mac): Path<String>) -> Result<Json<Value>, ApiError> {
     crate::api::check_csrf(&headers)?;
-    require_active(&s)?;
-    let mac = parse_mac(&mac)?;
+    crate::api::require_active(&s, "this needs")?;
+    let mac = crate::api::parse_mac(&mac)?;
     known_ap(&s, &mac)?;
     s.live.write().unwrap().reprovision.insert(mac);
     note(&s, "ap_provision_requested", mac, json!({})).await;
@@ -186,8 +170,8 @@ pub async fn provision(State(s): State<AppState>, headers: HeaderMap, Path(mac):
 /// POST /api/clients/{mac}/kick: disconnect the client so it reconnects.
 pub async fn kick(State(s): State<AppState>, headers: HeaderMap, Path(mac): Path<String>) -> Result<Json<Value>, ApiError> {
     crate::api::check_csrf(&headers)?;
-    require_active(&s)?;
-    let client = parse_mac(&mac)?;
+    crate::api::require_active(&s, "this needs")?;
+    let client = crate::api::parse_mac(&mac)?;
     let ap = {
         let mut live = s.live.write().unwrap();
         let ap = live
@@ -211,8 +195,8 @@ pub struct BlockBody {
 /// POST /api/clients/{mac}/block {blocked}
 pub async fn block(State(s): State<AppState>, headers: HeaderMap, Path(mac): Path<String>, Json(b): Json<BlockBody>) -> Result<Json<Value>, ApiError> {
     crate::api::check_csrf(&headers)?;
-    require_active(&s)?;
-    let client = parse_mac(&mac)?;
+    crate::api::require_active(&s, "this needs")?;
+    let client = crate::api::parse_mac(&mac)?;
     let m = client.to_string();
     let blocked = b.blocked;
     let what = if blocked { format!("blocked client {m}") } else { format!("unblocked client {m}") };
@@ -238,11 +222,11 @@ pub struct LockBody {
 /// POST /api/clients/{mac}/lock {ap}
 pub async fn lock(State(s): State<AppState>, headers: HeaderMap, Path(mac): Path<String>, Json(b): Json<LockBody>) -> Result<Json<Value>, ApiError> {
     crate::api::check_csrf(&headers)?;
-    require_active(&s)?;
-    let client = parse_mac(&mac)?;
+    crate::api::require_active(&s, "this needs")?;
+    let client = crate::api::parse_mac(&mac)?;
     let ap = match &b.ap {
         Some(a) => {
-            let a = parse_mac(a)?;
+            let a = crate::api::parse_mac(a)?;
             known_ap(&s, &a)?;
             Some(a.to_string())
         }

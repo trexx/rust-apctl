@@ -623,7 +623,7 @@ pub struct ListQuery {
 /// GET /api/alerts: recent alerts, newest first, with the unread count.
 pub async fn list(State(s): State<AppState>, Query(q): Query<ListQuery>) -> Result<Json<Value>, ApiError> {
     let limit = q.limit.unwrap_or(50).clamp(1, 500) as i64;
-    let rows = crate::insights::read(&s, Db::Config, move |c| {
+    let rows = crate::api::read(&s.store, Db::Config, move |c| {
         let mut stmt = c.prepare(
             "SELECT id, ts, key, category, severity, entity, title, message, link, tag, resolved_ts, read FROM alerts ORDER BY ts DESC, id DESC LIMIT ?1",
         )?;

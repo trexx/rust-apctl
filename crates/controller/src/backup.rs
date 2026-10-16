@@ -764,25 +764,20 @@ pub fn schedule(b: Backups, store: Arc<store::Store>) {
 
 // ---------------------------------------------------------------- API
 
-fn backups(s: &AppState) -> Result<Backups, ApiError> {
-    s.backups.clone().ok_or_else(|| ApiError(StatusCode::SERVICE_UNAVAILABLE, "backups are not available".into()))
-}
-
 fn valid_name(name: &str) -> bool {
     name.starts_with("apctl-") && name.ends_with(".apb") && name.chars().all(|c| c.is_ascii_alphanumeric() || "-._".contains(c)) && !name.contains("..")
 }
 
 /// GET /api/backups
 pub async fn index(State(s): State<AppState>) -> Result<Json<Value>, ApiError> {
-    let b = backups(&s)?;
+    let b = s.backups.clone();
     let encrypted = b.key.is_some();
     let store = s.store.clone();
     let (settings, list, staged, failed) = tokio::task::spawn_blocking(move || {
         let staged = b.staging().join("pending").exists();
         (load_settings(&store), list(&b), staged, fs::read_to_string(b.staging().join("pending.failed")).ok())
     })
-    .await
-    .map_err(|e| ApiError::internal(e.to_string()))?;
+    .await?;
     let next = settings.enabled.then(|| settings.next_due(store::now_ts()));
     Ok(Json(json!({
         "encrypted": encrypted, "version": VERSION, "settings": settings, "next_run": next,
@@ -813,18 +808,17 @@ pub async fn create_now(State(s): State<AppState>, headers: HeaderMap, Json(body
     if !(-1..=365).contains(&body.days) {
         return Err(ApiError(StatusCode::BAD_REQUEST, "history must be -1, 0 or 1-365 days".into()));
     }
-    let b = backups(&s)?;
+    let b = s.backups.clone();
     let dir = b.data_dir.clone();
     let meta = tokio::task::spawn_blocking(move || create(&b, &dir, Kind::Manual, body.days))
-        .await
-        .map_err(|e| ApiError::internal(e.to_string()))?
+        .await?
         .map_err(|e| ApiError::internal(format!("{e:#}")))?;
     Ok(Json(json!(meta)))
 }
 
 /// GET /api/backups/file/{name}: download.
 pub async fn download(State(s): State<AppState>, UrlPath(name): UrlPath<String>) -> Result<Response, ApiError> {
-    let b = backups(&s)?;
+    let b = s.backups.clone();
     if !valid_name(&name) {
         return Err(ApiError(StatusCode::BAD_REQUEST, "invalid backup name".into()));
     }
@@ -840,7 +834,7 @@ pub async fn download(State(s): State<AppState>, UrlPath(name): UrlPath<String>)
 /// DELETE /api/backups/file/{name}
 pub async fn delete(State(s): State<AppState>, headers: HeaderMap, UrlPath(name): UrlPath<String>) -> Result<Json<Value>, ApiError> {
     crate::api::check_csrf(&headers)?;
-    let b = backups(&s)?;
+    let b = s.backups.clone();
     let found = valid_name(&name)
         && tokio::task::spawn_blocking(move || {
             let found = b.dir().join(&name).exists();
@@ -849,8 +843,7 @@ pub async fn delete(State(s): State<AppState>, headers: HeaderMap, UrlPath(name)
             }
             found
         })
-        .await
-        .map_err(|e| ApiError::internal(e.to_string()))?;
+        .await?;
     if !found {
         return Err(ApiError(StatusCode::NOT_FOUND, "no such backup".into()));
     }
@@ -894,11 +887,11 @@ pub async fn upload(State(s): State<AppState>, headers: HeaderMap, body: Body) -
     use futures_util::StreamExt;
     use tokio::io::AsyncWriteExt;
     crate::api::check_csrf(&headers)?;
-    let b = backups(&s)?;
-    tokio::fs::create_dir_all(b.staging()).await.map_err(|e| ApiError::internal(e.to_string()))?;
+    let b = s.backups.clone();
+    tokio::fs::create_dir_all(b.staging()).await?;
     let name = format!("upload-{}-{}.apb", store::now_ts(), random_hex().map_err(ApiError::from)?);
     let tmp = TempFile(b.staging().join(name));
-    let mut file = tokio::fs::File::create_new(&tmp.0).await.map_err(|e| ApiError::internal(e.to_string()))?;
+    let mut file = tokio::fs::File::create_new(&tmp.0).await?;
     let mut stream = body.into_data_stream();
     // DefaultBodyLimit does not apply to a streamed body: count here.
     let mut size = 0u64;
@@ -908,17 +901,16 @@ pub async fn upload(State(s): State<AppState>, headers: HeaderMap, body: Body) -
         if size > UPLOAD_LIMIT {
             return Err(ApiError(StatusCode::PAYLOAD_TOO_LARGE, "the backup is too large (1 GiB at most)".into()));
         }
-        file.write_all(&chunk).await.map_err(|e| ApiError::internal(e.to_string()))?;
+        file.write_all(&chunk).await?;
     }
-    file.flush().await.map_err(|e| ApiError::internal(e.to_string()))?;
+    file.flush().await?;
     drop(file);
     let res = tokio::task::spawn_blocking(move || {
         let r = stage(&b, &tmp.0);
         drop(tmp);
         r
     })
-    .await
-    .map_err(|e| ApiError::internal(e.to_string()))?
+    .await?
     .map_err(|e| ApiError(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
     Ok(Json(json!({ "staged": res.0, "manifest": res.1 })))
 }
@@ -935,7 +927,7 @@ impl Drop for TempFile {
 /// POST /api/backups/restore: marks a backup to be restored and restarts apctl.
 pub async fn restore(State(s): State<AppState>, headers: HeaderMap, Json(body): Json<RestoreBody>) -> Result<Json<Value>, ApiError> {
     crate::api::check_csrf(&headers)?;
-    let b = backups(&s)?;
+    let b = s.backups.clone();
     let (id, m) = tokio::task::spawn_blocking(move || -> Result<(String, Manifest)> {
         let (id, m) = match (body.name, body.staged) {
             (Some(name), _) if valid_name(&name) => stage(&b, &b.dir().join(&name))?,
@@ -954,8 +946,7 @@ pub async fn restore(State(s): State<AppState>, headers: HeaderMap, Json(body): 
         }
         Ok((id, m))
     })
-    .await
-    .map_err(|e| ApiError::internal(e.to_string()))?
+    .await?
     .map_err(|e| ApiError(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
     tracing::warn!("restore of backup from {} staged as {id}; restarting", m.created);
     // Answer first, then exit, and the restore is applied on the next start. The

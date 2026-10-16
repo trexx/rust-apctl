@@ -11,7 +11,7 @@ use rusqlite::types::Value as Sql;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use crate::api::{ApiError, AppState};
+use crate::api::{ApiError, AppState, read};
 use crate::channelai::is_dfs;
 use crate::engine::Live;
 use crate::model::Ts;
@@ -48,11 +48,6 @@ fn bucket_for(range: Ts, tier: usize) -> Ts {
     let min = TIERS[tier].1.max(60);
     let target = (range / 288).max(min);
     [60, 300, 900, 1800, 3600, 3 * 3600, 6 * 3600, 86400].into_iter().find(|b| *b >= target).unwrap_or(86400)
-}
-
-pub async fn read<T: Send + 'static>(s: &AppState, db: Db, f: impl FnOnce(&Connection) -> anyhow::Result<T> + Send + 'static) -> Result<T, ApiError> {
-    let store = s.store.clone();
-    tokio::task::spawn_blocking(move || store.read(db, f)).await.map_err(|e| ApiError::internal(e.to_string()))?.map_err(ApiError::from)
 }
 
 /// Per-key series of counter values -> per-second rates between consecutive
@@ -159,7 +154,7 @@ pub async fn activity(State(s): State<AppState>, Query(q): Query<RangeQuery>) ->
     let bucket = bucket_for(to - from, tier);
     let band = q.band.clone();
     let ap = q.mac.as_ref().map(|m| m.to_ascii_lowercase());
-    let result = read(&s, Db::Metrics, move |c| {
+    let result = read(&s.store, Db::Metrics, move |c| {
         let ap_ok = |mac: &str| ap.as_deref().is_none_or(|a| a == mac);
         // VAP counters: bytes, packets, retries, multicast, drops; gauge: clients.
         const COLS: &[&str] = &[
@@ -280,7 +275,7 @@ fn totals(samples: &[(Ts, Vec<Option<f64>>)], from: Ts) -> (f64, f64) {
 pub async fn top(State(s): State<AppState>, Query(q): Query<RangeQuery>) -> Result<Json<Value>, ApiError> {
     let (from, to, tier) = window(&q);
     let ap = q.mac.as_ref().map(|m| m.to_ascii_lowercase());
-    let (aps, clients) = read(&s, Db::Metrics, move |c| {
+    let (aps, clients) = read(&s.store, Db::Metrics, move |c| {
         let vaps = load(c, Spec { table: "vap_stats", key: "bssid", extra: &["ap_mac"], cols: &["tx_bytes", "rx_bytes"] }, tier, from, to)?;
         let mut aps: HashMap<String, (f64, f64)> = HashMap::new();
         for (ex, samples) in vaps.values() {
@@ -376,7 +371,7 @@ const DENSITY_COLS: &[&str] = &["tx_bytes", "rx_bytes", "tx_retries", "wifi_tx_a
 pub async fn density(State(s): State<AppState>, Query(q): Query<RangeQuery>) -> Result<Json<Value>, ApiError> {
     let (from, to, tier) = window(&q);
     let suffix = TIERS[tier].0;
-    let (signals, vaps) = read(&s, Db::Metrics, move |c| {
+    let (signals, vaps) = read(&s.store, Db::Metrics, move |c| {
         let mut stmt = c.prepare(&format!("SELECT ts, ap_mac, radio, signal FROM client_stats{suffix} WHERE ts >= ?1 AND ts <= ?2 AND signal < 0 AND ap_mac IS NOT NULL"))?;
         let rows = stmt
             .query_map([from, to], |r| Ok((r.get::<_, Ts>(0)?, r.get::<_, String>(1)?, r.get::<_, Option<String>>(2)?, r.get::<_, f64>(3)?)))?
@@ -449,7 +444,7 @@ pub async fn density(State(s): State<AppState>, Query(q): Query<RangeQuery>) -> 
 /// GET /api/site/retries: each AP radio's TX retry rate over the window.
 pub async fn retries(State(s): State<AppState>, Query(q): Query<RangeQuery>) -> Result<Json<Value>, ApiError> {
     let (from, to, tier) = window(&q);
-    let vaps = read(&s, Db::Metrics, move |c| load(c, Spec { table: "vap_stats", key: "bssid", extra: &["ap_mac", "radio"], cols: RETRY_COLS }, tier, from, to)).await?;
+    let vaps = read(&s.store, Db::Metrics, move |c| load(c, Spec { table: "vap_stats", key: "bssid", extra: &["ap_mac", "radio"], cols: RETRY_COLS }, tier, from, to)).await?;
     let totals = retry_totals(&vaps, from);
     let live = s.live.read().unwrap();
     let mut out: Vec<Value> = totals
@@ -470,7 +465,7 @@ pub async fn multicast(State(s): State<AppState>, Query(q): Query<RangeQuery>) -
     let bucket = bucket_for(to - from, tier);
     let ap = q.mac.as_ref().map(|m| m.to_ascii_lowercase());
     let ap2 = ap.clone();
-    let (samples, clients) = read(&s, Db::Metrics, move |c| {
+    let (samples, clients) = read(&s.store, Db::Metrics, move |c| {
         let suffix = TIERS[tier].0;
         let mut stmt = c.prepare(&format!("SELECT mac, type, ts, tx_pps, rx_pps, tx_bytes_ps, rx_bytes_ps FROM mcast_stats{suffix} WHERE ts >= ?1 AND ts <= ?2"))?;
         let rows = stmt
@@ -596,7 +591,7 @@ pub async fn wlans(State(s): State<AppState>, Query(q): Query<RangeQuery>) -> Re
     let i = |name: &str| col(COLS, name);
     let [tx_bytes, rx_bytes, tx_packets, rx_packets, tx_mcast, rx_mcast, tx_bcast, rx_bcast, num_sta, satisfaction, signal] =
         ["tx_bytes", "rx_bytes", "tx_packets", "rx_packets", "tx_mcast", "rx_mcast", "tx_bcast", "rx_bcast", "num_sta", "satisfaction", "avg_client_signal"].map(i);
-    let vaps = read(&s, Db::Metrics, move |c| load(c, Spec { table: "vap_stats", key: "bssid", extra: &["essid", "ap_mac", "radio"], cols: COLS }, tier, from, to)).await?;
+    let vaps = read(&s.store, Db::Metrics, move |c| load(c, Spec { table: "vap_stats", key: "bssid", extra: &["essid", "ap_mac", "radio"], cols: COLS }, tier, from, to)).await?;
     type Bucket = (f64, f64, f64, f64);
     struct Agg {
         down: f64,
@@ -655,7 +650,7 @@ pub async fn wlans(State(s): State<AppState>, Query(q): Query<RangeQuery>) -> Re
     let on_air: HashMap<String, String> = if own.is_empty() {
         HashMap::new()
     } else {
-        read(&s, Db::Config, move |c| {
+        read(&s.store, Db::Config, move |c| {
             let marks = vec!["?"; own.len()].join(", ");
             let rows = c
                 .prepare(&format!("SELECT bssid, security FROM neighbors WHERE security IS NOT NULL AND bssid IN ({marks}) ORDER BY last_seen"))?
@@ -740,14 +735,14 @@ const RADIO_VAP_COLS: &[&str] = &["tx_bytes", "rx_bytes", "avg_client_signal", "
 /// over the window (interference, utilisation, traffic, retries, signal).
 pub async fn radios(State(s): State<AppState>, Query(q): Query<RangeQuery>) -> Result<Json<Value>, ApiError> {
     let (from, to, tier) = window(&q);
-    let (rstats, vstats) = read(&s, Db::Metrics, move |c| {
+    let (rstats, vstats) = read(&s.store, Db::Metrics, move |c| {
         let r = load(c, Spec { table: "radio_stats", key: "mac || '/' || radio", extra: &[], cols: &["cu_total", "cu_interf"] }, tier, from, to)?;
         // Retries come from the VAPs: the radio-level counters stay at 0 on some models.
         let v = load(c, Spec { table: "vap_stats", key: "bssid", extra: &["ap_mac", "radio"], cols: RADIO_VAP_COLS }, tier, from, to)?;
         Ok((r, v))
     })
     .await?;
-    let spectrum_rows = read(&s, Db::Config, |c| {
+    let spectrum_rows = read(&s.store, Db::Config, |c| {
         let mut stmt = c.prepare("SELECT ap_mac, radio, channel, width, utilization, interference, other_bss_count, ts FROM spectrum")?;
         let rows = stmt
             .query_map([], |r| {
@@ -827,7 +822,7 @@ pub struct NeighborQuery {
 pub async fn neighbors(State(s): State<AppState>, Query(q): Query<NeighborQuery>) -> Result<Json<Value>, ApiError> {
     let since = store::now_ts() - q.range.unwrap_or(86400).clamp(600, 30 * 86400);
     let band = q.band.clone();
-    let rows = read(&s, Db::Config, move |c| {
+    let rows = read(&s.store, Db::Config, move |c| {
         let mut cond = "last_seen >= ?1".to_string();
         let mut params = vec![Sql::Integer(since)];
         if let Some(b) = band.filter(|b| b != "all") {
@@ -1055,7 +1050,7 @@ pub async fn compute_plan(s: &AppState, radio: String, dfs: bool, allowed: Optio
     }
     let since = store::now_ts() - 7 * 86400;
     let r2 = radio.clone();
-    let (neigh, spectrum) = read(s, Db::Config, move |c| {
+    let (neigh, spectrum) = read(&s.store, Db::Config, move |c| {
         let mut stmt = c.prepare("SELECT ap_mac, bssid, essid, center_freq, bw, signal FROM neighbors WHERE radio = ?1 AND last_seen >= ?2")?;
         let n = stmt
             .query_map(rusqlite::params![r2, since], |r| {
@@ -1101,7 +1096,7 @@ pub async fn compute_plan(s: &AppState, radio: String, dfs: bool, allowed: Optio
         (aps, own)
     };
     let work = move || plan_channels(radio, dfs, allowed, pinned, aps, own_bssids, neigh, spectrum);
-    tokio::task::spawn_blocking(work).await.map_err(|e| ApiError::internal(e.to_string()))
+    Ok(tokio::task::spawn_blocking(work).await?)
 }
 
 type NeighborRow = (String, String, Option<String>, Option<f64>, Option<f64>, Option<f64>);

@@ -9,7 +9,6 @@ const STATUS: Record<string, string> = {
   equivalent: "Equivalent",
   differs: "Differs",
   error: "Generator error",
-  no_generator: "Generator not available yet",
   no_settings: "Import settings first",
   no_config_seen: "No config seen yet",
 };

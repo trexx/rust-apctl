@@ -181,7 +181,7 @@ fn logins(state: Option<&Value>, given: Option<(String, String)>) -> Vec<(String
         return vec![g];
     }
     let mut out: Vec<(String, String)> = Vec::new();
-    if let Some(m) = state.and_then(|st| crate::settings::docs(st, "setting").find(|x| x["key"].as_str() == Some("mgmt")))
+    if let Some(m) = state.map(|st| crate::settings::setting(st, "mgmt"))
         && let (Some(u), Some(p)) = (m["x_ssh_username"].as_str(), m["x_ssh_password"].as_str())
     {
         out.push((u.to_string(), p.to_string()));
@@ -207,9 +207,7 @@ pub struct AdoptBody {
 /// POST /api/devices/adopt-ssh {ip, port?, username?, password?}
 pub async fn adopt(State(s): State<AppState>, headers: HeaderMap, Json(b): Json<AdoptBody>) -> Result<Json<Value>, ApiError> {
     crate::api::check_csrf(&headers)?;
-    if !s.active {
-        return Err(ApiError(StatusCode::CONFLICT, "adoption needs active mode".into()));
-    }
+    crate::api::require_active(&s, "adoption needs")?;
     let url = inform_url(&s).ok_or_else(|| ApiError(StatusCode::CONFLICT, "apctl doesn't know the URL APs should inform to: set --inform-url".into()))?;
     if b.ip.parse::<std::net::IpAddr>().is_err() {
         return Err(ApiError(StatusCode::BAD_REQUEST, "enter the AP's IP address".into()));

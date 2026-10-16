@@ -340,7 +340,7 @@ fn aps(s: &AppState) -> Vec<ApInfo> {
 /// GET /api/firmware
 pub async fn index(State(s): State<AppState>) -> Result<Json<Value>, ApiError> {
     let store = s.store.clone();
-    let (rels, checked, error) = tokio::task::spawn_blocking(move || releases(&store)).await.map_err(|e| ApiError::internal(e.to_string()))??;
+    let (rels, checked, error) = tokio::task::spawn_blocking(move || releases(&store)).await??;
     let list: Vec<Value> = aps(&s)
         .into_iter()
         .map(|a| {
@@ -359,11 +359,10 @@ pub async fn index(State(s): State<AppState>) -> Result<Json<Value>, ApiError> {
 /// POST /api/firmware/check
 pub async fn check_now(State(s): State<AppState>, headers: HeaderMap) -> Result<Json<Value>, ApiError> {
     crate::api::check_csrf(&headers)?;
-    let w = s.writer.clone().ok_or_else(|| ApiError::internal("no writer"))?;
+    let w = s.writer.clone();
     let started = store::now_ts();
     let n = tokio::task::spawn_blocking(move || check(&w))
-        .await
-        .map_err(|e| ApiError::internal(e.to_string()))?
+        .await?
         .map_err(|e| ApiError(StatusCode::BAD_GATEWAY, format!("the firmware feed could not be read: {e:#}")))?;
     // The writer commits about once a second: wait (a few seconds at most) for
     // this check, written last, so that the page's next read shows the new releases.
@@ -381,14 +380,6 @@ pub async fn check_now(State(s): State<AppState>, headers: HeaderMap) -> Result<
     Ok(Json(json!({ "ok": true, "platforms": n })))
 }
 
-fn require_active(s: &AppState) -> Result<(), ApiError> {
-    if s.active {
-        Ok(())
-    } else {
-        Err(ApiError(StatusCode::CONFLICT, "upgrades need active mode: in shadow mode apctl never talks to the APs".into()))
-    }
-}
-
 #[derive(Deserialize)]
 pub struct UpgradeBody {
     macs: Vec<String>,
@@ -397,9 +388,9 @@ pub struct UpgradeBody {
 /// POST /api/firmware/upgrade: queue release upgrades, one AP at a time.
 pub async fn upgrade(State(s): State<AppState>, headers: HeaderMap, Json(b): Json<UpgradeBody>) -> Result<Json<Value>, ApiError> {
     crate::api::check_csrf(&headers)?;
-    require_active(&s)?;
+    crate::api::require_active(&s, "upgrades need")?;
     let store = s.store.clone();
-    let (rels, ..) = tokio::task::spawn_blocking(move || releases(&store)).await.map_err(|e| ApiError::internal(e.to_string()))??;
+    let (rels, ..) = tokio::task::spawn_blocking(move || releases(&store)).await??;
     let wanted: Vec<String> = b.macs.iter().map(|m| m.to_ascii_lowercase()).collect();
     let mut chosen: Vec<ApInfo> = aps(&s).into_iter().filter(|a| wanted.contains(&a.mac)).collect();
     // Mesh APs first: an AP with mesh children must not restart before them.
@@ -449,7 +440,7 @@ pub fn valid_firmware_url(url: &str) -> bool {
 /// POST /api/firmware/upgrade-url: install a specific firmware file (e.g. an early-access build).
 pub async fn upgrade_url(State(s): State<AppState>, headers: HeaderMap, Json(b): Json<UrlBody>) -> Result<Json<Value>, ApiError> {
     crate::api::check_csrf(&headers)?;
-    require_active(&s)?;
+    crate::api::require_active(&s, "upgrades need")?;
     if !valid_firmware_url(&b.url) {
         return Err(ApiError(StatusCode::BAD_REQUEST, "use an http(s) or ftp URL ending in .bin or .tar".into()));
     }

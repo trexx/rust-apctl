@@ -50,7 +50,7 @@ pub(crate) async fn change<B: Send + 'static>(s: &AppState, headers: &HeaderMap,
 /// What rendering needs is copied out of `live` first, and the rendering
 /// (twice per AP) runs off the async workers without the lock.
 async fn preview(s: &AppState, before: Arc<Value>, after: Value) -> Result<Vec<Value>, ApiError> {
-    let Some(render) = s.renderer.clone() else { return Ok(Vec::new()) };
+    let render = s.renderer.clone();
     let aps: Vec<_> = {
         let live = s.live.read().unwrap();
         live.devices
@@ -81,7 +81,7 @@ async fn preview(s: &AppState, before: Arc<Value>, after: Value) -> Result<Vec<V
         }
         out
     };
-    tokio::task::spawn_blocking(work).await.map_err(|e| ApiError::internal(e.to_string()))
+    Ok(tokio::task::spawn_blocking(work).await?)
 }
 
 /// Fields of an SSID the editor shows and edits (secrets are never listed).
@@ -98,10 +98,7 @@ const WLAN_FIELDS: &[&str] = &[
 
 /// The id of a settings document (plain or `{"$oid": ...}`).
 pub fn id_of(v: &Value) -> Option<String> {
-    match &v["_id"] {
-        Value::String(s) => Some(s.clone()),
-        o => o["$oid"].as_str().map(str::to_string),
-    }
+    apcfg::json::oid(v).map(str::to_string)
 }
 
 /// The site the APs belong to (apctl manages one).

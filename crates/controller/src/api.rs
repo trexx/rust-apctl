@@ -25,8 +25,8 @@ pub struct AppState {
     pub store: Arc<Store>,
     /// Manufacturer names by MAC prefix (IEEE registry).
     pub vendors: Arc<crate::vendor::Vendors>,
-    /// The config generator, when available (for on-demand dry runs).
-    pub renderer: Option<crate::dryrun::RenderFn>,
+    /// The config generator (for on-demand dry runs and settings previews).
+    pub renderer: crate::dryrun::RenderFn,
     pub auth: crate::auth::SharedAuth,
     /// Commands for the engine (e.g. setting aliases).
     pub engine: tokio::sync::mpsc::Sender<crate::engine::Input>,
@@ -34,10 +34,10 @@ pub struct AppState {
     pub tx: broadcast::Sender<LiveMsg>,
     pub started: Ts,
     pub source: String,
-    pub backups: Option<crate::backup::Backups>,
+    pub backups: crate::backup::Backups,
     /// Active mode: apctl answers the APs (and can upgrade them).
     pub active: bool,
-    pub writer: Option<crate::store::Writer>,
+    pub writer: crate::store::Writer,
 }
 
 pub fn router(state: AppState) -> Router {
@@ -90,7 +90,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/backups", get(crate::backup::index).post(crate::backup::create_now))
         .route("/api/backups/settings", axum::routing::put(crate::backup::put_settings))
         .route("/api/backups/file/{name}", get(crate::backup::download).delete(crate::backup::delete))
-        .route("/api/backups/upload", axum::routing::post(crate::backup::upload).layer(axum::extract::DefaultBodyLimit::max(1 << 30)))
+        .route("/api/backups/upload", axum::routing::post(crate::backup::upload))
         .route("/api/backups/restore", axum::routing::post(crate::backup::restore))
         .route("/api/alerts", get(crate::alerts::list))
         .route("/api/alerts/read", axum::routing::post(crate::alerts::mark_read))
@@ -118,6 +118,11 @@ pub fn router(state: AppState) -> Router {
     public.merge(protected).fallback(crate::web::handler).layer(tower_http::compression::CompressionLayer::new()).merge(socket).with_state(state)
 }
 
+/// 409 unless apctl is the active controller. `what` says what needs it ("upgrades need").
+pub fn require_active(s: &AppState, what: &str) -> Result<(), ApiError> {
+    if s.active { Ok(()) } else { Err(ApiError(StatusCode::CONFLICT, format!("{what} active mode: in shadow mode apctl never talks to the APs"))) }
+}
+
 pub struct ApiError(pub StatusCode, pub String);
 
 impl ApiError {
@@ -138,6 +143,12 @@ impl From<anyhow::Error> for ApiError {
     }
 }
 
+impl From<std::io::Error> for ApiError {
+    fn from(e: std::io::Error) -> Self {
+        ApiError::internal(e.to_string())
+    }
+}
+
 /// A blocking task that panicked or was cancelled.
 impl From<tokio::task::JoinError> for ApiError {
     fn from(e: tokio::task::JoinError) -> Self {
@@ -151,12 +162,13 @@ fn bad(msg: impl Into<String>) -> ApiError {
     ApiError(StatusCode::BAD_REQUEST, msg.into())
 }
 
-fn parse_mac(s: &str) -> Result<Mac, ApiError> {
+/// A MAC address from the URL or body; 400 when it isn't one.
+pub fn parse_mac(s: &str) -> Result<Mac, ApiError> {
     s.parse().map_err(|_| bad(format!("invalid MAC {s}")))
 }
 
 /// Runs a read query on the blocking pool.
-async fn read<T: Send + 'static>(
+pub async fn read<T: Send + 'static>(
     store: &Arc<Store>,
     db: Db,
     f: impl FnOnce(&rusqlite::Connection) -> anyhow::Result<T> + Send + 'static,
@@ -182,7 +194,7 @@ async fn status(State(s): State<AppState>) -> ApiResult {
 
 /// For Kubernetes probes. Fails once nothing can be stored any more.
 async fn healthz(State(s): State<AppState>) -> Response {
-    if s.writer.as_ref().is_some_and(|w| w.stopped()) {
+    if s.writer.stopped() {
         return (StatusCode::SERVICE_UNAVAILABLE, "database writer stopped").into_response();
     }
     "ok".into_response()
@@ -277,6 +289,7 @@ async fn device(State(s): State<AppState>, Path(mac): Path<String>) -> ApiResult
 /// the whole list).
 async fn clients(State(s): State<AppState>) -> ApiResult {
     let live = s.live.read().unwrap();
+    let controls = crate::actions::ClientControls::new(live.state.as_deref());
     let out: Vec<Value> = live
         .clients
         .iter()
@@ -288,7 +301,7 @@ async fn clients(State(s): State<AppState>) -> ApiResult {
             v["alias"] = json!(a.and_then(|a| a.alias.as_ref()));
             v["note"] = json!(a.and_then(|a| a.note.as_ref()));
             v["vendor"] = json!(s.vendors.lookup(mac));
-            crate::actions::add_controls(&mut v, live.state.as_deref(), &mac.to_string());
+            controls.add(&mut v, &mac.to_string());
             v
         })
         .collect();
@@ -404,8 +417,8 @@ async fn dryrun(State(s): State<AppState>) -> ApiResult {
                 }
                 v
             };
-            let (Some(render), Some(state)) = (&renderer, state.as_deref()) else {
-                devices.push(entry(if renderer.is_none() { "no_generator" } else { "no_settings" }, json!({})));
+            let Some(state) = state.as_deref() else {
+                devices.push(entry("no_settings", json!({})));
                 continue;
             };
             let Some((actual, redacted)) = actual else {
@@ -419,7 +432,7 @@ async fn dryrun(State(s): State<AppState>) -> ApiResult {
                 cfgversion: actual.2.as_deref().unwrap_or(""),
                 previous_system_cfg: Some(&actual.1),
             };
-            match render(&req) {
+            match renderer(&req) {
                 Ok(ours) => {
                     let c = crate::dryrun::compare(&ours, &actual.0, &actual.1, redacted);
                     let status = if c.mgmt_cfg.identical && c.system_cfg.identical {
@@ -438,7 +451,6 @@ async fn dryrun(State(s): State<AppState>) -> ApiResult {
     })
     .await?;
     Ok(Json(json!({
-        "generator": s.renderer.is_some(),
         "settings_imported_at": imported_at,
         "devices": devices,
         "history": history,
@@ -696,8 +708,9 @@ mod tests {
         let (engine, _) = tokio::sync::mpsc::channel(1);
         let (tx, _) = broadcast::channel(1);
         router(AppState {
-            store, vendors: Default::default(), renderer: None, auth, engine, live: Default::default(), tx, started: 0, source: "none".into(),
-            backups: None, active: false, writer: Some(writer),
+            backups: crate::backup::Backups { data_dir: dir.clone(), key: None },
+            store, vendors: Default::default(), renderer: crate::dryrun::apcfg_renderer(crate::EMULATE_VERSION.into()), auth, engine, live: Default::default(), tx, started: 0, source: "none".into(),
+            active: false, writer,
         })
     }
 

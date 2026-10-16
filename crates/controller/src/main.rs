@@ -261,10 +261,8 @@ async fn serve(args: ServeArgs) -> Result<()> {
     let mut engine = Engine::new(writer.clone(), keys.clone(), live.clone(), live_tx.clone());
     engine.restore(&store)?;
     // The config generator, for dry runs.
-    let renderer: Option<dryrun::RenderFn> = Some(dryrun::apcfg_renderer(emulate_version.clone()));
-    if let Some(r) = &renderer {
-        engine.set_renderer(r.clone());
-    }
+    let renderer = dryrun::apcfg_renderer(emulate_version.clone());
+    engine.set_renderer(renderer.clone());
     let tick_tx = in_tx.clone();
     tokio::spawn(async move {
         let mut every = tokio::time::interval(Duration::from_secs(5));
@@ -344,7 +342,7 @@ async fn serve(args: ServeArgs) -> Result<()> {
     alerts::spawn(store.clone(), writer.clone(), live.clone(), live_tx.clone());
     backup::schedule(backups.clone(), store.clone());
     firmware::schedule(writer.clone());
-    let state = api::AppState { backups: Some(backups), active, writer: Some(writer.clone()), store, vendors: Arc::new(vendors), renderer, auth, engine: in_tx.clone(), live, tx: live_tx, started: store::now_ts(), source: source_desc };
+    let state = api::AppState { backups, active, writer: writer.clone(), store, vendors: Arc::new(vendors), renderer, auth, engine: in_tx.clone(), live, tx: live_tx, started: store::now_ts(), source: source_desc };
     channelai::schedule(state.clone());
     ratelimit::spawn(state.clone());
     adopt::spawn(state.clone());
