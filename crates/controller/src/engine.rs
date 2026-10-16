@@ -221,11 +221,18 @@ pub struct Engine {
     isolated: HashMap<Mac, Ts>,
     /// When long-gone clients were last dropped from the live view.
     last_prune: Ts,
+    /// Where alert-worthy events go: the alert watcher's own channel.
+    alerts: Option<crate::alerts::Sink>,
 }
 
 impl Engine {
     pub fn new(writer: Writer, keys: Arc<KeyStore>, live: SharedLive, tx: broadcast::Sender<LiveMsg>) -> Self {
-        Engine { writer, keys, renderer: None, live, tx, configs: HashMap::new(), radios: HashMap::new(), mcast_prev: HashMap::new(), bss_prev: HashMap::new(), logevents: Default::default(), isolated: HashMap::new(), last_prune: 0 }
+        Engine { writer, keys, renderer: None, live, tx, configs: HashMap::new(), radios: HashMap::new(), mcast_prev: HashMap::new(), bss_prev: HashMap::new(), logevents: Default::default(), isolated: HashMap::new(), last_prune: 0, alerts: None }
+    }
+
+    /// Sends alert-worthy events to the alert watcher.
+    pub fn set_alerts(&mut self, sink: crate::alerts::Sink) {
+        self.alerts = Some(sink);
     }
 
     /// Enables dry-run comparisons of every captured config push.
@@ -377,6 +384,9 @@ impl Engine {
                 Sql::Text(ev.data.to_string()),
             ],
         );
+        if let Some(a) = &self.alerts {
+            a.offer(&ev);
+        }
         let _ = self.tx.send(LiveMsg::Event(ev));
     }
 
