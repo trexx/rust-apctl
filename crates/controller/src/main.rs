@@ -281,6 +281,16 @@ async fn serve(args: ServeArgs) -> Result<()> {
     // gets a thread of its own rather than an async worker.
     let runtime = tokio::runtime::Handle::current();
     std::thread::Builder::new().name("engine".into()).spawn(move || {
+        // However the thread ends, its queue closes with it, which /healthz reports.
+        struct Stopped;
+        impl Drop for Stopped {
+            fn drop(&mut self) {
+                if std::thread::panicking() {
+                    tracing::error!("the engine stopped after a panic: nothing more is processed");
+                }
+            }
+        }
+        let _stopped = Stopped;
         let _runtime = runtime.enter();
         while let Some(input) = in_rx.blocking_recv() {
             engine.handle(input);
@@ -305,18 +315,13 @@ async fn serve(args: ServeArgs) -> Result<()> {
         if let Err(e) = stun::serve(stun_listen, advertised).await {
             tracing::warn!("STUN not available on {stun_listen}: {e}");
         }
-        let controller = apcfg::Controller {
-            inform_url: inform_url.clone().unwrap_or_else(|| format!("http://unifi:{}/inform", inform_listen.port())),
-            mgmt_url: "https://unifi:8443".into(),
-            stun_url: "stun://unifi:3478/".into(),
-            syslog_ip: None,
-            version: emulate_version,
-            reporter_uuid: reporter.unwrap_or_else(|| {
-                let b: [u8; 16] = { let mut b = [0u8; 16]; getrandom::fill(&mut b).expect("random"); b };
-                let h = hex::encode(b);
-                format!("{}-{}-4{}-a{}-{}", &h[0..8], &h[8..12], &h[13..16], &h[17..20], &h[20..32])
-            }),
-        };
+        let reporter = reporter.unwrap_or_else(|| {
+            let b: [u8; 16] = { let mut b = [0u8; 16]; getrandom::fill(&mut b).expect("random"); b };
+            let h = hex::encode(b);
+            format!("{}-{}-4{}-a{}-{}", &h[0..8], &h[8..12], &h[13..16], &h[17..20], &h[20..32])
+        });
+        let inform_url = inform_url.clone().unwrap_or_else(|| format!("http://unifi:{}/inform", inform_listen.port()));
+        let controller = dryrun::controller(inform_url, emulate_version, reporter);
         let active_state = Arc::new(active::Active::new(&store, writer.clone(), live.clone(), keys.clone(), in_tx.clone(), controller, proxies.clone())?);
         let inform_app = axum::Router::new().route("/inform", axum::routing::post(active::inform)).with_state(active_state);
         let inform_socket = tokio::net::TcpListener::bind(inform_listen).await.with_context(|| format!("binding {inform_listen}"))?;
@@ -342,7 +347,7 @@ async fn serve(args: ServeArgs) -> Result<()> {
     alerts::spawn(store.clone(), writer.clone(), live.clone(), live_tx.clone());
     backup::schedule(backups.clone(), store.clone());
     firmware::schedule(writer.clone());
-    let state = api::AppState { backups, active, writer: writer.clone(), store, vendors: Arc::new(vendors), renderer, auth, engine: in_tx.clone(), live, tx: live_tx, started: store::now_ts(), source: source_desc };
+    let state = api::AppState { backups, active, writer: writer.clone(), store, vendors: Arc::new(vendors), renderer, auth, engine: in_tx.clone(), live, tx: api::live_json(&live_tx), started: store::now_ts(), source: source_desc };
     channelai::schedule(state.clone());
     ratelimit::spawn(state.clone());
     adopt::spawn(state.clone());

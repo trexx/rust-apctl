@@ -19,6 +19,19 @@ pub struct RenderRequest<'a> {
     pub previous_system_cfg: Option<&'a str>,
 }
 
+/// The controller as rendered configs describe it. Its URLs are fallbacks
+/// only: the host comes from the settings and the AP's inform URL.
+pub fn controller(inform_url: String, version: String, reporter_uuid: String) -> apcfg::Controller {
+    apcfg::Controller {
+        inform_url,
+        mgmt_url: "https://unifi:8443".into(),
+        stun_url: "stun://unifi:3478/".into(),
+        syslog_ip: None,
+        version,
+        reporter_uuid,
+    }
+}
+
 /// The real generator (`apcfg`), emulating a given controller version.
 pub fn apcfg_renderer(version: String) -> RenderFn {
     Arc::new(move |req: &RenderRequest| {
@@ -27,15 +40,7 @@ pub fn apcfg_renderer(version: String) -> RenderFn {
             .and_then(|c| c.lines().find_map(|l| l.strip_prefix("unifi.reporterid=")))
             .unwrap_or_default()
             .to_string();
-        let controller = apcfg::Controller {
-            // Fallbacks only: the host comes from the settings and the AP's inform URL.
-            inform_url: "http://unifi:8080/inform".into(),
-            mgmt_url: "https://unifi:8443".into(),
-            stun_url: "stun://unifi:3478/".into(),
-            syslog_ip: None,
-            version: version.clone(),
-            reporter_uuid: reporter,
-        };
+        let controller = controller("http://unifi:8080/inform".into(), version.clone(), reporter);
         let input = apcfg::Input {
             state: req.state,
             device_mac: req.device_mac,

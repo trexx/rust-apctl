@@ -4,6 +4,8 @@
 //! through lenient helpers. A missing field becomes `None` rather than an error:
 //! informs sent while a radio restarts are much shorter than normal ones.
 
+use std::sync::Arc;
+
 use inform::Mac;
 use serde::Serialize;
 use serde_json::Value;
@@ -106,7 +108,7 @@ pub struct VapSample {
 }
 
 /// A network heard by one of the AP's radios in a background scan.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct NeighborSample {
     pub radio: Option<String>,
     pub bssid: String,
@@ -126,7 +128,7 @@ pub struct NeighborSample {
 }
 
 /// One channel from a spectrum (channel survey) scan.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct SpectrumSample {
     pub radio: String,
     pub channel: i64,
@@ -275,7 +277,8 @@ pub struct Snapshot {
     pub uplink: Option<UplinkSample>,
     pub radios: Vec<RadioSample>,
     pub vaps: Vec<VapSample>,
-    pub clients: Vec<ClientSample>,
+    /// Shared with the live client list, which holds the same samples.
+    pub clients: Vec<Arc<ClientSample>>,
     pub neighbors: Vec<NeighborSample>,
     /// Only channels with survey samples (empty until a spectrum scan runs).
     pub spectrum: Vec<SpectrumSample>,
@@ -360,7 +363,7 @@ pub fn parse(ts: Ts, p: &Value) -> anyhow::Result<Snapshot> {
         }
         for s in v["sta_table"].as_array().into_iter().flatten() {
             let Some(cmac) = s["mac"].as_str().and_then(|m| m.parse::<Mac>().ok()) else { continue };
-            clients.push(ClientSample {
+            clients.push(Arc::new(ClientSample {
                 mac: cmac,
                 ap_mac: mac,
                 bssid: bssid.clone(),
@@ -391,7 +394,7 @@ pub fn parse(ts: Ts, p: &Value) -> anyhow::Result<Snapshot> {
                 latency_avg: int(&s["wifi_tx_latency_mov"]["avg"]),
                 is_11r: s["is_11r"].as_bool(),
                 multicast: Multicast::parse(&s["multicast"]),
-            });
+            }));
         }
     }
 

@@ -1,9 +1,8 @@
 //! HTTP API and live WebSocket for the web UI.
 
-use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
+use axum::extract::ws::{Message, Utf8Bytes, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
@@ -16,7 +15,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::sync::broadcast;
 
-use crate::engine::{LiveMsg, SharedLive};
+use crate::engine::{AliasEdit, LiveMsg, SharedLive};
 use crate::model::Ts;
 use crate::store::{self, Db, Store};
 
@@ -31,7 +30,8 @@ pub struct AppState {
     /// Commands for the engine (e.g. setting aliases).
     pub engine: tokio::sync::mpsc::Sender<crate::engine::Input>,
     pub live: SharedLive,
-    pub tx: broadcast::Sender<LiveMsg>,
+    /// The live messages as JSON text, for the UI's sockets (see `live_json`).
+    pub tx: broadcast::Sender<Utf8Bytes>,
     pub started: Ts,
     pub source: String,
     pub backups: crate::backup::Backups,
@@ -185,43 +185,80 @@ async fn status(State(s): State<AppState>) -> ApiResult {
         "source": s.source,
         "started": s.started,
         "now": store::now_ts(),
-        "counters": live.counters,
+        "counters": &*live.counters,
         "devices": live.devices.len(),
         "devices_online": live.devices.values().filter(|d| d.online).count(),
         "clients_connected": live.clients.values().filter(|c| c.connected).count(),
     })))
 }
 
-/// For Kubernetes probes. Fails once nothing can be stored any more.
+/// For Kubernetes probes. Fails once nothing can be stored or processed any more.
 async fn healthz(State(s): State<AppState>) -> Response {
     if s.writer.stopped() {
         return (StatusCode::SERVICE_UNAVAILABLE, "database writer stopped").into_response();
     }
+    // The engine thread drops its end of the queue however it ends, a panic
+    // included; a panic under the live view's lock poisons it for every reader.
+    if s.engine.is_closed() || s.live.is_poisoned() {
+        return (StatusCode::SERVICE_UNAVAILABLE, "engine stopped").into_response();
+    }
     "ok".into_response()
 }
 
-/// APs in the database, as views shaped like a live one but offline: shown
-/// after a restart until each AP reports again.
-async fn stored_devices(store: &Arc<Store>, only: Option<String>) -> Result<Vec<Value>, ApiError> {
+/// An AP as the database remembers it: shown after a restart until it reports again.
+struct StoredDevice {
+    mac: String,
+    /// The name given in apctl, else the AP's hostname.
+    name: Option<String>,
+    model: Option<String>,
+    model_display: Option<String>,
+    version: Option<String>,
+    ip: Option<String>,
+    serial: Option<String>,
+    first_seen: Ts,
+    last_seen: Ts,
+}
+
+impl StoredDevice {
+    /// Shaped like a live device view, but offline.
+    fn view(&self) -> Value {
+        json!({
+            "snapshot": {
+                "ap": {
+                    "mac": self.mac, "hostname": self.name, "model": self.model, "model_display": self.model_display, "version": self.version,
+                    "ip": self.ip, "serial": self.serial, "uptime": null, "cpu": null, "mem": null, "load1": null, "load5": null,
+                    "load15": null, "mem_total": null, "mem_used": null, "satisfaction": null,
+                },
+                "uplink": null, "radios": [], "vaps": [], "clients": [], "has_vap_table": false,
+            },
+            "online": false, "first_seen": self.first_seen, "last_seen": self.last_seen,
+            "peer": "", "interval": 0, "reconfiguring": false, "last_config_push": null, "stored_only": true,
+        })
+    }
+
+    /// Its row in the device list.
+    fn row(&self) -> Value {
+        json!({
+            "mac": self.mac, "name": self.name, "model": self.model, "model_display": self.model_display, "version": self.version,
+            "ip": self.ip, "online": false, "reconfiguring": false, "first_seen": self.first_seen, "last_seen": self.last_seen, "uptime": null,
+            "cpu": null, "mem": null, "load1": null, "satisfaction": null, "clients": 0, "uplink": null, "radios": [], "last_config_push": null,
+            "stored_only": true,
+        })
+    }
+}
+
+/// APs in the database (all, or `only` this one).
+async fn stored_devices(store: &Arc<Store>, only: Option<String>) -> Result<Vec<StoredDevice>, ApiError> {
     read(store, Db::Config, move |c| {
         let mut stmt = c.prepare(
-            "SELECT mac, COALESCE(name, hostname), model, model_display, version, ip, serial, first_seen, last_seen, uptime FROM devices WHERE ?1 IS NULL OR mac = ?1",
+            "SELECT mac, COALESCE(name, hostname), model, model_display, version, ip, serial, first_seen, last_seen FROM devices WHERE ?1 IS NULL OR mac = ?1",
         )?;
         let rows = stmt
             .query_map([only.as_deref()], |r| {
-                Ok(json!({
-                    "snapshot": {
-                        "ap": {
-                            "mac": r.get::<_, String>(0)?, "hostname": r.get::<_, Option<String>>(1)?, "model": r.get::<_, Option<String>>(2)?,
-                            "model_display": r.get::<_, Option<String>>(3)?, "version": r.get::<_, Option<String>>(4)?, "ip": r.get::<_, Option<String>>(5)?,
-                            "serial": r.get::<_, Option<String>>(6)?, "uptime": null, "cpu": null, "mem": null, "load1": null, "load5": null,
-                            "load15": null, "mem_total": null, "mem_used": null, "satisfaction": null,
-                        },
-                        "uplink": null, "radios": [], "vaps": [], "clients": [], "has_vap_table": false,
-                    },
-                    "online": false, "first_seen": r.get::<_, Option<i64>>(7)?.unwrap_or(0), "last_seen": r.get::<_, Option<i64>>(8)?.unwrap_or(0),
-                    "peer": "", "interval": 0, "reconfiguring": false, "last_config_push": null, "stored_only": true,
-                }))
+                Ok(StoredDevice {
+                    mac: r.get(0)?, name: r.get(1)?, model: r.get(2)?, model_display: r.get(3)?, version: r.get(4)?, ip: r.get(5)?, serial: r.get(6)?,
+                    first_seen: r.get::<_, Option<i64>>(7)?.unwrap_or(0), last_seen: r.get::<_, Option<i64>>(8)?.unwrap_or(0),
+                })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
@@ -232,12 +269,17 @@ async fn stored_devices(store: &Arc<Store>, only: Option<String>) -> Result<Vec<
 async fn devices(State(s): State<AppState>) -> ApiResult {
     let stored = stored_devices(&s.store, None).await?;
     let live = s.live.read().unwrap();
+    // Connected clients per AP, counted in one pass.
+    let mut per_ap: std::collections::HashMap<Mac, usize> = std::collections::HashMap::new();
+    for c in live.clients.values().filter(|c| c.connected) {
+        *per_ap.entry(c.sample.ap_mac).or_default() += 1;
+    }
     let mut list: Vec<Value> = live
         .devices
         .iter()
         .map(|(mac, d)| {
             let a = &d.snapshot.ap;
-            let clients = live.clients.values().filter(|c| c.connected && c.sample.ap_mac == *mac).count();
+            let clients = per_ap.get(mac).copied().unwrap_or(0);
             json!({
                 "mac": mac, "name": a.hostname, "model": a.model, "model_display": a.model_display,
                 "version": a.version, "ip": a.ip, "online": d.online, "reconfiguring": d.reconfiguring,
@@ -255,52 +297,60 @@ async fn devices(State(s): State<AppState>) -> ApiResult {
         })
         .collect();
     for d in stored {
-        let ap = &d["snapshot"]["ap"];
-        if ap["mac"].as_str().and_then(|m| m.parse().ok()).is_some_and(|m| live.devices.contains_key(&m)) {
+        if d.mac.parse().is_ok_and(|m: Mac| live.devices.contains_key(&m)) {
             continue;
         }
-        list.push(json!({
-            "mac": ap["mac"], "name": ap["hostname"], "model": ap["model"], "model_display": ap["model_display"], "version": ap["version"],
-            "ip": ap["ip"], "online": false, "reconfiguring": false, "first_seen": d["first_seen"], "last_seen": d["last_seen"], "uptime": null,
-            "cpu": null, "mem": null, "load1": null, "satisfaction": null, "clients": 0, "uplink": null, "radios": [], "last_config_push": null,
-            "stored_only": true,
-        }));
+        list.push(d.row());
     }
     Ok(Json(Value::Array(list)))
 }
 
 async fn device(State(s): State<AppState>, Path(mac): Path<String>) -> ApiResult {
     let mac = parse_mac(&mac)?;
-    {
+    let found = {
         let live = s.live.read().unwrap();
-        if let Some(d) = live.devices.get(&mac) {
-            let clients: Vec<_> = live.clients.values().filter(|c| c.connected && c.sample.ap_mac == mac).collect();
-            return Ok(Json(json!({ "device": d, "clients": clients, "locating": live.locating.contains(&mac) })));
-        }
+        live.devices.get(&mac).map(|d| {
+            // The clients are copied out (shared samples) and serialised after the lock.
+            let clients: Vec<_> = live.clients.values().filter(|c| c.connected && c.sample.ap_mac == mac).cloned().collect();
+            (serde_json::to_value(d).unwrap_or_default(), clients, live.locating.contains(&mac))
+        })
+    };
+    if let Some((device, clients, locating)) = found {
+        return Ok(Json(json!({ "device": device, "clients": clients, "locating": locating })));
     }
     // Known but not reporting since apctl started: offline, with what we stored.
     let stored = stored_devices(&s.store, Some(mac.to_string())).await?;
     let d = stored.into_iter().next().ok_or_else(|| ApiError(StatusCode::NOT_FOUND, "unknown device".into()))?;
-    Ok(Json(json!({ "device": d, "clients": [] })))
+    Ok(Json(json!({ "device": d.view(), "clients": [] })))
 }
 
 /// Every client: the ones seen in this run and the ones restored from the
 /// database at start (`Engine::restore` loads them all, so the live view is
 /// the whole list).
 async fn clients(State(s): State<AppState>) -> ApiResult {
-    let live = s.live.read().unwrap();
-    let controls = crate::actions::ClientControls::new(live.state.as_deref());
-    let out: Vec<Value> = live
-        .clients
-        .iter()
-        .map(|(mac, c)| {
-            let ap_name = live.devices.get(&c.sample.ap_mac).and_then(|d| d.snapshot.ap.hostname.clone());
-            let mut v = serde_json::to_value(c).unwrap_or_default();
+    // What each client's entry needs, copied under the lock (the samples are
+    // shared, the rest is small); the serialising happens after it.
+    let (state, list) = {
+        let live = s.live.read().unwrap();
+        let list: Vec<(Mac, crate::engine::ClientView, Option<String>, Option<crate::engine::Alias>)> = live
+            .clients
+            .iter()
+            .map(|(mac, c)| {
+                let ap_name = live.devices.get(&c.sample.ap_mac).and_then(|d| d.snapshot.ap.hostname.clone());
+                (*mac, c.clone(), ap_name, live.aliases.get(mac).cloned())
+            })
+            .collect();
+        (live.state.clone(), list)
+    };
+    let controls = crate::actions::ClientControls::new(state.as_deref());
+    let out: Vec<Value> = list
+        .into_iter()
+        .map(|(mac, c, ap_name, alias)| {
+            let mut v = serde_json::to_value(&c).unwrap_or_default();
             v["ap_name"] = json!(ap_name);
-            let a = live.aliases.get(mac);
-            v["alias"] = json!(a.and_then(|a| a.alias.as_ref()));
-            v["note"] = json!(a.and_then(|a| a.note.as_ref()));
-            v["vendor"] = json!(s.vendors.lookup(mac));
+            v["alias"] = json!(alias.as_ref().and_then(|a| a.alias.as_ref()));
+            v["note"] = json!(alias.as_ref().and_then(|a| a.note.as_ref()));
+            v["vendor"] = json!(s.vendors.lookup(&mac));
             controls.add(&mut v, &mac.to_string());
             v
         })
@@ -352,19 +402,7 @@ async fn import_state(State(s): State<AppState>, headers: axum::http::HeaderMap,
 /// config the other controller pushed; plus the comparisons made at each push.
 async fn dryrun(State(s): State<AppState>) -> ApiResult {
     // Redacted last configs from the database, for APs not pushed to since start.
-    let stored: BTreeMap<String, (String, String, Option<String>)> = read(&s.store, Db::Config, |c| {
-        let mut stmt = c.prepare("SELECT mac, mgmt_cfg, system_cfg, cfgversion FROM device_config")?;
-        let rows = stmt
-            .query_map([], |r| {
-                Ok((
-                    r.get::<_, String>(0)?,
-                    (r.get::<_, Option<String>>(1)?.unwrap_or_default(), r.get::<_, Option<String>>(2)?.unwrap_or_default(), r.get(3)?),
-                ))
-            })?
-            .collect::<rusqlite::Result<BTreeMap<_, _>>>()?;
-        Ok(rows)
-    })
-    .await?;
+    let stored = read(&s.store, Db::Config, |c| Ok(crate::engine::stored_pushes(c)?)).await?;
     let history: Vec<Value> = read(&s.store, Db::Config, |c| {
         let mut stmt = c.prepare("SELECT ts, mac, cfgversion, matches, comparison FROM dryrun_results ORDER BY ts DESC LIMIT 100")?;
         let rows = stmt
@@ -391,7 +429,7 @@ async fn dryrun(State(s): State<AppState>) -> ApiResult {
             .map(|(mac, d)| {
                 // Prefer the unredacted config seen in this run; fall back to the stored redacted copy.
                 // Only full configs count: a management-only push says nothing about system_cfg.
-                let actual = match (live.last_config.get(mac).filter(|c| !c.1.is_empty()), stored.get(&mac.to_string()).filter(|c| !c.1.is_empty())) {
+                let actual = match (live.last_config.get(mac).filter(|c| !c.system_cfg.is_empty()), stored.get(mac).filter(|c| !c.system_cfg.is_empty())) {
                     (Some(c), _) => Some((c.clone(), false)),
                     (None, Some(c)) => Some((c.clone(), true)),
                     (None, None) => None,
@@ -429,12 +467,12 @@ async fn dryrun(State(s): State<AppState>) -> ApiResult {
                 state,
                 device_mac: &mac.to_string(),
                 inform: inform.as_deref(),
-                cfgversion: actual.2.as_deref().unwrap_or(""),
-                previous_system_cfg: Some(&actual.1),
+                cfgversion: actual.cfgversion.as_deref().unwrap_or(""),
+                previous_system_cfg: Some(&actual.system_cfg),
             };
             match renderer(&req) {
                 Ok(ours) => {
-                    let c = crate::dryrun::compare(&ours, &actual.0, &actual.1, redacted);
+                    let c = crate::dryrun::compare(&ours, &actual.mgmt_cfg, &actual.system_cfg, redacted);
                     let status = if c.mgmt_cfg.identical && c.system_cfg.identical {
                         "match"
                     } else if c.matches() {
@@ -496,7 +534,8 @@ async fn set_alias(
     check_csrf(&headers)?;
     let mac = parse_mac(&mac)?;
     validate(&body.alias, &body.note)?;
-    let input = crate::engine::Input::SetAlias { ts: store::now_ts(), mac, alias: body.alias, note: body.note, only_if_unset: false };
+    let entries = vec![AliasEdit { mac, alias: body.alias, note: body.note }];
+    let input = crate::engine::Input::SetAliases { ts: store::now_ts(), entries, only_if_unset: false };
     s.engine.send(input).await.map_err(|_| ApiError(StatusCode::SERVICE_UNAVAILABLE, "engine stopped".into()))?;
     Ok(Json(json!({ "ok": true })))
 }
@@ -526,13 +565,12 @@ async fn import_aliases(
     let mut parsed = Vec::with_capacity(entries.len());
     for e in entries {
         validate(&e.alias, &e.note)?;
-        parsed.push((parse_mac(&e.mac)?, e.alias, e.note));
+        parsed.push(AliasEdit { mac: parse_mac(&e.mac)?, alias: e.alias, note: e.note });
     }
     let n = parsed.len();
-    for (mac, alias, note) in parsed {
-        let input = crate::engine::Input::SetAlias { ts: store::now_ts(), mac, alias, note, only_if_unset: !q.overwrite };
-        s.engine.send(input).await.map_err(|_| ApiError(StatusCode::SERVICE_UNAVAILABLE, "engine stopped".into()))?;
-    }
+    // All in one message: one pass of the engine, one client-list update.
+    let input = crate::engine::Input::SetAliases { ts: store::now_ts(), entries: parsed, only_if_unset: !q.overwrite };
+    s.engine.send(input).await.map_err(|_| ApiError(StatusCode::SERVICE_UNAVAILABLE, "engine stopped".into()))?;
     Ok(Json(json!({ "submitted": n })))
 }
 
@@ -668,19 +706,42 @@ async fn ws(State(s): State<AppState>, upgrade: WebSocketUpgrade) -> Response {
     upgrade.on_upgrade(move |socket| live_socket(socket, rx))
 }
 
-async fn live_socket(mut socket: WebSocket, mut rx: broadcast::Receiver<LiveMsg>) {
+/// Tells a client that missed messages to refetch rather than dropping it.
+const RESYNC: &str = r#"{"type":"resync"}"#;
+
+/// Serialises each live message once, whatever the number of sockets: a task
+/// forwards the engine's messages as JSON text to the channel they read.
+/// Messages the task itself misses become a resync.
+pub fn live_json(typed: &broadcast::Sender<LiveMsg>) -> broadcast::Sender<Utf8Bytes> {
+    let (tx, _) = broadcast::channel(4096);
+    let mut rx = typed.subscribe();
+    let out = tx.clone();
+    tokio::spawn(async move {
+        loop {
+            let text = match rx.recv().await {
+                Ok(_) if out.receiver_count() == 0 => continue, // no socket open
+                Ok(m) => Utf8Bytes::from(serde_json::to_string(&m).unwrap_or_default()),
+                Err(broadcast::error::RecvError::Lagged(_)) => Utf8Bytes::from_static(RESYNC),
+                Err(broadcast::error::RecvError::Closed) => return,
+            };
+            let _ = out.send(text);
+        }
+    });
+    tx
+}
+
+async fn live_socket(mut socket: WebSocket, mut rx: broadcast::Receiver<Utf8Bytes>) {
     loop {
         tokio::select! {
             msg = rx.recv() => match msg {
-                Ok(m) => {
-                    let text = serde_json::to_string(&m).unwrap_or_default();
-                    if socket.send(Message::Text(text.into())).await.is_err() {
+                // Shared text: sending it copies nothing.
+                Ok(text) => {
+                    if socket.send(Message::Text(text)).await.is_err() {
                         return;
                     }
                 }
-                // A slow client missed messages: tell it to refetch rather than dropping it.
                 Err(broadcast::error::RecvError::Lagged(_)) => {
-                    if socket.send(Message::Text(r#"{"type":"resync"}"#.into())).await.is_err() {
+                    if socket.send(Message::Text(Utf8Bytes::from_static(RESYNC))).await.is_err() {
                         return;
                     }
                 }
@@ -701,17 +762,63 @@ mod tests {
     use axum::http::{Request, header};
     use tower::ServiceExt;
 
-    fn app() -> Router {
-        let dir = std::env::temp_dir().join(format!("apctl-api-{}-{}", std::process::id(), store::now_ts()));
+    /// The app's state, and the engine's end of its queue (dropping it stops the "engine").
+    fn state() -> (AppState, tokio::sync::mpsc::Receiver<crate::engine::Input>) {
+        let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let dir = std::env::temp_dir().join(format!("apctl-api-{}-{nanos}", std::process::id()));
         let (store, writer) = Store::open(&dir).unwrap();
         let auth = Arc::new(crate::auth::Auth::new(Default::default(), &store, writer.clone(), Default::default()).unwrap());
-        let (engine, _) = tokio::sync::mpsc::channel(1);
+        let (engine, engine_rx) = tokio::sync::mpsc::channel(1);
         let (tx, _) = broadcast::channel(1);
-        router(AppState {
+        let state = AppState {
             backups: crate::backup::Backups { data_dir: dir.clone(), key: None },
             store, vendors: Default::default(), renderer: crate::dryrun::apcfg_renderer(crate::EMULATE_VERSION.into()), auth, engine, live: Default::default(), tx, started: 0, source: "none".into(),
             active: false, writer,
-        })
+        };
+        (state, engine_rx)
+    }
+
+    fn app() -> (Router, tokio::sync::mpsc::Receiver<crate::engine::Input>) {
+        let (state, engine) = state();
+        (router(state), engine)
+    }
+
+    async fn get_json(app: &Router, path: &str) -> Value {
+        let res = app.clone().oneshot(Request::get(path).body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        serde_json::from_slice(&axum::body::to_bytes(res.into_body(), 1 << 22).await.unwrap()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn device_and_client_lists() {
+        let (s, _engine) = state();
+        // One AP reporting with a client, one only in the database.
+        let (tx, _) = broadcast::channel(16);
+        let mut engine = crate::engine::Engine::new(s.writer.clone(), Default::default(), s.live.clone(), tx);
+        let payload = json!({ "mac": "02:00:00:00:00:01", "hostname": "Hall", "uptime": 100, "vap_table": [
+            { "bssid": "b1", "essid": "Home", "radio": "na", "channel": 36, "usage": "user", "sta_table": [{ "mac": "02:00:00:00:01:01", "hostname": "phone" }] },
+        ] });
+        let header = inform::Header { packet_version: 0, mac: Mac([0; 6]), flags: inform::Flags(0), iv: [0; 16], payload_version: 1, payload_len: 0 };
+        let decoded = wire::decode::Decoded { header, key: wire::decode::KeyUsed::Device, payload };
+        engine.handle(crate::engine::Input::Inform { ts: 50, peer: "x".into(), decoded });
+        s.writer.exec(Db::Config, "INSERT INTO devices (mac, name, model, first_seen, last_seen) VALUES ('02:00:00:00:00:02', 'Attic', 'U6', 10, 20)", vec![]);
+        assert!(s.writer.flush(std::time::Duration::from_secs(5)));
+        let app = router(s);
+
+        let list = get_json(&app, "/api/devices").await;
+        assert_eq!((list[0]["name"].as_str(), list[0]["clients"].as_i64(), list[0]["online"].as_bool()), (Some("Hall"), Some(1), Some(true)));
+        assert_eq!(list[1], json!({
+            "mac": "02:00:00:00:00:02", "name": "Attic", "model": "U6", "model_display": null, "version": null, "ip": null, "online": false,
+            "reconfiguring": false, "first_seen": 10, "last_seen": 20, "uptime": null, "cpu": null, "mem": null, "load1": null, "satisfaction": null,
+            "clients": 0, "uplink": null, "radios": [], "last_config_push": null, "stored_only": true,
+        }));
+        let one = get_json(&app, "/api/devices/02:00:00:00:00:01").await;
+        assert_eq!((one["clients"][0]["sample"]["hostname"].as_str(), one["locating"].as_bool()), (Some("phone"), Some(false)));
+        let stored = get_json(&app, "/api/devices/02:00:00:00:00:02").await;
+        assert_eq!((stored["device"]["snapshot"]["ap"]["hostname"].as_str(), stored["device"]["stored_only"].as_bool()), (Some("Attic"), Some(true)));
+        let clients = get_json(&app, "/api/clients").await;
+        assert_eq!((clients[0]["ap_name"].as_str(), clients[0]["connected"].as_bool(), clients[0]["sample"]["essid"].as_str()), (Some("Hall"), Some(true), Some("Home")));
+        assert!(clients[0]["alias"].is_null() && clients[0].get("blocked").is_some(), "{}", clients[0]);
     }
 
     async fn get(app: &Router, path: &str) -> Response {
@@ -721,7 +828,7 @@ mod tests {
 
     #[tokio::test]
     async fn json_is_gzipped_and_the_live_socket_is_not() {
-        let app = app();
+        let (app, _engine) = app();
         let res = get(&app, "/api/status").await;
         assert_eq!(res.status(), StatusCode::OK);
         assert_eq!(res.headers().get(header::CONTENT_ENCODING).map(|v| v.to_str().unwrap()), Some("gzip"));
@@ -729,5 +836,25 @@ mod tests {
         let res = get(&app, "/api/ws").await;
         assert!(res.headers().get(header::CONTENT_ENCODING).is_none());
         assert_eq!(get(&app, "/healthz").await.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn live_messages_are_serialised_once_for_the_sockets() {
+        let (typed, _) = broadcast::channel(16);
+        let json = live_json(&typed);
+        let mut socket = json.subscribe();
+        let ap: Mac = "02:00:00:00:00:01".parse().unwrap();
+        typed.send(LiveMsg::Log { device_mac: Some(ap) }).unwrap();
+        typed.send(LiveMsg::Device { mac: ap }).unwrap();
+        assert_eq!(socket.recv().await.unwrap().as_str(), r#"{"type":"log","device_mac":"02:00:00:00:00:01"}"#);
+        assert_eq!(socket.recv().await.unwrap().as_str(), r#"{"type":"device","mac":"02:00:00:00:00:01"}"#);
+    }
+
+    #[tokio::test]
+    async fn healthz_fails_once_the_engine_has_stopped() {
+        let (app, engine) = app();
+        assert_eq!(get(&app, "/healthz").await.status(), StatusCode::OK);
+        drop(engine); // as when the engine thread panics
+        assert_eq!(get(&app, "/healthz").await.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 }
