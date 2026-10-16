@@ -27,18 +27,24 @@ const CHANGED_ADDRESS: u16 = 0x0005;
 const XOR_MAPPED_ADDRESS: u16 = 0x0020;
 const MAGIC_COOKIE: u32 = 0x2112_A442;
 
-fn address(out: &mut Vec<u8>, kind: u16, addr: SocketAddr, xor: bool) {
-    let IpAddr::V4(ip) = addr.ip() else { return };
-    let (mut port, mut ip) = (addr.port(), u32::from(ip));
-    if xor {
+/// An address attribute: family 1 (IPv4) or 2 (IPv6, as RFC 5389 has it; an
+/// IPv4 peer on a dual-stack socket is written as IPv4). `xor`: the 16 bytes
+/// after the type and length (magic cookie and transaction ID) to mask it with.
+fn address(out: &mut Vec<u8>, kind: u16, addr: SocketAddr, xor: Option<&[u8]>) {
+    let mut port = addr.port();
+    let (family, mut ip): (u8, Vec<u8>) = match addr.ip().to_canonical() {
+        IpAddr::V4(ip) => (1, ip.octets().to_vec()),
+        IpAddr::V6(ip) => (2, ip.octets().to_vec()),
+    };
+    if let Some(mask) = xor {
         port ^= (MAGIC_COOKIE >> 16) as u16;
-        ip ^= MAGIC_COOKIE;
+        ip.iter_mut().zip(mask).for_each(|(b, m)| *b ^= m);
     }
     out.extend_from_slice(&kind.to_be_bytes());
-    out.extend_from_slice(&8u16.to_be_bytes());
-    out.extend_from_slice(&[0, 1]);
+    out.extend_from_slice(&(4 + ip.len() as u16).to_be_bytes());
+    out.extend_from_slice(&[0, family]);
     out.extend_from_slice(&port.to_be_bytes());
-    out.extend_from_slice(&ip.to_be_bytes());
+    out.extend_from_slice(&ip);
 }
 
 /// The answer to a STUN packet from `from`, if it is a Binding Request.
@@ -54,11 +60,11 @@ pub fn answer(req: &[u8], from: SocketAddr, local: SocketAddr) -> Option<Vec<u8>
     // Bytes 4-19: the transaction ID (RFC 5389 clients start it with the magic cookie).
     let modern = u32::from_be_bytes([req[4], req[5], req[6], req[7]]) == MAGIC_COOKIE;
     let mut attrs = Vec::new();
-    address(&mut attrs, MAPPED_ADDRESS, from, false);
-    address(&mut attrs, SOURCE_ADDRESS, local, false);
-    address(&mut attrs, CHANGED_ADDRESS, local, false);
+    address(&mut attrs, MAPPED_ADDRESS, from, None);
+    address(&mut attrs, SOURCE_ADDRESS, local, None);
+    address(&mut attrs, CHANGED_ADDRESS, local, None);
     if modern {
-        address(&mut attrs, XOR_MAPPED_ADDRESS, from, true);
+        address(&mut attrs, XOR_MAPPED_ADDRESS, from, Some(&req[4..20]));
     }
     let mut out = Vec::with_capacity(20 + attrs.len());
     out.extend_from_slice(&BINDING_RESPONSE.to_be_bytes());
@@ -83,7 +89,15 @@ pub async fn serve(listen: SocketAddr, advertised: Option<IpAddr>) -> anyhow::Re
     tokio::spawn(async move {
         let mut buf = [0u8; 1500];
         loop {
-            let Ok((n, from)) = socket.recv_from(&mut buf).await else { continue };
+            let (n, from) = match socket.recv_from(&mut buf).await {
+                Ok(r) => r,
+                Err(e) => {
+                    // E.g. an ICMP error reported for an earlier reply: not worth a busy loop.
+                    tracing::debug!("STUN: {e}");
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    continue;
+                }
+            };
             if let Some(reply) = answer(&buf[..n], from, local) {
                 let _ = socket.send_to(&reply, from).await;
             }
@@ -149,6 +163,22 @@ mod tests {
         // XOR-MAPPED-ADDRESS port: 40000 ^ 0x2112.
         assert_eq!(&r[56..58], &[0x00, 0x20]);
         assert_eq!(&r[62..64], &(40000u16 ^ 0x2112).to_be_bytes());
+        assert_eq!(&r[64..68], &[192 ^ 0x21, 0x12, 2 ^ 0xA4, 9 ^ 0x42]);
         assert_eq!(&request_packet()[..4], &[0x88, 0x88, 0, 0]);
+    }
+
+    #[test]
+    fn ipv6_peers_get_their_address() {
+        let local: SocketAddr = "192.0.2.1:3478".parse().unwrap();
+        let mut req = vec![0x00, 0x01, 0x00, 0x00];
+        req.extend_from_slice(&[7; 16]);
+        // An IPv4 peer seen through a dual-stack socket is an IPv4 address.
+        let r = answer(&req, "[::ffff:192.0.2.9]:40000".parse().unwrap(), local).unwrap();
+        assert_eq!(&r[20..32], &[0x00, 0x01, 0x00, 0x08, 0, 1, 0x9c, 0x40, 192, 0, 2, 9]);
+        // A real IPv6 peer: family 2, 16 bytes.
+        let r = answer(&req, "[2001:db8::9]:40000".parse().unwrap(), local).unwrap();
+        assert_eq!(&r[20..28], &[0x00, 0x01, 0x00, 0x14, 0, 2, 0x9c, 0x40]);
+        assert_eq!(&r[28..44], &"2001:db8::9".parse::<std::net::Ipv6Addr>().unwrap().octets());
+        assert_eq!(u16::from_be_bytes([r[2], r[3]]) as usize, r.len() - 20);
     }
 }
