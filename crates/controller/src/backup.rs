@@ -614,6 +614,7 @@ fn apply(b: &Backups, id: &str) -> Result<()> {
     if b.data_dir.join("config.db").exists() {
         let pre = create(b, &b.data_dir, Kind::PreRestore, -1).context("saving the current state before restoring")?;
         tracing::info!("saved the state before the restore as {}", pre.name);
+        prune(b, Kind::PreRestore, KEEP_PRE_RESTORE);
     }
     // Copy everything first: if a copy fails, the current databases are untouched.
     let restoring = |n: &str| b.data_dir.join(format!("{n}.restoring"));
@@ -771,13 +772,13 @@ fn remove(b: &Backups, name: &str) {
     let _ = fs::remove_file(b.dir().join(format!("{name}.json")));
 }
 
-/// Keeps the newest `keep` automatic backups and the newest 3 pre-restore ones.
-fn prune(b: &Backups, keep: usize) {
-    let all = list(b);
-    for (kind, n) in [(Kind::Auto, keep), (Kind::PreRestore, 3)] {
-        for m in all.iter().filter(|m| m.kind == kind).skip(n) {
-            remove(b, &m.name);
-        }
+/// How many pre-restore backups are kept.
+const KEEP_PRE_RESTORE: usize = 3;
+
+/// Keeps the newest `keep` backups of a kind.
+fn prune(b: &Backups, kind: Kind, keep: usize) {
+    for m in list(b).iter().filter(|m| m.kind == kind).skip(keep) {
+        remove(b, &m.name);
     }
 }
 
@@ -808,7 +809,7 @@ pub fn schedule(b: Backups, store: Arc<store::Store>) {
             let (b2, dir) = (b.clone(), b.data_dir.clone());
             let made = tokio::task::spawn_blocking(move || {
                 let m = create(&b2, &dir, Kind::Auto, s.days)?;
-                prune(&b2, s.keep);
+                prune(&b2, Kind::Auto, s.keep);
                 Ok::<_, anyhow::Error>(m)
             });
             let failed = match made.await {
@@ -1163,6 +1164,22 @@ mod tests {
         let left: Vec<String> = fs::read_dir(b.dir()).unwrap().flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect();
         assert!(left.iter().all(|n| !n.starts_with(".tmp-") && !n.ends_with(".part")), "{left:?}");
         assert!(list(&b).iter().any(|x| x.name == m.name), "finished backups are kept");
+    }
+
+    #[test]
+    fn a_restore_keeps_three_pre_restore_copies() {
+        let src = data("prune");
+        let b = Backups { data_dir: src.clone(), key: None };
+        let m = create(&b, &src, Kind::Manual, 0).unwrap();
+        for _ in 0..3 {
+            create(&b, &src, Kind::PreRestore, 0).unwrap();
+        }
+        let (id, _) = stage(&b, &b.dir().join(&m.name)).unwrap();
+        fs::write(b.staging().join("pending"), &id).unwrap();
+        apply_pending(&b);
+        assert!(!b.staging().join("pending").exists());
+        assert_eq!(list(&b).iter().filter(|x| x.kind == Kind::PreRestore).count(), 3, "the oldest is dropped, even with automatic backups off");
+        assert!(list(&b).iter().any(|x| x.name == m.name), "other backups are kept");
     }
 
     #[test]
