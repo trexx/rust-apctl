@@ -582,6 +582,7 @@ fn valid_id(id: &str) -> bool {
 /// the backups page) and apctl starts with the data it has, rather than
 /// failing on every start. Also clears out staging left behind.
 pub fn apply_pending(b: &Backups) {
+    clean_unfinished(b);
     let marker = b.staging().join("pending");
     if let Ok(id) = fs::read_to_string(&marker) {
         match apply(b, id.trim()) {
@@ -633,6 +634,20 @@ fn apply(b: &Backups, id: &str) -> Result<()> {
     }
     let _ = fs::remove_dir_all(&staged);
     Ok(())
+}
+
+/// Deletes what a backup cut off half way (a crash, a restart) left in the
+/// backups directory: its snapshot copies and its unfinished archive. Only at
+/// start, when no backup can be in progress.
+fn clean_unfinished(b: &Backups) {
+    for e in fs::read_dir(b.dir()).into_iter().flatten().flatten() {
+        let name = e.file_name().to_string_lossy().into_owned();
+        if name.starts_with(".tmp-") || name.ends_with(".apb.part") {
+            let p = e.path();
+            tracing::info!("removing {name}, left by a backup that did not finish");
+            let _ = if p.is_dir() { fs::remove_dir_all(&p) } else { fs::remove_file(&p) };
+        }
+    }
 }
 
 /// Deletes staged restores and uploads that were left behind (older than an
@@ -1015,13 +1030,17 @@ pub async fn restore(State(s): State<AppState>, Json(body): Json<RestoreBody>) -
     let writer = s.writer.clone();
     tokio::spawn(async move {
         tokio::time::sleep(Duration::from_millis(800)).await;
-        // What is queued is committed first: the copy saved before the restore,
-        // and the data kept if the restore fails, have it.
-        let flushed = tokio::task::spawn_blocking(move || writer.flush(Duration::from_secs(5))).await.unwrap_or(false);
-        if !flushed {
-            tracing::warn!("not all queued writes could be stored before the restart");
-        }
-        std::process::exit(75);
+        tokio::task::spawn_blocking(move || {
+            // A backup being written is finished first (none starts after it),
+            // so that none is cut off half way.
+            let _one = CREATING.lock().unwrap_or_else(PoisonError::into_inner);
+            // What is queued is committed first: the copy saved before the
+            // restore, and the data kept if the restore fails, have it.
+            if !writer.flush(Duration::from_secs(5)) {
+                tracing::warn!("not all queued writes could be stored before the restart");
+            }
+            std::process::exit(75);
+        });
     });
     Ok(Json(json!({ "ok": true, "restarting": true, "manifest": m })))
 }
@@ -1129,6 +1148,21 @@ mod tests {
         assert!(list(&b).iter().any(|x| x.kind == Kind::PreRestore), "the replaced state was saved");
         // Nothing pending: nothing happens.
         apply_pending(&b);
+    }
+
+    #[test]
+    fn unfinished_backups_are_cleared_at_start() {
+        let src = data("unfinished");
+        let b = Backups { data_dir: src.clone(), key: None };
+        let m = create(&b, &src, Kind::Manual, 0).unwrap();
+        // What a backup cut off by a crash leaves behind.
+        fs::create_dir_all(b.dir().join(".tmp-1-2-ab")).unwrap();
+        fs::write(b.dir().join(".tmp-1-2-ab").join("config.db"), "x").unwrap();
+        fs::write(b.dir().join("apctl-0.1.0-20260101-000000.apb.part"), "x").unwrap();
+        apply_pending(&b);
+        let left: Vec<String> = fs::read_dir(b.dir()).unwrap().flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect();
+        assert!(left.iter().all(|n| !n.starts_with(".tmp-") && !n.ends_with(".part")), "{left:?}");
+        assert!(list(&b).iter().any(|x| x.name == m.name), "finished backups are kept");
     }
 
     #[test]
