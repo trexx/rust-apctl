@@ -201,7 +201,8 @@ export function useSetParams() {
 /**
  * A row of buttons picking one of `options` (none when `value` matches none);
  * `children`, more buttons, follow them. With `tabs`, it switches the page's
- * tabs.
+ * views (in the URL): the current one is marked as the current page rather
+ * than as a pressed button.
  */
 export function Segmented<K extends string | number | boolean>({
   options,
@@ -219,16 +220,11 @@ export function Segmented<K extends string | number | boolean>({
   children?: ReactNode;
 }) {
   return (
-    <div
-      className="segmented"
-      role={tabs ? "tablist" : "group"}
-      aria-label={label}
-    >
+    <div className="segmented" role="group" aria-label={label}>
       {options.map(([k, text]) => (
         <button
           key={String(k)}
-          role={tabs ? "tab" : undefined}
-          aria-selected={tabs ? value === k : undefined}
+          aria-current={tabs && value === k ? "page" : undefined}
           aria-pressed={tabs ? undefined : value === k}
           className={value === k ? "active" : ""}
           onClick={() => onChange(k)}

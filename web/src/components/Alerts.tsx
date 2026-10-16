@@ -138,6 +138,8 @@ export function AlertBell() {
       <button
         className={`bell ${openNow.some((x) => x.severity === "high") ? "bell-bad" : ""}`}
         aria-label={`Alerts, ${unread} unread`}
+        aria-haspopup="dialog"
+        aria-expanded={open}
         onClick={() => setOpen((o) => !o)}
       >
         <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true">
