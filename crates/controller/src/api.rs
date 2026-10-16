@@ -248,7 +248,7 @@ async fn healthz(State(s): State<AppState>) -> Response {
 
 /// An AP as the database remembers it: shown after a restart until it reports again.
 struct StoredDevice {
-    mac: String,
+    mac: Mac,
     /// The name given in apctl, else the AP's hostname.
     name: Option<String>,
     model: Option<String>,
@@ -261,20 +261,20 @@ struct StoredDevice {
 }
 
 impl StoredDevice {
-    /// Shaped like a live device view, but offline.
-    fn view(&self) -> Value {
-        json!({
-            "snapshot": {
-                "ap": {
-                    "mac": self.mac, "hostname": self.name, "model": self.model, "model_display": self.model_display, "version": self.version,
-                    "ip": self.ip, "serial": self.serial, "uptime": null, "cpu": null, "mem": null, "load1": null, "load5": null,
-                    "load15": null, "mem_total": null, "mem_used": null, "satisfaction": null,
-                },
-                "uplink": null, "radios": [], "vaps": [], "clients": [], "has_vap_table": false,
+    /// A live device view of it, offline: what was not stored is empty.
+    fn view(self) -> DeviceView {
+        let ap = crate::model::ApSample {
+            mac: self.mac, ts: self.last_seen, hostname: self.name, model: self.model, model_display: self.model_display, version: self.version,
+            ip: self.ip, serial: self.serial, hash_id: None, cfgversion: None, uptime: None, cpu: None, mem: None, load1: None, load5: None,
+            load15: None, mem_total: None, mem_used: None, satisfaction: None, num_sta: None,
+        };
+        DeviceView {
+            snapshot: crate::model::Snapshot {
+                ap, uplink: None, radios: vec![], vaps: vec![], clients: vec![], neighbors: vec![], spectrum: vec![], has_vap_table: false,
             },
-            "online": false, "first_seen": self.first_seen, "last_seen": self.last_seen,
-            "peer": "", "interval": 0, "reconfiguring": false, "last_config_push": null, "stored_only": true,
-        })
+            online: false, first_seen: self.first_seen, last_seen: self.last_seen, peer: String::new(), interval: 0, reconfiguring: false,
+            reconfiguring_since: None, last_full_inform: 0, last_config_push: None,
+        }
     }
 
     /// Its row in the device list.
@@ -290,7 +290,7 @@ impl StoredDevice {
 /// An AP in the device list.
 #[derive(Serialize)]
 struct DeviceRow {
-    mac: String,
+    mac: Mac,
     name: Option<String>,
     model: Option<String>,
     model_display: Option<String>,
@@ -334,18 +334,21 @@ struct RadioRow {
 }
 
 /// APs in the database (all, or `only` this one).
-async fn stored_devices(store: &Arc<Store>, only: Option<String>) -> Result<Vec<StoredDevice>, ApiError> {
+async fn stored_devices(store: &Arc<Store>, only: Option<Mac>) -> Result<Vec<StoredDevice>, ApiError> {
     read(store, Db::Config, move |c| {
         let mut stmt = c.prepare(
             "SELECT mac, COALESCE(name, hostname), model, model_display, version, ip, serial, first_seen, last_seen FROM devices WHERE ?1 IS NULL OR mac = ?1",
         )?;
+        // A row whose MAC does not parse is no AP to show.
         let rows = stmt
-            .query_map([only.as_deref()], |r| {
-                Ok(StoredDevice {
-                    mac: r.get(0)?, name: r.get(1)?, model: r.get(2)?, model_display: r.get(3)?, version: r.get(4)?, ip: r.get(5)?, serial: r.get(6)?,
+            .query_map([only.map(|m| m.to_string())], |r| {
+                let Ok(mac) = r.get::<_, String>(0)?.parse() else { return Ok(None) };
+                Ok(Some(StoredDevice {
+                    mac, name: r.get(1)?, model: r.get(2)?, model_display: r.get(3)?, version: r.get(4)?, ip: r.get(5)?, serial: r.get(6)?,
                     first_seen: r.get::<_, Option<i64>>(7)?.unwrap_or(0), last_seen: r.get::<_, Option<i64>>(8)?.unwrap_or(0),
-                })
+                }))
             })?
+            .filter_map(Result::transpose)
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
     })
@@ -369,7 +372,7 @@ async fn devices(State(s): State<AppState>) -> Result<Json<Vec<DeviceRow>>, ApiE
             .map(|(mac, d)| {
                 let a = &d.snapshot.ap;
                 DeviceRow {
-                    mac: mac.to_string(), name: a.hostname.clone(), model: a.model.clone(), model_display: a.model_display.clone(),
+                    mac: *mac, name: a.hostname.clone(), model: a.model.clone(), model_display: a.model_display.clone(),
                     version: a.version.clone(), ip: a.ip.clone(), online: d.online, reconfiguring: d.reconfiguring,
                     first_seen: d.first_seen, last_seen: d.last_seen, uptime: a.uptime, cpu: a.cpu, mem: a.mem, load1: a.load1,
                     satisfaction: a.satisfaction, clients: per_ap.get(mac).copied().unwrap_or(0),
@@ -384,7 +387,7 @@ async fn devices(State(s): State<AppState>) -> Result<Json<Vec<DeviceRow>>, ApiE
                 }
             })
             .collect();
-        list.extend(stored.into_iter().filter(|d| !d.mac.parse().is_ok_and(|m: Mac| live.devices.contains_key(&m))).map(StoredDevice::row));
+        list.extend(stored.into_iter().filter(|d| !live.devices.contains_key(&d.mac)).map(StoredDevice::row));
         list
     };
     Ok(Json(list))
@@ -421,9 +424,9 @@ async fn device(State(s): State<AppState>, Path(mac): Path<String>) -> Result<Re
         return Ok(Json(DeviceDetail { device: DeviceOut { view: &view, stored_only: false }, clients: &clients, locating }).into_response());
     }
     // Known but not reporting since apctl started: offline, with what we stored.
-    let stored = stored_devices(&s.store, Some(mac.to_string())).await?;
+    let stored = stored_devices(&s.store, Some(mac)).await?;
     let d = stored.into_iter().next().ok_or_else(|| ApiError(StatusCode::NOT_FOUND, "unknown device".into()))?;
-    Ok(Json(json!({ "device": d.view(), "clients": [] })).into_response())
+    Ok(Json(DeviceDetail { device: DeviceOut { view: &d.view(), stored_only: true }, clients: &[], locating: false }).into_response())
 }
 
 /// Every client: the ones seen in this run and the ones restored from the
@@ -956,6 +959,21 @@ mod tests {
         assert_eq!((one["clients"][0]["sample"]["hostname"].as_str(), one["locating"].as_bool()), (Some("phone"), Some(false)));
         let stored = get_json(&app, "/api/devices/02:00:00:00:00:02").await;
         assert_eq!((stored["device"]["snapshot"]["ap"]["hostname"].as_str(), stored["device"]["stored_only"].as_bool()), (Some("Attic"), Some(true)));
+        // A stored AP is shaped like a live one, with only stored_only added.
+        let sorted = |v: &Value| {
+            let mut k: Vec<String> = v.as_object().unwrap().keys().cloned().collect();
+            k.sort();
+            k
+        };
+        for path in ["", "/device", "/device/snapshot", "/device/snapshot/ap"] {
+            let mut live = sorted(one.pointer(path).unwrap());
+            if path == "/device" {
+                live.push("stored_only".into());
+                live.sort();
+            }
+            assert_eq!(sorted(stored.pointer(path).unwrap()), live, "{path}");
+        }
+        assert_eq!(stored["device"]["snapshot"]["ap"]["mac"], "02:00:00:00:00:02");
         let clients = get_json(&app, "/api/clients").await;
         assert_eq!((clients[0]["ap_name"].as_str(), clients[0]["connected"].as_bool(), clients[0]["sample"]["essid"].as_str()), (Some("Hall"), Some(true), Some("Home")));
         assert!(clients[0]["alias"].is_null() && clients[0].get("blocked").is_some(), "{}", clients[0]);
