@@ -108,11 +108,25 @@ impl Event {
 pub enum LiveMsg {
     Device { mac: Mac },
     Clients,
-    Event(Event),
-    /// A syslog line was stored: `{"type":"log","device_mac":...}`. The UI
-    /// refetches the lines it shows, so the text is not sent along.
+    /// An event was stored: `{"type":"event","kind":...,"device_mac":...,"client_mac":...}`.
+    /// The UI refetches the event lists that show it, so the rest is not sent along.
+    Event(#[serde(serialize_with = "event_head")] Event),
+    /// Syslog lines were stored: `{"type":"log","device_mac":...}`, at most
+    /// once a second per AP. The UI refetches the lines it shows, so the text
+    /// is not sent along.
     Log { device_mac: Option<Mac> },
     Alert(crate::alerts::AlertMsg),
+}
+
+/// What the UI is told of an event (see `LiveMsg::Event`).
+fn event_head<S: serde::Serializer>(e: &Event, s: S) -> Result<S::Ok, S::Error> {
+    #[derive(Serialize)]
+    struct Head {
+        kind: &'static str,
+        device_mac: Option<Mac>,
+        client_mac: Option<Mac>,
+    }
+    Head { kind: e.kind, device_mac: e.device_mac, client_mac: e.client_mac }.serialize(s)
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -323,6 +337,9 @@ pub struct Engine {
     /// Syslog hash_ids that none of the keys opened, and when that was tried.
     /// Time or new settings (which may hold new keys) clear an entry.
     syslog_unknown: HashMap<String, Ts>,
+    /// Per AP: the second its stored syslog lines were last announced, and
+    /// whether more came in that second (see `log`).
+    logs_announced: HashMap<Option<Mac>, (Ts, bool)>,
     /// Where alert-worthy events go: the alert watcher's own channel.
     alerts: Option<crate::alerts::Sink>,
 }
@@ -336,7 +353,7 @@ impl Engine {
         Engine {
             writer, keys, renderer: None, live, counters, tx, radios: HashMap::new(), mcast_prev: HashMap::new(), bss_prev: HashMap::new(),
             logevents: Default::default(), isolated: HashMap::new(), last_prune: 0, written: Default::default(), syslog_unknown: HashMap::new(),
-            alerts: None,
+            logs_announced: HashMap::new(), alerts: None,
         }
     }
 
@@ -1197,13 +1214,28 @@ impl Engine {
                 Sql::Text(line.msg),
             ],
         );
-        let _ = self.tx.send(LiveMsg::Log { device_mac: line.device_mac });
+        // One message per AP and second: a burst (a crash dump, debug logging)
+        // would otherwise flood the sockets and force every browser to resync.
+        // Lines later in the same second are announced at the next tick.
+        match self.logs_announced.get_mut(&line.device_mac) {
+            Some((at, later)) if *at == line.ts => *later = true,
+            _ => {
+                self.logs_announced.insert(line.device_mac, (line.ts, false));
+                let _ = self.tx.send(LiveMsg::Log { device_mac: line.device_mac });
+            }
+        }
     }
 
     /// Time-based transitions: APs going quiet and clients disappearing.
     fn tick(&mut self, now: Ts) {
         self.mcast_prev.retain(|_, (ts, ..)| *ts > now - 3600);
         self.syslog_unknown.retain(|_, at| (*at..*at + SYSLOG_RETRY_SECS).contains(&now));
+        for (device_mac, (_, later)) in &mut self.logs_announced {
+            if std::mem::take(later) {
+                let _ = self.tx.send(LiveMsg::Log { device_mac: *device_mac });
+            }
+        }
+        self.logs_announced.retain(|_, (at, _)| now - *at < 60);
         {
             let mut live = self.live.write().unwrap();
             if let Some(mac) = live.firmware.expired(now)
@@ -1799,6 +1831,27 @@ mod tests {
         assert_eq!(edit(&mut h, Box::new(|_| Err("no".into()))), Err("no".into()));
         let kinds: Vec<_> = events(&mut h).into_iter().map(|e| e.0).collect();
         assert_eq!(kinds, ["settings_imported", "settings_changed"]);
+    }
+
+    #[test]
+    fn live_messages_are_short() {
+        let mut h = harness();
+        let line = |ts| LogLine { ts, device_mac: AP1.parse().ok(), src_ip: "x".into(), facility: None, severity: None, program: None, msg: "m".into() };
+        // A burst in one second is announced once, and what came after at the next tick.
+        for ts in [10, 10, 10, 11] {
+            h.engine.log(line(ts));
+        }
+        h.engine.handle(Input::Tick(12));
+        let logs = std::iter::from_fn(|| h.rx.try_recv().ok()).filter(|m| matches!(m, LiveMsg::Log { .. })).count();
+        assert_eq!(logs, 2);
+        h.engine.log(line(12));
+        h.engine.handle(Input::Tick(13));
+        let logs = std::iter::from_fn(|| h.rx.try_recv().ok()).filter(|m| matches!(m, LiveMsg::Log { .. })).count();
+        assert_eq!(logs, 1, "nothing more to announce");
+        // An event's data is not sent to the browsers.
+        let e = Event::device(1, "ap_crash", AP1.parse().unwrap(), json!({ "lines": ["a long crash dump"] }));
+        let text = serde_json::to_string(&LiveMsg::Event(e)).unwrap();
+        assert_eq!(text, r#"{"type":"event","kind":"ap_crash","device_mac":"02:00:00:00:00:01","client_mac":null}"#);
     }
 
     #[test]
