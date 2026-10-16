@@ -255,6 +255,9 @@ fn open_rw(path: &Path) -> Result<Connection> {
     // stay in memory. The container's root filesystem is read-only, so there is
     // no writable temp directory (SQLITE_IOERR_GETTEMPPATH, error 6410).
     conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA busy_timeout=5000; PRAGMA temp_store=MEMORY;")?;
+    // The writer runs some 30 distinct statements on config.db; rusqlite keeps 16
+    // prepared by default, so most would be compiled again on every batch.
+    conn.set_prepared_statement_cache_capacity(64);
     Ok(conn)
 }
 
@@ -262,6 +265,8 @@ fn open_ro(path: &Path) -> Result<Connection> {
     let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX)
         .with_context(|| format!("opening {} read-only", path.display()))?;
     conn.execute_batch("PRAGMA busy_timeout=5000; PRAGMA temp_store=MEMORY;")?;
+    // Room for every series query (6 tables in 3 tiers) besides the rest.
+    conn.set_prepared_statement_cache_capacity(32);
     Ok(conn)
 }
 
@@ -516,14 +521,14 @@ fn maintenance(conns: &mut Conns, now: Ts) {
         }
         for (suffix, _, keep) in TIERS {
             let table = format!("{}{suffix}", t.name);
-            step(&format!("retention of {table}"), delete_before(metrics, &table, now - keep));
+            step(&format!("retention of {table}"), delete_before(metrics, &table, Rows::Metric, now - keep));
         }
     }
-    step("retention of logs", delete_before(logs, "logs", now - LOG_RETENTION));
-    step("retention of events", delete_before(config, "events", now - 365 * 86400));
+    step("retention of logs", delete_before(logs, "logs", Rows::Rowid, now - LOG_RETENTION));
+    step("retention of events", delete_before(config, "events", Rows::Rowid, now - 365 * 86400));
     step("expiring sessions", config.execute("DELETE FROM sessions WHERE expires < ?1", [now]).map(drop).map_err(Into::into));
-    step("retention of dry runs", delete_before(config, "dryrun_results", now - 90 * 86400));
-    step("retention of connections", delete_before(config, "connections", now - 90 * 86400));
+    step("retention of dry runs", delete_before(config, "dryrun_results", Rows::Rowid, now - 90 * 86400));
+    step("retention of connections", delete_before(config, "connections", Rows::Rowid, now - 90 * 86400));
     step("retention of neighbours", config.execute("DELETE FROM neighbors WHERE last_seen < ?1", [now - 30 * 86400]).map(drop).map_err(Into::into));
     step(
         "retention of clients",
@@ -541,7 +546,9 @@ fn maintenance(conns: &mut Conns, now: Ts) {
 /// Rolls the complete `step`-second buckets of `src` not done yet into `dst`.
 fn rollup(metrics: &mut Connection, t: &Table, src: &str, dst: &str, step: i64, src_keep: i64, now: Ts) -> Result<()> {
     let state_key = format!("rollup:{dst}");
-    let done = read_state(metrics, &state_key);
+    // Not knowing how far it got (a transient error) skips this round: assuming
+    // nothing was done would redo the source's whole retention window.
+    let done = read_state(metrics, &state_key)?;
     // Only complete buckets, and never further back than the source keeps.
     let upto = (now / step) * step;
     let start = done.max(now - src_keep);
@@ -555,8 +562,12 @@ fn rollup(metrics: &mut Connection, t: &Table, src: &str, dst: &str, step: i64, 
     Ok(())
 }
 
-fn read_state(conn: &Connection, key: &str) -> Ts {
-    conn.query_row("SELECT upto FROM rollup_state WHERE name = ?1", [key], |r| r.get(0)).unwrap_or(0)
+/// How far a roll-up has got; 0 before its first run.
+fn read_state(conn: &Connection, key: &str) -> Result<Ts> {
+    match conn.query_row("SELECT upto FROM rollup_state WHERE name = ?1", [key], |r| r.get(0)) {
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(0),
+        r => Ok(r?),
+    }
 }
 
 fn write_state(conn: &Connection, key: &str, upto: Ts) -> Result<()> {
@@ -564,11 +575,19 @@ fn write_state(conn: &Connection, key: &str, upto: Ts) -> Result<()> {
     Ok(())
 }
 
-/// Deletes rows older than `cutoff`. Metric tables (WITHOUT ROWID, small per
-/// run because this runs every 5 minutes) go in one statement; rowid tables in
-/// batches so the writer never holds a long lock.
-fn delete_before(conn: &Connection, table: &str, cutoff: Ts) -> Result<()> {
-    if table.contains("_stats") {
+/// How `delete_before` removes a table's old rows.
+#[derive(Clone, Copy, PartialEq)]
+enum Rows {
+    /// A metric table: WITHOUT ROWID, and small per run because this runs every
+    /// 5 minutes, so one statement.
+    Metric,
+    /// A rowid table: in batches, so the writer never holds a long lock.
+    Rowid,
+}
+
+/// Deletes rows older than `cutoff`.
+fn delete_before(conn: &Connection, table: &str, rows: Rows, cutoff: Ts) -> Result<()> {
+    if rows == Rows::Metric {
         conn.execute(&format!("DELETE FROM {table} WHERE ts < ?1"), [cutoff])?;
         return Ok(());
     }
@@ -614,7 +633,7 @@ pub fn series(conn: &Connection, table: &Table, keys: &[String], from: Ts, to: T
         where_keys.join(" AND "),
     );
     let params = [Value::Integer(from), Value::Integer(to)].into_iter().chain(keys.iter().map(|k| Value::Text(k.clone())));
-    let mut stmt = conn.prepare(&sql)?;
+    let mut stmt = conn.prepare_cached(&sql)?;
     let rows: Vec<(Ts, Vec<Option<f64>>)> = stmt
         .query_map(params_from_iter(params), |r| {
             let ts: Ts = r.get(0)?;
@@ -624,16 +643,15 @@ pub fn series(conn: &Connection, table: &Table, keys: &[String], from: Ts, to: T
         .collect::<rusqlite::Result<_>>()?;
 
     let n_gauges = table.gauges.len();
-    let mut out = Series { tier: ["raw", "5m", "1h"][tier], step, ts: Vec::new(), fields: BTreeMap::new() };
-    for f in &fields {
-        out.fields.insert(f.to_string(), Vec::new());
-    }
+    let mut ts_out = Vec::with_capacity(rows.len());
+    // One column per field, in `fields` order; named at the end.
+    let mut columns: Vec<Vec<Option<f64>>> = vec![Vec::with_capacity(rows.len()); fields.len()];
     for (i, (ts, vals)) in rows.iter().enumerate() {
         if *ts < from {
             continue; // the look-behind row only feeds the first rate
         }
-        out.ts.push(*ts);
-        for (j, f) in fields.iter().enumerate() {
+        ts_out.push(*ts);
+        for (j, column) in columns.iter_mut().enumerate() {
             let v = if j < n_gauges {
                 vals[j]
             } else {
@@ -645,10 +663,11 @@ pub fn series(conn: &Connection, table: &Table, keys: &[String], from: Ts, to: T
                     (dt > 0.0).then(|| if cur >= prev { (cur - prev) / dt } else { cur / dt })
                 })
             };
-            out.fields.get_mut(*f).unwrap().push(v);
+            column.push(v);
         }
     }
-    Ok(out)
+    let fields = fields.iter().map(|f| f.to_string()).zip(columns).collect();
+    Ok(Series { tier: ["raw", "5m", "1h"][tier], step, ts: ts_out, fields })
 }
 
 #[cfg(test)]

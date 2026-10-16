@@ -259,9 +259,12 @@ impl Engine {
                     ))
                 })?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
-            let state: Option<(String, i64)> = c
-                .query_row("SELECT json, imported_at FROM controller_state WHERE id = 1", [], |r| Ok((r.get(0)?, r.get(1)?)))
-                .ok();
+            // No row: nothing imported yet. Any other error fails the start rather
+            // than running as if the settings were never imported.
+            let state: Option<(String, i64)> = match c.query_row("SELECT json, imported_at FROM controller_state WHERE id = 1", [], |r| Ok((r.get(0)?, r.get(1)?))) {
+                Err(rusqlite::Error::QueryReturnedNoRows) => None,
+                r => Some(r?),
+            };
             let mut stmt = c.prepare("SELECT mac, alias, note FROM client_aliases")?;
             let aliases = stmt
                 .query_map([], |r| Ok((r.get::<_, String>(0)?, Alias { alias: r.get(1)?, note: r.get(2)? })))?
