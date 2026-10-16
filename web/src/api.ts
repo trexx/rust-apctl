@@ -440,6 +440,7 @@ export const keys = {
   firmware: family("firmware"),
   rfRadios: family<[range: number]>("rf-radios"),
   rfNeighbors: family<[range: number, band: string]>("rf-neighbors"),
+  rfLinks: family<[range: number]>("rf-links"),
   rfPlan: family<[band: string, dfs: boolean]>("rf-plan"),
   channelAi: family("channel-ai"),
   adoption: family("adoption"),
@@ -962,6 +963,15 @@ export const useNeighbors = (range: number, band: string) =>
   useQuery({
     queryKey: keys.rfNeighbors(range, band),
     queryFn: getting<{ neighbors: Neighbor[]; own_links: OwnLink[] }>(`/api/rf/neighbors${qs({ range, band: bandParam(band) })}`),
+    refetchInterval: 60_000,
+    placeholderData: keepPreviousData,
+  });
+
+/** Only how loudly our APs hear each other (no neighbour list). */
+export const useOwnLinks = (range: number) =>
+  useQuery({
+    queryKey: keys.rfLinks(range),
+    queryFn: getting<{ own_links: OwnLink[] }>(`/api/rf/neighbors${qs({ range, links_only: "true" })}`),
     refetchInterval: 60_000,
     placeholderData: keepPreviousData,
   });

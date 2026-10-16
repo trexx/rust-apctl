@@ -499,7 +499,7 @@ const EVENTS: { [K in EventKind]: EventSpec<K> } = {
     label: "Client disconnected",
     tone: "warn",
     describe: (d) =>
-      `${d.reason === "ap_offline" ? "AP went offline" : "no longer seen"}${d.connected_for ? ` after ${duration(d.connected_for)}` : ""}${d.last_signal ? `, last ${d.last_signal} dBm` : ""}`,
+      `${d.reason === "ap_offline" ? "AP went offline" : d.reason === "ap_forgotten" ? "its AP was forgotten" : "no longer seen"}${d.connected_for ? ` after ${duration(d.connected_for)}` : ""}${d.last_signal ? `, last ${d.last_signal} dBm` : ""}`,
   },
   client_roamed: {
     label: "Client roamed",

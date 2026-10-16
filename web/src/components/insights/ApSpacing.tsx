@@ -1,4 +1,4 @@
-import { useNeighbors } from "../../api";
+import { useOwnLinks } from "../../api";
 import { band } from "../../format";
 import { QueryState } from "../common";
 import type { Verdict } from "./shared";
@@ -13,7 +13,7 @@ const TOO_CLOSE = -55;
  * (more co-channel contention, clients clinging to the wrong AP).
  */
 export function ApSpacing() {
-  const n = useNeighbors(7 * 86400, "all");
+  const n = useOwnLinks(7 * 86400);
   return (
     <QueryState q={n} panel>
       {(data) => {
