@@ -31,9 +31,7 @@ import {
   useStatus,
 } from "./api";
 import { Overview } from "./pages/Overview";
-import { Device } from "./pages/Device";
 import { Clients } from "./pages/Clients";
-import { Client } from "./pages/Client";
 import { Events } from "./pages/Events";
 import { Logs } from "./pages/Logs";
 import { Networks } from "./pages/Networks";
@@ -41,7 +39,13 @@ import { AlertBell, useNotifier } from "./components/Alerts";
 import { Loading, Outcome, useRunner } from "./components/common";
 import "./styles.css";
 
-// Pages that are seldom opened load on demand.
+// Pages that are seldom opened, or large, load on demand.
+const Device = lazy(() =>
+  import("./pages/Device").then((m) => ({ default: m.Device })),
+);
+const Client = lazy(() =>
+  import("./pages/Client").then((m) => ({ default: m.Client })),
+);
 const Settings = lazy(() =>
   import("./pages/Settings").then((m) => ({ default: m.Settings })),
 );
