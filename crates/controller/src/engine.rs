@@ -806,6 +806,8 @@ impl Engine {
             vec![Sql::Text(state.to_string()), Sql::Integer(ts)],
         );
         let summary = crate::dryrun::summarize_state(&state);
+        // The new settings may hold the syslog key of an AP given up on.
+        self.syslog_unknown.clear();
         let mut live = self.live.write().unwrap();
         live.state = Some(Arc::new(state));
         live.state_imported_at = Some(ts);
@@ -828,6 +830,7 @@ impl Engine {
             vec![Sql::Text(state.to_string()), Sql::Integer(imported_at)],
         );
         self.live.write().unwrap().state = Some(Arc::new(state));
+        self.syslog_unknown.clear();
         self.emit(ev(ts, "settings_changed", None, None, json!({ "what": what })));
         // The APs pick the change up now rather than at their next interval.
         crate::stun::poke_all(&self.live.read().unwrap());
@@ -1011,9 +1014,11 @@ impl Engine {
     /// Decrypts a datagram from the AP with this `hash_id`: with the key of the
     /// AP known by it, else by trying each key.
     fn decrypt_syslog(&mut self, ts: Ts, payload: &[u8], hash_id: String, by_hash: Option<Mac>) -> anyhow::Result<(Mac, String)> {
+        // Keys come from the settings (APs apctl adopted) and the key file.
+        let state = self.live.read().unwrap().state.clone();
         if let Some(mac) = by_hash
-            && let Some(key) = self.keys.syslog_key(&mac)
-            && let Ok(text) = crate::syslog::decrypt(payload, mac, key)
+            && let Some(key) = crate::adopt::syslog_key(state.as_deref(), &self.keys, &mac)
+            && let Ok(text) = crate::syslog::decrypt(payload, mac, &key)
         {
             return Ok((mac, text));
         }
@@ -1026,11 +1031,11 @@ impl Engine {
         {
             anyhow::bail!("no syslog key for hash_id {hash_id} (none worked {}s ago)", ts - at);
         }
-        for (mac, key) in self.keys.syslog_keys() {
-            if let Ok(text) = crate::syslog::decrypt(payload, *mac, key) {
+        for (mac, key) in crate::adopt::syslog_keys(state.as_deref(), &self.keys) {
+            if let Ok(text) = crate::syslog::decrypt(payload, mac, &key) {
                 self.syslog_unknown.remove(&hash_id);
-                self.live.write().unwrap().by_hash_id.insert(hash_id, *mac);
-                return Ok((*mac, text));
+                self.live.write().unwrap().by_hash_id.insert(hash_id, mac);
+                return Ok((mac, text));
             }
         }
         // Bounded against made-up hash_ids; expired entries go at each tick.
@@ -1698,6 +1703,15 @@ mod tests {
         send(&mut e, 20, 2, 7);
         assert_eq!(logs(), 1);
         assert_eq!(live.read().unwrap().by_hash_id.get(&hex::encode([2u8; 8])), Some(&AP1.parse().unwrap()));
+        // An AP apctl adopted: its key is in the settings only.
+        send(&mut e, 30, 3, 5);
+        assert_eq!(logs(), 1);
+        let ap2 = "02:00:00:00:00:02";
+        e.set_state(31, json!({ "devices": [{ "mac": ap2, "syslog_key": hex::encode([5u8; 32]) }] }));
+        assert!(e.syslog_unknown.is_empty(), "new settings, new keys: tried again");
+        send(&mut e, 32, 3, 5);
+        assert_eq!(logs(), 2);
+        assert_eq!(live.read().unwrap().by_hash_id.get(&hex::encode([3u8; 8])), Some(&ap2.parse().unwrap()));
         std::fs::remove_dir_all(&dir).ok();
     }
 
