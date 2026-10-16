@@ -17,10 +17,11 @@ import { ErrorNote, Loading, Outcome, QueryState, useRunner } from "./common";
 /**
  * Runs Channel AI actions. The settings checkboxes each send a patch built
  * from the current settings, so `busy` lasts until the refetched settings are
- * in: a second click can't send a patch built from stale ones.
+ * in: a second click can't send a patch built from stale ones. (Event lists
+ * refetch when the change's event arrives.)
  */
 const useRun = () =>
-  useRunner([keys.channelAi(), keys.rfPlan(), keys.events(), keys.rfRadios()]);
+  useRunner([keys.channelAi(), keys.rfPlan(), keys.rfRadios()]);
 
 /** Scan now / Apply plan for one band's channel plan. */
 export function PlanActions({
