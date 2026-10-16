@@ -324,7 +324,7 @@ pub async fn adopt(State(s): State<AppState>, Path(mac): Path<String>) -> Result
         live.adoption.adopting.insert(mac, store::now_ts());
         live.adoption.pending.remove(&mac);
     }
-    let _ = s.engine.send(Input::Note(Event::device(store::now_ts(), EventKind::ApAdopting, mac, json!({ "model": payload["model"], "ip": payload["ip"] })))).await;
+    s.note(Event::device(store::now_ts(), EventKind::ApAdopting, mac, json!({ "model": payload["model"], "ip": payload["ip"] }))).await;
     Ok(Json(json!({ "adopting": true })))
 }
 

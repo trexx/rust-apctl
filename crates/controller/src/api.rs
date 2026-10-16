@@ -157,6 +157,12 @@ impl AppState {
         self.send(input).await?;
         rx.await.map_err(|_| ApiError::engine_stopped())
     }
+
+    /// Records an event. Nothing to tell the caller if the engine has stopped:
+    /// the action it describes is done either way.
+    pub async fn note(&self, event: crate::engine::Event) {
+        let _ = self.engine.send(crate::engine::Input::Note(event)).await;
+    }
 }
 
 impl IntoResponse for ApiError {

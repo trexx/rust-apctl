@@ -20,7 +20,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::api::{ApiError, AppState};
-use crate::engine::{Event, EventKind, Input};
+use crate::engine::{Event, EventKind};
 use crate::store;
 
 /// The URL APs should inform to: `--inform-url`, else the one the managed APs use.
@@ -238,7 +238,7 @@ pub async fn adopt(State(s): State<AppState>, Json(b): Json<AdoptBody>) -> Resul
     let connected = connect(&b.ip, b.port.unwrap_or(22), &logins(state.as_deref(), given.clone()), expected.as_ref().map(|e| e.1.clone())).await;
     let session = match (connected, &expected) {
         (Err(Failure::HostKey), Some((mac, _))) => {
-            let _ = s.engine.send(Input::Note(Event::device(store::now_ts(), EventKind::ApHostKeyMismatch, *mac, json!({ "ip": b.ip })))).await;
+            s.note(Event::device(store::now_ts(), EventKind::ApHostKeyMismatch, *mac, json!({ "ip": b.ip }))).await;
             return Err(bad(Failure::HostKey));
         }
         (r, _) => r.map_err(bad)?,
@@ -253,7 +253,7 @@ pub async fn adopt(State(s): State<AppState>, Json(b): Json<AdoptBody>) -> Resul
     if let (Some(k), Some(seen)) = (known.and_then(|d| d["x_ssh_hostkey_fingerprint"].as_str()), &session.fingerprint)
         && k != seen
     {
-        let _ = s.engine.send(Input::Note(Event::device(store::now_ts(), EventKind::ApHostKeyMismatch, mac, json!({ "ip": b.ip })))).await;
+        s.note(Event::device(store::now_ts(), EventKind::ApHostKeyMismatch, mac, json!({ "ip": b.ip }))).await;
         return Err(bad(Failure::HostKey));
     }
     // Its record (and key), unless apctl has it already.
@@ -291,7 +291,7 @@ pub async fn adopt(State(s): State<AppState>, Json(b): Json<AdoptBody>) -> Resul
         }
     };
     s.live.write().unwrap().adoption.adopting.insert(mac, store::now_ts());
-    let _ = s.engine.send(Input::Note(Event::device(store::now_ts(), EventKind::ApAdopting, mac, json!({ "ip": b.ip, "via": "ssh" })))).await;
+    s.note(Event::device(store::now_ts(), EventKind::ApAdopting, mac, json!({ "ip": b.ip, "via": "ssh" }))).await;
     tracing::info!("{mac}: set-adopt {url} sent over SSH ({})", out.trim());
     Ok(Json(json!({ "adopting": true, "mac": mac, "inform_url": url })))
 }

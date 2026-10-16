@@ -138,15 +138,11 @@ fn known_ap(s: &AppState, mac: &Mac) -> Result<(), ApiError> {
     }
 }
 
-async fn note(s: &AppState, kind: EventKind, mac: Mac, data: Value) {
-    let _ = s.engine.send(Input::Note(Event::device(store::now_ts(), kind, mac, data))).await;
-}
-
 /// POST /api/devices/{mac}/restart
 pub async fn restart(State(s): State<AppState>, Path(mac): Path<String>) -> Result<Json<Value>, ApiError> {
     let mac = target_ap(&s, &mac)?;
     queue(&mut s.live.write().unwrap(), mac, json!({ "_type": "reboot", "reboot_type": "soft" }));
-    note(&s, EventKind::ApRestartRequested, mac, json!({})).await;
+    s.note(Event::device(store::now_ts(), EventKind::ApRestartRequested, mac, json!({}))).await;
     Ok(Json(json!({ "queued": true })))
 }
 
@@ -172,7 +168,7 @@ pub async fn locate(State(s): State<AppState>, Path(mac): Path<String>, Json(b):
 pub async fn provision(State(s): State<AppState>, Path(mac): Path<String>) -> Result<Json<Value>, ApiError> {
     let mac = target_ap(&s, &mac)?;
     s.live.write().unwrap().reprovision.insert(mac);
-    note(&s, EventKind::ApProvisionRequested, mac, json!({})).await;
+    s.note(Event::device(store::now_ts(), EventKind::ApProvisionRequested, mac, json!({}))).await;
     Ok(Json(json!({ "queued": true })))
 }
 
@@ -191,7 +187,7 @@ pub async fn kick(State(s): State<AppState>, Path(mac): Path<String>) -> Result<
         queue(&mut live, ap, json!({ "_type": "cmd", "cmd": "kick-sta", "mac": client.to_string() }));
         ap
     };
-    let _ = s.engine.send(Input::Note(Event::client(store::now_ts(), EventKind::ClientReconnectRequested, client, json!({ "ap": ap })))).await;
+    s.note(Event::client(store::now_ts(), EventKind::ClientReconnectRequested, client, json!({ "ap": ap }))).await;
     Ok(Json(json!({ "queued": true, "ap": ap })))
 }
 
@@ -220,7 +216,7 @@ pub async fn block(State(s): State<AppState>, Path(mac): Path<String>, Json(b): 
         }
     }
     let kind = if blocked { EventKind::ClientBlocked } else { EventKind::ClientUnblocked };
-    let _ = s.engine.send(Input::Note(Event::client(store::now_ts(), kind, client, json!({})))).await;
+    s.note(Event::client(store::now_ts(), kind, client, json!({}))).await;
     Ok(Json(json!({ "blocked": blocked })))
 }
 
