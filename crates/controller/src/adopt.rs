@@ -109,8 +109,20 @@ pub fn syslog_keys(state: Option<&Value>, keys: &KeyStore) -> Vec<(Mac, [u8; 32]
     stored.chain(keys.syslog_keys().map(|(m, k)| (*m, *k))).collect()
 }
 
-/// Records an inform from an AP waiting for adoption; true the first time.
-pub fn note_pending(live: &mut Live, payload: &Value, known: bool, now: Ts) -> bool {
+/// What adoption reads of a pending AP's inform (`new_device`, `radio_table`,
+/// the listing): kept instead of the whole inform, which anyone can send.
+pub fn pending_inform(payload: &Value) -> Value {
+    let pick = |v: &Value, keys: &[&str]| Value::Object(keys.iter().filter_map(|&k| Some((k.to_string(), v.get(k).filter(|x| !x.is_null())?.clone()))).collect());
+    let mut out = pick(payload, &["mac", "model", "model_display", "version", "serial", "ip", "hostname"]);
+    if let Some(radios) = payload["radio_table"].as_array() {
+        out["radio_table"] = radios.iter().take(8).map(|r| pick(r, &RADIO_KEYS)).collect();
+    }
+    out
+}
+
+/// Records an inform from an AP waiting for adoption (see `pending_inform`);
+/// true the first time.
+pub fn note_pending(live: &mut Live, payload: Value, known: bool, now: Ts) -> bool {
     let Some(mac) = payload["mac"].as_str().and_then(|m| m.parse::<Mac>().ok()) else { return false };
     let s = |k: &str| payload[k].as_str().map(str::to_string);
     let new = !live.adoption.pending.contains_key(&mac);
@@ -131,7 +143,7 @@ pub fn note_pending(live: &mut Live, payload: &Value, known: bool, now: Ts) -> b
             known,
             first_seen,
             last_seen: now,
-            payload: Arc::new(payload.clone()),
+            payload: Arc::new(payload),
         },
     );
     new
@@ -142,6 +154,12 @@ pub fn expire(live: &mut Live, now: Ts) {
     live.adoption.pending.retain(|_, p| now - p.last_seen < 600);
     live.adoption.adopting.retain(|_, t| now - *t < ADOPT_TIMEOUT);
 }
+
+/// What `radio_table` reads of each radio in an inform's `radio_table`.
+const RADIO_KEYS: [&str; 14] = [
+    "name", "radio", "radio_caps", "radio_caps2", "has_dfs", "has_fccdfs", "has_ht160", "is_11ac", "is_11ax", "nss", "min_txpower", "max_txpower", "builtin_antenna",
+    "builtin_ant_gain",
+];
 
 /// The radio settings of a new AP, from the radios its inform lists: auto
 /// channel, the site's default width, auto power.
@@ -162,7 +180,7 @@ pub fn radio_table(state: &Value, payload: &Value) -> Vec<Value> {
                 "name": r["name"], "radio": band, "channel": "auto", "ht": width(band), "tx_power_mode": "auto",
                 "min_rssi_enabled": false, "hard_noise_floor_enabled": false, "antenna_gain": r["builtin_ant_gain"],
             });
-            for k in ["radio_caps", "radio_caps2", "has_dfs", "has_fccdfs", "has_ht160", "is_11ac", "is_11ax", "nss", "min_txpower", "max_txpower", "builtin_antenna", "builtin_ant_gain"] {
+            for k in &RADIO_KEYS[2..] {
                 if !r[k].is_null() {
                     v[k] = r[k].clone();
                 }
@@ -259,10 +277,16 @@ pub fn spawn(s: AppState) {
         loop {
             tokio::time::sleep(std::time::Duration::from_secs(10)).await;
             let now = store::now_ts();
+            // Taken out of `forgetting` here, so an inform arriving meanwhile
+            // doesn't finish the same forget a second time.
             let overdue: Vec<Mac> = {
                 let mut live = s.live.write().unwrap();
                 expire(&mut live, now);
-                live.adoption.forgetting.iter().filter(|(_, t)| now - **t >= FORGET_TIMEOUT).map(|(m, _)| *m).collect()
+                let overdue: Vec<Mac> = live.adoption.forgetting.iter().filter(|(_, t)| now - **t >= FORGET_TIMEOUT).map(|(m, _)| *m).collect();
+                for m in &overdue {
+                    live.adoption.forgetting.remove(m);
+                }
+                overdue
             };
             for mac in overdue {
                 tracing::info!("{mac}: forgotten without reporting again");
@@ -408,10 +432,23 @@ mod tests {
     #[test]
     fn pending_aps_are_listed_and_expire() {
         let mut live = Live::default();
-        assert!(note_pending(&mut live, &inform(), false, 100));
-        assert!(!note_pending(&mut live, &inform(), false, 110), "only new the first time");
+        let mut big = inform();
+        big["sys_stats"] = json!({ "loadavg_1": "0.1" });
+        big["radio_table"][0]["scan_table"] = json!([{ "bssid": "x" }]);
+        assert!(note_pending(&mut live, pending_inform(&big), false, 100));
+        assert!(!note_pending(&mut live, pending_inform(&big), false, 110), "only new the first time");
         let p = &live.adoption.pending[&"02:00:00:00:00:09".parse().unwrap()];
         assert_eq!((p.first_seen, p.last_seen, p.model.as_deref()), (100, 110, Some("U6M")));
+        // Only what adoption reads is kept, and a record built from it is the same.
+        assert!(p.payload.get("sys_stats").is_none() && p.payload["radio_table"][0].get("scan_table").is_none());
+        let mac = "02:00:00:00:00:09".parse().unwrap();
+        let (mut a, mut b) = (new_device(&state(), &p.payload, &mac), new_device(&state(), &inform(), &mac));
+        for d in [&mut a, &mut b] {
+            for k in ["x_authkey", "syslog_key", "cfgversion", "adopted_at"] {
+                d[k] = Value::Null;
+            }
+        }
+        assert_eq!(a, b);
         expire(&mut live, 110 + 600);
         assert!(live.adoption.pending.is_empty());
     }
