@@ -19,7 +19,7 @@ use axum::Json;
 use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode};
 use inform::Mac;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::api::{ApiError, AppState};
@@ -71,16 +71,38 @@ fn same_mac(c: &Value, mac: &str) -> bool {
     c["mac"].as_str().is_some_and(|m| m.eq_ignore_ascii_case(mac))
 }
 
-/// Adds a client's `blocked`, `locked_to` and own speed limit (`usergroup_id`)
-/// from the settings to its view. For many clients, `ClientControls` looks
-/// each one up without scanning the settings' client list every time.
-pub fn add_controls(v: &mut Value, state: Option<&Value>, mac: &str) {
-    let entry = state.and_then(|s| s["clients"].as_array()).and_then(|l| l.iter().find(|c| same_mac(c, mac)));
-    set_controls(v, entry);
+/// A client's `blocked`, `locked_to` and own speed limit (`usergroup_id`) from
+/// the settings, as its view shows them.
+#[derive(Debug, Serialize, PartialEq)]
+pub struct Controls<'a> {
+    pub blocked: bool,
+    pub locked_to: Option<String>,
+    pub usergroup_id: Option<&'a Value>,
 }
 
-/// The settings' client entries by lowercase MAC, built once for a list of clients.
-pub struct ClientControls<'a>(HashMap<String, &'a Value>);
+impl<'a> Controls<'a> {
+    fn of(entry: Option<&'a Value>) -> Self {
+        let locked_to = entry.filter(|c| c["fixed_ap_enabled"].as_bool() == Some(true)).and_then(|c| c["fixed_ap_mac"].as_str());
+        Controls {
+            blocked: entry.and_then(|c| c["blocked"].as_bool()).unwrap_or(false),
+            locked_to: locked_to.map(str::to_ascii_lowercase),
+            usergroup_id: entry.map(|c| &c["usergroup_id"]),
+        }
+    }
+}
+
+/// One client's controls. For many clients, `ClientControls` looks each one
+/// up without scanning the settings' client list every time.
+pub fn controls<'a>(state: Option<&'a Value>, mac: &Mac) -> Controls<'a> {
+    Controls::of(state.and_then(|s| s["clients"].as_array()).and_then(|l| l.iter().find(|c| entry_mac(c) == Some(*mac))))
+}
+
+fn entry_mac(c: &Value) -> Option<Mac> {
+    c["mac"].as_str()?.parse().ok()
+}
+
+/// The settings' client entries by MAC, built once for a list of clients.
+pub struct ClientControls<'a>(HashMap<Mac, &'a Value>);
 
 impl<'a> ClientControls<'a> {
     pub fn new(state: Option<&'a Value>) -> Self {
@@ -88,25 +110,17 @@ impl<'a> ClientControls<'a> {
         let mut map = HashMap::with_capacity(list.len());
         for c in list {
             // The first entry for a MAC wins, as with a scan of the list.
-            if let Some(m) = c["mac"].as_str() {
-                map.entry(m.to_ascii_lowercase()).or_insert(c);
+            if let Some(m) = entry_mac(c) {
+                map.entry(m).or_insert(c);
             }
         }
         ClientControls(map)
     }
 
-    /// `add_controls` for one client.
-    pub fn add(&self, v: &mut Value, mac: &str) {
-        set_controls(v, self.0.get(&mac.to_ascii_lowercase()).copied());
+    /// `controls` for one client.
+    pub fn get(&self, mac: &Mac) -> Controls<'a> {
+        Controls::of(self.0.get(mac).copied())
     }
-}
-
-fn set_controls(v: &mut Value, entry: Option<&Value>) {
-    let blocked = entry.and_then(|c| c["blocked"].as_bool()).unwrap_or(false);
-    let locked_to = entry.filter(|c| c["fixed_ap_enabled"].as_bool() == Some(true)).and_then(|c| c["fixed_ap_mac"].as_str());
-    v["blocked"] = json!(blocked);
-    v["locked_to"] = json!(locked_to.map(str::to_ascii_lowercase));
-    v["usergroup_id"] = entry.map_or(Value::Null, |c| c["usergroup_id"].clone());
 }
 
 fn known_ap(s: &AppState, mac: &Mac) -> Result<(), ApiError> {
@@ -280,15 +294,13 @@ mod tests {
         assert_eq!(state["clients"][1]["site_id"], "s1");
         assert_eq!(apcfg::blocked_sta(&state, "s1"), "aa:bb:cc:00:00:01");
 
-        let mut v = json!({});
-        add_controls(&mut v, Some(&state), "AA:BB:CC:00:00:02");
-        assert_eq!((v["blocked"].as_bool(), v["locked_to"].as_str()), (Some(false), Some("02:00:00:00:00:01")));
-        let controls = ClientControls::new(Some(&state));
-        for mac in ["aa:bb:cc:00:00:01", "AA:BB:CC:00:00:02", "aa:bb:cc:00:00:03"] {
-            let (mut a, mut b) = (json!({}), json!({}));
-            add_controls(&mut a, Some(&state), mac);
-            controls.add(&mut b, mac);
-            assert_eq!(a, b, "{mac}");
+        let mac = |s: &str| s.parse::<Mac>().unwrap();
+        let c = controls(Some(&state), &mac("AA:BB:CC:00:00:02"));
+        assert_eq!((c.blocked, c.locked_to.as_deref()), (false, Some("02:00:00:00:00:01")));
+        assert_eq!(serde_json::to_value(controls(Some(&state), &mac("aa:bb:cc:00:00:01"))).unwrap(), json!({ "blocked": true, "locked_to": null, "usergroup_id": null }));
+        let all = ClientControls::new(Some(&state));
+        for m in ["aa:bb:cc:00:00:01", "AA:BB:CC:00:00:02", "aa:bb:cc:00:00:03"] {
+            assert_eq!(controls(Some(&state), &mac(m)), all.get(&mac(m)), "{m}");
         }
     }
 }

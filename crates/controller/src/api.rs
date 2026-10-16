@@ -11,7 +11,7 @@ use axum::{Json, Router};
 use inform::Mac;
 use rusqlite::types::Value as Sql;
 use rusqlite::params_from_iter;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::sync::broadcast;
 
@@ -241,14 +241,59 @@ impl StoredDevice {
     }
 
     /// Its row in the device list.
-    fn row(&self) -> Value {
-        json!({
-            "mac": self.mac, "name": self.name, "model": self.model, "model_display": self.model_display, "version": self.version,
-            "ip": self.ip, "online": false, "reconfiguring": false, "first_seen": self.first_seen, "last_seen": self.last_seen, "uptime": null,
-            "cpu": null, "mem": null, "load1": null, "satisfaction": null, "clients": 0, "uplink": null, "radios": [], "last_config_push": null,
-            "stored_only": true,
-        })
+    fn row(self) -> DeviceRow {
+        DeviceRow {
+            mac: self.mac, name: self.name, model: self.model, model_display: self.model_display, version: self.version, ip: self.ip,
+            online: false, reconfiguring: false, first_seen: self.first_seen, last_seen: self.last_seen, uptime: None, cpu: None, mem: None,
+            load1: None, satisfaction: None, clients: 0, uplink: None, radios: vec![], last_config_push: None, locating: None, stored_only: true,
+        }
     }
+}
+
+/// An AP in the device list.
+#[derive(Serialize)]
+struct DeviceRow {
+    mac: String,
+    name: Option<String>,
+    model: Option<String>,
+    model_display: Option<String>,
+    version: Option<String>,
+    ip: Option<String>,
+    online: bool,
+    reconfiguring: bool,
+    first_seen: Ts,
+    last_seen: Ts,
+    uptime: Option<i64>,
+    cpu: Option<f64>,
+    mem: Option<f64>,
+    load1: Option<f64>,
+    satisfaction: Option<i64>,
+    clients: usize,
+    uplink: Option<UplinkRow>,
+    radios: Vec<RadioRow>,
+    last_config_push: Option<Ts>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    locating: Option<bool>,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    stored_only: bool,
+}
+
+#[derive(Serialize)]
+struct UplinkRow {
+    speed: Option<i64>,
+    up: Option<bool>,
+    full_duplex: Option<bool>,
+}
+
+#[derive(Serialize)]
+struct RadioRow {
+    radio: String,
+    channel: Option<i64>,
+    bw: Option<i64>,
+    tx_power: Option<i64>,
+    cu_total: Option<i64>,
+    noise_floor: Option<i64>,
+    clients: i64,
 }
 
 /// APs in the database (all, or `only` this one).
@@ -270,43 +315,42 @@ async fn stored_devices(store: &Arc<Store>, only: Option<String>) -> Result<Vec<
     .await
 }
 
-async fn devices(State(s): State<AppState>) -> ApiResult {
+async fn devices(State(s): State<AppState>) -> Result<Json<Vec<DeviceRow>>, ApiError> {
     let stored = stored_devices(&s.store, None).await?;
-    let live = s.live.read().unwrap();
-    // Connected clients per AP, counted in one pass.
-    let mut per_ap: std::collections::HashMap<Mac, usize> = std::collections::HashMap::new();
-    for c in live.clients.values().filter(|c| c.connected) {
-        *per_ap.entry(c.sample.ap_mac).or_default() += 1;
-    }
-    let mut list: Vec<Value> = live
-        .devices
-        .iter()
-        .map(|(mac, d)| {
-            let a = &d.snapshot.ap;
-            let clients = per_ap.get(mac).copied().unwrap_or(0);
-            json!({
-                "mac": mac, "name": a.hostname, "model": a.model, "model_display": a.model_display,
-                "version": a.version, "ip": a.ip, "online": d.online, "reconfiguring": d.reconfiguring,
-                "first_seen": d.first_seen, "last_seen": d.last_seen, "uptime": a.uptime,
-                "cpu": a.cpu, "mem": a.mem, "load1": a.load1, "satisfaction": a.satisfaction,
-                "clients": clients,
-                "uplink": d.snapshot.uplink.as_ref().map(|u| json!({ "speed": u.speed, "up": u.up, "full_duplex": u.full_duplex })),
-                "radios": d.snapshot.radios.iter().map(|r| json!({
-                    "radio": r.radio, "channel": r.channel, "bw": r.bw, "tx_power": r.tx_power,
-                    "cu_total": r.cu_total, "noise_floor": r.noise_floor, "clients": r.num_sta,
-                })).collect::<Vec<_>>(),
-                "last_config_push": d.last_config_push,
-                "locating": live.locating.contains(mac),
-            })
-        })
-        .collect();
-    for d in stored {
-        if d.mac.parse().is_ok_and(|m: Mac| live.devices.contains_key(&m)) {
-            continue;
+    // The rows are copied out under the lock (a few short strings each) and
+    // serialised after it.
+    let list = {
+        let live = s.live.read().unwrap();
+        // Connected clients per AP, counted in one pass.
+        let mut per_ap: std::collections::HashMap<Mac, usize> = std::collections::HashMap::new();
+        for c in live.clients.values().filter(|c| c.connected) {
+            *per_ap.entry(c.sample.ap_mac).or_default() += 1;
         }
-        list.push(d.row());
-    }
-    Ok(Json(Value::Array(list)))
+        let mut list: Vec<DeviceRow> = live
+            .devices
+            .iter()
+            .map(|(mac, d)| {
+                let a = &d.snapshot.ap;
+                DeviceRow {
+                    mac: mac.to_string(), name: a.hostname.clone(), model: a.model.clone(), model_display: a.model_display.clone(),
+                    version: a.version.clone(), ip: a.ip.clone(), online: d.online, reconfiguring: d.reconfiguring,
+                    first_seen: d.first_seen, last_seen: d.last_seen, uptime: a.uptime, cpu: a.cpu, mem: a.mem, load1: a.load1,
+                    satisfaction: a.satisfaction, clients: per_ap.get(mac).copied().unwrap_or(0),
+                    uplink: d.snapshot.uplink.as_ref().map(|u| UplinkRow { speed: u.speed, up: u.up, full_duplex: u.full_duplex }),
+                    radios: d.snapshot.radios.iter().map(|r| RadioRow {
+                        radio: r.radio.clone(), channel: r.channel, bw: r.bw, tx_power: r.tx_power, cu_total: r.cu_total,
+                        noise_floor: r.noise_floor, clients: r.num_sta,
+                    }).collect(),
+                    last_config_push: d.last_config_push,
+                    locating: Some(live.locating.contains(mac)),
+                    stored_only: false,
+                }
+            })
+            .collect();
+        list.extend(stored.into_iter().filter(|d| !d.mac.parse().is_ok_and(|m: Mac| live.devices.contains_key(&m))).map(StoredDevice::row));
+        list
+    };
+    Ok(Json(list))
 }
 
 async fn device(State(s): State<AppState>, Path(mac): Path<String>) -> ApiResult {
@@ -331,12 +375,29 @@ async fn device(State(s): State<AppState>, Path(mac): Path<String>) -> ApiResult
 /// Every client: the ones seen in this run and the ones restored from the
 /// database at start (`Engine::restore` loads them all, so the live view is
 /// the whole list).
-async fn clients(State(s): State<AppState>) -> ApiResult {
+/// A client as the client list and page show it: its view, plus its name,
+/// manufacturer and controls.
+#[derive(Serialize)]
+struct ClientRow<'a> {
+    #[serde(flatten)]
+    view: &'a crate::engine::ClientView,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ap_name: Option<Option<&'a str>>,
+    alias: Option<&'a str>,
+    note: Option<&'a str>,
+    vendor: Option<&'a str>,
+    #[serde(flatten)]
+    controls: crate::actions::Controls<'a>,
+}
+
+type ClientCopy = (Mac, crate::engine::ClientView, Option<String>, Option<crate::engine::Alias>);
+
+async fn clients(State(s): State<AppState>) -> Response {
     // What each client's entry needs, copied under the lock (the samples are
     // shared, the rest is small); the serialising happens after it.
     let (state, list) = {
         let live = s.live.read().unwrap();
-        let list: Vec<(Mac, crate::engine::ClientView, Option<String>, Option<crate::engine::Alias>)> = live
+        let list: Vec<ClientCopy> = live
             .clients
             .iter()
             .map(|(mac, c)| {
@@ -347,39 +408,36 @@ async fn clients(State(s): State<AppState>) -> ApiResult {
         (live.state.clone(), list)
     };
     let controls = crate::actions::ClientControls::new(state.as_deref());
-    let out: Vec<Value> = list
-        .into_iter()
-        .map(|(mac, c, ap_name, alias)| {
-            let mut v = serde_json::to_value(&c).unwrap_or_default();
-            v["ap_name"] = json!(ap_name);
-            v["alias"] = json!(alias.as_ref().and_then(|a| a.alias.as_ref()));
-            v["note"] = json!(alias.as_ref().and_then(|a| a.note.as_ref()));
-            v["vendor"] = json!(s.vendors.lookup(&mac));
-            controls.add(&mut v, &mac.to_string());
-            v
+    let rows: Vec<ClientRow> = list
+        .iter()
+        .map(|(mac, view, ap_name, alias)| ClientRow {
+            view,
+            ap_name: Some(ap_name.as_deref()),
+            alias: alias.as_ref().and_then(|a| a.alias.as_deref()),
+            note: alias.as_ref().and_then(|a| a.note.as_deref()),
+            vendor: s.vendors.lookup(mac),
+            controls: controls.get(mac),
         })
         .collect();
-    Ok(Json(Value::Array(out)))
+    Json(rows).into_response()
 }
 
-async fn client(State(s): State<AppState>, Path(mac): Path<String>) -> ApiResult {
+async fn client(State(s): State<AppState>, Path(mac): Path<String>) -> Result<Response, ApiError> {
     let mac = parse_mac(&mac)?;
-    let found = {
+    let (view, alias, state) = {
         let live = s.live.read().unwrap();
-        let a = live.aliases.get(&mac).cloned().unwrap_or_default();
-        live.clients.get(&mac).map(|c| {
-            let mut v = serde_json::to_value(c).unwrap_or_default();
-            v["alias"] = json!(a.alias);
-            v["note"] = json!(a.note);
-            v["vendor"] = json!(s.vendors.lookup(&mac));
-            crate::actions::add_controls(&mut v, live.state.as_deref(), &mac.to_string());
-            v
-        })
+        let view = live.clients.get(&mac).cloned().ok_or_else(|| ApiError(StatusCode::NOT_FOUND, "unknown client".into()))?;
+        (view, live.aliases.get(&mac).cloned().unwrap_or_default(), live.state.clone())
     };
-    match found {
-        Some(v) => Ok(Json(v)),
-        None => Err(ApiError(StatusCode::NOT_FOUND, "unknown client".into())),
-    }
+    let row = ClientRow {
+        view: &view,
+        ap_name: None,
+        alias: alias.alias.as_deref(),
+        note: alias.note.as_deref(),
+        vendor: s.vendors.lookup(&mac),
+        controls: crate::actions::controls(state.as_deref(), &mac),
+    };
+    Ok(Json(row).into_response())
 }
 
 async fn state_summary(State(s): State<AppState>) -> ApiResult {
@@ -823,6 +881,11 @@ mod tests {
         let clients = get_json(&app, "/api/clients").await;
         assert_eq!((clients[0]["ap_name"].as_str(), clients[0]["connected"].as_bool(), clients[0]["sample"]["essid"].as_str()), (Some("Hall"), Some(true), Some("Home")));
         assert!(clients[0]["alias"].is_null() && clients[0].get("blocked").is_some(), "{}", clients[0]);
+        let keys = |v: &Value| v.as_object().unwrap().keys().cloned().collect::<Vec<_>>().join(",");
+        assert_eq!(keys(&clients[0]), "alias,ap_name,blocked,connected,first_seen,last_seen,locked_to,note,sample,usergroup_id,vendor");
+        let one = get_json(&app, "/api/clients/02:00:00:00:01:01").await;
+        assert_eq!(keys(&one), "alias,blocked,connected,first_seen,last_seen,locked_to,note,sample,usergroup_id,vendor", "no ap_name, as before");
+        assert_eq!(one["sample"], clients[0]["sample"]);
     }
 
     async fn get(app: &Router, path: &str) -> Response {
