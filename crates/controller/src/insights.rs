@@ -973,10 +973,48 @@ pub struct NeighborQuery {
     band: Option<String>,
     /// Only networks heard within this many seconds (default one day).
     range: Option<Ts>,
+    /// Only our APs' signal to each other (`neighbors` comes back empty).
+    #[serde(default)]
+    links_only: bool,
+}
+
+/// A network one of our APs heard, as `/api/rf/neighbors` lists it.
+#[derive(Serialize)]
+struct Neighbor<'a> {
+    bssid: String,
+    ap_mac: String,
+    radio: Option<String>,
+    essid: Option<String>,
+    channel: Option<i64>,
+    bw: Option<i64>,
+    center_freq: Option<i64>,
+    security: Option<String>,
+    signal: Option<i64>,
+    best_signal: Option<i64>,
+    is_unifi: bool,
+    ap_name: Option<String>,
+    model: Option<String>,
+    first_seen: Ts,
+    last_seen: Ts,
+    /// The name of the AP that hears it best.
+    nearest_ap: Option<String>,
+    vendor: Option<&'a str>,
+}
+
+/// One of our APs heard by another, with the strongest signal heard.
+#[derive(Serialize)]
+struct OwnLink {
+    from: String,
+    from_name: Option<String>,
+    to: String,
+    to_name: Option<String>,
+    radio: Option<String>,
+    signal: Option<i64>,
 }
 
 /// GET /api/rf/neighbors: networks heard by our APs, the AP hearing each best,
-/// and our own APs' signal to each other (AP density).
+/// and our own APs' signal to each other (AP density), once per pair of APs
+/// and band.
 pub async fn neighbors(State(s): State<AppState>, Query(q): Query<NeighborQuery>) -> Result<Json<Value>, ApiError> {
     let since = store::now_ts() - q.range.unwrap_or(86400).clamp(600, 30 * 86400);
     let band = q.band.clone();
@@ -993,13 +1031,11 @@ pub async fn neighbors(State(s): State<AppState>, Query(q): Query<NeighborQuery>
         let mut stmt = c.prepare(&sql)?;
         let rows = stmt
             .query_map(params_from_iter(params), |r| {
-                Ok(json!({
-                    "bssid": r.get::<_, String>(0)?, "ap_mac": r.get::<_, String>(1)?, "radio": r.get::<_, Option<String>>(2)?,
-                    "essid": r.get::<_, Option<String>>(3)?, "channel": r.get::<_, Option<i64>>(4)?, "bw": r.get::<_, Option<i64>>(5)?,
-                    "center_freq": r.get::<_, Option<i64>>(6)?, "security": r.get::<_, Option<String>>(7)?, "signal": r.get::<_, Option<i64>>(8)?,
-                    "best_signal": r.get::<_, Option<i64>>(9)?, "is_unifi": r.get::<_, i64>(10)? != 0, "ap_name": r.get::<_, Option<String>>(11)?,
-                    "model": r.get::<_, Option<String>>(12)?, "first_seen": r.get::<_, i64>(13)?, "last_seen": r.get::<_, i64>(14)?,
-                }))
+                Ok(Neighbor {
+                    bssid: r.get(0)?, ap_mac: r.get(1)?, radio: r.get(2)?, essid: r.get(3)?, channel: r.get(4)?, bw: r.get(5)?, center_freq: r.get(6)?,
+                    security: r.get(7)?, signal: r.get(8)?, best_signal: r.get(9)?, is_unifi: r.get::<_, i64>(10)? != 0, ap_name: r.get(11)?, model: r.get(12)?,
+                    first_seen: r.get(13)?, last_seen: r.get(14)?, nearest_ap: None, vendor: None,
+                })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
@@ -1007,36 +1043,35 @@ pub async fn neighbors(State(s): State<AppState>, Query(q): Query<NeighborQuery>
     .await?;
     let live = s.live.read().unwrap();
     // Our own BSSIDs, to tell our APs apart from the neighbours.
-    let own: HashMap<String, (inform::Mac, Option<String>)> = live
-        .devices
-        .iter()
-        .flat_map(|(m, d)| d.snapshot.vaps.iter().map(move |v| (v.bssid.clone(), (*m, v.radio.clone()))))
-        .collect();
-    let name_of = |m: &str| ap_name(&live, m);
-    let mut by_bssid: BTreeMap<String, Value> = BTreeMap::new();
-    let mut links = Vec::new();
+    let own: HashMap<&str, (String, Option<&str>)> =
+        live.devices.iter().flat_map(|(m, d)| d.snapshot.vaps.iter().map(move |v| (v.bssid.as_str(), (m.to_string(), v.radio.as_deref())))).collect();
+    let signal = |n: &Neighbor| n.signal.unwrap_or(-200);
+    let mut by_bssid: BTreeMap<String, Neighbor> = BTreeMap::new();
+    // (from, to, band) -> strongest signal: an AP has a BSSID per SSID.
+    let mut links: BTreeMap<(String, String, Option<&str>), Option<i64>> = BTreeMap::new();
     for r in rows {
-        let bssid = r["bssid"].as_str().unwrap_or("").to_string();
-        if let Some((owner, radio)) = own.get(&bssid) {
+        if let Some((owner, radio)) = own.get(r.bssid.as_str()) {
             // One of our APs heard another of ours.
-            if owner.to_string() != r["ap_mac"].as_str().unwrap_or("") {
-                links.push(json!({
-                    "from": r["ap_mac"], "from_name": name_of(r["ap_mac"].as_str().unwrap_or("")),
-                    "to": owner.to_string(), "to_name": name_of(&owner.to_string()), "radio": radio, "signal": r["signal"],
-                }));
+            if *owner != r.ap_mac {
+                let e = links.entry((r.ap_mac, owner.clone(), *radio)).or_insert(r.signal);
+                *e = (*e).max(r.signal);
             }
             continue;
         }
-        let better = by_bssid.get(&bssid).is_none_or(|cur| r["signal"].as_i64().unwrap_or(-200) > cur["signal"].as_i64().unwrap_or(-200));
-        if better {
-            let mut v = r.clone();
-            v["nearest_ap"] = json!(name_of(r["ap_mac"].as_str().unwrap_or("")));
-            v["vendor"] = json!(s.vendors.lookup_str(&bssid));
-            by_bssid.insert(bssid, v);
+        if !q.links_only && by_bssid.get(&r.bssid).is_none_or(|cur| signal(&r) > signal(cur)) {
+            by_bssid.insert(r.bssid.clone(), r);
         }
     }
-    let mut list: Vec<Value> = by_bssid.into_values().collect();
-    list.sort_by_key(|v| -v["signal"].as_i64().unwrap_or(-200));
+    let mut list: Vec<Neighbor> = by_bssid.into_values().collect();
+    for n in &mut list {
+        n.nearest_ap = ap_name(&live, &n.ap_mac);
+        n.vendor = s.vendors.lookup_str(&n.bssid);
+    }
+    list.sort_by_key(|n| -signal(n));
+    let links: Vec<OwnLink> = links
+        .into_iter()
+        .map(|((from, to, radio), signal)| OwnLink { from_name: ap_name(&live, &from), to_name: ap_name(&live, &to), from, to, radio: radio.map(str::to_string), signal })
+        .collect();
     Ok(Json(json!({ "neighbors": list, "own_links": links })))
 }
 
@@ -1823,6 +1858,29 @@ mod tests {
                 }
             }
             assert_eq!(out.as_object().unwrap().len(), expected.as_object().unwrap().len());
+        }
+
+        #[tokio::test]
+        async fn our_aps_hearing_each_other_are_listed_once_per_band() {
+            let (s, base, dir) = site();
+            // A2 hears both of A1's 5 GHz SSIDs.
+            let c = Connection::open(dir.join("config.db")).unwrap();
+            let row = |bssid: &str, sig: i64| vec![text(bssid), text(A2), text("na"), text("x"), int(44), int(80), int(5210), int(sig), int(base - 60), int(base)];
+            insert(&c, "neighbors", &["bssid", "ap_mac", "radio", "essid", "channel", "bw", "center_freq", "signal", "first_seen", "last_seen"], vec![row(BSS[1].0, -62), row(BSS[2].0, -58)]);
+            let q = Query(NeighborQuery { band: None, range: Some(30 * 86400), links_only: false });
+            let out = ok(neighbors(State(s.clone()), q).await);
+            let links: Vec<(&str, &str, &str, i64)> = out["own_links"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|l| (l["from"].as_str().unwrap(), l["to"].as_str().unwrap(), l["radio"].as_str().unwrap(), l["signal"].as_i64().unwrap()))
+                .collect();
+            assert_eq!(links, [(A1, A2, "na", -60), (A1, A2, "ng", -70), (A2, A1, "na", -58), (A2, A1, "ng", -65)]);
+            let names: Vec<&str> = out["neighbors"].as_array().unwrap().iter().map(|n| n["essid"].as_str().unwrap()).collect();
+            assert_eq!(names, ["Neighbour", "Other", "Far"], "strongest first");
+            let q = Query(NeighborQuery { band: None, range: Some(30 * 86400), links_only: true });
+            let only = ok(neighbors(State(s), q).await);
+            assert_eq!((only["neighbors"].as_array().unwrap().len(), &only["own_links"]), (0, &out["own_links"]));
         }
 
         #[tokio::test]
