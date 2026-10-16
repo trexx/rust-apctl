@@ -36,7 +36,7 @@ use crate::model::Ts;
 use crate::store::{self, Db, Store, Writer};
 
 /// What apctl remembers about an AP it manages.
-#[derive(Debug, Clone, Default)]
+#[derive(Clone, Default)]
 struct Managed {
     /// The cfgversion of the config apctl considers current for this AP.
     cfgversion: Option<String>,
@@ -44,6 +44,39 @@ struct Managed {
     content: Option<String>,
     /// Set once the AP has used AES-GCM; CBC is refused after that.
     gcm: bool,
+    /// The last render (memory only): reused while its inputs are unchanged.
+    render: Option<Arc<Render>>,
+}
+
+/// A render of an AP's config with the placeholder cfgversion, and what it
+/// was made from.
+struct Render {
+    /// The settings rendered from. Every change replaces their Arc; holding
+    /// it keeps the address from being reused by another version.
+    state: Arc<Value>,
+    /// What the generator reads from the inform (`render_inputs`).
+    inputs: Value,
+    out: apcfg::Output,
+    blocked: String,
+    /// Both configs and the blocked clients, as compared with `Managed::content`.
+    content: String,
+}
+
+/// The parts of an inform the config generator reads: the capability bits
+/// (apcfg `Caps::read`), `has_eth1` and the names in `vap_table` (net.rs),
+/// `inform_ip`, the `port_table` interface names and `uplink` (system.rs).
+/// Informs that agree on these render the same config from the same settings,
+/// so the rest (counters, uptime, clients) need not cause a render. Raw values
+/// are compared, which is stricter than what apcfg parses from them. Keep in
+/// step with apcfg when it reads more of the inform.
+fn render_inputs(p: &Value) -> Value {
+    let names = |table: &str, key: &str| p[table].as_array().map(|t| t.iter().map(|x| x[key].clone()).collect::<Vec<_>>());
+    let caps = ["fw_caps", "fw2_caps", "fw3_caps", "wifi_caps", "wifi_caps2", "hw_caps"].map(|k| p[k].clone());
+    json!({
+        "caps": caps,
+        "has_eth1": p["has_eth1"], "inform_ip": p["inform_ip"], "uplink": p["uplink"],
+        "vap_table": names("vap_table", "name"), "port_table": names("port_table", "ifname"),
+    })
 }
 
 pub struct Active {
@@ -70,6 +103,14 @@ fn random_bytes<const N: usize>() -> [u8; N] {
 
 fn new_cfgversion() -> String {
     hex::encode(random_bytes::<8>())
+}
+
+/// Seconds until an AP's next inform, for a site of `n_devices` APs. Matches
+/// the official controller for small sites: five seconds per AP plus jitter,
+/// at least ten.
+fn interval(n_devices: usize) -> i64 {
+    let n = n_devices.max(1) as i64;
+    if n < 18 { (n * 5 + (random_bytes::<1>()[0] % 5) as i64).max(10) } else { 60 + (random_bytes::<1>()[0] % 31) as i64 }
 }
 
 /// A `mgmt_cfg` rendered with the placeholder token, carrying `cfgversion`
@@ -100,7 +141,7 @@ impl Active {
                 .query_map([], |r| {
                     Ok((
                         r.get::<_, String>(0)?,
-                        Managed { cfgversion: r.get(1)?, content: r.get(2)?, gcm: r.get::<_, i64>(3)? != 0 },
+                        Managed { cfgversion: r.get(1)?, content: r.get(2)?, gcm: r.get::<_, i64>(3)? != 0, render: None },
                     ))
                 })?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -125,17 +166,28 @@ impl Active {
         );
     }
 
-    /// Seconds until the AP's next inform. Matches the official controller for
-    /// small sites: five seconds per AP plus jitter, at least ten.
-    fn interval(&self) -> i64 {
-        let n = self.live.read().unwrap().devices.len().max(1) as i64;
-        if n < 18 { (n * 5 + (random_bytes::<1>()[0] % 5) as i64).max(10) } else { 60 + (random_bytes::<1>()[0] % 31) as i64 }
-    }
-
     fn render(&self, state: &Value, mac: Mac, inform: &Value, cfgversion: &str) -> anyhow::Result<apcfg::Output> {
         let mac_s = mac.to_string();
         let input = apcfg::Input { state, device_mac: &mac_s, inform: Some(inform), cfgversion, controller: &self.controller };
         apcfg::render_with_meta(&input)
+    }
+
+    /// The AP's config with the placeholder cfgversion: the last render while
+    /// neither the settings nor what it read of the inform changed (most
+    /// informs), else a new one. The lock is not held while rendering.
+    fn placeholder_render(&self, state: &Arc<Value>, mac: Mac, payload: &Value) -> anyhow::Result<Arc<Render>> {
+        let inputs = render_inputs(payload);
+        let last = self.devices.lock().unwrap().get(&mac).and_then(|d| d.render.clone());
+        if let Some(r) = last.filter(|r| Arc::ptr_eq(&r.state, state) && r.inputs == inputs) {
+            return Ok(r);
+        }
+        let out = self.render(state, mac, payload, PLACEHOLDER)?;
+        let site_id = crate::adopt::device_doc(state, &mac).and_then(|d| d["site_id"].as_str()).unwrap_or("");
+        let blocked = apcfg::blocked_sta(state, site_id);
+        let content = format!("{}\n--\n{}\n--\n{}", out.rendered.mgmt_cfg, out.rendered.system_cfg, blocked);
+        let r = Arc::new(Render { state: state.clone(), inputs, out, blocked, content });
+        self.devices.lock().unwrap().entry(mac).or_default().render = Some(r.clone());
+        Ok(r)
     }
 
     /// The reply that adopts an AP: only `mgmt_cfg`, which carries its own key
@@ -143,8 +195,12 @@ impl Active {
     /// it informs with that key.
     fn adoption_reply(&self, ts: Ts, mac: Mac, payload: &Value) -> Value {
         let server_time = (ts * 1000).to_string();
-        let Some(mut state) = self.live.read().unwrap().state.as_deref().cloned() else {
-            return json!({ "_type": "noop", "interval": self.interval(), "server_time_in_utc": server_time });
+        let (state, n_devices) = {
+            let live = self.live.read().unwrap();
+            (live.state.clone(), live.devices.len())
+        };
+        let Some(mut state) = state.as_deref().cloned() else {
+            return json!({ "_type": "noop", "interval": interval(n_devices), "server_time_in_utc": server_time });
         };
         let mut cfgversion = new_cfgversion();
         if let Some(d) = crate::adopt::device_doc_mut(&mut state, &mac) {
@@ -158,7 +214,7 @@ impl Active {
             Ok(out) => json!({ "_type": "setparam", "mgmt_cfg": out.rendered.mgmt_cfg, "server_time_in_utc": server_time }),
             Err(e) => {
                 tracing::error!("{mac}: cannot render the adoption config: {e:#}");
-                json!({ "_type": "noop", "interval": self.interval(), "server_time_in_utc": server_time })
+                json!({ "_type": "noop", "interval": interval(n_devices), "server_time_in_utc": server_time })
             }
         }
     }
@@ -177,20 +233,22 @@ impl Active {
         if payload["inform_as_notif"].as_bool() == Some(true) {
             return json!({ "_type": "noop", "server_time_in_utc": server_time });
         }
-        // A queued command (restart, locate, kick...) goes before anything else.
-        if let Some(mut cmd) = crate::actions::next(&mut self.live.write().unwrap(), &mac) {
+        // One lock for what the reply needs: a queued command (restart, locate,
+        // kick...) goes before anything else; a resend asked from the UI (the
+        // flag stays until the push is built); the settings; the site's size.
+        let (cmd, force, state, n_devices) = {
+            let mut live = self.live.write().unwrap();
+            let cmd = crate::actions::next(&mut live, &mac);
+            (cmd, live.reprovision.contains(&mac), live.state.clone(), live.devices.len())
+        };
+        if let Some(mut cmd) = cmd {
             cmd["server_time_in_utc"] = json!(server_time);
             tracing::info!("{mac}: sending {} {}", cmd["_type"], cmd["cmd"]);
             return cmd;
         }
-        // A resend asked from the UI; the flag stays until the push is built.
-        let (force, state) = {
-            let live = self.live.read().unwrap();
-            (live.reprovision.contains(&mac), live.state.clone())
-        };
         let Some(state) = state else {
             tracing::warn!("{mac}: no settings imported, replying noop");
-            return noop(self.interval());
+            return noop(interval(n_devices));
         };
         let device = crate::adopt::device_doc(&state, &mac);
         // An AP adopted over SSH has no radio settings yet: take them from this inform first.
@@ -213,28 +271,26 @@ impl Active {
                 Ok(())
             });
             let _ = self.engine.try_send(Input::EditState { ts, what: format!("radio settings for new AP {mac}"), edit, done: tx });
-            return noop(self.interval());
+            return noop(interval(n_devices));
         }
         let reported = payload["cfgversion"].as_str().unwrap_or("").to_string();
 
         // What would we push, ignoring the cfgversion token? Rendered once: the
         // token is patched into mgmt_cfg where a version is needed.
-        let out = match self.render(&state, mac, payload, PLACEHOLDER) {
-            Ok(o) => o,
+        let render = match self.placeholder_render(&state, mac, payload) {
+            Ok(r) => r,
             Err(e) => {
                 tracing::error!("{mac}: cannot render config, replying noop: {e:#}");
-                return noop(self.interval());
+                return noop(interval(n_devices));
             }
         };
-        let site_id = device.and_then(|d| d["site_id"].as_str()).unwrap_or("");
-        let blocked = apcfg::blocked_sta(&state, site_id);
-        let content = format!("{}\n--\n{}\n--\n{}", out.rendered.mgmt_cfg, out.rendered.system_cfg, blocked);
+        let out = &render.out;
 
-        // The lock is never held while rendering, and never taken twice.
+        // The lock is never held while rendering.
         let (current, changed) = {
             let devices = self.devices.lock().unwrap();
             let d = devices.get(&mac);
-            (d.and_then(|d| d.cfgversion.clone()), force || d.and_then(|d| d.content.as_deref()) != Some(content.as_str()))
+            (d.and_then(|d| d.cfgversion.clone()), force || d.and_then(|d| d.content.as_deref()) != Some(render.content.as_str()))
         };
         let cfgversion = if !changed {
             current.unwrap_or_default()
@@ -262,7 +318,7 @@ impl Active {
                 let mut devices = self.devices.lock().unwrap();
                 let d = devices.entry(mac).or_default();
                 d.cfgversion = Some(version.clone());
-                d.content = Some(content);
+                d.content = Some(render.content.clone());
                 d.clone()
             };
             self.persist(mac, &snapshot);
@@ -271,7 +327,14 @@ impl Active {
 
         if reported == cfgversion {
             // Config is current: is it this AP's turn for a firmware upgrade?
-            let cmd = crate::firmware::command(&mut self.live.write().unwrap().firmware, &mac, payload, ts);
+            // (One lock: an upgrade that cannot be sent fails at once.)
+            let cmd = {
+                let mut live = self.live.write().unwrap();
+                match crate::firmware::command(&mut live.firmware, &mac, payload, ts) {
+                    Some(Err(why)) => Some(Err((why, live.firmware.failed(&mac, why).is_some()))),
+                    cmd => cmd.map(|c| c.map_err(|why| (why, false))),
+                }
+            };
             match cmd {
                 Some(Ok(cmd)) => {
                     tracing::warn!("{mac}: sending firmware upgrade to {}", cmd["version"]);
@@ -279,27 +342,24 @@ impl Active {
                     let _ = self.engine.try_send(Input::Note { ts, kind: "ap_upgrade_sent", mac, data });
                     return cmd;
                 }
-                Some(Err(why)) => {
-                    let failed = self.live.write().unwrap().firmware.failed(&mac, why);
-                    if failed.is_some() {
-                        let _ = self.engine.try_send(Input::Note { ts, kind: "ap_upgrade_failed", mac, data: json!({ "reason": "no internet", "detail": why }) });
-                    }
+                Some(Err((why, true))) => {
+                    let _ = self.engine.try_send(Input::Note { ts, kind: "ap_upgrade_failed", mac, data: json!({ "reason": "no internet", "detail": why }) });
                 }
-                None => {}
+                Some(Err((_, false))) | None => {}
             }
-            return noop(self.interval());
+            return noop(interval(n_devices));
         }
         if force {
             self.live.write().unwrap().reprovision.remove(&mac);
         }
         // Keep the section numbering the render allocated.
-        let _ = self.engine.try_send(Input::SetConfigMeta { mac, meta: out.config_meta });
+        let _ = self.engine.try_send(Input::SetConfigMeta { mac, meta: out.config_meta.clone() });
         tracing::info!("{mac}: pushing config {cfgversion} (AP reports {reported:?})");
         json!({
             "_type": "setparam",
             "cfgversion": cfgversion,
             "system_cfg": out.rendered.system_cfg,
-            "blocked_sta": blocked,
+            "blocked_sta": render.blocked,
             "mgmt_cfg": with_cfgversion(&out.rendered.mgmt_cfg, &cfgversion),
             "server_time_in_utc": server_time,
         })
@@ -356,9 +416,7 @@ pub async fn inform(
                 return status(StatusCode::INTERNAL_SERVER_ERROR);
             };
             tracing::info!("{mac}: adoption: sending its key");
-            let flags = Flags(Flags::ENCRYPTED | if gcm { Flags::GCM } else { 0 });
-            let packet = inform::seal(mac, flags, random_bytes::<16>(), &key, reply.to_string().as_bytes());
-            return ([(header::CONTENT_TYPE, "application/x-binary")], packet).into_response();
+            return sealed(mac, gcm, &key, &reply);
         }
         // Not ours, or ours but reset: answered 404 and listed for adoption.
         // Whatever apctl remembered about it (e.g. AES-GCM) no longer holds.
@@ -387,9 +445,7 @@ pub async fn inform(
         tokio::spawn(async move { crate::adopt::finish_forget(&engine, mac, true).await });
         active.devices.lock().unwrap().remove(&mac);
         let reply = json!({ "_type": "setdefault", "server_time_in_utc": (ts * 1000).to_string() });
-        let flags = Flags(Flags::ENCRYPTED | if gcm { Flags::GCM } else { 0 });
-        let packet = inform::seal(mac, flags, random_bytes::<16>(), &key, reply.to_string().as_bytes());
-        return ([(header::CONTENT_TYPE, "application/x-binary")], packet).into_response();
+        return sealed(mac, gcm, &key, &reply);
     }
     {
         let mut devices = active.devices.lock().unwrap();
@@ -420,8 +476,13 @@ pub async fn inform(
         let _ = active.engine.send(Input::ConfigPushed { ts, mac, payload: reply.clone() }).await;
     }
 
+    sealed(mac, gcm, &key, &reply)
+}
+
+/// A reply in the request's encryption mode, never compressed, with a fresh IV.
+fn sealed(mac: Mac, gcm: bool, key: &[u8; 16], reply: &Value) -> Response {
     let flags = Flags(Flags::ENCRYPTED | if gcm { Flags::GCM } else { 0 });
-    let packet = inform::seal(mac, flags, random_bytes::<16>(), &key, reply.to_string().as_bytes());
+    let packet = inform::seal(mac, flags, random_bytes::<16>(), key, reply.to_string().as_bytes());
     ([(header::CONTENT_TYPE, "application/x-binary")], packet).into_response()
 }
 
@@ -708,6 +769,35 @@ mod tests {
         assert_eq!(with_cfgversion(&probe.rendered.mgmt_cfg, "0123456789abcdef"), real.rendered.mgmt_cfg);
         assert_eq!(probe.rendered.system_cfg, real.rendered.system_cfg);
         assert_eq!(with_cfgversion("cfgversion=0000000000000000\nx=1\n", "ab"), "cfgversion=ab\nx=1\n");
+    }
+
+    #[test]
+    fn renders_again_only_when_the_settings_or_what_it_reads_change() {
+        let Some(_) = fixtures() else { return };
+        let rig = rig(true, None);
+        let ap: Mac = AP.parse().unwrap();
+        let state = rig.live.read().unwrap().state.clone().unwrap();
+        let mut payload = ap_payload("1");
+        let render = |state: &Arc<Value>, p: &Value| rig.active.placeholder_render(state, ap, p).unwrap();
+        let first = render(&state, &payload);
+        // What changes with every inform (uptime, counters, the reported version) is not read.
+        payload["uptime"] = json!(987654);
+        payload["bytes"] = json!(123);
+        payload["cfgversion"] = json!("2");
+        assert!(Arc::ptr_eq(&first, &render(&state, &payload)), "reused");
+        // Each field the generator reads makes a new render, equal to one made from scratch.
+        for (field, value) in [("inform_ip", json!("192.0.2.99")), ("has_eth1", json!(true)), ("wifi_caps", json!(0)), ("uplink", json!("eth1"))] {
+            let before = render(&state, &payload);
+            payload[field] = value;
+            let after = render(&state, &payload);
+            assert!(!Arc::ptr_eq(&before, &after), "{field} changed");
+            let fresh = rig.active.render(&state, ap, &payload, PLACEHOLDER).unwrap();
+            assert_eq!((&after.out.rendered.mgmt_cfg, &after.out.rendered.system_cfg), (&fresh.rendered.mgmt_cfg, &fresh.rendered.system_cfg));
+        }
+        // So does every change of the settings (a new Arc), even to an equal copy.
+        let latest = render(&state, &payload);
+        let copy = Arc::new((*state).clone());
+        assert!(!Arc::ptr_eq(&latest, &render(&copy, &payload)));
     }
 
     #[tokio::test]
