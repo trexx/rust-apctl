@@ -23,8 +23,10 @@ pub struct ConnId {
 
 #[derive(Debug)]
 pub enum HttpEvent {
-    Request { conn: ConnId, ts: Micros, method: String, path: String, headers: Vec<(String, String)>, body: Vec<u8> },
-    Response { conn: ConnId, ts: Micros, status: u16, headers: Vec<(String, String)>, body: Vec<u8> },
+    /// A request: `inform` for a POST to `/inform`. `forwarded_for` is its
+    /// X-Forwarded-For header, the only header anything reads.
+    Request { conn: ConnId, ts: Micros, inform: bool, forwarded_for: Option<String>, body: Vec<u8> },
+    Response { conn: ConnId, ts: Micros, status: u16, body: Vec<u8> },
     /// A UDP datagram to one of the watched UDP ports (e.g. AP syslog on 5514).
     Datagram { ts: Micros, src: SocketAddr, dst: SocketAddr, payload: Vec<u8> },
 }
@@ -206,12 +208,8 @@ impl Tracker {
 
         while let Some(msg) = half.take_http(to_server) {
             on_event(match msg {
-                Parsed::Request { method, path, headers, body } => {
-                    HttpEvent::Request { conn: conn_id, ts, method, path, headers, body }
-                }
-                Parsed::Response { status, headers, body } => {
-                    HttpEvent::Response { conn: conn_id, ts, status, headers, body }
-                }
+                Parsed::Request { inform, forwarded_for, body } => HttpEvent::Request { conn: conn_id, ts, inform, forwarded_for, body },
+                Parsed::Response { status, body } => HttpEvent::Response { conn: conn_id, ts, status, body },
             });
         }
         // Both sides closed and nothing is missing: release the buffers. The
@@ -353,7 +351,7 @@ impl HalfStream {
 
     fn take_http(&mut self, request: bool) -> Option<Parsed> {
         loop {
-            match parse_http(&self.buf, request) {
+            match parse_http(&self.buf, request, self.closed()) {
                 ParseResult::Complete(msg, used) => {
                     self.buf.drain(..used);
                     return Some(msg);
@@ -379,8 +377,8 @@ impl HalfStream {
 
 #[derive(Debug)]
 enum Parsed {
-    Request { method: String, path: String, headers: Vec<(String, String)>, body: Vec<u8> },
-    Response { status: u16, headers: Vec<(String, String)>, body: Vec<u8> },
+    Request { inform: bool, forwarded_for: Option<String>, body: Vec<u8> },
+    Response { status: u16, body: Vec<u8> },
 }
 
 enum ParseResult {
@@ -389,24 +387,29 @@ enum ParseResult {
     Garbage,
 }
 
-fn parse_http(buf: &[u8], request: bool) -> ParseResult {
+/// Cuts the first message out of `buf`. `closed`: its sender closed the stream with
+/// every byte received, which is what ends a response that has no length.
+fn parse_http(buf: &[u8], request: bool, closed: bool) -> ParseResult {
     if buf.is_empty() {
         return ParseResult::Partial;
     }
     // Until the whole message is there this runs again on every segment, so nothing
     // is copied before it is complete.
     let mut storage = [httparse::EMPTY_HEADER; 64];
-    let (head_len, headers, start): (usize, &[httparse::Header<'_>], _) = if request {
+    let (head_len, headers, inform, status): (usize, &[httparse::Header<'_>], _, _) = if request {
         let mut req = httparse::Request::new(&mut storage);
         match req.parse(buf) {
-            Ok(httparse::Status::Complete(n)) => (n, req.headers, (req.method.unwrap_or(""), req.path.unwrap_or(""), 0)),
+            Ok(httparse::Status::Complete(n)) => {
+                let inform = req.method == Some("POST") && req.path.is_some_and(|p| p.starts_with("/inform"));
+                (n, req.headers, inform, 0)
+            }
             Ok(httparse::Status::Partial) => return ParseResult::Partial,
             Err(_) => return ParseResult::Garbage,
         }
     } else {
         let mut resp = httparse::Response::new(&mut storage);
         match resp.parse(buf) {
-            Ok(httparse::Status::Complete(n)) => (n, resp.headers, ("", "", resp.code.unwrap_or(0))),
+            Ok(httparse::Status::Complete(n)) => (n, resp.headers, false, resp.code.unwrap_or(0)),
             Ok(httparse::Status::Partial) => return ParseResult::Partial,
             Err(_) => return ParseResult::Garbage,
         }
@@ -426,19 +429,28 @@ fn parse_http(buf: &[u8], request: bool) -> ParseResult {
             Chunked::Garbage => return ParseResult::Garbage,
         }
     } else {
-        let len = header("content-length").and_then(|v| std::str::from_utf8(v).ok()?.trim().parse::<usize>().ok()).unwrap_or(0);
+        let len = match header("content-length") {
+            Some(v) => match std::str::from_utf8(v).ok().and_then(|v| v.trim().parse::<usize>().ok()) {
+                Some(len) => len,
+                None => return ParseResult::Garbage,
+            },
+            // No length: a request has no body, nor has a response that never carries
+            // one; any other response runs until the connection closes.
+            None if request || status / 100 == 1 || status == 204 || status == 304 => 0,
+            None if closed => rest.len(),
+            None => return ParseResult::Partial,
+        };
         if rest.len() < len {
             return ParseResult::Partial;
         }
         (rest[..len].to_vec(), len)
     };
 
-    let headers = headers.iter().map(|h| (h.name.to_string(), String::from_utf8_lossy(h.value).into_owned())).collect();
-    let (method, path, status) = start;
     let msg = if request {
-        Parsed::Request { method: method.to_string(), path: path.to_string(), headers, body }
+        let forwarded_for = header("x-forwarded-for").map(|v| String::from_utf8_lossy(v).into_owned());
+        Parsed::Request { inform, forwarded_for, body }
     } else {
-        Parsed::Response { status, headers, body }
+        Parsed::Response { status, body }
     };
     ParseResult::Complete(msg, head_len + body_len)
 }
@@ -559,8 +571,8 @@ mod tests {
     fn parses_content_length_and_chunked_messages() {
         let mut h = HalfStream { buf: b"POST /inform HTTP/1.1\r\nContent-Length: 3\r\n\r\nabcPOST /inform HTTP/1.1\r\nContent-Le".to_vec(), ..Default::default() };
         match h.take_http(true) {
-            Some(Parsed::Request { path, body, .. }) => {
-                assert_eq!(path, "/inform");
+            Some(Parsed::Request { inform, body, .. }) => {
+                assert!(inform);
                 assert_eq!(body, b"abc");
             }
             other => panic!("{other:?}"),
@@ -612,6 +624,26 @@ mod tests {
         t.conns.extend((300..500u16).map(|p| (conn(p), Conn::default())));
         t.sweep(400_000_000);
         assert!(t.conns.is_empty(), "open ones after MAX_IDLE");
+    }
+
+    #[test]
+    fn messages_without_a_usable_length() {
+        // An unreadable Content-Length is skipped to the next message, not read as empty.
+        let mut h = HalfStream { buf: b"POST /inform HTTP/1.1\r\nContent-Length: x1\r\n\r\nabcPOST /inform HTTP/1.1\r\nContent-Length: 1\r\nX-Forwarded-For: 10.0.0.9\r\n\r\nz".to_vec(), ..Default::default() };
+        match h.take_http(true) {
+            Some(Parsed::Request { inform: true, forwarded_for, body }) => assert_eq!((forwarded_for.as_deref(), &body[..]), (Some("10.0.0.9"), &b"z"[..])),
+            other => panic!("{other:?}"),
+        }
+        // A GET without a length has no body, and is not an inform.
+        let mut h = HalfStream { buf: b"GET /status HTTP/1.1\r\n\r\n".to_vec(), ..Default::default() };
+        assert!(matches!(h.take_http(true), Some(Parsed::Request { inform: false, body, .. }) if body.is_empty()));
+        // A response without one runs until the connection closes.
+        let mut h = HalfStream { buf: b"HTTP/1.0 200 OK\r\n\r\nall of it".to_vec(), ..Default::default() };
+        assert!(h.take_http(false).is_none());
+        h.fin = true;
+        assert!(matches!(h.take_http(false), Some(Parsed::Response { status: 200, body }) if body == b"all of it"));
+        let mut h = HalfStream { buf: b"HTTP/1.1 204 No Content\r\n\r\n".to_vec(), ..Default::default() };
+        assert!(matches!(h.take_http(false), Some(Parsed::Response { status: 204, body }) if body.is_empty()));
     }
 
     #[test]

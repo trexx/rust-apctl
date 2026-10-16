@@ -63,15 +63,13 @@ impl Pairer {
 
     pub fn handle(&mut self, keys: &KeyStore, ev: HttpEvent) -> Option<InformEvent> {
         match ev {
-            HttpEvent::Request { conn, ts, method, path, headers, body } => {
-                if method != "POST" || !path.starts_with("/inform") {
+            HttpEvent::Request { conn, ts, inform, forwarded_for, body } => {
+                if !inform {
                     self.push(conn, ts, Pending::Other);
                     return None;
                 }
-                let peer = headers
-                    .iter()
-                    .find(|(k, _)| k.eq_ignore_ascii_case("x-forwarded-for"))
-                    .map(|(_, v)| v.split(',').next().unwrap_or("").trim().to_string())
+                let peer = forwarded_for
+                    .map(|v| v.split(',').next().unwrap_or("").trim().to_string())
                     .unwrap_or_else(|| conn.client.ip().to_string());
                 let decoded = decode(&body, keys, None);
                 let mac = match &decoded {
@@ -81,13 +79,12 @@ impl Pairer {
                 self.push(conn, ts, Pending::Inform(mac));
                 Some(InformEvent::Inform { ts, peer, mac, decoded })
             }
-            HttpEvent::Response { conn, ts, status, body, .. } => {
+            HttpEvent::Response { conn, ts, status, body } => {
                 let mac = match self.pop(conn) {
                     Some(Pending::Inform(mac)) => mac,
-                    Some(Pending::Other) => return None,
                     // The request was not captured: only look at bodies that are inform packets.
                     None if body.starts_with(inform::MAGIC) => None,
-                    None => return None,
+                    Some(Pending::Other) | None => return None,
                 };
                 let decoded = (!body.is_empty()).then(|| decode(&body, keys, mac));
                 Some(InformEvent::Reply { ts, mac, status, decoded })
@@ -107,11 +104,11 @@ mod tests {
     }
 
     fn get(c: ConnId, ts: Micros) -> HttpEvent {
-        HttpEvent::Request { conn: c, ts, method: "GET".into(), path: "/status".into(), headers: Vec::new(), body: Vec::new() }
+        HttpEvent::Request { conn: c, ts, inform: false, forwarded_for: None, body: Vec::new() }
     }
 
     fn ok(c: ConnId, ts: Micros) -> HttpEvent {
-        HttpEvent::Response { conn: c, ts, status: 200, headers: Vec::new(), body: b"{}".to_vec() }
+        HttpEvent::Response { conn: c, ts, status: 200, body: b"{}".to_vec() }
     }
 
     #[test]
