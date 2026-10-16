@@ -90,26 +90,43 @@ struct Session {
     fingerprint: Option<String>,
 }
 
+/// How long each step (connecting, a login attempt, a command) may take.
+const STEP_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// A connection with the host key checked, and the key's fingerprint.
+async fn open(config: &Arc<russh::client::Config>, ip: &str, port: u16, expected: &Option<String>) -> Result<(russh::client::Handle<Client>, Arc<Mutex<Option<String>>>), Failure> {
+    let seen = Arc::new(Mutex::new(None));
+    let client = Client { expected: expected.clone(), seen: seen.clone() };
+    match tokio::time::timeout(Duration::from_secs(5), russh::client::connect(config.clone(), (ip, port), client)).await {
+        Err(_) => Err(Failure::Unreachable("timed out".into())),
+        Ok(Err(russh::Error::UnknownKey)) => Err(Failure::HostKey),
+        Ok(Err(e)) => Err(Failure::Unreachable(e.to_string())),
+        Ok(Ok(h)) => Ok((h, seen)),
+    }
+}
+
+/// Logs in with each username and password in turn, on one connection while
+/// the AP keeps it open after a refusal (a new one when it doesn't).
 async fn connect(ip: &str, port: u16, logins: &[(String, String)], expected: Option<String>) -> Result<Session, Failure> {
     let config = Arc::new(russh::client::Config { inactivity_timeout: Some(Duration::from_secs(20)), ..Default::default() });
     let mut last = Failure::Login;
+    let mut open_conn = None;
     for (user, pass) in logins {
-        let seen = Arc::new(Mutex::new(None));
-        let client = Client { expected: expected.clone(), seen: seen.clone() };
-        let connecting = russh::client::connect(config.clone(), (ip, port), client);
-        let mut handle = match tokio::time::timeout(Duration::from_secs(5), connecting).await {
-            Err(_) => return Err(Failure::Unreachable("timed out".into())),
-            Ok(Err(russh::Error::UnknownKey)) => return Err(Failure::HostKey),
-            Ok(Err(e)) => return Err(Failure::Unreachable(e.to_string())),
-            Ok(Ok(h)) => h,
+        let (mut handle, seen) = match open_conn.take() {
+            Some(c) => c,
+            None => open(&config, ip, port, &expected).await?,
         };
-        match handle.authenticate_password(user, pass).await {
-            Ok(r) if r.success() => {
+        match tokio::time::timeout(STEP_TIMEOUT, handle.authenticate_password(user, pass)).await {
+            Ok(Ok(r)) if r.success() => {
                 let fingerprint = seen.lock().unwrap().clone();
                 return Ok(Session { handle, fingerprint });
             }
-            Ok(_) => last = Failure::Login,
-            Err(e) => last = Failure::Unreachable(e.to_string()),
+            Ok(Ok(_)) => {
+                last = Failure::Login;
+                open_conn = Some((handle, seen));
+            }
+            Ok(Err(e)) => last = Failure::Unreachable(e.to_string()),
+            Err(_) => last = Failure::Unreachable("timed out".into()),
         }
     }
     Err(last)
@@ -118,12 +135,12 @@ async fn connect(ip: &str, port: u16, logins: &[(String, String)], expected: Opt
 impl Session {
     /// Runs a command and returns what it printed; an error if it exited
     /// non-zero or didn't finish in time.
-    async fn run(&mut self, cmd: &str) -> Result<String, Failure> {
-        let mut ch = self.handle.channel_open_session().await.map_err(|e| Failure::Command(e.to_string()))?;
-        ch.exec(true, cmd).await.map_err(|e| Failure::Command(e.to_string()))?;
+    async fn run(&self, cmd: &str) -> Result<String, Failure> {
         let mut out = Vec::new();
         let mut status = None;
-        let read = async {
+        let run = async {
+            let mut ch = self.handle.channel_open_session().await.map_err(|e| Failure::Command(e.to_string()))?;
+            ch.exec(true, cmd).await.map_err(|e| Failure::Command(e.to_string()))?;
             // The exit status comes after the end of the output, so read until the channel closes.
             while let Some(msg) = ch.wait().await {
                 match msg {
@@ -133,10 +150,9 @@ impl Session {
                     _ => {}
                 }
             }
+            Ok(())
         };
-        if tokio::time::timeout(Duration::from_secs(15), read).await.is_err() {
-            return Err(Failure::Command("timed out".into()));
-        }
+        tokio::time::timeout(STEP_TIMEOUT, run).await.map_err(|_| Failure::Command("timed out".into()))??;
         let out = String::from_utf8_lossy(&out).into_owned();
         match status {
             Some(code) if code != 0 => Err(Failure::Command(format!("exit status {code}: {}", out.trim()))),
@@ -221,7 +237,7 @@ pub async fn adopt(State(s): State<AppState>, headers: HeaderMap, Json(b): Json<
     // A known AP keeps its host key, checked before any password is sent; a new one is trusted the first time.
     let expected = known_host_key(&s.live.read().unwrap(), &b.ip);
     let connected = connect(&b.ip, b.port.unwrap_or(22), &logins(state.as_deref(), given.clone()), expected.as_ref().map(|e| e.1.clone())).await;
-    let mut session = match (connected, &expected) {
+    let session = match (connected, &expected) {
         (Err(Failure::HostKey), Some((mac, _))) => {
             let _ = s.engine.send(Input::Note(Event::device(store::now_ts(), "ap_host_key_mismatch", *mac, json!({ "ip": b.ip })))).await;
             return Err(bad(Failure::HostKey));
@@ -247,6 +263,7 @@ pub async fn adopt(State(s): State<AppState>, headers: HeaderMap, Json(b): Json<
         "hostname": board_value(&board, "board.name"), "inform_url": url,
     });
     let fingerprint = session.fingerprint.clone();
+    let new = known.is_none();
     crate::actions::edit_settings(&s, format!("adopting {mac} over SSH"), move |st| {
         crate::adopt::adopt_device(st, &mac, &payload)?;
         let d = crate::adopt::device_doc_mut(st, &mac).ok_or("no record")?;
@@ -264,7 +281,16 @@ pub async fn adopt(State(s): State<AppState>, headers: HeaderMap, Json(b): Json<
         live.state.as_deref().and_then(|st| crate::adopt::device_doc(st, &mac)).and_then(|d| d["x_authkey"].as_str().map(str::to_string))
     }
     .ok_or_else(|| ApiError::internal("the new record has no key"))?;
-    let out = session.run(&format!("/usr/bin/syswrapper.sh set-adopt {} {}", shell_quote(&url), shell_quote(&key))).await.map_err(bad)?;
+    let out = match session.run(&format!("/usr/bin/syswrapper.sh set-adopt {} {}", shell_quote(&url), shell_quote(&key))).await {
+        Ok(out) => out,
+        Err(f) => {
+            // Not adopted after all: a record made for it would make it look like one of ours.
+            if new {
+                let _ = crate::actions::edit_settings(&s, format!("removed {mac}: adopting it over SSH failed"), move |st| crate::adopt::remove_device(st, &mac).map(|_| ())).await;
+            }
+            return Err(bad(f));
+        }
+    };
     s.live.write().unwrap().adoption.adopting.insert(mac, store::now_ts());
     let _ = s.engine.send(Input::Note(Event::device(store::now_ts(), "ap_adopting", mac, json!({ "ip": b.ip, "via": "ssh" })))).await;
     tracing::info!("{mac}: set-adopt {url} sent over SSH ({})", out.trim());

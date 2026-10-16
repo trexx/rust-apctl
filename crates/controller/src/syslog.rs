@@ -15,10 +15,14 @@
 //!
 //! The key is the device's 64-hex `syslog_key`.
 
+use std::sync::{Arc, Weak};
+
 use aes_gcm::aead::{Aead, KeyInit, Payload};
 use aes_gcm::{Aes256Gcm, Nonce};
 use anyhow::{Result, anyhow, bail};
 use inform::Mac;
+use serde_json::Value;
+use wire::keys::KeyStore;
 
 use crate::engine::LogLine;
 use crate::model::Ts;
@@ -58,13 +62,54 @@ pub fn open(datagram: &[u8], lookup: impl Fn(&str) -> Option<(Mac, [u8; 32])>) -
 
 /// Decrypts an encrypted datagram with `mac`'s syslog key.
 pub fn decrypt(datagram: &[u8], mac: Mac, key: &[u8; 32]) -> Result<String> {
+    decrypt_with(datagram, mac, &Aes256Gcm::new(key.into()))
+}
+
+/// Decrypts an encrypted datagram with `mac`'s cipher (see [`Ciphers`]).
+pub fn decrypt_with(datagram: &[u8], mac: Mac, cipher: &Aes256Gcm) -> Result<String> {
     if !datagram.starts_with(&MAGIC) || datagram.len() < HEADER + 16 {
         bail!("not an encrypted syslog datagram ({} bytes)", datagram.len());
     }
-    let plain = Aes256Gcm::new(key.into())
+    let plain = cipher
         .decrypt(&Nonce::try_from(&datagram[17..29]).expect("12 bytes"), Payload { msg: &datagram[HEADER..], aad: &datagram[..HEADER] })
         .map_err(|_| anyhow!("syslog decryption failed for {mac}"))?;
     Ok(String::from_utf8_lossy(&plain).into_owned())
+}
+
+/// The ciphers of every syslog key known (`adopt::syslog_keys`: the settings'
+/// before the key file's), set up once per version of the settings rather
+/// than for each datagram.
+#[derive(Default)]
+pub struct Ciphers {
+    /// The settings they were made from, once made. Compared by address: the
+    /// Weak keeps that address from being reused without keeping the settings.
+    from: Option<Option<Weak<Value>>>,
+    keys: Vec<(Mac, Aes256Gcm)>,
+}
+
+impl Ciphers {
+    /// Makes the ciphers again if the settings changed since the last call.
+    pub fn refresh(&mut self, state: Option<&Arc<Value>>, keys: &KeyStore) {
+        let same = match (&self.from, state) {
+            (Some(None), None) => true,
+            (Some(Some(w)), Some(s)) => std::ptr::eq(w.as_ptr(), Arc::as_ptr(s)),
+            _ => false,
+        };
+        if !same {
+            self.from = Some(state.map(Arc::downgrade));
+            self.keys = crate::adopt::syslog_keys(state.map(|s| &**s), keys).into_iter().map(|(m, k)| (m, Aes256Gcm::new(&k.into()))).collect();
+        }
+    }
+
+    /// The AP's cipher: its record's key, else the key file's.
+    pub fn get(&self, mac: &Mac) -> Option<&Aes256Gcm> {
+        self.keys.iter().find(|(m, _)| m == mac).map(|(_, c)| c)
+    }
+
+    /// Every key, to find whose a datagram is.
+    pub fn all(&self) -> impl Iterator<Item = (Mac, &Aes256Gcm)> {
+        self.keys.iter().map(|(m, c)| (*m, c))
+    }
 }
 
 /// Splits a syslog message into priority, program and text. Handles
@@ -138,6 +183,25 @@ pub(crate) mod tests {
         assert!(open(&dgram, |_| Some((mac, [8u8; 32]))).is_err(), "wrong key");
         assert!(open(&dgram, |_| None).is_err(), "unknown device");
         assert_eq!(open(b"plain text", lookup).unwrap(), (None, "plain text".to_string()));
+    }
+
+    #[test]
+    fn ciphers_follow_the_settings_without_keeping_them() {
+        let ap: Mac = "02:00:00:00:00:02".parse().unwrap();
+        let mut keys = KeyStore::default();
+        keys.insert_syslog("02:00:00:00:00:01", &hex::encode([1u8; 32])).unwrap();
+        let mut c = Ciphers::default();
+        c.refresh(None, &keys);
+        assert_eq!(c.all().count(), 1, "the key file's");
+        let state = Arc::new(serde_json::json!({ "devices": [{ "mac": "02:00:00:00:00:02", "syslog_key": hex::encode([5u8; 32]) }] }));
+        c.refresh(Some(&state), &keys);
+        let dgram = tests::seal([3; 8], [5; 32], "<14>hostapd: hello");
+        assert!(decrypt_with(&dgram, ap, c.get(&ap).unwrap()).is_ok());
+        assert_eq!(Arc::strong_count(&state), 1, "the settings are not held");
+        // Another version of the settings, even an equal one, is read again.
+        let other = Arc::new(serde_json::json!({ "devices": [] }));
+        c.refresh(Some(&other), &keys);
+        assert!(c.get(&ap).is_none());
     }
 
     #[test]

@@ -35,8 +35,9 @@ pub enum Input {
     SetState { ts: Ts, state: Value },
     /// Active mode: the section numbering a render allocated for an AP.
     SetConfigMeta { mac: Mac, meta: Value },
-    /// Active mode: apctl itself pushed this `setparam` to an AP.
-    ConfigPushed { ts: Ts, mac: Mac, payload: Value },
+    /// Active mode: apctl itself sent this reply to an AP (a `setparam`, or a
+    /// reply that sets its inform interval).
+    Replied { ts: Ts, mac: Mac, payload: Value },
     /// Set or clear clients' aliases and notes (None clears): one, or a bulk
     /// import. `only_if_unset` leaves existing aliases alone (for imports).
     SetAliases { ts: Ts, entries: Vec<AliasEdit>, only_if_unset: bool },
@@ -323,6 +324,8 @@ pub struct Engine {
     /// Syslog hash_ids that none of the keys opened, and when that was tried.
     /// Time or new settings (which may hold new keys) clear an entry.
     syslog_unknown: HashMap<String, Ts>,
+    /// The syslog keys, ready to decrypt with.
+    syslog_ciphers: crate::syslog::Ciphers,
     /// Where alert-worthy events go: the alert watcher's own channel.
     alerts: Option<crate::alerts::Sink>,
 }
@@ -336,7 +339,7 @@ impl Engine {
         Engine {
             writer, keys, renderer: None, live, counters, tx, radios: HashMap::new(), mcast_prev: HashMap::new(), bss_prev: HashMap::new(),
             logevents: Default::default(), isolated: HashMap::new(), last_prune: 0, written: Default::default(), syslog_unknown: HashMap::new(),
-            alerts: None,
+            syslog_ciphers: Default::default(), alerts: None,
         }
     }
 
@@ -431,7 +434,7 @@ impl Engine {
         match input {
             Input::Inform { ts, peer, decoded } => self.inform(ts, peer, decoded),
             Input::Reply { ts, mac, decoded } => self.reply(ts, mac, &decoded.payload, true),
-            Input::ConfigPushed { ts, mac, payload } => self.reply(ts, mac, &payload, false),
+            Input::Replied { ts, mac, payload } => self.reply(ts, mac, &payload, false),
             Input::SetConfigMeta { mac, meta } => self.set_config_meta(mac, meta),
             Input::Datagram { ts, src_ip, payload } => self.datagram(ts, src_ip, &payload),
             Input::Tick(now) => self.tick(now),
@@ -1036,12 +1039,12 @@ impl Engine {
 
     /// Decrypts a datagram from the AP with this `hash_id`: with the key of the
     /// AP known by it, else by trying each key.
-    fn decrypt_syslog(&mut self, ts: Ts, payload: &[u8], hash_id: String, by_hash: Option<Mac>) -> anyhow::Result<(Mac, String)> {
+    fn decrypt_syslog(&mut self, ts: Ts, payload: &[u8], hash_id: String, by_hash: Option<Mac>, state: Option<&Arc<Value>>) -> anyhow::Result<(Mac, String)> {
         // Keys come from the settings (APs apctl adopted) and the key file.
-        let state = self.live.read().unwrap().state.clone();
+        self.syslog_ciphers.refresh(state, &self.keys);
         if let Some(mac) = by_hash
-            && let Some(key) = crate::adopt::syslog_key(state.as_deref(), &self.keys, &mac)
-            && let Ok(text) = crate::syslog::decrypt(payload, mac, &key)
+            && let Some(cipher) = self.syslog_ciphers.get(&mac)
+            && let Ok(text) = crate::syslog::decrypt_with(payload, mac, cipher)
         {
             return Ok((mac, text));
         }
@@ -1054,8 +1057,8 @@ impl Engine {
         {
             anyhow::bail!("no syslog key for hash_id {hash_id} (none worked {}s ago)", ts - at);
         }
-        for (mac, key) in crate::adopt::syslog_keys(state.as_deref(), &self.keys) {
-            if let Ok(text) = crate::syslog::decrypt(payload, mac, &key) {
+        for (mac, cipher) in self.syslog_ciphers.all() {
+            if let Ok(text) = crate::syslog::decrypt_with(payload, mac, cipher) {
                 self.syslog_unknown.remove(&hash_id);
                 self.live.write().unwrap().by_hash_id.insert(hash_id, mac);
                 return Ok((mac, text));
@@ -1071,12 +1074,12 @@ impl Engine {
     fn datagram(&mut self, ts: Ts, src_ip: String, payload: &[u8]) {
         // Encrypted datagrams name their sender by hash_id; plain ones are passed through.
         let hash_id = crate::syslog::hash_id(payload);
-        let (by_hash, by_ip) = {
+        let (by_hash, by_ip, state) = {
             let live = self.live.read().unwrap();
-            (hash_id.as_ref().and_then(|h| live.by_hash_id.get(h).copied()), live.by_ip.get(&src_ip).copied())
+            (hash_id.as_ref().and_then(|h| live.by_hash_id.get(h).copied()), live.by_ip.get(&src_ip).copied(), hash_id.as_ref().and(live.state.clone()))
         };
         let result = match hash_id {
-            Some(h) => self.decrypt_syslog(ts, payload, h, by_hash).map(|(mac, text)| (Some(mac), text)),
+            Some(h) => self.decrypt_syslog(ts, payload, h, by_hash, state.as_ref()).map(|(mac, text)| (Some(mac), text)),
             None => crate::syslog::open(payload, |_| None),
         };
         match result {
