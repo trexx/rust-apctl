@@ -1270,8 +1270,7 @@ export function useLiveUpdates(): void {
           break;
         }
         case "alert":
-          invalidate(keys.alerts());
-          // The server stores alerts within a second of announcing them: look again then.
+          // The server stores alerts within a second of announcing them: look then.
           window.clearTimeout(alertTimer);
           alertTimer = window.setTimeout(() => void qc.invalidateQueries({ queryKey: keys.alerts() }), 1500);
           // The notifier decides whether this browser shows it.
