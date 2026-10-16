@@ -379,11 +379,16 @@ async fn radio_health(store: &Arc<Store>, now: Ts) -> anyhow::Result<HashMap<(St
         store.read(Db::Metrics, |c| {
             let from = now - HEALTH_WINDOW;
             let mut out: HashMap<(String, String), RadioHealth> = HashMap::new();
-            let mut stmt = c.prepare("SELECT mac, radio, AVG(cu_total), AVG(cu_interf), COUNT(*) FROM radio_stats WHERE ts >= ?1 GROUP BY mac, radio")?;
-            for row in stmt.query_map([from], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, Option<f64>>(2)?, r.get::<_, Option<f64>>(3)?, r.get::<_, i64>(4)?)))? {
-                let (mac, radio, cu, interf, n) = row?;
+            let mut stmt = c.prepare("SELECT mac, radio, AVG(cu_total), AVG(cu_interf), COUNT(*), MIN(ts), MAX(ts) FROM radio_stats WHERE ts >= ?1 GROUP BY mac, radio")?;
+            let rows = stmt.query_map([from], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, Option<f64>>(2)?, r.get::<_, Option<f64>>(3)?, r.get::<_, i64>(4)?, r.get::<_, Ts>(5)?, r.get::<_, Ts>(6)?))
+            })?;
+            for row in rows {
+                let (mac, radio, cu, interf, n, first, last) = row?;
                 // Only judge a radio that reported through most of the window.
-                if n >= 30 {
+                // By time, not by count: an AP informs every 5 s per AP on the
+                // site, so with many APs a window holds only a dozen reports.
+                if n >= 3 && last - first >= HEALTH_WINDOW * 2 / 3 {
                     let h = out.entry((mac, radio)).or_default();
                     h.utilisation = cu;
                     h.interference = interf;
@@ -869,6 +874,31 @@ mod tests {
         assert_eq!(stale_health(&book, &HashSet::new(), &mut unjudged, &known), vec![k.clone()]);
         // An AP that is gone closes at once; the site-wide alert is never stale.
         assert_eq!(stale_health(&book, &HashSet::new(), &mut HashMap::new(), &HashSet::new()), vec![k]);
+    }
+
+    #[tokio::test]
+    async fn radios_are_judged_when_they_reported_through_the_window() {
+        let (w, _rx) = watcher();
+        let now = 100_000;
+        let row = |radio: &str, ts: Ts| {
+            let sql = "INSERT INTO radio_stats (mac, radio, ts, cu_total, cu_interf) VALUES ('02:00:00:00:00:01', ?1, ?2, 90, 10)";
+            w.book.writer.exec(Db::Metrics, sql, vec![Sql::Text(radio.into()), Sql::Integer(ts)]);
+        };
+        // One report every 75 s, as from a site of 15 APs: 12 in the window.
+        for i in 0..12 {
+            row("na", now - 30 - i * 75);
+        }
+        // Many reports, but only over the last two minutes.
+        for i in 0..40 {
+            row("ng", now - i * 3);
+        }
+        // Too few to judge.
+        row("6e", now - 800);
+        row("6e", now);
+        assert!(w.book.writer.flush(Duration::from_secs(5)));
+        let h = radio_health(&w.store, now).await.unwrap();
+        let judged = |radio: &str| h.get(&("02:00:00:00:00:01".to_string(), radio.to_string())).and_then(|h| h.utilisation);
+        assert_eq!((judged("na"), judged("ng"), judged("6e")), (Some(90.0), None, None));
     }
 
     #[test]
