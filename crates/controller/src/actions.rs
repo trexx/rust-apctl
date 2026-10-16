@@ -122,6 +122,14 @@ impl<'a> ClientControls<'a> {
     }
 }
 
+/// The AP a device action is for: active mode, and an AP apctl has heard from.
+fn target_ap(s: &AppState, mac: &str) -> Result<Mac, ApiError> {
+    crate::api::require_active(s, "this needs")?;
+    let mac = crate::api::parse_mac(mac)?;
+    known_ap(s, &mac)?;
+    Ok(mac)
+}
+
 fn known_ap(s: &AppState, mac: &Mac) -> Result<(), ApiError> {
     if s.live.read().unwrap().devices.contains_key(mac) {
         Ok(())
@@ -136,9 +144,7 @@ async fn note(s: &AppState, kind: &'static str, mac: Mac, data: Value) {
 
 /// POST /api/devices/{mac}/restart
 pub async fn restart(State(s): State<AppState>, Path(mac): Path<String>) -> Result<Json<Value>, ApiError> {
-    crate::api::require_active(&s, "this needs")?;
-    let mac = crate::api::parse_mac(&mac)?;
-    known_ap(&s, &mac)?;
+    let mac = target_ap(&s, &mac)?;
     queue(&mut s.live.write().unwrap(), mac, json!({ "_type": "reboot", "reboot_type": "soft" }));
     note(&s, "ap_restart_requested", mac, json!({})).await;
     Ok(Json(json!({ "queued": true })))
@@ -151,9 +157,7 @@ pub struct LocateBody {
 
 /// POST /api/devices/{mac}/locate {on}
 pub async fn locate(State(s): State<AppState>, Path(mac): Path<String>, Json(b): Json<LocateBody>) -> Result<Json<Value>, ApiError> {
-    crate::api::require_active(&s, "this needs")?;
-    let mac = crate::api::parse_mac(&mac)?;
-    known_ap(&s, &mac)?;
+    let mac = target_ap(&s, &mac)?;
     let mut live = s.live.write().unwrap();
     queue(&mut live, mac, json!({ "_type": "cmd", "cmd": if b.on { "set-locate" } else { "unset-locate" } }));
     if b.on {
@@ -166,9 +170,7 @@ pub async fn locate(State(s): State<AppState>, Path(mac): Path<String>, Json(b):
 
 /// POST /api/devices/{mac}/provision: send the AP its config again.
 pub async fn provision(State(s): State<AppState>, Path(mac): Path<String>) -> Result<Json<Value>, ApiError> {
-    crate::api::require_active(&s, "this needs")?;
-    let mac = crate::api::parse_mac(&mac)?;
-    known_ap(&s, &mac)?;
+    let mac = target_ap(&s, &mac)?;
     s.live.write().unwrap().reprovision.insert(mac);
     note(&s, "ap_provision_requested", mac, json!({})).await;
     Ok(Json(json!({ "queued": true })))
@@ -263,9 +265,7 @@ pub async fn edit_settings(s: &AppState, what: String, edit: impl FnOnce(&mut Va
 /// `edit_settings` for an edit that itself says what it changed (worked out
 /// on the settings as the engine has them); returns that.
 pub async fn apply_edit(s: &AppState, edit: crate::engine::StateEdit) -> Result<String, ApiError> {
-    if s.live.read().unwrap().state.is_none() {
-        return Err(ApiError(StatusCode::CONFLICT, "no settings imported yet".into()));
-    }
+    crate::api::current_state(s)?;
     let (tx, rx) = tokio::sync::oneshot::channel();
     s.ask(Input::EditState { ts: store::now_ts(), edit, done: tx }, rx).await?.map_err(|e| ApiError(StatusCode::BAD_REQUEST, e))
 }

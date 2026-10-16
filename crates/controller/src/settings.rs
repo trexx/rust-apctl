@@ -32,7 +32,7 @@ pub type Apply<B> = fn(&mut Value, &B) -> Result<String, String>;
 /// returns what changed in words (for the event and the config history).
 pub(crate) async fn change<B: Send + 'static>(s: &AppState, q: &PreviewQuery, apply: Apply<B>, body: B) -> Result<Json<Value>, ApiError> {
     if q.preview {
-        let current = s.live.read().unwrap().state.clone().ok_or_else(|| ApiError(StatusCode::CONFLICT, "no settings imported yet".into()))?;
+        let current = crate::api::current_state(s)?;
         let mut edited = (*current).clone();
         let what = apply(&mut edited, &body).map_err(|e| ApiError(StatusCode::BAD_REQUEST, e))?;
         return Ok(Json(json!({ "what": what, "aps": preview(s, current, edited).await? })));
@@ -267,7 +267,7 @@ fn feature_support(state: &Value, informs: &HashMap<inform::Mac, std::sync::Arc<
 
 /// GET /api/settings/wlans/{id}/passphrase: shown on request only.
 pub async fn passphrase(State(s): State<AppState>, Path(id): Path<String>) -> Result<Json<Value>, ApiError> {
-    let state = s.live.read().unwrap().state.clone().ok_or_else(|| ApiError(StatusCode::CONFLICT, "no settings imported yet".into()))?;
+    let state = crate::api::current_state(&s)?;
     let w = docs(&state, "wlanconf").find(|w| id_of(w).as_deref() == Some(id.as_str())).ok_or_else(|| ApiError(StatusCode::NOT_FOUND, "unknown SSID".into()))?;
     Ok(Json(json!({ "passphrase": w["x_passphrase"] })))
 }
@@ -300,7 +300,7 @@ pub async fn device(State(s): State<AppState>, Path(mac): Path<String>) -> Resul
         let live = s.live.read().unwrap();
         (live.state.clone(), m.and_then(|m| live.raw_informs.get(&m).cloned()))
     };
-    let state = state.ok_or_else(|| ApiError(StatusCode::CONFLICT, "no settings imported yet".into()))?;
+    let state = state.ok_or_else(ApiError::no_state)?;
     let d = m.and_then(|m| crate::adopt::device_doc(&state, &m)).ok_or_else(|| ApiError(StatusCode::NOT_FOUND, "this AP is not in the settings".into()))?;
     let radios: Vec<Value> = d["radio_table"]
         .as_array()

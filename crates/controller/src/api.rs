@@ -123,11 +123,21 @@ pub fn require_active(s: &AppState, what: &str) -> Result<(), ApiError> {
     if s.active { Ok(()) } else { Err(ApiError(StatusCode::CONFLICT, format!("{what} active mode: in shadow mode apctl never talks to the APs"))) }
 }
 
+/// The imported settings, as they are now.
+pub fn current_state(s: &AppState) -> Result<Arc<Value>, ApiError> {
+    s.live.read().unwrap().state.clone().ok_or_else(ApiError::no_state)
+}
+
 pub struct ApiError(pub StatusCode, pub String);
 
 impl ApiError {
     pub fn internal(msg: impl Into<String>) -> Self {
         ApiError(StatusCode::INTERNAL_SERVER_ERROR, msg.into())
+    }
+
+    /// Nothing to work on: no settings were imported yet.
+    pub fn no_state() -> Self {
+        ApiError(StatusCode::CONFLICT, "no settings imported yet".into())
     }
 
     /// The engine thread is gone (it ended, or panicked).

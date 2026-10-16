@@ -5,7 +5,6 @@
 
 use axum::Json;
 use axum::extract::{Query, State};
-use axum::http::StatusCode;
 use serde_json::{Value, json};
 use std::collections::HashMap;
 
@@ -307,7 +306,7 @@ fn ssh_keys(v: &Value) -> Result<Vec<Value>, String> {
 
 /// GET /api/settings/site
 pub async fn get_site(State(s): State<AppState>) -> Result<Json<Value>, ApiError> {
-    let state = s.live.read().unwrap().state.clone().ok_or_else(|| ApiError(StatusCode::CONFLICT, "no settings imported yet".into()))?;
+    let state = crate::api::current_state(&s)?;
     let m = setting(&state, "mgmt");
     let mut mgmt = json!({ "has_ssh_password": m["x_ssh_password"].as_str().is_some_and(|p| !p.is_empty()) });
     for k in ["led_enabled", "outdoor_mode_enabled", "x_ssh_enabled", "x_ssh_username", "x_ssh_auth_password_enabled", "x_ssh_bind_wildcard", "x_ssh_keys"] {
