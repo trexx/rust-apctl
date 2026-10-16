@@ -111,9 +111,11 @@ pub fn router(state: AppState) -> Router {
         .route("/api/series/{table}", get(series))
         .route("/api/events", get(events))
         .route("/api/logs", get(logs))
-        .route("/api/ws", get(ws))
         .route_layer(axum::middleware::from_fn_with_state(state.clone(), crate::auth::require_login));
-    public.merge(protected).fallback(crate::web::handler).with_state(state)
+    // The live socket is added after compression, which must not touch an upgrade.
+    let socket = Router::new().route("/api/ws", get(ws)).route_layer(axum::middleware::from_fn_with_state(state.clone(), crate::auth::require_login));
+    // JSON and the UI's scripts and styles compress well (gzip only; images are left alone).
+    public.merge(protected).fallback(crate::web::handler).layer(tower_http::compression::CompressionLayer::new()).merge(socket).with_state(state)
 }
 
 pub struct ApiError(pub StatusCode, pub String);
@@ -530,7 +532,7 @@ struct SeriesQuery {
     to: Option<Ts>,
 }
 
-async fn series(State(s): State<AppState>, Path(table): Path<String>, Query(q): Query<SeriesQuery>) -> ApiResult {
+async fn series(State(s): State<AppState>, Path(table): Path<String>, Query(q): Query<SeriesQuery>) -> Result<Json<store::Series>, ApiError> {
     let t = store::table(&table).ok_or_else(|| bad(format!("unknown series {table}")))?;
     let keys: Vec<String> = q.key.split(',').map(str::to_string).collect();
     if keys.len() != t.keys.len() {
@@ -538,10 +540,10 @@ async fn series(State(s): State<AppState>, Path(table): Path<String>, Query(q): 
     }
     let now = store::now_ts();
     let to = q.to.unwrap_or(now);
-    let from = q.from.unwrap_or(to - 3600);
+    let from = q.from.unwrap_or(to.saturating_sub(3600));
+    let (from, to) = (from.min(to), from.max(to));
     let tier = store::tier_for(from, to, now);
-    let result = read(&s.store, Db::Metrics, move |c| store::series(c, t, &keys, from, to, tier)).await?;
-    Ok(Json(serde_json::to_value(result).unwrap_or_default()))
+    Ok(Json(read(&s.store, Db::Metrics, move |c| store::series(c, t, &keys, from, to, tier)).await?))
 }
 
 #[derive(Deserialize)]
@@ -582,14 +584,14 @@ async fn events(State(s): State<AppState>, Query(q): Query<EventQuery>) -> ApiRe
         cond.push(format!("ts < ?{}", params.len()));
     }
     let limit = q.limit.unwrap_or(200).clamp(1, 2000);
-    let sql = format!("SELECT ts, kind, device_mac, client_mac, data FROM events WHERE {} ORDER BY ts DESC, id DESC LIMIT {limit}", cond.join(" AND "));
+    let sql = format!("SELECT ts, kind, device_mac, client_mac, data, id FROM events WHERE {} ORDER BY ts DESC, id DESC LIMIT {limit}", cond.join(" AND "));
     let rows = read(&s.store, Db::Config, move |c| {
         let mut stmt = c.prepare(&sql)?;
         let rows = stmt
             .query_map(params_from_iter(params), |r| {
                 let data: Option<String> = r.get(4)?;
                 Ok(json!({
-                    "ts": r.get::<_, i64>(0)?, "kind": r.get::<_, String>(1)?,
+                    "id": r.get::<_, i64>(5)?, "ts": r.get::<_, i64>(0)?, "kind": r.get::<_, String>(1)?,
                     "device_mac": r.get::<_, Option<String>>(2)?, "client_mac": r.get::<_, Option<String>>(3)?,
                     "data": data.and_then(|d| serde_json::from_str::<Value>(&d).ok()),
                 }))
@@ -629,7 +631,7 @@ async fn logs(State(s): State<AppState>, Query(q): Query<LogQuery>) -> ApiResult
     }
     let limit = q.limit.unwrap_or(500).clamp(1, 5000);
     let sql = format!(
-        "SELECT l.ts, l.device_mac, l.src_ip, l.facility, l.severity, l.program, l.msg FROM logs l WHERE {} ORDER BY l.ts DESC, l.id DESC LIMIT {limit}",
+        "SELECT l.ts, l.device_mac, l.src_ip, l.facility, l.severity, l.program, l.msg, l.id FROM logs l WHERE {} ORDER BY l.ts DESC, l.id DESC LIMIT {limit}",
         cond.join(" AND ")
     );
     let rows = read(&s.store, Db::Logs, move |c| {
@@ -637,7 +639,7 @@ async fn logs(State(s): State<AppState>, Query(q): Query<LogQuery>) -> ApiResult
         let rows = stmt
             .query_map(params_from_iter(params), |r| {
                 Ok(json!({
-                    "ts": r.get::<_, i64>(0)?, "device_mac": r.get::<_, Option<String>>(1)?, "src_ip": r.get::<_, Option<String>>(2)?,
+                    "id": r.get::<_, i64>(7)?, "ts": r.get::<_, i64>(0)?, "device_mac": r.get::<_, Option<String>>(1)?, "src_ip": r.get::<_, Option<String>>(2)?,
                     "facility": r.get::<_, Option<i64>>(3)?, "severity": r.get::<_, Option<i64>>(4)?,
                     "program": r.get::<_, Option<String>>(5)?, "msg": r.get::<_, String>(6)?,
                 }))
@@ -677,5 +679,42 @@ async fn live_socket(mut socket: WebSocket, mut rx: broadcast::Receiver<LiveMsg>
                 _ => {}
             },
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::Body;
+    use axum::http::{Request, header};
+    use tower::ServiceExt;
+
+    fn app() -> Router {
+        let dir = std::env::temp_dir().join(format!("apctl-api-{}-{}", std::process::id(), store::now_ts()));
+        let (store, writer) = Store::open(&dir).unwrap();
+        let auth = Arc::new(crate::auth::Auth::new(Default::default(), &store, writer.clone(), Default::default()).unwrap());
+        let (engine, _) = tokio::sync::mpsc::channel(1);
+        let (tx, _) = broadcast::channel(1);
+        router(AppState {
+            store, vendors: Default::default(), renderer: None, auth, engine, live: Default::default(), tx, started: 0, source: "none".into(),
+            backups: None, active: false, writer: Some(writer),
+        })
+    }
+
+    async fn get(app: &Router, path: &str) -> Response {
+        let req = Request::get(path).header(header::ACCEPT_ENCODING, "gzip").body(Body::empty()).unwrap();
+        app.clone().oneshot(req).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn json_is_gzipped_and_the_live_socket_is_not() {
+        let app = app();
+        let res = get(&app, "/api/status").await;
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(res.headers().get(header::CONTENT_ENCODING).map(|v| v.to_str().unwrap()), Some("gzip"));
+        // Not an upgrade request, so refused; but never compressed either.
+        let res = get(&app, "/api/ws").await;
+        assert!(res.headers().get(header::CONTENT_ENCODING).is_none());
+        assert_eq!(get(&app, "/healthz").await.status(), StatusCode::OK);
     }
 }

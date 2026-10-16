@@ -27,10 +27,10 @@ const CHANGED_ADDRESS: u16 = 0x0005;
 const XOR_MAPPED_ADDRESS: u16 = 0x0020;
 const MAGIC_COOKIE: u32 = 0x2112_A442;
 
-fn address(out: &mut Vec<u8>, kind: u16, addr: SocketAddr, xor: Option<&[u8]>) {
+fn address(out: &mut Vec<u8>, kind: u16, addr: SocketAddr, xor: bool) {
     let IpAddr::V4(ip) = addr.ip() else { return };
     let (mut port, mut ip) = (addr.port(), u32::from(ip));
-    if xor.is_some() {
+    if xor {
         port ^= (MAGIC_COOKIE >> 16) as u16;
         ip ^= MAGIC_COOKIE;
     }
@@ -54,11 +54,11 @@ pub fn answer(req: &[u8], from: SocketAddr, local: SocketAddr) -> Option<Vec<u8>
     // Bytes 4-19: the transaction ID (RFC 5389 clients start it with the magic cookie).
     let modern = u32::from_be_bytes([req[4], req[5], req[6], req[7]]) == MAGIC_COOKIE;
     let mut attrs = Vec::new();
-    address(&mut attrs, MAPPED_ADDRESS, from, None);
-    address(&mut attrs, SOURCE_ADDRESS, local, None);
-    address(&mut attrs, CHANGED_ADDRESS, local, None);
+    address(&mut attrs, MAPPED_ADDRESS, from, false);
+    address(&mut attrs, SOURCE_ADDRESS, local, false);
+    address(&mut attrs, CHANGED_ADDRESS, local, false);
     if modern {
-        address(&mut attrs, XOR_MAPPED_ADDRESS, from, Some(&req[4..8]));
+        address(&mut attrs, XOR_MAPPED_ADDRESS, from, true);
     }
     let mut out = Vec::with_capacity(20 + attrs.len());
     out.extend_from_slice(&BINDING_RESPONSE.to_be_bytes());

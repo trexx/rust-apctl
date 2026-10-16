@@ -44,6 +44,9 @@ use wire::keys::KeyStore;
 
 use engine::{Engine, Input, SharedLive};
 
+/// The controller version rendered configs claim by default (`--emulate-version`).
+const EMULATE_VERSION: &str = "10.6.106";
+
 #[derive(Parser)]
 #[command(version, about = "Controller for UniFi access points")]
 struct Cli {
@@ -110,7 +113,7 @@ struct ServeArgs {
     pub users_file: Option<PathBuf>,
     /// Controller version to emulate in rendered configs (`unifi.version`). The dry run
     /// compares with the existing controller, so this should match its version.
-    #[arg(long, env = "APCTL_EMULATE_VERSION", default_value = "10.6.106")]
+    #[arg(long, env = "APCTL_EMULATE_VERSION", default_value = EMULATE_VERSION)]
     pub emulate_version: String,
     /// Active mode: answer the APs' informs and push config. Off by default;
     /// cannot be combined with shadow mode.
@@ -161,7 +164,7 @@ async fn main() -> Result<()> {
         Cmd::DebugRender { state, inform, mac, cfgversion } => {
             let state: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&state)?)?;
             let inform: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&inform)?)?;
-            let render = dryrun::apcfg_renderer("10.6.106".into());
+            let render = dryrun::apcfg_renderer(EMULATE_VERSION.into());
             let req = dryrun::RenderRequest { state: &state, device_mac: &mac, inform: Some(&inform), cfgversion: &cfgversion, previous_system_cfg: None };
             let (mgmt, system) = render(&req)?;
             println!("# mgmt_cfg\n{mgmt}\n# system_cfg\n{system}");
@@ -297,7 +300,10 @@ async fn serve(args: ServeArgs) -> Result<()> {
         if let Some(u) = &inform_url {
             ssh::set_inform_url(u.clone());
         }
-        let advertised = inform_url.as_deref().and_then(|u| u.split("://").nth(1)?.split([':', '/']).next()?.parse().ok());
+        let advertised = match &inform_url {
+            Some(u) => advertised_ip(u).await,
+            None => None,
+        };
         if let Err(e) = stun::serve(stun_listen, advertised).await {
             tracing::warn!("STUN not available on {stun_listen}: {e}");
         }
@@ -407,4 +413,29 @@ async fn shutdown(writer: store::Writer) {
         flush_writes(writer).await;
         std::process::exit(0);
     });
+}
+
+/// The address put in STUN answers: the host of the inform URL, resolved once
+/// (IPv4). None if it does not resolve; the socket's own address is used then.
+async fn advertised_ip(inform_url: &str) -> Option<std::net::IpAddr> {
+    let host = inform_url.split("://").nth(1)?.split([':', '/']).next()?;
+    if let Ok(ip) = host.parse() {
+        return Some(ip);
+    }
+    let lookup = tokio::time::timeout(Duration::from_secs(5), tokio::net::lookup_host((host, 0))).await;
+    match lookup.map(|r| r.map(|mut addrs| addrs.find(|a| a.is_ipv4()))) {
+        Ok(Ok(Some(a))) => Some(a.ip()),
+        Ok(Ok(None)) => {
+            tracing::warn!("{host} has no IPv4 address: STUN answers carry the socket's address");
+            None
+        }
+        Ok(Err(e)) => {
+            tracing::warn!("cannot resolve {host} ({e}): STUN answers carry the socket's address");
+            None
+        }
+        Err(_) => {
+            tracing::warn!("resolving {host} timed out: STUN answers carry the socket's address");
+            None
+        }
+    }
 }

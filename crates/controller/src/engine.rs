@@ -143,7 +143,7 @@ pub struct Alias {
     pub note: Option<String>,
 }
 
-#[derive(Default, Serialize)]
+#[derive(Default)]
 pub struct Live {
     pub devices: BTreeMap<Mac, DeviceView>,
     /// User-given client names, including clients not seen in this run.
@@ -151,41 +151,28 @@ pub struct Live {
     pub clients: BTreeMap<Mac, ClientView>,
     pub counters: Counters,
     /// For attributing syslog: an AP's `hash_id` and IP address.
-    #[serde(skip)]
     pub by_hash_id: HashMap<String, Mac>,
-    #[serde(skip)]
     pub by_ip: HashMap<String, Mac>,
     /// APs known from the database before their first inform in this process.
-    #[serde(skip)]
     pub known_devices: HashMap<Mac, KnownDevice>,
     /// Imported controller settings (contain secrets: never serialised).
-    #[serde(skip)]
     pub state: Option<Arc<Value>>,
-    #[serde(skip)]
     pub state_imported_at: Option<Ts>,
     /// Latest full inform per AP (capabilities and radios, for rendering).
-    #[serde(skip)]
     pub raw_informs: HashMap<Mac, Arc<Value>>,
     /// Firmware upgrades queued or in progress (one AP at a time).
-    #[serde(skip)]
     pub firmware: crate::firmware::Jobs,
     /// Commands waiting for each AP's next inform (restart, locate, kick...).
-    #[serde(skip)]
     pub commands: HashMap<Mac, std::collections::VecDeque<Value>>,
     /// APs told to flash their LED.
-    #[serde(skip)]
     pub locating: std::collections::HashSet<Mac>,
     /// APs to send their config again on the next inform.
-    #[serde(skip)]
     pub reprovision: std::collections::HashSet<Mac>,
     /// Quick scans (RF environment) asked of each AP and not finished yet.
-    #[serde(skip)]
     pub scans: HashMap<Mac, crate::channelai::Scan>,
     /// APs waiting for adoption, being adopted or being forgotten.
-    #[serde(skip)]
     pub adoption: crate::adopt::Adoption,
     /// Last config pushed to each AP by the other controller, unredacted.
-    #[serde(skip)]
     pub last_config: HashMap<Mac, (String, String, Option<String>)>,
 }
 
@@ -888,13 +875,13 @@ impl Engine {
                 opt_text(radio),
                 Sql::Text(event_type.clone()),
                 opt_text(text("auth_algo")),
-                opt_int(ms("assoc_delta")),
-                opt_int(ms("wpa_auth_delta")),
-                opt_int(ms("ip_delta")),
+                i(ms("assoc_delta")),
+                i(ms("wpa_auth_delta")),
+                i(ms("ip_delta")),
                 opt_text(text("ip_assign_type")),
-                opt_int(num("dns_responses").map(|v| v as i64)),
-                opt_int(num("dns_timeouts").map(|v| v as i64)),
-                opt_int(num("avg_rssi").or_else(|| num("auth_rssi")).map(|v| v as i64)),
+                i(num("dns_responses").map(|v| v as i64)),
+                i(num("dns_timeouts").map(|v| v as i64)),
+                i(num("avg_rssi").or_else(|| num("auth_rssi")).map(|v| v as i64)),
                 opt_text(text("sta_dc_reason")),
                 // The whole notification: failure counters and stage flags for connectivity stats.
                 Sql::Text(detail.to_string()),
@@ -905,14 +892,7 @@ impl Engine {
         let roamed = n["ip_assign_type"].as_str().is_some_and(|t| t.starts_with("roam"));
         if event_type == "failure" || (event_type == "soft failure" && !roamed) {
             let data = json!({ "essid": essid, "reason": n["sta_dc_reason"], "auth_algo": n["auth_algo"], "rssi": num("auth_rssi") });
-            let e = ev(ts, "client_connect_failed", Some(ap), Some(client), data);
-            live.counters.events += 1;
-            self.writer.exec(
-                Db::Config,
-                "INSERT INTO events (ts, kind, device_mac, client_mac, data) VALUES (?1, ?2, ?3, ?4, ?5)",
-                vec![Sql::Integer(e.ts), Sql::Text(e.kind.into()), Sql::Text(ap.to_string()), Sql::Text(client.to_string()), Sql::Text(e.data.to_string())],
-            );
-            let _ = self.tx.send(LiveMsg::Event(e));
+            self.emit(live, ev(ts, "client_connect_failed", Some(ap), Some(client), data));
         }
     }
 
@@ -988,20 +968,19 @@ impl Engine {
     /// Another AP's beacon flagged "isolated" (lost its uplink) that belongs to one
     /// of our APs: reported at most once an hour per AP.
     fn check_isolated(&mut self, ts: Ts, s: &Snapshot) {
-        let num = |m: &str| -> Option<u64> {
-            let m: Mac = m.parse().ok()?;
+        let num = |m: &Mac| -> u64 {
             let mut b = m.0;
             b[0] &= !0x02;
-            Some(b.iter().fold(0u64, |a, x| (a << 8) | u64::from(*x)))
+            b.iter().fold(0u64, |a, x| (a << 8) | u64::from(*x))
         };
         let flagged: Vec<&crate::model::NeighborSample> = s.neighbors.iter().filter(|n| n.is_isolated).collect();
         if flagged.is_empty() {
             return;
         }
         let mut live = self.live.write().unwrap();
-        let ours: Vec<(Mac, u64)> = live.devices.keys().filter_map(|m| num(&m.to_string()).map(|n| (*m, n))).collect();
+        let ours: Vec<(Mac, u64)> = live.devices.keys().map(|m| (*m, num(m))).collect();
         for n in flagged {
-            let Some(b) = num(&n.bssid) else { continue };
+            let Ok(b) = n.bssid.parse::<Mac>().map(|m| num(&m)) else { continue };
             let Some((ap, _)) = ours.iter().find(|(_, x)| x.abs_diff(b) <= 16) else { continue };
             if self.isolated.get(ap).is_some_and(|t| ts - t < 3600) {
                 continue;
@@ -1028,8 +1007,8 @@ impl Engine {
                 Sql::Integer(line.ts),
                 opt_text(line.device_mac.map(|m| m.to_string())),
                 Sql::Text(line.src_ip.clone()),
-                opt_int(line.facility),
-                opt_int(line.severity),
+                i(line.facility),
+                i(line.severity),
                 opt_text(line.program.clone()),
                 Sql::Text(line.msg.clone()),
             ],
@@ -1309,10 +1288,6 @@ fn f(v: Option<f64>) -> Sql {
 
 fn i(v: Option<i64>) -> Sql {
     v.map_or(Sql::Null, Sql::Integer)
-}
-
-fn opt_int(v: Option<i64>) -> Sql {
-    i(v)
 }
 
 fn opt_text(v: Option<String>) -> Sql {
