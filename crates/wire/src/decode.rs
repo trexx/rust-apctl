@@ -1,6 +1,6 @@
 //! Decrypting inform packets with the right key.
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use inform::{DEFAULT_KEY, Mac, Packet};
 use serde_json::Value;
 
@@ -24,34 +24,42 @@ pub struct Decoded {
 pub fn decode(body: &[u8], keys: &KeyStore, mac_hint: Option<Mac>) -> Result<Decoded> {
     let pkt = Packet::parse(body)?;
     let flags = pkt.header.flags;
-    let mut attempts: Vec<(KeyUsed, &[u8; 16])> = Vec::new();
+    let mut attempts: Vec<(KeyUsed, [u8; 16])> = Vec::new();
     if !flags.has(inform::Flags::ENCRYPTED) {
-        attempts.push((KeyUsed::None, &DEFAULT_KEY));
+        attempts.push((KeyUsed::None, DEFAULT_KEY));
     } else {
         let hint = mac_hint.filter(|m| *m != pkt.header.mac);
         for mac in [Some(pkt.header.mac), hint].into_iter().flatten() {
             if let Some(k) = keys.get(&mac) {
-                attempts.push((KeyUsed::Device, k));
+                attempts.push((KeyUsed::Device, *k));
             }
         }
-        attempts.push((KeyUsed::Default, &DEFAULT_KEY));
+        attempts.push((KeyUsed::Default, DEFAULT_KEY));
     }
+    let (key, _, payload) = open_with(&pkt, attempts)
+        .with_context(|| format!("no known key decrypts the packet from {} (flags {:?})", pkt.header.mac, flags))?;
+    Ok(Decoded { header: pkt.header.clone(), key, payload })
+}
 
+/// Opens a packet with each of `keys` in turn and parses the plaintext as JSON. The
+/// first key that yields JSON wins: CBC has no authentication, so a wrong key shows up
+/// as output that is not JSON rather than as an error. Returns that key with the
+/// payload, or the last key's error.
+///
+/// An unencrypted packet opens with any key (see [`Packet::open`]): callers that
+/// require encryption check the header's flags first.
+pub fn open_with(pkt: &Packet<'_>, keys: impl IntoIterator<Item = (KeyUsed, [u8; 16])>) -> Result<(KeyUsed, [u8; 16], Value)> {
     let mut last_err = None;
-    for (used, key) in attempts {
-        match pkt.open(key) {
-            Ok(plain) => {
-                // CBC has no authentication, so a wrong key shows up as non-JSON output.
-                match serde_json::from_slice::<Value>(&plain) {
-                    Ok(payload) => return Ok(Decoded { header: pkt.header.clone(), key: used, payload }),
-                    Err(e) => last_err = Some(anyhow::anyhow!("decrypted payload is not JSON: {e}")),
-                }
-            }
+    for (used, key) in keys {
+        match pkt.open(&key) {
+            Ok(plain) => match serde_json::from_slice::<Value>(&plain) {
+                Ok(payload) => return Ok((used, key, payload)),
+                Err(e) => last_err = Some(anyhow::anyhow!("decrypted payload is not JSON: {e}")),
+            },
             Err(e) => last_err = Some(e.into()),
         }
     }
-    Err(last_err.unwrap_or_else(|| anyhow::anyhow!("no key to try"))
-        .context(format!("no known key decrypts the packet from {} (flags {:?})", pkt.header.mac, flags)))
+    Err(last_err.unwrap_or_else(|| anyhow::anyhow!("no key to try")))
 }
 
 #[cfg(test)]
@@ -77,5 +85,17 @@ mod tests {
 
         let wire = seal(mac, flags, [3; 16], &[9; 16], b"{}");
         assert!(decode(&wire, &keys, None).is_err());
+    }
+
+    #[test]
+    fn open_with_takes_the_first_key_that_gives_json() {
+        let mac: Mac = "00:11:22:33:44:55".parse().unwrap();
+        // CBC: the wrong key "decrypts" too (or fails on the padding); only JSON counts.
+        let wire = seal(mac, Flags(Flags::ENCRYPTED | Flags::ZLIB), [4; 16], &DEFAULT_KEY, br#"{"a":1}"#);
+        let pkt = Packet::parse(&wire).unwrap();
+        let (used, key, v) = open_with(&pkt, [(KeyUsed::Device, [7; 16]), (KeyUsed::Default, DEFAULT_KEY)]).unwrap();
+        assert_eq!((used, key, v["a"].as_i64()), (KeyUsed::Default, DEFAULT_KEY, Some(1)));
+        assert!(open_with(&pkt, [(KeyUsed::Device, [7; 16])]).is_err());
+        assert!(open_with(&pkt, []).unwrap_err().to_string().contains("no key"));
     }
 }

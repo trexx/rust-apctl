@@ -1,9 +1,11 @@
 //! Radios and WLANs: which WLAN goes on which radio, and the `radio.R.*`, `aaa.N.*`
 //! and `wireless.N.*` blocks.
 
+use std::borrow::Cow;
+
 use serde_json::Value;
 
-use crate::cfg::Cfg;
+use crate::cfg::{Cfg, Prefix};
 use crate::javahash::hash_set_order;
 use crate::json::{arr, as_text, bool_of, flag, int_of, mac_eq, oid, on_off, str_list, str_of, text_of};
 use crate::meta::WifiSlot;
@@ -18,29 +20,78 @@ const RCAP2_OWE: u32 = 3;
 /// `radio_caps` bit for a hardware noise floor (sensitivity) setting.
 const RCAP_HARD_NOISE_FLOOR: u32 = 17;
 
+/// A radio's band, as the settings name it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Band<'a> {
+    /// 2.4 GHz, `ng`.
+    Ng,
+    /// 5 GHz, `na`.
+    Na,
+    /// 6 GHz, `6e`.
+    Six,
+    /// Any other name, kept as it is.
+    Other(&'a str),
+}
+
+impl<'a> Band<'a> {
+    pub fn parse(name: &'a str) -> Band<'a> {
+        match name {
+            "ng" => Band::Ng,
+            "na" => Band::Na,
+            "6e" => Band::Six,
+            other => Band::Other(other),
+        }
+    }
+
+    pub fn as_str(self) -> &'a str {
+        match self {
+            Band::Ng => "ng",
+            Band::Na => "na",
+            Band::Six => "6e",
+            Band::Other(name) => name,
+        }
+    }
+
+    /// The band of a WLAN's `wlan_bands` entry (`2g`, `5g`, `6g`).
+    fn of_wlan_band(b: &str) -> Option<Band<'static>> {
+        match b {
+            "2g" => Some(Band::Ng),
+            "5g" => Some(Band::Na),
+            "6g" => Some(Band::Six),
+            _ => None,
+        }
+    }
+}
+
+impl std::fmt::Display for Band<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 pub struct Radio<'a> {
     /// 1-based position in the name-sorted radio table (`radio.R`).
     pub idx: usize,
-    pub name: String,
-    /// `ng`, `na` or `6e`.
-    pub band: String,
+    pub name: &'a str,
+    pub band: Band<'a>,
     pub doc: &'a Value,
     /// Transmit power mode `disabled`: the radio and its VAPs are switched off.
     pub disabled: bool,
 }
 
 /// One WLAN deployed on one radio.
-pub struct Vap {
+pub struct Vap<'a> {
     /// [`wlan_id`] of the WLAN: the same for its VAPs on every radio.
     pub id: String,
-    /// The WLAN document after per-radio adjustments (e.g. WPA3 turned off).
-    pub w: Value,
+    /// The WLAN document after per-radio adjustments (e.g. WPA3 turned off); a copy
+    /// only when something was adjusted.
+    pub w: Cow<'a, Value>,
     /// Index into the radio list.
     pub radio: usize,
     pub slot: WifiSlot,
 }
 
-impl Vap {
+impl Vap<'_> {
     pub fn dev(&self) -> &str {
         &self.slot.device_name
     }
@@ -59,21 +110,12 @@ pub fn radios<'a>(ctx: &Ctx<'a>) -> Vec<Radio<'a>> {
         .enumerate()
         .map(|(i, r)| Radio {
             idx: i + 1,
-            name: str_of(r, "name").unwrap_or_default().to_string(),
-            band: str_of(r, "radio").unwrap_or("ng").to_string(),
+            name: str_of(r, "name").unwrap_or_default(),
+            band: Band::parse(str_of(r, "radio").unwrap_or("ng")),
             doc: r,
             disabled: str_of(r, "tx_power_mode").is_some_and(|m| m.eq_ignore_ascii_case("disabled")),
         })
         .collect()
-}
-
-fn band_of_wlan_band(b: &str) -> Option<&'static str> {
-    match b {
-        "2g" => Some("ng"),
-        "5g" => Some("na"),
-        "6g" => Some("6e"),
-        _ => None,
-    }
 }
 
 /// The AP's AP groups: the site default group plus every group listing its MAC.
@@ -87,28 +129,29 @@ pub fn ap_groups<'a>(ctx: &Ctx<'a>) -> Vec<&'a str> {
         .collect()
 }
 
-fn set(w: &mut Value, key: &str, v: impl Into<Value>) {
-    if let Some(o) = w.as_object_mut() {
+/// Sets a field of the WLAN, copying the document first if it is still the original.
+fn set(w: &mut Cow<Value>, key: &str, v: impl Into<Value>) {
+    if let Some(o) = w.to_mut().as_object_mut() {
         o.insert(key.to_string(), v.into());
     }
 }
 
 /// Per-radio security adjustments; `None` drops the WLAN from this radio.
-fn adapt(ctx: &Ctx, wlan: &Value, radio: &Radio) -> Option<Value> {
-    let mut w = wlan.clone();
+fn adapt<'a>(ctx: &Ctx, wlan: &'a Value, radio: &Radio) -> Option<Cow<'a, Value>> {
+    let mut w = Cow::Borrowed(wlan);
     let caps2 = int_of(radio.doc, "radio_caps2").unwrap_or(0) as u64;
     let rcap = |b| bit(caps2, b);
-    let security = str_of(&w, "security").unwrap_or("open").to_string();
-    let wpa3 = flag(&w, "wpa3_support", false);
-    let transition = flag(&w, "wpa3_transition", false);
-    let ppsk = flag(&w, "private_preshared_keys_enabled", false) || str_of(&w, "attr_hidden_id") == Some("UidIot");
+    let security = str_of(wlan, "security").unwrap_or("open");
+    let wpa3 = flag(wlan, "wpa3_support", false);
+    let transition = flag(wlan, "wpa3_transition", false);
+    let ppsk = flag(wlan, "private_preshared_keys_enabled", false) || str_of(wlan, "attr_hidden_id") == Some("UidIot");
     if ppsk && !bit(ctx.caps.wifi, 20) {
         return None;
     }
-    if (flag(&w, "hotspot2conf_enabled", false) || security == "osen") && !bit(ctx.caps.fw, 23) {
+    if (flag(wlan, "hotspot2conf_enabled", false) || security == "osen") && !bit(ctx.caps.fw, 23) {
         return None;
     }
-    match security.as_str() {
+    match security {
         "wpapsk" if wpa3 => {
             if !rcap(RCAP2_SAE) {
                 if !transition {
@@ -123,7 +166,7 @@ fn adapt(ctx: &Ctx, wlan: &Value, radio: &Radio) -> Option<Value> {
                         set(&mut w, "fast_roaming_enabled", false);
                     }
                 }
-                if radio.band == "6e" && transition {
+                if radio.band == Band::Six && transition {
                     set(&mut w, "wpa3_transition", false);
                     set(&mut w, "pmf_mode", "required");
                 }
@@ -131,7 +174,7 @@ fn adapt(ctx: &Ctx, wlan: &Value, radio: &Radio) -> Option<Value> {
             }
         }
         "wpaeap" | "osen" => {
-            if flag(&w, "wpa3_enhanced_192", false) {
+            if flag(wlan, "wpa3_enhanced_192", false) {
                 if !rcap(RCAP2_WPA3_192) {
                     return None;
                 }
@@ -160,12 +203,12 @@ fn adapt(ctx: &Ctx, wlan: &Value, radio: &Radio) -> Option<Value> {
 
 /// The WLANs to deploy as `(adjusted WLAN, radio index)`, radio by radio, each radio in
 /// the site's WLAN order.
-pub fn deploy(ctx: &Ctx, radios: &[Radio]) -> Vec<(Value, usize)> {
+pub fn deploy<'a>(ctx: &Ctx<'a>, radios: &[Radio]) -> Vec<(Cow<'a, Value>, usize)> {
     if flag(ctx.device, "disabled", false) {
         return Vec::new();
     }
     let groups = ap_groups(ctx);
-    let wlans: Vec<&Value> = ctx
+    let wlans: Vec<&'a Value> = ctx
         .site_docs("wlanconf")
         .filter(|w| flag(w, "enabled", true))
         .filter(|w| str_list(w, "ap_group_ids").iter().any(|g| groups.iter().any(|m| m == g)))
@@ -173,8 +216,8 @@ pub fn deploy(ctx: &Ctx, radios: &[Radio]) -> Vec<(Value, usize)> {
     let mut out = Vec::new();
     for (ri, radio) in radios.iter().enumerate() {
         for w in &wlans {
-            let bands: Vec<&str> = str_list(w, "wlan_bands").into_iter().filter_map(band_of_wlan_band).collect();
-            let on_band = if bands.is_empty() { radio.band == "ng" || radio.band == "na" } else { bands.contains(&radio.band.as_str()) };
+            let bands: Vec<Band> = str_list(w, "wlan_bands").into_iter().filter_map(Band::of_wlan_band).collect();
+            let on_band = if bands.is_empty() { matches!(radio.band, Band::Ng | Band::Na) } else { bands.contains(&radio.band) };
             if on_band && let Some(adapted) = adapt(ctx, w, radio) {
                 out.push((adapted, ri));
             }
@@ -185,21 +228,16 @@ pub fn deploy(ctx: &Ctx, radios: &[Radio]) -> Vec<(Value, usize)> {
 
 /// Effective channel width in MHz.
 fn width(ctx: &Ctx, r: &Radio) -> i64 {
-    let country_max = match r.band.as_str() {
-        "ng" => 40,
-        "na" => 160,
+    let country_max = match r.band {
+        Band::Ng => 40,
+        Band::Na => 160,
         _ => 320,
     };
     let configured = int_of(r.doc, "ht")
-        .or_else(|| {
-            arr(ctx.setting("radio_ai"), "radios_configuration")
-                .iter()
-                .find(|c| str_of(c, "radio") == Some(r.band.as_str()))
-                .and_then(|c| int_of(c, "channel_width"))
-        })
-        .unwrap_or(match r.band.as_str() {
-            "ng" => 20,
-            "na" => 80,
+        .or_else(|| ctx.radio_ai_config(r.band).and_then(|c| int_of(c, "channel_width")))
+        .unwrap_or(match r.band {
+            Band::Ng => 20,
+            Band::Na => 80,
             _ => 160,
         });
     let f = |k| flag(r.doc, k, false);
@@ -217,66 +255,56 @@ fn width(ctx: &Ctx, r: &Radio) -> i64 {
     country_max.min(configured).min(capable)
 }
 
-pub fn country(ctx: &Ctx) -> String {
-    text_of(ctx.setting("country"), "code").unwrap_or_else(|| "840".to_string())
-}
-
 /// `radio.R.*` for every radio. Returns whether any radio wrote a `stamgr.R` block.
 pub fn render_radios(c: &mut Cfg, ctx: &Ctx, radios: &[Radio], vaps: &[Vap]) -> bool {
-    let mgmt = ctx.setting("mgmt");
-    let advanced = flag(mgmt, "advanced_feature_enabled", false);
-    let country = country(ctx);
+    let advanced = flag(ctx.mgmt, "advanced_feature_enabled", false);
     let mut any_stamgr = false;
     for (ri, r) in radios.iter().enumerate() {
         let d = r.doc;
-        let k = |s: &str| format!("radio.{}.{s}", r.idx);
+        let k = Prefix::new("radio", r.idx);
         let on_radio: Vec<&Vap> = vaps.iter().filter(|v| v.radio == ri).collect();
         let width = width(ctx, r);
-        c.set(k("phyname"), &r.name);
-        c.set(k("ack.auto"), "disabled");
-        c.set(k("acktimeout"), 64);
-        c.set(k("ampdu.status"), "enabled");
-        c.set(k("clksel"), 1);
-        c.set(k("countrycode"), &country);
-        c.set(k("cwm.enable"), 0);
-        c.set(k("cwm.mode"), u8::from(r.band == "ng" && width != 20));
-        c.set(k("forbiasauto"), 0);
+        c.set(k.at("phyname"), r.name);
+        c.set(k.at("ack.auto"), "disabled");
+        c.set(k.at("acktimeout"), 64);
+        c.set(k.at("ampdu.status"), "enabled");
+        c.set(k.at("clksel"), 1);
+        c.set(k.at("countrycode"), &ctx.country);
+        c.set(k.at("cwm.enable"), 0);
+        c.set(k.at("cwm.mode"), u8::from(r.band == Band::Ng && width != 20));
+        c.set(k.at("forbiasauto"), 0);
         // No VAP is an uplink (mesh uplinks are not implemented), so always master.
-        c.set(k("mode"), "master");
-        c.set(k("rate.auto"), "enabled");
-        c.set(k("rate.mcs"), "auto");
-        c.set(k("rfscan"), on_off(flag(d, "spectrum_enabled", false)));
-        c.set(k("bcmc_l2_filter.status"), "enabled");
-        c.set(k("bgscan.status"), "disabled");
-        c.set(k("antenna.gain"), int_of(d, "antenna_gain").unwrap_or(6));
-        c.set(k("antenna"), int_of(d, "antenna_id").unwrap_or(-1));
-        c.set(k("txpower_mode"), str_of(d, "tx_power_mode").unwrap_or("auto").to_ascii_lowercase());
-        c.set(k("txpower"), text_of(d, "tx_power").unwrap_or_else(|| "auto".into()));
+        c.set(k.at("mode"), "master");
+        c.set(k.at("rate.auto"), "enabled");
+        c.set(k.at("rate.mcs"), "auto");
+        c.set(k.at("rfscan"), on_off(flag(d, "spectrum_enabled", false)));
+        c.set(k.at("bcmc_l2_filter.status"), "enabled");
+        c.set(k.at("bgscan.status"), "disabled");
+        c.set(k.at("antenna.gain"), int_of(d, "antenna_gain").unwrap_or(6));
+        c.set(k.at("antenna"), int_of(d, "antenna_id").unwrap_or(-1));
+        c.set(k.at("txpower_mode"), str_of(d, "tx_power_mode").unwrap_or("auto").to_ascii_lowercase());
+        c.set(k.at("txpower"), text_of(d, "tx_power").unwrap_or_else(|| "auto".into()));
         let channel = text_of(d, "channel").unwrap_or_else(|| "0".into());
-        c.set(k("channel"), &channel);
-        let g = if r.band == "ng" { "g" } else { "a" };
-        c.set(k("ieee_mode"), format!("11n{g}ht{width}"));
+        c.set(k.at("channel"), &channel);
+        let g = if r.band == Band::Ng { "g" } else { "a" };
+        c.set(k.at("ieee_mode"), format_args!("11n{g}ht{width}"));
         let acs_dfs = bit(ctx.caps.wifi2, 4);
-        let radio_ai = ctx.setting("radio_ai");
-        if r.band == "na" && acs_dfs {
-            let dfs = arr(radio_ai, "radios_configuration")
-                .iter()
-                .find(|c| str_of(c, "radio") == Some("na"))
-                .is_some_and(|c| flag(c, "dfs", false));
-            c.set(k("acsdfs"), on_off(dfs));
+        if r.band == Band::Na && acs_dfs {
+            let dfs = ctx.radio_ai_config(Band::Na).is_some_and(|c| flag(c, "dfs", false));
+            c.set(k.at("acsdfs"), on_off(dfs));
         }
         if channel == "auto" && acs_dfs {
-            let blocked: Vec<&str> = arr(radio_ai, "channels_blacklist")
+            let blocked: Vec<&str> = arr(ctx.radio_ai, "channels_blacklist")
                 .iter()
                 .filter(|b| str_of(b, "radio") == Some(r.band.as_str()))
                 .filter_map(|b| str_of(b, "channel"))
                 .collect();
             if !blocked.is_empty() {
-                c.set(k("blklst"), hash_set_order(&blocked).join(","));
+                c.set(k.at("blklst"), hash_set_order(&blocked).join(","));
             }
         }
         if bit(ctx.caps.wifi2, 2) {
-            c.set(k("green_ap"), if flag(ctx.device, "green_ap_enabled", false) { 2 } else { 0 });
+            c.set(k.at("green_ap"), if flag(ctx.device, "green_ap_enabled", false) { 2 } else { 0 });
         }
         // Sensitivity values are offsets above -95 dBm.
         let min_rssi = (int_of(d, "min_rssi").unwrap_or(-80) + 95).max(1);
@@ -294,35 +322,35 @@ pub fn render_radios(c: &mut Cfg, ctx: &Ctx, radios: &[Radio], vaps: &[Vap]) -> 
         };
         match sens {
             Some(s) if advanced => {
-                c.set(k("hard_noisefloor.status"), "enabled");
-                c.set(k("hard_noisefloor.max_sens"), -40);
-                c.set(k("hard_noisefloor.minrssi.value"), s);
-                c.set(k("hard_noisefloor.minrssi_backoff"), 0);
+                c.set(k.at("hard_noisefloor.status"), "enabled");
+                c.set(k.at("hard_noisefloor.max_sens"), -40);
+                c.set(k.at("hard_noisefloor.minrssi.value"), s);
+                c.set(k.at("hard_noisefloor.minrssi_backoff"), 0);
             }
-            _ => c.set(k("hard_noisefloor.status"), "disabled"),
+            _ => c.set(k.at("hard_noisefloor.status"), "disabled"),
         }
         let rssi_on = flag(d, "min_rssi_enabled", false);
         let lb_on = flag(d, "loadbalance_enabled", false);
         if advanced && (rssi_on || lb_on) {
             any_stamgr = true;
-            let s = |x: &str| format!("stamgr.{}.{x}", r.idx);
-            c.set(s("status"), "true");
-            c.set(s("radio"), &r.band);
-            c.set(s("minrssi.status"), rssi_on);
-            c.set(s("minrssi.rssi"), min_rssi);
-            c.set(s("loadbalance.status"), lb_on);
-            c.opt(s("loadbalance.maxsta"), text_of(d, "maxsta"));
+            let s = Prefix::new("stamgr", r.idx);
+            c.set(s.at("status"), "true");
+            c.set(s.at("radio"), r.band);
+            c.set(s.at("minrssi.status"), rssi_on);
+            c.set(s.at("minrssi.rssi"), min_rssi);
+            c.set(s.at("loadbalance.status"), lb_on);
+            c.opt(s.at("loadbalance.maxsta"), text_of(d, "maxsta"));
         }
         let status = on_off(!r.disabled);
         for v in on_radio {
             if v.slot.first_on_radio {
-                c.set(k("devname"), v.dev());
-                c.set(k("status"), status);
+                c.set(k.at("devname"), v.dev());
+                c.set(k.at("status"), status);
             } else {
                 let o = v.slot.on_radio;
-                c.set(k(&format!("virtual.{o}.devname")), v.dev());
-                c.set(k(&format!("virtual.{o}.status")), status);
-                c.set(k(&format!("virtual.{o}.mode")), "master");
+                c.set(format_args!("{k}virtual.{o}.devname"), v.dev());
+                c.set(format_args!("{k}virtual.{o}.status"), status);
+                c.set(format_args!("{k}virtual.{o}.mode"), "master");
             }
         }
     }
@@ -356,7 +384,7 @@ pub fn dynamic_vlan(ctx: &Ctx, w: &Value) -> u8 {
 }
 
 /// `radius.auth.*`, `radius.acct.*` and interim updates from the WLAN's RADIUS profile.
-fn radius_servers(c: &mut Cfg, ctx: &Ctx, w: &Value, k: &dyn Fn(&str) -> String) {
+fn radius_servers(c: &mut Cfg, ctx: &Ctx, w: &Value, k: Prefix) {
     let Some(p) = radius_profile(ctx, w) else { return };
     let servers = |list: &str, default_port: i64| -> Vec<(String, i64, String)> {
         arr(p, list)
@@ -370,18 +398,18 @@ fn radius_servers(c: &mut Cfg, ctx: &Ctx, w: &Value, k: &dyn Fn(&str) -> String)
             .collect()
     };
     for (i, (ip, port, secret)) in servers("auth_servers", 1812).iter().enumerate() {
-        c.set(k(&format!("radius.auth.{}.ip", i + 1)), ip);
-        c.set(k(&format!("radius.auth.{}.port", i + 1)), port);
-        c.set(k(&format!("radius.auth.{}.secret", i + 1)), secret);
+        c.set(format_args!("{k}radius.auth.{}.ip", i + 1), ip);
+        c.set(format_args!("{k}radius.auth.{}.port", i + 1), port);
+        c.set(format_args!("{k}radius.auth.{}.secret", i + 1), secret);
     }
     for (i, (ip, port, secret)) in servers("acct_servers", 1813).iter().enumerate() {
-        c.set(k(&format!("radius.acct.{}.ip", i + 1)), ip);
-        c.set(k(&format!("radius.acct.{}.port", i + 1)), port);
-        c.set(k(&format!("radius.acct.{}.secret", i + 1)), secret);
+        c.set(format_args!("{k}radius.acct.{}.ip", i + 1), ip);
+        c.set(format_args!("{k}radius.acct.{}.port", i + 1), port);
+        c.set(format_args!("{k}radius.acct.{}.secret", i + 1), secret);
     }
     if b(p, "interim_update_enabled") {
-        c.set(k("interim_update.status"), "enabled");
-        c.set(k("interim_update.interval"), int_of(p, "interim_update_interval").unwrap_or(3600));
+        c.set(k.at("interim_update.status"), "enabled");
+        c.set(k.at("interim_update.interval"), int_of(p, "interim_update_interval").unwrap_or(3600));
     }
 }
 
@@ -402,15 +430,24 @@ fn wep_key(w: &Value) -> (String, &'static str) {
     (hex, kind)
 }
 
+/// A WEP WLAN's key lines, the same in its `aaa.N` and `wireless.N` sections.
+fn wep(c: &mut Cfg, p: Prefix, w: &Value) {
+    let (key, kind) = wep_key(w);
+    let idx = int_of(w, "wep_idx").unwrap_or(1);
+    c.set(p.at("security"), kind);
+    c.set(format_args!("{p}security.{idx}.key"), key);
+    c.set(p.at("security.default_key"), idx);
+}
+
 /// `aaa.N.*` and `wireless.N.*` for one VAP. `bridge` is the bridge the VAP is a port of.
 pub fn render_vap(c: &mut Cfg, ctx: &Ctx, radios: &[Radio], vaps: &[Vap], i: usize, bridge: &str) {
     let v = &vaps[i];
-    let w = &v.w;
+    let w: &Value = &v.w;
     let r = &radios[v.radio];
     let n = v.slot.section;
-    let a = |s: &str| format!("aaa.{n}.{s}");
+    let a = Prefix::new("aaa", n as usize);
     let security = str_of(w, "security").unwrap_or("open");
-    let is_6e = r.band == "6e";
+    let is_6e = r.band == Band::Six;
     let wpa3 = b(w, "wpa3_support");
     let transition = b(w, "wpa3_transition");
     let ssid = str_of(w, "name").unwrap_or_default();
@@ -422,96 +459,92 @@ pub fn render_vap(c: &mut Cfg, ctx: &Ctx, radios: &[Radio], vaps: &[Vap], i: usi
         Some("required") => 2,
         _ => 0,
     };
-    c.set(a("pmf.status"), on_off(pmf != 0));
-    c.set(a("pmf.mode"), pmf);
-    c.set(a("ft.status"), on_off(b(w, "fast_roaming_enabled")));
+    c.set(a.at("pmf.status"), on_off(pmf != 0));
+    c.set(a.at("pmf.mode"), pmf);
+    c.set(a.at("ft.status"), on_off(b(w, "fast_roaming_enabled")));
     if let Some(level) = int_of(w, "log_level").filter(|l| *l >= 0) {
-        c.set(a("log_level"), level);
+        c.set(a.at("log_level"), level);
     }
-    c.set(a("country_beacon"), on_off(b(w, "country_beacon")));
-    c.set(a("11k.status"), on_off(b(w, "rrm_enabled")));
+    c.set(a.at("country_beacon"), on_off(b(w, "country_beacon")));
+    c.set(a.at("11k.status"), on_off(b(w, "rrm_enabled")));
     let common_tail = |c: &mut Cfg| {
-        c.set(a("p2p"), on_off(b(w, "p2p")));
-        c.set(a("p2p_cross_connect"), on_off(b(w, "p2p_cross_connect")));
-        c.set(a("proxy_arp"), on_off(b(w, "proxy_arp")));
-        c.set(a("is_guest"), is_guest);
-        c.set(a("tdls_prohibit"), on_off(b(w, "tdls_prohibit")));
-        c.set(a("bss_transition"), on_off(flag(w, "bss_transition", true)));
+        c.set(a.at("p2p"), on_off(b(w, "p2p")));
+        c.set(a.at("p2p_cross_connect"), on_off(b(w, "p2p_cross_connect")));
+        c.set(a.at("proxy_arp"), on_off(b(w, "proxy_arp")));
+        c.set(a.at("is_guest"), is_guest);
+        c.set(a.at("tdls_prohibit"), on_off(b(w, "tdls_prohibit")));
+        c.set(a.at("bss_transition"), on_off(flag(w, "bss_transition", true)));
     };
     let eap = matches!(security, "wpaeap" | "osen");
     if security == "open" || security == "wep" {
-        c.set(a("br.devname"), bridge);
-        c.set(a("devname"), v.dev());
-        c.set(a("driver"), "madwifi");
-        c.set(a("ssid"), ssid);
-        c.set(a("status"), on_off(bit(ctx.caps.wifi, 13) && !r.disabled));
-        c.set(a("id"), &id);
-        c.set(a("verbose"), 2);
+        c.set(a.at("br.devname"), bridge);
+        c.set(a.at("devname"), v.dev());
+        c.set(a.at("driver"), "madwifi");
+        c.set(a.at("ssid"), ssid);
+        c.set(a.at("status"), on_off(bit(ctx.caps.wifi, 13) && !r.disabled));
+        c.set(a.at("id"), &id);
+        c.set(a.at("verbose"), 2);
         common_tail(c);
         if security == "open" && wpa3 && !transition {
             // OWE transition pairs (an open VAP plus a hidden OWE companion) are not
             // implemented; a transition WLAN is deployed as its open half only.
-            c.set(a("wpa.key.1.mgmt"), "OWE");
+            c.set(a.at("wpa.key.1.mgmt"), "OWE");
         }
         if security == "wep" {
-            let (key, kind) = wep_key(w);
-            let idx = int_of(w, "wep_idx").unwrap_or(1);
-            c.set(a("security"), kind);
-            c.set(a(&format!("security.{idx}.key")), key);
-            c.set(a("security.default_key"), idx);
+            wep(c, a, w);
         }
     } else {
         let wpa_mode = str_of(w, "wpa_mode").unwrap_or("auto");
-        c.set(a("br.devname"), bridge);
-        c.set(a("devname"), v.dev());
-        c.set(a("driver"), "madwifi");
-        c.set(a("ssid"), ssid);
-        c.set(a("status"), on_off(!r.disabled));
-        c.set(a("verbose"), 2);
+        c.set(a.at("br.devname"), bridge);
+        c.set(a.at("devname"), v.dev());
+        c.set(a.at("driver"), "madwifi");
+        c.set(a.at("ssid"), ssid);
+        c.set(a.at("status"), on_off(!r.disabled));
+        c.set(a.at("verbose"), 2);
         c.set(
-            a("wpa"),
+            a.at("wpa"),
             match wpa_mode {
                 "wpa1" => 1,
                 "wpa2" => 2,
                 _ => 3,
             },
         );
-        c.set(a("eapol_version"), if wpa_mode == "wpa1" { 1 } else { 2 });
-        c.set(a("wpa.group_rekey"), int_of(w, "group_rekey").unwrap_or(3600));
+        c.set(a.at("eapol_version"), if wpa_mode == "wpa1" { 1 } else { 2 });
+        c.set(a.at("wpa.group_rekey"), int_of(w, "group_rekey").unwrap_or(3600));
         common_tail(c);
-        c.set(a("id"), &id);
+        c.set(a.at("id"), &id);
         if wpa3 || is_6e {
-            c.set(a("wpa3.support"), "enabled");
-            c.set(a("wpa3.transition"), on_off(transition));
+            c.set(a.at("wpa3.support"), "enabled");
+            c.set(a.at("wpa3.transition"), on_off(transition));
         }
         let passphrase = str_of(w, "x_passphrase").unwrap_or("letmeinnow");
         if eap {
             if b(w, "wpa3_enhanced_192") {
-                c.set(a("wpa3.enhanced_192"), "enabled");
+                c.set(a.at("wpa3.enhanced_192"), "enabled");
             }
-            c.set(a("wpa.key.1.mgmt"), if security == "osen" { "OSEN" } else { "WPA-EAP" });
-            c.set(a("wpa.psk"), passphrase);
-            c.set(a("auth_cache"), on_off(flag(w, "auth_cache", true)));
-            radius_servers(c, ctx, w, &a);
-            c.set(a("dynamic_vlan"), dynamic_vlan(ctx, w));
-            c.set(a("hs20.status"), "disabled");
+            c.set(a.at("wpa.key.1.mgmt"), if security == "osen" { "OSEN" } else { "WPA-EAP" });
+            c.set(a.at("wpa.psk"), passphrase);
+            c.set(a.at("auth_cache"), on_off(flag(w, "auth_cache", true)));
+            radius_servers(c, ctx, w, a);
+            c.set(a.at("dynamic_vlan"), dynamic_vlan(ctx, w));
+            c.set(a.at("hs20.status"), "disabled");
         } else {
             let sae = wpa3 || is_6e;
             if sae {
                 let ft = if transition { b(w, "wpa3_fast_roaming") } else { b(w, "fast_roaming_enabled") };
-                c.set(a("wpa3.ft.status"), on_off(ft));
+                c.set(a.at("wpa3.ft.status"), on_off(ft));
                 if let Some(x) = int_of(w, "sae_anti_clogging").filter(|x| *x > 0) {
-                    c.set(a("sae.anti_clogging"), x);
+                    c.set(a.at("sae.anti_clogging"), x);
                 }
                 if let Some(x) = int_of(w, "sae_sync").filter(|x| *x > 0) {
-                    c.set(a("sae.sync"), x);
+                    c.set(a.at("sae.sync"), x);
                 }
                 let groups = arr(w, "sae_groups");
                     for (gi, g) in groups.iter().enumerate() {
-                    c.opt(a(&format!("sae.groups.{}.group", gi + 1)), as_text(g));
+                    c.opt(format_args!("{a}sae.groups.{}.group", gi + 1), as_text(g));
                 }
                 if !groups.is_empty() {
-                    c.set(a("sae.has_groups"), "enabled");
+                    c.set(a.at("sae.has_groups"), "enabled");
                 }
                 let entries = arr(w, "sae_psk");
                 let default_psk = entries
@@ -524,33 +557,33 @@ pub fn render_vap(c: &mut Cfg, ctx: &Ctx, radios: &[Radio], vaps: &[Vap], i: usi
                     .filter(|p| p.len() <= 64);
                 let mut k = 0;
                 if transition {
-                    c.set(a("wpa.psk"), default_psk.unwrap_or(passphrase));
+                    c.set(a.at("wpa.psk"), default_psk.unwrap_or(passphrase));
                 } else if default_psk.is_none() {
                     k += 1;
-                    c.set(a(&format!("sae.psk.{k}.psk")), passphrase);
-                    c.set(a(&format!("sae.psk.{k}.mac")), "ff:ff:ff:ff:ff:ff");
+                    c.set(format_args!("{a}sae.psk.{k}.psk"), passphrase);
+                    c.set(format_args!("{a}sae.psk.{k}.mac"), "ff:ff:ff:ff:ff:ff");
                 }
                 for e in entries {
                     k += 1;
-                    c.opt(a(&format!("sae.psk.{k}.psk")), str_of(e, "psk"));
-                    c.opt(a(&format!("sae.psk.{k}.mac")), str_of(e, "mac"));
-                    c.opt(a(&format!("sae.psk.{k}.vlan")), text_of(e, "vlan"));
-                    c.opt(a(&format!("sae.psk.{k}.id")), str_of(e, "id"));
+                    c.opt(format_args!("{a}sae.psk.{k}.psk"), str_of(e, "psk"));
+                    c.opt(format_args!("{a}sae.psk.{k}.mac"), str_of(e, "mac"));
+                    c.opt(format_args!("{a}sae.psk.{k}.vlan"), text_of(e, "vlan"));
+                    c.opt(format_args!("{a}sae.psk.{k}.id"), str_of(e, "id"));
                 }
                 if entries.iter().any(|e| e.get("vlan").is_some()) {
-                    c.set(a("dynamic_vlan"), if b(w, "sae_psk_vlan_required") { 2 } else { 1 });
+                    c.set(a.at("dynamic_vlan"), if b(w, "sae_psk_vlan_required") { 2 } else { 1 });
                 }
             }
-            c.set(a("wpa.key.1.mgmt"), if sae { "SAE" } else { "WPA-PSK" });
-            c.set(a("wpa.psk"), passphrase);
+            c.set(a.at("wpa.key.1.mgmt"), if sae { "SAE" } else { "WPA-PSK" });
+            c.set(a.at("wpa.psk"), passphrase);
             if b(w, "private_preshared_keys_enabled") {
-                c.set(a("dynamic_vlan"), 1);
-                c.set(a("wpa.psk_file.status"), "enabled");
+                c.set(a.at("dynamic_vlan"), 1);
+                c.set(a.at("wpa.psk_file.status"), "enabled");
                 for (pi, key) in arr(w, "private_preshared_keys").iter().enumerate() {
-                    c.opt(a(&format!("wpa.psk_file.{}.psk", pi + 1)), str_of(key, "password"));
+                    c.opt(format_args!("{a}wpa.psk_file.{}.psk", pi + 1), str_of(key, "password"));
                     let vlan = network_vlan(ctx, str_of(key, "networkconf_id"));
                     if vlan != 1 {
-                        c.set(a(&format!("wpa.psk_file.{}.vlanid", pi + 1)), vlan);
+                        c.set(format_args!("{a}wpa.psk_file.{}.vlanid", pi + 1), vlan);
                     }
                 }
             }
@@ -561,36 +594,36 @@ pub fn render_vap(c: &mut Cfg, ctx: &Ctx, radios: &[Radio], vaps: &[Vap], i: usi
             "auto" => "CCMP".to_string(),
             other => other.to_ascii_uppercase(),
         };
-        c.set(a("wpa.1.pairwise"), pairwise);
+        c.set(a.at("wpa.1.pairwise"), pairwise);
         let cipher = match str_of(w, "pmf_cipher") {
             Some("bip-gmac-256") => "BIP-GMAC-256",
             _ => "AES-128-CMAC",
         };
-        c.set(a("pmf.cipher"), cipher);
+        c.set(a.at("pmf.cipher"), cipher);
     }
     let mac_auth = b(w, "radius_mac_auth_enabled");
     if eap || mac_auth {
-        nas_identifier(c, ctx, w, &a);
+        nas_identifier(c, ctx, w, a);
     }
     if mac_auth {
-        c.set(a("radius.macacl.status"), "enabled");
-        c.set(a("radius.macacl.emptypassword"), on_off(b(w, "radius_macacl_empty_password")));
+        c.set(a.at("radius.macacl.status"), "enabled");
+        c.set(a.at("radius.macacl.emptypassword"), on_off(b(w, "radius_macacl_empty_password")));
         if !eap {
-            radius_servers(c, ctx, w, &a);
+            radius_servers(c, ctx, w, a);
         }
     } else {
-        c.set(a("radius.macacl.status"), "disabled");
+        c.set(a.at("radius.macacl.status"), "disabled");
     }
-    c.set(a("hide_ssid"), b(w, "hide_ssid"));
+    c.set(a.at("hide_ssid"), b(w, "hide_ssid"));
     render_wireless(c, ctx, radios, vaps, i);
     if flag(w, "iapp_enabled", true)
         && let Some(key) = str_of(w, "x_iapp_key").filter(|k| !k.is_empty())
     {
-        c.set(a("iapp_key"), key);
+        c.set(a.at("iapp_key"), key);
     }
 }
 
-fn nas_identifier(c: &mut Cfg, ctx: &Ctx, w: &Value, a: &dyn Fn(&str) -> String) {
+fn nas_identifier(c: &mut Cfg, ctx: &Ctx, w: &Value, a: Prefix) {
     let value = match str_of(w, "nas_identifier_type") {
         Some("ap_mac") => Some(ctx.mac.clone()),
         Some("ap_name") => str_of(ctx.device, "name").map(str::to_string),
@@ -599,15 +632,15 @@ fn nas_identifier(c: &mut Cfg, ctx: &Ctx, w: &Value, a: &dyn Fn(&str) -> String)
         _ => None,
     };
     if let Some(v) = value {
-        c.set(a("nas_identifier"), v.chars().take(48).collect::<String>());
+        c.set(a.at("nas_identifier"), v.chars().take(48).collect::<String>());
     }
 }
 
 /// Minimum data rate lines; `None` when the band has no minimum rate configured.
-fn min_rate(w: &Value, band: &str) -> Option<i64> {
+fn min_rate(w: &Value, band: Band) -> Option<i64> {
     match band {
-        "ng" => Some(int_of(w, "minrate_ng_data_rate_kbps").unwrap_or(1000)),
-        "na" if b(w, "minrate_na_enabled") => Some(int_of(w, "minrate_na_data_rate_kbps").unwrap_or(6000)),
+        Band::Ng => Some(int_of(w, "minrate_ng_data_rate_kbps").unwrap_or(1000)),
+        Band::Na if b(w, "minrate_na_enabled") => Some(int_of(w, "minrate_na_data_rate_kbps").unwrap_or(6000)),
         _ => None,
     }
 }
@@ -620,81 +653,78 @@ fn allows_11b(rate: i64) -> bool {
 fn render_wireless(c: &mut Cfg, ctx: &Ctx, radios: &[Radio], vaps: &[Vap], i: usize) {
     let v = &vaps[i];
     let r = &radios[v.radio];
-    let w = &v.w;
+    let w: &Value = &v.w;
     let n = v.slot.section;
-    let k = |s: &str| format!("wireless.{n}.{s}");
+    let k = Prefix::new("wireless", n as usize);
     let security = str_of(w, "security").unwrap_or("open");
     let is_guest = b(w, "is_guest");
-    let rate = min_rate(w, &r.band);
+    let rate = min_rate(w, r.band);
     let caps = ctx.caps;
 
-    c.set(k("mode"), "master");
-    c.set(k("devname"), v.dev());
-    c.opt(k("id"), text_of(w, "short_id"));
-    c.set(k("status"), on_off(!r.disabled));
-    c.set(k("authmode"), if security == "open" { 0 } else { 1 });
-    c.set(k("l2_isolation"), on_off(bool_of(w, "l2_isolation").unwrap_or(is_guest)));
-    c.set(k("is_guest"), is_guest);
+    c.set(k.at("mode"), "master");
+    c.set(k.at("devname"), v.dev());
+    c.opt(k.at("id"), text_of(w, "short_id"));
+    c.set(k.at("status"), on_off(!r.disabled));
+    c.set(k.at("authmode"), if security == "open" { 0 } else { 1 });
+    c.set(k.at("l2_isolation"), on_off(bool_of(w, "l2_isolation").unwrap_or(is_guest)));
+    c.set(k.at("is_guest"), is_guest);
     if security == "wep" {
-        let (key, kind) = wep_key(w);
-        let idx = int_of(w, "wep_idx").unwrap_or(1);
-        c.set(k("security"), kind);
-        c.set(k(&format!("security.{idx}.key")), key);
-        c.set(k("security.default_key"), idx);
+        wep(c, k, w);
     } else {
-        c.set(k("security"), "none");
+        c.set(k.at("security"), "none");
     }
-    c.set(k("addmtikie"), "disabled");
-    c.set(k("ssid"), str_of(w, "name").unwrap_or_default());
-    c.set(k("hide_ssid"), b(w, "hide_ssid"));
-    c.set(k("mac_acl.status"), "enabled");
-    c.set(k("mac_acl.policy"), "deny");
-    c.set(k("wmm"), "enabled");
-    c.set(k("uapsd"), on_off(b(w, "uapsd_enabled")));
-    c.set(k("parent"), &r.name);
-    c.set(k("puren"), 0);
-    c.set(k("pureg"), u8::from(!(r.band == "ng" && rate.is_none_or(allows_11b))));
-    c.set(k("usage"), if is_guest { "guest" } else { "user" });
-    c.set(k("wds"), "disabled");
-    c.set(k("mcast.enhance"), u8::from(b(w, "mcastenhance_enabled")));
-    c.set(k("multicast.inspect"), bit(caps.fw3, 7));
-    c.set(k("autowds"), "disabled");
-    c.set(k("vport"), "disabled");
-    c.set(k("vwire"), "disabled");
-    c.set(k("schedule_enabled"), on_off(!arr(w, "schedule_with_duration").is_empty()));
-    let has_5g_twin = vaps.iter().any(|o| o.id == v.id && radios[o.radio].band == "na");
-    c.set(k("no2ghz_oui"), on_off(b(w, "no2ghz_oui") && r.band == "ng" && has_5g_twin));
-    c.set(k("element_adopt"), on_off(b(w, "element_adopt")));
+    c.set(k.at("addmtikie"), "disabled");
+    c.set(k.at("ssid"), str_of(w, "name").unwrap_or_default());
+    c.set(k.at("hide_ssid"), b(w, "hide_ssid"));
+    c.set(k.at("mac_acl.status"), "enabled");
+    c.set(k.at("mac_acl.policy"), "deny");
+    c.set(k.at("wmm"), "enabled");
+    c.set(k.at("uapsd"), on_off(b(w, "uapsd_enabled")));
+    c.set(k.at("parent"), r.name);
+    c.set(k.at("puren"), 0);
+    c.set(k.at("pureg"), u8::from(!(r.band == Band::Ng && rate.is_none_or(allows_11b))));
+    c.set(k.at("usage"), if is_guest { "guest" } else { "user" });
+    c.set(k.at("wds"), "disabled");
+    c.set(k.at("mcast.enhance"), u8::from(b(w, "mcastenhance_enabled")));
+    c.set(k.at("multicast.inspect"), bit(caps.fw3, 7));
+    c.set(k.at("autowds"), "disabled");
+    c.set(k.at("vport"), "disabled");
+    c.set(k.at("vwire"), "disabled");
+    c.set(k.at("schedule_enabled"), on_off(!arr(w, "schedule_with_duration").is_empty()));
+    let has_5g_twin = vaps.iter().any(|o| o.id == v.id && radios[o.radio].band == Band::Na);
+    c.set(k.at("no2ghz_oui"), on_off(b(w, "no2ghz_oui") && r.band == Band::Ng && has_5g_twin));
+    c.set(k.at("element_adopt"), on_off(b(w, "element_adopt")));
     if b(w, "enhanced_iot") {
-        c.set(k("iot"), "enabled");
-        c.set(k("qbssload"), "disabled");
+        c.set(k.at("iot"), "enabled");
+        c.set(k.at("qbssload"), "disabled");
     }
     if bit(caps.wifi2, 6) {
-        c.set(k("advertise_ap_name"), on_off(b(w, "advertise_device_name_in_beacon")));
+        c.set(k.at("advertise_ap_name"), on_off(b(w, "advertise_device_name_in_beacon")));
     }
     let suppressor = str_of(w, "multicast_suppressor_mode");
     let suppress_cap = bit(caps.wifi2, 22);
     if suppress_cap && matches!(suppressor, Some("conservative" | "aggressive")) {
-        c.set(k("multicast.suppressor"), "enabled");
+        c.set(k.at("multicast.suppressor"), "enabled");
     }
-    c.set(k("mcastrate"), text_of(w, "mcast_rate").unwrap_or_else(|| "auto".into()));
+    c.set(k.at("mcastrate"), text_of(w, "mcast_rate").unwrap_or_else(|| "auto".into()));
     if bit(caps.wifi, 6) {
-        c.set(k("bga_filter"), "enabled");
+        c.set(k.at("bga_filter"), "enabled");
     }
-    schedule(c, w, &k, bit(caps.fw, 22), bit(caps.fw, 12));
-    let dtim = if r.band == "ng" && b(w, "iot_dtim_lock") {
+    schedule(c, w, k, bit(caps.fw, 22), bit(caps.fw, 12));
+    let ng = r.band == Band::Ng;
+    let dtim = if ng && b(w, "iot_dtim_lock") {
         3
     } else if str_of(w, "dtim_mode") == Some("custom") {
-        int_of(w, &format!("dtim_{}", r.band)).unwrap_or(if r.band == "ng" { 1 } else { 3 })
-    } else if r.band == "ng" {
+        int_of(w, &format!("dtim_{}", r.band)).unwrap_or(if ng { 1 } else { 3 })
+    } else if ng {
         1
     } else {
         3
     };
-    c.set(k("dtim_period"), dtim);
+    c.set(k.at("dtim_period"), dtim);
     if let Some(rate) = rate {
-        c.set(k("minrate_data"), rate);
-        let beacon = if r.band == "ng" {
+        c.set(k.at("minrate_data"), rate);
+        let beacon = if ng {
             match rate {
                 6000 | 9000 => 11000,
                 18000 | 36000 | 48000 | 54000 => 24000,
@@ -703,45 +733,45 @@ fn render_wireless(c: &mut Cfg, ctx: &Ctx, radios: &[Radio], vaps: &[Vap], i: us
         } else {
             rate
         };
-        c.set(k("beacon_rate"), beacon);
-        c.set(k("mgmt_rate"), beacon);
-        if r.band == "ng" {
-            c.set(k("minrate_cck_rates.status"), allows_11b(rate));
+        c.set(k.at("beacon_rate"), beacon);
+        c.set(k.at("mgmt_rate"), beacon);
+        if ng {
+            c.set(k.at("minrate_cck_rates.status"), allows_11b(rate));
         }
         if b(w, &format!("minrate_{}_advertising_rates", r.band)) {
-            c.set(k("minrate_below_disable"), "true");
+            c.set(k.at("minrate_below_disable"), "true");
         }
     }
     let aggressive = suppress_cap && suppressor == Some("aggressive");
     if b(w, "bc_filter_enabled") || aggressive {
-        c.set(k("bcfilt.status"), "enabled");
+        c.set(k.at("bcfilt.status"), "enabled");
         if aggressive {
-            c.set(k("bcfilt.bypass_types"), "ARP|NSNA|DHCPV4|DHCPV6");
+            c.set(k.at("bcfilt.bypass_types"), "ARP|NSNA|DHCPV4|DHCPV6");
         }
         let mut macs: Vec<String> = str_list(w, "bc_filter_list").iter().map(|m| m.to_ascii_lowercase()).collect();
         macs.extend(gateway_macs(ctx));
         for (mi, mac) in hash_set_order(&macs).iter().enumerate() {
-            c.set(k(&format!("bcfilt.{}.status", mi + 1)), "enabled");
-            c.set(k(&format!("bcfilt.{}.mac", mi + 1)), mac);
+            c.set(format_args!("{k}bcfilt.{}.status", mi + 1), "enabled");
+            c.set(format_args!("{k}bcfilt.{}.mac", mi + 1), mac);
         }
     }
     if bit(caps.wifi2, 5) {
-        let (on, rssi) = match r.band.as_str() {
-            "na" => (b(w, "roaming_assistant_na_enabled"), int_of(w, "roaming_assistant_na_rssi").unwrap_or(-75)),
-            "6e" => (b(w, "roaming_assistant_6e_enabled"), int_of(w, "roaming_assistant_6e_rssi").unwrap_or(-88)),
+        let (on, rssi) = match r.band {
+            Band::Na => (b(w, "roaming_assistant_na_enabled"), int_of(w, "roaming_assistant_na_rssi").unwrap_or(-75)),
+            Band::Six => (b(w, "roaming_assistant_6e_enabled"), int_of(w, "roaming_assistant_6e_rssi").unwrap_or(-88)),
             _ => (false, 0),
         };
         if on {
-            c.set(k("btm_disassoc.status"), "enabled");
-            c.set(k("btm_disassoc.threshold"), rssi);
+            c.set(k.at("btm_disassoc.status"), "enabled");
+            c.set(k.at("btm_disassoc.threshold"), rssi);
         }
     }
     let dns_mode = str_of(w, "dns_assistance_mode").unwrap_or("off");
     if bit(caps.fw3, 3) && dns_mode != "off" {
-        c.set(k("dns_cache.status"), "enabled");
-        c.set(k("dns_bypass.status"), "enabled");
+        c.set(k.at("dns_cache.status"), "enabled");
+        c.set(k.at("dns_bypass.status"), "enabled");
         if dns_mode == "manual" {
-            c.set(k("dns_bypass.servers"), str_list(w, "dns_assistance_servers").join(","));
+            c.set(k.at("dns_bypass.servers"), str_list(w, "dns_assistance_servers").join(","));
         }
     }
 }
@@ -806,13 +836,13 @@ fn hhmm(m: i64) -> String {
 /// The schedule lines of a VAP: blackout blocks when the firmware takes them
 /// inverted (`invert`), else the times the WLAN is on; one key per block when
 /// it takes several (`multi`), else the day's key repeated.
-fn schedule(c: &mut Cfg, w: &Value, k: &dyn Fn(&str) -> String, invert: bool, multi: bool) {
+fn schedule(c: &mut Cfg, w: &Value, k: Prefix, invert: bool, multi: bool) {
     if arr(w, "schedule_with_duration").is_empty() {
         return;
     }
     let off = blackout_blocks(w);
     if invert {
-        c.set(k("schedule_invert"), "enabled");
+        c.set(k.at("schedule_invert"), "enabled");
     }
     for (d, blocks) in off.iter().enumerate() {
         let blocks: Vec<(i64, i64)> = if invert {
@@ -833,8 +863,12 @@ fn schedule(c: &mut Cfg, w: &Value, k: &dyn Fn(&str) -> String, invert: bool, mu
             on
         };
         for (i, (s, e)) in blocks.iter().enumerate() {
-            let key = if multi { format!("schedule_{}.{i}", DAYS[d]) } else { format!("schedule_{}", DAYS[d]) };
-            c.set(k(&key), format!("{}-{}", hhmm(*s), hhmm(*e)));
+            let time = format_args!("{}-{}", hhmm(*s), hhmm(*e));
+            if multi {
+                c.set(format_args!("{k}schedule_{}.{i}", DAYS[d]), time);
+            } else {
+                c.set(format_args!("{k}schedule_{}", DAYS[d]), time);
+            }
         }
     }
 }
@@ -846,7 +880,7 @@ mod schedule_tests {
 
     fn lines(w: &Value, invert: bool, multi: bool) -> Vec<String> {
         let mut c = Cfg::default();
-        schedule(&mut c, w, &|s: &str| format!("wireless.1.{s}"), invert, multi);
+        schedule(&mut c, w, Prefix::new("wireless", 1), invert, multi);
         c.finish().lines().map(str::to_string).collect()
     }
 

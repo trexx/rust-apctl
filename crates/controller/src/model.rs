@@ -520,21 +520,9 @@ pub fn parse(ts: Ts, p: &Value) -> anyhow::Result<Snapshot> {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use std::path::PathBuf;
 
-    /// The sanitised captures, kept outside the repository: `$APCTL_TESTDATA/2026-10-12-u6m-8.8.11`.
-    pub fn fixtures() -> Option<PathBuf> {
-        let Some(root) = std::env::var_os("APCTL_TESTDATA") else {
-            eprintln!("skipped: APCTL_TESTDATA is not set, so the capture fixtures are not available");
-            return None;
-        };
-        let dir = PathBuf::from(root).join("2026-10-12-u6m-8.8.11");
-        if !dir.is_dir() {
-            eprintln!("skipped: no capture fixtures in {}", dir.display());
-            return None;
-        }
-        Some(dir)
-    }
+    /// The sanitised captures, kept outside the repository.
+    pub use wire::capture::sample::fixtures;
 
     pub fn fixture(name_part: &str) -> Value {
         let dir = fixtures().expect("capture fixtures");

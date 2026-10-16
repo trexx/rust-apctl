@@ -2,7 +2,7 @@
 
 use crate::Ctx;
 use crate::cfg::Cfg;
-use crate::json::{flag, str_of};
+use crate::json::{flag, override_of, str_of};
 
 /// `scheme://host[:port][/path]` split into host and port.
 fn host_port(url: &str) -> Option<(String, Option<u16>)> {
@@ -27,7 +27,7 @@ fn host_port(url: &str) -> Option<(String, Option<u16>)> {
 /// migration URL, the "override inform host" hostname, the host of the device's stored
 /// inform URL, the controller's own inform URL.
 fn inform_host(ctx: &Ctx) -> String {
-    let override_host = flag(ctx.setting("super_mgmt"), "override_inform_host", false)
+    let override_host = flag(ctx.super_mgmt, "override_inform_host", false)
         .then(|| str_of(ctx.setting("super_identity"), "hostname").unwrap_or("example-domain.ui.com"));
     [str_of(ctx.device, "migrate_inform_url").and_then(host_port).map(|(h, _)| h), override_host.map(str::to_string)]
         .into_iter()
@@ -43,11 +43,7 @@ pub fn led_enabled(ctx: &Ctx) -> bool {
     if flag(ctx.device, "disabled", false) {
         return false;
     }
-    match str_of(ctx.device, "led_override") {
-        Some("off") => false,
-        Some("on") => true,
-        _ => flag(ctx.setting("mgmt"), "led_enabled", true),
-    }
+    override_of(ctx.device, "led_override", flag(ctx.mgmt, "led_enabled", true))
 }
 
 pub fn render(ctx: &Ctx) -> String {
@@ -64,17 +60,17 @@ pub fn render(ctx: &Ctx) -> String {
     out.set("selfrun_guest_mode", "pass");
     out.set("cfgversion", ctx.cfgversion);
     out.set("led_enabled", led_enabled(ctx));
-    out.set("stun_url", format!("stun://{host}:{stun_port}/"));
+    out.set("stun_url", format_args!("stun://{host}:{stun_port}/"));
     let https = if https_port == 443 { String::new() } else { format!(":{https_port}") };
-    out.set("mgmt_url", format!("https://{host}{https}/manage/site/{site_name}"));
+    out.set("mgmt_url", format_args!("https://{host}{https}/manage/site/{site_name}"));
     // The key is only resent while the AP still authenticates with an older one.
     if let (Some(key), Some(used)) = (str_of(ctx.device, "x_authkey"), str_of(ctx.device, "x_inform_authkey"))
         && key != used
     {
         out.set("authkey", key);
     }
-    if flag(ctx.setting("super_mgmt"), "override_inform_host", false) || ctx.device.get("migrate_inform_url").is_some() {
-        out.set("inform_url", format!("http://{host}:{inform_port}/inform"));
+    if flag(ctx.super_mgmt, "override_inform_host", false) || ctx.device.get("migrate_inform_url").is_some() {
+        out.set("inform_url", format_args!("http://{host}:{inform_port}/inform"));
     }
     out.set("use_aes_gcm", "true");
     out.set("report_crash", "true");

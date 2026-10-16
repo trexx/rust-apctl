@@ -3,15 +3,16 @@
 use std::collections::BTreeMap;
 use std::fmt::Write;
 
-pub fn parse(cfg: &str) -> BTreeMap<String, Vec<String>> {
-    let mut map: BTreeMap<String, Vec<String>> = BTreeMap::new();
+/// The values of each key, in order (a key can repeat), borrowed from `cfg`.
+fn parse(cfg: &str) -> BTreeMap<&str, Vec<&str>> {
+    let mut map: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
     for line in cfg.lines() {
         let line = line.trim_end();
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
         let (k, v) = line.split_once('=').unwrap_or((line, ""));
-        map.entry(k.to_string()).or_default().push(v.to_string());
+        map.entry(k).or_default().push(v);
     }
     map
 }
@@ -54,44 +55,54 @@ impl Diff {
 /// Keys whose values are credentials (PSKs, RADIUS secrets, authkeys, passwords,
 /// the SNMP community).
 pub fn is_secret(key: &str) -> bool {
-    let k = key.to_ascii_lowercase();
+    // Case-insensitive, without lowercasing a copy of every key.
+    let starts = |s: &str, p: &str| s.len() >= p.len() && s.as_bytes()[..p.len()].eq_ignore_ascii_case(p.as_bytes());
+    let ends = |s: &str, p: &str| s.len() >= p.len() && s.as_bytes()[s.len() - p.len()..].eq_ignore_ascii_case(p.as_bytes());
+    let contains = |s: &str, p: &str| s.as_bytes().windows(p.len()).any(|w| w.eq_ignore_ascii_case(p.as_bytes()));
     // `x_` marks secret fields in the controller's database, but only as a prefix
     // (`max_txpower` must stay visible).
-    let last = k.rsplit('.').next().unwrap_or("");
-    k.split('.').any(|seg| seg.starts_with("x_"))
-        || last == "key"
-        || last.ends_with("_key")
-        || last == "community"
+    let last = key.rsplit('.').next().unwrap_or("");
+    key.split('.').any(|seg| starts(seg, "x_"))
+        || last.eq_ignore_ascii_case("key")
+        || ends(last, "_key")
+        || last.eq_ignore_ascii_case("community")
         || ["psk", "passphrase", "secret", "authkey", "password", "passwd", "syslog_key", "sae_"]
             .iter()
-            .any(|s| k.contains(s))
+            .any(|s| contains(key, s))
 }
 
 /// Masks secret values in a whole `key=value` blob.
 pub fn redact(cfg: &str) -> String {
-    cfg.lines()
-        .map(|l| match l.split_once('=') {
-            Some((k, _)) if is_secret(k) => format!("{k}=<redacted>"),
-            _ => l.to_string(),
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
+    let mut out = String::with_capacity(cfg.len());
+    for (i, l) in cfg.lines().enumerate() {
+        if i > 0 {
+            out.push('\n');
+        }
+        match l.split_once('=') {
+            Some((k, _)) if is_secret(k) => {
+                out.push_str(k);
+                out.push_str("=<redacted>");
+            }
+            _ => out.push_str(l),
+        }
+    }
+    out
 }
 
 pub fn diff(old: &str, new: &str) -> Diff {
     let (old, new) = (parse(old), parse(new));
     let mut d = Diff::default();
-    let join = |v: &Vec<String>| v.join(" | ");
+    let join = |v: &Vec<&str>| v.join(" | ");
     for (k, nv) in &new {
         match old.get(k) {
-            None => d.added.push((k.clone(), join(nv))),
-            Some(ov) if ov != nv => d.changed.push((k.clone(), join(ov), join(nv))),
+            None => d.added.push((k.to_string(), join(nv))),
+            Some(ov) if ov != nv => d.changed.push((k.to_string(), join(ov), join(nv))),
             _ => {}
         }
     }
     for (k, ov) in &old {
         if !new.contains_key(k) {
-            d.removed.push((k.clone(), join(ov)));
+            d.removed.push((k.to_string(), join(ov)));
         }
     }
     d
@@ -120,6 +131,9 @@ mod tests {
         assert!(is_secret("aaa.3.iapp_key") && is_secret("unifi.key"));
         assert!(!is_secret("aaa.3.wpa.key.1.mgmt"));
         assert!(is_secret("snmp.community") && is_secret("community"));
+        assert!(is_secret("X_Passphrase") && is_secret("aaa.1.WPA.PSK") && is_secret("Unifi.KEY") && is_secret("a.b_KEY") && is_secret("SNMP.Community"));
+        assert!(!is_secret("") && !is_secret("radio.1.ht") && !is_secret("aaa.1.x") && !is_secret("max_x_power"));
+        assert_eq!(redact("a=1\n\nb\nc.psk=x=y\n"), "a=1\n\nb\nc.psk=<redacted>");
         assert_eq!(redact("snmp.status=enabled\nsnmp.community=public"), "snmp.status=enabled\nsnmp.community=<redacted>");
     }
 }
@@ -129,23 +143,10 @@ mod tests {
 #[cfg(test)]
 mod capture_fixtures {
     use super::*;
+    use crate::capture::sample::fixtures;
     use serde_json::Value;
     use std::collections::HashMap;
     use std::path::PathBuf;
-
-    /// The sanitised captures, kept outside the repository: `$APCTL_TESTDATA/2026-10-12-u6m-8.8.11`.
-    fn fixtures() -> Option<PathBuf> {
-        let Some(root) = std::env::var_os("APCTL_TESTDATA") else {
-            eprintln!("skipped: APCTL_TESTDATA is not set, so the capture fixtures are not available");
-            return None;
-        };
-        let dir = PathBuf::from(root).join("2026-10-12-u6m-8.8.11");
-        if !dir.is_dir() {
-            eprintln!("skipped: no capture fixtures in {}", dir.display());
-            return None;
-        }
-        Some(dir)
-    }
 
     fn dir() -> PathBuf {
         fixtures().expect("capture fixtures")

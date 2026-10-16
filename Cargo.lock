@@ -1578,6 +1578,7 @@ name = "informdump"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "apcfg",
  "clap",
  "etherparse",
  "futures-util",

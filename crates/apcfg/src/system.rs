@@ -1,14 +1,17 @@
 //! `system_cfg`: all sections, in the official controller's order.
 
+use std::borrow::Cow;
+use std::sync::OnceLock;
+
 use anyhow::{Result, bail};
 use serde_json::Value;
 
-use crate::cfg::Cfg;
+use crate::cfg::{Cfg, Prefix};
 use crate::javahash::hash_set_order;
-use crate::json::{arr, flag, int_of, mac_eq, on_off, str_list, str_of, text_of};
+use crate::json::{arr, flag, int_of, mac_eq, on_off, override_of, str_list, str_of, text_of};
 use crate::meta::Meta;
 use crate::net::{self, Net};
-use crate::wlan::{self, Radio, Vap, network_vlan, wlan_id};
+use crate::wlan::{self, Band, Radio, Vap, network_vlan, wlan_id};
 use crate::{Ctx, bit, mgmt, tz};
 
 pub fn render(ctx: &Ctx) -> Result<(String, Value)> {
@@ -17,13 +20,14 @@ pub fn render(ctx: &Ctx) -> Result<(String, Value)> {
     let mut meta = Meta::load(ctx, i64::from(qca_v2));
     let radios = wlan::radios(ctx);
     let wanted = wlan::deploy(ctx, &radios);
-    let keys: Vec<(String, String)> = wanted.iter().map(|(w, r)| (wlan_id(w).to_string(), radios[*r].name.clone())).collect();
+    let keys: Vec<(String, String)> = wanted.iter().map(|(w, r)| (wlan_id(w).to_string(), radios[*r].name.to_string())).collect();
     let slots = meta.wireless(&keys, |radio, k| if qca_v2 { format!("{radio}ap{k}") } else { format!("ath{k}") });
     let vaps: Vec<Vap> =
         wanted.into_iter().zip(slots).zip(keys).map(|(((w, radio), slot), (id, _))| Vap { id, w, radio, slot }).collect();
     let net = net::build(ctx, &radios, &vaps)?;
 
-    let mut c = Cfg::default();
+    // A typical system_cfg is 10-20 KB.
+    let mut c = Cfg::with_capacity(16 << 10);
     unifi(&mut c, ctx);
     system(&mut c, ctx);
     users(&mut c, ctx)?;
@@ -42,10 +46,10 @@ pub fn render(ctx: &Ctx) -> Result<(String, Value)> {
             [("guest", 2, 30, "skb"), ("vapid", 5, 11, "ubnt"), ("associd", 11, 0, "ubnt")].iter().enumerate()
         {
             let i = i + 1;
-            c.set(format!("mark.{i}.name"), name);
-            c.set(format!("mark.{i}.bits"), bits);
-            c.set(format!("mark.{i}.shift"), shift);
-            c.set(format!("mark.{i}.location"), location);
+            c.set(format_args!("mark.{i}.name"), name);
+            c.set(format_args!("mark.{i}.bits"), bits);
+            c.set(format_args!("mark.{i}.shift"), shift);
+            c.set(format_args!("mark.{i}.location"), location);
         }
     }
     qos(&mut c, ctx, &radios, &vaps);
@@ -58,7 +62,7 @@ pub fn render(ctx: &Ctx) -> Result<(String, Value)> {
     c.set("ip6tables.status", "disabled");
     for s in ["redirector", "ipset", "dnsmasq"] {
         c.header(s);
-        c.set(format!("{s}.status"), "disabled");
+        c.set(format_args!("{s}.status"), "disabled");
     }
     syslog(&mut c, ctx);
     sshd(&mut c, ctx);
@@ -81,18 +85,18 @@ pub fn render(ctx: &Ctx) -> Result<(String, Value)> {
     cron(&mut c, ctx, &radios, &vaps);
     c.header("DPI Fingerprint");
     c.header("misc");
-    Ok((c.finish(), meta.to_doc(&ctx.site_id, &ctx.mac)))
+    Ok((c.finish(), meta.to_doc(ctx.site_id, &ctx.mac)))
 }
 
 fn unifi(c: &mut Cfg, ctx: &Ctx) {
     let ctl = ctx.controller;
-    let mgmt = ctx.setting("mgmt");
+    let mgmt = ctx.mgmt;
     c.header("unifi");
     c.set("unifi.version", &ctl.version);
     c.set("unifi.anonymous_controller_id", &ctl.reporter_uuid);
     c.opt("unifi.anonymous_site_id", str_of(ctx.site, "anonymous_id"));
     c.set("unifi.reporterid", &ctl.reporter_uuid);
-    c.set("unifi.siteid", &ctx.site_id);
+    c.set("unifi.siteid", ctx.site_id);
     let idp = flag(mgmt, "unifi_idp_enabled", true);
     c.set("unifi.idp", on_off(idp));
     if idp {
@@ -107,12 +111,12 @@ fn unifi(c: &mut Cfg, ctx: &Ctx) {
         (3, 0..=2) => 3,
         _ => 7,
     };
-    c.set("unifi.cfgcap_info", format!("0x{cap:x}"));
+    c.set("unifi.cfgcap_info", format_args!("0x{cap:x}"));
 }
 
 fn system(c: &mut Cfg, ctx: &Ctx) {
     c.header("system");
-    let analytics = flag(ctx.setting("super_mgmt"), "enable_analytics", true);
+    let analytics = flag(ctx.super_mgmt, "enable_analytics", true);
     c.set("system.analytics.status", on_off(analytics));
     let zone = str_of(ctx.setting("locale"), "timezone").unwrap_or("UTC");
     if let Some(posix) = tz::posix(zone) {
@@ -125,7 +129,7 @@ fn system(c: &mut Cfg, ctx: &Ctx) {
 }
 
 fn users(c: &mut Cfg, ctx: &Ctx) -> Result<()> {
-    let mgmt = ctx.setting("mgmt");
+    let mgmt = ctx.mgmt;
     // The crypt(3) hash is random-salted, so it is an input: the controller stores it
     // next to the password (as the official one caches it in the same field).
     let field = if bit(ctx.caps.fw, 10) { "x_ssh_sha512passwd" } else { "x_ssh_md5passwd" };
@@ -172,14 +176,10 @@ fn wireless(c: &mut Cfg, ctx: &Ctx, radios: &[Radio], vaps: &[Vap], net: &Net) {
         c.header("no wlan provisioned as no radio found");
     } else {
         c.set("radio.status", "enabled");
-        c.set("radio.countrycode", wlan::country(ctx));
+        c.set("radio.countrycode", &ctx.country);
         c.set("aaa.status", "enabled");
         c.set("wireless.status", "enabled");
-        let outdoor = match str_of(ctx.device, "outdoor_mode_override") {
-            Some("on") => true,
-            Some("off") => false,
-            _ => flag(ctx.setting("mgmt"), "outdoor_mode_enabled", false),
-        };
+        let outdoor = override_of(ctx.device, "outdoor_mode_override", flag(ctx.mgmt, "outdoor_mode_enabled", false));
         c.set("radio.outdoor", on_off(outdoor));
         any_stamgr = wlan::render_radios(c, ctx, radios, vaps);
         for i in 0..vaps.len() {
@@ -218,7 +218,7 @@ fn wireless(c: &mut Cfg, ctx: &Ctx, radios: &[Radio], vaps: &[Vap], net: &Net) {
 fn bandsteering(c: &mut Cfg, ctx: &Ctx, radios: &[Radio], vaps: &[Vap]) {
     c.header("bandsteering");
     let mode = str_of(ctx.device, "bandsteering_mode").unwrap_or("off");
-    if !flag(ctx.setting("mgmt"), "advanced_feature_enabled", false) || mode == "off" {
+    if !flag(ctx.mgmt, "advanced_feature_enabled", false) || mode == "off" {
         c.set("bandsteering.status", "disabled");
         return;
     }
@@ -228,12 +228,12 @@ fn bandsteering(c: &mut Cfg, ctx: &Ctx, radios: &[Radio], vaps: &[Vap]) {
         return;
     }
     let mut k = 0;
-    for ng in vaps.iter().filter(|v| radios[v.radio].band == "ng") {
-        if let Some(na) = vaps.iter().find(|v| radios[v.radio].band == "na" && v.id == ng.id) {
+    for ng in vaps.iter().filter(|v| radios[v.radio].band == Band::Ng) {
+        if let Some(na) = vaps.iter().find(|v| radios[v.radio].band == Band::Na && v.id == ng.id) {
             k += 1;
-            c.set(format!("bandsteering.{k}.status"), "enabled");
-            c.set(format!("bandsteering.{k}.vap.1.devname"), ng.dev());
-            c.set(format!("bandsteering.{k}.vap.2.devname"), na.dev());
+            c.set(format_args!("bandsteering.{k}.status"), "enabled");
+            c.set(format_args!("bandsteering.{k}.vap.1.devname"), ng.dev());
+            c.set(format_args!("bandsteering.{k}.vap.2.devname"), na.dev());
         }
     }
 }
@@ -243,9 +243,8 @@ type AclBlock<'a> = (&'a str, &'a str, Vec<(String, &'static str)>);
 
 fn mac_acl(c: &mut Cfg, ctx: &Ctx, vaps: &[Vap]) {
     // Clients pinned ("lock to AP") to some other AP may not join this one.
-    let locked_elsewhere: Vec<String> = arr(ctx.state, "clients")
-        .iter()
-        .filter(|u| str_of(u, "site_id").is_none_or(|s| s == ctx.site_id))
+    let locked_elsewhere: Vec<String> = ctx
+        .site_docs("clients")
         .filter(|u| flag(u, "fixed_ap_enabled", false))
         .filter(|u| str_of(u, "fixed_ap_mac").is_some_and(|m| !mac_eq(m, &ctx.mac)))
         .filter_map(|u| str_of(u, "mac"))
@@ -282,15 +281,15 @@ fn mac_acl(c: &mut Cfg, ctx: &Ctx, vaps: &[Vap]) {
     c.set("macacl.status", on_off(!blocks.is_empty()));
     for (k, (dev, policy, entries)) in blocks.iter().enumerate() {
         let k = k + 1;
-        c.set(format!("macacl.{k}.status"), "enabled");
-        c.set(format!("macacl.{k}.devname"), dev);
-        c.set(format!("macacl.{k}.acl.status"), "enabled");
-        c.set(format!("macacl.{k}.acl.policy"), policy);
+        c.set(format_args!("macacl.{k}.status"), "enabled");
+        c.set(format_args!("macacl.{k}.devname"), dev);
+        c.set(format_args!("macacl.{k}.acl.status"), "enabled");
+        c.set(format_args!("macacl.{k}.acl.policy"), policy);
         for (j, (mac, kind)) in entries.iter().enumerate() {
             let j = j + 1;
-            c.set(format!("macacl.{k}.acl.{j}.status"), "enabled");
-            c.set(format!("macacl.{k}.acl.{j}.mac"), mac);
-            c.set(format!("macacl.{k}.acl.{j}.type"), kind);
+            c.set(format_args!("macacl.{k}.acl.{j}.status"), "enabled");
+            c.set(format_args!("macacl.{k}.acl.{j}.mac"), mac);
+            c.set(format_args!("macacl.{k}.acl.{j}.type"), kind);
         }
     }
 }
@@ -332,8 +331,8 @@ fn addressing(c: &mut Cfg, ctx: &Ctx) {
     for i in 1..=2 {
         let dns = cn(&format!("dns{i}")).filter(|d| !d.is_empty());
         match dns {
-            Some(ip) => c.set(format!("resolv.nameserver.{i}.ip"), ip),
-            None => c.set(format!("resolv.nameserver.{i}.status"), "disabled"),
+            Some(ip) => c.set(format_args!("resolv.nameserver.{i}.ip"), ip),
+            None => c.set(format_args!("resolv.nameserver.{i}.status"), "disabled"),
         }
     }
     if is_static {
@@ -384,7 +383,7 @@ fn syslog(c: &mut Cfg, ctx: &Ctx) {
 }
 
 fn sshd(c: &mut Cfg, ctx: &Ctx) {
-    let mgmt = ctx.setting("mgmt");
+    let mgmt = ctx.mgmt;
     c.header("sshd");
     if !flag(mgmt, "x_ssh_enabled", true) {
         c.set("sshd.status", "disabled");
@@ -395,11 +394,11 @@ fn sshd(c: &mut Cfg, ctx: &Ctx) {
     c.set("sshd.status", "enabled");
     c.set("sshd.auth.passwd", on_off(flag(mgmt, "x_ssh_auth_password_enabled", true)));
     for (i, key) in arr(mgmt, "x_ssh_keys").iter().enumerate() {
-        let k = |s: &str| format!("sshd.auth.key.{}.{s}", i + 1);
-        c.set(k("status"), "enabled");
-        c.opt(k("value"), str_of(key, "key"));
-        c.opt(k("type"), str_of(key, "type"));
-        c.opt(k("comment"), str_of(key, "comment").or(str_of(key, "name")));
+        let k = Prefix::new("sshd.auth.key", i + 1);
+        c.set(k.at("status"), "enabled");
+        c.opt(k.at("value"), str_of(key, "key"));
+        c.opt(k.at("type"), str_of(key, "type"));
+        c.opt(k.at("comment"), str_of(key, "comment").or(str_of(key, "name")));
     }
     if !flag(mgmt, "x_ssh_bind_wildcard", false) {
         c.set("sshd.1.status", "enabled");
@@ -446,8 +445,8 @@ fn ntp(c: &mut Cfg, ctx: &Ctx) {
     }
     c.set("ntpclient.status", "enabled");
     for (i, server) in servers.iter().enumerate() {
-        c.set(format!("ntpclient.{}.status", i + 1), "enabled");
-        c.set(format!("ntpclient.{}.server", i + 1), server);
+        c.set(format_args!("ntpclient.{}.status", i + 1), "enabled");
+        c.set(format_args!("ntpclient.{}.server", i + 1), server);
     }
 }
 
@@ -456,20 +455,19 @@ fn switch(c: &mut Cfg, ctx: &Ctx) {
     if !bit(ctx.caps.fw, 4) {
         return;
     }
-    let d = ctx.device;
     c.set("switch.status", "disabled");
-    c.set("switch.vlan.status", on_off(flag(d, "switch_vlan_enabled", false)));
-    c.set("switch.jumboframes", on_off(flag(d, "jumboframe_enabled", false)));
+    c.set("switch.vlan.status", on_off(flag(ctx.device, "switch_vlan_enabled", false)));
+    c.set("switch.jumboframes", on_off(flag(ctx.device, "jumboframe_enabled", false)));
     c.set("switch.dot1x.status", "disabled");
-    let ports: i64 = arr(d, "ethernet_table").iter().filter_map(|e| int_of(e, "num_port")).sum();
+    let ports: i64 = arr(ctx.device, "ethernet_table").iter().filter_map(|e| int_of(e, "num_port")).sum();
     for i in 1..=ports.max(1) {
-        let name = arr(d, "port_overrides")
+        let name = arr(ctx.device, "port_overrides")
             .iter()
             .find(|p| int_of(p, "port_idx") == Some(i))
             .and_then(|p| str_of(p, "name"))
             .map_or_else(|| format!("Port {i}"), str::to_string);
-        c.set(format!("switch.port.{i}.name"), name);
-        c.set(format!("switch.port.{i}.opmode"), "switch");
+        c.set(format_args!("switch.port.{i}.name"), name);
+        c.set(format_args!("switch.port.{i}.opmode"), "switch");
     }
 }
 
@@ -525,34 +523,31 @@ fn mdns_services(code: &str) -> &'static [&'static str] {
 
 /// What "auto" mode filters for: every code's types, each code's sorted, in table
 /// order (a type in two codes is listed twice, as the official controller does).
-fn mdns_auto_services() -> Vec<String> {
-    MDNS_SERVICES
-        .iter()
-        .flat_map(|(_, _, types)| {
-            let mut t: Vec<&str> = types.to_vec();
-            t.sort_unstable();
-            t
-        })
-        .map(str::to_string)
-        .collect()
+/// Built once.
+fn mdns_auto_services() -> &'static [&'static str] {
+    static AUTO: OnceLock<Vec<&'static str>> = OnceLock::new();
+    AUTO.get_or_init(|| {
+        MDNS_SERVICES
+            .iter()
+            .flat_map(|(_, _, types)| {
+                let mut t: Vec<&str> = types.to_vec();
+                t.sort_unstable();
+                t
+            })
+            .collect()
+    })
 }
 
-struct MdnsEntry {
-    networks: Vec<Option<String>>,
-    mode: String,
-    services: Vec<String>,
+struct MdnsEntry<'a> {
+    networks: Vec<Option<&'a str>>,
+    mode: &'a str,
+    services: Cow<'a, [&'a str]>,
 }
 
-fn entry_services(e: &Value) -> Vec<String> {
-    let mut out: Vec<String> = arr(e, "predefined_services")
-        .iter()
-        .filter_map(|s| str_of(s, "code"))
-        .flat_map(mdns_services)
-        .map(|s| s.to_string())
-        .collect();
+fn entry_services(e: &Value) -> Vec<&str> {
+    let mut out: Vec<&str> = arr(e, "predefined_services").iter().filter_map(|s| str_of(s, "code")).flat_map(mdns_services).copied().collect();
     for s in arr(e, "custom_services") {
-        let name = s.as_str().or_else(|| str_of(s, "address")).or_else(|| str_of(s, "name"));
-        out.extend(name.map(str::to_string));
+        out.extend(s.as_str().or_else(|| str_of(s, "address")).or_else(|| str_of(s, "name")));
     }
     out
 }
@@ -585,67 +580,62 @@ fn mdns(c: &mut Cfg, ctx: &Ctx, vaps: &[Vap], net: &Net) {
     }
     let bridge_of_vlan = |vlan: i64| {
         let tag = if vlan == 1 { 0 } else { vlan };
-        net.bridges.iter().find(|b| b.vlan == tag).map(|b| b.name.clone())
+        net.bridges.iter().find(|b| b.vlan == tag).map(|b| b.name.as_str())
     };
     let (mut f, mut p) = (0, 0);
     for wv in wlans {
-        let w = &wv.w;
+        let w: &Value = &wv.w;
         let devs: Vec<&str> = vaps.iter().filter(|v| v.id == wv.id).map(Vap::dev).collect();
-        let own = str_of(w, "networkconf_id").map(str::to_string);
+        let own = str_of(w, "networkconf_id");
         let mut entries: Vec<MdnsEntry> = Vec::new();
         if str_of(w, "mdns_proxy_mode") == Some("custom") {
             let custom: Vec<&Value> = arr(w, "mdns_proxy_custom").iter().filter(|e| applies(e)).collect();
-            let lists_own =
-                custom.iter().any(|e| own.as_deref().is_some_and(|o| str_list(e, "networkconf_ids").contains(&o)));
+            let lists_own = custom.iter().any(|e| own.is_some_and(|o| str_list(e, "networkconf_ids").contains(&o)));
             if !lists_own {
                 let all = custom.iter().any(|e| str_of(e, "services_mode") == Some("all"));
-                let mut union: Vec<String> = Vec::new();
+                let mut union: Vec<&str> = Vec::new();
                 for s in custom.iter().flat_map(|e| entry_services(e)) {
                     if !union.contains(&s) {
                         union.push(s);
                     }
                 }
-                entries.push(MdnsEntry {
-                    networks: vec![own.clone()],
-                    mode: if all { "all" } else { "specific" }.to_string(),
-                    services: union,
-                });
+                entries.push(MdnsEntry { networks: vec![own], mode: if all { "all" } else { "specific" }, services: Cow::Owned(union) });
             }
             entries.extend(custom.iter().map(|e| MdnsEntry {
-                networks: str_list(e, "networkconf_ids").into_iter().map(|n| Some(n.to_string())).collect(),
-                mode: str_of(e, "services_mode").unwrap_or("all").to_string(),
-                services: entry_services(e),
+                networks: str_list(e, "networkconf_ids").into_iter().map(Some).collect(),
+                mode: str_of(e, "services_mode").unwrap_or("all"),
+                services: Cow::Owned(entry_services(e)),
             }));
         } else {
-            entries.push(MdnsEntry { networks: vec![own.clone()], mode: "specific".into(), services: mdns_auto_services() });
+            entries.push(MdnsEntry { networks: vec![own], mode: "specific", services: Cow::Borrowed(mdns_auto_services()) });
         }
-        let own_bridge = bridge_of_vlan(network_vlan(ctx, own.as_deref()));
+        let own_bridge = bridge_of_vlan(network_vlan(ctx, own));
         for e in entries {
-            let others: Vec<String> = e
+            let others: Vec<&str> = e
                 .networks
                 .iter()
                 .filter(|n| **n != own)
-                .filter_map(|n| bridge_of_vlan(network_vlan(ctx, n.as_deref())))
-                .filter(|b| Some(b) != own_bridge.as_ref())
+                .filter_map(|n| bridge_of_vlan(network_vlan(ctx, *n)))
+                .filter(|b| Some(*b) != own_bridge)
                 .collect();
-            if let (false, Some(own_bridge)) = (others.is_empty(), &own_bridge) {
+            if let (false, Some(own_bridge)) = (others.is_empty(), own_bridge) {
                 p += 1;
-                c.set(format!("mdns_sd.proxy.{p}.status"), "enabled");
-                c.set(format!("mdns_sd.proxy.{p}.dst.1.devname"), own_bridge);
+                c.set(format_args!("mdns_sd.proxy.{p}.status"), "enabled");
+                c.set(format_args!("mdns_sd.proxy.{p}.dst.1.devname"), own_bridge);
                 for (i, b) in others.iter().enumerate() {
-                    c.set(format!("mdns_sd.proxy.{p}.src.{}.devname", i + 1), b);
+                    c.set(format_args!("mdns_sd.proxy.{p}.src.{}.devname", i + 1), b);
                 }
             }
             for n in &e.networks {
                 f += 1;
-                c.set(format!("mdns_sd.filter.{f}.vlan"), network_vlan(ctx, n.as_deref()));
-                c.set(format!("mdns_sd.filter.{f}.policy"), if e.mode == "all" { "allow" } else { "deny" });
+                c.set(format_args!("mdns_sd.filter.{f}.vlan"), network_vlan(ctx, *n));
+                c.set(format_args!("mdns_sd.filter.{f}.policy"), if e.mode == "all" { "allow" } else { "deny" });
                 for (i, d) in devs.iter().enumerate() {
-                    c.set(format!("mdns_sd.filter.{f}.dst.{}.devname", i + 1), d);
+                    c.set(format_args!("mdns_sd.filter.{f}.dst.{}.devname", i + 1), d);
                 }
                 if e.mode == "specific" {
                     for (i, s) in e.services.iter().enumerate() {
-                        c.set(format!("mdns_sd.filter.{f}.service.{}.name", i + 1), s);
+                        c.set(format_args!("mdns_sd.filter.{f}.service.{}.name", i + 1), s);
                     }
                 }
             }
@@ -669,8 +659,8 @@ fn limits(g: &Value) -> (i64, i64) {
 /// 5 GHz), which gives the table's 300 and 2400 for a U6-Mesh.
 fn radio_max_mbps(r: &Radio) -> i64 {
     let nss = int_of(r.doc, "nss").unwrap_or(2).max(1);
-    let per_stream = match r.band.as_str() {
-        "ng" => 150,
+    let per_stream = match r.band {
+        Band::Ng => 150,
         _ if flag(r.doc, "is_11ax", false) => 600,
         _ => 433,
     };
@@ -704,14 +694,14 @@ fn qos(c: &mut Cfg, ctx: &Ctx, radios: &[Radio], vaps: &[Vap]) {
     let mut k = 0;
     for u in &uplinks {
         k += 1;
-        c.set(format!("qos.if.{k}.devname"), u);
-        c.set(format!("qos.if.{k}.devspeed"), 1000);
-        c.set(format!("qos.if.{k}.type"), "uplink");
+        c.set(format_args!("qos.if.{k}.devname"), u);
+        c.set(format_args!("qos.if.{k}.devspeed"), 1000);
+        c.set(format_args!("qos.if.{k}.type"), "uplink");
     }
     for v in vaps {
         k += 1;
-        c.set(format!("qos.if.{k}.devname"), v.dev());
-        c.set(format!("qos.if.{k}.devspeed"), radio_max_mbps(&radios[v.radio]));
+        c.set(format_args!("qos.if.{k}.devname"), v.dev());
+        c.set(format_args!("qos.if.{k}.devspeed"), radio_max_mbps(&radios[v.radio]));
     }
     let default = groups.iter().find(|g| str_of(g, "attr_hidden_id") == Some("Default")).copied();
     for (i, v) in vaps.iter().enumerate() {
@@ -719,18 +709,18 @@ fn qos(c: &mut Cfg, ctx: &Ctx, radios: &[Radio], vaps: &[Vap]) {
         let group = str_of(&v.w, "usergroup_id").and_then(|id| groups.iter().find(|g| crate::json::oid(g) == Some(id)).copied()).or(default);
         let (down, up) = group.map_or((-1, -1), limits);
         let ceiling = radio_max_mbps(&radios[v.radio]);
-        c.set(format!("qos.vap.{m}.id"), m);
-        c.set(format!("qos.vap.{m}.devname"), v.dev());
-        c.set(format!("qos.vap.{m}.dwnlink.minspeed"), if down > 0 { down } else { ceiling });
+        c.set(format_args!("qos.vap.{m}.id"), m);
+        c.set(format_args!("qos.vap.{m}.devname"), v.dev());
+        c.set(format_args!("qos.vap.{m}.dwnlink.minspeed"), if down > 0 { down } else { ceiling });
         if down > 0 {
-            c.set(format!("qos.vap.{m}.dwnlink.maxspeed"), down);
+            c.set(format_args!("qos.vap.{m}.dwnlink.maxspeed"), down);
         }
         for (j, u) in uplinks.iter().enumerate() {
             let j = j + 1;
-            c.set(format!("qos.vap.{m}.uplink.{j}.devname"), u);
-            c.set(format!("qos.vap.{m}.uplink.{j}.minspeed"), if up > 0 { up } else { ceiling });
+            c.set(format_args!("qos.vap.{m}.uplink.{j}.devname"), u);
+            c.set(format_args!("qos.vap.{m}.uplink.{j}.minspeed"), if up > 0 { up } else { ceiling });
             if up > 0 {
-                c.set(format!("qos.vap.{m}.uplink.{j}.maxspeed"), up);
+                c.set(format_args!("qos.vap.{m}.uplink.{j}.maxspeed"), up);
             }
         }
     }
@@ -738,10 +728,9 @@ fn qos(c: &mut Cfg, ctx: &Ctx, radios: &[Radio], vaps: &[Vap]) {
 
 fn cron(c: &mut Cfg, ctx: &Ctx, radios: &[Radio], vaps: &[Vap]) {
     let schedules = vaps.iter().any(|v| !arr(&v.w, "schedule_with_duration").is_empty());
-    let country = wlan::country(ctx);
-    let fcc = country == "840" || country == "124";
+    let fcc = ctx.country == "840" || ctx.country == "124";
     let dfs = radios.iter().any(|r| {
-        r.band == "na"
+        r.band == Band::Na
             && flag(r.doc, if fcc { "has_fccdfs" } else { "has_dfs" }, false)
             && int_of(r.doc, "channel").is_some_and(is_dfs_channel)
     });
@@ -763,9 +752,9 @@ fn cron(c: &mut Cfg, ctx: &Ctx, radios: &[Radio], vaps: &[Vap]) {
     c.set("cron.1.user", ctx.ssh_username());
     for (j, (schedule, cmd)) in jobs.iter().enumerate() {
         let j = j + 1;
-        c.set(format!("cron.1.job.{j}.status"), "enabled");
-        c.set(format!("cron.1.job.{j}.schedule"), schedule);
-        c.set(format!("cron.1.job.{j}.cmd"), cmd);
+        c.set(format_args!("cron.1.job.{j}.status"), "enabled");
+        c.set(format_args!("cron.1.job.{j}.schedule"), schedule);
+        c.set(format_args!("cron.1.job.{j}.cmd"), cmd);
     }
 }
 

@@ -130,6 +130,8 @@ struct Tracker {
     ports: Vec<u16>,
     udp_ports: Vec<u16>,
     conns: HashMap<ConnId, Conn>,
+    /// Capture time of the last sweep for idle connections.
+    last_sweep: Micros,
 }
 
 #[derive(Default)]
@@ -139,9 +141,25 @@ struct Conn {
     last_seen: Micros,
 }
 
+impl Conn {
+    /// Both sides closed and nothing is missing.
+    fn closed(&self) -> bool {
+        self.to_server.closed() && self.to_client.closed()
+    }
+}
+
+/// Connections tracked beyond which idle ones are swept, at most once per `SWEEP_EVERY` of capture time.
+const SWEEP_ABOVE: usize = 256;
+const SWEEP_EVERY: Micros = 10_000_000;
+/// How long an open connection may idle before it is forgotten (long live captures).
+const MAX_IDLE: Micros = 300_000_000;
+/// How long a closed connection is kept: long enough for the duplicate copies of its
+/// last segments that `-i any` captures, which arrive right behind the originals.
+const CLOSED_LINGER: Micros = 2_000_000;
+
 impl Tracker {
     fn new(ports: Vec<u16>, udp_ports: Vec<u16>) -> Self {
-        Tracker { ports, udp_ports, conns: HashMap::new() }
+        Tracker { ports, udp_ports, conns: HashMap::new(), last_sweep: 0 }
     }
 
     fn packet(&mut self, linktype: Linktype, ts: Micros, data: &[u8], on_event: &mut impl FnMut(HttpEvent)) {
@@ -197,17 +215,22 @@ impl Tracker {
             });
         }
         // Both sides closed and nothing is missing: release the buffers. The
-        // entry itself stays until it idles out, so the duplicate copies that
-        // `-i any` captures of the last segments count as retransmissions
-        // instead of starting a new stream.
-        if conn.to_server.closed() && conn.to_client.closed() {
+        // entry itself stays a little longer (`CLOSED_LINGER`), so the duplicate
+        // copies that `-i any` captures of the last segments count as
+        // retransmissions instead of starting a new stream.
+        if conn.closed() {
             conn.to_server.release();
             conn.to_client.release();
         }
 
-        // Forget connections idle for more than five minutes (long live captures).
-        if self.conns.len() > 256 {
-            self.conns.retain(|_, c| ts - c.last_seen < 300_000_000);
+        self.sweep(ts);
+    }
+
+    /// Forgets idle connections. Not on every packet: that would scan the whole map each time.
+    fn sweep(&mut self, ts: Micros) {
+        if self.conns.len() > SWEEP_ABOVE && ts.abs_diff(self.last_sweep) >= SWEEP_EVERY as u64 {
+            self.last_sweep = ts;
+            self.conns.retain(|_, c| ts - c.last_seen < if c.closed() { CLOSED_LINGER } else { MAX_IDLE });
         }
     }
 }
@@ -244,6 +267,7 @@ impl HalfStream {
             self.pending_bytes = 0;
             self.gap_since = None;
             self.buf.clear();
+            self.fin = false;
             return;
         }
         if payload.is_empty() {
@@ -369,83 +393,94 @@ fn parse_http(buf: &[u8], request: bool) -> ParseResult {
     if buf.is_empty() {
         return ParseResult::Partial;
     }
+    // Until the whole message is there this runs again on every segment, so nothing
+    // is copied before it is complete.
     let mut storage = [httparse::EMPTY_HEADER; 64];
-    let (head_len, headers, start) = if request {
+    let (head_len, headers, start): (usize, &[httparse::Header<'_>], _) = if request {
         let mut req = httparse::Request::new(&mut storage);
         match req.parse(buf) {
-            Ok(httparse::Status::Complete(n)) => {
-                let start = (req.method.unwrap_or("").to_string(), req.path.unwrap_or("").to_string(), 0);
-                (n, collect_headers(req.headers), start)
-            }
+            Ok(httparse::Status::Complete(n)) => (n, req.headers, (req.method.unwrap_or(""), req.path.unwrap_or(""), 0)),
             Ok(httparse::Status::Partial) => return ParseResult::Partial,
             Err(_) => return ParseResult::Garbage,
         }
     } else {
         let mut resp = httparse::Response::new(&mut storage);
         match resp.parse(buf) {
-            Ok(httparse::Status::Complete(n)) => {
-                (n, collect_headers(resp.headers), (String::new(), String::new(), resp.code.unwrap_or(0)))
-            }
+            Ok(httparse::Status::Complete(n)) => (n, resp.headers, ("", "", resp.code.unwrap_or(0))),
             Ok(httparse::Status::Partial) => return ParseResult::Partial,
             Err(_) => return ParseResult::Garbage,
         }
     };
 
-    let header = |name: &str| headers.iter().find(|(k, _)| k.eq_ignore_ascii_case(name)).map(|(_, v)| v.as_str());
+    let header = |name: &str| headers.iter().find(|h| h.name.eq_ignore_ascii_case(name)).map(|h| h.value);
     let rest = &buf[head_len..];
-    let (body, body_len) = if header("transfer-encoding").is_some_and(|v| v.to_ascii_lowercase().contains("chunked")) {
-        match dechunk(rest) {
-            Some(r) => r,
-            None => return ParseResult::Partial,
+    let chunked = header("transfer-encoding").is_some_and(|v| v.windows(7).any(|w| w.eq_ignore_ascii_case(b"chunked")));
+    let (body, body_len) = if chunked {
+        match chunked_len(rest, |_| {}) {
+            Chunked::Complete(used, size) => {
+                let mut body = Vec::with_capacity(size);
+                chunked_len(rest, |chunk| body.extend_from_slice(chunk));
+                (body, used)
+            }
+            Chunked::Partial => return ParseResult::Partial,
+            Chunked::Garbage => return ParseResult::Garbage,
         }
     } else {
-        let len = header("content-length").and_then(|v| v.trim().parse::<usize>().ok()).unwrap_or(0);
+        let len = header("content-length").and_then(|v| std::str::from_utf8(v).ok()?.trim().parse::<usize>().ok()).unwrap_or(0);
         if rest.len() < len {
             return ParseResult::Partial;
         }
         (rest[..len].to_vec(), len)
     };
 
+    let headers = headers.iter().map(|h| (h.name.to_string(), String::from_utf8_lossy(h.value).into_owned())).collect();
     let (method, path, status) = start;
     let msg = if request {
-        Parsed::Request { method, path, headers, body }
+        Parsed::Request { method: method.to_string(), path: path.to_string(), headers, body }
     } else {
         Parsed::Response { status, headers, body }
     };
     ParseResult::Complete(msg, head_len + body_len)
 }
 
-fn collect_headers(headers: &[httparse::Header<'_>]) -> Vec<(String, String)> {
-    headers
-        .iter()
-        .map(|h| (h.name.to_string(), String::from_utf8_lossy(h.value).into_owned()))
-        .collect()
+enum Chunked {
+    /// The bytes the chunked body takes up (with its trailers), and the size of its data.
+    Complete(usize, usize),
+    Partial,
+    /// A chunk size that is not hex or larger than any message we keep.
+    Garbage,
 }
 
-/// Decodes a chunked body. Returns `None` until the terminating chunk is present.
-fn dechunk(mut buf: &[u8]) -> Option<(Vec<u8>, usize)> {
+/// Walks a chunked body, calling `chunk` with each chunk's data, until the terminating
+/// chunk and the trailers after it.
+fn chunked_len<'b>(mut buf: &'b [u8], mut chunk: impl FnMut(&'b [u8])) -> Chunked {
     let total = buf.len();
-    let mut body = Vec::new();
+    let mut data = 0;
     loop {
-        let line_end = find(buf, b"\r\n")?;
-        let size_str = std::str::from_utf8(&buf[..line_end]).ok()?;
-        let size = usize::from_str_radix(size_str.split(';').next()?.trim(), 16).ok()?;
+        let Some(line_end) = find(buf, b"\r\n") else { return Chunked::Partial };
+        let size = std::str::from_utf8(&buf[..line_end])
+            .ok()
+            .and_then(|line| usize::from_str_radix(line.split(';').next().unwrap_or_default().trim(), 16).ok());
+        // A chunk that could not fit the buffer is not one we will ever see whole; the
+        // cap also keeps `size + 2` from overflowing.
+        let Some(size) = size.filter(|&s| s <= MAX_BUFFER) else { return Chunked::Garbage };
         buf = &buf[line_end + 2..];
         if size == 0 {
             // Skip optional trailers up to the blank line.
-            let end = find(buf, b"\r\n")?;
+            let Some(end) = find(buf, b"\r\n") else { return Chunked::Partial };
             if end == 0 {
                 buf = &buf[2..];
             } else {
-                let end = find(buf, b"\r\n\r\n")?;
+                let Some(end) = find(buf, b"\r\n\r\n") else { return Chunked::Partial };
                 buf = &buf[end + 4..];
             }
-            return Some((body, total - buf.len()));
+            return Chunked::Complete(total - buf.len(), data);
         }
         if buf.len() < size + 2 {
-            return None;
+            return Chunked::Partial;
         }
-        body.extend_from_slice(&buf[..size]);
+        chunk(&buf[..size]);
+        data += size;
         buf = &buf[size + 2..];
     }
 }
@@ -478,6 +513,10 @@ mod tests {
         h.segment(0, 107, false, b"world "); // fills the gap
         assert_eq!(h.buf, b"hello world !");
         assert_eq!((h.pending_bytes, h.gap_since), (0, None));
+        // A new connection on the same addresses starts open.
+        h.fin = true;
+        h.segment(0, 9000, true, b"");
+        assert!(!h.closed() && h.buf.is_empty());
     }
 
     #[test]
@@ -540,27 +579,99 @@ mod tests {
     }
 
     #[test]
+    fn oversized_or_malformed_chunk_sizes_are_garbage() {
+        let good = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n2\r\nok\r\n0\r\n\r\n";
+        for size in ["ffffffffffffffff", "fffffffffffffffe", "1000000000", "zz"] {
+            let mut buf = format!("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n{size}\r\nabc").into_bytes();
+            buf.extend_from_slice(good);
+            let mut h = HalfStream { buf, ..Default::default() };
+            assert!(matches!(h.take_http(false), Some(Parsed::Response { body, .. }) if body == b"ok"), "{size}: skipped to the next response");
+            assert!(h.buf.is_empty());
+        }
+        // A size that is still arriving is not garbage.
+        assert!(matches!(chunked_len(b"fff", |_| {}), Chunked::Partial));
+        assert!(matches!(chunked_len(b"3\r\nab", |_| {}), Chunked::Partial));
+    }
+
+    #[test]
+    fn closed_connections_are_swept_soon_and_idle_ones_later() {
+        let mut t = Tracker::new(vec![8080], Vec::new());
+        let conn = |port: u16| ConnId { client: SocketAddr::from(([10, 0, 0, 5], port)), server: SocketAddr::from(([10, 0, 0, 1], 8080)) };
+        for port in 0..300u16 {
+            let mut c = Conn::default();
+            if port % 2 == 0 {
+                (c.to_server.fin, c.to_client.fin) = (true, true);
+            }
+            t.conns.insert(conn(port), c);
+        }
+        t.sweep(1_000_000);
+        assert_eq!(t.conns.len(), 300, "at most one sweep per SWEEP_EVERY");
+        t.sweep(20_000_000);
+        assert_eq!(t.conns.len(), 150, "closed ones go after CLOSED_LINGER");
+        assert!(t.conns.values().all(|c| !c.closed()));
+        t.conns.extend((300..500u16).map(|p| (conn(p), Conn::default())));
+        t.sweep(400_000_000);
+        assert!(t.conns.is_empty(), "open ones after MAX_IDLE");
+    }
+
+    #[test]
     fn resynchronises_after_starting_mid_message() {
         let mut h = HalfStream { buf: b"tail of an old body\x00\x01POST /inform HTTP/1.1\r\nContent-Length: 1\r\n\r\nx".to_vec(), ..Default::default() };
         assert!(matches!(h.take_http(true), Some(Parsed::Request { .. })));
     }
 }
 
-/// Builds synthetic captures for tests (here and in dependent crates).
+/// Synthetic captures and the capture fixtures, for tests here and in dependent crates (and
+/// informdump's made-up demo site, which writes the same pcap framing).
 #[doc(hidden)]
 pub mod sample {
+    use std::io::{self, Write};
+    use std::path::PathBuf;
+
     use etherparse::PacketBuilder;
+
+    use super::Micros;
+
+    /// The sanitised capture fixtures, kept outside the repository:
+    /// `$APCTL_TESTDATA/2026-10-12-u6m-8.8.11`. `None`, saying why, when they are not
+    /// there: tests that need them skip.
+    pub fn fixtures() -> Option<PathBuf> {
+        let Some(root) = std::env::var_os("APCTL_TESTDATA") else {
+            eprintln!("skipped: APCTL_TESTDATA is not set, so the capture fixtures are not available");
+            return None;
+        };
+        let dir = PathBuf::from(root).join("2026-10-12-u6m-8.8.11");
+        if !dir.is_dir() {
+            eprintln!("skipped: no capture fixtures in {}", dir.display());
+            return None;
+        }
+        Some(dir)
+    }
+
+    /// The header of a legacy pcap (microsecond timestamps) of Ethernet frames.
+    pub fn write_pcap_header(out: &mut impl Write, snaplen: u32) -> io::Result<()> {
+        out.write_all(&0xa1b2c3d4u32.to_le_bytes())?;
+        out.write_all(&2u16.to_le_bytes())?;
+        out.write_all(&4u16.to_le_bytes())?;
+        out.write_all(&0i32.to_le_bytes())?;
+        out.write_all(&0u32.to_le_bytes())?;
+        out.write_all(&snaplen.to_le_bytes())?;
+        out.write_all(&1u32.to_le_bytes()) // ethernet
+    }
+
+    /// One legacy pcap record holding all of `frame`.
+    pub fn write_pcap_record(out: &mut impl Write, ts: Micros, frame: &[u8]) -> io::Result<()> {
+        out.write_all(&((ts / 1_000_000) as u32).to_le_bytes())?;
+        out.write_all(&((ts % 1_000_000) as u32).to_le_bytes())?;
+        out.write_all(&(frame.len() as u32).to_le_bytes())?;
+        out.write_all(&(frame.len() as u32).to_le_bytes())?;
+        out.write_all(frame)
+    }
 
     /// A legacy pcap containing the given TCP segments as (to_server, seq, payload).
     pub fn pcap(segments: &[(bool, u32, &[u8])]) -> Vec<u8> {
         let mut out = Vec::new();
-        out.extend_from_slice(&0xa1b2c3d4u32.to_le_bytes());
-        out.extend_from_slice(&2u16.to_le_bytes());
-        out.extend_from_slice(&4u16.to_le_bytes());
-        out.extend_from_slice(&0i32.to_le_bytes());
-        out.extend_from_slice(&0u32.to_le_bytes());
-        out.extend_from_slice(&65535u32.to_le_bytes());
-        out.extend_from_slice(&1u32.to_le_bytes()); // ethernet
+        write_pcap_header(&mut out, 65535).unwrap();
         let (ap, ctrl) = ([10, 0, 0, 5], [10, 0, 0, 1]);
         for (i, (to_server, seq, payload)) in segments.iter().enumerate() {
             let builder = if *to_server {
@@ -570,31 +681,25 @@ pub mod sample {
             };
             let mut frame = Vec::new();
             builder.write(&mut frame, payload).unwrap();
-            let ts_sec = 1_791_840_600 + i as u32;
-            out.extend_from_slice(&ts_sec.to_le_bytes());
-            out.extend_from_slice(&0u32.to_le_bytes());
-            out.extend_from_slice(&(frame.len() as u32).to_le_bytes());
-            out.extend_from_slice(&(frame.len() as u32).to_le_bytes());
-            out.extend_from_slice(&frame);
+            write_pcap_record(&mut out, (1_791_840_600 + i as Micros) * 1_000_000, &frame).unwrap();
         }
         out
     }
 
-    pub fn http_request(body: &[u8]) -> Vec<u8> {
-        let mut m = format!(
-            "POST /inform HTTP/1.1\r\nHost: unifi\r\nX-Forwarded-For: 192.168.1.20\r\nContent-Length: {}\r\n\r\n",
-            body.len()
-        )
-        .into_bytes();
+    /// An HTTP/1.1 message: `head` is the start line and headers, each ending in CRLF;
+    /// the Content-Length and the blank line are added.
+    pub fn http(head: &str, body: &[u8]) -> Vec<u8> {
+        let mut m = format!("{head}Content-Length: {}\r\n\r\n", body.len()).into_bytes();
         m.extend_from_slice(body);
         m
     }
 
+    pub fn http_request(body: &[u8]) -> Vec<u8> {
+        http("POST /inform HTTP/1.1\r\nHost: unifi\r\nX-Forwarded-For: 192.168.1.20\r\n", body)
+    }
+
     pub fn http_response(body: &[u8]) -> Vec<u8> {
-        let mut m = format!("HTTP/1.1 200 OK\r\nContent-Type: application/x-binary\r\nContent-Length: {}\r\n\r\n", body.len())
-            .into_bytes();
-        m.extend_from_slice(body);
-        m
+        http("HTTP/1.1 200 OK\r\nContent-Type: application/x-binary\r\n", body)
     }
 }
 

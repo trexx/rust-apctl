@@ -19,12 +19,13 @@
 //! 16-byte nonce and the 40-byte header as associated data. The controller's
 //! reply uses the same framing.
 
+use std::borrow::Cow;
 use std::fmt;
 use std::io::Read;
 
 use aes::Aes128;
 use aes::cipher::{BlockModeDecrypt, BlockModeEncrypt, KeyIvInit, block_padding::Pkcs7};
-use aes_gcm::aead::{Aead, KeyInit, Payload};
+use aes_gcm::aead::{Aead, AeadInOut, KeyInit, Payload};
 use aes_gcm::aead::consts::U16;
 use aes_gcm::AesGcm;
 
@@ -84,18 +85,19 @@ impl std::str::FromStr for Mac {
     /// `aabbccddeeff`, any case.
     fn from_str(s: &str) -> Result<Self> {
         let b = s.as_bytes();
-        let hex: Vec<u8> = match b.len() {
-            12 => b.to_vec(),
+        let mut hex = [0u8; 12];
+        match b.len() {
+            12 => hex.copy_from_slice(b),
             17 if matches!(b[2], b':' | b'-') && (2..17).step_by(3).all(|i| b[i] == b[2]) => {
-                b.iter().enumerate().filter(|(i, _)| i % 3 != 2).map(|(_, c)| *c).collect()
+                for (i, pair) in b.chunks(3).enumerate() {
+                    hex[2 * i..2 * i + 2].copy_from_slice(&pair[..2]);
+                }
             }
             _ => return Err(Error::InvalidMac(s.to_string())),
-        };
-        let arr: [u8; 6] = hex::decode(&hex)
-            .ok()
-            .and_then(|b| b.try_into().ok())
-            .ok_or_else(|| Error::InvalidMac(s.to_string()))?;
-        Ok(Mac(arr))
+        }
+        let mut mac = [0u8; 6];
+        hex::decode_to_slice(hex, &mut mac).map_err(|_| Error::InvalidMac(s.to_string()))?;
+        Ok(Mac(mac))
     }
 }
 
@@ -222,13 +224,14 @@ impl<'a> Packet<'a> {
     pub fn open(&self, key: &[u8; 16]) -> Result<Vec<u8>> {
         let flags = self.header.flags;
         let decrypted = if !flags.has(Flags::ENCRYPTED) {
-            self.body.to_vec()
+            Cow::Borrowed(self.body)
         } else if flags.has(Flags::GCM) {
             let cipher = Aes128Gcm16::new(key.into());
             let nonce = (&self.header.iv).into();
-            cipher
+            let plain = cipher
                 .decrypt(nonce, Payload { msg: self.body, aad: self.raw_header })
-                .map_err(|_| Error::Decrypt)?
+                .map_err(|_| Error::Decrypt)?;
+            Cow::Owned(plain)
         } else {
             let mut buf = self.body.to_vec();
             let len = cbc::Decryptor::<Aes128>::new(key.into(), (&self.header.iv).into())
@@ -236,15 +239,18 @@ impl<'a> Packet<'a> {
                 .map_err(|_| Error::Decrypt)?
                 .len();
             buf.truncate(len);
-            buf
+            Cow::Owned(buf)
         };
         decompress(flags, decrypted)
     }
 }
 
-fn decompress(flags: Flags, data: Vec<u8>) -> Result<Vec<u8>> {
+/// Decompresses as flagged. An uncompressed payload is passed through, copied only if borrowed.
+fn decompress(flags: Flags, data: Cow<'_, [u8]>) -> Result<Vec<u8>> {
+    // Inflated JSON is a few times its compressed size: start there rather than growing from nothing.
+    let hint = data.len().saturating_mul(4).min(MAX_PLAINTEXT);
     if flags.has(Flags::ZLIB) {
-        read_capped(flate2::read::ZlibDecoder::new(&data[..])).map_err(|e| Error::Decompress(format!("zlib: {e}")))
+        read_capped(flate2::bufread::ZlibDecoder::new(&data[..]), hint).map_err(|e| Error::Decompress(format!("zlib: {e}")))
     } else if flags.has(Flags::SNAPPY) {
         // Raw snappy blocks are what we expect; fall back to the framed format. A raw
         // block declares its length up front, which the decoder would allocate.
@@ -254,17 +260,18 @@ fn decompress(flags: Flags, data: Vec<u8>) -> Result<Vec<u8>> {
         };
         match raw {
             Ok(out) => Ok(out),
-            Err(raw_err) => read_capped(snap::read::FrameDecoder::new(&data[..]))
+            Err(raw_err) => read_capped(snap::read::FrameDecoder::new(&data[..]), hint)
                 .map_err(|e| Error::Decompress(format!("snappy: {raw_err}; framed: {e}"))),
         }
     } else {
-        Ok(data)
+        Ok(data.into_owned())
     }
 }
 
 /// Reads a decompressing reader to the end, failing once it yields more than [`MAX_PLAINTEXT`].
-fn read_capped(r: impl Read) -> std::io::Result<Vec<u8>> {
-    let mut out = Vec::new();
+/// `capacity` is a guess at the output size.
+fn read_capped(r: impl Read, capacity: usize) -> std::io::Result<Vec<u8>> {
+    let mut out = Vec::with_capacity(capacity);
     r.take(MAX_PLAINTEXT as u64 + 1).read_to_end(&mut out)?;
     if out.len() > MAX_PLAINTEXT {
         return Err(std::io::Error::other(format!("output is over the {MAX_PLAINTEXT} byte limit")));
@@ -272,22 +279,37 @@ fn read_capped(r: impl Read) -> std::io::Result<Vec<u8>> {
     Ok(out)
 }
 
-fn compress(flags: Flags, data: &[u8]) -> Vec<u8> {
+/// Appends `data` to `out`, compressed as flagged.
+fn compress_into(flags: Flags, data: &[u8], mut out: Vec<u8>) -> Vec<u8> {
     if flags.has(Flags::ZLIB) {
         use std::io::Write;
-        let mut enc = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+        let mut enc = flate2::write::ZlibEncoder::new(out, flate2::Compression::default());
         enc.write_all(data).expect("writing to a Vec cannot fail");
         enc.finish().expect("writing to a Vec cannot fail")
     } else if flags.has(Flags::SNAPPY) {
-        snap::raw::Encoder::new().compress_vec(data).expect("snappy compression of a buffer")
+        let start = out.len();
+        out.resize(start + snap::raw::max_compress_len(data.len()), 0);
+        let n = snap::raw::Encoder::new().compress(data, &mut out[start..]).expect("snappy compression of a buffer");
+        out.truncate(start + n);
+        out
     } else {
-        data.to_vec()
+        out.extend_from_slice(data);
+        out
     }
 }
 
 /// Builds a complete packet. `iv` must be unique per packet when encryption is on.
+///
+/// Everything happens in one buffer: the payload goes in (compressed or not) behind
+/// room for the header, is encrypted in place, and the header is written last.
 pub fn seal(mac: Mac, flags: Flags, iv: [u8; 16], key: &[u8; 16], plaintext: &[u8]) -> Vec<u8> {
-    let compressed = compress(flags, plaintext);
+    // The header, the payload and a GCM tag or CBC padding (at most one block).
+    let snappy = flags.has(Flags::SNAPPY) && !flags.has(Flags::ZLIB);
+    let room = if snappy { snap::raw::max_compress_len(plaintext.len()) } else { plaintext.len() };
+    let mut out = Vec::with_capacity(HEADER_LEN + room + 16);
+    out.resize(HEADER_LEN, 0);
+    let mut out = compress_into(flags, plaintext, out);
+    let msg_len = out.len() - HEADER_LEN;
     let mut header = Header {
         packet_version: 0,
         mac,
@@ -296,24 +318,24 @@ pub fn seal(mac: Mac, flags: Flags, iv: [u8; 16], key: &[u8; 16], plaintext: &[u
         payload_version: 1,
         payload_len: 0,
     };
-    let body = if !flags.has(Flags::ENCRYPTED) {
-        compressed
-    } else if flags.has(Flags::GCM) {
+    if flags.has(Flags::ENCRYPTED) && flags.has(Flags::GCM) {
         // The header (with the final length) is the associated data, so the
         // ciphertext length must be known first: plaintext + 16-byte tag.
-        header.payload_len = (compressed.len() + 16) as u32;
+        header.payload_len = (msg_len + 16) as u32;
         let aad = header.to_bytes();
-        Aes128Gcm16::new(key.into())
-            .encrypt((&iv).into(), Payload { msg: &compressed, aad: &aad })
-            .expect("AES-GCM encryption of an in-memory buffer")
-    } else {
+        let tag = Aes128Gcm16::new(key.into())
+            .encrypt_inout_detached((&iv).into(), &aad, (&mut out[HEADER_LEN..]).into())
+            .expect("AES-GCM encryption of an in-memory buffer");
+        out.extend_from_slice(&tag);
+    } else if flags.has(Flags::ENCRYPTED) {
+        // PKCS#7 always pads, by 1 to 16 bytes, up to the next whole block.
+        out.resize(HEADER_LEN + (msg_len / 16 + 1) * 16, 0);
         cbc::Encryptor::<Aes128>::new(key.into(), (&iv).into())
-            .encrypt_padded_vec::<Pkcs7>(&compressed)
-    };
-    header.payload_len = body.len() as u32;
-    let mut out = Vec::with_capacity(HEADER_LEN + body.len());
-    out.extend_from_slice(&header.to_bytes());
-    out.extend_from_slice(&body);
+            .encrypt_padded::<Pkcs7>(&mut out[HEADER_LEN..], msg_len)
+            .expect("room for the padding");
+    }
+    header.payload_len = (out.len() - HEADER_LEN) as u32;
+    out[..HEADER_LEN].copy_from_slice(&header.to_bytes());
     out
 }
 
@@ -335,6 +357,8 @@ mod tests {
     fn round_trips_every_flag_combination() {
         let combos = [
             0,
+            Flags::ZLIB,
+            Flags::SNAPPY,
             Flags::ENCRYPTED,
             Flags::ENCRYPTED | Flags::ZLIB,
             Flags::ENCRYPTED | Flags::SNAPPY,
@@ -350,6 +374,27 @@ mod tests {
             assert_eq!(pkt.header.payload_len as usize, wire.len() - HEADER_LEN);
             assert_eq!(pkt.open(&KEY).unwrap(), JSON, "flags {:?}", Flags(bits));
         }
+        // CBC pads to the next whole block, by a full block when already aligned.
+        for len in [0, 1, 15, 16, 17, 32] {
+            let plain = vec![b'x'; len];
+            let wire = seal(MAC, Flags(Flags::ENCRYPTED), IV, &KEY, &plain);
+            assert_eq!(wire.len() - HEADER_LEN, (len / 16 + 1) * 16, "{len} bytes");
+            assert_eq!(Packet::parse(&wire).unwrap().open(&KEY).unwrap(), plain);
+        }
+    }
+
+    /// The bytes of a sealed packet do not change (they are what the APs decrypt).
+    #[test]
+    fn sealed_bytes_are_stable() {
+        let hex_of = |bits| hex::encode(seal(MAC, Flags(bits), IV, &KEY, JSON));
+        assert_eq!(
+            hex_of(Flags::ENCRYPTED | Flags::GCM | Flags::ZLIB),
+            "544e425500000000001122334455000b07070707070707070707070707070707000000010000003660058e882d29aecd91e16f1209e5c750f7a3983d0d57362bdc62aa6880dbfc79831072a78ee2c5b49eaaba69cb66cb9226714823938f"
+        );
+        assert_eq!(
+            hex_of(Flags::ENCRYPTED | Flags::SNAPPY),
+            "544e4255000000000011223344550005070707070707070707070707070707070000000100000030de3330cf20349f36d3f31176e1f4c3bcd208509ddbe77f9a6ad35880644ee6259bfb8524e7377a8f089c2bf6c81e554a"
+        );
     }
 
     #[test]
@@ -391,7 +436,14 @@ mod tests {
         assert!(matches!("zz:11:22:33:44:55".parse::<Mac>(), Err(Error::InvalidMac(_))));
         assert_eq!("00-11-22-33-44-55".parse::<Mac>().unwrap(), MAC);
         assert_eq!("00:11:22:33:44:AA".parse::<Mac>().unwrap().to_string(), "00:11:22:33:44:aa");
-        for bad in ["00:11-22:33:44:55", "001122:334455", "0:11:22:33:44:555", "00:11:22:33:44:55:", "+0:11:22:33:44:55", ""] {
+        let aa = Mac([0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff]);
+        for good in ["aa:bb:cc:dd:ee:ff", "AA:BB:CC:DD:EE:FF", "aa-bb-cc-dd-ee-ff", "Aa-bB-cc-DD-ee-FF", "aabbccddeeff", "AABBCCDDEEFF"] {
+            assert_eq!(good.parse::<Mac>().unwrap(), aa, "{good}");
+        }
+        for bad in [
+            "00:11-22:33:44:55", "001122:334455", "0:11:22:33:44:555", "00:11:22:33:44:55:", "+0:11:22:33:44:55", "", "00.11.22.33.44.55", "00::11:22:33:44:5",
+            "00112233445g", "0011223344556", "00:11:22:33:44:5g", " 00:11:22:33:44:55", "\u{e9}\u{e9}\u{e9}\u{e9}\u{e9}\u{e9}", "+01122334455",
+        ] {
             assert!(bad.parse::<Mac>().is_err(), "{bad}");
         }
     }
@@ -413,7 +465,7 @@ mod tests {
         // A raw snappy header claiming 4 GiB is refused before anything is allocated.
         let mut lie = vec![0xff, 0xff, 0xff, 0xff, 0x0f];
         lie.extend_from_slice(b"\x00x");
-        assert!(matches!(decompress(Flags(Flags::SNAPPY), lie), Err(Error::Decompress(_))));
+        assert!(matches!(decompress(Flags(Flags::SNAPPY), lie.into()), Err(Error::Decompress(_))));
         // The framed snappy format is capped too.
         let mut framed = Vec::new();
         {
@@ -421,6 +473,6 @@ mod tests {
             let mut w = snap::write::FrameEncoder::new(&mut framed);
             w.write_all(&big).unwrap();
         }
-        assert!(matches!(decompress(Flags(Flags::SNAPPY), framed), Err(Error::Decompress(_))));
+        assert!(matches!(decompress(Flags(Flags::SNAPPY), framed.into()), Err(Error::Decompress(_))));
     }
 }

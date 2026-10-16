@@ -68,6 +68,15 @@ pub fn oid(v: &Value) -> Option<&str> {
     }
 }
 
+/// A device's `on`/`off` override of a site-wide setting; anything else follows the site.
+pub fn override_of(device: &Value, key: &str, site: bool) -> bool {
+    match str_of(device, key) {
+        Some("on") => true,
+        Some("off") => false,
+        _ => site,
+    }
+}
+
 pub fn on_off(b: bool) -> &'static str {
     if b { "enabled" } else { "disabled" }
 }
