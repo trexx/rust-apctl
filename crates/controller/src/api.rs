@@ -1039,6 +1039,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_session_used_a_day_later_gets_its_cookie_again() {
+        let (mut state, _engine) = state();
+        let file = state.backups.data_dir.join("users");
+        std::fs::write(&file, format!("admin:{}\n", crate::auth::hash_password("x").unwrap())).unwrap();
+        let users = crate::auth::Users::load(&file).unwrap();
+        state.auth = Arc::new(crate::auth::Auth::new(users, &state.store, state.writer.clone(), Default::default()).unwrap());
+        let token = state.auth.create("admin").unwrap();
+        let auth = state.auth.clone();
+        let app = router(state);
+        let set_cookie = |path: &'static str| {
+            let req = Request::get(path).header(header::COOKIE, format!("{}={token}", crate::auth::COOKIE)).header("x-forwarded-proto", "https").body(Body::empty()).unwrap();
+            let app = app.clone();
+            async move {
+                let res = app.oneshot(req).await.unwrap();
+                assert_eq!(res.status(), StatusCode::OK);
+                res.headers().get(header::SET_COOKIE).map(|v| v.to_str().unwrap().to_string())
+            }
+        };
+        assert_eq!(set_cookie("/api/status").await, None, "fresh from the login");
+        for path in ["/api/status", "/api/me"] {
+            auth.age_session(&token, 2 * 86400);
+            let c = set_cookie(path).await.unwrap_or_else(|| panic!("{path}: no cookie"));
+            assert!(c.starts_with(&format!("{}={token};", crate::auth::COOKIE)) && c.contains("Max-Age=2592000") && c.ends_with("; Secure"), "{c}");
+            assert_eq!(set_cookie(path).await, None, "{path}: once a day");
+        }
+    }
+
+    #[tokio::test]
     async fn healthz_fails_once_the_engine_has_stopped() {
         let (app, engine) = app();
         assert_eq!(get(&app, "/healthz").await.status(), StatusCode::OK);

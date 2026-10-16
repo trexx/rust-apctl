@@ -3,7 +3,8 @@
 //!
 //! Session tokens are 256 random bits. Only their SHA-256 is kept (in memory
 //! and in `config.db`), so a copy of the database cannot be used to log in.
-//! Sessions slide: each use extends them to 30 days from now.
+//! Sessions slide: using one extends it, and its cookie, to 30 days from then
+//! (at most once a day).
 
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
@@ -15,7 +16,7 @@ use argon2::Argon2;
 use argon2::password_hash::phc::PasswordHash;
 use argon2::password_hash::{PasswordHasher, PasswordVerifier};
 use axum::extract::{ConnectInfo, Request, State};
-use axum::http::{HeaderMap, Method, StatusCode, header};
+use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, header};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
@@ -171,8 +172,9 @@ impl Auth {
         Ok(token)
     }
 
-    /// Returns the user for a valid session token, extending it.
-    fn check(&self, token: &str) -> Option<String> {
+    /// Returns the user for a valid session token, extending it, and whether
+    /// it was extended (the browser's cookie then needs the new expiry too).
+    fn check(&self, token: &str) -> Option<(String, bool)> {
         let hash = token_hash(token);
         let now = store::now_ts();
         let mut sessions = self.sessions.lock().unwrap();
@@ -181,12 +183,19 @@ impl Auth {
             sessions.remove(&hash);
             return None;
         }
-        // Persist the extension at most about once a day per session.
-        if now + SESSION_SECS - s.expires > 86400 {
+        // Extended (in the database and the cookie) at most about once a day per session.
+        let extend = now + SESSION_SECS - s.expires > 86400;
+        if extend {
             s.expires = now + SESSION_SECS;
             self.writer.exec(Db::Config, "UPDATE sessions SET expires = ?1 WHERE token_hash = ?2", vec![Sql::Integer(s.expires), Sql::Text(hash.clone())]);
         }
-        Some(s.user.clone())
+        Some((s.user.clone(), extend))
+    }
+
+    /// Makes a session look `secs` older (its expiry that much nearer).
+    #[cfg(test)]
+    pub(crate) fn age_session(&self, token: &str, secs: Ts) {
+        self.sessions.lock().unwrap().get_mut(&token_hash(token)).unwrap().expires -= secs;
     }
 
     fn revoke(&self, token: &str) {
@@ -342,9 +351,13 @@ pub async fn require_login(State(s): State<AppState>, req: Request, next: Next) 
         }
         return next.run(req).await;
     }
-    match session_token(req.headers()).and_then(|t| auth.check(&t)) {
+    let token = session_token(req.headers());
+    match token.as_deref().and_then(|t| Some((t, auth.check(t)?))) {
         Some(_) if mutating && !csrf_ok(req.headers()) => json_error(StatusCode::FORBIDDEN, "missing X-Requested-With: apctl header"),
-        Some(_) => next.run(req).await,
+        Some((t, (_, extended))) => {
+            let cookie = extended.then(|| cookie(req.headers(), t, SESSION_SECS));
+            renewed(next.run(req).await, cookie)
+        }
         None => json_error(StatusCode::UNAUTHORIZED, "login required"),
     }
 }
@@ -414,10 +427,21 @@ pub async fn me(State(s): State<AppState>, headers: HeaderMap) -> Response {
     if !auth.enabled() {
         return Json(json!({ "auth": false, "user": null, "read_only": true })).into_response();
     }
-    match session_token(&headers).and_then(|t| auth.check(&t)) {
-        Some(user) => Json(json!({ "auth": true, "user": user, "read_only": false })).into_response(),
+    let token = session_token(&headers);
+    match token.as_deref().and_then(|t| Some((t, auth.check(t)?))) {
+        Some((t, (user, extended))) => renewed(Json(json!({ "auth": true, "user": user, "read_only": false })).into_response(), extended.then(|| cookie(&headers, t, SESSION_SECS))),
         None => (StatusCode::UNAUTHORIZED, Json(json!({ "auth": true, "user": null }))).into_response(),
     }
+}
+
+/// A response with the session's cookie sent again, when the session was
+/// extended: the browser forgets the cookie when its own Max-Age (counted
+/// from when it was last sent) runs out, however often it was used.
+fn renewed(mut res: Response, cookie: Option<String>) -> Response {
+    if let Some(v) = cookie.and_then(|c| HeaderValue::from_str(&c).ok()) {
+        res.headers_mut().append(header::SET_COOKIE, v);
+    }
+    res
 }
 
 #[cfg(test)]
@@ -463,7 +487,7 @@ mod tests {
         let auth = Auth::new(users, &store, writer, Default::default()).unwrap();
         let token = auth.create("admin").unwrap();
         assert_eq!(token.len(), 64);
-        assert_eq!(auth.check(&token).as_deref(), Some("admin"));
+        assert_eq!(auth.check(&token), Some(("admin".into(), false)), "new: not extended yet");
         assert!(!auth.sessions.lock().unwrap().contains_key(&token), "only the hash is stored");
         assert_eq!(auth.check("forged"), None);
         auth.revoke(&token);
