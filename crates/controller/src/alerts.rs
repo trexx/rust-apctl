@@ -401,28 +401,7 @@ async fn radio_health(store: &Arc<Store>, now: Ts) -> anyhow::Result<HashMap<(St
 /// Clients whose every connection attempt in the window failed.
 async fn failing_clients(store: &Arc<Store>, now: Ts) -> anyhow::Result<Vec<String>> {
     let store = store.clone();
-    let events = tokio::task::spawn_blocking(move || {
-        store.read(Db::Config, |c| {
-            let mut stmt = c.prepare("SELECT ts, ap_mac, client_mac, vap, essid, radio, event_type, detail FROM connections WHERE ts >= ?1")?;
-            let rows = stmt
-                .query_map([now - HEALTH_WINDOW], |r| {
-                    let detail: Option<String> = r.get(7)?;
-                    Ok(crate::connections::ConnEvent {
-                        ts: r.get(0)?,
-                        ap: r.get(1)?,
-                        client: r.get(2)?,
-                        vap: r.get(3)?,
-                        essid: r.get(4)?,
-                        radio: r.get(5)?,
-                        event_type: r.get(6)?,
-                        n: detail.and_then(|d| serde_json::from_str(&d).ok()).unwrap_or(Value::Null),
-                    })
-                })?
-                .collect::<rusqlite::Result<Vec<_>>>()?;
-            Ok(rows)
-        })
-    })
-    .await??;
+    let events = tokio::task::spawn_blocking(move || store.read(Db::Config, |c| Ok(crate::connections::load_rows(c, now - HEALTH_WINDOW, Ts::MAX, None, None)?))).await??;
     let attempts = crate::connections::attempts(events);
     let ok: HashSet<&str> = attempts.iter().filter(|a| a.success).map(|a| a.client.as_str()).collect();
     let mut failing: Vec<String> = attempts.iter().filter(|a| !a.success && !ok.contains(a.client.as_str())).map(|a| a.client.clone()).collect();
