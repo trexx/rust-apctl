@@ -271,7 +271,13 @@ pub struct KnownDevice {
 
 pub type SharedLive = Arc<RwLock<Live>>;
 
-type McastTypes = std::collections::BTreeMap<String, crate::model::McastCounts>;
+type McastTypes = BTreeMap<String, crate::model::McastCounts>;
+
+/// A sample's multicast counters by traffic type (none if it has none).
+fn mcast_types(c: &ClientSample) -> &McastTypes {
+    static NONE: McastTypes = BTreeMap::new();
+    c.multicast.as_ref().map_or(&NONE, |m| &m.types)
+}
 
 /// Channel, width and power of one radio.
 type RadioSettings = (Option<i64>, Option<i64>, Option<i64>);
@@ -322,11 +328,11 @@ pub struct Engine {
     /// Debounced radio settings: right after a restart an AP briefly reports
     /// transient values (e.g. full transmit power) before settling.
     radios: HashMap<(Mac, String), RadioTrack>,
-    /// Each client's last multicast counters and the BSSID they came from.
-    mcast_prev: HashMap<Mac, (Ts, String, McastTypes)>,
+    /// Each client's last sample with multicast counters (and the BSSID they came from).
+    mcast_prev: HashMap<Mac, (Ts, Arc<ClientSample>)>,
     /// Each BSSID's last "delivered to clients" counters. The AP reports these
     /// per network, repeated identically in every client's block.
-    bss_prev: HashMap<String, (Ts, McastTypes)>,
+    bss_prev: HashMap<String, (Ts, Arc<ClientSample>)>,
     /// Events found in syslog lines.
     logevents: crate::logevents::LogEvents,
     /// When each AP was last reported isolated.
@@ -1439,7 +1445,7 @@ impl Engine {
         // how many clients sent any. "To clients" is counted once per network (BSSID),
         // "from clients" per client; only increases count (a client moving to another
         // network, or a restarted counter, adds nothing rather than its whole total).
-        let mut mcast: std::collections::BTreeMap<String, ([f64; 4], i64)> = std::collections::BTreeMap::new();
+        let mut mcast: BTreeMap<&str, ([f64; 4], i64)> = BTreeMap::new();
         let rate = |c: i64, p: i64, dt: f64| (c - p).max(0) as f64 / dt;
         let mut bss_done: std::collections::HashSet<&str> = std::collections::HashSet::new();
         for c in &s.clients {
@@ -1462,25 +1468,32 @@ impl Engine {
                     && ts - pts <= 120
                 {
                     let dt = (ts - pts) as f64;
+                    let prev = mcast_types(prev);
                     for (kind, cur) in &m.types {
                         let p = prev.get(kind).copied().unwrap_or(*cur);
-                        let e = mcast.entry(kind.clone()).or_default();
+                        let e = mcast.entry(kind).or_default();
                         e.0[0] += rate(cur.tx_pkts, p.tx_pkts, dt);
                         e.0[2] += rate(cur.tx_bytes, p.tx_bytes, dt);
                     }
                 }
-                self.bss_prev.insert(c.bssid.clone(), (ts, m.types.clone()));
+                match self.bss_prev.get_mut(&c.bssid) {
+                    Some(prev) => *prev = (ts, c.clone()),
+                    None => {
+                        self.bss_prev.insert(c.bssid.clone(), (ts, c.clone()));
+                    }
+                }
             }
-            if let Some((pts, bssid, prev)) = self.mcast_prev.get(&c.mac)
-                && *bssid == c.bssid
+            if let Some((pts, prev)) = self.mcast_prev.get(&c.mac)
+                && prev.bssid == c.bssid
                 && ts > *pts
                 && ts - pts <= 120
             {
                 let dt = (ts - pts) as f64;
+                let prev = mcast_types(prev);
                 for (kind, cur) in &m.types {
                     let p = prev.get(kind).copied().unwrap_or(*cur);
                     let (pk, by) = (rate(cur.rx_pkts, p.rx_pkts, dt), rate(cur.rx_bytes, p.rx_bytes, dt));
-                    let e = mcast.entry(kind.clone()).or_default();
+                    let e = mcast.entry(kind).or_default();
                     e.0[1] += pk;
                     e.0[3] += by;
                     if pk > 0.0 {
@@ -1488,13 +1501,13 @@ impl Engine {
                     }
                 }
             }
-            self.mcast_prev.insert(c.mac, (ts, c.bssid.clone(), m.types.clone()));
+            self.mcast_prev.insert(c.mac, (ts, c.clone()));
         }
         for (kind, (r, n)) in mcast {
             self.writer.send(Write::Metric {
                 table: &store::MCAST,
                 ts,
-                values: vec![mac(), Sql::Text(kind), Sql::Real(r[0]), Sql::Real(r[1]), Sql::Real(r[2]), Sql::Real(r[3]), Sql::Integer(n)],
+                values: vec![mac(), Sql::Text(kind.to_string()), Sql::Real(r[0]), Sql::Real(r[1]), Sql::Real(r[2]), Sql::Real(r[3]), Sql::Integer(n)],
             });
         }
     }
@@ -1831,6 +1844,28 @@ mod tests {
         assert_eq!(edit(&mut h, Box::new(|_| Err("no".into()))), Err("no".into()));
         let kinds: Vec<_> = events(&mut h).into_iter().map(|e| e.0).collect();
         assert_eq!(kinds, ["settings_imported", "settings_changed"]);
+    }
+
+    #[test]
+    fn multicast_rates_count_networks_once_and_clients_each() {
+        let dir = std::env::temp_dir().join(format!("apctl-mcast-{}-{}", std::process::id(), rand_suffix()));
+        let (store, writer) = store::Store::open(&dir).unwrap();
+        let (tx, _rx) = broadcast::channel(1024);
+        let mut e = Engine::new(writer.clone(), Default::default(), Default::default(), tx);
+        // Per-network "to clients" counters repeat in every client's block.
+        let sta = |mac: &str, to: i64, from: i64| json!({ "mac": mac, "multicast": { "types": { "mdns": { "tx_pkts": to, "tx_bytes": to * 100, "rx_pkts": from, "rx_bytes": from * 100 } } } });
+        let feed = |e: &mut Engine, ts: Ts, to: i64, from: i64| {
+            let p = json!({ "mac": AP1, "uptime": 1000 + ts, "vap_table": [{ "bssid": "b1", "radio": "na", "usage": "user", "sta_table": [sta(C1, to, from), sta("02:00:00:00:01:02", to, 0)] }] });
+            e.handle(Input::Inform { ts, peer: "x".into(), decoded: decoded(p) });
+        };
+        feed(&mut e, 0, 100, 0);
+        feed(&mut e, 10, 200, 50);
+        assert!(writer.flush(std::time::Duration::from_secs(5)));
+        let row: (f64, f64, f64, f64) = store
+            .read(Db::Metrics, |c| Ok(c.query_row("SELECT tx_pps, rx_pps, rx_bytes_ps, clients FROM mcast_stats WHERE ts = 10 AND type = 'mdns'", [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?))
+            .unwrap();
+        assert_eq!(row, (10.0, 5.0, 500.0, 1.0));
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
