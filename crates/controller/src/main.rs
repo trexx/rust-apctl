@@ -369,14 +369,8 @@ async fn flush_writes(writer: store::Writer) {
 }
 
 fn debug_syslog(pcap: &str, keys: &str, port: u16) -> Result<()> {
-    let raw: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(keys)?)?;
-    let mut candidates = Vec::new();
-    for d in raw["devices"].as_array().into_iter().flatten() {
-        if let (Some(mac), Some(k)) = (d["mac"].as_str(), d["syslog_key"].as_str()) {
-            let key: [u8; 32] = hex::decode(k)?.try_into().map_err(|_| anyhow::anyhow!("bad syslog key"))?;
-            candidates.push((mac.parse::<inform::Mac>()?, key));
-        }
-    }
+    let keys = KeyStore::load(keys)?;
+    let candidates: Vec<_> = keys.syslog_keys().map(|(mac, key)| (*mac, *key)).collect();
     let input = wire::capture::open_input(pcap)?;
     wire::capture::run_with_udp(input, &[], &[port], |ev| {
         if let wire::capture::HttpEvent::Datagram { ts, src, payload, .. } = ev {
