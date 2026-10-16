@@ -15,7 +15,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::sync::broadcast;
 
-use crate::engine::{LiveMsg, SharedLive};
+use crate::engine::{AliasEdit, LiveMsg, SharedLive};
 use crate::model::Ts;
 use crate::store::{self, Db, Store};
 
@@ -489,7 +489,8 @@ async fn set_alias(
     check_csrf(&headers)?;
     let mac = parse_mac(&mac)?;
     validate(&body.alias, &body.note)?;
-    let input = crate::engine::Input::SetAlias { ts: store::now_ts(), mac, alias: body.alias, note: body.note, only_if_unset: false };
+    let entries = vec![AliasEdit { mac, alias: body.alias, note: body.note }];
+    let input = crate::engine::Input::SetAliases { ts: store::now_ts(), entries, only_if_unset: false };
     s.engine.send(input).await.map_err(|_| ApiError(StatusCode::SERVICE_UNAVAILABLE, "engine stopped".into()))?;
     Ok(Json(json!({ "ok": true })))
 }
@@ -519,13 +520,12 @@ async fn import_aliases(
     let mut parsed = Vec::with_capacity(entries.len());
     for e in entries {
         validate(&e.alias, &e.note)?;
-        parsed.push((parse_mac(&e.mac)?, e.alias, e.note));
+        parsed.push(AliasEdit { mac: parse_mac(&e.mac)?, alias: e.alias, note: e.note });
     }
     let n = parsed.len();
-    for (mac, alias, note) in parsed {
-        let input = crate::engine::Input::SetAlias { ts: store::now_ts(), mac, alias, note, only_if_unset: !q.overwrite };
-        s.engine.send(input).await.map_err(|_| ApiError(StatusCode::SERVICE_UNAVAILABLE, "engine stopped".into()))?;
-    }
+    // All in one message: one pass of the engine, one client-list update.
+    let input = crate::engine::Input::SetAliases { ts: store::now_ts(), entries: parsed, only_if_unset: !q.overwrite };
+    s.engine.send(input).await.map_err(|_| ApiError(StatusCode::SERVICE_UNAVAILABLE, "engine stopped".into()))?;
     Ok(Json(json!({ "submitted": n })))
 }
 

@@ -37,9 +37,9 @@ pub enum Input {
     SetConfigMeta { mac: Mac, meta: Value },
     /// Active mode: apctl itself pushed this `setparam` to an AP.
     ConfigPushed { ts: Ts, mac: Mac, payload: Value },
-    /// Set or clear a client's alias and note (None clears). `only_if_unset`
-    /// leaves existing aliases alone (for bulk imports).
-    SetAlias { ts: Ts, mac: Mac, alias: Option<String>, note: Option<String>, only_if_unset: bool },
+    /// Set or clear clients' aliases and notes (None clears): one, or a bulk
+    /// import. `only_if_unset` leaves existing aliases alone (for imports).
+    SetAliases { ts: Ts, entries: Vec<AliasEdit>, only_if_unset: bool },
     /// A syslog datagram from an AP (captured in shadow mode or received directly).
     Datagram { ts: Ts, src_ip: String, payload: Vec<u8> },
     Reply { ts: Ts, mac: Mac, decoded: Decoded },
@@ -159,6 +159,14 @@ fn bump(counter: &AtomicU64) {
 /// A name and note the user gave a client.
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct Alias {
+    pub alias: Option<String>,
+    pub note: Option<String>,
+}
+
+/// A client's new alias and note, as given (trimmed by the engine; empty clears).
+#[derive(Debug)]
+pub struct AliasEdit {
+    pub mac: Mac,
     pub alias: Option<String>,
     pub note: Option<String>,
 }
@@ -394,7 +402,7 @@ impl Engine {
             Input::Datagram { ts, src_ip, payload } => self.datagram(ts, src_ip, &payload),
             Input::Tick(now) => self.tick(now),
             Input::DecodeError => bump(&self.counters.decode_errors),
-            Input::SetAlias { ts, mac, alias, note, only_if_unset } => self.set_alias(ts, mac, alias, note, only_if_unset),
+            Input::SetAliases { ts, entries, only_if_unset } => self.set_aliases(ts, entries, only_if_unset),
             Input::SetState { ts, state } => self.set_state(ts, state),
             Input::ThreatFound { ts, kind, bssid, device_mac, data, notify } => {
                 self.writer.exec(
@@ -843,34 +851,39 @@ impl Engine {
         }
     }
 
-    fn set_alias(&mut self, ts: Ts, mac: Mac, alias: Option<String>, note: Option<String>, only_if_unset: bool) {
+    /// Each rename is its own event (a client's history shows it); the client
+    /// list is announced once for the lot.
+    fn set_aliases(&mut self, ts: Ts, entries: Vec<AliasEdit>, only_if_unset: bool) {
         let clean = |v: Option<String>| v.map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
-        let (alias, note) = (clean(alias), clean(note));
+        let mut changed = false;
         let mut live = self.live.write().unwrap();
-        let old = live.aliases.get(&mac).cloned().unwrap_or_default();
-        if only_if_unset && old.alias.is_some() {
-            return;
-        }
-        if old.alias == alias && old.note == note {
-            return;
-        }
-        if alias.is_none() && note.is_none() {
-            live.aliases.remove(&mac);
-            self.writer.exec(Db::Config, "DELETE FROM client_aliases WHERE mac = ?1", vec![Sql::Text(mac.to_string())]);
-        } else {
-            live.aliases.insert(mac, Alias { alias: alias.clone(), note: note.clone() });
-            self.writer.exec(
-                Db::Config,
-                "INSERT OR REPLACE INTO client_aliases (mac, alias, note, updated) VALUES (?1, ?2, ?3, ?4)",
-                vec![Sql::Text(mac.to_string()), opt_text(alias.clone()), opt_text(note.clone()), Sql::Integer(ts)],
-            );
-        }
-        if old.alias != alias {
-            let ap = live.clients.get(&mac).map(|c| c.sample.ap_mac);
-            self.emit(ev(ts, "client_renamed", ap, Some(mac), json!({ "from": old.alias, "to": alias })));
+        for AliasEdit { mac, alias, note } in entries {
+            let (alias, note) = (clean(alias), clean(note));
+            let old = live.aliases.get(&mac).cloned().unwrap_or_default();
+            if (only_if_unset && old.alias.is_some()) || (old.alias == alias && old.note == note) {
+                continue;
+            }
+            changed = true;
+            if alias.is_none() && note.is_none() {
+                live.aliases.remove(&mac);
+                self.writer.exec(Db::Config, "DELETE FROM client_aliases WHERE mac = ?1", vec![Sql::Text(mac.to_string())]);
+            } else {
+                live.aliases.insert(mac, Alias { alias: alias.clone(), note: note.clone() });
+                self.writer.exec(
+                    Db::Config,
+                    "INSERT OR REPLACE INTO client_aliases (mac, alias, note, updated) VALUES (?1, ?2, ?3, ?4)",
+                    vec![Sql::Text(mac.to_string()), opt_text(alias.clone()), opt_text(note), Sql::Integer(ts)],
+                );
+            }
+            if old.alias != alias {
+                let ap = live.clients.get(&mac).map(|c| c.sample.ap_mac);
+                self.emit(ev(ts, "client_renamed", ap, Some(mac), json!({ "from": old.alias, "to": alias })));
+            }
         }
         drop(live);
-        let _ = self.tx.send(LiveMsg::Clients);
+        if changed {
+            let _ = self.tx.send(LiveMsg::Clients);
+        }
     }
 
     fn notification(&mut self, ts: Ts, p: &Value) {
@@ -1611,7 +1624,7 @@ mod tests {
         let mut h = harness();
         let mac: Mac = C1.parse().unwrap();
         let set = |h: &mut Harness, alias: Option<&str>, only_if_unset: bool| {
-            h.engine.handle(Input::SetAlias { ts: 1, mac, alias: alias.map(str::to_string), note: None, only_if_unset });
+            h.engine.handle(Input::SetAliases { ts: 1, entries: vec![AliasEdit { mac, alias: alias.map(str::to_string), note: None }], only_if_unset });
         };
         set(&mut h, Some("  Kitchen speaker "), false);
         assert_eq!(h.live.read().unwrap().aliases[&mac].alias.as_deref(), Some("Kitchen speaker"));
@@ -1624,6 +1637,19 @@ mod tests {
             .collect();
         assert_eq!(renames.len(), 2, "{renames:?}");
         assert_eq!(renames[1]["from"], "Kitchen speaker");
+    }
+
+    #[test]
+    fn a_bulk_import_announces_the_client_list_once() {
+        let mut h = harness();
+        let edit = |mac: &str, alias: &str| AliasEdit { mac: mac.parse().unwrap(), alias: Some(alias.into()), note: None };
+        let entries = vec![edit(C1, "Speaker"), edit("02:00:00:00:01:02", "Printer"), edit("02:00:00:00:01:03", "")];
+        h.engine.handle(Input::SetAliases { ts: 1, entries, only_if_unset: true });
+        let msgs: Vec<LiveMsg> = std::iter::from_fn(|| h.rx.try_recv().ok()).collect();
+        let renames = msgs.iter().filter(|m| matches!(m, LiveMsg::Event(e) if e.kind == "client_renamed")).count();
+        let lists = msgs.iter().filter(|m| matches!(m, LiveMsg::Clients)).count();
+        assert_eq!((renames, lists), (2, 1), "{msgs:?}");
+        assert_eq!(h.live.read().unwrap().aliases.len(), 2);
     }
 
     #[test]
