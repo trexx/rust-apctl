@@ -145,6 +145,16 @@ main {
   margin-bottom: 16px;
 }
 
+.form-warn {
+  background: var(--warn-bg);
+  color: var(--text);
+  border-radius: 6px;
+  padding: 4px 8px;
+  margin-top: 4px;
+  font-size: 12.5px;
+  flex-basis: 100%;
+}
+
 .banner {
   background: var(--warn-bg);
   border: 1px solid var(--border);

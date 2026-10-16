@@ -4,11 +4,15 @@
  "cfgversion": "0000000000000001",
  "country_code": 0,
  "default": false,
+ "fw2_caps": 1481179136,
+ "fw3_caps": 206,
+ "fw_caps": 3892117055,
  "gateway_ip": "192.168.1.1",
  "has_eth1": false,
  "has_speaker": false,
  "hash_id": "0000000000000000",
  "hostname": "ap",
+ "hw_caps": 2050,
  "if_table": [
   {
    "full_duplex": true,

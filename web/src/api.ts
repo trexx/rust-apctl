@@ -1000,6 +1000,10 @@ export interface WlanSettingsList {
   wlans: WlanSettings[];
   networks: { id: string; name: string; vlan: number | null; purpose: string | null }[];
   aps: { mac: Mac; name: string | null }[];
+  /** For each optional SSID feature, the APs that would broadcast without it. */
+  unsupported?: Record<string, Mac[]>;
+  /** APs whose feature support is not known yet (no inform). */
+  unknown?: Mac[];
 }
 
 export interface RadioSettings {

@@ -138,6 +138,38 @@ pub(crate) fn bit(v: u64, n: u32) -> bool {
     v >> n & 1 == 1
 }
 
+/// Optional SSID features that depend on what the AP supports, with the
+/// capability bit `render` checks for each one. An AP without it gets the SSID
+/// without the feature (no config lines), as the official controller does.
+pub const SSID_FEATURES: &[&str] = &["dns_assistance", "advertise_ap_name", "roaming_assistant", "multicast_suppression", "wpa3_fast_roaming"];
+
+/// Which of [`SSID_FEATURES`] the AP supports, as `(feature, supported)`, or
+/// `None` while that is unknown: the AP has not sent an inform and the
+/// settings hold no capability bits for it.
+pub fn ssid_feature_support(device: &Value, inform: Option<&Value>) -> Option<Vec<(&'static str, bool)>> {
+    let caps = Caps::read(inform, device);
+    if caps.fw == 0 && caps.fw3 == 0 && caps.wifi == 0 && caps.wifi2 == 0 {
+        return None;
+    }
+    let radios = json::arr(device, "radio_table");
+    let ft = !radios.is_empty() && radios.iter().all(|r| bit(json::int_of(r, "radio_caps2").unwrap_or(0) as u64, wlan::RCAP2_SAE_FT));
+    Some(
+        SSID_FEATURES
+            .iter()
+            .map(|&f| {
+                let ok = match f {
+                    "dns_assistance" => bit(caps.fw3, 3),
+                    "advertise_ap_name" => bit(caps.wifi2, 6),
+                    "roaming_assistant" => bit(caps.wifi2, 5),
+                    "multicast_suppression" => bit(caps.wifi2, 22),
+                    _ => ft,
+                };
+                (f, ok)
+            })
+            .collect(),
+    )
+}
+
 /// Everything one render needs, resolved once.
 pub(crate) struct Ctx<'a> {
     pub state: &'a Value,
@@ -211,5 +243,24 @@ impl<'a> Ctx<'a> {
 
     pub fn inform_str(&self, key: &str) -> Option<&'a str> {
         self.inform.and_then(|i| json::str_of(i, key))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn ssid_features_follow_the_capability_bits() {
+        let device = json!({ "radio_table": [{ "radio": "ng", "radio_caps2": 31 }, { "radio": "na", "radio_caps2": 1 }] });
+        assert_eq!(ssid_feature_support(&device, None), None);
+        // The bits a U6-Mesh on 8.8.11 reports.
+        let inform = json!({ "fw_caps": 3892117055u64, "fw3_caps": 206, "wifi_caps": 2709438173u64, "wifi_caps2": 4206576 });
+        let got = ssid_feature_support(&device, Some(&inform)).unwrap();
+        let missing: Vec<&str> = got.iter().filter(|(_, ok)| !ok).map(|(f, _)| *f).collect();
+        assert_eq!(missing, ["wpa3_fast_roaming"]);
+        let old = json!({ "fw_caps": 1, "fw3_caps": 0, "wifi_caps2": 0 });
+        assert!(ssid_feature_support(&device, Some(&old)).unwrap().iter().all(|(f, ok)| !ok || *f == "wpa3_fast_roaming"));
     }
 }

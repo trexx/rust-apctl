@@ -80,7 +80,9 @@ const WLAN_FIELDS: &[&str] = &[
     "mcastenhance_enabled", "multicast_suppressor_mode", "bc_filter_enabled", "bc_filter_list", "l2_isolation", "minrate_setting_preference",
     "minrate_ng_enabled", "minrate_ng_data_rate_kbps", "minrate_na_enabled", "minrate_na_data_rate_kbps", "dtim_mode", "dtim_ng", "dtim_na",
     "group_rekey", "mac_filter_enabled", "mac_filter_policy", "mac_filter_list", "is_guest", "networkconf_id", "country_beacon",
-    "usergroup_id", "schedule_with_duration",
+    "usergroup_id", "schedule_with_duration", "dns_assistance_mode", "dns_assistance_servers", "no2ghz_oui", "advertise_device_name_in_beacon",
+    "enhanced_iot", "iot_channel_lock", "iot_dtim_lock", "wpa3_fast_roaming", "sae_anti_clogging", "sae_sync", "rrm_enabled", "tdls_prohibit", "p2p",
+    "p2p_cross_connect", "log_level",
 ];
 
 /// The id of a settings document (plain or `{"$oid": ...}`).
@@ -118,7 +120,10 @@ fn wlan_aps(state: &Value, w: &Value) -> Option<Vec<String>> {
 
 /// GET /api/settings/wlans
 pub async fn wlans(State(s): State<AppState>) -> Result<Json<Value>, ApiError> {
-    let state = s.live.read().unwrap().state.clone();
+    let (state, informs) = {
+        let live = s.live.read().unwrap();
+        (live.state.clone(), live.raw_informs.clone())
+    };
     let Some(state) = state else { return Ok(Json(json!({ "active": s.active, "wlans": [], "networks": [] }))) };
     let list: Vec<Value> = docs(&state, "wlanconf")
         // The hidden "element" SSID belongs to the official controller's own adoption feature.
@@ -136,7 +141,30 @@ pub async fn wlans(State(s): State<AppState>) -> Result<Json<Value>, ApiError> {
         .collect();
     let networks: Vec<Value> = docs(&state, "networkconf").map(|n| json!({ "id": id_of(n), "name": n["name"], "vlan": n["vlan"], "purpose": n["purpose"] })).collect();
     let aps: Vec<Value> = docs(&state, "devices").map(|d| json!({ "mac": d["mac"].as_str().map(str::to_ascii_lowercase), "name": d["name"] })).collect();
-    Ok(Json(json!({ "active": s.active, "wlans": list, "networks": networks, "aps": aps })))
+    let (unsupported, unknown) = feature_support(&state, &informs);
+    Ok(Json(json!({ "active": s.active, "wlans": list, "networks": networks, "aps": aps, "unsupported": unsupported, "unknown": unknown })))
+}
+
+/// For each optional SSID feature, the APs that would broadcast the SSID
+/// without it; and the APs whose support is not known yet (no inform).
+fn feature_support(state: &Value, informs: &std::collections::HashMap<inform::Mac, std::sync::Arc<Value>>) -> (Value, Vec<String>) {
+    let mut unsupported: serde_json::Map<String, Value> = apcfg::SSID_FEATURES.iter().map(|f| (f.to_string(), json!([]))).collect();
+    let mut unknown = Vec::new();
+    for d in docs(state, "devices") {
+        let Some(mac) = d["mac"].as_str().map(str::to_ascii_lowercase) else { continue };
+        let inform = mac.parse::<inform::Mac>().ok().and_then(|m| informs.get(&m));
+        match apcfg::ssid_feature_support(d, inform.map(|v| v.as_ref())) {
+            None => unknown.push(mac),
+            Some(list) => {
+                for (f, ok) in list {
+                    if !ok {
+                        unsupported[f].as_array_mut().unwrap().push(json!(mac));
+                    }
+                }
+            }
+        }
+    }
+    (Value::Object(unsupported), unknown)
 }
 
 /// GET /api/settings/wlans/{id}/passphrase: shown on request only.
@@ -462,6 +490,31 @@ fn band_name(band: &str) -> &'static str {
     }
 }
 
+/// What Force Wi-Fi 4 (`enhanced_iot`) holds an SSID to, with each field's
+/// name for errors: the official controller's IoT template, plus the features
+/// its UI clears and its validation refuses alongside it.
+fn iot_template() -> Vec<(&'static str, Value, &'static str)> {
+    vec![
+        ("wlan_bands", json!(["2g"]), "a band other than 2.4 GHz"),
+        ("wpa3_support", json!(false), "WPA3"),
+        ("wpa3_transition", json!(false), "WPA3"),
+        ("wpa3_enhanced_192", json!(false), "WPA3"),
+        ("wpa3_fast_roaming", json!(false), "WPA3 fast roaming"),
+        ("pmf_mode", json!("disabled"), "PMF"),
+        ("fast_roaming_enabled", json!(false), "fast roaming"),
+        ("bss_transition", json!(false), "BSS transition"),
+        ("proxy_arp", json!(false), "proxy ARP"),
+        ("no2ghz_oui", json!(false), "band steering"),
+        ("group_rekey", json!(0), "group rekey"),
+        ("dtim_mode", json!("default"), "a custom DTIM period"),
+        ("hotspot2conf_enabled", json!(false), "Hotspot 2.0"),
+        ("mlo_enabled", json!(false), "MLO"),
+        ("advertise_device_name_in_beacon", json!(false), "the AP name in beacons"),
+        ("dns_assistance_mode", json!("off"), "DNS Assistance"),
+        ("roaming_assistant_na_enabled", json!(false), "the roaming assistant"),
+    ]
+}
+
 /// Applies an edit to one SSID (`body.id`, `body.patch`), with the official
 /// controller's rules for each field and the fields it derives on save.
 pub fn apply_wlan(state: &mut Value, body: &Value) -> Result<String, String> {
@@ -483,6 +536,21 @@ pub fn apply_wlan(state: &mut Value, body: &Value) -> Result<String, String> {
         }
         w["name"] = json!(name);
     }
+
+    // Force Wi-Fi 4: turning it on clears what it can't be combined with, as the
+    // official UI does; the edit is then checked against it at the end.
+    let was_iot = before["enhanced_iot"].as_bool() == Some(true);
+    if let Some(b) = bool_field(p, "enhanced_iot")? {
+        w["enhanced_iot"] = json!(b);
+    }
+    let iot = w["enhanced_iot"].as_bool() == Some(true);
+    if iot && !was_iot {
+        for (k, v, _) in iot_template() {
+            w[k] = v;
+        }
+    }
+    let iot_base = w.clone();
+
     for key in [
         "enabled", "hide_ssid", "is_guest", "proxy_arp", "l2_isolation", "uapsd_enabled", "bss_transition", "mcastenhance_enabled", "fast_roaming_enabled", "country_beacon",
     ] {
@@ -517,6 +585,24 @@ pub fn apply_wlan(state: &mut Value, body: &Value) -> Result<String, String> {
         (true, true, "disabled") => return Err("WPA2/WPA3 needs protected management frames (PMF) optional or required".into()),
         _ => {}
     }
+    // SAE timers (WPA3), seconds; the official UI starts both at 5.
+    if wpa3 && !p["protection"].is_null() {
+        for key in ["sae_anti_clogging", "sae_sync"] {
+            if w[key].is_null() {
+                w[key] = json!(5);
+            }
+        }
+    }
+    for key in ["sae_anti_clogging", "sae_sync"] {
+        if let Some(n) = int_field(p, key, 1, 60)? {
+            w[key] = json!(n);
+        }
+    }
+    // Fast roaming for WPA3 clients of a WPA2/WPA3 SSID (the official UI never sets it).
+    if let Some(b) = bool_field(p, "wpa3_fast_roaming")? {
+        w["wpa3_fast_roaming"] = json!(b);
+    }
+
     if let Some(pass) = p["passphrase"].as_str() {
         let printable = pass.chars().all(|c| (' '..='~').contains(&c));
         let hex64 = pass.len() == 64 && pass.chars().all(|c| c.is_ascii_hexdigit());
@@ -554,7 +640,70 @@ pub fn apply_wlan(state: &mut Value, body: &Value) -> Result<String, String> {
         w["roaming_assistant_na_rssi"] = json!(rssi);
     }
     if w["roaming_assistant_na_enabled"].as_bool() == Some(true) && w["enhanced_iot"].as_bool() == Some(true) {
-        return Err("the roaming assistant cannot be used with the IoT optimisation".into());
+        return Err("the roaming assistant is not available with Force Wi-Fi 4".into());
+    }
+
+    // Band steering: dual-band clients the AP has seen on 5 GHz are kept off 2.4 GHz.
+    let dual = bands.iter().any(|b| b == "2g") && bands.iter().any(|b| b == "5g");
+    if let Some(b) = bool_field(p, "no2ghz_oui")? {
+        if b && !dual {
+            return Err("band steering needs both 2.4 and 5 GHz".into());
+        }
+        w["no2ghz_oui"] = json!(b);
+    }
+    if !dual && w["no2ghz_oui"].as_bool() == Some(true) {
+        w["no2ghz_oui"] = json!(false);
+    }
+
+    // IoT locks: 2.4 GHz on channel 6 on every AP of the SSID, and a DTIM of 3
+    // there. Both need 2.4 GHz and go when it does.
+    for key in ["iot_channel_lock", "iot_dtim_lock"] {
+        if let Some(b) = bool_field(p, key)? {
+            if b && !has("2g") {
+                return Err("the IoT locks need 2.4 GHz".into());
+            }
+            w[key] = json!(b);
+        }
+        if !has("2g") && w[key].as_bool() == Some(true) {
+            w[key] = json!(false);
+        }
+    }
+
+    // Sent as they are; the official UI keeps but never shows the last three.
+    for key in ["advertise_device_name_in_beacon", "rrm_enabled", "tdls_prohibit", "p2p", "p2p_cross_connect"] {
+        if let Some(b) = bool_field(p, key)? {
+            w[key] = json!(b);
+        }
+    }
+    // hostapd's level for this SSID; -1 leaves the AP's default.
+    if let Some(n) = int_field(p, "log_level", -1, 4)? {
+        w["log_level"] = json!(n);
+    }
+
+    // DNS Assistance: the AP caches DNS and, when the network's server is slow
+    // or fails, sends queries to fallback servers (its own choice, or these).
+    if let Some(m) = enum_field(p, "dns_assistance_mode", &["off", "auto", "manual"])? {
+        w["dns_assistance_mode"] = json!(m);
+    }
+    if !p["dns_assistance_servers"].is_null() {
+        let list = p["dns_assistance_servers"].as_array().ok_or("dns_assistance_servers must be a list")?;
+        let mut servers: Vec<String> = Vec::new();
+        for v in list {
+            let ip = v.as_str().map(str::trim).filter(|s| !s.is_empty());
+            match ip.map(|s| (s, s.parse::<std::net::Ipv4Addr>())) {
+                None => {}
+                Some((s, Ok(_))) => servers.push(s.to_string()),
+                Some((s, Err(_))) => return Err(format!("DNS server {s} is not an IPv4 address")),
+            }
+        }
+        servers.dedup();
+        if servers.len() > 2 {
+            return Err("DNS Assistance takes at most 2 servers".into());
+        }
+        w["dns_assistance_servers"] = json!(servers);
+    }
+    if w["dns_assistance_mode"].as_str() == Some("manual") && w["dns_assistance_servers"].as_array().is_none_or(Vec::is_empty) {
+        return Err("DNS Assistance set to manual needs at least one server".into());
     }
 
     // Multicast and broadcast. The suppression mode decides the broadcast filter.
@@ -611,6 +760,12 @@ pub fn apply_wlan(state: &mut Value, body: &Value) -> Result<String, String> {
         w["dtim_na"] = json!(3);
         w["dtim_6e"] = json!(3);
     }
+    if w["iot_dtim_lock"].as_bool() == Some(true) {
+        if p["dtim_ng"].as_i64().is_some_and(|n| n != 3) {
+            return Err("the DTIM lock holds 2.4 GHz at 3".into());
+        }
+        w["dtim_ng"] = json!(3);
+    }
     if let Some(n) = int_field(p, "group_rekey", 0, 86400)? {
         if n != 0 && n < 60 {
             return Err("group rekey must be off (0) or 60 to 86400 seconds".into());
@@ -650,6 +805,20 @@ pub fn apply_wlan(state: &mut Value, body: &Value) -> Result<String, String> {
         w["networkconf_id"] = json!(n);
     }
 
+    if iot {
+        for (k, v, what) in iot_template() {
+            if w[k] != v {
+                // The edit asked for it: refuse. Otherwise the stored value just goes.
+                if w[k] != iot_base[k] {
+                    return Err(format!("{what} is not available with Force Wi-Fi 4"));
+                }
+                w[k] = v;
+            }
+        }
+        w["wlan_band"] = json!("2g");
+    }
+
+    let locked_aps_before = if before["iot_channel_lock"].as_bool() == Some(true) { deployed_to(state, &before) } else { Vec::new() };
     *find_wlan(state, &id).ok_or("unknown SSID")? = w.clone();
     // "aps": null means all APs; no "aps" leaves them as they are.
     if p.get("aps").is_some() {
@@ -661,13 +830,54 @@ pub fn apply_wlan(state: &mut Value, body: &Value) -> Result<String, String> {
     }
     check_wlan_limits(state)?;
     check_list_limits(state)?;
+    let channels = apply_channel_locks(state, &locked_aps_before);
 
     let after = find_wlan(state, &id).ok_or("unknown SSID")?.clone();
     let mut keys: Vec<&str> = after.as_object().map(|o| o.keys().map(String::as_str).collect()).unwrap_or_default();
     keys.retain(|k| *k != "x_passphrase" && before[*k] != after[*k]);
     changed.extend(keys);
     let name = after["name"].as_str().unwrap_or("?");
-    Ok(if changed.is_empty() { format!("SSID \"{name}\": nothing changed") } else { format!("SSID \"{name}\": {}", changed.join(", ")) })
+    let mut what = if changed.is_empty() { format!("SSID \"{name}\": nothing changed") } else { format!("SSID \"{name}\": {}", changed.join(", ")) };
+    if !channels.is_empty() {
+        what.push_str(&format!("; {}", channels.join("; ")));
+    }
+    Ok(what)
+}
+
+/// APs (lowercase MACs) broadcasting an SSID with the IoT channel lock.
+pub fn channel_locked_aps(state: &Value) -> Vec<String> {
+    let mut out: Vec<String> = docs(state, "wlanconf").filter(|w| w["iot_channel_lock"].as_bool() == Some(true)).flat_map(|w| deployed_to(state, w)).collect();
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// Keeps the 2.4 GHz channel of APs in line with the SSIDs' channel locks, as
+/// the official controller does when a lock changes: channel 6 on every AP an
+/// SSID with the lock is broadcast from, and back to auto on an AP in
+/// `released` (it had a locked SSID before the change) that has none left.
+/// Returns what changed, in words.
+fn apply_channel_locks(state: &mut Value, released: &[String]) -> Vec<String> {
+    let locked = channel_locked_aps(state);
+    let mut out = Vec::new();
+    for d in state["devices"].as_array_mut().into_iter().flatten() {
+        let Some(mac) = d["mac"].as_str().map(str::to_ascii_lowercase) else { continue };
+        let target = if locked.contains(&mac) {
+            json!("6")
+        } else if released.contains(&mac) {
+            json!("auto")
+        } else {
+            continue;
+        };
+        let name = d["name"].as_str().unwrap_or(&mac).to_string();
+        let Some(r) = d["radio_table"].as_array_mut().and_then(|t| t.iter_mut().find(|r| r["radio"].as_str() == Some("ng"))) else { continue };
+        let same = r["channel"] == target || r["channel"].as_i64().is_some_and(|c| c.to_string() == target.as_str().unwrap_or_default());
+        if !same {
+            r["channel"] = target.clone();
+            out.push(format!("AP {name}: 2.4 GHz channel {}", target.as_str().unwrap_or_default()));
+        }
+    }
+    out
 }
 
 const DAY_NAMES: [&str; 7] = ["sun", "mon", "tue", "wed", "thu", "fri", "sat"];
@@ -759,7 +969,7 @@ pub fn create_wlan(state: &mut Value, body: &Value) -> Result<String, String> {
         "setting_preference": "manual", "bss_transition": true, "fast_roaming_enabled": false, "uapsd_enabled": false, "proxy_arp": false,
         "l2_isolation": false, "mcastenhance_enabled": false, "multicast_suppressor_mode": "off", "bc_filter_enabled": false, "bc_filter_list": [],
         "minrate_setting_preference": "auto", "dtim_mode": "default", "group_rekey": 0, "mac_filter_enabled": false, "mac_filter_policy": "allow",
-        "mac_filter_list": [], "mdns_proxy_mode": "off", "roaming_assistant_na_enabled": false, "schedule_with_duration": [],
+        "mac_filter_list": [], "mdns_proxy_mode": "off", "roaming_assistant_na_enabled": false, "schedule_with_duration": [], "no2ghz_oui": true,
         "passphrase_autogenerated": false,
     });
     let mut doc = doc;
@@ -792,9 +1002,15 @@ pub fn delete_wlan(state: &mut Value, body: &Value) -> Result<String, String> {
     if w["attr_no_delete"].as_bool() == Some(true) {
         return Err("this SSID cannot be deleted".into());
     }
+    let released = if w["iot_channel_lock"].as_bool() == Some(true) { deployed_to(state, &w) } else { Vec::new() };
     state["wlanconf"].as_array_mut().unwrap().retain(|x| id_of(x).as_deref() != Some(id));
     prune_groups(state);
-    Ok(format!("deleted SSID \"{}\"", w["name"].as_str().unwrap_or("?")))
+    let channels = apply_channel_locks(state, &released);
+    let mut what = format!("deleted SSID \"{}\"", w["name"].as_str().unwrap_or("?"));
+    if !channels.is_empty() {
+        what.push_str(&format!("; {}", channels.join("; ")));
+    }
+    Ok(what)
 }
 
 // ---- APs ------------------------------------------------------------------
@@ -980,6 +1196,79 @@ mod tests {
         edit(&mut s, json!({ "protection": "wpa3" })).unwrap();
         assert_eq!(s["wlanconf"][0]["pmf_mode"], "required");
         assert!(edit(&mut s, json!({ "pmf_mode": "optional" })).is_err(), "WPA3 alone needs PMF required");
+    }
+
+    #[test]
+    fn dns_assistance_needs_ipv4_servers_when_manual() {
+        let mut s = state();
+        assert!(edit(&mut s, json!({ "dns_assistance_mode": "manual" })).unwrap_err().contains("at least one server"));
+        assert!(edit(&mut s, json!({ "dns_assistance_mode": "manual", "dns_assistance_servers": ["fd00::1"] })).is_err(), "IPv4 only");
+        edit(&mut s, json!({ "dns_assistance_mode": "manual", "dns_assistance_servers": [" 192.168.1.1", "", "9.9.9.9"] })).unwrap();
+        assert_eq!(s["wlanconf"][0]["dns_assistance_servers"], json!(["192.168.1.1", "9.9.9.9"]));
+        // The list is kept for later when the mode changes.
+        edit(&mut s, json!({ "dns_assistance_mode": "auto" })).unwrap();
+        assert_eq!(s["wlanconf"][0]["dns_assistance_servers"][1], "9.9.9.9");
+        assert!(edit(&mut s, json!({ "dns_assistance_mode": "fallback" })).is_err());
+    }
+
+    #[test]
+    fn band_steering_needs_both_bands_and_hidden_toggles_are_kept() {
+        let mut s = state();
+        edit(&mut s, json!({ "no2ghz_oui": true, "rrm_enabled": true, "tdls_prohibit": true, "log_level": 2 })).unwrap();
+        assert!(edit(&mut s, json!({ "log_level": 7 })).is_err());
+        // Dropping a band turns band steering off; enabling it then is refused.
+        let what = edit(&mut s, json!({ "wlan_bands": ["5g"] })).unwrap();
+        assert!(what.contains("no2ghz_oui"), "{what}");
+        assert!(edit(&mut s, json!({ "no2ghz_oui": true })).unwrap_err().contains("both"));
+        let w = &s["wlanconf"][0];
+        assert_eq!((w["rrm_enabled"].as_bool(), w["tdls_prohibit"].as_bool(), w["log_level"].as_i64()), (Some(true), Some(true), Some(2)));
+    }
+
+    #[test]
+    fn force_wifi4_clears_and_then_holds_the_newer_features() {
+        let mut s = state();
+        edit(&mut s, json!({ "protection": "wpa2_wpa3", "proxy_arp": true, "dns_assistance_mode": "auto", "no2ghz_oui": true })).unwrap();
+        edit(&mut s, json!({ "enhanced_iot": true })).unwrap();
+        let w = &s["wlanconf"][0];
+        assert_eq!(w["wlan_bands"], json!(["2g"]));
+        assert_eq!((w["wpa3_support"].as_bool(), w["pmf_mode"].as_str(), w["proxy_arp"].as_bool()), (Some(false), Some("disabled"), Some(false)));
+        assert_eq!((w["dns_assistance_mode"].as_str(), w["no2ghz_oui"].as_bool()), (Some("off"), Some(false)));
+        assert_eq!(protection_of(w), Some("wpa2"));
+        // While it is on, asking for one of them is refused.
+        assert!(edit(&mut s, json!({ "dns_assistance_mode": "auto" })).unwrap_err().contains("Force Wi-Fi 4"));
+        assert!(edit(&mut s, json!({ "wlan_bands": ["2g", "5g"] })).is_err());
+        assert!(edit(&mut s, json!({ "protection": "wpa3" })).is_err());
+        edit(&mut s, json!({ "enhanced_iot": false, "wlan_bands": ["2g", "5g"] })).unwrap();
+    }
+
+    #[test]
+    fn the_channel_lock_moves_its_aps_to_6_and_back() {
+        let mut s = state();
+        let what = edit(&mut s, json!({ "iot_channel_lock": true })).unwrap();
+        assert!(what.contains("Hall: 2.4 GHz channel 6") && what.contains("Attic"), "{what}");
+        assert_eq!(s["devices"][0]["radio_table"][0]["channel"], "6");
+        assert!(apply_device(&mut s, &json!({ "mac": AP1, "patch": { "radios": [{ "radio": "ng", "channel": 1 }] } })).is_err());
+        // Narrowed to one AP: the other is released.
+        edit(&mut s, json!({ "aps": [AP1] })).unwrap();
+        assert_eq!((s["devices"][0]["radio_table"][0]["channel"].as_str(), s["devices"][1]["radio_table"][0]["channel"].as_str()), (Some("6"), Some("auto")));
+        // Dropping 2.4 GHz ends the lock.
+        edit(&mut s, json!({ "wlan_bands": ["5g"] })).unwrap();
+        assert_eq!(s["wlanconf"][0]["iot_channel_lock"], false);
+        assert_eq!(s["devices"][0]["radio_table"][0]["channel"], "auto");
+        assert!(edit(&mut s, json!({ "iot_dtim_lock": true })).is_err());
+    }
+
+    #[test]
+    fn dtim_lock_and_sae_timers() {
+        let mut s = state();
+        edit(&mut s, json!({ "iot_dtim_lock": true })).unwrap();
+        assert_eq!(s["wlanconf"][0]["dtim_ng"], 3);
+        assert!(edit(&mut s, json!({ "dtim_mode": "custom", "dtim_ng": 1 })).is_err());
+        edit(&mut s, json!({ "protection": "wpa3" })).unwrap();
+        assert_eq!((s["wlanconf"][0]["sae_anti_clogging"].as_i64(), s["wlanconf"][0]["sae_sync"].as_i64()), (Some(5), Some(5)));
+        assert!(edit(&mut s, json!({ "sae_sync": 61 })).is_err());
+        edit(&mut s, json!({ "sae_sync": 10 })).unwrap();
+        assert!(edit(&mut s, json!({ "dns_assistance_mode": "manual", "dns_assistance_servers": ["1.1.1.1", "8.8.8.8", "9.9.9.9"] })).is_err());
     }
 
     #[test]

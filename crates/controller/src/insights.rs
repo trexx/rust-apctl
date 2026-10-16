@@ -990,7 +990,7 @@ pub async fn channel_plan(State(s): State<AppState>, Query(q): Query<PlanQuery>)
     let dfs = q.dfs.unwrap_or(false);
     let (allowed, pinned) = {
         let live = s.live.read().unwrap();
-        (crate::channelai::allowed(live.state.as_deref(), &radio, dfs), crate::channelai::pinned(&live))
+        (crate::channelai::allowed(live.state.as_deref(), &radio, dfs), crate::channelai::pinned(&live, &radio))
     };
     Ok(Json(compute_plan(&s, radio, dfs, allowed, pinned).await?))
 }

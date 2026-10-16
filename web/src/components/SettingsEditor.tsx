@@ -76,7 +76,7 @@ function Toggle({
   );
 }
 
-const macs = (text: string) =>
+const words = (text: string) =>
   text
     .split(/[\s,;]+/)
     .map((m) => m.trim())
@@ -100,7 +100,29 @@ function MacList({
       value={text}
       onChange={(e) => {
         setText(e.target.value);
-        onChange(macs(e.target.value));
+        onChange(words(e.target.value));
+      }}
+    />
+  );
+}
+
+/** IPv4 addresses, separated by commas or spaces (the text is kept as typed). */
+function ServerList({
+  value,
+  onChange,
+}: {
+  value: unknown;
+  onChange: (v: string[]) => void;
+}) {
+  const [text, setText] = useState(((value as string[]) ?? []).join(", "));
+  return (
+    <input
+      className="search mono"
+      placeholder="e.g. 192.168.1.1, 9.9.9.9"
+      value={text}
+      onChange={(e) => {
+        setText(e.target.value);
+        onChange(words(e.target.value));
       }}
     />
   );
@@ -207,6 +229,49 @@ function Review({
   );
 }
 
+/**
+ * Names the APs broadcasting this SSID that lack `feature`: they get the
+ * SSID without it. Shown while the feature is on.
+ */
+function Unsupported({
+  feature,
+  on,
+  aps,
+  list,
+}: {
+  feature: string;
+  on: boolean;
+  aps: string[] | null;
+  list: WlanSettingsList;
+}) {
+  if (!on) return null;
+  const from = aps ?? list.aps.map((a) => a.mac);
+  const name = (m: string) => list.aps.find((a) => a.mac === m)?.name ?? m;
+  const missing = (list.unsupported?.[feature] ?? []).filter((m) =>
+    from.includes(m),
+  );
+  const unknown = (list.unknown ?? []).filter((m) => from.includes(m));
+  if (missing.length === 0 && unknown.length === 0) return null;
+  return (
+    <div className="form-warn">
+      {missing.length > 0 && (
+        <>
+          Not supported by {missing.map(name).join(", ")}:{" "}
+          {missing.length === 1 ? "it broadcasts" : "they broadcast"} this SSID
+          without it.{" "}
+        </>
+      )}
+      {unknown.length > 0 && (
+        <>
+          {unknown.map(name).join(", ")}{" "}
+          {unknown.length === 1 ? "hasn't" : "haven't"} reported yet, so support
+          is unknown.
+        </>
+      )}
+    </div>
+  );
+}
+
 const PROTECTION: [string, string][] = [
   ["wpa2_wpa3", "WPA2/WPA3 Personal"],
   ["wpa2", "WPA2 Personal"],
@@ -254,6 +319,29 @@ export function WlanEditor({
   const toggleBand = (b: string, on: boolean) =>
     set("wlan_bands", on ? [...bands, b] : bands.filter((x) => x !== b));
   const aps = f.aps as string[] | null;
+  const iot = f.enhanced_iot === true;
+  const wpa3 = f.protection === "wpa3" || f.protection === "wpa2_wpa3";
+  /** Force Wi-Fi 4 clears what it can't be combined with, as the official UI does. */
+  const setIot = (on: boolean) =>
+    setForm((x) => ({
+      ...x,
+      enhanced_iot: on,
+      ...(on && {
+        wlan_bands: ["2g"],
+        protection: x.protection === "open" ? "open" : "wpa2",
+        pmf_mode: undefined,
+        fast_roaming_enabled: false,
+        wpa3_fast_roaming: false,
+        bss_transition: false,
+        proxy_arp: false,
+        no2ghz_oui: false,
+        group_rekey: 0,
+        dtim_mode: "default",
+        advertise_device_name_in_beacon: false,
+        dns_assistance_mode: "off",
+        roaming_assistant_na_enabled: false,
+      }),
+    }));
   const target: SettingsTarget = { kind: "wlan", id: wlan?.id ?? null };
   const patch = () => {
     const p = wlan ? changed(original, form) : { ...form };
@@ -305,7 +393,11 @@ export function WlanEditor({
             <option value="">(other, set elsewhere)</option>
           )}
           {PROTECTION.map(([v, l]) => (
-            <option key={v} value={v}>
+            <option
+              key={v}
+              value={v}
+              disabled={iot && v !== "wpa2" && v !== "open"}
+            >
               {l}
             </option>
           ))}
@@ -345,13 +437,18 @@ export function WlanEditor({
         <Toggle
           value={bands.includes("2g")}
           onChange={(v) => toggleBand("2g", v)}
+          disabled={iot}
           label="2.4 GHz"
         />
         <Toggle
           value={bands.includes("5g")}
           onChange={(v) => toggleBand("5g", v)}
+          disabled={iot}
           label="5 GHz"
         />
+        {iot && (
+          <span className="muted small">Force Wi-Fi 4 is on: 2.4 GHz only</span>
+        )}
       </Row>
       <Row label="Broadcast from">
         <Toggle
@@ -399,13 +496,39 @@ export function WlanEditor({
         <Row label="Fast roaming" hint="802.11r">
           <Toggle
             value={f.fast_roaming_enabled}
+            disabled={iot}
             onChange={(v) => set("fast_roaming_enabled", v)}
+            label="Enabled"
+          />
+          {f.protection === "wpa2_wpa3" && (
+            <Toggle
+              value={f.wpa3_fast_roaming}
+              disabled={iot}
+              onChange={(v) => set("wpa3_fast_roaming", v)}
+              label="Also for WPA3 clients (not in the official UI)"
+            />
+          )}
+          <Unsupported
+            feature="wpa3_fast_roaming"
+            on={f.protection === "wpa2_wpa3" && f.wpa3_fast_roaming === true}
+            aps={aps}
+            list={list}
+          />
+        </Row>
+        <Row
+          label="Neighbour reports"
+          hint="802.11k: clients learn the nearby APs (not in the official UI)"
+        >
+          <Toggle
+            value={f.rrm_enabled}
+            onChange={(v) => set("rrm_enabled", v)}
             label="Enabled"
           />
         </Row>
         <Row label="BSS transition" hint="802.11v: APs suggest a better AP">
           <Toggle
             value={f.bss_transition}
+            disabled={iot}
             onChange={(v) => set("bss_transition", v)}
             label="Enabled"
           />
@@ -416,6 +539,7 @@ export function WlanEditor({
         >
           <Toggle
             value={f.roaming_assistant_na_enabled}
+            disabled={iot}
             onChange={(v) => set("roaming_assistant_na_enabled", v)}
             label="Enabled"
           />
@@ -433,7 +557,63 @@ export function WlanEditor({
               {String(f.roaming_assistant_na_rssi ?? -75)} dBm
             </label>
           )}
+          <Unsupported
+            feature="roaming_assistant"
+            on={f.roaming_assistant_na_enabled === true}
+            aps={aps}
+            list={list}
+          />
         </Row>
+        <Row
+          label="Band steering"
+          hint="keep dual-band clients the APs have seen on 5 GHz off 2.4 GHz"
+        >
+          <Toggle
+            value={f.no2ghz_oui}
+            disabled={iot || !(bands.includes("2g") && bands.includes("5g"))}
+            onChange={(v) => set("no2ghz_oui", v)}
+            label="Enabled"
+          />
+          {!(bands.includes("2g") && bands.includes("5g")) && (
+            <span className="muted small">needs both 2.4 and 5 GHz</span>
+          )}
+        </Row>
+      </details>
+      <details
+        open={iot || f.iot_channel_lock === true || f.iot_dtim_lock === true}
+      >
+        <summary>IoT</summary>
+        <Row
+          label="Force Wi-Fi 4"
+          hint="for legacy devices: WPA2 or open on 2.4 GHz, without the newer features"
+        >
+          <Toggle value={f.enhanced_iot} onChange={setIot} label="Enabled" />
+        </Row>
+        <Row
+          label="Lock 2.4 GHz to channel 6"
+          hint="on every AP broadcasting this SSID"
+        >
+          <Toggle
+            value={f.iot_channel_lock}
+            disabled={!bands.includes("2g")}
+            onChange={(v) => set("iot_channel_lock", v)}
+            label="Enabled"
+          />
+        </Row>
+        <Row label="DTIM interval lock" hint="2.4 GHz DTIM held at 3">
+          <Toggle
+            value={f.iot_dtim_lock}
+            disabled={!bands.includes("2g")}
+            onChange={(v) => {
+              set("iot_dtim_lock", v);
+              if (v) set("dtim_ng", 3);
+            }}
+            label="Enabled"
+          />
+        </Row>
+        {!bands.includes("2g") && (
+          <div className="muted small">The locks need 2.4 GHz.</div>
+        )}
       </details>
       <details>
         <summary>Multicast and broadcast</summary>
@@ -456,6 +636,12 @@ export function WlanEditor({
             <option value="conservative">Conservative</option>
             <option value="aggressive">Aggressive (allow list only)</option>
           </select>
+          <Unsupported
+            feature="multicast_suppression"
+            on={(f.multicast_suppressor_mode ?? "off") !== "off"}
+            aps={aps}
+            list={list}
+          />
         </Row>
         {f.multicast_suppressor_mode === "aggressive" && (
           <Row label="Allowed senders" hint="MAC addresses, one per line">
@@ -469,6 +655,7 @@ export function WlanEditor({
         <Row label="Proxy ARP">
           <Toggle
             value={f.proxy_arp}
+            disabled={iot}
             onChange={(v) => set("proxy_arp", v)}
             label="Enabled"
           />
@@ -476,8 +663,52 @@ export function WlanEditor({
       </details>
       <details>
         <summary>Advanced</summary>
+        <Row
+          label="DNS Assistance"
+          hint="the APs cache DNS and fall back to other servers when the network's is slow or fails"
+        >
+          <select
+            disabled={iot}
+            value={String(f.dns_assistance_mode ?? "off")}
+            onChange={(e) => set("dns_assistance_mode", e.target.value)}
+          >
+            <option value="off">Off</option>
+            <option value="auto">Automatic fallback servers</option>
+            <option value="manual">These fallback servers</option>
+          </select>
+          {f.dns_assistance_mode === "manual" && (
+            <ServerList
+              value={f.dns_assistance_servers}
+              onChange={(v) => set("dns_assistance_servers", v)}
+            />
+          )}
+          <Unsupported
+            feature="dns_assistance"
+            on={(f.dns_assistance_mode ?? "off") !== "off"}
+            aps={aps}
+            list={list}
+          />
+        </Row>
+        <Row
+          label="AP name in beacons"
+          hint="clients can see which AP they're on"
+        >
+          <Toggle
+            value={f.advertise_device_name_in_beacon}
+            disabled={iot}
+            onChange={(v) => set("advertise_device_name_in_beacon", v)}
+            label="Enabled"
+          />
+          <Unsupported
+            feature="advertise_ap_name"
+            on={f.advertise_device_name_in_beacon === true}
+            aps={aps}
+            list={list}
+          />
+        </Row>
         <Row label="Protected management frames">
           <select
+            disabled={iot}
             value={String(f.pmf_mode ?? "")}
             onChange={(e) => set("pmf_mode", e.target.value || undefined)}
           >
@@ -564,6 +795,7 @@ export function WlanEditor({
         </Row>
         <Row label="DTIM period">
           <select
+            disabled={iot}
             value={String(f.dtim_mode ?? "default")}
             onChange={(e) => set("dtim_mode", e.target.value)}
           >
@@ -579,6 +811,7 @@ export function WlanEditor({
                   className="search num-input"
                   min={1}
                   max={255}
+                  disabled={k === "dtim_ng" && f.iot_dtim_lock === true}
                   value={Number(f[k] ?? 1)}
                   onChange={(e) => set(k, Number(e.target.value))}
                 />
@@ -591,9 +824,70 @@ export function WlanEditor({
             className="search num-input"
             min={0}
             max={86400}
+            disabled={iot}
             value={Number(f.group_rekey ?? 0)}
             onChange={(e) => set("group_rekey", Number(e.target.value))}
           />
+        </Row>
+        {wpa3 && (
+          <Row
+            label="SAE timers"
+            hint="WPA3, seconds; changing them is rarely needed"
+          >
+            {(
+              [
+                ["sae_anti_clogging", "anti-clogging"],
+                ["sae_sync", "sync"],
+              ] as const
+            ).map(([k, l]) => (
+              <label key={k} className="small">
+                {l}{" "}
+                <input
+                  type="number"
+                  className="search num-input"
+                  min={1}
+                  max={60}
+                  value={Number(f[k] ?? 5)}
+                  onChange={(e) => set(k, Number(e.target.value))}
+                />
+              </label>
+            ))}
+          </Row>
+        )}
+        <Row label="Client-to-client links" hint="not in the official UI">
+          <Toggle
+            value={f.tdls_prohibit}
+            onChange={(v) => set("tdls_prohibit", v)}
+            label="Prohibit TDLS"
+          />
+          <Toggle
+            value={f.p2p}
+            onChange={(v) => set("p2p", v)}
+            label="Wi-Fi Direct (P2P)"
+          />
+          {f.p2p === true && (
+            <Toggle
+              value={f.p2p_cross_connect}
+              onChange={(v) => set("p2p_cross_connect", v)}
+              label="P2P cross-connect"
+            />
+          )}
+        </Row>
+        <Row
+          label="hostapd log level"
+          hint="for debugging; not in the official UI"
+        >
+          <select
+            value={Number(f.log_level ?? -1)}
+            onChange={(e) => set("log_level", Number(e.target.value))}
+          >
+            <option value={-1}>AP default</option>
+            <option value={0}>0 (verbose debug)</option>
+            <option value={1}>1 (debug)</option>
+            <option value={2}>2 (info)</option>
+            <option value={3}>3 (notice)</option>
+            <option value={4}>4 (warning)</option>
+          </select>
         </Row>
         <Row label="MAC address filter">
           <Toggle

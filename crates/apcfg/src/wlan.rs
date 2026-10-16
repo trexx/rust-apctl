@@ -12,7 +12,7 @@ use crate::{Ctx, bit};
 /// `radio_caps2` bits for WPA3 features. Both U6-Mesh radios report 31 (all of them);
 /// the assignment of the individual bits is our assumption.
 const RCAP2_SAE: u32 = 0;
-const RCAP2_SAE_FT: u32 = 1;
+pub(crate) const RCAP2_SAE_FT: u32 = 1;
 const RCAP2_WPA3_192: u32 = 2;
 const RCAP2_OWE: u32 = 3;
 /// `radio_caps` bit for a hardware noise floor (sensitivity) setting.

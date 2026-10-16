@@ -105,10 +105,14 @@ pub fn allowed(state: Option<&Value>, band: &str, with_dfs: bool) -> Option<Vec<
     Some(list)
 }
 
-/// APs whose channel a plan must not change: excluded in the setting, on a
-/// wireless uplink (moving them would cut them off), or being upgraded.
-pub fn pinned(live: &Live) -> Vec<String> {
+/// APs whose channel on `band` a plan must not change: excluded in the
+/// setting, on a wireless uplink (moving them would cut them off), being
+/// upgraded, or (2.4 GHz) held on channel 6 by an SSID's IoT channel lock.
+pub fn pinned(live: &Live, band: &str) -> Vec<String> {
     let mut out = settings(live.state.as_deref()).exclude_devices;
+    if band == "ng" {
+        out.extend(live.state.as_deref().map(crate::settings::channel_locked_aps).unwrap_or_default());
+    }
     for (mac, p) in &live.raw_informs {
         let uplink = p["uplink"].as_str().unwrap_or("eth0");
         if !uplink.is_empty() && !uplink.starts_with("eth") {
@@ -198,7 +202,11 @@ async fn wait_for_scans(s: &AppState) {
 /// channel), checking each is legal at the radio's width and allowed.
 pub fn set_channels(state: &mut Value, changes: &[(String, String, i64)]) -> Result<(), String> {
     let c = country(state);
+    let locked = crate::settings::channel_locked_aps(state);
     for (mac, band, ch) in changes {
+        if band == "ng" && locked.contains(&mac.to_ascii_lowercase()) {
+            return Err(format!("{mac}: the 2.4 GHz channel is locked by an SSID's IoT setting"));
+        }
         let allowed_here = allowed(Some(state), band, true);
         let devices = state["devices"].as_array().ok_or("the settings have no APs")?;
         let d = devices.iter().position(|d| d["mac"].as_str().is_some_and(|m| m.eq_ignore_ascii_case(mac))).ok_or_else(|| format!("{mac} is not in the settings"))?;
@@ -234,7 +242,7 @@ pub async fn run(s: AppState, bands: Vec<String>, trigger: &'static str) {
         tokio::time::sleep(Duration::from_secs(5)).await;
         let (allowed, pinned) = {
             let live = s.live.read().unwrap();
-            (allowed(live.state.as_deref(), band, false), pinned(&live))
+            (allowed(live.state.as_deref(), band, false), pinned(&live, band))
         };
         let plan = match crate::insights::compute_plan(&s, band.clone(), false, allowed, pinned).await {
             Ok(p) => p,
