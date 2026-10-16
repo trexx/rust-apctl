@@ -1210,11 +1210,15 @@ export function useLiveUpdates(): void {
       pending.set(id, { key, due: Math.max(Date.now() + 750, (last.get(id) ?? 0) + gap) });
       schedule();
     };
-    /** Invalidates (as above) each cached query in `family` whose filter `matches`. */
+    /**
+     * Invalidates (as above) each query in `family` on screen whose filter `matches`. The rest
+     * are only marked stale, all at once, so that they refetch when shown again.
+     */
     const invalidateWhere = <F>(family: QueryKey, matches: (filter: F) => boolean, gap: number) => {
-      for (const q of qc.getQueryCache().findAll({ queryKey: family })) {
+      for (const q of qc.getQueryCache().findAll({ queryKey: family, type: "active" })) {
         if (matches((q.queryKey[1] ?? {}) as F)) invalidate(q.queryKey, gap);
       }
+      void qc.invalidateQueries({ queryKey: family, type: "inactive", refetchType: "none" });
     };
     /** Refetches everything: messages were missed. The event and log lists are fetched whole. */
     const refetchAll = () => {
