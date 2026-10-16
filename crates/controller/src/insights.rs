@@ -1363,4 +1363,289 @@ mod tests {
         assert_eq!((g["security"].as_str(), g["guest"].as_bool(), g["vlan"].as_str()), (Some("Open"), Some(true), Some("20")));
         assert!(wlan_settings(Some(&state), "Other").is_null());
     }
+
+    /// The views' output on a synthetic site, pinned so that reworking how they
+    /// are computed cannot change what they show. Run with `APCTL_WRITE_PIN=1`
+    /// to write the expected output again (after a deliberate change).
+    mod pin {
+        use super::*;
+        use crate::engine::{ClientView, DeviceView, SharedLive};
+
+        const A1: &str = "02:00:00:00:00:a1";
+        const A2: &str = "02:00:00:00:00:a2";
+        /// (BSSID, AP, network, band)
+        const BSS: [(&str, &str, &str, &str); 5] = [
+            ("02:00:00:00:01:01", A1, "Home", "ng"),
+            ("02:00:00:00:01:02", A1, "Home", "na"),
+            ("02:00:00:00:01:03", A1, "IoT", "na"),
+            ("02:00:00:00:02:01", A2, "Home", "ng"),
+            ("02:00:00:00:02:02", A2, "Home", "na"),
+        ];
+        const C1: &str = "02:00:00:00:10:01";
+        const C2: &str = "02:00:00:00:10:02";
+        const C3: &str = "02:00:00:00:10:03";
+
+        /// A small deterministic generator, so the site is the same every run.
+        struct Rng(u64);
+
+        impl Rng {
+            fn next(&mut self, below: i64) -> i64 {
+                self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                ((self.0 >> 33) % below as u64) as i64
+            }
+        }
+
+        fn insert(c: &Connection, table: &str, cols: &[&str], rows: Vec<Vec<Sql>>) {
+            let sql = format!("INSERT INTO {table} ({}) VALUES ({})", cols.join(", "), vec!["?"; cols.len()].join(", "));
+            for r in rows {
+                c.execute(&sql, params_from_iter(r)).unwrap();
+            }
+        }
+
+        fn int(v: i64) -> Sql {
+            Sql::Integer(v)
+        }
+
+        fn text(v: &str) -> Sql {
+            Sql::Text(v.into())
+        }
+
+        /// The site: two APs reporting for a little over an hour before `base + 3600`.
+        fn site() -> (AppState, Ts) {
+            let now = store::now_ts();
+            let base = now - now % 3600 - 3600;
+            let dir = std::env::temp_dir().join(format!("apctl-insights-pin-{}-{}", std::process::id(), now));
+            let (store, writer) = store::Store::open(&dir).unwrap();
+            let m = Connection::open(dir.join("metrics.db")).unwrap();
+            let mut rng = Rng(7);
+            // Per SSID: cumulative counters, a restart (the second), rows without attempt
+            // counters (the third), unreported scores and signals (the fourth), a missing
+            // report (the fifth).
+            const VAP_COLS: &[&str] = &[
+                "bssid", "ts", "ap_mac", "essid", "radio", "num_sta", "satisfaction", "avg_client_signal", "rx_bytes", "tx_bytes", "rx_packets", "tx_packets",
+                "tx_retries", "tx_dropped", "tx_mcast", "rx_mcast", "wifi_tx_attempts", "wifi_tx_dropped", "tx_bcast", "rx_bcast",
+            ];
+            let mut rows = Vec::new();
+            for (i, (bssid, ap, essid, radio)) in BSS.iter().enumerate() {
+                let mut cum = [0i64; 12];
+                for k in 0..13i64 {
+                    if i == 4 && k == 5 {
+                        continue;
+                    }
+                    if i == 1 && k == 6 {
+                        cum = [0; 12];
+                    }
+                    let scale = [900_000, 3_000_000, 4000, 6000, 900, 20, 300, 400, 5000, 30, 200, 300];
+                    for (c, s) in cum.iter_mut().zip(scale) {
+                        *c += rng.next(s);
+                    }
+                    let ts = base - 50 + k * 300 + (i as i64 * 17) % 40;
+                    let satisfaction = if i == 3 && k % 2 == 0 { -1 } else { 50 + rng.next(50) };
+                    let signal = if i == 3 && k % 3 == 0 { 0 } else { -40 - rng.next(40) };
+                    let attempts = |v: i64| if i == 2 && k < 4 { Sql::Null } else { int(v) };
+                    let mut r = vec![text(bssid), int(ts), text(ap), text(essid), text(radio), int(rng.next(10)), int(satisfaction), int(signal)];
+                    r.extend(cum[..8].iter().map(|v| int(*v)));
+                    r.extend([attempts(cum[8] * 3), attempts(cum[9]), int(cum[10]), int(cum[11])]);
+                    rows.push(r);
+                }
+            }
+            insert(&m, "vap_stats", VAP_COLS, rows);
+            const RADIO_COLS: &[&str] = &["mac", "radio", "ts", "channel", "bw", "cu_total", "cu_self_rx", "cu_self_tx", "cu_interf", "num_sta", "tx_packets", "tx_retries"];
+            let mut rows = Vec::new();
+            for (j, (ap, radio)) in [(A1, "ng"), (A1, "na"), (A2, "ng"), (A2, "na")].into_iter().enumerate() {
+                let (mut pk, mut re) = (0, 0);
+                for k in 0..13i64 {
+                    pk += rng.next(5000);
+                    re += rng.next(500);
+                    let (rx, tx) = (rng.next(20), rng.next(20));
+                    rows.push(vec![
+                        text(ap), text(radio), int(base - 40 + k * 300 + j as i64 * 7), int(if radio == "ng" { 6 } else { 44 }), int(if radio == "ng" { 20 } else { 80 }),
+                        int(rx + tx + rng.next(40)), int(rx), int(tx), int(rng.next(30)), int(rng.next(8)), int(pk), int(re),
+                    ]);
+                }
+            }
+            insert(&m, "radio_stats", RADIO_COLS, rows);
+            // Clients: one moves from the first AP to the second half way (its counters restart).
+            const CLIENT_COLS: &[&str] = &[
+                "mac", "ts", "ap_mac", "bssid", "essid", "radio", "signal", "tx_bytes", "rx_bytes", "mcast_tx_pkts", "mcast_rx_pkts", "mcast_tx_bytes", "mcast_rx_bytes",
+            ];
+            let mut rows = Vec::new();
+            for (j, mac) in [C1, C2, C3].into_iter().enumerate() {
+                let mut cum = [0i64; 6];
+                for k in 0..13i64 {
+                    let at = match (j, k) {
+                        (0, k) if k < 7 => 0,
+                        (0, 7) => {
+                            cum = [0; 6];
+                            4
+                        }
+                        (0, _) => 4,
+                        (1, _) => 1,
+                        _ => 3,
+                    };
+                    for (c, s) in cum.iter_mut().zip([2_000_000, 500_000, 40, 30, 4000, 3000]) {
+                        *c += rng.next(s);
+                    }
+                    let (bssid, ap, essid, radio) = BSS[at];
+                    let signal = if j == 2 && k % 4 == 0 { Sql::Null } else { int(-50 - rng.next(30)) };
+                    let mcast = |v: i64| if j == 0 { Sql::Null } else { int(v) };
+                    rows.push(vec![
+                        text(mac), int(base - 30 + k * 300 + j as i64 * 11), text(ap), text(bssid), text(essid), text(radio), signal, int(cum[0]), int(cum[1]),
+                        mcast(cum[2]), mcast(cum[3]), mcast(cum[4]), mcast(cum[5]),
+                    ]);
+                }
+            }
+            insert(&m, "client_stats", CLIENT_COLS, rows);
+            let c = Connection::open(dir.join("config.db")).unwrap();
+            let spectrum = [(A1, "na", 36, 80, 30, 20), (A1, "na", 52, 80, 5, 2), (A1, "ng", 1, 20, 50, 40), (A1, "ng", 6, 20, 20, 10), (A2, "na", 36, 80, 40, 10), (A2, "ng", 11, 20, 60, 30)];
+            let rows = spectrum.iter().map(|(ap, r, ch, w, u, i)| vec![text(ap), text(r), int(*ch), int(*w), int(*u), int(*i), int(2), int(base + 100)]).collect();
+            insert(&c, "spectrum", &["ap_mac", "radio", "channel", "width", "utilization", "interference", "other_bss_count", "ts"], rows);
+            let heard = [
+                (BSS[4].0, A1, "na", "Home", 44, 80, 5210, -60),
+                (BSS[0].0, A2, "ng", "Home", 6, 20, 2437, -65),
+                (BSS[3].0, A1, "ng", "Home", 1, 20, 2412, -70),
+                ("02:aa:00:00:00:01", A1, "ng", "Neighbour", 6, 20, 2437, -55),
+                ("02:aa:00:00:00:02", A2, "na", "Other", 36, 40, 5190, -70),
+                ("02:aa:00:00:00:03", A1, "na", "Far", 149, 80, 5775, -80),
+            ];
+            let rows = heard
+                .iter()
+                .map(|(b, ap, r, e, ch, bw, cf, sig)| vec![text(b), text(ap), text(r), text(e), int(*ch), int(*bw), int(*cf), text("WPA2-Personal"), int(*sig), int(*sig), int(base - 86400), int(base + 3000)])
+                .collect();
+            insert(&c, "neighbors", &["bssid", "ap_mac", "radio", "essid", "channel", "bw", "center_freq", "security", "signal", "best_signal", "first_seen", "last_seen"], rows);
+
+            // What the APs report now.
+            let live: SharedLive = Default::default();
+            {
+                let mut l = live.write().unwrap();
+                for (ap, name, ch_ng, ch_na) in [(A1, "Hall", 6, 44), (A2, "Attic", 1, 36)] {
+                    let vaps: Vec<Value> = BSS
+                        .iter()
+                        .filter(|b| b.1 == ap)
+                        .map(|(bssid, _, essid, radio)| {
+                            let sta: Vec<Value> = match *bssid {
+                                b if b == BSS[0].0 => vec![json!({ "mac": C1, "signal": -61 })],
+                                b if b == BSS[1].0 => vec![json!({ "mac": C2, "signal": -55 })],
+                                b if b == BSS[3].0 => vec![json!({ "mac": C3, "signal": -70 })],
+                                _ => vec![],
+                            };
+                            let ch = if *radio == "ng" { ch_ng } else { ch_na };
+                            json!({ "bssid": bssid, "essid": essid, "radio": radio, "channel": ch, "bw": if *radio == "ng" { 20 } else { 80 }, "tx_power": 20,
+                                "num_sta": sta.len(), "satisfaction": 90, "usage": "user", "sta_table": sta })
+                        })
+                        .collect();
+                    let radios = json!([
+                        { "radio": "ng", "name": "wifi0", "athstats": { "cu_total": 30, "cu_interf": 10, "cu_self_rx": 5, "cu_self_tx": 5, "noise_floor": -95 } },
+                        { "radio": "na", "name": "wifi1", "athstats": { "cu_total": 20, "cu_interf": 5, "cu_self_rx": 5, "cu_self_tx": 5, "noise_floor": -96 } },
+                    ]);
+                    let p = json!({ "mac": ap, "hostname": name, "radio_table": radios, "vap_table": vaps });
+                    let snapshot = crate::model::parse(base, &p).unwrap();
+                    let mac: inform::Mac = ap.parse().unwrap();
+                    for c in &snapshot.clients {
+                        l.clients.insert(c.mac, ClientView { sample: c.clone(), connected: true, first_seen: 0, last_seen: base });
+                    }
+                    let d = DeviceView {
+                        snapshot, online: true, first_seen: 0, last_seen: base, peer: "x".into(), interval: 10, reconfiguring: false, reconfiguring_since: None,
+                        last_full_inform: base, last_config_push: None,
+                    };
+                    l.devices.insert(mac, d);
+                    let mut raw = p.clone();
+                    raw["radio_table"][1]["spectrum_table"] = json!([{ "channel": 36, "width": 80 }, { "channel": 52, "width": 80 }, { "channel": 100, "width": 80 }]);
+                    l.raw_informs.insert(mac, std::sync::Arc::new(raw));
+                }
+                l.state = Some(std::sync::Arc::new(json!({
+                    "devices": [{ "mac": A1, "site_id": "s1" }, { "mac": A2, "site_id": "s1" }],
+                    "wlanconf": [{ "name": "Home", "security": "wpapsk", "wpa_mode": "wpa2", "networkconf_id": "n1", "site_id": "s1" }],
+                    "networkconf": [{ "_id": "n1", "name": "LAN", "site_id": "s1" }],
+                })));
+            }
+            let auth = std::sync::Arc::new(crate::auth::Auth::new(Default::default(), &store, writer.clone(), Default::default()).unwrap());
+            let (engine, _) = tokio::sync::mpsc::channel(1);
+            let (tx, _) = tokio::sync::broadcast::channel(1);
+            let s = AppState {
+                backups: crate::backup::Backups { data_dir: dir.clone(), key: None },
+                store, vendors: Default::default(), renderer: crate::dryrun::apcfg_renderer("10.6.106".into()), auth, engine, live, tx, started: 0, source: "none".into(),
+                active: false, writer,
+            };
+            (s, base)
+        }
+
+        /// Times as offsets from `base`, so the output does not depend on the day.
+        fn rebase(v: &mut Value, base: Ts) {
+            match v {
+                Value::Object(m) => {
+                    for (k, x) in m.iter_mut() {
+                        match (k.as_str(), &mut *x) {
+                            ("ts", Value::Number(n)) => *x = json!(n.as_i64().unwrap() - base),
+                            ("ts", Value::Array(a)) => a.iter_mut().for_each(|t| *t = json!(t.as_i64().unwrap() - base)),
+                            _ => rebase(x, base),
+                        }
+                    }
+                }
+                Value::Array(a) => a.iter_mut().for_each(|x| rebase(x, base)),
+                _ => {}
+            }
+        }
+
+        /// Equal, numbers to within rounding (sums may be added up in another order).
+        fn same(a: &Value, b: &Value, at: &str) -> Result<(), String> {
+            match (a, b) {
+                (Value::Number(x), Value::Number(y)) => {
+                    let (x, y) = (x.as_f64().unwrap(), y.as_f64().unwrap());
+                    if (x - y).abs() <= 1e-9 * x.abs().max(y.abs()).max(1.0) { Ok(()) } else { Err(format!("{at}: {x} != {y}")) }
+                }
+                (Value::Array(x), Value::Array(y)) if x.len() == y.len() => x.iter().zip(y).enumerate().try_for_each(|(i, (x, y))| same(x, y, &format!("{at}[{i}]"))),
+                (Value::Object(x), Value::Object(y)) if x.len() == y.len() => {
+                    x.iter().try_for_each(|(k, v)| y.get(k).ok_or_else(|| format!("{at}.{k} missing")).and_then(|w| same(v, w, &format!("{at}.{k}"))))
+                }
+                _ if a == b => Ok(()),
+                _ => Err(format!("{at}: {a} != {b}")),
+            }
+        }
+
+        fn ok<T>(r: Result<Json<T>, ApiError>) -> T {
+            r.unwrap_or_else(|e| panic!("{}", e.1)).0
+        }
+
+        async fn outputs() -> Value {
+            let (s, base) = site();
+            let q = |band: Option<&str>, mac: Option<&str>| Query(RangeQuery { range: None, from: Some(base), to: Some(base + 3600), band: band.map(Into::into), mac: mac.map(Into::into) });
+            let plan = |band: &str, dfs: bool| Query(PlanQuery { band: Some(band.into()), dfs: Some(dfs) });
+            let st = || State(s.clone());
+            let mut out = json!({
+                "activity": ok(activity(st(), q(None, None)).await),
+                "activity_na": ok(activity(st(), q(Some("na"), None)).await),
+                "activity_a1": ok(activity(st(), q(None, Some(A1))).await),
+                "top": ok(top(st(), q(None, None)).await),
+                "top_a2": ok(top(st(), q(None, Some(A2))).await),
+                "density": ok(density(st(), q(None, None)).await),
+                "retries": ok(retries(st(), q(None, None)).await),
+                "multicast": ok(multicast(st(), q(None, None)).await),
+                "wlans": ok(wlans(st(), q(None, None)).await),
+                "radios": ok(radios(st(), q(None, None)).await),
+                "plan_ng": json!(ok(channel_plan(st(), plan("ng", false)).await)),
+                "plan_na": json!(ok(channel_plan(st(), plan("na", true)).await)),
+            });
+            rebase(&mut out, base);
+            out
+        }
+
+        #[tokio::test]
+        async fn views_are_unchanged() {
+            let out = outputs().await;
+            let path = concat!(env!("CARGO_MANIFEST_DIR"), "/src/testdata/insights-pin.json");
+            if std::env::var_os("APCTL_WRITE_PIN").is_some() {
+                std::fs::create_dir_all(std::path::Path::new(path).parent().unwrap()).unwrap();
+                std::fs::write(path, serde_json::to_string_pretty(&out).unwrap() + "\n").unwrap();
+                return;
+            }
+            let expected: Value = serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+            for (k, v) in expected.as_object().unwrap() {
+                if let Err(e) = same(&out[k], v, k) {
+                    panic!("{e}");
+                }
+            }
+            assert_eq!(out.as_object().unwrap().len(), expected.as_object().unwrap().len());
+        }
+    }
 }
