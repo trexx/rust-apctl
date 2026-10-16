@@ -1103,9 +1103,10 @@ pub async fn compute_plan(s: &AppState, radio: String, dfs: bool, allowed: Optio
                 Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, Option<String>>(2)?, r.get::<_, Option<f64>>(3)?, r.get::<_, Option<f64>>(4)?, r.get::<_, Option<f64>>(5)?))
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
-        let mut stmt = c.prepare("SELECT ap_mac, channel, width, interference, utilization FROM spectrum WHERE radio = ?1")?;
+        // Scans as recent as the networks heard.
+        let mut stmt = c.prepare("SELECT ap_mac, channel, width, interference, utilization FROM spectrum WHERE radio = ?1 AND ts >= ?2")?;
         let sp = stmt
-            .query_map([r2], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?, r.get::<_, Option<i64>>(2)?, r.get::<_, Option<f64>>(3)?, r.get::<_, Option<f64>>(4)?)))?
+            .query_map(rusqlite::params![r2, since], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?, r.get::<_, Option<i64>>(2)?, r.get::<_, Option<f64>>(3)?, r.get::<_, Option<f64>>(4)?)))?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok((n, sp))
     })
@@ -1456,10 +1457,12 @@ mod tests {
         }
 
         /// The site: two APs reporting for a little over an hour before `base + 3600`.
-        fn site() -> (AppState, Ts) {
+        fn site() -> (AppState, Ts, std::path::PathBuf) {
             let now = store::now_ts();
             let base = now - now % 3600 - 3600;
-            let dir = std::env::temp_dir().join(format!("apctl-insights-pin-{}-{}", std::process::id(), now));
+            static SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+            let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let dir = std::env::temp_dir().join(format!("apctl-insights-pin-{}-{now}-{seq}", std::process::id()));
             let (store, writer) = store::Store::open(&dir).unwrap();
             let m = Connection::open(dir.join("metrics.db")).unwrap();
             let mut rng = Rng(7);
@@ -1612,7 +1615,7 @@ mod tests {
                 store, vendors: Default::default(), renderer: crate::dryrun::apcfg_renderer("10.6.106".into()), auth, engine, live, tx, started: 0, source: "none".into(),
                 active: false, writer,
             };
-            (s, base)
+            (s, base, dir)
         }
 
         /// Times as offsets from `base`, so the output does not depend on the day.
@@ -1653,7 +1656,7 @@ mod tests {
         }
 
         async fn outputs() -> Value {
-            let (s, base) = site();
+            let (s, base, _) = site();
             let q = |band: Option<&str>, mac: Option<&str>| Query(RangeQuery { range: None, from: Some(base), to: Some(base + 3600), band: band.map(Into::into), mac: mac.map(Into::into) });
             let plan = |band: &str, dfs: bool| Query(PlanQuery { band: Some(band.into()), dfs: Some(dfs) });
             let st = || State(s.clone());
@@ -1691,6 +1694,18 @@ mod tests {
                 }
             }
             assert_eq!(out.as_object().unwrap().len(), expected.as_object().unwrap().len());
+        }
+
+        #[tokio::test]
+        async fn plans_leave_out_old_scans() {
+            let (s, base, dir) = site();
+            let before = json!(ok(channel_plan(State(s.clone()), Query(PlanQuery { band: Some("na".into()), dfs: Some(true) })).await));
+            // A scan from long ago saying the channel the plan picks for A2 is full.
+            let c = Connection::open(dir.join("config.db")).unwrap();
+            let row = vec![text(A2), text("na"), int(52), int(80), int(100), int(100), int(9), int(base - 8 * 86400)];
+            insert(&c, "spectrum", &["ap_mac", "radio", "channel", "width", "utilization", "interference", "other_bss_count", "ts"], vec![row]);
+            let after = json!(ok(channel_plan(State(s), Query(PlanQuery { band: Some("na".into()), dfs: Some(true) })).await));
+            assert_eq!(before, after);
         }
     }
 }
