@@ -291,6 +291,33 @@ pub struct Live {
     pub last_config: HashMap<Mac, Arc<PushedConfig>>,
 }
 
+impl Live {
+    /// Drops what the live view keeps about a forgotten AP, except its clients
+    /// (the engine disconnects those, with events). Every field is named, so a
+    /// field added to `Live` has to be decided on here.
+    fn forget_ap(&mut self, mac: &Mac) {
+        let Live {
+            devices, aliases: _, clients: _, counters: _, by_hash_id, by_ip, known_devices, state: _, state_imported_at: _, raw_informs, firmware, commands,
+            locating, reprovision, scans, adoption, last_config,
+        } = self;
+        devices.remove(mac);
+        // Also what was restored from the database, or it could still be reported offline.
+        known_devices.remove(mac);
+        by_hash_id.retain(|_, m| m != mac);
+        by_ip.retain(|_, m| m != mac);
+        raw_informs.remove(mac);
+        last_config.remove(mac);
+        adoption.forgetting.remove(mac);
+        adoption.adopting.remove(mac);
+        // Nothing queued for it may reach it if it is adopted again.
+        firmware.remove(mac);
+        commands.remove(mac);
+        locating.remove(mac);
+        reprovision.remove(mac);
+        scans.remove(mac);
+    }
+}
+
 /// A config pushed to an AP.
 #[derive(Debug, Clone, Default)]
 pub struct PushedConfig {
@@ -973,21 +1000,7 @@ impl Engine {
 
     fn forget(&mut self, ts: Ts, mac: Mac) {
         let mut live = self.live.write().unwrap();
-        live.devices.remove(&mac);
-        // Also what was restored from the database, or it could still be reported offline.
-        live.known_devices.remove(&mac);
-        live.by_hash_id.retain(|_, m| *m != mac);
-        live.by_ip.retain(|_, m| *m != mac);
-        live.raw_informs.remove(&mac);
-        live.last_config.remove(&mac);
-        live.adoption.forgetting.remove(&mac);
-        live.adoption.adopting.remove(&mac);
-        // Nothing queued for it may reach it if it is adopted again.
-        live.commands.remove(&mac);
-        live.locating.remove(&mac);
-        live.reprovision.remove(&mac);
-        live.scans.remove(&mac);
-        live.firmware.remove(&mac);
+        live.forget_ap(&mac);
         // Its clients are gone with it, rather than left connected until they go stale.
         let mut events = Vec::new();
         let clients = &mut live.clients;
@@ -1988,13 +2001,17 @@ mod tests {
             let mut live = h.live.write().unwrap();
             live.commands.entry(mac).or_default().push_back(json!({ "cmd": "restart" }));
             live.locating.insert(mac);
+            live.reprovision.insert(mac);
+            live.last_config.insert(mac, Default::default());
+            live.adoption.forgetting.insert(mac, 1);
         }
         events(&mut h);
         h.engine.handle(Input::Forget { ts: 5, mac });
         assert_eq!(events(&mut h), vec![("client_disconnected", Some(C1.into()))]);
         let live = h.live.read().unwrap();
         assert!(!live.clients[&C1.parse().unwrap()].connected);
-        assert!(live.commands.is_empty() && live.locating.is_empty() && live.devices.is_empty());
+        assert!(live.commands.is_empty() && live.locating.is_empty() && live.reprovision.is_empty() && live.devices.is_empty());
+        assert!(live.raw_informs.is_empty() && live.last_config.is_empty() && live.adoption.forgetting.is_empty() && live.by_ip.is_empty());
     }
 
     fn notif(ap: &str, reason: &str, payload: Value) -> Decoded {
