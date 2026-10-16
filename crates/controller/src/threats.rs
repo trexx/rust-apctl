@@ -26,39 +26,18 @@ use rusqlite::{Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
+use crate::alerts::named_enum;
 use crate::api::{ApiError, AppState};
 use crate::engine::{Input, SharedLive};
 use crate::model::Ts;
 use crate::store::{self, Db, Store, Writer};
 use inform::Mac;
 
-/// What a finding is (see above).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Kind {
-    SpoofedBssid,
-    Impersonation,
-    Lookalike,
-    Bridged,
-    NewNearby,
-}
-
-impl Kind {
-    const ALL: [Kind; 5] = [Kind::SpoofedBssid, Kind::Impersonation, Kind::Lookalike, Kind::Bridged, Kind::NewNearby];
-
-    /// As stored and as the API and events name it.
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Kind::SpoofedBssid => "spoofed_bssid",
-            Kind::Impersonation => "impersonation",
-            Kind::Lookalike => "lookalike",
-            Kind::Bridged => "bridged",
-            Kind::NewNearby => "new_nearby",
-        }
-    }
-
-    pub fn parse(s: &str) -> Option<Kind> {
-        Kind::ALL.into_iter().find(|k| k.as_str() == s)
+named_enum! {
+    /// What a finding is (see above), as stored and as the API and events name it.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+    pub enum Kind {
+        SpoofedBssid = "spoofed_bssid", Impersonation = "impersonation", Lookalike = "lookalike", Bridged = "bridged", NewNearby = "new_nearby",
     }
 }
 

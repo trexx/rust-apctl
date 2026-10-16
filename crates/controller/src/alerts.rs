@@ -39,60 +39,50 @@ const HEALTH_COOLDOWN: Ts = 6 * 3600;
 /// many checks in a row (a minute apart): it stopped reporting, or its AP went.
 const HEALTH_STALE_CHECKS: u32 = 15;
 
-/// What an alert is about.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Category {
-    ApStatus,
-    Security,
-    Health,
-    Changes,
-}
-
-impl Category {
-    const ALL: [Category; 4] = [Category::ApStatus, Category::Security, Category::Health, Category::Changes];
-
-    /// As stored and as the API names it.
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Category::ApStatus => "ap_status",
-            Category::Security => "security",
-            Category::Health => "health",
-            Category::Changes => "changes",
+/// Declares a fieldless enum whose variants are stored and sent by name, with
+/// `as_str`, `parse` and serialisation as that name.
+macro_rules! named_enum {
+    ($(#[$attr:meta])* $vis:vis enum $name:ident { $($variant:ident = $str:literal),* $(,)? }) => {
+        $(#[$attr])*
+        $vis enum $name {
+            $($variant,)*
         }
-    }
 
-    fn parse(s: &str) -> Option<Category> {
-        Category::ALL.into_iter().find(|c| c.as_str() == s)
-    }
-}
+        impl $name {
+            /// As stored and as the API names it.
+            pub fn as_str(self) -> &'static str {
+                match self {
+                    $($name::$variant => $str,)*
+                }
+            }
 
-/// How urgent an alert is.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Severity {
-    High,
-    Medium,
-    Low,
-    Info,
-}
-
-impl Severity {
-    const ALL: [Severity; 4] = [Severity::High, Severity::Medium, Severity::Low, Severity::Info];
-
-    /// As stored and as the API names it.
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Severity::High => "high",
-            Severity::Medium => "medium",
-            Severity::Low => "low",
-            Severity::Info => "info",
+            pub fn parse(s: &str) -> Option<$name> {
+                match s {
+                    $($str => Some($name::$variant),)*
+                    _ => None,
+                }
+            }
         }
-    }
 
-    fn parse(s: &str) -> Option<Severity> {
-        Severity::ALL.into_iter().find(|x| x.as_str() == s)
-    }
+        impl serde::Serialize for $name {
+            fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+                s.serialize_str(self.as_str())
+            }
+        }
+    };
+}
+pub(crate) use named_enum;
+
+named_enum! {
+    /// What an alert is about.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum Category { ApStatus = "ap_status", Security = "security", Health = "health", Changes = "changes" }
+}
+
+named_enum! {
+    /// How urgent an alert is.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum Severity { High = "high", Medium = "medium", Low = "low", Info = "info" }
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
