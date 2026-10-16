@@ -28,7 +28,7 @@ use serde_json::{Value, json};
 use crate::api::{ApiError, AppState};
 use crate::engine::Live;
 use crate::api::read;
-use crate::insights::{RangeQuery, window};
+use crate::insights::{RangeQuery, ap_name, client_name, window};
 use crate::model::Ts;
 use crate::store::Db;
 
@@ -545,26 +545,26 @@ pub struct Names {
     pub clients: HashMap<String, Option<String>>,
 }
 
+/// (MAC, name) rows of a query, by MAC.
+fn pairs<P: rusqlite::Params>(c: &rusqlite::Connection, sql: &str, params: P) -> rusqlite::Result<HashMap<String, Option<String>>> {
+    c.prepare(sql)?.query_map(params, |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?)))?.collect()
+}
+
+/// APs' names, else their hostnames.
+const AP_NAMES: &str = "SELECT mac, COALESCE(name, hostname) FROM devices";
+
 impl Names {
     /// From the database: APs' names (else hostnames) and clients' hostnames.
     pub fn load(c: &rusqlite::Connection) -> rusqlite::Result<Names> {
-        let pairs = |sql: &str| -> rusqlite::Result<HashMap<String, Option<String>>> {
-            c.prepare(sql)?.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?)))?.collect()
-        };
-        Ok(Names { aps: pairs("SELECT mac, COALESCE(name, hostname) FROM devices")?, clients: pairs("SELECT mac, hostname FROM clients")? })
+        Ok(Names { aps: pairs(c, AP_NAMES, [])?, clients: pairs(c, "SELECT mac, hostname FROM clients", [])? })
     }
 
     /// The same for some clients only: every AP (there are few), and the clients asked for.
-    fn load_for(c: &rusqlite::Connection, clients: &BTreeSet<&str>) -> rusqlite::Result<Names> {
-        let aps = c.prepare("SELECT mac, COALESCE(name, hostname) FROM devices")?.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?)))?.collect::<rusqlite::Result<_>>()?;
-        let mut names = Names { aps, clients: HashMap::new() };
-        let list: Vec<&str> = clients.iter().copied().collect();
-        for chunk in list.chunks(500) {
+    fn load_for(c: &rusqlite::Connection, clients: &[String]) -> rusqlite::Result<Names> {
+        let mut names = Names { aps: pairs(c, AP_NAMES, [])?, clients: HashMap::new() };
+        for chunk in clients.chunks(500) {
             let sql = format!("SELECT mac, hostname FROM clients WHERE mac IN ({})", vec!["?"; chunk.len()].join(", "));
-            for row in c.prepare(&sql)?.query_map(rusqlite::params_from_iter(chunk), |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?)))? {
-                let (mac, name) = row?;
-                names.clients.insert(mac, name);
-            }
+            names.clients.extend(pairs(c, &sql, rusqlite::params_from_iter(chunk))?);
         }
         Ok(names)
     }
@@ -593,14 +593,15 @@ impl Names {
 }
 
 /// Display names (aliases first) of the APs and clients named in a response,
-/// for the ones that have one.
+/// for the ones that have one: what they report now, else what was stored.
 async fn names<'a>(s: &AppState, macs: impl Iterator<Item = (&'a str, &'a str)>) -> Result<(HashMap<String, String>, HashMap<String, String>), ApiError> {
     let (aps, clients): (BTreeSet<&str>, BTreeSet<&str>) = macs.unzip();
-    let wanted: BTreeSet<String> = clients.iter().map(|m| m.to_string()).collect();
-    let mut names = read(&s.store, Db::Config, move |c| Ok(Names::load_for(c, &wanted.iter().map(String::as_str).collect())?)).await?;
-    names.add_live(&s.live.read().unwrap());
-    let named = |m: HashMap<String, Option<String>>, keep: &BTreeSet<&str>| m.into_iter().filter(|(mac, _)| keep.contains(mac.as_str())).filter_map(|(mac, n)| n.map(|n| (mac, n))).collect();
-    Ok((named(names.aps, &aps), named(names.clients, &clients)))
+    let wanted: Vec<String> = clients.iter().map(|m| m.to_string()).collect();
+    let mut stored = read(&s.store, Db::Config, move |c| Ok(Names::load_for(c, &wanted)?)).await?;
+    let live = s.live.read().unwrap();
+    let aps = aps.into_iter().filter_map(|m| Some((m.to_string(), ap_name(&live, m).or_else(|| stored.aps.remove(m).flatten())?))).collect();
+    let clients = clients.into_iter().filter_map(|m| Some((m.to_string(), client_name(&live, m.parse().ok()).or_else(|| stored.clients.remove(m).flatten())?))).collect();
+    Ok((aps, clients))
 }
 
 /// (AP, client) of every attempt and both ends of every roam.

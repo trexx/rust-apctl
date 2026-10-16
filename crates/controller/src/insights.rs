@@ -169,7 +169,7 @@ pub(crate) fn ap_name(live: &Live, mac: &str) -> Option<String> {
 }
 
 /// A client's name: the alias given in apctl, else the host name it reports.
-fn client_name(live: &Live, mac: Option<inform::Mac>) -> Option<String> {
+pub(crate) fn client_name(live: &Live, mac: Option<inform::Mac>) -> Option<String> {
     let mac = mac?;
     live.aliases.get(&mac).and_then(|a| a.alias.clone()).or_else(|| live.clients.get(&mac).and_then(|c| c.sample.hostname.clone()))
 }
