@@ -54,7 +54,7 @@ pub enum Input {
     /// client blocked from the UI, a channel plan applied).
     Note(Event),
     /// Drop everything apctl keeps about a forgotten AP.
-    Forget { mac: Mac },
+    Forget { ts: Ts, mac: Mac },
     /// Change the settings (apctl's copy of the controller settings), store
     /// them, and record the change; `done` gets the result.
     EditState { ts: Ts, what: String, edit: StateEdit, done: tokio::sync::oneshot::Sender<Result<(), String>> },
@@ -450,7 +450,7 @@ impl Engine {
             }
             Input::AlertsRead => self.writer.exec(Db::Config, "UPDATE alerts SET read = 1 WHERE read = 0", vec![]),
             Input::Note(e) => self.emit(e),
-            Input::Forget { mac } => self.forget(mac),
+            Input::Forget { ts, mac } => self.forget(ts, mac),
             Input::EditState { ts, what, edit, done } => {
                 let _ = done.send(self.edit_state(ts, what, edit));
             }
@@ -518,10 +518,18 @@ impl Engine {
             live.raw_informs.insert(mac, Arc::new(decoded.payload));
         }
         bump(&self.counters.informs);
-        if let Some(h) = &snap.ap.hash_id {
+        // For attributing syslog. An address or hash_id the AP no longer has is
+        // dropped: plain syslog from whichever host gets the address next is not the AP's.
+        if let Some(h) = &snap.ap.hash_id
+            && live.by_hash_id.get(h) != Some(&mac)
+        {
+            live.by_hash_id.retain(|_, m| *m != mac);
             live.by_hash_id.insert(h.clone(), mac);
         }
-        if let Some(ip) = &snap.ap.ip {
+        if let Some(ip) = &snap.ap.ip
+            && live.by_ip.get(ip) != Some(&mac)
+        {
+            live.by_ip.retain(|_, m| *m != mac);
             live.by_ip.insert(ip.clone(), mac);
         }
 
@@ -860,7 +868,7 @@ impl Engine {
         Ok(())
     }
 
-    fn forget(&mut self, mac: Mac) {
+    fn forget(&mut self, ts: Ts, mac: Mac) {
         let mut live = self.live.write().unwrap();
         live.devices.remove(&mac);
         // Also what was restored from the database, or it could still be reported offline.
@@ -871,7 +879,27 @@ impl Engine {
         live.last_config.remove(&mac);
         live.adoption.forgetting.remove(&mac);
         live.adoption.adopting.remove(&mac);
+        // Nothing queued for it may reach it if it is adopted again.
+        live.commands.remove(&mac);
+        live.locating.remove(&mac);
+        live.reprovision.remove(&mac);
+        live.scans.remove(&mac);
+        live.firmware.remove(&mac);
+        // Its clients are gone with it, rather than left connected until they go stale.
+        let mut events = Vec::new();
+        for (cmac, c) in live.clients.iter_mut().filter(|(_, c)| c.connected && c.sample.ap_mac == mac) {
+            c.connected = false;
+            events.push(disconnected_event(ts, *cmac, c, "ap_forgotten"));
+            self.writer.exec(Db::Config, "UPDATE clients SET connected = 0 WHERE mac = ?1", vec![Sql::Text(cmac.to_string())]);
+        }
         drop(live);
+        let had_clients = !events.is_empty();
+        for e in events {
+            self.emit(e);
+        }
+        if had_clients {
+            let _ = self.tx.send(LiveMsg::Clients);
+        }
         self.radios.retain(|(m, _), _| *m != mac);
         self.isolated.remove(&mac);
         self.written.devices.remove(&mac);
@@ -1232,10 +1260,7 @@ impl Engine {
             if let Some(reason) = reason {
                 c.connected = false;
                 changed = true;
-                events.push(ev(now, "client_disconnected", Some(c.sample.ap_mac), Some(*cmac), json!({
-                    "reason": reason, "last_seen": c.last_seen, "essid": c.sample.essid,
-                    "connected_for": c.sample.uptime, "last_signal": c.sample.signal,
-                })));
+                events.push(disconnected_event(now, *cmac, c, reason));
                 self.writer.exec(Db::Config, "UPDATE clients SET connected = 0 WHERE mac = ?1", vec![Sql::Text(cmac.to_string())]);
             }
         }
@@ -1489,6 +1514,13 @@ fn connected_event(ts: Ts, c: &ClientSample, new: bool) -> Event {
     ev(ts, "client_connected", Some(c.ap_mac), Some(c.mac), json!({
         "essid": c.essid, "radio": c.radio, "channel": c.channel, "signal": c.signal,
         "hostname": c.hostname, "ip": c.ip, "new": new,
+    }))
+}
+
+fn disconnected_event(ts: Ts, mac: Mac, c: &ClientView, reason: &str) -> Event {
+    ev(ts, "client_disconnected", Some(c.sample.ap_mac), Some(mac), json!({
+        "reason": reason, "last_seen": c.last_seen, "essid": c.sample.essid,
+        "connected_for": c.sample.uptime, "last_signal": c.sample.signal,
     }))
 }
 
@@ -1767,6 +1799,24 @@ mod tests {
         assert_eq!(edit(&mut h, Box::new(|_| Err("no".into()))), Err("no".into()));
         let kinds: Vec<_> = events(&mut h).into_iter().map(|e| e.0).collect();
         assert_eq!(kinds, ["settings_imported", "settings_changed"]);
+    }
+
+    #[test]
+    fn a_forgotten_ap_leaves_nothing_behind() {
+        let mut h = harness();
+        let mac: Mac = AP1.parse().unwrap();
+        h.engine.handle(Input::Inform { ts: 0, peer: "x".into(), decoded: decoded(inform(AP1, 1000, &[(C1, "b1")])) });
+        {
+            let mut live = h.live.write().unwrap();
+            live.commands.entry(mac).or_default().push_back(json!({ "cmd": "restart" }));
+            live.locating.insert(mac);
+        }
+        events(&mut h);
+        h.engine.handle(Input::Forget { ts: 5, mac });
+        assert_eq!(events(&mut h), vec![("client_disconnected", Some(C1.into()))]);
+        let live = h.live.read().unwrap();
+        assert!(!live.clients[&C1.parse().unwrap()].connected);
+        assert!(live.commands.is_empty() && live.locating.is_empty() && live.devices.is_empty());
     }
 
     fn notif(ap: &str, reason: &str, payload: Value) -> Decoded {
