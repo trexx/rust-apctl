@@ -843,8 +843,7 @@ impl Engine {
             let summary = if old.is_empty() {
                 json!({ "baseline": true, "lines": new.lines().count() })
             } else {
-                let d = cfgdiff::diff(old, new);
-                json!({ "added": d.added.len(), "removed": d.removed.len(), "changed": d.changed.len(), "diff": d.render("", true) })
+                cfgdiff::diff(old, new).summary()
             };
             data.insert(field.into(), summary);
         }
