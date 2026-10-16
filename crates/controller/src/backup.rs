@@ -553,10 +553,11 @@ fn check_names(m: &Manifest) -> Result<()> {
     }
 }
 
-/// Whether a backup made by `theirs` can be restored on `ours` (no newer backups).
+/// Whether a backup made by `theirs` can be restored on `ours` (no newer
+/// backups), compared as firmware versions are: a release candidate is older
+/// than its release.
 pub fn version_ok(theirs: &str, ours: &str) -> bool {
-    let parse = |v: &str| v.split('.').map(|x| x.parse::<u64>().unwrap_or(0)).collect::<Vec<_>>();
-    parse(theirs) <= parse(ours)
+    crate::firmware::compare(theirs, ours).is_le()
 }
 
 // ---------------------------------------------------------------- restore
@@ -1278,6 +1279,10 @@ mod tests {
         assert!(version_ok("0.7.9", "0.8.0"));
         assert!(!version_ok("0.9.0", "0.8.0"));
         assert!(!version_ok("0.10.0", "0.9.5"));
+        // Pre-releases come before their release.
+        assert!(version_ok("0.16.0-rc1", "0.16.0"));
+        assert!(!version_ok("0.16.0", "0.16.0-rc1"));
+        assert!(!version_ok("0.16.1-rc1", "0.16.0"));
     }
 
     #[test]
