@@ -49,7 +49,7 @@ pub enum Input {
     DecodeError,
     /// A suspicious network found for the first time: record it, and report it
     /// as an event unless it was already acknowledged.
-    ThreatFound { ts: Ts, kind: &'static str, bssid: String, device_mac: Option<Mac>, data: Value, notify: bool },
+    ThreatFound { ts: Ts, kind: crate::threats::Kind, bssid: String, device_mac: Option<Mac>, data: Value, notify: bool },
     /// Mark every alert read.
     AlertsRead,
     /// Record an event raised elsewhere (e.g. active mode sending an upgrade, a
@@ -66,7 +66,7 @@ pub enum Input {
     /// queued or cancelled.
     Firmware { op: crate::firmware::Op, done: tokio::sync::oneshot::Sender<usize> },
     /// Acknowledge a finding with an optional note (`Some`), or withdraw the acknowledgement (`None`).
-    AckThreat { ts: Ts, kind: &'static str, bssid: String, note: Option<Option<String>> },
+    AckThreat { ts: Ts, kind: crate::threats::Kind, bssid: String, note: Option<Option<String>> },
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -80,10 +80,61 @@ pub struct LogLine {
     pub msg: String,
 }
 
+/// Declares `EventKind`: one variant per kind of event, stored and sent by its name.
+macro_rules! event_kinds {
+    ($($kind:ident = $name:literal),* $(,)?) => {
+        /// What an event is about. The names are stored with each event and read
+        /// by the UI, so a name never changes once used.
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+        pub enum EventKind {
+            $($kind,)*
+        }
+
+        impl EventKind {
+            #[cfg(test)]
+            pub const ALL: &[EventKind] = &[$(EventKind::$kind,)*];
+
+            pub const fn as_str(self) -> &'static str {
+                match self {
+                    $(EventKind::$kind => $name,)*
+                }
+            }
+        }
+    };
+}
+
+event_kinds!(
+    ApSeen = "ap_seen", ApOnline = "ap_online", ApOffline = "ap_offline", ApRestarted = "ap_restarted", ApFirmwareChanged = "ap_firmware_changed",
+    ApIsolated = "ap_isolated", ApCrash = "ap_crash", ApProcessRestarted = "ap_process_restarted", ApScanDone = "ap_scan_done", ApEvent = "ap_event",
+    DfsRadar = "dfs_radar", RogueAp = "rogue_ap", NetworkThreat = "network_threat", RadioChanged = "radio_changed",
+    ConfigPushed = "config_pushed", ConfigApplied = "config_applied", DryrunCompared = "dryrun_compared",
+    ApUpgradeSent = "ap_upgrade_sent", ApUpgradeStarted = "ap_upgrade_started", ApUpgradeProgress = "ap_upgrade_progress", ApUpgradeFailed = "ap_upgrade_failed",
+    ApUpgraded = "ap_upgraded",
+    ApPending = "ap_pending", ApAdopting = "ap_adopting", ApAdopted = "ap_adopted", ApForgotten = "ap_forgotten", ApHostKeyMismatch = "ap_host_key_mismatch",
+    ApRestartRequested = "ap_restart_requested", ApProvisionRequested = "ap_provision_requested",
+    ClientConnected = "client_connected", ClientDisconnected = "client_disconnected", ClientConnectFailed = "client_connect_failed", ClientRoamed = "client_roamed",
+    ClientRenamed = "client_renamed", ClientKicked = "client_kicked", ClientSteered = "client_steered", ClientWrongPassword = "client_wrong_password",
+    ClientExperience = "client_experience", ClientReconnectRequested = "client_reconnect_requested", ClientBlocked = "client_blocked",
+    ClientUnblocked = "client_unblocked",
+    SettingsImported = "settings_imported", SettingsChanged = "settings_changed", ChannelPlan = "channel_plan",
+);
+
+impl Serialize for EventKind {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(self.as_str())
+    }
+}
+
+impl std::fmt::Display for EventKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct Event {
     pub ts: Ts,
-    pub kind: &'static str,
+    pub kind: EventKind,
     pub device_mac: Option<Mac>,
     pub client_mac: Option<Mac>,
     pub data: Value,
@@ -91,17 +142,17 @@ pub struct Event {
 
 impl Event {
     /// An event about an AP.
-    pub fn device(ts: Ts, kind: &'static str, mac: Mac, data: Value) -> Self {
+    pub fn device(ts: Ts, kind: EventKind, mac: Mac, data: Value) -> Self {
         ev(ts, kind, Some(mac), None, data)
     }
 
     /// An event about a client.
-    pub fn client(ts: Ts, kind: &'static str, client: Mac, data: Value) -> Self {
+    pub fn client(ts: Ts, kind: EventKind, client: Mac, data: Value) -> Self {
         ev(ts, kind, None, Some(client), data)
     }
 
     /// An event about the whole site.
-    pub fn site(ts: Ts, kind: &'static str, data: Value) -> Self {
+    pub fn site(ts: Ts, kind: EventKind, data: Value) -> Self {
         ev(ts, kind, None, None, data)
     }
 }
@@ -127,7 +178,7 @@ pub enum LiveMsg {
 fn event_head<S: serde::Serializer>(e: &Event, s: S) -> Result<S::Ok, S::Error> {
     #[derive(Serialize)]
     struct Head {
-        kind: &'static str,
+        kind: EventKind,
         device_mac: Option<Mac>,
         client_mac: Option<Mac>,
     }
@@ -485,10 +536,10 @@ impl Engine {
                 self.writer.exec(
                     Db::Config,
                     "INSERT OR IGNORE INTO network_threats (kind, bssid, first_reported) VALUES (?1, ?2, ?3)",
-                    vec![Sql::Text(kind.into()), Sql::Text(bssid), Sql::Integer(ts)],
+                    vec![Sql::Text(kind.as_str().into()), Sql::Text(bssid), Sql::Integer(ts)],
                 );
                 if notify {
-                    self.emit(ev(ts, "network_threat", device_mac, None, data));
+                    self.emit(ev(ts, EventKind::NetworkThreat, device_mac, None, data));
                 }
             }
             Input::AlertsRead => self.writer.exec(Db::Config, "UPDATE alerts SET read = 1 WHERE read = 0", vec![]),
@@ -508,12 +559,12 @@ impl Engine {
                 Some(note) => self.writer.exec(
                     Db::Config,
                     "INSERT OR REPLACE INTO network_acks (kind, bssid, note, ts) VALUES (?1, ?2, ?3, ?4)",
-                    vec![Sql::Text(kind.into()), Sql::Text(bssid), opt_text(note), Sql::Integer(ts)],
+                    vec![Sql::Text(kind.as_str().into()), Sql::Text(bssid), opt_text(note), Sql::Integer(ts)],
                 ),
                 None => self.writer.exec(
                     Db::Config,
                     "DELETE FROM network_acks WHERE kind = ?1 AND bssid = ?2",
-                    vec![Sql::Text(kind.into()), Sql::Text(bssid)],
+                    vec![Sql::Text(kind.as_str().into()), Sql::Text(bssid)],
                 ),
             },
         }
@@ -526,7 +577,7 @@ impl Engine {
             "INSERT INTO events (ts, kind, device_mac, client_mac, data) VALUES (?1, ?2, ?3, ?4, ?5)",
             vec![
                 Sql::Integer(ev.ts),
-                Sql::Text(ev.kind.into()),
+                Sql::Text(ev.kind.as_str().into()),
                 opt_text(ev.device_mac.map(|m| m.to_string())),
                 opt_text(ev.client_mac.map(|m| m.to_string())),
                 Sql::Text(ev.data.to_string()),
@@ -586,27 +637,27 @@ impl Engine {
         let mut events = Vec::new();
         let known = if prev.is_none() { live.known_devices.remove(&mac) } else { None };
         match (&prev, &known) {
-            (None, None) => events.push(ev(ts, "ap_seen", Some(mac), None, json!({ "ip": snap.ap.ip, "model": snap.ap.model, "version": snap.ap.version }))),
+            (None, None) => events.push(ev(ts, EventKind::ApSeen, Some(mac), None, json!({ "ip": snap.ap.ip, "model": snap.ap.model, "version": snap.ap.version }))),
             // Known from a previous run: only report what we can prove changed while we were away.
             (None, Some(k)) => {
                 let away = ts - k.last_seen;
                 if let (Some(old), Some(up)) = (k.uptime, snap.ap.uptime)
                     && up + 60 < old + away {
-                        events.push(ev(ts, "ap_restarted", Some(mac), None, json!({ "uptime": up })));
+                        events.push(ev(ts, EventKind::ApRestarted, Some(mac), None, json!({ "uptime": up })));
                     }
                 if k.version.is_some() && snap.ap.version.is_some() && k.version != snap.ap.version {
-                    events.push(ev(ts, "ap_firmware_changed", Some(mac), None, json!({ "from": k.version, "to": snap.ap.version })));
+                    events.push(ev(ts, EventKind::ApFirmwareChanged, Some(mac), None, json!({ "from": k.version, "to": snap.ap.version })));
                 }
             }
-            (Some(p), _) if !p.online => events.push(ev(ts, "ap_online", Some(mac), None, json!({ "offline_for": ts - p.last_seen }))),
+            (Some(p), _) if !p.online => events.push(ev(ts, EventKind::ApOnline, Some(mac), None, json!({ "offline_for": ts - p.last_seen }))),
             _ => {}
         }
         if let (Some(p), Some(up)) = (&prev, snap.ap.uptime) {
             if p.snapshot.ap.uptime.is_some_and(|old| up + 30 < old) {
-                events.push(ev(ts, "ap_restarted", Some(mac), None, json!({ "uptime": up })));
+                events.push(ev(ts, EventKind::ApRestarted, Some(mac), None, json!({ "uptime": up })));
             }
             if p.snapshot.ap.version != snap.ap.version && snap.ap.version.is_some() {
-                events.push(ev(ts, "ap_firmware_changed", Some(mac), None, json!({ "from": p.snapshot.ap.version, "to": snap.ap.version })));
+                events.push(ev(ts, EventKind::ApFirmwareChanged, Some(mac), None, json!({ "from": p.snapshot.ap.version, "to": snap.ap.version })));
             }
         }
         if snap.has_vap_table {
@@ -622,7 +673,7 @@ impl Engine {
                     Some(c) if track.candidate == Some(now) => {
                         track.committed = Some(now);
                         track.candidate = None;
-                        events.push(ev(ts, "radio_changed", Some(mac), None, json!({
+                        events.push(ev(ts, EventKind::RadioChanged, Some(mac), None, json!({
                             "radio": r.radio,
                             "from": { "channel": c.0, "bw": c.1, "tx_power": c.2 },
                             "to": { "channel": now.0, "bw": now.1, "tx_power": now.2 },
@@ -651,7 +702,7 @@ impl Engine {
         if let Some(v) = &snap.ap.version
             && let Some(j) = live.firmware.version_seen(&mac, v)
         {
-            events.push(ev(ts, "ap_upgraded", Some(mac), None, json!({ "from": j.from, "to": v, "custom": j.custom })));
+            events.push(ev(ts, EventKind::ApUpgraded, Some(mac), None, json!({ "from": j.from, "to": v, "custom": j.custom })));
         }
         for e in events {
             self.emit(e);
@@ -705,7 +756,7 @@ impl Engine {
                     let event = if !view.connected {
                         Some(connected_event(ts, c, false))
                     } else if p.ap_mac != c.ap_mac || p.bssid != c.bssid {
-                        Some(ev(ts, "client_roamed", Some(c.ap_mac), Some(c.mac), json!({
+                        Some(ev(ts, EventKind::ClientRoamed, Some(c.ap_mac), Some(c.mac), json!({
                             "from": { "ap": p.ap_mac, "radio": p.radio, "channel": p.channel, "essid": p.essid, "signal": p.signal },
                             "to": { "ap": c.ap_mac, "radio": c.radio, "channel": c.channel, "essid": c.essid, "signal": c.signal },
                         })))
@@ -855,9 +906,9 @@ impl Engine {
             d.last_config_push = Some(ts);
         }
         live.last_config.insert(mac, PushedConfig { mgmt_cfg: mgmt, system_cfg: system, cfgversion });
-        self.emit(ev(ts, "config_pushed", Some(mac), None, Value::Object(data)));
+        self.emit(ev(ts, EventKind::ConfigPushed, Some(mac), None, Value::Object(data)));
         if let Some(summary) = dry {
-            self.emit(ev(ts, "dryrun_compared", Some(mac), None, summary));
+            self.emit(ev(ts, EventKind::DryrunCompared, Some(mac), None, summary));
         }
     }
 
@@ -894,7 +945,7 @@ impl Engine {
         let mut live = self.live.write().unwrap();
         live.state = Some(Arc::new(state));
         live.state_imported_at = Some(ts);
-        self.emit(ev(ts, "settings_imported", None, None, summary));
+        self.emit(ev(ts, EventKind::SettingsImported, None, None, summary));
     }
 
     /// The engine is the only writer of the settings, so they cannot change
@@ -914,7 +965,7 @@ impl Engine {
         );
         self.live.write().unwrap().state = Some(Arc::new(state));
         self.syslog_unknown.clear();
-        self.emit(ev(ts, "settings_changed", None, None, json!({ "what": what })));
+        self.emit(ev(ts, EventKind::SettingsChanged, None, None, json!({ "what": what })));
         // The APs pick the change up now rather than at their next interval.
         crate::stun::poke_all(&self.live.read().unwrap());
         Ok(what)
@@ -998,7 +1049,7 @@ impl Engine {
             }
             if old.alias != alias {
                 let ap = live.clients.get(&mac).map(|c| c.sample.ap_mac);
-                self.emit(ev(ts, "client_renamed", ap, Some(mac), json!({ "from": old.alias, "to": alias })));
+                self.emit(ev(ts, EventKind::ClientRenamed, ap, Some(mac), json!({ "from": old.alias, "to": alias })));
             }
         }
         drop(live);
@@ -1019,7 +1070,7 @@ impl Engine {
             Some("setparam") => {
                 let since_push = live.devices.get(&mac).and_then(|d| d.last_config_push).map(|t| ts - t);
                 let data = json!({ "cfgversion": p["cfgversion"], "seconds_after_push": since_push });
-                self.emit(ev(ts, "config_applied", Some(mac), None, data));
+                self.emit(ev(ts, EventKind::ConfigApplied, Some(mac), None, data));
             }
             Some("event") => {
                 let n = &p["notif_payload"];
@@ -1028,23 +1079,23 @@ impl Engine {
                 } else if let Some(kind) = n["event_string"].as_str() {
                     // AP events: radar (DFS), rogue APs, scan completion, process restarts...
                     let k = match kind {
-                        "EVT_AP_RadarDetected" => "dfs_radar",
-                        "EVT_AP_DetectRogueAP" => "rogue_ap",
-                        "EVT_AP_QuickScanEvent" | "EVT_AP_AcsTriggerComplete" => "ap_scan_done",
+                        "EVT_AP_RadarDetected" => EventKind::DfsRadar,
+                        "EVT_AP_DetectRogueAP" => EventKind::RogueAp,
+                        "EVT_AP_QuickScanEvent" | "EVT_AP_AcsTriggerComplete" => EventKind::ApScanDone,
                         // "{proc} exited with code {exit_status} and restarted by {caller}"
-                        "EVT_AP_RestartProc" => "ap_process_restarted",
+                        "EVT_AP_RestartProc" => EventKind::ApProcessRestarted,
                         "Upgrade" => {
                             self.upgrade_notice(&mut live, ts, mac, n);
                             return;
                         }
-                        _ => "ap_event",
+                        _ => EventKind::ApEvent,
                     };
                     self.emit(ev(ts, k, Some(mac), None, n.clone()));
                 }
             }
             // The AP starts an upgrade (ours, or one run on the AP itself).
             Some(r @ ("cmd-upgrade" | "cli-upgrade")) => {
-                self.emit(ev(ts, "ap_upgrade_started", Some(mac), None, json!({ "by": if r == "cli-upgrade" { "the AP's command line" } else { "the controller" } })));
+                self.emit(ev(ts, EventKind::ApUpgradeStarted, Some(mac), None, json!({ "by": if r == "cli-upgrade" { "the AP's command line" } else { "the controller" } })));
             }
             // A crash or recovery report: base64 text from the AP's crash store.
             Some(reason @ ("crashlog" | "recovery")) => {
@@ -1057,7 +1108,7 @@ impl Engine {
                 let lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
                 let tail: Vec<&str> = lines.iter().rev().take(200).rev().copied().collect();
                 let kind = if reason == "recovery" { "recovered after a crash" } else { "crash report" };
-                self.emit(ev(ts, "ap_crash", Some(mac), None, json!({ "kind": kind, "source": reason, "lines": tail })));
+                self.emit(ev(ts, EventKind::ApCrash, Some(mac), None, json!({ "kind": kind, "source": reason, "lines": tail })));
             }
             _ => {}
         }
@@ -1113,7 +1164,7 @@ impl Engine {
         let roamed = n["ip_assign_type"].as_str().is_some_and(|t| t.starts_with("roam"));
         if event_type == "failure" || (event_type == "soft failure" && !roamed) {
             let data = json!({ "essid": essid, "reason": n["sta_dc_reason"], "auth_algo": n["auth_algo"], "rssi": num("auth_rssi") });
-            self.emit(ev(ts, "client_connect_failed", Some(ap), Some(client), data));
+            self.emit(ev(ts, EventKind::ClientConnectFailed, Some(ap), Some(client), data));
         }
     }
 
@@ -1192,7 +1243,7 @@ impl Engine {
                     // Re-arm the deadline as the official controller does on each step.
                     j.expires = Some(ts + 450);
                 }
-                self.emit(ev(ts, "ap_upgrade_progress", Some(mac), None, json!({ "step": step })));
+                self.emit(ev(ts, EventKind::ApUpgradeProgress, Some(mac), None, json!({ "step": step })));
             }
             (Some("UpgradeError"), _) => {
                 let reason = s("reason");
@@ -1203,7 +1254,7 @@ impl Engine {
                     r => format!("failed ({r})"),
                 };
                 live.firmware.failed(&mac, &detail);
-                self.emit(ev(ts, "ap_upgrade_failed", Some(mac), None, json!({ "reason": reason, "detail": detail })));
+                self.emit(ev(ts, EventKind::ApUpgradeFailed, Some(mac), None, json!({ "reason": reason, "detail": detail })));
             }
             _ => {}
         }
@@ -1230,7 +1281,7 @@ impl Engine {
             }
             self.isolated.insert(*ap, ts);
             let data = json!({ "heard_by": s.ap.mac.to_string(), "bssid": n.bssid, "signal": n.signal });
-            self.emit(ev(ts, "ap_isolated", Some(*ap), None, data));
+            self.emit(ev(ts, EventKind::ApIsolated, Some(*ap), None, data));
         }
     }
 
@@ -1280,7 +1331,7 @@ impl Engine {
                 && let Some(j) = live.firmware.failed(&mac, "it did not come back with the new firmware in time")
             {
                 let data = json!({ "reason": "timed out", "detail": "it did not come back with the new firmware in time", "target": j.target });
-                self.emit(ev(now, "ap_upgrade_failed", Some(mac), None, data));
+                self.emit(ev(now, EventKind::ApUpgradeFailed, Some(mac), None, data));
             }
         }
         for f in self.logevents.tick(now) {
@@ -1295,7 +1346,7 @@ impl Engine {
             if d.online && now - d.last_seen > limit {
                 d.online = false;
                 offline.push(*mac);
-                events.push(ev(now, "ap_offline", Some(*mac), None, json!({ "last_seen": d.last_seen })));
+                events.push(ev(now, EventKind::ApOffline, Some(*mac), None, json!({ "last_seen": d.last_seen })));
                 self.writer.exec(Db::Config, "UPDATE devices SET online = 0 WHERE mac = ?1", vec![Sql::Text(mac.to_string())]);
             }
         }
@@ -1569,20 +1620,20 @@ pub(crate) fn section_labels(cfg: &str, radios: &[crate::model::RadioSample]) ->
     out
 }
 
-fn ev(ts: Ts, kind: &'static str, device_mac: Option<Mac>, client_mac: Option<Mac>, data: Value) -> Event {
+fn ev(ts: Ts, kind: EventKind, device_mac: Option<Mac>, client_mac: Option<Mac>, data: Value) -> Event {
     Event { ts, kind, device_mac, client_mac, data }
 }
 
 /// `new`: never seen before (not even in an earlier run).
 fn connected_event(ts: Ts, c: &ClientSample, new: bool) -> Event {
-    ev(ts, "client_connected", Some(c.ap_mac), Some(c.mac), json!({
+    ev(ts, EventKind::ClientConnected, Some(c.ap_mac), Some(c.mac), json!({
         "essid": c.essid, "radio": c.radio, "channel": c.channel, "signal": c.signal,
         "hostname": c.hostname, "ip": c.ip, "new": new,
     }))
 }
 
 fn disconnected_event(ts: Ts, mac: Mac, c: &ClientView, reason: &str) -> Event {
-    ev(ts, "client_disconnected", Some(c.sample.ap_mac), Some(mac), json!({
+    ev(ts, EventKind::ClientDisconnected, Some(c.sample.ap_mac), Some(mac), json!({
         "reason": reason, "last_seen": c.last_seen, "essid": c.sample.essid,
         "connected_for": c.sample.uptime, "last_signal": c.sample.signal,
     }))
@@ -1602,6 +1653,22 @@ fn opt_text(v: Option<String>) -> Sql {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn event_kinds_keep_their_names() {
+        // Stored with every event and read by the UI: never renamed.
+        let names: Vec<&str> = EventKind::ALL.iter().map(|k| k.as_str()).collect();
+        let known = "ap_seen ap_online ap_offline ap_restarted ap_firmware_changed ap_isolated ap_crash ap_process_restarted ap_scan_done ap_event \
+                     dfs_radar rogue_ap network_threat radio_changed config_pushed config_applied dryrun_compared ap_upgrade_sent ap_upgrade_started \
+                     ap_upgrade_progress ap_upgrade_failed ap_upgraded ap_pending ap_adopting ap_adopted ap_forgotten ap_host_key_mismatch \
+                     ap_restart_requested ap_provision_requested client_connected client_disconnected client_connect_failed client_roamed \
+                     client_renamed client_kicked client_steered client_wrong_password client_experience client_reconnect_requested client_blocked \
+                     client_unblocked settings_imported settings_changed channel_plan";
+        assert_eq!(names, known.split_whitespace().collect::<Vec<_>>());
+        for k in EventKind::ALL {
+            assert_eq!(serde_json::to_value(k).unwrap(), k.as_str());
+        }
+    }
 
     #[test]
     fn config_sections_get_names() {
@@ -1668,7 +1735,7 @@ mod tests {
         let mut out = Vec::new();
         while let Ok(m) = h.rx.try_recv() {
             if let LiveMsg::Event(e) = m {
-                out.push((e.kind, e.client_mac.map(|m| m.to_string())));
+                out.push((e.kind.as_str(), e.client_mac.map(|m| m.to_string())));
             }
         }
         out
@@ -1791,7 +1858,7 @@ mod tests {
         set(&mut h, Some(""), false); // empty clears
         assert!(!h.live.read().unwrap().aliases.contains_key(&mac));
         let renames: Vec<_> = std::iter::from_fn(|| h.rx.try_recv().ok())
-            .filter_map(|m| match m { LiveMsg::Event(e) if e.kind == "client_renamed" => Some(e.data), _ => None })
+            .filter_map(|m| match m { LiveMsg::Event(e) if e.kind == EventKind::ClientRenamed => Some(e.data), _ => None })
             .collect();
         assert_eq!(renames.len(), 2, "{renames:?}");
         assert_eq!(renames[1]["from"], "Kitchen speaker");
@@ -1841,7 +1908,7 @@ mod tests {
         let entries = vec![edit(C1, "Speaker"), edit("02:00:00:00:01:02", "Printer"), edit("02:00:00:00:01:03", "")];
         h.engine.handle(Input::SetAliases { ts: 1, entries, only_if_unset: true });
         let msgs: Vec<LiveMsg> = std::iter::from_fn(|| h.rx.try_recv().ok()).collect();
-        let renames = msgs.iter().filter(|m| matches!(m, LiveMsg::Event(e) if e.kind == "client_renamed")).count();
+        let renames = msgs.iter().filter(|m| matches!(m, LiveMsg::Event(e) if e.kind == EventKind::ClientRenamed)).count();
         let lists = msgs.iter().filter(|m| matches!(m, LiveMsg::Clients)).count();
         assert_eq!((renames, lists), (2, 1), "{msgs:?}");
         assert_eq!(h.live.read().unwrap().aliases.len(), 2);
@@ -1907,7 +1974,7 @@ mod tests {
         let logs = std::iter::from_fn(|| h.rx.try_recv().ok()).filter(|m| matches!(m, LiveMsg::Log { .. })).count();
         assert_eq!(logs, 1, "nothing more to announce");
         // An event's data is not sent to the browsers.
-        let e = Event::device(1, "ap_crash", AP1.parse().unwrap(), json!({ "lines": ["a long crash dump"] }));
+        let e = Event::device(1, EventKind::ApCrash, AP1.parse().unwrap(), json!({ "lines": ["a long crash dump"] }));
         let text = serde_json::to_string(&LiveMsg::Event(e)).unwrap();
         assert_eq!(text, r#"{"type":"event","kind":"ap_crash","device_mac":"02:00:00:00:00:01","client_mac":null}"#);
     }
@@ -1976,7 +2043,7 @@ mod tests {
         feed(&mut h, with(36, 9)); // ...confirmed
         feed(&mut h, with(36, 9));
         let changes: Vec<_> = std::iter::from_fn(|| h.rx.try_recv().ok())
-            .filter_map(|m| match m { LiveMsg::Event(e) if e.kind == "radio_changed" => Some(e.data), _ => None })
+            .filter_map(|m| match m { LiveMsg::Event(e) if e.kind == EventKind::RadioChanged => Some(e.data), _ => None })
             .collect();
         assert_eq!(changes.len(), 1, "{changes:?}");
         assert_eq!(changes[0]["from"]["channel"], 44);
