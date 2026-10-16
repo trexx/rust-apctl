@@ -6,3 +6,28 @@ members = ["crates/*"]
 edition = "2024"
 license = "MIT"
 publish = false
+
+# Shared versions. Members add the features they need.
+[workspace.dependencies]
+aes-gcm = "0.11.1"
+anyhow = "1.0.104"
+apcfg = { version = "0.1.0", path = "crates/apcfg" }
+clap = "4.6.7"
+etherparse = "0.21.0"
+flate2 = "1.1.10"
+futures-util = "0.3.34"
+getrandom = "0.4.3"
+hex = "0.4.3"
+inform = { version = "0.1.0", path = "crates/inform" }
+regex = "1.13.1"
+serde = "1.0.229"
+serde_json = "1.0.154"
+tokio = "1.53.2"
+wire = { version = "0.1.0", path = "crates/wire" }
+
+# Unwinding stays on: the controller relies on mutex poisoning and on a panicking
+# task not taking the process down.
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true

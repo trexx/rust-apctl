@@ -114,7 +114,8 @@ cargo build --release -p controller   # or: podman build --target runtime .
 ```
 
 `crates/informdump` decodes, imports, sanitises and simulates inform traffic. Run
-`informdump --help` for its commands. Pushing a version tag (e.g. `0.15.1`) publishes the
+`informdump --help` for its commands. `informdump import` reads the official controller's
+MongoDB and needs `cargo build --release -p informdump --features mongo`. Pushing a version tag (e.g. `0.15.1`) publishes the
 image.
 
 ## License

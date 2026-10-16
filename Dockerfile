@@ -6,15 +6,25 @@ RUN npm ci --no-fund --no-audit
 COPY web/ ./
 RUN npm run build
 
+# --- manufacturer names (IEEE MAC address registry, public data) ---
+# A stage of its own, so code changes don't download it again.
+FROM docker.io/library/rust:1.98-bookworm AS oui
+RUN curl -fsSL -o /oui.csv https://standards-oui.ieee.org/oui/oui.csv
+
 # --- controller ---
 FROM docker.io/library/rust:1.98-bookworm AS build
 WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
 COPY crates/ crates/
 COPY --from=web /web/dist web/dist
-RUN cargo build --release --locked -p controller && strip target/release/apctl
-# Manufacturer names (IEEE MAC address registry, public data).
-RUN curl -fsSL -o /oui.csv https://standards-oui.ieee.org/oui/oui.csv
+# The registry and target directory persist between builds (BuildKit cache
+# mounts), so a code change recompiles our crates, not every dependency. The
+# target directory is not part of the image: the binary is copied out of it.
+# The release profile strips the binary.
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/usr/local/cargo/git \
+    --mount=type=cache,target=/src/target \
+    cargo build --release --locked -p controller && cp target/release/apctl /apctl
 
 # --- capture sidecar for shadow mode: tcpdump writing pcap into a FIFO ---
 FROM docker.io/library/alpine:3.22 AS capture
@@ -26,8 +36,8 @@ ENTRYPOINT ["/bin/sh", "-c", "[ -p \"$FIFO\" ] || mkfifo -m 644 \"$FIFO\"; exec 
 
 # --- runtime ---
 FROM gcr.io/distroless/cc-debian12:nonroot AS runtime
-COPY --from=build /src/target/release/apctl /usr/local/bin/apctl
-COPY --from=build /oui.csv /usr/share/apctl/oui.csv
+COPY --from=build /apctl /usr/local/bin/apctl
+COPY --from=oui /oui.csv /usr/share/apctl/oui.csv
 USER nonroot
 ENV APCTL_DATA_DIR=/data APCTL_LISTEN=0.0.0.0:8090
 EXPOSE 8090

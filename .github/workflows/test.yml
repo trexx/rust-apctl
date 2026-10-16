@@ -16,10 +16,22 @@ jobs:
       - uses: 'actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1' # v7.0.1
       - uses: 'dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f' # master
         with:
-          toolchain: 'stable'
+          # Same release as the Dockerfile's rust:1.98 image.
+          toolchain: '1.98'
+          components: 'clippy'
       - uses: 'Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6' # v2.9.2
+      # The tests built on real captures need fixtures kept outside the repository
+      # (APCTL_TESTDATA); without them they pass without checking anything.
+      - name: 'Capture fixtures'
+        run: |
+          if [ -z "${APCTL_TESTDATA:-}" ]; then
+            echo "::notice::APCTL_TESTDATA is not set: the capture-based golden tests are skipped"
+          fi
       # The web UI is not needed: debug builds serve web/dist from disk if it exists.
       - run: 'cargo test --workspace --locked'
+      - run: 'cargo clippy --workspace --all-targets --locked -- -D warnings'
+      # informdump's MongoDB import is behind a feature; keep it compiling.
+      - run: 'cargo check -p informdump --features mongo --locked'
 
   web:
     runs-on: 'ubuntu-26.04'

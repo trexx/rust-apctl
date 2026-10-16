@@ -6,13 +6,10 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
-anyhow = "1.0.104"
-etherparse = "0.21.0"
-hex = "0.4.3"
+anyhow.workspace = true
+etherparse.workspace = true
+hex.workspace = true
 httparse = "1.10.1"
-inform = { version = "0.1.0", path = "../inform" }
+inform.workspace = true
 pcap-parser = "0.17.0"
-serde_json = "1.0.154"
-
-[dev-dependencies]
-serde_json = "1.0.154"
+serde_json.workspace = true

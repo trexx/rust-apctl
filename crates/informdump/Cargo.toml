@@ -1,19 +1,28 @@
 [package]
 name = "informdump"
 version = "0.1.0"
-edition = "2024"
+edition.workspace = true
 license.workspace = true
+publish.workspace = true
+
+[features]
+# `informdump import` (reads a controller's MongoDB). Off by default: the 2.x
+# driver, needed for the MongoDB 3.6 the official application bundles, pulls in
+# an old TLS and DNS stack.
+mongo = ["dep:mongodb", "dep:tokio", "dep:futures-util"]
 
 [dependencies]
-anyhow = "1.0.104"
-clap = { version = "4.6.7", features = ["derive"] }
-etherparse = "0.21.0"
-futures-util = "0.3.34"
-hex = "0.4.3"
-inform = { version = "0.1.0", path = "../inform" }
-mongodb = "2.8"
-regex = "1.13.1"
-serde = { version = "1.0.229", features = ["derive"] }
-serde_json = "1.0.154"
-tokio = { version = "1.53.2", features = ["rt", "macros"] }
-wire = { version = "0.1.0", path = "../wire" }
+anyhow.workspace = true
+clap = { workspace = true, features = ["derive"] }
+etherparse.workspace = true
+futures-util = { workspace = true, optional = true }
+getrandom.workspace = true
+hex.workspace = true
+inform.workspace = true
+mongodb = { version = "2.8", optional = true }
+regex.workspace = true
+# Keys keep their order in everything informdump prints and writes (decoded
+# payloads, --save, sanitised fixtures, demo-state), as when bson enabled it.
+serde_json = { workspace = true, features = ["preserve_order"] }
+tokio = { workspace = true, features = ["rt"], optional = true }
+wire.workspace = true
