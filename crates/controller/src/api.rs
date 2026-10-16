@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::sync::broadcast;
 
-use crate::engine::{AliasEdit, LiveMsg, SharedLive};
+use crate::engine::{AliasEdit, DeviceView, LiveMsg, SharedLive};
 use crate::model::Ts;
 use crate::store::{self, Db, Store};
 
@@ -115,7 +115,15 @@ pub fn router(state: AppState) -> Router {
     // The live socket is added after compression, which must not touch an upgrade.
     let socket = Router::new().route("/api/ws", get(ws)).route_layer(axum::middleware::from_fn_with_state(state.clone(), crate::auth::require_login));
     // JSON and the UI's scripts and styles compress well (gzip only; images are left alone).
-    public.merge(protected).fallback(crate::web::handler).layer(tower_http::compression::CompressionLayer::new()).merge(socket).with_state(state)
+    public.merge(protected).fallback(crate::web::handler).layer(tower_http::compression::CompressionLayer::new().compress_when(compressible())).merge(socket).with_state(state)
+}
+
+/// What is worth compressing: the defaults (nothing tiny, no images), and no
+/// octet-stream, which apctl only sends for backups, already compressed or
+/// encrypted (compressing them again costs CPU and loses their length).
+fn compressible() -> impl tower_http::compression::Predicate {
+    use tower_http::compression::predicate::{DefaultPredicate, NotForContentType, Predicate};
+    DefaultPredicate::new().and(NotForContentType::const_new("application/octet-stream"))
 }
 
 /// 409 unless apctl is the active controller. `what` says what needs it ("upgrades need").
@@ -181,10 +189,11 @@ impl From<std::io::Error> for ApiError {
 
 const INTERNAL: &str = "internal error (the details are in apctl's log)";
 
-/// A blocking task that panicked or was cancelled.
+/// A blocking task that panicked or was cancelled: logged, and as unexpected
+/// as any other failure to the browser (a panic message can name paths or data).
 impl From<tokio::task::JoinError> for ApiError {
     fn from(e: tokio::task::JoinError) -> Self {
-        ApiError::internal(e.to_string())
+        ApiError::from(anyhow::Error::from(e))
     }
 }
 
@@ -239,7 +248,7 @@ async fn healthz(State(s): State<AppState>) -> Response {
 
 /// An AP as the database remembers it: shown after a restart until it reports again.
 struct StoredDevice {
-    mac: String,
+    mac: Mac,
     /// The name given in apctl, else the AP's hostname.
     name: Option<String>,
     model: Option<String>,
@@ -252,20 +261,20 @@ struct StoredDevice {
 }
 
 impl StoredDevice {
-    /// Shaped like a live device view, but offline.
-    fn view(&self) -> Value {
-        json!({
-            "snapshot": {
-                "ap": {
-                    "mac": self.mac, "hostname": self.name, "model": self.model, "model_display": self.model_display, "version": self.version,
-                    "ip": self.ip, "serial": self.serial, "uptime": null, "cpu": null, "mem": null, "load1": null, "load5": null,
-                    "load15": null, "mem_total": null, "mem_used": null, "satisfaction": null,
-                },
-                "uplink": null, "radios": [], "vaps": [], "clients": [], "has_vap_table": false,
+    /// A live device view of it, offline: what was not stored is empty.
+    fn view(self) -> DeviceView {
+        let ap = crate::model::ApSample {
+            mac: self.mac, ts: self.last_seen, hostname: self.name, model: self.model, model_display: self.model_display, version: self.version,
+            ip: self.ip, serial: self.serial, hash_id: None, cfgversion: None, uptime: None, cpu: None, mem: None, load1: None, load5: None,
+            load15: None, mem_total: None, mem_used: None, satisfaction: None, num_sta: None,
+        };
+        DeviceView {
+            snapshot: crate::model::Snapshot {
+                ap, uplink: None, radios: vec![], vaps: vec![], clients: vec![], neighbors: vec![], spectrum: vec![], has_vap_table: false,
             },
-            "online": false, "first_seen": self.first_seen, "last_seen": self.last_seen,
-            "peer": "", "interval": 0, "reconfiguring": false, "last_config_push": null, "stored_only": true,
-        })
+            online: false, first_seen: self.first_seen, last_seen: self.last_seen, peer: String::new(), interval: 0, reconfiguring: false,
+            reconfiguring_since: None, last_full_inform: 0, last_config_push: None,
+        }
     }
 
     /// Its row in the device list.
@@ -281,7 +290,7 @@ impl StoredDevice {
 /// An AP in the device list.
 #[derive(Serialize)]
 struct DeviceRow {
-    mac: String,
+    mac: Mac,
     name: Option<String>,
     model: Option<String>,
     model_display: Option<String>,
@@ -325,18 +334,21 @@ struct RadioRow {
 }
 
 /// APs in the database (all, or `only` this one).
-async fn stored_devices(store: &Arc<Store>, only: Option<String>) -> Result<Vec<StoredDevice>, ApiError> {
+async fn stored_devices(store: &Arc<Store>, only: Option<Mac>) -> Result<Vec<StoredDevice>, ApiError> {
     read(store, Db::Config, move |c| {
         let mut stmt = c.prepare(
             "SELECT mac, COALESCE(name, hostname), model, model_display, version, ip, serial, first_seen, last_seen FROM devices WHERE ?1 IS NULL OR mac = ?1",
         )?;
+        // A row whose MAC does not parse is no AP to show.
         let rows = stmt
-            .query_map([only.as_deref()], |r| {
-                Ok(StoredDevice {
-                    mac: r.get(0)?, name: r.get(1)?, model: r.get(2)?, model_display: r.get(3)?, version: r.get(4)?, ip: r.get(5)?, serial: r.get(6)?,
+            .query_map([only.map(|m| m.to_string())], |r| {
+                let Ok(mac) = r.get::<_, String>(0)?.parse() else { return Ok(None) };
+                Ok(Some(StoredDevice {
+                    mac, name: r.get(1)?, model: r.get(2)?, model_display: r.get(3)?, version: r.get(4)?, ip: r.get(5)?, serial: r.get(6)?,
                     first_seen: r.get::<_, Option<i64>>(7)?.unwrap_or(0), last_seen: r.get::<_, Option<i64>>(8)?.unwrap_or(0),
-                })
+                }))
             })?
+            .filter_map(Result::transpose)
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
     })
@@ -360,7 +372,7 @@ async fn devices(State(s): State<AppState>) -> Result<Json<Vec<DeviceRow>>, ApiE
             .map(|(mac, d)| {
                 let a = &d.snapshot.ap;
                 DeviceRow {
-                    mac: mac.to_string(), name: a.hostname.clone(), model: a.model.clone(), model_display: a.model_display.clone(),
+                    mac: *mac, name: a.hostname.clone(), model: a.model.clone(), model_display: a.model_display.clone(),
                     version: a.version.clone(), ip: a.ip.clone(), online: d.online, reconfiguring: d.reconfiguring,
                     first_seen: d.first_seen, last_seen: d.last_seen, uptime: a.uptime, cpu: a.cpu, mem: a.mem, load1: a.load1,
                     satisfaction: a.satisfaction, clients: per_ap.get(mac).copied().unwrap_or(0),
@@ -375,29 +387,46 @@ async fn devices(State(s): State<AppState>) -> Result<Json<Vec<DeviceRow>>, ApiE
                 }
             })
             .collect();
-        list.extend(stored.into_iter().filter(|d| !d.mac.parse().is_ok_and(|m: Mac| live.devices.contains_key(&m))).map(StoredDevice::row));
+        list.extend(stored.into_iter().filter(|d| !live.devices.contains_key(&d.mac)).map(StoredDevice::row));
         list
     };
     Ok(Json(list))
 }
 
-async fn device(State(s): State<AppState>, Path(mac): Path<String>) -> ApiResult {
+/// An AP's page: its view, its connected clients, and whether it is blinking to be found.
+#[derive(Serialize)]
+struct DeviceDetail<'a> {
+    device: DeviceOut<'a>,
+    clients: &'a [crate::engine::ClientView],
+    locating: bool,
+}
+
+#[derive(Serialize)]
+struct DeviceOut<'a> {
+    #[serde(flatten)]
+    view: &'a DeviceView,
+    /// Known from the database only: it has not reported since apctl started.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    stored_only: bool,
+}
+
+async fn device(State(s): State<AppState>, Path(mac): Path<String>) -> Result<Response, ApiError> {
     let mac = parse_mac(&mac)?;
+    // Copied out under the lock (the clients' samples are shared), and serialised after it.
     let found = {
         let live = s.live.read().unwrap();
         live.devices.get(&mac).map(|d| {
-            // The clients are copied out (shared samples) and serialised after the lock.
             let clients: Vec<_> = live.clients.values().filter(|c| c.connected && c.sample.ap_mac == mac).cloned().collect();
-            (serde_json::to_value(d).unwrap_or_default(), clients, live.locating.contains(&mac))
+            (d.clone(), clients, live.locating.contains(&mac))
         })
     };
-    if let Some((device, clients, locating)) = found {
-        return Ok(Json(json!({ "device": device, "clients": clients, "locating": locating })));
+    if let Some((view, clients, locating)) = found {
+        return Ok(Json(DeviceDetail { device: DeviceOut { view: &view, stored_only: false }, clients: &clients, locating }).into_response());
     }
     // Known but not reporting since apctl started: offline, with what we stored.
-    let stored = stored_devices(&s.store, Some(mac.to_string())).await?;
+    let stored = stored_devices(&s.store, Some(mac)).await?;
     let d = stored.into_iter().next().ok_or_else(|| ApiError(StatusCode::NOT_FOUND, "unknown device".into()))?;
-    Ok(Json(json!({ "device": d.view(), "clients": [] })))
+    Ok(Json(DeviceDetail { device: DeviceOut { view: &d.view(), stored_only: true }, clients: &[], locating: false }).into_response())
 }
 
 /// Every client: the ones seen in this run and the ones restored from the
@@ -885,7 +914,7 @@ mod tests {
         let (engine, engine_rx) = tokio::sync::mpsc::channel(1);
         let (tx, _) = broadcast::channel(1);
         let state = AppState {
-            backups: crate::backup::Backups { data_dir: dir, key: None },
+            backups: crate::backup::Backups::new(dir, None),
             store, vendors: Default::default(), renderer: crate::dryrun::apcfg_renderer(crate::EMULATE_VERSION.into()), auth, engine, live: Default::default(), tx, started: 0, source: "none".into(),
             active: false, writer,
         };
@@ -930,6 +959,21 @@ mod tests {
         assert_eq!((one["clients"][0]["sample"]["hostname"].as_str(), one["locating"].as_bool()), (Some("phone"), Some(false)));
         let stored = get_json(&app, "/api/devices/02:00:00:00:00:02").await;
         assert_eq!((stored["device"]["snapshot"]["ap"]["hostname"].as_str(), stored["device"]["stored_only"].as_bool()), (Some("Attic"), Some(true)));
+        // A stored AP is shaped like a live one, with only stored_only added.
+        let sorted = |v: &Value| {
+            let mut k: Vec<String> = v.as_object().unwrap().keys().cloned().collect();
+            k.sort();
+            k
+        };
+        for path in ["", "/device", "/device/snapshot", "/device/snapshot/ap"] {
+            let mut live = sorted(one.pointer(path).unwrap());
+            if path == "/device" {
+                live.push("stored_only".into());
+                live.sort();
+            }
+            assert_eq!(sorted(stored.pointer(path).unwrap()), live, "{path}");
+        }
+        assert_eq!(stored["device"]["snapshot"]["ap"]["mac"], "02:00:00:00:00:02");
         let clients = get_json(&app, "/api/clients").await;
         assert_eq!((clients[0]["ap_name"].as_str(), clients[0]["connected"].as_bool(), clients[0]["sample"]["essid"].as_str()), (Some("Hall"), Some(true), Some("Home")));
         assert!(clients[0]["alias"].is_null() && clients[0].get("blocked").is_some(), "{}", clients[0]);
@@ -1036,6 +1080,58 @@ mod tests {
         // Reads need no header.
         let req = Request::get("/api/status").header(header::COOKIE, &cookie).body(Body::empty()).unwrap();
         assert_eq!(app.clone().oneshot(req).await.unwrap().status(), StatusCode::OK);
+    }
+
+    /// The app's state with one user, and that user's session cookie.
+    fn logged_in() -> (AppState, tokio::sync::mpsc::Receiver<crate::engine::Input>, String) {
+        let (mut state, engine) = state();
+        let file = state.backups.data_dir.join("users");
+        std::fs::write(&file, format!("admin:{}\n", crate::auth::hash_password("x").unwrap())).unwrap();
+        state.auth = Arc::new(crate::auth::Auth::new(crate::auth::Users::load(&file).unwrap(), &state.store, state.writer.clone(), Default::default()).unwrap());
+        let cookie = format!("{}={}", crate::auth::COOKIE, state.auth.create("admin").unwrap());
+        (state, engine, cookie)
+    }
+
+    #[tokio::test]
+    async fn saved_backup_settings_are_in_effect_at_once() {
+        let (state, _engine, cookie) = logged_in();
+        let app = router(state);
+        let body = json!({ "enabled": false, "frequency": "weekly", "minute_utc": 60, "weekday": 2, "monthday": 1, "keep": 5, "days": 7 });
+        let req = Request::put("/api/backups/settings")
+            .header(header::COOKIE, &cookie)
+            .header("x-requested-with", "apctl")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        assert_eq!(app.clone().oneshot(req).await.unwrap().status(), StatusCode::OK);
+        // Read back straight away, before the writer has committed anything.
+        let req = Request::get("/api/backups").header(header::COOKIE, &cookie).body(Body::empty()).unwrap();
+        let res = app.clone().oneshot(req).await.unwrap();
+        let index: Value = serde_json::from_slice(&axum::body::to_bytes(res.into_body(), 1 << 20).await.unwrap()).unwrap();
+        assert_eq!(index["settings"], body);
+        assert!(index["next_run"].is_null(), "automatic backups are off");
+    }
+
+    #[tokio::test]
+    async fn backups_download_with_their_length_and_uncompressed() {
+        let (state, _engine, cookie) = logged_in();
+        let m = crate::backup::create(&state.backups, &state.backups.data_dir, crate::backup::Kind::Manual, 0).unwrap();
+        let raw = std::fs::read(state.backups.dir().join(&m.name)).unwrap();
+        let app = router(state);
+        let req = Request::get(format!("/api/backups/file/{}", m.name)).header(header::COOKIE, &cookie).header(header::ACCEPT_ENCODING, "gzip").body(Body::empty()).unwrap();
+        let res = app.oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        assert!(res.headers().get(header::CONTENT_ENCODING).is_none());
+        assert_eq!(res.headers().get(header::CONTENT_LENGTH).map(|v| v.to_str().unwrap().to_string()), Some(raw.len().to_string()));
+        assert_eq!(axum::body::to_bytes(res.into_body(), 1 << 24).await.unwrap(), raw);
+    }
+
+    #[tokio::test]
+    async fn a_panicked_task_is_an_internal_error_without_detail() {
+        let e = tokio::task::spawn_blocking(|| panic!("reading /data/config.db")).await.unwrap_err();
+        let ApiError(status, msg) = ApiError::from(e);
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(msg, INTERNAL);
     }
 
     #[tokio::test]

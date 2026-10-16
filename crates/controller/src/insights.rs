@@ -1829,7 +1829,7 @@ mod tests {
             let (engine, _) = tokio::sync::mpsc::channel(1);
             let (tx, _) = tokio::sync::broadcast::channel(1);
             let s = AppState {
-                backups: crate::backup::Backups { data_dir: dir.clone(), key: None },
+                backups: crate::backup::Backups::new(dir.clone(), None),
                 store, vendors: Default::default(), renderer: crate::dryrun::apcfg_renderer("10.6.106".into()), auth, engine, live, tx, started: 0, source: "none".into(),
                 active: false, writer,
             };

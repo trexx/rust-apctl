@@ -60,8 +60,6 @@ pub enum Input {
     /// Change the settings (apctl's copy of the controller settings), store
     /// them, and record the change; `done` gets what changed, or the refusal.
     EditState { ts: Ts, edit: StateEdit, done: tokio::sync::oneshot::Sender<Result<String, String>> },
-    /// Store the automatic-backup settings (JSON).
-    SaveBackupSettings(String),
     /// Change the firmware upgrade queue; `done` gets how many upgrades were
     /// queued or cancelled.
     Firmware { op: crate::firmware::Op, done: tokio::sync::oneshot::Sender<usize> },
@@ -575,9 +573,6 @@ impl Engine {
             Input::Forget { ts, mac } => self.forget(ts, mac),
             Input::EditState { ts, edit, done } => {
                 let _ = done.send(self.edit_state(ts, edit));
-            }
-            Input::SaveBackupSettings(json) => {
-                self.writer.exec(Db::Config, "INSERT OR REPLACE INTO backup_settings (id, json) VALUES (1, ?1)", vec![Sql::Text(json)])
             }
             Input::Firmware { op, done } => {
                 let n = op.apply(&mut self.live.write().unwrap().firmware);
