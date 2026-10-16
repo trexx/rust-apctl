@@ -231,11 +231,8 @@ pub struct PushedConfig {
 
 /// The last push stored for each AP, with its secrets masked.
 pub fn stored_pushes(c: &rusqlite::Connection) -> rusqlite::Result<HashMap<Mac, PushedConfig>> {
-    let mut stmt = c.prepare("SELECT mac, mgmt_cfg, system_cfg, cfgversion FROM device_config")?;
-    let rows = stmt.query_map([], |r| {
-        let pushed = PushedConfig { mgmt_cfg: r.get::<_, Option<String>>(1)?.unwrap_or_default(), system_cfg: r.get::<_, Option<String>>(2)?.unwrap_or_default(), cfgversion: r.get(3)? };
-        Ok((r.get::<_, String>(0)?, pushed))
-    })?;
+    let mut stmt = c.prepare("SELECT mgmt_cfg, system_cfg, cfgversion, mac FROM device_config")?;
+    let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(3)?, stored_push_row(r)?)))?;
     let mut out = HashMap::new();
     for row in rows {
         let (mac, pushed) = row?;
@@ -244,6 +241,16 @@ pub fn stored_pushes(c: &rusqlite::Connection) -> rusqlite::Result<HashMap<Mac, 
         }
     }
     Ok(out)
+}
+
+/// One AP's last stored push, with its secrets masked.
+pub fn stored_push(c: &rusqlite::Connection, mac: &Mac) -> rusqlite::Result<Option<PushedConfig>> {
+    use rusqlite::OptionalExtension;
+    c.prepare_cached("SELECT mgmt_cfg, system_cfg, cfgversion FROM device_config WHERE mac = ?1")?.query_row([mac.to_string()], stored_push_row).optional()
+}
+
+fn stored_push_row(r: &rusqlite::Row) -> rusqlite::Result<PushedConfig> {
+    Ok(PushedConfig { mgmt_cfg: r.get::<_, Option<String>>(0)?.unwrap_or_default(), system_cfg: r.get::<_, Option<String>>(1)?.unwrap_or_default(), cfgversion: r.get(2)? })
 }
 
 /// What the database remembers about an AP from a previous run.

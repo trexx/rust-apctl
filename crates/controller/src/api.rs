@@ -463,11 +463,33 @@ async fn import_state(State(s): State<AppState>, headers: axum::http::HeaderMap,
 /// Dry-run status: for each AP, what apctl would push now compared with the last
 /// config the other controller pushed; plus the comparisons made at each push.
 async fn dryrun(State(s): State<AppState>) -> ApiResult {
-    // Redacted last configs from the database, for APs not pushed to since start.
-    let stored = read(&s.store, Db::Config, |c| Ok(crate::engine::stored_pushes(c)?)).await?;
-    let history: Vec<Value> = read(&s.store, Db::Config, |c| {
+    // What each AP's render needs, copied under a short lock: the unredacted
+    // config seen in this run when there is one. Only full configs count: a
+    // management-only push says nothing about system_cfg.
+    let (state, imported_at, aps) = {
+        let live = s.live.read().unwrap();
+        let aps: Vec<_> = live
+            .devices
+            .iter()
+            .map(|(mac, d)| {
+                let seen = live.last_config.get(mac).filter(|c| !c.system_cfg.is_empty()).cloned();
+                (*mac, d.snapshot.ap.hostname.clone(), d.snapshot.ap.cfgversion.clone(), seen, live.raw_informs.get(mac).cloned())
+            })
+            .collect();
+        (live.state.clone(), live.state_imported_at, aps)
+    };
+    // Then from the database, in one go: the stored redacted copy for APs not
+    // pushed to since start, and the comparisons made at each push.
+    let need: Vec<Mac> = aps.iter().filter(|a| a.3.is_none()).map(|a| a.0).collect();
+    let (stored, history) = read(&s.store, Db::Config, move |c| {
+        let mut stored = std::collections::HashMap::new();
+        for mac in need {
+            if let Some(p) = crate::engine::stored_push(c, &mac)?.filter(|p| !p.system_cfg.is_empty()) {
+                stored.insert(mac, p);
+            }
+        }
         let mut stmt = c.prepare("SELECT ts, mac, cfgversion, matches, comparison FROM dryrun_results ORDER BY ts DESC LIMIT 100")?;
-        let rows = stmt
+        let history = stmt
             .query_map([], |r| {
                 let comparison: String = r.get(4)?;
                 Ok(json!({
@@ -477,39 +499,29 @@ async fn dryrun(State(s): State<AppState>) -> ApiResult {
                 }))
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
-        Ok(rows)
+        Ok((stored, history))
     })
     .await?;
 
-    // What each AP's render needs, copied under a short lock; the renders run
-    // on the blocking pool.
-    let (state, imported_at, aps) = {
-        let live = s.live.read().unwrap();
-        let aps: Vec<_> = live
-            .devices
-            .iter()
-            .map(|(mac, d)| {
-                // Prefer the unredacted config seen in this run; fall back to the stored redacted copy.
-                // Only full configs count: a management-only push says nothing about system_cfg.
-                let actual = match (live.last_config.get(mac).filter(|c| !c.system_cfg.is_empty()), stored.get(mac).filter(|c| !c.system_cfg.is_empty())) {
-                    (Some(c), _) => Some((c.clone(), false)),
-                    (None, Some(c)) => Some((c.clone(), true)),
-                    (None, None) => None,
-                };
-                (*mac, d.snapshot.ap.hostname.clone(), d.snapshot.ap.cfgversion.clone(), actual, live.raw_informs.get(mac).cloned())
-            })
-            .collect();
-        (live.state.clone(), live.state_imported_at, aps)
-    };
+    // The renders run on the blocking pool.
     let renderer = s.renderer.clone();
     let devices = tokio::task::spawn_blocking(move || {
+        // The settings' AP records by MAC, looked up once (the first for a MAC counts).
+        let mut docs: std::collections::HashMap<Mac, &Value> = std::collections::HashMap::new();
+        for d in state.as_deref().and_then(|st| st["devices"].as_array()).into_iter().flatten() {
+            if let Some(mac) = d["mac"].as_str().and_then(|m| m.parse().ok()) {
+                docs.entry(mac).or_insert(d);
+            }
+        }
+        let mut stored = stored;
         let mut devices = Vec::new();
-        for (mac, name, running_version, actual, inform) in aps {
+        for (mac, name, running_version, seen, inform) in aps {
+            let actual = seen.map(|c| (c, false)).or_else(|| stored.remove(&mac).map(|c| (c, true)));
             // The snapshot records the cfgversion the other controller expected for
             // each AP at import time. If the AP now runs another one, that controller
             // has pushed new config since: the settings are probably out of date.
-            let snapshot_version = state.as_deref().and_then(|st| crate::adopt::device_doc(st, &mac)?["cfgversion"].as_str().map(str::to_string));
-            let settings_stale = matches!((&snapshot_version, &running_version), (Some(a), Some(b)) if a != b);
+            let snapshot_version = docs.get(&mac).and_then(|d| d["cfgversion"].as_str());
+            let settings_stale = matches!((snapshot_version, &running_version), (Some(a), Some(b)) if a != b);
             let entry = |status: &str, extra: Value| {
                 let mut v = json!({ "mac": mac, "name": name, "status": status, "settings_stale": settings_stale });
                 if let Value::Object(m) = extra {
@@ -945,6 +957,22 @@ mod tests {
         typed.send(LiveMsg::Device { mac: ap }).unwrap();
         assert_eq!(socket.recv().await.unwrap().as_str(), r#"{"type":"log","device_mac":"02:00:00:00:00:01"}"#);
         assert_eq!(socket.recv().await.unwrap().as_str(), r#"{"type":"device","mac":"02:00:00:00:00:01"}"#);
+    }
+
+    #[tokio::test]
+    async fn dry_run_reads_stored_pushes_and_history() {
+        let (s, _engine) = state();
+        let (tx, _) = broadcast::channel(16);
+        let mut engine = crate::engine::Engine::new(s.writer.clone(), Default::default(), s.live.clone(), tx);
+        let header = inform::Header { packet_version: 0, mac: Mac([0; 6]), flags: inform::Flags(0), iv: [0; 16], payload_version: 1, payload_len: 0 };
+        let payload = json!({ "mac": "02:00:00:00:00:01", "hostname": "Hall", "uptime": 100 });
+        engine.handle(crate::engine::Input::Inform { ts: 50, peer: "x".into(), decoded: wire::decode::Decoded { header, key: wire::decode::KeyUsed::Device, payload } });
+        s.writer.exec(Db::Config, "INSERT INTO device_config (mac, ts, mgmt_cfg, system_cfg) VALUES ('02:00:00:00:00:01', 1, 'a=1', 'b=2')", vec![]);
+        s.writer.exec(Db::Config, "INSERT INTO dryrun_results (ts, mac, matches, comparison) VALUES (7, '02:00:00:00:00:01', 1, '{}')", vec![]);
+        assert!(s.writer.flush(std::time::Duration::from_secs(5)));
+        let app = router(s);
+        let d = get_json(&app, "/api/dryrun").await;
+        assert_eq!((d["devices"][0]["status"].as_str(), d["history"][0]["ts"].as_i64()), (Some("no_settings"), Some(7)));
     }
 
     #[tokio::test]
