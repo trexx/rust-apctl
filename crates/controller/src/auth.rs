@@ -39,40 +39,71 @@ pub fn hash_password(password: &str) -> Result<String> {
 }
 
 #[derive(Default)]
-pub struct Users(HashMap<String, String>);
+pub struct Users {
+    hashes: HashMap<String, String>,
+    /// What an unknown username is checked against: the first user's hash, so
+    /// it costs the same as a known one whatever parameters the file uses.
+    dummy: String,
+}
 
 impl Users {
     /// Reads `username:hash` lines; blank lines and `#` comments are ignored.
+    /// A line that is not `username:hash` stops the start. Lines that could
+    /// never log in (no username, a name listed again, a hash other than
+    /// Argon2) are skipped with a warning, as `--keys` does with its entries;
+    /// a file left without users then is an error, not read-only mode.
     pub fn load(path: &Path) -> Result<Users> {
         let text = std::fs::read_to_string(path).with_context(|| format!("reading users from {}", path.display()))?;
-        let mut users = HashMap::new();
+        let mut users = Users::default();
+        let mut skipped = 0;
         for (n, line) in text.lines().enumerate() {
             let line = line.trim();
             if line.is_empty() || line.starts_with('#') {
                 continue;
             }
-            let Some((user, hash)) = line.split_once(':') else { bail!("{}:{}: expected username:hash", path.display(), n + 1) };
-            PasswordHash::new(hash).map_err(|e| anyhow::anyhow!("{}:{}: invalid hash: {e}", path.display(), n + 1))?;
-            users.insert(user.to_string(), hash.to_string());
+            let at = format!("{}:{}", path.display(), n + 1);
+            let Some((user, hash)) = line.split_once(':') else { bail!("{at}: expected username:hash") };
+            let parsed = PasswordHash::new(hash).map_err(|e| anyhow::anyhow!("{at}: invalid hash: {e}"))?;
+            let why = if user.is_empty() {
+                Some("no username".to_string())
+            } else if users.hashes.contains_key(user) {
+                Some(format!("{user:?} is listed already (the first line counts)"))
+            } else if argon2::Algorithm::try_from(parsed.algorithm.as_str()).is_err() {
+                Some(format!("{user:?} has a {} hash, and only Argon2 ones can log in (see apctl hash-password)", parsed.algorithm.as_str()))
+            } else {
+                None
+            };
+            if let Some(why) = why {
+                tracing::warn!("{at}: skipping the line: {why}");
+                skipped += 1;
+                continue;
+            }
+            if users.hashes.is_empty() {
+                users.dummy = hash.to_string();
+            }
+            users.hashes.insert(user.to_string(), hash.to_string());
         }
-        Ok(Users(users))
+        if users.is_empty() && skipped > 0 {
+            bail!("{}: no user can log in (see the warnings above)", path.display());
+        }
+        Ok(users)
     }
 
     pub fn is_empty(&self) -> bool {
-        self.0.is_empty()
+        self.hashes.is_empty()
     }
 
     pub fn len(&self) -> usize {
-        self.0.len()
+        self.hashes.len()
     }
 
     /// Checks a password. Unknown users cost the same as wrong passwords, so
-    /// timing does not reveal which usernames exist.
+    /// timing does not reveal which usernames exist: they are checked against
+    /// a real user's hash, which no password can pass for them.
     pub fn verify(&self, user: &str, password: &str) -> bool {
-        static DUMMY: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| hash_password("dummy").unwrap_or_default());
-        let (hash, known) = match self.0.get(user) {
+        let (hash, known) = match self.hashes.get(user) {
             Some(h) => (h.as_str(), true),
-            None => (DUMMY.as_str(), false),
+            None => (self.dummy.as_str(), false),
         };
         let ok = PasswordHash::new(hash).is_ok_and(|h| Argon2::default().verify_password(password.as_bytes(), &h).is_ok());
         ok && known
@@ -112,7 +143,7 @@ impl Auth {
             Ok(rows)
         })?;
         // Sessions of users that were removed from the file stop working.
-        let sessions = rows.into_iter().filter(|(_, s)| users.0.contains_key(&s.user)).collect();
+        let sessions = rows.into_iter().filter(|(_, s)| users.hashes.contains_key(&s.user)).collect();
         Ok(Auth { users, sessions: Mutex::new(sessions), failures: Mutex::new(HashMap::new()), writer, proxies })
     }
 
@@ -393,6 +424,20 @@ mod tests {
         assert!(!users.verify("nobody", "correct horse"));
         std::fs::write(&file, "admin:not-a-hash\n").unwrap();
         assert!(Users::load(&file).is_err());
+        // Lines that could never log in are skipped; the first of a name counts.
+        let (first, second) = (hash_password("first").unwrap(), hash_password("second").unwrap());
+        let pbkdf2 = "$pbkdf2-sha256$i=600000$c2FsdHNhbHQ$aGFzaGhhc2hoYXNoaGFzaGhhc2hoYXNoaGFzaGhhc2g";
+        std::fs::write(&file, format!("admin:{first}\nadmin:{second}\n:{second}\nold:{pbkdf2}\n")).unwrap();
+        let users = Users::load(&file).unwrap();
+        assert_eq!(users.len(), 1);
+        assert!(users.verify("admin", "first") && !users.verify("admin", "second"));
+        assert_eq!(users.dummy, first, "unknown names cost what a real user does");
+        assert!(!users.verify("old", "anything") && !users.verify("nobody", "first"));
+        // Nobody left who could log in: an error, not an open read-only API.
+        std::fs::write(&file, format!("old:{pbkdf2}\n")).unwrap();
+        assert!(Users::load(&file).is_err());
+        std::fs::write(&file, "# nobody yet\n").unwrap();
+        assert!(Users::load(&file).unwrap().is_empty());
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -401,7 +446,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("apctl-sessions-{}-{}", std::process::id(), store::now_ts()));
         let (store, writer) = Store::open(&dir).unwrap();
         let mut users = Users::default();
-        users.0.insert("admin".into(), hash_password("x").unwrap());
+        users.hashes.insert("admin".into(), hash_password("x").unwrap());
         let auth = Auth::new(users, &store, writer, Default::default()).unwrap();
         let token = auth.create("admin").unwrap();
         assert_eq!(token.len(), 64);
