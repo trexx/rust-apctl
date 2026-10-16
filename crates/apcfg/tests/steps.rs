@@ -145,8 +145,8 @@ fn mac_of(ap: &str) -> &'static str {
     if ap == "B" { AP_B } else { AP_U }
 }
 
-fn names(v: &[(String, String)]) -> Vec<&str> {
-    v.iter().map(|(k, _)| k.as_str()).collect()
+fn names<'a>(v: &[(&'a str, std::borrow::Cow<str>)]) -> Vec<&'a str> {
+    v.iter().map(|(k, _)| *k).collect()
 }
 
 #[test]

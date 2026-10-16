@@ -722,13 +722,13 @@ pub mod sample {
     pub fn check_expectation(ctx: &str, expect: &Value, d: &crate::cfgdiff::Diff) {
         if let Some(counts) = expect.get("counts") {
             let want: Vec<usize> = counts.as_array().unwrap().iter().map(|n| n.as_u64().unwrap() as usize).collect();
-            assert_eq!(vec![d.added.len(), d.removed.len(), d.changed.len()], want, "{ctx}: [added, removed, changed]");
+            assert_eq!(d.counts().to_vec(), want, "{ctx}: [added, removed, changed]");
             return;
         }
         let list = |name: &str| -> Vec<&str> { expect.get(name).and_then(Value::as_array).map(|a| a.iter().map(|s| s.as_str().unwrap()).collect()).unwrap_or_default() };
-        let changed: Vec<&str> = d.changed.iter().map(|(k, ..)| k.as_str()).collect();
-        let added: Vec<&str> = d.added.iter().map(|(k, _)| k.as_str()).collect();
-        let removed: Vec<&str> = d.removed.iter().map(|(k, _)| k.as_str()).collect();
+        let changed: Vec<&str> = d.changed.iter().map(|(k, ..)| *k).collect();
+        let added: Vec<&str> = d.added.iter().map(|(k, _)| *k).collect();
+        let removed: Vec<&str> = d.removed.iter().map(|(k, _)| *k).collect();
         assert_eq!(changed, list("changed"), "{ctx}: changed keys");
         assert_eq!(added, list("added"), "{ctx}: added keys");
         assert_eq!(removed, list("removed"), "{ctx}: removed keys");
