@@ -5,6 +5,7 @@
 //! shared snapshot (`Live`) and subscribes to a broadcast of changes.
 
 use std::collections::{BTreeMap, HashMap};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
 use inform::Mac;
@@ -124,16 +125,31 @@ pub struct ClientView {
     pub last_seen: Ts,
 }
 
-#[derive(Debug, Default, Clone, Serialize)]
-pub struct Counters {
-    pub informs: u64,
-    pub notifications: u64,
-    pub log_errors: u64,
-    pub replies: u64,
-    pub config_pushes: u64,
-    pub decode_errors: u64,
-    pub logs: u64,
-    pub events: u64,
+/// Declares `Counters` with one atomic per name, serialised as plain numbers.
+macro_rules! counters {
+    ($($name:ident),* $(,)?) => {
+        /// Running totals since start. Atomics, shared by the engine and the
+        /// live view, so counting a syslog line takes no lock.
+        #[derive(Debug, Default)]
+        pub struct Counters {
+            $(pub $name: AtomicU64,)*
+        }
+
+        impl Serialize for Counters {
+            fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+                use serde::ser::SerializeStruct;
+                let mut out = s.serialize_struct("Counters", [$(stringify!($name)),*].len())?;
+                $(out.serialize_field(stringify!($name), &self.$name.load(Ordering::Relaxed))?;)*
+                out.end()
+            }
+        }
+    };
+}
+
+counters!(informs, notifications, log_errors, replies, config_pushes, decode_errors, logs, events);
+
+fn bump(counter: &AtomicU64) {
+    counter.fetch_add(1, Ordering::Relaxed);
 }
 
 /// A name and note the user gave a client.
@@ -149,7 +165,8 @@ pub struct Live {
     /// User-given client names, including clients not seen in this run.
     pub aliases: HashMap<Mac, Alias>,
     pub clients: BTreeMap<Mac, ClientView>,
-    pub counters: Counters,
+    /// Also held by the engine, which counts without taking the lock.
+    pub counters: Arc<Counters>,
     /// For attributing syslog: an AP's `hash_id` and IP address.
     pub by_hash_id: HashMap<String, Mac>,
     pub by_ip: HashMap<String, Mac>,
@@ -204,6 +221,8 @@ pub struct Engine {
     keys: Arc<KeyStore>,
     renderer: Option<crate::dryrun::RenderFn>,
     live: SharedLive,
+    /// The live view's counters, updated without its lock.
+    counters: Arc<Counters>,
     tx: broadcast::Sender<LiveMsg>,
     /// Full (unredacted) last config per AP, for diffs. Only kept in memory.
     configs: HashMap<Mac, HashMap<&'static str, String>>,
@@ -225,7 +244,8 @@ pub struct Engine {
 
 impl Engine {
     pub fn new(writer: Writer, keys: Arc<KeyStore>, live: SharedLive, tx: broadcast::Sender<LiveMsg>) -> Self {
-        Engine { writer, keys, renderer: None, live, tx, configs: HashMap::new(), radios: HashMap::new(), mcast_prev: HashMap::new(), bss_prev: HashMap::new(), logevents: Default::default(), isolated: HashMap::new(), last_prune: 0 }
+        let counters = live.read().unwrap().counters.clone();
+        Engine { writer, keys, renderer: None, live, counters, tx, configs: HashMap::new(), radios: HashMap::new(), mcast_prev: HashMap::new(), bss_prev: HashMap::new(), logevents: Default::default(), isolated: HashMap::new(), last_prune: 0 }
     }
 
     /// Enables dry-run comparisons of every captured config push.
@@ -318,7 +338,7 @@ impl Engine {
             Input::SetConfigMeta { mac, meta } => self.set_config_meta(mac, meta),
             Input::Datagram { ts, src_ip, payload } => self.datagram(ts, src_ip, &payload),
             Input::Tick(now) => self.tick(now),
-            Input::DecodeError => self.live.write().unwrap().counters.decode_errors += 1,
+            Input::DecodeError => bump(&self.counters.decode_errors),
             Input::SetAlias { ts, mac, alias, note, only_if_unset } => self.set_alias(ts, mac, alias, note, only_if_unset),
             Input::SetState { ts, state } => self.set_state(ts, state),
             Input::ThreatFound { ts, kind, bssid, device_mac, data, notify } => {
@@ -328,23 +348,13 @@ impl Engine {
                     vec![Sql::Text(kind.into()), Sql::Text(bssid), Sql::Integer(ts)],
                 );
                 if notify {
-                    let mut live = self.live.write().unwrap();
-                    self.emit(&mut live, ev(ts, "network_threat", device_mac, None, data));
+                    self.emit(ev(ts, "network_threat", device_mac, None, data));
                 }
             }
             Input::AlertsRead => self.writer.exec(Db::Config, "UPDATE alerts SET read = 1 WHERE read = 0", vec![]),
-            Input::Note { ts, kind, mac, data } => {
-                let mut live = self.live.write().unwrap();
-                self.emit(&mut live, ev(ts, kind, Some(mac), None, data));
-            }
-            Input::ClientNote { ts, kind, client, data } => {
-                let mut live = self.live.write().unwrap();
-                self.emit(&mut live, ev(ts, kind, None, Some(client), data));
-            }
-            Input::SiteNote { ts, kind, data } => {
-                let mut live = self.live.write().unwrap();
-                self.emit(&mut live, ev(ts, kind, None, None, data));
-            }
+            Input::Note { ts, kind, mac, data } => self.emit(ev(ts, kind, Some(mac), None, data)),
+            Input::ClientNote { ts, kind, client, data } => self.emit(ev(ts, kind, None, Some(client), data)),
+            Input::SiteNote { ts, kind, data } => self.emit(ev(ts, kind, None, None, data)),
             Input::Forget { mac } => self.forget(mac),
             Input::EditState { ts, what, edit, done } => {
                 let _ = done.send(self.edit_state(ts, what, edit));
@@ -367,8 +377,8 @@ impl Engine {
         }
     }
 
-    fn emit(&self, live: &mut Live, ev: Event) {
-        live.counters.events += 1;
+    fn emit(&self, ev: Event) {
+        bump(&self.counters.events);
         self.writer.exec(
             Db::Config,
             "INSERT INTO events (ts, kind, device_mac, client_mac, data) VALUES (?1, ?2, ?3, ?4, ?5)",
@@ -395,7 +405,7 @@ impl Engine {
             Ok(s) => s,
             Err(e) => {
                 tracing::debug!("unparseable inform: {e:#}");
-                self.live.write().unwrap().counters.decode_errors += 1;
+                bump(&self.counters.decode_errors);
                 return;
             }
         };
@@ -407,7 +417,7 @@ impl Engine {
         if snap.has_vap_table {
             live.raw_informs.insert(mac, Arc::new(decoded.payload));
         }
-        live.counters.informs += 1;
+        bump(&self.counters.informs);
         if let Some(h) = &snap.ap.hash_id {
             live.by_hash_id.insert(h.clone(), mac);
         }
@@ -496,7 +506,7 @@ impl Engine {
             events.push(ev(ts, "ap_upgraded", Some(mac), None, json!({ "from": j.from, "to": v, "custom": j.custom })));
         }
         for e in events {
-            self.emit(&mut live, e);
+            self.emit(e);
         }
 
         if snap.has_vap_table {
@@ -577,7 +587,7 @@ impl Engine {
                 ],
             );
             for e in events {
-                self.emit(live, e);
+                self.emit(e);
             }
         }
         let _ = self.tx.send(LiveMsg::Clients);
@@ -591,14 +601,14 @@ impl Engine {
     fn reply(&mut self, ts: Ts, mac: Mac, p: &Value, dry_run: bool) {
         let (radios, mgmt, system, state, inform) = {
             let mut live = self.live.write().unwrap();
-            live.counters.replies += 1;
+            bump(&self.counters.replies);
             if let (Some(interval), Some(d)) = (p["interval"].as_i64(), live.devices.get_mut(&mac)) {
                 d.interval = interval;
             }
             if p["_type"].as_str() != Some("setparam") {
                 return;
             }
-            live.counters.config_pushes += 1;
+            bump(&self.counters.config_pushes);
             // A push can be management-only (e.g. after an LED change): it carries
             // mgmt_cfg alone, and the AP keeps its last full system_cfg.
             let previous = live.last_config.get(&mac);
@@ -685,9 +695,9 @@ impl Engine {
             d.last_config_push = Some(ts);
         }
         live.last_config.insert(mac, (mgmt, system, cfgversion));
-        self.emit(&mut live, ev(ts, "config_pushed", Some(mac), None, Value::Object(data)));
+        self.emit(ev(ts, "config_pushed", Some(mac), None, Value::Object(data)));
         if let Some(summary) = dry {
-            self.emit(&mut live, ev(ts, "dryrun_compared", Some(mac), None, summary));
+            self.emit(ev(ts, "dryrun_compared", Some(mac), None, summary));
         }
     }
 
@@ -722,7 +732,7 @@ impl Engine {
         let mut live = self.live.write().unwrap();
         live.state = Some(Arc::new(state));
         live.state_imported_at = Some(ts);
-        self.emit(&mut live, ev(ts, "settings_imported", None, None, summary));
+        self.emit(ev(ts, "settings_imported", None, None, summary));
     }
 
     fn edit_state(&mut self, ts: Ts, what: String, edit: StateEdit) -> Result<(), String> {
@@ -736,7 +746,7 @@ impl Engine {
             vec![Sql::Text(state.to_string()), Sql::Integer(imported_at)],
         );
         live.state = Some(Arc::new(state));
-        self.emit(&mut live, ev(ts, "settings_changed", None, None, json!({ "what": what })));
+        self.emit(ev(ts, "settings_changed", None, None, json!({ "what": what })));
         // The APs pick the change up now rather than at their next interval.
         crate::stun::poke_all(&live);
         Ok(())
@@ -783,7 +793,7 @@ impl Engine {
         }
         if old.alias != alias {
             let ap = live.clients.get(&mac).map(|c| c.sample.ap_mac);
-            self.emit(&mut live, ev(ts, "client_renamed", ap, Some(mac), json!({ "from": old.alias, "to": alias })));
+            self.emit(ev(ts, "client_renamed", ap, Some(mac), json!({ "from": old.alias, "to": alias })));
         }
         drop(live);
         let _ = self.tx.send(LiveMsg::Clients);
@@ -792,7 +802,7 @@ impl Engine {
     fn notification(&mut self, ts: Ts, p: &Value) {
         let Some(mac) = p["mac"].as_str().and_then(|m| m.parse::<Mac>().ok()) else { return };
         let mut live = self.live.write().unwrap();
-        live.counters.notifications += 1;
+        bump(&self.counters.notifications);
         if let Some(d) = live.devices.get_mut(&mac) {
             d.last_seen = ts; // proof of life, but not a status report
         }
@@ -801,7 +811,7 @@ impl Engine {
             Some("setparam") => {
                 let since_push = live.devices.get(&mac).and_then(|d| d.last_config_push).map(|t| ts - t);
                 let data = json!({ "cfgversion": p["cfgversion"], "seconds_after_push": since_push });
-                self.emit(&mut live, ev(ts, "config_applied", Some(mac), None, data));
+                self.emit(ev(ts, "config_applied", Some(mac), None, data));
             }
             Some("event") => {
                 let n = &p["notif_payload"];
@@ -821,12 +831,12 @@ impl Engine {
                         }
                         _ => "ap_event",
                     };
-                    self.emit(&mut live, ev(ts, k, Some(mac), None, n.clone()));
+                    self.emit(ev(ts, k, Some(mac), None, n.clone()));
                 }
             }
             // The AP starts an upgrade (ours, or one run on the AP itself).
             Some(r @ ("cmd-upgrade" | "cli-upgrade")) => {
-                self.emit(&mut live, ev(ts, "ap_upgrade_started", Some(mac), None, json!({ "by": if r == "cli-upgrade" { "the AP's command line" } else { "the controller" } })));
+                self.emit(ev(ts, "ap_upgrade_started", Some(mac), None, json!({ "by": if r == "cli-upgrade" { "the AP's command line" } else { "the controller" } })));
             }
             // A crash or recovery report: base64 text from the AP's crash store.
             Some(reason @ ("crashlog" | "recovery")) => {
@@ -839,7 +849,7 @@ impl Engine {
                 let lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
                 let tail: Vec<&str> = lines.iter().rev().take(200).rev().copied().collect();
                 let kind = if reason == "recovery" { "recovered after a crash" } else { "crash report" };
-                self.emit(&mut live, ev(ts, "ap_crash", Some(mac), None, json!({ "kind": kind, "source": reason, "lines": tail })));
+                self.emit(ev(ts, "ap_crash", Some(mac), None, json!({ "kind": kind, "source": reason, "lines": tail })));
             }
             _ => {}
         }
@@ -895,7 +905,7 @@ impl Engine {
         let roamed = n["ip_assign_type"].as_str().is_some_and(|t| t.starts_with("roam"));
         if event_type == "failure" || (event_type == "soft failure" && !roamed) {
             let data = json!({ "essid": essid, "reason": n["sta_dc_reason"], "auth_algo": n["auth_algo"], "rssi": num("auth_rssi") });
-            self.emit(live, ev(ts, "client_connect_failed", Some(ap), Some(client), data));
+            self.emit(ev(ts, "client_connect_failed", Some(ap), Some(client), data));
         }
     }
 
@@ -930,7 +940,7 @@ impl Engine {
             }
             Err(e) => {
                 tracing::debug!("syslog from {src_ip}: {e:#}");
-                self.live.write().unwrap().counters.log_errors += 1;
+                bump(&self.counters.log_errors);
             }
         }
     }
@@ -951,7 +961,7 @@ impl Engine {
                     // Re-arm the deadline as the official controller does on each step.
                     j.expires = Some(ts + 450);
                 }
-                self.emit(live, ev(ts, "ap_upgrade_progress", Some(mac), None, json!({ "step": step })));
+                self.emit(ev(ts, "ap_upgrade_progress", Some(mac), None, json!({ "step": step })));
             }
             (Some("UpgradeError"), _) => {
                 let reason = s("reason");
@@ -962,7 +972,7 @@ impl Engine {
                     r => format!("failed ({r})"),
                 };
                 live.firmware.failed(&mac, &detail);
-                self.emit(live, ev(ts, "ap_upgrade_failed", Some(mac), None, json!({ "reason": reason, "detail": detail })));
+                self.emit(ev(ts, "ap_upgrade_failed", Some(mac), None, json!({ "reason": reason, "detail": detail })));
             }
             _ => {}
         }
@@ -980,8 +990,7 @@ impl Engine {
         if flagged.is_empty() {
             return;
         }
-        let mut live = self.live.write().unwrap();
-        let ours: Vec<(Mac, u64)> = live.devices.keys().map(|m| (*m, num(m))).collect();
+        let ours: Vec<(Mac, u64)> = self.live.read().unwrap().devices.keys().map(|m| (*m, num(m))).collect();
         for n in flagged {
             let Ok(b) = n.bssid.parse::<Mac>().map(|m| num(&m)) else { continue };
             let Some((ap, _)) = ours.iter().find(|(_, x)| x.abs_diff(b) <= 16) else { continue };
@@ -990,19 +999,15 @@ impl Engine {
             }
             self.isolated.insert(*ap, ts);
             let data = json!({ "heard_by": s.ap.mac.to_string(), "bssid": n.bssid, "signal": n.signal });
-            self.emit(&mut live, ev(ts, "ap_isolated", Some(*ap), None, data));
+            self.emit(ev(ts, "ap_isolated", Some(*ap), None, data));
         }
     }
 
     fn log(&mut self, line: LogLine) {
-        let found = self.logevents.feed(&line);
-        if !found.is_empty() {
-            let mut live = self.live.write().unwrap();
-            for f in found {
-                self.emit(&mut live, ev(line.ts, f.kind, f.device, f.client, f.data));
-            }
+        for f in self.logevents.feed(&line) {
+            self.emit(ev(line.ts, f.kind, f.device, f.client, f.data));
         }
-        self.live.write().unwrap().counters.logs += 1;
+        bump(&self.counters.logs);
         self.writer.exec(
             Db::Logs,
             "INSERT INTO logs (ts, device_mac, src_ip, facility, severity, program, msg) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
@@ -1028,15 +1033,11 @@ impl Engine {
                 && let Some(j) = live.firmware.failed(&mac, "it did not come back with the new firmware in time")
             {
                 let data = json!({ "reason": "timed out", "detail": "it did not come back with the new firmware in time", "target": j.target });
-                self.emit(&mut live, ev(now, "ap_upgrade_failed", Some(mac), None, data));
+                self.emit(ev(now, "ap_upgrade_failed", Some(mac), None, data));
             }
         }
-        let found = self.logevents.tick(now);
-        if !found.is_empty() {
-            let mut live = self.live.write().unwrap();
-            for f in found {
-                self.emit(&mut live, ev(now, f.kind, f.device, f.client, f.data));
-            }
+        for f in self.logevents.tick(now) {
+            self.emit(ev(now, f.kind, f.device, f.client, f.data));
         }
         self.bss_prev.retain(|_, (ts, _)| *ts > now - 3600);
         let mut live = self.live.write().unwrap();
@@ -1090,7 +1091,7 @@ impl Engine {
             }
         }
         for e in events {
-            self.emit(&mut live, e);
+            self.emit(e);
         }
         // Clients gone longer than the database keeps them (see `store::maintenance`).
         if now - self.last_prune >= 3600 {
@@ -1501,7 +1502,7 @@ mod tests {
         );
         let live = h.live.read().unwrap();
         assert!(live.clients[&C1.parse().unwrap()].connected);
-        assert_eq!(live.counters.notifications, 4);
+        assert_eq!(live.counters.notifications.load(Ordering::Relaxed), 4);
         assert_eq!(live.devices[&AP1.parse().unwrap()].last_full_inform, 0, "notifications are not client lists");
     }
 

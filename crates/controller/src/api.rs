@@ -185,7 +185,7 @@ async fn status(State(s): State<AppState>) -> ApiResult {
         "source": s.source,
         "started": s.started,
         "now": store::now_ts(),
-        "counters": live.counters,
+        "counters": &*live.counters,
         "devices": live.devices.len(),
         "devices_online": live.devices.values().filter(|d| d.online).count(),
         "clients_connected": live.clients.values().filter(|c| c.connected).count(),
