@@ -15,7 +15,8 @@ so the APs need no changes.
 - Events, browser alerts, a connection log with per-stage timings, and roaming analysis
 - AP syslog with full-text search
 - Neighbouring networks, channel planning and nightly auto-channel
-- An SSID and radio settings editor with per-AP previews, plus schedules and speed limits
+- SSID, AP and site settings editors with per-AP previews, plus schedules, speed limits
+  and SNMP
 - Adoption, firmware upgrades, device and client actions, and encrypted backups
 
 Tested with U6-Mesh APs on firmware 8.8, against Network Application 10.6.
@@ -27,6 +28,12 @@ Tested with U6-Mesh APs on firmware 8.8, against Network Application 10.6.
 | ![Radios](docs/screenshots/radios.png) | ![Events](docs/screenshots/events.png) |
 
 These screenshots use mock data from `informdump demo`.
+
+## Not supported yet
+
+- **Wireless meshing.** apctl always sends the APs meshing off, whatever the imported
+  settings say. Don't switch a site whose APs mesh (or need to) over to apctl yet.
+- A tagged management VLAN, guest portals, Hotspot 2.0, and 6 GHz / Wi-Fi 7 features.
 
 ## Modes
 
