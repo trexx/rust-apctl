@@ -611,30 +611,56 @@ fn apply(b: &Backups, id: &str) -> Result<()> {
     let manifest: Manifest = serde_json::from_slice(&fs::read(staged.join("manifest.json")).context("staged restore has no manifest")?)?;
     check_names(&manifest)?;
     tracing::warn!("restoring the backup made {} by apctl {} (history: {} days)", manifest.created, manifest.version, manifest.days);
-    if b.data_dir.join("config.db").exists() {
+    let restoring = |n: &str| b.data_dir.join(format!("{n}.restoring"));
+    // Staging checks that every listed file is there, and files only leave it
+    // below: with one gone, this is a restore cut off part way (a crash, a
+    // stop), taken up again where it stopped. Its pre-restore copy was made
+    // the first time, and a new one would hold part of the restored data.
+    let resumed = manifest.files.keys().any(|n| !staged.join(n).exists());
+    if b.data_dir.join("config.db").exists() && !resumed {
         let pre = create(b, &b.data_dir, Kind::PreRestore, -1).context("saving the current state before restoring")?;
         tracing::info!("saved the state before the restore as {}", pre.name);
         prune(b, Kind::PreRestore, KEEP_PRE_RESTORE);
     }
-    // Copy everything first: if a copy fails, the current databases are untouched.
-    let restoring = |n: &str| b.data_dir.join(format!("{n}.restoring"));
+    // Everything beside its place first: if a move fails, the current
+    // databases are untouched. Staging is in the data directory, so these are
+    // renames, not copies (the files were synced when they were unpacked).
     for n in manifest.files.keys() {
-        if let Err(e) = fs::copy(staged.join(n), restoring(n)) {
+        if staged.join(n).exists()
+            && let Err(e) = fs::rename(staged.join(n), restoring(n))
+        {
             for n in manifest.files.keys() {
                 let _ = fs::remove_file(restoring(n));
             }
-            return Err(e).with_context(|| format!("copying {n} into place"));
+            return Err(e).with_context(|| format!("moving {n} into place"));
         }
     }
+    sync_dir(&b.data_dir)?;
     for n in manifest.files.keys() {
-        fs::rename(restoring(n), b.data_dir.join(n))?;
-        // The replaced database's journal must not be applied to the restored one.
-        for suffix in ["-wal", "-shm"] {
-            let _ = fs::remove_file(b.data_dir.join(format!("{n}{suffix}")));
+        // Neither staged nor beside its place: moved in before the restore was cut off.
+        if !restoring(n).exists() {
+            continue;
         }
+        // The replaced database's journal must never be applied to the
+        // restored one: it goes first, so no crash can leave the two together.
+        for suffix in ["-wal", "-shm"] {
+            match fs::remove_file(b.data_dir.join(format!("{n}{suffix}"))) {
+                Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e).with_context(|| format!("removing {n}{suffix}")),
+                _ => {}
+            }
+        }
+        sync_dir(&b.data_dir)?;
+        fs::rename(restoring(n), b.data_dir.join(n))?;
+        File::open(b.data_dir.join(n))?.sync_all()?;
     }
+    sync_dir(&b.data_dir)?;
     let _ = fs::remove_dir_all(&staged);
     Ok(())
+}
+
+/// Makes the renames in a directory durable.
+fn sync_dir(dir: &Path) -> Result<()> {
+    File::open(dir)?.sync_all().with_context(|| format!("syncing {}", dir.display()))
 }
 
 /// Deletes what a backup cut off half way (a crash, a restart) left in the
@@ -1180,6 +1206,26 @@ mod tests {
         assert!(!b.staging().join("pending").exists());
         assert_eq!(list(&b).iter().filter(|x| x.kind == Kind::PreRestore).count(), 3, "the oldest is dropped, even with automatic backups off");
         assert!(list(&b).iter().any(|x| x.name == m.name), "other backups are kept");
+    }
+
+    #[test]
+    fn a_restore_cut_off_part_way_is_finished_on_the_next_start() {
+        let src = data("resume");
+        let b = Backups { data_dir: src.clone(), key: None };
+        let m = create(&b, &src, Kind::Manual, -1).unwrap();
+        Connection::open(src.join("config.db")).unwrap().execute_batch("DELETE FROM client_aliases;").unwrap();
+        let (id, _) = stage(&b, &b.dir().join(&m.name)).unwrap();
+        fs::write(b.staging().join("pending"), &id).unwrap();
+        // As if apctl stopped after moving config.db beside its place, with the
+        // replaced database's journal still there.
+        fs::rename(b.staging().join(&id).join("config.db"), src.join("config.db.restoring")).unwrap();
+        fs::write(src.join("config.db-wal"), "the old journal").unwrap();
+        apply_pending(&b);
+        assert!(!b.staging().join("pending").exists() && !b.staging().join("pending.failed").exists());
+        assert!(!src.join("config.db-wal").exists() && !src.join("config.db.restoring").exists());
+        assert_eq!(count(&src.join("config.db"), "SELECT COUNT(*) FROM client_aliases"), 1, "restored");
+        assert_eq!(count(&src.join("metrics.db"), "SELECT COUNT(*) FROM ap_stats"), 2, "the rest moved in too");
+        assert!(!list(&b).iter().any(|x| x.kind == Kind::PreRestore), "no copy of the half-restored state");
     }
 
     #[test]
