@@ -429,7 +429,7 @@ pub async fn index(State(s): State<AppState>) -> Result<Json<Value>, ApiError> {
             })
         })
         .collect();
-    let jobs = serde_json::to_value(&s.live.read().unwrap().firmware).map_err(|e| ApiError::internal(e.to_string()))?;
+    let jobs = serde_json::to_value(&s.live.read().unwrap().firmware).map_err(anyhow::Error::from)?;
     Ok(Json(json!({ "checked": checked, "error": error, "channel": "release", "active": s.active, "aps": list, "jobs": jobs })))
 }
 

@@ -181,10 +181,11 @@ impl From<std::io::Error> for ApiError {
 
 const INTERNAL: &str = "internal error (the details are in apctl's log)";
 
-/// A blocking task that panicked or was cancelled.
+/// A blocking task that panicked or was cancelled: logged, and as unexpected
+/// as any other failure to the browser (a panic message can name paths or data).
 impl From<tokio::task::JoinError> for ApiError {
     fn from(e: tokio::task::JoinError) -> Self {
-        ApiError::internal(e.to_string())
+        ApiError::from(anyhow::Error::from(e))
     }
 }
 
@@ -1036,6 +1037,14 @@ mod tests {
         // Reads need no header.
         let req = Request::get("/api/status").header(header::COOKIE, &cookie).body(Body::empty()).unwrap();
         assert_eq!(app.clone().oneshot(req).await.unwrap().status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn a_panicked_task_is_an_internal_error_without_detail() {
+        let e = tokio::task::spawn_blocking(|| panic!("reading /data/config.db")).await.unwrap_err();
+        let ApiError(status, msg) = ApiError::from(e);
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(msg, INTERNAL);
     }
 
     #[tokio::test]
