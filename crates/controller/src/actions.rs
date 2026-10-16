@@ -23,7 +23,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::api::{ApiError, AppState};
-use crate::engine::{Input, Live};
+use crate::engine::{Event, Input, Live};
 use crate::store;
 
 /// Commands waiting for an AP's next inform.
@@ -118,7 +118,7 @@ fn known_ap(s: &AppState, mac: &Mac) -> Result<(), ApiError> {
 }
 
 async fn note(s: &AppState, kind: &'static str, mac: Mac, data: Value) {
-    let _ = s.engine.send(Input::Note { ts: store::now_ts(), kind, mac, data }).await;
+    let _ = s.engine.send(Input::Note(Event::device(store::now_ts(), kind, mac, data))).await;
 }
 
 /// POST /api/devices/{mac}/restart
@@ -180,7 +180,7 @@ pub async fn kick(State(s): State<AppState>, headers: HeaderMap, Path(mac): Path
         queue(&mut live, ap, json!({ "_type": "cmd", "cmd": "kick-sta", "mac": client.to_string() }));
         ap
     };
-    let _ = s.engine.send(Input::ClientNote { ts: store::now_ts(), kind: "client_reconnect_requested", client, data: json!({ "ap": ap }) }).await;
+    let _ = s.engine.send(Input::Note(Event::client(store::now_ts(), "client_reconnect_requested", client, json!({ "ap": ap })))).await;
     Ok(Json(json!({ "queued": true, "ap": ap })))
 }
 
@@ -206,7 +206,7 @@ pub async fn block(State(s): State<AppState>, headers: HeaderMap, Path(mac): Pat
         }
     }
     let kind = if blocked { "client_blocked" } else { "client_unblocked" };
-    let _ = s.engine.send(Input::ClientNote { ts: store::now_ts(), kind, client, data: json!({}) }).await;
+    let _ = s.engine.send(Input::Note(Event::client(store::now_ts(), kind, client, json!({})))).await;
     Ok(Json(json!({ "blocked": blocked })))
 }
 

@@ -23,7 +23,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::api::{ApiError, AppState};
-use crate::engine::{Input, Live};
+use crate::engine::{Event, Input, Live};
 use crate::model::Ts;
 use crate::adopt::{device_doc, device_doc_mut};
 use crate::settings::{band_channels, country, device_macs, inform_radio, legal_channels, num, setting, setting_mut, uplink};
@@ -293,7 +293,7 @@ pub async fn run(s: AppState, bands: Vec<String>, trigger: &'static str) {
                 Err(e) => data["error"] = json!(e.1),
             }
         }
-        let _ = s.engine.send(Input::SiteNote { ts: store::now_ts(), kind: "channel_plan", data }).await;
+        let _ = s.engine.send(Input::Note(Event::site(store::now_ts(), "channel_plan", data))).await;
     }
 }
 
@@ -428,7 +428,7 @@ pub async fn apply_plan(State(s): State<AppState>, headers: HeaderMap, Json(b): 
     }
     apply(&s, &b.band, &b.changes, "manual").await?;
     let data = json!({ "band": b.band, "trigger": "manual", "changes": b.changes, "applied": true });
-    let _ = s.engine.send(Input::SiteNote { ts: store::now_ts(), kind: "channel_plan", data }).await;
+    let _ = s.engine.send(Input::Note(Event::site(store::now_ts(), "channel_plan", data))).await;
     Ok(Json(json!({ "applied": b.changes.len() })))
 }
 

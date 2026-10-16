@@ -31,7 +31,7 @@ use tokio::sync::mpsc;
 use wire::decode::{Decoded, KeyUsed, open_with};
 use wire::keys::KeyStore;
 
-use crate::engine::{Input, PushedConfig, SharedLive};
+use crate::engine::{Event, Input, PushedConfig, SharedLive};
 use crate::model::Ts;
 use crate::store::{self, Db, Store, Writer};
 
@@ -339,11 +339,11 @@ impl Active {
                 Some(Ok(cmd)) => {
                     tracing::warn!("{mac}: sending firmware upgrade to {}", cmd["version"]);
                     let data = json!({ "target": cmd["version"], "url": cmd["url"] });
-                    let _ = self.engine.try_send(Input::Note { ts, kind: "ap_upgrade_sent", mac, data });
+                    let _ = self.engine.try_send(Input::Note(Event::device(ts, "ap_upgrade_sent", mac, data)));
                     return cmd;
                 }
                 Some(Err((why, true))) => {
-                    let _ = self.engine.try_send(Input::Note { ts, kind: "ap_upgrade_failed", mac, data: json!({ "reason": "no internet", "detail": why }) });
+                    let _ = self.engine.try_send(Input::Note(Event::device(ts, "ap_upgrade_failed", mac, json!({ "reason": "no internet", "detail": why }))));
                 }
                 Some(Err((_, false))) | None => {}
             }
@@ -418,7 +418,7 @@ pub async fn inform(
         if new {
             tracing::info!("{mac}: {} informing from {}", if known { "reset AP (adoption required)" } else { "AP waiting for adoption" }, peer.ip());
             let data = json!({ "model": payload["model"], "ip": payload["ip"], "known": known });
-            let _ = active.engine.send(Input::Note { ts, kind: "ap_pending", mac, data }).await;
+            let _ = active.engine.send(Input::Note(Event::device(ts, "ap_pending", mac, data))).await;
         }
         return status(StatusCode::NOT_FOUND);
     }
@@ -430,7 +430,7 @@ pub async fn inform(
     };
     if was_adopting {
         let data = json!({ "model": payload["model"], "ip": payload["ip"], "version": payload["version"] });
-        let _ = active.engine.send(Input::Note { ts, kind: "ap_adopted", mac, data }).await;
+        let _ = active.engine.send(Input::Note(Event::device(ts, "ap_adopted", mac, data))).await;
     }
     if forgetting {
         tracing::warn!("{mac}: forgotten: telling it to reset");

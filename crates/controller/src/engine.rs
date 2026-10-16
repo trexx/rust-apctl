@@ -50,12 +50,9 @@ pub enum Input {
     ThreatFound { ts: Ts, kind: &'static str, bssid: String, device_mac: Option<Mac>, data: Value, notify: bool },
     /// Mark every alert read.
     AlertsRead,
-    /// Record an event raised elsewhere (e.g. active mode sending an upgrade).
-    Note { ts: Ts, kind: &'static str, mac: Mac, data: Value },
-    /// Record a client event raised elsewhere (e.g. blocked from the UI).
-    ClientNote { ts: Ts, kind: &'static str, client: Mac, data: Value },
-    /// Record a site-wide event raised elsewhere (e.g. a channel plan applied).
-    SiteNote { ts: Ts, kind: &'static str, data: Value },
+    /// Record an event raised elsewhere (e.g. active mode sending an upgrade, a
+    /// client blocked from the UI, a channel plan applied).
+    Note(Event),
     /// Drop everything apctl keeps about a forgotten AP.
     Forget { mac: Mac },
     /// Change the settings (apctl's copy of the controller settings), store
@@ -85,6 +82,23 @@ pub struct Event {
     pub device_mac: Option<Mac>,
     pub client_mac: Option<Mac>,
     pub data: Value,
+}
+
+impl Event {
+    /// An event about an AP.
+    pub fn device(ts: Ts, kind: &'static str, mac: Mac, data: Value) -> Self {
+        ev(ts, kind, Some(mac), None, data)
+    }
+
+    /// An event about a client.
+    pub fn client(ts: Ts, kind: &'static str, client: Mac, data: Value) -> Self {
+        ev(ts, kind, None, Some(client), data)
+    }
+
+    /// An event about the whole site.
+    pub fn site(ts: Ts, kind: &'static str, data: Value) -> Self {
+        ev(ts, kind, None, None, data)
+    }
 }
 
 /// Messages pushed to live subscribers (the UI's WebSocket, serialised once
@@ -435,9 +449,7 @@ impl Engine {
                 }
             }
             Input::AlertsRead => self.writer.exec(Db::Config, "UPDATE alerts SET read = 1 WHERE read = 0", vec![]),
-            Input::Note { ts, kind, mac, data } => self.emit(ev(ts, kind, Some(mac), None, data)),
-            Input::ClientNote { ts, kind, client, data } => self.emit(ev(ts, kind, None, Some(client), data)),
-            Input::SiteNote { ts, kind, data } => self.emit(ev(ts, kind, None, None, data)),
+            Input::Note(e) => self.emit(e),
             Input::Forget { mac } => self.forget(mac),
             Input::EditState { ts, what, edit, done } => {
                 let _ = done.send(self.edit_state(ts, what, edit));
