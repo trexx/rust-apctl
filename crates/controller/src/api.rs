@@ -115,7 +115,15 @@ pub fn router(state: AppState) -> Router {
     // The live socket is added after compression, which must not touch an upgrade.
     let socket = Router::new().route("/api/ws", get(ws)).route_layer(axum::middleware::from_fn_with_state(state.clone(), crate::auth::require_login));
     // JSON and the UI's scripts and styles compress well (gzip only; images are left alone).
-    public.merge(protected).fallback(crate::web::handler).layer(tower_http::compression::CompressionLayer::new()).merge(socket).with_state(state)
+    public.merge(protected).fallback(crate::web::handler).layer(tower_http::compression::CompressionLayer::new().compress_when(compressible())).merge(socket).with_state(state)
+}
+
+/// What is worth compressing: the defaults (nothing tiny, no images), and no
+/// octet-stream, which apctl only sends for backups, already compressed or
+/// encrypted (compressing them again costs CPU and loses their length).
+fn compressible() -> impl tower_http::compression::Predicate {
+    use tower_http::compression::predicate::{DefaultPredicate, NotForContentType, Predicate};
+    DefaultPredicate::new().and(NotForContentType::const_new("application/octet-stream"))
 }
 
 /// 409 unless apctl is the active controller. `what` says what needs it ("upgrades need").
@@ -1037,6 +1045,24 @@ mod tests {
         // Reads need no header.
         let req = Request::get("/api/status").header(header::COOKIE, &cookie).body(Body::empty()).unwrap();
         assert_eq!(app.clone().oneshot(req).await.unwrap().status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn backups_download_with_their_length_and_uncompressed() {
+        let (mut state, _engine) = state();
+        let file = state.backups.data_dir.join("users");
+        std::fs::write(&file, format!("admin:{}\n", crate::auth::hash_password("x").unwrap())).unwrap();
+        state.auth = Arc::new(crate::auth::Auth::new(crate::auth::Users::load(&file).unwrap(), &state.store, state.writer.clone(), Default::default()).unwrap());
+        let cookie = format!("{}={}", crate::auth::COOKIE, state.auth.create("admin").unwrap());
+        let m = crate::backup::create(&state.backups, &state.backups.data_dir, crate::backup::Kind::Manual, 0).unwrap();
+        let raw = std::fs::read(state.backups.dir().join(&m.name)).unwrap();
+        let app = router(state);
+        let req = Request::get(format!("/api/backups/file/{}", m.name)).header(header::COOKIE, &cookie).header(header::ACCEPT_ENCODING, "gzip").body(Body::empty()).unwrap();
+        let res = app.oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        assert!(res.headers().get(header::CONTENT_ENCODING).is_none());
+        assert_eq!(res.headers().get(header::CONTENT_LENGTH).map(|v| v.to_str().unwrap().to_string()), Some(raw.len().to_string()));
+        assert_eq!(axum::body::to_bytes(res.into_body(), 1 << 24).await.unwrap(), raw);
     }
 
     #[tokio::test]

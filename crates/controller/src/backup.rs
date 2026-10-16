@@ -856,9 +856,16 @@ pub async fn download(State(s): State<AppState>, UrlPath(name): UrlPath<String>)
         return Err(ApiError(StatusCode::BAD_REQUEST, "invalid backup name".into()));
     }
     let file = tokio::fs::File::open(b.dir().join(&name)).await.map_err(|_| ApiError(StatusCode::NOT_FOUND, "no such backup".into()))?;
-    let body = Body::from_stream(tokio_util::io::ReaderStream::new(file));
+    // The length lets the browser show progress; the file is read a megabyte
+    // per trip to the blocking pool, and (as octet-stream) never recompressed.
+    let len = file.metadata().await?.len();
+    let body = Body::from_stream(tokio_util::io::ReaderStream::with_capacity(file, 1 << 20));
     Ok((
-        [(header::CONTENT_TYPE, "application/octet-stream".to_string()), (header::CONTENT_DISPOSITION, format!("attachment; filename=\"{name}\""))],
+        [
+            (header::CONTENT_TYPE, "application/octet-stream".to_string()),
+            (header::CONTENT_LENGTH, len.to_string()),
+            (header::CONTENT_DISPOSITION, format!("attachment; filename=\"{name}\"")),
+        ],
         body,
     )
         .into_response())
