@@ -31,7 +31,7 @@ use tokio::sync::mpsc;
 use wire::decode::{Decoded, KeyUsed};
 use wire::keys::KeyStore;
 
-use crate::engine::{Input, SharedLive};
+use crate::engine::{Input, PushedConfig, SharedLive};
 use crate::model::Ts;
 use crate::store::{self, Db, Store, Writer};
 
@@ -55,7 +55,7 @@ pub struct Active {
     devices: Mutex<HashMap<Mac, Managed>>,
     /// The last push stored for each AP (secrets masked), for adopting the
     /// running config after a restart, when no unmasked push is in memory.
-    stored_pushes: HashMap<Mac, (String, String, Option<String>)>,
+    stored_pushes: HashMap<Mac, PushedConfig>,
     /// Reverse proxies whose X-Forwarded-For is believed for the AP's address.
     proxies: Arc<crate::auth::Proxies>,
 }
@@ -107,19 +107,7 @@ impl Active {
             Ok(rows)
         })?;
         let devices = rows.into_iter().filter_map(|(m, d)| m.parse().ok().map(|m| (m, d))).collect();
-        let pushes = store.read(Db::Config, |c| {
-            let mut stmt = c.prepare("SELECT mac, mgmt_cfg, system_cfg, cfgversion FROM device_config")?;
-            let rows = stmt
-                .query_map([], |r| {
-                    Ok((
-                        r.get::<_, String>(0)?,
-                        (r.get::<_, Option<String>>(1)?.unwrap_or_default(), r.get::<_, Option<String>>(2)?.unwrap_or_default(), r.get(3)?),
-                    ))
-                })?
-                .collect::<rusqlite::Result<Vec<_>>>()?;
-            Ok(rows)
-        })?;
-        let stored_pushes = pushes.into_iter().filter_map(|(m, p)| m.parse().ok().map(|m| (m, p))).collect();
+        let stored_pushes = store.read(Db::Config, |c| Ok(crate::engine::stored_pushes(c)?))?;
         Ok(Active { live, keys, engine, writer, controller, devices: Mutex::new(devices), stored_pushes, proxies })
     }
 
@@ -260,9 +248,9 @@ impl Active {
             let adopt = !force && current.is_none() && {
                 let last_push = self.live.read().unwrap().last_config.get(&mac).cloned();
                 let candidate = last_push.map(|p| (p, false)).or_else(|| self.stored_pushes.get(&mac).cloned().map(|p| (p, true)));
-                candidate.is_some_and(|((m, s, v), redacted)| {
+                candidate.is_some_and(|(p, redacted)| {
                     let ours = (with_cfgversion(&out.rendered.mgmt_cfg, &reported), out.rendered.system_cfg.clone());
-                    v.as_deref() == Some(reported.as_str()) && crate::dryrun::compare(&ours, &m, &s, redacted).matches()
+                    p.cfgversion.as_deref() == Some(reported.as_str()) && crate::dryrun::compare(&ours, &p.mgmt_cfg, &p.system_cfg, redacted).matches()
                 })
             };
             let version = if adopt { reported.clone() } else { new_cfgversion() };
@@ -479,8 +467,8 @@ mod tests {
             if with_state {
                 l.state = Some(Arc::new(fixture("controller-state.json")));
             }
-            if let Some(p) = last_push {
-                l.last_config.insert(AP.parse().unwrap(), p);
+            if let Some((mgmt_cfg, system_cfg, cfgversion)) = last_push {
+                l.last_config.insert(AP.parse().unwrap(), PushedConfig { mgmt_cfg, system_cfg, cfgversion });
             }
         }
         let mut keys = KeyStore::default();

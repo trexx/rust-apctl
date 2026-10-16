@@ -189,8 +189,35 @@ pub struct Live {
     pub scans: HashMap<Mac, crate::channelai::Scan>,
     /// APs waiting for adoption, being adopted or being forgotten.
     pub adoption: crate::adopt::Adoption,
-    /// Last config pushed to each AP by the other controller, unredacted.
-    pub last_config: HashMap<Mac, (String, String, Option<String>)>,
+    /// Last config pushed to each AP (by the other controller or by apctl),
+    /// unredacted. Only kept in memory; the database has a redacted copy.
+    pub last_config: HashMap<Mac, PushedConfig>,
+}
+
+/// A config pushed to an AP.
+#[derive(Debug, Clone, Default)]
+pub struct PushedConfig {
+    pub mgmt_cfg: String,
+    /// Empty until a push with a `system_cfg` is seen (one can be management-only).
+    pub system_cfg: String,
+    pub cfgversion: Option<String>,
+}
+
+/// The last push stored for each AP, with its secrets masked.
+pub fn stored_pushes(c: &rusqlite::Connection) -> rusqlite::Result<HashMap<Mac, PushedConfig>> {
+    let mut stmt = c.prepare("SELECT mac, mgmt_cfg, system_cfg, cfgversion FROM device_config")?;
+    let rows = stmt.query_map([], |r| {
+        let pushed = PushedConfig { mgmt_cfg: r.get::<_, Option<String>>(1)?.unwrap_or_default(), system_cfg: r.get::<_, Option<String>>(2)?.unwrap_or_default(), cfgversion: r.get(3)? };
+        Ok((r.get::<_, String>(0)?, pushed))
+    })?;
+    let mut out = HashMap::new();
+    for row in rows {
+        let (mac, pushed) = row?;
+        if let Ok(mac) = mac.parse() {
+            out.insert(mac, pushed);
+        }
+    }
+    Ok(out)
 }
 
 /// What the database remembers about an AP from a previous run.
@@ -224,8 +251,6 @@ pub struct Engine {
     /// The live view's counters, updated without its lock.
     counters: Arc<Counters>,
     tx: broadcast::Sender<LiveMsg>,
-    /// Full (unredacted) last config per AP, for diffs. Only kept in memory.
-    configs: HashMap<Mac, HashMap<&'static str, String>>,
     /// Debounced radio settings: right after a restart an AP briefly reports
     /// transient values (e.g. full transmit power) before settling.
     radios: HashMap<(Mac, String), RadioTrack>,
@@ -245,7 +270,7 @@ pub struct Engine {
 impl Engine {
     pub fn new(writer: Writer, keys: Arc<KeyStore>, live: SharedLive, tx: broadcast::Sender<LiveMsg>) -> Self {
         let counters = live.read().unwrap().counters.clone();
-        Engine { writer, keys, renderer: None, live, counters, tx, configs: HashMap::new(), radios: HashMap::new(), mcast_prev: HashMap::new(), bss_prev: HashMap::new(), logevents: Default::default(), isolated: HashMap::new(), last_prune: 0 }
+        Engine { writer, keys, renderer: None, live, counters, tx, radios: HashMap::new(), mcast_prev: HashMap::new(), bss_prev: HashMap::new(), logevents: Default::default(), isolated: HashMap::new(), last_prune: 0 }
     }
 
     /// Enables dry-run comparisons of every captured config push.
@@ -599,7 +624,7 @@ impl Engine {
     /// The diffs and the dry-run render take a while, so the live view is only
     /// locked to read what they need and then to store the results.
     fn reply(&mut self, ts: Ts, mac: Mac, p: &Value, dry_run: bool) {
-        let (radios, mgmt, system, state, inform) = {
+        let (radios, previous, state, inform) = {
             let mut live = self.live.write().unwrap();
             bump(&self.counters.replies);
             if let (Some(interval), Some(d)) = (p["interval"].as_i64(), live.devices.get_mut(&mac)) {
@@ -609,40 +634,38 @@ impl Engine {
                 return;
             }
             bump(&self.counters.config_pushes);
-            // A push can be management-only (e.g. after an LED change): it carries
-            // mgmt_cfg alone, and the AP keeps its last full system_cfg.
-            let previous = live.last_config.get(&mac);
-            let field = |name: &str, prev: Option<&String>| p[name].as_str().map(str::to_string).or_else(|| prev.cloned()).unwrap_or_default();
-            let mgmt = field("mgmt_cfg", previous.map(|x| &x.0));
-            let system = field("system_cfg", previous.map(|x| &x.1));
+            // The last push (unredacted), for the diffs; empty fields if none was seen.
+            let previous = live.last_config.get(&mac).cloned().unwrap_or_default();
             let radios = live.devices.get(&mac).map(|d| d.snapshot.radios.clone()).unwrap_or_default();
-            let wanted = dry_run && !system.is_empty() && self.renderer.is_some();
+            let has_system = !p["system_cfg"].as_str().unwrap_or(&previous.system_cfg).is_empty();
+            let wanted = dry_run && has_system && self.renderer.is_some();
             let state = live.state.clone().filter(|_| wanted);
             let inform = state.as_ref().and_then(|_| live.raw_informs.get(&mac).cloned());
-            (radios, mgmt, system, state, inform)
+            (radios, previous, state, inform)
         };
+        // A push can be management-only (e.g. after an LED change): it carries
+        // mgmt_cfg alone, and the AP keeps its last full system_cfg.
+        let field = |name: &str, prev: &str| p[name].as_str().unwrap_or(prev).to_string();
+        let mgmt = field("mgmt_cfg", &previous.mgmt_cfg);
+        let system = field("system_cfg", &previous.system_cfg);
         let mut data = serde_json::Map::new();
         data.insert("cfgversion".into(), p["cfgversion"].clone());
-        let known = self.configs.entry(mac).or_default();
-        // Sections removed by this push are only named in the previous config.
-        let old_system = known.get("system_cfg").cloned();
-        for field in ["mgmt_cfg", "system_cfg"] {
+        for (field, old) in [("mgmt_cfg", &previous.mgmt_cfg), ("system_cfg", &previous.system_cfg)] {
             let Some(new) = p[field].as_str() else { continue };
-            let summary = match known.get(field) {
-                Some(old) => {
-                    let d = cfgdiff::diff(old, new);
-                    json!({ "added": d.added.len(), "removed": d.removed.len(), "changed": d.changed.len(), "diff": d.render("", true) })
-                }
-                None => json!({ "baseline": true, "lines": new.lines().count() }),
+            let summary = if old.is_empty() {
+                json!({ "baseline": true, "lines": new.lines().count() })
+            } else {
+                let d = cfgdiff::diff(old, new);
+                json!({ "added": d.added.len(), "removed": d.removed.len(), "changed": d.changed.len(), "diff": d.render("", true) })
             };
             data.insert(field.into(), summary);
-            known.insert(field, new.to_string());
         }
         // Names for numbered sections ("aaa.3" -> "Home WiFi (5 GHz)"), so the
-        // config history can say what a change was about.
-        if let Some(cfg) = known.get("system_cfg") {
-            let mut labels = old_system.map(|o| section_labels(&o, &radios)).unwrap_or_default();
-            labels.extend(section_labels(cfg, &radios));
+        // config history can say what a change was about. Sections removed by
+        // this push are only named in the previous config.
+        if !system.is_empty() {
+            let mut labels = if previous.system_cfg.is_empty() { Default::default() } else { section_labels(&previous.system_cfg, &radios) };
+            labels.extend(section_labels(&system, &radios));
             data.insert("labels".into(), Value::Object(labels));
         }
         let cfgversion = p["cfgversion"].as_str().map(str::to_string).or_else(|| {
@@ -694,7 +717,7 @@ impl Engine {
         if let Some(d) = live.devices.get_mut(&mac) {
             d.last_config_push = Some(ts);
         }
-        live.last_config.insert(mac, (mgmt, system, cfgversion));
+        live.last_config.insert(mac, PushedConfig { mgmt_cfg: mgmt, system_cfg: system, cfgversion });
         self.emit(ev(ts, "config_pushed", Some(mac), None, Value::Object(data)));
         if let Some(summary) = dry {
             self.emit(ev(ts, "dryrun_compared", Some(mac), None, summary));
@@ -768,7 +791,6 @@ impl Engine {
         live.last_config.remove(&mac);
         live.adoption.forgetting.remove(&mac);
         live.adoption.adopting.remove(&mac);
-        self.configs.remove(&mac);
         for sql in ["DELETE FROM devices WHERE mac = ?1", "DELETE FROM managed_devices WHERE mac = ?1", "DELETE FROM device_config WHERE mac = ?1"] {
             self.writer.exec(Db::Config, sql, vec![Sql::Text(mac.to_string())]);
         }

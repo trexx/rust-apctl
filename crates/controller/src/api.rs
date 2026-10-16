@@ -1,6 +1,5 @@
 //! HTTP API and live WebSocket for the web UI.
 
-use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
@@ -357,19 +356,7 @@ async fn import_state(State(s): State<AppState>, headers: axum::http::HeaderMap,
 /// config the other controller pushed; plus the comparisons made at each push.
 async fn dryrun(State(s): State<AppState>) -> ApiResult {
     // Redacted last configs from the database, for APs not pushed to since start.
-    let stored: BTreeMap<String, (String, String, Option<String>)> = read(&s.store, Db::Config, |c| {
-        let mut stmt = c.prepare("SELECT mac, mgmt_cfg, system_cfg, cfgversion FROM device_config")?;
-        let rows = stmt
-            .query_map([], |r| {
-                Ok((
-                    r.get::<_, String>(0)?,
-                    (r.get::<_, Option<String>>(1)?.unwrap_or_default(), r.get::<_, Option<String>>(2)?.unwrap_or_default(), r.get(3)?),
-                ))
-            })?
-            .collect::<rusqlite::Result<BTreeMap<_, _>>>()?;
-        Ok(rows)
-    })
-    .await?;
+    let stored = read(&s.store, Db::Config, |c| Ok(crate::engine::stored_pushes(c)?)).await?;
     let history: Vec<Value> = read(&s.store, Db::Config, |c| {
         let mut stmt = c.prepare("SELECT ts, mac, cfgversion, matches, comparison FROM dryrun_results ORDER BY ts DESC LIMIT 100")?;
         let rows = stmt
@@ -396,7 +383,7 @@ async fn dryrun(State(s): State<AppState>) -> ApiResult {
             .map(|(mac, d)| {
                 // Prefer the unredacted config seen in this run; fall back to the stored redacted copy.
                 // Only full configs count: a management-only push says nothing about system_cfg.
-                let actual = match (live.last_config.get(mac).filter(|c| !c.1.is_empty()), stored.get(&mac.to_string()).filter(|c| !c.1.is_empty())) {
+                let actual = match (live.last_config.get(mac).filter(|c| !c.system_cfg.is_empty()), stored.get(mac).filter(|c| !c.system_cfg.is_empty())) {
                     (Some(c), _) => Some((c.clone(), false)),
                     (None, Some(c)) => Some((c.clone(), true)),
                     (None, None) => None,
@@ -434,12 +421,12 @@ async fn dryrun(State(s): State<AppState>) -> ApiResult {
                 state,
                 device_mac: &mac.to_string(),
                 inform: inform.as_deref(),
-                cfgversion: actual.2.as_deref().unwrap_or(""),
-                previous_system_cfg: Some(&actual.1),
+                cfgversion: actual.cfgversion.as_deref().unwrap_or(""),
+                previous_system_cfg: Some(&actual.system_cfg),
             };
             match renderer(&req) {
                 Ok(ours) => {
-                    let c = crate::dryrun::compare(&ours, &actual.0, &actual.1, redacted);
+                    let c = crate::dryrun::compare(&ours, &actual.mgmt_cfg, &actual.system_cfg, redacted);
                     let status = if c.mgmt_cfg.identical && c.system_cfg.identical {
                         "match"
                     } else if c.matches() {
