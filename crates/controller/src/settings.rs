@@ -156,7 +156,7 @@ pub(crate) fn array_mut<'a>(state: &'a mut Value, key: &str) -> &'a mut Vec<Valu
     }
 }
 
-/// An inform's entry for one band in its `radio_table`.
+/// An inform's (or an AP record's) entry for one band in its `radio_table`.
 pub(crate) fn inform_radio<'a>(inform: &'a Value, band: &str) -> Option<&'a Value> {
     inform["radio_table"].as_array()?.iter().find(|r| r["radio"].as_str() == Some(band))
 }
@@ -366,31 +366,38 @@ pub(crate) fn country(state: &Value) -> Option<i64> {
 /// or the band (6 GHz): nothing is restricted then, the AP's own regulatory
 /// domain decides.
 pub fn legal_channels(country: Option<i64>, band: &str, width: i64, outdoor: bool) -> Option<Vec<i64>> {
+    Some(channel_blocks(country, band, width, outdoor)?.into_iter().flatten().copied().collect())
+}
+
+/// [`legal_channels`] for one channel, without building the list: `None` when
+/// apctl has no rules for the country or the band.
+pub fn is_legal(country: Option<i64>, band: &str, width: i64, outdoor: bool, ch: i64) -> Option<bool> {
+    Some(channel_blocks(country, band, width, outdoor)?.into_iter().any(|b| b.contains(&ch)))
+}
+
+/// A fixed channel of an AP's `radio_table` entry that the country and the
+/// AP's indoor/outdoor mode do not allow at its width: `(channel, width)`.
+pub(crate) fn illegal_fixed_channel(country: Option<i64>, radio: &Value, outdoor: bool) -> Option<(i64, i64)> {
+    let ch = num(&radio["channel"])?;
+    let width = num(&radio["ht"]).unwrap_or(20);
+    (is_legal(country, radio["radio"].as_str().unwrap_or(""), width, outdoor, ch) == Some(false)).then_some((ch, width))
+}
+
+/// The legal channels of [`legal_channels`], as up to three runs of a table.
+fn channel_blocks(country: Option<i64>, band: &str, width: i64, outdoor: bool) -> Option<[&'static [i64]; 3]> {
+    const NG: [i64; 13] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13];
+    const NA_LOW: &[i64] = &[36, 40, 44, 48, 52, 56, 60, 64];
+    const NA_MID: &[i64] = &[100, 104, 108, 112, 116, 120, 124, 128, 132, 136, 140];
+    const FCC_HIGH: &[i64] = &[144, 149, 153, 157, 161, 165];
     let etsi = country.is_some_and(|c| ETSI.contains(&c));
     let fcc = country.is_some_and(|c| FCC.contains(&c));
     Some(match band {
-        "ng" if etsi => (1..=13).collect(),
-        "ng" if fcc => (1..=11).collect(),
-        "na" if etsi => {
-            let low: Vec<i64> = if outdoor { vec![] } else { vec![36, 40, 44, 48, 52, 56, 60, 64] };
-            // 140 has no partner for 40 MHz; 132-140 make no 80 MHz block.
-            let high: &[i64] = match width {
-                20 => &[100, 104, 108, 112, 116, 120, 124, 128, 132, 136, 140],
-                40 => &[100, 104, 108, 112, 116, 120, 124, 128, 132, 136],
-                _ => &[100, 104, 108, 112, 116, 120, 124, 128],
-            };
-            low.into_iter().chain(high.iter().copied()).collect()
-        }
-        "na" if fcc => {
-            let mut c = vec![36, 40, 44, 48, 52, 56, 60, 64, 100, 104, 108, 112, 116, 120, 124, 128];
-            if width <= 80 {
-                c.extend([132, 136, 140, 144, 149, 153, 157, 161]);
-            }
-            if width == 20 {
-                c.push(165);
-            }
-            c
-        }
+        "ng" if etsi => [&NG, &[], &[]],
+        "ng" if fcc => [&NG[..11], &[], &[]],
+        // 140 has no partner for 40 MHz; 132-140 make no 80 MHz block.
+        "na" if etsi => [if outdoor { &[] } else { NA_LOW }, &NA_MID[..if width == 20 { 11 } else if width == 40 { 10 } else { 8 }], &[]],
+        // 132-161 make no 160 MHz block; 165 is 20 MHz only.
+        "na" if fcc => [NA_LOW, &NA_MID[..if width <= 80 { 11 } else { 8 }], &FCC_HIGH[..if width == 20 { 6 } else if width <= 80 { 5 } else { 0 }]],
         _ => return None,
     })
 }
@@ -591,7 +598,7 @@ fn set_wlan_aps(state: &mut Value, id: &str, aps: Option<Vec<String>>) -> Result
 
 /// Removes per-SSID AP groups no SSID uses any more.
 fn prune_groups(state: &mut Value) {
-    let used: Vec<String> = state["wlanconf"].as_array().into_iter().flatten().flat_map(|w| w["ap_group_ids"].as_array().cloned().unwrap_or_default()).filter_map(|v| v.as_str().map(str::to_string)).collect();
+    let used: Vec<String> = state["wlanconf"].as_array().into_iter().flatten().flat_map(|w| w["ap_group_ids"].as_array().into_iter().flatten()).filter_map(Value::as_str).map(str::to_string).collect();
     if let Some(groups) = state["apgroup"].as_array_mut() {
         groups.retain(|g| g["for_wlanconf"].as_bool() != Some(true) || id_of(g).is_some_and(|i| used.contains(&i)));
     }
@@ -599,9 +606,8 @@ fn prune_groups(state: &mut Value) {
 
 /// The APs (lowercase MACs) an SSID is deployed to.
 fn deployed_to(state: &Value, w: &Value) -> Vec<String> {
-    let all = device_macs(state);
     match wlan_aps(state, w) {
-        None if w["ap_group_ids"].as_array().is_some_and(|a| !a.is_empty()) => all,
+        None if w["ap_group_ids"].as_array().is_some_and(|a| !a.is_empty()) => device_macs(state),
         None => Vec::new(),
         Some(macs) => macs,
     }
@@ -1131,13 +1137,21 @@ fn apply_channel_locks(state: &mut Value, released: &[String]) -> Vec<String> {
         };
         let name = d["name"].as_str().unwrap_or(&mac).to_string();
         let Some(r) = d["radio_table"].as_array_mut().and_then(|t| t.iter_mut().find(|r| r["radio"].as_str() == Some("ng"))) else { continue };
-        let same = r["channel"] == target || r["channel"].as_i64().is_some_and(|c| c.to_string() == target.as_str().unwrap_or_default());
-        if !same {
+        if !same_channel(&r["channel"], &target) {
             r["channel"] = target.clone();
             out.push(format!("AP {name}: 2.4 GHz channel {}", target.as_str().unwrap_or_default()));
         }
     }
     out
+}
+
+/// Whether two radio `channel` values are the same channel: "auto", or a
+/// number the settings may hold as a number or as a string.
+fn same_channel(a: &Value, b: &Value) -> bool {
+    match (num(a), num(b)) {
+        (Some(x), Some(y)) => x == y,
+        _ => a == b,
+    }
 }
 
 const DAY_NAMES: [&str; 7] = ["sun", "mon", "tue", "wed", "thu", "fri", "sat"];
@@ -1301,7 +1315,7 @@ pub fn apply_device(state: &mut Value, e: &DeviceEdit) -> Result<String, String>
     // Outdoor mode changes which channels are legal.
     let o = outdoor(state, &d);
     // SSIDs locking this AP's 2.4 GHz channel for IoT devices.
-    let iot_lock = docs(state, "wlanconf").any(|w| w["iot_channel_lock"].as_bool() == Some(true) && deployed_to(state, w).contains(&mac));
+    let iot_lock = channel_locked_aps(state).contains(&mac);
     for rp in p["radios"].as_array().into_iter().flatten() {
         radio_edit(state, e, rp, &before, &mut d, o, iot_lock)?;
     }
@@ -1310,11 +1324,9 @@ pub fn apply_device(state: &mut Value, e: &DeviceEdit) -> Result<String, String>
     if o != outdoor(state, &before) {
         let c = country(state);
         for r in d["radio_table"].as_array().into_iter().flatten() {
-            let (band, width) = (r["radio"].as_str().unwrap_or(""), num(&r["ht"]).unwrap_or(20));
-            if let Some(ch) = num(&r["channel"])
-                && legal_channels(c, band, width, o).is_some_and(|l| !l.contains(&ch))
-            {
-                return Err(format!("{}: channel {ch} is not allowed {} here; pick another first", band_name(band), if o { "outdoors" } else { "indoors" }));
+            if let Some((ch, _)) = illegal_fixed_channel(c, r, o) {
+                let band = band_name(r["radio"].as_str().unwrap_or(""));
+                return Err(format!("{band}: channel {ch} is not allowed {} here; pick another first", if o { "outdoors" } else { "indoors" }));
             }
         }
     }
@@ -1415,13 +1427,10 @@ fn radio_edit(state: &Value, e: &DeviceEdit, rp: &Value, before: &Value, d: &mut
         }
     }
     // A fixed channel must be legal for the (possibly new) width.
-    if let Some(ch) = num(&r["channel"]) {
-        let width = num(&r["ht"]).unwrap_or(20);
-        if legal_channels(country(state), band, width, o).is_some_and(|l| !l.contains(&ch)) {
-            return Err(format!("{label}: channel {ch} is not allowed at {width} MHz here"));
-        }
+    if let Some((ch, width)) = illegal_fixed_channel(country(state), r, o) {
+        return Err(format!("{label}: channel {ch} is not allowed at {width} MHz here"));
     }
-    if band == "ng" && iot_lock && r["channel"] != before["radio_table"].as_array().and_then(|t| t.iter().find(|x| x["radio"].as_str() == Some(band))).map_or(Value::Null, |x| x["channel"].clone()) {
+    if band == "ng" && iot_lock && !same_channel(&r["channel"], inform_radio(before, band).map_or(&Value::Null, |x| &x["channel"])) {
         return Err("the 2.4 GHz channel is locked by an SSID's IoT setting".into());
     }
     copy_fields(rp, r, &[("tx_power_mode", Enum(&["auto", "high", "medium", "low", "custom", "disabled"]))])?;
@@ -1819,6 +1828,18 @@ mod tests {
         assert_eq!((legal_channels(None, "ng", 20, false), legal_channels(Some(392), "na", 80, false), legal_channels(Some(276), "6e", 20, false)), (None, None, None));
         assert_eq!(band_channels("6e", 20).len(), 59);
         assert_eq!((band_channels("6e", 160).last(), band_channels("na", 20).last()), (Some(&221), Some(&165)));
+        assert_eq!(legal_channels(Some(840), "na", 160, false).unwrap().last(), Some(&128));
+        assert_eq!(legal_channels(Some(840), "na", 80, false).unwrap().last(), Some(&161));
+        // One channel is checked against the same rules.
+        for (c, band, width, o) in [(Some(276), "ng", 20, false), (Some(840), "ng", 40, false), (Some(276), "na", 40, true), (Some(276), "na", 80, false), (Some(840), "na", 20, false), (Some(840), "na", 160, false), (None, "na", 20, false), (Some(276), "6e", 20, false)] {
+            let list = legal_channels(c, band, width, o);
+            for ch in 1..=233 {
+                assert_eq!(is_legal(c, band, width, o, ch), list.as_ref().map(|l| l.contains(&ch)), "{c:?} {band} {width} {o} {ch}");
+            }
+        }
+        assert_eq!(illegal_fixed_channel(Some(276), &json!({ "radio": "na", "ht": "40", "channel": "140" }), false), Some((140, 40)));
+        assert_eq!(illegal_fixed_channel(Some(276), &json!({ "radio": "na", "ht": 20, "channel": 140 }), false), None);
+        assert_eq!(illegal_fixed_channel(Some(276), &json!({ "radio": "na", "channel": "auto" }), true), None);
     }
 
     fn dev(s: &mut Value, patch: Value) -> Result<String, String> {
@@ -1845,6 +1866,10 @@ mod tests {
         s["wlanconf"][0]["iot_channel_lock"] = json!(true);
         assert!(dev(&mut s, json!({ "radios": [{ "radio": "ng", "channel": 6 }] })).unwrap_err().contains("IoT"));
         dev(&mut s, json!({ "radios": [{ "radio": "ng", "tx_power_mode": "low" }] })).unwrap();
+        // The lock keeps channel 6 as "6": asking for 6 again is no change.
+        s["devices"][0]["radio_table"][0]["channel"] = json!("6");
+        dev(&mut s, json!({ "radios": [{ "radio": "ng", "channel": 6 }] })).unwrap();
+        assert!(dev(&mut s, json!({ "radios": [{ "radio": "ng", "channel": 1 }] })).unwrap_err().contains("IoT"));
     }
 
     #[test]

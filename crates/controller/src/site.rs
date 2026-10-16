@@ -9,7 +9,7 @@ use axum::http::{HeaderMap, StatusCode};
 use serde_json::{Value, json};
 
 use crate::api::{ApiError, AppState};
-use crate::settings::{COUNTRY_NAMES, PreviewQuery, band_name, country, dedup_in_order, docs_mut, legal_channels, mgmt_flag, num, outdoor_with, setting, setting_mut};
+use crate::settings::{COUNTRY_NAMES, PreviewQuery, band_name, country, dedup_in_order, docs_mut, illegal_fixed_channel, mgmt_flag, num, outdoor_with, setting, setting_mut};
 
 /// A host name or IPv4 address, as NTP and syslog targets take (the official
 /// controller refuses IPv6 there).
@@ -55,13 +55,9 @@ fn reset_illegal_channels(state: &mut Value) -> Vec<String> {
         let o = outdoor_with(d, site_outdoor);
         let name = d["name"].as_str().or(d["mac"].as_str()).unwrap_or("?").to_string();
         for r in d["radio_table"].as_array_mut().into_iter().flatten() {
-            let band = r["radio"].as_str().unwrap_or("").to_string();
-            let width = num(&r["ht"]).unwrap_or(20);
-            if let Some(ch) = num(&r["channel"])
-                && legal_channels(c, &band, width, o).is_some_and(|l| !l.contains(&ch))
-            {
+            if let Some((ch, _)) = illegal_fixed_channel(c, r, o) {
+                out.push(format!("AP {name} {} channel {ch} → auto", band_name(r["radio"].as_str().unwrap_or(""))));
                 r["channel"] = json!("auto");
-                out.push(format!("AP {name} {} channel {ch} → auto", band_name(&band)));
             }
         }
     }
