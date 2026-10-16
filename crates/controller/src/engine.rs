@@ -1086,22 +1086,23 @@ impl Engine {
 
     fn notification(&self, ts: Ts, p: &Value) {
         let Some(mac) = p["mac"].as_str().and_then(|m| m.parse::<Mac>().ok()) else { return };
-        let mut live = self.live.write().unwrap();
         bump(&self.counters.notifications);
-        if let Some(d) = live.devices.get_mut(&mac) {
+        // The live view is written for this alone, and only read (or, for an
+        // upgrade notice, written) again where the notification needs it.
+        let since_push = self.live.write().unwrap().devices.get_mut(&mac).and_then(|d| {
             d.last_seen = ts; // proof of life, but not a status report
-        }
+            d.last_config_push.map(|t| ts - t)
+        });
         match p["notif_reason"].as_str() {
             // The AP confirms it applied a pushed config.
             Some("setparam") => {
-                let since_push = live.devices.get(&mac).and_then(|d| d.last_config_push).map(|t| ts - t);
                 let data = json!({ "cfgversion": p["cfgversion"], "seconds_after_push": since_push });
                 self.emit(ev(ts, EventKind::ConfigApplied, Some(mac), None, data));
             }
             Some("event") => {
                 let n = &p["notif_payload"];
                 if n["message_type"].as_str() == Some("STA_ASSOC_TRACKER") {
-                    self.connection_event(&live, ts, mac, n);
+                    self.connection_event(ts, mac, n);
                 } else if let Some(kind) = n["event_string"].as_str() {
                     // AP events: radar (DFS), rogue APs, scan completion, process restarts...
                     let k = match kind {
@@ -1111,7 +1112,7 @@ impl Engine {
                         // "{proc} exited with code {exit_status} and restarted by {caller}"
                         "EVT_AP_RestartProc" => EventKind::ApProcessRestarted,
                         "Upgrade" => {
-                            self.upgrade_notice(&mut live, ts, mac, n);
+                            self.upgrade_notice(&mut self.live.write().unwrap(), ts, mac, n);
                             return;
                         }
                         _ => EventKind::ApEvent,
@@ -1143,22 +1144,31 @@ impl Engine {
     /// A client connection-tracking event (`STA_ASSOC_TRACKER`): association,
     /// success (with association, WPA, IP and DNS timings), soft failure,
     /// roam, leave. Durations arrive in microseconds and are stored in ms.
-    fn connection_event(&self, live: &Live, ts: Ts, ap: Mac, n: &Value) {
+    fn connection_event(&self, ts: Ts, ap: Mac, n: &Value) {
         let Some(client) = n["mac"].as_str().and_then(|m| m.parse::<Mac>().ok()) else { return };
         let num = |k: &str| n[k].as_str().and_then(|v| v.parse::<f64>().ok()).or_else(|| n[k].as_f64());
         let ms = |k: &str| num(k).map(|us| (us / 1000.0).round() as i64);
         let text = |k: &str| n[k].as_str().map(str::to_string);
         let vap = text("vap");
-        let dev = live.devices.get(&ap);
-        let vap_info = dev.and_then(|d| d.snapshot.vaps.iter().find(|v| v.name.as_deref() == vap.as_deref()));
-        let (essid, radio) = vap_info.map(|v| (v.essid.clone(), v.radio.clone())).unwrap_or((None, None));
+        // The live view is read for the VAP alone; the row is built without the lock.
+        let vap_info = {
+            let live = self.live.read().unwrap();
+            let dev = live.devices.get(&ap);
+            dev.and_then(|d| d.snapshot.vaps.iter().find(|v| v.name.as_deref() == vap.as_deref())).map(|v| {
+                let bw = dev.and_then(|d| d.snapshot.radios.iter().find(|r| Some(&r.radio) == v.radio.as_ref())).and_then(|r| r.bw);
+                (v.essid.clone(), v.radio.clone(), v.channel, bw)
+            })
+        };
         // Channel and width at the time, for the connection log and roaming views.
         let mut detail = n.clone();
-        if let Some(v) = vap_info {
-            let bw = dev.and_then(|d| d.snapshot.radios.iter().find(|r| Some(&r.radio) == v.radio.as_ref())).and_then(|r| r.bw);
-            detail["x_channel"] = json!(v.channel);
-            detail["x_bw"] = json!(bw);
-        }
+        let (essid, radio) = match vap_info {
+            Some((essid, radio, channel, bw)) => {
+                detail["x_channel"] = json!(channel);
+                detail["x_bw"] = json!(bw);
+                (essid, radio)
+            }
+            None => (None, None),
+        };
         let event_type = text("event_type").unwrap_or_default();
         self.writer.exec(
             Db::Config,
