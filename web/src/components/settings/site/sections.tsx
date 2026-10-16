@@ -1,0 +1,273 @@
+import type { SiteSettings } from "../../../api";
+import {
+  ListInput,
+  NumberInput,
+  Row,
+  Select,
+  Toggle,
+  lines,
+  onePerLine,
+} from "../form";
+import type { SettingsForm } from "../form";
+import { NTP_SERVERS } from "./form";
+import type { MgmtForm, NtpForm, SnmpForm, SyslogForm, TopForm } from "./form";
+import { randomPassword } from "./randomPassword";
+
+/** A secret typed in the editor; it is sent only when set, and never shown back. */
+interface Secret {
+  value: string;
+  set: (v: string) => void;
+}
+
+export function CountryTimezone({
+  top,
+  d,
+}: {
+  top: SettingsForm<TopForm>;
+  d: SiteSettings;
+}) {
+  const { form: f, set } = top;
+  const known = d.countries.some((c) => c.code === f.country);
+  return (
+    <>
+      <Row label="Country" hint="decides the legal channels and power">
+        <Select
+          value={f.country ?? ""}
+          onChange={(v) => v !== "" && set("country", v)}
+          options={[
+            ...(known
+              ? []
+              : [[f.country ?? "", `(code ${f.country ?? "none"})`] as const]),
+            ...d.countries.map((c) => [c.code, c.name] as const),
+          ]}
+        />
+      </Row>
+      <Row label="Time zone" hint="for schedules and the APs' clocks">
+        <Select
+          value={f.timezone}
+          onChange={(v) => set("timezone", v)}
+          options={[
+            ...(d.timezones.includes(f.timezone)
+              ? []
+              : [[f.timezone, f.timezone] as const]),
+            ...d.timezones.map((z) => [z, z] as const),
+          ]}
+        />
+      </Row>
+    </>
+  );
+}
+
+export function ApDefaults({ mgmt }: { mgmt: SettingsForm<MgmtForm> }) {
+  return (
+    <Row label="AP defaults" hint="each AP can override these">
+      <Toggle {...mgmt.bind("led_enabled")} label="LEDs on" />
+      <Toggle {...mgmt.bind("outdoor_mode_enabled")} label="Outdoor mode" />
+    </Row>
+  );
+}
+
+export function Ssh({
+  mgmt,
+  d,
+  password,
+}: {
+  mgmt: SettingsForm<MgmtForm>;
+  d: SiteSettings;
+  password: Secret;
+}) {
+  const { form: f, set, bind } = mgmt;
+  const rules = "12+ characters with upper, lower, digit and symbol, or 20+";
+  return (
+    <details>
+      <summary>SSH access to the APs</summary>
+      <Row label="SSH">
+        <Toggle {...bind("x_ssh_enabled")} label="Enabled" />
+        <Toggle
+          {...bind("x_ssh_auth_password_enabled")}
+          label="Password logins"
+        />
+      </Row>
+      <Row label="User name">
+        <input
+          className="search"
+          maxLength={32}
+          value={f.x_ssh_username}
+          onChange={(e) => set("x_ssh_username", e.target.value)}
+        />
+      </Row>
+      <Row
+        label="Password"
+        hint={
+          d.mgmt.has_ssh_password ? `leave empty to keep it; ${rules}` : rules
+        }
+      >
+        <input
+          className="search mono"
+          type="text"
+          autoComplete="off"
+          placeholder={d.mgmt.has_ssh_password ? "unchanged" : ""}
+          size={30}
+          value={password.value}
+          onChange={(e) => password.set(e.target.value)}
+        />
+        <button
+          className="btn small"
+          onClick={() => password.set(randomPassword())}
+        >
+          Generate
+        </button>
+        {password.value && (
+          <span className="muted small">
+            Store it in your password manager before saving.
+          </span>
+        )}
+      </Row>
+      <Row label="Public keys" hint="one OpenSSH key per line (RSA or Ed25519)">
+        <ListInput
+          {...bind("x_ssh_keys")}
+          rows={3}
+          parse={lines}
+          format={onePerLine}
+        />
+      </Row>
+    </details>
+  );
+}
+
+export function Logging({ syslog }: { syslog: SettingsForm<SyslogForm> }) {
+  const { form: f, set, bind } = syslog;
+  return (
+    <details>
+      <summary>Logging</summary>
+      <Row
+        label="Syslog"
+        hint="to apctl needs its syslog listener (--syslog-listen on port 5514)"
+      >
+        <Select
+          {...bind("mode")}
+          options={[
+            ["off", "Off"],
+            ["controller", "To apctl"],
+            ["server", "To a syslog server"],
+          ]}
+        />
+        {f.mode === "server" && (
+          <>
+            <input
+              className="search mono"
+              placeholder="server"
+              value={f.ip}
+              onChange={(e) => set("ip", e.target.value)}
+            />
+            <NumberInput {...bind("port")} fallback={514} min={1} max={65535} />
+          </>
+        )}
+        {f.mode !== "off" && <Toggle {...bind("debug")} label="Debug level" />}
+      </Row>
+      {f.mode === "server" && (
+        <Row label="Netconsole" hint="kernel messages, for crash debugging">
+          <Toggle {...bind("netconsole_enabled")} label="Enabled" />
+          {f.netconsole_enabled && (
+            <>
+              <input
+                className="search mono"
+                placeholder="host"
+                value={f.netconsole_host}
+                onChange={(e) => set("netconsole_host", e.target.value)}
+              />
+              <NumberInput
+                {...bind("netconsole_port")}
+                fallback={514}
+                min={1}
+                max={65535}
+              />
+            </>
+          )}
+        </Row>
+      )}
+    </details>
+  );
+}
+
+export function Snmp({
+  snmp,
+  d,
+  v3password,
+}: {
+  snmp: SettingsForm<SnmpForm>;
+  d: SiteSettings;
+  v3password: Secret;
+}) {
+  const { form: f, set, bind } = snmp;
+  return (
+    <details>
+      <summary>SNMP</summary>
+      <Row label="SNMP v1/v2c">
+        <Toggle {...bind("enabled")} label="Enabled" />
+        {f.enabled && (
+          <input
+            className="search mono"
+            placeholder="community"
+            value={f.community}
+            onChange={(e) => set("community", e.target.value)}
+          />
+        )}
+      </Row>
+      <Row label="SNMPv3" hint="on firmware that supports it">
+        <Toggle {...bind("enabledV3")} label="Enabled" />
+        {f.enabledV3 && (
+          <>
+            <input
+              className="search mono"
+              placeholder="user name"
+              maxLength={30}
+              value={f.username}
+              onChange={(e) => set("username", e.target.value)}
+            />
+            <input
+              className="search mono"
+              autoComplete="off"
+              maxLength={32}
+              placeholder={
+                d.snmp.has_v3_password
+                  ? "password unchanged"
+                  : "password (8 to 32)"
+              }
+              value={v3password.value}
+              onChange={(e) => v3password.set(e.target.value)}
+            />
+          </>
+        )}
+      </Row>
+    </details>
+  );
+}
+
+export function Ntp({ ntp }: { ntp: SettingsForm<NtpForm> }) {
+  const { form: f, set, bind } = ntp;
+  return (
+    <details>
+      <summary>Time servers</summary>
+      <Row label="NTP">
+        <Select
+          {...bind("setting_preference")}
+          options={[
+            ["auto", "Automatic"],
+            ["manual", "These servers"],
+          ]}
+        />
+        {f.setting_preference === "manual" &&
+          NTP_SERVERS.map((k, i) => (
+            <input
+              key={k}
+              className="search mono"
+              placeholder={i === 0 ? "pool.ntp.org" : ""}
+              value={f[k]}
+              onChange={(e) => set(k, e.target.value)}
+            />
+          ))}
+      </Row>
+    </details>
+  );
+}
