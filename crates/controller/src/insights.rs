@@ -1261,7 +1261,8 @@ pub struct PlanEntry {
 struct PlanAp {
     mac: String,
     name: Option<String>,
-    current: Option<Block>,
+    /// The block it is on now.
+    current: Block,
     width: i64,
     clients: i64,
     /// Channel blocks the AP lists as available (its country and width).
@@ -1323,7 +1324,7 @@ pub async fn compute_plan(s: &AppState, radio: String, dfs: bool, allowed: Optio
                         .collect();
                     (!list.is_empty()).then_some(list)
                 });
-                Some(PlanAp { mac: m.to_string(), name: d.snapshot.ap.hostname.clone(), current: Some(block(&radio, ch, width)), width, clients: r.num_sta, available })
+                Some(PlanAp { mac: m.to_string(), name: d.snapshot.ap.hostname.clone(), current: block(&radio, ch, width), width, clients: r.num_sta, available })
             })
             .collect();
         // Our APs' BSSIDs on this band, to separate own signal from neighbours.
@@ -1395,7 +1396,7 @@ fn plan_channels(
     let is_pinned: Vec<bool> = aps.iter().map(|ap| pinned.contains(&ap.mac)).collect();
     // What AP `i` would put up with on block `b`, the others placed as in `placed`
     // (its own entry there is ignored), with (weight, reason) per contribution when `why`.
-    let contributions = |i: usize, b: &Block, placed: &[Option<Block>], mut why: Option<&mut Vec<(f64, String)>>| -> f64 {
+    let contributions = |i: usize, b: &Block, placed: &[Block], mut why: Option<&mut Vec<(f64, String)>>| -> f64 {
         let mut total = 0.0;
         for h in &heard[i] {
             if overlap(b, h.lo, h.hi) {
@@ -1407,7 +1408,7 @@ fn plan_channels(
             }
         }
         for (o, ob) in placed.iter().enumerate() {
-            if o == i || !ob.is_some_and(|ob| overlap(b, ob.lo, ob.hi)) {
+            if o == i || !overlap(b, ob.lo, ob.hi) {
                 continue;
             }
             let sig = ap_signal[i][o].unwrap_or(-75.0);
@@ -1424,9 +1425,9 @@ fn plan_channels(
         }
         total
     };
-    let cost = |i: usize, b: &Block, placed: &[Option<Block>]| contributions(i, b, placed, None);
+    let cost = |i: usize, b: &Block, placed: &[Block]| contributions(i, b, placed, None);
     // The cost with the four biggest reasons, for the plan shown.
-    let explain = |i: usize, b: &Block, placed: &[Option<Block>]| -> (f64, Vec<String>) {
+    let explain = |i: usize, b: &Block, placed: &[Block]| -> (f64, Vec<String>) {
         let mut reasons = Vec::new();
         let total = contributions(i, b, placed, Some(&mut reasons));
         reasons.sort_by(|a, b| b.0.total_cmp(&a.0));
@@ -1435,13 +1436,13 @@ fn plan_channels(
     // Greedy: busiest AP first, then a second pass with everyone placed.
     let mut order: Vec<usize> = (0..n).filter(|i| !is_pinned[*i]).collect();
     order.sort_by_key(|i| -aps[*i].clients);
-    let current: Vec<Option<Block>> = aps.iter().map(|a| a.current).collect();
+    let current: Vec<Block> = aps.iter().map(|a| a.current).collect();
     let mut assigned = current.clone();
     for _ in 0..2 {
         for &i in &order {
             let best = cands[i].iter().map(|b| (cost(i, b, &assigned), *b)).min_by(|a, b| a.0.total_cmp(&b.0));
             if let Some((_, b)) = best {
-                assigned[i] = Some(b);
+                assigned[i] = b;
             }
         }
     }
@@ -1450,17 +1451,17 @@ fn plan_channels(
     let mut evict: Vec<Option<bool>> = vec![None; n];
     let mut fin = current.clone();
     for (i, ap) in aps.iter().enumerate() {
-        let (Some(cur), Some(sug)) = (ap.current, assigned[i]) else { continue };
+        let (cur, sug) = (ap.current, assigned[i]);
         if is_pinned[i] || cur.primary == sug.primary {
             continue;
         }
         let ev = !cands[i].iter().any(|b| (b.lo - cur.lo).abs() < 1.0 && (b.hi - cur.hi).abs() < 1.0);
         if ev || cost(i, &sug, &assigned) + 5.0 < cost(i, &cur, &assigned) * 0.8 {
-            fin[i] = Some(sug);
+            fin[i] = sug;
             evict[i] = Some(ev);
         }
     }
-    let total = |m: &[Option<Block>]| -> f64 { m.iter().enumerate().filter_map(|(i, b)| b.map(|b| cost(i, &b, m))).sum() };
+    let total = |m: &[Block]| -> f64 { m.iter().enumerate().map(|(i, b)| cost(i, b, m)).sum() };
     let (current_total, final_total) = (total(&current), total(&fin));
     let accepted = evict.contains(&Some(true)) || (evict.iter().any(Option::is_some) && final_total * 1.1 < current_total);
     if !accepted {
@@ -1471,20 +1472,20 @@ fn plan_channels(
         .iter()
         .enumerate()
         .map(|(i, ap)| {
-            let cur = ap.current.map(|b| explain(i, &b, &current));
+            let (cur_score, cur_reasons) = explain(i, &ap.current, &current);
             let change = evict[i].is_some();
-            let sug = fin[i].map(|b| (b.primary, explain(i, &b, &fin)));
+            let (sug_score, sug_reasons) = explain(i, &fin[i], &fin);
             PlanEntry {
                 mac: ap.mac.clone(),
                 name: ap.name.clone(),
                 width: ap.width,
                 clients: ap.clients,
-                current_channel: ap.current.map(|c| c.primary),
-                current_score: cur.as_ref().map(|c| c.0.round()),
-                current_reasons: cur.map(|c| c.1),
-                suggested_channel: sug.as_ref().map(|s| s.0),
-                suggested_score: sug.as_ref().map(|s| s.1.0.round()),
-                suggested_reasons: if change { sug.map(|s| s.1.1).unwrap_or_default() } else { vec![] },
+                current_channel: Some(ap.current.primary),
+                current_score: Some(cur_score.round()),
+                current_reasons: Some(cur_reasons),
+                suggested_channel: Some(fin[i].primary),
+                suggested_score: Some(sug_score.round()),
+                suggested_reasons: if change { sug_reasons } else { vec![] },
                 change,
                 pinned: is_pinned[i],
                 not_allowed: evict[i].unwrap_or(false),
@@ -1526,7 +1527,7 @@ mod tests {
 
     #[test]
     fn two_aps_that_hear_each_other_are_split() {
-        let ap = |mac: &str, ch: i64, clients: i64| PlanAp { mac: mac.into(), name: Some(format!("AP {mac}")), current: Some(block("ng", ch, 20)), width: 20, clients, available: None };
+        let ap = |mac: &str, ch: i64, clients: i64| PlanAp { mac: mac.into(), name: Some(format!("AP {mac}")), current: block("ng", ch, 20), width: 20, clients, available: None };
         let aps = vec![ap("a", 6, 5), ap("b", 6, 1)];
         let own = HashMap::from([("bss-a".to_string(), "a".to_string()), ("bss-b".to_string(), "b".to_string())]);
         // Each hears the other loudly, and "a" hears a neighbour on channel 1.
