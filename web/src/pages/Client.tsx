@@ -1,6 +1,5 @@
 import { useState } from "react";
 import { Link, useParams } from "react-router-dom";
-import { useMutation, useQueryClient } from "@tanstack/react-query";
 import {
   HttpError,
   displayName,
@@ -29,6 +28,7 @@ import {
   QueryState,
   Signal,
   Stat,
+  useRunner,
 } from "../components/common";
 import { ago, band, bitrate, bytes, compact, duration, phy } from "../format";
 import { serviceNames } from "../components/insights/Multicast";
@@ -262,27 +262,19 @@ function AliasHeader(p: {
   note: string | null;
   hostname: string | null;
 }) {
-  const qc = useQueryClient();
   const canEdit = useCanEdit();
   const [editing, setEditing] = useState(false);
   const [alias, setAliasText] = useState("");
   const [note, setNote] = useState("");
-  const save = useMutation({
-    mutationFn: (v: { alias: string; note: string }) =>
-      setAlias(p.mac, v.alias, v.note),
-    onSuccess: () => {
-      setEditing(false);
-      // The engine applies the change asynchronously; the live socket also refreshes.
-      window.setTimeout(() => {
-        void qc.invalidateQueries({ queryKey: keys.client(p.mac) });
-        void qc.invalidateQueries({ queryKey: keys.clients() });
-      }, 300);
-    },
-  });
+  // The engine applies the change asynchronously; the live socket also refreshes.
+  const { busy, msg, setMsg, run } = useRunner(
+    [keys.client(p.mac), keys.clients()],
+    300,
+  );
   const start = () => {
     setAliasText(p.alias ?? "");
     setNote(p.note ?? "");
-    save.reset();
+    setMsg(null);
     setEditing(true);
   };
 
@@ -292,7 +284,10 @@ function AliasHeader(p: {
         className="alias-form"
         onSubmit={(e) => {
           e.preventDefault();
-          save.mutate({ alias, note });
+          void run(async () => {
+            await setAlias(p.mac, alias, note);
+            setEditing(false);
+          });
         }}
       >
         <input
@@ -312,15 +307,13 @@ function AliasHeader(p: {
           onChange={(e) => setNote(e.target.value)}
           aria-label="Note"
         />
-        <button type="submit" className="btn primary" disabled={save.isPending}>
+        <button type="submit" className="btn primary" disabled={busy}>
           Save
         </button>
         <button type="button" className="btn" onClick={() => setEditing(false)}>
           Cancel
         </button>
-        {save.error && (
-          <span className="error small">{save.error.message}</span>
-        )}
+        {msg && !msg.ok && <span className="error small">{msg.text}</span>}
         <span className="muted small">
           Leave both empty to remove the alias.
         </span>

@@ -1,9 +1,9 @@
 import { useEffect, useRef, useState } from "react";
 import { Link, useNavigate } from "react-router-dom";
-import { useQueryClient } from "@tanstack/react-query";
 import { keys, markAlertsRead, useAlerts } from "../api";
 import type { AlertCategory, AlertItem } from "../api";
 import { clock } from "../format";
+import { useRunner } from "./common";
 
 export const CATEGORIES: [AlertCategory, string, string][] = [
   [
@@ -123,8 +123,9 @@ export function useNotifier() {
 
 /** The header bell: unread count and the latest alerts. */
 export function AlertBell() {
-  const qc = useQueryClient();
   const a = useAlerts();
+  // The server stores the change a moment later.
+  const { run } = useRunner([keys.alerts()], 800);
   const [open, setOpen] = useState(false);
   const box = useRef<HTMLDivElement>(null);
   useEffect(() => {
@@ -142,13 +143,7 @@ export function AlertBell() {
   const unread = a.data?.unread ?? 0;
   const list = a.data?.alerts ?? [];
   const openNow = list.filter((x) => x.resolved_ts === null);
-  const readAll = async () => {
-    await markAlertsRead().catch(() => undefined);
-    window.setTimeout(
-      () => void qc.invalidateQueries({ queryKey: keys.alerts() }),
-      800,
-    );
-  };
+  const readAll = () => void run(markAlertsRead);
   return (
     <div className="bell-wrap" ref={box}>
       <button

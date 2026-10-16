@@ -1,10 +1,9 @@
 import { useState } from "react";
 import { Link } from "react-router-dom";
-import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { ackThreat, keys, useCanEdit, useThreats } from "../api";
 import type { ThreatFinding } from "../api";
 import { ago, band, duration } from "../format";
-import { ErrorNote, Loading, Signal } from "./common";
+import { ErrorNote, Loading, Signal, useRunner } from "./common";
 
 const KIND_LABEL: Record<ThreatFinding["kind"], string> = {
   spoofed_bssid: "Cloned AP address",
@@ -17,21 +16,15 @@ const KIND_LABEL: Record<ThreatFinding["kind"], string> = {
 const SEVERITY_LABEL = { high: "High", medium: "Medium", low: "Low" };
 
 function Finding({ f, readOnly }: { f: ThreatFinding; readOnly: boolean }) {
-  const qc = useQueryClient();
   const [noting, setNoting] = useState(false);
   const [note, setNote] = useState("");
-  const ack = useMutation({
-    mutationFn: (v: { ack: boolean; note?: string }) =>
-      ackThreat(f.kind, f.bssid, v.ack, v.note),
-    onSuccess: () => {
+  // The engine writes asynchronously: refresh once it has.
+  const { busy, msg, run } = useRunner([keys.threats()], 1500);
+  const ack = (on: boolean, why?: string) =>
+    void run(async () => {
+      await ackThreat(f.kind, f.bssid, on, why);
       setNoting(false);
-      // The engine writes asynchronously: refresh once it has.
-      setTimeout(
-        () => void qc.invalidateQueries({ queryKey: keys.threats() }),
-        1500,
-      );
-    },
-  });
+    });
   return (
     <div className={`threat threat-${f.acknowledged ? "acked" : f.severity}`}>
       <div className="threat-head">
@@ -83,8 +76,8 @@ function Finding({ f, readOnly }: { f: ThreatFinding; readOnly: boolean }) {
           {!readOnly && (
             <button
               className="btn small"
-              disabled={ack.isPending}
-              onClick={() => ack.mutate({ ack: false })}
+              disabled={busy}
+              onClick={() => ack(false)}
             >
               Undo
             </button>
@@ -97,7 +90,7 @@ function Finding({ f, readOnly }: { f: ThreatFinding; readOnly: boolean }) {
             className="threat-ack"
             onSubmit={(e) => {
               e.preventDefault();
-              ack.mutate({ ack: true, note });
+              ack(true, note);
             }}
           >
             <input
@@ -108,11 +101,7 @@ function Finding({ f, readOnly }: { f: ThreatFinding; readOnly: boolean }) {
               value={note}
               onChange={(e) => setNote(e.target.value)}
             />
-            <button
-              className="btn small primary"
-              type="submit"
-              disabled={ack.isPending}
-            >
+            <button className="btn small primary" type="submit" disabled={busy}>
               Dismiss
             </button>
             <button
@@ -131,7 +120,7 @@ function Finding({ f, readOnly }: { f: ThreatFinding; readOnly: boolean }) {
           </div>
         ))
       )}
-      {ack.error && <ErrorNote error={ack.error} />}
+      {msg && !msg.ok && <ErrorNote error={msg.text} />}
     </div>
   );
 }
