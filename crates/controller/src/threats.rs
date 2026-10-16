@@ -439,7 +439,8 @@ pub fn gather(store: &Store, live: &SharedLive, now: Ts) -> anyhow::Result<Asses
             }
             own.entry(bssid.clone()).or_insert_with(|| OwnBss { bssid: bssid.clone(), ap_mac: ap.clone(), essid: essid.clone(), channel: None, changed_at: 0 });
         }
-        let mut by_radio = HashMap::new();
+        // Read only when a BSSID's last change has to be worked out again.
+        let mut history: Option<History> = None;
         for b in own.values_mut() {
             if let Some(e) = &b.essid {
                 a.ssids.insert(e.clone());
@@ -449,7 +450,11 @@ pub fn gather(store: &Store, live: &SharedLive, now: Ts) -> anyhow::Result<Asses
             b.changed_at = match cache.changes.get(&b.bssid) {
                 Some(ch) if ch.of == key && (0..CACHE_SECS).contains(&(now - ch.at)) => ch.changed_at,
                 _ => {
-                    let changed_at = last_change(c, b, key.1.as_deref(), &mut by_radio)?;
+                    let h = match &mut history {
+                        Some(h) => h,
+                        None => history.insert(History::load(c)?),
+                    };
+                    let changed_at = h.last_change(b, key.1.as_deref());
                     cache.changes.insert(b.bssid.clone(), Change { of: key, at: now, changed_at });
                     changed_at
                 }
@@ -483,11 +488,13 @@ pub fn gather(store: &Store, live: &SharedLive, now: Ts) -> anyhow::Result<Asses
             .collect::<rusqlite::Result<_>>()?;
         a.watching_since = c.query_row("SELECT MIN(first_seen) FROM neighbors", [], |r| r.get::<_, Option<Ts>>(0)).optional()?.flatten().unwrap_or(now);
         let mut stmt = c.prepare("SELECT kind, bssid, note, ts FROM network_acks")?;
-        for (k, b, n, t) in stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get(2)?, r.get(3)?)))?.flatten() {
+        for row in stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get(2)?, r.get(3)?)))? {
+            let (k, b, n, t) = row?;
             a.acks.insert((k, b), (n, t));
         }
         let mut stmt = c.prepare("SELECT kind, bssid, first_reported FROM network_threats")?;
-        for (k, b, t) in stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get(2)?)))?.flatten() {
+        for row in stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get(2)?)))? {
+            let (k, b, t) = row?;
             a.reported.insert((k, b), t);
         }
         Ok(crate::connections::Names::load(c)?)
@@ -505,63 +512,79 @@ pub fn gather(store: &Store, live: &SharedLive, now: Ts) -> anyhow::Result<Asses
     Ok(a)
 }
 
-/// BSSIDs our APs used in the last 30 days, with their AP and latest name. The
-/// five-minute tier covers all but the last few minutes, which come from the
-/// raw one (the roll-up runs every five minutes, on complete buckets).
+/// BSSIDs our APs used in the last 30 days, with their AP and latest name.
+/// The hourly tier covers all but the last hour or so (the roll-ups run every
+/// five minutes, on complete buckets), the five-minute tier the last two
+/// hours and the raw one the last twenty minutes; the finest tier's name wins.
 fn used_bssids(c: &Connection, now: Ts) -> rusqlite::Result<Vec<(String, String, Option<String>)>> {
     let mut out: BTreeMap<String, (String, Option<String>)> = BTreeMap::new();
-    for (suffix, since) in [("", now - 20 * 60), ("_5m", now - 30 * 86400)] {
+    // A rolled-up row carries its bucket's start: the hour holding `now - 30 days` counts too.
+    for (suffix, since) in [("", now - 20 * 60), ("_5m", now - 2 * 3600), ("_1h", now - 30 * 86400 - 3599)] {
         let mut stmt = c.prepare(&format!("SELECT bssid, ap_mac, essid, MAX(ts) FROM vap_stats{suffix} WHERE ts >= ?1 GROUP BY bssid"))?;
-        let rows = stmt.query_map([since], |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?, r.get::<_, Option<String>>(2)?)))?;
-        for (bssid, ap, essid) in rows.flatten() {
+        for row in stmt.query_map([since], |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?, r.get::<_, Option<String>>(2)?)))? {
+            let (bssid, ap, essid) = row?;
             out.entry(bssid).or_insert((ap.unwrap_or_default(), essid));
         }
     }
     Ok(out.into_iter().map(|(b, (ap, e))| (b, ap, e)).collect())
 }
 
-/// When this BSSID's radio last ran another channel, or the BSSID another name.
-/// The radio's channel history is read once for all the networks on it.
-fn last_change(c: &Connection, b: &OwnBss, radio: Option<&str>, by_radio: &mut HashMap<(String, String, i64), Ts>) -> rusqlite::Result<Ts> {
-    let mut latest: Ts = 0;
-    if let Some(ch) = b.channel {
-        let cached = radio.and_then(|r| by_radio.get(&(b.ap_mac.clone(), r.to_string(), ch)).copied());
-        let t = match cached {
-            Some(t) => t,
-            None => {
-                let mut t: Ts = 0;
-                for suffix in ["", "_5m"] {
-                    let found: Option<Ts> = match radio {
-                        Some(r) => c
-                            .prepare_cached(&format!("SELECT MAX(ts) FROM radio_stats{suffix} WHERE mac = ?1 AND radio = ?2 AND channel IS NOT NULL AND channel != ?3"))?
-                            .query_row(rusqlite::params![b.ap_mac, r, ch], |r| r.get(0))?,
-                        // Not reporting its radio: the radios its BSSID was on.
-                        None => c
-                            .prepare_cached(&format!(
-                                "SELECT MAX(r.ts) FROM radio_stats{suffix} r JOIN (SELECT DISTINCT radio FROM vap_stats{suffix} WHERE bssid = ?1) v ON r.radio = v.radio \
-                                 WHERE r.mac = ?2 AND r.channel IS NOT NULL AND r.channel != ?3"
-                            ))?
-                            .query_row(rusqlite::params![b.bssid, b.ap_mac, ch], |r| r.get(0))?,
-                    };
-                    t = t.max(found.unwrap_or(0));
+/// When each radio last ran each channel, and each BSSID had each name (and
+/// the radios it was on), from the raw and five-minute tiers: one grouped
+/// query per table and tier, for all of our BSSIDs.
+#[derive(Default)]
+struct History {
+    /// (AP, radio) -> (channel, when last on it); a five-minute row's channel is its bucket's average.
+    channels: HashMap<(String, String), Vec<(f64, Ts)>>,
+    /// BSSID -> (name, when it last had it)
+    names: HashMap<String, Vec<(String, Ts)>>,
+    /// BSSID -> the radios it was on
+    radios: HashMap<String, HashSet<String>>,
+}
+
+impl History {
+    fn load(c: &Connection) -> rusqlite::Result<History> {
+        let mut h = History::default();
+        for suffix in ["", "_5m"] {
+            let sql = format!("SELECT mac, radio, channel, MAX(ts) FROM radio_stats{suffix} WHERE channel IS NOT NULL GROUP BY mac, radio, channel");
+            for row in c.prepare(&sql)?.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, f64>(2)?, r.get::<_, Ts>(3)?)))? {
+                let (mac, radio, ch, ts) = row?;
+                h.channels.entry((mac, radio)).or_default().push((ch, ts));
+            }
+            let sql = format!("SELECT bssid, essid, radio, MAX(ts) FROM vap_stats{suffix} GROUP BY bssid, essid, radio");
+            for row in c.prepare(&sql)?.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?, r.get::<_, Option<String>>(2)?, r.get::<_, Ts>(3)?)))? {
+                let (bssid, essid, radio, ts) = row?;
+                if let Some(e) = essid {
+                    h.names.entry(bssid.clone()).or_default().push((e, ts));
                 }
                 if let Some(r) = radio {
-                    by_radio.insert((b.ap_mac.clone(), r.to_string(), ch), t);
+                    h.radios.entry(bssid).or_default().insert(r);
                 }
-                t
             }
-        };
-        latest = latest.max(t);
-    }
-    if let Some(e) = &b.essid {
-        for suffix in ["", "_5m"] {
-            let t: Option<Ts> = c
-                .prepare_cached(&format!("SELECT MAX(ts) FROM vap_stats{suffix} WHERE bssid = ?1 AND essid IS NOT NULL AND essid != ?2"))?
-                .query_row(rusqlite::params![b.bssid, e], |r| r.get(0))?;
-            latest = latest.max(t.unwrap_or(0));
         }
+        Ok(h)
     }
-    Ok(latest)
+
+    /// When this BSSID's radio last ran another channel, or the BSSID had
+    /// another name. Without its radio: the radios the BSSID was on.
+    fn last_change(&self, b: &OwnBss, radio: Option<&str>) -> Ts {
+        let mut latest: Ts = 0;
+        if let Some(ch) = b.channel {
+            let radios: Vec<&str> = match radio {
+                Some(r) => vec![r],
+                None => self.radios.get(&b.bssid).into_iter().flatten().map(String::as_str).collect(),
+            };
+            for r in radios {
+                let other = self.channels.get(&(b.ap_mac.clone(), r.to_string())).into_iter().flatten().filter(|(c, _)| *c != ch as f64);
+                latest = latest.max(other.map(|(_, t)| *t).max().unwrap_or(0));
+            }
+        }
+        if let Some(e) = &b.essid {
+            let other = self.names.get(&b.bssid).into_iter().flatten().filter(|(n, _)| n != e);
+            latest = latest.max(other.map(|(_, t)| *t).max().unwrap_or(0));
+        }
+        latest
+    }
 }
 
 async fn findings(s: &AppState) -> Result<(Vec<Finding>, Ts), ApiError> {
@@ -581,11 +604,12 @@ pub async fn list(State(s): State<AppState>) -> Result<Json<Value>, ApiError> {
     let items: Vec<Value> = list
         .iter()
         .map(|f| {
-            let mut j = serde_json::to_value(f).unwrap_or_default();
+            let mut j = serde_json::to_value(f)?;
             j["vendor"] = json!(s.vendors.lookup_str(&f.bssid));
-            j
+            Ok(j)
         })
-        .collect();
+        .collect::<serde_json::Result<_>>()
+        .map_err(|e| ApiError::internal(e.to_string()))?;
     Ok(Json(json!({ "watching_since": watching_since, "findings": items })))
 }
 
@@ -786,6 +810,48 @@ mod tests {
         a.watching_since = a.now - 86400;
         a.heard.push(n);
         assert!(kinds(&a).is_empty());
+    }
+
+    #[test]
+    fn our_bssids_and_their_changes_come_from_every_tier() {
+        let dir = std::env::temp_dir().join(format!("apctl-threats-{}-{}", std::process::id(), store::now_ts()));
+        let (store, _writer) = Store::open(&dir).unwrap();
+        let c = Connection::open(dir.join("metrics.db")).unwrap();
+        let now = 1_000_000_000;
+        let vap = |suffix: &str, bssid: &str, ts: Ts, essid: &str, radio: &str| {
+            let sql = format!("INSERT INTO vap_stats{suffix} (bssid, ts, ap_mac, essid, radio) VALUES (?1, ?2, ?3, ?4, ?5)");
+            c.execute(&sql, rusqlite::params![bssid, ts, UP, essid, radio]).unwrap();
+        };
+        // Last heard 20 days ago (hourly tier only); an hour ago, renamed since; just now.
+        vap("_1h", "02:00:00:00:00:01", now - 20 * 86400, "Old", "ng");
+        vap("_1h", "02:00:00:00:00:02", now - 86400, "Home", "na");
+        vap("_5m", "02:00:00:00:00:02", now - 3600, "Home", "na");
+        vap("", "02:00:00:00:00:02", now - 60, "Home 2", "na");
+        vap("", "02:00:00:00:00:03", now - 60, "IoT", "ng");
+        // Too old for any tier's window.
+        vap("_1h", "02:00:00:00:00:04", now - 31 * 86400 - 3600, "Gone", "ng");
+        let radio = |suffix: &str, ts: Ts, radio: &str, ch: f64| {
+            let sql = format!("INSERT INTO radio_stats{suffix} (mac, radio, ts, channel) VALUES (?1, ?2, ?3, ?4)");
+            c.execute(&sql, rusqlite::params![UP, radio, ts, ch]).unwrap();
+        };
+        radio("_5m", now - 7200, "na", 40.0); // a bucket that saw a move from 36 to 44
+        radio("_5m", now - 3600, "na", 44.0);
+        radio("", now - 60, "na", 44.0);
+        radio("_5m", now - 600, "ng", 6.0);
+        radio("", now - 120, "ng", 1.0);
+        let (used, h) = store.read(Db::Metrics, |c| Ok((used_bssids(c, now)?, History::load(c)?))).unwrap();
+        let names: Vec<(&str, Option<&str>)> = used.iter().map(|(b, _, e)| (b.as_str(), e.as_deref())).collect();
+        assert_eq!(names, [("02:00:00:00:00:01", Some("Old")), ("02:00:00:00:00:02", Some("Home 2")), ("02:00:00:00:00:03", Some("IoT"))]);
+        let own = |bssid: &str, essid: &str, channel: i64| OwnBss { bssid: bssid.into(), ap_mac: UP.into(), essid: Some(essid.into()), channel: Some(channel), changed_at: 0 };
+        // Called "Home" an hour ago, and on channel 44 since the averaged bucket before.
+        assert_eq!(h.last_change(&own("02:00:00:00:00:02", "Home", 44), Some("na")), now - 60, "the rename");
+        assert_eq!(h.last_change(&own("02:00:00:00:00:02", "Home 2", 44), Some("na")), now - 3600);
+        assert_eq!(h.last_change(&own("02:00:00:00:00:02", "Home 2", 36), Some("na")), now - 60);
+        // Without its radio: the radios the BSSID was on.
+        assert_eq!(h.last_change(&own("02:00:00:00:00:03", "IoT", 6), None), now - 120);
+        assert_eq!(h.last_change(&own("02:00:00:00:00:03", "IoT", 1), Some("ng")), now - 600);
+        assert_eq!(h.last_change(&own("02:00:00:00:00:01", "Old", 6), None), 0, "only in the hourly tier");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
