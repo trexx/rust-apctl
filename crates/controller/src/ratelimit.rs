@@ -123,7 +123,7 @@ mod tests {
             "clients": clients,
         })));
         let sample = crate::model::ClientSample { mac: C.parse().unwrap(), ap_mac: AP1.parse().unwrap(), essid: Some("Home".into()), ..Default::default() };
-        live.clients.insert(C.parse().unwrap(), ClientView { sample, connected: true, first_seen: 0, last_seen: 0 });
+        live.clients.insert(C.parse().unwrap(), ClientView { sample: std::sync::Arc::new(sample), connected: true, first_seen: 0, last_seen: 0 });
         live
     }
 
@@ -142,7 +142,7 @@ mod tests {
         assert_eq!((cmds[0]["cmd"].as_str(), cmds[0]["dl_max"].as_i64(), cmds[0]["ul_max"].as_i64(), cmds[0]["mac"].as_str()), (Some("rate-update"), Some(2000), Some(500), Some(C)));
         tick(&mut live, &mut sent);
         assert!(sent_to(&mut live, AP1).is_empty(), "not repeated");
-        live.clients.get_mut(&C.parse().unwrap()).unwrap().sample.ap_mac = AP2.parse().unwrap();
+        std::sync::Arc::make_mut(&mut live.clients.get_mut(&C.parse().unwrap()).unwrap().sample).ap_mac = AP2.parse().unwrap();
         tick(&mut live, &mut sent);
         assert_eq!(sent_to(&mut live, AP2).len(), 1, "the new AP gets it");
     }
