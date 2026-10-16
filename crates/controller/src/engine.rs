@@ -346,6 +346,9 @@ pub struct Engine {
     /// Per AP: the second its stored syslog lines were last announced, and
     /// whether more came in that second (see `log`).
     logs_announced: HashMap<Option<Mac>, (Ts, bool)>,
+    /// The clients connected in the live view, so the tick need not walk the
+    /// year of clients it keeps.
+    connected: std::collections::BTreeSet<Mac>,
     /// Where alert-worthy events go: the alert watcher's own channel.
     alerts: Option<crate::alerts::Sink>,
 }
@@ -359,7 +362,7 @@ impl Engine {
         Engine {
             writer, keys, renderer: None, live, counters, tx, radios: HashMap::new(), mcast_prev: HashMap::new(), bss_prev: HashMap::new(),
             logevents: Default::default(), isolated: HashMap::new(), last_prune: 0, written: Default::default(), syslog_unknown: HashMap::new(),
-            logs_announced: HashMap::new(), alerts: None,
+            logs_announced: HashMap::new(), connected: Default::default(), alerts: None,
         }
     }
 
@@ -426,6 +429,9 @@ impl Engine {
         for (mac, hostname, ip, first_seen, last_seen, ap_mac, bssid, essid, radio, connected) in clients {
             let (Ok(mac), Some(Ok(ap_mac))) = (mac.parse::<Mac>(), ap_mac.map(|a| a.parse::<Mac>())) else { continue };
             let sample = Arc::new(ClientSample { mac, ap_mac, bssid: bssid.unwrap_or_default(), essid, radio, hostname, ip, ..Default::default() });
+            if connected {
+                self.connected.insert(mac);
+            }
             live.clients.insert(mac, ClientView { sample, connected, first_seen: first_seen.unwrap_or(0), last_seen: last_seen.unwrap_or(0) });
         }
         if let Some((json, at)) = state {
@@ -672,6 +678,7 @@ impl Engine {
     fn update_clients(&mut self, live: &mut Live, ts: Ts, clients: &[Arc<ClientSample>]) {
         use std::collections::btree_map::Entry;
         for c in clients {
+            self.connected.insert(c.mac);
             // One lookup for the event, whether the row changed, and the update.
             let (event, changed) = match live.clients.entry(c.mac) {
                 Entry::Occupied(mut e) => {
@@ -910,11 +917,14 @@ impl Engine {
         live.firmware.remove(&mac);
         // Its clients are gone with it, rather than left connected until they go stale.
         let mut events = Vec::new();
-        for (cmac, c) in live.clients.iter_mut().filter(|(_, c)| c.connected && c.sample.ap_mac == mac) {
+        let clients = &mut live.clients;
+        self.connected.retain(|cmac| {
+            let Some(c) = clients.get_mut(cmac).filter(|c| c.sample.ap_mac == mac) else { return true };
             c.connected = false;
             events.push(disconnected_event(ts, *cmac, c, "ap_forgotten"));
             self.writer.exec(Db::Config, "UPDATE clients SET connected = 0 WHERE mac = ?1", vec![Sql::Text(cmac.to_string())]);
-        }
+            false
+        });
         drop(live);
         let had_clients = !events.is_empty();
         for e in events {
@@ -1269,39 +1279,26 @@ impl Engine {
         }
         // A client is gone when its AP has reported a full client list since it was
         // last seen and the grace period has passed, or when its AP went offline.
-        let ap_last_full: HashMap<Mac, (Ts, bool)> = live
-            .devices
-            .iter()
-            .map(|(m, d)| (*m, (d.last_full_inform, d.online)))
-            .collect();
+        // Only the connected ones are looked at, not the year of clients kept.
         let mut changed = false;
-        for (cmac, c) in live.clients.iter_mut() {
-            if !c.connected {
-                continue;
-            }
+        let Live { devices, clients, .. } = &mut *live;
+        self.connected.retain(|cmac| {
+            let Some(c) = clients.get_mut(cmac).filter(|c| c.connected) else { return false };
             // An AP we have not heard from yet in this run (e.g. right after a
             // restart) is unknown, not offline: leave its clients alone.
-            let (ap_seen, ap_online, ap_known) = match ap_last_full.get(&c.sample.ap_mac) {
-                Some(&(seen, online)) => (seen, online, true),
-                None => (0, true, false),
-            };
-            let reason = if !ap_known {
+            let reason = match devices.get(&c.sample.ap_mac) {
                 // Its AP never reappeared (e.g. removed): give up after an hour.
-                (now - c.last_seen > 3600).then_some("stale")
-            } else if !ap_online {
-                Some("ap_offline")
-            } else if now - c.last_seen > CLIENT_GRACE_SECS && ap_seen > c.last_seen {
-                Some("not_seen")
-            } else {
-                None
+                None => (now - c.last_seen > 3600).then_some("stale"),
+                Some(d) if !d.online => Some("ap_offline"),
+                Some(d) => (now - c.last_seen > CLIENT_GRACE_SECS && d.last_full_inform > c.last_seen).then_some("not_seen"),
             };
-            if let Some(reason) = reason {
-                c.connected = false;
-                changed = true;
-                events.push(disconnected_event(now, *cmac, c, reason));
-                self.writer.exec(Db::Config, "UPDATE clients SET connected = 0 WHERE mac = ?1", vec![Sql::Text(cmac.to_string())]);
-            }
-        }
+            let Some(reason) = reason else { return true };
+            c.connected = false;
+            changed = true;
+            events.push(disconnected_event(now, *cmac, c, reason));
+            self.writer.exec(Db::Config, "UPDATE clients SET connected = 0 WHERE mac = ?1", vec![Sql::Text(cmac.to_string())]);
+            false
+        });
         for e in events {
             self.emit(e);
         }
