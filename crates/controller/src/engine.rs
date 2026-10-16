@@ -444,6 +444,8 @@ pub struct Engine {
     connected: std::collections::BTreeSet<Mac>,
     /// Where alert-worthy events go: the alert watcher's own channel.
     alerts: Option<crate::alerts::Sink>,
+    /// The time of this run's first tick (the capture's time in shadow mode).
+    first_tick: Option<Ts>,
 }
 
 /// How long a syslog hash_id no key opened is left untried.
@@ -455,7 +457,7 @@ impl Engine {
         Engine {
             writer, keys, renderer: None, live, counters, tx, radios: HashMap::new(), mcast_prev: HashMap::new(), bss_prev: HashMap::new(),
             logevents: Default::default(), isolated: HashMap::new(), last_prune: 0, written: Default::default(), syslog_unknown: HashMap::new(),
-            syslog_ciphers: Default::default(), logs_announced: HashMap::new(), connected: Default::default(), alerts: None,
+            syslog_ciphers: Default::default(), logs_announced: HashMap::new(), connected: Default::default(), alerts: None, first_tick: None,
         }
     }
 
@@ -1375,6 +1377,7 @@ impl Engine {
         // last seen and the grace period has passed, or when its AP went offline.
         // Only the connected ones are looked at, not the year of clients kept.
         let mut changed = false;
+        let started = *self.first_tick.get_or_insert(now);
         let Live { devices, clients, .. } = &mut *live;
         self.connected.retain(|cmac| {
             let Some(c) = clients.get_mut(cmac).filter(|c| c.connected) else { return false };
@@ -1382,7 +1385,9 @@ impl Engine {
             // restart) is unknown, not offline: leave its clients alone.
             let reason = match devices.get(&c.sample.ap_mac) {
                 // Its AP never reappeared (e.g. removed): give up after an hour.
-                None => (now - c.last_seen > 3600).then_some("stale"),
+                // Counted from this run's start too: after a long outage the
+                // APs get time to inform before their clients are written off.
+                None => (now - c.last_seen.max(started) > 3600).then_some("stale"),
                 Some(d) if !d.online => Some("ap_offline"),
                 Some(d) => (now - c.last_seen > CLIENT_GRACE_SECS && d.last_full_inform > c.last_seen).then_some("not_seen"),
             };
@@ -1833,6 +1838,31 @@ mod tests {
             .filter_map(|m| match m { LiveMsg::Event(ev) => Some(ev.kind), _ => None })
             .collect();
         assert!(kinds.is_empty(), "{kinds:?}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_long_outage_gives_the_aps_time_to_inform() {
+        let dir = std::env::temp_dir().join(format!("apctl-outage-{}-{}", std::process::id(), rand_suffix()));
+        {
+            let (_store, writer) = store::Store::open(&dir).unwrap();
+            let (tx, _rx) = broadcast::channel(1024);
+            let mut e = Engine::new(writer.clone(), Default::default(), Default::default(), tx);
+            e.handle(Input::Inform { ts: 0, peer: "x".into(), decoded: decoded(inform(AP1, 1000, &[(C1, "b1")])) });
+            assert!(writer.flush(std::time::Duration::from_secs(5)));
+        }
+        // Back after two hours: the first tick comes before the AP's first inform.
+        let (store, writer) = store::Store::open(&dir).unwrap();
+        let (tx, mut rx) = broadcast::channel(1024);
+        let mut e = Engine::new(writer, Default::default(), Default::default(), tx);
+        e.restore(&store).unwrap();
+        let mut kinds = || std::iter::from_fn(|| rx.try_recv().ok()).filter_map(|m| match m { LiveMsg::Event(ev) => Some(ev.kind), _ => None }).collect::<Vec<_>>();
+        e.handle(Input::Tick(7200));
+        e.handle(Input::Tick(7200 + 3600));
+        assert_eq!(kinds(), Vec::new(), "the client is left alone for the AP's first hour back");
+        // An AP that never informs again: its clients go an hour into the run.
+        e.handle(Input::Tick(7200 + 3601));
+        assert_eq!(kinds(), [EventKind::ClientDisconnected]);
         std::fs::remove_dir_all(&dir).ok();
     }
 
