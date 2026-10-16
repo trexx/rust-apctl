@@ -47,6 +47,9 @@ pub struct Table {
     pub keys: &'static [&'static str],
     /// Context that may change over time (e.g. which AP a client is on). Roll-ups keep the latest.
     pub texts: &'static [&'static str],
+    /// Numbers that are settings, not measurements (e.g. the channel). Roll-ups
+    /// keep the latest too: an average of channels 36 and 149 means nothing.
+    pub settings: &'static [&'static str],
     /// Instantaneous values. Roll-ups average them.
     pub gauges: &'static [&'static str],
     /// Monotonic counters (bytes, packets). Stored raw, returned as per-second rates.
@@ -58,7 +61,7 @@ impl Table {
         let mut cols: Vec<String> = self.keys.iter().map(|k| format!("{k} TEXT NOT NULL")).collect();
         cols.push("ts INTEGER NOT NULL".into());
         cols.extend(self.texts.iter().map(|c| format!("{c} TEXT")));
-        cols.extend(self.gauges.iter().chain(self.counters).map(|c| format!("{c} REAL")));
+        cols.extend(self.numbers().map(|c| format!("{c} REAL")));
         let pk: Vec<&str> = self.keys.iter().copied().chain(["ts"]).collect();
         format!(
             "CREATE TABLE IF NOT EXISTS {}{suffix} ({}, PRIMARY KEY ({})) WITHOUT ROWID;\n\
@@ -71,8 +74,18 @@ impl Table {
         )
     }
 
+    /// The numeric columns, in column order.
+    fn numbers(&self) -> impl Iterator<Item = &'static str> {
+        self.settings.iter().chain(self.gauges).chain(self.counters).copied()
+    }
+
+    /// Every column, in the order a metric row's values come in.
+    fn columns(&self) -> Vec<&'static str> {
+        self.keys.iter().copied().chain(["ts"]).chain(self.texts.iter().copied()).chain(self.numbers()).collect()
+    }
+
     fn insert_sql(&self) -> String {
-        let cols: Vec<&str> = self.keys.iter().copied().chain(["ts"]).chain(self.texts.iter().chain(self.gauges).chain(self.counters).copied()).collect();
+        let cols = self.columns();
         let marks = vec!["?"; cols.len()].join(", ");
         format!("INSERT OR REPLACE INTO {} ({}) VALUES ({marks})", self.name, cols.join(", "))
     }
@@ -85,16 +98,16 @@ impl Table {
     }
 
     /// Aggregates `from` rows into `step`-second buckets of `to`. Gauges are
-    /// averaged; counters and texts take the bucket's last value. SQLite gives
-    /// bare columns the values of the row holding the single `MAX(ts)`.
+    /// averaged; counters, settings and texts take the bucket's last value.
+    /// SQLite gives bare columns the values of the row holding the single `MAX(ts)`.
     fn rollup_sql(&self, from: &str, to: &str, step: i64) -> String {
         let keys = self.keys.join(", ");
         let mut select: Vec<String> = self.keys.iter().map(|k| k.to_string()).collect();
         select.push(format!("(ts / {step}) * {step}"));
-        select.extend(self.texts.iter().map(|c| c.to_string()));
+        select.extend(self.texts.iter().chain(self.settings).map(|c| c.to_string()));
         select.extend(self.gauges.iter().map(|g| format!("AVG({g})")));
         select.extend(self.counters.iter().map(|c| c.to_string()));
-        let cols: Vec<&str> = self.keys.iter().copied().chain(["ts"]).chain(self.texts.iter().chain(self.gauges).chain(self.counters).copied()).collect();
+        let cols = self.columns();
         // Wrap so the trailing MAX(ts) helper column is dropped.
         let inner_cols: Vec<String> = cols.iter().enumerate().map(|(i, _)| format!("c{i}")).collect();
         let aliased: Vec<String> = select.iter().enumerate().map(|(i, s)| format!("{s} AS c{i}")).collect();
@@ -112,6 +125,7 @@ pub const AP: Table = Table {
     name: "ap_stats",
     keys: &["mac"],
     texts: &[],
+    settings: &[],
     gauges: &["cpu", "mem", "load1", "load5", "load15", "mem_used", "mem_total", "uptime", "satisfaction", "num_sta"],
     counters: &[],
 };
@@ -119,6 +133,7 @@ pub const UPLINK: Table = Table {
     name: "uplink_stats",
     keys: &["mac"],
     texts: &[],
+    settings: &[],
     gauges: &["speed"],
     counters: &["rx_bytes", "tx_bytes", "rx_packets", "tx_packets", "rx_errors", "tx_errors", "rx_dropped", "tx_dropped"],
 };
@@ -126,13 +141,15 @@ pub const RADIO: Table = Table {
     name: "radio_stats",
     keys: &["mac", "radio"],
     texts: &[],
-    gauges: &["channel", "bw", "tx_power", "cu_total", "cu_self_rx", "cu_self_tx", "cu_interf", "noise_floor", "num_sta"],
+    settings: &["channel", "bw", "tx_power"],
+    gauges: &["cu_total", "cu_self_rx", "cu_self_tx", "cu_interf", "noise_floor", "num_sta"],
     counters: &["tx_packets", "tx_retries"],
 };
 pub const VAP: Table = Table {
     name: "vap_stats",
     keys: &["bssid"],
     texts: &["ap_mac", "essid", "radio"],
+    settings: &[],
     gauges: &["num_sta", "ccq", "satisfaction", "avg_client_signal", "latency_avg"],
     counters: &[
         "rx_bytes", "tx_bytes", "rx_packets", "tx_packets", "tx_retries", "tx_dropped", "tx_mcast", "rx_mcast", "wifi_tx_attempts", "wifi_tx_dropped", "tx_bcast",
@@ -143,7 +160,8 @@ pub const CLIENT: Table = Table {
     name: "client_stats",
     keys: &["mac"],
     texts: &["ap_mac", "bssid", "essid", "radio"],
-    gauges: &["rssi", "signal", "noise", "tx_rate", "rx_rate", "satisfaction", "latency_avg", "channel"],
+    settings: &["channel"],
+    gauges: &["rssi", "signal", "noise", "tx_rate", "rx_rate", "satisfaction", "latency_avg"],
     counters: &["tx_bytes", "rx_bytes", "tx_packets", "rx_packets", "tx_retries", "mcast_tx_pkts", "mcast_rx_pkts", "mcast_tx_bytes", "mcast_rx_bytes"],
 };
 /// Multicast and broadcast per AP and traffic type, as rates: `tx` delivered
@@ -153,6 +171,7 @@ pub const MCAST: Table = Table {
     name: "mcast_stats",
     keys: &["mac", "type"],
     texts: &[],
+    settings: &[],
     gauges: &["tx_pps", "rx_pps", "tx_bytes_ps", "rx_bytes_ps", "clients"],
     counters: &[],
 };
@@ -293,9 +312,9 @@ fn migrate(dir: &Path) -> Result<()> {
                 .prepare(&format!("SELECT name FROM pragma_table_info('{name}')"))?
                 .query_map([], |r| r.get(0))?
                 .collect::<rusqlite::Result<_>>()?;
-            for c in t.texts.iter().chain(t.gauges).chain(t.counters) {
+            for c in t.texts.iter().copied().chain(t.numbers()) {
                 if !existing.iter().any(|e| e == c) {
-                    let ty = if t.texts.contains(c) { "TEXT" } else { "REAL" };
+                    let ty = if t.texts.contains(&c) { "TEXT" } else { "REAL" };
                     metrics.execute_batch(&format!("ALTER TABLE {name} ADD COLUMN {c} {ty}"))?;
                 }
             }
@@ -306,7 +325,7 @@ fn migrate(dir: &Path) -> Result<()> {
 
 /// A write for the writer thread.
 pub enum Write {
-    /// One metric row; values in the table's column order (keys, texts, gauges, counters).
+    /// One metric row; values in the table's column order (keys, texts, settings, gauges, counters).
     Metric { table: &'static Table, ts: Ts, values: Vec<Value> },
     /// Arbitrary statement against one database.
     Exec { db: Db, sql: &'static str, params: Vec<Value> },
@@ -625,7 +644,7 @@ pub fn tier_for(from: Ts, to: Ts, now: Ts) -> usize {
 
 pub fn series(conn: &Connection, table: &Table, keys: &[String], from: Ts, to: Ts, tier: usize) -> Result<Series> {
     let (suffix, step, _) = TIERS[tier];
-    let fields: Vec<&str> = table.gauges.iter().chain(table.counters).copied().collect();
+    let fields: Vec<&str> = table.numbers().collect();
     let where_keys: Vec<String> = table.keys.iter().enumerate().map(|(i, k)| format!("{k} = ?{}", i + 3)).collect();
     // One row before `from`, so the first counter rate in range can be computed.
     let sql = format!(
@@ -646,7 +665,8 @@ pub fn series(conn: &Connection, table: &Table, keys: &[String], from: Ts, to: T
         })?
         .collect::<rusqlite::Result<_>>()?;
 
-    let n_gauges = table.gauges.len();
+    // Settings and gauges are returned as stored, counters as rates.
+    let n_gauges = table.settings.len() + table.gauges.len();
     let mut ts_out = Vec::with_capacity(rows.len());
     // One column per field, in `fields` order; named at the end.
     let mut columns: Vec<Vec<Option<f64>>> = vec![Vec::with_capacity(rows.len()); fields.len()];
@@ -737,6 +757,30 @@ mod tests {
         maintenance(&mut conns, now + ROLLUP_GRACE_SECS);
         let m = &conns[Db::Metrics as usize];
         assert_eq!(series(m, &UPLINK, &["bb".into()], now - 3600, now, 1).unwrap().ts.len(), 4);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn roll_ups_keep_the_latest_setting_and_average_the_measurements() {
+        let dir = temp_dir("settings");
+        std::fs::create_dir_all(&dir).unwrap();
+        migrate(&dir).unwrap();
+        let mut conns = open_all(&dir).unwrap();
+        let now = 1_800_000_000 + 1800;
+        // One five-minute bucket: channel 36 at 40% busy, then a move to 149 at 20%.
+        let writes = (0..30)
+            .map(|i| {
+                let (channel, busy) = if i < 15 { (36.0, 40.0) } else { (149.0, 20.0) };
+                let mut values = vec![Value::Text("aa".into()), Value::Text("na".into()), Value::Real(channel), Value::Real(80.0), Value::Real(20.0), Value::Real(busy)];
+                values.extend(std::iter::repeat_n(Value::Null, RADIO.columns().len() - 1 - values.len()));
+                Write::Metric { table: &RADIO, ts: now - 600 + i * 10, values }
+            })
+            .collect();
+        apply(&mut conns[Db::Metrics as usize], writes).unwrap();
+        maintenance(&mut conns, now + ROLLUP_GRACE_SECS);
+        let five = series(&conns[Db::Metrics as usize], &RADIO, &["aa".into(), "na".into()], now - 600, now, 1).unwrap();
+        assert_eq!(five.ts, vec![now - 600]);
+        assert_eq!((five.fields["channel"][0], five.fields["bw"][0], five.fields["cu_total"][0]), (Some(149.0), Some(80.0), Some(30.0)));
         std::fs::remove_dir_all(&dir).ok();
     }
 
