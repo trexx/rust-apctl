@@ -329,8 +329,17 @@ async fn serve(args: ServeArgs) -> Result<()> {
     let app = api::router(state);
     let listener = tokio::net::TcpListener::bind(listen).await.with_context(|| format!("binding {listen}"))?;
     tracing::info!("web UI and API on http://{listen}");
-    axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>()).with_graceful_shutdown(shutdown()).await?;
+    axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>()).with_graceful_shutdown(shutdown(writer.clone())).await?;
+    flush_writes(writer).await;
     Ok(())
+}
+
+/// Commits the writes still queued (they are batched about once a second).
+async fn flush_writes(writer: store::Writer) {
+    let flushed = tokio::task::spawn_blocking(move || writer.flush(Duration::from_secs(5))).await.unwrap_or(false);
+    if !flushed {
+        tracing::warn!("pending writes could not be committed before exit");
+    }
 }
 
 fn debug_syslog(pcap: &str, keys: &str, port: u16) -> Result<()> {
@@ -362,8 +371,8 @@ fn debug_syslog(pcap: &str, keys: &str, port: u16) -> Result<()> {
 
 /// Resolves on Ctrl-C or SIGTERM (what Kubernetes sends). Open WebSockets would
 /// keep a graceful shutdown waiting forever, so the process exits after a short
-/// grace period regardless.
-async fn shutdown() {
+/// grace period regardless, once the queued writes are committed.
+async fn shutdown(writer: store::Writer) {
     let term = async {
         match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
             Ok(mut s) => {
@@ -377,8 +386,9 @@ async fn shutdown() {
         _ = term => {}
     }
     tracing::info!("shutting down");
-    tokio::spawn(async {
+    tokio::spawn(async move {
         tokio::time::sleep(Duration::from_secs(3)).await;
+        flush_writes(writer).await;
         std::process::exit(0);
     });
 }

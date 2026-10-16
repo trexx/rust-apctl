@@ -43,7 +43,7 @@ pub struct AppState {
 pub fn router(state: AppState) -> Router {
     let public = Router::new()
         // For Kubernetes probes: no login, no data.
-        .route("/healthz", get(|| async { "ok" }))
+        .route("/healthz", get(healthz))
         .route("/api/login", axum::routing::post(crate::auth::login))
         .route("/api/logout", axum::routing::post(crate::auth::logout))
         .route("/api/me", get(crate::auth::me));
@@ -172,6 +172,14 @@ async fn status(State(s): State<AppState>) -> ApiResult {
         "devices_online": live.devices.values().filter(|d| d.online).count(),
         "clients_connected": live.clients.values().filter(|c| c.connected).count(),
     })))
+}
+
+/// For Kubernetes probes. Fails once nothing can be stored any more.
+async fn healthz(State(s): State<AppState>) -> Response {
+    if s.writer.as_ref().is_some_and(|w| w.stopped()) {
+        return (StatusCode::SERVICE_UNAVAILABLE, "database writer stopped").into_response();
+    }
+    "ok".into_response()
 }
 
 /// APs in the database, as views shaped like a live one but offline: shown

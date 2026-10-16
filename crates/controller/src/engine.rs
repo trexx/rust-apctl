@@ -232,11 +232,13 @@ pub struct Engine {
     logevents: crate::logevents::LogEvents,
     /// When each AP was last reported isolated.
     isolated: HashMap<Mac, Ts>,
+    /// When long-gone clients were last dropped from the live view.
+    last_prune: Ts,
 }
 
 impl Engine {
     pub fn new(writer: Writer, keys: Arc<KeyStore>, live: SharedLive, tx: broadcast::Sender<LiveMsg>) -> Self {
-        Engine { writer, keys, renderer: None, live, tx, configs: HashMap::new(), radios: HashMap::new(), mcast_prev: HashMap::new(), bss_prev: HashMap::new(), logevents: Default::default(), isolated: HashMap::new() }
+        Engine { writer, keys, renderer: None, live, tx, configs: HashMap::new(), radios: HashMap::new(), mcast_prev: HashMap::new(), bss_prev: HashMap::new(), logevents: Default::default(), isolated: HashMap::new(), last_prune: 0 }
     }
 
     /// Enables dry-run comparisons of every captured config push.
@@ -725,6 +727,10 @@ impl Engine {
     fn forget(&mut self, mac: Mac) {
         let mut live = self.live.write().unwrap();
         live.devices.remove(&mac);
+        // Also what was restored from the database, or it could still be reported offline.
+        live.known_devices.remove(&mac);
+        live.by_hash_id.retain(|_, m| *m != mac);
+        live.by_ip.retain(|_, m| *m != mac);
         live.raw_informs.remove(&mac);
         live.last_config.remove(&mac);
         live.adoption.forgetting.remove(&mac);
@@ -1072,6 +1078,15 @@ impl Engine {
         }
         for e in events {
             self.emit(&mut live, e);
+        }
+        // Clients gone longer than the database keeps them (see `store::maintenance`).
+        if now - self.last_prune >= 3600 {
+            self.last_prune = now;
+            let cutoff = now - store::CLIENT_RETENTION;
+            let Live { clients, aliases, .. } = &mut *live;
+            let before = clients.len();
+            clients.retain(|mac, c| c.last_seen >= cutoff || aliases.contains_key(mac));
+            changed |= clients.len() != before;
         }
         drop(live);
         for mac in offline {

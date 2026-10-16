@@ -9,10 +9,11 @@
 //! so no two writers ever contend. Readers use a small pool of read-only
 //! connections, which WAL mode lets run alongside the writer.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
+use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -74,6 +75,15 @@ impl Table {
         let cols: Vec<&str> = self.keys.iter().copied().chain(["ts"]).chain(self.texts.iter().chain(self.gauges).chain(self.counters).copied()).collect();
         let marks = vec!["?"; cols.len()].join(", ");
         format!("INSERT OR REPLACE INTO {} ({}) VALUES ({marks})", self.name, cols.join(", "))
+    }
+
+    /// The insert statement, built once per table (the writer runs it for every metric row).
+    fn insert(&'static self) -> std::borrow::Cow<'static, str> {
+        static INSERTS: LazyLock<HashMap<&'static str, String>> = LazyLock::new(|| TABLES.iter().map(|t| (t.name, t.insert_sql())).collect());
+        match INSERTS.get(self.name) {
+            Some(sql) => sql.as_str().into(),
+            None => self.insert_sql().into(),
+        }
     }
 
     /// Aggregates `from` rows into `step`-second buckets of `to`. Gauges are
@@ -186,6 +196,7 @@ CREATE TABLE IF NOT EXISTS alerts (
     id TEXT PRIMARY KEY, ts INTEGER NOT NULL, key TEXT NOT NULL, category TEXT NOT NULL, severity TEXT NOT NULL, entity TEXT NOT NULL,
     title TEXT NOT NULL, message TEXT NOT NULL, link TEXT, tag TEXT NOT NULL, resolved_ts INTEGER, read INTEGER NOT NULL DEFAULT 0);
 CREATE INDEX IF NOT EXISTS alerts_ts ON alerts (ts);
+CREATE INDEX IF NOT EXISTS alerts_unread ON alerts (read) WHERE read = 0;
 CREATE TABLE IF NOT EXISTS network_acks (
     kind TEXT NOT NULL, bssid TEXT NOT NULL, note TEXT, ts INTEGER NOT NULL, PRIMARY KEY (kind, bssid)) WITHOUT ROWID;
 CREATE TABLE IF NOT EXISTS network_threats (
@@ -231,6 +242,12 @@ END;
 ";
 
 const LOG_RETENTION: i64 = 14 * 86400;
+/// Clients not seen for this long are forgotten, unless they have a name (an
+/// alias). The same rule as a backup's history trim; the engine drops them
+/// from its live view too.
+pub const CLIENT_RETENTION: Ts = 365 * 86400;
+/// Resolved alerts are kept this long; open ones until they resolve.
+const ALERT_RETENTION: Ts = 90 * 86400;
 
 fn open_rw(path: &Path) -> Result<Connection> {
     let conn = Connection::open(path).with_context(|| format!("opening {}", path.display()))?;
@@ -290,19 +307,38 @@ pub enum Write {
     Metric { table: &'static Table, ts: Ts, values: Vec<Value> },
     /// Arbitrary statement against one database.
     Exec { db: Db, sql: &'static str, params: Vec<Value> },
+    /// Commit everything queued so far, then answer.
+    Flush(Sender<()>),
 }
 
 #[derive(Clone)]
-pub struct Writer(Sender<Write>);
+pub struct Writer {
+    tx: Sender<Write>,
+    /// Set when the writer thread has stopped: nothing sent is stored any more.
+    stopped: Arc<AtomicBool>,
+}
 
 impl Writer {
     pub fn send(&self, w: Write) {
-        // The writer only stops when the process exits.
-        let _ = self.0.send(w);
+        // Fails only once the writer has stopped, which `stopped` reports.
+        let _ = self.tx.send(w);
     }
 
     pub fn exec(&self, db: Db, sql: &'static str, params: Vec<Value>) {
         self.send(Write::Exec { db, sql, params });
+    }
+
+    /// Commits the writes queued so far, waiting at most `timeout`. False if
+    /// they could not be committed in time (or the writer has stopped).
+    pub fn flush(&self, timeout: Duration) -> bool {
+        let (ack, done) = channel();
+        self.tx.send(Write::Flush(ack)).is_ok() && done.recv_timeout(timeout).is_ok()
+    }
+
+    /// True once the writer thread has stopped (an error opening or writing the
+    /// databases, or a panic): the process can no longer store anything.
+    pub fn stopped(&self) -> bool {
+        self.stopped.load(Ordering::Relaxed)
     }
 }
 
@@ -317,16 +353,26 @@ impl Store {
         std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
         migrate(dir)?;
         let (tx, rx) = channel();
+        let stopped = Arc::new(AtomicBool::new(false));
         let writer_dir = dir.to_path_buf();
+        let flag = stopped.clone();
         std::thread::Builder::new()
             .name("sqlite-writer".into())
             .spawn(move || {
+                // Raised however the thread ends, a panic included.
+                struct Stopped(Arc<AtomicBool>);
+                impl Drop for Stopped {
+                    fn drop(&mut self) {
+                        self.0.store(true, Ordering::Relaxed);
+                    }
+                }
+                let _stopped = Stopped(flag);
                 if let Err(e) = writer_loop(&writer_dir, rx) {
-                    tracing::error!("sqlite writer stopped: {e:#}");
+                    tracing::error!("sqlite writer stopped, nothing more will be stored: {e:#}");
                 }
             })?;
         let store = Store { dir: dir.to_path_buf(), pools: Default::default() };
-        Ok((std::sync::Arc::new(store), Writer(tx)))
+        Ok((std::sync::Arc::new(store), Writer { tx, stopped }))
     }
 
     /// Runs `f` with a pooled read-only connection. Call from a blocking context.
@@ -346,16 +392,25 @@ impl Store {
     }
 }
 
+/// The writer's connections, indexed by `Db as usize`.
+type Conns = [Connection; 3];
+
+fn open_all(dir: &Path) -> Result<Conns> {
+    Ok([open_rw(&dir.join(Db::Config.file()))?, open_rw(&dir.join(Db::Metrics.file()))?, open_rw(&dir.join(Db::Logs.file()))?])
+}
+
+/// The channel to the writer stays unbounded: the engine and the request
+/// handlers must never block on the disk, and the writer drains a second's
+/// worth of writes per commit, far more than the APs produce.
 fn writer_loop(dir: &Path, rx: Receiver<Write>) -> Result<()> {
-    let mut conns: BTreeMap<u8, Connection> = BTreeMap::new();
-    for db in [Db::Config, Db::Metrics, Db::Logs] {
-        conns.insert(db as u8, open_rw(&dir.join(db.file()))?);
-    }
+    let mut conns = open_all(dir)?;
     let mut pending: Vec<Write> = Vec::new();
+    let mut acks: Vec<Sender<()>> = Vec::new();
     let mut last_flush = Instant::now();
     let mut last_maintenance = Instant::now() - Duration::from_secs(240);
     loop {
         match rx.recv_timeout(Duration::from_millis(250)) {
+            Ok(Write::Flush(ack)) => acks.push(ack),
             Ok(w) => pending.push(w),
             Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => {
@@ -363,53 +418,75 @@ fn writer_loop(dir: &Path, rx: Receiver<Write>) -> Result<()> {
                 return Ok(());
             }
         }
-        if !pending.is_empty() && (last_flush.elapsed() >= Duration::from_secs(1) || pending.len() >= 5000) {
+        if !acks.is_empty() || (!pending.is_empty() && (last_flush.elapsed() >= Duration::from_secs(1) || pending.len() >= 5000)) {
             flush(&mut conns, &mut pending);
             last_flush = Instant::now();
+            for ack in acks.drain(..) {
+                let _ = ack.send(());
+            }
         }
         if last_maintenance.elapsed() >= Duration::from_secs(300) {
             flush(&mut conns, &mut pending);
-            let now = now_ts();
-            if let Err(e) = maintenance(&mut conns, now) {
-                tracing::warn!("roll-up/retention failed: {e:#}");
-            }
+            maintenance(&mut conns, now_ts());
             last_maintenance = Instant::now();
         }
     }
 }
 
-fn flush(conns: &mut BTreeMap<u8, Connection>, pending: &mut Vec<Write>) {
-    let mut by_db: BTreeMap<u8, Vec<Write>> = BTreeMap::new();
+fn flush(conns: &mut Conns, pending: &mut Vec<Write>) {
+    let mut by_db: [Vec<Write>; 3] = Default::default();
     for w in pending.drain(..) {
         let db = match &w {
             Write::Metric { .. } => Db::Metrics,
             Write::Exec { db, .. } => *db,
+            Write::Flush(_) => continue,
         };
-        by_db.entry(db as u8).or_default().push(w);
+        by_db[db as usize].push(w);
     }
-    for (db, writes) in by_db {
-        let conn = conns.get_mut(&db).expect("all databases open");
+    for (conn, writes) in conns.iter_mut().zip(by_db) {
+        if writes.is_empty() {
+            continue;
+        }
         if let Err(e) = apply(conn, writes) {
             tracing::error!("write batch failed: {e:#}");
         }
     }
 }
 
+/// Commits a batch in one transaction. A write that fails (e.g. a constraint)
+/// is logged and skipped; SQLite undoes just that statement, so the rest of
+/// the batch is still stored. Only an error that ends the transaction itself
+/// (disk full, I/O) loses the batch.
 fn apply(conn: &mut Connection, writes: Vec<Write>) -> Result<()> {
     let tx = conn.transaction()?;
+    let (mut failed, mut first_error) = (0, None);
     for w in writes {
-        match w {
+        let result = match &w {
             Write::Metric { table, ts, values } => {
                 let n_keys = table.keys.len();
-                let params = values[..n_keys].iter().cloned().chain([Value::Integer(ts)]).chain(values[n_keys..].iter().cloned());
-                tx.prepare_cached(&table.insert_sql())?.execute(params_from_iter(params))?;
+                let ts = Value::Integer(*ts);
+                let params = values[..n_keys].iter().chain([&ts]).chain(&values[n_keys..]);
+                tx.prepare_cached(&table.insert()).and_then(|mut s| s.execute(params_from_iter(params)))
             }
-            Write::Exec { sql, params, .. } => {
-                tx.prepare_cached(sql)?.execute(params_from_iter(params))?;
+            Write::Exec { sql, params, .. } => tx.prepare_cached(sql).and_then(|mut s| s.execute(params_from_iter(params))),
+            Write::Flush(_) => continue,
+        };
+        if let Err(e) = result {
+            if tx.is_autocommit() {
+                return Err(anyhow::Error::from(e).context("the transaction was rolled back"));
             }
+            failed += 1;
+            first_error.get_or_insert_with(|| match &w {
+                Write::Metric { table, .. } => format!("{}: {e}", table.name),
+                Write::Exec { sql, .. } => format!("{}: {e}", sql.split_whitespace().take(4).collect::<Vec<_>>().join(" ")),
+                Write::Flush(_) => e.to_string(),
+            });
         }
     }
     tx.commit()?;
+    if let Some(e) = first_error {
+        tracing::error!("{failed} write(s) failed and were skipped, the first: {e}");
+    }
     Ok(())
 }
 
@@ -418,37 +495,63 @@ pub fn now_ts() -> Ts {
 }
 
 /// Rolls complete buckets up into the coarser tiers, then applies retention.
-fn maintenance(conns: &mut BTreeMap<u8, Connection>, now: Ts) -> Result<()> {
-    let metrics = conns.get_mut(&(Db::Metrics as u8)).unwrap();
+/// Each step runs on its own: one that fails is logged and the rest still run.
+///
+/// Both go by the wall clock. A capture replayed from the past writes raw rows
+/// that are older than the roll-up's progress mark (or than the raw tier's
+/// retention), so they are never rolled up; the raw tier still shows them
+/// while they are kept.
+fn maintenance(conns: &mut Conns, now: Ts) {
+    let step = |what: &str, result: Result<()>| {
+        if let Err(e) = result {
+            tracing::warn!("{what} failed: {e:#}");
+        }
+    };
+    let [config, metrics, logs] = conns;
     for t in TABLES {
         for w in TIERS.windows(2) {
-            let ((src_suffix, ..), (dst_suffix, step, _)) = (w[0], w[1]);
+            let ((src_suffix, _, src_keep), (dst_suffix, step_secs, _)) = (w[0], w[1]);
             let (src, dst) = (format!("{}{src_suffix}", t.name), format!("{}{dst_suffix}", t.name));
-            let state_key = format!("rollup:{dst}");
-            let done = read_state(metrics, &state_key);
-            // Only complete buckets, and never further back than the source keeps.
-            let upto = (now / step) * step;
-            let start = done.max(now - TIERS.iter().find(|x| x.0 == src_suffix).unwrap().2);
-            if upto <= start {
-                continue;
-            }
-            let tx = metrics.transaction()?;
-            tx.execute(&t.rollup_sql(&src, &dst, step), [start, upto])?;
-            write_state(&tx, &state_key, upto)?;
-            tx.commit()?;
+            step(&format!("rolling up {dst}"), rollup(metrics, t, &src, &dst, step_secs, src_keep, now));
         }
         for (suffix, _, keep) in TIERS {
-            delete_before(metrics, &format!("{}{suffix}", t.name), now - keep)?;
+            let table = format!("{}{suffix}", t.name);
+            step(&format!("retention of {table}"), delete_before(metrics, &table, now - keep));
         }
     }
-    let logs = conns.get_mut(&(Db::Logs as u8)).unwrap();
-    delete_before(logs, "logs", now - LOG_RETENTION)?;
-    let config = conns.get_mut(&(Db::Config as u8)).unwrap();
-    delete_before(config, "events", now - 365 * 86400)?;
-    config.execute("DELETE FROM sessions WHERE expires < ?1", [now])?;
-    delete_before(config, "dryrun_results", now - 90 * 86400)?;
-    delete_before(config, "connections", now - 90 * 86400)?;
-    config.execute("DELETE FROM neighbors WHERE last_seen < ?1", [now - 30 * 86400])?;
+    step("retention of logs", delete_before(logs, "logs", now - LOG_RETENTION));
+    step("retention of events", delete_before(config, "events", now - 365 * 86400));
+    step("expiring sessions", config.execute("DELETE FROM sessions WHERE expires < ?1", [now]).map(drop).map_err(Into::into));
+    step("retention of dry runs", delete_before(config, "dryrun_results", now - 90 * 86400));
+    step("retention of connections", delete_before(config, "connections", now - 90 * 86400));
+    step("retention of neighbours", config.execute("DELETE FROM neighbors WHERE last_seen < ?1", [now - 30 * 86400]).map(drop).map_err(Into::into));
+    step(
+        "retention of clients",
+        config
+            .execute("DELETE FROM clients WHERE COALESCE(last_seen, 0) < ?1 AND mac NOT IN (SELECT mac FROM client_aliases)", [now - CLIENT_RETENTION])
+            .map(drop)
+            .map_err(Into::into),
+    );
+    step(
+        "retention of alerts",
+        config.execute("DELETE FROM alerts WHERE ts < ?1 AND resolved_ts < ?1", [now - ALERT_RETENTION]).map(drop).map_err(Into::into),
+    );
+}
+
+/// Rolls the complete `step`-second buckets of `src` not done yet into `dst`.
+fn rollup(metrics: &mut Connection, t: &Table, src: &str, dst: &str, step: i64, src_keep: i64, now: Ts) -> Result<()> {
+    let state_key = format!("rollup:{dst}");
+    let done = read_state(metrics, &state_key);
+    // Only complete buckets, and never further back than the source keeps.
+    let upto = (now / step) * step;
+    let start = done.max(now - src_keep);
+    if upto <= start {
+        return Ok(());
+    }
+    let tx = metrics.transaction()?;
+    tx.execute(&t.rollup_sql(src, dst, step), [start, upto])?;
+    write_state(&tx, &state_key, upto)?;
+    tx.commit()?;
     Ok(())
 }
 
@@ -487,7 +590,7 @@ pub struct Series {
 
 /// Picks the finest tier that covers the range and keeps the point count sensible.
 pub fn tier_for(from: Ts, to: Ts, now: Ts) -> usize {
-    let span = to - from;
+    let span = to.saturating_sub(from);
     if span <= 6 * 3600 && from >= now - TIERS[0].2 {
         0
     } else if span <= 8 * 86400 && from >= now - TIERS[1].2 {
@@ -563,10 +666,7 @@ mod tests {
         let dir = temp_dir("store");
         std::fs::create_dir_all(&dir).unwrap();
         migrate(&dir).unwrap();
-        let mut conns: BTreeMap<u8, Connection> = BTreeMap::new();
-        for db in [Db::Config, Db::Metrics, Db::Logs] {
-            conns.insert(db as u8, open_rw(&dir.join(db.file())).unwrap());
-        }
+        let mut conns = open_all(&dir).unwrap();
         let now = 1_800_000_000 + 1800; // half past an hour
         // 10 minutes of uplink samples every 10 s: 1000 bytes/s, counter reset half-way.
         let mut writes = Vec::new();
@@ -578,9 +678,9 @@ mod tests {
             values.extend(std::iter::repeat_n(Value::Null, UPLINK.counters.len() - 1));
             writes.push(Write::Metric { table: &UPLINK, ts, values });
         }
-        apply(conns.get_mut(&(Db::Metrics as u8)).unwrap(), writes).unwrap();
+        apply(&mut conns[Db::Metrics as usize], writes).unwrap();
 
-        let m = conns.get(&(Db::Metrics as u8)).unwrap();
+        let m = &conns[Db::Metrics as usize];
         let s = series(m, &UPLINK, &["aa".into()], now - 1200, now, 0).unwrap();
         assert_eq!(s.ts.len(), 60);
         let rx = &s.fields["rx_bytes"];
@@ -596,10 +696,10 @@ mod tests {
             values.extend(std::iter::repeat_n(Value::Null, UPLINK.counters.len() - 1));
             writes.push(Write::Metric { table: &UPLINK, ts: now - 1200 + i * 10, values });
         }
-        apply(conns.get_mut(&(Db::Metrics as u8)).unwrap(), writes).unwrap();
+        apply(&mut conns[Db::Metrics as usize], writes).unwrap();
 
-        maintenance(&mut conns, now).unwrap();
-        let m = conns.get(&(Db::Metrics as u8)).unwrap();
+        maintenance(&mut conns, now);
+        let m = &conns[Db::Metrics as usize];
         let five = series(m, &UPLINK, &["bb".into()], now - 3600, now, 1).unwrap();
         assert_eq!(five.step, 300);
         assert_eq!(five.ts, vec![now - 1200, now - 900, now - 600, now - 300]);
@@ -607,9 +707,67 @@ mod tests {
         // Rates from the counters' last value in consecutive buckets.
         assert_eq!(five.fields["rx_bytes"], vec![None, Some(1000.0), Some(1000.0), Some(1000.0)]);
         // Running maintenance again is idempotent and does not redo finished buckets.
-        maintenance(&mut conns, now).unwrap();
-        let m = conns.get(&(Db::Metrics as u8)).unwrap();
+        maintenance(&mut conns, now);
+        let m = &conns[Db::Metrics as usize];
         assert_eq!(series(m, &UPLINK, &["bb".into()], now - 3600, now, 1).unwrap().ts.len(), 4);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_failing_write_does_not_lose_the_rest_of_the_batch() {
+        let dir = temp_dir("skip");
+        std::fs::create_dir_all(&dir).unwrap();
+        migrate(&dir).unwrap();
+        let mut conns = open_all(&dir).unwrap();
+        let alias = |mac: &str| Write::Exec {
+            db: Db::Config,
+            sql: "INSERT INTO client_aliases (mac, alias, updated) VALUES (?1, 'x', 1)",
+            params: vec![Value::Text(mac.into())],
+        };
+        // The second write breaks the primary key.
+        apply(&mut conns[Db::Config as usize], vec![alias("a"), alias("a"), alias("b")]).unwrap();
+        let n: i64 = conns[Db::Config as usize].query_row("SELECT COUNT(*) FROM client_aliases", [], |r| r.get(0)).unwrap();
+        assert_eq!(n, 2);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn retention_keeps_named_clients_and_open_alerts() {
+        let dir = temp_dir("retention");
+        std::fs::create_dir_all(&dir).unwrap();
+        migrate(&dir).unwrap();
+        let mut conns = open_all(&dir).unwrap();
+        let now = 1_800_000_000;
+        let (old, recent) = (now - CLIENT_RETENTION - 10, now - 10);
+        conns[Db::Config as usize]
+            .execute_batch(&format!(
+                "INSERT INTO clients (mac, last_seen) VALUES ('gone', {old}), ('named', {old}), ('recent', {recent});
+                 INSERT INTO client_aliases (mac, alias, updated) VALUES ('named', 'n', 0);
+                 INSERT INTO alerts (id, ts, key, category, severity, entity, title, message, tag, resolved_ts)
+                   VALUES ('done', {old}, 'k', 'c', 's', 'e', 't', 'm', 't', {old}), ('open', {old}, 'k', 'c', 's', 'e', 't', 'm', 't', NULL),
+                          ('new', {recent}, 'k', 'c', 's', 'e', 't', 'm', 't', {recent});"
+            ))
+            .unwrap();
+        // A roll-up that fails (here: a missing table) must not stop the retention.
+        conns[Db::Metrics as usize].execute_batch("DROP TABLE ap_stats_5m").unwrap();
+        maintenance(&mut conns, now);
+        let ids = |sql: &str| -> Vec<String> {
+            conns[Db::Config as usize].prepare(sql).unwrap().query_map([], |r| r.get(0)).unwrap().collect::<rusqlite::Result<_>>().unwrap()
+        };
+        assert_eq!(ids("SELECT mac FROM clients ORDER BY mac"), ["named", "recent"]);
+        assert_eq!(ids("SELECT id FROM alerts ORDER BY id"), ["new", "open"]);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn flush_commits_before_answering() {
+        let dir = temp_dir("flush");
+        let (store, writer) = Store::open(&dir).unwrap();
+        writer.exec(Db::Config, "INSERT INTO client_aliases (mac, alias, updated) VALUES ('a', 'x', 1)", vec![]);
+        assert!(writer.flush(Duration::from_secs(5)));
+        let n: i64 = store.read(Db::Config, |c| Ok(c.query_row("SELECT COUNT(*) FROM client_aliases", [], |r| r.get(0))?)).unwrap();
+        assert_eq!(n, 1, "committed well before the usual one-second batch");
+        assert!(!writer.stopped());
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -620,5 +778,6 @@ mod tests {
         assert_eq!(tier_for(now - 3 * 86400, now, now), 1);
         assert_eq!(tier_for(now - 90 * 86400, now, now), 2);
         assert_eq!(tier_for(now - 40 * 86400, now - 39 * 86400, now), 2, "old data is only kept hourly");
+        assert_eq!(tier_for(i64::MIN, i64::MAX, now), 2, "no overflow");
     }
 }
