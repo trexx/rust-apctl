@@ -201,7 +201,8 @@ impl Alerts {
         if let Some(n) = note {
             a.message = n;
         }
-        self.writer.exec(Db::Config, "UPDATE alerts SET resolved_ts = ?2 WHERE id = ?1", vec![Sql::Text(a.id.clone()), Sql::Integer(now)]);
+        // The message too: after a reload the alert reads as the live view said ("Back after 12 min").
+        self.writer.exec(Db::Config, "UPDATE alerts SET resolved_ts = ?2, message = ?3 WHERE id = ?1", vec![Sql::Text(a.id.clone()), Sql::Integer(now), Sql::Text(a.message.clone())]);
         let _ = self.tx.send(LiveMsg::Alert(AlertMsg { action: "resolved", alert: a.clone() }));
         Some(a)
     }
@@ -814,6 +815,10 @@ mod tests {
         assert!(told(&mut rx).is_empty(), "cleared only when nobody fails");
         w.judge_connections(1180, 0);
         assert_eq!(told(&mut rx), [("resolved", "connect_failures".to_string())]);
+        // Stored as the live view showed it.
+        assert!(w.book.writer.flush(std::time::Duration::from_secs(5)));
+        let stored: String = w.store.read(Db::Config, |c| Ok(c.query_row("SELECT message FROM alerts WHERE resolved_ts = 1180", [], |r| r.get(0))?)).unwrap();
+        assert_eq!(stored, "Clients are connecting again.");
         // Not again within the cooldown.
         w.judge_connections(1240, 9);
         assert!(told(&mut rx).is_empty());
