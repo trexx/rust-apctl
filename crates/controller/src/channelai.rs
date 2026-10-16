@@ -264,8 +264,12 @@ pub async fn run(s: AppState, bands: Vec<String>, trigger: &'static str) {
         let scanned = start_scans(&mut s.live.write().unwrap(), band, store::now_ts());
         tracing::info!("channel AI ({trigger}): {} APs scanning {band}", scanned.len());
         wait_for_scans(&s).await;
-        // Let the scan results reach the database.
-        tokio::time::sleep(Duration::from_secs(5)).await;
+        // The engine queues an AP's scan results before it shows the scan as
+        // done: once they are committed, the plan reads them.
+        let w = s.writer.clone();
+        if !tokio::task::spawn_blocking(move || w.flush(Duration::from_secs(10))).await.unwrap_or(false) {
+            tracing::warn!("channel AI: the scan results were not stored in time; planning {band} with what is there");
+        }
         let (allowed, pinned) = {
             let live = s.live.read().unwrap();
             (allowed(live.state.as_deref(), band, false), pinned(&live, band))
@@ -420,6 +424,9 @@ pub async fn apply_plan(State(s): State<AppState>, headers: HeaderMap, Json(b): 
     crate::api::check_csrf(&headers)?;
     crate::api::require_active(&s, "this needs")?;
     let b: ApplyBody = serde_json::from_value(b).map_err(|e| ApiError(StatusCode::BAD_REQUEST, format!("not a plan: {e}")))?;
+    if !BANDS.contains(&b.band.as_str()) {
+        return Err(ApiError(StatusCode::BAD_REQUEST, "band must be ng or na".into()));
+    }
     if b.changes.is_empty() {
         return Err(ApiError(StatusCode::BAD_REQUEST, "the plan changes nothing".into()));
     }

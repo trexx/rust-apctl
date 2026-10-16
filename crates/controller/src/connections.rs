@@ -227,9 +227,12 @@ pub struct Attempt {
 /// How far back a fixup reaches for the failure it corrects.
 const FIXUP_WITHIN: Ts = 1200;
 
+/// The reports that are connection attempts (or fix one up).
+const ATTEMPT_TYPES: [&str; 4] = ["failure", "soft failure", "success", "fixup"];
+
 /// Connection attempts from the notifications, oldest first.
 pub fn attempts(mut events: Vec<ConnEvent>) -> Vec<Attempt> {
-    events.retain(|e| matches!(e.event_type.as_str(), "failure" | "soft failure" | "success" | "fixup"));
+    events.retain(|e| ATTEMPT_TYPES.contains(&e.event_type.as_str()));
     events.sort_by_key(|e| e.ts);
     // (event, succeeded on its own, merged with a fixup)
     let mut merged: Vec<(ConnEvent, bool, bool)> = Vec::new();
@@ -477,17 +480,20 @@ pub fn roam_clients(roams: &[Roam]) -> Vec<Value> {
     out
 }
 
-/// The notifications in a window (optionally one client's), oldest first; or
-/// with `newest`, at most that many, newest first.
-pub fn load_rows(c: &rusqlite::Connection, from: Ts, to: Ts, client: Option<&str>, newest: Option<usize>) -> rusqlite::Result<Vec<ConnEvent>> {
+/// The notifications in a window (optionally one client's, and with
+/// `attempts_only` only the reports [`attempts`] reads), oldest first; or with
+/// `newest`, at most that many, newest first.
+pub fn load_rows(c: &rusqlite::Connection, from: Ts, to: Ts, client: Option<&str>, newest: Option<usize>, attempts_only: bool) -> rusqlite::Result<Vec<ConnEvent>> {
     const COLUMNS: &str = "SELECT ts, ap_mac, client_mac, vap, essid, radio, event_type, detail, ip_assign_type, dns_responses, dns_timeouts, rssi FROM connections";
     // Two statements: `(?3 IS NULL OR client_mac = ?3)` would keep SQLite off the per-client index.
     let filter = if client.is_some() { "client_mac = ?3 AND ts >= ?1 AND ts <= ?2" } else { "ts >= ?1 AND ts <= ?2" };
+    // The other reports (associations, leaves) are then not parsed for nothing.
+    let types = if attempts_only { format!("AND event_type IN ('{}')", ATTEMPT_TYPES.join("', '")) } else { String::new() };
     let order = match newest {
         Some(n) => format!("ORDER BY ts DESC, id DESC LIMIT {n}"),
         None => "ORDER BY ts, id".into(),
     };
-    let mut stmt = c.prepare(&format!("{COLUMNS} WHERE {filter} {order}"))?;
+    let mut stmt = c.prepare(&format!("{COLUMNS} WHERE {filter} {types} {order}"))?;
     let params: Vec<&dyn rusqlite::ToSql> = match &client {
         Some(m) => vec![&from, &to, m],
         None => vec![&from, &to],
@@ -509,27 +515,28 @@ pub fn load_rows(c: &rusqlite::Connection, from: Ts, to: Ts, client: Option<&str
 
 /// Loads the notifications in a window (optionally one client's), oldest first.
 async fn load(s: &AppState, from: Ts, to: Ts, client: Option<String>) -> Result<Vec<ConnEvent>, ApiError> {
-    read(&s.store, Db::Config, move |c| Ok(load_rows(c, from, to, client.as_deref(), None)?)).await
+    read(&s.store, Db::Config, move |c| Ok(load_rows(c, from, to, client.as_deref(), None, false)?)).await
 }
 
-/// The newest `limit` attempts (failed ones only with `failed`) and roams in
-/// the window, newest first. Rows are read newest first, a growing batch at a
-/// time, until both lists are full or the window is read: of a batch, only
-/// what lies more than [`FIXUP_WITHIN`] after its oldest row counts, as a
-/// fixup can still merge into a failure that long before it (and a roam's
-/// two reports are seconds apart).
-fn newest(c: &rusqlite::Connection, from: Ts, to: Ts, client: Option<&str>, limit: usize, failed: bool) -> rusqlite::Result<(Vec<Attempt>, Vec<Roam>)> {
+/// The newest `limit` attempts (failed ones only with `failed`) and, with
+/// `with_roams`, roams in the window, newest first. Rows are read newest first,
+/// a growing batch at a time, until the lists asked for are full or the window
+/// is read: of a batch, only what lies more than [`FIXUP_WITHIN`] after its
+/// oldest row counts, as a fixup can still merge into a failure that long
+/// before it (and a roam's two reports are seconds apart).
+fn newest(c: &rusqlite::Connection, from: Ts, to: Ts, client: Option<&str>, limit: usize, failed: bool, with_roams: bool) -> rusqlite::Result<(Vec<Attempt>, Vec<Roam>)> {
     let mut batch = (limit * 4).max(2000);
     loop {
-        let mut events = load_rows(c, from, to, client, Some(batch))?;
+        // Without roams, only the attempts' own reports are read.
+        let mut events = load_rows(c, from, to, client, Some(batch), !with_roams)?;
         let all = events.len() < batch;
         // The oldest time read may have more rows than were read.
         let oldest = events.last().map_or(from, |e| e.ts);
         let settled = |ts: Ts| all || ts > oldest.saturating_add(FIXUP_WITHIN);
         events.reverse();
-        let r: Vec<Roam> = roams(&events).into_iter().rev().filter(|x| settled(x.ts)).take(limit).collect();
+        let r: Vec<Roam> = if with_roams { roams(&events).into_iter().rev().filter(|x| settled(x.ts)).take(limit).collect() } else { Vec::new() };
         let list: Vec<Attempt> = attempts(events).into_iter().rev().filter(|a| settled(a.ts) && (!failed || !a.success)).take(limit).collect();
-        if all || (list.len() == limit && r.len() == limit) {
+        if all || (list.len() == limit && (!with_roams || r.len() == limit)) {
             return Ok((list, r));
         }
         batch *= 4;
@@ -611,7 +618,7 @@ fn macs_of<'a>(attempts: &'a [Attempt], roams: &'a [Roam]) -> impl Iterator<Item
 /// all bands and each band.
 pub async fn connectivity(State(s): State<AppState>, Query(q): Query<RangeQuery>) -> Result<Json<Value>, ApiError> {
     let (from, to, _) = window(&q);
-    let list = attempts(load(&s, from, to, None).await?);
+    let list = attempts(read(&s.store, Db::Config, move |c| Ok(load_rows(c, from, to, None, None, true)?)).await?);
     let mut bands = serde_json::Map::new();
     for b in [None, Some("ng"), Some("na"), Some("6e")] {
         let v = connectivity_stats(&list, b);
@@ -633,6 +640,8 @@ pub struct ListQuery {
     #[serde(default)]
     failed: bool,
     limit: Option<usize>,
+    /// `false`: attempts only (`roams` comes back empty), so fewer rows are read.
+    roams: Option<bool>,
 }
 
 /// GET /api/connections: connection attempts and roams, newest first.
@@ -640,7 +649,8 @@ pub async fn list(State(s): State<AppState>, Query(q): Query<ListQuery>) -> Resu
     let (from, to, _) = window(&RangeQuery { range: q.range, from: q.from, to: q.to, ..Default::default() });
     let client = q.client.map(|c| c.to_ascii_lowercase());
     let limit = q.limit.unwrap_or(500).min(5000);
-    let (list, r) = read(&s.store, Db::Config, move |c| Ok(newest(c, from, to, client.as_deref(), limit, q.failed)?)).await?;
+    let with_roams = q.roams.unwrap_or(true);
+    let (list, r) = read(&s.store, Db::Config, move |c| Ok(newest(c, from, to, client.as_deref(), limit, q.failed, with_roams)?)).await?;
     let (aps, clients) = names(&s, macs_of(&list, &r)).await?;
     Ok(Json(json!({ "attempts": list, "roams": r, "ap_names": aps, "client_names": clients })))
 }
@@ -825,10 +835,22 @@ mod tests {
         c.execute_batch("COMMIT").unwrap();
         let (from, to) = (1_000_000 + 3600, 1_000_000 + 12_000 * 7);
         // From the first batch of rows, from several, and from all of them.
-        for (client, failed, limit) in [(None, false, 40), (Some("02:00:00:00:10:01"), true, 10), (None, false, 500), (None, true, 300), (Some("02:00:00:00:10:03"), false, 200), (None, false, 0), (None, false, 9000)] {
-            let (list, r) = store.read(Db::Config, |c| Ok(newest(c, from, to, client, limit, failed)?)).unwrap();
-            let all = store.read(Db::Config, |c| Ok(load_rows(c, from, to, client, None)?)).unwrap();
-            let mut want_r = roams(&all);
+        let cases = [
+            (None, false, 40, true),
+            (Some("02:00:00:00:10:01"), true, 10, true),
+            (None, false, 500, true),
+            (None, true, 300, true),
+            (Some("02:00:00:00:10:03"), false, 200, true),
+            (None, false, 0, true),
+            (None, false, 9000, true),
+            // Attempts only.
+            (None, false, 500, false),
+            (Some("02:00:00:00:10:02"), true, 50, false),
+        ];
+        for (client, failed, limit, with_roams) in cases {
+            let (list, r) = store.read(Db::Config, |c| Ok(newest(c, from, to, client, limit, failed, with_roams)?)).unwrap();
+            let all = store.read(Db::Config, |c| Ok(load_rows(c, from, to, client, None, false)?)).unwrap();
+            let mut want_r = if with_roams { roams(&all) } else { Vec::new() };
             want_r.reverse();
             want_r.truncate(limit);
             let mut want = attempts(all);

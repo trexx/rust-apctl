@@ -201,7 +201,8 @@ impl Alerts {
         if let Some(n) = note {
             a.message = n;
         }
-        self.writer.exec(Db::Config, "UPDATE alerts SET resolved_ts = ?2 WHERE id = ?1", vec![Sql::Text(a.id.clone()), Sql::Integer(now)]);
+        // The message too: after a reload the alert reads as the live view said ("Back after 12 min").
+        self.writer.exec(Db::Config, "UPDATE alerts SET resolved_ts = ?2, message = ?3 WHERE id = ?1", vec![Sql::Text(a.id.clone()), Sql::Integer(now), Sql::Text(a.message.clone())]);
         let _ = self.tx.send(LiveMsg::Alert(AlertMsg { action: "resolved", alert: a.clone() }));
         Some(a)
     }
@@ -401,13 +402,17 @@ async fn radio_health(store: &Arc<Store>, now: Ts) -> anyhow::Result<HashMap<(St
 /// Clients whose every connection attempt in the window failed.
 async fn failing_clients(store: &Arc<Store>, now: Ts) -> anyhow::Result<Vec<String>> {
     let store = store.clone();
-    let events = tokio::task::spawn_blocking(move || store.read(Db::Config, |c| Ok(crate::connections::load_rows(c, now - HEALTH_WINDOW, Ts::MAX, None, None)?))).await??;
-    let attempts = crate::connections::attempts(events);
-    let ok: HashSet<&str> = attempts.iter().filter(|a| a.success).map(|a| a.client.as_str()).collect();
-    let mut failing: Vec<String> = attempts.iter().filter(|a| !a.success && !ok.contains(a.client.as_str())).map(|a| a.client.clone()).collect();
-    failing.sort();
-    failing.dedup();
-    Ok(failing)
+    // Parsing the reports and pairing fixups is CPU work: off the async workers too.
+    tokio::task::spawn_blocking(move || {
+        let events = store.read(Db::Config, |c| Ok(crate::connections::load_rows(c, now - HEALTH_WINDOW, Ts::MAX, None, None, true)?))?;
+        let attempts = crate::connections::attempts(events);
+        let ok: HashSet<&str> = attempts.iter().filter(|a| a.success).map(|a| a.client.as_str()).collect();
+        let mut failing: Vec<String> = attempts.iter().filter(|a| !a.success && !ok.contains(a.client.as_str())).map(|a| a.client.clone()).collect();
+        failing.sort();
+        failing.dedup();
+        Ok(failing)
+    })
+    .await?
 }
 
 /// Alerts left open by a previous run.
@@ -810,6 +815,10 @@ mod tests {
         assert!(told(&mut rx).is_empty(), "cleared only when nobody fails");
         w.judge_connections(1180, 0);
         assert_eq!(told(&mut rx), [("resolved", "connect_failures".to_string())]);
+        // Stored as the live view showed it.
+        assert!(w.book.writer.flush(std::time::Duration::from_secs(5)));
+        let stored: String = w.store.read(Db::Config, |c| Ok(c.query_row("SELECT message FROM alerts WHERE resolved_ts = 1180", [], |r| r.get(0))?)).unwrap();
+        assert_eq!(stored, "Clients are connecting again.");
         // Not again within the cooldown.
         w.judge_connections(1240, 9);
         assert!(told(&mut rx).is_empty());

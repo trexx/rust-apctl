@@ -511,7 +511,7 @@ pub fn gather(store: &Store, live: &SharedLive, now: Ts) -> anyhow::Result<Asses
                 _ => {
                     let h = match &mut history {
                         Some(h) => h,
-                        None => history.insert(History::load(c)?),
+                        None => history.insert(History::load(c, now)?),
                     };
                     let changed_at = h.last_change(b, key.1.as_deref());
                     cache.changes.insert(b.bssid.clone(), Change { of: key, at: now, changed_at });
@@ -595,6 +595,12 @@ fn used_bssids(c: &Connection, now: Ts) -> rusqlite::Result<Vec<(String, String,
 /// When each radio last ran each channel, and each BSSID had each name (and
 /// the radios it was on), from the raw and five-minute tiers: one grouped
 /// query per table and tier, for all of our BSSIDs.
+///
+/// Only the last [`HISTORY_SECS`] count: a change before any scan result that
+/// is still looked at (the last seven days) cannot change a finding. The raw
+/// tier covers the last hour, which the five-minute roll-ups may not have
+/// reached yet; before that, a five-minute row counts as lasting to its
+/// bucket's end, so a change is never placed earlier than it happened.
 #[derive(Default)]
 struct History {
     /// (AP, radio) -> (channel, when last on it); a five-minute row's channel is its bucket's average.
@@ -605,17 +611,21 @@ struct History {
     radios: HashMap<String, HashSet<String>>,
 }
 
+/// How far back [`History`] reads: the scan results' seven days and a day to spare.
+const HISTORY_SECS: Ts = 8 * 86400;
+
 impl History {
-    fn load(c: &Connection) -> rusqlite::Result<History> {
+    fn load(c: &Connection, now: Ts) -> rusqlite::Result<History> {
         let mut h = History::default();
-        for suffix in ["", "_5m"] {
-            let sql = format!("SELECT mac, radio, channel, MAX(ts) FROM radio_stats{suffix} WHERE channel IS NOT NULL GROUP BY mac, radio, channel");
-            for row in c.prepare(&sql)?.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, f64>(2)?, r.get::<_, Ts>(3)?)))? {
+        // (tier, since, added to a row's time to reach the end of what it covers)
+        for (suffix, since, end) in [("", now - 3600, 0), ("_5m", now - HISTORY_SECS, 299)] {
+            let sql = format!("SELECT mac, radio, channel, MAX(ts) + {end} FROM radio_stats{suffix} WHERE ts >= ?1 AND channel IS NOT NULL GROUP BY mac, radio, channel");
+            for row in c.prepare(&sql)?.query_map([since], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, f64>(2)?, r.get::<_, Ts>(3)?)))? {
                 let (mac, radio, ch, ts) = row?;
                 h.channels.entry((mac, radio)).or_default().push((ch, ts));
             }
-            let sql = format!("SELECT bssid, essid, radio, MAX(ts) FROM vap_stats{suffix} GROUP BY bssid, essid, radio");
-            for row in c.prepare(&sql)?.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?, r.get::<_, Option<String>>(2)?, r.get::<_, Ts>(3)?)))? {
+            let sql = format!("SELECT bssid, essid, radio, MAX(ts) + {end} FROM vap_stats{suffix} WHERE ts >= ?1 GROUP BY bssid, essid, radio");
+            for row in c.prepare(&sql)?.query_map([since], |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?, r.get::<_, Option<String>>(2)?, r.get::<_, Ts>(3)?)))? {
                 let (bssid, essid, radio, ts) = row?;
                 if let Some(e) = essid {
                     h.names.entry(bssid.clone()).or_default().push((e, ts));
@@ -650,14 +660,37 @@ impl History {
     }
 }
 
+/// The findings last worked out (by [`watch`] every minute, or for a request),
+/// which `list` serves while they are fresh rather than gathering them again.
+struct Latest {
+    at: Ts,
+    findings: Vec<Finding>,
+    watching_since: Ts,
+}
+
+/// How long [`Latest`] is served: a little over `watch`'s minute.
+const LATEST_SECS: Ts = 90;
+
+static LATEST: std::sync::Mutex<Option<Latest>> = std::sync::Mutex::new(None);
+
+fn latest() -> std::sync::MutexGuard<'static, Option<Latest>> {
+    LATEST.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 async fn findings(s: &AppState) -> Result<(Vec<Finding>, Ts), ApiError> {
+    let now = store::now_ts();
+    if let Some(l) = latest().as_ref().filter(|l| (0..LATEST_SECS).contains(&(now - l.at))) {
+        return Ok((l.findings.clone(), l.watching_since));
+    }
     let (store, live) = (s.store.clone(), s.live.clone());
-    tokio::task::spawn_blocking(move || {
-        let a = gather(&store, &live, store::now_ts())?;
+    let (list, watching_since) = tokio::task::spawn_blocking(move || {
+        let a = gather(&store, &live, now)?;
         Ok::<_, anyhow::Error>((assess(&a), a.watching_since))
     })
     .await?
-    .map_err(ApiError::from)
+    .map_err(ApiError::from)?;
+    *latest() = Some(Latest { at: now, findings: list.clone(), watching_since });
+    Ok((list, watching_since))
 }
 
 /// GET /api/rf/threats
@@ -701,8 +734,16 @@ pub async fn ack(State(s): State<AppState>, headers: axum::http::HeaderMap, Json
     if note.as_ref().is_some_and(|n| n.chars().count() > 200) {
         return Err(ApiError(StatusCode::BAD_REQUEST, "note is too long (200 characters at most)".into()));
     }
-    let input = Input::AckThreat { ts: store::now_ts(), kind: kind.as_str(), bssid: bssid.to_string(), note: if b.ack { Some(note) } else { None } };
+    let (ts, bssid) = (store::now_ts(), bssid.to_string());
+    let ack = b.ack.then(|| Ack { note: note.clone(), ts });
+    let input = Input::AckThreat { ts, kind: kind.as_str(), bssid: bssid.clone(), note: if b.ack { Some(note) } else { None } };
     s.engine.send(input).await.map_err(|_| ApiError(StatusCode::SERVICE_UNAVAILABLE, "engine stopped".into()))?;
+    // The findings served from memory show it at once.
+    if let Some(l) = latest().as_mut() {
+        for f in l.findings.iter_mut().filter(|f| f.kind == kind && f.bssid == bssid) {
+            f.acknowledged.clone_from(&ack);
+        }
+    }
     Ok(Json(json!({ "ok": true })))
 }
 
@@ -726,9 +767,9 @@ pub fn watch(store: std::sync::Arc<Store>, live: SharedLive, engine: tokio::sync
                 prune(&writer);
                 pruned = store::now_ts();
             }
-            let (st, lv) = (store.clone(), live.clone());
-            let found = tokio::task::spawn_blocking(move || gather(&st, &lv, store::now_ts()).map(|a| assess(&a))).await;
-            let list = match found {
+            let (st, lv, now) = (store.clone(), live.clone(), store::now_ts());
+            let found = tokio::task::spawn_blocking(move || gather(&st, &lv, now).map(|a| (assess(&a), a.watching_since))).await;
+            let (mut list, watching_since) = match found {
                 Ok(Ok(l)) => l,
                 Ok(Err(e)) => {
                     tracing::warn!("network threat check failed: {e:#}");
@@ -739,18 +780,21 @@ pub fn watch(store: std::sync::Arc<Store>, live: SharedLive, engine: tokio::sync
                     continue;
                 }
             };
-            for f in list.into_iter().filter(|f| f.first_reported.is_none()) {
+            for f in list.iter_mut().filter(|f| f.first_reported.is_none()) {
                 let device = f.heard_by.first().and_then(|h| h.mac.parse().ok());
                 let notify = f.acknowledged.is_none();
                 let data = json!({
                     "kind": f.kind, "severity": f.severity, "bssid": f.bssid, "essid": f.essid, "target": f.target,
                     "signal": f.best_signal, "channel": f.channel, "detail": f.detail,
                 });
-                let input = Input::ThreatFound { ts: store::now_ts(), kind: f.kind.as_str(), bssid: f.bssid, device_mac: device, data, notify };
+                let input = Input::ThreatFound { ts: now, kind: f.kind.as_str(), bssid: f.bssid.clone(), device_mac: device, data, notify };
                 if engine.send(input).await.is_err() {
                     return;
                 }
+                // As the engine records it.
+                f.first_reported = Some(now);
             }
+            *latest() = Some(Latest { at: now, findings: list, watching_since });
         }
     });
 }
@@ -914,17 +958,23 @@ mod tests {
         radio("", now - 60, "na", 44.0);
         radio("_5m", now - 600, "ng", 6.0);
         radio("", now - 120, "ng", 1.0);
-        let (used, h) = store.read(Db::Metrics, |c| Ok((used_bssids(c, now)?, History::load(c)?))).unwrap();
+        // Raw rows past the last hour are left to the five-minute tier, and
+        // nothing before the scan results' window counts.
+        radio("", now - 2 * 3600, "na", 36.0);
+        radio("_5m", now - 9 * 86400, "na", 52.0);
+        vap("_5m", "02:00:00:00:00:02", now - 9 * 86400, "Ancient", "na");
+        let (used, h) = store.read(Db::Metrics, |c| Ok((used_bssids(c, now)?, History::load(c, now)?))).unwrap();
         let names: Vec<(&str, Option<&str>)> = used.iter().map(|(b, _, e)| (b.as_str(), e.as_deref())).collect();
         assert_eq!(names, [("02:00:00:00:00:01", Some("Old")), ("02:00:00:00:00:02", Some("Home 2")), ("02:00:00:00:00:03", Some("IoT"))]);
         let own = |bssid: &str, essid: &str, channel: i64| OwnBss { bssid: bssid.into(), ap_mac: UP.into(), essid: Some(essid.into()), channel: Some(channel), changed_at: 0 };
-        // Called "Home" an hour ago, and on channel 44 since the averaged bucket before.
+        // Called "Home" an hour ago, and on channel 44 since the averaged bucket
+        // before; a five-minute row lasts to its bucket's end.
         assert_eq!(h.last_change(&own("02:00:00:00:00:02", "Home", 44), Some("na")), now - 60, "the rename");
-        assert_eq!(h.last_change(&own("02:00:00:00:00:02", "Home 2", 44), Some("na")), now - 3600);
+        assert_eq!(h.last_change(&own("02:00:00:00:00:02", "Home 2", 44), Some("na")), now - 3600 + 299);
         assert_eq!(h.last_change(&own("02:00:00:00:00:02", "Home 2", 36), Some("na")), now - 60);
         // Without its radio: the radios the BSSID was on.
         assert_eq!(h.last_change(&own("02:00:00:00:00:03", "IoT", 6), None), now - 120);
-        assert_eq!(h.last_change(&own("02:00:00:00:00:03", "IoT", 1), Some("ng")), now - 600);
+        assert_eq!(h.last_change(&own("02:00:00:00:00:03", "IoT", 1), Some("ng")), now - 600 + 299);
         assert_eq!(h.last_change(&own("02:00:00:00:00:01", "Old", 6), None), 0, "only in the hourly tier");
         let _ = std::fs::remove_dir_all(&dir);
     }
