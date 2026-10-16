@@ -783,6 +783,9 @@ export interface RoamDir {
 export interface Roaming {
   from: number;
   to: number;
+  /** Over every roam in the window. */
+  total: { roams: number; successes: number; fast: number };
+  /** The newest roams (the server lists 100). */
   roams: Roam[];
   pairs: {
     ap_1: Mac;
@@ -829,13 +832,13 @@ export interface Wlan {
   series: { ts: number[]; clients: number[]; download_bps: number[]; upload_bps: number[] };
 }
 
-/** Connection attempts and roams, newest first: at most `limit` of each (the server's default is 500). */
-export const useConnections = (span: TimeSpan, opts: { client?: Mac; failed?: boolean; limit?: number } = {}) =>
+/** Connection attempts and roams, newest first: at most `limit` of each (the server's default is 500); `roams: false` skips the roams. */
+export const useConnections = (span: TimeSpan, opts: { client?: Mac; failed?: boolean; limit?: number; roams?: boolean } = {}) =>
   useSpanQuery<{ attempts: ConnAttempt[]; roams: Roam[]; ap_names: Record<string, string>; client_names: Record<string, string> }>(
     keys.connections(span, opts),
     "/api/connections",
     span,
-    { client: opts.client, failed: opts.failed ? "true" : undefined, limit: opts.limit },
+    { client: opts.client, failed: opts.failed ? "true" : undefined, limit: opts.limit, roams: opts.roams === false ? "false" : undefined },
   );
 
 export const useRoaming = (span: TimeSpan) => useSpanQuery<Roaming>(keys.roaming(span), "/api/roaming", span);

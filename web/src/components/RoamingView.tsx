@@ -1,8 +1,8 @@
 import { Link } from "react-router-dom";
 import { useRoaming } from "../api";
 import type { Roaming } from "../api";
-import { band, clock } from "../format";
 import { RangePicker, useTimeSpan } from "./Chart";
+import { RoamRow, roamId, stableKeys } from "./Connections";
 import { QueryState, Signal, Stat } from "./common";
 import { spanText } from "./insights/shared";
 
@@ -32,7 +32,7 @@ export function RoamingView() {
 }
 
 function Summary({ data }: { data: Roaming }) {
-  const n = data.roams.length;
+  const { roams: n, successes: ok, fast } = data.total;
   if (n === 0)
     return (
       <div className="muted small">
@@ -40,8 +40,6 @@ function Summary({ data }: { data: Roaming }) {
         same network.
       </div>
     );
-  const ok = data.roams.filter((x) => x.success).length;
-  const fast = data.roams.filter((x) => x.fast).length;
   const weaker = data.clients.reduce((a, c) => a + c.to_weaker, 0);
   const back = data.clients.reduce((a, c) => a + c.quick_returns, 0);
   return (
@@ -77,6 +75,7 @@ function Summary({ data }: { data: Roaming }) {
 function Details({ data }: { data: Roaming }) {
   const ap = (m: string) => data.ap_names[m] ?? m;
   const client = (m: string) => data.client_names[m] ?? m;
+  const keys = stableKeys(data.roams, roamId);
   return (
     <>
       <div className="grid2 align-top">
@@ -192,50 +191,20 @@ function Details({ data }: { data: Roaming }) {
               <tr>
                 <th>Time</th>
                 <th>Client</th>
-                <th>From → to</th>
-                <th>Signal</th>
-                <th>Band</th>
                 <th>Result</th>
+                <th>From → to</th>
+                <th>Network</th>
+                <th>Signal</th>
               </tr>
             </thead>
             <tbody>
-              {data.roams.slice(0, 100).map((x, i) => (
-                <tr key={i}>
-                  <td className="nowrap small">{clock(x.ts)}</td>
-                  <td>
-                    <Link to={`/clients/${x.client}`}>{client(x.client)}</Link>
-                  </td>
-                  <td className="small">
-                    {ap(x.from.ap)} → {ap(x.to.ap)}
-                  </td>
-                  <td className="nowrap">
-                    <Signal dbm={x.from.rssi} /> → <Signal dbm={x.to.rssi} />
-                  </td>
-                  <td className="small nowrap">
-                    {band(x.from.radio)} → {band(x.to.radio)}
-                    {x.to.channel !== null && (
-                      <span className="muted"> ch {x.to.channel}</span>
-                    )}
-                  </td>
-                  <td className="small">
-                    {x.success ? (
-                      <span className="tone-good">Roamed</span>
-                    ) : (
-                      <span className="tone-bad">
-                        Failed{x.gap_s ? `, off for ${x.gap_s}s` : ""}
-                      </span>
-                    )}
-                    <div className="muted">
-                      {[
-                        x.fast && "802.11r",
-                        x.min_rssi && "minimum RSSI",
-                        x.assistant && "roaming assistant",
-                      ]
-                        .filter(Boolean)
-                        .join(" · ")}
-                    </div>
-                  </td>
-                </tr>
+              {data.roams.map((x, i) => (
+                <RoamRow
+                  key={keys[i]}
+                  r={x}
+                  apName={ap}
+                  client={client(x.client)}
+                />
               ))}
             </tbody>
           </table>
