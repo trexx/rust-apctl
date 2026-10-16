@@ -492,7 +492,9 @@ pub fn apply_settings(state: &mut Value, p: &Value) -> Result<String, String> {
     }
     if !p["hour"].is_null() {
         let h = p["hour"].as_i64().filter(|h| (0..24).contains(h)).ok_or("the hour must be 0 to 23")?;
-        r["cron_expr"] = json!(format!("0 {h} * * *"));
+        // The minute stays (an imported setting may have one).
+        let (_, m) = parse_cron(r["cron_expr"].as_str().unwrap_or("0 3 * * *"));
+        r["cron_expr"] = json!(format!("{m} {h} * * *"));
     }
     if !p["radios"].is_null() {
         let radios: Vec<String> = p["radios"].as_array().ok_or("radios must be a list")?.iter().filter_map(|v| v.as_str().map(str::to_string)).collect();
@@ -576,6 +578,10 @@ mod tests {
         // ng: Germany's 1-13 minus the blacklist (2 and 13 here).
         assert_eq!(r["channels_ng"].as_array().unwrap().len(), 11);
         assert!(apply_settings(&mut s, &json!({ "hour": 24 })).is_err());
+        // An imported minute is kept when only the hour changes.
+        setting_mut(&mut s, "radio_ai")["cron_expr"] = json!("30 2 * * *");
+        apply_settings(&mut s, &json!({ "hour": 6 })).unwrap();
+        assert_eq!((settings(Some(&s)).hour, settings(Some(&s)).minute), (6, 30));
         assert!(apply_settings(&mut s, &json!({ "exclude_devices": ["02:00:00:00:00:99"] })).is_err());
         apply_settings(&mut s, &json!({ "exclude_devices": ["02:00:00:00:00:01"] })).unwrap();
         assert_eq!(settings(Some(&s)).exclude_devices, vec!["02:00:00:00:00:01"]);
