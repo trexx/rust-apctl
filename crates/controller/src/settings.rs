@@ -500,6 +500,21 @@ fn protection_of(w: &Value) -> Option<&'static str> {
         .map(|p| p.0)
 }
 
+/// How an SSID's security reads for people: the editor's choices by name,
+/// anything else from its fields.
+pub(crate) fn security_label(w: &Value) -> String {
+    match (protection_of(w), w["security"].as_str()) {
+        (Some("open"), _) | (None, Some("open")) => "Open".into(),
+        (Some("wpa2"), _) => "WPA2 Personal".into(),
+        (Some("wpa2_wpa3"), _) => "WPA2/WPA3 Personal".into(),
+        (Some(_), _) => "WPA3 Personal".into(),
+        (None, Some("wpapsk")) => format!("{} Personal", w["wpa_mode"].as_str().unwrap_or("wpa2").to_uppercase()),
+        (None, Some("wpaeap")) => "WPA Enterprise".into(),
+        (None, Some(o)) => o.to_string(),
+        (None, None) => "?".into(),
+    }
+}
+
 const MINRATE_NG: &[i64] = &[1000, 2000, 5500, 6000, 9000, 11000, 12000, 18000, 24000, 36000, 48000, 54000];
 const MINRATE_NA: &[i64] = &[6000, 9000, 12000, 18000, 24000, 36000, 48000, 54000];
 
