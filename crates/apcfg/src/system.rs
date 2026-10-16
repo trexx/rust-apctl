@@ -8,7 +8,7 @@ use crate::javahash::hash_set_order;
 use crate::json::{arr, flag, int_of, mac_eq, on_off, str_list, str_of, text_of};
 use crate::meta::Meta;
 use crate::net::{self, Net};
-use crate::wlan::{self, Radio, Vap, network_vlan, wlan_id};
+use crate::wlan::{self, Band, Radio, Vap, network_vlan, wlan_id};
 use crate::{Ctx, bit, mgmt, tz};
 
 pub fn render(ctx: &Ctx) -> Result<(String, Value)> {
@@ -17,7 +17,7 @@ pub fn render(ctx: &Ctx) -> Result<(String, Value)> {
     let mut meta = Meta::load(ctx, i64::from(qca_v2));
     let radios = wlan::radios(ctx);
     let wanted = wlan::deploy(ctx, &radios);
-    let keys: Vec<(String, String)> = wanted.iter().map(|(w, r)| (wlan_id(w).to_string(), radios[*r].name.clone())).collect();
+    let keys: Vec<(String, String)> = wanted.iter().map(|(w, r)| (wlan_id(w).to_string(), radios[*r].name.to_string())).collect();
     let slots = meta.wireless(&keys, |radio, k| if qca_v2 { format!("{radio}ap{k}") } else { format!("ath{k}") });
     let vaps: Vec<Vap> =
         wanted.into_iter().zip(slots).zip(keys).map(|(((w, radio), slot), (id, _))| Vap { id, w, radio, slot }).collect();
@@ -229,8 +229,8 @@ fn bandsteering(c: &mut Cfg, ctx: &Ctx, radios: &[Radio], vaps: &[Vap]) {
         return;
     }
     let mut k = 0;
-    for ng in vaps.iter().filter(|v| radios[v.radio].band == "ng") {
-        if let Some(na) = vaps.iter().find(|v| radios[v.radio].band == "na" && v.id == ng.id) {
+    for ng in vaps.iter().filter(|v| radios[v.radio].band == Band::Ng) {
+        if let Some(na) = vaps.iter().find(|v| radios[v.radio].band == Band::Na && v.id == ng.id) {
             k += 1;
             c.set(format_args!("bandsteering.{k}.status"), "enabled");
             c.set(format_args!("bandsteering.{k}.vap.1.devname"), ng.dev());
@@ -669,8 +669,8 @@ fn limits(g: &Value) -> (i64, i64) {
 /// 5 GHz), which gives the table's 300 and 2400 for a U6-Mesh.
 fn radio_max_mbps(r: &Radio) -> i64 {
     let nss = int_of(r.doc, "nss").unwrap_or(2).max(1);
-    let per_stream = match r.band.as_str() {
-        "ng" => 150,
+    let per_stream = match r.band {
+        Band::Ng => 150,
         _ if flag(r.doc, "is_11ax", false) => 600,
         _ => 433,
     };
@@ -741,7 +741,7 @@ fn cron(c: &mut Cfg, ctx: &Ctx, radios: &[Radio], vaps: &[Vap]) {
     let country = wlan::country(ctx);
     let fcc = country == "840" || country == "124";
     let dfs = radios.iter().any(|r| {
-        r.band == "na"
+        r.band == Band::Na
             && flag(r.doc, if fcc { "has_fccdfs" } else { "has_dfs" }, false)
             && int_of(r.doc, "channel").is_some_and(is_dfs_channel)
     });

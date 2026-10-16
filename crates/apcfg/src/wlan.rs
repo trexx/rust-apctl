@@ -20,12 +20,60 @@ const RCAP2_OWE: u32 = 3;
 /// `radio_caps` bit for a hardware noise floor (sensitivity) setting.
 const RCAP_HARD_NOISE_FLOOR: u32 = 17;
 
+/// A radio's band, as the settings name it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Band<'a> {
+    /// 2.4 GHz, `ng`.
+    Ng,
+    /// 5 GHz, `na`.
+    Na,
+    /// 6 GHz, `6e`.
+    Six,
+    /// Any other name, kept as it is.
+    Other(&'a str),
+}
+
+impl<'a> Band<'a> {
+    pub fn parse(name: &'a str) -> Band<'a> {
+        match name {
+            "ng" => Band::Ng,
+            "na" => Band::Na,
+            "6e" => Band::Six,
+            other => Band::Other(other),
+        }
+    }
+
+    pub fn as_str(self) -> &'a str {
+        match self {
+            Band::Ng => "ng",
+            Band::Na => "na",
+            Band::Six => "6e",
+            Band::Other(name) => name,
+        }
+    }
+
+    /// The band of a WLAN's `wlan_bands` entry (`2g`, `5g`, `6g`).
+    fn of_wlan_band(b: &str) -> Option<Band<'static>> {
+        match b {
+            "2g" => Some(Band::Ng),
+            "5g" => Some(Band::Na),
+            "6g" => Some(Band::Six),
+            _ => None,
+        }
+    }
+}
+
+impl std::fmt::Display for Band<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 pub struct Radio<'a> {
     /// 1-based position in the name-sorted radio table (`radio.R`).
     pub idx: usize,
-    pub name: String,
-    /// `ng`, `na` or `6e`.
-    pub band: String,
+    pub name: &'a str,
+    pub band: Band<'a>,
     pub doc: &'a Value,
     /// Transmit power mode `disabled`: the radio and its VAPs are switched off.
     pub disabled: bool,
@@ -62,21 +110,12 @@ pub fn radios<'a>(ctx: &Ctx<'a>) -> Vec<Radio<'a>> {
         .enumerate()
         .map(|(i, r)| Radio {
             idx: i + 1,
-            name: str_of(r, "name").unwrap_or_default().to_string(),
-            band: str_of(r, "radio").unwrap_or("ng").to_string(),
+            name: str_of(r, "name").unwrap_or_default(),
+            band: Band::parse(str_of(r, "radio").unwrap_or("ng")),
             doc: r,
             disabled: str_of(r, "tx_power_mode").is_some_and(|m| m.eq_ignore_ascii_case("disabled")),
         })
         .collect()
-}
-
-fn band_of_wlan_band(b: &str) -> Option<&'static str> {
-    match b {
-        "2g" => Some("ng"),
-        "5g" => Some("na"),
-        "6g" => Some("6e"),
-        _ => None,
-    }
 }
 
 /// The AP's AP groups: the site default group plus every group listing its MAC.
@@ -127,7 +166,7 @@ fn adapt<'a>(ctx: &Ctx, wlan: &'a Value, radio: &Radio) -> Option<Cow<'a, Value>
                         set(&mut w, "fast_roaming_enabled", false);
                     }
                 }
-                if radio.band == "6e" && transition {
+                if radio.band == Band::Six && transition {
                     set(&mut w, "wpa3_transition", false);
                     set(&mut w, "pmf_mode", "required");
                 }
@@ -177,8 +216,8 @@ pub fn deploy<'a>(ctx: &Ctx<'a>, radios: &[Radio]) -> Vec<(Cow<'a, Value>, usize
     let mut out = Vec::new();
     for (ri, radio) in radios.iter().enumerate() {
         for w in &wlans {
-            let bands: Vec<&str> = str_list(w, "wlan_bands").into_iter().filter_map(band_of_wlan_band).collect();
-            let on_band = if bands.is_empty() { radio.band == "ng" || radio.band == "na" } else { bands.contains(&radio.band.as_str()) };
+            let bands: Vec<Band> = str_list(w, "wlan_bands").into_iter().filter_map(Band::of_wlan_band).collect();
+            let on_band = if bands.is_empty() { matches!(radio.band, Band::Ng | Band::Na) } else { bands.contains(&radio.band) };
             if on_band && let Some(adapted) = adapt(ctx, w, radio) {
                 out.push((adapted, ri));
             }
@@ -189,9 +228,9 @@ pub fn deploy<'a>(ctx: &Ctx<'a>, radios: &[Radio]) -> Vec<(Cow<'a, Value>, usize
 
 /// Effective channel width in MHz.
 fn width(ctx: &Ctx, r: &Radio) -> i64 {
-    let country_max = match r.band.as_str() {
-        "ng" => 40,
-        "na" => 160,
+    let country_max = match r.band {
+        Band::Ng => 40,
+        Band::Na => 160,
         _ => 320,
     };
     let configured = int_of(r.doc, "ht")
@@ -201,9 +240,9 @@ fn width(ctx: &Ctx, r: &Radio) -> i64 {
                 .find(|c| str_of(c, "radio") == Some(r.band.as_str()))
                 .and_then(|c| int_of(c, "channel_width"))
         })
-        .unwrap_or(match r.band.as_str() {
-            "ng" => 20,
-            "na" => 80,
+        .unwrap_or(match r.band {
+            Band::Ng => 20,
+            Band::Na => 80,
             _ => 160,
         });
     let f = |k| flag(r.doc, k, false);
@@ -236,14 +275,14 @@ pub fn render_radios(c: &mut Cfg, ctx: &Ctx, radios: &[Radio], vaps: &[Vap]) -> 
         let k = Prefix::new("radio", r.idx);
         let on_radio: Vec<&Vap> = vaps.iter().filter(|v| v.radio == ri).collect();
         let width = width(ctx, r);
-        c.set(k.at("phyname"), &r.name);
+        c.set(k.at("phyname"), r.name);
         c.set(k.at("ack.auto"), "disabled");
         c.set(k.at("acktimeout"), 64);
         c.set(k.at("ampdu.status"), "enabled");
         c.set(k.at("clksel"), 1);
         c.set(k.at("countrycode"), &country);
         c.set(k.at("cwm.enable"), 0);
-        c.set(k.at("cwm.mode"), u8::from(r.band == "ng" && width != 20));
+        c.set(k.at("cwm.mode"), u8::from(r.band == Band::Ng && width != 20));
         c.set(k.at("forbiasauto"), 0);
         // No VAP is an uplink (mesh uplinks are not implemented), so always master.
         c.set(k.at("mode"), "master");
@@ -258,11 +297,11 @@ pub fn render_radios(c: &mut Cfg, ctx: &Ctx, radios: &[Radio], vaps: &[Vap]) -> 
         c.set(k.at("txpower"), text_of(d, "tx_power").unwrap_or_else(|| "auto".into()));
         let channel = text_of(d, "channel").unwrap_or_else(|| "0".into());
         c.set(k.at("channel"), &channel);
-        let g = if r.band == "ng" { "g" } else { "a" };
+        let g = if r.band == Band::Ng { "g" } else { "a" };
         c.set(k.at("ieee_mode"), format_args!("11n{g}ht{width}"));
         let acs_dfs = bit(ctx.caps.wifi2, 4);
         let radio_ai = ctx.setting("radio_ai");
-        if r.band == "na" && acs_dfs {
+        if r.band == Band::Na && acs_dfs {
             let dfs = arr(radio_ai, "radios_configuration")
                 .iter()
                 .find(|c| str_of(c, "radio") == Some("na"))
@@ -311,7 +350,7 @@ pub fn render_radios(c: &mut Cfg, ctx: &Ctx, radios: &[Radio], vaps: &[Vap]) -> 
             any_stamgr = true;
             let s = Prefix::new("stamgr", r.idx);
             c.set(s.at("status"), "true");
-            c.set(s.at("radio"), &r.band);
+            c.set(s.at("radio"), r.band);
             c.set(s.at("minrssi.status"), rssi_on);
             c.set(s.at("minrssi.rssi"), min_rssi);
             c.set(s.at("loadbalance.status"), lb_on);
@@ -414,7 +453,7 @@ pub fn render_vap(c: &mut Cfg, ctx: &Ctx, radios: &[Radio], vaps: &[Vap], i: usi
     let n = v.slot.section;
     let a = Prefix::new("aaa", n as usize);
     let security = str_of(w, "security").unwrap_or("open");
-    let is_6e = r.band == "6e";
+    let is_6e = r.band == Band::Six;
     let wpa3 = b(w, "wpa3_support");
     let transition = b(w, "wpa3_transition");
     let ssid = str_of(w, "name").unwrap_or_default();
@@ -608,10 +647,10 @@ fn nas_identifier(c: &mut Cfg, ctx: &Ctx, w: &Value, a: Prefix) {
 }
 
 /// Minimum data rate lines; `None` when the band has no minimum rate configured.
-fn min_rate(w: &Value, band: &str) -> Option<i64> {
+fn min_rate(w: &Value, band: Band) -> Option<i64> {
     match band {
-        "ng" => Some(int_of(w, "minrate_ng_data_rate_kbps").unwrap_or(1000)),
-        "na" if b(w, "minrate_na_enabled") => Some(int_of(w, "minrate_na_data_rate_kbps").unwrap_or(6000)),
+        Band::Ng => Some(int_of(w, "minrate_ng_data_rate_kbps").unwrap_or(1000)),
+        Band::Na if b(w, "minrate_na_enabled") => Some(int_of(w, "minrate_na_data_rate_kbps").unwrap_or(6000)),
         _ => None,
     }
 }
@@ -629,7 +668,7 @@ fn render_wireless(c: &mut Cfg, ctx: &Ctx, radios: &[Radio], vaps: &[Vap], i: us
     let k = Prefix::new("wireless", n as usize);
     let security = str_of(w, "security").unwrap_or("open");
     let is_guest = b(w, "is_guest");
-    let rate = min_rate(w, &r.band);
+    let rate = min_rate(w, r.band);
     let caps = ctx.caps;
 
     c.set(k.at("mode"), "master");
@@ -655,9 +694,9 @@ fn render_wireless(c: &mut Cfg, ctx: &Ctx, radios: &[Radio], vaps: &[Vap], i: us
     c.set(k.at("mac_acl.policy"), "deny");
     c.set(k.at("wmm"), "enabled");
     c.set(k.at("uapsd"), on_off(b(w, "uapsd_enabled")));
-    c.set(k.at("parent"), &r.name);
+    c.set(k.at("parent"), r.name);
     c.set(k.at("puren"), 0);
-    c.set(k.at("pureg"), u8::from(!(r.band == "ng" && rate.is_none_or(allows_11b))));
+    c.set(k.at("pureg"), u8::from(!(r.band == Band::Ng && rate.is_none_or(allows_11b))));
     c.set(k.at("usage"), if is_guest { "guest" } else { "user" });
     c.set(k.at("wds"), "disabled");
     c.set(k.at("mcast.enhance"), u8::from(b(w, "mcastenhance_enabled")));
@@ -666,8 +705,8 @@ fn render_wireless(c: &mut Cfg, ctx: &Ctx, radios: &[Radio], vaps: &[Vap], i: us
     c.set(k.at("vport"), "disabled");
     c.set(k.at("vwire"), "disabled");
     c.set(k.at("schedule_enabled"), on_off(!arr(w, "schedule_with_duration").is_empty()));
-    let has_5g_twin = vaps.iter().any(|o| o.id == v.id && radios[o.radio].band == "na");
-    c.set(k.at("no2ghz_oui"), on_off(b(w, "no2ghz_oui") && r.band == "ng" && has_5g_twin));
+    let has_5g_twin = vaps.iter().any(|o| o.id == v.id && radios[o.radio].band == Band::Na);
+    c.set(k.at("no2ghz_oui"), on_off(b(w, "no2ghz_oui") && r.band == Band::Ng && has_5g_twin));
     c.set(k.at("element_adopt"), on_off(b(w, "element_adopt")));
     if b(w, "enhanced_iot") {
         c.set(k.at("iot"), "enabled");
@@ -686,11 +725,12 @@ fn render_wireless(c: &mut Cfg, ctx: &Ctx, radios: &[Radio], vaps: &[Vap], i: us
         c.set(k.at("bga_filter"), "enabled");
     }
     schedule(c, w, k, bit(caps.fw, 22), bit(caps.fw, 12));
-    let dtim = if r.band == "ng" && b(w, "iot_dtim_lock") {
+    let ng = r.band == Band::Ng;
+    let dtim = if ng && b(w, "iot_dtim_lock") {
         3
     } else if str_of(w, "dtim_mode") == Some("custom") {
-        int_of(w, &format!("dtim_{}", r.band)).unwrap_or(if r.band == "ng" { 1 } else { 3 })
-    } else if r.band == "ng" {
+        int_of(w, &format!("dtim_{}", r.band)).unwrap_or(if ng { 1 } else { 3 })
+    } else if ng {
         1
     } else {
         3
@@ -698,7 +738,7 @@ fn render_wireless(c: &mut Cfg, ctx: &Ctx, radios: &[Radio], vaps: &[Vap], i: us
     c.set(k.at("dtim_period"), dtim);
     if let Some(rate) = rate {
         c.set(k.at("minrate_data"), rate);
-        let beacon = if r.band == "ng" {
+        let beacon = if ng {
             match rate {
                 6000 | 9000 => 11000,
                 18000 | 36000 | 48000 | 54000 => 24000,
@@ -709,7 +749,7 @@ fn render_wireless(c: &mut Cfg, ctx: &Ctx, radios: &[Radio], vaps: &[Vap], i: us
         };
         c.set(k.at("beacon_rate"), beacon);
         c.set(k.at("mgmt_rate"), beacon);
-        if r.band == "ng" {
+        if ng {
             c.set(k.at("minrate_cck_rates.status"), allows_11b(rate));
         }
         if b(w, &format!("minrate_{}_advertising_rates", r.band)) {
@@ -730,9 +770,9 @@ fn render_wireless(c: &mut Cfg, ctx: &Ctx, radios: &[Radio], vaps: &[Vap], i: us
         }
     }
     if bit(caps.wifi2, 5) {
-        let (on, rssi) = match r.band.as_str() {
-            "na" => (b(w, "roaming_assistant_na_enabled"), int_of(w, "roaming_assistant_na_rssi").unwrap_or(-75)),
-            "6e" => (b(w, "roaming_assistant_6e_enabled"), int_of(w, "roaming_assistant_6e_rssi").unwrap_or(-88)),
+        let (on, rssi) = match r.band {
+            Band::Na => (b(w, "roaming_assistant_na_enabled"), int_of(w, "roaming_assistant_na_rssi").unwrap_or(-75)),
+            Band::Six => (b(w, "roaming_assistant_6e_enabled"), int_of(w, "roaming_assistant_6e_rssi").unwrap_or(-88)),
             _ => (false, 0),
         };
         if on {
