@@ -28,7 +28,7 @@ use serde_json::{Value, json};
 use crate::api::{ApiError, AppState};
 use crate::engine::Live;
 use crate::api::read;
-use crate::insights::{RangeQuery, window};
+use crate::insights::{RangeQuery, ap_name, client_name, memo_read, window};
 use crate::model::Ts;
 use crate::store::Db;
 
@@ -131,35 +131,31 @@ pub struct ConnEvent {
 /// Connection stages in the order a client passes them.
 pub const STAGES: [&str; 6] = ["association", "authentication", "dhcp", "dns", "traffic", "success"];
 
-/// Failure counters present in a report, as (stage 1-5, label).
-fn failures(n: &ConnDetail) -> Vec<(usize, &'static str)> {
-    let pos = |f: &Option<Field>| num(f).is_some_and(|v| v > 0.0);
-    let mut out = Vec::new();
-    if pos(&n.assoc_failures) {
-        out.push((1, "Association"));
-    }
-    if pos(&n.auth_failures) {
-        out.push((2, "Authentication"));
-    }
-    if pos(&n.wpa_auth_failures) {
-        out.push((2, "WPA authentication"));
-    }
-    if text(&n.radius_auth_status) == Some("failure") {
-        out.push((2, "RADIUS authentication"));
-    }
-    if pos(&n.ip_failures) {
-        out.push((3, "DHCP timeout"));
-    }
-    if pos(&n.dns_timeouts) {
-        out.push((4, "DNS timeout"));
-    }
-    if text(&n.dns_resp_seen) == Some("no") {
-        out.push((4, "DNS response not seen"));
-    }
-    if pos(&n.traffic_failures) {
-        out.push((5, "Traffic failure"));
-    }
-    out
+/// A counter above zero.
+fn pos(f: &Option<Field>) -> bool {
+    num(f).is_some_and(|v| v > 0.0)
+}
+
+/// Whether a report shows a failure.
+type Shows = fn(&ConnDetail) -> bool;
+
+/// The failures a report can show, as (stage 1-5, label, whether it shows
+/// it), by stage. Within a stage the later one wins: WPA over plain
+/// authentication, RADIUS over both, a missing DNS response over a timeout.
+const FAILURES: [(usize, &str, Shows); 8] = [
+    (1, "Association", |n| pos(&n.assoc_failures)),
+    (2, "Authentication", |n| pos(&n.auth_failures)),
+    (2, "WPA authentication", |n| pos(&n.wpa_auth_failures)),
+    (2, "RADIUS authentication", |n| text(&n.radius_auth_status) == Some("failure")),
+    (3, "DHCP timeout", |n| pos(&n.ip_failures)),
+    (4, "DNS timeout", |n| pos(&n.dns_timeouts)),
+    (4, "DNS response not seen", |n| text(&n.dns_resp_seen) == Some("no")),
+    (5, "Traffic failure", |n| pos(&n.traffic_failures)),
+];
+
+/// The furthest failure a report shows, as (stage, label).
+fn failure(n: &ConnDetail) -> Option<(usize, &'static str)> {
+    FAILURES.iter().rev().find(|f| (f.2)(n)).map(|f| (f.0, f.1))
 }
 
 /// A soft failure that kept its IP by roaming.
@@ -168,7 +164,6 @@ fn roamed(event_type: &str, n: &ConnDetail) -> bool {
 }
 
 fn succeeded(event_type: &str, n: &ConnDetail) -> bool {
-    let pos = |f: &Option<Field>| num(f).is_some_and(|v| v > 0.0);
     event_type != "failure"
         && (roamed(event_type, n) || (n.traffic_delta.is_none() && text(&n.dns_resp_seen) == Some("yes")) || (pos(&n.traffic_delta) && pos(&n.dns_responses)))
 }
@@ -263,8 +258,8 @@ pub fn attempts(mut events: Vec<ConnEvent>) -> Vec<Attempt> {
                 if rssi.is_some_and(|r| r < -75.0) {
                     return None;
                 }
-                let worst = *failures(n).iter().max_by_key(|f| f.0)?;
-                (worst.0, Some(worst.1))
+                let (stage, label) = failure(n)?;
+                (stage, Some(label))
             };
             Some(Attempt {
                 ts: e.ts,
@@ -362,6 +357,9 @@ fn band_rank(radio: Option<&str>) -> u8 {
     }
 }
 
+/// The reports of a client leaving an AP.
+const LEAVE_TYPES: [&str; 2] = ["sta_roam", "sta_leave"];
+
 /// Roams: a client leaving one AP paired with it joining another.
 pub fn roams(events: &[ConnEvent]) -> Vec<Roam> {
     let mut by_client: BTreeMap<&str, Vec<&ConnEvent>> = BTreeMap::new();
@@ -372,7 +370,7 @@ pub fn roams(events: &[ConnEvent]) -> Vec<Roam> {
     for (client, mut evs) in by_client {
         evs.sort_by_key(|e| e.ts);
         // Whether each event is a leave, and whether it carries the signal a join needs.
-        let leave: Vec<bool> = evs.iter().map(|e| matches!(e.event_type.as_str(), "sta_roam" | "sta_leave")).collect();
+        let leave: Vec<bool> = evs.iter().map(|e| LEAVE_TYPES.contains(&e.event_type.as_str())).collect();
         let joined: Vec<bool> = evs.iter().zip(&leave).map(|(e, l)| !l && num(&e.n.auth_rssi).is_some()).collect();
         let mut used: HashSet<usize> = HashSet::new();
         for (li, l) in evs.iter().enumerate() {
@@ -461,8 +459,10 @@ pub fn roam_clients(roams: &[Roam]) -> Vec<Value> {
     for r in roams {
         per.entry(&r.client).or_default().push(r);
     }
-    let mut out: Vec<Value> = per
-        .into_iter()
+    // Most roams first (by MAC among equals).
+    let mut per: Vec<(&str, Vec<&Roam>)> = per.into_iter().collect();
+    per.sort_by_key(|(_, rs)| std::cmp::Reverse(rs.len()));
+    per.into_iter()
         .map(|(c, mut rs)| {
             rs.sort_by_key(|r| r.ts);
             let sig: Vec<f64> = rs.iter().filter_map(|r| r.from.rssi).collect();
@@ -475,72 +475,89 @@ pub fn roam_clients(roams: &[Roam]) -> Vec<Value> {
                 "to_weaker": weaker, "quick_returns": back,
             })
         })
-        .collect();
-    out.sort_by(|a, b| b["roams"].as_u64().cmp(&a["roams"].as_u64()));
-    out
+        .collect()
+}
+
+/// The columns [`event_of`] reads.
+const COLUMNS: &str = "SELECT ts, ap_mac, client_mac, vap, essid, radio, event_type, detail, ip_assign_type, dns_responses, dns_timeouts, rssi FROM connections";
+
+/// A notification, from a row of [`COLUMNS`].
+fn event_of(r: &rusqlite::Row) -> rusqlite::Result<ConnEvent> {
+    let detail = r.get_ref(7)?.as_str_or_null()?;
+    // Rows from before the full notification was kept: rebuild what we can.
+    let n = detail.and_then(|d| serde_json::from_str(d).ok()).unwrap_or_else(|| ConnDetail {
+        ip_assign_type: r.get::<_, Option<String>>(8).ok().flatten().map(Field::Str),
+        dns_responses: r.get::<_, Option<i64>>(9).ok().flatten().map(Field::Int),
+        dns_timeouts: r.get::<_, Option<i64>>(10).ok().flatten().map(Field::Int),
+        avg_rssi: r.get::<_, Option<i64>>(11).ok().flatten().map(Field::Int),
+        ..Default::default()
+    });
+    Ok(ConnEvent { ts: r.get(0)?, ap: r.get(1)?, client: r.get(2)?, vap: r.get(3)?, essid: r.get(4)?, radio: r.get(5)?, event_type: r.get(6)?, n })
+}
+
+/// The rows of [`COLUMNS`] in a window, optionally one client's, that also
+/// meet `cond`, in `order`.
+fn query_rows(c: &rusqlite::Connection, from: Ts, to: Ts, client: Option<&str>, cond: &str, order: &str) -> rusqlite::Result<Vec<ConnEvent>> {
+    // Two statements: `(?3 IS NULL OR client_mac = ?3)` would keep SQLite off the per-client index.
+    let filter = if client.is_some() { "client_mac = ?3 AND ts >= ?1 AND ts <= ?2" } else { "ts >= ?1 AND ts <= ?2" };
+    let mut stmt = c.prepare(&format!("{COLUMNS} WHERE {filter} {cond} {order}"))?;
+    let params: Vec<&dyn rusqlite::ToSql> = match &client {
+        Some(m) => vec![&from, &to, m],
+        None => vec![&from, &to],
+    };
+    stmt.query_map(params.as_slice(), event_of)?.collect()
 }
 
 /// The notifications in a window (optionally one client's, and with
 /// `attempts_only` only the reports [`attempts`] reads), oldest first; or with
 /// `newest`, at most that many, newest first.
 pub fn load_rows(c: &rusqlite::Connection, from: Ts, to: Ts, client: Option<&str>, newest: Option<usize>, attempts_only: bool) -> rusqlite::Result<Vec<ConnEvent>> {
-    const COLUMNS: &str = "SELECT ts, ap_mac, client_mac, vap, essid, radio, event_type, detail, ip_assign_type, dns_responses, dns_timeouts, rssi FROM connections";
-    // Two statements: `(?3 IS NULL OR client_mac = ?3)` would keep SQLite off the per-client index.
-    let filter = if client.is_some() { "client_mac = ?3 AND ts >= ?1 AND ts <= ?2" } else { "ts >= ?1 AND ts <= ?2" };
     // The other reports (associations, leaves) are then not parsed for nothing.
     let types = if attempts_only { format!("AND event_type IN ('{}')", ATTEMPT_TYPES.join("', '")) } else { String::new() };
     let order = match newest {
         Some(n) => format!("ORDER BY ts DESC, id DESC LIMIT {n}"),
         None => "ORDER BY ts, id".into(),
     };
-    let mut stmt = c.prepare(&format!("{COLUMNS} WHERE {filter} {types} {order}"))?;
-    let params: Vec<&dyn rusqlite::ToSql> = match &client {
-        Some(m) => vec![&from, &to, m],
-        None => vec![&from, &to],
-    };
-    stmt.query_map(params.as_slice(), |r| {
-        let detail = r.get_ref(7)?.as_str_or_null()?;
-        // Rows from before the full notification was kept: rebuild what we can.
-        let n = detail.and_then(|d| serde_json::from_str(d).ok()).unwrap_or_else(|| ConnDetail {
-            ip_assign_type: r.get::<_, Option<String>>(8).ok().flatten().map(Field::Str),
-            dns_responses: r.get::<_, Option<i64>>(9).ok().flatten().map(Field::Int),
-            dns_timeouts: r.get::<_, Option<i64>>(10).ok().flatten().map(Field::Int),
-            avg_rssi: r.get::<_, Option<i64>>(11).ok().flatten().map(Field::Int),
-            ..Default::default()
-        });
-        Ok(ConnEvent { ts: r.get(0)?, ap: r.get(1)?, client: r.get(2)?, vap: r.get(3)?, essid: r.get(4)?, radio: r.get(5)?, event_type: r.get(6)?, n })
-    })?
-    .collect()
+    query_rows(c, from, to, client, &types, &order)
 }
 
-/// Loads the notifications in a window (optionally one client's), oldest first.
-async fn load(s: &AppState, from: Ts, to: Ts, client: Option<String>) -> Result<Vec<ConnEvent>, ApiError> {
-    read(&s.store, Db::Config, move |c| Ok(load_rows(c, from, to, client.as_deref(), None, false)?)).await
+/// The notifications in a window [`roams`] can pair (optionally one
+/// client's), oldest first: the client's leaves, and its reports from 10 s
+/// before to 15 s after one of them. The rest cannot be part of a roam, so
+/// the roams of these are the roams of the whole window.
+fn roam_rows(c: &rusqlite::Connection, from: Ts, to: Ts, client: Option<&str>) -> rusqlite::Result<Vec<ConnEvent>> {
+    // Each row looks for a leave nearby through the per-client index; only the rows kept are parsed.
+    let near = format!(
+        "AND EXISTS (SELECT 1 FROM connections l WHERE l.client_mac = connections.client_mac AND l.ts >= connections.ts - 15 AND l.ts <= connections.ts + 10 AND l.event_type IN ('{}'))",
+        LEAVE_TYPES.join("', '")
+    );
+    query_rows(c, from, to, client, &near, "ORDER BY ts, id")
 }
 
 /// The newest `limit` attempts (failed ones only with `failed`) and, with
-/// `with_roams`, roams in the window, newest first. Rows are read newest first,
-/// a growing batch at a time, until the lists asked for are full or the window
-/// is read: of a batch, only what lies more than [`FIXUP_WITHIN`] after its
-/// oldest row counts, as a fixup can still merge into a failure that long
-/// before it (and a roam's two reports are seconds apart).
+/// `with_roams`, roams in the window, newest first. Attempts are read newest
+/// first, a growing batch at a time, until the list is full or the window is
+/// read: of a batch, only what lies more than [`FIXUP_WITHIN`] after its oldest
+/// row counts, as a fixup can still merge into a failure that long before it.
+/// Roams come from the reports around the window's leaves only: a window
+/// rarely holds `limit` of them, and the reports in between need not be read.
 fn newest(c: &rusqlite::Connection, from: Ts, to: Ts, client: Option<&str>, limit: usize, failed: bool, with_roams: bool) -> rusqlite::Result<(Vec<Attempt>, Vec<Roam>)> {
     let mut batch = (limit * 4).max(2000);
-    loop {
-        // Without roams, only the attempts' own reports are read.
-        let mut events = load_rows(c, from, to, client, Some(batch), !with_roams)?;
+    let list = loop {
+        let mut events = load_rows(c, from, to, client, Some(batch), true)?;
         let all = events.len() < batch;
         // The oldest time read may have more rows than were read.
         let oldest = events.last().map_or(from, |e| e.ts);
         let settled = |ts: Ts| all || ts > oldest.saturating_add(FIXUP_WITHIN);
         events.reverse();
-        let r: Vec<Roam> = if with_roams { roams(&events).into_iter().rev().filter(|x| settled(x.ts)).take(limit).collect() } else { Vec::new() };
         let list: Vec<Attempt> = attempts(events).into_iter().rev().filter(|a| settled(a.ts) && (!failed || !a.success)).take(limit).collect();
-        if all || (list.len() == limit && (!with_roams || r.len() == limit)) {
-            return Ok((list, r));
+        if all || list.len() == limit {
+            break list;
         }
         batch *= 4;
-    }
+    };
+    let r = if with_roams { roams(&roam_rows(c, from, to, client)?).into_iter().rev().take(limit).collect() } else { Vec::new() };
+    Ok((list, r))
 }
 
 /// Every AP and client apctl knows, by MAC, with its display name if it has one.
@@ -550,26 +567,26 @@ pub struct Names {
     pub clients: HashMap<String, Option<String>>,
 }
 
+/// (MAC, name) rows of a query, by MAC.
+fn pairs<P: rusqlite::Params>(c: &rusqlite::Connection, sql: &str, params: P) -> rusqlite::Result<HashMap<String, Option<String>>> {
+    c.prepare(sql)?.query_map(params, |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?)))?.collect()
+}
+
+/// APs' names, else their hostnames.
+const AP_NAMES: &str = "SELECT mac, COALESCE(name, hostname) FROM devices";
+
 impl Names {
     /// From the database: APs' names (else hostnames) and clients' hostnames.
     pub fn load(c: &rusqlite::Connection) -> rusqlite::Result<Names> {
-        let pairs = |sql: &str| -> rusqlite::Result<HashMap<String, Option<String>>> {
-            c.prepare(sql)?.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?)))?.collect()
-        };
-        Ok(Names { aps: pairs("SELECT mac, COALESCE(name, hostname) FROM devices")?, clients: pairs("SELECT mac, hostname FROM clients")? })
+        Ok(Names { aps: pairs(c, AP_NAMES, [])?, clients: pairs(c, "SELECT mac, hostname FROM clients", [])? })
     }
 
     /// The same for some clients only: every AP (there are few), and the clients asked for.
-    fn load_for(c: &rusqlite::Connection, clients: &BTreeSet<&str>) -> rusqlite::Result<Names> {
-        let aps = c.prepare("SELECT mac, COALESCE(name, hostname) FROM devices")?.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?)))?.collect::<rusqlite::Result<_>>()?;
-        let mut names = Names { aps, clients: HashMap::new() };
-        let list: Vec<&str> = clients.iter().copied().collect();
-        for chunk in list.chunks(500) {
+    fn load_for(c: &rusqlite::Connection, clients: &[String]) -> rusqlite::Result<Names> {
+        let mut names = Names { aps: pairs(c, AP_NAMES, [])?, clients: HashMap::new() };
+        for chunk in clients.chunks(500) {
             let sql = format!("SELECT mac, hostname FROM clients WHERE mac IN ({})", vec!["?"; chunk.len()].join(", "));
-            for row in c.prepare(&sql)?.query_map(rusqlite::params_from_iter(chunk), |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?)))? {
-                let (mac, name) = row?;
-                names.clients.insert(mac, name);
-            }
+            names.clients.extend(pairs(c, &sql, rusqlite::params_from_iter(chunk))?);
         }
         Ok(names)
     }
@@ -598,14 +615,15 @@ impl Names {
 }
 
 /// Display names (aliases first) of the APs and clients named in a response,
-/// for the ones that have one.
+/// for the ones that have one: what they report now, else what was stored.
 async fn names<'a>(s: &AppState, macs: impl Iterator<Item = (&'a str, &'a str)>) -> Result<(HashMap<String, String>, HashMap<String, String>), ApiError> {
     let (aps, clients): (BTreeSet<&str>, BTreeSet<&str>) = macs.unzip();
-    let wanted: BTreeSet<String> = clients.iter().map(|m| m.to_string()).collect();
-    let mut names = read(&s.store, Db::Config, move |c| Ok(Names::load_for(c, &wanted.iter().map(String::as_str).collect())?)).await?;
-    names.add_live(&s.live.read().unwrap());
-    let named = |m: HashMap<String, Option<String>>, keep: &BTreeSet<&str>| m.into_iter().filter(|(mac, _)| keep.contains(mac.as_str())).filter_map(|(mac, n)| n.map(|n| (mac, n))).collect();
-    Ok((named(names.aps, &aps), named(names.clients, &clients)))
+    let wanted: Vec<String> = clients.iter().map(|m| m.to_string()).collect();
+    let mut stored = read(&s.store, Db::Config, move |c| Ok(Names::load_for(c, &wanted)?)).await?;
+    let live = s.live.read().unwrap();
+    let aps = aps.into_iter().filter_map(|m| Some((m.to_string(), ap_name(&live, m).or_else(|| stored.aps.remove(m).flatten())?))).collect();
+    let clients = clients.into_iter().filter_map(|m| Some((m.to_string(), client_name(&live, m.parse().ok()).or_else(|| stored.clients.remove(m).flatten())?))).collect();
+    Ok((aps, clients))
 }
 
 /// (AP, client) of every attempt and both ends of every roam.
@@ -617,16 +635,21 @@ fn macs_of<'a>(attempts: &'a [Attempt], roams: &'a [Roam]) -> impl Iterator<Item
 /// GET /api/site/connectivity: connection success per client and stage, for
 /// all bands and each band.
 pub async fn connectivity(State(s): State<AppState>, Query(q): Query<RangeQuery>) -> Result<Json<Value>, ApiError> {
-    let (from, to, _) = window(&q);
-    let list = attempts(read(&s.store, Db::Config, move |c| Ok(load_rows(c, from, to, None, None, true)?)).await?);
-    let mut bands = serde_json::Map::new();
-    for b in [None, Some("ng"), Some("na"), Some("6e")] {
-        let v = connectivity_stats(&list, b);
-        if b.is_none() || v["attempts"].as_u64().unwrap_or(0) > 0 {
-            bands.insert(b.unwrap_or("all").into(), v);
+    let (from, to, tier) = window(&q);
+    // Every report in the window is read and parsed: the result is reused for a while.
+    let bands = memo_read(&s, Db::Config, "connectivity", &q, tier, move |c| {
+        let list = attempts(load_rows(c, from, to, None, None, true)?);
+        let mut bands = serde_json::Map::new();
+        for b in [None, Some("ng"), Some("na"), Some("6e")] {
+            let v = connectivity_stats(&list, b);
+            if b.is_none() || v["attempts"].as_u64().unwrap_or(0) > 0 {
+                bands.insert(b.unwrap_or("all").into(), v);
+            }
         }
-    }
-    Ok(Json(json!({ "bands": bands })))
+        Ok(bands)
+    })
+    .await?;
+    Ok(Json(json!({ "bands": *bands })))
 }
 
 #[derive(Deserialize)]
@@ -672,14 +695,19 @@ pub struct RoamingQuery {
 /// GET /api/roaming: the newest roams in the window (default two days), with
 /// totals, per-AP-pair and per-client figures over all of them.
 pub async fn roaming(State(s): State<AppState>, Query(q): Query<RoamingQuery>) -> Result<Json<Value>, ApiError> {
-    let (from, to, _) = window(&RangeQuery { range: q.range.or(Some(2 * 86400)), from: q.from, to: q.to, ..Default::default() });
-    let events = load(&s, from, to, None).await?;
-    let r = roams(&events);
-    let (total, pairs, clients) = (roam_totals(&r), roam_pairs(&r), roam_clients(&r));
-    let (aps, names) = names(&s, macs_of(&[], &r)).await?;
-    let mut list = r;
-    list.reverse();
-    list.truncate(q.limit.unwrap_or(100).min(1000));
+    let range = RangeQuery { range: q.range.or(Some(2 * 86400)), from: q.from, to: q.to, ..Default::default() };
+    let (from, to, tier) = window(&range);
+    // Roams newest first, and the figures over all of them, reused for a while.
+    let got = memo_read(&s, Db::Config, "roaming", &range, tier, move |c| {
+        let mut r = roams(&roam_rows(c, from, to, None)?);
+        let figures = (roam_totals(&r), roam_pairs(&r), roam_clients(&r));
+        r.reverse();
+        Ok((r, figures))
+    })
+    .await?;
+    let (r, (total, pairs, clients)) = &*got;
+    let (aps, names) = names(&s, macs_of(&[], r)).await?;
+    let list = &r[..r.len().min(q.limit.unwrap_or(100).min(1000))];
     Ok(Json(json!({ "from": from, "to": to, "total": total, "roams": list, "pairs": pairs, "clients": clients, "ap_names": aps, "client_names": names })))
 }
 
@@ -727,6 +755,16 @@ mod tests {
         assert_eq!(v["success_pct"].as_f64(), Some(67.0));
         assert_eq!(v["failed_at"]["dns"], 1);
         assert_eq!(connectivity_stats(&list, Some("ng"))["clients"], 0);
+    }
+
+    #[test]
+    fn a_failure_is_placed_at_its_furthest_and_most_specific_stage() {
+        let f = |n: Value| failure(&serde_json::from_value(n).unwrap());
+        assert_eq!(f(json!({ "auth_failures": 1, "wpa_auth_failures": 2 })), Some((2, "WPA authentication")));
+        assert_eq!(f(json!({ "wpa_auth_failures": 2, "radius_auth_status": "failure", "assoc_failures": 1 })), Some((2, "RADIUS authentication")));
+        assert_eq!(f(json!({ "dns_timeouts": 1, "dns_resp_seen": "no" })), Some((4, "DNS response not seen")));
+        assert_eq!(f(json!({ "assoc_failures": 1, "traffic_failures": 1 })), Some((5, "Traffic failure")));
+        assert_eq!(f(json!({ "dns_timeouts": 0, "dns_resp_seen": "yes" })), None);
     }
 
     #[test]
@@ -860,6 +898,45 @@ mod tests {
             assert_eq!(json!(list), json!(want), "{client:?} {failed} {limit}");
             assert_eq!(json!(r), json!(want_r), "{client:?} {failed} {limit}");
             assert_eq!(list.len(), limit.min(want.len()));
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_few_roams_among_many_attempts_are_found_without_reading_them_all() {
+        let dir = std::env::temp_dir().join(format!("apctl-roams-{}-{}", std::process::id(), crate::store::now_ts()));
+        let (store, _writer) = crate::store::Store::open(&dir).unwrap();
+        let c = rusqlite::Connection::open(dir.join("config.db")).unwrap();
+        let sql = "INSERT INTO connections (ts, ap_mac, client_mac, vap, essid, radio, event_type, detail) VALUES (?1, ?2, ?3, 'wifi1ap0', 'Home', 'na', ?4, ?5)";
+        let (a1, a2) = ("02:00:00:00:00:a1", "02:00:00:00:00:a2");
+        let (me, other) = ("02:00:00:00:10:01", "02:00:00:00:10:02");
+        let row = |ts: i64, ap: &str, client: &str, kind: &str, detail: Value| c.execute(sql, rusqlite::params![ts, ap, client, kind, detail.to_string()]).unwrap();
+        c.execute_batch("BEGIN").unwrap();
+        // A success every 5 s for a day, two clients taking turns.
+        for i in 0..17_280i64 {
+            let client = if i % 2 == 0 { me } else { other };
+            row(1_000_000 + i * 5, a1, client, "success", json!({ "traffic_delta": 120000, "dns_responses": 1, "auth_rssi": -55 }));
+        }
+        // Three roams of one client; the other leaves too but comes back to the same AP.
+        for t in [1_010_002, 1_040_002, 1_080_002] {
+            row(t, a1, me, "sta_roam", json!({ "avg_rssi": -76 }));
+            row(t + 1, a2, me, "association", json!({ "auth_rssi": -58, "auth_algo": "ft" }));
+        }
+        row(1_050_003, a1, other, "sta_leave", json!({ "avg_rssi": -70 }));
+        row(1_050_009, a1, other, "association", json!({ "auth_rssi": -60 }));
+        c.execute_batch("COMMIT").unwrap();
+        let (from, to) = (1_000_000, 1_000_000 + 86400);
+        for client in [Some(me), None] {
+            let (list, r) = store.read(Db::Config, |c| Ok(newest(c, from, to, client, 100, false, true)?)).unwrap();
+            let all = store.read(Db::Config, |c| Ok(load_rows(c, from, to, client, None, false)?)).unwrap();
+            let mut want = roams(&all);
+            want.reverse();
+            assert_eq!(json!(r), json!(want), "{client:?}");
+            assert_eq!(r.len(), 3);
+            assert_eq!(list.len(), 100);
+            // Only the leaves and the reports around them were read.
+            let read = store.read(Db::Config, |c| Ok(roam_rows(c, from, to, client)?)).unwrap();
+            assert!(read.len() < 40, "{} rows", read.len());
         }
         let _ = std::fs::remove_dir_all(&dir);
     }

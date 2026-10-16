@@ -254,12 +254,9 @@ pub struct Change {
     pub width: Option<i64>,
 }
 
-/// Scans, plans and (when worth it) applies, band by band.
-pub async fn run(s: AppState, bands: Vec<String>, trigger: &'static str) {
-    let Some(_running) = RunGuard::take() else {
-        tracing::info!("channel AI: a run is already going");
-        return;
-    };
+/// Scans, plans and (when worth it) applies, band by band, holding the run
+/// flag (`_running`) until done.
+async fn run(s: AppState, bands: Vec<String>, trigger: &'static str, _running: RunGuard) {
     for band in bands.iter().filter(|b| BANDS.contains(&b.as_str())) {
         let scanned = start_scans(&mut s.live.write().unwrap(), band, store::now_ts());
         tracing::info!("channel AI ({trigger}): {} APs scanning {band}", scanned.len());
@@ -315,7 +312,7 @@ pub fn schedule(s: AppState) {
         return;
     }
     tokio::spawn(async move {
-        let mut last_day = None;
+        let mut nightly = Nightly::default();
         loop {
             tokio::time::sleep(Duration::from_secs(30)).await;
             let (cfg, tz) = {
@@ -325,12 +322,45 @@ pub fn schedule(s: AppState) {
                 (settings(st), tz)
             };
             let (day, minute) = crate::clock::local(tz.as_deref(), store::now_ts());
-            if cfg.enabled && minute == cfg.hour * 60 + cfg.minute && last_day != Some(day) {
-                last_day = Some(day);
-                run(s.clone(), cfg.radios.clone(), "nightly").await;
+            if !nightly.due(&cfg, day, minute) {
+                continue;
+            }
+            match RunGuard::take() {
+                Some(guard) => {
+                    nightly.started(day);
+                    run(s.clone(), cfg.radios.clone(), "nightly", guard).await;
+                }
+                None if minute == cfg.hour * 60 + cfg.minute => tracing::info!("channel AI: a run is already going; the nightly run follows it"),
+                None => {}
             }
         }
     });
+}
+
+/// When the nightly run is due: from the setting's minute until it has
+/// started that day, so that a run going at that minute only delays it.
+#[derive(Debug, Default)]
+struct Nightly {
+    /// The day the nightly run last started.
+    done: Option<i64>,
+    /// The day whose run is due and has not started yet.
+    waiting: Option<i64>,
+}
+
+impl Nightly {
+    /// Whether the nightly run should start now (`day`, `minute`: the local
+    /// day and minute of the day). A wait does not carry over into the next day.
+    fn due(&mut self, cfg: &Settings, day: i64, minute: i64) -> bool {
+        if cfg.enabled && minute == cfg.hour * 60 + cfg.minute && self.done != Some(day) {
+            self.waiting = Some(day);
+        }
+        cfg.enabled && self.waiting == Some(day)
+    }
+
+    fn started(&mut self, day: i64) {
+        self.done = Some(day);
+        self.waiting = None;
+    }
 }
 
 /// The next nightly run (UTC), if enabled: the first minute after now at the
@@ -401,11 +431,10 @@ pub struct RunBody {
 /// POST /api/rf/channel-ai/run {bands?}: scan, plan and apply now.
 pub async fn run_now(State(s): State<AppState>, Json(b): Json<RunBody>) -> Result<Json<Value>, ApiError> {
     crate::api::require_active(&s, "this needs")?;
-    if RUNNING.load(Ordering::SeqCst) {
-        return Err(ApiError(StatusCode::CONFLICT, "Channel AI is already running".into()));
-    }
+    // Taken here, so that of two requests at once only one is told it started.
+    let guard = RunGuard::take().ok_or_else(|| ApiError(StatusCode::CONFLICT, "Channel AI is already running".into()))?;
     let bands = b.bands.unwrap_or_else(|| settings(s.live.read().unwrap().state.as_deref()).radios);
-    tokio::spawn(run(s.clone(), bands, "manual"));
+    tokio::spawn(run(s.clone(), bands, "manual", guard));
     Ok(Json(json!({ "started": true })))
 }
 
@@ -463,7 +492,9 @@ pub fn apply_settings(state: &mut Value, p: &Value) -> Result<String, String> {
     }
     if !p["hour"].is_null() {
         let h = p["hour"].as_i64().filter(|h| (0..24).contains(h)).ok_or("the hour must be 0 to 23")?;
-        r["cron_expr"] = json!(format!("0 {h} * * *"));
+        // The minute stays (an imported setting may have one).
+        let (_, m) = parse_cron(r["cron_expr"].as_str().unwrap_or("0 3 * * *"));
+        r["cron_expr"] = json!(format!("{m} {h} * * *"));
     }
     if !p["radios"].is_null() {
         let radios: Vec<String> = p["radios"].as_array().ok_or("radios must be a list")?.iter().filter_map(|v| v.as_str().map(str::to_string)).collect();
@@ -547,6 +578,10 @@ mod tests {
         // ng: Germany's 1-13 minus the blacklist (2 and 13 here).
         assert_eq!(r["channels_ng"].as_array().unwrap().len(), 11);
         assert!(apply_settings(&mut s, &json!({ "hour": 24 })).is_err());
+        // An imported minute is kept when only the hour changes.
+        setting_mut(&mut s, "radio_ai")["cron_expr"] = json!("30 2 * * *");
+        apply_settings(&mut s, &json!({ "hour": 6 })).unwrap();
+        assert_eq!((settings(Some(&s)).hour, settings(Some(&s)).minute), (6, 30));
         assert!(apply_settings(&mut s, &json!({ "exclude_devices": ["02:00:00:00:00:99"] })).is_err());
         apply_settings(&mut s, &json!({ "exclude_devices": ["02:00:00:00:00:01"] })).unwrap();
         assert_eq!(settings(Some(&s)).exclude_devices, vec!["02:00:00:00:00:01"]);
@@ -620,6 +655,23 @@ mod tests {
         });
         assert!(r.is_err());
         assert!(!RUNNING.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn a_nightly_run_held_up_by_another_starts_after_it() {
+        let cfg = Settings { enabled: true, hour: 3, minute: 15, radios: vec![], dfs: false, exclude_devices: vec![] };
+        let mut n = Nightly::default();
+        assert!(!n.due(&cfg, 1, 3 * 60 + 14));
+        // Due at its minute; another run is going, so it waits, and is still due after.
+        assert!(n.due(&cfg, 1, 3 * 60 + 15));
+        assert!(n.due(&cfg, 1, 3 * 60 + 17));
+        n.started(1);
+        assert!(!n.due(&cfg, 1, 3 * 60 + 15), "once a day");
+        assert!(!n.due(&cfg, 2, 3 * 60 + 16), "not before its minute");
+        assert!(n.due(&cfg, 2, 3 * 60 + 15));
+        // A run that never got to start is not carried into the next day.
+        assert!(!n.due(&cfg, 3, 3 * 60 + 14));
+        assert!(!n.due(&Settings { enabled: false, ..cfg }, 2, 3 * 60 + 15));
     }
 
     #[test]
