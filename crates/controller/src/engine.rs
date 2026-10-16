@@ -703,8 +703,8 @@ impl Engine {
 
     /// Stores an AP's section numbering in the settings, so later renders keep it.
     fn set_config_meta(&mut self, mac: Mac, meta: Value) {
-        let mut live = self.live.write().unwrap();
-        let Some(state) = live.state.clone() else { return };
+        // Copied and serialised without the lock, as in `edit_state`.
+        let Some(state) = self.live.read().unwrap().state.clone() else { return };
         let mac_s = mac.to_string();
         let same_mac = |m: &Value| m["mac"].as_str().is_some_and(|x| x.eq_ignore_ascii_case(&mac_s));
         let current = state["config_meta"].as_array().and_then(|a| a.iter().find(|m| same_mac(m)));
@@ -719,7 +719,7 @@ impl Engine {
         list.retain(|m| !same_mac(m));
         list.push(meta);
         self.writer.exec(Db::Config, "UPDATE controller_state SET json = ?1 WHERE id = 1", vec![Sql::Text(next.to_string())]);
-        live.state = Some(Arc::new(next));
+        self.live.write().unwrap().state = Some(Arc::new(next));
     }
 
     fn set_state(&mut self, ts: Ts, state: Value) {
@@ -735,20 +735,25 @@ impl Engine {
         self.emit(ev(ts, "settings_imported", None, None, summary));
     }
 
+    /// The engine is the only writer of the settings, so they cannot change
+    /// between reading and swapping them in: the copy, the edit (which may hash
+    /// a password) and the serialising run without holding the lock.
     fn edit_state(&mut self, ts: Ts, what: String, edit: StateEdit) -> Result<(), String> {
-        let mut live = self.live.write().unwrap();
-        let mut state = live.state.as_deref().cloned().ok_or("no settings imported yet")?;
+        let (current, imported_at) = {
+            let live = self.live.read().unwrap();
+            (live.state.clone(), live.state_imported_at.unwrap_or(ts))
+        };
+        let mut state = current.as_deref().cloned().ok_or("no settings imported yet")?;
         edit(&mut state)?;
-        let imported_at = live.state_imported_at.unwrap_or(ts);
         self.writer.exec(
             Db::Config,
             "INSERT OR REPLACE INTO controller_state (id, json, imported_at) VALUES (1, ?1, ?2)",
             vec![Sql::Text(state.to_string()), Sql::Integer(imported_at)],
         );
-        live.state = Some(Arc::new(state));
+        self.live.write().unwrap().state = Some(Arc::new(state));
         self.emit(ev(ts, "settings_changed", None, None, json!({ "what": what })));
         // The APs pick the change up now rather than at their next interval.
-        crate::stun::poke_all(&live);
+        crate::stun::poke_all(&self.live.read().unwrap());
         Ok(())
     }
 
