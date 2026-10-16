@@ -17,7 +17,7 @@
 use std::fs::{self, File};
 use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use aes_gcm::aead::{Aead, KeyInit, Payload};
@@ -41,6 +41,10 @@ const MAGIC: &[u8; 8] = b"APCTLBK1";
 const CHUNK: usize = 1 << 20;
 const TAG: usize = 16;
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+/// The largest backup that can be uploaded.
+const UPLOAD_LIMIT: u64 = 1 << 30;
+/// Staged restores and uploads not used within this long are deleted.
+const STAGING_TTL: Duration = Duration::from_secs(3600);
 
 /// Where backups live and how they are sealed.
 #[derive(Clone)]
@@ -226,12 +230,30 @@ pub struct Manifest {
     pub files: std::collections::BTreeMap<String, FileInfo>,
 }
 
+/// What made a backup.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Kind {
+    Auto,
+    Manual,
+    PreRestore,
+}
+
+impl Kind {
+    fn prefix(self) -> &'static str {
+        match self {
+            Kind::Auto => "apctl-auto-",
+            Kind::PreRestore => "apctl-prerestore-",
+            Kind::Manual => "apctl-",
+        }
+    }
+}
+
 /// A backup's description, kept beside it (`<name>.json`) for listing.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Meta {
     pub name: String,
-    /// `auto`, `manual` or `pre-restore`.
-    pub kind: String,
+    pub kind: Kind,
     pub version: String,
     pub created: Ts,
     pub days: i64,
@@ -253,6 +275,32 @@ fn sha256_file(path: &Path) -> Result<FileInfo> {
         size += n as u64;
     }
     Ok(FileInfo { size, sha256: hex::encode(h.finalize()) })
+}
+
+/// Hashes and counts what passes through to the file.
+struct Hashing {
+    out: File,
+    hash: Sha256,
+    size: u64,
+}
+
+impl Write for Hashing {
+    fn write(&mut self, d: &[u8]) -> io::Result<usize> {
+        let n = self.out.write(d)?;
+        self.hash.update(&d[..n]);
+        self.size += n as u64;
+        Ok(n)
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        self.out.flush()
+    }
+}
+
+/// Eight random hex characters, to keep names unique.
+fn random_hex() -> Result<String> {
+    let mut b = [0u8; 4];
+    getrandom::fill(&mut b).map_err(|e| anyhow!("random: {e}"))?;
+    Ok(hex::encode(b))
 }
 
 /// A consistent copy of a live database.
@@ -279,19 +327,21 @@ fn trim(dir: &Path, cutoff: Option<Ts>) -> Result<()> {
     c.execute_batch("VACUUM;")?;
     drop(c);
     if let Some(t) = cutoff {
-        for name in ["metrics.db", "logs.db"] {
+        // Every metric table in every tier, and the logs (whose full-text index follows by trigger).
+        let metrics: Vec<String> = store::TABLES.iter().flat_map(|t| store::TIERS.iter().map(move |(suffix, ..)| format!("{}{suffix}", t.name))).collect();
+        for (name, tables) in [("metrics.db", metrics), ("logs.db", vec!["logs".to_string()])] {
             let p = dir.join(name);
             if !p.exists() {
                 continue;
             }
             let c = Connection::open(&p)?;
             c.execute_batch("PRAGMA temp_store=MEMORY;")?;
-            let tables: Vec<String> = c
-                .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND sql LIKE '%ts INTEGER%' AND name NOT LIKE '%fts%'")?
-                .query_map([], |r| r.get(0))?
-                .collect::<rusqlite::Result<_>>()?;
             for table in tables {
-                c.execute(&format!("DELETE FROM \"{table}\" WHERE ts < ?1"), [t])?;
+                // A database from an older version may lack the newest tables.
+                let exists: bool = c.query_row("SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1", [&table], |r| r.get::<_, i64>(0))? > 0;
+                if exists {
+                    c.execute(&format!("DELETE FROM \"{table}\" WHERE ts < ?1"), [t])?;
+                }
             }
             c.execute_batch("VACUUM;")?;
         }
@@ -299,31 +349,32 @@ fn trim(dir: &Path, cutoff: Option<Ts>) -> Result<()> {
     Ok(())
 }
 
+/// `YYYYMMDD-HHMMSS` in UTC.
 fn stamp(ts: Ts) -> String {
-    let days = ts.div_euclid(86400);
+    let (y, m, d) = crate::clock::civil_from_days(ts.div_euclid(86400));
     let secs = ts.rem_euclid(86400);
-    // Civil date from days since 1970-01-01 (Howard Hinnant's algorithm).
-    let z = days + 719_468;
-    let era = z.div_euclid(146_097);
-    let doe = z - era * 146_097;
-    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
-    let y = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 };
-    let y = if m <= 2 { y + 1 } else { y };
-    format!("{y:04}{m:02}{d:02}-{:02}{:02}", secs / 3600, (secs % 3600) / 60)
+    format!("{y:04}{m:02}{d:02}-{:02}{:02}{:02}", secs / 3600, (secs % 3600) / 60, secs % 60)
 }
 
+/// One backup is written at a time (an automatic one may coincide with one
+/// asked for), so each gets its own name.
+static CREATING: Mutex<()> = Mutex::new(());
+
 /// Writes a backup of the databases in `src_dir` and returns its description.
-pub fn create(b: &Backups, src_dir: &Path, kind: &str, days: i64) -> Result<Meta> {
+pub fn create(b: &Backups, src_dir: &Path, kind: Kind, days: i64) -> Result<Meta> {
+    let _one = CREATING.lock().unwrap_or_else(PoisonError::into_inner);
     let now = store::now_ts();
     let dir = b.dir();
     fs::create_dir_all(&dir)?;
-    let tmp = dir.join(format!(".tmp-{now}-{}", std::process::id()));
-    let _ = fs::remove_dir_all(&tmp);
-    fs::create_dir_all(&tmp)?;
+    let tmp = dir.join(format!(".tmp-{now}-{}-{}", std::process::id(), random_hex()?));
+    fs::create_dir(&tmp)?;
+    // A name no other backup has: the time to the second, then a counter.
+    let base = format!("{}{VERSION}-{}", kind.prefix(), stamp(now));
+    let name = (1..)
+        .map(|i| if i == 1 { format!("{base}.apb") } else { format!("{base}-{i}.apb") })
+        .find(|n| !dir.join(n).exists() && !dir.join(format!("{n}.part")).exists())
+        .expect("a free name");
+    let part = dir.join(format!("{name}.part"));
     let result = (|| -> Result<Meta> {
         let mut names = vec!["config.db"];
         if days != 0 {
@@ -348,15 +399,8 @@ pub fn create(b: &Backups, src_dir: &Path, kind: &str, days: i64) -> Result<Meta
             }
         }
         let manifest = Manifest { format: 1, app: "apctl".into(), version: VERSION.into(), created: now, days, files };
-        let prefix = match kind {
-            "auto" => "apctl-auto-",
-            "pre-restore" => "apctl-prerestore-",
-            _ => "apctl-",
-        };
-        let name = format!("{prefix}{VERSION}-{}.apb", stamp(now));
-        let part = dir.join(format!("{name}.part"));
         {
-            let out = BufWriter::new(File::create(&part)?);
+            let out = BufWriter::new(fs::OpenOptions::new().write(true).create_new(true).open(&part)?);
             let sink = match &b.key {
                 Some(k) => Sink::Sealed(Box::new(SealWriter::new(out, k)?)),
                 None => {
@@ -383,10 +427,15 @@ pub fn create(b: &Backups, src_dir: &Path, kind: &str, days: i64) -> Result<Meta
         }
         fs::rename(&part, dir.join(&name))?;
         let size = fs::metadata(dir.join(&name))?.len();
-        let meta = Meta { name: name.clone(), kind: kind.into(), version: VERSION.into(), created: now, days, size, encrypted: b.key.is_some() };
+        let meta = Meta { name: name.clone(), kind, version: VERSION.into(), created: now, days, size, encrypted: b.key.is_some() };
         fs::write(dir.join(format!("{name}.json")), serde_json::to_vec_pretty(&meta)?)?;
         Ok(meta)
     })();
+    if result.is_err() {
+        // Nothing half-written stays behind (the name is this call's own).
+        let _ = fs::remove_file(&part);
+        let _ = fs::remove_file(dir.join(&name));
+    }
     let _ = fs::remove_dir_all(&tmp);
     result
 }
@@ -428,6 +477,9 @@ pub fn unpack(path: &Path, key: Option<&[u8; 32]>, dest: &Path) -> Result<Manife
         let mut e = entry?;
         let name = e.path()?.to_string_lossy().to_string();
         if name == "manifest.json" {
+            if e.header().size()? > 1 << 20 {
+                bail!("the backup's manifest is too large");
+            }
             let mut s = String::new();
             e.read_to_string(&mut s)?;
             manifest = Some(serde_json::from_str(&s).context("the backup's manifest is unreadable")?);
@@ -439,11 +491,15 @@ pub fn unpack(path: &Path, key: Option<&[u8; 32]>, dest: &Path) -> Result<Manife
         }
         let m = manifest.as_ref().ok_or_else(|| anyhow!("the backup has no manifest"))?;
         let expected = m.files.get(&name).ok_or_else(|| anyhow!("{name} is not listed in the manifest"))?;
-        let mut out = File::create(dest.join(&name))?;
+        // Checked before anything is written, so an oversized entry cannot fill the disk.
+        if e.header().size()? != expected.size {
+            bail!("{name} does not match its checksum: the backup is damaged");
+        }
+        // Hashed while it is written (a file twice in the archive is refused).
+        let mut out = Hashing { out: fs::OpenOptions::new().write(true).create_new(true).open(dest.join(&name))?, hash: Sha256::new(), size: 0 };
         io::copy(&mut e, &mut out)?;
-        out.sync_all()?;
-        let got = sha256_file(&dest.join(&name))?;
-        if &got != expected {
+        out.out.sync_all()?;
+        if (FileInfo { size: out.size, sha256: hex::encode(out.hash.finalize()) }) != *expected {
             bail!("{name} does not match its checksum: the backup is damaged");
         }
     }
@@ -467,39 +523,103 @@ pub fn version_ok(theirs: &str, ours: &str) -> bool {
 
 // ---------------------------------------------------------------- restore
 
+/// Whether a staging id is one `stage` made (`r` and digits).
+fn valid_id(id: &str) -> bool {
+    id.strip_prefix('r').is_some_and(|d| !d.is_empty() && d.chars().all(|c| c.is_ascii_digit()))
+}
+
 /// Applies a staged restore, if any, before the databases are opened: saves
 /// the current state as a pre-restore backup, then swaps the staged files in.
 /// A settings-only backup leaves the current statistics and logs in place.
+///
+/// A restore that fails is logged and set aside (`pending.failed`, shown on
+/// the backups page) and apctl starts with the data it has, rather than
+/// failing on every start. Also clears out staging left behind.
 pub fn apply_pending(b: &Backups) -> Result<()> {
     let marker = b.staging().join("pending");
-    let Ok(id) = fs::read_to_string(&marker) else { return Ok(()) };
-    let staged = b.staging().join(id.trim());
+    if let Ok(id) = fs::read_to_string(&marker) {
+        match apply(b, id.trim()) {
+            Ok(()) => {
+                let _ = fs::remove_file(&marker);
+                let _ = fs::remove_file(b.staging().join("pending.failed"));
+                tracing::warn!("restore complete");
+            }
+            Err(e) => {
+                tracing::error!("the staged restore failed; starting with the current data: {e:#}");
+                let failed = b.staging().join("pending.failed");
+                if fs::write(&failed, format!("{e:#}")).is_err() || fs::remove_file(&marker).is_err() {
+                    let _ = fs::rename(&marker, &failed);
+                }
+            }
+        }
+    }
+    clean_staging(b);
+    Ok(())
+}
+
+fn apply(b: &Backups, id: &str) -> Result<()> {
+    if !valid_id(id) {
+        bail!("the restore marker names no staged backup ({id:?})");
+    }
+    let staged = b.staging().join(id);
     let manifest: Manifest = serde_json::from_slice(&fs::read(staged.join("manifest.json")).context("staged restore has no manifest")?)?;
     tracing::warn!("restoring the backup made {} by apctl {} (history: {} days)", manifest.created, manifest.version, manifest.days);
     if b.data_dir.join("config.db").exists() {
-        let pre = create(b, &b.data_dir, "pre-restore", -1).context("saving the current state before restoring")?;
+        let pre = create(b, &b.data_dir, Kind::PreRestore, -1).context("saving the current state before restoring")?;
         tracing::info!("saved the state before the restore as {}", pre.name);
     }
+    // Copy everything first: if a copy fails, the current databases are untouched.
+    let restoring = |n: &str| b.data_dir.join(format!("{n}.restoring"));
     for n in manifest.files.keys() {
+        if let Err(e) = fs::copy(staged.join(n), restoring(n)) {
+            for n in manifest.files.keys() {
+                let _ = fs::remove_file(restoring(n));
+            }
+            return Err(e).with_context(|| format!("copying {n} into place"));
+        }
+    }
+    for n in manifest.files.keys() {
+        fs::rename(restoring(n), b.data_dir.join(n))?;
+        // The replaced database's journal must not be applied to the restored one.
         for suffix in ["-wal", "-shm"] {
             let _ = fs::remove_file(b.data_dir.join(format!("{n}{suffix}")));
         }
-        fs::copy(staged.join(n), b.data_dir.join(format!("{n}.restoring")))?;
-        fs::rename(b.data_dir.join(format!("{n}.restoring")), b.data_dir.join(n))?;
     }
-    fs::remove_file(&marker)?;
     let _ = fs::remove_dir_all(&staged);
-    tracing::warn!("restore complete");
     Ok(())
+}
+
+/// Deletes staged restores and uploads that were left behind (older than an
+/// hour), except the restore waiting to be applied.
+fn clean_staging(b: &Backups) {
+    let keep = fs::read_to_string(b.staging().join("pending")).ok().map(|s| s.trim().to_string());
+    for e in fs::read_dir(b.staging()).into_iter().flatten().flatten() {
+        let name = e.file_name().to_string_lossy().into_owned();
+        if name == "pending" || name == "pending.failed" || keep.as_deref() == Some(name.as_str()) {
+            continue;
+        }
+        let old = e.metadata().and_then(|m| m.modified()).ok().and_then(|t| t.elapsed().ok()).is_some_and(|age| age > STAGING_TTL);
+        if old {
+            let p = e.path();
+            let _ = if p.is_dir() { fs::remove_dir_all(&p) } else { fs::remove_file(&p) };
+        }
+    }
 }
 
 // ---------------------------------------------------------------- settings and schedule
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Frequency {
+    Daily,
+    Weekly,
+    Monthly,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Settings {
     pub enabled: bool,
-    /// `daily`, `weekly` or `monthly`.
-    pub frequency: String,
+    pub frequency: Frequency,
     /// Time of day in UTC, minutes after midnight.
     pub minute_utc: u32,
     /// Weekly: 0 Monday .. 6 Sunday.
@@ -513,15 +633,12 @@ pub struct Settings {
 impl Default for Settings {
     /// Daily at 03:30 UTC (before the cluster's 04:00 volume sync), keep 14, settings only.
     fn default() -> Self {
-        Settings { enabled: true, frequency: "daily".into(), minute_utc: 3 * 60 + 30, weekday: 0, monthday: 1, keep: 14, days: 0 }
+        Settings { enabled: true, frequency: Frequency::Daily, minute_utc: 3 * 60 + 30, weekday: 0, monthday: 1, keep: 14, days: 0 }
     }
 }
 
 impl Settings {
     fn validate(&self) -> Result<(), String> {
-        if !["daily", "weekly", "monthly"].contains(&self.frequency.as_str()) {
-            return Err("frequency must be daily, weekly or monthly".into());
-        }
         if self.minute_utc >= 1440 || self.weekday > 6 || !(1..=28).contains(&self.monthday) {
             return Err("invalid time or day".into());
         }
@@ -536,11 +653,11 @@ impl Settings {
 
     /// Whether a backup is scheduled on this day (days since 1970-01-01, UTC).
     fn runs_on(&self, day: Ts) -> bool {
-        match self.frequency.as_str() {
+        match self.frequency {
             // 1970-01-01 was a Thursday (weekday 3 with Monday = 0).
-            "weekly" => (day + 3).rem_euclid(7) == Ts::from(self.weekday),
-            "monthly" => stamp(day * 86400)[6..8].parse::<u32>().unwrap_or(0) == self.monthday,
-            _ => true,
+            Frequency::Weekly => (day + 3).rem_euclid(7) == Ts::from(self.weekday),
+            Frequency::Monthly => crate::clock::civil_from_days(day).2 == i64::from(self.monthday),
+            Frequency::Daily => true,
         }
     }
 
@@ -594,38 +711,53 @@ fn remove(b: &Backups, name: &str) {
 /// Keeps the newest `keep` automatic backups and the newest 3 pre-restore ones.
 fn prune(b: &Backups, keep: usize) {
     let all = list(b);
-    for (kind, n) in [("auto", keep), ("pre-restore", 3)] {
+    for (kind, n) in [(Kind::Auto, keep), (Kind::PreRestore, 3)] {
         for m in all.iter().filter(|m| m.kind == kind).skip(n) {
             remove(b, &m.name);
         }
     }
 }
 
-/// Runs automatic backups when due (checked every minute).
+/// Runs automatic backups when due (checked every minute), and clears out
+/// staging left behind.
 pub fn schedule(b: Backups, store: Arc<store::Store>) {
     tokio::spawn(async move {
         let mut every = tokio::time::interval(Duration::from_secs(60));
+        // After a failed automatic backup, the next try waits an hour.
+        let mut retry_at: Ts = 0;
         loop {
             every.tick().await;
-            let s = load_settings(&store);
+            let (b2, st) = (b.clone(), store.clone());
+            let checked = tokio::task::spawn_blocking(move || {
+                clean_staging(&b2);
+                let last = list(&b2).iter().filter(|m| m.kind == Kind::Auto).map(|m| m.created).max().unwrap_or(0);
+                (load_settings(&st), last)
+            });
+            let Ok((s, last)) = checked.await else { continue };
             if !s.enabled {
                 continue;
             }
             let now = store::now_ts();
             let due = s.last_due(now);
-            let last = list(&b).iter().filter(|m| m.kind == "auto").map(|m| m.created).max().unwrap_or(0);
-            if last >= due || now - due > 6 * 3600 && last > 0 && now - last < 86400 {
+            if last >= due || now - due > 6 * 3600 && last > 0 && now - last < 86400 || now < retry_at {
                 continue;
             }
             let (b2, dir) = (b.clone(), b.data_dir.clone());
-            match tokio::task::spawn_blocking(move || create(&b2, &dir, "auto", s.days)).await {
+            let made = tokio::task::spawn_blocking(move || {
+                let m = create(&b2, &dir, Kind::Auto, s.days)?;
+                prune(&b2, s.keep);
+                Ok::<_, anyhow::Error>(m)
+            });
+            let failed = match made.await {
                 Ok(Ok(m)) => {
                     tracing::info!("automatic backup {} ({} bytes)", m.name, m.size);
-                    prune(&b, s.keep);
+                    continue;
                 }
-                Ok(Err(e)) => tracing::error!("automatic backup failed: {e:#}"),
-                Err(e) => tracing::error!("automatic backup failed: {e}"),
-            }
+                Ok(Err(e)) => format!("{e:#}"),
+                Err(e) => e.to_string(),
+            };
+            tracing::error!("automatic backup failed (trying again in an hour): {failed}");
+            retry_at = now + 3600;
         }
     });
 }
@@ -643,13 +775,18 @@ fn valid_name(name: &str) -> bool {
 /// GET /api/backups
 pub async fn index(State(s): State<AppState>) -> Result<Json<Value>, ApiError> {
     let b = backups(&s)?;
+    let encrypted = b.key.is_some();
     let store = s.store.clone();
-    let settings = tokio::task::spawn_blocking(move || load_settings(&store)).await.map_err(|e| ApiError::internal(e.to_string()))?;
-    let staged = fs::read_to_string(b.staging().join("pending")).ok();
+    let (settings, list, staged, failed) = tokio::task::spawn_blocking(move || {
+        let staged = b.staging().join("pending").exists();
+        (load_settings(&store), list(&b), staged, fs::read_to_string(b.staging().join("pending.failed")).ok())
+    })
+    .await
+    .map_err(|e| ApiError::internal(e.to_string()))?;
     let next = settings.enabled.then(|| settings.next_due(store::now_ts()));
     Ok(Json(json!({
-        "encrypted": b.key.is_some(), "version": VERSION, "settings": settings, "next_run": next,
-        "backups": list(&b), "restore_pending": staged.is_some(),
+        "encrypted": encrypted, "version": VERSION, "settings": settings, "next_run": next,
+        "backups": list, "restore_pending": staged, "restore_failed": failed,
     })))
 }
 
@@ -678,7 +815,7 @@ pub async fn create_now(State(s): State<AppState>, headers: HeaderMap, Json(body
     }
     let b = backups(&s)?;
     let dir = b.data_dir.clone();
-    let meta = tokio::task::spawn_blocking(move || create(&b, &dir, "manual", body.days))
+    let meta = tokio::task::spawn_blocking(move || create(&b, &dir, Kind::Manual, body.days))
         .await
         .map_err(|e| ApiError::internal(e.to_string()))?
         .map_err(|e| ApiError::internal(format!("{e:#}")))?;
@@ -704,18 +841,30 @@ pub async fn download(State(s): State<AppState>, UrlPath(name): UrlPath<String>)
 pub async fn delete(State(s): State<AppState>, headers: HeaderMap, UrlPath(name): UrlPath<String>) -> Result<Json<Value>, ApiError> {
     crate::api::check_csrf(&headers)?;
     let b = backups(&s)?;
-    if !valid_name(&name) || !b.dir().join(&name).exists() {
+    let found = valid_name(&name)
+        && tokio::task::spawn_blocking(move || {
+            let found = b.dir().join(&name).exists();
+            if found {
+                remove(&b, &name);
+            }
+            found
+        })
+        .await
+        .map_err(|e| ApiError::internal(e.to_string()))?;
+    if !found {
         return Err(ApiError(StatusCode::NOT_FOUND, "no such backup".into()));
     }
-    remove(&b, &name);
     Ok(Json(json!({ "ok": true })))
 }
 
 /// Unpacks and checks a backup into the staging area; returns its manifest and id.
 fn stage(b: &Backups, path: &Path) -> Result<(String, Manifest)> {
-    let id = format!("r{}", store::now_ts());
+    let mut r = [0u8; 2];
+    getrandom::fill(&mut r).map_err(|e| anyhow!("random: {e}"))?;
+    let id = format!("r{}{:05}", store::now_ts(), u16::from_be_bytes(r));
     let dest = b.staging().join(&id);
-    let _ = fs::remove_dir_all(&dest);
+    fs::create_dir_all(b.staging())?;
+    fs::create_dir(&dest)?;
     let m = match unpack(path, b.key.as_ref(), &dest) {
         Ok(m) => m,
         Err(e) => {
@@ -747,24 +896,40 @@ pub async fn upload(State(s): State<AppState>, headers: HeaderMap, body: Body) -
     crate::api::check_csrf(&headers)?;
     let b = backups(&s)?;
     tokio::fs::create_dir_all(b.staging()).await.map_err(|e| ApiError::internal(e.to_string()))?;
-    let tmp = b.staging().join(format!("upload-{}.apb", store::now_ts()));
-    let mut file = tokio::fs::File::create(&tmp).await.map_err(|e| ApiError::internal(e.to_string()))?;
+    let name = format!("upload-{}-{}.apb", store::now_ts(), random_hex().map_err(ApiError::from)?);
+    let tmp = TempFile(b.staging().join(name));
+    let mut file = tokio::fs::File::create_new(&tmp.0).await.map_err(|e| ApiError::internal(e.to_string()))?;
     let mut stream = body.into_data_stream();
+    // DefaultBodyLimit does not apply to a streamed body: count here.
+    let mut size = 0u64;
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.map_err(|e| ApiError(StatusCode::BAD_REQUEST, format!("upload interrupted: {e}")))?;
+        size += chunk.len() as u64;
+        if size > UPLOAD_LIMIT {
+            return Err(ApiError(StatusCode::PAYLOAD_TOO_LARGE, "the backup is too large (1 GiB at most)".into()));
+        }
         file.write_all(&chunk).await.map_err(|e| ApiError::internal(e.to_string()))?;
     }
     file.flush().await.map_err(|e| ApiError::internal(e.to_string()))?;
     drop(file);
     let res = tokio::task::spawn_blocking(move || {
-        let r = stage(&b, &tmp);
-        let _ = fs::remove_file(&tmp);
+        let r = stage(&b, &tmp.0);
+        drop(tmp);
         r
     })
     .await
     .map_err(|e| ApiError::internal(e.to_string()))?
     .map_err(|e| ApiError(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
     Ok(Json(json!({ "staged": res.0, "manifest": res.1 })))
+}
+
+/// A file deleted when dropped, so an upload cut off half way leaves nothing behind.
+struct TempFile(PathBuf);
+
+impl Drop for TempFile {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.0);
+    }
 }
 
 /// POST /api/backups/restore: marks a backup to be restored and restarts apctl.
@@ -774,23 +939,31 @@ pub async fn restore(State(s): State<AppState>, headers: HeaderMap, Json(body): 
     let (id, m) = tokio::task::spawn_blocking(move || -> Result<(String, Manifest)> {
         let (id, m) = match (body.name, body.staged) {
             (Some(name), _) if valid_name(&name) => stage(&b, &b.dir().join(&name))?,
-            (_, Some(id)) if id.starts_with('r') && id[1..].chars().all(|c| c.is_ascii_digit()) => {
+            (_, Some(id)) if valid_id(&id) => {
                 let m: Manifest = serde_json::from_slice(&fs::read(b.staging().join(&id).join("manifest.json")).context("that upload has expired")?)?;
                 (id, m)
             }
             _ => bail!("say which backup to restore"),
         };
+        let previous = fs::read_to_string(b.staging().join("pending")).ok();
         fs::write(b.staging().join("pending"), &id)?;
+        let _ = fs::remove_file(b.staging().join("pending.failed"));
+        // A restore staged before and now replaced.
+        if let Some(p) = previous.as_deref().map(str::trim).filter(|p| *p != id && valid_id(p)) {
+            let _ = fs::remove_dir_all(b.staging().join(p));
+        }
         Ok((id, m))
     })
     .await
     .map_err(|e| ApiError::internal(e.to_string()))?
     .map_err(|e| ApiError(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
     tracing::warn!("restore of backup from {} staged as {id}; restarting", m.created);
-    // Answer first, then exit: the container is restarted and applies it on start.
+    // Answer first, then exit, and the restore is applied on the next start. The
+    // exit status is 75 (EX_TEMPFAIL), a failure, so that a restart policy of
+    // on-failure restarts apctl as well as one of always.
     tokio::spawn(async {
         tokio::time::sleep(Duration::from_millis(800)).await;
-        std::process::exit(0);
+        std::process::exit(75);
     });
     Ok(Json(json!({ "ok": true, "restarting": true, "manifest": m })))
 }
@@ -835,7 +1008,7 @@ mod tests {
     fn encrypted_round_trip_with_history_filter() {
         let src = data("rt");
         let b = Backups { data_dir: src.clone(), key: Some([7u8; 32]) };
-        let m = create(&b, &src, "manual", 7).unwrap();
+        let m = create(&b, &src, Kind::Manual, 7).unwrap();
         assert!(m.encrypted && m.days == 7);
         let raw = fs::read(b.dir().join(&m.name)).unwrap();
         assert_eq!(&raw[..9], b"APCTLBK1\x01");
@@ -858,7 +1031,7 @@ mod tests {
     fn settings_only_and_unencrypted() {
         let src = data("so");
         let b = Backups { data_dir: src.clone(), key: None };
-        let m = create(&b, &src, "auto", 0).unwrap();
+        let m = create(&b, &src, Kind::Auto, 0).unwrap();
         assert!(!m.encrypted && m.name.starts_with("apctl-auto-"));
         let out = dir("so-out");
         let man = unpack(&b.dir().join(&m.name), None, &out).unwrap();
@@ -871,7 +1044,7 @@ mod tests {
     fn tampering_and_truncation_are_detected() {
         let src = data("tamper");
         let b = Backups { data_dir: src.clone(), key: Some([1u8; 32]) };
-        let m = create(&b, &src, "manual", -1).unwrap();
+        let m = create(&b, &src, Kind::Manual, -1).unwrap();
         let path = b.dir().join(&m.name);
         let good = fs::read(&path).unwrap();
         let mut bad = good.clone();
@@ -887,7 +1060,7 @@ mod tests {
     fn staged_restore_is_applied_on_start_with_a_pre_restore_copy() {
         let src = data("apply");
         let b = Backups { data_dir: src.clone(), key: Some([3u8; 32]) };
-        let m = create(&b, &src, "manual", -1).unwrap();
+        let m = create(&b, &src, Kind::Manual, -1).unwrap();
         // Change the live data after the backup.
         Connection::open(src.join("config.db")).unwrap().execute_batch("DELETE FROM client_aliases;").unwrap();
         let (id, _) = stage(&b, &b.dir().join(&m.name)).unwrap();
@@ -895,9 +1068,83 @@ mod tests {
         apply_pending(&b).unwrap();
         assert_eq!(count(&src.join("config.db"), "SELECT COUNT(*) FROM client_aliases"), 1, "restored");
         assert!(!b.staging().join("pending").exists());
-        assert!(list(&b).iter().any(|x| x.kind == "pre-restore"), "the replaced state was saved");
+        assert!(list(&b).iter().any(|x| x.kind == Kind::PreRestore), "the replaced state was saved");
         // Nothing pending: nothing happens.
         apply_pending(&b).unwrap();
+    }
+
+    #[test]
+    fn backups_at_the_same_moment_get_their_own_names() {
+        let src = data("same");
+        let b = Backups { data_dir: src.clone(), key: None };
+        let names: Vec<String> = std::thread::scope(|sc| {
+            let hs: Vec<_> = (0..3).map(|_| sc.spawn(|| create(&b, &src, Kind::Manual, 0).unwrap().name)).collect();
+            hs.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+        let mut unique = names.clone();
+        unique.sort();
+        unique.dedup();
+        assert_eq!(unique.len(), 3, "{names:?}");
+        assert_eq!(list(&b).len(), 3);
+        for n in &names {
+            assert!(unpack(&b.dir().join(n), None, &dir(&format!("same-{n}"))).is_ok(), "{n}");
+        }
+        // Nothing half-written is left over.
+        assert!(fs::read_dir(b.dir()).unwrap().flatten().all(|e| !e.file_name().to_string_lossy().ends_with(".part") && !e.file_name().to_string_lossy().starts_with(".tmp")));
+    }
+
+    #[test]
+    fn a_failed_restore_is_set_aside_and_apctl_starts() {
+        let src = data("failed");
+        let b = Backups { data_dir: src.clone(), key: None };
+        fs::create_dir_all(b.staging()).unwrap();
+        fs::write(b.staging().join("pending"), "r123").unwrap();
+        apply_pending(&b).unwrap();
+        assert!(!b.staging().join("pending").exists());
+        assert!(fs::read_to_string(b.staging().join("pending.failed")).unwrap().contains("no manifest"));
+        assert_eq!(count(&src.join("config.db"), "SELECT COUNT(*) FROM client_aliases"), 1, "the current data is kept");
+        // A marker naming no staged backup.
+        fs::write(b.staging().join("pending"), "../config.db").unwrap();
+        apply_pending(&b).unwrap();
+        assert!(src.join("config.db").exists() && !b.staging().join("pending").exists());
+    }
+
+    #[test]
+    fn oversized_entries_are_refused_before_they_are_written() {
+        let d = dir("oversized");
+        let mut manifest = Manifest { format: 1, app: "apctl".into(), version: VERSION.into(), created: 0, days: 0, files: Default::default() };
+        manifest.files.insert("config.db".into(), FileInfo { size: 4, sha256: "00".into() });
+        let mut file = MAGIC.to_vec();
+        file.push(0);
+        let mut tar = tar::Builder::new(flate2::write::GzEncoder::new(file, flate2::Compression::default()));
+        for (name, data) in [("manifest.json", serde_json::to_vec(&manifest).unwrap()), ("config.db", vec![0u8; 4096])] {
+            let mut h = tar::Header::new_gnu();
+            h.set_size(data.len() as u64);
+            h.set_cksum();
+            tar.append_data(&mut h, name, data.as_slice()).unwrap();
+        }
+        fs::write(d.join("x.apb"), tar.into_inner().unwrap().finish().unwrap()).unwrap();
+        let out = d.join("out");
+        let err = unpack(&d.join("x.apb"), None, &out).unwrap_err();
+        assert!(err.to_string().contains("damaged"), "{err:#}");
+        assert!(!out.join("config.db").exists());
+    }
+
+    #[test]
+    fn left_over_staging_is_cleared() {
+        let src = dir("clean");
+        let b = Backups { data_dir: src.clone(), key: None };
+        fs::create_dir_all(b.staging().join("r1")).unwrap();
+        fs::create_dir_all(b.staging().join("r2")).unwrap();
+        fs::write(b.staging().join("upload-1-x.apb"), "x").unwrap();
+        fs::write(b.staging().join("pending"), "r2").unwrap();
+        let old = std::time::SystemTime::now() - Duration::from_secs(2 * 3600);
+        for n in ["r1", "r2", "upload-1-x.apb"] {
+            File::open(b.staging().join(n)).unwrap().set_modified(old).unwrap();
+        }
+        clean_staging(&b);
+        let left: Vec<String> = fs::read_dir(b.staging()).unwrap().flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect();
+        assert!(left.contains(&"r2".to_string()) && left.contains(&"pending".to_string()) && left.len() == 2, "{left:?}");
     }
 
     #[test]
@@ -913,16 +1160,20 @@ mod tests {
         let daily = Settings::default();
         // 2026-10-13 is a Tuesday. 03:30 UTC that day:
         let t = 1_791_862_200; // 2026-10-13 03:30:00 UTC
-        assert_eq!(stamp(t), "20261013-0330");
+        assert_eq!(stamp(t), "20261013-033000");
         assert_eq!(daily.last_due(t + 60), t);
         assert_eq!(daily.last_due(t - 60), t - 86400);
-        let weekly = Settings { frequency: "weekly".into(), weekday: 0, ..Settings::default() }; // Mondays
+        let weekly = Settings { frequency: Frequency::Weekly, weekday: 0, ..Settings::default() }; // Mondays
         assert_eq!(weekly.last_due(t + 60), t - 86400);
-        let monthly = Settings { frequency: "monthly".into(), monthday: 1, ..Settings::default() };
-        assert_eq!(stamp(monthly.last_due(t)), "20261001-0330");
+        let monthly = Settings { frequency: Frequency::Monthly, monthday: 1, ..Settings::default() };
+        assert_eq!(stamp(monthly.last_due(t)), "20261001-033000");
         assert_eq!(daily.next_due(t - 60), t);
         assert_eq!(daily.next_due(t), t + 86400);
-        assert_eq!(stamp(monthly.next_due(t)), "20261101-0330");
+        assert_eq!(stamp(monthly.next_due(t)), "20261101-033000");
         assert!(Settings { keep: 0, ..Settings::default() }.validate().is_err());
+        // The settings and backup descriptions keep their JSON form.
+        assert_eq!(serde_json::to_value(&monthly).unwrap()["frequency"], "monthly");
+        assert_eq!(serde_json::to_value(Kind::PreRestore).unwrap(), "pre-restore");
+        assert_eq!(serde_json::from_str::<Kind>("\"auto\"").unwrap(), Kind::Auto);
     }
 }
