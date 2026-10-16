@@ -1,5 +1,8 @@
 //! `system_cfg`: all sections, in the official controller's order.
 
+use std::borrow::Cow;
+use std::sync::OnceLock;
+
 use anyhow::{Result, bail};
 use serde_json::Value;
 
@@ -520,34 +523,31 @@ fn mdns_services(code: &str) -> &'static [&'static str] {
 
 /// What "auto" mode filters for: every code's types, each code's sorted, in table
 /// order (a type in two codes is listed twice, as the official controller does).
-fn mdns_auto_services() -> Vec<String> {
-    MDNS_SERVICES
-        .iter()
-        .flat_map(|(_, _, types)| {
-            let mut t: Vec<&str> = types.to_vec();
-            t.sort_unstable();
-            t
-        })
-        .map(str::to_string)
-        .collect()
+/// Built once.
+fn mdns_auto_services() -> &'static [&'static str] {
+    static AUTO: OnceLock<Vec<&'static str>> = OnceLock::new();
+    AUTO.get_or_init(|| {
+        MDNS_SERVICES
+            .iter()
+            .flat_map(|(_, _, types)| {
+                let mut t: Vec<&str> = types.to_vec();
+                t.sort_unstable();
+                t
+            })
+            .collect()
+    })
 }
 
-struct MdnsEntry {
-    networks: Vec<Option<String>>,
-    mode: String,
-    services: Vec<String>,
+struct MdnsEntry<'a> {
+    networks: Vec<Option<&'a str>>,
+    mode: &'a str,
+    services: Cow<'a, [&'a str]>,
 }
 
-fn entry_services(e: &Value) -> Vec<String> {
-    let mut out: Vec<String> = arr(e, "predefined_services")
-        .iter()
-        .filter_map(|s| str_of(s, "code"))
-        .flat_map(mdns_services)
-        .map(|s| s.to_string())
-        .collect();
+fn entry_services(e: &Value) -> Vec<&str> {
+    let mut out: Vec<&str> = arr(e, "predefined_services").iter().filter_map(|s| str_of(s, "code")).flat_map(mdns_services).copied().collect();
     for s in arr(e, "custom_services") {
-        let name = s.as_str().or_else(|| str_of(s, "address")).or_else(|| str_of(s, "name"));
-        out.extend(name.map(str::to_string));
+        out.extend(s.as_str().or_else(|| str_of(s, "address")).or_else(|| str_of(s, "name")));
     }
     out
 }
@@ -580,50 +580,45 @@ fn mdns(c: &mut Cfg, ctx: &Ctx, vaps: &[Vap], net: &Net) {
     }
     let bridge_of_vlan = |vlan: i64| {
         let tag = if vlan == 1 { 0 } else { vlan };
-        net.bridges.iter().find(|b| b.vlan == tag).map(|b| b.name.clone())
+        net.bridges.iter().find(|b| b.vlan == tag).map(|b| b.name.as_str())
     };
     let (mut f, mut p) = (0, 0);
     for wv in wlans {
         let w: &Value = &wv.w;
         let devs: Vec<&str> = vaps.iter().filter(|v| v.id == wv.id).map(Vap::dev).collect();
-        let own = str_of(w, "networkconf_id").map(str::to_string);
+        let own = str_of(w, "networkconf_id");
         let mut entries: Vec<MdnsEntry> = Vec::new();
         if str_of(w, "mdns_proxy_mode") == Some("custom") {
             let custom: Vec<&Value> = arr(w, "mdns_proxy_custom").iter().filter(|e| applies(e)).collect();
-            let lists_own =
-                custom.iter().any(|e| own.as_deref().is_some_and(|o| str_list(e, "networkconf_ids").contains(&o)));
+            let lists_own = custom.iter().any(|e| own.is_some_and(|o| str_list(e, "networkconf_ids").contains(&o)));
             if !lists_own {
                 let all = custom.iter().any(|e| str_of(e, "services_mode") == Some("all"));
-                let mut union: Vec<String> = Vec::new();
+                let mut union: Vec<&str> = Vec::new();
                 for s in custom.iter().flat_map(|e| entry_services(e)) {
                     if !union.contains(&s) {
                         union.push(s);
                     }
                 }
-                entries.push(MdnsEntry {
-                    networks: vec![own.clone()],
-                    mode: if all { "all" } else { "specific" }.to_string(),
-                    services: union,
-                });
+                entries.push(MdnsEntry { networks: vec![own], mode: if all { "all" } else { "specific" }, services: Cow::Owned(union) });
             }
             entries.extend(custom.iter().map(|e| MdnsEntry {
-                networks: str_list(e, "networkconf_ids").into_iter().map(|n| Some(n.to_string())).collect(),
-                mode: str_of(e, "services_mode").unwrap_or("all").to_string(),
-                services: entry_services(e),
+                networks: str_list(e, "networkconf_ids").into_iter().map(Some).collect(),
+                mode: str_of(e, "services_mode").unwrap_or("all"),
+                services: Cow::Owned(entry_services(e)),
             }));
         } else {
-            entries.push(MdnsEntry { networks: vec![own.clone()], mode: "specific".into(), services: mdns_auto_services() });
+            entries.push(MdnsEntry { networks: vec![own], mode: "specific", services: Cow::Borrowed(mdns_auto_services()) });
         }
-        let own_bridge = bridge_of_vlan(network_vlan(ctx, own.as_deref()));
+        let own_bridge = bridge_of_vlan(network_vlan(ctx, own));
         for e in entries {
-            let others: Vec<String> = e
+            let others: Vec<&str> = e
                 .networks
                 .iter()
                 .filter(|n| **n != own)
-                .filter_map(|n| bridge_of_vlan(network_vlan(ctx, n.as_deref())))
-                .filter(|b| Some(b) != own_bridge.as_ref())
+                .filter_map(|n| bridge_of_vlan(network_vlan(ctx, *n)))
+                .filter(|b| Some(*b) != own_bridge)
                 .collect();
-            if let (false, Some(own_bridge)) = (others.is_empty(), &own_bridge) {
+            if let (false, Some(own_bridge)) = (others.is_empty(), own_bridge) {
                 p += 1;
                 c.set(format_args!("mdns_sd.proxy.{p}.status"), "enabled");
                 c.set(format_args!("mdns_sd.proxy.{p}.dst.1.devname"), own_bridge);
@@ -633,7 +628,7 @@ fn mdns(c: &mut Cfg, ctx: &Ctx, vaps: &[Vap], net: &Net) {
             }
             for n in &e.networks {
                 f += 1;
-                c.set(format_args!("mdns_sd.filter.{f}.vlan"), network_vlan(ctx, n.as_deref()));
+                c.set(format_args!("mdns_sd.filter.{f}.vlan"), network_vlan(ctx, *n));
                 c.set(format_args!("mdns_sd.filter.{f}.policy"), if e.mode == "all" { "allow" } else { "deny" });
                 for (i, d) in devs.iter().enumerate() {
                     c.set(format_args!("mdns_sd.filter.{f}.dst.{}.devname", i + 1), d);
