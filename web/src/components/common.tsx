@@ -3,14 +3,13 @@ import type { ReactNode } from "react";
 import { Link, useSearchParams } from "react-router-dom";
 import { useQueryClient } from "@tanstack/react-query";
 import type { QueryKey } from "@tanstack/react-query";
-import { displayName, eventData, useDevices } from "../api";
+import { eventData, useDevices } from "../api";
 import type {
   AppEvent,
-  ClientView,
-  DeviceSummary,
   EventKind,
   EventPayloads,
   LogLine,
+  Names,
 } from "../api";
 import { band, clock, duration, signalClass } from "../format";
 
@@ -224,33 +223,15 @@ export function ApSelect({
   );
 }
 
-/** Names devices by MAC for event and log rows. */
-export type DeviceNames = Map<string, string>;
-
-/** Client display names (alias, else hostname) by MAC, for event rows. */
-export function clientNames(
-  clients: ClientView[] | undefined,
-): Map<string, string> {
-  return new Map(
-    (clients ?? [])
-      .filter((c) => c.alias || c.sample.hostname)
-      .map((c) => [c.sample.mac, displayName(c)]),
-  );
-}
-
-export function deviceNames(devices: DeviceSummary[] | undefined): DeviceNames {
-  return new Map((devices ?? []).map((d) => [d.mac, d.name ?? d.mac]));
-}
-
 export function DeviceLink({
   mac,
   names,
 }: {
   mac: string | null;
-  names: DeviceNames;
+  names: Names;
 }) {
   if (!mac) return <span className="muted">—</span>;
-  return <Link to={`/devices/${mac}`}>{names.get(mac) ?? mac}</Link>;
+  return <Link to={`/devices/${mac}`}>{names[mac] ?? mac}</Link>;
 }
 
 type Tone = "bad" | "warn" | "info" | "neutral";
@@ -259,7 +240,7 @@ interface EventSpec<K extends EventKind> {
   label: string;
   tone: Tone | ((d: Partial<EventPayloads[K]>) => Tone);
   /** The detail line; a method so the table below can hold every kind. */
-  describe?(d: Partial<EventPayloads[K]>, names: DeviceNames): string;
+  describe?(d: Partial<EventPayloads[K]>, names: Names): string;
 }
 
 const parts = (...xs: (string | null | undefined | false)[]) =>
@@ -428,7 +409,7 @@ const EVENTS: { [K in EventKind]: EventSpec<K> } = {
     label: "AP isolated",
     tone: "bad",
     describe: (d, names) =>
-      `its beacon says it lost its uplink${d.heard_by ? ` (heard by ${names.get(d.heard_by) ?? d.heard_by})` : ""}`,
+      `its beacon says it lost its uplink${d.heard_by ? ` (heard by ${names[d.heard_by] ?? d.heard_by})` : ""}`,
   },
   ap_scan_done: { label: "Scan finished", tone: "neutral" },
   ap_event: { label: "AP event", tone: "neutral" },
@@ -470,7 +451,7 @@ const EVENTS: { [K in EventKind]: EventSpec<K> } = {
     label: "Client roamed",
     tone: "info",
     describe: (d, names) =>
-      `from ${names.get(d.from?.ap ?? "") ?? "?"} (${band(d.from?.radio)}, ${d.from?.signal ?? "?"} dBm) to ${names.get(d.to?.ap ?? "") ?? "?"} (${band(d.to?.radio)}, ${d.to?.signal ?? "?"} dBm)`,
+      `from ${names[d.from?.ap ?? ""] ?? "?"} (${band(d.from?.radio)}, ${d.from?.signal ?? "?"} dBm) to ${names[d.to?.ap ?? ""] ?? "?"} (${band(d.to?.radio)}, ${d.to?.signal ?? "?"} dBm)`,
   },
   client_renamed: {
     label: "Client renamed",
@@ -547,8 +528,8 @@ export function EventList({
   showDevice = true,
 }: {
   events: AppEvent[];
-  names: DeviceNames;
-  clientNames?: Map<string, string>;
+  names: Names;
+  clientNames?: Names;
   showDevice?: boolean;
 }) {
   if (events.length === 0)
@@ -577,9 +558,9 @@ export function EventList({
                 {e.client_mac && (
                   <Link
                     to={`/clients/${e.client_mac}`}
-                    className={clientNames?.get(e.client_mac) ? "" : "mono"}
+                    className={clientNames?.[e.client_mac] ? "" : "mono"}
                   >
-                    {clientNames?.get(e.client_mac) ?? e.client_mac}
+                    {clientNames?.[e.client_mac] ?? e.client_mac}
                   </Link>
                 )}
                 {showDevice &&
@@ -625,7 +606,7 @@ export function LogList({
   showDevice = true,
 }: {
   logs: LogLine[];
-  names: DeviceNames;
+  names: Names;
   showDevice?: boolean;
 }) {
   if (logs.length === 0) return <div className="muted pad">No log lines</div>;

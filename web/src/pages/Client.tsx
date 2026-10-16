@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useMemo, useState } from "react";
 import { Link, useParams } from "react-router-dom";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import {
@@ -9,6 +9,7 @@ import {
   useCanEdit,
   useClients,
   useClient,
+  useDeviceNames,
   useDevices,
   useEvents,
   useSeries,
@@ -28,8 +29,6 @@ import {
   QueryState,
   Signal,
   Stat,
-  clientNames,
-  deviceNames,
 } from "../components/common";
 import { ago, band, bitrate, bytes, compact, duration, phy } from "../format";
 import { serviceNames } from "../components/insights/Multicast";
@@ -42,18 +41,24 @@ export function Client() {
   const [range, setRange] = useTimeSpan(6 * 3600);
   const client = useClient(mac);
   const devices = useDevices();
-  const names = deviceNames(devices.data);
-  const clients = useClients();
-  const cnames = clientNames(clients.data);
-  // Clients not seen in this run still have their stored name and alias in the list.
+  const names = useDeviceNames();
+  const c = client.data;
+  const s = c?.sample;
+  // The whole list is only needed for a client not seen in this run (it has
+  // its stored name and alias there) and for multicast group peers.
+  const clients = useClients(client.isError || !!s?.multicast);
   const listed = clients.data?.find((x) => x.sample.mac === mac);
   const events = useEvents({ client: mac, limit: 100 });
   const series = useSeries("client", mac, range);
 
-  const c = client.data;
-  const s = c?.sample;
   // The live view when there is one, else the stored one from the list.
   const v = c ?? listed;
+  const name = v ? displayName(v) : mac;
+  // Every event in the timeline is this client's (a MAC alone shows as one).
+  const cnames = useMemo(
+    () => (name !== mac ? { [mac]: name } : {}),
+    [mac, name],
+  );
   const unknown =
     client.error instanceof HttpError && client.error.status === 404;
 
@@ -74,7 +79,7 @@ export function Client() {
           </div>
           <ClientActions
             mac={mac}
-            name={v ? displayName(v) : mac}
+            name={name}
             connected={c?.connected ?? false}
             blocked={v?.blocked ?? false}
             lockedTo={v?.locked_to ?? null}
@@ -88,7 +93,7 @@ export function Client() {
           )}
           {v?.locked_to && (
             <div className="banner">
-              Locked to {names.get(v.locked_to) ?? v.locked_to}: the other APs
+              Locked to {names[v.locked_to] ?? v.locked_to}: the other APs
               refuse it.
             </div>
           )}
@@ -108,7 +113,7 @@ export function Client() {
                 value={
                   c.connected ? (
                     <Link to={`/devices/${s.ap_mac}`}>
-                      {names.get(s.ap_mac) ?? s.ap_mac}
+                      {names[s.ap_mac] ?? s.ap_mac}
                     </Link>
                   ) : (
                     "Disconnected"

@@ -1,12 +1,6 @@
 import { useSearchParams } from "react-router-dom";
-import { useClients, useDevices, useEvents } from "../api";
-import {
-  ApSelect,
-  EventList,
-  QueryState,
-  clientNames,
-  deviceNames,
-} from "../components/common";
+import { useClientNames, useDeviceNames, useEvents } from "../api";
+import { ApSelect, EventList, QueryState } from "../components/common";
 
 const KINDS: { value: string; label: string }[] = [
   { value: "", label: "All events" },
@@ -33,9 +27,8 @@ export function Events() {
       },
       { replace: true },
     );
-  const devices = useDevices();
-  const names = deviceNames(devices.data);
-  const cnames = clientNames(useClients().data);
+  const names = useDeviceNames();
+  const cnames = useClientNames();
   const events = useEvents({
     kind: kind || undefined,
     device: device || undefined,

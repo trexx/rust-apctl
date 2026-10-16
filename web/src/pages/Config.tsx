@@ -1,17 +1,11 @@
 import { useMemo, useState } from "react";
 import type { ReactNode } from "react";
 import { Link } from "react-router-dom";
-import { eventData, useDevices, useEvents } from "../api";
+import { eventData, useDeviceNames, useEvents } from "../api";
 import type { AppEvent } from "../api";
 import { DryRunPage } from "./DryRun";
 import { FirmwarePanel } from "../components/Firmware";
-import {
-  ApSelect,
-  QueryState,
-  Tabs,
-  deviceNames,
-  useUrlTab,
-} from "../components/common";
+import { ApSelect, QueryState, Tabs, useUrlTab } from "../components/common";
 import { band, clock } from "../format";
 import { ChangeGroups, summarise } from "../components/ConfigDiff";
 
@@ -84,15 +78,14 @@ function describe(e: AppEvent): [string, string] {
 
 function History() {
   const [device, setDevice] = useState("");
-  const devices = useDevices();
-  const names = deviceNames(devices.data);
+  const names = useDeviceNames();
   const ev = useEvents({
     kind: "config_pushed,config_applied,settings_imported,settings_changed,radio_changed",
     device: device || undefined,
     limit: 300,
   });
   const ap = (mac: string | null) =>
-    mac ? <Link to={`/devices/${mac}`}>{names.get(mac) ?? mac}</Link> : null;
+    mac ? <Link to={`/devices/${mac}`}>{names[mac] ?? mac}</Link> : null;
   return (
     <div className="panel">
       <div className="panel-head">

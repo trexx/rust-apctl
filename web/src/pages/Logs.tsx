@@ -1,12 +1,7 @@
 import { useEffect, useState } from "react";
 import { useSearchParams } from "react-router-dom";
-import { useDevices, useLogs } from "../api";
-import {
-  ApSelect,
-  LogList,
-  QueryState,
-  deviceNames,
-} from "../components/common";
+import { useDeviceNames, useLogs } from "../api";
+import { ApSelect, LogList, QueryState } from "../components/common";
 
 export function Logs() {
   const [params, setParams] = useSearchParams();
@@ -19,8 +14,7 @@ export function Logs() {
     setShown(q);
     setText(q);
   }
-  const devices = useDevices();
-  const names = deviceNames(devices.data);
+  const names = useDeviceNames();
   const logs = useLogs({
     device: device || undefined,
     q: q || undefined,

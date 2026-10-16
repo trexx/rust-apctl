@@ -1,7 +1,7 @@
 import { Link } from "react-router-dom";
-import { useDevices, useDryRun } from "../api";
+import { useDeviceNames, useDryRun } from "../api";
 import type { FieldComparison } from "../api";
-import { ErrorNote, Loading, deviceNames } from "../components/common";
+import { ErrorNote, Loading } from "../components/common";
 import { clock } from "../format";
 
 const STATUS: Record<string, string> = {
@@ -41,8 +41,7 @@ function FieldResult({ label, c }: { label: string; c: FieldComparison }) {
 
 export function DryRunPage({ embedded = false }: { embedded?: boolean }) {
   const dr = useDryRun();
-  const devices = useDevices();
-  const names = deviceNames(devices.data);
+  const names = useDeviceNames();
   if (dr.isLoading) return <Loading />;
   if (dr.error || !dr.data) return <ErrorNote error={dr.error ?? "no data"} />;
   const d = dr.data;
@@ -122,7 +121,7 @@ export function DryRunPage({ embedded = false }: { embedded?: boolean }) {
               {d.history.map((h, i) => (
                 <tr key={`${h.ts}-${i}`}>
                   <td>{clock(h.ts)}</td>
-                  <td>{names.get(h.mac) ?? h.mac}</td>
+                  <td>{names[h.mac] ?? h.mac}</td>
                   <td className={h.matches ? "ok" : "error"}>
                     {h.matches
                       ? h.comparison?.system_cfg?.identical === false

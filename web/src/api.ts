@@ -1,5 +1,5 @@
 import { useEffect } from "react";
-import { keepPreviousData, useQuery, useQueryClient } from "@tanstack/react-query";
+import { keepPreviousData, queryOptions, useQuery, useQueryClient } from "@tanstack/react-query";
 import type { QueryKey } from "@tanstack/react-query";
 
 export type Mac = string;
@@ -955,12 +955,35 @@ export const useChannelPlan = (band: string, dfs: boolean) =>
 
 export const useStatus = () => useQuery({ queryKey: keys.status(), queryFn: ({ signal }) => get<Status>("/api/status", signal), refetchInterval: 15_000 });
 
-export const useDevices = () => useQuery({ queryKey: keys.devices(), queryFn: ({ signal }) => get<DeviceSummary[]>("/api/devices", signal) });
+const devicesQuery = queryOptions({ queryKey: keys.devices(), queryFn: ({ signal }) => get<DeviceSummary[]>("/api/devices", signal) });
+const clientsQuery = queryOptions({ queryKey: keys.clients(), queryFn: ({ signal }) => get<ClientView[]>("/api/clients", signal) });
+
+export const useDevices = () => useQuery(devicesQuery);
 
 export const useDevice = (mac: Mac) =>
   useQuery({ queryKey: keys.device(mac), queryFn: ({ signal }) => get<DeviceDetail>(`/api/devices/${mac}`, signal) });
 
-export const useClients = () => useQuery({ queryKey: keys.clients(), queryFn: ({ signal }) => get<ClientView[]>("/api/clients", signal) });
+/** Every client; with `enabled` false, only what's already cached. */
+export const useClients = (enabled = true) => useQuery({ ...clientsQuery, enabled });
+
+/**
+ * Something derived from the client list, re-rendering only when it changes.
+ * `select` must be a module-level function, so it runs once per fetch.
+ */
+export const useClientsSelect = <T>(select: (clients: ClientView[]) => T) => useQuery({ ...clientsQuery, select });
+
+/** Names by MAC, for links. */
+export type Names = Readonly<Record<Mac, string>>;
+
+const NO_NAMES: Names = Object.freeze({});
+const deviceNames = (devices: DeviceSummary[]): Names => Object.fromEntries(devices.map((d) => [d.mac, d.name ?? d.mac]));
+const clientNames = (clients: ClientView[]): Names => Object.fromEntries(clients.filter((c) => c.alias || c.sample.hostname).map((c) => [c.sample.mac, displayName(c)]));
+
+/** AP names (else their MAC) by MAC; the same object until a name changes. */
+export const useDeviceNames = (): Names => useQuery({ ...devicesQuery, select: deviceNames }).data ?? NO_NAMES;
+
+/** Client display names by MAC, for the clients that have one; the same object until a name changes. */
+export const useClientNames = (): Names => useClientsSelect(clientNames).data ?? NO_NAMES;
 
 /** One client; a 404 (HttpError) means it hasn't been seen since apctl started. */
 export const useClient = (mac: Mac) =>

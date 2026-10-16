@@ -2,9 +2,9 @@ import { Suspense, lazy } from "react";
 import { Link, useParams } from "react-router-dom";
 import {
   displayName,
-  useClients,
+  useClientNames,
   useDevice,
-  useDevices,
+  useDeviceNames,
   useEvents,
   useLogs,
   useSeries,
@@ -28,8 +28,6 @@ import {
   QueryState,
   Signal,
   Stat,
-  clientNames,
-  deviceNames,
 } from "../components/common";
 import {
   ago,
@@ -60,9 +58,8 @@ export function Device() {
   const { mac = "" } = useParams();
   const [range, setRange] = useTimeSpan(6 * 3600);
   const detail = useDevice(mac);
-  const devices = useDevices();
-  const names = deviceNames(devices.data);
-  const cnames = clientNames(useClients().data);
+  const names = useDeviceNames();
+  const cnames = useClientNames();
   const events = useEvents({ device: mac, limit: 50 });
   const logs = useLogs({ device: mac, limit: 100 });
 

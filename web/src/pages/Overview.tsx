@@ -1,5 +1,13 @@
 import { Link } from "react-router-dom";
-import { useClients, useDevices, useEvents, useStatus } from "../api";
+import {
+  useClientNames,
+  useClientsSelect,
+  useDeviceNames,
+  useDevices,
+  useEvents,
+  useStatus,
+} from "../api";
+import type { ClientView } from "../api";
 import {
   Dot,
   ErrorNote,
@@ -8,8 +16,6 @@ import {
   Meter,
   QueryState,
   Stat,
-  clientNames,
-  deviceNames,
 } from "../components/common";
 import { SIGNAL, ago, band, dbm, duration, pct } from "../format";
 import { Connectivity } from "../components/insights/Connectivity";
@@ -22,27 +28,31 @@ import { useTimeSpan } from "../components/Chart";
 import { ThreatBanner } from "../components/Threats";
 import { AdoptionPanel } from "../components/Adoption";
 
+/** Connected clients: how many, on each band, and with a weak signal. */
+function clientCounts(clients: ClientView[]) {
+  const connected = clients.filter((c) => c.connected);
+  const byBand: Record<string, number> = {};
+  for (const c of connected) {
+    const b = band(c.sample.radio);
+    byBand[b] = (byBand[b] ?? 0) + 1;
+  }
+  const weak = connected.filter(
+    (c) => (c.sample.signal ?? 0) < SIGNAL.fair,
+  ).length;
+  return { connected: connected.length, byBand, weak };
+}
+
 export function Overview() {
   const devices = useDevices();
-  const clients = useClients();
+  const counts = useClientsSelect(clientCounts).data;
   const events = useEvents({ limit: 12 });
   const status = useStatus();
-  const names = deviceNames(devices.data);
-  const cnames = clientNames(clients.data);
+  const names = useDeviceNames();
+  const cnames = useClientNames();
 
   if (devices.isLoading) return <Loading />;
   if (devices.error) return <ErrorNote error={devices.error} />;
   const list = devices.data ?? [];
-  const connected = (clients.data ?? []).filter((c) => c.connected);
-  const byBand = new Map<string, number>();
-  for (const c of connected)
-    byBand.set(
-      band(c.sample.radio),
-      (byBand.get(band(c.sample.radio)) ?? 0) + 1,
-    );
-  const weak = connected.filter(
-    (c) => (c.sample.signal ?? 0) < SIGNAL.fair,
-  ).length;
 
   return (
     <div className="page">
@@ -54,15 +64,16 @@ export function Overview() {
         />
         <Stat
           label="Clients"
-          value={connected.length}
+          value={counts?.connected ?? 0}
           sub={
-            [...byBand.entries()].map(([b, n]) => `${n} on ${b}`).join(" · ") ||
-            "none connected"
+            Object.entries(counts?.byBand ?? {})
+              .map(([b, n]) => `${n} on ${b}`)
+              .join(" · ") || "none connected"
           }
         />
         <Stat
           label="Weak signal"
-          value={weak}
+          value={counts?.weak ?? 0}
           sub={`clients below ${dbm(SIGNAL.fair)}`}
         />
         <Stat
