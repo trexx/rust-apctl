@@ -16,12 +16,6 @@
   ],
   "packageRules": [
     {
-      "enabled": false,
-      "matchDepTypes": [
-        "stage"
-      ]
-    },
-    {
       "description": "One PR for all non-major Rust crate updates",
       "groupName": "Rust crates",
       "matchManagers": [

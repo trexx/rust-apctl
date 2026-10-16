@@ -2,7 +2,7 @@ name: 'Build capture sidecar'
 
 # The tcpdump sidecar for shadow mode (the Dockerfile's `capture` stage) is
 # versioned on its own: push a tag like capture-0.1.2 to publish
-# ghcr.io/trexx/apctl-capture:0.1.2 and :latest.
+# ghcr.io/trexx/rust-apctl-capture:0.1.2 and :latest.
 on:
   push:
     tags: [ 'capture-[0-9]+.[0-9]+.[0-9]+' ]

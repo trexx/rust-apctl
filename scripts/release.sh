@@ -10,7 +10,7 @@
 # failure, so a stale image is never pushed under a new tag.
 set -euo pipefail
 
-IMAGE=${APCTL_IMAGE:-ghcr.io/trexx/apctl}
+IMAGE=${APCTL_IMAGE:-ghcr.io/trexx/rust-apctl}
 cd "$(dirname "$0")/.."
 
 version=${1:?usage: scripts/release.sh <version> [--pin <manifest>] [--no-push] [--no-test]}

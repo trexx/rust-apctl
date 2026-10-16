@@ -40,10 +40,10 @@ These screenshots use mock data from `informdump demo`.
 ## Run
 
 ```sh
-printf '%s' 'a long password' | docker run --rm -i ghcr.io/trexx/apctl hash-password | sed 's/^/admin:/' > users
+printf '%s' 'a long password' | docker run --rm -i ghcr.io/trexx/rust-apctl hash-password | sed 's/^/admin:/' > users
 docker run -d -v apctl-data:/data -v $PWD/users:/users:ro -e APCTL_USERS_FILE=/users \
   -e APCTL_SYSLOG_LISTEN=0.0.0.0:5514 -p 8090:8090 -p 8080:8080 -p 5514:5514/udp -p 3478:3478/udp \
-  ghcr.io/trexx/apctl serve --active --keys /data/import.json
+  ghcr.io/trexx/rust-apctl serve --active --keys /data/import.json
 ```
 
 On Kubernetes (active mode), with the APs' ports on the node and the data on local storage:
@@ -62,7 +62,7 @@ spec:
       securityContext: { fsGroup: 65532 }
       containers:
         - name: apctl
-          image: ghcr.io/trexx/apctl:0.15.1
+          image: ghcr.io/trexx/rust-apctl:0.15.1
           args: [serve, --active, --keys, /secret/import.json, --users-file, /secret/users]
           env:
             - { name: APCTL_SYSLOG_LISTEN, value: "0.0.0.0:5514" }
@@ -84,7 +84,7 @@ spec:
 
 Expose port 8090 with a Service for the web UI. For shadow mode, drop `--active` and the
 host ports, and feed it a capture with `--shadow` or `--shadow-cmd`; the
-`ghcr.io/trexx/apctl-capture` image is a tcpdump sidecar for that. `apctl serve --help`
+`ghcr.io/trexx/rust-apctl-capture` image is a tcpdump sidecar for that. `apctl serve --help`
 lists every option.
 
 ## Demo
