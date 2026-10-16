@@ -26,6 +26,11 @@ use crate::model::Ts;
 const NOISE_FLOOR: i64 = -95;
 /// How long a crash capture collects lines before it is reported.
 const CRASH_WINDOW: Ts = 180;
+/// At most this many entries in each map below: anyone can send syslog lines,
+/// so made-up clients and senders must not grow them without bound.
+const MAX_TRACKED: usize = 10_000;
+/// At most this many candidate APs kept per steering request.
+const MAX_TARGETS: usize = 16;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Found {
@@ -51,18 +56,35 @@ struct Crash {
     lines: Vec<String>,
 }
 
+/// Who sent a line: the AP, else the address of a sender apctl can't name.
+#[derive(Clone, PartialEq, Eq, Hash)]
+enum Source {
+    Device(Mac),
+    Address(String),
+}
+
 #[derive(Default)]
 pub struct LogEvents {
     /// Steering requests waiting for the client's answer, by client.
-    steering: HashMap<String, Steering>,
+    steering: HashMap<Mac, Steering>,
     /// The client each device's latest steering request was about.
-    steering_by_device: HashMap<String, String>,
-    /// Last report per kind and subject, to avoid repeating one line's event.
-    recent: HashMap<&'static str, HashMap<String, Ts>>,
+    steering_by_device: HashMap<Source, Mac>,
+    /// Last report per kind, client and detail (e.g. a steering answer's
+    /// status), to avoid repeating one line's event.
+    recent: HashMap<(&'static str, Mac, i64), Ts>,
     /// Current experience problems per client, and when they were reported.
-    anomalies: HashMap<String, (String, Ts)>,
-    /// Crash captures in progress, by device (or source address).
-    crashes: HashMap<String, (Option<Mac>, Crash)>,
+    anomalies: HashMap<Mac, (String, Ts)>,
+    /// Crash captures in progress, by sender.
+    crashes: HashMap<Source, (Option<Mac>, Crash)>,
+}
+
+/// Inserts unless the map is full (a key already there is always replaced).
+fn bounded<K: std::hash::Hash + Eq, V>(map: &mut HashMap<K, V>, key: K, value: V) -> bool {
+    if map.len() >= MAX_TRACKED && !map.contains_key(&key) {
+        return false;
+    }
+    map.insert(key, value);
+    true
 }
 
 /// Text after `key` up to the next space, comma or bracket.
@@ -93,26 +115,27 @@ pub fn btm_status(code: i64) -> &'static str {
 }
 
 impl LogEvents {
-    /// Reports at most once per `secs` for the same kind and subject.
-    fn fresh(&mut self, kind: &'static str, subject: &str, ts: Ts, secs: Ts) -> bool {
-        let seen = self.recent.entry(kind).or_default();
-        match seen.get_mut(subject) {
-            Some(t) if ts - *t < secs => return false,
-            Some(t) => *t = ts,
-            None => {
-                seen.insert(subject.to_string(), ts);
+    /// Reports at most once per `secs` for the same kind, client and detail.
+    /// Past [`MAX_TRACKED`] new subjects are not reported (a flood of made-up
+    /// clients must not become a flood of events).
+    fn fresh(&mut self, kind: &'static str, client: Mac, detail: i64, ts: Ts, secs: Ts) -> bool {
+        match self.recent.get_mut(&(kind, client, detail)) {
+            Some(t) if ts - *t < secs => false,
+            Some(t) => {
+                *t = ts;
+                true
             }
+            None => bounded(&mut self.recent, (kind, client, detail), ts),
         }
-        true
     }
 
     pub fn feed(&mut self, line: &LogLine) -> Vec<Found> {
         let mut out = Vec::new();
         let msg = line.msg.as_str();
         let prog = line.program.as_deref().unwrap_or("");
-        // Crashes and steering are followed per device (or source address); the
-        // key is made only for a line that needs it.
-        let dev_key = || line.device_mac.map_or_else(|| line.src_ip.clone(), |m| m.to_string());
+        // Crashes and steering are followed per sender; the key is made only
+        // for a line that needs it.
+        let dev_key = || line.device_mac.map_or_else(|| Source::Address(line.src_ip.clone()), Source::Device);
 
         // Crash capture: collect everything the device says for a while after a
         // fault (up to 200 lines), while its other events are still reported.
@@ -142,8 +165,8 @@ impl LogEvents {
                     out.extend(self.flush(&key));
                 }
             } else if let Some((kind, process)) = fault {
-                self.crashes.insert(key.clone(), (line.device_mac, Crash { started: line.ts, kind, process, lines: vec![format!("{prog}: {msg}")] }));
-                if kind == "kernel panic" {
+                let crash = Crash { started: line.ts, kind, process, lines: vec![format!("{prog}: {msg}")] };
+                if bounded(&mut self.crashes, key.clone(), (line.device_mac, crash)) && kind == "kernel panic" {
                     out.extend(self.flush(&key));
                 }
             }
@@ -161,7 +184,7 @@ impl LogEvents {
             let reason = rest.split("reason:").nth(1).map(|r| r.split(" rssi:").next().unwrap_or(r).trim_end_matches(')').trim().to_string());
             let signal = field(rest, "rssi:").and_then(|v| v.parse::<i64>().ok()).map(|r| r + NOISE_FLOOR);
             if let Some(c) = client
-                && self.fresh("client_kicked", &c.to_string(), line.ts, 60)
+                && self.fresh("client_kicked", c, 0, line.ts, 60)
             {
                 out.push(Found { kind: "client_kicked", device: line.device_mac, client: Some(c), data: json!({ "reason": reason, "signal": signal, "vap": vap }) });
             }
@@ -179,11 +202,13 @@ impl LogEvents {
                     targets: vec![],
                     vap,
                 };
-                self.steering.insert(c.to_string(), s);
-                self.steering_by_device.insert(dev_key(), c.to_string());
+                if bounded(&mut self.steering, c, s) {
+                    bounded(&mut self.steering_by_device, dev_key(), c);
+                }
             } else if let Some(t) = msg.split("BTM: [").nth(1).filter(|t| t.contains("]{"))
-                && let Some(client) = self.steering_by_device.get(&dev_key()).cloned()
-                && let Some(s) = self.steering.get_mut(&client)
+                && let Some(client) = self.steering_by_device.get(&dev_key())
+                && let Some(s) = self.steering.get_mut(client)
+                && s.targets.len() < MAX_TARGETS
             {
                 // A candidate: "[0]{bssid chNN/opNN/phyNN}".
                 let inner = t.split('{').nth(1).unwrap_or("").trim_end_matches('}');
@@ -195,18 +220,16 @@ impl LogEvents {
                 let client = r.split(']').next().and_then(mac);
                 let status = field(msg, "status ").and_then(|v| v.parse::<i64>().ok());
                 if let (Some(c), Some(st)) = (client, status) {
-                    let req = self.steering.remove(&c.to_string()).filter(|s| line.ts - s.ts <= 30);
+                    let req = self.steering.remove(&c).filter(|s| line.ts - s.ts <= 30).unwrap_or_default();
                     let to = field(msg, "bssid ").filter(|b| *b != "n/a").map(str::to_string);
-                    if self.fresh("client_steered", &format!("{c}/{st}"), line.ts, 600) {
+                    if self.fresh("client_steered", c, st, line.ts, 600) {
                         out.push(Found {
                             kind: "client_steered",
                             device: line.device_mac,
                             client: Some(c),
                             data: json!({
                                 "status": st, "result": btm_status(st), "accepted": st == 0, "to_bssid": to,
-                                "signal": req.as_ref().and_then(|s| s.rssi), "candidates": req.as_ref().map(|s| s.targets.clone()).unwrap_or_default(),
-                                "offered": req.as_ref().and_then(|s| s.candidates),
-                                "vap": req.and_then(|s| s.vap),
+                                "signal": req.rssi, "candidates": req.targets, "offered": req.candidates, "vap": req.vap,
                             }),
                         });
                     }
@@ -220,7 +243,7 @@ impl LogEvents {
             && let Some(c) = rest.split_whitespace().next().and_then(mac)
         {
             let vap = msg.split(':').next().filter(|v| v.starts_with("wifi")).map(str::to_string);
-            if self.fresh("client_wrong_password", &c.to_string(), line.ts, 600) {
+            if self.fresh("client_wrong_password", c, 0, line.ts, 600) {
                 out.push(Found { kind: "client_wrong_password", device: line.device_mac, client: Some(c), data: json!({ "vap": vap }) });
             }
             return out;
@@ -233,10 +256,8 @@ impl LogEvents {
             if let Some(c) = client
                 && !reasons.is_empty()
             {
-                let key = c.to_string();
-                let changed = self.anomalies.get(&key).is_none_or(|(r, t)| *r != reasons || line.ts - t >= 1800);
-                if changed {
-                    self.anomalies.insert(key, (reasons.clone(), line.ts));
+                let changed = self.anomalies.get(&c).is_none_or(|(r, t)| *r != reasons || line.ts - t >= 1800);
+                if changed && bounded(&mut self.anomalies, c, (reasons.clone(), line.ts)) {
                     out.push(Found {
                         kind: "client_experience",
                         device: line.device_mac,
@@ -253,20 +274,20 @@ impl LogEvents {
         out
     }
 
-    fn flush(&mut self, key: &str) -> Option<Found> {
+    fn flush(&mut self, key: &Source) -> Option<Found> {
         let (device, c) = self.crashes.remove(key)?;
         Some(Found { kind: "ap_crash", device, client: None, data: json!({ "kind": c.kind, "process": c.process, "source": "syslog", "lines": c.lines }) })
     }
 
     /// Reports crash captures that have collected long enough.
     pub fn tick(&mut self, now: Ts) -> Vec<Found> {
-        let due: Vec<String> = self.crashes.iter().filter(|(_, (_, c))| now - c.started >= CRASH_WINDOW).map(|(k, _)| k.clone()).collect();
+        let due: Vec<Source> = self.crashes.iter().filter(|(_, (_, c))| now - c.started >= CRASH_WINDOW).map(|(k, _)| k.clone()).collect();
         let mut out: Vec<Found> = due.iter().filter_map(|k| self.flush(k)).collect();
         // Forget old de-duplication and steering state.
-        for seen in self.recent.values_mut() {
-            seen.retain(|_, t| now - *t < 3600);
-        }
+        self.recent.retain(|_, t| now - *t < 3600);
         self.steering.retain(|_, s| now - s.ts < 300);
+        let steering = &self.steering;
+        self.steering_by_device.retain(|_, c| steering.contains_key(c));
         self.anomalies.retain(|_, (_, t)| now - *t < 3 * 3600);
         out.sort_by_key(|f| f.kind);
         out
@@ -378,6 +399,27 @@ mod tests {
         assert!(l.tick(1000).is_empty());
         assert!(l.feed(&line(10, "kernel", "Oops[#1]:")).is_empty());
         assert_eq!(l.tick(1000)[0].data["kind"], "kernel oops");
+    }
+
+    #[test]
+    fn what_is_tracked_is_bounded() {
+        let mut l = LogEvents::default();
+        let client = |i: usize| format!("02:00:{:02x}:{:02x}:{:02x}:01", i >> 16, (i >> 8) & 0xff, i & 0xff);
+        let p = "wlan: [0:I:ANY] [UNSPECIFIED] vap-0(wifi1ap1):";
+        let mut kicks = 0;
+        for i in 0..MAX_TRACKED + 50 {
+            kicks += l.feed(&line(1, "stamgr", &format!("kick-sta-on {} wifi1ap1 (reason:Low RSSI rssi:19)", client(i)))).len();
+            l.feed(&line(1, "kernel", &format!("{p}BTM: STA {} RSSI: -77, candidates: 1, error: 0, flags: ALLOW (0x1)", client(i))));
+        }
+        assert_eq!(kicks, MAX_TRACKED, "made-up clients past the limit are not reported");
+        assert_eq!((l.recent.len(), l.steering.len()), (MAX_TRACKED, MAX_TRACKED));
+        for _ in 0..100 {
+            l.feed(&line(1, "kernel", &format!("{p}BTM: [0]{{78:45:58:3c:51:ae ch44/op128/phy14}}")));
+        }
+        assert!(l.steering.values().all(|s| s.targets.len() <= MAX_TARGETS));
+        // Time clears them, and the device's pointer to its last request goes with it.
+        assert!(l.tick(4000).is_empty());
+        assert!(l.recent.is_empty() && l.steering.is_empty() && l.steering_by_device.is_empty());
     }
 
     #[test]
