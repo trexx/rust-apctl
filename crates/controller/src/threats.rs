@@ -17,12 +17,15 @@
 //! so a later, different finding for the same BSSID is still reported.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::sync::Arc;
 use std::time::Duration;
 
 use axum::Json;
 use axum::extract::State;
-use axum::http::StatusCode;
 use rusqlite::{Connection, OptionalExtension};
+use axum::http::{StatusCode, header};
+use axum::response::{IntoResponse, Response};
+use rusqlite::types::Value as Sql;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -83,8 +86,7 @@ pub struct Assessment {
     pub heard: Vec<Heard>,
     /// When the first neighbouring network was recorded.
     pub watching_since: Ts,
-    /// (kind, bssid) -> acknowledgement note and time.
-    pub acks: HashMap<(Kind, String), (Option<String>, Ts)>,
+    pub acks: Acks,
     /// (kind, bssid) -> when first reported.
     pub reported: HashMap<(Kind, String), Ts>,
 }
@@ -124,6 +126,8 @@ pub struct Finding {
     pub target: Option<String>,
     pub detail: String,
     pub first_reported: Option<Ts>,
+    /// As it was when the finding was worked out; `list` sends it as it is now.
+    #[serde(skip)]
     pub acknowledged: Option<Ack>,
 }
 
@@ -132,6 +136,9 @@ pub struct Ack {
     pub note: Option<String>,
     pub ts: Ts,
 }
+
+/// Acknowledgements by (kind, bssid).
+pub type Acks = HashMap<(Kind, String), Ack>;
 
 /// A MAC as a number with the locally-administered bit cleared, so the
 /// variants an AP or phone derives from one address sit next to each other.
@@ -314,7 +321,7 @@ pub fn assess(a: &Assessment) -> Vec<Finding> {
                 target,
                 detail,
                 first_reported: a.reported.get(&key).copied(),
-                acknowledged: a.acks.get(&key).map(|(note, ts)| Ack { note: note.clone(), ts: *ts }),
+                acknowledged: a.acks.get(&key).cloned(),
             });
         };
 
@@ -534,13 +541,6 @@ pub fn gather(store: &Store, live: &SharedLive, now: Ts) -> anyhow::Result<Asses
             })?
             .collect::<rusqlite::Result<_>>()?;
         a.watching_since = c.query_row("SELECT MIN(first_seen) FROM neighbors", [], |r| r.get::<_, Option<Ts>>(0)).optional()?.flatten().unwrap_or(now);
-        let mut stmt = c.prepare("SELECT kind, bssid, note, ts FROM network_acks")?;
-        for row in stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get(2)?, r.get(3)?)))? {
-            let (k, b, n, t) = row?;
-            if let Some(k) = Kind::parse(&k) {
-                a.acks.insert((k, b), (n, t));
-            }
-        }
         let mut stmt = c.prepare("SELECT kind, bssid, first_reported FROM network_threats")?;
         for row in stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get(2)?)))? {
             let (k, b, t) = row?;
@@ -550,6 +550,7 @@ pub fn gather(store: &Store, live: &SharedLive, now: Ts) -> anyhow::Result<Asses
         }
         Ok(crate::connections::Names::load(c)?)
     })?;
+    a.acks = with_acks(store, |acks| acks.clone())?;
     // Our APs and every Wi-Fi client ever seen, with their names (aliases first).
     names.add_live(&live.read().unwrap());
     for (mac, name) in names.aps {
@@ -651,8 +652,9 @@ impl History {
 /// The findings last worked out (by [`watch`] every minute, or for a request),
 /// which `list` serves while they are fresh rather than gathering them again.
 struct Latest {
+    /// When what they rest on was gathered.
     at: Ts,
-    findings: Vec<Finding>,
+    findings: Arc<[Finding]>,
     watching_since: Ts,
 }
 
@@ -665,7 +667,42 @@ fn latest() -> std::sync::MutexGuard<'static, Option<Latest>> {
     LATEST.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
-async fn findings(s: &AppState) -> Result<(Vec<Finding>, Ts), ApiError> {
+/// Serves findings gathered at `at`, unless newer ones are served already (a
+/// request and `watch` can gather at once). Ones from the future, from before
+/// the clock stepped back, are replaced.
+fn publish(at: Ts, findings: Arc<[Finding]>, watching_since: Ts) {
+    let mut l = latest();
+    if l.as_ref().is_none_or(|l| !(at + 1..at + LATEST_SECS).contains(&l.at)) {
+        *l = Some(Latest { at, findings, watching_since });
+    }
+}
+
+/// The acknowledgements: read from the database once, then kept here as
+/// [`ack`] changes them, so what is served shows a change at once.
+static ACKS: std::sync::Mutex<Option<Acks>> = std::sync::Mutex::new(None);
+
+fn load_acks(c: &Connection) -> rusqlite::Result<Acks> {
+    let mut acks = Acks::new();
+    let mut stmt = c.prepare("SELECT kind, bssid, note, ts FROM network_acks")?;
+    for row in stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get(2)?, r.get(3)?)))? {
+        let (k, b, note, ts) = row?;
+        if let Some(k) = Kind::parse(&k) {
+            acks.insert((k, b), Ack { note, ts });
+        }
+    }
+    Ok(acks)
+}
+
+/// Runs `f` on the acknowledgements, read from the database the first time.
+fn with_acks<T>(store: &Store, f: impl FnOnce(&mut Acks) -> T) -> anyhow::Result<T> {
+    let mut acks = ACKS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    if acks.is_none() {
+        *acks = Some(store.read(Db::Config, |c| Ok(load_acks(c)?))?);
+    }
+    Ok(f(acks.as_mut().expect("read above")))
+}
+
+async fn findings(s: &AppState) -> Result<(Arc<[Finding]>, Ts), ApiError> {
     let now = store::now_ts();
     if let Some(l) = latest().as_ref().filter(|l| (0..LATEST_SECS).contains(&(now - l.at))) {
         return Ok((l.findings.clone(), l.watching_since));
@@ -673,28 +710,47 @@ async fn findings(s: &AppState) -> Result<(Vec<Finding>, Ts), ApiError> {
     let (store, live) = (s.store.clone(), s.live.clone());
     let (list, watching_since) = tokio::task::spawn_blocking(move || {
         let a = gather(&store, &live, now)?;
-        Ok::<_, anyhow::Error>((assess(&a), a.watching_since))
+        Ok::<_, anyhow::Error>((Arc::<[Finding]>::from(assess(&a)), a.watching_since))
     })
     .await?
     .map_err(ApiError::from)?;
-    *latest() = Some(Latest { at: now, findings: list.clone(), watching_since });
+    publish(now, list.clone(), watching_since);
     Ok((list, watching_since))
 }
 
+/// A finding as `list` sends it: with its acknowledgement as it is now, and
+/// the vendor of its BSSID.
+#[derive(Serialize)]
+struct Served<'a> {
+    #[serde(flatten)]
+    finding: &'a Finding,
+    acknowledged: Option<&'a Ack>,
+    vendor: Option<&'a str>,
+}
+
 /// GET /api/rf/threats
-pub async fn list(State(s): State<AppState>) -> Result<Json<Value>, ApiError> {
+pub async fn list(State(s): State<AppState>) -> Result<Response, ApiError> {
     let (list, watching_since) = findings(&s).await?;
-    // Vendors help tell a neighbour's router from a laptop or phone.
-    let items: Vec<Value> = list
+    let acks = ACKS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let items: Vec<Served> = list
         .iter()
-        .map(|f| {
-            let mut j = serde_json::to_value(f)?;
-            j["vendor"] = json!(s.vendors.lookup_str(&f.bssid));
-            Ok(j)
+        .map(|f| Served {
+            finding: f,
+            // Read with the findings, unless that failed: then as the findings had them.
+            acknowledged: acks.as_ref().map_or(f.acknowledged.as_ref(), |a| a.get(&(f.kind, f.bssid.clone()))),
+            // Vendors help tell a neighbour's router from a laptop or phone.
+            vendor: s.vendors.lookup_str(&f.bssid),
         })
-        .collect::<serde_json::Result<_>>()
-        .map_err(|e| ApiError::internal(e.to_string()))?;
-    Ok(Json(json!({ "watching_since": watching_since, "findings": items })))
+        .collect();
+    #[derive(Serialize)]
+    struct Body<'a> {
+        watching_since: Ts,
+        findings: Vec<Served<'a>>,
+    }
+    // Written out here: what is sent borrows the findings and acknowledgements.
+    let body = serde_json::to_string(&Body { watching_since, findings: items }).map_err(|e| ApiError::internal(e.to_string()))?;
+    drop(acks);
+    Ok(([(header::CONTENT_TYPE, "application/json")], body).into_response())
 }
 
 #[derive(Deserialize)]
@@ -722,16 +778,30 @@ pub async fn ack(State(s): State<AppState>, Json(b): Json<AckBody>) -> Result<Js
         return Err(ApiError(StatusCode::BAD_REQUEST, "note is too long (200 characters at most)".into()));
     }
     let (ts, bssid) = (store::now_ts(), bssid.to_string());
-    let ack = b.ack.then(|| Ack { note: note.clone(), ts });
-    let input = Input::AckThreat { ts, kind, bssid: bssid.clone(), note: if b.ack { Some(note) } else { None } };
-    s.send(input).await?;
-    // The findings served from memory show it at once.
-    if let Some(l) = latest().as_mut() {
-        for f in l.findings.iter_mut().filter(|f| f.kind == kind && f.bssid == bssid) {
-            f.acknowledged.clone_from(&ack);
-        }
-    }
+    let ack = b.ack.then_some(Ack { note, ts });
+    let (store, writer) = (s.store.clone(), s.writer.clone());
+    tokio::task::spawn_blocking(move || set_ack(&store, &writer, kind, bssid, ack)).await?.map_err(ApiError::from)?;
     Ok(Json(json!({ "ok": true })))
+}
+
+/// Acknowledges a finding (`Some`) or withdraws the acknowledgement: in memory
+/// and in the database in one step, so the two never disagree, and what is
+/// served shows it at once, however old the findings are.
+fn set_ack(store: &Store, writer: &Writer, kind: Kind, bssid: String, ack: Option<Ack>) -> anyhow::Result<()> {
+    with_acks(store, |acks| {
+        let k = Sql::Text(kind.as_str().into());
+        match ack {
+            Some(a) => {
+                let sql = "INSERT OR REPLACE INTO network_acks (kind, bssid, note, ts) VALUES (?1, ?2, ?3, ?4)";
+                writer.exec(Db::Config, sql, vec![k, Sql::Text(bssid.clone()), a.note.clone().map_or(Sql::Null, Sql::Text), Sql::Integer(a.ts)]);
+                acks.insert((kind, bssid), a);
+            }
+            None => {
+                writer.exec(Db::Config, "DELETE FROM network_acks WHERE kind = ?1 AND bssid = ?2", vec![k, Sql::Text(bssid.clone())]);
+                acks.remove(&(kind, bssid));
+            }
+        }
+    })
 }
 
 /// Forgets the findings about networks no longer heard at all (the networks
@@ -781,7 +851,7 @@ pub fn watch(store: std::sync::Arc<Store>, live: SharedLive, engine: tokio::sync
                 // As the engine records it.
                 f.first_reported = Some(now);
             }
-            *latest() = Some(Latest { at: now, findings: list, watching_since });
+            publish(now, list.into(), watching_since);
         }
     });
 }
@@ -996,10 +1066,68 @@ mod tests {
     }
 
     #[test]
+    fn findings_are_sent_with_their_acknowledgement_as_it_is_now() {
+        let mut a = site();
+        a.heard.push(heard("02:aa:bb:cc:dd:ee", UP, "H0me", 36, "Open", -70));
+        let f = assess(&a).remove(0);
+        let ack = Ack { note: Some("the neighbours".into()), ts: 5 };
+        let sent = serde_json::to_value(Served { finding: &f, acknowledged: Some(&ack), vendor: Some("Acme") }).unwrap();
+        // The same fields as a finding has, and the vendor.
+        let mut keys: Vec<&str> = sent.as_object().unwrap().keys().map(String::as_str).collect();
+        let mut want = vec![
+            "kind", "severity", "bssid", "essid", "security", "channel", "radio", "best_signal", "heard_by", "first_seen", "last_seen", "target", "detail", "first_reported",
+            "acknowledged", "vendor",
+        ];
+        want.sort();
+        keys.sort();
+        assert_eq!(keys, want);
+        assert_eq!((sent["kind"].as_str(), sent["acknowledged"]["note"].as_str(), sent["vendor"].as_str()), (Some("lookalike"), Some("the neighbours"), Some("Acme")));
+        assert!(serde_json::to_value(Served { finding: &f, acknowledged: None, vendor: None }).unwrap()["acknowledged"].is_null());
+    }
+
+    #[test]
+    fn older_findings_do_not_replace_newer_ones() {
+        let at = || latest().as_ref().map(|l| l.at);
+        publish(1_000, Arc::from([]), 0);
+        publish(990, Arc::from([]), 0);
+        assert_eq!(at(), Some(1_000), "gathered before the ones served");
+        publish(1_030, Arc::from([]), 0);
+        assert_eq!(at(), Some(1_030));
+        // Served ones far ahead are from before the clock stepped back.
+        publish(500, Arc::from([]), 0);
+        assert_eq!(at(), Some(500));
+    }
+
+    #[test]
+    fn acknowledgements_and_slow_reads_are_kept_in_memory() {
+        let dir = std::env::temp_dir().join(format!("apctl-threats-acks-{}-{}", std::process::id(), store::now_ts()));
+        let (store, writer) = Store::open(&dir).unwrap();
+        let live: SharedLive = Default::default();
+        let exec = |sql: &'static str| writer.exec(Db::Config, sql, vec![]);
+        exec("INSERT INTO network_acks (kind, bssid, note, ts) VALUES ('lookalike', '02:00:00:00:00:01', 'stored', 1)");
+        exec("INSERT INTO neighbors (bssid, ap_mac, first_seen, last_seen) VALUES ('02:00:00:00:00:01', 'x', 100, 200)");
+        exec("INSERT INTO clients (mac, hostname) VALUES ('02:00:00:00:01:01', 'phone')");
+        assert!(writer.flush(Duration::from_secs(5)));
+        let now = 1_000_000;
+        let a = gather(&store, &live, now).unwrap();
+        assert_eq!(a.acks[&(Kind::Lookalike, "02:00:00:00:00:01".to_string())].note.as_deref(), Some("stored"));
+        assert_eq!((a.watching_since, a.clients.len()), (100, 1));
+        // Acknowledging shows in the next gather, and is written.
+        set_ack(&store, &writer, Kind::Bridged, "02:00:00:00:00:02".into(), Some(Ack { note: None, ts: 7 })).unwrap();
+        set_ack(&store, &writer, Kind::Lookalike, "02:00:00:00:00:01".into(), None).unwrap();
+        assert!(writer.flush(Duration::from_secs(5)));
+        let a = gather(&store, &live, now + 60).unwrap();
+        assert_eq!(a.acks.keys().collect::<Vec<_>>(), [&(Kind::Bridged, "02:00:00:00:00:02".to_string())]);
+        let stored: Vec<String> = store.read(Db::Config, |c| Ok(c.prepare("SELECT kind FROM network_acks")?.query_map([], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?)).unwrap();
+        assert_eq!(stored, ["bridged"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn acknowledgements_are_per_kind_and_bssid() {
         let mut a = site();
         a.heard.push(heard("02:aa:bb:cc:dd:ee", UP, "H0me", 36, "Open", -70));
-        a.acks.insert((Kind::Lookalike, "02:aa:bb:cc:dd:ee".into()), (Some("the neighbours".into()), 5));
+        a.acks.insert((Kind::Lookalike, "02:aa:bb:cc:dd:ee".into()), Ack { note: Some("the neighbours".into()), ts: 5 });
         assert_eq!((Kind::parse("lookalike"), json!(Kind::NewNearby)), (Some(Kind::Lookalike), json!("new_nearby")), "named as stored");
         let f = assess(&a);
         assert_eq!(f[0].acknowledged.as_ref().and_then(|x| x.note.as_deref()), Some("the neighbours"));

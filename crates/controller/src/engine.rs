@@ -63,8 +63,6 @@ pub enum Input {
     /// Change the firmware upgrade queue; `done` gets how many upgrades were
     /// queued or cancelled.
     Firmware { op: crate::firmware::Op, done: tokio::sync::oneshot::Sender<usize> },
-    /// Acknowledge a finding with an optional note (`Some`), or withdraw the acknowledgement (`None`).
-    AckThreat { ts: Ts, kind: crate::threats::Kind, bssid: String, note: Option<Option<String>> },
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -582,18 +580,6 @@ impl Engine {
                 let n = op.apply(&mut self.live.write().unwrap().firmware);
                 let _ = done.send(n);
             }
-            Input::AckThreat { ts, kind, bssid, note } => match note {
-                Some(note) => self.writer.exec(
-                    Db::Config,
-                    "INSERT OR REPLACE INTO network_acks (kind, bssid, note, ts) VALUES (?1, ?2, ?3, ?4)",
-                    vec![Sql::Text(kind.as_str().into()), Sql::Text(bssid), opt_text(note), Sql::Integer(ts)],
-                ),
-                None => self.writer.exec(
-                    Db::Config,
-                    "DELETE FROM network_acks WHERE kind = ?1 AND bssid = ?2",
-                    vec![Sql::Text(kind.as_str().into()), Sql::Text(bssid)],
-                ),
-            },
         }
     }
 
