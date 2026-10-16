@@ -303,12 +303,18 @@ pub struct Engine {
     /// When long-gone clients were last dropped from the live view.
     last_prune: Ts,
     written: Written,
+    /// Syslog hash_ids that none of the keys opened, and when that was tried.
+    /// The keys are fixed at start (`--keys`), so only time clears an entry.
+    syslog_unknown: HashMap<String, Ts>,
 }
+
+/// How long a syslog hash_id no key opened is left untried.
+const SYSLOG_RETRY_SECS: Ts = 300;
 
 impl Engine {
     pub fn new(writer: Writer, keys: Arc<KeyStore>, live: SharedLive, tx: broadcast::Sender<LiveMsg>) -> Self {
         let counters = live.read().unwrap().counters.clone();
-        Engine { writer, keys, renderer: None, live, counters, tx, radios: HashMap::new(), mcast_prev: HashMap::new(), bss_prev: HashMap::new(), logevents: Default::default(), isolated: HashMap::new(), last_prune: 0, written: Default::default() }
+        Engine { writer, keys, renderer: None, live, counters, tx, radios: HashMap::new(), mcast_prev: HashMap::new(), bss_prev: HashMap::new(), logevents: Default::default(), isolated: HashMap::new(), last_prune: 0, written: Default::default(), syslog_unknown: HashMap::new() }
     }
 
     /// Enables dry-run comparisons of every captured config push.
@@ -996,28 +1002,49 @@ impl Engine {
         }
     }
 
-    fn datagram(&mut self, ts: Ts, src_ip: String, payload: &[u8]) {
-        let (by_hash, by_ip) = {
-            let live = self.live.read().unwrap();
-            (crate::syslog::hash_id(payload).and_then(|h| live.by_hash_id.get(&h).copied()), live.by_ip.get(&src_ip).copied())
-        };
-        let keys = &self.keys;
-        // `open` only asks for the datagram's own hash_id, looked up above.
-        let lookup = |_: &str| by_hash.and_then(|mac| keys.syslog_key(&mac).map(|k| (mac, *k)));
-        let mut result = crate::syslog::open(payload, lookup);
+    /// Decrypts a datagram from the AP with this `hash_id`: with the key of the
+    /// AP known by it, else by trying each key.
+    fn decrypt_syslog(&mut self, ts: Ts, payload: &[u8], hash_id: String, by_hash: Option<Mac>) -> anyhow::Result<(Mac, String)> {
+        if let Some(mac) = by_hash
+            && let Some(key) = self.keys.syslog_key(&mac)
+            && let Ok(text) = crate::syslog::decrypt(payload, mac, key)
+        {
+            return Ok((mac, text));
+        }
         // Syslog can arrive before the AP's first inform tells us its hash_id:
         // try each known key (there are few) and remember the one that works.
-        if result.is_err()
-            && let Some(hash_id) = crate::syslog::hash_id(payload)
+        // A hash_id no key opened is not tried again for a while: an AP whose
+        // key apctl lacks sends a datagram per log line.
+        if let Some(at) = self.syslog_unknown.get(&hash_id)
+            && (*at..*at + SYSLOG_RETRY_SECS).contains(&ts)
         {
-            for (mac, key) in keys.syslog_keys() {
-                if let Ok(found) = crate::syslog::open(payload, |_| Some((*mac, *key))) {
-                    self.live.write().unwrap().by_hash_id.insert(hash_id, *mac);
-                    result = Ok(found);
-                    break;
-                }
+            anyhow::bail!("no syslog key for hash_id {hash_id} (none worked {}s ago)", ts - at);
+        }
+        for (mac, key) in self.keys.syslog_keys() {
+            if let Ok(text) = crate::syslog::decrypt(payload, *mac, key) {
+                self.syslog_unknown.remove(&hash_id);
+                self.live.write().unwrap().by_hash_id.insert(hash_id, *mac);
+                return Ok((*mac, text));
             }
         }
+        // Bounded against made-up hash_ids; expired entries go at each tick.
+        if self.syslog_unknown.len() < 10_000 {
+            self.syslog_unknown.insert(hash_id.clone(), ts);
+        }
+        anyhow::bail!("no syslog key for hash_id {hash_id}")
+    }
+
+    fn datagram(&mut self, ts: Ts, src_ip: String, payload: &[u8]) {
+        // Encrypted datagrams name their sender by hash_id; plain ones are passed through.
+        let hash_id = crate::syslog::hash_id(payload);
+        let (by_hash, by_ip) = {
+            let live = self.live.read().unwrap();
+            (hash_id.as_ref().and_then(|h| live.by_hash_id.get(h).copied()), live.by_ip.get(&src_ip).copied())
+        };
+        let result = match hash_id {
+            Some(h) => self.decrypt_syslog(ts, payload, h, by_hash).map(|(mac, text)| (Some(mac), text)),
+            None => crate::syslog::open(payload, |_| None),
+        };
         match result {
             Ok((mac, text)) => {
                 // Netconsole and multi-line messages can carry several lines.
@@ -1114,6 +1141,7 @@ impl Engine {
     /// Time-based transitions: APs going quiet and clients disappearing.
     fn tick(&mut self, now: Ts) {
         self.mcast_prev.retain(|_, (ts, ..)| *ts > now - 3600);
+        self.syslog_unknown.retain(|_, at| (*at..*at + SYSLOG_RETRY_SECS).contains(&now));
         {
             let mut live = self.live.write().unwrap();
             if let Some(mac) = live.firmware.expired(now)
@@ -1637,6 +1665,34 @@ mod tests {
             .collect();
         assert_eq!(renames.len(), 2, "{renames:?}");
         assert_eq!(renames[1]["from"], "Kitchen speaker");
+    }
+
+    #[test]
+    fn syslog_keys_are_tried_once_per_unknown_sender() {
+        let mut keys = KeyStore::default();
+        keys.insert_syslog(AP1, &hex::encode([7u8; 32])).unwrap();
+        let dir = std::env::temp_dir().join(format!("apctl-syslog-{}-{}", std::process::id(), rand_suffix()));
+        let (_store, writer) = store::Store::open(&dir).unwrap();
+        let (tx, _rx) = broadcast::channel(1024);
+        let live: SharedLive = Default::default();
+        let mut e = Engine::new(writer, Arc::new(keys), live.clone(), tx);
+        let send = |e: &mut Engine, ts: Ts, hash_id: u8, key: u8| {
+            let payload = crate::syslog::tests::seal([hash_id; 8], [key; 32], "<14>hostapd: hello");
+            e.handle(Input::Datagram { ts, src_ip: "192.0.2.1".into(), payload });
+        };
+        let logs = || live.read().unwrap().counters.logs.load(Ordering::Relaxed);
+        // An AP whose key apctl lacks: remembered, not tried again for a while.
+        send(&mut e, 0, 1, 9);
+        assert_eq!(e.syslog_unknown.get(&hex::encode([1u8; 8])), Some(&0));
+        send(&mut e, 10, 1, 9);
+        assert_eq!(e.syslog_unknown.get(&hex::encode([1u8; 8])), Some(&0), "not retried within the window");
+        e.handle(Input::Tick(SYSLOG_RETRY_SECS));
+        assert!(e.syslog_unknown.is_empty(), "expired");
+        // A known key under a hash_id not seen yet: found by trial and remembered.
+        send(&mut e, 20, 2, 7);
+        assert_eq!(logs(), 1);
+        assert_eq!(live.read().unwrap().by_hash_id.get(&hex::encode([2u8; 8])), Some(&AP1.parse().unwrap()));
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

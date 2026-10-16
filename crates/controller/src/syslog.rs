@@ -53,10 +53,18 @@ pub fn open(datagram: &[u8], lookup: impl Fn(&str) -> Option<(Mac, [u8; 32])>) -
     }
     let hash_id = hex::encode(&datagram[9..17]);
     let (mac, key) = lookup(&hash_id).ok_or_else(|| anyhow!("no syslog key for hash_id {hash_id}"))?;
-    let plain = Aes256Gcm::new(&key.into())
+    Ok((Some(mac), decrypt(datagram, mac, &key)?))
+}
+
+/// Decrypts an encrypted datagram with `mac`'s syslog key.
+pub fn decrypt(datagram: &[u8], mac: Mac, key: &[u8; 32]) -> Result<String> {
+    if !datagram.starts_with(&MAGIC) || datagram.len() < HEADER + 16 {
+        bail!("not an encrypted syslog datagram ({} bytes)", datagram.len());
+    }
+    let plain = Aes256Gcm::new(key.into())
         .decrypt(&Nonce::try_from(&datagram[17..29]).expect("12 bytes"), Payload { msg: &datagram[HEADER..], aad: &datagram[..HEADER] })
         .map_err(|_| anyhow!("syslog decryption failed for {mac}"))?;
-    Ok((Some(mac), String::from_utf8_lossy(&plain).into_owned()))
+    Ok(String::from_utf8_lossy(&plain).into_owned())
 }
 
 /// Splits a syslog message into priority, program and text. Handles
@@ -102,10 +110,10 @@ pub fn parse(ts: Ts, src_ip: String, device_mac: Option<Mac>, raw: &str) -> LogL
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
-    fn seal(hash_id: [u8; 8], key: [u8; 32], text: &str) -> Vec<u8> {
+    pub(crate) fn seal(hash_id: [u8; 8], key: [u8; 32], text: &str) -> Vec<u8> {
         let mut header = Vec::new();
         header.extend_from_slice(&MAGIC);
         header.push(1);
