@@ -145,6 +145,8 @@ struct Conn {
     to_server: HalfStream,
     to_client: HalfStream,
     last_seen: Micros,
+    /// Some segment in either direction carried data.
+    carried: bool,
 }
 
 impl Conn {
@@ -152,13 +154,30 @@ impl Conn {
     fn closed(&self) -> bool {
         self.to_server.closed() && self.to_client.closed()
     }
+
+    /// How long the connection may go unseen before it is forgotten.
+    fn max_idle(&self) -> Micros {
+        if self.closed() {
+            CLOSED_LINGER
+        } else if self.carried {
+            MAX_IDLE
+        } else {
+            MAX_IDLE_EMPTY
+        }
+    }
 }
 
 /// Connections tracked beyond which idle ones are swept, at most once per `SWEEP_EVERY` of capture time.
 const SWEEP_ABOVE: usize = 256;
 const SWEEP_EVERY: Micros = 10_000_000;
+/// Most connections tracked at once. An AP keeps one open, so this is far more than
+/// any site has; it bounds what packets with made-up addresses can make us hold.
+const MAX_CONNS: usize = 16_384;
 /// How long an open connection may idle before it is forgotten (long live captures).
 const MAX_IDLE: Micros = 300_000_000;
+/// The same for one that never carried data (a handshake, a stray ACK): an AP sends
+/// its request as soon as it has connected.
+const MAX_IDLE_EMPTY: Micros = 10_000_000;
 /// How long a closed connection is kept: long enough for the duplicate copies of its
 /// last segments that `-i any` captures, which arrive right behind the originals.
 const CLOSED_LINGER: Micros = 2_000_000;
@@ -200,13 +219,17 @@ impl Tracker {
             return;
         };
 
-        let conn = self.conns.entry(conn_id).or_default();
-        conn.last_seen = ts;
-        let half = if to_server { &mut conn.to_server } else { &mut conn.to_client };
         if tcp.rst() {
             self.conns.remove(&conn_id);
             return;
         }
+        if self.conns.len() >= MAX_CONNS && !self.conns.contains_key(&conn_id) {
+            self.make_room(ts);
+        }
+        let conn = self.conns.entry(conn_id).or_default();
+        conn.last_seen = ts;
+        conn.carried |= !tcp.payload().is_empty();
+        let half = if to_server { &mut conn.to_server } else { &mut conn.to_client };
         half.segment(ts, tcp.sequence_number(), tcp.syn(), tcp.payload());
         half.fin |= tcp.fin();
 
@@ -232,7 +255,22 @@ impl Tracker {
     fn sweep(&mut self, ts: Micros) {
         if self.conns.len() > SWEEP_ABOVE && ts.abs_diff(self.last_sweep) >= SWEEP_EVERY as u64 {
             self.last_sweep = ts;
-            self.conns.retain(|_, c| ts - c.last_seen < if c.closed() { CLOSED_LINGER } else { MAX_IDLE });
+            self.conns.retain(|_, c| ts - c.last_seen < c.max_idle());
+        }
+    }
+
+    /// Called when the map is full and a new connection shows up: sweeps, and if
+    /// that frees too little, forgets an eighth of the map, those that never carried
+    /// data first and then the least recently seen. Packets with made-up addresses
+    /// cost no more than that, and a real connection that is forgotten picks up again
+    /// at its next message.
+    fn make_room(&mut self, ts: Micros) {
+        self.last_sweep = ts;
+        self.conns.retain(|_, c| ts - c.last_seen < c.max_idle());
+        if self.conns.len() > MAX_CONNS - MAX_CONNS / 8 {
+            let mut order: Vec<(bool, Micros)> = self.conns.values().map(|c| (c.carried, c.last_seen)).collect();
+            let (_, &mut cutoff, _) = order.select_nth_unstable(MAX_CONNS / 8);
+            self.conns.retain(|_, c| (c.carried, c.last_seen) > cutoff);
         }
     }
 }
@@ -633,7 +671,7 @@ mod tests {
         let mut t = Tracker::new(vec![8080], Vec::new());
         let conn = |port: u16| ConnId { client: SocketAddr::from(([10, 0, 0, 5], port)), server: SocketAddr::from(([10, 0, 0, 1], 8080)) };
         for port in 0..300u16 {
-            let mut c = Conn::default();
+            let mut c = Conn { carried: true, ..Conn::default() };
             if port % 2 == 0 {
                 (c.to_server.fin, c.to_client.fin) = (true, true);
             }
@@ -644,7 +682,7 @@ mod tests {
         t.sweep(20_000_000);
         assert_eq!(t.conns.len(), 150, "closed ones go after CLOSED_LINGER");
         assert!(t.conns.values().all(|c| !c.closed()));
-        t.conns.extend((300..500u16).map(|p| (conn(p), Conn::default())));
+        t.conns.extend((300..500u16).map(|p| (conn(p), Conn { carried: true, ..Conn::default() })));
         t.sweep(400_000_000);
         assert!(t.conns.is_empty(), "open ones after MAX_IDLE");
     }
@@ -673,6 +711,36 @@ mod tests {
     fn resynchronises_after_starting_mid_message() {
         let mut h = HalfStream { buf: b"tail of an old body\x00\x01POST /inform HTTP/1.1\r\nContent-Length: 1\r\n\r\nx".to_vec(), ..Default::default() };
         assert!(matches!(h.take_http(true), Some(Parsed::Request { .. })));
+    }
+
+    #[test]
+    fn connections_are_capped() {
+        let mut t = Tracker::new(vec![8080], Vec::new());
+        let syn = |port: u16| {
+            let mut frame = Vec::new();
+            etherparse::PacketBuilder::ethernet2([2; 6], [4; 6]).ipv4([10, 0, (port >> 8) as u8, port as u8], [10, 0, 0, 1], 64).tcp(port, 8080, 1, 1024).syn().write(&mut frame, b"").unwrap();
+            frame
+        };
+        // A real connection that carried data, then a flood of bare SYNs from made-up addresses.
+        let req = sample::http_request(b"x");
+        let mut frame = Vec::new();
+        etherparse::PacketBuilder::ethernet2([2; 6], [4; 6]).ipv4([10, 0, 0, 5], [10, 0, 0, 1], 64).tcp(40000, 8080, 1, 1024).write(&mut frame, &req).unwrap();
+        let mut events = 0;
+        t.packet(Linktype::ETHERNET, 0, &frame, &mut |_| events += 1);
+        assert_eq!(events, 1);
+        for port in 0..(MAX_CONNS + MAX_CONNS / 4) as u16 {
+            t.packet(Linktype::ETHERNET, 1, &syn(port), &mut |_| {});
+            assert!(t.conns.len() <= MAX_CONNS);
+        }
+        assert!(t.conns.values().any(|c| c.carried), "connections that carried data are kept over ones that did not");
+        // Ones that never carried data are swept after a short while.
+        t.sweep(1 + MAX_IDLE_EMPTY);
+        assert_eq!(t.conns.len(), 1);
+        // A reset of an unknown connection does not create one.
+        let mut frame = Vec::new();
+        etherparse::PacketBuilder::ethernet2([2; 6], [4; 6]).ipv4([10, 0, 9, 9], [10, 0, 0, 1], 64).tcp(9, 8080, 1, 1024).rst().write(&mut frame, b"").unwrap();
+        t.packet(Linktype::ETHERNET, 2 + MAX_IDLE_EMPTY, &frame, &mut |_| {});
+        assert_eq!(t.conns.len(), 1);
     }
 }
 
