@@ -119,11 +119,15 @@ pub fn parse(ts: Ts, src_ip: String, device_mac: Option<Mac>, raw: &str) -> LogL
     let mut rest = raw.trim_end_matches(['\n', '\r', '\0']);
     let mut facility = None;
     let mut severity = None;
+    // A priority is one to three digits up to 191 (facility 23, severity 7):
+    // anything else (`<-1>`, `<+5>`, `<999>`) is text, not a kernel line.
     if let Some(stripped) = rest.strip_prefix('<')
         && let Some((pri, after)) = stripped.split_once('>')
-            && let Ok(p) = pri.parse::<i64>() {
-                facility = Some(p / 8);
-                severity = Some(p % 8);
+            && (1..=3).contains(&pri.len()) && pri.bytes().all(|b| b.is_ascii_digit())
+            && let Ok(p) = pri.parse::<u8>()
+            && p <= 191 {
+                facility = Some(i64::from(p / 8));
+                severity = Some(i64::from(p % 8));
                 rest = after;
             }
     // Optional BSD timestamp ("Oct 12 19:45:01 ") and hostname.
@@ -220,6 +224,13 @@ pub(crate) mod tests {
         let l = parse(1, "ip".into(), None, "<14>mcad: ace_reporter.reporter_save_config(): authkey: 0123456789abcdef0123456789abcdef");
         assert_eq!(l.msg, "ace_reporter.reporter_save_config(): authkey: <redacted>");
         assert_eq!(redact("x_passphrase=hunter2, psk:abc; channel=36"), "x_passphrase=<redacted>, psk:<redacted>; channel=36");
+        // Only a real priority is read as one.
+        for bad in ["<-1>kernel: x", "<+5>kernel: x", "<192>kernel: x", "<0000>kernel: x", "<>kernel: x", "<256>kernel: x"] {
+            let l = parse(1, "ip".into(), None, bad);
+            assert_eq!((l.facility, l.severity), (None, None), "{bad}");
+        }
+        let l = parse(1, "ip".into(), None, "<191>x");
+        assert_eq!((l.facility, l.severity), (Some(23), Some(7)));
         let l = parse(1, "ip".into(), None, "free text without a program");
         assert_eq!((l.program, l.msg.as_str()), (None, "free text without a program"));
     }
