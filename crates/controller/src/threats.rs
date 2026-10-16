@@ -736,7 +736,7 @@ pub async fn ack(State(s): State<AppState>, headers: axum::http::HeaderMap, Json
     }
     let (ts, bssid) = (store::now_ts(), bssid.to_string());
     let ack = b.ack.then(|| Ack { note: note.clone(), ts });
-    let input = Input::AckThreat { ts, kind: kind.as_str(), bssid: bssid.clone(), note: if b.ack { Some(note) } else { None } };
+    let input = Input::AckThreat { ts, kind, bssid: bssid.clone(), note: if b.ack { Some(note) } else { None } };
     s.engine.send(input).await.map_err(|_| ApiError(StatusCode::SERVICE_UNAVAILABLE, "engine stopped".into()))?;
     // The findings served from memory show it at once.
     if let Some(l) = latest().as_mut() {
@@ -787,7 +787,7 @@ pub fn watch(store: std::sync::Arc<Store>, live: SharedLive, engine: tokio::sync
                     "kind": f.kind, "severity": f.severity, "bssid": f.bssid, "essid": f.essid, "target": f.target,
                     "signal": f.best_signal, "channel": f.channel, "detail": f.detail,
                 });
-                let input = Input::ThreatFound { ts: now, kind: f.kind.as_str(), bssid: f.bssid.clone(), device_mac: device, data, notify };
+                let input = Input::ThreatFound { ts: now, kind: f.kind, bssid: f.bssid.clone(), device_mac: device, data, notify };
                 if engine.send(input).await.is_err() {
                     return;
                 }

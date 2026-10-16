@@ -23,7 +23,7 @@ use serde_json::{Value, json};
 use tokio::sync::{broadcast, mpsc};
 
 use crate::api::{ApiError, AppState};
-use crate::engine::{Event, LiveMsg, SharedLive};
+use crate::engine::{Event, EventKind, LiveMsg, SharedLive};
 use crate::insights::{RETRY_AT, RETRY_COLS, Spec, retry_pct, retry_totals};
 use crate::model::Ts;
 use crate::settings::band_name;
@@ -274,17 +274,17 @@ impl ApWatch {
     }
 }
 
-/// The kinds of event [`from_event`] may turn into an alert: the engine sends
-/// the watcher only these.
-pub const EVENT_KINDS: [&str; 10] = [
-    "network_threat", "ap_restarted", "ap_firmware_changed", "dfs_radar", "ap_isolated", "ap_crash", "ap_process_restarted", "ap_upgrade_failed", "ap_upgraded",
-    "config_applied",
-];
+/// Whether [`from_event`] may turn an event of this kind into an alert: the
+/// engine sends the watcher only these.
+pub fn alertable(kind: EventKind) -> bool {
+    use EventKind::*;
+    matches!(kind, NetworkThreat | ApRestarted | ApFirmwareChanged | DfsRadar | ApIsolated | ApCrash | ApProcessRestarted | ApUpgradeFailed | ApUpgraded | ConfigApplied)
+}
 
 /// An alert for an event, if the event deserves one.
-fn from_event(kind: &str, device: Option<&str>, data: &Value, ap_name: &dyn Fn(&str) -> String) -> Option<Alert> {
+fn from_event(kind: EventKind, device: Option<&str>, data: &Value, ap_name: &dyn Fn(&str) -> String) -> Option<Alert> {
     use Category::{ApStatus, Changes};
-    if !EVENT_KINDS.contains(&kind) {
+    if !alertable(kind) {
         return None;
     }
     let dev = device.unwrap_or_default();
@@ -293,7 +293,7 @@ fn from_event(kind: &str, device: Option<&str>, data: &Value, ap_name: &dyn Fn(&
     let s = |k: &str| data[k].as_str().unwrap_or_default().to_string();
     let on = |key: &str, category: Category, severity: Severity, title: String, message: String| Alert::for_device(key, category, severity, dev, title, message);
     Some(match kind {
-        "network_threat" => {
+        EventKind::NetworkThreat => {
             let sev = match data["severity"].as_str() {
                 Some("high") => Severity::High,
                 Some("medium") => Severity::Medium,
@@ -305,21 +305,21 @@ fn from_event(kind: &str, device: Option<&str>, data: &Value, ap_name: &dyn Fn(&
                 .link("/radios?tab=rogue")
                 .tagged(format!("threat:{kind}:{bssid}"))
         }
-        "ap_restarted" => on("ap_restarted", Changes, Severity::Low, format!("{name} restarted"), format!("It had been up for {}.", human(data["uptime"].as_i64().unwrap_or(0))))
+        EventKind::ApRestarted => on("ap_restarted", Changes, Severity::Low, format!("{name} restarted"), format!("It had been up for {}.", human(data["uptime"].as_i64().unwrap_or(0))))
             .tagged(format!("restart:{dev}")),
-        "ap_firmware_changed" => on("ap_firmware_changed", Changes, Severity::Info, format!("{name} firmware changed"), format!("{} → {}", s("from"), s("to"))).tagged(format!("firmware:{dev}")),
-        "dfs_radar" => {
+        EventKind::ApFirmwareChanged => on("ap_firmware_changed", Changes, Severity::Info, format!("{name} firmware changed"), format!("{} → {}", s("from"), s("to"))).tagged(format!("firmware:{dev}")),
+        EventKind::DfsRadar => {
             let message = match data["channel"].as_i64() {
                 Some(c) => format!("Channel {c} had to be vacated (DFS); the AP moved to another channel."),
                 None => "A DFS channel had to be vacated; the AP moved to another channel.".into(),
             };
             on("dfs_radar", Changes, Severity::Low, format!("Radar detected by {name}"), message).tagged(format!("radar:{dev}"))
         }
-        "ap_isolated" => {
+        EventKind::ApIsolated => {
             let message = "Its beacon says it has lost its uplink; clients on it may have no network.".into();
             on("ap_isolated", ApStatus, Severity::High, format!("{name} is isolated"), message).tagged(format!("ap-status:{dev}"))
         }
-        "ap_crash" => {
+        EventKind::ApCrash => {
             let title = match data["process"].as_str() {
                 Some(p) => format!("{p} crashed on {name}"),
                 None => format!("{name}: {}", data["kind"].as_str().unwrap_or("crash")),
@@ -327,21 +327,21 @@ fn from_event(kind: &str, device: Option<&str>, data: &Value, ap_name: &dyn Fn(&
             let first = data["lines"].as_array().and_then(|l| l.first()).and_then(Value::as_str).unwrap_or("See the event for details.");
             on("ap_crash", Changes, Severity::Medium, title, first.to_string()).tagged(format!("crash:{dev}"))
         }
-        "ap_process_restarted" => {
+        EventKind::ApProcessRestarted => {
             let title = format!("{} restarted on {name}", data["proc"].as_str().unwrap_or("A process"));
             let message = format!("It exited with code {} and was restarted by {}.", data["exit_status"], data["caller"].as_str().unwrap_or("the system"));
             on("ap_process_restarted", Changes, Severity::Low, title, message).tagged(format!("proc:{dev}"))
         }
-        "ap_upgrade_failed" => {
+        EventKind::ApUpgradeFailed => {
             let message = data["detail"].as_str().unwrap_or("The update did not complete.").to_string();
             on("ap_upgrade_failed", Changes, Severity::Medium, format!("{name} firmware update failed"), message).link("/config?tab=firmware").tagged(format!("upgrade:{dev}"))
         }
-        "ap_upgraded" => {
+        EventKind::ApUpgraded => {
             let title = format!("{name} updated to {}", data["to"].as_str().unwrap_or("new firmware"));
             let message = format!("From {}.", data["from"].as_str().unwrap_or("the previous version"));
             on("ap_upgraded", Changes, Severity::Info, title, message).link("/config?tab=firmware").tagged(format!("upgrade:{dev}"))
         }
-        "config_applied" => {
+        EventKind::ConfigApplied => {
             let message = "The AP applied a configuration change.".into();
             on("config_applied", Changes, Severity::Info, format!("New settings applied on {name}"), message).link("/config").tagged(format!("config:{dev}"))
         }
@@ -482,7 +482,7 @@ pub struct Sink {
 impl Sink {
     /// Passes an event on if it may make an alert.
     pub fn offer(&self, ev: &Event) {
-        if !EVENT_KINDS.contains(&ev.kind) {
+        if !alertable(ev.kind) {
             return;
         }
         if let Err(mpsc::error::TrySendError::Full(_)) = self.tx.try_send(ev.clone()) {
@@ -746,21 +746,21 @@ mod tests {
     #[test]
     fn events_that_deserve_an_alert() {
         let name = |m: &str| if m == "aa" { "Garage".to_string() } else { m.to_string() };
-        let t = from_event("network_threat", Some("aa"), &json!({ "kind": "impersonation", "severity": "high", "bssid": "02:00:00:00:00:01", "essid": "Home", "detail": "x" }), &name).unwrap();
+        let t = from_event(EventKind::NetworkThreat, Some("aa"), &json!({ "kind": "impersonation", "severity": "high", "bssid": "02:00:00:00:00:01", "essid": "Home", "detail": "x" }), &name).unwrap();
         assert_eq!((t.category, t.severity, t.title.as_str()), (Category::Security, Severity::High, "Suspicious network: \"Home\""));
         assert_eq!((t.entity.as_str(), t.tag.as_str(), t.link.as_deref()), ("impersonation/02:00:00:00:00:01", "threat:impersonation:02:00:00:00:00:01", Some("/radios?tab=rogue")));
         let j = json!(t);
         assert_eq!((j["category"].as_str(), j["severity"].as_str()), (Some("security"), Some("high")), "named as before");
-        assert!(from_event("network_threat", Some("aa"), &json!({ "severity": "low" }), &name).is_none(), "low findings only show in the list");
-        let r = from_event("ap_restarted", Some("aa"), &json!({ "uptime": 7200 }), &name).unwrap();
+        assert!(from_event(EventKind::NetworkThreat, Some("aa"), &json!({ "severity": "low" }), &name).is_none(), "low findings only show in the list");
+        let r = from_event(EventKind::ApRestarted, Some("aa"), &json!({ "uptime": 7200 }), &name).unwrap();
         assert_eq!((r.title.as_str(), r.message.as_str()), ("Garage restarted", "It had been up for 2.0 h."));
         assert_eq!((r.link.as_deref(), r.tag.as_str()), (Some("/devices/aa"), "restart:aa"));
-        let u = from_event("ap_upgraded", Some("aa"), &json!({ "to": "8.8.12" }), &name).unwrap();
+        let u = from_event(EventKind::ApUpgraded, Some("aa"), &json!({ "to": "8.8.12" }), &name).unwrap();
         assert_eq!((u.link.as_deref(), u.tag.as_str(), u.severity), (Some("/config?tab=firmware"), "upgrade:aa", Severity::Info));
-        assert!(from_event("client_connected", Some("aa"), &json!({}), &name).is_none());
-        // Every kind the engine passes on can make an alert.
-        for kind in EVENT_KINDS {
-            assert!(from_event(kind, Some("aa"), &json!({ "severity": "high" }), &name).is_some(), "{kind}");
+        assert!(from_event(EventKind::ClientConnected, Some("aa"), &json!({}), &name).is_none());
+        // Exactly the kinds the engine passes on can make an alert.
+        for &kind in EventKind::ALL {
+            assert_eq!(from_event(kind, Some("aa"), &json!({ "severity": "high" }), &name).is_some(), alertable(kind), "{kind}");
         }
     }
 
@@ -787,14 +787,14 @@ mod tests {
         let (sink, mut events) = channel();
         let ev = |kind| Event { ts: 0, kind, device_mac: "02:00:00:00:00:01".parse().ok(), client_mac: None, data: json!({ "uptime": 60 }) };
         // Only what may make an alert is passed on.
-        sink.offer(&ev("client_connected"));
-        sink.offer(&ev("ap_restarted"));
+        sink.offer(&ev(EventKind::ClientConnected));
+        sink.offer(&ev(EventKind::ApRestarted));
         let e = events.recv().await.unwrap();
-        assert_eq!(e.kind, "ap_restarted");
+        assert_eq!(e.kind, EventKind::ApRestarted);
         assert!(events.try_recv().is_err());
         // A full queue drops and counts.
         for _ in 0..QUEUE + 3 {
-            sink.offer(&ev("ap_restarted"));
+            sink.offer(&ev(EventKind::ApRestarted));
         }
         assert_eq!(sink.dropped.load(Ordering::Relaxed), 3);
         let (mut w, mut rx) = watcher();

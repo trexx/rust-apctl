@@ -26,7 +26,7 @@ use serde_json::{Value, json};
 use wire::keys::KeyStore;
 
 use crate::api::{ApiError, AppState};
-use crate::engine::{Event, Input, Live};
+use crate::engine::{Event, EventKind, Input, Live};
 use crate::model::Ts;
 use crate::settings::random_hex;
 use crate::store;
@@ -325,7 +325,7 @@ pub async fn adopt(State(s): State<AppState>, headers: HeaderMap, Path(mac): Pat
         live.adoption.adopting.insert(mac, store::now_ts());
         live.adoption.pending.remove(&mac);
     }
-    let _ = s.engine.send(Input::Note(Event::device(store::now_ts(), "ap_adopting", mac, json!({ "model": payload["model"], "ip": payload["ip"] })))).await;
+    let _ = s.engine.send(Input::Note(Event::device(store::now_ts(), EventKind::ApAdopting, mac, json!({ "model": payload["model"], "ip": payload["ip"] })))).await;
     Ok(Json(json!({ "adopting": true })))
 }
 
@@ -358,7 +358,7 @@ pub async fn finish_forget(engine: &tokio::sync::mpsc::Sender<Input>, mac: Mac, 
     let _ = engine.send(Input::EditState { ts: store::now_ts(), edit, done: tx }).await;
     let _ = rx.await;
     let _ = engine.send(Input::Forget { ts: store::now_ts(), mac }).await;
-    let _ = engine.send(Input::Note(Event::device(store::now_ts(), "ap_forgotten", mac, json!({ "reset": reset })))).await;
+    let _ = engine.send(Input::Note(Event::device(store::now_ts(), EventKind::ApForgotten, mac, json!({ "reset": reset })))).await;
 }
 
 #[cfg(test)]

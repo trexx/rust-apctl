@@ -19,7 +19,7 @@ use std::collections::HashMap;
 use inform::Mac;
 use serde_json::{Value, json};
 
-use crate::engine::LogLine;
+use crate::engine::{EventKind, LogLine};
 use crate::model::Ts;
 
 /// Noise floor that `stamgr`'s relative RSSI is measured against.
@@ -34,7 +34,7 @@ const MAX_TARGETS: usize = 16;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Found {
-    pub kind: &'static str,
+    pub kind: EventKind,
     pub device: Option<Mac>,
     pub client: Option<Mac>,
     pub data: Value,
@@ -71,7 +71,7 @@ pub struct LogEvents {
     steering_by_device: HashMap<Source, Mac>,
     /// Last report per kind, client and detail (e.g. a steering answer's
     /// status), to avoid repeating one line's event.
-    recent: HashMap<(&'static str, Mac, i64), Ts>,
+    recent: HashMap<(EventKind, Mac, i64), Ts>,
     /// Current experience problems per client, and when they were reported.
     anomalies: HashMap<Mac, (String, Ts)>,
     /// Crash captures in progress, by sender.
@@ -118,7 +118,7 @@ impl LogEvents {
     /// Reports at most once per `secs` for the same kind, client and detail.
     /// Past [`MAX_TRACKED`] new subjects are not reported (a flood of made-up
     /// clients must not become a flood of events).
-    fn fresh(&mut self, kind: &'static str, client: Mac, detail: i64, ts: Ts, secs: Ts) -> bool {
+    fn fresh(&mut self, kind: EventKind, client: Mac, detail: i64, ts: Ts, secs: Ts) -> bool {
         match self.recent.get_mut(&(kind, client, detail)) {
             Some(t) if ts - *t < secs => false,
             Some(t) => {
@@ -184,9 +184,9 @@ impl LogEvents {
             let reason = rest.split("reason:").nth(1).map(|r| r.split(" rssi:").next().unwrap_or(r).trim_end_matches(')').trim().to_string());
             let signal = field(rest, "rssi:").and_then(|v| v.parse::<i64>().ok()).map(|r| r + NOISE_FLOOR);
             if let Some(c) = client
-                && self.fresh("client_kicked", c, 0, line.ts, 60)
+                && self.fresh(EventKind::ClientKicked, c, 0, line.ts, 60)
             {
-                out.push(Found { kind: "client_kicked", device: line.device_mac, client: Some(c), data: json!({ "reason": reason, "signal": signal, "vap": vap }) });
+                out.push(Found { kind: EventKind::ClientKicked, device: line.device_mac, client: Some(c), data: json!({ "reason": reason, "signal": signal, "vap": vap }) });
             }
             return out;
         }
@@ -222,9 +222,9 @@ impl LogEvents {
                 if let (Some(c), Some(st)) = (client, status) {
                     let req = self.steering.remove(&c).filter(|s| line.ts - s.ts <= 30).unwrap_or_default();
                     let to = field(msg, "bssid ").filter(|b| *b != "n/a").map(str::to_string);
-                    if self.fresh("client_steered", c, st, line.ts, 600) {
+                    if self.fresh(EventKind::ClientSteered, c, st, line.ts, 600) {
                         out.push(Found {
-                            kind: "client_steered",
+                            kind: EventKind::ClientSteered,
                             device: line.device_mac,
                             client: Some(c),
                             data: json!({
@@ -243,8 +243,8 @@ impl LogEvents {
             && let Some(c) = rest.split_whitespace().next().and_then(mac)
         {
             let vap = msg.split(':').next().filter(|v| v.starts_with("wifi")).map(str::to_string);
-            if self.fresh("client_wrong_password", c, 0, line.ts, 600) {
-                out.push(Found { kind: "client_wrong_password", device: line.device_mac, client: Some(c), data: json!({ "vap": vap }) });
+            if self.fresh(EventKind::ClientWrongPassword, c, 0, line.ts, 600) {
+                out.push(Found { kind: EventKind::ClientWrongPassword, device: line.device_mac, client: Some(c), data: json!({ "vap": vap }) });
             }
             return out;
         }
@@ -259,7 +259,7 @@ impl LogEvents {
                 let changed = self.anomalies.get(&c).is_none_or(|(r, t)| *r != reasons || line.ts - t >= 1800);
                 if changed && bounded(&mut self.anomalies, c, (reasons.clone(), line.ts)) {
                     out.push(Found {
-                        kind: "client_experience",
+                        kind: EventKind::ClientExperience,
                         device: line.device_mac,
                         client: Some(c),
                         data: json!({
@@ -276,7 +276,7 @@ impl LogEvents {
 
     fn flush(&mut self, key: &Source) -> Option<Found> {
         let (device, c) = self.crashes.remove(key)?;
-        Some(Found { kind: "ap_crash", device, client: None, data: json!({ "kind": c.kind, "process": c.process, "source": "syslog", "lines": c.lines }) })
+        Some(Found { kind: EventKind::ApCrash, device, client: None, data: json!({ "kind": c.kind, "process": c.process, "source": "syslog", "lines": c.lines }) })
     }
 
     /// Reports crash captures that have collected long enough.
@@ -289,7 +289,7 @@ impl LogEvents {
         let steering = &self.steering;
         self.steering_by_device.retain(|_, c| steering.contains_key(c));
         self.anomalies.retain(|_, (_, t)| now - *t < 3 * 3600);
-        out.sort_by_key(|f| f.kind);
+        out.sort_by_key(|f| f.kind.as_str());
         out
     }
 }
@@ -309,7 +309,7 @@ mod tests {
         let mut l = LogEvents::default();
         let f = l.feed(&line(100, "stamgr", "kick-sta-on 6c:ac:c2:00:00:01 wifi1ap1 (reason:Low RSSI rssi:19)"));
         assert_eq!(f.len(), 1);
-        assert_eq!(f[0].kind, "client_kicked");
+        assert_eq!(f[0].kind, EventKind::ClientKicked);
         assert_eq!(f[0].client, "6c:ac:c2:00:00:01".parse().ok());
         assert_eq!(f[0].data["reason"], "Low RSSI");
         assert_eq!(f[0].data["signal"], -76);
@@ -327,7 +327,7 @@ mod tests {
         let f = l.feed(&line(11, "kernel", &format!("{p}BTM: Received response from [6c:ac:c2:00:00:01](len = 5): dialog_token 1, status 7, delay 0, bssid n/a, cancel 0")));
         assert_eq!(f.len(), 1);
         let d = &f[0].data;
-        assert_eq!((f[0].kind, d["status"].as_i64(), d["accepted"].as_bool()), ("client_steered", Some(7), Some(false)));
+        assert_eq!((f[0].kind, d["status"].as_i64(), d["accepted"].as_bool()), (EventKind::ClientSteered, Some(7), Some(false)));
         assert_eq!(d["result"], "rejected: no suitable AP to move to");
         assert_eq!(d["signal"], -77);
         assert_eq!(d["candidates"][0]["bssid"], "78:45:58:3c:51:ae");
@@ -356,14 +356,14 @@ mod tests {
         assert!(l.tick(60).is_empty(), "still collecting");
         let f = l.tick(200);
         assert_eq!(f.len(), 1);
-        assert_eq!((f[0].kind, f[0].data["process"].as_str()), ("ap_crash", Some("mcad")));
+        assert_eq!((f[0].kind, f[0].data["process"].as_str()), (EventKind::ApCrash, Some("mcad")));
         assert_eq!(f[0].data["lines"].as_array().map(Vec::len), Some(2));
         // A kernel panic is reported at once.
         let f = l.feed(&line(300, "kernel", "Kernel panic - not syncing: Fatal exception"));
         assert_eq!(f[0].data["kind"], "kernel panic");
         // A wrong password, once per 10 minutes per client.
         let f = l.feed(&line(500, "hostapd", "wifi1ap0: AP-STA-POSSIBLE-PSK-MISMATCH 0e:00:00:00:00:02"));
-        assert_eq!((f[0].kind, f[0].data["vap"].as_str()), ("client_wrong_password", Some("wifi1ap0")));
+        assert_eq!((f[0].kind, f[0].data["vap"].as_str()), (EventKind::ClientWrongPassword, Some("wifi1ap0")));
         assert!(l.feed(&line(510, "hostapd", "wifi1ap0: AP-STA-POSSIBLE-PSK-MISMATCH 0e:00:00:00:00:02")).is_empty());
         // Normal handshake lines are not mistaken for it.
         assert!(l.feed(&line(520, "hostapd", "wifi1ap0: STA 0e:00:00:00:00:02 WPA: pairwise key handshake completed (RSN)")).is_empty());

@@ -23,7 +23,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::api::{ApiError, AppState};
-use crate::engine::{Event, Input, Live};
+use crate::engine::{Event, EventKind, Input, Live};
 use crate::store;
 
 /// Commands waiting for an AP's next inform.
@@ -130,7 +130,7 @@ fn known_ap(s: &AppState, mac: &Mac) -> Result<(), ApiError> {
     }
 }
 
-async fn note(s: &AppState, kind: &'static str, mac: Mac, data: Value) {
+async fn note(s: &AppState, kind: EventKind, mac: Mac, data: Value) {
     let _ = s.engine.send(Input::Note(Event::device(store::now_ts(), kind, mac, data))).await;
 }
 
@@ -141,7 +141,7 @@ pub async fn restart(State(s): State<AppState>, headers: HeaderMap, Path(mac): P
     let mac = crate::api::parse_mac(&mac)?;
     known_ap(&s, &mac)?;
     queue(&mut s.live.write().unwrap(), mac, json!({ "_type": "reboot", "reboot_type": "soft" }));
-    note(&s, "ap_restart_requested", mac, json!({})).await;
+    note(&s, EventKind::ApRestartRequested, mac, json!({})).await;
     Ok(Json(json!({ "queued": true })))
 }
 
@@ -173,7 +173,7 @@ pub async fn provision(State(s): State<AppState>, headers: HeaderMap, Path(mac):
     let mac = crate::api::parse_mac(&mac)?;
     known_ap(&s, &mac)?;
     s.live.write().unwrap().reprovision.insert(mac);
-    note(&s, "ap_provision_requested", mac, json!({})).await;
+    note(&s, EventKind::ApProvisionRequested, mac, json!({})).await;
     Ok(Json(json!({ "queued": true })))
 }
 
@@ -193,7 +193,7 @@ pub async fn kick(State(s): State<AppState>, headers: HeaderMap, Path(mac): Path
         queue(&mut live, ap, json!({ "_type": "cmd", "cmd": "kick-sta", "mac": client.to_string() }));
         ap
     };
-    let _ = s.engine.send(Input::Note(Event::client(store::now_ts(), "client_reconnect_requested", client, json!({ "ap": ap })))).await;
+    let _ = s.engine.send(Input::Note(Event::client(store::now_ts(), EventKind::ClientReconnectRequested, client, json!({ "ap": ap })))).await;
     Ok(Json(json!({ "queued": true, "ap": ap })))
 }
 
@@ -222,7 +222,7 @@ pub async fn block(State(s): State<AppState>, headers: HeaderMap, Path(mac): Pat
             queue(&mut live, ap, json!({ "_type": "cmd", "cmd": if blocked { "block-sta" } else { "unblock-sta" }, "mac": client.to_string() }));
         }
     }
-    let kind = if blocked { "client_blocked" } else { "client_unblocked" };
+    let kind = if blocked { EventKind::ClientBlocked } else { EventKind::ClientUnblocked };
     let _ = s.engine.send(Input::Note(Event::client(store::now_ts(), kind, client, json!({})))).await;
     Ok(Json(json!({ "blocked": blocked })))
 }
