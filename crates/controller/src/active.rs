@@ -363,6 +363,11 @@ fn status(code: StatusCode) -> Response {
     code.into_response()
 }
 
+/// A managed AP that informed with its own key less than this long ago is not
+/// taken for reset when a factory-key inform comes under its MAC (the official
+/// controller has no such wait).
+const RESET_QUIET_SECS: Ts = 600;
+
 /// POST /inform
 pub async fn inform(
     State(active): State<Arc<Active>>,
@@ -413,6 +418,12 @@ pub async fn inform(
         // under its MAC): that is kept until it is adopted again.
         if !known {
             active.devices.lock().unwrap().remove(&mac);
+        } else if active.live.read().unwrap().devices.get(&mac).is_some_and(|d| ts - d.last_seen < RESET_QUIET_SECS) {
+            // It informed with its own key moments ago: a reset AP is silent
+            // while it reboots, so this is most likely someone else. Listing
+            // it would let an Adopt hand them the AP's key.
+            tracing::warn!("{mac}: factory-key inform from {} while the AP still informs with its own key: ignored", peer.ip());
+            return status(StatusCode::NOT_FOUND);
         }
         let inform = crate::adopt::pending_inform(&payload);
         let new = crate::adopt::note_pending(&mut active.live.write().unwrap(), inform, known, ts);
@@ -916,6 +927,29 @@ mod tests {
         let (status, _) = inform_as_ap(&rig, &ap_payload("1"), DEFAULT_KEY, GCM_ZLIB).await;
         assert_eq!(status, StatusCode::NOT_FOUND);
         assert!(rig.live.read().unwrap().adoption.pending.get(&AP.parse().unwrap()).is_some_and(|p| p.known));
+    }
+
+    #[tokio::test]
+    async fn a_factory_key_inform_is_ignored_while_the_ap_informs_with_its_own() {
+        let Some(_) = fixtures() else { return };
+        let rig = rig(true, None);
+        let mac: Mac = AP.parse().unwrap();
+        let seen = |last_seen: Ts| {
+            let snapshot = crate::model::parse(last_seen, &ap_payload("1")).unwrap();
+            let d = crate::engine::DeviceView {
+                snapshot, online: true, first_seen: 0, last_seen, peer: "x".into(), interval: 10, reconfiguring: false, reconfiguring_since: None,
+                last_full_inform: last_seen, last_config_push: None,
+            };
+            rig.live.write().unwrap().devices.insert(mac, d);
+        };
+        seen(store::now_ts());
+        let (status, _) = inform_as_ap(&rig, &ap_payload("1"), DEFAULT_KEY, GCM_ZLIB).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert!(!rig.live.read().unwrap().adoption.pending.contains_key(&mac), "not offered for adoption");
+        // Quiet for long enough: it was reset.
+        seen(store::now_ts() - RESET_QUIET_SECS - 1);
+        inform_as_ap(&rig, &ap_payload("1"), DEFAULT_KEY, GCM_ZLIB).await;
+        assert!(rig.live.read().unwrap().adoption.pending.get(&mac).is_some_and(|p| p.known));
     }
 
     #[tokio::test]
