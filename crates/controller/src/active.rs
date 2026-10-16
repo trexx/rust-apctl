@@ -56,6 +56,8 @@ pub struct Active {
     /// The last push stored for each AP (secrets masked), for adopting the
     /// running config after a restart, when no unmasked push is in memory.
     stored_pushes: HashMap<Mac, (String, String, Option<String>)>,
+    /// Reverse proxies whose X-Forwarded-For is believed for the AP's address.
+    proxies: Arc<crate::auth::Proxies>,
 }
 
 const PLACEHOLDER: &str = "0000000000000000";
@@ -78,6 +80,7 @@ impl Active {
         keys: Arc<KeyStore>,
         engine: mpsc::Sender<Input>,
         controller: apcfg::Controller,
+        proxies: Arc<crate::auth::Proxies>,
     ) -> anyhow::Result<Active> {
         let rows = store.read(Db::Config, |c| {
             let mut stmt = c.prepare("SELECT mac, cfgversion, content, gcm FROM managed_devices")?;
@@ -105,7 +108,7 @@ impl Active {
             Ok(rows)
         })?;
         let stored_pushes = pushes.into_iter().filter_map(|(m, p)| m.parse().ok().map(|m| (m, p))).collect();
-        Ok(Active { live, keys, engine, writer, controller, devices: Mutex::new(devices), stored_pushes })
+        Ok(Active { live, keys, engine, writer, controller, devices: Mutex::new(devices), stored_pushes, proxies })
     }
 
     fn persist(&self, mac: Mac, d: &Managed) {
@@ -327,6 +330,11 @@ pub async fn inform(
     let Ok(pkt) = Packet::parse(&body) else { return status(StatusCode::BAD_REQUEST) };
     let mac = pkt.header.mac;
     let gcm = pkt.header.flags.has(Flags::GCM);
+    // An unencrypted packet "opens" with any key: it proves nothing.
+    if !pkt.header.flags.has(Flags::ENCRYPTED) {
+        tracing::warn!("{mac}: refusing an unencrypted inform from {}", peer.ip());
+        return status(StatusCode::BAD_REQUEST);
+    }
 
     // Which keys may this AP use? Its own if apctl manages it; the factory key always.
     let state = active.live.read().unwrap().state.clone();
@@ -405,13 +413,8 @@ pub async fn inform(
         }
     }
 
-    let peer_ip = headers
-        .get("x-forwarded-for")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.split(',').next())
-        .map(|s| s.trim().to_string())
-        .unwrap_or_else(|| peer.ip().to_string());
     let reply = active.reply(ts, mac, &payload);
+    let peer_ip = active.proxies.client_ip(&headers, peer.ip()).to_string();
     let decoded = Decoded { header: pkt.header.clone(), key: used, payload };
     if active.engine.send(Input::Inform { ts, peer: peer_ip, decoded }).await.is_err() {
         return status(StatusCode::SERVICE_UNAVAILABLE);
@@ -482,7 +485,7 @@ mod tests {
             version: "10.6.106".into(),
             reporter_uuid: "00000000-0000-4000-8000-000000000004".into(),
         };
-        let active = Arc::new(Active::new(&store, writer, live.clone(), Arc::new(keys), tx, controller).unwrap());
+        let active = Arc::new(Active::new(&store, writer, live.clone(), Arc::new(keys), tx, controller, Default::default()).unwrap());
         let app = axum::Router::new().route("/inform", axum::routing::post(inform)).with_state(active.clone());
         Rig { app, live, _rx: rx, active }
     }
@@ -660,6 +663,18 @@ mod tests {
         let rig = rig_with_stored(true, None, Some((out.rendered.mgmt_cfg, out.rendered.system_cfg, "abcdefabcdefabcd".into())));
         let (_, reply) = inform_as_ap(&rig, &payload, KEY, GCM_ZLIB).await;
         assert_eq!(reply.unwrap().1["_type"], "noop");
+    }
+
+    #[tokio::test]
+    async fn refuses_unencrypted_informs() {
+        let Some(_) = fixtures() else { return };
+        let rig = rig(true, None);
+        // Plain JSON under an adopted AP's MAC "opens" with its key: it must not count.
+        for flags in [0, Flags::ZLIB, Flags::GCM, Flags::GCM | Flags::ZLIB] {
+            let (status, _) = inform_as_ap(&rig, &ap_payload("1"), KEY, flags).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "flags {flags:#x}");
+        }
+        assert!(rig.active.devices.lock().unwrap().is_empty(), "nothing recorded");
     }
 
     #[tokio::test]

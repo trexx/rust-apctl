@@ -134,6 +134,12 @@ struct ServeArgs {
     /// SealedSecret). Without it backups are written unencrypted.
     #[arg(long, env = "APCTL_BACKUP_KEY")]
     pub backup_key: Option<PathBuf>,
+    /// Reverse proxies in front of apctl, as comma-separated addresses or CIDR
+    /// ranges (e.g. 10.42.0.0/16). X-Forwarded-For is only believed on
+    /// connections from these, for the login throttle and AP addresses; by
+    /// default it is ignored.
+    #[arg(long, env = "APCTL_TRUSTED_PROXIES", value_delimiter = ',')]
+    pub trusted_proxies: Vec<String>,
 }
 
 #[tokio::main]
@@ -167,8 +173,9 @@ async fn main() -> Result<()> {
 async fn serve(args: ServeArgs) -> Result<()> {
     let ServeArgs {
         data_dir, keys, shadow, shadow_cmd, inform_ports, listen, syslog_listen, users_file, emulate_version, active, inform_listen,
-        oui_file, backup_key, inform_url, stun_listen,
+        oui_file, backup_key, inform_url, stun_listen, trusted_proxies,
     } = args;
+    let proxies = Arc::new(auth::Proxies::parse(&trusted_proxies)?);
     let vendors = match vendor::Vendors::load(&oui_file) {
         Ok(v) => {
             tracing::info!("loaded {} manufacturer prefixes from {}", v.len(), oui_file.display());
@@ -290,7 +297,7 @@ async fn serve(args: ServeArgs) -> Result<()> {
                 format!("{}-{}-4{}-a{}-{}", &h[0..8], &h[8..12], &h[13..16], &h[17..20], &h[20..32])
             }),
         };
-        let active_state = Arc::new(active::Active::new(&store, writer.clone(), live.clone(), keys.clone(), in_tx.clone(), controller)?);
+        let active_state = Arc::new(active::Active::new(&store, writer.clone(), live.clone(), keys.clone(), in_tx.clone(), controller, proxies.clone())?);
         let inform_app = axum::Router::new().route("/inform", axum::routing::post(active::inform)).with_state(active_state);
         let inform_socket = tokio::net::TcpListener::bind(inform_listen).await.with_context(|| format!("binding {inform_listen}"))?;
         tracing::warn!("ACTIVE MODE: answering AP informs on http://{inform_listen}/inform and pushing config");
@@ -310,7 +317,7 @@ async fn serve(args: ServeArgs) -> Result<()> {
     } else {
         tracing::info!("login enabled for {} user(s)", users.len());
     }
-    let auth = Arc::new(auth::Auth::new(users, &store, writer.clone())?);
+    let auth = Arc::new(auth::Auth::new(users, &store, writer.clone(), proxies)?);
     threats::watch(store.clone(), live.clone(), in_tx.clone());
     alerts::spawn(store.clone(), writer.clone(), live.clone(), live_tx.clone());
     backup::schedule(backups.clone(), store.clone());
