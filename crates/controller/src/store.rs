@@ -78,12 +78,10 @@ impl Table {
     }
 
     /// The insert statement, built once per table (the writer runs it for every metric row).
-    fn insert(&'static self) -> std::borrow::Cow<'static, str> {
+    fn insert(&'static self) -> &'static str {
+        // Every table is in TABLES.
         static INSERTS: LazyLock<HashMap<&'static str, String>> = LazyLock::new(|| TABLES.iter().map(|t| (t.name, t.insert_sql())).collect());
-        match INSERTS.get(self.name) {
-            Some(sql) => sql.as_str().into(),
-            None => self.insert_sql().into(),
-        }
+        &INSERTS[self.name]
     }
 
     /// Aggregates `from` rows into `step`-second buckets of `to`. Gauges are
@@ -96,11 +94,10 @@ impl Table {
         select.extend(self.texts.iter().map(|c| c.to_string()));
         select.extend(self.gauges.iter().map(|g| format!("AVG({g})")));
         select.extend(self.counters.iter().map(|c| c.to_string()));
-        select.push("MAX(ts)".into());
         let cols: Vec<&str> = self.keys.iter().copied().chain(["ts"]).chain(self.texts.iter().chain(self.gauges).chain(self.counters).copied()).collect();
         // Wrap so the trailing MAX(ts) helper column is dropped.
         let inner_cols: Vec<String> = cols.iter().enumerate().map(|(i, _)| format!("c{i}")).collect();
-        let aliased: Vec<String> = select.iter().take(cols.len()).enumerate().map(|(i, s)| format!("{s} AS c{i}")).collect();
+        let aliased: Vec<String> = select.iter().enumerate().map(|(i, s)| format!("{s} AS c{i}")).collect();
         format!(
             "INSERT OR REPLACE INTO {to} ({}) SELECT {} FROM (SELECT {}, MAX(ts) FROM {from} \
              WHERE ts >= ?1 AND ts < ?2 GROUP BY {keys}, (ts / {step}))",
@@ -473,7 +470,7 @@ fn apply(conn: &mut Connection, writes: Vec<Write>) -> Result<()> {
                 let n_keys = table.keys.len();
                 let ts = Value::Integer(*ts);
                 let params = values[..n_keys].iter().chain([&ts]).chain(&values[n_keys..]);
-                tx.prepare_cached(&table.insert()).and_then(|mut s| s.execute(params_from_iter(params)))
+                tx.prepare_cached(table.insert()).and_then(|mut s| s.execute(params_from_iter(params)))
             }
             Write::Exec { sql, params, .. } => tx.prepare_cached(sql).and_then(|mut s| s.execute(params_from_iter(params))),
             Write::Flush(_) => continue,
