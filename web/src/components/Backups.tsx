@@ -307,6 +307,12 @@ export function BackupSection() {
           A restore is waiting to be applied at the next start.
         </div>
       )}
+      {d.restore_failed && (
+        <div className="banner banner-high">
+          The last restore could not be applied, so apctl started with its
+          current data: {d.restore_failed}
+        </div>
+      )}
 
       <Schedule
         key={JSON.stringify(d.settings)}

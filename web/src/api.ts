@@ -867,7 +867,7 @@ export const useBackups = () =>
   useQuery({
     queryKey: keys.backups(),
     queryFn: ({ signal }) =>
-      get<{ encrypted: boolean; version: string; settings: BackupSettings; next_run: number | null; backups: BackupMeta[]; restore_pending: boolean }>("/api/backups", signal),
+      get<{ encrypted: boolean; version: string; settings: BackupSettings; next_run: number | null; backups: BackupMeta[]; restore_pending: boolean; restore_failed: string | null }>("/api/backups", signal),
   });
 
 export const saveBackupSettings = (s: BackupSettings) => send("PUT", "/api/backups/settings", s);
