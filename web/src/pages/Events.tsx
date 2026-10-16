@@ -47,7 +47,7 @@ export function Events() {
           onChange={(k) => set("kind", k)}
         />
       </div>
-      <div className="panel">
+      <div className={events.isPlaceholderData ? "panel dim" : "panel"}>
         <QueryState q={events}>
           {(data) => (
             <EventList events={data} names={names} clientNames={cnames} />

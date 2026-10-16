@@ -495,6 +495,12 @@ input.search {
 .event:last-child {
   border-bottom: none;
 }
+/* Long lists: rows off screen are not laid out or painted. */
+.event,
+.log-line {
+  content-visibility: auto;
+  contain-intrinsic-size: auto 30px;
+}
 .event-time {
   color: var(--text-muted);
   white-space: nowrap;

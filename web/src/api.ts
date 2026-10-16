@@ -1041,11 +1041,12 @@ export function useSeries(table: string, key: string, span: TimeSpan) {
 export type EventFilter = { device?: Mac; client?: Mac; kind?: string; limit?: number };
 export type LogFilter = { device?: Mac; q?: string; limit?: number };
 
+// The previous list stays up (`isPlaceholderData`) while another filter's loads.
 export const useEvents = (filter: EventFilter) =>
-  useQuery({ queryKey: keys.events(filter), queryFn: ({ signal }) => get<AppEvent[]>(`/api/events${qs(filter)}`, signal) });
+  useQuery({ queryKey: keys.events(filter), queryFn: ({ signal }) => get<AppEvent[]>(`/api/events${qs(filter)}`, signal), placeholderData: keepPreviousData });
 
 export const useLogs = (filter: LogFilter) =>
-  useQuery({ queryKey: keys.logs(filter), queryFn: ({ signal }) => get<LogLine[]>(`/api/logs${qs(filter)}`, signal) });
+  useQuery({ queryKey: keys.logs(filter), queryFn: ({ signal }) => get<LogLine[]>(`/api/logs${qs(filter)}`, signal), placeholderData: keepPreviousData });
 
 /** A filter's MAC against a message's, as the server compares them (it normalises the filter). */
 const sameMac = (filter: Mac | undefined, mac: Mac | null) => !filter || filter.toLowerCase() === mac?.toLowerCase();

@@ -44,7 +44,9 @@ export function Logs() {
       <div className="page-head">
         <h1>Logs</h1>
         <span className="muted">
-          {logs.data ? `${logs.data.length} lines` : ""}
+          {logs.data && !logs.isPlaceholderData
+            ? `${logs.data.length} lines`
+            : ""}
         </span>
         <span className="spacer" />
         <ApSelect value={device} onChange={setDevice} />
@@ -55,7 +57,7 @@ export function Logs() {
           onChange={(e) => setText(e.target.value)}
         />
       </div>
-      <div className="panel">
+      <div className={logs.isPlaceholderData ? "panel dim" : "panel"}>
         <QueryState q={logs}>
           {(data) => <LogList logs={data} names={names} />}
         </QueryState>
