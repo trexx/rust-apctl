@@ -81,17 +81,64 @@ impl Delta<'_> {
 
 /// The intervals between consecutive samples that end in the window (at or
 /// after `from`); none across a gap of over two hours.
-pub(crate) fn deltas(samples: &[(Ts, Vec<Option<f64>>)], from: Ts) -> impl Iterator<Item = Delta<'_>> {
-    samples.windows(2).filter_map(move |w| {
-        let ((pt, pv), (t, v)) = (&w[0], &w[1]);
-        (*t >= from && *t > *pt && t - pt <= 2 * 3600).then(|| Delta { ts: *t, dt: (t - pt) as f64, prev: pv, cur: v })
+pub(crate) fn deltas(samples: &Samples, from: Ts) -> impl Iterator<Item = Delta<'_>> {
+    samples.ts.windows(2).enumerate().filter_map(move |(i, w)| {
+        let (pt, t) = (w[0], w[1]);
+        (t >= from && t > pt && t - pt <= 2 * 3600).then(|| Delta { ts: t, dt: (t - pt) as f64, prev: samples.row(i), cur: samples.row(i + 1) })
     })
 }
 
-/// Samples of one series: (ts, values in the requested column order).
-pub(crate) type Samples = Vec<(Ts, Vec<Option<f64>>)>;
+/// Samples of one series: their times, and for each the values of the
+/// requested columns (in their order), all in one list.
+#[derive(Debug, Default)]
+pub(crate) struct Samples {
+    width: usize,
+    ts: Vec<Ts>,
+    vals: Vec<Option<f64>>,
+}
+
+impl Samples {
+    fn new(width: usize) -> Samples {
+        Samples { width, ..Default::default() }
+    }
+
+    fn row(&self, i: usize) -> &[Option<f64>] {
+        &self.vals[i * self.width..(i + 1) * self.width]
+    }
+
+    /// (time, values) of each sample, oldest first.
+    pub fn iter(&self) -> impl Iterator<Item = (Ts, &[Option<f64>])> {
+        (0..self.ts.len()).map(|i| (self.ts[i], self.row(i)))
+    }
+
+    /// The samples at or after `from`.
+    pub fn since(&self, from: Ts) -> impl Iterator<Item = (Ts, &[Option<f64>])> {
+        self.iter().filter(move |(t, _)| *t >= from)
+    }
+
+    #[cfg(test)]
+    fn from_rows(rows: Vec<(Ts, Vec<Option<f64>>)>) -> Samples {
+        let mut s = Samples::new(rows.first().map_or(0, |r| r.1.len()));
+        for (t, v) in rows {
+            s.ts.push(t);
+            s.vals.extend(v);
+        }
+        s
+    }
+}
+
 /// Per key: its text columns and its samples.
 pub(crate) type Loaded = BTreeMap<String, (Vec<String>, Samples)>;
+
+/// Which rows of a metrics table to load.
+#[derive(Clone, Copy)]
+pub(crate) enum Only<'a> {
+    /// The rows with this value in this column.
+    Is(&'a str, &'a str),
+    /// The rows with one of these values in this column (one AP's SSIDs, by
+    /// BSSID: the table's key, so its own index is used).
+    In(&'a str, &'a [String]),
+}
 
 /// What to load from a metrics table.
 pub(crate) struct Spec<'a> {
@@ -102,8 +149,8 @@ pub(crate) struct Spec<'a> {
     pub extra: &'a [&'a str],
     /// Numeric columns.
     pub cols: &'a [&'a str],
-    /// Only the rows with this value in this column (one AP's).
-    pub only: Option<(&'a str, &'a str)>,
+    /// Only some rows (one AP's); all when `None`.
+    pub only: Option<Only<'a>>,
 }
 
 /// Where a column is in a column list (a list the caller wrote, so a miss is a bug).
@@ -131,28 +178,36 @@ fn client_name(live: &Live, mac: Option<inform::Mac>) -> Option<String> {
 pub(crate) fn load(c: &Connection, spec: Spec, tier: usize, from: Ts, to: Ts) -> anyhow::Result<Loaded> {
     let Spec { table, key, extra, cols, only } = spec;
     let suffix = TIERS[tier].0;
+    let step = TIERS[tier].1.max(30) * 2;
+    let mut params = vec![Sql::Integer(from), Sql::Integer(to), Sql::Integer(step)];
+    let only = match only {
+        None => String::new(),
+        Some(Only::Is(c, v)) => {
+            params.push(Sql::Text(v.into()));
+            format!(" AND {c} = ?4")
+        }
+        Some(Only::In(c, vs)) => {
+            params.extend(vs.iter().map(|v| Sql::Text(v.clone())));
+            format!(" AND {c} IN ({})", (4..4 + vs.len()).map(|i| format!("?{i}")).collect::<Vec<_>>().join(", "))
+        }
+    };
     // One sample before the window so the first rate in range is known.
     let sql = format!(
-        "SELECT {key}, ts, {}{}{} FROM {table}{suffix} WHERE ts >= ?1 - ?3 AND ts <= ?2{} ORDER BY ts",
+        "SELECT {key}, ts, {}{}{} FROM {table}{suffix} WHERE ts >= ?1 - ?3 AND ts <= ?2{only} ORDER BY ts",
         extra.join(", "),
         if extra.is_empty() { "" } else { ", " },
         cols.join(", "),
-        only.map_or(String::new(), |(c, _)| format!(" AND {c} = ?4")),
     );
-    let step = TIERS[tier].1.max(30) * 2;
-    let mut params = vec![Sql::Integer(from), Sql::Integer(to), Sql::Integer(step)];
-    params.extend(only.map(|(_, v)| Sql::Text(v.into())));
-    // In time order (the `ts` index, no sort); the map groups them per key.
-    let mut stmt = c.prepare(&sql)?;
+    // In time order; the map groups them per key. The views run the same few
+    // statements over and over: the read connections keep them prepared.
+    let mut stmt = c.prepare_cached(&sql)?;
     let mut out: Loaded = BTreeMap::new();
     let mut rows = stmt.query(params_from_iter(params))?;
     while let Some(r) = rows.next()? {
         // Strings are made only for a new key, or for text that changed.
         let k = r.get_ref(0)?.as_str()?;
-        let ts: Ts = r.get(1)?;
-        let vals: Vec<Option<f64>> = (0..cols.len()).map(|i| r.get::<_, Option<f64>>(2 + extra.len() + i)).collect::<rusqlite::Result<_>>()?;
         if !out.contains_key(k) {
-            out.insert(k.to_string(), (vec![String::new(); extra.len()], Vec::new()));
+            out.insert(k.to_string(), (vec![String::new(); extra.len()], Samples::new(cols.len())));
         }
         let e = out.get_mut(k).expect("just added");
         // The text columns of the latest sample.
@@ -162,7 +217,26 @@ pub(crate) fn load(c: &Connection, spec: Spec, tier: usize, from: Ts, to: Ts) ->
                 v.clone_into(t);
             }
         }
-        e.1.push((ts, vals));
+        e.1.ts.push(r.get(1)?);
+        for i in 0..cols.len() {
+            e.1.vals.push(r.get(2 + extra.len() + i)?);
+        }
+    }
+    Ok(out)
+}
+
+/// The BSSIDs an AP's SSIDs have had in a tier of `vap_stats` (a BSSID stays
+/// on its AP): one step through the table's own index per BSSID, rather than
+/// a scan of every row for `ap_mac`.
+fn bssids_of(c: &Connection, tier: usize, ap: &str) -> rusqlite::Result<Vec<String>> {
+    use rusqlite::OptionalExtension;
+    let mut stmt = c.prepare_cached(&format!("SELECT bssid, ap_mac FROM vap_stats{} WHERE bssid > ?1 ORDER BY bssid LIMIT 1", TIERS[tier].0))?;
+    let (mut out, mut after) = (Vec::new(), String::new());
+    while let Some((bssid, on)) = stmt.query_row([&after], |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?))).optional()? {
+        if on.as_deref() == Some(ap) {
+            out.push(bssid.clone());
+        }
+        after = bssid;
     }
     Ok(out)
 }
@@ -187,8 +261,10 @@ pub async fn activity(State(s): State<AppState>, Query(q): Query<RangeQuery>) ->
         let [tx_bytes, rx_bytes, tx_packets, rx_packets, tx_mcast, rx_mcast, tx_bcast, rx_bcast, tx_dropped, num_sta] =
             cols_at(COLS, ["tx_bytes", "rx_bytes", "tx_packets", "rx_packets", "tx_mcast", "rx_mcast", "tx_bcast", "rx_bcast", "tx_dropped", "num_sta"]);
         let [retries, attempts, wifi_dropped] = cols_at(COLS, RETRY_COLS);
-        let only = |col| ap.as_deref().map(|a| (col, a));
-        let vaps = load(c, Spec { table: "vap_stats", key: "bssid", extra: &["radio"], cols: COLS, only: only("ap_mac") }, tier, from, to)?;
+        // One AP's SSIDs by their BSSIDs, the table's key (`ap_mac` has no index).
+        let bssids = ap.as_deref().map(|a| bssids_of(c, tier, a)).transpose()?;
+        let only = bssids.as_deref().map(|b| Only::In("bssid", b));
+        let vaps = load(c, Spec { table: "vap_stats", key: "bssid", extra: &["radio"], cols: COLS, only }, tier, from, to)?;
         // bucket -> per-bssid accumulators
         #[derive(Default, Clone)]
         struct Acc {
@@ -251,14 +327,14 @@ pub async fn activity(State(s): State<AppState>, Query(q): Query<RangeQuery>) ->
         }
 
         // Airtime from the radios: averages across radios per bucket.
-        let spec = Spec { table: "radio_stats", key: "mac || '/' || radio", extra: &["radio"], cols: &["cu_total", "cu_interf", "cu_self_rx", "cu_self_tx"], only: only("mac") };
+        let spec = Spec { table: "radio_stats", key: "mac || '/' || radio", extra: &["radio"], cols: &["cu_total", "cu_interf", "cu_self_rx", "cu_self_tx"], only: ap.as_deref().map(|a| Only::Is("mac", a)) };
         let radios = load(c, spec, tier, from, to)?;
         let mut air: BTreeMap<Ts, Vec<[f64; 4]>> = BTreeMap::new();
         for (ex, samples) in radios.values() {
             if !band_ok(&band, &ex[0]) {
                 continue;
             }
-            for (t, v) in samples.iter().filter(|p| p.0 >= from) {
+            for (t, v) in samples.since(from) {
                 let b = t - t % bucket;
                 let g = |i: usize| v[i].unwrap_or(0.0);
                 air.entry(b).or_default().push([g(0), g(1), g(2), g(3)]);
@@ -286,8 +362,8 @@ pub async fn activity(State(s): State<AppState>, Query(q): Query<RangeQuery>) ->
 
 /// Bytes moved per key over the window (sum of counter deltas), from the
 /// `[tx, rx]` columns.
-fn totals(samples: &[(Ts, Vec<Option<f64>>)], [tx, rx]: [usize; 2], from: Ts) -> (f64, f64) {
-    deltas(samples, from).fold((0.0, 0.0), |(d, u), x| (d + x.rate(tx).unwrap_or(0.0) * x.dt, u + x.rate(rx).unwrap_or(0.0) * x.dt))
+fn totals(samples: &Samples, [tx, rx]: [usize; 2], from: Ts) -> (f64, f64) {
+    deltas(samples, from).fold((0.0, 0.0), |(d, u), x| (d + x.inc(tx).unwrap_or(0.0), u + x.inc(rx).unwrap_or(0.0)))
 }
 
 /// GET /api/site/top: APs and clients by traffic over the window.
@@ -304,7 +380,7 @@ pub async fn top(State(s): State<AppState>, Query(q): Query<RangeQuery>) -> Resu
             e.1 += u;
         }
         // Per client and AP, so a client's traffic counts towards the AP it was on.
-        let spec = Spec { table: "client_stats", key: "mac || '/' || coalesce(ap_mac, '')", extra: &[], cols: &BYTE_COLS, only: ap.as_deref().map(|a| ("ap_mac", a)) };
+        let spec = Spec { table: "client_stats", key: "mac || '/' || coalesce(ap_mac, '')", extra: &[], cols: &BYTE_COLS, only: ap.as_deref().map(|a| Only::Is("ap_mac", a)) };
         let cl = load(c, spec, tier, from, to)?;
         let mut per_client: HashMap<String, (f64, f64)> = HashMap::new();
         for (k, (_, s)) in &cl {
@@ -500,12 +576,14 @@ pub async fn multicast(State(s): State<AppState>, Query(q): Query<RangeQuery>) -
     let (from, to, tier) = window(&q);
     let bucket = bucket_for(to - from, tier);
     let ap = q.mac.as_ref().map(|m| m.to_ascii_lowercase());
-    let ap2 = ap.clone();
     let (samples, clients) = read(&s.store, Db::Metrics, move |c| {
         let suffix = TIERS[tier].0;
-        let mut stmt = c.prepare(&format!("SELECT mac, type, ts, tx_pps, rx_pps, tx_bytes_ps, rx_bytes_ps FROM mcast_stats{suffix} WHERE ts >= ?1 AND ts <= ?2"))?;
+        // One AP's by its MAC, the table's key.
+        let (one, mut params) = (if ap.is_some() { " AND mac = ?3" } else { "" }, vec![Sql::Integer(from), Sql::Integer(to)]);
+        params.extend(ap.clone().map(Sql::Text));
+        let mut stmt = c.prepare(&format!("SELECT mac, type, ts, tx_pps, rx_pps, tx_bytes_ps, rx_bytes_ps FROM mcast_stats{suffix} WHERE ts >= ?1 AND ts <= ?2{one}"))?;
         let rows = stmt
-            .query_map([from, to], |r| {
+            .query_map(params_from_iter(params), |r| {
                 Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, Ts>(2)?, [0, 1, 2, 3].map(|i| r.get::<_, Option<f64>>(3 + i).ok().flatten().unwrap_or(0.0))))
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -517,7 +595,7 @@ pub async fn multicast(State(s): State<AppState>, Query(q): Query<RangeQuery>) -
                 key: "mac || '/' || coalesce(ap_mac, '') || '/' || coalesce(bssid, '')",
                 extra: &[],
                 cols: &["mcast_tx_pkts", "mcast_rx_pkts", "mcast_tx_bytes", "mcast_rx_bytes"],
-                only: ap2.as_deref().map(|a| ("ap_mac", a)),
+                only: ap.as_deref().map(|a| Only::Is("ap_mac", a)),
             },
             tier,
             from,
@@ -540,9 +618,6 @@ pub async fn multicast(State(s): State<AppState>, Query(q): Query<RangeQuery>) -
     type PerAp = HashMap<String, ([f64; 4], f64)>;
     let mut acc: BTreeMap<String, BTreeMap<Ts, PerAp>> = BTreeMap::new();
     for (mac, kind, ts, r) in samples {
-        if ap.as_deref().is_some_and(|a| a != mac) || ts < from {
-            continue;
-        }
         let e = acc.entry(kind).or_default().entry(ts - ts % bucket).or_default().entry(mac).or_default();
         for (a, b) in e.0.iter_mut().zip(r) {
             *a += b;
@@ -682,9 +757,10 @@ pub async fn wlans(State(s): State<AppState>, Query(q): Query<RangeQuery>) -> Re
                 let (mut cl, mut dn, mut up) = (vec![], vec![], vec![]);
                 for (t, m) in &a.series {
                     ts.push(*t);
-                    cl.push(m.values().map(|x| x.0 / x.1.max(1.0)).sum::<f64>());
-                    dn.push(m.values().map(|x| x.2 / x.1.max(1.0)).sum::<f64>() * 8.0);
-                    up.push(m.values().map(|x| x.3 / x.1.max(1.0)).sum::<f64>() * 8.0);
+                    let (c, d, u) = m.values().map(Bucket::averages).fold((0.0, 0.0, 0.0), |s, x| (s.0 + x.0, s.1 + x.1, s.2 + x.2));
+                    cl.push(c);
+                    dn.push(d * 8.0);
+                    up.push(u * 8.0);
                 }
                 let peak = cl.iter().copied().fold(0.0, f64::max);
                 (ts, cl, dn, up, peak)
@@ -701,8 +777,8 @@ pub async fn wlans(State(s): State<AppState>, Query(q): Query<RangeQuery>) -> Re
                 "clients": clients,
                 "peak_clients": peak.round().max(clients as f64),
                 "satisfaction": mean(&scores),
-                "satisfaction_avg": agg.and_then(|a| mean(&a.sat)),
-                "signal_avg": agg.and_then(|a| mean(&a.sig)),
+                "satisfaction_avg": agg.and_then(|a| a.sat.get()).map(f64::round),
+                "signal_avg": agg.and_then(|a| a.sig.get()).map(f64::round),
                 "download_bytes": agg.map_or(0.0, |a| a.down), "upload_bytes": agg.map_or(0.0, |a| a.up),
                 "tx_retry_pct": retry,
                 "multicast_pct": agg.filter(|a| a.pkts > 0.0).map(|a| (100.0 * a.mcast / a.pkts).min(100.0)),
@@ -719,8 +795,41 @@ const WLAN_COLS: &[&str] = &[
     "num_sta", "satisfaction", "avg_client_signal",
 ];
 
-/// Per SSID in a bucket of [`WlanAgg::series`].
-type Bucket = (f64, f64, f64, f64);
+/// One SSID in a bucket of [`WlanAgg::series`].
+#[derive(Default, Clone, Copy)]
+struct Bucket {
+    /// Clients, summed over its samples.
+    clients: f64,
+    samples: f64,
+    /// Bytes per second each way, summed over its intervals.
+    down: f64,
+    up: f64,
+    intervals: f64,
+}
+
+impl Bucket {
+    /// Average clients, and bytes per second each way.
+    fn averages(&self) -> (f64, f64, f64) {
+        let i = self.intervals.max(1.0);
+        (self.clients / self.samples.max(1.0), self.down / i, self.up / i)
+    }
+}
+
+/// A running mean: (sum, count).
+#[derive(Default, Clone, Copy)]
+struct Mean(f64, usize);
+
+impl Mean {
+    fn add(&mut self, x: f64) {
+        self.0 += x;
+        self.1 += 1;
+    }
+
+    /// None without values.
+    fn get(self) -> Option<f64> {
+        (self.1 > 0).then(|| self.0 / self.1 as f64)
+    }
+}
 
 /// One network's history in [`wlans`].
 #[derive(Default)]
@@ -729,10 +838,10 @@ struct WlanAgg {
     up: f64,
     pkts: f64,
     mcast: f64,
-    sat: Vec<f64>,
-    sig: Vec<f64>,
-    /// bucket -> bssid -> (clients sum, samples, down bytes/s, up bytes/s)
-    series: BTreeMap<Ts, HashMap<String, Bucket>>,
+    sat: Mean,
+    sig: Mean,
+    /// bucket -> SSID (its place among the VAPs loaded) -> its share
+    series: BTreeMap<Ts, HashMap<usize, Bucket>>,
     /// Retries, attempts and drops over all its SSIDs.
     retry: [f64; 3],
 }
@@ -743,7 +852,7 @@ fn wlan_history(vaps: &Loaded, from: Ts, bucket: Ts) -> BTreeMap<String, WlanAgg
         cols_at(WLAN_COLS, ["tx_bytes", "rx_bytes", "tx_packets", "rx_packets", "tx_mcast", "rx_mcast", "tx_bcast", "rx_bcast", "num_sta", "satisfaction", "avg_client_signal"]);
     let retries = cols_at(WLAN_COLS, RETRY_COLS);
     let mut per: BTreeMap<String, WlanAgg> = BTreeMap::new();
-    for (bssid, (ex, samples)) in vaps {
+    for (vap, (ex, samples)) in vaps.values().enumerate() {
         let essid = &ex[0];
         if essid.is_empty() {
             continue;
@@ -753,25 +862,26 @@ fn wlan_history(vaps: &Loaded, from: Ts, bucket: Ts) -> BTreeMap<String, WlanAgg
         }
         let a = per.get_mut(essid).expect("just added");
         for d in deltas(samples, from) {
-            let g = |i: usize| d.rate(i).unwrap_or(0.0);
-            a.down += g(tx_bytes) * d.dt;
-            a.up += g(rx_bytes) * d.dt;
-            a.pkts += (g(tx_packets) + g(rx_packets)) * d.dt;
-            a.mcast += (g(tx_mcast) + g(rx_mcast) + g(tx_bcast) + g(rx_bcast)) * d.dt;
-            let e = a.series.entry(d.ts - d.ts % bucket).or_default().entry(bssid.clone()).or_default();
-            e.2 += g(tx_bytes);
-            e.3 += g(rx_bytes);
+            let g = |i: usize| d.inc(i).unwrap_or(0.0);
+            a.down += g(tx_bytes);
+            a.up += g(rx_bytes);
+            a.pkts += g(tx_packets) + g(rx_packets);
+            a.mcast += g(tx_mcast) + g(rx_mcast) + g(tx_bcast) + g(rx_bcast);
+            let e = a.series.entry(d.ts - d.ts % bucket).or_default().entry(vap).or_default();
+            e.down += d.rate(tx_bytes).unwrap_or(0.0);
+            e.up += d.rate(rx_bytes).unwrap_or(0.0);
+            e.intervals += 1.0;
             add_retries(&mut a.retry, &d, retries);
         }
-        for (t, v) in samples.iter().filter(|p| p.0 >= from) {
-            let e = a.series.entry(t - t % bucket).or_default().entry(bssid.clone()).or_default();
-            e.0 += v[num_sta].unwrap_or(0.0);
-            e.1 += 1.0;
+        for (t, v) in samples.since(from) {
+            let e = a.series.entry(t - t % bucket).or_default().entry(vap).or_default();
+            e.clients += v[num_sta].unwrap_or(0.0);
+            e.samples += 1.0;
             if let Some(x) = v[satisfaction].filter(|x| *x >= 0.0) {
-                a.sat.push(x);
+                a.sat.add(x);
             }
             if let Some(x) = v[signal].filter(|x| *x < -10.0) {
-                a.sig.push(x);
+                a.sig.add(x);
             }
         }
     }
@@ -808,14 +918,16 @@ pub async fn radios(State(s): State<AppState>, Query(q): Query<RangeQuery>) -> R
     let retry = retry_totals(&vstats, cols_at(RADIO_VAP_COLS, RETRY_COLS), from);
     // Traffic and client signal per (AP, band), and the spectrum rows, grouped once.
     let [tx, rx, signal] = cols_at(RADIO_VAP_COLS, ["tx_bytes", "rx_bytes", "avg_client_signal"]);
-    let mut vap_use: HashMap<(&str, &str), (f64, Vec<f64>)> = HashMap::new();
+    let mut vap_use: HashMap<(&str, &str), (f64, Mean)> = HashMap::new();
     for (ex, samples) in vstats.values() {
         let e = vap_use.entry((ex[0].as_str(), ex[1].as_str())).or_default();
         for d in deltas(samples, from) {
-            e.0 += (d.rate(tx).unwrap_or(0.0) + d.rate(rx).unwrap_or(0.0)) * d.dt;
+            e.0 += d.inc(tx).unwrap_or(0.0) + d.inc(rx).unwrap_or(0.0);
         }
         // The AP reports 0 or -1 when no client is connected.
-        e.1.extend(samples.iter().filter(|p| p.0 >= from).filter_map(|p| p.1[signal]).filter(|v| *v < -10.0));
+        for x in samples.since(from).filter_map(|(_, v)| v[signal]).filter(|v| *v < -10.0) {
+            e.1.add(x);
+        }
     }
     let mut spectrum: HashMap<(&str, &str), Vec<&Value>> = HashMap::new();
     for (m, rd, v) in &spectrum_rows {
@@ -829,16 +941,16 @@ pub async fn radios(State(s): State<AppState>, Query(q): Query<RangeQuery>) -> R
             let key = format!("{mac}/{}", r.radio);
             let (avg_cu, avg_interf) = match rstats.get(&key) {
                 Some((_, samples)) => {
-                    let inr: Vec<&(Ts, Vec<Option<f64>>)> = samples.iter().filter(|p| p.0 >= from).collect();
-                    let avg = |i: usize| {
-                        let v: Vec<f64> = inr.iter().filter_map(|p| p.1[i]).collect();
-                        (!v.is_empty()).then(|| v.iter().sum::<f64>() / v.len() as f64)
-                    };
-                    (avg(0), avg(1))
+                    let (mut cu, mut interf) = (Mean::default(), Mean::default());
+                    for (_, v) in samples.since(from) {
+                        v[0].into_iter().for_each(|x| cu.add(x));
+                        v[1].into_iter().for_each(|x| interf.add(x));
+                    }
+                    (cu.get(), interf.get())
                 }
                 None => (None, None),
             };
-            let (usage, signals) = vap_use.get(&(mac_s.as_str(), r.radio.as_str())).map_or((0.0, &[][..]), |(u, s)| (*u, s.as_slice()));
+            let (usage, signal) = vap_use.get(&(mac_s.as_str(), r.radio.as_str())).copied().unwrap_or_default();
             let retry_pct = retry.get(&(mac_s.clone(), r.radio.clone())).map(|t| retry_pct(*t));
             let spec = spectrum.get(&(mac_s.as_str(), r.radio.as_str())).cloned().unwrap_or_default();
             out.push(json!({
@@ -848,7 +960,7 @@ pub async fn radios(State(s): State<AppState>, Query(q): Query<RangeQuery>) -> R
                 "clients": r.num_sta, "cu_total_now": r.cu_total, "noise_floor": r.noise_floor,
                 "avg_utilization": avg_cu, "avg_interference": avg_interf, "tx_retry_pct": retry_pct,
                 "usage_bytes": usage,
-                "avg_client_signal": (!signals.is_empty()).then(|| signals.iter().sum::<f64>() / signals.len() as f64),
+                "avg_client_signal": signal.get(),
                 "spectrum": spec,
             }));
         }
@@ -1372,7 +1484,7 @@ mod tests {
         let s = |t, r, a, d| (t, vec![Some(r), Some(a), Some(d)]);
         let samples = vec![s(0, 100.0, 1000.0, 0.0), s(10, 130.0, 1100.0, 10.0), s(20, 5.0, 20.0, 0.0), s(30, 25.0, 120.0, 0.0)];
         let mut vaps: Loaded = BTreeMap::new();
-        vaps.insert("bss".into(), (vec!["ap".into(), "na".into()], samples));
+        vaps.insert("bss".into(), (vec!["ap".into(), "na".into()], Samples::from_rows(samples)));
         let t = retry_totals(&vaps, RETRY_AT, 0)[&("ap".to_string(), "na".to_string())];
         // 30+20 retries, 100+100 attempts, 10 dropped; the restart at t=20 adds nothing.
         assert_eq!(t, [50.0, 200.0, 10.0]);
@@ -1380,14 +1492,31 @@ mod tests {
         assert_eq!(retry_pct([0.0, 0.0, 0.0]), 0.0);
         // Older rows without attempt counters are left out rather than read as 100 %.
         let mut vaps: Loaded = BTreeMap::new();
-        vaps.insert("bss".into(), (vec!["ap".into(), "na".into()], vec![(0, vec![Some(1.0), None, None]), (10, vec![Some(9.0), None, None])]));
+        vaps.insert("bss".into(), (vec!["ap".into(), "na".into()], Samples::from_rows(vec![(0, vec![Some(1.0), None, None]), (10, vec![Some(9.0), None, None])])));
         assert!(retry_totals(&vaps, RETRY_AT, 0).is_empty());
+    }
+
+    #[test]
+    fn network_throughput_is_averaged_over_intervals_not_samples() {
+        // A new SSID: three reports in the bucket, so two intervals of 100 bytes/s down.
+        let row = |t: Ts, tx: f64| {
+            let mut v = vec![None; WLAN_COLS.len()];
+            v[col(WLAN_COLS, "tx_bytes")] = Some(tx);
+            v[col(WLAN_COLS, "num_sta")] = Some(3.0);
+            (t, v)
+        };
+        let mut vaps: Loaded = BTreeMap::new();
+        vaps.insert("bss".into(), (vec!["Home".into()], Samples::from_rows(vec![row(0, 0.0), row(10, 1000.0), row(20, 2000.0)])));
+        let per = wlan_history(&vaps, 0, 60);
+        let b = per["Home"].series[&0][&0];
+        assert_eq!(b.averages(), (3.0, 100.0, 0.0));
+        assert_eq!(per["Home"].down, 2000.0);
     }
 
     #[test]
     fn rates_count_nothing_across_a_counter_restart_or_a_gap() {
         let s = |t, v| (t, vec![Some(v), None]);
-        let samples = [s(0, 100.0), s(10, 200.0), s(20, 50.0), s(30, 80.0), s(30 + 7201, 90.0), s(30 + 7211, 100.0)];
+        let samples = Samples::from_rows(vec![s(0, 100.0), s(10, 200.0), s(20, 50.0), s(30, 80.0), s(30 + 7201, 90.0), s(30 + 7211, 100.0)]);
         let r: Vec<(Ts, Option<f64>, Option<f64>)> = deltas(&samples, 0).map(|d| (d.ts, d.rate(0), d.inc(1))).collect();
         assert_eq!(r, [(10, Some(10.0), None), (20, Some(0.0), None), (30, Some(3.0), None), (7241, Some(1.0), None)]);
         // Only intervals ending in the window; a gauge is read at the end of one.
