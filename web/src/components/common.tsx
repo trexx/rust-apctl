@@ -81,7 +81,7 @@ export function Loading() {
   return <div className="muted pad">Loading…</div>;
 }
 
-export const errorText = (error: unknown) =>
+const errorText = (error: unknown) =>
   error instanceof Error ? error.message : String(error);
 
 export function ErrorNote({ error }: { error: unknown }) {
@@ -108,7 +108,7 @@ export function QueryState<T>({
 }
 
 /** An action's outcome, shown under its buttons. */
-export type RunResult = { ok: boolean; text: string } | null;
+type RunResult = { ok: boolean; text: string } | null;
 
 /**
  * Runs one action at a time: `busy` while it runs, then its outcome. The
@@ -287,13 +287,7 @@ export function ApSelect({
   );
 }
 
-export function DeviceLink({
-  mac,
-  names,
-}: {
-  mac: string | null;
-  names: Names;
-}) {
+function DeviceLink({ mac, names }: { mac: string | null; names: Names }) {
   if (!mac) return <span className="muted">—</span>;
   return <Link to={`/devices/${mac}`}>{names[mac] ?? mac}</Link>;
 }

@@ -5,7 +5,7 @@ import type { AlertCategory, AlertItem } from "../api";
 import { clock } from "../format";
 import { useDismiss, useRunner } from "./common";
 
-export const CATEGORIES: [AlertCategory, string, string][] = [
+const CATEGORIES: [AlertCategory, string, string][] = [
   [
     "ap_status",
     "AP offline / back online",
@@ -43,7 +43,7 @@ const DEFAULT_PREFS: Prefs = {
 };
 
 /** This browser's notification choices (stored only in this browser). */
-export function loadPrefs(): Prefs {
+function loadPrefs(): Prefs {
   try {
     const raw = localStorage.getItem(PREFS_KEY);
     if (raw)
@@ -61,7 +61,7 @@ export function loadPrefs(): Prefs {
   return DEFAULT_PREFS;
 }
 
-export function savePrefs(p: Prefs) {
+function savePrefs(p: Prefs) {
   try {
     localStorage.setItem(PREFS_KEY, JSON.stringify(p));
   } catch {
@@ -69,7 +69,7 @@ export function savePrefs(p: Prefs) {
   }
 }
 
-export const notificationsSupported = () =>
+const notificationsSupported = () =>
   typeof window !== "undefined" &&
   "Notification" in window &&
   window.isSecureContext;

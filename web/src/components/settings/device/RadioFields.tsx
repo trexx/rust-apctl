@@ -3,7 +3,7 @@ import { NumberInput, Row, Select, Toggle, binder } from "../form";
 import type { Option } from "../form";
 
 /** A radio's editable fields, as the form holds them. */
-export type RadioForm = {
+type RadioForm = {
   radio: string;
   channel: number | "auto";
   ht: number;
