@@ -15,7 +15,7 @@
 //! version in an inform. apctl upgrades strictly one AP at a time, mesh
 //! children before the APs they hang off, and stops the queue on a failure.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::time::Duration;
 
 use axum::Json;
@@ -163,6 +163,13 @@ pub struct Job {
     pub expires: Option<Ts>,
 }
 
+impl Job {
+    /// A queued upgrade of `a` to `target`, a release version or "custom" for a firmware URL.
+    fn new(a: ApInfo, target: String, url: String, md5: Option<String>, sha256: Option<String>, custom: bool) -> Job {
+        Job { mac: a.mac, name: a.name, from: a.version, target, url, md5, sha256, custom, state: JobState::Queued, sent_at: None, expires: None }
+    }
+}
+
 /// The upgrade queue: one AP at a time.
 #[derive(Debug, Default, Serialize)]
 pub struct Jobs {
@@ -214,8 +221,10 @@ impl Jobs {
 
     /// The current job failed: stop the queue so a problem is not repeated on every AP.
     pub fn failed(&mut self, mac: &Mac, why: &str) -> Option<Job> {
-        let j = self.current.as_ref().filter(|j| j.mac == *mac)?.clone();
-        self.current = None;
+        if !self.current.as_ref().is_some_and(|j| j.mac == *mac) {
+            return None;
+        }
+        let j = self.current.take()?;
         if !self.queue.is_empty() {
             self.stopped = Some(format!("{} failed: {why}", j.name.clone().unwrap_or_else(|| j.mac.to_string())));
         }
@@ -369,17 +378,29 @@ pub fn schedule(writer: Writer) {
     });
 }
 
-fn releases(store: &Store) -> anyhow::Result<(Vec<Release>, Option<Ts>, Option<String>)> {
+/// The newest release for each platform.
+type Releases = HashMap<String, Release>;
+
+/// The stored releases, and when the feed was last checked (with its error, if it failed).
+fn releases(store: &Store) -> anyhow::Result<(Releases, Option<Ts>, Option<String>)> {
     store.read(Db::Config, |c| {
         let list = c
             .prepare("SELECT platform, version, url, md5, sha256, size, created FROM firmware_releases")?
             .query_map([], |r| {
                 Ok(Release { platform: r.get(0)?, version: r.get(1)?, url: r.get(2)?, md5: r.get(3)?, sha256: r.get(4)?, size: r.get(5)?, created: r.get(6)? })
             })?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
+            .map(|r| r.map(|r| (r.platform.clone(), r)))
+            .collect::<rusqlite::Result<HashMap<_, _>>>()?;
         let (ts, err) = c.query_row("SELECT ts, error FROM firmware_check WHERE id = 1", [], |r| Ok((r.get(0)?, r.get(1)?))).optional()?.unwrap_or((None, None));
         Ok((list, ts, err))
     })
+}
+
+/// An AP model's feed platform, and the release for it.
+fn release_for<'a>(rels: &'a Releases, model: Option<&str>) -> (Option<String>, Option<&'a Release>) {
+    let platform = model.map(platform_for);
+    let rel = platform.as_ref().and_then(|p| rels.get(p));
+    (platform, rel)
 }
 
 // ---------------------------------------------------------------- API
@@ -421,8 +442,7 @@ pub async fn index(State(s): State<AppState>) -> Result<Json<Value>, ApiError> {
     let list: Vec<Value> = aps(&s)
         .into_iter()
         .map(|a| {
-            let platform = a.model.as_deref().map(platform_for);
-            let rel = platform.as_ref().and_then(|p| rels.iter().find(|r| &r.platform == p));
+            let (platform, rel) = release_for(&rels, a.model.as_deref());
             json!({
                 "mac": a.mac, "name": a.name, "model": a.model, "platform": platform, "version": a.version, "online": a.online,
                 "release": rel, "status": status(a.version.as_deref(), rel, a.required.as_deref()),
@@ -472,21 +492,9 @@ pub async fn upgrade(State(s): State<AppState>, Json(b): Json<UpgradeBody>) -> R
     chosen.sort_by(|x, y| y.mesh.cmp(&x.mesh).then(x.mac.cmp(&y.mac)));
     let mut jobs = Vec::new();
     for a in chosen {
-        let rel = a.model.as_deref().map(platform_for).and_then(|p| rels.iter().find(|r| r.platform == p).cloned());
-        match (status(a.version.as_deref(), rel.as_ref(), a.required.as_deref()), rel, a.online) {
-            (Status::UpdateAvailable, Some(r), true) => jobs.push(Job {
-                mac: a.mac,
-                name: a.name,
-                from: a.version,
-                target: r.version,
-                url: r.url,
-                md5: r.md5,
-                sha256: r.sha256,
-                custom: false,
-                state: JobState::Queued,
-                sent_at: None,
-                expires: None,
-            }),
+        let (_, rel) = release_for(&rels, a.model.as_deref());
+        match (status(a.version.as_deref(), rel, a.required.as_deref()), rel, a.online) {
+            (Status::UpdateAvailable, Some(r), true) => jobs.push(Job::new(a, r.version.clone(), r.url.clone(), r.md5.clone(), r.sha256.clone(), false)),
             (st, _, online) => {
                 let why = match st {
                     _ if !online => Skip::Offline,
@@ -529,19 +537,7 @@ pub async fn upgrade_url(State(s): State<AppState>, Json(b): Json<UrlBody>) -> R
     if !a.online {
         return Err(ApiError(StatusCode::CONFLICT, "the AP is offline".into()));
     }
-    let job = Job {
-        mac: a.mac,
-        name: a.name,
-        from: a.version,
-        target: "custom".into(),
-        url: b.url,
-        md5: None,
-        sha256: None,
-        custom: true,
-        state: JobState::Queued,
-        sent_at: None,
-        expires: None,
-    };
+    let job = Job::new(a, "custom".into(), b.url, None, None, true);
     let n = change_queue(&s, Op::Enqueue(vec![job])).await?;
     Ok(Json(json!({ "queued": n })))
 }
