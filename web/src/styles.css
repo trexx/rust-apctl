@@ -12,6 +12,14 @@
   --info-bg: #eef4ff;
   --warn-bg: #fff6e5;
   --bad-bg: #fdecec;
+  /* Text on a solid --accent, and on a solid --good / --fair / --poor. */
+  --on-accent: #fff;
+  --on-status: #fff;
+  /* The charts' series colours (Chart.tsx COLORS), for other graphics. */
+  --c-blue: #3b7ddd;
+  --c-orange: #e8833a;
+  --c-purple: #8a63d2;
+  --c-teal: #2aa3b8;
   --radius: 10px;
   color-scheme: light;
 }
@@ -31,6 +39,13 @@
     --info-bg: #1b2638;
     --warn-bg: #2d2617;
     --bad-bg: #331d1f;
+    /* The dark palette's colours are light: white on them is hard to read. */
+    --on-accent: #12151b;
+    --on-status: #12151b;
+    --c-blue: #6f9cf0;
+    --c-orange: #f0995a;
+    --c-purple: #a585e3;
+    --c-teal: #4cc0d4;
     color-scheme: dark;
   }
 }
@@ -237,11 +252,23 @@ main {
   overflow: hidden;
   text-overflow: ellipsis;
 }
+/* Label/value grids: AP cards and settings (spans), radio panels (dt/dd). */
 .kv {
   display: grid;
-  grid-template-columns: 90px 1fr;
+  grid-template-columns: max-content 1fr;
   gap: 4px 12px;
+  margin: 4px 0 8px;
   font-size: 13px;
+}
+.kv.kv-wide {
+  grid-template-columns: 130px 1fr;
+}
+.kv dt {
+  color: var(--text-muted);
+}
+.kv dd {
+  margin: 0;
+  min-width: 0;
 }
 .kv > span {
   /* card rows stay on one line; long values end in an ellipsis (full text in the tooltip) */
@@ -395,7 +422,7 @@ main {
 }
 .segmented button.active {
   background: var(--accent);
-  color: #fff;
+  color: var(--on-accent);
 }
 
 input.search,
@@ -579,12 +606,11 @@ input.search {
 .btn.primary {
   background: var(--accent);
   border-color: var(--accent);
-  color: #fff;
+  color: var(--on-accent);
 }
 .btn.small {
   font-size: 12px;
   padding: 2px 8px;
-  margin-left: 6px;
   font-weight: normal;
 }
 .btn:disabled {
@@ -607,7 +633,7 @@ input.search {
 .user {
   display: flex;
   align-items: center;
-  gap: 4px;
+  gap: 10px;
   color: var(--text-muted);
   font-size: 13px;
 }
@@ -643,9 +669,6 @@ input.search {
 
 .ok {
   color: var(--good);
-}
-.kv-wide {
-  grid-template-columns: 130px 1fr;
 }
 .import {
   margin-top: 16px;
@@ -700,7 +723,7 @@ input.search {
 }
 .buckets {
   display: grid;
-  grid-template-columns: repeat(7, 1fr);
+  grid-template-columns: repeat(6, 1fr);
   gap: 4px;
   text-align: center;
 }
@@ -708,7 +731,7 @@ input.search {
   height: 22px;
   border-radius: 4px;
   background: var(--grid);
-  color: #fff;
+  color: var(--on-status);
   font-size: 12px;
   line-height: 22px;
 }
@@ -735,15 +758,15 @@ input.search {
 }
 .stage-good {
   background: var(--good);
-  color: #fff;
+  color: var(--on-status);
 }
 .stage-warn {
   background: var(--fair);
-  color: #fff;
+  color: var(--on-status);
 }
 .stage-bad {
   background: var(--poor);
-  color: #fff;
+  color: var(--on-status);
 }
 .density {
   position: relative;
@@ -815,18 +838,18 @@ td.warn {
   font-size: 11px;
 }
 .spectrum-shape {
-  fill: rgba(102, 112, 133, 0.12);
+  fill: color-mix(in srgb, var(--text-muted) 12%, transparent);
   stroke: var(--text-muted);
   stroke-width: 1;
 }
 .spectrum-shape.own {
-  fill: rgba(47, 111, 223, 0.18);
+  fill: color-mix(in srgb, var(--accent) 18%, transparent);
   stroke: var(--accent);
   stroke-width: 2;
 }
 .spectrum-shape.active {
-  fill: rgba(232, 131, 58, 0.3);
-  stroke: #e8833a;
+  fill: color-mix(in srgb, var(--c-orange) 30%, transparent);
+  stroke: var(--c-orange);
 }
 .legend {
   display: flex;
@@ -841,29 +864,15 @@ td.warn {
   height: 10px;
   border-radius: 2px;
   border: 1px solid var(--text-muted);
-  background: rgba(102, 112, 133, 0.12);
+  background: color-mix(in srgb, var(--text-muted) 12%, transparent);
   margin-left: 8px;
 }
 .swatch.own {
   border: 2px solid var(--accent);
-  background: rgba(47, 111, 223, 0.18);
+  background: color-mix(in srgb, var(--accent) 18%, transparent);
   margin-left: 0;
 }
 
-.kv {
-  display: grid;
-  grid-template-columns: max-content 1fr;
-  gap: 4px 12px;
-  margin: 4px 0 8px;
-  font-size: 13px;
-}
-.kv dt {
-  color: var(--text-muted);
-}
-.kv dd {
-  margin: 0;
-  min-width: 0;
-}
 .dist-bar {
   display: flex;
   height: 10px;
@@ -934,7 +943,7 @@ td.warn {
   margin-right: auto;
 }
 .chart-plot .u-select {
-  background: rgba(47, 111, 223, 0.15);
+  background: color-mix(in srgb, var(--accent) 15%, transparent);
 }
 
 .page > .panel + .threat,
@@ -991,7 +1000,7 @@ td.warn {
   letter-spacing: 0.03em;
   border-radius: 6px;
   padding: 1px 6px;
-  color: #fff;
+  color: var(--on-status);
   background: var(--poor);
 }
 .sev-medium {
@@ -999,6 +1008,7 @@ td.warn {
 }
 .sev-low {
   background: var(--accent);
+  color: var(--on-accent);
 }
 .stats + .banner {
   margin: 12px 0 0;
@@ -1010,9 +1020,6 @@ td.warn {
 .bucket-empty {
   opacity: 0.12;
   color: transparent;
-}
-.buckets {
-  grid-template-columns: repeat(6, 1fr);
 }
 .bucket-edges {
   display: flex;
@@ -1069,18 +1076,6 @@ td.warn {
   font-size: 12px;
 }
 
-.mcast-layout {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
-  gap: 16px;
-  align-items: start;
-}
-@media (max-width: 1000px) {
-  .mcast-layout {
-    grid-template-columns: 1fr;
-  }
-}
-
 .cards-fill {
   grid-template-columns: repeat(auto-fit, minmax(min(390px, 100%), 1fr));
 }
@@ -1129,19 +1124,19 @@ td.warn {
   background: var(--grid);
 }
 .seg-assoc {
-  background: #2aa3b8;
+  background: var(--c-teal);
 }
 .seg-auth {
-  background: #8a63d2;
+  background: var(--c-purple);
 }
 .seg-dhcp {
-  background: #e8833a;
+  background: var(--c-orange);
 }
 .seg-dns {
-  background: #3b7ddd;
+  background: var(--c-blue);
 }
 .tag-good {
-  background: rgba(47, 158, 110, 0.14);
+  background: color-mix(in srgb, var(--good) 14%, transparent);
   color: var(--good);
 }
 .tag-bad {
@@ -1206,7 +1201,7 @@ td .tag {
 .cfg-old {
   color: var(--poor);
   text-decoration: line-through;
-  text-decoration-color: rgba(214, 69, 69, 0.4);
+  text-decoration-color: color-mix(in srgb, var(--poor) 40%, transparent);
 }
 .cfg-new {
   color: var(--good);
@@ -1247,7 +1242,7 @@ td .tag {
   padding: 0 4px;
   border-radius: 8px;
   background: var(--poor);
-  color: #fff;
+  color: var(--on-status);
   font-size: 10px;
   line-height: 16px;
   text-align: center;
