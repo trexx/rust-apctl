@@ -175,7 +175,16 @@ pub async fn passphrase(State(s): State<AppState>, Path(id): Path<String>) -> Re
 }
 
 /// Fields of an AP radio the editor shows and edits.
-const RADIO_FIELDS: &[&str] = &["radio", "name", "channel", "ht", "tx_power_mode", "tx_power", "min_rssi_enabled", "min_rssi", "hard_noise_floor_enabled", "sens_level_enabled", "sens_level"];
+const RADIO_FIELDS: &[&str] = &[
+    "radio", "name", "channel", "ht", "tx_power_mode", "tx_power", "min_rssi_enabled", "min_rssi", "hard_noise_floor_enabled", "sens_level_enabled", "sens_level",
+    "antenna_gain", "antenna_id", "vwire_enabled", "loadbalance_enabled", "maxsta",
+];
+
+/// Fields of an AP the editor shows and edits, besides its radios.
+const DEVICE_FIELDS: &[&str] = &[
+    "name", "led_override", "led_override_color", "led_override_color_brightness", "outdoor_mode_override", "bandsteering_mode", "atf_enabled",
+    "green_ap_enabled", "resetbtn_enabled", "jumboframe_enabled", "config_network",
+];
 
 /// What the AP itself reports about a radio: power range, widths, channels.
 fn radio_caps(inform: Option<&Value>, band: &str) -> Value {
@@ -208,16 +217,26 @@ pub async fn device(State(s): State<AppState>, Path(mac): Path<String>) -> Resul
             }
             let band = r["radio"].as_str().unwrap_or("");
             v["caps"] = radio_caps(inform.as_deref(), band);
-            v["channels"] = channels(&state, d, band);
+            v["channels"] = channels(&state, band, false);
+            v["channels_outdoor"] = channels(&state, band, true);
             // The "interference blocker" exists only on radios reporting this capability.
             v["has_blocker"] = json!(r["radio_caps"].as_i64().is_some_and(|c| c & 131072 != 0));
             v
         })
         .collect();
-    Ok(Json(json!({
-        "active": s.active, "mac": mac.to_ascii_lowercase(), "name": d["name"], "model": d["model"],
-        "led_override": d["led_override"], "led_override_color_brightness": d["led_override_color_brightness"], "radios": radios,
-    })))
+    let supported: Vec<&str> = apcfg::device_feature_support(d, inform.as_deref()).map_or_else(|| apcfg::DEVICE_FEATURES.to_vec(), |l| l.into_iter().filter(|(_, ok)| *ok).map(|(f, _)| f).collect());
+    let site_outdoor = docs(&state, "setting").any(|s| s["key"].as_str() == Some("mgmt") && s["outdoor_mode_enabled"].as_bool() == Some(true));
+    let advanced = docs(&state, "setting").any(|s| s["key"].as_str() == Some("mgmt") && s["advanced_feature_enabled"].as_bool() == Some(true));
+    let antennas: Vec<Value> = inform.as_deref().and_then(|p| p["antenna_table"].as_array().cloned()).unwrap_or_default();
+    let mut out = json!({
+        "active": s.active, "mac": mac.to_ascii_lowercase(), "model": d["model"], "radios": radios, "features": supported,
+        "reported": inform.is_some(), "site_outdoor": site_outdoor, "advanced_features": advanced, "antennas": antennas,
+        "ports": d["ethernet_table"].as_array().map_or(0, |t| t.iter().filter_map(|e| e["num_port"].as_i64()).sum::<i64>()),
+    });
+    for f in DEVICE_FIELDS {
+        out[*f] = d[*f].clone();
+    }
+    Ok(Json(out))
 }
 
 // ---- Channels -------------------------------------------------------------
@@ -281,9 +300,8 @@ pub(crate) fn outdoor(state: &Value, d: &Value) -> bool {
 }
 
 /// Channel choices per width for the editor.
-fn channels(state: &Value, d: &Value, band: &str) -> Value {
+fn channels(state: &Value, band: &str, o: bool) -> Value {
     let c = country(state);
-    let o = outdoor(state, d);
     let widths: &[i64] = if band == "ng" { &[20, 40] } else { &[20, 40, 80, 160] };
     let mut out = serde_json::Map::new();
     for w in widths {
@@ -1025,7 +1043,6 @@ pub fn apply_device(state: &mut Value, body: &Value) -> Result<String, String> {
     let devices = state["devices"].as_array().ok_or("the settings have no APs")?;
     let i = devices.iter().position(|d| d["mac"].as_str().is_some_and(|m| m.eq_ignore_ascii_case(&mac))).ok_or("this AP is not in the settings")?;
     let before = devices[i].clone();
-    let o = outdoor(state, &before);
     // SSIDs locking this AP's 2.4 GHz channel for IoT devices.
     let iot_lock = docs(state, "wlanconf").any(|w| w["iot_channel_lock"].as_bool() == Some(true) && deployed_to(state, w).contains(&mac));
     let mut d = before.clone();
@@ -1043,6 +1060,38 @@ pub fn apply_device(state: &mut Value, body: &Value) -> Result<String, String> {
     if let Some(b) = int_field(p, "led_override_color_brightness", 0, 100)? {
         d["led_override_color_brightness"] = json!(b);
     }
+    if let Some(c) = p["led_override_color"].as_str() {
+        d["led_override_color"] = json!(led_color(c)?);
+    }
+    for (key, allowed) in [("outdoor_mode_override", &["default", "on", "off"][..]), ("bandsteering_mode", &["off", "equal", "prefer_5g"]), ("resetbtn_enabled", &["on", "off"])] {
+        if let Some(v) = enum_field(p, key, allowed)? {
+            d[key] = json!(v);
+        }
+    }
+    for key in ["atf_enabled", "green_ap_enabled", "jumboframe_enabled"] {
+        if let Some(b) = bool_field(p, key)? {
+            d[key] = json!(b);
+        }
+    }
+    // The antenna, from those the AP reports; each radio's gain follows it, as in
+    // the official UI (which offers the choice only with two or more antennas).
+    if let Some(a) = int_field(p, "antenna_id", 0, 9)? {
+        let entry = body["antennas"].as_array().into_iter().flatten().find(|x| x["id"].as_i64() == Some(a)).ok_or_else(|| format!("this AP has no antenna {a}"))?;
+        for r in d["radio_table"].as_array_mut().into_iter().flatten() {
+            let gain = r["name"].as_str().and_then(|n| entry[format!("{n}_gain")].as_i64()).unwrap_or(6);
+            r["antenna_id"] = json!(a);
+            r["antenna_gain"] = json!(gain);
+        }
+    }
+    if !p["config_network"].is_null() {
+        let cn = check_config_network(&p["config_network"], &before["config_network"])?;
+        if let Some(ip) = cn["ip"].as_str() {
+            check_ip_free(state, &mac, ip)?;
+        }
+        d["config_network"] = cn;
+    }
+    // Outdoor mode changes which channels are legal.
+    let o = outdoor(state, &d);
 
     for rp in p["radios"].as_array().into_iter().flatten() {
         let band = rp["radio"].as_str().ok_or("each radio needs its band (radio)")?;
@@ -1101,16 +1150,38 @@ pub fn apply_device(state: &mut Value, body: &Value) -> Result<String, String> {
             }
             r["hard_noise_floor_enabled"] = json!(b);
         }
+        for key in ["vwire_enabled", "sens_level_enabled", "loadbalance_enabled"] {
+            if let Some(b) = bool_field(rp, key)? {
+                r[key] = json!(b);
+            }
+        }
+        if let Some(v) = int_field(rp, "sens_level", -90, -50)? {
+            r["sens_level"] = json!(v);
+        }
+        if let Some(n) = int_field(rp, "maxsta", 1, 200)? {
+            r["maxsta"] = json!(n);
+        }
         if r["tx_power_mode"].as_str() == Some("disabled") && body["wireless_uplink"].as_str() == Some(band) {
             return Err(format!("{label}: this radio carries the AP's wireless uplink, so it cannot be turned off"));
         }
     }
 
+    // Outdoor mode may have made a radio's fixed channel illegal.
+    if o != outdoor(state, &before) {
+        for r in d["radio_table"].as_array().into_iter().flatten() {
+            let (band, width) = (r["radio"].as_str().unwrap_or(""), r["ht"].as_i64().unwrap_or(20));
+            if let Some(ch) = r["channel"].as_i64().or_else(|| r["channel"].as_str()?.parse().ok())
+                && !legal_channels(c, band, width, o).contains(&ch)
+            {
+                return Err(format!("{}: channel {ch} is not allowed {} here; pick another first", band_name(band), if o { "outdoors" } else { "indoors" }));
+            }
+        }
+    }
     state["devices"].as_array_mut().unwrap()[i] = d.clone();
     let name = d["name"].as_str().unwrap_or(&mac).to_string();
     let mut changed: Vec<String> = Vec::new();
-    for k in ["name", "led_override", "led_override_color_brightness"] {
-        if before[k] != d[k] {
+    for k in DEVICE_FIELDS {
+        if before[*k] != d[*k] {
             changed.push(k.replace('_', " "));
         }
     }
@@ -1122,6 +1193,84 @@ pub fn apply_device(state: &mut Value, body: &Value) -> Result<String, String> {
         }
     }
     Ok(if changed.is_empty() { format!("AP {name}: nothing changed") } else { format!("AP {name}: {}", changed.join("; ")) })
+}
+
+/// The AP's own address: DHCP, or static with an address, netmask, a gateway
+/// on that subnet, a DNS server (a second one and a search domain optional).
+fn check_config_network(p: &Value, before: &Value) -> Result<Value, String> {
+    use std::net::Ipv4Addr;
+    let ip = |key: &str, required: bool| -> Result<Option<Ipv4Addr>, String> {
+        match p[key].as_str().map(str::trim).filter(|s| !s.is_empty()) {
+            None if required => Err(format!("a static address needs {key}")),
+            None => Ok(None),
+            Some(s) => s.parse().map(Some).map_err(|_| format!("{key}: {s} is not an IPv4 address")),
+        }
+    };
+    let mut out = json!({ "type": "dhcp" });
+    if let Some(b) = before["bonding_enabled"].as_bool() {
+        out["bonding_enabled"] = json!(b);
+    }
+    match p["type"].as_str() {
+        Some("dhcp") => return Ok(out),
+        Some("static") => {}
+        _ => return Err("config_network.type must be dhcp or static".into()),
+    }
+    let addr = ip("ip", true)?.unwrap();
+    let mask = ip("netmask", true)?.unwrap();
+    let m = u32::from(mask);
+    if m == 0 || m.leading_ones() + m.trailing_zeros() != 32 || m.trailing_zeros() < 2 {
+        return Err(format!("{mask} is not a usable netmask"));
+    }
+    let net = u32::from(addr) & m;
+    if u32::from(addr) == net || u32::from(addr) == net | !m {
+        return Err(format!("{addr} is the network or broadcast address of its subnet"));
+    }
+    out["type"] = json!("static");
+    out["ip"] = json!(addr.to_string());
+    out["netmask"] = json!(mask.to_string());
+    // The official UI also needs a gateway and a DNS server; the subnet check is ours.
+    let gw = ip("gateway", true)?.unwrap();
+    if u32::from(gw) & m != net || gw == addr {
+        return Err(format!("the gateway {gw} must be another address on {}/{}", Ipv4Addr::from(net), m.leading_ones()));
+    }
+    out["gateway"] = json!(gw.to_string());
+    for (key, required) in [("dns1", true), ("dns2", false)] {
+        if let Some(d) = ip(key, required)? {
+            out[key] = json!(d.to_string());
+        }
+    }
+    if let Some(suffix) = p["dnssuffix"].as_str().map(str::trim).filter(|s| !s.is_empty()) {
+        if suffix.len() > 253 || !suffix.split('.').all(|l| !l.is_empty() && l.len() <= 63 && l.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')) {
+            return Err(format!("{suffix} is not a domain name"));
+        }
+        out["dnssuffix"] = json!(suffix);
+    }
+    Ok(out)
+}
+
+/// A static address must not be another AP's, or one reserved for a client.
+fn check_ip_free(state: &Value, mac: &str, ip: &str) -> Result<(), String> {
+    if let Some(o) = docs(state, "devices").find(|o| o["mac"].as_str().is_some_and(|m| !m.eq_ignore_ascii_case(mac)) && o["config_network"]["type"].as_str() == Some("static") && o["config_network"]["ip"].as_str() == Some(ip)) {
+        return Err(format!("{ip} is already {}'s address", o["name"].as_str().or(o["mac"].as_str()).unwrap_or("another AP")));
+    }
+    if let Some(c) = docs(state, "clients").find(|c| c["use_fixedip"].as_bool() == Some(true) && c["fixed_ip"].as_str() == Some(ip)) {
+        return Err(format!("{ip} is reserved for the client {}", c["name"].as_str().or(c["hostname"].as_str()).or(c["mac"].as_str()).unwrap_or("?")));
+    }
+    Ok(())
+}
+
+/// An LED colour as `#rrggbb` (the AP config takes six hex digits).
+fn led_color(c: &str) -> Result<String, String> {
+    let hex = c.trim().trim_start_matches('#');
+    let full: String = match hex.len() {
+        3 => hex.chars().flat_map(|x| [x, x]).collect(),
+        6 => hex.to_string(),
+        _ => String::new(),
+    };
+    if full.is_empty() || !full.chars().all(|x| x.is_ascii_hexdigit()) {
+        return Err(format!("{c} is not a colour like #0000ff"));
+    }
+    Ok(format!("#{}", full.to_ascii_lowercase()))
 }
 
 // ---- Handlers -------------------------------------------------------------
@@ -1153,7 +1302,8 @@ pub async fn put_device(State(s): State<AppState>, headers: HeaderMap, Path(mac)
     let caps = json!({ "ng": radio_caps(inform.as_deref(), "ng"), "na": radio_caps(inform.as_deref(), "na"), "6e": radio_caps(inform.as_deref(), "6e") });
     // A mesh AP's uplink radio must stay on.
     let uplink = inform.as_deref().filter(|p| p["uplink"]["type"].as_str() == Some("wireless")).and_then(|p| p["uplink"]["radio"].as_str().map(str::to_string));
-    change(&s, &headers, &q, apply_device, json!({ "mac": mac, "patch": b.patch, "caps": caps, "wireless_uplink": uplink })).await
+    let antennas = inform.as_deref().map_or(Value::Null, |p| p["antenna_table"].clone());
+    change(&s, &headers, &q, apply_device, json!({ "mac": mac, "patch": b.patch, "caps": caps, "wireless_uplink": uplink, "antennas": antennas })).await
 }
 
 #[cfg(test)]
@@ -1388,6 +1538,54 @@ mod tests {
         s["wlanconf"][0]["iot_channel_lock"] = json!(true);
         assert!(dev(&mut s, json!({ "radios": [{ "radio": "ng", "channel": 6 }] })).unwrap_err().contains("IoT"));
         dev(&mut s, json!({ "radios": [{ "radio": "ng", "tx_power_mode": "low" }] })).unwrap();
+    }
+
+    #[test]
+    fn ap_wide_settings_and_its_address() {
+        let mut s = state();
+        let what = dev(&mut s, json!({ "led_override_color": "#0F0", "bandsteering_mode": "prefer_5g", "resetbtn_enabled": "off" })).unwrap();
+        assert!(what.contains("bandsteering mode") && what.contains("resetbtn enabled"), "{what}");
+        assert_eq!(s["devices"][0]["led_override_color"], "#00ff00", "three digits become six");
+        assert!(dev(&mut s, json!({ "led_override_color": "green" })).is_err());
+        assert!(dev(&mut s, json!({ "bandsteering_mode": "always" })).is_err());
+        // Outdoors in Europe 5 GHz is 100-140 only, so channel 44 has to go first.
+        assert!(dev(&mut s, json!({ "outdoor_mode_override": "on" })).unwrap_err().contains("channel 44"));
+        dev(&mut s, json!({ "outdoor_mode_override": "on", "radios": [{ "radio": "na", "channel": 100 }] })).unwrap();
+
+        let static_ip = |ip: &str, gw: &str| json!({ "config_network": { "type": "static", "ip": ip, "netmask": "255.255.255.0", "gateway": gw, "dns1": "192.168.1.1" } });
+        s["devices"][1]["config_network"] = json!({ "type": "static", "ip": "192.168.1.21" });
+        s["clients"] = json!([{ "mac": "02:00:00:00:00:99", "name": "NAS", "use_fixedip": true, "fixed_ip": "192.168.1.22", "site_id": "s1" }]);
+        assert!(dev(&mut s, static_ip("192.168.1.21", "192.168.1.1")).unwrap_err().contains("Attic"));
+        assert!(dev(&mut s, static_ip("192.168.1.22", "192.168.1.1")).unwrap_err().contains("NAS"));
+        assert!(dev(&mut s, json!({ "config_network": { "type": "static", "ip": "192.168.1.20", "netmask": "255.255.255.0", "gateway": "192.168.1.1" } })).unwrap_err().contains("dns1"));
+        dev(&mut s, static_ip("192.168.1.20", "192.168.1.1")).unwrap();
+        assert_eq!(s["devices"][0]["config_network"]["ip"], "192.168.1.20");
+        assert!(dev(&mut s, static_ip("192.168.1.20", "10.0.0.1")).unwrap_err().contains("gateway"));
+        assert!(dev(&mut s, static_ip("192.168.1.255", "192.168.1.1")).is_err(), "broadcast address");
+        assert!(dev(&mut s, json!({ "config_network": { "type": "static", "ip": "192.168.1.20" } })).is_err(), "netmask needed");
+        dev(&mut s, json!({ "config_network": { "type": "dhcp", "ip": "192.168.1.20" } })).unwrap();
+        assert_eq!(s["devices"][0]["config_network"], json!({ "type": "dhcp" }));
+    }
+
+    #[test]
+    fn radio_extras_are_range_checked() {
+        let mut s = state();
+        let antennas = json!([{ "id": 4, "name": "Combined", "wifi0_gain": 3, "wifi1_gain": 5 }, { "id": 5, "name": "External" }]);
+        let caps = json!({ "na": { "min_txpower": 6, "max_txpower": 26 }, "ng": { "min_txpower": 6, "max_txpower": 22 } });
+        let any = |s: &mut Value, p: Value| apply_device(s, &json!({ "mac": AP1, "patch": p, "caps": caps, "antennas": antennas }));
+        let edit = |s: &mut Value, r: Value| any(s, json!({ "radios": [r] }));
+        edit(&mut s, json!({ "radio": "na", "loadbalance_enabled": true, "maxsta": 40, "sens_level_enabled": true, "sens_level": -80 })).unwrap();
+        let r = &s["devices"][0]["radio_table"][1];
+        assert_eq!((r["maxsta"].as_i64(), r["sens_level"].as_i64()), (Some(40), Some(-80)));
+        // The antenna sets each radio's gain from the AP's table (6 when it has none).
+        any(&mut s, json!({ "antenna_id": 4 })).unwrap();
+        let gains = |s: &Value| s["devices"][0]["radio_table"].as_array().unwrap().iter().map(|r| r["antenna_gain"].as_i64().unwrap()).collect::<Vec<_>>();
+        assert_eq!(gains(&s), [3, 5]);
+        any(&mut s, json!({ "antenna_id": 5 })).unwrap();
+        assert_eq!(gains(&s), [6, 6]);
+        assert!(any(&mut s, json!({ "antenna_id": 2 })).is_err());
+        assert!(edit(&mut s, json!({ "radio": "na", "maxsta": 500 })).is_err());
+        assert!(edit(&mut s, json!({ "radio": "na", "sens_level": -40 })).is_err());
     }
 }
 

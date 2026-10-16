@@ -1016,10 +1016,28 @@ export interface RadioSettings {
   min_rssi_enabled: boolean | null;
   min_rssi: number | null;
   hard_noise_floor_enabled: boolean | null;
+  sens_level_enabled: boolean | null;
+  sens_level: number | null;
+  antenna_gain: number | null;
+  antenna_id: number | null;
+  vwire_enabled: boolean | null;
+  loadbalance_enabled: boolean | null;
+  maxsta: number | null;
   has_blocker: boolean;
   caps: { min_txpower: number | null; max_txpower: number | null; has_ht160: boolean | null } | null;
-  /** Legal channels by width (MHz) in the site's country. */
+  /** Legal channels by width (MHz) in the site's country, indoors and in outdoor mode. */
   channels: Record<string, number[]>;
+  channels_outdoor: Record<string, number[]>;
+}
+
+export interface ConfigNetwork {
+  type: "dhcp" | "static";
+  ip?: string;
+  netmask?: string;
+  gateway?: string;
+  dns1?: string;
+  dns2?: string;
+  dnssuffix?: string;
 }
 
 export interface DeviceSettings {
@@ -1028,7 +1046,24 @@ export interface DeviceSettings {
   name: string | null;
   model: string | null;
   led_override: "default" | "on" | "off" | null;
+  led_override_color: string | null;
+  led_override_color_brightness: number | null;
+  outdoor_mode_override: "default" | "on" | "off" | null;
+  bandsteering_mode: "off" | "equal" | "prefer_5g" | null;
+  atf_enabled: boolean | null;
+  green_ap_enabled: boolean | null;
+  resetbtn_enabled: "on" | "off" | null;
+  jumboframe_enabled: boolean | null;
+  config_network: ConfigNetwork | null;
   radios: RadioSettings[];
+  /** AP-wide features its capability bits allow (all of them until it reports). */
+  features: string[];
+  reported: boolean;
+  site_outdoor: boolean;
+  /** The site's "advanced features" switch, which band steering, minimum signal and client limits need. */
+  advanced_features: boolean;
+  antennas: { id: number; name: string; default?: boolean }[];
+  ports: number;
 }
 
 /** What a settings change would send each AP (the shape of a config push). */

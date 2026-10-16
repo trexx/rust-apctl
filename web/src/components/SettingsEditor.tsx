@@ -1399,6 +1399,10 @@ function radioForm(r: RadioSettings): Fields {
     min_rssi_enabled: r.min_rssi_enabled ?? false,
     min_rssi: r.min_rssi ?? -80,
     hard_noise_floor_enabled: r.hard_noise_floor_enabled ?? false,
+    sens_level_enabled: r.sens_level_enabled ?? false,
+    sens_level: r.sens_level ?? -90,
+    loadbalance_enabled: r.loadbalance_enabled ?? false,
+    maxsta: r.maxsta ?? 50,
   };
 }
 
@@ -1406,17 +1410,22 @@ function RadioFields({
   r,
   form,
   set,
+  outdoor,
+  d,
 }: {
   r: RadioSettings;
   form: Fields;
   set: (k: string, v: unknown) => void;
+  outdoor: boolean;
+  d: DeviceSettings;
 }) {
+  const chans = outdoor ? r.channels_outdoor : r.channels;
   const widths =
     r.radio === "ng"
       ? [20, 40]
       : [20, 40, 80, ...(r.caps?.has_ht160 ? [160] : [])];
   const ht = Number(form.ht ?? 20);
-  const legal = r.channels[String(ht)] ?? [];
+  const legal = chans[String(ht)] ?? [];
   const lo = r.caps?.min_txpower ?? 1;
   const hi = r.caps?.max_txpower ?? 30;
   return (
@@ -1430,7 +1439,7 @@ function RadioFields({
             // A fixed channel not legal at the new width falls back to auto.
             if (
               form.channel !== "auto" &&
-              !(r.channels[String(w)] ?? []).includes(Number(form.channel))
+              !(chans[String(w)] ?? []).includes(Number(form.channel))
             )
               set("channel", "auto");
           }}
@@ -1503,7 +1512,7 @@ function RadioFields({
           </label>
         )}
       </Row>
-      {r.has_blocker && (
+      {r.has_blocker && form.min_rssi_enabled === true && (
         <Row
           label="Interference blocker"
           hint="ignore signals below the minimum"
@@ -1514,6 +1523,108 @@ function RadioFields({
             label="Enabled"
           />
         </Row>
+      )}
+      {r.has_blocker && (
+        <Row
+          label="Sensitivity"
+          hint="ignore signals weaker than this, instead of deriving it from the minimum signal (not in the official UI)"
+        >
+          <Toggle
+            value={form.sens_level_enabled}
+            onChange={(v) => set("sens_level_enabled", v)}
+            label="Fixed level"
+          />
+          {form.sens_level_enabled === true && (
+            <label className="small">
+              <input
+                type="range"
+                min={-90}
+                max={-50}
+                value={Number(form.sens_level ?? -90)}
+                onChange={(e) => set("sens_level", Number(e.target.value))}
+              />{" "}
+              {String(form.sens_level)} dBm
+            </label>
+          )}
+        </Row>
+      )}
+      <Row
+        label="Client limit"
+        hint="clients this radio accepts (not in the official UI)"
+      >
+        <Toggle
+          value={form.loadbalance_enabled}
+          onChange={(v) => set("loadbalance_enabled", v)}
+          label="Enabled"
+        />
+        {form.loadbalance_enabled === true && (
+          <label className="small">
+            <input
+              type="number"
+              className="search num-input"
+              min={1}
+              max={200}
+              value={Number(form.maxsta ?? 50)}
+              onChange={(e) => set("maxsta", Number(e.target.value))}
+            />{" "}
+            clients
+          </label>
+        )}
+      </Row>
+      {!d.advanced_features &&
+        (form.min_rssi_enabled === true ||
+          form.loadbalance_enabled === true ||
+          form.sens_level_enabled === true) && (
+          <div className="form-warn">
+            The site's advanced features are off, so the minimum signal,
+            sensitivity and client limit are not sent to the AP.
+          </div>
+        )}
+    </>
+  );
+}
+
+/** The AP's own address; static needs care, as a wrong one cuts the AP off. */
+function AddressFields({
+  value,
+  onChange,
+}: {
+  value: Fields;
+  onChange: (v: Fields) => void;
+}) {
+  const field = (k: string, label: string, placeholder?: string) => (
+    <label className="small">
+      {label}{" "}
+      <input
+        className="search mono"
+        placeholder={placeholder}
+        value={String(value[k] ?? "")}
+        onChange={(e) => onChange({ ...value, [k]: e.target.value })}
+      />
+    </label>
+  );
+  return (
+    <>
+      <select
+        value={String(value.type ?? "dhcp")}
+        onChange={(e) => onChange({ ...value, type: e.target.value })}
+      >
+        <option value="dhcp">DHCP</option>
+        <option value="static">Static</option>
+      </select>
+      {value.type === "static" && (
+        <>
+          {field("ip", "address", "192.168.1.20")}
+          {field("netmask", "netmask", "255.255.255.0")}
+          {field("gateway", "gateway", "192.168.1.1")}
+          {field("dns1", "DNS", "192.168.1.1")}
+          {field("dns2", "DNS 2")}
+          {field("dnssuffix", "search domain")}
+          <div className="form-warn">
+            A wrong address leaves the AP unreachable until it is reset. Check
+            it against your network before saving.
+          </div>
+        </>
       )}
     </>
   );
@@ -1529,7 +1640,28 @@ function DeviceEditor({
   const original: Fields = {
     name: d.name ?? "",
     led_override: d.led_override ?? "default",
+    led_override_color: d.led_override_color ?? "#0000ff",
+    led_override_color_brightness: d.led_override_color_brightness ?? 100,
+    outdoor_mode_override: d.outdoor_mode_override ?? "default",
+    bandsteering_mode: d.bandsteering_mode ?? "off",
+    atf_enabled: d.atf_enabled ?? false,
+    green_ap_enabled: d.green_ap_enabled ?? false,
+    resetbtn_enabled: d.resetbtn_enabled ?? "on",
+    jumboframe_enabled: d.jumboframe_enabled ?? false,
+    config_network: d.config_network ?? { type: "dhcp" },
+    antenna_id:
+      d.radios.find((r) => r.antenna_id !== null && r.antenna_id >= 0)
+        ?.antenna_id ??
+      d.antennas.find((a) => a.default)?.id ??
+      -1,
   };
+  const has = (f: string) => d.features.includes(f);
+  const missing = [
+    ["band_steering", "band steering"],
+    ["airtime_fairness", "airtime fairness"],
+    ["green_ap", "Green AP"],
+    ["led_color", "LED colour"],
+  ].filter(([f]) => !has(f));
   const [form, setForm] = useState<Fields>(original);
   const [radios, setRadios] = useState<Fields[]>(d.radios.map(radioForm));
   const [review, setReview] = useState<Fields | null>(null);
@@ -1555,6 +1687,10 @@ function DeviceEditor({
       />
     );
   const nothing = Object.keys(patch()).length === 0;
+  const set = (k: string, v: unknown) => setForm({ ...form, [k]: v });
+  const outdoor =
+    form.outdoor_mode_override === "on" ||
+    (form.outdoor_mode_override === "default" && d.site_outdoor);
   return (
     <div className="settings-form">
       <Row label="Name">
@@ -1574,7 +1710,129 @@ function DeviceEditor({
           <option value="on">On</option>
           <option value="off">Off</option>
         </select>
+        {has("led") && form.led_override !== "off" && (
+          <label className="small">
+            brightness{" "}
+            <input
+              type="range"
+              min={1}
+              max={100}
+              value={Number(form.led_override_color_brightness)}
+              onChange={(e) =>
+                set("led_override_color_brightness", Number(e.target.value))
+              }
+            />{" "}
+            {String(form.led_override_color_brightness)}%
+          </label>
+        )}
+        {has("led_color") && form.led_override !== "off" && (
+          <input
+            type="color"
+            value={String(form.led_override_color)}
+            onChange={(e) => set("led_override_color", e.target.value)}
+          />
+        )}
       </Row>
+      <Row label="Antenna" hint="the gain sets the power limits">
+        {d.antennas.length > 1 && (
+          <select
+            value={Number(form.antenna_id)}
+            onChange={(e) => set("antenna_id", Number(e.target.value))}
+          >
+            {d.antennas.map((a) => (
+              <option key={a.id} value={a.id}>
+                {a.name}
+              </option>
+            ))}
+          </select>
+        )}
+        <span className="muted small">
+          {d.radios
+            .map(
+              (r) =>
+                `${r.radio === "ng" ? "2.4 GHz" : r.radio === "na" ? "5 GHz" : r.radio} ${r.antenna_gain ?? 6} dBi`,
+            )
+            .join(", ")}
+        </span>
+      </Row>
+      <Row label="Outdoor mode" hint="changes which channels are allowed">
+        <select
+          value={String(form.outdoor_mode_override)}
+          onChange={(e) => set("outdoor_mode_override", e.target.value)}
+        >
+          <option value="default">
+            Site default ({d.site_outdoor ? "outdoor" : "indoor"})
+          </option>
+          <option value="on">Outdoor</option>
+          <option value="off">Indoor</option>
+        </select>
+      </Row>
+      {has("band_steering") &&
+        d.radios.some((r) => r.radio === "ng") &&
+        d.radios.some((r) => r.radio === "na") && (
+          <Row
+            label="Band steering"
+            hint="move dual-band clients between this AP's radios"
+          >
+            <select
+              value={String(form.bandsteering_mode)}
+              onChange={(e) => set("bandsteering_mode", e.target.value)}
+            >
+              <option value="off">Off</option>
+              <option value="equal">Balance the bands</option>
+              <option value="prefer_5g">Prefer 5 GHz</option>
+            </select>
+            {!d.advanced_features && form.bandsteering_mode !== "off" && (
+              <div className="form-warn">
+                The site's advanced features are off, so band steering is not
+                sent to the AP.
+              </div>
+            )}
+          </Row>
+        )}
+      {(has("airtime_fairness") || has("green_ap")) && (
+        <Row label="Radio features">
+          {has("airtime_fairness") && (
+            <Toggle
+              value={form.atf_enabled}
+              onChange={(v) => set("atf_enabled", v)}
+              label="Airtime fairness"
+            />
+          )}
+          {has("green_ap") && (
+            <Toggle
+              value={form.green_ap_enabled}
+              onChange={(v) => set("green_ap_enabled", v)}
+              label="Green AP (power saving when idle)"
+            />
+          )}
+        </Row>
+      )}
+      <Row label="Hardware" hint="not in the official UI">
+        <Toggle
+          value={form.resetbtn_enabled !== "off"}
+          onChange={(v) => set("resetbtn_enabled", v ? "on" : "off")}
+          label="Reset button works"
+        />
+        {has("jumbo_frames") && (
+          <Toggle
+            value={form.jumboframe_enabled}
+            onChange={(v) => set("jumboframe_enabled", v)}
+            label="Jumbo frames on its port"
+          />
+        )}
+      </Row>
+      <Row label="IP address" hint="the AP's own management address">
+        <AddressFields
+          value={form.config_network as Fields}
+          onChange={(v) => set("config_network", v)}
+        />
+      </Row>
+      {d.reported && missing.length > 0 && (
+        <div className="muted small">
+          Not supported by this AP: {missing.map(([, l]) => l).join(", ")}.
+        </div>
+      )}
       {d.radios.map((r, i) => (
         <details key={r.radio} open>
           <summary>
@@ -1586,6 +1844,8 @@ function DeviceEditor({
           </summary>
           <RadioFields
             r={r}
+            d={d}
+            outdoor={outdoor}
             form={radios[i]}
             set={(k, v) =>
               setRadios((all) =>

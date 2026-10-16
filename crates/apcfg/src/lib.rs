@@ -246,6 +246,35 @@ impl<'a> Ctx<'a> {
     }
 }
 
+/// AP-wide features that depend on the AP's capability bits, as `render`
+/// checks them: without the bit the setting is not sent at all.
+pub const DEVICE_FEATURES: &[&str] = &["band_steering", "airtime_fairness", "green_ap", "led", "led_color", "jumbo_frames"];
+
+/// Which of [`DEVICE_FEATURES`] the AP supports, or `None` while unknown (see
+/// [`ssid_feature_support`]).
+pub fn device_feature_support(device: &Value, inform: Option<&Value>) -> Option<Vec<(&'static str, bool)>> {
+    let caps = Caps::read(inform, device);
+    if caps.fw == 0 && caps.wifi == 0 && caps.hw == 0 {
+        return None;
+    }
+    Some(
+        DEVICE_FEATURES
+            .iter()
+            .map(|&f| {
+                let ok = match f {
+                    "band_steering" => bit(caps.wifi, 2),
+                    "airtime_fairness" => bit(caps.wifi, 5),
+                    "green_ap" => bit(caps.wifi2, 2),
+                    "led" => bit(caps.hw, 1) || bit(caps.hw, 14),
+                    "led_color" => bit(caps.hw, 1),
+                    _ => bit(caps.fw, 4),
+                };
+                (f, ok)
+            })
+            .collect(),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -256,10 +285,12 @@ mod tests {
         let device = json!({ "radio_table": [{ "radio": "ng", "radio_caps2": 31 }, { "radio": "na", "radio_caps2": 1 }] });
         assert_eq!(ssid_feature_support(&device, None), None);
         // The bits a U6-Mesh on 8.8.11 reports.
-        let inform = json!({ "fw_caps": 3892117055u64, "fw3_caps": 206, "wifi_caps": 2709438173u64, "wifi_caps2": 4206576 });
+        let inform = json!({ "fw_caps": 3892117055u64, "fw3_caps": 206, "wifi_caps": 2709438173u64, "wifi_caps2": 4206576, "hw_caps": 2050 });
         let got = ssid_feature_support(&device, Some(&inform)).unwrap();
         let missing: Vec<&str> = got.iter().filter(|(_, ok)| !ok).map(|(f, _)| *f).collect();
         assert_eq!(missing, ["wpa3_fast_roaming"]);
+        let dev: Vec<&str> = device_feature_support(&device, Some(&inform)).unwrap().iter().filter(|(_, ok)| !ok).map(|(f, _)| *f).collect();
+        assert_eq!(dev, ["airtime_fairness", "green_ap"]);
         let old = json!({ "fw_caps": 1, "fw3_caps": 0, "wifi_caps2": 0 });
         assert!(ssid_feature_support(&device, Some(&old)).unwrap().iter().all(|(f, ok)| !ok || *f == "wpa3_fast_roaming"));
     }
