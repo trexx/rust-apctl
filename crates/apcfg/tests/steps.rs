@@ -15,7 +15,7 @@
 
 mod common;
 
-use common::{AP_B, AP_U, assert_matches, load, manifest, render, state, store_meta};
+use common::{AP_B, AP_U, EXPECTED_PUSHES, assert_matches, check_expectation, load, manifest, render, state, store_meta};
 use serde_json::{Value, json};
 use wire::cfgdiff;
 
@@ -145,25 +145,8 @@ fn mac_of(ap: &str) -> &'static str {
     if ap == "B" { AP_B } else { AP_U }
 }
 
-fn names(v: &[(String, String)]) -> Vec<String> {
-    v.iter().map(|(k, _)| k.clone()).collect()
-}
-
-fn strings(v: Option<&Value>) -> Vec<String> {
-    v.and_then(Value::as_array).map(|a| a.iter().map(|s| s.as_str().unwrap().to_string()).collect()).unwrap_or_default()
-}
-
-/// The manifest's expectation for a diff, checked against the diff of our renders.
-fn check_expectation(ctx: &str, expect: &Value, d: &cfgdiff::Diff) {
-    if let Some(counts) = expect.get("counts") {
-        let want: Vec<usize> = counts.as_array().unwrap().iter().map(|n| n.as_u64().unwrap() as usize).collect();
-        assert_eq!(vec![d.added.len(), d.removed.len(), d.changed.len()], want, "{ctx}: [added, removed, changed]");
-    } else {
-        let changed: Vec<String> = d.changed.iter().map(|(k, ..)| k.clone()).collect();
-        assert_eq!(changed, strings(expect.get("changed")), "{ctx}: changed keys");
-        assert_eq!(names(&d.added), strings(expect.get("added")), "{ctx}: added keys");
-        assert_eq!(names(&d.removed), strings(expect.get("removed")), "{ctx}: removed keys");
-    }
+fn names(v: &[(String, String)]) -> Vec<&str> {
+    v.iter().map(|(k, _)| k.as_str()).collect()
 }
 
 #[test]
@@ -198,7 +181,7 @@ fn every_step_renders_like_the_capture() {
             previous.insert(ap.to_string(), out.rendered.system_cfg);
         }
     }
-    assert_eq!(checked, 22, "every push after the two baselines is checked");
+    assert_eq!(checked, EXPECTED_PUSHES, "every push after the two baselines is checked");
 }
 
 /// Step 1's baseline has no manifest expectation; check the size of what the test SSID
@@ -213,8 +196,8 @@ fn step_one_adds_the_test_ssid_on_both_bands() {
     let d = cfgdiff::diff(&before, &after);
     assert!(d.removed.is_empty() && d.changed.is_empty(), "{}", d.render("", false));
     let added = names(&d.added);
-    assert!(added.contains(&"aaa.3.ssid".to_string()) && added.contains(&"aaa.4.ssid".to_string()));
-    assert!(added.contains(&"radio.1.virtual.1.devname".to_string()));
+    assert!(added.contains(&"aaa.3.ssid") && added.contains(&"aaa.4.ssid"));
+    assert!(added.contains(&"radio.1.virtual.1.devname"));
     let push = load("2026-10-12T184539.445Z_000026_020000000001_reply-setparam.json");
     assert_eq!(after.lines().count(), push["system_cfg"].as_str().unwrap().lines().count());
     assert_eq!(after.lines().count(), 593);
@@ -237,7 +220,7 @@ fn snmp_lines_follow_sshd() {
     assert!(d.removed.is_empty() && d.changed.is_empty(), "{}", d.render("", false));
     assert_eq!(
         names(&d.added),
-        ["snmp.community", "snmp.location", "snmp.status", "snmp.user.1.name", "snmp.user.1.password", "snmp.version"].map(String::from)
+        ["snmp.community", "snmp.location", "snmp.status", "snmp.user.1.name", "snmp.user.1.password", "snmp.version"]
     );
     let lines: Vec<&str> = after.lines().collect();
     let at = |p: &str| lines.iter().position(|l| l.starts_with(p)).unwrap();

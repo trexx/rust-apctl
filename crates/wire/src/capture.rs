@@ -681,6 +681,7 @@ pub mod sample {
     use std::path::PathBuf;
 
     use etherparse::PacketBuilder;
+    use serde_json::Value;
 
     use super::Micros;
 
@@ -698,6 +699,39 @@ pub mod sample {
             return None;
         }
         Some(dir)
+    }
+
+    /// A JSON file of the capture fixtures (a decoded inform or reply, the manifest).
+    pub fn load(file: &str) -> Value {
+        let dir = fixtures().expect("capture fixtures");
+        let text = std::fs::read_to_string(dir.join(file)).unwrap_or_else(|e| panic!("{file}: {e}"));
+        serde_json::from_str(&text).unwrap_or_else(|e| panic!("{file}: {e}"))
+    }
+
+    /// The fixtures' `manifest.json`: the capture session's steps, each with the pushes
+    /// it caused and, after the baselines, what each push changed (`expect`).
+    pub fn manifest() -> Value {
+        load("manifest.json")
+    }
+
+    /// How many pushes in the manifest carry an `expect` (all but the two baselines).
+    pub const EXPECTED_PUSHES: usize = 22;
+
+    /// Checks a diff against a manifest push's `expect`: either `counts` ([added,
+    /// removed, changed]) or the keys `added`, `removed` and `changed`.
+    pub fn check_expectation(ctx: &str, expect: &Value, d: &crate::cfgdiff::Diff) {
+        if let Some(counts) = expect.get("counts") {
+            let want: Vec<usize> = counts.as_array().unwrap().iter().map(|n| n.as_u64().unwrap() as usize).collect();
+            assert_eq!(vec![d.added.len(), d.removed.len(), d.changed.len()], want, "{ctx}: [added, removed, changed]");
+            return;
+        }
+        let list = |name: &str| -> Vec<&str> { expect.get(name).and_then(Value::as_array).map(|a| a.iter().map(|s| s.as_str().unwrap()).collect()).unwrap_or_default() };
+        let changed: Vec<&str> = d.changed.iter().map(|(k, ..)| k.as_str()).collect();
+        let added: Vec<&str> = d.added.iter().map(|(k, _)| k.as_str()).collect();
+        let removed: Vec<&str> = d.removed.iter().map(|(k, _)| k.as_str()).collect();
+        assert_eq!(changed, list("changed"), "{ctx}: changed keys");
+        assert_eq!(added, list("added"), "{ctx}: added keys");
+        assert_eq!(removed, list("removed"), "{ctx}: removed keys");
     }
 
     /// The header of a legacy pcap (microsecond timestamps) of Ethernet frames.

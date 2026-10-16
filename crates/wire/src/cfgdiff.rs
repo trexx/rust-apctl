@@ -143,61 +143,34 @@ mod tests {
 #[cfg(test)]
 mod capture_fixtures {
     use super::*;
-    use crate::capture::sample::fixtures;
-    use serde_json::Value;
+    use crate::capture::sample::{EXPECTED_PUSHES, check_expectation, fixtures, load, manifest};
     use std::collections::HashMap;
-    use std::path::PathBuf;
-
-    fn dir() -> PathBuf {
-        fixtures().expect("capture fixtures")
-    }
 
     fn system_cfg(file: &str) -> String {
-        let v: Value = serde_json::from_str(&std::fs::read_to_string(dir().join(file)).unwrap()).unwrap();
+        let v = load(file);
         assert_eq!(v["_type"], "setparam", "{file}");
         v["system_cfg"].as_str().unwrap().to_string()
-    }
-
-    fn keys(v: &[(String, String)]) -> Vec<&str> {
-        v.iter().map(|(k, _)| k.as_str()).collect()
     }
 
     #[test]
     fn each_labelled_change_produces_the_observed_diff() {
         let Some(_) = fixtures() else { return };
-        let manifest: Value =
-            serde_json::from_str(&std::fs::read_to_string(dir().join("manifest.json")).unwrap()).unwrap();
         let mut previous: HashMap<String, String> = HashMap::new();
         let mut checked = 0;
-        for step in manifest["steps"].as_array().unwrap() {
+        for step in manifest()["steps"].as_array().unwrap() {
             let label = step["label"].as_str().unwrap();
             for push in step["pushes"].as_array().unwrap() {
                 let ap = push["ap"].as_str().unwrap().to_string();
                 let cfg = system_cfg(push["file"].as_str().unwrap());
                 if let Some(expect) = push.get("expect") {
                     let d = diff(previous.get(&ap).expect("baseline first"), &cfg);
-                    let ctx = format!("step {} ({label}) on AP {ap}", step["step"]);
-                    if let Some(c) = expect.get("counts") {
-                        let got = [d.added.len(), d.removed.len(), d.changed.len()];
-                        let want: Vec<usize> = c.as_array().unwrap().iter().map(|n| n.as_u64().unwrap() as usize).collect();
-                        assert_eq!(got.to_vec(), want, "{ctx}: [added, removed, changed]");
-                    } else {
-                        let list = |name: &str| -> Vec<String> {
-                            expect.get(name).and_then(Value::as_array).map(|a| {
-                                a.iter().map(|s| s.as_str().unwrap().to_string()).collect()
-                            }).unwrap_or_default()
-                        };
-                        let changed: Vec<&str> = d.changed.iter().map(|(k, ..)| k.as_str()).collect();
-                        assert_eq!(changed, list("changed"), "{ctx}: changed");
-                        assert_eq!(keys(&d.added), list("added"), "{ctx}: added");
-                        assert_eq!(keys(&d.removed), list("removed"), "{ctx}: removed");
-                    }
+                    check_expectation(&format!("step {} ({label}) on AP {ap}", step["step"]), expect, &d);
                     checked += 1;
                 }
                 previous.insert(ap, cfg);
             }
         }
-        assert_eq!(checked, 22, "every push after the two baselines is checked");
+        assert_eq!(checked, EXPECTED_PUSHES, "every push after the two baselines is checked");
     }
 
     #[test]

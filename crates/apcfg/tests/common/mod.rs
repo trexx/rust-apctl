@@ -8,30 +8,17 @@
 #![allow(dead_code)]
 
 use std::collections::{BTreeMap, HashSet};
-use std::path::PathBuf;
 
 use apcfg::{Controller, Input, Output};
 use serde_json::{Value, json};
 
-/// The capture fixtures (sanitised real captures, kept outside the repository).
-/// Tests that need them skip without them.
-pub use wire::capture::sample::fixtures;
+/// The capture fixtures (sanitised real captures, kept outside the repository), a JSON
+/// file of them, and their manifest. Tests that need them skip without them.
+#[allow(unused_imports)]
+pub use wire::capture::sample::{EXPECTED_PUSHES, check_expectation, fixtures, load, manifest};
 
 pub const AP_B: &str = "02:00:00:00:00:01";
 pub const AP_U: &str = "02:00:00:00:00:02";
-
-pub fn dir() -> PathBuf {
-    fixtures().expect("capture fixtures")
-}
-
-pub fn load(file: &str) -> Value {
-    let text = std::fs::read_to_string(dir().join(file)).unwrap_or_else(|e| panic!("{file}: {e}"));
-    serde_json::from_str(&text).unwrap()
-}
-
-pub fn manifest() -> Value {
-    load("manifest.json")
-}
 
 pub fn inform(mac: &str) -> Value {
     load(match mac {
