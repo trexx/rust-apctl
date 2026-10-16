@@ -317,7 +317,10 @@ const SYSLOG_RETRY_SECS: Ts = 300;
 impl Engine {
     pub fn new(writer: Writer, keys: Arc<KeyStore>, live: SharedLive, tx: broadcast::Sender<LiveMsg>) -> Self {
         let counters = live.read().unwrap().counters.clone();
-        Engine { writer, keys, renderer: None, live, counters, tx, radios: HashMap::new(), mcast_prev: HashMap::new(), bss_prev: HashMap::new(), logevents: Default::default(), isolated: HashMap::new(), last_prune: 0, written: Default::default(), syslog_unknown: HashMap::new() }
+        Engine {
+            writer, keys, renderer: None, live, counters, tx, radios: HashMap::new(), mcast_prev: HashMap::new(), bss_prev: HashMap::new(),
+            logevents: Default::default(), isolated: HashMap::new(), last_prune: 0, written: Default::default(), syslog_unknown: HashMap::new(),
+        }
     }
 
     /// Enables dry-run comparisons of every captured config push.
