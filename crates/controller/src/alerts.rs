@@ -401,13 +401,17 @@ async fn radio_health(store: &Arc<Store>, now: Ts) -> anyhow::Result<HashMap<(St
 /// Clients whose every connection attempt in the window failed.
 async fn failing_clients(store: &Arc<Store>, now: Ts) -> anyhow::Result<Vec<String>> {
     let store = store.clone();
-    let events = tokio::task::spawn_blocking(move || store.read(Db::Config, |c| Ok(crate::connections::load_rows(c, now - HEALTH_WINDOW, Ts::MAX, None, None)?))).await??;
-    let attempts = crate::connections::attempts(events);
-    let ok: HashSet<&str> = attempts.iter().filter(|a| a.success).map(|a| a.client.as_str()).collect();
-    let mut failing: Vec<String> = attempts.iter().filter(|a| !a.success && !ok.contains(a.client.as_str())).map(|a| a.client.clone()).collect();
-    failing.sort();
-    failing.dedup();
-    Ok(failing)
+    // Parsing the reports and pairing fixups is CPU work: off the async workers too.
+    tokio::task::spawn_blocking(move || {
+        let events = store.read(Db::Config, |c| Ok(crate::connections::load_rows(c, now - HEALTH_WINDOW, Ts::MAX, None, None, true)?))?;
+        let attempts = crate::connections::attempts(events);
+        let ok: HashSet<&str> = attempts.iter().filter(|a| a.success).map(|a| a.client.as_str()).collect();
+        let mut failing: Vec<String> = attempts.iter().filter(|a| !a.success && !ok.contains(a.client.as_str())).map(|a| a.client.clone()).collect();
+        failing.sort();
+        failing.dedup();
+        Ok(failing)
+    })
+    .await?
 }
 
 /// Alerts left open by a previous run.
