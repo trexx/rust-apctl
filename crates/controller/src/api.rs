@@ -12,6 +12,7 @@ use inform::Mac;
 use rusqlite::types::Value as Sql;
 use rusqlite::params_from_iter;
 use serde::{Deserialize, Serialize};
+use serde_json::value::RawValue;
 use serde_json::{Value, json};
 use tokio::sync::broadcast;
 
@@ -518,7 +519,7 @@ async fn import_state(State(s): State<AppState>, Json(state): Json<Value>) -> Ap
 
 /// Dry-run status: for each AP, what apctl would push now compared with the last
 /// config the other controller pushed; plus the comparisons made at each push.
-async fn dryrun(State(s): State<AppState>) -> ApiResult {
+async fn dryrun(State(s): State<AppState>) -> Result<Json<DryRunStatus>, ApiError> {
     // What each AP's render needs, copied under a short lock: the unredacted
     // config seen in this run when there is one. Only full configs count: a
     // management-only push says nothing about system_cfg.
@@ -547,12 +548,7 @@ async fn dryrun(State(s): State<AppState>) -> ApiResult {
         let mut stmt = c.prepare("SELECT ts, mac, cfgversion, matches, comparison FROM dryrun_results ORDER BY ts DESC LIMIT 100")?;
         let history = stmt
             .query_map([], |r| {
-                let comparison: String = r.get(4)?;
-                Ok(json!({
-                    "ts": r.get::<_, i64>(0)?, "mac": r.get::<_, String>(1)?, "cfgversion": r.get::<_, Option<String>>(2)?,
-                    "matches": r.get::<_, i64>(3)? != 0,
-                    "comparison": serde_json::from_str::<Value>(&comparison).unwrap_or(Value::Null),
-                }))
+                Ok(DryRunHistory { ts: r.get(0)?, mac: r.get(1)?, cfgversion: r.get(2)?, matches: r.get(3)?, comparison: raw_json(r.get(4)?) })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok((stored, history))
@@ -618,11 +614,24 @@ async fn dryrun(State(s): State<AppState>) -> ApiResult {
         devices
     })
     .await?;
-    Ok(Json(json!({
-        "settings_imported_at": imported_at,
-        "devices": devices,
-        "history": history,
-    })))
+    Ok(Json(DryRunStatus { settings_imported_at: imported_at, devices, history }))
+}
+
+/// A comparison made at a push, as stored.
+#[derive(Serialize)]
+struct DryRunHistory {
+    ts: Ts,
+    mac: String,
+    cfgversion: Option<String>,
+    matches: bool,
+    comparison: Option<Box<RawValue>>,
+}
+
+#[derive(Serialize)]
+struct DryRunStatus {
+    settings_imported_at: Option<Ts>,
+    devices: Vec<Value>,
+    history: Vec<DryRunHistory>,
 }
 
 #[derive(Deserialize)]
@@ -739,6 +748,21 @@ struct EventQuery {
     limit: Option<i64>,
 }
 
+/// A stored JSON column, passed on as stored; text that isn't JSON becomes null.
+fn raw_json(text: Option<String>) -> Option<Box<RawValue>> {
+    text.and_then(|t| RawValue::from_string(t).ok())
+}
+
+#[derive(Serialize)]
+struct EventRow {
+    id: i64,
+    ts: Ts,
+    kind: String,
+    device_mac: Option<String>,
+    client_mac: Option<String>,
+    data: Option<Box<RawValue>>,
+}
+
 /// The event kinds starting with `prefix`, read from the kind index one kind
 /// at a time (a handful of lookups, however many events there are).
 fn kinds_with_prefix(c: &rusqlite::Connection, prefix: &str) -> rusqlite::Result<Vec<String>> {
@@ -751,7 +775,7 @@ fn kinds_with_prefix(c: &rusqlite::Connection, prefix: &str) -> rusqlite::Result
     stmt.query_map((prefix, format!("{prefix}{}", char::MAX)), |r| r.get(0))?.collect()
 }
 
-async fn events(State(s): State<AppState>, Query(q): Query<EventQuery>) -> ApiResult {
+async fn events(State(s): State<AppState>, Query(q): Query<EventQuery>) -> Result<Json<Vec<EventRow>>, ApiError> {
     let mut w = Where::default();
     if let Some(d) = &q.device {
         w.and("device_mac = ?", Sql::Text(parse_mac(d)?.to_string()));
@@ -793,18 +817,13 @@ async fn events(State(s): State<AppState>, Query(q): Query<EventQuery>) -> ApiRe
         let mut stmt = c.prepare(&sql)?;
         let rows = stmt
             .query_map(params_from_iter(w.params), |r| {
-                let data: Option<String> = r.get(4)?;
-                Ok(json!({
-                    "id": r.get::<_, i64>(5)?, "ts": r.get::<_, i64>(0)?, "kind": r.get::<_, String>(1)?,
-                    "device_mac": r.get::<_, Option<String>>(2)?, "client_mac": r.get::<_, Option<String>>(3)?,
-                    "data": data.and_then(|d| serde_json::from_str::<Value>(&d).ok()),
-                }))
+                Ok(EventRow { id: r.get(5)?, ts: r.get(0)?, kind: r.get(1)?, device_mac: r.get(2)?, client_mac: r.get(3)?, data: raw_json(r.get(4)?) })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
     })
     .await?;
-    Ok(Json(Value::Array(rows)))
+    Ok(Json(rows))
 }
 
 #[derive(Deserialize)]
@@ -1039,6 +1058,7 @@ mod tests {
         assert_eq!(ts(get_json(&app, "/api/events?kind=client&device=02:00:00:00:00:02").await), vec![4, 3]);
         assert_eq!(ts(get_json(&app, "/api/events?kind=nothing").await), Vec::<i64>::new());
         assert_eq!(ts(get_json(&app, "/api/events?limit=3").await), vec![6, 5, 4]);
+        assert_eq!(get_json(&app, "/api/events?limit=1").await[0]["data"], json!({}), "the stored payload, as stored");
     }
 
     #[tokio::test]

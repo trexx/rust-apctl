@@ -24,7 +24,7 @@ rusqlite = { version = "0.40.2", features = ["bundled"] }
 russh = { version = "0.64", default-features = false, features = ["ring", "rsa"] }
 rust-embed = { version = "8.13.0", features = ["mime-guess"] }
 serde = { workspace = true, features = ["derive", "rc"] }
-serde_json.workspace = true
+serde_json = { workspace = true, features = ["raw_value"] }
 sha-crypt = "0.6.0"
 sha2 = "0.11.1"
 tar = "0.4.46"
