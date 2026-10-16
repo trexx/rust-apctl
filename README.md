@@ -95,7 +95,8 @@ host ports, and feed it a capture with `--shadow` or `--shadow-cmd`; the
 lists every option.
 
 Without `--users-file` (`APCTL_USERS_FILE`), apctl is read-only and needs no login: anyone
-who can reach port 8090 sees everything except the Wi-Fi passphrases and backup downloads.
+who can reach port 8090 sees everything except the Wi-Fi passphrases, the SNMP community
+and backup downloads.
 
 Behind a reverse proxy or ingress, list its addresses with `--trusted-proxies`
 (`APCTL_TRUSTED_PROXIES`, IPs or CIDR ranges). Only then is its `X-Forwarded-For` header

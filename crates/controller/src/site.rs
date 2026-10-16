@@ -304,15 +304,20 @@ fn ssh_keys(v: &Value) -> Result<Vec<Value>, String> {
     Ok(out)
 }
 
-/// GET /api/settings/site
+/// GET /api/settings/site. Read-only mode (no users) leaves out the SNMP
+/// community, which works as a password.
 pub async fn get_site(State(s): State<AppState>) -> Result<Json<Value>, ApiError> {
     let state = crate::api::current_state(&s)?;
-    let m = setting(&state, "mgmt");
+    Ok(Json(site_view(&state, s.active, s.auth.enabled())))
+}
+
+fn site_view(state: &Value, active: bool, secrets: bool) -> Value {
+    let m = setting(state, "mgmt");
     let mut mgmt = json!({ "has_ssh_password": m["x_ssh_password"].as_str().is_some_and(|p| !p.is_empty()) });
     for k in ["led_enabled", "outdoor_mode_enabled", "x_ssh_enabled", "x_ssh_username", "x_ssh_auth_password_enabled", "x_ssh_bind_wildcard", "x_ssh_keys"] {
         mgmt[k] = m[k].clone();
     }
-    let r = setting(&state, "rsyslogd");
+    let r = setting(state, "rsyslogd");
     let mut rsyslogd = json!({});
     for k in ["ip", "port", "debug", "netconsole_enabled", "netconsole_host", "netconsole_port"] {
         rsyslogd[k] = r[k].clone();
@@ -322,22 +327,22 @@ pub async fn get_site(State(s): State<AppState>) -> Result<Json<Value>, ApiError
         (true, true) => "controller",
         (true, false) => "server",
     });
-    let n = setting(&state, "ntp");
+    let n = setting(state, "ntp");
     let mut ntp = json!({});
     for k in ["setting_preference", "ntp_server_1", "ntp_server_2", "ntp_server_3", "ntp_server_4"] {
         ntp[k] = n[k].clone();
     }
-    let sn = setting(&state, "snmp");
+    let sn = setting(state, "snmp");
     let snmp = json!({
-        "enabled": sn["enabled"], "enabledV3": sn["enabledV3"], "community": sn["community"], "username": sn["username"],
+        "enabled": sn["enabled"], "enabledV3": sn["enabledV3"], "community": if secrets { sn["community"].clone() } else { Value::Null }, "username": sn["username"],
         "has_v3_password": sn["x_password"].as_str().is_some_and(|p| !p.is_empty()),
     });
-    Ok(Json(json!({
-        "active": s.active, "mgmt": mgmt, "rsyslogd": rsyslogd, "ntp": ntp, "snmp": snmp,
-        "country": country(&state), "timezone": setting(&state, "locale")["timezone"],
+    json!({
+        "active": active, "mgmt": mgmt, "rsyslogd": rsyslogd, "ntp": ntp, "snmp": snmp,
+        "country": country(state), "timezone": setting(state, "locale")["timezone"],
         "countries": COUNTRY_NAMES.iter().map(|(c, n)| json!({ "code": c, "name": n })).collect::<Vec<_>>(),
         "timezones": apcfg::tz::names().collect::<Vec<_>>(),
-    })))
+    })
 }
 
 /// PUT /api/settings/site {patch} (`?preview=true` to see the effect)
@@ -436,6 +441,11 @@ mod tests {
         assert!(edit(&mut s, json!({ "snmp": { "enabledV3": true, "username": "mon", "x_password": "short" } })).is_err());
         let what = edit(&mut s, json!({ "snmp": { "enabledV3": true, "username": "mon", "x_password": "v3-secret-pw" } })).unwrap();
         assert!(what.contains("SNMPv3 password") && !what.contains("v3-secret"), "{what}");
+        // Shown to logged-in users; never the v3 password, and nothing in read-only mode.
+        assert_eq!(site_view(&s, true, true)["snmp"]["community"], "c0mmunity");
+        assert_eq!(site_view(&s, true, true)["snmp"]["has_v3_password"], true);
+        assert!(site_view(&s, true, false)["snmp"]["community"].is_null());
+        assert!(!site_view(&s, true, true).to_string().contains("v3-secret"));
     }
 
     #[test]
