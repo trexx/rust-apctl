@@ -287,7 +287,13 @@ fn from_event(kind: EventKind, device: Option<&str>, data: &Value, ap_name: &dyn
     if !alertable(kind) {
         return None;
     }
-    let dev = device.unwrap_or_default();
+    // Every alert but a suspicious network's is about an AP: without one (a
+    // crash line from a sender apctl can't name) it makes none.
+    let dev = match device {
+        Some(d) => d,
+        None if kind == EventKind::NetworkThreat => "",
+        None => return None,
+    };
     let lookup = || ap_name(dev);
     let name = Name(&lookup);
     let s = |k: &str| data[k].as_str().unwrap_or_default().to_string();
@@ -758,6 +764,11 @@ mod tests {
         for &kind in EventKind::ALL {
             assert_eq!(from_event(kind, Some("aa"), &json!({ "severity": "high" }), &name).is_some(), alertable(kind), "{kind}");
         }
+        // An AP's alert needs the AP: a crash line from anyone else makes none.
+        let panic = json!({ "kind": "kernel panic", "lines": ["Kernel panic"] });
+        assert!(from_event(EventKind::ApCrash, None, &panic, &name).is_none());
+        assert_eq!(from_event(EventKind::ApCrash, Some("aa"), &panic, &name).unwrap().title, "Garage: kernel panic");
+        assert!(from_event(EventKind::NetworkThreat, None, &json!({ "severity": "high" }), &name).is_some());
     }
 
     fn watcher() -> (Watcher, broadcast::Receiver<LiveMsg>) {

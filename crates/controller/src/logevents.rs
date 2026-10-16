@@ -26,6 +26,14 @@ use crate::model::Ts;
 const NOISE_FLOOR: i64 = -95;
 /// How long a crash capture collects lines before it is reported.
 const CRASH_WINDOW: Ts = 180;
+/// After a crash is reported, another fault of the same AP within this long
+/// starts no capture: a crash loop is one report per period, not one per boot.
+const CRASH_COOLDOWN: Ts = 600;
+/// At most this many crash captures at once (each is one AP's).
+const MAX_CRASHES: usize = 64;
+/// At most this many lines, and this much text, kept per crash capture.
+const CRASH_LINES: usize = 200;
+const CRASH_BYTES: usize = 64 * 1024;
 /// At most this many entries in each map below: anyone can send syslog lines,
 /// so made-up clients and senders must not grow them without bound.
 const MAX_TRACKED: usize = 10_000;
@@ -49,11 +57,61 @@ struct Steering {
     vap: Option<String>,
 }
 
+/// What kind of fault a crash capture started with (or ended in).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CrashKind {
+    Panic,
+    Oops,
+    Segfault,
+    MemoryFault,
+}
+
+impl CrashKind {
+    /// As the event's data names it.
+    fn as_str(self) -> &'static str {
+        match self {
+            CrashKind::Panic => "kernel panic",
+            CrashKind::Oops => "kernel oops",
+            CrashKind::Segfault => "process crashed (segmentation fault)",
+            CrashKind::MemoryFault => "process crashed (memory fault)",
+        }
+    }
+}
+
+/// The fault a kernel line reports, if any, with the process it killed.
+fn fault(msg: &str) -> Option<(CrashKind, Option<String>)> {
+    if msg.contains("---[ end Kernel panic") {
+        // The panic's closing line, after the panic itself was reported.
+        None
+    } else if msg.contains("Kernel panic") {
+        Some((CrashKind::Panic, None))
+    } else if msg.contains("Oops:") || msg.contains("Oops[#") || msg.contains("Internal error:") {
+        Some((CrashKind::Oops, None))
+    } else if let Some(p) = msg.split("sending SIGSEGV to ").nth(1) {
+        Some((CrashKind::Segfault, Some(p.split_whitespace().next().unwrap_or(p).trim_end_matches(':').to_string())))
+    } else if msg.contains("unhandled level 2 translation fault") {
+        Some((CrashKind::MemoryFault, msg.split_whitespace().find(|w| w.contains('[')).map(|w| w.to_string())))
+    } else {
+        None
+    }
+}
+
 struct Crash {
     started: Ts,
-    kind: &'static str,
+    kind: CrashKind,
     process: Option<String>,
     lines: Vec<String>,
+    /// The size of `lines`, against [`CRASH_BYTES`].
+    bytes: usize,
+}
+
+impl Crash {
+    fn push(&mut self, line: String) {
+        if self.lines.len() < CRASH_LINES && self.bytes + line.len() <= CRASH_BYTES {
+            self.bytes += line.len();
+            self.lines.push(line);
+        }
+    }
 }
 
 /// Who sent a line: the AP, else the address of a sender apctl can't name.
@@ -74,8 +132,10 @@ pub struct LogEvents {
     recent: HashMap<(EventKind, Mac, i64), Ts>,
     /// Current experience problems per client, and when they were reported.
     anomalies: HashMap<Mac, (String, Ts)>,
-    /// Crash captures in progress, by sender.
-    crashes: HashMap<Source, (Option<Mac>, Crash)>,
+    /// Crash captures in progress, by AP.
+    crashes: HashMap<Mac, Crash>,
+    /// When each AP's last crash was reported, for [`CRASH_COOLDOWN`].
+    crash_reported: HashMap<Mac, Ts>,
 }
 
 /// Inserts unless the map is full (a key already there is always replaced).
@@ -137,41 +197,16 @@ impl LogEvents {
         // for a line that needs it.
         let dev_key = || line.device_mac.map_or_else(|| Source::Address(line.src_ip.clone()), Source::Device);
 
-        // Crash capture: collect everything the device says for a while after a
-        // fault (up to 200 lines), while its other events are still reported.
-        let kernel = prog == "kernel" || line.facility == Some(0);
-        let fault = if !kernel {
-            None
-        } else if msg.contains("Kernel panic") {
-            Some(("kernel panic", None))
-        } else if msg.contains("Oops:") || msg.contains("Oops[#") || msg.contains("Internal error:") {
-            Some(("kernel oops", None))
-        } else if let Some(p) = msg.split("sending SIGSEGV to ").nth(1) {
-            Some(("process crashed (segmentation fault)", Some(p.split_whitespace().next().unwrap_or(p).trim_end_matches(':').to_string())))
-        } else if msg.contains("unhandled level 2 translation fault") {
-            Some(("process crashed (memory fault)", msg.split_whitespace().find(|w| w.contains('[')).map(|w| w.to_string())))
-        } else {
-            None
-        };
-        let is_fault = fault.is_some();
-        if is_fault || !self.crashes.is_empty() {
-            let key = dev_key();
-            if let Some((_, c)) = self.crashes.get_mut(&key) {
-                if c.lines.len() < 200 {
-                    c.lines.push(format!("{prog}: {msg}"));
-                }
-                if matches!(fault, Some(("kernel panic", _))) {
-                    c.kind = "kernel panic";
-                    out.extend(self.flush(&key));
-                }
-            } else if let Some((kind, process)) = fault {
-                let crash = Crash { started: line.ts, kind, process, lines: vec![format!("{prog}: {msg}")] };
-                if bounded(&mut self.crashes, key.clone(), (line.device_mac, crash)) && kind == "kernel panic" {
-                    out.extend(self.flush(&key));
-                }
-            }
+        // Crashes are followed only for a sender known to be one of our APs, as
+        // the official controller does: anyone can send a line saying "Kernel panic".
+        if let Some(dev) = line.device_mac
+            && self.crash(dev, line, &mut out)
+        {
+            return out;
         }
-        if is_fault {
+        // A line without a priority is netconsole's: the kernel's own output,
+        // which syslog carries too. Only crashes are looked for in it.
+        if line.facility.is_none() {
             return out;
         }
 
@@ -274,22 +309,56 @@ impl LogEvents {
         out
     }
 
-    fn flush(&mut self, key: &Source) -> Option<Found> {
-        let (device, c) = self.crashes.remove(key)?;
-        Some(Found { kind: EventKind::ApCrash, device, client: None, data: json!({ "kind": c.kind, "process": c.process, "source": "syslog", "lines": c.lines }) })
+    /// Crash capture: everything the AP says for a while after a fault, while
+    /// its other events are still reported; a panic is reported at once.
+    /// Returns whether the line was a fault.
+    fn crash(&mut self, dev: Mac, line: &LogLine, out: &mut Vec<Found>) -> bool {
+        let (msg, prog) = (line.msg.as_str(), line.program.as_deref());
+        // Netconsole sends the kernel's lines with no priority.
+        let kernel = prog == Some("kernel") || matches!(line.facility, Some(0) | None);
+        let fault = if kernel { fault(msg) } else { None };
+        let is_fault = fault.is_some();
+        let text = || prog.map_or_else(|| msg.to_string(), |p| format!("{p}: {msg}"));
+        if let Some(c) = self.crashes.get_mut(&dev) {
+            c.push(text());
+            if let Some((CrashKind::Panic, _)) = fault {
+                c.kind = CrashKind::Panic;
+                out.extend(self.flush(dev, line.ts));
+            }
+        } else if let Some((kind, process)) = fault
+            && self.crash_reported.get(&dev).is_none_or(|t| !(0..CRASH_COOLDOWN).contains(&(line.ts - t)))
+            && self.crashes.len() < MAX_CRASHES
+        {
+            let mut crash = Crash { started: line.ts, kind, process, lines: Vec::new(), bytes: 0 };
+            crash.push(text());
+            self.crashes.insert(dev, crash);
+            if kind == CrashKind::Panic {
+                out.extend(self.flush(dev, line.ts));
+            }
+        }
+        is_fault
+    }
+
+    fn flush(&mut self, dev: Mac, now: Ts) -> Option<Found> {
+        let c = self.crashes.remove(&dev)?;
+        self.crash_reported.insert(dev, now);
+        let data = json!({ "kind": c.kind.as_str(), "process": c.process, "source": "syslog", "lines": c.lines });
+        Some(Found { kind: EventKind::ApCrash, device: Some(dev), client: None, data })
     }
 
     /// Reports crash captures that have collected long enough.
     pub fn tick(&mut self, now: Ts) -> Vec<Found> {
-        let due: Vec<Source> = self.crashes.iter().filter(|(_, (_, c))| now - c.started >= CRASH_WINDOW).map(|(k, _)| k.clone()).collect();
-        let mut out: Vec<Found> = due.iter().filter_map(|k| self.flush(k)).collect();
+        let due: Vec<Mac> = self.crashes.iter().filter(|(_, c)| now - c.started >= CRASH_WINDOW).map(|(k, _)| *k).collect();
+        let mut out: Vec<Found> = due.into_iter().filter_map(|k| self.flush(k, now)).collect();
+        self.crash_reported.retain(|_, t| (0..CRASH_COOLDOWN).contains(&(now - *t)));
         // Forget old de-duplication and steering state.
         self.recent.retain(|_, t| now - *t < 3600);
         self.steering.retain(|_, s| now - s.ts < 300);
         let steering = &self.steering;
         self.steering_by_device.retain(|_, c| steering.contains_key(c));
         self.anomalies.retain(|_, (_, t)| now - *t < 3 * 3600);
-        out.sort_by_key(|f| f.kind.as_str());
+        // Every one is a crash: in AP order rather than the map's.
+        out.sort_by_key(|f| f.device);
         out
     }
 }
@@ -300,8 +369,15 @@ mod tests {
 
     const AP: &str = "78:45:58:3c:52:bc";
 
+    /// A syslog line from the AP: the kernel's with facility 0, the rest as user programs'.
     fn line(ts: Ts, prog: &str, msg: &str) -> LogLine {
-        LogLine { ts, device_mac: AP.parse().ok(), src_ip: "192.168.1.6".into(), facility: None, severity: Some(6), program: Some(prog.into()), msg: msg.into() }
+        let facility = Some(if prog == "kernel" { 0 } else { 1 });
+        LogLine { ts, device_mac: AP.parse().ok(), src_ip: "192.168.1.6".into(), facility, severity: Some(6), program: Some(prog.into()), msg: msg.into() }
+    }
+
+    /// A netconsole line from the AP: no priority, and the kernel's text as it is.
+    fn netconsole(ts: Ts, raw: &str) -> LogLine {
+        crate::syslog::parse(ts, "192.168.1.6".into(), AP.parse().ok(), raw)
     }
 
     #[test]
@@ -358,9 +434,13 @@ mod tests {
         assert_eq!(f.len(), 1);
         assert_eq!((f[0].kind, f[0].data["process"].as_str()), (EventKind::ApCrash, Some("mcad")));
         assert_eq!(f[0].data["lines"].as_array().map(Vec::len), Some(2));
-        // A kernel panic is reported at once.
-        let f = l.feed(&line(300, "kernel", "Kernel panic - not syncing: Fatal exception"));
+        // Another crash within 10 minutes of the report is not reported.
+        assert!(l.feed(&line(300, "kernel", "Kernel panic - not syncing: Fatal exception")).is_empty());
+        assert!(l.tick(700).is_empty());
+        // After that, a kernel panic is reported at once.
+        let f = l.feed(&line(800, "kernel", "Kernel panic - not syncing: Fatal exception"));
         assert_eq!(f[0].data["kind"], "kernel panic");
+        assert_eq!(f[0].data["lines"][0], "kernel: Kernel panic - not syncing: Fatal exception");
         // A wrong password, once per 10 minutes per client.
         let f = l.feed(&line(500, "hostapd", "wifi1ap0: AP-STA-POSSIBLE-PSK-MISMATCH 0e:00:00:00:00:02"));
         assert_eq!((f[0].kind, f[0].data["vap"].as_str()), (EventKind::ClientWrongPassword, Some("wifi1ap0")));
@@ -399,6 +479,62 @@ mod tests {
         assert!(l.tick(1000).is_empty());
         assert!(l.feed(&line(10, "kernel", "Oops[#1]:")).is_empty());
         assert_eq!(l.tick(1000)[0].data["kind"], "kernel oops");
+    }
+
+    #[test]
+    fn netconsole_crashes_are_found() {
+        let mut l = LogEvents::default();
+        // The kernel's lines as netconsole sends them: no priority, no program.
+        assert!(l.feed(&netconsole(0, "[ 1234.567890] Internal error: Oops: 17 [#1] SMP ARM")).is_empty());
+        assert!(l.feed(&netconsole(0, "[ 1234.567900] CPU: 1 PID: 0 Comm: swapper/1 Not tainted")).is_empty());
+        let f = l.feed(&netconsole(1, "[ 1234.568000] Kernel panic - not syncing: Fatal exception in interrupt"));
+        assert_eq!((f.len(), f[0].data["kind"].as_str(), f[0].device), (1, Some("kernel panic"), AP.parse().ok()));
+        let lines: Vec<&str> = f[0].data["lines"].as_array().unwrap().iter().filter_map(Value::as_str).collect();
+        assert_eq!(lines[0], "[ 1234.567890] Internal error: Oops: 17 [#1] SMP ARM");
+        assert_eq!(lines[1], "[ 1234.567900] CPU: 1 PID: 0 Comm: swapper/1 Not tainted");
+        // The panic's closing line is not a second crash.
+        assert!(l.feed(&netconsole(1, "[ 1234.568100] ---[ end Kernel panic - not syncing: Fatal exception in interrupt ]---")).is_empty());
+        assert!(l.tick(1000).is_empty());
+        // A process killed by a fault, without printk times.
+        let f = l.feed(&netconsole(2000, "do_page_fault(): sending SIGSEGV to hostapd for invalid read access from 00000000"));
+        assert!(f.is_empty());
+        assert_eq!(l.tick(2200)[0].data["process"], "hostapd");
+        // Netconsole lines make no other events (syslog carries the same lines).
+        assert!(l.feed(&netconsole(3000, "wlan: [0:I:ANY] [UNSPECIFIED] vap-0(wifi1ap1):BTM: Received response from [6c:ac:c2:00:00:01](len = 5): dialog_token 1, status 7")).is_empty());
+    }
+
+    #[test]
+    fn crashes_only_from_our_aps() {
+        let mut l = LogEvents::default();
+        let mut stranger = line(0, "kernel", "Kernel panic - not syncing: Fatal exception");
+        stranger.device_mac = None;
+        assert!(l.feed(&stranger).is_empty());
+        stranger.facility = None;
+        assert!(l.feed(&stranger).is_empty());
+        assert!(l.tick(1000).is_empty() && l.crashes.is_empty());
+    }
+
+    #[test]
+    fn crash_captures_are_bounded() {
+        let mut l = LogEvents::default();
+        // At most so much text per capture.
+        assert!(l.feed(&line(0, "kernel", "Internal error: Oops: 17 [#1] SMP ARM")).is_empty());
+        let long = "x".repeat(8000);
+        for _ in 0..100 {
+            l.feed(&line(1, "kernel", &long));
+        }
+        let c = &l.crashes[&AP.parse::<Mac>().unwrap()];
+        assert!(c.bytes <= CRASH_BYTES && c.lines.len() < 10, "{} lines", c.lines.len());
+        // At most so many captures at once, reported in AP order.
+        for i in 0..MAX_CRASHES + 10 {
+            let mut f = line(0, "kernel", "Internal error: Oops: 17 [#1] SMP ARM");
+            f.device_mac = format!("02:00:00:00:{:02x}:{:02x}", i >> 8, i & 0xff).parse().ok();
+            l.feed(&f);
+        }
+        assert_eq!(l.crashes.len(), MAX_CRASHES);
+        let f = l.tick(1000);
+        assert_eq!(f.len(), MAX_CRASHES);
+        assert!(f.windows(2).all(|w| w[0].device < w[1].device));
     }
 
     #[test]
