@@ -48,11 +48,8 @@ pub fn next(live: &mut Live, mac: &Mac) -> Option<Value> {
 
 /// Sets fields on a client's entry in the settings, creating it if needed.
 pub fn edit_client(state: &mut Value, mac: &str, fields: &[(&str, Value)]) -> Result<(), String> {
-    let site = state["devices"].as_array().and_then(|d| d.iter().find_map(|d| d["site_id"].as_str().map(str::to_string)));
-    if !state["clients"].is_array() {
-        state["clients"] = json!([]);
-    }
-    let list = state["clients"].as_array_mut().ok_or("settings have no client list")?;
+    let site = crate::settings::site_id(state);
+    let list = crate::settings::array_mut(state, "clients");
     let entry = match list.iter().position(|c| same_mac(c, mac)) {
         Some(i) => &mut list[i],
         None => {

@@ -28,6 +28,7 @@ use wire::keys::KeyStore;
 use crate::api::{ApiError, AppState};
 use crate::engine::{Input, Live};
 use crate::model::Ts;
+use crate::settings::random_hex;
 use crate::store;
 
 /// How long an AP has to come back with its new key.
@@ -143,12 +144,6 @@ pub fn expire(live: &mut Live, now: Ts) {
     live.adoption.adopting.retain(|_, t| now - *t < ADOPT_TIMEOUT);
 }
 
-fn random_hex(bytes: usize) -> String {
-    let mut b = vec![0u8; bytes];
-    getrandom::fill(&mut b).expect("system random source");
-    hex::encode(b)
-}
-
 /// The radio settings of a new AP, from the radios its inform lists: auto
 /// channel, the site's default width, auto power.
 pub fn radio_table(state: &Value, payload: &Value) -> Vec<Value> {
@@ -215,10 +210,7 @@ pub fn adopt_device(state: &mut Value, mac: &Mac, payload: &Value) -> Result<Str
         return Ok(format!("re-adopting {mac}"));
     }
     let d = new_device(state, payload, mac);
-    if !state["devices"].is_array() {
-        state["devices"] = json!([]);
-    }
-    state["devices"].as_array_mut().unwrap().push(d);
+    crate::settings::array_mut(state, "devices").push(d);
     Ok(format!("adopted AP {} ({mac})", payload["hostname"].as_str().or(payload["model"].as_str()).unwrap_or("new")))
 }
 

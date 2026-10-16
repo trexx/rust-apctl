@@ -21,6 +21,7 @@ use std::time::Duration;
 use axum::Json;
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
+use rusqlite::OptionalExtension;
 use rusqlite::types::Value as Sql;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -102,13 +103,35 @@ pub fn compare(a: &str, b: &str) -> std::cmp::Ordering {
 }
 
 /// Where an AP stands against the release feed.
-pub fn status(current: Option<&str>, release: Option<&Release>, required: Option<&str>) -> &'static str {
-    let (Some(cur), Some(rel)) = (current, release) else { return "unknown" };
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Status {
+    UpdateAvailable,
+    UpToDate,
+    /// Newer than the release (early access).
+    Ahead,
+    Unknown,
+}
+
+impl Status {
+    /// As the API names it.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Status::UpdateAvailable => "update_available",
+            Status::UpToDate => "up_to_date",
+            Status::Ahead => "ahead",
+            Status::Unknown => "unknown",
+        }
+    }
+}
+
+pub fn status(current: Option<&str>, release: Option<&Release>, required: Option<&str>) -> Status {
+    let (Some(cur), Some(rel)) = (current, release) else { return Status::Unknown };
     match compare(&rel.version, cur) {
-        std::cmp::Ordering::Greater if required.is_none_or(|r| compare(&rel.version, r).is_ge()) => "update_available",
-        std::cmp::Ordering::Greater => "unknown",
-        std::cmp::Ordering::Equal => "up_to_date",
-        std::cmp::Ordering::Less => "ahead",
+        std::cmp::Ordering::Greater if required.is_none_or(|r| compare(&rel.version, r).is_ge()) => Status::UpdateAvailable,
+        std::cmp::Ordering::Greater => Status::Unknown,
+        std::cmp::Ordering::Equal => Status::UpToDate,
+        std::cmp::Ordering::Less => Status::Ahead,
     }
 }
 
@@ -312,7 +335,7 @@ fn releases(store: &Store) -> anyhow::Result<(Vec<Release>, Option<Ts>, Option<S
                 Ok(Release { platform: r.get(0)?, version: r.get(1)?, url: r.get(2)?, md5: r.get(3)?, sha256: r.get(4)?, size: r.get(5)?, created: r.get(6)? })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
-        let (ts, err) = c.query_row("SELECT ts, error FROM firmware_check WHERE id = 1", [], |r| Ok((r.get(0)?, r.get(1)?))).unwrap_or((None, None));
+        let (ts, err) = c.query_row("SELECT ts, error FROM firmware_check WHERE id = 1", [], |r| Ok((r.get(0)?, r.get(1)?))).optional()?.unwrap_or((None, None));
         Ok((list, ts, err))
     })
 }
@@ -343,7 +366,7 @@ fn aps(s: &AppState) -> Vec<ApInfo> {
                 version: d.snapshot.ap.version.clone(),
                 required: raw.and_then(|r| r["required_version"].as_str().map(str::to_string)),
                 online: d.online,
-                mesh: d.snapshot.uplink.as_ref().is_some_and(|u| !u.ifname.starts_with("eth")),
+                mesh: raw.is_some_and(|r| crate::settings::uplink(r).is_wireless()),
             }
         })
         .collect()
@@ -364,7 +387,7 @@ pub async fn index(State(s): State<AppState>) -> Result<Json<Value>, ApiError> {
             })
         })
         .collect();
-    let jobs = serde_json::to_value(&s.live.read().unwrap().firmware).unwrap_or_default();
+    let jobs = serde_json::to_value(&s.live.read().unwrap().firmware).map_err(|e| ApiError::internal(e.to_string()))?;
     Ok(Json(json!({ "checked": checked, "error": error, "channel": "release", "active": s.active, "aps": list, "jobs": jobs })))
 }
 
@@ -372,22 +395,14 @@ pub async fn index(State(s): State<AppState>) -> Result<Json<Value>, ApiError> {
 pub async fn check_now(State(s): State<AppState>, headers: HeaderMap) -> Result<Json<Value>, ApiError> {
     crate::api::check_csrf(&headers)?;
     let w = s.writer.clone();
-    let started = store::now_ts();
     let n = tokio::task::spawn_blocking(move || check(&w))
         .await?
         .map_err(|e| ApiError(StatusCode::BAD_GATEWAY, format!("the firmware feed could not be read: {e:#}")))?;
-    // The writer commits about once a second: wait (a few seconds at most) for
-    // this check, written last, so that the page's next read shows the new releases.
-    for _ in 0..30 {
-        let store = s.store.clone();
-        let checked = tokio::task::spawn_blocking(move || store.read(Db::Config, |c| Ok(c.query_row("SELECT ts FROM firmware_check WHERE id = 1", [], |r| r.get::<_, Ts>(0))?)))
-            .await
-            .ok()
-            .and_then(Result::ok);
-        if checked.is_some_and(|t| t >= started) {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
+    // The writer commits about once a second: have it commit this check now (waiting
+    // a few seconds at most), so that the page's next read shows the new releases.
+    let w = s.writer.clone();
+    if !tokio::task::spawn_blocking(move || w.flush(Duration::from_secs(5))).await? {
+        tracing::warn!("the firmware check was not stored within five seconds");
     }
     Ok(Json(json!({ "ok": true, "platforms": n })))
 }
@@ -412,7 +427,7 @@ pub async fn upgrade(State(s): State<AppState>, headers: HeaderMap, Json(b): Jso
     for a in chosen {
         let rel = a.model.as_deref().map(platform_for).and_then(|p| rels.iter().find(|r| r.platform == p).cloned());
         match (status(a.version.as_deref(), rel.as_ref(), a.required.as_deref()), rel, a.online) {
-            ("update_available", Some(r), true) => jobs.push(Job {
+            (Status::UpdateAvailable, Some(r), true) => jobs.push(Job {
                 mac: a.mac,
                 name: a.name,
                 from: a.version,
@@ -425,7 +440,7 @@ pub async fn upgrade(State(s): State<AppState>, headers: HeaderMap, Json(b): Jso
                 sent_at: None,
                 expires: None,
             }),
-            (st, _, online) => skipped.push(json!({ "mac": a.mac, "why": if online { st } else { "offline" } })),
+            (st, _, online) => skipped.push(json!({ "mac": a.mac, "why": if online { st.as_str() } else { "offline" } })),
         }
     }
     let n = jobs.len();
@@ -518,12 +533,13 @@ mod tests {
     fn never_offers_a_downgrade() {
         let rel = Release { platform: "U6M".into(), version: "6.8.2.15592".into(), url: "u".into(), md5: None, sha256: None, size: None, created: None };
         // The user's APs run early-access 8.8.11: ahead of release, nothing offered.
-        assert_eq!(status(Some("8.8.11.20161"), Some(&rel), Some("6.2.49")), "ahead");
-        assert_eq!(status(Some("6.8.2.15592"), Some(&rel), None), "up_to_date");
-        assert_eq!(status(Some("6.7.0.1"), Some(&rel), None), "update_available");
+        assert_eq!(status(Some("8.8.11.20161"), Some(&rel), Some("6.2.49")), Status::Ahead);
+        assert_eq!(status(Some("6.8.2.15592"), Some(&rel), None), Status::UpToDate);
+        assert_eq!(status(Some("6.7.0.1"), Some(&rel), None), Status::UpdateAvailable);
         // A release below what the AP needs is not offered.
-        assert_eq!(status(Some("6.7.0.1"), Some(&rel), Some("7.0.0")), "unknown");
-        assert_eq!(status(Some("6.7.0.1"), None, None), "unknown");
+        assert_eq!(status(Some("6.7.0.1"), Some(&rel), Some("7.0.0")), Status::Unknown);
+        assert_eq!(status(Some("6.7.0.1"), None, None), Status::Unknown);
+        assert_eq!((json!(Status::UpdateAvailable), Status::UpToDate.as_str()), (json!("update_available"), "up_to_date"), "named as the UI expects");
     }
 
     /// A test AP's MAC, by a one-hex-digit name.

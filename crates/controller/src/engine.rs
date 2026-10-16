@@ -307,8 +307,10 @@ pub struct Engine {
     last_prune: Ts,
     written: Written,
     /// Syslog hash_ids that none of the keys opened, and when that was tried.
-    /// The keys are fixed at start (`--keys`), so only time clears an entry.
+    /// Time or new settings (which may hold new keys) clear an entry.
     syslog_unknown: HashMap<String, Ts>,
+    /// Where alert-worthy events go: the alert watcher's own channel.
+    alerts: Option<crate::alerts::Sink>,
 }
 
 /// How long a syslog hash_id no key opened is left untried.
@@ -320,7 +322,13 @@ impl Engine {
         Engine {
             writer, keys, renderer: None, live, counters, tx, radios: HashMap::new(), mcast_prev: HashMap::new(), bss_prev: HashMap::new(),
             logevents: Default::default(), isolated: HashMap::new(), last_prune: 0, written: Default::default(), syslog_unknown: HashMap::new(),
+            alerts: None,
         }
+    }
+
+    /// Sends alert-worthy events to the alert watcher.
+    pub fn set_alerts(&mut self, sink: crate::alerts::Sink) {
+        self.alerts = Some(sink);
     }
 
     /// Enables dry-run comparisons of every captured config push.
@@ -465,6 +473,9 @@ impl Engine {
                 Sql::Text(ev.data.to_string()),
             ],
         );
+        if let Some(a) = &self.alerts {
+            a.offer(&ev);
+        }
         let _ = self.tx.send(LiveMsg::Event(ev));
     }
 

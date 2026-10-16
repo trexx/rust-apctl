@@ -18,7 +18,7 @@
 //!   it a roam or the client was back within a second; 802.11r ("ft") and the
 //!   AP's roaming triggers (minimum RSSI, roaming assistant) are recorded.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use axum::Json;
 use axum::extract::{Query, State};
@@ -32,6 +32,89 @@ use crate::insights::{RangeQuery, window};
 use crate::model::Ts;
 use crate::store::Db;
 
+/// One field of a notification, as the AP sent it.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Field {
+    Null,
+    Int(i64),
+    Float(f64),
+    Str(String),
+    /// Anything else (true/false, a list, an object), kept for comparisons only.
+    Other(Value),
+}
+
+impl<'de> Deserialize<'de> for Field {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Field, D::Error> {
+        Ok(match Value::deserialize(d)? {
+            Value::Null => Field::Null,
+            Value::Number(n) => n.as_i64().map_or_else(|| Field::Float(n.as_f64().unwrap_or(f64::NAN)), Field::Int),
+            Value::String(s) => Field::Str(s),
+            v => Field::Other(v),
+        })
+    }
+}
+
+impl Field {
+    /// A number, sent as one or as a string.
+    fn num(&self) -> Option<f64> {
+        match self {
+            Field::Int(i) => Some(*i as f64),
+            Field::Float(f) => Some(*f),
+            Field::Str(s) => s.parse().ok(),
+            _ => None,
+        }
+    }
+}
+
+/// A present field, even `null` (`None` is for an absent one).
+fn present<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<Field>, D::Error> {
+    Field::deserialize(d).map(Some)
+}
+
+fn num(f: &Option<Field>) -> Option<f64> {
+    f.as_ref().and_then(Field::num)
+}
+
+fn text(f: &Option<Field>) -> Option<&str> {
+    match f {
+        Some(Field::Str(s)) => Some(s),
+        _ => None,
+    }
+}
+
+fn int(f: &Option<Field>) -> Option<i64> {
+    match f {
+        Some(Field::Int(i)) => Some(*i),
+        _ => None,
+    }
+}
+
+/// The fields of a connection-tracking report apctl reads, each parsed once
+/// (`None`: not in the report), and how a fixup's fields update a failure's.
+macro_rules! detail {
+    ($($f:ident),* $(,)?) => {
+        #[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+        pub struct ConnDetail {
+            $(#[serde(default, deserialize_with = "present")] pub $f: Option<Field>,)*
+        }
+
+        impl ConnDetail {
+            /// Takes every field `other` has.
+            fn merge(&mut self, other: &ConnDetail) {
+                $(if other.$f.is_some() {
+                    self.$f.clone_from(&other.$f);
+                })*
+            }
+        }
+    };
+}
+
+detail!(
+    event_id, ip_assign_type, dns_resp_seen, traffic_delta, dns_responses, assoc_failures, auth_failures, wpa_auth_failures, radius_auth_status, ip_failures,
+    dns_timeouts, traffic_failures, assoc_delta, wpa_auth_delta, radius_auth_delta, auth_delta, ip_delta, auth_rssi, avg_rssi, x_channel, x_bw, sta_dc_reason,
+    assoc_status, auth_algo,
+);
+
 /// One connection-tracking notification from an AP.
 #[derive(Debug, Clone)]
 pub struct ConnEvent {
@@ -42,54 +125,52 @@ pub struct ConnEvent {
     pub essid: Option<String>,
     pub radio: Option<String>,
     pub event_type: String,
-    pub n: Value,
+    pub n: ConnDetail,
 }
 
 /// Connection stages in the order a client passes them.
 pub const STAGES: [&str; 6] = ["association", "authentication", "dhcp", "dns", "traffic", "success"];
 
-fn num_of(n: &Value, k: &str) -> Option<f64> {
-    n[k].as_f64().or_else(|| n[k].as_str().and_then(|v| v.parse().ok()))
-}
-
 /// Failure counters present in a report, as (stage 1-5, label).
-fn failures(n: &Value) -> Vec<(usize, &'static str)> {
-    let pos = |k: &str| num_of(n, k).is_some_and(|v| v > 0.0);
-    let is = |k: &str, v: &str| n[k].as_str() == Some(v);
+fn failures(n: &ConnDetail) -> Vec<(usize, &'static str)> {
+    let pos = |f: &Option<Field>| num(f).is_some_and(|v| v > 0.0);
     let mut out = Vec::new();
-    if pos("assoc_failures") {
+    if pos(&n.assoc_failures) {
         out.push((1, "Association"));
     }
-    if pos("auth_failures") {
+    if pos(&n.auth_failures) {
         out.push((2, "Authentication"));
     }
-    if pos("wpa_auth_failures") {
+    if pos(&n.wpa_auth_failures) {
         out.push((2, "WPA authentication"));
     }
-    if is("radius_auth_status", "failure") {
+    if text(&n.radius_auth_status) == Some("failure") {
         out.push((2, "RADIUS authentication"));
     }
-    if pos("ip_failures") {
+    if pos(&n.ip_failures) {
         out.push((3, "DHCP timeout"));
     }
-    if pos("dns_timeouts") {
+    if pos(&n.dns_timeouts) {
         out.push((4, "DNS timeout"));
     }
-    if is("dns_resp_seen", "no") {
+    if text(&n.dns_resp_seen) == Some("no") {
         out.push((4, "DNS response not seen"));
     }
-    if pos("traffic_failures") {
+    if pos(&n.traffic_failures) {
         out.push((5, "Traffic failure"));
     }
     out
 }
 
-fn succeeded(event_type: &str, n: &Value) -> bool {
-    let pos = |k: &str| num_of(n, k).is_some_and(|v| v > 0.0);
+/// A soft failure that kept its IP by roaming.
+fn roamed(event_type: &str, n: &ConnDetail) -> bool {
+    event_type == "soft failure" && text(&n.ip_assign_type).is_some_and(|v| v.starts_with("roam"))
+}
+
+fn succeeded(event_type: &str, n: &ConnDetail) -> bool {
+    let pos = |f: &Option<Field>| num(f).is_some_and(|v| v > 0.0);
     event_type != "failure"
-        && ((event_type == "soft failure" && n["ip_assign_type"].as_str().is_some_and(|v| v.starts_with("roam")))
-            || (n.get("traffic_delta").is_none() && n["dns_resp_seen"].as_str() == Some("yes"))
-            || (pos("traffic_delta") && pos("dns_responses")))
+        && (roamed(event_type, n) || (n.traffic_delta.is_none() && text(&n.dns_resp_seen) == Some("yes")) || (pos(&n.traffic_delta) && pos(&n.dns_responses)))
 }
 
 /// Milliseconds per stage, from the cumulative microsecond deltas.
@@ -102,14 +183,14 @@ pub struct Timings {
     pub total: Option<f64>,
 }
 
-fn timings(n: &Value) -> Timings {
+fn timings(n: &ConnDetail) -> Timings {
     // Deltas over a minute are not believable; they are dropped.
-    let d = |k: &str| num_of(n, k).filter(|v| *v > 0.0 && *v <= 60_000_000.0);
+    let d = |f: &Option<Field>| num(f).filter(|v| *v > 0.0 && *v <= 60_000_000.0);
     let ms = |us: f64| (us / 100.0).round() / 10.0;
-    let assoc = d("assoc_delta");
-    let auth = ["wpa_auth_delta", "radius_auth_delta", "auth_delta"].iter().find_map(|k| d(k).filter(|a| assoc.is_none_or(|x| *a > x)));
-    let ip = d("ip_delta");
-    let traffic = d("traffic_delta");
+    let assoc = d(&n.assoc_delta);
+    let auth = [&n.wpa_auth_delta, &n.radius_auth_delta, &n.auth_delta].into_iter().find_map(|f| d(f).filter(|a| assoc.is_none_or(|x| *a > x)));
+    let ip = d(&n.ip_delta);
+    let traffic = d(&n.traffic_delta);
     Timings {
         association: assoc.map(ms),
         authentication: auth.zip(assoc).map(|(a, s)| ms(a - s)),
@@ -143,6 +224,9 @@ pub struct Attempt {
     pub reason: Option<String>,
 }
 
+/// How far back a fixup reaches for the failure it corrects.
+const FIXUP_WITHIN: Ts = 1200;
+
 /// Connection attempts from the notifications, oldest first.
 pub fn attempts(mut events: Vec<ConnEvent>) -> Vec<Attempt> {
     events.retain(|e| matches!(e.event_type.as_str(), "failure" | "soft failure" | "success" | "fixup"));
@@ -152,17 +236,13 @@ pub fn attempts(mut events: Vec<ConnEvent>) -> Vec<Attempt> {
     for e in events {
         let ok = succeeded(&e.event_type, &e.n);
         if e.event_type == "fixup"
-            && let Some(id) = e.n.get("event_id").filter(|v| !v.is_null())
+            && let Some(id) = e.n.event_id.as_ref().filter(|v| **v != Field::Null)
             // Sorted by time: only the last 20 minutes need looking at.
-            && let Some(prev) = merged.iter_mut().rev().take_while(|(p, _, _)| e.ts - p.ts <= 1200).find(|(p, _, _)| {
-                p.ap == e.ap && p.client == e.client && p.vap == e.vap && p.n.get("event_id") == Some(id) && p.event_type.contains("failure")
+            && let Some(prev) = merged.iter_mut().rev().take_while(|(p, _, _)| e.ts - p.ts <= FIXUP_WITHIN).find(|(p, _, _)| {
+                p.ap == e.ap && p.client == e.client && p.vap == e.vap && p.n.event_id.as_ref() == Some(id) && p.event_type.contains("failure")
             })
         {
-            if let (Some(a), Some(b)) = (prev.0.n.as_object_mut(), e.n.as_object()) {
-                for (k, v) in b {
-                    a.insert(k.clone(), v.clone());
-                }
-            }
+            prev.0.n.merge(&e.n);
             prev.1 = prev.1 || ok;
             prev.2 = true;
             continue;
@@ -173,38 +253,36 @@ pub fn attempts(mut events: Vec<ConnEvent>) -> Vec<Attempt> {
         .into_iter()
         .filter_map(|(e, ok, fixed)| {
             let n = &e.n;
-            let rssi = num_of(n, "auth_rssi").or_else(|| num_of(n, "avg_rssi"));
-            let fails = failures(n);
+            let rssi = num(&n.auth_rssi).or_else(|| num(&n.avg_rssi));
             let (stage, failure) = if ok {
                 (6, None)
             } else {
                 if rssi.is_some_and(|r| r < -75.0) {
                     return None;
                 }
-                let worst = fails.iter().max_by_key(|f| f.0)?;
+                let worst = *failures(n).iter().max_by_key(|f| f.0)?;
                 (worst.0, Some(worst.1))
             };
             Some(Attempt {
                 ts: e.ts,
-                roam: e.event_type == "soft failure" && n["ip_assign_type"].as_str().is_some_and(|v| v.starts_with("roam")),
-                client: e.client,
-                ap: e.ap,
-                essid: e.essid,
-                radio: e.radio,
-                channel: n["x_channel"].as_i64(),
-                bw: n["x_bw"].as_i64(),
+                roam: roamed(&e.event_type, n),
+                channel: int(&n.x_channel),
+                bw: int(&n.x_bw),
                 success: ok,
                 stage,
                 failure,
                 rssi,
                 timings: timings(n),
                 fixed_up: fixed,
-                reason: n["sta_dc_reason"].as_str().filter(|r| !r.is_empty() && !ok).map(str::to_string),
+                reason: text(&n.sta_dc_reason).filter(|r| !r.is_empty() && !ok).map(str::to_string),
+                client: e.client,
+                ap: e.ap,
+                essid: e.essid,
+                radio: e.radio,
             })
         })
         .collect()
 }
-
 /// Connection success per client: each client counts once, at the furthest
 /// stage any of its attempts reached; timings are averaged over the attempts
 /// that have them.
@@ -262,14 +340,14 @@ pub struct Roam {
     pub assistant: bool,
 }
 
-fn end_of(e: &ConnEvent, rssi_key: &str) -> RoamEnd {
+fn end_of(e: &ConnEvent, rssi: &Option<Field>) -> RoamEnd {
     RoamEnd {
         ap: e.ap.clone(),
         essid: e.essid.clone(),
         radio: e.radio.clone(),
-        channel: e.n["x_channel"].as_i64(),
-        bw: e.n["x_bw"].as_i64(),
-        rssi: num_of(&e.n, rssi_key),
+        channel: int(&e.n.x_channel),
+        bw: int(&e.n.x_bw),
+        rssi: num(rssi),
     }
 }
 
@@ -292,10 +370,10 @@ pub fn roams(events: &[ConnEvent]) -> Vec<Roam> {
         evs.sort_by_key(|e| e.ts);
         // Whether each event is a leave, and whether it carries the signal a join needs.
         let leave: Vec<bool> = evs.iter().map(|e| matches!(e.event_type.as_str(), "sta_roam" | "sta_leave")).collect();
-        let joined: Vec<bool> = evs.iter().zip(&leave).map(|(e, l)| !l && num_of(&e.n, "auth_rssi").is_some()).collect();
+        let joined: Vec<bool> = evs.iter().zip(&leave).map(|(e, l)| !l && num(&e.n.auth_rssi).is_some()).collect();
         let mut used: HashSet<usize> = HashSet::new();
         for (li, l) in evs.iter().enumerate() {
-            if !leave[li] || num_of(&l.n, "avg_rssi").is_none() {
+            if !leave[li] || num(&l.n.avg_rssi).is_none() {
                 continue;
             }
             // The join: another AP on the same network, with the signal it joined at,
@@ -309,15 +387,15 @@ pub fn roams(events: &[ConnEvent]) -> Vec<Roam> {
             used.insert(ji);
             let gap = j.ts - l.ts;
             let success = l.event_type == "sta_roam" || gap.abs() <= 1;
-            let status = num_of(&l.n, "assoc_status").unwrap_or(0.0) as i64;
+            let status = num(&l.n.assoc_status).unwrap_or(0.0) as i64;
             out.push(Roam {
                 ts: j.ts.max(l.ts),
                 client: client.to_string(),
-                from: end_of(l, "avg_rssi"),
-                to: end_of(j, "auth_rssi"),
+                from: end_of(l, &l.n.avg_rssi),
+                to: end_of(j, &j.n.auth_rssi),
                 success,
                 gap_s: (!success).then_some(gap.max(0)),
-                fast: j.n["auth_algo"].as_str() == Some("ft"),
+                fast: text(&j.n.auth_algo) == Some("ft"),
                 min_rssi: status & 16 != 0,
                 assistant: status & 8192 != 0,
             });
@@ -399,46 +477,63 @@ pub fn roam_clients(roams: &[Roam]) -> Vec<Value> {
     out
 }
 
-/// Loads the notifications in a window (optionally one client's).
+/// The notifications in a window (optionally one client's), oldest first; or
+/// with `newest`, at most that many, newest first.
+pub fn load_rows(c: &rusqlite::Connection, from: Ts, to: Ts, client: Option<&str>, newest: Option<usize>) -> rusqlite::Result<Vec<ConnEvent>> {
+    const COLUMNS: &str = "SELECT ts, ap_mac, client_mac, vap, essid, radio, event_type, detail, ip_assign_type, dns_responses, dns_timeouts, rssi FROM connections";
+    // Two statements: `(?3 IS NULL OR client_mac = ?3)` would keep SQLite off the per-client index.
+    let filter = if client.is_some() { "client_mac = ?3 AND ts >= ?1 AND ts <= ?2" } else { "ts >= ?1 AND ts <= ?2" };
+    let order = match newest {
+        Some(n) => format!("ORDER BY ts DESC, id DESC LIMIT {n}"),
+        None => "ORDER BY ts, id".into(),
+    };
+    let mut stmt = c.prepare(&format!("{COLUMNS} WHERE {filter} {order}"))?;
+    let params: Vec<&dyn rusqlite::ToSql> = match &client {
+        Some(m) => vec![&from, &to, m],
+        None => vec![&from, &to],
+    };
+    stmt.query_map(params.as_slice(), |r| {
+        let detail = r.get_ref(7)?.as_str_or_null()?;
+        // Rows from before the full notification was kept: rebuild what we can.
+        let n = detail.and_then(|d| serde_json::from_str(d).ok()).unwrap_or_else(|| ConnDetail {
+            ip_assign_type: r.get::<_, Option<String>>(8).ok().flatten().map(Field::Str),
+            dns_responses: r.get::<_, Option<i64>>(9).ok().flatten().map(Field::Int),
+            dns_timeouts: r.get::<_, Option<i64>>(10).ok().flatten().map(Field::Int),
+            avg_rssi: r.get::<_, Option<i64>>(11).ok().flatten().map(Field::Int),
+            ..Default::default()
+        });
+        Ok(ConnEvent { ts: r.get(0)?, ap: r.get(1)?, client: r.get(2)?, vap: r.get(3)?, essid: r.get(4)?, radio: r.get(5)?, event_type: r.get(6)?, n })
+    })?
+    .collect()
+}
+
+/// Loads the notifications in a window (optionally one client's), oldest first.
 async fn load(s: &AppState, from: Ts, to: Ts, client: Option<String>) -> Result<Vec<ConnEvent>, ApiError> {
-    read(&s.store, Db::Config, move |c| {
-        const COLUMNS: &str = "SELECT ts, ap_mac, client_mac, vap, essid, radio, event_type, detail, ip_assign_type, dns_responses, dns_timeouts, rssi FROM connections";
-        // Two statements: `(?3 IS NULL OR client_mac = ?3)` would keep SQLite off the per-client index.
-        let mut stmt = match client {
-            Some(_) => c.prepare(&format!("{COLUMNS} WHERE client_mac = ?3 AND ts >= ?1 AND ts <= ?2"))?,
-            None => c.prepare(&format!("{COLUMNS} WHERE ts >= ?1 AND ts <= ?2"))?,
-        };
-        let params: Vec<&dyn rusqlite::ToSql> = match &client {
-            Some(m) => vec![&from, &to, m],
-            None => vec![&from, &to],
-        };
-        let rows = stmt
-            .query_map(params.as_slice(), |r| {
-                let detail: Option<String> = r.get(7)?;
-                // Rows from before the full notification was kept: rebuild what we can.
-                let n = detail.and_then(|d| serde_json::from_str(&d).ok()).unwrap_or_else(|| {
-                    json!({
-                        "ip_assign_type": r.get::<_, Option<String>>(8).ok().flatten(),
-                        "dns_responses": r.get::<_, Option<i64>>(9).ok().flatten(),
-                        "dns_timeouts": r.get::<_, Option<i64>>(10).ok().flatten(),
-                        "avg_rssi": r.get::<_, Option<i64>>(11).ok().flatten(),
-                    })
-                });
-                Ok(ConnEvent {
-                    ts: r.get(0)?,
-                    ap: r.get(1)?,
-                    client: r.get(2)?,
-                    vap: r.get(3)?,
-                    essid: r.get(4)?,
-                    radio: r.get(5)?,
-                    event_type: r.get(6)?,
-                    n,
-                })
-            })?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        Ok(rows)
-    })
-    .await
+    read(&s.store, Db::Config, move |c| Ok(load_rows(c, from, to, client.as_deref(), None)?)).await
+}
+
+/// The newest `limit` attempts (failed ones only with `failed`) and roams in
+/// the window, newest first. Rows are read newest first, a growing batch at a
+/// time, until both lists are full or the window is read: of a batch, only
+/// what lies more than [`FIXUP_WITHIN`] after its oldest row counts, as a
+/// fixup can still merge into a failure that long before it (and a roam's
+/// two reports are seconds apart).
+fn newest(c: &rusqlite::Connection, from: Ts, to: Ts, client: Option<&str>, limit: usize, failed: bool) -> rusqlite::Result<(Vec<Attempt>, Vec<Roam>)> {
+    let mut batch = (limit * 4).max(2000);
+    loop {
+        let mut events = load_rows(c, from, to, client, Some(batch))?;
+        let all = events.len() < batch;
+        // The oldest time read may have more rows than were read.
+        let oldest = events.last().map_or(from, |e| e.ts);
+        let settled = |ts: Ts| all || ts > oldest.saturating_add(FIXUP_WITHIN);
+        events.reverse();
+        let r: Vec<Roam> = roams(&events).into_iter().rev().filter(|x| settled(x.ts)).take(limit).collect();
+        let list: Vec<Attempt> = attempts(events).into_iter().rev().filter(|a| settled(a.ts) && (!failed || !a.success)).take(limit).collect();
+        if all || (list.len() == limit && r.len() == limit) {
+            return Ok((list, r));
+        }
+        batch *= 4;
+    }
 }
 
 /// Every AP and client apctl knows, by MAC, with its display name if it has one.
@@ -455,6 +550,21 @@ impl Names {
             c.prepare(sql)?.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?)))?.collect()
         };
         Ok(Names { aps: pairs("SELECT mac, COALESCE(name, hostname) FROM devices")?, clients: pairs("SELECT mac, hostname FROM clients")? })
+    }
+
+    /// The same for some clients only: every AP (there are few), and the clients asked for.
+    fn load_for(c: &rusqlite::Connection, clients: &BTreeSet<&str>) -> rusqlite::Result<Names> {
+        let aps = c.prepare("SELECT mac, COALESCE(name, hostname) FROM devices")?.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?)))?.collect::<rusqlite::Result<_>>()?;
+        let mut names = Names { aps, clients: HashMap::new() };
+        let list: Vec<&str> = clients.iter().copied().collect();
+        for chunk in list.chunks(500) {
+            let sql = format!("SELECT mac, hostname FROM clients WHERE mac IN ({})", vec!["?"; chunk.len()].join(", "));
+            for row in c.prepare(&sql)?.query_map(rusqlite::params_from_iter(chunk), |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?)))? {
+                let (mac, name) = row?;
+                names.clients.insert(mac, name);
+            }
+        }
+        Ok(names)
     }
 
     /// What the APs and clients report now on top, then aliases (which win).
@@ -480,12 +590,21 @@ impl Names {
     }
 }
 
-/// Display names for APs and clients (aliases first), for the ones that have one.
-async fn names(s: &AppState) -> Result<(HashMap<String, String>, HashMap<String, String>), ApiError> {
-    let mut names = read(&s.store, Db::Config, |c| Ok(Names::load(c)?)).await?;
+/// Display names (aliases first) of the APs and clients named in a response,
+/// for the ones that have one.
+async fn names<'a>(s: &AppState, macs: impl Iterator<Item = (&'a str, &'a str)>) -> Result<(HashMap<String, String>, HashMap<String, String>), ApiError> {
+    let (aps, clients): (BTreeSet<&str>, BTreeSet<&str>) = macs.unzip();
+    let wanted: BTreeSet<String> = clients.iter().map(|m| m.to_string()).collect();
+    let mut names = read(&s.store, Db::Config, move |c| Ok(Names::load_for(c, &wanted.iter().map(String::as_str).collect())?)).await?;
     names.add_live(&s.live.read().unwrap());
-    let named = |m: HashMap<String, Option<String>>| m.into_iter().filter_map(|(mac, n)| n.map(|n| (mac, n))).collect();
-    Ok((named(names.aps), named(names.clients)))
+    let named = |m: HashMap<String, Option<String>>, keep: &BTreeSet<&str>| m.into_iter().filter(|(mac, _)| keep.contains(mac.as_str())).filter_map(|(mac, n)| n.map(|n| (mac, n))).collect();
+    Ok((named(names.aps, &aps), named(names.clients, &clients)))
+}
+
+/// (AP, client) of every attempt and both ends of every roam.
+fn macs_of<'a>(attempts: &'a [Attempt], roams: &'a [Roam]) -> impl Iterator<Item = (&'a str, &'a str)> {
+    let a = attempts.iter().map(|a| (a.ap.as_str(), a.client.as_str()));
+    a.chain(roams.iter().flat_map(|r| [(r.from.ap.as_str(), r.client.as_str()), (r.to.ap.as_str(), r.client.as_str())]))
 }
 
 /// GET /api/site/connectivity: connection success per client and stage, for
@@ -520,18 +639,9 @@ pub struct ListQuery {
 pub async fn list(State(s): State<AppState>, Query(q): Query<ListQuery>) -> Result<Json<Value>, ApiError> {
     let (from, to, _) = window(&RangeQuery { range: q.range, from: q.from, to: q.to, ..Default::default() });
     let client = q.client.map(|c| c.to_ascii_lowercase());
-    let events = load(&s, from, to, client).await?;
     let limit = q.limit.unwrap_or(500).min(5000);
-    let mut r = roams(&events);
-    r.reverse();
-    r.truncate(limit);
-    let mut list = attempts(events);
-    if q.failed {
-        list.retain(|a| !a.success);
-    }
-    list.reverse();
-    list.truncate(limit);
-    let (aps, clients) = names(&s).await?;
+    let (list, r) = read(&s.store, Db::Config, move |c| Ok(newest(c, from, to, client.as_deref(), limit, q.failed)?)).await?;
+    let (aps, clients) = names(&s, macs_of(&list, &r)).await?;
     Ok(Json(json!({ "attempts": list, "roams": r, "ap_names": aps, "client_names": clients })))
 }
 
@@ -543,7 +653,7 @@ pub async fn roaming(State(s): State<AppState>, Query(q): Query<RangeQuery>) -> 
     let r = roams(&events);
     let pairs = roam_pairs(&r);
     let clients = roam_clients(&r);
-    let (aps, names) = names(&s).await?;
+    let (aps, names) = names(&s, macs_of(&[], &r)).await?;
     let mut list = r;
     list.reverse();
     Ok(Json(json!({ "from": from, "to": to, "roams": list, "pairs": pairs, "clients": clients, "ap_names": aps, "client_names": names })))
@@ -562,7 +672,7 @@ mod tests {
             essid: Some("Home".into()),
             radio: Some("na".into()),
             event_type: event_type.into(),
-            n,
+            n: serde_json::from_value(n).unwrap(),
         }
     }
 
@@ -614,10 +724,10 @@ mod tests {
 
     #[test]
     fn timings_split_the_cumulative_deltas() {
-        let t = timings(&json!({ "assoc_delta": 10000, "wpa_auth_delta": 40000, "ip_delta": 120000, "traffic_delta": 150000 }));
+        let t = timings(&serde_json::from_value(json!({ "assoc_delta": 10000, "wpa_auth_delta": 40000, "ip_delta": 120000, "traffic_delta": 150000 })).unwrap());
         assert_eq!(t, Timings { association: Some(10.0), authentication: Some(30.0), dhcp: Some(80.0), dns: Some(30.0), total: Some(150.0) });
         // Over a minute is dropped; DHCP without a later IP time is unknown.
-        let t = timings(&json!({ "assoc_delta": 10000, "auth_delta": 20000, "ip_delta": 70_000_000 }));
+        let t = timings(&serde_json::from_value(json!({ "assoc_delta": 10000, "auth_delta": 20000, "ip_delta": 70_000_000 })).unwrap());
         assert_eq!((t.authentication, t.dhcp), (Some(10.0), None));
     }
 
@@ -646,5 +756,67 @@ mod tests {
         // A -> B at -78 -> -55 (better), then B -> A 107 s later at -80 -> -60 (back to where it was).
         let c = roam_clients(&r);
         assert_eq!((c[0]["roams"].as_u64(), c[0]["to_weaker"].as_u64(), c[0]["quick_returns"].as_u64()), (Some(2), Some(0), Some(1)));
+    }
+
+    #[test]
+    fn report_fields_are_read_as_sent() {
+        let n: ConnDetail = serde_json::from_value(json!({ "dns_timeouts": "2", "auth_rssi": -60.5, "x_channel": 36, "x_bw": "80", "traffic_delta": null, "other": [1] })).unwrap();
+        assert_eq!((num(&n.dns_timeouts), num(&n.auth_rssi), int(&n.x_channel), int(&n.x_bw)), (Some(2.0), Some(-60.5), Some(36), None));
+        // Present but null is not absent: a report with no traffic time is not "older firmware".
+        assert_eq!((n.traffic_delta.clone(), n.dns_resp_seen.clone()), (Some(Field::Null), None));
+        let mut f: ConnDetail = serde_json::from_value(json!({ "event_id": 7, "dns_timeouts": 1 })).unwrap();
+        f.merge(&serde_json::from_value(json!({ "event_id": 7, "dns_timeouts": 0, "dns_responses": 3 })).unwrap());
+        assert_eq!((num(&f.dns_timeouts), num(&f.dns_responses), f.event_id), (Some(0.0), Some(3.0), Some(Field::Int(7))));
+    }
+
+    #[test]
+    fn the_newest_attempts_and_roams_are_read_from_the_end() {
+        let dir = std::env::temp_dir().join(format!("apctl-connections-{}-{}", std::process::id(), crate::store::now_ts()));
+        let (store, _writer) = crate::store::Store::open(&dir).unwrap();
+        let c = rusqlite::Connection::open(dir.join("config.db")).unwrap();
+        // Five clients, one report every 7 s for a day: failures with their fixups up
+        // to 20 minutes later, successes, roams between two APs, and a few old rows
+        // without the full report.
+        let mut seed = 1u64;
+        let mut rnd = |n: u64| {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (seed >> 33) % n
+        };
+        let sql = "INSERT INTO connections (ts, ap_mac, client_mac, vap, essid, radio, event_type, ip_assign_type, rssi, detail) VALUES (?1, ?2, ?3, 'wifi1ap0', 'Home', 'na', ?4, ?5, ?6, ?7)";
+        c.execute_batch("BEGIN").unwrap();
+        for i in 0..12_000i64 {
+            let ts = 1_000_000 + i * 7;
+            let client = format!("02:00:00:00:10:0{}", rnd(5));
+            let ap = if rnd(2) == 0 { "02:00:00:00:00:a1" } else { "02:00:00:00:00:a2" };
+            let id = i / 3;
+            let (kind, detail) = match rnd(6) {
+                0 => ("failure", json!({ "event_id": id, "dns_timeouts": 1, "auth_rssi": -60 })),
+                1 => ("fixup", json!({ "event_id": id - rnd(200) as i64, "dns_responses": 2, "traffic_delta": 9000 })),
+                2 => ("success", json!({ "traffic_delta": 120000, "dns_responses": 1, "auth_rssi": -55 })),
+                3 => ("sta_leave", json!({ "avg_rssi": -78 })),
+                4 => ("association", json!({ "auth_rssi": -50 })),
+                _ => ("soft failure", json!({ "ip_assign_type": "roamed" })),
+            };
+            let detail = if i < 300 { None } else { Some(detail.to_string()) };
+            c.execute(sql, rusqlite::params![ts, ap, client, kind, "roamed", -70, detail]).unwrap();
+        }
+        c.execute_batch("COMMIT").unwrap();
+        let (from, to) = (1_000_000 + 3600, 1_000_000 + 12_000 * 7);
+        // From the first batch of rows, from several, and from all of them.
+        for (client, failed, limit) in [(None, false, 40), (Some("02:00:00:00:10:01"), true, 10), (None, false, 500), (None, true, 300), (Some("02:00:00:00:10:03"), false, 200), (None, false, 0), (None, false, 9000)] {
+            let (list, r) = store.read(Db::Config, |c| Ok(newest(c, from, to, client, limit, failed)?)).unwrap();
+            let all = store.read(Db::Config, |c| Ok(load_rows(c, from, to, client, None)?)).unwrap();
+            let mut want_r = roams(&all);
+            want_r.reverse();
+            want_r.truncate(limit);
+            let mut want = attempts(all);
+            want.retain(|a| !failed || !a.success);
+            want.reverse();
+            want.truncate(limit);
+            assert_eq!(json!(list), json!(want), "{client:?} {failed} {limit}");
+            assert_eq!(json!(r), json!(want_r), "{client:?} {failed} {limit}");
+            assert_eq!(list.len(), limit.min(want.len()));
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -263,6 +263,9 @@ async fn serve(args: ServeArgs) -> Result<()> {
     // The config generator, for dry runs.
     let renderer = dryrun::apcfg_renderer(emulate_version.clone());
     engine.set_renderer(renderer.clone());
+    // Alert-worthy events reach the alert watcher on a channel of their own.
+    let (alert_sink, alert_events) = alerts::channel();
+    engine.set_alerts(alert_sink);
     let tick_tx = in_tx.clone();
     tokio::spawn(async move {
         let mut every = tokio::time::interval(Duration::from_secs(5));
@@ -343,8 +346,8 @@ async fn serve(args: ServeArgs) -> Result<()> {
         tracing::info!("login enabled for {} user(s)", users.len());
     }
     let auth = Arc::new(auth::Auth::new(users, &store, writer.clone(), proxies)?);
-    threats::watch(store.clone(), live.clone(), in_tx.clone());
-    alerts::spawn(store.clone(), writer.clone(), live.clone(), live_tx.clone());
+    threats::watch(store.clone(), live.clone(), in_tx.clone(), writer.clone());
+    alerts::spawn(store.clone(), writer.clone(), live.clone(), live_tx.clone(), alert_events);
     backup::schedule(backups.clone(), store.clone());
     firmware::schedule(writer.clone());
     let state = api::AppState { backups, active, writer: writer.clone(), store, vendors: Arc::new(vendors), renderer, auth, engine: in_tx.clone(), live, tx: api::live_json(&live_tx), started: store::now_ts(), source: source_desc };

@@ -57,8 +57,8 @@ pub struct LogEvents {
     steering: HashMap<String, Steering>,
     /// The client each device's latest steering request was about.
     steering_by_device: HashMap<String, String>,
-    /// Last report per (kind, subject), to avoid repeating one line's event.
-    recent: HashMap<(&'static str, String), Ts>,
+    /// Last report per kind and subject, to avoid repeating one line's event.
+    recent: HashMap<&'static str, HashMap<String, Ts>>,
     /// Current experience problems per client, and when they were reported.
     anomalies: HashMap<String, (String, Ts)>,
     /// Crash captures in progress, by device (or source address).
@@ -95,11 +95,14 @@ pub fn btm_status(code: i64) -> &'static str {
 impl LogEvents {
     /// Reports at most once per `secs` for the same kind and subject.
     fn fresh(&mut self, kind: &'static str, subject: &str, ts: Ts, secs: Ts) -> bool {
-        let k = (kind, subject.to_string());
-        if self.recent.get(&k).is_some_and(|t| ts - t < secs) {
-            return false;
+        let seen = self.recent.entry(kind).or_default();
+        match seen.get_mut(subject) {
+            Some(t) if ts - *t < secs => return false,
+            Some(t) => *t = ts,
+            None => {
+                seen.insert(subject.to_string(), ts);
+            }
         }
-        self.recent.insert(k, ts);
         true
     }
 
@@ -107,7 +110,9 @@ impl LogEvents {
         let mut out = Vec::new();
         let msg = line.msg.as_str();
         let prog = line.program.as_deref().unwrap_or("");
-        let dev_key = line.device_mac.map_or_else(|| line.src_ip.clone(), |m| m.to_string());
+        // Crashes and steering are followed per device (or source address); the
+        // key is made only for a line that needs it.
+        let dev_key = || line.device_mac.map_or_else(|| line.src_ip.clone(), |m| m.to_string());
 
         // Crash capture: collect everything the device says for a while after a
         // fault (up to 200 lines), while its other events are still reported.
@@ -126,18 +131,21 @@ impl LogEvents {
             None
         };
         let is_fault = fault.is_some();
-        if let Some((_, c)) = self.crashes.get_mut(&dev_key) {
-            if c.lines.len() < 200 {
-                c.lines.push(format!("{prog}: {msg}"));
-            }
-            if matches!(fault, Some(("kernel panic", _))) {
-                c.kind = "kernel panic";
-                out.extend(self.flush(&dev_key));
-            }
-        } else if let Some((kind, process)) = fault {
-            self.crashes.insert(dev_key.clone(), (line.device_mac, Crash { started: line.ts, kind, process, lines: vec![format!("{prog}: {msg}")] }));
-            if kind == "kernel panic" {
-                out.extend(self.flush(&dev_key));
+        if is_fault || !self.crashes.is_empty() {
+            let key = dev_key();
+            if let Some((_, c)) = self.crashes.get_mut(&key) {
+                if c.lines.len() < 200 {
+                    c.lines.push(format!("{prog}: {msg}"));
+                }
+                if matches!(fault, Some(("kernel panic", _))) {
+                    c.kind = "kernel panic";
+                    out.extend(self.flush(&key));
+                }
+            } else if let Some((kind, process)) = fault {
+                self.crashes.insert(key.clone(), (line.device_mac, Crash { started: line.ts, kind, process, lines: vec![format!("{prog}: {msg}")] }));
+                if kind == "kernel panic" {
+                    out.extend(self.flush(&key));
+                }
             }
         }
         if is_fault {
@@ -172,9 +180,9 @@ impl LogEvents {
                     vap,
                 };
                 self.steering.insert(c.to_string(), s);
-                self.steering_by_device.insert(dev_key, c.to_string());
+                self.steering_by_device.insert(dev_key(), c.to_string());
             } else if let Some(t) = msg.split("BTM: [").nth(1).filter(|t| t.contains("]{"))
-                && let Some(client) = self.steering_by_device.get(&dev_key).cloned()
+                && let Some(client) = self.steering_by_device.get(&dev_key()).cloned()
                 && let Some(s) = self.steering.get_mut(&client)
             {
                 // A candidate: "[0]{bssid chNN/opNN/phyNN}".
@@ -255,7 +263,9 @@ impl LogEvents {
         let due: Vec<String> = self.crashes.iter().filter(|(_, (_, c))| now - c.started >= CRASH_WINDOW).map(|(k, _)| k.clone()).collect();
         let mut out: Vec<Found> = due.iter().filter_map(|k| self.flush(k)).collect();
         // Forget old de-duplication and steering state.
-        self.recent.retain(|_, t| now - *t < 3600);
+        for seen in self.recent.values_mut() {
+            seen.retain(|_, t| now - *t < 3600);
+        }
         self.steering.retain(|_, s| now - s.ts < 300);
         self.anomalies.retain(|_, (_, t)| now - *t < 3 * 3600);
         out.sort_by_key(|f| f.kind);

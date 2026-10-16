@@ -12,6 +12,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use axum::Json;
@@ -19,11 +20,11 @@ use axum::extract::{Query, State};
 use rusqlite::types::Value as Sql;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, mpsc};
 
 use crate::api::{ApiError, AppState};
-use crate::engine::{LiveMsg, SharedLive};
-use crate::insights::{RETRY_COLS, Spec, retry_pct, retry_totals};
+use crate::engine::{Event, LiveMsg, SharedLive};
+use crate::insights::{RETRY_AT, RETRY_COLS, Spec, retry_pct, retry_totals};
 use crate::model::Ts;
 use crate::settings::band_name;
 use crate::store::{self, Db, Store, Writer};
@@ -38,16 +39,70 @@ const HEALTH_COOLDOWN: Ts = 6 * 3600;
 /// many checks in a row (a minute apart): it stopped reporting, or its AP went.
 const HEALTH_STALE_CHECKS: u32 = 15;
 
+/// What an alert is about.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Category {
+    ApStatus,
+    Security,
+    Health,
+    Changes,
+}
+
+impl Category {
+    const ALL: [Category; 4] = [Category::ApStatus, Category::Security, Category::Health, Category::Changes];
+
+    /// As stored and as the API names it.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Category::ApStatus => "ap_status",
+            Category::Security => "security",
+            Category::Health => "health",
+            Category::Changes => "changes",
+        }
+    }
+
+    fn parse(s: &str) -> Option<Category> {
+        Category::ALL.into_iter().find(|c| c.as_str() == s)
+    }
+}
+
+/// How urgent an alert is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Severity {
+    High,
+    Medium,
+    Low,
+    Info,
+}
+
+impl Severity {
+    const ALL: [Severity; 4] = [Severity::High, Severity::Medium, Severity::Low, Severity::Info];
+
+    /// As stored and as the API names it.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Severity::High => "high",
+            Severity::Medium => "medium",
+            Severity::Low => "low",
+            Severity::Info => "info",
+        }
+    }
+
+    fn parse(s: &str) -> Option<Severity> {
+        Severity::ALL.into_iter().find(|x| x.as_str() == s)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct Alert {
     pub id: String,
     pub ts: Ts,
     /// e.g. `ap_offline`, `high_retries`.
     pub key: String,
-    /// `ap_status`, `security`, `health` or `changes`.
-    pub category: &'static str,
-    /// `high`, `medium`, `low` or `info`.
-    pub severity: &'static str,
+    pub category: Category,
+    pub severity: Severity,
     /// What it is about (AP MAC, AP MAC + band, BSSID...).
     pub entity: String,
     pub title: String,
@@ -57,6 +112,33 @@ pub struct Alert {
     /// Notifications with the same tag replace each other (offline -> back online).
     pub tag: String,
     pub resolved_ts: Option<Ts>,
+}
+
+impl Alert {
+    /// A new alert, linked nowhere, tagged with its key and entity.
+    fn new(key: &str, category: Category, severity: Severity, entity: &str, title: String, message: String) -> Alert {
+        let tag = format!("{key}:{entity}");
+        Alert { id: String::new(), ts: 0, key: key.into(), category, severity, entity: entity.into(), title, message, link: None, tag, resolved_ts: None }
+    }
+
+    /// An alert about an AP (`mac`), linked to its page.
+    fn for_device(key: &str, category: Category, severity: Severity, mac: &str, title: String, message: String) -> Alert {
+        let link = (!mac.is_empty()).then(|| format!("/devices/{mac}"));
+        Alert { link, ..Alert::new(key, category, severity, mac, title, message) }
+    }
+
+    fn link(self, link: impl Into<String>) -> Alert {
+        Alert { link: Some(link.into()), ..self }
+    }
+
+    fn tagged(self, tag: impl Into<String>) -> Alert {
+        Alert { tag: tag.into(), ..self }
+    }
+
+    /// Raised already resolved: a one-off notice.
+    fn resolved(self, now: Ts) -> Alert {
+        Alert { resolved_ts: Some(now), ..self }
+    }
 }
 
 /// What a live subscriber is told.
@@ -89,8 +171,8 @@ impl Alerts {
                 Sql::Text(a.id.clone()),
                 Sql::Integer(now),
                 Sql::Text(a.key.clone()),
-                Sql::Text(a.category.into()),
-                Sql::Text(a.severity.into()),
+                Sql::Text(a.category.as_str().into()),
+                Sql::Text(a.severity.as_str().into()),
                 Sql::Text(a.entity.clone()),
                 Sql::Text(a.title.clone()),
                 Sql::Text(a.message.clone()),
@@ -123,11 +205,6 @@ impl Alerts {
         let _ = self.tx.send(LiveMsg::Alert(AlertMsg { action: "resolved", alert: a.clone() }));
         Some(a)
     }
-}
-
-#[allow(clippy::too_many_arguments)] // a plain constructor; named fields would only add noise at the call sites
-fn alert(key: &str, category: &'static str, severity: &'static str, entity: &str, title: String, message: String, link: Option<String>, tag: String) -> Alert {
-    Alert { id: String::new(), ts: 0, key: key.into(), category, severity, entity: entity.into(), title, message, link, tag, resolved_ts: None }
 }
 
 /// An AP's name in an alert, looked up only when the alert is written.
@@ -196,128 +273,77 @@ impl ApWatch {
     }
 }
 
+/// The kinds of event [`from_event`] may turn into an alert: the engine sends
+/// the watcher only these.
+pub const EVENT_KINDS: [&str; 10] = [
+    "network_threat", "ap_restarted", "ap_firmware_changed", "dfs_radar", "ap_isolated", "ap_crash", "ap_process_restarted", "ap_upgrade_failed", "ap_upgraded",
+    "config_applied",
+];
+
 /// An alert for an event, if the event deserves one.
 fn from_event(kind: &str, device: Option<&str>, data: &Value, ap_name: &dyn Fn(&str) -> String) -> Option<Alert> {
+    use Category::{ApStatus, Changes};
+    if !EVENT_KINDS.contains(&kind) {
+        return None;
+    }
     let dev = device.unwrap_or_default();
     let lookup = || ap_name(dev);
     let name = Name(&lookup);
-    let link = (!dev.is_empty()).then(|| format!("/devices/{dev}"));
     let s = |k: &str| data[k].as_str().unwrap_or_default().to_string();
+    let on = |key: &str, category: Category, severity: Severity, title: String, message: String| Alert::for_device(key, category, severity, dev, title, message);
     Some(match kind {
         "network_threat" => {
             let sev = match data["severity"].as_str() {
-                Some("high") => "high",
-                Some("medium") => "medium",
+                Some("high") => Severity::High,
+                Some("medium") => Severity::Medium,
                 _ => return None,
             };
             let essid = data["essid"].as_str().map_or("A hidden network".to_string(), |e| format!("\"{e}\""));
-            alert(
-                "suspicious_network",
-                "security",
-                sev,
-                &format!("{}/{}", s("kind"), s("bssid")),
-                format!("Suspicious network: {essid}"),
-                s("detail"),
-                Some("/radios?tab=rogue".into()),
-                format!("threat:{}:{}", s("kind"), s("bssid")),
-            )
+            let (kind, bssid) = (s("kind"), s("bssid"));
+            Alert::new("suspicious_network", Category::Security, sev, &format!("{kind}/{bssid}"), format!("Suspicious network: {essid}"), s("detail"))
+                .link("/radios?tab=rogue")
+                .tagged(format!("threat:{kind}:{bssid}"))
         }
-        "ap_restarted" => alert(
-            "ap_restarted",
-            "changes",
-            "low",
-            dev,
-            format!("{name} restarted"),
-            format!("It had been up for {}.", human(data["uptime"].as_i64().unwrap_or(0))),
-            link,
-            format!("restart:{dev}"),
-        ),
-        "ap_firmware_changed" => alert(
-            "ap_firmware_changed",
-            "changes",
-            "info",
-            dev,
-            format!("{name} firmware changed"),
-            format!("{} → {}", s("from"), s("to")),
-            link,
-            format!("firmware:{dev}"),
-        ),
-        "dfs_radar" => alert(
-            "dfs_radar",
-            "changes",
-            "low",
-            dev,
-            format!("Radar detected by {name}"),
-            match data["channel"].as_i64() {
+        "ap_restarted" => on("ap_restarted", Changes, Severity::Low, format!("{name} restarted"), format!("It had been up for {}.", human(data["uptime"].as_i64().unwrap_or(0))))
+            .tagged(format!("restart:{dev}")),
+        "ap_firmware_changed" => on("ap_firmware_changed", Changes, Severity::Info, format!("{name} firmware changed"), format!("{} → {}", s("from"), s("to"))).tagged(format!("firmware:{dev}")),
+        "dfs_radar" => {
+            let message = match data["channel"].as_i64() {
                 Some(c) => format!("Channel {c} had to be vacated (DFS); the AP moved to another channel."),
                 None => "A DFS channel had to be vacated; the AP moved to another channel.".into(),
-            },
-            link,
-            format!("radar:{dev}"),
-        ),
-        "ap_isolated" => alert(
-            "ap_isolated",
-            "ap_status",
-            "high",
-            dev,
-            format!("{name} is isolated"),
-            "Its beacon says it has lost its uplink; clients on it may have no network.".into(),
-            link,
-            format!("ap-status:{dev}"),
-        ),
-        "ap_crash" => alert(
-            "ap_crash",
-            "changes",
-            "medium",
-            dev,
-            match data["process"].as_str() {
+            };
+            on("dfs_radar", Changes, Severity::Low, format!("Radar detected by {name}"), message).tagged(format!("radar:{dev}"))
+        }
+        "ap_isolated" => {
+            let message = "Its beacon says it has lost its uplink; clients on it may have no network.".into();
+            on("ap_isolated", ApStatus, Severity::High, format!("{name} is isolated"), message).tagged(format!("ap-status:{dev}"))
+        }
+        "ap_crash" => {
+            let title = match data["process"].as_str() {
                 Some(p) => format!("{p} crashed on {name}"),
                 None => format!("{name}: {}", data["kind"].as_str().unwrap_or("crash")),
-            },
-            data["lines"].as_array().and_then(|l| l.first()).and_then(Value::as_str).unwrap_or("See the event for details.").to_string(),
-            link,
-            format!("crash:{dev}"),
-        ),
-        "ap_process_restarted" => alert(
-            "ap_process_restarted",
-            "changes",
-            "low",
-            dev,
-            format!("{} restarted on {name}", data["proc"].as_str().unwrap_or("A process")),
-            format!("It exited with code {} and was restarted by {}.", data["exit_status"], data["caller"].as_str().unwrap_or("the system")),
-            link,
-            format!("proc:{dev}"),
-        ),
-        "ap_upgrade_failed" => alert(
-            "ap_upgrade_failed",
-            "changes",
-            "medium",
-            dev,
-            format!("{name} firmware update failed"),
-            data["detail"].as_str().unwrap_or("The update did not complete.").to_string(),
-            Some("/config?tab=firmware".into()),
-            format!("upgrade:{dev}"),
-        ),
-        "ap_upgraded" => alert(
-            "ap_upgraded",
-            "changes",
-            "info",
-            dev,
-            format!("{name} updated to {}", data["to"].as_str().unwrap_or("new firmware")),
-            format!("From {}.", data["from"].as_str().unwrap_or("the previous version")),
-            Some("/config?tab=firmware".into()),
-            format!("upgrade:{dev}"),
-        ),
-        "config_applied" => alert(
-            "config_applied",
-            "changes",
-            "info",
-            dev,
-            format!("New settings applied on {name}"),
-            "The AP applied a configuration change.".into(),
-            Some("/config".into()),
-            format!("config:{dev}"),
-        ),
+            };
+            let first = data["lines"].as_array().and_then(|l| l.first()).and_then(Value::as_str).unwrap_or("See the event for details.");
+            on("ap_crash", Changes, Severity::Medium, title, first.to_string()).tagged(format!("crash:{dev}"))
+        }
+        "ap_process_restarted" => {
+            let title = format!("{} restarted on {name}", data["proc"].as_str().unwrap_or("A process"));
+            let message = format!("It exited with code {} and was restarted by {}.", data["exit_status"], data["caller"].as_str().unwrap_or("the system"));
+            on("ap_process_restarted", Changes, Severity::Low, title, message).tagged(format!("proc:{dev}"))
+        }
+        "ap_upgrade_failed" => {
+            let message = data["detail"].as_str().unwrap_or("The update did not complete.").to_string();
+            on("ap_upgrade_failed", Changes, Severity::Medium, format!("{name} firmware update failed"), message).link("/config?tab=firmware").tagged(format!("upgrade:{dev}"))
+        }
+        "ap_upgraded" => {
+            let title = format!("{name} updated to {}", data["to"].as_str().unwrap_or("new firmware"));
+            let message = format!("From {}.", data["from"].as_str().unwrap_or("the previous version"));
+            on("ap_upgraded", Changes, Severity::Info, title, message).link("/config?tab=firmware").tagged(format!("upgrade:{dev}"))
+        }
+        "config_applied" => {
+            let message = "The AP applied a configuration change.".into();
+            on("config_applied", Changes, Severity::Info, format!("New settings applied on {name}"), message).link("/config").tagged(format!("config:{dev}"))
+        }
         _ => return None,
     })
 }
@@ -357,9 +383,9 @@ async fn radio_health(store: &Arc<Store>, now: Ts) -> anyhow::Result<HashMap<(St
                 }
             }
             // Retries from the SSIDs' counters, counted as the other views count them.
-            let spec = Spec { table: "vap_stats", key: "bssid", extra: &["ap_mac", "radio"], cols: RETRY_COLS };
+            let spec = Spec { table: "vap_stats", key: "bssid", extra: &["ap_mac", "radio"], cols: &RETRY_COLS, only: None };
             let vaps = crate::insights::load(c, spec, 0, from, now)?;
-            for (k, t) in retry_totals(&vaps, from) {
+            for (k, t) in retry_totals(&vaps, RETRY_AT, from) {
                 let h = out.entry(k).or_default();
                 h.attempts = t[1];
                 if t.iter().sum::<f64>() > 0.0 {
@@ -375,28 +401,7 @@ async fn radio_health(store: &Arc<Store>, now: Ts) -> anyhow::Result<HashMap<(St
 /// Clients whose every connection attempt in the window failed.
 async fn failing_clients(store: &Arc<Store>, now: Ts) -> anyhow::Result<Vec<String>> {
     let store = store.clone();
-    let events = tokio::task::spawn_blocking(move || {
-        store.read(Db::Config, |c| {
-            let mut stmt = c.prepare("SELECT ts, ap_mac, client_mac, vap, essid, radio, event_type, detail FROM connections WHERE ts >= ?1")?;
-            let rows = stmt
-                .query_map([now - HEALTH_WINDOW], |r| {
-                    let detail: Option<String> = r.get(7)?;
-                    Ok(crate::connections::ConnEvent {
-                        ts: r.get(0)?,
-                        ap: r.get(1)?,
-                        client: r.get(2)?,
-                        vap: r.get(3)?,
-                        essid: r.get(4)?,
-                        radio: r.get(5)?,
-                        event_type: r.get(6)?,
-                        n: detail.and_then(|d| serde_json::from_str(&d).ok()).unwrap_or(Value::Null),
-                    })
-                })?
-                .collect::<rusqlite::Result<Vec<_>>>()?;
-            Ok(rows)
-        })
-    })
-    .await??;
+    let events = tokio::task::spawn_blocking(move || store.read(Db::Config, |c| Ok(crate::connections::load_rows(c, now - HEALTH_WINDOW, Ts::MAX, None, None)?))).await??;
     let attempts = crate::connections::attempts(events);
     let ok: HashSet<&str> = attempts.iter().filter(|a| a.success).map(|a| a.client.as_str()).collect();
     let mut failing: Vec<String> = attempts.iter().filter(|a| !a.success && !ok.contains(a.client.as_str())).map(|a| a.client.clone()).collect();
@@ -413,14 +418,13 @@ async fn load_open(store: &Arc<Store>) -> anyhow::Result<Vec<Alert>> {
             let mut stmt = c.prepare("SELECT id, ts, key, category, severity, entity, title, message, link, tag FROM alerts WHERE resolved_ts IS NULL")?;
             let rows = stmt
                 .query_map([], |r| {
-                    let cat: String = r.get(3)?;
-                    let sev: String = r.get(4)?;
+                    let (cat, sev): (String, String) = (r.get(3)?, r.get(4)?);
                     Ok(Alert {
                         id: r.get(0)?,
                         ts: r.get(1)?,
                         key: r.get(2)?,
-                        category: ["ap_status", "security", "health", "changes"].into_iter().find(|x| *x == cat).unwrap_or("changes"),
-                        severity: ["high", "medium", "low", "info"].into_iter().find(|x| *x == sev).unwrap_or("info"),
+                        category: Category::parse(&cat).unwrap_or(Category::Changes),
+                        severity: Severity::parse(&sev).unwrap_or(Severity::Info),
                         entity: r.get(5)?,
                         title: r.get(6)?,
                         message: r.get(7)?,
@@ -441,7 +445,7 @@ async fn load_open(store: &Arc<Store>) -> anyhow::Result<Vec<Alert>> {
 fn stale_health(open: &HashMap<(String, String), Alert>, judged: &HashSet<(String, String)>, unjudged: &mut HashMap<(String, String), u32>, known: &HashSet<String>) -> Vec<(String, String)> {
     let mut out = Vec::new();
     for (k, a) in open {
-        if a.category != "health" || k.0 == "connect_failures" {
+        if a.category != Category::Health || k.0 == "connect_failures" {
             continue;
         }
         if judged.contains(k) {
@@ -461,150 +465,203 @@ fn stale_health(open: &HashMap<(String, String), Alert>, judged: &HashSet<(Strin
     out
 }
 
-/// Starts the alert watcher.
-pub fn spawn(store: Arc<Store>, writer: Writer, live: SharedLive, tx: broadcast::Sender<LiveMsg>) {
-    let mut events = tx.subscribe();
-    tokio::spawn(async move {
-        let mut book = Alerts { writer, tx, seq: 0, open: HashMap::new() };
-        // Alerts left open by a previous run.
-        match load_open(&store).await {
+/// The engine's side of the watcher's own event channel: alert-worthy events
+/// only, so they are not lost among the log lines on the live broadcast. When
+/// the watcher falls that far behind, events are dropped and counted.
+#[derive(Clone)]
+pub struct Sink {
+    tx: mpsc::Sender<Event>,
+    dropped: Arc<AtomicU64>,
+}
+
+impl Sink {
+    /// Passes an event on if it may make an alert.
+    pub fn offer(&self, ev: &Event) {
+        if !EVENT_KINDS.contains(&ev.kind) {
+            return;
+        }
+        if let Err(mpsc::error::TrySendError::Full(_)) = self.tx.try_send(ev.clone()) {
+            let n = self.dropped.fetch_add(1, Ordering::Relaxed) + 1;
+            // The first drop, then every time the count doubles.
+            if n.is_power_of_two() {
+                tracing::warn!("the alert watcher is behind: {n} events dropped so far");
+            }
+        }
+    }
+}
+
+/// How many alert-worthy events may wait for the watcher.
+const QUEUE: usize = 1024;
+
+/// The engine's sender and the watcher's receiver (see [`spawn`]).
+pub fn channel() -> (Sink, mpsc::Receiver<Event>) {
+    let (tx, rx) = mpsc::channel(QUEUE);
+    (Sink { tx, dropped: Default::default() }, rx)
+}
+
+/// The alert watcher: open alerts and what the checks remember between runs.
+struct Watcher {
+    book: Alerts,
+    store: Arc<Store>,
+    live: SharedLive,
+    aps: ApWatch,
+    /// When each health alert last cleared, for the cooldown.
+    cleared: HashMap<(String, String), Ts>,
+    /// Checks in a row each open radio health alert was not judged in.
+    unjudged: HashMap<(String, String), u32>,
+}
+
+impl Watcher {
+    /// Starts with the alerts a previous run left open.
+    async fn start(store: Arc<Store>, writer: Writer, live: SharedLive, tx: broadcast::Sender<LiveMsg>) -> Watcher {
+        let mut w = Watcher { book: Alerts { writer, tx, seq: 0, open: HashMap::new() }, store, live, aps: ApWatch::default(), cleared: HashMap::new(), unjudged: HashMap::new() };
+        match load_open(&w.store).await {
             Ok(open) => {
                 for a in open {
-                    book.open.insert((a.key.clone(), a.entity.clone()), a);
+                    w.book.open.insert((a.key.clone(), a.entity.clone()), a);
                 }
             }
             Err(e) => tracing::warn!("could not load the open alerts: {e:#}"),
         }
-        let mut aps = ApWatch::default();
         // An AP already reported offline before a restart stays so.
-        for ((key, mac), a) in &book.open {
+        for ((key, mac), a) in &w.book.open {
             if key == "ap_offline" {
-                aps.down.insert(mac.clone(), a.ts - OFFLINE_AFTER);
-                aps.sent.entry(mac.clone()).or_default().push(a.ts);
+                w.aps.down.insert(mac.clone(), a.ts - OFFLINE_AFTER);
+                w.aps.sent.entry(mac.clone()).or_default().push(a.ts);
             }
         }
-        let mut cleared: HashMap<(String, String), Ts> = HashMap::new();
-        let mut unjudged: HashMap<(String, String), u32> = HashMap::new();
+        w
+    }
+
+    /// An event as it happens: a one-off alert, if it deserves one.
+    fn event(&mut self, now: Ts, e: &Event) {
+        // Most events make no alert: the name is looked up only for one that does.
+        let name = |m: &str| crate::insights::ap_name(&self.live.read().unwrap(), m).unwrap_or_else(|| m.to_string());
+        if let Some(a) = from_event(e.kind, e.device_mac.map(|m| m.to_string()).as_deref(), &e.data, &name) {
+            self.book.raise(now, a.resolved(now));
+        }
+    }
+
+    /// AP status: offline after a while without contact, back online.
+    fn status_tick(&mut self, now: Ts) {
+        let seen: Vec<(String, Option<String>, Ts)> = {
+            let l = self.live.read().unwrap();
+            let mut v: Vec<_> = l.devices.iter().map(|(m, d)| (m.to_string(), d.snapshot.ap.hostname.clone(), d.last_seen)).collect();
+            for (m, k) in &l.known_devices {
+                if !l.devices.contains_key(m) {
+                    v.push((m.to_string(), None, k.last_seen));
+                }
+            }
+            v
+        };
+        // APs neither reporting nor remembered (forgotten, replaced): their offline alert closes.
+        let known: HashSet<&str> = seen.iter().map(|(m, _, _)| m.as_str()).collect();
+        let gone: Vec<String> = self.book.open.keys().filter(|(k, m)| k == "ap_offline" && !known.contains(m.as_str())).map(|(_, m)| m.clone()).collect();
+        for mac in gone {
+            self.aps.down.remove(&mac);
+            self.book.resolve(now, "ap_offline", &mac, Some("The AP is no longer managed.".into()));
+        }
+        for (mac, name, last_seen) in seen {
+            let name = name.unwrap_or_else(|| mac.clone());
+            let tag = format!("ap-status:{mac}");
+            let status = |key: &str, severity: Severity, title: String, message: String| Alert::for_device(key, Category::ApStatus, severity, &mac, title, message).tagged(tag.clone());
+            match self.aps.check(now, &mac, last_seen) {
+                Some(ApChange::Offline { last_seen }) => {
+                    let message = format!("No contact for {} (last seen {}).", human(now - last_seen), clock(last_seen));
+                    self.book.open(now, status("ap_offline", Severity::High, format!("{name} is offline"), message));
+                }
+                Some(ApChange::Flapping { times }) => {
+                    let message = format!("Offline {times} times in the last day; further drops today are not reported separately.");
+                    self.book.open(now, status("ap_offline", Severity::Medium, format!("{name} keeps dropping off"), message));
+                }
+                Some(ApChange::Online { down_for, alerted }) => {
+                    let note = format!("Back after {}.", human(down_for));
+                    if self.book.resolve(now, "ap_offline", &mac, Some(note.clone())).is_some() || alerted {
+                        self.book.raise(now, status("ap_online", Severity::Low, format!("{name} is back online"), note).resolved(now));
+                    }
+                }
+                None => {}
+            }
+        }
+    }
+
+    /// Wi-Fi health over the last window: each radio, and clients failing to connect.
+    async fn health_tick(&mut self, now: Ts) {
+        let (online, known): (HashSet<String>, HashSet<String>) = {
+            let l = self.live.read().unwrap();
+            (l.devices.iter().filter(|(_, d)| d.online).map(|(m, _)| m.to_string()).collect(), l.devices.keys().map(|m| m.to_string()).collect())
+        };
+        match radio_health(&self.store, now).await {
+            Ok(radios) => self.judge_radios(now, radios, &online, &known),
+            Err(e) => tracing::warn!("radio health check failed: {e:#}"),
+        }
+        match failing_clients(&self.store, now).await {
+            Ok(failing) => self.judge_connections(now, failing.len()),
+            Err(e) => tracing::warn!("connection health check failed: {e:#}"),
+        }
+    }
+
+    /// Raises or clears each threshold of each online AP's radios, and closes
+    /// the alerts of radios no longer judged.
+    fn judge_radios(&mut self, now: Ts, radios: HashMap<(String, String), RadioHealth>, online: &HashSet<String>, known: &HashSet<String>) {
+        let mut judged: HashSet<(String, String)> = HashSet::new();
+        for ((mac, radio), h) in radios {
+            if !online.contains(&mac) {
+                continue;
+            }
+            for (key, value, raise_at, clear_at, what) in radio_checks(&h) {
+                let entity = format!("{mac}/{radio}");
+                let k = (key.to_string(), entity.clone());
+                let Some(v) = value else { continue };
+                judged.insert(k.clone());
+                if v >= raise_at && !self.book.open.contains_key(&k) && self.cleared.get(&k).is_none_or(|t| now - t >= HEALTH_COOLDOWN) {
+                    let name = crate::insights::ap_name(&self.live.read().unwrap(), &mac).unwrap_or_else(|| mac.clone());
+                    let title = format!("High {what} on {name} {}", band_name(&radio));
+                    let message = format!("{what} has averaged {v:.0}% over the last 15 minutes (alert at {raise_at:.0}%).");
+                    let a = Alert::new(key, Category::Health, Severity::Medium, &entity, title, message).link(format!("/devices/{mac}")).tagged(format!("health:{key}:{entity}"));
+                    self.book.open(now, a);
+                } else if v < clear_at && self.book.resolve(now, key, &entity, Some(format!("Back to normal: {what} {v:.0}%."))).is_some() {
+                    self.cleared.insert(k, now);
+                }
+            }
+        }
+        for (key, entity) in stale_health(&self.book.open, &judged, &mut self.unjudged, known) {
+            if self.book.resolve(now, &key, &entity, Some("No longer reported: the radio or its AP stopped reporting.".into())).is_some() {
+                self.cleared.insert((key, entity), now);
+            }
+        }
+    }
+
+    /// Raises an alert when at least three clients failed every connection
+    /// attempt in the window; clears it when none did.
+    fn judge_connections(&mut self, now: Ts, failing: usize) {
+        let k = ("connect_failures".to_string(), "site".to_string());
+        if failing >= 3 && !self.book.open.contains_key(&k) && self.cleared.get(&k).is_none_or(|t| now - t >= HEALTH_COOLDOWN) {
+            let message = "Every connection attempt these clients made in the last 15 minutes failed.".into();
+            let a = Alert::new("connect_failures", Category::Health, Severity::Medium, "site", format!("{failing} clients can't connect"), message);
+            self.book.open(now, a.link("/clients?tab=attempts").tagged("health:connect_failures"));
+        } else if failing == 0 && self.book.resolve(now, "connect_failures", "site", Some("Clients are connecting again.".into())).is_some() {
+            self.cleared.insert(k, now);
+        }
+    }
+}
+
+/// Starts the alert watcher, fed by the engine through `events` (see [`channel`]).
+pub fn spawn(store: Arc<Store>, writer: Writer, live: SharedLive, tx: broadcast::Sender<LiveMsg>, mut events: mpsc::Receiver<Event>) {
+    tokio::spawn(async move {
+        let mut w = Watcher::start(store, writer, live, tx).await;
         // Give APs a chance to report after a restart before judging them.
         let mut status = tokio::time::interval_at(tokio::time::Instant::now() + Duration::from_secs(90), Duration::from_secs(30));
         let mut health = tokio::time::interval_at(tokio::time::Instant::now() + Duration::from_secs(120), Duration::from_secs(60));
         loop {
+            // Events wait in the channel while a check runs.
             tokio::select! {
-                msg = events.recv() => match msg {
-                    Ok(LiveMsg::Event(e)) => {
-                        // Most events make no alert: the name is looked up only for one that does.
-                        let name = |m: &str| crate::insights::ap_name(&live.read().unwrap(), m).unwrap_or_else(|| m.to_string());
-                        if let Some(a) = from_event(e.kind, e.device_mac.map(|m| m.to_string()).as_deref(), &e.data, &name) {
-                            let resolved = Alert { resolved_ts: Some(store::now_ts()), ..a };
-                            book.raise(store::now_ts(), resolved);
-                        }
-                    }
-                    Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {}
-                    Err(broadcast::error::RecvError::Closed) => return,
+                e = events.recv() => match e {
+                    Some(e) => w.event(store::now_ts(), &e),
+                    None => return,
                 },
-                _ = status.tick() => {
-                    let now = store::now_ts();
-                    let seen: Vec<(String, Option<String>, Ts)> = {
-                        let l = live.read().unwrap();
-                        let mut v: Vec<_> = l.devices.iter().map(|(m, d)| (m.to_string(), d.snapshot.ap.hostname.clone(), d.last_seen)).collect();
-                        for (m, k) in &l.known_devices {
-                            if !l.devices.contains_key(m) {
-                                v.push((m.to_string(), None, k.last_seen));
-                            }
-                        }
-                        v
-                    };
-                    // APs neither reporting nor remembered (forgotten, replaced): their offline alert closes.
-                    let known: HashSet<&str> = seen.iter().map(|(m, _, _)| m.as_str()).collect();
-                    let gone: Vec<String> = book.open.keys().filter(|(k, m)| k == "ap_offline" && !known.contains(m.as_str())).map(|(_, m)| m.clone()).collect();
-                    for mac in gone {
-                        aps.down.remove(&mac);
-                        book.resolve(now, "ap_offline", &mac, Some("The AP is no longer managed.".into()));
-                    }
-                    for (mac, name, last_seen) in seen {
-                        let name = name.unwrap_or_else(|| mac.clone());
-                        let tag = format!("ap-status:{mac}");
-                        let link = Some(format!("/devices/{mac}"));
-                        match aps.check(now, &mac, last_seen) {
-                            Some(ApChange::Offline { last_seen }) => book.open(now, alert(
-                                "ap_offline", "ap_status", "high", &mac,
-                                format!("{name} is offline"),
-                                format!("No contact for {} (last seen {}).", human(now - last_seen), clock(last_seen)),
-                                link, tag,
-                            )),
-                            Some(ApChange::Flapping { times }) => book.open(now, alert(
-                                "ap_offline", "ap_status", "medium", &mac,
-                                format!("{name} keeps dropping off"),
-                                format!("Offline {times} times in the last day; further drops today are not reported separately."),
-                                link, tag,
-                            )),
-                            Some(ApChange::Online { down_for, alerted }) => {
-                                let note = format!("Back after {}.", human(down_for));
-                                if book.resolve(now, "ap_offline", &mac, Some(note.clone())).is_some() || alerted {
-                                    let back = alert("ap_online", "ap_status", "low", &mac, format!("{name} is back online"), note, link, tag);
-                                    book.raise(now, Alert { resolved_ts: Some(now), ..back });
-                                }
-                            }
-                            None => {}
-                        }
-                    }
-                }
-                _ = health.tick() => {
-                    let now = store::now_ts();
-                    let (online, known): (HashSet<String>, HashSet<String>) = {
-                        let l = live.read().unwrap();
-                        (l.devices.iter().filter(|(_, d)| d.online).map(|(m, _)| m.to_string()).collect(), l.devices.keys().map(|m| m.to_string()).collect())
-                    };
-                    match radio_health(&store, now).await {
-                        Ok(radios) => {
-                            let mut judged: HashSet<(String, String)> = HashSet::new();
-                            for ((mac, radio), h) in radios {
-                                if !online.contains(&mac) {
-                                    continue;
-                                }
-                                for (key, value, raise_at, clear_at, what) in radio_checks(&h) {
-                                    let entity = format!("{mac}/{radio}");
-                                    let k = (key.to_string(), entity.clone());
-                                    let Some(v) = value else { continue };
-                                    judged.insert(k.clone());
-                                    if v >= raise_at && !book.open.contains_key(&k) && cleared.get(&k).is_none_or(|t| now - t >= HEALTH_COOLDOWN) {
-                                        let name = crate::insights::ap_name(&live.read().unwrap(), &mac).unwrap_or_else(|| mac.clone());
-                                        book.open(now, alert(
-                                            key, "health", "medium", &entity,
-                                            format!("High {what} on {name} {}", band_name(&radio)),
-                                            format!("{what} has averaged {v:.0}% over the last 15 minutes (alert at {raise_at:.0}%)."),
-                                            Some(format!("/devices/{mac}")), format!("health:{key}:{entity}"),
-                                        ));
-                                    } else if v < clear_at && book.resolve(now, key, &entity, Some(format!("Back to normal: {what} {v:.0}%."))).is_some() {
-                                        cleared.insert(k, now);
-                                    }
-                                }
-                            }
-                            for (key, entity) in stale_health(&book.open, &judged, &mut unjudged, &known) {
-                                if book.resolve(now, &key, &entity, Some("No longer reported: the radio or its AP stopped reporting.".into())).is_some() {
-                                    cleared.insert((key, entity), now);
-                                }
-                            }
-                        }
-                        Err(e) => tracing::warn!("radio health check failed: {e:#}"),
-                    }
-                    match failing_clients(&store, now).await {
-                        Ok(failing) => {
-                            let k = ("connect_failures".to_string(), "site".to_string());
-                            if failing.len() >= 3 && !book.open.contains_key(&k) && cleared.get(&k).is_none_or(|t| now - t >= HEALTH_COOLDOWN) {
-                                book.open(now, alert(
-                                    "connect_failures", "health", "medium", "site",
-                                    format!("{} clients can't connect", failing.len()),
-                                    "Every connection attempt these clients made in the last 15 minutes failed.".into(),
-                                    Some("/clients?tab=attempts".into()), "health:connect_failures".into(),
-                                ));
-                            } else if failing.is_empty() && book.resolve(now, "connect_failures", "site", Some("Clients are connecting again.".into())).is_some() {
-                                cleared.insert(k, now);
-                            }
-                        }
-                        Err(e) => tracing::warn!("connection health check failed: {e:#}"),
-                    }
-                }
+                _ = status.tick() => w.status_tick(store::now_ts()),
+                _ = health.tick() => w.health_tick(store::now_ts()).await,
             }
         }
     });
@@ -685,11 +742,96 @@ mod tests {
     fn events_that_deserve_an_alert() {
         let name = |m: &str| if m == "aa" { "Garage".to_string() } else { m.to_string() };
         let t = from_event("network_threat", Some("aa"), &json!({ "kind": "impersonation", "severity": "high", "bssid": "02:00:00:00:00:01", "essid": "Home", "detail": "x" }), &name).unwrap();
-        assert_eq!((t.category, t.severity, t.title.as_str()), ("security", "high", "Suspicious network: \"Home\""));
+        assert_eq!((t.category, t.severity, t.title.as_str()), (Category::Security, Severity::High, "Suspicious network: \"Home\""));
+        assert_eq!((t.entity.as_str(), t.tag.as_str(), t.link.as_deref()), ("impersonation/02:00:00:00:00:01", "threat:impersonation:02:00:00:00:00:01", Some("/radios?tab=rogue")));
+        let j = json!(t);
+        assert_eq!((j["category"].as_str(), j["severity"].as_str()), (Some("security"), Some("high")), "named as before");
         assert!(from_event("network_threat", Some("aa"), &json!({ "severity": "low" }), &name).is_none(), "low findings only show in the list");
         let r = from_event("ap_restarted", Some("aa"), &json!({ "uptime": 7200 }), &name).unwrap();
         assert_eq!((r.title.as_str(), r.message.as_str()), ("Garage restarted", "It had been up for 2.0 h."));
+        assert_eq!((r.link.as_deref(), r.tag.as_str()), (Some("/devices/aa"), "restart:aa"));
+        let u = from_event("ap_upgraded", Some("aa"), &json!({ "to": "8.8.12" }), &name).unwrap();
+        assert_eq!((u.link.as_deref(), u.tag.as_str(), u.severity), (Some("/config?tab=firmware"), "upgrade:aa", Severity::Info));
         assert!(from_event("client_connected", Some("aa"), &json!({}), &name).is_none());
+        // Every kind the engine passes on can make an alert.
+        for kind in EVENT_KINDS {
+            assert!(from_event(kind, Some("aa"), &json!({ "severity": "high" }), &name).is_some(), "{kind}");
+        }
+    }
+
+    fn watcher() -> (Watcher, broadcast::Receiver<LiveMsg>) {
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!("apctl-alerts-{}-{}", std::process::id(), SEQ.fetch_add(1, Ordering::Relaxed)));
+        let (store, writer) = Store::open(&dir).unwrap();
+        let (tx, rx) = broadcast::channel(64);
+        let book = Alerts { writer, tx, seq: 0, open: HashMap::new() };
+        (Watcher { book, store, live: Default::default(), aps: ApWatch::default(), cleared: HashMap::new(), unjudged: HashMap::new() }, rx)
+    }
+
+    /// What live subscribers were told: (action, alert key).
+    fn told(rx: &mut broadcast::Receiver<LiveMsg>) -> Vec<(&'static str, String)> {
+        let mut out = Vec::new();
+        while let Ok(LiveMsg::Alert(m)) = rx.try_recv() {
+            out.push((m.action, m.alert.key));
+        }
+        out
+    }
+
+    #[tokio::test]
+    async fn events_reach_the_watcher_on_their_own_channel() {
+        let (sink, mut events) = channel();
+        let ev = |kind| Event { ts: 0, kind, device_mac: "02:00:00:00:00:01".parse().ok(), client_mac: None, data: json!({ "uptime": 60 }) };
+        // Only what may make an alert is passed on.
+        sink.offer(&ev("client_connected"));
+        sink.offer(&ev("ap_restarted"));
+        let e = events.recv().await.unwrap();
+        assert_eq!(e.kind, "ap_restarted");
+        assert!(events.try_recv().is_err());
+        // A full queue drops and counts.
+        for _ in 0..QUEUE + 3 {
+            sink.offer(&ev("ap_restarted"));
+        }
+        assert_eq!(sink.dropped.load(Ordering::Relaxed), 3);
+        let (mut w, mut rx) = watcher();
+        w.event(100, &e);
+        assert_eq!(told(&mut rx), [("raised", "ap_restarted".to_string())]);
+        assert!(w.book.open.is_empty(), "a one-off notice, raised resolved");
+    }
+
+    #[tokio::test]
+    async fn connection_failures_open_once_and_clear() {
+        let (mut w, mut rx) = watcher();
+        w.judge_connections(1000, 2);
+        assert!(told(&mut rx).is_empty(), "two clients are not enough");
+        w.judge_connections(1000, 3);
+        w.judge_connections(1060, 5);
+        assert_eq!(told(&mut rx), [("raised", "connect_failures".to_string())]);
+        w.judge_connections(1120, 1);
+        assert!(told(&mut rx).is_empty(), "cleared only when nobody fails");
+        w.judge_connections(1180, 0);
+        assert_eq!(told(&mut rx), [("resolved", "connect_failures".to_string())]);
+        // Not again within the cooldown.
+        w.judge_connections(1240, 9);
+        assert!(told(&mut rx).is_empty());
+        w.judge_connections(1180 + HEALTH_COOLDOWN, 9);
+        assert_eq!(told(&mut rx), [("raised", "connect_failures".to_string())]);
+    }
+
+    #[tokio::test]
+    async fn radio_thresholds_raise_and_clear() {
+        let (mut w, mut rx) = watcher();
+        let ap = "02:00:00:00:00:01".to_string();
+        let set: HashSet<String> = [ap.clone()].into();
+        let busy = |cu| HashMap::from([((ap.clone(), "na".to_string()), RadioHealth { utilisation: Some(cu), ..Default::default() })]);
+        w.judge_radios(1000, busy(85.0), &HashSet::new(), &set);
+        assert!(told(&mut rx).is_empty(), "offline APs are not judged");
+        w.judge_radios(1000, busy(85.0), &set, &set);
+        let a = &w.book.open[&("busy_channel".to_string(), format!("{ap}/na"))];
+        assert_eq!((a.category, a.tag.as_str(), a.link.as_deref()), (Category::Health, "health:busy_channel:02:00:00:00:00:01/na", Some("/devices/02:00:00:00:00:01")));
+        w.judge_radios(1060, busy(75.0), &set, &set);
+        assert_eq!(told(&mut rx), [("raised", "busy_channel".to_string())], "75% is between the two thresholds");
+        w.judge_radios(1120, busy(65.0), &set, &set);
+        assert_eq!(told(&mut rx), [("resolved", "busy_channel".to_string())]);
     }
 
     #[test]
@@ -697,8 +839,8 @@ mod tests {
         let ap = "02:00:00:00:00:01";
         let k = ("busy_channel".to_string(), format!("{ap}/na"));
         let book: HashMap<(String, String), Alert> = [
-            (k.clone(), alert("busy_channel", "health", "medium", &k.1, "t".into(), "m".into(), None, "x".into())),
-            (("connect_failures".into(), "site".into()), alert("connect_failures", "health", "medium", "site", "t".into(), "m".into(), None, "y".into())),
+            (k.clone(), Alert::new("busy_channel", Category::Health, Severity::Medium, &k.1, "t".into(), "m".into())),
+            (("connect_failures".into(), "site".into()), Alert::new("connect_failures", Category::Health, Severity::Medium, "site", "t".into(), "m".into())),
         ]
         .into();
         let known: HashSet<String> = [ap.to_string()].into();
