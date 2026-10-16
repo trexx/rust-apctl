@@ -324,11 +324,12 @@ pub fn render_radios(c: &mut Cfg, ctx: &Ctx, radios: &[Radio], vaps: &[Vap]) -> 
         if bit(ctx.caps.wifi2, 2) {
             c.set(k.at("green_ap"), if flag(ctx.device, "green_ap_enabled", false) { 2 } else { 0 });
         }
-        // Sensitivity values are offsets above -95 dBm.
-        let min_rssi = (int_of(d, "min_rssi").unwrap_or(-80) + 95).max(1);
+        // Sensitivity values are offsets above -95 dBm (saturating: an imported value
+        // can be any number).
+        let min_rssi = int_of(d, "min_rssi").unwrap_or(-80).saturating_add(95).max(1);
         let sens = if bit(int_of(d, "radio_caps").unwrap_or(0) as u64, RCAP_HARD_NOISE_FLOOR) {
             if flag(d, "sens_level_enabled", false) {
-                Some(int_of(d, "sens_level").unwrap_or(-94) + 95)
+                Some(int_of(d, "sens_level").unwrap_or(-94).saturating_add(95))
             } else if flag(d, "min_rssi_enabled", false) && flag(d, "hard_noise_floor_enabled", false) {
                 Some(min_rssi - 6)
             } else {

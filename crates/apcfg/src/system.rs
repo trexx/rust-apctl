@@ -450,6 +450,9 @@ fn ntp(c: &mut Cfg, ctx: &Ctx) {
     }
 }
 
+/// Most switch ports any UniFi device has (the 48-port switches' 52).
+const MAX_PORTS: i64 = 52;
+
 fn switch(c: &mut Cfg, ctx: &Ctx) {
     c.header("switch");
     if !bit(ctx.caps.fw, 4) {
@@ -459,14 +462,23 @@ fn switch(c: &mut Cfg, ctx: &Ctx) {
     c.set("switch.vlan.status", on_off(flag(ctx.device, "switch_vlan_enabled", false)));
     c.set("switch.jumboframes", on_off(flag(ctx.device, "jumboframe_enabled", false)));
     c.set("switch.dot1x.status", "disabled");
-    let ports: i64 = arr(ctx.device, "ethernet_table").iter().filter_map(|e| int_of(e, "num_port")).sum();
-    for i in 1..=ports.max(1) {
-        let name = arr(ctx.device, "port_overrides")
-            .iter()
-            .find(|p| int_of(p, "port_idx") == Some(i))
-            .and_then(|p| str_of(p, "name"))
-            .map_or_else(|| format!("Port {i}"), str::to_string);
-        c.set(format_args!("switch.port.{i}.name"), name);
+    // The ports of all its interfaces, as the AP reported them. Imported numbers can be
+    // anything, and no UniFi device has more than 52 ports.
+    let ports = arr(ctx.device, "ethernet_table").iter().filter_map(|e| int_of(e, "num_port")).map(|n| n.clamp(0, MAX_PORTS)).fold(0, i64::saturating_add).clamp(1, MAX_PORTS) as usize;
+    // The first override for a port decides its name.
+    let mut overrides: Vec<Option<&Value>> = vec![None; ports + 1];
+    for p in arr(ctx.device, "port_overrides") {
+        if let Some(slot) = int_of(p, "port_idx").and_then(|i| usize::try_from(i).ok()).filter(|&i| i >= 1).and_then(|i| overrides.get_mut(i))
+            && slot.is_none()
+        {
+            *slot = Some(p);
+        }
+    }
+    for (i, p) in overrides.iter().enumerate().skip(1) {
+        match p.and_then(|p| str_of(p, "name")) {
+            Some(name) => c.set(format_args!("switch.port.{i}.name"), name),
+            None => c.set(format_args!("switch.port.{i}.name"), format_args!("Port {i}")),
+        }
         c.set(format_args!("switch.port.{i}.opmode"), "switch");
     }
 }
@@ -755,7 +767,47 @@ fn cron(c: &mut Cfg, ctx: &Ctx, radios: &[Radio], vaps: &[Vap]) {
 
 #[cfg(test)]
 mod tests {
-    use super::hostname;
+    use super::*;
+    use crate::{Controller, Input};
+    use serde_json::json;
+
+    fn switch_lines(ethernet_table: Value, port_overrides: Value) -> Vec<String> {
+        let mac = "02:00:00:00:00:01";
+        let state = json!({ "sites": [{ "_id": "s" }], "devices": [
+            { "mac": mac, "site_id": "s", "type": "uap", "fw_caps": 16, "ethernet_table": ethernet_table, "port_overrides": port_overrides },
+        ]});
+        let controller = Controller {
+            inform_url: String::new(),
+            mgmt_url: String::new(),
+            stun_url: String::new(),
+            syslog_ip: None,
+            version: String::new(),
+            reporter_uuid: String::new(),
+        };
+        let ctx = Ctx::new(&Input { state: &state, device_mac: mac, inform: None, cfgversion: "1", controller: &controller }).unwrap();
+        let mut c = Cfg::default();
+        switch(&mut c, &ctx);
+        c.finish().lines().filter(|l| l.starts_with("switch.port.")).map(str::to_string).collect()
+    }
+
+    #[test]
+    fn switch_ports_are_clamped_and_named_by_their_first_override() {
+        let overrides = json!([
+            { "port_idx": 2, "name": "Desk" }, { "port_idx": 2, "name": "later" }, { "port_idx": 3 }, { "port_idx": 3, "name": "unnamed first" },
+            { "port_idx": -1, "name": "x" }, { "port_idx": 0, "name": "x" }, { "port_idx": 1_000_000, "name": "x" },
+        ]);
+        let lines = switch_lines(json!([{ "num_port": 3 }]), overrides.clone());
+        assert_eq!(lines, [
+            "switch.port.1.name=Port 1", "switch.port.1.opmode=switch", "switch.port.2.name=Desk", "switch.port.2.opmode=switch",
+            "switch.port.3.name=Port 3", "switch.port.3.opmode=switch",
+        ]);
+        for huge in [json!([{ "num_port": 1_000_000_000 }, { "num_port": 2 }]), json!([{ "num_port": i64::MAX }, { "num_port": i64::MAX }])] {
+            let lines = switch_lines(huge, overrides.clone());
+            assert_eq!((lines.len(), lines.last().map(String::as_str)), (2 * 52, Some("switch.port.52.opmode=switch")));
+        }
+        assert_eq!(switch_lines(json!([{ "num_port": -5 }, { "num_port": 2 }]), json!([])).len(), 2 * 2);
+        assert_eq!(switch_lines(json!([]), json!([])), ["switch.port.1.name=Port 1", "switch.port.1.opmode=switch"]);
+    }
 
     #[test]
     fn hostnames() {
