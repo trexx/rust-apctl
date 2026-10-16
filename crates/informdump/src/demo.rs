@@ -20,6 +20,7 @@ use anyhow::Result;
 use etherparse::PacketBuilder;
 use inform::{Flags, Mac};
 use serde_json::{Value, json};
+use wire::capture::sample::{self, http};
 
 const TEMPLATE_INFORM: &str = include_str!("demo/inform.json");
 const TEMPLATE_STATE: &str = include_str!("demo/state.json");
@@ -586,23 +587,12 @@ struct PcapWriter<W: Write> {
 
 impl<W: Write> PcapWriter<W> {
     fn new(mut out: W) -> Result<Self> {
-        out.write_all(&0xa1b2c3d4u32.to_le_bytes())?;
-        out.write_all(&2u16.to_le_bytes())?;
-        out.write_all(&4u16.to_le_bytes())?;
-        out.write_all(&0i32.to_le_bytes())?;
-        out.write_all(&0u32.to_le_bytes())?;
-        out.write_all(&262_144u32.to_le_bytes())?;
-        out.write_all(&1u32.to_le_bytes())?; // ethernet
+        sample::write_pcap_header(&mut out, 262_144)?;
         Ok(PcapWriter { out, seq: vec![(1, 1); APS.len()] })
     }
 
     fn record(&mut self, ts_ms: i64, frame: &[u8]) -> Result<()> {
-        self.out.write_all(&((ts_ms / 1000) as u32).to_le_bytes())?;
-        self.out.write_all(&((ts_ms % 1000 * 1000) as u32).to_le_bytes())?;
-        self.out.write_all(&(frame.len() as u32).to_le_bytes())?;
-        self.out.write_all(&(frame.len() as u32).to_le_bytes())?;
-        self.out.write_all(frame)?;
-        Ok(())
+        Ok(sample::write_pcap_record(&mut self.out, ts_ms * 1000, frame)?)
     }
 
     fn tcp(&mut self, ts_ms: i64, ap: usize, to_server: bool, data: &[u8]) -> Result<()> {
@@ -630,12 +620,6 @@ impl<W: Write> PcapWriter<W> {
         PacketBuilder::ethernet2(mac_bytes(a.mac), [0x0e, 0x5d, 0x7a, 0, 0, 0x10]).ipv4(a.ip, CONTROLLER_IP, 64).udp(38_000, 5514).write(&mut frame, text.as_bytes())?;
         self.record(ts_ms, &frame)
     }
-}
-
-fn http(head: &str, body: &[u8]) -> Vec<u8> {
-    let mut m = format!("{head}Content-Length: {}\r\n\r\n", body.len()).into_bytes();
-    m.extend_from_slice(body);
-    m
 }
 
 /// Streams the demo capture: `hours` of history ending now, then (with

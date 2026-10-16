@@ -621,21 +621,57 @@ mod tests {
     }
 }
 
-/// Builds synthetic captures for tests (here and in dependent crates).
+/// Synthetic captures and the capture fixtures, for tests here and in dependent crates (and
+/// informdump's made-up demo site, which writes the same pcap framing).
 #[doc(hidden)]
 pub mod sample {
+    use std::io::{self, Write};
+    use std::path::PathBuf;
+
     use etherparse::PacketBuilder;
+
+    use super::Micros;
+
+    /// The sanitised capture fixtures, kept outside the repository:
+    /// `$APCTL_TESTDATA/2026-10-12-u6m-8.8.11`. `None`, saying why, when they are not
+    /// there: tests that need them skip.
+    pub fn fixtures() -> Option<PathBuf> {
+        let Some(root) = std::env::var_os("APCTL_TESTDATA") else {
+            eprintln!("skipped: APCTL_TESTDATA is not set, so the capture fixtures are not available");
+            return None;
+        };
+        let dir = PathBuf::from(root).join("2026-10-12-u6m-8.8.11");
+        if !dir.is_dir() {
+            eprintln!("skipped: no capture fixtures in {}", dir.display());
+            return None;
+        }
+        Some(dir)
+    }
+
+    /// The header of a legacy pcap (microsecond timestamps) of Ethernet frames.
+    pub fn write_pcap_header(out: &mut impl Write, snaplen: u32) -> io::Result<()> {
+        out.write_all(&0xa1b2c3d4u32.to_le_bytes())?;
+        out.write_all(&2u16.to_le_bytes())?;
+        out.write_all(&4u16.to_le_bytes())?;
+        out.write_all(&0i32.to_le_bytes())?;
+        out.write_all(&0u32.to_le_bytes())?;
+        out.write_all(&snaplen.to_le_bytes())?;
+        out.write_all(&1u32.to_le_bytes()) // ethernet
+    }
+
+    /// One legacy pcap record holding all of `frame`.
+    pub fn write_pcap_record(out: &mut impl Write, ts: Micros, frame: &[u8]) -> io::Result<()> {
+        out.write_all(&((ts / 1_000_000) as u32).to_le_bytes())?;
+        out.write_all(&((ts % 1_000_000) as u32).to_le_bytes())?;
+        out.write_all(&(frame.len() as u32).to_le_bytes())?;
+        out.write_all(&(frame.len() as u32).to_le_bytes())?;
+        out.write_all(frame)
+    }
 
     /// A legacy pcap containing the given TCP segments as (to_server, seq, payload).
     pub fn pcap(segments: &[(bool, u32, &[u8])]) -> Vec<u8> {
         let mut out = Vec::new();
-        out.extend_from_slice(&0xa1b2c3d4u32.to_le_bytes());
-        out.extend_from_slice(&2u16.to_le_bytes());
-        out.extend_from_slice(&4u16.to_le_bytes());
-        out.extend_from_slice(&0i32.to_le_bytes());
-        out.extend_from_slice(&0u32.to_le_bytes());
-        out.extend_from_slice(&65535u32.to_le_bytes());
-        out.extend_from_slice(&1u32.to_le_bytes()); // ethernet
+        write_pcap_header(&mut out, 65535).unwrap();
         let (ap, ctrl) = ([10, 0, 0, 5], [10, 0, 0, 1]);
         for (i, (to_server, seq, payload)) in segments.iter().enumerate() {
             let builder = if *to_server {
@@ -645,31 +681,25 @@ pub mod sample {
             };
             let mut frame = Vec::new();
             builder.write(&mut frame, payload).unwrap();
-            let ts_sec = 1_791_840_600 + i as u32;
-            out.extend_from_slice(&ts_sec.to_le_bytes());
-            out.extend_from_slice(&0u32.to_le_bytes());
-            out.extend_from_slice(&(frame.len() as u32).to_le_bytes());
-            out.extend_from_slice(&(frame.len() as u32).to_le_bytes());
-            out.extend_from_slice(&frame);
+            write_pcap_record(&mut out, (1_791_840_600 + i as Micros) * 1_000_000, &frame).unwrap();
         }
         out
     }
 
-    pub fn http_request(body: &[u8]) -> Vec<u8> {
-        let mut m = format!(
-            "POST /inform HTTP/1.1\r\nHost: unifi\r\nX-Forwarded-For: 192.168.1.20\r\nContent-Length: {}\r\n\r\n",
-            body.len()
-        )
-        .into_bytes();
+    /// An HTTP/1.1 message: `head` is the start line and headers, each ending in CRLF;
+    /// the Content-Length and the blank line are added.
+    pub fn http(head: &str, body: &[u8]) -> Vec<u8> {
+        let mut m = format!("{head}Content-Length: {}\r\n\r\n", body.len()).into_bytes();
         m.extend_from_slice(body);
         m
     }
 
+    pub fn http_request(body: &[u8]) -> Vec<u8> {
+        http("POST /inform HTTP/1.1\r\nHost: unifi\r\nX-Forwarded-For: 192.168.1.20\r\n", body)
+    }
+
     pub fn http_response(body: &[u8]) -> Vec<u8> {
-        let mut m = format!("HTTP/1.1 200 OK\r\nContent-Type: application/x-binary\r\nContent-Length: {}\r\n\r\n", body.len())
-            .into_bytes();
-        m.extend_from_slice(body);
-        m
+        http("HTTP/1.1 200 OK\r\nContent-Type: application/x-binary\r\n", body)
     }
 }
 

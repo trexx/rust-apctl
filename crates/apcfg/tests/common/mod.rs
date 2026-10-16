@@ -13,23 +13,12 @@ use std::path::PathBuf;
 use apcfg::{Controller, Input, Output};
 use serde_json::{Value, json};
 
+/// The capture fixtures (sanitised real captures, kept outside the repository).
+/// Tests that need them skip without them.
+pub use wire::capture::sample::fixtures;
+
 pub const AP_B: &str = "02:00:00:00:00:01";
 pub const AP_U: &str = "02:00:00:00:00:02";
-
-/// The capture fixtures (sanitised real captures, kept outside the repository):
-/// `$APCTL_TESTDATA/2026-10-12-u6m-8.8.11`. Tests that need them skip without it.
-pub fn fixtures() -> Option<PathBuf> {
-    let Some(root) = std::env::var_os("APCTL_TESTDATA") else {
-        eprintln!("skipped: APCTL_TESTDATA is not set, so the capture fixtures are not available");
-        return None;
-    };
-    let dir = PathBuf::from(root).join("2026-10-12-u6m-8.8.11");
-    if !dir.is_dir() {
-        eprintln!("skipped: no capture fixtures in {}", dir.display());
-        return None;
-    }
-    Some(dir)
-}
 
 pub fn dir() -> PathBuf {
     fixtures().expect("capture fixtures")

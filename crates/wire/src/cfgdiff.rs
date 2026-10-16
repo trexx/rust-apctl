@@ -143,23 +143,10 @@ mod tests {
 #[cfg(test)]
 mod capture_fixtures {
     use super::*;
+    use crate::capture::sample::fixtures;
     use serde_json::Value;
     use std::collections::HashMap;
     use std::path::PathBuf;
-
-    /// The sanitised captures, kept outside the repository: `$APCTL_TESTDATA/2026-10-12-u6m-8.8.11`.
-    fn fixtures() -> Option<PathBuf> {
-        let Some(root) = std::env::var_os("APCTL_TESTDATA") else {
-            eprintln!("skipped: APCTL_TESTDATA is not set, so the capture fixtures are not available");
-            return None;
-        };
-        let dir = PathBuf::from(root).join("2026-10-12-u6m-8.8.11");
-        if !dir.is_dir() {
-            eprintln!("skipped: no capture fixtures in {}", dir.display());
-            return None;
-        }
-        Some(dir)
-    }
 
     fn dir() -> PathBuf {
         fixtures().expect("capture fixtures")
