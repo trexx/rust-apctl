@@ -228,12 +228,24 @@ async fn serve(args: ServeArgs) -> Result<()> {
         let tx = in_tx.clone();
         tokio::spawn(async move {
             let mut buf = vec![0u8; 8192];
+            // Syslog shares the engine's queue with the informs: when the queue is
+            // full, datagrams are dropped (and counted) rather than holding up the
+            // APs' informs behind a flood.
+            let (mut dropped, mut last_warning) = (0u64, None::<std::time::Instant>);
             loop {
                 match socket.recv_from(&mut buf).await {
                     Ok((n, src)) => {
                         let input = Input::Datagram { ts: store::now_ts(), src_ip: src.ip().to_string(), payload: buf[..n].to_vec() };
-                        if tx.send(input).await.is_err() {
-                            return;
+                        match tx.try_send(input) {
+                            Ok(()) => {}
+                            Err(mpsc::error::TrySendError::Full(_)) => {
+                                dropped += 1;
+                                if last_warning.is_none_or(|t| t.elapsed() >= Duration::from_secs(60)) {
+                                    tracing::warn!("engine busy: dropped {dropped} syslog datagram(s)");
+                                    (dropped, last_warning) = (0, Some(std::time::Instant::now()));
+                                }
+                            }
+                            Err(mpsc::error::TrySendError::Closed(_)) => return,
                         }
                     }
                     Err(e) => tracing::warn!("syslog socket: {e}"),
@@ -264,11 +276,15 @@ async fn serve(args: ServeArgs) -> Result<()> {
             }
         }
     });
-    tokio::spawn(async move {
-        while let Some(input) = in_rx.recv().await {
+    // The engine is synchronous and at times busy (diffs, dry-run renders): it
+    // gets a thread of its own rather than an async worker.
+    let runtime = tokio::runtime::Handle::current();
+    std::thread::Builder::new().name("engine".into()).spawn(move || {
+        let _runtime = runtime.enter();
+        while let Some(input) = in_rx.blocking_recv() {
             engine.handle(input);
         }
-    });
+    })?;
 
     if active {
         // The other controller's installation ID, so rendered configs stay identical

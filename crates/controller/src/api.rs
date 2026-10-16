@@ -136,6 +136,13 @@ impl From<anyhow::Error> for ApiError {
     }
 }
 
+/// A blocking task that panicked or was cancelled.
+impl From<tokio::task::JoinError> for ApiError {
+    fn from(e: tokio::task::JoinError) -> Self {
+        ApiError::internal(e.to_string())
+    }
+}
+
 type ApiResult = Result<Json<Value>, ApiError>;
 
 fn bad(msg: impl Into<String>) -> ApiError {
@@ -153,10 +160,7 @@ async fn read<T: Send + 'static>(
     f: impl FnOnce(&rusqlite::Connection) -> anyhow::Result<T> + Send + 'static,
 ) -> Result<T, ApiError> {
     let store = store.clone();
-    tokio::task::spawn_blocking(move || store.read(db, f))
-        .await
-        .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
-        .map_err(ApiError::from)
+    tokio::task::spawn_blocking(move || store.read(db, f)).await?.map_err(ApiError::from)
 }
 
 async fn status(State(s): State<AppState>) -> ApiResult {
@@ -266,56 +270,26 @@ async fn device(State(s): State<AppState>, Path(mac): Path<String>) -> ApiResult
     Ok(Json(json!({ "device": d, "clients": [] })))
 }
 
+/// Every client: the ones seen in this run and the ones restored from the
+/// database at start (`Engine::restore` loads them all, so the live view is
+/// the whole list).
 async fn clients(State(s): State<AppState>) -> ApiResult {
-    #[allow(clippy::type_complexity)]
-    let (live_clients, aliases, state): (BTreeMap<String, Value>, BTreeMap<String, Value>, Option<Arc<Value>>) = {
-        let live = s.live.read().unwrap();
-        let clients = live
-            .clients
-            .iter()
-            .map(|(mac, c)| {
-                let ap_name = live.devices.get(&c.sample.ap_mac).and_then(|d| d.snapshot.ap.hostname.clone());
-                let mut v = serde_json::to_value(c).unwrap_or_default();
-                v["ap_name"] = json!(ap_name);
-                let a = live.aliases.get(mac).cloned().unwrap_or_default();
-                v["alias"] = json!(a.alias);
-                v["note"] = json!(a.note);
-                v["vendor"] = json!(s.vendors.lookup(mac));
-                crate::actions::add_controls(&mut v, live.state.as_deref(), &mac.to_string());
-                (mac.to_string(), v)
-            })
-            .collect();
-        let aliases = live.aliases.iter().map(|(m, a)| (m.to_string(), serde_json::to_value(a).unwrap_or_default())).collect();
-        (clients, aliases, live.state.clone())
-    };
-    // Clients known from before this process started, not yet seen again.
-    let known: Vec<Value> = read(&s.store, Db::Config, |c| {
-        let mut stmt = c.prepare("SELECT mac, hostname, ip, first_seen, last_seen, ap_mac, essid, radio FROM clients ORDER BY last_seen DESC LIMIT 2000")?;
-        let rows = stmt
-            .query_map([], |r| {
-                Ok(json!({
-                    "mac": r.get::<_, String>(0)?, "hostname": r.get::<_, Option<String>>(1)?, "ip": r.get::<_, Option<String>>(2)?,
-                    "first_seen": r.get::<_, Option<i64>>(3)?, "last_seen": r.get::<_, Option<i64>>(4)?,
-                    "ap_mac": r.get::<_, Option<String>>(5)?, "essid": r.get::<_, Option<String>>(6)?, "radio": r.get::<_, Option<String>>(7)?,
-                }))
-            })?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        Ok(rows)
-    })
-    .await?;
-    let mut out: Vec<Value> = live_clients.values().cloned().collect();
-    for k in known {
-        let mac = k["mac"].as_str().unwrap_or("").to_string();
-        if !live_clients.contains_key(&mac) {
-            let a = aliases.get(&mac).cloned().unwrap_or_default();
-            let mut v = json!({
-                "connected": false, "first_seen": k["first_seen"], "last_seen": k["last_seen"], "sample": k,
-                "alias": a["alias"], "note": a["note"], "vendor": s.vendors.lookup_str(&mac),
-            });
-            crate::actions::add_controls(&mut v, state.as_deref(), &mac);
-            out.push(v);
-        }
-    }
+    let live = s.live.read().unwrap();
+    let out: Vec<Value> = live
+        .clients
+        .iter()
+        .map(|(mac, c)| {
+            let ap_name = live.devices.get(&c.sample.ap_mac).and_then(|d| d.snapshot.ap.hostname.clone());
+            let mut v = serde_json::to_value(c).unwrap_or_default();
+            v["ap_name"] = json!(ap_name);
+            let a = live.aliases.get(mac);
+            v["alias"] = json!(a.and_then(|a| a.alias.as_ref()));
+            v["note"] = json!(a.and_then(|a| a.note.as_ref()));
+            v["vendor"] = json!(s.vendors.lookup(mac));
+            crate::actions::add_controls(&mut v, live.state.as_deref(), &mac.to_string());
+            v
+        })
+        .collect();
     Ok(Json(Value::Array(out)))
 }
 
@@ -392,71 +366,78 @@ async fn dryrun(State(s): State<AppState>) -> ApiResult {
     })
     .await?;
 
-    let live = s.live.read().unwrap();
-    let mut devices = Vec::new();
-    for (mac, d) in &live.devices {
-        let name = d.snapshot.ap.hostname.clone();
-        let entry = |status: &str, extra: Value| {
-            let mut v = json!({ "mac": mac, "name": name, "status": status });
-            if let Value::Object(m) = extra {
-                v.as_object_mut().unwrap().extend(m);
-            }
-            v
-        };
-        // The snapshot records the cfgversion the other controller expected for
-        // each AP at import time. If the AP now runs another one, that controller
-        // has pushed new config since: the settings are probably out of date.
-        let snapshot_version = live.state.as_deref().and_then(|st| {
-            st["devices"].as_array()?.iter().find(|x| x["mac"].as_str().is_some_and(|m| m.eq_ignore_ascii_case(&mac.to_string())))?["cfgversion"]
-                .as_str()
-                .map(str::to_string)
-        });
-        let running_version = d.snapshot.ap.cfgversion.clone();
-        let settings_stale = matches!((&snapshot_version, &running_version), (Some(a), Some(b)) if a != b);
-        let entry = |status: &str, extra: Value| {
-            let mut v = entry(status, extra);
-            v["settings_stale"] = json!(settings_stale);
-            v
-        };
-        let (Some(render), Some(state)) = (&s.renderer, live.state.as_deref()) else {
-            devices.push(entry(if s.renderer.is_none() { "no_generator" } else { "no_settings" }, json!({})));
-            continue;
-        };
-        // Prefer the unredacted config seen in this run; fall back to the stored redacted copy.
-        // Only full configs count: a management-only push says nothing about system_cfg.
-        let (actual, redacted) = match (live.last_config.get(mac).filter(|c| !c.1.is_empty()), stored.get(&mac.to_string()).filter(|c| !c.1.is_empty())) {
-            (Some(c), _) => (c.clone(), false),
-            (None, Some(c)) => (c.clone(), true),
-            (None, None) => {
+    // What each AP's render needs, copied under a short lock; the renders run
+    // on the blocking pool.
+    let (state, imported_at, aps) = {
+        let live = s.live.read().unwrap();
+        let aps: Vec<_> = live
+            .devices
+            .iter()
+            .map(|(mac, d)| {
+                // Prefer the unredacted config seen in this run; fall back to the stored redacted copy.
+                // Only full configs count: a management-only push says nothing about system_cfg.
+                let actual = match (live.last_config.get(mac).filter(|c| !c.1.is_empty()), stored.get(&mac.to_string()).filter(|c| !c.1.is_empty())) {
+                    (Some(c), _) => Some((c.clone(), false)),
+                    (None, Some(c)) => Some((c.clone(), true)),
+                    (None, None) => None,
+                };
+                (*mac, d.snapshot.ap.hostname.clone(), d.snapshot.ap.cfgversion.clone(), actual, live.raw_informs.get(mac).cloned())
+            })
+            .collect();
+        (live.state.clone(), live.state_imported_at, aps)
+    };
+    let renderer = s.renderer.clone();
+    let devices = tokio::task::spawn_blocking(move || {
+        let mut devices = Vec::new();
+        for (mac, name, running_version, actual, inform) in aps {
+            // The snapshot records the cfgversion the other controller expected for
+            // each AP at import time. If the AP now runs another one, that controller
+            // has pushed new config since: the settings are probably out of date.
+            let snapshot_version = state.as_deref().and_then(|st| crate::adopt::device_doc(st, &mac)?["cfgversion"].as_str().map(str::to_string));
+            let settings_stale = matches!((&snapshot_version, &running_version), (Some(a), Some(b)) if a != b);
+            let entry = |status: &str, extra: Value| {
+                let mut v = json!({ "mac": mac, "name": name, "status": status, "settings_stale": settings_stale });
+                if let Value::Object(m) = extra {
+                    v.as_object_mut().unwrap().extend(m);
+                }
+                v
+            };
+            let (Some(render), Some(state)) = (&renderer, state.as_deref()) else {
+                devices.push(entry(if renderer.is_none() { "no_generator" } else { "no_settings" }, json!({})));
+                continue;
+            };
+            let Some((actual, redacted)) = actual else {
                 devices.push(entry("no_config_seen", json!({})));
                 continue;
+            };
+            let req = crate::dryrun::RenderRequest {
+                state,
+                device_mac: &mac.to_string(),
+                inform: inform.as_deref(),
+                cfgversion: actual.2.as_deref().unwrap_or(""),
+                previous_system_cfg: Some(&actual.1),
+            };
+            match render(&req) {
+                Ok(ours) => {
+                    let c = crate::dryrun::compare(&ours, &actual.0, &actual.1, redacted);
+                    let status = if c.mgmt_cfg.identical && c.system_cfg.identical {
+                        "match"
+                    } else if c.matches() {
+                        "equivalent"
+                    } else {
+                        "differs"
+                    };
+                    devices.push(entry(status, json!({ "comparison": c, "against_redacted": redacted })));
+                }
+                Err(e) => devices.push(entry("error", json!({ "error": format!("{e:#}") }))),
             }
-        };
-        let req = crate::dryrun::RenderRequest {
-            state,
-            device_mac: &mac.to_string(),
-            inform: live.raw_informs.get(mac).map(|v| v.as_ref()),
-            cfgversion: actual.2.as_deref().unwrap_or(""),
-            previous_system_cfg: Some(&actual.1),
-        };
-        match render(&req) {
-            Ok(ours) => {
-                let c = crate::dryrun::compare(&ours, &actual.0, &actual.1, redacted);
-                let status = if c.mgmt_cfg.identical && c.system_cfg.identical {
-                    "match"
-                } else if c.matches() {
-                    "equivalent"
-                } else {
-                    "differs"
-                };
-                devices.push(entry(status, json!({ "comparison": c, "against_redacted": redacted })));
-            }
-            Err(e) => devices.push(entry("error", json!({ "error": format!("{e:#}") }))),
         }
-    }
+        devices
+    })
+    .await?;
     Ok(Json(json!({
         "generator": s.renderer.is_some(),
-        "settings_imported_at": live.state_imported_at,
+        "settings_imported_at": imported_at,
         "devices": devices,
         "history": history,
     })))

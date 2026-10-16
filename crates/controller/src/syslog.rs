@@ -37,6 +37,11 @@ pub fn redact(msg: &str) -> String {
 }
 const HEADER: usize = 29;
 
+/// The sender's `hash_id` (16 hex characters) of an encrypted datagram.
+pub fn hash_id(datagram: &[u8]) -> Option<String> {
+    (datagram.starts_with(&MAGIC) && datagram.len() >= 17).then(|| hex::encode(&datagram[9..17]))
+}
+
 /// Decrypts or passes through one datagram. `lookup` maps a hash_id to the
 /// device and its syslog key.
 pub fn open(datagram: &[u8], lookup: impl Fn(&str) -> Option<(Mac, [u8; 32])>) -> Result<(Option<Mac>, String)> {

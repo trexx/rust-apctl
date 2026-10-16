@@ -72,6 +72,18 @@ fn new_cfgversion() -> String {
     hex::encode(random_bytes::<8>())
 }
 
+/// A `mgmt_cfg` rendered with the placeholder token, carrying `cfgversion`
+/// instead. The token appears nowhere else in a render (apcfg sets it on this
+/// one line of `mgmt_cfg`), so this equals rendering again with `cfgversion`.
+fn with_cfgversion(mgmt: &str, cfgversion: &str) -> String {
+    let line = format!("cfgversion={PLACEHOLDER}\n");
+    let at = if mgmt.starts_with(&line) { Some(0) } else { mgmt.find(&format!("\n{line}")).map(|i| i + 1) };
+    match at {
+        Some(i) => format!("{}cfgversion={cfgversion}\n{}", &mgmt[..i], &mgmt[i + line.len()..]),
+        None => mgmt.to_string(),
+    }
+}
+
 impl Active {
     pub fn new(
         store: &Store,
@@ -184,17 +196,18 @@ impl Active {
             tracing::info!("{mac}: sending {} {}", cmd["_type"], cmd["cmd"]);
             return cmd;
         }
-        let force = self.live.write().unwrap().reprovision.remove(&mac);
-        let (state, last_push) = {
+        // A resend asked from the UI; the flag stays until the push is built.
+        let (force, state) = {
             let live = self.live.read().unwrap();
-            (live.state.clone(), live.last_config.get(&mac).cloned())
+            (live.reprovision.contains(&mac), live.state.clone())
         };
         let Some(state) = state else {
             tracing::warn!("{mac}: no settings imported, replying noop");
             return noop(self.interval());
         };
+        let device = crate::adopt::device_doc(&state, &mac);
         // An AP adopted over SSH has no radio settings yet: take them from this inform first.
-        let has_radios = crate::adopt::device_doc(&state, &mac).is_some_and(|d| d["radio_table"].as_array().is_some_and(|t| !t.is_empty()));
+        let has_radios = device.is_some_and(|d| d["radio_table"].as_array().is_some_and(|t| !t.is_empty()));
         if !has_radios && payload["radio_table"].is_array() {
             let (tx, _rx) = tokio::sync::oneshot::channel();
             let p = payload.clone();
@@ -218,22 +231,18 @@ impl Active {
         }
         let reported = payload["cfgversion"].as_str().unwrap_or("").to_string();
 
-        // What would we push, ignoring the cfgversion token?
-        let probe = match self.render(&state, mac, payload, PLACEHOLDER) {
+        // What would we push, ignoring the cfgversion token? Rendered once: the
+        // token is patched into mgmt_cfg where a version is needed.
+        let out = match self.render(&state, mac, payload, PLACEHOLDER) {
             Ok(o) => o,
             Err(e) => {
                 tracing::error!("{mac}: cannot render config, replying noop: {e:#}");
                 return noop(self.interval());
             }
         };
-        let site_id = state["devices"]
-            .as_array()
-            .and_then(|d| d.iter().find(|d| d["mac"].as_str().is_some_and(|m| m.eq_ignore_ascii_case(&mac.to_string()))))
-            .and_then(|d| d["site_id"].as_str())
-            .unwrap_or("")
-            .to_string();
-        let blocked = apcfg::blocked_sta(&state, &site_id);
-        let content = format!("{}\n--\n{}\n--\n{}", probe.rendered.mgmt_cfg, probe.rendered.system_cfg, blocked);
+        let site_id = device.and_then(|d| d["site_id"].as_str()).unwrap_or("");
+        let blocked = apcfg::blocked_sta(&state, site_id);
+        let content = format!("{}\n--\n{}\n--\n{}", out.rendered.mgmt_cfg, out.rendered.system_cfg, blocked);
 
         // The lock is never held while rendering, and never taken twice.
         let (current, changed) = {
@@ -249,14 +258,15 @@ impl Active {
             // with the AP's token), keep its token instead of re-pushing.
             // Prefer the unmasked push seen in this run; otherwise the stored copy,
             // where secrets are masked (they come from the same imported settings).
-            let candidate = last_push.map(|p| (p, false)).or_else(|| self.stored_pushes.get(&mac).cloned().map(|p| (p, true)));
-            let adopt = current.is_none()
-                && candidate.as_ref().is_some_and(|((m, s, v), redacted)| {
-                    v.as_deref() == Some(reported.as_str())
-                        && self.render(&state, mac, payload, &reported).is_ok_and(|ours| {
-                            crate::dryrun::compare(&(ours.rendered.mgmt_cfg, ours.rendered.system_cfg), m, s, *redacted).matches()
-                        })
-                });
+            // A resend asked for is always a push.
+            let adopt = !force && current.is_none() && {
+                let last_push = self.live.read().unwrap().last_config.get(&mac).cloned();
+                let candidate = last_push.map(|p| (p, false)).or_else(|| self.stored_pushes.get(&mac).cloned().map(|p| (p, true)));
+                candidate.is_some_and(|((m, s, v), redacted)| {
+                    let ours = (with_cfgversion(&out.rendered.mgmt_cfg, &reported), out.rendered.system_cfg.clone());
+                    v.as_deref() == Some(reported.as_str()) && crate::dryrun::compare(&ours, &m, &s, redacted).matches()
+                })
+            };
             let version = if adopt { reported.clone() } else { new_cfgversion() };
             tracing::info!(
                 "{mac}: config {} (cfgversion {version})",
@@ -293,25 +303,20 @@ impl Active {
             }
             return noop(self.interval());
         }
-        match self.render(&state, mac, payload, &cfgversion) {
-            Ok(out) => {
-                // Keep the section numbering the render allocated.
-                let _ = self.engine.try_send(Input::SetConfigMeta { mac, meta: out.config_meta });
-                tracing::info!("{mac}: pushing config {cfgversion} (AP reports {reported:?})");
-                json!({
-                    "_type": "setparam",
-                    "cfgversion": cfgversion,
-                    "system_cfg": out.rendered.system_cfg,
-                    "blocked_sta": blocked,
-                    "mgmt_cfg": out.rendered.mgmt_cfg,
-                    "server_time_in_utc": server_time,
-                })
-            }
-            Err(e) => {
-                tracing::error!("{mac}: cannot render config, replying noop: {e:#}");
-                noop(self.interval())
-            }
+        if force {
+            self.live.write().unwrap().reprovision.remove(&mac);
         }
+        // Keep the section numbering the render allocated.
+        let _ = self.engine.try_send(Input::SetConfigMeta { mac, meta: out.config_meta });
+        tracing::info!("{mac}: pushing config {cfgversion} (AP reports {reported:?})");
+        json!({
+            "_type": "setparam",
+            "cfgversion": cfgversion,
+            "system_cfg": out.rendered.system_cfg,
+            "blocked_sta": blocked,
+            "mgmt_cfg": with_cfgversion(&out.rendered.mgmt_cfg, &cfgversion),
+            "server_time_in_utc": server_time,
+        })
     }
 }
 
@@ -355,13 +360,15 @@ pub async fn inform(
         tracing::warn!("{mac}: header and payload MACs differ");
         return status(StatusCode::BAD_REQUEST);
     }
-    let ts_now = ts;
     if device_key.is_none() || used == KeyUsed::Default {
         let known = device_key.is_some();
         let adopting = active.live.read().unwrap().adoption.adopting.contains_key(&mac);
         if known && adopting {
             // Adopt pressed: hand the AP its own key (in mgmt_cfg), with the factory key.
-            let reply = active.adoption_reply(ts_now, mac, &payload);
+            let a = active.clone();
+            let Ok(reply) = tokio::task::spawn_blocking(move || a.adoption_reply(ts, mac, &payload)).await else {
+                return status(StatusCode::INTERNAL_SERVER_ERROR);
+            };
             tracing::info!("{mac}: adoption: sending its key");
             let flags = Flags(Flags::ENCRYPTED | if gcm { Flags::GCM } else { 0 });
             let packet = inform::seal(mac, flags, random_bytes::<16>(), &key, reply.to_string().as_bytes());
@@ -370,11 +377,11 @@ pub async fn inform(
         // Not ours, or ours but reset: answered 404 and listed for adoption.
         // Whatever apctl remembered about it (e.g. AES-GCM) no longer holds.
         active.devices.lock().unwrap().remove(&mac);
-        let new = crate::adopt::note_pending(&mut active.live.write().unwrap(), &payload, known, ts_now);
+        let new = crate::adopt::note_pending(&mut active.live.write().unwrap(), &payload, known, ts);
         if new {
             tracing::info!("{mac}: {} informing from {}", if known { "reset AP (adoption required)" } else { "AP waiting for adoption" }, peer.ip());
             let data = json!({ "model": payload["model"], "ip": payload["ip"], "known": known });
-            let _ = active.engine.send(Input::Note { ts: ts_now, kind: "ap_pending", mac, data }).await;
+            let _ = active.engine.send(Input::Note { ts, kind: "ap_pending", mac, data }).await;
         }
         return status(StatusCode::NOT_FOUND);
     }
@@ -386,14 +393,14 @@ pub async fn inform(
     };
     if was_adopting {
         let data = json!({ "model": payload["model"], "ip": payload["ip"], "version": payload["version"] });
-        let _ = active.engine.send(Input::Note { ts: ts_now, kind: "ap_adopted", mac, data }).await;
+        let _ = active.engine.send(Input::Note { ts, kind: "ap_adopted", mac, data }).await;
     }
     if forgetting {
         tracing::warn!("{mac}: forgotten: telling it to reset");
         let engine = active.engine.clone();
         tokio::spawn(async move { crate::adopt::finish_forget(&engine, mac, true).await });
         active.devices.lock().unwrap().remove(&mac);
-        let reply = json!({ "_type": "setdefault", "server_time_in_utc": (ts_now * 1000).to_string() });
+        let reply = json!({ "_type": "setdefault", "server_time_in_utc": (ts * 1000).to_string() });
         let flags = Flags(Flags::ENCRYPTED | if gcm { Flags::GCM } else { 0 });
         let packet = inform::seal(mac, flags, random_bytes::<16>(), &key, reply.to_string().as_bytes());
         return ([(header::CONTENT_TYPE, "application/x-binary")], packet).into_response();
@@ -413,8 +420,12 @@ pub async fn inform(
         }
     }
 
-    let reply = active.reply(ts, mac, &payload);
     let peer_ip = active.proxies.client_ip(&headers, peer.ip()).to_string();
+    // Rendering the config takes a while: off the async workers.
+    let a = active.clone();
+    let Ok((reply, payload)) = tokio::task::spawn_blocking(move || (a.reply(ts, mac, &payload), payload)).await else {
+        return status(StatusCode::INTERNAL_SERVER_ERROR);
+    };
     let decoded = Decoded { header: pkt.header.clone(), key: used, payload };
     if active.engine.send(Input::Inform { ts, peer: peer_ip, decoded }).await.is_err() {
         return status(StatusCode::SERVICE_UNAVAILABLE);
@@ -698,6 +709,44 @@ mod tests {
         stranger["mac"] = json!("02:00:00:00:00:77");
         let (status, _) = inform_as_ap(&rig, &stranger, DEFAULT_KEY, Flags::ENCRYPTED | Flags::GCM).await;
         assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[test]
+    fn patching_the_cfgversion_equals_rendering_with_it() {
+        let Some(_) = fixtures() else { return };
+        let rig = rig(true, None);
+        let state = rig.live.read().unwrap().state.clone().unwrap();
+        let payload = ap_payload("1");
+        let probe = rig.active.render(&state, AP.parse().unwrap(), &payload, PLACEHOLDER).unwrap();
+        let real = rig.active.render(&state, AP.parse().unwrap(), &payload, "0123456789abcdef").unwrap();
+        assert_eq!(with_cfgversion(&probe.rendered.mgmt_cfg, "0123456789abcdef"), real.rendered.mgmt_cfg);
+        assert_eq!(probe.rendered.system_cfg, real.rendered.system_cfg);
+        assert_eq!(with_cfgversion("cfgversion=0000000000000000\nx=1\n", "ab"), "cfgversion=ab\nx=1\n");
+    }
+
+    #[tokio::test]
+    async fn a_resend_survives_an_inform_that_cannot_push() {
+        let Some(_) = fixtures() else { return };
+        let rig = rig(true, None);
+        let ap: Mac = AP.parse().unwrap();
+        let (_, reply) = inform_as_ap(&rig, &ap_payload("1111111111111111"), KEY, GCM_ZLIB).await;
+        let version = reply.unwrap().1["cfgversion"].as_str().unwrap().to_string();
+        let with_radios = rig.live.read().unwrap().state.clone().unwrap();
+        {
+            let mut live = rig.live.write().unwrap();
+            live.reprovision.insert(ap);
+            // As if adopted over SSH: no radio settings yet, so this inform only collects them.
+            let mut state = (*with_radios).clone();
+            state["devices"].as_array_mut().unwrap().iter_mut().find(|d| d["mac"] == AP).unwrap()["radio_table"] = json!([]);
+            live.state = Some(Arc::new(state));
+        }
+        let (_, reply) = inform_as_ap(&rig, &ap_payload(&version), KEY, GCM_ZLIB).await;
+        assert_eq!(reply.unwrap().1["_type"], "noop");
+        assert!(rig.live.read().unwrap().reprovision.contains(&ap), "the resend is still wanted");
+        rig.live.write().unwrap().state = Some(with_radios);
+        let (_, reply) = inform_as_ap(&rig, &ap_payload(&version), KEY, GCM_ZLIB).await;
+        assert_eq!(reply.unwrap().1["_type"], "setparam");
+        assert!(rig.live.read().unwrap().reprovision.is_empty());
     }
 
     #[tokio::test]

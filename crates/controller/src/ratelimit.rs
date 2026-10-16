@@ -24,17 +24,12 @@ fn limits(state: &Value, group: &str) -> Option<(i64, i64)> {
     Some((g["qos_rate_max_down"].as_i64().unwrap_or(-1), g["qos_rate_max_up"].as_i64().unwrap_or(-1)))
 }
 
-/// The limits a connected client should get by command: its own group's when
-/// that differs from its SSID's, else (if a command was sent before) the SSID's.
-fn wanted(state: &Value, client: &Mac, essid: &str, before: bool) -> Option<(i64, i64)> {
-    let own = state["clients"]
-        .as_array()?
-        .iter()
-        .find(|c| c["mac"].as_str().is_some_and(|m| m.eq_ignore_ascii_case(&client.to_string())))
-        .and_then(|c| c["usergroup_id"].as_str())
-        .filter(|g| !g.is_empty());
+/// The limits a connected client should get by command: its own group's
+/// (`own`) when that differs from its SSID's, else (if a command was sent
+/// before) the SSID's.
+fn wanted(state: &Value, own: Option<&str>, essid: &str, before: bool) -> Option<(i64, i64)> {
     let ssid_group = docs(state, "wlanconf").find(|w| w["name"].as_str() == Some(essid)).and_then(|w| w["usergroup_id"].as_str()).map(str::to_string).or_else(|| crate::settings::default_usergroup(state));
-    match own {
+    match own.filter(|g| !g.is_empty()) {
         Some(g) if Some(g) != ssid_group.as_deref() => limits(state, g),
         // Back to the SSID's limit, but only to undo an earlier command.
         _ if before => Some(ssid_group.and_then(|g| limits(state, &g)).unwrap_or((-1, -1))),
@@ -42,16 +37,25 @@ fn wanted(state: &Value, client: &Mac, essid: &str, before: bool) -> Option<(i64
     }
 }
 
-/// Queues the commands due now and updates `sent`.
-pub fn tick(live: &mut Live, sent: &mut Sent) {
-    let Some(state) = live.state.clone() else { return };
-    let connected: Vec<(Mac, Mac, String)> = live.clients.iter().filter(|(_, c)| c.connected).map(|(m, c)| (*m, c.sample.ap_mac, c.sample.essid.clone().unwrap_or_default())).collect();
-    sent.retain(|m, _| connected.iter().any(|c| c.0 == *m));
-    for (client, ap, essid) in connected {
+/// The commands due now, as (AP, command); updates `sent`.
+fn due(live: &Live, sent: &mut Sent) -> Vec<(Mac, Value)> {
+    let Some(state) = live.state.as_deref() else { return Vec::new() };
+    // Each client's own group (its first entry's), looked up once per tick.
+    let mut own: HashMap<Mac, Option<&str>> = HashMap::new();
+    for c in state["clients"].as_array().into_iter().flatten() {
+        if let Some(mac) = c["mac"].as_str().and_then(|m| m.parse::<Mac>().ok()) {
+            own.entry(mac).or_insert(c["usergroup_id"].as_str());
+        }
+    }
+    let connected: HashMap<Mac, (Mac, String)> =
+        live.clients.iter().filter(|(_, c)| c.connected).map(|(m, c)| (*m, (c.sample.ap_mac, c.sample.essid.clone().unwrap_or_default()))).collect();
+    sent.retain(|m, _| connected.contains_key(m));
+    let mut out = Vec::new();
+    for (client, (ap, essid)) in connected {
         let before = sent.get(&client);
         // A roam or SSID change starts afresh: the new AP knows nothing of earlier commands.
         let same_place = before.is_some_and(|b| b.0 == ap && b.1 == essid);
-        let Some(limit) = wanted(&state, &client, &essid, same_place) else {
+        let Some(limit) = wanted(state, own.get(&client).copied().flatten(), &essid, same_place) else {
             sent.remove(&client);
             continue;
         };
@@ -59,9 +63,18 @@ pub fn tick(live: &mut Live, sent: &mut Sent) {
             continue;
         }
         let (down, up) = limit;
-        crate::actions::queue(live, ap, json!({ "_type": "cmd", "cmd": "rate-update", "mac": client.to_string(), "dl_max": down, "dl_min": 64, "ul_max": up, "ul_min": 64 }));
+        out.push((ap, json!({ "_type": "cmd", "cmd": "rate-update", "mac": client.to_string(), "dl_max": down, "dl_min": 64, "ul_max": up, "ul_min": 64 })));
         tracing::info!("{client}: speed limit down {down} up {up} kbps via {ap}");
         sent.insert(client, (ap, essid, limit));
+    }
+    out
+}
+
+/// Queues the commands due now and updates `sent`.
+#[cfg(test)]
+fn tick(live: &mut Live, sent: &mut Sent) {
+    for (ap, cmd) in due(live, sent) {
+        crate::actions::queue(live, ap, cmd);
     }
 }
 
@@ -74,7 +87,14 @@ pub fn spawn(s: AppState) {
         let mut sent = Sent::new();
         loop {
             tokio::time::sleep(Duration::from_secs(5)).await;
-            tick(&mut s.live.write().unwrap(), &mut sent);
+            // Worked out under the read lock; the write lock only to queue.
+            let cmds = due(&s.live.read().unwrap(), &mut sent);
+            if !cmds.is_empty() {
+                let mut live = s.live.write().unwrap();
+                for (ap, cmd) in cmds {
+                    crate::actions::queue(&mut live, ap, cmd);
+                }
+            }
         }
     });
 }
