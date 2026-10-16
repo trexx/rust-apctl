@@ -456,8 +456,10 @@ pub fn roam_clients(roams: &[Roam]) -> Vec<Value> {
     for r in roams {
         per.entry(&r.client).or_default().push(r);
     }
-    let mut out: Vec<Value> = per
-        .into_iter()
+    // Most roams first (by MAC among equals).
+    let mut per: Vec<(&str, Vec<&Roam>)> = per.into_iter().collect();
+    per.sort_by_key(|(_, rs)| std::cmp::Reverse(rs.len()));
+    per.into_iter()
         .map(|(c, mut rs)| {
             rs.sort_by_key(|r| r.ts);
             let sig: Vec<f64> = rs.iter().filter_map(|r| r.from.rssi).collect();
@@ -470,9 +472,7 @@ pub fn roam_clients(roams: &[Roam]) -> Vec<Value> {
                 "to_weaker": weaker, "quick_returns": back,
             })
         })
-        .collect();
-    out.sort_by(|a, b| b["roams"].as_u64().cmp(&a["roams"].as_u64()));
-    out
+        .collect()
 }
 
 /// The notifications in a window (optionally one client's, and with
