@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { createContext, useContext, useId, useState } from "react";
 import type { ChangeEvent, Dispatch, ReactNode, SetStateAction } from "react";
 
 /** A settings patch, as sent to the server. */
@@ -60,6 +60,19 @@ export function useSettingsForm<F extends object>(
   };
 }
 
+/** The ids of the enclosing `Row`'s label and hint, which name the controls in it. */
+const RowLabel = createContext<{ label?: string; hint?: string }>({});
+
+/** `aria-labelledby` / `aria-describedby` for a control: its `Row`'s label and hint. */
+const useRowLabel = () => {
+  const { label, hint } = useContext(RowLabel);
+  return { "aria-labelledby": label, "aria-describedby": hint };
+};
+
+/**
+ * A labelled form row. Its label names the group, and the `Select`,
+ * `NumberInput` and `ListInput` in it (screen readers announce it).
+ */
 export function Row({
   label,
   hint,
@@ -69,13 +82,26 @@ export function Row({
   hint?: string;
   children: ReactNode;
 }) {
+  const id = useId();
+  const ids = { label: `${id}-label`, hint: hint ? `${id}-hint` : undefined };
   return (
-    <div className="form-row">
+    <div
+      className="form-row"
+      role="group"
+      aria-labelledby={ids.label}
+      aria-describedby={ids.hint}
+    >
       <div className="form-label">
-        {label}
-        {hint && <div className="muted small">{hint}</div>}
+        <span id={ids.label}>{label}</span>
+        {hint && (
+          <div className="muted small" id={ids.hint}>
+            {hint}
+          </div>
+        )}
       </div>
-      <div className="form-control">{children}</div>
+      <div className="form-control">
+        <RowLabel value={ids}>{children}</RowLabel>
+      </div>
     </div>
   );
 }
@@ -125,8 +151,10 @@ export function Select<T extends string | number>({
   onChange: (v: T) => void;
   disabled?: boolean;
 }) {
+  const named = useRowLabel();
   return (
     <select
+      {...named}
       value={String(value ?? fallback ?? "")}
       disabled={disabled}
       onChange={(e) => {
@@ -163,6 +191,7 @@ export function NumberInput({
   onChange: (v: number) => void;
   disabled?: boolean;
 }) {
+  const named = useRowLabel();
   const shown = value ?? fallback;
   const [text, setText] = useState(String(shown));
   const [last, setLast] = useState(shown);
@@ -173,6 +202,7 @@ export function NumberInput({
   }
   return (
     <input
+      {...named}
       type="number"
       className="search num-input"
       min={min}
@@ -228,8 +258,10 @@ export function ListInput<T>({
   rows?: number;
   placeholder?: string;
 }) {
+  const named = useRowLabel();
   const [text, setText] = useState(() => format(value ?? []));
   const props = {
+    ...named,
     className: "search mono",
     placeholder,
     value: text,
