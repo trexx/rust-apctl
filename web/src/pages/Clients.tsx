@@ -107,18 +107,21 @@ function ClientList({ tabs }: { tabs: React.ReactNode }) {
 
   const th = (key: SortKey, label: string) => (
     <th
-      className="sortable"
-      onClick={() =>
-        setSort((s) => ({
-          key,
-          desc: s.key === key ? !s.desc : key !== "name",
-        }))
-      }
       aria-sort={
         sort.key === key ? (sort.desc ? "descending" : "ascending") : "none"
       }
     >
-      {label} {sort.key === key ? (sort.desc ? "↓" : "↑") : ""}
+      <button
+        className="plain sortable"
+        onClick={() =>
+          setSort((s) => ({
+            key,
+            desc: s.key === key ? !s.desc : key !== "name",
+          }))
+        }
+      >
+        {label} {sort.key === key ? (sort.desc ? "↓" : "↑") : ""}
+      </button>
     </th>
   );
 

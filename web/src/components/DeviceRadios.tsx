@@ -321,9 +321,12 @@ function VapRow({
 }) {
   return (
     <>
+      {/* The whole row toggles; the button (its click bubbles up) is for the keyboard. */}
       <tr className="clickable" onClick={toggle}>
         <td>
-          {open ? "▾" : "▸"} {vap.essid}
+          <button className="plain" aria-expanded={open}>
+            {open ? "▾" : "▸"} {vap.essid}
+          </button>
         </td>
         <td>
           {band(vap.radio)} ch {vap.channel}
