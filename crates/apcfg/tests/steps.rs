@@ -219,3 +219,29 @@ fn step_one_adds_the_test_ssid_on_both_bands() {
     assert_eq!(after.lines().count(), push["system_cfg"].as_str().unwrap().lines().count());
     assert_eq!(after.lines().count(), 593);
 }
+
+/// SNMP (written from the official logic; no capture uses it): its lines sit between
+/// `sshd` and `ntpclient`, with no header, and v3 needs the firmware's capability bit.
+#[test]
+fn snmp_lines_follow_sshd() {
+    let Some(_) = common::fixtures() else { return };
+    let mut s = state();
+    let before = render(&s, AP_B, "0").rendered.system_cfg;
+    s["setting"].as_array_mut().unwrap().push(json!({
+        "key": "snmp", "site_id": SITE, "enabled": true, "enabledV3": true, "community": "c0mmunity", "username": "mon", "x_password": "v3-secret",
+    }));
+    let dev = s["devices"].as_array_mut().unwrap().iter_mut().find(|d| d["mac"] == AP_B).unwrap();
+    dev["snmp_location"] = json!("Garage");
+    let after = render(&s, AP_B, "0").rendered.system_cfg;
+    let d = cfgdiff::diff(&before, &after);
+    assert!(d.removed.is_empty() && d.changed.is_empty(), "{}", d.render("", false));
+    assert_eq!(
+        names(&d.added),
+        ["snmp.community", "snmp.location", "snmp.status", "snmp.user.1.name", "snmp.user.1.password", "snmp.version"].map(String::from)
+    );
+    let lines: Vec<&str> = after.lines().collect();
+    let at = |p: &str| lines.iter().position(|l| l.starts_with(p)).unwrap();
+    let order = ["sshd.", "snmp.status", "snmp.version", "snmp.location", "snmp.community", "snmp.user.1.name", "snmp.user.1.password", "# ntpclient"];
+    assert!(order.windows(2).all(|w| at(w[0]) < at(w[1])), "snmp lines out of order");
+    assert!(after.contains("snmp.version=all\n"));
+}

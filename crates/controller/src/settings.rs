@@ -183,7 +183,7 @@ const RADIO_FIELDS: &[&str] = &[
 /// Fields of an AP the editor shows and edits, besides its radios.
 const DEVICE_FIELDS: &[&str] = &[
     "name", "led_override", "led_override_color", "led_override_color_brightness", "outdoor_mode_override", "bandsteering_mode", "atf_enabled",
-    "green_ap_enabled", "resetbtn_enabled", "jumboframe_enabled", "config_network",
+    "green_ap_enabled", "resetbtn_enabled", "jumboframe_enabled", "config_network", "snmp_location", "snmp_contact",
 ];
 
 /// What the AP itself reports about a radio: power range, widths, channels.
@@ -1074,6 +1074,14 @@ pub fn apply_device(state: &mut Value, body: &Value) -> Result<String, String> {
     }
     for (key, allowed) in [("outdoor_mode_override", &["default", "on", "off"][..]), ("bandsteering_mode", &["off", "equal", "prefer_5g"]), ("resetbtn_enabled", &["on", "off"])] {
         if let Some(v) = enum_field(p, key, allowed)? {
+            d[key] = json!(v);
+        }
+    }
+    for key in ["snmp_location", "snmp_contact"] {
+        if let Some(v) = p[key].as_str().map(str::trim) {
+            if v.chars().count() > 255 {
+                return Err(format!("{} can be at most 255 characters", key.replace('_', " ")));
+            }
             d[key] = json!(v);
         }
     }

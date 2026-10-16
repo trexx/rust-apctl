@@ -1,5 +1,5 @@
 //! Site-wide device settings: the LED and outdoor defaults, the APs' SSH
-//! access, remote syslog, NTP, country and time zone.
+//! access, remote syslog, SNMP, NTP, country and time zone.
 //! Changes go through [`crate::settings::change`], so they can be previewed
 //! per AP like SSID and AP edits.
 
@@ -91,9 +91,9 @@ fn reset_illegal_channels(state: &mut Value) -> Vec<String> {
     out
 }
 
-const SECRETS: &[&str] = &["x_ssh_password", "x_ssh_sha512passwd", "x_ssh_md5passwd"];
+const SECRETS: &[&str] = &["x_ssh_password", "x_ssh_sha512passwd", "x_ssh_md5passwd", "x_password"];
 
-/// Applies `body.patch`: `{ mgmt: {...}, rsyslogd: {...}, ntp: {...}, country, timezone }`.
+/// Applies `body.patch`: `{ mgmt: {...}, rsyslogd: {...}, snmp: {...}, ntp: {...}, country, timezone }`.
 pub fn apply_site(state: &mut Value, body: &Value) -> Result<String, String> {
     let p = &body["patch"];
     let before = state["setting"].clone();
@@ -218,6 +218,38 @@ pub fn apply_site(state: &mut Value, body: &Value) -> Result<String, String> {
         }
     }
 
+    let sn = &p["snmp"];
+    if !sn.is_null() {
+        let doc = setting_mut(state, "snmp")?;
+        bools(sn, doc, &["enabled", "enabledV3"])?;
+        if let Some(c) = sn["community"].as_str() {
+            if c.is_empty() || c.len() > 256 || c.contains(char::is_whitespace) {
+                return Err("the SNMP community must be 1 to 256 characters without spaces".into());
+            }
+            doc["community"] = json!(c);
+        }
+        if let Some(u) = sn["username"].as_str().map(str::trim) {
+            if !(1..=30).contains(&u.len()) {
+                return Err("the SNMPv3 user name must be 1 to 30 characters".into());
+            }
+            doc["username"] = json!(u);
+        }
+        if let Some(pw) = sn["x_password"].as_str() {
+            if !(8..=32).contains(&pw.len()) || pw.contains(['"', '\'']) {
+                return Err("the SNMPv3 password must be 8 to 32 characters without quotes".into());
+            }
+            doc["x_password"] = json!(pw);
+            notes.push("SNMPv3 password".into());
+        }
+        let doc = &*doc;
+        if doc["enabled"].as_bool() == Some(true) && doc["community"].as_str().is_none_or(str::is_empty) {
+            return Err("SNMP v1/v2c needs a community".into());
+        }
+        if doc["enabledV3"].as_bool() == Some(true) && (doc["username"].as_str().is_none_or(str::is_empty) || doc["x_password"].as_str().is_none_or(str::is_empty)) {
+            return Err("SNMPv3 needs a user name and password".into());
+        }
+    }
+
     if !p["country"].is_null() {
         let code = p["country"].as_i64().or_else(|| p["country"].as_str()?.parse().ok()).ok_or("country must be an ISO 3166 numeric code")?;
         if !COUNTRY_NAMES.iter().any(|(c, _)| *c == code) {
@@ -246,7 +278,7 @@ pub fn apply_site(state: &mut Value, body: &Value) -> Result<String, String> {
         let old = before.as_array().and_then(|l| l.iter().find(|o| o["key"] == s["key"] && o["site_id"] == s["site_id"])).cloned().unwrap_or(Value::Null);
         for (k, v) in s.as_object().into_iter().flatten() {
             // Secrets are summed up as "SSH password" (from `notes`).
-            if old[k] != *v && !SECRETS.contains(&k.as_str()) {
+            if old[k] != *v && !SECRETS.contains(&k.as_str()) && !matches!(k.as_str(), "key" | "site_id") {
                 changed.push(if k == "x_ssh_keys" { "SSH keys".to_string() } else { format!("{key}.{k}") });
             }
         }
@@ -323,8 +355,13 @@ pub async fn get_site(State(s): State<AppState>) -> Result<Json<Value>, ApiError
     for k in ["setting_preference", "ntp_server_1", "ntp_server_2", "ntp_server_3", "ntp_server_4"] {
         ntp[k] = n[k].clone();
     }
+    let sn = setting(&state, "snmp");
+    let snmp = json!({
+        "enabled": sn["enabled"], "enabledV3": sn["enabledV3"], "community": sn["community"], "username": sn["username"],
+        "has_v3_password": sn["x_password"].as_str().is_some_and(|p| !p.is_empty()),
+    });
     Ok(Json(json!({
-        "active": s.active, "mgmt": mgmt, "rsyslogd": rsyslogd, "ntp": ntp,
+        "active": s.active, "mgmt": mgmt, "rsyslogd": rsyslogd, "ntp": ntp, "snmp": snmp,
         "country": crate::settings::country(&state), "timezone": setting(&state, "locale")["timezone"],
         "countries": COUNTRY_NAMES.iter().map(|(c, n)| json!({ "code": c, "name": n })).collect::<Vec<_>>(),
         "timezones": apcfg::tz::names().collect::<Vec<_>>(),
@@ -389,6 +426,17 @@ mod tests {
         edit(&mut s, json!({ "country": 208, "timezone": "Europe/Copenhagen" })).unwrap();
         assert_eq!((setting(&s, "country")["code"].as_str(), setting(&s, "locale")["timezone"].as_str()), (Some("208"), Some("Europe/Copenhagen")));
         assert!(edit(&mut s, json!({ "timezone": "Mars/Olympus" })).is_err());
+    }
+
+    #[test]
+    fn snmp_needs_its_credentials() {
+        let mut s = state();
+        assert!(edit(&mut s, json!({ "snmp": { "enabled": true, "community": "with space" } })).is_err());
+        edit(&mut s, json!({ "snmp": { "enabled": true, "community": "c0mmunity" } })).unwrap();
+        assert!(edit(&mut s, json!({ "snmp": { "enabledV3": true, "username": "mon" } })).unwrap_err().contains("password"));
+        assert!(edit(&mut s, json!({ "snmp": { "enabledV3": true, "username": "mon", "x_password": "short" } })).is_err());
+        let what = edit(&mut s, json!({ "snmp": { "enabledV3": true, "username": "mon", "x_password": "v3-secret-pw" } })).unwrap();
+        assert!(what.contains("SNMPv3 password") && !what.contains("v3-secret"), "{what}");
     }
 
     #[test]

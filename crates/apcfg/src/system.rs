@@ -61,6 +61,7 @@ pub fn render(ctx: &Ctx) -> Result<(String, Value)> {
     }
     syslog(&mut c, ctx);
     sshd(&mut c, ctx);
+    snmp(&mut c, ctx);
     ntp(&mut c, ctx);
     switch(&mut c, ctx);
     if bit(caps.fw2, 28) {
@@ -402,6 +403,32 @@ fn sshd(c: &mut Cfg, ctx: &Ctx) {
     if !flag(mgmt, "x_ssh_bind_wildcard", false) {
         c.set("sshd.1.status", "enabled");
         c.set("sshd.1.ifname", "br0");
+    }
+}
+
+/// `snmp.*`, no section header, nothing at all while SNMP is off. v3 needs
+/// firmware capability bit 14; the community is cut to 256 characters.
+fn snmp(c: &mut Cfg, ctx: &Ctx) {
+    let s = ctx.setting("snmp");
+    let v1 = flag(s, "enabled", false);
+    let v3 = flag(s, "enabledV3", false) && bit(ctx.caps.fw, 14);
+    if !v1 && !v3 {
+        return;
+    }
+    c.set("snmp.status", "enabled");
+    c.set("snmp.version", match (v1, v3) {
+        (true, true) => "all",
+        (true, false) => "1_2c",
+        _ => "3",
+    });
+    c.opt("snmp.location", str_of(ctx.device, "snmp_location").filter(|l| !l.is_empty()));
+    c.opt("snmp.contact", str_of(ctx.device, "snmp_contact").filter(|l| !l.is_empty()));
+    if v1 {
+        c.set("snmp.community", str_of(s, "community").unwrap_or("public").chars().take(256).collect::<String>());
+    }
+    if v3 {
+        c.set("snmp.user.1.name", str_of(s, "username").unwrap_or(""));
+        c.set("snmp.user.1.password", str_of(s, "x_password").unwrap_or(""));
     }
 }
 

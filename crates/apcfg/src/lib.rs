@@ -19,7 +19,8 @@
 //! "auto" service list.
 //!
 //! Written from the official logic but not yet checked against a capture (none of
-//! our data uses them): WLAN schedules (`schedule_*` lines) and speed limits (`qos`).
+//! our data uses them): WLAN schedules (`schedule_*` lines), speed limits (`qos`) and
+//! SNMP (`snmp.*`).
 
 mod cfg;
 mod javahash;
@@ -248,7 +249,7 @@ impl<'a> Ctx<'a> {
 
 /// AP-wide features that depend on the AP's capability bits, as `render`
 /// checks them: without the bit the setting is not sent at all.
-pub const DEVICE_FEATURES: &[&str] = &["band_steering", "airtime_fairness", "green_ap", "led", "led_color", "jumbo_frames"];
+pub const DEVICE_FEATURES: &[&str] = &["band_steering", "airtime_fairness", "green_ap", "led", "led_color", "jumbo_frames", "snmp"];
 
 /// Which of [`DEVICE_FEATURES`] the AP supports, or `None` while unknown (see
 /// [`ssid_feature_support`]).
@@ -267,6 +268,7 @@ pub fn device_feature_support(device: &Value, inform: Option<&Value>) -> Option<
                     "green_ap" => bit(caps.wifi2, 2),
                     "led" => bit(caps.hw, 1) || bit(caps.hw, 14),
                     "led_color" => bit(caps.hw, 1),
+                    "snmp" => bit(caps.fw, 13) || bit(caps.fw, 14),
                     _ => bit(caps.fw, 4),
                 };
                 (f, ok)

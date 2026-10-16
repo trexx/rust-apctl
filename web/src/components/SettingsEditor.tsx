@@ -1651,6 +1651,8 @@ function DeviceEditor({
     resetbtn_enabled: d.resetbtn_enabled ?? "on",
     jumboframe_enabled: d.jumboframe_enabled ?? false,
     config_network: d.config_network ?? { type: "dhcp" },
+    snmp_location: d.snmp_location ?? "",
+    snmp_contact: d.snmp_contact ?? "",
     antenna_id:
       d.radios.find((r) => r.antenna_id !== null && r.antenna_id >= 0)
         ?.antenna_id ??
@@ -1824,6 +1826,24 @@ function DeviceEditor({
           />
         )}
       </Row>
+      {has("snmp") && (
+        <Row label="SNMP" hint="sent while SNMP is on in the site settings">
+          <input
+            className="search"
+            maxLength={255}
+            placeholder="location"
+            value={String(form.snmp_location)}
+            onChange={(e) => set("snmp_location", e.target.value)}
+          />
+          <input
+            className="search"
+            maxLength={255}
+            placeholder="contact"
+            value={String(form.snmp_contact)}
+            onChange={(e) => set("snmp_contact", e.target.value)}
+          />
+        </Row>
+      )}
       <Row label="IP address" hint="the AP's own management address">
         <AddressFields
           value={form.config_network as Fields}
@@ -1976,6 +1996,14 @@ function SiteEditor({ d, onClose }: { d: SiteSettings; onClose: () => void }) {
     ntp_server_4: d.ntp.ntp_server_4 ?? "",
   };
   const top0: Fields = { country: d.country, timezone: d.timezone ?? "UTC" };
+  const snmp0: Fields = {
+    enabled: d.snmp.enabled ?? false,
+    community: d.snmp.community ?? "public",
+    enabledV3: d.snmp.enabledV3 ?? false,
+    username: d.snmp.username ?? "",
+  };
+  const [snmp, setSnmp] = useState<Fields>(snmp0);
+  const [v3password, setV3password] = useState("");
   const [mgmt, setMgmt] = useState<Fields>(mgmt0);
   const [syslog, setSyslog] = useState<Fields>(syslog0);
   const [ntp, setNtp] = useState<Fields>(ntp0);
@@ -1989,6 +2017,9 @@ function SiteEditor({ d, onClose }: { d: SiteSettings; onClose: () => void }) {
     if (Object.keys(m).length) p.mgmt = m;
     const r = changed(syslog0, syslog);
     if (Object.keys(r).length) p.rsyslogd = r;
+    const sn = changed(snmp0, snmp);
+    if (v3password) sn.x_password = v3password;
+    if (Object.keys(sn).length) p.snmp = sn;
     const n = changed(ntp0, ntp);
     // Manual servers are sent as a whole list.
     if (Object.keys(n).length)
@@ -2192,6 +2223,54 @@ function SiteEditor({ d, onClose }: { d: SiteSettings; onClose: () => void }) {
             )}
           </Row>
         )}
+      </details>
+      <details>
+        <summary>SNMP</summary>
+        <Row label="SNMP v1/v2c">
+          <Toggle
+            value={snmp.enabled}
+            onChange={(v) => setSnmp({ ...snmp, enabled: v })}
+            label="Enabled"
+          />
+          {snmp.enabled === true && (
+            <input
+              className="search mono"
+              placeholder="community"
+              value={String(snmp.community)}
+              onChange={(e) => setSnmp({ ...snmp, community: e.target.value })}
+            />
+          )}
+        </Row>
+        <Row label="SNMPv3" hint="on firmware that supports it">
+          <Toggle
+            value={snmp.enabledV3}
+            onChange={(v) => setSnmp({ ...snmp, enabledV3: v })}
+            label="Enabled"
+          />
+          {snmp.enabledV3 === true && (
+            <>
+              <input
+                className="search mono"
+                placeholder="user name"
+                maxLength={30}
+                value={String(snmp.username)}
+                onChange={(e) => setSnmp({ ...snmp, username: e.target.value })}
+              />
+              <input
+                className="search mono"
+                autoComplete="off"
+                maxLength={32}
+                placeholder={
+                  d.snmp.has_v3_password
+                    ? "password unchanged"
+                    : "password (8 to 32)"
+                }
+                value={v3password}
+                onChange={(e) => setV3password(e.target.value)}
+              />
+            </>
+          )}
+        </Row>
       </details>
       <details>
         <summary>Time servers</summary>
