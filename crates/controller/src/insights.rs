@@ -475,15 +475,15 @@ fn add_retries(t: &mut [f64; 3], d: &Delta, at: [usize; 3]) -> bool {
 
 /// Retries, attempts and drops summed per (AP, band) from SSID counters
 /// (`at`: their columns; the text columns are AP and band).
-pub(crate) fn retry_totals(vaps: &Loaded, at: [usize; 3], from: Ts) -> HashMap<(String, String), [f64; 3]> {
-    let mut out: HashMap<(String, String), [f64; 3]> = HashMap::new();
+pub(crate) fn retry_totals(vaps: &Loaded, at: [usize; 3], from: Ts) -> HashMap<(&str, &str), [f64; 3]> {
+    let mut out: HashMap<(&str, &str), [f64; 3]> = HashMap::new();
     for (ex, samples) in vaps.values() {
         let (mut t, mut any) = ([0.0; 3], false);
         for d in deltas(samples, from) {
             any |= add_retries(&mut t, &d, at);
         }
         if any {
-            let e = out.entry((ex[0].clone(), ex[1].clone())).or_default();
+            let e = out.entry((ex[0].as_str(), ex[1].as_str())).or_default();
             for (e, x) in e.iter_mut().zip(t) {
                 *e += x;
             }
@@ -550,10 +550,10 @@ fn density_of(signals: Vec<(Ts, String, Option<String>, f64)>, vaps: &Loaded, fr
             *bytes.entry((ex[0].as_str(), band)).or_default() += d + u;
         }
     }
-    let mut retries: BTreeMap<(String, String), [f64; 3]> = retry_totals(vaps, cols_at(DENSITY_COLS, RETRY_COLS), from).into_iter().collect();
-    let per_band: Vec<(String, [f64; 3])> = retries.iter().map(|((ap, _), t)| (ap.clone(), *t)).collect();
+    let mut retries = retry_totals(vaps, cols_at(DENSITY_COLS, RETRY_COLS), from);
+    let per_band: Vec<(&str, [f64; 3])> = retries.iter().map(|((ap, _), t)| (*ap, *t)).collect();
     for (ap, t) in per_band {
-        let e = retries.entry((ap, "all".into())).or_default();
+        let e = retries.entry((ap, "all")).or_default();
         for (e, x) in e.iter_mut().zip(t) {
             *e += x;
         }
@@ -581,7 +581,7 @@ fn density_of(signals: Vec<(Ts, String, Option<String>, f64)>, vaps: &Loaded, fr
             }
             let traffic = bytes.get(&(ap.as_str(), band.as_ref())).copied().unwrap_or(0.0);
             let total = band_total.get(band.as_ref()).copied().unwrap_or(0.0);
-            let retry = retries.get(&(ap.clone(), band.to_string())).map(|r| retry_pct(*r));
+            let retry = retries.get(&(ap.as_str(), band.as_ref())).map(|r| retry_pct(*r));
             groups.push(json!({
                 "band": band,
                 "weakest_signal": (weakest.iter().sum::<f64>() / weakest.len().max(1) as f64).round(),
@@ -600,15 +600,21 @@ fn density_of(signals: Vec<(Ts, String, Option<String>, f64)>, vaps: &Loaded, fr
 pub async fn retries(State(s): State<AppState>, Query(q): Query<RangeQuery>) -> Result<Json<Value>, ApiError> {
     let (from, to, tier) = window(&q);
     let spec = Spec { table: "vap_stats", key: "bssid", extra: &["ap_mac", "radio"], cols: &RETRY_COLS, only: None };
-    let totals = memo_read(&s, Db::Metrics, "retries", &q, tier, move |c| Ok(retry_totals(&load(c, spec, tier, from, to)?, RETRY_AT, from))).await?;
+    // By AP and band.
+    let totals = memo_read(&s, Db::Metrics, "retries", &q, tier, move |c| {
+        let vaps = load(c, spec, tier, from, to)?;
+        let mut totals: Vec<((String, String), [f64; 3])> = retry_totals(&vaps, RETRY_AT, from).into_iter().map(|((ap, band), t)| ((ap.to_string(), band.to_string()), t)).collect();
+        totals.sort_by(|a, b| a.0.cmp(&b.0));
+        Ok(totals)
+    })
+    .await?;
     let live = s.live.read().unwrap();
-    let mut out: Vec<Value> = totals
+    let out: Vec<Value> = totals
         .iter()
         .map(|((ap, band), t)| {
             json!({ "name": ap_name(&live, ap), "mac": ap, "radio": band, "tx_retry_pct": retry_pct(*t), "retries": t[0], "attempts": t[1], "dropped": t[2] })
         })
         .collect();
-    out.sort_by(|a, b| a["mac"].as_str().cmp(&b["mac"].as_str()).then(a["radio"].as_str().cmp(&b["radio"].as_str())));
     Ok(Json(Value::Array(out)))
 }
 
@@ -961,6 +967,8 @@ pub async fn radios(State(s): State<AppState>, Query(q): Query<RangeQuery>) -> R
     })
     .await?;
     let retry = retry_totals(vstats, cols_at(RADIO_VAP_COLS, RETRY_COLS), from);
+    // The radios' samples by (AP, band), from their `mac/radio` keys.
+    let rstats: HashMap<(&str, &str), &Samples> = rstats.iter().filter_map(|(k, (_, samples))| Some((k.split_once('/')?, samples))).collect();
     // Traffic and client signal per (AP, band), and the spectrum rows, grouped once.
     let [tx, rx, signal] = cols_at(RADIO_VAP_COLS, ["tx_bytes", "rx_bytes", "avg_client_signal"]);
     let mut vap_use: HashMap<(&str, &str), (f64, Mean)> = HashMap::new();
@@ -983,9 +991,9 @@ pub async fn radios(State(s): State<AppState>, Query(q): Query<RangeQuery>) -> R
     for (mac, d) in &live.devices {
         let mac_s = mac.to_string();
         for r in &d.snapshot.radios {
-            let key = format!("{mac}/{}", r.radio);
+            let key = (mac_s.as_str(), r.radio.as_str());
             let (avg_cu, avg_interf) = match rstats.get(&key) {
-                Some((_, samples)) => {
+                Some(samples) => {
                     let (mut cu, mut interf) = (Mean::default(), Mean::default());
                     for (_, v) in samples.since(from) {
                         v[0].into_iter().for_each(|x| cu.add(x));
@@ -995,9 +1003,9 @@ pub async fn radios(State(s): State<AppState>, Query(q): Query<RangeQuery>) -> R
                 }
                 None => (None, None),
             };
-            let (usage, signal) = vap_use.get(&(mac_s.as_str(), r.radio.as_str())).copied().unwrap_or_default();
-            let retry_pct = retry.get(&(mac_s.clone(), r.radio.clone())).map(|t| retry_pct(*t));
-            let spec = spectrum.get(&(mac_s.as_str(), r.radio.as_str())).cloned().unwrap_or_default();
+            let (usage, signal) = vap_use.get(&key).copied().unwrap_or_default();
+            let retry_pct = retry.get(&key).map(|t| retry_pct(*t));
+            let spec = spectrum.get(&key).cloned().unwrap_or_default();
             out.push(json!({
                 "mac": mac, "name": d.snapshot.ap.hostname, "radio": r.radio, "channel": r.channel, "bw": r.bw,
                 "tx_power": r.tx_power, "eirp": r.tx_power.zip(r.antenna_gain).map(|(p, g)| p + g),
@@ -1586,7 +1594,7 @@ mod tests {
         let samples = vec![s(0, 100.0, 1000.0, 0.0), s(10, 130.0, 1100.0, 10.0), s(20, 5.0, 20.0, 0.0), s(30, 25.0, 120.0, 0.0)];
         let mut vaps: Loaded = BTreeMap::new();
         vaps.insert("bss".into(), (vec!["ap".into(), "na".into()], Samples::from_rows(samples)));
-        let t = retry_totals(&vaps, RETRY_AT, 0)[&("ap".to_string(), "na".to_string())];
+        let t = retry_totals(&vaps, RETRY_AT, 0)[&("ap", "na")];
         // 30+20 retries, 100+100 attempts, 10 dropped; the restart at t=20 adds nothing.
         assert_eq!(t, [50.0, 200.0, 10.0]);
         assert!((retry_pct(t) - 100.0 * 50.0 / 260.0).abs() < 1e-9);
