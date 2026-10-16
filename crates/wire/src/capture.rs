@@ -24,7 +24,6 @@ pub struct ConnId {
 #[derive(Debug)]
 pub enum HttpEvent {
     Request { conn: ConnId, ts: Micros, method: String, path: String, headers: Vec<(String, String)>, body: Vec<u8> },
-    #[allow(dead_code)] // headers are kept for future use (e.g. content-type checks)
     Response { conn: ConnId, ts: Micros, status: u16, headers: Vec<(String, String)>, body: Vec<u8> },
     /// A UDP datagram to one of the watched UDP ports (e.g. AP syslog on 5514).
     Datagram { ts: Micros, src: SocketAddr, dst: SocketAddr, payload: Vec<u8> },
@@ -43,7 +42,8 @@ pub fn run_with_udp<R: Read + Send>(
     udp_ports: &[u16],
     mut on_event: impl FnMut(HttpEvent),
 ) -> Result<()> {
-    let mut reader = create_reader(1 << 20, input).map_err(|e| anyhow::anyhow!("reading capture header: {e:?}"))?;
+    let mut buffer_size = 1 << 20;
+    let mut reader = create_reader(buffer_size, input).map_err(|e| anyhow::anyhow!("reading capture header: {e:?}"))?;
     let mut tracker = Tracker::new(ports.to_vec(), udp_ports.to_vec());
     // pcapng: per-interface link type and timestamp resolution.
     let mut interfaces: Vec<(Linktype, u64, i64)> = Vec::new();
@@ -83,6 +83,22 @@ pub fn run_with_udp<R: Read + Send>(
                 reader.consume(offset);
             }
             Err(PcapError::Eof) => return Ok(()),
+            // tcpdump killed mid-write leaves half a block at the end: keep what came before.
+            Err(PcapError::UnexpectedEof) => {
+                eprintln!("warning: the capture ends in the middle of a packet (truncated?); ignoring the rest");
+                return Ok(());
+            }
+            // A block larger than the buffer (jumbo frames, huge snaplen).
+            Err(PcapError::BufferTooSmall) => {
+                if buffer_size >= MAX_BLOCK {
+                    bail!("capture block over {MAX_BLOCK} bytes");
+                }
+                buffer_size *= 4;
+                reader.grow(buffer_size);
+                if let Err(e) = reader.refill() {
+                    bail!("reading capture: {e:?}");
+                }
+            }
             Err(PcapError::Incomplete(_)) => {
                 // Blocks until more data arrives when reading a live `tcpdump -w -` pipe.
                 if let Err(e) = reader.refill() {
@@ -93,6 +109,9 @@ pub fn run_with_udp<R: Read + Send>(
         }
     }
 }
+
+/// Largest capture block the reader grows its buffer for.
+const MAX_BLOCK: usize = 64 << 20;
 
 fn slice(linktype: Linktype, data: &[u8]) -> Option<SlicedPacket<'_>> {
     let ip = |d| SlicedPacket::from_ip(d).ok();
@@ -164,7 +183,8 @@ impl Tracker {
             self.conns.remove(&conn_id);
             return;
         }
-        half.segment(tcp.sequence_number(), tcp.syn(), tcp.payload());
+        half.segment(ts, tcp.sequence_number(), tcp.syn(), tcp.payload());
+        half.fin |= tcp.fin();
 
         while let Some(msg) = half.take_http(to_server) {
             on_event(match msg {
@@ -175,6 +195,14 @@ impl Tracker {
                     HttpEvent::Response { conn: conn_id, ts, status, headers, body }
                 }
             });
+        }
+        // Both sides closed and nothing is missing: release the buffers. The
+        // entry itself stays until it idles out, so the duplicate copies that
+        // `-i any` captures of the last segments count as retransmissions
+        // instead of starting a new stream.
+        if conn.to_server.closed() && conn.to_client.closed() {
+            conn.to_server.release();
+            conn.to_client.release();
         }
 
         // Forget connections idle for more than five minutes (long live captures).
@@ -187,19 +215,34 @@ impl Tracker {
 #[derive(Default)]
 struct HalfStream {
     next_seq: Option<u32>,
-    /// Segments that arrived ahead of `next_seq`.
+    /// Segments that arrived ahead of `next_seq`, and their total size.
     pending: Vec<(u32, Vec<u8>)>,
+    pending_bytes: usize,
+    /// Since when the stream has been waiting for the bytes before `pending`.
+    gap_since: Option<Micros>,
     buf: Vec<u8>,
+    /// A FIN was seen.
+    fin: bool,
 }
 
+/// How much may wait behind a gap before the missing bytes are given up on.
 const MAX_PENDING: usize = 4096;
-const MAX_BUFFER: usize = 32 << 20;
+const MAX_PENDING_BYTES: usize = 4 << 20;
+/// How long a gap may wait for its retransmission. A segment the capture missed
+/// but the peer received is never sent again, so without this the stream would
+/// stall for good.
+const MAX_GAP_AGE: Micros = 10_000_000;
+/// Largest unparsed message kept. Inform bodies are a few KB (the largest
+/// decoded ones a few hundred KB), and anything bigger on the port is not an inform.
+const MAX_BUFFER: usize = 8 << 20;
 
 impl HalfStream {
-    fn segment(&mut self, seq: u32, syn: bool, payload: &[u8]) {
+    fn segment(&mut self, ts: Micros, seq: u32, syn: bool, payload: &[u8]) {
         if syn {
             self.next_seq = Some(seq.wrapping_add(1));
             self.pending.clear();
+            self.pending_bytes = 0;
+            self.gap_since = None;
             self.buf.clear();
             return;
         }
@@ -209,19 +252,64 @@ impl HalfStream {
         let next = *self.next_seq.get_or_insert(seq);
         let offset = seq.wrapping_sub(next) as i32;
         if offset > 0 {
-            if self.pending.len() < MAX_PENDING {
-                self.pending.push((seq, payload.to_vec()));
-            }
-            return;
+            self.pending_bytes += payload.len();
+            self.pending.push((seq, payload.to_vec()));
+            self.gap_since.get_or_insert(ts);
+        } else {
+            self.append(seq, payload);
+            self.apply_pending(ts);
         }
-        self.append(seq, payload);
-        // Apply any queued segments that are now contiguous.
+        while self.pending.len() > MAX_PENDING
+            || self.pending_bytes > MAX_PENDING_BYTES
+            || self.gap_since.is_some_and(|since| ts.saturating_sub(since) > MAX_GAP_AGE)
+        {
+            self.skip_gap(ts);
+        }
+    }
+
+    /// Applies the queued segments that are now contiguous.
+    fn apply_pending(&mut self, ts: Micros) {
+        let mut progress = false;
         loop {
             let next = self.next_seq.unwrap();
             let Some(i) = self.pending.iter().position(|(s, _)| s.wrapping_sub(next) as i32 <= 0) else { break };
             let (s, p) = self.pending.swap_remove(i);
+            self.pending_bytes -= p.len();
             self.append(s, &p);
+            progress = true;
         }
+        if self.pending.is_empty() {
+            self.gap_since = None;
+        } else if progress {
+            self.gap_since = Some(ts);
+        }
+    }
+
+    /// Gives up on the missing bytes and goes on from the earliest queued segment.
+    /// The message they belonged to is lost, so the partial one in `buf` goes too;
+    /// `take_http` then resynchronises on the next message start.
+    fn skip_gap(&mut self, ts: Micros) {
+        let next = self.next_seq.unwrap_or(0);
+        let Some(&(lowest, _)) = self.pending.iter().min_by_key(|(s, _)| s.wrapping_sub(next)) else {
+            self.gap_since = None;
+            return;
+        };
+        self.buf.clear();
+        self.next_seq = Some(lowest);
+        self.apply_pending(ts);
+    }
+
+    /// Closed by its sender with every byte received.
+    fn closed(&self) -> bool {
+        self.fin && self.pending.is_empty()
+    }
+
+    /// Frees the buffers but keeps `next_seq`.
+    fn release(&mut self) {
+        self.buf = Vec::new();
+        self.pending = Vec::new();
+        self.pending_bytes = 0;
+        self.gap_since = None;
     }
 
     /// Appends the part of a segment that lies at or beyond `next_seq` (skips retransmitted bytes).
@@ -383,12 +471,49 @@ mod tests {
     #[test]
     fn reassembles_out_of_order_and_duplicate_segments() {
         let mut h = HalfStream::default();
-        h.segment(100, true, b"");
-        h.segment(101, false, b"hello ");
-        h.segment(113, false, b"!"); // ahead
-        h.segment(101, false, b"hello "); // duplicate
-        h.segment(107, false, b"world "); // fills the gap
+        h.segment(0, 100, true, b"");
+        h.segment(0, 101, false, b"hello ");
+        h.segment(0, 113, false, b"!"); // ahead
+        h.segment(0, 101, false, b"hello "); // duplicate
+        h.segment(0, 107, false, b"world "); // fills the gap
         assert_eq!(h.buf, b"hello world !");
+        assert_eq!((h.pending_bytes, h.gap_since), (0, None));
+    }
+
+    #[test]
+    fn a_gap_that_never_fills_is_skipped() {
+        let msg = |body: &str| format!("POST /inform HTTP/1.1\r\nContent-Length: {}\r\n\r\n{body}", body.len()).into_bytes();
+        let (first, second) = (msg("lost"), msg("next"));
+        let mut h = HalfStream::default();
+        h.segment(0, 99, true, b"");
+        h.segment(0, 100, false, &first[..10]);
+        // The rest of the first message never shows up; the second one queues behind the gap.
+        let at = 100 + first.len() as u32;
+        h.segment(1_000_000, at, false, &second);
+        assert!(h.take_http(true).is_none());
+        // Still waiting while a retransmission may come ...
+        h.segment(5_000_000, at, false, &second);
+        assert_eq!(h.pending_bytes, 2 * second.len());
+        // ... then gives up on it and carries on with the second message.
+        h.segment(12_000_000, at, false, &second);
+        assert!(matches!(h.take_http(true), Some(Parsed::Request { body, .. }) if body == b"next"));
+        assert!(h.take_http(true).is_none());
+        assert_eq!((h.pending_bytes, h.gap_since), (0, None));
+        h.segment(12_000_000, at + second.len() as u32, false, &first);
+        assert!(matches!(h.take_http(true), Some(Parsed::Request { body, .. }) if body == b"lost"), "in sync again");
+    }
+
+    #[test]
+    fn pending_bytes_are_bounded() {
+        let mut h = HalfStream::default();
+        h.segment(0, 0, true, b"");
+        h.segment(0, 1, false, b"x");
+        let chunk = vec![b'y'; 60_000];
+        for i in 0..200u32 {
+            h.segment(0, 100 + i * 60_000, false, &chunk); // all behind the gap at 2..100
+            assert!(h.pending_bytes <= MAX_PENDING_BYTES);
+        }
+        assert!(h.next_seq.unwrap() > 100, "skipped ahead");
     }
 
     #[test]
@@ -502,5 +627,31 @@ mod pcap_tests {
             e => panic!("{e:?}"),
         }
         assert!(matches!(&events[1], HttpEvent::Response { status: 200, body, .. } if body == b"RESPONSE"));
+    }
+
+    #[test]
+    fn a_truncated_capture_keeps_what_it_has() {
+        let req = sample::http_request(b"REQUEST-BODY");
+        let resp = sample::http_response(b"RESPONSE");
+        let data = sample::pcap(&[(true, 1000, &req), (false, 5000, &resp)]);
+        let mut events = Vec::new();
+        run(&data[..data.len() - 5], &[8080], |e| events.push(e)).unwrap();
+        assert_eq!(events.len(), 1, "{events:?}");
+    }
+
+    #[test]
+    fn blocks_larger_than_the_buffer_are_read() {
+        let req = sample::http_request(b"REQUEST-BODY");
+        let mut data = sample::pcap(&[]);
+        // A 3 MiB record (not a frame we parse), then a normal one.
+        let big = 3 << 20;
+        for v in [1_791_840_600u32, 0, big, big] {
+            data.extend_from_slice(&v.to_le_bytes());
+        }
+        data.resize(data.len() + big as usize, 0);
+        data.extend_from_slice(&sample::pcap(&[(true, 1000, &req)])[24..]);
+        let mut events = Vec::new();
+        run(&data[..], &[8080], |e| events.push(e)).unwrap();
+        assert!(matches!(&events[..], [HttpEvent::Request { body, .. }] if body == b"REQUEST-BODY"), "{events:?}");
     }
 }

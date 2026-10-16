@@ -51,7 +51,8 @@ impl Diff {
     }
 }
 
-/// Keys whose values are credentials (PSKs, RADIUS secrets, authkeys, passwords).
+/// Keys whose values are credentials (PSKs, RADIUS secrets, authkeys, passwords,
+/// the SNMP community).
 pub fn is_secret(key: &str) -> bool {
     let k = key.to_ascii_lowercase();
     // `x_` marks secret fields in the controller's database, but only as a prefix
@@ -60,6 +61,7 @@ pub fn is_secret(key: &str) -> bool {
     k.split('.').any(|seg| seg.starts_with("x_"))
         || last == "key"
         || last.ends_with("_key")
+        || last == "community"
         || ["psk", "passphrase", "secret", "authkey", "password", "passwd", "syslog_key", "sae_"]
             .iter()
             .any(|s| k.contains(s))
@@ -117,6 +119,8 @@ mod tests {
         assert!(is_secret("x_passphrase"));
         assert!(is_secret("aaa.3.iapp_key") && is_secret("unifi.key"));
         assert!(!is_secret("aaa.3.wpa.key.1.mgmt"));
+        assert!(is_secret("snmp.community") && is_secret("community"));
+        assert_eq!(redact("snmp.status=enabled\nsnmp.community=public"), "snmp.status=enabled\nsnmp.community=<redacted>");
     }
 }
 
@@ -131,7 +135,11 @@ mod capture_fixtures {
 
     /// The sanitised captures, kept outside the repository: `$APCTL_TESTDATA/2026-10-12-u6m-8.8.11`.
     fn fixtures() -> Option<PathBuf> {
-        let dir = PathBuf::from(std::env::var_os("APCTL_TESTDATA")?).join("2026-10-12-u6m-8.8.11");
+        let Some(root) = std::env::var_os("APCTL_TESTDATA") else {
+            eprintln!("skipped: APCTL_TESTDATA is not set, so the capture fixtures are not available");
+            return None;
+        };
+        let dir = PathBuf::from(root).join("2026-10-12-u6m-8.8.11");
         if !dir.is_dir() {
             eprintln!("skipped: no capture fixtures in {}", dir.display());
             return None;

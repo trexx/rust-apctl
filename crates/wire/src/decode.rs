@@ -28,7 +28,8 @@ pub fn decode(body: &[u8], keys: &KeyStore, mac_hint: Option<Mac>) -> Result<Dec
     if !flags.has(inform::Flags::ENCRYPTED) {
         attempts.push((KeyUsed::None, &DEFAULT_KEY));
     } else {
-        for mac in [Some(pkt.header.mac), mac_hint].into_iter().flatten() {
+        let hint = mac_hint.filter(|m| *m != pkt.header.mac);
+        for mac in [Some(pkt.header.mac), hint].into_iter().flatten() {
             if let Some(k) = keys.get(&mac) {
                 attempts.push((KeyUsed::Device, k));
             }
