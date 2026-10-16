@@ -689,7 +689,9 @@ fn check_mdns_rules(state: &Value, v: &Value) -> Result<Vec<Value>, String> {
 /// adoption). Disabled SSIDs count too.
 fn check_wlan_limits(state: &Value) -> Result<(), String> {
     let setting_on = |key: &str, default: bool| setting(state, key)["enabled"].as_bool().unwrap_or(default);
-    let wlans: Vec<&Value> = docs(state, "wlanconf").collect();
+    // Each SSID's bands and the APs it goes to, worked out once.
+    let wlans: Vec<(Vec<&str>, Vec<String>)> =
+        docs(state, "wlanconf").map(|w| (w["wlan_bands"].as_array().into_iter().flatten().filter_map(Value::as_str).collect(), deployed_to(state, w))).collect();
     for d in docs(state, "devices") {
         let mac = d["mac"].as_str().unwrap_or_default().to_ascii_lowercase();
         let name = d["name"].as_str().unwrap_or(&mac);
@@ -705,11 +707,7 @@ fn check_wlan_limits(state: &Value) -> Result<(), String> {
             } else {
                 8
             };
-            let count = wlans
-                .iter()
-                .filter(|w| w["wlan_bands"].as_array().is_some_and(|b| b.iter().any(|x| x.as_str() == Some(wb))))
-                .filter(|w| deployed_to(state, w).contains(&mac))
-                .count();
+            let count = wlans.iter().filter(|(bands, aps)| bands.contains(&wb) && aps.contains(&mac)).count();
             if count > limit {
                 return Err(format!("{name} would have {count} SSIDs on its {} radio; it supports {limit}", band_name(band)));
             }
@@ -1904,6 +1902,25 @@ mod tests {
         let mut s = state();
         let e = DeviceEdit { mac: AP1.into(), patch: json!({ "radios": [{ "radio": "na", "tx_power_mode": "disabled" }] }), caps: Value::Null, wireless_uplink: Some("na".into()), antennas: Value::Null };
         assert!(apply_device(&mut s, &e).unwrap_err().contains("uplink"));
+    }
+
+    #[test]
+    fn ssids_per_radio_are_limited() {
+        let wlan = |i: usize, bands: Value, groups: Value| json!({ "_id": format!("w{i}"), "name": format!("N{i}"), "wlan_bands": bands, "ap_group_ids": groups });
+        let mut s = json!({
+            "devices": [{ "mac": AP1, "name": "Hall", "radio_table": [{ "radio": "ng" }, { "radio": "na" }] }, { "mac": AP2, "radio_table": [{ "radio": "na" }] }],
+            "apgroup": [{ "_id": "all", "attr_hidden_id": "default" }, { "_id": "one", "device_macs": [AP2] }],
+            "setting": [{ "key": "connectivity", "enabled": false }],
+            "wlanconf": (0..8).map(|i| wlan(i, json!(["2g", "5g"]), json!(["all"]))).collect::<Vec<_>>(),
+        });
+        assert!(check_wlan_limits(&s).is_ok(), "eight per radio");
+        // A ninth on 5 GHz for the second AP only: the first is still fine.
+        s["wlanconf"].as_array_mut().unwrap().push(wlan(8, json!(["5g"]), json!(["one"])));
+        assert!(check_wlan_limits(&s).unwrap_err().starts_with(&format!("{AP2} would have 9 SSIDs on its 5 GHz radio")));
+        // Wireless meshing on: four per radio.
+        s["wlanconf"].as_array_mut().unwrap().truncate(5);
+        s["setting"][0]["enabled"] = json!(true);
+        assert_eq!(check_wlan_limits(&s).unwrap_err(), "Hall would have 5 SSIDs on its 2.4 GHz radio; it supports 4");
     }
 
     #[test]
