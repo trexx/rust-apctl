@@ -1066,12 +1066,44 @@ export function useSeries(table: string, key: string, span: TimeSpan) {
 export type EventFilter = { device?: Mac; client?: Mac; kind?: string; limit?: number };
 export type LogFilter = { device?: Mac; q?: string; limit?: number };
 
-// The previous list stays up (`isPlaceholderData`) while another filter's loads.
-export const useEvents = (filter: EventFilter) =>
-  useQuery({ queryKey: keys.events(filter), queryFn: getting<AppEvent[]>(`/api/events${qs(filter)}`), placeholderData: keepPreviousData });
+/**
+ * When the live socket last reconnected or was told to resync: a list cached before then is
+ * fetched whole, since what it missed was never announced (and a restored backup restarts the ids).
+ */
+let liveResetAt = 0;
 
-export const useLogs = (filter: LogFilter) =>
-  useQuery({ queryKey: keys.logs(filter), queryFn: getting<LogLine[]>(`/api/logs${qs(filter)}`), placeholderData: keepPreviousData });
+/** `prev` with the rows of `add` (stored after them), newest first as the server sorts them, and only the `limit` newest. */
+function mergeNewest<T extends { id: number; ts: number }>(prev: T[], add: T[], limit: number): T[] {
+  return [...add, ...prev].sort((a, b) => b.ts - a.ts || b.id - a.id).slice(0, limit);
+}
+
+/**
+ * A newest-first list whose rows have rising ids (events, log lines). A refetch with something
+ * cached asks only for the rows stored after its newest, and keeps the `limit` newest; the
+ * previous list stays up (`isPlaceholderData`) while another filter's loads.
+ */
+function useNewestList<T extends { id: number; ts: number }>(queryKey: QueryKey, path: string, filter: Record<string, string | number | undefined> & { limit?: number }, defaultLimit: number) {
+  const qc = useQueryClient();
+  return useQuery({
+    queryKey,
+    queryFn: async ({ signal }) => {
+      const cached = qc.getQueryState<T[]>(queryKey);
+      const prev = cached?.data;
+      if (cached && prev?.length && cached.dataUpdatedAt > liveResetAt) {
+        const after = prev.reduce((max, r) => Math.max(max, r.id), 0);
+        const add = await get<T[]>(`${path}${qs({ ...filter, after })}`, signal);
+        return add.length ? mergeNewest(prev, add, filter.limit ?? defaultLimit) : prev;
+      }
+      return get<T[]>(`${path}${qs(filter)}`, signal);
+    },
+    placeholderData: keepPreviousData,
+  });
+}
+
+// The server's default limits: 200 events, 500 log lines.
+export const useEvents = (filter: EventFilter) => useNewestList<AppEvent>(keys.events(filter), "/api/events", filter, 200);
+
+export const useLogs = (filter: LogFilter) => useNewestList<LogLine>(keys.logs(filter), "/api/logs", filter, 500);
 
 /** A filter's MAC against a message's, as the server compares them (it normalises the filter). */
 const sameMac = (filter: Mac | undefined, mac: Mac | null) => !filter || filter.toLowerCase() === mac?.toLowerCase();
@@ -1180,6 +1212,11 @@ export function useLiveUpdates(): void {
         if (matches((q.queryKey[1] ?? {}) as F)) invalidate(q.queryKey, gap);
       }
     };
+    /** Refetches everything: messages were missed. The event and log lists are fetched whole. */
+    const refetchAll = () => {
+      liveResetAt = Date.now();
+      void qc.invalidateQueries();
+    };
     const onVisible = () => {
       if (!document.hidden) schedule();
     };
@@ -1231,7 +1268,7 @@ export function useLiveUpdates(): void {
           window.dispatchEvent(new CustomEvent("apctl:alert", { detail: msg }));
           break;
         case "resync":
-          void qc.invalidateQueries();
+          refetchAll();
           break;
       }
     };
@@ -1244,7 +1281,7 @@ export function useLiveUpdates(): void {
       socket.onopen = () => {
         retry = 1000;
         // Whatever changed while disconnected (e.g. during a restart) was never announced.
-        if (dropped) void qc.invalidateQueries();
+        if (dropped) refetchAll();
       };
       socket.onmessage = onMessage;
       socket.onclose = () => {
