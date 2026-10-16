@@ -94,6 +94,10 @@ host ports, and feed it a capture with `--shadow` or `--shadow-cmd`; the
 `ghcr.io/trexx/rust-apctl-capture` image is a tcpdump sidecar for that. `apctl serve --help`
 lists every option.
 
+Behind a reverse proxy or ingress, list its addresses with `--trusted-proxies`
+(`APCTL_TRUSTED_PROXIES`, IPs or CIDR ranges). Only then is its `X-Forwarded-For` header
+used, so the login throttle sees each client rather than the proxy.
+
 ## Demo
 
 Try the UI without any APs. The demo is a made-up site with three APs and about twenty clients:
@@ -115,8 +119,8 @@ cargo build --release -p controller   # or: podman build --target runtime .
 
 `crates/informdump` decodes, imports, sanitises and simulates inform traffic. Run
 `informdump --help` for its commands. `informdump import` reads the official controller's
-MongoDB and needs `cargo build --release -p informdump --features mongo`. Pushing a version tag (e.g. `0.15.1`) publishes the
-image.
+MongoDB and needs `cargo build --release -p informdump --features mongo`. Pushing a version
+tag (e.g. `0.15.1`) publishes the image.
 
 ## License
 

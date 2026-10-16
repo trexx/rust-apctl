@@ -28,7 +28,10 @@ jobs:
             echo "::notice::APCTL_TESTDATA is not set: the capture-based golden tests are skipped"
           fi
       # The web UI is not needed: debug builds serve web/dist from disk if it exists.
-      - run: 'cargo test --workspace --locked'
+      # informdump turns on serde_json's preserve_order; testing it on its own keeps the
+      # other crates on the features the shipped binary is built with.
+      - run: 'cargo test --workspace --exclude informdump --locked'
+      - run: 'cargo test -p informdump --locked'
       - run: 'cargo clippy --workspace --all-targets --locked -- -D warnings'
       # informdump's MongoDB import is behind a feature; keep it compiling.
       - run: 'cargo check -p informdump --features mongo --locked'

@@ -7,34 +7,34 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
-aes-gcm = "0.11.1"
-anyhow = "1.0.104"
-apcfg = { version = "0.1.0", path = "../apcfg" }
+aes-gcm.workspace = true
+anyhow.workspace = true
+apcfg.workspace = true
 argon2 = "0.6.0"
 axum = { version = "0.8.9", features = ["ws"] }
 base64 = "0.22"
-clap = { version = "4.6.7", features = ["derive", "env"] }
-flate2 = "1.1.10"
-futures-util = "0.3.34"
-getrandom = "0.4.3"
-hex = "0.4.3"
-inform = { version = "0.1.0", path = "../inform" }
-regex = "1.13.1"
+clap = { workspace = true, features = ["derive", "env"] }
+flate2.workspace = true
+futures-util.workspace = true
+getrandom.workspace = true
+hex.workspace = true
+inform.workspace = true
+regex.workspace = true
 rusqlite = { version = "0.40.2", features = ["bundled"] }
 russh = { version = "0.64", default-features = false, features = ["ring", "rsa"] }
 rust-embed = { version = "8.13.0", features = ["mime-guess"] }
-serde = { version = "1.0.229", features = ["derive"] }
-serde_json = "1.0.154"
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
 sha-crypt = "0.6.0"
 sha2 = "0.11.1"
 tar = "0.4.46"
-tokio = { version = "1.53.2", features = ["full"] }
+tokio = { workspace = true, features = ["full"] }
 tokio-util = { version = "0.7.20", features = ["io"] }
 tower-http = { version = "0.6.11", features = ["compression-gzip"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 ureq = "3.4.2"
-wire = { version = "0.1.0", path = "../wire" }
+wire.workspace = true
 
 [[bin]]
 name = "apctl"
