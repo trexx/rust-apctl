@@ -240,8 +240,31 @@ pub async fn adopt(State(s): State<AppState>, headers: HeaderMap, Json(b): Json<
     Ok(Json(json!({ "adopting": true, "mac": mac, "inform_url": url })))
 }
 
+/// A SHA-512 crypt(3) hash (`$6$salt$hash`, 5000 rounds, 8-character salt):
+/// what the AP config carries for the SSH password.
+pub fn sha512_crypt(password: &str) -> String {
+    use sha_crypt::{PasswordHasher, ShaCrypt};
+    let mut salt = [0u8; 6];
+    getrandom::fill(&mut salt).expect("system random source");
+    let h = ShaCrypt::SHA512.hash_password_with_salt(password.as_bytes(), &salt).expect("SHA-512 crypt").to_string();
+    // The default round count need not be spelled out, and the APs' own hashes leave it out.
+    h.replacen("$rounds=5000$", "$", 1)
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn ssh_password_hashes_are_standard_sha512_crypt() {
+        use sha_crypt::{PasswordVerifier, ShaCrypt};
+        // The test vector from the SHA-crypt specification checks the verifier reads this form.
+        ShaCrypt::SHA512.verify_password(b"Hello world!", "$6$saltstring$svn8UoSVapNtMuq1ukKS4tPQd8iKwSMHWjl/O817G3uBnIFNjnQJuesI68u4OTLiBFdcbYEdFCoEOfaS35inz1").unwrap();
+        let h = super::sha512_crypt("correct horse");
+        let parts: Vec<&str> = h.split('$').collect();
+        assert_eq!((parts[1], parts[2].len(), parts[3].len()), ("6", 8, 86), "{h}");
+        ShaCrypt::SHA512.verify_password(b"correct horse", h.as_str()).unwrap();
+        assert!(ShaCrypt::SHA512.verify_password(b"wrong", h.as_str()).is_err());
+    }
+
     use super::*;
 
     #[test]

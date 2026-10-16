@@ -250,6 +250,15 @@ const ETSI: &[i64] = &[
 /// Countries using the US (FCC) rules.
 const FCC: &[i64] = &[840, 124];
 
+/// Names of the countries the channel tables above cover, for the site settings.
+pub(crate) const COUNTRY_NAMES: &[(i64, &str)] = &[
+    (40, "Austria"), (56, "Belgium"), (100, "Bulgaria"), (124, "Canada"), (191, "Croatia"), (196, "Cyprus"), (203, "Czechia"), (208, "Denmark"),
+    (233, "Estonia"), (246, "Finland"), (250, "France"), (276, "Germany"), (300, "Greece"), (348, "Hungary"), (352, "Iceland"), (372, "Ireland"),
+    (380, "Italy"), (428, "Latvia"), (438, "Liechtenstein"), (440, "Lithuania"), (442, "Luxembourg"), (470, "Malta"), (528, "Netherlands"), (578, "Norway"),
+    (616, "Poland"), (620, "Portugal"), (642, "Romania"), (703, "Slovakia"), (705, "Slovenia"), (724, "Spain"), (752, "Sweden"), (756, "Switzerland"),
+    (826, "United Kingdom"), (840, "United States"),
+];
+
 /// The site's country (ISO 3166 numeric), from the `country` setting.
 pub(crate) fn country(state: &Value) -> Option<i64> {
     let c = docs(state, "setting").find(|s| s["key"].as_str() == Some("country"))?;

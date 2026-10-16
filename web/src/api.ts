@@ -1075,8 +1075,41 @@ export interface SettingsPreview {
 export type SettingsTarget =
   | { kind: "wlan"; id: string | null; remove?: boolean }
   | { kind: "device"; mac: Mac }
-  | { kind: "usergroup"; id: string | null; remove?: boolean };
+  | { kind: "usergroup"; id: string | null; remove?: boolean }
+  | { kind: "site" };
 
+export interface SshKey { name: string; type: string; key: string; comment: string }
+
+/** Site-wide device settings (secrets are never sent back). */
+export interface SiteSettings {
+  active: boolean;
+  mgmt: {
+    has_ssh_password: boolean;
+    led_enabled: boolean | null;
+    outdoor_mode_enabled: boolean | null;
+    x_ssh_enabled: boolean | null;
+    x_ssh_username: string | null;
+    x_ssh_auth_password_enabled: boolean | null;
+    x_ssh_bind_wildcard: boolean | null;
+    x_ssh_keys: SshKey[] | null;
+  };
+  rsyslogd: {
+    mode: "off" | "controller" | "server";
+    ip: string | null;
+    port: number | string | null;
+    debug: boolean | null;
+    netconsole_enabled: boolean | null;
+    netconsole_host: string | null;
+    netconsole_port: number | string | null;
+  };
+  ntp: { setting_preference: "auto" | "manual" | null; ntp_server_1: string | null; ntp_server_2: string | null; ntp_server_3: string | null; ntp_server_4: string | null };
+  country: number | null;
+  timezone: string | null;
+  countries: { code: number; name: string }[];
+  timezones: string[];
+}
+
+export const useSiteSettings = () => useQuery({ queryKey: ["settings", "site"], queryFn: () => get<SiteSettings>("/api/settings/site"), retry: false });
 export const useWlanSettings = () => useQuery({ queryKey: ["settings", "wlans"], queryFn: () => get<WlanSettingsList>("/api/settings/wlans") });
 export const useDeviceSettings = (mac: Mac) => useQuery({ queryKey: ["settings", "device", mac], queryFn: () => get<DeviceSettings>(`/api/settings/devices/${mac}`), retry: false });
 export const wlanPassphrase = (id: string) => get<{ passphrase: string | null }>(`/api/settings/wlans/${id}/passphrase`);
@@ -1085,6 +1118,7 @@ export const wlanPassphrase = (id: string) => get<{ passphrase: string | null }>
 export function changeSettings<T>(target: SettingsTarget, patch: Record<string, unknown>, save: boolean): Promise<T> {
   const q = save ? "" : "?preview=true";
   if (target.kind === "device") return send<T>("PUT", `/api/settings/devices/${target.mac}${q}`, { patch });
+  if (target.kind === "site") return send<T>("PUT", `/api/settings/site${q}`, { patch });
   if (target.kind === "usergroup") {
     if (target.remove) return send<T>("DELETE", `/api/settings/usergroups/${target.id}${q}`, {});
     if (target.id === null) return send<T>("POST", `/api/settings/usergroups${q}`, { patch });

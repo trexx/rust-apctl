@@ -4,6 +4,7 @@ import { useQueryClient } from "@tanstack/react-query";
 import {
   changeSettings,
   useDeviceSettings,
+  useSiteSettings,
   speed,
   useMe,
   useUserGroups,
@@ -15,6 +16,7 @@ import type {
   RadioSettings,
   SettingsPreview,
   SettingsTarget,
+  SiteSettings,
   UserGroup,
   WlanSettings,
   WlanSettingsList,
@@ -1895,6 +1897,340 @@ export function DeviceSettingsPanel({ mac }: { mac: string }) {
         )}
       </div>
       {editing && <DeviceEditor d={d} onClose={() => setEditing(false)} />}
+    </div>
+  );
+}
+
+/** A random password from letters and digits (no look-alikes), from the browser's CSPRNG. */
+function randomPassword(n = 24): string {
+  const alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789";
+  const out: string[] = [];
+  const buf = new Uint32Array(1);
+  while (out.length < n) {
+    crypto.getRandomValues(buf);
+    // Rejection sampling keeps every character equally likely.
+    if (buf[0] < Math.floor(2 ** 32 / alphabet.length) * alphabet.length)
+      out.push(alphabet[buf[0] % alphabet.length]);
+  }
+  return out.join("");
+}
+
+const keyLine = (k: { type: string; key: string; comment: string }) =>
+  [k.type, k.key, k.comment].filter(Boolean).join(" ");
+
+/** Site-wide device settings: LED, outdoor, SSH, syslog, NTP, country, time zone. */
+export function SiteSettingsPanel() {
+  const q = useSiteSettings();
+  const readOnly = useMe().data?.read_only ?? false;
+  const [editing, setEditing] = useState(false);
+  if (q.isLoading) return <Loading />;
+  if (q.error) return <ErrorNote error={q.error} />;
+  if (!q.data) return null;
+  const d = q.data;
+  const country = d.countries.find((c) => c.code === d.country)?.name;
+  return (
+    <div className="panel">
+      <div className="panel-head">
+        <b>Site settings</b>
+        <span className="muted small">
+          {editing
+            ? ""
+            : `${country ?? `country ${d.country ?? "?"}`}, ${d.timezone ?? "UTC"}, SSH user ${d.mgmt.x_ssh_username ?? "ubnt"}`}
+        </span>
+        <span className="spacer" />
+        {!editing && !readOnly && (
+          <button className="btn small" onClick={() => setEditing(true)}>
+            Edit
+          </button>
+        )}
+      </div>
+      {editing && <SiteEditor d={d} onClose={() => setEditing(false)} />}
+    </div>
+  );
+}
+
+function SiteEditor({ d, onClose }: { d: SiteSettings; onClose: () => void }) {
+  const mgmt0: Fields = {
+    led_enabled: d.mgmt.led_enabled ?? true,
+    outdoor_mode_enabled: d.mgmt.outdoor_mode_enabled ?? false,
+    x_ssh_enabled: d.mgmt.x_ssh_enabled ?? true,
+    x_ssh_username: d.mgmt.x_ssh_username ?? "",
+    x_ssh_auth_password_enabled: d.mgmt.x_ssh_auth_password_enabled ?? true,
+    x_ssh_bind_wildcard: d.mgmt.x_ssh_bind_wildcard ?? false,
+    x_ssh_keys: (d.mgmt.x_ssh_keys ?? []).map(keyLine),
+  };
+  const syslog0: Fields = {
+    mode: d.rsyslogd.mode,
+    ip: d.rsyslogd.ip ?? "",
+    port: Number(d.rsyslogd.port ?? 514),
+    debug: d.rsyslogd.debug ?? false,
+    netconsole_enabled: d.rsyslogd.netconsole_enabled ?? false,
+    netconsole_host: d.rsyslogd.netconsole_host ?? "",
+    netconsole_port: Number(d.rsyslogd.netconsole_port ?? 514),
+  };
+  const ntp0: Fields = {
+    setting_preference: d.ntp.setting_preference ?? "auto",
+    ntp_server_1: d.ntp.ntp_server_1 ?? "",
+    ntp_server_2: d.ntp.ntp_server_2 ?? "",
+    ntp_server_3: d.ntp.ntp_server_3 ?? "",
+    ntp_server_4: d.ntp.ntp_server_4 ?? "",
+  };
+  const top0: Fields = { country: d.country, timezone: d.timezone ?? "UTC" };
+  const [mgmt, setMgmt] = useState<Fields>(mgmt0);
+  const [syslog, setSyslog] = useState<Fields>(syslog0);
+  const [ntp, setNtp] = useState<Fields>(ntp0);
+  const [top, setTop] = useState<Fields>(top0);
+  const [password, setPassword] = useState("");
+  const [review, setReview] = useState<Fields | null>(null);
+  const patch = () => {
+    const p: Fields = changed(top0, top);
+    const m = changed(mgmt0, mgmt);
+    if (password) m.x_ssh_password = password;
+    if (Object.keys(m).length) p.mgmt = m;
+    const r = changed(syslog0, syslog);
+    if (Object.keys(r).length) p.rsyslogd = r;
+    const n = changed(ntp0, ntp);
+    // Manual servers are sent as a whole list.
+    if (Object.keys(n).length)
+      p.ntp =
+        ntp.setting_preference === "manual"
+          ? ntp
+          : { setting_preference: ntp.setting_preference };
+    return p;
+  };
+  if (review)
+    return (
+      <Review
+        target={{ kind: "site" }}
+        patch={review}
+        active={d.active}
+        onBack={() => setReview(null)}
+        onSaved={onClose}
+      />
+    );
+  const nothing = Object.keys(patch()).length === 0;
+  const m = (k: string) => (v: unknown) => setMgmt({ ...mgmt, [k]: v });
+  const r = (k: string) => (v: unknown) => setSyslog({ ...syslog, [k]: v });
+  return (
+    <div className="settings-form">
+      <Row label="Country" hint="decides the legal channels and power">
+        <select
+          value={String(top.country ?? "")}
+          onChange={(e) => setTop({ ...top, country: Number(e.target.value) })}
+        >
+          {!d.countries.some((c) => c.code === top.country) && (
+            <option value="">(code {String(top.country ?? "none")})</option>
+          )}
+          {d.countries.map((c) => (
+            <option key={c.code} value={c.code}>
+              {c.name}
+            </option>
+          ))}
+        </select>
+      </Row>
+      <Row label="Time zone" hint="for schedules and the APs' clocks">
+        <select
+          value={String(top.timezone)}
+          onChange={(e) => setTop({ ...top, timezone: e.target.value })}
+        >
+          {!d.timezones.includes(String(top.timezone)) && (
+            <option value={String(top.timezone)}>{String(top.timezone)}</option>
+          )}
+          {d.timezones.map((z) => (
+            <option key={z} value={z}>
+              {z}
+            </option>
+          ))}
+        </select>
+      </Row>
+      <Row label="AP defaults" hint="each AP can override these">
+        <Toggle
+          value={mgmt.led_enabled}
+          onChange={m("led_enabled")}
+          label="LEDs on"
+        />
+        <Toggle
+          value={mgmt.outdoor_mode_enabled}
+          onChange={m("outdoor_mode_enabled")}
+          label="Outdoor mode"
+        />
+      </Row>
+      <details>
+        <summary>SSH access to the APs</summary>
+        <Row label="SSH">
+          <Toggle
+            value={mgmt.x_ssh_enabled}
+            onChange={m("x_ssh_enabled")}
+            label="Enabled"
+          />
+          <Toggle
+            value={mgmt.x_ssh_auth_password_enabled}
+            onChange={m("x_ssh_auth_password_enabled")}
+            label="Password logins"
+          />
+        </Row>
+        <Row label="User name">
+          <input
+            className="search"
+            maxLength={32}
+            value={String(mgmt.x_ssh_username)}
+            onChange={(e) => m("x_ssh_username")(e.target.value)}
+          />
+        </Row>
+        <Row
+          label="Password"
+          hint={
+            d.mgmt.has_ssh_password
+              ? "leave empty to keep it; 12+ characters with upper, lower, digit and symbol, or 20+"
+              : "12+ characters with upper, lower, digit and symbol, or 20+"
+          }
+        >
+          <input
+            className="search mono"
+            type="text"
+            autoComplete="off"
+            placeholder={d.mgmt.has_ssh_password ? "unchanged" : ""}
+            size={30}
+            value={password}
+            onChange={(e) => setPassword(e.target.value)}
+          />
+          <button
+            className="btn small"
+            onClick={() => setPassword(randomPassword())}
+          >
+            Generate
+          </button>
+          {password && (
+            <span className="muted small">
+              Store it in your password manager before saving.
+            </span>
+          )}
+        </Row>
+        <Row
+          label="Public keys"
+          hint="one OpenSSH key per line (RSA or Ed25519)"
+        >
+          <textarea
+            className="search mono"
+            rows={3}
+            value={(mgmt.x_ssh_keys as string[]).join("\n")}
+            onChange={(e) =>
+              m("x_ssh_keys")(
+                e.target.value
+                  .split("\n")
+                  .map((l) => l.trim())
+                  .filter(Boolean),
+              )
+            }
+          />
+        </Row>
+      </details>
+      <details>
+        <summary>Logging</summary>
+        <Row
+          label="Syslog"
+          hint="to apctl needs its syslog listener (--syslog-listen on port 5514)"
+        >
+          <select
+            value={String(syslog.mode)}
+            onChange={(e) => r("mode")(e.target.value)}
+          >
+            <option value="off">Off</option>
+            <option value="controller">To apctl</option>
+            <option value="server">To a syslog server</option>
+          </select>
+          {syslog.mode === "server" && (
+            <>
+              <input
+                className="search mono"
+                placeholder="server"
+                value={String(syslog.ip)}
+                onChange={(e) => r("ip")(e.target.value)}
+              />
+              <input
+                type="number"
+                className="search num-input"
+                min={1}
+                max={65535}
+                value={Number(syslog.port)}
+                onChange={(e) => r("port")(Number(e.target.value))}
+              />
+            </>
+          )}
+          {syslog.mode !== "off" && (
+            <Toggle
+              value={syslog.debug}
+              onChange={r("debug")}
+              label="Debug level"
+            />
+          )}
+        </Row>
+        {syslog.mode === "server" && (
+          <Row label="Netconsole" hint="kernel messages, for crash debugging">
+            <Toggle
+              value={syslog.netconsole_enabled}
+              onChange={r("netconsole_enabled")}
+              label="Enabled"
+            />
+            {syslog.netconsole_enabled === true && (
+              <>
+                <input
+                  className="search mono"
+                  placeholder="host"
+                  value={String(syslog.netconsole_host)}
+                  onChange={(e) => r("netconsole_host")(e.target.value)}
+                />
+                <input
+                  type="number"
+                  className="search num-input"
+                  min={1}
+                  max={65535}
+                  value={Number(syslog.netconsole_port)}
+                  onChange={(e) => r("netconsole_port")(Number(e.target.value))}
+                />
+              </>
+            )}
+          </Row>
+        )}
+      </details>
+      <details>
+        <summary>Time servers</summary>
+        <Row label="NTP">
+          <select
+            value={String(ntp.setting_preference)}
+            onChange={(e) =>
+              setNtp({ ...ntp, setting_preference: e.target.value })
+            }
+          >
+            <option value="auto">Automatic</option>
+            <option value="manual">These servers</option>
+          </select>
+          {ntp.setting_preference === "manual" &&
+            [1, 2, 3, 4].map((i) => (
+              <input
+                key={i}
+                className="search mono"
+                placeholder={i === 1 ? "pool.ntp.org" : ""}
+                value={String(ntp[`ntp_server_${i}`] ?? "")}
+                onChange={(e) =>
+                  setNtp({ ...ntp, [`ntp_server_${i}`]: e.target.value })
+                }
+              />
+            ))}
+        </Row>
+      </details>
+      <div className="actions-row">
+        <button className="btn" onClick={onClose}>
+          Cancel
+        </button>
+        <button
+          className="btn primary"
+          disabled={nothing}
+          onClick={() => setReview(patch())}
+        >
+          {nothing ? "No changes" : "Review changes"}
+        </button>
+      </div>
     </div>
   );
 }

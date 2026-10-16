@@ -82,6 +82,11 @@ const ZONES: &[(&str, &str)] = &[
     ("Africa/Johannesburg", "SAST-2"),
 ];
 
+/// The zones [`posix`] knows, in table order.
+pub fn names() -> impl Iterator<Item = &'static str> {
+    ZONES.iter().map(|(name, _)| *name)
+}
+
 pub fn posix(olson: &str) -> Option<&'static str> {
     ZONES.iter().find(|(name, _)| *name == olson).map(|(_, tz)| *tz)
 }

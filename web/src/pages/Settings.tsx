@@ -4,6 +4,7 @@ import { importState, useMe, useSettingsState } from "../api";
 import { ErrorNote, Loading } from "../components/common";
 import { NotificationSettings } from "../components/Alerts";
 import { BackupSection } from "../components/Backups";
+import { SiteSettingsPanel } from "../components/SettingsEditor";
 import { ago, clock } from "../format";
 
 export function Settings() {
@@ -50,6 +51,9 @@ export function Settings() {
 
       <h2>Backups</h2>
       <BackupSection />
+
+      <h2>Site settings</h2>
+      <SiteSettingsPanel />
 
       <h2>Controller settings</h2>
       <div className="panel">

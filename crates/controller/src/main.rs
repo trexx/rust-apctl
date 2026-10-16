@@ -22,6 +22,7 @@ mod model;
 mod ratelimit;
 mod settings;
 mod shadow;
+mod site;
 mod ssh;
 mod stun;
 mod store;
