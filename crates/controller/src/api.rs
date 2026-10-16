@@ -192,10 +192,15 @@ async fn status(State(s): State<AppState>) -> ApiResult {
     })))
 }
 
-/// For Kubernetes probes. Fails once nothing can be stored any more.
+/// For Kubernetes probes. Fails once nothing can be stored or processed any more.
 async fn healthz(State(s): State<AppState>) -> Response {
     if s.writer.stopped() {
         return (StatusCode::SERVICE_UNAVAILABLE, "database writer stopped").into_response();
+    }
+    // The engine thread drops its end of the queue however it ends, a panic
+    // included; a panic under the live view's lock poisons it for every reader.
+    if s.engine.is_closed() || s.live.is_poisoned() {
+        return (StatusCode::SERVICE_UNAVAILABLE, "engine stopped").into_response();
     }
     "ok".into_response()
 }
@@ -701,17 +706,19 @@ mod tests {
     use axum::http::{Request, header};
     use tower::ServiceExt;
 
-    fn app() -> Router {
+    /// The router, and the engine's end of its queue (dropping it stops the "engine").
+    fn app() -> (Router, tokio::sync::mpsc::Receiver<crate::engine::Input>) {
         let dir = std::env::temp_dir().join(format!("apctl-api-{}-{}", std::process::id(), store::now_ts()));
         let (store, writer) = Store::open(&dir).unwrap();
         let auth = Arc::new(crate::auth::Auth::new(Default::default(), &store, writer.clone(), Default::default()).unwrap());
-        let (engine, _) = tokio::sync::mpsc::channel(1);
+        let (engine, engine_rx) = tokio::sync::mpsc::channel(1);
         let (tx, _) = broadcast::channel(1);
-        router(AppState {
+        let app = router(AppState {
             backups: crate::backup::Backups { data_dir: dir.clone(), key: None },
             store, vendors: Default::default(), renderer: crate::dryrun::apcfg_renderer(crate::EMULATE_VERSION.into()), auth, engine, live: Default::default(), tx, started: 0, source: "none".into(),
             active: false, writer,
-        })
+        });
+        (app, engine_rx)
     }
 
     async fn get(app: &Router, path: &str) -> Response {
@@ -721,7 +728,7 @@ mod tests {
 
     #[tokio::test]
     async fn json_is_gzipped_and_the_live_socket_is_not() {
-        let app = app();
+        let (app, _engine) = app();
         let res = get(&app, "/api/status").await;
         assert_eq!(res.status(), StatusCode::OK);
         assert_eq!(res.headers().get(header::CONTENT_ENCODING).map(|v| v.to_str().unwrap()), Some("gzip"));
@@ -729,5 +736,13 @@ mod tests {
         let res = get(&app, "/api/ws").await;
         assert!(res.headers().get(header::CONTENT_ENCODING).is_none());
         assert_eq!(get(&app, "/healthz").await.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn healthz_fails_once_the_engine_has_stopped() {
+        let (app, engine) = app();
+        assert_eq!(get(&app, "/healthz").await.status(), StatusCode::OK);
+        drop(engine); // as when the engine thread panics
+        assert_eq!(get(&app, "/healthz").await.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 }

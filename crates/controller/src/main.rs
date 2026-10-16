@@ -281,6 +281,16 @@ async fn serve(args: ServeArgs) -> Result<()> {
     // gets a thread of its own rather than an async worker.
     let runtime = tokio::runtime::Handle::current();
     std::thread::Builder::new().name("engine".into()).spawn(move || {
+        // However the thread ends, its queue closes with it, which /healthz reports.
+        struct Stopped;
+        impl Drop for Stopped {
+            fn drop(&mut self) {
+                if std::thread::panicking() {
+                    tracing::error!("the engine stopped after a panic: nothing more is processed");
+                }
+            }
+        }
+        let _stopped = Stopped;
         let _runtime = runtime.enter();
         while let Some(input) = in_rx.blocking_recv() {
             engine.handle(input);
