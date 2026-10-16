@@ -877,9 +877,11 @@ impl Engine {
         }
         // Names for numbered sections ("aaa.3" -> "Home WiFi (5 GHz)"), so the
         // config history can say what a change was about. Sections removed by
-        // this push are only named in the previous config.
+        // this push are only named in the previous config, which is read only
+        // when this push replaces it.
         if !system.is_empty() {
-            let mut labels = if previous.system_cfg.is_empty() { Default::default() } else { section_labels(&previous.system_cfg, &radios) };
+            let new_system = p["system_cfg"].is_string() && !previous.system_cfg.is_empty();
+            let mut labels = if new_system { section_labels(&previous.system_cfg, &radios) } else { Default::default() };
             labels.extend(section_labels(&system, &radios));
             data.insert("labels".into(), Value::Object(labels));
         }
