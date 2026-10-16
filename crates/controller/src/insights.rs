@@ -413,13 +413,16 @@ pub async fn top(State(s): State<AppState>, Query(q): Query<RangeQuery>) -> Resu
     let (from, to, tier) = window(&q);
     let ap = q.mac.as_ref().map(|m| m.to_ascii_lowercase());
     let got = memo_read(&s, Db::Metrics, "top", &q, tier, move |c| {
-        let vaps = load(c, Spec { table: "vap_stats", key: "bssid", extra: &["ap_mac"], cols: &BYTE_COLS, only: None }, tier, from, to)?;
+        // One AP's page lists only its clients: the APs are left out.
         let mut aps: HashMap<String, (f64, f64)> = HashMap::new();
-        for (ex, samples) in vaps.values() {
-            let (d, u) = totals(samples, [0, 1], from);
-            let e = aps.entry(ex[0].clone()).or_default();
-            e.0 += d;
-            e.1 += u;
+        if ap.is_none() {
+            let vaps = load(c, Spec { table: "vap_stats", key: "bssid", extra: &["ap_mac"], cols: &BYTE_COLS, only: None }, tier, from, to)?;
+            for (ex, samples) in vaps.values() {
+                let (d, u) = totals(samples, [0, 1], from);
+                let e = aps.entry(ex[0].clone()).or_default();
+                e.0 += d;
+                e.1 += u;
+            }
         }
         // Per client and AP, so a client's traffic counts towards the AP it was on.
         let spec = Spec { table: "client_stats", key: "mac || '/' || coalesce(ap_mac, '')", extra: &[], cols: &BYTE_COLS, only: ap.as_deref().map(|a| Only::Is("ap_mac", a)) };
@@ -432,22 +435,21 @@ pub async fn top(State(s): State<AppState>, Query(q): Query<RangeQuery>) -> Resu
             e.0 += d;
             e.1 += u;
         }
-        let clients: Vec<(String, f64, f64)> = per_client.into_iter().map(|(m, (d, u))| (m, d, u)).collect();
+        // Most traffic first (by MAC among equals); the 25 busiest clients.
+        let by_total = |a: &(String, f64, f64), b: &(String, f64, f64)| (b.1 + b.2).total_cmp(&(a.1 + a.2)).then_with(|| a.0.cmp(&b.0));
+        let mut aps: Vec<(String, f64, f64)> = aps.into_iter().map(|(m, (d, u))| (m, d, u)).collect();
+        aps.sort_by(by_total);
+        let mut clients: Vec<(String, f64, f64)> = per_client.into_iter().filter(|(_, (d, u))| d + u > 0.0).map(|(m, (d, u))| (m, d, u)).collect();
+        clients.sort_by(by_total);
+        clients.truncate(25);
         Ok((aps, clients))
     })
     .await?;
     let (aps, clients) = &*got;
     let live = s.live.read().unwrap();
-    // Most traffic first.
-    let by_total = |a: &Value, b: &Value| {
-        let t = |x: &Value| x["download_bytes"].as_f64().unwrap_or(0.0) + x["upload_bytes"].as_f64().unwrap_or(0.0);
-        t(b).total_cmp(&t(a))
-    };
-    let mut ap_list: Vec<Value> = aps.iter().map(|(mac, (d, u))| json!({ "name": ap_name(&live, mac), "mac": mac, "download_bytes": d, "upload_bytes": u })).collect();
-    ap_list.sort_by(by_total);
-    let mut cl_list: Vec<Value> = clients
+    let ap_list: Vec<Value> = aps.iter().map(|(mac, d, u)| json!({ "name": ap_name(&live, mac), "mac": mac, "download_bytes": d, "upload_bytes": u })).collect();
+    let cl_list: Vec<Value> = clients
         .iter()
-        .filter(|(_, d, u)| d + u > 0.0)
         .map(|(mac, d, u)| {
             let m: Option<inform::Mac> = mac.parse().ok();
             let view = m.and_then(|m| live.clients.get(&m));
@@ -457,8 +459,6 @@ pub async fn top(State(s): State<AppState>, Query(q): Query<RangeQuery>) -> Resu
             })
         })
         .collect();
-    cl_list.sort_by(by_total);
-    cl_list.truncate(25);
     Ok(Json(json!({ "aps": ap_list, "clients": cl_list })))
 }
 
