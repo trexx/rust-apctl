@@ -52,6 +52,9 @@ pub fn run_with_udp<R: Read + Send>(
     let mut interfaces: Vec<(Linktype, u64, i64)> = Vec::new();
     let mut legacy_linktype = Linktype::ETHERNET;
     let mut legacy_nanos = false;
+    // A pcapng simple packet block has no timestamp: it gets the last one seen, so
+    // shadow mode's capture-following clock does not jump back to 1970.
+    let mut last_ts: Micros = 0;
 
     loop {
         match reader.next() {
@@ -63,8 +66,8 @@ pub fn run_with_udp<R: Read + Send>(
                     }
                     PcapBlockOwned::Legacy(b) => {
                         let frac = if legacy_nanos { b.ts_usec as i64 / 1000 } else { b.ts_usec as i64 };
-                        let ts = b.ts_sec as i64 * 1_000_000 + frac;
-                        tracker.packet(legacy_linktype, ts, b.data, &mut on_event);
+                        last_ts = b.ts_sec as i64 * 1_000_000 + frac;
+                        tracker.packet(legacy_linktype, last_ts, b.data, &mut on_event);
                     }
                     PcapBlockOwned::NG(Block::SectionHeader(_)) => interfaces.clear(),
                     PcapBlockOwned::NG(Block::InterfaceDescription(idb)) => {
@@ -73,12 +76,12 @@ pub fn run_with_udp<R: Read + Send>(
                     PcapBlockOwned::NG(Block::EnhancedPacket(epb)) => {
                         let Some(&(linktype, res, off)) = interfaces.get(epb.if_id as usize) else { continue };
                         let (sec, frac) = epb.decode_ts(off.max(0) as u64, res);
-                        let ts = sec as i64 * 1_000_000 + (frac as i128 * 1_000_000 / res as i128) as i64;
-                        tracker.packet(linktype, ts, epb.data, &mut on_event);
+                        last_ts = sec as i64 * 1_000_000 + (frac as i128 * 1_000_000 / res as i128) as i64;
+                        tracker.packet(linktype, last_ts, epb.data, &mut on_event);
                     }
                     PcapBlockOwned::NG(Block::SimplePacket(spb)) => {
                         if let Some(&(linktype, ..)) = interfaces.first() {
-                            tracker.packet(linktype, 0, spb.data, &mut on_event);
+                            tracker.packet(linktype, last_ts, spb.data, &mut on_event);
                         }
                     }
                     PcapBlockOwned::NG(_) => {}
@@ -828,6 +831,50 @@ mod pcap_tests {
         let mut events = Vec::new();
         run(&data[..data.len() - 5], &[8080], |e| events.push(e)).unwrap();
         assert_eq!(events.len(), 1, "{events:?}");
+    }
+
+    #[test]
+    fn simple_packet_blocks_take_the_last_timestamp() {
+        fn block(out: &mut Vec<u8>, kind: u32, body: &[u8]) {
+            let padded = body.len().next_multiple_of(4);
+            let len = (12 + padded) as u32;
+            out.extend_from_slice(&kind.to_le_bytes());
+            out.extend_from_slice(&len.to_le_bytes());
+            out.extend_from_slice(body);
+            out.resize(out.len() + padded - body.len(), 0);
+            out.extend_from_slice(&len.to_le_bytes());
+        }
+        let frame = |to_server: bool, payload: &[u8]| {
+            let builder = if to_server {
+                etherparse::PacketBuilder::ethernet2([2; 6], [4; 6]).ipv4([10, 0, 0, 5], [10, 0, 0, 1], 64).tcp(40000, 8080, 1, 1024)
+            } else {
+                etherparse::PacketBuilder::ethernet2([4; 6], [2; 6]).ipv4([10, 0, 0, 1], [10, 0, 0, 5], 64).tcp(8080, 40000, 1, 1024)
+            };
+            let mut f = Vec::new();
+            builder.write(&mut f, payload).unwrap();
+            f
+        };
+        let ts: Micros = 1_791_840_600_000_000;
+        let mut data = Vec::new();
+        let mut shb = 0x1a2b3c4du32.to_le_bytes().to_vec();
+        shb.extend_from_slice(&[1, 0, 0, 0]);
+        shb.extend_from_slice(&(-1i64).to_le_bytes());
+        block(&mut data, 0x0a0d0d0a, &shb);
+        block(&mut data, 1, &[1, 0, 0, 0, 0, 0, 4, 0]); // Ethernet, snaplen 256 KiB
+        let req = frame(true, &sample::http_request(b"Q"));
+        let mut epb = 0u32.to_le_bytes().to_vec();
+        for v in [(ts >> 32) as u32, ts as u32, req.len() as u32, req.len() as u32] {
+            epb.extend_from_slice(&v.to_le_bytes());
+        }
+        epb.extend_from_slice(&req);
+        block(&mut data, 6, &epb);
+        let resp = frame(false, &sample::http_response(b"A"));
+        let mut spb = (resp.len() as u32).to_le_bytes().to_vec();
+        spb.extend_from_slice(&resp);
+        block(&mut data, 3, &spb);
+        let mut events = Vec::new();
+        run(&data[..], &[8080], |e| events.push(e)).unwrap();
+        assert!(matches!(&events[..], [HttpEvent::Request { ts: a, .. }, HttpEvent::Response { ts: b, .. }] if *a == ts && *b == ts), "{events:?}");
     }
 
     #[test]
