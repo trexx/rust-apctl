@@ -412,7 +412,8 @@ fn writer_loop(dir: &Path, rx: Receiver<Write>) -> Result<()> {
     let mut pending: Vec<Write> = Vec::new();
     let mut acks: Vec<Sender<()>> = Vec::new();
     let mut last_flush = Instant::now();
-    let mut last_maintenance = Instant::now() - Duration::from_secs(240);
+    // The first maintenance a minute after start.
+    let mut last_maintenance = Instant::now().checked_sub(Duration::from_secs(240)).unwrap_or_else(Instant::now);
     loop {
         match rx.recv_timeout(Duration::from_millis(250)) {
             Ok(Write::Flush(ack)) => acks.push(ack),
@@ -543,6 +544,11 @@ fn maintenance(conns: &mut Conns, now: Ts) {
     );
 }
 
+/// How long after a bucket ends it is rolled up: rows still queued in the
+/// engine or the writer, or from a shadow capture running a little behind, are
+/// written by then. A row that arrives later is never rolled up.
+const ROLLUP_GRACE_SECS: Ts = 150;
+
 /// Rolls the complete `step`-second buckets of `src` not done yet into `dst`.
 fn rollup(metrics: &mut Connection, t: &Table, src: &str, dst: &str, step: i64, src_keep: i64, now: Ts) -> Result<()> {
     let state_key = format!("rollup:{dst}");
@@ -550,7 +556,7 @@ fn rollup(metrics: &mut Connection, t: &Table, src: &str, dst: &str, step: i64, 
     // nothing was done would redo the source's whole retention window.
     let done = read_state(metrics, &state_key)?;
     // Only complete buckets, and never further back than the source keeps.
-    let upto = (now / step) * step;
+    let upto = ((now - ROLLUP_GRACE_SECS) / step) * step;
     let start = done.max(now - src_keep);
     if upto <= start {
         return Ok(());
@@ -717,7 +723,11 @@ mod tests {
         }
         apply(&mut conns[Db::Metrics as usize], writes).unwrap();
 
+        // The last bucket has just ended: rows for it may still be on their way.
         maintenance(&mut conns, now);
+        let m = &conns[Db::Metrics as usize];
+        assert_eq!(series(m, &UPLINK, &["bb".into()], now - 3600, now, 1).unwrap().ts.len(), 3);
+        maintenance(&mut conns, now + ROLLUP_GRACE_SECS);
         let m = &conns[Db::Metrics as usize];
         let five = series(m, &UPLINK, &["bb".into()], now - 3600, now, 1).unwrap();
         assert_eq!(five.step, 300);
@@ -726,7 +736,7 @@ mod tests {
         // Rates from the counters' last value in consecutive buckets.
         assert_eq!(five.fields["rx_bytes"], vec![None, Some(1000.0), Some(1000.0), Some(1000.0)]);
         // Running maintenance again is idempotent and does not redo finished buckets.
-        maintenance(&mut conns, now);
+        maintenance(&mut conns, now + ROLLUP_GRACE_SECS);
         let m = &conns[Db::Metrics as usize];
         assert_eq!(series(m, &UPLINK, &["bb".into()], now - 3600, now, 1).unwrap().ts.len(), 4);
         std::fs::remove_dir_all(&dir).ok();

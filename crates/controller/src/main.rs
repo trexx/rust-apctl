@@ -213,13 +213,13 @@ async fn serve(args: ServeArgs) -> Result<()> {
         (None, Some(c)) => Some(shadow::Source::Command(c)),
         (None, None) => None,
     };
-    let replaying = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let clock = Arc::new(shadow::Clock::default());
     let source_desc = source.as_ref().map_or("none".to_string(), |s| s.to_string());
     match source {
         Some(src) => {
             tracing::info!("shadow mode: reading inform traffic from {src}");
             let syslog_port = syslog_listen.map_or(5514, |a| a.port());
-            shadow::spawn(src, inform_ports, syslog_port, keys.clone(), in_tx.clone(), replaying.clone());
+            shadow::spawn(src, inform_ports, syslog_port, keys.clone(), in_tx.clone(), clock.clone());
         }
         None if active => {}
         None => tracing::warn!("no shadow source configured: nothing will be ingested"),
@@ -271,11 +271,9 @@ async fn serve(args: ServeArgs) -> Result<()> {
         let mut every = tokio::time::interval(Duration::from_secs(5));
         loop {
             every.tick().await;
-            // A replaying capture ticks in its own time (see `shadow::spawn`).
-            if replaying.load(std::sync::atomic::Ordering::Relaxed) {
-                continue;
-            }
-            if tick_tx.send(Input::Tick(store::now_ts())).await.is_err() {
+            // The capture's time in shadow mode; a replay ticks itself (see `shadow::Clock`).
+            let Some(now) = clock.now() else { continue };
+            if tick_tx.send(Input::Tick(now)).await.is_err() {
                 return;
             }
         }
@@ -371,14 +369,8 @@ async fn flush_writes(writer: store::Writer) {
 }
 
 fn debug_syslog(pcap: &str, keys: &str, port: u16) -> Result<()> {
-    let raw: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(keys)?)?;
-    let mut candidates = Vec::new();
-    for d in raw["devices"].as_array().into_iter().flatten() {
-        if let (Some(mac), Some(k)) = (d["mac"].as_str(), d["syslog_key"].as_str()) {
-            let key: [u8; 32] = hex::decode(k)?.try_into().map_err(|_| anyhow::anyhow!("bad syslog key"))?;
-            candidates.push((mac.parse::<inform::Mac>()?, key));
-        }
-    }
+    let keys = KeyStore::load(keys)?;
+    let candidates: Vec<_> = keys.syslog_keys().map(|(mac, key)| (*mac, *key)).collect();
     let input = wire::capture::open_input(pcap)?;
     wire::capture::run_with_udp(input, &[], &[port], |ev| {
         if let wire::capture::HttpEvent::Datagram { ts, src, payload, .. } = ev {

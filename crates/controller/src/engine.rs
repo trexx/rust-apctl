@@ -55,7 +55,7 @@ pub enum Input {
     /// client blocked from the UI, a channel plan applied).
     Note(Event),
     /// Drop everything apctl keeps about a forgotten AP.
-    Forget { mac: Mac },
+    Forget { ts: Ts, mac: Mac },
     /// Change the settings (apctl's copy of the controller settings), store
     /// them, and record the change; `done` gets the result.
     EditState { ts: Ts, what: String, edit: StateEdit, done: tokio::sync::oneshot::Sender<Result<(), String>> },
@@ -109,11 +109,25 @@ impl Event {
 pub enum LiveMsg {
     Device { mac: Mac },
     Clients,
-    Event(Event),
-    /// A syslog line was stored: `{"type":"log","device_mac":...}`. The UI
-    /// refetches the lines it shows, so the text is not sent along.
+    /// An event was stored: `{"type":"event","kind":...,"device_mac":...,"client_mac":...}`.
+    /// The UI refetches the event lists that show it, so the rest is not sent along.
+    Event(#[serde(serialize_with = "event_head")] Event),
+    /// Syslog lines were stored: `{"type":"log","device_mac":...}`, at most
+    /// once a second per AP. The UI refetches the lines it shows, so the text
+    /// is not sent along.
     Log { device_mac: Option<Mac> },
     Alert(crate::alerts::AlertMsg),
+}
+
+/// What the UI is told of an event (see `LiveMsg::Event`).
+fn event_head<S: serde::Serializer>(e: &Event, s: S) -> Result<S::Ok, S::Error> {
+    #[derive(Serialize)]
+    struct Head {
+        kind: &'static str,
+        device_mac: Option<Mac>,
+        client_mac: Option<Mac>,
+    }
+    Head { kind: e.kind, device_mac: e.device_mac, client_mac: e.client_mac }.serialize(s)
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -258,7 +272,13 @@ pub struct KnownDevice {
 
 pub type SharedLive = Arc<RwLock<Live>>;
 
-type McastTypes = std::collections::BTreeMap<String, crate::model::McastCounts>;
+type McastTypes = BTreeMap<String, crate::model::McastCounts>;
+
+/// A sample's multicast counters by traffic type (none if it has none).
+fn mcast_types(c: &ClientSample) -> &McastTypes {
+    static NONE: McastTypes = BTreeMap::new();
+    c.multicast.as_ref().map_or(&NONE, |m| &m.types)
+}
 
 /// Channel, width and power of one radio.
 type RadioSettings = (Option<i64>, Option<i64>, Option<i64>);
@@ -309,11 +329,11 @@ pub struct Engine {
     /// Debounced radio settings: right after a restart an AP briefly reports
     /// transient values (e.g. full transmit power) before settling.
     radios: HashMap<(Mac, String), RadioTrack>,
-    /// Each client's last multicast counters and the BSSID they came from.
-    mcast_prev: HashMap<Mac, (Ts, String, McastTypes)>,
+    /// Each client's last sample with multicast counters (and the BSSID they came from).
+    mcast_prev: HashMap<Mac, (Ts, Arc<ClientSample>)>,
     /// Each BSSID's last "delivered to clients" counters. The AP reports these
     /// per network, repeated identically in every client's block.
-    bss_prev: HashMap<String, (Ts, McastTypes)>,
+    bss_prev: HashMap<String, (Ts, Arc<ClientSample>)>,
     /// Events found in syslog lines.
     logevents: crate::logevents::LogEvents,
     /// When each AP was last reported isolated.
@@ -326,6 +346,12 @@ pub struct Engine {
     syslog_unknown: HashMap<String, Ts>,
     /// The syslog keys, ready to decrypt with.
     syslog_ciphers: crate::syslog::Ciphers,
+    /// Per AP: the second its stored syslog lines were last announced, and
+    /// whether more came in that second (see `log`).
+    logs_announced: HashMap<Option<Mac>, (Ts, bool)>,
+    /// The clients connected in the live view, so the tick need not walk the
+    /// year of clients it keeps.
+    connected: std::collections::BTreeSet<Mac>,
     /// Where alert-worthy events go: the alert watcher's own channel.
     alerts: Option<crate::alerts::Sink>,
 }
@@ -339,7 +365,7 @@ impl Engine {
         Engine {
             writer, keys, renderer: None, live, counters, tx, radios: HashMap::new(), mcast_prev: HashMap::new(), bss_prev: HashMap::new(),
             logevents: Default::default(), isolated: HashMap::new(), last_prune: 0, written: Default::default(), syslog_unknown: HashMap::new(),
-            syslog_ciphers: Default::default(), alerts: None,
+            syslog_ciphers: Default::default(), logs_announced: HashMap::new(), connected: Default::default(), alerts: None,
         }
     }
 
@@ -406,6 +432,9 @@ impl Engine {
         for (mac, hostname, ip, first_seen, last_seen, ap_mac, bssid, essid, radio, connected) in clients {
             let (Ok(mac), Some(Ok(ap_mac))) = (mac.parse::<Mac>(), ap_mac.map(|a| a.parse::<Mac>())) else { continue };
             let sample = Arc::new(ClientSample { mac, ap_mac, bssid: bssid.unwrap_or_default(), essid, radio, hostname, ip, ..Default::default() });
+            if connected {
+                self.connected.insert(mac);
+            }
             live.clients.insert(mac, ClientView { sample, connected, first_seen: first_seen.unwrap_or(0), last_seen: last_seen.unwrap_or(0) });
         }
         if let Some((json, at)) = state {
@@ -453,7 +482,7 @@ impl Engine {
             }
             Input::AlertsRead => self.writer.exec(Db::Config, "UPDATE alerts SET read = 1 WHERE read = 0", vec![]),
             Input::Note(e) => self.emit(e),
-            Input::Forget { mac } => self.forget(mac),
+            Input::Forget { ts, mac } => self.forget(ts, mac),
             Input::EditState { ts, what, edit, done } => {
                 let _ = done.send(self.edit_state(ts, what, edit));
             }
@@ -521,10 +550,18 @@ impl Engine {
             live.raw_informs.insert(mac, Arc::new(decoded.payload));
         }
         bump(&self.counters.informs);
-        if let Some(h) = &snap.ap.hash_id {
+        // For attributing syslog. An address or hash_id the AP no longer has is
+        // dropped: plain syslog from whichever host gets the address next is not the AP's.
+        if let Some(h) = &snap.ap.hash_id
+            && live.by_hash_id.get(h) != Some(&mac)
+        {
+            live.by_hash_id.retain(|_, m| *m != mac);
             live.by_hash_id.insert(h.clone(), mac);
         }
-        if let Some(ip) = &snap.ap.ip {
+        if let Some(ip) = &snap.ap.ip
+            && live.by_ip.get(ip) != Some(&mac)
+        {
+            live.by_ip.retain(|_, m| *m != mac);
             live.by_ip.insert(ip.clone(), mac);
         }
 
@@ -644,6 +681,7 @@ impl Engine {
     fn update_clients(&mut self, live: &mut Live, ts: Ts, clients: &[Arc<ClientSample>]) {
         use std::collections::btree_map::Entry;
         for c in clients {
+            self.connected.insert(c.mac);
             // One lookup for the event, whether the row changed, and the update.
             let (event, changed) = match live.clients.entry(c.mac) {
                 Entry::Occupied(mut e) => {
@@ -703,17 +741,21 @@ impl Engine {
     ///
     /// The diffs and the dry-run render take a while, so the live view is only
     /// locked to read what they need and then to store the results.
-    fn reply(&mut self, ts: Ts, mac: Mac, p: &Value, dry_run: bool) {
-        let (radios, previous, state, inform) = {
-            let mut live = self.live.write().unwrap();
-            bump(&self.counters.replies);
-            if let (Some(interval), Some(d)) = (p["interval"].as_i64(), live.devices.get_mut(&mac)) {
+    fn reply(&self, ts: Ts, mac: Mac, p: &Value, dry_run: bool) {
+        bump(&self.counters.replies);
+        // Nearly every reply repeats the interval the AP already has.
+        if let Some(interval) = p["interval"].as_i64() {
+            let changed = self.live.read().unwrap().devices.get(&mac).is_some_and(|d| d.interval != interval);
+            if changed && let Some(d) = self.live.write().unwrap().devices.get_mut(&mac) {
                 d.interval = interval;
             }
-            if p["_type"].as_str() != Some("setparam") {
-                return;
-            }
-            bump(&self.counters.config_pushes);
+        }
+        if p["_type"].as_str() != Some("setparam") {
+            return;
+        }
+        bump(&self.counters.config_pushes);
+        let (radios, previous, state, inform) = {
+            let live = self.live.read().unwrap();
             // The last push (unredacted), for the diffs; empty fields if none was seen.
             let previous = live.last_config.get(&mac).cloned().unwrap_or_default();
             let radios = live.devices.get(&mac).map(|d| d.snapshot.radios.clone()).unwrap_or_default();
@@ -805,7 +847,7 @@ impl Engine {
     }
 
     /// Stores an AP's section numbering in the settings, so later renders keep it.
-    fn set_config_meta(&mut self, mac: Mac, meta: Value) {
+    fn set_config_meta(&self, mac: Mac, meta: Value) {
         // Copied and serialised without the lock, as in `edit_state`.
         let Some(state) = self.live.read().unwrap().state.clone() else { return };
         let mac_s = mac.to_string();
@@ -863,7 +905,7 @@ impl Engine {
         Ok(())
     }
 
-    fn forget(&mut self, mac: Mac) {
+    fn forget(&mut self, ts: Ts, mac: Mac) {
         let mut live = self.live.write().unwrap();
         live.devices.remove(&mac);
         // Also what was restored from the database, or it could still be reported offline.
@@ -874,7 +916,30 @@ impl Engine {
         live.last_config.remove(&mac);
         live.adoption.forgetting.remove(&mac);
         live.adoption.adopting.remove(&mac);
+        // Nothing queued for it may reach it if it is adopted again.
+        live.commands.remove(&mac);
+        live.locating.remove(&mac);
+        live.reprovision.remove(&mac);
+        live.scans.remove(&mac);
+        live.firmware.remove(&mac);
+        // Its clients are gone with it, rather than left connected until they go stale.
+        let mut events = Vec::new();
+        let clients = &mut live.clients;
+        self.connected.retain(|cmac| {
+            let Some(c) = clients.get_mut(cmac).filter(|c| c.sample.ap_mac == mac) else { return true };
+            c.connected = false;
+            events.push(disconnected_event(ts, *cmac, c, "ap_forgotten"));
+            self.writer.exec(Db::Config, "UPDATE clients SET connected = 0 WHERE mac = ?1", vec![Sql::Text(cmac.to_string())]);
+            false
+        });
         drop(live);
+        let had_clients = !events.is_empty();
+        for e in events {
+            self.emit(e);
+        }
+        if had_clients {
+            let _ = self.tx.send(LiveMsg::Clients);
+        }
         self.radios.retain(|(m, _), _| *m != mac);
         self.isolated.remove(&mac);
         self.written.devices.remove(&mac);
@@ -894,7 +959,7 @@ impl Engine {
 
     /// Each rename is its own event (a client's history shows it); the client
     /// list is announced once for the lot.
-    fn set_aliases(&mut self, ts: Ts, entries: Vec<AliasEdit>, only_if_unset: bool) {
+    fn set_aliases(&self, ts: Ts, entries: Vec<AliasEdit>, only_if_unset: bool) {
         let clean = |v: Option<String>| v.map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
         let mut changed = false;
         let mut live = self.live.write().unwrap();
@@ -927,7 +992,7 @@ impl Engine {
         }
     }
 
-    fn notification(&mut self, ts: Ts, p: &Value) {
+    fn notification(&self, ts: Ts, p: &Value) {
         let Some(mac) = p["mac"].as_str().and_then(|m| m.parse::<Mac>().ok()) else { return };
         let mut live = self.live.write().unwrap();
         bump(&self.counters.notifications);
@@ -944,7 +1009,7 @@ impl Engine {
             Some("event") => {
                 let n = &p["notif_payload"];
                 if n["message_type"].as_str() == Some("STA_ASSOC_TRACKER") {
-                    self.connection_event(&mut live, ts, mac, n);
+                    self.connection_event(&live, ts, mac, n);
                 } else if let Some(kind) = n["event_string"].as_str() {
                     // AP events: radar (DFS), rogue APs, scan completion, process restarts...
                     let k = match kind {
@@ -986,7 +1051,7 @@ impl Engine {
     /// A client connection-tracking event (`STA_ASSOC_TRACKER`): association,
     /// success (with association, WPA, IP and DNS timings), soft failure,
     /// roam, leave. Durations arrive in microseconds and are stored in ms.
-    fn connection_event(&self, live: &mut Live, ts: Ts, ap: Mac, n: &Value) {
+    fn connection_event(&self, live: &Live, ts: Ts, ap: Mac, n: &Value) {
         let Some(client) = n["mac"].as_str().and_then(|m| m.parse::<Mac>().ok()) else { return };
         let num = |k: &str| n[k].as_str().and_then(|v| v.parse::<f64>().ok()).or_else(|| n[k].as_f64());
         let ms = |k: &str| num(k).map(|us| (us / 1000.0).round() as i64);
@@ -1172,13 +1237,28 @@ impl Engine {
                 Sql::Text(line.msg),
             ],
         );
-        let _ = self.tx.send(LiveMsg::Log { device_mac: line.device_mac });
+        // One message per AP and second: a burst (a crash dump, debug logging)
+        // would otherwise flood the sockets and force every browser to resync.
+        // Lines later in the same second are announced at the next tick.
+        match self.logs_announced.get_mut(&line.device_mac) {
+            Some((at, later)) if *at == line.ts => *later = true,
+            _ => {
+                self.logs_announced.insert(line.device_mac, (line.ts, false));
+                let _ = self.tx.send(LiveMsg::Log { device_mac: line.device_mac });
+            }
+        }
     }
 
     /// Time-based transitions: APs going quiet and clients disappearing.
     fn tick(&mut self, now: Ts) {
         self.mcast_prev.retain(|_, (ts, ..)| *ts > now - 3600);
         self.syslog_unknown.retain(|_, at| (*at..*at + SYSLOG_RETRY_SECS).contains(&now));
+        for (device_mac, (_, later)) in &mut self.logs_announced {
+            if std::mem::take(later) {
+                let _ = self.tx.send(LiveMsg::Log { device_mac: *device_mac });
+            }
+        }
+        self.logs_announced.retain(|_, (at, _)| now - *at < 60);
         {
             let mut live = self.live.write().unwrap();
             if let Some(mac) = live.firmware.expired(now)
@@ -1206,42 +1286,26 @@ impl Engine {
         }
         // A client is gone when its AP has reported a full client list since it was
         // last seen and the grace period has passed, or when its AP went offline.
-        let ap_last_full: HashMap<Mac, (Ts, bool)> = live
-            .devices
-            .iter()
-            .map(|(m, d)| (*m, (d.last_full_inform, d.online)))
-            .collect();
+        // Only the connected ones are looked at, not the year of clients kept.
         let mut changed = false;
-        for (cmac, c) in live.clients.iter_mut() {
-            if !c.connected {
-                continue;
-            }
+        let Live { devices, clients, .. } = &mut *live;
+        self.connected.retain(|cmac| {
+            let Some(c) = clients.get_mut(cmac).filter(|c| c.connected) else { return false };
             // An AP we have not heard from yet in this run (e.g. right after a
             // restart) is unknown, not offline: leave its clients alone.
-            let (ap_seen, ap_online, ap_known) = match ap_last_full.get(&c.sample.ap_mac) {
-                Some(&(seen, online)) => (seen, online, true),
-                None => (0, true, false),
-            };
-            let reason = if !ap_known {
+            let reason = match devices.get(&c.sample.ap_mac) {
                 // Its AP never reappeared (e.g. removed): give up after an hour.
-                (now - c.last_seen > 3600).then_some("stale")
-            } else if !ap_online {
-                Some("ap_offline")
-            } else if now - c.last_seen > CLIENT_GRACE_SECS && ap_seen > c.last_seen {
-                Some("not_seen")
-            } else {
-                None
+                None => (now - c.last_seen > 3600).then_some("stale"),
+                Some(d) if !d.online => Some("ap_offline"),
+                Some(d) => (now - c.last_seen > CLIENT_GRACE_SECS && d.last_full_inform > c.last_seen).then_some("not_seen"),
             };
-            if let Some(reason) = reason {
-                c.connected = false;
-                changed = true;
-                events.push(ev(now, "client_disconnected", Some(c.sample.ap_mac), Some(*cmac), json!({
-                    "reason": reason, "last_seen": c.last_seen, "essid": c.sample.essid,
-                    "connected_for": c.sample.uptime, "last_signal": c.sample.signal,
-                })));
-                self.writer.exec(Db::Config, "UPDATE clients SET connected = 0 WHERE mac = ?1", vec![Sql::Text(cmac.to_string())]);
-            }
-        }
+            let Some(reason) = reason else { return true };
+            c.connected = false;
+            changed = true;
+            events.push(disconnected_event(now, *cmac, c, reason));
+            self.writer.exec(Db::Config, "UPDATE clients SET connected = 0 WHERE mac = ?1", vec![Sql::Text(cmac.to_string())]);
+            false
+        });
         for e in events {
             self.emit(e);
         }
@@ -1385,7 +1449,7 @@ impl Engine {
         // how many clients sent any. "To clients" is counted once per network (BSSID),
         // "from clients" per client; only increases count (a client moving to another
         // network, or a restarted counter, adds nothing rather than its whole total).
-        let mut mcast: std::collections::BTreeMap<String, ([f64; 4], i64)> = std::collections::BTreeMap::new();
+        let mut mcast: BTreeMap<&str, ([f64; 4], i64)> = BTreeMap::new();
         let rate = |c: i64, p: i64, dt: f64| (c - p).max(0) as f64 / dt;
         let mut bss_done: std::collections::HashSet<&str> = std::collections::HashSet::new();
         for c in &s.clients {
@@ -1408,25 +1472,32 @@ impl Engine {
                     && ts - pts <= 120
                 {
                     let dt = (ts - pts) as f64;
+                    let prev = mcast_types(prev);
                     for (kind, cur) in &m.types {
                         let p = prev.get(kind).copied().unwrap_or(*cur);
-                        let e = mcast.entry(kind.clone()).or_default();
+                        let e = mcast.entry(kind).or_default();
                         e.0[0] += rate(cur.tx_pkts, p.tx_pkts, dt);
                         e.0[2] += rate(cur.tx_bytes, p.tx_bytes, dt);
                     }
                 }
-                self.bss_prev.insert(c.bssid.clone(), (ts, m.types.clone()));
+                match self.bss_prev.get_mut(&c.bssid) {
+                    Some(prev) => *prev = (ts, c.clone()),
+                    None => {
+                        self.bss_prev.insert(c.bssid.clone(), (ts, c.clone()));
+                    }
+                }
             }
-            if let Some((pts, bssid, prev)) = self.mcast_prev.get(&c.mac)
-                && *bssid == c.bssid
+            if let Some((pts, prev)) = self.mcast_prev.get(&c.mac)
+                && prev.bssid == c.bssid
                 && ts > *pts
                 && ts - pts <= 120
             {
                 let dt = (ts - pts) as f64;
+                let prev = mcast_types(prev);
                 for (kind, cur) in &m.types {
                     let p = prev.get(kind).copied().unwrap_or(*cur);
                     let (pk, by) = (rate(cur.rx_pkts, p.rx_pkts, dt), rate(cur.rx_bytes, p.rx_bytes, dt));
-                    let e = mcast.entry(kind.clone()).or_default();
+                    let e = mcast.entry(kind).or_default();
                     e.0[1] += pk;
                     e.0[3] += by;
                     if pk > 0.0 {
@@ -1434,13 +1505,13 @@ impl Engine {
                     }
                 }
             }
-            self.mcast_prev.insert(c.mac, (ts, c.bssid.clone(), m.types.clone()));
+            self.mcast_prev.insert(c.mac, (ts, c.clone()));
         }
         for (kind, (r, n)) in mcast {
             self.writer.send(Write::Metric {
                 table: &store::MCAST,
                 ts,
-                values: vec![mac(), Sql::Text(kind), Sql::Real(r[0]), Sql::Real(r[1]), Sql::Real(r[2]), Sql::Real(r[3]), Sql::Integer(n)],
+                values: vec![mac(), Sql::Text(kind.to_string()), Sql::Real(r[0]), Sql::Real(r[1]), Sql::Real(r[2]), Sql::Real(r[3]), Sql::Integer(n)],
             });
         }
     }
@@ -1464,14 +1535,14 @@ pub(crate) fn section_labels(cfg: &str, radios: &[crate::model::RadioSample]) ->
     }
     let mut out = serde_json::Map::new();
     for (k, v) in &kv {
-        for section in ["aaa", "wireless"] {
-            if let Some(n) = k.strip_prefix(&format!("{section}.")).and_then(|r| r.strip_suffix(".ssid")) {
-                let band = kv.get(format!("{section}.{n}.devname").as_str()).and_then(|d| band_of_dev.get(d));
+        for section in ["aaa.", "wireless."] {
+            if let Some(n) = k.strip_prefix(section).and_then(|r| r.strip_suffix(".ssid")) {
+                let band = kv.get(format!("{section}{n}.devname").as_str()).and_then(|d| band_of_dev.get(d));
                 let label = match band {
                     Some(b) => format!("{v} ({b})"),
                     None => v.to_string(),
                 };
-                out.insert(format!("{section}.{n}"), json!(label));
+                out.insert(format!("{section}{n}"), json!(label));
             }
         }
         if let Some(n) = k.strip_prefix("radio.").and_then(|r| r.strip_suffix(".phyname"))
@@ -1492,6 +1563,13 @@ fn connected_event(ts: Ts, c: &ClientSample, new: bool) -> Event {
     ev(ts, "client_connected", Some(c.ap_mac), Some(c.mac), json!({
         "essid": c.essid, "radio": c.radio, "channel": c.channel, "signal": c.signal,
         "hostname": c.hostname, "ip": c.ip, "new": new,
+    }))
+}
+
+fn disconnected_event(ts: Ts, mac: Mac, c: &ClientView, reason: &str) -> Event {
+    ev(ts, "client_disconnected", Some(c.sample.ap_mac), Some(mac), json!({
+        "reason": reason, "last_seen": c.last_seen, "essid": c.sample.essid,
+        "connected_for": c.sample.uptime, "last_signal": c.sample.signal,
     }))
 }
 
@@ -1770,6 +1848,67 @@ mod tests {
         assert_eq!(edit(&mut h, Box::new(|_| Err("no".into()))), Err("no".into()));
         let kinds: Vec<_> = events(&mut h).into_iter().map(|e| e.0).collect();
         assert_eq!(kinds, ["settings_imported", "settings_changed"]);
+    }
+
+    #[test]
+    fn multicast_rates_count_networks_once_and_clients_each() {
+        let dir = std::env::temp_dir().join(format!("apctl-mcast-{}-{}", std::process::id(), rand_suffix()));
+        let (store, writer) = store::Store::open(&dir).unwrap();
+        let (tx, _rx) = broadcast::channel(1024);
+        let mut e = Engine::new(writer.clone(), Default::default(), Default::default(), tx);
+        // Per-network "to clients" counters repeat in every client's block.
+        let sta = |mac: &str, to: i64, from: i64| json!({ "mac": mac, "multicast": { "types": { "mdns": { "tx_pkts": to, "tx_bytes": to * 100, "rx_pkts": from, "rx_bytes": from * 100 } } } });
+        let feed = |e: &mut Engine, ts: Ts, to: i64, from: i64| {
+            let p = json!({ "mac": AP1, "uptime": 1000 + ts, "vap_table": [{ "bssid": "b1", "radio": "na", "usage": "user", "sta_table": [sta(C1, to, from), sta("02:00:00:00:01:02", to, 0)] }] });
+            e.handle(Input::Inform { ts, peer: "x".into(), decoded: decoded(p) });
+        };
+        feed(&mut e, 0, 100, 0);
+        feed(&mut e, 10, 200, 50);
+        assert!(writer.flush(std::time::Duration::from_secs(5)));
+        let row: (f64, f64, f64, f64) = store
+            .read(Db::Metrics, |c| Ok(c.query_row("SELECT tx_pps, rx_pps, rx_bytes_ps, clients FROM mcast_stats WHERE ts = 10 AND type = 'mdns'", [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?))
+            .unwrap();
+        assert_eq!(row, (10.0, 5.0, 500.0, 1.0));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn live_messages_are_short() {
+        let mut h = harness();
+        let line = |ts| LogLine { ts, device_mac: AP1.parse().ok(), src_ip: "x".into(), facility: None, severity: None, program: None, msg: "m".into() };
+        // A burst in one second is announced once, and what came after at the next tick.
+        for ts in [10, 10, 10, 11] {
+            h.engine.log(line(ts));
+        }
+        h.engine.handle(Input::Tick(12));
+        let logs = std::iter::from_fn(|| h.rx.try_recv().ok()).filter(|m| matches!(m, LiveMsg::Log { .. })).count();
+        assert_eq!(logs, 2);
+        h.engine.log(line(12));
+        h.engine.handle(Input::Tick(13));
+        let logs = std::iter::from_fn(|| h.rx.try_recv().ok()).filter(|m| matches!(m, LiveMsg::Log { .. })).count();
+        assert_eq!(logs, 1, "nothing more to announce");
+        // An event's data is not sent to the browsers.
+        let e = Event::device(1, "ap_crash", AP1.parse().unwrap(), json!({ "lines": ["a long crash dump"] }));
+        let text = serde_json::to_string(&LiveMsg::Event(e)).unwrap();
+        assert_eq!(text, r#"{"type":"event","kind":"ap_crash","device_mac":"02:00:00:00:00:01","client_mac":null}"#);
+    }
+
+    #[test]
+    fn a_forgotten_ap_leaves_nothing_behind() {
+        let mut h = harness();
+        let mac: Mac = AP1.parse().unwrap();
+        h.engine.handle(Input::Inform { ts: 0, peer: "x".into(), decoded: decoded(inform(AP1, 1000, &[(C1, "b1")])) });
+        {
+            let mut live = h.live.write().unwrap();
+            live.commands.entry(mac).or_default().push_back(json!({ "cmd": "restart" }));
+            live.locating.insert(mac);
+        }
+        events(&mut h);
+        h.engine.handle(Input::Forget { ts: 5, mac });
+        assert_eq!(events(&mut h), vec![("client_disconnected", Some(C1.into()))]);
+        let live = h.live.read().unwrap();
+        assert!(!live.clients[&C1.parse().unwrap()].connected);
+        assert!(live.commands.is_empty() && live.locating.is_empty() && live.devices.is_empty());
     }
 
     fn notif(ap: &str, reason: &str, payload: Value) -> Decoded {

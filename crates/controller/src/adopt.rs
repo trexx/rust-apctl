@@ -357,7 +357,7 @@ pub async fn finish_forget(engine: &tokio::sync::mpsc::Sender<Input>, mac: Mac, 
     let edit: crate::engine::StateEdit = Box::new(move |state: &mut Value| remove_device(state, &mac).map(|_| ()));
     let _ = engine.send(Input::EditState { ts: store::now_ts(), what: format!("forgot AP {mac}"), edit, done: tx }).await;
     let _ = rx.await;
-    let _ = engine.send(Input::Forget { mac }).await;
+    let _ = engine.send(Input::Forget { ts: store::now_ts(), mac }).await;
     let _ = engine.send(Input::Note(Event::device(store::now_ts(), "ap_forgotten", mac, json!({ "reset": reset })))).await;
 }
 

@@ -235,6 +235,15 @@ impl Jobs {
         self.stopped = None;
         n
     }
+
+    /// Drops a forgotten AP's job, queued or current; the next one starts.
+    pub fn remove(&mut self, mac: &Mac) {
+        self.queue.retain(|j| j.mac != *mac);
+        if self.current.as_ref().is_some_and(|j| j.mac == *mac) {
+            self.current = None;
+            self.next();
+        }
+    }
 }
 
 /// The upgrade command for an AP's inform reply, if its turn has come. Marks
