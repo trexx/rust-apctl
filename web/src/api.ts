@@ -333,6 +333,10 @@ export interface Status {
   devices: number;
   devices_online: number;
   clients_connected: number;
+  /** Connected clients by radio ("ng", "na", …). */
+  clients_by_band: Record<string, number>;
+  /** Connected clients with a signal below -75 dBm. */
+  clients_weak: number;
   counters: Record<string, number>;
 }
 
@@ -419,6 +423,7 @@ export const keys = {
   devices: family("devices"),
   device: family<[mac: Mac]>("device"),
   clients: family("clients"),
+  clientNames: family("client-names"),
   client: family<[mac: Mac]>("client"),
   series: family<[table: string, key: string, span: TimeSpan]>("series"),
   events: family<[filter: EventFilter]>("events"),
@@ -1008,13 +1013,17 @@ export type Names = Readonly<Record<Mac, string>>;
 
 const NO_NAMES: Names = Object.freeze({});
 const deviceNames = (devices: DeviceSummary[]): Names => Object.fromEntries(devices.map((d) => [d.mac, d.name ?? d.mac]));
-const clientNames = (clients: ClientView[]): Names => Object.fromEntries(clients.filter((c) => c.alias || c.sample.hostname).map((c) => [c.sample.mac, displayName(c)]));
 
 /** AP names (else their MAC) by MAC; the same object until a name changes. */
 export const useDeviceNames = (): Names => useQuery({ ...devicesQuery, select: deviceNames }).data ?? NO_NAMES;
 
-/** Client display names by MAC, for the clients that have one; the same object until a name changes. */
-export const useClientNames = (): Names => useClientsSelect(clientNames).data ?? NO_NAMES;
+/**
+ * Client display names by MAC, for the clients that have one; the same object until a name changes.
+ * The live socket refreshes them when a client is renamed or an unnamed one connects; the slow poll
+ * catches a hostname an AP reports later.
+ */
+export const useClientNames = (): Names =>
+  useQuery({ queryKey: keys.clientNames(), queryFn: getting<Names>("/api/clients/names"), refetchInterval: 300_000 }).data ?? NO_NAMES;
 
 /** One client; a 404 (HttpError) means it hasn't been seen since apctl started. */
 export const useClient = (mac: Mac) =>
@@ -1202,6 +1211,10 @@ export function useLiveUpdates(): void {
           }
           if (ADOPTION_EVENTS.has(msg.kind)) invalidate(keys.adoption());
           if (msg.kind.startsWith("ap_upgrade")) invalidate(keys.firmware());
+          if (msg.kind === "client_renamed") invalidate(keys.clientNames());
+          // A client without a name may have reported one as it connected.
+          else if (msg.kind === "client_connected" && msg.client_mac && !qc.getQueryData<Names>(keys.clientNames())?.[msg.client_mac])
+            invalidate(keys.clientNames(), 10_000);
           break;
         }
         case "log": {

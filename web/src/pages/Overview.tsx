@@ -1,13 +1,11 @@
 import { Link } from "react-router-dom";
 import {
   useClientNames,
-  useClientsSelect,
   useDeviceNames,
   useDevices,
   useEvents,
   useStatus,
 } from "../api";
-import type { ClientView } from "../api";
 import {
   Dot,
   ErrorNote,
@@ -28,25 +26,12 @@ import { useTimeSpan } from "../components/Chart";
 import { ThreatBanner } from "../components/Threats";
 import { AdoptionPanel } from "../components/Adoption";
 
-/** Connected clients: how many, on each band, and with a weak signal. */
-function clientCounts(clients: ClientView[]) {
-  const connected = clients.filter((c) => c.connected);
-  const byBand: Record<string, number> = {};
-  for (const c of connected) {
-    const b = band(c.sample.radio);
-    byBand[b] = (byBand[b] ?? 0) + 1;
-  }
-  const weak = connected.filter(
-    (c) => (c.sample.signal ?? 0) < SIGNAL.fair,
-  ).length;
-  return { connected: connected.length, byBand, weak };
-}
-
 export function Overview() {
   const devices = useDevices();
-  const counts = useClientsSelect(clientCounts).data;
   const events = useEvents({ limit: 12 });
+  // Also the client counters: the server counts them, so the overview needs no client list.
   const status = useStatus(true);
+  const s = status.data;
   const names = useDeviceNames();
   const cnames = useClientNames();
 
@@ -64,16 +49,16 @@ export function Overview() {
         />
         <Stat
           label="Clients"
-          value={counts?.connected ?? 0}
+          value={s?.clients_connected ?? 0}
           sub={
-            Object.entries(counts?.byBand ?? {})
-              .map(([b, n]) => `${n} on ${b}`)
+            Object.entries(s?.clients_by_band ?? {})
+              .map(([r, n]) => `${n} on ${band(r)}`)
               .join(" · ") || "none connected"
           }
         />
         <Stat
           label="Weak signal"
-          value={counts?.weak ?? 0}
+          value={s?.clients_weak ?? 0}
           sub={`clients below ${dbm(SIGNAL.fair)}`}
         />
         <Stat

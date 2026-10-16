@@ -52,6 +52,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/devices", get(devices))
         .route("/api/devices/{mac}", get(device))
         .route("/api/clients", get(clients))
+        .route("/api/clients/names", get(client_names))
         .route("/api/clients/{mac}", get(client))
         .route("/api/clients/{mac}/alias", axum::routing::put(set_alias))
         .route("/api/clients/aliases", axum::routing::post(import_aliases))
@@ -209,8 +210,21 @@ pub async fn read<T: Send + 'static>(
     tokio::task::spawn_blocking(move || store.read(db, f)).await?.map_err(ApiError::from)
 }
 
+/// A connected client's signal below this (dBm) is weak: the UI's "fair" threshold.
+const WEAK_SIGNAL: i64 = -75;
+
 async fn status(State(s): State<AppState>) -> ApiResult {
     let live = s.live.read().unwrap();
+    // The overview's client counters, so that it needs no client list: the
+    // connected clients by radio, and how many of them have a weak signal.
+    let (mut connected, mut weak, mut by_band) = (0, 0, std::collections::BTreeMap::<&str, usize>::new());
+    for c in live.clients.values().filter(|c| c.connected) {
+        connected += 1;
+        weak += usize::from(c.sample.signal.is_some_and(|s| s < WEAK_SIGNAL));
+        if let Some(radio) = c.sample.radio.as_deref() {
+            *by_band.entry(radio).or_default() += 1;
+        }
+    }
     Ok(Json(json!({
         "version": env!("CARGO_PKG_VERSION"),
         "mode": if s.active { "active" } else { "shadow" },
@@ -220,7 +234,9 @@ async fn status(State(s): State<AppState>) -> ApiResult {
         "counters": &*live.counters,
         "devices": live.devices.len(),
         "devices_online": live.devices.values().filter(|d| d.online).count(),
-        "clients_connected": live.clients.values().filter(|c| c.connected).count(),
+        "clients_connected": connected,
+        "clients_by_band": by_band,
+        "clients_weak": weak,
     })))
 }
 
@@ -448,6 +464,22 @@ async fn clients(State(s): State<AppState>) -> Response {
         })
         .collect();
     Json(rows).into_response()
+}
+
+/// Each named client's display name (its alias, else its hostname) by MAC:
+/// what event lists and links show, without the client list's samples.
+async fn client_names(State(s): State<AppState>) -> Json<std::collections::HashMap<String, String>> {
+    let live = s.live.read().unwrap();
+    let names = live
+        .clients
+        .iter()
+        .filter_map(|(mac, c)| {
+            let alias = live.aliases.get(mac).and_then(|a| a.alias.as_deref());
+            let name = alias.or(c.sample.hostname.as_deref()).filter(|n| !n.is_empty())?;
+            Some((mac.to_string(), name.to_string()))
+        })
+        .collect();
+    Json(names)
 }
 
 async fn client(State(s): State<AppState>, Path(mac): Path<String>) -> Result<Response, ApiError> {
@@ -938,6 +970,9 @@ mod tests {
         let one = get_json(&app, "/api/clients/02:00:00:00:01:01").await;
         assert_eq!(keys(&one), "alias,blocked,connected,first_seen,last_seen,locked_to,note,sample,usergroup_id,vendor", "no ap_name, as before");
         assert_eq!(one["sample"], clients[0]["sample"]);
+        assert_eq!(get_json(&app, "/api/clients/names").await, json!({ "02:00:00:00:01:01": "phone" }));
+        let status = get_json(&app, "/api/status").await;
+        assert_eq!((&status["clients_connected"], &status["clients_by_band"], &status["clients_weak"]), (&json!(1), &json!({ "na": 1 }), &json!(0)));
     }
 
     async fn get(app: &Router, path: &str) -> Response {
