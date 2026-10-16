@@ -205,28 +205,60 @@ async fn healthz(State(s): State<AppState>) -> Response {
     "ok".into_response()
 }
 
-/// APs in the database, as views shaped like a live one but offline: shown
-/// after a restart until each AP reports again.
-async fn stored_devices(store: &Arc<Store>, only: Option<String>) -> Result<Vec<Value>, ApiError> {
+/// An AP as the database remembers it: shown after a restart until it reports again.
+struct StoredDevice {
+    mac: String,
+    /// The name given in apctl, else the AP's hostname.
+    name: Option<String>,
+    model: Option<String>,
+    model_display: Option<String>,
+    version: Option<String>,
+    ip: Option<String>,
+    serial: Option<String>,
+    first_seen: Ts,
+    last_seen: Ts,
+}
+
+impl StoredDevice {
+    /// Shaped like a live device view, but offline.
+    fn view(&self) -> Value {
+        json!({
+            "snapshot": {
+                "ap": {
+                    "mac": self.mac, "hostname": self.name, "model": self.model, "model_display": self.model_display, "version": self.version,
+                    "ip": self.ip, "serial": self.serial, "uptime": null, "cpu": null, "mem": null, "load1": null, "load5": null,
+                    "load15": null, "mem_total": null, "mem_used": null, "satisfaction": null,
+                },
+                "uplink": null, "radios": [], "vaps": [], "clients": [], "has_vap_table": false,
+            },
+            "online": false, "first_seen": self.first_seen, "last_seen": self.last_seen,
+            "peer": "", "interval": 0, "reconfiguring": false, "last_config_push": null, "stored_only": true,
+        })
+    }
+
+    /// Its row in the device list.
+    fn row(&self) -> Value {
+        json!({
+            "mac": self.mac, "name": self.name, "model": self.model, "model_display": self.model_display, "version": self.version,
+            "ip": self.ip, "online": false, "reconfiguring": false, "first_seen": self.first_seen, "last_seen": self.last_seen, "uptime": null,
+            "cpu": null, "mem": null, "load1": null, "satisfaction": null, "clients": 0, "uplink": null, "radios": [], "last_config_push": null,
+            "stored_only": true,
+        })
+    }
+}
+
+/// APs in the database (all, or `only` this one).
+async fn stored_devices(store: &Arc<Store>, only: Option<String>) -> Result<Vec<StoredDevice>, ApiError> {
     read(store, Db::Config, move |c| {
         let mut stmt = c.prepare(
-            "SELECT mac, COALESCE(name, hostname), model, model_display, version, ip, serial, first_seen, last_seen, uptime FROM devices WHERE ?1 IS NULL OR mac = ?1",
+            "SELECT mac, COALESCE(name, hostname), model, model_display, version, ip, serial, first_seen, last_seen FROM devices WHERE ?1 IS NULL OR mac = ?1",
         )?;
         let rows = stmt
             .query_map([only.as_deref()], |r| {
-                Ok(json!({
-                    "snapshot": {
-                        "ap": {
-                            "mac": r.get::<_, String>(0)?, "hostname": r.get::<_, Option<String>>(1)?, "model": r.get::<_, Option<String>>(2)?,
-                            "model_display": r.get::<_, Option<String>>(3)?, "version": r.get::<_, Option<String>>(4)?, "ip": r.get::<_, Option<String>>(5)?,
-                            "serial": r.get::<_, Option<String>>(6)?, "uptime": null, "cpu": null, "mem": null, "load1": null, "load5": null,
-                            "load15": null, "mem_total": null, "mem_used": null, "satisfaction": null,
-                        },
-                        "uplink": null, "radios": [], "vaps": [], "clients": [], "has_vap_table": false,
-                    },
-                    "online": false, "first_seen": r.get::<_, Option<i64>>(7)?.unwrap_or(0), "last_seen": r.get::<_, Option<i64>>(8)?.unwrap_or(0),
-                    "peer": "", "interval": 0, "reconfiguring": false, "last_config_push": null, "stored_only": true,
-                }))
+                Ok(StoredDevice {
+                    mac: r.get(0)?, name: r.get(1)?, model: r.get(2)?, model_display: r.get(3)?, version: r.get(4)?, ip: r.get(5)?, serial: r.get(6)?,
+                    first_seen: r.get::<_, Option<i64>>(7)?.unwrap_or(0), last_seen: r.get::<_, Option<i64>>(8)?.unwrap_or(0),
+                })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
@@ -237,12 +269,17 @@ async fn stored_devices(store: &Arc<Store>, only: Option<String>) -> Result<Vec<
 async fn devices(State(s): State<AppState>) -> ApiResult {
     let stored = stored_devices(&s.store, None).await?;
     let live = s.live.read().unwrap();
+    // Connected clients per AP, counted in one pass.
+    let mut per_ap: std::collections::HashMap<Mac, usize> = std::collections::HashMap::new();
+    for c in live.clients.values().filter(|c| c.connected) {
+        *per_ap.entry(c.sample.ap_mac).or_default() += 1;
+    }
     let mut list: Vec<Value> = live
         .devices
         .iter()
         .map(|(mac, d)| {
             let a = &d.snapshot.ap;
-            let clients = live.clients.values().filter(|c| c.connected && c.sample.ap_mac == *mac).count();
+            let clients = per_ap.get(mac).copied().unwrap_or(0);
             json!({
                 "mac": mac, "name": a.hostname, "model": a.model, "model_display": a.model_display,
                 "version": a.version, "ip": a.ip, "online": d.online, "reconfiguring": d.reconfiguring,
@@ -260,52 +297,60 @@ async fn devices(State(s): State<AppState>) -> ApiResult {
         })
         .collect();
     for d in stored {
-        let ap = &d["snapshot"]["ap"];
-        if ap["mac"].as_str().and_then(|m| m.parse().ok()).is_some_and(|m| live.devices.contains_key(&m)) {
+        if d.mac.parse().is_ok_and(|m: Mac| live.devices.contains_key(&m)) {
             continue;
         }
-        list.push(json!({
-            "mac": ap["mac"], "name": ap["hostname"], "model": ap["model"], "model_display": ap["model_display"], "version": ap["version"],
-            "ip": ap["ip"], "online": false, "reconfiguring": false, "first_seen": d["first_seen"], "last_seen": d["last_seen"], "uptime": null,
-            "cpu": null, "mem": null, "load1": null, "satisfaction": null, "clients": 0, "uplink": null, "radios": [], "last_config_push": null,
-            "stored_only": true,
-        }));
+        list.push(d.row());
     }
     Ok(Json(Value::Array(list)))
 }
 
 async fn device(State(s): State<AppState>, Path(mac): Path<String>) -> ApiResult {
     let mac = parse_mac(&mac)?;
-    {
+    let found = {
         let live = s.live.read().unwrap();
-        if let Some(d) = live.devices.get(&mac) {
-            let clients: Vec<_> = live.clients.values().filter(|c| c.connected && c.sample.ap_mac == mac).collect();
-            return Ok(Json(json!({ "device": d, "clients": clients, "locating": live.locating.contains(&mac) })));
-        }
+        live.devices.get(&mac).map(|d| {
+            // The clients are copied out (shared samples) and serialised after the lock.
+            let clients: Vec<_> = live.clients.values().filter(|c| c.connected && c.sample.ap_mac == mac).cloned().collect();
+            (serde_json::to_value(d).unwrap_or_default(), clients, live.locating.contains(&mac))
+        })
+    };
+    if let Some((device, clients, locating)) = found {
+        return Ok(Json(json!({ "device": device, "clients": clients, "locating": locating })));
     }
     // Known but not reporting since apctl started: offline, with what we stored.
     let stored = stored_devices(&s.store, Some(mac.to_string())).await?;
     let d = stored.into_iter().next().ok_or_else(|| ApiError(StatusCode::NOT_FOUND, "unknown device".into()))?;
-    Ok(Json(json!({ "device": d, "clients": [] })))
+    Ok(Json(json!({ "device": d.view(), "clients": [] })))
 }
 
 /// Every client: the ones seen in this run and the ones restored from the
 /// database at start (`Engine::restore` loads them all, so the live view is
 /// the whole list).
 async fn clients(State(s): State<AppState>) -> ApiResult {
-    let live = s.live.read().unwrap();
-    let controls = crate::actions::ClientControls::new(live.state.as_deref());
-    let out: Vec<Value> = live
-        .clients
-        .iter()
-        .map(|(mac, c)| {
-            let ap_name = live.devices.get(&c.sample.ap_mac).and_then(|d| d.snapshot.ap.hostname.clone());
-            let mut v = serde_json::to_value(c).unwrap_or_default();
+    // What each client's entry needs, copied under the lock (the samples are
+    // shared, the rest is small); the serialising happens after it.
+    let (state, list) = {
+        let live = s.live.read().unwrap();
+        let list: Vec<(Mac, crate::engine::ClientView, Option<String>, Option<crate::engine::Alias>)> = live
+            .clients
+            .iter()
+            .map(|(mac, c)| {
+                let ap_name = live.devices.get(&c.sample.ap_mac).and_then(|d| d.snapshot.ap.hostname.clone());
+                (*mac, c.clone(), ap_name, live.aliases.get(mac).cloned())
+            })
+            .collect();
+        (live.state.clone(), list)
+    };
+    let controls = crate::actions::ClientControls::new(state.as_deref());
+    let out: Vec<Value> = list
+        .into_iter()
+        .map(|(mac, c, ap_name, alias)| {
+            let mut v = serde_json::to_value(&c).unwrap_or_default();
             v["ap_name"] = json!(ap_name);
-            let a = live.aliases.get(mac);
-            v["alias"] = json!(a.and_then(|a| a.alias.as_ref()));
-            v["note"] = json!(a.and_then(|a| a.note.as_ref()));
-            v["vendor"] = json!(s.vendors.lookup(mac));
+            v["alias"] = json!(alias.as_ref().and_then(|a| a.alias.as_ref()));
+            v["note"] = json!(alias.as_ref().and_then(|a| a.note.as_ref()));
+            v["vendor"] = json!(s.vendors.lookup(&mac));
             controls.add(&mut v, &mac.to_string());
             v
         })
@@ -717,19 +762,63 @@ mod tests {
     use axum::http::{Request, header};
     use tower::ServiceExt;
 
-    /// The router, and the engine's end of its queue (dropping it stops the "engine").
-    fn app() -> (Router, tokio::sync::mpsc::Receiver<crate::engine::Input>) {
-        let dir = std::env::temp_dir().join(format!("apctl-api-{}-{}", std::process::id(), store::now_ts()));
+    /// The app's state, and the engine's end of its queue (dropping it stops the "engine").
+    fn state() -> (AppState, tokio::sync::mpsc::Receiver<crate::engine::Input>) {
+        let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let dir = std::env::temp_dir().join(format!("apctl-api-{}-{nanos}", std::process::id()));
         let (store, writer) = Store::open(&dir).unwrap();
         let auth = Arc::new(crate::auth::Auth::new(Default::default(), &store, writer.clone(), Default::default()).unwrap());
         let (engine, engine_rx) = tokio::sync::mpsc::channel(1);
         let (tx, _) = broadcast::channel(1);
-        let app = router(AppState {
+        let state = AppState {
             backups: crate::backup::Backups { data_dir: dir.clone(), key: None },
             store, vendors: Default::default(), renderer: crate::dryrun::apcfg_renderer(crate::EMULATE_VERSION.into()), auth, engine, live: Default::default(), tx, started: 0, source: "none".into(),
             active: false, writer,
-        });
-        (app, engine_rx)
+        };
+        (state, engine_rx)
+    }
+
+    fn app() -> (Router, tokio::sync::mpsc::Receiver<crate::engine::Input>) {
+        let (state, engine) = state();
+        (router(state), engine)
+    }
+
+    async fn get_json(app: &Router, path: &str) -> Value {
+        let res = app.clone().oneshot(Request::get(path).body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        serde_json::from_slice(&axum::body::to_bytes(res.into_body(), 1 << 22).await.unwrap()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn device_and_client_lists() {
+        let (s, _engine) = state();
+        // One AP reporting with a client, one only in the database.
+        let (tx, _) = broadcast::channel(16);
+        let mut engine = crate::engine::Engine::new(s.writer.clone(), Default::default(), s.live.clone(), tx);
+        let payload = json!({ "mac": "02:00:00:00:00:01", "hostname": "Hall", "uptime": 100, "vap_table": [
+            { "bssid": "b1", "essid": "Home", "radio": "na", "channel": 36, "usage": "user", "sta_table": [{ "mac": "02:00:00:00:01:01", "hostname": "phone" }] },
+        ] });
+        let header = inform::Header { packet_version: 0, mac: Mac([0; 6]), flags: inform::Flags(0), iv: [0; 16], payload_version: 1, payload_len: 0 };
+        let decoded = wire::decode::Decoded { header, key: wire::decode::KeyUsed::Device, payload };
+        engine.handle(crate::engine::Input::Inform { ts: 50, peer: "x".into(), decoded });
+        s.writer.exec(Db::Config, "INSERT INTO devices (mac, name, model, first_seen, last_seen) VALUES ('02:00:00:00:00:02', 'Attic', 'U6', 10, 20)", vec![]);
+        assert!(s.writer.flush(std::time::Duration::from_secs(5)));
+        let app = router(s);
+
+        let list = get_json(&app, "/api/devices").await;
+        assert_eq!((list[0]["name"].as_str(), list[0]["clients"].as_i64(), list[0]["online"].as_bool()), (Some("Hall"), Some(1), Some(true)));
+        assert_eq!(list[1], json!({
+            "mac": "02:00:00:00:00:02", "name": "Attic", "model": "U6", "model_display": null, "version": null, "ip": null, "online": false,
+            "reconfiguring": false, "first_seen": 10, "last_seen": 20, "uptime": null, "cpu": null, "mem": null, "load1": null, "satisfaction": null,
+            "clients": 0, "uplink": null, "radios": [], "last_config_push": null, "stored_only": true,
+        }));
+        let one = get_json(&app, "/api/devices/02:00:00:00:00:01").await;
+        assert_eq!((one["clients"][0]["sample"]["hostname"].as_str(), one["locating"].as_bool()), (Some("phone"), Some(false)));
+        let stored = get_json(&app, "/api/devices/02:00:00:00:00:02").await;
+        assert_eq!((stored["device"]["snapshot"]["ap"]["hostname"].as_str(), stored["device"]["stored_only"].as_bool()), (Some("Attic"), Some(true)));
+        let clients = get_json(&app, "/api/clients").await;
+        assert_eq!((clients[0]["ap_name"].as_str(), clients[0]["connected"].as_bool(), clients[0]["sample"]["essid"].as_str()), (Some("Hall"), Some(true), Some("Home")));
+        assert!(clients[0]["alias"].is_null() && clients[0].get("blocked").is_some(), "{}", clients[0]);
     }
 
     async fn get(app: &Router, path: &str) -> Response {
