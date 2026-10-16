@@ -555,7 +555,7 @@ impl Engine {
             Input::Reply { ts, mac, decoded } => self.reply(ts, mac, &decoded.payload, true),
             Input::Replied { ts, mac, payload } => self.reply(ts, mac, &payload, false),
             Input::SetConfigMeta { mac, meta } => self.set_config_meta(mac, meta),
-            Input::Datagram { ts, src_ip, payload } => self.datagram(ts, src_ip, &payload),
+            Input::Datagram { ts, src_ip, payload } => self.datagram(ts, &src_ip, &payload),
             Input::Tick(now) => self.tick(now),
             Input::DecodeError => bump(&self.counters.decode_errors),
             Input::SetAliases { ts, entries, only_if_unset } => self.set_aliases(ts, entries, only_if_unset),
@@ -1215,12 +1215,12 @@ impl Engine {
         anyhow::bail!("no syslog key for hash_id {hash_id}")
     }
 
-    fn datagram(&mut self, ts: Ts, src_ip: String, payload: &[u8]) {
+    fn datagram(&mut self, ts: Ts, src_ip: &str, payload: &[u8]) {
         // Encrypted datagrams name their sender by hash_id; plain ones are passed through.
         let hash_id = crate::syslog::hash_id(payload);
         let (by_hash, by_ip, state) = {
             let live = self.live.read().unwrap();
-            (hash_id.as_ref().and_then(|h| live.by_hash_id.get(h).copied()), live.by_ip.get(&src_ip).copied(), hash_id.as_ref().and(live.state.clone()))
+            (hash_id.as_ref().and_then(|h| live.by_hash_id.get(h).copied()), live.by_ip.get(src_ip).copied(), hash_id.as_ref().and(live.state.clone()))
         };
         let result = match hash_id {
             Some(h) => self.decrypt_syslog(ts, payload, h, by_hash, state.as_ref()).map(|(mac, text)| (Some(mac), text)),
@@ -1230,7 +1230,7 @@ impl Engine {
             Ok((mac, text)) => {
                 // Netconsole and multi-line messages can carry several lines.
                 for line in text.lines().filter(|l| !l.trim().is_empty()) {
-                    self.log(crate::syslog::parse(ts, src_ip.clone(), mac.or(by_ip), line));
+                    self.log(crate::syslog::parse(ts, src_ip.to_string(), mac.or(by_ip), line));
                 }
             }
             Err(e) => {
