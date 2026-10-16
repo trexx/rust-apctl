@@ -109,20 +109,14 @@ impl LogEvents {
         let prog = line.program.as_deref().unwrap_or("");
         let dev_key = line.device_mac.map_or_else(|| line.src_ip.clone(), |m| m.to_string());
 
-        // Crash capture: collect everything the device says for a while after a fault.
-        if let Some((_, c)) = self.crashes.get_mut(&dev_key)
-            && c.lines.len() < 200
-        {
-            c.lines.push(format!("{prog}: {msg}"));
-            if msg.contains("Kernel panic") {
-                c.kind = "kernel panic";
-                out.extend(self.flush(&dev_key));
-            }
-            return out;
-        }
-        let fault = if msg.contains("Kernel panic") {
+        // Crash capture: collect everything the device says for a while after a
+        // fault (up to 200 lines), while its other events are still reported.
+        let kernel = prog == "kernel" || line.facility == Some(0);
+        let fault = if !kernel {
+            None
+        } else if msg.contains("Kernel panic") {
             Some(("kernel panic", None))
-        } else if msg.contains("Oops") || (msg.contains("[#") && msg.contains("Internal error")) {
+        } else if msg.contains("Oops:") || msg.contains("Oops[#") || msg.contains("Internal error:") {
             Some(("kernel oops", None))
         } else if let Some(p) = msg.split("sending SIGSEGV to ").nth(1) {
             Some(("process crashed (segmentation fault)", Some(p.split_whitespace().next().unwrap_or(p).trim_end_matches(':').to_string())))
@@ -131,11 +125,22 @@ impl LogEvents {
         } else {
             None
         };
-        if let Some((kind, process)) = fault {
+        let is_fault = fault.is_some();
+        if let Some((_, c)) = self.crashes.get_mut(&dev_key) {
+            if c.lines.len() < 200 {
+                c.lines.push(format!("{prog}: {msg}"));
+            }
+            if matches!(fault, Some(("kernel panic", _))) {
+                c.kind = "kernel panic";
+                out.extend(self.flush(&dev_key));
+            }
+        } else if let Some((kind, process)) = fault {
             self.crashes.insert(dev_key.clone(), (line.device_mac, Crash { started: line.ts, kind, process, lines: vec![format!("{prog}: {msg}")] }));
             if kind == "kernel panic" {
                 out.extend(self.flush(&dev_key));
             }
+        }
+        if is_fault {
             return out;
         }
 
@@ -156,7 +161,7 @@ impl LogEvents {
         }
 
         if msg.contains("BTM:") {
-            let vap = msg.split("vap-").nth(1).and_then(|r| Some(r[r.find('(')? + 1..r.find(')')?].to_string()));
+            let vap = msg.split("vap-").nth(1).and_then(|r| r.split_once('(')).and_then(|(_, r)| r.split_once(')')).map(|(v, _)| v.to_string());
             if let Some(c) = msg.split("BTM: STA ").nth(1).and_then(|r| r.split_whitespace().next()).and_then(mac) {
                 // A request: the client's signal and how many APs were offered.
                 let s = Steering {
@@ -333,5 +338,64 @@ mod tests {
         assert!(l.feed(&line(520, "hostapd", "wifi1ap0: STA 0e:00:00:00:00:02 WPA: pairwise key handshake completed (RSN)")).is_empty());
         // Unrelated lines produce nothing.
         assert!(l.feed(&line(400, "dnsmasq", "query[A] example.com")).is_empty());
+    }
+
+    #[test]
+    fn crash_capture_keeps_other_events_and_the_first_fault() {
+        let mut l = LogEvents::default();
+        assert!(l.feed(&line(0, "kernel", "Internal error: Oops: 17 [#1] SMP ARM")).is_empty());
+        // Other events of the device are still reported while capturing.
+        let f = l.feed(&line(1, "stamgr", "kick-sta-on 6c:ac:c2:00:00:01 wifi1ap1 (reason:Low RSSI rssi:19)"));
+        assert_eq!(f.len(), 1);
+        for i in 0..300 {
+            assert!(l.feed(&line(2, "kernel", &format!("line {i}"))).is_empty());
+        }
+        // A second fault in the same capture does not replace the first.
+        assert!(l.feed(&line(3, "kernel", "do_page_fault(): sending SIGSEGV to mcad for invalid read access from 00000000")).is_empty());
+        let f = l.tick(200);
+        assert_eq!(f.len(), 1);
+        assert_eq!(f[0].data["kind"], "kernel oops");
+        assert_eq!(f[0].data["lines"].as_array().map(Vec::len), Some(200));
+        assert!(l.tick(400).is_empty());
+    }
+
+    #[test]
+    fn oops_only_from_kernel_lines() {
+        let mut l = LogEvents::default();
+        assert!(l.feed(&line(0, "hostapd", "wifi1ap0: STA 0e:00:00:00:00:02 IEEE 802.11: associated (ssid Oops: guest [#1])")).is_empty());
+        assert!(l.feed(&line(1, "dnsmasq", "query[A] oops.example.com")).is_empty());
+        assert!(l.feed(&line(2, "kernel", "wlan: hostname Oopsie connected")).is_empty());
+        assert!(l.tick(1000).is_empty());
+        assert!(l.feed(&line(10, "kernel", "Oops[#1]:")).is_empty());
+        assert_eq!(l.tick(1000)[0].data["kind"], "kernel oops");
+    }
+
+    #[test]
+    fn hostile_lines_do_not_panic() {
+        let mut l = LogEvents::default();
+        let p = "wlan: [0:I:ANY] [UNSPECIFIED] vap-0(wifi1ap1):";
+        let samples = [
+            "BTM: vap-)(".to_string(),
+            "BTM: vap-(".to_string(),
+            "vap-)BTM: STA 6c:ac:c2:00:00:01 (".to_string(),
+            format!("{p}BTM: STA 6c:ac:c2:00:00:01 RSSI: -77, candidates: 1, error: 0, flags: ALLOW (0x1)"),
+            format!("{p}BTM: [0]{{78:45:58:3c:51:ae ch44/op128/phy14}}"),
+            format!("{p}BTM: Received response from [6c:ac:c2:00:00:01](len = 5): dialog_token 1, status 7, delay 0, bssid n/a, cancel 0"),
+            "kick-sta-on 6c:ac:c2:00:00:01 wifi1ap1 (reason:Low RSSI rssi:19)".to_string(),
+            "wireless_agg_stats.log_sta_anomalies(): sta=92:00:00:00:00:05 signal=-48 satisfaction_now=70 anomalies=low_phy_rate".to_string(),
+            "wifi1ap0: AP-STA-POSSIBLE-PSK-MISMATCH 0e:00:00:00:00:02".to_string(),
+            "do_page_fault(): sending SIGSEGV to ".to_string(),
+            "unhandled level 2 translation fault (11) at 0x0, esr 0x92000005 ü[".to_string(),
+            "BTM: ü vap-ü)ü(ü BTM: [ü]{ü status ü bssid ü Received response from ü]".to_string(),
+        ];
+        // Every prefix of every sample, from every program that has a parser.
+        for s in &samples {
+            for (i, _) in s.char_indices().chain([(s.len(), ' ')]) {
+                for prog in ["kernel", "stamgr", "mcad", "hostapd"] {
+                    l.feed(&line(i as Ts, prog, &s[..i]));
+                }
+            }
+        }
+        l.tick(10_000);
     }
 }
