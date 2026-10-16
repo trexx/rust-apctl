@@ -406,23 +406,22 @@ pub fn dynamic_vlan(ctx: &Ctx, w: &Value) -> u8 {
 /// `radius.auth.*`, `radius.acct.*` and interim updates from the WLAN's RADIUS profile.
 fn radius_servers(c: &mut Cfg, ctx: &Ctx, w: &Value, k: Prefix) {
     let Some(p) = radius_profile(ctx, w) else { return };
-    let servers = |list: &str, default_port: i64| -> Vec<(String, i64, String)> {
+    let servers = |list: &str, default_port: i64| {
         arr(p, list)
             .iter()
-            .filter_map(|s| {
+            .filter_map(move |s| {
                 let ip = str_of(s, "ip").filter(|v| !v.is_empty())?;
                 let secret = str_of(s, "x_secret").filter(|v| !v.is_empty())?;
-                Some((ip.to_string(), int_of(s, "port").unwrap_or(default_port), secret.to_string()))
+                Some((ip, int_of(s, "port").unwrap_or(default_port), secret))
             })
             .take(4)
-            .collect()
     };
-    for (i, (ip, port, secret)) in servers("auth_servers", 1812).iter().enumerate() {
+    for (i, (ip, port, secret)) in servers("auth_servers", 1812).enumerate() {
         c.set(format_args!("{k}radius.auth.{}.ip", i + 1), ip);
         c.set(format_args!("{k}radius.auth.{}.port", i + 1), port);
         c.set(format_args!("{k}radius.auth.{}.secret", i + 1), secret);
     }
-    for (i, (ip, port, secret)) in servers("acct_servers", 1813).iter().enumerate() {
+    for (i, (ip, port, secret)) in servers("acct_servers", 1813).enumerate() {
         c.set(format_args!("{k}radius.acct.{}.ip", i + 1), ip);
         c.set(format_args!("{k}radius.acct.{}.port", i + 1), port);
         c.set(format_args!("{k}radius.acct.{}.secret", i + 1), secret);
@@ -648,14 +647,16 @@ pub fn render_vap(c: &mut Cfg, ctx: &Ctx, radios: &[Radio], vaps: &[Vap], i: usi
 
 fn nas_identifier(c: &mut Cfg, ctx: &Ctx, w: &Value, a: Prefix) {
     let value = match str_of(w, "nas_identifier_type") {
-        Some("ap_mac") => Some(ctx.mac.clone()),
-        Some("ap_name") => str_of(ctx.device, "name").map(str::to_string),
-        Some("site_name") => str_of(ctx.site, "desc").or(str_of(ctx.site, "name")).map(str::to_string),
-        Some("custom") => str_of(w, "nas_identifier").map(str::to_string),
+        Some("ap_mac") => Some(ctx.mac.as_str()),
+        Some("ap_name") => str_of(ctx.device, "name"),
+        Some("site_name") => str_of(ctx.site, "desc").or(str_of(ctx.site, "name")),
+        Some("custom") => str_of(w, "nas_identifier"),
         _ => None,
     };
     if let Some(v) = value {
-        c.set(a.at("nas_identifier"), v.chars().take(48).collect::<String>());
+        // The first 48 characters.
+        let end = v.char_indices().nth(48).map_or(v.len(), |(i, _)| i);
+        c.set(a.at("nas_identifier"), &v[..end]);
     }
 }
 

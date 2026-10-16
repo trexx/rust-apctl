@@ -352,7 +352,7 @@ fn syslog(c: &mut Cfg, ctx: &Ctx) {
     if enabled && !this && !wants_ap_logs {
         return;
     }
-    let controller_ip = ctx.controller.syslog_ip.clone().or_else(|| ctx.inform_str("inform_ip").map(str::to_string));
+    let controller_ip = ctx.controller.syslog_ip.as_deref().or_else(|| ctx.inform_str("inform_ip"));
     c.header("syslog");
     c.set("syslog.status", "enabled");
     c.set("syslog.level", if enabled && flag(s, "debug", false) { 8 } else { 7 });
@@ -362,9 +362,9 @@ fn syslog(c: &mut Cfg, ctx: &Ctx) {
     }
     if enabled {
         let (ip, port) = if this {
-            (controller_ip.clone(), Some(Text::Str("5514")))
+            (controller_ip, Some(Text::Str("5514")))
         } else {
-            (str_of(s, "ip").map(str::to_string), text_of(s, "port"))
+            (str_of(s, "ip"), text_of(s, "port"))
         };
         c.opt("syslog.remote.ip", ip);
         c.opt("syslog.remote.port", port);
@@ -374,7 +374,7 @@ fn syslog(c: &mut Cfg, ctx: &Ctx) {
         let (host, port) = if this {
             (controller_ip, Some(Text::Str("5514")))
         } else {
-            (str_of(s, "netconsole_host").map(str::to_string), text_of(s, "netconsole_port"))
+            (str_of(s, "netconsole_host"), text_of(s, "netconsole_port"))
         };
         c.opt("netconsole.host", host);
         c.opt("netconsole.port", port);
@@ -681,15 +681,10 @@ fn qos(c: &mut Cfg, ctx: &Ctx, radios: &[Radio], vaps: &[Vap]) {
     c.set("qos.status", "enabled");
     c.set("qos.mode", 1);
     // Wired uplinks: the AP's ports, else the interface it reports as its uplink.
-    let mut uplinks: Vec<String> = ctx
-        .inform
-        .and_then(|p| p["port_table"].as_array())
-        .into_iter()
-        .flatten()
-        .filter_map(|p| str_of(p, "ifname").map(str::to_string))
-        .collect();
+    let mut uplinks: Vec<&str> =
+        ctx.inform.and_then(|p| p["port_table"].as_array()).into_iter().flatten().filter_map(|p| str_of(p, "ifname")).collect();
     if uplinks.is_empty() {
-        uplinks.push(ctx.inform_str("uplink").filter(|u| u.starts_with("eth")).unwrap_or("eth0").to_string());
+        uplinks.push(ctx.inform_str("uplink").filter(|u| u.starts_with("eth")).unwrap_or("eth0"));
     }
     let mut k = 0;
     for u in &uplinks {
