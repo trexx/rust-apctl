@@ -130,9 +130,15 @@ pub fn ap_groups<'a>(ctx: &Ctx<'a>) -> Vec<&'a str> {
 }
 
 /// Sets a field of the WLAN, copying the document first if it is still the original.
+/// A field that already has the value leaves the document alone (most WPA3, open and
+/// enterprise WLANs already hold the values `adapt` writes).
 fn set(w: &mut Cow<Value>, key: &str, v: impl Into<Value>) {
+    let v = v.into();
+    if w.get(key) == Some(&v) {
+        return;
+    }
     if let Some(o) = w.to_mut().as_object_mut() {
-        o.insert(key.to_string(), v.into());
+        o.insert(key.to_string(), v);
     }
 }
 
@@ -882,6 +888,16 @@ mod schedule_tests {
         let mut c = Cfg::default();
         schedule(&mut c, w, Prefix::new("wireless", 1), invert, multi);
         c.finish().lines().map(str::to_string).collect()
+    }
+
+    #[test]
+    fn a_wlan_is_copied_only_for_a_real_change() {
+        let w = json!({ "security": "open", "fast_roaming_enabled": false });
+        let mut c = Cow::Borrowed(&w);
+        set(&mut c, "fast_roaming_enabled", false);
+        assert!(matches!(c, Cow::Borrowed(_)));
+        set(&mut c, "wpa_mode", "wpa2");
+        assert_eq!((matches!(c, Cow::Owned(_)), &c["wpa_mode"]), (true, &json!("wpa2")));
     }
 
     #[test]
