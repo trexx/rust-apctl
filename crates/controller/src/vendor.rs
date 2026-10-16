@@ -8,6 +8,9 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use inform::Mac;
 
+/// What a locally administered (randomised) address is listed as.
+const PRIVATE: &str = "Private (randomised)";
+
 #[derive(Default)]
 pub struct Vendors(HashMap<u32, String>);
 
@@ -52,15 +55,15 @@ impl Vendors {
 
     /// The manufacturer for a MAC. Locally administered addresses (random MACs
     /// used by phones and laptops for privacy) have no registered owner.
-    pub fn lookup(&self, mac: &Mac) -> Option<String> {
+    pub fn lookup(&self, mac: &Mac) -> Option<&str> {
         let b = mac.0;
         if b[0] & 0x02 != 0 {
-            return Some("Private (randomised)".into());
+            return Some(PRIVATE);
         }
-        self.0.get(&(u32::from(b[0]) << 16 | u32::from(b[1]) << 8 | u32::from(b[2]))).cloned()
+        self.0.get(&(u32::from(b[0]) << 16 | u32::from(b[1]) << 8 | u32::from(b[2]))).map(String::as_str)
     }
 
-    pub fn lookup_str(&self, mac: &str) -> Option<String> {
+    pub fn lookup_str(&self, mac: &str) -> Option<&str> {
         mac.parse::<Mac>().ok().and_then(|m| self.lookup(&m))
     }
 }
@@ -82,9 +85,9 @@ mod tests {
         )
         .unwrap();
         let v = Vendors::load(&file).unwrap();
-        assert_eq!(v.lookup_str("78:45:58:3c:52:bc").as_deref(), Some("Ubiquiti Inc"));
-        assert_eq!(v.lookup_str("28:6f:b9:00:00:01").as_deref(), Some("Nokia Shanghai Bell Co., Ltd."));
-        assert_eq!(v.lookup_str("86:00:00:00:00:06").as_deref(), Some("Private (randomised)"));
+        assert_eq!(v.lookup_str("78:45:58:3c:52:bc"), Some("Ubiquiti Inc"));
+        assert_eq!(v.lookup_str("28:6f:b9:00:00:01"), Some("Nokia Shanghai Bell Co., Ltd."));
+        assert_eq!(v.lookup_str("86:00:00:00:00:06"), Some("Private (randomised)"));
         assert_eq!(v.lookup_str("00:00:01:00:00:00"), None);
         std::fs::remove_dir_all(&dir).ok();
     }

@@ -1,6 +1,7 @@
 //! Dry run: render what apctl would push to an AP and compare it with what the
 //! other controller actually pushed, without sending anything.
 
+use std::borrow::Cow;
 use std::sync::Arc;
 
 use serde::Serialize;
@@ -129,7 +130,7 @@ fn lines(s: &str) -> Vec<&str> {
 /// masked on both sides first (used when only a redacted copy of the actual
 /// config is available).
 pub fn compare_field(ours: &str, actual: &str, redacted: bool) -> FieldComparison {
-    let (ours, actual) = if redacted { (cfgdiff::redact(ours), cfgdiff::redact(actual)) } else { (ours.to_string(), actual.to_string()) };
+    let (ours, actual): (Cow<str>, Cow<str>) = if redacted { (cfgdiff::redact(ours).into(), cfgdiff::redact(actual).into()) } else { (ours.into(), actual.into()) };
     let (o, a) = (lines(&ours), lines(&actual));
     let d = cfgdiff::diff(&actual, &ours);
     FieldComparison {

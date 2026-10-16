@@ -26,6 +26,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::api::{ApiError, AppState};
+use crate::engine::Live;
 use crate::insights::{RangeQuery, read, window};
 use crate::model::Ts;
 use crate::store::Db;
@@ -151,13 +152,9 @@ pub fn attempts(mut events: Vec<ConnEvent>) -> Vec<Attempt> {
         let ok = succeeded(&e.event_type, &e.n);
         if e.event_type == "fixup"
             && let Some(id) = e.n.get("event_id").filter(|v| !v.is_null())
-            && let Some(prev) = merged.iter_mut().rev().find(|(p, _, _)| {
-                p.ap == e.ap
-                    && p.client == e.client
-                    && p.vap == e.vap
-                    && p.n.get("event_id") == Some(id)
-                    && e.ts - p.ts <= 1200
-                    && p.event_type.contains("failure")
+            // Sorted by time: only the last 20 minutes need looking at.
+            && let Some(prev) = merged.iter_mut().rev().take_while(|(p, _, _)| e.ts - p.ts <= 1200).find(|(p, _, _)| {
+                p.ap == e.ap && p.client == e.client && p.vap == e.vap && p.n.get("event_id") == Some(id) && p.event_type.contains("failure")
             })
         {
             if let (Some(a), Some(b)) = (prev.0.n.as_object_mut(), e.n.as_object()) {
@@ -292,25 +289,20 @@ pub fn roams(events: &[ConnEvent]) -> Vec<Roam> {
     let mut out = Vec::new();
     for (client, mut evs) in by_client {
         evs.sort_by_key(|e| e.ts);
+        // Whether each event is a leave, and whether it carries the signal a join needs.
+        let leave: Vec<bool> = evs.iter().map(|e| matches!(e.event_type.as_str(), "sta_roam" | "sta_leave")).collect();
+        let joined: Vec<bool> = evs.iter().zip(&leave).map(|(e, l)| !l && num_of(&e.n, "auth_rssi").is_some()).collect();
         let mut used: HashSet<usize> = HashSet::new();
         for (li, l) in evs.iter().enumerate() {
-            if !matches!(l.event_type.as_str(), "sta_roam" | "sta_leave") || num_of(&l.n, "avg_rssi").is_none() {
+            if !leave[li] || num_of(&l.n, "avg_rssi").is_none() {
                 continue;
             }
-            // The join: another AP on the same network, with the signal it joined at.
-            let join = evs
-                .iter()
-                .enumerate()
-                .filter(|(ji, j)| {
-                    *ji != li
-                        && !used.contains(ji)
-                        && !matches!(j.event_type.as_str(), "sta_roam" | "sta_leave")
-                        && j.ap != l.ap
-                        && num_of(&j.n, "auth_rssi").is_some()
-                        && (j.essid.is_none() || l.essid.is_none() || j.essid == l.essid)
-                        && j.ts >= l.ts - 10
-                        && j.ts <= l.ts + 15
-                })
+            // The join: another AP on the same network, with the signal it joined at,
+            // from 10 s before to 15 s after the leave.
+            let (lo, hi) = (evs.partition_point(|j| j.ts < l.ts - 10), evs.partition_point(|j| j.ts <= l.ts + 15));
+            let join = (lo..hi)
+                .map(|ji| (ji, evs[ji]))
+                .filter(|(ji, j)| joined[*ji] && !used.contains(ji) && j.ap != l.ap && (j.essid.is_none() || l.essid.is_none() || j.essid == l.essid))
                 .max_by_key(|(_, j)| (band_rank(j.radio.as_deref()), std::cmp::Reverse((j.ts - l.ts).abs())));
             let Some((ji, j)) = join else { continue };
             used.insert(ji);
@@ -409,12 +401,18 @@ pub fn roam_clients(roams: &[Roam]) -> Vec<Value> {
 /// Loads the notifications in a window (optionally one client's).
 async fn load(s: &AppState, from: Ts, to: Ts, client: Option<String>) -> Result<Vec<ConnEvent>, ApiError> {
     read(s, Db::Config, move |c| {
-        let mut stmt = c.prepare(
-            "SELECT ts, ap_mac, client_mac, vap, essid, radio, event_type, detail, ip_assign_type, dns_responses, dns_timeouts, rssi \
-             FROM connections WHERE ts >= ?1 AND ts <= ?2 AND (?3 IS NULL OR client_mac = ?3)",
-        )?;
+        const COLUMNS: &str = "SELECT ts, ap_mac, client_mac, vap, essid, radio, event_type, detail, ip_assign_type, dns_responses, dns_timeouts, rssi FROM connections";
+        // Two statements: `(?3 IS NULL OR client_mac = ?3)` would keep SQLite off the per-client index.
+        let mut stmt = match client {
+            Some(_) => c.prepare(&format!("{COLUMNS} WHERE client_mac = ?3 AND ts >= ?1 AND ts <= ?2"))?,
+            None => c.prepare(&format!("{COLUMNS} WHERE ts >= ?1 AND ts <= ?2"))?,
+        };
+        let params: Vec<&dyn rusqlite::ToSql> = match &client {
+            Some(m) => vec![&from, &to, m],
+            None => vec![&from, &to],
+        };
         let rows = stmt
-            .query_map(rusqlite::params![from, to, client], |r| {
+            .query_map(params.as_slice(), |r| {
                 let detail: Option<String> = r.get(7)?;
                 // Rows from before the full notification was kept: rebuild what we can.
                 let n = detail.and_then(|d| serde_json::from_str(&d).ok()).unwrap_or_else(|| {
@@ -442,39 +440,51 @@ async fn load(s: &AppState, from: Ts, to: Ts, client: Option<String>) -> Result<
     .await
 }
 
-/// Display names for APs and clients (aliases first).
+/// Every AP and client apctl knows, by MAC, with its display name if it has one.
+#[derive(Debug, Default)]
+pub struct Names {
+    pub aps: HashMap<String, Option<String>>,
+    pub clients: HashMap<String, Option<String>>,
+}
+
+impl Names {
+    /// From the database: APs' names (else hostnames) and clients' hostnames.
+    pub fn load(c: &rusqlite::Connection) -> rusqlite::Result<Names> {
+        let pairs = |sql: &str| -> rusqlite::Result<HashMap<String, Option<String>>> {
+            c.prepare(sql)?.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?)))?.collect()
+        };
+        Ok(Names { aps: pairs("SELECT mac, COALESCE(name, hostname) FROM devices")?, clients: pairs("SELECT mac, hostname FROM clients")? })
+    }
+
+    /// What the APs and clients report now on top, then aliases (which win).
+    pub fn add_live(&mut self, live: &Live) {
+        let put = |map: &mut HashMap<String, Option<String>>, mac: &inform::Mac, name: &Option<String>| {
+            let e = map.entry(mac.to_string()).or_default();
+            if name.is_some() {
+                e.clone_from(name);
+            }
+        };
+        for (mac, d) in &live.devices {
+            put(&mut self.aps, mac, &d.snapshot.ap.hostname);
+        }
+        for mac in live.known_devices.keys() {
+            put(&mut self.aps, mac, &None);
+        }
+        for (mac, c) in &live.clients {
+            put(&mut self.clients, mac, &c.sample.hostname);
+        }
+        for (mac, a) in live.aliases.iter().filter(|(_, a)| a.alias.is_some()) {
+            put(&mut self.clients, mac, &a.alias);
+        }
+    }
+}
+
+/// Display names for APs and clients (aliases first), for the ones that have one.
 async fn names(s: &AppState) -> Result<(HashMap<String, String>, HashMap<String, String>), ApiError> {
-    let (mut aps, mut clients): (HashMap<String, String>, HashMap<String, String>) = read(s, Db::Config, |c| {
-        let aps = c
-            .prepare("SELECT mac, COALESCE(name, hostname) FROM devices")?
-            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?)))?
-            .filter_map(|r| r.ok().and_then(|(m, n)| n.map(|n| (m, n))))
-            .collect();
-        let clients = c
-            .prepare("SELECT mac, hostname FROM clients")?
-            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?)))?
-            .filter_map(|r| r.ok().and_then(|(m, n)| n.map(|n| (m, n))))
-            .collect();
-        Ok((aps, clients))
-    })
-    .await?;
-    let live = s.live.read().unwrap();
-    for (mac, d) in &live.devices {
-        if let Some(n) = &d.snapshot.ap.hostname {
-            aps.insert(mac.to_string(), n.clone());
-        }
-    }
-    for (mac, c) in &live.clients {
-        if let Some(n) = &c.sample.hostname {
-            clients.insert(mac.to_string(), n.clone());
-        }
-    }
-    for (mac, a) in &live.aliases {
-        if let Some(n) = &a.alias {
-            clients.insert(mac.to_string(), n.clone());
-        }
-    }
-    Ok((aps, clients))
+    let mut names = read(s, Db::Config, |c| Ok(Names::load(c)?)).await?;
+    names.add_live(&s.live.read().unwrap());
+    let named = |m: HashMap<String, Option<String>>| m.into_iter().filter_map(|(mac, n)| n.map(|n| (mac, n))).collect();
+    Ok((named(names.aps), named(names.clients)))
 }
 
 /// GET /api/site/connectivity: connection success per client and stage, for
@@ -510,14 +520,16 @@ pub async fn list(State(s): State<AppState>, Query(q): Query<ListQuery>) -> Resu
     let (from, to, _) = window(&RangeQuery { range: q.range, from: q.from, to: q.to, ..Default::default() });
     let client = q.client.map(|c| c.to_ascii_lowercase());
     let events = load(&s, from, to, client).await?;
-    let mut list = attempts(events.clone());
+    let limit = q.limit.unwrap_or(500).min(5000);
+    let mut r = roams(&events);
+    r.reverse();
+    r.truncate(limit);
+    let mut list = attempts(events);
     if q.failed {
         list.retain(|a| !a.success);
     }
     list.reverse();
-    list.truncate(q.limit.unwrap_or(500).min(5000));
-    let mut r = roams(&events);
-    r.reverse();
+    list.truncate(limit);
     let (aps, clients) = names(&s).await?;
     Ok(Json(json!({ "attempts": list, "roams": r, "ap_names": aps, "client_names": clients })))
 }

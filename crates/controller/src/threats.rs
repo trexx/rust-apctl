@@ -90,10 +90,19 @@ pub struct HeardBy {
     pub last_seen: Ts,
 }
 
+/// How serious a finding is; sorts most serious first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Severity {
+    High,
+    Medium,
+    Low,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct Finding {
     pub kind: &'static str,
-    pub severity: &'static str,
+    pub severity: Severity,
     pub bssid: String,
     pub essid: Option<String>,
     pub security: Option<String>,
@@ -196,11 +205,19 @@ fn lookalike(name: &str, ours: &str) -> Option<&'static str> {
     None
 }
 
-fn severity_rank(s: &str) -> u8 {
-    match s {
-        "high" => 0,
-        "medium" => 1,
-        _ => 2,
+/// What a finding reports about the sightings it rests on.
+struct Seen<'a> {
+    latest: &'a Heard,
+    best: Option<i64>,
+    first: Ts,
+}
+
+fn seen<'a>(rows: &[&'a Heard]) -> Seen<'a> {
+    let latest = *rows.iter().max_by_key(|h| h.last_seen).expect("a BSSID has sightings");
+    Seen {
+        latest,
+        best: rows.iter().filter_map(|h| h.best_signal.or(h.signal)).max(),
+        first: rows.iter().map(|h| h.first_seen).min().unwrap_or(latest.first_seen),
     }
 }
 
@@ -230,26 +247,26 @@ pub fn assess(a: &Assessment) -> Vec<Finding> {
 
     let mut out = Vec::new();
     for (bssid, rows) in by_bssid {
-        let latest = rows.iter().max_by_key(|h| h.last_seen).unwrap();
-        let best = rows.iter().filter_map(|h| h.best_signal.or(h.signal)).max();
-        let mut push = |kind: &'static str, severity: &'static str, target: Option<String>, detail: String, rows: &[&Heard]| {
+        let all = seen(&rows);
+        let (latest, best) = (all.latest, all.best);
+        // `rows` are the sightings the finding rests on, `s` what they add up to.
+        let mut push = |kind: &'static str, severity: Severity, target: Option<String>, detail: String, rows: &[&Heard], s: &Seen| {
             let key = (kind.to_string(), bssid.to_string());
             let mut heard_by: Vec<HeardBy> =
                 rows.iter().map(|h| HeardBy { mac: h.ap_mac.clone(), name: ap_name(&h.ap_mac), signal: h.signal, last_seen: h.last_seen }).collect();
             heard_by.sort_by_key(|h| std::cmp::Reverse(h.signal.unwrap_or(-200)));
-            let latest = rows.iter().max_by_key(|h| h.last_seen).unwrap();
             out.push(Finding {
                 kind,
                 severity,
                 bssid: bssid.to_string(),
-                essid: latest.essid.clone(),
-                security: latest.security.clone(),
-                channel: latest.channel,
-                radio: latest.radio.clone(),
-                best_signal: rows.iter().filter_map(|h| h.best_signal.or(h.signal)).max(),
+                essid: s.latest.essid.clone(),
+                security: s.latest.security.clone(),
+                channel: s.latest.channel,
+                radio: s.latest.radio.clone(),
+                best_signal: s.best,
                 heard_by,
-                first_seen: rows.iter().map(|h| h.first_seen).min().unwrap_or(latest.first_seen),
-                last_seen: latest.last_seen,
+                first_seen: s.first,
+                last_seen: s.latest.last_seen,
                 target,
                 detail,
                 first_reported: a.reported.get(&key).copied(),
@@ -271,7 +288,7 @@ pub fn assess(a: &Assessment) -> Vec<Finding> {
             if let Some(h) = odd_channel.first() {
                 push(
                     "spoofed_bssid",
-                    "high",
+                    Severity::High,
                     Some(owner.clone()),
                     format!(
                         "Uses the address of {owner}'s \"{}\" network, but was heard on channel {} while {owner} is on {}. Something may be cloning your AP.",
@@ -280,11 +297,12 @@ pub fn assess(a: &Assessment) -> Vec<Finding> {
                         o.channel.unwrap_or_default()
                     ),
                     &odd_channel,
+                    &seen(&odd_channel),
                 );
             } else if let Some(h) = odd_name.first() {
                 push(
                     "spoofed_bssid",
-                    "high",
+                    Severity::High,
                     Some(owner.clone()),
                     format!(
                         "Uses the address of {owner}'s \"{}\" network, but calls itself \"{}\". Something may be cloning your AP.",
@@ -292,6 +310,7 @@ pub fn assess(a: &Assessment) -> Vec<Finding> {
                         h.essid.as_deref().unwrap_or("")
                     ),
                     &odd_name,
+                    &seen(&odd_name),
                 );
             }
             continue;
@@ -315,13 +334,13 @@ pub fn assess(a: &Assessment) -> Vec<Finding> {
                 } else {
                     format!("Broadcasts your network name \"{e}\" from a device that is not one of your APs.")
                 };
-                push("impersonation", if family { "medium" } else { "high" }, Some(e.to_string()), detail, &rows);
+                push("impersonation", if family { Severity::Medium } else { Severity::High }, Some(e.to_string()), detail, &rows, &all);
                 continue;
             }
             if !family
                 && let Some((ours, why)) = a.ssids.iter().find_map(|o| lookalike(e, o).map(|w| (o, w)))
             {
-                push("lookalike", "medium", Some(ours.clone()), format!("\"{e}\" {why} (\"{ours}\")."), &rows);
+                push("lookalike", Severity::Medium, Some(ours.clone()), format!("\"{e}\" {why} (\"{ours}\")."), &rows, &all);
                 continue;
             }
         }
@@ -334,51 +353,65 @@ pub fn assess(a: &Assessment) -> Vec<Finding> {
             let who = name.cloned().unwrap_or_else(|| mac.to_string());
             push(
                 "bridged",
-                "medium",
+                Severity::Medium,
                 Some(mac.to_string()),
                 format!(
                     "Its address is next to that of your client {who}, so {who} probably broadcasts it: a phone hotspot, a Wi-Fi extender or the device's own setup network. Extenders and hotspots can bridge other devices onto your network."
                 ),
                 &rows,
+                &all,
             );
             continue;
         }
-        let first = rows.iter().map(|h| h.first_seen).min().unwrap_or(latest.first_seen);
-        if watched_for > 2 * 86400 && first > a.now - 86400 && best.is_some_and(|s| s >= -60) {
-            push(
-                "new_nearby",
-                "low",
-                None,
-                format!("A strong network ({} dBm) that first appeared in the last day.", best.unwrap_or_default()),
-                &rows,
-            );
+        if watched_for > 2 * 86400 && all.first > a.now - 86400 && best.is_some_and(|s| s >= -60) {
+            push("new_nearby", Severity::Low, None, format!("A strong network ({} dBm) that first appeared in the last day.", best.unwrap_or_default()), &rows, &all);
         }
     }
-    out.sort_by(|x, y| severity_rank(x.severity).cmp(&severity_rank(y.severity)).then(y.best_signal.cmp(&x.best_signal)));
+    out.sort_by(|x, y| x.severity.cmp(&y.severity).then(y.best_signal.cmp(&x.best_signal)));
     out
 }
+
+/// How long the BSSIDs our APs used, and when each last changed, are reused
+/// before they are read from the metrics again (the checks run every minute).
+const CACHE_SECS: Ts = 600;
+
+/// What `gather` last worked out from the metrics.
+#[derive(Default)]
+struct Cache {
+    /// When `used` was read.
+    used_at: Ts,
+    /// BSSIDs our APs used in the last 30 days: (bssid, AP, network name).
+    used: Vec<(String, String, Option<String>)>,
+    /// Per BSSID: its last change, as last worked out.
+    changes: HashMap<String, Change>,
+}
+
+/// When one of our BSSIDs last changed, for the AP, radio, channel and name it
+/// had when that was worked out (`at`).
+struct Change {
+    of: (String, Option<String>, Option<i64>, Option<String>),
+    at: Ts,
+    changed_at: Ts,
+}
+
+static CACHE: std::sync::LazyLock<std::sync::Mutex<Cache>> = std::sync::LazyLock::new(Default::default);
 
 /// Loads what `assess` needs from the database and live state.
 pub fn gather(store: &Store, live: &SharedLive, now: Ts) -> anyhow::Result<Assessment> {
     let mut a = Assessment { now, ..Default::default() };
     let mut own: BTreeMap<String, OwnBss> = BTreeMap::new();
+    // The radio each of our live BSSIDs is on.
+    let mut radios: HashMap<String, Option<String>> = HashMap::new();
     {
         let live = live.read().unwrap();
         for (mac, d) in &live.devices {
-            a.aps.insert(mac.to_string(), d.snapshot.ap.hostname.clone());
             for v in &d.snapshot.vaps {
                 own.insert(
                     v.bssid.clone(),
                     OwnBss { bssid: v.bssid.clone(), ap_mac: mac.to_string(), essid: v.essid.clone(), channel: v.channel, changed_at: 0 },
                 );
+                radios.insert(v.bssid.clone(), v.radio.clone());
             }
-        }
-        for mac in live.known_devices.keys() {
-            a.aps.entry(mac.to_string()).or_insert(None);
-        }
-        for c in live.clients.values() {
-            let alias = live.aliases.get(&c.sample.mac).and_then(|x| x.alias.clone());
-            a.clients.push((c.sample.mac.to_string(), alias.or(c.sample.hostname.clone())));
         }
         if let Some(state) = &live.state {
             for w in state.get("wlanconf").and_then(Value::as_array).into_iter().flatten() {
@@ -391,34 +424,44 @@ pub fn gather(store: &Store, live: &SharedLive, now: Ts) -> anyhow::Result<Asses
         }
     }
 
-    // BSSIDs our APs used in the last 30 days, including ones not reporting now.
+    let mut cache = CACHE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     store.read(Db::Metrics, |c| {
-        let since = now - 30 * 86400;
-        for suffix in ["", "_5m"] {
-            let mut stmt = c.prepare(&format!("SELECT bssid, ap_mac, essid, MAX(ts) FROM vap_stats{suffix} WHERE ts >= ?1 GROUP BY bssid"))?;
-            let rows = stmt.query_map([since], |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?, r.get::<_, Option<String>>(2)?)))?;
-            for (bssid, ap, essid) in rows.flatten() {
-                let ap = ap.unwrap_or_default();
-                if !ap.is_empty() {
-                    a.aps.entry(ap.clone()).or_insert(None);
-                }
-                if let Some(e) = &essid {
-                    a.ssids.insert(e.clone());
-                }
-                own.entry(bssid.clone()).or_insert(OwnBss { bssid, ap_mac: ap, essid, channel: None, changed_at: 0 });
-            }
+        if !(0..CACHE_SECS).contains(&(now - cache.used_at)) {
+            cache.used = used_bssids(c, now)?;
+            cache.used_at = now;
         }
+        for (bssid, ap, essid) in &cache.used {
+            if !ap.is_empty() {
+                a.aps.entry(ap.clone()).or_insert(None);
+            }
+            if let Some(e) = essid {
+                a.ssids.insert(e.clone());
+            }
+            own.entry(bssid.clone()).or_insert_with(|| OwnBss { bssid: bssid.clone(), ap_mac: ap.clone(), essid: essid.clone(), channel: None, changed_at: 0 });
+        }
+        let mut by_radio = HashMap::new();
         for b in own.values_mut() {
             if let Some(e) = &b.essid {
                 a.ssids.insert(e.clone());
             }
-            b.changed_at = last_change(c, b)?;
+            let radio = radios.get(&b.bssid).cloned().flatten();
+            let key = (b.ap_mac.clone(), radio, b.channel, b.essid.clone());
+            b.changed_at = match cache.changes.get(&b.bssid) {
+                Some(ch) if ch.of == key && (0..CACHE_SECS).contains(&(now - ch.at)) => ch.changed_at,
+                _ => {
+                    let changed_at = last_change(c, b, key.1.as_deref(), &mut by_radio)?;
+                    cache.changes.insert(b.bssid.clone(), Change { of: key, at: now, changed_at });
+                    changed_at
+                }
+            };
         }
+        cache.changes.retain(|k, _| own.contains_key(k));
         Ok(())
     })?;
+    drop(cache);
     a.own = own.into_values().collect();
 
-    store.read(Db::Config, |c| {
+    let mut names = store.read(Db::Config, |c| {
         let mut stmt = c.prepare(
             "SELECT bssid, ap_mac, radio, essid, channel, security, signal, best_signal, first_seen, last_seen FROM neighbors WHERE last_seen >= ?1",
         )?;
@@ -439,20 +482,6 @@ pub fn gather(store: &Store, live: &SharedLive, now: Ts) -> anyhow::Result<Asses
             })?
             .collect::<rusqlite::Result<_>>()?;
         a.watching_since = c.query_row("SELECT MIN(first_seen) FROM neighbors", [], |r| r.get::<_, Option<Ts>>(0)).optional()?.flatten().unwrap_or(now);
-        let mut stmt = c.prepare("SELECT mac, hostname FROM clients")?;
-        let known: HashSet<String> = a.clients.iter().map(|c| c.0.clone()).collect();
-        for row in stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?)))?.flatten() {
-            if !known.contains(&row.0) {
-                a.clients.push(row);
-            }
-        }
-        let mut stmt = c.prepare("SELECT mac, COALESCE(name, hostname) FROM devices")?;
-        for (mac, name) in stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?)))?.flatten() {
-            let e = a.aps.entry(mac).or_insert(None);
-            if e.is_none() {
-                *e = name;
-            }
-        }
         let mut stmt = c.prepare("SELECT kind, bssid, note, ts FROM network_acks")?;
         for (k, b, n, t) in stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get(2)?, r.get(3)?)))?.flatten() {
             a.acks.insert((k, b), (n, t));
@@ -461,29 +490,74 @@ pub fn gather(store: &Store, live: &SharedLive, now: Ts) -> anyhow::Result<Asses
         for (k, b, t) in stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get(2)?)))?.flatten() {
             a.reported.insert((k, b), t);
         }
-        Ok(())
+        Ok(crate::connections::Names::load(c)?)
     })?;
+    // Our APs and every Wi-Fi client ever seen, with their names (aliases first).
+    names.add_live(&live.read().unwrap());
+    for (mac, name) in names.aps {
+        let e = a.aps.entry(mac).or_insert(None);
+        if name.is_some() {
+            *e = name;
+        }
+    }
+    a.clients = names.clients.into_iter().collect();
+    a.clients.sort();
     Ok(a)
 }
 
-/// When this BSSID's radio last ran another channel, or the BSSID another name.
-fn last_change(c: &Connection, b: &OwnBss) -> rusqlite::Result<Ts> {
-    let mut latest: Ts = 0;
-    for suffix in ["", "_5m"] {
-        if let Some(ch) = b.channel {
-            let t: Option<Ts> = c.query_row(
-                &format!(
-                    "SELECT MAX(r.ts) FROM radio_stats{suffix} r JOIN (SELECT DISTINCT radio FROM vap_stats{suffix} WHERE bssid = ?1) v ON r.radio = v.radio \
-                     WHERE r.mac = ?2 AND r.channel IS NOT NULL AND r.channel != ?3"
-                ),
-                rusqlite::params![b.bssid, b.ap_mac, ch],
-                |r| r.get(0),
-            )?;
-            latest = latest.max(t.unwrap_or(0));
+/// BSSIDs our APs used in the last 30 days, with their AP and latest name. The
+/// five-minute tier covers all but the last few minutes, which come from the
+/// raw one (the roll-up runs every five minutes, on complete buckets).
+fn used_bssids(c: &Connection, now: Ts) -> rusqlite::Result<Vec<(String, String, Option<String>)>> {
+    let mut out: BTreeMap<String, (String, Option<String>)> = BTreeMap::new();
+    for (suffix, since) in [("", now - 20 * 60), ("_5m", now - 30 * 86400)] {
+        let mut stmt = c.prepare(&format!("SELECT bssid, ap_mac, essid, MAX(ts) FROM vap_stats{suffix} WHERE ts >= ?1 GROUP BY bssid"))?;
+        let rows = stmt.query_map([since], |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?, r.get::<_, Option<String>>(2)?)))?;
+        for (bssid, ap, essid) in rows.flatten() {
+            out.entry(bssid).or_insert((ap.unwrap_or_default(), essid));
         }
-        if let Some(e) = &b.essid {
-            let t: Option<Ts> =
-                c.query_row(&format!("SELECT MAX(ts) FROM vap_stats{suffix} WHERE bssid = ?1 AND essid IS NOT NULL AND essid != ?2"), rusqlite::params![b.bssid, e], |r| r.get(0))?;
+    }
+    Ok(out.into_iter().map(|(b, (ap, e))| (b, ap, e)).collect())
+}
+
+/// When this BSSID's radio last ran another channel, or the BSSID another name.
+/// The radio's channel history is read once for all the networks on it.
+fn last_change(c: &Connection, b: &OwnBss, radio: Option<&str>, by_radio: &mut HashMap<(String, String, i64), Ts>) -> rusqlite::Result<Ts> {
+    let mut latest: Ts = 0;
+    if let Some(ch) = b.channel {
+        let cached = radio.and_then(|r| by_radio.get(&(b.ap_mac.clone(), r.to_string(), ch)).copied());
+        let t = match cached {
+            Some(t) => t,
+            None => {
+                let mut t: Ts = 0;
+                for suffix in ["", "_5m"] {
+                    let found: Option<Ts> = match radio {
+                        Some(r) => c
+                            .prepare_cached(&format!("SELECT MAX(ts) FROM radio_stats{suffix} WHERE mac = ?1 AND radio = ?2 AND channel IS NOT NULL AND channel != ?3"))?
+                            .query_row(rusqlite::params![b.ap_mac, r, ch], |r| r.get(0))?,
+                        // Not reporting its radio: the radios its BSSID was on.
+                        None => c
+                            .prepare_cached(&format!(
+                                "SELECT MAX(r.ts) FROM radio_stats{suffix} r JOIN (SELECT DISTINCT radio FROM vap_stats{suffix} WHERE bssid = ?1) v ON r.radio = v.radio \
+                                 WHERE r.mac = ?2 AND r.channel IS NOT NULL AND r.channel != ?3"
+                            ))?
+                            .query_row(rusqlite::params![b.bssid, b.ap_mac, ch], |r| r.get(0))?,
+                    };
+                    t = t.max(found.unwrap_or(0));
+                }
+                if let Some(r) = radio {
+                    by_radio.insert((b.ap_mac.clone(), r.to_string(), ch), t);
+                }
+                t
+            }
+        };
+        latest = latest.max(t);
+    }
+    if let Some(e) = &b.essid {
+        for suffix in ["", "_5m"] {
+            let t: Option<Ts> = c
+                .prepare_cached(&format!("SELECT MAX(ts) FROM vap_stats{suffix} WHERE bssid = ?1 AND essid IS NOT NULL AND essid != ?2"))?
+                .query_row(rusqlite::params![b.bssid, e], |r| r.get(0))?;
             latest = latest.max(t.unwrap_or(0));
         }
     }
@@ -505,13 +579,11 @@ async fn findings(s: &AppState) -> Result<(Vec<Finding>, Ts), ApiError> {
 pub async fn list(State(s): State<AppState>) -> Result<Json<Value>, ApiError> {
     let (list, watching_since) = findings(&s).await?;
     // Vendors help tell a neighbour's router from a laptop or phone.
-    let vendors: Vec<Option<String>> = list.iter().map(|f| s.vendors.lookup_str(&f.bssid)).collect();
     let items: Vec<Value> = list
-        .into_iter()
-        .zip(vendors)
-        .map(|(f, v)| {
+        .iter()
+        .map(|f| {
             let mut j = serde_json::to_value(f).unwrap_or_default();
-            j["vendor"] = json!(v);
+            j["vendor"] = json!(s.vendors.lookup_str(&f.bssid));
             j
         })
         .collect();
@@ -564,7 +636,10 @@ pub fn watch(store: std::sync::Arc<Store>, live: SharedLive, engine: tokio::sync
                     tracing::warn!("network threat check failed: {e:#}");
                     continue;
                 }
-                Err(_) => continue,
+                Err(e) => {
+                    tracing::error!("network threat check crashed: {e}");
+                    continue;
+                }
             };
             for f in list.into_iter().filter(|f| f.first_reported.is_none()) {
                 let device = f.heard_by.first().and_then(|h| h.mac.parse().ok());
@@ -626,7 +701,7 @@ mod tests {
         a
     }
 
-    fn kinds(a: &Assessment) -> Vec<(&'static str, &'static str, String)> {
+    fn kinds(a: &Assessment) -> Vec<(&'static str, Severity, String)> {
         assess(a).into_iter().map(|f| (f.kind, f.severity, f.bssid)).collect()
     }
 
@@ -640,7 +715,7 @@ mod tests {
         let mut a = site();
         a.heard.push(heard("02:11:22:33:44:55", DOWN, "Home", 6, "Open", -55));
         let f = assess(&a);
-        assert_eq!((f[0].kind, f[0].severity), ("impersonation", "high"));
+        assert_eq!((f[0].kind, f[0].severity), ("impersonation", Severity::High));
         assert!(f[0].detail.contains("no password"), "{}", f[0].detail);
         // Different security is called out.
         let mut a = site();
@@ -649,7 +724,7 @@ mod tests {
         // Next to our AP's own addresses: probably ours, so only medium.
         let mut a = site();
         a.heard.push(heard("7a:45:58:3c:52:bf", UP, "Home", 48, "WPA2-Personal (AES/CCMP)", -80));
-        assert_eq!(kinds(&a), vec![("impersonation", "medium", "7a:45:58:3c:52:bf".into())]);
+        assert_eq!(kinds(&a), vec![("impersonation", Severity::Medium, "7a:45:58:3c:52:bf".into())]);
     }
 
     #[test]
@@ -658,7 +733,7 @@ mod tests {
         a.heard.push(heard("78:45:58:3c:52:be", UP, "Home", 149, "WPA2-Personal (AES/CCMP)", -60));
         // (replaces the normal sighting: one row per BSSID and hearing AP)
         a.heard.retain(|h| !(h.bssid == "78:45:58:3c:52:be" && h.channel == Some(48)));
-        assert_eq!(kinds(&a), vec![("spoofed_bssid", "high", "78:45:58:3c:52:be".into())]);
+        assert_eq!(kinds(&a), vec![("spoofed_bssid", Severity::High, "78:45:58:3c:52:be".into())]);
         // The scan predates our own channel change: not reported.
         a.own.iter_mut().find(|o| o.bssid == "78:45:58:3c:52:be").unwrap().changed_at = 20_000;
         assert!(kinds(&a).is_empty());
@@ -684,7 +759,7 @@ mod tests {
         assert!(lookalike("Hide", "Home").is_none());
         let mut a = site();
         a.heard.push(heard("02:aa:bb:cc:dd:ee", UP, "H0me", 36, "Open", -70));
-        assert_eq!(kinds(&a), vec![("lookalike", "medium", "02:aa:bb:cc:dd:ee".into())]);
+        assert_eq!(kinds(&a), vec![("lookalike", Severity::Medium, "02:aa:bb:cc:dd:ee".into())]);
     }
 
     #[test]
@@ -703,7 +778,7 @@ mod tests {
         n.first_seen = a.now - 3600;
         n.last_seen = a.now;
         a.heard.push(n.clone());
-        assert_eq!(kinds(&a), vec![("new_nearby", "low", "02:00:00:00:00:01".into())]);
+        assert_eq!(kinds(&a), vec![("new_nearby", Severity::Low, "02:00:00:00:00:01".into())]);
         // Weak ones are not interesting.
         a.heard.last_mut().unwrap().best_signal = Some(-80);
         assert!(kinds(&a).is_empty());
