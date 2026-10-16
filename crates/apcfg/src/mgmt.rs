@@ -23,13 +23,19 @@ fn host_port(url: &str) -> Option<(String, Option<u16>)> {
     })
 }
 
+/// The host of a pending migration: `migrate_inform_url`, when that is a URL with a
+/// host (not null or empty).
+fn migration_host(ctx: &Ctx) -> Option<String> {
+    str_of(ctx.device, "migrate_inform_url").and_then(host_port).map(|(h, _)| h)
+}
+
 /// The host the AP should use for the controller, first match wins: a pending
 /// migration URL, the "override inform host" hostname, the host of the device's stored
 /// inform URL, the controller's own inform URL.
 fn inform_host(ctx: &Ctx) -> String {
     let override_host = flag(ctx.super_mgmt, "override_inform_host", false)
         .then(|| str_of(ctx.setting("super_identity"), "hostname").unwrap_or("example-domain.ui.com"));
-    [str_of(ctx.device, "migrate_inform_url").and_then(host_port).map(|(h, _)| h), override_host.map(str::to_string)]
+    [migration_host(ctx), override_host.map(str::to_string)]
         .into_iter()
         .flatten()
         .chain(str_of(ctx.device, "inform_url").and_then(host_port).map(|(h, _)| h))
@@ -69,7 +75,7 @@ pub fn render(ctx: &Ctx) -> String {
     {
         out.set("authkey", key);
     }
-    if flag(ctx.super_mgmt, "override_inform_host", false) || ctx.device.get("migrate_inform_url").is_some() {
+    if flag(ctx.super_mgmt, "override_inform_host", false) || migration_host(ctx).is_some() {
         out.set("inform_url", format_args!("http://{host}:{inform_port}/inform"));
     }
     out.set("use_aes_gcm", "true");
@@ -79,7 +85,32 @@ pub fn render(ctx: &Ctx) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::host_port;
+    use super::*;
+    use crate::{Controller, Input};
+    use serde_json::{Value, json};
+
+    fn inform_url_line(migrate: Value) -> Option<String> {
+        let mac = "02:00:00:00:00:01";
+        let state = json!({ "sites": [{ "_id": "s" }], "devices": [{ "mac": mac, "site_id": "s", "type": "uap", "migrate_inform_url": migrate }] });
+        let controller = Controller {
+            inform_url: "http://unifi.example.net:8080/inform".into(),
+            mgmt_url: String::new(),
+            stun_url: String::new(),
+            syslog_ip: None,
+            version: String::new(),
+            reporter_uuid: String::new(),
+        };
+        let ctx = Ctx::new(&Input { state: &state, device_mac: mac, inform: None, cfgversion: "1", controller: &controller }).unwrap();
+        render(&ctx).lines().find_map(|l| l.strip_prefix("inform_url=")).map(str::to_string)
+    }
+
+    #[test]
+    fn inform_url_is_sent_only_for_a_real_migration() {
+        assert_eq!(inform_url_line(json!("http://new.example.net:8080/inform")).as_deref(), Some("http://new.example.net:8080/inform"));
+        for none in [json!(null), json!(""), json!("http:///inform"), json!(3)] {
+            assert_eq!(inform_url_line(none.clone()), None, "{none}");
+        }
+    }
 
     #[test]
     fn splits_urls() {
