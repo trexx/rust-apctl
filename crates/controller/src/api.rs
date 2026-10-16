@@ -137,17 +137,21 @@ impl IntoResponse for ApiError {
     }
 }
 
+/// An unexpected failure: the details (paths, SQL) go to the log, not to the browser.
 impl From<anyhow::Error> for ApiError {
     fn from(e: anyhow::Error) -> Self {
-        ApiError(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}"))
+        tracing::error!("request failed: {e:#}");
+        ApiError::internal(INTERNAL)
     }
 }
 
 impl From<std::io::Error> for ApiError {
     fn from(e: std::io::Error) -> Self {
-        ApiError::internal(e.to_string())
+        ApiError::from(anyhow::Error::from(e))
     }
 }
+
+const INTERNAL: &str = "internal error (the details are in apctl's log)";
 
 /// A blocking task that panicked or was cancelled.
 impl From<tokio::task::JoinError> for ApiError {

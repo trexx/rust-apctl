@@ -851,9 +851,7 @@ pub async fn create_now(State(s): State<AppState>, headers: HeaderMap, Json(body
     }
     let b = s.backups.clone();
     let dir = b.data_dir.clone();
-    let meta = tokio::task::spawn_blocking(move || create(&b, &dir, Kind::Manual, body.days))
-        .await?
-        .map_err(|e| ApiError::internal(format!("{e:#}")))?;
+    let meta = tokio::task::spawn_blocking(move || create(&b, &dir, Kind::Manual, body.days)).await??;
     Ok(Json(json!(meta)))
 }
 
@@ -952,8 +950,21 @@ pub async fn upload(State(s): State<AppState>, headers: HeaderMap, body: Body) -
         r
     })
     .await?
-    .map_err(|e| ApiError(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
+    .map_err(refused)?;
     Ok(Json(json!({ "staged": res.0, "manifest": res.1 })))
+}
+
+/// Why a backup could not be staged or restored. Most reasons are the
+/// backup's (damaged, wrong key, too new: 400, with the reason), a missing one
+/// is 404, and apctl's own trouble (a full disk, permissions) is a 500.
+fn refused(e: anyhow::Error) -> ApiError {
+    use io::ErrorKind::*;
+    let kind = e.chain().find_map(|c| c.downcast_ref::<io::Error>()).map(io::Error::kind);
+    match kind {
+        Some(NotFound) => ApiError(StatusCode::NOT_FOUND, format!("{e:#}")),
+        Some(StorageFull | QuotaExceeded | PermissionDenied | ReadOnlyFilesystem | OutOfMemory) => ApiError::from(e),
+        _ => ApiError(StatusCode::BAD_REQUEST, format!("{e:#}")),
+    }
 }
 
 /// A file deleted when dropped, so an upload cut off half way leaves nothing behind.
@@ -971,7 +982,13 @@ pub async fn restore(State(s): State<AppState>, headers: HeaderMap, Json(body): 
     let b = s.backups.clone();
     let (id, m) = tokio::task::spawn_blocking(move || -> Result<(String, Manifest)> {
         let (id, m) = match (body.name, body.staged) {
-            (Some(name), _) if valid_name(&name) => stage(&b, &b.dir().join(&name))?,
+            (Some(name), _) if valid_name(&name) => {
+                let path = b.dir().join(&name);
+                if !path.exists() {
+                    return Err(io::Error::new(io::ErrorKind::NotFound, "no such backup").into());
+                }
+                stage(&b, &path)?
+            }
             (_, Some(id)) if valid_id(&id) => {
                 let m: Manifest = serde_json::from_slice(&fs::read(b.staging().join(&id).join("manifest.json")).context("that upload has expired")?)?;
                 (id, m)
@@ -988,7 +1005,7 @@ pub async fn restore(State(s): State<AppState>, headers: HeaderMap, Json(body): 
         Ok((id, m))
     })
     .await?
-    .map_err(|e| ApiError(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
+    .map_err(refused)?;
     tracing::warn!("restore of backup from {} staged as {id}; restarting", m.created);
     // Answer first, then exit, and the restore is applied on the next start. The
     // exit status is 75 (EX_TEMPFAIL), a failure, so that a restart policy of
@@ -1244,6 +1261,17 @@ mod tests {
         clean_staging(&b);
         let left: Vec<String> = fs::read_dir(b.staging()).unwrap().flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect();
         assert!(left.contains(&"r2".to_string()) && left.contains(&"pending".to_string()) && left.len() == 2, "{left:?}");
+    }
+
+    #[test]
+    fn a_bad_backup_is_the_requests_fault_a_full_disk_is_not() {
+        let status = |e: anyhow::Error| refused(e).0;
+        assert_eq!(status(anyhow!("the backup is damaged")), StatusCode::BAD_REQUEST);
+        assert_eq!(status(anyhow::Error::from(io::Error::from(io::ErrorKind::InvalidData)).context("reading")), StatusCode::BAD_REQUEST);
+        assert_eq!(status(io::Error::new(io::ErrorKind::NotFound, "no such backup").into()), StatusCode::NOT_FOUND);
+        let full = refused(anyhow::Error::from(io::Error::from(io::ErrorKind::StorageFull)).context("writing /data/restore/r1/config.db"));
+        assert_eq!(full.0, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(!full.1.contains("/data"), "paths stay in the log: {}", full.1);
     }
 
     #[test]
