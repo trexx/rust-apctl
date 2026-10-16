@@ -194,8 +194,14 @@ impl Sanitizer {
     }
 
     /// Fails if any original value we replaced still appears in `text`.
+    #[cfg(test)]
     pub fn check_clean(&self, text: &str, what: &str) -> Result<()> {
-        let lower = text.to_ascii_lowercase();
+        self.leak_check().check(text, what)
+    }
+
+    /// The replaced values to look for, prepared once for checking many texts.
+    pub fn leak_check(&self) -> LeakCheck {
+        let mut originals = Vec::new();
         for (kind, map) in &self.maps {
             for original in map.keys() {
                 // Names and SSIDs under 4 characters ("tv", "Mac") collide with
@@ -204,12 +210,31 @@ impl Sanitizer {
                     continue;
                 }
                 let original = original.to_ascii_lowercase();
-                let found = if *kind == "secret" { contains_value(&lower, &original) } else { contains_word(&lower, &original) };
                 // MACs also appear without colons (serial numbers, file names).
-                let found = found || (*kind == "mac" && lower.contains(&original.replace(':', "")));
-                if found {
-                    bail!("{what}: a {kind} value ({} chars) survived sanitising", original.len());
-                }
+                let bare = (*kind == "mac").then(|| original.replace(':', ""));
+                originals.push((*kind, original, bare));
+            }
+        }
+        LeakCheck { originals }
+    }
+}
+
+/// The original values a sanitiser replaced, lowercased.
+pub struct LeakCheck {
+    originals: Vec<(&'static str, String, Option<String>)>,
+}
+
+impl LeakCheck {
+    /// Fails if any of the originals still appears in `text`.
+    pub fn check(&self, text: &str, what: &str) -> Result<()> {
+        let lower = text.to_ascii_lowercase();
+        for (kind, original, bare) in &self.originals {
+            let found = match *kind {
+                "secret" => contains_value(&lower, original),
+                _ => contains_word(&lower, original),
+            };
+            if found || bare.as_ref().is_some_and(|b| lower.contains(b.as_str())) {
+                bail!("{what}: a {kind} value ({} chars) survived sanitising", original.len());
             }
         }
         Ok(())
@@ -320,10 +345,11 @@ pub fn run(input: &Path, output: &Path, files: &[String], domains: Vec<String>, 
     }
     // Check everything against the final maps, so values first seen in a later
     // file are also caught in earlier ones.
+    let leaks = s.leak_check();
     for (path, text) in &written {
-        s.check_clean(text, &path.display().to_string())?;
+        leaks.check(text, &path.display().to_string())?;
         let name = path.file_name().unwrap_or_default().to_string_lossy();
-        s.check_clean(&name, &format!("file name {name}"))?;
+        leaks.check(&name, &format!("file name {name}"))?;
     }
     for (path, text) in written {
         std::fs::write(&path, text).with_context(|| format!("writing {}", path.display()))?;
