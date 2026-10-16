@@ -4,7 +4,8 @@
 //! (tolerating duplicates, which `tcpdump -i any` produces, and reordering),
 //! then HTTP/1.1 requests and responses are cut out of each byte stream.
 
-use std::collections::HashMap;
+use std::collections::btree_map::Entry;
+use std::collections::{BTreeMap, HashMap};
 use std::io::Read;
 use std::net::{IpAddr, SocketAddr};
 
@@ -236,8 +237,12 @@ impl Tracker {
 #[derive(Default)]
 struct HalfStream {
     next_seq: Option<u32>,
-    /// Segments that arrived ahead of `next_seq`, and their total size.
-    pending: Vec<(u32, Vec<u8>)>,
+    /// Where `next_seq` lies in the stream, counted in bytes from where tracking
+    /// started: unlike sequence numbers it does not wrap, so it can order `pending`.
+    pos: i64,
+    /// Segments that arrived ahead of `next_seq`, by stream position (one per
+    /// position: a duplicate is kept once), and their total size.
+    pending: BTreeMap<i64, Vec<u8>>,
     pending_bytes: usize,
     /// Since when the stream has been waiting for the bytes before `pending`.
     gap_since: Option<Micros>,
@@ -260,25 +265,30 @@ const MAX_BUFFER: usize = 8 << 20;
 impl HalfStream {
     fn segment(&mut self, ts: Micros, seq: u32, syn: bool, payload: &[u8]) {
         if syn {
-            self.next_seq = Some(seq.wrapping_add(1));
-            self.pending.clear();
-            self.pending_bytes = 0;
-            self.gap_since = None;
-            self.buf.clear();
-            self.fin = false;
+            *self = HalfStream { next_seq: Some(seq.wrapping_add(1)), ..HalfStream::default() };
             return;
         }
         if payload.is_empty() {
             return;
         }
         let next = *self.next_seq.get_or_insert(seq);
-        let offset = seq.wrapping_sub(next) as i32;
-        if offset > 0 {
-            self.pending_bytes += payload.len();
-            self.pending.push((seq, payload.to_vec()));
+        let at = self.pos + i64::from(seq.wrapping_sub(next) as i32);
+        if at > self.pos {
+            match self.pending.entry(at) {
+                Entry::Vacant(e) => {
+                    self.pending_bytes += payload.len();
+                    e.insert(payload.to_vec());
+                }
+                // A copy (`-i any` captures each segment twice), or a resend that carries more.
+                Entry::Occupied(mut e) if e.get().len() < payload.len() => {
+                    self.pending_bytes += payload.len() - e.get().len();
+                    e.insert(payload.to_vec());
+                }
+                Entry::Occupied(_) => {}
+            }
             self.gap_since.get_or_insert(ts);
         } else {
-            self.append(seq, payload);
+            self.append(at, payload);
             self.apply_pending(ts);
         }
         while self.pending.len() > MAX_PENDING
@@ -292,12 +302,12 @@ impl HalfStream {
     /// Applies the queued segments that are now contiguous.
     fn apply_pending(&mut self, ts: Micros) {
         let mut progress = false;
-        loop {
-            let next = self.next_seq.unwrap();
-            let Some(i) = self.pending.iter().position(|(s, _)| s.wrapping_sub(next) as i32 <= 0) else { break };
-            let (s, p) = self.pending.swap_remove(i);
+        while let Some(e) = self.pending.first_entry()
+            && *e.key() <= self.pos
+        {
+            let (at, p) = e.remove_entry();
             self.pending_bytes -= p.len();
-            self.append(s, &p);
+            self.append(at, &p);
             progress = true;
         }
         if self.pending.is_empty() {
@@ -311,13 +321,13 @@ impl HalfStream {
     /// The message they belonged to is lost, so the partial one in `buf` goes too;
     /// `take_http` then resynchronises on the next message start.
     fn skip_gap(&mut self, ts: Micros) {
-        let next = self.next_seq.unwrap_or(0);
-        let Some(&(lowest, _)) = self.pending.iter().min_by_key(|(s, _)| s.wrapping_sub(next)) else {
+        let Some(&lowest) = self.pending.keys().next() else {
             self.gap_since = None;
             return;
         };
         self.buf.clear();
-        self.next_seq = Some(lowest);
+        self.next_seq = self.next_seq.map(|next| next.wrapping_add((lowest - self.pos) as u32));
+        self.pos = lowest;
         self.apply_pending(ts);
     }
 
@@ -329,15 +339,15 @@ impl HalfStream {
     /// Frees the buffers but keeps `next_seq`.
     fn release(&mut self) {
         self.buf = Vec::new();
-        self.pending = Vec::new();
+        self.pending = BTreeMap::new();
         self.pending_bytes = 0;
         self.gap_since = None;
     }
 
-    /// Appends the part of a segment that lies at or beyond `next_seq` (skips retransmitted bytes).
-    fn append(&mut self, seq: u32, payload: &[u8]) {
-        let next = self.next_seq.unwrap();
-        let skip = next.wrapping_sub(seq) as usize;
+    /// Appends the part of a segment starting at stream position `at` (at or before
+    /// `pos`) that lies beyond `pos`: retransmitted bytes are skipped.
+    fn append(&mut self, at: i64, payload: &[u8]) {
+        let skip = (self.pos - at) as usize;
         if skip >= payload.len() {
             return;
         }
@@ -346,7 +356,8 @@ impl HalfStream {
             self.buf.clear();
         }
         self.buf.extend_from_slice(fresh);
-        self.next_seq = Some(next.wrapping_add(fresh.len() as u32));
+        self.pos += fresh.len() as i64;
+        self.next_seq = self.next_seq.map(|next| next.wrapping_add(fresh.len() as u32));
     }
 
     fn take_http(&mut self, request: bool) -> Option<Parsed> {
@@ -529,6 +540,15 @@ mod tests {
         h.fin = true;
         h.segment(0, 9000, true, b"");
         assert!(!h.closed() && h.buf.is_empty());
+        // Sequence numbers that wrap around, out of order.
+        let mut h = HalfStream::default();
+        h.segment(0, u32::MAX - 4, true, b"");
+        h.segment(0, 2, false, b"cd");
+        h.segment(0, 1, false, b"b");
+        h.segment(0, u32::MAX - 3, false, b"aaaa");
+        assert_eq!(h.buf, b"aaaa");
+        h.segment(0, 0, false, b"_");
+        assert_eq!((&h.buf[..], h.pending.len(), h.next_seq), (&b"aaaa_bcd"[..], 0, Some(4)));
     }
 
     #[test]
@@ -544,7 +564,7 @@ mod tests {
         assert!(h.take_http(true).is_none());
         // Still waiting while a retransmission may come ...
         h.segment(5_000_000, at, false, &second);
-        assert_eq!(h.pending_bytes, 2 * second.len());
+        assert_eq!(h.pending_bytes, second.len(), "the copy is queued once");
         // ... then gives up on it and carries on with the second message.
         h.segment(12_000_000, at, false, &second);
         assert!(matches!(h.take_http(true), Some(Parsed::Request { body, .. }) if body == b"next"));
