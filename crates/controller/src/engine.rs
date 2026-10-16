@@ -50,8 +50,6 @@ pub enum Input {
     /// A suspicious network found for the first time: record it, and report it
     /// as an event unless it was already acknowledged.
     ThreatFound { ts: Ts, kind: crate::threats::Kind, bssid: String, device_mac: Option<Mac>, data: Value, notify: bool },
-    /// Mark every alert read.
-    AlertsRead,
     /// Record an event raised elsewhere (e.g. active mode sending an upgrade, a
     /// client blocked from the UI, a channel plan applied).
     Note(Event),
@@ -572,7 +570,6 @@ impl Engine {
                     self.emit(ev(ts, EventKind::NetworkThreat, device_mac, None, data));
                 }
             }
-            Input::AlertsRead => self.writer.exec(Db::Config, "UPDATE alerts SET read = 1 WHERE read = 0", vec![]),
             Input::Note(e) => self.emit(e),
             Input::Forget { ts, mac } => self.forget(ts, mac),
             Input::EditState { ts, edit, done } => {

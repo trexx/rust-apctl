@@ -735,7 +735,8 @@ pub async fn list(State(s): State<AppState>, Query(q): Query<ListQuery>) -> Resu
 
 /// POST /api/alerts/read: marks every alert read.
 pub async fn mark_read(State(s): State<AppState>) -> Result<Json<Value>, ApiError> {
-    s.send(crate::engine::Input::AlertsRead).await?;
+    // Straight to the database: the engine's queue is for what changes its state.
+    s.writer.exec(Db::Config, "UPDATE alerts SET read = 1 WHERE read = 0", vec![]);
     Ok(Json(json!({ "ok": true })))
 }
 
