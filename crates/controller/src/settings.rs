@@ -422,10 +422,16 @@ fn channels(state: &Value, band: &str, o: bool) -> Value {
 
 // ---- Validation helpers ---------------------------------------------------
 
-fn new_id() -> String {
-    let mut b = [0u8; 12];
+/// `bytes` random bytes, in hex.
+pub(crate) fn random_hex(bytes: usize) -> String {
+    let mut b = vec![0u8; bytes];
     getrandom::fill(&mut b).expect("system random source");
     hex::encode(b)
+}
+
+/// A new settings document's id.
+fn new_id() -> String {
+    random_hex(12)
 }
 
 pub(crate) fn is_mac(s: &str) -> bool {

@@ -28,6 +28,7 @@ use wire::keys::KeyStore;
 use crate::api::{ApiError, AppState};
 use crate::engine::{Input, Live};
 use crate::model::Ts;
+use crate::settings::random_hex;
 use crate::store;
 
 /// How long an AP has to come back with its new key.
@@ -128,12 +129,6 @@ pub fn note_pending(live: &mut Live, payload: &Value, known: bool, now: Ts) -> b
 pub fn expire(live: &mut Live, now: Ts) {
     live.adoption.pending.retain(|_, p| now - p.last_seen < 600);
     live.adoption.adopting.retain(|_, t| now - *t < ADOPT_TIMEOUT);
-}
-
-fn random_hex(bytes: usize) -> String {
-    let mut b = vec![0u8; bytes];
-    getrandom::fill(&mut b).expect("system random source");
-    hex::encode(b)
 }
 
 /// The radio settings of a new AP, from the radios its inform lists: auto

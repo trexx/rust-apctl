@@ -28,7 +28,7 @@ use axum::body::Body;
 use axum::extract::{Path as UrlPath, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
-use rusqlite::{Connection, OpenFlags};
+use rusqlite::{Connection, OpenFlags, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -296,11 +296,12 @@ impl Write for Hashing {
     }
 }
 
-/// Eight random hex characters, to keep names unique.
-fn random_hex() -> Result<String> {
-    let mut b = [0u8; 4];
-    getrandom::fill(&mut b).map_err(|e| anyhow!("random: {e}"))?;
-    Ok(hex::encode(b))
+/// A snapshot copy, opened to be trimmed: it is thrown away if anything goes
+/// wrong, so it needs no journal and no syncing.
+fn scratch(p: &Path) -> Result<Connection> {
+    let c = Connection::open(p)?;
+    c.execute_batch("PRAGMA journal_mode=OFF; PRAGMA synchronous=OFF; PRAGMA temp_store=MEMORY;")?;
+    Ok(c)
 }
 
 /// A consistent copy of a live database.
@@ -316,14 +317,17 @@ fn snapshot(src: &Path, dst: &Path) -> Result<()> {
 /// have a name (alias) are kept whatever their age, as are settings, keys,
 /// device configs and acknowledgements; login sessions never travel.
 fn trim(dir: &Path, cutoff: Option<Ts>) -> Result<()> {
-    let c = Connection::open(dir.join("config.db"))?;
-    c.execute_batch("PRAGMA temp_store=MEMORY; DELETE FROM sessions;")?;
+    let mut c = scratch(&dir.join("config.db"))?;
+    // The deletes in one transaction, then one rewrite to drop the pages they freed.
+    let tx = c.transaction()?;
+    tx.execute_batch("DELETE FROM sessions;")?;
     if let Some(t) = cutoff {
         for (table, col) in [("events", "ts"), ("connections", "ts"), ("alerts", "ts"), ("neighbors", "last_seen"), ("spectrum", "ts"), ("dryrun_results", "ts")] {
-            c.execute(&format!("DELETE FROM {table} WHERE {col} < ?1"), [t])?;
+            tx.execute(&format!("DELETE FROM {table} WHERE {col} < ?1"), [t])?;
         }
-        c.execute("DELETE FROM clients WHERE COALESCE(last_seen, 0) < ?1 AND mac NOT IN (SELECT mac FROM client_aliases)", [t])?;
+        tx.execute("DELETE FROM clients WHERE COALESCE(last_seen, 0) < ?1 AND mac NOT IN (SELECT mac FROM client_aliases)", [t])?;
     }
+    tx.commit()?;
     c.execute_batch("VACUUM;")?;
     drop(c);
     if let Some(t) = cutoff {
@@ -334,15 +338,16 @@ fn trim(dir: &Path, cutoff: Option<Ts>) -> Result<()> {
             if !p.exists() {
                 continue;
             }
-            let c = Connection::open(&p)?;
-            c.execute_batch("PRAGMA temp_store=MEMORY;")?;
+            let mut c = scratch(&p)?;
+            let tx = c.transaction()?;
             for table in tables {
                 // A database from an older version may lack the newest tables.
-                let exists: bool = c.query_row("SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1", [&table], |r| r.get::<_, i64>(0))? > 0;
+                let exists: bool = tx.query_row("SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1", [&table], |r| r.get::<_, i64>(0))? > 0;
                 if exists {
-                    c.execute(&format!("DELETE FROM \"{table}\" WHERE ts < ?1"), [t])?;
+                    tx.execute(&format!("DELETE FROM \"{table}\" WHERE ts < ?1"), [t])?;
                 }
             }
+            tx.commit()?;
             c.execute_batch("VACUUM;")?;
         }
     }
@@ -366,7 +371,7 @@ pub fn create(b: &Backups, src_dir: &Path, kind: Kind, days: i64) -> Result<Meta
     let now = store::now_ts();
     let dir = b.dir();
     fs::create_dir_all(&dir)?;
-    let tmp = dir.join(format!(".tmp-{now}-{}-{}", std::process::id(), random_hex()?));
+    let tmp = dir.join(format!(".tmp-{now}-{}-{}", std::process::id(), crate::settings::random_hex(4)));
     fs::create_dir(&tmp)?;
     // A name no other backup has: the time to the second, then a counter.
     let base = format!("{}{VERSION}-{}", kind.prefix(), stamp(now));
@@ -678,15 +683,17 @@ impl Settings {
     }
 }
 
+/// The backup settings; the defaults when none are stored, or (with a
+/// warning) when they cannot be read.
 fn load_settings(store: &store::Store) -> Settings {
-    store
-        .read(Db::Config, |c| {
-            let s: Option<String> = c.query_row("SELECT json FROM backup_settings WHERE id = 1", [], |r| r.get(0)).ok();
-            Ok(s.and_then(|s| serde_json::from_str(&s).ok()))
-        })
-        .ok()
-        .flatten()
-        .unwrap_or_default()
+    let stored = store.read(Db::Config, |c| Ok(c.query_row("SELECT json FROM backup_settings WHERE id = 1", [], |r| r.get::<_, String>(0)).optional()?));
+    match stored.and_then(|s| s.map(|s| serde_json::from_str::<Settings>(&s)).transpose().map_err(Into::into)) {
+        Ok(s) => s.unwrap_or_default(),
+        Err(e) => {
+            tracing::warn!("the backup settings could not be read, the defaults apply: {e:#}");
+            Settings::default()
+        }
+    }
 }
 
 /// Backups in the directory, newest first.
@@ -889,7 +896,7 @@ pub async fn upload(State(s): State<AppState>, headers: HeaderMap, body: Body) -
     crate::api::check_csrf(&headers)?;
     let b = s.backups.clone();
     tokio::fs::create_dir_all(b.staging()).await?;
-    let name = format!("upload-{}-{}.apb", store::now_ts(), random_hex().map_err(ApiError::from)?);
+    let name = format!("upload-{}-{}.apb", store::now_ts(), crate::settings::random_hex(4));
     let tmp = TempFile(b.staging().join(name));
     let mut file = tokio::fs::File::create_new(&tmp.0).await?;
     let mut stream = body.into_data_stream();
@@ -952,8 +959,15 @@ pub async fn restore(State(s): State<AppState>, headers: HeaderMap, Json(body): 
     // Answer first, then exit, and the restore is applied on the next start. The
     // exit status is 75 (EX_TEMPFAIL), a failure, so that a restart policy of
     // on-failure restarts apctl as well as one of always.
-    tokio::spawn(async {
+    let writer = s.writer.clone();
+    tokio::spawn(async move {
         tokio::time::sleep(Duration::from_millis(800)).await;
+        // What is queued is committed first: the copy saved before the restore,
+        // and the data kept if the restore fails, have it.
+        let flushed = tokio::task::spawn_blocking(move || writer.flush(Duration::from_secs(5))).await.unwrap_or(false);
+        if !flushed {
+            tracing::warn!("not all queued writes could be stored before the restart");
+        }
         std::process::exit(75);
     });
     Ok(Json(json!({ "ok": true, "restarting": true, "manifest": m })))
