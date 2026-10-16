@@ -48,14 +48,14 @@ fn is_local(url: &str) -> bool {
     host.eq_ignore_ascii_case("localhost") || host.parse::<IpAddr>().is_ok_and(|ip| ip.is_loopback())
 }
 
-pub fn run(pcap: &str, keys: &KeyStore, url: &str, limit: usize, every: f64) -> Result<()> {
+pub fn run(pcap: &str, ports: &[u16], keys: &KeyStore, url: &str, limit: usize, every: f64) -> Result<()> {
     if !is_local(url) {
         bail!("refusing to simulate APs against {url}: only local controllers (http:// to 127.0.0.1, ::1 or localhost)");
     }
     // Collect the informs first, in capture order.
     let mut informs: Vec<Value> = Vec::new();
     let mut pairer = Pairer::default();
-    capture::run(capture::open_input(pcap)?, &[8080], |ev| {
+    capture::run(capture::open_input(pcap)?, ports, |ev| {
         if let Some(InformEvent::Inform { decoded: Ok(d), .. }) = pairer.handle(keys, ev) {
             informs.push(d.payload);
         }

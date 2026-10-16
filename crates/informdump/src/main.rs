@@ -97,6 +97,9 @@ enum Cmd {
         /// Seconds to wait between informs (0: as fast as the controller answers).
         #[arg(long, default_value = "0")]
         every: f64,
+        /// Server ports carrying inform traffic in the capture.
+        #[arg(long = "port", default_value = "8080")]
+        ports: Vec<u16>,
     },
     /// Write a made-up site's capture (three APs, their clients, syslog) as pcap to
     /// stdout, for demos and screenshots: `apctl serve --keys <demo-state output>
@@ -227,7 +230,7 @@ fn main() -> Result<()> {
             println!("{}", serde_json::to_string_pretty(&demo::state()?)?);
             Ok(())
         }
-        Cmd::Simulate { pcap, keys, url, limit, every } => simulate::run(&pcap, &load_keys(Some(&keys))?, &url, limit, every),
+        Cmd::Simulate { pcap, keys, url, limit, every, ports } => simulate::run(&pcap, &ports, &load_keys(Some(&keys))?, &url, limit, every),
         Cmd::Sanitize { input, output, domains, devices, files } => {
             sanitize::run(&input, &output, &files, domains, &devices)
         }
