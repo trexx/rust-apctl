@@ -791,7 +791,17 @@ impl Engine {
         live.last_config.remove(&mac);
         live.adoption.forgetting.remove(&mac);
         live.adoption.adopting.remove(&mac);
-        for sql in ["DELETE FROM devices WHERE mac = ?1", "DELETE FROM managed_devices WHERE mac = ?1", "DELETE FROM device_config WHERE mac = ?1"] {
+        drop(live);
+        self.radios.retain(|(m, _), _| *m != mac);
+        self.isolated.remove(&mac);
+        for sql in [
+            "DELETE FROM devices WHERE mac = ?1",
+            "DELETE FROM managed_devices WHERE mac = ?1",
+            "DELETE FROM device_config WHERE mac = ?1",
+            // What it heard: other APs' neighbours and scans are kept.
+            "DELETE FROM neighbors WHERE ap_mac = ?1",
+            "DELETE FROM spectrum WHERE ap_mac = ?1",
+        ] {
             self.writer.exec(Db::Config, sql, vec![Sql::Text(mac.to_string())]);
         }
     }
