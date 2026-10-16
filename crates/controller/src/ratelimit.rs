@@ -70,11 +70,12 @@ impl Groups {
             return None;
         }
         let ssid_group = self.ssid.get(essid).and_then(Option::as_deref).or(self.default.as_deref());
-        match own {
-            Some(g) if Some(g) != ssid_group => self.limits.get(g).copied(),
+        // A group missing from the settings (as after an import) counts as none.
+        match own.filter(|g| Some(*g) != ssid_group).and_then(|g| self.limits.get(g)) {
+            Some(limit) => Some(*limit),
             // Back to the SSID's limit, but only to undo an earlier command.
-            _ if before => Some(ssid_group.and_then(|g| self.limits.get(g).copied()).unwrap_or((-1, -1))),
-            _ => None,
+            None if before => Some(ssid_group.and_then(|g| self.limits.get(g).copied()).unwrap_or((-1, -1))),
+            None => None,
         }
     }
 }
@@ -203,6 +204,26 @@ mod tests {
         let cmds = sent_to(&mut live, AP1);
         assert_eq!((cmds.len(), cmds[0]["dl_max"].as_i64()), (1, Some(-1)));
         tick(&mut live, &mut sent);
+        assert!(sent_to(&mut live, AP1).is_empty());
+    }
+
+    #[test]
+    fn a_client_whose_group_is_gone_gets_the_ssids_limit_back() {
+        let mut live = live(Some("slow"));
+        let mut sent = Limits::default();
+        tick(&mut live, &mut sent);
+        sent_to(&mut live, AP1);
+        let mut state = (**live.state.as_ref().unwrap()).clone();
+        state["clients"][0]["usergroup_id"] = json!("imported-elsewhere");
+        live.state = Some(std::sync::Arc::new(state));
+        tick(&mut live, &mut sent);
+        let cmds = sent_to(&mut live, AP1);
+        assert_eq!((cmds.len(), cmds[0]["dl_max"].as_i64()), (1, Some(-1)));
+        tick(&mut live, &mut sent);
+        assert!(sent_to(&mut live, AP1).is_empty());
+        // Never limited: nothing to undo.
+        let mut live = self::live(Some("imported-elsewhere"));
+        tick(&mut live, &mut Limits::default());
         assert!(sent_to(&mut live, AP1).is_empty());
     }
 
