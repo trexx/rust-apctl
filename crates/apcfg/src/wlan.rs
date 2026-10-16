@@ -1,6 +1,8 @@
 //! Radios and WLANs: which WLAN goes on which radio, and the `radio.R.*`, `aaa.N.*`
 //! and `wireless.N.*` blocks.
 
+use std::borrow::Cow;
+
 use serde_json::Value;
 
 use crate::cfg::{Cfg, Prefix};
@@ -30,17 +32,18 @@ pub struct Radio<'a> {
 }
 
 /// One WLAN deployed on one radio.
-pub struct Vap {
+pub struct Vap<'a> {
     /// [`wlan_id`] of the WLAN: the same for its VAPs on every radio.
     pub id: String,
-    /// The WLAN document after per-radio adjustments (e.g. WPA3 turned off).
-    pub w: Value,
+    /// The WLAN document after per-radio adjustments (e.g. WPA3 turned off); a copy
+    /// only when something was adjusted.
+    pub w: Cow<'a, Value>,
     /// Index into the radio list.
     pub radio: usize,
     pub slot: WifiSlot,
 }
 
-impl Vap {
+impl Vap<'_> {
     pub fn dev(&self) -> &str {
         &self.slot.device_name
     }
@@ -87,28 +90,29 @@ pub fn ap_groups<'a>(ctx: &Ctx<'a>) -> Vec<&'a str> {
         .collect()
 }
 
-fn set(w: &mut Value, key: &str, v: impl Into<Value>) {
-    if let Some(o) = w.as_object_mut() {
+/// Sets a field of the WLAN, copying the document first if it is still the original.
+fn set(w: &mut Cow<Value>, key: &str, v: impl Into<Value>) {
+    if let Some(o) = w.to_mut().as_object_mut() {
         o.insert(key.to_string(), v.into());
     }
 }
 
 /// Per-radio security adjustments; `None` drops the WLAN from this radio.
-fn adapt(ctx: &Ctx, wlan: &Value, radio: &Radio) -> Option<Value> {
-    let mut w = wlan.clone();
+fn adapt<'a>(ctx: &Ctx, wlan: &'a Value, radio: &Radio) -> Option<Cow<'a, Value>> {
+    let mut w = Cow::Borrowed(wlan);
     let caps2 = int_of(radio.doc, "radio_caps2").unwrap_or(0) as u64;
     let rcap = |b| bit(caps2, b);
-    let security = str_of(&w, "security").unwrap_or("open").to_string();
-    let wpa3 = flag(&w, "wpa3_support", false);
-    let transition = flag(&w, "wpa3_transition", false);
-    let ppsk = flag(&w, "private_preshared_keys_enabled", false) || str_of(&w, "attr_hidden_id") == Some("UidIot");
+    let security = str_of(wlan, "security").unwrap_or("open");
+    let wpa3 = flag(wlan, "wpa3_support", false);
+    let transition = flag(wlan, "wpa3_transition", false);
+    let ppsk = flag(wlan, "private_preshared_keys_enabled", false) || str_of(wlan, "attr_hidden_id") == Some("UidIot");
     if ppsk && !bit(ctx.caps.wifi, 20) {
         return None;
     }
-    if (flag(&w, "hotspot2conf_enabled", false) || security == "osen") && !bit(ctx.caps.fw, 23) {
+    if (flag(wlan, "hotspot2conf_enabled", false) || security == "osen") && !bit(ctx.caps.fw, 23) {
         return None;
     }
-    match security.as_str() {
+    match security {
         "wpapsk" if wpa3 => {
             if !rcap(RCAP2_SAE) {
                 if !transition {
@@ -131,7 +135,7 @@ fn adapt(ctx: &Ctx, wlan: &Value, radio: &Radio) -> Option<Value> {
             }
         }
         "wpaeap" | "osen" => {
-            if flag(&w, "wpa3_enhanced_192", false) {
+            if flag(wlan, "wpa3_enhanced_192", false) {
                 if !rcap(RCAP2_WPA3_192) {
                     return None;
                 }
@@ -160,12 +164,12 @@ fn adapt(ctx: &Ctx, wlan: &Value, radio: &Radio) -> Option<Value> {
 
 /// The WLANs to deploy as `(adjusted WLAN, radio index)`, radio by radio, each radio in
 /// the site's WLAN order.
-pub fn deploy(ctx: &Ctx, radios: &[Radio]) -> Vec<(Value, usize)> {
+pub fn deploy<'a>(ctx: &Ctx<'a>, radios: &[Radio]) -> Vec<(Cow<'a, Value>, usize)> {
     if flag(ctx.device, "disabled", false) {
         return Vec::new();
     }
     let groups = ap_groups(ctx);
-    let wlans: Vec<&Value> = ctx
+    let wlans: Vec<&'a Value> = ctx
         .site_docs("wlanconf")
         .filter(|w| flag(w, "enabled", true))
         .filter(|w| str_list(w, "ap_group_ids").iter().any(|g| groups.iter().any(|m| m == g)))
@@ -405,7 +409,7 @@ fn wep_key(w: &Value) -> (String, &'static str) {
 /// `aaa.N.*` and `wireless.N.*` for one VAP. `bridge` is the bridge the VAP is a port of.
 pub fn render_vap(c: &mut Cfg, ctx: &Ctx, radios: &[Radio], vaps: &[Vap], i: usize, bridge: &str) {
     let v = &vaps[i];
-    let w = &v.w;
+    let w: &Value = &v.w;
     let r = &radios[v.radio];
     let n = v.slot.section;
     let a = Prefix::new("aaa", n as usize);
@@ -620,7 +624,7 @@ fn allows_11b(rate: i64) -> bool {
 fn render_wireless(c: &mut Cfg, ctx: &Ctx, radios: &[Radio], vaps: &[Vap], i: usize) {
     let v = &vaps[i];
     let r = &radios[v.radio];
-    let w = &v.w;
+    let w: &Value = &v.w;
     let n = v.slot.section;
     let k = Prefix::new("wireless", n as usize);
     let security = str_of(w, "security").unwrap_or("open");

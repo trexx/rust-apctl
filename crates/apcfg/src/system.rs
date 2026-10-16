@@ -589,7 +589,7 @@ fn mdns(c: &mut Cfg, ctx: &Ctx, vaps: &[Vap], net: &Net) {
     };
     let (mut f, mut p) = (0, 0);
     for wv in wlans {
-        let w = &wv.w;
+        let w: &Value = &wv.w;
         let devs: Vec<&str> = vaps.iter().filter(|v| v.id == wv.id).map(Vap::dev).collect();
         let own = str_of(w, "networkconf_id").map(str::to_string);
         let mut entries: Vec<MdnsEntry> = Vec::new();

@@ -33,7 +33,7 @@ fn bridge_name(vlan: i64) -> String {
 
 /// The VLAN a WLAN's clients are tagged with, if any.
 fn wlan_vlan(ctx: &Ctx, vap: &Vap) -> Option<i64> {
-    let w = &vap.w;
+    let w: &Value = &vap.w;
     if matches!(str_of(w, "security"), Some("wpaeap")) && dynamic_vlan(ctx, w) != 0 {
         return None;
     }
