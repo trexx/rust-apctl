@@ -26,8 +26,9 @@ pub const CLIENT_GRACE_SECS: Ts = 60;
 pub const OFFLINE_INTERVALS: Ts = 4;
 const DEFAULT_INTERVAL: Ts = 15;
 
-/// A change to the settings, applied by the engine.
-pub type StateEdit = Box<dyn FnOnce(&mut Value) -> Result<(), String> + Send>;
+/// A change to the settings, applied by the engine: it edits, then says what
+/// it changed in words (for the event and the config history).
+pub type StateEdit = Box<dyn FnOnce(&mut Value) -> Result<String, String> + Send>;
 
 pub enum Input {
     Inform { ts: Ts, peer: String, decoded: Decoded },
@@ -56,8 +57,8 @@ pub enum Input {
     /// Drop everything apctl keeps about a forgotten AP.
     Forget { mac: Mac },
     /// Change the settings (apctl's copy of the controller settings), store
-    /// them, and record the change; `done` gets the result.
-    EditState { ts: Ts, what: String, edit: StateEdit, done: tokio::sync::oneshot::Sender<Result<(), String>> },
+    /// them, and record the change; `done` gets what changed, or the refusal.
+    EditState { ts: Ts, edit: StateEdit, done: tokio::sync::oneshot::Sender<Result<String, String>> },
     /// Store the automatic-backup settings (JSON).
     SaveBackupSettings(String),
     /// Acknowledge a finding with an optional note (`Some`), or withdraw the acknowledgement (`None`).
@@ -451,8 +452,8 @@ impl Engine {
             Input::AlertsRead => self.writer.exec(Db::Config, "UPDATE alerts SET read = 1 WHERE read = 0", vec![]),
             Input::Note(e) => self.emit(e),
             Input::Forget { mac } => self.forget(mac),
-            Input::EditState { ts, what, edit, done } => {
-                let _ = done.send(self.edit_state(ts, what, edit));
+            Input::EditState { ts, edit, done } => {
+                let _ = done.send(self.edit_state(ts, edit));
             }
             Input::SaveBackupSettings(json) => {
                 self.writer.exec(Db::Config, "INSERT OR REPLACE INTO backup_settings (id, json) VALUES (1, ?1)", vec![Sql::Text(json)])
@@ -840,13 +841,13 @@ impl Engine {
     /// The engine is the only writer of the settings, so they cannot change
     /// between reading and swapping them in: the copy, the edit (which may hash
     /// a password) and the serialising run without holding the lock.
-    fn edit_state(&mut self, ts: Ts, what: String, edit: StateEdit) -> Result<(), String> {
+    fn edit_state(&mut self, ts: Ts, edit: StateEdit) -> Result<String, String> {
         let (current, imported_at) = {
             let live = self.live.read().unwrap();
             (live.state.clone(), live.state_imported_at.unwrap_or(ts))
         };
         let mut state = current.as_deref().cloned().ok_or("no settings imported yet")?;
-        edit(&mut state)?;
+        let what = edit(&mut state)?;
         self.writer.exec(
             Db::Config,
             "INSERT OR REPLACE INTO controller_state (id, json, imported_at) VALUES (1, ?1, ?2)",
@@ -857,7 +858,7 @@ impl Engine {
         self.emit(ev(ts, "settings_changed", None, None, json!({ "what": what })));
         // The APs pick the change up now rather than at their next interval.
         crate::stun::poke_all(&self.live.read().unwrap());
-        Ok(())
+        Ok(what)
     }
 
     fn forget(&mut self, mac: Mac) {
@@ -1756,12 +1757,16 @@ mod tests {
         let mut h = harness();
         let edit = |h: &mut Harness, f: StateEdit| {
             let (tx, mut rx) = tokio::sync::oneshot::channel();
-            h.engine.handle(Input::EditState { ts: 5, what: "blocked client".into(), edit: f, done: tx });
+            h.engine.handle(Input::EditState { ts: 5, edit: f, done: tx });
             rx.try_recv().unwrap()
         };
-        assert!(edit(&mut h, Box::new(|_| Ok(()))).is_err(), "nothing to edit before an import");
+        assert!(edit(&mut h, Box::new(|_| Ok("nothing".into()))).is_err(), "nothing to edit before an import");
         h.engine.handle(Input::SetState { ts: 1, state: json!({ "clients": [] }) });
-        edit(&mut h, Box::new(|s| crate::actions::edit_client(s, C1, &[("blocked", json!(true))]))).unwrap();
+        let what = edit(&mut h, Box::new(|s| {
+            crate::actions::edit_client(s, C1, &[("blocked", json!(true))]);
+            Ok("blocked client".into())
+        }));
+        assert_eq!(what.as_deref(), Ok("blocked client"), "what the edit itself reports");
         assert_eq!(h.live.read().unwrap().state.as_ref().unwrap()["clients"][0]["blocked"], true);
         assert_eq!(h.live.read().unwrap().state_imported_at, Some(1), "an edit is not an import");
         assert_eq!(edit(&mut h, Box::new(|_| Err("no".into()))), Err("no".into()));

@@ -268,9 +268,9 @@ impl Active {
                 if d["name"].is_null() {
                     d["name"] = p["hostname"].clone();
                 }
-                Ok(())
+                Ok(format!("radio settings for new AP {mac}"))
             });
-            let _ = self.engine.try_send(Input::EditState { ts, what: format!("radio settings for new AP {mac}"), edit, done: tx });
+            let _ = self.engine.try_send(Input::EditState { ts, edit, done: tx });
             return noop(interval(n_devices));
         }
         let reported = payload["cfgversion"].as_str().unwrap_or("").to_string();
@@ -650,7 +650,7 @@ mod tests {
         {
             let mut live = rig.live.write().unwrap();
             let mut state = live.state.as_deref().cloned().unwrap();
-            crate::actions::edit_client(&mut state, "aa:bb:cc:00:00:09", &[("blocked", json!(true))]).unwrap();
+            crate::actions::edit_client(&mut state, "aa:bb:cc:00:00:09", &[("blocked", json!(true))]);
             live.state = Some(Arc::new(state));
         }
         let (_, reply) = inform_as_ap(&rig, &ap_payload(&version), KEY, GCM_ZLIB).await;

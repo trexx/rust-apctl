@@ -47,7 +47,7 @@ pub fn next(live: &mut Live, mac: &Mac) -> Option<Value> {
 }
 
 /// Sets fields on a client's entry in the settings, creating it if needed.
-pub fn edit_client(state: &mut Value, mac: &str, fields: &[(&str, Value)]) -> Result<(), String> {
+pub fn edit_client(state: &mut Value, mac: &str, fields: &[(&str, Value)]) {
     let site = crate::settings::site_id(state);
     let list = crate::settings::array_mut(state, "clients");
     let entry = match list.iter().position(|c| same_mac(c, mac)) {
@@ -64,7 +64,6 @@ pub fn edit_client(state: &mut Value, mac: &str, fields: &[(&str, Value)]) -> Re
     for (k, v) in fields {
         entry[*k] = v.clone();
     }
-    Ok(())
 }
 
 fn same_mac(c: &Value, mac: &str) -> bool {
@@ -197,7 +196,11 @@ pub async fn block(State(s): State<AppState>, headers: HeaderMap, Path(mac): Pat
     let m = client.to_string();
     let blocked = b.blocked;
     let what = if blocked { format!("blocked client {m}") } else { format!("unblocked client {m}") };
-    edit_settings(&s, what, move |state| edit_client(state, &m, &[("blocked", json!(blocked))])).await?;
+    edit_settings(&s, what, move |state| {
+        edit_client(state, &m, &[("blocked", json!(blocked))]);
+        Ok(())
+    })
+    .await?;
     {
         let mut live = s.live.write().unwrap();
         let aps: Vec<Mac> = live.devices.keys().copied().collect();
@@ -235,22 +238,32 @@ pub async fn lock(State(s): State<AppState>, headers: HeaderMap, Path(mac): Path
         None => format!("unlocked client {m}"),
     };
     let fields = vec![("fixed_ap_enabled", json!(ap.is_some())), ("fixed_ap_mac", ap.clone().map_or(Value::Null, Value::String))];
-    edit_settings(&s, what, move |state| edit_client(state, &m, &fields)).await?;
+    edit_settings(&s, what, move |state| {
+        edit_client(state, &m, &fields);
+        Ok(())
+    })
+    .await?;
     Ok(Json(json!({ "locked_to": ap })))
 }
 
 /// Applies a change to the settings through the engine (which stores it and
 /// records it in the config history); the next informs push the new config.
 pub async fn edit_settings(s: &AppState, what: String, edit: impl FnOnce(&mut Value) -> Result<(), String> + Send + 'static) -> Result<(), ApiError> {
+    apply_edit(s, Box::new(move |state| edit(state).map(|()| what))).await.map(|_| ())
+}
+
+/// `edit_settings` for an edit that itself says what it changed (worked out
+/// on the settings as the engine has them); returns that.
+pub async fn apply_edit(s: &AppState, edit: crate::engine::StateEdit) -> Result<String, ApiError> {
     if s.live.read().unwrap().state.is_none() {
         return Err(ApiError(StatusCode::CONFLICT, "no settings imported yet".into()));
     }
     let (tx, rx) = tokio::sync::oneshot::channel();
     s.engine
-        .send(Input::EditState { ts: store::now_ts(), what, edit: Box::new(edit), done: tx })
+        .send(Input::EditState { ts: store::now_ts(), edit, done: tx })
         .await
         .map_err(|_| ApiError(StatusCode::SERVICE_UNAVAILABLE, "engine stopped".into()))?;
-    rx.await.map_err(|_| ApiError::internal("engine stopped"))?.map_err(|e| ApiError(StatusCode::BAD_REQUEST, e))
+    rx.await.map_err(|_| ApiError(StatusCode::SERVICE_UNAVAILABLE, "engine stopped".into()))?.map_err(|e| ApiError(StatusCode::BAD_REQUEST, e))
 }
 
 #[cfg(test)]
@@ -273,10 +286,10 @@ mod tests {
     #[test]
     fn client_settings_are_edited_or_created() {
         let mut state = json!({ "devices": [{ "mac": "02:00:00:00:00:01", "site_id": "s1" }], "clients": [{ "mac": "AA:BB:CC:00:00:01", "name": "tv" }] });
-        edit_client(&mut state, "aa:bb:cc:00:00:01", &[("blocked", json!(true))]).unwrap();
+        edit_client(&mut state, "aa:bb:cc:00:00:01", &[("blocked", json!(true))]);
         assert_eq!(state["clients"][0]["blocked"], true);
         assert_eq!(state["clients"][0]["name"], "tv", "other fields kept");
-        edit_client(&mut state, "aa:bb:cc:00:00:02", &[("fixed_ap_enabled", json!(true)), ("fixed_ap_mac", json!("02:00:00:00:00:01"))]).unwrap();
+        edit_client(&mut state, "aa:bb:cc:00:00:02", &[("fixed_ap_enabled", json!(true)), ("fixed_ap_mac", json!("02:00:00:00:00:01"))]);
         assert_eq!(state["clients"][1]["site_id"], "s1");
         assert_eq!(apcfg::blocked_sta(&state, "s1"), "aa:bb:cc:00:00:01");
 

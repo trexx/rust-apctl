@@ -32,17 +32,18 @@ pub type Apply<B> = fn(&mut Value, &B) -> Result<String, String>;
 /// returns what changed in words (for the event and the config history).
 pub(crate) async fn change<B: Send + 'static>(s: &AppState, headers: &HeaderMap, q: &PreviewQuery, apply: Apply<B>, body: B) -> Result<Json<Value>, ApiError> {
     crate::api::check_csrf(headers)?;
-    let current = s.live.read().unwrap().state.clone().ok_or_else(|| ApiError(StatusCode::CONFLICT, "no settings imported yet".into()))?;
-    let mut edited = (*current).clone();
-    let what = apply(&mut edited, &body).map_err(|e| ApiError(StatusCode::BAD_REQUEST, e))?;
     if q.preview {
+        let current = s.live.read().unwrap().state.clone().ok_or_else(|| ApiError(StatusCode::CONFLICT, "no settings imported yet".into()))?;
+        let mut edited = (*current).clone();
+        let what = apply(&mut edited, &body).map_err(|e| ApiError(StatusCode::BAD_REQUEST, e))?;
         return Ok(Json(json!({ "what": what, "aps": preview(s, current, edited).await? })));
     }
     if !s.active {
         return Err(ApiError(StatusCode::CONFLICT, "saving needs active mode: in shadow mode the settings belong to the other controller".into()));
     }
-    // Applied again inside the engine, to the settings as they are then.
-    crate::actions::edit_settings(s, what.clone(), move |state| apply(state, &body).map(|_| ())).await?;
+    // Applied once, inside the engine, to the settings as they are then; what
+    // changed is what that run says.
+    let what = crate::actions::apply_edit(s, Box::new(move |state| apply(state, &body))).await?;
     Ok(Json(json!({ "saved": true, "what": what })))
 }
 
@@ -2069,7 +2070,7 @@ pub fn apply_client_group(state: &mut Value, e: &ClientGroup) -> Result<String, 
         Some(g) => docs(state, "usergroup").find(|x| id_of(x).as_deref() == Some(g.as_str())).ok_or("unknown speed limit")?["name"].as_str().unwrap_or("?").to_string(),
         None => String::new(),
     };
-    crate::actions::edit_client(state, &mac, &[("usergroup_id", group.clone().map_or(Value::Null, Value::String))])?;
+    crate::actions::edit_client(state, &mac, &[("usergroup_id", group.clone().map_or(Value::Null, Value::String))]);
     Ok(match group {
         Some(_) => format!("client {mac}: speed limit \"{name}\""),
         None => format!("client {mac}: no own speed limit"),
