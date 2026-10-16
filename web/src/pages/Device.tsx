@@ -58,10 +58,6 @@ export function Device() {
   const { mac = "" } = useParams();
   const [range, setRange] = useTimeSpan(6 * 3600);
   const detail = useDevice(mac);
-  const names = useDeviceNames();
-  const cnames = useClientNames();
-  const events = useEvents({ device: mac, limit: 50 });
-  const logs = useLogs({ device: mac, limit: 100 });
 
   if (detail.isLoading) return <Loading />;
   if (detail.error || !detail.data)
@@ -229,40 +225,55 @@ export function Device() {
           </div>
 
           <div className="grid2">
-            <div>
-              <h2>Events</h2>
-              <div className="panel scroll">
-                <QueryState q={events}>
-                  {(data) => (
-                    <EventList
-                      events={data}
-                      names={names}
-                      clientNames={cnames}
-                      showDevice={false}
-                    />
-                  )}
-                </QueryState>
-              </div>
-            </div>
-            <div>
-              <h2>
-                Logs{" "}
-                <Link to={`/logs?device=${mac}`} className="small">
-                  all logs →
-                </Link>
-              </h2>
-              <div className="panel scroll">
-                <QueryState q={logs}>
-                  {(data) => (
-                    <LogList logs={data} names={names} showDevice={false} />
-                  )}
-                </QueryState>
-              </div>
-            </div>
+            <DeviceEvents mac={mac} />
+            <DeviceLogs mac={mac} />
           </div>
         </div>
       </SpanContext.Provider>
     </ZoomContext.Provider>
+  );
+}
+
+function DeviceEvents({ mac }: { mac: string }) {
+  const events = useEvents({ device: mac, limit: 50 });
+  const names = useDeviceNames();
+  const cnames = useClientNames();
+  return (
+    <div>
+      <h2>Events</h2>
+      <div className="panel scroll">
+        <QueryState q={events}>
+          {(data) => (
+            <EventList
+              events={data}
+              names={names}
+              clientNames={cnames}
+              showDevice={false}
+            />
+          )}
+        </QueryState>
+      </div>
+    </div>
+  );
+}
+
+function DeviceLogs({ mac }: { mac: string }) {
+  const logs = useLogs({ device: mac, limit: 100 });
+  const names = useDeviceNames();
+  return (
+    <div>
+      <h2>
+        Logs{" "}
+        <Link to={`/logs?device=${mac}`} className="small">
+          all logs →
+        </Link>
+      </h2>
+      <div className="panel scroll">
+        <QueryState q={logs}>
+          {(data) => <LogList logs={data} names={names} showDevice={false} />}
+        </QueryState>
+      </div>
+    </div>
   );
 }
 
