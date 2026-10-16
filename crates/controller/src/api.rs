@@ -449,8 +449,7 @@ async fn state_summary(State(s): State<AppState>) -> ApiResult {
 }
 
 /// Replaces the imported controller settings with an `informdump import` snapshot.
-async fn import_state(State(s): State<AppState>, headers: axum::http::HeaderMap, Json(state): Json<Value>) -> ApiResult {
-    check_csrf(&headers)?;
+async fn import_state(State(s): State<AppState>, Json(state): Json<Value>) -> ApiResult {
     crate::dryrun::validate_state(&state).map_err(|e| bad(format!("{e:#}")))?;
     let summary = crate::dryrun::summarize_state(&state);
     s.engine
@@ -569,16 +568,6 @@ async fn dryrun(State(s): State<AppState>) -> ApiResult {
     })))
 }
 
-/// Mutations must carry this header. Browsers cannot add custom headers to
-/// cross-site requests without a CORS preflight, which this server never
-/// approves, so another website cannot make a visitor's browser change data.
-pub fn check_csrf(headers: &axum::http::HeaderMap) -> Result<(), ApiError> {
-    match headers.get("x-requested-with").and_then(|v| v.to_str().ok()) {
-        Some("apctl") => Ok(()),
-        _ => Err(ApiError(StatusCode::FORBIDDEN, "missing X-Requested-With: apctl header".into())),
-    }
-}
-
 #[derive(Deserialize)]
 struct AliasBody {
     alias: Option<String>,
@@ -602,10 +591,8 @@ fn validate(alias: &Option<String>, note: &Option<String>) -> Result<(), ApiErro
 async fn set_alias(
     State(s): State<AppState>,
     Path(mac): Path<String>,
-    headers: axum::http::HeaderMap,
     Json(body): Json<AliasBody>,
 ) -> ApiResult {
-    check_csrf(&headers)?;
     let mac = parse_mac(&mac)?;
     validate(&body.alias, &body.note)?;
     let entries = vec![AliasEdit { mac, alias: body.alias, note: body.note }];
@@ -632,10 +619,8 @@ struct ImportQuery {
 async fn import_aliases(
     State(s): State<AppState>,
     Query(q): Query<ImportQuery>,
-    headers: axum::http::HeaderMap,
     Json(entries): Json<Vec<ImportEntry>>,
 ) -> ApiResult {
-    check_csrf(&headers)?;
     let mut parsed = Vec::with_capacity(entries.len());
     for e in entries {
         validate(&e.alias, &e.note)?;
@@ -1003,6 +988,29 @@ mod tests {
         assert_eq!(get(&app, "/api/status").await.status(), StatusCode::OK);
         assert_eq!(get(&app, "/api/settings/wlans/w1/passphrase").await.status(), StatusCode::FORBIDDEN);
         assert_eq!(get(&app, "/api/backups/file/apctl-0.1.0-20260101-000000.apb").await.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn changes_need_the_csrf_header() {
+        let (mut state, _engine) = state();
+        let file = state.backups.data_dir.join("users");
+        std::fs::write(&file, format!("admin:{}\n", crate::auth::hash_password("x").unwrap())).unwrap();
+        let users = crate::auth::Users::load(&file).unwrap();
+        state.auth = Arc::new(crate::auth::Auth::new(users, &state.store, state.writer.clone(), Default::default()).unwrap());
+        let cookie = format!("{}={}", crate::auth::COOKIE, state.auth.create("admin").unwrap());
+        let app = router(state);
+        let post = |csrf: bool| {
+            let mut req = Request::post("/api/alerts/read").header(header::COOKIE, &cookie);
+            if csrf {
+                req = req.header("x-requested-with", "apctl");
+            }
+            app.clone().oneshot(req.body(Body::empty()).unwrap())
+        };
+        assert_eq!(post(false).await.unwrap().status(), StatusCode::FORBIDDEN);
+        assert_eq!(post(true).await.unwrap().status(), StatusCode::OK);
+        // Reads need no header.
+        let req = Request::get("/api/status").header(header::COOKIE, &cookie).body(Body::empty()).unwrap();
+        assert_eq!(app.clone().oneshot(req).await.unwrap().status(), StatusCode::OK);
     }
 
     #[tokio::test]

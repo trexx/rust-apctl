@@ -707,8 +707,7 @@ pub async fn list(State(s): State<AppState>, Query(q): Query<ListQuery>) -> Resu
 }
 
 /// POST /api/alerts/read: marks every alert read.
-pub async fn mark_read(State(s): State<AppState>, headers: axum::http::HeaderMap) -> Result<Json<Value>, ApiError> {
-    crate::api::check_csrf(&headers)?;
+pub async fn mark_read(State(s): State<AppState>) -> Result<Json<Value>, ApiError> {
     s.engine
         .send(crate::engine::Input::AlertsRead)
         .await

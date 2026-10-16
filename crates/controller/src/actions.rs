@@ -17,7 +17,7 @@ use std::collections::HashMap;
 
 use axum::Json;
 use axum::extract::{Path, State};
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::StatusCode;
 use inform::Mac;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -135,8 +135,7 @@ async fn note(s: &AppState, kind: &'static str, mac: Mac, data: Value) {
 }
 
 /// POST /api/devices/{mac}/restart
-pub async fn restart(State(s): State<AppState>, headers: HeaderMap, Path(mac): Path<String>) -> Result<Json<Value>, ApiError> {
-    crate::api::check_csrf(&headers)?;
+pub async fn restart(State(s): State<AppState>, Path(mac): Path<String>) -> Result<Json<Value>, ApiError> {
     crate::api::require_active(&s, "this needs")?;
     let mac = crate::api::parse_mac(&mac)?;
     known_ap(&s, &mac)?;
@@ -151,8 +150,7 @@ pub struct LocateBody {
 }
 
 /// POST /api/devices/{mac}/locate {on}
-pub async fn locate(State(s): State<AppState>, headers: HeaderMap, Path(mac): Path<String>, Json(b): Json<LocateBody>) -> Result<Json<Value>, ApiError> {
-    crate::api::check_csrf(&headers)?;
+pub async fn locate(State(s): State<AppState>, Path(mac): Path<String>, Json(b): Json<LocateBody>) -> Result<Json<Value>, ApiError> {
     crate::api::require_active(&s, "this needs")?;
     let mac = crate::api::parse_mac(&mac)?;
     known_ap(&s, &mac)?;
@@ -167,8 +165,7 @@ pub async fn locate(State(s): State<AppState>, headers: HeaderMap, Path(mac): Pa
 }
 
 /// POST /api/devices/{mac}/provision: send the AP its config again.
-pub async fn provision(State(s): State<AppState>, headers: HeaderMap, Path(mac): Path<String>) -> Result<Json<Value>, ApiError> {
-    crate::api::check_csrf(&headers)?;
+pub async fn provision(State(s): State<AppState>, Path(mac): Path<String>) -> Result<Json<Value>, ApiError> {
     crate::api::require_active(&s, "this needs")?;
     let mac = crate::api::parse_mac(&mac)?;
     known_ap(&s, &mac)?;
@@ -178,8 +175,7 @@ pub async fn provision(State(s): State<AppState>, headers: HeaderMap, Path(mac):
 }
 
 /// POST /api/clients/{mac}/kick: disconnect the client so it reconnects.
-pub async fn kick(State(s): State<AppState>, headers: HeaderMap, Path(mac): Path<String>) -> Result<Json<Value>, ApiError> {
-    crate::api::check_csrf(&headers)?;
+pub async fn kick(State(s): State<AppState>, Path(mac): Path<String>) -> Result<Json<Value>, ApiError> {
     crate::api::require_active(&s, "this needs")?;
     let client = crate::api::parse_mac(&mac)?;
     let ap = {
@@ -203,8 +199,7 @@ pub struct BlockBody {
 }
 
 /// POST /api/clients/{mac}/block {blocked}
-pub async fn block(State(s): State<AppState>, headers: HeaderMap, Path(mac): Path<String>, Json(b): Json<BlockBody>) -> Result<Json<Value>, ApiError> {
-    crate::api::check_csrf(&headers)?;
+pub async fn block(State(s): State<AppState>, Path(mac): Path<String>, Json(b): Json<BlockBody>) -> Result<Json<Value>, ApiError> {
     crate::api::require_active(&s, "this needs")?;
     let client = crate::api::parse_mac(&mac)?;
     let m = client.to_string();
@@ -234,8 +229,7 @@ pub struct LockBody {
 }
 
 /// POST /api/clients/{mac}/lock {ap}
-pub async fn lock(State(s): State<AppState>, headers: HeaderMap, Path(mac): Path<String>, Json(b): Json<LockBody>) -> Result<Json<Value>, ApiError> {
-    crate::api::check_csrf(&headers)?;
+pub async fn lock(State(s): State<AppState>, Path(mac): Path<String>, Json(b): Json<LockBody>) -> Result<Json<Value>, ApiError> {
     crate::api::require_active(&s, "this needs")?;
     let client = crate::api::parse_mac(&mac)?;
     let ap = match &b.ap {

@@ -120,7 +120,7 @@ impl Auth {
         !self.users.is_empty()
     }
 
-    fn create(&self, user: &str) -> Result<String> {
+    pub(crate) fn create(&self, user: &str) -> Result<String> {
         let mut bytes = [0u8; 32];
         getrandom::fill(&mut bytes).map_err(|e| anyhow::anyhow!("random: {e}"))?;
         let token = hex::encode(bytes);
@@ -276,7 +276,16 @@ fn secret(path: &str) -> bool {
     path.starts_with("/api/backups/file/") || (path.starts_with("/api/settings/wlans/") && path.ends_with("/passphrase"))
 }
 
-/// Guards every API route except login/logout/me.
+/// Whether a request carries the header every change must have. Browsers
+/// cannot add custom headers to cross-site requests without a CORS preflight,
+/// which this server never approves, so another website cannot make a
+/// visitor's browser change data.
+fn csrf_ok(headers: &HeaderMap) -> bool {
+    headers.get("x-requested-with").and_then(|v| v.to_str().ok()) == Some("apctl")
+}
+
+/// Guards every API route except login/logout/me; changes (anything but GET,
+/// HEAD and OPTIONS) also need the CSRF header.
 pub async fn require_login(State(s): State<AppState>, req: Request, next: Next) -> Response {
     let auth = &s.auth;
     let mutating = !matches!(*req.method(), Method::GET | Method::HEAD | Method::OPTIONS);
@@ -291,6 +300,7 @@ pub async fn require_login(State(s): State<AppState>, req: Request, next: Next) 
         return next.run(req).await;
     }
     match session_token(req.headers()).and_then(|t| auth.check(&t)) {
+        Some(_) if mutating && !csrf_ok(req.headers()) => json_error(StatusCode::FORBIDDEN, "missing X-Requested-With: apctl header"),
         Some(_) => next.run(req).await,
         None => json_error(StatusCode::UNAUTHORIZED, "login required"),
     }

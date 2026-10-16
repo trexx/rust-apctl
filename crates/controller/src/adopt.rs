@@ -19,7 +19,7 @@ use std::sync::Arc;
 
 use axum::Json;
 use axum::extract::{Path, State};
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::StatusCode;
 use inform::Mac;
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -313,8 +313,7 @@ pub async fn pending(State(s): State<AppState>) -> Json<Value> {
 }
 
 /// POST /api/devices/{mac}/adopt: adopt a pending AP.
-pub async fn adopt(State(s): State<AppState>, headers: HeaderMap, Path(mac): Path<String>) -> Result<Json<Value>, ApiError> {
-    crate::api::check_csrf(&headers)?;
+pub async fn adopt(State(s): State<AppState>, Path(mac): Path<String>) -> Result<Json<Value>, ApiError> {
     crate::api::require_active(&s, "adoption needs")?;
     let mac = crate::api::parse_mac(&mac)?;
     let payload = s.live.read().unwrap().adoption.pending.get(&mac).map(|p| p.payload.clone()).ok_or_else(|| ApiError(StatusCode::NOT_FOUND, "this AP is not waiting for adoption".into()))?;
@@ -330,8 +329,7 @@ pub async fn adopt(State(s): State<AppState>, headers: HeaderMap, Path(mac): Pat
 }
 
 /// POST /api/devices/{mac}/forget: remove an AP; if it reports again it resets itself.
-pub async fn forget(State(s): State<AppState>, headers: HeaderMap, Path(mac): Path<String>) -> Result<Json<Value>, ApiError> {
-    crate::api::check_csrf(&headers)?;
+pub async fn forget(State(s): State<AppState>, Path(mac): Path<String>) -> Result<Json<Value>, ApiError> {
     crate::api::require_active(&s, "adoption needs")?;
     let mac = crate::api::parse_mac(&mac)?;
     let online = {

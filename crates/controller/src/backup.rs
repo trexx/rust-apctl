@@ -26,7 +26,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use axum::Json;
 use axum::body::Body;
 use axum::extract::{Path as UrlPath, State};
-use axum::http::{HeaderMap, StatusCode, header};
+use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use rusqlite::{Connection, OpenFlags, OptionalExtension};
 use serde::{Deserialize, Serialize};
@@ -826,8 +826,7 @@ pub async fn index(State(s): State<AppState>) -> Result<Json<Value>, ApiError> {
 }
 
 /// PUT /api/backups/settings
-pub async fn put_settings(State(s): State<AppState>, headers: HeaderMap, Json(body): Json<Settings>) -> Result<Json<Value>, ApiError> {
-    crate::api::check_csrf(&headers)?;
+pub async fn put_settings(State(s): State<AppState>, Json(body): Json<Settings>) -> Result<Json<Value>, ApiError> {
     body.validate().map_err(|e| ApiError(StatusCode::BAD_REQUEST, e))?;
     s.engine
         .send(crate::engine::Input::SaveBackupSettings(serde_json::to_string(&body).unwrap_or_default()))
@@ -843,8 +842,7 @@ pub struct CreateBody {
 }
 
 /// POST /api/backups: make a backup now.
-pub async fn create_now(State(s): State<AppState>, headers: HeaderMap, Json(body): Json<CreateBody>) -> Result<Json<Value>, ApiError> {
-    crate::api::check_csrf(&headers)?;
+pub async fn create_now(State(s): State<AppState>, Json(body): Json<CreateBody>) -> Result<Json<Value>, ApiError> {
     if !(-1..=365).contains(&body.days) {
         return Err(ApiError(StatusCode::BAD_REQUEST, "history must be -1, 0 or 1-365 days".into()));
     }
@@ -870,8 +868,7 @@ pub async fn download(State(s): State<AppState>, UrlPath(name): UrlPath<String>)
 }
 
 /// DELETE /api/backups/file/{name}
-pub async fn delete(State(s): State<AppState>, headers: HeaderMap, UrlPath(name): UrlPath<String>) -> Result<Json<Value>, ApiError> {
-    crate::api::check_csrf(&headers)?;
+pub async fn delete(State(s): State<AppState>, UrlPath(name): UrlPath<String>) -> Result<Json<Value>, ApiError> {
     let b = s.backups.clone();
     let found = valid_name(&name)
         && tokio::task::spawn_blocking(move || {
@@ -921,10 +918,9 @@ pub struct RestoreBody {
 
 /// POST /api/backups/upload: checks an uploaded backup and stages it (not applied yet).
 /// The body is streamed to disk, so large backups need no memory.
-pub async fn upload(State(s): State<AppState>, headers: HeaderMap, body: Body) -> Result<Json<Value>, ApiError> {
+pub async fn upload(State(s): State<AppState>, body: Body) -> Result<Json<Value>, ApiError> {
     use futures_util::StreamExt;
     use tokio::io::AsyncWriteExt;
-    crate::api::check_csrf(&headers)?;
     let b = s.backups.clone();
     tokio::fs::create_dir_all(b.staging()).await?;
     let name = format!("upload-{}-{}.apb", store::now_ts(), crate::settings::random_hex(4));
@@ -976,8 +972,7 @@ impl Drop for TempFile {
 }
 
 /// POST /api/backups/restore: marks a backup to be restored and restarts apctl.
-pub async fn restore(State(s): State<AppState>, headers: HeaderMap, Json(body): Json<RestoreBody>) -> Result<Json<Value>, ApiError> {
-    crate::api::check_csrf(&headers)?;
+pub async fn restore(State(s): State<AppState>, Json(body): Json<RestoreBody>) -> Result<Json<Value>, ApiError> {
     let b = s.backups.clone();
     let (id, m) = tokio::task::spawn_blocking(move || -> Result<(String, Manifest)> {
         let (id, m) = match (body.name, body.staged) {

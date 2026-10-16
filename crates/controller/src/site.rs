@@ -5,7 +5,7 @@
 
 use axum::Json;
 use axum::extract::{Query, State};
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::StatusCode;
 use serde_json::{Value, json};
 use std::collections::HashMap;
 
@@ -342,8 +342,8 @@ pub async fn get_site(State(s): State<AppState>) -> Result<Json<Value>, ApiError
 }
 
 /// PUT /api/settings/site {patch} (`?preview=true` to see the effect)
-pub async fn put_site(State(s): State<AppState>, headers: HeaderMap, Query(q): Query<PreviewQuery>, Json(b): Json<Patch>) -> Result<Json<Value>, ApiError> {
-    crate::settings::change(&s, &headers, &q, apply_site, b.patch).await
+pub async fn put_site(State(s): State<AppState>, Query(q): Query<PreviewQuery>, Json(b): Json<Patch>) -> Result<Json<Value>, ApiError> {
+    crate::settings::change(&s, &q, apply_site, b.patch).await
 }
 
 #[cfg(test)]

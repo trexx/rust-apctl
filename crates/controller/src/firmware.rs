@@ -20,7 +20,7 @@ use std::time::Duration;
 
 use axum::Json;
 use axum::extract::State;
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::StatusCode;
 use rusqlite::OptionalExtension;
 use rusqlite::types::Value as Sql;
 use serde::{Deserialize, Serialize};
@@ -436,8 +436,7 @@ pub async fn index(State(s): State<AppState>) -> Result<Json<Value>, ApiError> {
 }
 
 /// POST /api/firmware/check
-pub async fn check_now(State(s): State<AppState>, headers: HeaderMap) -> Result<Json<Value>, ApiError> {
-    crate::api::check_csrf(&headers)?;
+pub async fn check_now(State(s): State<AppState>) -> Result<Json<Value>, ApiError> {
     let w = s.writer.clone();
     let n = tokio::task::spawn_blocking(move || check(&w))
         .await?
@@ -457,8 +456,7 @@ pub struct UpgradeBody {
 }
 
 /// POST /api/firmware/upgrade: queue release upgrades, one AP at a time.
-pub async fn upgrade(State(s): State<AppState>, headers: HeaderMap, Json(b): Json<UpgradeBody>) -> Result<Json<Value>, ApiError> {
-    crate::api::check_csrf(&headers)?;
+pub async fn upgrade(State(s): State<AppState>, Json(b): Json<UpgradeBody>) -> Result<Json<Value>, ApiError> {
     crate::api::require_active(&s, "upgrades need")?;
     let store = s.store.clone();
     let (rels, ..) = tokio::task::spawn_blocking(move || releases(&store)).await??;
@@ -523,8 +521,7 @@ pub fn valid_firmware_url(url: &str) -> bool {
 }
 
 /// POST /api/firmware/upgrade-url: install a specific firmware file (e.g. an early-access build).
-pub async fn upgrade_url(State(s): State<AppState>, headers: HeaderMap, Json(b): Json<UrlBody>) -> Result<Json<Value>, ApiError> {
-    crate::api::check_csrf(&headers)?;
+pub async fn upgrade_url(State(s): State<AppState>, Json(b): Json<UrlBody>) -> Result<Json<Value>, ApiError> {
     crate::api::require_active(&s, "upgrades need")?;
     if !valid_firmware_url(&b.url) {
         return Err(ApiError(StatusCode::BAD_REQUEST, "use an http(s) or ftp URL ending in .bin or .tar".into()));
@@ -552,8 +549,7 @@ pub async fn upgrade_url(State(s): State<AppState>, headers: HeaderMap, Json(b):
 }
 
 /// POST /api/firmware/cancel: drop queued upgrades (one already sent cannot be stopped).
-pub async fn cancel(State(s): State<AppState>, headers: HeaderMap) -> Result<Json<Value>, ApiError> {
-    crate::api::check_csrf(&headers)?;
+pub async fn cancel(State(s): State<AppState>) -> Result<Json<Value>, ApiError> {
     let n = change_queue(&s, Op::CancelQueued).await?;
     Ok(Json(json!({ "cancelled": n })))
 }

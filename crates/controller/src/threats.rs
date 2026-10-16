@@ -724,8 +724,7 @@ fn yes() -> bool {
 }
 
 /// PUT /api/rf/threats/ack
-pub async fn ack(State(s): State<AppState>, headers: axum::http::HeaderMap, Json(b): Json<AckBody>) -> Result<Json<Value>, ApiError> {
-    crate::api::check_csrf(&headers)?;
+pub async fn ack(State(s): State<AppState>, Json(b): Json<AckBody>) -> Result<Json<Value>, ApiError> {
     let Some(kind) = Kind::parse(&b.kind) else {
         return Err(ApiError(StatusCode::BAD_REQUEST, "unknown kind".into()));
     };

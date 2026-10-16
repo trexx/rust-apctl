@@ -9,7 +9,7 @@
 
 use axum::Json;
 use axum::extract::{Path, Query, State};
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::StatusCode;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, LazyLock};
 
@@ -30,8 +30,7 @@ pub type Apply<B> = fn(&mut Value, &B) -> Result<String, String>;
 
 /// Previews or saves `apply(state, body)`. `apply` validates, edits, and
 /// returns what changed in words (for the event and the config history).
-pub(crate) async fn change<B: Send + 'static>(s: &AppState, headers: &HeaderMap, q: &PreviewQuery, apply: Apply<B>, body: B) -> Result<Json<Value>, ApiError> {
-    crate::api::check_csrf(headers)?;
+pub(crate) async fn change<B: Send + 'static>(s: &AppState, q: &PreviewQuery, apply: Apply<B>, body: B) -> Result<Json<Value>, ApiError> {
     if q.preview {
         let current = s.live.read().unwrap().state.clone().ok_or_else(|| ApiError(StatusCode::CONFLICT, "no settings imported yet".into()))?;
         let mut edited = (*current).clone();
@@ -1564,22 +1563,22 @@ pub struct Patch {
 }
 
 /// PUT /api/settings/wlans/{id} {patch} (`?preview=true` to see the effect)
-pub async fn put_wlan(State(s): State<AppState>, headers: HeaderMap, Path(id): Path<String>, Query(q): Query<PreviewQuery>, Json(b): Json<Patch>) -> Result<Json<Value>, ApiError> {
-    change(&s, &headers, &q, apply_wlan, WlanEdit { id, patch: b.patch }).await
+pub async fn put_wlan(State(s): State<AppState>, Path(id): Path<String>, Query(q): Query<PreviewQuery>, Json(b): Json<Patch>) -> Result<Json<Value>, ApiError> {
+    change(&s, &q, apply_wlan, WlanEdit { id, patch: b.patch }).await
 }
 
 /// POST /api/settings/wlans {patch}
-pub async fn post_wlan(State(s): State<AppState>, headers: HeaderMap, Query(q): Query<PreviewQuery>, Json(b): Json<Patch>) -> Result<Json<Value>, ApiError> {
-    change(&s, &headers, &q, create_wlan, b.patch).await
+pub async fn post_wlan(State(s): State<AppState>, Query(q): Query<PreviewQuery>, Json(b): Json<Patch>) -> Result<Json<Value>, ApiError> {
+    change(&s, &q, create_wlan, b.patch).await
 }
 
 /// DELETE /api/settings/wlans/{id}
-pub async fn delete_wlan_route(State(s): State<AppState>, headers: HeaderMap, Path(id): Path<String>, Query(q): Query<PreviewQuery>) -> Result<Json<Value>, ApiError> {
-    change(&s, &headers, &q, |state: &mut Value, id: &String| delete_wlan(state, id), id).await
+pub async fn delete_wlan_route(State(s): State<AppState>, Path(id): Path<String>, Query(q): Query<PreviewQuery>) -> Result<Json<Value>, ApiError> {
+    change(&s, &q, |state: &mut Value, id: &String| delete_wlan(state, id), id).await
 }
 
 /// PUT /api/settings/devices/{mac} {patch}
-pub async fn put_device(State(s): State<AppState>, headers: HeaderMap, Path(mac): Path<String>, Query(q): Query<PreviewQuery>, Json(b): Json<Patch>) -> Result<Json<Value>, ApiError> {
+pub async fn put_device(State(s): State<AppState>, Path(mac): Path<String>, Query(q): Query<PreviewQuery>, Json(b): Json<Patch>) -> Result<Json<Value>, ApiError> {
     let inform = mac.parse::<inform::Mac>().ok().and_then(|m| s.live.read().unwrap().raw_informs.get(&m).cloned());
     let caps = json!({ "ng": radio_caps(inform.as_deref(), "ng"), "na": radio_caps(inform.as_deref(), "na"), "6e": radio_caps(inform.as_deref(), "6e") });
     // A mesh AP's uplink radio must stay on.
@@ -1588,7 +1587,7 @@ pub async fn put_device(State(s): State<AppState>, headers: HeaderMap, Path(mac)
         _ => None,
     };
     let antennas = inform.as_deref().map_or(Value::Null, |p| p["antenna_table"].clone());
-    change(&s, &headers, &q, apply_device, DeviceEdit { mac, patch: b.patch, caps, wireless_uplink, antennas }).await
+    change(&s, &q, apply_device, DeviceEdit { mac, patch: b.patch, caps, wireless_uplink, antennas }).await
 }
 
 /// How an AP reaches the network.
@@ -2157,18 +2156,18 @@ pub async fn usergroups(State(s): State<AppState>) -> Result<Json<Value>, ApiErr
 }
 
 /// POST /api/settings/usergroups {patch}
-pub async fn post_usergroup(State(s): State<AppState>, headers: HeaderMap, Query(q): Query<PreviewQuery>, Json(b): Json<Patch>) -> Result<Json<Value>, ApiError> {
-    change(&s, &headers, &q, apply_usergroup, GroupEdit { id: None, patch: b.patch, delete: false }).await
+pub async fn post_usergroup(State(s): State<AppState>, Query(q): Query<PreviewQuery>, Json(b): Json<Patch>) -> Result<Json<Value>, ApiError> {
+    change(&s, &q, apply_usergroup, GroupEdit { id: None, patch: b.patch, delete: false }).await
 }
 
 /// PUT /api/settings/usergroups/{id} {patch}
-pub async fn put_usergroup(State(s): State<AppState>, headers: HeaderMap, Path(id): Path<String>, Query(q): Query<PreviewQuery>, Json(b): Json<Patch>) -> Result<Json<Value>, ApiError> {
-    change(&s, &headers, &q, apply_usergroup, GroupEdit { id: Some(id), patch: b.patch, delete: false }).await
+pub async fn put_usergroup(State(s): State<AppState>, Path(id): Path<String>, Query(q): Query<PreviewQuery>, Json(b): Json<Patch>) -> Result<Json<Value>, ApiError> {
+    change(&s, &q, apply_usergroup, GroupEdit { id: Some(id), patch: b.patch, delete: false }).await
 }
 
 /// DELETE /api/settings/usergroups/{id}
-pub async fn delete_usergroup(State(s): State<AppState>, headers: HeaderMap, Path(id): Path<String>, Query(q): Query<PreviewQuery>) -> Result<Json<Value>, ApiError> {
-    change(&s, &headers, &q, apply_usergroup, GroupEdit { id: Some(id), patch: Value::Null, delete: true }).await
+pub async fn delete_usergroup(State(s): State<AppState>, Path(id): Path<String>, Query(q): Query<PreviewQuery>) -> Result<Json<Value>, ApiError> {
+    change(&s, &q, apply_usergroup, GroupEdit { id: Some(id), patch: Value::Null, delete: true }).await
 }
 
 #[derive(Deserialize)]
@@ -2177,8 +2176,8 @@ pub struct ClientGroupBody {
 }
 
 /// PUT /api/clients/{mac}/speed-limit {usergroup_id}
-pub async fn put_client_group(State(s): State<AppState>, headers: HeaderMap, Path(mac): Path<String>, Query(q): Query<PreviewQuery>, Json(b): Json<ClientGroupBody>) -> Result<Json<Value>, ApiError> {
-    change(&s, &headers, &q, apply_client_group, ClientGroup { mac, usergroup_id: b.usergroup_id }).await
+pub async fn put_client_group(State(s): State<AppState>, Path(mac): Path<String>, Query(q): Query<PreviewQuery>, Json(b): Json<ClientGroupBody>) -> Result<Json<Value>, ApiError> {
+    change(&s, &q, apply_client_group, ClientGroup { mac, usergroup_id: b.usergroup_id }).await
 }
 
 #[cfg(test)]
