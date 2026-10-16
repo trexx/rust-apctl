@@ -29,7 +29,7 @@ use serde_json::{Value, json};
 use crate::api::{ApiError, AppState};
 use crate::engine::{Input, SharedLive};
 use crate::model::Ts;
-use crate::store::{self, Db, Store};
+use crate::store::{self, Db, Store, Writer};
 use inform::Mac;
 
 /// What a finding is (see above).
@@ -706,14 +706,26 @@ pub async fn ack(State(s): State<AppState>, headers: axum::http::HeaderMap, Json
     Ok(Json(json!({ "ok": true })))
 }
 
+/// Forgets the findings about networks no longer heard at all (the networks
+/// heard are kept 30 days), so the list of reported findings does not grow
+/// for ever; a network heard again later is reported again.
+fn prune(writer: &Writer) {
+    writer.exec(Db::Config, "DELETE FROM network_threats WHERE bssid NOT IN (SELECT bssid FROM neighbors)", vec![]);
+}
+
 /// Re-assesses every minute and reports each new, unacknowledged finding once.
-pub fn watch(store: std::sync::Arc<Store>, live: SharedLive, engine: tokio::sync::mpsc::Sender<Input>) {
+pub fn watch(store: std::sync::Arc<Store>, live: SharedLive, engine: tokio::sync::mpsc::Sender<Input>, writer: Writer) {
     tokio::spawn(async move {
         // Give the APs a few informs to report their networks first.
         tokio::time::sleep(Duration::from_secs(90)).await;
         let mut every = tokio::time::interval(Duration::from_secs(60));
+        let mut pruned: Ts = 0;
         loop {
             every.tick().await;
+            if store::now_ts() - pruned >= 3600 {
+                prune(&writer);
+                pruned = store::now_ts();
+            }
             let (st, lv) = (store.clone(), live.clone());
             let found = tokio::task::spawn_blocking(move || gather(&st, &lv, store::now_ts()).map(|a| assess(&a))).await;
             let list = match found {
@@ -914,6 +926,25 @@ mod tests {
         assert_eq!(h.last_change(&own("02:00:00:00:00:03", "IoT", 6), None), now - 120);
         assert_eq!(h.last_change(&own("02:00:00:00:00:03", "IoT", 1), Some("ng")), now - 600);
         assert_eq!(h.last_change(&own("02:00:00:00:00:01", "Old", 6), None), 0, "only in the hourly tier");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn findings_about_networks_no_longer_heard_are_forgotten() {
+        let dir = std::env::temp_dir().join(format!("apctl-threats-prune-{}-{}", std::process::id(), store::now_ts()));
+        let (store, writer) = Store::open(&dir).unwrap();
+        let sql = "INSERT INTO neighbors (bssid, ap_mac, first_seen, last_seen) VALUES ('02:00:00:00:00:01', ?1, 1, 2)";
+        writer.exec(Db::Config, sql, vec![rusqlite::types::Value::Text(UP.into())]);
+        for (kind, bssid) in [("lookalike", "02:00:00:00:00:01"), ("bridged", "02:00:00:00:00:01"), ("new_nearby", "02:00:00:00:00:02")] {
+            let sql = "INSERT INTO network_threats (kind, bssid, first_reported) VALUES (?1, ?2, 1)";
+            writer.exec(Db::Config, sql, vec![rusqlite::types::Value::Text(kind.into()), rusqlite::types::Value::Text(bssid.into())]);
+        }
+        prune(&writer);
+        assert!(writer.flush(Duration::from_secs(5)));
+        let left: Vec<String> = store
+            .read(Db::Config, |c| Ok(c.prepare("SELECT kind FROM network_threats ORDER BY kind")?.query_map([], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?))
+            .unwrap();
+        assert_eq!(left, ["bridged", "lookalike"]);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

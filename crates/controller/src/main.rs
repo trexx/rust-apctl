@@ -341,7 +341,7 @@ async fn serve(args: ServeArgs) -> Result<()> {
         tracing::info!("login enabled for {} user(s)", users.len());
     }
     let auth = Arc::new(auth::Auth::new(users, &store, writer.clone(), proxies)?);
-    threats::watch(store.clone(), live.clone(), in_tx.clone());
+    threats::watch(store.clone(), live.clone(), in_tx.clone(), writer.clone());
     alerts::spawn(store.clone(), writer.clone(), live.clone(), live_tx.clone(), alert_events);
     backup::schedule(backups.clone(), store.clone());
     firmware::schedule(writer.clone());
