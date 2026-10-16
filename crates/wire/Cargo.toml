@@ -11,5 +11,6 @@ etherparse.workspace = true
 hex.workspace = true
 httparse.workspace = true
 inform.workspace = true
+memchr.workspace = true
 pcap-parser.workspace = true
 serde_json.workspace = true

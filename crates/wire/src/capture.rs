@@ -288,6 +288,10 @@ struct HalfStream {
     /// Since when the stream has been waiting for the bytes before `pending`.
     gap_since: Option<Micros>,
     buf: Vec<u8>,
+    /// How much of `buf` has been cut into messages or skipped. The used bytes are
+    /// dropped only once they are most of the buffer: dropping them after each
+    /// message would move the rest of the buffer every time.
+    consumed: usize,
     /// A FIN was seen.
     fin: bool,
 }
@@ -302,6 +306,12 @@ const MAX_GAP_AGE: Micros = 10_000_000;
 /// Largest unparsed message kept. Inform bodies are a few KB (the largest
 /// decoded ones a few hundred KB), and anything bigger on the port is not an inform.
 const MAX_BUFFER: usize = 8 << 20;
+/// Largest message head (start line and headers). Until a head is complete it is
+/// parsed again with every segment, so one that never ends is given up on early.
+const MAX_HEAD: usize = 64 << 10;
+/// Most chunks in a chunked body: a body is walked again with every segment until
+/// it is complete. Inform replies, a few hundred KB at most, come in far fewer.
+const MAX_CHUNKS: usize = 4096;
 
 impl HalfStream {
     fn segment(&mut self, ts: Micros, seq: u32, syn: bool, payload: &[u8]) {
@@ -366,7 +376,7 @@ impl HalfStream {
             self.gap_since = None;
             return;
         };
-        self.buf.clear();
+        self.clear_buf();
         self.next_seq = self.next_seq.map(|next| next.wrapping_add((lowest - self.pos) as u32));
         self.pos = lowest;
         self.apply_pending(ts);
@@ -380,6 +390,7 @@ impl HalfStream {
     /// Frees the buffers but keeps `next_seq`.
     fn release(&mut self) {
         self.buf = Vec::new();
+        self.consumed = 0;
         self.pending = BTreeMap::new();
         self.pending_bytes = 0;
         self.gap_since = None;
@@ -393,31 +404,48 @@ impl HalfStream {
             return;
         }
         let fresh = &payload[skip..];
-        if self.buf.len() + fresh.len() > MAX_BUFFER {
-            self.buf.clear();
+        if self.buf.len() - self.consumed + fresh.len() > MAX_BUFFER {
+            self.clear_buf();
         }
         self.buf.extend_from_slice(fresh);
         self.pos += fresh.len() as i64;
         self.next_seq = self.next_seq.map(|next| next.wrapping_add(fresh.len() as u32));
     }
 
+    fn clear_buf(&mut self) {
+        self.buf.clear();
+        self.consumed = 0;
+    }
+
     fn take_http(&mut self, request: bool) -> Option<Parsed> {
+        let msg = self.next_http(request);
+        // Each byte is moved at most once more than it is parsed, however many
+        // messages arrive at once.
+        if self.consumed == self.buf.len() {
+            self.clear_buf();
+        } else if self.consumed > self.buf.len() / 2 {
+            self.buf.drain(..self.consumed);
+            self.consumed = 0;
+        }
+        msg
+    }
+
+    fn next_http(&mut self, request: bool) -> Option<Parsed> {
         loop {
-            match parse_http(&self.buf, request, self.closed()) {
+            let rest = &self.buf[self.consumed..];
+            match parse_http(rest, request, self.closed()) {
                 ParseResult::Complete(msg, used) => {
-                    self.buf.drain(..used);
+                    self.consumed += used;
                     return Some(msg);
                 }
                 ParseResult::Partial => return None,
                 ParseResult::Garbage => {
                     // The capture started mid-message: skip to the next message start.
                     let marker: &[u8] = if request { b"POST " } else { b"HTTP/1." };
-                    match find(&self.buf[1..], marker) {
-                        Some(i) => {
-                            self.buf.drain(..i + 1);
-                        }
+                    match find(&rest[1..], marker) {
+                        Some(i) => self.consumed += i + 1,
                         None => {
-                            self.buf.clear();
+                            self.consumed = self.buf.len();
                             return None;
                         }
                     }
@@ -455,14 +483,14 @@ fn parse_http(buf: &[u8], request: bool, closed: bool) -> ParseResult {
                 let inform = req.method == Some("POST") && req.path.is_some_and(|p| p.starts_with("/inform"));
                 (n, req.headers, inform, 0)
             }
-            Ok(httparse::Status::Partial) => return ParseResult::Partial,
+            Ok(httparse::Status::Partial) => return head_partial(buf),
             Err(_) => return ParseResult::Garbage,
         }
     } else {
         let mut resp = httparse::Response::new(&mut storage);
         match resp.parse(buf) {
             Ok(httparse::Status::Complete(n)) => (n, resp.headers, false, resp.code.unwrap_or(0)),
-            Ok(httparse::Status::Partial) => return ParseResult::Partial,
+            Ok(httparse::Status::Partial) => return head_partial(buf),
             Err(_) => return ParseResult::Garbage,
         }
     };
@@ -507,11 +535,17 @@ fn parse_http(buf: &[u8], request: bool, closed: bool) -> ParseResult {
     ParseResult::Complete(msg, head_len + body_len)
 }
 
+/// A head that is not complete yet, unless it is already longer than any we accept.
+fn head_partial(buf: &[u8]) -> ParseResult {
+    if buf.len() > MAX_HEAD { ParseResult::Garbage } else { ParseResult::Partial }
+}
+
 enum Chunked {
     /// The bytes the chunked body takes up (with its trailers), and the size of its data.
     Complete(usize, usize),
     Partial,
-    /// A chunk size that is not hex or larger than any message we keep.
+    /// A chunk size that is not hex or larger than any message we keep, or more
+    /// than `MAX_CHUNKS` chunks.
     Garbage,
 }
 
@@ -520,7 +554,7 @@ enum Chunked {
 fn chunked_len<'b>(mut buf: &'b [u8], mut chunk: impl FnMut(&'b [u8])) -> Chunked {
     let total = buf.len();
     let mut data = 0;
-    loop {
+    for _ in 0..=MAX_CHUNKS {
         let Some(line_end) = find(buf, b"\r\n") else { return Chunked::Partial };
         let size = std::str::from_utf8(&buf[..line_end])
             .ok()
@@ -547,10 +581,11 @@ fn chunked_len<'b>(mut buf: &'b [u8], mut chunk: impl FnMut(&'b [u8])) -> Chunke
         data += size;
         buf = &buf[size + 2..];
     }
+    Chunked::Garbage
 }
 
 fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    haystack.windows(needle.len()).position(|w| w == needle)
+    memchr::memmem::find(haystack, needle)
 }
 
 /// Opens a capture file, or stdin for `-`.
@@ -711,6 +746,51 @@ mod tests {
     fn resynchronises_after_starting_mid_message() {
         let mut h = HalfStream { buf: b"tail of an old body\x00\x01POST /inform HTTP/1.1\r\nContent-Length: 1\r\n\r\nx".to_vec(), ..Default::default() };
         assert!(matches!(h.take_http(true), Some(Parsed::Request { .. })));
+    }
+
+    /// Before the buffer kept an offset, each of these drained the rest of a 2 MB buffer.
+    #[test]
+    fn a_burst_of_pipelined_requests_is_cut_in_linear_time() {
+        let one = b"POST /inform HTTP/1.1\r\nContent-Length: 1\r\n\r\nx";
+        let mut h = HalfStream::default();
+        h.segment(0, 0, true, b"");
+        h.segment(0, 1, false, &one.repeat(50_000));
+        let mut n = 0;
+        while let Some(Parsed::Request { body, .. }) = h.take_http(true) {
+            assert_eq!(body, b"x");
+            n += 1;
+            assert!(h.consumed <= h.buf.len() - h.consumed, "compacted once used bytes are the larger part");
+        }
+        assert_eq!((n, h.buf.len(), h.consumed), (50_000, 0, 0));
+        // Garbage with a message start every few bytes is skipped as quickly.
+        let mut h = HalfStream { buf: b"POST POST ".repeat(100_000), ..Default::default() };
+        h.buf.extend_from_slice(one);
+        assert!(matches!(h.take_http(true), Some(Parsed::Request { body, .. }) if body == b"x"));
+        assert!(h.buf.is_empty());
+    }
+
+    #[test]
+    fn a_head_that_never_ends_is_given_up_on() {
+        let mut h = HalfStream::default();
+        h.segment(0, 0, true, b"");
+        let mut seq = 1;
+        let mut send = |h: &mut HalfStream, data: &[u8]| {
+            h.segment(0, seq, false, data);
+            seq += data.len() as u32;
+        };
+        send(&mut h, b"POST /inform HTTP/1.1\r\nX-Long: ");
+        for _ in 0..100 {
+            send(&mut h, &[b'a'; 1400]);
+            assert!(h.take_http(true).is_none());
+            assert!(h.buf.len() <= MAX_HEAD + 1400, "{}", h.buf.len());
+        }
+        send(&mut h, b"\r\n\r\nPOST /inform HTTP/1.1\r\nContent-Length: 2\r\n\r\nok");
+        assert!(matches!(h.take_http(true), Some(Parsed::Request { body, .. }) if body == b"ok"));
+        // A chunked body in more chunks than any reply has.
+        let mut buf = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n".to_vec();
+        buf.extend_from_slice(&b"1\r\nx\r\n".repeat(MAX_CHUNKS + 1));
+        assert!(matches!(chunked_len(&buf[45..], |_| {}), Chunked::Garbage));
+        assert!(matches!(chunked_len(&b"1\r\nx\r\n".repeat(MAX_CHUNKS), |_| {}), Chunked::Partial));
     }
 
     #[test]

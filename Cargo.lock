@@ -4107,6 +4107,7 @@ dependencies = [
  "hex",
  "httparse",
  "inform",
+ "memchr",
  "pcap-parser",
  "serde_json",
 ]
