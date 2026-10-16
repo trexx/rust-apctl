@@ -506,6 +506,14 @@ pub fn unpack(path: &Path, key: Option<&[u8; 32]>, dest: &Path) -> Result<Manife
             let mut s = String::new();
             e.read_to_string(&mut s)?;
             let m: Manifest = serde_json::from_str(&s).context("the backup's manifest is unreadable")?;
+            // The manifest comes first: a backup apctl cannot restore is refused
+            // before anything is unpacked (which can be a hundred times the file).
+            if m.app != "apctl" || m.format != 1 {
+                bail!("not an apctl backup (format {})", m.format);
+            }
+            if !version_ok(&m.version, VERSION) {
+                bail!("this backup is from apctl {}, newer than this one ({VERSION}); upgrade apctl first", m.version);
+            }
             check_names(&m)?;
             if m.files.values().fold(0u64, |n, f| n.saturating_add(f.size)) > limit {
                 bail!("the backup's contents are far larger than the file: it is damaged");
@@ -524,9 +532,11 @@ pub fn unpack(path: &Path, key: Option<&[u8; 32]>, dest: &Path) -> Result<Manife
         if e.header().size()? != expected.size {
             bail!("{name} does not match its checksum: the backup is damaged");
         }
-        // Hashed while it is written (a file twice in the archive is refused).
-        let mut out = Hashing { out: fs::OpenOptions::new().write(true).create_new(true).open(dest.join(&name))?, hash: Sha256::new(), size: 0 };
+        // Hashed while it is written, a megabyte at a time (a file twice in the archive is refused).
+        let file = fs::OpenOptions::new().write(true).create_new(true).open(dest.join(&name))?;
+        let mut out = BufWriter::with_capacity(1 << 20, Hashing { out: file, hash: Sha256::new(), size: 0 });
         io::copy(&mut e, &mut out)?;
+        let out = out.into_inner().map_err(|e| e.into_error())?;
         out.out.sync_all()?;
         if (FileInfo { size: out.size, sha256: hex::encode(out.hash.finalize()) }) != *expected {
             bail!("{name} does not match its checksum: the backup is damaged");
@@ -537,9 +547,6 @@ pub fn unpack(path: &Path, key: Option<&[u8; 32]>, dest: &Path) -> Result<Manife
         if !dest.join(n).exists() {
             bail!("{n} is listed but missing: the backup is incomplete");
         }
-    }
-    if m.app != "apctl" || m.format != 1 {
-        bail!("not an apctl backup (format {})", m.format);
     }
     Ok(m)
 }
@@ -905,10 +912,6 @@ fn stage(b: &Backups, path: &Path) -> Result<(String, Manifest)> {
             return Err(e);
         }
     };
-    if !version_ok(&m.version, VERSION) {
-        let _ = fs::remove_dir_all(&dest);
-        bail!("this backup is from apctl {}, newer than this one ({VERSION}); upgrade apctl first", m.version);
-    }
     fs::write(dest.join("manifest.json"), serde_json::to_vec_pretty(&m)?)?;
     Ok((id, m))
 }
@@ -1192,6 +1195,21 @@ mod tests {
         let err = unpack(&d.join("x.apb"), None, &out).unwrap_err();
         assert!(err.to_string().contains("damaged"), "{err:#}");
         assert!(!out.join("config.db").exists());
+    }
+
+    #[test]
+    fn newer_or_foreign_backups_are_refused_before_anything_is_unpacked() {
+        let d = dir("early");
+        let newer = Manifest { version: "999.0.0".into(), ..manifest(&[("config.db", 4)]) };
+        hand_made(&d.join("x.apb"), &newer, &[("config.db", vec![0u8; 4])]);
+        let err = unpack(&d.join("x.apb"), None, &d.join("out")).unwrap_err();
+        assert!(err.to_string().contains("newer than this one"), "{err:#}");
+        assert!(!d.join("out").join("config.db").exists());
+        let foreign = Manifest { app: "other".into(), ..manifest(&[("config.db", 4)]) };
+        hand_made(&d.join("y.apb"), &foreign, &[("config.db", vec![0u8; 4])]);
+        let err = unpack(&d.join("y.apb"), None, &d.join("out2")).unwrap_err();
+        assert!(err.to_string().contains("not an apctl backup"), "{err:#}");
+        assert!(!d.join("out2").join("config.db").exists());
     }
 
     #[test]
