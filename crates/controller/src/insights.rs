@@ -898,7 +898,7 @@ pub async fn neighbors(State(s): State<AppState>, Query(q): Query<NeighborQuery>
     let own: HashMap<String, (inform::Mac, Option<String>)> = live
         .devices
         .iter()
-        .flat_map(|(m, d)| d.snapshot.vaps.iter().map(move |v| (v.bssid.to_ascii_lowercase(), (*m, v.radio.clone()))))
+        .flat_map(|(m, d)| d.snapshot.vaps.iter().map(move |v| (v.bssid.clone(), (*m, v.radio.clone()))))
         .collect();
     let name_of = |m: &str| ap_name(&live, m);
     let mut by_bssid: BTreeMap<String, Value> = BTreeMap::new();
@@ -1138,7 +1138,7 @@ pub async fn compute_plan(s: &AppState, radio: String, dfs: bool, allowed: Optio
         let own: HashMap<String, String> = live
             .devices
             .iter()
-            .flat_map(|(m, d)| d.snapshot.vaps.iter().filter(|v| v.radio.as_deref() == Some(radio.as_str())).map(move |v| (v.bssid.to_ascii_lowercase(), m.to_string())))
+            .flat_map(|(m, d)| d.snapshot.vaps.iter().filter(|v| v.radio.as_deref() == Some(radio.as_str())).map(move |v| (v.bssid.clone(), m.to_string())))
             .collect();
         (aps, own)
     };

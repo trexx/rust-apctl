@@ -326,7 +326,8 @@ pub fn parse(ts: Ts, p: &Value) -> anyhow::Result<Snapshot> {
     let mut vaps = Vec::new();
     let mut clients = Vec::new();
     for v in vap_table.into_iter().flatten() {
-        let Some(bssid) = string(&v["bssid"]) else { continue };
+        // Lower case, as the neighbours' BSSIDs are kept: the two are compared.
+        let Some(bssid) = string(&v["bssid"]).map(|b| b.to_ascii_lowercase()) else { continue };
         // Clients come from user and guest VAPs; mesh uplink/downlink VAPs are skipped.
         let usage = v["usage"].as_str().unwrap_or("user");
         let essid = string(&v["essid"]);
@@ -568,5 +569,16 @@ pub(crate) mod tests {
         assert!(!s.has_vap_table);
         assert!(s.clients.is_empty());
         assert_eq!(s.ap.num_sta, None, "unknown, not zero");
+    }
+
+    #[test]
+    fn bssids_are_kept_in_lower_case() {
+        let p = serde_json::json!({
+            "mac": "02:00:00:00:00:01",
+            "vap_table": [{ "bssid": "02:AB:00:00:00:01", "essid": "Home", "radio": "na" }],
+            "radio_table": [{ "radio": "na", "scan_table": [{ "bssid": "02:CD:00:00:00:01", "essid": "Next door" }] }],
+        });
+        let s = parse(1000, &p).unwrap();
+        assert_eq!((s.vaps[0].bssid.as_str(), s.neighbors[0].bssid.as_str()), ("02:ab:00:00:00:01", "02:cd:00:00:00:01"));
     }
 }
