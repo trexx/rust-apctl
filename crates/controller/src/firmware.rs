@@ -25,6 +25,8 @@ use rusqlite::types::Value as Sql;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
+use inform::Mac;
+
 use crate::api::{ApiError, AppState};
 use crate::model::Ts;
 use crate::store::{self, Db, Store, Writer};
@@ -110,9 +112,20 @@ pub fn status(current: Option<&str>, release: Option<&Release>, required: Option
     }
 }
 
+/// Where an upgrade is: queued, sent with an inform reply, then the AP's own steps.
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum JobState {
+    Queued,
+    Sent,
+    Preparing,
+    Downloading,
+    Writing,
+}
+
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct Job {
-    pub mac: String,
+    pub mac: Mac,
     pub name: Option<String>,
     pub from: Option<String>,
     /// The version to install, or "custom" for a firmware URL.
@@ -121,8 +134,7 @@ pub struct Job {
     pub md5: Option<String>,
     pub sha256: Option<String>,
     pub custom: bool,
-    /// `queued`, `sent`, `downloading` or `writing`.
-    pub state: &'static str,
+    pub state: JobState,
     pub sent_at: Option<Ts>,
     pub expires: Option<Ts>,
 }
@@ -154,15 +166,15 @@ impl Jobs {
         }
     }
 
-    pub fn current_for(&mut self, mac: &str) -> Option<&mut Job> {
-        self.current.as_mut().filter(|j| j.mac == mac)
+    pub fn current_for(&mut self, mac: &Mac) -> Option<&mut Job> {
+        self.current.as_mut().filter(|j| j.mac == *mac)
     }
 
     /// The AP reports its version: the job succeeded if it was upgrading and
     /// the version changed. When the version it started from is not known, the
     /// first one it reports after the upgrade was sent is taken as that.
-    pub fn version_seen(&mut self, mac: &str, version: &str) -> Option<Job> {
-        let j = self.current.as_mut().filter(|j| j.mac == mac && j.state != "queued")?;
+    pub fn version_seen(&mut self, mac: &Mac, version: &str) -> Option<Job> {
+        let j = self.current.as_mut().filter(|j| j.mac == *mac && j.state != JobState::Queued)?;
         match &j.from {
             None => {
                 j.from = Some(version.to_string());
@@ -177,24 +189,24 @@ impl Jobs {
     }
 
     /// The current job failed: stop the queue so a problem is not repeated on every AP.
-    pub fn failed(&mut self, mac: &str, why: &str) -> Option<Job> {
-        let j = self.current.as_ref().filter(|j| j.mac == mac)?.clone();
+    pub fn failed(&mut self, mac: &Mac, why: &str) -> Option<Job> {
+        let j = self.current.as_ref().filter(|j| j.mac == *mac)?.clone();
         self.current = None;
         if !self.queue.is_empty() {
-            self.stopped = Some(format!("{} failed: {why}", j.name.as_deref().unwrap_or(&j.mac)));
+            self.stopped = Some(format!("{} failed: {why}", j.name.clone().unwrap_or_else(|| j.mac.to_string())));
         }
         Some(j)
     }
 
     /// A sent upgrade that has not finished in time.
-    pub fn expired(&self, now: Ts) -> Option<String> {
-        self.current.as_ref().filter(|j| j.expires.is_some_and(|e| now > e)).map(|j| j.mac.clone())
+    pub fn expired(&self, now: Ts) -> Option<Mac> {
+        self.current.as_ref().filter(|j| j.expires.is_some_and(|e| now > e)).map(|j| j.mac)
     }
 
     pub fn cancel_queued(&mut self) -> usize {
-        let n = self.queue.len() + usize::from(self.current.as_ref().is_some_and(|j| j.state == "queued"));
+        let n = self.queue.len() + usize::from(self.current.as_ref().is_some_and(|j| j.state == JobState::Queued));
         self.queue.clear();
-        if self.current.as_ref().is_some_and(|j| j.state == "queued") {
+        if self.current.as_ref().is_some_and(|j| j.state == JobState::Queued) {
             self.current = None;
         }
         self.stopped = None;
@@ -205,13 +217,13 @@ impl Jobs {
 /// The upgrade command for an AP's inform reply, if its turn has come. Marks
 /// the job sent and sets its deadline: at least 450 s (the official
 /// controller's minimum for U6 APs), or the AP's own upgrade + reboot estimate.
-pub fn command(jobs: &mut Jobs, mac: &str, inform: &Value, now: Ts) -> Option<Result<Value, &'static str>> {
-    let j = jobs.current_for(mac).filter(|j| j.state == "queued")?;
+pub fn command(jobs: &mut Jobs, mac: &Mac, inform: &Value, now: Ts) -> Option<Result<Value, &'static str>> {
+    let j = jobs.current_for(mac).filter(|j| j.state == JobState::Queued)?;
     if !j.custom && inform["internet"].as_bool() == Some(false) {
         return Some(Err("the AP has no internet access to download the firmware"));
     }
     let estimate = inform["upgrade_duration"].as_i64().unwrap_or(0) + inform["reboot_duration"].as_i64().unwrap_or(0);
-    j.state = "sent";
+    j.state = JobState::Sent;
     j.sent_at = Some(now);
     j.expires = Some(now + estimate.max(450));
     // What it runs now, so that only a different version counts as the upgrade landing.
@@ -308,7 +320,7 @@ fn releases(store: &Store) -> anyhow::Result<(Vec<Release>, Option<Ts>, Option<S
 // ---------------------------------------------------------------- API
 
 struct ApInfo {
-    mac: String,
+    mac: Mac,
     name: Option<String>,
     model: Option<String>,
     version: Option<String>,
@@ -325,7 +337,7 @@ fn aps(s: &AppState) -> Vec<ApInfo> {
         .map(|(mac, d)| {
             let raw = live.raw_informs.get(mac);
             ApInfo {
-                mac: mac.to_string(),
+                mac: *mac,
                 name: d.snapshot.ap.hostname.clone(),
                 model: d.snapshot.ap.model.clone(),
                 version: d.snapshot.ap.version.clone(),
@@ -391,7 +403,7 @@ pub async fn upgrade(State(s): State<AppState>, headers: HeaderMap, Json(b): Jso
     crate::api::require_active(&s, "upgrades need")?;
     let store = s.store.clone();
     let (rels, ..) = tokio::task::spawn_blocking(move || releases(&store)).await??;
-    let wanted: Vec<String> = b.macs.iter().map(|m| m.to_ascii_lowercase()).collect();
+    let wanted: Vec<Mac> = b.macs.iter().filter_map(|m| m.parse().ok()).collect();
     let mut chosen: Vec<ApInfo> = aps(&s).into_iter().filter(|a| wanted.contains(&a.mac)).collect();
     // Mesh APs first: an AP with mesh children must not restart before them.
     chosen.sort_by(|x, y| y.mesh.cmp(&x.mesh).then(x.mac.cmp(&y.mac)));
@@ -409,7 +421,7 @@ pub async fn upgrade(State(s): State<AppState>, headers: HeaderMap, Json(b): Jso
                 md5: r.md5,
                 sha256: r.sha256,
                 custom: false,
-                state: "queued",
+                state: JobState::Queued,
                 sent_at: None,
                 expires: None,
             }),
@@ -444,7 +456,7 @@ pub async fn upgrade_url(State(s): State<AppState>, headers: HeaderMap, Json(b):
     if !valid_firmware_url(&b.url) {
         return Err(ApiError(StatusCode::BAD_REQUEST, "use an http(s) or ftp URL ending in .bin or .tar".into()));
     }
-    let mac = b.mac.to_ascii_lowercase();
+    let mac = crate::api::parse_mac(&b.mac)?;
     let a = aps(&s).into_iter().find(|a| a.mac == mac).ok_or_else(|| ApiError(StatusCode::NOT_FOUND, "unknown AP".into()))?;
     if !a.online {
         return Err(ApiError(StatusCode::CONFLICT, "the AP is offline".into()));
@@ -458,7 +470,7 @@ pub async fn upgrade_url(State(s): State<AppState>, headers: HeaderMap, Json(b):
         md5: None,
         sha256: None,
         custom: true,
-        state: "queued",
+        state: JobState::Queued,
         sent_at: None,
         expires: None,
     };
@@ -514,9 +526,14 @@ mod tests {
         assert_eq!(status(Some("6.7.0.1"), None, None), "unknown");
     }
 
+    /// A test AP's MAC, by a one-hex-digit name.
+    fn m(name: &str) -> Mac {
+        format!("02:00:00:00:00:0{name}").parse().unwrap()
+    }
+
     fn job(mac: &str) -> Job {
         Job {
-            mac: mac.into(),
+            mac: m(mac),
             name: Some(mac.into()),
             from: Some("6.7.0.1".into()),
             target: "6.8.2.15592".into(),
@@ -524,7 +541,7 @@ mod tests {
             md5: Some("m".into()),
             sha256: Some("s".into()),
             custom: false,
-            state: "queued",
+            state: JobState::Queued,
             sent_at: None,
             expires: None,
         }
@@ -534,52 +551,52 @@ mod tests {
     fn one_at_a_time_and_stop_on_failure() {
         let mut j = Jobs::default();
         j.enqueue(vec![job("a"), job("b"), job("c")]);
-        assert_eq!(j.current.as_ref().map(|c| c.mac.as_str()), Some("a"));
+        assert_eq!(j.current.as_ref().map(|c| c.mac), Some(m("a")));
         // Not a's turn to be told yet for b.
-        assert!(command(&mut j, "b", &json!({}), 100).is_none());
+        assert!(command(&mut j, &m("b"), &json!({}), 100).is_none());
         // a informs: it gets the command (sha256 only with the capability bit).
-        let cmd = command(&mut j, "a", &json!({ "fw_caps": CAP_SHA256, "upgrade_duration": 120, "reboot_duration": 60 }), 100).unwrap().unwrap();
+        let cmd = command(&mut j, &m("a"), &json!({ "fw_caps": CAP_SHA256, "upgrade_duration": 120, "reboot_duration": 60 }), 100).unwrap().unwrap();
         assert_eq!((cmd["_type"].as_str(), cmd["version"].as_str(), cmd["md5sum"].as_str(), cmd["sha256sum"].as_str()), (Some("upgrade"), Some("6.8.2.15592"), Some("m"), Some("s")));
         assert_eq!(j.current.as_ref().and_then(|c| c.expires), Some(100 + 450), "at least 450 s");
-        assert!(command(&mut j, "a", &json!({}), 110).is_none(), "sent once");
-        assert!(j.version_seen("b", "6.8.2.15592").is_none(), "not b's turn");
+        assert!(command(&mut j, &m("a"), &json!({}), 110).is_none(), "sent once");
+        assert!(j.version_seen(&m("b"), "6.8.2.15592").is_none(), "not b's turn");
         // The same version again is not success; the new one is.
-        assert!(j.version_seen("a", "6.7.0.1").is_none());
-        assert!(j.version_seen("a", "6.8.2.15592").is_some());
-        assert_eq!(j.current.as_ref().map(|c| c.mac.as_str()), Some("b"));
+        assert!(j.version_seen(&m("a"), "6.7.0.1").is_none());
+        assert!(j.version_seen(&m("a"), "6.8.2.15592").is_some());
+        assert_eq!(j.current.as_ref().map(|c| c.mac), Some(m("b")));
         // b has no internet: refused, and the queue stops before c.
-        assert_eq!(command(&mut j, "b", &json!({ "internet": false }), 200).unwrap().unwrap_err(), "the AP has no internet access to download the firmware");
-        j.failed("b", "no internet");
+        assert_eq!(command(&mut j, &m("b"), &json!({ "internet": false }), 200).unwrap().unwrap_err(), "the AP has no internet access to download the firmware");
+        j.failed(&m("b"), "no internet");
         assert!(j.current.is_none() && j.stopped.is_some() && j.queue.len() == 1);
         // Starting again clears the stop.
         j.enqueue(vec![]);
-        assert_eq!(j.current.as_ref().map(|c| c.mac.as_str()), Some("c"));
+        assert_eq!(j.current.as_ref().map(|c| c.mac), Some(m("c")));
     }
 
     #[test]
     fn success_needs_a_version_change_when_the_start_is_unknown() {
         let mut j = Jobs::default();
         j.enqueue(vec![Job { from: None, ..job("a") }]);
-        assert!(j.version_seen("a", "6.7.0.1").is_none(), "not sent yet");
+        assert!(j.version_seen(&m("a"), "6.7.0.1").is_none(), "not sent yet");
         // The version in the inform the command goes out with is where it started.
-        command(&mut j, "a", &json!({ "version": "6.7.0.1" }), 0).unwrap().unwrap();
-        assert!(j.version_seen("a", "6.7.0.1").is_none(), "the next inform, still downloading");
-        assert_eq!(j.version_seen("a", "6.8.2.15592").and_then(|x| x.from).as_deref(), Some("6.7.0.1"));
+        command(&mut j, &m("a"), &json!({ "version": "6.7.0.1" }), 0).unwrap().unwrap();
+        assert!(j.version_seen(&m("a"), "6.7.0.1").is_none(), "the next inform, still downloading");
+        assert_eq!(j.version_seen(&m("a"), "6.8.2.15592").and_then(|x| x.from).as_deref(), Some("6.7.0.1"));
         // An inform without a version: the first one reported afterwards is the start.
         j.enqueue(vec![Job { from: None, ..job("b") }]);
-        command(&mut j, "b", &json!({}), 0).unwrap().unwrap();
-        assert!(j.version_seen("b", "6.7.0.1").is_none());
-        assert!(j.version_seen("b", "6.7.0.1").is_none());
-        assert!(j.version_seen("b", "6.8.2.15592").is_some());
+        command(&mut j, &m("b"), &json!({}), 0).unwrap().unwrap();
+        assert!(j.version_seen(&m("b"), "6.7.0.1").is_none());
+        assert!(j.version_seen(&m("b"), "6.7.0.1").is_none());
+        assert!(j.version_seen(&m("b"), "6.8.2.15592").is_some());
     }
 
     #[test]
     fn deadlines_and_cancelling() {
         let mut j = Jobs::default();
         j.enqueue(vec![job("a"), job("b")]);
-        command(&mut j, "a", &json!({ "upgrade_duration": 600, "reboot_duration": 100 }), 0).unwrap().unwrap();
+        command(&mut j, &m("a"), &json!({ "upgrade_duration": 600, "reboot_duration": 100 }), 0).unwrap().unwrap();
         assert_eq!(j.expired(700), None);
-        assert_eq!(j.expired(701), Some("a".into()));
+        assert_eq!(j.expired(701), Some(m("a")));
         assert_eq!(j.cancel_queued(), 1, "only b; a is already upgrading");
         assert!(j.current.is_some());
     }

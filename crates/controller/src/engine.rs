@@ -488,7 +488,7 @@ impl Engine {
         );
         // An upgrade we sent has landed: the AP reports the new version.
         if let Some(v) = &snap.ap.version
-            && let Some(j) = live.firmware.version_seen(&mac.to_string(), v)
+            && let Some(j) = live.firmware.version_seen(&mac, v)
         {
             events.push(ev(ts, "ap_upgraded", Some(mac), None, json!({ "from": j.from, "to": v, "custom": j.custom })));
         }
@@ -935,15 +935,15 @@ impl Engine {
     /// Upgrade progress from the AP: downloading, writing, or an error.
     fn upgrade_notice(&self, live: &mut Live, ts: Ts, mac: Mac, n: &Value) {
         let s = |k: &str| n[k].as_str().unwrap_or_default().to_string();
-        let key = mac.to_string();
         match (n["up_type"].as_str(), n["up_stage"].as_str()) {
             (Some("UpgradeReady"), stage) => {
+                use crate::firmware::JobState;
                 let step = match stage {
-                    Some("FWDownloading") => "downloading",
-                    Some("FWCheckOK") => "writing",
-                    _ => "preparing",
+                    Some("FWDownloading") => JobState::Downloading,
+                    Some("FWCheckOK") => JobState::Writing,
+                    _ => JobState::Preparing,
                 };
-                if let Some(j) = live.firmware.current_for(&key) {
+                if let Some(j) = live.firmware.current_for(&mac) {
                     j.state = step;
                     // Re-arm the deadline as the official controller does on each step.
                     j.expires = Some(ts + 450);
@@ -958,7 +958,7 @@ impl Engine {
                     "FWWriteFailed" => "writing the firmware failed".into(),
                     r => format!("failed ({r})"),
                 };
-                live.firmware.failed(&key, &detail);
+                live.firmware.failed(&mac, &detail);
                 self.emit(live, ev(ts, "ap_upgrade_failed", Some(mac), None, json!({ "reason": reason, "detail": detail })));
             }
             _ => {}
@@ -1025,7 +1025,7 @@ impl Engine {
                 && let Some(j) = live.firmware.failed(&mac, "it did not come back with the new firmware in time")
             {
                 let data = json!({ "reason": "timed out", "detail": "it did not come back with the new firmware in time", "target": j.target });
-                self.emit(&mut live, ev(now, "ap_upgrade_failed", mac.parse().ok(), None, data));
+                self.emit(&mut live, ev(now, "ap_upgrade_failed", Some(mac), None, data));
             }
         }
         let found = self.logevents.tick(now);

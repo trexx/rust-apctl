@@ -283,7 +283,7 @@ impl Active {
 
         if reported == cfgversion {
             // Config is current: is it this AP's turn for a firmware upgrade?
-            let cmd = crate::firmware::command(&mut self.live.write().unwrap().firmware, &mac.to_string(), payload, ts);
+            let cmd = crate::firmware::command(&mut self.live.write().unwrap().firmware, &mac, payload, ts);
             match cmd {
                 Some(Ok(cmd)) => {
                     tracing::warn!("{mac}: sending firmware upgrade to {}", cmd["version"]);
@@ -292,7 +292,7 @@ impl Active {
                     return cmd;
                 }
                 Some(Err(why)) => {
-                    let failed = self.live.write().unwrap().firmware.failed(&mac.to_string(), why);
+                    let failed = self.live.write().unwrap().firmware.failed(&mac, why);
                     if failed.is_some() {
                         let _ = self.engine.try_send(Input::Note { ts, kind: "ap_upgrade_failed", mac, data: json!({ "reason": "no internet", "detail": why }) });
                     }
@@ -537,7 +537,7 @@ mod tests {
         let (_, reply) = inform_as_ap(&rig, &ap_payload("1111111111111111"), KEY, GCM_ZLIB).await;
         let version = reply.unwrap().1["cfgversion"].as_str().unwrap().to_string();
         rig.live.write().unwrap().firmware.enqueue(vec![crate::firmware::Job {
-            mac: AP.into(),
+            mac: AP.parse().unwrap(),
             name: None,
             from: Some("8.8.11.20161".into()),
             target: "8.8.12.20200".into(),
@@ -545,7 +545,7 @@ mod tests {
             md5: Some("abc".into()),
             sha256: None,
             custom: false,
-            state: "queued",
+            state: crate::firmware::JobState::Queued,
             sent_at: None,
             expires: None,
         }]);
@@ -560,7 +560,7 @@ mod tests {
         // Sent once: the next inform is a heartbeat.
         let (_, reply) = inform_as_ap(&rig, &ap_payload(&version), KEY, GCM_ZLIB).await;
         assert_eq!(reply.unwrap().1["_type"], "noop");
-        assert_eq!(rig.live.read().unwrap().firmware.current.as_ref().map(|j| j.state), Some("sent"));
+        assert_eq!(rig.live.read().unwrap().firmware.current.as_ref().map(|j| j.state), Some(crate::firmware::JobState::Sent));
     }
 
     #[tokio::test]

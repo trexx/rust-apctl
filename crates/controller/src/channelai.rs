@@ -118,7 +118,7 @@ pub fn pinned(live: &Live, band: &str) -> Vec<String> {
         }
     }
     if let Some(j) = &live.firmware.current {
-        out.push(j.mac.to_ascii_lowercase());
+        out.push(j.mac.to_string());
     }
     out
 }
