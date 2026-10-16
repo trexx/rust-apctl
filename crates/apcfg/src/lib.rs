@@ -24,7 +24,7 @@
 
 mod cfg;
 mod javahash;
-mod json;
+pub mod json;
 mod meta;
 mod mgmt;
 mod net;
@@ -141,10 +141,59 @@ pub(crate) fn bit(v: u64, n: u32) -> bool {
     v >> n & 1 == 1
 }
 
+/// A capability bit a feature needs (any one of a list will do).
+#[derive(Clone, Copy)]
+enum Need {
+    Fw(u32),
+    Fw2(u32),
+    Fw3(u32),
+    Wifi(u32),
+    Wifi2(u32),
+    Hw(u32),
+    /// Every radio supports WPA3 fast roaming (`radio_caps2`).
+    RadiosFt,
+}
+
+impl Need {
+    fn met(self, caps: &Caps, radios_ft: bool) -> bool {
+        match self {
+            Need::Fw(b) => bit(caps.fw, b),
+            Need::Fw2(b) => bit(caps.fw2, b),
+            Need::Fw3(b) => bit(caps.fw3, b),
+            Need::Wifi(b) => bit(caps.wifi, b),
+            Need::Wifi2(b) => bit(caps.wifi2, b),
+            Need::Hw(b) => bit(caps.hw, b),
+            Need::RadiosFt => radios_ft,
+        }
+    }
+}
+
+type FeatureTable<const N: usize> = [(&'static str, &'static [Need]); N];
+
+const fn feature_names<const N: usize>(table: FeatureTable<N>) -> [&'static str; N] {
+    let mut out = [""; N];
+    let mut i = 0;
+    while i < N {
+        out[i] = table[i].0;
+        i += 1;
+    }
+    out
+}
+
+/// Optional SSID features with the capability bits `render` checks for each.
+const SSID_FEATURE_CAPS: FeatureTable<6> = [
+    ("dns_assistance", &[Need::Fw3(3)]),
+    ("advertise_ap_name", &[Need::Wifi2(6)]),
+    ("roaming_assistant", &[Need::Wifi2(5)]),
+    ("multicast_suppression", &[Need::Wifi2(22)]),
+    ("wpa3_fast_roaming", &[Need::RadiosFt]),
+    ("mdns_proxy", &[Need::Fw2(28)]),
+];
+
 /// Optional SSID features that depend on what the AP supports, with the
 /// capability bit `render` checks for each one. An AP without it gets the SSID
 /// without the feature (no config lines), as the official controller does.
-pub const SSID_FEATURES: &[&str] = &["dns_assistance", "advertise_ap_name", "roaming_assistant", "multicast_suppression", "wpa3_fast_roaming", "mdns_proxy"];
+pub const SSID_FEATURES: &[&str] = &feature_names(SSID_FEATURE_CAPS);
 
 /// Which of [`SSID_FEATURES`] the AP supports, as `(feature, supported)`, or
 /// `None` while that is unknown: the AP has not sent an inform and the
@@ -156,22 +205,7 @@ pub fn ssid_feature_support(device: &Value, inform: Option<&Value>) -> Option<Ve
     }
     let radios = json::arr(device, "radio_table");
     let ft = !radios.is_empty() && radios.iter().all(|r| bit(json::int_of(r, "radio_caps2").unwrap_or(0) as u64, wlan::RCAP2_SAE_FT));
-    Some(
-        SSID_FEATURES
-            .iter()
-            .map(|&f| {
-                let ok = match f {
-                    "dns_assistance" => bit(caps.fw3, 3),
-                    "advertise_ap_name" => bit(caps.wifi2, 6),
-                    "roaming_assistant" => bit(caps.wifi2, 5),
-                    "multicast_suppression" => bit(caps.wifi2, 22),
-                    "mdns_proxy" => bit(caps.fw2, 28),
-                    _ => ft,
-                };
-                (f, ok)
-            })
-            .collect(),
-    )
+    Some(SSID_FEATURE_CAPS.iter().map(|&(f, needs)| (f, needs.iter().any(|n| n.met(&caps, ft)))).collect())
 }
 
 /// Everything one render needs, resolved once.
@@ -200,7 +234,7 @@ impl<'a> Ctx<'a> {
         let site_id = json::str_of(device, "site_id").context("device has no site_id")?.to_string();
         let site = json::arr(state, "sites")
             .iter()
-            .find(|s| json::oid(s).as_deref() == Some(site_id.as_str()))
+            .find(|s| json::oid(s) == Some(site_id.as_str()))
             .with_context(|| format!("site {site_id} is not in the state"))?;
         if json::str_of(device, "type").is_some_and(|t| t != "uap") {
             bail!("device {mac} is not an access point");
@@ -237,7 +271,7 @@ impl<'a> Ctx<'a> {
     }
 
     pub fn network(&self, id: &str) -> Option<&'a Value> {
-        self.site_docs("networkconf").find(|n| json::oid(n).as_deref() == Some(id))
+        self.site_docs("networkconf").find(|n| json::oid(n) == Some(id))
     }
 
     /// SSH account name: also the user cron jobs run as.
@@ -250,9 +284,19 @@ impl<'a> Ctx<'a> {
     }
 }
 
+const DEVICE_FEATURE_CAPS: FeatureTable<7> = [
+    ("band_steering", &[Need::Wifi(2)]),
+    ("airtime_fairness", &[Need::Wifi(5)]),
+    ("green_ap", &[Need::Wifi2(2)]),
+    ("led", &[Need::Hw(1), Need::Hw(14)]),
+    ("led_color", &[Need::Hw(1)]),
+    ("jumbo_frames", &[Need::Fw(4)]),
+    ("snmp", &[Need::Fw(13), Need::Fw(14)]),
+];
+
 /// AP-wide features that depend on the AP's capability bits, as `render`
 /// checks them: without the bit the setting is not sent at all.
-pub const DEVICE_FEATURES: &[&str] = &["band_steering", "airtime_fairness", "green_ap", "led", "led_color", "jumbo_frames", "snmp"];
+pub const DEVICE_FEATURES: &[&str] = &feature_names(DEVICE_FEATURE_CAPS);
 
 /// Which of [`DEVICE_FEATURES`] the AP supports, or `None` while unknown (see
 /// [`ssid_feature_support`]).
@@ -261,23 +305,7 @@ pub fn device_feature_support(device: &Value, inform: Option<&Value>) -> Option<
     if caps.fw == 0 && caps.wifi == 0 && caps.hw == 0 {
         return None;
     }
-    Some(
-        DEVICE_FEATURES
-            .iter()
-            .map(|&f| {
-                let ok = match f {
-                    "band_steering" => bit(caps.wifi, 2),
-                    "airtime_fairness" => bit(caps.wifi, 5),
-                    "green_ap" => bit(caps.wifi2, 2),
-                    "led" => bit(caps.hw, 1) || bit(caps.hw, 14),
-                    "led_color" => bit(caps.hw, 1),
-                    "snmp" => bit(caps.fw, 13) || bit(caps.fw, 14),
-                    _ => bit(caps.fw, 4),
-                };
-                (f, ok)
-            })
-            .collect(),
-    )
+    Some(DEVICE_FEATURE_CAPS.iter().map(|&(f, needs)| (f, needs.iter().any(|n| n.met(&caps, false)))).collect())
 }
 
 #[cfg(test)]

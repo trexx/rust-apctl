@@ -17,9 +17,10 @@ pub fn render(ctx: &Ctx) -> Result<(String, Value)> {
     let mut meta = Meta::load(ctx, i64::from(qca_v2));
     let radios = wlan::radios(ctx);
     let wanted = wlan::deploy(ctx, &radios);
-    let keys: Vec<(String, String)> = wanted.iter().map(|(w, r)| (wlan_id(w), radios[*r].name.clone())).collect();
+    let keys: Vec<(String, String)> = wanted.iter().map(|(w, r)| (wlan_id(w).to_string(), radios[*r].name.clone())).collect();
     let slots = meta.wireless(&keys, |radio, k| if qca_v2 { format!("{radio}ap{k}") } else { format!("ath{k}") });
-    let vaps: Vec<Vap> = wanted.into_iter().zip(slots).map(|((w, radio), slot)| Vap { w, radio, slot }).collect();
+    let vaps: Vec<Vap> =
+        wanted.into_iter().zip(slots).zip(keys).map(|(((w, radio), slot), (id, _))| Vap { id, w, radio, slot }).collect();
     let net = net::build(ctx, &radios, &vaps)?;
 
     let mut c = Cfg::default();
@@ -148,7 +149,7 @@ fn ledbar(c: &mut Cfg, ctx: &Ctx) {
     c.set("ledbar.status", on_off(on));
     c.set("ledbar.persistent", "true");
     if on {
-        let pct = int_of(ctx.device, "led_override_color_brightness").unwrap_or(100);
+        let pct = int_of(ctx.device, "led_override_color_brightness").unwrap_or(100).clamp(0, 100);
         c.set("ledbar.brightness", 255 * pct / 100);
         c.set("ledbar.active", 3);
         if bit(ctx.caps.hw, 1) {
@@ -228,8 +229,7 @@ fn bandsteering(c: &mut Cfg, ctx: &Ctx, radios: &[Radio], vaps: &[Vap]) {
     }
     let mut k = 0;
     for ng in vaps.iter().filter(|v| radios[v.radio].band == "ng") {
-        let id = wlan_id(&ng.w);
-        if let Some(na) = vaps.iter().find(|v| radios[v.radio].band == "na" && wlan_id(&v.w) == id) {
+        if let Some(na) = vaps.iter().find(|v| radios[v.radio].band == "na" && v.id == ng.id) {
             k += 1;
             c.set(format!("bandsteering.{k}.status"), "enabled");
             c.set(format!("bandsteering.{k}.vap.1.devname"), ng.dev());
@@ -308,8 +308,9 @@ pub fn hostname(name: &str) -> String {
 
 /// `dhcpc`, `route` and `resolv`.
 fn addressing(c: &mut Cfg, ctx: &Ctx) {
-    let cn = ctx.device.get("config_network").cloned().unwrap_or_default();
-    let is_static = str_of(&cn, "type") == Some("static");
+    let static_ip = net::static_ip(ctx);
+    let is_static = static_ip.is_some();
+    let cn = |key: &str| static_ip.and_then(|cn| str_of(cn, key));
     c.header("dhcpc");
     c.set("dhcpc.status", "enabled");
     if !is_static {
@@ -321,7 +322,7 @@ fn addressing(c: &mut Cfg, ctx: &Ctx) {
         c.set("route.1.status", "enabled");
         c.set("route.1.devname", "br0");
         c.set("route.1.ip", "0.0.0.0");
-        c.opt("route.1.gateway", str_of(&cn, "gateway"));
+        c.opt("route.1.gateway", cn("gateway"));
     }
     c.set("route.status", "enabled");
     c.header("resolv");
@@ -329,14 +330,14 @@ fn addressing(c: &mut Cfg, ctx: &Ctx) {
     let name = str_of(ctx.device, "name").map(hostname).filter(|h| !h.is_empty());
     c.opt("resolv.host.1.name", name);
     for i in 1..=2 {
-        let dns = if is_static { str_of(&cn, &format!("dns{i}")).filter(|d| !d.is_empty()) } else { None };
+        let dns = cn(&format!("dns{i}")).filter(|d| !d.is_empty());
         match dns {
             Some(ip) => c.set(format!("resolv.nameserver.{i}.ip"), ip),
             None => c.set(format!("resolv.nameserver.{i}.status"), "disabled"),
         }
     }
     if is_static {
-        c.opt("resolv.search", str_of(&cn, "dnssuffix").filter(|s| !s.is_empty()));
+        c.opt("resolv.search", cn("dnssuffix").filter(|s| !s.is_empty()));
     }
 }
 
@@ -557,36 +558,27 @@ fn entry_services(e: &Value) -> Vec<String> {
 }
 
 fn mdns(c: &mut Cfg, ctx: &Ctx, vaps: &[Vap], net: &Net) {
-    let groups: Vec<String> = ctx
-        .site_docs("apgroup")
-        .filter(|g| {
-            str_of(g, "attr_hidden_id") == Some("default")
-                || str_list(g, "device_macs").iter().any(|m| mac_eq(m, &ctx.mac))
-        })
-        .filter_map(crate::json::oid)
-        .collect();
+    let groups = wlan::ap_groups(ctx);
     let applies = |e: &Value| match str_of(e, "ap_scope_mode").unwrap_or("all") {
         "all" => true,
         "specific" => str_list(e, "ap_macs").iter().any(|m| mac_eq(m, &ctx.mac)),
         "group" => str_list(e, "ap_group_ids").iter().any(|g| groups.iter().any(|m| m == g)),
         _ => false,
     };
-    let mut seen: Vec<String> = Vec::new();
-    let mut wlans: Vec<&Value> = Vec::new();
+    // One VAP per WLAN stands for all of its radios.
+    let mut wlans: Vec<&Vap> = Vec::new();
     for v in vaps {
-        let id = wlan_id(&v.w);
-        if !seen.contains(&id) && matches!(str_of(&v.w, "mdns_proxy_mode"), Some("auto" | "custom")) {
-            seen.push(id);
-            wlans.push(&v.w);
+        if !wlans.iter().any(|o| o.id == v.id) && matches!(str_of(&v.w, "mdns_proxy_mode"), Some("auto" | "custom")) {
+            wlans.push(v);
         }
     }
     if wlans.is_empty() {
         return;
     }
     c.set("mdns_sd.status", "enabled");
-    let isolation = wlans.iter().any(|w| {
-        str_of(w, "mdns_proxy_mode") == Some("custom")
-            && arr(w, "mdns_proxy_custom").iter().any(|e| applies(e) && flag(e, "isolation_enabled", false))
+    let isolation = wlans.iter().any(|v| {
+        str_of(&v.w, "mdns_proxy_mode") == Some("custom")
+            && arr(&v.w, "mdns_proxy_custom").iter().any(|e| applies(e) && flag(e, "isolation_enabled", false))
     });
     if isolation {
         c.set("mdns_sd.ap_mode", "enabled");
@@ -596,9 +588,9 @@ fn mdns(c: &mut Cfg, ctx: &Ctx, vaps: &[Vap], net: &Net) {
         net.bridges.iter().find(|b| b.vlan == tag).map(|b| b.name.clone())
     };
     let (mut f, mut p) = (0, 0);
-    for w in wlans {
-        let id = wlan_id(w);
-        let devs: Vec<&str> = vaps.iter().filter(|v| wlan_id(&v.w) == id).map(Vap::dev).collect();
+    for wv in wlans {
+        let w = &wv.w;
+        let devs: Vec<&str> = vaps.iter().filter(|v| v.id == wv.id).map(Vap::dev).collect();
         let own = str_of(w, "networkconf_id").map(str::to_string);
         let mut entries: Vec<MdnsEntry> = Vec::new();
         if str_of(w, "mdns_proxy_mode") == Some("custom") {
@@ -724,7 +716,7 @@ fn qos(c: &mut Cfg, ctx: &Ctx, radios: &[Radio], vaps: &[Vap]) {
     let default = groups.iter().find(|g| str_of(g, "attr_hidden_id") == Some("Default")).copied();
     for (i, v) in vaps.iter().enumerate() {
         let m = i + 1;
-        let group = str_of(&v.w, "usergroup_id").and_then(|id| groups.iter().find(|g| crate::json::oid(g).as_deref() == Some(id)).copied()).or(default);
+        let group = str_of(&v.w, "usergroup_id").and_then(|id| groups.iter().find(|g| crate::json::oid(g) == Some(id)).copied()).or(default);
         let (down, up) = group.map_or((-1, -1), limits);
         let ceiling = radio_max_mbps(&radios[v.radio]);
         c.set(format!("qos.vap.{m}.id"), m);

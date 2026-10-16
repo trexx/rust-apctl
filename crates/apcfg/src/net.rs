@@ -2,6 +2,7 @@
 //! frames off untagged VAPs.
 
 use anyhow::{Result, bail};
+use serde_json::Value;
 
 use crate::Ctx;
 use crate::cfg::Cfg;
@@ -44,6 +45,11 @@ fn wlan_vlan(ctx: &Ctx, vap: &Vap) -> Option<i64> {
         return int_of(w, "vlan");
     }
     None
+}
+
+/// The AP's `config_network` when it has a static address.
+pub fn static_ip<'a>(ctx: &Ctx<'a>) -> Option<&'a Value> {
+    ctx.device.get("config_network").filter(|cn| str_of(cn, "type") == Some("static"))
 }
 
 pub fn build(ctx: &Ctx, radios: &[Radio], vaps: &[Vap]) -> Result<Net> {
@@ -160,8 +166,7 @@ pub fn render_netconf(c: &mut Cfg, ctx: &Ctx, net: &Net, radios: &[Radio], vaps:
     }
     let names: Vec<String> = ifaces.iter().map(|(n, _)| n.clone()).collect();
     let indices = meta.netconf(&names);
-    let cn = ctx.device.get("config_network").cloned().unwrap_or_default();
-    let is_static = str_of(&cn, "type") == Some("static");
+    let static_ip = static_ip(ctx);
     // VAPs are brought up by hostapd on APs that run it for every SSID.
     let hostapd_up = crate::bit(ctx.caps.wifi, 13);
     for ((name, kind), n) in ifaces.iter().zip(indices) {
@@ -169,11 +174,11 @@ pub fn render_netconf(c: &mut Cfg, ctx: &Ctx, net: &Net, radios: &[Radio], vaps:
         let mgmt = name == "br0";
         c.set(k("status"), if matches!(kind, Kind::Vap { disabled: true }) { "disabled" } else { "enabled" });
         c.set(k("devname"), name);
-        let ip = if mgmt && is_static { str_of(&cn, "ip") } else { None };
-        c.set(k("ip"), ip.unwrap_or("0.0.0.0"));
+        let cn = static_ip.filter(|_| mgmt);
+        c.set(k("ip"), cn.and_then(|cn| str_of(cn, "ip")).unwrap_or("0.0.0.0"));
         c.set(k("autoip.status"), "disabled");
-        if mgmt && is_static {
-            c.opt(k("netmask"), str_of(&cn, "netmask"));
+        if let Some(cn) = cn {
+            c.opt(k("netmask"), str_of(cn, "netmask"));
         }
         if matches!(kind, Kind::Eth | Kind::Vap { .. }) {
             c.set(k("promisc"), "enabled");

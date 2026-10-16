@@ -38,7 +38,12 @@ pub fn as_int(v: &Value) -> Option<i64> {
 
 /// A scalar rendered the way it appears in a config line (`9`, `auto`, `true`).
 pub fn text_of(v: &Value, key: &str) -> Option<String> {
-    match v.get(key)? {
+    as_text(v.get(key)?)
+}
+
+/// [`text_of`] for a value at hand (an array element).
+pub fn as_text(v: &Value) -> Option<String> {
+    match v {
         Value::String(s) => Some(s.clone()),
         Value::Number(n) => Some(n.to_string()),
         Value::Bool(b) => Some(b.to_string()),
@@ -55,10 +60,10 @@ pub fn str_list<'a>(v: &'a Value, key: &str) -> Vec<&'a str> {
 }
 
 /// A document id, either `{"_id": {"$oid": "..."}}` (extended JSON) or a plain string.
-pub fn oid(v: &Value) -> Option<String> {
+pub fn oid(v: &Value) -> Option<&str> {
     match v.get("_id")? {
-        Value::String(s) => Some(s.clone()),
-        Value::Object(o) => o.get("$oid").and_then(Value::as_str).map(str::to_string),
+        Value::String(s) => Some(s),
+        Value::Object(o) => o.get("$oid").and_then(Value::as_str),
         _ => None,
     }
 }

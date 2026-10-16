@@ -7,7 +7,7 @@
 
 #![allow(dead_code)]
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::path::PathBuf;
 
 use apcfg::{Controller, Input, Output};
@@ -19,7 +19,11 @@ pub const AP_U: &str = "02:00:00:00:00:02";
 /// The capture fixtures (sanitised real captures, kept outside the repository):
 /// `$APCTL_TESTDATA/2026-10-12-u6m-8.8.11`. Tests that need them skip without it.
 pub fn fixtures() -> Option<PathBuf> {
-    let dir = PathBuf::from(std::env::var_os("APCTL_TESTDATA")?).join("2026-10-12-u6m-8.8.11");
+    let Some(root) = std::env::var_os("APCTL_TESTDATA") else {
+        eprintln!("skipped: APCTL_TESTDATA is not set, so the capture fixtures are not available");
+        return None;
+    };
+    let dir = PathBuf::from(root).join("2026-10-12-u6m-8.8.11");
     if !dir.is_dir() {
         eprintln!("skipped: no capture fixtures in {}", dir.display());
         return None;
@@ -143,6 +147,7 @@ pub fn normalise(cfg: &str, ours: bool) -> Vec<String> {
         }
     }
     let mut groups: BTreeMap<String, Vec<usize>> = BTreeMap::new();
+    let all: HashSet<&str> = lines.iter().map(String::as_str).collect();
     for (i, line) in lines.iter().enumerate() {
         let key = line_kv(line).0;
         let parts: Vec<&str> = key.split('.').collect();
@@ -151,7 +156,7 @@ pub fn normalise(cfg: &str, ours: bool) -> Vec<String> {
         }
         if let ["macacl", k, "acl", j, "mac"] = parts[..] {
             let type_key = format!("macacl.{k}.acl.{j}.type=lock2ap");
-            if lines.contains(&type_key) {
+            if all.contains(type_key.as_str()) {
                 groups.entry(format!("macacl {k}")).or_default().push(i);
             }
         }

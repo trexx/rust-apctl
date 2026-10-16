@@ -5,7 +5,7 @@ use serde_json::Value;
 
 use crate::cfg::Cfg;
 use crate::javahash::hash_set_order;
-use crate::json::{arr, bool_of, flag, int_of, mac_eq, oid, on_off, str_list, str_of, text_of};
+use crate::json::{arr, as_text, bool_of, flag, int_of, mac_eq, oid, on_off, str_list, str_of, text_of};
 use crate::meta::WifiSlot;
 use crate::{Ctx, bit};
 
@@ -31,6 +31,8 @@ pub struct Radio<'a> {
 
 /// One WLAN deployed on one radio.
 pub struct Vap {
+    /// [`wlan_id`] of the WLAN: the same for its VAPs on every radio.
+    pub id: String,
     /// The WLAN document after per-radio adjustments (e.g. WPA3 turned off).
     pub w: Value,
     /// Index into the radio list.
@@ -44,14 +46,14 @@ impl Vap {
     }
 }
 
-pub fn wlan_id(w: &Value) -> String {
-    oid(w).or_else(|| str_of(w, "name").map(str::to_string)).unwrap_or_default()
+pub fn wlan_id(w: &Value) -> &str {
+    oid(w).or_else(|| str_of(w, "name")).unwrap_or_default()
 }
 
 /// The device's radios, sorted by name (`wifi0`, `wifi1`, ...).
 pub fn radios<'a>(ctx: &Ctx<'a>) -> Vec<Radio<'a>> {
-    let mut table: Vec<&Value> = arr(ctx.device, "radio_table").iter().collect();
-    table.sort_by_key(|r| str_of(r, "name").unwrap_or_default().to_string());
+    let mut table: Vec<&'a Value> = arr(ctx.device, "radio_table").iter().collect();
+    table.sort_by_key(|&r| str_of(r, "name").unwrap_or_default());
     table
         .into_iter()
         .enumerate()
@@ -75,7 +77,7 @@ fn band_of_wlan_band(b: &str) -> Option<&'static str> {
 }
 
 /// The AP's AP groups: the site default group plus every group listing its MAC.
-fn ap_groups(ctx: &Ctx) -> Vec<String> {
+pub fn ap_groups<'a>(ctx: &Ctx<'a>) -> Vec<&'a str> {
     ctx.site_docs("apgroup")
         .filter(|g| {
             str_of(g, "attr_hidden_id") == Some("default")
@@ -341,7 +343,7 @@ pub fn network_vlan(ctx: &Ctx, network_id: Option<&str>) -> i64 {
 
 fn radius_profile<'a>(ctx: &Ctx<'a>, w: &Value) -> Option<&'a Value> {
     let id = str_of(w, "radiusprofile_id")?;
-    ctx.site_docs("radiusprofile").find(|p| oid(p).as_deref() == Some(id))
+    ctx.site_docs("radiusprofile").find(|p| oid(p) == Some(id))
 }
 
 /// Dynamic VLAN mode of an EAP WLAN: 0 off, 1 optional, 2 required.
@@ -505,8 +507,8 @@ pub fn render_vap(c: &mut Cfg, ctx: &Ctx, radios: &[Radio], vaps: &[Vap], i: usi
                     c.set(a("sae.sync"), x);
                 }
                 let groups = arr(w, "sae_groups");
-                for (gi, g) in groups.iter().enumerate() {
-                    c.set(a(&format!("sae.groups.{}.group", gi + 1)), g.to_string().trim_matches('"'));
+                    for (gi, g) in groups.iter().enumerate() {
+                    c.opt(a(&format!("sae.groups.{}.group", gi + 1)), as_text(g));
                 }
                 if !groups.is_empty() {
                     c.set(a("sae.has_groups"), "enabled");
@@ -660,8 +662,7 @@ fn render_wireless(c: &mut Cfg, ctx: &Ctx, radios: &[Radio], vaps: &[Vap], i: us
     c.set(k("vport"), "disabled");
     c.set(k("vwire"), "disabled");
     c.set(k("schedule_enabled"), on_off(!arr(w, "schedule_with_duration").is_empty()));
-    let id = wlan_id(w);
-    let has_5g_twin = vaps.iter().any(|o| wlan_id(&o.w) == id && radios[o.radio].band == "na");
+    let has_5g_twin = vaps.iter().any(|o| o.id == v.id && radios[o.radio].band == "na");
     c.set(k("no2ghz_oui"), on_off(b(w, "no2ghz_oui") && r.band == "ng" && has_5g_twin));
     c.set(k("element_adopt"), on_off(b(w, "element_adopt")));
     if b(w, "enhanced_iot") {
@@ -763,8 +764,10 @@ const DAYS: [&str; 7] = ["sun", "mon", "tue", "wed", "thu", "fri", "sat"];
 pub fn blackout_blocks(w: &Value) -> [Vec<(i64, i64)>; 7] {
     let mut days: [Vec<(i64, i64)>; 7] = Default::default();
     for e in arr(w, "schedule_with_duration") {
-        let start = int_of(e, "start_hour").unwrap_or(0) * 60 + int_of(e, "start_minute").unwrap_or(0);
-        let end = start + int_of(e, "duration_minutes").unwrap_or(0);
+        // Imported values are not trusted: the start stays within the day and a
+        // block lasts at most a week, so the loop below runs at most eight times.
+        let start = int_of(e, "start_hour").unwrap_or(0).saturating_mul(60).saturating_add(int_of(e, "start_minute").unwrap_or(0)).clamp(0, 1439);
+        let end = start + int_of(e, "duration_minutes").unwrap_or(0).clamp(0, 7 * 1440);
         if end <= start {
             continue;
         }
@@ -886,5 +889,19 @@ mod schedule_tests {
         let b = blackout_blocks(&w);
         assert_eq!((b[1].clone(), b[2].len()), (vec![(1380, 1440)], 0));
         assert_eq!(lines(&w, true, false), vec!["wireless.1.schedule_invert=enabled", "wireless.1.schedule_mon=2300-2359"]);
+    }
+
+    #[test]
+    fn out_of_range_schedules_are_clamped() {
+        // A duration of years and absurd start times: at most a week, within the day.
+        let w = json!({ "schedule_with_duration": [
+            { "start_days_of_week": ["mon"], "start_hour": 12, "start_minute": 0, "duration_minutes": i64::MAX },
+            { "start_days_of_week": ["tue"], "start_hour": i64::MAX, "start_minute": i64::MAX, "duration_minutes": 30 },
+            { "start_days_of_week": ["wed"], "start_hour": -5, "start_minute": 0, "duration_minutes": 60 },
+        ]});
+        let b = blackout_blocks(&w);
+        assert!(b.iter().all(|day| day.iter().all(|&(s, e)| (0..1440).contains(&s) && s < e && e <= 1440)), "{b:?}");
+        assert_eq!(b[1], vec![(0, 1440)], "a week from Monday noon covers Monday");
+        assert_eq!(b[3], vec![(0, 1440)]);
     }
 }

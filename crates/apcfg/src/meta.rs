@@ -5,6 +5,8 @@
 //! take the lowest free ones, and entries that disappeared free theirs. So deleting a
 //! WLAN leaves a gap instead of renumbering everything after it.
 
+use std::collections::HashSet;
+
 use serde_json::{Value, json};
 
 use crate::Ctx;
@@ -44,8 +46,10 @@ pub struct Meta {
     ports: Vec<(String, String, u32)>,
 }
 
-fn lowest_free(used: impl Iterator<Item = u32> + Clone, min: u32) -> u32 {
-    (min..).find(|n| !used.clone().any(|u| u == *n)).unwrap_or(min)
+/// The lowest number from `min` up that is not in `used` (one of the first `used.len() + 1`).
+fn lowest_free(used: impl Iterator<Item = u32>, min: u32) -> u32 {
+    let used: HashSet<u32> = used.collect();
+    (min..).find(|n| !used.contains(n)).unwrap_or(min)
 }
 
 fn num(v: &Value, key: &str) -> u32 {
