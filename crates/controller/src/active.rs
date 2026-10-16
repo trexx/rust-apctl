@@ -31,7 +31,7 @@ use tokio::sync::mpsc;
 use wire::decode::{Decoded, KeyUsed, open_with};
 use wire::keys::KeyStore;
 
-use crate::engine::{Event, Input, PushedConfig, SharedLive};
+use crate::engine::{Event, EventKind, Input, PushedConfig, SharedLive};
 use crate::model::Ts;
 use crate::store::{self, Db, Store, Writer};
 
@@ -292,7 +292,10 @@ impl Active {
             // A resend asked for is always a push.
             let adopt = !force && current.is_none() && {
                 let last_push = self.live.read().unwrap().last_config.get(&mac).cloned();
-                let candidate = last_push.map(|p| (p, false)).or_else(|| self.stored_pushes.get(&mac).cloned().map(|p| (p, true)));
+                let candidate = match &last_push {
+                    Some(p) => Some((&**p, false)),
+                    None => self.stored_pushes.get(&mac).map(|p| (p, true)),
+                };
                 candidate.is_some_and(|(p, redacted)| {
                     p.cfgversion.as_deref() == Some(reported.as_str())
                         && crate::dryrun::equivalent(&with_cfgversion(&out.rendered.mgmt_cfg, &reported), &p.mgmt_cfg, redacted)
@@ -332,11 +335,11 @@ impl Active {
                 Some(Ok(cmd)) => {
                     tracing::warn!("{mac}: sending firmware upgrade to {}", cmd["version"]);
                     let data = json!({ "target": cmd["version"], "url": cmd["url"] });
-                    let _ = self.engine.blocking_send(Input::Note(Event::device(ts, "ap_upgrade_sent", mac, data)));
+                    let _ = self.engine.blocking_send(Input::Note(Event::device(ts, EventKind::ApUpgradeSent, mac, data)));
                     return cmd;
                 }
                 Some(Err((why, true))) => {
-                    let _ = self.engine.blocking_send(Input::Note(Event::device(ts, "ap_upgrade_failed", mac, json!({ "reason": "no internet", "detail": why }))));
+                    let _ = self.engine.blocking_send(Input::Note(Event::device(ts, EventKind::ApUpgradeFailed, mac, json!({ "reason": "no internet", "detail": why }))));
                 }
                 Some(Err((_, false))) | None => {}
             }
@@ -430,7 +433,7 @@ pub async fn inform(
         if new {
             tracing::info!("{mac}: {} informing from {}", if known { "reset AP (adoption required)" } else { "AP waiting for adoption" }, peer.ip());
             let data = json!({ "model": payload["model"], "ip": payload["ip"], "known": known });
-            let _ = active.engine.send(Input::Note(Event::device(ts, "ap_pending", mac, data))).await;
+            let _ = active.engine.send(Input::Note(Event::device(ts, EventKind::ApPending, mac, data))).await;
         }
         return status(StatusCode::NOT_FOUND);
     }
@@ -451,7 +454,7 @@ pub async fn inform(
         // is pinned again from this inform.
         active.devices.lock().unwrap().remove(&mac);
         let data = json!({ "model": payload["model"], "ip": payload["ip"], "version": payload["version"] });
-        let _ = active.engine.send(Input::Note(Event::device(ts, "ap_adopted", mac, data))).await;
+        let _ = active.engine.send(Input::Note(Event::device(ts, EventKind::ApAdopted, mac, data))).await;
     }
     if forgetting {
         tracing::warn!("{mac}: forgotten: telling it to reset");
@@ -546,7 +549,7 @@ mod tests {
                 l.state = Some(Arc::new(fixture("controller-state.json")));
             }
             if let Some((mgmt_cfg, system_cfg, cfgversion)) = last_push {
-                l.last_config.insert(AP.parse().unwrap(), PushedConfig { mgmt_cfg, system_cfg, cfgversion });
+                l.last_config.insert(AP.parse().unwrap(), Arc::new(PushedConfig { mgmt_cfg, system_cfg, cfgversion }));
             }
         }
         let mut keys = KeyStore::default();

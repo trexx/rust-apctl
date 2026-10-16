@@ -509,7 +509,7 @@ async fn dryrun(State(s): State<AppState>) -> ApiResult {
         let mut stored = std::collections::HashMap::new();
         for mac in need {
             if let Some(p) = crate::engine::stored_push(c, &mac)?.filter(|p| !p.system_cfg.is_empty()) {
-                stored.insert(mac, p);
+                stored.insert(mac, Arc::new(p));
             }
         }
         let mut stmt = c.prepare("SELECT ts, mac, cfgversion, matches, comparison FROM dryrun_results ORDER BY ts DESC LIMIT 100")?;

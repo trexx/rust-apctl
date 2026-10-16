@@ -65,10 +65,7 @@ async fn preview(s: &AppState, before: Arc<Value>, after: Value) -> Result<Vec<V
             let req = |state| crate::dryrun::RenderRequest { state, device_mac: &mac_s, inform: inform.as_deref(), cfgversion, previous_system_cfg: None };
             match (render(&req(&before)), render(&req(&after))) {
                 (Ok(old), Ok(new)) => {
-                    let summary = |o: &str, n: &str| {
-                        let d = wire::cfgdiff::diff(o, n);
-                        json!({ "added": d.added.len(), "removed": d.removed.len(), "changed": d.changed.len(), "diff": d.render("", true) })
-                    };
+                    let summary = |o: &str, n: &str| wire::cfgdiff::diff(o, n).summary();
                     let mut labels = crate::engine::section_labels(&old.1, radios);
                     labels.extend(crate::engine::section_labels(&new.1, radios));
                     out.push(json!({
