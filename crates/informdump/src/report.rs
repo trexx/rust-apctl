@@ -190,8 +190,7 @@ impl Reporter {
     fn save(&mut self, ts: Micros, mac: Mac, kind: &str, payload: &Value) {
         let Some(dir) = &self.opts.save else { return };
         self.seq += 1;
-        let name = format!("{}_{:06}_{}_{}.json", format_ts(ts).replace(':', ""), self.seq, mac.to_string().replace(':', ""), kind);
-        let path = dir.join(name);
+        let path = dir.join(save_name(ts, self.seq, mac, kind));
         // If it cannot be created, writing the file says why.
         self.save_dir_ready = self.save_dir_ready || crate::create_private_dir(dir).is_ok();
         let result = crate::write_private(&path, pretty(payload).as_bytes()).with_context(|| format!("saving {}", path.display()));
@@ -204,6 +203,14 @@ impl Reporter {
         let mac = mac.map(|m| m.to_string()).unwrap_or_else(|| "??:??:??:??:??:??".into());
         println!("{} {mac} {dir} {text}", format_ts(ts));
     }
+}
+
+/// The `--save` file name of a message. `kind` comes from the decoded reply (its
+/// `_type`), which whoever sent it chose: only letters, digits, `_` and `-` are kept,
+/// so it cannot name another directory, and it is cut short.
+fn save_name(ts: Micros, seq: u64, mac: Mac, kind: &str) -> String {
+    let kind: String = kind.chars().filter(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-')).take(40).collect();
+    format!("{}_{seq:06}_{}_{kind}.json", format_ts(ts).replace(':', ""), mac.to_string().replace(':', ""))
 }
 
 /// Masks secret fields, including secret lines inside `*_cfg` blobs.
@@ -259,6 +266,15 @@ pub fn format_ts(ts: Micros) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn save_names_keep_only_safe_characters() {
+        let mac: Mac = "02:00:00:00:00:01".parse().unwrap();
+        let ts = 1_791_840_601_123_456;
+        assert_eq!(save_name(ts, 7, mac, "reply-setparam"), "2026-10-12T213001.123Z_000007_020000000001_reply-setparam.json");
+        assert_eq!(save_name(ts, 7, mac, "reply-../../x/\u{1b}[2J.y"), "2026-10-12T213001.123Z_000007_020000000001_reply-x2Jy.json");
+        assert_eq!(save_name(ts, 7, mac, &format!("reply-{}", "a".repeat(500))).len(), "2026-10-12T213001.123Z_000007_020000000001_.json".len() + 40);
+    }
 
     #[test]
     fn formats_timestamps() {
