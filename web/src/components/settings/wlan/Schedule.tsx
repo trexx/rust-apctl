@@ -1,3 +1,4 @@
+import { hhmm as time } from "../../../format";
 import type { Blackout } from "./form";
 
 const WEEK = ["sun", "mon", "tue", "wed", "thu", "fri", "sat"] as const;
@@ -11,8 +12,6 @@ const WEEK_LABEL: Record<string, string> = {
   sat: "Sa",
 };
 
-const time = (m: number) =>
-  `${String(Math.floor(m / 60) % 24).padStart(2, "0")}:${String(m % 60).padStart(2, "0")}`;
 const minutes = (t: string) => {
   const [h, m] = t.split(":").map(Number);
   return (h || 0) * 60 + (m || 0);

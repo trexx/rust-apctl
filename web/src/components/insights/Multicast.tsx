@@ -25,18 +25,23 @@ const MCAST_COLORS: Record<string, string> = {
   other: "#8a8f98",
 };
 
-const MCAST_LABEL: Record<string, string> = {
-  mdns: "mDNS",
-  ssdp: "SSDP",
-  arp: "ARP",
-  igmp: "IGMP",
-  mld: "MLD",
-  stream: "Streams",
-  dhcp: "DHCP",
-  dhcpv6: "DHCPv6",
-  ipv6_nd: "IPv6 ND",
-  other: "Other",
+/** Multicast traffic types: a short name for charts and a longer one for tables. */
+const MCAST_TYPES: Record<string, [short: string, long: string]> = {
+  mdns: ["mDNS", "mDNS (device discovery)"],
+  ssdp: ["SSDP", "SSDP / UPnP"],
+  arp: ["ARP", "ARP"],
+  igmp: ["IGMP", "IGMP (group joins)"],
+  mld: ["MLD", "MLD (IPv6 group joins)"],
+  stream: ["Streams", "Streams (video, audio)"],
+  dhcp: ["DHCP", "DHCP"],
+  dhcpv6: ["DHCPv6", "DHCPv6"],
+  ipv6_nd: ["IPv6 ND", "IPv6 neighbour discovery"],
+  other: ["Other", "Other"],
 };
+
+/** A multicast traffic type's name, short or long. */
+export const mcastLabel = (type: string, long = false) =>
+  MCAST_TYPES[type]?.[long ? 1 : 0] ?? type;
 
 /** Multicast and broadcast by traffic type, and the clients behind it. */
 export function MulticastPanel({
@@ -107,7 +112,7 @@ function MulticastView({
               min={0}
               format={(v) => `${v.toFixed(v < 10 ? 1 : 0)}/s`}
               series={kinds.map(([k, v]) => ({
-                label: MCAST_LABEL[k] ?? k,
+                label: mcastLabel(k),
                 values: v[`${dir}_pps`],
                 color: MCAST_COLORS[k] ?? COLORS.teal,
               }))}
@@ -123,7 +128,7 @@ function MulticastView({
                     borderColor: MCAST_COLORS[k] ?? COLORS.teal,
                   }}
                 />{" "}
-                {MCAST_LABEL[k] ?? k} <b>{compact(v[`${dir}_pkts`])}</b>
+                {mcastLabel(k)} <b>{compact(v[`${dir}_pkts`])}</b>
               </span>
             ))}
           </div>

@@ -2,7 +2,7 @@ import { useMemo, useState } from "react";
 import { Link } from "react-router-dom";
 import { useChannelPlan, useNeighbors, useRadios } from "../api";
 import type { Neighbor, RadioOverview } from "../api";
-import { ago, band as bandName, bytes } from "../format";
+import { ago, band as bandName, bytes, pct1 } from "../format";
 import { ApSpacing } from "../components/insights/ApSpacing";
 import { DeploymentDensity } from "../components/insights/DeploymentDensity";
 import { BandPicker } from "../components/insights/shared";
@@ -309,9 +309,7 @@ function RadioTable({ radios }: { radios: RadioOverview[] }) {
                       : ""
                   }
                 >
-                  {r.tx_retry_pct === null
-                    ? "—"
-                    : `${r.tx_retry_pct.toFixed(1)}%`}
+                  {pct1(r.tx_retry_pct)}
                 </td>
                 <td className="nowrap">
                   {r.noise_floor === null ? "—" : `${r.noise_floor} dBm`}

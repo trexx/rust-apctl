@@ -3,10 +3,10 @@ import { useSeries, useSiteActivity } from "../api";
 import type { ClientView, RadioSample, TimeSpan, VapSample } from "../api";
 import { COLORS, Chart } from "./Chart";
 import { QueryState, Signal } from "./common";
-import { SIGNAL, band, bitrate, bytes, compact } from "../format";
+import { SIGNAL, band, bitrate, bytes, compact, pct1 } from "../format";
 
 const share = (part: number, whole: number) =>
-  whole > 0 ? `${((100 * part) / whole).toFixed(1)}%` : "—";
+  pct1(whole > 0 ? (100 * part) / whole : null);
 
 /** Lower edges of the signal buckets, strongest first, with the colour of `signalClass`. */
 const SIGNAL_BUCKETS: [number, string, string][] = [

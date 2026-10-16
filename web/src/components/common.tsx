@@ -572,6 +572,18 @@ const EVENTS: { [K in EventKind]: EventSpec<K> } = {
   client_unblocked: { label: "Client unblocked", tone: "info" },
 };
 
+/** An event's label and detail line, as the event lists show them. */
+export function eventText(
+  e: AppEvent,
+  names: Names,
+): { label: string; detail: string } {
+  const spec = eventSpec(e.kind);
+  return {
+    label: spec.label,
+    detail: spec.describe?.(eventData(e), names) ?? "",
+  };
+}
+
 /** The kind's entry, or a plain one for kinds this UI doesn't know yet. */
 function eventSpec(kind: string): EventSpec<EventKind> {
   return (

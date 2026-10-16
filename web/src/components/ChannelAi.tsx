@@ -11,7 +11,7 @@ import {
   useEvents,
 } from "../api";
 import type { ChannelPlanResult } from "../api";
-import { band as bandName, clock } from "../format";
+import { band as bandName, clock, hhmm } from "../format";
 import { ErrorNote, Loading, Outcome, QueryState, useRunner } from "./common";
 
 /**
@@ -110,7 +110,7 @@ export function ChannelAiPanel() {
         <b>Channel AI</b>
         <span className="muted small">
           {s.enabled
-            ? `nightly at ${String(s.hour).padStart(2, "0")}:${String(s.minute).padStart(2, "0")} ${d.timezone ?? "UTC"}`
+            ? `nightly at ${hhmm(s.hour * 60 + s.minute)} ${d.timezone ?? "UTC"}`
             : "nightly optimisation off"}
           {d.active && d.next_run ? ` · next ${clock(d.next_run)}` : ""}
         </span>
@@ -162,7 +162,7 @@ export function ChannelAiPanel() {
             >
               {HOURS.map((h) => (
                 <option key={h} value={h}>
-                  {String(h).padStart(2, "0")}:00
+                  {hhmm(h * 60)}
                 </option>
               ))}
             </select>

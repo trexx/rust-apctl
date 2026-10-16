@@ -2,7 +2,7 @@ import { Suspense, lazy } from "react";
 import { Link } from "react-router-dom";
 import { useWlans } from "../api";
 import type { Wlan } from "../api";
-import { band, bitrate, bytes } from "../format";
+import { band, bitrate, bytes, pct1 } from "../format";
 import {
   COLORS,
   Chart,
@@ -130,7 +130,7 @@ function WlanPanel({ w }: { w: Wlan }) {
               w.tx_retry_pct !== null && w.tx_retry_pct >= 20 ? "tone-warn" : ""
             }
           >
-            {w.tx_retry_pct === null ? "—" : `${w.tx_retry_pct.toFixed(1)}%`}
+            {pct1(w.tx_retry_pct)}
           </b>
         </div>
         <div>
@@ -142,7 +142,7 @@ function WlanPanel({ w }: { w: Wlan }) {
                 : ""
             }
           >
-            {w.multicast_pct === null ? "—" : `${w.multicast_pct.toFixed(1)}%`}
+            {pct1(w.multicast_pct)}
           </b>
           <span className="muted small"> of packets</span>
         </div>

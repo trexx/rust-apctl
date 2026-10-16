@@ -32,6 +32,14 @@ function formatter(options: Intl.DateTimeFormatOptions): Intl.DateTimeFormat {
 const timeFmt = formatter({ hour: "2-digit", minute: "2-digit", second: "2-digit" });
 const dayFmt = formatter({ day: "numeric", month: "short" });
 const minuteFmt = formatter({ hour: "2-digit", minute: "2-digit" });
+const dateTimeFmt = formatter({ day: "numeric", month: "short", year: "numeric", hour: "2-digit", minute: "2-digit" });
+
+/** "13 Oct 2026, 06:00" in the browser's locale. */
+export const dateTime = (ts: number) => dateTimeFmt.format(new Date(ts * 1000));
+
+/** "HH:MM" for minutes after midnight. */
+export const hhmm = (minutes: number) =>
+  `${String(Math.floor(minutes / 60) % 24).padStart(2, "0")}:${String(minutes % 60).padStart(2, "0")}`;
 
 /** Today's date as `clock` compares it: lists work it out once for all their rows. */
 export const today = () => new Date().toDateString();
@@ -81,6 +89,9 @@ export function bytes(n: number | null | undefined): string {
 }
 
 export const pct = (v: number | null | undefined) => (v === null || v === undefined ? "—" : `${Math.round(v)}%`);
+
+/** A percentage with one decimal: "12.5%". */
+export const pct1 = (v: number | null | undefined) => (v === null || v === undefined ? "—" : `${v.toFixed(1)}%`);
 
 /**
  * Client signal levels (dBm) commonly used for Wi-Fi: at least `good` is good

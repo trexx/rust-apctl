@@ -10,7 +10,7 @@ import {
   useCanEdit,
 } from "../api";
 import type { BackupManifest, BackupMeta, BackupSettings } from "../api";
-import { ago, bytes } from "../format";
+import { ago, bytes, dateTime as when, hhmm } from "../format";
 import { ErrorNote, Loading, Outcome, useRunner } from "./common";
 
 const HISTORY: [number, string][] = [
@@ -38,23 +38,12 @@ const KIND: Record<BackupMeta["kind"], string> = {
   "pre-restore": "Before a restore",
 };
 
-const when = (ts: number) =>
-  new Date(ts * 1000).toLocaleString(undefined, {
-    day: "numeric",
-    month: "short",
-    year: "numeric",
-    hour: "2-digit",
-    minute: "2-digit",
-  });
-
 /** Minutes after midnight UTC <-> "HH:MM" in this browser's time zone. */
 const offsetMin = () => -new Date().getTimezoneOffset();
-const toLocal = (utcMin: number) => {
-  const m = (((utcMin + offsetMin()) % 1440) + 1440) % 1440;
-  return `${String(Math.floor(m / 60)).padStart(2, "0")}:${String(m % 60).padStart(2, "0")}`;
-};
-const fromLocal = (hhmm: string) => {
-  const [h = 0, m = 0] = hhmm.split(":").map(Number);
+const toLocal = (utcMin: number) =>
+  hhmm((((utcMin + offsetMin()) % 1440) + 1440) % 1440);
+const fromLocal = (text: string) => {
+  const [h = 0, m = 0] = text.split(":").map(Number);
   return (((h * 60 + m - offsetMin()) % 1440) + 1440) % 1440;
 };
 
@@ -162,10 +151,7 @@ function Schedule({
             }
           />
         </label>
-        <span className="muted small">
-          ({String(Math.floor(s.minute_utc / 60)).padStart(2, "0")}:
-          {String(s.minute_utc % 60).padStart(2, "0")} UTC)
-        </span>
+        <span className="muted small">({hhmm(s.minute_utc)} UTC)</span>
       </div>
       <div className="backup-row">
         <label className="small">

@@ -31,7 +31,7 @@ import {
   useRunner,
 } from "../components/common";
 import { ago, band, bitrate, bytes, compact, duration, phy } from "../format";
-import { serviceNames } from "../components/insights/Multicast";
+import { mcastLabel, serviceNames } from "../components/insights/Multicast";
 import { ConnectionLog } from "../components/Connections";
 import { ClientActions } from "../components/Actions";
 import type { ClientView, Multicast } from "../api";
@@ -344,19 +344,6 @@ function AliasHeader(p: {
   );
 }
 
-const TYPE_LABEL: Record<string, string> = {
-  mdns: "mDNS (device discovery)",
-  ssdp: "SSDP / UPnP",
-  arp: "ARP",
-  igmp: "IGMP (group joins)",
-  mld: "MLD (IPv6 group joins)",
-  stream: "Streams (video, audio)",
-  dhcp: "DHCP",
-  dhcpv6: "DHCPv6",
-  ipv6_nd: "IPv6 neighbour discovery",
-  other: "Other",
-};
-
 /** What this client sends and receives as multicast/broadcast, from the AP's latest report. */
 function ClientMulticast({
   mac,
@@ -405,7 +392,7 @@ function ClientMulticast({
               <tbody>
                 {types.map(([k, c]) => (
                   <tr key={k}>
-                    <td>{TYPE_LABEL[k] ?? k}</td>
+                    <td>{mcastLabel(k, true)}</td>
                     <td>{compact(c.rx_pkts)}</td>
                     <td>{compact(c.tx_pkts)}</td>
                   </tr>

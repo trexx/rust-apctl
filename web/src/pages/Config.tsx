@@ -9,9 +9,10 @@ import {
   ApSelect,
   QueryState,
   Segmented,
+  eventText,
   useUrlTab,
 } from "../components/common";
-import { band, clock } from "../format";
+import { clock } from "../format";
 import { ChangeGroups, summarise } from "../components/ConfigDiff";
 
 function Push({ e, ap }: { e: AppEvent; ap: ReactNode }) {
@@ -47,40 +48,6 @@ function Push({ e, ap }: { e: AppEvent; ap: ReactNode }) {
   );
 }
 
-/** One line for the other configuration events: its title and what happened. */
-function describe(e: AppEvent): [string, string] {
-  switch (e.kind) {
-    case "config_applied": {
-      const d = eventData<"config_applied">(e);
-      return [
-        "Applied",
-        d.seconds_after_push !== undefined && d.seconds_after_push !== null
-          ? `applied it ${d.seconds_after_push}s later`
-          : "applied it",
-      ];
-    }
-    case "radio_changed": {
-      const d = eventData<"radio_changed">(e);
-      return [
-        "Radio changed",
-        `${band(d.radio)}: channel ${d.from?.channel} → ${d.to?.channel}, ${d.from?.bw} → ${d.to?.bw} MHz, ${d.from?.tx_power} → ${d.to?.tx_power} dBm`,
-      ];
-    }
-    case "settings_changed":
-      return [
-        "Settings changed",
-        String(eventData<"settings_changed">(e).what ?? ""),
-      ];
-    default: {
-      const d = eventData<"settings_imported">(e);
-      return [
-        "Settings imported",
-        `settings imported: ${(d.wlans ?? []).length} SSIDs, ${(d.networks ?? []).length} networks`,
-      ];
-    }
-  }
-}
-
 function History() {
   const [device, setDevice] = useState("");
   const names = useDeviceNames();
@@ -111,14 +78,14 @@ function History() {
               {events.map((e) => {
                 if (e.kind === "config_pushed")
                   return <Push key={e.id} e={e} ap={ap(e.device_mac)} />;
-                const [title, text] = describe(e);
+                const { label, detail } = eventText(e, names);
                 return (
                   <div key={e.id} className="cfg-entry">
                     <div className="cfg-head">
                       <span className="muted small nowrap">{clock(e.ts)}</span>
-                      <b className="muted">{title}</b>
+                      <b className="muted">{label}</b>
                       {e.device_mac && <span>{ap(e.device_mac)}</span>}
-                      <span className="muted small">{text}</span>
+                      <span className="muted small">{detail}</span>
                     </div>
                   </div>
                 );
