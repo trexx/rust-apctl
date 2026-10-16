@@ -87,14 +87,17 @@ pub struct Event {
     pub data: Value,
 }
 
-/// Messages pushed to live subscribers (the UI's WebSocket).
+/// Messages pushed to live subscribers (the UI's WebSocket, serialised once
+/// for all of them by `api::live_json`).
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum LiveMsg {
     Device { mac: Mac },
     Clients,
     Event(Event),
-    Log(LogLine),
+    /// A syslog line was stored: `{"type":"log","device_mac":...}`. The UI
+    /// refetches the lines it shows, so the text is not sent along.
+    Log { device_mac: Option<Mac> },
     Alert(crate::alerts::AlertMsg),
 }
 
@@ -1085,14 +1088,14 @@ impl Engine {
             vec![
                 Sql::Integer(line.ts),
                 opt_text(line.device_mac.map(|m| m.to_string())),
-                Sql::Text(line.src_ip.clone()),
+                Sql::Text(line.src_ip),
                 i(line.facility),
                 i(line.severity),
-                opt_text(line.program.clone()),
-                Sql::Text(line.msg.clone()),
+                opt_text(line.program),
+                Sql::Text(line.msg),
             ],
         );
-        let _ = self.tx.send(LiveMsg::Log(line));
+        let _ = self.tx.send(LiveMsg::Log { device_mac: line.device_mac });
     }
 
     /// Time-based transitions: APs going quiet and clients disappearing.

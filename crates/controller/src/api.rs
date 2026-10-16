@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
+use axum::extract::ws::{Message, Utf8Bytes, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
@@ -30,7 +30,8 @@ pub struct AppState {
     /// Commands for the engine (e.g. setting aliases).
     pub engine: tokio::sync::mpsc::Sender<crate::engine::Input>,
     pub live: SharedLive,
-    pub tx: broadcast::Sender<LiveMsg>,
+    /// The live messages as JSON text, for the UI's sockets (see `live_json`).
+    pub tx: broadcast::Sender<Utf8Bytes>,
     pub started: Ts,
     pub source: String,
     pub backups: crate::backup::Backups,
@@ -660,19 +661,42 @@ async fn ws(State(s): State<AppState>, upgrade: WebSocketUpgrade) -> Response {
     upgrade.on_upgrade(move |socket| live_socket(socket, rx))
 }
 
-async fn live_socket(mut socket: WebSocket, mut rx: broadcast::Receiver<LiveMsg>) {
+/// Tells a client that missed messages to refetch rather than dropping it.
+const RESYNC: &str = r#"{"type":"resync"}"#;
+
+/// Serialises each live message once, whatever the number of sockets: a task
+/// forwards the engine's messages as JSON text to the channel they read.
+/// Messages the task itself misses become a resync.
+pub fn live_json(typed: &broadcast::Sender<LiveMsg>) -> broadcast::Sender<Utf8Bytes> {
+    let (tx, _) = broadcast::channel(4096);
+    let mut rx = typed.subscribe();
+    let out = tx.clone();
+    tokio::spawn(async move {
+        loop {
+            let text = match rx.recv().await {
+                Ok(_) if out.receiver_count() == 0 => continue, // no socket open
+                Ok(m) => Utf8Bytes::from(serde_json::to_string(&m).unwrap_or_default()),
+                Err(broadcast::error::RecvError::Lagged(_)) => Utf8Bytes::from_static(RESYNC),
+                Err(broadcast::error::RecvError::Closed) => return,
+            };
+            let _ = out.send(text);
+        }
+    });
+    tx
+}
+
+async fn live_socket(mut socket: WebSocket, mut rx: broadcast::Receiver<Utf8Bytes>) {
     loop {
         tokio::select! {
             msg = rx.recv() => match msg {
-                Ok(m) => {
-                    let text = serde_json::to_string(&m).unwrap_or_default();
-                    if socket.send(Message::Text(text.into())).await.is_err() {
+                // Shared text: sending it copies nothing.
+                Ok(text) => {
+                    if socket.send(Message::Text(text)).await.is_err() {
                         return;
                     }
                 }
-                // A slow client missed messages: tell it to refetch rather than dropping it.
                 Err(broadcast::error::RecvError::Lagged(_)) => {
-                    if socket.send(Message::Text(r#"{"type":"resync"}"#.into())).await.is_err() {
+                    if socket.send(Message::Text(Utf8Bytes::from_static(RESYNC))).await.is_err() {
                         return;
                     }
                 }
@@ -723,6 +747,18 @@ mod tests {
         let res = get(&app, "/api/ws").await;
         assert!(res.headers().get(header::CONTENT_ENCODING).is_none());
         assert_eq!(get(&app, "/healthz").await.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn live_messages_are_serialised_once_for_the_sockets() {
+        let (typed, _) = broadcast::channel(16);
+        let json = live_json(&typed);
+        let mut socket = json.subscribe();
+        let ap: Mac = "02:00:00:00:00:01".parse().unwrap();
+        typed.send(LiveMsg::Log { device_mac: Some(ap) }).unwrap();
+        typed.send(LiveMsg::Device { mac: ap }).unwrap();
+        assert_eq!(socket.recv().await.unwrap().as_str(), r#"{"type":"log","device_mac":"02:00:00:00:00:01"}"#);
+        assert_eq!(socket.recv().await.unwrap().as_str(), r#"{"type":"device","mac":"02:00:00:00:00:01"}"#);
     }
 
     #[tokio::test]
