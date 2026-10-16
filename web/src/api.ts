@@ -1004,17 +1004,39 @@ export const useClientNames = (): Names => useClientsSelect(clientNames).data ??
 export const useClient = (mac: Mac) =>
   useQuery({ queryKey: keys.client(mac), queryFn: ({ signal }) => get<ClientView>(`/api/clients/${mac}`, signal), retry: false });
 
-/** Time-series for one entity over a time span. */
-export const useSeries = (table: string, key: string, span: TimeSpan) =>
-  useQuery({
-    queryKey: keys.series(table, key, span),
-    queryFn: ({ signal }) => {
+/** `prev` with the samples of `add` (all newer) appended, and those before `from` dropped. */
+function appendSeries(prev: Series, add: Series, from: number): Series {
+  const keep = prev.ts.findIndex((t) => t >= from);
+  const start = keep < 0 ? prev.ts.length : keep;
+  const fields: Series["fields"] = {};
+  for (const [f, values] of Object.entries(prev.fields)) fields[f] = [...values.slice(start), ...(add.fields[f] ?? add.ts.map(() => null))];
+  return { ...prev, ts: [...prev.ts.slice(start), ...add.ts], fields };
+}
+
+/**
+ * Time-series for one entity over a time span. A live chart of raw samples
+ * (up to 6 hours) asks only for what is newer than its last sample.
+ */
+export function useSeries(table: string, key: string, span: TimeSpan) {
+  const qc = useQueryClient();
+  const queryKey = keys.series(table, key, span);
+  return useQuery({
+    queryKey,
+    queryFn: async ({ signal }) => {
       const [from, to] = spanBounds(span);
-      return get<Series>(`/api/series/${table}${qs({ key, from, to })}`, signal);
+      const url = (from: number) => `/api/series/${table}${qs({ key, from, to })}`;
+      const prev = isFixed(span) ? undefined : qc.getQueryData<Series>(queryKey);
+      const last = prev?.tier === "raw" ? prev.ts.at(-1) : undefined;
+      if (prev && last !== undefined && last >= from) {
+        const add = await get<Series>(url(last + 1), signal);
+        if (add.tier === "raw") return appendSeries(prev, add, from);
+      }
+      return get<Series>(url(from), signal);
     },
     refetchInterval: refreshFor(span, spanLength(span) <= 6 * 3600 ? 15_000 : 300_000),
     placeholderData: keepPreviousData,
   });
+}
 
 export type EventFilter = { device?: Mac; client?: Mac; kind?: string; limit?: number };
 export type LogFilter = { device?: Mac; q?: string; limit?: number };
