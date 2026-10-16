@@ -262,16 +262,23 @@ impl Proxies {
     /// The client's address. X-Forwarded-For counts only on a connection from
     /// a trusted proxy, and then its right-most hop that is not itself a
     /// trusted proxy: hops further left were written by the client and can
-    /// be anything.
+    /// be anything. A hop may carry a port (`203.0.113.7:4711`, `[2001:db8::1]:4711`).
     pub fn client_ip(&self, headers: &HeaderMap, peer: IpAddr) -> IpAddr {
         let peer = peer.to_canonical();
         if !self.contains(peer) {
             return peer;
         }
-        let hops: Vec<&str> = headers.get_all("x-forwarded-for").iter().filter_map(|v| v.to_str().ok()).flat_map(|v| v.split(',')).collect();
         let mut client = peer;
-        for hop in hops.iter().rev() {
-            let Ok(ip) = hop.trim().parse::<IpAddr>() else { break };
+        for hop in headers.get_all("x-forwarded-for").iter().filter_map(|v| v.to_str().ok()).flat_map(|v| v.split(',')).rev() {
+            let Some(ip) = hop_ip(hop.trim()) else {
+                // Skipping it would believe the hops left of it, which the
+                // client wrote: the last proxy's address is kept instead, so
+                // the clients behind it share their login attempts. Said once,
+                // as it is the proxy's setup that needs fixing.
+                static SAID: std::sync::Once = std::sync::Once::new();
+                SAID.call_once(|| tracing::warn!("X-Forwarded-For hop {hop:?} from {client} is not an address: logins through that proxy are throttled as one client"));
+                break;
+            };
             client = ip.to_canonical();
             if !self.contains(client) {
                 break;
@@ -279,6 +286,11 @@ impl Proxies {
         }
         client
     }
+}
+
+/// The address of an X-Forwarded-For hop, with or without a port.
+fn hop_ip(hop: &str) -> Option<IpAddr> {
+    hop.parse::<IpAddr>().ok().or_else(|| hop.parse::<SocketAddr>().ok().map(|a| a.ip())).or_else(|| hop.strip_prefix('[')?.strip_suffix(']')?.parse().ok())
 }
 
 pub fn session_token(headers: &HeaderMap) -> Option<String> {
@@ -503,6 +515,18 @@ mod tests {
         // From anyone else: the peer.
         assert_eq!(proxies.client_ip(&h, ip("198.51.100.1")), ip("198.51.100.1"));
         assert_eq!(proxies.client_ip(&HeaderMap::new(), ip("192.0.2.1")), ip("192.0.2.1"));
+        // Hops with ports, and over several headers (the last one is right-most).
+        let mut h = HeaderMap::new();
+        h.append("x-forwarded-for", "6.6.6.6".parse().unwrap());
+        h.append("x-forwarded-for", "203.0.113.7:4711, 10.42.0.3".parse().unwrap());
+        assert_eq!(proxies.client_ip(&h, ip("10.42.0.5")), ip("203.0.113.7"));
+        h.insert("x-forwarded-for", "[2001:db8::7]:4711".parse().unwrap());
+        assert_eq!(proxies.client_ip(&h, ip("10.42.0.5")), ip("2001:db8::7"));
+        h.insert("x-forwarded-for", "[2001:db8::8]".parse().unwrap());
+        assert_eq!(proxies.client_ip(&h, ip("10.42.0.5")), ip("2001:db8::8"));
+        // A hop that is no address: the client's own hops left of it are not believed.
+        h.insert("x-forwarded-for", "6.6.6.6, unknown, 10.42.0.3".parse().unwrap());
+        assert_eq!(proxies.client_ip(&h, ip("10.42.0.5")), ip("10.42.0.3"));
         assert!(Proxies::parse(&["10.0.0.0/33".into()]).is_err());
         assert!(Proxies::parse(&["proxy.example".into()]).is_err());
         assert!(Proxies::parse(&["fd00::/8".into()]).unwrap().contains(ip("fd12::1")));
