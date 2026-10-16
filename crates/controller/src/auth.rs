@@ -132,7 +132,11 @@ impl Auth {
             "INSERT OR REPLACE INTO sessions (token_hash, username, created, expires) VALUES (?1, ?2, ?3, ?4)",
             vec![Sql::Text(hash.clone()), Sql::Text(user.to_string()), Sql::Integer(now), Sql::Integer(session.expires)],
         );
-        self.sessions.lock().unwrap().insert(hash, session);
+        let mut sessions = self.sessions.lock().unwrap();
+        // Expired sessions are otherwise only dropped when presented. Every
+        // session starts here, so this keeps the map to the live ones.
+        sessions.retain(|_, s| s.expires > now);
+        sessions.insert(hash, session);
         Ok(token)
     }
 
@@ -368,6 +372,12 @@ mod tests {
         assert_eq!(auth.check("forged"), None);
         auth.revoke(&token);
         assert_eq!(auth.check(&token), None);
+        // An expired session nobody presents again is dropped at the next login.
+        let old = auth.create("admin").unwrap();
+        auth.sessions.lock().unwrap().get_mut(&token_hash(&old)).unwrap().expires = 0;
+        auth.create("admin").unwrap();
+        assert!(!auth.sessions.lock().unwrap().contains_key(&token_hash(&old)));
+        assert_eq!(auth.sessions.lock().unwrap().len(), 1);
         std::fs::remove_dir_all(&dir).ok();
     }
 
