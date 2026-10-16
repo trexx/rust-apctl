@@ -245,6 +245,47 @@ fn band_ok(band: &Option<String>, radio: &str) -> bool {
     band.as_deref().is_none_or(|b| b == "all" || b == radio)
 }
 
+/// How long a view's metrics read is reused, per tier: the raw tier grows with
+/// each report, the roll-ups every five minutes.
+const MEMO_SECS: [u64; 3] = [15, 60, 300];
+
+type Memo = HashMap<String, (std::time::Instant, std::sync::Arc<dyn std::any::Any + Send + Sync>)>;
+
+/// What the views last read from the metrics, by view and query: several tabs,
+/// and each tab's refresh every minute, ask for the same windows again.
+static MEMO: std::sync::LazyLock<std::sync::Mutex<Memo>> = std::sync::LazyLock::new(Default::default);
+
+fn memo() -> std::sync::MutexGuard<'static, Memo> {
+    MEMO.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// [`read`] from the metrics for `view`, reusing what the same query read
+/// less than [`MEMO_SECS`] ago (the window then ends that much earlier).
+async fn memo_read<T: Send + Sync + 'static>(
+    s: &AppState,
+    view: &str,
+    q: &RangeQuery,
+    tier: usize,
+    f: impl FnOnce(&Connection) -> anyhow::Result<T> + Send + 'static,
+) -> Result<std::sync::Arc<T>, ApiError> {
+    let RangeQuery { range, from, to, band, mac } = q;
+    // The data directory tells databases apart (tests run several).
+    let key = format!("{}|{view}|{range:?}|{from:?}|{to:?}|{band:?}|{mac:?}", s.backups.data_dir.display());
+    let ttl = std::time::Duration::from_secs(MEMO_SECS[tier]);
+    let hit = memo().get(&key).filter(|(at, _)| at.elapsed() < ttl).and_then(|(_, v)| v.clone().downcast::<T>().ok());
+    if let Some(v) = hit {
+        return Ok(v);
+    }
+    let v = std::sync::Arc::new(read(&s.store, Db::Metrics, f).await?);
+    let mut m = memo();
+    m.retain(|_, (at, _)| at.elapsed().as_secs() < MEMO_SECS[2]);
+    // Bounded: odd queries (explicit windows) are not all kept.
+    if m.len() < 256 {
+        m.insert(key, (std::time::Instant::now(), v.clone()));
+    }
+    Ok(v)
+}
+
 /// GET /api/site/activity: Wi-Fi traffic, retries, clients and multicast,
 /// plus airtime (channel use and interference), bucketed.
 pub async fn activity(State(s): State<AppState>, Query(q): Query<RangeQuery>) -> Result<Json<Value>, ApiError> {
@@ -252,7 +293,7 @@ pub async fn activity(State(s): State<AppState>, Query(q): Query<RangeQuery>) ->
     let bucket = bucket_for(to - from, tier);
     let band = q.band.clone();
     let ap = q.mac.as_ref().map(|m| m.to_ascii_lowercase());
-    let result = read(&s.store, Db::Metrics, move |c| {
+    let result = memo_read(&s, "activity", &q, tier, move |c| {
         // VAP counters: bytes, packets, retries, multicast, drops; gauge: clients.
         const COLS: &[&str] = &[
             "tx_bytes", "rx_bytes", "tx_packets", "rx_packets", "tx_retries", "tx_mcast", "rx_mcast", "tx_dropped", "num_sta", "tx_bcast", "rx_bcast",
@@ -357,7 +398,7 @@ pub async fn activity(State(s): State<AppState>, Query(q): Query<RangeQuery>) ->
         }))
     })
     .await?;
-    Ok(Json(result))
+    Ok(Json((*result).clone()))
 }
 
 /// Bytes moved per key over the window (sum of counter deltas), from the
@@ -370,7 +411,7 @@ fn totals(samples: &Samples, [tx, rx]: [usize; 2], from: Ts) -> (f64, f64) {
 pub async fn top(State(s): State<AppState>, Query(q): Query<RangeQuery>) -> Result<Json<Value>, ApiError> {
     let (from, to, tier) = window(&q);
     let ap = q.mac.as_ref().map(|m| m.to_ascii_lowercase());
-    let (aps, clients) = read(&s.store, Db::Metrics, move |c| {
+    let got = memo_read(&s, "top", &q, tier, move |c| {
         let vaps = load(c, Spec { table: "vap_stats", key: "bssid", extra: &["ap_mac"], cols: &BYTE_COLS, only: None }, tier, from, to)?;
         let mut aps: HashMap<String, (f64, f64)> = HashMap::new();
         for (ex, samples) in vaps.values() {
@@ -394,23 +435,24 @@ pub async fn top(State(s): State<AppState>, Query(q): Query<RangeQuery>) -> Resu
         Ok((aps, clients))
     })
     .await?;
+    let (aps, clients) = &*got;
     let live = s.live.read().unwrap();
     // Most traffic first.
     let by_total = |a: &Value, b: &Value| {
         let t = |x: &Value| x["download_bytes"].as_f64().unwrap_or(0.0) + x["upload_bytes"].as_f64().unwrap_or(0.0);
         t(b).total_cmp(&t(a))
     };
-    let mut ap_list: Vec<Value> = aps.into_iter().map(|(mac, (d, u))| json!({ "name": ap_name(&live, &mac), "mac": mac, "download_bytes": d, "upload_bytes": u })).collect();
+    let mut ap_list: Vec<Value> = aps.iter().map(|(mac, (d, u))| json!({ "name": ap_name(&live, mac), "mac": mac, "download_bytes": d, "upload_bytes": u })).collect();
     ap_list.sort_by(by_total);
     let mut cl_list: Vec<Value> = clients
-        .into_iter()
+        .iter()
         .filter(|(_, d, u)| d + u > 0.0)
         .map(|(mac, d, u)| {
             let m: Option<inform::Mac> = mac.parse().ok();
             let view = m.and_then(|m| live.clients.get(&m));
             json!({
                 "mac": mac, "name": client_name(&live, m), "connected": view.is_some_and(|c| c.connected),
-                "vendor": s.vendors.lookup_str(&mac), "download_bytes": d, "upload_bytes": u,
+                "vendor": s.vendors.lookup_str(mac), "download_bytes": d, "upload_bytes": u,
             })
         })
         .collect();
@@ -470,7 +512,7 @@ pub async fn density(State(s): State<AppState>, Query(q): Query<RangeQuery>) -> 
     let (from, to, tier) = window(&q);
     let suffix = TIERS[tier].0;
     // Worked out where the data is read, off the async workers and the live lock.
-    let aps = read(&s.store, Db::Metrics, move |c| {
+    let aps = memo_read(&s, "density", &q, tier, move |c| {
         let mut stmt = c.prepare(&format!("SELECT ts, ap_mac, radio, signal FROM client_stats{suffix} WHERE ts >= ?1 AND ts <= ?2 AND signal < 0 AND ap_mac IS NOT NULL"))?;
         let signals = stmt
             .query_map([from, to], |r| Ok((r.get::<_, Ts>(0)?, r.get::<_, String>(1)?, r.get::<_, Option<String>>(2)?, r.get::<_, f64>(3)?)))?
@@ -480,7 +522,7 @@ pub async fn density(State(s): State<AppState>, Query(q): Query<RangeQuery>) -> 
     })
     .await?;
     let live = s.live.read().unwrap();
-    let list: Vec<Value> = aps.into_iter().map(|(mac, groups)| json!({ "name": ap_name(&live, &mac), "mac": mac, "bands": groups })).collect();
+    let list: Vec<Value> = aps.iter().map(|(mac, groups)| json!({ "name": ap_name(&live, mac), "mac": mac, "bands": groups })).collect();
     Ok(Json(json!({ "aps": list })))
 }
 
@@ -557,12 +599,12 @@ fn density_of(signals: Vec<(Ts, String, Option<String>, f64)>, vaps: &Loaded, fr
 pub async fn retries(State(s): State<AppState>, Query(q): Query<RangeQuery>) -> Result<Json<Value>, ApiError> {
     let (from, to, tier) = window(&q);
     let spec = Spec { table: "vap_stats", key: "bssid", extra: &["ap_mac", "radio"], cols: &RETRY_COLS, only: None };
-    let totals = read(&s.store, Db::Metrics, move |c| Ok(retry_totals(&load(c, spec, tier, from, to)?, RETRY_AT, from))).await?;
+    let totals = memo_read(&s, "retries", &q, tier, move |c| Ok(retry_totals(&load(c, spec, tier, from, to)?, RETRY_AT, from))).await?;
     let live = s.live.read().unwrap();
     let mut out: Vec<Value> = totals
-        .into_iter()
+        .iter()
         .map(|((ap, band), t)| {
-            json!({ "name": ap_name(&live, &ap), "mac": ap, "radio": band, "tx_retry_pct": retry_pct(t), "retries": t[0], "attempts": t[1], "dropped": t[2] })
+            json!({ "name": ap_name(&live, ap), "mac": ap, "radio": band, "tx_retry_pct": retry_pct(*t), "retries": t[0], "attempts": t[1], "dropped": t[2] })
         })
         .collect();
     out.sort_by(|a, b| a["mac"].as_str().cmp(&b["mac"].as_str()).then(a["radio"].as_str().cmp(&b["radio"].as_str())));
@@ -576,7 +618,7 @@ pub async fn multicast(State(s): State<AppState>, Query(q): Query<RangeQuery>) -
     let (from, to, tier) = window(&q);
     let bucket = bucket_for(to - from, tier);
     let ap = q.mac.as_ref().map(|m| m.to_ascii_lowercase());
-    let (samples, clients) = read(&s.store, Db::Metrics, move |c| {
+    let got = memo_read(&s, "multicast", &q, tier, move |c| {
         let suffix = TIERS[tier].0;
         // One AP's by its MAC, the table's key.
         let (one, mut params) = (if ap.is_some() { " AND mac = ?3" } else { "" }, vec![Sql::Integer(from), Sql::Integer(to)]);
@@ -614,11 +656,12 @@ pub async fn multicast(State(s): State<AppState>, Query(q): Query<RangeQuery>) -
         Ok((rows, per))
     })
     .await?;
+    let (samples, clients) = &*got;
     // type -> bucket -> AP -> (sum of rates, samples)
-    type PerAp = HashMap<String, ([f64; 4], f64)>;
-    let mut acc: BTreeMap<String, BTreeMap<Ts, PerAp>> = BTreeMap::new();
+    type PerAp<'a> = HashMap<&'a str, ([f64; 4], f64)>;
+    let mut acc: BTreeMap<&str, BTreeMap<Ts, PerAp>> = BTreeMap::new();
     for (mac, kind, ts, r) in samples {
-        let e = acc.entry(kind).or_default().entry(ts - ts % bucket).or_default().entry(mac).or_default();
+        let e = acc.entry(kind.as_str()).or_default().entry(ts - ts % bucket).or_default().entry(mac.as_str()).or_default();
         for (a, b) in e.0.iter_mut().zip(r) {
             *a += b;
         }
@@ -639,13 +682,13 @@ pub async fn multicast(State(s): State<AppState>, Query(q): Query<RangeQuery>) -
             }
         }
         types.insert(
-            kind.clone(),
+            kind.to_string(),
             json!({ "tx_pps": series[0], "rx_pps": series[1], "tx_pkts": total[0].round(), "rx_pkts": total[1].round(), "tx_bytes": total[2].round(), "rx_bytes": total[3].round() }),
         );
     }
     let live = s.live.read().unwrap();
     let mut list: Vec<Value> = clients
-        .into_iter()
+        .iter()
         .filter(|(_, t)| t[0] + t[1] > 0.0)
         .map(|(mac, t)| {
             let m: Option<inform::Mac> = mac.parse().ok();
@@ -653,7 +696,7 @@ pub async fn multicast(State(s): State<AppState>, Query(q): Query<RangeQuery>) -
             let mc = view.and_then(|v| v.sample.multicast.as_ref());
             let ap_name = view.and_then(|v| live.devices.get(&v.sample.ap_mac)).and_then(|d| d.snapshot.ap.hostname.clone());
             json!({
-                "mac": mac, "name": client_name(&live, m), "vendor": s.vendors.lookup_str(&mac),
+                "mac": mac, "name": client_name(&live, m), "vendor": s.vendors.lookup_str(mac),
                 "connected": view.is_some_and(|c| c.connected), "ap": ap_name, "radio": view.and_then(|c| c.sample.radio.clone()),
                 "tx_pkts": t[0].round(), "rx_pkts": t[1].round(), "tx_bytes": t[2].round(), "rx_bytes": t[3].round(),
                 "services": mc.map(|m| m.services.clone()).unwrap_or_default(),
@@ -693,7 +736,7 @@ pub async fn wlans(State(s): State<AppState>, Query(q): Query<RangeQuery>) -> Re
     let (from, to, tier) = window(&q);
     let bucket = bucket_for(to - from, tier);
     // The history, summed up per network where it is read.
-    let per = read(&s.store, Db::Metrics, move |c| {
+    let per = memo_read(&s, "wlans", &q, tier, move |c| {
         let vaps = load(c, Spec { table: "vap_stats", key: "bssid", extra: &["essid"], cols: WLAN_COLS, only: None }, tier, from, to)?;
         Ok(wlan_history(&vaps, from, bucket))
     })
@@ -895,13 +938,14 @@ const RADIO_VAP_COLS: &[&str] = &["tx_bytes", "rx_bytes", "avg_client_signal", "
 /// over the window (interference, utilisation, traffic, retries, signal).
 pub async fn radios(State(s): State<AppState>, Query(q): Query<RangeQuery>) -> Result<Json<Value>, ApiError> {
     let (from, to, tier) = window(&q);
-    let (rstats, vstats) = read(&s.store, Db::Metrics, move |c| {
+    let got = memo_read(&s, "radios", &q, tier, move |c| {
         let r = load(c, Spec { table: "radio_stats", key: "mac || '/' || radio", extra: &[], cols: &["cu_total", "cu_interf"], only: None }, tier, from, to)?;
         // Retries come from the VAPs: the radio-level counters stay at 0 on some models.
         let v = load(c, Spec { table: "vap_stats", key: "bssid", extra: &["ap_mac", "radio"], cols: RADIO_VAP_COLS, only: None }, tier, from, to)?;
         Ok((r, v))
     })
     .await?;
+    let (rstats, vstats) = &*got;
     let spectrum_rows = read(&s.store, Db::Config, |c| {
         let mut stmt = c.prepare("SELECT ap_mac, radio, channel, width, utilization, interference, other_bss_count, ts FROM spectrum")?;
         let rows = stmt
@@ -915,7 +959,7 @@ pub async fn radios(State(s): State<AppState>, Query(q): Query<RangeQuery>) -> R
         Ok(rows)
     })
     .await?;
-    let retry = retry_totals(&vstats, cols_at(RADIO_VAP_COLS, RETRY_COLS), from);
+    let retry = retry_totals(vstats, cols_at(RADIO_VAP_COLS, RETRY_COLS), from);
     // Traffic and client signal per (AP, band), and the spectrum rows, grouped once.
     let [tx, rx, signal] = cols_at(RADIO_VAP_COLS, ["tx_bytes", "rx_bytes", "avg_client_signal"]);
     let mut vap_use: HashMap<(&str, &str), (f64, Mean)> = HashMap::new();
@@ -1868,6 +1912,16 @@ mod tests {
                 }
             }
             assert_eq!(out.as_object().unwrap().len(), expected.as_object().unwrap().len());
+        }
+
+        #[tokio::test]
+        async fn a_repeated_query_is_answered_from_memory() {
+            let (s, base, dir) = site();
+            let q = |range| Query(RangeQuery { range, from: Some(base), to: Some(base + 3600), band: None, mac: None });
+            let first = ok(retries(State(s.clone()), q(None)).await);
+            Connection::open(dir.join("metrics.db")).unwrap().execute("DELETE FROM vap_stats", []).unwrap();
+            assert_eq!(ok(retries(State(s.clone()), q(None)).await), first, "read again within the time it is kept");
+            assert_eq!(ok(retries(State(s), q(Some(600))).await), json!([]), "another query reads the database");
         }
 
         #[tokio::test]
