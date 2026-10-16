@@ -2152,8 +2152,7 @@ pub fn apply_client_group(state: &mut Value, e: &ClientGroup) -> Result<String, 
 
 /// GET /api/settings/usergroups
 pub async fn usergroups(State(s): State<AppState>) -> Result<Json<Value>, ApiError> {
-    let state = s.live.read().unwrap().state.clone();
-    let Some(state) = state else { return Ok(Json(json!({ "active": s.active, "groups": [] }))) };
+    let state = crate::api::current_state(&s)?;
     let users = group_users(&state);
     let group = |g: &Value| {
         let id = id_of(g).unwrap_or_default();
