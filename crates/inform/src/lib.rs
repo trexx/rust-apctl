@@ -30,6 +30,9 @@ use aes_gcm::AesGcm;
 
 pub const MAGIC: &[u8; 4] = b"TNBU";
 pub const HEADER_LEN: usize = 40;
+/// Largest payload accepted after decompression. Real informs are tens to a few
+/// hundred KB; the cap stops a small compressed body from inflating to gigabytes.
+pub const MAX_PLAINTEXT: usize = 8 << 20;
 
 /// Key used by devices that have not been adopted yet (MD5 of "ubnt").
 pub const DEFAULT_KEY: [u8; 16] = [
@@ -52,6 +55,8 @@ pub enum Error {
     Decompress(String),
     #[error("invalid key: {0}")]
     InvalidKey(String),
+    #[error("invalid MAC address {0:?}")]
+    InvalidMac(String),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -75,13 +80,21 @@ impl fmt::Debug for Mac {
 impl std::str::FromStr for Mac {
     type Err = Error;
 
-    /// Accepts `aa:bb:cc:dd:ee:ff`, `aa-bb-...` or `aabbccddeeff`, any case.
+    /// Accepts `aa:bb:cc:dd:ee:ff`, `aa-bb-...` (one separator throughout) or
+    /// `aabbccddeeff`, any case.
     fn from_str(s: &str) -> Result<Self> {
-        let hex: String = s.chars().filter(|c| *c != ':' && *c != '-').collect();
-        let bytes = hex::decode(&hex).map_err(|e| Error::InvalidKey(format!("mac {s}: {e}")))?;
-        let arr: [u8; 6] = bytes
-            .try_into()
-            .map_err(|_| Error::InvalidKey(format!("mac {s}: expected 6 bytes")))?;
+        let b = s.as_bytes();
+        let hex: Vec<u8> = match b.len() {
+            12 => b.to_vec(),
+            17 if matches!(b[2], b':' | b'-') && (2..17).step_by(3).all(|i| b[i] == b[2]) => {
+                b.iter().enumerate().filter(|(i, _)| i % 3 != 2).map(|(_, c)| *c).collect()
+            }
+            _ => return Err(Error::InvalidMac(s.to_string())),
+        };
+        let arr: [u8; 6] = hex::decode(&hex)
+            .ok()
+            .and_then(|b| b.try_into().ok())
+            .ok_or_else(|| Error::InvalidMac(s.to_string()))?;
         Ok(Mac(arr))
     }
 }
@@ -202,6 +215,10 @@ impl<'a> Packet<'a> {
     }
 
     /// Decrypts and decompresses the payload, returning the plaintext (normally JSON).
+    ///
+    /// A packet without the ENCRYPTED flag is not decrypted at all: its body passes
+    /// through (decompressed if flagged) whatever `key` is. Callers that require an
+    /// encrypted inform must check `header.flags` themselves.
     pub fn open(&self, key: &[u8; 16]) -> Result<Vec<u8>> {
         let flags = self.header.flags;
         let decrypted = if !flags.has(Flags::ENCRYPTED) {
@@ -227,26 +244,32 @@ impl<'a> Packet<'a> {
 
 fn decompress(flags: Flags, data: Vec<u8>) -> Result<Vec<u8>> {
     if flags.has(Flags::ZLIB) {
-        let mut out = Vec::new();
-        flate2::read::ZlibDecoder::new(&data[..])
-            .read_to_end(&mut out)
-            .map_err(|e| Error::Decompress(format!("zlib: {e}")))?;
-        Ok(out)
+        read_capped(flate2::read::ZlibDecoder::new(&data[..])).map_err(|e| Error::Decompress(format!("zlib: {e}")))
     } else if flags.has(Flags::SNAPPY) {
-        // Raw snappy blocks are what we expect; fall back to the framed format.
-        match snap::raw::Decoder::new().decompress_vec(&data) {
+        // Raw snappy blocks are what we expect; fall back to the framed format. A raw
+        // block declares its length up front, which the decoder would allocate.
+        let raw = match snap::raw::decompress_len(&data) {
+            Ok(n) if n > MAX_PLAINTEXT => Err(format!("{n} bytes is over the {MAX_PLAINTEXT} byte limit")),
+            _ => snap::raw::Decoder::new().decompress_vec(&data).map_err(|e| e.to_string()),
+        };
+        match raw {
             Ok(out) => Ok(out),
-            Err(raw_err) => {
-                let mut out = Vec::new();
-                snap::read::FrameDecoder::new(&data[..])
-                    .read_to_end(&mut out)
-                    .map_err(|e| Error::Decompress(format!("snappy: {raw_err}; framed: {e}")))?;
-                Ok(out)
-            }
+            Err(raw_err) => read_capped(snap::read::FrameDecoder::new(&data[..]))
+                .map_err(|e| Error::Decompress(format!("snappy: {raw_err}; framed: {e}"))),
         }
     } else {
         Ok(data)
     }
+}
+
+/// Reads a decompressing reader to the end, failing once it yields more than [`MAX_PLAINTEXT`].
+fn read_capped(r: impl Read) -> std::io::Result<Vec<u8>> {
+    let mut out = Vec::new();
+    r.take(MAX_PLAINTEXT as u64 + 1).read_to_end(&mut out)?;
+    if out.len() > MAX_PLAINTEXT {
+        return Err(std::io::Error::other(format!("output is over the {MAX_PLAINTEXT} byte limit")));
+    }
+    Ok(out)
 }
 
 fn compress(flags: Flags, data: &[u8]) -> Vec<u8> {
@@ -364,6 +387,40 @@ mod tests {
         assert_eq!("00:11:22:33:44:55".parse::<Mac>().unwrap(), MAC);
         assert_eq!("001122334455".parse::<Mac>().unwrap(), MAC);
         assert_eq!(MAC.to_string(), "00:11:22:33:44:55");
-        assert!("00:11".parse::<Mac>().is_err());
+        assert!(matches!("00:11".parse::<Mac>(), Err(Error::InvalidMac(_))));
+        assert!(matches!("zz:11:22:33:44:55".parse::<Mac>(), Err(Error::InvalidMac(_))));
+        assert_eq!("00-11-22-33-44-55".parse::<Mac>().unwrap(), MAC);
+        assert_eq!("00:11:22:33:44:AA".parse::<Mac>().unwrap().to_string(), "00:11:22:33:44:aa");
+        for bad in ["00:11-22:33:44:55", "001122:334455", "0:11:22:33:44:555", "00:11:22:33:44:55:", "+0:11:22:33:44:55", ""] {
+            assert!(bad.parse::<Mac>().is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn decompression_is_capped() {
+        // Highly compressible, just over the cap: a few KB on the wire.
+        let big = vec![b' '; MAX_PLAINTEXT + 1];
+        for bits in [Flags::ZLIB, Flags::SNAPPY, Flags::ENCRYPTED | Flags::GCM | Flags::ZLIB, Flags::ENCRYPTED | Flags::GCM | Flags::SNAPPY] {
+            let wire = seal(MAC, Flags(bits), IV, &KEY, &big);
+            assert!(wire.len() < MAX_PLAINTEXT / 16, "{:?} compresses", Flags(bits));
+            let pkt = Packet::parse(&wire).unwrap();
+            assert!(matches!(pkt.open(&KEY), Err(Error::Decompress(_))), "{:?}", Flags(bits));
+        }
+        // Exactly at the cap still decodes.
+        let max = vec![b' '; MAX_PLAINTEXT];
+        let wire = seal(MAC, Flags(Flags::ZLIB), IV, &KEY, &max);
+        assert_eq!(Packet::parse(&wire).unwrap().open(&KEY).unwrap().len(), MAX_PLAINTEXT);
+        // A raw snappy header claiming 4 GiB is refused before anything is allocated.
+        let mut lie = vec![0xff, 0xff, 0xff, 0xff, 0x0f];
+        lie.extend_from_slice(b"\x00x");
+        assert!(matches!(decompress(Flags(Flags::SNAPPY), lie), Err(Error::Decompress(_))));
+        // The framed snappy format is capped too.
+        let mut framed = Vec::new();
+        {
+            use std::io::Write;
+            let mut w = snap::write::FrameEncoder::new(&mut framed);
+            w.write_all(&big).unwrap();
+        }
+        assert!(matches!(decompress(Flags(Flags::SNAPPY), framed), Err(Error::Decompress(_))));
     }
 }
