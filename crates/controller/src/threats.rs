@@ -173,30 +173,34 @@ fn fold(s: &str) -> String {
     out.replace("rn", "m").replace("vv", "w")
 }
 
-fn levenshtein(a: &str, b: &str) -> usize {
-    let a: Vec<char> = a.chars().collect();
-    let b: Vec<char> = b.chars().collect();
-    let mut prev: Vec<usize> = (0..=b.len()).collect();
-    for (i, ca) in a.iter().enumerate() {
-        let mut cur = vec![i + 1];
-        for (j, cb) in b.iter().enumerate() {
-            cur.push((prev[j] + usize::from(ca != cb)).min(prev[j + 1] + 1).min(cur[j] + 1));
-        }
-        prev = cur;
+/// Whether `a` becomes `b` in at most `max` single-character edits.
+fn within_edits(a: &[char], b: &[char], max: usize) -> bool {
+    // Each edit changes the length by one at most.
+    if a.len().abs_diff(b.len()) > max {
+        return false;
     }
-    prev[b.len()]
+    let mut prev: Vec<usize> = (0..=b.len()).collect();
+    let mut cur = vec![0; b.len() + 1];
+    for (i, ca) in a.iter().enumerate() {
+        cur[0] = i + 1;
+        for (j, cb) in b.iter().enumerate() {
+            cur[j + 1] = (prev[j] + usize::from(ca != cb)).min(prev[j + 1] + 1).min(cur[j] + 1);
+        }
+        std::mem::swap(&mut prev, &mut cur);
+    }
+    prev[b.len()] <= max
 }
 
 /// A network name with the forms [`similar`] compares, worked out once.
 struct Name<'a> {
     raw: &'a str,
     lower: String,
-    folded: String,
+    folded: Vec<char>,
 }
 
 impl<'a> Name<'a> {
     fn new(raw: &'a str) -> Name<'a> {
-        Name { raw, lower: raw.trim().to_lowercase(), folded: fold(raw) }
+        Name { raw, lower: raw.trim().to_lowercase(), folded: fold(raw).chars().collect() }
     }
 }
 
@@ -215,17 +219,17 @@ fn similar(name: &Name, ours: &Name) -> Option<&'static str> {
         return Some("the same name with different capitals or spacing");
     }
     let (a, b) = (&name.folded, &ours.folded);
-    let len = b.chars().count();
+    let len = b.len();
     if len < 4 {
         return None;
     }
     if a == b {
         return Some("looks the same, with look-alike characters swapped in (such as 0 for O)");
     }
-    if levenshtein(a, b) <= if len >= 8 { 2 } else { 1 } {
+    if within_edits(a, b, if len >= 8 { 2 } else { 1 }) {
         return Some("differs from your network's name by a character or two");
     }
-    if a.starts_with(b.as_str()) && a.chars().count() - len <= 6 {
+    if a.starts_with(b) && a.len() - len <= 6 {
         return Some("your network's name with something added");
     }
     None
@@ -282,6 +286,9 @@ pub fn assess(a: &Assessment) -> Vec<Finding> {
         by_bssid.entry(&h.bssid).or_default().push(h);
     }
 
+    // Which of our names each network name passes for, and why: worked out
+    // once per name, however many BSSIDs broadcast it.
+    let mut lookalikes: HashMap<&str, Option<(&str, &'static str)>> = HashMap::new();
     let mut out = Vec::new();
     for (bssid, rows) in by_bssid {
         let all = seen(&rows);
@@ -375,8 +382,10 @@ pub fn assess(a: &Assessment) -> Vec<Finding> {
                 continue;
             }
             if !family
-                && let name = Name::new(e)
-                && let Some((ours, why)) = ours.iter().find_map(|o| similar(&name, o).map(|w| (o.raw, w)))
+                && let Some((ours, why)) = *lookalikes.entry(e).or_insert_with(|| {
+                    let name = Name::new(e);
+                    ours.iter().find_map(|o| similar(&name, o).map(|w| (o.raw, w)))
+                })
             {
                 push(Kind::Lookalike, Severity::Medium, Some(ours.to_string()), format!("\"{e}\" {why} (\"{ours}\")."), &rows, &all);
                 continue;
@@ -974,6 +983,16 @@ mod tests {
             .unwrap();
         assert_eq!(left, ["bridged", "lookalike"]);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn edit_distance_with_a_limit() {
+        let c = |s: &str| s.chars().collect::<Vec<char>>();
+        assert!(within_edits(&c("home"), &c("hone"), 1));
+        assert!(within_edits(&c("homewifi"), &c("homewlfii"), 2));
+        assert!(!within_edits(&c("home"), &c("hide"), 1));
+        assert!(!within_edits(&c("home"), &c("homewifi"), 2), "lengths too far apart");
+        assert!(within_edits(&c(""), &c("ab"), 2));
     }
 
     #[test]
