@@ -168,17 +168,17 @@ pub fn start_scans(live: &mut Live, band: &str, now: Ts) -> Vec<Mac> {
 /// spectrum table for the band is younger than the request, it went offline,
 /// or it timed out.
 pub fn check_scans(live: &mut Live, now: Ts) {
-    let informs = live.raw_informs.clone();
-    let offline: Vec<Mac> = live.devices.iter().filter(|(_, d)| !d.online).map(|(m, _)| *m).collect();
-    live.scans.retain(|mac, s| {
-        let Some(p) = informs.get(mac) else { return false };
+    let Live { scans, raw_informs, devices, .. } = live;
+    scans.retain(|mac, s| {
+        let Some(p) = raw_informs.get(mac) else { return false };
         match p["quickscan_scanning"].as_bool() {
             Some(true) => s.seen_scanning = true,
             Some(false) if s.seen_scanning => return false,
             _ => {}
         }
         let renewed = spectrum_age(p, &s.band).is_some_and(|age| age < now - s.started);
-        !renewed && !offline.contains(mac) && now - s.started < SCAN_TIMEOUT
+        let offline = devices.get(mac).is_some_and(|d| !d.online);
+        !renewed && !offline && now - s.started < SCAN_TIMEOUT
     });
 }
 
@@ -226,12 +226,42 @@ pub fn set_channels(state: &mut Value, changes: &[(String, String, i64)]) -> Res
 /// One Channel AI run already going (nightly or asked for).
 static RUNNING: AtomicBool = AtomicBool::new(false);
 
+/// Holds [`RUNNING`] for one run and lets it go however the run ends (a
+/// panic included), so Channel AI is never left "already running".
+struct RunGuard;
+
+impl RunGuard {
+    fn take() -> Option<RunGuard> {
+        (!RUNNING.swap(true, Ordering::SeqCst)).then_some(RunGuard)
+    }
+}
+
+impl Drop for RunGuard {
+    fn drop(&mut self) {
+        RUNNING.store(false, Ordering::SeqCst);
+    }
+}
+
+/// A channel move of one AP, as a plan lists it and the API takes it back.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Change {
+    pub mac: String,
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub from: Option<i64>,
+    #[serde(alias = "channel")]
+    pub to: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub width: Option<i64>,
+}
+
 /// Scans, plans and (when worth it) applies, band by band.
 pub async fn run(s: AppState, bands: Vec<String>, trigger: &'static str) {
-    if RUNNING.swap(true, Ordering::SeqCst) {
+    let Some(_running) = RunGuard::take() else {
         tracing::info!("channel AI: a run is already going");
         return;
-    }
+    };
     for band in bands.iter().filter(|b| BANDS.contains(&b.as_str())) {
         let scanned = start_scans(&mut s.live.write().unwrap(), band, store::now_ts());
         tracing::info!("channel AI ({trigger}): {} APs scanning {band}", scanned.len());
@@ -249,16 +279,15 @@ pub async fn run(s: AppState, bands: Vec<String>, trigger: &'static str) {
                 continue;
             }
         };
-        let changes: Vec<Value> = plan["plan"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .filter(|p| p["change"].as_bool() == Some(true))
-            .map(|p| json!({ "mac": p["mac"], "name": p["name"], "from": p["current_channel"], "to": p["suggested_channel"], "width": p["width"] }))
+        let changes: Vec<Change> = plan
+            .plan
+            .iter()
+            .filter(|p| p.change)
+            .filter_map(|p| Some(Change { mac: p.mac.clone(), name: p.name.clone(), from: p.current_channel, to: p.suggested_channel?, width: Some(p.width) }))
             .collect();
         let mut data = json!({
             "band": band, "trigger": trigger, "scanned": scanned.len(), "changes": changes,
-            "current_total": plan["current_total"], "suggested_total": plan["suggested_total"], "applied": false,
+            "current_total": plan.current_total, "suggested_total": plan.suggested_total, "applied": false,
         });
         if !changes.is_empty() {
             match apply(&s, band, &changes, trigger).await {
@@ -268,18 +297,12 @@ pub async fn run(s: AppState, bands: Vec<String>, trigger: &'static str) {
         }
         let _ = s.engine.send(Input::SiteNote { ts: store::now_ts(), kind: "channel_plan", data }).await;
     }
-    RUNNING.store(false, Ordering::SeqCst);
 }
 
-async fn apply(s: &AppState, band: &str, changes: &[Value], trigger: &str) -> Result<(), ApiError> {
-    let list: Vec<(String, String, i64)> = changes
-        .iter()
-        .filter_map(|c| Some((c["mac"].as_str()?.to_string(), band.to_string(), c["to"].as_i64().or(c["channel"].as_i64())?)))
-        .collect();
-    let what = format!(
-        "channel AI ({trigger}): {}",
-        changes.iter().map(|c| format!("{} {} → {}", c["name"].as_str().or(c["mac"].as_str()).unwrap_or("?"), c["from"], c["to"].as_i64().or(c["channel"].as_i64()).unwrap_or(0))).collect::<Vec<_>>().join(", ")
-    );
+async fn apply(s: &AppState, band: &str, changes: &[Change], trigger: &str) -> Result<(), ApiError> {
+    let list: Vec<(String, String, i64)> = changes.iter().map(|c| (c.mac.clone(), band.to_string(), c.to)).collect();
+    let show = |c: &Change| format!("{} {} → {}", c.name.as_deref().unwrap_or(&c.mac), c.from.map_or_else(|| "null".to_string(), |f| f.to_string()), c.to);
+    let what = format!("channel AI ({trigger}): {}", changes.iter().map(show).collect::<Vec<_>>().join(", "));
     crate::actions::edit_settings(s, what, move |state| set_channels(state, &list)).await
 }
 
@@ -308,21 +331,25 @@ pub fn schedule(s: AppState) {
     });
 }
 
-/// The next nightly run (UTC), if enabled.
+/// The next nightly run (UTC), if enabled: the first minute after now at the
+/// setting's local time, today or on one of the next days (a time skipped by
+/// a summer-time change is skipped that day, as the scheduler skips it).
 fn next_run(cfg: &Settings, tz: Option<&str>, now: Ts) -> Option<Ts> {
     if !cfg.enabled {
         return None;
     }
     let target = cfg.hour * 60 + cfg.minute;
-    // The first minute within the next 26 hours (DST days included) at that local time.
-    let mut t = now - now % 60 + 60;
-    for _ in 0..(26 * 60) {
-        if crate::clock::local(tz, t).1 == target {
-            return Some(t);
-        }
-        t += 60;
-    }
-    None
+    // The zone's rule, looked up once; unknown zones are UTC (as in `clock::local`).
+    let rule = tz.and_then(apcfg::tz::posix);
+    let offset = |t: Ts| rule.and_then(|r| crate::clock::utc_offset(r, t)).unwrap_or(0);
+    let local = |t: Ts| (t + offset(t)).rem_euclid(86400) / 60;
+    let first = now - now % 60 + 60;
+    let today = (first + offset(first)).div_euclid(86400);
+    (0..3).find_map(|day| {
+        let wall = (today + day) * 86400 + target * 60;
+        // The UTC time of that wall-clock time, under the offset before or after a change.
+        [wall - offset(wall), wall - offset(wall - offset(wall))].into_iter().filter(|t| *t >= first && local(*t) == target).min()
+    })
 }
 
 // ---- API ------------------------------------------------------------------
@@ -337,16 +364,20 @@ fn require_active(s: &AppState) -> Result<(), ApiError> {
 
 /// GET /api/rf/channel-ai
 pub async fn status(State(s): State<AppState>) -> Result<Json<Value>, ApiError> {
-    let mut live = s.live.write().unwrap();
-    check_scans(&mut live, store::now_ts());
-    let st = live.state.as_deref();
-    let tz = st.and_then(crate::settings::timezone).map(str::to_string);
+    // Finished scans are cleared under the write lock; the rest needs only a copy.
+    let (state, scans) = {
+        let mut live = s.live.write().unwrap();
+        check_scans(&mut live, store::now_ts());
+        let scans: Vec<Value> = live.scans.iter().map(|(m, sc)| json!({ "mac": m, "band": sc.band, "started": sc.started })).collect();
+        (live.state.clone(), scans)
+    };
+    let st = state.as_deref();
+    let tz = st.and_then(crate::settings::timezone);
     let cfg = settings(st);
-    let scans: Vec<Value> = live.scans.iter().map(|(m, sc)| json!({ "mac": m, "band": sc.band, "started": sc.started })).collect();
     Ok(Json(json!({
-        "active": s.active, "has_settings": st.and_then(radio_ai).is_some(), "settings": cfg, "timezone": tz,
-        "next_run": next_run(&cfg, tz.as_deref(), store::now_ts()), "running": RUNNING.load(Ordering::SeqCst), "scans": scans,
-        "allowed": { "ng": allowed(st, "ng", false), "na": allowed(st, "na", false) },
+        "active": s.active, "has_settings": st.and_then(radio_ai).is_some(), "timezone": tz,
+        "next_run": next_run(&cfg, tz, store::now_ts()), "running": RUNNING.load(Ordering::SeqCst), "scans": scans,
+        "allowed": { "ng": allowed(st, "ng", false), "na": allowed(st, "na", false) }, "settings": cfg,
     })))
 }
 
@@ -390,15 +421,20 @@ pub async fn run_now(State(s): State<AppState>, headers: HeaderMap, Json(b): Jso
 pub struct ApplyBody {
     band: String,
     /// `{mac, name, from, to}` as the plan listed them.
-    changes: Vec<Value>,
+    changes: Vec<Change>,
 }
 
 /// POST /api/rf/channel-plan/apply {band, changes}: apply a plan as shown.
-pub async fn apply_plan(State(s): State<AppState>, headers: HeaderMap, Json(b): Json<ApplyBody>) -> Result<Json<Value>, ApiError> {
+/// Every change must be complete (a malformed one refuses the whole plan).
+pub async fn apply_plan(State(s): State<AppState>, headers: HeaderMap, Json(b): Json<Value>) -> Result<Json<Value>, ApiError> {
     crate::api::check_csrf(&headers)?;
     require_active(&s)?;
+    let b: ApplyBody = serde_json::from_value(b).map_err(|e| ApiError(StatusCode::BAD_REQUEST, format!("not a plan: {e}")))?;
     if b.changes.is_empty() {
         return Err(ApiError(StatusCode::BAD_REQUEST, "the plan changes nothing".into()));
+    }
+    if let Some(c) = b.changes.iter().find(|c| !crate::settings::is_mac(&c.mac)) {
+        return Err(ApiError(StatusCode::BAD_REQUEST, format!("{} is not a MAC address", c.mac)));
     }
     apply(&s, &b.band, &b.changes, "manual").await?;
     let data = json!({ "band": b.band, "trigger": "manual", "changes": b.changes, "applied": true });
@@ -570,5 +606,33 @@ mod tests {
         // 2026-07-01 00:00 UTC: 05:00 in Berlin (summer) is 03:00 UTC.
         let now = 1_782_864_000;
         assert_eq!(next_run(&cfg, Some("Europe/Berlin"), now), Some(now + 3 * 3600));
+        // Just past it: tomorrow; in winter 05:00 in Berlin is 04:00 UTC; no zone is UTC.
+        assert_eq!(next_run(&cfg, Some("Europe/Berlin"), now + 3 * 3600), Some(now + 27 * 3600));
+        let winter = 1_796_083_200; // 2026-12-01 00:00 UTC
+        assert_eq!(next_run(&cfg, Some("Europe/Berlin"), winter), Some(winter + 4 * 3600));
+        assert_eq!(next_run(&cfg, None, winter), Some(winter + 5 * 3600));
+        // 02:30 does not exist on 2026-03-29 in Berlin: the next run is the day after.
+        let cfg = Settings { hour: 2, minute: 30, ..settings(Some(&s)) };
+        let before = 1_774_742_400; // 2026-03-29 00:00 UTC
+        assert_eq!(next_run(&cfg, Some("Europe/Berlin"), before), Some(before + 86400 + 30 * 60));
+    }
+
+    #[test]
+    fn a_run_that_panics_lets_go_of_the_flag() {
+        let r = std::panic::catch_unwind(|| {
+            let _g = RunGuard::take().unwrap();
+            assert!(RunGuard::take().is_none(), "one run at a time");
+            panic!("plan failed");
+        });
+        assert!(r.is_err());
+        assert!(!RUNNING.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn plan_changes_must_be_complete() {
+        let ok: ApplyBody = serde_json::from_value(json!({ "band": "na", "changes": [{ "mac": "02:00:00:00:00:01", "name": null, "from": 44, "to": 36 }] })).unwrap();
+        assert_eq!((ok.changes[0].to, ok.changes[0].from), (36, Some(44)));
+        assert!(serde_json::from_value::<ApplyBody>(json!({ "band": "na", "changes": [{ "mac": "02:00:00:00:00:01", "to": null }] })).is_err());
+        assert!(serde_json::from_value::<ApplyBody>(json!({ "band": "na", "changes": [{ "to": 36 }] })).is_err());
     }
 }

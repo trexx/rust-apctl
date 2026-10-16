@@ -8,7 +8,7 @@ use axum::extract::{Query, State};
 use rusqlite::Connection;
 use rusqlite::params_from_iter;
 use rusqlite::types::Value as Sql;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::api::{ApiError, AppState};
@@ -985,7 +985,7 @@ fn allowed_blocks(radio: &str, width: i64, allowed: &[i64]) -> Vec<Block> {
 /// GET /api/rf/channel-plan: a suggested channel per AP for one band, from
 /// the networks each AP hears, our APs' signal to each other, and measured
 /// interference. Suggestions only: nothing is applied.
-pub async fn channel_plan(State(s): State<AppState>, Query(q): Query<PlanQuery>) -> Result<Json<Value>, ApiError> {
+pub async fn channel_plan(State(s): State<AppState>, Query(q): Query<PlanQuery>) -> Result<Json<Plan>, ApiError> {
     let radio = q.band.clone().unwrap_or_else(|| "na".into());
     let dfs = q.dfs.unwrap_or(false);
     let (allowed, pinned) = {
@@ -995,11 +995,68 @@ pub async fn channel_plan(State(s): State<AppState>, Query(q): Query<PlanQuery>)
     Ok(Json(compute_plan(&s, radio, dfs, allowed, pinned).await?))
 }
 
-/// The channel plan for one band. `allowed` limits the channels (the Channel
-/// AI settings; `None`: every channel the AP or the band offers), `pinned`
-/// APs keep their channel. A plan only moves APs when it is clearly better
-/// overall (by more than 10%), or when an AP is on a channel no longer allowed.
-pub async fn compute_plan(s: &AppState, radio: String, dfs: bool, allowed: Option<Vec<i64>>, pinned: Vec<String>) -> Result<Value, ApiError> {
+/// A channel plan for one band.
+#[derive(Debug, Serialize)]
+pub struct Plan {
+    pub band: String,
+    pub dfs: bool,
+    /// The channels the plan could use; `None`: any.
+    pub allowed: Option<Vec<i64>>,
+    pub plan: Vec<PlanEntry>,
+    pub current_total: f64,
+    pub suggested_total: f64,
+    /// Worth applying: clearly better, or an AP must move.
+    pub accepted: bool,
+}
+
+/// One AP in a channel plan.
+#[derive(Debug, Serialize)]
+pub struct PlanEntry {
+    pub mac: String,
+    pub name: Option<String>,
+    pub width: i64,
+    pub clients: i64,
+    pub current_channel: Option<i64>,
+    pub current_score: Option<f64>,
+    pub current_reasons: Option<Vec<String>>,
+    pub suggested_channel: Option<i64>,
+    pub suggested_score: Option<f64>,
+    pub suggested_reasons: Vec<String>,
+    pub change: bool,
+    pub pinned: bool,
+    /// It moves because its channel is no longer allowed.
+    pub not_allowed: bool,
+}
+
+/// An AP radio as the plan sees it.
+struct PlanAp {
+    mac: String,
+    name: Option<String>,
+    current: Option<Block>,
+    width: i64,
+    clients: i64,
+    /// Channel blocks the AP lists as available (its country and width).
+    available: Option<Vec<i64>>,
+}
+
+/// A network an AP hears (not one of ours): its name, span and signal.
+struct Heard {
+    essid: Option<String>,
+    lo: f64,
+    hi: f64,
+    signal: f64,
+}
+
+/// The channel plan for one band (`ng` or `na`). `allowed` limits the
+/// channels (the Channel AI settings; `None`: every channel the AP or the band
+/// offers), `pinned` APs keep their channel. A plan only moves APs when it is
+/// clearly better overall (by more than 10%), or when an AP is on a channel no
+/// longer allowed.
+pub async fn compute_plan(s: &AppState, radio: String, dfs: bool, allowed: Option<Vec<i64>>, pinned: Vec<String>) -> Result<Plan, ApiError> {
+    // The channel blocks are worked out for 2.4 and 5 GHz only.
+    if !matches!(radio.as_str(), "ng" | "na") {
+        return Err(ApiError(axum::http::StatusCode::BAD_REQUEST, "band must be ng or na".into()));
+    }
     let since = store::now_ts() - 7 * 86400;
     let r2 = radio.clone();
     let (neigh, spectrum) = read(s, Db::Config, move |c| {
@@ -1016,65 +1073,95 @@ pub async fn compute_plan(s: &AppState, radio: String, dfs: bool, allowed: Optio
         Ok((n, sp))
     })
     .await?;
-    let live = s.live.read().unwrap();
-    struct Ap {
-        mac: String,
-        name: Option<String>,
-        current: Option<Block>,
-        width: i64,
-        clients: i64,
-        /// Channel blocks the AP lists as available (its country and width).
-        available: Option<Vec<i64>>,
-    }
-    let aps: Vec<Ap> = live
-        .devices
-        .iter()
-        .filter_map(|(m, d)| {
-            let r = d.snapshot.radios.iter().find(|r| r.radio == radio)?;
-            let ch = r.channel?;
-            let width = if radio == "ng" { 20 } else { r.bw.unwrap_or(80) };
-            let available = live.raw_informs.get(m).and_then(|p| {
-                let rt = p["radio_table"].as_array()?.iter().find(|x| x["radio"].as_str() == Some(radio.as_str()))?;
-                let list: Vec<i64> = rt["spectrum_table"]
-                    .as_array()?
-                    .iter()
-                    .filter(|c| radio == "ng" || c["width"].as_i64() == Some(width))
-                    .filter_map(|c| c["channel"].as_i64())
-                    .collect();
-                (!list.is_empty()).then_some(list)
-            });
-            Some(Ap { mac: m.to_string(), name: d.snapshot.ap.hostname.clone(), current: Some(block(&radio, ch, width)), width, clients: r.num_sta, available })
-        })
-        .collect();
-    // Our APs' BSSIDs on this band, to separate own signal from neighbours.
-    let own_bssids: HashMap<String, String> = live
-        .devices
-        .iter()
-        .flat_map(|(m, d)| d.snapshot.vaps.iter().filter(|v| v.radio.as_deref() == Some(radio.as_str())).map(move |v| (v.bssid.to_ascii_lowercase(), m.to_string())))
-        .collect();
-    // AP-to-AP signal (strongest seen either way).
+    // What the plan needs from `live`, copied so the lock is not held while it is worked out.
+    let (aps, own_bssids) = {
+        let live = s.live.read().unwrap();
+        let aps: Vec<PlanAp> = live
+            .devices
+            .iter()
+            .filter_map(|(m, d)| {
+                let r = d.snapshot.radios.iter().find(|r| r.radio == radio)?;
+                let ch = r.channel?;
+                let width = if radio == "ng" { 20 } else { r.bw.unwrap_or(80) };
+                let available = live.raw_informs.get(m).and_then(|p| {
+                    let rt = p["radio_table"].as_array()?.iter().find(|x| x["radio"].as_str() == Some(radio.as_str()))?;
+                    let list: Vec<i64> = rt["spectrum_table"]
+                        .as_array()?
+                        .iter()
+                        .filter(|c| radio == "ng" || c["width"].as_i64() == Some(width))
+                        .filter_map(|c| c["channel"].as_i64())
+                        .collect();
+                    (!list.is_empty()).then_some(list)
+                });
+                Some(PlanAp { mac: m.to_string(), name: d.snapshot.ap.hostname.clone(), current: Some(block(&radio, ch, width)), width, clients: r.num_sta, available })
+            })
+            .collect();
+        // Our APs' BSSIDs on this band, to separate own signal from neighbours.
+        let own: HashMap<String, String> = live
+            .devices
+            .iter()
+            .flat_map(|(m, d)| d.snapshot.vaps.iter().filter(|v| v.radio.as_deref() == Some(radio.as_str())).map(move |v| (v.bssid.to_ascii_lowercase(), m.to_string())))
+            .collect();
+        (aps, own)
+    };
+    let work = move || plan_channels(radio, dfs, allowed, pinned, aps, own_bssids, neigh, spectrum);
+    tokio::task::spawn_blocking(work).await.map_err(|e| ApiError::internal(e.to_string()))
+}
+
+type NeighborRow = (String, String, Option<String>, Option<f64>, Option<f64>, Option<f64>);
+type SpectrumRow = (String, i64, Option<i64>, Option<f64>, Option<f64>);
+
+/// The greedy search behind [`compute_plan`], on data copied out of `live`.
+#[allow(clippy::too_many_arguments)] // the inputs of one computation, passed once
+fn plan_channels(
+    radio: String,
+    dfs: bool,
+    allowed: Option<Vec<i64>>,
+    pinned: Vec<String>,
+    aps: Vec<PlanAp>,
+    own_bssids: HashMap<String, String>,
+    neigh: Vec<NeighborRow>,
+    spectrum: Vec<SpectrumRow>,
+) -> Plan {
+    // AP-to-AP signal (strongest seen either way), and what each AP hears of the neighbours.
     let mut ap_signal: HashMap<(String, String), f64> = HashMap::new();
-    for (heard_by, bssid, _, _, _, sig) in &neigh {
-        if let (Some(owner), Some(sig)) = (own_bssids.get(bssid), sig) {
-            for k in [(heard_by.clone(), owner.clone()), (owner.clone(), heard_by.clone())] {
-                let e = ap_signal.entry(k).or_insert(-200.0);
-                *e = e.max(*sig);
+    let mut heard: HashMap<String, Vec<Heard>> = HashMap::new();
+    for (heard_by, bssid, essid, cf, bw, sig) in neigh {
+        match own_bssids.get(&bssid) {
+            Some(owner) => {
+                if let Some(sig) = sig {
+                    for k in [(heard_by.clone(), owner.clone()), (owner.clone(), heard_by.clone())] {
+                        let e = ap_signal.entry(k).or_insert(-200.0);
+                        *e = e.max(sig);
+                    }
+                }
+            }
+            None => {
+                let (Some(cf), Some(signal)) = (cf, sig) else { continue };
+                let half = bw.unwrap_or(20.0) / 2.0;
+                heard.entry(heard_by).or_default().push(Heard { essid, lo: cf - half, hi: cf + half, signal });
             }
         }
     }
-    let cost = |ap: &Ap, b: &Block, assigned: &HashMap<String, Block>| -> (f64, Vec<String>) {
+    // Measured load per AP: the channel blocks and what each costs.
+    let mut measured: HashMap<String, Vec<(Block, f64)>> = HashMap::new();
+    for (m, ch, width, interference, util) in spectrum {
+        let load = util.unwrap_or(0.0) * 0.5 + interference.map_or(0.0, |i| weight(i) * 0.5);
+        measured.entry(m).or_default().push((block(&radio, ch, width.unwrap_or(20)), load));
+    }
+    let names: HashMap<&str, &str> = aps.iter().filter_map(|a| Some((a.mac.as_str(), a.name.as_deref()?))).collect();
+    let no_neighbours = Vec::new();
+    // What the AP would put up with on block `b`, the others placed as in `assigned`
+    // (its own entry there is ignored), with (weight, reason) per contribution when `why`.
+    let contributions = |ap: &PlanAp, b: &Block, assigned: &HashMap<String, Block>, mut why: Option<&mut Vec<(f64, String)>>| -> f64 {
         let mut total = 0.0;
-        let mut reasons: Vec<(f64, String)> = Vec::new();
-        for (heard_by, bssid, essid, cf, bw, sig) in &neigh {
-            if heard_by != &ap.mac || own_bssids.contains_key(bssid) {
-                continue;
-            }
-            let (Some(cf), Some(sig)) = (cf, sig) else { continue };
-            let half = bw.unwrap_or(20.0) / 2.0;
-            if overlap(b, cf - half, cf + half) {
-                let w = weight(*sig);
+        for n in heard.get(&ap.mac).unwrap_or(&no_neighbours) {
+            if overlap(b, n.lo, n.hi) {
+                let w = weight(n.signal);
                 total += w;
-                reasons.push((w, format!("{} ({sig:.0} dBm)", essid.clone().unwrap_or_else(|| "hidden network".into()))));
+                if let Some(why) = why.as_deref_mut() {
+                    why.push((w, format!("{} ({:.0} dBm)", n.essid.as_deref().unwrap_or("hidden network"), n.signal)));
+                }
             }
         }
         for (other, ob) in assigned {
@@ -1082,41 +1169,44 @@ pub async fn compute_plan(s: &AppState, radio: String, dfs: bool, allowed: Optio
                 let sig = ap_signal.get(&(ap.mac.clone(), other.clone())).copied().unwrap_or(-75.0);
                 let w = 2.0 * weight(sig);
                 total += w;
-                let name = aps.iter().find(|a| &a.mac == other).and_then(|a| a.name.clone()).unwrap_or_else(|| other.clone());
-                reasons.push((w, format!("your AP {name} ({sig:.0} dBm)")));
+                if let Some(why) = why.as_deref_mut() {
+                    why.push((w, format!("your AP {} ({sig:.0} dBm)", names.get(other.as_str()).copied().unwrap_or(other))));
+                }
             }
         }
-        for (m, ch, width, interference, util) in &spectrum {
-            if m != &ap.mac {
-                continue;
-            }
-            let sb = block(&radio, *ch, width.unwrap_or(20));
+        for (sb, load) in measured.get(&ap.mac).into_iter().flatten() {
             if overlap(b, sb.lo, sb.hi) {
-                total += util.unwrap_or(0.0) * 0.5 + interference.map_or(0.0, |i| weight(i) * 0.5);
+                total += load;
             }
         }
+        total
+    };
+    let cost = |ap: &PlanAp, b: &Block, assigned: &HashMap<String, Block>| contributions(ap, b, assigned, None);
+    // The cost with the four biggest reasons, for the plan shown.
+    let explain = |ap: &PlanAp, b: &Block, assigned: &HashMap<String, Block>| -> (f64, Vec<String>) {
+        let mut reasons = Vec::new();
+        let total = contributions(ap, b, assigned, Some(&mut reasons));
         reasons.sort_by(|a, b| b.0.total_cmp(&a.0));
         (total, reasons.into_iter().take(4).map(|r| r.1).collect())
     };
-    let cands = |ap: &Ap| match &allowed {
+    let cands = |ap: &PlanAp| match &allowed {
         Some(a) => allowed_blocks(&radio, ap.width, a),
         None => candidates(&radio, ap.width, dfs, ap.available.as_deref()),
     };
-    let is_pinned = |ap: &Ap| pinned.contains(&ap.mac);
+    let is_pinned = |ap: &PlanAp| pinned.contains(&ap.mac);
     // Greedy: busiest AP first, then a second pass with everyone placed.
-    let mut order: Vec<&Ap> = aps.iter().filter(|a| !is_pinned(a)).collect();
+    let mut order: Vec<&PlanAp> = aps.iter().filter(|a| !is_pinned(a)).collect();
     order.sort_by_key(|a| -a.clients);
     let current: HashMap<String, Block> = aps.iter().filter_map(|a| a.current.map(|c| (a.mac.clone(), c))).collect();
     let mut assigned = current.clone();
     for _ in 0..2 {
         for ap in &order {
-            let best = cands(ap).into_iter().map(|b| (cost(ap, &b, &assigned).0, b)).min_by(|a, b| a.0.total_cmp(&b.0));
+            let best = cands(ap).into_iter().map(|b| (cost(ap, &b, &assigned), b)).min_by(|a, b| a.0.total_cmp(&b.0));
             if let Some((_, b)) = best {
                 assigned.insert(ap.mac.clone(), b);
             }
         }
     }
-    let without = |m: &HashMap<String, Block>, mac: &str| -> HashMap<String, Block> { m.iter().filter(|(k, _)| k.as_str() != mac).map(|(k, b)| (k.clone(), *b)).collect() };
     // Which APs move: on a channel no longer allowed, or clearly better off elsewhere.
     let mut evict: HashMap<String, bool> = HashMap::new();
     let mut fin = current.clone();
@@ -1126,39 +1216,42 @@ pub async fn compute_plan(s: &AppState, radio: String, dfs: bool, allowed: Optio
             continue;
         }
         let ev = !cands(ap).iter().any(|b| (b.lo - cur.lo).abs() < 1.0 && (b.hi - cur.hi).abs() < 1.0);
-        let others = without(&assigned, &ap.mac);
-        if ev || cost(ap, &sug, &others).0 + 5.0 < cost(ap, &cur, &others).0 * 0.8 {
+        if ev || cost(ap, &sug, &assigned) + 5.0 < cost(ap, &cur, &assigned) * 0.8 {
             fin.insert(ap.mac.clone(), sug);
             evict.insert(ap.mac.clone(), ev);
         }
     }
-    let total = |m: &HashMap<String, Block>| -> f64 { aps.iter().filter_map(|ap| m.get(&ap.mac).map(|b| cost(ap, b, &without(m, &ap.mac)).0)).sum() };
+    let total = |m: &HashMap<String, Block>| -> f64 { aps.iter().filter_map(|ap| m.get(&ap.mac).map(|b| cost(ap, b, m))).sum() };
     let (current_total, final_total) = (total(&current), total(&fin));
     let accepted = evict.values().any(|e| *e) || (!evict.is_empty() && final_total * 1.1 < current_total);
     if !accepted {
         fin = current.clone();
         evict.clear();
     }
-    let plan: Vec<Value> = aps
+    let plan: Vec<PlanEntry> = aps
         .iter()
         .map(|ap| {
-            let cur = ap.current.map(|b| cost(ap, &b, &without(&current, &ap.mac)));
+            let cur = ap.current.map(|b| explain(ap, &b, &current));
             let change = evict.contains_key(&ap.mac);
-            let sug = fin.get(&ap.mac).map(|b| (b.primary, cost(ap, b, &without(&fin, &ap.mac))));
-            json!({
-                "mac": ap.mac, "name": ap.name, "width": ap.width, "clients": ap.clients,
-                "current_channel": ap.current.map(|c| c.primary), "current_score": cur.as_ref().map(|c| c.0.round()),
-                "current_reasons": cur.map(|c| c.1),
-                "suggested_channel": sug.as_ref().map(|s| s.0), "suggested_score": sug.as_ref().map(|s| s.1.0.round()),
-                "suggested_reasons": if change { sug.map(|s| s.1.1).unwrap_or_default() } else { vec![] },
-                "change": change, "pinned": is_pinned(ap), "not_allowed": evict.get(&ap.mac).copied().unwrap_or(false),
-            })
+            let sug = fin.get(&ap.mac).map(|b| (b.primary, explain(ap, b, &fin)));
+            PlanEntry {
+                mac: ap.mac.clone(),
+                name: ap.name.clone(),
+                width: ap.width,
+                clients: ap.clients,
+                current_channel: ap.current.map(|c| c.primary),
+                current_score: cur.as_ref().map(|c| c.0.round()),
+                current_reasons: cur.map(|c| c.1),
+                suggested_channel: sug.as_ref().map(|s| s.0),
+                suggested_score: sug.as_ref().map(|s| s.1.0.round()),
+                suggested_reasons: if change { sug.map(|s| s.1.1).unwrap_or_default() } else { vec![] },
+                change,
+                pinned: is_pinned(ap),
+                not_allowed: evict.get(&ap.mac).copied().unwrap_or(false),
+            }
         })
         .collect();
-    Ok(json!({
-        "band": radio, "dfs": dfs, "allowed": allowed, "plan": plan,
-        "current_total": current_total.round(), "suggested_total": final_total.round(), "accepted": accepted,
-    }))
+    Plan { band: radio, dfs, allowed, plan, current_total: current_total.round(), suggested_total: final_total.round(), accepted }
 }
 
 #[cfg(test)]
@@ -1189,6 +1282,26 @@ mod tests {
         assert!(allowed_blocks("na", 160, &low).is_empty(), "36-64 needs 52-64 too");
         assert_eq!(allowed_blocks("na", 80, &[36, 40, 44]).len(), 0);
         assert_eq!(allowed_blocks("ng", 20, &[1, 6, 11]).len(), 3);
+    }
+
+    #[test]
+    fn two_aps_that_hear_each_other_are_split() {
+        let ap = |mac: &str, ch: i64, clients: i64| PlanAp { mac: mac.into(), name: Some(format!("AP {mac}")), current: Some(block("ng", ch, 20)), width: 20, clients, available: None };
+        let aps = vec![ap("a", 6, 5), ap("b", 6, 1)];
+        let own = HashMap::from([("bss-a".to_string(), "a".to_string()), ("bss-b".to_string(), "b".to_string())]);
+        // Each hears the other loudly, and "a" hears a neighbour on channel 1.
+        let neigh = vec![
+            ("a".to_string(), "bss-b".to_string(), None, None, None, Some(-50.0)),
+            ("b".to_string(), "bss-a".to_string(), None, None, None, Some(-50.0)),
+            ("a".to_string(), "x".to_string(), Some("Next door".to_string()), Some(2412.0), Some(20.0), Some(-60.0)),
+        ];
+        let plan = plan_channels("ng".into(), false, None, vec![], aps, own, neigh, vec![]);
+        assert!(plan.accepted, "{plan:?}");
+        let ch: HashMap<&str, Option<i64>> = plan.plan.iter().map(|p| (p.mac.as_str(), p.suggested_channel)).collect();
+        assert_ne!(ch["a"], ch["b"]);
+        assert_ne!(ch["a"], Some(1), "a keeps off its neighbour");
+        let a = plan.plan.iter().find(|p| p.mac == "a").unwrap();
+        assert_eq!(a.current_reasons.as_deref(), Some(&["your AP AP b (-50 dBm)".to_string()][..]));
     }
 
     #[test]
