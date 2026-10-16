@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { useState } from "react";
 import { Link, useParams } from "react-router-dom";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import {
@@ -55,10 +55,7 @@ export function Client() {
   const v = c ?? listed;
   const name = v ? displayName(v) : mac;
   // Every event in the timeline is this client's (a MAC alone shows as one).
-  const cnames = useMemo(
-    () => (name !== mac ? { [mac]: name } : {}),
-    [mac, name],
-  );
+  const cnames = name !== mac ? { [mac]: name } : {};
   const unknown =
     client.error instanceof HttpError && client.error.status === 404;
 
