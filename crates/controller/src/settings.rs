@@ -10,7 +10,7 @@
 use axum::Json;
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use serde::Deserialize;
@@ -246,7 +246,7 @@ pub async fn wlans(State(s): State<AppState>) -> Result<Json<Value>, ApiError> {
 
 /// For each optional SSID feature, the APs that would broadcast the SSID
 /// without it; and the APs whose support is not known yet (no inform).
-fn feature_support(state: &Value, informs: &std::collections::HashMap<inform::Mac, std::sync::Arc<Value>>) -> (Value, Vec<String>) {
+fn feature_support(state: &Value, informs: &HashMap<inform::Mac, std::sync::Arc<Value>>) -> (Value, Vec<String>) {
     let mut unsupported: serde_json::Map<String, Value> = apcfg::SSID_FEATURES.iter().map(|f| (f.to_string(), json!([]))).collect();
     let mut unknown = Vec::new();
     for d in docs(state, "devices") {
@@ -2021,16 +2021,19 @@ fn rate(v: &Value, what: &str) -> Result<i64, String> {
 }
 
 /// Who uses a user group: SSID and client names.
-fn group_users(state: &Value, id: &str) -> Vec<String> {
-    let mut out: Vec<String> = docs(state, "wlanconf").filter(|w| w["usergroup_id"].as_str() == Some(id)).map(|w| format!("SSID {}", w["name"].as_str().unwrap_or("?"))).collect();
-    out.extend(
-        state["clients"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .filter(|c| c["usergroup_id"].as_str() == Some(id))
-            .map(|c| format!("client {}", c["name"].as_str().or(c["hostname"].as_str()).or(c["mac"].as_str()).unwrap_or("?"))),
-    );
+/// Who uses each user group (by id): SSID and client names, read in one pass.
+fn group_users(state: &Value) -> HashMap<&str, Vec<String>> {
+    let mut out: HashMap<&str, Vec<String>> = HashMap::new();
+    for w in docs(state, "wlanconf") {
+        if let Some(id) = w["usergroup_id"].as_str() {
+            out.entry(id).or_default().push(format!("SSID {}", w["name"].as_str().unwrap_or("?")));
+        }
+    }
+    for c in docs(state, "clients") {
+        if let Some(id) = c["usergroup_id"].as_str() {
+            out.entry(id).or_default().push(format!("client {}", c["name"].as_str().or(c["hostname"].as_str()).or(c["mac"].as_str()).unwrap_or("?")));
+        }
+    }
     out
 }
 
@@ -2051,7 +2054,7 @@ pub fn apply_usergroup(state: &mut Value, e: &GroupEdit) -> Result<String, Strin
         if g["attr_no_delete"].as_bool() == Some(true) {
             return Err("the default speed limit cannot be deleted".into());
         }
-        let users = group_users(state, &id);
+        let users = group_users(state).remove(id.as_str()).unwrap_or_default();
         if !users.is_empty() {
             return Err(format!("still used by {}", users.join(", ")));
         }
@@ -2135,11 +2138,13 @@ pub fn apply_client_group(state: &mut Value, e: &ClientGroup) -> Result<String, 
 pub async fn usergroups(State(s): State<AppState>) -> Result<Json<Value>, ApiError> {
     let state = s.live.read().unwrap().state.clone();
     let Some(state) = state else { return Ok(Json(json!({ "active": s.active, "groups": [] }))) };
+    let users = group_users(&state);
     let group = |g: &Value| {
         let id = id_of(g).unwrap_or_default();
+        let used_by = users.get(id.as_str()).map(Vec::as_slice).unwrap_or_default();
         json!({
             "id": id, "name": g["name"], "default": g["attr_hidden_id"].as_str() == Some("Default"),
-            "qos_rate_max_down": g["qos_rate_max_down"], "qos_rate_max_up": g["qos_rate_max_up"], "used_by": group_users(&state, &id),
+            "qos_rate_max_down": g["qos_rate_max_down"], "qos_rate_max_up": g["qos_rate_max_up"], "used_by": used_by,
         })
     };
     let mut groups: Vec<Value> = docs(&state, "usergroup").map(group).collect();
