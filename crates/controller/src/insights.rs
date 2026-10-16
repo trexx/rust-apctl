@@ -1122,7 +1122,7 @@ pub async fn compute_plan(s: &AppState, radio: String, dfs: bool, allowed: Optio
                 let ch = r.channel?;
                 let width = if radio == "ng" { 20 } else { r.bw.unwrap_or(80) };
                 let available = live.raw_informs.get(m).and_then(|p| {
-                    let rt = p["radio_table"].as_array()?.iter().find(|x| x["radio"].as_str() == Some(radio.as_str()))?;
+                    let rt = crate::settings::inform_radio(p, &radio)?;
                     let list: Vec<i64> = rt["spectrum_table"]
                         .as_array()?
                         .iter()

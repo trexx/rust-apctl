@@ -366,7 +366,7 @@ fn aps(s: &AppState) -> Vec<ApInfo> {
                 version: d.snapshot.ap.version.clone(),
                 required: raw.and_then(|r| r["required_version"].as_str().map(str::to_string)),
                 online: d.online,
-                mesh: d.snapshot.uplink.as_ref().is_some_and(|u| !u.ifname.starts_with("eth")),
+                mesh: raw.is_some_and(|r| crate::settings::uplink(r).is_wireless()),
             }
         })
         .collect()

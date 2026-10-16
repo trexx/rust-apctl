@@ -132,10 +132,7 @@ pub(crate) fn setting<'a>(state: &'a Value, key: &str) -> &'a Value {
 /// The site's setting document with this key, created when missing.
 pub(crate) fn setting_mut<'a>(state: &'a mut Value, key: &str) -> &'a mut Value {
     let site = site_id(state);
-    if !state["setting"].is_array() {
-        state["setting"] = json!([]);
-    }
-    let list = state["setting"].as_array_mut().unwrap();
+    let list = array_mut(state, "setting");
     let i = match list.iter().position(|s| s["key"].as_str() == Some(key) && in_site(site.as_deref(), s)) {
         Some(i) => i,
         None => {
@@ -144,6 +141,23 @@ pub(crate) fn setting_mut<'a>(state: &'a mut Value, key: &str) -> &'a mut Value 
         }
     };
     &mut list[i]
+}
+
+/// A list in the settings (a collection), created empty when missing.
+pub(crate) fn array_mut<'a>(state: &'a mut Value, key: &str) -> &'a mut Vec<Value> {
+    let v = &mut state[key];
+    if !v.is_array() {
+        *v = Value::Array(Vec::new());
+    }
+    match v {
+        Value::Array(list) => list,
+        _ => unreachable!("made a list above"),
+    }
+}
+
+/// An inform's entry for one band in its `radio_table`.
+pub(crate) fn inform_radio<'a>(inform: &'a Value, band: &str) -> Option<&'a Value> {
+    inform["radio_table"].as_array()?.iter().find(|r| r["radio"].as_str() == Some(band))
 }
 
 /// A flag of the site's `mgmt` setting (outdoor mode, advanced features...).
@@ -272,7 +286,7 @@ const DEVICE_FIELDS: &[&str] = &[
 
 /// What the AP itself reports about a radio: power range, widths, channels.
 fn radio_caps(inform: Option<&Value>, band: &str) -> Value {
-    let Some(r) = inform.and_then(|p| p["radio_table"].as_array()?.iter().find(|r| r["radio"].as_str() == Some(band))) else { return Value::Null };
+    let Some(r) = inform.and_then(|p| inform_radio(p, band)) else { return Value::Null };
     json!({
         "min_txpower": r["min_txpower"], "max_txpower": r["max_txpower"], "has_ht160": r["has_ht160"], "has_dfs": r["has_dfs"],
         "is_11ax": r["is_11ax"], "nss": r["nss"],
@@ -281,15 +295,13 @@ fn radio_caps(inform: Option<&Value>, band: &str) -> Value {
 
 /// GET /api/settings/devices/{mac}
 pub async fn device(State(s): State<AppState>, Path(mac): Path<String>) -> Result<Json<Value>, ApiError> {
+    let m: Option<inform::Mac> = mac.parse().ok();
     let (state, inform) = {
         let live = s.live.read().unwrap();
-        let inform = mac.parse().ok().and_then(|m| live.raw_informs.get(&m).cloned());
-        (live.state.clone(), inform)
+        (live.state.clone(), m.and_then(|m| live.raw_informs.get(&m).cloned()))
     };
     let state = state.ok_or_else(|| ApiError(StatusCode::CONFLICT, "no settings imported yet".into()))?;
-    let d = docs(&state, "devices")
-        .find(|d| d["mac"].as_str().is_some_and(|m| m.eq_ignore_ascii_case(&mac)))
-        .ok_or_else(|| ApiError(StatusCode::NOT_FOUND, "this AP is not in the settings".into()))?;
+    let d = m.and_then(|m| crate::adopt::device_doc(&state, &m)).ok_or_else(|| ApiError(StatusCode::NOT_FOUND, "this AP is not in the settings".into()))?;
     let radios: Vec<Value> = d["radio_table"]
         .as_array()
         .into_iter()
@@ -559,10 +571,7 @@ fn set_wlan_aps(state: &mut Value, id: &str, aps: Option<Vec<String>>) -> Result
                     if let Some(s) = &site {
                         doc["site_id"] = json!(s);
                     }
-                    if !state["apgroup"].is_array() {
-                        state["apgroup"] = json!([]);
-                    }
-                    state["apgroup"].as_array_mut().unwrap().push(doc);
+                    array_mut(state, "apgroup").push(doc);
                     g
                 }
             };
@@ -1167,10 +1176,7 @@ pub fn ensure_default_usergroup(state: &mut Value) -> String {
     }
     let doc = new_default_usergroup(state);
     let id = id_of(&doc).unwrap_or_default();
-    if !state["usergroup"].is_array() {
-        state["usergroup"] = json!([]);
-    }
-    state["usergroup"].as_array_mut().unwrap().push(doc);
+    array_mut(state, "usergroup").push(doc);
     id
 }
 
@@ -1245,10 +1251,7 @@ pub fn create_wlan(state: &mut Value, patch: &Value) -> Result<String, String> {
         patch["protection"] = json!("wpa2");
     }
     let name = patch["name"].as_str().unwrap_or_default().trim().to_string();
-    if !state["wlanconf"].is_array() {
-        state["wlanconf"] = json!([]);
-    }
-    state["wlanconf"].as_array_mut().unwrap().push(doc);
+    array_mut(state, "wlanconf").push(doc);
     apply_wlan(state, &WlanEdit { id, patch })?;
     Ok(format!("added SSID \"{name}\""))
 }
@@ -1260,7 +1263,7 @@ pub fn delete_wlan(state: &mut Value, id: &str) -> Result<String, String> {
         return Err("this SSID cannot be deleted".into());
     }
     let released = if w["iot_channel_lock"].as_bool() == Some(true) { deployed_to(state, &w) } else { Vec::new() };
-    state["wlanconf"].as_array_mut().unwrap().retain(|x| id_of(x).as_deref() != Some(id));
+    array_mut(state, "wlanconf").retain(|x| id_of(x).as_deref() != Some(id));
     prune_groups(state);
     let channels = apply_channel_locks(state, &released);
     let mut what = format!("deleted SSID \"{}\"", w["name"].as_str().unwrap_or("?"));
@@ -1288,9 +1291,11 @@ pub struct DeviceEdit {
 pub fn apply_device(state: &mut Value, e: &DeviceEdit) -> Result<String, String> {
     let mac = e.mac.to_ascii_lowercase();
     let p = &e.patch;
-    let devices = state["devices"].as_array().ok_or("the settings have no APs")?;
-    let i = devices.iter().position(|d| d["mac"].as_str().is_some_and(|m| m.eq_ignore_ascii_case(&mac))).ok_or("this AP is not in the settings")?;
-    let before = devices[i].clone();
+    if !state["devices"].is_array() {
+        return Err("the settings have no APs".into());
+    }
+    let m: inform::Mac = mac.parse().map_err(|_| "this AP is not in the settings")?;
+    let before = crate::adopt::device_doc(state, &m).ok_or("this AP is not in the settings")?.clone();
     let mut d = before.clone();
 
     device_fields(state, e, &mac, &before, &mut d)?;
@@ -1314,7 +1319,7 @@ pub fn apply_device(state: &mut Value, e: &DeviceEdit) -> Result<String, String>
             }
         }
     }
-    state["devices"].as_array_mut().unwrap()[i] = d.clone();
+    *crate::adopt::device_doc_mut(state, &m).expect("found above") = d.clone();
     let name = d["name"].as_str().unwrap_or(&mac).to_string();
     let mut changed: Vec<String> = Vec::new();
     for k in DEVICE_FIELDS {
@@ -1552,21 +1557,38 @@ pub async fn put_device(State(s): State<AppState>, headers: HeaderMap, Path(mac)
     let inform = mac.parse::<inform::Mac>().ok().and_then(|m| s.live.read().unwrap().raw_informs.get(&m).cloned());
     let caps = json!({ "ng": radio_caps(inform.as_deref(), "ng"), "na": radio_caps(inform.as_deref(), "na"), "6e": radio_caps(inform.as_deref(), "6e") });
     // A mesh AP's uplink radio must stay on.
-    let wireless_uplink = inform.as_deref().and_then(wireless_uplink);
+    let wireless_uplink = match inform.as_deref().map(uplink) {
+        Some(Uplink::Wireless(band)) => band,
+        _ => None,
+    };
     let antennas = inform.as_deref().map_or(Value::Null, |p| p["antenna_table"].clone());
     change(&s, &headers, &q, apply_device, DeviceEdit { mac, patch: b.patch, caps, wireless_uplink, antennas }).await
 }
 
-/// The band of the radio an AP's wireless (mesh) uplink runs on, from its
-/// inform. `uplink` names the uplink interface: `eth0` (any `eth...`) when
-/// wired, else the AP's own station VAP, which `vap_table` lists by `name`
-/// (`mld_name` for a multi-link one) with its band in `radio`, as the official
-/// controller reads it. Without such a VAP (an isolated AP reports a
-/// placeholder) the band is unknown.
-fn wireless_uplink(p: &Value) -> Option<String> {
-    let up = p["uplink"].as_str().filter(|u| !u.is_empty() && !u.starts_with("eth"))?;
-    let vap = p["vap_table"].as_array()?.iter().find(|v| v["name"].as_str() == Some(up) || v["mld_name"].as_str() == Some(up))?;
-    vap["radio"].as_str().map(str::to_string)
+/// How an AP reaches the network.
+#[derive(Debug, PartialEq)]
+pub(crate) enum Uplink {
+    Wired,
+    /// Over Wi-Fi (mesh), with the band of the radio it runs on when known.
+    Wireless(Option<String>),
+}
+
+impl Uplink {
+    pub fn is_wireless(&self) -> bool {
+        matches!(self, Uplink::Wireless(_))
+    }
+}
+
+/// How an AP reaches the network, from its (full) inform. `uplink` names the
+/// uplink interface: missing, empty or `eth...` when wired; else the AP's own
+/// station VAP, which `vap_table` lists by `name` (`mld_name` for a
+/// multi-link one) with its band in `radio`, as the official controller reads
+/// it. An AP that lost its mesh uplink (isolated) names a placeholder that is
+/// no VAP: still wireless, on an unknown band.
+pub(crate) fn uplink(p: &Value) -> Uplink {
+    let Some(up) = p["uplink"].as_str().filter(|u| !u.is_empty() && !u.starts_with("eth")) else { return Uplink::Wired };
+    let vap = p["vap_table"].as_array().into_iter().flatten().find(|v| v["name"].as_str() == Some(up) || v["mld_name"].as_str() == Some(up));
+    Uplink::Wireless(vap.and_then(|v| v["radio"].as_str()).map(str::to_string))
 }
 
 #[cfg(test)]
@@ -1874,9 +1896,11 @@ mod tests {
     #[test]
     fn a_mesh_uplink_is_found_by_its_vap() {
         let inform = |uplink: &str| json!({ "uplink": uplink, "vap_table": [{ "name": "wifi1ap0", "radio": "na" }, { "name": "wifi1sta0", "radio": "na", "usage": "uplink" }] });
-        assert_eq!(wireless_uplink(&inform("wifi1sta0")).as_deref(), Some("na"));
-        assert_eq!(wireless_uplink(&inform("eth0")), None);
-        assert_eq!(wireless_uplink(&inform("ath0")), None, "a placeholder names no VAP");
+        assert_eq!(uplink(&inform("wifi1sta0")), Uplink::Wireless(Some("na".into())));
+        assert_eq!(uplink(&inform("eth0")), Uplink::Wired);
+        assert_eq!(uplink(&inform("")), Uplink::Wired);
+        assert_eq!(uplink(&json!({ "vap_table": [] })), Uplink::Wired, "no uplink named: wired");
+        assert_eq!(uplink(&inform("ath0")), Uplink::Wireless(None), "a placeholder names no VAP: wireless, band unknown");
         let mut s = state();
         let e = DeviceEdit { mac: AP1.into(), patch: json!({ "radios": [{ "radio": "na", "tx_power_mode": "disabled" }] }), caps: Value::Null, wireless_uplink: Some("na".into()), antennas: Value::Null };
         assert!(apply_device(&mut s, &e).unwrap_err().contains("uplink"));
@@ -1959,7 +1983,7 @@ pub fn apply_usergroup(state: &mut Value, e: &GroupEdit) -> Result<String, Strin
         if !users.is_empty() {
             return Err(format!("still used by {}", users.join(", ")));
         }
-        state["usergroup"].as_array_mut().unwrap().retain(|x| id_of(x).as_deref() != Some(id.as_str()));
+        array_mut(state, "usergroup").retain(|x| id_of(x).as_deref() != Some(id.as_str()));
         return Ok(format!("deleted speed limit \"{}\"", g["name"].as_str().unwrap_or("?")));
     }
     let p = &e.patch;
@@ -1975,7 +1999,7 @@ pub fn apply_usergroup(state: &mut Value, e: &GroupEdit) -> Result<String, Strin
         return Err(format!("another speed limit is called \"{n}\""));
     }
     let site = site_id(state);
-    let list = state["usergroup"].as_array_mut().unwrap();
+    let list = array_mut(state, "usergroup");
     let (g, created) = match &id {
         Some(id) => (list.iter_mut().find(|g| id_of(g).as_deref() == Some(id.as_str())).ok_or("unknown speed limit")?, false),
         None => {

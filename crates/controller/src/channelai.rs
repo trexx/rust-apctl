@@ -25,7 +25,8 @@ use serde_json::{Value, json};
 use crate::api::{ApiError, AppState};
 use crate::engine::{Input, Live};
 use crate::model::Ts;
-use crate::settings::{band_channels, country, device_macs, legal_channels, num, setting, setting_mut};
+use crate::adopt::{device_doc, device_doc_mut};
+use crate::settings::{band_channels, country, device_macs, inform_radio, legal_channels, num, setting, setting_mut, uplink};
 use crate::store;
 
 /// Bands Channel AI handles (6 GHz needs hardware apctl has not seen).
@@ -111,12 +112,7 @@ pub fn pinned(live: &Live, band: &str) -> Vec<String> {
     if band == "ng" {
         out.extend(live.state.as_deref().map(crate::settings::channel_locked_aps).unwrap_or_default());
     }
-    for (mac, p) in &live.raw_informs {
-        let uplink = p["uplink"].as_str().unwrap_or("eth0");
-        if !uplink.is_empty() && !uplink.starts_with("eth") {
-            out.push(mac.to_string());
-        }
-    }
+    out.extend(live.raw_informs.iter().filter(|(_, p)| uplink(p).is_wireless()).map(|(mac, _)| mac.to_string()));
     if let Some(j) = &live.firmware.current {
         out.push(j.mac.to_string());
     }
@@ -134,7 +130,7 @@ fn band_index(band: &str) -> i64 {
 /// How old (seconds) the AP's spectrum table for a band is: `spectrum_table_time`
 /// counts up from the last scan with every report.
 fn spectrum_age(inform: &Value, band: &str) -> Option<i64> {
-    inform["radio_table"].as_array()?.iter().find(|r| r["radio"].as_str() == Some(band))?["spectrum_table_time"].as_i64()
+    inform_radio(inform, band)?["spectrum_table_time"].as_i64()
 }
 
 /// Asks every AP that can to scan a band; returns the APs asked. Scans go out
@@ -152,9 +148,7 @@ pub fn start_scans(live: &mut Live, band: &str, now: Ts) -> Vec<Mac> {
         .filter_map(|(mac, _)| {
             let p = live.raw_informs.get(mac)?;
             let caps = p["wifi_caps2"].as_u64().unwrap_or(0);
-            let wired = p["uplink"].as_str().is_none_or(|u| u.is_empty() || u.starts_with("eth"));
-            let has_band = p["radio_table"].as_array()?.iter().any(|r| r["radio"].as_str() == Some(band));
-            (caps & 128 != 0 && wired && has_band).then_some(*mac)
+            (caps & 128 != 0 && !uplink(p).is_wireless() && inform_radio(p, band).is_some()).then_some(*mac)
         })
         .collect();
     for mac in &eligible {
@@ -206,10 +200,14 @@ pub fn set_channels(state: &mut Value, changes: &[(String, String, i64)]) -> Res
             return Err(format!("{mac}: the 2.4 GHz channel is locked by an SSID's IoT setting"));
         }
         let allowed_here = allowed(Some(state), band, true);
-        let devices = state["devices"].as_array().ok_or("the settings have no APs")?;
-        let d = devices.iter().position(|d| d["mac"].as_str().is_some_and(|m| m.eq_ignore_ascii_case(mac))).ok_or_else(|| format!("{mac} is not in the settings"))?;
-        let outdoor = crate::settings::outdoor(state, &state["devices"][d]);
-        let r = state["devices"][d]["radio_table"].as_array_mut().and_then(|t| t.iter_mut().find(|r| r["radio"].as_str() == Some(band))).ok_or_else(|| format!("{mac} has no {band} radio"))?;
+        if !state["devices"].is_array() {
+            return Err("the settings have no APs".into());
+        }
+        let m: Mac = mac.parse().map_err(|_| format!("{mac} is not in the settings"))?;
+        let d = device_doc(state, &m).ok_or_else(|| format!("{mac} is not in the settings"))?;
+        let outdoor = crate::settings::outdoor(state, d);
+        let d = device_doc_mut(state, &m).expect("found above");
+        let r = d["radio_table"].as_array_mut().and_then(|t| t.iter_mut().find(|r| r["radio"].as_str() == Some(band))).ok_or_else(|| format!("{mac} has no {band} radio"))?;
         let width = num(&r["ht"]).unwrap_or(20);
         if legal_channels(c, band, width, outdoor).is_some_and(|l| !l.contains(ch)) {
             return Err(format!("channel {ch} is not allowed at {width} MHz here"));

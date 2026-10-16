@@ -197,10 +197,7 @@ pub fn adopt_device(state: &mut Value, mac: &Mac, payload: &Value) -> Result<Str
         return Ok(format!("re-adopting {mac}"));
     }
     let d = new_device(state, payload, mac);
-    if !state["devices"].is_array() {
-        state["devices"] = json!([]);
-    }
-    state["devices"].as_array_mut().unwrap().push(d);
+    crate::settings::array_mut(state, "devices").push(d);
     Ok(format!("adopted AP {} ({mac})", payload["hostname"].as_str().or(payload["model"].as_str()).unwrap_or("new")))
 }
 
