@@ -42,3 +42,4 @@ path = "src/main.rs"
 
 [dev-dependencies]
 tower = { version = "0.5.3", features = ["util"] }
+wire = { workspace = true, features = ["test-util"] }

@@ -824,17 +824,17 @@ mod tests {
     }
 }
 
-/// Synthetic captures and the capture fixtures, for tests here and in dependent crates (and
-/// informdump's made-up demo site, which writes the same pcap framing).
-#[doc(hidden)]
+/// The capture fixtures and synthetic captures, for tests here and in dependent crates
+/// (which enable the `test-util` feature from their dev-dependencies).
+#[cfg(any(test, feature = "test-util"))]
 pub mod sample {
-    use std::io::{self, Write};
     use std::path::PathBuf;
 
     use etherparse::PacketBuilder;
     use serde_json::Value;
 
     use super::Micros;
+    use crate::synth::{http, write_pcap_header, write_pcap_record};
 
     /// The sanitised capture fixtures, kept outside the repository:
     /// `$APCTL_TESTDATA/2026-10-12-u6m-8.8.11`. `None`, saying why, when they are not
@@ -885,26 +885,6 @@ pub mod sample {
         assert_eq!(removed, list("removed"), "{ctx}: removed keys");
     }
 
-    /// The header of a legacy pcap (microsecond timestamps) of Ethernet frames.
-    pub fn write_pcap_header(out: &mut impl Write, snaplen: u32) -> io::Result<()> {
-        out.write_all(&0xa1b2c3d4u32.to_le_bytes())?;
-        out.write_all(&2u16.to_le_bytes())?;
-        out.write_all(&4u16.to_le_bytes())?;
-        out.write_all(&0i32.to_le_bytes())?;
-        out.write_all(&0u32.to_le_bytes())?;
-        out.write_all(&snaplen.to_le_bytes())?;
-        out.write_all(&1u32.to_le_bytes()) // ethernet
-    }
-
-    /// One legacy pcap record holding all of `frame`.
-    pub fn write_pcap_record(out: &mut impl Write, ts: Micros, frame: &[u8]) -> io::Result<()> {
-        out.write_all(&((ts / 1_000_000) as u32).to_le_bytes())?;
-        out.write_all(&((ts % 1_000_000) as u32).to_le_bytes())?;
-        out.write_all(&(frame.len() as u32).to_le_bytes())?;
-        out.write_all(&(frame.len() as u32).to_le_bytes())?;
-        out.write_all(frame)
-    }
-
     /// A legacy pcap containing the given TCP segments as (to_server, seq, payload).
     pub fn pcap(segments: &[(bool, u32, &[u8])]) -> Vec<u8> {
         let mut out = Vec::new();
@@ -921,14 +901,6 @@ pub mod sample {
             write_pcap_record(&mut out, (1_791_840_600 + i as Micros) * 1_000_000, &frame).unwrap();
         }
         out
-    }
-
-    /// An HTTP/1.1 message: `head` is the start line and headers, each ending in CRLF;
-    /// the Content-Length and the blank line are added.
-    pub fn http(head: &str, body: &[u8]) -> Vec<u8> {
-        let mut m = format!("{head}Content-Length: {}\r\n\r\n", body.len()).into_bytes();
-        m.extend_from_slice(body);
-        m
     }
 
     pub fn http_request(body: &[u8]) -> Vec<u8> {
