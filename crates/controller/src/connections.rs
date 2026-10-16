@@ -28,7 +28,7 @@ use serde_json::{Value, json};
 use crate::api::{ApiError, AppState};
 use crate::engine::Live;
 use crate::api::read;
-use crate::insights::{RangeQuery, ap_name, client_name, window};
+use crate::insights::{RangeQuery, ap_name, client_name, memo_read, window};
 use crate::model::Ts;
 use crate::store::Db;
 
@@ -635,16 +635,21 @@ fn macs_of<'a>(attempts: &'a [Attempt], roams: &'a [Roam]) -> impl Iterator<Item
 /// GET /api/site/connectivity: connection success per client and stage, for
 /// all bands and each band.
 pub async fn connectivity(State(s): State<AppState>, Query(q): Query<RangeQuery>) -> Result<Json<Value>, ApiError> {
-    let (from, to, _) = window(&q);
-    let list = attempts(read(&s.store, Db::Config, move |c| Ok(load_rows(c, from, to, None, None, true)?)).await?);
-    let mut bands = serde_json::Map::new();
-    for b in [None, Some("ng"), Some("na"), Some("6e")] {
-        let v = connectivity_stats(&list, b);
-        if b.is_none() || v["attempts"].as_u64().unwrap_or(0) > 0 {
-            bands.insert(b.unwrap_or("all").into(), v);
+    let (from, to, tier) = window(&q);
+    // Every report in the window is read and parsed: the result is reused for a while.
+    let bands = memo_read(&s, Db::Config, "connectivity", &q, tier, move |c| {
+        let list = attempts(load_rows(c, from, to, None, None, true)?);
+        let mut bands = serde_json::Map::new();
+        for b in [None, Some("ng"), Some("na"), Some("6e")] {
+            let v = connectivity_stats(&list, b);
+            if b.is_none() || v["attempts"].as_u64().unwrap_or(0) > 0 {
+                bands.insert(b.unwrap_or("all").into(), v);
+            }
         }
-    }
-    Ok(Json(json!({ "bands": bands })))
+        Ok(bands)
+    })
+    .await?;
+    Ok(Json(json!({ "bands": *bands })))
 }
 
 #[derive(Deserialize)]
@@ -690,13 +695,19 @@ pub struct RoamingQuery {
 /// GET /api/roaming: the newest roams in the window (default two days), with
 /// totals, per-AP-pair and per-client figures over all of them.
 pub async fn roaming(State(s): State<AppState>, Query(q): Query<RoamingQuery>) -> Result<Json<Value>, ApiError> {
-    let (from, to, _) = window(&RangeQuery { range: q.range.or(Some(2 * 86400)), from: q.from, to: q.to, ..Default::default() });
-    let r = roams(&read(&s.store, Db::Config, move |c| Ok(roam_rows(c, from, to, None)?)).await?);
-    let (total, pairs, clients) = (roam_totals(&r), roam_pairs(&r), roam_clients(&r));
-    let (aps, names) = names(&s, macs_of(&[], &r)).await?;
-    let mut list = r;
-    list.reverse();
-    list.truncate(q.limit.unwrap_or(100).min(1000));
+    let range = RangeQuery { range: q.range.or(Some(2 * 86400)), from: q.from, to: q.to, ..Default::default() };
+    let (from, to, tier) = window(&range);
+    // Roams newest first, and the figures over all of them, reused for a while.
+    let got = memo_read(&s, Db::Config, "roaming", &range, tier, move |c| {
+        let mut r = roams(&roam_rows(c, from, to, None)?);
+        let figures = (roam_totals(&r), roam_pairs(&r), roam_clients(&r));
+        r.reverse();
+        Ok((r, figures))
+    })
+    .await?;
+    let (r, (total, pairs, clients)) = &*got;
+    let (aps, names) = names(&s, macs_of(&[], r)).await?;
+    let list = &r[..r.len().min(q.limit.unwrap_or(100).min(1000))];
     Ok(Json(json!({ "from": from, "to": to, "total": total, "roams": list, "pairs": pairs, "clients": clients, "ap_names": aps, "client_names": names })))
 }
 
