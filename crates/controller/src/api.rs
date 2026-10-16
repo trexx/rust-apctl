@@ -855,6 +855,15 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn read_only_mode_keeps_secrets() {
+        // No users: read-only, without a login.
+        let (app, _engine) = app();
+        assert_eq!(get(&app, "/api/status").await.status(), StatusCode::OK);
+        assert_eq!(get(&app, "/api/settings/wlans/w1/passphrase").await.status(), StatusCode::FORBIDDEN);
+        assert_eq!(get(&app, "/api/backups/file/apctl-0.1.0-20260101-000000.apb").await.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
     async fn healthz_fails_once_the_engine_has_stopped() {
         let (app, engine) = app();
         assert_eq!(get(&app, "/healthz").await.status(), StatusCode::OK);

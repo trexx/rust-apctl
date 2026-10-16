@@ -260,14 +260,23 @@ fn json_error(status: StatusCode, msg: &str) -> Response {
     (status, Json(json!({ "error": msg }))).into_response()
 }
 
+/// Reads that hand out secrets: Wi-Fi passphrases, and backups (which hold the
+/// APs' keys and the passphrases). Read-only mode does not serve them.
+fn secret(path: &str) -> bool {
+    path.starts_with("/api/backups/file/") || (path.starts_with("/api/settings/wlans/") && path.ends_with("/passphrase"))
+}
+
 /// Guards every API route except login/logout/me.
 pub async fn require_login(State(s): State<AppState>, req: Request, next: Next) -> Response {
     let auth = &s.auth;
     let mutating = !matches!(*req.method(), Method::GET | Method::HEAD | Method::OPTIONS);
     if !auth.enabled() {
-        // Without users apctl is read-only.
+        // Without users apctl is read-only, and keeps its secrets.
         if mutating {
             return json_error(StatusCode::FORBIDDEN, "read-only: no users are configured (see --users-file)");
+        }
+        if secret(req.uri().path()) {
+            return json_error(StatusCode::FORBIDDEN, "this needs a login: no users are configured (see --users-file)");
         }
         return next.run(req).await;
     }

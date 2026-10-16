@@ -94,6 +94,9 @@ host ports, and feed it a capture with `--shadow` or `--shadow-cmd`; the
 `ghcr.io/trexx/rust-apctl-capture` image is a tcpdump sidecar for that. `apctl serve --help`
 lists every option.
 
+Without `--users-file` (`APCTL_USERS_FILE`), apctl is read-only and needs no login: anyone
+who can reach port 8090 sees everything except the Wi-Fi passphrases and backup downloads.
+
 Behind a reverse proxy or ingress, list its addresses with `--trusted-proxies`
 (`APCTL_TRUSTED_PROXIES`, IPs or CIDR ranges). Only then is its `X-Forwarded-For` header
 used, so the login throttle sees each client rather than the proxy.
