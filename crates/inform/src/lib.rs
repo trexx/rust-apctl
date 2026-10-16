@@ -85,18 +85,19 @@ impl std::str::FromStr for Mac {
     /// `aabbccddeeff`, any case.
     fn from_str(s: &str) -> Result<Self> {
         let b = s.as_bytes();
-        let hex: Vec<u8> = match b.len() {
-            12 => b.to_vec(),
+        let mut hex = [0u8; 12];
+        match b.len() {
+            12 => hex.copy_from_slice(b),
             17 if matches!(b[2], b':' | b'-') && (2..17).step_by(3).all(|i| b[i] == b[2]) => {
-                b.iter().enumerate().filter(|(i, _)| i % 3 != 2).map(|(_, c)| *c).collect()
+                for (i, pair) in b.chunks(3).enumerate() {
+                    hex[2 * i..2 * i + 2].copy_from_slice(&pair[..2]);
+                }
             }
             _ => return Err(Error::InvalidMac(s.to_string())),
-        };
-        let arr: [u8; 6] = hex::decode(&hex)
-            .ok()
-            .and_then(|b| b.try_into().ok())
-            .ok_or_else(|| Error::InvalidMac(s.to_string()))?;
-        Ok(Mac(arr))
+        }
+        let mut mac = [0u8; 6];
+        hex::decode_to_slice(hex, &mut mac).map_err(|_| Error::InvalidMac(s.to_string()))?;
+        Ok(Mac(mac))
     }
 }
 
@@ -435,7 +436,14 @@ mod tests {
         assert!(matches!("zz:11:22:33:44:55".parse::<Mac>(), Err(Error::InvalidMac(_))));
         assert_eq!("00-11-22-33-44-55".parse::<Mac>().unwrap(), MAC);
         assert_eq!("00:11:22:33:44:AA".parse::<Mac>().unwrap().to_string(), "00:11:22:33:44:aa");
-        for bad in ["00:11-22:33:44:55", "001122:334455", "0:11:22:33:44:555", "00:11:22:33:44:55:", "+0:11:22:33:44:55", ""] {
+        let aa = Mac([0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff]);
+        for good in ["aa:bb:cc:dd:ee:ff", "AA:BB:CC:DD:EE:FF", "aa-bb-cc-dd-ee-ff", "Aa-bB-cc-DD-ee-FF", "aabbccddeeff", "AABBCCDDEEFF"] {
+            assert_eq!(good.parse::<Mac>().unwrap(), aa, "{good}");
+        }
+        for bad in [
+            "00:11-22:33:44:55", "001122:334455", "0:11:22:33:44:555", "00:11:22:33:44:55:", "+0:11:22:33:44:55", "", "00.11.22.33.44.55", "00::11:22:33:44:5",
+            "00112233445g", "0011223344556", "00:11:22:33:44:5g", " 00:11:22:33:44:55", "\u{e9}\u{e9}\u{e9}\u{e9}\u{e9}\u{e9}", "+01122334455",
+        ] {
             assert!(bad.parse::<Mac>().is_err(), "{bad}");
         }
     }
