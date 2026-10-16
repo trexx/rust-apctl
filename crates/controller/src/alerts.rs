@@ -358,6 +358,8 @@ fn from_event(kind: EventKind, device: Option<&str>, data: &Value, ap_name: &dyn
 /// Health figures for one AP radio over the last window.
 #[derive(Debug, Default, Clone, PartialEq)]
 pub struct RadioHealth {
+    /// Whether the radio's networks reported TX counters in the window.
+    pub retries_reported: bool,
     pub retry_pct: Option<f64>,
     pub attempts: f64,
     pub utilisation: Option<f64>,
@@ -399,6 +401,7 @@ async fn radio_health(store: &Arc<Store>, now: Ts) -> anyhow::Result<HashMap<(St
             let vaps = crate::insights::load(c, spec, 0, from, now)?;
             for (k, t) in retry_totals(&vaps, RETRY_AT, from) {
                 let h = out.entry(k).or_default();
+                h.retries_reported = true;
                 h.attempts = t[1];
                 if t.iter().sum::<f64>() > 0.0 {
                     h.retry_pct = Some(retry_pct(t));
@@ -626,9 +629,16 @@ impl Watcher {
                 continue;
             }
             for (key, value, raise_at, clear_at, what) in radio_checks(&h) {
+                let Some(v) = value else {
+                    // Retries are not judged on a radio carrying little traffic, but
+                    // it still reports: an alert open for it stays as it is.
+                    if key == "high_retries" && h.retries_reported {
+                        judged.insert((key.to_string(), format!("{mac}/{radio}")));
+                    }
+                    continue;
+                };
                 let entity = format!("{mac}/{radio}");
                 let k = (key.to_string(), entity.clone());
-                let Some(v) = value else { continue };
                 judged.insert(k.clone());
                 if v >= raise_at && !self.book.open.contains_key(&k) && self.cleared.get(&k).is_none_or(|t| now - t >= HEALTH_COOLDOWN) {
                     let name = crate::insights::ap_name(&self.live.read().unwrap(), &mac).unwrap_or_else(|| mac.clone());
@@ -855,6 +865,24 @@ mod tests {
         assert_eq!(told(&mut rx), [("resolved", "busy_channel".to_string())]);
     }
 
+    #[tokio::test]
+    async fn a_retries_alert_stays_open_while_its_radio_is_quiet() {
+        let (mut w, mut rx) = watcher();
+        let ap = "02:00:00:00:00:01".to_string();
+        let set: HashSet<String> = [ap.clone()].into();
+        let radio = |retry_pct, attempts| HashMap::from([((ap.clone(), "na".to_string()), RadioHealth { retries_reported: true, retry_pct: Some(retry_pct), attempts, ..Default::default() })]);
+        w.judge_radios(1000, radio(40.0, 5000.0), &set, &set);
+        assert_eq!(told(&mut rx), [("raised", "high_retries".to_string())]);
+        // Too little traffic to judge, for longer than a radio that stopped reporting gets.
+        for i in 1..=HEALTH_STALE_CHECKS as Ts + 1 {
+            w.judge_radios(1000 + 60 * i, radio(40.0, 100.0), &set, &set);
+        }
+        assert!(told(&mut rx).is_empty(), "the radio still reports");
+        assert!(w.book.open.contains_key(&("high_retries".to_string(), format!("{ap}/na"))));
+        w.judge_radios(2200, radio(5.0, 5000.0), &set, &set);
+        assert_eq!(told(&mut rx), [("resolved", "high_retries".to_string())]);
+    }
+
     #[test]
     fn health_alerts_close_when_their_radio_stops_reporting() {
         let ap = "02:00:00:00:00:01";
@@ -903,7 +931,7 @@ mod tests {
 
     #[test]
     fn radio_thresholds_need_enough_traffic() {
-        let quiet = RadioHealth { retry_pct: Some(60.0), attempts: 100.0, utilisation: Some(10.0), interference: None };
+        let quiet = RadioHealth { retries_reported: true, retry_pct: Some(60.0), attempts: 100.0, utilisation: Some(10.0), interference: None };
         let checks = radio_checks(&quiet);
         assert_eq!(checks[0].1, None, "a few retries on an idle radio are not a problem");
         let busy = RadioHealth { retry_pct: Some(30.0), attempts: 5000.0, ..quiet };
