@@ -135,7 +135,7 @@ async fn connect(ip: &str, port: u16, logins: &[(String, String)], expected: Opt
 impl Session {
     /// Runs a command and returns what it printed; an error if it exited
     /// non-zero or didn't finish in time.
-    async fn run(&mut self, cmd: &str) -> Result<String, Failure> {
+    async fn run(&self, cmd: &str) -> Result<String, Failure> {
         let mut out = Vec::new();
         let mut status = None;
         let run = async {
@@ -237,7 +237,7 @@ pub async fn adopt(State(s): State<AppState>, headers: HeaderMap, Json(b): Json<
     // A known AP keeps its host key, checked before any password is sent; a new one is trusted the first time.
     let expected = known_host_key(&s.live.read().unwrap(), &b.ip);
     let connected = connect(&b.ip, b.port.unwrap_or(22), &logins(state.as_deref(), given.clone()), expected.as_ref().map(|e| e.1.clone())).await;
-    let mut session = match (connected, &expected) {
+    let session = match (connected, &expected) {
         (Err(Failure::HostKey), Some((mac, _))) => {
             let _ = s.engine.send(Input::Note(Event::device(store::now_ts(), "ap_host_key_mismatch", *mac, json!({ "ip": b.ip })))).await;
             return Err(bad(Failure::HostKey));
