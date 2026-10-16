@@ -263,10 +263,13 @@ struct Written {
     devices: HashMap<Mac, Ts>,
     clients: HashMap<Mac, Ts>,
     /// Per AP: each neighbour by BSSID.
-    neighbors: HashMap<Mac, HashMap<String, (crate::model::NeighborSample, Ts)>>,
+    neighbors: HashMap<Mac, Rows<String, crate::model::NeighborSample>>,
     /// Per AP: each scanned channel by (radio, channel).
-    spectrum: HashMap<Mac, HashMap<(String, i64), (crate::model::SpectrumSample, Ts)>>,
+    spectrum: HashMap<Mac, Rows<(String, i64), crate::model::SpectrumSample>>,
 }
+
+/// Rows as last written, and when, by key.
+type Rows<K, T> = HashMap<K, (T, Ts)>;
 
 /// Whether a row last written at `at` (if ever) is due again at `ts`.
 fn due(at: Option<&Ts>, ts: Ts, every: Ts) -> bool {
