@@ -48,7 +48,6 @@ interface Shape {
 
 /** Channel occupancy: each network drawn as a trapezoid over the frequencies it uses, as tall as it is loud. */
 function Spectrum({ band, shapes }: { band: "ng" | "na"; shapes: Shape[] }) {
-  const [hover, setHover] = useState<string | null>(null);
   const ax = AXIS[band];
   const W = 900;
   const H = 220;
@@ -111,14 +110,11 @@ function Spectrum({ band, shapes }: { band: "ng" | "na"; shapes: Shape[] }) {
         ]
           .map((p) => p.join(","))
           .join(" ");
-        const active = hover === s.key;
         return (
           <polygon
             key={s.key}
             points={pts}
-            className={`spectrum-shape ${s.own ? "own" : ""} ${active ? "active" : ""}`}
-            onMouseEnter={() => setHover(s.key)}
-            onMouseLeave={() => setHover(null)}
+            className={s.own ? "spectrum-shape own" : "spectrum-shape"}
           >
             <title>{`${s.label}: ${s.signal} dBm, ${s.width} MHz`}</title>
           </polygon>

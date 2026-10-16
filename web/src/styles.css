@@ -847,7 +847,7 @@ td.warn {
   stroke: var(--accent);
   stroke-width: 2;
 }
-.spectrum-shape.active {
+.spectrum-shape:hover {
   fill: color-mix(in srgb, var(--c-orange) 30%, transparent);
   stroke: var(--c-orange);
 }
