@@ -1,10 +1,4 @@
-import {
-  Component,
-  StrictMode,
-  Suspense,
-  useEffect,
-  useState,
-} from "react";
+import { Component, StrictMode, Suspense, useEffect, useState } from "react";
 import type { ReactNode } from "react";
 import { createRoot } from "react-dom/client";
 import {

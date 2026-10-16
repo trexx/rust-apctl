@@ -38,7 +38,7 @@ import type { ClientView, Multicast } from "../api";
 
 /** Keyed by MAC: nothing typed or shown for one client carries over to the next. */
 export function Client() {
-  const { mac = "" } = useParams();
+  const mac = useParams().mac ?? "";
   return <ClientPage key={mac} mac={mac} />;
 }
 

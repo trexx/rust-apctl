@@ -145,15 +145,17 @@ export function FirmwarePanel() {
                       <button
                         className="btn small primary"
                         disabled={busy || !!job}
-                        onClick={() =>
-                          window.confirm(
-                            `Update ${a.name ?? a.mac} from ${a.version} to ${a.release?.version}? It restarts and drops its clients for a few minutes.`,
-                          ) &&
-                          void run(
-                            async () =>
-                              `${(await upgradeFirmware([a.mac])).queued ? "Queued" : "Not queued"}.`,
+                        onClick={() => {
+                          if (
+                            window.confirm(
+                              `Update ${a.name ?? a.mac} from ${a.version} to ${a.release?.version}? It restarts and drops its clients for a few minutes.`,
+                            )
                           )
-                        }
+                            void run(
+                              async () =>
+                                `${(await upgradeFirmware([a.mac])).queued ? "Queued" : "Not queued"}.`,
+                            );
+                        }}
                       >
                         Update
                       </button>

@@ -39,7 +39,7 @@ function FieldResult({ label, c }: { label: string; c: FieldComparison }) {
   );
 }
 
-export function DryRunPage({ embedded = false }: { embedded?: boolean }) {
+export function DryRunPage({ embedded }: { embedded?: boolean }) {
   const dr = useDryRun();
   const names = useDeviceNames();
   if (dr.isLoading) return <Loading />;
