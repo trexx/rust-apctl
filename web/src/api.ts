@@ -1000,8 +1000,8 @@ export const useDevices = () => useQuery(devicesQuery);
 export const useDevice = (mac: Mac) =>
   useQuery({ queryKey: keys.device(mac), queryFn: getting<DeviceDetail>(`/api/devices/${mac}`) });
 
-/** Every client; with `enabled` false, only what's already cached. */
-export const useClients = (enabled = true) => useQuery({ ...clientsQuery, enabled });
+/** Every client of the past year, with its latest sample: for the client list. */
+export const useClients = () => useQuery(clientsQuery);
 
 /**
  * Something derived from the client list, re-rendering only when it changes.
