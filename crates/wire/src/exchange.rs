@@ -1,6 +1,7 @@
 //! Pairs captured HTTP requests and responses into inform exchanges.
 
 use std::collections::{HashMap, VecDeque};
+use std::net::{IpAddr, SocketAddr};
 
 use anyhow::Result;
 use inform::Mac;
@@ -11,7 +12,8 @@ use crate::keys::KeyStore;
 
 #[derive(Debug)]
 pub enum InformEvent {
-    /// An AP's inform. `peer` is its address (from X-Forwarded-For behind a proxy).
+    /// An AP's inform. `peer` is its address (from X-Forwarded-For behind a proxy, if
+    /// that holds an address).
     Inform { ts: Micros, peer: String, mac: Option<Mac>, decoded: Result<Decoded> },
     /// The controller's reply. `mac` is its request's, or when that was not captured,
     /// the one the reply is sealed under. `decoded` is `None` for an empty body.
@@ -87,9 +89,7 @@ impl Pairer {
                     self.push(conn, ts, Pending::Other);
                     return None;
                 }
-                let peer = forwarded_for
-                    .map(|v| v.split(',').next().unwrap_or("").trim().to_string())
-                    .unwrap_or_else(|| conn.client.ip().to_string());
+                let peer = forwarded_for.as_deref().and_then(forwarded_ip).unwrap_or(conn.client.ip()).to_string();
                 let decoded = decode(&body, keys, None);
                 let mac = match &decoded {
                     Ok(d) => Some(d.header.mac),
@@ -114,6 +114,13 @@ impl Pairer {
             HttpEvent::Datagram { .. } => None,
         }
     }
+}
+
+/// The client's address from an X-Forwarded-For header: its first entry, if that is
+/// an address (some proxies add the port).
+fn forwarded_ip(header: &str) -> Option<IpAddr> {
+    let first = header.split(',').next()?.trim();
+    first.parse().ok().or_else(|| first.parse::<SocketAddr>().ok().map(|a| a.ip()))
 }
 
 #[cfg(test)]
@@ -197,5 +204,22 @@ mod tests {
             p.handle(&keys, inform(conn(4), a, None));
         }
         assert_eq!(p.in_flight[&conn(4)].1.len(), MAX_QUEUED);
+    }
+
+    #[test]
+    fn the_peer_is_an_address() {
+        let keys = KeyStore::default();
+        let mut p = Pairer::default();
+        let mut peer = |xff: Option<&str>| match p.handle(&keys, inform(conn(1), "02:00:00:00:00:01", xff)) {
+            Some(InformEvent::Inform { peer, .. }) => peer,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(peer(Some(" 203.0.113.9 , 10.0.0.1")), "203.0.113.9");
+        assert_eq!(peer(Some("198.51.100.7:4711")), "198.51.100.7");
+        assert_eq!(peer(Some("[2001:db8::1]:80")), "2001:db8::1");
+        assert_eq!(peer(Some("2001:db8::2")), "2001:db8::2");
+        assert_eq!(peer(Some("not-an-address, 10.0.0.1")), "10.0.0.5", "not an address: the connection's");
+        assert_eq!(peer(Some("")), "10.0.0.5");
+        assert_eq!(peer(None), "10.0.0.5");
     }
 }
