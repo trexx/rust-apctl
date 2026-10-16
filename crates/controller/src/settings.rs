@@ -929,9 +929,10 @@ fn wlan_security(p: &Value, w: &mut Value, changed: &mut Vec<&str>) -> Result<()
     if let Some(pass) = p["passphrase"].as_str() {
         let printable = pass.chars().all(|c| (' '..='~').contains(&c));
         let hex64 = pass.len() == 64 && pass.chars().all(|c| c.is_ascii_hexdigit());
-        let ok = if wpa3 && !transition { printable && (8..=255).contains(&pass.len()) } else { hex64 || printable && (8..=63).contains(&pass.len()) };
+        let wpa3_only = wpa3 && !transition;
+        let ok = if wpa3_only { printable && (8..=255).contains(&pass.len()) } else { hex64 || printable && (8..=63).contains(&pass.len()) };
         if !ok {
-            return Err("the password must be 8 to 63 printable ASCII characters (or 64 hex digits)".into());
+            return Err(if wpa3_only { "the password must be 8 to 255 printable ASCII characters" } else { "the password must be 8 to 63 printable ASCII characters (or 64 hex digits)" }.into());
         }
         w["x_passphrase"] = json!(pass);
         changed.push("password");
@@ -1082,7 +1083,7 @@ fn wlan_power_saving(p: &Value, w: &mut Value) -> Result<(), String> {
         w["dtim_6e"] = json!(3);
     }
     if w["iot_dtim_lock"].as_bool() == Some(true) {
-        if p["dtim_ng"].as_i64().is_some_and(|n| n != 3) {
+        if num(&p["dtim_ng"]).is_some_and(|n| n != 3) {
             return Err("the DTIM lock holds 2.4 GHz at 3".into());
         }
         w["dtim_ng"] = json!(3);
@@ -1723,7 +1724,9 @@ mod tests {
         edit(&mut s, json!({ "iot_dtim_lock": true })).unwrap();
         assert_eq!(s["wlanconf"][0]["dtim_ng"], 3);
         assert!(edit(&mut s, json!({ "dtim_mode": "custom", "dtim_ng": 1 })).is_err());
+        assert!(edit(&mut s, json!({ "dtim_mode": "custom", "dtim_ng": "1" })).is_err(), "a number as text is held to the lock too");
         edit(&mut s, json!({ "protection": "wpa3" })).unwrap();
+        assert!(edit(&mut s, json!({ "passphrase": "short" })).unwrap_err().contains("8 to 255"));
         assert_eq!((s["wlanconf"][0]["sae_anti_clogging"].as_i64(), s["wlanconf"][0]["sae_sync"].as_i64()), (Some(5), Some(5)));
         assert!(edit(&mut s, json!({ "sae_sync": 61 })).is_err());
         edit(&mut s, json!({ "sae_sync": 10 })).unwrap();
@@ -2010,7 +2013,7 @@ mod tests {
 
 /// A limit in kbps: -1 (none) or 2 to 100000, as the official controller allows.
 fn rate(v: &Value, what: &str) -> Result<i64, String> {
-    match v.as_i64() {
+    match num(v) {
         Some(-1) => Ok(-1),
         Some(n) if (2..=100_000).contains(&n) => Ok(n),
         _ => Err(format!("the {what} limit must be 2 to 100000 kbps, or -1 for none")),
@@ -2202,6 +2205,7 @@ mod speed_and_schedule_tests {
         assert!(what.contains("down 5 Mbps, up none"), "{what}");
         let id = id_of(s["usergroup"].as_array().unwrap().iter().find(|g| g["name"] == "Kids").unwrap()).unwrap();
         assert!(apply_usergroup(&mut s, &group(Some(&id), json!({ "qos_rate_max_down": 1 }), false)).is_err(), "0 and 1 kbps are not allowed");
+        apply_usergroup(&mut s, &group(Some(&id), json!({ "qos_rate_max_down": "6000" }), false)).unwrap();
         assert!(apply_usergroup(&mut s, &group(None, json!({ "name": "Kids" }), false)).is_err(), "names are unique");
         apply_client_group(&mut s, &client("AA:BB:CC:00:00:01", Some(&id))).unwrap();
         let err = apply_usergroup(&mut s, &group(Some(&id), Value::Null, true)).unwrap_err();
