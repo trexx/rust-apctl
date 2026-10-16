@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { memo, useState } from "react";
 import type { ReactNode } from "react";
 import { Link, useSearchParams } from "react-router-dom";
 import { useQueryClient } from "@tanstack/react-query";
@@ -11,7 +11,7 @@ import type {
   LogLine,
   Names,
 } from "../api";
-import { band, clock, duration, signalClass } from "../format";
+import { band, clock, duration, signalClass, today } from "../format";
 
 export function Stat({
   label,
@@ -521,6 +521,78 @@ function eventSpec(kind: string): EventSpec<EventKind> {
   );
 }
 
+interface EventRowProps {
+  e: AppEvent;
+  names: Names;
+  clientNames?: Names;
+  showDevice: boolean;
+  /** `today()`, worked out once per list. */
+  today: string;
+}
+
+/** One event. Events never change, so it re-renders only for another id or other names. */
+const EventRow = memo(
+  function EventRow({
+    e,
+    names,
+    clientNames,
+    showDevice,
+    today,
+  }: EventRowProps) {
+    const spec = eventSpec(e.kind);
+    const d = eventData(e);
+    const tone = typeof spec.tone === "function" ? spec.tone(d) : spec.tone;
+    const detail = spec.describe?.(d, names);
+    const threat = eventData<"network_threat">(e);
+    const diff = eventData<"config_pushed">(e).system_cfg?.diff;
+    return (
+      <li className={`event event-${tone}`}>
+        <span className="event-time">{clock(e.ts, today)}</span>
+        <span className="event-kind">{spec.label}</span>
+        <span className="event-what">
+          <span className="event-subject">
+            {e.kind === "network_threat" && (
+              <>
+                {threat.essid ? `"${threat.essid}"` : "Hidden network"}
+                <span className="muted"> heard by </span>
+              </>
+            )}
+            {e.client_mac && (
+              <Link
+                to={`/clients/${e.client_mac}`}
+                className={clientNames?.[e.client_mac] ? "" : "mono"}
+              >
+                {clientNames?.[e.client_mac] ?? e.client_mac}
+              </Link>
+            )}
+            {showDevice &&
+              e.device_mac &&
+              !e.kind.startsWith("client_roamed") && (
+                <>
+                  {e.client_mac && <span className="muted"> on </span>}
+                  <DeviceLink mac={e.device_mac} names={names} />
+                </>
+              )}
+          </span>
+          {detail ? <span className="event-detail">{detail}</span> : null}
+          {e.kind === "config_pushed" && typeof diff === "string" && diff && (
+            <details>
+              <summary>diff</summary>
+              <pre className="diff">{diff}</pre>
+            </details>
+          )}
+        </span>
+      </li>
+    );
+  },
+  (a, b) =>
+    a.e.id === b.e.id &&
+    a.names === b.names &&
+    a.clientNames === b.clientNames &&
+    a.showDevice === b.showDevice &&
+    a.today === b.today,
+);
+
 export function EventList({
   events,
   names,
@@ -534,57 +606,19 @@ export function EventList({
 }) {
   if (events.length === 0)
     return <div className="muted pad">No events yet</div>;
+  const day = today();
   return (
     <ul className="events">
-      {events.map((e) => {
-        const spec = eventSpec(e.kind);
-        const d = eventData(e);
-        const tone = typeof spec.tone === "function" ? spec.tone(d) : spec.tone;
-        const detail = spec.describe?.(d, names);
-        const threat = eventData<"network_threat">(e);
-        const diff = eventData<"config_pushed">(e).system_cfg?.diff;
-        return (
-          <li key={e.id} className={`event event-${tone}`}>
-            <span className="event-time">{clock(e.ts)}</span>
-            <span className="event-kind">{spec.label}</span>
-            <span className="event-what">
-              <span className="event-subject">
-                {e.kind === "network_threat" && (
-                  <>
-                    {threat.essid ? `"${threat.essid}"` : "Hidden network"}
-                    <span className="muted"> heard by </span>
-                  </>
-                )}
-                {e.client_mac && (
-                  <Link
-                    to={`/clients/${e.client_mac}`}
-                    className={clientNames?.[e.client_mac] ? "" : "mono"}
-                  >
-                    {clientNames?.[e.client_mac] ?? e.client_mac}
-                  </Link>
-                )}
-                {showDevice &&
-                  e.device_mac &&
-                  !e.kind.startsWith("client_roamed") && (
-                    <>
-                      {e.client_mac && <span className="muted"> on </span>}
-                      <DeviceLink mac={e.device_mac} names={names} />
-                    </>
-                  )}
-              </span>
-              {detail ? <span className="event-detail">{detail}</span> : null}
-              {e.kind === "config_pushed" &&
-                typeof diff === "string" &&
-                diff && (
-                  <details>
-                    <summary>diff</summary>
-                    <pre className="diff">{diff}</pre>
-                  </details>
-                )}
-            </span>
-          </li>
-        );
-      })}
+      {events.map((e) => (
+        <EventRow
+          key={e.id}
+          e={e}
+          names={names}
+          clientNames={clientNames}
+          showDevice={showDevice}
+          today={day}
+        />
+      ))}
     </ul>
   );
 }
@@ -600,6 +634,40 @@ const SEVERITY = [
   "debug",
 ];
 
+interface LogRowProps {
+  l: LogLine;
+  names: Names;
+  showDevice: boolean;
+  /** `today()`, worked out once per list. */
+  today: string;
+}
+
+/** One log line. Lines never change, so it re-renders only for another id or other names. */
+const LogRow = memo(
+  function LogRow({ l, names, showDevice, today }: LogRowProps) {
+    return (
+      <div className={`log-line sev-${l.severity ?? 6}`}>
+        <span className="log-time">{clock(l.ts, today)}</span>
+        {showDevice && (
+          <span className="log-device">
+            <DeviceLink mac={l.device_mac} names={names} />
+          </span>
+        )}
+        <span className="log-sev">
+          {l.severity !== null ? SEVERITY[l.severity] : ""}
+        </span>
+        <span className="log-prog">{l.program ?? ""}</span>
+        <span className="log-msg">{l.msg}</span>
+      </div>
+    );
+  },
+  (a, b) =>
+    a.l.id === b.l.id &&
+    a.names === b.names &&
+    a.showDevice === b.showDevice &&
+    a.today === b.today,
+);
+
 export function LogList({
   logs,
   names,
@@ -610,22 +678,17 @@ export function LogList({
   showDevice?: boolean;
 }) {
   if (logs.length === 0) return <div className="muted pad">No log lines</div>;
+  const day = today();
   return (
     <div className={showDevice ? "logs" : "logs logs-no-device"}>
       {logs.map((l) => (
-        <div key={l.id} className={`log-line sev-${l.severity ?? 6}`}>
-          <span className="log-time">{clock(l.ts)}</span>
-          {showDevice && (
-            <span className="log-device">
-              <DeviceLink mac={l.device_mac} names={names} />
-            </span>
-          )}
-          <span className="log-sev">
-            {l.severity !== null ? SEVERITY[l.severity] : ""}
-          </span>
-          <span className="log-prog">{l.program ?? ""}</span>
-          <span className="log-msg">{l.msg}</span>
-        </div>
+        <LogRow
+          key={l.id}
+          l={l}
+          names={names}
+          showDevice={showDevice}
+          today={day}
+        />
       ))}
     </div>
   );

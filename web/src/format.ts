@@ -33,9 +33,13 @@ const timeFmt = formatter({ hour: "2-digit", minute: "2-digit", second: "2-digit
 const dayFmt = formatter({ day: "numeric", month: "short" });
 const minuteFmt = formatter({ hour: "2-digit", minute: "2-digit" });
 
-export function clock(ts: number): string {
+/** Today's date as `clock` compares it: lists work it out once for all their rows. */
+export const today = () => new Date().toDateString();
+
+/** The time of day, with the date unless it is `day` (today). */
+export function clock(ts: number, day = today()): string {
   const d = new Date(ts * 1000);
-  const sameDay = d.toDateString() === new Date().toDateString();
+  const sameDay = d.toDateString() === day;
   const time = timeFmt.format(d);
   return sameDay ? time : `${dayFmt.format(d)} ${time}`;
 }
