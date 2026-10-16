@@ -45,6 +45,8 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 const UPLOAD_LIMIT: u64 = 1 << 30;
 /// Staged restores and uploads not used within this long are deleted.
 const STAGING_TTL: Duration = Duration::from_secs(3600);
+/// The files a backup may hold besides its manifest: never paths.
+const DATABASES: [&str; 3] = ["config.db", "metrics.db", "logs.db"];
 
 /// Where backups live and how they are sealed.
 #[derive(Clone)]
@@ -487,11 +489,13 @@ pub fn unpack(path: &Path, key: Option<&[u8; 32]>, dest: &Path) -> Result<Manife
             }
             let mut s = String::new();
             e.read_to_string(&mut s)?;
-            manifest = Some(serde_json::from_str(&s).context("the backup's manifest is unreadable")?);
+            let m: Manifest = serde_json::from_str(&s).context("the backup's manifest is unreadable")?;
+            check_names(&m)?;
+            manifest = Some(m);
             continue;
         }
         // Only the known database files, never paths.
-        if !["config.db", "metrics.db", "logs.db"].contains(&name.as_str()) {
+        if !DATABASES.contains(&name.as_str()) {
             bail!("unexpected file in backup: {name}");
         }
         let m = manifest.as_ref().ok_or_else(|| anyhow!("the backup has no manifest"))?;
@@ -518,6 +522,15 @@ pub fn unpack(path: &Path, key: Option<&[u8; 32]>, dest: &Path) -> Result<Manife
         bail!("not an apctl backup (format {})", m.format);
     }
     Ok(m)
+}
+
+/// The manifest names files to restore by their place in the data directory:
+/// only the known databases, so a crafted one cannot reach outside it.
+fn check_names(m: &Manifest) -> Result<()> {
+    match m.files.keys().find(|n| !DATABASES.contains(&n.as_str())) {
+        Some(n) => bail!("unexpected file in backup: {n}"),
+        None => Ok(()),
+    }
 }
 
 /// Whether a backup made by `theirs` can be restored on `ours` (no newer backups).
@@ -568,6 +581,7 @@ fn apply(b: &Backups, id: &str) -> Result<()> {
     }
     let staged = b.staging().join(id);
     let manifest: Manifest = serde_json::from_slice(&fs::read(staged.join("manifest.json")).context("staged restore has no manifest")?)?;
+    check_names(&manifest)?;
     tracing::warn!("restoring the backup made {} by apctl {} (history: {} days)", manifest.created, manifest.version, manifest.days);
     if b.data_dir.join("config.db").exists() {
         let pre = create(b, &b.data_dir, Kind::PreRestore, -1).context("saving the current state before restoring")?;
@@ -1114,25 +1128,53 @@ mod tests {
         assert!(src.join("config.db").exists() && !b.staging().join("pending").exists());
     }
 
-    #[test]
-    fn oversized_entries_are_refused_before_they_are_written() {
-        let d = dir("oversized");
-        let mut manifest = Manifest { format: 1, app: "apctl".into(), version: VERSION.into(), created: 0, days: 0, files: Default::default() };
-        manifest.files.insert("config.db".into(), FileInfo { size: 4, sha256: "00".into() });
+    /// A manifest listing `files`, for hand-made backups.
+    fn manifest(files: &[(&str, u64)]) -> Manifest {
+        let files = files.iter().map(|(n, size)| (n.to_string(), FileInfo { size: *size, sha256: "00".into() })).collect();
+        Manifest { format: 1, app: "apctl".into(), version: VERSION.into(), created: 0, days: 0, files }
+    }
+
+    /// Writes an unencrypted backup holding `manifest` and then `entries`, as given.
+    fn hand_made(path: &Path, manifest: &Manifest, entries: &[(&str, Vec<u8>)]) {
         let mut file = MAGIC.to_vec();
         file.push(0);
         let mut tar = tar::Builder::new(flate2::write::GzEncoder::new(file, flate2::Compression::default()));
-        for (name, data) in [("manifest.json", serde_json::to_vec(&manifest).unwrap()), ("config.db", vec![0u8; 4096])] {
+        for (name, data) in std::iter::once(("manifest.json", serde_json::to_vec(manifest).unwrap())).chain(entries.iter().map(|(n, d)| (*n, d.clone()))) {
             let mut h = tar::Header::new_gnu();
             h.set_size(data.len() as u64);
             h.set_cksum();
             tar.append_data(&mut h, name, data.as_slice()).unwrap();
         }
-        fs::write(d.join("x.apb"), tar.into_inner().unwrap().finish().unwrap()).unwrap();
+        fs::write(path, tar.into_inner().unwrap().finish().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn oversized_entries_are_refused_before_they_are_written() {
+        let d = dir("oversized");
+        hand_made(&d.join("x.apb"), &manifest(&[("config.db", 4)]), &[("config.db", vec![0u8; 4096])]);
         let out = d.join("out");
         let err = unpack(&d.join("x.apb"), None, &out).unwrap_err();
         assert!(err.to_string().contains("damaged"), "{err:#}");
         assert!(!out.join("config.db").exists());
+    }
+
+    #[test]
+    fn a_manifest_cannot_name_files_outside_the_data_directory() {
+        let d = dir("names");
+        // Listed, but never in the archive: the name alone must be refused.
+        for name in ["../../config.db", "/tmp/x.db", "other.db"] {
+            hand_made(&d.join("x.apb"), &manifest(&[(name, 1)]), &[]);
+            let err = unpack(&d.join("x.apb"), None, &d.join("out")).unwrap_err();
+            assert!(err.to_string().contains("unexpected file"), "{name}: {err:#}");
+        }
+        // Nor can a staged manifest, when the restore is applied.
+        let src = data("names-apply");
+        let b = Backups { data_dir: src.clone(), key: None };
+        fs::create_dir_all(b.staging().join("r1")).unwrap();
+        fs::write(b.staging().join("r1").join("manifest.json"), serde_json::to_vec(&manifest(&[("../config.db", 1)])).unwrap()).unwrap();
+        fs::write(b.staging().join("pending"), "r1").unwrap();
+        apply_pending(&b).unwrap();
+        assert!(fs::read_to_string(b.staging().join("pending.failed")).unwrap().contains("unexpected file"));
     }
 
     #[test]
