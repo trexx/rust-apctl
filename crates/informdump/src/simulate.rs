@@ -5,7 +5,7 @@
 
 use std::collections::HashMap;
 use std::io::{Read, Write};
-use std::net::TcpStream;
+use std::net::{IpAddr, TcpStream};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
@@ -31,9 +31,26 @@ fn post(url: &str, body: &[u8]) -> Result<(u16, Vec<u8>)> {
     Ok((status, resp[head_end + 4..].to_vec()))
 }
 
+/// Whether `url` is `http://` to this machine: `localhost`, 127.0.0.0/8 or `[::1]`.
+fn is_local(url: &str) -> bool {
+    let Some(rest) = url.strip_prefix("http://") else { return false };
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    if authority.contains('@') {
+        return false;
+    }
+    let host = match authority.strip_prefix('[') {
+        Some(v6) => match v6.split_once(']') {
+            Some((h, port)) if port.is_empty() || port.starts_with(':') => h,
+            _ => return false,
+        },
+        None => authority.split_once(':').map_or(authority, |(h, _)| h),
+    };
+    host.eq_ignore_ascii_case("localhost") || host.parse::<IpAddr>().is_ok_and(|ip| ip.is_loopback())
+}
+
 pub fn run(pcap: &str, keys: &KeyStore, url: &str, limit: usize, every: f64) -> Result<()> {
-    if !(url.contains("127.0.0.1") || url.contains("localhost")) {
-        bail!("refusing to simulate APs against {url}: only local controllers (127.0.0.1/localhost)");
+    if !is_local(url) {
+        bail!("refusing to simulate APs against {url}: only local controllers (http:// to 127.0.0.1, ::1 or localhost)");
     }
     // Collect the informs first, in capture order.
     let mut informs: Vec<Value> = Vec::new();
@@ -66,9 +83,8 @@ pub fn run(pcap: &str, keys: &KeyStore, url: &str, limit: usize, every: f64) -> 
         if key == inform::DEFAULT_KEY {
             payload["default"] = Value::from(true);
         }
-        let mut iv = [0u8; 16];
-        iv.iter_mut().enumerate().for_each(|(i, b)| *b = (i as u8).wrapping_mul(31) ^ (counts.values().sum::<usize>() as u8));
-        let packet = inform::seal(mac, Flags(Flags::ENCRYPTED | Flags::GCM | Flags::ZLIB), iv, &key, payload.to_string().as_bytes());
+        // These are real AP keys: a GCM nonce must never repeat under one.
+        let packet = inform::seal(mac, Flags(Flags::ENCRYPTED | Flags::GCM | Flags::ZLIB), crate::random_iv(), &key, payload.to_string().as_bytes());
         let (status, body) = post(url, &packet)?;
         let line = if status != 200 {
             format!("HTTP {status}")
@@ -108,4 +124,29 @@ pub fn run(pcap: &str, keys: &KeyStore, url: &str, limit: usize, every: f64) -> 
     }
     eprintln!("replies: {counts:?}");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_local;
+
+    #[test]
+    fn only_local_urls_pass() {
+        for ok in ["http://127.0.0.1:18180/inform", "http://localhost/inform", "http://LOCALHOST:8080", "http://127.1.2.3/x", "http://[::1]:8080/inform"] {
+            assert!(is_local(ok), "{ok}");
+        }
+        for bad in [
+            "http://prod/?127.0.0.1",
+            "http://prod/127.0.0.1",
+            "http://127.0.0.1.example.net/inform",
+            "http://localhost.example.net/",
+            "http://127.0.0.1@prod:8080/inform",
+            "http://prod#127.0.0.1",
+            "https://127.0.0.1/inform",
+            "http://[::1].prod/",
+            "http://10.0.0.1:8080/inform",
+        ] {
+            assert!(!is_local(bad), "{bad}");
+        }
+    }
 }

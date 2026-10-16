@@ -14,16 +14,23 @@ use serde_json::Value;
 
 use wire::cfgdiff;
 
+/// original -> replacement, per category so fakes stay readable.
+type Maps = HashMap<&'static str, BTreeMap<String, String>>;
+
 pub struct Sanitizer {
-    /// original -> replacement, per category so fakes stay readable.
-    maps: HashMap<&'static str, BTreeMap<String, String>>,
+    maps: Maps,
     mac: Regex,
     mac_bare: Regex,
+    mac_shape: Regex,
     uuid: Regex,
     hex: Regex,
     ipv6: Regex,
     /// Domain suffixes to replace (e.g. the controller's DNS name).
     domains: Vec<String>,
+    /// Known hostnames and SSIDs as (original, fake), longest first, and the sizes
+    /// of the two maps it was built from (the maps only grow).
+    known: Vec<(String, String)>,
+    known_sizes: (usize, usize),
 }
 
 const KEEP_MACS: [&str; 2] = ["ff:ff:ff:ff:ff:ff", "00:00:00:00:00:00"];
@@ -34,81 +41,74 @@ impl Sanitizer {
             maps: HashMap::new(),
             mac: Regex::new(r"(?i)\b[0-9a-f]{2}(?::[0-9a-f]{2}){5}\b").unwrap(),
             mac_bare: Regex::new(r"(?i)\b[0-9a-f]{12}\b").unwrap(),
+            mac_shape: Regex::new(r"(?i)^[0-9a-f]{2}(?::[0-9a-f]{2}){5}$").unwrap(),
             uuid: Regex::new(r"(?i)\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b").unwrap(),
             hex: Regex::new(r"(?i)\b[0-9a-f]{16,}\b").unwrap(),
             ipv6: Regex::new(r"(?i)\b(?:[0-9a-f]{1,4}:){2,7}[0-9a-f]{1,4}\b").unwrap(),
             domains,
+            known: Vec::new(),
+            known_sizes: (0, 0),
         }
     }
 
     fn fake(&mut self, kind: &'static str, original: &str, make: impl FnOnce(usize) -> String) -> String {
-        let map = self.maps.entry(kind).or_default();
-        if let Some(f) = map.get(original) {
-            return f.clone();
-        }
-        let f = make(map.len() + 1);
-        map.insert(original.to_string(), f.clone());
-        f
+        fake(&mut self.maps, kind, original, make)
     }
 
     fn fake_mac(&mut self, mac: &str) -> String {
-        let lower = mac.to_ascii_lowercase();
-        if KEEP_MACS.contains(&lower.as_str()) {
-            return lower;
-        }
-        // Locally administered unicast range, numbered by first appearance.
-        self.fake("mac", &lower, |n| format!("02:00:00:00:{:02x}:{:02x}", n >> 8, n & 0xff))
+        fake_mac(&mut self.maps, mac)
     }
 
-    /// A MAC written without colons (as in serial numbers), keeping its case.
-    fn fake_bare_mac(&mut self, bare: &str) -> String {
-        let colon: String = bare.to_ascii_lowercase().as_bytes().chunks(2).map(|c| std::str::from_utf8(c).unwrap()).collect::<Vec<_>>().join(":");
-        let fake = self.fake_mac(&colon).replace(':', "");
-        if bare.chars().any(|c| c.is_ascii_uppercase()) { fake.to_ascii_uppercase() } else { fake }
+    /// Hostnames and SSIDs learned from their own fields can also appear inside
+    /// other values (e.g. `resolv.host.1.name`). Longest first, so a name that
+    /// contains another name is replaced whole. Rebuilt only when a map grew.
+    fn refresh_known(&mut self) {
+        let size = |k: &str| self.maps.get(k).map_or(0, BTreeMap::len);
+        let sizes = (size("name"), size("ssid"));
+        if sizes == self.known_sizes {
+            return;
+        }
+        self.known = ["name", "ssid"]
+            .iter()
+            .filter_map(|k| self.maps.get(k))
+            .flat_map(|m| m.iter().filter(|(o, _)| o.len() >= 4).map(|(o, f)| (o.clone(), f.clone())))
+            .collect();
+        self.known.sort_by_key(|(o, _)| std::cmp::Reverse(o.len()));
+        self.known_sizes = sizes;
     }
 
     /// Rewrites identifiers that can appear inside any string value.
     fn scrub(&mut self, s: &str) -> String {
         let mut out = s.to_string();
-        // Hostnames and SSIDs learned from their own fields can also appear inside
-        // other values (e.g. `resolv.host.1.name`). Longest first, so a name that
-        // contains another name is replaced whole.
-        let mut known: Vec<(String, String)> = ["name", "ssid"]
-            .iter()
-            .filter_map(|k| self.maps.get(k))
-            .flat_map(|m| m.iter().filter(|(o, _)| o.len() >= 4).map(|(o, f)| (o.clone(), f.clone())))
-            .collect();
-        known.sort_by_key(|(o, _)| std::cmp::Reverse(o.len()));
-        for (original, fake) in known {
-            if out.contains(&original) && out != fake {
-                out = out.replace(&original, &fake);
+        self.refresh_known();
+        for (original, fake) in &self.known {
+            if out.contains(original.as_str()) && out != *fake {
+                out = out.replace(original.as_str(), fake);
             }
         }
-        for d in self.domains.clone() {
-            out = out.replace(&d, "example.net");
+        for d in &self.domains {
+            out = out.replace(d.as_str(), "example.net");
         }
-        out = replace_all(&self.uuid.clone(), &out, |m| {
-            self.fake("uuid", &m.to_ascii_lowercase(), |n| format!("00000000-0000-4000-8000-{n:012x}"))
-        });
-        out = replace_all(&self.mac.clone(), &out, |m| self.fake_mac(m));
+        let maps = &mut self.maps;
+        out = replace_all(&self.uuid, &out, |m| fake(maps, "uuid", &m.to_ascii_lowercase(), |n| format!("00000000-0000-4000-8000-{n:012x}")));
+        out = replace_all(&self.mac, &out, |m| fake_mac(maps, m));
         // A bare 12-hex string is only treated as a MAC when we already know that MAC
         // (serial numbers on these APs are the MAC without colons).
-        out = replace_all(&self.mac_bare.clone(), &out, |m| {
-            let colon: String = m.to_ascii_lowercase().as_bytes().chunks(2).map(|c| std::str::from_utf8(c).unwrap()).collect::<Vec<_>>().join(":");
-            if self.maps.get("mac").is_some_and(|mm| mm.contains_key(&colon)) { self.fake_bare_mac(m) } else { m.to_string() }
+        out = replace_all(&self.mac_bare, &out, |m| {
+            if maps.get("mac").is_some_and(|mm| mm.contains_key(&colon_mac(m))) { fake_bare_mac(maps, m) } else { m.to_string() }
         });
-        out = replace_all(&self.hex.clone(), &out, |m| {
+        out = replace_all(&self.hex, &out, |m| {
             let len = m.len();
-            self.fake("hex", &m.to_ascii_lowercase(), |n| format!("{n:0len$x}"))
+            fake(maps, "hex", &m.to_ascii_lowercase(), |n| format!("{n:0len$x}"))
         });
-        let mac_shape = Regex::new(r"(?i)^[0-9a-f]{2}(?::[0-9a-f]{2}){5}$").unwrap();
-        out = replace_all(&self.ipv6.clone(), &out, |m| {
+        let mac_shape = &self.mac_shape;
+        out = replace_all(&self.ipv6, &out, |m| {
             // Keep MACs (already handled), link-local and the like; global
             // addresses would reveal the ISP prefix.
             if mac_shape.is_match(m) || m.to_ascii_lowercase().starts_with("fe80") || m.starts_with("::") {
                 m.to_string()
             } else {
-                self.fake("ipv6", &m.to_ascii_lowercase(), |n| format!("2001:db8::{n:x}"))
+                fake(maps, "ipv6", &m.to_ascii_lowercase(), |n| format!("2001:db8::{n:x}"))
             }
         });
         out
@@ -132,7 +132,7 @@ impl Sanitizer {
         } else if matches!(last, "serial" | "serialno" | "serial_no") && self.mac_bare.is_match(value) && value.len() == 12 {
             // Serial numbers are the device's MAC without colons, including those
             // of neighbouring APs in scan results: their real BSSIDs follow from them.
-            self.fake_bare_mac(value)
+            fake_bare_mac(&mut self.maps, value)
         } else if last == "fingerprint" {
             // SSH host key fingerprints identify the device.
             self.fake("fingerprint", value, |n| format!("SHA256:fingerprint-{n}"))
@@ -214,6 +214,36 @@ impl Sanitizer {
         }
         Ok(())
     }
+}
+
+fn fake(maps: &mut Maps, kind: &'static str, original: &str, make: impl FnOnce(usize) -> String) -> String {
+    let map = maps.entry(kind).or_default();
+    if let Some(f) = map.get(original) {
+        return f.clone();
+    }
+    let f = make(map.len() + 1);
+    map.insert(original.to_string(), f.clone());
+    f
+}
+
+fn fake_mac(maps: &mut Maps, mac: &str) -> String {
+    let lower = mac.to_ascii_lowercase();
+    if KEEP_MACS.contains(&lower.as_str()) {
+        return lower;
+    }
+    // Locally administered unicast range, numbered by first appearance.
+    fake(maps, "mac", &lower, |n| format!("02:00:00:00:{:02x}:{:02x}", n >> 8, n & 0xff))
+}
+
+/// `aabbccddeeff` (any case) as `aa:bb:cc:dd:ee:ff`.
+fn colon_mac(bare: &str) -> String {
+    bare.to_ascii_lowercase().as_bytes().chunks(2).map(|c| std::str::from_utf8(c).unwrap()).collect::<Vec<_>>().join(":")
+}
+
+/// A MAC written without colons (as in serial numbers), keeping its case.
+fn fake_bare_mac(maps: &mut Maps, bare: &str) -> String {
+    let fake = fake_mac(maps, &colon_mac(bare)).replace(':', "");
+    if bare.chars().any(|c| c.is_ascii_uppercase()) { fake.to_ascii_uppercase() } else { fake }
 }
 
 /// A plain mDNS service type such as `_googlecast._tcp.local`, with no device ID in it.

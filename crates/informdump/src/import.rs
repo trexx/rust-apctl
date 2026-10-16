@@ -4,7 +4,6 @@
 //! The output contains secrets (device authkeys, WLAN passphrases): it is
 //! written with mode 0600 and must never be committed.
 
-use std::io::Write;
 use std::path::Path;
 
 use anyhow::{Context, Result};
@@ -75,7 +74,7 @@ pub async fn run(uri: &str, db: &str, out: &Path) -> Result<()> {
         "devices": devices,
         "clients": users,
     });
-    write_private(out, &serde_json::to_vec_pretty(&snapshot)?)?;
+    crate::write_private(out, &serde_json::to_vec_pretty(&snapshot)?)?;
     eprintln!("wrote {} (mode 0600; contains secrets, keep it out of git)", out.display());
     Ok(())
 }
@@ -94,17 +93,4 @@ async fn find_all(db: &mongodb::Database, coll: &str, projection: Document) -> R
         out.push(Bson::Document(d).into_relaxed_extjson());
     }
     Ok(out)
-}
-
-fn write_private(path: &Path, data: &[u8]) -> Result<()> {
-    let mut opts = std::fs::OpenOptions::new();
-    opts.write(true).create(true).truncate(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        opts.mode(0o600);
-    }
-    let mut f = opts.open(path).with_context(|| format!("creating {}", path.display()))?;
-    f.write_all(data)?;
-    Ok(())
 }

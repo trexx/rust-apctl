@@ -464,7 +464,6 @@ impl Sim {
                 vc.tx += vap_traffic[vi].0 + 2_000.0 * dt;
                 vc.rx += vap_traffic[vi].1 + 500.0 * dt;
                 vc.pkts += (vap_traffic[vi].0 + vap_traffic[vi].1) / 1000.0 + dt;
-                vc.retries += vc.pkts * 0.0;
                 let sta = std::mem::take(&mut stas[vi]);
                 let n = sta.len() as i64;
                 let avg = if n > 0 { sta.iter().map(|s| s["signal"].as_i64().unwrap_or(0)).sum::<i64>() / n } else { 0 };
@@ -660,7 +659,6 @@ pub fn run(hours: f64, live: bool, out: impl Write) -> Result<()> {
     let mut pcap = PcapWriter::new(out)?;
     let mut t = start;
     let mut last = vec![start; APS.len()];
-    let mut iv_counter = 0u8;
     loop {
         let wall = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs() as i64;
         if t > wall {
@@ -695,14 +693,12 @@ pub fn run(hours: f64, live: bool, out: impl Write) -> Result<()> {
             while let Some((lt, li, line)) = logs.next_if(|l| l.0 <= at) {
                 write_syslog(&mut pcap, lt, li, &line)?;
             }
-            iv_counter = iv_counter.wrapping_add(1);
             let key = authkey(&APS[i]);
-            let iv = [iv_counter; 16];
             let mac: Mac = APS[i].mac.parse()?;
-            let body = inform::seal(mac, Flags(Flags::ENCRYPTED | Flags::GCM | Flags::ZLIB), iv, &key, payload.to_string().as_bytes());
+            let body = inform::seal(mac, Flags(Flags::ENCRYPTED | Flags::GCM | Flags::ZLIB), crate::random_iv(), &key, payload.to_string().as_bytes());
             pcap.tcp(at * 1000, i, true, &http("POST /inform HTTP/1.1\r\nHost: controller.home.arpa:8080\r\nContent-Type: application/x-binary\r\n", &body))?;
             let reply = json!({ "_type": "noop", "interval": step, "server_time_in_utc": (at * 1000).to_string() });
-            let sealed = inform::seal(mac, Flags(Flags::ENCRYPTED | Flags::GCM | Flags::ZLIB), [iv_counter ^ 0x5a; 16], &key, reply.to_string().as_bytes());
+            let sealed = inform::seal(mac, Flags(Flags::ENCRYPTED | Flags::GCM | Flags::ZLIB), crate::random_iv(), &key, reply.to_string().as_bytes());
             pcap.tcp(at * 1000 + 40, i, false, &http("HTTP/1.1 200 OK\r\nContent-Type: application/x-binary\r\n", &sealed))?;
         }
         for (lt, li, line) in logs {
@@ -724,17 +720,8 @@ fn write_syslog<W: Write>(pcap: &mut PcapWriter<W>, ts: i64, ap: usize, line: &s
 /// `Mon dd hh:mm:ss` in UTC, as BSD syslog writes it.
 fn chrono_like(ts: i64) -> String {
     const MONTHS: [&str; 12] = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
-    let days = ts.div_euclid(86_400);
     let secs = ts.rem_euclid(86_400);
-    // Civil date from days since 1970-01-01 (Howard Hinnant's algorithm).
-    let z = days + 719_468;
-    let era = z.div_euclid(146_097);
-    let doe = z - era * 146_097;
-    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let (_, m, d) = wire::civil_from_days(ts.div_euclid(86_400));
     format!("{} {d:>2} {:02}:{:02}:{:02}", MONTHS[(m - 1) as usize], secs / 3600, secs / 60 % 60, secs % 60)
 }
 

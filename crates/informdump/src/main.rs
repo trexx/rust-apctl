@@ -7,12 +7,14 @@
 //! ```
 
 mod demo;
+#[cfg(feature = "mongo")]
 mod import;
 mod report;
 mod sanitize;
 mod simulate;
 
-use std::path::PathBuf;
+use std::io::Write;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand};
@@ -50,6 +52,7 @@ enum Cmd {
     },
     /// Snapshot sites, WLANs and device authkeys from a controller's MongoDB (read-only).
     ///
+    /// Needs a build with the `mongo` feature: `cargo build --release -p informdump --features mongo`.
     /// For a controller in Kubernetes:
     /// `kubectl -n unifi-controller port-forward pod/unifi-controller-0 27117:27117`
     Import {
@@ -161,6 +164,39 @@ fn run_capture(input: &str, common: Common, all: bool) -> Result<()> {
     capture::run(capture::open_input(input)?, &common.ports, |ev| reporter.handle(ev))
 }
 
+/// A fresh nonce for sealing a packet: random, so it never repeats under one key.
+pub fn random_iv() -> [u8; 16] {
+    let mut iv = [0u8; 16];
+    getrandom::fill(&mut iv).expect("system random source");
+    iv
+}
+
+/// Writes a file only its owner can read (mode 0600): it holds secrets.
+pub fn write_private(path: &Path, data: &[u8]) -> Result<()> {
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let mut f = opts.open(path).with_context(|| format!("creating {}", path.display()))?;
+    f.write_all(data)?;
+    Ok(())
+}
+
+/// Creates a directory (and its parents) only its owner can enter (mode 0700).
+pub fn create_private_dir(dir: &Path) -> Result<()> {
+    let mut builder = std::fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    builder.create(dir).with_context(|| format!("creating {}", dir.display()))
+}
+
 fn main() -> Result<()> {
     match Cli::parse().cmd {
         Cmd::Decode { file, key, keys } => {
@@ -186,9 +222,14 @@ fn main() -> Result<()> {
         Cmd::Sanitize { input, output, domains, devices, files } => {
             sanitize::run(&input, &output, &files, domains, &devices)
         }
+        #[cfg(feature = "mongo")]
         Cmd::Import { mongo, db, out } => tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()?
             .block_on(import::run(&mongo, &db, &out)),
+        #[cfg(not(feature = "mongo"))]
+        Cmd::Import { .. } => anyhow::bail!(
+            "this informdump was built without MongoDB support; rebuild it with `cargo build --release -p informdump --features mongo`"
+        ),
     }
 }

@@ -182,13 +182,14 @@ impl Reporter {
         println!("{obj}");
     }
 
+    /// Saves a payload unredacted (authkeys, PSKs): owner-only directory and files.
     fn save(&mut self, ts: Micros, mac: Mac, kind: &str, payload: &Value) {
         let Some(dir) = &self.opts.save else { return };
         self.seq += 1;
         let name = format!("{}_{:06}_{}_{}.json", format_ts(ts).replace(':', ""), self.seq, mac.to_string().replace(':', ""), kind);
         let path = dir.join(name);
-        let result = std::fs::create_dir_all(dir)
-            .and_then(|_| std::fs::write(&path, pretty(payload)))
+        let result = crate::create_private_dir(dir)
+            .and_then(|_| crate::write_private(&path, pretty(payload).as_bytes()))
             .with_context(|| format!("saving {}", path.display()));
         if let Err(e) = result {
             eprintln!("warning: {e:#}");
@@ -241,17 +242,8 @@ fn pretty(v: &Value) -> String {
 pub fn format_ts(ts: Micros) -> String {
     let secs = ts.div_euclid(1_000_000);
     let millis = ts.rem_euclid(1_000_000) / 1000;
-    let (days, sod) = (secs.div_euclid(86_400), secs.rem_euclid(86_400));
-    // Civil-from-days (Howard Hinnant's algorithm).
-    let z = days + 719_468;
-    let era = z.div_euclid(146_097);
-    let doe = z.rem_euclid(146_097);
-    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let day = doy - (153 * mp + 2) / 5 + 1;
-    let month = if mp < 10 { mp + 3 } else { mp - 9 };
-    let year = yoe + era * 400 + i64::from(month <= 2);
+    let sod = secs.rem_euclid(86_400);
+    let (year, month, day) = wire::civil_from_days(secs.div_euclid(86_400));
     format!(
         "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}.{millis:03}Z",
         sod / 3600,
