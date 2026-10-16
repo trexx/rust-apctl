@@ -7,9 +7,11 @@ use axum::Json;
 use axum::extract::{Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use serde_json::{Value, json};
+use std::collections::HashMap;
 
 use crate::api::{ApiError, AppState};
-use crate::settings::{COUNTRY_NAMES, PreviewQuery, band_name, country, dedup_in_order, docs_mut, illegal_fixed_channel, mgmt_flag, num, outdoor_with, setting, setting_mut};
+use crate::settings::Kind::{Bool, Int};
+use crate::settings::{COUNTRY_NAMES, Patch, PreviewQuery, band_name, copy_fields, country, dedup_in_order, docs_mut, illegal_fixed_channel, mgmt_flag, num, outdoor_with, setting, setting_mut};
 
 /// A host name or IPv4 address, as NTP and syslog targets take (the official
 /// controller refuses IPv6 there).
@@ -22,27 +24,6 @@ fn is_host(h: &str) -> bool {
 
 /// The servers automatic NTP stands for.
 const NTP_POOL: [&str; 4] = ["0.ubnt.pool.ntp.org", "1.ubnt.pool.ntp.org", "2.ubnt.pool.ntp.org", "3.ubnt.pool.ntp.org"];
-
-fn port(v: &Value, what: &str) -> Result<Option<i64>, String> {
-    match v {
-        Value::Null => Ok(None),
-        v => match num(v) {
-            Some(n) if (1..=65535).contains(&n) => Ok(Some(n)),
-            _ => Err(format!("{what} must be a port from 1 to 65535")),
-        },
-    }
-}
-
-fn bools(p: &Value, doc: &mut Value, keys: &[&str]) -> Result<(), String> {
-    for k in keys {
-        match &p[*k] {
-            Value::Null => {}
-            Value::Bool(b) => doc[*k] = json!(b),
-            _ => return Err(format!("{k} must be true or false")),
-        }
-    }
-    Ok(())
-}
 
 /// Sets fixed channels that the site's country and the APs' indoor/outdoor
 /// mode no longer allow back to auto, as the official controller does when
@@ -71,158 +52,199 @@ pub fn apply_site(state: &mut Value, p: &Value) -> Result<String, String> {
     let before = state["setting"].clone();
     let rules_before = (country(state), mgmt_flag(state, "outdoor_mode_enabled"));
     let mut notes: Vec<String> = Vec::new();
+    if !p["mgmt"].is_null() {
+        site_mgmt(setting_mut(state, "mgmt"), &p["mgmt"], &mut notes)?;
+    }
+    if !p["rsyslogd"].is_null() {
+        site_syslog(setting_mut(state, "rsyslogd"), &p["rsyslogd"])?;
+    }
+    if !p["ntp"].is_null() {
+        site_ntp(setting_mut(state, "ntp"), &p["ntp"])?;
+    }
+    if !p["snmp"].is_null() {
+        site_snmp(setting_mut(state, "snmp"), &p["snmp"], &mut notes)?;
+    }
+    site_region(state, p)?;
 
-    let m = &p["mgmt"];
-    if !m.is_null() {
-        let doc = setting_mut(state, "mgmt");
-        bools(m, doc, &["led_enabled", "outdoor_mode_enabled", "x_ssh_enabled", "x_ssh_auth_password_enabled", "x_ssh_bind_wildcard"])?;
-        // The official controller turns this on with every save of these settings; the
-        // features it gates (band steering, minimum signal and more) need it.
-        doc["advanced_feature_enabled"] = json!(true);
-        if let Some(u) = m["x_ssh_username"].as_str().map(str::trim) {
-            let ok = (1..=30).contains(&u.len())
-                && u.chars().enumerate().all(|(i, c)| c.is_ascii_alphanumeric() || c == '_' || i > 0 && matches!(c, '-' | '.'))
-                && u != "root";
-            if !ok {
-                return Err("the SSH user name must be 1 to 30 letters, digits, '_', '-' or '.', starting with a letter, digit or '_' (and not root)".into());
-            }
-            doc["x_ssh_username"] = json!(u);
-        }
-        if let Some(pw) = m["x_ssh_password"].as_str() {
-            set_ssh_password(doc, pw)?;
-            notes.push("SSH password".into());
-        }
-        if !m["x_ssh_keys"].is_null() {
-            doc["x_ssh_keys"] = json!(ssh_keys(&m["x_ssh_keys"])?);
-        }
-        let doc = &*doc;
-        if doc["x_ssh_enabled"].as_bool() != Some(false) && doc["x_ssh_auth_password_enabled"].as_bool() == Some(false) && doc["x_ssh_keys"].as_array().is_none_or(Vec::is_empty) {
-            return Err("with password logins off, SSH needs at least one key".into());
-        }
+    // The country and the outdoor default decide which fixed channels are legal:
+    // when either changes, fixed channels no longer allowed go back to auto.
+    // Other saves leave the channels alone.
+    if (country(state), mgmt_flag(state, "outdoor_mode_enabled")) != rules_before {
+        notes.extend(reset_illegal_channels(state));
+    }
+    if !p["country"].is_null() && !setting(state, "radio_ai").is_null() {
+        // Channel AI's channel lists follow the country.
+        crate::channelai::apply_settings(state, &json!({}))?;
     }
 
-    let r = &p["rsyslogd"];
-    if !r.is_null() {
-        let doc = setting_mut(state, "rsyslogd");
-        bools(r, doc, &["debug", "netconsole_enabled"])?;
-        // Off, to apctl ("Network Application"), or to a server, saved as the official UI does.
-        match r["mode"].as_str() {
-            None => {}
-            Some("off") => {
-                doc["enabled"] = json!(false);
-                doc["log_all_contents"] = json!(true);
-                doc["debug"] = json!(false);
+    let mut changed = changed_settings(&before, &state["setting"]);
+    changed.extend(notes);
+    dedup_in_order(&mut changed);
+    Ok(if changed.is_empty() { "site settings: nothing changed".into() } else { format!("site settings: {}", changed.join(", ")) })
+}
+
+/// The `setting` fields that differ, as "key.field" (secrets left out: they
+/// are summed up as e.g. "SSH password" by the editors).
+fn changed_settings(before: &Value, after: &Value) -> Vec<String> {
+    let old: HashMap<(Option<&str>, Option<&str>), &Value> = before.as_array().into_iter().flatten().map(|o| ((o["key"].as_str(), o["site_id"].as_str()), o)).collect();
+    let mut changed = Vec::new();
+    for s in after.as_array().into_iter().flatten() {
+        let key = s["key"].as_str();
+        let old = old.get(&(key, s["site_id"].as_str())).copied().unwrap_or(&Value::Null);
+        for (k, v) in s.as_object().into_iter().flatten() {
+            if old[k] != *v && !SECRETS.contains(&k.as_str()) && !matches!(k.as_str(), "key" | "site_id") {
+                changed.push(if k == "x_ssh_keys" { "SSH keys".to_string() } else { format!("{}.{k}", key.unwrap_or("?")) });
             }
-            Some("controller") => {
-                doc["enabled"] = json!(true);
-                doc["this_controller"] = json!(true);
-                doc["log_all_contents"] = json!(true);
-                doc["netconsole_enabled"] = json!(false);
-            }
-            Some("server") => {
-                doc["enabled"] = json!(true);
-                doc["this_controller"] = json!(false);
-                doc["log_all_contents"] = json!(true);
-            }
-            Some(_) => return Err("the syslog mode must be off, controller or server".into()),
-        }
-        doc["this_controller_encrypted_only"] = json!(false);
-        if let Some(ip) = r["ip"].as_str().map(str::trim) {
-            if !ip.is_empty() && !is_host(ip) {
-                return Err(format!("{ip} is not a host name or address"));
-            }
-            doc["ip"] = json!(ip);
-        }
-        if let Some(n) = port(&r["port"], "the syslog port")? {
-            doc["port"] = json!(n);
-        }
-        if let Some(h) = r["netconsole_host"].as_str().map(str::trim) {
-            if !h.is_empty() && !is_host(h) {
-                return Err(format!("{h} is not a host name or address"));
-            }
-            doc["netconsole_host"] = json!(h);
-        }
-        if let Some(n) = port(&r["netconsole_port"], "the netconsole port")? {
-            doc["netconsole_port"] = json!(n);
-        }
-        let doc = &*doc;
-        let on = |k: &str| doc[k].as_bool() == Some(true);
-        if on("enabled") && !on("this_controller") && doc["ip"].as_str().is_none_or(str::is_empty) {
-            return Err("remote syslog needs a server".into());
-        }
-        if on("netconsole_enabled") && doc["netconsole_host"].as_str().is_none_or(str::is_empty) {
-            return Err("netconsole needs a host".into());
         }
     }
+    changed
+}
 
-    let n = &p["ntp"];
-    if !n.is_null() {
-        let doc = setting_mut(state, "ntp");
-        let was_manual = doc["setting_preference"].as_str() == Some("manual");
-        match n["setting_preference"].as_str() {
-            None => {}
-            Some(pref @ ("auto" | "manual")) => doc["setting_preference"] = json!(pref),
-            Some(_) => return Err("setting_preference must be auto or manual".into()),
+/// LEDs, the outdoor default and the APs' SSH access (`mgmt`).
+fn site_mgmt(doc: &mut Value, m: &Value, notes: &mut Vec<String>) -> Result<(), String> {
+    copy_fields(m, doc, &[("led_enabled", Bool), ("outdoor_mode_enabled", Bool), ("x_ssh_enabled", Bool), ("x_ssh_auth_password_enabled", Bool), ("x_ssh_bind_wildcard", Bool)])?;
+    // The official controller turns this on with every save of these settings; the
+    // features it gates (band steering, minimum signal and more) need it.
+    doc["advanced_feature_enabled"] = json!(true);
+    if let Some(u) = m["x_ssh_username"].as_str().map(str::trim) {
+        let ok = (1..=30).contains(&u.len())
+            && u.chars().enumerate().all(|(i, c)| c.is_ascii_alphanumeric() || c == '_' || i > 0 && matches!(c, '-' | '.'))
+            && u != "root";
+        if !ok {
+            return Err("the SSH user name must be 1 to 30 letters, digits, '_', '-' or '.', starting with a letter, digit or '_' (and not root)".into());
         }
-        if doc["setting_preference"].as_str() == Some("auto") {
-            // Going back to automatic restores the pool, as the official controller does.
-            if was_manual || doc["ntp_server_1"].is_null() {
-                for (i, h) in NTP_POOL.iter().enumerate() {
-                    doc[format!("ntp_server_{}", i + 1)] = json!(h);
+        doc["x_ssh_username"] = json!(u);
+    }
+    if let Some(pw) = m["x_ssh_password"].as_str() {
+        set_ssh_password(doc, pw)?;
+        notes.push("SSH password".into());
+    }
+    if !m["x_ssh_keys"].is_null() {
+        doc["x_ssh_keys"] = json!(ssh_keys(&m["x_ssh_keys"])?);
+    }
+    if doc["x_ssh_enabled"].as_bool() != Some(false) && doc["x_ssh_auth_password_enabled"].as_bool() == Some(false) && doc["x_ssh_keys"].as_array().is_none_or(Vec::is_empty) {
+        return Err("with password logins off, SSH needs at least one key".into());
+    }
+    Ok(())
+}
+
+/// Remote syslog and netconsole (`rsyslogd`).
+fn site_syslog(doc: &mut Value, r: &Value) -> Result<(), String> {
+    copy_fields(r, doc, &[("debug", Bool), ("netconsole_enabled", Bool), ("port", Int(1, 65535)), ("netconsole_port", Int(1, 65535))])?;
+    // Off, to apctl ("Network Application"), or to a server, saved as the official UI does.
+    match r["mode"].as_str() {
+        None => {}
+        Some("off") => {
+            doc["enabled"] = json!(false);
+            doc["log_all_contents"] = json!(true);
+            doc["debug"] = json!(false);
+        }
+        Some("controller") => {
+            doc["enabled"] = json!(true);
+            doc["this_controller"] = json!(true);
+            doc["log_all_contents"] = json!(true);
+            doc["netconsole_enabled"] = json!(false);
+        }
+        Some("server") => {
+            doc["enabled"] = json!(true);
+            doc["this_controller"] = json!(false);
+            doc["log_all_contents"] = json!(true);
+        }
+        Some(_) => return Err("the syslog mode must be off, controller or server".into()),
+    }
+    doc["this_controller_encrypted_only"] = json!(false);
+    if let Some(ip) = r["ip"].as_str().map(str::trim) {
+        if !ip.is_empty() && !is_host(ip) {
+            return Err(format!("{ip} is not a host name or address"));
+        }
+        doc["ip"] = json!(ip);
+    }
+    if let Some(h) = r["netconsole_host"].as_str().map(str::trim) {
+        if !h.is_empty() && !is_host(h) {
+            return Err(format!("{h} is not a host name or address"));
+        }
+        doc["netconsole_host"] = json!(h);
+    }
+    let doc = &*doc;
+    let on = |k: &str| doc[k].as_bool() == Some(true);
+    if on("enabled") && !on("this_controller") && doc["ip"].as_str().is_none_or(str::is_empty) {
+        return Err("remote syslog needs a server".into());
+    }
+    if on("netconsole_enabled") && doc["netconsole_host"].as_str().is_none_or(str::is_empty) {
+        return Err("netconsole needs a host".into());
+    }
+    Ok(())
+}
+
+/// The APs' time servers (`ntp`).
+fn site_ntp(doc: &mut Value, n: &Value) -> Result<(), String> {
+    let was_manual = doc["setting_preference"].as_str() == Some("manual");
+    match n["setting_preference"].as_str() {
+        None => {}
+        Some(pref @ ("auto" | "manual")) => doc["setting_preference"] = json!(pref),
+        Some(_) => return Err("setting_preference must be auto or manual".into()),
+    }
+    if doc["setting_preference"].as_str() == Some("auto") {
+        // Going back to automatic restores the pool, as the official controller does.
+        if was_manual || doc["ntp_server_1"].is_null() {
+            for (i, h) in NTP_POOL.iter().enumerate() {
+                doc[format!("ntp_server_{}", i + 1)] = json!(h);
+            }
+        }
+    } else if (1..=4).any(|i| !n[format!("ntp_server_{i}")].is_null()) {
+        // Manual servers replace all four.
+        let mut list = Vec::new();
+        for i in 1..=4 {
+            if let Some(h) = n[format!("ntp_server_{i}")].as_str().map(str::trim).filter(|h| !h.is_empty()) {
+                if !is_host(h) {
+                    return Err(format!("{h} is not a host name or IPv4 address"));
                 }
-            }
-        } else if (1..=4).any(|i| !n[format!("ntp_server_{i}")].is_null()) {
-            // Manual servers replace all four.
-            let mut list = Vec::new();
-            for i in 1..=4 {
-                if let Some(h) = n[format!("ntp_server_{i}")].as_str().map(str::trim).filter(|h| !h.is_empty()) {
-                    if !is_host(h) {
-                        return Err(format!("{h} is not a host name or IPv4 address"));
-                    }
-                    list.push(h.to_string());
-                }
-            }
-            for i in 1..=4 {
-                doc[format!("ntp_server_{i}")] = json!(list.get(i - 1).cloned().unwrap_or_default());
+                list.push(h.to_string());
             }
         }
-        if doc["setting_preference"].as_str() == Some("manual") && (1..=4).all(|i| doc[format!("ntp_server_{i}")].as_str().is_none_or(str::is_empty)) {
-            return Err("manual NTP needs at least one server".into());
+        for i in 1..=4 {
+            doc[format!("ntp_server_{i}")] = json!(list.get(i - 1).cloned().unwrap_or_default());
         }
     }
-
-    let sn = &p["snmp"];
-    if !sn.is_null() {
-        let doc = setting_mut(state, "snmp");
-        bools(sn, doc, &["enabled", "enabledV3"])?;
-        if let Some(c) = sn["community"].as_str() {
-            if c.is_empty() || c.len() > 256 || c.contains(char::is_whitespace) {
-                return Err("the SNMP community must be 1 to 256 characters without spaces".into());
-            }
-            doc["community"] = json!(c);
-        }
-        if let Some(u) = sn["username"].as_str().map(str::trim) {
-            if !(1..=30).contains(&u.len()) {
-                return Err("the SNMPv3 user name must be 1 to 30 characters".into());
-            }
-            doc["username"] = json!(u);
-        }
-        if let Some(pw) = sn["x_password"].as_str() {
-            if !(8..=32).contains(&pw.len()) || pw.contains(['"', '\'']) {
-                return Err("the SNMPv3 password must be 8 to 32 characters without quotes".into());
-            }
-            doc["x_password"] = json!(pw);
-            notes.push("SNMPv3 password".into());
-        }
-        let doc = &*doc;
-        if doc["enabled"].as_bool() == Some(true) && doc["community"].as_str().is_none_or(str::is_empty) {
-            return Err("SNMP v1/v2c needs a community".into());
-        }
-        if doc["enabledV3"].as_bool() == Some(true) && (doc["username"].as_str().is_none_or(str::is_empty) || doc["x_password"].as_str().is_none_or(str::is_empty)) {
-            return Err("SNMPv3 needs a user name and password".into());
-        }
+    if doc["setting_preference"].as_str() == Some("manual") && (1..=4).all(|i| doc[format!("ntp_server_{i}")].as_str().is_none_or(str::is_empty)) {
+        return Err("manual NTP needs at least one server".into());
     }
+    Ok(())
+}
 
+/// SNMP v1/v2c and v3 (`snmp`).
+fn site_snmp(doc: &mut Value, sn: &Value, notes: &mut Vec<String>) -> Result<(), String> {
+    copy_fields(sn, doc, &[("enabled", Bool), ("enabledV3", Bool)])?;
+    if let Some(c) = sn["community"].as_str() {
+        if c.is_empty() || c.len() > 256 || c.contains(char::is_whitespace) {
+            return Err("the SNMP community must be 1 to 256 characters without spaces".into());
+        }
+        doc["community"] = json!(c);
+    }
+    if let Some(u) = sn["username"].as_str().map(str::trim) {
+        if !(1..=30).contains(&u.len()) {
+            return Err("the SNMPv3 user name must be 1 to 30 characters".into());
+        }
+        doc["username"] = json!(u);
+    }
+    if let Some(pw) = sn["x_password"].as_str() {
+        if !(8..=32).contains(&pw.len()) || pw.contains(['"', '\'']) {
+            return Err("the SNMPv3 password must be 8 to 32 characters without quotes".into());
+        }
+        doc["x_password"] = json!(pw);
+        notes.push("SNMPv3 password".into());
+    }
+    if doc["enabled"].as_bool() == Some(true) && doc["community"].as_str().is_none_or(str::is_empty) {
+        return Err("SNMP v1/v2c needs a community".into());
+    }
+    if doc["enabledV3"].as_bool() == Some(true) && (doc["username"].as_str().is_none_or(str::is_empty) || doc["x_password"].as_str().is_none_or(str::is_empty)) {
+        return Err("SNMPv3 needs a user name and password".into());
+    }
+    Ok(())
+}
+
+/// The country (which channels are legal) and the time zone.
+fn site_region(state: &mut Value, p: &Value) -> Result<(), String> {
     if !p["country"].is_null() {
         let code = num(&p["country"]).ok_or("country must be an ISO 3166 numeric code")?;
         if !COUNTRY_NAMES.iter().any(|(c, _)| *c == code) {
@@ -236,33 +258,7 @@ pub fn apply_site(state: &mut Value, p: &Value) -> Result<String, String> {
         }
         setting_mut(state, "locale")["timezone"] = json!(tz);
     }
-
-    // The country and the outdoor default decide which fixed channels are legal:
-    // when either changes, fixed channels no longer allowed go back to auto.
-    // Other saves leave the channels alone.
-    if (country(state), mgmt_flag(state, "outdoor_mode_enabled")) != rules_before {
-        notes.extend(reset_illegal_channels(state));
-    }
-    if !p["country"].is_null() && !setting(state, "radio_ai").is_null() {
-        // Channel AI's channel lists follow the country.
-        crate::channelai::apply_settings(state, &json!({}))?;
-    }
-
-    let mut changed: Vec<String> = Vec::new();
-    let after = state["setting"].as_array().cloned().unwrap_or_default();
-    for s in &after {
-        let key = s["key"].as_str().unwrap_or("?");
-        let old = before.as_array().and_then(|l| l.iter().find(|o| o["key"] == s["key"] && o["site_id"] == s["site_id"])).cloned().unwrap_or(Value::Null);
-        for (k, v) in s.as_object().into_iter().flatten() {
-            // Secrets are summed up as "SSH password" (from `notes`).
-            if old[k] != *v && !SECRETS.contains(&k.as_str()) && !matches!(k.as_str(), "key" | "site_id") {
-                changed.push(if k == "x_ssh_keys" { "SSH keys".to_string() } else { format!("{key}.{k}") });
-            }
-        }
-    }
-    changed.extend(notes);
-    dedup_in_order(&mut changed);
-    Ok(if changed.is_empty() { "site settings: nothing changed".into() } else { format!("site settings: {}", changed.join(", ")) })
+    Ok(())
 }
 
 /// The APs' SSH password: kept for apctl's own SSH (adoption) and as the
@@ -346,8 +342,8 @@ pub async fn get_site(State(s): State<AppState>) -> Result<Json<Value>, ApiError
 }
 
 /// PUT /api/settings/site {patch} (`?preview=true` to see the effect)
-pub async fn put_site(State(s): State<AppState>, headers: HeaderMap, Query(q): Query<PreviewQuery>, Json(b): Json<Value>) -> Result<Json<Value>, ApiError> {
-    crate::settings::change(&s, &headers, &q, apply_site, b["patch"].clone()).await
+pub async fn put_site(State(s): State<AppState>, headers: HeaderMap, Query(q): Query<PreviewQuery>, Json(b): Json<Patch>) -> Result<Json<Value>, ApiError> {
+    crate::settings::change(&s, &headers, &q, apply_site, b.patch).await
 }
 
 #[cfg(test)]

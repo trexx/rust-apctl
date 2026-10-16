@@ -750,7 +750,7 @@ fn iot_template() -> Vec<(&'static str, Value, &'static str)> {
 
 /// How a plain field of a patch is checked before it is copied.
 #[derive(Clone, Copy)]
-enum Kind {
+pub(crate) enum Kind {
     Bool,
     Int(i64, i64),
     Enum(&'static [&'static str]),
@@ -760,7 +760,7 @@ use Kind::{Bool, Enum, Int};
 
 /// Copies the fields of `fields` the patch sets into `doc`, each checked by its
 /// kind. Fields with rules of their own are handled by hand around this.
-fn copy_fields(p: &Value, doc: &mut Value, fields: &[(&str, Kind)]) -> Result<(), String> {
+pub(crate) fn copy_fields(p: &Value, doc: &mut Value, fields: &[(&str, Kind)]) -> Result<(), String> {
     for (key, kind) in fields {
         let v = match kind {
             Bool => bool_field(p, key)?.map(Value::from),
@@ -1542,7 +1542,7 @@ fn led_color(c: &str) -> Result<String, String> {
 #[derive(Deserialize)]
 pub struct Patch {
     #[serde(default)]
-    patch: Value,
+    pub(crate) patch: Value,
 }
 
 /// PUT /api/settings/wlans/{id} {patch} (`?preview=true` to see the effect)
