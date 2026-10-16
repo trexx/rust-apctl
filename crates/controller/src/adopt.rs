@@ -67,16 +67,20 @@ pub struct Adoption {
     pub forgetting: HashMap<Mac, Ts>,
 }
 
+/// Whether a record's `mac` is this one (`aa:bb:..`, any case), without
+/// making a string for each record compared.
+fn is_mac(v: &Value, mac: &Mac) -> bool {
+    v.as_str().is_some_and(|s| s.len() == 17 && s.as_bytes()[2] == b':' && s.parse::<Mac>().is_ok_and(|m| m == *mac))
+}
+
 /// The AP's record in the settings.
 pub fn device_doc<'a>(state: &'a Value, mac: &Mac) -> Option<&'a Value> {
-    let m = mac.to_string();
-    state["devices"].as_array()?.iter().find(|d| d["mac"].as_str().is_some_and(|x| x.eq_ignore_ascii_case(&m)))
+    state["devices"].as_array()?.iter().find(|d| is_mac(&d["mac"], mac))
 }
 
 /// The AP's record in the settings, to change it.
 pub fn device_doc_mut<'a>(state: &'a mut Value, mac: &Mac) -> Option<&'a mut Value> {
-    let m = mac.to_string();
-    state["devices"].as_array_mut()?.iter_mut().find(|d| d["mac"].as_str().is_some_and(|x| x.eq_ignore_ascii_case(&m)))
+    state["devices"].as_array_mut()?.iter_mut().find(|d| is_mac(&d["mac"], mac))
 }
 
 fn parse_key<const N: usize>(hex_key: &str) -> Option<[u8; N]> {
@@ -97,13 +101,8 @@ pub fn device_key(state: Option<&Value>, keys: &KeyStore, mac: &Mac) -> Option<[
     }
 }
 
-/// The key an AP encrypts its syslog with: its record's `syslog_key` (apctl
-/// makes one at adoption), else the key file's.
-pub fn syslog_key(state: Option<&Value>, keys: &KeyStore, mac: &Mac) -> Option<[u8; 32]> {
-    state.and_then(|s| device_doc(s, mac)).and_then(|d| d["syslog_key"].as_str()).and_then(parse_key).or_else(|| keys.syslog_key(mac).copied())
-}
-
-/// Every syslog key known, the settings' before the key file's.
+/// Every syslog key known, the settings' before the key file's (an AP
+/// encrypts with its record's `syslog_key`, which apctl makes at adoption).
 pub fn syslog_keys(state: Option<&Value>, keys: &KeyStore) -> Vec<(Mac, [u8; 32])> {
     let devices = state.and_then(|s| s["devices"].as_array()).into_iter().flatten();
     let stored = devices.filter_map(|d| Some((d["mac"].as_str()?.parse().ok()?, parse_key(d["syslog_key"].as_str()?)?)));
