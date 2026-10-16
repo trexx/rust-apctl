@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { useState } from "react";
 import { Link } from "react-router-dom";
 import { AttemptList } from "../components/Connections";
 import { RangePicker, SpanContext, useTimeSpan } from "../components/Chart";
@@ -14,7 +14,13 @@ import {
 import { ago, band, duration, phy } from "../format";
 
 type SortKey =
-  "name" | "ap" | "essid" | "signal" | "rate" | "uptime" | "last_seen";
+  | "name"
+  | "ap"
+  | "essid"
+  | "signal"
+  | "rate"
+  | "uptime"
+  | "last_seen";
 
 const name = displayName;
 
@@ -69,60 +75,77 @@ function Attempts({ tabs }: { tabs: React.ReactNode }) {
   );
 }
 
+type Sort = { key: SortKey; desc: boolean };
+
+/** A sortable column's header. */
+function SortHeader({
+  k,
+  label,
+  sort,
+  onSort,
+}: {
+  k: SortKey;
+  label: string;
+  sort: Sort;
+  onSort: () => void;
+}) {
+  const on = sort.key === k;
+  return (
+    <th aria-sort={on ? (sort.desc ? "descending" : "ascending") : "none"}>
+      <button className="plain sortable" onClick={onSort}>
+        {label} {on ? (sort.desc ? "↓" : "↑") : ""}
+      </button>
+    </th>
+  );
+}
+
 function ClientList({ tabs }: { tabs: React.ReactNode }) {
   const clients = useClients();
   const [filter, setFilter] = useState("");
   const [showGone, setShowGone] = useState(false);
-  const [sort, setSort] = useState<{ key: SortKey; desc: boolean }>({
+  const [sort, setSort] = useState<Sort>({
     key: "signal",
     desc: true,
   });
 
-  const rows = useMemo(() => {
-    const f = filter.trim().toLowerCase();
-    return (clients.data ?? [])
-      .filter((c) => showGone || c.connected)
-      .filter(
-        (c) =>
-          !f ||
-          [
-            c.alias,
-            c.note,
-            c.sample.hostname,
-            c.sample.mac,
-            c.sample.ip,
-            c.sample.essid,
-            c.ap_name,
-          ].some((v) => v?.toLowerCase().includes(f)),
-      )
-      .sort((a, b) => {
-        const [x, y] = [value(a, sort.key), value(b, sort.key)];
-        const cmp = x < y ? -1 : x > y ? 1 : 0;
-        return sort.desc ? -cmp : cmp;
-      });
-  }, [clients.data, filter, showGone, sort]);
+  const f = filter.trim().toLowerCase();
+  const rows = (clients.data ?? [])
+    .filter((c) => showGone || c.connected)
+    .filter(
+      (c) =>
+        !f ||
+        [
+          c.alias,
+          c.note,
+          c.sample.hostname,
+          c.sample.mac,
+          c.sample.ip,
+          c.sample.essid,
+          c.ap_name,
+        ].some((v) => v?.toLowerCase().includes(f)),
+    )
+    .sort((a, b) => {
+      const x = value(a, sort.key);
+      const y = value(b, sort.key);
+      const cmp = x < y ? -1 : x > y ? 1 : 0;
+      return sort.desc ? -cmp : cmp;
+    });
 
   if (clients.isLoading) return <Loading />;
   if (clients.error) return <ErrorNote error={clients.error} />;
 
   const th = (key: SortKey, label: string) => (
-    <th
-      aria-sort={
-        sort.key === key ? (sort.desc ? "descending" : "ascending") : "none"
+    <SortHeader
+      k={key}
+      label={label}
+      sort={sort}
+      onSort={() =>
+        setSort((s) => ({
+          key,
+          desc: s.key === key ? !s.desc : key !== "name",
+        }))
       }
-    >
-      <button
-        className="plain sortable"
-        onClick={() =>
-          setSort((s) => ({
-            key,
-            desc: s.key === key ? !s.desc : key !== "name",
-          }))
-        }
-      >
-        {label} {sort.key === key ? (sort.desc ? "↓" : "↑") : ""}
-      </button>
-    </th>
+    />
   );
 
   return (

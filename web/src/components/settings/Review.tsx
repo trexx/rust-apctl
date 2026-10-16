@@ -39,7 +39,7 @@ export function Review({
     onSuccess: async () => {
       await qc.invalidateQueries({ queryKey: keys.settings() });
       void qc.invalidateQueries({ queryKey: keys.wlans() });
-      void qc.invalidateQueries({ queryKey: keys.events() });
+      // The event lists that show the change refetch when its event arrives.
       onSaved();
     },
   });

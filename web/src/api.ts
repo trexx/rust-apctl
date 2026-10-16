@@ -394,6 +394,9 @@ async function get<T>(path: string, signal?: AbortSignal): Promise<T> {
   return (await check(await fetch(path, { signal }))).json() as Promise<T>;
 }
 
+/** A query function that GETs `path`. */
+const getting = <T>(path: string) => ({ signal }: { signal: AbortSignal }) => get<T>(path, signal);
+
 function qs(params: Record<string, string | number | undefined | null>): string {
   const p = new URLSearchParams();
   for (const [k, v] of Object.entries(params)) {
@@ -418,8 +421,8 @@ export const keys = {
   clients: family("clients"),
   client: family<[mac: Mac]>("client"),
   series: family<[table: string, key: string, span: TimeSpan]>("series"),
-  events: family<[filter: object]>("events"),
-  logs: family<[filter: object]>("logs"),
+  events: family<[filter: EventFilter]>("events"),
+  logs: family<[filter: LogFilter]>("logs"),
   alerts: family("alerts"),
   settingsState: family("settings-state"),
   dryrun: family("dryrun"),
@@ -478,7 +481,7 @@ export interface StateSummary {
   summary: { sites: number; wlans: string[]; networks: string[]; ap_groups: string[]; devices: number; clients: number; settings: number } | null;
 }
 
-export const useSettingsState = () => useQuery({ queryKey: keys.settingsState(), queryFn: ({ signal }) => get<StateSummary>("/api/settings/state", signal) });
+export const useSettingsState = () => useQuery({ queryKey: keys.settingsState(), queryFn: getting<StateSummary>("/api/settings/state") });
 
 export const importState = (snapshot: unknown) => send<{ ok: boolean }>("POST", "/api/settings/state", snapshot);
 
@@ -510,7 +513,7 @@ export interface DryRun {
 }
 
 /** Refreshed by the live socket when a comparison is recorded or settings are imported. */
-export const useDryRun = () => useQuery({ queryKey: keys.dryrun(), queryFn: ({ signal }) => get<DryRun>("/api/dryrun", signal) });
+export const useDryRun = () => useQuery({ queryKey: keys.dryrun(), queryFn: getting<DryRun>("/api/dryrun") });
 
 export interface SiteActivity {
   bucket: number;
@@ -675,7 +678,7 @@ export interface ThreatFinding {
 export const useThreats = () =>
   useQuery({
     queryKey: keys.threats(),
-    queryFn: ({ signal }) => get<{ watching_since: number; findings: ThreatFinding[] }>("/api/rf/threats", signal),
+    queryFn: getting<{ watching_since: number; findings: ThreatFinding[] }>("/api/rf/threats"),
     refetchInterval: 60_000,
   });
 
@@ -706,7 +709,7 @@ const refreshFor = (s: TimeSpan, live: number) => (isFixed(s) && s.to < Date.now
 function useSpanQuery<T>(key: QueryKey, path: string, span: TimeSpan, extra: Record<string, string | number | undefined> = {}) {
   return useQuery({
     queryKey: key,
-    queryFn: ({ signal }) => get<T>(`${path}${qs({ ...spanParams(span), ...extra })}`, signal),
+    queryFn: getting<T>(`${path}${qs({ ...spanParams(span), ...extra })}`),
     refetchInterval: refreshFor(span, 60_000),
     placeholderData: keepPreviousData,
   });
@@ -783,6 +786,9 @@ export interface RoamDir {
 export interface Roaming {
   from: number;
   to: number;
+  /** Over every roam in the window. */
+  total: { roams: number; successes: number; fast: number };
+  /** The newest roams (the server lists 100). */
   roams: Roam[];
   pairs: {
     ap_1: Mac;
@@ -829,13 +835,13 @@ export interface Wlan {
   series: { ts: number[]; clients: number[]; download_bps: number[]; upload_bps: number[] };
 }
 
-/** Connection attempts and roams, newest first: at most `limit` of each (the server's default is 500). */
-export const useConnections = (span: TimeSpan, opts: { client?: Mac; failed?: boolean; limit?: number } = {}) =>
+/** Connection attempts and roams, newest first: at most `limit` of each (the server's default is 500); `roams: false` skips the roams. */
+export const useConnections = (span: TimeSpan, opts: { client?: Mac; failed?: boolean; limit?: number; roams?: boolean } = {}) =>
   useSpanQuery<{ attempts: ConnAttempt[]; roams: Roam[]; ap_names: Record<string, string>; client_names: Record<string, string> }>(
     keys.connections(span, opts),
     "/api/connections",
     span,
-    { client: opts.client, failed: opts.failed ? "true" : undefined, limit: opts.limit },
+    { client: opts.client, failed: opts.failed ? "true" : undefined, limit: opts.limit, roams: opts.roams === false ? "false" : undefined },
   );
 
 export const useRoaming = (span: TimeSpan) => useSpanQuery<Roaming>(keys.roaming(span), "/api/roaming", span);
@@ -934,7 +940,7 @@ export interface FirmwareInfo {
 export const useFirmware = () =>
   useQuery({
     queryKey: keys.firmware(),
-    queryFn: ({ signal }) => get<FirmwareInfo>("/api/firmware", signal),
+    queryFn: getting<FirmwareInfo>("/api/firmware"),
     refetchInterval: (q) => (q.state.data?.jobs.current || q.state.data?.jobs.queue.length ? 5_000 : 60_000),
   });
 export const checkFirmware = () => send<{ platforms: number }>("POST", "/api/firmware/check", {});
@@ -947,7 +953,7 @@ export const useMulticast = (span: TimeSpan, mac?: Mac) => useSpanQuery<SiteMult
 export const useRadios = (range: number) =>
   useQuery({
     queryKey: keys.rfRadios(range),
-    queryFn: ({ signal }) => get<RadioOverview[]>(`/api/rf/radios${qs({ range })}`, signal),
+    queryFn: getting<RadioOverview[]>(`/api/rf/radios${qs({ range })}`),
     refetchInterval: 60_000,
     placeholderData: keepPreviousData,
   });
@@ -955,7 +961,7 @@ export const useRadios = (range: number) =>
 export const useNeighbors = (range: number, band: string) =>
   useQuery({
     queryKey: keys.rfNeighbors(range, band),
-    queryFn: ({ signal }) => get<{ neighbors: Neighbor[]; own_links: OwnLink[] }>(`/api/rf/neighbors${qs({ range, band: bandParam(band) })}`, signal),
+    queryFn: getting<{ neighbors: Neighbor[]; own_links: OwnLink[] }>(`/api/rf/neighbors${qs({ range, band: bandParam(band) })}`),
     refetchInterval: 60_000,
     placeholderData: keepPreviousData,
   });
@@ -963,20 +969,20 @@ export const useNeighbors = (range: number, band: string) =>
 export const useChannelPlan = (band: string, dfs: boolean) =>
   useQuery({
     queryKey: keys.rfPlan(band, dfs),
-    queryFn: ({ signal }) => get<ChannelPlanResult>(`/api/rf/channel-plan${qs({ band, dfs: dfs ? "true" : undefined })}`, signal),
+    queryFn: getting<ChannelPlanResult>(`/api/rf/channel-plan${qs({ band, dfs: dfs ? "true" : undefined })}`),
   });
 
 /** The server's status; only the overview's counters need it to `poll`. */
 export const useStatus = (poll = false) =>
-  useQuery({ queryKey: keys.status(), queryFn: ({ signal }) => get<Status>("/api/status", signal), refetchInterval: poll ? 15_000 : false });
+  useQuery({ queryKey: keys.status(), queryFn: getting<Status>("/api/status"), refetchInterval: poll ? 15_000 : false });
 
-const devicesQuery = queryOptions({ queryKey: keys.devices(), queryFn: ({ signal }) => get<DeviceSummary[]>("/api/devices", signal) });
-const clientsQuery = queryOptions({ queryKey: keys.clients(), queryFn: ({ signal }) => get<ClientView[]>("/api/clients", signal) });
+const devicesQuery = queryOptions({ queryKey: keys.devices(), queryFn: getting<DeviceSummary[]>("/api/devices") });
+const clientsQuery = queryOptions({ queryKey: keys.clients(), queryFn: getting<ClientView[]>("/api/clients") });
 
 export const useDevices = () => useQuery(devicesQuery);
 
 export const useDevice = (mac: Mac) =>
-  useQuery({ queryKey: keys.device(mac), queryFn: ({ signal }) => get<DeviceDetail>(`/api/devices/${mac}`, signal) });
+  useQuery({ queryKey: keys.device(mac), queryFn: getting<DeviceDetail>(`/api/devices/${mac}`) });
 
 /** Every client; with `enabled` false, only what's already cached. */
 export const useClients = (enabled = true) => useQuery({ ...clientsQuery, enabled });
@@ -985,7 +991,7 @@ export const useClients = (enabled = true) => useQuery({ ...clientsQuery, enable
  * Something derived from the client list, re-rendering only when it changes.
  * `select` must be a module-level function, so it runs once per fetch.
  */
-export const useClientsSelect = <T>(select: (clients: ClientView[]) => T) => useQuery({ ...clientsQuery, select });
+export const useClientsSelect = <T>(select: (clients: ClientView[]) => T, enabled = true) => useQuery({ ...clientsQuery, select, enabled });
 
 /** Names by MAC, for links. */
 export type Names = Readonly<Record<Mac, string>>;
@@ -1002,28 +1008,51 @@ export const useClientNames = (): Names => useClientsSelect(clientNames).data ??
 
 /** One client; a 404 (HttpError) means it hasn't been seen since apctl started. */
 export const useClient = (mac: Mac) =>
-  useQuery({ queryKey: keys.client(mac), queryFn: ({ signal }) => get<ClientView>(`/api/clients/${mac}`, signal), retry: false });
+  useQuery({ queryKey: keys.client(mac), queryFn: getting<ClientView>(`/api/clients/${mac}`), retry: false });
 
-/** Time-series for one entity over a time span. */
-export const useSeries = (table: string, key: string, span: TimeSpan) =>
-  useQuery({
-    queryKey: keys.series(table, key, span),
-    queryFn: ({ signal }) => {
+/** `prev` with the samples of `add` (all newer) appended, and those before `from` dropped. */
+function appendSeries(prev: Series, add: Series, from: number): Series {
+  const keep = prev.ts.findIndex((t) => t >= from);
+  const start = keep < 0 ? prev.ts.length : keep;
+  const fields: Series["fields"] = {};
+  for (const [f, values] of Object.entries(prev.fields)) fields[f] = [...values.slice(start), ...(add.fields[f] ?? add.ts.map(() => null))];
+  return { ...prev, ts: [...prev.ts.slice(start), ...add.ts], fields };
+}
+
+/**
+ * Time-series for one entity over a time span. A live chart of raw samples
+ * (up to 6 hours) asks only for what is newer than its last sample.
+ */
+export function useSeries(table: string, key: string, span: TimeSpan) {
+  const qc = useQueryClient();
+  const queryKey = keys.series(table, key, span);
+  return useQuery({
+    queryKey,
+    queryFn: async ({ signal }) => {
       const [from, to] = spanBounds(span);
-      return get<Series>(`/api/series/${table}${qs({ key, from, to })}`, signal);
+      const url = (from: number) => `/api/series/${table}${qs({ key, from, to })}`;
+      const prev = isFixed(span) ? undefined : qc.getQueryData<Series>(queryKey);
+      const last = prev?.tier === "raw" ? prev.ts.at(-1) : undefined;
+      if (prev && last !== undefined && last >= from) {
+        const add = await get<Series>(url(last + 1), signal);
+        if (add.tier === "raw") return appendSeries(prev, add, from);
+      }
+      return get<Series>(url(from), signal);
     },
     refetchInterval: refreshFor(span, spanLength(span) <= 6 * 3600 ? 15_000 : 300_000),
     placeholderData: keepPreviousData,
   });
+}
 
 export type EventFilter = { device?: Mac; client?: Mac; kind?: string; limit?: number };
 export type LogFilter = { device?: Mac; q?: string; limit?: number };
 
+// The previous list stays up (`isPlaceholderData`) while another filter's loads.
 export const useEvents = (filter: EventFilter) =>
-  useQuery({ queryKey: keys.events(filter), queryFn: ({ signal }) => get<AppEvent[]>(`/api/events${qs(filter)}`, signal) });
+  useQuery({ queryKey: keys.events(filter), queryFn: getting<AppEvent[]>(`/api/events${qs(filter)}`), placeholderData: keepPreviousData });
 
 export const useLogs = (filter: LogFilter) =>
-  useQuery({ queryKey: keys.logs(filter), queryFn: ({ signal }) => get<LogLine[]>(`/api/logs${qs(filter)}`, signal) });
+  useQuery({ queryKey: keys.logs(filter), queryFn: getting<LogLine[]>(`/api/logs${qs(filter)}`), placeholderData: keepPreviousData });
 
 /** A filter's MAC against a message's, as the server compares them (it normalises the filter). */
 const sameMac = (filter: Mac | undefined, mac: Mac | null) => !filter || filter.toLowerCase() === mac?.toLowerCase();
@@ -1041,7 +1070,7 @@ const logMatches = (f: LogFilter, device: Mac | null) => sameMac(f.device, devic
 type LiveMsg =
   | { type: "device"; mac: Mac }
   | { type: "clients" }
-  | ({ type: "event" } & Omit<AppEvent, "id">)
+  | ({ type: "event" } & Pick<AppEvent, "kind" | "device_mac" | "client_mac">)
   | { type: "log"; device_mac: Mac | null }
   | ({ type: "alert"; action: "raised" | "resolved" } & AlertItem)
   | { type: "resync" };
@@ -1064,7 +1093,7 @@ export interface AlertItem {
 }
 
 export const useAlerts = () =>
-  useQuery({ queryKey: keys.alerts(), queryFn: ({ signal }) => get<{ alerts: AlertItem[]; unread: number }>("/api/alerts?limit=50", signal), refetchInterval: 120_000 });
+  useQuery({ queryKey: keys.alerts(), queryFn: getting<{ alerts: AlertItem[]; unread: number }>("/api/alerts?limit=50"), refetchInterval: 120_000 });
 
 export const markAlertsRead = () => send("POST", "/api/alerts/read", {});
 
@@ -1436,10 +1465,10 @@ export interface SiteSettings {
   timezones: string[];
 }
 
-export const useSiteSettings = () => useQuery({ queryKey: keys.settings("site"), queryFn: ({ signal }) => get<SiteSettings>("/api/settings/site", signal), retry: false });
-export const useWlanSettings = () => useQuery({ queryKey: keys.settings("wlans"), queryFn: ({ signal }) => get<WlanSettingsList>("/api/settings/wlans", signal) });
+export const useSiteSettings = () => useQuery({ queryKey: keys.settings("site"), queryFn: getting<SiteSettings>("/api/settings/site"), retry: false });
+export const useWlanSettings = () => useQuery({ queryKey: keys.settings("wlans"), queryFn: getting<WlanSettingsList>("/api/settings/wlans") });
 export const useDeviceSettings = (mac: Mac) =>
-  useQuery({ queryKey: keys.settings("device", mac), queryFn: ({ signal }) => get<DeviceSettings>(`/api/settings/devices/${mac}`, signal), retry: false });
+  useQuery({ queryKey: keys.settings("device", mac), queryFn: getting<DeviceSettings>(`/api/settings/devices/${mac}`), retry: false });
 export const wlanPassphrase = (id: string) => get<{ passphrase: string | null }>(`/api/settings/wlans/${id}/passphrase`);
 
 /** Previews (or, with `save`, saves) a change to an SSID, a speed limit, an AP or the site. */
@@ -1483,7 +1512,7 @@ export interface ChannelAiStatus {
 export const useChannelAi = () =>
   useQuery({
     queryKey: keys.channelAi(),
-    queryFn: ({ signal }) => get<ChannelAiStatus>("/api/rf/channel-ai", signal),
+    queryFn: getting<ChannelAiStatus>("/api/rf/channel-ai"),
     refetchInterval: (q) => (q.state.data?.running || q.state.data?.scans.length ? 5_000 : 60_000),
   });
 export const startScan = (band: string) => send<{ scanning: Mac[] }>("POST", "/api/rf/scan", { band });
@@ -1505,8 +1534,8 @@ export interface UserGroup {
   used_by: string[];
 }
 
-export const useUserGroups = () =>
-  useQuery({ queryKey: keys.settings("usergroups"), queryFn: ({ signal }) => get<{ active: boolean; groups: UserGroup[] }>("/api/settings/usergroups", signal) });
+export const useUserGroups = (enabled = true) =>
+  useQuery({ queryKey: keys.settings("usergroups"), queryFn: getting<{ active: boolean; groups: UserGroup[] }>("/api/settings/usergroups"), enabled });
 export const setClientSpeedLimit = (mac: Mac, usergroup_id: string | null) => send<{ saved: boolean; what: string }>("PUT", `/api/clients/${mac}/speed-limit`, { usergroup_id });
 
 // ---- Adoption ----
@@ -1537,7 +1566,7 @@ export interface AdoptionStatus {
 export const useAdoption = (enabled = true) =>
   useQuery({
     queryKey: keys.adoption(),
-    queryFn: ({ signal }) => get<AdoptionStatus>("/api/devices/pending", signal),
+    queryFn: getting<AdoptionStatus>("/api/devices/pending"),
     enabled,
     refetchInterval: (q) => {
       const d = q.state.data;

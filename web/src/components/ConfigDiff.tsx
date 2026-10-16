@@ -35,14 +35,14 @@ const AREA: Record<string, string> = {
   qos: "QoS",
 };
 
-export interface Change {
+interface Change {
   op: "+" | "-" | "~";
   key: string;
   before?: string;
   after?: string;
 }
 
-export function parseDiff(diff: string): Change[] {
+function parseDiff(diff: string): Change[] {
   const out: Change[] = [];
   for (const line of diff.split("\n")) {
     const m = line.match(/^([~+-]) (.*)$/);

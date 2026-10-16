@@ -12,11 +12,8 @@ export function AdoptionPanel() {
   const [ip, setIp] = useState("");
   const [user, setUser] = useState("");
   const [pass, setPass] = useState("");
-  const { busy, msg, run } = useRunner([
-    keys.adoption(),
-    keys.devices(),
-    keys.events(),
-  ]);
+  // Event lists refetch when the adoption's events arrive.
+  const { busy, msg, run } = useRunner([keys.adoption(), keys.devices()]);
   if (!a.data || !a.data.active || !canEdit) return null;
   const d = a.data;
   const nothing = d.pending.length === 0 && d.adopting.length === 0;

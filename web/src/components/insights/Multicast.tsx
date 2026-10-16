@@ -47,7 +47,7 @@ export const mcastLabel = (type: string, long = false) =>
 export function MulticastPanel({
   mac,
   span,
-  title = "Multicast and broadcast",
+  title,
 }: {
   mac?: string;
   span: TimeSpan;
@@ -62,7 +62,7 @@ export function MulticastPanel({
           data={data}
           mac={mac}
           span={span}
-          title={title}
+          title={title ?? "Multicast and broadcast"}
           dir={dir}
           setDir={setDir}
         />

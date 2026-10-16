@@ -5,7 +5,7 @@ import type { AlertCategory, AlertItem } from "../api";
 import { clock } from "../format";
 import { useDismiss, useRunner } from "./common";
 
-export const CATEGORIES: [AlertCategory, string, string][] = [
+const CATEGORIES: [AlertCategory, string, string][] = [
   [
     "ap_status",
     "AP offline / back online",
@@ -43,7 +43,7 @@ const DEFAULT_PREFS: Prefs = {
 };
 
 /** This browser's notification choices (stored only in this browser). */
-export function loadPrefs(): Prefs {
+function loadPrefs(): Prefs {
   try {
     const raw = localStorage.getItem(PREFS_KEY);
     if (raw)
@@ -61,7 +61,7 @@ export function loadPrefs(): Prefs {
   return DEFAULT_PREFS;
 }
 
-export function savePrefs(p: Prefs) {
+function savePrefs(p: Prefs) {
   try {
     localStorage.setItem(PREFS_KEY, JSON.stringify(p));
   } catch {
@@ -69,7 +69,7 @@ export function savePrefs(p: Prefs) {
   }
 }
 
-export const notificationsSupported = () =>
+const notificationsSupported = () =>
   typeof window !== "undefined" &&
   "Notification" in window &&
   window.isSecureContext;
@@ -138,6 +138,8 @@ export function AlertBell() {
       <button
         className={`bell ${openNow.some((x) => x.severity === "high") ? "bell-bad" : ""}`}
         aria-label={`Alerts, ${unread} unread`}
+        aria-haspopup="dialog"
+        aria-expanded={open}
         onClick={() => setOpen((o) => !o)}
       >
         <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true">

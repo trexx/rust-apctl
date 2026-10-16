@@ -645,18 +645,32 @@ pub async fn list(State(s): State<AppState>, Query(q): Query<ListQuery>) -> Resu
     Ok(Json(json!({ "attempts": list, "roams": r, "ap_names": aps, "client_names": clients })))
 }
 
-/// GET /api/roaming: roams in the window (default two days) and per-AP-pair totals.
-pub async fn roaming(State(s): State<AppState>, Query(q): Query<RangeQuery>) -> Result<Json<Value>, ApiError> {
-    let q = RangeQuery { range: q.range.or(Some(2 * 86400)), ..q };
-    let (from, to, _) = window(&q);
+/// Roams, successful ones and fast (802.11r) ones.
+fn roam_totals(roams: &[Roam]) -> Value {
+    json!({ "roams": roams.len(), "successes": roams.iter().filter(|r| r.success).count(), "fast": roams.iter().filter(|r| r.fast).count() })
+}
+
+#[derive(Deserialize)]
+pub struct RoamingQuery {
+    range: Option<Ts>,
+    from: Option<Ts>,
+    to: Option<Ts>,
+    /// How many of the newest roams to list (default 100); the totals count them all.
+    limit: Option<usize>,
+}
+
+/// GET /api/roaming: the newest roams in the window (default two days), with
+/// totals, per-AP-pair and per-client figures over all of them.
+pub async fn roaming(State(s): State<AppState>, Query(q): Query<RoamingQuery>) -> Result<Json<Value>, ApiError> {
+    let (from, to, _) = window(&RangeQuery { range: q.range.or(Some(2 * 86400)), from: q.from, to: q.to, ..Default::default() });
     let events = load(&s, from, to, None).await?;
     let r = roams(&events);
-    let pairs = roam_pairs(&r);
-    let clients = roam_clients(&r);
+    let (total, pairs, clients) = (roam_totals(&r), roam_pairs(&r), roam_clients(&r));
     let (aps, names) = names(&s, macs_of(&[], &r)).await?;
     let mut list = r;
     list.reverse();
-    Ok(Json(json!({ "from": from, "to": to, "roams": list, "pairs": pairs, "clients": clients, "ap_names": aps, "client_names": names })))
+    list.truncate(q.limit.unwrap_or(100).min(1000));
+    Ok(Json(json!({ "from": from, "to": to, "total": total, "roams": list, "pairs": pairs, "clients": clients, "ap_names": aps, "client_names": names })))
 }
 
 #[cfg(test)]
@@ -729,6 +743,14 @@ mod tests {
         // Over a minute is dropped; DHCP without a later IP time is unknown.
         let t = timings(&serde_json::from_value(json!({ "assoc_delta": 10000, "auth_delta": 20000, "ip_delta": 70_000_000 })).unwrap());
         assert_eq!((t.authentication, t.dhcp), (Some(10.0), None));
+    }
+
+    #[test]
+    fn roam_totals_count_successes_and_fast_roams() {
+        let end = |ap: &str| RoamEnd { ap: ap.into(), essid: None, radio: None, channel: None, bw: None, rssi: None };
+        let roam = |success, fast| Roam { ts: 1, client: "c".into(), from: end("a"), to: end("b"), success, gap_s: None, fast, min_rssi: false, assistant: false };
+        let t = roam_totals(&[roam(true, true), roam(true, false), roam(false, false)]);
+        assert_eq!(t, json!({ "roams": 3, "successes": 2, "fast": 1 }));
     }
 
     #[test]

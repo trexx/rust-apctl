@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { useState } from "react";
 import type { ReactNode } from "react";
 import { Link } from "react-router-dom";
 import { eventData, useDeviceNames, useEvents } from "../api";
@@ -19,10 +19,7 @@ function Push({ e, ap }: { e: AppEvent; ap: ReactNode }) {
   const [open, setOpen] = useState(false);
   const d = eventData<"config_pushed">(e);
   const s = d.system_cfg ?? {};
-  const { changes, groups } = useMemo(
-    () => summarise(eventData<"config_pushed">(e)),
-    [e],
-  );
+  const { changes, groups } = summarise(d);
   const summary = s.baseline
     ? `first config seen (${s.lines} lines)`
     : changes.length === 0

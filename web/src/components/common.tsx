@@ -50,7 +50,7 @@ export function Signal({ dbm }: { dbm: number | null | undefined }) {
 
 export function Meter({
   value,
-  max = 100,
+  max,
 }: {
   value: number | null | undefined;
   max?: number;
@@ -58,7 +58,7 @@ export function Meter({
   const v =
     value === null || value === undefined
       ? 0
-      : Math.min(100, (value / max) * 100);
+      : Math.min(100, (value / (max ?? 100)) * 100);
   const level = v >= 80 ? "high" : v >= 50 ? "mid" : "low";
   return (
     <span
@@ -81,7 +81,7 @@ export function Loading() {
   return <div className="muted pad">Loading…</div>;
 }
 
-export const errorText = (error: unknown) =>
+const errorText = (error: unknown) =>
   error instanceof Error ? error.message : String(error);
 
 export function ErrorNote({ error }: { error: unknown }) {
@@ -95,7 +95,7 @@ export function ErrorNote({ error }: { error: unknown }) {
  */
 export function QueryState<T>({
   q,
-  panel = false,
+  panel,
   children,
 }: {
   q: { data: T | undefined; error: unknown };
@@ -108,7 +108,7 @@ export function QueryState<T>({
 }
 
 /** An action's outcome, shown under its buttons. */
-export type RunResult = { ok: boolean; text: string } | null;
+type RunResult = { ok: boolean; text: string } | null;
 
 /**
  * Runs one action at a time: `busy` while it runs, then its outcome. The
@@ -124,13 +124,16 @@ export function useRunner(refresh: QueryKey[] = [], delay = 0) {
   const run = async (fn: () => Promise<unknown>, done?: string) => {
     setBusy(true);
     setMsg(null);
-    try {
-      const r = await fn();
-      const text = typeof r === "string" && r ? r : done;
-      if (text) setMsg({ ok: true, text });
-    } catch (e) {
-      setMsg({ ok: false, text: errorText(e) });
-    }
+    const outcome = await Promise.resolve()
+      .then(fn)
+      .then(
+        (r): RunResult => {
+          const text = typeof r === "string" && r ? r : done;
+          return text ? { ok: true, text } : null;
+        },
+        (e: unknown): RunResult => ({ ok: false, text: errorText(e) }),
+      );
+    if (outcome) setMsg(outcome);
     const invalidate = () =>
       Promise.all(
         refresh.map((key) => qc.invalidateQueries({ queryKey: key })),
@@ -146,7 +149,7 @@ export function useRunner(refresh: QueryKey[] = [], delay = 0) {
 export function Outcome({
   msg,
   why,
-  inline = false,
+  inline,
 }: {
   msg: RunResult;
   why?: string | null;
@@ -180,7 +183,7 @@ export function useSetParams() {
   const [, setParams] = useSearchParams();
   return (
     changes: Record<string, string | null | undefined>,
-    { replace = false } = {},
+    options?: { replace?: boolean },
   ) =>
     setParams(
       (prev) => {
@@ -191,21 +194,22 @@ export function useSetParams() {
         }
         return next;
       },
-      { replace },
+      { replace: options?.replace },
     );
 }
 
 /**
  * A row of buttons picking one of `options` (none when `value` matches none);
  * `children`, more buttons, follow them. With `tabs`, it switches the page's
- * tabs.
+ * views (in the URL): the current one is marked as the current page rather
+ * than as a pressed button.
  */
 export function Segmented<K extends string | number | boolean>({
   options,
   value,
   onChange,
   label,
-  tabs = false,
+  tabs,
   children,
 }: {
   options: readonly (readonly [K, ReactNode])[];
@@ -216,16 +220,11 @@ export function Segmented<K extends string | number | boolean>({
   children?: ReactNode;
 }) {
   return (
-    <div
-      className="segmented"
-      role={tabs ? "tablist" : "group"}
-      aria-label={label}
-    >
+    <div className="segmented" role="group" aria-label={label}>
       {options.map(([k, text]) => (
         <button
           key={String(k)}
-          role={tabs ? "tab" : undefined}
-          aria-selected={tabs ? value === k : undefined}
+          aria-current={tabs && value === k ? "page" : undefined}
           aria-pressed={tabs ? undefined : value === k}
           className={value === k ? "active" : ""}
           onClick={() => onChange(k)}
@@ -284,13 +283,7 @@ export function ApSelect({
   );
 }
 
-export function DeviceLink({
-  mac,
-  names,
-}: {
-  mac: string | null;
-  names: Names;
-}) {
+function DeviceLink({ mac, names }: { mac: string | null; names: Names }) {
   if (!mac) return <span className="muted">—</span>;
   return <Link to={`/devices/${mac}`}>{names[mac] ?? mac}</Link>;
 }
@@ -670,7 +663,7 @@ export function EventList({
   events,
   names,
   clientNames,
-  showDevice = true,
+  showDevice,
 }: {
   events: AppEvent[];
   names: Names;
@@ -688,7 +681,7 @@ export function EventList({
           e={e}
           names={names}
           clientNames={clientNames}
-          showDevice={showDevice}
+          showDevice={showDevice !== false}
           today={day}
         />
       ))}
@@ -744,7 +737,7 @@ const LogRow = memo(
 export function LogList({
   logs,
   names,
-  showDevice = true,
+  showDevice,
 }: {
   logs: LogLine[];
   names: Names;
@@ -753,13 +746,13 @@ export function LogList({
   if (logs.length === 0) return <div className="muted pad">No log lines</div>;
   const day = today();
   return (
-    <div className={showDevice ? "logs" : "logs logs-no-device"}>
+    <div className={showDevice !== false ? "logs" : "logs logs-no-device"}>
       {logs.map((l) => (
         <LogRow
           key={l.id}
           l={l}
           names={names}
-          showDevice={showDevice}
+          showDevice={showDevice !== false}
           today={day}
         />
       ))}

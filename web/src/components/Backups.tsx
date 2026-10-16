@@ -47,6 +47,13 @@ const fromLocal = (text: string) => {
   return (((h * 60 + m - offsetMin()) % 1440) + 1440) % 1440;
 };
 
+/** Whether apctl answers its health check. */
+const healthy = () =>
+  fetch("/healthz", { cache: "no-store" }).then(
+    (r) => r.ok,
+    () => false,
+  );
+
 /** Waits for apctl to come back after a restore, then reloads the page. */
 function useRestartWatch(active: boolean) {
   useEffect(() => {
@@ -56,14 +63,10 @@ function useRestartWatch(active: boolean) {
     const poll = async () => {
       while (!stop && Date.now() - started < 5 * 60_000) {
         await new Promise((r) => setTimeout(r, 2000));
-        try {
-          const r = await fetch("/healthz", { cache: "no-store" });
-          if (r.ok && Date.now() - started > 4000) {
-            window.location.reload();
-            return;
-          }
-        } catch {
-          // Still restarting.
+        // Not answering yet: still restarting.
+        if ((await healthy()) && Date.now() - started > 4000) {
+          window.location.reload();
+          return;
         }
       }
     };
@@ -202,10 +205,12 @@ function Schedule({
 
 function ConfirmRestore({
   what,
+  busy,
   onConfirm,
   onCancel,
 }: {
   what: React.ReactNode;
+  busy: boolean;
   onConfirm: () => void;
   onCancel: () => void;
 }) {
@@ -218,8 +223,12 @@ function ConfirmRestore({
         need to sign in again.
       </div>
       <div className="backup-row">
-        <button className="btn small primary" onClick={onConfirm}>
-          Restore and restart
+        <button
+          className="btn small primary"
+          disabled={busy}
+          onClick={onConfirm}
+        >
+          {busy ? "Restoring…" : "Restore and restart"}
         </button>
         <button className="btn small" onClick={onCancel}>
           Cancel
@@ -371,6 +380,7 @@ export function BackupSection() {
       {confirm && (
         <ConfirmRestore
           what={confirm.label}
+          busy={busy}
           onCancel={() => setConfirm(null)}
           onConfirm={() =>
             void run(async () => {

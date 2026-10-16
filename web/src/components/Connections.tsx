@@ -23,7 +23,7 @@ const ms = (v: number) =>
       : `${(v / 60000).toFixed(1)} min`;
 
 /** How long each step of joining took: association, authentication, DHCP, DNS. */
-export function TimingBar({ t }: { t: Timings }) {
+function TimingBar({ t }: { t: Timings }) {
   const parts: [string, number | null, string][] = [
     ["Associate", t.association, "seg-assoc"],
     ["Authenticate", t.authentication, "seg-auth"],
@@ -89,12 +89,115 @@ const where = (
     .filter((x) => x && x !== "—")
     .join(" ");
 
+/**
+ * One connection attempt as a table row: time, (with `client`, the client's
+ * name), result, AP, network, signal and time to connect.
+ */
+function AttemptRow({
+  a,
+  apName,
+  client,
+}: {
+  a: ConnAttempt;
+  apName: (mac: string) => string;
+  client?: string;
+}) {
+  return (
+    <tr>
+      <td className="nowrap small">{clock(a.ts)}</td>
+      {client !== undefined && (
+        <td>
+          <Link to={`/clients/${a.client}`}>{client}</Link>
+        </td>
+      )}
+      <td>
+        <Result a={a} />
+        {a.reason && <div className="muted small">AP reason: {a.reason}</div>}
+      </td>
+      <td>
+        <Link to={`/devices/${a.ap}`}>{apName(a.ap)}</Link>
+      </td>
+      <td className="small">
+        {a.essid ?? "—"}
+        <div className="muted">{where(a.radio, a.channel, a.bw)}</div>
+      </td>
+      <td>
+        <Signal dbm={a.rssi} />
+      </td>
+      <td>
+        <TimingBar t={a.timings} />
+      </td>
+    </tr>
+  );
+}
+
+/**
+ * One roam as a table row, in the same columns as `AttemptRow` (`timing`
+ * leaves the time-to-connect column empty).
+ */
+export function RoamRow({
+  r,
+  apName,
+  client,
+  timing,
+}: {
+  r: Roam;
+  apName: (mac: string) => string;
+  client?: string;
+  timing?: boolean;
+}) {
+  return (
+    <tr>
+      <td className="nowrap small">{clock(r.ts)}</td>
+      {client !== undefined && (
+        <td>
+          <Link to={`/clients/${r.client}`}>{client}</Link>
+        </td>
+      )}
+      <td>
+        <span className={`tag ${r.success ? "tag-info" : "tag-bad"}`}>
+          {r.success
+            ? "Roamed"
+            : `Roam failed${r.gap_s ? `, off for ${r.gap_s}s` : ""}`}
+        </span>
+        <div className="muted small">
+          {[
+            r.fast && "fast roaming (802.11r)",
+            r.min_rssi && "pushed by minimum RSSI",
+            r.assistant && "roaming assistant",
+          ]
+            .filter(Boolean)
+            .join(" · ")}
+        </div>
+      </td>
+      <td className="small">
+        <Link to={`/devices/${r.from.ap}`}>{apName(r.from.ap)}</Link> →{" "}
+        <Link to={`/devices/${r.to.ap}`}>{apName(r.to.ap)}</Link>
+      </td>
+      <td className="small">
+        {r.to.essid ?? "—"}
+        <div className="muted">
+          {band(r.from.radio)} → {where(r.to.radio, r.to.channel, r.to.bw)}
+        </div>
+      </td>
+      <td className="nowrap">
+        <Signal dbm={r.from.rssi} /> → <Signal dbm={r.to.rssi} />
+      </td>
+      {timing && <td />}
+    </tr>
+  );
+}
+
+/** A roam's row key. */
+export const roamId = (r: Roam) =>
+  `r-${r.ts}-${r.client}-${r.from.ap}-${r.to.ap}`;
+
 type Item =
   | { kind: "attempt"; ts: number; a: ConnAttempt; key: string }
   | { kind: "roam"; ts: number; r: Roam; key: string };
 
 /** Keys from what identifies each row, numbered when two rows share one. */
-function stableKeys<T>(rows: T[], id: (row: T) => string): string[] {
+export function stableKeys<T>(rows: T[], id: (row: T) => string): string[] {
   const seen = new Map<string, number>();
   return rows.map((row) => {
     const k = id(row);
@@ -142,10 +245,7 @@ function ConnectionTable({
     a.roam && !!roamsTo.get(a.ap)?.some((ts) => Math.abs(ts - a.ts) <= 15);
   const attempts = data.attempts.filter((a) => !isRoamJoin(a));
   const attemptKeys = stableKeys(attempts, attemptId);
-  const roamKeys = stableKeys(
-    data.roams,
-    (r) => `r-${r.ts}-${r.client}-${r.from.ap}-${r.to.ap}`,
-  );
+  const roamKeys = stableKeys(data.roams, roamId);
   const items: Item[] = [
     ...attempts.map((a, i) => ({
       kind: "attempt" as const,
@@ -180,71 +280,15 @@ function ConnectionTable({
         </tr>
       </thead>
       <tbody>
-        {items.slice(0, LOG_ROWS).map((it) =>
-          it.kind === "attempt" ? (
-            <tr key={it.key}>
-              <td className="nowrap small">{clock(it.ts)}</td>
-              <td>
-                <Result a={it.a} />
-                {it.a.reason && (
-                  <div className="muted small">AP reason: {it.a.reason}</div>
-                )}
-              </td>
-              <td>
-                <Link to={`/devices/${it.a.ap}`}>{ap(it.a.ap)}</Link>
-              </td>
-              <td className="small">
-                {it.a.essid ?? "—"}
-                <div className="muted">
-                  {where(it.a.radio, it.a.channel, it.a.bw)}
-                </div>
-              </td>
-              <td>
-                <Signal dbm={it.a.rssi} />
-              </td>
-              <td>
-                <TimingBar t={it.a.timings} />
-              </td>
-            </tr>
-          ) : (
-            <tr key={it.key}>
-              <td className="nowrap small">{clock(it.ts)}</td>
-              <td>
-                <span
-                  className={`tag ${it.r.success ? "tag-info" : "tag-bad"}`}
-                >
-                  {it.r.success
-                    ? "Roamed"
-                    : `Roam failed${it.r.gap_s ? `, off for ${it.r.gap_s}s` : ""}`}
-                </span>
-                <div className="muted small">
-                  {[
-                    it.r.fast && "fast roaming (802.11r)",
-                    it.r.min_rssi && "pushed by minimum RSSI",
-                    it.r.assistant && "roaming assistant",
-                  ]
-                    .filter(Boolean)
-                    .join(" · ")}
-                </div>
-              </td>
-              <td className="small">
-                <Link to={`/devices/${it.r.from.ap}`}>{ap(it.r.from.ap)}</Link>{" "}
-                → <Link to={`/devices/${it.r.to.ap}`}>{ap(it.r.to.ap)}</Link>
-              </td>
-              <td className="small">
-                {it.r.to.essid ?? "—"}
-                <div className="muted">
-                  {band(it.r.from.radio)} →{" "}
-                  {where(it.r.to.radio, it.r.to.channel, it.r.to.bw)}
-                </div>
-              </td>
-              <td className="nowrap">
-                <Signal dbm={it.r.from.rssi} /> → <Signal dbm={it.r.to.rssi} />
-              </td>
-              <td />
-            </tr>
-          ),
-        )}
+        {items
+          .slice(0, LOG_ROWS)
+          .map((it) =>
+            it.kind === "attempt" ? (
+              <AttemptRow key={it.key} a={it.a} apName={ap} />
+            ) : (
+              <RoamRow key={it.key} r={it.r} apName={ap} timing />
+            ),
+          )}
       </tbody>
     </table>
   );
@@ -258,7 +302,7 @@ const WHICH = [
 /** Connection attempts across the site, newest first. */
 export function AttemptList({ span }: { span: TimeSpan }) {
   const [failed, setFailed] = useState(false);
-  const c = useConnections(span, { failed, limit: ATTEMPT_ROWS });
+  const c = useConnections(span, { failed, limit: ATTEMPT_ROWS, roams: false });
   return (
     <div className="panel">
       <div className="panel-head">
@@ -313,32 +357,12 @@ function AttemptTable({
         </thead>
         <tbody>
           {data.attempts.map((a, i) => (
-            <tr key={keys[i]}>
-              <td className="nowrap small">{clock(a.ts)}</td>
-              <td>
-                <Link to={`/clients/${a.client}`}>
-                  {data.client_names[a.client] ?? a.client}
-                </Link>
-              </td>
-              <td>
-                <Result a={a} />
-              </td>
-              <td>
-                <Link to={`/devices/${a.ap}`}>
-                  {data.ap_names[a.ap] ?? a.ap}
-                </Link>
-              </td>
-              <td className="small">
-                {a.essid ?? "—"}
-                <div className="muted">{where(a.radio, a.channel, a.bw)}</div>
-              </td>
-              <td>
-                <Signal dbm={a.rssi} />
-              </td>
-              <td>
-                <TimingBar t={a.timings} />
-              </td>
-            </tr>
+            <AttemptRow
+              key={keys[i]}
+              a={a}
+              apName={(m) => data.ap_names[m] ?? m}
+              client={data.client_names[a.client] ?? a.client}
+            />
           ))}
         </tbody>
       </table>

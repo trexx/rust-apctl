@@ -1,4 +1,4 @@
-import { Suspense, lazy } from "react";
+import { Suspense } from "react";
 import { Link } from "react-router-dom";
 import { useWlans } from "../api";
 import type { Wlan } from "../api";
@@ -13,17 +13,16 @@ import {
 } from "../components/Chart";
 import { QueryState, Signal } from "../components/common";
 import { spanText } from "../components/insights/shared";
+import { lazyNamed } from "../lazy";
 
 // The settings editor is large: load it on demand.
-const WlanSettingsPanel = lazy(() =>
-  import("../components/SettingsEditor").then((m) => ({
-    default: m.WlanSettingsPanel,
-  })),
+const WlanSettingsPanel = lazyNamed(
+  () => import("../components/SettingsEditor"),
+  "WlanSettingsPanel",
 );
-const SpeedLimitsPanel = lazy(() =>
-  import("../components/SettingsEditor").then((m) => ({
-    default: m.SpeedLimitsPanel,
-  })),
+const SpeedLimitsPanel = lazyNamed(
+  () => import("../components/SettingsEditor"),
+  "SpeedLimitsPanel",
 );
 
 /** Experience bands as the official controller colours them: 90+ excellent, 70+ good. */

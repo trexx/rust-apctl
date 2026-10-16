@@ -7,9 +7,9 @@ import {
   setAlias,
   useCanEdit,
   useClients,
+  useClientsSelect,
   useClient,
   useDeviceNames,
-  useDevices,
   useEvents,
   useSeries,
 } from "../api";
@@ -36,18 +36,26 @@ import { ConnectionLog } from "../components/Connections";
 import { ClientActions } from "../components/Actions";
 import type { ClientView, Multicast } from "../api";
 
+/** Keyed by MAC: nothing typed or shown for one client carries over to the next. */
 export function Client() {
-  const { mac = "" } = useParams();
+  const mac = useParams().mac ?? "";
+  return <ClientPage key={mac} mac={mac} />;
+}
+
+function ClientPage({ mac }: { mac: string }) {
   const [range, setRange] = useTimeSpan(6 * 3600);
   const client = useClient(mac);
-  const devices = useDevices();
   const names = useDeviceNames();
   const c = client.data;
   const s = c?.sample;
   // The whole list is only needed for a client not seen in this run (it has
-  // its stored name and alias there) and for multicast group peers.
-  const clients = useClients(client.isError || !!s?.multicast);
+  // its stored name and alias there), and for the peers in its multicast groups.
+  const clients = useClients(client.isError);
   const listed = clients.data?.find((x) => x.sample.mac === mac);
+  const members = useClientsSelect(
+    groupMembers,
+    (s?.multicast?.memberships.length ?? 0) > 0,
+  ).data;
   const events = useEvents({ client: mac, limit: 100 });
   const series = useSeries("client", mac, range);
 
@@ -80,7 +88,7 @@ export function Client() {
             connected={c?.connected ?? false}
             blocked={v?.blocked ?? false}
             lockedTo={v?.locked_to ?? null}
-            aps={devices.data ?? []}
+            aps={names}
             usergroupId={v?.usergroup_id ?? null}
           />
           {v?.blocked && (
@@ -228,11 +236,7 @@ export function Client() {
           </QueryState>
 
           {s?.multicast && (
-            <ClientMulticast
-              mac={mac}
-              m={s.multicast}
-              all={clients.data ?? []}
-            />
+            <ClientMulticast mac={mac} m={s.multicast} members={members} />
           )}
 
           <h2>Connection log</h2>
@@ -344,15 +348,30 @@ function AliasHeader(p: {
   );
 }
 
+/** The clients in each multicast group, by group (a `useClientsSelect` select: once per fetch). */
+function groupMembers(
+  clients: ClientView[],
+): ReadonlyMap<string, ClientView[]> {
+  const by = new Map<string, ClientView[]>();
+  for (const c of clients)
+    for (const g of c.sample.multicast?.memberships ?? []) {
+      const list = by.get(g);
+      if (list) list.push(c);
+      else by.set(g, [c]);
+    }
+  return by;
+}
+
 /** What this client sends and receives as multicast/broadcast, from the AP's latest report. */
 function ClientMulticast({
   mac,
   m,
-  all,
+  members,
 }: {
   mac: string;
   m: Multicast;
-  all: ClientView[];
+  /** `groupMembers` of every client; undefined while loading. */
+  members: ReadonlyMap<string, ClientView[]> | undefined;
 }) {
   const types = Object.entries(m.types)
     .filter(([, c]) => c.tx_pkts + c.rx_pkts > 0)
@@ -361,12 +380,8 @@ function ClientMulticast({
     );
   // Other clients that joined the same groups.
   const peers = (group: string) =>
-    all
-      .filter(
-        (c) =>
-          c.sample.mac !== mac &&
-          c.sample.multicast?.memberships.includes(group),
-      )
+    (members?.get(group) ?? [])
+      .filter((c) => c.sample.mac !== mac)
       .map(displayName);
   const services = serviceNames(m.services);
   return (

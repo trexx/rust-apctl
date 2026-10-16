@@ -3,7 +3,6 @@ import {
   useContext,
   useEffect,
   useLayoutEffect,
-  useMemo,
   useRef,
   useState,
 } from "react";
@@ -56,7 +55,7 @@ export const COLORS = {
   teal: "#2aa3b8",
 };
 
-export interface ChartSeries {
+interface ChartSeries {
   label: string;
   /** Missing (a field the server didn't send) draws nothing. */
   values: (number | null)[] | undefined;
@@ -310,7 +309,7 @@ export function Chart({
   );
 }
 
-export const RANGES: { label: string; seconds: number }[] = [
+const RANGES: { label: string; seconds: number }[] = [
   { label: "1h", seconds: 3600 },
   { label: "6h", seconds: 6 * 3600 },
   { label: "24h", seconds: 86400 },
@@ -345,15 +344,12 @@ export function useTimeSpan(
   const from = Number(params.get("from"));
   const to = Number(params.get("to"));
   const range = Number(params.get("range"));
-  const span = useMemo<TimeSpan>(
-    () =>
-      from > 0 && to > from
-        ? { from, to }
-        : range > 0
-          ? { last: range }
-          : { last: defaultLast },
-    [from, to, range, defaultLast],
-  );
+  const span: TimeSpan =
+    from > 0 && to > from
+      ? { from, to }
+      : range > 0
+        ? { last: range }
+        : { last: defaultLast };
   const set = (s: TimeSpan) =>
     setUrl(
       isFixed(s)

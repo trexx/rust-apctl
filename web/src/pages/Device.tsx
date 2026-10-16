@@ -1,4 +1,4 @@
-import { Suspense, lazy } from "react";
+import { Suspense } from "react";
 import { Link, useParams } from "react-router-dom";
 import {
   displayName,
@@ -46,16 +46,21 @@ import {
   VapTable,
 } from "../components/DeviceRadios";
 import { DeviceActions } from "../components/Actions";
+import { lazyNamed } from "../lazy";
 
 // The settings editor is large and only used by those who can edit: load it on demand.
-const DeviceSettingsPanel = lazy(() =>
-  import("../components/SettingsEditor").then((m) => ({
-    default: m.DeviceSettingsPanel,
-  })),
+const DeviceSettingsPanel = lazyNamed(
+  () => import("../components/SettingsEditor"),
+  "DeviceSettingsPanel",
 );
 
+/** Keyed by MAC: nothing typed or shown for one AP carries over to the next. */
 export function Device() {
-  const { mac = "" } = useParams();
+  const mac = useParams().mac ?? "";
+  return <DevicePage key={mac} mac={mac} />;
+}
+
+function DevicePage({ mac }: { mac: string }) {
   const [range, setRange] = useTimeSpan(6 * 3600);
   const detail = useDevice(mac);
 

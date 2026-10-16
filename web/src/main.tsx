@@ -1,11 +1,4 @@
-import {
-  Component,
-  StrictMode,
-  Suspense,
-  lazy,
-  useEffect,
-  useState,
-} from "react";
+import { Component, StrictMode, Suspense, useEffect, useState } from "react";
 import type { ReactNode } from "react";
 import { createRoot } from "react-dom/client";
 import {
@@ -37,27 +30,16 @@ import { Logs } from "./pages/Logs";
 import { Networks } from "./pages/Networks";
 import { AlertBell, useNotifier } from "./components/Alerts";
 import { Loading, Outcome, useRunner } from "./components/common";
+import { lazyNamed } from "./lazy";
 import "./styles.css";
 
 // Pages that are seldom opened, or large, load on demand.
-const Device = lazy(() =>
-  import("./pages/Device").then((m) => ({ default: m.Device })),
-);
-const Client = lazy(() =>
-  import("./pages/Client").then((m) => ({ default: m.Client })),
-);
-const Settings = lazy(() =>
-  import("./pages/Settings").then((m) => ({ default: m.Settings })),
-);
-const Radios = lazy(() =>
-  import("./pages/Radios").then((m) => ({ default: m.Radios })),
-);
-const Config = lazy(() =>
-  import("./pages/Config").then((m) => ({ default: m.Config })),
-);
-const DryRunPage = lazy(() =>
-  import("./pages/DryRun").then((m) => ({ default: m.DryRunPage })),
-);
+const Device = lazyNamed(() => import("./pages/Device"), "Device");
+const Client = lazyNamed(() => import("./pages/Client"), "Client");
+const Settings = lazyNamed(() => import("./pages/Settings"), "Settings");
+const Radios = lazyNamed(() => import("./pages/Radios"), "Radios");
+const Config = lazyNamed(() => import("./pages/Config"), "Config");
+const DryRunPage = lazyNamed(() => import("./pages/DryRun"), "DryRunPage");
 
 const queryClient = new QueryClient({
   defaultOptions: {

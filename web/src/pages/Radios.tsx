@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { useState } from "react";
 import { Link } from "react-router-dom";
 import { useChannelPlan, useNeighbors, useRadios } from "../api";
 import type { Neighbor, RadioOverview } from "../api";
@@ -345,6 +345,45 @@ function Channels() {
   );
 }
 
+/** What the occupancy chart draws: the networks heard (our own with `showOwn`) and our radios on `band`. */
+function occupancy(
+  neighbors: Neighbor[],
+  radios: RadioOverview[],
+  band: string,
+  showOwn: boolean,
+): Shape[] {
+  const out: Shape[] = [];
+  for (const nb of neighbors) {
+    if (nb.channel === null || nb.signal === null) continue;
+    if (nb.is_unifi && nb.ap_name && !showOwn) continue;
+    const w = nb.bw ?? 20;
+    out.push({
+      key: nb.bssid + nb.ap_mac,
+      label: nb.essid || "hidden network",
+      freq:
+        nb.center_freq && nb.bw && nb.bw > 20
+          ? nb.center_freq
+          : centre(nb.channel, w, nb.radio),
+      width: w,
+      signal: nb.best_signal ?? nb.signal,
+      own: false,
+    });
+  }
+  for (const radio of radios) {
+    if (radio.radio !== band || radio.channel === null) continue;
+    out.push({
+      key: `own-${radio.mac}`,
+      label: `${radio.name ?? radio.mac} (yours)`,
+      freq: centre(radio.channel, radio.bw, radio.radio),
+      width: radio.bw ?? 20,
+      // Our APs are drawn at the level our clients hear them at.
+      signal: radio.avg_client_signal ?? -50,
+      own: true,
+    });
+  }
+  return out;
+}
+
 function Environment() {
   const [band, setBand] = useState<"ng" | "na">("na");
   const [q, setQ] = useState("");
@@ -352,58 +391,29 @@ function Environment() {
   const n = useNeighbors(7 * 86400, band);
   const r = useRadios(86400);
 
-  const shapes = useMemo<Shape[]>(() => {
-    const out: Shape[] = [];
-    for (const nb of n.data?.neighbors ?? []) {
-      if (nb.channel === null || nb.signal === null) continue;
-      if (nb.is_unifi && nb.ap_name && !showOwn) continue;
-      const w = nb.bw ?? 20;
-      out.push({
-        key: nb.bssid + nb.ap_mac,
-        label: nb.essid || "hidden network",
-        freq:
-          nb.center_freq && nb.bw && nb.bw > 20
-            ? nb.center_freq
-            : centre(nb.channel, w, nb.radio),
-        width: w,
-        signal: nb.best_signal ?? nb.signal,
-        own: false,
-      });
-    }
-    for (const radio of r.data ?? []) {
-      if (radio.radio !== band || radio.channel === null) continue;
-      out.push({
-        key: `own-${radio.mac}`,
-        label: `${radio.name ?? radio.mac} (yours)`,
-        freq: centre(radio.channel, radio.bw, radio.radio),
-        width: radio.bw ?? 20,
-        // Our APs are drawn at the level our clients hear them at.
-        signal: radio.avg_client_signal ?? -50,
-        own: true,
-      });
-    }
-    return out;
-  }, [n.data, r.data, band, showOwn]);
-
-  const list = useMemo(() => {
-    const term = q.trim().toLowerCase();
-    return (n.data?.neighbors ?? [])
-      .filter(
-        (x) =>
-          !term ||
-          [x.essid, x.bssid, x.vendor, x.nearest_ap].some((v) =>
-            v?.toLowerCase().includes(term),
-          ),
-      )
-      .sort((a, b) => (b.best_signal ?? -200) - (a.best_signal ?? -200));
-  }, [n.data, q]);
-
+  const shapes = occupancy(
+    n.data?.neighbors ?? [],
+    r.data ?? [],
+    band,
+    showOwn,
+  );
+  const term = q.trim().toLowerCase();
+  const list = (n.data?.neighbors ?? [])
+    .filter(
+      (x) =>
+        !term ||
+        [x.essid, x.bssid, x.vendor, x.nearest_ap].some((v) =>
+          v?.toLowerCase().includes(term),
+        ),
+    )
+    .sort((a, b) => (b.best_signal ?? -200) - (a.best_signal ?? -200));
   // One row per network, merged across our APs that heard it.
-  const unique = useMemo(() => {
-    const m = new Map<string, Neighbor>();
-    for (const x of list) if (!m.has(x.bssid)) m.set(x.bssid, x);
-    return [...m.values()];
-  }, [list]);
+  const seen = new Set<string>();
+  const unique = list.filter((x) => {
+    if (seen.has(x.bssid)) return false;
+    seen.add(x.bssid);
+    return true;
+  });
 
   return (
     <>

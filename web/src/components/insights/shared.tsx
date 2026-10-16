@@ -8,7 +8,7 @@ const BANDS = [["all", "All radios"] as const, ...RADIOS];
 export function BandPicker({
   value,
   onChange,
-  all = true,
+  all,
 }: {
   value: string;
   onChange: (b: string) => void;
@@ -17,7 +17,7 @@ export function BandPicker({
   return (
     <Segmented
       label="Band"
-      options={all ? BANDS : RADIOS}
+      options={all !== false ? BANDS : RADIOS}
       value={value}
       onChange={onChange}
     />
@@ -67,7 +67,7 @@ const pos = (s: number) =>
 /** Pins on a signal scale; pins in the same 3 dB step stack upwards. */
 export function DensityStrip({
   pins,
-  reverse = false,
+  reverse,
 }: {
   pins: DensityPin[];
   /** Colour the scale for "louder is worse" (AP spacing). */
