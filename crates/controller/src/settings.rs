@@ -35,9 +35,7 @@ pub type Apply<B> = fn(&mut Value, &B) -> Result<String, String>;
 pub(crate) async fn change<B: Send + 'static>(s: &AppState, q: &PreviewQuery, apply: Apply<B>, body: B) -> Result<Json<Value>, ApiError> {
     if q.preview {
         let current = crate::api::current_state(s)?;
-        let mut edited = (*current).clone();
-        let what = apply(&mut edited, &body).map_err(|e| ApiError(StatusCode::BAD_REQUEST, e))?;
-        return Ok(Json(json!({ "what": what, "aps": preview(s, current, edited).await? })));
+        return Ok(Json(preview(s, current, move |state| apply(state, &body)).await?));
     }
     if !s.active {
         return Err(ApiError(StatusCode::CONFLICT, "saving needs active mode: in shadow mode the settings belong to the other controller".into()));
@@ -48,10 +46,11 @@ pub(crate) async fn change<B: Send + 'static>(s: &AppState, q: &PreviewQuery, ap
     Ok(Json(json!({ "saved": true, "what": what })))
 }
 
-/// What each reporting AP's config would become, as config-push summaries.
-/// What rendering needs is copied out of `live` first, and the rendering
-/// (twice per AP) runs off the async workers without the lock.
-async fn preview(s: &AppState, before: Arc<Value>, after: Value) -> Result<Vec<Value>, ApiError> {
+/// What `edit` changes in words, and what each reporting AP's config would
+/// become, as config-push summaries. What rendering needs is copied out of
+/// `live` first; copying the settings, the edit (some hash passwords) and the
+/// rendering (twice per AP) run off the async workers without the lock.
+async fn preview(s: &AppState, before: Arc<Value>, edit: impl FnOnce(&mut Value) -> Result<String, String> + Send + 'static) -> Result<Value, ApiError> {
     let render = s.renderer.clone();
     let aps: Vec<_> = {
         let live = s.live.read().unwrap();
@@ -61,6 +60,8 @@ async fn preview(s: &AppState, before: Arc<Value>, after: Value) -> Result<Vec<V
             .collect()
     };
     let work = move || {
+        let mut after = (*before).clone();
+        let what = edit(&mut after).map_err(|e| ApiError(StatusCode::BAD_REQUEST, e))?;
         let mut out = Vec::new();
         for (mac, inform, cfgversion, name, radios) in &aps {
             let mac_s = mac.to_string();
@@ -78,9 +79,9 @@ async fn preview(s: &AppState, before: Arc<Value>, after: Value) -> Result<Vec<V
                 (_, Err(e)) | (Err(e), _) => out.push(json!({ "mac": mac, "name": name, "error": format!("{e:#}") })),
             }
         }
-        out
+        Ok(json!({ "what": what, "aps": out }))
     };
-    Ok(tokio::task::spawn_blocking(work).await?)
+    tokio::task::spawn_blocking(work).await?
 }
 
 /// Fields of an SSID the editor shows and edits (secrets are never listed).
