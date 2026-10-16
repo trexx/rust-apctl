@@ -131,35 +131,31 @@ pub struct ConnEvent {
 /// Connection stages in the order a client passes them.
 pub const STAGES: [&str; 6] = ["association", "authentication", "dhcp", "dns", "traffic", "success"];
 
-/// Failure counters present in a report, as (stage 1-5, label).
-fn failures(n: &ConnDetail) -> Vec<(usize, &'static str)> {
-    let pos = |f: &Option<Field>| num(f).is_some_and(|v| v > 0.0);
-    let mut out = Vec::new();
-    if pos(&n.assoc_failures) {
-        out.push((1, "Association"));
-    }
-    if pos(&n.auth_failures) {
-        out.push((2, "Authentication"));
-    }
-    if pos(&n.wpa_auth_failures) {
-        out.push((2, "WPA authentication"));
-    }
-    if text(&n.radius_auth_status) == Some("failure") {
-        out.push((2, "RADIUS authentication"));
-    }
-    if pos(&n.ip_failures) {
-        out.push((3, "DHCP timeout"));
-    }
-    if pos(&n.dns_timeouts) {
-        out.push((4, "DNS timeout"));
-    }
-    if text(&n.dns_resp_seen) == Some("no") {
-        out.push((4, "DNS response not seen"));
-    }
-    if pos(&n.traffic_failures) {
-        out.push((5, "Traffic failure"));
-    }
-    out
+/// A counter above zero.
+fn pos(f: &Option<Field>) -> bool {
+    num(f).is_some_and(|v| v > 0.0)
+}
+
+/// Whether a report shows a failure.
+type Shows = fn(&ConnDetail) -> bool;
+
+/// The failures a report can show, as (stage 1-5, label, whether it shows
+/// it), by stage. Within a stage the later one wins: WPA over plain
+/// authentication, RADIUS over both, a missing DNS response over a timeout.
+const FAILURES: [(usize, &str, Shows); 8] = [
+    (1, "Association", |n| pos(&n.assoc_failures)),
+    (2, "Authentication", |n| pos(&n.auth_failures)),
+    (2, "WPA authentication", |n| pos(&n.wpa_auth_failures)),
+    (2, "RADIUS authentication", |n| text(&n.radius_auth_status) == Some("failure")),
+    (3, "DHCP timeout", |n| pos(&n.ip_failures)),
+    (4, "DNS timeout", |n| pos(&n.dns_timeouts)),
+    (4, "DNS response not seen", |n| text(&n.dns_resp_seen) == Some("no")),
+    (5, "Traffic failure", |n| pos(&n.traffic_failures)),
+];
+
+/// The furthest failure a report shows, as (stage, label).
+fn failure(n: &ConnDetail) -> Option<(usize, &'static str)> {
+    FAILURES.iter().rev().find(|f| (f.2)(n)).map(|f| (f.0, f.1))
 }
 
 /// A soft failure that kept its IP by roaming.
@@ -168,7 +164,6 @@ fn roamed(event_type: &str, n: &ConnDetail) -> bool {
 }
 
 fn succeeded(event_type: &str, n: &ConnDetail) -> bool {
-    let pos = |f: &Option<Field>| num(f).is_some_and(|v| v > 0.0);
     event_type != "failure"
         && (roamed(event_type, n) || (n.traffic_delta.is_none() && text(&n.dns_resp_seen) == Some("yes")) || (pos(&n.traffic_delta) && pos(&n.dns_responses)))
 }
@@ -263,8 +258,8 @@ pub fn attempts(mut events: Vec<ConnEvent>) -> Vec<Attempt> {
                 if rssi.is_some_and(|r| r < -75.0) {
                     return None;
                 }
-                let worst = *failures(n).iter().max_by_key(|f| f.0)?;
-                (worst.0, Some(worst.1))
+                let (stage, label) = failure(n)?;
+                (stage, Some(label))
             };
             Some(Attempt {
                 ts: e.ts,
@@ -727,6 +722,16 @@ mod tests {
         assert_eq!(v["success_pct"].as_f64(), Some(67.0));
         assert_eq!(v["failed_at"]["dns"], 1);
         assert_eq!(connectivity_stats(&list, Some("ng"))["clients"], 0);
+    }
+
+    #[test]
+    fn a_failure_is_placed_at_its_furthest_and_most_specific_stage() {
+        let f = |n: Value| failure(&serde_json::from_value(n).unwrap());
+        assert_eq!(f(json!({ "auth_failures": 1, "wpa_auth_failures": 2 })), Some((2, "WPA authentication")));
+        assert_eq!(f(json!({ "wpa_auth_failures": 2, "radius_auth_status": "failure", "assoc_failures": 1 })), Some((2, "RADIUS authentication")));
+        assert_eq!(f(json!({ "dns_timeouts": 1, "dns_resp_seen": "no" })), Some((4, "DNS response not seen")));
+        assert_eq!(f(json!({ "assoc_failures": 1, "traffic_failures": 1 })), Some((5, "Traffic failure")));
+        assert_eq!(f(json!({ "dns_timeouts": 0, "dns_resp_seen": "yes" })), None);
     }
 
     #[test]
