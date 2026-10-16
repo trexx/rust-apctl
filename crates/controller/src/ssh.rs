@@ -6,7 +6,8 @@
 //! `/usr/bin/syswrapper.sh set-adopt <inform url> <key>`: the AP then informs
 //! here with its new key. apctl first reads the AP's MAC (and model) so it can
 //! create its record and key. The host key is accepted the first time and
-//! kept (`x_ssh_hostkey_fingerprint`).
+//! kept (`x_ssh_hostkey_fingerprint`). For an AP apctl already knows at that
+//! address, the kept key is checked before any password is sent.
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -115,23 +116,47 @@ async fn connect(ip: &str, port: u16, logins: &[(String, String)], expected: Opt
 }
 
 impl Session {
-    /// Runs a command and returns what it printed.
+    /// Runs a command and returns what it printed; an error if it exited
+    /// non-zero or didn't finish in time.
     async fn run(&mut self, cmd: &str) -> Result<String, Failure> {
         let mut ch = self.handle.channel_open_session().await.map_err(|e| Failure::Command(e.to_string()))?;
         ch.exec(true, cmd).await.map_err(|e| Failure::Command(e.to_string()))?;
         let mut out = Vec::new();
+        let mut status = None;
         let read = async {
+            // The exit status comes after the end of the output, so read until the channel closes.
             while let Some(msg) = ch.wait().await {
                 match msg {
                     russh::ChannelMsg::Data { data } => out.extend_from_slice(&data),
-                    russh::ChannelMsg::Eof | russh::ChannelMsg::Close => break,
+                    russh::ChannelMsg::ExitStatus { exit_status } => status = Some(exit_status),
+                    russh::ChannelMsg::Close => break,
                     _ => {}
                 }
             }
         };
-        let _ = tokio::time::timeout(Duration::from_secs(15), read).await;
-        Ok(String::from_utf8_lossy(&out).into_owned())
+        if tokio::time::timeout(Duration::from_secs(15), read).await.is_err() {
+            return Err(Failure::Command("timed out".into()));
+        }
+        let out = String::from_utf8_lossy(&out).into_owned();
+        match status {
+            Some(code) if code != 0 => Err(Failure::Command(format!("exit status {code}: {}", out.trim()))),
+            _ => Ok(out),
+        }
     }
+}
+
+/// A word for the AP's shell, in single quotes.
+fn shell_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', r"'\''"))
+}
+
+/// The host key apctl kept for an AP it knows at this address (its record's
+/// IP, or the address it informs from), and that AP.
+fn known_host_key(live: &crate::engine::Live, ip: &str) -> Option<(Mac, String)> {
+    let state = live.state.as_deref()?;
+    let fingerprint = |mac: &Mac| crate::adopt::device_doc(state, mac).and_then(|d| d["x_ssh_hostkey_fingerprint"].as_str()).map(str::to_string);
+    let by_record = state["devices"].as_array()?.iter().filter(|d| d["ip"].as_str() == Some(ip)).filter_map(|d| d["mac"].as_str()?.parse::<Mac>().ok());
+    live.by_ip.get(ip).copied().into_iter().chain(by_record).find_map(|mac| Some((mac, fingerprint(&mac)?)))
 }
 
 /// A MAC written with or without separators.
@@ -195,15 +220,24 @@ pub async fn adopt(State(s): State<AppState>, headers: HeaderMap, Json(b): Json<
         _ => None,
     };
     let bad = |f: Failure| ApiError(StatusCode::BAD_GATEWAY, f.to_string());
-    // A known AP keeps its host key; a new one is trusted the first time.
-    let mut session = connect(&b.ip, b.port.unwrap_or(22), &logins(state.as_deref(), given.clone()), None).await.map_err(bad)?;
+    // A known AP keeps its host key, checked before any password is sent; a new one is trusted the first time.
+    let expected = known_host_key(&s.live.read().unwrap(), &b.ip);
+    let connected = connect(&b.ip, b.port.unwrap_or(22), &logins(state.as_deref(), given.clone()), expected.as_ref().map(|e| e.1.clone())).await;
+    let mut session = match (connected, &expected) {
+        (Err(Failure::HostKey), Some((mac, _))) => {
+            let _ = s.engine.send(Input::Note { ts: store::now_ts(), kind: "ap_host_key_mismatch", mac: *mac, data: json!({ "ip": b.ip }) }).await;
+            return Err(bad(Failure::HostKey));
+        }
+        (r, _) => r.map_err(bad)?,
+    };
     let board = session.run("cat /etc/board.info").await.unwrap_or_default();
     let eth0 = session.run("cat /sys/class/net/eth0/address").await.unwrap_or_default();
     let mac = parse_mac(&eth0)
         .or_else(|| board_value(&board, "board.hwaddr").and_then(parse_mac))
         .ok_or_else(|| ApiError(StatusCode::BAD_GATEWAY, "could not read the AP's MAC address: is this a UniFi AP?".into()))?;
-    let known = state.as_deref().and_then(|st| crate::adopt::device_doc(st, &mac).cloned());
-    if let (Some(k), Some(seen)) = (known.as_ref().and_then(|d| d["x_ssh_hostkey_fingerprint"].as_str()), &session.fingerprint)
+    // An AP apctl knows by its MAC but not at this address: check its key too.
+    let known = state.as_deref().and_then(|st| crate::adopt::device_doc(st, &mac));
+    if let (Some(k), Some(seen)) = (known.and_then(|d| d["x_ssh_hostkey_fingerprint"].as_str()), &session.fingerprint)
         && k != seen
     {
         let _ = s.engine.send(Input::Note { ts: store::now_ts(), kind: "ap_host_key_mismatch", mac, data: json!({ "ip": b.ip }) }).await;
@@ -215,11 +249,10 @@ pub async fn adopt(State(s): State<AppState>, headers: HeaderMap, Json(b): Json<
         "hostname": board_value(&board, "board.name"), "inform_url": url,
     });
     let fingerprint = session.fingerprint.clone();
-    let body = json!({ "mac": mac.to_string(), "payload": payload });
     crate::actions::edit_settings(&s, format!("adopting {mac} over SSH"), move |st| {
-        crate::adopt::add_device(st, &body)?;
-        let d = st["devices"].as_array_mut().and_then(|l| l.iter_mut().find(|d| d["mac"].as_str().is_some_and(|m| m.eq_ignore_ascii_case(body["mac"].as_str().unwrap_or_default())))).ok_or("no record")?;
-        d["inform_url"] = body["payload"]["inform_url"].clone();
+        crate::adopt::adopt_device(st, &mac, &payload)?;
+        let d = crate::adopt::device_doc_mut(st, &mac).ok_or("no record")?;
+        d["inform_url"] = payload["inform_url"].clone();
         if let Some(fp) = &fingerprint
             && d["x_ssh_hostkey_fingerprint"].is_null()
         {
@@ -233,7 +266,7 @@ pub async fn adopt(State(s): State<AppState>, headers: HeaderMap, Json(b): Json<
         live.state.as_deref().and_then(|st| crate::adopt::device_doc(st, &mac)).and_then(|d| d["x_authkey"].as_str().map(str::to_string))
     }
     .ok_or_else(|| ApiError::internal("the new record has no key"))?;
-    let out = session.run(&format!("/usr/bin/syswrapper.sh set-adopt {url} {key}")).await.map_err(bad)?;
+    let out = session.run(&format!("/usr/bin/syswrapper.sh set-adopt {} {}", shell_quote(&url), shell_quote(&key))).await.map_err(bad)?;
     s.live.write().unwrap().adoption.adopting.insert(mac, store::now_ts());
     let _ = s.engine.send(Input::Note { ts: store::now_ts(), kind: "ap_adopting", mac, data: json!({ "ip": b.ip, "via": "ssh" }) }).await;
     tracing::info!("{mac}: set-adopt {url} sent over SSH ({})", out.trim());
@@ -284,5 +317,27 @@ mod tests {
         assert_eq!(parse_mac("02AB0000009A").map(|m| m.to_string()).as_deref(), Some("02:ab:00:00:00:9a"));
         assert_eq!(parse_mac("02:ab:00:00:00:9a\n").map(|m| m.to_string()).as_deref(), Some("02:ab:00:00:00:9a"));
         assert!(parse_mac("cat: no such file").is_none());
+    }
+
+    #[test]
+    fn shell_words_are_quoted() {
+        assert_eq!(shell_quote("http://192.0.2.1:8080/inform"), "'http://192.0.2.1:8080/inform'");
+        assert_eq!(shell_quote("http://x/$(reboot);a'b"), r"'http://x/$(reboot);a'\''b'");
+    }
+
+    #[test]
+    fn host_keys_of_aps_known_at_an_address() {
+        let ap: Mac = "02:00:00:00:00:01".parse().unwrap();
+        let state = json!({ "devices": [
+            { "mac": "02:00:00:00:00:01", "ip": "192.0.2.5", "x_ssh_hostkey_fingerprint": "SHA256:abc" },
+            { "mac": "02:00:00:00:00:02", "ip": "192.0.2.6" },
+        ] });
+        let mut live = crate::engine::Live { state: Some(std::sync::Arc::new(state)), ..Default::default() };
+        assert_eq!(known_host_key(&live, "192.0.2.5"), Some((ap, "SHA256:abc".into())));
+        assert_eq!(known_host_key(&live, "192.0.2.6"), None, "no key kept yet");
+        assert_eq!(known_host_key(&live, "192.0.2.7"), None);
+        // An AP that informs from another address than its record says.
+        live.by_ip.insert("192.0.2.7".into(), ap);
+        assert_eq!(known_host_key(&live, "192.0.2.7"), Some((ap, "SHA256:abc".into())));
     }
 }

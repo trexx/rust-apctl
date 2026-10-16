@@ -13,6 +13,8 @@
 //! All of this needs active mode: in shadow mode apctl never answers the APs,
 //! and changing settings there would only diverge from the other controller.
 
+use std::collections::HashMap;
+
 use axum::Json;
 use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode};
@@ -73,9 +75,39 @@ fn same_mac(c: &Value, mac: &str) -> bool {
 }
 
 /// Adds a client's `blocked`, `locked_to` and own speed limit (`usergroup_id`)
-/// from the settings to its view.
+/// from the settings to its view. For many clients, `ClientControls` looks
+/// each one up without scanning the settings' client list every time.
 pub fn add_controls(v: &mut Value, state: Option<&Value>, mac: &str) {
     let entry = state.and_then(|s| s["clients"].as_array()).and_then(|l| l.iter().find(|c| same_mac(c, mac)));
+    set_controls(v, entry);
+}
+
+/// The settings' client entries by lowercase MAC, built once for a list of clients.
+// Not used yet: /api/clients (api.rs) is to build one per request instead of calling `add_controls` per client.
+#[allow(dead_code)]
+pub struct ClientControls<'a>(HashMap<String, &'a Value>);
+
+#[allow(dead_code)]
+impl<'a> ClientControls<'a> {
+    pub fn new(state: Option<&'a Value>) -> Self {
+        let list = state.and_then(|s| s["clients"].as_array()).map(Vec::as_slice).unwrap_or_default();
+        let mut map = HashMap::with_capacity(list.len());
+        for c in list {
+            // The first entry for a MAC wins, as with a scan of the list.
+            if let Some(m) = c["mac"].as_str() {
+                map.entry(m.to_ascii_lowercase()).or_insert(c);
+            }
+        }
+        ClientControls(map)
+    }
+
+    /// `add_controls` for one client.
+    pub fn add(&self, v: &mut Value, mac: &str) {
+        set_controls(v, self.0.get(&mac.to_ascii_lowercase()).copied());
+    }
+}
+
+fn set_controls(v: &mut Value, entry: Option<&Value>) {
     let blocked = entry.and_then(|c| c["blocked"].as_bool()).unwrap_or(false);
     let locked_to = entry.filter(|c| c["fixed_ap_enabled"].as_bool() == Some(true)).and_then(|c| c["fixed_ap_mac"].as_str());
     v["blocked"] = json!(blocked);
@@ -91,7 +123,8 @@ fn require_active(s: &AppState) -> Result<(), ApiError> {
     }
 }
 
-fn parse(mac: &str) -> Result<Mac, ApiError> {
+/// A MAC address from the URL or body; 400 when it isn't one.
+pub fn parse_mac(mac: &str) -> Result<Mac, ApiError> {
     mac.parse().map_err(|_| ApiError(StatusCode::BAD_REQUEST, "invalid MAC address".into()))
 }
 
@@ -111,7 +144,7 @@ async fn note(s: &AppState, kind: &'static str, mac: Mac, data: Value) {
 pub async fn restart(State(s): State<AppState>, headers: HeaderMap, Path(mac): Path<String>) -> Result<Json<Value>, ApiError> {
     crate::api::check_csrf(&headers)?;
     require_active(&s)?;
-    let mac = parse(&mac)?;
+    let mac = parse_mac(&mac)?;
     known_ap(&s, &mac)?;
     queue(&mut s.live.write().unwrap(), mac, json!({ "_type": "reboot", "reboot_type": "soft" }));
     note(&s, "ap_restart_requested", mac, json!({})).await;
@@ -127,7 +160,7 @@ pub struct LocateBody {
 pub async fn locate(State(s): State<AppState>, headers: HeaderMap, Path(mac): Path<String>, Json(b): Json<LocateBody>) -> Result<Json<Value>, ApiError> {
     crate::api::check_csrf(&headers)?;
     require_active(&s)?;
-    let mac = parse(&mac)?;
+    let mac = parse_mac(&mac)?;
     known_ap(&s, &mac)?;
     let mut live = s.live.write().unwrap();
     queue(&mut live, mac, json!({ "_type": "cmd", "cmd": if b.on { "set-locate" } else { "unset-locate" } }));
@@ -143,7 +176,7 @@ pub async fn locate(State(s): State<AppState>, headers: HeaderMap, Path(mac): Pa
 pub async fn provision(State(s): State<AppState>, headers: HeaderMap, Path(mac): Path<String>) -> Result<Json<Value>, ApiError> {
     crate::api::check_csrf(&headers)?;
     require_active(&s)?;
-    let mac = parse(&mac)?;
+    let mac = parse_mac(&mac)?;
     known_ap(&s, &mac)?;
     s.live.write().unwrap().reprovision.insert(mac);
     note(&s, "ap_provision_requested", mac, json!({})).await;
@@ -154,7 +187,7 @@ pub async fn provision(State(s): State<AppState>, headers: HeaderMap, Path(mac):
 pub async fn kick(State(s): State<AppState>, headers: HeaderMap, Path(mac): Path<String>) -> Result<Json<Value>, ApiError> {
     crate::api::check_csrf(&headers)?;
     require_active(&s)?;
-    let client = parse(&mac)?;
+    let client = parse_mac(&mac)?;
     let ap = {
         let mut live = s.live.write().unwrap();
         let ap = live
@@ -179,7 +212,7 @@ pub struct BlockBody {
 pub async fn block(State(s): State<AppState>, headers: HeaderMap, Path(mac): Path<String>, Json(b): Json<BlockBody>) -> Result<Json<Value>, ApiError> {
     crate::api::check_csrf(&headers)?;
     require_active(&s)?;
-    let client = parse(&mac)?;
+    let client = parse_mac(&mac)?;
     let m = client.to_string();
     let blocked = b.blocked;
     let what = if blocked { format!("blocked client {m}") } else { format!("unblocked client {m}") };
@@ -206,10 +239,10 @@ pub struct LockBody {
 pub async fn lock(State(s): State<AppState>, headers: HeaderMap, Path(mac): Path<String>, Json(b): Json<LockBody>) -> Result<Json<Value>, ApiError> {
     crate::api::check_csrf(&headers)?;
     require_active(&s)?;
-    let client = parse(&mac)?;
+    let client = parse_mac(&mac)?;
     let ap = match &b.ap {
         Some(a) => {
-            let a = parse(a)?;
+            let a = parse_mac(a)?;
             known_ap(&s, &a)?;
             Some(a.to_string())
         }
@@ -269,5 +302,12 @@ mod tests {
         let mut v = json!({});
         add_controls(&mut v, Some(&state), "AA:BB:CC:00:00:02");
         assert_eq!((v["blocked"].as_bool(), v["locked_to"].as_str()), (Some(false), Some("02:00:00:00:00:01")));
+        let controls = ClientControls::new(Some(&state));
+        for mac in ["aa:bb:cc:00:00:01", "AA:BB:CC:00:00:02", "aa:bb:cc:00:00:03"] {
+            let (mut a, mut b) = (json!({}), json!({}));
+            add_controls(&mut a, Some(&state), mac);
+            controls.add(&mut b, mac);
+            assert_eq!(a, b, "{mac}");
+        }
     }
 }

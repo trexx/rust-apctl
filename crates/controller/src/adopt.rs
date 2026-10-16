@@ -72,6 +72,12 @@ pub fn device_doc<'a>(state: &'a Value, mac: &Mac) -> Option<&'a Value> {
     state["devices"].as_array()?.iter().find(|d| d["mac"].as_str().is_some_and(|x| x.eq_ignore_ascii_case(&m)))
 }
 
+/// The AP's record in the settings, to change it.
+pub fn device_doc_mut<'a>(state: &'a mut Value, mac: &Mac) -> Option<&'a mut Value> {
+    let m = mac.to_string();
+    state["devices"].as_array_mut()?.iter_mut().find(|d| d["mac"].as_str().is_some_and(|x| x.eq_ignore_ascii_case(&m)))
+}
+
 fn parse_key(hex_key: &str) -> Option<[u8; 16]> {
     let b = hex::decode(hex_key).ok()?;
     b.try_into().ok()
@@ -189,14 +195,13 @@ pub fn new_device(state: &Value, payload: &Value, mac: &Mac) -> Value {
     d
 }
 
-/// Adds a pending AP to the settings (or, for an AP apctl knew, keeps its record).
-pub fn add_device(state: &mut Value, body: &Value) -> Result<String, String> {
-    let mac: Mac = body["mac"].as_str().and_then(|m| m.parse().ok()).ok_or("which AP?")?;
-    let payload = &body["payload"];
-    if device_doc(state, &mac).is_some() {
+/// Adds a pending AP to the settings, from its inform (or, for an AP apctl
+/// knew, keeps its record).
+pub fn adopt_device(state: &mut Value, mac: &Mac, payload: &Value) -> Result<String, String> {
+    if device_doc(state, mac).is_some() {
         return Ok(format!("re-adopting {mac}"));
     }
-    let d = new_device(state, payload, &mac);
+    let d = new_device(state, payload, mac);
     if !state["devices"].is_array() {
         state["devices"] = json!([]);
     }
@@ -204,9 +209,16 @@ pub fn add_device(state: &mut Value, body: &Value) -> Result<String, String> {
     Ok(format!("adopted AP {} ({mac})", payload["hostname"].as_str().or(payload["model"].as_str()).unwrap_or("new")))
 }
 
+/// `adopt_device` with `{mac, payload}`, as active.rs's tests call it.
+#[cfg(test)]
+pub fn add_device(state: &mut Value, body: &Value) -> Result<String, String> {
+    let mac: Mac = body["mac"].as_str().and_then(|m| m.parse().ok()).ok_or("which AP?")?;
+    adopt_device(state, &mac, &body["payload"])
+}
+
 /// Removes an AP from the settings and everything that names it.
-pub fn remove_device(state: &mut Value, body: &Value) -> Result<String, String> {
-    let mac = body["mac"].as_str().ok_or("which AP?")?.to_ascii_lowercase();
+pub fn remove_device(state: &mut Value, mac: &Mac) -> Result<String, String> {
+    let mac = mac.to_string();
     let same = |v: &Value| v.as_str().is_some_and(|m| m.eq_ignore_ascii_case(&mac));
     let devices = state["devices"].as_array_mut().ok_or("the settings have no APs")?;
     let before = devices.len();
@@ -291,10 +303,10 @@ pub async fn pending(State(s): State<AppState>) -> Json<Value> {
 pub async fn adopt(State(s): State<AppState>, headers: HeaderMap, Path(mac): Path<String>) -> Result<Json<Value>, ApiError> {
     crate::api::check_csrf(&headers)?;
     require_active(&s)?;
-    let mac: Mac = mac.parse().map_err(|_| ApiError(StatusCode::BAD_REQUEST, "invalid MAC address".into()))?;
+    let mac = crate::actions::parse_mac(&mac)?;
     let payload = s.live.read().unwrap().adoption.pending.get(&mac).map(|p| p.payload.clone()).ok_or_else(|| ApiError(StatusCode::NOT_FOUND, "this AP is not waiting for adoption".into()))?;
-    let body = json!({ "mac": mac.to_string(), "payload": *payload });
-    crate::actions::edit_settings(&s, format!("adopting {mac}"), move |state| add_device(state, &body).map(|_| ())).await?;
+    let inform = payload.clone();
+    crate::actions::edit_settings(&s, format!("adopting {mac}"), move |state| adopt_device(state, &mac, &inform).map(|_| ())).await?;
     {
         let mut live = s.live.write().unwrap();
         live.adoption.adopting.insert(mac, store::now_ts());
@@ -308,7 +320,7 @@ pub async fn adopt(State(s): State<AppState>, headers: HeaderMap, Path(mac): Pat
 pub async fn forget(State(s): State<AppState>, headers: HeaderMap, Path(mac): Path<String>) -> Result<Json<Value>, ApiError> {
     crate::api::check_csrf(&headers)?;
     require_active(&s)?;
-    let mac: Mac = mac.parse().map_err(|_| ApiError(StatusCode::BAD_REQUEST, "invalid MAC address".into()))?;
+    let mac = crate::actions::parse_mac(&mac)?;
     let online = {
         let live = s.live.read().unwrap();
         if live.state.as_deref().and_then(|st| device_doc(st, &mac)).is_none() {
@@ -329,8 +341,7 @@ pub async fn forget(State(s): State<AppState>, headers: HeaderMap, Path(mac): Pa
 /// Removes a forgotten AP from the settings and apctl's records.
 pub async fn finish_forget(engine: &tokio::sync::mpsc::Sender<Input>, mac: Mac, reset: bool) {
     let (tx, rx) = tokio::sync::oneshot::channel();
-    let body = json!({ "mac": mac.to_string() });
-    let edit: crate::engine::StateEdit = Box::new(move |state: &mut Value| remove_device(state, &body).map(|_| ()));
+    let edit: crate::engine::StateEdit = Box::new(move |state: &mut Value| remove_device(state, &mac).map(|_| ()));
     let _ = engine.send(Input::EditState { ts: store::now_ts(), what: format!("forgot AP {mac}"), edit, done: tx }).await;
     let _ = rx.await;
     let _ = engine.send(Input::Forget { mac }).await;
@@ -378,7 +389,7 @@ mod tests {
     #[test]
     fn adopting_creates_a_record_with_a_new_key_and_radios() {
         let mut s = state();
-        add_device(&mut s, &json!({ "mac": "02:00:00:00:00:09", "payload": inform() })).unwrap();
+        adopt_device(&mut s, &"02:00:00:00:00:09".parse().unwrap(), &inform()).unwrap();
         let d = device_doc(&s, &"02:00:00:00:00:09".parse().unwrap()).unwrap().clone();
         assert_eq!(d["x_authkey"].as_str().unwrap().len(), 32);
         assert_ne!(d["x_authkey"], s["devices"][0]["x_authkey"]);
@@ -387,20 +398,22 @@ mod tests {
         assert_eq!(d["radio_table"][1]["ht"], 40, "the site's default width");
         assert_eq!((d["radio_table"][0]["channel"].as_str(), d["radio_table"][1]["has_ht160"].as_bool()), (Some("auto"), Some(true)));
         // Adopting again keeps the record (and key).
-        add_device(&mut s, &json!({ "mac": "02:00:00:00:00:09", "payload": inform() })).unwrap();
+        adopt_device(&mut s, &"02:00:00:00:00:09".parse().unwrap(), &inform()).unwrap();
         assert_eq!(s["devices"].as_array().unwrap().len(), 2);
     }
 
     #[test]
     fn forgetting_removes_every_mention() {
         let mut s = state();
-        remove_device(&mut s, &json!({ "mac": "02:00:00:00:00:01" })).unwrap();
+        let ap: Mac = "02:00:00:00:00:01".parse().unwrap();
+        remove_device(&mut s, &ap).unwrap();
         assert!(s["devices"].as_array().unwrap().is_empty());
         assert_eq!(s["apgroup"][0]["device_macs"], json!(["02:00:00:00:00:02"]));
         assert_eq!(s["wlanconf"][0]["broadcasting_aps"], json!([]));
         assert_eq!(s["clients"][0]["fixed_ap_enabled"], false);
         assert!(s["config_meta"].as_array().unwrap().is_empty());
-        assert!(remove_device(&mut s, &json!({ "mac": "02:00:00:00:00:01" })).is_err());
+        assert!(remove_device(&mut s, &ap).is_err());
+        assert!(device_doc_mut(&mut state(), &ap).is_some());
     }
 
     #[test]
