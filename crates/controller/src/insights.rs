@@ -1297,6 +1297,7 @@ type NeighborRow = (String, String, Option<String>, Option<f64>, Option<f64>, Op
 type SpectrumRow = (String, i64, Option<i64>, Option<f64>, Option<f64>);
 
 /// The greedy search behind [`compute_plan`], on data copied out of `live`.
+/// APs are known by their place in `aps`.
 #[allow(clippy::too_many_arguments)] // the inputs of one computation, passed once
 fn plan_channels(
     radio: String,
@@ -1308,117 +1309,126 @@ fn plan_channels(
     neigh: Vec<NeighborRow>,
     spectrum: Vec<SpectrumRow>,
 ) -> Plan {
+    let n = aps.len();
+    let index: HashMap<&str, usize> = aps.iter().enumerate().map(|(i, a)| (a.mac.as_str(), i)).collect();
     // AP-to-AP signal (strongest seen either way), and what each AP hears of the neighbours.
-    let mut ap_signal: HashMap<(String, String), f64> = HashMap::new();
-    let mut heard: HashMap<String, Vec<Heard>> = HashMap::new();
+    let mut ap_signal: Vec<Vec<Option<f64>>> = vec![vec![None; n]; n];
+    let mut heard: Vec<Vec<Heard>> = (0..n).map(|_| Vec::new()).collect();
     for (heard_by, bssid, essid, cf, bw, sig) in neigh {
+        let Some(&by) = index.get(heard_by.as_str()) else { continue };
         match own_bssids.get(&bssid) {
             Some(owner) => {
-                if let Some(sig) = sig {
-                    for k in [(heard_by.clone(), owner.clone()), (owner.clone(), heard_by.clone())] {
-                        let e = ap_signal.entry(k).or_insert(-200.0);
-                        *e = e.max(sig);
+                if let (Some(sig), Some(&of)) = (sig, index.get(owner.as_str())) {
+                    for (a, b) in [(by, of), (of, by)] {
+                        let e = &mut ap_signal[a][b];
+                        *e = Some(e.map_or(sig, |s| s.max(sig)));
                     }
                 }
             }
             None => {
                 let (Some(cf), Some(signal)) = (cf, sig) else { continue };
                 let half = bw.unwrap_or(20.0) / 2.0;
-                heard.entry(heard_by).or_default().push(Heard { essid, lo: cf - half, hi: cf + half, signal });
+                heard[by].push(Heard { essid, lo: cf - half, hi: cf + half, signal });
             }
         }
     }
     // Measured load per AP: the channel blocks and what each costs.
-    let mut measured: HashMap<String, Vec<(Block, f64)>> = HashMap::new();
+    let mut measured: Vec<Vec<(Block, f64)>> = (0..n).map(|_| Vec::new()).collect();
     for (m, ch, width, interference, util) in spectrum {
+        let Some(&i) = index.get(m.as_str()) else { continue };
         let load = util.unwrap_or(0.0) * 0.5 + interference.map_or(0.0, |i| weight(i) * 0.5);
-        measured.entry(m).or_default().push((block(&radio, ch, width.unwrap_or(20)), load));
+        measured[i].push((block(&radio, ch, width.unwrap_or(20)), load));
     }
-    let names: HashMap<&str, &str> = aps.iter().filter_map(|a| Some((a.mac.as_str(), a.name.as_deref()?))).collect();
-    let no_neighbours = Vec::new();
-    // What the AP would put up with on block `b`, the others placed as in `assigned`
+    // Each AP's candidate blocks, worked out once.
+    let cands: Vec<Vec<Block>> = aps
+        .iter()
+        .map(|ap| match &allowed {
+            Some(a) => allowed_blocks(&radio, ap.width, a),
+            None => candidates(&radio, ap.width, dfs, ap.available.as_deref()),
+        })
+        .collect();
+    let is_pinned: Vec<bool> = aps.iter().map(|ap| pinned.contains(&ap.mac)).collect();
+    // What AP `i` would put up with on block `b`, the others placed as in `placed`
     // (its own entry there is ignored), with (weight, reason) per contribution when `why`.
-    let contributions = |ap: &PlanAp, b: &Block, assigned: &HashMap<String, Block>, mut why: Option<&mut Vec<(f64, String)>>| -> f64 {
+    let contributions = |i: usize, b: &Block, placed: &[Option<Block>], mut why: Option<&mut Vec<(f64, String)>>| -> f64 {
         let mut total = 0.0;
-        for n in heard.get(&ap.mac).unwrap_or(&no_neighbours) {
-            if overlap(b, n.lo, n.hi) {
-                let w = weight(n.signal);
+        for h in &heard[i] {
+            if overlap(b, h.lo, h.hi) {
+                let w = weight(h.signal);
                 total += w;
                 if let Some(why) = why.as_deref_mut() {
-                    why.push((w, format!("{} ({:.0} dBm)", n.essid.as_deref().unwrap_or("hidden network"), n.signal)));
+                    why.push((w, format!("{} ({:.0} dBm)", h.essid.as_deref().unwrap_or("hidden network"), h.signal)));
                 }
             }
         }
-        for (other, ob) in assigned {
-            if other != &ap.mac && overlap(b, ob.lo, ob.hi) {
-                let sig = ap_signal.get(&(ap.mac.clone(), other.clone())).copied().unwrap_or(-75.0);
-                let w = 2.0 * weight(sig);
-                total += w;
-                if let Some(why) = why.as_deref_mut() {
-                    why.push((w, format!("your AP {} ({sig:.0} dBm)", names.get(other.as_str()).copied().unwrap_or(other))));
-                }
+        for (o, ob) in placed.iter().enumerate() {
+            if o == i || !ob.is_some_and(|ob| overlap(b, ob.lo, ob.hi)) {
+                continue;
+            }
+            let sig = ap_signal[i][o].unwrap_or(-75.0);
+            let w = 2.0 * weight(sig);
+            total += w;
+            if let Some(why) = why.as_deref_mut() {
+                why.push((w, format!("your AP {} ({sig:.0} dBm)", aps[o].name.as_deref().unwrap_or(&aps[o].mac))));
             }
         }
-        for (sb, load) in measured.get(&ap.mac).into_iter().flatten() {
+        for (sb, load) in &measured[i] {
             if overlap(b, sb.lo, sb.hi) {
                 total += load;
             }
         }
         total
     };
-    let cost = |ap: &PlanAp, b: &Block, assigned: &HashMap<String, Block>| contributions(ap, b, assigned, None);
+    let cost = |i: usize, b: &Block, placed: &[Option<Block>]| contributions(i, b, placed, None);
     // The cost with the four biggest reasons, for the plan shown.
-    let explain = |ap: &PlanAp, b: &Block, assigned: &HashMap<String, Block>| -> (f64, Vec<String>) {
+    let explain = |i: usize, b: &Block, placed: &[Option<Block>]| -> (f64, Vec<String>) {
         let mut reasons = Vec::new();
-        let total = contributions(ap, b, assigned, Some(&mut reasons));
+        let total = contributions(i, b, placed, Some(&mut reasons));
         reasons.sort_by(|a, b| b.0.total_cmp(&a.0));
         (total, reasons.into_iter().take(4).map(|r| r.1).collect())
     };
-    let cands = |ap: &PlanAp| match &allowed {
-        Some(a) => allowed_blocks(&radio, ap.width, a),
-        None => candidates(&radio, ap.width, dfs, ap.available.as_deref()),
-    };
-    let is_pinned = |ap: &PlanAp| pinned.contains(&ap.mac);
     // Greedy: busiest AP first, then a second pass with everyone placed.
-    let mut order: Vec<&PlanAp> = aps.iter().filter(|a| !is_pinned(a)).collect();
-    order.sort_by_key(|a| -a.clients);
-    let current: HashMap<String, Block> = aps.iter().filter_map(|a| a.current.map(|c| (a.mac.clone(), c))).collect();
+    let mut order: Vec<usize> = (0..n).filter(|i| !is_pinned[*i]).collect();
+    order.sort_by_key(|i| -aps[*i].clients);
+    let current: Vec<Option<Block>> = aps.iter().map(|a| a.current).collect();
     let mut assigned = current.clone();
     for _ in 0..2 {
-        for ap in &order {
-            let best = cands(ap).into_iter().map(|b| (cost(ap, &b, &assigned), b)).min_by(|a, b| a.0.total_cmp(&b.0));
+        for &i in &order {
+            let best = cands[i].iter().map(|b| (cost(i, b, &assigned), *b)).min_by(|a, b| a.0.total_cmp(&b.0));
             if let Some((_, b)) = best {
-                assigned.insert(ap.mac.clone(), b);
+                assigned[i] = Some(b);
             }
         }
     }
-    // Which APs move: on a channel no longer allowed, or clearly better off elsewhere.
-    let mut evict: HashMap<String, bool> = HashMap::new();
+    // Which APs move, and whether because their channel is no longer allowed
+    // (otherwise they are clearly better off elsewhere).
+    let mut evict: Vec<Option<bool>> = vec![None; n];
     let mut fin = current.clone();
-    for ap in &aps {
-        let (Some(cur), Some(sug)) = (ap.current, assigned.get(&ap.mac).copied()) else { continue };
-        if is_pinned(ap) || cur.primary == sug.primary {
+    for (i, ap) in aps.iter().enumerate() {
+        let (Some(cur), Some(sug)) = (ap.current, assigned[i]) else { continue };
+        if is_pinned[i] || cur.primary == sug.primary {
             continue;
         }
-        let ev = !cands(ap).iter().any(|b| (b.lo - cur.lo).abs() < 1.0 && (b.hi - cur.hi).abs() < 1.0);
-        if ev || cost(ap, &sug, &assigned) + 5.0 < cost(ap, &cur, &assigned) * 0.8 {
-            fin.insert(ap.mac.clone(), sug);
-            evict.insert(ap.mac.clone(), ev);
+        let ev = !cands[i].iter().any(|b| (b.lo - cur.lo).abs() < 1.0 && (b.hi - cur.hi).abs() < 1.0);
+        if ev || cost(i, &sug, &assigned) + 5.0 < cost(i, &cur, &assigned) * 0.8 {
+            fin[i] = Some(sug);
+            evict[i] = Some(ev);
         }
     }
-    let total = |m: &HashMap<String, Block>| -> f64 { aps.iter().filter_map(|ap| m.get(&ap.mac).map(|b| cost(ap, b, m))).sum() };
+    let total = |m: &[Option<Block>]| -> f64 { m.iter().enumerate().filter_map(|(i, b)| b.map(|b| cost(i, &b, m))).sum() };
     let (current_total, final_total) = (total(&current), total(&fin));
-    let accepted = evict.values().any(|e| *e) || (!evict.is_empty() && final_total * 1.1 < current_total);
+    let accepted = evict.contains(&Some(true)) || (evict.iter().any(Option::is_some) && final_total * 1.1 < current_total);
     if !accepted {
         fin = current.clone();
-        evict.clear();
+        evict = vec![None; n];
     }
     let plan: Vec<PlanEntry> = aps
         .iter()
-        .map(|ap| {
-            let cur = ap.current.map(|b| explain(ap, &b, &current));
-            let change = evict.contains_key(&ap.mac);
-            let sug = fin.get(&ap.mac).map(|b| (b.primary, explain(ap, b, &fin)));
+        .enumerate()
+        .map(|(i, ap)| {
+            let cur = ap.current.map(|b| explain(i, &b, &current));
+            let change = evict[i].is_some();
+            let sug = fin[i].map(|b| (b.primary, explain(i, &b, &fin)));
             PlanEntry {
                 mac: ap.mac.clone(),
                 name: ap.name.clone(),
@@ -1431,8 +1441,8 @@ fn plan_channels(
                 suggested_score: sug.as_ref().map(|s| s.1.0.round()),
                 suggested_reasons: if change { sug.map(|s| s.1.1).unwrap_or_default() } else { vec![] },
                 change,
-                pinned: is_pinned(ap),
-                not_allowed: evict.get(&ap.mac).copied().unwrap_or(false),
+                pinned: is_pinned[i],
+                not_allowed: evict[i].unwrap_or(false),
             }
         })
         .collect();
