@@ -32,7 +32,35 @@ use crate::model::Ts;
 use crate::store::{self, Db, Store};
 use inform::Mac;
 
-pub const KINDS: [&str; 5] = ["spoofed_bssid", "impersonation", "lookalike", "bridged", "new_nearby"];
+/// What a finding is (see above).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Kind {
+    SpoofedBssid,
+    Impersonation,
+    Lookalike,
+    Bridged,
+    NewNearby,
+}
+
+impl Kind {
+    const ALL: [Kind; 5] = [Kind::SpoofedBssid, Kind::Impersonation, Kind::Lookalike, Kind::Bridged, Kind::NewNearby];
+
+    /// As stored and as the API and events name it.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Kind::SpoofedBssid => "spoofed_bssid",
+            Kind::Impersonation => "impersonation",
+            Kind::Lookalike => "lookalike",
+            Kind::Bridged => "bridged",
+            Kind::NewNearby => "new_nearby",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Kind> {
+        Kind::ALL.into_iter().find(|k| k.as_str() == s)
+    }
+}
 
 /// A BSSID one of our APs broadcasts (or did recently).
 #[derive(Debug, Clone)]
@@ -77,9 +105,9 @@ pub struct Assessment {
     /// When the first neighbouring network was recorded.
     pub watching_since: Ts,
     /// (kind, bssid) -> acknowledgement note and time.
-    pub acks: HashMap<(String, String), (Option<String>, Ts)>,
+    pub acks: HashMap<(Kind, String), (Option<String>, Ts)>,
     /// (kind, bssid) -> when first reported.
-    pub reported: HashMap<(String, String), Ts>,
+    pub reported: HashMap<(Kind, String), Ts>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -101,7 +129,7 @@ pub enum Severity {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct Finding {
-    pub kind: &'static str,
+    pub kind: Kind,
     pub severity: Severity,
     pub bssid: String,
     pub essid: Option<String>,
@@ -180,15 +208,34 @@ fn levenshtein(a: &str, b: &str) -> usize {
     prev[b.len()]
 }
 
+/// A network name with the forms [`similar`] compares, worked out once.
+struct Name<'a> {
+    raw: &'a str,
+    lower: String,
+    folded: String,
+}
+
+impl<'a> Name<'a> {
+    fn new(raw: &'a str) -> Name<'a> {
+        Name { raw, lower: raw.trim().to_lowercase(), folded: fold(raw) }
+    }
+}
+
 /// Why `name` might be passed off as `ours`, if it might.
+#[cfg(test)]
 fn lookalike(name: &str, ours: &str) -> Option<&'static str> {
-    if name == ours {
+    similar(&Name::new(name), &Name::new(ours))
+}
+
+/// [`lookalike`] on names already folded.
+fn similar(name: &Name, ours: &Name) -> Option<&'static str> {
+    if name.raw == ours.raw {
         return None;
     }
-    if name.trim().to_lowercase() == ours.trim().to_lowercase() {
+    if name.lower == ours.lower {
         return Some("the same name with different capitals or spacing");
     }
-    let (a, b) = (fold(name), fold(ours));
+    let (a, b) = (&name.folded, &ours.folded);
     let len = b.chars().count();
     if len < 4 {
         return None;
@@ -196,10 +243,10 @@ fn lookalike(name: &str, ours: &str) -> Option<&'static str> {
     if a == b {
         return Some("looks the same, with look-alike characters swapped in (such as 0 for O)");
     }
-    if levenshtein(&a, &b) <= if len >= 8 { 2 } else { 1 } {
+    if levenshtein(a, b) <= if len >= 8 { 2 } else { 1 } {
         return Some("differs from your network's name by a character or two");
     }
-    if a.starts_with(&b) && a.chars().count() - len <= 6 {
+    if a.starts_with(b.as_str()) && a.chars().count() - len <= 6 {
         return Some("your network's name with something added");
     }
     None
@@ -227,7 +274,18 @@ pub fn assess(a: &Assessment) -> Vec<Finding> {
     // Addresses our APs and their radios use: anything this close is our hardware.
     let family: Vec<u64> = a.own.iter().map(|b| b.bssid.as_str()).chain(a.aps.keys().map(String::as_str)).filter_map(mac_num).collect();
     let is_family = |bssid: &str| mac_num(bssid).is_some_and(|n| family.iter().any(|f| near(n, *f, 16)));
-    let clients: Vec<(u64, &str, Option<&String>)> = a.clients.iter().filter_map(|(m, n)| mac_num(m).map(|x| (x, m.as_str(), n.as_ref()))).collect();
+    // Clients by address, each with its place in the list (the first one near a BSSID is the one named).
+    let mut clients: Vec<(u64, usize, &str, Option<&String>)> =
+        a.clients.iter().enumerate().filter_map(|(i, (m, n))| mac_num(m).map(|x| (x, i, m.as_str(), n.as_ref()))).collect();
+    clients.sort_unstable();
+    let client_near = |n: u64| {
+        let from = clients.partition_point(|c| c.0 < n.saturating_sub(8));
+        clients[from..].iter().take_while(|c| c.0 <= n + 8).min_by_key(|c| c.1).map(|c| (c.2, c.3))
+    };
+    // Our network names, folded once (in name order, so the same one is named every time).
+    let mut ours: Vec<&String> = a.ssids.iter().collect();
+    ours.sort();
+    let ours: Vec<Name> = ours.into_iter().map(|o| Name::new(o)).collect();
     // The security our own networks show in scans, to compare copies against.
     let mut expected: HashMap<&str, &str> = HashMap::new();
     for h in &a.heard {
@@ -250,8 +308,8 @@ pub fn assess(a: &Assessment) -> Vec<Finding> {
         let all = seen(&rows);
         let (latest, best) = (all.latest, all.best);
         // `rows` are the sightings the finding rests on, `s` what they add up to.
-        let mut push = |kind: &'static str, severity: Severity, target: Option<String>, detail: String, rows: &[&Heard], s: &Seen| {
-            let key = (kind.to_string(), bssid.to_string());
+        let mut push = |kind: Kind, severity: Severity, target: Option<String>, detail: String, rows: &[&Heard], s: &Seen| {
+            let key = (kind, bssid.to_string());
             let mut heard_by: Vec<HeardBy> =
                 rows.iter().map(|h| HeardBy { mac: h.ap_mac.clone(), name: ap_name(&h.ap_mac), signal: h.signal, last_seen: h.last_seen }).collect();
             heard_by.sort_by_key(|h| std::cmp::Reverse(h.signal.unwrap_or(-200)));
@@ -287,7 +345,7 @@ pub fn assess(a: &Assessment) -> Vec<Finding> {
             let owner = ap_name(&o.ap_mac).unwrap_or_else(|| o.ap_mac.clone());
             if let Some(h) = odd_channel.first() {
                 push(
-                    "spoofed_bssid",
+                    Kind::SpoofedBssid,
                     Severity::High,
                     Some(owner.clone()),
                     format!(
@@ -301,7 +359,7 @@ pub fn assess(a: &Assessment) -> Vec<Finding> {
                 );
             } else if let Some(h) = odd_name.first() {
                 push(
-                    "spoofed_bssid",
+                    Kind::SpoofedBssid,
                     Severity::High,
                     Some(owner.clone()),
                     format!(
@@ -334,13 +392,14 @@ pub fn assess(a: &Assessment) -> Vec<Finding> {
                 } else {
                     format!("Broadcasts your network name \"{e}\" from a device that is not one of your APs.")
                 };
-                push("impersonation", if family { Severity::Medium } else { Severity::High }, Some(e.to_string()), detail, &rows, &all);
+                push(Kind::Impersonation, if family { Severity::Medium } else { Severity::High }, Some(e.to_string()), detail, &rows, &all);
                 continue;
             }
             if !family
-                && let Some((ours, why)) = a.ssids.iter().find_map(|o| lookalike(e, o).map(|w| (o, w)))
+                && let name = Name::new(e)
+                && let Some((ours, why)) = ours.iter().find_map(|o| similar(&name, o).map(|w| (o.raw, w)))
             {
-                push("lookalike", Severity::Medium, Some(ours.clone()), format!("\"{e}\" {why} (\"{ours}\")."), &rows, &all);
+                push(Kind::Lookalike, Severity::Medium, Some(ours.to_string()), format!("\"{e}\" {why} (\"{ours}\")."), &rows, &all);
                 continue;
             }
         }
@@ -348,11 +407,11 @@ pub fn assess(a: &Assessment) -> Vec<Finding> {
             continue;
         }
         if let Some(n) = mac_num(bssid)
-            && let Some((_, mac, name)) = clients.iter().find(|(c, _, _)| near(n, *c, 8))
+            && let Some((mac, name)) = client_near(n)
         {
             let who = name.cloned().unwrap_or_else(|| mac.to_string());
             push(
-                "bridged",
+                Kind::Bridged,
                 Severity::Medium,
                 Some(mac.to_string()),
                 format!(
@@ -364,7 +423,7 @@ pub fn assess(a: &Assessment) -> Vec<Finding> {
             continue;
         }
         if watched_for > 2 * 86400 && all.first > a.now - 86400 && best.is_some_and(|s| s >= -60) {
-            push("new_nearby", Severity::Low, None, format!("A strong network ({} dBm) that first appeared in the last day.", best.unwrap_or_default()), &rows, &all);
+            push(Kind::NewNearby, Severity::Low, None, format!("A strong network ({} dBm) that first appeared in the last day.", best.unwrap_or_default()), &rows, &all);
         }
     }
     out.sort_by(|x, y| x.severity.cmp(&y.severity).then(y.best_signal.cmp(&x.best_signal)));
@@ -490,12 +549,16 @@ pub fn gather(store: &Store, live: &SharedLive, now: Ts) -> anyhow::Result<Asses
         let mut stmt = c.prepare("SELECT kind, bssid, note, ts FROM network_acks")?;
         for row in stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get(2)?, r.get(3)?)))? {
             let (k, b, n, t) = row?;
-            a.acks.insert((k, b), (n, t));
+            if let Some(k) = Kind::parse(&k) {
+                a.acks.insert((k, b), (n, t));
+            }
         }
         let mut stmt = c.prepare("SELECT kind, bssid, first_reported FROM network_threats")?;
         for row in stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get(2)?)))? {
             let (k, b, t) = row?;
-            a.reported.insert((k, b), t);
+            if let Some(k) = Kind::parse(&k) {
+                a.reported.insert((k, b), t);
+            }
         }
         Ok(crate::connections::Names::load(c)?)
     })?;
@@ -630,7 +693,7 @@ fn yes() -> bool {
 /// PUT /api/rf/threats/ack
 pub async fn ack(State(s): State<AppState>, headers: axum::http::HeaderMap, Json(b): Json<AckBody>) -> Result<Json<Value>, ApiError> {
     crate::api::check_csrf(&headers)?;
-    let Some(kind) = KINDS.iter().find(|k| **k == b.kind) else {
+    let Some(kind) = Kind::parse(&b.kind) else {
         return Err(ApiError(StatusCode::BAD_REQUEST, "unknown kind".into()));
     };
     let bssid: Mac = b.bssid.parse().map_err(|_| ApiError(StatusCode::BAD_REQUEST, "invalid BSSID".into()))?;
@@ -638,7 +701,7 @@ pub async fn ack(State(s): State<AppState>, headers: axum::http::HeaderMap, Json
     if note.as_ref().is_some_and(|n| n.chars().count() > 200) {
         return Err(ApiError(StatusCode::BAD_REQUEST, "note is too long (200 characters at most)".into()));
     }
-    let input = Input::AckThreat { ts: store::now_ts(), kind, bssid: bssid.to_string(), note: if b.ack { Some(note) } else { None } };
+    let input = Input::AckThreat { ts: store::now_ts(), kind: kind.as_str(), bssid: bssid.to_string(), note: if b.ack { Some(note) } else { None } };
     s.engine.send(input).await.map_err(|_| ApiError(StatusCode::SERVICE_UNAVAILABLE, "engine stopped".into()))?;
     Ok(Json(json!({ "ok": true })))
 }
@@ -671,7 +734,7 @@ pub fn watch(store: std::sync::Arc<Store>, live: SharedLive, engine: tokio::sync
                     "kind": f.kind, "severity": f.severity, "bssid": f.bssid, "essid": f.essid, "target": f.target,
                     "signal": f.best_signal, "channel": f.channel, "detail": f.detail,
                 });
-                let input = Input::ThreatFound { ts: store::now_ts(), kind: f.kind, bssid: f.bssid, device_mac: device, data, notify };
+                let input = Input::ThreatFound { ts: store::now_ts(), kind: f.kind.as_str(), bssid: f.bssid, device_mac: device, data, notify };
                 if engine.send(input).await.is_err() {
                     return;
                 }
@@ -724,7 +787,7 @@ mod tests {
         a
     }
 
-    fn kinds(a: &Assessment) -> Vec<(&'static str, Severity, String)> {
+    fn kinds(a: &Assessment) -> Vec<(Kind, Severity, String)> {
         assess(a).into_iter().map(|f| (f.kind, f.severity, f.bssid)).collect()
     }
 
@@ -738,7 +801,7 @@ mod tests {
         let mut a = site();
         a.heard.push(heard("02:11:22:33:44:55", DOWN, "Home", 6, "Open", -55));
         let f = assess(&a);
-        assert_eq!((f[0].kind, f[0].severity), ("impersonation", Severity::High));
+        assert_eq!((f[0].kind, f[0].severity), (Kind::Impersonation, Severity::High));
         assert!(f[0].detail.contains("no password"), "{}", f[0].detail);
         // Different security is called out.
         let mut a = site();
@@ -747,7 +810,7 @@ mod tests {
         // Next to our AP's own addresses: probably ours, so only medium.
         let mut a = site();
         a.heard.push(heard("7a:45:58:3c:52:bf", UP, "Home", 48, "WPA2-Personal (AES/CCMP)", -80));
-        assert_eq!(kinds(&a), vec![("impersonation", Severity::Medium, "7a:45:58:3c:52:bf".into())]);
+        assert_eq!(kinds(&a), vec![(Kind::Impersonation, Severity::Medium, "7a:45:58:3c:52:bf".into())]);
     }
 
     #[test]
@@ -756,7 +819,7 @@ mod tests {
         a.heard.push(heard("78:45:58:3c:52:be", UP, "Home", 149, "WPA2-Personal (AES/CCMP)", -60));
         // (replaces the normal sighting: one row per BSSID and hearing AP)
         a.heard.retain(|h| !(h.bssid == "78:45:58:3c:52:be" && h.channel == Some(48)));
-        assert_eq!(kinds(&a), vec![("spoofed_bssid", Severity::High, "78:45:58:3c:52:be".into())]);
+        assert_eq!(kinds(&a), vec![(Kind::SpoofedBssid, Severity::High, "78:45:58:3c:52:be".into())]);
         // The scan predates our own channel change: not reported.
         a.own.iter_mut().find(|o| o.bssid == "78:45:58:3c:52:be").unwrap().changed_at = 20_000;
         assert!(kinds(&a).is_empty());
@@ -782,7 +845,7 @@ mod tests {
         assert!(lookalike("Hide", "Home").is_none());
         let mut a = site();
         a.heard.push(heard("02:aa:bb:cc:dd:ee", UP, "H0me", 36, "Open", -70));
-        assert_eq!(kinds(&a), vec![("lookalike", Severity::Medium, "02:aa:bb:cc:dd:ee".into())]);
+        assert_eq!(kinds(&a), vec![(Kind::Lookalike, Severity::Medium, "02:aa:bb:cc:dd:ee".into())]);
     }
 
     #[test]
@@ -790,7 +853,7 @@ mod tests {
         let mut a = site();
         a.heard.push(heard("3e:55:76:00:00:04", UP, "phone hotspot", 6, "WPA2-Personal (AES/CCMP)", -50));
         let f = assess(&a);
-        assert_eq!((f[0].kind, f[0].target.as_deref()), ("bridged", Some("3c:55:76:00:00:03")));
+        assert_eq!((f[0].kind, f[0].target.as_deref()), (Kind::Bridged, Some("3c:55:76:00:00:03")));
         assert!(f[0].detail.contains("phone"));
     }
 
@@ -801,7 +864,7 @@ mod tests {
         n.first_seen = a.now - 3600;
         n.last_seen = a.now;
         a.heard.push(n.clone());
-        assert_eq!(kinds(&a), vec![("new_nearby", Severity::Low, "02:00:00:00:00:01".into())]);
+        assert_eq!(kinds(&a), vec![(Kind::NewNearby, Severity::Low, "02:00:00:00:00:01".into())]);
         // Weak ones are not interesting.
         a.heard.last_mut().unwrap().best_signal = Some(-80);
         assert!(kinds(&a).is_empty());
@@ -858,7 +921,8 @@ mod tests {
     fn acknowledgements_are_per_kind_and_bssid() {
         let mut a = site();
         a.heard.push(heard("02:aa:bb:cc:dd:ee", UP, "H0me", 36, "Open", -70));
-        a.acks.insert(("lookalike".into(), "02:aa:bb:cc:dd:ee".into()), (Some("the neighbours".into()), 5));
+        a.acks.insert((Kind::Lookalike, "02:aa:bb:cc:dd:ee".into()), (Some("the neighbours".into()), 5));
+        assert_eq!((Kind::parse("lookalike"), json!(Kind::NewNearby)), (Some(Kind::Lookalike), json!("new_nearby")), "named as stored");
         let f = assess(&a);
         assert_eq!(f[0].acknowledged.as_ref().and_then(|x| x.note.as_deref()), Some("the neighbours"));
         // The same BSSID copying our name exactly is a different finding.
