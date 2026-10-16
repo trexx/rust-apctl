@@ -153,6 +153,9 @@ pub struct AlertMsg {
 pub struct Alerts {
     writer: Writer,
     tx: broadcast::Sender<LiveMsg>,
+    /// The last alert's number, which ids carry: it continues from the stored
+    /// alerts' (see [`load_open`]), so an id is never used twice, even when
+    /// apctl restarts within a second or the clock steps back.
     seq: u64,
     /// Open alerts by (key, entity).
     open: HashMap<(String, String), Alert>,
@@ -427,11 +430,14 @@ async fn failing_clients(store: &Arc<Store>, now: Ts) -> anyhow::Result<usize> {
     .await?
 }
 
-/// Alerts left open by a previous run.
-async fn load_open(store: &Arc<Store>) -> anyhow::Result<Vec<Alert>> {
+/// Alerts left open by a previous run, and the highest number a stored
+/// alert's id carries (`{ts}-{number}`).
+async fn load_open(store: &Arc<Store>) -> anyhow::Result<(Vec<Alert>, u64)> {
     let store = store.clone();
     tokio::task::spawn_blocking(move || {
         store.read(Db::Config, |c| {
+            let sql = "SELECT COALESCE(MAX(CAST(substr(id, instr(id, '-') + 1) AS INTEGER)), 0) FROM alerts";
+            let seq = c.query_row(sql, [], |r| r.get::<_, i64>(0))?;
             let mut stmt = c.prepare("SELECT id, ts, key, category, severity, entity, title, message, link, tag FROM alerts WHERE resolved_ts IS NULL")?;
             let rows = stmt
                 .query_map([], |r| {
@@ -451,7 +457,7 @@ async fn load_open(store: &Arc<Store>) -> anyhow::Result<Vec<Alert>> {
                     })
                 })?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
-            Ok(rows)
+            Ok((rows, u64::try_from(seq).unwrap_or(0)))
         })
     })
     .await?
@@ -533,7 +539,8 @@ impl Watcher {
     async fn start(store: Arc<Store>, writer: Writer, live: SharedLive, tx: broadcast::Sender<LiveMsg>) -> Watcher {
         let mut w = Watcher { book: Alerts { writer, tx, seq: 0, open: HashMap::new() }, store, live, aps: ApWatch::default(), cleared: HashMap::new(), unjudged: HashMap::new() };
         match load_open(&w.store).await {
-            Ok(open) => {
+            Ok((open, seq)) => {
+                w.book.seq = seq;
                 for a in open {
                     w.book.open.insert((a.key.clone(), a.entity.clone()), a);
                 }
@@ -701,13 +708,14 @@ pub struct ListQuery {
     limit: Option<usize>,
 }
 
+/// Recent alerts, newest first: by time, then as stored.
+const LIST: &str = "SELECT id, ts, key, category, severity, entity, title, message, link, tag, resolved_ts, read FROM alerts ORDER BY ts DESC, rowid DESC LIMIT ?1";
+
 /// GET /api/alerts: recent alerts, newest first, with the unread count.
 pub async fn list(State(s): State<AppState>, Query(q): Query<ListQuery>) -> Result<Json<Value>, ApiError> {
     let limit = q.limit.unwrap_or(50).clamp(1, 500) as i64;
     let rows = crate::api::read(&s.store, Db::Config, move |c| {
-        let mut stmt = c.prepare(
-            "SELECT id, ts, key, category, severity, entity, title, message, link, tag, resolved_ts, read FROM alerts ORDER BY ts DESC, id DESC LIMIT ?1",
-        )?;
+        let mut stmt = c.prepare(LIST)?;
         let rows = stmt
             .query_map([limit], |r| {
                 Ok(json!({
@@ -821,6 +829,24 @@ mod tests {
         w.event(100, &e);
         assert_eq!(told(&mut rx), [("raised", "ap_restarted".to_string())]);
         assert!(w.book.open.is_empty(), "a one-off notice, raised resolved");
+    }
+
+    #[tokio::test]
+    async fn alert_ids_are_never_reused_and_list_newest_first() {
+        let (mut w, _rx) = watcher();
+        let notice = || Alert::new("ap_restarted", Category::Changes, Severity::Low, "aa", "t".into(), "m".into());
+        for _ in 0..11 {
+            w.book.raise(1000, notice());
+        }
+        assert!(w.book.writer.flush(Duration::from_secs(5)));
+        // A restart within the same second carries on from the stored ids.
+        let mut again = Watcher::start(w.store.clone(), w.book.writer.clone(), Default::default(), broadcast::channel(4).0).await;
+        let last = again.book.raise(1000, notice());
+        assert_eq!(last.id, "1000-12");
+        assert!(w.book.writer.flush(Duration::from_secs(5)));
+        let ids: Vec<String> = w.store.read(Db::Config, |c| Ok(c.prepare(LIST)?.query_map([100], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?)).unwrap();
+        assert_eq!(ids.len(), 12, "none overwritten");
+        assert_eq!((ids[0].as_str(), ids[1].as_str(), ids[2].as_str()), ("1000-12", "1000-11", "1000-10"));
     }
 
     #[tokio::test]
