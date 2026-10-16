@@ -978,17 +978,33 @@ export const useSeries = (table: string, key: string, span: TimeSpan) =>
     placeholderData: keepPreviousData,
   });
 
-export const useEvents = (filter: { device?: Mac; client?: Mac; kind?: string; limit?: number }) =>
+export type EventFilter = { device?: Mac; client?: Mac; kind?: string; limit?: number };
+export type LogFilter = { device?: Mac; q?: string; limit?: number };
+
+export const useEvents = (filter: EventFilter) =>
   useQuery({ queryKey: keys.events(filter), queryFn: ({ signal }) => get<AppEvent[]>(`/api/events${qs(filter)}`, signal) });
 
-export const useLogs = (filter: { device?: Mac; q?: string; limit?: number }) =>
+export const useLogs = (filter: LogFilter) =>
   useQuery({ queryKey: keys.logs(filter), queryFn: ({ signal }) => get<LogLine[]>(`/api/logs${qs(filter)}`, signal) });
+
+/** A filter's MAC against a message's, as the server compares them (it normalises the filter). */
+const sameMac = (filter: Mac | undefined, mac: Mac | null) => !filter || filter.toLowerCase() === mac?.toLowerCase();
+
+/** Whether a list fetched with `f` would show the event, filtered as the server does: MACs exactly, kinds by comma-separated prefixes. */
+function eventMatches(f: EventFilter, e: { kind: string; device_mac: Mac | null; client_mac: Mac | null }): boolean {
+  if (!sameMac(f.device, e.device_mac) || !sameMac(f.client, e.client_mac)) return false;
+  const kinds = (f.kind ?? "").split(",").map((k) => k.trim().toLowerCase()).filter(Boolean);
+  return kinds.length === 0 || kinds.some((k) => e.kind.toLowerCase().startsWith(k));
+}
+
+/** Whether a log list fetched with `f` may show a new line from `device` (the text isn't announced, so a search always may). */
+const logMatches = (f: LogFilter, device: Mac | null) => sameMac(f.device, device);
 
 type LiveMsg =
   | { type: "device"; mac: Mac }
   | { type: "clients" }
   | ({ type: "event" } & Omit<AppEvent, "id">)
-  | ({ type: "log" } & Omit<LogLine, "id">)
+  | { type: "log"; device_mac: Mac | null }
   | ({ type: "alert"; action: "raised" | "resolved" } & AlertItem)
   | { type: "resync" };
 
@@ -1019,7 +1035,8 @@ const ADOPTION_EVENTS = new Set(["ap_pending", "ap_adopting", "ap_adopted", "ap_
 
 /**
  * Keeps queries fresh from the server's WebSocket: device and client changes
- * invalidate the cached lists, new events and logs refetch their lists.
+ * invalidate the cached lists, new events and logs refetch the lists whose
+ * filters they match.
  *
  * Invalidations are batched (a burst of messages causes one refetch), the busy
  * lists are refreshed at most every few seconds, and nothing is refetched while
@@ -1071,6 +1088,12 @@ export function useLiveUpdates(): void {
       pending.set(id, { key, due: Math.max(Date.now() + 750, (last.get(id) ?? 0) + gap) });
       schedule();
     };
+    /** Invalidates (as above) each cached query in `family` whose filter `matches`. */
+    const invalidateWhere = <F>(family: QueryKey, matches: (filter: F) => boolean, gap: number) => {
+      for (const q of qc.getQueryCache().findAll({ queryKey: family })) {
+        if (matches((q.queryKey[1] ?? {}) as F)) invalidate(q.queryKey, gap);
+      }
+    };
     const onVisible = () => {
       if (!document.hidden) schedule();
     };
@@ -1093,17 +1116,21 @@ export function useLiveUpdates(): void {
           invalidate(keys.clients(), 4000);
           invalidate(keys.client(), 4000);
           break;
-        case "event":
-          invalidate(keys.events(), 2000);
+        case "event": {
+          const e = msg;
+          invalidateWhere<EventFilter>(keys.events(), (f) => eventMatches(f, e), 2000);
           if (msg.kind === "dryrun_compared" || msg.kind === "settings_imported") {
             invalidate(keys.dryrun());
             invalidate(keys.settingsState());
           }
           if (ADOPTION_EVENTS.has(msg.kind)) invalidate(keys.adoption());
           break;
-        case "log":
-          invalidate(keys.logs(), 3000);
+        }
+        case "log": {
+          const device = msg.device_mac;
+          invalidateWhere<LogFilter>(keys.logs(), (f) => logMatches(f, device), 3000);
           break;
+        }
         case "alert":
           invalidate(keys.alerts());
           // The server stores alerts within a second of announcing them: look again then.
