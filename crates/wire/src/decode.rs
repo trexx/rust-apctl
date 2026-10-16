@@ -1,7 +1,7 @@
 //! Decrypting inform packets with the right key.
 
 use anyhow::{Context, Result};
-use inform::{DEFAULT_KEY, Mac, Packet};
+use inform::{DEFAULT_KEY, Flags, Mac, Packet};
 use serde_json::Value;
 
 use crate::keys::KeyStore;
@@ -25,7 +25,7 @@ pub fn decode(body: &[u8], keys: &KeyStore, mac_hint: Option<Mac>) -> Result<Dec
     let pkt = Packet::parse(body)?;
     let flags = pkt.header.flags;
     let mut attempts: Vec<(KeyUsed, [u8; 16])> = Vec::new();
-    if !flags.has(inform::Flags::ENCRYPTED) {
+    if !flags.has(Flags::ENCRYPTED) {
         attempts.push((KeyUsed::None, DEFAULT_KEY));
     } else {
         let hint = mac_hint.filter(|m| *m != pkt.header.mac);
@@ -38,34 +38,50 @@ pub fn decode(body: &[u8], keys: &KeyStore, mac_hint: Option<Mac>) -> Result<Dec
     }
     let (key, _, payload) = open_with(&pkt, attempts)
         .with_context(|| format!("no known key decrypts the packet from {} (flags {:?})", pkt.header.mac, flags))?;
-    Ok(Decoded { header: pkt.header.clone(), key, payload })
+    Ok(Decoded { header: pkt.header, key, payload })
 }
 
 /// Opens a packet with each of `keys` in turn and parses the plaintext as JSON. The
 /// first key that yields JSON wins: CBC has no authentication, so a wrong key shows up
 /// as output that is not JSON rather than as an error. Returns that key with the
-/// payload, or the last key's error.
+/// payload, or why no key worked: a failure after decryption (decompressing, the JSON)
+/// rather than "wrong key", and for AES-GCM, which authenticates, the first key that
+/// decrypted is the answer whatever comes after.
 ///
 /// An unencrypted packet opens with any key (see [`Packet::open`]): callers that
 /// require encryption check the header's flags first.
 pub fn open_with(pkt: &Packet<'_>, keys: impl IntoIterator<Item = (KeyUsed, [u8; 16])>) -> Result<(KeyUsed, [u8; 16], Value)> {
-    let mut last_err = None;
+    let flags = pkt.header.flags;
+    // Whether getting past decryption proves the key right (or no key is involved).
+    let authenticated = !flags.has(Flags::ENCRYPTED) || flags.has(Flags::GCM);
+    let mut err = None;
     for (used, key) in keys {
-        match pkt.open(&key) {
+        let e = match pkt.open(&key) {
             Ok(plain) => match serde_json::from_slice::<Value>(&plain) {
                 Ok(payload) => return Ok((used, key, payload)),
-                Err(e) => last_err = Some(anyhow::anyhow!("decrypted payload is not JSON: {e}")),
+                Err(e) => anyhow::anyhow!("decrypted payload is not JSON: {e}"),
             },
-            Err(e) => last_err = Some(e.into()),
+            Err(inform::Error::Decrypt) => {
+                err.get_or_insert_with(|| inform::Error::Decrypt.into());
+                continue;
+            }
+            Err(e) => e.into(),
+        };
+        if authenticated {
+            return Err(e);
+        }
+        // CBC: a wrong key can get this far too; the first such failure is kept.
+        if err.as_ref().is_none_or(|e: &anyhow::Error| matches!(e.downcast_ref(), Some(inform::Error::Decrypt))) {
+            err = Some(e);
         }
     }
-    Err(last_err.unwrap_or_else(|| anyhow::anyhow!("no key to try")))
+    Err(err.unwrap_or_else(|| anyhow::anyhow!("no key to try")))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use inform::{Flags, seal};
+    use inform::seal;
 
     #[test]
     fn decode_prefers_device_key_and_falls_back_to_default() {
@@ -97,5 +113,19 @@ mod tests {
         assert_eq!((used, key, v["a"].as_i64()), (KeyUsed::Default, DEFAULT_KEY, Some(1)));
         assert!(open_with(&pkt, [(KeyUsed::Device, [7; 16])]).is_err());
         assert!(open_with(&pkt, []).unwrap_err().to_string().contains("no key"));
+    }
+
+    #[test]
+    fn open_with_reports_what_failed_after_decryption() {
+        let mac: Mac = "00:11:22:33:44:55".parse().unwrap();
+        let keys = [(KeyUsed::Device, [7; 16]), (KeyUsed::Default, DEFAULT_KEY)];
+        // AES-GCM authenticated the device key: its failure is the answer, not the default key's.
+        let wire = seal(mac, Flags(Flags::ENCRYPTED | Flags::GCM), [5; 16], &[7; 16], b"not json");
+        let err = open_with(&Packet::parse(&wire).unwrap(), keys).unwrap_err().to_string();
+        assert!(err.contains("not JSON"), "{err}");
+        // No key decrypts: that is what is reported.
+        let wire = seal(mac, Flags(Flags::ENCRYPTED | Flags::GCM), [6; 16], &[8; 16], b"{}");
+        let err = open_with(&Packet::parse(&wire).unwrap(), keys).unwrap_err().to_string();
+        assert!(err.contains("wrong key"), "{err}");
     }
 }
