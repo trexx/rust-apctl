@@ -5,7 +5,7 @@ use anyhow::{Result, bail};
 use serde_json::Value;
 
 use crate::Ctx;
-use crate::cfg::Cfg;
+use crate::cfg::{Cfg, Prefix};
 use crate::json::{flag, int_of, oid, str_of};
 use crate::meta::Meta;
 use crate::wlan::{Radio, Vap, dynamic_vlan, network_vlan};
@@ -112,8 +112,8 @@ pub fn render_vlan(c: &mut Cfg, net: &Net) {
     for v in &net.vlans {
         for dev in &net.eth {
             k += 1;
-            c.set(format!("vlan.{k}.devname"), dev);
-            c.set(format!("vlan.{k}.id"), v);
+            c.set(format_args!("vlan.{k}.devname"), dev);
+            c.set(format_args!("vlan.{k}.id"), v);
         }
     }
 }
@@ -128,11 +128,11 @@ pub fn render_bridge(c: &mut Cfg, net: &Net, meta: &mut Meta) {
     let names: Vec<String> = net.bridges.iter().map(|b| b.name.clone()).collect();
     let indices = meta.bridges(&names);
     for (b, i) in net.bridges.iter().zip(indices) {
-        c.set(format!("bridge.{i}.devname"), &b.name);
-        c.set(format!("bridge.{i}.fd"), 1);
-        c.set(format!("bridge.{i}.stp.status"), "disabled");
+        c.set(format_args!("bridge.{i}.devname"), &b.name);
+        c.set(format_args!("bridge.{i}.fd"), 1);
+        c.set(format_args!("bridge.{i}.stp.status"), "disabled");
         for (dev, p) in meta.ports(&b.name, &b.ports) {
-            c.set(format!("bridge.{i}.port.{p}.devname"), dev);
+            c.set(format_args!("bridge.{i}.port.{p}.devname"), dev);
         }
     }
 }
@@ -170,21 +170,21 @@ pub fn render_netconf(c: &mut Cfg, ctx: &Ctx, net: &Net, radios: &[Radio], vaps:
     // VAPs are brought up by hostapd on APs that run it for every SSID.
     let hostapd_up = crate::bit(ctx.caps.wifi, 13);
     for ((name, kind), n) in ifaces.iter().zip(indices) {
-        let k = |s: &str| format!("netconf.{n}.{s}");
+        let k = Prefix::new("netconf", n as usize);
         let mgmt = name == "br0";
-        c.set(k("status"), if matches!(kind, Kind::Vap { disabled: true }) { "disabled" } else { "enabled" });
-        c.set(k("devname"), name);
+        c.set(k.at("status"), if matches!(kind, Kind::Vap { disabled: true }) { "disabled" } else { "enabled" });
+        c.set(k.at("devname"), name);
         let cn = static_ip.filter(|_| mgmt);
-        c.set(k("ip"), cn.and_then(|cn| str_of(cn, "ip")).unwrap_or("0.0.0.0"));
-        c.set(k("autoip.status"), "disabled");
+        c.set(k.at("ip"), cn.and_then(|cn| str_of(cn, "ip")).unwrap_or("0.0.0.0"));
+        c.set(k.at("autoip.status"), "disabled");
         if let Some(cn) = cn {
-            c.opt(k("netmask"), str_of(cn, "netmask"));
+            c.opt(k.at("netmask"), str_of(cn, "netmask"));
         }
         if matches!(kind, Kind::Eth | Kind::Vap { .. }) {
-            c.set(k("promisc"), "enabled");
+            c.set(k.at("promisc"), "enabled");
         }
         let up = !(matches!(kind, Kind::Vap { .. }) && hostapd_up);
-        c.set(k("up"), if up { "enabled" } else { "disabled" });
+        c.set(k.at("up"), if up { "enabled" } else { "disabled" });
     }
 }
 
@@ -197,6 +197,6 @@ pub fn render_ebtables(c: &mut Cfg, net: &Net) {
     c.set("ebtables.status", "enabled");
     c.set("ebtables.add_vlan.status", "disabled");
     for (i, rule) in net.ebtables.iter().enumerate() {
-        c.set(format!("ebtables.{}.cmd", i + 1), rule);
+        c.set(format_args!("ebtables.{}.cmd", i + 1), rule);
     }
 }

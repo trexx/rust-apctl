@@ -3,7 +3,7 @@
 use anyhow::{Result, bail};
 use serde_json::Value;
 
-use crate::cfg::Cfg;
+use crate::cfg::{Cfg, Prefix};
 use crate::javahash::hash_set_order;
 use crate::json::{arr, flag, int_of, mac_eq, on_off, str_list, str_of, text_of};
 use crate::meta::Meta;
@@ -23,7 +23,8 @@ pub fn render(ctx: &Ctx) -> Result<(String, Value)> {
         wanted.into_iter().zip(slots).zip(keys).map(|(((w, radio), slot), (id, _))| Vap { id, w, radio, slot }).collect();
     let net = net::build(ctx, &radios, &vaps)?;
 
-    let mut c = Cfg::default();
+    // A typical system_cfg is 10-20 KB.
+    let mut c = Cfg::with_capacity(16 << 10);
     unifi(&mut c, ctx);
     system(&mut c, ctx);
     users(&mut c, ctx)?;
@@ -42,10 +43,10 @@ pub fn render(ctx: &Ctx) -> Result<(String, Value)> {
             [("guest", 2, 30, "skb"), ("vapid", 5, 11, "ubnt"), ("associd", 11, 0, "ubnt")].iter().enumerate()
         {
             let i = i + 1;
-            c.set(format!("mark.{i}.name"), name);
-            c.set(format!("mark.{i}.bits"), bits);
-            c.set(format!("mark.{i}.shift"), shift);
-            c.set(format!("mark.{i}.location"), location);
+            c.set(format_args!("mark.{i}.name"), name);
+            c.set(format_args!("mark.{i}.bits"), bits);
+            c.set(format_args!("mark.{i}.shift"), shift);
+            c.set(format_args!("mark.{i}.location"), location);
         }
     }
     qos(&mut c, ctx, &radios, &vaps);
@@ -58,7 +59,7 @@ pub fn render(ctx: &Ctx) -> Result<(String, Value)> {
     c.set("ip6tables.status", "disabled");
     for s in ["redirector", "ipset", "dnsmasq"] {
         c.header(s);
-        c.set(format!("{s}.status"), "disabled");
+        c.set(format_args!("{s}.status"), "disabled");
     }
     syslog(&mut c, ctx);
     sshd(&mut c, ctx);
@@ -107,7 +108,7 @@ fn unifi(c: &mut Cfg, ctx: &Ctx) {
         (3, 0..=2) => 3,
         _ => 7,
     };
-    c.set("unifi.cfgcap_info", format!("0x{cap:x}"));
+    c.set("unifi.cfgcap_info", format_args!("0x{cap:x}"));
 }
 
 fn system(c: &mut Cfg, ctx: &Ctx) {
@@ -231,9 +232,9 @@ fn bandsteering(c: &mut Cfg, ctx: &Ctx, radios: &[Radio], vaps: &[Vap]) {
     for ng in vaps.iter().filter(|v| radios[v.radio].band == "ng") {
         if let Some(na) = vaps.iter().find(|v| radios[v.radio].band == "na" && v.id == ng.id) {
             k += 1;
-            c.set(format!("bandsteering.{k}.status"), "enabled");
-            c.set(format!("bandsteering.{k}.vap.1.devname"), ng.dev());
-            c.set(format!("bandsteering.{k}.vap.2.devname"), na.dev());
+            c.set(format_args!("bandsteering.{k}.status"), "enabled");
+            c.set(format_args!("bandsteering.{k}.vap.1.devname"), ng.dev());
+            c.set(format_args!("bandsteering.{k}.vap.2.devname"), na.dev());
         }
     }
 }
@@ -282,15 +283,15 @@ fn mac_acl(c: &mut Cfg, ctx: &Ctx, vaps: &[Vap]) {
     c.set("macacl.status", on_off(!blocks.is_empty()));
     for (k, (dev, policy, entries)) in blocks.iter().enumerate() {
         let k = k + 1;
-        c.set(format!("macacl.{k}.status"), "enabled");
-        c.set(format!("macacl.{k}.devname"), dev);
-        c.set(format!("macacl.{k}.acl.status"), "enabled");
-        c.set(format!("macacl.{k}.acl.policy"), policy);
+        c.set(format_args!("macacl.{k}.status"), "enabled");
+        c.set(format_args!("macacl.{k}.devname"), dev);
+        c.set(format_args!("macacl.{k}.acl.status"), "enabled");
+        c.set(format_args!("macacl.{k}.acl.policy"), policy);
         for (j, (mac, kind)) in entries.iter().enumerate() {
             let j = j + 1;
-            c.set(format!("macacl.{k}.acl.{j}.status"), "enabled");
-            c.set(format!("macacl.{k}.acl.{j}.mac"), mac);
-            c.set(format!("macacl.{k}.acl.{j}.type"), kind);
+            c.set(format_args!("macacl.{k}.acl.{j}.status"), "enabled");
+            c.set(format_args!("macacl.{k}.acl.{j}.mac"), mac);
+            c.set(format_args!("macacl.{k}.acl.{j}.type"), kind);
         }
     }
 }
@@ -332,8 +333,8 @@ fn addressing(c: &mut Cfg, ctx: &Ctx) {
     for i in 1..=2 {
         let dns = cn(&format!("dns{i}")).filter(|d| !d.is_empty());
         match dns {
-            Some(ip) => c.set(format!("resolv.nameserver.{i}.ip"), ip),
-            None => c.set(format!("resolv.nameserver.{i}.status"), "disabled"),
+            Some(ip) => c.set(format_args!("resolv.nameserver.{i}.ip"), ip),
+            None => c.set(format_args!("resolv.nameserver.{i}.status"), "disabled"),
         }
     }
     if is_static {
@@ -395,11 +396,11 @@ fn sshd(c: &mut Cfg, ctx: &Ctx) {
     c.set("sshd.status", "enabled");
     c.set("sshd.auth.passwd", on_off(flag(mgmt, "x_ssh_auth_password_enabled", true)));
     for (i, key) in arr(mgmt, "x_ssh_keys").iter().enumerate() {
-        let k = |s: &str| format!("sshd.auth.key.{}.{s}", i + 1);
-        c.set(k("status"), "enabled");
-        c.opt(k("value"), str_of(key, "key"));
-        c.opt(k("type"), str_of(key, "type"));
-        c.opt(k("comment"), str_of(key, "comment").or(str_of(key, "name")));
+        let k = Prefix::new("sshd.auth.key", i + 1);
+        c.set(k.at("status"), "enabled");
+        c.opt(k.at("value"), str_of(key, "key"));
+        c.opt(k.at("type"), str_of(key, "type"));
+        c.opt(k.at("comment"), str_of(key, "comment").or(str_of(key, "name")));
     }
     if !flag(mgmt, "x_ssh_bind_wildcard", false) {
         c.set("sshd.1.status", "enabled");
@@ -446,8 +447,8 @@ fn ntp(c: &mut Cfg, ctx: &Ctx) {
     }
     c.set("ntpclient.status", "enabled");
     for (i, server) in servers.iter().enumerate() {
-        c.set(format!("ntpclient.{}.status", i + 1), "enabled");
-        c.set(format!("ntpclient.{}.server", i + 1), server);
+        c.set(format_args!("ntpclient.{}.status", i + 1), "enabled");
+        c.set(format_args!("ntpclient.{}.server", i + 1), server);
     }
 }
 
@@ -467,8 +468,8 @@ fn switch(c: &mut Cfg, ctx: &Ctx) {
             .find(|p| int_of(p, "port_idx") == Some(i))
             .and_then(|p| str_of(p, "name"))
             .map_or_else(|| format!("Port {i}"), str::to_string);
-        c.set(format!("switch.port.{i}.name"), name);
-        c.set(format!("switch.port.{i}.opmode"), "switch");
+        c.set(format_args!("switch.port.{i}.name"), name);
+        c.set(format_args!("switch.port.{i}.opmode"), "switch");
     }
 }
 
@@ -629,22 +630,22 @@ fn mdns(c: &mut Cfg, ctx: &Ctx, vaps: &[Vap], net: &Net) {
                 .collect();
             if let (false, Some(own_bridge)) = (others.is_empty(), &own_bridge) {
                 p += 1;
-                c.set(format!("mdns_sd.proxy.{p}.status"), "enabled");
-                c.set(format!("mdns_sd.proxy.{p}.dst.1.devname"), own_bridge);
+                c.set(format_args!("mdns_sd.proxy.{p}.status"), "enabled");
+                c.set(format_args!("mdns_sd.proxy.{p}.dst.1.devname"), own_bridge);
                 for (i, b) in others.iter().enumerate() {
-                    c.set(format!("mdns_sd.proxy.{p}.src.{}.devname", i + 1), b);
+                    c.set(format_args!("mdns_sd.proxy.{p}.src.{}.devname", i + 1), b);
                 }
             }
             for n in &e.networks {
                 f += 1;
-                c.set(format!("mdns_sd.filter.{f}.vlan"), network_vlan(ctx, n.as_deref()));
-                c.set(format!("mdns_sd.filter.{f}.policy"), if e.mode == "all" { "allow" } else { "deny" });
+                c.set(format_args!("mdns_sd.filter.{f}.vlan"), network_vlan(ctx, n.as_deref()));
+                c.set(format_args!("mdns_sd.filter.{f}.policy"), if e.mode == "all" { "allow" } else { "deny" });
                 for (i, d) in devs.iter().enumerate() {
-                    c.set(format!("mdns_sd.filter.{f}.dst.{}.devname", i + 1), d);
+                    c.set(format_args!("mdns_sd.filter.{f}.dst.{}.devname", i + 1), d);
                 }
                 if e.mode == "specific" {
                     for (i, s) in e.services.iter().enumerate() {
-                        c.set(format!("mdns_sd.filter.{f}.service.{}.name", i + 1), s);
+                        c.set(format_args!("mdns_sd.filter.{f}.service.{}.name", i + 1), s);
                     }
                 }
             }
@@ -703,14 +704,14 @@ fn qos(c: &mut Cfg, ctx: &Ctx, radios: &[Radio], vaps: &[Vap]) {
     let mut k = 0;
     for u in &uplinks {
         k += 1;
-        c.set(format!("qos.if.{k}.devname"), u);
-        c.set(format!("qos.if.{k}.devspeed"), 1000);
-        c.set(format!("qos.if.{k}.type"), "uplink");
+        c.set(format_args!("qos.if.{k}.devname"), u);
+        c.set(format_args!("qos.if.{k}.devspeed"), 1000);
+        c.set(format_args!("qos.if.{k}.type"), "uplink");
     }
     for v in vaps {
         k += 1;
-        c.set(format!("qos.if.{k}.devname"), v.dev());
-        c.set(format!("qos.if.{k}.devspeed"), radio_max_mbps(&radios[v.radio]));
+        c.set(format_args!("qos.if.{k}.devname"), v.dev());
+        c.set(format_args!("qos.if.{k}.devspeed"), radio_max_mbps(&radios[v.radio]));
     }
     let default = groups.iter().find(|g| str_of(g, "attr_hidden_id") == Some("Default")).copied();
     for (i, v) in vaps.iter().enumerate() {
@@ -718,18 +719,18 @@ fn qos(c: &mut Cfg, ctx: &Ctx, radios: &[Radio], vaps: &[Vap]) {
         let group = str_of(&v.w, "usergroup_id").and_then(|id| groups.iter().find(|g| crate::json::oid(g) == Some(id)).copied()).or(default);
         let (down, up) = group.map_or((-1, -1), limits);
         let ceiling = radio_max_mbps(&radios[v.radio]);
-        c.set(format!("qos.vap.{m}.id"), m);
-        c.set(format!("qos.vap.{m}.devname"), v.dev());
-        c.set(format!("qos.vap.{m}.dwnlink.minspeed"), if down > 0 { down } else { ceiling });
+        c.set(format_args!("qos.vap.{m}.id"), m);
+        c.set(format_args!("qos.vap.{m}.devname"), v.dev());
+        c.set(format_args!("qos.vap.{m}.dwnlink.minspeed"), if down > 0 { down } else { ceiling });
         if down > 0 {
-            c.set(format!("qos.vap.{m}.dwnlink.maxspeed"), down);
+            c.set(format_args!("qos.vap.{m}.dwnlink.maxspeed"), down);
         }
         for (j, u) in uplinks.iter().enumerate() {
             let j = j + 1;
-            c.set(format!("qos.vap.{m}.uplink.{j}.devname"), u);
-            c.set(format!("qos.vap.{m}.uplink.{j}.minspeed"), if up > 0 { up } else { ceiling });
+            c.set(format_args!("qos.vap.{m}.uplink.{j}.devname"), u);
+            c.set(format_args!("qos.vap.{m}.uplink.{j}.minspeed"), if up > 0 { up } else { ceiling });
             if up > 0 {
-                c.set(format!("qos.vap.{m}.uplink.{j}.maxspeed"), up);
+                c.set(format_args!("qos.vap.{m}.uplink.{j}.maxspeed"), up);
             }
         }
     }
@@ -762,9 +763,9 @@ fn cron(c: &mut Cfg, ctx: &Ctx, radios: &[Radio], vaps: &[Vap]) {
     c.set("cron.1.user", ctx.ssh_username());
     for (j, (schedule, cmd)) in jobs.iter().enumerate() {
         let j = j + 1;
-        c.set(format!("cron.1.job.{j}.status"), "enabled");
-        c.set(format!("cron.1.job.{j}.schedule"), schedule);
-        c.set(format!("cron.1.job.{j}.cmd"), cmd);
+        c.set(format_args!("cron.1.job.{j}.status"), "enabled");
+        c.set(format_args!("cron.1.job.{j}.schedule"), schedule);
+        c.set(format_args!("cron.1.job.{j}.cmd"), cmd);
     }
 }
 

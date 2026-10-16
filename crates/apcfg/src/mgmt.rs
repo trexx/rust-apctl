@@ -64,9 +64,9 @@ pub fn render(ctx: &Ctx) -> String {
     out.set("selfrun_guest_mode", "pass");
     out.set("cfgversion", ctx.cfgversion);
     out.set("led_enabled", led_enabled(ctx));
-    out.set("stun_url", format!("stun://{host}:{stun_port}/"));
+    out.set("stun_url", format_args!("stun://{host}:{stun_port}/"));
     let https = if https_port == 443 { String::new() } else { format!(":{https_port}") };
-    out.set("mgmt_url", format!("https://{host}{https}/manage/site/{site_name}"));
+    out.set("mgmt_url", format_args!("https://{host}{https}/manage/site/{site_name}"));
     // The key is only resent while the AP still authenticates with an older one.
     if let (Some(key), Some(used)) = (str_of(ctx.device, "x_authkey"), str_of(ctx.device, "x_inform_authkey"))
         && key != used
@@ -74,7 +74,7 @@ pub fn render(ctx: &Ctx) -> String {
         out.set("authkey", key);
     }
     if flag(ctx.setting("super_mgmt"), "override_inform_host", false) || ctx.device.get("migrate_inform_url").is_some() {
-        out.set("inform_url", format!("http://{host}:{inform_port}/inform"));
+        out.set("inform_url", format_args!("http://{host}:{inform_port}/inform"));
     }
     out.set("use_aes_gcm", "true");
     out.set("report_crash", "true");
