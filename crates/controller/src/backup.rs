@@ -573,7 +573,7 @@ fn valid_id(id: &str) -> bool {
 /// A restore that fails is logged and set aside (`pending.failed`, shown on
 /// the backups page) and apctl starts with the data it has, rather than
 /// failing on every start. Also clears out staging left behind.
-pub fn apply_pending(b: &Backups) -> Result<()> {
+pub fn apply_pending(b: &Backups) {
     let marker = b.staging().join("pending");
     if let Ok(id) = fs::read_to_string(&marker) {
         match apply(b, id.trim()) {
@@ -592,7 +592,6 @@ pub fn apply_pending(b: &Backups) -> Result<()> {
         }
     }
     clean_staging(b);
-    Ok(())
 }
 
 fn apply(b: &Backups, id: &str) -> Result<()> {
@@ -1121,12 +1120,12 @@ mod tests {
         Connection::open(src.join("config.db")).unwrap().execute_batch("DELETE FROM client_aliases;").unwrap();
         let (id, _) = stage(&b, &b.dir().join(&m.name)).unwrap();
         fs::write(b.staging().join("pending"), &id).unwrap();
-        apply_pending(&b).unwrap();
+        apply_pending(&b);
         assert_eq!(count(&src.join("config.db"), "SELECT COUNT(*) FROM client_aliases"), 1, "restored");
         assert!(!b.staging().join("pending").exists());
         assert!(list(&b).iter().any(|x| x.kind == Kind::PreRestore), "the replaced state was saved");
         // Nothing pending: nothing happens.
-        apply_pending(&b).unwrap();
+        apply_pending(&b);
     }
 
     #[test]
@@ -1155,13 +1154,13 @@ mod tests {
         let b = Backups { data_dir: src.clone(), key: None };
         fs::create_dir_all(b.staging()).unwrap();
         fs::write(b.staging().join("pending"), "r123").unwrap();
-        apply_pending(&b).unwrap();
+        apply_pending(&b);
         assert!(!b.staging().join("pending").exists());
         assert!(fs::read_to_string(b.staging().join("pending.failed")).unwrap().contains("no manifest"));
         assert_eq!(count(&src.join("config.db"), "SELECT COUNT(*) FROM client_aliases"), 1, "the current data is kept");
         // A marker naming no staged backup.
         fs::write(b.staging().join("pending"), "../config.db").unwrap();
-        apply_pending(&b).unwrap();
+        apply_pending(&b);
         assert!(src.join("config.db").exists() && !b.staging().join("pending").exists());
     }
 
@@ -1222,7 +1221,7 @@ mod tests {
     fn with_a_key_only_sealed_backups_are_restored() {
         let src = data("plain");
         let plain = create(&Backups { data_dir: src.clone(), key: None }, &src, Kind::Manual, 0).unwrap();
-        let b = Backups { data_dir: src.clone(), key: Some([5u8; 32]) };
+        let b = Backups { data_dir: src, key: Some([5u8; 32]) };
         let err = unpack(&b.dir().join(&plain.name), b.key.as_ref(), &dir("plain-out")).unwrap_err();
         assert!(err.to_string().contains("not encrypted"), "{err:#}");
     }
@@ -1238,18 +1237,18 @@ mod tests {
         }
         // Nor can a staged manifest, when the restore is applied.
         let src = data("names-apply");
-        let b = Backups { data_dir: src.clone(), key: None };
+        let b = Backups { data_dir: src, key: None };
         fs::create_dir_all(b.staging().join("r1")).unwrap();
         fs::write(b.staging().join("r1").join("manifest.json"), serde_json::to_vec(&manifest(&[("../config.db", 1)])).unwrap()).unwrap();
         fs::write(b.staging().join("pending"), "r1").unwrap();
-        apply_pending(&b).unwrap();
+        apply_pending(&b);
         assert!(fs::read_to_string(b.staging().join("pending.failed")).unwrap().contains("unexpected file"));
     }
 
     #[test]
     fn left_over_staging_is_cleared() {
         let src = dir("clean");
-        let b = Backups { data_dir: src.clone(), key: None };
+        let b = Backups { data_dir: src, key: None };
         fs::create_dir_all(b.staging().join("r1")).unwrap();
         fs::create_dir_all(b.staging().join("r2")).unwrap();
         fs::write(b.staging().join("upload-1-x.apb"), "x").unwrap();

@@ -875,7 +875,7 @@ mod tests {
         let (engine, engine_rx) = tokio::sync::mpsc::channel(1);
         let (tx, _) = broadcast::channel(1);
         let state = AppState {
-            backups: crate::backup::Backups { data_dir: dir.clone(), key: None },
+            backups: crate::backup::Backups { data_dir: dir, key: None },
             store, vendors: Default::default(), renderer: crate::dryrun::apcfg_renderer(crate::EMULATE_VERSION.into()), auth, engine, live: Default::default(), tx, started: 0, source: "none".into(),
             active: false, writer,
         };
