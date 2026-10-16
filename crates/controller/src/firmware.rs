@@ -113,16 +113,17 @@ pub enum Status {
     Unknown,
 }
 
-impl Status {
-    /// As the API names it.
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Status::UpdateAvailable => "update_available",
-            Status::UpToDate => "up_to_date",
-            Status::Ahead => "ahead",
-            Status::Unknown => "unknown",
-        }
-    }
+/// Why an AP asked to be upgraded was not queued.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Skip {
+    UpToDate,
+    Ahead,
+    /// No release to offer (none for its model, or below what it needs).
+    Unknown,
+    Offline,
+    /// Not an AP apctl knows (or not a MAC at all).
+    NotFound,
 }
 
 pub fn status(current: Option<&str>, release: Option<&Release>, required: Option<&str>) -> Status {
@@ -235,6 +236,40 @@ impl Jobs {
         self.stopped = None;
         n
     }
+}
+
+/// A change to the queue asked for from the UI, made by the engine.
+#[derive(Debug)]
+pub enum Op {
+    Enqueue(Vec<Job>),
+    CancelQueued,
+}
+
+impl Op {
+    /// Makes the change; how many upgrades it queued or cancelled.
+    pub fn apply(self, jobs: &mut Jobs) -> usize {
+        match self {
+            Op::Enqueue(new) => {
+                let n = new.len();
+                jobs.enqueue(new);
+                tracing::info!("firmware: {n} upgrade(s) queued");
+                n
+            }
+            Op::CancelQueued => {
+                let n = jobs.cancel_queued();
+                tracing::info!("firmware: {n} queued upgrade(s) cancelled");
+                n
+            }
+        }
+    }
+}
+
+/// Has the engine change the queue.
+async fn change_queue(s: &AppState, op: Op) -> Result<usize, ApiError> {
+    let (done, rx) = tokio::sync::oneshot::channel();
+    let stopped = || ApiError(StatusCode::SERVICE_UNAVAILABLE, "engine stopped".into());
+    s.engine.send(crate::engine::Input::Firmware { op, done }).await.map_err(|_| stopped())?;
+    rx.await.map_err(|_| stopped())
 }
 
 /// The upgrade command for an AP's inform reply, if its turn has come. Marks
@@ -418,12 +453,19 @@ pub async fn upgrade(State(s): State<AppState>, headers: HeaderMap, Json(b): Jso
     crate::api::require_active(&s, "upgrades need")?;
     let store = s.store.clone();
     let (rels, ..) = tokio::task::spawn_blocking(move || releases(&store)).await??;
-    let wanted: Vec<Mac> = b.macs.iter().filter_map(|m| m.parse().ok()).collect();
-    let mut chosen: Vec<ApInfo> = aps(&s).into_iter().filter(|a| wanted.contains(&a.mac)).collect();
+    let known = aps(&s);
+    let mut skipped = Vec::new();
+    let mut wanted: Vec<Mac> = Vec::new();
+    for m in &b.macs {
+        match m.parse::<Mac>() {
+            Ok(mac) if known.iter().any(|a| a.mac == mac) => wanted.push(mac),
+            _ => skipped.push(json!({ "mac": m, "why": Skip::NotFound })),
+        }
+    }
+    let mut chosen: Vec<ApInfo> = known.into_iter().filter(|a| wanted.contains(&a.mac)).collect();
     // Mesh APs first: an AP with mesh children must not restart before them.
     chosen.sort_by(|x, y| y.mesh.cmp(&x.mesh).then(x.mac.cmp(&y.mac)));
     let mut jobs = Vec::new();
-    let mut skipped = Vec::new();
     for a in chosen {
         let rel = a.model.as_deref().map(platform_for).and_then(|p| rels.iter().find(|r| r.platform == p).cloned());
         match (status(a.version.as_deref(), rel.as_ref(), a.required.as_deref()), rel, a.online) {
@@ -440,11 +482,18 @@ pub async fn upgrade(State(s): State<AppState>, headers: HeaderMap, Json(b): Jso
                 sent_at: None,
                 expires: None,
             }),
-            (st, _, online) => skipped.push(json!({ "mac": a.mac, "why": if online { st.as_str() } else { "offline" } })),
+            (st, _, online) => {
+                let why = match st {
+                    _ if !online => Skip::Offline,
+                    Status::UpToDate => Skip::UpToDate,
+                    Status::Ahead => Skip::Ahead,
+                    Status::UpdateAvailable | Status::Unknown => Skip::Unknown,
+                };
+                skipped.push(json!({ "mac": a.mac, "why": why }));
+            }
         }
     }
-    let n = jobs.len();
-    s.live.write().unwrap().firmware.enqueue(jobs);
+    let n = change_queue(&s, Op::Enqueue(jobs)).await?;
     Ok(Json(json!({ "queued": n, "skipped": skipped })))
 }
 
@@ -489,14 +538,14 @@ pub async fn upgrade_url(State(s): State<AppState>, headers: HeaderMap, Json(b):
         sent_at: None,
         expires: None,
     };
-    s.live.write().unwrap().firmware.enqueue(vec![job]);
-    Ok(Json(json!({ "queued": 1 })))
+    let n = change_queue(&s, Op::Enqueue(vec![job])).await?;
+    Ok(Json(json!({ "queued": n })))
 }
 
 /// POST /api/firmware/cancel: drop queued upgrades (one already sent cannot be stopped).
 pub async fn cancel(State(s): State<AppState>, headers: HeaderMap) -> Result<Json<Value>, ApiError> {
     crate::api::check_csrf(&headers)?;
-    let n = s.live.write().unwrap().firmware.cancel_queued();
+    let n = change_queue(&s, Op::CancelQueued).await?;
     Ok(Json(json!({ "cancelled": n })))
 }
 
@@ -539,7 +588,7 @@ mod tests {
         // A release below what the AP needs is not offered.
         assert_eq!(status(Some("6.7.0.1"), Some(&rel), Some("7.0.0")), Status::Unknown);
         assert_eq!(status(Some("6.7.0.1"), None, None), Status::Unknown);
-        assert_eq!((json!(Status::UpdateAvailable), Status::UpToDate.as_str()), (json!("update_available"), "up_to_date"), "named as the UI expects");
+        assert_eq!((json!(Status::UpdateAvailable), json!(Skip::NotFound)), (json!("update_available"), json!("not_found")), "named as the UI expects");
     }
 
     /// A test AP's MAC, by a one-hex-digit name.
@@ -615,6 +664,9 @@ mod tests {
         assert_eq!(j.expired(701), Some(m("a")));
         assert_eq!(j.cancel_queued(), 1, "only b; a is already upgrading");
         assert!(j.current.is_some());
+        // As the engine makes the changes the UI asks for.
+        assert_eq!(Op::Enqueue(vec![job("c"), job("d")]).apply(&mut j), 2);
+        assert_eq!(Op::CancelQueued.apply(&mut j), 2);
     }
 
     #[test]

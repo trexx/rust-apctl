@@ -60,6 +60,9 @@ pub enum Input {
     EditState { ts: Ts, what: String, edit: StateEdit, done: tokio::sync::oneshot::Sender<Result<(), String>> },
     /// Store the automatic-backup settings (JSON).
     SaveBackupSettings(String),
+    /// Change the firmware upgrade queue; `done` gets how many upgrades were
+    /// queued or cancelled.
+    Firmware { op: crate::firmware::Op, done: tokio::sync::oneshot::Sender<usize> },
     /// Acknowledge a finding with an optional note (`Some`), or withdraw the acknowledgement (`None`).
     AckThreat { ts: Ts, kind: &'static str, bssid: String, note: Option<Option<String>> },
 }
@@ -463,6 +466,10 @@ impl Engine {
             }
             Input::SaveBackupSettings(json) => {
                 self.writer.exec(Db::Config, "INSERT OR REPLACE INTO backup_settings (id, json) VALUES (1, ?1)", vec![Sql::Text(json)])
+            }
+            Input::Firmware { op, done } => {
+                let n = op.apply(&mut self.live.write().unwrap().firmware);
+                let _ = done.send(n);
             }
             Input::AckThreat { ts, kind, bssid, note } => match note {
                 Some(note) => self.writer.exec(
