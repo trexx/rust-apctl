@@ -158,12 +158,22 @@ impl Jobs {
         self.current.as_mut().filter(|j| j.mac == mac)
     }
 
-    /// The AP reports a new version: the job succeeded if it was upgrading.
+    /// The AP reports its version: the job succeeded if it was upgrading and
+    /// the version changed. When the version it started from is not known, the
+    /// first one it reports after the upgrade was sent is taken as that.
     pub fn version_seen(&mut self, mac: &str, version: &str) -> Option<Job> {
-        let j = self.current.as_ref().filter(|j| j.mac == mac && j.state != "queued" && j.from.as_deref() != Some(version))?.clone();
-        self.current = None;
+        let j = self.current.as_mut().filter(|j| j.mac == mac && j.state != "queued")?;
+        match &j.from {
+            None => {
+                j.from = Some(version.to_string());
+                return None;
+            }
+            Some(f) if f == version => return None,
+            Some(_) => {}
+        }
+        let j = self.current.take();
         self.next();
-        Some(j)
+        j
     }
 
     /// The current job failed: stop the queue so a problem is not repeated on every AP.
@@ -203,7 +213,11 @@ pub fn command(jobs: &mut Jobs, mac: &str, inform: &Value, now: Ts) -> Option<Re
     let estimate = inform["upgrade_duration"].as_i64().unwrap_or(0) + inform["reboot_duration"].as_i64().unwrap_or(0);
     j.state = "sent";
     j.sent_at = Some(now);
-    j.expires = Some(now + estimate.max(180).max(450));
+    j.expires = Some(now + estimate.max(450));
+    // What it runs now, so that only a different version counts as the upgrade landing.
+    if j.from.is_none() {
+        j.from = inform["version"].as_str().map(str::to_string);
+    }
     let mut cmd = json!({ "_type": "upgrade", "version": j.target, "url": j.url, "server_time_in_utc": (now * 1000).to_string() });
     if let Some(m) = &j.md5 {
         cmd["md5sum"] = json!(m);
@@ -249,6 +263,8 @@ pub fn check(writer: &Writer) -> anyhow::Result<usize> {
                     ],
                 );
             }
+            // Platforms the feed no longer lists.
+            writer.exec(Db::Config, "DELETE FROM firmware_releases WHERE checked < ?1", vec![Sql::Integer(now)]);
             writer.exec(Db::Config, "INSERT OR REPLACE INTO firmware_check (id, ts, error) VALUES (1, ?1, NULL)", vec![Sql::Integer(now)]);
             Ok(releases.len())
         }
@@ -344,10 +360,24 @@ pub async fn index(State(s): State<AppState>) -> Result<Json<Value>, ApiError> {
 pub async fn check_now(State(s): State<AppState>, headers: HeaderMap) -> Result<Json<Value>, ApiError> {
     crate::api::check_csrf(&headers)?;
     let w = s.writer.clone().ok_or_else(|| ApiError::internal("no writer"))?;
+    let started = store::now_ts();
     let n = tokio::task::spawn_blocking(move || check(&w))
         .await
         .map_err(|e| ApiError::internal(e.to_string()))?
         .map_err(|e| ApiError(StatusCode::BAD_GATEWAY, format!("the firmware feed could not be read: {e:#}")))?;
+    // The writer commits about once a second: wait (a few seconds at most) for
+    // this check, written last, so that the page's next read shows the new releases.
+    for _ in 0..30 {
+        let store = s.store.clone();
+        let checked = tokio::task::spawn_blocking(move || store.read(Db::Config, |c| Ok(c.query_row("SELECT ts FROM firmware_check WHERE id = 1", [], |r| r.get::<_, Ts>(0))?)))
+            .await
+            .ok()
+            .and_then(Result::ok);
+        if checked.is_some_and(|t| t >= started) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
     Ok(Json(json!({ "ok": true, "platforms": n })))
 }
 
@@ -521,6 +551,7 @@ mod tests {
         assert_eq!((cmd["_type"].as_str(), cmd["version"].as_str(), cmd["md5sum"].as_str(), cmd["sha256sum"].as_str()), (Some("upgrade"), Some("6.8.2.15592"), Some("m"), Some("s")));
         assert_eq!(j.current.as_ref().and_then(|c| c.expires), Some(100 + 450), "at least 450 s");
         assert!(command(&mut j, "a", &json!({}), 110).is_none(), "sent once");
+        assert!(j.version_seen("b", "6.8.2.15592").is_none(), "not b's turn");
         // The same version again is not success; the new one is.
         assert!(j.version_seen("a", "6.7.0.1").is_none());
         assert!(j.version_seen("a", "6.8.2.15592").is_some());
@@ -532,6 +563,23 @@ mod tests {
         // Starting again clears the stop.
         j.enqueue(vec![]);
         assert_eq!(j.current.as_ref().map(|c| c.mac.as_str()), Some("c"));
+    }
+
+    #[test]
+    fn success_needs_a_version_change_when_the_start_is_unknown() {
+        let mut j = Jobs::default();
+        j.enqueue(vec![Job { from: None, ..job("a") }]);
+        assert!(j.version_seen("a", "6.7.0.1").is_none(), "not sent yet");
+        // The version in the inform the command goes out with is where it started.
+        command(&mut j, "a", &json!({ "version": "6.7.0.1" }), 0).unwrap().unwrap();
+        assert!(j.version_seen("a", "6.7.0.1").is_none(), "the next inform, still downloading");
+        assert_eq!(j.version_seen("a", "6.8.2.15592").and_then(|x| x.from).as_deref(), Some("6.7.0.1"));
+        // An inform without a version: the first one reported afterwards is the start.
+        j.enqueue(vec![Job { from: None, ..job("b") }]);
+        command(&mut j, "b", &json!({}), 0).unwrap().unwrap();
+        assert!(j.version_seen("b", "6.7.0.1").is_none());
+        assert!(j.version_seen("b", "6.7.0.1").is_none());
+        assert!(j.version_seen("b", "6.8.2.15592").is_some());
     }
 
     #[test]
