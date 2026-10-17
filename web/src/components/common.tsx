@@ -535,13 +535,16 @@ const EVENTS: { [K in EventKind]: EventSpec<K> } = {
   channel_plan: {
     label: "Channel AI",
     tone: "neutral",
-    describe: (d) => {
+    describe: (d, names) => {
       const moves = d.changes ?? [];
       return `${d.band ? band(d.band) : d.band} (${d.trigger}): ${
         moves.length === 0
           ? "nothing to move"
           : moves
-              .map((m) => `${m.name ?? m.mac} ${m.from ?? "?"} → ${m.to}`)
+              .map(
+                (m) =>
+                  `${m.name ?? names[m.mac] ?? m.mac} ${m.from ?? "?"} → ${m.to}`,
+              )
               .join(", ")
       }${moves.length > 0 && !d.applied ? " (not applied)" : ""}`;
     },
