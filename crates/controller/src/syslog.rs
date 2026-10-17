@@ -29,16 +29,63 @@ use crate::model::Ts;
 
 pub const MAGIC: [u8; 4] = [0xab, 0xcd, 0xdc, 0xba];
 
-/// APs log some secrets in clear text (e.g. `authkey: <hex>` when they save a
-/// new management config). Values after these names are masked before storage.
-static SECRET: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
-    // Any key name ending in one of these words, e.g. `x_passphrase`, `wpa_psk`.
-    regex::Regex::new(r"(?i)\b([a-z_]*(?:authkey|syslog_key|vwirekey|psk|passphrase|password|passwd|secret|iapp_key))(\s*[:=]\s*)([^\s,;]+)").unwrap()
-});
+/// A key name and its separator: `key=`, `key: `, and JSON's `"key": `. An
+/// ASCII word boundary: a Unicode one would keep the regex off its fast path
+/// on a line with any non-ASCII text.
+static KEY: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| regex::Regex::new(r#"(?i)(?-u:\b)([a-z0-9_.]+)["']?\s*[:=]\s*"#).unwrap());
 
+/// APs log some secrets in clear text (e.g. `authkey: <hex>` when they save a
+/// new management config). The values of keys named like a secret in a
+/// config (`x_passphrase`, `wpa.psk`, `snmp.community`...) are masked before
+/// storage; a quoted value is masked whole, its quotes kept.
 pub fn redact(msg: &str) -> String {
-    SECRET.replace_all(msg, "${1}${2}<redacted>").into_owned()
+    let mut out = String::with_capacity(msg.len());
+    // How much of `msg` is copied to `out` or masked.
+    let mut done = 0;
+    // Only a secret's value is skipped: another key's may hold a secret's
+    // key (`wifi1ap0: psk=x`), which the search then finds.
+    for c in KEY.captures_iter(msg) {
+        let (all, key) = (c.get(0).expect("the whole match"), &c[1]);
+        if all.start() < done || !wire::cfgdiff::is_secret(key) {
+            continue;
+        }
+        let (len, quote) = value(&msg[all.end()..]);
+        if len == 0 {
+            continue;
+        }
+        out.push_str(&msg[done..all.end()]);
+        match quote {
+            Some(q) => {
+                out.push(q);
+                out.push_str("<redacted>");
+                out.push(q);
+            }
+            None => out.push_str("<redacted>"),
+        }
+        done = all.end() + len;
+    }
+    out.push_str(&msg[done..]);
+    out
 }
+
+/// The length of the value `s` starts with, and its quote if it is quoted: a
+/// quoted string whole (`"a b"`, `"a\"b"`, `'a b'`), else up to a space,
+/// comma, semicolon or closing brace.
+fn value(s: &str) -> (usize, Option<char>) {
+    let b = s.as_bytes();
+    if let Some(&q @ (b'"' | b'\'')) = b.first() {
+        let mut i = 1;
+        while i < b.len() {
+            match b[i] {
+                b'\\' if q == b'"' => i += 2,
+                c if c == q => return (i + 1, Some(char::from(q))),
+                _ => i += 1,
+            }
+        }
+    }
+    (s.find(|c: char| c.is_whitespace() || matches!(c, ',' | ';' | '}')).unwrap_or(s.len()), None)
+}
+
 const HEADER: usize = 29;
 
 /// The sender's `hash_id` (16 hex characters) of an encrypted datagram.
@@ -206,6 +253,35 @@ pub(crate) mod tests {
         let other = Arc::new(serde_json::json!({ "devices": [] }));
         c.refresh(Some(&other), &keys);
         assert!(c.get(&ap).is_none());
+    }
+
+    #[test]
+    fn secrets_are_masked_in_every_form() {
+        for (line, want) in [
+            ("x_passphrase=hunter2, psk:abc; channel=36", "x_passphrase=<redacted>, psk:<redacted>; channel=36"),
+            // JSON and other quoted keys, a quoted value whole.
+            (r#"{"x_passphrase": "a b", "name": "Home"}"#, r#"{"x_passphrase": "<redacted>", "name": "Home"}"#),
+            (r#"cfg {"psk":"x","channel":36}"#, r#"cfg {"psk":"<redacted>","channel":36}"#),
+            (r#"{"psk":"a\"b c"} done"#, r#"{"psk":"<redacted>"} done"#),
+            ("'wpa_psk': 'a b' ok", "'wpa_psk': '<redacted>' ok"),
+            (r#"psk="a b" channel=36"#, r#"psk="<redacted>" channel=36"#),
+            (r#"psk="unterminated value"#, "psk=<redacted> value"),
+            (r#"{"radius_secret":12345}"#, r#"{"radius_secret":<redacted>}"#),
+            // The names config diffs mask.
+            ("aaa.1.wpa.psk=x snmp.community=public unifi.key=k iapp_key: 0f sae_password = y", "aaa.1.wpa.psk=<redacted> snmp.community=<redacted> unifi.key=<redacted> iapp_key: <redacted> sae_password = <redacted>"),
+            ("Authkey: ABC", "Authkey: <redacted>"),
+            // A secret's key in another key's value is still found.
+            ("wifi1ap0: psk=abc", "wifi1ap0: psk=<redacted>"),
+            ("cfg: authkey: 0123", "cfg: authkey: <redacted>"),
+            // Not secrets.
+            ("max_txpower=20 channel: 36 key_mgmt WPA-PSK", "max_txpower=20 channel: 36 key_mgmt WPA-PSK"),
+            ("psk: ", "psk: "),
+            // Non-ASCII text around them.
+            ("Café « psk=hunter2 » ключ=1 x_passphrase: пароль ✓", "Café « psk=<redacted> » ключ=1 x_passphrase: <redacted> ✓"),
+            ("naïve_psk=ü", "naïve_psk=<redacted>"),
+        ] {
+            assert_eq!(redact(line), want, "{line}");
+        }
     }
 
     #[test]
