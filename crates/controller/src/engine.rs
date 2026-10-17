@@ -320,20 +320,6 @@ pub struct PushedConfig {
     pub cfgversion: Option<String>,
 }
 
-/// The last push stored for each AP, with its secrets masked.
-pub fn stored_pushes(c: &rusqlite::Connection) -> rusqlite::Result<HashMap<Mac, PushedConfig>> {
-    let mut stmt = c.prepare("SELECT mgmt_cfg, system_cfg, cfgversion, mac FROM device_config")?;
-    let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(3)?, stored_push_row(r)?)))?;
-    let mut out = HashMap::new();
-    for row in rows {
-        let (mac, pushed) = row?;
-        if let Ok(mac) = mac.parse() {
-            out.insert(mac, pushed);
-        }
-    }
-    Ok(out)
-}
-
 /// One AP's last stored push, with its secrets masked.
 pub fn stored_push(c: &rusqlite::Connection, mac: &Mac) -> rusqlite::Result<Option<PushedConfig>> {
     use rusqlite::OptionalExtension;

@@ -97,20 +97,17 @@ impl Comparison {
 /// Their values are sorted within each list, keeping the line positions.
 fn normalise_unordered<'a>(lines: &[&'a str]) -> Vec<Cow<'a, str>> {
     let mut out: Vec<Cow<str>> = lines.iter().map(|l| Cow::Borrowed(*l)).collect();
-    let mut groups: std::collections::BTreeMap<String, Vec<usize>> = Default::default();
-    let lock2ap: std::collections::HashSet<String> = lines
-        .iter()
-        .filter_map(|l| l.strip_suffix(".type=lock2ap"))
-        .map(|k| format!("{k}.mac"))
-        .collect();
+    let mut groups: std::collections::BTreeMap<(&str, &str), Vec<usize>> = Default::default();
+    // The `macacl.<k>.acl.<n>` entries that lock a client to an AP.
+    let lock2ap: std::collections::HashSet<&str> = lines.iter().filter_map(|l| l.strip_suffix(".type=lock2ap")).collect();
     for (i, line) in lines.iter().enumerate() {
         let key = line.split_once('=').map_or(*line, |(k, _)| k);
-        let parts: Vec<&str> = key.split('.').collect();
-        let group = match parts[..] {
-            ["mdns_sd", "filter", n, "service", _, "name"] => Some(format!("mdns {n}")),
-            ["wireless", n, "bcfilt", _, "mac"] => Some(format!("bcfilt {n}")),
-            ["macacl", k, "acl", _, "mac"] if lock2ap.contains(key) => Some(format!("lock2ap {k}")),
-            _ => None,
+        let group = if let Some(n) = list_of(key, "mdns_sd.filter.", "service.", ".name") {
+            Some(("mdns", n))
+        } else if let Some(n) = list_of(key, "wireless.", "bcfilt.", ".mac") {
+            Some(("bcfilt", n))
+        } else {
+            list_of(key, "macacl.", "acl.", ".mac").filter(|_| key.strip_suffix(".mac").is_some_and(|k| lock2ap.contains(k))).map(|k| ("lock2ap", k))
         };
         if let Some(g) = group {
             groups.entry(g).or_default().push(i);
@@ -129,18 +126,33 @@ fn normalise_unordered<'a>(lines: &[&'a str]) -> Vec<Cow<'a, str>> {
     out
 }
 
+/// The list a key is an entry of, for keys `<prefix><list>.<middle><index><suffix>`
+/// (the list and index one part each): `list`.
+fn list_of<'a>(key: &'a str, prefix: &str, middle: &str, suffix: &str) -> Option<&'a str> {
+    let (list, rest) = key.strip_prefix(prefix)?.split_once('.')?;
+    let index = rest.strip_prefix(middle)?.strip_suffix(suffix)?;
+    (!index.contains('.')).then_some(list)
+}
+
 /// Line by line the same, or the same once [`normalise_unordered`] sorted the unordered lists.
 fn equivalent_lines(o: &[&str], a: &[&str]) -> bool {
     o == a || o.len() == a.len() && normalise_unordered(o) == normalise_unordered(a)
 }
 
 /// What [`Comparison::matches`] says of one config, without making the diff.
+/// With `redacted`, secrets are not compared: the caller must know they
+/// cannot differ.
 pub fn equivalent(ours: &str, actual: &str, redacted: bool) -> bool {
     if ours == actual {
         return true;
     }
-    let (ours, actual): (Cow<str>, Cow<str>) = if redacted { (cfgdiff::redact(ours).into(), cfgdiff::redact(actual).into()) } else { (ours.into(), actual.into()) };
+    let (ours, actual) = masked(ours, actual, redacted);
     equivalent_lines(&lines(&ours), &lines(&actual))
+}
+
+/// Both configs, with their secret values masked if `redacted`.
+fn masked<'a>(ours: &'a str, actual: &'a str, redacted: bool) -> (Cow<'a, str>, Cow<'a, str>) {
+    if redacted { (cfgdiff::redact(ours).into(), cfgdiff::redact(actual).into()) } else { (ours.into(), actual.into()) }
 }
 
 fn lines(s: &str) -> Vec<&str> {
@@ -151,7 +163,7 @@ fn lines(s: &str) -> Vec<&str> {
 /// masked on both sides first (used when only a redacted copy of the actual
 /// config is available).
 pub fn compare_field(ours: &str, actual: &str, redacted: bool) -> FieldComparison {
-    let (ours, actual): (Cow<str>, Cow<str>) = if redacted { (cfgdiff::redact(ours).into(), cfgdiff::redact(actual).into()) } else { (ours.into(), actual.into()) };
+    let (ours, actual) = masked(ours, actual, redacted);
     let (o, a) = (lines(&ours), lines(&actual));
     let d = cfgdiff::diff(&actual, &ours);
     FieldComparison {
@@ -223,6 +235,13 @@ mod tests {
         assert!(!swapped.identical && !swapped.same_content && swapped.equivalent);
         let real_change = compare_field("mdns_sd.filter.2.service.1.name=_airplay._tcp.local", "mdns_sd.filter.2.service.1.name=_googlecast._tcp.local", false);
         assert!(!real_change.equivalent);
+        // So do a VAP's broadcast-filter MACs and the lock-to-AP entries, but no other MAC list.
+        let acl = |kind: &str, a: &str, b: &str| {
+            format!("wireless.1.bcfilt.1.mac={a}\nwireless.1.bcfilt.2.mac={b}\nmacacl.3.acl.1.type={kind}\nmacacl.3.acl.1.mac={a}\nmacacl.3.acl.2.type={kind}\nmacacl.3.acl.2.mac={b}")
+        };
+        assert!(compare_field(&acl("lock2ap", "aa", "bb"), &acl("lock2ap", "bb", "aa"), false).equivalent);
+        assert!(!compare_field(&acl("deny", "aa", "bb"), &acl("deny", "bb", "aa"), false).equivalent);
+        assert!(!compare_field("wireless.1.bcfilt.1.mac=aa\nwireless.2.bcfilt.1.mac=bb", "wireless.1.bcfilt.1.mac=bb\nwireless.2.bcfilt.1.mac=aa", false).equivalent, "per VAP");
 
         // Against a redacted copy, secret values cannot differ.
         let r = compare_field("a=1\nb=2\naaa.1.wpa.psk=other", &cfgdiff::redact(actual), true);

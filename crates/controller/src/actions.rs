@@ -5,11 +5,14 @@
 //! - re-send config ("force provision"): the AP gets its config again with a new version;
 //! - reconnect a client: `{"_type":"cmd","cmd":"kick-sta","mac"}` to the AP it is on;
 //! - block / unblock: the client's `blocked` flag in the settings (so every AP's
-//!   config carries it in `blocked_sta`), plus `block-sta` / `unblock-sta` to every AP;
+//!   config carries it in `blocked_sta`), plus `block-sta` / `unblock-sta` to every
+//!   AP online (one that is away gets the flag with its config when it is back);
 //! - lock to an AP: `fixed_ap_enabled` / `fixed_ap_mac` in the client's settings, which
 //!   the config generator turns into MAC filters on the other APs.
 //!
-//! Commands are queued per AP and sent one per inform, before any config push.
+//! Commands are queued per AP and sent one per inform, before any config push;
+//! restart, locate and reconnect need the AP online (it would otherwise run
+//! them whenever it is back).
 //! All of this needs active mode: in shadow mode apctl never answers the APs,
 //! and changing settings there would only diverge from the other controller.
 
@@ -29,11 +32,29 @@ use crate::store;
 /// Commands waiting for an AP's next inform.
 pub fn queue(live: &mut Live, mac: Mac, cmd: Value) {
     let q = live.commands.entry(mac).or_default();
-    // The same command twice in a row (e.g. a double click) is sent once.
-    if q.back() != Some(&cmd) {
+    // A command undone before it was sent is dropped, and one already waiting
+    // (e.g. after a double click) is sent once: toggling does not grow the queue.
+    if let Some(undo) = opposite(&cmd) {
+        q.retain(|c| *c != undo);
+    }
+    if !q.contains(&cmd) {
         q.push_back(cmd);
     }
     crate::stun::poke(live, &mac);
+}
+
+/// The command that undoes this one, if any.
+fn opposite(cmd: &Value) -> Option<Value> {
+    let undo = match cmd["cmd"].as_str()? {
+        "set-locate" => "unset-locate",
+        "unset-locate" => "set-locate",
+        "block-sta" => "unblock-sta",
+        "unblock-sta" => "block-sta",
+        _ => return None,
+    };
+    let mut o = cmd.clone();
+    o["cmd"] = json!(undo);
+    Some(o)
 }
 
 /// The next queued command for an AP, if any.
@@ -50,7 +71,9 @@ pub fn next(live: &mut Live, mac: &Mac) -> Option<Value> {
 pub fn edit_client(state: &mut Value, mac: &str, fields: &[(&str, Value)]) {
     let site = crate::settings::site_id(state);
     let list = crate::settings::array_mut(state, "clients");
-    let entry = match list.iter().position(|c| same_mac(c, mac)) {
+    // Matched as `controls` reads them, whichever way the entry writes its MAC.
+    let parsed = mac.parse::<Mac>().ok();
+    let entry = match list.iter().position(|c| parsed.map_or_else(|| same_mac(c, mac), |m| entry_mac(c) == Some(m))) {
         Some(i) => &mut list[i],
         None => {
             let mut c = json!({ "mac": mac });
@@ -138,15 +161,27 @@ fn known_ap(s: &AppState, mac: &Mac) -> Result<(), ApiError> {
     }
 }
 
-async fn note(s: &AppState, kind: EventKind, mac: Mac, data: Value) {
-    let _ = s.engine.send(Input::Note(Event::device(store::now_ts(), kind, mac, data))).await;
+/// Whether an AP is online: a command queued for one that is away would run
+/// whenever it is back (a restart days later).
+fn is_online(live: &Live, mac: &Mac) -> bool {
+    live.devices.get(mac).is_some_and(|d| d.online)
+}
+
+fn offline() -> ApiError {
+    ApiError(StatusCode::CONFLICT, "the AP is offline".into())
 }
 
 /// POST /api/devices/{mac}/restart
 pub async fn restart(State(s): State<AppState>, Path(mac): Path<String>) -> Result<Json<Value>, ApiError> {
     let mac = target_ap(&s, &mac)?;
-    queue(&mut s.live.write().unwrap(), mac, json!({ "_type": "reboot", "reboot_type": "soft" }));
-    note(&s, EventKind::ApRestartRequested, mac, json!({})).await;
+    {
+        let mut live = s.live.write().unwrap();
+        if !is_online(&live, &mac) {
+            return Err(offline());
+        }
+        queue(&mut live, mac, json!({ "_type": "reboot", "reboot_type": "soft" }));
+    }
+    s.note(Event::device(store::now_ts(), EventKind::ApRestartRequested, mac, json!({}))).await;
     Ok(Json(json!({ "queued": true })))
 }
 
@@ -159,6 +194,10 @@ pub struct LocateBody {
 pub async fn locate(State(s): State<AppState>, Path(mac): Path<String>, Json(b): Json<LocateBody>) -> Result<Json<Value>, ApiError> {
     let mac = target_ap(&s, &mac)?;
     let mut live = s.live.write().unwrap();
+    // Turning it off can wait for an AP that is away: it is harmless when it comes.
+    if b.on && !is_online(&live, &mac) {
+        return Err(offline());
+    }
     queue(&mut live, mac, json!({ "_type": "cmd", "cmd": if b.on { "set-locate" } else { "unset-locate" } }));
     if b.on {
         live.locating.insert(mac);
@@ -172,7 +211,7 @@ pub async fn locate(State(s): State<AppState>, Path(mac): Path<String>, Json(b):
 pub async fn provision(State(s): State<AppState>, Path(mac): Path<String>) -> Result<Json<Value>, ApiError> {
     let mac = target_ap(&s, &mac)?;
     s.live.write().unwrap().reprovision.insert(mac);
-    note(&s, EventKind::ApProvisionRequested, mac, json!({})).await;
+    s.note(Event::device(store::now_ts(), EventKind::ApProvisionRequested, mac, json!({}))).await;
     Ok(Json(json!({ "queued": true })))
 }
 
@@ -188,10 +227,13 @@ pub async fn kick(State(s): State<AppState>, Path(mac): Path<String>) -> Result<
             .filter(|c| c.connected)
             .map(|c| c.sample.ap_mac)
             .ok_or_else(|| ApiError(StatusCode::CONFLICT, "the client is not connected".into()))?;
+        if !is_online(&live, &ap) {
+            return Err(ApiError(StatusCode::CONFLICT, "the client's AP is offline".into()));
+        }
         queue(&mut live, ap, json!({ "_type": "cmd", "cmd": "kick-sta", "mac": client.to_string() }));
         ap
     };
-    let _ = s.engine.send(Input::Note(Event::client(store::now_ts(), EventKind::ClientReconnectRequested, client, json!({ "ap": ap })))).await;
+    s.note(Event::client(store::now_ts(), EventKind::ClientReconnectRequested, client, json!({ "ap": ap }))).await;
     Ok(Json(json!({ "queued": true, "ap": ap })))
 }
 
@@ -214,13 +256,13 @@ pub async fn block(State(s): State<AppState>, Path(mac): Path<String>, Json(b): 
     .await?;
     {
         let mut live = s.live.write().unwrap();
-        let aps: Vec<Mac> = live.devices.keys().copied().collect();
+        let aps: Vec<Mac> = live.devices.iter().filter(|(_, d)| d.online).map(|(m, _)| *m).collect();
         for ap in aps {
             queue(&mut live, ap, json!({ "_type": "cmd", "cmd": if blocked { "block-sta" } else { "unblock-sta" }, "mac": client.to_string() }));
         }
     }
     let kind = if blocked { EventKind::ClientBlocked } else { EventKind::ClientUnblocked };
-    let _ = s.engine.send(Input::Note(Event::client(store::now_ts(), kind, client, json!({})))).await;
+    s.note(Event::client(store::now_ts(), kind, client, json!({}))).await;
     Ok(Json(json!({ "blocked": blocked })))
 }
 
@@ -288,6 +330,31 @@ mod tests {
     }
 
     #[test]
+    fn toggling_does_not_grow_the_queue() {
+        let mut live = Live::default();
+        let ap: Mac = "02:00:00:00:00:01".parse().unwrap();
+        let cmd = |c: &str, mac: Option<&str>| {
+            let mut v = json!({ "_type": "cmd", "cmd": c });
+            if let Some(m) = mac {
+                v["mac"] = json!(m);
+            }
+            v
+        };
+        for _ in 0..10 {
+            for c in ["set-locate", "unset-locate"] {
+                queue(&mut live, ap, cmd(c, None));
+            }
+            for c in ["block-sta", "unblock-sta"] {
+                queue(&mut live, ap, cmd(c, Some("aa:bb:cc:00:00:01")));
+            }
+            queue(&mut live, ap, cmd("block-sta", Some("aa:bb:cc:00:00:02")));
+            queue(&mut live, ap, cmd("kick-sta", Some("aa:bb:cc:00:00:03")));
+        }
+        let cmds: Vec<String> = std::iter::from_fn(|| next(&mut live, &ap)).map(|c| format!("{} {}", c["cmd"].as_str().unwrap(), c["mac"].as_str().unwrap_or(""))).collect();
+        assert_eq!(cmds, ["block-sta aa:bb:cc:00:00:02", "kick-sta aa:bb:cc:00:00:03", "unset-locate ", "unblock-sta aa:bb:cc:00:00:01"]);
+    }
+
+    #[test]
     fn client_settings_are_edited_or_created() {
         let mut state = json!({ "devices": [{ "mac": "02:00:00:00:00:01", "site_id": "s1" }], "clients": [{ "mac": "AA:BB:CC:00:00:01", "name": "tv" }] });
         edit_client(&mut state, "aa:bb:cc:00:00:01", &[("blocked", json!(true))]);
@@ -305,5 +372,11 @@ mod tests {
         for m in ["aa:bb:cc:00:00:01", "AA:BB:CC:00:00:02", "aa:bb:cc:00:00:03"] {
             assert_eq!(controls(Some(&state), &mac(m)), all.get(&mac(m)), "{m}");
         }
+        // An entry that writes its MAC another way is the one edited, as the one shown.
+        let mut state = json!({ "clients": [{ "mac": "AA-BB-CC-00-00-04" }, { "mac": "aabbcc000005" }] });
+        edit_client(&mut state, "aa:bb:cc:00:00:04", &[("blocked", json!(true))]);
+        edit_client(&mut state, "aa:bb:cc:00:00:05", &[("blocked", json!(true))]);
+        assert_eq!(state["clients"].as_array().unwrap().len(), 2, "no duplicate");
+        assert!(controls(Some(&state), &mac("aa:bb:cc:00:00:04")).blocked && controls(Some(&state), &mac("aa:bb:cc:00:00:05")).blocked);
     }
 }
