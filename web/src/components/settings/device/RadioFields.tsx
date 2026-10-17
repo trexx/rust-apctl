@@ -106,9 +106,11 @@ export function RadioFields({
             ...(strayChannel
               ? [[form.channel, `${form.channel} (not allowed here)`] as const]
               : []),
-            ...legal.map(
-              (c) => [c, `${c}${c >= 52 && c <= 144 ? " (DFS)" : ""}`] as const,
-            ),
+            ...legal.map((c) => {
+              // DFS is a 5 GHz rule; 6 GHz reuses the channel numbers.
+              const dfs = r.radio === "na" && c >= 52 && c <= 144;
+              return [c, `${c}${dfs ? " (DFS)" : ""}`] as const;
+            }),
           ]}
         />
       </Row>
