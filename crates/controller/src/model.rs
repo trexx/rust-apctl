@@ -280,9 +280,14 @@ pub struct Snapshot {
     pub radios: Vec<RadioSample>,
     pub vaps: Vec<VapSample>,
     /// Shared with the live client list, which holds the same samples.
+    /// Not sent with the AP (nor its neighbours and spectrum): its page gets
+    /// the clients beside it, and the RF pages have routes of their own.
+    #[serde(skip_serializing)]
     pub clients: Vec<Arc<ClientSample>>,
+    #[serde(skip_serializing)]
     pub neighbors: Vec<NeighborSample>,
     /// Only channels with survey samples (empty until a spectrum scan runs).
+    #[serde(skip_serializing)]
     pub spectrum: Vec<SpectrumSample>,
     /// False for an inform without a VAP table: the absence of clients then
     /// says nothing about whether they are still connected. Only notifications

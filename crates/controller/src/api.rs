@@ -434,6 +434,17 @@ struct DeviceOut<'a> {
     stored_only: bool,
 }
 
+/// A copy of an AP's view with what its page shows: not the snapshot's
+/// clients, neighbours and spectrum, which are not sent with it (see `Snapshot`).
+fn page_view(d: &DeviceView) -> DeviceView {
+    let s = &d.snapshot;
+    let snapshot = crate::model::Snapshot {
+        ap: s.ap.clone(), uplink: s.uplink.clone(), radios: s.radios.clone(), vaps: s.vaps.clone(), clients: vec![], neighbors: vec![], spectrum: vec![],
+        has_vap_table: s.has_vap_table,
+    };
+    DeviceView { snapshot, peer: d.peer.clone(), ..*d }
+}
+
 async fn device(State(s): State<AppState>, Path(mac): Path<String>) -> Result<Response, ApiError> {
     let mac = parse_mac(&mac)?;
     // Copied out under the lock (the clients' samples are shared), and serialised after it.
@@ -441,7 +452,7 @@ async fn device(State(s): State<AppState>, Path(mac): Path<String>) -> Result<Re
         let live = s.live.read().unwrap();
         live.devices.get(&mac).map(|d| {
             let clients: Vec<_> = live.clients.values().filter(|c| c.connected && c.sample.ap_mac == mac).cloned().collect();
-            (d.clone(), clients, live.locating.contains(&mac))
+            (page_view(d), clients, live.locating.contains(&mac))
         })
     };
     if let Some((view, clients, locating)) = found {
@@ -453,17 +464,11 @@ async fn device(State(s): State<AppState>, Path(mac): Path<String>) -> Result<Re
     Ok(Json(DeviceDetail { device: DeviceOut { view: &d.view(), stored_only: true }, clients: &[], locating: false }).into_response())
 }
 
-/// Every client: the ones seen in this run and the ones restored from the
-/// database at start (`Engine::restore` loads them all, so the live view is
-/// the whole list).
-/// A client as the client list and page show it: its view, plus its name,
-/// manufacturer and controls.
+/// A client as its page shows it: its view, plus its name, manufacturer and controls.
 #[derive(Serialize)]
 struct ClientRow<'a> {
     #[serde(flatten)]
     view: &'a crate::engine::ClientView,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    ap_name: Option<Option<&'a str>>,
     alias: Option<&'a str>,
     note: Option<&'a str>,
     vendor: Option<&'a str>,
@@ -471,8 +476,20 @@ struct ClientRow<'a> {
     controls: crate::actions::Controls<'a>,
 }
 
+/// A client in the client list: as on its page, plus the name of the AP it is on.
+#[derive(Serialize)]
+struct ListedClient<'a> {
+    #[serde(flatten)]
+    client: ClientRow<'a>,
+    /// Null when that AP has no name, or is not reporting.
+    ap_name: Option<&'a str>,
+}
+
 type ClientCopy = (Mac, crate::engine::ClientView, Option<String>, Option<crate::engine::Alias>);
 
+/// Every client: the ones seen in this run and the ones restored from the
+/// database at start (`Engine::restore` loads them all, so the live view is
+/// the whole list).
 async fn clients(State(s): State<AppState>) -> Response {
     // What each client's entry needs, copied under the lock (the samples are
     // shared, the rest is small); the serialising happens after it.
@@ -489,15 +506,17 @@ async fn clients(State(s): State<AppState>) -> Response {
         (live.state.clone(), list)
     };
     let controls = crate::actions::ClientControls::new(state.as_deref());
-    let rows: Vec<ClientRow> = list
+    let rows: Vec<ListedClient> = list
         .iter()
-        .map(|(mac, view, ap_name, alias)| ClientRow {
-            view,
-            ap_name: Some(ap_name.as_deref()),
-            alias: alias.as_ref().and_then(|a| a.alias.as_deref()),
-            note: alias.as_ref().and_then(|a| a.note.as_deref()),
-            vendor: s.vendors.lookup(mac),
-            controls: controls.get(mac),
+        .map(|(mac, view, ap_name, alias)| ListedClient {
+            client: ClientRow {
+                view,
+                alias: alias.as_ref().and_then(|a| a.alias.as_deref()),
+                note: alias.as_ref().and_then(|a| a.note.as_deref()),
+                vendor: s.vendors.lookup(mac),
+                controls: controls.get(mac),
+            },
+            ap_name: ap_name.as_deref(),
         })
         .collect();
     Json(rows).into_response()
@@ -528,7 +547,6 @@ async fn client(State(s): State<AppState>, Path(mac): Path<String>) -> Result<Re
     };
     let row = ClientRow {
         view: &view,
-        ap_name: None,
         alias: alias.alias.as_deref(),
         note: alias.note.as_deref(),
         vendor: s.vendors.lookup(&mac),
@@ -610,19 +628,13 @@ async fn dryrun(State(s): State<AppState>) -> Result<Json<DryRunStatus>, ApiErro
             // has pushed new config since: the settings are probably out of date.
             let snapshot_version = docs.get(&mac).and_then(|d| d["cfgversion"].as_str());
             let settings_stale = matches!((snapshot_version, &running_version), (Some(a), Some(b)) if a != b);
-            let entry = |status: &str, extra: Value| {
-                let mut v = json!({ "mac": mac, "name": name, "status": status, "settings_stale": settings_stale });
-                if let Value::Object(m) = extra {
-                    v.as_object_mut().unwrap().extend(m);
-                }
-                v
-            };
+            let entry = |status| DryRunDevice { mac, name: name.clone(), status, settings_stale, comparison: None, against_redacted: None, error: None };
             let Some(state) = state.as_deref() else {
-                devices.push(entry("no_settings", json!({})));
+                devices.push(entry(DryRunState::NoSettings));
                 continue;
             };
             let Some((actual, redacted)) = actual else {
-                devices.push(entry("no_config_seen", json!({})));
+                devices.push(entry(DryRunState::NoConfigSeen));
                 continue;
             };
             let req = crate::dryrun::RenderRequest {
@@ -636,15 +648,15 @@ async fn dryrun(State(s): State<AppState>) -> Result<Json<DryRunStatus>, ApiErro
                 Ok(ours) => {
                     let c = crate::dryrun::compare(&ours, &actual.mgmt_cfg, &actual.system_cfg, redacted);
                     let status = if c.mgmt_cfg.identical && c.system_cfg.identical {
-                        "match"
+                        DryRunState::Match
                     } else if c.matches() {
-                        "equivalent"
+                        DryRunState::Equivalent
                     } else {
-                        "differs"
+                        DryRunState::Differs
                     };
-                    devices.push(entry(status, json!({ "comparison": c, "against_redacted": redacted })));
+                    devices.push(DryRunDevice { comparison: Some(c), against_redacted: Some(redacted), ..entry(status) });
                 }
-                Err(e) => devices.push(entry("error", json!({ "error": format!("{e:#}") }))),
+                Err(e) => devices.push(DryRunDevice { error: Some(format!("{e:#}")), ..entry(DryRunState::Error) }),
             }
         }
         devices
@@ -666,8 +678,41 @@ struct DryRunHistory {
 #[derive(Serialize)]
 struct DryRunStatus {
     settings_imported_at: Option<Ts>,
-    devices: Vec<Value>,
+    devices: Vec<DryRunDevice>,
     history: Vec<DryRunHistory>,
+}
+
+/// An AP's dry run now: how what apctl would push compares with what it runs.
+#[derive(Serialize)]
+struct DryRunDevice {
+    mac: Mac,
+    name: Option<String>,
+    status: DryRunState,
+    /// The AP runs another cfgversion than the imported settings expect.
+    settings_stale: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    comparison: Option<crate::dryrun::Comparison>,
+    /// Compared with the stored copy, whose secrets are masked.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    against_redacted: Option<bool>,
+    /// Why the render failed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "snake_case")]
+enum DryRunState {
+    /// Nothing to render from: no settings imported.
+    NoSettings,
+    /// No full config pushed to the AP seen yet.
+    NoConfigSeen,
+    /// Identical configs.
+    Match,
+    /// The same settings, in other words (see `dryrun::compare`).
+    Equivalent,
+    Differs,
+    Error,
 }
 
 #[derive(Deserialize)]
@@ -926,7 +971,20 @@ fn logs_sql(w: &mut Where, device: Option<Mac>, search: Option<&str>, after: Opt
     format!("SELECT {COLUMNS} FROM {from} WHERE {} ORDER BY l.ts DESC, l.id DESC LIMIT {limit}", w.sql())
 }
 
-async fn logs(State(s): State<AppState>, Query(q): Query<LogQuery>) -> ApiResult {
+/// A stored syslog line.
+#[derive(Serialize)]
+struct LogRow {
+    id: i64,
+    ts: Ts,
+    device_mac: Option<String>,
+    src_ip: Option<String>,
+    facility: Option<i64>,
+    severity: Option<i64>,
+    program: Option<String>,
+    msg: String,
+}
+
+async fn logs(State(s): State<AppState>, Query(q): Query<LogQuery>) -> Result<Json<Vec<LogRow>>, ApiError> {
     let device = q.device.as_deref().map(parse_mac).transpose()?;
     let search = q.q.as_deref().filter(|t| !t.trim().is_empty());
     let limit = q.limit.unwrap_or(500).clamp(1, 5000);
@@ -936,17 +994,16 @@ async fn logs(State(s): State<AppState>, Query(q): Query<LogQuery>) -> ApiResult
         let mut stmt = c.prepare(&sql)?;
         let rows = stmt
             .query_map(params_from_iter(w.params), |r| {
-                Ok(json!({
-                    "id": r.get::<_, i64>(7)?, "ts": r.get::<_, i64>(0)?, "device_mac": r.get::<_, Option<String>>(1)?, "src_ip": r.get::<_, Option<String>>(2)?,
-                    "facility": r.get::<_, Option<i64>>(3)?, "severity": r.get::<_, Option<i64>>(4)?,
-                    "program": r.get::<_, Option<String>>(5)?, "msg": r.get::<_, String>(6)?,
-                }))
+                Ok(LogRow {
+                    id: r.get(7)?, ts: r.get(0)?, device_mac: r.get(1)?, src_ip: r.get(2)?, facility: r.get(3)?, severity: r.get(4)?, program: r.get(5)?,
+                    msg: r.get(6)?,
+                })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
     })
     .await?;
-    Ok(Json(Value::Array(rows)))
+    Ok(Json(rows))
 }
 
 async fn ws(
@@ -1111,6 +1168,8 @@ mod tests {
             assert_eq!(sorted(stored.pointer(path).unwrap()), live, "{path}");
         }
         assert_eq!(stored["device"]["snapshot"]["ap"]["mac"], "02:00:00:00:00:02");
+        // The snapshot's clients come beside it; its neighbours and spectrum are the RF pages'.
+        assert_eq!(sorted(&one["device"]["snapshot"]), ["ap", "has_vap_table", "radios", "uplink", "vaps"]);
         let clients = get_json(&app, "/api/clients").await;
         assert_eq!((clients[0]["ap_name"].as_str(), clients[0]["connected"].as_bool(), clients[0]["sample"]["essid"].as_str()), (Some("Hall"), Some(true), Some("Home")));
         assert!(clients[0]["alias"].is_null() && clients[0].get("blocked").is_some(), "{}", clients[0]);
@@ -1167,6 +1226,7 @@ mod tests {
         let app = router(s);
         let d = get_json(&app, "/api/dryrun").await;
         assert_eq!((d["devices"][0]["status"].as_str(), d["history"][0]["ts"].as_i64()), (Some("no_settings"), Some(7)));
+        assert_eq!(d["devices"][0], json!({ "mac": "02:00:00:00:00:01", "name": "Hall", "status": "no_settings", "settings_stale": false }));
     }
 
     #[tokio::test]
@@ -1226,6 +1286,10 @@ mod tests {
         assert_eq!(ts(get_json(&app, "/api/logs?after=1").await), vec![3, 2]);
         assert_eq!(ts(get_json(&app, "/api/logs?after=1&device=02:00:00:00:00:02").await), vec![2]);
         assert_eq!(ts(get_json(&app, "/api/logs?q=link&device=02:00:00:00:00:01").await), Vec::<i64>::new());
+        let line = json!({
+            "id": 3, "ts": 3, "device_mac": "02:00:00:00:00:01", "src_ip": null, "facility": null, "severity": null, "program": "hostapd", "msg": "wlan1: STA left",
+        });
+        assert_eq!(get_json(&app, "/api/logs?limit=1").await, json!([line]));
     }
 
     #[tokio::test]
@@ -1261,7 +1325,10 @@ mod tests {
             }
             app.clone().oneshot(req.body(Body::empty()).unwrap())
         };
-        assert_eq!(post(false).await.unwrap().status(), StatusCode::FORBIDDEN);
+        let refused = post(false).await.unwrap();
+        assert_eq!(refused.status(), StatusCode::FORBIDDEN);
+        let body: Value = serde_json::from_slice(&axum::body::to_bytes(refused.into_body(), 1 << 16).await.unwrap()).unwrap();
+        assert_eq!(body, json!({ "error": "missing X-Requested-With: apctl header" }));
         assert_eq!(post(true).await.unwrap().status(), StatusCode::OK);
         // Reads need no header.
         let req = Request::get("/api/status").header(header::COOKIE, &cookie).body(Body::empty()).unwrap();

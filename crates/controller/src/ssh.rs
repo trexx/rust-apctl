@@ -213,14 +213,16 @@ fn known_host_key(live: &crate::engine::Live, ip: &str) -> Option<(Mac, String)>
     live.by_ip.get(ip).copied().into_iter().chain(by_record).find_map(|mac| Some((mac, fingerprint(&mac)?)))
 }
 
-/// A MAC written with or without separators.
+/// A MAC as the AP prints it (`/sys/class/net/eth0/address`, `board.hwaddr`):
+/// with or without separators, and a line end.
 fn parse_mac(text: &str) -> Option<Mac> {
-    let hex: String = text.trim().chars().filter(char::is_ascii_hexdigit).collect();
-    if hex.len() != 12 || text.trim().chars().any(|c| !(c.is_ascii_hexdigit() || c == ':' || c == '-')) {
-        return None;
-    }
-    let pairs: Vec<&str> = (0..6).map(|i| &hex[i * 2..i * 2 + 2]).collect();
-    pairs.join(":").to_ascii_lowercase().parse().ok()
+    text.trim().parse().ok()
+}
+
+/// The address typed for the AP, written as apctl writes addresses (the APs'
+/// records, `by_ip`): an IPv4-mapped IPv6 one as IPv4, IPv6 in its short form.
+fn canonical_ip(text: &str) -> Option<String> {
+    text.trim().parse::<std::net::IpAddr>().ok().map(|ip| ip.to_canonical().to_string())
 }
 
 /// `key=value` lines (as in /etc/board.info).
@@ -264,9 +266,7 @@ pub struct AdoptBody {
 pub async fn adopt(State(s): State<AppState>, Json(b): Json<AdoptBody>) -> Result<Json<Value>, ApiError> {
     crate::api::require_active(&s, "adoption needs")?;
     let url = inform_url(&s).ok_or_else(|| ApiError(StatusCode::CONFLICT, "apctl doesn't know the URL APs should inform to: set --inform-url".into()))?;
-    if b.ip.parse::<std::net::IpAddr>().is_err() {
-        return Err(ApiError(StatusCode::BAD_REQUEST, "enter the AP's IP address".into()));
-    }
+    let ip = canonical_ip(&b.ip).ok_or_else(|| ApiError(StatusCode::BAD_REQUEST, "enter the AP's IP address".into()))?;
     let state = s.live.read().unwrap().state.clone();
     let given = match (b.username.filter(|u| !u.is_empty()), b.password) {
         (Some(u), Some(p)) => Some((u, p)),
@@ -274,11 +274,11 @@ pub async fn adopt(State(s): State<AppState>, Json(b): Json<AdoptBody>) -> Resul
     };
     let bad = |f: Failure| ApiError(StatusCode::BAD_GATEWAY, f.to_string());
     // A known AP keeps its host key, checked before any password is sent; a new one is trusted the first time.
-    let expected = known_host_key(&s.live.read().unwrap(), &b.ip);
-    let connected = connect(&b.ip, b.port.unwrap_or(22), &logins(state.as_deref(), given.clone()), expected.as_ref().map(|e| e.1.clone())).await;
+    let expected = known_host_key(&s.live.read().unwrap(), &ip);
+    let connected = connect(&ip, b.port.unwrap_or(22), &logins(state.as_deref(), given.clone()), expected.as_ref().map(|e| e.1.clone())).await;
     let session = match (connected, &expected) {
         (Err(Failure::HostKey), Some((mac, _))) => {
-            s.note(Event::device(store::now_ts(), EventKind::ApHostKeyMismatch, *mac, json!({ "ip": b.ip }))).await;
+            s.note(Event::device(store::now_ts(), EventKind::ApHostKeyMismatch, *mac, json!({ "ip": ip }))).await;
             return Err(bad(Failure::HostKey));
         }
         (r, _) => r.map_err(bad)?,
@@ -293,12 +293,12 @@ pub async fn adopt(State(s): State<AppState>, Json(b): Json<AdoptBody>) -> Resul
     if let (Some(k), Some(seen)) = (known.and_then(|d| d["x_ssh_hostkey_fingerprint"].as_str()), &session.fingerprint)
         && k != seen
     {
-        s.note(Event::device(store::now_ts(), EventKind::ApHostKeyMismatch, mac, json!({ "ip": b.ip }))).await;
+        s.note(Event::device(store::now_ts(), EventKind::ApHostKeyMismatch, mac, json!({ "ip": ip }))).await;
         return Err(bad(Failure::HostKey));
     }
     // Its record (and key), unless apctl has it already.
     let payload = json!({
-        "mac": mac.to_string(), "ip": b.ip, "model": board_value(&board, "board.shortname").or(board_value(&board, "board.name")),
+        "mac": mac.to_string(), "ip": ip, "model": board_value(&board, "board.shortname").or(board_value(&board, "board.name")),
         "hostname": board_value(&board, "board.name"), "inform_url": url,
     });
     let fingerprint = session.fingerprint.clone();
@@ -341,7 +341,7 @@ pub async fn adopt(State(s): State<AppState>, Json(b): Json<AdoptBody>) -> Resul
             return Err(bad(f));
         }
     };
-    s.note(Event::device(store::now_ts(), EventKind::ApAdopting, mac, json!({ "ip": b.ip, "via": "ssh" }))).await;
+    s.note(Event::device(store::now_ts(), EventKind::ApAdopting, mac, json!({ "ip": ip, "via": "ssh" }))).await;
     tracing::info!("{mac}: set-adopt {url} sent over SSH ({})", out.trim());
     Ok(Json(json!({ "adopting": true, "mac": mac, "inform_url": url })))
 }
@@ -432,6 +432,7 @@ mod tests {
         assert_eq!(parse_mac("02AB0000009A").map(|m| m.to_string()).as_deref(), Some("02:ab:00:00:00:9a"));
         assert_eq!(parse_mac("02:ab:00:00:00:9a\n").map(|m| m.to_string()).as_deref(), Some("02:ab:00:00:00:9a"));
         assert!(parse_mac("cat: no such file").is_none());
+        assert!(parse_mac("02:ab-00:00:00:9a").is_none(), "one separator throughout");
     }
 
     #[test]
@@ -454,5 +455,18 @@ mod tests {
         // An AP that informs from another address than its record says.
         live.by_ip.insert("192.0.2.7".into(), ap);
         assert_eq!(known_host_key(&live, "192.0.2.7"), Some((ap, "SHA256:abc".into())));
+    }
+
+    #[test]
+    fn a_typed_address_is_written_as_the_records_write_it() {
+        assert_eq!(canonical_ip(" 192.0.2.5 ").as_deref(), Some("192.0.2.5"));
+        assert_eq!(canonical_ip("::ffff:192.0.2.5").as_deref(), Some("192.0.2.5"));
+        assert_eq!(canonical_ip("2001:DB8:0:0::0:5").as_deref(), Some("2001:db8::5"));
+        assert_eq!(canonical_ip("ap.example"), None);
+        // So the kept host key of an AP is found however its address is typed.
+        let state = json!({ "devices": [{ "mac": "02:00:00:00:00:01", "ip": "2001:db8::5", "x_ssh_hostkey_fingerprint": "SHA256:abc" }] });
+        let live = crate::engine::Live { state: Some(std::sync::Arc::new(state)), ..Default::default() };
+        let typed = canonical_ip("2001:0db8::0005").unwrap();
+        assert_eq!(known_host_key(&live, &typed).map(|k| k.1).as_deref(), Some("SHA256:abc"));
     }
 }
