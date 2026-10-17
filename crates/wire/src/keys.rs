@@ -70,10 +70,6 @@ impl KeyStore {
         Ok(())
     }
 
-    pub fn syslog_key(&self, mac: &Mac) -> Option<&[u8; 32]> {
-        self.syslog.get(mac)
-    }
-
     pub fn syslog_keys(&self) -> impl Iterator<Item = (&Mac, &[u8; 32])> {
         self.syslog.iter()
     }

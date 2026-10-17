@@ -564,7 +564,7 @@ pub fn render_vap(c: &mut Cfg, ctx: &Ctx, radios: &[Radio], vaps: &[Vap], i: usi
                     c.set(a.at("sae.sync"), x);
                 }
                 let groups = arr(w, "sae_groups");
-                    for (gi, g) in groups.iter().enumerate() {
+                for (gi, g) in groups.iter().enumerate() {
                     c.opt(format_args!("{a}sae.groups.{}.group", gi + 1), as_text(g));
                 }
                 if !groups.is_empty() {
