@@ -18,18 +18,17 @@ use std::collections::{BTreeMap, HashMap};
 use std::net::{IpAddr, Ipv6Addr};
 use std::sync::Arc;
 
-use axum::Json;
-use axum::extract::{Path, State};
+use axum::extract::State;
 use axum::http::StatusCode;
 use inform::Mac;
 use serde::Serialize;
 use serde_json::{Value, json};
 use wire::keys::KeyStore;
 
-use crate::api::{ApiError, AppState};
+use crate::api::{ApiError, AppState, Json, MacPath};
+use crate::clock;
 use crate::engine::{Event, EventKind, Input, Live};
 use crate::model::Ts;
-use crate::clock;
 
 /// How long an AP has to come back with its new key.
 pub const ADOPT_TIMEOUT: Ts = 300;
@@ -365,9 +364,8 @@ pub async fn pending(State(s): State<AppState>) -> Json<Value> {
 }
 
 /// POST /api/devices/{mac}/adopt: adopt a pending AP.
-pub async fn adopt(State(s): State<AppState>, Path(mac): Path<String>) -> Result<Json<Value>, ApiError> {
+pub async fn adopt(State(s): State<AppState>, MacPath(mac): MacPath) -> Result<Json<Value>, ApiError> {
     crate::api::require_active(&s, "adoption needs")?;
-    let mac = crate::api::parse_mac(&mac)?;
     let payload = s.live.read().unwrap().adoption.pending.get(&mac).map(|p| p.payload.clone()).ok_or_else(|| ApiError(StatusCode::NOT_FOUND, "this AP is not waiting for adoption".into()))?;
     let inform = payload.clone();
     crate::actions::apply_edit(&s, Box::new(move |state: &mut Value| adopt_device(state, &mac, &inform))).await?;
@@ -381,9 +379,8 @@ pub async fn adopt(State(s): State<AppState>, Path(mac): Path<String>) -> Result
 }
 
 /// POST /api/devices/{mac}/forget: remove an AP; if it reports again it resets itself.
-pub async fn forget(State(s): State<AppState>, Path(mac): Path<String>) -> Result<Json<Value>, ApiError> {
+pub async fn forget(State(s): State<AppState>, MacPath(mac): MacPath) -> Result<Json<Value>, ApiError> {
     crate::api::require_active(&s, "adoption needs")?;
-    let mac = crate::api::parse_mac(&mac)?;
     let online = {
         let live = s.live.read().unwrap();
         if live.state.as_deref().and_then(|st| device_doc(st, &mac)).is_none() {

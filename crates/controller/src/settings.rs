@@ -7,8 +7,7 @@
 //! too; saving needs active mode, since in shadow mode the settings belong to
 //! the other controller (the next import would replace them).
 
-use axum::Json;
-use axum::extract::{Path, Query, State};
+use axum::extract::State;
 use axum::http::StatusCode;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, LazyLock};
@@ -18,7 +17,7 @@ use serde_json::{Value, json};
 
 use apcfg::oid;
 
-use crate::api::{ApiError, AppState};
+use crate::api::{ApiError, AppState, Json, MacPath, Path, Query};
 use crate::random_hex;
 
 #[derive(Deserialize, Default)]
@@ -306,14 +305,13 @@ fn radio_caps(inform: Option<&Value>, band: &str) -> Value {
 }
 
 /// GET /api/settings/devices/{mac}
-pub async fn device(State(s): State<AppState>, Path(mac): Path<String>) -> Result<Json<Value>, ApiError> {
-    let m: Option<inform::Mac> = mac.parse().ok();
+pub async fn device(State(s): State<AppState>, MacPath(mac): MacPath) -> Result<Json<Value>, ApiError> {
     let (state, inform) = {
         let live = s.live.read().unwrap();
-        (live.state.clone(), m.and_then(|m| live.raw_informs.get(&m).cloned()))
+        (live.state.clone(), live.raw_informs.get(&mac).cloned())
     };
     let state = state.ok_or_else(ApiError::no_state)?;
-    let d = m.and_then(|m| crate::adopt::device_doc(&state, &m)).ok_or_else(|| ApiError(StatusCode::NOT_FOUND, "this AP is not in the settings".into()))?;
+    let d = crate::adopt::device_doc(&state, &mac).ok_or_else(|| ApiError(StatusCode::NOT_FOUND, "this AP is not in the settings".into()))?;
     let radios: Vec<Value> = d["radio_table"]
         .as_array()
         .into_iter()
@@ -337,7 +335,7 @@ pub async fn device(State(s): State<AppState>, Path(mac): Path<String>) -> Resul
     let advanced = mgmt_flag(&state, "advanced_feature_enabled");
     let antennas: Vec<Value> = inform.as_deref().and_then(|p| p["antenna_table"].as_array().cloned()).unwrap_or_default();
     let mut out = json!({
-        "active": s.active, "mac": mac.to_ascii_lowercase(), "model": d["model"], "radios": radios, "features": supported,
+        "active": s.active, "mac": mac.to_string(), "model": d["model"], "radios": radios, "features": supported,
         "reported": inform.is_some(), "site_outdoor": site_outdoor, "advanced_features": advanced, "antennas": antennas,
         "ports": d["ethernet_table"].as_array().map_or(0, |t| t.iter().filter_map(|e| e["num_port"].as_i64()).sum::<i64>()),
     });
@@ -1628,8 +1626,7 @@ pub async fn delete_wlan_route(State(s): State<AppState>, Path(id): Path<String>
 }
 
 /// PUT /api/settings/devices/{mac} {patch}
-pub async fn put_device(State(s): State<AppState>, Path(mac): Path<String>, Query(q): Query<PreviewQuery>, Json(b): Json<Patch>) -> Result<Json<Value>, ApiError> {
-    let mac = crate::api::parse_mac(&mac)?;
+pub async fn put_device(State(s): State<AppState>, MacPath(mac): MacPath, Query(q): Query<PreviewQuery>, Json(b): Json<Patch>) -> Result<Json<Value>, ApiError> {
     let inform = s.live.read().unwrap().raw_informs.get(&mac).cloned();
     let caps = json!({ "ng": radio_caps(inform.as_deref(), "ng"), "na": radio_caps(inform.as_deref(), "na"), "6e": radio_caps(inform.as_deref(), "6e") });
     // A mesh AP's uplink radio must stay on.
@@ -2268,8 +2265,7 @@ pub struct ClientGroupBody {
 }
 
 /// PUT /api/clients/{mac}/speed-limit {usergroup_id}
-pub async fn put_client_group(State(s): State<AppState>, Path(mac): Path<String>, Query(q): Query<PreviewQuery>, Json(b): Json<ClientGroupBody>) -> Result<Json<Value>, ApiError> {
-    let mac = crate::api::parse_mac(&mac)?;
+pub async fn put_client_group(State(s): State<AppState>, MacPath(mac): MacPath, Query(q): Query<PreviewQuery>, Json(b): Json<ClientGroupBody>) -> Result<Json<Value>, ApiError> {
     change(&s, &q, apply_client_group, ClientGroup { mac, usergroup_id: b.usergroup_id }).await
 }
 

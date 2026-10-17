@@ -18,16 +18,15 @@
 
 use std::collections::HashMap;
 
-use axum::Json;
-use axum::extract::{Path, State};
+use axum::extract::State;
 use axum::http::StatusCode;
 use inform::Mac;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use crate::api::{ApiError, AppState};
-use crate::engine::{Event, EventKind, Input, Live};
+use crate::api::{ApiError, AppState, Json, MacPath};
 use crate::clock;
+use crate::engine::{Event, EventKind, Input, Live};
 
 /// Commands waiting for an AP's next inform.
 pub fn queue(live: &mut Live, mac: Mac, cmd: Value) {
@@ -134,9 +133,8 @@ impl<'a> ClientControls<'a> {
 }
 
 /// The AP a device action is for: active mode, and an AP apctl has heard from.
-fn target_ap(s: &AppState, mac: &str) -> Result<Mac, ApiError> {
+fn target_ap(s: &AppState, mac: Mac) -> Result<Mac, ApiError> {
     crate::api::require_active(s, "this needs")?;
-    let mac = crate::api::parse_mac(mac)?;
     known_ap(s, &mac)?;
     Ok(mac)
 }
@@ -160,8 +158,8 @@ fn offline() -> ApiError {
 }
 
 /// POST /api/devices/{mac}/restart
-pub async fn restart(State(s): State<AppState>, Path(mac): Path<String>) -> Result<Json<Value>, ApiError> {
-    let mac = target_ap(&s, &mac)?;
+pub async fn restart(State(s): State<AppState>, MacPath(mac): MacPath) -> Result<Json<Value>, ApiError> {
+    let mac = target_ap(&s, mac)?;
     {
         let mut live = s.live.write().unwrap();
         if !is_online(&live, &mac) {
@@ -179,8 +177,8 @@ pub struct LocateBody {
 }
 
 /// POST /api/devices/{mac}/locate {on}
-pub async fn locate(State(s): State<AppState>, Path(mac): Path<String>, Json(b): Json<LocateBody>) -> Result<Json<Value>, ApiError> {
-    let mac = target_ap(&s, &mac)?;
+pub async fn locate(State(s): State<AppState>, MacPath(mac): MacPath, Json(b): Json<LocateBody>) -> Result<Json<Value>, ApiError> {
+    let mac = target_ap(&s, mac)?;
     let mut live = s.live.write().unwrap();
     // Turning it off can wait for an AP that is away: it is harmless when it comes.
     if b.on && !is_online(&live, &mac) {
@@ -196,17 +194,16 @@ pub async fn locate(State(s): State<AppState>, Path(mac): Path<String>, Json(b):
 }
 
 /// POST /api/devices/{mac}/provision: send the AP its config again.
-pub async fn provision(State(s): State<AppState>, Path(mac): Path<String>) -> Result<Json<Value>, ApiError> {
-    let mac = target_ap(&s, &mac)?;
+pub async fn provision(State(s): State<AppState>, MacPath(mac): MacPath) -> Result<Json<Value>, ApiError> {
+    let mac = target_ap(&s, mac)?;
     s.live.write().unwrap().reprovision.insert(mac);
     s.note(Event::device(clock::now_ts(), EventKind::ApProvisionRequested, mac, json!({}))).await;
     Ok(Json(json!({ "queued": true })))
 }
 
 /// POST /api/clients/{mac}/kick: disconnect the client so it reconnects.
-pub async fn kick(State(s): State<AppState>, Path(mac): Path<String>) -> Result<Json<Value>, ApiError> {
+pub async fn kick(State(s): State<AppState>, MacPath(client): MacPath) -> Result<Json<Value>, ApiError> {
     crate::api::require_active(&s, "this needs")?;
-    let client = crate::api::parse_mac(&mac)?;
     let ap = {
         let mut live = s.live.write().unwrap();
         let ap = live
@@ -231,9 +228,8 @@ pub struct BlockBody {
 }
 
 /// POST /api/clients/{mac}/block {blocked}
-pub async fn block(State(s): State<AppState>, Path(mac): Path<String>, Json(b): Json<BlockBody>) -> Result<Json<Value>, ApiError> {
+pub async fn block(State(s): State<AppState>, MacPath(client): MacPath, Json(b): Json<BlockBody>) -> Result<Json<Value>, ApiError> {
     crate::api::require_active(&s, "this needs")?;
-    let client = crate::api::parse_mac(&mac)?;
     let blocked = b.blocked;
     let what = if blocked { format!("blocked client {client}") } else { format!("unblocked client {client}") };
     edit_settings(&s, what, move |state| {
@@ -260,9 +256,8 @@ pub struct LockBody {
 }
 
 /// POST /api/clients/{mac}/lock {ap}
-pub async fn lock(State(s): State<AppState>, Path(mac): Path<String>, Json(b): Json<LockBody>) -> Result<Json<Value>, ApiError> {
+pub async fn lock(State(s): State<AppState>, MacPath(client): MacPath, Json(b): Json<LockBody>) -> Result<Json<Value>, ApiError> {
     crate::api::require_active(&s, "this needs")?;
-    let client = crate::api::parse_mac(&mac)?;
     let ap = match &b.ap {
         Some(a) => {
             let a = crate::api::parse_mac(a)?;

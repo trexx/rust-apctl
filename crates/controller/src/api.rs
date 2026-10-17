@@ -2,12 +2,14 @@
 
 use std::sync::Arc;
 
+use axum::Router;
 use axum::extract::ws::{Message, Utf8Bytes, WebSocket, WebSocketUpgrade};
-use axum::extract::{Path, Query, State};
+use axum::extract::rejection::{JsonRejection, PathRejection, QueryRejection};
+use axum::extract::{FromRequest, FromRequestParts, State};
 use axum::http::StatusCode;
+use axum::http::request::Parts;
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
-use axum::{Json, Router};
 use inform::Mac;
 use rusqlite::types::Value as Sql;
 use rusqlite::params_from_iter;
@@ -218,6 +220,73 @@ fn bad(msg: impl Into<String>) -> ApiError {
 /// A MAC address from the URL or body; 400 when it isn't one.
 pub fn parse_mac(s: &str) -> Result<Mac, ApiError> {
     s.parse().map_err(|_| bad(format!("invalid MAC {s}")))
+}
+
+// axum's extractors answer a malformed request in plain text. These wrap them
+// so the UI gets `{"error": ...}` like any other failure, with the same status
+// and text. `Json` also stands in for axum's as a response.
+
+/// A JSON request body (and response).
+pub struct Json<T>(pub T);
+
+/// A query string.
+pub struct Query<T>(pub T);
+
+/// A path parameter.
+pub struct Path<T>(pub T);
+
+/// A MAC address path parameter; 400 when it isn't one.
+pub struct MacPath(pub Mac);
+
+macro_rules! rejection_to_api_error {
+    ($($rejection:ty),*) => {$(
+        impl From<$rejection> for ApiError {
+            fn from(r: $rejection) -> Self {
+                ApiError(r.status(), r.body_text())
+            }
+        }
+    )*};
+}
+
+rejection_to_api_error!(JsonRejection, QueryRejection, PathRejection);
+
+impl<T: serde::de::DeserializeOwned, S: Send + Sync> FromRequest<S> for Json<T> {
+    type Rejection = ApiError;
+
+    async fn from_request(req: axum::extract::Request, state: &S) -> Result<Self, ApiError> {
+        Ok(Json(axum::Json::<T>::from_request(req, state).await?.0))
+    }
+}
+
+impl<T: Serialize> IntoResponse for Json<T> {
+    fn into_response(self) -> Response {
+        axum::Json(self.0).into_response()
+    }
+}
+
+impl<T: serde::de::DeserializeOwned, S: Send + Sync> FromRequestParts<S> for Query<T> {
+    type Rejection = ApiError;
+
+    async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, ApiError> {
+        Ok(Query(axum::extract::Query::<T>::from_request_parts(parts, state).await?.0))
+    }
+}
+
+impl<T: serde::de::DeserializeOwned + Send, S: Send + Sync> FromRequestParts<S> for Path<T> {
+    type Rejection = ApiError;
+
+    async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, ApiError> {
+        Ok(Path(axum::extract::Path::<T>::from_request_parts(parts, state).await?.0))
+    }
+}
+
+impl<S: Send + Sync> FromRequestParts<S> for MacPath {
+    type Rejection = ApiError;
+
+    async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, ApiError> {
+        let Path(text) = Path::<String>::from_request_parts(parts, state).await?;
+        parse_mac(&text).map(MacPath)
+    }
 }
 
 /// Runs a read query on the blocking pool.
@@ -447,8 +516,7 @@ fn page_view(d: &DeviceView) -> DeviceView {
     DeviceView { snapshot, peer: d.peer.clone(), ..*d }
 }
 
-async fn device(State(s): State<AppState>, Path(mac): Path<String>) -> Result<Response, ApiError> {
-    let mac = parse_mac(&mac)?;
+async fn device(State(s): State<AppState>, MacPath(mac): MacPath) -> Result<Response, ApiError> {
     // Copied out under the lock (the clients' samples are shared), and serialised after it.
     let found = {
         let live = s.live.read().unwrap();
@@ -540,8 +608,7 @@ async fn client_names(State(s): State<AppState>) -> Json<std::collections::HashM
     Json(names)
 }
 
-async fn client(State(s): State<AppState>, Path(mac): Path<String>) -> Result<Response, ApiError> {
-    let mac = parse_mac(&mac)?;
+async fn client(State(s): State<AppState>, MacPath(mac): MacPath) -> Result<Response, ApiError> {
     let (view, alias, state) = {
         let live = s.live.read().unwrap();
         let view = live.clients.get(&mac).cloned().ok_or_else(|| ApiError(StatusCode::NOT_FOUND, "unknown client".into()))?;
@@ -739,10 +806,9 @@ fn validate(alias: &Option<String>, note: &Option<String>) -> Result<(), ApiErro
 /// Sets (or, with empty values, clears) a client's alias and note.
 async fn set_alias(
     State(s): State<AppState>,
-    Path(mac): Path<String>,
+    MacPath(mac): MacPath,
     Json(body): Json<AliasBody>,
 ) -> ApiResult {
-    let mac = parse_mac(&mac)?;
     validate(&body.alias, &body.note)?;
     let entries = vec![AliasEdit { mac, alias: body.alias, note: body.note }];
     let input = crate::engine::Input::SetAliases { ts: clock::now_ts(), entries, only_if_unset: false };
@@ -1335,6 +1401,33 @@ mod tests {
         // Reads need no header.
         let req = Request::get("/api/status").header(header::COOKIE, &cookie).body(Body::empty()).unwrap();
         assert_eq!(app.clone().oneshot(req).await.unwrap().status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn a_malformed_request_is_answered_in_json() {
+        let (state, _engine, cookie) = logged_in();
+        let app = router(state);
+        let error = |res: Response| async move {
+            let status = res.status();
+            let body: Value = serde_json::from_slice(&axum::body::to_bytes(res.into_body(), 1 << 16).await.unwrap()).unwrap();
+            (status, body["error"].as_str().unwrap_or_else(|| panic!("no error in {body}")).to_string())
+        };
+        let get = |path: &str| app.clone().oneshot(Request::get(path).header(header::COOKIE, &cookie).body(Body::empty()).unwrap());
+        assert_eq!(error(get("/api/devices/nope").await.unwrap()).await, (StatusCode::BAD_REQUEST, "invalid MAC nope".into()));
+        let (status, msg) = error(get("/api/series/clients?from=soon").await.unwrap()).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(msg.starts_with("Failed to deserialize query string"), "{msg}");
+        let put = |content_type: &str, body: &'static str| {
+            let req = Request::put("/api/clients/02:00:00:00:01:01/alias").header(header::COOKIE, &cookie).header("x-requested-with", "apctl").header(header::CONTENT_TYPE, content_type);
+            app.clone().oneshot(req.body(Body::from(body)).unwrap())
+        };
+        let (status, msg) = error(put("application/json", "{\"alias\":").await.unwrap()).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(msg.starts_with("Failed to parse the request body as JSON"), "{msg}");
+        let (status, msg) = error(put("text/plain", "{}").await.unwrap()).await;
+        assert_eq!(status, StatusCode::UNSUPPORTED_MEDIA_TYPE, "the rejection's own status: {msg}");
+        let (status, _) = error(put("application/json", "{\"alias\": 5}").await.unwrap()).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
     }
 
     /// The app's state with one user, and that user's session cookie.

@@ -12,16 +12,15 @@
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use axum::Json;
 use axum::extract::State;
 use axum::http::StatusCode;
 use inform::Mac;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use crate::api::{ApiError, AppState};
-use crate::engine::{Event, EventKind};
+use crate::api::{ApiError, AppState, Json};
 use crate::clock;
+use crate::engine::{Event, EventKind};
 
 /// The URL APs should inform to: `--inform-url`, else the one the managed APs use.
 pub fn inform_url(s: &AppState) -> Option<String> {

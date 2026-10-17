@@ -15,19 +15,18 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use axum::Json;
-use axum::extract::{Query, State};
+use axum::extract::State;
 use axum::http::StatusCode;
 use inform::Mac;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use crate::api::{ApiError, AppState};
+use crate::api::{ApiError, AppState, Json, Query};
+use crate::clock;
 use crate::engine::{Event, EventKind, Live};
 use crate::model::Ts;
 use crate::adopt::{device_doc, device_doc_mut};
 use crate::settings::{band_channels, country, device_macs, inform_radio, is_legal, legal_channels, num, setting, setting_mut, uplink};
-use crate::clock;
 
 /// A band Channel AI handles, and how its quick scan is asked for.
 pub struct Band {
