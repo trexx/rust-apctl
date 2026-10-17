@@ -553,6 +553,9 @@ pub fn unpack(path: &Path, key: Option<&[u8; 32]>, dest: &Path) -> Result<Manife
         let mut e = entry?;
         let name = e.path()?.to_string_lossy().to_string();
         if name == "manifest.json" {
+            if manifest.is_some() {
+                bail!("the backup has two manifests");
+            }
             if e.header().size()? > 1 << 20 {
                 bail!("the backup's manifest is too large");
             }
@@ -972,7 +975,15 @@ pub async fn create_now(State(s): State<AppState>, Json(body): Json<CreateBody>)
     }
     let b = s.backups.clone();
     let dir = b.data_dir.clone();
-    let meta = tokio::task::spawn_blocking(move || create(&b, &dir, Kind::Manual, body.days)).await??;
+    let writer = s.writer.clone();
+    let meta = tokio::task::spawn_blocking(move || {
+        // What is queued is committed first, so the backup has the last edits.
+        if !writer.flush(Duration::from_secs(5)) {
+            tracing::warn!("not all queued writes were stored before the backup");
+        }
+        create(&b, &dir, Kind::Manual, body.days)
+    })
+    .await??;
     Ok(Json(json!(meta)))
 }
 
@@ -1489,6 +1500,11 @@ mod tests {
         let err = unpack(&d.join("y.apb"), None, &d.join("out2")).unwrap_err();
         assert!(err.to_string().contains("not an apctl backup"), "{err:#}");
         assert!(!d.join("out2").join("config.db").exists());
+        // A second manifest cannot change what the first one said.
+        let m = manifest(&[("config.db", 4)]);
+        hand_made(&d.join("z.apb"), &m, &[("manifest.json", serde_json::to_vec(&manifest(&[("config.db", 5)])).unwrap())]);
+        let err = unpack(&d.join("z.apb"), None, &d.join("out3")).unwrap_err();
+        assert!(err.to_string().contains("two manifests"), "{err:#}");
     }
 
     #[test]
