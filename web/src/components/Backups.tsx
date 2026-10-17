@@ -12,6 +12,8 @@ import {
 import type { BackupManifest, BackupMeta, BackupSettings } from "../api";
 import { ago, bytes, dateTime as when, hhmm } from "../format";
 import { ErrorNote, Loading, Outcome, useRunner } from "./common";
+import { FileButton } from "./FileButton";
+import { NumberInput } from "./settings/form";
 
 const HISTORY: [number, string][] = [
   [0, "Settings only"],
@@ -93,6 +95,42 @@ function useRestartWatch(restart: { before: string | null } | null) {
   return gaveUp;
 }
 
+/**
+ * A local "HH:MM". The text is kept as typed; the form only gets a complete
+ * time, so a cleared field leaves the time as it was (shown again on leaving).
+ */
+function TimeInput({
+  value,
+  onChange,
+  disabled,
+}: {
+  value: string;
+  onChange: (t: string) => void;
+  disabled?: boolean;
+}) {
+  const [text, setText] = useState(value);
+  const [last, setLast] = useState(value);
+  if (value !== last) {
+    setLast(value);
+    setText(value);
+  }
+  return (
+    <input
+      type="time"
+      className="search time-input"
+      value={text}
+      disabled={disabled}
+      onChange={(e) => {
+        setText(e.target.value);
+        if (!e.target.value) return;
+        setLast(e.target.value);
+        onChange(e.target.value);
+      }}
+      onBlur={() => setText(value)}
+    />
+  );
+}
+
 function Schedule({
   initial,
   readOnly,
@@ -160,14 +198,10 @@ function Schedule({
         )}
         <label className="small">
           at{" "}
-          <input
-            type="time"
-            className="search time-input"
+          <TimeInput
             value={toLocal(s.minute_utc)}
             disabled={readOnly || !s.enabled}
-            onChange={(e) =>
-              setS({ ...s, minute_utc: fromLocal(e.target.value) })
-            }
+            onChange={(t) => setS({ ...s, minute_utc: fromLocal(t) })}
           />
         </label>
         <span className="muted small">({hhmm(s.minute_utc)} UTC)</span>
@@ -175,14 +209,13 @@ function Schedule({
       <div className="backup-row">
         <label className="small">
           Keep the newest{" "}
-          <input
-            type="number"
-            className="search num-input"
+          <NumberInput
+            value={s.keep}
+            fallback={s.keep}
             min={1}
             max={100}
-            value={s.keep}
             disabled={readOnly || !s.enabled}
-            onChange={(e) => setS({ ...s, keep: Number(e.target.value) })}
+            onChange={(keep) => setS({ ...s, keep })}
           />
         </label>
         <label className="small">
@@ -275,8 +308,7 @@ export function BackupSection() {
   } | null>(null);
   const gaveUp = useRestartWatch(restarting);
 
-  if (b.error) return <ErrorNote error={b.error} />;
-  if (!b.data) return <Loading />;
+  // apctl's API is down while it restarts, so these come before the fetch error.
   if (restarting && gaveUp)
     return (
       <div className="panel">
@@ -292,6 +324,8 @@ export function BackupSection() {
         reloads when it is back.
       </div>
     );
+  if (b.error) return <ErrorNote error={b.error} />;
+  if (!b.data) return <Loading />;
   const d = b.data;
   return (
     <div className="panel" id="backups">
@@ -362,22 +396,18 @@ export function BackupSection() {
           >
             {busy ? "Working…" : "Back up now"}
           </button>
-          <label className="btn small upload-btn">
+          <FileButton
+            className="btn small"
+            accept=".apb"
+            disabled={busy}
+            onFile={(f) =>
+              void run(async () =>
+                setUploaded({ ...(await uploadBackup(f)), file: f.name }),
+              )
+            }
+          >
             Restore from a file…
-            <input
-              type="file"
-              accept=".apb"
-              hidden
-              onChange={(e) => {
-                const f = e.target.files?.[0];
-                e.target.value = "";
-                if (f)
-                  void run(async () =>
-                    setUploaded({ ...(await uploadBackup(f)), file: f.name }),
-                  );
-              }}
-            />
-          </label>
+          </FileButton>
         </div>
       )}
       <Outcome msg={msg} />

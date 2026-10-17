@@ -1348,9 +1348,6 @@ input.search.num-input {
   width: 70px;
   min-width: 0;
 }
-.upload-btn {
-  cursor: pointer;
-}
 .restore-confirm {
   display: grid;
   gap: 8px;
