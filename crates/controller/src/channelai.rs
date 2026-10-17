@@ -282,7 +282,7 @@ async fn run(s: AppState, bands: Vec<String>, trigger: &'static str, _running: R
             .plan
             .iter()
             .filter(|p| p.change)
-            .filter_map(|p| Some(Change { mac: p.mac.clone(), name: p.name.clone(), from: p.current_channel, to: p.suggested_channel?, width: Some(p.width) }))
+            .map(|p| Change { mac: p.mac.clone(), name: p.name.clone(), from: Some(p.current_channel), to: p.suggested_channel, width: Some(p.width) })
             .collect();
         let mut data = json!({
             "band": band, "trigger": trigger, "scanned": scanned.len(), "changes": changes,

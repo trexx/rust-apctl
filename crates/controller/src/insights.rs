@@ -1292,11 +1292,12 @@ pub struct PlanEntry {
     pub name: Option<String>,
     pub width: i64,
     pub clients: i64,
-    pub current_channel: Option<i64>,
-    pub current_score: Option<f64>,
-    pub current_reasons: Option<Vec<String>>,
-    pub suggested_channel: Option<i64>,
-    pub suggested_score: Option<f64>,
+    pub current_channel: i64,
+    pub current_score: f64,
+    pub current_reasons: Vec<String>,
+    pub suggested_channel: i64,
+    pub suggested_score: f64,
+    /// Only for an AP that moves.
     pub suggested_reasons: Vec<String>,
     pub change: bool,
     pub pinned: bool,
@@ -1521,18 +1522,19 @@ fn plan_channels(
         .map(|(i, ap)| {
             let (cur_score, cur_reasons) = explain(i, &ap.current, &current);
             let change = evict[i].is_some();
-            let (sug_score, sug_reasons) = explain(i, &fin[i], &fin);
+            // The reasons for a suggestion are only shown for an AP that moves.
+            let (sug_score, sug_reasons) = if change { explain(i, &fin[i], &fin) } else { (cost(i, &fin[i], &fin), Vec::new()) };
             PlanEntry {
                 mac: ap.mac.clone(),
                 name: ap.name.clone(),
                 width: ap.width,
                 clients: ap.clients,
-                current_channel: Some(ap.current.primary),
-                current_score: Some(cur_score.round()),
-                current_reasons: Some(cur_reasons),
-                suggested_channel: Some(fin[i].primary),
-                suggested_score: Some(sug_score.round()),
-                suggested_reasons: if change { sug_reasons } else { vec![] },
+                current_channel: ap.current.primary,
+                current_score: cur_score.round(),
+                current_reasons: cur_reasons,
+                suggested_channel: fin[i].primary,
+                suggested_score: sug_score.round(),
+                suggested_reasons: sug_reasons,
                 change,
                 pinned: is_pinned[i],
                 not_allowed: evict[i].unwrap_or(false),
@@ -1585,11 +1587,11 @@ mod tests {
         ];
         let plan = plan_channels("ng".into(), false, None, vec![], aps, own, neigh, vec![]);
         assert!(plan.accepted, "{plan:?}");
-        let ch: HashMap<&str, Option<i64>> = plan.plan.iter().map(|p| (p.mac.as_str(), p.suggested_channel)).collect();
+        let ch: HashMap<&str, i64> = plan.plan.iter().map(|p| (p.mac.as_str(), p.suggested_channel)).collect();
         assert_ne!(ch["a"], ch["b"]);
-        assert_ne!(ch["a"], Some(1), "a keeps off its neighbour");
+        assert_ne!(ch["a"], 1, "a keeps off its neighbour");
         let a = plan.plan.iter().find(|p| p.mac == "a").unwrap();
-        assert_eq!(a.current_reasons.as_deref(), Some(&["your AP AP b (-50 dBm)".to_string()][..]));
+        assert_eq!(a.current_reasons, ["your AP AP b (-50 dBm)"]);
     }
 
     #[test]
