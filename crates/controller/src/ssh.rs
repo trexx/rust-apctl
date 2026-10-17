@@ -303,11 +303,13 @@ pub async fn adopt(State(s): State<AppState>, Json(b): Json<AdoptBody>) -> Resul
     });
     let fingerprint = session.fingerprint.clone();
     let new = known.is_none();
-    crate::actions::edit_settings(&s, format!("adopting {mac} over SSH"), move |st| {
+    crate::actions::apply_edit(&s, Box::new(move |st: &mut Value| {
         // A known AP keeps its key: it reaches the AP over SSH, not sealed with the factory key.
-        if crate::adopt::device_doc(st, &mac).is_none() {
-            crate::adopt::adopt_device(st, &mac, &payload)?;
-        }
+        let what = if crate::adopt::device_doc(st, &mac).is_none() {
+            format!("{} over SSH", crate::adopt::adopt_device(st, &mac, &payload)?)
+        } else {
+            format!("adopting {mac} over SSH")
+        };
         let d = crate::adopt::device_doc_mut(st, &mac).ok_or("no record")?;
         d["inform_url"] = payload["inform_url"].clone();
         if let Some(fp) = &fingerprint
@@ -315,8 +317,8 @@ pub async fn adopt(State(s): State<AppState>, Json(b): Json<AdoptBody>) -> Resul
         {
             d["x_ssh_hostkey_fingerprint"] = json!(fp);
         }
-        Ok(())
-    })
+        Ok(what)
+    }))
     .await?;
     let key = {
         let live = s.live.read().unwrap();
@@ -336,7 +338,8 @@ pub async fn adopt(State(s): State<AppState>, Json(b): Json<AdoptBody>) -> Resul
             s.live.write().unwrap().adoption.adopting.remove(&mac);
             // Not adopted after all: a record made for it would make it look like one of ours.
             if new {
-                let _ = crate::actions::edit_settings(&s, format!("removed {mac}: adopting it over SSH failed"), move |st| crate::adopt::remove_device(st, &mac).map(|_| ())).await;
+                let undo = move |st: &mut Value| crate::adopt::remove_device(st, &mac).map(|what| format!("{what}: adopting it over SSH failed"));
+                let _ = crate::actions::apply_edit(&s, Box::new(undo)).await;
             }
             return Err(bad(f));
         }

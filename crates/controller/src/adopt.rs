@@ -270,7 +270,8 @@ pub fn adopt_device(state: &mut Value, mac: &Mac, payload: &Value) -> Result<Str
         if let Some(o) = d.as_object_mut() {
             o.remove("x_inform_authkey");
         }
-        return Ok(format!("re-adopting {mac}"));
+        let name = d["name"].as_str().map_or_else(|| mac.to_string(), |n| format!("{n} ({mac})"));
+        return Ok(format!("re-adopting AP {name} with new keys"));
     }
     let d = new_device(state, payload, mac);
     crate::settings::push_doc(state, "devices", d);
@@ -279,11 +280,10 @@ pub fn adopt_device(state: &mut Value, mac: &Mac, payload: &Value) -> Result<Str
 
 /// Removes an AP from the settings and everything that names it.
 pub fn remove_device(state: &mut Value, mac: &Mac) -> Result<String, String> {
-    let mac = mac.to_string();
-    let same = |v: &Value| v.as_str().is_some_and(|m| m.eq_ignore_ascii_case(&mac));
+    let same = |v: &Value| v.as_str().is_some_and(|m| m.parse::<Mac>().ok() == Some(*mac));
     let devices = state["devices"].as_array_mut().ok_or("the settings have no APs")?;
     let before = devices.len();
-    let name = devices.iter().find(|d| same(&d["mac"])).and_then(|d| d["name"].as_str().map(str::to_string)).unwrap_or_else(|| mac.clone());
+    let name = devices.iter().find(|d| same(&d["mac"])).and_then(|d| d["name"].as_str()).map_or_else(|| mac.to_string(), |n| format!("{n} ({mac})"));
     devices.retain(|d| !same(&d["mac"]));
     if devices.len() == before {
         return Err("this AP is not in the settings".into());
@@ -299,6 +299,13 @@ pub fn remove_device(state: &mut Value, mac: &Mac) -> Result<String, String> {
     for w in state["wlanconf"].as_array_mut().into_iter().flatten() {
         if let Some(l) = w["broadcasting_aps"].as_array_mut() {
             l.retain(|m| !same(m));
+        }
+        // An mDNS rule left with no AP applies nowhere, as it did; the editor
+        // asks for its APs when the SSID is edited next.
+        for r in w["mdns_proxy_custom"].as_array_mut().into_iter().flatten() {
+            if let Some(l) = r.get_mut("ap_macs").and_then(Value::as_array_mut) {
+                l.retain(|m| !same(m));
+            }
         }
     }
     for c in state["clients"].as_array_mut().into_iter().flatten() {
@@ -369,7 +376,7 @@ pub async fn adopt(State(s): State<AppState>, Path(mac): Path<String>) -> Result
     let mac = crate::api::parse_mac(&mac)?;
     let payload = s.live.read().unwrap().adoption.pending.get(&mac).map(|p| p.payload.clone()).ok_or_else(|| ApiError(StatusCode::NOT_FOUND, "this AP is not waiting for adoption".into()))?;
     let inform = payload.clone();
-    crate::actions::edit_settings(&s, format!("adopting {mac}"), move |state| adopt_device(state, &mac, &inform).map(|_| ())).await?;
+    crate::actions::apply_edit(&s, Box::new(move |state: &mut Value| adopt_device(state, &mac, &inform))).await?;
     {
         let mut live = s.live.write().unwrap();
         live.adoption.adopting.insert(mac, store::now_ts());
@@ -403,7 +410,7 @@ pub async fn forget(State(s): State<AppState>, Path(mac): Path<String>) -> Resul
 /// Removes a forgotten AP from the settings and apctl's records.
 pub async fn finish_forget(engine: &tokio::sync::mpsc::Sender<Input>, mac: Mac, reset: bool) {
     let (tx, rx) = tokio::sync::oneshot::channel();
-    let edit: crate::engine::StateEdit = Box::new(move |state: &mut Value| remove_device(state, &mac).map(|_| format!("forgot AP {mac}")));
+    let edit: crate::engine::StateEdit = Box::new(move |state: &mut Value| remove_device(state, &mac));
     let _ = engine.send(Input::EditState { ts: store::now_ts(), edit, done: tx }).await;
     let _ = rx.await;
     let _ = engine.send(Input::Forget { ts: store::now_ts(), mac }).await;
@@ -474,14 +481,19 @@ mod tests {
     fn forgetting_removes_every_mention() {
         let mut s = state();
         let ap: Mac = "02:00:00:00:00:01".parse().unwrap();
-        remove_device(&mut s, &ap).unwrap();
+        s["devices"][0]["name"] = json!("Hall");
+        s["wlanconf"][0]["mdns_proxy_custom"] = json!([{ "ap_scope_mode": "specific", "ap_macs": ["02:00:00:00:00:01", "02:00:00:00:00:02"] }, { "ap_scope_mode": "all" }]);
+        assert_eq!(remove_device(&mut s, &ap).unwrap(), "forgot AP Hall (02:00:00:00:00:01)");
         assert!(s["devices"].as_array().unwrap().is_empty());
         assert_eq!(s["apgroup"][0]["device_macs"], json!(["02:00:00:00:00:02"]));
         assert_eq!(s["wlanconf"][0]["broadcasting_aps"], json!([]));
+        assert_eq!(s["wlanconf"][0]["mdns_proxy_custom"][0]["ap_macs"], json!(["02:00:00:00:00:02"]));
+        assert!(s["wlanconf"][0]["mdns_proxy_custom"][1].get("ap_macs").is_none());
         assert_eq!(s["clients"][0]["fixed_ap_enabled"], false);
         assert!(s["config_meta"].as_array().unwrap().is_empty());
         assert!(remove_device(&mut s, &ap).is_err());
         assert!(device_doc_mut(&mut state(), &ap).is_some());
+        assert_eq!(remove_device(&mut state(), &ap).unwrap(), "forgot AP 02:00:00:00:00:01", "no name: the MAC");
     }
 
     #[test]
