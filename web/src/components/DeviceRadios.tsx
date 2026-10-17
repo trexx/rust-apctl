@@ -3,10 +3,18 @@ import { useSeries, useSiteActivity } from "../api";
 import type { ClientView, RadioSample, TimeSpan, VapSample } from "../api";
 import { COLORS, Chart } from "./Chart";
 import { QueryState, Signal } from "./common";
-import { SIGNAL, band, bitrate, bytes, compact, pct1 } from "../format";
+import { SIGNAL, band, bytes, compact, pct1, rate } from "../format";
 
 const share = (part: number, whole: number) =>
   pct1(whole > 0 ? (100 * part) / whole : null);
+
+/** A value with its unit, or "—" when there is none. */
+const unit = (v: number | null, u: string) => (v === null ? "—" : `${v} ${u}`);
+
+/** The keys of `T` whose values are numbers (or null). */
+type NumericKey<T> = {
+  [K in keyof T]: T[K] extends number | null ? K : never;
+}[keyof T];
 
 /** Lower edges of the signal buckets, strongest first, with the colour of `signalClass`. */
 const SIGNAL_BUCKETS: [number, string, string][] = [
@@ -16,16 +24,14 @@ const SIGNAL_BUCKETS: [number, string, string][] = [
   [-Infinity, "Poor", "poor"],
 ];
 
-/** How many of the radio's clients are in each signal band. */
+/** How many of the radio's clients are in each signal band; those without a signal reading are left out. */
 function SignalDistribution({ clients }: { clients: ClientView[] }) {
+  const signals = clients.flatMap((c) => c.sample.signal ?? []);
   const counts = SIGNAL_BUCKETS.map(([min], i) => {
     const max = i === 0 ? Infinity : SIGNAL_BUCKETS[i - 1]![0];
-    return clients.filter(
-      (c) =>
-        (c.sample.signal ?? -200) >= min && (c.sample.signal ?? -200) < max,
-    ).length;
+    return signals.filter((s) => s >= min && s < max).length;
   });
-  const total = clients.length;
+  const total = signals.length;
   return (
     <div className="dist">
       <div className="dist-bar">
@@ -68,8 +74,8 @@ export function RadioPanel({
 }) {
   const s = useSeries("radio", `${mac},${radio.radio}`, range);
   // The radio's own retry counters stay at zero on this firmware, so totals come from its SSIDs.
-  const sum = (k: keyof VapSample) =>
-    vaps.reduce((a, v) => a + ((v[k] as number | null) ?? 0), 0);
+  const sum = (k: NumericKey<VapSample>) =>
+    vaps.reduce((a, v) => a + (v[k] ?? 0), 0);
   const txPkts = sum("tx_packets");
   const retries = sum("tx_retries");
   const attempts = sum("wifi_tx_attempts");
@@ -87,15 +93,15 @@ export function RadioPanel({
         <b>{band(radio.radio)}</b>
         <span className="muted">
           {radio.channel !== null
-            ? `channel ${radio.channel} · ${radio.bw} MHz`
+            ? `channel ${radio.channel} · ${unit(radio.bw, "MHz")}`
             : "no SSIDs on this radio"}{" "}
-          · noise {radio.noise_floor} dBm
+          · noise {unit(radio.noise_floor, "dBm")}
         </span>
       </div>
       <dl className="kv">
         <dt>TX power</dt>
         <dd>
-          {radio.tx_power ?? "—"} dBm
+          {unit(radio.tx_power, "dBm")}
           {eirp !== null && <span className="muted"> · {eirp} dBm EIRP</span>}
           {radio.min_txpower !== null && radio.max_txpower !== null && (
             <span className="muted small">
@@ -203,7 +209,7 @@ export function RadioActivity({
           <Chart
             title="Client activity"
             ts={x.ts}
-            format={(v) => bitrate(v / 8)}
+            format={rate}
             formatRight={(v) => `${Math.round(v)}`}
             series={[
               {
@@ -357,7 +363,7 @@ function VapChart({ bssid, range }: { bssid: string; range: TimeSpan }) {
         <Chart
           title="SSID traffic on this radio"
           ts={data.ts}
-          format={(v) => bitrate(v / 8)}
+          format={rate}
           series={[
             {
               label: "To clients",

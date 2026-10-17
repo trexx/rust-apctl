@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { useSiteActivity } from "../../api";
-import { bitrate } from "../../format";
+import { rate } from "../../format";
 import {
   COLORS,
   Chart,
@@ -46,7 +46,7 @@ export function SiteActivity() {
                     title="Wi-Fi traffic"
                     ts={activity.ts}
                     height={200}
-                    format={(v) => bitrate(v / 8)}
+                    format={rate}
                     formatRight={(v) => `${Math.round(v)}`}
                     series={[
                       {
