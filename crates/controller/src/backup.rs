@@ -80,13 +80,14 @@ impl Backups {
 
     /// The backup settings: the stored ones, read once (the defaults when
     /// none are stored, or, with a warning, while they cannot be read).
+    /// The lock is never held while the database or the directory is read.
     fn settings(&self, store: &store::Store) -> Settings {
-        let mut k = self.known();
-        if let Some(s) = &k.settings {
+        if let Some(s) = &self.known().settings {
             return s.clone();
         }
         match load_settings(store) {
-            Ok(s) => k.settings.insert(s).clone(),
+            // Settings saved meanwhile are newer than the ones read.
+            Ok(s) => self.known().settings.get_or_insert(s).clone(),
             Err(e) => {
                 tracing::warn!("the backup settings could not be read, the defaults apply: {e:#}");
                 Settings::default()
@@ -96,8 +97,15 @@ impl Backups {
 
     /// When the newest automatic backup was made (0: none).
     fn last_auto(&self) -> Ts {
+        if let Some(t) = self.known().last_auto {
+            return t;
+        }
+        let found = list(self).iter().filter(|m| m.kind == Kind::Auto).map(|m| m.created).max().unwrap_or(0);
+        // One made meanwhile is the newest.
         let mut k = self.known();
-        *k.last_auto.get_or_insert_with(|| list(self).iter().filter(|m| m.kind == Kind::Auto).map(|m| m.created).max().unwrap_or(0))
+        let t = k.last_auto.map_or(found, |t| t.max(found));
+        k.last_auto = Some(t);
+        t
     }
 
     pub fn dir(&self) -> PathBuf {
@@ -505,10 +513,9 @@ pub fn create(b: &Backups, src_dir: &Path, kind: Kind, days: i64) -> Result<Meta
         fs::rename(tmp.join("meta.json"), dir.join(format!("{name}.json")))?;
         fs::rename(&part, dir.join(&name))?;
         sync_dir(&dir)?;
-        if kind == Kind::Auto
-            && let Some(last) = &mut b.known().last_auto
-        {
-            *last = (*last).max(now);
+        if kind == Kind::Auto {
+            let mut k = b.known();
+            k.last_auto = Some(k.last_auto.map_or(now, |t| t.max(now)));
         }
         Ok(meta)
     })();
@@ -876,8 +883,6 @@ pub fn list(b: &Backups) -> Vec<Meta> {
 fn remove(b: &Backups, name: &str) {
     let _ = fs::remove_file(b.dir().join(name));
     let _ = fs::remove_file(b.dir().join(format!("{name}.json")));
-    // It may have been the newest automatic one: found again when next needed.
-    b.known().last_auto = None;
 }
 
 /// How many pre-restore backups are kept.
@@ -1024,6 +1029,11 @@ pub async fn delete(State(s): State<AppState>, UrlPath(name): UrlPath<String>) -
             let found = b.dir().join(&name).exists();
             if found {
                 remove(&b, &name);
+                // It may have been the newest automatic one: found again when next needed.
+                // (Pruning keeps the newest, so it never needs this.)
+                if name.starts_with(Kind::Auto.prefix()) {
+                    b.known().last_auto = None;
+                }
             }
             found
         })
@@ -1311,6 +1321,18 @@ mod tests {
         assert!(list(&b).iter().any(|x| x.kind == Kind::PreRestore), "the replaced state was saved");
         // Nothing pending: nothing happens.
         apply_pending(&b);
+    }
+
+    #[test]
+    fn the_newest_automatic_backup_is_known_without_reading_the_directory_again() {
+        let src = data("last-auto");
+        let b = Backups::new(src.clone(), None);
+        create(&b, &src, Kind::Manual, 0).unwrap();
+        assert_eq!(b.last_auto(), 0);
+        let m = create(&b, &src, Kind::Auto, 0).unwrap();
+        assert_eq!(b.known().last_auto, Some(m.created), "kept by the backup made");
+        fs::remove_file(b.dir().join(format!("{}.json", m.name))).unwrap();
+        assert_eq!(b.last_auto(), m.created, "not read again");
     }
 
     #[test]
