@@ -25,7 +25,7 @@ use serde::Deserialize;
 use serde_json::json;
 use sha2::{Digest, Sha256};
 
-use crate::api::AppState;
+use crate::api::{ApiError, AppState};
 use crate::model::Ts;
 use crate::store::{self, Db, Store, Writer};
 
@@ -118,7 +118,7 @@ struct Session {
 }
 
 pub struct Auth {
-    pub users: Users,
+    users: Users,
     sessions: Mutex<HashMap<String, Session>>,
     /// Login attempts per address in the current window (the count, and when
     /// the window started).
@@ -353,7 +353,7 @@ fn origin_matches(origin: &str, host: &str) -> bool {
     !authority.is_empty() && bare(authority) == bare(host)
 }
 
-pub fn session_token(headers: &HeaderMap) -> Option<String> {
+fn session_token(headers: &HeaderMap) -> Option<String> {
     headers
         .get_all(header::COOKIE)
         .iter()
@@ -369,18 +369,22 @@ fn cookie(headers: &HeaderMap, value: &str, max_age: Ts) -> String {
     format!("{COOKIE}={value}; Path=/; HttpOnly; SameSite=Lax; Max-Age={max_age}{}", if https { "; Secure" } else { "" })
 }
 
-fn json_error(status: StatusCode, msg: &str) -> Response {
-    (status, Json(json!({ "error": msg }))).into_response()
+/// The user of the request's session, if it is a valid one; and the cookie
+/// to send again when using it extended it (see `renewed`).
+fn session(auth: &Auth, headers: &HeaderMap) -> Option<(String, Option<String>)> {
+    let token = session_token(headers)?;
+    let (user, extended) = auth.check(&token)?;
+    Some((user, extended.then(|| cookie(headers, &token, SESSION_SECS))))
 }
 
 /// For the routes that hand out secrets (Wi-Fi passphrases, and backups, which
 /// hold the APs' keys and the passphrases): read-only mode does not serve
 /// them. Set on the route itself, so a new one cannot be missed.
-pub async fn withhold_in_read_only(State(s): State<AppState>, req: Request, next: Next) -> Response {
+pub async fn withhold_in_read_only(State(s): State<AppState>, req: Request, next: Next) -> Result<Response, ApiError> {
     if !s.auth.enabled() {
-        return json_error(StatusCode::FORBIDDEN, "this needs a login: no users are configured (see --users-file)");
+        return Err(ApiError(StatusCode::FORBIDDEN, "this needs a login: no users are configured (see --users-file)".into()));
     }
-    next.run(req).await
+    Ok(next.run(req).await)
 }
 
 /// Whether a request carries the header every change must have. Browsers
@@ -393,25 +397,20 @@ fn csrf_ok(headers: &HeaderMap) -> bool {
 
 /// Guards every API route except login/logout/me; changes (anything but GET,
 /// HEAD and OPTIONS) also need the CSRF header.
-pub async fn require_login(State(s): State<AppState>, req: Request, next: Next) -> Response {
-    let auth = &s.auth;
+pub async fn require_login(State(s): State<AppState>, req: Request, next: Next) -> Result<Response, ApiError> {
     let mutating = !matches!(*req.method(), Method::GET | Method::HEAD | Method::OPTIONS);
-    if !auth.enabled() {
+    if !s.auth.enabled() {
         // Without users apctl is read-only, and keeps its secrets (the
         // routes that hold them have `withhold_in_read_only`).
         if mutating {
-            return json_error(StatusCode::FORBIDDEN, "read-only: no users are configured (see --users-file)");
+            return Err(ApiError(StatusCode::FORBIDDEN, "read-only: no users are configured (see --users-file)".into()));
         }
-        return next.run(req).await;
+        return Ok(next.run(req).await);
     }
-    let token = session_token(req.headers());
-    match token.as_deref().and_then(|t| Some((t, auth.check(t)?))) {
-        Some(_) if mutating && !csrf_ok(req.headers()) => json_error(StatusCode::FORBIDDEN, "missing X-Requested-With: apctl header"),
-        Some((t, (_, extended))) => {
-            let cookie = extended.then(|| cookie(req.headers(), t, SESSION_SECS));
-            renewed(next.run(req).await, cookie)
-        }
-        None => json_error(StatusCode::UNAUTHORIZED, "login required"),
+    match session(&s.auth, req.headers()) {
+        Some(_) if mutating && !csrf_ok(req.headers()) => Err(ApiError(StatusCode::FORBIDDEN, "missing X-Requested-With: apctl header".into())),
+        Some((_, cookie)) => Ok(renewed(next.run(req).await, cookie)),
+        None => Err(ApiError(StatusCode::UNAUTHORIZED, "login required".into())),
     }
 }
 
@@ -426,14 +425,14 @@ pub async fn login(
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     Json(body): Json<LoginBody>,
-) -> Response {
+) -> Result<Response, ApiError> {
     let auth = s.auth.clone();
     if !auth.enabled() {
-        return json_error(StatusCode::NOT_FOUND, "login is not enabled");
+        return Err(ApiError(StatusCode::NOT_FOUND, "login is not enabled".into()));
     }
     let ip = auth.proxies.client_ip(&headers, peer.ip());
     if !auth.attempt(ip) {
-        return json_error(StatusCode::TOO_MANY_REQUESTS, "too many failed attempts, try again in a few minutes");
+        return Err(ApiError(StatusCode::TOO_MANY_REQUESTS, "too many failed attempts, try again in a few minutes".into()));
     }
     // Argon2 is deliberately slow and takes about 19 MiB per check: keep it off
     // the async workers, and run at most two at a time. A queue kept full (by
@@ -444,27 +443,21 @@ pub async fn login(
         Ok(p) => p.expect("the semaphore is never closed"),
         Err(_) => {
             auth.refund(ip);
-            return json_error(StatusCode::SERVICE_UNAVAILABLE, "too many logins at once, try again shortly");
+            return Err(ApiError(StatusCode::SERVICE_UNAVAILABLE, "too many logins at once, try again shortly".into()));
         }
     };
     let verifier = auth.clone();
-    let Ok((ok, user)) = tokio::task::spawn_blocking(move || (verifier.users.verify(&body.username, &body.password), body.username)).await else {
-        return json_error(StatusCode::INTERNAL_SERVER_ERROR, "the password check failed");
-    };
+    let (ok, user) = tokio::task::spawn_blocking(move || (verifier.users.verify(&body.username, &body.password), body.username)).await?;
     if !ok {
         // The name is the client's, up to the whole body: the log gets its start.
         let shown = &user[..user.floor_char_boundary(64)];
         tracing::warn!("failed login for {shown:?}{} from {ip}", if shown.len() < user.len() { "…" } else { "" });
-        return json_error(StatusCode::UNAUTHORIZED, "wrong username or password");
+        return Err(ApiError(StatusCode::UNAUTHORIZED, "wrong username or password".into()));
     }
     auth.refund(ip);
-    match auth.create(&user) {
-        Ok(token) => {
-            tracing::info!("{user} logged in from {ip}");
-            ([(header::SET_COOKIE, cookie(&headers, &token, SESSION_SECS))], Json(json!({ "user": user }))).into_response()
-        }
-        Err(e) => json_error(StatusCode::INTERNAL_SERVER_ERROR, &format!("{e:#}")),
-    }
+    let token = auth.create(&user)?;
+    tracing::info!("{user} logged in from {ip}");
+    Ok(([(header::SET_COOKIE, cookie(&headers, &token, SESSION_SECS))], Json(json!({ "user": user }))).into_response())
 }
 
 pub async fn logout(State(s): State<AppState>, headers: HeaderMap) -> Response {
@@ -476,13 +469,11 @@ pub async fn logout(State(s): State<AppState>, headers: HeaderMap) -> Response {
 
 /// Who is logged in, and whether login is needed at all.
 pub async fn me(State(s): State<AppState>, headers: HeaderMap) -> Response {
-    let auth = &s.auth;
-    if !auth.enabled() {
+    if !s.auth.enabled() {
         return Json(json!({ "auth": false, "user": null, "read_only": true })).into_response();
     }
-    let token = session_token(&headers);
-    match token.as_deref().and_then(|t| Some((t, auth.check(t)?))) {
-        Some((t, (user, extended))) => renewed(Json(json!({ "auth": true, "user": user, "read_only": false })).into_response(), extended.then(|| cookie(&headers, t, SESSION_SECS))),
+    match session(&s.auth, &headers) {
+        Some((user, cookie)) => renewed(Json(json!({ "auth": true, "user": user, "read_only": false })).into_response(), cookie),
         None => (StatusCode::UNAUTHORIZED, Json(json!({ "auth": true, "user": null }))).into_response(),
     }
 }

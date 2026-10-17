@@ -1275,7 +1275,10 @@ mod tests {
             }
             app.clone().oneshot(req.body(Body::empty()).unwrap())
         };
-        assert_eq!(post(false).await.unwrap().status(), StatusCode::FORBIDDEN);
+        let refused = post(false).await.unwrap();
+        assert_eq!(refused.status(), StatusCode::FORBIDDEN);
+        let body: Value = serde_json::from_slice(&axum::body::to_bytes(refused.into_body(), 1 << 16).await.unwrap()).unwrap();
+        assert_eq!(body, json!({ "error": "missing X-Requested-With: apctl header" }));
         assert_eq!(post(true).await.unwrap().status(), StatusCode::OK);
         // Reads need no header.
         let req = Request::get("/api/status").header(header::COOKIE, &cookie).body(Body::empty()).unwrap();
