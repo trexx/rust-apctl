@@ -29,8 +29,30 @@ use crate::adopt::{device_doc, device_doc_mut};
 use crate::settings::{band_channels, country, device_macs, inform_radio, is_legal, legal_channels, num, setting, setting_mut, uplink};
 use crate::store;
 
+/// A band Channel AI handles, and how its quick scan is asked for.
+pub struct Band {
+    pub radio: &'static str,
+    /// `scan-band` in the quick-scan command.
+    scan_band: i64,
+    /// `scan-bw`: the width scanned (MHz).
+    scan_width: i64,
+}
+
 /// Bands Channel AI handles (6 GHz needs hardware apctl has not seen).
-const BANDS: &[&str] = &["ng", "na"];
+const BANDS: &[Band] = &[Band { radio: "ng", scan_band: 0, scan_width: 20 }, Band { radio: "na", scan_band: 1, scan_width: 80 }];
+
+impl Band {
+    /// The band with this radio name, if Channel AI handles it.
+    pub fn named(radio: &str) -> Option<&'static Band> {
+        BANDS.iter().find(|b| b.radio == radio)
+    }
+}
+
+/// `wifi_caps2` bit: the AP can run a quick scan.
+const CAP_QUICK_SCAN: u64 = 128;
+/// The schedule when the setting has none: 03:00, the official default.
+const DEFAULT_CRON: &str = "0 3 * * *";
+
 /// Longest wait for one AP's quick scan.
 const SCAN_TIMEOUT: Ts = 120;
 
@@ -59,6 +81,11 @@ fn radio_ai(state: &Value) -> Option<&Value> {
     Some(setting(state, "radio_ai")).filter(|r| !r.is_null())
 }
 
+/// Whether the `radio_ai` setting allows DFS channels on 5 GHz.
+fn na_dfs(r: &Value) -> bool {
+    r["radios_configuration"].as_array().and_then(|l| l.iter().find(|c| c["radio"].as_str() == Some("na"))).and_then(|c| c["dfs"].as_bool()).unwrap_or(false)
+}
+
 /// `M H * * *` (the only form the official UI writes); 03:00 otherwise, its default.
 fn parse_cron(expr: &str) -> (i64, i64) {
     let f: Vec<&str> = expr.split_whitespace().collect();
@@ -73,10 +100,10 @@ fn parse_cron(expr: &str) -> (i64, i64) {
 
 pub fn settings(state: Option<&Value>) -> Settings {
     let r = state.and_then(radio_ai);
-    let (hour, minute) = parse_cron(r.and_then(|r| r["cron_expr"].as_str()).unwrap_or("0 3 * * *"));
+    let (hour, minute) = parse_cron(r.and_then(|r| r["cron_expr"].as_str()).unwrap_or(DEFAULT_CRON));
     let list = |k: &str| -> Vec<String> { r.and_then(|r| r[k].as_array()).into_iter().flatten().filter_map(|v| v.as_str().map(str::to_ascii_lowercase)).collect() };
-    let radios = r.map_or_else(|| BANDS.iter().map(|b| b.to_string()).collect(), |_| list("radios"));
-    let dfs = r.and_then(|r| r["radios_configuration"].as_array()?.iter().find(|c| c["radio"].as_str() == Some("na"))?["dfs"].as_bool()).unwrap_or(false);
+    let radios = r.map_or_else(|| BANDS.iter().map(|b| b.radio.to_string()).collect(), |_| list("radios"));
+    let dfs = r.is_some_and(na_dfs);
     Settings { enabled: r.and_then(|r| r["enabled"].as_bool()).unwrap_or(false), hour, minute, radios, dfs, exclude_devices: list("exclude_devices") }
 }
 
@@ -119,14 +146,6 @@ pub fn pinned(live: &Live, band: &str) -> Vec<String> {
     out
 }
 
-fn band_index(band: &str) -> i64 {
-    match band {
-        "ng" => 0,
-        "na" => 1,
-        _ => 2,
-    }
-}
-
 /// How old (seconds) the AP's spectrum table for a band is: `spectrum_table_time`
 /// counts up from the last scan with every report.
 fn spectrum_age(inform: &Value, band: &str) -> Option<i64> {
@@ -135,12 +154,7 @@ fn spectrum_age(inform: &Value, band: &str) -> Option<i64> {
 
 /// Asks every AP that can to scan a band; returns the APs asked. Scans go out
 /// with each AP's next inform (see `actions`).
-pub fn start_scans(live: &mut Live, band: &str, now: Ts) -> Vec<Mac> {
-    let width = match band {
-        "ng" => 20,
-        "na" => 80,
-        _ => 160,
-    };
+pub fn start_scans(live: &mut Live, band: &Band, now: Ts) -> Vec<Mac> {
     let eligible: Vec<Mac> = live
         .devices
         .iter()
@@ -148,12 +162,12 @@ pub fn start_scans(live: &mut Live, band: &str, now: Ts) -> Vec<Mac> {
         .filter_map(|(mac, _)| {
             let p = live.raw_informs.get(mac)?;
             let caps = p["wifi_caps2"].as_u64().unwrap_or(0);
-            (caps & 128 != 0 && !uplink(p).is_wireless() && inform_radio(p, band).is_some()).then_some(*mac)
+            (caps & CAP_QUICK_SCAN != 0 && !uplink(p).is_wireless() && inform_radio(p, band.radio).is_some()).then_some(*mac)
         })
         .collect();
     for mac in &eligible {
-        crate::actions::queue(live, *mac, json!({ "_type": "cmd", "cmd": "quick-scan", "scan-band": band_index(band), "scan-bw": width }));
-        live.scans.insert(*mac, Scan { band: band.to_string(), started: now, seen_scanning: false });
+        crate::actions::queue(live, *mac, json!({ "_type": "cmd", "cmd": "quick-scan", "scan-band": band.scan_band, "scan-bw": band.scan_width }));
+        live.scans.insert(*mac, Scan { band: band.radio.to_string(), started: now, seen_scanning: false });
     }
     eligible
 }
@@ -190,18 +204,18 @@ async fn wait_for_scans(s: &AppState) {
     }
 }
 
-/// Writes fixed channels into the APs' radio settings (`changes`: AP, band,
-/// channel), checking each is legal at the radio's width and allowed.
-pub fn set_channels(state: &mut Value, changes: &[(String, String, i64)]) -> Result<(), String> {
+/// Writes fixed channels on `band` into the APs' radio settings (`changes`:
+/// AP, channel), checking each is legal at the radio's width and allowed.
+pub fn set_channels(state: &mut Value, band: &str, changes: &[(String, i64)]) -> Result<(), String> {
+    if !state["devices"].is_array() {
+        return Err("the settings have no APs".into());
+    }
     let c = country(state);
-    let locked = crate::settings::channel_locked_aps(state);
-    for (mac, band, ch) in changes {
-        if band == "ng" && locked.contains(&mac.to_ascii_lowercase()) {
+    let locked = if band == "ng" { crate::settings::channel_locked_aps(state) } else { vec![] };
+    let allowed_here = allowed(Some(state), band, true);
+    for (mac, ch) in changes {
+        if locked.contains(&mac.to_ascii_lowercase()) {
             return Err(format!("{mac}: the 2.4 GHz channel is locked by an SSID's IoT setting"));
-        }
-        let allowed_here = allowed(Some(state), band, true);
-        if !state["devices"].is_array() {
-            return Err("the settings have no APs".into());
         }
         let m: Mac = mac.parse().map_err(|_| format!("{mac} is not in the settings"))?;
         let d = device_doc(state, &m).ok_or_else(|| format!("{mac} is not in the settings"))?;
@@ -212,7 +226,7 @@ pub fn set_channels(state: &mut Value, changes: &[(String, String, i64)]) -> Res
         if is_legal(c, band, width, outdoor, *ch) == Some(false) {
             return Err(format!("channel {ch} is not allowed at {width} MHz here"));
         }
-        if allowed_here.is_some_and(|a| !a.contains(ch)) {
+        if allowed_here.as_ref().is_some_and(|a| !a.contains(ch)) {
             return Err(format!("channel {ch} is not one of the channels Channel AI may use"));
         }
         r["channel"] = json!(ch);
@@ -257,8 +271,8 @@ pub struct Change {
 /// Scans, plans and (when worth it) applies, band by band, holding the run
 /// flag (`_running`) until done.
 async fn run(s: AppState, bands: Vec<String>, trigger: &'static str, _running: RunGuard) {
-    for band in bands.iter().filter(|b| BANDS.contains(&b.as_str())) {
-        let scanned = start_scans(&mut s.live.write().unwrap(), band, store::now_ts());
+    for (band, b) in bands.iter().filter_map(|n| Some((n, Band::named(n)?))) {
+        let scanned = start_scans(&mut s.live.write().unwrap(), b, store::now_ts());
         tracing::info!("channel AI ({trigger}): {} APs scanning {band}", scanned.len());
         wait_for_scans(&s).await;
         // The engine queues an AP's scan results before it shows the scan as
@@ -299,10 +313,11 @@ async fn run(s: AppState, bands: Vec<String>, trigger: &'static str, _running: R
 }
 
 async fn apply(s: &AppState, band: &str, changes: &[Change], trigger: &str) -> Result<(), ApiError> {
-    let list: Vec<(String, String, i64)> = changes.iter().map(|c| (c.mac.clone(), band.to_string(), c.to)).collect();
-    let show = |c: &Change| format!("{} {} → {}", c.name.as_deref().unwrap_or(&c.mac), c.from.map_or_else(|| "null".to_string(), |f| f.to_string()), c.to);
+    let list: Vec<(String, i64)> = changes.iter().map(|c| (c.mac.clone(), c.to)).collect();
+    let show = |c: &Change| format!("{} {} → {}", c.name.as_deref().unwrap_or(&c.mac), c.from.map_or_else(|| "auto".to_string(), |f| f.to_string()), c.to);
     let what = format!("channel AI ({trigger}): {}", changes.iter().map(show).collect::<Vec<_>>().join(", "));
-    crate::actions::edit_settings(s, what, move |state| set_channels(state, &list)).await
+    let band = band.to_string();
+    crate::actions::edit_settings(s, what, move |state| set_channels(state, &band, &list)).await
 }
 
 /// Runs Channel AI nightly at the setting's hour, in the site's time zone
@@ -413,10 +428,8 @@ pub struct BandBody {
 /// POST /api/rf/scan {band}
 pub async fn scan(State(s): State<AppState>, Json(b): Json<BandBody>) -> Result<Json<Value>, ApiError> {
     crate::api::require_active(&s, "this needs")?;
-    if !BANDS.contains(&b.band.as_str()) {
-        return Err(ApiError(StatusCode::BAD_REQUEST, "band must be ng or na".into()));
-    }
-    let asked = start_scans(&mut s.live.write().unwrap(), &b.band, store::now_ts());
+    let band = Band::named(&b.band).ok_or_else(|| ApiError(StatusCode::BAD_REQUEST, "band must be ng or na".into()))?;
+    let asked = start_scans(&mut s.live.write().unwrap(), band, store::now_ts());
     if asked.is_empty() {
         return Err(ApiError(StatusCode::CONFLICT, "no online AP can scan this band".into()));
     }
@@ -450,7 +463,7 @@ pub struct ApplyBody {
 pub async fn apply_plan(State(s): State<AppState>, Json(b): Json<Value>) -> Result<Json<Value>, ApiError> {
     crate::api::require_active(&s, "this needs")?;
     let b: ApplyBody = serde_json::from_value(b).map_err(|e| ApiError(StatusCode::BAD_REQUEST, format!("not a plan: {e}")))?;
-    if !BANDS.contains(&b.band.as_str()) {
+    if Band::named(&b.band).is_none() {
         return Err(ApiError(StatusCode::BAD_REQUEST, "band must be ng or na".into()));
     }
     if b.changes.is_empty() {
@@ -478,7 +491,7 @@ pub fn apply_settings(state: &mut Value, p: &Value) -> Result<String, String> {
     if missing {
         let blacklist: Vec<Value> = [2, 3, 4, 5, 7, 8, 9, 10, 12, 13, 14].iter().map(|c| json!({ "radio": "ng", "channel": c.to_string(), "channel_width": "20" })).collect();
         let defaults = json!({
-            "enabled": false, "cron_expr": "0 3 * * *", "radios": ["ng", "na"], "channels_blacklist": blacklist,
+            "enabled": false, "cron_expr": DEFAULT_CRON, "radios": ["ng", "na"], "channels_blacklist": blacklist,
             "radios_configuration": [{ "radio": "ng", "channel_width": 20, "dfs": false }, { "radio": "na", "channel_width": 40, "dfs": false }],
             "exclude_devices": [],
         });
@@ -493,12 +506,12 @@ pub fn apply_settings(state: &mut Value, p: &Value) -> Result<String, String> {
     if !p["hour"].is_null() {
         let h = p["hour"].as_i64().filter(|h| (0..24).contains(h)).ok_or("the hour must be 0 to 23")?;
         // The minute stays (an imported setting may have one).
-        let (_, m) = parse_cron(r["cron_expr"].as_str().unwrap_or("0 3 * * *"));
+        let (_, m) = parse_cron(r["cron_expr"].as_str().unwrap_or(DEFAULT_CRON));
         r["cron_expr"] = json!(format!("{m} {h} * * *"));
     }
     if !p["radios"].is_null() {
         let radios: Vec<String> = p["radios"].as_array().ok_or("radios must be a list")?.iter().filter_map(|v| v.as_str().map(str::to_string)).collect();
-        if radios.iter().any(|b| !BANDS.contains(&b.as_str())) {
+        if radios.iter().any(|b| Band::named(b).is_none()) {
             return Err("radios can be ng and na".into());
         }
         r["radios"] = json!(radios);
@@ -525,8 +538,8 @@ pub fn apply_settings(state: &mut Value, p: &Value) -> Result<String, String> {
             b["radio"].as_str() == Some(band) && num(&b["channel"]) == Some(ch) && b["channel_width"].as_str().is_none_or(|w| w == "20")
         })
     };
-    let dfs = r["radios_configuration"].as_array().and_then(|l| l.iter().find(|c| c["radio"].as_str() == Some("na"))).and_then(|c| c["dfs"].as_bool()).unwrap_or(false);
-    for band in BANDS {
+    let dfs = na_dfs(r);
+    for band in BANDS.iter().map(|b| b.radio) {
         let chans: Vec<String> = legal_channels(c, band, 20, false).unwrap_or_else(|| band_channels(band, 20)).into_iter().filter(|ch| !blacklisted(band, *ch) && (dfs || !is_dfs(*ch))).map(|ch| ch.to_string()).collect();
         r[format!("channels_{band}")] = json!(chans);
     }
@@ -590,11 +603,12 @@ mod tests {
     #[test]
     fn plans_are_written_as_fixed_channels_when_legal() {
         let mut s = state();
-        set_channels(&mut s, &[("02:00:00:00:00:01".into(), "ng".into(), 6)]).unwrap();
+        set_channels(&mut s, "ng", &[("02:00:00:00:00:01".into(), 6)]).unwrap();
         assert_eq!(s["devices"][0]["radio_table"][1]["channel"], 6, "an auto radio is pinned");
-        assert!(set_channels(&mut s, &[("02:00:00:00:00:01".into(), "na".into(), 140)]).is_err(), "not at 80 MHz");
-        assert!(set_channels(&mut s, &[("02:00:00:00:00:01".into(), "ng".into(), 3)]).is_err(), "not in the allowed list");
-        set_channels(&mut s, &[("02:00:00:00:00:01".into(), "na".into(), 36)]).unwrap();
+        assert!(set_channels(&mut s, "na", &[("02:00:00:00:00:01".into(), 140)]).is_err(), "not at 80 MHz");
+        assert!(set_channels(&mut s, "ng", &[("02:00:00:00:00:01".into(), 3)]).is_err(), "not in the allowed list");
+        set_channels(&mut s, "na", &[("02:00:00:00:00:01".into(), 36)]).unwrap();
+        assert!(set_channels(&mut s, "na", &[("02:00:00:00:00:02".into(), 36)]).is_err(), "not one of the APs");
     }
 
     #[test]
