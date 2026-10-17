@@ -31,7 +31,7 @@ use crate::settings::band_name;
 use crate::store::{self, Db, Store, Writer};
 
 /// An AP is offline after this long without contact.
-pub const OFFLINE_AFTER: Ts = 240;
+const OFFLINE_AFTER: Ts = 240;
 /// How long a Wi-Fi health condition must hold.
 const HEALTH_WINDOW: Ts = 900;
 /// The same health alert is not raised again sooner than this after it cleared.
@@ -263,7 +263,7 @@ fn human(secs: Ts) -> String {
 
 /// AP offline/online decisions, kept apart from I/O for testing.
 #[derive(Default)]
-pub struct ApWatch {
+struct ApWatch {
     /// Offline alerts sent per AP: times, for the two-a-day limit.
     sent: HashMap<Mac, Vec<Ts>>,
     /// APs currently considered offline, with the last contact time.
@@ -273,7 +273,7 @@ pub struct ApWatch {
 }
 
 #[derive(Debug, PartialEq)]
-pub enum ApChange {
+enum ApChange {
     Offline { last_seen: Ts },
     /// Too many offline alerts today: this one is summarised instead.
     Flapping { times: usize },
@@ -282,7 +282,7 @@ pub enum ApChange {
 }
 
 impl ApWatch {
-    pub fn check(&mut self, now: Ts, mac: Mac, last_seen: Ts) -> Option<ApChange> {
+    fn check(&mut self, now: Ts, mac: Mac, last_seen: Ts) -> Option<ApChange> {
         let gone = now - last_seen >= OFFLINE_AFTER;
         match (gone, self.down.get(&mac).copied()) {
             (true, None) => {
@@ -386,7 +386,7 @@ fn from_event(kind: EventKind, device: Option<Mac>, data: &Value, ap_name: &dyn 
 
 /// Health figures for one AP radio over the last window.
 #[derive(Debug, Default, Clone, PartialEq)]
-pub struct RadioHealth {
+struct RadioHealth {
     /// Whether the radio's networks reported TX counters in the window.
     pub retries_reported: bool,
     pub retry_pct: Option<f64>,

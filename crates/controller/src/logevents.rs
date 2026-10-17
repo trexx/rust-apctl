@@ -168,7 +168,7 @@ fn mac(s: &str) -> Option<Mac> {
 }
 
 /// Meaning of an 802.11v BSS Transition Management response status.
-pub fn btm_status(code: i64) -> &'static str {
+fn btm_status(code: i64) -> &'static str {
     match code {
         0 => "accepted",
         1 => "rejected (unspecified)",
