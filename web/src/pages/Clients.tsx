@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { memo, useDeferredValue, useState } from "react";
 import { Link } from "react-router-dom";
 import { AttemptList } from "../components/Connections";
 import { RangePicker, SpanContext, useTimeSpan } from "../components/Chart";
@@ -108,7 +108,11 @@ function ClientList({ tabs }: { tabs: React.ReactNode }) {
     desc: true,
   });
 
-  const f = filter.trim().toLowerCase();
+  // Typing stays responsive however many clients there are: the list
+  // follows the filter when React has time.
+  const f = useDeferredValue(filter).trim().toLowerCase();
+  // When the list was fetched, in minutes: what "last seen" counts from.
+  const minute = Math.floor(clients.dataUpdatedAt / 60_000);
   const rows = (clients.data ?? [])
     .filter((c) => showGone || c.connected)
     .filter(
@@ -188,52 +192,7 @@ function ClientList({ tabs }: { tabs: React.ReactNode }) {
           </thead>
           <tbody>
             {rows.map((c) => (
-              <tr key={c.sample.mac} className={c.connected ? "" : "dim"}>
-                <td>
-                  <Link
-                    to={`/clients/${c.sample.mac}`}
-                    title={c.note ?? undefined}
-                  >
-                    {name(c)}
-                  </Link>
-                  <div className="small muted">
-                    {c.alias && c.sample.hostname
-                      ? `${c.sample.hostname} · `
-                      : ""}
-                    {(c.alias || c.sample.hostname) && (
-                      <span className="mono">{c.sample.mac}</span>
-                    )}
-                  </div>
-                </td>
-                <td className="mono">{c.sample.ip ?? "—"}</td>
-                <td>
-                  {c.sample.ap_mac ? (
-                    <Link to={`/devices/${c.sample.ap_mac}`}>
-                      {c.ap_name ?? c.sample.ap_mac}
-                    </Link>
-                  ) : (
-                    "—"
-                  )}
-                </td>
-                <td>{c.sample.essid ?? "—"}</td>
-                <td>
-                  {band(c.sample.radio)}
-                  {c.sample.channel ? ` ch ${c.sample.channel}` : ""}
-                </td>
-                <td>{c.connected ? <Signal dbm={c.sample.signal} /> : "—"}</td>
-                <td>
-                  {c.connected
-                    ? `${phy(c.sample.tx_rate)} / ${phy(c.sample.rx_rate)}`
-                    : "—"}
-                </td>
-                <td>
-                  {c.sample.wifi_gen
-                    ? `802.11${c.sample.wifi_gen}${c.sample.nss ? ` ${c.sample.nss}×${c.sample.nss}` : ""}`
-                    : "—"}
-                </td>
-                <td>{c.connected ? duration(c.sample.uptime) : "—"}</td>
-                <td>{c.connected ? "now" : ago(c.last_seen)}</td>
-              </tr>
+              <ClientRow key={c.sample.mac} c={c} minute={minute} />
             ))}
           </tbody>
         </table>
@@ -241,3 +200,61 @@ function ClientList({ tabs }: { tabs: React.ReactNode }) {
     </div>
   );
 }
+
+/**
+ * One client. A refetch keeps an unchanged client's object (React Query's
+ * structural sharing), so only the changed rows re-render, and the rest once
+ * a minute for their "last seen".
+ */
+const ClientRow = memo(function ClientRow({
+  c,
+  minute,
+}: {
+  c: ClientView;
+  /** The minute "last seen" counts from (Unix minutes). */
+  minute: number;
+}) {
+  return (
+    <tr className={c.connected ? "" : "dim"}>
+      <td>
+        <Link to={`/clients/${c.sample.mac}`} title={c.note ?? undefined}>
+          {name(c)}
+        </Link>
+        <div className="small muted">
+          {c.alias && c.sample.hostname ? `${c.sample.hostname} · ` : ""}
+          {(c.alias || c.sample.hostname) && (
+            <span className="mono">{c.sample.mac}</span>
+          )}
+        </div>
+      </td>
+      <td className="mono">{c.sample.ip ?? "—"}</td>
+      <td>
+        {c.sample.ap_mac ? (
+          <Link to={`/devices/${c.sample.ap_mac}`}>
+            {c.ap_name ?? c.sample.ap_mac}
+          </Link>
+        ) : (
+          "—"
+        )}
+      </td>
+      <td>{c.sample.essid ?? "—"}</td>
+      <td>
+        {band(c.sample.radio)}
+        {c.sample.channel ? ` ch ${c.sample.channel}` : ""}
+      </td>
+      <td>{c.connected ? <Signal dbm={c.sample.signal} /> : "—"}</td>
+      <td>
+        {c.connected
+          ? `${phy(c.sample.tx_rate)} / ${phy(c.sample.rx_rate)}`
+          : "—"}
+      </td>
+      <td>
+        {c.sample.wifi_gen
+          ? `802.11${c.sample.wifi_gen}${c.sample.nss ? ` ${c.sample.nss}×${c.sample.nss}` : ""}`
+          : "—"}
+      </td>
+      <td>{c.connected ? duration(c.sample.uptime) : "—"}</td>
+      <td>{c.connected ? "now" : ago(c.last_seen, minute * 60)}</td>
+    </tr>
+  );
+});

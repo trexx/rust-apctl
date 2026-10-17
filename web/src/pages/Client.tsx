@@ -6,7 +6,6 @@ import {
   keys,
   setAlias,
   useCanEdit,
-  useClients,
   useClientsSelect,
   useClient,
   useDeviceNames,
@@ -48,10 +47,7 @@ function ClientPage({ mac }: { mac: string }) {
   const names = useDeviceNames();
   const c = client.data;
   const s = c?.sample;
-  // The whole list is only needed for a client not seen in this run (it has
-  // its stored name and alias there), and for the peers in its multicast groups.
-  const clients = useClients(client.isError);
-  const listed = clients.data?.find((x) => x.sample.mac === mac);
+  // The whole list, for the peers in its multicast groups.
   const members = useClientsSelect(
     groupMembers,
     (s?.multicast?.memberships.length ?? 0) > 0,
@@ -59,9 +55,10 @@ function ClientPage({ mac }: { mac: string }) {
   const events = useEvents({ client: mac, limit: 100 });
   const series = useSeries("client", mac, range);
 
-  // The live view when there is one, else the stored one from the list.
-  const v = c ?? listed;
-  const name = v ? displayName(v) : mac;
+  // The client list and this client's view come from the same live view, so
+  // a client the server doesn't know (404) is in neither: only its MAC and
+  // stored history show.
+  const name = c ? displayName(c) : mac;
   // Every event in the timeline is this client's (a MAC alone shows as one).
   const cnames = name !== mac ? { [mac]: name } : {};
   const unknown =
@@ -75,9 +72,9 @@ function ClientPage({ mac }: { mac: string }) {
             <AliasHeader
               mac={mac}
               connected={c?.connected}
-              alias={v?.alias ?? null}
-              note={v?.note ?? null}
-              hostname={v?.sample.hostname ?? null}
+              alias={c?.alias ?? null}
+              note={c?.note ?? null}
+              hostname={c?.sample.hostname ?? null}
             />
             <span className="spacer" />
             <RangePicker value={range} onChange={setRange} />
@@ -86,19 +83,19 @@ function ClientPage({ mac }: { mac: string }) {
             mac={mac}
             name={name}
             connected={c?.connected ?? false}
-            blocked={v?.blocked ?? false}
-            lockedTo={v?.locked_to ?? null}
+            blocked={c?.blocked ?? false}
+            lockedTo={c?.locked_to ?? null}
             aps={names}
-            usergroupId={v?.usergroup_id ?? null}
+            usergroupId={c?.usergroup_id ?? null}
           />
-          {v?.blocked && (
+          {c?.blocked && (
             <div className="banner">
               Blocked: no AP lets this device join any SSID.
             </div>
           )}
-          {v?.locked_to && (
+          {c?.locked_to && (
             <div className="banner">
-              Locked to {names[v.locked_to] ?? v.locked_to}: the other APs
+              Locked to {names[c.locked_to] ?? c.locked_to}: the other APs
               refuse it.
             </div>
           )}

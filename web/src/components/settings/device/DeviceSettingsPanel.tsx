@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { useCanEdit, useDeviceSettings } from "../../../api";
+import { useDeviceSettings } from "../../../api";
 import type { RadioSettings } from "../../../api";
 import { band } from "../../../format";
 import { DeviceEditor } from "./DeviceEditor";
@@ -10,9 +10,8 @@ const radioSummary = (r: RadioSettings) =>
 
 function DevicePanel({ mac }: { mac: string }) {
   const s = useDeviceSettings(mac);
-  const readOnly = !useCanEdit();
   const [editing, setEditing] = useState(false);
-  if (!s.data || readOnly) return null;
+  if (!s.data) return null;
   const d = s.data;
   return (
     <div className="panel">
@@ -34,9 +33,10 @@ function DevicePanel({ mac }: { mac: string }) {
 }
 
 /**
- * The AP page's settings section. Keyed by MAC: going to another AP's page
- * (Back, a link) starts afresh, so one AP's edits are never diffed against,
- * and saved to, another.
+ * The AP page's settings section, for those who can edit (the page shows it
+ * only to them, so that nobody else loads it). Keyed by MAC: going to
+ * another AP's page (Back, a link) starts afresh, so one AP's edits are
+ * never diffed against, and saved to, another.
  */
 export function DeviceSettingsPanel({ mac }: { mac: string }) {
   return <DevicePanel key={mac} mac={mac} />;

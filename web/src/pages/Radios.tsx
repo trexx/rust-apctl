@@ -345,17 +345,15 @@ function Channels() {
   );
 }
 
-/** What the occupancy chart draws: the networks heard (our own with `showOwn`) and our radios on `band`. */
+/** What the occupancy chart draws: the neighbouring networks heard and our radios on `band`. */
 function occupancy(
   neighbors: Neighbor[],
   radios: RadioOverview[],
   band: string,
-  showOwn: boolean,
 ): Shape[] {
   const out: Shape[] = [];
   for (const nb of neighbors) {
     if (nb.channel === null || nb.signal === null) continue;
-    if (nb.is_unifi && nb.ap_name && !showOwn) continue;
     const w = nb.bw ?? 20;
     out.push({
       key: nb.bssid + nb.ap_mac,
@@ -387,17 +385,13 @@ function occupancy(
 function Environment() {
   const [band, setBand] = useState<"ng" | "na">("na");
   const [q, setQ] = useState("");
-  const [showOwn, setShowOwn] = useState(false);
   const n = useNeighbors(7 * 86400, band);
   const r = useRadios(86400);
 
-  const shapes = occupancy(
-    n.data?.neighbors ?? [],
-    r.data ?? [],
-    band,
-    showOwn,
-  );
+  const shapes = occupancy(n.data?.neighbors ?? [], r.data ?? [], band);
   const term = q.trim().toLowerCase();
+  // One row per network (the server merges what our APs heard, and leaves out
+  // our own BSSIDs).
   const list = (n.data?.neighbors ?? [])
     .filter(
       (x) =>
@@ -407,13 +401,6 @@ function Environment() {
         ),
     )
     .sort((a, b) => (b.best_signal ?? -200) - (a.best_signal ?? -200));
-  // One row per network, merged across our APs that heard it.
-  const seen = new Set<string>();
-  const unique = list.filter((x) => {
-    if (seen.has(x.bssid)) return false;
-    seen.add(x.bssid);
-    return true;
-  });
 
   return (
     <>
@@ -425,15 +412,6 @@ function Environment() {
             onChange={(b) => setBand(b as "ng" | "na")}
             all={false}
           />
-          <span className="spacer" />
-          <label className="small">
-            <input
-              type="checkbox"
-              checked={showOwn}
-              onChange={(e) => setShowOwn(e.target.checked)}
-            />{" "}
-            Include your APs as heard by each other
-          </label>
         </div>
         <QueryState q={n}>
           {() => <Spectrum band={band} shapes={shapes} />}
@@ -452,7 +430,7 @@ function Environment() {
       <div className="panel">
         <div className="panel-head">
           <b>Neighbouring networks</b>
-          <span className="muted small">{unique.length} seen</span>
+          <span className="muted small">{list.length} seen</span>
           <span className="spacer" />
           <input
             className="search"
@@ -463,7 +441,7 @@ function Environment() {
         </div>
         <QueryState q={n}>
           {() =>
-            unique.length === 0 ? (
+            list.length === 0 ? (
               <div className="muted small">
                 Nothing heard yet on {bandName(band)}.
               </div>
@@ -482,13 +460,10 @@ function Environment() {
                     </tr>
                   </thead>
                   <tbody>
-                    {unique.map((x) => (
+                    {list.map((x) => (
                       <tr key={x.bssid}>
                         <td>
                           {x.essid || <span className="muted">hidden</span>}
-                          {x.is_unifi && x.ap_name && (
-                            <span className="tag">your AP {x.ap_name}</span>
-                          )}
                           <div className="muted small mono">{x.bssid}</div>
                         </td>
                         <td className="nowrap">

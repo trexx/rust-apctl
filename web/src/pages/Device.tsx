@@ -2,6 +2,7 @@ import { Suspense } from "react";
 import { Link, useParams } from "react-router-dom";
 import {
   displayName,
+  useCanEdit,
   useClientNames,
   useDevice,
   useDeviceNames,
@@ -63,6 +64,8 @@ export function Device() {
 function DevicePage({ mac }: { mac: string }) {
   const [range, setRange] = useTimeSpan(6 * 3600);
   const detail = useDevice(mac);
+  // Read-only users get neither the editor's code nor the AP's settings.
+  const canEdit = useCanEdit();
 
   if (detail.isLoading) return <Loading />;
   if (detail.error || !detail.data)
@@ -92,9 +95,11 @@ function DevicePage({ mac }: { mac: string }) {
             online={d.online}
             locating={detail.data.locating ?? false}
           />
-          <Suspense fallback={null}>
-            <DeviceSettingsPanel mac={mac} />
-          </Suspense>
+          {canEdit && (
+            <Suspense fallback={null}>
+              <DeviceSettingsPanel mac={mac} />
+            </Suspense>
+          )}
           {d.reconfiguring && (
             <div className="banner">
               Applying a configuration change. Client data resumes in a moment.

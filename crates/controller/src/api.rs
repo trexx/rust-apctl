@@ -12,6 +12,7 @@ use inform::Mac;
 use rusqlite::types::Value as Sql;
 use rusqlite::params_from_iter;
 use serde::{Deserialize, Serialize};
+use serde_json::value::RawValue;
 use serde_json::{Value, json};
 use tokio::sync::broadcast;
 
@@ -52,6 +53,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/devices", get(devices))
         .route("/api/devices/{mac}", get(device))
         .route("/api/clients", get(clients))
+        .route("/api/clients/names", get(client_names))
         .route("/api/clients/{mac}", get(client))
         .route("/api/clients/{mac}/alias", axum::routing::put(set_alias))
         .route("/api/clients/aliases", axum::routing::post(import_aliases))
@@ -218,8 +220,21 @@ pub async fn read<T: Send + 'static>(
     tokio::task::spawn_blocking(move || store.read(db, f)).await?.map_err(ApiError::from)
 }
 
+/// A connected client's signal below this (dBm) is weak: the UI's "fair" threshold.
+const WEAK_SIGNAL: i64 = -75;
+
 async fn status(State(s): State<AppState>) -> ApiResult {
     let live = s.live.read().unwrap();
+    // The overview's client counters, so that it needs no client list: the
+    // connected clients by radio, and how many of them have a weak signal.
+    let (mut connected, mut weak, mut by_band) = (0, 0, std::collections::BTreeMap::<&str, usize>::new());
+    for c in live.clients.values().filter(|c| c.connected) {
+        connected += 1;
+        weak += usize::from(c.sample.signal.is_some_and(|s| s < WEAK_SIGNAL));
+        if let Some(radio) = c.sample.radio.as_deref() {
+            *by_band.entry(radio).or_default() += 1;
+        }
+    }
     Ok(Json(json!({
         "version": env!("CARGO_PKG_VERSION"),
         "mode": if s.active { "active" } else { "shadow" },
@@ -229,7 +244,9 @@ async fn status(State(s): State<AppState>) -> ApiResult {
         "counters": &*live.counters,
         "devices": live.devices.len(),
         "devices_online": live.devices.values().filter(|d| d.online).count(),
-        "clients_connected": live.clients.values().filter(|c| c.connected).count(),
+        "clients_connected": connected,
+        "clients_by_band": by_band,
+        "clients_weak": weak,
     })))
 }
 
@@ -479,6 +496,22 @@ async fn clients(State(s): State<AppState>) -> Response {
     Json(rows).into_response()
 }
 
+/// Each named client's display name (its alias, else its hostname) by MAC:
+/// what event lists and links show, without the client list's samples.
+async fn client_names(State(s): State<AppState>) -> Json<std::collections::HashMap<String, String>> {
+    let live = s.live.read().unwrap();
+    let names = live
+        .clients
+        .iter()
+        .filter_map(|(mac, c)| {
+            let alias = live.aliases.get(mac).and_then(|a| a.alias.as_deref());
+            let name = alias.or(c.sample.hostname.as_deref()).filter(|n| !n.is_empty())?;
+            Some((mac.to_string(), name.to_string()))
+        })
+        .collect();
+    Json(names)
+}
+
 async fn client(State(s): State<AppState>, Path(mac): Path<String>) -> Result<Response, ApiError> {
     let mac = parse_mac(&mac)?;
     let (view, alias, state) = {
@@ -515,7 +548,7 @@ async fn import_state(State(s): State<AppState>, Json(state): Json<Value>) -> Ap
 
 /// Dry-run status: for each AP, what apctl would push now compared with the last
 /// config the other controller pushed; plus the comparisons made at each push.
-async fn dryrun(State(s): State<AppState>) -> ApiResult {
+async fn dryrun(State(s): State<AppState>) -> Result<Json<DryRunStatus>, ApiError> {
     // What each AP's render needs, copied under a short lock: the unredacted
     // config seen in this run when there is one. Only full configs count: a
     // management-only push says nothing about system_cfg.
@@ -544,12 +577,7 @@ async fn dryrun(State(s): State<AppState>) -> ApiResult {
         let mut stmt = c.prepare("SELECT ts, mac, cfgversion, matches, comparison FROM dryrun_results ORDER BY ts DESC LIMIT 100")?;
         let history = stmt
             .query_map([], |r| {
-                let comparison: String = r.get(4)?;
-                Ok(json!({
-                    "ts": r.get::<_, i64>(0)?, "mac": r.get::<_, String>(1)?, "cfgversion": r.get::<_, Option<String>>(2)?,
-                    "matches": r.get::<_, i64>(3)? != 0,
-                    "comparison": serde_json::from_str::<Value>(&comparison).unwrap_or(Value::Null),
-                }))
+                Ok(DryRunHistory { ts: r.get(0)?, mac: r.get(1)?, cfgversion: r.get(2)?, matches: r.get(3)?, comparison: raw_json(r.get(4)?) })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok((stored, history))
@@ -615,11 +643,24 @@ async fn dryrun(State(s): State<AppState>) -> ApiResult {
         devices
     })
     .await?;
-    Ok(Json(json!({
-        "settings_imported_at": imported_at,
-        "devices": devices,
-        "history": history,
-    })))
+    Ok(Json(DryRunStatus { settings_imported_at: imported_at, devices, history }))
+}
+
+/// A comparison made at a push, as stored.
+#[derive(Serialize)]
+struct DryRunHistory {
+    ts: Ts,
+    mac: String,
+    cfgversion: Option<String>,
+    matches: bool,
+    comparison: Option<Box<RawValue>>,
+}
+
+#[derive(Serialize)]
+struct DryRunStatus {
+    settings_imported_at: Option<Ts>,
+    devices: Vec<Value>,
+    history: Vec<DryRunHistory>,
 }
 
 #[derive(Deserialize)]
@@ -734,6 +775,23 @@ struct EventQuery {
     client: Option<String>,
     kind: Option<String>,
     limit: Option<i64>,
+    /// Only the events stored after the one with this id (a list catching up).
+    after: Option<i64>,
+}
+
+/// A stored JSON column, passed on as stored; text that isn't JSON becomes null.
+fn raw_json(text: Option<String>) -> Option<Box<RawValue>> {
+    text.and_then(|t| RawValue::from_string(t).ok())
+}
+
+#[derive(Serialize)]
+struct EventRow {
+    id: i64,
+    ts: Ts,
+    kind: String,
+    device_mac: Option<String>,
+    client_mac: Option<String>,
+    data: Option<Box<RawValue>>,
 }
 
 /// The event kinds starting with `prefix`, read from the kind index one kind
@@ -748,7 +806,7 @@ fn kinds_with_prefix(c: &rusqlite::Connection, prefix: &str) -> rusqlite::Result
     stmt.query_map((prefix, format!("{prefix}{}", char::MAX)), |r| r.get(0))?.collect()
 }
 
-async fn events(State(s): State<AppState>, Query(q): Query<EventQuery>) -> ApiResult {
+async fn events(State(s): State<AppState>, Query(q): Query<EventQuery>) -> Result<Json<Vec<EventRow>>, ApiError> {
     let mut w = Where::default();
     if let Some(d) = &q.device {
         w.and("device_mac = ?", Sql::Text(parse_mac(d)?.to_string()));
@@ -760,23 +818,40 @@ async fn events(State(s): State<AppState>, Query(q): Query<EventQuery>) -> ApiRe
     // can be given separated by commas.
     let prefixes: Vec<String> = q.kind.iter().flat_map(|k| k.split(',')).map(|k| k.trim().to_ascii_lowercase()).filter(|k| !k.is_empty()).take(10).collect();
     let limit = q.limit.unwrap_or(200).clamp(1, 2000);
+    let after = q.after;
     const COLUMNS: &str = "ts, kind, device_mac, client_mac, data, id";
     let rows = read(&s.store, Db::Config, move |c| {
-        let sql = if prefixes.is_empty() {
+        let mut kinds: Vec<String> = Vec::new();
+        for p in &prefixes {
+            kinds.extend(kinds_with_prefix(c, p)?);
+        }
+        kinds.sort();
+        kinds.dedup();
+        if !prefixes.is_empty() && kinds.is_empty() {
+            return Ok(vec![]);
+        }
+        let sql = if let Some(after) = after {
+            // Catching up: the few events stored since, found by id (the
+            // rowid). An index on the filters would walk back through every
+            // older event when fewer than the limit are new.
+            w.and("id > ?", Sql::Integer(after));
+            if !kinds.is_empty() {
+                let marks: Vec<String> = kinds
+                    .into_iter()
+                    .map(|k| {
+                        w.params.push(Sql::Text(k));
+                        format!("?{}", w.params.len())
+                    })
+                    .collect();
+                w.cond.push(format!("kind IN ({})", marks.join(", ")));
+            }
+            format!("SELECT {COLUMNS} FROM events NOT INDEXED WHERE {} ORDER BY ts DESC, id DESC LIMIT {limit}", w.sql())
+        } else if kinds.is_empty() {
             format!("SELECT {COLUMNS} FROM events WHERE {} ORDER BY ts DESC, id DESC LIMIT {limit}", w.sql())
         } else {
             // The newest of each matching kind from the (kind, ts) index, then
             // the newest of those: a rare kind is found without walking every
             // event, and a common one reads no more than the limit.
-            let mut kinds: Vec<String> = Vec::new();
-            for p in &prefixes {
-                kinds.extend(kinds_with_prefix(c, p)?);
-            }
-            kinds.sort();
-            kinds.dedup();
-            if kinds.is_empty() {
-                return Ok(vec![]);
-            }
             let filters = w.sql();
             let parts: Vec<String> = kinds
                 .into_iter()
@@ -790,18 +865,13 @@ async fn events(State(s): State<AppState>, Query(q): Query<EventQuery>) -> ApiRe
         let mut stmt = c.prepare(&sql)?;
         let rows = stmt
             .query_map(params_from_iter(w.params), |r| {
-                let data: Option<String> = r.get(4)?;
-                Ok(json!({
-                    "id": r.get::<_, i64>(5)?, "ts": r.get::<_, i64>(0)?, "kind": r.get::<_, String>(1)?,
-                    "device_mac": r.get::<_, Option<String>>(2)?, "client_mac": r.get::<_, Option<String>>(3)?,
-                    "data": data.and_then(|d| serde_json::from_str::<Value>(&d).ok()),
-                }))
+                Ok(EventRow { id: r.get(5)?, ts: r.get(0)?, kind: r.get(1)?, device_mac: r.get(2)?, client_mac: r.get(3)?, data: raw_json(r.get(4)?) })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
     })
     .await?;
-    Ok(Json(Value::Array(rows)))
+    Ok(Json(rows))
 }
 
 #[derive(Deserialize)]
@@ -810,23 +880,51 @@ struct LogQuery {
     /// Full-text query (SQLite FTS5 syntax).
     q: Option<String>,
     limit: Option<i64>,
+    /// Only the lines stored after the one with this id (a list catching up).
+    after: Option<i64>,
+}
+
+/// The SQL for a log query, newest first.
+fn logs_sql(w: &mut Where, device: Option<Mac>, search: Option<&str>, after: Option<i64>, limit: i64) -> String {
+    const COLUMNS: &str = "l.ts, l.device_mac, l.src_ip, l.facility, l.severity, l.program, l.msg, l.id";
+    if let Some(text) = search {
+        // Quote each word so user input cannot break FTS syntax; words are ANDed.
+        let fts: Vec<String> = text.split_whitespace().map(|w| format!("\"{}\"", w.replace('"', "\"\""))).collect();
+        w.and("logs_fts MATCH ?", Sql::Text(fts.join(" ")));
+    }
+    if let Some(d) = device {
+        w.and("l.device_mac = ?", Sql::Text(d.to_string()));
+    }
+    if search.is_some() {
+        // The newest matches straight from the full-text index, which can
+        // stop at the limit (a line's id is its rowid there, and ids rise
+        // with time); then in time order, as without a search.
+        if let Some(after) = after {
+            w.and("logs_fts.rowid > ?", Sql::Integer(after));
+        }
+        return format!(
+            "SELECT * FROM (SELECT {COLUMNS} FROM logs_fts CROSS JOIN logs l ON l.id = logs_fts.rowid WHERE {} ORDER BY logs_fts.rowid DESC LIMIT {limit}) ORDER BY ts DESC, id DESC",
+            w.sql()
+        );
+    }
+    // Catching up, the few lines stored since are found by id (the rowid):
+    // the time index would walk back through every older line when fewer
+    // than the limit are new.
+    let from = if let Some(after) = after {
+        w.and("l.id > ?", Sql::Integer(after));
+        "logs l NOT INDEXED"
+    } else {
+        "logs l"
+    };
+    format!("SELECT {COLUMNS} FROM {from} WHERE {} ORDER BY l.ts DESC, l.id DESC LIMIT {limit}", w.sql())
 }
 
 async fn logs(State(s): State<AppState>, Query(q): Query<LogQuery>) -> ApiResult {
-    let mut w = Where::default();
-    if let Some(d) = &q.device {
-        w.and("l.device_mac = ?", Sql::Text(parse_mac(d)?.to_string()));
-    }
-    if let Some(text) = q.q.as_deref().filter(|t| !t.trim().is_empty()) {
-        // Quote each word so user input cannot break FTS syntax; words are ANDed.
-        let fts: Vec<String> = text.split_whitespace().map(|w| format!("\"{}\"", w.replace('"', "\"\""))).collect();
-        w.and("l.id IN (SELECT rowid FROM logs_fts WHERE logs_fts MATCH ?)", Sql::Text(fts.join(" ")));
-    }
+    let device = q.device.as_deref().map(parse_mac).transpose()?;
+    let search = q.q.as_deref().filter(|t| !t.trim().is_empty());
     let limit = q.limit.unwrap_or(500).clamp(1, 5000);
-    let sql = format!(
-        "SELECT l.ts, l.device_mac, l.src_ip, l.facility, l.severity, l.program, l.msg, l.id FROM logs l WHERE {} ORDER BY l.ts DESC, l.id DESC LIMIT {limit}",
-        w.sql()
-    );
+    let mut w = Where::default();
+    let sql = logs_sql(&mut w, device, search, q.after, limit);
     let rows = read(&s.store, Db::Logs, move |c| {
         let mut stmt = c.prepare(&sql)?;
         let rows = stmt
@@ -982,6 +1080,9 @@ mod tests {
         let one = get_json(&app, "/api/clients/02:00:00:00:01:01").await;
         assert_eq!(keys(&one), "alias,blocked,connected,first_seen,last_seen,locked_to,note,sample,usergroup_id,vendor", "no ap_name, as before");
         assert_eq!(one["sample"], clients[0]["sample"]);
+        assert_eq!(get_json(&app, "/api/clients/names").await, json!({ "02:00:00:00:01:01": "phone" }));
+        let status = get_json(&app, "/api/status").await;
+        assert_eq!((&status["clients_connected"], &status["clients_by_band"], &status["clients_weak"]), (&json!(1), &json!({ "na": 1 }), &json!(0)));
     }
 
     async fn get(app: &Router, path: &str) -> Response {
@@ -1048,6 +1149,44 @@ mod tests {
         assert_eq!(ts(get_json(&app, "/api/events?kind=client&device=02:00:00:00:00:02").await), vec![4, 3]);
         assert_eq!(ts(get_json(&app, "/api/events?kind=nothing").await), Vec::<i64>::new());
         assert_eq!(ts(get_json(&app, "/api/events?limit=3").await), vec![6, 5, 4]);
+        // Catching up: only what was stored after a given event (here the ids follow the times).
+        assert_eq!(ts(get_json(&app, "/api/events?after=4").await), vec![6, 5]);
+        assert_eq!(ts(get_json(&app, "/api/events?kind=client&after=3").await), vec![6, 4]);
+        assert_eq!(ts(get_json(&app, "/api/events?kind=client&device=02:00:00:00:00:02&after=1").await), vec![4, 3]);
+        assert_eq!(ts(get_json(&app, "/api/events?after=6").await), Vec::<i64>::new());
+        assert_eq!(get_json(&app, "/api/events?limit=1").await[0]["data"], json!({}), "the stored payload, as stored");
+    }
+
+    #[tokio::test]
+    async fn logs_search_and_catch_up() {
+        let (s, _engine) = state();
+        let lines = [(1, "02:00:00:00:00:01", "hostapd", "wlan0: STA joined"), (2, "02:00:00:00:00:02", "kernel", "eth0 link up"), (3, "02:00:00:00:00:01", "hostapd", "wlan1: STA left")];
+        for (ts, mac, program, msg) in lines {
+            let sql = "INSERT INTO logs (ts, device_mac, program, msg) VALUES (?1, ?2, ?3, ?4)";
+            s.writer.exec(Db::Logs, sql, vec![Sql::Integer(ts), Sql::Text(mac.into()), Sql::Text(program.into()), Sql::Text(msg.into())]);
+        }
+        assert!(s.writer.flush(std::time::Duration::from_secs(5)));
+        // A search is read from the full-text index, newest first, and stops at the limit.
+        let mut w = Where::default();
+        let sql = logs_sql(&mut w, None, Some("sta"), None, 10);
+        let plan: Vec<String> = s
+            .store
+            .read(Db::Logs, |c| Ok(c.prepare(&format!("EXPLAIN QUERY PLAN {sql}"))?.query_map(params_from_iter(w.params), |r| r.get(3))?.collect::<rusqlite::Result<_>>()?))
+            .unwrap();
+        assert!(plan.iter().any(|p| p.starts_with("SCAN logs_fts VIRTUAL TABLE")) && plan.iter().any(|p| p.starts_with("SEARCH l USING INTEGER PRIMARY KEY")), "{plan:?}");
+        // Only the limited rows are sorted by time, after the index's own order.
+        assert_eq!(plan.iter().filter(|p| p.contains("TEMP B-TREE")).count(), 1, "{plan:?}");
+        assert!(plan.last().is_some_and(|p| p == "USE TEMP B-TREE FOR ORDER BY") && plan.iter().any(|p| p.starts_with("SCAN (subquery")), "{plan:?}");
+        let app = router(s);
+        let ts = |v: Value| v.as_array().unwrap().iter().map(|e| e["ts"].as_i64().unwrap()).collect::<Vec<_>>();
+        assert_eq!(ts(get_json(&app, "/api/logs").await), vec![3, 2, 1]);
+        assert_eq!(ts(get_json(&app, "/api/logs?q=sta").await), vec![3, 1]);
+        assert_eq!(ts(get_json(&app, "/api/logs?q=sta&limit=1").await), vec![3]);
+        assert_eq!(ts(get_json(&app, "/api/logs?q=STA%20joined").await), vec![1], "words are ANDed");
+        assert_eq!(ts(get_json(&app, "/api/logs?q=sta&after=1").await), vec![3]);
+        assert_eq!(ts(get_json(&app, "/api/logs?after=1").await), vec![3, 2]);
+        assert_eq!(ts(get_json(&app, "/api/logs?after=1&device=02:00:00:00:00:02").await), vec![2]);
+        assert_eq!(ts(get_json(&app, "/api/logs?q=link&device=02:00:00:00:00:01").await), Vec::<i64>::new());
     }
 
     #[tokio::test]

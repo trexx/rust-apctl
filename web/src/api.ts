@@ -333,6 +333,10 @@ export interface Status {
   devices: number;
   devices_online: number;
   clients_connected: number;
+  /** Connected clients by radio ("ng", "na", …). */
+  clients_by_band: Record<string, number>;
+  /** Connected clients with a signal below -75 dBm. */
+  clients_weak: number;
   counters: Record<string, number>;
 }
 
@@ -419,6 +423,7 @@ export const keys = {
   devices: family("devices"),
   device: family<[mac: Mac]>("device"),
   clients: family("clients"),
+  clientNames: family("client-names"),
   client: family<[mac: Mac]>("client"),
   series: family<[table: string, key: string, span: TimeSpan]>("series"),
   events: family<[filter: EventFilter]>("events"),
@@ -676,11 +681,12 @@ export interface ThreatFinding {
   vendor: string | null;
 }
 
+/** A new finding is announced (as a network_threat event); the slow poll catches the ones that go away. */
 export const useThreats = () =>
   useQuery({
     queryKey: keys.threats(),
     queryFn: getting<{ watching_since: number; findings: ThreatFinding[] }>("/api/rf/threats"),
-    refetchInterval: 60_000,
+    refetchInterval: 300_000,
   });
 
 export const ackThreat = (kind: string, bssid: string, ack: boolean, note?: string) => send("PUT", "/api/rf/threats/ack", { kind, bssid, ack, note });
@@ -994,8 +1000,8 @@ export const useDevices = () => useQuery(devicesQuery);
 export const useDevice = (mac: Mac) =>
   useQuery({ queryKey: keys.device(mac), queryFn: getting<DeviceDetail>(`/api/devices/${mac}`) });
 
-/** Every client; with `enabled` false, only what's already cached. */
-export const useClients = (enabled = true) => useQuery({ ...clientsQuery, enabled });
+/** Every client of the past year, with its latest sample: for the client list. */
+export const useClients = () => useQuery(clientsQuery);
 
 /**
  * Something derived from the client list, re-rendering only when it changes.
@@ -1008,13 +1014,17 @@ export type Names = Readonly<Record<Mac, string>>;
 
 const NO_NAMES: Names = Object.freeze({});
 const deviceNames = (devices: DeviceSummary[]): Names => Object.fromEntries(devices.map((d) => [d.mac, d.name ?? d.mac]));
-const clientNames = (clients: ClientView[]): Names => Object.fromEntries(clients.filter((c) => c.alias || c.sample.hostname).map((c) => [c.sample.mac, displayName(c)]));
 
 /** AP names (else their MAC) by MAC; the same object until a name changes. */
 export const useDeviceNames = (): Names => useQuery({ ...devicesQuery, select: deviceNames }).data ?? NO_NAMES;
 
-/** Client display names by MAC, for the clients that have one; the same object until a name changes. */
-export const useClientNames = (): Names => useClientsSelect(clientNames).data ?? NO_NAMES;
+/**
+ * Client display names by MAC, for the clients that have one; the same object until a name changes.
+ * The live socket refreshes them when a client is renamed or an unnamed one connects; the slow poll
+ * catches a hostname an AP reports later.
+ */
+export const useClientNames = (): Names =>
+  useQuery({ queryKey: keys.clientNames(), queryFn: getting<Names>("/api/clients/names"), refetchInterval: 300_000 }).data ?? NO_NAMES;
 
 /** One client; a 404 (HttpError) means it hasn't been seen since apctl started. */
 export const useClient = (mac: Mac) =>
@@ -1057,12 +1067,44 @@ export function useSeries(table: string, key: string, span: TimeSpan) {
 export type EventFilter = { device?: Mac; client?: Mac; kind?: string; limit?: number };
 export type LogFilter = { device?: Mac; q?: string; limit?: number };
 
-// The previous list stays up (`isPlaceholderData`) while another filter's loads.
-export const useEvents = (filter: EventFilter) =>
-  useQuery({ queryKey: keys.events(filter), queryFn: getting<AppEvent[]>(`/api/events${qs(filter)}`), placeholderData: keepPreviousData });
+/**
+ * When the live socket last reconnected or was told to resync: a list cached before then is
+ * fetched whole, since what it missed was never announced (and a restored backup restarts the ids).
+ */
+let liveResetAt = 0;
 
-export const useLogs = (filter: LogFilter) =>
-  useQuery({ queryKey: keys.logs(filter), queryFn: getting<LogLine[]>(`/api/logs${qs(filter)}`), placeholderData: keepPreviousData });
+/** `prev` with the rows of `add` (stored after them), newest first as the server sorts them, and only the `limit` newest. */
+function mergeNewest<T extends { id: number; ts: number }>(prev: T[], add: T[], limit: number): T[] {
+  return [...add, ...prev].sort((a, b) => b.ts - a.ts || b.id - a.id).slice(0, limit);
+}
+
+/**
+ * A newest-first list whose rows have rising ids (events, log lines). A refetch with something
+ * cached asks only for the rows stored after its newest, and keeps the `limit` newest; the
+ * previous list stays up (`isPlaceholderData`) while another filter's loads.
+ */
+function useNewestList<T extends { id: number; ts: number }>(queryKey: QueryKey, path: string, filter: Record<string, string | number | undefined> & { limit?: number }, defaultLimit: number) {
+  const qc = useQueryClient();
+  return useQuery({
+    queryKey,
+    queryFn: async ({ signal }) => {
+      const cached = qc.getQueryState<T[]>(queryKey);
+      const prev = cached?.data;
+      if (cached && prev?.length && cached.dataUpdatedAt > liveResetAt) {
+        const after = prev.reduce((max, r) => Math.max(max, r.id), 0);
+        const add = await get<T[]>(`${path}${qs({ ...filter, after })}`, signal);
+        return add.length ? mergeNewest(prev, add, filter.limit ?? defaultLimit) : prev;
+      }
+      return get<T[]>(`${path}${qs(filter)}`, signal);
+    },
+    placeholderData: keepPreviousData,
+  });
+}
+
+// The server's default limits: 200 events, 500 log lines.
+export const useEvents = (filter: EventFilter) => useNewestList<AppEvent>(keys.events(filter), "/api/events", filter, 200);
+
+export const useLogs = (filter: LogFilter) => useNewestList<LogLine>(keys.logs(filter), "/api/logs", filter, 500);
 
 /** A filter's MAC against a message's, as the server compares them (it normalises the filter). */
 const sameMac = (filter: Mac | undefined, mac: Mac | null) => !filter || filter.toLowerCase() === mac?.toLowerCase();
@@ -1109,6 +1151,9 @@ export const markAlertsRead = () => send("POST", "/api/alerts/read", {});
 
 /** Event kinds that change what the adoption panel shows. */
 const ADOPTION_EVENTS = new Set(["ap_pending", "ap_adopting", "ap_adopted", "ap_forgotten"]);
+
+/** Event kinds that change the channel plan and the RF views. */
+const RF_EVENTS = new Set(["ap_scan_done", "channel_plan", "radio_changed"]);
 
 /**
  * Keeps queries fresh from the server's WebSocket: device and client changes
@@ -1165,11 +1210,20 @@ export function useLiveUpdates(): void {
       pending.set(id, { key, due: Math.max(Date.now() + 750, (last.get(id) ?? 0) + gap) });
       schedule();
     };
-    /** Invalidates (as above) each cached query in `family` whose filter `matches`. */
+    /**
+     * Invalidates (as above) each query in `family` on screen whose filter `matches`. The rest
+     * are only marked stale, all at once, so that they refetch when shown again.
+     */
     const invalidateWhere = <F>(family: QueryKey, matches: (filter: F) => boolean, gap: number) => {
-      for (const q of qc.getQueryCache().findAll({ queryKey: family })) {
+      for (const q of qc.getQueryCache().findAll({ queryKey: family, type: "active" })) {
         if (matches((q.queryKey[1] ?? {}) as F)) invalidate(q.queryKey, gap);
       }
+      void qc.invalidateQueries({ queryKey: family, type: "inactive", refetchType: "none" });
+    };
+    /** Refetches everything: messages were missed. The event and log lists are fetched whole. */
+    const refetchAll = () => {
+      liveResetAt = Date.now();
+      void qc.invalidateQueries();
     };
     const onVisible = () => {
       if (!document.hidden) schedule();
@@ -1202,6 +1256,16 @@ export function useLiveUpdates(): void {
           }
           if (ADOPTION_EVENTS.has(msg.kind)) invalidate(keys.adoption());
           if (msg.kind.startsWith("ap_upgrade")) invalidate(keys.firmware());
+          if (RF_EVENTS.has(msg.kind)) {
+            // A scan, a plan run or a channel change can change the plan, and what the radios hear.
+            for (const key of [keys.rfPlan(), keys.rfRadios(), keys.rfNeighbors(), keys.rfLinks()]) invalidate(key, 5000);
+          }
+          if (msg.kind === "channel_plan") invalidate(keys.channelAi());
+          if (msg.kind === "network_threat") invalidate(keys.threats());
+          if (msg.kind === "client_renamed") invalidate(keys.clientNames());
+          // A client without a name may have reported one as it connected.
+          else if (msg.kind === "client_connected" && msg.client_mac && !qc.getQueryData<Names>(keys.clientNames())?.[msg.client_mac])
+            invalidate(keys.clientNames(), 10_000);
           break;
         }
         case "log": {
@@ -1210,15 +1274,14 @@ export function useLiveUpdates(): void {
           break;
         }
         case "alert":
-          invalidate(keys.alerts());
-          // The server stores alerts within a second of announcing them: look again then.
+          // The server stores alerts within a second of announcing them: look then.
           window.clearTimeout(alertTimer);
           alertTimer = window.setTimeout(() => void qc.invalidateQueries({ queryKey: keys.alerts() }), 1500);
           // The notifier decides whether this browser shows it.
           window.dispatchEvent(new CustomEvent("apctl:alert", { detail: msg }));
           break;
         case "resync":
-          void qc.invalidateQueries();
+          refetchAll();
           break;
       }
     };
@@ -1231,7 +1294,7 @@ export function useLiveUpdates(): void {
       socket.onopen = () => {
         retry = 1000;
         // Whatever changed while disconnected (e.g. during a restart) was never announced.
-        if (dropped) void qc.invalidateQueries();
+        if (dropped) refetchAll();
       };
       socket.onmessage = onMessage;
       socket.onclose = () => {

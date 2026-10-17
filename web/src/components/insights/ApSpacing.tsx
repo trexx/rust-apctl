@@ -44,7 +44,7 @@ export function ApSpacing() {
                 key: `${l.from}-${l.to}-${l.radio}`,
                 signal: l.signal,
                 tone: l.signal > TOO_CLOSE ? "warn" : undefined,
-                title: `${l.from_name} hears ${l.to_name} at ${l.signal} dBm (${band(l.radio)})`,
+                title: `${l.from_name ?? l.from} hears ${l.to_name ?? l.to} at ${l.signal} dBm (${band(l.radio)})`,
               }))}
             />
             {links.length === 0 && (

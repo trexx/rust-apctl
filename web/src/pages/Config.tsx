@@ -3,7 +3,7 @@ import type { ReactNode } from "react";
 import { Link } from "react-router-dom";
 import { eventData, useDeviceNames, useEvents } from "../api";
 import type { AppEvent } from "../api";
-import { DryRunPage } from "./DryRun";
+import { DryRun } from "./DryRun";
 import { FirmwarePanel } from "../components/Firmware";
 import {
   ApSelect,
@@ -114,7 +114,7 @@ export function Config() {
       ) : tab === "firmware" ? (
         <FirmwarePanel />
       ) : (
-        <DryRunPage embedded />
+        <DryRun />
       )}
     </div>
   );
