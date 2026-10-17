@@ -285,6 +285,24 @@ pub struct Live {
 }
 
 impl Live {
+    /// Records the AP's hash_id and address, for attributing syslog. An address
+    /// or hash_id the AP no longer has is dropped: plain syslog from whichever
+    /// host gets the address next is not the AP's.
+    fn attribute(&mut self, a: &crate::model::ApSample) {
+        if let Some(h) = &a.hash_id
+            && self.by_hash_id.get(h) != Some(&a.mac)
+        {
+            self.by_hash_id.retain(|_, m| *m != a.mac);
+            self.by_hash_id.insert(h.clone(), a.mac);
+        }
+        if let Some(ip) = &a.ip
+            && self.by_ip.get(ip) != Some(&a.mac)
+        {
+            self.by_ip.retain(|_, m| *m != a.mac);
+            self.by_ip.insert(ip.clone(), a.mac);
+        }
+    }
+
     /// Drops what the live view keeps about a forgotten AP, except its clients
     /// (the engine disconnects those, with events). Every field is named, so a
     /// field added to `Live` has to be decided on here.
@@ -619,88 +637,16 @@ impl Engine {
             live.raw_informs.insert(mac, Arc::new(decoded.payload));
         }
         bump(&self.counters.informs);
-        // For attributing syslog. An address or hash_id the AP no longer has is
-        // dropped: plain syslog from whichever host gets the address next is not the AP's.
-        if let Some(h) = &snap.ap.hash_id
-            && live.by_hash_id.get(h) != Some(&mac)
-        {
-            live.by_hash_id.retain(|_, m| *m != mac);
-            live.by_hash_id.insert(h.clone(), mac);
-        }
-        if let Some(ip) = &snap.ap.ip
-            && live.by_ip.get(ip) != Some(&mac)
-        {
-            live.by_ip.retain(|_, m| *m != mac);
-            live.by_ip.insert(ip.clone(), mac);
-        }
+        live.attribute(&snap.ap);
 
-        // Device lifecycle events. The previous view is taken out (no copy) and
-        // replaced at the end; the lock is held throughout.
+        // The previous view is taken out (no copy) and replaced at the end; the lock is held throughout.
         let prev = live.devices.remove(&mac);
-        let mut events = Vec::new();
         let known = if prev.is_none() { live.known_devices.remove(&mac) } else { None };
-        match (&prev, &known) {
-            (None, None) => events.push(Event::device(ts, EventKind::ApSeen, mac, json!({ "ip": snap.ap.ip, "model": snap.ap.model, "version": snap.ap.version }))),
-            // Known from a previous run: only report what we can prove changed while we were away.
-            (None, Some(k)) => {
-                let away = ts - k.last_seen;
-                if let (Some(old), Some(up)) = (k.uptime, snap.ap.uptime)
-                    && up + 60 < old + away {
-                        events.push(Event::device(ts, EventKind::ApRestarted, mac, json!({ "uptime": up })));
-                    }
-                if k.version.is_some() && snap.ap.version.is_some() && k.version != snap.ap.version {
-                    events.push(Event::device(ts, EventKind::ApFirmwareChanged, mac, json!({ "from": k.version, "to": snap.ap.version })));
-                }
-            }
-            (Some(p), _) if !p.online => events.push(Event::device(ts, EventKind::ApOnline, mac, json!({ "offline_for": ts - p.last_seen }))),
-            _ => {}
-        }
-        if let (Some(p), Some(up)) = (&prev, snap.ap.uptime) {
-            if p.snapshot.ap.uptime.is_some_and(|old| up + 30 < old) {
-                events.push(Event::device(ts, EventKind::ApRestarted, mac, json!({ "uptime": up })));
-            }
-            if p.snapshot.ap.version != snap.ap.version && snap.ap.version.is_some() {
-                events.push(Event::device(ts, EventKind::ApFirmwareChanged, mac, json!({ "from": p.snapshot.ap.version, "to": snap.ap.version })));
-            }
-        }
+        let mut events = lifecycle_events(ts, &snap.ap, prev.as_ref(), known.as_ref());
         if snap.has_vap_table {
-            for r in &snap.radios {
-                let now = (r.channel, r.bw, r.tx_power);
-                if now.0.is_none() {
-                    continue; // no VAP on this radio, so nothing to compare
-                }
-                let track = self.radios.entry((mac, r.radio.clone())).or_default();
-                match track.committed {
-                    None => track.committed = Some(now),
-                    Some(c) if c == now => track.candidate = None,
-                    Some(c) if track.candidate == Some(now) => {
-                        track.committed = Some(now);
-                        track.candidate = None;
-                        events.push(Event::device(ts, EventKind::RadioChanged, mac, json!({
-                            "radio": r.radio,
-                            "from": { "channel": c.0, "bw": c.1, "tx_power": c.2 },
-                            "to": { "channel": now.0, "bw": now.1, "tx_power": now.2 },
-                        })));
-                    }
-                    Some(_) => track.candidate = Some(now),
-                }
-            }
+            self.radio_events(ts, &snap, &mut events);
         }
-
-        // The row changes with every inform (uptime, last_seen): written when
-        // something else changed, or the AP came back, and otherwise once a
-        // minute. Uptime and last_seen are always written together, so a
-        // restart while apctl was away is still worked out right.
-        let a = &snap.ap;
-        let changed = prev.as_ref().is_none_or(|p| {
-            let o = &p.snapshot.ap;
-            !p.online || (&o.hostname, &o.model, &o.model_display, &o.version, &o.ip, &o.serial, &o.hash_id)
-                != (&a.hostname, &a.model, &a.model_display, &a.version, &a.ip, &a.serial, &a.hash_id)
-        });
-        if changed || due(self.written.devices.get(&mac), ts, REFRESH_SECS) {
-            self.written.devices.insert(mac, ts);
-            self.write_device(&snap.ap);
-        }
+        self.write_device_if_due(ts, &snap.ap, prev.as_ref());
         // An upgrade we sent has landed: the AP reports the new version.
         if let Some(v) = &snap.ap.version
             && let Some(j) = live.firmware.version_seen(&mac, v)
@@ -714,33 +660,51 @@ impl Engine {
         if snap.has_vap_table {
             self.update_clients(&mut live, ts, &snap.clients);
         }
-        let first_seen = prev.as_ref().map(|p| p.first_seen).or(known.as_ref().map(|k| k.first_seen)).unwrap_or(ts);
-        let view = match prev {
-            Some(p) => DeviceView {
-                // Without a VAP table the inform says nothing of radios, VAPs or clients: keep the last full picture.
-                last_full_inform: if snap.has_vap_table { ts } else { p.last_full_inform },
-                snapshot: if snap.has_vap_table { snap } else { Snapshot { uplink: snap.uplink.or(p.snapshot.uplink), ap: snap.ap, ..p.snapshot } },
-                online: true,
-                first_seen,
-                last_seen: ts,
-                peer,
-                interval: p.interval,
-                last_config_push: p.last_config_push,
-            },
-            None => DeviceView {
-                last_full_inform: if snap.has_vap_table { ts } else { 0 },
-                snapshot: snap,
-                online: true,
-                first_seen,
-                last_seen: ts,
-                peer,
-                interval: DEFAULT_INTERVAL,
-                last_config_push: None,
-            },
-        };
-        live.devices.insert(mac, view);
+        live.devices.insert(mac, device_view(ts, peer, snap, prev, known.as_ref()));
         drop(live);
         let _ = self.tx.send(LiveMsg::Device { mac });
+    }
+
+    /// Settings changes on the AP's radios, debounced (see `radios`).
+    fn radio_events(&mut self, ts: Ts, snap: &Snapshot, events: &mut Vec<Event>) {
+        let mac = snap.ap.mac;
+        for r in &snap.radios {
+            let now = (r.channel, r.bw, r.tx_power);
+            if now.0.is_none() {
+                continue; // no VAP on this radio, so nothing to compare
+            }
+            let track = self.radios.entry((mac, r.radio.clone())).or_default();
+            match track.committed {
+                None => track.committed = Some(now),
+                Some(c) if c == now => track.candidate = None,
+                Some(c) if track.candidate == Some(now) => {
+                    track.committed = Some(now);
+                    track.candidate = None;
+                    events.push(Event::device(ts, EventKind::RadioChanged, mac, json!({
+                        "radio": r.radio,
+                        "from": { "channel": c.0, "bw": c.1, "tx_power": c.2 },
+                        "to": { "channel": now.0, "bw": now.1, "tx_power": now.2 },
+                    })));
+                }
+                Some(_) => track.candidate = Some(now),
+            }
+        }
+    }
+
+    /// The row changes with every inform (uptime, last_seen): written when
+    /// something else changed, or the AP came back, and otherwise once a
+    /// minute. Uptime and last_seen are always written together, so a
+    /// restart while apctl was away is still worked out right.
+    fn write_device_if_due(&mut self, ts: Ts, a: &crate::model::ApSample, prev: Option<&DeviceView>) {
+        let changed = prev.is_none_or(|p| {
+            let o = &p.snapshot.ap;
+            !p.online || (&o.hostname, &o.model, &o.model_display, &o.version, &o.ip, &o.serial, &o.hash_id)
+                != (&a.hostname, &a.model, &a.model_display, &a.version, &a.ip, &a.serial, &a.hash_id)
+        });
+        if changed || due(self.written.devices.get(&a.mac), ts, REFRESH_SECS) {
+            self.written.devices.insert(a.mac, ts);
+            self.write_device(a);
+        }
     }
 
     fn update_clients(&mut self, live: &mut Live, ts: Ts, clients: &[Arc<ClientSample>]) {
@@ -1648,6 +1612,66 @@ pub(crate) fn section_labels(cfg: &str, radios: &[crate::model::RadioSample]) ->
         }
     }
     out
+}
+
+/// An AP's comings and goings, from its inform and what was known of it:
+/// `prev` from this run, else `known` from the database.
+fn lifecycle_events(ts: Ts, a: &crate::model::ApSample, prev: Option<&DeviceView>, known: Option<&KnownDevice>) -> Vec<Event> {
+    let mac = a.mac;
+    let mut events = Vec::new();
+    match (prev, known) {
+        (None, None) => events.push(Event::device(ts, EventKind::ApSeen, mac, json!({ "ip": a.ip, "model": a.model, "version": a.version }))),
+        // Known from a previous run: only report what we can prove changed while we were away.
+        (None, Some(k)) => {
+            let away = ts - k.last_seen;
+            if let (Some(old), Some(up)) = (k.uptime, a.uptime)
+                && up + 60 < old + away {
+                    events.push(Event::device(ts, EventKind::ApRestarted, mac, json!({ "uptime": up })));
+                }
+            if k.version.is_some() && a.version.is_some() && k.version != a.version {
+                events.push(Event::device(ts, EventKind::ApFirmwareChanged, mac, json!({ "from": k.version, "to": a.version })));
+            }
+        }
+        (Some(p), _) if !p.online => events.push(Event::device(ts, EventKind::ApOnline, mac, json!({ "offline_for": ts - p.last_seen }))),
+        _ => {}
+    }
+    if let (Some(p), Some(up)) = (prev, a.uptime) {
+        if p.snapshot.ap.uptime.is_some_and(|old| up + 30 < old) {
+            events.push(Event::device(ts, EventKind::ApRestarted, mac, json!({ "uptime": up })));
+        }
+        if p.snapshot.ap.version != a.version && a.version.is_some() {
+            events.push(Event::device(ts, EventKind::ApFirmwareChanged, mac, json!({ "from": p.snapshot.ap.version, "to": a.version })));
+        }
+    }
+    events
+}
+
+/// The AP's live view after an inform at `ts`.
+fn device_view(ts: Ts, peer: String, snap: Snapshot, prev: Option<DeviceView>, known: Option<&KnownDevice>) -> DeviceView {
+    let first_seen = prev.as_ref().map(|p| p.first_seen).or(known.map(|k| k.first_seen)).unwrap_or(ts);
+    match prev {
+        Some(p) => DeviceView {
+            // Without a VAP table the inform says nothing of radios, VAPs or clients: keep the last full picture.
+            last_full_inform: if snap.has_vap_table { ts } else { p.last_full_inform },
+            snapshot: if snap.has_vap_table { snap } else { Snapshot { uplink: snap.uplink.or(p.snapshot.uplink), ap: snap.ap, ..p.snapshot } },
+            online: true,
+            first_seen,
+            last_seen: ts,
+            peer,
+            interval: p.interval,
+            last_config_push: p.last_config_push,
+        },
+        None => DeviceView {
+            last_full_inform: if snap.has_vap_table { ts } else { 0 },
+            snapshot: snap,
+            online: true,
+            first_seen,
+            last_seen: ts,
+            peer,
+            interval: DEFAULT_INTERVAL,
+            last_config_push: None,
+        },
+    }
 }
 
 /// `new`: never seen before (not even in an earlier run).
