@@ -1,10 +1,10 @@
 import { Link } from "react-router";
 import { useDeviceNames, useDryRun } from "../api";
-import type { FieldComparison } from "../api";
+import type { DryRun as DryRunData, FieldComparison } from "../api";
 import { ErrorNote, Loading } from "../components/common";
 import { clock, useNow } from "../format";
 
-const STATUS: Record<string, string> = {
+const STATUS: Record<DryRunData["devices"][number]["status"], string> = {
   match: "Identical",
   equivalent: "Equivalent",
   differs: "Differs",
@@ -47,8 +47,12 @@ export function DryRun() {
   if (dr.isLoading) return <Loading />;
   if (dr.error || !dr.data) return <ErrorNote error={dr.error ?? "no data"} />;
   const d = dr.data;
+  // A match whose system_cfg isn't identical differs only in the order of unordered lists.
+  const equivalent = (h: DryRunData["history"][number]) =>
+    h.matches && h.comparison?.system_cfg?.identical === false;
   const total = d.history.length;
   const matched = d.history.filter((h) => h.matches).length;
+  const reordered = d.history.filter(equivalent).length;
   return (
     <>
       <div className="page-head">
@@ -99,7 +103,9 @@ export function DryRun() {
       <h2>
         At each config push{" "}
         <span className="muted small">
-          {total ? `${matched} of ${total} identical` : ""}
+          {total
+            ? `${matched} of ${total} match${reordered ? ` (${matched - reordered} identical, ${reordered} equivalent)` : ""}`
+            : ""}
         </span>
       </h2>
       <div className="panel">
@@ -124,11 +130,11 @@ export function DryRun() {
                   <td>{clock(h.ts, now)}</td>
                   <td>{names[h.mac] ?? h.mac}</td>
                   <td className={h.matches ? "ok" : "error"}>
-                    {h.matches
-                      ? h.comparison?.system_cfg?.identical === false
-                        ? "equivalent"
-                        : "identical"
-                      : "differs"}
+                    {equivalent(h)
+                      ? "equivalent"
+                      : h.matches
+                        ? "identical"
+                        : "differs"}
                   </td>
                   <td className="muted">
                     {h.comparison?.error ??
