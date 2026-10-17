@@ -39,6 +39,7 @@ import {
   duration,
   pct,
   phy,
+  useNow,
 } from "../format";
 import { MulticastPanel } from "../components/insights/Multicast";
 import {
@@ -64,6 +65,7 @@ export function Device() {
 function DevicePage({ mac }: { mac: string }) {
   const [range, setRange] = useTimeSpan(6 * 3600);
   const detail = useDevice(mac);
+  const now = useNow();
   // Read-only users get neither the editor's code nor the AP's settings.
   const canEdit = useCanEdit();
 
@@ -114,8 +116,8 @@ function DevicePage({ mac }: { mac: string }) {
               value={d.online ? "Online" : "Offline"}
               sub={
                 d.interval
-                  ? `seen ${ago(d.last_seen)}, every ~${d.interval}s`
-                  : `last seen ${ago(d.last_seen)}`
+                  ? `seen ${ago(d.last_seen, now)}, every ~${d.interval}s`
+                  : `last seen ${ago(d.last_seen, now)}`
               }
             />
             <Stat label="Uptime" value={duration(ap.uptime)} />

@@ -2,7 +2,7 @@ import { useState } from "react";
 import { Link } from "react-router";
 import { useChannelPlan, useNeighbors, useRadios } from "../api";
 import type { Neighbor, RadioOverview } from "../api";
-import { ago, band as bandName, bytes, pct1 } from "../format";
+import { ago, band as bandName, bytes, pct1, useNow } from "../format";
 import { ApSpacing } from "../components/insights/ApSpacing";
 import { DeploymentDensity } from "../components/insights/DeploymentDensity";
 import { BandPicker } from "../components/insights/shared";
@@ -385,6 +385,7 @@ function Environment() {
   const [q, setQ] = useState("");
   const n = useNeighbors(7 * 86400, band);
   const r = useRadios(86400);
+  const now = useNow();
 
   const shapes = occupancy(n.data?.neighbors ?? [], r.data ?? [], band);
   const term = q.trim().toLowerCase();
@@ -477,7 +478,7 @@ function Environment() {
                         <td className="small">{x.security ?? "—"}</td>
                         <td className="small">{x.vendor ?? "—"}</td>
                         <td className="small">{x.nearest_ap ?? "—"}</td>
-                        <td className="small nowrap">{ago(x.last_seen)}</td>
+                        <td className="small nowrap">{ago(x.last_seen, now)}</td>
                       </tr>
                     ))}
                   </tbody>

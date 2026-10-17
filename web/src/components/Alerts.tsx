@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { Link, useNavigate } from "react-router";
 import { keys, markAlertsRead, useAlerts } from "../api";
 import type { AlertCategory, AlertItem } from "../api";
-import { clock } from "../format";
+import { clock, useNow } from "../format";
 import { useDismiss, useRunner } from "./common";
 
 const CATEGORIES: [AlertCategory, string, string][] = [
@@ -124,6 +124,7 @@ export function useNotifier() {
 /** The header bell: unread count and the latest alerts. */
 export function AlertBell() {
   const a = useAlerts();
+  const now = useNow();
   // The server stores the change a moment later.
   const { run } = useRunner([keys.alerts()], 800);
   const [open, setOpen] = useState(false);
@@ -185,7 +186,7 @@ export function AlertBell() {
                         x.title
                       )}
                     </span>
-                    <span className="muted small nowrap">{clock(x.ts)}</span>
+                    <span className="muted small nowrap">{clock(x.ts, now)}</span>
                   </div>
                   <div className="small muted">{x.message}</div>
                   {x.resolved_ts === null ? (

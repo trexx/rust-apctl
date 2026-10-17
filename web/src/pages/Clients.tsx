@@ -11,7 +11,7 @@ import {
   Segmented,
   useUrlTab,
 } from "../components/common";
-import { ago, band, duration, phy } from "../format";
+import { ago, band, duration, phy, useNow } from "../format";
 
 type SortKey =
   | "name"
@@ -111,8 +111,8 @@ function ClientList({ tabs }: { tabs: React.ReactNode }) {
   // Typing stays responsive however many clients there are: the list
   // follows the filter when React has time.
   const f = useDeferredValue(filter).trim().toLowerCase();
-  // When the list was fetched, in minutes: what "last seen" counts from.
-  const minute = Math.floor(clients.dataUpdatedAt / 60_000);
+  // What "last seen" counts from: a minute's ticks.
+  const now = useNow();
   const rows = (clients.data ?? [])
     .filter((c) => showGone || c.connected)
     .filter(
@@ -192,7 +192,7 @@ function ClientList({ tabs }: { tabs: React.ReactNode }) {
           </thead>
           <tbody>
             {rows.map((c) => (
-              <ClientRow key={c.sample.mac} c={c} minute={minute} />
+              <ClientRow key={c.sample.mac} c={c} now={now} />
             ))}
           </tbody>
         </table>
@@ -208,11 +208,11 @@ function ClientList({ tabs }: { tabs: React.ReactNode }) {
  */
 const ClientRow = memo(function ClientRow({
   c,
-  minute,
+  now,
 }: {
   c: ClientView;
-  /** The minute "last seen" counts from (Unix minutes). */
-  minute: number;
+  /** What "last seen" counts from (`useNow()`). */
+  now: number;
 }) {
   return (
     <tr className={c.connected ? "" : "dim"}>
@@ -254,7 +254,7 @@ const ClientRow = memo(function ClientRow({
           : "—"}
       </td>
       <td>{c.connected ? duration(c.sample.uptime) : "—"}</td>
-      <td>{c.connected ? "now" : ago(c.last_seen, minute * 60)}</td>
+      <td>{c.connected ? "now" : ago(c.last_seen, now)}</td>
     </tr>
   );
 });

@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { adoptAp, adoptOverSsh, keys, useAdoption, useCanEdit } from "../api";
-import { ago } from "../format";
+import { ago, useNow } from "../format";
 import { Outcome, useRunner } from "./common";
 
 /** APs waiting for adoption, and adopting one by IP over SSH (active mode). */
@@ -8,6 +8,7 @@ export function AdoptionPanel() {
   const canEdit = useCanEdit();
   // Read-only users never see the panel, so don't fetch (or poll) for them.
   const a = useAdoption(canEdit);
+  const now = useNow();
   const [form, setForm] = useState(false);
   const [ip, setIp] = useState("");
   const [user, setUser] = useState("");
@@ -46,7 +47,7 @@ export function AdoptionPanel() {
                     <div className="muted">
                       {p.known
                         ? "was yours, then reset: adopt it again"
-                        : `waiting since ${ago(p.first_seen)}`}
+                        : `waiting since ${ago(p.first_seen, now)}`}
                     </div>
                   </td>
                   <td className="nowrap">
@@ -71,7 +72,7 @@ export function AdoptionPanel() {
       )}
       {d.adopting.map((x) => (
         <div key={x.mac} className="small muted">
-          Adopting <span className="mono">{x.mac}</span> (since {ago(x.since)})…
+          Adopting <span className="mono">{x.mac}</span> (since {ago(x.since, now)})…
         </div>
       ))}
       {form && (

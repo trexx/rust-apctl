@@ -11,7 +11,7 @@ import type {
   LogLine,
   Names,
 } from "../api";
-import { band, clock, duration, signalClass, today } from "../format";
+import { band, clock, duration, sameDay, signalClass, useNow } from "../format";
 
 export function Stat({
   label,
@@ -288,8 +288,8 @@ type Tone = "bad" | "warn" | "info" | "neutral";
 interface EventSpec<K extends EventKind> {
   label: string;
   tone: Tone | ((d: Partial<EventPayloads[K]>) => Tone);
-  /** The detail line; a method so the table below can hold every kind. */
-  describe?(d: Partial<EventPayloads[K]>, names: Names): string;
+  /** The detail line (`ts` is the event's); a method so the table below can hold every kind. */
+  describe?(d: Partial<EventPayloads[K]>, names: Names, ts: number): string;
 }
 
 const parts = (...xs: (string | null | undefined | false)[]) =>
@@ -310,8 +310,9 @@ const EVENTS: { [K in EventKind]: EventSpec<K> } = {
   ap_offline: {
     label: "AP offline",
     tone: "bad",
-    describe: (d) =>
-      d.last_seen !== undefined ? `last seen ${clock(d.last_seen)}` : "",
+    // With its date only if that isn't the event's.
+    describe: (d, _names, ts) =>
+      d.last_seen !== undefined ? `last seen ${clock(d.last_seen, ts)}` : "",
   },
   ap_restarted: {
     label: "AP restarted",
@@ -568,7 +569,7 @@ export function eventText(
   const spec = eventSpec(e.kind);
   return {
     label: spec.label,
-    detail: spec.describe?.(eventData(e), names) ?? "",
+    detail: spec.describe?.(eventData(e), names, e.ts) ?? "",
   };
 }
 
@@ -587,28 +588,28 @@ interface EventRowProps {
   names: Names;
   clientNames?: Names;
   showDevice: boolean;
-  /** `today()`, worked out once per list. */
-  today: string;
+  /** `useNow()`: only its date matters. */
+  now: number;
 }
 
-/** One event. Events never change, so it re-renders only for another id or other names. */
+/** One event. Events never change, so it re-renders only for another id, other names or another day. */
 const EventRow = memo(
   function EventRow({
     e,
     names,
     clientNames,
     showDevice,
-    today,
+    now,
   }: EventRowProps) {
     const spec = eventSpec(e.kind);
     const d = eventData(e);
     const tone = typeof spec.tone === "function" ? spec.tone(d) : spec.tone;
-    const detail = spec.describe?.(d, names);
+    const detail = spec.describe?.(d, names, e.ts);
     const threat = eventData<"network_threat">(e);
     const diff = eventData<"config_pushed">(e).system_cfg?.diff;
     return (
       <li className={`event event-${tone}`}>
-        <span className="event-time">{clock(e.ts, today)}</span>
+        <span className="event-time">{clock(e.ts, now)}</span>
         <span className="event-kind">{spec.label}</span>
         <span className="event-what">
           <span className="event-subject">
@@ -651,7 +652,7 @@ const EventRow = memo(
     a.names === b.names &&
     a.clientNames === b.clientNames &&
     a.showDevice === b.showDevice &&
-    a.today === b.today,
+    sameDay(a.now, b.now),
 );
 
 export function EventList({
@@ -665,9 +666,9 @@ export function EventList({
   clientNames?: Names;
   showDevice?: boolean;
 }) {
+  const now = useNow();
   if (events.length === 0)
     return <div className="muted pad">No events yet</div>;
-  const day = today();
   return (
     <ul className="events">
       {events.map((e) => (
@@ -677,7 +678,7 @@ export function EventList({
           names={names}
           clientNames={clientNames}
           showDevice={showDevice !== false}
-          today={day}
+          now={now}
         />
       ))}
     </ul>
@@ -699,16 +700,16 @@ interface LogRowProps {
   l: LogLine;
   names: Names;
   showDevice: boolean;
-  /** `today()`, worked out once per list. */
-  today: string;
+  /** `useNow()`: only its date matters. */
+  now: number;
 }
 
-/** One log line. Lines never change, so it re-renders only for another id or other names. */
+/** One log line. Lines never change, so it re-renders only for another id, other names or another day. */
 const LogRow = memo(
-  function LogRow({ l, names, showDevice, today }: LogRowProps) {
+  function LogRow({ l, names, showDevice, now }: LogRowProps) {
     return (
       <div className={`log-line sev-${l.severity ?? 6}`}>
-        <span className="log-time">{clock(l.ts, today)}</span>
+        <span className="log-time">{clock(l.ts, now)}</span>
         {showDevice && (
           <span className="log-device">
             <DeviceLink mac={l.device_mac} names={names} />
@@ -726,7 +727,7 @@ const LogRow = memo(
     a.l.id === b.l.id &&
     a.names === b.names &&
     a.showDevice === b.showDevice &&
-    a.today === b.today,
+    sameDay(a.now, b.now),
 );
 
 export function LogList({
@@ -738,8 +739,8 @@ export function LogList({
   names: Names;
   showDevice?: boolean;
 }) {
+  const now = useNow();
   if (logs.length === 0) return <div className="muted pad">No log lines</div>;
-  const day = today();
   return (
     <div className={showDevice !== false ? "logs" : "logs logs-no-device"}>
       {logs.map((l) => (
@@ -748,7 +749,7 @@ export function LogList({
           l={l}
           names={names}
           showDevice={showDevice !== false}
-          today={day}
+          now={now}
         />
       ))}
     </div>

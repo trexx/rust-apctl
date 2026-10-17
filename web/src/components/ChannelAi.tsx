@@ -11,7 +11,7 @@ import {
   useEvents,
 } from "../api";
 import type { ChannelPlanResult } from "../api";
-import { band as bandName, clock, hhmm } from "../format";
+import { band as bandName, clock, hhmm, useNow } from "../format";
 import { ErrorNote, Loading, Outcome, QueryState, useRunner } from "./common";
 
 /**
@@ -96,6 +96,7 @@ export function ChannelAiPanel() {
   const canEdit = useCanEdit();
   const runs = useEvents({ kind: "channel_plan", limit: 10 });
   const { busy, msg, run } = useRun();
+  const now = useNow();
   if (ai.error) return <ErrorNote error={ai.error} />;
   if (!ai.data) return <Loading />;
   const d = ai.data;
@@ -113,7 +114,7 @@ export function ChannelAiPanel() {
           {s.enabled
             ? `nightly at ${hhmm(s.hour * 60 + s.minute)} ${d.timezone ?? "UTC"}`
             : "nightly optimisation off"}
-          {d.active && d.next_run ? ` · next ${clock(d.next_run)}` : ""}
+          {d.active && d.next_run ? ` · next ${clock(d.next_run, now)}` : ""}
         </span>
         <span className="spacer" />
         {canEdit && (
@@ -242,7 +243,7 @@ export function ChannelAiPanel() {
                   const changes = r.changes ?? [];
                   return (
                     <li key={e.id}>
-                      <span className="muted nowrap">{clock(e.ts)}</span>{" "}
+                      <span className="muted nowrap">{clock(e.ts, now)}</span>{" "}
                       {r.band ? bandName(r.band) : r.band} ({r.trigger}):{" "}
                       {changes.length === 0
                         ? "no clearly better plan, nothing moved"

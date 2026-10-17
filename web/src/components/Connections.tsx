@@ -2,7 +2,7 @@ import { useState } from "react";
 import { Link } from "react-router";
 import { useConnections } from "../api";
 import type { ConnAttempt, Roam, TimeSpan, Timings } from "../api";
-import { band, clock } from "../format";
+import { band, clock, useNow } from "../format";
 import { QueryState, Segmented, Signal } from "./common";
 
 const STAGE_NAME = [
@@ -102,9 +102,10 @@ function AttemptRow({
   apName: (mac: string) => string;
   client?: string;
 }) {
+  const now = useNow();
   return (
     <tr>
-      <td className="nowrap small">{clock(a.ts)}</td>
+      <td className="nowrap small">{clock(a.ts, now)}</td>
       {client !== undefined && (
         <td>
           <Link to={`/clients/${a.client}`}>{client}</Link>
@@ -146,9 +147,10 @@ export function RoamRow({
   client?: string;
   timing?: boolean;
 }) {
+  const now = useNow();
   return (
     <tr>
-      <td className="nowrap small">{clock(r.ts)}</td>
+      <td className="nowrap small">{clock(r.ts, now)}</td>
       {client !== undefined && (
         <td>
           <Link to={`/clients/${r.client}`}>{client}</Link>

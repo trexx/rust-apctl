@@ -2,7 +2,7 @@ import { Link } from "react-router";
 import { useDeviceNames, useDryRun } from "../api";
 import type { FieldComparison } from "../api";
 import { ErrorNote, Loading } from "../components/common";
-import { clock } from "../format";
+import { clock, useNow } from "../format";
 
 const STATUS: Record<string, string> = {
   match: "Identical",
@@ -43,6 +43,7 @@ function FieldResult({ label, c }: { label: string; c: FieldComparison }) {
 export function DryRun() {
   const dr = useDryRun();
   const names = useDeviceNames();
+  const now = useNow();
   if (dr.isLoading) return <Loading />;
   if (dr.error || !dr.data) return <ErrorNote error={dr.error ?? "no data"} />;
   const d = dr.data;
@@ -120,7 +121,7 @@ export function DryRun() {
             <tbody>
               {d.history.map((h, i) => (
                 <tr key={`${h.ts}-${i}`}>
-                  <td>{clock(h.ts)}</td>
+                  <td>{clock(h.ts, now)}</td>
                   <td>{names[h.mac] ?? h.mac}</td>
                   <td className={h.matches ? "ok" : "error"}>
                     {h.matches

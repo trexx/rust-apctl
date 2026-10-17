@@ -10,7 +10,7 @@ import {
   useFirmware,
 } from "../api";
 import type { FirmwareInfo } from "../api";
-import { ago, bytes, clock } from "../format";
+import { ago, bytes, clock, useNow } from "../format";
 import { ErrorNote, Loading, Outcome, useRunner } from "./common";
 
 const STATUS: Record<FirmwareInfo["aps"][number]["status"], [string, string]> =
@@ -31,6 +31,7 @@ const STEP: Record<string, string> = {
 export function FirmwarePanel() {
   const f = useFirmware();
   const readOnly = !useCanEdit();
+  const now = useNow();
   const [urlFor, setUrlFor] = useState<string | null>(null);
   const [url, setUrl] = useState("");
   // The engine updates the job list a moment after each request.
@@ -50,7 +51,7 @@ export function FirmwarePanel() {
           <b>Firmware</b>
           <span className="muted small">
             {d.channel} channel ·{" "}
-            {d.checked ? `checked ${ago(d.checked)}` : "not checked yet"}
+            {d.checked ? `checked ${ago(d.checked, now)}` : "not checked yet"}
           </span>
           <span className="spacer" />
           {!readOnly && (
@@ -262,11 +263,11 @@ export function FirmwarePanel() {
             <div className="small">
               <b>{job.name ?? job.mac}</b>: {job.from} → {job.target},{" "}
               {STEP[job.state] ?? job.state}
-              {job.sent_at && ` since ${clock(job.sent_at)}`}
+              {job.sent_at && ` since ${clock(job.sent_at, now)}`}
               {job.expires && (
                 <span className="muted">
                   {" "}
-                  · gives up at {clock(job.expires)}
+                  · gives up at {clock(job.expires, now)}
                 </span>
               )}
             </div>

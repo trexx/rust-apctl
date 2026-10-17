@@ -15,7 +15,7 @@ import {
   QueryState,
   Stat,
 } from "../components/common";
-import { SIGNAL, ago, band, dbm, duration, pct } from "../format";
+import { SIGNAL, ago, band, dbm, duration, pct, useNow } from "../format";
 import { Connectivity } from "../components/insights/Connectivity";
 import { DeploymentDensity } from "../components/insights/DeploymentDensity";
 import { MulticastPanel } from "../components/insights/Multicast";
@@ -34,6 +34,7 @@ export function Overview() {
   const s = status.data;
   const names = useDeviceNames();
   const cnames = useClientNames();
+  const now = useNow();
 
   if (devices.isLoading) return <Loading />;
   if (devices.error) return <ErrorNote error={devices.error} />;
@@ -120,8 +121,8 @@ export function Overview() {
             <div className="card-foot muted" title={`${d.version} · ${d.ip}`}>
               {d.version} · {d.ip} ·{" "}
               {d.online
-                ? `seen ${ago(d.last_seen)}`
-                : `offline since ${ago(d.last_seen)}`}
+                ? `seen ${ago(d.last_seen, now)}`
+                : `offline since ${ago(d.last_seen, now)}`}
             </div>
           </Link>
         ))}

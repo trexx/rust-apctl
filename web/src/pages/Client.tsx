@@ -29,7 +29,16 @@ import {
   Stat,
   useRunner,
 } from "../components/common";
-import { ago, band, bitrate, bytes, compact, duration, phy } from "../format";
+import {
+  ago,
+  band,
+  bitrate,
+  bytes,
+  compact,
+  duration,
+  phy,
+  useNow,
+} from "../format";
 import { mcastLabel, serviceNames } from "../components/insights/Multicast";
 import { ConnectionLog } from "../components/Connections";
 import { ClientActions } from "../components/Actions";
@@ -45,6 +54,7 @@ function ClientPage({ mac }: { mac: string }) {
   const [range, setRange] = useTimeSpan(6 * 3600);
   const client = useClient(mac);
   const names = useDeviceNames();
+  const now = useNow();
   const c = client.data;
   const s = c?.sample;
   // The other clients in its multicast groups.
@@ -123,7 +133,7 @@ function ClientPage({ mac }: { mac: string }) {
                 sub={
                   c.connected
                     ? `${s.essid} · ${band(s.radio)} ch ${s.channel}`
-                    : `last seen ${ago(c.last_seen)}`
+                    : `last seen ${ago(c.last_seen, now)}`
                 }
               />
               <Stat

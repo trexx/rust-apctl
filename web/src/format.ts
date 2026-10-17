@@ -1,3 +1,5 @@
+import { useSyncExternalStore } from "react";
+
 export const BANDS: Record<string, string> = { ng: "2.4 GHz", na: "5 GHz", "6e": "6 GHz" };
 
 export const band = (radio: string | null | undefined) => (radio ? (BANDS[radio] ?? radio) : "—");
@@ -14,7 +16,8 @@ export function duration(seconds: number | null | undefined): string {
   return `${s}s`;
 }
 
-export function ago(ts: number | null | undefined, now = Date.now() / 1000): string {
+/** How long before `now` (`useNow()`) `ts` was: "5m ago". */
+export function ago(ts: number | null | undefined, now: number): string {
   if (!ts) return "—";
   const d = now - ts;
   if (d < 10) return "just now";
@@ -35,15 +38,70 @@ export const dateTime = (ts: number) => dateTimeFmt.format(new Date(ts * 1000));
 export const hhmm = (minutes: number) =>
   `${String(Math.floor(minutes / 60) % 24).padStart(2, "0")}:${String(minutes % 60).padStart(2, "0")}`;
 
-/** Today's date as `clock` compares it: lists work it out once for all their rows. */
-export const today = () => new Date().toDateString();
+/** The local date of `now`, worked out once for all the times a list shows with the same `now`. */
+let dayOfNow = { now: NaN, day: "" };
+function dayOf(now: number): string {
+  if (dayOfNow.now !== now) dayOfNow = { now, day: new Date(now * 1000).toDateString() };
+  return dayOfNow.day;
+}
 
-/** The time of day, with the date unless it is `day` (today). */
-export function clock(ts: number, day = today()): string {
+/** Whether two times (Unix seconds) fall on the same local date. */
+export const sameDay = (a: number, b: number) => a === b || new Date(a * 1000).toDateString() === new Date(b * 1000).toDateString();
+
+/** The time of day, with the date unless it is the date of `now` (`useNow()`). */
+export function clock(ts: number, now: number): string {
   const d = new Date(ts * 1000);
-  const sameDay = d.toDateString() === day;
   const time = timeFmt.format(d);
-  return sameDay ? time : `${dayFmt.format(d)} ${time}`;
+  return d.toDateString() === dayOf(now) ? time : `${dayFmt.format(d)} ${time}`;
+}
+
+const unixNow = () => Math.floor(Date.now() / 1000);
+
+/** A clock shared by the components that show times relative to now: one timer per interval, while they're shown. */
+interface Ticker {
+  subscribe: (onTick: () => void) => () => void;
+  read: () => number;
+}
+
+const tickers = new Map<number, Ticker>();
+
+function ticker(ms: number): Ticker {
+  const known = tickers.get(ms);
+  if (known) return known;
+  const listeners = new Set<() => void>();
+  let timer: number | undefined;
+  let now = unixNow();
+  const t: Ticker = {
+    subscribe(onTick) {
+      listeners.add(onTick);
+      timer ??= window.setInterval(() => {
+        now = unixNow();
+        for (const l of listeners) l();
+      }, ms);
+      return () => {
+        listeners.delete(onTick);
+        if (listeners.size > 0) return;
+        window.clearInterval(timer);
+        timer = undefined;
+      };
+    },
+    // While nothing is subscribed the timer is off: the first reading after a while is a fresh one.
+    read() {
+      if (timer === undefined && unixNow() !== now) now = unixNow();
+      return now;
+    },
+  };
+  tickers.set(ms, t);
+  return t;
+}
+
+/**
+ * The time (Unix seconds), renewed every `ms`: what `ago` and `clock` measure from. Read during render, the
+ * time would be kept by React Compiler's memoisation; this re-renders the component as it passes instead.
+ */
+export function useNow(ms = 60_000): number {
+  const t = ticker(ms);
+  return useSyncExternalStore(t.subscribe, t.read);
 }
 
 /** Bits per second from bytes per second. */
