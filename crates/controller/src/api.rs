@@ -622,19 +622,13 @@ async fn dryrun(State(s): State<AppState>) -> Result<Json<DryRunStatus>, ApiErro
             // has pushed new config since: the settings are probably out of date.
             let snapshot_version = docs.get(&mac).and_then(|d| d["cfgversion"].as_str());
             let settings_stale = matches!((snapshot_version, &running_version), (Some(a), Some(b)) if a != b);
-            let entry = |status: &str, extra: Value| {
-                let mut v = json!({ "mac": mac, "name": name, "status": status, "settings_stale": settings_stale });
-                if let Value::Object(m) = extra {
-                    v.as_object_mut().unwrap().extend(m);
-                }
-                v
-            };
+            let entry = |status| DryRunDevice { mac, name: name.clone(), status, settings_stale, comparison: None, against_redacted: None, error: None };
             let Some(state) = state.as_deref() else {
-                devices.push(entry("no_settings", json!({})));
+                devices.push(entry(DryRunState::NoSettings));
                 continue;
             };
             let Some((actual, redacted)) = actual else {
-                devices.push(entry("no_config_seen", json!({})));
+                devices.push(entry(DryRunState::NoConfigSeen));
                 continue;
             };
             let req = crate::dryrun::RenderRequest {
@@ -648,15 +642,15 @@ async fn dryrun(State(s): State<AppState>) -> Result<Json<DryRunStatus>, ApiErro
                 Ok(ours) => {
                     let c = crate::dryrun::compare(&ours, &actual.mgmt_cfg, &actual.system_cfg, redacted);
                     let status = if c.mgmt_cfg.identical && c.system_cfg.identical {
-                        "match"
+                        DryRunState::Match
                     } else if c.matches() {
-                        "equivalent"
+                        DryRunState::Equivalent
                     } else {
-                        "differs"
+                        DryRunState::Differs
                     };
-                    devices.push(entry(status, json!({ "comparison": c, "against_redacted": redacted })));
+                    devices.push(DryRunDevice { comparison: Some(c), against_redacted: Some(redacted), ..entry(status) });
                 }
-                Err(e) => devices.push(entry("error", json!({ "error": format!("{e:#}") }))),
+                Err(e) => devices.push(DryRunDevice { error: Some(format!("{e:#}")), ..entry(DryRunState::Error) }),
             }
         }
         devices
@@ -678,8 +672,41 @@ struct DryRunHistory {
 #[derive(Serialize)]
 struct DryRunStatus {
     settings_imported_at: Option<Ts>,
-    devices: Vec<Value>,
+    devices: Vec<DryRunDevice>,
     history: Vec<DryRunHistory>,
+}
+
+/// An AP's dry run now: how what apctl would push compares with what it runs.
+#[derive(Serialize)]
+struct DryRunDevice {
+    mac: Mac,
+    name: Option<String>,
+    status: DryRunState,
+    /// The AP runs another cfgversion than the imported settings expect.
+    settings_stale: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    comparison: Option<crate::dryrun::Comparison>,
+    /// Compared with the stored copy, whose secrets are masked.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    against_redacted: Option<bool>,
+    /// Why the render failed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "snake_case")]
+enum DryRunState {
+    /// Nothing to render from: no settings imported.
+    NoSettings,
+    /// No full config pushed to the AP seen yet.
+    NoConfigSeen,
+    /// Identical configs.
+    Match,
+    /// The same settings, in other words (see `dryrun::compare`).
+    Equivalent,
+    Differs,
+    Error,
 }
 
 #[derive(Deserialize)]
@@ -1193,6 +1220,7 @@ mod tests {
         let app = router(s);
         let d = get_json(&app, "/api/dryrun").await;
         assert_eq!((d["devices"][0]["status"].as_str(), d["history"][0]["ts"].as_i64()), (Some("no_settings"), Some(7)));
+        assert_eq!(d["devices"][0], json!({ "mac": "02:00:00:00:00:01", "name": "Hall", "status": "no_settings", "settings_stale": false }));
     }
 
     #[tokio::test]
