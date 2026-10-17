@@ -41,7 +41,8 @@ pub fn set_inform_url(url: String) {
 
 /// Whether adopting over SSH can work: active mode and an inform URL to give.
 pub fn available(s: &AppState) -> Value {
-    json!({ "possible": s.active && inform_url(s).is_some(), "inform_url": inform_url(s) })
+    let url = inform_url(s);
+    json!({ "possible": s.active && url.is_some(), "inform_url": url })
 }
 
 struct Client {
@@ -92,9 +93,15 @@ struct Session {
 
 /// How long each step (connecting, a login attempt, a command) may take.
 const STEP_TIMEOUT: Duration = Duration::from_secs(15);
+/// The most a command may print: what the AP prints is short, and another
+/// host at that address could send anything.
+const MAX_OUTPUT: usize = 64 << 10;
+
+/// A connection, and the fingerprint of the host key it was made with.
+type Conn = (russh::client::Handle<Client>, Arc<Mutex<Option<String>>>);
 
 /// A connection with the host key checked, and the key's fingerprint.
-async fn open(config: &Arc<russh::client::Config>, ip: &str, port: u16, expected: &Option<String>) -> Result<(russh::client::Handle<Client>, Arc<Mutex<Option<String>>>), Failure> {
+async fn open(config: &Arc<russh::client::Config>, ip: &str, port: u16, expected: &Option<String>) -> Result<Conn, Failure> {
     let seen = Arc::new(Mutex::new(None));
     let client = Client { expected: expected.clone(), seen: seen.clone() };
     match tokio::time::timeout(Duration::from_secs(5), russh::client::connect(config.clone(), (ip, port), client)).await {
@@ -109,24 +116,50 @@ async fn open(config: &Arc<russh::client::Config>, ip: &str, port: u16, expected
 /// the AP keeps it open after a refusal (a new one when it doesn't).
 async fn connect(ip: &str, port: u16, logins: &[(String, String)], expected: Option<String>) -> Result<Session, Failure> {
     let config = Arc::new(russh::client::Config { inactivity_timeout: Some(Duration::from_secs(20)), ..Default::default() });
-    let mut last = Failure::Login;
-    let mut open_conn = None;
-    for (user, pass) in logins {
-        let (mut handle, seen) = match open_conn.take() {
-            Some(c) => c,
-            None => open(&config, ip, port, &expected).await?,
+    let login = |(mut handle, seen): Conn, user: String, pass: String| async move {
+        let r = match tokio::time::timeout(STEP_TIMEOUT, handle.authenticate_password(user, pass)).await {
+            Ok(Ok(r)) => Ok(r.success()),
+            Ok(Err(e)) => Err(Failure::Unreachable(e.to_string())),
+            Err(_) => Err(Failure::Unreachable("timed out".into())),
         };
-        match tokio::time::timeout(STEP_TIMEOUT, handle.authenticate_password(user, pass)).await {
-            Ok(Ok(r)) if r.success() => {
-                let fingerprint = seen.lock().unwrap().clone();
-                return Ok(Session { handle, fingerprint });
+        ((handle, seen), r)
+    };
+    let (handle, seen) = try_logins(logins, || open(&config, ip, port, &expected), login).await?;
+    let fingerprint = seen.lock().unwrap().clone();
+    Ok(Session { handle, fingerprint })
+}
+
+/// Tries each login in turn (true: accepted), on the last connection while it
+/// stays open. One that fails on a connection already used (the AP may have
+/// closed it after a refusal) is tried once more on a new one, so a refusal is
+/// not reported as an AP that cannot be reached.
+async fn try_logins<C, O, L>(logins: &[(String, String)], mut open: impl FnMut() -> O, mut login: impl FnMut(C, String, String) -> L) -> Result<C, Failure>
+where
+    O: Future<Output = Result<C, Failure>>,
+    L: Future<Output = (C, Result<bool, Failure>)>,
+{
+    let mut last = Failure::Login;
+    let mut conn = None;
+    for (user, pass) in logins {
+        let mut reused = conn.is_some();
+        loop {
+            let c = match conn.take() {
+                Some(c) => c,
+                None => open().await?,
+            };
+            match login(c, user.clone(), pass.clone()).await {
+                (c, Ok(true)) => return Ok(c),
+                (c, Ok(false)) => {
+                    last = Failure::Login;
+                    conn = Some(c);
+                }
+                (_, Err(_)) if reused => {
+                    reused = false;
+                    continue;
+                }
+                (_, Err(f)) => last = f,
             }
-            Ok(Ok(_)) => {
-                last = Failure::Login;
-                open_conn = Some((handle, seen));
-            }
-            Ok(Err(e)) => last = Failure::Unreachable(e.to_string()),
-            Err(_) => last = Failure::Unreachable("timed out".into()),
+            break;
         }
     }
     Err(last)
@@ -144,7 +177,12 @@ impl Session {
             // The exit status comes after the end of the output, so read until the channel closes.
             while let Some(msg) = ch.wait().await {
                 match msg {
-                    russh::ChannelMsg::Data { data } => out.extend_from_slice(&data),
+                    russh::ChannelMsg::Data { data } => {
+                        if out.len() + data.len() > MAX_OUTPUT {
+                            return Err(Failure::Command(format!("more than {MAX_OUTPUT} bytes of output")));
+                        }
+                        out.extend_from_slice(&data)
+                    }
                     russh::ChannelMsg::ExitStatus { exit_status } => status = Some(exit_status),
                     russh::ChannelMsg::Close => break,
                     _ => {}
@@ -203,9 +241,11 @@ fn logins(state: Option<&Value>, given: Option<(String, String)>) -> Vec<(String
         out.push((u.to_string(), p.to_string()));
     }
     for (u, p) in [("ubnt", "ubnt"), ("ui", "ui")] {
-        out.push((u.to_string(), p.to_string()));
+        let login = (u.to_string(), p.to_string());
+        if !out.contains(&login) {
+            out.push(login);
+        }
     }
-    out.dedup();
     out
 }
 
@@ -264,7 +304,10 @@ pub async fn adopt(State(s): State<AppState>, Json(b): Json<AdoptBody>) -> Resul
     let fingerprint = session.fingerprint.clone();
     let new = known.is_none();
     crate::actions::edit_settings(&s, format!("adopting {mac} over SSH"), move |st| {
-        crate::adopt::adopt_device(st, &mac, &payload)?;
+        // A known AP keeps its key: it reaches the AP over SSH, not sealed with the factory key.
+        if crate::adopt::device_doc(st, &mac).is_none() {
+            crate::adopt::adopt_device(st, &mac, &payload)?;
+        }
         let d = crate::adopt::device_doc_mut(st, &mac).ok_or("no record")?;
         d["inform_url"] = payload["inform_url"].clone();
         if let Some(fp) = &fingerprint
@@ -280,9 +323,17 @@ pub async fn adopt(State(s): State<AppState>, Json(b): Json<AdoptBody>) -> Resul
         live.state.as_deref().and_then(|st| crate::adopt::device_doc(st, &mac)).and_then(|d| d["x_authkey"].as_str().map(str::to_string))
     }
     .ok_or_else(|| ApiError::internal("the new record has no key"))?;
+    // Expected from now on: the AP may inform with its key before the command returns.
+    s.live.write().unwrap().adoption.adopting.insert(mac, store::now_ts());
     let out = match session.run(&format!("/usr/bin/syswrapper.sh set-adopt {} {}", shell_quote(&url), shell_quote(&key))).await {
         Ok(out) => out,
+        // Back with its key already (that ends the adoption): it worked.
+        Err(f) if !s.live.read().unwrap().adoption.adopting.contains_key(&mac) => {
+            tracing::warn!("{mac}: set-adopt reported a failure, but the AP informs with its key: {f}");
+            String::new()
+        }
         Err(f) => {
+            s.live.write().unwrap().adoption.adopting.remove(&mac);
             // Not adopted after all: a record made for it would make it look like one of ours.
             if new {
                 let _ = crate::actions::edit_settings(&s, format!("removed {mac}: adopting it over SSH failed"), move |st| crate::adopt::remove_device(st, &mac).map(|_| ())).await;
@@ -290,7 +341,6 @@ pub async fn adopt(State(s): State<AppState>, Json(b): Json<AdoptBody>) -> Resul
             return Err(bad(f));
         }
     };
-    s.live.write().unwrap().adoption.adopting.insert(mac, store::now_ts());
     s.note(Event::device(store::now_ts(), EventKind::ApAdopting, mac, json!({ "ip": b.ip, "via": "ssh" }))).await;
     tracing::info!("{mac}: set-adopt {url} sent over SSH ({})", out.trim());
     Ok(Json(json!({ "adopting": true, "mac": mac, "inform_url": url })))
@@ -330,6 +380,48 @@ mod tests {
         let users: Vec<String> = logins(Some(&state), None).into_iter().map(|x| x.0).collect();
         assert_eq!(users, ["admin", "ubnt", "ui"]);
         assert_eq!(logins(None, None).len(), 2);
+        // The site's login may be a factory one: each is tried once.
+        let state = json!({ "devices": [{ "site_id": "s1" }], "setting": [{ "key": "mgmt", "site_id": "s1", "x_ssh_username": "ui", "x_ssh_password": "ui" }] });
+        let users: Vec<String> = logins(Some(&state), None).into_iter().map(|x| x.0).collect();
+        assert_eq!(users, ["ui", "ubnt"]);
+    }
+
+    /// `try_logins` against an AP that accepts `password` and closes a
+    /// connection after `refusals` refused logins on it: the connections
+    /// opened, and the outcome (the connection logged in on).
+    async fn logins_against(password: &str, refusals: usize, tries: &[&str]) -> (usize, Result<usize, Failure>) {
+        use std::cell::RefCell;
+        // Per connection: how many logins it refused.
+        let refused = RefCell::new(Vec::<usize>::new());
+        let conns = &refused;
+        let logins: Vec<(String, String)> = tries.iter().map(|p| ("ubnt".to_string(), p.to_string())).collect();
+        let open = move || async move {
+            conns.borrow_mut().push(0);
+            Ok::<usize, Failure>(conns.borrow().len() - 1)
+        };
+        let login = move |c: usize, _user: String, pass: String| async move {
+            let mut conns = conns.borrow_mut();
+            if conns[c] >= refusals {
+                return (c, Err(Failure::Unreachable("disconnected".into())));
+            }
+            if pass == password {
+                return (c, Ok(true));
+            }
+            conns[c] += 1;
+            (c, Ok(false))
+        };
+        let r = try_logins(&logins, open, login).await;
+        (refused.borrow().len(), r)
+    }
+
+    #[tokio::test]
+    async fn a_login_is_tried_again_when_the_ap_closed_the_connection() {
+        // The AP closes the connection after each refusal: each login gets a new one.
+        assert_eq!(logins_against("ui", 1, &["admin", "ubnt", "ui"]).await, (3, Ok(2)));
+        assert_eq!(logins_against("x", 1, &["admin", "ubnt", "ui"]).await, (3, Err(Failure::Login)), "refused, not unreachable");
+        // One that keeps it open: one connection for all.
+        assert_eq!(logins_against("ui", 5, &["admin", "ubnt", "ui"]).await, (1, Ok(0)));
+        assert_eq!(logins_against("ui", 2, &["admin", "ubnt", "ui"]).await, (2, Ok(1)));
     }
 
     #[test]
