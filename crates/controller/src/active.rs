@@ -526,7 +526,7 @@ impl Caller {
     /// A reply in the request's encryption mode, never compressed, with a
     /// fresh IV, serialised straight into the packet.
     fn seal(&self, reply: &Value) -> Response {
-        let flags = Flags(Flags::ENCRYPTED | if self.gcm { Flags::GCM } else { 0 });
+        let flags = Flags::ENCRYPTED | if self.gcm { Flags::GCM } else { Flags(0) };
         let packet = inform::seal_with(self.mac, flags, random_bytes::<16>(), &self.key, |out| serde_json::to_writer(out, reply).expect("a JSON value serialises"));
         ([(header::CONTENT_TYPE, "application/x-binary")], packet).into_response()
     }
@@ -543,7 +543,7 @@ pub async fn inform(
     let Ok(header) = Packet::parse(&body).map(|p| p.header) else { return status(StatusCode::BAD_REQUEST) };
     let mac = header.mac;
     // An unencrypted packet "opens" with any key: it proves nothing.
-    if !header.flags.has(Flags::ENCRYPTED) {
+    if !header.flags.contains(Flags::ENCRYPTED) {
         tracing::warn!("{mac}: refusing an unencrypted inform from {}", peer.ip());
         return status(StatusCode::BAD_REQUEST);
     }
@@ -559,7 +559,7 @@ pub async fn inform(
         tracing::warn!("{mac}: header and payload MACs differ");
         return status(StatusCode::BAD_REQUEST);
     }
-    let caller = Caller { mac, gcm: header.flags.has(Flags::GCM), key, peer: peer.ip(), source: active.proxies.client_ip(&headers, peer.ip()) };
+    let caller = Caller { mac, gcm: header.flags.contains(Flags::GCM), key, peer: peer.ip(), source: active.proxies.client_ip(&headers, peer.ip()) };
     // Only an AP apctl manages is tried with a key of its own.
     if used == KeyUsed::Default {
         factory_key_inform(&active, ts, &caller, payload, device_key.is_some()).await
@@ -759,9 +759,9 @@ mod tests {
     }
 
     /// Sends an inform the way the AP does (GCM + zlib unless `flags` says otherwise).
-    async fn inform_as_ap(rig: &Rig, payload: &Value, key: [u8; 16], flags: u16) -> (StatusCode, Option<(Flags, Value)>) {
+    async fn inform_as_ap(rig: &Rig, payload: &Value, key: [u8; 16], flags: Flags) -> (StatusCode, Option<(Flags, Value)>) {
         let mac: Mac = payload["mac"].as_str().unwrap().parse().unwrap();
-        let packet = inform::seal(mac, Flags(flags), random_bytes::<16>(), &key, payload.to_string().as_bytes());
+        let packet = inform::seal(mac, flags, random_bytes::<16>(), &key, payload.to_string().as_bytes());
         let (status, body) = send(rig, packet).await;
         if status != StatusCode::OK {
             return (status, None);
@@ -771,7 +771,7 @@ mod tests {
         (status, Some((pkt.header.flags, reply)))
     }
 
-    const GCM_ZLIB: u16 = Flags::ENCRYPTED | Flags::GCM | Flags::ZLIB;
+    const GCM_ZLIB: Flags = Flags(Flags::ENCRYPTED.0 | Flags::GCM.0 | Flags::ZLIB.0);
 
     #[tokio::test]
     async fn sends_a_queued_upgrade_once_the_config_is_current() {
@@ -867,7 +867,7 @@ mod tests {
         let (status, reply) = inform_as_ap(&rig, &ap_payload("1111111111111111"), KEY, GCM_ZLIB).await;
         assert_eq!(status, StatusCode::OK);
         let (flags, reply) = reply.unwrap();
-        assert_eq!(flags, Flags(Flags::ENCRYPTED | Flags::GCM), "same mode as the request, never compressed");
+        assert_eq!(flags, Flags::ENCRYPTED | Flags::GCM, "same mode as the request, never compressed");
         assert_eq!(reply["_type"], "setparam");
         let version = reply["cfgversion"].as_str().unwrap().to_string();
         assert_eq!(version.len(), 16);
@@ -1059,9 +1059,9 @@ mod tests {
         let Some(_) = fixtures() else { return };
         let rig = rig(true, None);
         // Plain JSON under an adopted AP's MAC "opens" with its key: it must not count.
-        for flags in [0, Flags::ZLIB, Flags::GCM, Flags::GCM | Flags::ZLIB] {
+        for flags in [Flags(0), Flags::ZLIB, Flags::GCM, Flags::GCM | Flags::ZLIB] {
             let (status, _) = inform_as_ap(&rig, &ap_payload("1"), KEY, flags).await;
-            assert_eq!(status, StatusCode::BAD_REQUEST, "flags {flags:#x}");
+            assert_eq!(status, StatusCode::BAD_REQUEST, "flags {flags:?}");
         }
         assert!(rig.active.devices.lock().unwrap().is_empty(), "nothing recorded");
     }
@@ -1074,7 +1074,7 @@ mod tests {
         let (status, _) = inform_as_ap(&rig, &ap_payload("1"), [9; 16], GCM_ZLIB).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
         // Header MAC differs from the payload's.
-        let packet = inform::seal("02:00:00:00:00:01".parse().unwrap(), Flags(GCM_ZLIB), random_bytes::<16>(), &KEY, {
+        let packet = inform::seal("02:00:00:00:00:01".parse().unwrap(), GCM_ZLIB, random_bytes::<16>(), &KEY, {
             let mut p = ap_payload("1");
             p["mac"] = json!("02:00:00:00:00:99");
             p.to_string()
@@ -1300,7 +1300,7 @@ mod tests {
         // A CBC-only exchange is answered in CBC.
         let (status, reply) = inform_as_ap(&rig, &ap_payload("1"), KEY, Flags::ENCRYPTED).await;
         assert_eq!(status, StatusCode::OK);
-        assert_eq!(reply.unwrap().0, Flags(Flags::ENCRYPTED));
+        assert_eq!(reply.unwrap().0, Flags::ENCRYPTED);
         // Once the device has used GCM, CBC is refused.
         inform_as_ap(&rig, &ap_payload("1"), KEY, GCM_ZLIB).await;
         let (status, _) = inform_as_ap(&rig, &ap_payload("1"), KEY, Flags::ENCRYPTED).await;

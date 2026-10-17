@@ -24,7 +24,7 @@ pub struct Decoded {
 pub fn decode(body: &[u8], keys: &KeyStore, mac_hint: Option<Mac>) -> Result<Decoded> {
     let pkt = Packet::parse(body)?;
     let flags = pkt.header.flags;
-    let encrypted = flags.has(Flags::ENCRYPTED);
+    let encrypted = flags.contains(Flags::ENCRYPTED);
     // An unencrypted packet needs no key; otherwise the device's (by the header's MAC,
     // then by the hint), then the default one.
     let hint = mac_hint.filter(|m| *m != pkt.header.mac);
@@ -47,7 +47,7 @@ pub fn decode(body: &[u8], keys: &KeyStore, mac_hint: Option<Mac>) -> Result<Dec
 pub fn open_with(pkt: &Packet<'_>, keys: impl IntoIterator<Item = (KeyUsed, [u8; 16])>) -> Result<(KeyUsed, [u8; 16], Value)> {
     let flags = pkt.header.flags;
     // Whether getting past decryption proves the key right (or no key is involved).
-    let authenticated = !flags.has(Flags::ENCRYPTED) || flags.has(Flags::GCM);
+    let authenticated = !flags.contains(Flags::ENCRYPTED) || flags.contains(Flags::GCM);
     let mut err = None;
     for (used, key) in keys {
         let e = match pkt.open(&key) {
@@ -83,14 +83,14 @@ mod tests {
         let mut keys = KeyStore::default();
         keys.insert("00:11:22:33:44:55", "000102030405060708090a0b0c0d0e0f").unwrap();
         let device_key = *keys.get(&mac).unwrap();
-        let flags = Flags(Flags::ENCRYPTED | Flags::GCM);
+        let flags = Flags::ENCRYPTED | Flags::GCM;
 
         let wire = seal(mac, flags, [1; 16], &device_key, br#"{"model":"U7PG2"}"#);
         let d = decode(&wire, &keys, None).unwrap();
         assert_eq!(d.key, KeyUsed::Device);
         assert_eq!(d.payload["model"], "U7PG2");
 
-        let wire = seal(mac, Flags(Flags::ENCRYPTED), [2; 16], &DEFAULT_KEY, br#"{"default":true}"#);
+        let wire = seal(mac, Flags::ENCRYPTED, [2; 16], &DEFAULT_KEY, br#"{"default":true}"#);
         assert_eq!(decode(&wire, &keys, None).unwrap().key, KeyUsed::Default);
 
         let wire = seal(mac, flags, [3; 16], &[9; 16], b"{}");
@@ -101,7 +101,7 @@ mod tests {
     fn open_with_takes_the_first_key_that_gives_json() {
         let mac: Mac = "00:11:22:33:44:55".parse().unwrap();
         // CBC: the wrong key "decrypts" too (or fails on the padding); only JSON counts.
-        let wire = seal(mac, Flags(Flags::ENCRYPTED | Flags::ZLIB), [4; 16], &DEFAULT_KEY, br#"{"a":1}"#);
+        let wire = seal(mac, Flags::ENCRYPTED | Flags::ZLIB, [4; 16], &DEFAULT_KEY, br#"{"a":1}"#);
         let pkt = Packet::parse(&wire).unwrap();
         let (used, key, v) = open_with(&pkt, [(KeyUsed::Device, [7; 16]), (KeyUsed::Default, DEFAULT_KEY)]).unwrap();
         assert_eq!((used, key, v["a"].as_i64()), (KeyUsed::Default, DEFAULT_KEY, Some(1)));
@@ -114,11 +114,11 @@ mod tests {
         let mac: Mac = "00:11:22:33:44:55".parse().unwrap();
         let keys = [(KeyUsed::Device, [7; 16]), (KeyUsed::Default, DEFAULT_KEY)];
         // AES-GCM authenticated the device key: its failure is the answer, not the default key's.
-        let wire = seal(mac, Flags(Flags::ENCRYPTED | Flags::GCM), [5; 16], &[7; 16], b"not json");
+        let wire = seal(mac, Flags::ENCRYPTED | Flags::GCM, [5; 16], &[7; 16], b"not json");
         let err = open_with(&Packet::parse(&wire).unwrap(), keys).unwrap_err().to_string();
         assert!(err.contains("not JSON"), "{err}");
         // No key decrypts: that is what is reported.
-        let wire = seal(mac, Flags(Flags::ENCRYPTED | Flags::GCM), [6; 16], &[8; 16], b"{}");
+        let wire = seal(mac, Flags::ENCRYPTED | Flags::GCM, [6; 16], &[8; 16], b"{}");
         let err = open_with(&Packet::parse(&wire).unwrap(), keys).unwrap_err().to_string();
         assert!(err.contains("wrong key"), "{err}");
     }

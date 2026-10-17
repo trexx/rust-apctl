@@ -162,7 +162,7 @@ mod tests {
     }
 
     fn sealed(mac: &str, json: &str) -> Vec<u8> {
-        inform::seal(mac.parse().unwrap(), inform::Flags(inform::Flags::ENCRYPTED | inform::Flags::GCM), [1; 16], &inform::DEFAULT_KEY, json.as_bytes())
+        inform::seal(mac.parse().unwrap(), inform::Flags::ENCRYPTED | inform::Flags::GCM, [1; 16], &inform::DEFAULT_KEY, json.as_bytes())
     }
 
     fn inform(c: ConnId, from: &str, forwarded_for: Option<&str>) -> HttpEvent {

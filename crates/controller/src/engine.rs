@@ -1745,7 +1745,7 @@ mod tests {
         let header = Header {
             packet_version: 0,
             mac: Mac([0; 6]),
-            flags: Flags(Flags::ENCRYPTED | Flags::GCM),
+            flags: Flags::ENCRYPTED | Flags::GCM,
             iv: [0; 16],
             payload_version: 1,
             payload_len: 0,

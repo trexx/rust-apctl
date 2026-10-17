@@ -720,10 +720,10 @@ fn stream(now: i64, hours: f64, live: bool, out: impl Write) -> Result<()> {
             }
             let key = authkey(&APS[i]);
             let mac: Mac = APS[i].mac.parse()?;
-            let body = inform::seal(mac, Flags(Flags::ENCRYPTED | Flags::GCM | Flags::ZLIB), crate::random_iv(), &key, payload.to_string().as_bytes());
+            let body = inform::seal(mac, Flags::ENCRYPTED | Flags::GCM | Flags::ZLIB, crate::random_iv(), &key, payload.to_string().as_bytes());
             pcap.tcp(at * 1000, i, true, &http("POST /inform HTTP/1.1\r\nHost: controller.home.arpa:8080\r\nContent-Type: application/x-binary\r\n", &body))?;
             let reply = json!({ "_type": "noop", "interval": step, "server_time_in_utc": (at * 1000).to_string() });
-            let sealed = inform::seal(mac, Flags(Flags::ENCRYPTED | Flags::GCM | Flags::ZLIB), crate::random_iv(), &key, reply.to_string().as_bytes());
+            let sealed = inform::seal(mac, Flags::ENCRYPTED | Flags::GCM | Flags::ZLIB, crate::random_iv(), &key, reply.to_string().as_bytes());
             pcap.tcp(at * 1000 + 40, i, false, &http("HTTP/1.1 200 OK\r\nContent-Type: application/x-binary\r\n", &sealed))?;
         }
         for (lt, li, line) in logs {

@@ -128,17 +128,27 @@ impl<'de> serde::Deserialize<'de> for Mac {
     }
 }
 
+/// The header's flag bits; `.0` is the value on the wire.
 #[derive(Clone, Copy, PartialEq, Eq, Default)]
 pub struct Flags(pub u16);
 
 impl Flags {
-    pub const ENCRYPTED: u16 = 0x01;
-    pub const ZLIB: u16 = 0x02;
-    pub const SNAPPY: u16 = 0x04;
-    pub const GCM: u16 = 0x08;
+    pub const ENCRYPTED: Flags = Flags(0x01);
+    pub const ZLIB: Flags = Flags(0x02);
+    pub const SNAPPY: Flags = Flags(0x04);
+    pub const GCM: Flags = Flags(0x08);
 
-    pub fn has(self, bit: u16) -> bool {
-        self.0 & bit != 0
+    /// Whether every bit of `other` is set.
+    pub fn contains(self, other: Flags) -> bool {
+        self.0 & other.0 == other.0
+    }
+}
+
+impl std::ops::BitOr for Flags {
+    type Output = Flags;
+
+    fn bitor(self, other: Flags) -> Flags {
+        Flags(self.0 | other.0)
     }
 }
 
@@ -151,7 +161,7 @@ impl fmt::Debug for Flags {
             (Self::SNAPPY, "snappy"),
             (Self::GCM, "gcm"),
         ] {
-            if self.has(bit) {
+            if self.contains(bit) {
                 names.push(name);
             }
         }
@@ -235,9 +245,9 @@ impl<'a> Packet<'a> {
     /// encrypted inform must check `header.flags` themselves.
     pub fn open(&self, key: &[u8; 16]) -> Result<Vec<u8>> {
         let flags = self.header.flags;
-        let decrypted = if !flags.has(Flags::ENCRYPTED) {
+        let decrypted = if !flags.contains(Flags::ENCRYPTED) {
             Cow::Borrowed(self.body)
-        } else if flags.has(Flags::GCM) {
+        } else if flags.contains(Flags::GCM) {
             let cipher = Aes128Gcm16::new(key.into());
             let nonce = (&self.header.iv).into();
             let plain = cipher
@@ -261,9 +271,9 @@ impl<'a> Packet<'a> {
 fn decompress(flags: Flags, data: Cow<'_, [u8]>) -> Result<Vec<u8>> {
     // Inflated JSON is a few times its compressed size: start there rather than growing from nothing.
     let hint = data.len().saturating_mul(4).min(MAX_PLAINTEXT);
-    if flags.has(Flags::ZLIB) {
+    if flags.contains(Flags::ZLIB) {
         read_capped(flate2::bufread::ZlibDecoder::new(&data[..]), hint).map_err(|e| Error::Decompress(format!("zlib: {e}")))
-    } else if flags.has(Flags::SNAPPY) {
+    } else if flags.contains(Flags::SNAPPY) {
         // Raw snappy blocks are what we expect; fall back to the framed format. A raw
         // block declares its length up front, which the decoder would allocate.
         let raw = match snap::raw::decompress_len(&data) {
@@ -293,12 +303,12 @@ fn read_capped(r: impl Read, capacity: usize) -> std::io::Result<Vec<u8>> {
 
 /// Appends `data` to `out`, compressed as flagged.
 fn compress_into(flags: Flags, data: &[u8], mut out: Vec<u8>) -> Vec<u8> {
-    if flags.has(Flags::ZLIB) {
+    if flags.contains(Flags::ZLIB) {
         use std::io::Write;
         let mut enc = flate2::write::ZlibEncoder::new(out, flate2::Compression::default());
         enc.write_all(data).expect("writing to a Vec cannot fail");
         enc.finish().expect("writing to a Vec cannot fail")
-    } else if flags.has(Flags::SNAPPY) {
+    } else if flags.contains(Flags::SNAPPY) {
         let start = out.len();
         out.resize(start + snap::raw::max_compress_len(data.len()), 0);
         let n = snap::raw::Encoder::new().compress(data, &mut out[start..]).expect("snappy compression of a buffer");
@@ -316,7 +326,7 @@ fn compress_into(flags: Flags, data: &[u8], mut out: Vec<u8>) -> Vec<u8> {
 /// room for the header, is encrypted in place, and the header is written last.
 pub fn seal(mac: Mac, flags: Flags, iv: [u8; 16], key: &[u8; 16], plaintext: &[u8]) -> Vec<u8> {
     // The header, the payload and a GCM tag or CBC padding (at most one block).
-    let snappy = flags.has(Flags::SNAPPY) && !flags.has(Flags::ZLIB);
+    let snappy = flags.contains(Flags::SNAPPY) && !flags.contains(Flags::ZLIB);
     let room = if snappy { snap::raw::max_compress_len(plaintext.len()) } else { plaintext.len() };
     let mut out = Vec::with_capacity(HEADER_LEN + room + 16);
     out.resize(HEADER_LEN, 0);
@@ -327,7 +337,7 @@ pub fn seal(mac: Mac, flags: Flags, iv: [u8; 16], key: &[u8; 16], plaintext: &[u
 /// at the end of the buffer it gets: straight into the packet, unless it is
 /// to be compressed.
 pub fn seal_with(mac: Mac, flags: Flags, iv: [u8; 16], key: &[u8; 16], write: impl FnOnce(&mut Vec<u8>)) -> Vec<u8> {
-    if flags.has(Flags::ZLIB) || flags.has(Flags::SNAPPY) {
+    if flags.contains(Flags::ZLIB) || flags.contains(Flags::SNAPPY) {
         let mut plaintext = Vec::new();
         write(&mut plaintext);
         return seal(mac, flags, iv, key, &plaintext);
@@ -349,7 +359,7 @@ fn encrypt_into(mac: Mac, flags: Flags, iv: [u8; 16], key: &[u8; 16], mut out: V
         payload_version: 1,
         payload_len: 0,
     };
-    if flags.has(Flags::ENCRYPTED) && flags.has(Flags::GCM) {
+    if flags.contains(Flags::ENCRYPTED) && flags.contains(Flags::GCM) {
         // The header (with the final length) is the associated data, so the
         // ciphertext length must be known first: plaintext + 16-byte tag.
         header.payload_len = (msg_len + 16) as u32;
@@ -358,7 +368,7 @@ fn encrypt_into(mac: Mac, flags: Flags, iv: [u8; 16], key: &[u8; 16], mut out: V
             .encrypt_inout_detached((&iv).into(), &aad, (&mut out[HEADER_LEN..]).into())
             .expect("AES-GCM encryption of an in-memory buffer");
         out.extend_from_slice(&tag);
-    } else if flags.has(Flags::ENCRYPTED) {
+    } else if flags.contains(Flags::ENCRYPTED) {
         // PKCS#7 always pads, by 1 to 16 bytes, up to the next whole block.
         out.resize(HEADER_LEN + (msg_len / 16 + 1) * 16, 0);
         cbc::Encryptor::<Aes128>::new(key.into(), (&iv).into())
@@ -385,6 +395,15 @@ mod tests {
     }
 
     #[test]
+    fn flags_combine_into_their_wire_bits() {
+        let f = Flags::ENCRYPTED | Flags::GCM;
+        assert_eq!(f.0, 0x09);
+        assert!(f.contains(Flags::GCM) && f.contains(Flags::ENCRYPTED | Flags::GCM));
+        assert!(!f.contains(Flags::GCM | Flags::ZLIB), "every bit asked for must be set");
+        assert_eq!(format!("{f:?}"), "0x0009[encrypted|gcm]");
+    }
+
+    #[test]
     fn a_key_is_read_without_its_surrounding_whitespace() {
         assert_eq!(parse_key::<16>(" ba86f2bbe107c7c57eb5f2690775c712\n").unwrap(), DEFAULT_KEY);
         assert_eq!(parse_key::<2>("abcd").unwrap(), [0xab, 0xcd]);
@@ -397,7 +416,7 @@ mod tests {
     #[test]
     fn round_trips_every_flag_combination() {
         let combos = [
-            0,
+            Flags(0),
             Flags::ZLIB,
             Flags::SNAPPY,
             Flags::ENCRYPTED,
@@ -408,18 +427,18 @@ mod tests {
             Flags::ENCRYPTED | Flags::GCM | Flags::ZLIB,
         ];
         for bits in combos {
-            let wire = seal(MAC, Flags(bits), IV, &KEY, JSON);
-            assert_eq!(seal_with(MAC, Flags(bits), IV, &KEY, |out| out.extend_from_slice(JSON)), wire, "flags {:?}", Flags(bits));
+            let wire = seal(MAC, bits, IV, &KEY, JSON);
+            assert_eq!(seal_with(MAC, bits, IV, &KEY, |out| out.extend_from_slice(JSON)), wire, "flags {:?}", bits);
             let pkt = Packet::parse(&wire).unwrap();
             assert_eq!(pkt.header.mac, MAC);
-            assert_eq!(pkt.header.flags, Flags(bits));
+            assert_eq!(pkt.header.flags, bits);
             assert_eq!(pkt.header.payload_len as usize, wire.len() - HEADER_LEN);
-            assert_eq!(pkt.open(&KEY).unwrap(), JSON, "flags {:?}", Flags(bits));
+            assert_eq!(pkt.open(&KEY).unwrap(), JSON, "flags {:?}", bits);
         }
         // CBC pads to the next whole block, by a full block when already aligned.
         for len in [0, 1, 15, 16, 17, 32] {
             let plain = vec![b'x'; len];
-            let wire = seal(MAC, Flags(Flags::ENCRYPTED), IV, &KEY, &plain);
+            let wire = seal(MAC, Flags::ENCRYPTED, IV, &KEY, &plain);
             assert_eq!(wire.len() - HEADER_LEN, (len / 16 + 1) * 16, "{len} bytes");
             assert_eq!(Packet::parse(&wire).unwrap().open(&KEY).unwrap(), plain);
         }
@@ -428,7 +447,7 @@ mod tests {
     /// The bytes of a sealed packet do not change (they are what the APs decrypt).
     #[test]
     fn sealed_bytes_are_stable() {
-        let hex_of = |bits| hex::encode(seal(MAC, Flags(bits), IV, &KEY, JSON));
+        let hex_of = |bits| hex::encode(seal(MAC, bits, IV, &KEY, JSON));
         assert_eq!(
             hex_of(Flags::ENCRYPTED | Flags::GCM | Flags::ZLIB),
             "544e425500000000001122334455000b07070707070707070707070707070707000000010000003660058e882d29aecd91e16f1209e5c750f7a3983d0d57362bdc62aa6880dbfc79831072a78ee2c5b49eaaba69cb66cb9226714823938f"
@@ -441,14 +460,14 @@ mod tests {
 
     #[test]
     fn wrong_key_is_rejected_for_gcm() {
-        let wire = seal(MAC, Flags(Flags::ENCRYPTED | Flags::GCM), IV, &KEY, JSON);
+        let wire = seal(MAC, Flags::ENCRYPTED | Flags::GCM, IV, &KEY, JSON);
         let pkt = Packet::parse(&wire).unwrap();
         assert!(matches!(pkt.open(&DEFAULT_KEY), Err(Error::Decrypt)));
     }
 
     #[test]
     fn gcm_authenticates_the_header() {
-        let mut wire = seal(MAC, Flags(Flags::ENCRYPTED | Flags::GCM), IV, &KEY, JSON);
+        let mut wire = seal(MAC, Flags::ENCRYPTED | Flags::GCM, IV, &KEY, JSON);
         wire[13] ^= 1; // flip a bit of the MAC
         let pkt = Packet::parse(&wire).unwrap();
         assert!(matches!(pkt.open(&KEY), Err(Error::Decrypt)));
@@ -456,7 +475,7 @@ mod tests {
 
     #[test]
     fn header_round_trip_and_errors() {
-        let wire = seal(MAC, Flags(Flags::ENCRYPTED), IV, &KEY, JSON);
+        let wire = seal(MAC, Flags::ENCRYPTED, IV, &KEY, JSON);
         let h = Header::parse(&wire).unwrap();
         assert_eq!(&h.to_bytes()[..], &wire[..HEADER_LEN]);
         assert!(matches!(Header::parse(&wire[..10]), Err(Error::TooShort(10))));
@@ -506,19 +525,19 @@ mod tests {
         // Highly compressible, just over the cap: a few KB on the wire.
         let big = vec![b' '; MAX_PLAINTEXT + 1];
         for bits in [Flags::ZLIB, Flags::SNAPPY, Flags::ENCRYPTED | Flags::GCM | Flags::ZLIB, Flags::ENCRYPTED | Flags::GCM | Flags::SNAPPY] {
-            let wire = seal(MAC, Flags(bits), IV, &KEY, &big);
-            assert!(wire.len() < MAX_PLAINTEXT / 16, "{:?} compresses", Flags(bits));
+            let wire = seal(MAC, bits, IV, &KEY, &big);
+            assert!(wire.len() < MAX_PLAINTEXT / 16, "{:?} compresses", bits);
             let pkt = Packet::parse(&wire).unwrap();
-            assert!(matches!(pkt.open(&KEY), Err(Error::Decompress(_))), "{:?}", Flags(bits));
+            assert!(matches!(pkt.open(&KEY), Err(Error::Decompress(_))), "{:?}", bits);
         }
         // Exactly at the cap still decodes.
         let max = vec![b' '; MAX_PLAINTEXT];
-        let wire = seal(MAC, Flags(Flags::ZLIB), IV, &KEY, &max);
+        let wire = seal(MAC, Flags::ZLIB, IV, &KEY, &max);
         assert_eq!(Packet::parse(&wire).unwrap().open(&KEY).unwrap().len(), MAX_PLAINTEXT);
         // A raw snappy header claiming 4 GiB is refused before anything is allocated.
         let mut lie = vec![0xff, 0xff, 0xff, 0xff, 0x0f];
         lie.extend_from_slice(b"\x00x");
-        assert!(matches!(decompress(Flags(Flags::SNAPPY), lie.into()), Err(Error::Decompress(_))));
+        assert!(matches!(decompress(Flags::SNAPPY, lie.into()), Err(Error::Decompress(_))));
         // The framed snappy format is capped too.
         let mut framed = Vec::new();
         {
@@ -526,6 +545,6 @@ mod tests {
             let mut w = snap::write::FrameEncoder::new(&mut framed);
             w.write_all(&big).unwrap();
         }
-        assert!(matches!(decompress(Flags(Flags::SNAPPY), framed.into()), Err(Error::Decompress(_))));
+        assert!(matches!(decompress(Flags::SNAPPY, framed.into()), Err(Error::Decompress(_))));
     }
 }

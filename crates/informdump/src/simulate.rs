@@ -101,7 +101,7 @@ pub fn run(pcap: &str, ports: &[u16], keys: &KeyStore, url: &str, limit: usize, 
             payload["default"] = Value::from(true);
         }
         // These are real AP keys: a GCM nonce must never repeat under one.
-        let packet = inform::seal(mac, Flags(Flags::ENCRYPTED | Flags::GCM | Flags::ZLIB), crate::random_iv(), &key, payload.to_string().as_bytes());
+        let packet = inform::seal(mac, Flags::ENCRYPTED | Flags::GCM | Flags::ZLIB, crate::random_iv(), &key, payload.to_string().as_bytes());
         let (status, body) = post(url, &packet)?;
         // Replies are counted by status, and those with 200 by their type.
         let (counted, line) = if status != 200 {
