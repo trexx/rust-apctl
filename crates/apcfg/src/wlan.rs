@@ -141,6 +141,12 @@ pub fn ap_groups<'a>(ctx: &Ctx<'a>) -> Vec<&'a str> {
         .collect()
 }
 
+/// Whether a document scoped to AP groups (a WLAN, an mDNS entry) names one of `groups`,
+/// the AP's (see [`ap_groups`]), in its `ap_group_ids`.
+pub fn in_groups(doc: &Value, groups: &[&str]) -> bool {
+    arr(doc, "ap_group_ids").iter().filter_map(Value::as_str).any(|g| groups.contains(&g))
+}
+
 /// Sets a field of the WLAN, copying the document first if it is still the original.
 /// A field that already has the value leaves the document alone (most WPA3, open and
 /// enterprise WLANs already hold the values `adapt` writes).
@@ -229,7 +235,7 @@ pub fn deploy<'a>(ctx: &Ctx<'a>, radios: &[Radio]) -> Vec<(Cow<'a, Value>, usize
     let wlans: Vec<&'a Value> = ctx
         .site_docs("wlanconf")
         .filter(|w| flag(w, "enabled", true))
-        .filter(|w| str_list(w, "ap_group_ids").iter().any(|g| groups.iter().any(|m| m == g)))
+        .filter(|w| in_groups(w, &groups))
         .collect();
     let mut out = Vec::new();
     for (ri, radio) in radios.iter().enumerate() {
