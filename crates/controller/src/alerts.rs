@@ -460,12 +460,20 @@ async fn failing_clients(store: &Arc<Store>, now: Ts) -> anyhow::Result<usize> {
     .await?
 }
 
-/// Alerts left open by a previous run, and the highest number a stored
-/// alert's id carries (`{ts}-{number}`).
-async fn load_open(store: &Arc<Store>) -> anyhow::Result<(Vec<Alert>, u64)> {
+/// What a previous run left: the alerts still open, the highest number a
+/// stored alert's id carries (`{ts}-{number}`), and the AP offline alerts of
+/// the day before `now`, oldest first: (AP, when, whether it was a "keeps
+/// dropping off" one).
+async fn load_open(store: &Arc<Store>, now: Ts) -> anyhow::Result<(Vec<Alert>, u64, Vec<(Mac, Ts, bool)>)> {
     let store = store.clone();
     tokio::task::spawn_blocking(move || {
         store.read(Db::Config, |c| {
+            // "Keeps dropping off" is the only offline alert raised as medium.
+            let mut stmt = c.prepare("SELECT entity, ts, severity = 'medium' FROM alerts WHERE key = 'ap_offline' AND ts > ?1 ORDER BY ts")?;
+            let offline = stmt
+                .query_map([now - 86400], |r| Ok((r.get::<_, String>(0)?.parse().ok(), r.get(1)?, r.get(2)?)))?
+                .filter_map(|r| r.map(|(mac, ts, flapping)| Some((mac?, ts, flapping))).transpose())
+                .collect::<rusqlite::Result<Vec<_>>>()?;
             let sql = "SELECT COALESCE(MAX(CAST(substr(id, instr(id, '-') + 1) AS INTEGER)), 0) FROM alerts";
             let seq = c.query_row(sql, [], |r| r.get::<_, i64>(0))?;
             let mut stmt = c.prepare("SELECT id, ts, key, category, severity, entity, title, message, link, tag FROM alerts WHERE resolved_ts IS NULL")?;
@@ -490,7 +498,7 @@ async fn load_open(store: &Arc<Store>) -> anyhow::Result<(Vec<Alert>, u64)> {
                 })?
                 .filter_map(Result::transpose)
                 .collect::<rusqlite::Result<Vec<_>>>()?;
-            Ok((rows, u64::try_from(seq).unwrap_or(0)))
+            Ok((rows, u64::try_from(seq).unwrap_or(0), offline))
         })
     })
     .await?
@@ -566,14 +574,22 @@ struct Watcher {
 }
 
 impl Watcher {
-    /// Starts with the alerts a previous run left open.
-    async fn start(store: Arc<Store>, writer: Writer, live: SharedLive, tx: broadcast::Sender<LiveMsg>) -> Watcher {
+    /// Starts with the alerts a previous run left open, and the offline
+    /// alerts it sent in the last day, which count towards today's limit.
+    async fn start(store: Arc<Store>, writer: Writer, live: SharedLive, tx: broadcast::Sender<LiveMsg>, now: Ts) -> Watcher {
         let mut w = Watcher { book: Alerts { writer, tx, seq: 0, open: HashMap::new() }, store, live, aps: ApWatch::default(), cleared: HashMap::new(), unjudged: HashMap::new() };
-        match load_open(&w.store).await {
-            Ok((open, seq)) => {
+        match load_open(&w.store, now).await {
+            Ok((open, seq, offline)) => {
                 w.book.seq = seq;
                 for a in open {
                     w.book.open.insert((a.key, a.entity.clone()), a);
+                }
+                for (mac, ts, flapping) in offline {
+                    if flapping {
+                        w.aps.flapping_day.insert(mac, ts / 86400);
+                    } else {
+                        w.aps.sent.entry(mac).or_default().push(ts);
+                    }
                 }
             }
             Err(e) => tracing::warn!("could not load the open alerts: {e:#}"),
@@ -582,7 +598,6 @@ impl Watcher {
         for (k, a) in &w.book.open {
             if let (Key::ApOffline, Entity::Ap(mac)) = k {
                 w.aps.down.insert(*mac, a.ts - OFFLINE_AFTER);
-                w.aps.sent.entry(*mac).or_default().push(a.ts);
             }
         }
         w
@@ -717,7 +732,7 @@ impl Watcher {
 /// Starts the alert watcher, fed by the engine through `events` (see [`channel`]).
 pub fn spawn(store: Arc<Store>, writer: Writer, live: SharedLive, tx: broadcast::Sender<LiveMsg>, mut events: mpsc::Receiver<Event>) {
     tokio::spawn(async move {
-        let mut w = Watcher::start(store, writer, live, tx).await;
+        let mut w = Watcher::start(store, writer, live, tx, store::now_ts()).await;
         // Give APs a chance to report after a restart before judging them.
         let mut status = tokio::time::interval_at(tokio::time::Instant::now() + Duration::from_secs(90), Duration::from_secs(30));
         let mut health = tokio::time::interval_at(tokio::time::Instant::now() + Duration::from_secs(120), Duration::from_secs(60));
@@ -879,13 +894,34 @@ mod tests {
         }
         assert!(w.book.writer.flush(Duration::from_secs(5)));
         // A restart within the same second carries on from the stored ids.
-        let mut again = Watcher::start(w.store.clone(), w.book.writer.clone(), Default::default(), broadcast::channel(4).0).await;
+        let mut again = Watcher::start(w.store.clone(), w.book.writer.clone(), Default::default(), broadcast::channel(4).0, 2000).await;
         let last = again.book.raise(1000, notice());
         assert_eq!(last.id, "1000-12");
         assert!(w.book.writer.flush(Duration::from_secs(5)));
         let ids: Vec<String> = w.store.read(Db::Config, |c| Ok(c.prepare(LIST)?.query_map([100], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?)).unwrap();
         assert_eq!(ids.len(), 12, "none overwritten");
         assert_eq!((ids[0].as_str(), ids[1].as_str(), ids[2].as_str()), ("1000-12", "1000-11", "1000-10"));
+    }
+
+    #[tokio::test]
+    async fn a_restart_keeps_the_offline_alerts_of_the_day() {
+        let (mut w, _rx) = watcher();
+        let ap: Mac = "02:00:00:00:00:01".parse().unwrap();
+        let offline = |severity| Alert::for_device(Key::ApOffline, Category::ApStatus, severity, ap, "t".into(), "m".into());
+        // Two drops reported, the AP back after each.
+        w.book.raise(1000, offline(Severity::High).resolved(1060));
+        w.book.raise(2000, offline(Severity::High).resolved(2100));
+        assert!(w.book.writer.flush(Duration::from_secs(5)));
+        let restart = |now| Watcher::start(w.store.clone(), w.book.writer.clone(), Default::default(), broadcast::channel(4).0, now);
+        // The third drop is summarised, as without the restart.
+        let mut again = restart(3000).await;
+        assert_eq!(again.aps.check(3000, ap, 2700), Some(ApChange::Flapping { times: 3 }));
+        again.book.raise(3000, offline(Severity::Medium).resolved(3100));
+        assert!(w.book.writer.flush(Duration::from_secs(5)));
+        // The fourth is not reported, even after another restart.
+        assert_eq!(restart(4000).await.aps.check(4000, ap, 3700), None);
+        // A day after the first two, a drop is reported again.
+        assert!(matches!(restart(91_000).await.aps.check(91_000, ap, 90_700), Some(ApChange::Offline { .. })));
     }
 
     #[tokio::test]
@@ -979,7 +1015,7 @@ mod tests {
         let stored: Vec<(String, String)> = w.store.read(Db::Config, |c| Ok(c.prepare("SELECT key, entity FROM alerts WHERE key != 'gone' ORDER BY key")?.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<rusqlite::Result<_>>()?)).unwrap();
         assert_eq!(stored, [("busy_channel".to_string(), "02:00:00:00:00:01/na".to_string()), ("connect_failures".to_string(), "site".to_string())]);
         // After a restart they are open as they were; one apctl doesn't know is left alone.
-        let again = Watcher::start(w.store.clone(), w.book.writer.clone(), Default::default(), broadcast::channel(4).0).await;
+        let again = Watcher::start(w.store.clone(), w.book.writer.clone(), Default::default(), broadcast::channel(4).0, 2000).await;
         let mut open: Vec<String> = again.book.open.keys().map(|(k, e)| format!("{}:{e}", k.as_str())).collect();
         open.sort();
         assert_eq!(open, ["busy_channel:02:00:00:00:00:01/na", "connect_failures:site"]);
