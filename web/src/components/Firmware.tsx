@@ -4,6 +4,7 @@ import {
   cancelFirmware,
   checkFirmware,
   keys,
+  resumeFirmware,
   upgradeFirmware,
   upgradeFirmwareUrl,
   useCanEdit,
@@ -12,6 +13,7 @@ import {
 import type { FirmwareInfo } from "../api";
 import { ago, bytes, clock } from "../format";
 import { ErrorNote, Loading, Outcome, useRunner } from "./common";
+import { TextInput } from "./settings/form";
 
 const STATUS: Record<FirmwareInfo["aps"][number]["status"], [string, string]> =
   {
@@ -43,6 +45,7 @@ export function FirmwarePanel() {
     (a) => a.status === "update_available" && a.online,
   );
   const job = d.jobs.current;
+  const urlName = d.aps.find((a) => a.mac === urlFor)?.name ?? urlFor;
   return (
     <div className="stack">
       <div className="panel">
@@ -70,7 +73,7 @@ export function FirmwarePanel() {
           {canAct && updatable.length > 1 && (
             <button
               className="btn small primary"
-              disabled={busy}
+              disabled={busy || !!job}
               onClick={() =>
                 window.confirm(
                   `Update ${updatable.length} APs, one at a time? Each restarts and drops its clients for a few minutes.`,
@@ -181,10 +184,9 @@ export function FirmwarePanel() {
             className="banner backup-row"
             onSubmit={(e) => {
               e.preventDefault();
-              const ap = d.aps.find((a) => a.mac === urlFor);
               if (
                 !window.confirm(
-                  `Install the firmware at ${url} on ${ap?.name ?? urlFor}? apctl cannot check custom firmware; the AP verifies it before writing.`,
+                  `Install the firmware at ${url} on ${urlName}? apctl cannot check custom firmware; the AP verifies it before writing.`,
                 )
               )
                 return;
@@ -196,15 +198,13 @@ export function FirmwarePanel() {
               });
             }}
           >
-            <span className="small">
-              Firmware file for {d.aps.find((a) => a.mac === urlFor)?.name}:
-            </span>
-            <input
-              className="search"
+            <span className="small">Firmware file for {urlName}:</span>
+            <TextInput
               required
               placeholder="https://…/firmware.bin"
+              aria-label={`Firmware file for ${urlName}`}
               value={url}
-              onChange={(e) => setUrl(e.target.value)}
+              onChange={setUrl}
             />
             <button className="btn small primary" type="submit" disabled={busy}>
               Install
@@ -229,6 +229,7 @@ export function FirmwarePanel() {
             {!readOnly && d.jobs.queue.length > 0 && (
               <button
                 className="btn small"
+                disabled={busy}
                 onClick={() =>
                   run(
                     async () =>
@@ -246,10 +247,12 @@ export function FirmwarePanel() {
               {canAct && (
                 <button
                   className="btn small"
+                  disabled={busy || !!job}
                   onClick={() =>
-                    run(
-                      async () =>
-                        `${(await upgradeFirmware([])).queued} queued; resuming.`,
+                    run(async () =>
+                      (await resumeFirmware()).resumed
+                        ? "Resuming."
+                        : "Nothing to resume.",
                     )
                   }
                 >
