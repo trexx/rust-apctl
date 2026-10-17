@@ -377,17 +377,23 @@ async fn flush_writes(writer: store::Writer) {
 
 fn debug_syslog(pcap: &str, keys: &str, port: u16) -> Result<()> {
     let keys = KeyStore::load(keys)?;
-    let candidates: Vec<_> = keys.syslog_keys().map(|(mac, key)| (*mac, *key)).collect();
+    // Every key's cipher, set up once.
+    let mut ciphers = syslog::Ciphers::default();
+    ciphers.refresh(None, &keys);
     let input = wire::capture::open_input(pcap)?;
     wire::capture::run_with_udp(input, &[], &[port], |ev| {
         if let wire::capture::HttpEvent::Datagram { ts, src, payload, .. } = ev {
-            let found = candidates.iter().find_map(|(mac, key)| syslog::open(&payload, |_| Some((*mac, *key))).ok());
+            let found = if payload.starts_with(&syslog::MAGIC) {
+                ciphers.all().find_map(|(mac, cipher)| Some((Some(mac), syslog::decrypt_with(&payload, mac, cipher).ok()?)))
+            } else {
+                Some((None, String::from_utf8_lossy(&payload).into_owned()))
+            };
             match found {
                 Some((mac, text)) => {
                     if std::env::var_os("APCTL_DEBUG_RAW").is_some() {
                         println!("raw: {:?}", text.chars().take(70).collect::<String>());
                     }
-                    let line = syslog::parse(ts / 1_000_000, src.ip().to_string(), mac, &text);
+                    let line = syslog::parse(ts / 1_000_000, &src.ip().to_string(), mac, &text);
                     println!("{} {:?} prog={:?} sev={:?} {}", line.ts, line.device_mac, line.program, line.severity, line.msg);
                 }
                 None => println!("{ts} {src}: could not decode {} bytes", payload.len()),

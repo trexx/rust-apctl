@@ -256,8 +256,8 @@ pub struct Live {
     pub clients: BTreeMap<Mac, ClientView>,
     /// Also held by the engine, which counts without taking the lock.
     pub counters: Arc<Counters>,
-    /// For attributing syslog: an AP's `hash_id` and IP address.
-    pub by_hash_id: HashMap<String, Mac>,
+    /// For attributing syslog: an AP's `hash_id` (see `syslog::hash_id`) and IP address.
+    pub by_hash_id: HashMap<u64, Mac>,
     pub by_ip: HashMap<String, Mac>,
     /// APs known from the database before their first inform in this process.
     pub known_devices: HashMap<Mac, KnownDevice>,
@@ -412,7 +412,7 @@ pub struct Engine {
     written: Written,
     /// Syslog hash_ids that none of the keys opened, and when that was tried.
     /// Time or new settings (which may hold new keys) clear an entry.
-    syslog_unknown: HashMap<String, Ts>,
+    syslog_unknown: HashMap<u64, Ts>,
     /// The syslog keys, ready to decrypt with.
     syslog_ciphers: crate::syslog::Ciphers,
     /// Per AP: the second its stored syslog lines were last announced, and
@@ -493,7 +493,7 @@ impl Engine {
         let mut live = self.live.write().unwrap();
         for (mac, known, hash_id, ip) in devices {
             let Ok(mac) = mac.parse::<Mac>() else { continue };
-            if let Some(h) = hash_id {
+            if let Some(h) = hash_id.as_deref().and_then(crate::syslog::parse_hash_id) {
                 live.by_hash_id.insert(h, mac);
             }
             if let Some(ip) = ip {
@@ -613,11 +613,11 @@ impl Engine {
         bump(&self.counters.informs);
         // For attributing syslog. An address or hash_id the AP no longer has is
         // dropped: plain syslog from whichever host gets the address next is not the AP's.
-        if let Some(h) = &snap.ap.hash_id
-            && live.by_hash_id.get(h) != Some(&mac)
+        if let Some(h) = snap.ap.hash_id.as_deref().and_then(crate::syslog::parse_hash_id)
+            && live.by_hash_id.get(&h) != Some(&mac)
         {
             live.by_hash_id.retain(|_, m| *m != mac);
-            live.by_hash_id.insert(h.clone(), mac);
+            live.by_hash_id.insert(h, mac);
         }
         if let Some(ip) = &snap.ap.ip
             && live.by_ip.get(ip) != Some(&mac)
@@ -1174,7 +1174,7 @@ impl Engine {
 
     /// Decrypts a datagram from the AP with this `hash_id`: with the key of the
     /// AP known by it, else by trying each key.
-    fn decrypt_syslog(&mut self, ts: Ts, payload: &[u8], hash_id: String, by_hash: Option<Mac>, state: Option<&Arc<Value>>) -> anyhow::Result<(Mac, String)> {
+    fn decrypt_syslog(&mut self, ts: Ts, payload: &[u8], hash_id: u64, by_hash: Option<Mac>, state: Option<&Arc<Value>>) -> anyhow::Result<(Mac, String)> {
         // Keys come from the settings (APs apctl adopted) and the key file.
         self.syslog_ciphers.refresh(state, &self.keys);
         if let Some(mac) = by_hash
@@ -1190,12 +1190,12 @@ impl Engine {
         if let Some(at) = self.syslog_unknown.get(&hash_id)
             && (*at..*at + SYSLOG_RETRY_SECS).contains(&ts)
         {
-            anyhow::bail!("no syslog key for hash_id {hash_id} (none worked {}s ago)", ts - at);
+            anyhow::bail!("no syslog key for hash_id {hash_id:016x} (none worked {}s ago)", ts - at);
         }
         // So many unknown hash_ids at once are made up: trying every key on each
         // would keep the engine busy. A real AP is found by its informs meanwhile.
         if self.syslog_unknown.len() >= SYSLOG_UNKNOWN_MAX {
-            anyhow::bail!("no syslog key for hash_id {hash_id} (too many unknown senders to try)");
+            anyhow::bail!("no syslog key for hash_id {hash_id:016x} (too many unknown senders to try)");
         }
         for (mac, cipher) in self.syslog_ciphers.all() {
             if let Ok(text) = crate::syslog::decrypt_with(payload, mac, cipher) {
@@ -1205,8 +1205,8 @@ impl Engine {
             }
         }
         // Bounded (above) against made-up hash_ids; expired entries go at each tick.
-        self.syslog_unknown.insert(hash_id.clone(), ts);
-        anyhow::bail!("no syslog key for hash_id {hash_id}")
+        self.syslog_unknown.insert(hash_id, ts);
+        anyhow::bail!("no syslog key for hash_id {hash_id:016x}")
     }
 
     fn datagram(&mut self, ts: Ts, src_ip: &str, payload: &[u8]) {
@@ -1215,11 +1215,12 @@ impl Engine {
         let (by_hash, by_ip, state) = {
             let live = self.live.read().unwrap();
             let by_ip = live.by_ip.get(src_ip).copied();
-            (hash_id.as_ref().and_then(|h| live.by_hash_id.get(h).copied()), by_ip, (hash_id.is_some() || by_ip.is_some()).then(|| live.state.clone()).flatten())
+            (hash_id.and_then(|h| live.by_hash_id.get(&h).copied()), by_ip, (hash_id.is_some() || by_ip.is_some()).then(|| live.state.clone()).flatten())
         };
         let result = match hash_id {
-            Some(h) => self.decrypt_syslog(ts, payload, h, by_hash, state.as_ref()).map(|(mac, text)| (Some(mac), text)),
-            None => crate::syslog::open(payload, |_| None),
+            Some(h) => self.decrypt_syslog(ts, payload, h, by_hash, state.as_ref()).map(|(mac, text)| (Some(mac), std::borrow::Cow::Owned(text))),
+            None if payload.starts_with(&crate::syslog::MAGIC) => Err(anyhow::anyhow!("encrypted syslog datagram too short ({} bytes)", payload.len())),
+            None => Ok((None, String::from_utf8_lossy(payload))),
         };
         match result {
             Ok((mac, text)) => {
@@ -1233,7 +1234,7 @@ impl Engine {
                 });
                 // Netconsole and multi-line messages can carry several lines.
                 for line in text.lines().filter(|l| !l.trim().is_empty()) {
-                    let mut l = crate::syslog::parse(ts, src_ip.to_string(), mac.or(by_ip.filter(|_| !keyed)), line);
+                    let mut l = crate::syslog::parse(ts, src_ip, mac.or(by_ip.filter(|_| !keyed)), line);
                     if l.device_mac.is_none() && l.facility.is_none() {
                         l.device_mac = by_ip;
                     }
@@ -1943,15 +1944,15 @@ mod tests {
         let logs = || live.read().unwrap().counters.logs.load(Ordering::Relaxed);
         // An AP whose key apctl lacks: remembered, not tried again for a while.
         send(&mut e, 0, 1, 9);
-        assert_eq!(e.syslog_unknown.get(&hex::encode([1u8; 8])), Some(&0));
+        assert_eq!(e.syslog_unknown.get(&u64::from_be_bytes([1; 8])), Some(&0));
         send(&mut e, 10, 1, 9);
-        assert_eq!(e.syslog_unknown.get(&hex::encode([1u8; 8])), Some(&0), "not retried within the window");
+        assert_eq!(e.syslog_unknown.get(&u64::from_be_bytes([1; 8])), Some(&0), "not retried within the window");
         e.handle(Input::Tick(SYSLOG_RETRY_SECS));
         assert!(e.syslog_unknown.is_empty(), "expired");
         // A known key under a hash_id not seen yet: found by trial and remembered.
         send(&mut e, 20, 2, 7);
         assert_eq!(logs(), 1);
-        assert_eq!(live.read().unwrap().by_hash_id.get(&hex::encode([2u8; 8])), Some(&AP1.parse().unwrap()));
+        assert_eq!(live.read().unwrap().by_hash_id.get(&u64::from_be_bytes([2; 8])), Some(&AP1.parse().unwrap()));
         // An AP apctl adopted: its key is in the settings only.
         send(&mut e, 30, 3, 5);
         assert_eq!(logs(), 1);
@@ -1960,14 +1961,14 @@ mod tests {
         assert!(e.syslog_unknown.is_empty(), "new settings, new keys: tried again");
         send(&mut e, 32, 3, 5);
         assert_eq!(logs(), 2);
-        assert_eq!(live.read().unwrap().by_hash_id.get(&hex::encode([3u8; 8])), Some(&ap2.parse().unwrap()));
+        assert_eq!(live.read().unwrap().by_hash_id.get(&u64::from_be_bytes([3; 8])), Some(&ap2.parse().unwrap()));
         // So many unknown hash_ids at once: a new one is not tried with every key.
         for i in 0..SYSLOG_UNKNOWN_MAX {
-            e.syslog_unknown.insert(format!("{i:016x}"), 40);
+            e.syslog_unknown.insert(i as u64, 40);
         }
         send(&mut e, 41, 4, 7);
         assert_eq!((logs(), e.syslog_unknown.len()), (2, SYSLOG_UNKNOWN_MAX));
-        assert!(!live.read().unwrap().by_hash_id.contains_key(&hex::encode([4u8; 8])));
+        assert!(!live.read().unwrap().by_hash_id.contains_key(&u64::from_be_bytes([4; 8])));
         std::fs::remove_dir_all(&dir).ok();
     }
 

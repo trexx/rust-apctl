@@ -88,28 +88,18 @@ fn value(s: &str) -> (usize, Option<char>) {
 
 const HEADER: usize = 29;
 
-/// The sender's `hash_id` (16 hex characters) of an encrypted datagram.
-pub fn hash_id(datagram: &[u8]) -> Option<String> {
-    (datagram.starts_with(&MAGIC) && datagram.len() >= 17).then(|| hex::encode(&datagram[9..17]))
+/// The sender's `hash_id` of an encrypted datagram, as a number (shown as 16
+/// hex characters, as the AP's informs carry it: see [`parse_hash_id`]).
+pub fn hash_id(datagram: &[u8]) -> Option<u64> {
+    (datagram.starts_with(&MAGIC) && datagram.len() >= 17).then(|| u64::from_be_bytes(datagram[9..17].try_into().expect("8 bytes")))
 }
 
-/// Decrypts or passes through one datagram. `lookup` maps a hash_id to the
-/// device and its syslog key.
-pub fn open(datagram: &[u8], lookup: impl Fn(&str) -> Option<(Mac, [u8; 32])>) -> Result<(Option<Mac>, String)> {
-    if !datagram.starts_with(&MAGIC) {
-        return Ok((None, String::from_utf8_lossy(datagram).into_owned()));
-    }
-    if datagram.len() < HEADER + 16 {
-        bail!("encrypted syslog datagram too short ({} bytes)", datagram.len());
-    }
-    let hash_id = hex::encode(&datagram[9..17]);
-    let (mac, key) = lookup(&hash_id).ok_or_else(|| anyhow!("no syslog key for hash_id {hash_id}"))?;
-    Ok((Some(mac), decrypt(datagram, mac, &key)?))
-}
-
-/// Decrypts an encrypted datagram with `mac`'s syslog key.
-pub fn decrypt(datagram: &[u8], mac: Mac, key: &[u8; 32]) -> Result<String> {
-    decrypt_with(datagram, mac, &Aes256Gcm::new(key.into()))
+/// A `hash_id` as an AP's informs carry it, as [`hash_id`] reads it from the
+/// AP's datagrams.
+pub fn parse_hash_id(hex: &str) -> Option<u64> {
+    let mut b = [0u8; 8];
+    hex::decode_to_slice(hex, &mut b).ok()?;
+    Some(u64::from_be_bytes(b))
 }
 
 /// Decrypts an encrypted datagram with `mac`'s cipher (see [`Ciphers`]).
@@ -120,7 +110,8 @@ pub fn decrypt_with(datagram: &[u8], mac: Mac, cipher: &Aes256Gcm) -> Result<Str
     let plain = cipher
         .decrypt(&Nonce::try_from(&datagram[17..29]).expect("12 bytes"), Payload { msg: &datagram[HEADER..], aad: &datagram[..HEADER] })
         .map_err(|_| anyhow!("syslog decryption failed for {mac}"))?;
-    Ok(String::from_utf8_lossy(&plain).into_owned())
+    // Valid UTF-8 (the usual case) is taken as it is, not copied.
+    Ok(String::from_utf8(plain).unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned()))
 }
 
 /// The ciphers of every syslog key known (`adopt::syslog_keys`: the settings'
@@ -162,7 +153,7 @@ impl Ciphers {
 /// Splits a syslog message into priority, program and text. Handles
 /// `<PRI>` prefixes and BSD-style `Mon dd hh:mm:ss host prog[pid]: msg`
 /// headers, and falls back to the raw text.
-pub fn parse(ts: Ts, src_ip: String, device_mac: Option<Mac>, raw: &str) -> LogLine {
+pub fn parse(ts: Ts, src_ip: &str, device_mac: Option<Mac>, raw: &str) -> LogLine {
     let mut rest = raw.trim_end_matches(['\n', '\r', '\0']);
     let mut facility = None;
     let mut severity = None;
@@ -202,7 +193,7 @@ pub fn parse(ts: Ts, src_ip: String, device_mac: Option<Mac>, raw: &str) -> LogL
             program = Some(head.split('[').next().unwrap_or(head).to_string());
             rest = msg;
         }
-    LogLine { ts, device_mac, src_ip, facility, severity, program, msg: redact(rest.trim()) }
+    LogLine { ts, device_mac, src_ip: src_ip.to_string(), facility, severity, program, msg: redact(rest.trim()) }
 }
 
 #[cfg(test)]
@@ -227,13 +218,14 @@ pub(crate) mod tests {
         let mac: Mac = "02:00:00:00:00:01".parse().unwrap();
         let key = [7u8; 32];
         let dgram = seal([1, 2, 3, 4, 5, 6, 7, 8], key, "<14>hostapd: wifi1ap0: STA aa:bb AUTHENTICATED");
-        let lookup = |h: &str| (h == "0102030405060708").then_some((mac, key));
-        let (m, text) = open(&dgram, lookup).unwrap();
-        assert_eq!(m, Some(mac));
+        assert_eq!(hash_id(&dgram), parse_hash_id("0102030405060708"));
+        assert_eq!(hash_id(&dgram).map(|h| format!("{h:016x}")).as_deref(), Some("0102030405060708"));
+        assert_eq!((parse_hash_id("0102030405060708"), parse_hash_id("01020304050607"), parse_hash_id("010203040506070g")), (Some(0x0102030405060708), None, None));
+        let text = decrypt_with(&dgram, mac, &Aes256Gcm::new(&key.into())).unwrap();
         assert!(text.starts_with("<14>hostapd"));
-        assert!(open(&dgram, |_| Some((mac, [8u8; 32]))).is_err(), "wrong key");
-        assert!(open(&dgram, |_| None).is_err(), "unknown device");
-        assert_eq!(open(b"plain text", lookup).unwrap(), (None, "plain text".to_string()));
+        assert!(decrypt_with(&dgram, mac, &Aes256Gcm::new(&[8u8; 32].into())).is_err(), "wrong key");
+        assert!(decrypt_with(b"plain text", mac, &Aes256Gcm::new(&key.into())).is_err());
+        assert_eq!(hash_id(b"plain text"), None);
     }
 
     #[test]
@@ -286,28 +278,28 @@ pub(crate) mod tests {
 
     #[test]
     fn parses_common_syslog_shapes() {
-        let l = parse(1, "ip".into(), None, "<30>Oct 12 19:45:01 U6-Mesh hostapd[123]: wifi1ap0: STA connected\n");
+        let l = parse(1, "ip", None, "<30>Oct 12 19:45:01 U6-Mesh hostapd[123]: wifi1ap0: STA connected\n");
         assert_eq!((l.facility, l.severity), (Some(3), Some(6)));
         assert_eq!(l.program.as_deref(), Some("hostapd"));
         assert_eq!(l.msg, "wifi1ap0: STA connected");
-        let l = parse(1, "ip".into(), None, "<14>kernel: [12.3] something");
+        let l = parse(1, "ip", None, "<14>kernel: [12.3] something");
         assert_eq!(l.program.as_deref(), Some("kernel"));
         // The shape UniFi APs (U6-Mesh, 8.8.11) actually send.
-        let l = parse(1, "ip".into(), None, "<14>Oct 12 21:41:29 ap-name 020000000001,U6-Mesh-8.8.11+20161: mcad[3443]: wireless_agg_stats.log_sta_anomalies(): x");
+        let l = parse(1, "ip", None, "<14>Oct 12 21:41:29 ap-name 020000000001,U6-Mesh-8.8.11+20161: mcad[3443]: wireless_agg_stats.log_sta_anomalies(): x");
         assert_eq!((l.facility, l.severity), (Some(1), Some(6)));
         assert_eq!(l.program.as_deref(), Some("mcad"));
         assert_eq!(l.msg, "wireless_agg_stats.log_sta_anomalies(): x");
-        let l = parse(1, "ip".into(), None, "<14>mcad: ace_reporter.reporter_save_config(): authkey: 0123456789abcdef0123456789abcdef");
+        let l = parse(1, "ip", None, "<14>mcad: ace_reporter.reporter_save_config(): authkey: 0123456789abcdef0123456789abcdef");
         assert_eq!(l.msg, "ace_reporter.reporter_save_config(): authkey: <redacted>");
         assert_eq!(redact("x_passphrase=hunter2, psk:abc; channel=36"), "x_passphrase=<redacted>, psk:<redacted>; channel=36");
         // Only a real priority is read as one.
         for bad in ["<-1>kernel: x", "<+5>kernel: x", "<192>kernel: x", "<0000>kernel: x", "<>kernel: x", "<256>kernel: x"] {
-            let l = parse(1, "ip".into(), None, bad);
+            let l = parse(1, "ip", None, bad);
             assert_eq!((l.facility, l.severity), (None, None), "{bad}");
         }
-        let l = parse(1, "ip".into(), None, "<191>x");
+        let l = parse(1, "ip", None, "<191>x");
         assert_eq!((l.facility, l.severity), (Some(23), Some(7)));
-        let l = parse(1, "ip".into(), None, "free text without a program");
+        let l = parse(1, "ip", None, "free text without a program");
         assert_eq!((l.program, l.msg.as_str()), (None, "free text without a program"));
     }
 }

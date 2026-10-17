@@ -377,7 +377,7 @@ mod tests {
 
     /// A netconsole line from the AP: no priority, and the kernel's text as it is.
     fn netconsole(ts: Ts, raw: &str) -> LogLine {
-        crate::syslog::parse(ts, "192.168.1.6".into(), AP.parse().ok(), raw)
+        crate::syslog::parse(ts, "192.168.1.6", AP.parse().ok(), raw)
     }
 
     #[test]
