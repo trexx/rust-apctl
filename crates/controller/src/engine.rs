@@ -1295,7 +1295,8 @@ impl Engine {
         let ours: Vec<(Mac, u64)> = self.live.read().unwrap().devices.keys().map(|m| (*m, num(m))).collect();
         for n in flagged {
             let Ok(b) = n.bssid.parse::<Mac>().map(|m| num(&m)) else { continue };
-            let Some((ap, _)) = ours.iter().find(|(_, x)| x.abs_diff(b) <= 16) else { continue };
+            // The nearest of our APs within 16 addresses: each AP's BSSIDs are its MAC plus a little.
+            let Some((ap, _)) = ours.iter().filter(|(_, x)| x.abs_diff(b) <= 16).min_by_key(|(_, x)| x.abs_diff(b)) else { continue };
             if self.isolated.get(ap).is_some_and(|t| ts - t < 3600) {
                 continue;
             }
@@ -2082,6 +2083,38 @@ mod tests {
             .read(Db::Metrics, |c| Ok(c.query_row("SELECT tx_pps, rx_pps, rx_bytes_ps, clients FROM mcast_stats WHERE ts = 10 AND type = 'mdns'", [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?))
             .unwrap();
         assert_eq!(row, (10.0, 5.0, 500.0, 1.0));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn an_isolated_beacon_is_blamed_on_the_nearest_ap() {
+        let mut h = harness();
+        let (a, b) = ("02:00:00:00:00:10", "02:00:00:00:00:18");
+        h.engine.handle(Input::Inform { ts: 0, peer: "x".into(), decoded: decoded(inform(a, 1000, &[])) });
+        h.engine.handle(Input::Inform { ts: 1, peer: "x".into(), decoded: decoded(inform(b, 1000, &[])) });
+        // A heard B's BSSID flagged isolated; A's own MAC is within 16 of it too.
+        let mut p = inform(a, 1002, &[]);
+        p["radio_table"] = json!([{ "radio": "na", "scan_table": [{ "bssid": "02:00:00:00:00:1a", "is_isolated": true, "signal": -70 }] }]);
+        h.engine.handle(Input::Inform { ts: 2, peer: "x".into(), decoded: decoded(p) });
+        let blamed: Vec<_> = std::iter::from_fn(|| h.rx.try_recv().ok())
+            .filter_map(|m| match m { LiveMsg::Event(e) if e.kind == EventKind::ApIsolated => Some(e.device_mac), _ => None })
+            .collect();
+        assert_eq!(blamed, [b.parse().ok()]);
+    }
+
+    #[test]
+    fn captured_informs_are_stored_without_a_failing_write() {
+        use crate::model::tests::{fixture, fixtures};
+        let Some(_) = fixtures() else { return };
+        let (writer, store) = store::capture();
+        let (tx, _rx) = broadcast::channel(1024);
+        let mut e = Engine::new(writer, Default::default(), Default::default(), tx);
+        // Twice each, so the second inform's rows are compared with the first's.
+        for (ts, name) in [(0, "000001_020000000001_inform"), (1, "000003_020000000002_inform"), (100, "000001_020000000001_inform"), (101, "000003_020000000002_inform")] {
+            e.handle(Input::Inform { ts, peer: "x".into(), decoded: decoded(fixture(name)) });
+        }
+        let dir = std::env::temp_dir().join(format!("apctl-fixture-writes-{}-{}", std::process::id(), rand_suffix()));
+        assert_eq!(store(&dir).unwrap(), 0);
         std::fs::remove_dir_all(&dir).ok();
     }
 
