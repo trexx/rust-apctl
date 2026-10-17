@@ -136,8 +136,8 @@ struct Tracker {
     ports: Vec<u16>,
     udp_ports: Vec<u16>,
     conns: HashMap<ConnId, Conn>,
-    /// Capture time of the last sweep for idle connections.
-    last_sweep: Micros,
+    /// When idle connections were last swept.
+    sweeper: Sweeper,
 }
 
 #[derive(Default)]
@@ -167,9 +167,28 @@ impl Conn {
     }
 }
 
-/// Connections tracked beyond which idle ones are swept, at most once per `SWEEP_EVERY` of capture time.
-const SWEEP_ABOVE: usize = 256;
+/// Entries in a map of connections (here, and the requests waiting in `exchange`) beyond
+/// which stale ones are swept, at most once per `SWEEP_EVERY` of capture time: not on
+/// every packet, which would scan the whole map each time.
+pub(crate) const SWEEP_ABOVE: usize = 256;
 const SWEEP_EVERY: Micros = 10_000_000;
+
+/// When a map of connections was last swept.
+#[derive(Default)]
+pub(crate) struct Sweeper {
+    pub(crate) last: Micros,
+}
+
+impl Sweeper {
+    /// Whether a map of `len` entries is due for a sweep at `ts`; if it is, the sweep counts as done.
+    pub(crate) fn due(&mut self, len: usize, ts: Micros) -> bool {
+        let due = len > SWEEP_ABOVE && ts.abs_diff(self.last) >= SWEEP_EVERY as u64;
+        if due {
+            self.last = ts;
+        }
+        due
+    }
+}
 /// Most connections tracked at once. An AP keeps one open, so this is far more than
 /// any site has; it bounds what packets with made-up addresses can make us hold.
 const MAX_CONNS: usize = 16_384;
@@ -184,7 +203,7 @@ const CLOSED_LINGER: Micros = 2_000_000;
 
 impl Tracker {
     fn new(ports: Vec<u16>, udp_ports: Vec<u16>) -> Self {
-        Tracker { ports, udp_ports, conns: HashMap::new(), last_sweep: 0 }
+        Tracker { ports, udp_ports, conns: HashMap::new(), sweeper: Sweeper::default() }
     }
 
     fn packet(&mut self, linktype: Linktype, ts: Micros, data: &[u8], on_event: &mut impl FnMut(HttpEvent)) {
@@ -230,8 +249,7 @@ impl Tracker {
         conn.last_seen = ts;
         conn.carried |= !tcp.payload().is_empty();
         let half = if to_server { &mut conn.to_server } else { &mut conn.to_client };
-        half.segment(ts, tcp.sequence_number(), tcp.syn(), tcp.payload());
-        half.fin |= tcp.fin();
+        half.segment(ts, tcp.sequence_number(), tcp.syn(), tcp.fin(), tcp.payload());
 
         while let Some(msg) = half.take_http(to_server) {
             on_event(match msg {
@@ -251,10 +269,9 @@ impl Tracker {
         self.sweep(ts);
     }
 
-    /// Forgets idle connections. Not on every packet: that would scan the whole map each time.
+    /// Forgets idle connections, when a sweep is due.
     fn sweep(&mut self, ts: Micros) {
-        if self.conns.len() > SWEEP_ABOVE && ts.abs_diff(self.last_sweep) >= SWEEP_EVERY as u64 {
-            self.last_sweep = ts;
+        if self.sweeper.due(self.conns.len(), ts) {
             self.conns.retain(|_, c| ts - c.last_seen < c.max_idle());
         }
     }
@@ -265,7 +282,7 @@ impl Tracker {
     /// cost no more than that, and a real connection that is forgotten picks up again
     /// at its next message.
     fn make_room(&mut self, ts: Micros) {
-        self.last_sweep = ts;
+        self.sweeper.last = ts;
         self.conns.retain(|_, c| ts - c.last_seen < c.max_idle());
         if self.conns.len() > MAX_CONNS - MAX_CONNS / 8 {
             let mut order: Vec<(bool, Micros)> = self.conns.values().map(|c| (c.carried, c.last_seen)).collect();
@@ -292,8 +309,9 @@ struct HalfStream {
     /// dropped only once they are most of the buffer: dropping them after each
     /// message would move the rest of the buffer every time.
     consumed: usize,
-    /// A FIN was seen.
-    fin: bool,
+    /// The stream position of a FIN that was seen: the end of the stream. It may arrive
+    /// ahead of the last bytes, so the stream is closed only once `pos` reaches it.
+    fin_at: Option<i64>,
 }
 
 /// How much may wait behind a gap before the missing bytes are given up on.
@@ -314,16 +332,20 @@ const MAX_HEAD: usize = 64 << 10;
 const MAX_CHUNKS: usize = 4096;
 
 impl HalfStream {
-    fn segment(&mut self, ts: Micros, seq: u32, syn: bool, payload: &[u8]) {
+    fn segment(&mut self, ts: Micros, seq: u32, syn: bool, fin: bool, payload: &[u8]) {
         if syn {
             *self = HalfStream { next_seq: Some(seq.wrapping_add(1)), ..HalfStream::default() };
             return;
         }
+        // Where the segment lies in the stream (where we are, for the first one seen).
+        let at = self.pos + self.next_seq.map_or(0, |next| i64::from(seq.wrapping_sub(next) as i32));
+        if fin {
+            self.fin_at.get_or_insert(at + payload.len() as i64);
+        }
         if payload.is_empty() {
             return;
         }
-        let next = *self.next_seq.get_or_insert(seq);
-        let at = self.pos + i64::from(seq.wrapping_sub(next) as i32);
+        self.next_seq.get_or_insert(seq);
         if at > self.pos {
             match self.pending.entry(at) {
                 Entry::Vacant(e) => {
@@ -384,7 +406,7 @@ impl HalfStream {
 
     /// Closed by its sender with every byte received.
     fn closed(&self) -> bool {
-        self.fin && self.pending.is_empty()
+        self.fin_at.is_some_and(|fin_at| self.pos >= fin_at) && self.pending.is_empty()
     }
 
     /// Frees the buffers but keeps `next_seq`.
@@ -520,6 +542,11 @@ fn parse_http(buf: &[u8], request: bool, closed: bool) -> ParseResult {
             None if closed => rest.len(),
             None => return ParseResult::Partial,
         };
+        // A message that could not fit the buffer would stall the stream until the buffer
+        // is cleared, losing the messages behind it: skip it, as an oversized chunk.
+        if len > MAX_BUFFER.saturating_sub(head_len) {
+            return ParseResult::Garbage;
+        }
         if rest.len() < len {
             return ParseResult::Partial;
         }
@@ -615,25 +642,25 @@ mod tests {
     #[test]
     fn reassembles_out_of_order_and_duplicate_segments() {
         let mut h = HalfStream::default();
-        h.segment(0, 100, true, b"");
-        h.segment(0, 101, false, b"hello ");
-        h.segment(0, 113, false, b"!"); // ahead
-        h.segment(0, 101, false, b"hello "); // duplicate
-        h.segment(0, 107, false, b"world "); // fills the gap
+        h.segment(0, 100, true, false, b"");
+        h.segment(0, 101, false, false, b"hello ");
+        h.segment(0, 113, false, false, b"!"); // ahead
+        h.segment(0, 101, false, false, b"hello "); // duplicate
+        h.segment(0, 107, false, false, b"world "); // fills the gap
         assert_eq!(h.buf, b"hello world !");
         assert_eq!((h.pending_bytes, h.gap_since), (0, None));
         // A new connection on the same addresses starts open.
-        h.fin = true;
-        h.segment(0, 9000, true, b"");
+        h.fin_at = Some(h.pos);
+        h.segment(0, 9000, true, false, b"");
         assert!(!h.closed() && h.buf.is_empty());
         // Sequence numbers that wrap around, out of order.
         let mut h = HalfStream::default();
-        h.segment(0, u32::MAX - 4, true, b"");
-        h.segment(0, 2, false, b"cd");
-        h.segment(0, 1, false, b"b");
-        h.segment(0, u32::MAX - 3, false, b"aaaa");
+        h.segment(0, u32::MAX - 4, true, false, b"");
+        h.segment(0, 2, false, false, b"cd");
+        h.segment(0, 1, false, false, b"b");
+        h.segment(0, u32::MAX - 3, false, false, b"aaaa");
         assert_eq!(h.buf, b"aaaa");
-        h.segment(0, 0, false, b"_");
+        h.segment(0, 0, false, false, b"_");
         assert_eq!((&h.buf[..], h.pending.len(), h.next_seq), (&b"aaaa_bcd"[..], 0, Some(4)));
     }
 
@@ -642,32 +669,32 @@ mod tests {
         let msg = |body: &str| format!("POST /inform HTTP/1.1\r\nContent-Length: {}\r\n\r\n{body}", body.len()).into_bytes();
         let (first, second) = (msg("lost"), msg("next"));
         let mut h = HalfStream::default();
-        h.segment(0, 99, true, b"");
-        h.segment(0, 100, false, &first[..10]);
+        h.segment(0, 99, true, false, b"");
+        h.segment(0, 100, false, false, &first[..10]);
         // The rest of the first message never shows up; the second one queues behind the gap.
         let at = 100 + first.len() as u32;
-        h.segment(1_000_000, at, false, &second);
+        h.segment(1_000_000, at, false, false, &second);
         assert!(h.take_http(true).is_none());
         // Still waiting while a retransmission may come ...
-        h.segment(5_000_000, at, false, &second);
+        h.segment(5_000_000, at, false, false, &second);
         assert_eq!(h.pending_bytes, second.len(), "the copy is queued once");
         // ... then gives up on it and carries on with the second message.
-        h.segment(12_000_000, at, false, &second);
+        h.segment(12_000_000, at, false, false, &second);
         assert!(matches!(h.take_http(true), Some(Parsed::Request { body, .. }) if body == b"next"));
         assert!(h.take_http(true).is_none());
         assert_eq!((h.pending_bytes, h.gap_since), (0, None));
-        h.segment(12_000_000, at + second.len() as u32, false, &first);
+        h.segment(12_000_000, at + second.len() as u32, false, false, &first);
         assert!(matches!(h.take_http(true), Some(Parsed::Request { body, .. }) if body == b"lost"), "in sync again");
     }
 
     #[test]
     fn pending_bytes_are_bounded() {
         let mut h = HalfStream::default();
-        h.segment(0, 0, true, b"");
-        h.segment(0, 1, false, b"x");
+        h.segment(0, 0, true, false, b"");
+        h.segment(0, 1, false, false, b"x");
         let chunk = vec![b'y'; 60_000];
         for i in 0..200u32 {
-            h.segment(0, 100 + i * 60_000, false, &chunk); // all behind the gap at 2..100
+            h.segment(0, 100 + i * 60_000, false, false, &chunk); // all behind the gap at 2..100
             assert!(h.pending_bytes <= MAX_PENDING_BYTES);
         }
         assert!(h.next_seq.unwrap() > 100, "skipped ahead");
@@ -712,13 +739,29 @@ mod tests {
     }
 
     #[test]
+    fn a_content_length_beyond_the_buffer_is_garbage() {
+        let next = b"POST /inform HTTP/1.1\r\nContent-Length: 2\r\n\r\nok";
+        for len in [MAX_BUFFER, usize::MAX] {
+            let mut buf = format!("POST /inform HTTP/1.1\r\nContent-Length: {len}\r\n\r\nabc").into_bytes();
+            buf.extend_from_slice(next);
+            let mut h = HalfStream { buf, ..Default::default() };
+            assert!(matches!(h.take_http(true), Some(Parsed::Request { body, .. }) if body == b"ok"), "{len}: skipped to the next request");
+            assert!(h.buf.is_empty());
+        }
+        // One that fits, with its head, is waited for.
+        let head = "POST /inform HTTP/1.1\r\nContent-Length: 0000000000\r\n\r\n";
+        let buf = head.replace("0000000000", &format!("{:010}", MAX_BUFFER - head.len())).into_bytes();
+        assert!(matches!(parse_http(&buf, true, false), ParseResult::Partial));
+    }
+
+    #[test]
     fn closed_connections_are_swept_soon_and_idle_ones_later() {
         let mut t = Tracker::new(vec![8080], Vec::new());
         let conn = |port: u16| ConnId { client: SocketAddr::from(([10, 0, 0, 5], port)), server: SocketAddr::from(([10, 0, 0, 1], 8080)) };
         for port in 0..300u16 {
             let mut c = Conn { carried: true, ..Conn::default() };
             if port % 2 == 0 {
-                (c.to_server.fin, c.to_client.fin) = (true, true);
+                (c.to_server.fin_at, c.to_client.fin_at) = (Some(0), Some(0));
             }
             t.conns.insert(conn(port), c);
         }
@@ -746,10 +789,46 @@ mod tests {
         // A response without one runs until the connection closes.
         let mut h = HalfStream { buf: b"HTTP/1.0 200 OK\r\n\r\nall of it".to_vec(), ..Default::default() };
         assert!(h.take_http(false).is_none());
-        h.fin = true;
+        h.fin_at = Some(h.pos);
         assert!(matches!(h.take_http(false), Some(Parsed::Response { status: 200, body }) if body == b"all of it"));
         let mut h = HalfStream { buf: b"HTTP/1.1 204 No Content\r\n\r\n".to_vec(), ..Default::default() };
         assert!(matches!(h.take_http(false), Some(Parsed::Response { status: 204, body }) if body.is_empty()));
+    }
+
+    #[test]
+    fn a_fin_ahead_of_the_last_bytes_waits_for_them() {
+        let (a, b, c) = (&b"HTTP/1.0 200 OK\r\n\r\nall "[..], &b"of "[..], &b"it"[..]);
+        let (b_seq, c_seq) = (1 + a.len() as u32, 1 + (a.len() + b.len()) as u32);
+        let end = c_seq + c.len() as u32;
+        // A bare FIN that overtakes the last two segments.
+        let mut h = HalfStream::default();
+        h.segment(0, 0, true, false, b"");
+        h.segment(0, 1, false, false, a);
+        h.segment(0, end, false, true, b"");
+        assert!(!h.closed());
+        assert!(h.take_http(false).is_none(), "a response without a length is not cut at the early FIN");
+        h.segment(0, c_seq, false, false, c);
+        h.segment(0, end, false, true, b""); // its `-i any` copy
+        assert!(!h.closed());
+        h.segment(0, b_seq, false, false, b);
+        assert!(h.closed());
+        assert!(matches!(h.take_http(false), Some(Parsed::Response { status: 200, body }) if body == b"all of it"));
+        // A FIN on the last data, ahead of the segment before it.
+        let mut h = HalfStream::default();
+        h.segment(0, 0, true, false, b"");
+        h.segment(0, 1, false, false, a);
+        h.segment(0, c_seq, false, true, c);
+        assert!(!h.closed() && h.take_http(false).is_none());
+        h.segment(0, b_seq, false, false, b);
+        assert!(h.closed());
+        assert!(matches!(h.take_http(false), Some(Parsed::Response { status: 200, body }) if body == b"all of it"));
+        // A FIN in order closes at once, as does one that tracking starts at.
+        h.segment(0, 9000, true, false, b"");
+        h.segment(0, 9001, false, true, a);
+        assert!(h.closed());
+        let mut h = HalfStream::default();
+        h.segment(0, 77, false, true, b"");
+        assert!(h.closed());
     }
 
     #[test]
@@ -772,8 +851,8 @@ mod tests {
     fn a_burst_of_pipelined_requests_is_cut_in_linear_time() {
         let one = b"POST /inform HTTP/1.1\r\nContent-Length: 1\r\n\r\nx";
         let mut h = HalfStream::default();
-        h.segment(0, 0, true, b"");
-        h.segment(0, 1, false, &one.repeat(50_000));
+        h.segment(0, 0, true, false, b"");
+        h.segment(0, 1, false, false, &one.repeat(50_000));
         let mut n = 0;
         while let Some(Parsed::Request { body, .. }) = h.take_http(true) {
             assert_eq!(body, b"x");
@@ -791,10 +870,10 @@ mod tests {
     #[test]
     fn a_head_that_never_ends_is_given_up_on() {
         let mut h = HalfStream::default();
-        h.segment(0, 0, true, b"");
+        h.segment(0, 0, true, false, b"");
         let mut seq = 1;
         let mut send = |h: &mut HalfStream, data: &[u8]| {
-            h.segment(0, seq, false, data);
+            h.segment(0, seq, false, false, data);
             seq += data.len() as u32;
         };
         send(&mut h, b"POST /inform HTTP/1.1\r\nX-Long: ");

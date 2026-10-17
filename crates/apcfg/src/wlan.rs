@@ -141,6 +141,12 @@ pub fn ap_groups<'a>(ctx: &Ctx<'a>) -> Vec<&'a str> {
         .collect()
 }
 
+/// Whether a document scoped to AP groups (a WLAN, an mDNS entry) names one of `groups`,
+/// the AP's (see [`ap_groups`]), in its `ap_group_ids`.
+pub fn in_groups(doc: &Value, groups: &[&str]) -> bool {
+    arr(doc, "ap_group_ids").iter().filter_map(Value::as_str).any(|g| groups.contains(&g))
+}
+
 /// Sets a field of the WLAN, copying the document first if it is still the original.
 /// A field that already has the value leaves the document alone (most WPA3, open and
 /// enterprise WLANs already hold the values `adapt` writes).
@@ -229,7 +235,7 @@ pub fn deploy<'a>(ctx: &Ctx<'a>, radios: &[Radio]) -> Vec<(Cow<'a, Value>, usize
     let wlans: Vec<&'a Value> = ctx
         .site_docs("wlanconf")
         .filter(|w| flag(w, "enabled", true))
-        .filter(|w| str_list(w, "ap_group_ids").iter().any(|g| groups.iter().any(|m| m == g)))
+        .filter(|w| in_groups(w, &groups))
         .collect();
     let mut out = Vec::new();
     for (ri, radio) in radios.iter().enumerate() {
@@ -433,11 +439,12 @@ fn radius_servers(c: &mut Cfg, ctx: &Ctx, w: &Value, k: Prefix) {
     }
 }
 
-/// WEP key as hex plus the key type (`wep64`, `wep128`, otherwise `aes128`).
+/// WEP key as hex plus the key type (`wep64`, `wep128`, otherwise `aes128`). A 5- or 13-character key is
+/// an ASCII passphrase and is always hex-encoded, even when it looks like hex; the official controller
+/// does the same, and sends the placeholder "wrong" (so hex-encoded too) when no key is set.
 fn wep_key(w: &Value) -> (String, &'static str) {
-    let key = str_of(w, "x_wep").unwrap_or_default();
-    let is_hex = key.chars().all(|ch| ch.is_ascii_hexdigit());
-    let hex = if !is_hex && (key.len() == 5 || key.len() == 13) {
+    let key = str_of(w, "x_wep").unwrap_or("wrong");
+    let hex = if key.len() == 5 || key.len() == 13 {
         key.bytes().fold(String::with_capacity(2 * key.len()), |mut hex, b| {
             let _ = write!(hex, "{b:02x}");
             hex
@@ -563,7 +570,7 @@ pub fn render_vap(c: &mut Cfg, ctx: &Ctx, radios: &[Radio], vaps: &[Vap], i: usi
                     c.set(a.at("sae.sync"), x);
                 }
                 let groups = arr(w, "sae_groups");
-                    for (gi, g) in groups.iter().enumerate() {
+                for (gi, g) in groups.iter().enumerate() {
                     c.opt(format_args!("{a}sae.groups.{}.group", gi + 1), as_text(g));
                 }
                 if !groups.is_empty() {
@@ -958,6 +965,17 @@ mod schedule_tests {
         let b = blackout_blocks(&w);
         assert_eq!((b[1].clone(), b[2].len()), (vec![(1380, 1440)], 0));
         assert_eq!(lines(&w, true, false), vec!["wireless.1.schedule_invert=enabled", "wireless.1.schedule_mon=2300-2359"]);
+    }
+
+    #[test]
+    fn wep_keys_of_5_or_13_characters_are_always_hex_encoded() {
+        let key = |w: Value| wep_key(&w);
+        assert_eq!(key(json!({ "x_wep": "abcde" })), ("6162636465".to_string(), "wep64"), "hex-looking, but a passphrase");
+        assert_eq!(key(json!({ "x_wep": "12345" })), ("3132333435".to_string(), "wep64"));
+        assert_eq!(key(json!({ "x_wep": "0123456789abc" })), ("30313233343536373839616263".to_string(), "wep128"));
+        assert_eq!(key(json!({ "x_wep": "0123456789" })), ("0123456789".to_string(), "wep64"), "10 characters are hex already");
+        assert_eq!(key(json!({ "x_wep": "0123456789abcdef0123456789" })).1, "wep128");
+        assert_eq!(key(json!({})), ("77726f6e67".to_string(), "wep64"), "a missing key is \"wrong\"");
     }
 
     #[test]

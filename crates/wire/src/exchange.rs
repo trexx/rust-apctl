@@ -6,7 +6,7 @@ use std::net::{IpAddr, SocketAddr};
 use anyhow::Result;
 use inform::Mac;
 
-use crate::capture::{ConnId, HttpEvent, Micros};
+use crate::capture::{ConnId, HttpEvent, Micros, Sweeper};
 use crate::decode::{Decoded, decode};
 use crate::keys::KeyStore;
 
@@ -27,13 +27,9 @@ enum Pending {
     Other,
 }
 
-/// Connections with requests in flight beyond which stale ones are forgotten.
-const MAX_IN_FLIGHT: usize = 256;
 /// How long a request may wait for its response before it is forgotten (a
 /// response the capture missed, a connection that died).
 const MAX_WAIT: Micros = 300_000_000;
-/// Stale requests are looked for at most this often (capture time), not on every new connection.
-const SWEEP_EVERY: Micros = 10_000_000;
 /// Requests kept waiting per connection; older ones are taken to have lost their responses.
 const MAX_QUEUED: usize = 32;
 
@@ -43,13 +39,14 @@ pub struct Pairer {
     /// with the time of the latest one. A connection leaves the map when its queue
     /// empties, so a long-running shadow mode does not keep one entry per connection.
     in_flight: HashMap<ConnId, (Micros, VecDeque<Pending>)>,
-    last_sweep: Micros,
+    /// Stale requests are looked for when a new connection makes the map too big, at most
+    /// so often (see `capture::SWEEP_ABOVE`).
+    sweeper: Sweeper,
 }
 
 impl Pairer {
     fn push(&mut self, conn: ConnId, ts: Micros, p: Pending) {
-        if self.in_flight.len() >= MAX_IN_FLIGHT && ts.abs_diff(self.last_sweep) >= SWEEP_EVERY as u64 && !self.in_flight.contains_key(&conn) {
-            self.last_sweep = ts;
+        if !self.in_flight.contains_key(&conn) && self.sweeper.due(self.in_flight.len() + 1, ts) {
             self.in_flight.retain(|_, (last, _)| ts - *last < MAX_WAIT);
         }
         let (last, queue) = self.in_flight.entry(conn).or_default();
@@ -126,6 +123,7 @@ fn forwarded_ip(header: &str) -> Option<IpAddr> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::capture::SWEEP_ABOVE;
     use std::net::SocketAddr;
 
     fn conn(port: u16) -> ConnId {
@@ -153,14 +151,14 @@ mod tests {
         for port in 0..1000 {
             p.handle(&keys, get(conn(port), Micros::from(port) * 10_000_000));
         }
-        assert!(p.in_flight.len() <= MAX_IN_FLIGHT + 1, "{}", p.in_flight.len());
+        assert!(p.in_flight.len() <= SWEEP_ABOVE + 1, "{}", p.in_flight.len());
         // Many live connections at once: the map is not rescanned for every new one.
         let mut p = Pairer::default();
         for port in 0..1000 {
             p.handle(&keys, get(conn(port), 20_000_000 + Micros::from(port)));
         }
         assert_eq!(p.in_flight.len(), 1000);
-        assert_eq!(p.last_sweep, 20_000_000 + Micros::from(MAX_IN_FLIGHT as u16), "one sweep, when the map filled up");
+        assert_eq!(p.sweeper.last, 20_000_000 + Micros::from(SWEEP_ABOVE as u16), "one sweep, when the map filled up");
     }
 
     fn sealed(mac: &str, json: &str) -> Vec<u8> {

@@ -569,7 +569,7 @@ fn mdns(c: &mut Cfg, ctx: &Ctx, vaps: &[Vap], net: &Net) {
     let applies = |e: &Value| match str_of(e, "ap_scope_mode").unwrap_or("all") {
         "all" => true,
         "specific" => str_list(e, "ap_macs").iter().any(|m| mac_eq(m, &ctx.mac)),
-        "group" => str_list(e, "ap_group_ids").iter().any(|g| groups.iter().any(|m| m == g)),
+        "group" => wlan::in_groups(e, &groups),
         _ => false,
     };
     // One VAP per WLAN stands for all of its radios.

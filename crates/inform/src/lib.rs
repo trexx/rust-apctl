@@ -108,10 +108,21 @@ impl serde::Serialize for Mac {
     }
 }
 
+/// Read from any of the string forms [`FromStr`](std::str::FromStr) accepts, borrowed or
+/// not, without copying it.
 impl<'de> serde::Deserialize<'de> for Mac {
     fn deserialize<D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
-        let s = <std::borrow::Cow<'de, str>>::deserialize(d)?;
-        s.parse().map_err(serde::de::Error::custom)
+        struct MacVisitor;
+        impl serde::de::Visitor<'_> for MacVisitor {
+            type Value = Mac;
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("a MAC address")
+            }
+            fn visit_str<E: serde::de::Error>(self, s: &str) -> std::result::Result<Mac, E> {
+                s.parse().map_err(E::custom)
+            }
+        }
+        d.deserialize_str(MacVisitor)
     }
 }
 
@@ -446,6 +457,17 @@ mod tests {
         ] {
             assert!(bad.parse::<Mac>().is_err(), "{bad}");
         }
+    }
+
+    #[test]
+    fn mac_deserializes_from_borrowed_and_owned_strings() {
+        use serde::Deserialize;
+        use serde::de::IntoDeserializer;
+        use serde::de::value::{BorrowedStrDeserializer, Error};
+        assert_eq!(Mac::deserialize(BorrowedStrDeserializer::<Error>::new("00:11:22:33:44:55")), Ok(MAC));
+        assert_eq!(Mac::deserialize(IntoDeserializer::<Error>::into_deserializer("00-11-22-33-44-55".to_string())), Ok(MAC));
+        assert!(Mac::deserialize(IntoDeserializer::<Error>::into_deserializer("00:11")).is_err());
+        assert!(Mac::deserialize(IntoDeserializer::<Error>::into_deserializer(5u32)).is_err());
     }
 
     #[test]

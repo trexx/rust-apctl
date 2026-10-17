@@ -24,13 +24,14 @@
 
 mod cfg;
 mod javahash;
-pub mod json;
+mod json;
 mod meta;
 mod mgmt;
 mod net;
 mod system;
 pub mod tz;
 
+pub use json::oid;
 pub use system::MDNS_SERVICES;
 mod wlan;
 

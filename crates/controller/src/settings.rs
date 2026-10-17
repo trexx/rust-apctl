@@ -16,7 +16,7 @@ use std::sync::{Arc, LazyLock};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use apcfg::json::oid;
+use apcfg::oid;
 
 use crate::api::{ApiError, AppState};
 

@@ -121,10 +121,7 @@ pub fn render_vlan(c: &mut Cfg, net: &Net) {
 
 pub fn render_bridge(c: &mut Cfg, net: &Net, meta: &mut Meta) {
     c.header("bridge");
-    if net.bridges.is_empty() {
-        c.set("bridge.status", "disabled");
-        return;
-    }
+    // There is always the untagged bridge.
     c.set("bridge.status", "enabled");
     let names: Vec<&str> = net.bridges.iter().map(|b| b.name.as_str()).collect();
     let indices = meta.bridges(&names);

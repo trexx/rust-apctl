@@ -7,6 +7,8 @@
 //! bucket in insertion order (resizing keeps the relative order of the entries that stay
 //! together). Treeified buckets (8+ collisions in a table of 64+) are not modelled.
 
+use std::collections::HashSet;
+
 /// `String.hashCode()` over UTF-16 code units.
 fn string_hash(s: &str) -> u32 {
     s.encode_utf16().fold(0u32, |h, c| h.wrapping_mul(31).wrapping_add(u32::from(c)))
@@ -15,12 +17,8 @@ fn string_hash(s: &str) -> u32 {
 /// Deduplicates `items` (first occurrence wins) and returns them in the order a
 /// default-constructed `HashSet` filled one element at a time would iterate them.
 pub fn hash_set_order<S: AsRef<str>>(items: &[S]) -> Vec<&str> {
-    let mut unique: Vec<&str> = Vec::new();
-    for s in items {
-        if !unique.contains(&s.as_ref()) {
-            unique.push(s.as_ref());
-        }
-    }
+    let mut seen = HashSet::with_capacity(items.len());
+    let mut unique: Vec<&str> = items.iter().map(AsRef::as_ref).filter(|s| seen.insert(*s)).collect();
     // Default capacity 16, load factor 0.75: the table doubles once size exceeds 3/4.
     let mut capacity = 16usize;
     while unique.len() * 4 > capacity * 3 {
@@ -30,7 +28,7 @@ pub fn hash_set_order<S: AsRef<str>>(items: &[S]) -> Vec<&str> {
         let h = string_hash(s);
         ((h ^ (h >> 16)) as usize) & (capacity - 1)
     };
-    unique.sort_by_key(|s| bucket(s)); // stable: insertion order within a bucket
+    unique.sort_by_cached_key(|s| bucket(s)); // stable: insertion order within a bucket
     unique
 }
 
@@ -44,6 +42,8 @@ mod tests {
         // value the official controller sent for it.
         let stored = ["2", "3", "4", "5", "7", "8", "9", "10", "12", "13", "14"];
         assert_eq!(hash_set_order(&stored).join(","), "12,2,13,3,14,4,5,7,8,9,10");
+        // Duplicates are dropped, the first one kept.
+        assert_eq!(hash_set_order(&["13", "2", "13", "12", "2"]).join(","), "12,13,2");
     }
 
     #[test]
