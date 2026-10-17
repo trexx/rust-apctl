@@ -39,6 +39,8 @@ const MCAST_TYPES: Record<string, [short: string, long: string]> = {
   other: ["Other", "Other"],
 };
 
+const TYPE_ORDER = Object.keys(MCAST_TYPES);
+
 /** A multicast traffic type's name, short or long. */
 export const mcastLabel = (type: string, long = false) =>
   MCAST_TYPES[type]?.[long ? 1 : 0] ?? type;
@@ -86,9 +88,19 @@ function MulticastView({
   dir: "tx" | "rx";
   setDir: (d: "tx" | "rx") => void;
 }) {
+  // The chart's series keep a fixed order (MCAST_TYPES', then any unknown
+  // type by name), so a change in the ranking pushes new data instead of
+  // rebuilding the chart; only the legend below is ranked by count.
+  const order = (k: string) => {
+    const i = TYPE_ORDER.indexOf(k);
+    return i < 0 ? TYPE_ORDER.length : i;
+  };
   const kinds = Object.entries(data.types)
     .filter(([, v]) => v.tx_pkts + v.rx_pkts > 0)
-    .sort((a, b) => b[1][`${dir}_pkts`] - a[1][`${dir}_pkts`]);
+    .sort(([a], [b]) => order(a) - order(b) || a.localeCompare(b));
+  const ranked = [...kinds].sort(
+    (a, b) => b[1][`${dir}_pkts`] - a[1][`${dir}_pkts`],
+  );
   return (
     <div className="panel">
       <div className="panel-head">
@@ -119,7 +131,7 @@ function MulticastView({
             />
           </SpanContext.Provider>
           <div className="mcast-types small">
-            {kinds.map(([k, v]) => (
+            {ranked.map(([k, v]) => (
               <span key={k}>
                 <i
                   className="swatch"
