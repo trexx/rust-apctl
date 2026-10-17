@@ -79,6 +79,11 @@ impl Table {
         self.settings.iter().chain(self.gauges).chain(self.counters).copied()
     }
 
+    /// How many values a metric row has: one for every column but `ts`.
+    fn width(&self) -> usize {
+        self.keys.len() + self.texts.len() + self.settings.len() + self.gauges.len() + self.counters.len()
+    }
+
     /// Every column, in the order a metric row's values come in.
     fn columns(&self) -> Vec<&'static str> {
         self.keys.iter().copied().chain(["ts"]).chain(self.texts.iter().copied()).chain(self.numbers()).collect()
@@ -329,13 +334,18 @@ pub enum Write {
     Metric { table: &'static Table, ts: Ts, values: Vec<Value> },
     /// Arbitrary statement against one database.
     Exec { db: Db, sql: &'static str, params: Vec<Value> },
+}
+
+/// What the writer thread is sent.
+enum Msg {
+    Write(Write),
     /// Commit everything queued so far, then answer.
     Flush(Sender<()>),
 }
 
 #[derive(Clone)]
 pub struct Writer {
-    tx: Sender<Write>,
+    tx: Sender<Msg>,
     /// Set when the writer thread has stopped: nothing sent is stored any more.
     stopped: Arc<AtomicBool>,
 }
@@ -343,7 +353,7 @@ pub struct Writer {
 impl Writer {
     pub fn send(&self, w: Write) {
         // Fails only once the writer has stopped, which `stopped` reports.
-        let _ = self.tx.send(w);
+        let _ = self.tx.send(Msg::Write(w));
     }
 
     pub fn exec(&self, db: Db, sql: &'static str, params: Vec<Value>) {
@@ -354,7 +364,7 @@ impl Writer {
     /// they could not be committed in time (or the writer has stopped).
     pub fn flush(&self, timeout: Duration) -> bool {
         let (ack, done) = channel();
-        self.tx.send(Write::Flush(ack)).is_ok() && done.recv_timeout(timeout).is_ok()
+        self.tx.send(Msg::Flush(ack)).is_ok() && done.recv_timeout(timeout).is_ok()
     }
 
     /// True once the writer thread has stopped (an error opening or writing the
@@ -424,7 +434,7 @@ fn open_all(dir: &Path) -> Result<Conns> {
 /// The channel to the writer stays unbounded: the engine and the request
 /// handlers must never block on the disk, and the writer drains a second's
 /// worth of writes per commit, far more than the APs produce.
-fn writer_loop(dir: &Path, rx: Receiver<Write>) -> Result<()> {
+fn writer_loop(dir: &Path, rx: Receiver<Msg>) -> Result<()> {
     let mut conns = open_all(dir)?;
     let mut pending: Vec<Write> = Vec::new();
     let mut acks: Vec<Sender<()>> = Vec::new();
@@ -433,8 +443,8 @@ fn writer_loop(dir: &Path, rx: Receiver<Write>) -> Result<()> {
     let mut last_maintenance = Instant::now().checked_sub(Duration::from_secs(240)).unwrap_or_else(Instant::now);
     loop {
         match rx.recv_timeout(Duration::from_millis(250)) {
-            Ok(Write::Flush(ack)) => acks.push(ack),
-            Ok(w) => pending.push(w),
+            Ok(Msg::Flush(ack)) => acks.push(ack),
+            Ok(Msg::Write(w)) => pending.push(w),
             Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => {
                 flush(&mut conns, &mut pending);
@@ -456,35 +466,44 @@ fn writer_loop(dir: &Path, rx: Receiver<Write>) -> Result<()> {
     }
 }
 
-fn flush(conns: &mut Conns, pending: &mut Vec<Write>) {
+/// Commits the pending writes; returns how many failed.
+fn flush(conns: &mut Conns, pending: &mut Vec<Write>) -> usize {
     let mut by_db: [Vec<Write>; 3] = Default::default();
     for w in pending.drain(..) {
         let db = match &w {
             Write::Metric { .. } => Db::Metrics,
             Write::Exec { db, .. } => *db,
-            Write::Flush(_) => continue,
         };
         by_db[db as usize].push(w);
     }
+    let mut failed = 0;
     for (conn, writes) in conns.iter_mut().zip(by_db) {
         if writes.is_empty() {
             continue;
         }
-        if let Err(e) = apply(conn, writes) {
-            tracing::error!("write batch failed: {e:#}");
+        let n = writes.len();
+        match apply(conn, writes) {
+            Ok(f) => failed += f,
+            Err(e) => {
+                tracing::error!("write batch failed: {e:#}");
+                failed += n;
+            }
         }
     }
+    failed
 }
 
 /// Commits a batch in one transaction. A write that fails (e.g. a constraint)
 /// is logged and skipped; SQLite undoes just that statement, so the rest of
 /// the batch is still stored. Only an error that ends the transaction itself
-/// (disk full, I/O) loses the batch.
-fn apply(conn: &mut Connection, writes: Vec<Write>) -> Result<()> {
+/// (disk full, I/O) loses the batch. Returns how many writes failed.
+fn apply(conn: &mut Connection, writes: Vec<Write>) -> Result<usize> {
     let tx = conn.transaction()?;
     let (mut failed, mut first_error) = (0, None);
     for w in writes {
         let result = match &w {
+            // A row of the wrong length is the engine's mistake: refused, not stored in the wrong columns.
+            Write::Metric { table, values, .. } if values.len() != table.width() => Err(rusqlite::Error::InvalidParameterCount(values.len() + 1, table.width() + 1)),
             Write::Metric { table, ts, values } => {
                 let n_keys = table.keys.len();
                 let ts = Value::Integer(*ts);
@@ -492,7 +511,6 @@ fn apply(conn: &mut Connection, writes: Vec<Write>) -> Result<()> {
                 tx.prepare_cached(table.insert()).and_then(|mut s| s.execute(params_from_iter(params)))
             }
             Write::Exec { sql, params, .. } => tx.prepare_cached(sql).and_then(|mut s| s.execute(params_from_iter(params))),
-            Write::Flush(_) => continue,
         };
         if let Err(e) = result {
             if tx.is_autocommit() {
@@ -502,7 +520,6 @@ fn apply(conn: &mut Connection, writes: Vec<Write>) -> Result<()> {
             first_error.get_or_insert_with(|| match &w {
                 Write::Metric { table, .. } => format!("{}: {e}", table.name),
                 Write::Exec { sql, .. } => format!("{}: {e}", sql.split_whitespace().take(4).collect::<Vec<_>>().join(" ")),
-                Write::Flush(_) => e.to_string(),
             });
         }
     }
@@ -510,7 +527,7 @@ fn apply(conn: &mut Connection, writes: Vec<Write>) -> Result<()> {
     if let Some(e) = first_error {
         tracing::error!("{failed} write(s) failed and were skipped, the first: {e}");
     }
-    Ok(())
+    Ok(failed)
 }
 
 pub fn now_ts() -> Ts {
@@ -694,6 +711,22 @@ pub fn series(conn: &Connection, table: &Table, keys: &[String], from: Ts, to: T
     Ok(Series { tier: ["raw", "5m", "1h"][tier], step, ts: ts_out, fields })
 }
 
+/// A writer whose writes are kept, and a function that stores them in new
+/// databases in a directory and returns how many failed.
+#[cfg(test)]
+pub(crate) fn capture() -> (Writer, impl FnOnce(&Path) -> Result<usize>) {
+    let (tx, rx) = channel();
+    let writer = Writer { tx, stopped: Default::default() };
+    let store = move |dir: &Path| {
+        std::fs::create_dir_all(dir)?;
+        migrate(dir)?;
+        let mut conns = open_all(dir)?;
+        let mut writes = rx.try_iter().filter_map(|m| match m { Msg::Write(w) => Some(w), Msg::Flush(_) => None }).collect();
+        Ok(flush(&mut conns, &mut writes))
+    };
+    (writer, store)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -721,7 +754,7 @@ mod tests {
             values.extend(std::iter::repeat_n(Value::Null, UPLINK.counters.len() - 1));
             writes.push(Write::Metric { table: &UPLINK, ts, values });
         }
-        apply(&mut conns[Db::Metrics as usize], writes).unwrap();
+        assert_eq!(apply(&mut conns[Db::Metrics as usize], writes).unwrap(), 0);
 
         let m = &conns[Db::Metrics as usize];
         let s = series(m, &UPLINK, &["aa".into()], now - 1200, now, 0).unwrap();
@@ -739,7 +772,7 @@ mod tests {
             values.extend(std::iter::repeat_n(Value::Null, UPLINK.counters.len() - 1));
             writes.push(Write::Metric { table: &UPLINK, ts: now - 1200 + i * 10, values });
         }
-        apply(&mut conns[Db::Metrics as usize], writes).unwrap();
+        assert_eq!(apply(&mut conns[Db::Metrics as usize], writes).unwrap(), 0);
 
         // The last bucket has just ended: rows for it may still be on their way.
         maintenance(&mut conns, now);
@@ -776,7 +809,7 @@ mod tests {
                 Write::Metric { table: &RADIO, ts: now - 600 + i * 10, values }
             })
             .collect();
-        apply(&mut conns[Db::Metrics as usize], writes).unwrap();
+        assert_eq!(apply(&mut conns[Db::Metrics as usize], writes).unwrap(), 0);
         maintenance(&mut conns, now + ROLLUP_GRACE_SECS);
         let five = series(&conns[Db::Metrics as usize], &RADIO, &["aa".into(), "na".into()], now - 600, now, 1).unwrap();
         assert_eq!(five.ts, vec![now - 600]);
@@ -796,9 +829,14 @@ mod tests {
             params: vec![Value::Text(mac.into())],
         };
         // The second write breaks the primary key.
-        apply(&mut conns[Db::Config as usize], vec![alias("a"), alias("a"), alias("b")]).unwrap();
+        assert_eq!(apply(&mut conns[Db::Config as usize], vec![alias("a"), alias("a"), alias("b")]).unwrap(), 1);
         let n: i64 = conns[Db::Config as usize].query_row("SELECT COUNT(*) FROM client_aliases", [], |r| r.get(0)).unwrap();
         assert_eq!(n, 2);
+        // A metric row with a value too few or too many is refused, not stored in the wrong columns.
+        let row = |n: usize| Write::Metric { table: &MCAST, ts: 1, values: [Value::Text("aa".into()), Value::Text("mdns".into())].into_iter().chain(std::iter::repeat_n(Value::Real(1.0), n)).collect() };
+        assert_eq!(apply(&mut conns[Db::Metrics as usize], vec![row(4), row(5), row(6)]).unwrap(), 2);
+        let n: i64 = conns[Db::Metrics as usize].query_row("SELECT COUNT(*) FROM mcast_stats", [], |r| r.get(0)).unwrap();
+        assert_eq!(n, 1);
         std::fs::remove_dir_all(&dir).ok();
     }
 
