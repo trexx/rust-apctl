@@ -696,7 +696,7 @@ impl Watcher {
                     }
                     continue;
                 };
-                if v >= raise_at && !self.book.open.contains_key(&k) && self.cleared.get(&k).is_none_or(|t| now - t >= HEALTH_COOLDOWN) {
+                if v >= raise_at && !self.book.open.contains_key(&k) && self.cleared.get(&k).is_none_or(|t| !(0..HEALTH_COOLDOWN).contains(&(now - t))) {
                     let name = crate::insights::ap_name(&self.live.read().unwrap(), &mac.to_string()).unwrap_or_else(|| mac.to_string());
                     let title = format!("High {what} on {name} {}", band_name(&radio));
                     let message = format!("{what} has averaged {v:.0}% over the last 15 minutes (alert at {raise_at:.0}%).");
@@ -719,7 +719,7 @@ impl Watcher {
     /// attempt in the window; clears it when none did.
     fn judge_connections(&mut self, now: Ts, failing: usize) {
         let k = (Key::ConnectFailures, Entity::Site);
-        if failing >= 3 && !self.book.open.contains_key(&k) && self.cleared.get(&k).is_none_or(|t| now - t >= HEALTH_COOLDOWN) {
+        if failing >= 3 && !self.book.open.contains_key(&k) && self.cleared.get(&k).is_none_or(|t| !(0..HEALTH_COOLDOWN).contains(&(now - t))) {
             let message = "Every connection attempt these clients made in the last 15 minutes failed.".into();
             let a = Alert::new(Key::ConnectFailures, Category::Health, Severity::Medium, Entity::Site, format!("{failing} clients can't connect"), message);
             self.book.open(now, a.link("/clients?tab=attempts").tagged("health:connect_failures"));
@@ -945,6 +945,10 @@ mod tests {
         assert!(told(&mut rx).is_empty());
         w.judge_connections(1180 + HEALTH_COOLDOWN, 9);
         assert_eq!(told(&mut rx), [("raised", "connect_failures")]);
+        // After the clock steps back, the cooldown does not last until it catches up.
+        w.judge_connections(30_000, 0);
+        w.judge_connections(29_000, 9);
+        assert_eq!(told(&mut rx), [("resolved", "connect_failures"), ("raised", "connect_failures")]);
     }
 
     #[tokio::test]
