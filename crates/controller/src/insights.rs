@@ -174,11 +174,16 @@ pub(crate) fn client_name(live: &Live, mac: Option<inform::Mac>) -> Option<Strin
     live.aliases.get(&mac).and_then(|a| a.alias.clone()).or_else(|| live.clients.get(&mac).and_then(|c| c.sample.hostname.clone()))
 }
 
+/// The longest inform interval the controller asks for (90 s, on sites of 18
+/// APs or more): a raw sample covers at most this long before it.
+const MAX_INFORM_INTERVAL: Ts = 90;
+
 /// Loads a metrics table's samples in range, grouped by key.
 pub(crate) fn load(c: &Connection, spec: Spec, tier: usize, from: Ts, to: Ts) -> anyhow::Result<Loaded> {
     let Spec { table, key, extra, cols, only } = spec;
     let suffix = TIERS[tier].0;
-    let step = TIERS[tier].1.max(30) * 2;
+    // Twice the longest interval between two samples, so the one before the window is read.
+    let step = TIERS[tier].1.max(MAX_INFORM_INTERVAL) * 2;
     let mut params = vec![Sql::Integer(from), Sql::Integer(to), Sql::Integer(step)];
     let only = match only {
         None => String::new(),
@@ -1644,6 +1649,20 @@ mod tests {
         let b = per["Home"].series[&0][&0];
         assert_eq!(b.averages(), (3.0, 100.0, 0.0));
         assert_eq!(per["Home"].down, 2000.0);
+    }
+
+    #[test]
+    fn the_first_interval_in_the_window_is_counted_at_long_inform_intervals() {
+        // A site with many APs: an SSID reports every 75 s, the window starts between two reports.
+        let c = Connection::open_in_memory().unwrap();
+        c.execute_batch("CREATE TABLE vap_stats (bssid TEXT, ts INTEGER, radio TEXT, tx_bytes INTEGER)").unwrap();
+        let from = 10_000;
+        for (i, ts) in [from - 145, from - 70, from + 5, from + 80].into_iter().enumerate() {
+            c.execute("INSERT INTO vap_stats VALUES ('bss', ?1, 'na', ?2)", [ts, 1000 * i as Ts]).unwrap();
+        }
+        let vaps = load(&c, Spec { table: "vap_stats", key: "bssid", extra: &["radio"], cols: &["tx_bytes"], only: None }, 0, from, from + 600).unwrap();
+        let ends: Vec<(Ts, Option<f64>)> = deltas(&vaps["bss"].1, from).map(|d| (d.ts, d.inc(0))).collect();
+        assert_eq!(ends, [(from + 5, Some(1000.0)), (from + 80, Some(1000.0))]);
     }
 
     #[test]
