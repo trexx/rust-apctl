@@ -137,17 +137,22 @@ pub struct Event {
 impl Event {
     /// An event about an AP.
     pub fn device(ts: Ts, kind: EventKind, mac: Mac, data: Value) -> Self {
-        ev(ts, kind, Some(mac), None, data)
+        Event { ts, kind, device_mac: Some(mac), client_mac: None, data }
     }
 
     /// An event about a client.
     pub fn client(ts: Ts, kind: EventKind, client: Mac, data: Value) -> Self {
-        ev(ts, kind, None, Some(client), data)
+        Event { ts, kind, device_mac: None, client_mac: Some(client), data }
+    }
+
+    /// An event about a client on an AP.
+    pub fn client_on(ts: Ts, kind: EventKind, ap: Mac, client: Mac, data: Value) -> Self {
+        Event { ts, kind, device_mac: Some(ap), client_mac: Some(client), data }
     }
 
     /// An event about the whole site.
     pub fn site(ts: Ts, kind: EventKind, data: Value) -> Self {
-        ev(ts, kind, None, None, data)
+        Event { ts, kind, device_mac: None, client_mac: None, data }
     }
 }
 
@@ -551,7 +556,7 @@ impl Engine {
                     vec![Sql::Text(kind.as_str().into()), Sql::Text(bssid), Sql::Integer(ts)],
                 );
                 if notify {
-                    self.emit(ev(ts, EventKind::NetworkThreat, device_mac, None, data));
+                    self.emit(Event { ts, kind: EventKind::NetworkThreat, device_mac, client_mac: None, data });
                 }
             }
             Input::Note(e) => self.emit(e),
@@ -635,27 +640,27 @@ impl Engine {
         let mut events = Vec::new();
         let known = if prev.is_none() { live.known_devices.remove(&mac) } else { None };
         match (&prev, &known) {
-            (None, None) => events.push(ev(ts, EventKind::ApSeen, Some(mac), None, json!({ "ip": snap.ap.ip, "model": snap.ap.model, "version": snap.ap.version }))),
+            (None, None) => events.push(Event::device(ts, EventKind::ApSeen, mac, json!({ "ip": snap.ap.ip, "model": snap.ap.model, "version": snap.ap.version }))),
             // Known from a previous run: only report what we can prove changed while we were away.
             (None, Some(k)) => {
                 let away = ts - k.last_seen;
                 if let (Some(old), Some(up)) = (k.uptime, snap.ap.uptime)
                     && up + 60 < old + away {
-                        events.push(ev(ts, EventKind::ApRestarted, Some(mac), None, json!({ "uptime": up })));
+                        events.push(Event::device(ts, EventKind::ApRestarted, mac, json!({ "uptime": up })));
                     }
                 if k.version.is_some() && snap.ap.version.is_some() && k.version != snap.ap.version {
-                    events.push(ev(ts, EventKind::ApFirmwareChanged, Some(mac), None, json!({ "from": k.version, "to": snap.ap.version })));
+                    events.push(Event::device(ts, EventKind::ApFirmwareChanged, mac, json!({ "from": k.version, "to": snap.ap.version })));
                 }
             }
-            (Some(p), _) if !p.online => events.push(ev(ts, EventKind::ApOnline, Some(mac), None, json!({ "offline_for": ts - p.last_seen }))),
+            (Some(p), _) if !p.online => events.push(Event::device(ts, EventKind::ApOnline, mac, json!({ "offline_for": ts - p.last_seen }))),
             _ => {}
         }
         if let (Some(p), Some(up)) = (&prev, snap.ap.uptime) {
             if p.snapshot.ap.uptime.is_some_and(|old| up + 30 < old) {
-                events.push(ev(ts, EventKind::ApRestarted, Some(mac), None, json!({ "uptime": up })));
+                events.push(Event::device(ts, EventKind::ApRestarted, mac, json!({ "uptime": up })));
             }
             if p.snapshot.ap.version != snap.ap.version && snap.ap.version.is_some() {
-                events.push(ev(ts, EventKind::ApFirmwareChanged, Some(mac), None, json!({ "from": p.snapshot.ap.version, "to": snap.ap.version })));
+                events.push(Event::device(ts, EventKind::ApFirmwareChanged, mac, json!({ "from": p.snapshot.ap.version, "to": snap.ap.version })));
             }
         }
         if snap.has_vap_table {
@@ -671,7 +676,7 @@ impl Engine {
                     Some(c) if track.candidate == Some(now) => {
                         track.committed = Some(now);
                         track.candidate = None;
-                        events.push(ev(ts, EventKind::RadioChanged, Some(mac), None, json!({
+                        events.push(Event::device(ts, EventKind::RadioChanged, mac, json!({
                             "radio": r.radio,
                             "from": { "channel": c.0, "bw": c.1, "tx_power": c.2 },
                             "to": { "channel": now.0, "bw": now.1, "tx_power": now.2 },
@@ -700,7 +705,7 @@ impl Engine {
         if let Some(v) = &snap.ap.version
             && let Some(j) = live.firmware.version_seen(&mac, v)
         {
-            events.push(ev(ts, EventKind::ApUpgraded, Some(mac), None, json!({ "from": j.from, "to": v, "custom": j.custom })));
+            events.push(Event::device(ts, EventKind::ApUpgraded, mac, json!({ "from": j.from, "to": v, "custom": j.custom })));
         }
         for e in events {
             self.emit(e);
@@ -750,7 +755,7 @@ impl Engine {
                     let event = if !view.connected {
                         Some(connected_event(ts, c, false))
                     } else if p.ap_mac != c.ap_mac || p.bssid != c.bssid {
-                        Some(ev(ts, EventKind::ClientRoamed, Some(c.ap_mac), Some(c.mac), json!({
+                        Some(Event::client_on(ts, EventKind::ClientRoamed, c.ap_mac, c.mac, json!({
                             "from": { "ap": p.ap_mac, "radio": p.radio, "channel": p.channel, "essid": p.essid, "signal": p.signal },
                             "to": { "ap": c.ap_mac, "radio": c.radio, "channel": c.channel, "essid": c.essid, "signal": c.signal },
                         })))
@@ -901,9 +906,9 @@ impl Engine {
             d.last_config_push = Some(ts);
         }
         live.last_config.insert(mac, Arc::new(PushedConfig { mgmt_cfg: mgmt, system_cfg: system, cfgversion }));
-        self.emit(ev(ts, EventKind::ConfigPushed, Some(mac), None, Value::Object(data)));
+        self.emit(Event::device(ts, EventKind::ConfigPushed, mac, Value::Object(data)));
         if let Some(summary) = dry {
-            self.emit(ev(ts, EventKind::DryrunCompared, Some(mac), None, summary));
+            self.emit(Event::device(ts, EventKind::DryrunCompared, mac, summary));
         }
     }
 
@@ -950,7 +955,7 @@ impl Engine {
         self.store_state(state, ts);
         // The new settings may hold the syslog key of an AP given up on.
         self.syslog_unknown.clear();
-        self.emit(ev(ts, EventKind::SettingsImported, None, None, summary));
+        self.emit(Event::site(ts, EventKind::SettingsImported, summary));
     }
 
     /// The engine is the only writer of the settings, so they cannot change
@@ -965,7 +970,7 @@ impl Engine {
         let what = edit(&mut state)?;
         self.store_state(state, imported_at);
         self.syslog_unknown.clear();
-        self.emit(ev(ts, EventKind::SettingsChanged, None, None, json!({ "what": what })));
+        self.emit(Event::site(ts, EventKind::SettingsChanged, json!({ "what": what })));
         // The APs pick the change up now rather than at their next interval.
         crate::stun::poke_all(&self.live.read().unwrap());
         Ok(what)
@@ -1041,7 +1046,7 @@ impl Engine {
             }
             if old.alias != alias {
                 let ap = live.clients.get(&mac).map(|c| c.sample.ap_mac);
-                self.emit(ev(ts, EventKind::ClientRenamed, ap, Some(mac), json!({ "from": old.alias, "to": alias })));
+                self.emit(Event { ts, kind: EventKind::ClientRenamed, device_mac: ap, client_mac: Some(mac), data: json!({ "from": old.alias, "to": alias }) });
             }
         }
         drop(live);
@@ -1067,7 +1072,7 @@ impl Engine {
             // The AP confirms it applied a pushed config.
             Some("setparam") => {
                 let data = json!({ "cfgversion": p["cfgversion"], "seconds_after_push": since_push });
-                self.emit(ev(ts, EventKind::ConfigApplied, Some(mac), None, data));
+                self.emit(Event::device(ts, EventKind::ConfigApplied, mac, data));
             }
             Some("event") => {
                 let n = &p["notif_payload"];
@@ -1087,12 +1092,12 @@ impl Engine {
                         }
                         _ => EventKind::ApEvent,
                     };
-                    self.emit(ev(ts, k, Some(mac), None, n.clone()));
+                    self.emit(Event::device(ts, k, mac, n.clone()));
                 }
             }
             // The AP starts an upgrade (ours, or one run on the AP itself).
             Some(r @ ("cmd-upgrade" | "cli-upgrade")) => {
-                self.emit(ev(ts, EventKind::ApUpgradeStarted, Some(mac), None, json!({ "by": if r == "cli-upgrade" { "the AP's command line" } else { "the controller" } })));
+                self.emit(Event::device(ts, EventKind::ApUpgradeStarted, mac, json!({ "by": if r == "cli-upgrade" { "the AP's command line" } else { "the controller" } })));
             }
             // A crash or recovery report: base64 text from the AP's crash store.
             Some(reason @ ("crashlog" | "recovery")) => {
@@ -1105,7 +1110,7 @@ impl Engine {
                 let lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
                 let tail = &lines[lines.len().saturating_sub(200)..];
                 let kind = if reason == "recovery" { "recovered after a crash" } else { "crash report" };
-                self.emit(ev(ts, EventKind::ApCrash, Some(mac), None, json!({ "kind": kind, "source": reason, "lines": tail })));
+                self.emit(Event::device(ts, EventKind::ApCrash, mac, json!({ "kind": kind, "source": reason, "lines": tail })));
             }
             _ => {}
         }
@@ -1167,7 +1172,7 @@ impl Engine {
         let roamed = n["ip_assign_type"].as_str().is_some_and(|t| t.starts_with("roam"));
         if event_type == "failure" || (event_type == "soft failure" && !roamed) {
             let data = json!({ "essid": essid, "reason": n["sta_dc_reason"], "auth_algo": n["auth_algo"], "rssi": num("auth_rssi") });
-            self.emit(ev(ts, EventKind::ClientConnectFailed, Some(ap), Some(client), data));
+            self.emit(Event::client_on(ts, EventKind::ClientConnectFailed, ap, client, data));
         }
     }
 
@@ -1262,7 +1267,7 @@ impl Engine {
                     // Re-arm the deadline as the official controller does on each step.
                     j.expires = Some(ts + 450);
                 }
-                self.emit(ev(ts, EventKind::ApUpgradeProgress, Some(mac), None, json!({ "step": step })));
+                self.emit(Event::device(ts, EventKind::ApUpgradeProgress, mac, json!({ "step": step })));
             }
             (Some("UpgradeError"), _) => {
                 let reason = s("reason");
@@ -1273,7 +1278,7 @@ impl Engine {
                     r => format!("failed ({r})"),
                 };
                 live.firmware.failed(&mac, &detail);
-                self.emit(ev(ts, EventKind::ApUpgradeFailed, Some(mac), None, json!({ "reason": reason, "detail": detail })));
+                self.emit(Event::device(ts, EventKind::ApUpgradeFailed, mac, json!({ "reason": reason, "detail": detail })));
             }
             _ => {}
         }
@@ -1301,13 +1306,13 @@ impl Engine {
             }
             self.isolated.insert(*ap, ts);
             let data = json!({ "heard_by": s.ap.mac.to_string(), "bssid": n.bssid, "signal": n.signal });
-            self.emit(ev(ts, EventKind::ApIsolated, Some(*ap), None, data));
+            self.emit(Event::device(ts, EventKind::ApIsolated, *ap, data));
         }
     }
 
     fn log(&mut self, line: LogLine) {
         for f in self.logevents.feed(&line) {
-            self.emit(ev(line.ts, f.kind, f.device, f.client, f.data));
+            self.emit(Event { ts: line.ts, kind: f.kind, device_mac: f.device, client_mac: f.client, data: f.data });
         }
         bump(&self.counters.logs);
         self.writer.exec(
@@ -1351,11 +1356,11 @@ impl Engine {
                 && let Some(j) = live.firmware.failed(&mac, "it did not come back with the new firmware in time")
             {
                 let data = json!({ "reason": "timed out", "detail": "it did not come back with the new firmware in time", "target": j.target });
-                self.emit(ev(now, EventKind::ApUpgradeFailed, Some(mac), None, data));
+                self.emit(Event::device(now, EventKind::ApUpgradeFailed, mac, data));
             }
         }
         for f in self.logevents.tick(now) {
-            self.emit(ev(now, f.kind, f.device, f.client, f.data));
+            self.emit(Event { ts: now, kind: f.kind, device_mac: f.device, client_mac: f.client, data: f.data });
         }
         self.bss_prev.retain(|_, (ts, _)| *ts > now - 3600);
         let mut live = self.live.write().unwrap();
@@ -1366,7 +1371,7 @@ impl Engine {
             if d.online && now - d.last_seen > limit {
                 d.online = false;
                 offline.push(*mac);
-                events.push(ev(now, EventKind::ApOffline, Some(*mac), None, json!({ "last_seen": d.last_seen })));
+                events.push(Event::device(now, EventKind::ApOffline, *mac, json!({ "last_seen": d.last_seen })));
             }
         }
         // A client is gone when its AP has reported a full client list since it was
@@ -1647,13 +1652,9 @@ pub(crate) fn section_labels(cfg: &str, radios: &[crate::model::RadioSample]) ->
     out
 }
 
-fn ev(ts: Ts, kind: EventKind, device_mac: Option<Mac>, client_mac: Option<Mac>, data: Value) -> Event {
-    Event { ts, kind, device_mac, client_mac, data }
-}
-
 /// `new`: never seen before (not even in an earlier run).
 fn connected_event(ts: Ts, c: &ClientSample, new: bool) -> Event {
-    ev(ts, EventKind::ClientConnected, Some(c.ap_mac), Some(c.mac), json!({
+    Event::client_on(ts, EventKind::ClientConnected, c.ap_mac, c.mac, json!({
         "essid": c.essid, "radio": c.radio, "channel": c.channel, "signal": c.signal,
         "hostname": c.hostname, "ip": c.ip, "new": new,
     }))
@@ -1664,7 +1665,7 @@ fn connected_event(ts: Ts, c: &ClientSample, new: bool) -> Event {
 fn disconnect(writer: &Writer, ts: Ts, mac: Mac, c: &mut ClientView, reason: &str) -> Event {
     c.connected = false;
     writer.exec(Db::Config, "UPDATE clients SET connected = 0 WHERE mac = ?1", vec![Sql::Text(mac.to_string())]);
-    ev(ts, EventKind::ClientDisconnected, Some(c.sample.ap_mac), Some(mac), json!({
+    Event::client_on(ts, EventKind::ClientDisconnected, c.sample.ap_mac, mac, json!({
         "reason": reason, "last_seen": c.last_seen, "essid": c.sample.essid,
         "connected_for": c.sample.uptime, "last_signal": c.sample.signal,
     }))
