@@ -832,7 +832,7 @@ pub fn apply_wlan(state: &mut Value, e: &WlanEdit) -> Result<String, String> {
             ("bss_transition", Bool), ("mcastenhance_enabled", Bool), ("fast_roaming_enabled", Bool), ("country_beacon", Bool),
         ],
     )?;
-    wlan_security(p, &mut w, &mut changed)?;
+    wlan_security(p, &mut w)?;
     let bands = wlan_bands(p, &mut w)?;
     wlan_roaming(p, &mut w, &bands)?;
     // Sent as they are; the official UI keeps but never shows the last three.
@@ -865,6 +865,7 @@ pub fn apply_wlan(state: &mut Value, e: &WlanEdit) -> Result<String, String> {
         }
         w["wlan_band"] = json!("2g");
     }
+    wlan_password(p, &before, &mut w, &mut changed)?;
 
     let locked_aps_before = if before["iot_channel_lock"].as_bool() == Some(true) { deployed_to(state, &before) } else { Vec::new() };
     *find_wlan(state, id).ok_or("unknown SSID")? = w;
@@ -892,8 +893,8 @@ pub fn apply_wlan(state: &mut Value, e: &WlanEdit) -> Result<String, String> {
     Ok(what)
 }
 
-/// Protection, PMF, the WPA3 timers and the password.
-fn wlan_security(p: &Value, w: &mut Value, changed: &mut Vec<&str>) -> Result<(), String> {
+/// Protection, PMF and the WPA3 timers.
+fn wlan_security(p: &Value, w: &mut Value) -> Result<(), String> {
     if let Some(choice) = enum_field(p, "protection", &PROTECTION.iter().map(|x| x.0).collect::<Vec<_>>())? {
         let (_, security, mode, wpa3, transition) = PROTECTION.iter().find(|x| x.0 == choice).copied().unwrap();
         w["security"] = json!(security);
@@ -927,15 +928,26 @@ fn wlan_security(p: &Value, w: &mut Value, changed: &mut Vec<&str>) -> Result<()
     }
     // `wpa3_fast_roaming`: fast roaming for WPA3 clients of a WPA2/WPA3 SSID (the official UI never sets it).
     copy_fields(p, w, &[("sae_anti_clogging", Int(1, 60)), ("sae_sync", Int(1, 60)), ("wpa3_fast_roaming", Bool)])?;
+    Ok(())
+}
 
+/// The password, checked against the protection the SSID ends up with (`w`,
+/// once Force Wi-Fi 4 has had its say).
+fn wlan_password(p: &Value, before: &Value, w: &mut Value, changed: &mut Vec<&str>) -> Result<(), String> {
+    let effective = |w: &Value| {
+        let wpa3 = w["wpa3_support"].as_bool().unwrap_or(false);
+        (w["security"].as_str() == Some("wpapsk"), wpa3, wpa3 && w["wpa3_transition"].as_bool().unwrap_or(false))
+    };
+    let (psk, wpa3, transition) = effective(w);
     let given = p["passphrase"].as_str();
     if psk && given.is_none() && w["x_passphrase"].as_str().is_none_or(str::is_empty) {
         return Err("a password is needed for WPA2/WPA3".into());
     }
-    // A kept password is checked against the new protection too: WPA3 allows
-    // up to 255 characters, and a longer one kept for WPA2 would reach the APs
-    // as a key they cannot use.
-    if given.is_some() || psk && !p["protection"].is_null() {
+    // A kept password is checked against the new protection too, however it
+    // came about (Force Wi-Fi 4 turns WPA3 off): WPA3 allows up to 255
+    // characters, and a longer one kept for WPA2 would reach the APs as a key
+    // they cannot use.
+    if given.is_some() || psk && (!p["protection"].is_null() || effective(before) != effective(w)) {
         let pass = given.or(w["x_passphrase"].as_str()).unwrap_or_default();
         let printable = pass.chars().all(|c| (' '..='~').contains(&c));
         let hex64 = pass.len() == 64 && pass.chars().all(|c| c.is_ascii_hexdigit());
@@ -1709,6 +1721,20 @@ mod tests {
         assert!(edit(&mut s, json!({ "wlan_bands": ["2g", "5g"] })).is_err());
         assert!(edit(&mut s, json!({ "protection": "wpa3" })).is_err());
         edit(&mut s, json!({ "enhanced_iot": false, "wlan_bands": ["2g", "5g"] })).unwrap();
+    }
+
+    #[test]
+    fn force_wifi4_checks_a_kept_wpa3_password() {
+        let mut s = state();
+        edit(&mut s, json!({ "protection": "wpa3", "wlan_bands": ["2g"], "passphrase": "p".repeat(100) })).unwrap();
+        // Turning WPA3 off this way leaves WPA2, where 100 characters are no key.
+        assert!(edit(&mut s, json!({ "enhanced_iot": true })).unwrap_err().contains("enter a new one"));
+        edit(&mut s, json!({ "enhanced_iot": true, "passphrase": "short enough" })).unwrap();
+        assert_eq!(protection_of(&s["wlanconf"][0]), Some("wpa2"));
+        // A kept password that fits passes as before.
+        let mut s = state();
+        edit(&mut s, json!({ "protection": "wpa2_wpa3" })).unwrap();
+        edit(&mut s, json!({ "enhanced_iot": true })).unwrap();
     }
 
     #[test]
