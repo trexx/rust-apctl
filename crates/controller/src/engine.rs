@@ -349,12 +349,37 @@ struct Written {
     clients: HashMap<Mac, Ts>,
     /// Per AP: each neighbour by BSSID.
     neighbors: HashMap<Mac, Rows<String, crate::model::NeighborSample>>,
-    /// Per AP: each scanned channel by (radio, channel).
-    spectrum: HashMap<Mac, Rows<(String, i64), crate::model::SpectrumSample>>,
+    /// Per AP and radio: each scanned channel.
+    spectrum: HashMap<Mac, HashMap<String, Rows<i64, crate::model::SpectrumSample>>>,
 }
 
-/// Rows as last written, and when, by key.
-type Rows<K, T> = HashMap<K, (T, Ts)>;
+/// Rows by key.
+type Rows<K, T> = HashMap<K, Row<T>>;
+
+/// A row as last written, when, and when it was last reported.
+struct Row<T> {
+    value: T,
+    written: Ts,
+    seen: Ts,
+}
+
+impl<T: PartialEq + Clone> Row<T> {
+    fn new(value: &T, ts: Ts) -> Self {
+        Row { value: value.clone(), written: ts, seen: ts }
+    }
+
+    /// Records `value` as reported at `ts`; true if it is to be written: it
+    /// changed, or was last written `every` seconds ago.
+    fn report(&mut self, value: &T, ts: Ts, every: Ts) -> bool {
+        self.seen = ts;
+        if self.value == *value && !due(Some(&self.written), ts, every) {
+            return false;
+        }
+        self.value.clone_from(value);
+        self.written = ts;
+        true
+    }
+}
 
 /// Whether a row last written at `at` (if ever) is due again at `ts`.
 fn due(at: Option<&Ts>, ts: Ts, every: Ts) -> bool {
@@ -1466,17 +1491,17 @@ impl Engine {
         // Scan results repeat in every inform until the next scan: an unchanged
         // neighbour is written once a minute (last_seen), an unchanged spectrum
         // row once an hour. What the AP no longer reports is forgotten here.
-        let mut before = self.written.neighbors.remove(&s.ap.mac).unwrap_or_default();
-        let mut now = HashMap::with_capacity(s.neighbors.len());
+        let rows = self.written.neighbors.entry(s.ap.mac).or_default();
         for n in &s.neighbors {
-            match before.remove(&n.bssid) {
-                Some((old, at)) if old == *n && !due(Some(&at), ts, REFRESH_SECS) => {
-                    now.insert(n.bssid.clone(), (old, at));
-                    continue;
+            let write = match rows.get_mut(n.bssid.as_str()) {
+                Some(row) => row.report(n, ts, REFRESH_SECS),
+                None => {
+                    rows.insert(n.bssid.clone(), Row::new(n, ts));
+                    true
                 }
-                _ => {
-                    now.insert(n.bssid.clone(), (n.clone(), ts));
-                }
+            };
+            if !write {
+                continue;
             }
             self.writer.exec(
                 Db::Config,
@@ -1493,19 +1518,22 @@ impl Engine {
                 ],
             );
         }
-        self.written.neighbors.insert(s.ap.mac, now);
-        let mut before = self.written.spectrum.remove(&s.ap.mac).unwrap_or_default();
-        let mut now = HashMap::with_capacity(s.spectrum.len());
+        rows.retain(|_, r| r.seen == ts);
+        let radios = self.written.spectrum.entry(s.ap.mac).or_default();
         for c in &s.spectrum {
-            let key = (c.radio.clone(), c.channel);
-            match before.remove(&key) {
-                Some((old, at)) if old == *c && !due(Some(&at), ts, SPECTRUM_REFRESH_SECS) => {
-                    now.insert(key, (old, at));
-                    continue;
+            if !radios.contains_key(c.radio.as_str()) {
+                radios.insert(c.radio.clone(), Rows::new());
+            }
+            let rows = radios.get_mut(c.radio.as_str()).expect("inserted above");
+            let write = match rows.get_mut(&c.channel) {
+                Some(row) => row.report(c, ts, SPECTRUM_REFRESH_SECS),
+                None => {
+                    rows.insert(c.channel, Row::new(c, ts));
+                    true
                 }
-                _ => {
-                    now.insert(key, (c.clone(), ts));
-                }
+            };
+            if !write {
+                continue;
             }
             self.writer.exec(
                 Db::Config,
@@ -1513,7 +1541,10 @@ impl Engine {
                 vec![mac(), Sql::Text(c.radio.clone()), Sql::Integer(c.channel), i(c.width), i(c.utilization), i(c.interference), i(c.other_bss_count), Sql::Integer(ts)],
             );
         }
-        self.written.spectrum.insert(s.ap.mac, now);
+        radios.retain(|_, rows| {
+            rows.retain(|_, r| r.seen == ts);
+            !rows.is_empty()
+        });
         // Per traffic type: [to clients pps, from clients pps, to bytes/s, from bytes/s], and
         // how many clients sent any. "To clients" is counted once per network (BSSID),
         // "from clients" per client; only increases count (a client moving to another
@@ -1905,6 +1936,31 @@ mod tests {
         feed(&mut e, 90, "b");
         assert_eq!((stored(device).0, stored(client).0), (90, 90), "last_seen moves on once a minute");
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn unchanged_neighbours_are_written_once_a_minute_and_forgotten_when_gone() {
+        let mut h = harness();
+        let feed = |h: &mut Harness, ts: Ts, signal: Option<i64>| {
+            let mut p = inform(AP1, 1000 + ts, &[]);
+            if let Some(signal) = signal {
+                p["radio_table"] = json!([{ "radio": "na", "scan_table": [{ "bssid": "02:cd:00:00:00:01", "signal": signal }] }]);
+            }
+            h.engine.handle(Input::Inform { ts, peer: "x".into(), decoded: decoded(p) });
+        };
+        let last_seen = |h: &Harness| -> i64 {
+            assert!(h.writer.flush(std::time::Duration::from_secs(5)));
+            h.store.read(Db::Config, |c| Ok(c.query_row("SELECT last_seen FROM neighbors", [], |r| r.get(0))?)).unwrap()
+        };
+        feed(&mut h, 0, Some(-70));
+        feed(&mut h, 15, Some(-70));
+        assert_eq!(last_seen(&h), 0, "unchanged: not written again yet");
+        feed(&mut h, 30, Some(-60));
+        assert_eq!(last_seen(&h), 30, "a change is written at once");
+        feed(&mut h, 45, None);
+        assert!(h.engine.written.neighbors[&AP1.parse().unwrap()].is_empty(), "no longer reported: forgotten");
+        feed(&mut h, 50, Some(-60));
+        assert_eq!(last_seen(&h), 50, "reported again: written as new");
     }
 
     #[test]
