@@ -21,7 +21,7 @@ use serde_json::{Value, json};
 
 use crate::api::{ApiError, AppState};
 use crate::engine::{Event, EventKind};
-use crate::store;
+use crate::clock;
 
 /// The URL APs should inform to: `--inform-url`, else the one the managed APs use.
 pub fn inform_url(s: &AppState) -> Option<String> {
@@ -278,7 +278,7 @@ pub async fn adopt(State(s): State<AppState>, Json(b): Json<AdoptBody>) -> Resul
     let connected = connect(&ip, b.port.unwrap_or(22), &logins(state.as_deref(), given.clone()), expected.as_ref().map(|e| e.1.clone())).await;
     let session = match (connected, &expected) {
         (Err(Failure::HostKey), Some((mac, _))) => {
-            s.note(Event::device(store::now_ts(), EventKind::ApHostKeyMismatch, *mac, json!({ "ip": ip }))).await;
+            s.note(Event::device(clock::now_ts(), EventKind::ApHostKeyMismatch, *mac, json!({ "ip": ip }))).await;
             return Err(bad(Failure::HostKey));
         }
         (r, _) => r.map_err(bad)?,
@@ -293,7 +293,7 @@ pub async fn adopt(State(s): State<AppState>, Json(b): Json<AdoptBody>) -> Resul
     if let (Some(k), Some(seen)) = (known.and_then(|d| d["x_ssh_hostkey_fingerprint"].as_str()), &session.fingerprint)
         && k != seen
     {
-        s.note(Event::device(store::now_ts(), EventKind::ApHostKeyMismatch, mac, json!({ "ip": ip }))).await;
+        s.note(Event::device(clock::now_ts(), EventKind::ApHostKeyMismatch, mac, json!({ "ip": ip }))).await;
         return Err(bad(Failure::HostKey));
     }
     // Its record (and key), unless apctl has it already.
@@ -326,7 +326,7 @@ pub async fn adopt(State(s): State<AppState>, Json(b): Json<AdoptBody>) -> Resul
     }
     .ok_or_else(|| ApiError::internal("the new record has no key"))?;
     // Expected from now on: the AP may inform with its key before the command returns.
-    s.live.write().unwrap().adoption.adopting.insert(mac, store::now_ts());
+    s.live.write().unwrap().adoption.adopting.insert(mac, clock::now_ts());
     let out = match session.run(&format!("/usr/bin/syswrapper.sh set-adopt {} {}", shell_quote(&url), shell_quote(&key))).await {
         Ok(out) => out,
         // Back with its key already (that ends the adoption): it worked.
@@ -344,7 +344,7 @@ pub async fn adopt(State(s): State<AppState>, Json(b): Json<AdoptBody>) -> Resul
             return Err(bad(f));
         }
     };
-    s.note(Event::device(store::now_ts(), EventKind::ApAdopting, mac, json!({ "ip": ip, "via": "ssh" }))).await;
+    s.note(Event::device(clock::now_ts(), EventKind::ApAdopting, mac, json!({ "ip": ip, "via": "ssh" }))).await;
     tracing::info!("{mac}: set-adopt {url} sent over SSH ({})", out.trim());
     Ok(Json(json!({ "adopting": true, "mac": mac, "inform_url": url })))
 }

@@ -27,7 +27,7 @@ use serde_json::{Value, json};
 
 use crate::api::{ApiError, AppState};
 use crate::engine::{Event, EventKind, Input, Live};
-use crate::store;
+use crate::clock;
 
 /// Commands waiting for an AP's next inform.
 pub fn queue(live: &mut Live, mac: Mac, cmd: Value) {
@@ -169,7 +169,7 @@ pub async fn restart(State(s): State<AppState>, Path(mac): Path<String>) -> Resu
         }
         queue(&mut live, mac, json!({ "_type": "reboot", "reboot_type": "soft" }));
     }
-    s.note(Event::device(store::now_ts(), EventKind::ApRestartRequested, mac, json!({}))).await;
+    s.note(Event::device(clock::now_ts(), EventKind::ApRestartRequested, mac, json!({}))).await;
     Ok(Json(json!({ "queued": true })))
 }
 
@@ -199,7 +199,7 @@ pub async fn locate(State(s): State<AppState>, Path(mac): Path<String>, Json(b):
 pub async fn provision(State(s): State<AppState>, Path(mac): Path<String>) -> Result<Json<Value>, ApiError> {
     let mac = target_ap(&s, &mac)?;
     s.live.write().unwrap().reprovision.insert(mac);
-    s.note(Event::device(store::now_ts(), EventKind::ApProvisionRequested, mac, json!({}))).await;
+    s.note(Event::device(clock::now_ts(), EventKind::ApProvisionRequested, mac, json!({}))).await;
     Ok(Json(json!({ "queued": true })))
 }
 
@@ -221,7 +221,7 @@ pub async fn kick(State(s): State<AppState>, Path(mac): Path<String>) -> Result<
         queue(&mut live, ap, json!({ "_type": "cmd", "cmd": "kick-sta", "mac": client.to_string() }));
         ap
     };
-    s.note(Event::client(store::now_ts(), EventKind::ClientReconnectRequested, client, json!({ "ap": ap }))).await;
+    s.note(Event::client(clock::now_ts(), EventKind::ClientReconnectRequested, client, json!({ "ap": ap }))).await;
     Ok(Json(json!({ "queued": true, "ap": ap })))
 }
 
@@ -249,7 +249,7 @@ pub async fn block(State(s): State<AppState>, Path(mac): Path<String>, Json(b): 
         }
     }
     let kind = if blocked { EventKind::ClientBlocked } else { EventKind::ClientUnblocked };
-    s.note(Event::client(store::now_ts(), kind, client, json!({}))).await;
+    s.note(Event::client(clock::now_ts(), kind, client, json!({}))).await;
     Ok(Json(json!({ "blocked": blocked })))
 }
 
@@ -295,7 +295,7 @@ pub async fn edit_settings(s: &AppState, what: String, edit: impl FnOnce(&mut Va
 pub async fn apply_edit(s: &AppState, edit: crate::engine::StateEdit) -> Result<String, ApiError> {
     crate::api::current_state(s)?;
     let (tx, rx) = tokio::sync::oneshot::channel();
-    s.ask(Input::EditState { ts: store::now_ts(), edit, done: tx }, rx).await?.map_err(|e| ApiError(StatusCode::BAD_REQUEST, e))
+    s.ask(Input::EditState { ts: clock::now_ts(), edit, done: tx }, rx).await?.map_err(|e| ApiError(StatusCode::BAD_REQUEST, e))
 }
 
 #[cfg(test)]

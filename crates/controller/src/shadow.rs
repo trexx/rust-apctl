@@ -59,12 +59,12 @@ impl Clock {
     /// The engine's time now, or `None` while a replay ticks in its own time.
     pub fn now(&self) -> Option<Ts> {
         let lag = self.lag.load(Ordering::Relaxed);
-        (lag <= REPLAY_LAG_SECS).then(|| crate::store::now_ts() - lag)
+        (lag <= REPLAY_LAG_SECS).then(|| crate::clock::now_ts() - lag)
     }
 
     /// Notes an inform's capture time; true if the capture is being replayed.
     fn observe(&self, ts: Ts) -> bool {
-        let lag = (crate::store::now_ts() - ts).max(0);
+        let lag = (crate::clock::now_ts() - ts).max(0);
         self.lag.store(lag, Ordering::Relaxed);
         lag > REPLAY_LAG_SECS
     }
@@ -188,7 +188,7 @@ mod tests {
     #[test]
     fn the_clock_follows_a_lagging_capture_and_pauses_for_a_replay() {
         let clock = Clock::default();
-        let now = crate::store::now_ts();
+        let now = crate::clock::now_ts();
         assert!(clock.now().is_some_and(|t| (now..now + 2).contains(&t)), "no capture yet: the wall clock");
         // A live capture 90 s behind: ticks in its time, or every AP would look offline.
         assert!(!clock.observe(now - 90));

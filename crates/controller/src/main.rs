@@ -291,7 +291,7 @@ async fn serve(args: ServeArgs) -> Result<()> {
     alerts::spawn(store.clone(), writer.clone(), live.clone(), live_tx.clone(), alert_events);
     backup::schedule(backups.clone(), store.clone());
     firmware::schedule(writer.clone());
-    let state = api::AppState { backups, active, writer: writer.clone(), store, vendors: Arc::new(vendors), renderer, auth, engine: in_tx.clone(), live, tx: api::live_json(&live_tx), started: store::now_ts(), source: source_desc };
+    let state = api::AppState { backups, active, writer: writer.clone(), store, vendors: Arc::new(vendors), renderer, auth, engine: in_tx.clone(), live, tx: api::live_json(&live_tx), started: clock::now_ts(), source: source_desc };
     channelai::schedule(state.clone());
     ratelimit::spawn(state.clone());
     adopt::spawn(state.clone());
@@ -317,7 +317,7 @@ async fn spawn_syslog(addr: SocketAddr, tx: mpsc::Sender<Input>) -> Result<()> {
             match socket.recv_from(&mut buf).await {
                 Ok((n, src)) => {
                     // An IPv4 AP on a dual-stack socket goes by its IPv4 address, as its informs report it.
-                    let input = Input::Datagram { ts: store::now_ts(), src_ip: src.ip().to_canonical().to_string(), payload: buf[..n].to_vec() };
+                    let input = Input::Datagram { ts: clock::now_ts(), src_ip: src.ip().to_canonical().to_string(), payload: buf[..n].to_vec() };
                     match tx.try_send(input) {
                         Ok(()) => {}
                         Err(mpsc::error::TrySendError::Full(_)) => {

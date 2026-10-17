@@ -469,7 +469,7 @@ fn writer_loop(dir: &Path, rx: Receiver<Msg>) -> Result<()> {
         }
         if last_maintenance.elapsed() >= Duration::from_secs(300) {
             flush(&mut conns, &mut pending);
-            maintenance(&mut conns, now_ts());
+            maintenance(&mut conns, crate::clock::now_ts());
             last_maintenance = Instant::now();
         }
     }
@@ -556,10 +556,6 @@ pub fn stored_push(c: &Connection, mac: &inform::Mac) -> rusqlite::Result<Option
             Ok(PushedConfig { mgmt_cfg: r.get::<_, Option<String>>(0)?.unwrap_or_default(), system_cfg: r.get::<_, Option<String>>(1)?.unwrap_or_default(), cfgversion: r.get(2)? })
         })
         .optional()
-}
-
-pub fn now_ts() -> Ts {
-    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0)
 }
 
 /// Rolls complete buckets up into the coarser tiers, then applies retention.

@@ -26,8 +26,9 @@ use serde_json::json;
 use sha2::{Digest, Sha256};
 
 use crate::api::{ApiError, AppState};
+use crate::clock;
 use crate::model::Ts;
-use crate::store::{self, Db, Store, Writer};
+use crate::store::{Db, Store, Writer};
 
 pub const COOKIE: &str = "apctl_session";
 const SESSION_SECS: Ts = 30 * 86400;
@@ -137,7 +138,7 @@ fn token_hash(token: &str) -> String {
 
 impl Auth {
     pub fn new(users: Users, store: &Store, writer: Writer, proxies: Arc<Proxies>) -> Result<Auth> {
-        let now = store::now_ts();
+        let now = clock::now_ts();
         let rows = store.read(Db::Config, |c| {
             let mut stmt = c.prepare("SELECT token_hash, username, expires FROM sessions WHERE expires > ?1")?;
             let rows = stmt
@@ -158,7 +159,7 @@ impl Auth {
         let mut bytes = [0u8; 32];
         getrandom::fill(&mut bytes).map_err(|e| anyhow::anyhow!("random: {e}"))?;
         let token = hex::encode(bytes);
-        let now = store::now_ts();
+        let now = clock::now_ts();
         let session = Session { user: user.to_string(), expires: now + SESSION_SECS };
         let hash = token_hash(&token);
         self.writer.exec(
@@ -178,7 +179,7 @@ impl Auth {
     /// it was extended (the browser's cookie then needs the new expiry too).
     fn check(&self, token: &str) -> Option<(String, bool)> {
         let hash = token_hash(token);
-        let now = store::now_ts();
+        let now = clock::now_ts();
         let mut sessions = self.sessions.lock().unwrap();
         let s = sessions.get_mut(&hash)?;
         if s.expires <= now {
@@ -216,7 +217,7 @@ impl Auth {
 
     /// Whether a session (by its hash) is still there: not logged out, not expired.
     pub(crate) fn alive(&self, hash: &str) -> bool {
-        self.sessions.lock().unwrap().get(hash).is_some_and(|s| s.expires > store::now_ts())
+        self.sessions.lock().unwrap().get(hash).is_some_and(|s| s.expires > clock::now_ts())
     }
 
     /// Whether a WebSocket handshake comes from a page of this server. CORS
@@ -243,7 +244,7 @@ impl Auth {
     /// parallel requests cannot all get in under the limit. False when the
     /// address has used up its attempts for this window.
     fn attempt(&self, ip: IpAddr) -> bool {
-        let now = store::now_ts();
+        let now = clock::now_ts();
         let mut f = self.failures.lock().unwrap();
         // Forget windows that have passed, so the map stays small.
         f.retain(|_, (_, since)| now - *since < FAILURE_WINDOW);
@@ -524,7 +525,7 @@ mod tests {
 
     #[test]
     fn sessions_are_hashed_checked_and_revoked() {
-        let dir = std::env::temp_dir().join(format!("apctl-sessions-{}-{}", std::process::id(), store::now_ts()));
+        let dir = std::env::temp_dir().join(format!("apctl-sessions-{}-{}", std::process::id(), clock::now_ts()));
         let (store, writer) = Store::open(&dir).unwrap();
         let mut users = Users::default();
         users.hashes.insert("admin".into(), hash_password("x").unwrap());
@@ -547,7 +548,7 @@ mod tests {
 
     #[test]
     fn throttles_after_repeated_failures() {
-        let dir = std::env::temp_dir().join(format!("apctl-throttle-{}-{}", std::process::id(), store::now_ts()));
+        let dir = std::env::temp_dir().join(format!("apctl-throttle-{}-{}", std::process::id(), clock::now_ts()));
         let (store, writer) = Store::open(&dir).unwrap();
         let auth = Auth::new(Users::default(), &store, writer, Default::default()).unwrap();
         let ip: IpAddr = "10.0.0.9".parse().unwrap();
@@ -602,7 +603,7 @@ mod tests {
 
     #[test]
     fn live_sockets_are_only_for_pages_of_this_server() {
-        let dir = std::env::temp_dir().join(format!("apctl-origin-{}-{}", std::process::id(), store::now_ts()));
+        let dir = std::env::temp_dir().join(format!("apctl-origin-{}-{}", std::process::id(), clock::now_ts()));
         let (store, writer) = Store::open(&dir).unwrap();
         let proxies = Arc::new(Proxies::parse(&["10.42.0.0/16".into()]).unwrap());
         let auth = Auth::new(Users::default(), &store, writer, proxies).unwrap();

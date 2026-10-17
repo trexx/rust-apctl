@@ -31,9 +31,10 @@ use serde_json::{Value, json};
 
 use crate::alerts::named_enum;
 use crate::api::{ApiError, AppState};
+use crate::clock;
 use crate::engine::{Input, SharedLive};
 use crate::model::Ts;
-use crate::store::{self, Db, Store, Writer};
+use crate::store::{Db, Store, Writer};
 use inform::Mac;
 
 named_enum! {
@@ -748,7 +749,7 @@ fn with_acks<T>(store: &Store, f: impl FnOnce(&mut Acks) -> T) -> anyhow::Result
 }
 
 async fn findings(s: &AppState) -> Result<(Arc<[Finding]>, Ts), ApiError> {
-    let now = store::now_ts();
+    let now = clock::now_ts();
     if let Some(l) = latest().as_ref().filter(|l| (0..LATEST_SECS).contains(&(now - l.at))) {
         return Ok((l.findings.clone(), l.watching_since));
     }
@@ -827,7 +828,7 @@ pub async fn ack(State(s): State<AppState>, Json(b): Json<AckBody>) -> Result<Js
     if note.as_ref().is_some_and(|n| n.chars().count() > 200) {
         return Err(ApiError(StatusCode::BAD_REQUEST, "note is too long (200 characters at most)".into()));
     }
-    let (ts, bssid) = (store::now_ts(), bssid.to_string());
+    let (ts, bssid) = (clock::now_ts(), bssid.to_string());
     let ack = b.ack.then_some(Ack { note, ts });
     let (store, writer) = (s.store.clone(), s.writer.clone());
     tokio::task::spawn_blocking(move || set_ack(&store, &writer, kind, bssid, ack)).await?.map_err(ApiError::from)?;
@@ -872,11 +873,11 @@ pub fn watch(store: std::sync::Arc<Store>, live: SharedLive, engine: tokio::sync
         let mut pruned: Ts = 0;
         loop {
             every.tick().await;
-            if store::now_ts() - pruned >= 3600 {
+            if clock::now_ts() - pruned >= 3600 {
                 prune(&writer);
-                pruned = store::now_ts();
+                pruned = clock::now_ts();
             }
-            let (st, lv, now) = (store.clone(), live.clone(), store::now_ts());
+            let (st, lv, now) = (store.clone(), live.clone(), clock::now_ts());
             let found = tokio::task::spawn_blocking(move || gather(&st, &lv, now).map(|a| (assess(&a), a.watching_since))).await;
             let (mut list, watching_since) = match found {
                 Ok(Ok(l)) => l,
@@ -1054,7 +1055,7 @@ mod tests {
 
     #[test]
     fn our_bssids_and_their_changes_come_from_every_tier() {
-        let dir = std::env::temp_dir().join(format!("apctl-threats-{}-{}", std::process::id(), store::now_ts()));
+        let dir = std::env::temp_dir().join(format!("apctl-threats-{}-{}", std::process::id(), clock::now_ts()));
         let (store, _writer) = Store::open(&dir).unwrap();
         let c = Connection::open(dir.join("metrics.db")).unwrap();
         let now = 1_000_000_000;
@@ -1102,7 +1103,7 @@ mod tests {
 
     #[test]
     fn findings_about_networks_no_longer_heard_are_forgotten() {
-        let dir = std::env::temp_dir().join(format!("apctl-threats-prune-{}-{}", std::process::id(), store::now_ts()));
+        let dir = std::env::temp_dir().join(format!("apctl-threats-prune-{}-{}", std::process::id(), clock::now_ts()));
         let (store, writer) = Store::open(&dir).unwrap();
         let sql = "INSERT INTO neighbors (bssid, ap_mac, first_seen, last_seen) VALUES ('02:00:00:00:00:01', ?1, 1, 2)";
         writer.exec(Db::Config, sql, vec![rusqlite::types::Value::Text(UP.into())]);
@@ -1164,7 +1165,7 @@ mod tests {
 
     #[test]
     fn acknowledgements_and_slow_reads_are_kept_in_memory() {
-        let dir = std::env::temp_dir().join(format!("apctl-threats-acks-{}-{}", std::process::id(), store::now_ts()));
+        let dir = std::env::temp_dir().join(format!("apctl-threats-acks-{}-{}", std::process::id(), clock::now_ts()));
         let (store, writer) = Store::open(&dir).unwrap();
         let live: SharedLive = Default::default();
         let exec = |sql: &'static str| writer.exec(Db::Config, sql, vec![]);

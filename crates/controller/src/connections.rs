@@ -875,7 +875,7 @@ mod tests {
 
     #[test]
     fn the_newest_attempts_and_roams_are_read_from_the_end() {
-        let dir = std::env::temp_dir().join(format!("apctl-connections-{}-{}", std::process::id(), crate::store::now_ts()));
+        let dir = std::env::temp_dir().join(format!("apctl-connections-{}-{}", std::process::id(), crate::clock::now_ts()));
         let (store, _writer) = crate::store::Store::open(&dir).unwrap();
         let c = rusqlite::Connection::open(dir.join("config.db")).unwrap();
         // Five clients, one report every 7 s for a day: failures with their fixups up
@@ -938,7 +938,7 @@ mod tests {
 
     #[test]
     fn a_few_roams_among_many_attempts_are_found_without_reading_them_all() {
-        let dir = std::env::temp_dir().join(format!("apctl-roams-{}-{}", std::process::id(), crate::store::now_ts()));
+        let dir = std::env::temp_dir().join(format!("apctl-roams-{}-{}", std::process::id(), crate::clock::now_ts()));
         let (store, _writer) = crate::store::Store::open(&dir).unwrap();
         let c = rusqlite::Connection::open(dir.join("config.db")).unwrap();
         let sql = "INSERT INTO connections (ts, ap_mac, client_mac, vap, essid, radio, event_type, detail) VALUES (?1, ?2, ?3, 'wifi1ap0', 'Home', 'na', ?4, ?5)";

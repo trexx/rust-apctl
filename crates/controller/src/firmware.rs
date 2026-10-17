@@ -29,9 +29,10 @@ use serde_json::{Value, json};
 use inform::Mac;
 
 use crate::api::{ApiError, AppState};
+use crate::clock;
 use crate::engine::Live;
 use crate::model::Ts;
-use crate::store::{self, Db, Store, Writer};
+use crate::store::{Db, Store, Writer};
 
 pub const FEED: &str = "https://fw-update.ubnt.com/api/firmware-newest?filter=eq~~product~~unifi-firmware&filter=eq~~channel~~release";
 /// `fw_caps` bit: the AP verifies SHA-256 checksums.
@@ -341,7 +342,7 @@ pub fn check(writer: &Writer) -> anyhow::Result<usize> {
         }
         Ok(releases)
     })();
-    let now = store::now_ts();
+    let now = clock::now_ts();
     match result {
         Ok(releases) => {
             for r in &releases {

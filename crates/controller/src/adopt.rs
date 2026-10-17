@@ -30,7 +30,7 @@ use crate::api::{ApiError, AppState};
 use crate::engine::{Event, EventKind, Input, Live};
 use crate::model::Ts;
 use crate::settings::random_hex;
-use crate::store;
+use crate::clock;
 
 /// How long an AP has to come back with its new key.
 pub const ADOPT_TIMEOUT: Ts = 300;
@@ -238,7 +238,7 @@ pub fn new_device(state: &Value, payload: &Value, mac: &Mac) -> Value {
     let other = &state["devices"][0];
     let mut d = json!({
         "mac": mac.to_string(), "adopted": true, "type": "uap", "x_authkey": random_hex(16), "syslog_key": random_hex(32),
-        "cfgversion": random_hex(8), "config_network": { "type": "dhcp" }, "adopted_at": store::now_ts(),
+        "cfgversion": random_hex(8), "config_network": { "type": "dhcp" }, "adopted_at": clock::now_ts(),
         "radio_table": radio_table(state, payload),
     });
     for k in ["model", "version", "serial", "ip"] {
@@ -329,7 +329,7 @@ pub fn spawn(s: AppState) {
     tokio::spawn(async move {
         loop {
             tokio::time::sleep(std::time::Duration::from_secs(10)).await;
-            let now = store::now_ts();
+            let now = clock::now_ts();
             // Taken out of `forgetting` here, so an inform arriving meanwhile
             // doesn't finish the same forget a second time.
             let overdue: Vec<Mac> = {
@@ -355,7 +355,7 @@ pub fn spawn(s: AppState) {
 pub async fn pending(State(s): State<AppState>) -> Json<Value> {
     // Before taking the lock below: it reads the settings too.
     let ssh = crate::ssh::available(&s);
-    let now = store::now_ts();
+    let now = clock::now_ts();
     // What `expire` would drop is left out (it runs every ten seconds), and
     // the lists are serialised after the lock is released.
     let (pending, adopting, forgetting) = {
@@ -379,10 +379,10 @@ pub async fn adopt(State(s): State<AppState>, Path(mac): Path<String>) -> Result
     crate::actions::apply_edit(&s, Box::new(move |state: &mut Value| adopt_device(state, &mac, &inform))).await?;
     {
         let mut live = s.live.write().unwrap();
-        live.adoption.adopting.insert(mac, store::now_ts());
+        live.adoption.adopting.insert(mac, clock::now_ts());
         live.adoption.pending.remove(&mac);
     }
-    s.note(Event::device(store::now_ts(), EventKind::ApAdopting, mac, json!({ "model": payload["model"], "ip": payload["ip"] }))).await;
+    s.note(Event::device(clock::now_ts(), EventKind::ApAdopting, mac, json!({ "model": payload["model"], "ip": payload["ip"] }))).await;
     Ok(Json(json!({ "adopting": true })))
 }
 
@@ -399,7 +399,7 @@ pub async fn forget(State(s): State<AppState>, Path(mac): Path<String>) -> Resul
     };
     if online {
         // Removed when it reports (and is told to reset), or after the timeout.
-        s.live.write().unwrap().adoption.forgetting.insert(mac, store::now_ts());
+        s.live.write().unwrap().adoption.forgetting.insert(mac, clock::now_ts());
         crate::stun::poke(&s.live.read().unwrap(), &mac);
         return Ok(Json(json!({ "forgetting": true })));
     }
@@ -411,10 +411,10 @@ pub async fn forget(State(s): State<AppState>, Path(mac): Path<String>) -> Resul
 pub async fn finish_forget(engine: &tokio::sync::mpsc::Sender<Input>, mac: Mac, reset: bool) {
     let (tx, rx) = tokio::sync::oneshot::channel();
     let edit: crate::engine::StateEdit = Box::new(move |state: &mut Value| remove_device(state, &mac));
-    let _ = engine.send(Input::EditState { ts: store::now_ts(), edit, done: tx }).await;
+    let _ = engine.send(Input::EditState { ts: clock::now_ts(), edit, done: tx }).await;
     let _ = rx.await;
-    let _ = engine.send(Input::Forget { ts: store::now_ts(), mac }).await;
-    let _ = engine.send(Input::Note(Event::device(store::now_ts(), EventKind::ApForgotten, mac, json!({ "reset": reset })))).await;
+    let _ = engine.send(Input::Forget { ts: clock::now_ts(), mac }).await;
+    let _ = engine.send(Input::Note(Event::device(clock::now_ts(), EventKind::ApForgotten, mac, json!({ "reset": reset })))).await;
 }
 
 #[cfg(test)]

@@ -34,6 +34,7 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
 use crate::api::{ApiError, AppState};
+use crate::clock;
 use crate::model::Ts;
 use crate::store::{self, Db};
 
@@ -448,7 +449,7 @@ static CREATING: Mutex<()> = Mutex::new(());
 /// Writes a backup of the databases in `src_dir` and returns its description.
 pub fn create(b: &Backups, src_dir: &Path, kind: Kind, days: i64) -> Result<Meta> {
     let _one = CREATING.lock().unwrap_or_else(PoisonError::into_inner);
-    let now = store::now_ts();
+    let now = clock::now_ts();
     let dir = b.dir();
     fs::create_dir_all(&dir)?;
     let tmp = dir.join(format!(".tmp-{now}-{}-{}", std::process::id(), crate::settings::random_hex(4)));
@@ -921,7 +922,7 @@ pub fn schedule(b: Backups, store: Arc<store::Store>) {
             if !s.enabled {
                 continue;
             }
-            let now = store::now_ts();
+            let now = clock::now_ts();
             let due = s.last_due(now);
             if last >= due || now - due > 6 * 3600 && last > 0 && now - last < 86400 || now < retry_at {
                 continue;
@@ -962,7 +963,7 @@ pub async fn index(State(s): State<AppState>) -> Result<Json<Value>, ApiError> {
         (b.settings(&store), list(&b), staged, fs::read_to_string(b.staging().join("pending.failed")).ok())
     })
     .await?;
-    let next = settings.enabled.then(|| settings.next_due(store::now_ts()));
+    let next = settings.enabled.then(|| settings.next_due(clock::now_ts()));
     Ok(Json(json!({
         "encrypted": encrypted, "version": VERSION, "settings": settings, "next_run": next,
         "backups": list, "restore_pending": staged, "restore_failed": failed,
@@ -1056,7 +1057,7 @@ pub async fn delete(State(s): State<AppState>, UrlPath(name): UrlPath<String>) -
 fn stage(b: &Backups, path: &Path) -> Result<(String, Manifest)> {
     let mut r = [0u8; 2];
     getrandom::fill(&mut r).map_err(|e| anyhow!("random: {e}"))?;
-    let id = format!("r{}{:05}", store::now_ts(), u16::from_be_bytes(r));
+    let id = format!("r{}{:05}", clock::now_ts(), u16::from_be_bytes(r));
     let dest = b.staging().join(&id);
     fs::create_dir_all(b.staging())?;
     fs::create_dir(&dest)?;
@@ -1086,7 +1087,7 @@ pub async fn upload(State(s): State<AppState>, body: Body) -> Result<Json<Value>
     use tokio::io::AsyncWriteExt;
     let b = s.backups.clone();
     tokio::fs::create_dir_all(b.staging()).await?;
-    let name = format!("upload-{}-{}.apb", store::now_ts(), crate::settings::random_hex(4));
+    let name = format!("upload-{}-{}.apb", clock::now_ts(), crate::settings::random_hex(4));
     let tmp = TempFile(b.staging().join(name));
     // Written a megabyte per trip to the blocking pool, not one trip per body chunk.
     let mut file = tokio::io::BufWriter::with_capacity(1 << 20, tokio::fs::File::create_new(&tmp.0).await?);
@@ -1204,7 +1205,7 @@ mod tests {
         drop(writer);
         drop(store);
         let c = Connection::open(d.join("config.db")).unwrap();
-        let now = store::now_ts();
+        let now = clock::now_ts();
         c.execute_batch(&format!(
             "INSERT INTO events (ts, kind, data) VALUES ({old}, 'old', '{{}}'), ({now}, 'new', '{{}}');
              INSERT INTO clients (mac, hostname, last_seen) VALUES ('aa:aa:aa:aa:aa:01', 'gone', {old}), ('aa:aa:aa:aa:aa:02', 'named', {old}), ('aa:aa:aa:aa:aa:03', 'recent', {now});
@@ -1248,7 +1249,7 @@ mod tests {
     #[test]
     fn history_dropped_from_a_backup_leaves_no_trace_and_little_free_space() {
         let src = data("trim");
-        let old = store::now_ts() - 40 * 86400;
+        let old = clock::now_ts() - 40 * 86400;
         let metrics = Connection::open(src.join("metrics.db")).unwrap();
         metrics.execute_batch(&format!("INSERT INTO ap_stats (mac, ts, cpu) VALUES ('old-ap-gone-0001', {old}, 3.0);")).unwrap();
         let b = Backups::new(src.clone(), None);

@@ -24,11 +24,12 @@ use serde_json::{Value, json};
 use tokio::sync::{broadcast, mpsc};
 
 use crate::api::{ApiError, AppState};
+use crate::clock;
 use crate::engine::{Event, EventKind, LiveMsg, SharedLive};
 use crate::insights::{RETRY_AT, RETRY_COLS, Spec, retry_pct, retry_totals};
 use crate::model::Ts;
 use crate::settings::band_name;
-use crate::store::{self, Db, Store, Writer};
+use crate::store::{Db, Store, Writer};
 
 /// An AP is offline after this long without contact.
 const OFFLINE_AFTER: Ts = 240;
@@ -732,7 +733,7 @@ impl Watcher {
 /// Starts the alert watcher, fed by the engine through `events` (see [`channel`]).
 pub fn spawn(store: Arc<Store>, writer: Writer, live: SharedLive, tx: broadcast::Sender<LiveMsg>, mut events: mpsc::Receiver<Event>) {
     tokio::spawn(async move {
-        let mut w = Watcher::start(store, writer, live, tx, store::now_ts()).await;
+        let mut w = Watcher::start(store, writer, live, tx, clock::now_ts()).await;
         // Give APs a chance to report after a restart before judging them.
         let mut status = tokio::time::interval_at(tokio::time::Instant::now() + Duration::from_secs(90), Duration::from_secs(30));
         let mut health = tokio::time::interval_at(tokio::time::Instant::now() + Duration::from_secs(120), Duration::from_secs(60));
@@ -740,11 +741,11 @@ pub fn spawn(store: Arc<Store>, writer: Writer, live: SharedLive, tx: broadcast:
             // Events wait in the channel while a check runs.
             tokio::select! {
                 e = events.recv() => match e {
-                    Some(e) => w.event(store::now_ts(), &e),
+                    Some(e) => w.event(clock::now_ts(), &e),
                     None => return,
                 },
-                _ = status.tick() => w.status_tick(store::now_ts()),
-                _ = health.tick() => w.health_tick(store::now_ts()).await,
+                _ = status.tick() => w.status_tick(clock::now_ts()),
+                _ = health.tick() => w.health_tick(clock::now_ts()).await,
             }
         }
     });

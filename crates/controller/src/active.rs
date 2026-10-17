@@ -34,9 +34,10 @@ use tokio::sync::{Semaphore, SemaphorePermit, mpsc};
 use wire::decode::{Decoded, KeyUsed, open_with};
 use wire::keys::KeyStore;
 
+use crate::clock;
 use crate::engine::{Event, EventKind, Input, SharedLive};
 use crate::model::Ts;
-use crate::store::{self, Db, PushedConfig, Store, Writer};
+use crate::store::{Db, PushedConfig, Store, Writer};
 
 /// What apctl remembers about an AP it manages.
 #[derive(Clone, Default)]
@@ -204,7 +205,7 @@ impl Active {
                 d.cfgversion.clone().map_or(Sql::Null, Sql::Text),
                 d.content.map_or(Sql::Null, |c| Sql::Text(hex::encode(c))),
                 Sql::Integer(d.gcm as i64),
-                Sql::Integer(store::now_ts()),
+                Sql::Integer(clock::now_ts()),
             ],
         );
     }
@@ -543,7 +544,7 @@ pub async fn inform(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    let ts = store::now_ts();
+    let ts = clock::now_ts();
     let Ok(header) = Packet::parse(&body).map(|p| p.header) else { return status(StatusCode::BAD_REQUEST) };
     let mac = header.mac;
     // An unencrypted packet "opens" with any key: it proves nothing.
@@ -1287,12 +1288,12 @@ mod tests {
             };
             rig.live.write().unwrap().devices.insert(mac, d);
         };
-        seen(store::now_ts());
+        seen(clock::now_ts());
         let (status, _) = inform_as_ap(&rig, &ap_payload("1"), DEFAULT_KEY, GCM_ZLIB).await;
         assert_eq!(status, StatusCode::NOT_FOUND);
         assert!(!rig.live.read().unwrap().adoption.pending.contains_key(&mac), "not offered for adoption");
         // Quiet for long enough: it was reset.
-        seen(store::now_ts() - RESET_QUIET_SECS - 1);
+        seen(clock::now_ts() - RESET_QUIET_SECS - 1);
         inform_as_ap(&rig, &ap_payload("1"), DEFAULT_KEY, GCM_ZLIB).await;
         assert!(rig.live.read().unwrap().adoption.pending.get(&mac).is_some_and(|p| p.known));
     }

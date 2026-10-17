@@ -4,6 +4,11 @@
 
 use crate::model::Ts;
 
+/// Seconds since the Unix epoch by the wall clock (0 if it is set before 1970).
+pub fn now_ts() -> Ts {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0)
+}
+
 /// Days since 1970-01-01 of a civil date.
 fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
     let y = if m <= 2 { y - 1 } else { y };

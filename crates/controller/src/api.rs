@@ -16,6 +16,7 @@ use serde_json::value::RawValue;
 use serde_json::{Value, json};
 use tokio::sync::broadcast;
 
+use crate::clock;
 use crate::engine::{AliasEdit, DeviceView, LiveMsg, SharedLive};
 use crate::model::Ts;
 use crate::store::{self, Db, Store};
@@ -249,7 +250,7 @@ async fn status(State(s): State<AppState>) -> ApiResult {
         "mode": if s.active { "active" } else { "shadow" },
         "source": s.source,
         "started": s.started,
-        "now": store::now_ts(),
+        "now": clock::now_ts(),
         "counters": &*live.counters,
         "devices": live.devices.len(),
         "devices_online": live.devices.values().filter(|d| d.online).count(),
@@ -568,7 +569,7 @@ async fn state_summary(State(s): State<AppState>) -> ApiResult {
 async fn import_state(State(s): State<AppState>, Json(state): Json<Value>) -> ApiResult {
     crate::dryrun::validate_state(&state).map_err(|e| bad(format!("{e:#}")))?;
     let summary = crate::dryrun::summarize_state(&state);
-    s.send(crate::engine::Input::SetState { ts: store::now_ts(), state }).await?;
+    s.send(crate::engine::Input::SetState { ts: clock::now_ts(), state }).await?;
     Ok(Json(json!({ "ok": true, "summary": summary })))
 }
 
@@ -744,7 +745,7 @@ async fn set_alias(
     let mac = parse_mac(&mac)?;
     validate(&body.alias, &body.note)?;
     let entries = vec![AliasEdit { mac, alias: body.alias, note: body.note }];
-    let input = crate::engine::Input::SetAliases { ts: store::now_ts(), entries, only_if_unset: false };
+    let input = crate::engine::Input::SetAliases { ts: clock::now_ts(), entries, only_if_unset: false };
     s.send(input).await?;
     Ok(Json(json!({ "ok": true })))
 }
@@ -776,7 +777,7 @@ async fn import_aliases(
     }
     let n = parsed.len();
     // All in one message: one pass of the engine, one client-list update.
-    let input = crate::engine::Input::SetAliases { ts: store::now_ts(), entries: parsed, only_if_unset: !q.overwrite };
+    let input = crate::engine::Input::SetAliases { ts: clock::now_ts(), entries: parsed, only_if_unset: !q.overwrite };
     s.send(input).await?;
     Ok(Json(json!({ "submitted": n })))
 }
@@ -795,7 +796,7 @@ async fn series(State(s): State<AppState>, Path(table): Path<String>, Query(q): 
     if keys.len() != t.keys.len() {
         return Err(bad(format!("{table} needs key {}", t.keys.join(","))));
     }
-    let now = store::now_ts();
+    let now = clock::now_ts();
     let to = q.to.unwrap_or(now);
     let from = q.from.unwrap_or(to.saturating_sub(3600));
     let (from, to) = (from.min(to), from.max(to));

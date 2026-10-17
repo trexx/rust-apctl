@@ -13,6 +13,7 @@ use serde_json::{Value, json};
 
 use crate::api::{ApiError, AppState, read};
 use crate::channelai::is_dfs;
+use crate::clock;
 use crate::engine::Live;
 use crate::model::Ts;
 use crate::store::{self, Db, TIERS};
@@ -34,7 +35,7 @@ pub struct RangeQuery {
 /// ending no later than now (`to`, default now; from `from`, or `range`
 /// seconds back from its end); and the storage tier to read it from.
 pub fn window(q: &RangeQuery) -> (Ts, Ts, usize) {
-    let now = store::now_ts();
+    let now = clock::now_ts();
     let to = q.to.unwrap_or(now).clamp(0, now);
     let from = match q.from {
         Some(from) => from.clamp(to.saturating_sub(400 * 86400), to.saturating_sub(600)),
@@ -1140,7 +1141,7 @@ struct OwnLink {
 /// and our own APs' signal to each other (AP density), once per pair of APs
 /// and band.
 pub async fn neighbors(State(s): State<AppState>, Query(q): Query<NeighborQuery>) -> Result<Json<Value>, ApiError> {
-    let since = store::now_ts() - q.range.unwrap_or(86400).clamp(600, 30 * 86400);
+    let since = clock::now_ts() - q.range.unwrap_or(86400).clamp(600, 30 * 86400);
     let band = q.band.clone();
     // Our APs' signal to each other only: the rows of our own BSSIDs (the table's key) are enough.
     let only: Option<Vec<Sql>> = q.links_only.then(|| own_bssids(&s.live.read().unwrap()).map(|(_, v)| Sql::Text(v.bssid.clone())).collect());
@@ -1380,7 +1381,7 @@ pub async fn compute_plan(s: &AppState, radio: String, dfs: bool, allowed: Optio
     if !matches!(radio.as_str(), "ng" | "na") {
         return Err(ApiError(axum::http::StatusCode::BAD_REQUEST, "band must be ng or na".into()));
     }
-    let since = store::now_ts() - 7 * 86400;
+    let since = clock::now_ts() - 7 * 86400;
     let r2 = radio.clone();
     let (neigh, spectrum) = read(&s.store, Db::Config, move |c| {
         let mut stmt = c.prepare("SELECT ap_mac, bssid, essid, center_freq, bw, signal FROM neighbors WHERE radio = ?1 AND last_seen >= ?2")?;
@@ -1639,13 +1640,13 @@ mod tests {
     #[test]
     fn windows_are_clamped() {
         let q = |range, from, to| RangeQuery { range, from, to, band: None, mac: None };
-        let now = store::now_ts();
+        let now = clock::now_ts();
         let (f, t, _) = window(&q(Some(3600), None, None));
         assert!(t - f == 3600 && t >= now);
         // An explicit window wins over `range`, and cannot end in the future.
         let (f, t, _) = window(&q(Some(3600), Some(now - 7200), Some(now + 999)));
         assert_eq!(t - f, 7200);
-        assert!(t <= store::now_ts());
+        assert!(t <= clock::now_ts());
         // Too short a window is widened backwards to ten minutes.
         let (f, t, _) = window(&q(None, Some(now - 100), Some(now - 60)));
         assert_eq!((t, t - f), (now - 60, 600));
@@ -1655,7 +1656,7 @@ mod tests {
         let (f, t, _) = window(&q(None, Some(i64::MIN), Some(i64::MIN)));
         assert_eq!((f, t), (-400 * 86400, 0));
         let (f, t, _) = window(&q(Some(i64::MAX), Some(i64::MAX), Some(i64::MAX)));
-        assert!(t <= store::now_ts() && t - f == 600);
+        assert!(t <= clock::now_ts() && t - f == 600);
         // A week ago reads the five-minute tier; a day 60 days back reads hourly.
         assert_eq!(window(&q(None, Some(now - 7 * 86400), Some(now - 6 * 86400))).2, 1);
         assert_eq!(window(&q(None, Some(now - 60 * 86400), Some(now - 59 * 86400))).2, 2);
@@ -1802,7 +1803,7 @@ mod tests {
 
         /// The site: two APs reporting for a little over an hour before `base + 3600`.
         fn site() -> (AppState, Ts, std::path::PathBuf) {
-            let now = store::now_ts();
+            let now = clock::now_ts();
             let base = now - now % 3600 - 3600;
             static SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
             let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);

@@ -27,7 +27,7 @@ use crate::engine::{Event, EventKind, Live};
 use crate::model::Ts;
 use crate::adopt::{device_doc, device_doc_mut};
 use crate::settings::{band_channels, country, device_macs, inform_radio, is_legal, legal_channels, num, setting, setting_mut, uplink};
-use crate::store;
+use crate::clock;
 
 /// A band Channel AI handles, and how its quick scan is asked for.
 pub struct Band {
@@ -195,7 +195,7 @@ async fn wait_for_scans(s: &AppState) {
     for _ in 0..(SCAN_TIMEOUT / 2 + 5) {
         {
             let mut live = s.live.write().unwrap();
-            check_scans(&mut live, store::now_ts());
+            check_scans(&mut live, clock::now_ts());
             if live.scans.is_empty() {
                 return;
             }
@@ -272,7 +272,7 @@ pub struct Change {
 /// flag (`_running`) until done.
 async fn run(s: AppState, bands: Vec<String>, trigger: &'static str, _running: RunGuard) {
     for (band, b) in bands.iter().filter_map(|n| Some((n, Band::named(n)?))) {
-        let scanned = start_scans(&mut s.live.write().unwrap(), b, store::now_ts());
+        let scanned = start_scans(&mut s.live.write().unwrap(), b, clock::now_ts());
         tracing::info!("channel AI ({trigger}): {} APs scanning {band}", scanned.len());
         wait_for_scans(&s).await;
         // The engine queues an AP's scan results before it shows the scan as
@@ -308,7 +308,7 @@ async fn run(s: AppState, bands: Vec<String>, trigger: &'static str, _running: R
                 Err(e) => data["error"] = json!(e.1),
             }
         }
-        s.note(Event::site(store::now_ts(), EventKind::ChannelPlan, data)).await;
+        s.note(Event::site(clock::now_ts(), EventKind::ChannelPlan, data)).await;
     }
 }
 
@@ -336,7 +336,7 @@ pub fn schedule(s: AppState) {
                 let tz = st.and_then(crate::settings::timezone).map(str::to_string);
                 (settings(st), tz)
             };
-            let (day, minute) = crate::clock::local(tz.as_deref(), store::now_ts());
+            let (day, minute) = crate::clock::local(tz.as_deref(), clock::now_ts());
             if !nightly.due(&cfg, day, minute) {
                 continue;
             }
@@ -406,7 +406,7 @@ pub async fn status(State(s): State<AppState>) -> Result<Json<Value>, ApiError> 
     // Finished scans are cleared under the write lock; the rest needs only a copy.
     let (state, scans) = {
         let mut live = s.live.write().unwrap();
-        check_scans(&mut live, store::now_ts());
+        check_scans(&mut live, clock::now_ts());
         let scans: Vec<Value> = live.scans.iter().map(|(m, sc)| json!({ "mac": m, "band": sc.band, "started": sc.started })).collect();
         (live.state.clone(), scans)
     };
@@ -415,7 +415,7 @@ pub async fn status(State(s): State<AppState>) -> Result<Json<Value>, ApiError> 
     let cfg = settings(st);
     Ok(Json(json!({
         "active": s.active, "has_settings": st.and_then(radio_ai).is_some(), "timezone": tz,
-        "next_run": next_run(&cfg, tz, store::now_ts()), "running": RUNNING.load(Ordering::SeqCst), "scans": scans,
+        "next_run": next_run(&cfg, tz, clock::now_ts()), "running": RUNNING.load(Ordering::SeqCst), "scans": scans,
         "allowed": { "ng": allowed(st, "ng", false), "na": allowed(st, "na", false) }, "settings": cfg,
     })))
 }
@@ -429,7 +429,7 @@ pub struct BandBody {
 pub async fn scan(State(s): State<AppState>, Json(b): Json<BandBody>) -> Result<Json<Value>, ApiError> {
     crate::api::require_active(&s, "this needs")?;
     let band = Band::named(&b.band).ok_or_else(|| ApiError(StatusCode::BAD_REQUEST, "band must be ng or na".into()))?;
-    let asked = start_scans(&mut s.live.write().unwrap(), band, store::now_ts());
+    let asked = start_scans(&mut s.live.write().unwrap(), band, clock::now_ts());
     if asked.is_empty() {
         return Err(ApiError(StatusCode::CONFLICT, "no online AP can scan this band".into()));
     }
@@ -474,7 +474,7 @@ pub async fn apply_plan(State(s): State<AppState>, Json(b): Json<Value>) -> Resu
     }
     apply(&s, &b.band, &b.changes, "manual").await?;
     let data = json!({ "band": b.band, "trigger": "manual", "changes": b.changes, "applied": true });
-    s.note(Event::site(store::now_ts(), EventKind::ChannelPlan, data)).await;
+    s.note(Event::site(clock::now_ts(), EventKind::ChannelPlan, data)).await;
     Ok(Json(json!({ "applied": b.changes.len() })))
 }
 
