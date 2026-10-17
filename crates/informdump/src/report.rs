@@ -213,7 +213,8 @@ fn save_name(ts: Micros, seq: u64, mac: Mac, kind: &str) -> String {
     format!("{}_{seq:06}_{}_{kind}.json", format_ts(ts).replace(':', ""), mac.to_string().replace(':', ""))
 }
 
-/// Masks secret fields, including secret lines inside `*_cfg` blobs.
+/// Masks secret fields, including secret lines inside `*_cfg` blobs. Under a secret
+/// key every string is masked, however deeply it is nested (`x_ssh_keys: [{...}]`).
 fn redact_json(v: &Value) -> Value {
     match v {
         Value::Object(m) => Value::Object(
@@ -221,7 +222,7 @@ fn redact_json(v: &Value) -> Value {
                 .map(|(k, v)| {
                     let v = match v {
                         Value::String(s) if k.ends_with("_cfg") => Value::String(cfgdiff::redact(s)),
-                        Value::String(_) if cfgdiff::is_secret(k) => Value::String("<redacted>".into()),
+                        secret if cfgdiff::is_secret(k) => redact_all(secret),
                         other => redact_json(other),
                     };
                     (k.clone(), v)
@@ -229,6 +230,16 @@ fn redact_json(v: &Value) -> Value {
                 .collect(),
         ),
         Value::Array(a) => Value::Array(a.iter().map(redact_json).collect()),
+        other => other.clone(),
+    }
+}
+
+/// Every string in `v` masked.
+fn redact_all(v: &Value) -> Value {
+    match v {
+        Value::String(_) => Value::String("<redacted>".into()),
+        Value::Array(a) => Value::Array(a.iter().map(redact_all).collect()),
+        Value::Object(m) => Value::Object(m.iter().map(|(k, v)| (k.clone(), redact_all(v))).collect()),
         other => other.clone(),
     }
 }
@@ -274,6 +285,23 @@ mod tests {
         assert_eq!(save_name(ts, 7, mac, "reply-setparam"), "2026-10-12T213001.123Z_000007_020000000001_reply-setparam.json");
         assert_eq!(save_name(ts, 7, mac, "reply-../../x/\u{1b}[2J.y"), "2026-10-12T213001.123Z_000007_020000000001_reply-x2Jy.json");
         assert_eq!(save_name(ts, 7, mac, &format!("reply-{}", "a".repeat(500))).len(), "2026-10-12T213001.123Z_000007_020000000001_.json".len() + 40);
+    }
+
+    #[test]
+    fn secrets_are_masked_in_arrays_and_objects_too() {
+        let v = json!({
+            "x_passphrase": "hunter22",
+            "x_ssh_keys": [{ "key": "ssh-ed25519 AAAAC3Nz", "comment": "me@laptop", "date": 7 }],
+            "psk": ["one", "two"],
+            "radio_table": [{ "name": "wifi0", "x_secret": { "inner": "s3cret" } }],
+            "system_cfg": "aaa.1.wpa.psk=hunter22\nradio.1.channel=36",
+        });
+        let out = redact_json(&v);
+        assert_eq!(out["x_passphrase"], "<redacted>");
+        assert_eq!(out["x_ssh_keys"], json!([{ "key": "<redacted>", "comment": "<redacted>", "date": 7 }]));
+        assert_eq!(out["psk"], json!(["<redacted>", "<redacted>"]));
+        assert_eq!(out["radio_table"], json!([{ "name": "wifi0", "x_secret": { "inner": "<redacted>" } }]));
+        assert!(!out.to_string().contains("hunter22") && out["system_cfg"].as_str().unwrap().contains("radio.1.channel=36"));
     }
 
     #[test]
