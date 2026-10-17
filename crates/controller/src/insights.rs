@@ -165,7 +165,17 @@ fn cols_at<const N: usize>(cols: &[&str], names: [&str; N]) -> [usize; N] {
 
 /// An AP's name (its host name), if it is reporting.
 pub(crate) fn ap_name(live: &Live, mac: &str) -> Option<String> {
-    mac.parse().ok().and_then(|m| live.devices.get(&m)).and_then(|d| d.snapshot.ap.hostname.clone())
+    ap_name_of(live, &mac.parse().ok()?)
+}
+
+/// The same by MAC.
+pub(crate) fn ap_name_of(live: &Live, mac: &inform::Mac) -> Option<String> {
+    live.devices.get(mac).and_then(|d| d.snapshot.ap.hostname.clone())
+}
+
+/// Our APs' SSIDs (BSSIDs), with the AP of each.
+fn own_bssids(live: &Live) -> impl Iterator<Item = (&inform::Mac, &crate::model::VapSample)> {
+    live.devices.iter().flat_map(|(m, d)| d.snapshot.vaps.iter().map(move |v| (m, v)))
 }
 
 /// A client's name: the alias given in apctl, else the host name it reports.
@@ -702,10 +712,9 @@ pub async fn multicast(State(s): State<AppState>, Query(q): Query<RangeQuery>) -
             let m: Option<inform::Mac> = mac.parse().ok();
             let view = m.and_then(|m| live.clients.get(&m));
             let mc = view.and_then(|v| v.sample.multicast.as_ref());
-            let ap_name = view.and_then(|v| live.devices.get(&v.sample.ap_mac)).and_then(|d| d.snapshot.ap.hostname.clone());
             json!({
                 "mac": mac, "name": client_name(&live, m), "vendor": s.vendors.lookup_str(mac),
-                "connected": view.is_some_and(|c| c.connected), "ap": ap_name, "radio": view.and_then(|c| c.sample.radio.clone()),
+                "connected": view.is_some_and(|c| c.connected), "ap": view.and_then(|v| ap_name_of(&live, &v.sample.ap_mac)), "radio": view.and_then(|c| c.sample.radio.clone()),
                 "tx_pkts": t[0].round(), "rx_pkts": t[1].round(), "tx_bytes": t[2].round(), "rx_bytes": t[3].round(),
                 "services": mc.map(|m| m.services.clone()).unwrap_or_default(),
                 "delivery": mc.and_then(|m| m.delivery()),
@@ -797,7 +806,7 @@ pub async fn wlans(State(s): State<AppState>, Query(q): Query<RangeQuery>) -> Re
     })
     .await?;
     // How our own SSIDs are heard over the air (our APs scan each other).
-    let own: Vec<Sql> = s.live.read().unwrap().devices.values().flat_map(|d| d.snapshot.vaps.iter().map(|v| Sql::Text(v.bssid.clone()))).collect();
+    let own: Vec<Sql> = own_bssids(&s.live.read().unwrap()).map(|(_, v)| Sql::Text(v.bssid.clone())).collect();
     let on_air: HashMap<String, String> = if own.is_empty() {
         HashMap::new()
     } else {
@@ -1120,7 +1129,7 @@ pub async fn neighbors(State(s): State<AppState>, Query(q): Query<NeighborQuery>
     let since = store::now_ts() - q.range.unwrap_or(86400).clamp(600, 30 * 86400);
     let band = q.band.clone();
     // Our APs' signal to each other only: the rows of our own BSSIDs (the table's key) are enough.
-    let only: Option<Vec<Sql>> = q.links_only.then(|| s.live.read().unwrap().devices.values().flat_map(|d| d.snapshot.vaps.iter().map(|v| Sql::Text(v.bssid.clone()))).collect());
+    let only: Option<Vec<Sql>> = q.links_only.then(|| own_bssids(&s.live.read().unwrap()).map(|(_, v)| Sql::Text(v.bssid.clone())).collect());
     let rows = read(&s.store, Db::Config, move |c| {
         if only.as_ref().is_some_and(Vec::is_empty) {
             return Ok(Vec::new());
@@ -1152,19 +1161,24 @@ pub async fn neighbors(State(s): State<AppState>, Query(q): Query<NeighborQuery>
         Ok(rows)
     })
     .await?;
-    let live = s.live.read().unwrap();
-    // Our own BSSIDs, to tell our APs apart from the neighbours.
-    let own: HashMap<&str, (String, Option<&str>)> =
-        live.devices.iter().flat_map(|(m, d)| d.snapshot.vaps.iter().map(move |v| (v.bssid.as_str(), (m.to_string(), v.radio.as_deref())))).collect();
+    // Our own BSSIDs (to tell our APs apart from the neighbours) and our APs' names, copied
+    // so that the live lock is not held while the lists are made.
+    let (own, names) = {
+        let live = s.live.read().unwrap();
+        let own: HashMap<String, (String, Option<String>)> = own_bssids(&live).map(|(m, v)| (v.bssid.clone(), (m.to_string(), v.radio.clone()))).collect();
+        let names: HashMap<String, String> = live.devices.iter().filter_map(|(m, d)| Some((m.to_string(), d.snapshot.ap.hostname.clone()?))).collect();
+        (own, names)
+    };
+    let name = |mac: &str| names.get(mac).cloned();
     let signal = |n: &Neighbor| n.signal.unwrap_or(-200);
     let mut by_bssid: BTreeMap<String, Neighbor> = BTreeMap::new();
     // (from, to, band) -> strongest signal: an AP has a BSSID per SSID.
-    let mut links: BTreeMap<(String, String, Option<&str>), Option<i64>> = BTreeMap::new();
+    let mut links: BTreeMap<(String, &str, Option<&str>), Option<i64>> = BTreeMap::new();
     for r in rows {
-        if let Some((owner, radio)) = own.get(r.bssid.as_str()) {
+        if let Some((owner, radio)) = own.get(&r.bssid) {
             // One of our APs heard another of ours.
             if *owner != r.ap_mac {
-                let e = links.entry((r.ap_mac, owner.clone(), *radio)).or_insert(r.signal);
+                let e = links.entry((r.ap_mac, owner, radio.as_deref())).or_insert(r.signal);
                 *e = (*e).max(r.signal);
             }
             continue;
@@ -1175,13 +1189,13 @@ pub async fn neighbors(State(s): State<AppState>, Query(q): Query<NeighborQuery>
     }
     let mut list: Vec<Neighbor> = by_bssid.into_values().collect();
     for n in &mut list {
-        n.nearest_ap = ap_name(&live, &n.ap_mac);
+        n.nearest_ap = name(&n.ap_mac);
         n.vendor = s.vendors.lookup_str(&n.bssid);
     }
     list.sort_by_key(|n| -signal(n));
     let links: Vec<OwnLink> = links
         .into_iter()
-        .map(|((from, to, radio), signal)| OwnLink { from_name: ap_name(&live, &from), to_name: ap_name(&live, &to), from, to, radio: radio.map(str::to_string), signal })
+        .map(|((from, to, radio), signal)| OwnLink { from_name: name(&from), to_name: name(to), from, to: to.to_string(), radio: radio.map(str::to_string), signal })
         .collect();
     Ok(Json(json!({ "neighbors": list, "own_links": links })))
 }
@@ -1395,11 +1409,8 @@ pub async fn compute_plan(s: &AppState, radio: String, dfs: bool, allowed: Optio
             })
             .collect();
         // Our APs' BSSIDs on this band, to separate own signal from neighbours.
-        let own: HashMap<String, String> = live
-            .devices
-            .iter()
-            .flat_map(|(m, d)| d.snapshot.vaps.iter().filter(|v| v.radio.as_deref() == Some(radio.as_str())).map(move |v| (v.bssid.clone(), m.to_string())))
-            .collect();
+        let own: HashMap<String, String> =
+            own_bssids(&live).filter(|(_, v)| v.radio.as_deref() == Some(radio.as_str())).map(|(m, v)| (v.bssid.clone(), m.to_string())).collect();
         (aps, own)
     };
     let work = move || plan_channels(radio, dfs, allowed, pinned, aps, own_bssids, neigh, spectrum);
