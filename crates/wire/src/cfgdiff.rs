@@ -1,23 +1,27 @@
 //! Diffs `system_cfg` / `mgmt_cfg` blobs, which are newline-separated `key=value` lines.
 
 use std::borrow::Cow;
-use std::collections::BTreeMap;
+use std::cmp::Ordering;
 use std::fmt::Write;
 
 use serde_json::{Value, json};
 
-/// The values of each key, in order (a key can repeat), borrowed from `cfg`.
-fn parse(cfg: &str) -> BTreeMap<&str, Vec<&str>> {
-    let mut map: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
-    for line in cfg.lines() {
-        let line = line.trim_end();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        let (k, v) = line.split_once('=').unwrap_or((line, ""));
-        map.entry(k).or_default().push(v);
-    }
-    map
+/// The `(key, value)` lines of `cfg`, borrowed from it, sorted by key. A key can repeat;
+/// its values stay in order (the sort is stable).
+fn parse(cfg: &str) -> Vec<(&str, &str)> {
+    let mut lines: Vec<(&str, &str)> = cfg
+        .lines()
+        .map(str::trim_end)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .map(|line| line.split_once('=').unwrap_or((line, "")))
+        .collect();
+    lines.sort_by_key(|&(k, _)| k);
+    lines
+}
+
+/// Each key of sorted lines, with its lines.
+fn by_key<'a, 'l>(lines: &'l [(&'a str, &'a str)]) -> impl Iterator<Item = (&'a str, &'l [(&'a str, &'a str)])> {
+    lines.chunk_by(|a, b| a.0 == b.0).map(|run| (run[0].0, run))
 }
 
 /// What changed between two configs, borrowed from them. A key's value is its line's
@@ -114,17 +118,36 @@ pub fn redact(cfg: &str) -> String {
 pub fn diff<'a>(old: &'a str, new: &'a str) -> Diff<'a> {
     let (old, new) = (parse(old), parse(new));
     let mut d = Diff::default();
-    let join = |v: &[&'a str]| -> Cow<'a, str> { if let [one] = v { Cow::Borrowed(*one) } else { Cow::Owned(v.join(" | ")) } };
-    for (&k, nv) in &new {
-        match old.get(k) {
-            None => d.added.push((k, join(nv))),
-            Some(ov) if ov != nv => d.changed.push((k, join(ov), join(nv))),
-            _ => {}
+    let join = |v: &[(&'a str, &'a str)]| -> Cow<'a, str> {
+        match v {
+            [(_, one)] => Cow::Borrowed(*one),
+            _ => Cow::Owned(v.iter().map(|(_, v)| *v).collect::<Vec<_>>().join(" | ")),
         }
-    }
-    for (&k, ov) in &old {
-        if !new.contains_key(k) {
-            d.removed.push((k, join(ov)));
+    };
+    // Both are sorted by key: walk them side by side.
+    let (mut old, mut new) = (by_key(&old).peekable(), by_key(&new).peekable());
+    loop {
+        let order = match (old.peek(), new.peek()) {
+            (None, None) => break,
+            (Some(_), None) => Ordering::Less,
+            (None, Some(_)) => Ordering::Greater,
+            (Some((o, _)), Some((n, _))) => o.cmp(n),
+        };
+        match order {
+            Ordering::Less => {
+                let (k, ov) = old.next().unwrap();
+                d.removed.push((k, join(ov)));
+            }
+            Ordering::Greater => {
+                let (k, nv) = new.next().unwrap();
+                d.added.push((k, join(nv)));
+            }
+            Ordering::Equal => {
+                let ((k, ov), (_, nv)) = (old.next().unwrap(), new.next().unwrap());
+                if !ov.iter().map(|(_, v)| v).eq(nv.iter().map(|(_, v)| v)) {
+                    d.changed.push((k, join(ov), join(nv)));
+                }
+            }
         }
     }
     d
@@ -146,6 +169,8 @@ mod tests {
         assert!(matches!(d.added[0].1, Cow::Borrowed(_)), "single values are borrowed");
         let repeated = diff("a=1\n", "a=1\na=2\n");
         assert_eq!(repeated.changed, vec![("a", "1".into(), Cow::Owned::<str>("1 | 2".into()))]);
+        assert!(diff("a=1\nb=x\n# note\na=2\n", "b=x\na=1\n\na=2\n").is_empty(), "a repeated key's values in order, wherever they are");
+        assert_eq!(diff("a=2\na=1\nc\n", "a=1\na=2\nc=\n").changed, vec![("a", "2 | 1".into(), "1 | 2".into())]);
         assert_eq!(d.counts(), [1, 1, 1]);
         assert_eq!(diff("x.psk=a", "x.psk=b").summary(), serde_json::json!({ "added": 0, "removed": 0, "changed": 1, "diff": "~ x.psk: <redacted> -> <redacted>\n" }));
         assert_eq!(d.render("  ", false), "  - radio.1.channel=36\n  ~ wireless.1.security: wpa2 -> wpa3\n  + wireless.2.ssid=Test\n");
