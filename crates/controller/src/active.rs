@@ -19,6 +19,7 @@
 //! pushing the same config again under a new token.
 
 use std::collections::HashMap;
+use std::net::IpAddr;
 use std::sync::{Arc, Mutex, Weak};
 
 use axum::body::Bytes;
@@ -28,6 +29,7 @@ use axum::response::{IntoResponse, Response};
 use inform::{DEFAULT_KEY, Flags, Mac, Packet};
 use rusqlite::types::Value as Sql;
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use tokio::sync::{Semaphore, SemaphorePermit, mpsc};
 use wire::decode::{Decoded, KeyUsed, open_with};
 use wire::keys::KeyStore;
@@ -41,9 +43,9 @@ use crate::store::{self, Db, PushedConfig, Store, Writer};
 struct Managed {
     /// The cfgversion of the config apctl considers current for this AP.
     cfgversion: Option<String>,
-    /// The rendered config with a placeholder cfgversion, to detect changes
-    /// (shared with the render it came from).
-    content: Option<Arc<str>>,
+    /// The digest of the config that cfgversion stands for (`Render::digest`),
+    /// to detect changes. Only the digest is stored: the config holds secrets.
+    content: Option<[u8; 32]>,
     /// Set once the AP has used AES-GCM; CBC is refused after that.
     gcm: bool,
     /// The last render (memory only): reused while its inputs are unchanged.
@@ -61,8 +63,34 @@ struct Render {
     inputs: Value,
     out: apcfg::Output,
     blocked: String,
-    /// Both configs and the blocked clients, as compared with `Managed::content`.
-    content: Arc<str>,
+    /// The digest of both configs and the blocked clients (see `content_digest`),
+    /// as compared with `Managed::content`.
+    digest: [u8; 32],
+}
+
+/// SHA-256 of `mgmt_cfg`, `system_cfg` and `blocked_sta` joined by `\n--\n`:
+/// the text `managed_devices.content` held before it held this digest.
+fn content_digest(mgmt: &str, system: &str, blocked: &str) -> [u8; 32] {
+    let mut h = Sha256::new();
+    for (i, part) in [mgmt, system, blocked].into_iter().enumerate() {
+        if i > 0 {
+            h.update(b"\n--\n");
+        }
+        h.update(part.as_bytes());
+    }
+    h.finalize().into()
+}
+
+/// A stored `managed_devices.content`: a digest in hex. A row from before
+/// apctl stored digests holds the rendered text itself, whose digest equals
+/// that of the same config rendered now, so an upgrade pushes nothing again;
+/// true for such a row, to rewrite it with the digest.
+fn stored_digest(content: &str) -> ([u8; 32], bool) {
+    let mut digest = [0u8; 32];
+    match hex::decode_to_slice(content, &mut digest) {
+        Ok(()) => (digest, false),
+        Err(_) => (Sha256::digest(content.as_bytes()).into(), true),
+    }
 }
 
 pub struct Active {
@@ -136,20 +164,35 @@ impl Active {
             let mut stmt = c.prepare("SELECT mac, cfgversion, content, gcm FROM managed_devices")?;
             let rows = stmt
                 .query_map([], |r| {
-                    Ok((
-                        r.get::<_, String>(0)?,
-                        Managed { cfgversion: r.get(1)?, content: r.get::<_, Option<String>>(2)?.map(Arc::from), gcm: r.get::<_, i64>(3)? != 0, render: None },
-                    ))
+                    let content = r.get::<_, Option<String>>(2)?.map(|c| stored_digest(&c));
+                    let managed = Managed { cfgversion: r.get(1)?, content: content.map(|c| c.0), gcm: r.get::<_, i64>(3)? != 0, render: None };
+                    Ok((r.get::<_, String>(0)?, managed, content.is_some_and(|c| c.1)))
                 })?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
             Ok(rows)
         })?;
-        let devices = rows.into_iter().filter_map(|(m, d)| m.parse().ok().map(|m| (m, d))).collect();
+        let mut legacy = Vec::new();
+        let mut devices = HashMap::new();
+        for (m, d, old) in rows {
+            let Ok(m) = m.parse::<Mac>() else { continue };
+            if old {
+                legacy.push((m, d.clone()));
+            }
+            devices.insert(m, d);
+        }
         let cpus = std::thread::available_parallelism().map_or(4, |n| n.get());
-        Ok(Active {
+        let active = Active {
             live, keys, engine, writer, controller, devices: Mutex::new(devices), store: store.clone(), adoption_cfgs: Default::default(),
             work: Semaphore::new(cpus), strangers: Semaphore::new((cpus / 2).max(1)), proxies,
-        })
+        };
+        // Rows holding the rendered config (with its secrets) get its digest instead.
+        if !legacy.is_empty() {
+            tracing::info!("replacing the stored configs of {} managed APs with their digests", legacy.len());
+        }
+        for (m, d) in legacy {
+            active.persist(m, &d);
+        }
+        Ok(active)
     }
 
     fn persist(&self, mac: Mac, d: &Managed) {
@@ -159,7 +202,7 @@ impl Active {
             vec![
                 Sql::Text(mac.to_string()),
                 d.cfgversion.clone().map_or(Sql::Null, Sql::Text),
-                d.content.as_deref().map_or(Sql::Null, |c| Sql::Text(c.to_string())),
+                d.content.map_or(Sql::Null, |c| Sql::Text(hex::encode(c))),
                 Sql::Integer(d.gcm as i64),
                 Sql::Integer(store::now_ts()),
             ],
@@ -176,16 +219,15 @@ impl Active {
     /// neither the settings nor what it read of the inform changed (most
     /// informs), else a new one. The lock is not held while rendering.
     fn placeholder_render(&self, state: &Arc<Value>, mac: Mac, payload: &Value) -> anyhow::Result<Arc<Render>> {
-        let inputs = apcfg::inform_inputs(payload);
         let last = self.devices.lock().unwrap().get(&mac).and_then(|d| d.render.clone());
-        if let Some(r) = last.filter(|r| std::ptr::eq(r.state.as_ptr(), Arc::as_ptr(state)) && r.inputs == inputs) {
+        if let Some(r) = last.filter(|r| std::ptr::eq(r.state.as_ptr(), Arc::as_ptr(state)) && apcfg::inform_inputs_match(&r.inputs, payload)) {
             return Ok(r);
         }
         let out = self.render(state, mac, payload, PLACEHOLDER)?;
         let site_id = crate::adopt::device_doc(state, &mac).and_then(|d| d["site_id"].as_str()).unwrap_or("");
         let blocked = apcfg::blocked_sta(state, site_id);
-        let content: Arc<str> = format!("{}\n--\n{}\n--\n{}", out.rendered.mgmt_cfg, out.rendered.system_cfg, blocked).into();
-        let r = Arc::new(Render { state: Arc::downgrade(state), inputs, out, blocked, content });
+        let digest = content_digest(&out.rendered.mgmt_cfg, &out.rendered.system_cfg, &blocked);
+        let r = Arc::new(Render { state: Arc::downgrade(state), inputs: apcfg::inform_inputs(payload), out, blocked, digest });
         self.devices.lock().unwrap().entry(mac).or_default().render = Some(r.clone());
         Ok(r)
     }
@@ -351,7 +393,7 @@ impl Active {
         let (current, changed) = {
             let devices = self.devices.lock().unwrap();
             let d = devices.get(&mac);
-            let same = d.and_then(|d| d.content.as_ref()).is_some_and(|c| Arc::ptr_eq(c, &render.content) || *c == render.content);
+            let same = d.and_then(|d| d.content) == Some(render.digest);
             (d.and_then(|d| d.cfgversion.clone()), force || !same)
         };
         if !changed {
@@ -365,7 +407,7 @@ impl Active {
             let mut devices = self.devices.lock().unwrap();
             let d = devices.entry(mac).or_default();
             d.cfgversion = Some(version.clone());
-            d.content = Some(render.content.clone());
+            d.content = Some(render.digest);
             d.clone()
         };
         self.persist(mac, &snapshot);
@@ -473,6 +515,27 @@ fn status(code: StatusCode) -> Response {
 /// controller has no such wait).
 const RESET_QUIET_SECS: Ts = 600;
 
+/// Who sent an inform, and the key it was opened with: what answering it needs.
+struct Caller {
+    mac: Mac,
+    gcm: bool,
+    key: [u8; 16],
+    /// The address the inform came from.
+    peer: IpAddr,
+    /// The AP's own address: `peer`, or behind a trusted proxy what it says.
+    source: IpAddr,
+}
+
+impl Caller {
+    /// A reply in the request's encryption mode, never compressed, with a
+    /// fresh IV, serialised straight into the packet.
+    fn seal(&self, reply: &Value) -> Response {
+        let flags = Flags(Flags::ENCRYPTED | if self.gcm { Flags::GCM } else { 0 });
+        let packet = inform::seal_with(self.mac, flags, random_bytes::<16>(), &self.key, |out| serde_json::to_writer(out, reply).expect("a JSON value serialises"));
+        ([(header::CONTENT_TYPE, "application/x-binary")], packet).into_response()
+    }
+}
+
 /// POST /inform
 pub async fn inform(
     State(active): State<Arc<Active>>,
@@ -483,7 +546,6 @@ pub async fn inform(
     let ts = store::now_ts();
     let Ok(header) = Packet::parse(&body).map(|p| p.header) else { return status(StatusCode::BAD_REQUEST) };
     let mac = header.mac;
-    let gcm = header.flags.has(Flags::GCM);
     // An unencrypted packet "opens" with any key: it proves nothing.
     if !header.flags.has(Flags::ENCRYPTED) {
         tracing::warn!("{mac}: refusing an unencrypted inform from {}", peer.ip());
@@ -501,42 +563,58 @@ pub async fn inform(
         tracing::warn!("{mac}: header and payload MACs differ");
         return status(StatusCode::BAD_REQUEST);
     }
-    if device_key.is_none() || used == KeyUsed::Default {
-        let known = device_key.is_some();
-        let adopting = active.live.read().unwrap().adoption.adopting.contains_key(&mac);
-        if known && adopting {
-            // Adopt pressed: hand the AP its own key (in mgmt_cfg), with the factory key.
-            let a = active.clone();
-            let Ok(reply) = tokio::task::spawn_blocking(move || a.adoption_reply(ts, mac, &payload)).await else {
-                return status(StatusCode::INTERNAL_SERVER_ERROR);
-            };
-            tracing::info!("{mac}: adoption: sending its key");
-            return sealed(mac, gcm, &key, &reply);
-        }
-        // Not ours, or ours but reset: answered 404 and listed for adoption.
-        // What apctl remembers about an AP it no longer has (e.g. AES-GCM) goes.
-        // For one it has, the factory key proves nothing (anyone can send this
-        // under its MAC): that is kept until it is adopted again.
-        if !known {
-            active.devices.lock().unwrap().remove(&mac);
-        } else if active.live.read().unwrap().devices.get(&mac).is_some_and(|d| ts - d.last_seen < RESET_QUIET_SECS) {
-            // It informed with its own key moments ago: a reset AP is silent
-            // while it reboots, so this is most likely someone else. Listing
-            // it would let an Adopt hand them the AP's key.
-            tracing::warn!("{mac}: factory-key inform from {} while the AP still informs with its own key: ignored", peer.ip());
-            return status(StatusCode::NOT_FOUND);
-        }
-        let inform = crate::adopt::pending_inform(&payload);
-        drop(payload);
-        let data = json!({ "model": inform["model"], "ip": inform["ip"], "known": known });
-        let source = active.proxies.client_ip(&headers, peer.ip());
-        let new = crate::adopt::note_pending(&mut active.live.write().unwrap(), inform, known, ts, source);
-        if new {
-            tracing::info!("{mac}: {} informing from {}", if known { "reset AP (adoption required)" } else { "AP waiting for adoption" }, peer.ip());
-            let _ = active.engine.send(Input::Note(Event::device(ts, EventKind::ApPending, mac, data))).await;
-        }
+    let caller = Caller { mac, gcm: header.flags.has(Flags::GCM), key, peer: peer.ip(), source: active.proxies.client_ip(&headers, peer.ip()) };
+    // Only an AP apctl manages is tried with a key of its own.
+    if used == KeyUsed::Default {
+        factory_key_inform(&active, ts, &caller, payload, device_key.is_some()).await
+    } else {
+        managed_inform(&active, ts, &caller, header, used, payload).await
+    }
+}
+
+/// An inform under the factory key: an AP apctl is adopting gets its own key;
+/// any other is answered 404 and listed for adoption. `known`: apctl manages
+/// an AP of this MAC.
+async fn factory_key_inform(active: &Arc<Active>, ts: Ts, caller: &Caller, payload: Value, known: bool) -> Response {
+    let mac = caller.mac;
+    let adopting = active.live.read().unwrap().adoption.adopting.contains_key(&mac);
+    if known && adopting {
+        // Adopt pressed: hand the AP its own key (in mgmt_cfg), with the factory key.
+        let a = active.clone();
+        let Ok(reply) = tokio::task::spawn_blocking(move || a.adoption_reply(ts, mac, &payload)).await else {
+            return status(StatusCode::INTERNAL_SERVER_ERROR);
+        };
+        tracing::info!("{mac}: adoption: sending its key");
+        return caller.seal(&reply);
+    }
+    // Not ours, or ours but reset: answered 404 and listed for adoption.
+    // What apctl remembers about an AP it no longer has (e.g. AES-GCM) goes.
+    // For one it has, the factory key proves nothing (anyone can send this
+    // under its MAC): that is kept until it is adopted again.
+    if !known {
+        active.devices.lock().unwrap().remove(&mac);
+    } else if active.live.read().unwrap().devices.get(&mac).is_some_and(|d| ts - d.last_seen < RESET_QUIET_SECS) {
+        // It informed with its own key moments ago: a reset AP is silent
+        // while it reboots, so this is most likely someone else. Listing
+        // it would let an Adopt hand them the AP's key.
+        tracing::warn!("{mac}: factory-key inform from {} while the AP still informs with its own key: ignored", caller.peer);
         return status(StatusCode::NOT_FOUND);
     }
+    let inform = crate::adopt::pending_inform(&payload);
+    drop(payload);
+    let data = json!({ "model": inform["model"], "ip": inform["ip"], "known": known });
+    let new = crate::adopt::note_pending(&mut active.live.write().unwrap(), inform, known, ts, caller.source);
+    if new {
+        tracing::info!("{mac}: {} informing from {}", if known { "reset AP (adoption required)" } else { "AP waiting for adoption" }, caller.peer);
+        let _ = active.engine.send(Input::Note(Event::device(ts, EventKind::ApPending, mac, data))).await;
+    }
+    status(StatusCode::NOT_FOUND)
+}
+
+/// An inform under an AP's own key: the reply to it (a config push, a
+/// command, a heartbeat), and the inform for the engine.
+async fn managed_inform(active: &Arc<Active>, ts: Ts, caller: &Caller, header: inform::Header, used: KeyUsed, payload: Value) -> Response {
+    let (mac, gcm) = (caller.mac, caller.gcm);
     // Its own key: an adoption is complete; a forgotten AP is told to reset
     // (once: the entry goes, so later informs don't finish the forget again).
     let (was_adopting, forgetting) = {
@@ -567,7 +645,7 @@ pub async fn inform(
         tokio::spawn(async move { crate::adopt::finish_forget(&engine, mac, true).await });
         active.devices.lock().unwrap().remove(&mac);
         let reply = json!({ "_type": "setdefault", "server_time_in_utc": (ts * 1000).to_string() });
-        return sealed(mac, gcm, &key, &reply);
+        return caller.seal(&reply);
     }
     {
         let mut devices = active.devices.lock().unwrap();
@@ -584,17 +662,16 @@ pub async fn inform(
         }
     }
 
-    let peer_ip = active.proxies.client_ip(&headers, peer.ip()).to_string();
     // Rendering the config takes a while: off the async workers.
     let a = active.clone();
     let Ok((reply, payload)) = tokio::task::spawn_blocking(move || (a.reply(ts, mac, &payload), payload)).await else {
         return status(StatusCode::INTERNAL_SERVER_ERROR);
     };
     let decoded = Decoded { header, key: used, payload };
-    if active.engine.send(Input::Inform { ts, peer: peer_ip, decoded }).await.is_err() {
+    if active.engine.send(Input::Inform { ts, peer: caller.source.to_string(), decoded }).await.is_err() {
         return status(StatusCode::SERVICE_UNAVAILABLE);
     }
-    let response = sealed(mac, gcm, &key, &reply);
+    let response = caller.seal(&reply);
     // The engine follows the interval it asked for (or the AP would be called
     // offline on a site where informs come more than a minute apart) and
     // records each push.
@@ -602,13 +679,6 @@ pub async fn inform(
         let _ = active.engine.send(Input::Replied { ts, mac, payload: reply }).await;
     }
     response
-}
-
-/// A reply in the request's encryption mode, never compressed, with a fresh IV.
-fn sealed(mac: Mac, gcm: bool, key: &[u8; 16], reply: &Value) -> Response {
-    let flags = Flags(Flags::ENCRYPTED | if gcm { Flags::GCM } else { 0 });
-    let packet = inform::seal(mac, flags, random_bytes::<16>(), key, reply.to_string().as_bytes());
-    ([(header::CONTENT_TYPE, "application/x-binary")], packet).into_response()
 }
 
 #[cfg(test)]
@@ -660,17 +730,20 @@ mod tests {
         let mut keys = KeyStore::default();
         keys.insert(AP, &hex::encode(KEY)).unwrap();
         let (tx, rx) = mpsc::channel(1000);
-        let controller = apcfg::Controller {
+        let active = Arc::new(Active::new(&store, writer, live.clone(), Arc::new(keys), tx, controller(), Default::default()).unwrap());
+        let app = axum::Router::new().route("/inform", axum::routing::post(inform)).with_state(active.clone());
+        Rig { app, live, rx, active }
+    }
+
+    fn controller() -> apcfg::Controller {
+        apcfg::Controller {
             inform_url: "http://unifi.example.net:8080/inform".into(),
             mgmt_url: "https://unifi.example.net:8443".into(),
             stun_url: "stun://unifi.example.net:3478/".into(),
             syslog_ip: None,
             version: "10.6.106".into(),
             reporter_uuid: "00000000-0000-4000-8000-000000000004".into(),
-        };
-        let active = Arc::new(Active::new(&store, writer, live.clone(), Arc::new(keys), tx, controller, Default::default()).unwrap());
-        let app = axum::Router::new().route("/inform", axum::routing::post(inform)).with_state(active.clone());
-        Rig { app, live, rx, active }
+        }
     }
 
     /// The AP's own inform (sanitised capture), with a chosen cfgversion.
@@ -782,7 +855,7 @@ mod tests {
         {
             let mut live = rig.live.write().unwrap();
             let mut state = live.state.as_deref().cloned().unwrap();
-            crate::actions::edit_client(&mut state, "aa:bb:cc:00:00:09", &[("blocked", json!(true))]);
+            crate::actions::edit_client(&mut state, "aa:bb:cc:00:00:09".parse().unwrap(), &[("blocked", json!(true))]);
             live.state = Some(Arc::new(state));
         }
         let (_, reply) = inform_as_ap(&rig, &ap_payload(&version), KEY, GCM_ZLIB).await;
@@ -1021,6 +1094,30 @@ mod tests {
     }
 
     #[test]
+    fn only_a_digest_of_the_config_is_stored_and_old_rows_keep_their_version() {
+        let Some(_) = fixtures() else { return };
+        let rig = rig(true, None);
+        let ap: Mac = AP.parse().unwrap();
+        let state = rig.live.read().unwrap().state.clone().unwrap();
+        let render = rig.active.placeholder_render(&state, ap, &ap_payload("1")).unwrap();
+        // As written before digests: the rendered text itself, secrets and all.
+        let text = format!("{}\n--\n{}\n--\n{}", render.out.rendered.mgmt_cfg, render.out.rendered.system_cfg, render.blocked);
+        let (a, w) = (&rig.active, &rig.active.writer);
+        w.exec(Db::Config, "INSERT INTO managed_devices (mac, cfgversion, content, gcm, updated) VALUES (?1, 'abcdefabcdefabcd', ?2, 1, 0)", vec![Sql::Text(AP.into()), Sql::Text(text)]);
+        assert!(w.flush(std::time::Duration::from_secs(5)));
+        // After a restart it reads as the digest of the same render: the config is current, under the version it had.
+        let (tx, _rx) = mpsc::channel(10);
+        let again = Active::new(&a.store, w.clone(), rig.live.clone(), a.keys.clone(), tx, controller(), Default::default()).unwrap();
+        assert_eq!(again.devices.lock().unwrap()[&ap].content, Some(render.digest));
+        assert_eq!(again.decide_version(ap, "abcdefabcdefabcd", &render, false), "abcdefabcdefabcd");
+        // And the row is rewritten with the digest alone.
+        assert!(w.flush(std::time::Duration::from_secs(5)));
+        let stored: String = a.store.read(Db::Config, |c| Ok(c.query_row("SELECT content FROM managed_devices WHERE mac = ?1", [AP], |r| r.get(0))?)).unwrap();
+        assert_eq!(stored, hex::encode(render.digest));
+        assert_eq!(stored_digest(&stored), (render.digest, false));
+    }
+
+    #[test]
     fn patching_the_cfgversion_equals_rendering_with_it() {
         let Some(_) = fixtures() else { return };
         let rig = rig(true, None);
@@ -1031,6 +1128,31 @@ mod tests {
         assert_eq!(with_cfgversion(&probe.rendered.mgmt_cfg, "0123456789abcdef"), real.rendered.mgmt_cfg);
         assert_eq!(probe.rendered.system_cfg, real.rendered.system_cfg);
         assert_eq!(with_cfgversion("cfgversion=0000000000000000\nx=1\n", "ab"), "cfgversion=ab\nx=1\n");
+    }
+
+    #[test]
+    fn inform_inputs_match_as_the_inputs_compare() {
+        let base = json!({ "fw_caps": 1, "uptime": 5, "vap_table": [{ "name": "ath0", "tx_bytes": 9 }], "port_table": [{ "ifname": "eth0" }] });
+        let inputs = apcfg::inform_inputs(&base);
+        let changed = |f: &dyn Fn(&mut Value)| {
+            let mut p = base.clone();
+            f(&mut p);
+            p
+        };
+        for p in [
+            base.clone(),
+            changed(&|p| p["uptime"] = json!(6)),
+            changed(&|p| p["vap_table"][0]["tx_bytes"] = json!(10)),
+            changed(&|p| p["has_eth1"] = json!(true)),
+            changed(&|p| p["fw_caps"] = json!(2)),
+            changed(&|p| p["vap_table"] = json!([{ "name": "ath0" }, { "name": "ath1" }])),
+            changed(&|p| p["vap_table"] = json!({})),
+            changed(&|p| p["port_table"] = Value::Null),
+            changed(&|p| p["port_table"][0]["ifname"] = json!("eth1")),
+            json!(null),
+        ] {
+            assert_eq!(apcfg::inform_inputs_match(&inputs, &p), apcfg::inform_inputs(&p) == inputs, "{p}");
+        }
     }
 
     #[test]

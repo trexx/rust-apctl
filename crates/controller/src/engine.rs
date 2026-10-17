@@ -2106,7 +2106,7 @@ mod tests {
         assert!(edit(&mut h, Box::new(|_| Ok("nothing".into()))).is_err(), "nothing to edit before an import");
         h.engine.handle(Input::SetState { ts: 1, state: json!({ "clients": [] }) });
         let what = edit(&mut h, Box::new(|s| {
-            crate::actions::edit_client(s, C1, &[("blocked", json!(true))]);
+            crate::actions::edit_client(s, C1.parse().unwrap(), &[("blocked", json!(true))]);
             Ok("blocked client".into())
         }));
         assert_eq!(what.as_deref(), Ok("blocked client"), "what the edit itself reports");

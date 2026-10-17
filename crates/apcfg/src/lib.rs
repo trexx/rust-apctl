@@ -107,6 +107,18 @@ pub fn inform_inputs(inform: &Value) -> Value {
     Value::Object(out)
 }
 
+/// Whether `inform` agrees on what a render reads with the inform `inputs` were
+/// made from: `inform_inputs(inform) == *inputs`, without building it (the
+/// controller asks this for every inform).
+pub fn inform_inputs_match(inputs: &Value, inform: &Value) -> bool {
+    INFORM_KEYS.iter().all(|&k| inputs[k] == inform[k])
+        && INFORM_TABLE_KEYS.iter().all(|&(table, key)| match (&inputs[table], inform[table].as_array()) {
+            (Value::Array(seen), Some(rows)) => seen.len() == rows.len() && seen.iter().zip(rows).all(|(s, row)| *s == row[key]),
+            (Value::Null, None) => true,
+            _ => false,
+        })
+}
+
 /// The fields of a `clients` (user) document a render reads: blocked clients and
 /// clients locked to an AP.
 pub const CLIENT_KEYS: &[&str] = &["mac", "site_id", "blocked", "fixed_ap_enabled", "fixed_ap_mac"];

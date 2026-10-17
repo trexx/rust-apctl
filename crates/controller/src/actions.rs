@@ -67,31 +67,19 @@ pub fn next(live: &mut Live, mac: &Mac) -> Option<Value> {
     cmd
 }
 
-/// Sets fields on a client's entry in the settings, creating it if needed.
-pub fn edit_client(state: &mut Value, mac: &str, fields: &[(&str, Value)]) {
-    let site = crate::settings::site_id(state).map(str::to_string);
-    let list = crate::settings::array_mut(state, "clients");
+/// Sets fields on a client's entry in the settings, creating it (with the
+/// MAC as `aa:bb:..`) if needed.
+pub fn edit_client(state: &mut Value, mac: Mac, fields: &[(&str, Value)]) {
     // Matched as `controls` reads them, whichever way the entry writes its MAC.
-    let parsed = mac.parse::<Mac>().ok();
-    let entry = match list.iter().position(|c| parsed.map_or_else(|| same_mac(c, mac), |m| entry_mac(c) == Some(m))) {
-        Some(i) => &mut list[i],
-        None => {
-            let mut c = json!({ "mac": mac });
-            if let Some(s) = site {
-                c["site_id"] = json!(s);
-            }
-            list.push(c);
-            list.last_mut().expect("just pushed")
-        }
+    let entry = match state["clients"].as_array().and_then(|l| l.iter().position(|c| entry_mac(c) == Some(mac))) {
+        Some(i) => &mut state["clients"][i],
+        None => crate::settings::push_doc(state, "clients", json!({ "mac": mac.to_string() })),
     };
     for (k, v) in fields {
         entry[*k] = v.clone();
     }
 }
 
-fn same_mac(c: &Value, mac: &str) -> bool {
-    c["mac"].as_str().is_some_and(|m| m.eq_ignore_ascii_case(mac))
-}
 
 /// A client's `blocked`, `locked_to` and own speed limit (`usergroup_id`) from
 /// the settings, as its view shows them.
@@ -246,11 +234,10 @@ pub struct BlockBody {
 pub async fn block(State(s): State<AppState>, Path(mac): Path<String>, Json(b): Json<BlockBody>) -> Result<Json<Value>, ApiError> {
     crate::api::require_active(&s, "this needs")?;
     let client = crate::api::parse_mac(&mac)?;
-    let m = client.to_string();
     let blocked = b.blocked;
-    let what = if blocked { format!("blocked client {m}") } else { format!("unblocked client {m}") };
+    let what = if blocked { format!("blocked client {client}") } else { format!("unblocked client {client}") };
     edit_settings(&s, what, move |state| {
-        edit_client(state, &m, &[("blocked", json!(blocked))]);
+        edit_client(state, client, &[("blocked", json!(blocked))]);
         Ok(())
     })
     .await?;
@@ -284,14 +271,13 @@ pub async fn lock(State(s): State<AppState>, Path(mac): Path<String>, Json(b): J
         }
         None => None,
     };
-    let m = client.to_string();
     let what = match &ap {
-        Some(a) => format!("locked client {m} to AP {a}"),
-        None => format!("unlocked client {m}"),
+        Some(a) => format!("locked client {client} to AP {a}"),
+        None => format!("unlocked client {client}"),
     };
     let fields = vec![("fixed_ap_enabled", json!(ap.is_some())), ("fixed_ap_mac", ap.clone().map_or(Value::Null, Value::String))];
     edit_settings(&s, what, move |state| {
-        edit_client(state, &m, &fields);
+        edit_client(state, client, &fields);
         Ok(())
     })
     .await?;
@@ -357,14 +343,13 @@ mod tests {
     #[test]
     fn client_settings_are_edited_or_created() {
         let mut state = json!({ "devices": [{ "mac": "02:00:00:00:00:01", "site_id": "s1" }], "clients": [{ "mac": "AA:BB:CC:00:00:01", "name": "tv" }] });
-        edit_client(&mut state, "aa:bb:cc:00:00:01", &[("blocked", json!(true))]);
+        let mac = |s: &str| s.parse::<Mac>().unwrap();
+        edit_client(&mut state, mac("aa:bb:cc:00:00:01"), &[("blocked", json!(true))]);
         assert_eq!(state["clients"][0]["blocked"], true);
         assert_eq!(state["clients"][0]["name"], "tv", "other fields kept");
-        edit_client(&mut state, "aa:bb:cc:00:00:02", &[("fixed_ap_enabled", json!(true)), ("fixed_ap_mac", json!("02:00:00:00:00:01"))]);
-        assert_eq!(state["clients"][1]["site_id"], "s1");
+        edit_client(&mut state, mac("AA-BB-CC-00-00-02"), &[("fixed_ap_enabled", json!(true)), ("fixed_ap_mac", json!("02:00:00:00:00:01"))]);
+        assert_eq!((state["clients"][1]["site_id"].as_str(), state["clients"][1]["mac"].as_str()), (Some("s1"), Some("aa:bb:cc:00:00:02")), "a new entry's MAC is canonical");
         assert_eq!(apcfg::blocked_sta(&state, "s1"), "aa:bb:cc:00:00:01");
-
-        let mac = |s: &str| s.parse::<Mac>().unwrap();
         let c = controls(Some(&state), &mac("AA:BB:CC:00:00:02"));
         assert_eq!((c.blocked, c.locked_to.as_deref()), (false, Some("02:00:00:00:00:01")));
         assert_eq!(serde_json::to_value(controls(Some(&state), &mac("aa:bb:cc:00:00:01"))).unwrap(), json!({ "blocked": true, "locked_to": null, "usergroup_id": null }));
@@ -374,8 +359,8 @@ mod tests {
         }
         // An entry that writes its MAC another way is the one edited, as the one shown.
         let mut state = json!({ "clients": [{ "mac": "AA-BB-CC-00-00-04" }, { "mac": "aabbcc000005" }] });
-        edit_client(&mut state, "aa:bb:cc:00:00:04", &[("blocked", json!(true))]);
-        edit_client(&mut state, "aa:bb:cc:00:00:05", &[("blocked", json!(true))]);
+        edit_client(&mut state, mac("aa:bb:cc:00:00:04"), &[("blocked", json!(true))]);
+        edit_client(&mut state, mac("aabbcc000005"), &[("blocked", json!(true))]);
         assert_eq!(state["clients"].as_array().unwrap().len(), 2, "no duplicate");
         assert!(controls(Some(&state), &mac("aa:bb:cc:00:00:04")).blocked && controls(Some(&state), &mac("aa:bb:cc:00:00:05")).blocked);
     }

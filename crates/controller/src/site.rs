@@ -11,19 +11,20 @@ use std::sync::LazyLock;
 
 use crate::api::{ApiError, AppState};
 use crate::settings::Kind::{Bool, Int};
-use crate::settings::{COUNTRY_NAMES, Patch, PreviewQuery, band_name, copy_fields, country, dedup_in_order, docs_mut, illegal_fixed_channel, mgmt_flag, num, outdoor_with, setting, setting_mut};
+use crate::settings::{COUNTRIES, Patch, PreviewQuery, band_name, copy_fields, country, dedup_in_order, docs_mut, illegal_fixed_channel, mgmt_flag, num, outdoor_with, setting, setting_mut};
 
 /// A host name or IPv4 address, as NTP and syslog targets take (the official
-/// controller refuses IPv6 there).
+/// controller refuses IPv6 there). A name's labels are letters, digits and
+/// hyphens, neither starting nor ending with a hyphen.
 fn is_host(h: &str) -> bool {
-    !h.is_empty()
-        && h.len() <= 253
-        && (h.parse::<std::net::Ipv4Addr>().is_ok()
-            || h.chars().any(|c| c.is_ascii_alphabetic()) && h.split('.').all(|l| !l.is_empty() && l.len() <= 63 && l.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')))
+    let label = |l: &str| !l.is_empty() && l.len() <= 63 && !l.starts_with('-') && !l.ends_with('-') && l.chars().all(|c| c.is_ascii_alphanumeric() || c == '-');
+    !h.is_empty() && h.len() <= 253 && (h.parse::<std::net::Ipv4Addr>().is_ok() || h.chars().any(|c| c.is_ascii_alphabetic()) && h.split('.').all(label))
 }
 
 /// The servers automatic NTP stands for.
 const NTP_POOL: [&str; 4] = ["0.ubnt.pool.ntp.org", "1.ubnt.pool.ntp.org", "2.ubnt.pool.ntp.org", "3.ubnt.pool.ntp.org"];
+/// The `ntp` setting's four servers, in order.
+const NTP_KEYS: [&str; 4] = ["ntp_server_1", "ntp_server_2", "ntp_server_3", "ntp_server_4"];
 
 /// Sets fixed channels that the site's country and the APs' indoor/outdoor
 /// mode no longer allow back to auto, as the official controller does when
@@ -186,27 +187,27 @@ fn site_ntp(doc: &mut Value, n: &Value) -> Result<(), String> {
     }
     if doc["setting_preference"].as_str() == Some("auto") {
         // Going back to automatic restores the pool, as the official controller does.
-        if was_manual || doc["ntp_server_1"].is_null() {
-            for (i, h) in NTP_POOL.iter().enumerate() {
-                doc[format!("ntp_server_{}", i + 1)] = json!(h);
+        if was_manual || doc[NTP_KEYS[0]].is_null() {
+            for (k, h) in NTP_KEYS.iter().zip(NTP_POOL) {
+                doc[*k] = json!(h);
             }
         }
-    } else if (1..=4).any(|i| !n[format!("ntp_server_{i}")].is_null()) {
+    } else if NTP_KEYS.iter().any(|k| !n[*k].is_null()) {
         // Manual servers replace all four.
         let mut list = Vec::new();
-        for i in 1..=4 {
-            if let Some(h) = n[format!("ntp_server_{i}")].as_str().map(str::trim).filter(|h| !h.is_empty()) {
+        for k in NTP_KEYS {
+            if let Some(h) = n[k].as_str().map(str::trim).filter(|h| !h.is_empty()) {
                 if !is_host(h) {
                     return Err(format!("{h} is not a host name or IPv4 address"));
                 }
-                list.push(h.to_string());
+                list.push(h);
             }
         }
-        for i in 1..=4 {
-            doc[format!("ntp_server_{i}")] = json!(list.get(i - 1).cloned().unwrap_or_default());
+        for (i, k) in NTP_KEYS.iter().enumerate() {
+            doc[*k] = json!(list.get(i).copied().unwrap_or_default());
         }
     }
-    if doc["setting_preference"].as_str() == Some("manual") && (1..=4).all(|i| doc[format!("ntp_server_{i}")].as_str().is_none_or(str::is_empty)) {
+    if doc["setting_preference"].as_str() == Some("manual") && NTP_KEYS.iter().all(|k| doc[*k].as_str().is_none_or(str::is_empty)) {
         return Err("manual NTP needs at least one server".into());
     }
     Ok(())
@@ -247,7 +248,7 @@ fn site_snmp(doc: &mut Value, sn: &Value, notes: &mut Vec<String>) -> Result<(),
 fn site_region(state: &mut Value, p: &Value) -> Result<(), String> {
     if !p["country"].is_null() {
         let code = num(&p["country"]).ok_or("country must be an ISO 3166 numeric code")?;
-        if !COUNTRY_NAMES.iter().any(|(c, _)| *c == code) {
+        if !COUNTRIES.iter().any(|c| c.code == code) {
             return Err(format!("country {code} is not one apctl has channel rules for"));
         }
         setting_mut(state, "country")["code"] = json!(code.to_string());
@@ -298,18 +299,30 @@ fn ssh_keys(v: &Value) -> Result<Vec<Value>, String> {
             return Err(format!("not an SSH public key: {}", if key.is_empty() { kind } else { format!("{kind} {}…", key.chars().take(12).collect::<String>()) }));
         }
         let name = k["name"].as_str().filter(|n| !n.is_empty()).map(str::to_string).unwrap_or_else(|| if comment.is_empty() { kind.clone() } else { comment.clone() });
-        if !out.iter().any(|o: &Value| o["key"] == json!(key)) {
+        if !out.iter().any(|o: &Value| o["key"].as_str() == Some(key.as_str())) {
             out.push(json!({ "name": name, "type": kind, "key": key, "comment": comment }));
         }
     }
     Ok(out)
 }
 
+/// The site settings as shown, with the choices of country and time zone.
+#[derive(serde::Serialize)]
+pub struct SiteView {
+    #[serde(flatten)]
+    settings: Value,
+    countries: &'static Value,
+    timezones: &'static Value,
+}
+
 /// GET /api/settings/site. Read-only mode (no users) leaves out the SNMP
 /// community, which works as a password.
-pub async fn get_site(State(s): State<AppState>) -> Result<Json<Value>, ApiError> {
+pub async fn get_site(State(s): State<AppState>) -> Result<Json<SiteView>, ApiError> {
     let state = crate::api::current_state(&s)?;
-    Ok(Json(site_view(&state, s.active, s.auth.enabled())))
+    // The choices never change: built once, and serialised from there.
+    static COUNTRY_LIST: LazyLock<Value> = LazyLock::new(|| COUNTRIES.iter().map(|c| json!({ "code": c.code, "name": c.name })).collect());
+    static TIMEZONES: LazyLock<Value> = LazyLock::new(|| apcfg::tz::names().collect());
+    Ok(Json(SiteView { settings: site_view(&state, s.active, s.auth.enabled()), countries: &COUNTRY_LIST, timezones: &TIMEZONES }))
 }
 
 fn site_view(state: &Value, active: bool, secrets: bool) -> Value {
@@ -330,7 +343,8 @@ fn site_view(state: &Value, active: bool, secrets: bool) -> Value {
     });
     let n = setting(state, "ntp");
     let mut ntp = json!({});
-    for k in ["setting_preference", "ntp_server_1", "ntp_server_2", "ntp_server_3", "ntp_server_4"] {
+    ntp["setting_preference"] = n["setting_preference"].clone();
+    for k in NTP_KEYS {
         ntp[k] = n[k].clone();
     }
     let sn = setting(state, "snmp");
@@ -338,16 +352,10 @@ fn site_view(state: &Value, active: bool, secrets: bool) -> Value {
         "enabled": sn["enabled"], "enabledV3": sn["enabledV3"], "community": if secrets { sn["community"].clone() } else { Value::Null }, "username": sn["username"],
         "has_v3_password": sn["x_password"].as_str().is_some_and(|p| !p.is_empty()),
     });
-    // The choices never change: built once.
-    static COUNTRIES: LazyLock<Value> = LazyLock::new(|| COUNTRY_NAMES.iter().map(|(c, n)| json!({ "code": c, "name": n })).collect());
-    static TIMEZONES: LazyLock<Value> = LazyLock::new(|| apcfg::tz::names().collect());
-    let mut v = json!({
+    json!({
         "active": active, "mgmt": mgmt, "rsyslogd": rsyslogd, "ntp": ntp, "snmp": snmp,
         "country": country(state), "timezone": setting(state, "locale")["timezone"],
-    });
-    v["countries"] = COUNTRIES.clone();
-    v["timezones"] = TIMEZONES.clone();
-    v
+    })
 }
 
 /// PUT /api/settings/site {patch} (`?preview=true` to see the effect)
@@ -392,6 +400,10 @@ mod tests {
         assert!(edit(&mut s, json!({ "mgmt": { "x_ssh_keys": ["ssh-dss AAAA"] } })).is_err());
         assert!(edit(&mut s, json!({ "mgmt": { "x_ssh_keys": [format!("ecdsa-sha2-nistp256 {}", "A".repeat(68))] } })).is_err(), "RSA and Ed25519 only");
         assert!(edit(&mut s, json!({ "mgmt": { "x_ssh_username": "-dash" } })).is_err());
+        // The same key twice, as a line and as an object: kept once.
+        let key = "A".repeat(68);
+        edit(&mut s, json!({ "mgmt": { "x_ssh_keys": [format!("ssh-ed25519 {key} me@laptop"), { "type": "ssh-ed25519", "key": key, "name": "again" }] } })).unwrap();
+        assert_eq!(setting(&s, "mgmt")["x_ssh_keys"].as_array().unwrap().len(), 1);
     }
 
     #[test]
@@ -469,6 +481,10 @@ mod tests {
         let n = setting(&s, "ntp");
         assert_eq!((n["ntp_server_2"].as_str(), n["ntp_server_4"].as_str()), (Some("192.0.2.1"), Some("")), "the list replaces all four");
         assert!(edit(&mut s, json!({ "ntp": { "ntp_server_2": "bad host!" } })).is_err());
+        for bad in ["-time.example.net", "time-.example.net", "time.-example.net"] {
+            assert!(edit(&mut s, json!({ "ntp": { "ntp_server_2": bad } })).is_err(), "{bad}");
+        }
+        assert!(is_host("time-1.example.net") && is_host("192.0.2.1"));
         edit(&mut s, json!({ "ntp": { "setting_preference": "auto" } })).unwrap();
         assert_eq!(setting(&s, "ntp")["ntp_server_1"], "0.ubnt.pool.ntp.org");
     }
