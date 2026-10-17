@@ -1,3 +1,4 @@
+import { useState } from "react";
 import { hhmm as time } from "../../../format";
 import type { Blackout } from "../../../api";
 
@@ -28,8 +29,11 @@ export function ScheduleEditor({
   const list = Array.isArray(value) ? value : [];
   const update = (i: number, e: Partial<Blackout>) =>
     onChange(list.map((x, j) => (j === i ? { ...x, ...e } : x)));
+  // Open at first when there are periods; afterwards the user's choice (a
+  // live `open` would snap shut on removing the last one).
+  const [open] = useState(list.length > 0);
   return (
-    <details open={list.length > 0}>
+    <details open={open}>
       <summary>
         Schedule
         {list.length > 0

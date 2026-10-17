@@ -1,3 +1,4 @@
+import { useState } from "react";
 import { Row, Toggle } from "../form";
 import type { WlanSection } from "./form";
 
@@ -8,10 +9,13 @@ export function Iot({
   const { form: f, set, bind } = w;
   const iot = f.enhanced_iot === true;
   const has2g = (f.wlan_bands ?? []).includes("2g");
+  // Open at first when something is on; afterwards the user's choice (a live
+  // `open` would snap shut as the last toggle goes off).
+  const [open] = useState(
+    iot || f.iot_channel_lock === true || f.iot_dtim_lock === true,
+  );
   return (
-    <details
-      open={iot || f.iot_channel_lock === true || f.iot_dtim_lock === true}
-    >
+    <details open={open}>
       <summary>IoT</summary>
       <Row
         label="Force Wi-Fi 4"

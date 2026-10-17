@@ -1,3 +1,4 @@
+import { useState } from "react";
 import type { MdnsRule, WlanSettingsList } from "../../../api";
 import { ListInput, Row, Select, Toggle, lines } from "../form";
 import type { WlanSection } from "./form";
@@ -176,8 +177,10 @@ function MdnsRules({
 
 export function Mdns({ w, list }: WlanSection) {
   const { form: f, setForm, set } = w;
+  // Open at first for custom rules; afterwards the user's choice.
+  const [open] = useState(f.mdns_proxy_mode === "custom");
   return (
-    <details open={f.mdns_proxy_mode === "custom"}>
+    <details open={open}>
       <summary>mDNS</summary>
       <Row
         label="mDNS proxy"
