@@ -20,7 +20,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
-use aes_gcm::aead::{Aead, KeyInit, Payload};
+use aes_gcm::aead::{AeadInOut, KeyInit};
 use aes_gcm::{Aes256Gcm, Nonce};
 use anyhow::{Context, Result, anyhow, bail};
 use axum::Json;
@@ -80,13 +80,14 @@ impl Backups {
 
     /// The backup settings: the stored ones, read once (the defaults when
     /// none are stored, or, with a warning, while they cannot be read).
+    /// The lock is never held while the database or the directory is read.
     fn settings(&self, store: &store::Store) -> Settings {
-        let mut k = self.known();
-        if let Some(s) = &k.settings {
+        if let Some(s) = &self.known().settings {
             return s.clone();
         }
         match load_settings(store) {
-            Ok(s) => k.settings.insert(s).clone(),
+            // Settings saved meanwhile are newer than the ones read.
+            Ok(s) => self.known().settings.get_or_insert(s).clone(),
             Err(e) => {
                 tracing::warn!("the backup settings could not be read, the defaults apply: {e:#}");
                 Settings::default()
@@ -96,8 +97,15 @@ impl Backups {
 
     /// When the newest automatic backup was made (0: none).
     fn last_auto(&self) -> Ts {
+        if let Some(t) = self.known().last_auto {
+            return t;
+        }
+        let found = list(self).iter().filter(|m| m.kind == Kind::Auto).map(|m| m.created).max().unwrap_or(0);
+        // One made meanwhile is the newest.
         let mut k = self.known();
-        *k.last_auto.get_or_insert_with(|| list(self).iter().filter(|m| m.kind == Kind::Auto).map(|m| m.created).max().unwrap_or(0))
+        let t = k.last_auto.map_or(found, |t| t.max(found));
+        k.last_auto = Some(t);
+        t
     }
 
     pub fn dir(&self) -> PathBuf {
@@ -136,23 +144,27 @@ struct SealWriter<W: Write> {
 }
 
 impl<W: Write> SealWriter<W> {
-    fn new(mut out: W, key: &[u8; 32]) -> Result<Self> {
+    fn new(out: W, key: &[u8; 32]) -> Result<Self> {
         let mut prefix = [0u8; 7];
         getrandom::fill(&mut prefix).map_err(|e| anyhow!("random: {e}"))?;
+        Ok(Self::with_prefix(out, key, prefix)?)
+    }
+
+    fn with_prefix(mut out: W, key: &[u8; 32], prefix: [u8; 7]) -> io::Result<Self> {
         let mut header = MAGIC.to_vec();
         header.push(1);
         header.extend_from_slice(&prefix);
         out.write_all(&header)?;
-        Ok(SealWriter { out, cipher: Aes256Gcm::new(key.into()), header, prefix, counter: 0, buf: Vec::with_capacity(CHUNK) })
+        // Room for the tag too: each chunk is sealed where it lies.
+        Ok(SealWriter { out, cipher: Aes256Gcm::new(key.into()), header, prefix, counter: 0, buf: Vec::with_capacity(CHUNK + TAG) })
     }
 
     fn seal(&mut self, last: bool) -> io::Result<()> {
         let n = nonce(&self.prefix, self.counter, last);
-        let sealed = self
-            .cipher
-            .encrypt(&Nonce::try_from(&n[..]).expect("12 bytes"), Payload { msg: &self.buf, aad: &self.header })
+        self.cipher
+            .encrypt_in_place(&Nonce::try_from(&n[..]).expect("12 bytes"), &self.header, &mut self.buf)
             .map_err(|_| io::Error::other("encryption failed"))?;
-        self.out.write_all(&sealed)?;
+        self.out.write_all(&self.buf)?;
         self.counter = self.counter.checked_add(1).ok_or_else(|| io::Error::other("backup too large"))?;
         self.buf.clear();
         Ok(())
@@ -179,7 +191,9 @@ impl<W: Write> Write for SealWriter<W> {
     }
 }
 
-/// Decrypts a sealed stream, failing on any tampering or truncation.
+/// Decrypts a sealed stream, failing on any tampering or truncation. Two
+/// buffers take turns: the chunk being read (opened where it lies) and the
+/// one after it, read ahead to know whether this one is the last.
 struct OpenReader<R: Read> {
     inp: R,
     cipher: Aes256Gcm,
@@ -188,31 +202,32 @@ struct OpenReader<R: Read> {
     counter: u32,
     plain: Vec<u8>,
     pos: usize,
-    ahead: Option<Vec<u8>>,
+    ahead: Vec<u8>,
     done: bool,
 }
 
-fn read_block<R: Read>(r: &mut R, size: usize) -> io::Result<Vec<u8>> {
-    let mut b = Vec::with_capacity(size);
-    r.take(size as u64).read_to_end(&mut b)?;
-    Ok(b)
+/// Reads the next sealed chunk (or what is left) into `b`.
+fn read_block<R: Read>(r: &mut R, b: &mut Vec<u8>) -> io::Result<()> {
+    b.clear();
+    r.take((CHUNK + TAG) as u64).read_to_end(b)?;
+    Ok(())
 }
 
 impl<R: Read> OpenReader<R> {
+    fn new(mut inp: R, key: &[u8; 32], header: Vec<u8>, prefix: [u8; 7]) -> io::Result<Self> {
+        let mut ahead = Vec::with_capacity(CHUNK + TAG);
+        read_block(&mut inp, &mut ahead)?;
+        let plain = Vec::with_capacity(CHUNK + TAG);
+        Ok(OpenReader { inp, cipher: Aes256Gcm::new(key.into()), header, prefix, counter: 0, plain, pos: 0, ahead, done: false })
+    }
+
     fn next_chunk(&mut self) -> io::Result<()> {
-        let block = match self.ahead.take() {
-            Some(b) => b,
-            None => read_block(&mut self.inp, CHUNK + TAG)?,
-        };
-        let after = read_block(&mut self.inp, CHUNK + TAG)?;
-        let last = after.is_empty();
-        if !last {
-            self.ahead = Some(after);
-        }
+        std::mem::swap(&mut self.plain, &mut self.ahead);
+        read_block(&mut self.inp, &mut self.ahead)?;
+        let last = self.ahead.is_empty();
         let n = nonce(&self.prefix, self.counter, last);
-        self.plain = self
-            .cipher
-            .decrypt(&Nonce::try_from(&n[..]).expect("12 bytes"), Payload { msg: &block, aad: &self.header })
+        self.cipher
+            .decrypt_in_place(&Nonce::try_from(&n[..]).expect("12 bytes"), &self.header, &mut self.plain)
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "the backup is damaged, truncated or was made with a different key"))?;
         self.pos = 0;
         self.counter += 1;
@@ -250,7 +265,7 @@ fn open_payload(path: &Path, key: Option<&[u8; 32]>) -> Result<Box<dyn Read>> {
         f.read_exact(&mut prefix)?;
         let mut header = head.to_vec();
         header.extend_from_slice(&prefix);
-        Box::new(OpenReader { inp: f, cipher: Aes256Gcm::new(key.into()), header, prefix, counter: 0, plain: vec![], pos: 0, ahead: None, done: false })
+        Box::new(OpenReader::new(f, key, header, prefix)?)
     } else if key.is_some() {
         // With a key, only what was sealed with it is trusted: anyone who can
         // put a file in front of apctl could otherwise have it restored.
@@ -395,7 +410,12 @@ fn trim(dir: &Path, cutoff: Option<Ts>) -> Result<()> {
             if !p.exists() {
                 continue;
             }
+            // What is deleted is overwritten in place, so the file need not be
+            // rewritten to be rid of it: only when it frees much of the file
+            // (zeroed pages would otherwise bloat the restored database, and
+            // compress so well that the restore's size check could refuse it).
             let mut c = scratch(&p)?;
+            c.execute_batch("PRAGMA secure_delete=ON;")?;
             let tx = c.transaction()?;
             for table in tables {
                 // A database from an older version may lack the newest tables.
@@ -405,7 +425,10 @@ fn trim(dir: &Path, cutoff: Option<Ts>) -> Result<()> {
                 }
             }
             tx.commit()?;
-            c.execute_batch("VACUUM;")?;
+            let pages = |pragma: &str| c.query_row(&format!("PRAGMA {pragma}"), [], |r| r.get::<_, i64>(0));
+            if pages("freelist_count")? * 4 > pages("page_count")? {
+                c.execute_batch("VACUUM;")?;
+            }
         }
     }
     Ok(())
@@ -487,14 +510,20 @@ pub fn create(b: &Backups, src_dir: &Path, kind: Kind, days: i64) -> Result<Meta
             let gz = tar.into_inner()?;
             gz.finish()?.finish()?.sync_all()?;
         }
-        fs::rename(&part, dir.join(&name))?;
-        let size = fs::metadata(dir.join(&name))?.len();
+        // The description is in place, whole and synced, before the backup
+        // is: a backup is never without one, and one left without its backup
+        // (by a crash) is removed at the next start.
+        let size = fs::metadata(&part)?.len();
         let meta = Meta { name: name.clone(), kind, version: VERSION.into(), created: now, days, size, encrypted: b.key.is_some() };
-        fs::write(dir.join(format!("{name}.json")), serde_json::to_vec_pretty(&meta)?)?;
-        if kind == Kind::Auto
-            && let Some(last) = &mut b.known().last_auto
-        {
-            *last = (*last).max(now);
+        let mut f = fs::OpenOptions::new().write(true).create_new(true).open(tmp.join("meta.json"))?;
+        f.write_all(&serde_json::to_vec_pretty(&meta)?)?;
+        f.sync_all()?;
+        fs::rename(tmp.join("meta.json"), dir.join(format!("{name}.json")))?;
+        fs::rename(&part, dir.join(&name))?;
+        sync_dir(&dir)?;
+        if kind == Kind::Auto {
+            let mut k = b.known();
+            k.last_auto = Some(k.last_auto.map_or(now, |t| t.max(now)));
         }
         Ok(meta)
     })();
@@ -502,6 +531,7 @@ pub fn create(b: &Backups, src_dir: &Path, kind: Kind, days: i64) -> Result<Meta
         // Nothing half-written stays behind (the name is this call's own).
         let _ = fs::remove_file(&part);
         let _ = fs::remove_file(dir.join(&name));
+        let _ = fs::remove_file(dir.join(format!("{name}.json")));
     }
     let _ = fs::remove_dir_all(&tmp);
     result
@@ -545,6 +575,9 @@ pub fn unpack(path: &Path, key: Option<&[u8; 32]>, dest: &Path) -> Result<Manife
         let mut e = entry?;
         let name = e.path()?.to_string_lossy().to_string();
         if name == "manifest.json" {
+            if manifest.is_some() {
+                bail!("the backup has two manifests");
+            }
             if e.header().size()? > 1 << 20 {
                 bail!("the backup's manifest is too large");
             }
@@ -623,24 +656,47 @@ fn valid_id(id: &str) -> bool {
 /// the current state as a pre-restore backup, then swaps the staged files in.
 /// A settings-only backup leaves the current statistics and logs in place.
 ///
-/// A restore that fails is logged and set aside (`pending.failed`, shown on
-/// the backups page) and apctl starts with the data it has, rather than
-/// failing on every start. Also clears out staging left behind.
+/// A restore that fails before any file has left staging is logged and set
+/// aside (`pending.failed`, shown on the backups page) and apctl starts with
+/// the data it has, rather than failing on every start. One that fails part
+/// way keeps its marker and is taken up again at the next start: the files
+/// already moved have no other copy. Also clears out staging left behind.
 pub fn apply_pending(b: &Backups) {
     clean_unfinished(b);
     let marker = b.staging().join("pending");
-    if let Ok(id) = fs::read_to_string(&marker) {
-        match apply(b, id.trim()) {
-            Ok(()) => {
-                let _ = fs::remove_file(&marker);
-                let _ = fs::remove_file(b.staging().join("pending.failed"));
-                tracing::warn!("restore complete");
+    match fs::read_to_string(&marker) {
+        Ok(id) => {
+            let mut under_way = false;
+            match apply(b, id.trim(), &mut under_way) {
+                Ok(()) => {
+                    // The marker goes before the staged files: a crash in between
+                    // must not show a finished restore as failed.
+                    let _ = fs::remove_file(&marker);
+                    let _ = fs::remove_file(b.staging().join("pending.failed"));
+                    let _ = sync_dir(&b.staging());
+                    let _ = fs::remove_dir_all(b.staging().join(id.trim()));
+                    tracing::warn!("restore complete");
+                }
+                Err(e) if under_way => {
+                    tracing::error!("the staged restore failed part way; it is tried again at the next start: {e:#}");
+                }
+                Err(e) => {
+                    tracing::error!("the staged restore failed; starting with the current data: {e:#}");
+                    let failed = b.staging().join("pending.failed");
+                    if fs::write(&failed, format!("{e:#}")).is_err() || fs::remove_file(&marker).is_err() {
+                        let _ = fs::rename(&marker, &failed);
+                    }
+                }
             }
-            Err(e) => {
-                tracing::error!("the staged restore failed; starting with the current data: {e:#}");
-                let failed = b.staging().join("pending.failed");
-                if fs::write(&failed, format!("{e:#}")).is_err() || fs::remove_file(&marker).is_err() {
-                    let _ = fs::rename(&marker, &failed);
+        }
+        // Files beside their place belong to a restore under way: only
+        // without one are they left over (from a restore since replaced).
+        Err(_) => {
+            for n in DATABASES {
+                let p = b.data_dir.join(format!("{n}.restoring"));
+                if p.exists() {
+                    tracing::info!("removing {}, left by a restore that did not finish", p.display());
+                    let _ = fs::remove_file(&p);
                 }
             }
         }
@@ -648,7 +704,10 @@ pub fn apply_pending(b: &Backups) {
     clean_staging(b);
 }
 
-fn apply(b: &Backups, id: &str) -> Result<()> {
+/// Swaps a staged restore in. `under_way` is set once a file has left
+/// staging (or had in an earlier run): from then on a failure is retried
+/// rather than set aside.
+fn apply(b: &Backups, id: &str, under_way: &mut bool) -> Result<()> {
     if !valid_id(id) {
         bail!("the restore marker names no staged backup ({id:?})");
     }
@@ -662,6 +721,7 @@ fn apply(b: &Backups, id: &str) -> Result<()> {
     // stop), taken up again where it stopped. Its pre-restore copy was made
     // the first time, and a new one would hold part of the restored data.
     let resumed = manifest.files.keys().any(|n| !staged.join(n).exists());
+    *under_way = resumed;
     if b.data_dir.join("config.db").exists() && !resumed {
         let pre = create(b, &b.data_dir, Kind::PreRestore, -1).context("saving the current state before restoring")?;
         tracing::info!("saved the state before the restore as {}", pre.name);
@@ -670,14 +730,11 @@ fn apply(b: &Backups, id: &str) -> Result<()> {
     // Everything beside its place first: if a move fails, the current
     // databases are untouched. Staging is in the data directory, so these are
     // renames, not copies (the files were synced when they were unpacked).
+    // A file moved is in no other place: it is never deleted here.
     for n in manifest.files.keys() {
-        if staged.join(n).exists()
-            && let Err(e) = fs::rename(staged.join(n), restoring(n))
-        {
-            for n in manifest.files.keys() {
-                let _ = fs::remove_file(restoring(n));
-            }
-            return Err(e).with_context(|| format!("moving {n} into place"));
+        if staged.join(n).exists() {
+            fs::rename(staged.join(n), restoring(n)).with_context(|| format!("moving {n} into place"))?;
+            *under_way = true;
         }
     }
     sync_dir(&b.data_dir)?;
@@ -698,9 +755,7 @@ fn apply(b: &Backups, id: &str) -> Result<()> {
         fs::rename(restoring(n), b.data_dir.join(n))?;
         File::open(b.data_dir.join(n))?.sync_all()?;
     }
-    sync_dir(&b.data_dir)?;
-    let _ = fs::remove_dir_all(&staged);
-    Ok(())
+    sync_dir(&b.data_dir)
 }
 
 /// Makes the renames in a directory durable.
@@ -709,12 +764,14 @@ fn sync_dir(dir: &Path) -> Result<()> {
 }
 
 /// Deletes what a backup cut off half way (a crash, a restart) left in the
-/// backups directory: its snapshot copies and its unfinished archive. Only at
-/// start, when no backup can be in progress.
+/// backups directory: its snapshot copies, its unfinished archive and a
+/// description without its backup. Only at start, when no backup can be in
+/// progress.
 fn clean_unfinished(b: &Backups) {
     for e in fs::read_dir(b.dir()).into_iter().flatten().flatten() {
         let name = e.file_name().to_string_lossy().into_owned();
-        if name.starts_with(".tmp-") || name.ends_with(".apb.part") {
+        let orphan = name.strip_suffix(".json").is_some_and(|apb| apb.ends_with(".apb") && !b.dir().join(apb).exists());
+        if name.starts_with(".tmp-") || name.ends_with(".apb.part") || orphan {
             let p = e.path();
             tracing::info!("removing {name}, left by a backup that did not finish");
             let _ = if p.is_dir() { fs::remove_dir_all(&p) } else { fs::remove_file(&p) };
@@ -834,8 +891,6 @@ pub fn list(b: &Backups) -> Vec<Meta> {
 fn remove(b: &Backups, name: &str) {
     let _ = fs::remove_file(b.dir().join(name));
     let _ = fs::remove_file(b.dir().join(format!("{name}.json")));
-    // It may have been the newest automatic one: found again when next needed.
-    b.known().last_auto = None;
 }
 
 /// How many pre-restore backups are kept.
@@ -940,7 +995,15 @@ pub async fn create_now(State(s): State<AppState>, Json(body): Json<CreateBody>)
     }
     let b = s.backups.clone();
     let dir = b.data_dir.clone();
-    let meta = tokio::task::spawn_blocking(move || create(&b, &dir, Kind::Manual, body.days)).await??;
+    let writer = s.writer.clone();
+    let meta = tokio::task::spawn_blocking(move || {
+        // What is queued is committed first, so the backup has the last edits.
+        if !writer.flush(Duration::from_secs(5)) {
+            tracing::warn!("not all queued writes were stored before the backup");
+        }
+        create(&b, &dir, Kind::Manual, body.days)
+    })
+    .await??;
     Ok(Json(json!(meta)))
 }
 
@@ -974,6 +1037,11 @@ pub async fn delete(State(s): State<AppState>, UrlPath(name): UrlPath<String>) -
             let found = b.dir().join(&name).exists();
             if found {
                 remove(&b, &name);
+                // It may have been the newest automatic one: found again when next needed.
+                // (Pruning keeps the newest, so it never needs this.)
+                if name.starts_with(Kind::Auto.prefix()) {
+                    b.known().last_auto = None;
+                }
             }
             found
         })
@@ -1020,7 +1088,8 @@ pub async fn upload(State(s): State<AppState>, body: Body) -> Result<Json<Value>
     tokio::fs::create_dir_all(b.staging()).await?;
     let name = format!("upload-{}-{}.apb", store::now_ts(), crate::settings::random_hex(4));
     let tmp = TempFile(b.staging().join(name));
-    let mut file = tokio::fs::File::create_new(&tmp.0).await?;
+    // Written a megabyte per trip to the blocking pool, not one trip per body chunk.
+    let mut file = tokio::io::BufWriter::with_capacity(1 << 20, tokio::fs::File::create_new(&tmp.0).await?);
     let mut stream = body.into_data_stream();
     // DefaultBodyLimit does not apply to a streamed body: count here.
     let mut size = 0u64;
@@ -1177,6 +1246,28 @@ mod tests {
     }
 
     #[test]
+    fn history_dropped_from_a_backup_leaves_no_trace_and_little_free_space() {
+        let src = data("trim");
+        let old = store::now_ts() - 40 * 86400;
+        let metrics = Connection::open(src.join("metrics.db")).unwrap();
+        metrics.execute_batch(&format!("INSERT INTO ap_stats (mac, ts, cpu) VALUES ('old-ap-gone-0001', {old}, 3.0);")).unwrap();
+        let b = Backups::new(src.clone(), None);
+        // A little dropped: overwritten where it was.
+        let out = dir("trim-few");
+        unpack(&b.dir().join(create(&b, &src, Kind::Manual, 7).unwrap().name), None, &out).unwrap();
+        assert_eq!(count(&out.join("metrics.db"), "SELECT COUNT(*) FROM ap_stats"), 1);
+        assert!(!fs::read(out.join("metrics.db")).unwrap().windows(16).any(|w| w == b"old-ap-gone-0001"));
+        // Most of the file dropped: rewritten without the pages it freed.
+        metrics
+            .execute_batch(&format!("WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 20000) INSERT INTO ap_stats (mac, ts, cpu) SELECT 'old-' || i, {old}, 1.0 FROM n;"))
+            .unwrap();
+        let out = dir("trim-many");
+        unpack(&b.dir().join(create(&b, &src, Kind::Manual, 7).unwrap().name), None, &out).unwrap();
+        assert_eq!(count(&out.join("metrics.db"), "SELECT COUNT(*) FROM ap_stats"), 1);
+        assert_eq!(count(&out.join("metrics.db"), "PRAGMA freelist_count"), 0);
+    }
+
+    #[test]
     fn settings_only_and_unencrypted() {
         let src = data("so");
         let b = Backups::new(src.clone(), None);
@@ -1187,6 +1278,46 @@ mod tests {
         assert_eq!(man.files.keys().cloned().collect::<Vec<_>>(), vec!["config.db"]);
         assert_eq!(count(&out.join("config.db"), "SELECT COUNT(*) FROM events"), 0);
         assert_eq!(count(&out.join("config.db"), "SELECT COUNT(*) FROM client_aliases"), 1);
+    }
+
+    /// Seals `data` as apctl did before chunks were sealed in place: a new
+    /// buffer per chunk, from the allocating AEAD calls.
+    fn sealed_the_old_way(data: &[u8], key: &[u8; 32], prefix: [u8; 7]) -> Vec<u8> {
+        use aes_gcm::aead::{Aead, Payload};
+        let cipher = Aes256Gcm::new(key.into());
+        let mut header = MAGIC.to_vec();
+        header.push(1);
+        header.extend_from_slice(&prefix);
+        let mut out = header.clone();
+        let mut seal = |msg: &[u8], i: u32, last: bool| {
+            let n = nonce(&prefix, i, last);
+            out.extend(cipher.encrypt(&Nonce::try_from(&n[..]).unwrap(), Payload { msg, aad: &header }).unwrap());
+        };
+        // Full chunks as they fill, then the rest (perhaps nothing) as the last.
+        let (mut rest, mut i) = (data, 0);
+        while rest.len() >= CHUNK {
+            seal(&rest[..CHUNK], i, false);
+            (rest, i) = (&rest[CHUNK..], i + 1);
+        }
+        seal(rest, i, true);
+        out
+    }
+
+    #[test]
+    fn sealing_in_place_writes_and_reads_the_same_bytes_as_before() {
+        let key = [9u8; 32];
+        let prefix = [1, 2, 3, 4, 5, 6, 7];
+        for len in [0, 10, CHUNK, 2 * CHUNK + CHUNK / 2] {
+            let data: Vec<u8> = (0..len).map(|i| (i * 7 % 251) as u8).collect();
+            let old = sealed_the_old_way(&data, &key, prefix);
+            let mut w = SealWriter::with_prefix(Vec::new(), &key, prefix).unwrap();
+            w.write_all(&data).unwrap();
+            assert!(w.finish().unwrap() == old, "{len} bytes: byte for byte as before");
+            let mut r = OpenReader::new(&old[MAGIC.len() + 1 + 7..], &key, old[..MAGIC.len() + 1 + 7].to_vec(), prefix).unwrap();
+            let mut back = Vec::new();
+            r.read_to_end(&mut back).unwrap();
+            assert!(back == data, "{len} bytes read back");
+        }
     }
 
     #[test]
@@ -1223,6 +1354,18 @@ mod tests {
     }
 
     #[test]
+    fn the_newest_automatic_backup_is_known_without_reading_the_directory_again() {
+        let src = data("last-auto");
+        let b = Backups::new(src.clone(), None);
+        create(&b, &src, Kind::Manual, 0).unwrap();
+        assert_eq!(b.last_auto(), 0);
+        let m = create(&b, &src, Kind::Auto, 0).unwrap();
+        assert_eq!(b.known().last_auto, Some(m.created), "kept by the backup made");
+        fs::remove_file(b.dir().join(format!("{}.json", m.name))).unwrap();
+        assert_eq!(b.last_auto(), m.created, "not read again");
+    }
+
+    #[test]
     fn unfinished_backups_are_cleared_at_start() {
         let src = data("unfinished");
         let b = Backups::new(src.clone(), None);
@@ -1231,9 +1374,12 @@ mod tests {
         fs::create_dir_all(b.dir().join(".tmp-1-2-ab")).unwrap();
         fs::write(b.dir().join(".tmp-1-2-ab").join("config.db"), "x").unwrap();
         fs::write(b.dir().join("apctl-0.1.0-20260101-000000.apb.part"), "x").unwrap();
+        fs::write(b.dir().join("apctl-0.1.0-20260101-000000.apb.json"), "{}").unwrap();
         apply_pending(&b);
         let left: Vec<String> = fs::read_dir(b.dir()).unwrap().flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect();
         assert!(left.iter().all(|n| !n.starts_with(".tmp-") && !n.ends_with(".part")), "{left:?}");
+        assert!(!left.iter().any(|n| n.starts_with("apctl-0.1.0-")), "a description without its backup goes: {left:?}");
+        assert!(left.contains(&format!("{}.json", m.name)), "{left:?}");
         assert!(list(&b).iter().any(|x| x.name == m.name), "finished backups are kept");
     }
 
@@ -1271,6 +1417,108 @@ mod tests {
         assert_eq!(count(&src.join("config.db"), "SELECT COUNT(*) FROM client_aliases"), 1, "restored");
         assert_eq!(count(&src.join("metrics.db"), "SELECT COUNT(*) FROM ap_stats"), 2, "the rest moved in too");
         assert!(!list(&b).iter().any(|x| x.kind == Kind::PreRestore), "no copy of the half-restored state");
+    }
+
+    /// A restore of all history staged and marked to be applied, made before
+    /// the live config lost its client alias.
+    fn staged_restore(name: &str) -> (PathBuf, Backups, String) {
+        let src = data(name);
+        let b = Backups::new(src.clone(), None);
+        let m = create(&b, &src, Kind::Manual, -1).unwrap();
+        Connection::open(src.join("config.db")).unwrap().execute_batch("DELETE FROM client_aliases;").unwrap();
+        let (id, _) = stage(&b, &b.dir().join(&m.name)).unwrap();
+        fs::write(b.staging().join("pending"), &id).unwrap();
+        (src, b, id)
+    }
+
+    /// Puts something in the way of a path: a directory with a file in it
+    /// cannot be renamed over or removed as a file.
+    fn block(p: &Path) {
+        fs::create_dir_all(p.join("x")).unwrap();
+    }
+
+    fn aliases(src: &Path) -> i64 {
+        count(&src.join("config.db"), "SELECT COUNT(*) FROM client_aliases")
+    }
+
+    fn marked(b: &Backups) -> (bool, bool) {
+        (b.staging().join("pending").exists(), b.staging().join("pending.failed").exists())
+    }
+
+    /// The restore is complete: everything in, nothing left over.
+    fn finished(src: &Path, b: &Backups, id: &str, pre_restore: usize) {
+        assert_eq!(marked(b), (false, false));
+        assert!(!b.staging().join(id).exists(), "the staged files are removed");
+        assert_eq!(aliases(src), 1, "restored");
+        assert_eq!(count(&src.join("metrics.db"), "SELECT COUNT(*) FROM ap_stats"), 2, "the rest moved in too");
+        assert!(DATABASES.iter().all(|n| !src.join(format!("{n}.restoring")).exists()));
+        assert_eq!(list(b).iter().filter(|x| x.kind == Kind::PreRestore).count(), pre_restore);
+    }
+
+    #[test]
+    fn a_restore_that_cannot_begin_is_set_aside() {
+        let (src, b, id) = staged_restore("fail-first");
+        block(&src.join("config.db.restoring"));
+        apply_pending(&b);
+        assert_eq!(marked(&b), (false, true));
+        assert!(fs::read_to_string(b.staging().join("pending.failed")).unwrap().contains("moving config.db"));
+        assert_eq!(aliases(&src), 0, "the current data is kept");
+        assert!(b.staging().join(&id).join("config.db").exists(), "nothing has left staging");
+    }
+
+    #[test]
+    fn a_restore_that_fails_moving_files_aside_is_tried_again() {
+        let (src, b, id) = staged_restore("fail-aside");
+        // config.db goes beside its place, logs.db cannot.
+        block(&src.join("logs.db.restoring"));
+        apply_pending(&b);
+        assert_eq!(marked(&b), (true, false), "kept for the next start");
+        assert!(src.join("config.db.restoring").exists(), "the file moved has no other copy");
+        assert_eq!(aliases(&src), 0, "the current databases are untouched");
+        // Failing again as a resumed restore, it still deletes nothing.
+        apply_pending(&b);
+        assert_eq!(marked(&b), (true, false));
+        assert!(src.join("config.db.restoring").exists());
+        fs::remove_dir_all(src.join("logs.db.restoring")).unwrap();
+        apply_pending(&b);
+        finished(&src, &b, &id, 1);
+    }
+
+    #[test]
+    fn a_restore_that_fails_swapping_files_in_is_tried_again() {
+        let (src, b, id) = staged_restore("fail-swap");
+        // As if a run had moved config.db and logs.db beside their place
+        // (and saved the state before); logs.db's old journal cannot go.
+        for n in ["config.db", "logs.db"] {
+            fs::rename(b.staging().join(&id).join(n), src.join(format!("{n}.restoring"))).unwrap();
+        }
+        block(&src.join("logs.db-wal"));
+        apply_pending(&b);
+        assert_eq!(marked(&b), (true, false), "kept for the next start");
+        assert_eq!(aliases(&src), 1, "config.db is in");
+        assert!(src.join("logs.db.restoring").exists() && src.join("metrics.db.restoring").exists());
+        fs::remove_dir_all(src.join("logs.db-wal")).unwrap();
+        apply_pending(&b);
+        finished(&src, &b, &id, 0);
+    }
+
+    #[test]
+    fn a_restore_cut_off_after_its_last_file_finishes() {
+        let (src, b, id) = staged_restore("cut-last");
+        for n in DATABASES {
+            fs::rename(b.staging().join(&id).join(n), src.join(n)).unwrap();
+        }
+        apply_pending(&b);
+        finished(&src, &b, &id, 0);
+    }
+
+    #[test]
+    fn files_beside_their_place_are_removed_only_without_a_restore_under_way() {
+        let src = data("stale");
+        let b = Backups::new(src.clone(), None);
+        fs::write(src.join("metrics.db.restoring"), "x").unwrap();
+        apply_pending(&b);
+        assert!(!src.join("metrics.db.restoring").exists());
     }
 
     #[test]
@@ -1352,6 +1600,11 @@ mod tests {
         let err = unpack(&d.join("y.apb"), None, &d.join("out2")).unwrap_err();
         assert!(err.to_string().contains("not an apctl backup"), "{err:#}");
         assert!(!d.join("out2").join("config.db").exists());
+        // A second manifest cannot change what the first one said.
+        let m = manifest(&[("config.db", 4)]);
+        hand_made(&d.join("z.apb"), &m, &[("manifest.json", serde_json::to_vec(&manifest(&[("config.db", 5)])).unwrap())]);
+        let err = unpack(&d.join("z.apb"), None, &d.join("out3")).unwrap_err();
+        assert!(err.to_string().contains("two manifests"), "{err:#}");
     }
 
     #[test]

@@ -91,6 +91,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/firmware/upgrade", axum::routing::post(crate::firmware::upgrade))
         .route("/api/firmware/upgrade-url", axum::routing::post(crate::firmware::upgrade_url))
         .route("/api/firmware/cancel", axum::routing::post(crate::firmware::cancel))
+        .route("/api/firmware/resume", axum::routing::post(crate::firmware::resume))
         .route("/api/backups", get(crate::backup::index).post(crate::backup::create_now))
         .route("/api/backups/settings", axum::routing::put(crate::backup::put_settings))
         .route("/api/backups/file/{name}", get(crate::backup::download).delete(crate::backup::delete).route_layer(secret.clone()))
