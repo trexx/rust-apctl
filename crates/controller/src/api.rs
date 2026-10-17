@@ -938,7 +938,20 @@ fn logs_sql(w: &mut Where, device: Option<Mac>, search: Option<&str>, after: Opt
     format!("SELECT {COLUMNS} FROM {from} WHERE {} ORDER BY l.ts DESC, l.id DESC LIMIT {limit}", w.sql())
 }
 
-async fn logs(State(s): State<AppState>, Query(q): Query<LogQuery>) -> ApiResult {
+/// A stored syslog line.
+#[derive(Serialize)]
+struct LogRow {
+    id: i64,
+    ts: Ts,
+    device_mac: Option<String>,
+    src_ip: Option<String>,
+    facility: Option<i64>,
+    severity: Option<i64>,
+    program: Option<String>,
+    msg: String,
+}
+
+async fn logs(State(s): State<AppState>, Query(q): Query<LogQuery>) -> Result<Json<Vec<LogRow>>, ApiError> {
     let device = q.device.as_deref().map(parse_mac).transpose()?;
     let search = q.q.as_deref().filter(|t| !t.trim().is_empty());
     let limit = q.limit.unwrap_or(500).clamp(1, 5000);
@@ -948,17 +961,16 @@ async fn logs(State(s): State<AppState>, Query(q): Query<LogQuery>) -> ApiResult
         let mut stmt = c.prepare(&sql)?;
         let rows = stmt
             .query_map(params_from_iter(w.params), |r| {
-                Ok(json!({
-                    "id": r.get::<_, i64>(7)?, "ts": r.get::<_, i64>(0)?, "device_mac": r.get::<_, Option<String>>(1)?, "src_ip": r.get::<_, Option<String>>(2)?,
-                    "facility": r.get::<_, Option<i64>>(3)?, "severity": r.get::<_, Option<i64>>(4)?,
-                    "program": r.get::<_, Option<String>>(5)?, "msg": r.get::<_, String>(6)?,
-                }))
+                Ok(LogRow {
+                    id: r.get(7)?, ts: r.get(0)?, device_mac: r.get(1)?, src_ip: r.get(2)?, facility: r.get(3)?, severity: r.get(4)?, program: r.get(5)?,
+                    msg: r.get(6)?,
+                })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
     })
     .await?;
-    Ok(Json(Value::Array(rows)))
+    Ok(Json(rows))
 }
 
 async fn ws(
@@ -1240,6 +1252,10 @@ mod tests {
         assert_eq!(ts(get_json(&app, "/api/logs?after=1").await), vec![3, 2]);
         assert_eq!(ts(get_json(&app, "/api/logs?after=1&device=02:00:00:00:00:02").await), vec![2]);
         assert_eq!(ts(get_json(&app, "/api/logs?q=link&device=02:00:00:00:00:01").await), Vec::<i64>::new());
+        let line = json!({
+            "id": 3, "ts": 3, "device_mac": "02:00:00:00:00:01", "src_ip": null, "facility": null, "severity": null, "program": "hostapd", "msg": "wlan1: STA left",
+        });
+        assert_eq!(get_json(&app, "/api/logs?limit=1").await, json!([line]));
     }
 
     #[tokio::test]
