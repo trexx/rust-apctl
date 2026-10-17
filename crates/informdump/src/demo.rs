@@ -179,6 +179,21 @@ fn hex_key(seed: &str, bytes: usize) -> String {
     hex::encode((0..bytes).map(|_| r.next() as u8).collect::<Vec<u8>>())
 }
 
+/// A syslog datagram as an AP with a `syslog_key` sends it: magic, 0x01, 1 (u32),
+/// the AP's hash_id, a nonce, then the text sealed with AES-256-GCM over that header.
+fn seal_syslog(ap: &Ap, text: &str) -> Vec<u8> {
+    use aes_gcm::aead::{Aead, KeyInit, Payload};
+    let mut key = [0u8; 32];
+    hex::decode_to_slice(hex_key(&format!("syslog {}", ap.mac), 32), &mut key).expect("hex");
+    let mut out = vec![0xab, 0xcd, 0xdc, 0xba, 0x01, 0, 0, 0, 1];
+    out.extend(hex::decode(hex_key(&format!("hash {}", ap.mac), 8)).expect("hex"));
+    out.extend_from_slice(&crate::random_iv()[..12]);
+    let nonce = aes_gcm::Nonce::try_from(&out[17..29]).expect("12 bytes");
+    let sealed = aes_gcm::Aes256Gcm::new(&key.into()).encrypt(&nonce, Payload { msg: text.as_bytes(), aad: &out }).expect("AES-GCM sealing");
+    out.extend(sealed);
+    out
+}
+
 fn authkey(ap: &Ap) -> [u8; 16] {
     let mut k = [0u8; 16];
     hex::decode_to_slice(hex_key(ap.mac, 16), &mut k).expect("hex");
@@ -651,7 +666,7 @@ impl<W: Write> PcapWriter<W> {
     fn syslog(&mut self, ts_ms: i64, ap: usize, text: &str) -> Result<()> {
         let a = &APS[ap];
         let (from, to) = (Endpoint { mac: mac_bytes(a.mac), ip: a.ip, port: 38_000 }, Endpoint { mac: CONTROLLER_MAC, ip: CONTROLLER_IP, port: 5514 });
-        let frame = synth::udp_frame(from, to, text.as_bytes())?;
+        let frame = synth::udp_frame(from, to, &seal_syslog(a, text))?;
         self.record(ts_ms, &frame)
     }
 }
