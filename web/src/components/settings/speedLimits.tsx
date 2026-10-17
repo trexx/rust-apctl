@@ -2,7 +2,7 @@ import { useState } from "react";
 import { useCanEdit, useUserGroups } from "../../api";
 import { speed } from "../../format";
 import type { UserGroup } from "../../api";
-import { Row } from "./form";
+import { Row, TextInput } from "./form";
 import type { Fields } from "./form";
 import { EditorShell } from "./Review";
 import { ListPanel } from "./ListPanel";
@@ -27,22 +27,29 @@ function SpeedLimitEditor({
   const [name, setName] = useState(group?.name ?? "");
   const [down, setDown] = useState(mbpsField(group?.qos_rate_max_down));
   const [up, setUp] = useState(mbpsField(group?.qos_rate_max_up));
-  // The whole limit is sent, not a difference; the default group has no name to send.
+  // The whole limit is sent, not a difference (the default group, which has
+  // no name, isn't editable); an unchanged group sends nothing, so Review
+  // says there is nothing to review.
   const patch: Fields = {
-    ...(!group?.default && { name }),
+    name,
     qos_rate_max_down: kbps(down),
     qos_rate_max_up: kbps(up),
   };
+  const unchanged =
+    group !== null &&
+    name === group.name &&
+    kbps(down) === kbps(mbpsField(group.qos_rate_max_down)) &&
+    kbps(up) === kbps(mbpsField(group.qos_rate_max_up));
   const rate = (label: string, value: string, set: (v: string) => void) => (
     <Row label={label} hint="Mbps per client; empty for no limit">
-      <input
+      <TextInput
         className="search num-input"
         type="number"
         min={0.002}
         max={100}
         step="any"
         value={value}
-        onChange={(e) => set(e.target.value)}
+        onChange={set}
       />
     </Row>
   );
@@ -50,20 +57,13 @@ function SpeedLimitEditor({
     <EditorShell
       target={{ kind: "usergroup", id: group?.id ?? null }}
       active={active}
-      patch={patch}
+      patch={unchanged ? {} : patch}
       invalid={!name.trim()}
       onClose={onClose}
     >
-      {!group?.default && (
-        <Row label="Name">
-          <input
-            className="search"
-            maxLength={128}
-            value={name}
-            onChange={(e) => setName(e.target.value)}
-          />
-        </Row>
-      )}
+      <Row label="Name">
+        <TextInput maxLength={128} value={name} onChange={setName} />
+      </Row>
       {rate("Download", down, setDown)}
       {rate("Upload", up, setUp)}
     </EditorShell>
