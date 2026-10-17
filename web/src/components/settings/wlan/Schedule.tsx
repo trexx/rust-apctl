@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { hhmm as time } from "../../../format";
-import { TextInput } from "../form";
+import { TextInput, TimeInput } from "../form";
 import type { Blackout } from "../../../api";
 
 const WEEK = ["sun", "mon", "tue", "wed", "thu", "fri", "sat"] as const;
@@ -78,12 +78,10 @@ export function ScheduleEditor({
               ))}
               <label className="small">
                 off from{" "}
-                <input
-                  type="time"
-                  className="search time-input"
+                <TimeInput
                   value={time(start)}
-                  onChange={(ev) => {
-                    const s = minutes(ev.target.value);
+                  onChange={(t) => {
+                    const s = minutes(t);
                     update(i, {
                       start_hour: Math.floor(s / 60),
                       start_minute: s % 60,
@@ -94,15 +92,12 @@ export function ScheduleEditor({
               </label>
               <label className="small">
                 until{" "}
-                <input
-                  type="time"
-                  className="search time-input"
+                <TimeInput
                   value={time(end)}
-                  onChange={(ev) =>
+                  onChange={(t) =>
                     update(i, {
                       duration_minutes:
-                        (minutes(ev.target.value) - start + 1440) % 1440 ||
-                        1440,
+                        (minutes(t) - start + 1440) % 1440 || 1440,
                     })
                   }
                 />

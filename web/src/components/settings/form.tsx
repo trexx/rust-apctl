@@ -257,6 +257,43 @@ export function TextInput({
   );
 }
 
+/**
+ * A time of day, "HH:MM". The text is kept as typed; the form only gets a
+ * complete time, so a cleared field leaves the time as it was (shown again on
+ * leaving) instead of becoming midnight.
+ */
+export function TimeInput({
+  value,
+  onChange,
+  disabled,
+}: {
+  value: string;
+  onChange: (t: string) => void;
+  disabled?: boolean;
+}) {
+  const [text, setText] = useState(value);
+  const [last, setLast] = useState(value);
+  if (value !== last) {
+    setLast(value);
+    setText(value);
+  }
+  return (
+    <input
+      type="time"
+      className="search time-input"
+      value={text}
+      disabled={disabled}
+      onChange={(e) => {
+        setText(e.target.value);
+        if (!e.target.value) return;
+        setLast(e.target.value);
+        onChange(e.target.value);
+      }}
+      onBlur={() => setText(value)}
+    />
+  );
+}
+
 /** Splits on white space, commas and semicolons: MAC addresses, servers. */
 export const words = (text: string) =>
   text

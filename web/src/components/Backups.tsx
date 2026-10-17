@@ -13,7 +13,7 @@ import type { BackupManifest, BackupMeta, BackupSettings } from "../api";
 import { ago, bytes, dateTime as when, hhmm, useNow } from "../format";
 import { ErrorNote, Loading, Outcome, useRunner } from "./common";
 import { FileButton } from "./FileButton";
-import { NumberInput } from "./settings/form";
+import { NumberInput, TimeInput } from "./settings/form";
 
 const HISTORY: [number, string][] = [
   [0, "Settings only"],
@@ -93,42 +93,6 @@ function useRestartWatch(restart: { before: string | null } | null) {
     };
   }, [restart]);
   return gaveUp;
-}
-
-/**
- * A local "HH:MM". The text is kept as typed; the form only gets a complete
- * time, so a cleared field leaves the time as it was (shown again on leaving).
- */
-function TimeInput({
-  value,
-  onChange,
-  disabled,
-}: {
-  value: string;
-  onChange: (t: string) => void;
-  disabled?: boolean;
-}) {
-  const [text, setText] = useState(value);
-  const [last, setLast] = useState(value);
-  if (value !== last) {
-    setLast(value);
-    setText(value);
-  }
-  return (
-    <input
-      type="time"
-      className="search time-input"
-      value={text}
-      disabled={disabled}
-      onChange={(e) => {
-        setText(e.target.value);
-        if (!e.target.value) return;
-        setLast(e.target.value);
-        onChange(e.target.value);
-      }}
-      onBlur={() => setText(value)}
-    />
-  );
 }
 
 function Schedule({
