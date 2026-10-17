@@ -282,6 +282,8 @@ pub struct Live {
     /// unredacted. Only kept in memory; the database has a redacted copy.
     /// Shared, so readers copy a pointer under the lock, not the config.
     pub last_config: HashMap<Mac, Arc<PushedConfig>>,
+    /// The STUN socket (active mode), which connection requests are sent from.
+    pub stun: Option<Arc<tokio::net::UdpSocket>>,
 }
 
 impl Live {
@@ -309,7 +311,7 @@ impl Live {
     fn forget_ap(&mut self, mac: &Mac) {
         let Live {
             devices, aliases: _, clients: _, counters: _, by_hash_id, by_ip, known_devices, state: _, state_imported_at: _, raw_informs, firmware, commands,
-            locating, reprovision, scans, adoption, last_config,
+            locating, reprovision, scans, adoption, last_config, stun: _,
         } = self;
         devices.remove(mac);
         // Also what was restored from the database, or it could still be reported offline.

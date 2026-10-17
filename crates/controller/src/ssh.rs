@@ -24,18 +24,11 @@ use crate::engine::{Event, EventKind};
 
 /// The URL APs should inform to: `--inform-url`, else the one the managed APs use.
 pub fn inform_url(s: &AppState) -> Option<String> {
-    if let Some(u) = INFORM_URL.get() {
+    if let Some(u) = &s.inform_url {
         return Some(u.clone());
     }
     let live = s.live.read().unwrap();
     live.state.as_deref()?["devices"].as_array()?.iter().find_map(|d| d["inform_url"].as_str().filter(|u| u.starts_with("http")).map(str::to_string))
-}
-
-static INFORM_URL: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-
-/// Sets `--inform-url`.
-pub fn set_inform_url(url: String) {
-    let _ = INFORM_URL.set(url);
 }
 
 /// Whether adopting over SSH can work: active mode and an inform URL to give.

@@ -274,7 +274,7 @@ async fn serve(args: ServeArgs) -> Result<()> {
         let url = inform_url.clone().unwrap_or_else(|| format!("http://unifi:{}/inform", inform_listen.port()));
         let controller = dryrun::controller(url, emulate_version, reporter_id(&store)?);
         let active_state = active::Active::new(&store, writer.clone(), live.clone(), keys.clone(), in_tx.clone(), controller, proxies.clone())?;
-        start_active(Arc::new(active_state), inform_url, inform_listen, stun_listen).await?;
+        start_active(Arc::new(active_state), &live, inform_url.as_deref(), inform_listen, stun_listen).await?;
     }
 
     let users = match &users_file {
@@ -287,11 +287,15 @@ async fn serve(args: ServeArgs) -> Result<()> {
         tracing::info!("login enabled for {} user(s)", users.len());
     }
     let auth = Arc::new(auth::Auth::new(users, &store, writer.clone(), proxies)?);
-    threats::watch(store.clone(), live.clone(), in_tx.clone(), writer.clone());
+    let threat_acks: Arc<threats::AckCache> = Default::default();
+    threats::watch(store.clone(), threat_acks.clone(), live.clone(), in_tx.clone(), writer.clone());
     alerts::spawn(store.clone(), writer.clone(), live.clone(), live_tx.clone(), alert_events);
     backup::schedule(backups.clone(), store.clone());
     firmware::schedule(writer.clone());
-    let state = api::AppState { backups, active, writer: writer.clone(), store, vendors: Arc::new(vendors), renderer, auth, engine: in_tx.clone(), live, tx: api::live_json(&live_tx), started: clock::now_ts(), source: source_desc };
+    let state = api::AppState::new(api::AppStateInner {
+        backups, active, writer: writer.clone(), store, vendors: Arc::new(vendors), renderer, auth, engine: in_tx.clone(), live, tx: api::live_json(&live_tx), started: clock::now_ts(),
+        source: source_desc, inform_url: inform_url.filter(|_| active), memo: Default::default(), threat_acks,
+    });
     channelai::schedule(state.clone());
     ratelimit::spawn(state.clone());
     adopt::spawn(state.clone());
@@ -373,15 +377,12 @@ pub(crate) fn random_hex(bytes: usize) -> String {
 
 /// Active mode's servers: STUN (`inform_url`'s host is the address its answers
 /// give), and the APs' informs, on listeners of their own.
-async fn start_active(state: Arc<active::Active>, inform_url: Option<String>, inform_listen: SocketAddr, stun_listen: SocketAddr) -> Result<()> {
-    let advertised = match &inform_url {
+async fn start_active(state: Arc<active::Active>, live: &SharedLive, inform_url: Option<&str>, inform_listen: SocketAddr, stun_listen: SocketAddr) -> Result<()> {
+    let advertised = match inform_url {
         Some(u) => advertised_ip(u).await,
         None => None,
     };
-    if let Some(u) = inform_url {
-        ssh::set_inform_url(u);
-    }
-    if let Err(e) = stun::serve(stun_listen, advertised).await {
+    if let Err(e) = stun::serve(stun_listen, advertised, live).await {
         tracing::warn!("STUN not available on {stun_listen}: {e}");
     }
     let inform_app = axum::Router::new().route("/inform", axum::routing::post(active::inform)).with_state(state);

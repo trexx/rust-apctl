@@ -10,14 +10,12 @@
 //! config is waiting).
 
 use std::net::{IpAddr, SocketAddr};
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 
 use inform::Mac;
 use tokio::net::UdpSocket;
 
-use crate::engine::Live;
-
-static SOCKET: OnceLock<Arc<UdpSocket>> = OnceLock::new();
+use crate::engine::{Live, SharedLive};
 
 const BINDING_REQUEST: u16 = 0x0001;
 const BINDING_RESPONSE: u16 = 0x0101;
@@ -75,10 +73,11 @@ fn answer(req: &[u8], from: SocketAddr, local: SocketAddr) -> Option<Vec<u8>> {
 }
 
 /// Serves STUN on `listen`; `advertised` is the address put in the answers
-/// when the socket is bound to all interfaces.
-pub async fn serve(listen: SocketAddr, advertised: Option<IpAddr>) -> anyhow::Result<()> {
+/// when the socket is bound to all interfaces. The socket goes in `live`,
+/// for [`poke`].
+pub async fn serve(listen: SocketAddr, advertised: Option<IpAddr>, live: &SharedLive) -> anyhow::Result<()> {
     let socket = Arc::new(UdpSocket::bind(listen).await?);
-    let _ = SOCKET.set(socket.clone());
+    live.write().unwrap().stun = Some(socket.clone());
     let mut local = socket.local_addr()?;
     if local.ip().is_unspecified()
         && let Some(ip) = advertised
@@ -116,7 +115,7 @@ const REQUEST_PACKET: [u8; 20] = {
 
 /// Asks an AP to inform now, if it told us where it can be reached.
 pub fn poke(live: &Live, mac: &Mac) {
-    let Some(socket) = SOCKET.get() else { return };
+    let Some(socket) = &live.stun else { return };
     let Some(p) = live.raw_informs.get(mac) else { return };
     let ip = p["connect_request_ip"].as_str().and_then(|i| i.parse::<IpAddr>().ok());
     let port = p["connect_request_port"].as_u64().or_else(|| p["connect_request_port"].as_str()?.parse().ok()).and_then(|v| u16::try_from(v).ok());

@@ -23,8 +23,33 @@ use crate::engine::{AliasEdit, DeviceView, LiveMsg, SharedLive};
 use crate::model::Ts;
 use crate::store::{self, Db, Store};
 
+/// What the handlers share. Cloned for every request (and by some handlers
+/// again), so it is one `Arc`: a clone is a single count, and what is kept
+/// for the whole process (the insights memo) needs no `Arc` of its own.
 #[derive(Clone)]
-pub struct AppState {
+pub struct AppState(Arc<AppStateInner>);
+
+impl std::ops::Deref for AppState {
+    type Target = AppStateInner;
+
+    fn deref(&self) -> &AppStateInner {
+        &self.0
+    }
+}
+
+impl AppState {
+    pub fn new(inner: AppStateInner) -> Self {
+        AppState(Arc::new(inner))
+    }
+
+    /// To change a test's state before it is handed out.
+    #[cfg(test)]
+    pub fn get_mut(&mut self) -> &mut AppStateInner {
+        Arc::get_mut(&mut self.0).expect("the state is not shared yet")
+    }
+}
+
+pub struct AppStateInner {
     pub store: Arc<Store>,
     /// Manufacturer names by MAC prefix (IEEE registry).
     pub vendors: Arc<crate::vendor::Vendors>,
@@ -42,6 +67,12 @@ pub struct AppState {
     /// Active mode: apctl answers the APs (and can upgrade them).
     pub active: bool,
     pub writer: crate::store::Writer,
+    /// `--inform-url` in active mode (see `ssh::inform_url`).
+    pub inform_url: Option<String>,
+    /// What the insights views read lately (see `insights::memo_read`).
+    pub memo: crate::insights::Memo,
+    /// The threat acknowledgements, shared with `threats::watch`.
+    pub threat_acks: Arc<crate::threats::AckCache>,
 }
 
 pub fn router(state: AppState) -> Router {
@@ -1175,11 +1206,11 @@ mod tests {
         let auth = Arc::new(crate::auth::Auth::new(Default::default(), &store, writer.clone(), Default::default()).unwrap());
         let (engine, engine_rx) = tokio::sync::mpsc::channel(1);
         let (tx, _) = broadcast::channel(1);
-        let state = AppState {
+        let state = AppState::new(AppStateInner {
             backups: crate::backup::Backups::new(dir, None),
             store, vendors: Default::default(), renderer: crate::dryrun::apcfg_renderer(crate::EMULATE_VERSION.into()), auth, engine, live: Default::default(), tx, started: 0, source: "none".into(),
-            active: false, writer,
-        };
+            active: false, writer, inform_url: None, memo: Default::default(), threat_acks: Default::default(),
+        });
         (state, engine_rx)
     }
 
@@ -1371,7 +1402,7 @@ mod tests {
         let (mut state, _engine) = state();
         let file = state.backups.data_dir.join("users");
         std::fs::write(&file, format!("admin:{}\n", crate::auth::hash_password("x").unwrap())).unwrap();
-        state.auth = Arc::new(crate::auth::Auth::new(crate::auth::Users::load(&file).unwrap(), &state.store, state.writer.clone(), Default::default()).unwrap());
+        state.get_mut().auth = Arc::new(crate::auth::Auth::new(crate::auth::Users::load(&file).unwrap(), &state.store, state.writer.clone(), Default::default()).unwrap());
         let cookie = format!("{}={}", crate::auth::COOKIE, state.auth.create("admin").unwrap());
         let req = Request::get("/api/settings/wlans/w1/passphrase").header(header::COOKIE, cookie).body(Body::empty()).unwrap();
         assert_eq!(router(state).oneshot(req).await.unwrap().status(), StatusCode::CONFLICT);
@@ -1383,7 +1414,7 @@ mod tests {
         let file = state.backups.data_dir.join("users");
         std::fs::write(&file, format!("admin:{}\n", crate::auth::hash_password("x").unwrap())).unwrap();
         let users = crate::auth::Users::load(&file).unwrap();
-        state.auth = Arc::new(crate::auth::Auth::new(users, &state.store, state.writer.clone(), Default::default()).unwrap());
+        state.get_mut().auth = Arc::new(crate::auth::Auth::new(users, &state.store, state.writer.clone(), Default::default()).unwrap());
         let cookie = format!("{}={}", crate::auth::COOKIE, state.auth.create("admin").unwrap());
         let app = router(state);
         let post = |csrf: bool| {
@@ -1435,7 +1466,7 @@ mod tests {
         let (mut state, engine) = state();
         let file = state.backups.data_dir.join("users");
         std::fs::write(&file, format!("admin:{}\n", crate::auth::hash_password("x").unwrap())).unwrap();
-        state.auth = Arc::new(crate::auth::Auth::new(crate::auth::Users::load(&file).unwrap(), &state.store, state.writer.clone(), Default::default()).unwrap());
+        state.get_mut().auth = Arc::new(crate::auth::Auth::new(crate::auth::Users::load(&file).unwrap(), &state.store, state.writer.clone(), Default::default()).unwrap());
         let cookie = format!("{}={}", crate::auth::COOKIE, state.auth.create("admin").unwrap());
         (state, engine, cookie)
     }
@@ -1489,7 +1520,7 @@ mod tests {
         let file = state.backups.data_dir.join("users");
         std::fs::write(&file, format!("admin:{}\n", crate::auth::hash_password("x").unwrap())).unwrap();
         let users = crate::auth::Users::load(&file).unwrap();
-        state.auth = Arc::new(crate::auth::Auth::new(users, &state.store, state.writer.clone(), Default::default()).unwrap());
+        state.get_mut().auth = Arc::new(crate::auth::Auth::new(users, &state.store, state.writer.clone(), Default::default()).unwrap());
         let cookie = format!("{}={}", crate::auth::COOKIE, state.auth.create("admin").unwrap());
         let app = router(state);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1533,7 +1564,7 @@ mod tests {
         let file = state.backups.data_dir.join("users");
         std::fs::write(&file, format!("admin:{}\n", crate::auth::hash_password("x").unwrap())).unwrap();
         let users = crate::auth::Users::load(&file).unwrap();
-        state.auth = Arc::new(crate::auth::Auth::new(users, &state.store, state.writer.clone(), Default::default()).unwrap());
+        state.get_mut().auth = Arc::new(crate::auth::Auth::new(users, &state.store, state.writer.clone(), Default::default()).unwrap());
         let token = state.auth.create("admin").unwrap();
         let auth = state.auth.clone();
         let app = router(state);

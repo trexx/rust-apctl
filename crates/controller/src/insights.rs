@@ -268,16 +268,11 @@ const MEMO_SECS: [u64; 3] = [15, 60, 300];
 /// it empty reads it; the others asking meanwhile wait for that read.
 type Slot = std::sync::Arc<tokio::sync::OnceCell<(std::time::Instant, std::sync::Arc<dyn std::any::Any + Send + Sync>)>>;
 
-/// By query: when its slot was made, and the slot.
-type Memo = HashMap<String, (std::time::Instant, Slot)>;
-
-/// What the views last read, by view and query: several tabs, and each tab's
-/// refresh every minute, ask for the same windows again.
-static MEMO: std::sync::LazyLock<std::sync::Mutex<Memo>> = std::sync::LazyLock::new(Default::default);
-
-fn memo() -> std::sync::MutexGuard<'static, Memo> {
-    MEMO.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
-}
+/// What the views last read, by view and query (when its slot was made, and
+/// the slot): several tabs, and each tab's refresh every minute, ask for the
+/// same windows again. Kept in `AppState`.
+#[derive(Default)]
+pub struct Memo(std::sync::Mutex<HashMap<String, (std::time::Instant, Slot)>>);
 
 /// [`read`] from `db` for `view`, reusing what the same query read less than
 /// [`MEMO_SECS`] ago (the window then ends that much earlier). Queries made
@@ -291,12 +286,11 @@ pub(crate) async fn memo_read<T: Send + Sync + 'static>(
     f: impl FnOnce(&Connection) -> anyhow::Result<T> + Send + 'static,
 ) -> Result<std::sync::Arc<T>, ApiError> {
     let RangeQuery { range, from, to, band, mac } = q;
-    // The data directory tells databases apart (tests run several).
-    let key = format!("{}|{view}|{range:?}|{from:?}|{to:?}|{band:?}|{mac:?}", s.backups.data_dir.display());
+    let key = format!("{view}|{range:?}|{from:?}|{to:?}|{band:?}|{mac:?}");
     let ttl = std::time::Duration::from_secs(MEMO_SECS[tier]);
     // The slot being read or read recently enough, else a new one.
     let slot = {
-        let mut m = memo();
+        let mut m = s.memo.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         match m.get(&key) {
             Some((_, slot)) if slot.get().is_none_or(|(at, _)| at.elapsed() < ttl) => slot.clone(),
             _ => {
@@ -1966,11 +1960,11 @@ mod tests {
             let auth = std::sync::Arc::new(crate::auth::Auth::new(Default::default(), &store, writer.clone(), Default::default()).unwrap());
             let (engine, _) = tokio::sync::mpsc::channel(1);
             let (tx, _) = tokio::sync::broadcast::channel(1);
-            let s = AppState {
+            let s = AppState::new(crate::api::AppStateInner {
                 backups: crate::backup::Backups::new(dir.clone(), None),
                 store, vendors: Default::default(), renderer: crate::dryrun::apcfg_renderer("10.6.106".into()), auth, engine, live, tx, started: 0, source: "none".into(),
-                active: false, writer,
-            };
+                active: false, writer, inform_url: None, memo: Default::default(), threat_acks: Default::default(),
+            });
             (s, base, dir)
         }
 
