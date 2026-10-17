@@ -48,6 +48,8 @@ pub fn router(state: AppState) -> Router {
         .route("/api/login", axum::routing::post(crate::auth::login))
         .route("/api/logout", axum::routing::post(crate::auth::logout))
         .route("/api/me", get(crate::auth::me));
+    // Routes that hand out secrets: withheld in read-only mode.
+    let secret = axum::middleware::from_fn_with_state(state.clone(), crate::auth::withhold_in_read_only);
     let protected = Router::new()
         .route("/api/status", get(status))
         .route("/api/devices", get(devices))
@@ -74,7 +76,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/settings/site", get(crate::site::get_site).put(crate::site::put_site))
         .route("/api/settings/wlans", get(crate::settings::wlans).post(crate::settings::post_wlan))
         .route("/api/settings/wlans/{id}", axum::routing::put(crate::settings::put_wlan).delete(crate::settings::delete_wlan_route))
-        .route("/api/settings/wlans/{id}/passphrase", get(crate::settings::passphrase))
+        .route("/api/settings/wlans/{id}/passphrase", get(crate::settings::passphrase).route_layer(secret.clone()))
         .route("/api/settings/devices/{mac}", get(crate::settings::device).put(crate::settings::put_device))
         .route("/api/settings/usergroups", get(crate::settings::usergroups).post(crate::settings::post_usergroup))
         .route("/api/settings/usergroups/{id}", axum::routing::put(crate::settings::put_usergroup).delete(crate::settings::delete_usergroup))
@@ -91,7 +93,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/firmware/cancel", axum::routing::post(crate::firmware::cancel))
         .route("/api/backups", get(crate::backup::index).post(crate::backup::create_now))
         .route("/api/backups/settings", axum::routing::put(crate::backup::put_settings))
-        .route("/api/backups/file/{name}", get(crate::backup::download).delete(crate::backup::delete))
+        .route("/api/backups/file/{name}", get(crate::backup::download).delete(crate::backup::delete).route_layer(secret.clone()))
         .route("/api/backups/upload", axum::routing::post(crate::backup::upload))
         .route("/api/backups/restore", axum::routing::post(crate::backup::restore))
         .route("/api/alerts", get(crate::alerts::list))
@@ -948,10 +950,23 @@ async fn logs(State(s): State<AppState>, Query(q): Query<LogQuery>) -> ApiResult
     Ok(Json(Value::Array(rows)))
 }
 
-async fn ws(State(s): State<AppState>, upgrade: WebSocketUpgrade) -> Response {
+async fn ws(
+    State(s): State<AppState>,
+    headers: axum::http::HeaderMap,
+    uri: axum::http::Uri,
+    peer: Option<axum::Extension<axum::extract::ConnectInfo<std::net::SocketAddr>>>,
+    upgrade: WebSocketUpgrade,
+) -> Response {
+    if !s.auth.same_origin(&headers, peer.map(|p| p.0.0.ip()), uri.authority().map(|a| a.as_str())) {
+        return ApiError(StatusCode::FORBIDDEN, "the live socket is only for pages of this server".into()).into_response();
+    }
     let rx = s.tx.subscribe();
-    upgrade.on_upgrade(move |socket| live_socket(socket, rx))
+    let (auth, session) = (s.auth.clone(), s.auth.session_of(&headers));
+    upgrade.on_upgrade(move |socket| live_socket(socket, rx, auth, session))
 }
+
+/// How often an open socket checks that its session is still there.
+const SESSION_RECHECK: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Tells a client that missed messages to refetch rather than dropping it.
 const RESYNC: &str = r#"{"type":"resync"}"#;
@@ -977,9 +992,28 @@ pub fn live_json(typed: &broadcast::Sender<LiveMsg>) -> broadcast::Sender<Utf8By
     tx
 }
 
-async fn live_socket(mut socket: WebSocket, mut rx: broadcast::Receiver<Utf8Bytes>) {
+/// Streams the live messages until the client goes, or its session does:
+/// the login is checked at the upgrade, then at every logout and now and
+/// then (for expiry). Read-only mode has no sessions to check.
+async fn live_socket(mut socket: WebSocket, mut rx: broadcast::Receiver<Utf8Bytes>, auth: crate::auth::SharedAuth, session: Option<String>) {
+    let mut recheck = tokio::time::interval_at(tokio::time::Instant::now() + SESSION_RECHECK, SESSION_RECHECK);
+    let mut logouts = auth.logouts();
     loop {
+        // (The logouts' sender lives in `auth`, which this holds: it never closes.)
+        let due = async {
+            tokio::select! {
+                _ = recheck.tick() => {}
+                _ = logouts.changed() => {}
+            }
+        };
         tokio::select! {
+            _ = due, if session.is_some() => {
+                if !session.as_deref().is_some_and(|h| auth.alive(h)) {
+                    let close = axum::extract::ws::CloseFrame { code: axum::extract::ws::close_code::POLICY, reason: Utf8Bytes::from_static("logged out") };
+                    let _ = socket.send(Message::Close(Some(close))).await;
+                    return;
+                }
+            }
             msg = rx.recv() => match msg {
                 // Shared text: sending it copies nothing.
                 Ok(text) => {
@@ -1202,6 +1236,14 @@ mod tests {
         assert_eq!(get(&app, "/api/status").await.status(), StatusCode::OK);
         assert_eq!(get(&app, "/api/settings/wlans/w1/passphrase").await.status(), StatusCode::FORBIDDEN);
         assert_eq!(get(&app, "/api/backups/file/apctl-0.1.0-20260101-000000.apb").await.status(), StatusCode::FORBIDDEN);
+        // With a login they are served (here: there are no settings yet).
+        let (mut state, _engine) = state();
+        let file = state.backups.data_dir.join("users");
+        std::fs::write(&file, format!("admin:{}\n", crate::auth::hash_password("x").unwrap())).unwrap();
+        state.auth = Arc::new(crate::auth::Auth::new(crate::auth::Users::load(&file).unwrap(), &state.store, state.writer.clone(), Default::default()).unwrap());
+        let cookie = format!("{}={}", crate::auth::COOKIE, state.auth.create("admin").unwrap());
+        let req = Request::get("/api/settings/wlans/w1/passphrase").header(header::COOKIE, cookie).body(Body::empty()).unwrap();
+        assert_eq!(router(state).oneshot(req).await.unwrap().status(), StatusCode::CONFLICT);
     }
 
     #[tokio::test]
@@ -1277,6 +1319,79 @@ mod tests {
         let ApiError(status, msg) = ApiError::from(e);
         assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
         assert_eq!(msg, INTERNAL);
+    }
+
+    #[tokio::test]
+    async fn the_live_socket_checks_the_origin_and_closes_at_logout() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let (mut state, _engine) = state();
+        let file = state.backups.data_dir.join("users");
+        std::fs::write(&file, format!("admin:{}\n", crate::auth::hash_password("x").unwrap())).unwrap();
+        let users = crate::auth::Users::load(&file).unwrap();
+        state.auth = Arc::new(crate::auth::Auth::new(users, &state.store, state.writer.clone(), Default::default()).unwrap());
+        let cookie = format!("{}={}", crate::auth::COOKIE, state.auth.create("admin").unwrap());
+        let app = router(state);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = app.clone().into_make_service_with_connect_info::<std::net::SocketAddr>();
+        tokio::spawn(async move { axum::serve(listener, server).await.unwrap() });
+        // A handshake by hand: the status line, and the open connection.
+        let open = |origin: Option<String>| {
+            let cookie = cookie.clone();
+            async move {
+                let mut tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+                let origin = origin.map(|o| format!("Origin: {o}\r\n")).unwrap_or_default();
+                let req = format!(
+                    "GET /api/ws HTTP/1.1\r\nHost: {addr}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nCookie: {cookie}\r\n{origin}\r\n"
+                );
+                tcp.write_all(req.as_bytes()).await.unwrap();
+                let mut head = Vec::new();
+                while !head.ends_with(b"\r\n\r\n") {
+                    let mut b = [0u8; 1];
+                    tcp.read_exact(&mut b).await.unwrap();
+                    head.push(b[0]);
+                }
+                let status = String::from_utf8(head).unwrap().split(' ').nth(1).unwrap().to_string();
+                (status, tcp)
+            }
+        };
+        assert_eq!(open(Some("http://evil.example".into())).await.0, "403");
+        assert_eq!(open(None).await.0, "101", "no Origin: not a browser page");
+        let (status, mut tcp) = open(Some(format!("http://{addr}"))).await;
+        assert_eq!(status, "101");
+        let req = Request::post("/api/logout").header(header::COOKIE, &cookie).body(Body::empty()).unwrap();
+        assert_eq!(app.oneshot(req).await.unwrap().status(), StatusCode::OK);
+        let mut frame = [0u8; 2];
+        tokio::time::timeout(std::time::Duration::from_secs(5), tcp.read_exact(&mut frame)).await.expect("closed at the logout").unwrap();
+        assert_eq!(frame[0], 0x88, "a close frame");
+    }
+
+    #[tokio::test]
+    async fn a_session_used_a_day_later_gets_its_cookie_again() {
+        let (mut state, _engine) = state();
+        let file = state.backups.data_dir.join("users");
+        std::fs::write(&file, format!("admin:{}\n", crate::auth::hash_password("x").unwrap())).unwrap();
+        let users = crate::auth::Users::load(&file).unwrap();
+        state.auth = Arc::new(crate::auth::Auth::new(users, &state.store, state.writer.clone(), Default::default()).unwrap());
+        let token = state.auth.create("admin").unwrap();
+        let auth = state.auth.clone();
+        let app = router(state);
+        let set_cookie = |path: &'static str| {
+            let req = Request::get(path).header(header::COOKIE, format!("{}={token}", crate::auth::COOKIE)).header("x-forwarded-proto", "https").body(Body::empty()).unwrap();
+            let app = app.clone();
+            async move {
+                let res = app.oneshot(req).await.unwrap();
+                assert_eq!(res.status(), StatusCode::OK);
+                res.headers().get(header::SET_COOKIE).map(|v| v.to_str().unwrap().to_string())
+            }
+        };
+        assert_eq!(set_cookie("/api/status").await, None, "fresh from the login");
+        for path in ["/api/status", "/api/me"] {
+            auth.age_session(&token, 2 * 86400);
+            let c = set_cookie(path).await.unwrap_or_else(|| panic!("{path}: no cookie"));
+            assert!(c.starts_with(&format!("{}={token};", crate::auth::COOKIE)) && c.contains("Max-Age=2592000") && c.ends_with("; Secure"), "{c}");
+            assert_eq!(set_cookie(path).await, None, "{path}: once a day");
+        }
     }
 
     #[tokio::test]

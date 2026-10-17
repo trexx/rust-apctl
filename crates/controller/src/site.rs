@@ -7,6 +7,7 @@ use axum::Json;
 use axum::extract::{Query, State};
 use serde_json::{Value, json};
 use std::collections::HashMap;
+use std::sync::LazyLock;
 
 use crate::api::{ApiError, AppState};
 use crate::settings::Kind::{Bool, Int};
@@ -252,7 +253,7 @@ fn site_region(state: &mut Value, p: &Value) -> Result<(), String> {
         setting_mut(state, "country")["code"] = json!(code.to_string());
     }
     if let Some(tz) = p["timezone"].as_str() {
-        if !apcfg::tz::names().any(|n| n == tz) {
+        if apcfg::tz::posix(tz).is_none() {
             return Err(format!("{tz} is not a time zone apctl knows"));
         }
         setting_mut(state, "locale")["timezone"] = json!(tz);
@@ -337,12 +338,16 @@ fn site_view(state: &Value, active: bool, secrets: bool) -> Value {
         "enabled": sn["enabled"], "enabledV3": sn["enabledV3"], "community": if secrets { sn["community"].clone() } else { Value::Null }, "username": sn["username"],
         "has_v3_password": sn["x_password"].as_str().is_some_and(|p| !p.is_empty()),
     });
-    json!({
+    // The choices never change: built once.
+    static COUNTRIES: LazyLock<Value> = LazyLock::new(|| COUNTRY_NAMES.iter().map(|(c, n)| json!({ "code": c, "name": n })).collect());
+    static TIMEZONES: LazyLock<Value> = LazyLock::new(|| apcfg::tz::names().collect());
+    let mut v = json!({
         "active": active, "mgmt": mgmt, "rsyslogd": rsyslogd, "ntp": ntp, "snmp": snmp,
         "country": country(state), "timezone": setting(state, "locale")["timezone"],
-        "countries": COUNTRY_NAMES.iter().map(|(c, n)| json!({ "code": c, "name": n })).collect::<Vec<_>>(),
-        "timezones": apcfg::tz::names().collect::<Vec<_>>(),
-    })
+    });
+    v["countries"] = COUNTRIES.clone();
+    v["timezones"] = TIMEZONES.clone();
+    v
 }
 
 /// PUT /api/settings/site {patch} (`?preview=true` to see the effect)

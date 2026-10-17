@@ -3,7 +3,8 @@
 //!
 //! Session tokens are 256 random bits. Only their SHA-256 is kept (in memory
 //! and in `config.db`), so a copy of the database cannot be used to log in.
-//! Sessions slide: each use extends them to 30 days from now.
+//! Sessions slide: using one extends it, and its cookie, to 30 days from then
+//! (at most once a day).
 
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
@@ -15,7 +16,7 @@ use argon2::Argon2;
 use argon2::password_hash::phc::PasswordHash;
 use argon2::password_hash::{PasswordHasher, PasswordVerifier};
 use axum::extract::{ConnectInfo, Request, State};
-use axum::http::{HeaderMap, Method, StatusCode, header};
+use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, header};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
@@ -39,40 +40,71 @@ pub fn hash_password(password: &str) -> Result<String> {
 }
 
 #[derive(Default)]
-pub struct Users(HashMap<String, String>);
+pub struct Users {
+    hashes: HashMap<String, String>,
+    /// What an unknown username is checked against: the first user's hash, so
+    /// it costs the same as a known one whatever parameters the file uses.
+    dummy: String,
+}
 
 impl Users {
     /// Reads `username:hash` lines; blank lines and `#` comments are ignored.
+    /// A line that is not `username:hash` stops the start. Lines that could
+    /// never log in (no username, a name listed again, a hash other than
+    /// Argon2) are skipped with a warning, as `--keys` does with its entries;
+    /// a file left without users then is an error, not read-only mode.
     pub fn load(path: &Path) -> Result<Users> {
         let text = std::fs::read_to_string(path).with_context(|| format!("reading users from {}", path.display()))?;
-        let mut users = HashMap::new();
+        let mut users = Users::default();
+        let mut skipped = 0;
         for (n, line) in text.lines().enumerate() {
             let line = line.trim();
             if line.is_empty() || line.starts_with('#') {
                 continue;
             }
-            let Some((user, hash)) = line.split_once(':') else { bail!("{}:{}: expected username:hash", path.display(), n + 1) };
-            PasswordHash::new(hash).map_err(|e| anyhow::anyhow!("{}:{}: invalid hash: {e}", path.display(), n + 1))?;
-            users.insert(user.to_string(), hash.to_string());
+            let at = format!("{}:{}", path.display(), n + 1);
+            let Some((user, hash)) = line.split_once(':') else { bail!("{at}: expected username:hash") };
+            let parsed = PasswordHash::new(hash).map_err(|e| anyhow::anyhow!("{at}: invalid hash: {e}"))?;
+            let why = if user.is_empty() {
+                Some("no username".to_string())
+            } else if users.hashes.contains_key(user) {
+                Some(format!("{user:?} is listed already (the first line counts)"))
+            } else if argon2::Algorithm::try_from(parsed.algorithm.as_str()).is_err() {
+                Some(format!("{user:?} has a {} hash, and only Argon2 ones can log in (see apctl hash-password)", parsed.algorithm.as_str()))
+            } else {
+                None
+            };
+            if let Some(why) = why {
+                tracing::warn!("{at}: skipping the line: {why}");
+                skipped += 1;
+                continue;
+            }
+            if users.hashes.is_empty() {
+                users.dummy = hash.to_string();
+            }
+            users.hashes.insert(user.to_string(), hash.to_string());
         }
-        Ok(Users(users))
+        if users.is_empty() && skipped > 0 {
+            bail!("{}: no user can log in (see the warnings above)", path.display());
+        }
+        Ok(users)
     }
 
     pub fn is_empty(&self) -> bool {
-        self.0.is_empty()
+        self.hashes.is_empty()
     }
 
     pub fn len(&self) -> usize {
-        self.0.len()
+        self.hashes.len()
     }
 
     /// Checks a password. Unknown users cost the same as wrong passwords, so
-    /// timing does not reveal which usernames exist.
+    /// timing does not reveal which usernames exist: they are checked against
+    /// a real user's hash, which no password can pass for them.
     pub fn verify(&self, user: &str, password: &str) -> bool {
-        static DUMMY: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| hash_password("dummy").unwrap_or_default());
-        let (hash, known) = match self.0.get(user) {
+        let (hash, known) = match self.hashes.get(user) {
             Some(h) => (h.as_str(), true),
-            None => (DUMMY.as_str(), false),
+            None => (self.dummy.as_str(), false),
         };
         let ok = PasswordHash::new(hash).is_ok_and(|h| Argon2::default().verify_password(password.as_bytes(), &h).is_ok());
         ok && known
@@ -93,6 +125,8 @@ pub struct Auth {
     failures: Mutex<HashMap<IpAddr, (u32, Ts)>>,
     writer: Writer,
     proxies: Arc<Proxies>,
+    /// Told of every logout, so open live sockets check their session at once.
+    logouts: tokio::sync::watch::Sender<()>,
 }
 
 pub type SharedAuth = Arc<Auth>;
@@ -112,8 +146,8 @@ impl Auth {
             Ok(rows)
         })?;
         // Sessions of users that were removed from the file stop working.
-        let sessions = rows.into_iter().filter(|(_, s)| users.0.contains_key(&s.user)).collect();
-        Ok(Auth { users, sessions: Mutex::new(sessions), failures: Mutex::new(HashMap::new()), writer, proxies })
+        let sessions = rows.into_iter().filter(|(_, s)| users.hashes.contains_key(&s.user)).collect();
+        Ok(Auth { users, sessions: Mutex::new(sessions), failures: Mutex::new(HashMap::new()), writer, proxies, logouts: tokio::sync::watch::Sender::new(()) })
     }
 
     pub fn enabled(&self) -> bool {
@@ -140,8 +174,9 @@ impl Auth {
         Ok(token)
     }
 
-    /// Returns the user for a valid session token, extending it.
-    fn check(&self, token: &str) -> Option<String> {
+    /// Returns the user for a valid session token, extending it, and whether
+    /// it was extended (the browser's cookie then needs the new expiry too).
+    fn check(&self, token: &str) -> Option<(String, bool)> {
         let hash = token_hash(token);
         let now = store::now_ts();
         let mut sessions = self.sessions.lock().unwrap();
@@ -150,17 +185,57 @@ impl Auth {
             sessions.remove(&hash);
             return None;
         }
-        // Persist the extension at most about once a day per session.
-        if now + SESSION_SECS - s.expires > 86400 {
+        // Extended (in the database and the cookie) at most about once a day per session.
+        let extend = now + SESSION_SECS - s.expires > 86400;
+        if extend {
             s.expires = now + SESSION_SECS;
             self.writer.exec(Db::Config, "UPDATE sessions SET expires = ?1 WHERE token_hash = ?2", vec![Sql::Integer(s.expires), Sql::Text(hash.clone())]);
         }
-        Some(s.user.clone())
+        Some((s.user.clone(), extend))
+    }
+
+    /// Makes a session look `secs` older (its expiry that much nearer).
+    #[cfg(test)]
+    pub(crate) fn age_session(&self, token: &str, secs: Ts) {
+        self.sessions.lock().unwrap().get_mut(&token_hash(token)).unwrap().expires -= secs;
+    }
+
+    /// The session a request belongs to (its token's hash); `None` without
+    /// logins (read-only mode has no sessions).
+    pub(crate) fn session_of(&self, headers: &HeaderMap) -> Option<String> {
+        if !self.enabled() {
+            return None;
+        }
+        session_token(headers).map(|t| token_hash(&t))
+    }
+
+    /// Changes at every logout.
+    pub(crate) fn logouts(&self) -> tokio::sync::watch::Receiver<()> {
+        self.logouts.subscribe()
+    }
+
+    /// Whether a session (by its hash) is still there: not logged out, not expired.
+    pub(crate) fn alive(&self, hash: &str) -> bool {
+        self.sessions.lock().unwrap().get(hash).is_some_and(|s| s.expires > store::now_ts())
+    }
+
+    /// Whether a WebSocket handshake comes from a page of this server. CORS
+    /// does not cover WebSockets, and the SameSite=Lax cookie is sent from
+    /// any page of the same site (a sibling subdomain), so the browser's
+    /// Origin must name the host the request was sent to: the Host header, or
+    /// X-Forwarded-Host from a trusted proxy. A handshake without an Origin
+    /// is not from a browser page, and is let through.
+    pub(crate) fn same_origin(&self, headers: &HeaderMap, peer: Option<IpAddr>, authority: Option<&str>) -> bool {
+        let Some(origin) = headers.get(header::ORIGIN) else { return true };
+        let forwarded = || headers.get_all("x-forwarded-host").iter().filter_map(|v| v.to_str().ok()).flat_map(|v| v.split(',')).next_back().map(str::trim);
+        let host = peer.filter(|p| self.proxies.contains(*p)).and_then(|_| forwarded()).or_else(|| headers.get(header::HOST)?.to_str().ok()).or(authority);
+        origin.to_str().ok().zip(host).is_some_and(|(o, h)| origin_matches(o, h))
     }
 
     fn revoke(&self, token: &str) {
         let hash = token_hash(token);
         self.sessions.lock().unwrap().remove(&hash);
+        self.logouts.send_replace(());
         self.writer.exec(Db::Config, "DELETE FROM sessions WHERE token_hash = ?1", vec![Sql::Text(hash)]);
     }
 
@@ -231,16 +306,23 @@ impl Proxies {
     /// The client's address. X-Forwarded-For counts only on a connection from
     /// a trusted proxy, and then its right-most hop that is not itself a
     /// trusted proxy: hops further left were written by the client and can
-    /// be anything.
+    /// be anything. A hop may carry a port (`203.0.113.7:4711`, `[2001:db8::1]:4711`).
     pub fn client_ip(&self, headers: &HeaderMap, peer: IpAddr) -> IpAddr {
         let peer = peer.to_canonical();
         if !self.contains(peer) {
             return peer;
         }
-        let hops: Vec<&str> = headers.get_all("x-forwarded-for").iter().filter_map(|v| v.to_str().ok()).flat_map(|v| v.split(',')).collect();
         let mut client = peer;
-        for hop in hops.iter().rev() {
-            let Ok(ip) = hop.trim().parse::<IpAddr>() else { break };
+        for hop in headers.get_all("x-forwarded-for").iter().filter_map(|v| v.to_str().ok()).flat_map(|v| v.split(',')).rev() {
+            let Some(ip) = hop_ip(hop.trim()) else {
+                // Skipping it would believe the hops left of it, which the
+                // client wrote: the last proxy's address is kept instead, so
+                // the clients behind it share their login attempts. Said once,
+                // as it is the proxy's setup that needs fixing.
+                static SAID: std::sync::Once = std::sync::Once::new();
+                SAID.call_once(|| tracing::warn!("X-Forwarded-For hop {hop:?} from {client} is not an address: logins through that proxy are throttled as one client"));
+                break;
+            };
             client = ip.to_canonical();
             if !self.contains(client) {
                 break;
@@ -248,6 +330,27 @@ impl Proxies {
         }
         client
     }
+}
+
+/// The address of an X-Forwarded-For hop, with or without a port.
+fn hop_ip(hop: &str) -> Option<IpAddr> {
+    hop.parse::<IpAddr>().ok().or_else(|| hop.parse::<SocketAddr>().ok().map(|a| a.ip())).or_else(|| hop.strip_prefix('[')?.strip_suffix(']')?.parse().ok())
+}
+
+/// Whether an Origin (`https://apctl.example:8443`) names this host (`apctl.example:8443`),
+/// a port the scheme implies being the same as none.
+fn origin_matches(origin: &str, host: &str) -> bool {
+    let Some((scheme, authority)) = origin.split_once("://") else { return false };
+    let default = match scheme.to_ascii_lowercase().as_str() {
+        "https" => ":443",
+        "http" => ":80",
+        _ => return false,
+    };
+    let bare = |a: &str| {
+        let a = a.trim().to_ascii_lowercase();
+        a.strip_suffix(default).map(str::to_string).unwrap_or(a)
+    };
+    !authority.is_empty() && bare(authority) == bare(host)
 }
 
 pub fn session_token(headers: &HeaderMap) -> Option<String> {
@@ -270,10 +373,14 @@ fn json_error(status: StatusCode, msg: &str) -> Response {
     (status, Json(json!({ "error": msg }))).into_response()
 }
 
-/// Reads that hand out secrets: Wi-Fi passphrases, and backups (which hold the
-/// APs' keys and the passphrases). Read-only mode does not serve them.
-fn secret(path: &str) -> bool {
-    path.starts_with("/api/backups/file/") || (path.starts_with("/api/settings/wlans/") && path.ends_with("/passphrase"))
+/// For the routes that hand out secrets (Wi-Fi passphrases, and backups, which
+/// hold the APs' keys and the passphrases): read-only mode does not serve
+/// them. Set on the route itself, so a new one cannot be missed.
+pub async fn withhold_in_read_only(State(s): State<AppState>, req: Request, next: Next) -> Response {
+    if !s.auth.enabled() {
+        return json_error(StatusCode::FORBIDDEN, "this needs a login: no users are configured (see --users-file)");
+    }
+    next.run(req).await
 }
 
 /// Whether a request carries the header every change must have. Browsers
@@ -290,18 +397,20 @@ pub async fn require_login(State(s): State<AppState>, req: Request, next: Next) 
     let auth = &s.auth;
     let mutating = !matches!(*req.method(), Method::GET | Method::HEAD | Method::OPTIONS);
     if !auth.enabled() {
-        // Without users apctl is read-only, and keeps its secrets.
+        // Without users apctl is read-only, and keeps its secrets (the
+        // routes that hold them have `withhold_in_read_only`).
         if mutating {
             return json_error(StatusCode::FORBIDDEN, "read-only: no users are configured (see --users-file)");
         }
-        if secret(req.uri().path()) {
-            return json_error(StatusCode::FORBIDDEN, "this needs a login: no users are configured (see --users-file)");
-        }
         return next.run(req).await;
     }
-    match session_token(req.headers()).and_then(|t| auth.check(&t)) {
+    let token = session_token(req.headers());
+    match token.as_deref().and_then(|t| Some((t, auth.check(t)?))) {
         Some(_) if mutating && !csrf_ok(req.headers()) => json_error(StatusCode::FORBIDDEN, "missing X-Requested-With: apctl header"),
-        Some(_) => next.run(req).await,
+        Some((t, (_, extended))) => {
+            let cookie = extended.then(|| cookie(req.headers(), t, SESSION_SECS));
+            renewed(next.run(req).await, cookie)
+        }
         None => json_error(StatusCode::UNAUTHORIZED, "login required"),
     }
 }
@@ -332,19 +441,20 @@ pub async fn login(
     // turned away unchecked does not count against its address.
     static VERIFYING: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(2);
     let _permit = match tokio::time::timeout(std::time::Duration::from_secs(5), VERIFYING.acquire()).await {
-        Ok(Ok(p)) => p,
-        Ok(Err(_)) => return json_error(StatusCode::SERVICE_UNAVAILABLE, "shutting down"),
+        Ok(p) => p.expect("the semaphore is never closed"),
         Err(_) => {
             auth.refund(ip);
             return json_error(StatusCode::SERVICE_UNAVAILABLE, "too many logins at once, try again shortly");
         }
     };
-    let (user, pass) = (body.username, body.password);
-    let check = auth.clone();
-    let user2 = user.clone();
-    let ok = tokio::task::spawn_blocking(move || check.users.verify(&user2, &pass)).await.unwrap_or(false);
+    let verifier = auth.clone();
+    let Ok((ok, user)) = tokio::task::spawn_blocking(move || (verifier.users.verify(&body.username, &body.password), body.username)).await else {
+        return json_error(StatusCode::INTERNAL_SERVER_ERROR, "the password check failed");
+    };
     if !ok {
-        tracing::warn!("failed login for {user:?} from {ip}");
+        // The name is the client's, up to the whole body: the log gets its start.
+        let shown = &user[..user.floor_char_boundary(64)];
+        tracing::warn!("failed login for {shown:?}{} from {ip}", if shown.len() < user.len() { "…" } else { "" });
         return json_error(StatusCode::UNAUTHORIZED, "wrong username or password");
     }
     auth.refund(ip);
@@ -370,10 +480,21 @@ pub async fn me(State(s): State<AppState>, headers: HeaderMap) -> Response {
     if !auth.enabled() {
         return Json(json!({ "auth": false, "user": null, "read_only": true })).into_response();
     }
-    match session_token(&headers).and_then(|t| auth.check(&t)) {
-        Some(user) => Json(json!({ "auth": true, "user": user, "read_only": false })).into_response(),
+    let token = session_token(&headers);
+    match token.as_deref().and_then(|t| Some((t, auth.check(t)?))) {
+        Some((t, (user, extended))) => renewed(Json(json!({ "auth": true, "user": user, "read_only": false })).into_response(), extended.then(|| cookie(&headers, t, SESSION_SECS))),
         None => (StatusCode::UNAUTHORIZED, Json(json!({ "auth": true, "user": null }))).into_response(),
     }
+}
+
+/// A response with the session's cookie sent again, when the session was
+/// extended: the browser forgets the cookie when its own Max-Age (counted
+/// from when it was last sent) runs out, however often it was used.
+fn renewed(mut res: Response, cookie: Option<String>) -> Response {
+    if let Some(v) = cookie.and_then(|c| HeaderValue::from_str(&c).ok()) {
+        res.headers_mut().append(header::SET_COOKIE, v);
+    }
+    res
 }
 
 #[cfg(test)]
@@ -393,6 +514,20 @@ mod tests {
         assert!(!users.verify("nobody", "correct horse"));
         std::fs::write(&file, "admin:not-a-hash\n").unwrap();
         assert!(Users::load(&file).is_err());
+        // Lines that could never log in are skipped; the first of a name counts.
+        let (first, second) = (hash_password("first").unwrap(), hash_password("second").unwrap());
+        let pbkdf2 = "$pbkdf2-sha256$i=600000$c2FsdHNhbHQ$aGFzaGhhc2hoYXNoaGFzaGhhc2hoYXNoaGFzaGhhc2g";
+        std::fs::write(&file, format!("admin:{first}\nadmin:{second}\n:{second}\nold:{pbkdf2}\n")).unwrap();
+        let users = Users::load(&file).unwrap();
+        assert_eq!(users.len(), 1);
+        assert!(users.verify("admin", "first") && !users.verify("admin", "second"));
+        assert_eq!(users.dummy, first, "unknown names cost what a real user does");
+        assert!(!users.verify("old", "anything") && !users.verify("nobody", "first"));
+        // Nobody left who could log in: an error, not an open read-only API.
+        std::fs::write(&file, format!("old:{pbkdf2}\n")).unwrap();
+        assert!(Users::load(&file).is_err());
+        std::fs::write(&file, "# nobody yet\n").unwrap();
+        assert!(Users::load(&file).unwrap().is_empty());
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -401,11 +536,11 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("apctl-sessions-{}-{}", std::process::id(), store::now_ts()));
         let (store, writer) = Store::open(&dir).unwrap();
         let mut users = Users::default();
-        users.0.insert("admin".into(), hash_password("x").unwrap());
+        users.hashes.insert("admin".into(), hash_password("x").unwrap());
         let auth = Auth::new(users, &store, writer, Default::default()).unwrap();
         let token = auth.create("admin").unwrap();
         assert_eq!(token.len(), 64);
-        assert_eq!(auth.check(&token).as_deref(), Some("admin"));
+        assert_eq!(auth.check(&token), Some(("admin".into(), false)), "new: not extended yet");
         assert!(!auth.sessions.lock().unwrap().contains_key(&token), "only the hash is stored");
         assert_eq!(auth.check("forged"), None);
         auth.revoke(&token);
@@ -457,9 +592,53 @@ mod tests {
         // From anyone else: the peer.
         assert_eq!(proxies.client_ip(&h, ip("198.51.100.1")), ip("198.51.100.1"));
         assert_eq!(proxies.client_ip(&HeaderMap::new(), ip("192.0.2.1")), ip("192.0.2.1"));
+        // Hops with ports, and over several headers (the last one is right-most).
+        let mut h = HeaderMap::new();
+        h.append("x-forwarded-for", "6.6.6.6".parse().unwrap());
+        h.append("x-forwarded-for", "203.0.113.7:4711, 10.42.0.3".parse().unwrap());
+        assert_eq!(proxies.client_ip(&h, ip("10.42.0.5")), ip("203.0.113.7"));
+        h.insert("x-forwarded-for", "[2001:db8::7]:4711".parse().unwrap());
+        assert_eq!(proxies.client_ip(&h, ip("10.42.0.5")), ip("2001:db8::7"));
+        h.insert("x-forwarded-for", "[2001:db8::8]".parse().unwrap());
+        assert_eq!(proxies.client_ip(&h, ip("10.42.0.5")), ip("2001:db8::8"));
+        // A hop that is no address: the client's own hops left of it are not believed.
+        h.insert("x-forwarded-for", "6.6.6.6, unknown, 10.42.0.3".parse().unwrap());
+        assert_eq!(proxies.client_ip(&h, ip("10.42.0.5")), ip("10.42.0.3"));
         assert!(Proxies::parse(&["10.0.0.0/33".into()]).is_err());
         assert!(Proxies::parse(&["proxy.example".into()]).is_err());
         assert!(Proxies::parse(&["fd00::/8".into()]).unwrap().contains(ip("fd12::1")));
+    }
+
+    #[test]
+    fn live_sockets_are_only_for_pages_of_this_server() {
+        let dir = std::env::temp_dir().join(format!("apctl-origin-{}-{}", std::process::id(), store::now_ts()));
+        let (store, writer) = Store::open(&dir).unwrap();
+        let proxies = Arc::new(Proxies::parse(&["10.42.0.0/16".into()]).unwrap());
+        let auth = Auth::new(Users::default(), &store, writer, proxies).unwrap();
+        let ok = |origin: Option<&str>, host: &str, forwarded: Option<&str>, peer: &str| {
+            let mut h = HeaderMap::new();
+            h.insert(header::HOST, host.parse().unwrap());
+            if let Some(o) = origin {
+                h.insert(header::ORIGIN, o.parse().unwrap());
+            }
+            if let Some(f) = forwarded {
+                h.insert("x-forwarded-host", f.parse().unwrap());
+            }
+            auth.same_origin(&h, Some(peer.parse().unwrap()), None)
+        };
+        let lan = "192.168.1.20";
+        assert!(ok(Some("http://apctl.lan:8080"), "apctl.lan:8080", None, lan));
+        assert!(ok(Some("https://APCTL.example"), "apctl.example:443", None, lan), "default port, any case");
+        assert!(ok(None, "apctl.lan:8080", None, lan), "not a browser page");
+        assert!(!ok(Some("https://other.example"), "apctl.example", None, lan), "a sibling site");
+        assert!(!ok(Some("http://apctl.lan:8081"), "apctl.lan:8080", None, lan));
+        assert!(!ok(Some("null"), "apctl.lan", None, lan));
+        // Behind a trusted proxy the host the browser used is X-Forwarded-Host.
+        assert!(ok(Some("https://apctl.example"), "apctl:8080", Some("apctl.example"), "10.42.0.3"));
+        assert!(!ok(Some("https://other.example"), "apctl:8080", Some("apctl.example"), "10.42.0.3"));
+        // From anyone else it is not believed.
+        assert!(!ok(Some("https://evil.example"), "apctl.lan", Some("evil.example"), lan));
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

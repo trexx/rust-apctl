@@ -69,7 +69,7 @@ pub fn next(live: &mut Live, mac: &Mac) -> Option<Value> {
 
 /// Sets fields on a client's entry in the settings, creating it if needed.
 pub fn edit_client(state: &mut Value, mac: &str, fields: &[(&str, Value)]) {
-    let site = crate::settings::site_id(state);
+    let site = crate::settings::site_id(state).map(str::to_string);
     let list = crate::settings::array_mut(state, "clients");
     // Matched as `controls` reads them, whichever way the entry writes its MAC.
     let parsed = mac.parse::<Mac>().ok();
