@@ -226,40 +226,7 @@ async fn serve(args: ServeArgs) -> Result<()> {
     }
 
     if let Some(addr) = syslog_listen {
-        let socket = tokio::net::UdpSocket::bind(addr).await.with_context(|| format!("binding syslog {addr}"))?;
-        tracing::info!("receiving AP syslog on udp://{addr}");
-        let tx = in_tx.clone();
-        tokio::spawn(async move {
-            let mut buf = vec![0u8; 8192];
-            // Syslog shares the engine's queue with the informs: when the queue is
-            // full, datagrams are dropped (and counted) rather than holding up the
-            // APs' informs behind a flood.
-            let (mut dropped, mut last_warning) = (0u64, None::<std::time::Instant>);
-            loop {
-                match socket.recv_from(&mut buf).await {
-                    Ok((n, src)) => {
-                        // An IPv4 AP on a dual-stack socket goes by its IPv4 address, as its informs report it.
-                        let input = Input::Datagram { ts: store::now_ts(), src_ip: src.ip().to_canonical().to_string(), payload: buf[..n].to_vec() };
-                        match tx.try_send(input) {
-                            Ok(()) => {}
-                            Err(mpsc::error::TrySendError::Full(_)) => {
-                                dropped += 1;
-                                if last_warning.is_none_or(|t| t.elapsed() >= Duration::from_secs(60)) {
-                                    tracing::warn!("engine busy: dropped {dropped} syslog datagram(s)");
-                                    (dropped, last_warning) = (0, Some(std::time::Instant::now()));
-                                }
-                            }
-                            Err(mpsc::error::TrySendError::Closed(_)) => return,
-                        }
-                    }
-                    Err(e) => {
-                        // A socket that keeps failing must not spin a core and flood the log.
-                        tracing::warn!("syslog socket: {e}");
-                        tokio::time::sleep(Duration::from_millis(100)).await;
-                    }
-                }
-            }
-        });
+        spawn_syslog(addr, in_tx.clone()).await?;
     }
 
     // The engine owns all mutable state and processes inputs in order.
@@ -304,41 +271,10 @@ async fn serve(args: ServeArgs) -> Result<()> {
     })?;
 
     if active {
-        // The other controller's installation ID, so rendered configs stay identical
-        // to what the APs run; a new one only when none was ever seen.
-        let reporter: Option<String> = store.read(store::Db::Config, |c| {
-            use rusqlite::OptionalExtension;
-            let cfg: Option<String> = c
-                .query_row("SELECT system_cfg FROM device_config WHERE instr(system_cfg, 'unifi.reporterid=') > 0 LIMIT 1", [], |r| r.get(0))
-                .optional()?;
-            Ok(cfg.and_then(|cfg| cfg.lines().find_map(|l| l.strip_prefix("unifi.reporterid=")).map(str::to_string)))
-        })?;
-        if let Some(u) = &inform_url {
-            ssh::set_inform_url(u.clone());
-        }
-        let advertised = match &inform_url {
-            Some(u) => advertised_ip(u).await,
-            None => None,
-        };
-        if let Err(e) = stun::serve(stun_listen, advertised).await {
-            tracing::warn!("STUN not available on {stun_listen}: {e}");
-        }
-        let reporter = reporter.unwrap_or_else(|| {
-            let b: [u8; 16] = { let mut b = [0u8; 16]; getrandom::fill(&mut b).expect("random"); b };
-            let h = hex::encode(b);
-            format!("{}-{}-4{}-a{}-{}", &h[0..8], &h[8..12], &h[13..16], &h[17..20], &h[20..32])
-        });
-        let inform_url = inform_url.clone().unwrap_or_else(|| format!("http://unifi:{}/inform", inform_listen.port()));
-        let controller = dryrun::controller(inform_url, emulate_version, reporter);
-        let active_state = Arc::new(active::Active::new(&store, writer.clone(), live.clone(), keys.clone(), in_tx.clone(), controller, proxies.clone())?);
-        let inform_app = axum::Router::new().route("/inform", axum::routing::post(active::inform)).with_state(active_state);
-        let inform_socket = tokio::net::TcpListener::bind(inform_listen).await.with_context(|| format!("binding {inform_listen}"))?;
-        tracing::warn!("ACTIVE MODE: answering AP informs on http://{inform_listen}/inform and pushing config");
-        tokio::spawn(async move {
-            if let Err(e) = axum::serve(inform_socket, inform_app.into_make_service_with_connect_info::<SocketAddr>()).await {
-                tracing::error!("inform server stopped: {e}");
-            }
-        });
+        let url = inform_url.clone().unwrap_or_else(|| format!("http://unifi:{}/inform", inform_listen.port()));
+        let controller = dryrun::controller(url, emulate_version, reporter_id(&store)?);
+        let active_state = active::Active::new(&store, writer.clone(), live.clone(), keys.clone(), in_tx.clone(), controller, proxies.clone())?;
+        start_active(Arc::new(active_state), inform_url, inform_listen, stun_listen).await?;
     }
 
     let users = match &users_file {
@@ -364,6 +300,85 @@ async fn serve(args: ServeArgs) -> Result<()> {
     tracing::info!("web UI and API on http://{listen}");
     axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>()).with_graceful_shutdown(shutdown(writer.clone())).await?;
     flush_writes(writer).await;
+    Ok(())
+}
+
+/// Receives AP syslog on `addr` and hands each datagram to the engine.
+async fn spawn_syslog(addr: SocketAddr, tx: mpsc::Sender<Input>) -> Result<()> {
+    let socket = tokio::net::UdpSocket::bind(addr).await.with_context(|| format!("binding syslog {addr}"))?;
+    tracing::info!("receiving AP syslog on udp://{addr}");
+    tokio::spawn(async move {
+        let mut buf = vec![0u8; 8192];
+        // Syslog shares the engine's queue with the informs: when the queue is
+        // full, datagrams are dropped (and counted) rather than holding up the
+        // APs' informs behind a flood.
+        let (mut dropped, mut last_warning) = (0u64, None::<std::time::Instant>);
+        loop {
+            match socket.recv_from(&mut buf).await {
+                Ok((n, src)) => {
+                    // An IPv4 AP on a dual-stack socket goes by its IPv4 address, as its informs report it.
+                    let input = Input::Datagram { ts: store::now_ts(), src_ip: src.ip().to_canonical().to_string(), payload: buf[..n].to_vec() };
+                    match tx.try_send(input) {
+                        Ok(()) => {}
+                        Err(mpsc::error::TrySendError::Full(_)) => {
+                            dropped += 1;
+                            if last_warning.is_none_or(|t| t.elapsed() >= Duration::from_secs(60)) {
+                                tracing::warn!("engine busy: dropped {dropped} syslog datagram(s)");
+                                (dropped, last_warning) = (0, Some(std::time::Instant::now()));
+                            }
+                        }
+                        Err(mpsc::error::TrySendError::Closed(_)) => return,
+                    }
+                }
+                Err(e) => {
+                    // A socket that keeps failing must not spin a core and flood the log.
+                    tracing::warn!("syslog socket: {e}");
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+            }
+        }
+    });
+    Ok(())
+}
+
+/// The other controller's installation ID, so rendered configs stay identical
+/// to what the APs run; a new one only when none was ever seen.
+fn reporter_id(store: &store::Store) -> Result<String> {
+    let seen: Option<String> = store.read(store::Db::Config, |c| {
+        use rusqlite::OptionalExtension;
+        let cfg: Option<String> = c
+            .query_row("SELECT system_cfg FROM device_config WHERE instr(system_cfg, 'unifi.reporterid=') > 0 LIMIT 1", [], |r| r.get(0))
+            .optional()?;
+        Ok(cfg.and_then(|cfg| cfg.lines().find_map(|l| l.strip_prefix("unifi.reporterid=")).map(str::to_string)))
+    })?;
+    Ok(seen.unwrap_or_else(|| {
+        let b: [u8; 16] = { let mut b = [0u8; 16]; getrandom::fill(&mut b).expect("random"); b };
+        let h = hex::encode(b);
+        format!("{}-{}-4{}-a{}-{}", &h[0..8], &h[8..12], &h[13..16], &h[17..20], &h[20..32])
+    }))
+}
+
+/// Active mode's servers: STUN (`inform_url`'s host is the address its answers
+/// give), and the APs' informs, on listeners of their own.
+async fn start_active(state: Arc<active::Active>, inform_url: Option<String>, inform_listen: SocketAddr, stun_listen: SocketAddr) -> Result<()> {
+    let advertised = match &inform_url {
+        Some(u) => advertised_ip(u).await,
+        None => None,
+    };
+    if let Some(u) = inform_url {
+        ssh::set_inform_url(u);
+    }
+    if let Err(e) = stun::serve(stun_listen, advertised).await {
+        tracing::warn!("STUN not available on {stun_listen}: {e}");
+    }
+    let inform_app = axum::Router::new().route("/inform", axum::routing::post(active::inform)).with_state(state);
+    let inform_socket = tokio::net::TcpListener::bind(inform_listen).await.with_context(|| format!("binding {inform_listen}"))?;
+    tracing::warn!("ACTIVE MODE: answering AP informs on http://{inform_listen}/inform and pushing config");
+    tokio::spawn(async move {
+        if let Err(e) = axum::serve(inform_socket, inform_app.into_make_service_with_connect_info::<SocketAddr>()).await {
+            tracing::error!("inform server stopped: {e}");
+        }
+    });
     Ok(())
 }
 
