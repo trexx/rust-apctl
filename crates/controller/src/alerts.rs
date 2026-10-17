@@ -39,60 +39,50 @@ const HEALTH_COOLDOWN: Ts = 6 * 3600;
 /// many checks in a row (a minute apart): it stopped reporting, or its AP went.
 const HEALTH_STALE_CHECKS: u32 = 15;
 
-/// What an alert is about.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Category {
-    ApStatus,
-    Security,
-    Health,
-    Changes,
-}
-
-impl Category {
-    const ALL: [Category; 4] = [Category::ApStatus, Category::Security, Category::Health, Category::Changes];
-
-    /// As stored and as the API names it.
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Category::ApStatus => "ap_status",
-            Category::Security => "security",
-            Category::Health => "health",
-            Category::Changes => "changes",
+/// Declares a fieldless enum whose variants are stored and sent by name, with
+/// `as_str`, `parse` and serialisation as that name.
+macro_rules! named_enum {
+    ($(#[$attr:meta])* $vis:vis enum $name:ident { $($variant:ident = $str:literal),* $(,)? }) => {
+        $(#[$attr])*
+        $vis enum $name {
+            $($variant,)*
         }
-    }
 
-    fn parse(s: &str) -> Option<Category> {
-        Category::ALL.into_iter().find(|c| c.as_str() == s)
-    }
-}
+        impl $name {
+            /// As stored and as the API names it.
+            pub fn as_str(self) -> &'static str {
+                match self {
+                    $($name::$variant => $str,)*
+                }
+            }
 
-/// How urgent an alert is.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Severity {
-    High,
-    Medium,
-    Low,
-    Info,
-}
-
-impl Severity {
-    const ALL: [Severity; 4] = [Severity::High, Severity::Medium, Severity::Low, Severity::Info];
-
-    /// As stored and as the API names it.
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Severity::High => "high",
-            Severity::Medium => "medium",
-            Severity::Low => "low",
-            Severity::Info => "info",
+            pub fn parse(s: &str) -> Option<$name> {
+                match s {
+                    $($str => Some($name::$variant),)*
+                    _ => None,
+                }
+            }
         }
-    }
 
-    fn parse(s: &str) -> Option<Severity> {
-        Severity::ALL.into_iter().find(|x| x.as_str() == s)
-    }
+        impl serde::Serialize for $name {
+            fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+                s.serialize_str(self.as_str())
+            }
+        }
+    };
+}
+pub(crate) use named_enum;
+
+named_enum! {
+    /// What an alert is about.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum Category { ApStatus = "ap_status", Security = "security", Health = "health", Changes = "changes" }
+}
+
+named_enum! {
+    /// How urgent an alert is.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum Severity { High = "high", Medium = "medium", Low = "low", Info = "info" }
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -153,6 +143,9 @@ pub struct AlertMsg {
 pub struct Alerts {
     writer: Writer,
     tx: broadcast::Sender<LiveMsg>,
+    /// The last alert's number, which ids carry: it continues from the stored
+    /// alerts' (see [`load_open`]), so an id is never used twice, even when
+    /// apctl restarts within a second or the clock steps back.
     seq: u64,
     /// Open alerts by (key, entity).
     open: HashMap<(String, String), Alert>,
@@ -287,7 +280,13 @@ fn from_event(kind: EventKind, device: Option<&str>, data: &Value, ap_name: &dyn
     if !alertable(kind) {
         return None;
     }
-    let dev = device.unwrap_or_default();
+    // Every alert but a suspicious network's is about an AP: without one (a
+    // crash line from a sender apctl can't name) it makes none.
+    let dev = match device {
+        Some(d) => d,
+        None if kind == EventKind::NetworkThreat => "",
+        None => return None,
+    };
     let lookup = || ap_name(dev);
     let name = Name(&lookup);
     let s = |k: &str| data[k].as_str().unwrap_or_default().to_string();
@@ -352,6 +351,8 @@ fn from_event(kind: EventKind, device: Option<&str>, data: &Value, ap_name: &dyn
 /// Health figures for one AP radio over the last window.
 #[derive(Debug, Default, Clone, PartialEq)]
 pub struct RadioHealth {
+    /// Whether the radio's networks reported TX counters in the window.
+    pub retries_reported: bool,
     pub retry_pct: Option<f64>,
     pub attempts: f64,
     pub utilisation: Option<f64>,
@@ -373,11 +374,16 @@ async fn radio_health(store: &Arc<Store>, now: Ts) -> anyhow::Result<HashMap<(St
         store.read(Db::Metrics, |c| {
             let from = now - HEALTH_WINDOW;
             let mut out: HashMap<(String, String), RadioHealth> = HashMap::new();
-            let mut stmt = c.prepare("SELECT mac, radio, AVG(cu_total), AVG(cu_interf), COUNT(*) FROM radio_stats WHERE ts >= ?1 GROUP BY mac, radio")?;
-            for row in stmt.query_map([from], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, Option<f64>>(2)?, r.get::<_, Option<f64>>(3)?, r.get::<_, i64>(4)?)))? {
-                let (mac, radio, cu, interf, n) = row?;
+            let mut stmt = c.prepare("SELECT mac, radio, AVG(cu_total), AVG(cu_interf), COUNT(*), MIN(ts), MAX(ts) FROM radio_stats WHERE ts >= ?1 GROUP BY mac, radio")?;
+            let rows = stmt.query_map([from], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, Option<f64>>(2)?, r.get::<_, Option<f64>>(3)?, r.get::<_, i64>(4)?, r.get::<_, Ts>(5)?, r.get::<_, Ts>(6)?))
+            })?;
+            for row in rows {
+                let (mac, radio, cu, interf, n, first, last) = row?;
                 // Only judge a radio that reported through most of the window.
-                if n >= 30 {
+                // By time, not by count: an AP informs every 5 s per AP on the
+                // site, so with many APs a window holds only a dozen reports.
+                if n >= 3 && last - first >= HEALTH_WINDOW * 2 / 3 {
                     let h = out.entry((mac, radio)).or_default();
                     h.utilisation = cu;
                     h.interference = interf;
@@ -388,6 +394,7 @@ async fn radio_health(store: &Arc<Store>, now: Ts) -> anyhow::Result<HashMap<(St
             let vaps = crate::insights::load(c, spec, 0, from, now)?;
             for ((ap, band), t) in retry_totals(&vaps, RETRY_AT, from) {
                 let h = out.entry((ap.to_string(), band.to_string())).or_default();
+                h.retries_reported = true;
                 h.attempts = t[1];
                 if t.iter().sum::<f64>() > 0.0 {
                     h.retry_pct = Some(retry_pct(t));
@@ -399,27 +406,28 @@ async fn radio_health(store: &Arc<Store>, now: Ts) -> anyhow::Result<HashMap<(St
     .await?
 }
 
-/// Clients whose every connection attempt in the window failed.
-async fn failing_clients(store: &Arc<Store>, now: Ts) -> anyhow::Result<Vec<String>> {
+/// How many clients failed every connection attempt in the window.
+async fn failing_clients(store: &Arc<Store>, now: Ts) -> anyhow::Result<usize> {
     let store = store.clone();
     // Parsing the reports and pairing fixups is CPU work: off the async workers too.
     tokio::task::spawn_blocking(move || {
         let events = store.read(Db::Config, |c| Ok(crate::connections::load_rows(c, now - HEALTH_WINDOW, Ts::MAX, None, None, true)?))?;
         let attempts = crate::connections::attempts(events);
         let ok: HashSet<&str> = attempts.iter().filter(|a| a.success).map(|a| a.client.as_str()).collect();
-        let mut failing: Vec<String> = attempts.iter().filter(|a| !a.success && !ok.contains(a.client.as_str())).map(|a| a.client.clone()).collect();
-        failing.sort();
-        failing.dedup();
-        Ok(failing)
+        let failing: HashSet<&str> = attempts.iter().filter(|a| !a.success && !ok.contains(a.client.as_str())).map(|a| a.client.as_str()).collect();
+        Ok(failing.len())
     })
     .await?
 }
 
-/// Alerts left open by a previous run.
-async fn load_open(store: &Arc<Store>) -> anyhow::Result<Vec<Alert>> {
+/// Alerts left open by a previous run, and the highest number a stored
+/// alert's id carries (`{ts}-{number}`).
+async fn load_open(store: &Arc<Store>) -> anyhow::Result<(Vec<Alert>, u64)> {
     let store = store.clone();
     tokio::task::spawn_blocking(move || {
         store.read(Db::Config, |c| {
+            let sql = "SELECT COALESCE(MAX(CAST(substr(id, instr(id, '-') + 1) AS INTEGER)), 0) FROM alerts";
+            let seq = c.query_row(sql, [], |r| r.get::<_, i64>(0))?;
             let mut stmt = c.prepare("SELECT id, ts, key, category, severity, entity, title, message, link, tag FROM alerts WHERE resolved_ts IS NULL")?;
             let rows = stmt
                 .query_map([], |r| {
@@ -439,7 +447,7 @@ async fn load_open(store: &Arc<Store>) -> anyhow::Result<Vec<Alert>> {
                     })
                 })?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
-            Ok(rows)
+            Ok((rows, u64::try_from(seq).unwrap_or(0)))
         })
     })
     .await?
@@ -521,7 +529,8 @@ impl Watcher {
     async fn start(store: Arc<Store>, writer: Writer, live: SharedLive, tx: broadcast::Sender<LiveMsg>) -> Watcher {
         let mut w = Watcher { book: Alerts { writer, tx, seq: 0, open: HashMap::new() }, store, live, aps: ApWatch::default(), cleared: HashMap::new(), unjudged: HashMap::new() };
         match load_open(&w.store).await {
-            Ok(open) => {
+            Ok((open, seq)) => {
+                w.book.seq = seq;
                 for a in open {
                     w.book.open.insert((a.key.clone(), a.entity.clone()), a);
                 }
@@ -601,7 +610,7 @@ impl Watcher {
             Err(e) => tracing::warn!("radio health check failed: {e:#}"),
         }
         match failing_clients(&self.store, now).await {
-            Ok(failing) => self.judge_connections(now, failing.len()),
+            Ok(failing) => self.judge_connections(now, failing),
             Err(e) => tracing::warn!("connection health check failed: {e:#}"),
         }
     }
@@ -615,9 +624,16 @@ impl Watcher {
                 continue;
             }
             for (key, value, raise_at, clear_at, what) in radio_checks(&h) {
+                let Some(v) = value else {
+                    // Retries are not judged on a radio carrying little traffic, but
+                    // it still reports: an alert open for it stays as it is.
+                    if key == "high_retries" && h.retries_reported {
+                        judged.insert((key.to_string(), format!("{mac}/{radio}")));
+                    }
+                    continue;
+                };
                 let entity = format!("{mac}/{radio}");
                 let k = (key.to_string(), entity.clone());
-                let Some(v) = value else { continue };
                 judged.insert(k.clone());
                 if v >= raise_at && !self.book.open.contains_key(&k) && self.cleared.get(&k).is_none_or(|t| now - t >= HEALTH_COOLDOWN) {
                     let name = crate::insights::ap_name(&self.live.read().unwrap(), &mac).unwrap_or_else(|| mac.clone());
@@ -682,13 +698,14 @@ pub struct ListQuery {
     limit: Option<usize>,
 }
 
+/// Recent alerts, newest first: by time, then as stored.
+const LIST: &str = "SELECT id, ts, key, category, severity, entity, title, message, link, tag, resolved_ts, read FROM alerts ORDER BY ts DESC, rowid DESC LIMIT ?1";
+
 /// GET /api/alerts: recent alerts, newest first, with the unread count.
 pub async fn list(State(s): State<AppState>, Query(q): Query<ListQuery>) -> Result<Json<Value>, ApiError> {
     let limit = q.limit.unwrap_or(50).clamp(1, 500) as i64;
     let rows = crate::api::read(&s.store, Db::Config, move |c| {
-        let mut stmt = c.prepare(
-            "SELECT id, ts, key, category, severity, entity, title, message, link, tag, resolved_ts, read FROM alerts ORDER BY ts DESC, id DESC LIMIT ?1",
-        )?;
+        let mut stmt = c.prepare(LIST)?;
         let rows = stmt
             .query_map([limit], |r| {
                 Ok(json!({
@@ -708,7 +725,8 @@ pub async fn list(State(s): State<AppState>, Query(q): Query<ListQuery>) -> Resu
 
 /// POST /api/alerts/read: marks every alert read.
 pub async fn mark_read(State(s): State<AppState>) -> Result<Json<Value>, ApiError> {
-    s.send(crate::engine::Input::AlertsRead).await?;
+    // Straight to the database: the engine's queue is for what changes its state.
+    s.writer.exec(Db::Config, "UPDATE alerts SET read = 1 WHERE read = 0", vec![]);
     Ok(Json(json!({ "ok": true })))
 }
 
@@ -758,6 +776,11 @@ mod tests {
         for &kind in EventKind::ALL {
             assert_eq!(from_event(kind, Some("aa"), &json!({ "severity": "high" }), &name).is_some(), alertable(kind), "{kind}");
         }
+        // An AP's alert needs the AP: a crash line from anyone else makes none.
+        let panic = json!({ "kind": "kernel panic", "lines": ["Kernel panic"] });
+        assert!(from_event(EventKind::ApCrash, None, &panic, &name).is_none());
+        assert_eq!(from_event(EventKind::ApCrash, Some("aa"), &panic, &name).unwrap().title, "Garage: kernel panic");
+        assert!(from_event(EventKind::NetworkThreat, None, &json!({ "severity": "high" }), &name).is_some());
     }
 
     fn watcher() -> (Watcher, broadcast::Receiver<LiveMsg>) {
@@ -800,6 +823,24 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn alert_ids_are_never_reused_and_list_newest_first() {
+        let (mut w, _rx) = watcher();
+        let notice = || Alert::new("ap_restarted", Category::Changes, Severity::Low, "aa", "t".into(), "m".into());
+        for _ in 0..11 {
+            w.book.raise(1000, notice());
+        }
+        assert!(w.book.writer.flush(Duration::from_secs(5)));
+        // A restart within the same second carries on from the stored ids.
+        let mut again = Watcher::start(w.store.clone(), w.book.writer.clone(), Default::default(), broadcast::channel(4).0).await;
+        let last = again.book.raise(1000, notice());
+        assert_eq!(last.id, "1000-12");
+        assert!(w.book.writer.flush(Duration::from_secs(5)));
+        let ids: Vec<String> = w.store.read(Db::Config, |c| Ok(c.prepare(LIST)?.query_map([100], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?)).unwrap();
+        assert_eq!(ids.len(), 12, "none overwritten");
+        assert_eq!((ids[0].as_str(), ids[1].as_str(), ids[2].as_str()), ("1000-12", "1000-11", "1000-10"));
+    }
+
+    #[tokio::test]
     async fn connection_failures_open_once_and_clear() {
         let (mut w, mut rx) = watcher();
         w.judge_connections(1000, 2);
@@ -839,6 +880,24 @@ mod tests {
         assert_eq!(told(&mut rx), [("resolved", "busy_channel".to_string())]);
     }
 
+    #[tokio::test]
+    async fn a_retries_alert_stays_open_while_its_radio_is_quiet() {
+        let (mut w, mut rx) = watcher();
+        let ap = "02:00:00:00:00:01".to_string();
+        let set: HashSet<String> = [ap.clone()].into();
+        let radio = |retry_pct, attempts| HashMap::from([((ap.clone(), "na".to_string()), RadioHealth { retries_reported: true, retry_pct: Some(retry_pct), attempts, ..Default::default() })]);
+        w.judge_radios(1000, radio(40.0, 5000.0), &set, &set);
+        assert_eq!(told(&mut rx), [("raised", "high_retries".to_string())]);
+        // Too little traffic to judge, for longer than a radio that stopped reporting gets.
+        for i in 1..=HEALTH_STALE_CHECKS as Ts + 1 {
+            w.judge_radios(1000 + 60 * i, radio(40.0, 100.0), &set, &set);
+        }
+        assert!(told(&mut rx).is_empty(), "the radio still reports");
+        assert!(w.book.open.contains_key(&("high_retries".to_string(), format!("{ap}/na"))));
+        w.judge_radios(2200, radio(5.0, 5000.0), &set, &set);
+        assert_eq!(told(&mut rx), [("resolved", "high_retries".to_string())]);
+    }
+
     #[test]
     fn health_alerts_close_when_their_radio_stops_reporting() {
         let ap = "02:00:00:00:00:01";
@@ -860,9 +919,34 @@ mod tests {
         assert_eq!(stale_health(&book, &HashSet::new(), &mut HashMap::new(), &HashSet::new()), vec![k]);
     }
 
+    #[tokio::test]
+    async fn radios_are_judged_when_they_reported_through_the_window() {
+        let (w, _rx) = watcher();
+        let now = 100_000;
+        let row = |radio: &str, ts: Ts| {
+            let sql = "INSERT INTO radio_stats (mac, radio, ts, cu_total, cu_interf) VALUES ('02:00:00:00:00:01', ?1, ?2, 90, 10)";
+            w.book.writer.exec(Db::Metrics, sql, vec![Sql::Text(radio.into()), Sql::Integer(ts)]);
+        };
+        // One report every 75 s, as from a site of 15 APs: 12 in the window.
+        for i in 0..12 {
+            row("na", now - 30 - i * 75);
+        }
+        // Many reports, but only over the last two minutes.
+        for i in 0..40 {
+            row("ng", now - i * 3);
+        }
+        // Too few to judge.
+        row("6e", now - 800);
+        row("6e", now);
+        assert!(w.book.writer.flush(Duration::from_secs(5)));
+        let h = radio_health(&w.store, now).await.unwrap();
+        let judged = |radio: &str| h.get(&("02:00:00:00:00:01".to_string(), radio.to_string())).and_then(|h| h.utilisation);
+        assert_eq!((judged("na"), judged("ng"), judged("6e")), (Some(90.0), None, None));
+    }
+
     #[test]
     fn radio_thresholds_need_enough_traffic() {
-        let quiet = RadioHealth { retry_pct: Some(60.0), attempts: 100.0, utilisation: Some(10.0), interference: None };
+        let quiet = RadioHealth { retries_reported: true, retry_pct: Some(60.0), attempts: 100.0, utilisation: Some(10.0), interference: None };
         let checks = radio_checks(&quiet);
         assert_eq!(checks[0].1, None, "a few retries on an idle radio are not a problem");
         let busy = RadioHealth { retry_pct: Some(30.0), attempts: 5000.0, ..quiet };

@@ -50,8 +50,6 @@ pub enum Input {
     /// A suspicious network found for the first time: record it, and report it
     /// as an event unless it was already acknowledged.
     ThreatFound { ts: Ts, kind: crate::threats::Kind, bssid: String, device_mac: Option<Mac>, data: Value, notify: bool },
-    /// Mark every alert read.
-    AlertsRead,
     /// Record an event raised elsewhere (e.g. active mode sending an upgrade, a
     /// client blocked from the UI, a channel plan applied).
     Note(Event),
@@ -63,8 +61,6 @@ pub enum Input {
     /// Change the firmware upgrade queue; `done` gets how many upgrades were
     /// queued or cancelled.
     Firmware { op: crate::firmware::Op, done: tokio::sync::oneshot::Sender<usize> },
-    /// Acknowledge a finding with an optional note (`Some`), or withdraw the acknowledgement (`None`).
-    AckThreat { ts: Ts, kind: crate::threats::Kind, bssid: String, note: Option<Option<String>> },
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -447,6 +443,8 @@ pub struct Engine {
 
 /// How long a syslog hash_id no key opened is left untried.
 const SYSLOG_RETRY_SECS: Ts = 300;
+/// At most this many such hash_ids remembered; past it, new ones are not tried.
+const SYSLOG_UNKNOWN_MAX: usize = 10_000;
 
 impl Engine {
     pub fn new(writer: Writer, keys: Arc<KeyStore>, live: SharedLive, tx: broadcast::Sender<LiveMsg>) -> Self {
@@ -569,7 +567,6 @@ impl Engine {
                     self.emit(ev(ts, EventKind::NetworkThreat, device_mac, None, data));
                 }
             }
-            Input::AlertsRead => self.writer.exec(Db::Config, "UPDATE alerts SET read = 1 WHERE read = 0", vec![]),
             Input::Note(e) => self.emit(e),
             Input::Forget { ts, mac } => self.forget(ts, mac),
             Input::EditState { ts, edit, done } => {
@@ -579,18 +576,6 @@ impl Engine {
                 let n = op.apply(&mut self.live.write().unwrap().firmware);
                 let _ = done.send(n);
             }
-            Input::AckThreat { ts, kind, bssid, note } => match note {
-                Some(note) => self.writer.exec(
-                    Db::Config,
-                    "INSERT OR REPLACE INTO network_acks (kind, bssid, note, ts) VALUES (?1, ?2, ?3, ?4)",
-                    vec![Sql::Text(kind.as_str().into()), Sql::Text(bssid), opt_text(note), Sql::Integer(ts)],
-                ),
-                None => self.writer.exec(
-                    Db::Config,
-                    "DELETE FROM network_acks WHERE kind = ?1 AND bssid = ?2",
-                    vec![Sql::Text(kind.as_str().into()), Sql::Text(bssid)],
-                ),
-            },
         }
     }
 
@@ -1221,6 +1206,11 @@ impl Engine {
         {
             anyhow::bail!("no syslog key for hash_id {hash_id} (none worked {}s ago)", ts - at);
         }
+        // So many unknown hash_ids at once are made up: trying every key on each
+        // would keep the engine busy. A real AP is found by its informs meanwhile.
+        if self.syslog_unknown.len() >= SYSLOG_UNKNOWN_MAX {
+            anyhow::bail!("no syslog key for hash_id {hash_id} (too many unknown senders to try)");
+        }
         for (mac, cipher) in self.syslog_ciphers.all() {
             if let Ok(text) = crate::syslog::decrypt_with(payload, mac, cipher) {
                 self.syslog_unknown.remove(&hash_id);
@@ -1228,10 +1218,8 @@ impl Engine {
                 return Ok((mac, text));
             }
         }
-        // Bounded against made-up hash_ids; expired entries go at each tick.
-        if self.syslog_unknown.len() < 10_000 {
-            self.syslog_unknown.insert(hash_id.clone(), ts);
-        }
+        // Bounded (above) against made-up hash_ids; expired entries go at each tick.
+        self.syslog_unknown.insert(hash_id.clone(), ts);
         anyhow::bail!("no syslog key for hash_id {hash_id}")
     }
 
@@ -1240,7 +1228,8 @@ impl Engine {
         let hash_id = crate::syslog::hash_id(payload);
         let (by_hash, by_ip, state) = {
             let live = self.live.read().unwrap();
-            (hash_id.as_ref().and_then(|h| live.by_hash_id.get(h).copied()), live.by_ip.get(src_ip).copied(), hash_id.as_ref().and(live.state.clone()))
+            let by_ip = live.by_ip.get(src_ip).copied();
+            (hash_id.as_ref().and_then(|h| live.by_hash_id.get(h).copied()), by_ip, (hash_id.is_some() || by_ip.is_some()).then(|| live.state.clone()).flatten())
         };
         let result = match hash_id {
             Some(h) => self.decrypt_syslog(ts, payload, h, by_hash, state.as_ref()).map(|(mac, text)| (Some(mac), text)),
@@ -1248,9 +1237,21 @@ impl Engine {
         };
         match result {
             Ok((mac, text)) => {
+                // A plain datagram's source address can be forged. It names the
+                // AP only if the AP has no syslog key (apctl's APs encrypt their
+                // syslog), except for netconsole's lines: the kernel's, plain and
+                // without a priority, which are only looked at for crashes.
+                let keyed = by_ip.is_some_and(|m| {
+                    self.syslog_ciphers.refresh(state.as_ref(), &self.keys);
+                    self.syslog_ciphers.get(&m).is_some()
+                });
                 // Netconsole and multi-line messages can carry several lines.
                 for line in text.lines().filter(|l| !l.trim().is_empty()) {
-                    self.log(crate::syslog::parse(ts, src_ip.to_string(), mac.or(by_ip), line));
+                    let mut l = crate::syslog::parse(ts, src_ip.to_string(), mac.or(by_ip.filter(|_| !keyed)), line);
+                    if l.device_mac.is_none() && l.facility.is_none() {
+                        l.device_mac = by_ip;
+                    }
+                    self.log(l);
                 }
             }
             Err(e) => {
@@ -1974,6 +1975,39 @@ mod tests {
         send(&mut e, 32, 3, 5);
         assert_eq!(logs(), 2);
         assert_eq!(live.read().unwrap().by_hash_id.get(&hex::encode([3u8; 8])), Some(&ap2.parse().unwrap()));
+        // So many unknown hash_ids at once: a new one is not tried with every key.
+        for i in 0..SYSLOG_UNKNOWN_MAX {
+            e.syslog_unknown.insert(format!("{i:016x}"), 40);
+        }
+        send(&mut e, 41, 4, 7);
+        assert_eq!((logs(), e.syslog_unknown.len()), (2, SYSLOG_UNKNOWN_MAX));
+        assert!(!live.read().unwrap().by_hash_id.contains_key(&hex::encode([4u8; 8])));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn plain_syslog_names_an_ap_by_its_address_only_without_a_key() {
+        let mut keys = KeyStore::default();
+        keys.insert_syslog(AP1, &hex::encode([7u8; 32])).unwrap();
+        let dir = std::env::temp_dir().join(format!("apctl-syslog-ip-{}-{}", std::process::id(), rand_suffix()));
+        let (_store, writer) = store::Store::open(&dir).unwrap();
+        let (tx, mut rx) = broadcast::channel(1024);
+        let live: SharedLive = Default::default();
+        let ap2: Mac = "02:00:00:00:00:02".parse().unwrap();
+        live.write().unwrap().by_ip.insert("192.0.2.1".into(), AP1.parse().unwrap());
+        live.write().unwrap().by_ip.insert("192.0.2.2".into(), ap2);
+        let mut e = Engine::new(writer, Arc::new(keys), live.clone(), tx);
+        let mut events = |e: &mut Engine, ts: Ts, src: &str, text: &str| {
+            e.handle(Input::Datagram { ts, src_ip: src.into(), payload: text.as_bytes().to_vec() });
+            std::iter::from_fn(|| rx.try_recv().ok()).filter_map(|m| match m { LiveMsg::Event(e) => Some((e.kind, e.device_mac)), _ => None }).collect::<Vec<_>>()
+        };
+        let kick = "<14>stamgr: kick-sta-on 6c:ac:c2:00:00:01 wifi1ap1 (reason:Low RSSI rssi:19)";
+        // From the address of an AP that encrypts its syslog: not taken for the AP's.
+        assert_eq!(events(&mut e, 1, "192.0.2.1", kick), [(EventKind::ClientKicked, None)]);
+        // Its netconsole's crash is, as the official controller takes it.
+        assert_eq!(events(&mut e, 2, "192.0.2.1", "[ 12.3] Kernel panic - not syncing: Fatal exception"), [(EventKind::ApCrash, AP1.parse().ok())]);
+        // An AP without a key logs in plain text: its address names it.
+        assert_eq!(events(&mut e, 3, "192.0.2.2", "<14>stamgr: kick-sta-on 6c:ac:c2:00:00:02 wifi1ap1 (reason:Low RSSI rssi:19)"), [(EventKind::ClientKicked, Some(ap2))]);
         std::fs::remove_dir_all(&dir).ok();
     }
 
