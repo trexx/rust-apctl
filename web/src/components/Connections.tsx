@@ -1,9 +1,10 @@
 import { useState } from "react";
 import { Link } from "react-router-dom";
 import { useConnections } from "../api";
-import type { ConnAttempt, Roam, TimeSpan, Timings } from "../api";
+import type { ConnAttempt, Connections, Roam, TimeSpan, Timings } from "../api";
 import { band, clock } from "../format";
 import { QueryState, Segmented, Signal } from "./common";
+import { stableKeys } from "./keys";
 
 const STAGE_NAME = [
   "",
@@ -188,6 +189,33 @@ export function RoamRow({
   );
 }
 
+/**
+ * The head of a table of `AttemptRow`s and `RoamRow`s: `client` adds the
+ * client column; `roamsOnly` (roams, no attempts) names the AP column
+ * "From → to" and leaves out time to connect.
+ */
+export function ConnHead({
+  client,
+  roamsOnly,
+}: {
+  client?: boolean;
+  roamsOnly?: boolean;
+}) {
+  return (
+    <thead>
+      <tr>
+        <th>Time</th>
+        {client && <th>Client</th>}
+        <th>Result</th>
+        <th>{roamsOnly ? "From → to" : "Access point"}</th>
+        <th>Network</th>
+        <th>Signal</th>
+        {!roamsOnly && <th>Time to connect</th>}
+      </tr>
+    </thead>
+  );
+}
+
 /** A roam's row key. */
 export const roamId = (r: Roam) =>
   `r-${r.ts}-${r.client}-${r.from.ap}-${r.to.ap}`;
@@ -195,17 +223,6 @@ export const roamId = (r: Roam) =>
 type Item =
   | { kind: "attempt"; ts: number; a: ConnAttempt; key: string }
   | { kind: "roam"; ts: number; r: Roam; key: string };
-
-/** Keys from what identifies each row, numbered when two rows share one. */
-export function stableKeys<T>(rows: T[], id: (row: T) => string): string[] {
-  const seen = new Map<string, number>();
-  return rows.map((row) => {
-    const k = id(row);
-    const n = seen.get(k) ?? 0;
-    seen.set(k, n + 1);
-    return n ? `${k}#${n}` : k;
-  });
-}
 
 const attemptId = (a: ConnAttempt) => `a-${a.ts}-${a.client}-${a.ap}`;
 
@@ -228,11 +245,7 @@ export function ConnectionLog({
   );
 }
 
-function ConnectionTable({
-  data,
-}: {
-  data: NonNullable<ReturnType<typeof useConnections>["data"]>;
-}) {
+function ConnectionTable({ data }: { data: Connections }) {
   const ap = (m: string) => data.ap_names[m] ?? m;
   // A roam also shows up as the attempt on the new AP; keep just the roam.
   const roamsTo = new Map<string, number[]>();
@@ -269,16 +282,7 @@ function ConnectionTable({
     );
   return (
     <table className="table conn-log">
-      <thead>
-        <tr>
-          <th>Time</th>
-          <th>Result</th>
-          <th>Access point</th>
-          <th>Network</th>
-          <th>Signal</th>
-          <th>Time to connect</th>
-        </tr>
-      </thead>
+      <ConnHead />
       <tbody>
         {items
           .slice(0, LOG_ROWS)
@@ -335,26 +339,12 @@ export function AttemptList({ span }: { span: TimeSpan }) {
   );
 }
 
-function AttemptTable({
-  data,
-}: {
-  data: NonNullable<ReturnType<typeof useConnections>["data"]>;
-}) {
+function AttemptTable({ data }: { data: Connections }) {
   const keys = stableKeys(data.attempts, attemptId);
   return (
     <div className="table-wrap">
       <table className="table">
-        <thead>
-          <tr>
-            <th>Time</th>
-            <th>Client</th>
-            <th>Result</th>
-            <th>Access point</th>
-            <th>Network</th>
-            <th>Signal</th>
-            <th>Time to connect</th>
-          </tr>
-        </thead>
+        <ConnHead client />
         <tbody>
           {data.attempts.map((a, i) => (
             <AttemptRow

@@ -2,8 +2,9 @@ import { Link } from "react-router-dom";
 import { useRoaming } from "../api";
 import type { Roaming } from "../api";
 import { RangePicker, useTimeSpan } from "./Chart";
-import { RoamRow, roamId, stableKeys } from "./Connections";
+import { ConnHead, RoamRow, roamId } from "./Connections";
 import { QueryState, Signal, Stat } from "./common";
+import { stableKeys } from "./keys";
 import { spanText } from "./insights/shared";
 
 /** Same colours as the official roaming map: green above 67 %, orange above 33 %. */
@@ -187,16 +188,7 @@ function Details({ data }: { data: Roaming }) {
         </div>
         <div className="table-wrap">
           <table className="table">
-            <thead>
-              <tr>
-                <th>Time</th>
-                <th>Client</th>
-                <th>Result</th>
-                <th>From → to</th>
-                <th>Network</th>
-                <th>Signal</th>
-              </tr>
-            </thead>
+            <ConnHead client roamsOnly />
             <tbody>
               {data.roams.map((x, i) => (
                 <RoamRow
