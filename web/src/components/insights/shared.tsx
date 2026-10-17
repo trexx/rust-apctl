@@ -1,6 +1,8 @@
+import { useState } from "react";
+import type { ReactNode } from "react";
 import type { TimeSpan } from "../../api";
 import { band, duration, spanLabel } from "../../format";
-import { Segmented } from "../common";
+import { QueryState, Segmented } from "../common";
 
 const RADIOS = (["ng", "na"] as const).map((b) => [b, band(b)] as const);
 const BANDS = [["all", "All radios"] as const, ...RADIOS];
@@ -21,6 +23,44 @@ export function BandPicker({
       value={value}
       onChange={onChange}
     />
+  );
+}
+
+/**
+ * An insight panel with a band picker: the title (fixed, or worked out from
+ * the data and band, as a verdict is), the range and the picker on top, then
+ * `children` for the chosen band ("all" at first).
+ */
+export function BandInsight<T>({
+  q,
+  span,
+  title,
+  children,
+}: {
+  q: { data: T | undefined; error: unknown };
+  span: TimeSpan;
+  title: ReactNode | ((data: T, band: string) => ReactNode);
+  children: (data: T, band: string) => ReactNode;
+}) {
+  const [picked, setPicked] = useState("all");
+  return (
+    <QueryState q={q} panel>
+      {(data) => (
+        <div className="panel">
+          <div className="panel-head">
+            {typeof title === "function" ? (
+              title(data, picked)
+            ) : (
+              <b>{title}</b>
+            )}
+            <span className="muted small">{spanText(span)}</span>
+            <span className="spacer" />
+            <BandPicker value={picked} onChange={setPicked} />
+          </div>
+          {children(data, picked)}
+        </div>
+      )}
+    </QueryState>
   );
 }
 

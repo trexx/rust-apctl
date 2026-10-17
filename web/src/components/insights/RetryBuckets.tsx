@@ -1,29 +1,20 @@
-import { useState } from "react";
 import { useRetries } from "../../api";
 import { band as bandName } from "../../format";
 import { useTimeSpan } from "../Chart";
-import { QueryState } from "../common";
-import { BandPicker, spanText } from "./shared";
+import { BandInsight } from "./shared";
 
 /** Lower edges of the retry buckets, worst first (as the official dashboard). */
 const RETRY_EDGES = [25, 20, 15, 10, 5, 0];
 
 export function RetryBuckets() {
-  const [band, setBand] = useState("all");
   const [span] = useTimeSpan(86400);
   const r = useRetries(span);
   return (
-    <QueryState q={r} panel>
-      {(data) => {
+    <BandInsight q={r} span={span} title="AP radio TX retries">
+      {(data, band) => {
         const radios = data.filter((x) => band === "all" || x.radio === band);
         return (
-          <div className="panel">
-            <div className="panel-head">
-              <b>AP radio TX retries</b>
-              <span className="muted small">{spanText(span)}</span>
-              <span className="spacer" />
-              <BandPicker value={band} onChange={setBand} />
-            </div>
+          <>
             <div className="buckets">
               {RETRY_EDGES.map((min, i) => {
                 const upper = i === 0 ? Infinity : RETRY_EDGES[i - 1]!;
@@ -58,9 +49,9 @@ export function RetryBuckets() {
               Retries as a share of all transmissions (retries ÷ attempts +
               retries + dropped), per AP radio.
             </div>
-          </div>
+          </>
         );
       }}
-    </QueryState>
+    </BandInsight>
   );
 }

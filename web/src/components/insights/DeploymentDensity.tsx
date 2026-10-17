@@ -1,46 +1,50 @@
-import { useState } from "react";
 import { useDensity } from "../../api";
+import type { DensityAp } from "../../api";
 import { useTimeSpan } from "../Chart";
-import { QueryState } from "../common";
 import type { DensityPin, Verdict } from "./shared";
-import { BandPicker, DensityStrip, VerdictHead, spanText } from "./shared";
+import { BandInsight, DensityStrip, VerdictHead } from "./shared";
 
 /** Weaker clients averaging below this (dBm) suggest they are far from their AP. */
 const FAR = -75;
 const VERY_FAR = -80;
 
+/** The APs with clients on `band`; "quiet" ones carry too little traffic to count. */
+const pinsOf = (aps: DensityAp[], band: string) =>
+  aps.flatMap((ap) => {
+    const g = ap.bands.find((b) => b.band === band);
+    return g && g.clients > 0 && g.signal_avg !== 0
+      ? [{ ap, g, quiet: g.traffic_pct < 1 }]
+      : [];
+  });
+
+function verdictOf(pins: ReturnType<typeof pinsOf>): Verdict | null {
+  const counted = pins.filter((p) => !p.quiet);
+  return counted.length === 0
+    ? null
+    : counted.some((p) => p.g.weakest_signal < FAR)
+      ? { text: "AP deployment density may need improvement", tone: "warn" }
+      : { text: "AP density is good", tone: "good" };
+}
+
 /** Deployment density: per AP, the average signal of its weaker half of clients. */
 export function DeploymentDensity() {
-  const [band, setBand] = useState("all");
   const [span] = useTimeSpan(86400);
   const d = useDensity(span);
   return (
-    <QueryState q={d} panel>
-      {(data) => {
-        const pins = data.aps.flatMap((ap) => {
-          const g = ap.bands.find((b) => b.band === band);
-          return g && g.clients > 0 && g.signal_avg !== 0
-            ? [{ ap, g, quiet: g.traffic_pct < 1 }]
-            : [];
-        });
-        const counted = pins.filter((p) => !p.quiet);
-        const verdict: Verdict | null =
-          counted.length === 0
-            ? null
-            : counted.some((p) => p.g.weakest_signal < FAR)
-              ? {
-                  text: "AP deployment density may need improvement",
-                  tone: "warn",
-                }
-              : { text: "AP density is good", tone: "good" };
+    <BandInsight
+      q={d}
+      span={span}
+      title={(data, band) => (
+        <VerdictHead
+          verdict={verdictOf(pinsOf(data.aps, band))}
+          fallback="Deployment density"
+        />
+      )}
+    >
+      {(data, band) => {
+        const pins = pinsOf(data.aps, band);
         return (
-          <div className="panel">
-            <div className="panel-head">
-              <VerdictHead verdict={verdict} fallback="Deployment density" />
-              <span className="muted small">{spanText(span)}</span>
-              <span className="spacer" />
-              <BandPicker value={band} onChange={setBand} />
-            </div>
+          <>
             <div className="muted small">
               Signal of each AP's weaker half of clients, averaged. Below −75
               dBm suggests clients are far from their AP.
@@ -62,9 +66,9 @@ export function DeploymentDensity() {
             {pins.length === 0 && (
               <div className="muted small">No clients in this range.</div>
             )}
-          </div>
+          </>
         );
       }}
-    </QueryState>
+    </BandInsight>
   );
 }
