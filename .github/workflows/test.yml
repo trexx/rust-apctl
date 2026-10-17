@@ -33,8 +33,8 @@ jobs:
       - run: 'cargo test --workspace --exclude informdump --locked'
       - run: 'cargo test -p informdump --locked'
       - run: 'cargo clippy --workspace --all-targets --locked -- -D warnings'
-      # informdump's MongoDB import is behind a feature; keep it compiling.
-      - run: 'cargo check -p informdump --features mongo --locked'
+      # informdump's MongoDB import is behind a feature; keep it compiling and linted.
+      - run: 'cargo clippy -p informdump --features mongo --all-targets --locked -- -D warnings'
 
   web:
     runs-on: 'ubuntu-26.04'
