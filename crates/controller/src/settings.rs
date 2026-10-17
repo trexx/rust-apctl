@@ -19,6 +19,7 @@ use serde_json::{Value, json};
 use apcfg::oid;
 
 use crate::api::{ApiError, AppState};
+use crate::random_hex;
 
 #[derive(Deserialize, Default)]
 pub struct PreviewQuery {
@@ -470,13 +471,6 @@ fn channels(state: &Value, band: &str, o: bool) -> Value {
 }
 
 // ---- Validation helpers ---------------------------------------------------
-
-/// `bytes` random bytes, in hex.
-pub(crate) fn random_hex(bytes: usize) -> String {
-    let mut b = vec![0u8; bytes];
-    getrandom::fill(&mut b).expect("system random source");
-    hex::encode(b)
-}
 
 /// A new settings document's id.
 fn new_id() -> String {
@@ -1312,13 +1306,11 @@ pub fn create_wlan(state: &mut Value, patch: &Value) -> Result<String, String> {
     let usergroup = ensure_default_usergroup(state);
     let short_id = docs(state, "wlanconf").filter_map(|w| w["short_id"].as_i64()).max().unwrap_or(0) + 1;
     let id = new_id();
-    let mut iapp = [0u8; 16];
-    getrandom::fill(&mut iapp).expect("system random source");
     let doc = json!({
         "_id": id, "site_id": site, "name": "", "enabled": true, "hide_ssid": false, "is_guest": false,
         "security": "wpapsk", "wpa_mode": "wpa2", "wpa_enc": "ccmp", "wpa3_support": false, "wpa3_transition": false, "pmf_mode": "disabled",
         "wlan_bands": ["2g", "5g"], "wlan_band": "both", "ap_group_mode": "all", "ap_group_ids": [all], "broadcasting_aps": [],
-        "networkconf_id": network, "usergroup_id": usergroup, "iapp_enabled": true, "x_iapp_key": hex::encode(iapp), "short_id": short_id,
+        "networkconf_id": network, "usergroup_id": usergroup, "iapp_enabled": true, "x_iapp_key": random_hex(16), "short_id": short_id,
     });
     let rest = json!({
         "setting_preference": "manual", "bss_transition": true, "fast_roaming_enabled": false, "uapsd_enabled": false, "proxy_arp": false,

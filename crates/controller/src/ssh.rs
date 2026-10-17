@@ -353,9 +353,7 @@ pub async fn adopt(State(s): State<AppState>, Json(b): Json<AdoptBody>) -> Resul
 /// what the AP config carries for the SSH password.
 pub fn sha512_crypt(password: &str) -> String {
     use sha_crypt::{PasswordHasher, ShaCrypt};
-    let mut salt = [0u8; 6];
-    getrandom::fill(&mut salt).expect("system random source");
-    let h = ShaCrypt::SHA512.hash_password_with_salt(password.as_bytes(), &salt).expect("SHA-512 crypt").to_string();
+    let h = ShaCrypt::SHA512.hash_password_with_salt(password.as_bytes(), &crate::random_bytes::<6>()).expect("SHA-512 crypt").to_string();
     // The default round count need not be spelled out, and the APs' own hashes leave it out.
     h.replacen("$rounds=5000$", "$", 1)
 }

@@ -29,7 +29,6 @@ use wire::keys::KeyStore;
 use crate::api::{ApiError, AppState};
 use crate::engine::{Event, EventKind, Input, Live};
 use crate::model::Ts;
-use crate::settings::random_hex;
 use crate::clock;
 
 /// How long an AP has to come back with its new key.
@@ -237,8 +236,8 @@ pub fn radio_table(state: &Value, payload: &Value) -> Vec<Value> {
 pub fn new_device(state: &Value, payload: &Value, mac: &Mac) -> Value {
     let other = &state["devices"][0];
     let mut d = json!({
-        "mac": mac.to_string(), "adopted": true, "type": "uap", "x_authkey": random_hex(16), "syslog_key": random_hex(32),
-        "cfgversion": random_hex(8), "config_network": { "type": "dhcp" }, "adopted_at": clock::now_ts(),
+        "mac": mac.to_string(), "adopted": true, "type": "uap", "x_authkey": crate::random_hex(16), "syslog_key": crate::random_hex(32),
+        "cfgversion": crate::random_hex(8), "config_network": { "type": "dhcp" }, "adopted_at": clock::now_ts(),
         "radio_table": radio_table(state, payload),
     });
     for k in ["model", "version", "serial", "ip"] {
@@ -264,8 +263,8 @@ pub fn new_device(state: &Value, payload: &Value, mac: &Mac) -> Value {
 /// was sent to the AP under the old one (its Wi-Fi passwords).
 pub fn adopt_device(state: &mut Value, mac: &Mac, payload: &Value) -> Result<String, String> {
     if let Some(d) = device_doc_mut(state, mac) {
-        d["x_authkey"] = json!(random_hex(16));
-        d["syslog_key"] = json!(random_hex(32));
+        d["x_authkey"] = json!(crate::random_hex(16));
+        d["syslog_key"] = json!(crate::random_hex(32));
         // The key it informed with, which is not this one any more.
         if let Some(o) = d.as_object_mut() {
             o.remove("x_inform_authkey");

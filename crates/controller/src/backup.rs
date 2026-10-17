@@ -146,9 +146,7 @@ struct SealWriter<W: Write> {
 
 impl<W: Write> SealWriter<W> {
     fn new(out: W, key: &[u8; 32]) -> Result<Self> {
-        let mut prefix = [0u8; 7];
-        getrandom::fill(&mut prefix).map_err(|e| anyhow!("random: {e}"))?;
-        Ok(Self::with_prefix(out, key, prefix)?)
+        Ok(Self::with_prefix(out, key, crate::random_bytes::<7>())?)
     }
 
     fn with_prefix(mut out: W, key: &[u8; 32], prefix: [u8; 7]) -> io::Result<Self> {
@@ -452,7 +450,7 @@ pub fn create(b: &Backups, src_dir: &Path, kind: Kind, days: i64) -> Result<Meta
     let now = clock::now_ts();
     let dir = b.dir();
     fs::create_dir_all(&dir)?;
-    let tmp = dir.join(format!(".tmp-{now}-{}-{}", std::process::id(), crate::settings::random_hex(4)));
+    let tmp = dir.join(format!(".tmp-{now}-{}-{}", std::process::id(), crate::random_hex(4)));
     fs::create_dir(&tmp)?;
     // A name no other backup has: the time to the second, then a counter.
     let base = format!("{}{VERSION}-{}", kind.prefix(), stamp(now));
@@ -1055,9 +1053,7 @@ pub async fn delete(State(s): State<AppState>, UrlPath(name): UrlPath<String>) -
 
 /// Unpacks and checks a backup into the staging area; returns its manifest and id.
 fn stage(b: &Backups, path: &Path) -> Result<(String, Manifest)> {
-    let mut r = [0u8; 2];
-    getrandom::fill(&mut r).map_err(|e| anyhow!("random: {e}"))?;
-    let id = format!("r{}{:05}", clock::now_ts(), u16::from_be_bytes(r));
+    let id = format!("r{}{:05}", clock::now_ts(), u16::from_be_bytes(crate::random_bytes::<2>()));
     let dest = b.staging().join(&id);
     fs::create_dir_all(b.staging())?;
     fs::create_dir(&dest)?;
@@ -1087,7 +1083,7 @@ pub async fn upload(State(s): State<AppState>, body: Body) -> Result<Json<Value>
     use tokio::io::AsyncWriteExt;
     let b = s.backups.clone();
     tokio::fs::create_dir_all(b.staging()).await?;
-    let name = format!("upload-{}-{}.apb", clock::now_ts(), crate::settings::random_hex(4));
+    let name = format!("upload-{}-{}.apb", clock::now_ts(), crate::random_hex(4));
     let tmp = TempFile(b.staging().join(name));
     // Written a megabyte per trip to the blocking pool, not one trip per body chunk.
     let mut file = tokio::io::BufWriter::with_capacity(1 << 20, tokio::fs::File::create_new(&tmp.0).await?);

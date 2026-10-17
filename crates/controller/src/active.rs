@@ -37,6 +37,7 @@ use wire::keys::KeyStore;
 use crate::clock;
 use crate::engine::{Event, EventKind, Input, SharedLive};
 use crate::model::Ts;
+use crate::random_bytes;
 use crate::store::{Db, PushedConfig, Store, Writer};
 
 /// What apctl remembers about an AP it manages.
@@ -121,14 +122,8 @@ type AdoptionCfg = (Weak<Value>, Arc<str>);
 
 const PLACEHOLDER: &str = "0000000000000000";
 
-fn random_bytes<const N: usize>() -> [u8; N] {
-    let mut b = [0u8; N];
-    getrandom::fill(&mut b).expect("system random source");
-    b
-}
-
 fn new_cfgversion() -> String {
-    hex::encode(random_bytes::<8>())
+    crate::random_hex(8)
 }
 
 /// Seconds until an AP's next inform, for a site of `n_devices` APs. Matches

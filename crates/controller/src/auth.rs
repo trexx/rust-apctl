@@ -156,9 +156,7 @@ impl Auth {
     }
 
     pub(crate) fn create(&self, user: &str) -> Result<String> {
-        let mut bytes = [0u8; 32];
-        getrandom::fill(&mut bytes).map_err(|e| anyhow::anyhow!("random: {e}"))?;
-        let token = hex::encode(bytes);
+        let token = crate::random_hex(32);
         let now = clock::now_ts();
         let session = Session { user: user.to_string(), expires: now + SESSION_SECS };
         let hash = token_hash(&token);
