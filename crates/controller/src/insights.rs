@@ -1,7 +1,7 @@
 //! Site-wide and RF views: activity, airtime, top APs and clients, retry
 //! rates, connection success, the radio overview and neighbouring networks.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap};
 
 use axum::Json;
 use axum::extract::{Query, State};
@@ -165,7 +165,17 @@ fn cols_at<const N: usize>(cols: &[&str], names: [&str; N]) -> [usize; N] {
 
 /// An AP's name (its host name), if it is reporting.
 pub(crate) fn ap_name(live: &Live, mac: &str) -> Option<String> {
-    mac.parse().ok().and_then(|m| live.devices.get(&m)).and_then(|d| d.snapshot.ap.hostname.clone())
+    ap_name_of(live, &mac.parse().ok()?)
+}
+
+/// The same by MAC.
+pub(crate) fn ap_name_of(live: &Live, mac: &inform::Mac) -> Option<String> {
+    live.devices.get(mac).and_then(|d| d.snapshot.ap.hostname.clone())
+}
+
+/// Our APs' SSIDs (BSSIDs), with the AP of each.
+fn own_bssids(live: &Live) -> impl Iterator<Item = (&inform::Mac, &crate::model::VapSample)> {
+    live.devices.iter().flat_map(|(m, d)| d.snapshot.vaps.iter().map(move |v| (m, v)))
 }
 
 /// A client's name: the alias given in apctl, else the host name it reports.
@@ -174,11 +184,16 @@ pub(crate) fn client_name(live: &Live, mac: Option<inform::Mac>) -> Option<Strin
     live.aliases.get(&mac).and_then(|a| a.alias.clone()).or_else(|| live.clients.get(&mac).and_then(|c| c.sample.hostname.clone()))
 }
 
+/// The longest inform interval the controller asks for (90 s, on sites of 18
+/// APs or more): a raw sample covers at most this long before it.
+const MAX_INFORM_INTERVAL: Ts = 90;
+
 /// Loads a metrics table's samples in range, grouped by key.
 pub(crate) fn load(c: &Connection, spec: Spec, tier: usize, from: Ts, to: Ts) -> anyhow::Result<Loaded> {
     let Spec { table, key, extra, cols, only } = spec;
     let suffix = TIERS[tier].0;
-    let step = TIERS[tier].1.max(30) * 2;
+    // Twice the longest interval between two samples, so the one before the window is read.
+    let step = TIERS[tier].1.max(MAX_INFORM_INTERVAL) * 2;
     let mut params = vec![Sql::Integer(from), Sql::Integer(to), Sql::Integer(step)];
     let only = match only {
         None => String::new(),
@@ -249,7 +264,12 @@ fn band_ok(band: &Option<String>, radio: &str) -> bool {
 /// the raw tier grows with each report, the roll-ups every five minutes.
 const MEMO_SECS: [u64; 3] = [15, 60, 300];
 
-type Memo = HashMap<String, (std::time::Instant, std::sync::Arc<dyn std::any::Any + Send + Sync>)>;
+/// A memoised read: its result and when it was read, once read. Whoever finds
+/// it empty reads it; the others asking meanwhile wait for that read.
+type Slot = std::sync::Arc<tokio::sync::OnceCell<(std::time::Instant, std::sync::Arc<dyn std::any::Any + Send + Sync>)>>;
+
+/// By query: when its slot was made, and the slot.
+type Memo = HashMap<String, (std::time::Instant, Slot)>;
 
 /// What the views last read, by view and query: several tabs, and each tab's
 /// refresh every minute, ask for the same windows again.
@@ -260,7 +280,8 @@ fn memo() -> std::sync::MutexGuard<'static, Memo> {
 }
 
 /// [`read`] from `db` for `view`, reusing what the same query read less than
-/// [`MEMO_SECS`] ago (the window then ends that much earlier).
+/// [`MEMO_SECS`] ago (the window then ends that much earlier). Queries made
+/// while the same query is being read wait for that read rather than read again.
 pub(crate) async fn memo_read<T: Send + Sync + 'static>(
     s: &AppState,
     db: Db,
@@ -273,23 +294,36 @@ pub(crate) async fn memo_read<T: Send + Sync + 'static>(
     // The data directory tells databases apart (tests run several).
     let key = format!("{}|{view}|{range:?}|{from:?}|{to:?}|{band:?}|{mac:?}", s.backups.data_dir.display());
     let ttl = std::time::Duration::from_secs(MEMO_SECS[tier]);
-    let hit = memo().get(&key).filter(|(at, _)| at.elapsed() < ttl).and_then(|(_, v)| v.clone().downcast::<T>().ok());
-    if let Some(v) = hit {
-        return Ok(v);
-    }
-    let v = std::sync::Arc::new(read(&s.store, db, f).await?);
-    let mut m = memo();
-    m.retain(|_, (at, _)| at.elapsed().as_secs() < MEMO_SECS[2]);
-    // Bounded: odd queries (explicit windows) are not all kept.
-    if m.len() < 256 {
-        m.insert(key, (std::time::Instant::now(), v.clone()));
-    }
-    Ok(v)
+    // The slot being read or read recently enough, else a new one.
+    let slot = {
+        let mut m = memo();
+        match m.get(&key) {
+            Some((_, slot)) if slot.get().is_none_or(|(at, _)| at.elapsed() < ttl) => slot.clone(),
+            _ => {
+                m.remove(&key);
+                // A slot left empty (its read failed or was given up) goes too, after a while.
+                m.retain(|_, (made, slot)| slot.get().map_or(*made, |(at, _)| *at).elapsed().as_secs() < MEMO_SECS[2]);
+                let slot = Slot::default();
+                // Bounded: odd queries (explicit windows) are not all kept.
+                if m.len() < 256 {
+                    m.insert(key, (std::time::Instant::now(), slot.clone()));
+                }
+                slot
+            }
+        }
+    };
+    let (_, v) = slot
+        .get_or_try_init(|| async {
+            let v: std::sync::Arc<dyn std::any::Any + Send + Sync> = std::sync::Arc::new(read(&s.store, db, f).await?);
+            Ok::<_, ApiError>((std::time::Instant::now(), v))
+        })
+        .await?;
+    v.clone().downcast::<T>().map_err(|_| ApiError::internal(format!("{view}: memoised as another type")))
 }
 
 /// GET /api/site/activity: Wi-Fi traffic, retries, clients and multicast,
 /// plus airtime (channel use and interference), bucketed.
-pub async fn activity(State(s): State<AppState>, Query(q): Query<RangeQuery>) -> Result<Json<Value>, ApiError> {
+pub async fn activity(State(s): State<AppState>, Query(q): Query<RangeQuery>) -> Result<Json<std::sync::Arc<Value>>, ApiError> {
     let (from, to, tier) = window(&q);
     let bucket = bucket_for(to - from, tier);
     let band = q.band.clone();
@@ -352,11 +386,23 @@ pub async fn activity(State(s): State<AppState>, Query(q): Query<RangeQuery>) ->
         let (mut tx_pps, mut rx_pps, mut dropped) = (Vec::new(), Vec::new(), Vec::new());
         for (b, m) in &per {
             ts.push(*b);
-            // Average per VAP within the bucket, then sum across VAPs.
-            let sum = |f: &dyn Fn(&Acc) -> f64| m.values().map(|a| f(a) / a.n.max(1.0)).sum::<f64>();
-            let (d, u, p, r, mc, cl) = (sum(&|a| a.down), sum(&|a| a.up), sum(&|a| a.pkts), sum(&|a| a.retries), sum(&|a| a.mcast), sum(&|a| a.clients));
-            let (rp, dr) = (sum(&|a| a.rx_pkts), sum(&|a| a.dropped));
-            let (at, wd) = (sum(&|a| a.attempts), sum(&|a| a.wifi_dropped));
+            // Average per VAP within the bucket, then sum across VAPs (in one pass).
+            let t = m.values().fold(Acc::default(), |mut t, a| {
+                let n = a.n.max(1.0);
+                t.down += a.down / n;
+                t.up += a.up / n;
+                t.pkts += a.pkts / n;
+                t.rx_pkts += a.rx_pkts / n;
+                t.retries += a.retries / n;
+                t.attempts += a.attempts / n;
+                t.wifi_dropped += a.wifi_dropped / n;
+                t.dropped += a.dropped / n;
+                t.mcast += a.mcast / n;
+                t.clients += a.clients / n;
+                t
+            });
+            let (d, u, p, r, mc, cl) = (t.down, t.up, t.pkts, t.retries, t.mcast, t.clients);
+            let (rp, dr, at, wd) = (t.rx_pkts, t.dropped, t.attempts, t.wifi_dropped);
             tx_pps.push(p);
             rx_pps.push(rp);
             dropped.push(if p + dr > 0.0 { Some(100.0 * dr / (p + dr)) } else { None });
@@ -399,7 +445,7 @@ pub async fn activity(State(s): State<AppState>, Query(q): Query<RangeQuery>) ->
         }))
     })
     .await?;
-    Ok(Json((*result).clone()))
+    Ok(Json(result))
 }
 
 /// Bytes moved per key over the window (sum of counter deltas), from the
@@ -514,7 +560,7 @@ pub async fn density(State(s): State<AppState>, Query(q): Query<RangeQuery>) -> 
     let suffix = TIERS[tier].0;
     // Worked out where the data is read, off the async workers and the live lock.
     let aps = memo_read(&s, Db::Metrics, "density", &q, tier, move |c| {
-        let mut stmt = c.prepare(&format!("SELECT ts, ap_mac, radio, signal FROM client_stats{suffix} WHERE ts >= ?1 AND ts <= ?2 AND signal < 0 AND ap_mac IS NOT NULL"))?;
+        let mut stmt = c.prepare_cached(&format!("SELECT ts, ap_mac, radio, signal FROM client_stats{suffix} WHERE ts >= ?1 AND ts <= ?2 AND signal < 0 AND ap_mac IS NOT NULL"))?;
         let signals = stmt
             .query_map([from, to], |r| Ok((r.get::<_, Ts>(0)?, r.get::<_, String>(1)?, r.get::<_, Option<String>>(2)?, r.get::<_, f64>(3)?)))?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -630,7 +676,7 @@ pub async fn multicast(State(s): State<AppState>, Query(q): Query<RangeQuery>) -
         // From a little before the window: what each sample covers starts before it.
         let (one, mut params) = (if ap.is_some() { " AND mac = ?3" } else { "" }, vec![Sql::Integer(from - if step > 0 { step } else { MCAST_GAP }), Sql::Integer(to)]);
         params.extend(ap.clone().map(Sql::Text));
-        let mut stmt = c.prepare(&format!(
+        let mut stmt = c.prepare_cached(&format!(
             "SELECT mac, type, ts, tx_pps, rx_pps, tx_bytes_ps, rx_bytes_ps FROM mcast_stats{suffix} WHERE ts >= ?1 AND ts <= ?2{one} ORDER BY mac, type, ts"
         ))?;
         let rows = stmt
@@ -678,10 +724,9 @@ pub async fn multicast(State(s): State<AppState>, Query(q): Query<RangeQuery>) -
             let m: Option<inform::Mac> = mac.parse().ok();
             let view = m.and_then(|m| live.clients.get(&m));
             let mc = view.and_then(|v| v.sample.multicast.as_ref());
-            let ap_name = view.and_then(|v| live.devices.get(&v.sample.ap_mac)).and_then(|d| d.snapshot.ap.hostname.clone());
             json!({
                 "mac": mac, "name": client_name(&live, m), "vendor": s.vendors.lookup_str(mac),
-                "connected": view.is_some_and(|c| c.connected), "ap": ap_name, "radio": view.and_then(|c| c.sample.radio.clone()),
+                "connected": view.is_some_and(|c| c.connected), "ap": view.and_then(|v| ap_name_of(&live, &v.sample.ap_mac)), "radio": view.and_then(|c| c.sample.radio.clone()),
                 "tx_pkts": t[0].round(), "rx_pkts": t[1].round(), "tx_bytes": t[2].round(), "rx_bytes": t[3].round(),
                 "services": mc.map(|m| m.services.clone()).unwrap_or_default(),
                 "delivery": mc.and_then(|m| m.delivery()),
@@ -773,7 +818,7 @@ pub async fn wlans(State(s): State<AppState>, Query(q): Query<RangeQuery>) -> Re
     })
     .await?;
     // How our own SSIDs are heard over the air (our APs scan each other).
-    let own: Vec<Sql> = s.live.read().unwrap().devices.values().flat_map(|d| d.snapshot.vaps.iter().map(|v| Sql::Text(v.bssid.clone()))).collect();
+    let own: Vec<Sql> = own_bssids(&s.live.read().unwrap()).map(|(_, v)| Sql::Text(v.bssid.clone())).collect();
     let on_air: HashMap<String, String> = if own.is_empty() {
         HashMap::new()
     } else {
@@ -789,15 +834,15 @@ pub async fn wlans(State(s): State<AppState>, Query(q): Query<RangeQuery>) -> Re
     };
     // Now: per network, the APs and bands broadcasting it, clients and scores;
     // copied, so that the live lock is not held while the list is made.
-    // essid -> (where it is broadcast, bands, experience scores)
-    type Now = (Vec<Value>, std::collections::BTreeSet<String>, Vec<f64>);
+    // essid -> (where it is broadcast, bands, experience scores, APs)
+    type Now = (Vec<Value>, std::collections::BTreeSet<String>, Vec<f64>, usize);
     let (mut now, connected, state) = {
         let live = s.live.read().unwrap();
         let mut now: BTreeMap<String, Now> = BTreeMap::new();
         for (mac, d) in &live.devices {
-            for v in &d.snapshot.vaps {
-                let Some(e) = v.essid.clone().filter(|e| !e.is_empty()) else { continue };
-                let n = now.entry(e).or_default();
+            for (i, v) in d.snapshot.vaps.iter().enumerate() {
+                let Some(e) = v.essid.as_deref().filter(|e| !e.is_empty()) else { continue };
+                let n = now.entry(e.to_string()).or_default();
                 n.0.push(json!({ "ap": mac, "name": d.snapshot.ap.hostname, "radio": v.radio, "channel": v.channel, "bssid": v.bssid, "clients": v.num_sta, "online": d.online }));
                 if let Some(r) = &v.radio {
                     n.1.insert(r.clone());
@@ -805,16 +850,18 @@ pub async fn wlans(State(s): State<AppState>, Query(q): Query<RangeQuery>) -> Re
                 if let Some(x) = v.satisfaction.filter(|x| *x >= 0 && v.num_sta.unwrap_or(0) > 0) {
                     n.2.push(x as f64);
                 }
+                // An AP counts once, at its first SSID of the network.
+                if !d.snapshot.vaps[..i].iter().any(|w| w.essid == v.essid) {
+                    n.3 += 1;
+                }
             }
         }
-        // The clients connected now, per network.
-        let mut connected: HashMap<&str, HashSet<inform::Mac>> = HashMap::new();
-        for c in live.clients.values().filter(|c| c.connected) {
-            if let Some(e) = c.sample.essid.as_deref() {
-                connected.entry(e).or_default().insert(c.sample.mac);
-            }
+        // The clients connected now, per network (each client is listed once).
+        let mut connected: HashMap<&str, usize> = HashMap::new();
+        for e in live.clients.values().filter(|c| c.connected).filter_map(|c| c.sample.essid.as_deref()) {
+            *connected.entry(e).or_default() += 1;
         }
-        let connected: HashMap<String, usize> = connected.into_iter().map(|(e, m)| (e.to_string(), m.len())).collect();
+        let connected: HashMap<String, usize> = connected.into_iter().map(|(e, n)| (e.to_string(), n)).collect();
         (now, connected, live.state.clone())
     };
     let mut names: std::collections::BTreeSet<String> = per.keys().cloned().collect();
@@ -823,7 +870,7 @@ pub async fn wlans(State(s): State<AppState>, Query(q): Query<RangeQuery>) -> Re
     let list: Vec<Value> = names
         .into_iter()
         .map(|essid| {
-            let (bss, bands, scores) = now.remove(&essid).unwrap_or_default();
+            let (bss, bands, scores, ap_count) = now.remove(&essid).unwrap_or_default();
             let clients = connected.get(&essid).copied().unwrap_or(0);
             let agg = per.get(&essid);
             let (ts, series_clients, down_bps, up_bps, peak) = agg.map_or((vec![], vec![], vec![], vec![], 0.0), |a| {
@@ -847,7 +894,7 @@ pub async fn wlans(State(s): State<AppState>, Query(q): Query<RangeQuery>) -> Re
                 "security_on_air": heard,
                 "broadcast": bss,
                 "bands": bands,
-                "ap_count": bss.iter().filter_map(|b| b["ap"].as_str()).collect::<HashSet<_>>().len(),
+                "ap_count": ap_count,
                 "clients": clients,
                 "peak_clients": peak.round().max(clients as f64),
                 "satisfaction": mean(&scores),
@@ -1096,7 +1143,7 @@ pub async fn neighbors(State(s): State<AppState>, Query(q): Query<NeighborQuery>
     let since = store::now_ts() - q.range.unwrap_or(86400).clamp(600, 30 * 86400);
     let band = q.band.clone();
     // Our APs' signal to each other only: the rows of our own BSSIDs (the table's key) are enough.
-    let only: Option<Vec<Sql>> = q.links_only.then(|| s.live.read().unwrap().devices.values().flat_map(|d| d.snapshot.vaps.iter().map(|v| Sql::Text(v.bssid.clone()))).collect());
+    let only: Option<Vec<Sql>> = q.links_only.then(|| own_bssids(&s.live.read().unwrap()).map(|(_, v)| Sql::Text(v.bssid.clone())).collect());
     let rows = read(&s.store, Db::Config, move |c| {
         if only.as_ref().is_some_and(Vec::is_empty) {
             return Ok(Vec::new());
@@ -1128,19 +1175,24 @@ pub async fn neighbors(State(s): State<AppState>, Query(q): Query<NeighborQuery>
         Ok(rows)
     })
     .await?;
-    let live = s.live.read().unwrap();
-    // Our own BSSIDs, to tell our APs apart from the neighbours.
-    let own: HashMap<&str, (String, Option<&str>)> =
-        live.devices.iter().flat_map(|(m, d)| d.snapshot.vaps.iter().map(move |v| (v.bssid.as_str(), (m.to_string(), v.radio.as_deref())))).collect();
+    // Our own BSSIDs (to tell our APs apart from the neighbours) and our APs' names, copied
+    // so that the live lock is not held while the lists are made.
+    let (own, names) = {
+        let live = s.live.read().unwrap();
+        let own: HashMap<String, (String, Option<String>)> = own_bssids(&live).map(|(m, v)| (v.bssid.clone(), (m.to_string(), v.radio.clone()))).collect();
+        let names: HashMap<String, String> = live.devices.iter().filter_map(|(m, d)| Some((m.to_string(), d.snapshot.ap.hostname.clone()?))).collect();
+        (own, names)
+    };
+    let name = |mac: &str| names.get(mac).cloned();
     let signal = |n: &Neighbor| n.signal.unwrap_or(-200);
     let mut by_bssid: BTreeMap<String, Neighbor> = BTreeMap::new();
     // (from, to, band) -> strongest signal: an AP has a BSSID per SSID.
-    let mut links: BTreeMap<(String, String, Option<&str>), Option<i64>> = BTreeMap::new();
+    let mut links: BTreeMap<(String, &str, Option<&str>), Option<i64>> = BTreeMap::new();
     for r in rows {
-        if let Some((owner, radio)) = own.get(r.bssid.as_str()) {
+        if let Some((owner, radio)) = own.get(&r.bssid) {
             // One of our APs heard another of ours.
             if *owner != r.ap_mac {
-                let e = links.entry((r.ap_mac, owner.clone(), *radio)).or_insert(r.signal);
+                let e = links.entry((r.ap_mac, owner, radio.as_deref())).or_insert(r.signal);
                 *e = (*e).max(r.signal);
             }
             continue;
@@ -1151,13 +1203,13 @@ pub async fn neighbors(State(s): State<AppState>, Query(q): Query<NeighborQuery>
     }
     let mut list: Vec<Neighbor> = by_bssid.into_values().collect();
     for n in &mut list {
-        n.nearest_ap = ap_name(&live, &n.ap_mac);
+        n.nearest_ap = name(&n.ap_mac);
         n.vendor = s.vendors.lookup_str(&n.bssid);
     }
     list.sort_by_key(|n| -signal(n));
     let links: Vec<OwnLink> = links
         .into_iter()
-        .map(|((from, to, radio), signal)| OwnLink { from_name: ap_name(&live, &from), to_name: ap_name(&live, &to), from, to, radio: radio.map(str::to_string), signal })
+        .map(|((from, to, radio), signal)| OwnLink { from_name: name(&from), to_name: name(to), from, to: to.to_string(), radio: radio.map(str::to_string), signal })
         .collect();
     Ok(Json(json!({ "neighbors": list, "own_links": links })))
 }
@@ -1223,12 +1275,10 @@ fn candidates(radio: &str, width: i64, dfs: bool, available: Option<&[i64]>) -> 
         chans.extend([52, 56, 60, 64, 100, 104, 108, 112, 116, 120, 124, 128, 132, 136, 140]);
     }
     // One candidate per aligned block (its first channel as primary).
-    let mut seen = Vec::new();
-    let mut out = Vec::new();
+    let mut out: Vec<Block> = Vec::new();
     for c in chans {
         let b = block(radio, c, width);
-        if !seen.iter().any(|s: &(f64, f64)| (s.0 - b.lo).abs() < 1.0) {
-            seen.push((b.lo, b.hi));
+        if !out.iter().any(|o| (o.lo - b.lo).abs() < 1.0) {
             out.push(b);
         }
     }
@@ -1287,11 +1337,12 @@ pub struct PlanEntry {
     pub name: Option<String>,
     pub width: i64,
     pub clients: i64,
-    pub current_channel: Option<i64>,
-    pub current_score: Option<f64>,
-    pub current_reasons: Option<Vec<String>>,
-    pub suggested_channel: Option<i64>,
-    pub suggested_score: Option<f64>,
+    pub current_channel: i64,
+    pub current_score: f64,
+    pub current_reasons: Vec<String>,
+    pub suggested_channel: i64,
+    pub suggested_score: f64,
+    /// Only for an AP that moves.
     pub suggested_reasons: Vec<String>,
     pub change: bool,
     pub pinned: bool,
@@ -1370,11 +1421,8 @@ pub async fn compute_plan(s: &AppState, radio: String, dfs: bool, allowed: Optio
             })
             .collect();
         // Our APs' BSSIDs on this band, to separate own signal from neighbours.
-        let own: HashMap<String, String> = live
-            .devices
-            .iter()
-            .flat_map(|(m, d)| d.snapshot.vaps.iter().filter(|v| v.radio.as_deref() == Some(radio.as_str())).map(move |v| (v.bssid.clone(), m.to_string())))
-            .collect();
+        let own: HashMap<String, String> =
+            own_bssids(&live).filter(|(_, v)| v.radio.as_deref() == Some(radio.as_str())).map(|(m, v)| (v.bssid.clone(), m.to_string())).collect();
         (aps, own)
     };
     let work = move || plan_channels(radio, dfs, allowed, pinned, aps, own_bssids, neigh, spectrum);
@@ -1516,18 +1564,19 @@ fn plan_channels(
         .map(|(i, ap)| {
             let (cur_score, cur_reasons) = explain(i, &ap.current, &current);
             let change = evict[i].is_some();
-            let (sug_score, sug_reasons) = explain(i, &fin[i], &fin);
+            // The reasons for a suggestion are only shown for an AP that moves.
+            let (sug_score, sug_reasons) = if change { explain(i, &fin[i], &fin) } else { (cost(i, &fin[i], &fin), Vec::new()) };
             PlanEntry {
                 mac: ap.mac.clone(),
                 name: ap.name.clone(),
                 width: ap.width,
                 clients: ap.clients,
-                current_channel: Some(ap.current.primary),
-                current_score: Some(cur_score.round()),
-                current_reasons: Some(cur_reasons),
-                suggested_channel: Some(fin[i].primary),
-                suggested_score: Some(sug_score.round()),
-                suggested_reasons: if change { sug_reasons } else { vec![] },
+                current_channel: ap.current.primary,
+                current_score: cur_score.round(),
+                current_reasons: cur_reasons,
+                suggested_channel: fin[i].primary,
+                suggested_score: sug_score.round(),
+                suggested_reasons: sug_reasons,
                 change,
                 pinned: is_pinned[i],
                 not_allowed: evict[i].unwrap_or(false),
@@ -1580,11 +1629,11 @@ mod tests {
         ];
         let plan = plan_channels("ng".into(), false, None, vec![], aps, own, neigh, vec![]);
         assert!(plan.accepted, "{plan:?}");
-        let ch: HashMap<&str, Option<i64>> = plan.plan.iter().map(|p| (p.mac.as_str(), p.suggested_channel)).collect();
+        let ch: HashMap<&str, i64> = plan.plan.iter().map(|p| (p.mac.as_str(), p.suggested_channel)).collect();
         assert_ne!(ch["a"], ch["b"]);
-        assert_ne!(ch["a"], Some(1), "a keeps off its neighbour");
+        assert_ne!(ch["a"], 1, "a keeps off its neighbour");
         let a = plan.plan.iter().find(|p| p.mac == "a").unwrap();
-        assert_eq!(a.current_reasons.as_deref(), Some(&["your AP AP b (-50 dBm)".to_string()][..]));
+        assert_eq!(a.current_reasons, ["your AP AP b (-50 dBm)"]);
     }
 
     #[test]
@@ -1644,6 +1693,20 @@ mod tests {
         let b = per["Home"].series[&0][&0];
         assert_eq!(b.averages(), (3.0, 100.0, 0.0));
         assert_eq!(per["Home"].down, 2000.0);
+    }
+
+    #[test]
+    fn the_first_interval_in_the_window_is_counted_at_long_inform_intervals() {
+        // A site with many APs: an SSID reports every 75 s, the window starts between two reports.
+        let c = Connection::open_in_memory().unwrap();
+        c.execute_batch("CREATE TABLE vap_stats (bssid TEXT, ts INTEGER, radio TEXT, tx_bytes INTEGER)").unwrap();
+        let from = 10_000;
+        for (i, ts) in [from - 145, from - 70, from + 5, from + 80].into_iter().enumerate() {
+            c.execute("INSERT INTO vap_stats VALUES ('bss', ?1, 'na', ?2)", [ts, 1000 * i as Ts]).unwrap();
+        }
+        let vaps = load(&c, Spec { table: "vap_stats", key: "bssid", extra: &["radio"], cols: &["tx_bytes"], only: None }, 0, from, from + 600).unwrap();
+        let ends: Vec<(Ts, Option<f64>)> = deltas(&vaps["bss"].1, from).map(|d| (d.ts, d.inc(0))).collect();
+        assert_eq!(ends, [(from + 5, Some(1000.0)), (from + 80, Some(1000.0))]);
     }
 
     #[test]
@@ -1998,6 +2061,23 @@ mod tests {
             Connection::open(dir.join("metrics.db")).unwrap().execute("DELETE FROM vap_stats", []).unwrap();
             assert_eq!(ok(retries(State(s.clone()), q(None)).await), first, "read again within the time it is kept");
             assert_eq!(ok(retries(State(s), q(Some(600))).await), json!([]), "another query reads the database");
+        }
+
+        #[tokio::test]
+        async fn a_query_asked_again_while_it_is_read_is_read_once() {
+            let (s, base, _) = site();
+            static READS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+            let q = RangeQuery { range: None, from: Some(base), to: Some(base + 3600), band: None, mac: None };
+            let one = || {
+                memo_read(&s, Db::Metrics, "read-once", &q, 0, |_| {
+                    READS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                    Ok(7)
+                })
+            };
+            let (a, b, c) = tokio::join!(one(), one(), one());
+            assert_eq!((*a.ok().unwrap(), *b.ok().unwrap(), *c.ok().unwrap()), (7, 7, 7));
+            assert_eq!(READS.load(std::sync::atomic::Ordering::Relaxed), 1);
         }
 
         #[tokio::test]
