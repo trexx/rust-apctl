@@ -12,10 +12,10 @@ publish.workspace = true
 mongo = ["dep:mongodb", "dep:tokio", "dep:futures-util", "dep:apcfg"]
 
 [dependencies]
+aho-corasick.workspace = true
 anyhow.workspace = true
 apcfg = { workspace = true, optional = true }
 clap = { workspace = true, features = ["derive"] }
-etherparse.workspace = true
 futures-util = { workspace = true, optional = true }
 getrandom.workspace = true
 hex.workspace = true
@@ -27,6 +27,3 @@ regex.workspace = true
 serde_json = { workspace = true, features = ["preserve_order"] }
 tokio = { workspace = true, features = ["rt"], optional = true }
 wire.workspace = true
-
-[dev-dependencies]
-wire = { workspace = true, features = ["test-util"] }

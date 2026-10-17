@@ -23,12 +23,22 @@ fn split_url(url: &str) -> Option<(&str, String)> {
     Some((authority, if target.starts_with('/') { target.to_string() } else { format!("/{target}") }))
 }
 
+/// The address to connect to for a URL's authority: port 80 when it names none.
+fn with_port(authority: &str) -> String {
+    let has_port = match authority.rsplit_once(']') {
+        Some((_, after)) => after.starts_with(':'),
+        None => authority.contains(':'),
+    };
+    if has_port { authority.to_string() } else { format!("{authority}:80") }
+}
+
 /// POSTs a body with plain HTTP/1.1 and returns (status, body).
 fn post(url: &str, body: &[u8]) -> Result<(u16, Vec<u8>)> {
-    let (hostport, path) = split_url(url).context("only http:// URLs are supported")?;
-    let mut s = TcpStream::connect(hostport).with_context(|| format!("connecting to {hostport}"))?;
+    let (authority, path) = split_url(url).context("only http:// URLs are supported")?;
+    let addr = with_port(authority);
+    let mut s = TcpStream::connect(&addr).with_context(|| format!("connecting to {addr}"))?;
     s.set_read_timeout(Some(Duration::from_secs(10)))?;
-    write!(s, "POST {path} HTTP/1.1\r\nHost: {hostport}\r\nContent-Type: application/x-binary\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len())?;
+    write!(s, "POST {path} HTTP/1.1\r\nHost: {authority}\r\nContent-Type: application/x-binary\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len())?;
     s.write_all(body)?;
     let mut resp = Vec::new();
     s.read_to_end(&mut resp)?;
@@ -55,15 +65,19 @@ pub fn run(pcap: &str, ports: &[u16], keys: &KeyStore, url: &str, limit: usize, 
     if !is_local(url) {
         bail!("refusing to simulate APs against {url}: only local controllers (http:// to 127.0.0.1, ::1 or localhost)");
     }
-    // Collect the informs first, in capture order.
+    // Collect the informs first, in capture order. Once there are enough, the rest of
+    // the capture is read but not decoded.
     let mut informs: Vec<Value> = Vec::new();
     let mut pairer = Pairer::default();
     capture::run(capture::open_input(pcap)?, ports, |ev| {
+        if informs.len() >= limit {
+            return;
+        }
         if let Some(InformEvent::Inform { decoded: Ok(d), .. }) = pairer.handle(keys, ev) {
             informs.push(d.payload);
         }
     })?;
-    eprintln!("replaying {} of {} informs to {url}", limit.min(informs.len()), informs.len());
+    eprintln!("replaying {} informs to {url}", informs.len());
 
     // What each simulated AP currently runs (it adopts pushed versions), and
     // the key it uses: its own, the factory key after a reset (`setdefault`),
@@ -71,7 +85,7 @@ pub fn run(pcap: &str, ports: &[u16], keys: &KeyStore, url: &str, limit: usize, 
     let mut running: HashMap<Mac, String> = HashMap::new();
     let mut keys_now: HashMap<Mac, [u8; 16]> = HashMap::new();
     let mut counts: HashMap<String, usize> = HashMap::new();
-    for (i, mut payload) in informs.into_iter().take(limit).enumerate() {
+    for (i, mut payload) in informs.into_iter().enumerate() {
         if i > 0 && every > 0.0 {
             std::thread::sleep(Duration::from_secs_f64(every));
         }
@@ -89,8 +103,9 @@ pub fn run(pcap: &str, ports: &[u16], keys: &KeyStore, url: &str, limit: usize, 
         // These are real AP keys: a GCM nonce must never repeat under one.
         let packet = inform::seal(mac, Flags(Flags::ENCRYPTED | Flags::GCM | Flags::ZLIB), crate::random_iv(), &key, payload.to_string().as_bytes());
         let (status, body) = post(url, &packet)?;
-        let line = if status != 200 {
-            format!("HTTP {status}")
+        // Replies are counted by status, and those with 200 by their type.
+        let (counted, line) = if status != 200 {
+            (format!("HTTP {status}"), format!("HTTP {status}"))
         } else {
             let pkt = Packet::parse(&body)?;
             let reply: Value = serde_json::from_slice(&pkt.open(&key).context("reply does not decrypt with the AP's key")?)?;
@@ -120,9 +135,10 @@ pub fn run(pcap: &str, ports: &[u16], keys: &KeyStore, url: &str, limit: usize, 
                 "reboot" => reply["reboot_type"].as_str().unwrap_or("").to_string(),
                 _ => String::new(),
             };
-            format!("{kind} {detail}")
+            let line = format!("{kind} {detail}");
+            (kind, line)
         };
-        *counts.entry(line.split_whitespace().next().unwrap_or("").to_string()).or_default() += 1;
+        *counts.entry(counted).or_default() += 1;
         println!("{mac} reports {:<16} -> {line}", payload["cfgversion"].as_str().unwrap_or(""));
     }
     eprintln!("replies: {counts:?}");
@@ -131,7 +147,7 @@ pub fn run(pcap: &str, ports: &[u16], keys: &KeyStore, url: &str, limit: usize, 
 
 #[cfg(test)]
 mod tests {
-    use super::{is_local, split_url};
+    use super::{is_local, split_url, with_port};
 
     #[test]
     fn urls_split_where_the_local_check_splits_them() {
@@ -141,6 +157,14 @@ mod tests {
         assert_eq!(split("http://localhost#/elsewhere"), Some(("localhost".into(), "/".into())));
         assert_eq!(split("http://[::1]:8080"), Some(("[::1]:8080".into(), "/".into())));
         assert_eq!(split("https://localhost/"), None);
+    }
+
+    #[test]
+    fn port_80_is_the_default() {
+        assert_eq!(with_port("localhost"), "localhost:80");
+        assert_eq!(with_port("127.0.0.1:18180"), "127.0.0.1:18180");
+        assert_eq!(with_port("[::1]"), "[::1]:80");
+        assert_eq!(with_port("[::1]:8080"), "[::1]:8080");
     }
 
     #[test]

@@ -193,7 +193,9 @@ impl Reporter {
         let path = dir.join(save_name(ts, self.seq, mac, kind));
         // If it cannot be created, writing the file says why.
         self.save_dir_ready = self.save_dir_ready || crate::create_private_dir(dir).is_ok();
-        let result = crate::write_private(&path, pretty(payload).as_bytes()).with_context(|| format!("saving {}", path.display()));
+        // Always a new file: a name already taken (by an earlier run, or by someone else
+        // in a shared directory) is not written through.
+        let result = crate::create_private(&path, pretty(payload).as_bytes()).with_context(|| format!("saving {}", path.display()));
         if let Err(e) = result {
             eprintln!("warning: {e:#}");
         }
@@ -213,7 +215,8 @@ fn save_name(ts: Micros, seq: u64, mac: Mac, kind: &str) -> String {
     format!("{}_{seq:06}_{}_{kind}.json", format_ts(ts).replace(':', ""), mac.to_string().replace(':', ""))
 }
 
-/// Masks secret fields, including secret lines inside `*_cfg` blobs.
+/// Masks secret fields, including secret lines inside `*_cfg` blobs. Under a secret
+/// key every string is masked, however deeply it is nested (`x_ssh_keys: [{...}]`).
 fn redact_json(v: &Value) -> Value {
     match v {
         Value::Object(m) => Value::Object(
@@ -221,7 +224,7 @@ fn redact_json(v: &Value) -> Value {
                 .map(|(k, v)| {
                     let v = match v {
                         Value::String(s) if k.ends_with("_cfg") => Value::String(cfgdiff::redact(s)),
-                        Value::String(_) if cfgdiff::is_secret(k) => Value::String("<redacted>".into()),
+                        secret if cfgdiff::is_secret(k) => redact_all(secret),
                         other => redact_json(other),
                     };
                     (k.clone(), v)
@@ -229,6 +232,16 @@ fn redact_json(v: &Value) -> Value {
                 .collect(),
         ),
         Value::Array(a) => Value::Array(a.iter().map(redact_json).collect()),
+        other => other.clone(),
+    }
+}
+
+/// Every string in `v` masked.
+fn redact_all(v: &Value) -> Value {
+    match v {
+        Value::String(_) => Value::String("<redacted>".into()),
+        Value::Array(a) => Value::Array(a.iter().map(redact_all).collect()),
+        Value::Object(m) => Value::Object(m.iter().map(|(k, v)| (k.clone(), redact_all(v))).collect()),
         other => other.clone(),
     }
 }
@@ -277,46 +290,25 @@ mod tests {
     }
 
     #[test]
+    fn secrets_are_masked_in_arrays_and_objects_too() {
+        let v = json!({
+            "x_passphrase": "hunter22",
+            "x_ssh_keys": [{ "key": "ssh-ed25519 AAAAC3Nz", "comment": "me@laptop", "date": 7 }],
+            "psk": ["one", "two"],
+            "radio_table": [{ "name": "wifi0", "x_secret": { "inner": "s3cret" } }],
+            "system_cfg": "aaa.1.wpa.psk=hunter22\nradio.1.channel=36",
+        });
+        let out = redact_json(&v);
+        assert_eq!(out["x_passphrase"], "<redacted>");
+        assert_eq!(out["x_ssh_keys"], json!([{ "key": "<redacted>", "comment": "<redacted>", "date": 7 }]));
+        assert_eq!(out["psk"], json!(["<redacted>", "<redacted>"]));
+        assert_eq!(out["radio_table"], json!([{ "name": "wifi0", "x_secret": { "inner": "<redacted>" } }]));
+        assert!(!out.to_string().contains("hunter22") && out["system_cfg"].as_str().unwrap().contains("radio.1.channel=36"));
+    }
+
+    #[test]
     fn formats_timestamps() {
         assert_eq!(format_ts(0), "1970-01-01T00:00:00.000Z");
         assert_eq!(format_ts(1_791_840_601_123_456), "2026-10-12T21:30:01.123Z");
-    }
-}
-
-#[cfg(test)]
-mod sample_capture {
-    use super::*;
-    use wire::capture::sample;
-    use inform::{Flags, seal};
-
-    /// Writes a demo capture plus keys when `INFORMDUMP_SAMPLE_DIR` is set:
-    /// `INFORMDUMP_SAMPLE_DIR=/tmp/x cargo test write_sample -- --ignored`
-    #[test]
-    #[ignore]
-    fn write_sample() {
-        let dir = PathBuf::from(std::env::var("INFORMDUMP_SAMPLE_DIR").expect("set INFORMDUMP_SAMPLE_DIR"));
-        let mac: Mac = "fc:ec:da:00:00:01".parse().unwrap();
-        let key = [0x42u8; 16];
-        let gcm = Flags(Flags::ENCRYPTED | Flags::GCM | Flags::SNAPPY);
-        let inform = br#"{"hostname":"ap-office","model":"U7PG2","version":"6.6.77","state":2,"cfgversion":"aaa","uptime":1234,
-            "vap_table":[{"essid":"Home","sta_table":[{"mac":"00:00:00:00:00:aa"},{"mac":"00:00:00:00:00:bb"}]}]}"#;
-        let cfg1 = r#"{"_type":"setparam","cfgversion":"bbb","mgmt_cfg":"cfgversion=bbb\nauthkey=x","system_cfg":"aaa.1.ssid=Home\nwireless.1.ssid=Home\nwireless.1.security=wpa2\nradio.1.channel=36"}"#;
-        let cfg2 = r#"{"_type":"setparam","cfgversion":"ccc","mgmt_cfg":"cfgversion=ccc\nauthkey=x","system_cfg":"aaa.1.ssid=Home\nwireless.1.ssid=Home\nwireless.1.security=wpa3\nwireless.2.ssid=TestSSID"}"#;
-        let noop = br#"{"_type":"noop","interval":10}"#;
-
-        let mut segs: Vec<(bool, u32, Vec<u8>)> = Vec::new();
-        let (mut cseq, mut sseq) = (1u32, 1u32);
-        for (i, reply) in [cfg1.as_bytes(), noop, cfg2.as_bytes()].iter().enumerate() {
-            let req = sample::http_request(&seal(mac, gcm, [i as u8; 16], &key, inform));
-            let resp = sample::http_response(&seal(mac, gcm, [0x80 | i as u8; 16], &key, reply));
-            segs.push((true, cseq, req.clone()));
-            cseq += req.len() as u32;
-            segs.push((false, sseq, resp.clone()));
-            sseq += resp.len() as u32;
-        }
-        let refs: Vec<(bool, u32, &[u8])> = segs.iter().map(|(d, s, p)| (*d, *s, p.as_slice())).collect();
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("sample.pcap"), sample::pcap(&refs)).unwrap();
-        std::fs::write(dir.join("sample.keys.json"), format!(r#"{{"{mac}":"{}"}}"#, hex::encode(key))).unwrap();
     }
 }
