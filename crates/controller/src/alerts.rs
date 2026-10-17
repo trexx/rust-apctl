@@ -181,7 +181,7 @@ impl Alerts {
                 a.resolved_ts.map_or(Sql::Null, Sql::Integer),
             ],
         );
-        let _ = self.tx.send(LiveMsg::Alert(AlertMsg { action: "raised", alert: a.clone() }));
+        let _ = self.tx.send(LiveMsg::Alert(Box::new(AlertMsg { action: "raised", alert: a.clone() })));
         a
     }
 
@@ -203,7 +203,7 @@ impl Alerts {
         }
         // The message too: after a reload the alert reads as the live view said ("Back after 12 min").
         self.writer.exec(Db::Config, "UPDATE alerts SET resolved_ts = ?2, message = ?3 WHERE id = ?1", vec![Sql::Text(a.id.clone()), Sql::Integer(now), Sql::Text(a.message.clone())]);
-        let _ = self.tx.send(LiveMsg::Alert(AlertMsg { action: "resolved", alert: a.clone() }));
+        let _ = self.tx.send(LiveMsg::Alert(Box::new(AlertMsg { action: "resolved", alert: a.clone() })));
         Some(a)
     }
 }

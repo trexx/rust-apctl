@@ -171,7 +171,8 @@ pub enum LiveMsg {
     /// once a second per AP. The UI refetches the lines it shows, so the text
     /// is not sent along.
     Log { device_mac: Option<Mac> },
-    Alert(crate::alerts::AlertMsg),
+    /// Boxed: an alert is far larger than the other messages.
+    Alert(Box<crate::alerts::AlertMsg>),
 }
 
 /// What the UI is told of an event (see `LiveMsg::Event`). Without the data,
