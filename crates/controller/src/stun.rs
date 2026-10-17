@@ -49,7 +49,7 @@ fn address(out: &mut Vec<u8>, kind: u16, addr: SocketAddr, xor: Option<&[u8]>) {
 
 /// The answer to a STUN packet from `from`, if it is a Binding Request.
 /// `local` is this server's address as the AP sees it.
-pub fn answer(req: &[u8], from: SocketAddr, local: SocketAddr) -> Option<Vec<u8>> {
+fn answer(req: &[u8], from: SocketAddr, local: SocketAddr) -> Option<Vec<u8>> {
     if req.len() < 20 || u16::from_be_bytes([req[0], req[1]]) != BINDING_REQUEST {
         return None;
     }
@@ -107,12 +107,12 @@ pub async fn serve(listen: SocketAddr, advertised: Option<IpAddr>) -> anyhow::Re
 }
 
 /// The connection request packet.
-pub fn request_packet() -> [u8; 20] {
+const REQUEST_PACKET: [u8; 20] = {
     let mut p = [0u8; 20];
     p[0] = 0x88;
     p[1] = 0x88;
     p
-}
+};
 
 /// Asks an AP to inform now, if it told us where it can be reached.
 pub fn poke(live: &Live, mac: &Mac) {
@@ -121,7 +121,7 @@ pub fn poke(live: &Live, mac: &Mac) {
     let ip = p["connect_request_ip"].as_str().and_then(|i| i.parse::<IpAddr>().ok());
     let port = p["connect_request_port"].as_u64().or_else(|| p["connect_request_port"].as_str()?.parse().ok()).and_then(|v| u16::try_from(v).ok());
     if let (Some(ip), Some(port)) = (ip, port) {
-        let _ = socket.try_send_to(&request_packet(), SocketAddr::new(ip, port));
+        let _ = socket.try_send_to(&REQUEST_PACKET, SocketAddr::new(ip, port));
     }
 }
 
@@ -164,7 +164,7 @@ mod tests {
         assert_eq!(&r[56..58], &[0x00, 0x20]);
         assert_eq!(&r[62..64], &(40000u16 ^ 0x2112).to_be_bytes());
         assert_eq!(&r[64..68], &[192 ^ 0x21, 0x12, 2 ^ 0xA4, 9 ^ 0x42]);
-        assert_eq!(&request_packet()[..4], &[0x88, 0x88, 0, 0]);
+        assert_eq!(&REQUEST_PACKET[..4], &[0x88, 0x88, 0, 0]);
     }
 
     #[test]

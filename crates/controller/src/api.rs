@@ -465,17 +465,11 @@ async fn device(State(s): State<AppState>, Path(mac): Path<String>) -> Result<Re
     Ok(Json(DeviceDetail { device: DeviceOut { view: &d.view(), stored_only: true }, clients: &[], locating: false }).into_response())
 }
 
-/// Every client: the ones seen in this run and the ones restored from the
-/// database at start (`Engine::restore` loads them all, so the live view is
-/// the whole list).
-/// A client as the client list and page show it: its view, plus its name,
-/// manufacturer and controls.
+/// A client as its page shows it: its view, plus its name, manufacturer and controls.
 #[derive(Serialize)]
 struct ClientRow<'a> {
     #[serde(flatten)]
     view: &'a crate::engine::ClientView,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    ap_name: Option<Option<&'a str>>,
     alias: Option<&'a str>,
     note: Option<&'a str>,
     vendor: Option<&'a str>,
@@ -483,8 +477,20 @@ struct ClientRow<'a> {
     controls: crate::actions::Controls<'a>,
 }
 
+/// A client in the client list: as on its page, plus the name of the AP it is on.
+#[derive(Serialize)]
+struct ListedClient<'a> {
+    #[serde(flatten)]
+    client: ClientRow<'a>,
+    /// Null when that AP has no name, or is not reporting.
+    ap_name: Option<&'a str>,
+}
+
 type ClientCopy = (Mac, crate::engine::ClientView, Option<String>, Option<crate::engine::Alias>);
 
+/// Every client: the ones seen in this run and the ones restored from the
+/// database at start (`Engine::restore` loads them all, so the live view is
+/// the whole list).
 async fn clients(State(s): State<AppState>) -> Response {
     // What each client's entry needs, copied under the lock (the samples are
     // shared, the rest is small); the serialising happens after it.
@@ -501,15 +507,17 @@ async fn clients(State(s): State<AppState>) -> Response {
         (live.state.clone(), list)
     };
     let controls = crate::actions::ClientControls::new(state.as_deref());
-    let rows: Vec<ClientRow> = list
+    let rows: Vec<ListedClient> = list
         .iter()
-        .map(|(mac, view, ap_name, alias)| ClientRow {
-            view,
-            ap_name: Some(ap_name.as_deref()),
-            alias: alias.as_ref().and_then(|a| a.alias.as_deref()),
-            note: alias.as_ref().and_then(|a| a.note.as_deref()),
-            vendor: s.vendors.lookup(mac),
-            controls: controls.get(mac),
+        .map(|(mac, view, ap_name, alias)| ListedClient {
+            client: ClientRow {
+                view,
+                alias: alias.as_ref().and_then(|a| a.alias.as_deref()),
+                note: alias.as_ref().and_then(|a| a.note.as_deref()),
+                vendor: s.vendors.lookup(mac),
+                controls: controls.get(mac),
+            },
+            ap_name: ap_name.as_deref(),
         })
         .collect();
     Json(rows).into_response()
@@ -540,7 +548,6 @@ async fn client(State(s): State<AppState>, Path(mac): Path<String>) -> Result<Re
     };
     let row = ClientRow {
         view: &view,
-        ap_name: None,
         alias: alias.alias.as_deref(),
         note: alias.note.as_deref(),
         vendor: s.vendors.lookup(&mac),
