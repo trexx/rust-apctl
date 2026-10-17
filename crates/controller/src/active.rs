@@ -782,7 +782,7 @@ mod tests {
         {
             let mut live = rig.live.write().unwrap();
             let mut state = live.state.as_deref().cloned().unwrap();
-            crate::actions::edit_client(&mut state, "aa:bb:cc:00:00:09", &[("blocked", json!(true))]);
+            crate::actions::edit_client(&mut state, "aa:bb:cc:00:00:09".parse().unwrap(), &[("blocked", json!(true))]);
             live.state = Some(Arc::new(state));
         }
         let (_, reply) = inform_as_ap(&rig, &ap_payload(&version), KEY, GCM_ZLIB).await;
