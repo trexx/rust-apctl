@@ -530,6 +530,25 @@ fn apply(conn: &mut Connection, writes: Vec<Write>) -> Result<usize> {
     Ok(failed)
 }
 
+/// A config pushed to an AP.
+#[derive(Debug, Clone, Default)]
+pub struct PushedConfig {
+    pub mgmt_cfg: String,
+    /// Empty until a push with a `system_cfg` is seen (one can be management-only).
+    pub system_cfg: String,
+    pub cfgversion: Option<String>,
+}
+
+/// One AP's last stored push, with its secrets masked.
+pub fn stored_push(c: &Connection, mac: &inform::Mac) -> rusqlite::Result<Option<PushedConfig>> {
+    use rusqlite::OptionalExtension;
+    c.prepare_cached("SELECT mgmt_cfg, system_cfg, cfgversion FROM device_config WHERE mac = ?1")?
+        .query_row([mac.to_string()], |r| {
+            Ok(PushedConfig { mgmt_cfg: r.get::<_, Option<String>>(0)?.unwrap_or_default(), system_cfg: r.get::<_, Option<String>>(1)?.unwrap_or_default(), cfgversion: r.get(2)? })
+        })
+        .optional()
+}
+
 pub fn now_ts() -> Ts {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0)
 }

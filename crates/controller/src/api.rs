@@ -578,7 +578,7 @@ async fn dryrun(State(s): State<AppState>) -> Result<Json<DryRunStatus>, ApiErro
     let (stored, history) = read(&s.store, Db::Config, move |c| {
         let mut stored = std::collections::HashMap::new();
         for mac in need {
-            if let Some(p) = crate::engine::stored_push(c, &mac)?.filter(|p| !p.system_cfg.is_empty()) {
+            if let Some(p) = crate::store::stored_push(c, &mac)?.filter(|p| !p.system_cfg.is_empty()) {
                 stored.insert(mac, Arc::new(p));
             }
         }

@@ -18,7 +18,7 @@ use wire::decode::Decoded;
 use wire::keys::KeyStore;
 
 use crate::model::{self, ClientSample, Snapshot, Ts};
-use crate::store::{self, Db, Write, Writer};
+use crate::store::{self, Db, PushedConfig, Write, Writer};
 
 /// A client is considered gone once no full inform has listed it for this long.
 pub const CLIENT_GRACE_SECS: Ts = 60;
@@ -309,25 +309,6 @@ impl Live {
         reprovision.remove(mac);
         scans.remove(mac);
     }
-}
-
-/// A config pushed to an AP.
-#[derive(Debug, Clone, Default)]
-pub struct PushedConfig {
-    pub mgmt_cfg: String,
-    /// Empty until a push with a `system_cfg` is seen (one can be management-only).
-    pub system_cfg: String,
-    pub cfgversion: Option<String>,
-}
-
-/// One AP's last stored push, with its secrets masked.
-pub fn stored_push(c: &rusqlite::Connection, mac: &Mac) -> rusqlite::Result<Option<PushedConfig>> {
-    use rusqlite::OptionalExtension;
-    c.prepare_cached("SELECT mgmt_cfg, system_cfg, cfgversion FROM device_config WHERE mac = ?1")?.query_row([mac.to_string()], stored_push_row).optional()
-}
-
-fn stored_push_row(r: &rusqlite::Row) -> rusqlite::Result<PushedConfig> {
-    Ok(PushedConfig { mgmt_cfg: r.get::<_, Option<String>>(0)?.unwrap_or_default(), system_cfg: r.get::<_, Option<String>>(1)?.unwrap_or_default(), cfgversion: r.get(2)? })
 }
 
 /// What the database remembers about an AP from a previous run.
