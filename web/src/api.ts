@@ -887,12 +887,17 @@ export interface BackupManifest {
   files: Record<string, { size: number; sha256: string }>;
 }
 
-export const useBackups = () =>
-  useQuery({
-    queryKey: keys.backups(),
-    queryFn: ({ signal }) =>
-      get<{ encrypted: boolean; version: string; settings: BackupSettings; next_run: number | null; backups: BackupMeta[]; restore_pending: boolean; restore_failed: string | null }>("/api/backups", signal),
-  });
+interface Backups {
+  encrypted: boolean;
+  version: string;
+  settings: BackupSettings;
+  next_run: number | null;
+  backups: BackupMeta[];
+  restore_pending: boolean;
+  restore_failed: string | null;
+}
+
+export const useBackups = () => useQuery({ queryKey: keys.backups(), queryFn: getting<Backups>("/api/backups") });
 
 export const saveBackupSettings = (s: BackupSettings) => send("PUT", "/api/backups/settings", s);
 export const createBackup = (days: number) => send<BackupMeta>("POST", "/api/backups", { days });
@@ -963,30 +968,17 @@ export const resumeFirmware = () => send<{ resumed: boolean }>("POST", "/api/fir
 
 export const useMulticast = (span: TimeSpan, mac?: Mac) => useSpanQuery<SiteMulticast>(keys.multicast(span, mac), "/api/site/multicast", span, { mac });
 
-export const useRadios = (range: number) =>
-  useQuery({
-    queryKey: keys.rfRadios(range),
-    queryFn: getting<RadioOverview[]>(`/api/rf/radios${qs({ range })}`),
-    refetchInterval: 60_000,
-    placeholderData: keepPreviousData,
-  });
+/** GETs `path` every minute; the previous data stays up while another key's loads. */
+const usePolled = <T>(queryKey: QueryKey, path: string) =>
+  useQuery({ queryKey, queryFn: getting<T>(path), refetchInterval: 60_000, placeholderData: keepPreviousData });
+
+export const useRadios = (range: number) => usePolled<RadioOverview[]>(keys.rfRadios(range), `/api/rf/radios${qs({ range })}`);
 
 export const useNeighbors = (range: number, band: string) =>
-  useQuery({
-    queryKey: keys.rfNeighbors(range, band),
-    queryFn: getting<{ neighbors: Neighbor[]; own_links: OwnLink[] }>(`/api/rf/neighbors${qs({ range, band: bandParam(band) })}`),
-    refetchInterval: 60_000,
-    placeholderData: keepPreviousData,
-  });
+  usePolled<{ neighbors: Neighbor[]; own_links: OwnLink[] }>(keys.rfNeighbors(range, band), `/api/rf/neighbors${qs({ range, band: bandParam(band) })}`);
 
 /** Only how loudly our APs hear each other (no neighbour list). */
-export const useOwnLinks = (range: number) =>
-  useQuery({
-    queryKey: keys.rfLinks(range),
-    queryFn: getting<{ own_links: OwnLink[] }>(`/api/rf/neighbors${qs({ range, links_only: "true" })}`),
-    refetchInterval: 60_000,
-    placeholderData: keepPreviousData,
-  });
+export const useOwnLinks = (range: number) => usePolled<{ own_links: OwnLink[] }>(keys.rfLinks(range), `/api/rf/neighbors${qs({ range, links_only: "true" })}`);
 
 export const useChannelPlan = (band: string, dfs: boolean) =>
   useQuery({
