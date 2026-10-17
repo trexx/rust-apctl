@@ -629,7 +629,7 @@ const EventRow = memo(
             )}
             {showDevice &&
               e.device_mac &&
-              !e.kind.startsWith("client_roamed") && (
+              e.kind !== "client_roamed" && (
                 <>
                   {e.client_mac && <span className="muted"> on </span>}
                   <DeviceLink mac={e.device_mac} names={names} />
