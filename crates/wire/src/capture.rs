@@ -520,6 +520,11 @@ fn parse_http(buf: &[u8], request: bool, closed: bool) -> ParseResult {
             None if closed => rest.len(),
             None => return ParseResult::Partial,
         };
+        // A message that could not fit the buffer would stall the stream until the buffer
+        // is cleared, losing the messages behind it: skip it, as an oversized chunk.
+        if len > MAX_BUFFER.saturating_sub(head_len) {
+            return ParseResult::Garbage;
+        }
         if rest.len() < len {
             return ParseResult::Partial;
         }
@@ -709,6 +714,22 @@ mod tests {
         // A size that is still arriving is not garbage.
         assert!(matches!(chunked_len(b"fff", |_| {}), Chunked::Partial));
         assert!(matches!(chunked_len(b"3\r\nab", |_| {}), Chunked::Partial));
+    }
+
+    #[test]
+    fn a_content_length_beyond_the_buffer_is_garbage() {
+        let next = b"POST /inform HTTP/1.1\r\nContent-Length: 2\r\n\r\nok";
+        for len in [MAX_BUFFER, usize::MAX] {
+            let mut buf = format!("POST /inform HTTP/1.1\r\nContent-Length: {len}\r\n\r\nabc").into_bytes();
+            buf.extend_from_slice(next);
+            let mut h = HalfStream { buf, ..Default::default() };
+            assert!(matches!(h.take_http(true), Some(Parsed::Request { body, .. }) if body == b"ok"), "{len}: skipped to the next request");
+            assert!(h.buf.is_empty());
+        }
+        // One that fits, with its head, is waited for.
+        let head = "POST /inform HTTP/1.1\r\nContent-Length: 0000000000\r\n\r\n";
+        let buf = head.replace("0000000000", &format!("{:010}", MAX_BUFFER - head.len())).into_bytes();
+        assert!(matches!(parse_http(&buf, true, false), ParseResult::Partial));
     }
 
     #[test]
