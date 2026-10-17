@@ -605,7 +605,7 @@ fn used_bssids(c: &Connection, now: Ts) -> rusqlite::Result<Vec<(String, String,
 /// bucket's end, so a change is never placed earlier than it happened.
 #[derive(Default)]
 struct History {
-    /// (AP, radio) -> (channel, when last on it); a five-minute row's channel is its bucket's average.
+    /// (AP, radio) -> (channel, when last on it); a five-minute row's channel is the last one in its bucket.
     channels: HashMap<(String, String), Vec<(f64, Ts)>>,
     /// BSSID -> (name, when it last had it)
     names: HashMap<String, Vec<(String, Ts)>>,
@@ -761,7 +761,7 @@ pub async fn list(State(s): State<AppState>) -> Result<Response, ApiError> {
         findings: Vec<Served<'a>>,
     }
     // Written out here: what is sent borrows the findings and acknowledgements.
-    let body = serde_json::to_string(&Body { watching_since, findings: items }).map_err(|e| ApiError::internal(e.to_string()))?;
+    let body = serde_json::to_string(&Body { watching_since, findings: items }).map_err(anyhow::Error::from)?;
     drop(acks);
     Ok(([(header::CONTENT_TYPE, "application/json")], body).into_response())
 }
@@ -1023,7 +1023,7 @@ mod tests {
             let sql = format!("INSERT INTO radio_stats{suffix} (mac, radio, ts, channel) VALUES (?1, ?2, ?3, ?4)");
             c.execute(&sql, rusqlite::params![UP, radio, ts, ch]).unwrap();
         };
-        radio("_5m", now - 7200, "na", 40.0); // a bucket that saw a move from 36 to 44
+        radio("_5m", now - 7200, "na", 40.0); // an older roll-up's average of a bucket that saw a move from 36 to 44
         radio("_5m", now - 3600, "na", 44.0);
         radio("", now - 60, "na", 44.0);
         radio("_5m", now - 600, "ng", 6.0);
@@ -1037,7 +1037,7 @@ mod tests {
         let names: Vec<(&str, Option<&str>)> = used.iter().map(|(b, _, e)| (b.as_str(), e.as_deref())).collect();
         assert_eq!(names, [("02:00:00:00:00:01", Some("Old")), ("02:00:00:00:00:02", Some("Home 2")), ("02:00:00:00:00:03", Some("IoT"))]);
         let own = |bssid: &str, essid: &str, channel: i64| OwnBss { bssid: bssid.into(), ap_mac: UP.into(), essid: Some(essid.into()), channel: Some(channel), changed_at: 0 };
-        // Called "Home" an hour ago, and on channel 44 since the averaged bucket
+        // Called "Home" an hour ago, and on channel 44 since the bucket with the move
         // before; a five-minute row lasts to its bucket's end.
         assert_eq!(h.last_change(&own("02:00:00:00:00:02", "Home", 44), Some("na")), now - 60, "the rename");
         assert_eq!(h.last_change(&own("02:00:00:00:00:02", "Home 2", 44), Some("na")), now - 3600 + 299);
