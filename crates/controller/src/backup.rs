@@ -410,7 +410,12 @@ fn trim(dir: &Path, cutoff: Option<Ts>) -> Result<()> {
             if !p.exists() {
                 continue;
             }
+            // What is deleted is overwritten in place, so the file need not be
+            // rewritten to be rid of it: only when it frees much of the file
+            // (zeroed pages would otherwise bloat the restored database, and
+            // compress so well that the restore's size check could refuse it).
             let mut c = scratch(&p)?;
+            c.execute_batch("PRAGMA secure_delete=ON;")?;
             let tx = c.transaction()?;
             for table in tables {
                 // A database from an older version may lack the newest tables.
@@ -420,7 +425,10 @@ fn trim(dir: &Path, cutoff: Option<Ts>) -> Result<()> {
                 }
             }
             tx.commit()?;
-            c.execute_batch("VACUUM;")?;
+            let pages = |pragma: &str| c.query_row(&format!("PRAGMA {pragma}"), [], |r| r.get::<_, i64>(0));
+            if pages("freelist_count")? * 4 > pages("page_count")? {
+                c.execute_batch("VACUUM;")?;
+            }
         }
     }
     Ok(())
@@ -1235,6 +1243,28 @@ mod tests {
         // The wrong key, or none, is refused.
         assert!(unpack(&b.dir().join(&m.name), Some(&[8u8; 32]), &dir("rt-wrong")).is_err());
         assert!(unpack(&b.dir().join(&m.name), None, &dir("rt-none")).is_err());
+    }
+
+    #[test]
+    fn history_dropped_from_a_backup_leaves_no_trace_and_little_free_space() {
+        let src = data("trim");
+        let old = store::now_ts() - 40 * 86400;
+        let metrics = Connection::open(src.join("metrics.db")).unwrap();
+        metrics.execute_batch(&format!("INSERT INTO ap_stats (mac, ts, cpu) VALUES ('old-ap-gone-0001', {old}, 3.0);")).unwrap();
+        let b = Backups::new(src.clone(), None);
+        // A little dropped: overwritten where it was.
+        let out = dir("trim-few");
+        unpack(&b.dir().join(create(&b, &src, Kind::Manual, 7).unwrap().name), None, &out).unwrap();
+        assert_eq!(count(&out.join("metrics.db"), "SELECT COUNT(*) FROM ap_stats"), 1);
+        assert!(!fs::read(out.join("metrics.db")).unwrap().windows(16).any(|w| w == b"old-ap-gone-0001"));
+        // Most of the file dropped: rewritten without the pages it freed.
+        metrics
+            .execute_batch(&format!("WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 20000) INSERT INTO ap_stats (mac, ts, cpu) SELECT 'old-' || i, {old}, 1.0 FROM n;"))
+            .unwrap();
+        let out = dir("trim-many");
+        unpack(&b.dir().join(create(&b, &src, Kind::Manual, 7).unwrap().name), None, &out).unwrap();
+        assert_eq!(count(&out.join("metrics.db"), "SELECT COUNT(*) FROM ap_stats"), 1);
+        assert_eq!(count(&out.join("metrics.db"), "PRAGMA freelist_count"), 0);
     }
 
     #[test]
