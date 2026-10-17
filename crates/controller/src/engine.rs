@@ -1350,20 +1350,18 @@ impl Engine {
             }
         }
         self.logs_announced.retain(|_, (at, _)| now - *at < 60);
-        {
-            let mut live = self.live.write().unwrap();
-            if let Some(mac) = live.firmware.expired(now)
-                && let Some(j) = live.firmware.failed(&mac, "it did not come back with the new firmware in time")
-            {
-                let data = json!({ "reason": "timed out", "detail": "it did not come back with the new firmware in time", "target": j.target });
-                self.emit(Event::device(now, EventKind::ApUpgradeFailed, mac, data));
-            }
-        }
+        self.bss_prev.retain(|_, (ts, _)| *ts > now - 3600);
         for f in self.logevents.tick(now) {
             self.emit(Event { ts: now, kind: f.kind, device_mac: f.device, client_mac: f.client, data: f.data });
         }
-        self.bss_prev.retain(|_, (ts, _)| *ts > now - 3600);
         let mut live = self.live.write().unwrap();
+        const TIMED_OUT: &str = "it did not come back with the new firmware in time";
+        if let Some(mac) = live.firmware.expired(now)
+            && let Some(j) = live.firmware.failed(&mac, TIMED_OUT)
+        {
+            let data = json!({ "reason": "timed out", "detail": TIMED_OUT, "target": j.target });
+            self.emit(Event::device(now, EventKind::ApUpgradeFailed, mac, data));
+        }
         let mut events = Vec::new();
         let mut offline = Vec::new();
         for (mac, d) in live.devices.iter_mut() {
