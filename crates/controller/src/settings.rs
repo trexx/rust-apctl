@@ -507,23 +507,30 @@ fn mac_list_value(v: &Value, key: &str) -> Result<Option<Vec<String>>, String> {
 
 // ---- SSIDs ----------------------------------------------------------------
 
-/// Security choices as the official UI offers them, mapped to
-/// `(security, wpa_mode, wpa3_support, wpa3_transition)`.
-const PROTECTION: &[(&str, &str, &str, bool, bool)] = &[
-    ("wpa2", "wpapsk", "wpa2", false, false),
-    ("wpa2_wpa3", "wpapsk", "wpa2", true, true),
-    ("wpa3", "wpapsk", "wpa2", true, false),
-    ("open", "open", "wpa2", false, false),
+/// A security choice as the official UI offers it, and the fields it sets.
+struct Protection {
+    name: &'static str,
+    security: &'static str,
+    wpa_mode: &'static str,
+    wpa3_support: bool,
+    wpa3_transition: bool,
+}
+
+const PROTECTION: &[Protection] = &[
+    Protection { name: "wpa2", security: "wpapsk", wpa_mode: "wpa2", wpa3_support: false, wpa3_transition: false },
+    Protection { name: "wpa2_wpa3", security: "wpapsk", wpa_mode: "wpa2", wpa3_support: true, wpa3_transition: true },
+    Protection { name: "wpa3", security: "wpapsk", wpa_mode: "wpa2", wpa3_support: true, wpa3_transition: false },
+    Protection { name: "open", security: "open", wpa_mode: "wpa2", wpa3_support: false, wpa3_transition: false },
 ];
 
 /// The protection choice of a stored SSID, if it is one the editor offers.
+/// An open SSID's `wpa_mode`, and the transition flag without WPA3, mean nothing.
 fn protection_of(w: &Value) -> Option<&'static str> {
+    let security = w["security"].as_str()?;
+    let wpa_mode = if security == "open" { "wpa2" } else { w["wpa_mode"].as_str().unwrap_or("wpa2") };
     let wpa3 = w["wpa3_support"].as_bool().unwrap_or(false);
-    let transition = w["wpa3_transition"].as_bool().unwrap_or(false);
-    PROTECTION
-        .iter()
-        .find(|p| w["security"].as_str() == Some(p.1) && (p.1 == "open" && !wpa3 || p.1 != "open" && w["wpa_mode"].as_str().unwrap_or("wpa2") == p.2 && wpa3 == p.3 && (!wpa3 || transition == p.4)))
-        .map(|p| p.0)
+    let transition = wpa3 && w["wpa3_transition"].as_bool().unwrap_or(false);
+    PROTECTION.iter().find(|p| (p.security, p.wpa_mode, p.wpa3_support, p.wpa3_transition) == (security, wpa_mode, wpa3, transition)).map(|p| p.name)
 }
 
 /// How an SSID's security reads for people: the editor's choices by name,
@@ -895,18 +902,24 @@ pub fn apply_wlan(state: &mut Value, e: &WlanEdit) -> Result<String, String> {
 
 /// Protection, PMF and the WPA3 timers.
 fn wlan_security(p: &Value, w: &mut Value) -> Result<(), String> {
-    if let Some(choice) = enum_field(p, "protection", &PROTECTION.iter().map(|x| x.0).collect::<Vec<_>>())? {
-        let (_, security, mode, wpa3, transition) = PROTECTION.iter().find(|x| x.0 == choice).copied().unwrap();
-        w["security"] = json!(security);
-        w["wpa_mode"] = json!(mode);
-        w["wpa3_support"] = json!(wpa3);
-        w["wpa3_transition"] = json!(transition);
-        if security == "wpapsk" {
+    if !p["protection"].is_null() {
+        let x = PROTECTION.iter().find(|x| p["protection"].as_str() == Some(x.name)).ok_or_else(|| {
+            format!("protection must be one of {}", PROTECTION.iter().map(|x| x.name).collect::<Vec<_>>().join(", "))
+        })?;
+        w["security"] = json!(x.security);
+        w["wpa_mode"] = json!(x.wpa_mode);
+        w["wpa3_support"] = json!(x.wpa3_support);
+        w["wpa3_transition"] = json!(x.wpa3_transition);
+        if x.security == "wpapsk" {
             w["wpa_enc"] = json!("ccmp");
         }
         // The protection decides PMF unless the edit sets it too.
         if p["pmf_mode"].is_null() {
-            w["pmf_mode"] = json!(if wpa3 && transition { "optional" } else if wpa3 { "required" } else { "disabled" });
+            w["pmf_mode"] = json!(match (x.wpa3_support, x.wpa3_transition) {
+                (true, true) => "optional",
+                (true, false) => "required",
+                (false, _) => "disabled",
+            });
         }
     }
     copy_fields(p, w, &[("pmf_mode", Enum(&["disabled", "optional", "required"]))])?;
