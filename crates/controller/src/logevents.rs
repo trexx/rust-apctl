@@ -103,13 +103,22 @@ struct Crash {
     lines: Vec<String>,
     /// The size of `lines`, against [`CRASH_BYTES`].
     bytes: usize,
+    /// Set at the first line that did not fit: later ones are not kept (nor
+    /// formatted), so the capture has no holes.
+    full: bool,
 }
 
 impl Crash {
-    fn push(&mut self, line: String) {
+    fn push(&mut self, line: impl FnOnce() -> String) {
+        if self.full {
+            return;
+        }
+        let line = line();
         if self.lines.len() < CRASH_LINES && self.bytes + line.len() <= CRASH_BYTES {
             self.bytes += line.len();
             self.lines.push(line);
+        } else {
+            self.full = true;
         }
     }
 }
@@ -320,7 +329,7 @@ impl LogEvents {
         let is_fault = fault.is_some();
         let text = || prog.map_or_else(|| msg.to_string(), |p| format!("{p}: {msg}"));
         if let Some(c) = self.crashes.get_mut(&dev) {
-            c.push(text());
+            c.push(text);
             if let Some((CrashKind::Panic, _)) = fault {
                 c.kind = CrashKind::Panic;
                 out.extend(self.flush(dev, line.ts));
@@ -329,8 +338,8 @@ impl LogEvents {
             && self.crash_reported.get(&dev).is_none_or(|t| !(0..CRASH_COOLDOWN).contains(&(line.ts - t)))
             && self.crashes.len() < MAX_CRASHES
         {
-            let mut crash = Crash { started: line.ts, kind, process, lines: Vec::new(), bytes: 0 };
-            crash.push(text());
+            let mut crash = Crash { started: line.ts, kind, process, lines: Vec::new(), bytes: 0, full: false };
+            crash.push(text);
             self.crashes.insert(dev, crash);
             if kind == CrashKind::Panic {
                 out.extend(self.flush(dev, line.ts));
@@ -544,8 +553,11 @@ mod tests {
         for _ in 0..100 {
             l.feed(&line(1, "kernel", &long));
         }
+        // Once a line did not fit, a short one after it is not kept either: no holes.
+        l.feed(&line(1, "kernel", "short"));
         let c = &l.crashes[&AP.parse::<Mac>().unwrap()];
         assert!(c.bytes <= CRASH_BYTES && c.lines.len() < 10, "{} lines", c.lines.len());
+        assert!(c.full && c.lines.last().is_some_and(|l| l.ends_with('x')));
         // At most so many captures at once, reported in AP order.
         for i in 0..MAX_CRASHES + 10 {
             let mut f = line(0, "kernel", "Internal error: Oops: 17 [#1] SMP ARM");
