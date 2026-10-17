@@ -741,6 +741,7 @@ pub async fn roaming(State(s): State<AppState>, Query(q): Query<RoamingQuery>) -
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::tests::TestDir;
 
     fn conn(ts: Ts, client: &str, ap: &str, event_type: &str, n: Value) -> ConnEvent {
         ConnEvent {
@@ -874,7 +875,7 @@ mod tests {
 
     #[test]
     fn the_newest_attempts_and_roams_are_read_from_the_end() {
-        let dir = std::env::temp_dir().join(format!("apctl-connections-{}-{}", std::process::id(), crate::clock::now_ts()));
+        let dir = TestDir::new("connections");
         let (store, _writer) = crate::store::Store::open(&dir).unwrap();
         let c = rusqlite::Connection::open(dir.join("config.db")).unwrap();
         // Five clients, one report every 7 s for a day: failures with their fixups up
@@ -932,12 +933,11 @@ mod tests {
             assert_eq!(json!(r), json!(want_r), "{client:?} {failed} {limit}");
             assert_eq!(list.len(), limit.min(want.len()));
         }
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn a_few_roams_among_many_attempts_are_found_without_reading_them_all() {
-        let dir = std::env::temp_dir().join(format!("apctl-roams-{}-{}", std::process::id(), crate::clock::now_ts()));
+        let dir = TestDir::new("roams");
         let (store, _writer) = crate::store::Store::open(&dir).unwrap();
         let c = rusqlite::Connection::open(dir.join("config.db")).unwrap();
         let sql = "INSERT INTO connections (ts, ap_mac, client_mac, vap, essid, radio, event_type, detail) VALUES (?1, ?2, ?3, 'wifi1ap0', 'Home', 'na', ?4, ?5)";
@@ -971,6 +971,5 @@ mod tests {
             let read = store.read(Db::Config, |c| Ok(roam_rows(c, from, to, client)?)).unwrap();
             assert!(read.len() < 40, "{} rows", read.len());
         }
-        let _ = std::fs::remove_dir_all(&dir);
     }
 }

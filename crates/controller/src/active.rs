@@ -684,6 +684,7 @@ async fn managed_inform(active: &Arc<Active>, ts: Ts, caller: &Caller, header: i
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::tests::TestDir;
     use axum::body::Body;
     use axum::http::Request;
     use std::net::SocketAddr;
@@ -699,6 +700,7 @@ mod tests {
         live: SharedLive,
         rx: mpsc::Receiver<Input>,
         active: Arc<Active>,
+        _dir: TestDir,
     }
 
     fn rig(with_state: bool, last_push: Option<(String, String, Option<String>)>) -> Rig {
@@ -707,7 +709,7 @@ mod tests {
 
     /// `stored`: a push already in the database (as written in shadow mode, masked).
     fn rig_with_stored(with_state: bool, last_push: Option<(String, String, Option<String>)>, stored: Option<(String, String, String)>) -> Rig {
-        let dir = std::env::temp_dir().join(format!("apctl-active-{}-{}", std::process::id(), hex::encode(random_bytes::<4>())));
+        let dir = TestDir::new("active");
         let (store, writer) = Store::open(&dir).unwrap();
         if let Some((mgmt, system, version)) = stored {
             writer.exec(
@@ -732,7 +734,7 @@ mod tests {
         let (tx, rx) = mpsc::channel(1000);
         let active = Arc::new(Active::new(&store, writer, live.clone(), Arc::new(keys), tx, controller(), Default::default()).unwrap());
         let app = axum::Router::new().route("/inform", axum::routing::post(inform)).with_state(active.clone());
-        Rig { app, live, rx, active }
+        Rig { app, live, rx, active, _dir: dir }
     }
 
     fn controller() -> apcfg::Controller {

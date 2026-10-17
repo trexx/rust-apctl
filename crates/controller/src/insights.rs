@@ -1580,6 +1580,7 @@ fn plan_channels(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::tests::TestDir;
 
     #[test]
     fn channel_blocks_and_overlap() {
@@ -1792,12 +1793,10 @@ mod tests {
         }
 
         /// The site: two APs reporting for a little over an hour before `base + 3600`.
-        fn site() -> (AppState, Ts, std::path::PathBuf) {
+        fn site() -> (AppState, Ts, TestDir) {
             let now = clock::now_ts();
             let base = now - now % 3600 - 3600;
-            static SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-            let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            let dir = std::env::temp_dir().join(format!("apctl-insights-pin-{}-{now}-{seq}", std::process::id()));
+            let dir = TestDir::new("insights-pin");
             let (store, writer) = store::Store::open(&dir).unwrap();
             let m = Connection::open(dir.join("metrics.db")).unwrap();
             let mut rng = Rng(7);
@@ -1958,7 +1957,7 @@ mod tests {
             let (engine, _) = tokio::sync::mpsc::channel(1);
             let (tx, _) = tokio::sync::broadcast::channel(1);
             let s = AppState::new(crate::api::AppStateInner {
-                backups: crate::backup::Backups::new(dir.clone(), None),
+                backups: crate::backup::Backups::new(dir.to_path_buf(), None),
                 store, vendors: Default::default(), renderer: crate::dryrun::apcfg_renderer("10.6.106".into()), auth, engine, live, tx, started: 0, source: "none".into(),
                 active: false, writer, inform_url: None, memo: Default::default(), threat_acks: Default::default(),
             });
@@ -2003,7 +2002,7 @@ mod tests {
         }
 
         async fn outputs() -> Value {
-            let (s, base, _) = site();
+            let (s, base, _dir) = site();
             let q = |band: Option<&str>, mac: Option<&str>| Query(RangeQuery { range: None, from: Some(base), to: Some(base + 3600), band: band.map(Into::into), mac: mac.map(Into::into) });
             let plan = |band: &str, dfs: bool| Query(PlanQuery { band: Some(band.into()), dfs: Some(dfs) });
             let st = || State(s.clone());
@@ -2056,7 +2055,7 @@ mod tests {
 
         #[tokio::test]
         async fn a_query_asked_again_while_it_is_read_is_read_once() {
-            let (s, base, _) = site();
+            let (s, base, _dir) = site();
             static READS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
             let q = RangeQuery { range: None, from: Some(base), to: Some(base + 3600), band: None, mac: None };
             let one = || {

@@ -907,6 +907,7 @@ pub fn watch(store: std::sync::Arc<Store>, acks: Arc<AckCache>, live: SharedLive
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::tests::TestDir;
 
     const UP: &str = "78:45:58:3c:51:ac";
     const DOWN: &str = "78:45:58:3c:52:bc";
@@ -1050,7 +1051,7 @@ mod tests {
 
     #[test]
     fn our_bssids_and_their_changes_come_from_every_tier() {
-        let dir = std::env::temp_dir().join(format!("apctl-threats-{}-{}", std::process::id(), clock::now_ts()));
+        let dir = TestDir::new("threats");
         let (store, _writer) = Store::open(&dir).unwrap();
         let c = Connection::open(dir.join("metrics.db")).unwrap();
         let now = 1_000_000_000;
@@ -1093,12 +1094,11 @@ mod tests {
         assert_eq!(h.last_change(&own("02:00:00:00:00:03", "IoT", 6), None), now - 120);
         assert_eq!(h.last_change(&own("02:00:00:00:00:03", "IoT", 1), Some("ng")), now - 600 + 299);
         assert_eq!(h.last_change(&own("02:00:00:00:00:01", "Old", 6), None), 0, "only in the hourly tier");
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn findings_about_networks_no_longer_heard_are_forgotten() {
-        let dir = std::env::temp_dir().join(format!("apctl-threats-prune-{}-{}", std::process::id(), clock::now_ts()));
+        let dir = TestDir::new("threats-prune");
         let (store, writer) = Store::open(&dir).unwrap();
         let sql = "INSERT INTO neighbors (bssid, ap_mac, first_seen, last_seen) VALUES ('02:00:00:00:00:01', ?1, 1, 2)";
         writer.exec(Db::Config, sql, vec![rusqlite::types::Value::Text(UP.into())]);
@@ -1112,7 +1112,6 @@ mod tests {
             .read(Db::Config, |c| Ok(c.prepare("SELECT kind FROM network_threats ORDER BY kind")?.query_map([], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?))
             .unwrap();
         assert_eq!(left, ["bridged", "lookalike"]);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -1160,7 +1159,7 @@ mod tests {
 
     #[test]
     fn acknowledgements_and_slow_reads_are_kept_in_memory() {
-        let dir = std::env::temp_dir().join(format!("apctl-threats-acks-{}-{}", std::process::id(), clock::now_ts()));
+        let dir = TestDir::new("threats-acks");
         let (store, writer) = Store::open(&dir).unwrap();
         let (live, acks): (SharedLive, AckCache) = Default::default();
         let exec = |sql: &'static str| writer.exec(Db::Config, sql, vec![]);
@@ -1186,7 +1185,6 @@ mod tests {
         assert_eq!((a.watching_since, a.clients.len()), (100, 1));
         let a = gather(&store, &acks, &live, now + CACHE_SECS).unwrap();
         assert_eq!((a.watching_since, a.clients.len()), (50, 2));
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

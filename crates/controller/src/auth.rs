@@ -489,11 +489,11 @@ fn renewed(mut res: Response, cookie: Option<String>) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::tests::TestDir;
 
     #[test]
     fn users_file_and_verification() {
-        let dir = std::env::temp_dir().join(format!("apctl-users-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = TestDir::new("users");
         let file = dir.join("users");
         std::fs::write(&file, format!("# admins\nadmin:{}\n\n", hash_password("correct horse").unwrap())).unwrap();
         let users = Users::load(&file).unwrap();
@@ -517,12 +517,11 @@ mod tests {
         assert!(Users::load(&file).is_err());
         std::fs::write(&file, "# nobody yet\n").unwrap();
         assert!(Users::load(&file).unwrap().is_empty());
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
     fn sessions_are_hashed_checked_and_revoked() {
-        let dir = std::env::temp_dir().join(format!("apctl-sessions-{}-{}", std::process::id(), clock::now_ts()));
+        let dir = TestDir::new("sessions");
         let (store, writer) = Store::open(&dir).unwrap();
         let mut users = Users::default();
         users.hashes.insert("admin".into(), hash_password("x").unwrap());
@@ -540,12 +539,11 @@ mod tests {
         auth.create("admin").unwrap();
         assert!(!auth.sessions.lock().unwrap().contains_key(&token_hash(&old)));
         assert_eq!(auth.sessions.lock().unwrap().len(), 1);
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
     fn throttles_after_repeated_failures() {
-        let dir = std::env::temp_dir().join(format!("apctl-throttle-{}-{}", std::process::id(), clock::now_ts()));
+        let dir = TestDir::new("throttle");
         let (store, writer) = Store::open(&dir).unwrap();
         let auth = Auth::new(Users::default(), &store, writer, Default::default()).unwrap();
         let ip: IpAddr = "10.0.0.9".parse().unwrap();
@@ -564,7 +562,6 @@ mod tests {
         }
         assert!(!auth.attempt("2001:db8:1:2:ffff::1".parse().unwrap()));
         assert!(auth.attempt("2001:db8:1:3::1".parse().unwrap()));
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -600,7 +597,7 @@ mod tests {
 
     #[test]
     fn live_sockets_are_only_for_pages_of_this_server() {
-        let dir = std::env::temp_dir().join(format!("apctl-origin-{}-{}", std::process::id(), clock::now_ts()));
+        let dir = TestDir::new("origin");
         let (store, writer) = Store::open(&dir).unwrap();
         let proxies = Arc::new(Proxies::parse(&["10.42.0.0/16".into()]).unwrap());
         let auth = Auth::new(Users::default(), &store, writer, proxies).unwrap();
@@ -627,7 +624,6 @@ mod tests {
         assert!(!ok(Some("https://other.example"), "apctl:8080", Some("apctl.example"), "10.42.0.3"));
         // From anyone else it is not believed.
         assert!(!ok(Some("https://evil.example"), "apctl.lan", Some("evil.example"), lan));
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

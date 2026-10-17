@@ -71,11 +71,11 @@ impl Vendors {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::tests::TestDir;
 
     #[test]
     fn parses_the_registry_format() {
-        let dir = std::env::temp_dir().join(format!("apctl-oui-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = TestDir::new("oui");
         let file = dir.join("oui.csv");
         std::fs::write(
             &file,
@@ -89,6 +89,5 @@ mod tests {
         assert_eq!(v.lookup_str("28:6f:b9:00:00:01"), Some("Nokia Shanghai Bell Co., Ltd."));
         assert_eq!(v.lookup_str("86:00:00:00:00:06"), Some("Private (randomised)"));
         assert_eq!(v.lookup_str("00:00:01:00:00:00"), None);
-        std::fs::remove_dir_all(&dir).ok();
     }
 }

@@ -1184,16 +1184,14 @@ pub async fn restore(State(s): State<AppState>, Json(body): Json<RestoreBody>) -
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::tests::TestDir;
 
-    fn dir(name: &str) -> PathBuf {
-        let d = std::env::temp_dir().join(format!("apctl-backup-{name}-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&d);
-        fs::create_dir_all(&d).unwrap();
-        d
+    fn dir(name: &str) -> TestDir {
+        TestDir::new(&format!("backup-{name}"))
     }
 
     /// A data directory with a little of everything.
-    fn data(name: &str) -> PathBuf {
+    fn data(name: &str) -> TestDir {
         let d = dir(name);
         let (store, writer) = store::Store::open(&d).unwrap();
         drop(writer);
@@ -1220,7 +1218,7 @@ mod tests {
     #[test]
     fn encrypted_round_trip_with_history_filter() {
         let src = data("rt");
-        let b = Backups::new(src.clone(), Some([7u8; 32]));
+        let b = Backups::new(src.to_path_buf(), Some([7u8; 32]));
         let m = create(&b, &src, Kind::Manual, 7).unwrap();
         assert!(m.encrypted && m.days == 7);
         let raw = fs::read(b.dir().join(&m.name)).unwrap();
@@ -1246,7 +1244,7 @@ mod tests {
         let old = clock::now_ts() - 40 * 86400;
         let metrics = Connection::open(src.join("metrics.db")).unwrap();
         metrics.execute_batch(&format!("INSERT INTO ap_stats (mac, ts, cpu) VALUES ('old-ap-gone-0001', {old}, 3.0);")).unwrap();
-        let b = Backups::new(src.clone(), None);
+        let b = Backups::new(src.to_path_buf(), None);
         // A little dropped: overwritten where it was.
         let out = dir("trim-few");
         unpack(&b.dir().join(create(&b, &src, Kind::Manual, 7).unwrap().name), None, &out).unwrap();
@@ -1265,7 +1263,7 @@ mod tests {
     #[test]
     fn settings_only_and_unencrypted() {
         let src = data("so");
-        let b = Backups::new(src.clone(), None);
+        let b = Backups::new(src.to_path_buf(), None);
         let m = create(&b, &src, Kind::Auto, 0).unwrap();
         assert!(!m.encrypted && m.name.starts_with("apctl-auto-"));
         let out = dir("so-out");
@@ -1318,7 +1316,7 @@ mod tests {
     #[test]
     fn tampering_and_truncation_are_detected() {
         let src = data("tamper");
-        let b = Backups::new(src.clone(), Some([1u8; 32]));
+        let b = Backups::new(src.to_path_buf(), Some([1u8; 32]));
         let m = create(&b, &src, Kind::Manual, -1).unwrap();
         let path = b.dir().join(&m.name);
         let good = fs::read(&path).unwrap();
@@ -1334,7 +1332,7 @@ mod tests {
     #[test]
     fn staged_restore_is_applied_on_start_with_a_pre_restore_copy() {
         let src = data("apply");
-        let b = Backups::new(src.clone(), Some([3u8; 32]));
+        let b = Backups::new(src.to_path_buf(), Some([3u8; 32]));
         let m = create(&b, &src, Kind::Manual, -1).unwrap();
         // Change the live data after the backup.
         Connection::open(src.join("config.db")).unwrap().execute_batch("DELETE FROM client_aliases;").unwrap();
@@ -1351,7 +1349,7 @@ mod tests {
     #[test]
     fn the_newest_automatic_backup_is_known_without_reading_the_directory_again() {
         let src = data("last-auto");
-        let b = Backups::new(src.clone(), None);
+        let b = Backups::new(src.to_path_buf(), None);
         create(&b, &src, Kind::Manual, 0).unwrap();
         assert_eq!(b.last_auto(), 0);
         let m = create(&b, &src, Kind::Auto, 0).unwrap();
@@ -1363,7 +1361,7 @@ mod tests {
     #[test]
     fn unfinished_backups_are_cleared_at_start() {
         let src = data("unfinished");
-        let b = Backups::new(src.clone(), None);
+        let b = Backups::new(src.to_path_buf(), None);
         let m = create(&b, &src, Kind::Manual, 0).unwrap();
         // What a backup cut off by a crash leaves behind.
         fs::create_dir_all(b.dir().join(".tmp-1-2-ab")).unwrap();
@@ -1381,7 +1379,7 @@ mod tests {
     #[test]
     fn a_restore_keeps_three_pre_restore_copies() {
         let src = data("prune");
-        let b = Backups::new(src.clone(), None);
+        let b = Backups::new(src.to_path_buf(), None);
         let m = create(&b, &src, Kind::Manual, 0).unwrap();
         for _ in 0..3 {
             create(&b, &src, Kind::PreRestore, 0).unwrap();
@@ -1397,7 +1395,7 @@ mod tests {
     #[test]
     fn a_restore_cut_off_part_way_is_finished_on_the_next_start() {
         let src = data("resume");
-        let b = Backups::new(src.clone(), None);
+        let b = Backups::new(src.to_path_buf(), None);
         let m = create(&b, &src, Kind::Manual, -1).unwrap();
         Connection::open(src.join("config.db")).unwrap().execute_batch("DELETE FROM client_aliases;").unwrap();
         let (id, _) = stage(&b, &b.dir().join(&m.name)).unwrap();
@@ -1416,9 +1414,9 @@ mod tests {
 
     /// A restore of all history staged and marked to be applied, made before
     /// the live config lost its client alias.
-    fn staged_restore(name: &str) -> (PathBuf, Backups, String) {
+    fn staged_restore(name: &str) -> (TestDir, Backups, String) {
         let src = data(name);
-        let b = Backups::new(src.clone(), None);
+        let b = Backups::new(src.to_path_buf(), None);
         let m = create(&b, &src, Kind::Manual, -1).unwrap();
         Connection::open(src.join("config.db")).unwrap().execute_batch("DELETE FROM client_aliases;").unwrap();
         let (id, _) = stage(&b, &b.dir().join(&m.name)).unwrap();
@@ -1510,7 +1508,7 @@ mod tests {
     #[test]
     fn files_beside_their_place_are_removed_only_without_a_restore_under_way() {
         let src = data("stale");
-        let b = Backups::new(src.clone(), None);
+        let b = Backups::new(src.to_path_buf(), None);
         fs::write(src.join("metrics.db.restoring"), "x").unwrap();
         apply_pending(&b);
         assert!(!src.join("metrics.db.restoring").exists());
@@ -1519,7 +1517,7 @@ mod tests {
     #[test]
     fn backups_at_the_same_moment_get_their_own_names() {
         let src = data("same");
-        let b = Backups::new(src.clone(), None);
+        let b = Backups::new(src.to_path_buf(), None);
         let names: Vec<String> = std::thread::scope(|sc| {
             let hs: Vec<_> = (0..3).map(|_| sc.spawn(|| create(&b, &src, Kind::Manual, 0).unwrap().name)).collect();
             hs.into_iter().map(|h| h.join().unwrap()).collect()
@@ -1539,7 +1537,7 @@ mod tests {
     #[test]
     fn a_failed_restore_is_set_aside_and_apctl_starts() {
         let src = data("failed");
-        let b = Backups::new(src.clone(), None);
+        let b = Backups::new(src.to_path_buf(), None);
         fs::create_dir_all(b.staging()).unwrap();
         fs::write(b.staging().join("pending"), "r123").unwrap();
         apply_pending(&b);
@@ -1605,7 +1603,7 @@ mod tests {
     #[test]
     fn sessions_never_travel_even_with_all_history() {
         let src = data("sessions");
-        let b = Backups::new(src.clone(), None);
+        let b = Backups::new(src.to_path_buf(), None);
         let m = create(&b, &src, Kind::Manual, -1).unwrap();
         let out = dir("sessions-out");
         unpack(&b.dir().join(&m.name), None, &out).unwrap();
@@ -1628,8 +1626,8 @@ mod tests {
     #[test]
     fn with_a_key_only_sealed_backups_are_restored() {
         let src = data("plain");
-        let plain = create(&Backups::new(src.clone(), None), &src, Kind::Manual, 0).unwrap();
-        let b = Backups::new(src, Some([5u8; 32]));
+        let plain = create(&Backups::new(src.to_path_buf(), None), &src, Kind::Manual, 0).unwrap();
+        let b = Backups::new(src.to_path_buf(), Some([5u8; 32]));
         let err = unpack(&b.dir().join(&plain.name), b.key.as_ref(), &dir("plain-out")).unwrap_err();
         assert!(err.to_string().contains("not encrypted"), "{err:#}");
     }
@@ -1645,7 +1643,7 @@ mod tests {
         }
         // Nor can a staged manifest, when the restore is applied.
         let src = data("names-apply");
-        let b = Backups::new(src, None);
+        let b = Backups::new(src.to_path_buf(), None);
         fs::create_dir_all(b.staging().join("r1")).unwrap();
         fs::write(b.staging().join("r1").join("manifest.json"), serde_json::to_vec(&manifest(&[("../config.db", 1)])).unwrap()).unwrap();
         fs::write(b.staging().join("pending"), "r1").unwrap();
@@ -1656,7 +1654,7 @@ mod tests {
     #[test]
     fn left_over_staging_is_cleared() {
         let src = dir("clean");
-        let b = Backups::new(src, None);
+        let b = Backups::new(src.to_path_buf(), None);
         fs::create_dir_all(b.staging().join("r1")).unwrap();
         fs::create_dir_all(b.staging().join("r2")).unwrap();
         fs::write(b.staging().join("upload-1-x.apb"), "x").unwrap();

@@ -599,6 +599,59 @@ pub(crate) mod tests {
         serde_json::from_str(&std::fs::read_to_string(file).unwrap()).unwrap()
     }
 
+    /// A test's own empty directory under the temp dir, removed with all in it
+    /// when dropped (declare it first, so that it outlives the store using it).
+    pub struct TestDir(std::path::PathBuf);
+
+    impl TestDir {
+        pub fn new(name: &str) -> TestDir {
+            static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let dir = std::env::temp_dir().join(format!("apctl-{name}-{}-{seq}", std::process::id()));
+            // One left by a run that was killed, with a process id used again.
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            TestDir(dir)
+        }
+    }
+
+    impl std::ops::Deref for TestDir {
+        type Target = std::path::Path;
+
+        fn deref(&self) -> &std::path::Path {
+            &self.0
+        }
+    }
+
+    impl AsRef<std::path::Path> for TestDir {
+        fn as_ref(&self) -> &std::path::Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TestDir {
+        fn drop(&mut self) {
+            // A store's writer thread can still be closing its files: once it
+            // has, nothing more appears in the directory.
+            for _ in 0..20 {
+                if std::fs::remove_dir_all(&self.0).is_ok() || !self.0.exists() {
+                    return;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            }
+        }
+    }
+
+    #[test]
+    fn a_test_dir_goes_when_dropped() {
+        let dir = TestDir::new("testdir");
+        std::fs::write(dir.join("f"), "x").unwrap();
+        let path = dir.to_path_buf();
+        assert!(path.is_dir());
+        drop(dir);
+        assert!(!path.exists());
+    }
+
     #[test]
     fn a_device_s_derived_addresses_are_the_same_hardware() {
         let num = |s: &str| hardware_num(&s.parse().unwrap());

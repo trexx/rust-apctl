@@ -1706,6 +1706,7 @@ mod tests {
     }
 
     use super::*;
+    use crate::model::tests::TestDir;
     use inform::{Flags, Header};
     use wire::decode::KeyUsed;
 
@@ -1741,11 +1742,11 @@ mod tests {
         rx: broadcast::Receiver<LiveMsg>,
         store: Arc<store::Store>,
         writer: Writer,
-        _dir: std::path::PathBuf,
+        _dir: TestDir,
     }
 
     fn harness() -> Harness {
-        let dir = std::env::temp_dir().join(format!("apctl-engine-{}-{}", std::process::id(), rand_suffix()));
+        let dir = TestDir::new("engine");
         let (store, writer) = store::Store::open(&dir).unwrap();
         let live: SharedLive = Default::default();
         let (tx, rx) = broadcast::channel(1024);
@@ -1763,10 +1764,6 @@ mod tests {
                 Ok(rows.iter().map(|d| serde_json::from_str(d).unwrap()).collect())
             })
             .unwrap()
-    }
-
-    fn rand_suffix() -> u64 {
-        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos() as u64
     }
 
     fn events(h: &mut Harness) -> Vec<(&'static str, Option<String>)> {
@@ -1847,7 +1844,7 @@ mod tests {
 
     #[test]
     fn restart_of_the_controller_does_not_reconnect_everyone() {
-        let dir = std::env::temp_dir().join(format!("apctl-restore-{}-{}", std::process::id(), rand_suffix()));
+        let dir = TestDir::new("restore");
         let feed = |e: &mut Engine, ts| e.handle(Input::Inform { ts, peer: "x".into(), decoded: decoded(inform(AP1, 1000 + ts, &[(C1, "b1")])) });
         {
             let (_store, writer) = store::Store::open(&dir).unwrap();
@@ -1866,12 +1863,11 @@ mod tests {
             .filter_map(|m| match m { LiveMsg::Event(ev) => Some(ev.kind), _ => None })
             .collect();
         assert!(kinds.is_empty(), "{kinds:?}");
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
     fn a_long_outage_gives_the_aps_time_to_inform() {
-        let dir = std::env::temp_dir().join(format!("apctl-outage-{}-{}", std::process::id(), rand_suffix()));
+        let dir = TestDir::new("outage");
         {
             let (_store, writer) = store::Store::open(&dir).unwrap();
             let (tx, _rx) = broadcast::channel(1024);
@@ -1891,12 +1887,11 @@ mod tests {
         // An AP that never informs again: its clients go an hour into the run.
         e.handle(Input::Tick(7200 + 3601));
         assert_eq!(kinds(), [EventKind::ClientDisconnected]);
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
     fn unchanged_rows_are_written_once_a_minute() {
-        let dir = std::env::temp_dir().join(format!("apctl-written-{}-{}", std::process::id(), rand_suffix()));
+        let dir = TestDir::new("written");
         let (store, writer) = store::Store::open(&dir).unwrap();
         let (tx, _rx) = broadcast::channel(1024);
         let mut e = Engine::new(writer.clone(), Default::default(), Default::default(), tx);
@@ -1920,7 +1915,6 @@ mod tests {
         assert_eq!(stored(device).0, 30);
         feed(&mut e, 90, "b");
         assert_eq!((stored(device).0, stored(client).0), (90, 90), "last_seen moves on once a minute");
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -1970,7 +1964,7 @@ mod tests {
     fn syslog_keys_are_tried_once_per_unknown_sender() {
         let mut keys = KeyStore::default();
         keys.insert_syslog(AP1, &hex::encode([7u8; 32])).unwrap();
-        let dir = std::env::temp_dir().join(format!("apctl-syslog-{}-{}", std::process::id(), rand_suffix()));
+        let dir = TestDir::new("syslog");
         let (_store, writer) = store::Store::open(&dir).unwrap();
         let (tx, _rx) = broadcast::channel(1024);
         let live: SharedLive = Default::default();
@@ -2007,14 +2001,13 @@ mod tests {
         send(&mut e, 41, 4, 7);
         assert_eq!((logs(), e.syslog_unknown.len()), (2, SYSLOG_UNKNOWN_MAX));
         assert!(!live.read().unwrap().by_hash_id.contains_key(&u64::from_be_bytes([4; 8])));
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
     fn plain_syslog_names_an_ap_by_its_address_only_without_a_key() {
         let mut keys = KeyStore::default();
         keys.insert_syslog(AP1, &hex::encode([7u8; 32])).unwrap();
-        let dir = std::env::temp_dir().join(format!("apctl-syslog-ip-{}-{}", std::process::id(), rand_suffix()));
+        let dir = TestDir::new("syslog-ip");
         let (_store, writer) = store::Store::open(&dir).unwrap();
         let (tx, mut rx) = broadcast::channel(1024);
         let live: SharedLive = Default::default();
@@ -2033,7 +2026,6 @@ mod tests {
         assert_eq!(events(&mut e, 2, "192.0.2.1", "[ 12.3] Kernel panic - not syncing: Fatal exception"), [(EventKind::ApCrash, AP1.parse().ok())]);
         // An AP without a key logs in plain text: its address names it.
         assert_eq!(events(&mut e, 3, "192.0.2.2", "<14>stamgr: kick-sta-on 6c:ac:c2:00:00:02 wifi1ap1 (reason:Low RSSI rssi:19)"), [(EventKind::ClientKicked, Some(ap2))]);
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -2088,7 +2080,7 @@ mod tests {
 
     #[test]
     fn multicast_rates_count_networks_once_and_clients_each() {
-        let dir = std::env::temp_dir().join(format!("apctl-mcast-{}-{}", std::process::id(), rand_suffix()));
+        let dir = TestDir::new("mcast");
         let (store, writer) = store::Store::open(&dir).unwrap();
         let (tx, _rx) = broadcast::channel(1024);
         let mut e = Engine::new(writer.clone(), Default::default(), Default::default(), tx);
@@ -2105,7 +2097,6 @@ mod tests {
             .read(Db::Metrics, |c| Ok(c.query_row("SELECT tx_pps, rx_pps, rx_bytes_ps, clients FROM mcast_stats WHERE ts = 10 AND type = 'mdns'", [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?))
             .unwrap();
         assert_eq!(row, (10.0, 5.0, 500.0, 1.0));
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -2135,9 +2126,8 @@ mod tests {
         for (ts, name) in [(0, "000001_020000000001_inform"), (1, "000003_020000000002_inform"), (100, "000001_020000000001_inform"), (101, "000003_020000000002_inform")] {
             e.handle(Input::Inform { ts, peer: "x".into(), decoded: decoded(fixture(name)) });
         }
-        let dir = std::env::temp_dir().join(format!("apctl-fixture-writes-{}-{}", std::process::id(), rand_suffix()));
+        let dir = TestDir::new("fixture-writes");
         assert_eq!(store(&dir).unwrap(), 0);
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

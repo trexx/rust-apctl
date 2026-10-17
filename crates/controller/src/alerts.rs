@@ -769,6 +769,7 @@ pub async fn mark_read(State(s): State<AppState>) -> Result<Json<Value>, ApiErro
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::tests::TestDir;
 
     #[test]
     fn offline_after_four_minutes_and_at_most_twice_a_day() {
@@ -836,13 +837,13 @@ mod tests {
         assert_eq!((json!(EventKind::NetworkThreat), EventKind::NetworkThreat.to_string()), (json!("network_threat"), "network_threat".to_string()));
     }
 
-    fn watcher() -> (Watcher, broadcast::Receiver<LiveMsg>) {
-        static SEQ: AtomicU64 = AtomicU64::new(0);
-        let dir = std::env::temp_dir().join(format!("apctl-alerts-{}-{}", std::process::id(), SEQ.fetch_add(1, Ordering::Relaxed)));
+    /// A watcher on a store of its own, its live messages, and the store's directory.
+    fn watcher() -> (Watcher, broadcast::Receiver<LiveMsg>, TestDir) {
+        let dir = TestDir::new("alerts");
         let (store, writer) = Store::open(&dir).unwrap();
         let (tx, rx) = broadcast::channel(64);
         let book = Alerts { writer, tx, seq: 0, open: HashMap::new() };
-        (Watcher { book, store, live: Default::default(), aps: ApWatch::default(), cleared: HashMap::new(), unjudged: HashMap::new() }, rx)
+        (Watcher { book, store, live: Default::default(), aps: ApWatch::default(), cleared: HashMap::new(), unjudged: HashMap::new() }, rx, dir)
     }
 
     /// What live subscribers were told: (action, alert key).
@@ -869,7 +870,7 @@ mod tests {
             sink.offer(ev(EventKind::ApRestarted));
         }
         assert_eq!(sink.dropped.load(Ordering::Relaxed), 3);
-        let (mut w, mut rx) = watcher();
+        let (mut w, mut rx, _dir) = watcher();
         w.event(100, &e);
         assert_eq!(told(&mut rx), [("raised", "ap_restarted")]);
         assert!(w.book.open.is_empty(), "a one-off notice, raised resolved");
@@ -877,7 +878,7 @@ mod tests {
 
     #[tokio::test]
     async fn alert_ids_are_never_reused_and_list_newest_first() {
-        let (mut w, _rx) = watcher();
+        let (mut w, _rx, _dir) = watcher();
         let notice = || Alert::new(Key::ApRestarted, Category::Changes, Severity::Low, Entity::Ap("02:00:00:00:00:aa".parse().unwrap()), "t".into(), "m".into());
         for _ in 0..11 {
             w.book.raise(1000, notice());
@@ -895,7 +896,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_restart_keeps_the_offline_alerts_of_the_day() {
-        let (mut w, _rx) = watcher();
+        let (mut w, _rx, _dir) = watcher();
         let ap: Mac = "02:00:00:00:00:01".parse().unwrap();
         let offline = |severity| Alert::for_device(Key::ApOffline, Category::ApStatus, severity, ap, "t".into(), "m".into());
         // Two drops reported, the AP back after each.
@@ -916,7 +917,7 @@ mod tests {
 
     #[tokio::test]
     async fn connection_failures_open_once_and_clear() {
-        let (mut w, mut rx) = watcher();
+        let (mut w, mut rx, _dir) = watcher();
         w.judge_connections(1000, 2);
         assert!(told(&mut rx).is_empty(), "two clients are not enough");
         w.judge_connections(1000, 3);
@@ -943,7 +944,7 @@ mod tests {
 
     #[tokio::test]
     async fn radio_thresholds_raise_and_clear() {
-        let (mut w, mut rx) = watcher();
+        let (mut w, mut rx, _dir) = watcher();
         let ap: Mac = "02:00:00:00:00:01".parse().unwrap();
         let set: HashSet<Mac> = [ap].into();
         let busy = |cu| HashMap::from([((ap, "na".to_string()), RadioHealth { utilisation: Some(cu), ..Default::default() })]);
@@ -960,7 +961,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_retries_alert_stays_open_while_its_radio_is_quiet() {
-        let (mut w, mut rx) = watcher();
+        let (mut w, mut rx, _dir) = watcher();
         let ap: Mac = "02:00:00:00:00:01".parse().unwrap();
         let set: HashSet<Mac> = [ap].into();
         let radio = |retry_pct, attempts| HashMap::from([((ap, "na".to_string()), RadioHealth { retries_reported: true, retry_pct: Some(retry_pct), attempts, ..Default::default() })]);
@@ -999,7 +1000,7 @@ mod tests {
 
     #[tokio::test]
     async fn open_alerts_are_stored_as_text_and_read_back() {
-        let (mut w, _rx) = watcher();
+        let (mut w, _rx, _dir) = watcher();
         let ap: Mac = "02:00:00:00:00:01".parse().unwrap();
         let set: HashSet<Mac> = [ap].into();
         w.judge_radios(1000, HashMap::from([((ap, "na".to_string()), RadioHealth { utilisation: Some(90.0), ..Default::default() })]), &set, &set);
@@ -1018,7 +1019,7 @@ mod tests {
 
     #[tokio::test]
     async fn radios_are_judged_when_they_reported_through_the_window() {
-        let (w, _rx) = watcher();
+        let (w, _rx, _dir) = watcher();
         let now = 100_000;
         let row = |radio: &str, ts: Ts| {
             let sql = "INSERT INTO radio_stats (mac, radio, ts, cu_total, cu_interf) VALUES ('02:00:00:00:00:01', ?1, ?2, 90, 10)";

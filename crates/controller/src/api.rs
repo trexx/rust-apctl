@@ -1194,29 +1194,30 @@ async fn live_socket(mut socket: WebSocket, mut rx: broadcast::Receiver<Utf8Byte
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::tests::TestDir;
     use axum::body::Body;
     use axum::http::{Request, header};
     use tower::ServiceExt;
 
-    /// The app's state, and the engine's end of its queue (dropping it stops the "engine").
-    fn state() -> (AppState, tokio::sync::mpsc::Receiver<crate::engine::Input>) {
-        let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
-        let dir = std::env::temp_dir().join(format!("apctl-api-{}-{nanos}", std::process::id()));
+    /// The app's state, the engine's end of its queue (dropping it stops the
+    /// "engine"), and the data directory.
+    fn state() -> (AppState, tokio::sync::mpsc::Receiver<crate::engine::Input>, TestDir) {
+        let dir = TestDir::new("api");
         let (store, writer) = Store::open(&dir).unwrap();
         let auth = Arc::new(crate::auth::Auth::new(Default::default(), &store, writer.clone(), Default::default()).unwrap());
         let (engine, engine_rx) = tokio::sync::mpsc::channel(1);
         let (tx, _) = broadcast::channel(1);
         let state = AppState::new(AppStateInner {
-            backups: crate::backup::Backups::new(dir, None),
+            backups: crate::backup::Backups::new(dir.to_path_buf(), None),
             store, vendors: Default::default(), renderer: crate::dryrun::apcfg_renderer(crate::EMULATE_VERSION.into()), auth, engine, live: Default::default(), tx, started: 0, source: "none".into(),
             active: false, writer, inform_url: None, memo: Default::default(), threat_acks: Default::default(),
         });
-        (state, engine_rx)
+        (state, engine_rx, dir)
     }
 
-    fn app() -> (Router, tokio::sync::mpsc::Receiver<crate::engine::Input>) {
-        let (state, engine) = state();
-        (router(state), engine)
+    fn app() -> (Router, tokio::sync::mpsc::Receiver<crate::engine::Input>, TestDir) {
+        let (state, engine, dir) = state();
+        (router(state), engine, dir)
     }
 
     async fn get_json(app: &Router, path: &str) -> Value {
@@ -1227,7 +1228,7 @@ mod tests {
 
     #[tokio::test]
     async fn device_and_client_lists() {
-        let (s, _engine) = state();
+        let (s, _engine, _dir) = state();
         // One AP reporting with a client, one only in the database.
         let (tx, _) = broadcast::channel(16);
         let mut engine = crate::engine::Engine::new(s.writer.clone(), Default::default(), s.live.clone(), tx);
@@ -1289,7 +1290,7 @@ mod tests {
 
     #[tokio::test]
     async fn json_is_gzipped_and_the_live_socket_is_not() {
-        let (app, _engine) = app();
+        let (app, _engine, _dir) = app();
         let res = get(&app, "/api/status").await;
         assert_eq!(res.status(), StatusCode::OK);
         assert_eq!(res.headers().get(header::CONTENT_ENCODING).map(|v| v.to_str().unwrap()), Some("gzip"));
@@ -1313,7 +1314,7 @@ mod tests {
 
     #[tokio::test]
     async fn dry_run_reads_stored_pushes_and_history() {
-        let (s, _engine) = state();
+        let (s, _engine, _dir) = state();
         let (tx, _) = broadcast::channel(16);
         let mut engine = crate::engine::Engine::new(s.writer.clone(), Default::default(), s.live.clone(), tx);
         let header = inform::Header { packet_version: 0, mac: Mac([0; 6]), flags: inform::Flags(0), iv: [0; 16], payload_version: 1, payload_len: 0 };
@@ -1330,7 +1331,7 @@ mod tests {
 
     #[tokio::test]
     async fn events_by_kind_prefix_newest_first() {
-        let (s, _engine) = state();
+        let (s, _engine, _dir) = state();
         let rows = [
             (1, "client_connected", Some("02:00:00:00:00:01")), (2, "ap_online", Some("02:00:00:00:00:01")), (3, "client_roamed", Some("02:00:00:00:00:02")),
             (4, "client_connected", Some("02:00:00:00:00:02")), (5, "config_pushed", Some("02:00:00:00:00:01")), (6, "client_connected", None),
@@ -1357,7 +1358,7 @@ mod tests {
 
     #[tokio::test]
     async fn logs_search_and_catch_up() {
-        let (s, _engine) = state();
+        let (s, _engine, _dir) = state();
         let lines = [(1, "02:00:00:00:00:01", "hostapd", "wlan0: STA joined"), (2, "02:00:00:00:00:02", "kernel", "eth0 link up"), (3, "02:00:00:00:00:01", "hostapd", "wlan1: STA left")];
         for (ts, mac, program, msg) in lines {
             let sql = "INSERT INTO logs (ts, device_mac, program, msg) VALUES (?1, ?2, ?3, ?4)";
@@ -1394,12 +1395,12 @@ mod tests {
     #[tokio::test]
     async fn read_only_mode_keeps_secrets() {
         // No users: read-only, without a login.
-        let (app, _engine) = app();
+        let (app, _engine, _dir) = app();
         assert_eq!(get(&app, "/api/status").await.status(), StatusCode::OK);
         assert_eq!(get(&app, "/api/settings/wlans/w1/passphrase").await.status(), StatusCode::FORBIDDEN);
         assert_eq!(get(&app, "/api/backups/file/apctl-0.1.0-20260101-000000.apb").await.status(), StatusCode::FORBIDDEN);
         // With a login they are served (here: there are no settings yet).
-        let (mut state, _engine) = state();
+        let (mut state, _engine, _dir) = state();
         let file = state.backups.data_dir.join("users");
         std::fs::write(&file, format!("admin:{}\n", crate::auth::hash_password("x").unwrap())).unwrap();
         state.get_mut().auth = Arc::new(crate::auth::Auth::new(crate::auth::Users::load(&file).unwrap(), &state.store, state.writer.clone(), Default::default()).unwrap());
@@ -1410,7 +1411,7 @@ mod tests {
 
     #[tokio::test]
     async fn changes_need_the_csrf_header() {
-        let (mut state, _engine) = state();
+        let (mut state, _engine, _dir) = state();
         let file = state.backups.data_dir.join("users");
         std::fs::write(&file, format!("admin:{}\n", crate::auth::hash_password("x").unwrap())).unwrap();
         let users = crate::auth::Users::load(&file).unwrap();
@@ -1436,7 +1437,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_malformed_request_is_answered_in_json() {
-        let (state, _engine, cookie) = logged_in();
+        let (state, _engine, cookie, _dir) = logged_in();
         let app = router(state);
         let error = |res: Response| async move {
             let status = res.status();
@@ -1461,19 +1462,19 @@ mod tests {
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
     }
 
-    /// The app's state with one user, and that user's session cookie.
-    fn logged_in() -> (AppState, tokio::sync::mpsc::Receiver<crate::engine::Input>, String) {
-        let (mut state, engine) = state();
+    /// The app's state with one user, that user's session cookie, and the data directory.
+    fn logged_in() -> (AppState, tokio::sync::mpsc::Receiver<crate::engine::Input>, String, TestDir) {
+        let (mut state, engine, dir) = state();
         let file = state.backups.data_dir.join("users");
         std::fs::write(&file, format!("admin:{}\n", crate::auth::hash_password("x").unwrap())).unwrap();
         state.get_mut().auth = Arc::new(crate::auth::Auth::new(crate::auth::Users::load(&file).unwrap(), &state.store, state.writer.clone(), Default::default()).unwrap());
         let cookie = format!("{}={}", crate::auth::COOKIE, state.auth.create("admin").unwrap());
-        (state, engine, cookie)
+        (state, engine, cookie, dir)
     }
 
     #[tokio::test]
     async fn saved_backup_settings_are_in_effect_at_once() {
-        let (state, _engine, cookie) = logged_in();
+        let (state, _engine, cookie, _dir) = logged_in();
         let app = router(state);
         let body = json!({ "enabled": false, "frequency": "weekly", "minute_utc": 60, "weekday": 2, "monthday": 1, "keep": 5, "days": 7 });
         let req = Request::put("/api/backups/settings")
@@ -1493,7 +1494,7 @@ mod tests {
 
     #[tokio::test]
     async fn backups_download_with_their_length_and_uncompressed() {
-        let (state, _engine, cookie) = logged_in();
+        let (state, _engine, cookie, _dir) = logged_in();
         let m = crate::backup::create(&state.backups, &state.backups.data_dir, crate::backup::Kind::Manual, 0).unwrap();
         let raw = std::fs::read(state.backups.dir().join(&m.name)).unwrap();
         let app = router(state);
@@ -1516,7 +1517,7 @@ mod tests {
     #[tokio::test]
     async fn the_live_socket_checks_the_origin_and_closes_at_logout() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        let (mut state, _engine) = state();
+        let (mut state, _engine, _dir) = state();
         let file = state.backups.data_dir.join("users");
         std::fs::write(&file, format!("admin:{}\n", crate::auth::hash_password("x").unwrap())).unwrap();
         let users = crate::auth::Users::load(&file).unwrap();
@@ -1560,7 +1561,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_session_used_a_day_later_gets_its_cookie_again() {
-        let (mut state, _engine) = state();
+        let (mut state, _engine, _dir) = state();
         let file = state.backups.data_dir.join("users");
         std::fs::write(&file, format!("admin:{}\n", crate::auth::hash_password("x").unwrap())).unwrap();
         let users = crate::auth::Users::load(&file).unwrap();
@@ -1588,7 +1589,7 @@ mod tests {
 
     #[tokio::test]
     async fn healthz_fails_once_the_engine_has_stopped() {
-        let (app, engine) = app();
+        let (app, engine, _dir) = app();
         assert_eq!(get(&app, "/healthz").await.status(), StatusCode::OK);
         drop(engine); // as when the engine thread panics
         assert_eq!(get(&app, "/healthz").await.status(), StatusCode::SERVICE_UNAVAILABLE);

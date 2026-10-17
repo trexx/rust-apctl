@@ -750,11 +750,10 @@ pub(crate) fn capture() -> (Writer, impl FnOnce(&Path) -> Result<usize>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::tests::TestDir;
 
-    fn temp_dir(name: &str) -> PathBuf {
-        let d = std::env::temp_dir().join(format!("apctl-test-{name}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&d);
-        d
+    fn temp_dir(name: &str) -> TestDir {
+        TestDir::new(&format!("store-{name}"))
     }
 
     #[test]
@@ -810,7 +809,6 @@ mod tests {
         maintenance(&mut conns, now + ROLLUP_GRACE_SECS);
         let m = &conns[Db::Metrics as usize];
         assert_eq!(series(m, &UPLINK, &["bb".into()], now - 3600, now, 1).unwrap().ts.len(), 4);
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -834,7 +832,6 @@ mod tests {
         let five = series(&conns[Db::Metrics as usize], &RADIO, &["aa".into(), "na".into()], now - 600, now, 1).unwrap();
         assert_eq!(five.ts, vec![now - 600]);
         assert_eq!((five.fields["channel"][0], five.fields["bw"][0], five.fields["cu_total"][0]), (Some(149.0), Some(80.0), Some(30.0)));
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -857,7 +854,6 @@ mod tests {
         assert_eq!(apply(&mut conns[Db::Metrics as usize], vec![row(4), row(5), row(6)]).unwrap(), 2);
         let n: i64 = conns[Db::Metrics as usize].query_row("SELECT COUNT(*) FROM mcast_stats", [], |r| r.get(0)).unwrap();
         assert_eq!(n, 1);
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -885,7 +881,6 @@ mod tests {
         };
         assert_eq!(ids("SELECT mac FROM clients ORDER BY mac"), ["named", "recent"]);
         assert_eq!(ids("SELECT id FROM alerts ORDER BY id"), ["new", "open"]);
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -897,7 +892,6 @@ mod tests {
         let n: i64 = store.read(Db::Config, |c| Ok(c.query_row("SELECT COUNT(*) FROM client_aliases", [], |r| r.get(0))?)).unwrap();
         assert_eq!(n, 1, "committed well before the usual one-second batch");
         assert!(!writer.stopped());
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
