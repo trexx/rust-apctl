@@ -1166,8 +1166,9 @@ const RF_EVENTS = new Set(["ap_scan_done", "channel_plan", "radio_changed"]);
  *
  * Invalidations are batched (a burst of messages causes one refetch), the busy
  * lists are refreshed at most every few seconds, and nothing is refetched while
- * the tab is hidden: what was missed is caught up when it shows again. After a
- * reconnect everything is refetched, since messages sent meanwhile are lost.
+ * the tab is hidden: what changed meanwhile is only marked stale, and React
+ * Query's own refetch on return catches it up (once). After a reconnect
+ * everything is refetched, since messages sent meanwhile are lost.
  */
 export function useLiveUpdates(): void {
   const qc = useQueryClient();
@@ -1177,7 +1178,6 @@ export function useLiveUpdates(): void {
     let dropped = false;
     let retry = 1000;
     let reconnectTimer: number | undefined;
-    let alertTimer: number | undefined;
     let flushTimer: number | undefined;
     let flushAt = Infinity;
     // Waiting invalidations by key, each with the earliest time it may run.
@@ -1185,10 +1185,16 @@ export function useLiveUpdates(): void {
     // When each key was last invalidated, for the minimum gaps.
     const last = new Map<string, number>();
 
+    /** Marks `key` stale without refetching: the refetch on the tab's return picks it up. */
+    const markStale = (key: QueryKey) => void qc.invalidateQueries({ queryKey: key, refetchType: "none" });
     const flush = () => {
       flushTimer = undefined;
       flushAt = Infinity;
-      if (document.hidden) return;
+      if (document.hidden) {
+        for (const p of pending.values()) markStale(p.key);
+        pending.clear();
+        return;
+      }
       const now = Date.now();
       for (const [id, p] of pending) {
         if (p.due > now) continue;
@@ -1207,11 +1213,15 @@ export function useLiveUpdates(): void {
       flushAt = due;
       flushTimer = window.setTimeout(flush, Math.max(0, due - Date.now()));
     };
-    /** Invalidates `key` within 750 ms, but no sooner than `gap` ms after the last time. */
-    const invalidate = (key: QueryKey, gap = 0) => {
+    /**
+     * Invalidates `key` in `delay` ms (a burst of messages in that time causes one refetch), but no sooner
+     * than `gap` ms after the last time. While the tab is hidden, it is only marked stale.
+     */
+    const invalidate = (key: QueryKey, gap = 0, delay = 750) => {
+      if (document.hidden) return markStale(key);
       const id = JSON.stringify(key);
       if (pending.has(id)) return;
-      pending.set(id, { key, due: Math.max(Date.now() + 750, (last.get(id) ?? 0) + gap) });
+      pending.set(id, { key, due: Math.max(Date.now() + delay, (last.get(id) ?? 0) + gap) });
       schedule();
     };
     /**
@@ -1224,15 +1234,11 @@ export function useLiveUpdates(): void {
       }
       void qc.invalidateQueries({ queryKey: family, type: "inactive", refetchType: "none" });
     };
-    /** Refetches everything: messages were missed. The event and log lists are fetched whole. */
+    /** Refetches everything (on return, if hidden): messages were missed. The event and log lists are fetched whole. */
     const refetchAll = () => {
       liveResetAt = Date.now();
-      void qc.invalidateQueries();
+      void qc.invalidateQueries({ refetchType: document.hidden ? "none" : "active" });
     };
-    const onVisible = () => {
-      if (!document.hidden) schedule();
-    };
-    document.addEventListener("visibilitychange", onVisible);
 
     const onMessage = (m: MessageEvent) => {
       let msg: LiveMsg;
@@ -1279,8 +1285,7 @@ export function useLiveUpdates(): void {
         }
         case "alert":
           // The server stores alerts within a second of announcing them: look then.
-          window.clearTimeout(alertTimer);
-          alertTimer = window.setTimeout(() => void qc.invalidateQueries({ queryKey: keys.alerts() }), 1500);
+          invalidate(keys.alerts(), 0, 1500);
           // The notifier decides whether this browser shows it.
           window.dispatchEvent(new CustomEvent("apctl:alert", { detail: msg }));
           break;
@@ -1314,8 +1319,6 @@ export function useLiveUpdates(): void {
       ws?.close();
       window.clearTimeout(reconnectTimer);
       window.clearTimeout(flushTimer);
-      window.clearTimeout(alertTimer);
-      document.removeEventListener("visibilitychange", onVisible);
     };
   }, [qc]);
 }

@@ -48,7 +48,6 @@ const queryClient = new QueryClient({
       // The live socket refreshes what changes; this only limits refetches on
       // focus and remount (hooks that need fresher data set their own).
       staleTime: 30_000,
-      refetchOnWindowFocus: true,
       // A missing login won't fix itself (show the login page at once), nor
       // will another refusal (an unknown AP, nothing imported): only server
       // errors and lost connections are tried again.
