@@ -19,16 +19,18 @@
 //!   AP's roaming triggers (minimum RSSI, roaming assistant) are recorded.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::sync::Arc;
 
 use axum::Json;
 use axum::extract::{Query, State};
+use axum::response::{IntoResponse, Response};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::api::{ApiError, AppState};
 use crate::engine::Live;
 use crate::api::read;
-use crate::insights::{RangeQuery, ap_name, client_name, memo_read, window};
+use crate::insights::{RangeQuery, ap_name, ap_name_of, client_name, memo_read, window};
 use crate::model::Ts;
 use crate::store::Db;
 
@@ -286,27 +288,32 @@ pub fn attempts(mut events: Vec<ConnEvent>) -> Vec<Attempt> {
 /// that have them.
 pub fn connectivity_stats(attempts: &[Attempt], band: Option<&str>) -> Value {
     let list: Vec<&Attempt> = attempts.iter().filter(|a| band.is_none_or(|b| a.radio.as_deref() == Some(b))).collect();
-    let mut furthest: BTreeMap<&str, usize> = BTreeMap::new();
+    let mut furthest: HashMap<&str, usize> = HashMap::new();
     for a in &list {
         let f = furthest.entry(a.client.as_str()).or_insert(0);
         *f = (*f).max(a.stage);
     }
+    // Clients by the furthest stage they reached (1 association .. 6 success).
+    let mut at = [0usize; STAGES.len() + 1];
+    for s in furthest.values() {
+        at[*s] += 1;
+    }
     let clients = furthest.len();
-    let pct = |past: usize| (clients > 0).then(|| (100.0 * furthest.values().filter(|s| **s > past).count() as f64 / clients as f64).round());
-    let avg = |f: &dyn Fn(&Timings) -> Option<f64>| {
-        let v: Vec<f64> = list.iter().filter_map(|a| f(&a.timings)).collect();
-        (!v.is_empty()).then(|| (v.iter().sum::<f64>() / v.len() as f64).round())
+    let pct = |past: usize| (clients > 0).then(|| (100.0 * at[past + 1..].iter().sum::<usize>() as f64 / clients as f64).round());
+    let avg = |f: fn(&Timings) -> Option<f64>| {
+        let (sum, n) = list.iter().filter_map(|a| f(&a.timings)).fold((0.0, 0usize), |(sum, n), x| (sum + x, n + 1));
+        (n > 0).then(|| (sum / n as f64).round())
     };
     json!({
         "attempts": list.len(),
         "clients": clients,
-        "failed_clients": furthest.values().filter(|s| **s < 6).count(),
+        "failed_clients": clients - at[6],
         "association_pct": pct(1), "authentication_pct": pct(2), "dhcp_pct": pct(3), "dns_pct": pct(4),
         "success_pct": pct(5),
-        "failed_at": STAGES.iter().take(5).enumerate().map(|(i, k)| (k.to_string(), json!(furthest.values().filter(|s| **s == i + 1).count()))).collect::<serde_json::Map<_, _>>(),
+        "failed_at": STAGES.iter().take(5).enumerate().map(|(i, k)| (k.to_string(), json!(at[i + 1]))).collect::<serde_json::Map<_, _>>(),
         "latency_ms": {
-            "association": avg(&|t| t.association), "authentication": avg(&|t| t.authentication), "dhcp": avg(&|t| t.dhcp),
-            "dns": avg(&|t| t.dns), "total": avg(&|t| t.total),
+            "association": avg(|t| t.association), "authentication": avg(|t| t.authentication), "dhcp": avg(|t| t.dhcp),
+            "dns": avg(|t| t.dns), "total": avg(|t| t.total),
         },
     })
 }
@@ -417,10 +424,10 @@ pub fn roam_pairs(roams: &[Roam]) -> Vec<Value> {
         min_rssi: u64,
     }
     // (AP, AP) -> (first to second, second to first, roams per client)
-    type Pair = (Dir, Dir, HashMap<String, u64>);
-    let mut pairs: BTreeMap<(String, String), Pair> = BTreeMap::new();
+    type Pair<'a> = (Dir, Dir, HashMap<&'a str, u64>);
+    let mut pairs: BTreeMap<(&str, &str), Pair> = BTreeMap::new();
     for r in roams {
-        let (a, b) = (r.from.ap.clone(), r.to.ap.clone());
+        let (a, b) = (r.from.ap.as_str(), r.to.ap.as_str());
         let forward = a <= b;
         let key = if forward { (a, b) } else { (b, a) };
         let e = pairs.entry(key).or_default();
@@ -430,7 +437,7 @@ pub fn roam_pairs(roams: &[Roam]) -> Vec<Value> {
         d.fast += u64::from(r.fast);
         d.assistant += u64::from(r.assistant);
         d.min_rssi += u64::from(r.min_rssi);
-        *e.2.entry(r.client.clone()).or_default() += 1;
+        *e.2.entry(r.client.as_str()).or_default() += 1;
     }
     let dir = |d: &Dir| json!({ "attempts": d.attempts, "successes": d.successes, "fast": d.fast, "assistant": d.assistant, "min_rssi": d.min_rssi });
     pairs
@@ -438,8 +445,8 @@ pub fn roam_pairs(roams: &[Roam]) -> Vec<Value> {
         .map(|((a, b), (ab, ba, clients))| {
             let attempts = ab.attempts + ba.attempts;
             let ok = ab.successes + ba.successes;
-            let mut top: Vec<(String, u64)> = clients.into_iter().collect();
-            top.sort_by(|x, y| y.1.cmp(&x.1).then(x.0.cmp(&y.0)));
+            let mut top: Vec<(&str, u64)> = clients.into_iter().collect();
+            top.sort_by(|x, y| y.1.cmp(&x.1).then(x.0.cmp(y.0)));
             top.truncate(10);
             json!({
                 "ap_1": a, "ap_2": b, "attempts": attempts, "successes": ok,
@@ -496,30 +503,35 @@ fn event_of(r: &rusqlite::Row) -> rusqlite::Result<ConnEvent> {
 }
 
 /// The rows of [`COLUMNS`] in a window, optionally one client's, that also
-/// meet `cond`, in `order`.
-fn query_rows(c: &rusqlite::Connection, from: Ts, to: Ts, client: Option<&str>, cond: &str, order: &str) -> rusqlite::Result<Vec<ConnEvent>> {
-    // Two statements: `(?3 IS NULL OR client_mac = ?3)` would keep SQLite off the per-client index.
-    let filter = if client.is_some() { "client_mac = ?3 AND ts >= ?1 AND ts <= ?2" } else { "ts >= ?1 AND ts <= ?2" };
-    let mut stmt = c.prepare(&format!("{COLUMNS} WHERE {filter} {cond} {order}"))?;
+/// meet `cond`: oldest first, or with `newest` at most that many, newest first.
+fn query_rows(c: &rusqlite::Connection, from: Ts, to: Ts, client: Option<&str>, cond: &str, newest: Option<usize>) -> rusqlite::Result<Vec<ConnEvent>> {
+    // Two statements: `(?4 IS NULL OR client_mac = ?4)` would keep SQLite off the per-client index.
+    let filter = if client.is_some() { "client_mac = ?4 AND ts >= ?1 AND ts <= ?2" } else { "ts >= ?1 AND ts <= ?2" };
+    let order = if newest.is_some() { "ORDER BY ts DESC, id DESC" } else { "ORDER BY ts, id" };
+    // A negative limit is none: the same few statements, kept prepared, whatever the limit.
+    let limit = newest.map_or(-1, |n| i64::try_from(n).unwrap_or(i64::MAX));
+    let mut stmt = c.prepare_cached(&format!("{COLUMNS} WHERE {filter} {cond} {order} LIMIT ?3"))?;
     let params: Vec<&dyn rusqlite::ToSql> = match &client {
-        Some(m) => vec![&from, &to, m],
-        None => vec![&from, &to],
+        Some(m) => vec![&from, &to, &limit, m],
+        None => vec![&from, &to, &limit],
     };
     stmt.query_map(params.as_slice(), event_of)?.collect()
 }
+
+/// Only the reports [`attempts`] reads ([`ATTEMPT_TYPES`]).
+const ATTEMPTS_ONLY: &str = "AND event_type IN ('failure', 'soft failure', 'success', 'fixup')";
 
 /// The notifications in a window (optionally one client's, and with
 /// `attempts_only` only the reports [`attempts`] reads), oldest first; or with
 /// `newest`, at most that many, newest first.
 pub fn load_rows(c: &rusqlite::Connection, from: Ts, to: Ts, client: Option<&str>, newest: Option<usize>, attempts_only: bool) -> rusqlite::Result<Vec<ConnEvent>> {
     // The other reports (associations, leaves) are then not parsed for nothing.
-    let types = if attempts_only { format!("AND event_type IN ('{}')", ATTEMPT_TYPES.join("', '")) } else { String::new() };
-    let order = match newest {
-        Some(n) => format!("ORDER BY ts DESC, id DESC LIMIT {n}"),
-        None => "ORDER BY ts, id".into(),
-    };
-    query_rows(c, from, to, client, &types, &order)
+    query_rows(c, from, to, client, if attempts_only { ATTEMPTS_ONLY } else { "" }, newest)
 }
+
+/// Only a client's reports from 10 s before to 15 s after one of its leaves ([`LEAVE_TYPES`]).
+const NEAR_A_LEAVE: &str = "AND EXISTS (SELECT 1 FROM connections l WHERE l.client_mac = connections.client_mac AND l.ts >= connections.ts - 15 \
+                            AND l.ts <= connections.ts + 10 AND l.event_type IN ('sta_roam', 'sta_leave'))";
 
 /// The notifications in a window [`roams`] can pair (optionally one
 /// client's), oldest first: the client's leaves, and its reports from 10 s
@@ -527,11 +539,7 @@ pub fn load_rows(c: &rusqlite::Connection, from: Ts, to: Ts, client: Option<&str
 /// the roams of these are the roams of the whole window.
 fn roam_rows(c: &rusqlite::Connection, from: Ts, to: Ts, client: Option<&str>) -> rusqlite::Result<Vec<ConnEvent>> {
     // Each row looks for a leave nearby through the per-client index; only the rows kept are parsed.
-    let near = format!(
-        "AND EXISTS (SELECT 1 FROM connections l WHERE l.client_mac = connections.client_mac AND l.ts >= connections.ts - 15 AND l.ts <= connections.ts + 10 AND l.event_type IN ('{}'))",
-        LEAVE_TYPES.join("', '")
-    );
-    query_rows(c, from, to, client, &near, "ORDER BY ts, id")
+    query_rows(c, from, to, client, NEAR_A_LEAVE, None)
 }
 
 /// The newest `limit` attempts (failed ones only with `failed`) and, with
@@ -581,8 +589,10 @@ impl Names {
         Ok(Names { aps: pairs(c, AP_NAMES, [])?, clients: pairs(c, "SELECT mac, hostname FROM clients", [])? })
     }
 
-    /// The same for some clients only: every AP (there are few), and the clients asked for.
-    fn load_for(c: &rusqlite::Connection, clients: &[String]) -> rusqlite::Result<Names> {
+    /// The same for some clients only (those of `macs`, as [`macs_of`] lists
+    /// them): every AP (there are few), and the clients asked for.
+    fn load_for<'a>(c: &rusqlite::Connection, macs: impl Iterator<Item = (&'a str, &'a str)>) -> rusqlite::Result<Names> {
+        let clients: Vec<&str> = macs.map(|(_, c)| c).collect::<BTreeSet<_>>().into_iter().collect();
         let mut names = Names { aps: pairs(c, AP_NAMES, [])?, clients: HashMap::new() };
         for chunk in clients.chunks(500) {
             let sql = format!("SELECT mac, hostname FROM clients WHERE mac IN ({})", vec!["?"; chunk.len()].join(", "));
@@ -591,39 +601,39 @@ impl Names {
         Ok(names)
     }
 
-    /// What the APs and clients report now on top, then aliases (which win).
+    /// An AP's display name: what it reports now, else what was stored.
+    fn ap(&self, live: &Live, mac: &str) -> Option<String> {
+        ap_name(live, mac).or_else(|| self.aps.get(mac).cloned().flatten())
+    }
+
+    /// A client's display name: its alias, else what it reports now, else what was stored.
+    fn client(&self, live: &Live, mac: &str) -> Option<String> {
+        client_name(live, mac.parse().ok()).or_else(|| self.clients.get(mac).cloned().flatten())
+    }
+
+    /// The names of every AP and client `live` knows, as [`Names::ap`] and
+    /// [`Names::client`] give them, on top.
     pub fn add_live(&mut self, live: &Live) {
-        let put = |map: &mut HashMap<String, Option<String>>, mac: &inform::Mac, name: &Option<String>| {
-            let e = map.entry(mac.to_string()).or_default();
-            if name.is_some() {
-                e.clone_from(name);
-            }
-        };
-        for (mac, d) in &live.devices {
-            put(&mut self.aps, mac, &d.snapshot.ap.hostname);
+        for mac in live.devices.keys().chain(live.known_devices.keys()) {
+            let m = mac.to_string();
+            let name = ap_name_of(live, mac).or_else(|| self.aps.remove(&m).flatten());
+            self.aps.insert(m, name);
         }
-        for mac in live.known_devices.keys() {
-            put(&mut self.aps, mac, &None);
-        }
-        for (mac, c) in &live.clients {
-            put(&mut self.clients, mac, &c.sample.hostname);
-        }
-        for (mac, a) in live.aliases.iter().filter(|(_, a)| a.alias.is_some()) {
-            put(&mut self.clients, mac, &a.alias);
+        for mac in live.clients.keys().chain(live.aliases.iter().filter(|(_, a)| a.alias.is_some()).map(|(m, _)| m)) {
+            let m = mac.to_string();
+            let name = client_name(live, Some(*mac)).or_else(|| self.clients.remove(&m).flatten());
+            self.clients.insert(m, name);
         }
     }
 }
 
-/// Display names (aliases first) of the APs and clients named in a response,
-/// for the ones that have one: what they report now, else what was stored.
-async fn names<'a>(s: &AppState, macs: impl Iterator<Item = (&'a str, &'a str)>) -> Result<(HashMap<String, String>, HashMap<String, String>), ApiError> {
+/// Display names of the APs and clients of `macs`, for the ones that have
+/// one, by AP and by client.
+fn names<'a>(stored: &Names, live: &Live, macs: impl Iterator<Item = (&'a str, &'a str)>) -> (BTreeMap<String, String>, BTreeMap<String, String>) {
     let (aps, clients): (BTreeSet<&str>, BTreeSet<&str>) = macs.unzip();
-    let wanted: Vec<String> = clients.iter().map(|m| m.to_string()).collect();
-    let mut stored = read(&s.store, Db::Config, move |c| Ok(Names::load_for(c, &wanted)?)).await?;
-    let live = s.live.read().unwrap();
-    let aps = aps.into_iter().filter_map(|m| Some((m.to_string(), ap_name(&live, m).or_else(|| stored.aps.remove(m).flatten())?))).collect();
-    let clients = clients.into_iter().filter_map(|m| Some((m.to_string(), client_name(&live, m.parse().ok()).or_else(|| stored.clients.remove(m).flatten())?))).collect();
-    Ok((aps, clients))
+    let aps = aps.into_iter().filter_map(|m| Some((m.to_string(), stored.ap(live, m)?))).collect();
+    let clients = clients.into_iter().filter_map(|m| Some((m.to_string(), stored.client(live, m)?))).collect();
+    (aps, clients)
 }
 
 /// (AP, client) of every attempt and both ends of every roam.
@@ -634,22 +644,22 @@ fn macs_of<'a>(attempts: &'a [Attempt], roams: &'a [Roam]) -> impl Iterator<Item
 
 /// GET /api/site/connectivity: connection success per client and stage, for
 /// all bands and each band.
-pub async fn connectivity(State(s): State<AppState>, Query(q): Query<RangeQuery>) -> Result<Json<Value>, ApiError> {
+pub async fn connectivity(State(s): State<AppState>, Query(q): Query<RangeQuery>) -> Result<Json<Arc<Value>>, ApiError> {
     let (from, to, tier) = window(&q);
     // Every report in the window is read and parsed: the result is reused for a while.
-    let bands = memo_read(&s, Db::Config, "connectivity", &q, tier, move |c| {
+    let got = memo_read(&s, Db::Config, "connectivity", &q, tier, move |c| {
         let list = attempts(load_rows(c, from, to, None, None, true)?);
         let mut bands = serde_json::Map::new();
+        // All bands, and each band with attempts.
         for b in [None, Some("ng"), Some("na"), Some("6e")] {
-            let v = connectivity_stats(&list, b);
-            if b.is_none() || v["attempts"].as_u64().unwrap_or(0) > 0 {
-                bands.insert(b.unwrap_or("all").into(), v);
+            if b.is_none_or(|b| list.iter().any(|a| a.radio.as_deref() == Some(b))) {
+                bands.insert(b.unwrap_or("all").into(), connectivity_stats(&list, b));
             }
         }
-        Ok(bands)
+        Ok(Value::Object(serde_json::Map::from_iter([("bands".to_string(), Value::Object(bands))])))
     })
     .await?;
-    Ok(Json(json!({ "bands": *bands })))
+    Ok(Json(got))
 }
 
 #[derive(Deserialize)]
@@ -673,8 +683,13 @@ pub async fn list(State(s): State<AppState>, Query(q): Query<ListQuery>) -> Resu
     let client = q.client.map(|c| c.to_ascii_lowercase());
     let limit = q.limit.unwrap_or(500).min(5000);
     let with_roams = q.roams.unwrap_or(true);
-    let (list, r) = read(&s.store, Db::Config, move |c| Ok(newest(c, from, to, client.as_deref(), limit, q.failed, with_roams)?)).await?;
-    let (aps, clients) = names(&s, macs_of(&list, &r)).await?;
+    let (list, r, stored) = read(&s.store, Db::Config, move |c| {
+        let (list, r) = newest(c, from, to, client.as_deref(), limit, q.failed, with_roams)?;
+        let stored = Names::load_for(c, macs_of(&list, &r))?;
+        Ok((list, r, stored))
+    })
+    .await?;
+    let (aps, clients) = names(&stored, &s.live.read().unwrap(), macs_of(&list, &r));
     Ok(Json(json!({ "attempts": list, "roams": r, "ap_names": aps, "client_names": clients })))
 }
 
@@ -694,21 +709,34 @@ pub struct RoamingQuery {
 
 /// GET /api/roaming: the newest roams in the window (default two days), with
 /// totals, per-AP-pair and per-client figures over all of them.
-pub async fn roaming(State(s): State<AppState>, Query(q): Query<RoamingQuery>) -> Result<Json<Value>, ApiError> {
+pub async fn roaming(State(s): State<AppState>, Query(q): Query<RoamingQuery>) -> Result<Response, ApiError> {
     let range = RangeQuery { range: q.range.or(Some(2 * 86400)), from: q.from, to: q.to, ..Default::default() };
     let (from, to, tier) = window(&range);
-    // Roams newest first, and the figures over all of them, reused for a while.
+    // Roams newest first, the figures over all of them and the stored names, reused for a while.
     let got = memo_read(&s, Db::Config, "roaming", &range, tier, move |c| {
         let mut r = roams(&roam_rows(c, from, to, None)?);
         let figures = (roam_totals(&r), roam_pairs(&r), roam_clients(&r));
+        let stored = Names::load_for(c, macs_of(&[], &r))?;
         r.reverse();
-        Ok((r, figures))
+        Ok((r, figures, stored))
     })
     .await?;
-    let (r, (total, pairs, clients)) = &*got;
-    let (aps, names) = names(&s, macs_of(&[], r)).await?;
-    let list = &r[..r.len().min(q.limit.unwrap_or(100).min(1000))];
-    Ok(Json(json!({ "from": from, "to": to, "total": total, "roams": list, "pairs": pairs, "clients": clients, "ap_names": aps, "client_names": names })))
+    let (r, (total, pairs, clients), stored) = &*got;
+    let (ap_names, client_names) = names(stored, &s.live.read().unwrap(), macs_of(&[], r));
+    /// The response, written out from the memoised parts as they are (keys in alphabetical order, as `json!` has them).
+    #[derive(Serialize)]
+    struct Out<'a> {
+        ap_names: BTreeMap<String, String>,
+        client_names: BTreeMap<String, String>,
+        clients: &'a [Value],
+        from: Ts,
+        pairs: &'a [Value],
+        roams: &'a [Roam],
+        to: Ts,
+        total: &'a Value,
+    }
+    let roams = &r[..r.len().min(q.limit.unwrap_or(100).min(1000))];
+    Ok(Json(Out { ap_names, client_names, clients, from, pairs, roams, to, total }).into_response())
 }
 
 #[cfg(test)]
@@ -755,6 +783,12 @@ mod tests {
         assert_eq!(v["success_pct"].as_f64(), Some(67.0));
         assert_eq!(v["failed_at"]["dns"], 1);
         assert_eq!(connectivity_stats(&list, Some("ng"))["clients"], 0);
+    }
+
+    #[test]
+    fn the_report_conditions_name_the_report_types() {
+        assert_eq!(ATTEMPTS_ONLY, format!("AND event_type IN ('{}')", ATTEMPT_TYPES.join("', '")));
+        assert!(NEAR_A_LEAVE.ends_with(&format!("l.event_type IN ('{}'))", LEAVE_TYPES.join("', '"))), "{NEAR_A_LEAVE}");
     }
 
     #[test]

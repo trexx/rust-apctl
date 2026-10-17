@@ -560,7 +560,7 @@ pub async fn density(State(s): State<AppState>, Query(q): Query<RangeQuery>) -> 
     let suffix = TIERS[tier].0;
     // Worked out where the data is read, off the async workers and the live lock.
     let aps = memo_read(&s, Db::Metrics, "density", &q, tier, move |c| {
-        let mut stmt = c.prepare(&format!("SELECT ts, ap_mac, radio, signal FROM client_stats{suffix} WHERE ts >= ?1 AND ts <= ?2 AND signal < 0 AND ap_mac IS NOT NULL"))?;
+        let mut stmt = c.prepare_cached(&format!("SELECT ts, ap_mac, radio, signal FROM client_stats{suffix} WHERE ts >= ?1 AND ts <= ?2 AND signal < 0 AND ap_mac IS NOT NULL"))?;
         let signals = stmt
             .query_map([from, to], |r| Ok((r.get::<_, Ts>(0)?, r.get::<_, String>(1)?, r.get::<_, Option<String>>(2)?, r.get::<_, f64>(3)?)))?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -676,7 +676,7 @@ pub async fn multicast(State(s): State<AppState>, Query(q): Query<RangeQuery>) -
         // From a little before the window: what each sample covers starts before it.
         let (one, mut params) = (if ap.is_some() { " AND mac = ?3" } else { "" }, vec![Sql::Integer(from - if step > 0 { step } else { MCAST_GAP }), Sql::Integer(to)]);
         params.extend(ap.clone().map(Sql::Text));
-        let mut stmt = c.prepare(&format!(
+        let mut stmt = c.prepare_cached(&format!(
             "SELECT mac, type, ts, tx_pps, rx_pps, tx_bytes_ps, rx_bytes_ps FROM mcast_stats{suffix} WHERE ts >= ?1 AND ts <= ?2{one} ORDER BY mac, type, ts"
         ))?;
         let rows = stmt
