@@ -29,6 +29,7 @@ use serde_json::{Value, json};
 use inform::Mac;
 
 use crate::api::{ApiError, AppState};
+use crate::engine::Live;
 use crate::model::Ts;
 use crate::store::{self, Db, Store, Writer};
 
@@ -180,6 +181,8 @@ pub struct Jobs {
 }
 
 impl Jobs {
+    /// Queues upgrades (an AP already queued or upgrading is not queued again).
+    /// A queue stopped by a failure stays stopped until it is resumed.
     pub fn enqueue(&mut self, jobs: Vec<Job>) {
         for j in jobs {
             let busy = self.current.as_ref().is_some_and(|c| c.mac == j.mac) || self.queue.iter().any(|q| q.mac == j.mac);
@@ -187,8 +190,14 @@ impl Jobs {
                 self.queue.push_back(j);
             }
         }
-        self.stopped = None;
         self.next();
+    }
+
+    /// Starts a queue a failure stopped again; whether it was stopped.
+    pub fn resume(&mut self) -> bool {
+        let stopped = self.stopped.take().is_some();
+        self.next();
+        stopped
     }
 
     fn next(&mut self) {
@@ -221,10 +230,7 @@ impl Jobs {
 
     /// The current job failed: stop the queue so a problem is not repeated on every AP.
     pub fn failed(&mut self, mac: &Mac, why: &str) -> Option<Job> {
-        if !self.current.as_ref().is_some_and(|j| j.mac == *mac) {
-            return None;
-        }
-        let j = self.current.take()?;
+        let j = self.current.take_if(|j| j.mac == *mac)?;
         if !self.queue.is_empty() {
             self.stopped = Some(format!("{} failed: {why}", j.name.clone().unwrap_or_else(|| j.mac.to_string())));
         }
@@ -237,11 +243,8 @@ impl Jobs {
     }
 
     pub fn cancel_queued(&mut self) -> usize {
-        let n = self.queue.len() + usize::from(self.current.as_ref().is_some_and(|j| j.state == JobState::Queued));
+        let n = self.queue.len() + usize::from(self.current.take_if(|j| j.state == JobState::Queued).is_some());
         self.queue.clear();
-        if self.current.as_ref().is_some_and(|j| j.state == JobState::Queued) {
-            self.current = None;
-        }
         self.stopped = None;
         n
     }
@@ -249,8 +252,7 @@ impl Jobs {
     /// Drops a forgotten AP's job, queued or current; the next one starts.
     pub fn remove(&mut self, mac: &Mac) {
         self.queue.retain(|j| j.mac != *mac);
-        if self.current.as_ref().is_some_and(|j| j.mac == *mac) {
-            self.current = None;
+        if self.current.take_if(|j| j.mac == *mac).is_some() {
             self.next();
         }
     }
@@ -261,10 +263,12 @@ impl Jobs {
 pub enum Op {
     Enqueue(Vec<Job>),
     CancelQueued,
+    /// Starts a queue stopped by a failure again.
+    Resume,
 }
 
 impl Op {
-    /// Makes the change; how many upgrades it queued or cancelled.
+    /// Makes the change; how many upgrades it queued or cancelled (resuming: 1 if the queue was stopped).
     pub fn apply(self, jobs: &mut Jobs) -> usize {
         match self {
             Op::Enqueue(new) => {
@@ -277,6 +281,13 @@ impl Op {
                 let n = jobs.cancel_queued();
                 tracing::info!("firmware: {n} queued upgrade(s) cancelled");
                 n
+            }
+            Op::Resume => {
+                let resumed = jobs.resume();
+                if resumed {
+                    tracing::info!("firmware: the upgrade queue resumed");
+                }
+                usize::from(resumed)
             }
         }
     }
@@ -416,8 +427,7 @@ struct ApInfo {
     mesh: bool,
 }
 
-fn aps(s: &AppState) -> Vec<ApInfo> {
-    let live = s.live.read().unwrap();
+fn aps(live: &Live) -> Vec<ApInfo> {
     live.devices
         .iter()
         .map(|(mac, d)| {
@@ -439,7 +449,11 @@ fn aps(s: &AppState) -> Vec<ApInfo> {
 pub async fn index(State(s): State<AppState>) -> Result<Json<Value>, ApiError> {
     let store = s.store.clone();
     let (rels, checked, error) = tokio::task::spawn_blocking(move || releases(&store)).await??;
-    let list: Vec<Value> = aps(&s)
+    let (aps, jobs) = {
+        let live = s.live.read().unwrap();
+        (aps(&live), serde_json::to_value(&live.firmware).map_err(anyhow::Error::from)?)
+    };
+    let list: Vec<Value> = aps
         .into_iter()
         .map(|a| {
             let (platform, rel) = release_for(&rels, a.model.as_deref());
@@ -449,7 +463,6 @@ pub async fn index(State(s): State<AppState>) -> Result<Json<Value>, ApiError> {
             })
         })
         .collect();
-    let jobs = serde_json::to_value(&s.live.read().unwrap().firmware).map_err(anyhow::Error::from)?;
     Ok(Json(json!({ "checked": checked, "error": error, "channel": "release", "active": s.active, "aps": list, "jobs": jobs })))
 }
 
@@ -478,7 +491,7 @@ pub async fn upgrade(State(s): State<AppState>, Json(b): Json<UpgradeBody>) -> R
     crate::api::require_active(&s, "upgrades need")?;
     let store = s.store.clone();
     let (rels, ..) = tokio::task::spawn_blocking(move || releases(&store)).await??;
-    let known = aps(&s);
+    let known = aps(&s.live.read().unwrap());
     let mut skipped = Vec::new();
     let mut wanted: Vec<Mac> = Vec::new();
     for m in &b.macs {
@@ -533,7 +546,7 @@ pub async fn upgrade_url(State(s): State<AppState>, Json(b): Json<UrlBody>) -> R
         return Err(ApiError(StatusCode::BAD_REQUEST, "use an http(s) or ftp URL ending in .bin or .tar".into()));
     }
     let mac = crate::api::parse_mac(&b.mac)?;
-    let a = aps(&s).into_iter().find(|a| a.mac == mac).ok_or_else(|| ApiError(StatusCode::NOT_FOUND, "unknown AP".into()))?;
+    let a = aps(&s.live.read().unwrap()).into_iter().find(|a| a.mac == mac).ok_or_else(|| ApiError(StatusCode::NOT_FOUND, "unknown AP".into()))?;
     if !a.online {
         return Err(ApiError(StatusCode::CONFLICT, "the AP is offline".into()));
     }
@@ -546,6 +559,13 @@ pub async fn upgrade_url(State(s): State<AppState>, Json(b): Json<UrlBody>) -> R
 pub async fn cancel(State(s): State<AppState>) -> Result<Json<Value>, ApiError> {
     let n = change_queue(&s, Op::CancelQueued).await?;
     Ok(Json(json!({ "cancelled": n })))
+}
+
+/// POST /api/firmware/resume: start a queue a failed upgrade stopped again.
+pub async fn resume(State(s): State<AppState>) -> Result<Json<Value>, ApiError> {
+    crate::api::require_active(&s, "upgrades need")?;
+    let n = change_queue(&s, Op::Resume).await?;
+    Ok(Json(json!({ "resumed": n > 0 })))
 }
 
 #[cfg(test)]
@@ -632,9 +652,12 @@ mod tests {
         assert_eq!(command(&mut j, &m("b"), &json!({ "internet": false }), 200).unwrap().unwrap_err(), "the AP has no internet access to download the firmware");
         j.failed(&m("b"), "no internet");
         assert!(j.current.is_none() && j.stopped.is_some() && j.queue.len() == 1);
-        // Starting again clears the stop.
-        j.enqueue(vec![]);
+        // Queuing more does not start a stopped queue; resuming does, once.
+        j.enqueue(vec![job("d")]);
+        assert!(j.current.is_none() && j.stopped.is_some() && j.queue.len() == 2);
+        assert_eq!(Op::Resume.apply(&mut j), 1);
         assert_eq!(j.current.as_ref().map(|c| c.mac), Some(m("c")));
+        assert_eq!(Op::Resume.apply(&mut j), 0, "not stopped");
     }
 
     #[test]
