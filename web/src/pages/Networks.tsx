@@ -1,5 +1,5 @@
 import { Suspense } from "react";
-import { Link } from "react-router-dom";
+import { Link } from "react-router";
 import { useWlans } from "../api";
 import type { Wlan } from "../api";
 import { band, bitrate, bytes, pct1 } from "../format";
@@ -29,7 +29,8 @@ const SpeedLimitsPanel = lazyNamed(
 const uxTone = (v: number | null) =>
   v === null ? "" : v >= 90 ? "tone-good" : v >= 70 ? "tone-warn" : "tone-bad";
 
-function Settings({ w }: { w: Wlan }) {
+/** The SSID's security and other settings, as chips. */
+function SecurityChips({ w }: { w: Wlan }) {
   const s = w.settings;
   // The settings say one thing, the APs broadcast another (e.g. WPA3 enabled but not advertised).
   const wpa3 = (x: string) => /wpa3/i.test(x);
@@ -94,7 +95,7 @@ function WlanPanel({ w }: { w: Wlan }) {
           ))}
         </span>
       </div>
-      <Settings w={w} />
+      <SecurityChips w={w} />
       <div className="wlan-stats">
         <div>
           <div className="muted small">Clients</div>

@@ -1,4 +1,4 @@
-import { Link } from "react-router-dom";
+import { Link } from "react-router";
 import {
   useClientNames,
   useDeviceNames,
@@ -15,7 +15,7 @@ import {
   QueryState,
   Stat,
 } from "../components/common";
-import { SIGNAL, ago, band, dbm, duration, pct } from "../format";
+import { SIGNAL, ago, band, dbm, duration, pct, useNow } from "../format";
 import { Connectivity } from "../components/insights/Connectivity";
 import { DeploymentDensity } from "../components/insights/DeploymentDensity";
 import { MulticastPanel } from "../components/insights/Multicast";
@@ -34,6 +34,7 @@ export function Overview() {
   const s = status.data;
   const names = useDeviceNames();
   const cnames = useClientNames();
+  const now = useNow();
 
   if (devices.isLoading) return <Loading />;
   if (devices.error) return <ErrorNote error={devices.error} />;
@@ -62,11 +63,11 @@ export function Overview() {
           sub={`clients below ${dbm(SIGNAL.fair)}`}
         />
         <Stat
-          label="Shadow feed"
-          value={status.data ? status.data.counters.informs : "—"}
+          label={s?.mode === "shadow" ? "Shadow feed" : "AP reports"}
+          value={s ? s.counters.informs : "—"}
           sub={
-            status.data
-              ? `informs since start, ${status.data.counters.decode_errors} errors`
+            s
+              ? `informs since start, ${s.counters.decode_errors} errors`
               : ""
           }
         />
@@ -79,7 +80,7 @@ export function Overview() {
         {list.map((d) => (
           <Link key={d.mac} to={`/devices/${d.mac}`} className="card card-link">
             <div className="card-head">
-              <Dot ok={d.online} warn={d.reconfiguring} />
+              <Dot ok={d.online} />
               <span className="card-title" title={d.name ?? d.mac}>
                 {d.name ?? d.mac}
               </span>
@@ -120,8 +121,8 @@ export function Overview() {
             <div className="card-foot muted" title={`${d.version} · ${d.ip}`}>
               {d.version} · {d.ip} ·{" "}
               {d.online
-                ? `seen ${ago(d.last_seen)}`
-                : `offline since ${ago(d.last_seen)}`}
+                ? `seen ${ago(d.last_seen, now)}`
+                : `offline since ${ago(d.last_seen, now)}`}
             </div>
           </Link>
         ))}

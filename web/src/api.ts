@@ -1,5 +1,5 @@
 import { useEffect } from "react";
-import { keepPreviousData, queryOptions, useQuery, useQueryClient } from "@tanstack/react-query";
+import { keepPreviousData, useQuery, useQueryClient } from "@tanstack/react-query";
 import type { QueryKey } from "@tanstack/react-query";
 
 export type Mac = string;
@@ -22,7 +22,6 @@ export interface DeviceSummary {
   version: string | null;
   ip: string | null;
   online: boolean;
-  reconfiguring: boolean;
   first_seen: number;
   last_seen: number;
   uptime: number | null;
@@ -196,7 +195,6 @@ export interface DeviceDetail {
     last_seen: number;
     peer: string;
     interval: number;
-    reconfiguring: boolean;
     last_config_push: number | null;
     /** Known from the database only: hasn't reported since apctl started. */
     stored_only?: boolean;
@@ -326,7 +324,8 @@ export interface LogLine {
 
 export interface Status {
   version: string;
-  mode: string;
+  /** Active: apctl manages the APs; shadow: it watches another controller's traffic. */
+  mode: "active" | "shadow";
   source: string;
   started: number;
   now: number;
@@ -372,14 +371,15 @@ async function check(res: Response, handles401 = false): Promise<Response> {
   return res;
 }
 
-async function send<T>(method: string, path: string, body: unknown): Promise<T> {
+/** Sends a JSON request. With `handles401`, a 401 is the caller's HttpError (a failed login) rather than a lost session. */
+async function send<T>(method: string, path: string, body: unknown, { handles401 = false } = {}): Promise<T> {
   const res = await fetch(path, {
     method,
     // The server requires this header on writes (CSRF protection).
     headers: { "Content-Type": "application/json", "X-Requested-With": "apctl" },
     body: JSON.stringify(body),
   });
-  return (await check(res, path === "/api/login")).json() as Promise<T>;
+  return (await check(res, handles401)).json() as Promise<T>;
 }
 
 export const setAlias = (mac: Mac, alias: string, note: string) =>
@@ -421,9 +421,11 @@ export const keys = {
   me: family("me"),
   status: family("status"),
   devices: family("devices"),
+  deviceNames: family("device-names"),
   device: family<[mac: Mac]>("device"),
   clients: family("clients"),
   clientNames: family("client-names"),
+  multicastPeers: family("multicast-peers"),
   client: family<[mac: Mac]>("client"),
   series: family<[table: string, key: string, span: TimeSpan]>("series"),
   events: family<[filter: EventFilter]>("events"),
@@ -479,7 +481,7 @@ export const useMe = () =>
 /** Whether this user may change things: false until /api/me has answered. */
 export const useCanEdit = () => useMe().data?.read_only === false;
 
-export const login = (username: string, password: string) => send<{ user: string }>("POST", "/api/login", { username, password });
+export const login = (username: string, password: string) => send<{ user: string }>("POST", "/api/login", { username, password }, { handles401: true });
 export const logout = () => send<{ ok: boolean }>("POST", "/api/logout", {});
 
 export interface StateSummary {
@@ -649,11 +651,11 @@ export interface PlanEntry {
   name: string | null;
   width: number;
   clients: number;
-  current_channel: number | null;
-  current_score: number | null;
-  current_reasons: string[] | null;
-  suggested_channel: number | null;
-  suggested_score: number | null;
+  current_channel: number;
+  current_score: number;
+  current_reasons: string[];
+  suggested_channel: number;
+  suggested_score: number;
   suggested_reasons: string[];
   change: boolean;
   /** Kept as is: excluded, on a wireless uplink, or being upgraded. */
@@ -842,9 +844,12 @@ export interface Wlan {
   series: { ts: number[]; clients: number[]; download_bps: number[]; upload_bps: number[] };
 }
 
+/** What `useConnections` returns. */
+export type Connections = { attempts: ConnAttempt[]; roams: Roam[]; ap_names: Record<string, string>; client_names: Record<string, string> };
+
 /** Connection attempts and roams, newest first: at most `limit` of each (the server's default is 500); `roams: false` skips the roams. */
 export const useConnections = (span: TimeSpan, opts: { client?: Mac; failed?: boolean; limit?: number; roams?: boolean } = {}) =>
-  useSpanQuery<{ attempts: ConnAttempt[]; roams: Roam[]; ap_names: Record<string, string>; client_names: Record<string, string> }>(
+  useSpanQuery<Connections>(
     keys.connections(span, opts),
     "/api/connections",
     span,
@@ -882,12 +887,17 @@ export interface BackupManifest {
   files: Record<string, { size: number; sha256: string }>;
 }
 
-export const useBackups = () =>
-  useQuery({
-    queryKey: keys.backups(),
-    queryFn: ({ signal }) =>
-      get<{ encrypted: boolean; version: string; settings: BackupSettings; next_run: number | null; backups: BackupMeta[]; restore_pending: boolean; restore_failed: string | null }>("/api/backups", signal),
-  });
+interface Backups {
+  encrypted: boolean;
+  version: string;
+  settings: BackupSettings;
+  next_run: number | null;
+  backups: BackupMeta[];
+  restore_pending: boolean;
+  restore_failed: string | null;
+}
+
+export const useBackups = () => useQuery({ queryKey: keys.backups(), queryFn: getting<Backups>("/api/backups") });
 
 export const saveBackupSettings = (s: BackupSettings) => send("PUT", "/api/backups/settings", s);
 export const createBackup = (days: number) => send<BackupMeta>("POST", "/api/backups", { days });
@@ -954,33 +964,21 @@ export const checkFirmware = () => send<{ platforms: number }>("POST", "/api/fir
 export const upgradeFirmware = (macs: Mac[]) => send<{ queued: number; skipped: { mac: Mac; why: string }[] }>("POST", "/api/firmware/upgrade", { macs });
 export const upgradeFirmwareUrl = (mac: Mac, url: string) => send("POST", "/api/firmware/upgrade-url", { mac, url });
 export const cancelFirmware = () => send<{ cancelled: number }>("POST", "/api/firmware/cancel", {});
+export const resumeFirmware = () => send<{ resumed: boolean }>("POST", "/api/firmware/resume", {});
 
 export const useMulticast = (span: TimeSpan, mac?: Mac) => useSpanQuery<SiteMulticast>(keys.multicast(span, mac), "/api/site/multicast", span, { mac });
 
-export const useRadios = (range: number) =>
-  useQuery({
-    queryKey: keys.rfRadios(range),
-    queryFn: getting<RadioOverview[]>(`/api/rf/radios${qs({ range })}`),
-    refetchInterval: 60_000,
-    placeholderData: keepPreviousData,
-  });
+/** GETs `path` every minute; the previous data stays up while another key's loads. */
+const usePolled = <T>(queryKey: QueryKey, path: string) =>
+  useQuery({ queryKey, queryFn: getting<T>(path), refetchInterval: 60_000, placeholderData: keepPreviousData });
+
+export const useRadios = (range: number) => usePolled<RadioOverview[]>(keys.rfRadios(range), `/api/rf/radios${qs({ range })}`);
 
 export const useNeighbors = (range: number, band: string) =>
-  useQuery({
-    queryKey: keys.rfNeighbors(range, band),
-    queryFn: getting<{ neighbors: Neighbor[]; own_links: OwnLink[] }>(`/api/rf/neighbors${qs({ range, band: bandParam(band) })}`),
-    refetchInterval: 60_000,
-    placeholderData: keepPreviousData,
-  });
+  usePolled<{ neighbors: Neighbor[]; own_links: OwnLink[] }>(keys.rfNeighbors(range, band), `/api/rf/neighbors${qs({ range, band: bandParam(band) })}`);
 
 /** Only how loudly our APs hear each other (no neighbour list). */
-export const useOwnLinks = (range: number) =>
-  useQuery({
-    queryKey: keys.rfLinks(range),
-    queryFn: getting<{ own_links: OwnLink[] }>(`/api/rf/neighbors${qs({ range, links_only: "true" })}`),
-    refetchInterval: 60_000,
-    placeholderData: keepPreviousData,
-  });
+export const useOwnLinks = (range: number) => usePolled<{ own_links: OwnLink[] }>(keys.rfLinks(range), `/api/rf/neighbors${qs({ range, links_only: "true" })}`);
 
 export const useChannelPlan = (band: string, dfs: boolean) =>
   useQuery({
@@ -992,22 +990,39 @@ export const useChannelPlan = (band: string, dfs: boolean) =>
 export const useStatus = (poll = false) =>
   useQuery({ queryKey: keys.status(), queryFn: getting<Status>("/api/status"), refetchInterval: poll ? 15_000 : false });
 
-const devicesQuery = queryOptions({ queryKey: keys.devices(), queryFn: getting<DeviceSummary[]>("/api/devices") });
-const clientsQuery = queryOptions({ queryKey: keys.clients(), queryFn: getting<ClientView[]>("/api/clients") });
-
-export const useDevices = () => useQuery(devicesQuery);
+/** Every AP with its latest report, refreshed by the live socket as they report: for the overview's cards. */
+export const useDevices = () => useQuery({ queryKey: keys.devices(), queryFn: getting<DeviceSummary[]>("/api/devices") });
 
 export const useDevice = (mac: Mac) =>
   useQuery({ queryKey: keys.device(mac), queryFn: getting<DeviceDetail>(`/api/devices/${mac}`) });
 
 /** Every client of the past year, with its latest sample: for the client list. */
-export const useClients = () => useQuery(clientsQuery);
+export const useClients = () => useQuery({ queryKey: keys.clients(), queryFn: getting<ClientView[]>("/api/clients") });
+
+/** A client in a multicast group, as a client's page lists its peers. */
+export type GroupMember = { mac: Mac; name: string };
+
+/** The connected clients in each multicast group, by group. */
+function groupMembers(clients: ClientView[]): Record<string, GroupMember[]> {
+  const by: Record<string, GroupMember[]> = {};
+  for (const c of clients) {
+    if (!c.connected) continue;
+    for (const g of c.sample.multicast?.memberships ?? []) (by[g] ??= []).push({ mac: c.sample.mac, name: displayName(c) });
+  }
+  return by;
+}
 
 /**
- * Something derived from the client list, re-rendering only when it changes.
- * `select` must be a module-level function, so it runs once per fetch.
+ * The connected clients in each multicast group, for a client's page (only fetched when `enabled`). It takes
+ * the whole client list, so it is polled every minute rather than refreshed by the live socket.
  */
-export const useClientsSelect = <T>(select: (clients: ClientView[]) => T, enabled = true) => useQuery({ ...clientsQuery, select, enabled });
+export const useMulticastPeers = (enabled: boolean) =>
+  useQuery({
+    queryKey: keys.multicastPeers(),
+    queryFn: async ({ signal }) => groupMembers(await get<ClientView[]>("/api/clients", signal)),
+    refetchInterval: 60_000,
+    enabled,
+  });
 
 /** Names by MAC, for links. */
 export type Names = Readonly<Record<Mac, string>>;
@@ -1015,8 +1030,17 @@ export type Names = Readonly<Record<Mac, string>>;
 const NO_NAMES: Names = Object.freeze({});
 const deviceNames = (devices: DeviceSummary[]): Names => Object.fromEntries(devices.map((d) => [d.mac, d.name ?? d.mac]));
 
-/** AP names (else their MAC) by MAC; the same object until a name changes. */
-export const useDeviceNames = (): Names => useQuery({ ...devicesQuery, select: deviceNames }).data ?? NO_NAMES;
+/**
+ * AP names (else their MAC) by MAC, in the server's order; the same object until a name changes. Kept apart
+ * from `useDevices`, which refetches as the APs report: the live socket refreshes the names when an AP is
+ * adopted, forgotten or renamed (its new name comes with the config), and the slow poll catches the rest.
+ */
+export const useDeviceNames = (): Names =>
+  useQuery({
+    queryKey: keys.deviceNames(),
+    queryFn: async ({ signal }) => deviceNames(await get<DeviceSummary[]>("/api/devices", signal)),
+    refetchInterval: 300_000,
+  }).data ?? NO_NAMES;
 
 /**
  * Client display names by MAC, for the clients that have one; the same object until a name changes.
@@ -1028,7 +1052,7 @@ export const useClientNames = (): Names =>
 
 /** One client; a 404 (HttpError) means it hasn't been seen since apctl started. */
 export const useClient = (mac: Mac) =>
-  useQuery({ queryKey: keys.client(mac), queryFn: getting<ClientView>(`/api/clients/${mac}`), retry: false });
+  useQuery({ queryKey: keys.client(mac), queryFn: getting<ClientView>(`/api/clients/${mac}`) });
 
 /** `prev` with the samples of `add` (all newer) appended, and those before `from` dropped. */
 function appendSeries(prev: Series, add: Series, from: number): Series {
@@ -1152,6 +1176,9 @@ export const markAlertsRead = () => send("POST", "/api/alerts/read", {});
 /** Event kinds that change what the adoption panel shows. */
 const ADOPTION_EVENTS = new Set(["ap_pending", "ap_adopting", "ap_adopted", "ap_forgotten"]);
 
+/** Event kinds that may change an AP's name, or which APs there are. */
+const NAME_EVENTS = new Set(["ap_seen", "ap_adopted", "ap_forgotten", "config_applied", "settings_changed", "settings_imported"]);
+
 /** Event kinds that change the channel plan and the RF views. */
 const RF_EVENTS = new Set(["ap_scan_done", "channel_plan", "radio_changed"]);
 
@@ -1162,8 +1189,9 @@ const RF_EVENTS = new Set(["ap_scan_done", "channel_plan", "radio_changed"]);
  *
  * Invalidations are batched (a burst of messages causes one refetch), the busy
  * lists are refreshed at most every few seconds, and nothing is refetched while
- * the tab is hidden: what was missed is caught up when it shows again. After a
- * reconnect everything is refetched, since messages sent meanwhile are lost.
+ * the tab is hidden: what changed meanwhile is only marked stale, and React
+ * Query's own refetch on return catches it up (once). After a reconnect
+ * everything is refetched, since messages sent meanwhile are lost.
  */
 export function useLiveUpdates(): void {
   const qc = useQueryClient();
@@ -1173,7 +1201,6 @@ export function useLiveUpdates(): void {
     let dropped = false;
     let retry = 1000;
     let reconnectTimer: number | undefined;
-    let alertTimer: number | undefined;
     let flushTimer: number | undefined;
     let flushAt = Infinity;
     // Waiting invalidations by key, each with the earliest time it may run.
@@ -1181,10 +1208,16 @@ export function useLiveUpdates(): void {
     // When each key was last invalidated, for the minimum gaps.
     const last = new Map<string, number>();
 
+    /** Marks `key` stale without refetching: the refetch on the tab's return picks it up. */
+    const markStale = (key: QueryKey) => void qc.invalidateQueries({ queryKey: key, refetchType: "none" });
     const flush = () => {
       flushTimer = undefined;
       flushAt = Infinity;
-      if (document.hidden) return;
+      if (document.hidden) {
+        for (const p of pending.values()) markStale(p.key);
+        pending.clear();
+        return;
+      }
       const now = Date.now();
       for (const [id, p] of pending) {
         if (p.due > now) continue;
@@ -1203,11 +1236,15 @@ export function useLiveUpdates(): void {
       flushAt = due;
       flushTimer = window.setTimeout(flush, Math.max(0, due - Date.now()));
     };
-    /** Invalidates `key` within 750 ms, but no sooner than `gap` ms after the last time. */
-    const invalidate = (key: QueryKey, gap = 0) => {
+    /**
+     * Invalidates `key` in `delay` ms (a burst of messages in that time causes one refetch), but no sooner
+     * than `gap` ms after the last time. While the tab is hidden, it is only marked stale.
+     */
+    const invalidate = (key: QueryKey, gap = 0, delay = 750) => {
+      if (document.hidden) return markStale(key);
       const id = JSON.stringify(key);
       if (pending.has(id)) return;
-      pending.set(id, { key, due: Math.max(Date.now() + 750, (last.get(id) ?? 0) + gap) });
+      pending.set(id, { key, due: Math.max(Date.now() + delay, (last.get(id) ?? 0) + gap) });
       schedule();
     };
     /**
@@ -1220,15 +1257,11 @@ export function useLiveUpdates(): void {
       }
       void qc.invalidateQueries({ queryKey: family, type: "inactive", refetchType: "none" });
     };
-    /** Refetches everything: messages were missed. The event and log lists are fetched whole. */
+    /** Refetches everything (on return, if hidden): messages were missed. The event and log lists are fetched whole. */
     const refetchAll = () => {
       liveResetAt = Date.now();
-      void qc.invalidateQueries();
+      void qc.invalidateQueries({ refetchType: document.hidden ? "none" : "active" });
     };
-    const onVisible = () => {
-      if (!document.hidden) schedule();
-    };
-    document.addEventListener("visibilitychange", onVisible);
 
     const onMessage = (m: MessageEvent) => {
       let msg: LiveMsg;
@@ -1239,12 +1272,14 @@ export function useLiveUpdates(): void {
       }
       switch (msg.type) {
         case "device":
+          // Only the overview's cards use the whole list; the names have their own query.
           invalidate(keys.devices(), 4000);
           invalidate(keys.device(msg.mac));
           break;
         case "clients":
-          // The message doesn't say which clients changed; at most one client page is open.
-          invalidate(keys.clients(), 4000);
+          // Sent with every report that has clients, without saying which changed. The list holds every
+          // client of the past year, so it follows more slowly; at most one client page is open.
+          invalidate(keys.clients(), 20_000);
           invalidate(keys.client(), 4000);
           break;
         case "event": {
@@ -1255,6 +1290,7 @@ export function useLiveUpdates(): void {
             invalidate(keys.settingsState());
           }
           if (ADOPTION_EVENTS.has(msg.kind)) invalidate(keys.adoption());
+          if (NAME_EVENTS.has(msg.kind)) invalidate(keys.deviceNames(), 5000);
           if (msg.kind.startsWith("ap_upgrade")) invalidate(keys.firmware());
           if (RF_EVENTS.has(msg.kind)) {
             // A scan, a plan run or a channel change can change the plan, and what the radios hear.
@@ -1275,8 +1311,7 @@ export function useLiveUpdates(): void {
         }
         case "alert":
           // The server stores alerts within a second of announcing them: look then.
-          window.clearTimeout(alertTimer);
-          alertTimer = window.setTimeout(() => void qc.invalidateQueries({ queryKey: keys.alerts() }), 1500);
+          invalidate(keys.alerts(), 0, 1500);
           // The notifier decides whether this browser shows it.
           window.dispatchEvent(new CustomEvent("apctl:alert", { detail: msg }));
           break;
@@ -1310,8 +1345,6 @@ export function useLiveUpdates(): void {
       ws?.close();
       window.clearTimeout(reconnectTimer);
       window.clearTimeout(flushTimer);
-      window.clearTimeout(alertTimer);
-      document.removeEventListener("visibilitychange", onVisible);
     };
   }, [qc]);
 }
@@ -1538,10 +1571,10 @@ export interface SiteSettings {
   timezones: string[];
 }
 
-export const useSiteSettings = () => useQuery({ queryKey: keys.settings("site"), queryFn: getting<SiteSettings>("/api/settings/site"), retry: false });
+export const useSiteSettings = () => useQuery({ queryKey: keys.settings("site"), queryFn: getting<SiteSettings>("/api/settings/site") });
 export const useWlanSettings = () => useQuery({ queryKey: keys.settings("wlans"), queryFn: getting<WlanSettingsList>("/api/settings/wlans") });
 export const useDeviceSettings = (mac: Mac) =>
-  useQuery({ queryKey: keys.settings("device", mac), queryFn: getting<DeviceSettings>(`/api/settings/devices/${mac}`), retry: false });
+  useQuery({ queryKey: keys.settings("device", mac), queryFn: getting<DeviceSettings>(`/api/settings/devices/${mac}`) });
 export const wlanPassphrase = (id: string) => get<{ passphrase: string | null }>(`/api/settings/wlans/${id}/passphrase`);
 
 /** Previews (or, with `save`, saves) a change to an SSID, a speed limit, an AP or the site. */
@@ -1608,7 +1641,7 @@ export interface UserGroup {
 }
 
 export const useUserGroups = (enabled = true) =>
-  useQuery({ queryKey: keys.settings("usergroups"), queryFn: getting<{ active: boolean; groups: UserGroup[] }>("/api/settings/usergroups"), enabled, retry: false });
+  useQuery({ queryKey: keys.settings("usergroups"), queryFn: getting<{ active: boolean; groups: UserGroup[] }>("/api/settings/usergroups"), enabled });
 export const setClientSpeedLimit = (mac: Mac, usergroup_id: string | null) => send<{ saved: boolean; what: string }>("PUT", `/api/clients/${mac}/speed-limit`, { usergroup_id });
 
 // ---- Adoption ----

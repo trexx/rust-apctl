@@ -6,7 +6,7 @@ import {
   useRef,
   useState,
 } from "react";
-import { useSearchParams } from "react-router-dom";
+import { useSearchParams } from "react-router";
 import uPlot from "uplot";
 import "uplot/dist/uPlot.min.css";
 import { isFixed, spanBounds } from "../api";

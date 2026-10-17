@@ -1,6 +1,6 @@
 import { useState } from "react";
 import type { ReactNode } from "react";
-import { Link } from "react-router-dom";
+import { Link } from "react-router";
 import { eventData, useDeviceNames, useEvents } from "../api";
 import type { AppEvent } from "../api";
 import { DryRun } from "./DryRun";
@@ -12,10 +12,10 @@ import {
   eventText,
   useUrlTab,
 } from "../components/common";
-import { clock } from "../format";
+import { clock, useNow } from "../format";
 import { ChangeGroups, summarise } from "../components/ConfigDiff";
 
-function Push({ e, ap }: { e: AppEvent; ap: ReactNode }) {
+function Push({ e, ap, now }: { e: AppEvent; ap: ReactNode; now: number }) {
   const [open, setOpen] = useState(false);
   const d = eventData<"config_pushed">(e);
   const s = d.system_cfg ?? {};
@@ -28,7 +28,7 @@ function Push({ e, ap }: { e: AppEvent; ap: ReactNode }) {
   return (
     <div className="cfg-entry">
       <div className="cfg-head">
-        <span className="muted small nowrap">{clock(e.ts)}</span>
+        <span className="muted small nowrap">{clock(e.ts, now)}</span>
         <b>Config sent</b>
         <span>to {ap}</span>
         <span className="muted small cfg-summary">{summary}</span>
@@ -48,6 +48,7 @@ function Push({ e, ap }: { e: AppEvent; ap: ReactNode }) {
 function History() {
   const [device, setDevice] = useState("");
   const names = useDeviceNames();
+  const now = useNow();
   const ev = useEvents({
     kind: "config_pushed,config_applied,settings_imported,settings_changed,radio_changed",
     device: device || undefined,
@@ -74,12 +75,16 @@ function History() {
             <div>
               {events.map((e) => {
                 if (e.kind === "config_pushed")
-                  return <Push key={e.id} e={e} ap={ap(e.device_mac)} />;
+                  return (
+                    <Push key={e.id} e={e} ap={ap(e.device_mac)} now={now} />
+                  );
                 const { label, detail } = eventText(e, names);
                 return (
                   <div key={e.id} className="cfg-entry">
                     <div className="cfg-head">
-                      <span className="muted small nowrap">{clock(e.ts)}</span>
+                      <span className="muted small nowrap">
+                        {clock(e.ts, now)}
+                      </span>
                       <b className="muted">{label}</b>
                       {e.device_mac && <span>{ap(e.device_mac)}</span>}
                       <span className="muted small">{detail}</span>

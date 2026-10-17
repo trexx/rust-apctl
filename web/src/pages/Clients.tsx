@@ -1,5 +1,5 @@
 import { memo, useDeferredValue, useState } from "react";
-import { Link } from "react-router-dom";
+import { Link } from "react-router";
 import { AttemptList } from "../components/Connections";
 import { RangePicker, SpanContext, useTimeSpan } from "../components/Chart";
 import { displayName, useClients } from "../api";
@@ -11,7 +11,7 @@ import {
   Segmented,
   useUrlTab,
 } from "../components/common";
-import { ago, band, duration, phy } from "../format";
+import { ago, band, duration, phy, useNow } from "../format";
 
 type SortKey =
   | "name"
@@ -22,12 +22,10 @@ type SortKey =
   | "uptime"
   | "last_seen";
 
-const name = displayName;
-
 function value(c: ClientView, key: SortKey): string | number {
   switch (key) {
     case "name":
-      return name(c).toLowerCase();
+      return displayName(c).toLowerCase();
     case "ap":
       return (c.ap_name ?? "").toLowerCase();
     case "essid":
@@ -111,8 +109,8 @@ function ClientList({ tabs }: { tabs: React.ReactNode }) {
   // Typing stays responsive however many clients there are: the list
   // follows the filter when React has time.
   const f = useDeferredValue(filter).trim().toLowerCase();
-  // When the list was fetched, in minutes: what "last seen" counts from.
-  const minute = Math.floor(clients.dataUpdatedAt / 60_000);
+  // What "last seen" counts from: a minute's ticks.
+  const now = useNow();
   const rows = (clients.data ?? [])
     .filter((c) => showGone || c.connected)
     .filter(
@@ -128,12 +126,13 @@ function ClientList({ tabs }: { tabs: React.ReactNode }) {
           c.ap_name,
         ].some((v) => v?.toLowerCase().includes(f)),
     )
-    .sort((a, b) => {
-      const x = value(a, sort.key);
-      const y = value(b, sort.key);
+    // Each client's key worked out once, not in every comparison.
+    .map((c) => [value(c, sort.key), c] as const)
+    .sort(([x], [y]) => {
       const cmp = x < y ? -1 : x > y ? 1 : 0;
       return sort.desc ? -cmp : cmp;
-    });
+    })
+    .map(([, c]) => c);
 
   if (clients.isLoading) return <Loading />;
   if (clients.error) return <ErrorNote error={clients.error} />;
@@ -192,7 +191,7 @@ function ClientList({ tabs }: { tabs: React.ReactNode }) {
           </thead>
           <tbody>
             {rows.map((c) => (
-              <ClientRow key={c.sample.mac} c={c} minute={minute} />
+              <ClientRow key={c.sample.mac} c={c} now={now} />
             ))}
           </tbody>
         </table>
@@ -208,17 +207,17 @@ function ClientList({ tabs }: { tabs: React.ReactNode }) {
  */
 const ClientRow = memo(function ClientRow({
   c,
-  minute,
+  now,
 }: {
   c: ClientView;
-  /** The minute "last seen" counts from (Unix minutes). */
-  minute: number;
+  /** What "last seen" counts from (`useNow()`). */
+  now: number;
 }) {
   return (
     <tr className={c.connected ? "" : "dim"}>
       <td>
         <Link to={`/clients/${c.sample.mac}`} title={c.note ?? undefined}>
-          {name(c)}
+          {displayName(c)}
         </Link>
         <div className="small muted">
           {c.alias && c.sample.hostname ? `${c.sample.hostname} · ` : ""}
@@ -254,7 +253,7 @@ const ClientRow = memo(function ClientRow({
           : "—"}
       </td>
       <td>{c.connected ? duration(c.sample.uptime) : "—"}</td>
-      <td>{c.connected ? "now" : ago(c.last_seen, minute * 60)}</td>
+      <td>{c.connected ? "now" : ago(c.last_seen, now)}</td>
     </tr>
   );
 });

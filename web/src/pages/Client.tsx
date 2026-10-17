@@ -1,15 +1,15 @@
 import { useState } from "react";
-import { Link, useParams } from "react-router-dom";
+import { Link, useParams } from "react-router";
 import {
   HttpError,
   displayName,
   keys,
   setAlias,
   useCanEdit,
-  useClientsSelect,
   useClient,
   useDeviceNames,
   useEvents,
+  useMulticastPeers,
   useSeries,
 } from "../api";
 import {
@@ -29,11 +29,20 @@ import {
   Stat,
   useRunner,
 } from "../components/common";
-import { ago, band, bitrate, bytes, compact, duration, phy } from "../format";
+import {
+  ago,
+  band,
+  bitrate,
+  bytes,
+  compact,
+  duration,
+  phy,
+  useNow,
+} from "../format";
 import { mcastLabel, serviceNames } from "../components/insights/Multicast";
 import { ConnectionLog } from "../components/Connections";
 import { ClientActions } from "../components/Actions";
-import type { ClientView, Multicast } from "../api";
+import type { GroupMember, Multicast } from "../api";
 
 /** Keyed by MAC: nothing typed or shown for one client carries over to the next. */
 export function Client() {
@@ -45,11 +54,11 @@ function ClientPage({ mac }: { mac: string }) {
   const [range, setRange] = useTimeSpan(6 * 3600);
   const client = useClient(mac);
   const names = useDeviceNames();
+  const now = useNow();
   const c = client.data;
   const s = c?.sample;
-  // The whole list, for the peers in its multicast groups.
-  const members = useClientsSelect(
-    groupMembers,
+  // The other clients in its multicast groups.
+  const members = useMulticastPeers(
     (s?.multicast?.memberships.length ?? 0) > 0,
   ).data;
   const events = useEvents({ client: mac, limit: 100 });
@@ -123,8 +132,8 @@ function ClientPage({ mac }: { mac: string }) {
                 }
                 sub={
                   c.connected
-                    ? `${s.essid} · ${band(s.radio)} ch ${s.channel}`
-                    : `last seen ${ago(c.last_seen)}`
+                    ? `${s.essid ?? "—"} · ${band(s.radio)}${s.channel ? ` ch ${s.channel}` : ""}`
+                    : `last seen ${ago(c.last_seen, now)}`
                 }
               />
               <Stat
@@ -345,20 +354,6 @@ function AliasHeader(p: {
   );
 }
 
-/** The clients in each multicast group, by group (a `useClientsSelect` select: once per fetch). */
-function groupMembers(
-  clients: ClientView[],
-): ReadonlyMap<string, ClientView[]> {
-  const by = new Map<string, ClientView[]>();
-  for (const c of clients)
-    for (const g of c.sample.multicast?.memberships ?? []) {
-      const list = by.get(g);
-      if (list) list.push(c);
-      else by.set(g, [c]);
-    }
-  return by;
-}
-
 /** What this client sends and receives as multicast/broadcast, from the AP's latest report. */
 function ClientMulticast({
   mac,
@@ -367,19 +362,17 @@ function ClientMulticast({
 }: {
   mac: string;
   m: Multicast;
-  /** `groupMembers` of every client; undefined while loading. */
-  members: ReadonlyMap<string, ClientView[]> | undefined;
+  /** The connected clients in each group; undefined while loading. */
+  members: Record<string, GroupMember[]> | undefined;
 }) {
   const types = Object.entries(m.types)
     .filter(([, c]) => c.tx_pkts + c.rx_pkts > 0)
     .sort(
       (a, b) => b[1].rx_pkts + b[1].tx_pkts - (a[1].rx_pkts + a[1].tx_pkts),
     );
-  // Other clients that joined the same groups.
+  // Other connected clients that joined the same groups.
   const peers = (group: string) =>
-    (members?.get(group) ?? [])
-      .filter((c) => c.sample.mac !== mac)
-      .map(displayName);
+    (members?.[group] ?? []).filter((c) => c.mac !== mac).map((c) => c.name);
   const services = serviceNames(m.services);
   return (
     <>
