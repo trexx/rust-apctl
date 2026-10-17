@@ -15,7 +15,6 @@ mongo = ["dep:mongodb", "dep:tokio", "dep:futures-util", "dep:apcfg"]
 anyhow.workspace = true
 apcfg = { workspace = true, optional = true }
 clap = { workspace = true, features = ["derive"] }
-etherparse.workspace = true
 futures-util = { workspace = true, optional = true }
 getrandom.workspace = true
 hex.workspace = true

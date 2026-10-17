@@ -14,13 +14,12 @@
 //! apart from where "now" falls.
 
 use std::io::Write;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
-use etherparse::PacketBuilder;
 use inform::{Flags, Mac};
 use serde_json::{Value, json};
-use wire::synth::{self, http};
+use wire::synth::{self, Endpoint, http};
 
 const TEMPLATE_INFORM: &str = include_str!("demo/inform.json");
 const TEMPLATE_STATE: &str = include_str!("demo/state.json");
@@ -28,6 +27,7 @@ const TEMPLATE_STATE: &str = include_str!("demo/state.json");
 const SSID: &str = "Homestead";
 const IOT_SSID: &str = "Homestead IoT";
 const CONTROLLER_IP: [u8; 4] = [192, 168, 1, 10];
+const CONTROLLER_MAC: [u8; 6] = [0x0e, 0x5d, 0x7a, 0, 0, 0x10];
 const VERSION: &str = "8.8.11.20161";
 
 struct Ap {
@@ -51,6 +51,9 @@ const APS: [Ap; 3] = [
 /// Signal (dBm) at each location (living room, upstairs, studio) from each AP.
 const SIGNAL: [[i64; 3]; 3] = [[-46, -66, -77], [-69, -49, -79], [-78, -76, -51]];
 
+/// Signal (dBm) at each AP from each other AP on 2.4 GHz; 5 GHz arrives 9 dB weaker.
+const AP_SIGNAL: [[i64; 3]; 3] = [[0, -58, -71], [-58, 0, -74], [-71, -74, 0]];
+
 #[derive(Clone, Copy, PartialEq)]
 enum Kind {
     Phone,
@@ -62,6 +65,17 @@ enum Kind {
     Server,
 }
 
+/// What sets a client apart from the routine.
+#[derive(Clone, Copy, PartialEq)]
+enum Quirk {
+    /// Fails its handshake half the time before connecting.
+    FailsHandshake,
+    /// A weak link: now and then poor experience, and a kick when the signal drops.
+    WeakLink,
+    /// A guest, here for a few hours at the start of the history (instead of a plan).
+    Visitor,
+}
+
 struct Client {
     mac: &'static str,
     hostname: &'static str,
@@ -71,6 +85,7 @@ struct Client {
     iot: bool,
     /// Signal offset from the location's.
     offset: i64,
+    quirk: Option<Quirk>,
     /// (from hour, to hour, location) in UTC; hours past the last entry and
     /// before the first are away.
     plan: &'static [(f64, f64, usize)],
@@ -81,36 +96,33 @@ const ALWAYS_UP: &[(f64, f64, usize)] = &[(0.0, 24.0, 1)];
 const ALWAYS_STUDIO: &[(f64, f64, usize)] = &[(0.0, 24.0, 2)];
 
 const CLIENTS: &[Client] = &[
-    Client { mac: "a4:83:e7:3c:41:0a", hostname: "Sams-iPhone", alias: Some("Sam's iPhone"), kind: Kind::Phone, iot: false, offset: 0,
+    Client { mac: "a4:83:e7:3c:41:0a", hostname: "Sams-iPhone", alias: Some("Sam's iPhone"), kind: Kind::Phone, iot: false, offset: 0, quirk: None,
              plan: &[(0.0, 7.4, 1), (7.4, 8.2, 0), (17.6, 18.4, 0), (18.4, 19.1, 2), (19.1, 23.2, 0), (23.2, 24.0, 1)] },
-    Client { mac: "7c:2e:bd:92:5e:11", hostname: "Pixel-8", alias: Some("Robin's Pixel"), kind: Kind::Phone, iot: false, offset: -3,
+    Client { mac: "7c:2e:bd:92:5e:11", hostname: "Pixel-8", alias: Some("Robin's Pixel"), kind: Kind::Phone, iot: false, offset: -3, quirk: None,
              plan: &[(0.0, 7.0, 1), (7.0, 8.6, 0), (8.6, 12.4, 2), (12.4, 13.1, 0), (13.1, 17.4, 2), (17.4, 22.6, 0), (22.6, 24.0, 1)] },
-    Client { mac: "a0:a4:c5:5b:21:7f", hostname: "WORK-LT-0417", alias: Some("Work laptop"), kind: Kind::Laptop, iot: false, offset: 2,
+    Client { mac: "a0:a4:c5:5b:21:7f", hostname: "WORK-LT-0417", alias: Some("Work laptop"), kind: Kind::Laptop, iot: false, offset: 2, quirk: None,
              plan: &[(8.7, 12.5, 2), (13.0, 17.7, 2)] },
-    Client { mac: "f0:18:98:6e:0c:d2", hostname: "MacBook-Air", alias: None, kind: Kind::Laptop, iot: false, offset: 0,
+    Client { mac: "f0:18:98:6e:0c:d2", hostname: "MacBook-Air", alias: None, kind: Kind::Laptop, iot: false, offset: 0, quirk: None,
              plan: &[(6.9, 7.6, 0), (19.4, 23.1, 0)] },
-    Client { mac: "3c:22:fb:a1:77:40", hostname: "iPad", alias: None, kind: Kind::Tablet, iot: false, offset: -2,
+    Client { mac: "3c:22:fb:a1:77:40", hostname: "iPad", alias: None, kind: Kind::Tablet, iot: false, offset: -2, quirk: None,
              plan: &[(7.0, 7.5, 0), (20.6, 23.0, 1)] },
-    Client { mac: "6c:ac:c2:18:9d:33", hostname: "Galaxy-Tab-S9", alias: None, kind: Kind::Tablet, iot: false, offset: -4,
+    Client { mac: "6c:ac:c2:18:9d:33", hostname: "Galaxy-Tab-S9", alias: None, kind: Kind::Tablet, iot: false, offset: -4, quirk: None,
              plan: &[(15.8, 18.2, 0)] },
-    Client { mac: "98:d6:f7:20:4b:6e", hostname: "LG-webOS-TV", alias: Some("Living room TV"), kind: Kind::Tv, iot: false, offset: -6, plan: ALWAYS_LIVING },
-    Client { mac: "5c:aa:fd:0d:e1:5a", hostname: "Sonos-Kitchen", alias: Some("Kitchen speaker"), kind: Kind::Speaker, iot: false, offset: -8, plan: ALWAYS_LIVING },
-    Client { mac: "48:a6:b8:7f:02:c9", hostname: "Sonos-Bedroom", alias: Some("Bedroom speaker"), kind: Kind::Speaker, iot: false, offset: -5, plan: ALWAYS_UP },
-    Client { mac: "f4:f5:d8:44:9a:10", hostname: "Chromecast", alias: None, kind: Kind::Tv, iot: false, offset: -7, plan: ALWAYS_UP },
-    Client { mac: "dc:a6:32:b7:58:0f", hostname: "raspberrypi", alias: Some("Home Assistant"), kind: Kind::Server, iot: false, offset: -4, plan: ALWAYS_UP },
-    Client { mac: "fc:a1:83:5a:3e:62", hostname: "amazon-echo", alias: None, kind: Kind::Speaker, iot: true, offset: -3, plan: ALWAYS_LIVING },
-    Client { mac: "18:b4:30:6d:12:a5", hostname: "Nest-Thermostat", alias: Some("Thermostat"), kind: Kind::Iot, iot: true, offset: -9, plan: ALWAYS_LIVING },
-    Client { mac: "70:ee:50:3a:19:c4", hostname: "Netatmo-Weather", alias: None, kind: Kind::Iot, iot: true, offset: -6, plan: ALWAYS_STUDIO },
-    Client { mac: "24:0a:c4:91:2f:08", hostname: "esp-greenhouse", alias: Some("Greenhouse sensor"), kind: Kind::Iot, iot: true, offset: -24, plan: ALWAYS_STUDIO },
-    Client { mac: "9c:9c:1f:c2:60:4d", hostname: "esp-doorbell", alias: Some("Doorbell"), kind: Kind::Iot, iot: true, offset: -14, plan: ALWAYS_LIVING },
-    Client { mac: "50:ec:50:4e:aa:17", hostname: "roborock-vacuum", alias: Some("Vacuum"), kind: Kind::Iot, iot: true, offset: -8,
+    Client { mac: "98:d6:f7:20:4b:6e", hostname: "LG-webOS-TV", alias: Some("Living room TV"), kind: Kind::Tv, iot: false, offset: -6, quirk: None, plan: ALWAYS_LIVING },
+    Client { mac: "5c:aa:fd:0d:e1:5a", hostname: "Sonos-Kitchen", alias: Some("Kitchen speaker"), kind: Kind::Speaker, iot: false, offset: -8, quirk: None, plan: ALWAYS_LIVING },
+    Client { mac: "48:a6:b8:7f:02:c9", hostname: "Sonos-Bedroom", alias: Some("Bedroom speaker"), kind: Kind::Speaker, iot: false, offset: -5, quirk: None, plan: ALWAYS_UP },
+    Client { mac: "f4:f5:d8:44:9a:10", hostname: "Chromecast", alias: None, kind: Kind::Tv, iot: false, offset: -7, quirk: None, plan: ALWAYS_UP },
+    Client { mac: "dc:a6:32:b7:58:0f", hostname: "raspberrypi", alias: Some("Home Assistant"), kind: Kind::Server, iot: false, offset: -4, quirk: None, plan: ALWAYS_UP },
+    Client { mac: "fc:a1:83:5a:3e:62", hostname: "amazon-echo", alias: None, kind: Kind::Speaker, iot: true, offset: -3, quirk: None, plan: ALWAYS_LIVING },
+    Client { mac: "18:b4:30:6d:12:a5", hostname: "Nest-Thermostat", alias: Some("Thermostat"), kind: Kind::Iot, iot: true, offset: -9, quirk: None, plan: ALWAYS_LIVING },
+    Client { mac: "70:ee:50:3a:19:c4", hostname: "Netatmo-Weather", alias: None, kind: Kind::Iot, iot: true, offset: -6, quirk: None, plan: ALWAYS_STUDIO },
+    Client { mac: "24:0a:c4:91:2f:08", hostname: "esp-greenhouse", alias: Some("Greenhouse sensor"), kind: Kind::Iot, iot: true, offset: -24, quirk: Some(Quirk::WeakLink), plan: ALWAYS_STUDIO },
+    Client { mac: "9c:9c:1f:c2:60:4d", hostname: "esp-doorbell", alias: Some("Doorbell"), kind: Kind::Iot, iot: true, offset: -14, quirk: Some(Quirk::FailsHandshake), plan: ALWAYS_LIVING },
+    Client { mac: "50:ec:50:4e:aa:17", hostname: "roborock-vacuum", alias: Some("Vacuum"), kind: Kind::Iot, iot: true, offset: -8, quirk: None,
              plan: &[(0.0, 10.2, 0), (10.2, 10.7, 1), (10.7, 11.0, 2), (11.0, 24.0, 0)] },
-    Client { mac: "00:bb:3a:7e:05:b8", hostname: "Kindle", alias: None, kind: Kind::Tablet, iot: false, offset: -2, plan: &[(21.4, 23.6, 1)] },
-    Client { mac: "ac:bc:32:0f:6a:93", hostname: "Guest-iPhone", alias: None, kind: Kind::Phone, iot: false, offset: 0, plan: &[] },
+    Client { mac: "00:bb:3a:7e:05:b8", hostname: "Kindle", alias: None, kind: Kind::Tablet, iot: false, offset: -2, quirk: None, plan: &[(21.4, 23.6, 1)] },
+    Client { mac: "ac:bc:32:0f:6a:93", hostname: "Guest-iPhone", alias: None, kind: Kind::Phone, iot: false, offset: 0, quirk: Some(Quirk::Visitor), plan: &[] },
 ];
-
-/// A guest that was here for a few hours at the start of the history.
-const GUEST: &str = "ac:bc:32:0f:6a:93";
 
 /// A neighbouring network: (bssid, essid, band, channel, width, signal at each AP).
 type Neighbour = (&'static str, &'static str, &'static str, i64, i64, [i64; 3]);
@@ -237,7 +249,7 @@ pub fn state() -> Result<Value> {
 
 /// Where a client is at `ts` (seconds since the epoch), if at home.
 fn location(c: &Client, ts: i64, start: i64) -> Option<usize> {
-    if c.mac == GUEST {
+    if c.quirk == Some(Quirk::Visitor) {
         let since = ts - start;
         return (2 * 3600..5 * 3600 + 900).contains(&since).then_some(0);
     }
@@ -346,7 +358,7 @@ impl Sim {
             match (cur, want) {
                 (None, Some((ap, signal))) => {
                     // The doorbell sometimes fails its handshake first.
-                    if c.hostname == "esp-doorbell" && self.rng.unit() < 0.5 {
+                    if c.quirk == Some(Quirk::FailsHandshake) && self.rng.unit() < 0.5 {
                         out.push((at - 6, ap, self.notif(ap, json!({ "message_type": "STA_ASSOC_TRACKER", "event_type": "failure", "mac": c.mac, "vap": "wifi0ap1",
                             "assoc_delta": "21000", "wpa_auth_failures": "1", "auth_rssi": signal.to_string(), "sta_dc_reason": "4-way handshake timeout" }))));
                         self.log(at - 6, ap, "hostapd", format!("wifi0ap1: AP-STA-POSSIBLE-PSK-MISMATCH {}", c.mac));
@@ -401,9 +413,23 @@ impl Sim {
 
     /// A full status report from AP `i`, after `dt` seconds of traffic.
     fn inform(&mut self, i: usize, ts: i64, dt: f64) -> Value {
-        let ap = &APS[i];
         let hour = ts.rem_euclid(86_400) as f64 / 3600.0;
+        let (stas, vap_traffic) = self.stations(i, ts, dt, hour);
+        let busy = 0.5 + 0.5 * (((hour - 20.0) / 24.0 * std::f64::consts::TAU).cos());
+        let totals = self.count_traffic(i, dt, &vap_traffic);
+        let vaps = self.vaps(i, dt, stas, &vap_traffic);
         let mut p = self.template.clone();
+        for r in p["radio_table"].as_array_mut().into_iter().flatten() {
+            self.radio(r, i, ts, busy, &totals);
+        }
+        self.system(&mut p, i, ts, busy, &totals, vaps);
+        p
+    }
+
+    /// The station tables of AP `i`'s VAPs (2.4 GHz, 5 GHz, IoT) and the (down, up)
+    /// bytes of each over the last `dt` seconds; moves its clients' counters on.
+    fn stations(&mut self, i: usize, ts: i64, dt: f64, hour: f64) -> ([Vec<Value>; 3], [(f64, f64); 3]) {
+        let ap = &APS[i];
         let mut stas: [Vec<Value>; 3] = Default::default();
         let mut vap_traffic = [(0.0f64, 0.0f64); 3];
         for (ci, c) in CLIENTS.iter().enumerate() {
@@ -442,23 +468,32 @@ impl Sim {
                 "wifi_tx_latency_mov": { "avg": if signal < -70 { 12 } else { 2 }, "max": 40, "min": 0 },
             }));
             // Now and then (about hourly and every two hours): poor experience, and a kick.
-            if c.hostname == "esp-greenhouse" && self.rng.unit() < dt / 3600.0 {
+            let weak = c.quirk == Some(Quirk::WeakLink);
+            if weak && self.rng.unit() < dt / 3600.0 {
                 self.log(ts, i, "mcad", format!("wireless_agg_stats.log_sta_anomalies(): bssid={} radio=wifi0 vap=wifi0ap1 sta={} signal={signal} satisfaction_now={sat} anomalies=low_rssi,high_tcp_latency", bssid(ap, "ng", 1), c.mac));
             }
-            if c.hostname == "esp-greenhouse" && signal < -76 && self.rng.unit() < dt / 7200.0 {
+            if weak && signal < -76 && self.rng.unit() < dt / 7200.0 {
                 self.log(ts, i, "stamgr", format!("kick-sta-on {} wifi0ap1 (reason:Low RSSI rssi:{})", c.mac, signal + 95));
             }
         }
-        let busy = 0.5 + 0.5 * (((hour - 20.0) / 24.0 * std::f64::consts::TAU).cos());
+        (stas, vap_traffic)
+    }
+
+    /// Adds the VAPs' traffic to AP `i`'s own counters, and returns them.
+    fn count_traffic(&mut self, i: usize, dt: f64, vap_traffic: &[(f64, f64); 3]) -> ApCounters {
         let c = &mut self.counters[i];
         let (down, up): (f64, f64) = vap_traffic.iter().fold((0.0, 0.0), |a, v| (a.0 + v.0, a.1 + v.1));
         c.tx += up + 400.0 * dt;
         c.rx += down + 900.0 * dt;
         c.pkts += (down + up) / 1000.0;
         c.retries += (down + up) / 1000.0 * 0.05;
-        let (eth_rx, eth_tx, ap_pkts, ap_retries) = (c.rx, c.tx, c.pkts, c.retries);
+        c.clone()
+    }
 
-        let vaps: Vec<Value> = [("ng", 0u8, SSID, 0usize), ("na", 0u8, SSID, 1), ("ng", 1u8, IOT_SSID, 2)]
+    /// AP `i`'s VAP table, each VAP with its stations.
+    fn vaps(&mut self, i: usize, dt: f64, mut stas: [Vec<Value>; 3], vap_traffic: &[(f64, f64); 3]) -> Vec<Value> {
+        let ap = &APS[i];
+        [("ng", 0u8, SSID, 0usize), ("na", 0u8, SSID, 1), ("ng", 1u8, IOT_SSID, 2)]
             .into_iter()
             .map(|(radio, idx, essid, vi)| {
                 let vc = &mut self.vap_counters[i][vi];
@@ -481,51 +516,58 @@ impl Sim {
                     "wifi_tx_attempts": (vc.tx / 1000.0) as i64, "wifi_tx_dropped": 0, "sta_table": sta,
                 })
             })
+            .collect()
+    }
+
+    /// Fills in one of AP `i`'s radios: channel use, counters, neighbours and spectrum.
+    fn radio(&mut self, r: &mut Value, i: usize, ts: i64, busy: f64, totals: &ApCounters) {
+        let ap = &APS[i];
+        let na = r["radio"] == "na";
+        let base = if na { 6.0 } else { 22.0 };
+        let interf = if na { 2 } else { self.rng.range(9, 18) };
+        let self_tx = ((if na { 14.0 } else { 6.0 }) * busy + self.rng.unit() * 3.0) as i64;
+        let total = (base * (0.6 + 0.4 * busy)) as i64 + interf + self_tx;
+        let ath = &mut r["athstats"];
+        ath["cu_total"] = json!(total.min(95));
+        ath["cu_self_tx"] = json!(self_tx);
+        ath["cu_self_rx"] = json!(self_tx / 3);
+        ath["cu_interf"] = json!(interf);
+        ath["noise_floor"] = json!(if na { -96 } else { -93 + self.rng.range(-1, 1) });
+        ath["n_tx_pkts"] = json!(totals.pkts as i64);
+        ath["n_tx_retries"] = json!((totals.retries * if na { 0.7 } else { 1.6 }) as i64);
+        ath["n_rx_pkts"] = json!((totals.pkts * 0.6) as i64);
+        let band = if na { "na" } else { "ng" };
+        let mut scan: Vec<Value> = NEIGHBOURS
+            .iter()
+            .filter(|n| n.2 == band)
+            .map(|n| neighbour(n.0, n.1, band, n.3, n.4, n.5[i] + self.rng.range(-2, 2), false, ""))
             .collect();
-
-        for r in p["radio_table"].as_array_mut().into_iter().flatten() {
-            let na = r["radio"] == "na";
-            let base = if na { 6.0 } else { 22.0 };
-            let interf = if na { 2 } else { self.rng.range(9, 18) };
-            let self_tx = ((if na { 14.0 } else { 6.0 }) * busy + self.rng.unit() * 3.0) as i64;
-            let total = (base * (0.6 + 0.4 * busy)) as i64 + interf + self_tx;
-            let ath = &mut r["athstats"];
-            ath["cu_total"] = json!(total.min(95));
-            ath["cu_self_tx"] = json!(self_tx);
-            ath["cu_self_rx"] = json!(self_tx / 3);
-            ath["cu_interf"] = json!(interf);
-            ath["noise_floor"] = json!(if na { -96 } else { -93 + self.rng.range(-1, 1) });
-            ath["n_tx_pkts"] = json!(ap_pkts as i64);
-            ath["n_tx_retries"] = json!((ap_retries * if na { 0.7 } else { 1.6 }) as i64);
-            ath["n_rx_pkts"] = json!((ap_pkts * 0.6) as i64);
-            let band = if na { "na" } else { "ng" };
-            let mut scan: Vec<Value> = NEIGHBOURS
-                .iter()
-                .filter(|n| n.2 == band)
-                .map(|n| neighbour(n.0, n.1, band, n.3, n.4, n.5[i] + self.rng.range(-2, 2), false, ""))
-                .collect();
-            for (j, other) in APS.iter().enumerate().filter(|(j, _)| *j != i) {
-                let signal = [[0, -58, -71], [-58, 0, -74], [-71, -74, 0]][i][j] + if na { -9 } else { 0 } + self.rng.range(-2, 2);
-                let ch = if na { other.na } else { other.ng };
-                scan.push(neighbour(&bssid(other, band, 0), SSID, band, ch, if na { other.na_bw } else { 20 }, signal, true, other.name));
-            }
-            if !na && i == 2 && ts > self.end_history - 3 * 3600 {
-                scan.push(neighbour(LOOKALIKE.0, LOOKALIKE.1, "ng", LOOKALIKE.2, 20, LOOKALIKE.3 + self.rng.range(-2, 2), false, ""));
-            }
-            r["scan_table"] = json!(scan);
-            let channels: Vec<i64> = if na { vec![36, 40, 44, 48, 52, 56, 60, 64, 100, 104, 108, 112, 116, 120, 124, 128, 132, 136, 140] } else { (1..=13).collect() };
-            r["spectrum_table"] = json!(channels
-                .iter()
-                .map(|ch| {
-                    let others = NEIGHBOURS.iter().filter(|n| n.2 == band && (n.3 - ch).abs() <= if na { 12 } else { 2 }).count() as i64;
-                    let util = (others * if na { 4 } else { 9 }) + self.rng.range(1, 6) + if *ch == if na { ap.na } else { ap.ng } { self_tx } else { 0 };
-                    json!({ "channel": ch, "center_freq": if na { 5000 + ch * 5 } else { 2407 + ch * 5 }, "width": 20,
-                            "utilization": util.min(90), "interference": -96 + others * 3, "interference_type": [], "other_bss_count": others, "total_samples": 120 })
-                })
-                .collect::<Vec<_>>());
-            r["spectrum_table_time"] = json!(1800);
+        for (j, other) in APS.iter().enumerate().filter(|(j, _)| *j != i) {
+            let signal = AP_SIGNAL[i][j] + if na { -9 } else { 0 } + self.rng.range(-2, 2);
+            let ch = if na { other.na } else { other.ng };
+            scan.push(neighbour(&bssid(other, band, 0), SSID, band, ch, if na { other.na_bw } else { 20 }, signal, true, other.name));
         }
+        if !na && i == 2 && ts > self.end_history - 3 * 3600 {
+            scan.push(neighbour(LOOKALIKE.0, LOOKALIKE.1, "ng", LOOKALIKE.2, 20, LOOKALIKE.3 + self.rng.range(-2, 2), false, ""));
+        }
+        r["scan_table"] = json!(scan);
+        let channels: Vec<i64> = if na { vec![36, 40, 44, 48, 52, 56, 60, 64, 100, 104, 108, 112, 116, 120, 124, 128, 132, 136, 140] } else { (1..=13).collect() };
+        r["spectrum_table"] = json!(channels
+            .iter()
+            .map(|ch| {
+                let others = NEIGHBOURS.iter().filter(|n| n.2 == band && (n.3 - ch).abs() <= if na { 12 } else { 2 }).count() as i64;
+                let util = (others * if na { 4 } else { 9 }) + self.rng.range(1, 6) + if *ch == if na { ap.na } else { ap.ng } { self_tx } else { 0 };
+                json!({ "channel": ch, "center_freq": if na { 5000 + ch * 5 } else { 2407 + ch * 5 }, "width": 20,
+                        "utilization": util.min(90), "interference": -96 + others * 3, "interference_type": [], "other_bss_count": others, "total_samples": 120 })
+            })
+            .collect::<Vec<_>>());
+        r["spectrum_table_time"] = json!(1800);
+    }
 
+    /// The rest of AP `i`'s report: who it is, its load and uptime, its uplink's counters
+    /// and the VAP table.
+    fn system(&mut self, p: &mut Value, i: usize, ts: i64, busy: f64, totals: &ApCounters, vaps: Vec<Value>) {
+        let ap = &APS[i];
         let n_clients: i64 = vaps.iter().map(|v| v["num_sta"].as_i64().unwrap_or(0)).sum();
         let cpu = 3.0 + n_clients as f64 * 0.6 + busy * 4.0 + self.rng.unit() * 3.0;
         let mem = 24.0 + n_clients as f64 * 0.3 + self.rng.unit();
@@ -553,13 +595,12 @@ impl Sim {
         p["system-stats"] = json!({ "cpu": format!("{cpu:.1}"), "mem": format!("{mem:.1}"), "uptime": uptime.to_string() });
         if let Some(eth) = p["if_table"].as_array_mut().and_then(|t| t.first_mut()) {
             eth["mac"] = json!(mac);
-            eth["rx_bytes"] = json!(eth_rx as i64);
-            eth["tx_bytes"] = json!(eth_tx as i64);
-            eth["rx_packets"] = json!((eth_rx / 900.0) as i64);
-            eth["tx_packets"] = json!((eth_tx / 600.0) as i64);
+            eth["rx_bytes"] = json!(totals.rx as i64);
+            eth["tx_bytes"] = json!(totals.tx as i64);
+            eth["rx_packets"] = json!((totals.rx / 900.0) as i64);
+            eth["tx_packets"] = json!((totals.tx / 600.0) as i64);
         }
         p["vap_table"] = json!(vaps);
-        p
     }
 }
 
@@ -597,18 +638,11 @@ impl<W: Write> PcapWriter<W> {
 
     fn tcp(&mut self, ts_ms: i64, ap: usize, to_server: bool, data: &[u8]) -> Result<()> {
         let a = &APS[ap];
-        let (apmac, ctrl_mac) = (mac_bytes(a.mac), [0x0e, 0x5d, 0x7a, 0, 0, 0x10]);
-        let port = 41_000 + ap as u16;
+        let (ap_end, controller) = (Endpoint { mac: mac_bytes(a.mac), ip: a.ip, port: 41_000 + ap as u16 }, Endpoint { mac: CONTROLLER_MAC, ip: CONTROLLER_IP, port: 8080 });
         for chunk in data.chunks(32_000) {
             let seq = if to_server { &mut self.seq[ap].0 } else { &mut self.seq[ap].1 };
-            let builder = if to_server {
-                PacketBuilder::ethernet2(apmac, ctrl_mac).ipv4(a.ip, CONTROLLER_IP, 64).tcp(port, 8080, *seq, 65_535)
-            } else {
-                PacketBuilder::ethernet2(ctrl_mac, apmac).ipv4(CONTROLLER_IP, a.ip, 64).tcp(8080, port, *seq, 65_535)
-            };
+            let frame = if to_server { synth::tcp_frame(ap_end, controller, *seq, chunk)? } else { synth::tcp_frame(controller, ap_end, *seq, chunk)? };
             *seq = seq.wrapping_add(chunk.len() as u32);
-            let mut frame = Vec::with_capacity(chunk.len() + 64);
-            builder.write(&mut frame, chunk)?;
             self.record(ts_ms, &frame)?;
         }
         Ok(())
@@ -616,8 +650,8 @@ impl<W: Write> PcapWriter<W> {
 
     fn syslog(&mut self, ts_ms: i64, ap: usize, text: &str) -> Result<()> {
         let a = &APS[ap];
-        let mut frame = Vec::new();
-        PacketBuilder::ethernet2(mac_bytes(a.mac), [0x0e, 0x5d, 0x7a, 0, 0, 0x10]).ipv4(a.ip, CONTROLLER_IP, 64).udp(38_000, 5514).write(&mut frame, text.as_bytes())?;
+        let (from, to) = (Endpoint { mac: mac_bytes(a.mac), ip: a.ip, port: 38_000 }, Endpoint { mac: CONTROLLER_MAC, ip: CONTROLLER_IP, port: 5514 });
+        let frame = synth::udp_frame(from, to, text.as_bytes())?;
         self.record(ts_ms, &frame)
     }
 }
@@ -626,6 +660,13 @@ impl<W: Write> PcapWriter<W> {
 /// `live`) a new report from every AP every 10 seconds, in real time.
 pub fn run(hours: f64, live: bool, out: impl Write) -> Result<()> {
     let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs() as i64;
+    stream(now, hours, live, out)
+}
+
+/// [`run`] with `now` given: the history ends there, and the live part follows it in
+/// real time.
+fn stream(now: i64, hours: f64, live: bool, out: impl Write) -> Result<()> {
+    let started = Instant::now();
     let start = now - (hours * 3600.0) as i64;
     let mut template: Value = serde_json::from_str(TEMPLATE_INFORM)?;
     template["version"] = json!(VERSION);
@@ -644,7 +685,7 @@ pub fn run(hours: f64, live: bool, out: impl Write) -> Result<()> {
     let mut t = start;
     let mut last = vec![start; APS.len()];
     loop {
-        let wall = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs() as i64;
+        let wall = now + started.elapsed().as_secs() as i64;
         if t > wall {
             if !live {
                 break;
@@ -723,7 +764,7 @@ mod tests {
     fn capture_decodes_with_the_state_keys() {
         let keys = wire::keys::KeyStore::from_value(&state().unwrap());
         let mut buf = Vec::new();
-        run(0.5, false, &mut buf).unwrap();
+        stream(1_791_830_666, 0.5, false, &mut buf).unwrap();
         let mut pairer = wire::exchange::Pairer::default();
         let mut informs = 0;
         let mut syslog = 0;
