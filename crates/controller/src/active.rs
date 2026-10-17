@@ -219,16 +219,15 @@ impl Active {
     /// neither the settings nor what it read of the inform changed (most
     /// informs), else a new one. The lock is not held while rendering.
     fn placeholder_render(&self, state: &Arc<Value>, mac: Mac, payload: &Value) -> anyhow::Result<Arc<Render>> {
-        let inputs = apcfg::inform_inputs(payload);
         let last = self.devices.lock().unwrap().get(&mac).and_then(|d| d.render.clone());
-        if let Some(r) = last.filter(|r| std::ptr::eq(r.state.as_ptr(), Arc::as_ptr(state)) && r.inputs == inputs) {
+        if let Some(r) = last.filter(|r| std::ptr::eq(r.state.as_ptr(), Arc::as_ptr(state)) && apcfg::inform_inputs_match(&r.inputs, payload)) {
             return Ok(r);
         }
         let out = self.render(state, mac, payload, PLACEHOLDER)?;
         let site_id = crate::adopt::device_doc(state, &mac).and_then(|d| d["site_id"].as_str()).unwrap_or("");
         let blocked = apcfg::blocked_sta(state, site_id);
         let digest = content_digest(&out.rendered.mgmt_cfg, &out.rendered.system_cfg, &blocked);
-        let r = Arc::new(Render { state: Arc::downgrade(state), inputs, out, blocked, digest });
+        let r = Arc::new(Render { state: Arc::downgrade(state), inputs: apcfg::inform_inputs(payload), out, blocked, digest });
         self.devices.lock().unwrap().entry(mac).or_default().render = Some(r.clone());
         Ok(r)
     }
@@ -1129,6 +1128,31 @@ mod tests {
         assert_eq!(with_cfgversion(&probe.rendered.mgmt_cfg, "0123456789abcdef"), real.rendered.mgmt_cfg);
         assert_eq!(probe.rendered.system_cfg, real.rendered.system_cfg);
         assert_eq!(with_cfgversion("cfgversion=0000000000000000\nx=1\n", "ab"), "cfgversion=ab\nx=1\n");
+    }
+
+    #[test]
+    fn inform_inputs_match_as_the_inputs_compare() {
+        let base = json!({ "fw_caps": 1, "uptime": 5, "vap_table": [{ "name": "ath0", "tx_bytes": 9 }], "port_table": [{ "ifname": "eth0" }] });
+        let inputs = apcfg::inform_inputs(&base);
+        let changed = |f: &dyn Fn(&mut Value)| {
+            let mut p = base.clone();
+            f(&mut p);
+            p
+        };
+        for p in [
+            base.clone(),
+            changed(&|p| p["uptime"] = json!(6)),
+            changed(&|p| p["vap_table"][0]["tx_bytes"] = json!(10)),
+            changed(&|p| p["has_eth1"] = json!(true)),
+            changed(&|p| p["fw_caps"] = json!(2)),
+            changed(&|p| p["vap_table"] = json!([{ "name": "ath0" }, { "name": "ath1" }])),
+            changed(&|p| p["vap_table"] = json!({})),
+            changed(&|p| p["port_table"] = Value::Null),
+            changed(&|p| p["port_table"][0]["ifname"] = json!("eth1")),
+            json!(null),
+        ] {
+            assert_eq!(apcfg::inform_inputs_match(&inputs, &p), apcfg::inform_inputs(&p) == inputs, "{p}");
+        }
     }
 
     #[test]
