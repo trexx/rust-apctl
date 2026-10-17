@@ -375,8 +375,6 @@ function CustomRange({
   const [f0, t0] = spanBounds(value);
   const [from, setFrom] = useState(toLocalInput(f0));
   const [to, setTo] = useState(toLocalInput(t0));
-  const box = useRef<HTMLDivElement>(null);
-  useDismiss(box, onClose);
   // "Now" as of opening the picker, so rendering stays pure.
   const [now] = useState(() => Math.floor(Date.now() / 1000));
   const f = fromLocalInput(from);
@@ -403,7 +401,6 @@ function CustomRange({
   return (
     <div
       className="range-pop panel"
-      ref={box}
       role="dialog"
       aria-label="Custom time range"
     >
@@ -479,6 +476,15 @@ export function RangePicker({
   onChange: (s: TimeSpan) => void;
 }) {
   const [open, setOpen] = useState(false);
+  // The wrapper holds the toggle and the popup, so pressing the toggle
+  // toggles rather than counting as a press outside.
+  const box = useRef<HTMLDivElement>(null);
+  useDismiss(box, () => setOpen(false), open);
+  // Any other pick inside the wrapper (a preset, a step) closes the popup too.
+  const pick = (s: TimeSpan) => {
+    onChange(s);
+    setOpen(false);
+  };
   const fixed = isFixed(value);
   const preset = !fixed && RANGES.some((r) => r.seconds === value.last);
   const [from, to] = spanBounds(value);
@@ -487,11 +493,11 @@ export function RangePicker({
   const step = (dir: -1 | 1) => {
     const now = Math.floor(Date.now() / 1000);
     const t = to + dir * len;
-    if (t >= now - 60) onChange({ last: len });
-    else onChange({ from: Math.max(from + dir * len, now - MAX_AGE), to: t });
+    if (t >= now - 60) pick({ last: len });
+    else pick({ from: Math.max(from + dir * len, now - MAX_AGE), to: t });
   };
   return (
-    <div className="range-picker">
+    <div className="range-picker" ref={box}>
       <button
         className="btn small step"
         aria-label="Earlier"
@@ -513,7 +519,7 @@ export function RangePicker({
         label="Time range"
         options={RANGE_OPTIONS}
         value={fixed ? null : value.last}
-        onChange={(last) => onChange({ last })}
+        onChange={(last) => pick({ last })}
       >
         <button
           className={preset ? "" : "active"}
@@ -532,10 +538,7 @@ export function RangePicker({
         <CustomRange
           value={value}
           onClose={() => setOpen(false)}
-          onApply={(s) => {
-            onChange(s);
-            setOpen(false);
-          }}
+          onApply={pick}
         />
       )}
     </div>
