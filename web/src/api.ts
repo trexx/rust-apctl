@@ -371,14 +371,15 @@ async function check(res: Response, handles401 = false): Promise<Response> {
   return res;
 }
 
-async function send<T>(method: string, path: string, body: unknown): Promise<T> {
+/** Sends a JSON request. With `handles401`, a 401 is the caller's HttpError (a failed login) rather than a lost session. */
+async function send<T>(method: string, path: string, body: unknown, { handles401 = false } = {}): Promise<T> {
   const res = await fetch(path, {
     method,
     // The server requires this header on writes (CSRF protection).
     headers: { "Content-Type": "application/json", "X-Requested-With": "apctl" },
     body: JSON.stringify(body),
   });
-  return (await check(res, path === "/api/login")).json() as Promise<T>;
+  return (await check(res, handles401)).json() as Promise<T>;
 }
 
 export const setAlias = (mac: Mac, alias: string, note: string) =>
@@ -478,7 +479,7 @@ export const useMe = () =>
 /** Whether this user may change things: false until /api/me has answered. */
 export const useCanEdit = () => useMe().data?.read_only === false;
 
-export const login = (username: string, password: string) => send<{ user: string }>("POST", "/api/login", { username, password });
+export const login = (username: string, password: string) => send<{ user: string }>("POST", "/api/login", { username, password }, { handles401: true });
 export const logout = () => send<{ ok: boolean }>("POST", "/api/logout", {});
 
 export interface StateSummary {
@@ -1031,7 +1032,7 @@ export const useClientNames = (): Names =>
 
 /** One client; a 404 (HttpError) means it hasn't been seen since apctl started. */
 export const useClient = (mac: Mac) =>
-  useQuery({ queryKey: keys.client(mac), queryFn: getting<ClientView>(`/api/clients/${mac}`), retry: false });
+  useQuery({ queryKey: keys.client(mac), queryFn: getting<ClientView>(`/api/clients/${mac}`) });
 
 /** `prev` with the samples of `add` (all newer) appended, and those before `from` dropped. */
 function appendSeries(prev: Series, add: Series, from: number): Series {
@@ -1541,10 +1542,10 @@ export interface SiteSettings {
   timezones: string[];
 }
 
-export const useSiteSettings = () => useQuery({ queryKey: keys.settings("site"), queryFn: getting<SiteSettings>("/api/settings/site"), retry: false });
+export const useSiteSettings = () => useQuery({ queryKey: keys.settings("site"), queryFn: getting<SiteSettings>("/api/settings/site") });
 export const useWlanSettings = () => useQuery({ queryKey: keys.settings("wlans"), queryFn: getting<WlanSettingsList>("/api/settings/wlans") });
 export const useDeviceSettings = (mac: Mac) =>
-  useQuery({ queryKey: keys.settings("device", mac), queryFn: getting<DeviceSettings>(`/api/settings/devices/${mac}`), retry: false });
+  useQuery({ queryKey: keys.settings("device", mac), queryFn: getting<DeviceSettings>(`/api/settings/devices/${mac}`) });
 export const wlanPassphrase = (id: string) => get<{ passphrase: string | null }>(`/api/settings/wlans/${id}/passphrase`);
 
 /** Previews (or, with `save`, saves) a change to an SSID, a speed limit, an AP or the site. */
@@ -1611,7 +1612,7 @@ export interface UserGroup {
 }
 
 export const useUserGroups = (enabled = true) =>
-  useQuery({ queryKey: keys.settings("usergroups"), queryFn: getting<{ active: boolean; groups: UserGroup[] }>("/api/settings/usergroups"), enabled, retry: false });
+  useQuery({ queryKey: keys.settings("usergroups"), queryFn: getting<{ active: boolean; groups: UserGroup[] }>("/api/settings/usergroups"), enabled });
 export const setClientSpeedLimit = (mac: Mac, usergroup_id: string | null) => send<{ saved: boolean; what: string }>("PUT", `/api/clients/${mac}/speed-limit`, { usergroup_id });
 
 // ---- Adoption ----
