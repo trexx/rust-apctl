@@ -263,11 +263,19 @@ CREATE TRIGGER IF NOT EXISTS logs_ad AFTER DELETE ON logs BEGIN
 END;
 ";
 
-const LOG_RETENTION: i64 = 14 * 86400;
+const LOG_RETENTION: Ts = 14 * 86400;
+const EVENT_RETENTION: Ts = 365 * 86400;
+const DRYRUN_RETENTION: Ts = 90 * 86400;
+const CONNECTION_RETENTION: Ts = 90 * 86400;
+/// Neighbours not heard for this long are forgotten.
+const NEIGHBOR_RETENTION: Ts = 30 * 86400;
 /// Clients not seen for this long are forgotten, unless they have a name (an
 /// alias). The same rule as a backup's history trim; the engine drops them
 /// from its live view too.
 pub const CLIENT_RETENTION: Ts = 365 * 86400;
+/// Deletes the clients last seen before ?1 that have no name: the retention
+/// above, and a backup's history trim.
+pub const FORGET_OLD_CLIENTS: &str = "DELETE FROM clients WHERE COALESCE(last_seen, 0) < ?1 AND mac NOT IN (SELECT mac FROM client_aliases)";
 /// Resolved alerts are kept this long; open ones until they resolve.
 const ALERT_RETENTION: Ts = 90 * 86400;
 
@@ -579,18 +587,12 @@ fn maintenance(conns: &mut Conns, now: Ts) {
         }
     }
     step("retention of logs", delete_before(logs, "logs", Rows::Rowid, now - LOG_RETENTION));
-    step("retention of events", delete_before(config, "events", Rows::Rowid, now - 365 * 86400));
+    step("retention of events", delete_before(config, "events", Rows::Rowid, now - EVENT_RETENTION));
     step("expiring sessions", config.execute("DELETE FROM sessions WHERE expires < ?1", [now]).map(drop).map_err(Into::into));
-    step("retention of dry runs", delete_before(config, "dryrun_results", Rows::Rowid, now - 90 * 86400));
-    step("retention of connections", delete_before(config, "connections", Rows::Rowid, now - 90 * 86400));
-    step("retention of neighbours", config.execute("DELETE FROM neighbors WHERE last_seen < ?1", [now - 30 * 86400]).map(drop).map_err(Into::into));
-    step(
-        "retention of clients",
-        config
-            .execute("DELETE FROM clients WHERE COALESCE(last_seen, 0) < ?1 AND mac NOT IN (SELECT mac FROM client_aliases)", [now - CLIENT_RETENTION])
-            .map(drop)
-            .map_err(Into::into),
-    );
+    step("retention of dry runs", delete_before(config, "dryrun_results", Rows::Rowid, now - DRYRUN_RETENTION));
+    step("retention of connections", delete_before(config, "connections", Rows::Rowid, now - CONNECTION_RETENTION));
+    step("retention of neighbours", config.execute("DELETE FROM neighbors WHERE last_seen < ?1", [now - NEIGHBOR_RETENTION]).map(drop).map_err(Into::into));
+    step("retention of clients", config.execute(FORGET_OLD_CLIENTS, [now - CLIENT_RETENTION]).map(drop).map_err(Into::into));
     step(
         "retention of alerts",
         config.execute("DELETE FROM alerts WHERE ts < ?1 AND resolved_ts < ?1", [now - ALERT_RETENTION]).map(drop).map_err(Into::into),
