@@ -7,12 +7,20 @@ import {
   startScan,
   useCanEdit,
   useChannelAi,
+  useDeviceNames,
   useDevices,
   useEvents,
 } from "../api";
 import type { ChannelPlanResult } from "../api";
 import { band as bandName, clock, hhmm } from "../format";
-import { ErrorNote, Loading, Outcome, QueryState, useRunner } from "./common";
+import {
+  ErrorNote,
+  Loading,
+  Outcome,
+  QueryState,
+  eventText,
+  useRunner,
+} from "./common";
 
 /**
  * Runs Channel AI actions. The settings checkboxes each send a patch built
@@ -93,6 +101,7 @@ const HOURS = Array.from({ length: 24 }, (_, h) => h);
 export function ChannelAiPanel() {
   const ai = useChannelAi();
   const devices = useDevices();
+  const names = useDeviceNames();
   const canEdit = useCanEdit();
   const runs = useEvents({ kind: "channel_plan", limit: 10 });
   const { busy, msg, run } = useRun();
@@ -103,8 +112,6 @@ export function ChannelAiPanel() {
   const can = d.active && canEdit && !busy;
   const save = (patch: Record<string, unknown>) =>
     void run(async () => (await saveChannelAi(patch)).what);
-  const name = (mac: string) =>
-    devices.data?.find((x) => x.mac === mac)?.name ?? mac;
   return (
     <div className="panel">
       <div className="panel-head">
@@ -238,23 +245,15 @@ export function ChannelAiPanel() {
             ) : (
               <ul className="plain-list">
                 {data.map((e) => {
-                  const r = eventData<"channel_plan">(e);
-                  const changes = r.changes ?? [];
+                  // The event lists' own text, plus why a plan wasn't applied.
+                  const { error, applied } = eventData<"channel_plan">(e);
                   return (
                     <li key={e.id}>
                       <span className="muted nowrap">{clock(e.ts)}</span>{" "}
-                      {r.band ? bandName(r.band) : r.band} ({r.trigger}):{" "}
-                      {changes.length === 0
-                        ? "no clearly better plan, nothing moved"
-                        : changes
-                            .map(
-                              (c) =>
-                                `${c.name ?? name(c.mac)} ${c.from ?? "?"} → ${c.to}`,
-                            )
-                            .join(", ") +
-                          (r.applied
-                            ? ""
-                            : ` (not applied: ${r.error ?? "?"})`)}
+                      {eventText(e, names).detail}
+                      {!applied && error && (
+                        <span className="error"> {error}</span>
+                      )}
                     </li>
                   );
                 })}
