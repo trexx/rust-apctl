@@ -709,7 +709,7 @@ impl Engine {
         let first_seen = prev.as_ref().map(|p| p.first_seen).or(known.as_ref().map(|k| k.first_seen)).unwrap_or(ts);
         let view = match prev {
             Some(p) => DeviceView {
-                // Keep the last full picture while the AP is reconfiguring.
+                // Without a VAP table the inform says nothing of radios, VAPs or clients: keep the last full picture.
                 last_full_inform: if snap.has_vap_table { ts } else { p.last_full_inform },
                 snapshot: if snap.has_vap_table { snap } else { Snapshot { uplink: snap.uplink.or(p.snapshot.uplink), ap: snap.ap, ..p.snapshot } },
                 online: true,
@@ -1457,7 +1457,7 @@ impl Engine {
             });
         }
         if !s.has_vap_table {
-            return; // radio, VAP and client figures are absent or meaningless while restarting
+            return; // no VAP table: radio, VAP and client figures are absent
         }
         for r in &s.radios {
             self.writer.send(Write::Metric {
@@ -1829,6 +1829,22 @@ mod tests {
         let evs = events(&mut h);
         assert!(evs.is_empty(), "{evs:?}");
         assert!(h.live.read().unwrap().clients[&C1.parse().unwrap()].connected);
+    }
+
+    #[test]
+    fn an_ap_with_every_network_off_has_no_clients() {
+        let mut h = harness();
+        h.engine.handle(Input::Inform { ts: 0, peer: "x".into(), decoded: decoded(inform(AP1, 1000, &[(C1, "b1")])) });
+        events(&mut h);
+        // Every SSID off (e.g. by a schedule): the AP still informs, with an empty VAP table.
+        let ts = CLIENT_GRACE_SECS + 5;
+        h.engine.handle(Input::Inform { ts, peer: "x".into(), decoded: decoded(json!({ "mac": AP1, "uptime": 1000 + ts, "vap_table": [] })) });
+        h.engine.handle(Input::Tick(ts + 1));
+        assert_eq!(events(&mut h), vec![("client_disconnected", Some(C1.into()))]);
+        let live = h.live.read().unwrap();
+        let d = &live.devices[&AP1.parse().unwrap()];
+        assert!(d.snapshot.vaps.is_empty() && d.snapshot.clients.is_empty());
+        assert_eq!(d.last_full_inform, ts);
     }
 
     #[test]
