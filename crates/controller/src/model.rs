@@ -2,7 +2,7 @@
 //!
 //! Firmware sends some numbers as strings (`"cpu": "3.9"`), so every field goes
 //! through lenient helpers. A missing field becomes `None` rather than an error:
-//! informs sent while a radio restarts are much shorter than normal ones.
+//! models and firmware versions differ in what they report.
 
 use std::sync::Arc;
 
@@ -166,7 +166,6 @@ pub struct ClientSample {
     /// Seconds connected to this AP.
     pub uptime: Option<i64>,
     pub satisfaction: Option<i64>,
-    pub satisfaction_reason: Option<i64>,
     pub anomalies: Option<i64>,
     pub nss: Option<i64>,
     pub chwidth: Option<i64>,
@@ -285,8 +284,10 @@ pub struct Snapshot {
     pub neighbors: Vec<NeighborSample>,
     /// Only channels with survey samples (empty until a spectrum scan runs).
     pub spectrum: Vec<SpectrumSample>,
-    /// False for the short informs sent while radios restart: the absence of
-    /// clients then says nothing about whether they are still connected.
+    /// False for an inform without a VAP table: the absence of clients then
+    /// says nothing about whether they are still connected. Only notifications
+    /// (which are not parsed) have been seen without one. An empty table is a
+    /// report like any other: an AP with every network off has no clients.
     pub has_vap_table: bool,
 }
 
@@ -324,7 +325,7 @@ pub fn parse(ts: Ts, p: &Value) -> anyhow::Result<Snapshot> {
     let sys = &p["sys_stats"];
     let stats = &p["system-stats"];
     let vap_table = p["vap_table"].as_array();
-    let has_vap_table = vap_table.is_some_and(|v| !v.is_empty());
+    let has_vap_table = vap_table.is_some();
 
     let mut vaps = Vec::new();
     let mut clients = Vec::new();
@@ -391,7 +392,6 @@ pub fn parse(ts: Ts, p: &Value) -> anyhow::Result<Snapshot> {
                 idletime: int(&s["idletime"]),
                 uptime: int(&s["uptime"]),
                 satisfaction: int(&s["satisfaction"]),
-                satisfaction_reason: int(&s["satisfaction_reason"]),
                 anomalies: int(&s["anomalies"]),
                 nss: int(&s["nss"]),
                 chwidth: int(&s["chwidth"]),
@@ -404,37 +404,7 @@ pub fn parse(ts: Ts, p: &Value) -> anyhow::Result<Snapshot> {
         }
     }
 
-    let radios = p["radio_table"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter_map(|r| {
-            let radio = string(&r["radio"])?;
-            let ath = &r["athstats"];
-            // Channel, width and power all from the same VAP.
-            let first_vap = vaps.iter().find(|v| v.radio.as_deref() == Some(radio.as_str()));
-            Some(RadioSample {
-                name: string(&r["name"]),
-                channel: first_vap.and_then(|v| v.channel),
-                bw: first_vap.and_then(|v| v.bw),
-                tx_power: first_vap.and_then(|v| v.tx_power),
-                cu_total: int(&ath["cu_total"]),
-                cu_self_rx: int(&ath["cu_self_rx"]),
-                cu_self_tx: int(&ath["cu_self_tx"]),
-                cu_interf: int(&ath["cu_interf"]),
-                noise_floor: int(&ath["noise_floor"]),
-                tx_packets: int(&ath["n_tx_pkts"]),
-                tx_retries: int(&ath["n_tx_retries"]),
-                rx_packets: int(&ath["n_rx_pkts"]),
-                antenna_gain: int(&r["builtin_ant_gain"]),
-                min_txpower: int(&r["min_txpower"]),
-                max_txpower: int(&r["max_txpower"]),
-                num_sta: clients.iter().filter(|c| c.radio.as_deref() == Some(radio.as_str())).count() as i64,
-                radio,
-            })
-        })
-        .collect();
-
+    let mut radios = Vec::new();
     let mut neighbors = Vec::new();
     let mut spectrum = Vec::new();
     for r in p["radio_table"].as_array().into_iter().flatten() {
@@ -457,13 +427,14 @@ pub fn parse(ts: Ts, p: &Value) -> anyhow::Result<Snapshot> {
                 model: string(&n["model"]),
             });
         }
+        let Some(radio) = radio else { continue };
         for c in r["spectrum_table"].as_array().into_iter().flatten() {
-            let (Some(radio), Some(channel)) = (radio.clone(), int(&c["channel"])) else { continue };
+            let Some(channel) = int(&c["channel"]) else { continue };
             if int(&c["total_samples"]).unwrap_or(0) == 0 {
                 continue; // no survey has run for this channel
             }
             spectrum.push(SpectrumSample {
-                radio,
+                radio: radio.clone(),
                 channel,
                 width: int(&c["width"]),
                 utilization: int(&c["utilization"]),
@@ -471,6 +442,28 @@ pub fn parse(ts: Ts, p: &Value) -> anyhow::Result<Snapshot> {
                 other_bss_count: int(&c["other_bss_count"]),
             });
         }
+        let ath = &r["athstats"];
+        // Channel, width and power all from the same VAP.
+        let first_vap = vaps.iter().find(|v| v.radio.as_deref() == Some(radio.as_str()));
+        radios.push(RadioSample {
+            name: string(&r["name"]),
+            channel: first_vap.and_then(|v| v.channel),
+            bw: first_vap.and_then(|v| v.bw),
+            tx_power: first_vap.and_then(|v| v.tx_power),
+            cu_total: int(&ath["cu_total"]),
+            cu_self_rx: int(&ath["cu_self_rx"]),
+            cu_self_tx: int(&ath["cu_self_tx"]),
+            cu_interf: int(&ath["cu_interf"]),
+            noise_floor: int(&ath["noise_floor"]),
+            tx_packets: int(&ath["n_tx_pkts"]),
+            tx_retries: int(&ath["n_tx_retries"]),
+            rx_packets: int(&ath["n_rx_pkts"]),
+            antenna_gain: int(&r["builtin_ant_gain"]),
+            min_txpower: int(&r["min_txpower"]),
+            max_txpower: int(&r["max_txpower"]),
+            num_sta: clients.iter().filter(|c| c.radio.as_deref() == Some(radio.as_str())).count() as i64,
+            radio,
+        });
     }
 
     // The uplink is the interface named by `uplink` (eth0 for wired APs).
@@ -565,12 +558,22 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn short_inform_during_radio_restart_has_no_client_information() {
+    fn an_inform_without_a_vap_table_has_no_client_information() {
         let Some(_) = fixtures() else { return };
+        // A notification sent after a config push (the engine does not parse
+        // those): the only kind of inform captured without a VAP table.
         let s = parse(1000, &fixture("000593_020000000002_inform")).unwrap();
         assert!(!s.has_vap_table);
         assert!(s.clients.is_empty());
         assert_eq!(s.ap.num_sta, None, "unknown, not zero");
+    }
+
+    #[test]
+    fn an_empty_vap_table_means_no_clients() {
+        // Every network off (a schedule, or no SSID for this AP).
+        let s = parse(1000, &serde_json::json!({ "mac": "02:00:00:00:00:01", "vap_table": [] })).unwrap();
+        assert!(s.has_vap_table);
+        assert_eq!(s.ap.num_sta, Some(0));
     }
 
     #[test]

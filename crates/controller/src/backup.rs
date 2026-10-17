@@ -380,7 +380,7 @@ fn trim(dir: &Path, cutoff: Option<Ts>) -> Result<()> {
         for (table, col) in [("events", "ts"), ("connections", "ts"), ("alerts", "ts"), ("neighbors", "last_seen"), ("spectrum", "ts"), ("dryrun_results", "ts")] {
             tx.execute(&format!("DELETE FROM {table} WHERE {col} < ?1"), [t])?;
         }
-        tx.execute("DELETE FROM clients WHERE COALESCE(last_seen, 0) < ?1 AND mac NOT IN (SELECT mac FROM client_aliases)", [t])?;
+        tx.execute(store::FORGET_OLD_CLIENTS, [t])?;
     }
     tx.commit()?;
     if cutoff.is_some() {

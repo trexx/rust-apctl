@@ -79,6 +79,11 @@ impl Table {
         self.settings.iter().chain(self.gauges).chain(self.counters).copied()
     }
 
+    /// How many values a metric row has: one for every column but `ts`.
+    fn width(&self) -> usize {
+        self.keys.len() + self.texts.len() + self.settings.len() + self.gauges.len() + self.counters.len()
+    }
+
     /// Every column, in the order a metric row's values come in.
     fn columns(&self) -> Vec<&'static str> {
         self.keys.iter().copied().chain(["ts"]).chain(self.texts.iter().copied()).chain(self.numbers()).collect()
@@ -186,6 +191,7 @@ pub fn table(name: &str) -> Option<&'static Table> {
 pub const TIERS: [(&str, i64, i64); 3] = [("", 0, 48 * 3600), ("_5m", 300, 30 * 86400), ("_1h", 3600, 365 * 86400)];
 
 const CONFIG_SCHEMA: &str = "
+-- name, cfgversion and online are no longer written; old databases have them filled.
 CREATE TABLE IF NOT EXISTS devices (
     mac TEXT PRIMARY KEY, name TEXT, hostname TEXT, model TEXT, model_display TEXT, version TEXT,
     ip TEXT, serial TEXT, hash_id TEXT, first_seen INTEGER, last_seen INTEGER, uptime INTEGER,
@@ -258,11 +264,19 @@ CREATE TRIGGER IF NOT EXISTS logs_ad AFTER DELETE ON logs BEGIN
 END;
 ";
 
-const LOG_RETENTION: i64 = 14 * 86400;
+const LOG_RETENTION: Ts = 14 * 86400;
+const EVENT_RETENTION: Ts = 365 * 86400;
+const DRYRUN_RETENTION: Ts = 90 * 86400;
+const CONNECTION_RETENTION: Ts = 90 * 86400;
+/// Neighbours not heard for this long are forgotten.
+const NEIGHBOR_RETENTION: Ts = 30 * 86400;
 /// Clients not seen for this long are forgotten, unless they have a name (an
 /// alias). The same rule as a backup's history trim; the engine drops them
 /// from its live view too.
 pub const CLIENT_RETENTION: Ts = 365 * 86400;
+/// Deletes the clients last seen before ?1 that have no name: the retention
+/// above, and a backup's history trim.
+pub const FORGET_OLD_CLIENTS: &str = "DELETE FROM clients WHERE COALESCE(last_seen, 0) < ?1 AND mac NOT IN (SELECT mac FROM client_aliases)";
 /// Resolved alerts are kept this long; open ones until they resolve.
 const ALERT_RETENTION: Ts = 90 * 86400;
 
@@ -329,13 +343,18 @@ pub enum Write {
     Metric { table: &'static Table, ts: Ts, values: Vec<Value> },
     /// Arbitrary statement against one database.
     Exec { db: Db, sql: &'static str, params: Vec<Value> },
+}
+
+/// What the writer thread is sent.
+enum Msg {
+    Write(Write),
     /// Commit everything queued so far, then answer.
     Flush(Sender<()>),
 }
 
 #[derive(Clone)]
 pub struct Writer {
-    tx: Sender<Write>,
+    tx: Sender<Msg>,
     /// Set when the writer thread has stopped: nothing sent is stored any more.
     stopped: Arc<AtomicBool>,
 }
@@ -343,7 +362,7 @@ pub struct Writer {
 impl Writer {
     pub fn send(&self, w: Write) {
         // Fails only once the writer has stopped, which `stopped` reports.
-        let _ = self.tx.send(w);
+        let _ = self.tx.send(Msg::Write(w));
     }
 
     pub fn exec(&self, db: Db, sql: &'static str, params: Vec<Value>) {
@@ -354,7 +373,7 @@ impl Writer {
     /// they could not be committed in time (or the writer has stopped).
     pub fn flush(&self, timeout: Duration) -> bool {
         let (ack, done) = channel();
-        self.tx.send(Write::Flush(ack)).is_ok() && done.recv_timeout(timeout).is_ok()
+        self.tx.send(Msg::Flush(ack)).is_ok() && done.recv_timeout(timeout).is_ok()
     }
 
     /// True once the writer thread has stopped (an error opening or writing the
@@ -424,7 +443,7 @@ fn open_all(dir: &Path) -> Result<Conns> {
 /// The channel to the writer stays unbounded: the engine and the request
 /// handlers must never block on the disk, and the writer drains a second's
 /// worth of writes per commit, far more than the APs produce.
-fn writer_loop(dir: &Path, rx: Receiver<Write>) -> Result<()> {
+fn writer_loop(dir: &Path, rx: Receiver<Msg>) -> Result<()> {
     let mut conns = open_all(dir)?;
     let mut pending: Vec<Write> = Vec::new();
     let mut acks: Vec<Sender<()>> = Vec::new();
@@ -433,8 +452,8 @@ fn writer_loop(dir: &Path, rx: Receiver<Write>) -> Result<()> {
     let mut last_maintenance = Instant::now().checked_sub(Duration::from_secs(240)).unwrap_or_else(Instant::now);
     loop {
         match rx.recv_timeout(Duration::from_millis(250)) {
-            Ok(Write::Flush(ack)) => acks.push(ack),
-            Ok(w) => pending.push(w),
+            Ok(Msg::Flush(ack)) => acks.push(ack),
+            Ok(Msg::Write(w)) => pending.push(w),
             Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => {
                 flush(&mut conns, &mut pending);
@@ -456,35 +475,44 @@ fn writer_loop(dir: &Path, rx: Receiver<Write>) -> Result<()> {
     }
 }
 
-fn flush(conns: &mut Conns, pending: &mut Vec<Write>) {
+/// Commits the pending writes; returns how many failed.
+fn flush(conns: &mut Conns, pending: &mut Vec<Write>) -> usize {
     let mut by_db: [Vec<Write>; 3] = Default::default();
     for w in pending.drain(..) {
         let db = match &w {
             Write::Metric { .. } => Db::Metrics,
             Write::Exec { db, .. } => *db,
-            Write::Flush(_) => continue,
         };
         by_db[db as usize].push(w);
     }
+    let mut failed = 0;
     for (conn, writes) in conns.iter_mut().zip(by_db) {
         if writes.is_empty() {
             continue;
         }
-        if let Err(e) = apply(conn, writes) {
-            tracing::error!("write batch failed: {e:#}");
+        let n = writes.len();
+        match apply(conn, writes) {
+            Ok(f) => failed += f,
+            Err(e) => {
+                tracing::error!("write batch failed: {e:#}");
+                failed += n;
+            }
         }
     }
+    failed
 }
 
 /// Commits a batch in one transaction. A write that fails (e.g. a constraint)
 /// is logged and skipped; SQLite undoes just that statement, so the rest of
 /// the batch is still stored. Only an error that ends the transaction itself
-/// (disk full, I/O) loses the batch.
-fn apply(conn: &mut Connection, writes: Vec<Write>) -> Result<()> {
+/// (disk full, I/O) loses the batch. Returns how many writes failed.
+fn apply(conn: &mut Connection, writes: Vec<Write>) -> Result<usize> {
     let tx = conn.transaction()?;
     let (mut failed, mut first_error) = (0, None);
     for w in writes {
         let result = match &w {
+            // A row of the wrong length is the engine's mistake: refused, not stored in the wrong columns.
+            Write::Metric { table, values, .. } if values.len() != table.width() => Err(rusqlite::Error::InvalidParameterCount(values.len() + 1, table.width() + 1)),
             Write::Metric { table, ts, values } => {
                 let n_keys = table.keys.len();
                 let ts = Value::Integer(*ts);
@@ -492,7 +520,6 @@ fn apply(conn: &mut Connection, writes: Vec<Write>) -> Result<()> {
                 tx.prepare_cached(table.insert()).and_then(|mut s| s.execute(params_from_iter(params)))
             }
             Write::Exec { sql, params, .. } => tx.prepare_cached(sql).and_then(|mut s| s.execute(params_from_iter(params))),
-            Write::Flush(_) => continue,
         };
         if let Err(e) = result {
             if tx.is_autocommit() {
@@ -502,7 +529,6 @@ fn apply(conn: &mut Connection, writes: Vec<Write>) -> Result<()> {
             first_error.get_or_insert_with(|| match &w {
                 Write::Metric { table, .. } => format!("{}: {e}", table.name),
                 Write::Exec { sql, .. } => format!("{}: {e}", sql.split_whitespace().take(4).collect::<Vec<_>>().join(" ")),
-                Write::Flush(_) => e.to_string(),
             });
         }
     }
@@ -510,7 +536,26 @@ fn apply(conn: &mut Connection, writes: Vec<Write>) -> Result<()> {
     if let Some(e) = first_error {
         tracing::error!("{failed} write(s) failed and were skipped, the first: {e}");
     }
-    Ok(())
+    Ok(failed)
+}
+
+/// A config pushed to an AP.
+#[derive(Debug, Clone, Default)]
+pub struct PushedConfig {
+    pub mgmt_cfg: String,
+    /// Empty until a push with a `system_cfg` is seen (one can be management-only).
+    pub system_cfg: String,
+    pub cfgversion: Option<String>,
+}
+
+/// One AP's last stored push, with its secrets masked.
+pub fn stored_push(c: &Connection, mac: &inform::Mac) -> rusqlite::Result<Option<PushedConfig>> {
+    use rusqlite::OptionalExtension;
+    c.prepare_cached("SELECT mgmt_cfg, system_cfg, cfgversion FROM device_config WHERE mac = ?1")?
+        .query_row([mac.to_string()], |r| {
+            Ok(PushedConfig { mgmt_cfg: r.get::<_, Option<String>>(0)?.unwrap_or_default(), system_cfg: r.get::<_, Option<String>>(1)?.unwrap_or_default(), cfgversion: r.get(2)? })
+        })
+        .optional()
 }
 
 pub fn now_ts() -> Ts {
@@ -543,18 +588,12 @@ fn maintenance(conns: &mut Conns, now: Ts) {
         }
     }
     step("retention of logs", delete_before(logs, "logs", Rows::Rowid, now - LOG_RETENTION));
-    step("retention of events", delete_before(config, "events", Rows::Rowid, now - 365 * 86400));
+    step("retention of events", delete_before(config, "events", Rows::Rowid, now - EVENT_RETENTION));
     step("expiring sessions", config.execute("DELETE FROM sessions WHERE expires < ?1", [now]).map(drop).map_err(Into::into));
-    step("retention of dry runs", delete_before(config, "dryrun_results", Rows::Rowid, now - 90 * 86400));
-    step("retention of connections", delete_before(config, "connections", Rows::Rowid, now - 90 * 86400));
-    step("retention of neighbours", config.execute("DELETE FROM neighbors WHERE last_seen < ?1", [now - 30 * 86400]).map(drop).map_err(Into::into));
-    step(
-        "retention of clients",
-        config
-            .execute("DELETE FROM clients WHERE COALESCE(last_seen, 0) < ?1 AND mac NOT IN (SELECT mac FROM client_aliases)", [now - CLIENT_RETENTION])
-            .map(drop)
-            .map_err(Into::into),
-    );
+    step("retention of dry runs", delete_before(config, "dryrun_results", Rows::Rowid, now - DRYRUN_RETENTION));
+    step("retention of connections", delete_before(config, "connections", Rows::Rowid, now - CONNECTION_RETENTION));
+    step("retention of neighbours", config.execute("DELETE FROM neighbors WHERE last_seen < ?1", [now - NEIGHBOR_RETENTION]).map(drop).map_err(Into::into));
+    step("retention of clients", config.execute(FORGET_OLD_CLIENTS, [now - CLIENT_RETENTION]).map(drop).map_err(Into::into));
     step(
         "retention of alerts",
         config.execute("DELETE FROM alerts WHERE ts < ?1 AND resolved_ts < ?1", [now - ALERT_RETENTION]).map(drop).map_err(Into::into),
@@ -627,7 +666,7 @@ pub struct Series {
     pub step: i64,
     pub ts: Vec<Ts>,
     /// Gauges as stored; counters converted to per-second rates.
-    pub fields: BTreeMap<String, Vec<Option<f64>>>,
+    pub fields: BTreeMap<&'static str, Vec<Option<f64>>>,
 }
 
 /// Picks the finest tier that covers the range and keeps the point count sensible.
@@ -644,7 +683,7 @@ pub fn tier_for(from: Ts, to: Ts, now: Ts) -> usize {
 
 pub fn series(conn: &Connection, table: &Table, keys: &[String], from: Ts, to: Ts, tier: usize) -> Result<Series> {
     let (suffix, step, _) = TIERS[tier];
-    let fields: Vec<&str> = table.numbers().collect();
+    let fields: Vec<&'static str> = table.numbers().collect();
     let where_keys: Vec<String> = table.keys.iter().enumerate().map(|(i, k)| format!("{k} = ?{}", i + 3)).collect();
     // One row before `from`, so the first counter rate in range can be computed.
     let sql = format!(
@@ -657,41 +696,59 @@ pub fn series(conn: &Connection, table: &Table, keys: &[String], from: Ts, to: T
     );
     let params = [Value::Integer(from), Value::Integer(to)].into_iter().chain(keys.iter().map(|k| Value::Text(k.clone())));
     let mut stmt = conn.prepare_cached(&sql)?;
-    let rows: Vec<(Ts, Vec<Option<f64>>)> = stmt
-        .query_map(params_from_iter(params), |r| {
-            let ts: Ts = r.get(0)?;
-            let vals = (0..fields.len()).map(|i| r.get::<_, Option<f64>>(i + 1)).collect::<rusqlite::Result<_>>()?;
-            Ok((ts, vals))
-        })?
-        .collect::<rusqlite::Result<_>>()?;
+    let mut rows = stmt.query(params_from_iter(params))?;
 
     // Settings and gauges are returned as stored, counters as rates.
     let n_gauges = table.settings.len() + table.gauges.len();
-    let mut ts_out = Vec::with_capacity(rows.len());
+    let mut ts_out = Vec::new();
     // One column per field, in `fields` order; named at the end.
-    let mut columns: Vec<Vec<Option<f64>>> = vec![Vec::with_capacity(rows.len()); fields.len()];
-    for (i, (ts, vals)) in rows.iter().enumerate() {
-        if *ts < from {
-            continue; // the look-behind row only feeds the first rate
+    let mut columns: Vec<Vec<Option<f64>>> = vec![Vec::new(); fields.len()];
+    // This row's values and the previous row's (for the rates), reused for every row.
+    let (mut vals, mut prev): (Vec<Option<f64>>, Vec<Option<f64>>) = (vec![None; fields.len()], vec![None; fields.len()]);
+    let mut prev_ts = None;
+    while let Some(r) = rows.next()? {
+        let ts: Ts = r.get(0)?;
+        for (j, v) in vals.iter_mut().enumerate() {
+            *v = r.get(j + 1)?;
         }
-        ts_out.push(*ts);
-        for (j, column) in columns.iter_mut().enumerate() {
-            let v = if j < n_gauges {
-                vals[j]
-            } else {
-                // Rate from the previous row; a smaller value means the counter reset.
-                i.checked_sub(1).and_then(|p| {
-                    let (pts, pvals) = &rows[p];
-                    let (cur, prev) = (vals[j]?, pvals[j]?);
-                    let dt = (ts - pts) as f64;
-                    (dt > 0.0).then(|| if cur >= prev { (cur - prev) / dt } else { cur / dt })
-                })
-            };
-            column.push(v);
+        // The look-behind row only feeds the first rate.
+        if ts >= from {
+            ts_out.push(ts);
+            for (j, column) in columns.iter_mut().enumerate() {
+                let v = if j < n_gauges {
+                    vals[j]
+                } else {
+                    // Rate from the previous row; a smaller value means the counter reset.
+                    prev_ts.and_then(|pts: Ts| {
+                        let (cur, last) = (vals[j]?, prev[j]?);
+                        let dt = (ts - pts) as f64;
+                        (dt > 0.0).then(|| if cur >= last { (cur - last) / dt } else { cur / dt })
+                    })
+                };
+                column.push(v);
+            }
         }
+        std::mem::swap(&mut vals, &mut prev);
+        prev_ts = Some(ts);
     }
-    let fields = fields.iter().map(|f| f.to_string()).zip(columns).collect();
+    let fields = fields.into_iter().zip(columns).collect();
     Ok(Series { tier: ["raw", "5m", "1h"][tier], step, ts: ts_out, fields })
+}
+
+/// A writer whose writes are kept, and a function that stores them in new
+/// databases in a directory and returns how many failed.
+#[cfg(test)]
+pub(crate) fn capture() -> (Writer, impl FnOnce(&Path) -> Result<usize>) {
+    let (tx, rx) = channel();
+    let writer = Writer { tx, stopped: Default::default() };
+    let store = move |dir: &Path| {
+        std::fs::create_dir_all(dir)?;
+        migrate(dir)?;
+        let mut conns = open_all(dir)?;
+        let mut writes = rx.try_iter().filter_map(|m| match m { Msg::Write(w) => Some(w), Msg::Flush(_) => None }).collect();
+        Ok(flush(&mut conns, &mut writes))
+    };
+    (writer, store)
 }
 
 #[cfg(test)]
@@ -721,7 +778,7 @@ mod tests {
             values.extend(std::iter::repeat_n(Value::Null, UPLINK.counters.len() - 1));
             writes.push(Write::Metric { table: &UPLINK, ts, values });
         }
-        apply(&mut conns[Db::Metrics as usize], writes).unwrap();
+        assert_eq!(apply(&mut conns[Db::Metrics as usize], writes).unwrap(), 0);
 
         let m = &conns[Db::Metrics as usize];
         let s = series(m, &UPLINK, &["aa".into()], now - 1200, now, 0).unwrap();
@@ -739,7 +796,7 @@ mod tests {
             values.extend(std::iter::repeat_n(Value::Null, UPLINK.counters.len() - 1));
             writes.push(Write::Metric { table: &UPLINK, ts: now - 1200 + i * 10, values });
         }
-        apply(&mut conns[Db::Metrics as usize], writes).unwrap();
+        assert_eq!(apply(&mut conns[Db::Metrics as usize], writes).unwrap(), 0);
 
         // The last bucket has just ended: rows for it may still be on their way.
         maintenance(&mut conns, now);
@@ -776,7 +833,7 @@ mod tests {
                 Write::Metric { table: &RADIO, ts: now - 600 + i * 10, values }
             })
             .collect();
-        apply(&mut conns[Db::Metrics as usize], writes).unwrap();
+        assert_eq!(apply(&mut conns[Db::Metrics as usize], writes).unwrap(), 0);
         maintenance(&mut conns, now + ROLLUP_GRACE_SECS);
         let five = series(&conns[Db::Metrics as usize], &RADIO, &["aa".into(), "na".into()], now - 600, now, 1).unwrap();
         assert_eq!(five.ts, vec![now - 600]);
@@ -796,9 +853,14 @@ mod tests {
             params: vec![Value::Text(mac.into())],
         };
         // The second write breaks the primary key.
-        apply(&mut conns[Db::Config as usize], vec![alias("a"), alias("a"), alias("b")]).unwrap();
+        assert_eq!(apply(&mut conns[Db::Config as usize], vec![alias("a"), alias("a"), alias("b")]).unwrap(), 1);
         let n: i64 = conns[Db::Config as usize].query_row("SELECT COUNT(*) FROM client_aliases", [], |r| r.get(0)).unwrap();
         assert_eq!(n, 2);
+        // A metric row with a value too few or too many is refused, not stored in the wrong columns.
+        let row = |n: usize| Write::Metric { table: &MCAST, ts: 1, values: [Value::Text("aa".into()), Value::Text("mdns".into())].into_iter().chain(std::iter::repeat_n(Value::Real(1.0), n)).collect() };
+        assert_eq!(apply(&mut conns[Db::Metrics as usize], vec![row(4), row(5), row(6)]).unwrap(), 2);
+        let n: i64 = conns[Db::Metrics as usize].query_row("SELECT COUNT(*) FROM mcast_stats", [], |r| r.get(0)).unwrap();
+        assert_eq!(n, 1);
         std::fs::remove_dir_all(&dir).ok();
     }
 

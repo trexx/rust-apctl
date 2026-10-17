@@ -489,11 +489,11 @@ pub struct Sink {
 
 impl Sink {
     /// Passes an event on if it may make an alert.
-    pub fn offer(&self, ev: &Event) {
+    pub fn offer(&self, ev: Event) {
         if !alertable(ev.kind) {
             return;
         }
-        if let Err(mpsc::error::TrySendError::Full(_)) = self.tx.try_send(ev.clone()) {
+        if let Err(mpsc::error::TrySendError::Full(_)) = self.tx.try_send(ev) {
             let n = self.dropped.fetch_add(1, Ordering::Relaxed) + 1;
             // The first drop, then every time the count doubles.
             if n.is_power_of_two() {
@@ -806,14 +806,14 @@ mod tests {
         let (sink, mut events) = channel();
         let ev = |kind| Event { ts: 0, kind, device_mac: "02:00:00:00:00:01".parse().ok(), client_mac: None, data: json!({ "uptime": 60 }) };
         // Only what may make an alert is passed on.
-        sink.offer(&ev(EventKind::ClientConnected));
-        sink.offer(&ev(EventKind::ApRestarted));
+        sink.offer(ev(EventKind::ClientConnected));
+        sink.offer(ev(EventKind::ApRestarted));
         let e = events.recv().await.unwrap();
         assert_eq!(e.kind, EventKind::ApRestarted);
         assert!(events.try_recv().is_err());
         // A full queue drops and counts.
         for _ in 0..QUEUE + 3 {
-            sink.offer(&ev(EventKind::ApRestarted));
+            sink.offer(ev(EventKind::ApRestarted));
         }
         assert_eq!(sink.dropped.load(Ordering::Relaxed), 3);
         let (mut w, mut rx) = watcher();

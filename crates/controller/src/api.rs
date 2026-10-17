@@ -297,8 +297,8 @@ impl StoredDevice {
             snapshot: crate::model::Snapshot {
                 ap, uplink: None, radios: vec![], vaps: vec![], clients: vec![], neighbors: vec![], spectrum: vec![], has_vap_table: false,
             },
-            online: false, first_seen: self.first_seen, last_seen: self.last_seen, peer: String::new(), interval: 0, reconfiguring: false,
-            reconfiguring_since: None, last_full_inform: 0, last_config_push: None,
+            online: false, first_seen: self.first_seen, last_seen: self.last_seen, peer: String::new(), interval: 0, last_full_inform: 0,
+            last_config_push: None,
         }
     }
 
@@ -306,7 +306,7 @@ impl StoredDevice {
     fn row(self) -> DeviceRow {
         DeviceRow {
             mac: self.mac, name: self.name, model: self.model, model_display: self.model_display, version: self.version, ip: self.ip,
-            online: false, reconfiguring: false, first_seen: self.first_seen, last_seen: self.last_seen, uptime: None, cpu: None, mem: None,
+            online: false, first_seen: self.first_seen, last_seen: self.last_seen, uptime: None, cpu: None, mem: None,
             load1: None, satisfaction: None, clients: 0, uplink: None, radios: vec![], last_config_push: None, locating: None, stored_only: true,
         }
     }
@@ -322,7 +322,6 @@ struct DeviceRow {
     version: Option<String>,
     ip: Option<String>,
     online: bool,
-    reconfiguring: bool,
     first_seen: Ts,
     last_seen: Ts,
     uptime: Option<i64>,
@@ -362,7 +361,7 @@ struct RadioRow {
 async fn stored_devices(store: &Arc<Store>, only: Option<Mac>) -> Result<Vec<StoredDevice>, ApiError> {
     read(store, Db::Config, move |c| {
         let mut stmt = c.prepare(
-            "SELECT mac, COALESCE(name, hostname), model, model_display, version, ip, serial, first_seen, last_seen FROM devices WHERE ?1 IS NULL OR mac = ?1",
+            "SELECT mac, hostname, model, model_display, version, ip, serial, first_seen, last_seen FROM devices WHERE ?1 IS NULL OR mac = ?1",
         )?;
         // A row whose MAC does not parse is no AP to show.
         let rows = stmt
@@ -398,7 +397,7 @@ async fn devices(State(s): State<AppState>) -> Result<Json<Vec<DeviceRow>>, ApiE
                 let a = &d.snapshot.ap;
                 DeviceRow {
                     mac: *mac, name: a.hostname.clone(), model: a.model.clone(), model_display: a.model_display.clone(),
-                    version: a.version.clone(), ip: a.ip.clone(), online: d.online, reconfiguring: d.reconfiguring,
+                    version: a.version.clone(), ip: a.ip.clone(), online: d.online,
                     first_seen: d.first_seen, last_seen: d.last_seen, uptime: a.uptime, cpu: a.cpu, mem: a.mem, load1: a.load1,
                     satisfaction: a.satisfaction, clients: per_ap.get(mac).copied().unwrap_or(0),
                     uplink: d.snapshot.uplink.as_ref().map(|u| UplinkRow { speed: u.speed, up: u.up, full_duplex: u.full_duplex }),
@@ -578,7 +577,7 @@ async fn dryrun(State(s): State<AppState>) -> Result<Json<DryRunStatus>, ApiErro
     let (stored, history) = read(&s.store, Db::Config, move |c| {
         let mut stored = std::collections::HashMap::new();
         for mac in need {
-            if let Some(p) = crate::engine::stored_push(c, &mac)?.filter(|p| !p.system_cfg.is_empty()) {
+            if let Some(p) = crate::store::stored_push(c, &mac)?.filter(|p| !p.system_cfg.is_empty()) {
                 stored.insert(mac, Arc::new(p));
             }
         }
@@ -1082,7 +1081,7 @@ mod tests {
         let header = inform::Header { packet_version: 0, mac: Mac([0; 6]), flags: inform::Flags(0), iv: [0; 16], payload_version: 1, payload_len: 0 };
         let decoded = wire::decode::Decoded { header, key: wire::decode::KeyUsed::Device, payload };
         engine.handle(crate::engine::Input::Inform { ts: 50, peer: "x".into(), decoded });
-        s.writer.exec(Db::Config, "INSERT INTO devices (mac, name, model, first_seen, last_seen) VALUES ('02:00:00:00:00:02', 'Attic', 'U6', 10, 20)", vec![]);
+        s.writer.exec(Db::Config, "INSERT INTO devices (mac, hostname, model, first_seen, last_seen) VALUES ('02:00:00:00:00:02', 'Attic', 'U6', 10, 20)", vec![]);
         assert!(s.writer.flush(std::time::Duration::from_secs(5)));
         let app = router(s);
 
@@ -1090,7 +1089,7 @@ mod tests {
         assert_eq!((list[0]["name"].as_str(), list[0]["clients"].as_i64(), list[0]["online"].as_bool()), (Some("Hall"), Some(1), Some(true)));
         assert_eq!(list[1], json!({
             "mac": "02:00:00:00:00:02", "name": "Attic", "model": "U6", "model_display": null, "version": null, "ip": null, "online": false,
-            "reconfiguring": false, "first_seen": 10, "last_seen": 20, "uptime": null, "cpu": null, "mem": null, "load1": null, "satisfaction": null,
+            "first_seen": 10, "last_seen": 20, "uptime": null, "cpu": null, "mem": null, "load1": null, "satisfaction": null,
             "clients": 0, "uplink": null, "radios": [], "last_config_push": null, "stored_only": true,
         }));
         let one = get_json(&app, "/api/devices/02:00:00:00:00:01").await;

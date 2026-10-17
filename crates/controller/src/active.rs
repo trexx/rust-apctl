@@ -32,9 +32,9 @@ use tokio::sync::{Semaphore, SemaphorePermit, mpsc};
 use wire::decode::{Decoded, KeyUsed, open_with};
 use wire::keys::KeyStore;
 
-use crate::engine::{Event, EventKind, Input, PushedConfig, SharedLive};
+use crate::engine::{Event, EventKind, Input, SharedLive};
 use crate::model::Ts;
-use crate::store::{self, Db, Store, Writer};
+use crate::store::{self, Db, PushedConfig, Store, Writer};
 
 /// What apctl remembers about an AP it manages.
 #[derive(Clone, Default)]
@@ -406,7 +406,7 @@ impl Active {
                 tracing::info!("{mac}: the settings were edited after its last stored push: not comparing with it");
                 return Ok(None);
             }
-            Ok(crate::engine::stored_push(c, &mac)?)
+            Ok(crate::store::stored_push(c, &mac)?)
         });
         read.unwrap_or_else(|e| {
             tracing::warn!("{mac}: cannot read its last stored push: {e:#}");
@@ -1160,7 +1160,7 @@ mod tests {
         let seen = |last_seen: Ts| {
             let snapshot = crate::model::parse(last_seen, &ap_payload("1")).unwrap();
             let d = crate::engine::DeviceView {
-                snapshot, online: true, first_seen: 0, last_seen, peer: "x".into(), interval: 10, reconfiguring: false, reconfiguring_since: None,
+                snapshot, online: true, first_seen: 0, last_seen, peer: "x".into(), interval: 10,
                 last_full_inform: last_seen, last_config_push: None,
             };
             rig.live.write().unwrap().devices.insert(mac, d);
