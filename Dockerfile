@@ -7,9 +7,16 @@ COPY web/ ./
 RUN npm run build
 
 # --- manufacturer names (IEEE MAC address registry, public data) ---
-# A stage of its own, so code changes don't download it again.
-FROM docker.io/library/rust:1.98-bookworm AS oui
-RUN curl -fsSL -o /oui.csv https://standards-oui.ieee.org/oui/oui.csv
+# A small stage of its own, so code changes don't download it again. The layer is
+# cached until OUI_MONTH changes (scripts/release.sh passes the current month), so the
+# list is at most about a month old. (The IEEE server answers 418 to the HTTP client
+# behind ADD <url>, so busybox wget fetches it.)
+FROM docker.io/library/alpine:3.22 AS oui
+ARG OUI_MONTH=
+RUN echo "registry of ${OUI_MONTH:-the first build}" \
+    && wget -q -O /oui.csv https://standards-oui.ieee.org/oui/oui.csv \
+    && head -1 /oui.csv | grep -q Assignment \
+    && chmod 644 /oui.csv
 
 # --- controller ---
 FROM docker.io/library/rust:1.98-bookworm AS build

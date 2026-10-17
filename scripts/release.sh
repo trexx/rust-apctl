@@ -76,7 +76,8 @@ fi
 
 echo "== building $IMAGE:$version"
 # --force-rm: a failed build must not leave working containers (they pin their images).
-podman build -q --force-rm --target runtime -t "$IMAGE:$version" .
+# OUI_MONTH: the manufacturer list is downloaded again once a month.
+podman build -q --force-rm --target runtime --build-arg OUI_MONTH="$(date +%Y-%m)" -t "$IMAGE:$version" .
 reported=$(podman run --rm "$IMAGE:$version" --version)
 if [ "$reported" != "controller $version" ]; then
   echo "the image reports '$reported', expected 'controller $version'" >&2

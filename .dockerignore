@@ -1,5 +1,17 @@
-target
-web/node_modules
+**/target
+**/node_modules
 web/dist
 docs
+scripts
 .git
+.github
+.claude
+# Never send captures, keys or data imported from a live controller to a build (the
+# same as .gitignore, at any depth).
+**/*.pcap
+**/*.pcapng
+**/*.keys.json
+**/import*.json
+captures
+secrets
+data
