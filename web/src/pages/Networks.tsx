@@ -2,7 +2,7 @@ import { Suspense } from "react";
 import { Link } from "react-router";
 import { useWlans } from "../api";
 import type { Wlan } from "../api";
-import { band, bitrate, bytes, pct1 } from "../format";
+import { band, bytes, pct1, rate } from "../format";
 import {
   COLORS,
   Chart,
@@ -167,7 +167,7 @@ function WlanPanel({ w }: { w: Wlan }) {
           title="Traffic"
           ts={w.series.ts}
           height={120}
-          format={(v) => bitrate(v / 8)}
+          format={rate}
           series={[
             {
               label: "To clients",

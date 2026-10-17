@@ -32,11 +32,11 @@ import {
 import {
   ago,
   band,
-  bitrate,
   bytes,
   compact,
   duration,
   phy,
+  rate,
   useNow,
 } from "../format";
 import { mcastLabel, serviceNames } from "../components/insights/Multicast";
@@ -202,7 +202,7 @@ function ClientPage({ mac }: { mac: string }) {
                   <Chart
                     title="Throughput"
                     ts={ts}
-                    format={(v) => bitrate(v / 8)}
+                    format={rate}
                     series={[
                       {
                         label: "Down",

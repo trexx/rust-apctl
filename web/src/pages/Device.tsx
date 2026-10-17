@@ -33,12 +33,12 @@ import {
 import {
   ago,
   band,
-  bitrate,
   bytes,
   compact,
   duration,
   pct,
   phy,
+  rate,
   useNow,
 } from "../format";
 import { MulticastPanel } from "../components/insights/Multicast";
@@ -343,7 +343,7 @@ function UplinkChart({ mac, range }: { mac: string; range: TimeSpan }) {
           <Chart
             title="Uplink throughput"
             ts={ts}
-            format={(v) => bitrate(v / 8)}
+            format={rate}
             series={[
               {
                 label: "Download (to AP)",
