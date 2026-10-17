@@ -1,7 +1,7 @@
 //! Site-wide and RF views: activity, airtime, top APs and clients, retry
 //! rates, connection success, the radio overview and neighbouring networks.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap};
 
 use axum::Json;
 use axum::extract::{Query, State};
@@ -386,11 +386,23 @@ pub async fn activity(State(s): State<AppState>, Query(q): Query<RangeQuery>) ->
         let (mut tx_pps, mut rx_pps, mut dropped) = (Vec::new(), Vec::new(), Vec::new());
         for (b, m) in &per {
             ts.push(*b);
-            // Average per VAP within the bucket, then sum across VAPs.
-            let sum = |f: &dyn Fn(&Acc) -> f64| m.values().map(|a| f(a) / a.n.max(1.0)).sum::<f64>();
-            let (d, u, p, r, mc, cl) = (sum(&|a| a.down), sum(&|a| a.up), sum(&|a| a.pkts), sum(&|a| a.retries), sum(&|a| a.mcast), sum(&|a| a.clients));
-            let (rp, dr) = (sum(&|a| a.rx_pkts), sum(&|a| a.dropped));
-            let (at, wd) = (sum(&|a| a.attempts), sum(&|a| a.wifi_dropped));
+            // Average per VAP within the bucket, then sum across VAPs (in one pass).
+            let t = m.values().fold(Acc::default(), |mut t, a| {
+                let n = a.n.max(1.0);
+                t.down += a.down / n;
+                t.up += a.up / n;
+                t.pkts += a.pkts / n;
+                t.rx_pkts += a.rx_pkts / n;
+                t.retries += a.retries / n;
+                t.attempts += a.attempts / n;
+                t.wifi_dropped += a.wifi_dropped / n;
+                t.dropped += a.dropped / n;
+                t.mcast += a.mcast / n;
+                t.clients += a.clients / n;
+                t
+            });
+            let (d, u, p, r, mc, cl) = (t.down, t.up, t.pkts, t.retries, t.mcast, t.clients);
+            let (rp, dr, at, wd) = (t.rx_pkts, t.dropped, t.attempts, t.wifi_dropped);
             tx_pps.push(p);
             rx_pps.push(rp);
             dropped.push(if p + dr > 0.0 { Some(100.0 * dr / (p + dr)) } else { None });
@@ -822,15 +834,15 @@ pub async fn wlans(State(s): State<AppState>, Query(q): Query<RangeQuery>) -> Re
     };
     // Now: per network, the APs and bands broadcasting it, clients and scores;
     // copied, so that the live lock is not held while the list is made.
-    // essid -> (where it is broadcast, bands, experience scores)
-    type Now = (Vec<Value>, std::collections::BTreeSet<String>, Vec<f64>);
+    // essid -> (where it is broadcast, bands, experience scores, APs)
+    type Now = (Vec<Value>, std::collections::BTreeSet<String>, Vec<f64>, usize);
     let (mut now, connected, state) = {
         let live = s.live.read().unwrap();
         let mut now: BTreeMap<String, Now> = BTreeMap::new();
         for (mac, d) in &live.devices {
-            for v in &d.snapshot.vaps {
-                let Some(e) = v.essid.clone().filter(|e| !e.is_empty()) else { continue };
-                let n = now.entry(e).or_default();
+            for (i, v) in d.snapshot.vaps.iter().enumerate() {
+                let Some(e) = v.essid.as_deref().filter(|e| !e.is_empty()) else { continue };
+                let n = now.entry(e.to_string()).or_default();
                 n.0.push(json!({ "ap": mac, "name": d.snapshot.ap.hostname, "radio": v.radio, "channel": v.channel, "bssid": v.bssid, "clients": v.num_sta, "online": d.online }));
                 if let Some(r) = &v.radio {
                     n.1.insert(r.clone());
@@ -838,16 +850,18 @@ pub async fn wlans(State(s): State<AppState>, Query(q): Query<RangeQuery>) -> Re
                 if let Some(x) = v.satisfaction.filter(|x| *x >= 0 && v.num_sta.unwrap_or(0) > 0) {
                     n.2.push(x as f64);
                 }
+                // An AP counts once, at its first SSID of the network.
+                if !d.snapshot.vaps[..i].iter().any(|w| w.essid == v.essid) {
+                    n.3 += 1;
+                }
             }
         }
-        // The clients connected now, per network.
-        let mut connected: HashMap<&str, HashSet<inform::Mac>> = HashMap::new();
-        for c in live.clients.values().filter(|c| c.connected) {
-            if let Some(e) = c.sample.essid.as_deref() {
-                connected.entry(e).or_default().insert(c.sample.mac);
-            }
+        // The clients connected now, per network (each client is listed once).
+        let mut connected: HashMap<&str, usize> = HashMap::new();
+        for e in live.clients.values().filter(|c| c.connected).filter_map(|c| c.sample.essid.as_deref()) {
+            *connected.entry(e).or_default() += 1;
         }
-        let connected: HashMap<String, usize> = connected.into_iter().map(|(e, m)| (e.to_string(), m.len())).collect();
+        let connected: HashMap<String, usize> = connected.into_iter().map(|(e, n)| (e.to_string(), n)).collect();
         (now, connected, live.state.clone())
     };
     let mut names: std::collections::BTreeSet<String> = per.keys().cloned().collect();
@@ -856,7 +870,7 @@ pub async fn wlans(State(s): State<AppState>, Query(q): Query<RangeQuery>) -> Re
     let list: Vec<Value> = names
         .into_iter()
         .map(|essid| {
-            let (bss, bands, scores) = now.remove(&essid).unwrap_or_default();
+            let (bss, bands, scores, ap_count) = now.remove(&essid).unwrap_or_default();
             let clients = connected.get(&essid).copied().unwrap_or(0);
             let agg = per.get(&essid);
             let (ts, series_clients, down_bps, up_bps, peak) = agg.map_or((vec![], vec![], vec![], vec![], 0.0), |a| {
@@ -880,7 +894,7 @@ pub async fn wlans(State(s): State<AppState>, Query(q): Query<RangeQuery>) -> Re
                 "security_on_air": heard,
                 "broadcast": bss,
                 "bands": bands,
-                "ap_count": bss.iter().filter_map(|b| b["ap"].as_str()).collect::<HashSet<_>>().len(),
+                "ap_count": ap_count,
                 "clients": clients,
                 "peak_clients": peak.round().max(clients as f64),
                 "satisfaction": mean(&scores),
@@ -1261,12 +1275,10 @@ fn candidates(radio: &str, width: i64, dfs: bool, available: Option<&[i64]>) -> 
         chans.extend([52, 56, 60, 64, 100, 104, 108, 112, 116, 120, 124, 128, 132, 136, 140]);
     }
     // One candidate per aligned block (its first channel as primary).
-    let mut seen = Vec::new();
-    let mut out = Vec::new();
+    let mut out: Vec<Block> = Vec::new();
     for c in chans {
         let b = block(radio, c, width);
-        if !seen.iter().any(|s: &(f64, f64)| (s.0 - b.lo).abs() < 1.0) {
-            seen.push((b.lo, b.hi));
+        if !out.iter().any(|o| (o.lo - b.lo).abs() < 1.0) {
             out.push(b);
         }
     }
