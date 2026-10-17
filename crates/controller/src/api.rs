@@ -47,6 +47,8 @@ pub fn router(state: AppState) -> Router {
         .route("/api/login", axum::routing::post(crate::auth::login))
         .route("/api/logout", axum::routing::post(crate::auth::logout))
         .route("/api/me", get(crate::auth::me));
+    // Routes that hand out secrets: withheld in read-only mode.
+    let secret = axum::middleware::from_fn_with_state(state.clone(), crate::auth::withhold_in_read_only);
     let protected = Router::new()
         .route("/api/status", get(status))
         .route("/api/devices", get(devices))
@@ -72,7 +74,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/settings/site", get(crate::site::get_site).put(crate::site::put_site))
         .route("/api/settings/wlans", get(crate::settings::wlans).post(crate::settings::post_wlan))
         .route("/api/settings/wlans/{id}", axum::routing::put(crate::settings::put_wlan).delete(crate::settings::delete_wlan_route))
-        .route("/api/settings/wlans/{id}/passphrase", get(crate::settings::passphrase))
+        .route("/api/settings/wlans/{id}/passphrase", get(crate::settings::passphrase).route_layer(secret.clone()))
         .route("/api/settings/devices/{mac}", get(crate::settings::device).put(crate::settings::put_device))
         .route("/api/settings/usergroups", get(crate::settings::usergroups).post(crate::settings::post_usergroup))
         .route("/api/settings/usergroups/{id}", axum::routing::put(crate::settings::put_usergroup).delete(crate::settings::delete_usergroup))
@@ -89,7 +91,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/firmware/cancel", axum::routing::post(crate::firmware::cancel))
         .route("/api/backups", get(crate::backup::index).post(crate::backup::create_now))
         .route("/api/backups/settings", axum::routing::put(crate::backup::put_settings))
-        .route("/api/backups/file/{name}", get(crate::backup::download).delete(crate::backup::delete))
+        .route("/api/backups/file/{name}", get(crate::backup::download).delete(crate::backup::delete).route_layer(secret.clone()))
         .route("/api/backups/upload", axum::routing::post(crate::backup::upload))
         .route("/api/backups/restore", axum::routing::post(crate::backup::restore))
         .route("/api/alerts", get(crate::alerts::list))
@@ -1013,6 +1015,14 @@ mod tests {
         assert_eq!(get(&app, "/api/status").await.status(), StatusCode::OK);
         assert_eq!(get(&app, "/api/settings/wlans/w1/passphrase").await.status(), StatusCode::FORBIDDEN);
         assert_eq!(get(&app, "/api/backups/file/apctl-0.1.0-20260101-000000.apb").await.status(), StatusCode::FORBIDDEN);
+        // With a login they are served (here: there are no settings yet).
+        let (mut state, _engine) = state();
+        let file = state.backups.data_dir.join("users");
+        std::fs::write(&file, format!("admin:{}\n", crate::auth::hash_password("x").unwrap())).unwrap();
+        state.auth = Arc::new(crate::auth::Auth::new(crate::auth::Users::load(&file).unwrap(), &state.store, state.writer.clone(), Default::default()).unwrap());
+        let cookie = format!("{}={}", crate::auth::COOKIE, state.auth.create("admin").unwrap());
+        let req = Request::get("/api/settings/wlans/w1/passphrase").header(header::COOKIE, cookie).body(Body::empty()).unwrap();
+        assert_eq!(router(state).oneshot(req).await.unwrap().status(), StatusCode::CONFLICT);
     }
 
     #[tokio::test]

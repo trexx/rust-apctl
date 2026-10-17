@@ -322,10 +322,14 @@ fn json_error(status: StatusCode, msg: &str) -> Response {
     (status, Json(json!({ "error": msg }))).into_response()
 }
 
-/// Reads that hand out secrets: Wi-Fi passphrases, and backups (which hold the
-/// APs' keys and the passphrases). Read-only mode does not serve them.
-fn secret(path: &str) -> bool {
-    path.starts_with("/api/backups/file/") || (path.starts_with("/api/settings/wlans/") && path.ends_with("/passphrase"))
+/// For the routes that hand out secrets (Wi-Fi passphrases, and backups, which
+/// hold the APs' keys and the passphrases): read-only mode does not serve
+/// them. Set on the route itself, so a new one cannot be missed.
+pub async fn withhold_in_read_only(State(s): State<AppState>, req: Request, next: Next) -> Response {
+    if !s.auth.enabled() {
+        return json_error(StatusCode::FORBIDDEN, "this needs a login: no users are configured (see --users-file)");
+    }
+    next.run(req).await
 }
 
 /// Whether a request carries the header every change must have. Browsers
@@ -342,12 +346,10 @@ pub async fn require_login(State(s): State<AppState>, req: Request, next: Next) 
     let auth = &s.auth;
     let mutating = !matches!(*req.method(), Method::GET | Method::HEAD | Method::OPTIONS);
     if !auth.enabled() {
-        // Without users apctl is read-only, and keeps its secrets.
+        // Without users apctl is read-only, and keeps its secrets (the
+        // routes that hold them have `withhold_in_read_only`).
         if mutating {
             return json_error(StatusCode::FORBIDDEN, "read-only: no users are configured (see --users-file)");
-        }
-        if secret(req.uri().path()) {
-            return json_error(StatusCode::FORBIDDEN, "this needs a login: no users are configured (see --users-file)");
         }
         return next.run(req).await;
     }
