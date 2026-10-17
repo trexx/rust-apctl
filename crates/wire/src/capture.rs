@@ -588,6 +588,16 @@ fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     memchr::memmem::find(haystack, needle)
 }
 
+/// The status and body (chunked encoding undone) of the HTTP response in `buf`, which
+/// holds everything the server sent before it closed the connection. `None` when that
+/// is not one whole, well-formed response.
+pub fn parse_response(buf: &[u8]) -> Option<(u16, Vec<u8>)> {
+    match parse_http(buf, false, true) {
+        ParseResult::Complete(Parsed::Response { status, body }, _) => Some((status, body)),
+        _ => None,
+    }
+}
+
 /// Opens a capture file, or stdin for `-`.
 pub fn open_input(path: &str) -> Result<Box<dyn Read + Send>> {
     if path == "-" {
@@ -740,6 +750,15 @@ mod tests {
         assert!(matches!(h.take_http(false), Some(Parsed::Response { status: 200, body }) if body == b"all of it"));
         let mut h = HalfStream { buf: b"HTTP/1.1 204 No Content\r\n\r\n".to_vec(), ..Default::default() };
         assert!(matches!(h.take_http(false), Some(Parsed::Response { status: 204, body }) if body.is_empty()));
+    }
+
+    #[test]
+    fn a_whole_response_is_parsed_for_its_reader() {
+        assert_eq!(parse_response(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nokEXTRA"), Some((200, b"ok".to_vec())));
+        assert_eq!(parse_response(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n2\r\nok\r\n1\r\n!\r\n0\r\n\r\n"), Some((200, b"ok!".to_vec())));
+        assert_eq!(parse_response(b"HTTP/1.0 404 Not Found\r\n\r\nall of it"), Some((404, b"all of it".to_vec())));
+        assert_eq!(parse_response(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nok"), None, "truncated");
+        assert_eq!(parse_response(b"not http"), None);
     }
 
     #[test]
