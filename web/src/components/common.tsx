@@ -3,7 +3,7 @@ import type { ReactNode, RefObject } from "react";
 import { Link, useSearchParams } from "react-router";
 import { useQueryClient } from "@tanstack/react-query";
 import type { QueryKey } from "@tanstack/react-query";
-import { eventData, useDevices } from "../api";
+import { eventData, useDeviceNames } from "../api";
 import type {
   AppEvent,
   EventKind,
@@ -261,7 +261,7 @@ export function ApSelect({
   value: string;
   onChange: (mac: string) => void;
 }) {
-  const devices = useDevices();
+  const names = useDeviceNames();
   return (
     <select
       value={value}
@@ -269,9 +269,9 @@ export function ApSelect({
       aria-label="Access point"
     >
       <option value="">All APs</option>
-      {(devices.data ?? []).map((d) => (
-        <option key={d.mac} value={d.mac}>
-          {d.name ?? d.mac}
+      {Object.entries(names).map(([mac, name]) => (
+        <option key={mac} value={mac}>
+          {name}
         </option>
       ))}
     </select>

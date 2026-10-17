@@ -1,5 +1,5 @@
 import { useEffect } from "react";
-import { keepPreviousData, queryOptions, useQuery, useQueryClient } from "@tanstack/react-query";
+import { keepPreviousData, useQuery, useQueryClient } from "@tanstack/react-query";
 import type { QueryKey } from "@tanstack/react-query";
 
 export type Mac = string;
@@ -421,9 +421,11 @@ export const keys = {
   me: family("me"),
   status: family("status"),
   devices: family("devices"),
+  deviceNames: family("device-names"),
   device: family<[mac: Mac]>("device"),
   clients: family("clients"),
   clientNames: family("client-names"),
+  multicastPeers: family("multicast-peers"),
   client: family<[mac: Mac]>("client"),
   series: family<[table: string, key: string, span: TimeSpan]>("series"),
   events: family<[filter: EventFilter]>("events"),
@@ -996,22 +998,39 @@ export const useChannelPlan = (band: string, dfs: boolean) =>
 export const useStatus = (poll = false) =>
   useQuery({ queryKey: keys.status(), queryFn: getting<Status>("/api/status"), refetchInterval: poll ? 15_000 : false });
 
-const devicesQuery = queryOptions({ queryKey: keys.devices(), queryFn: getting<DeviceSummary[]>("/api/devices") });
-const clientsQuery = queryOptions({ queryKey: keys.clients(), queryFn: getting<ClientView[]>("/api/clients") });
-
-export const useDevices = () => useQuery(devicesQuery);
+/** Every AP with its latest report, refreshed by the live socket as they report: for the overview's cards. */
+export const useDevices = () => useQuery({ queryKey: keys.devices(), queryFn: getting<DeviceSummary[]>("/api/devices") });
 
 export const useDevice = (mac: Mac) =>
   useQuery({ queryKey: keys.device(mac), queryFn: getting<DeviceDetail>(`/api/devices/${mac}`) });
 
 /** Every client of the past year, with its latest sample: for the client list. */
-export const useClients = () => useQuery(clientsQuery);
+export const useClients = () => useQuery({ queryKey: keys.clients(), queryFn: getting<ClientView[]>("/api/clients") });
+
+/** A client in a multicast group, as a client's page lists its peers. */
+export type GroupMember = { mac: Mac; name: string };
+
+/** The connected clients in each multicast group, by group. */
+function groupMembers(clients: ClientView[]): Record<string, GroupMember[]> {
+  const by: Record<string, GroupMember[]> = {};
+  for (const c of clients) {
+    if (!c.connected) continue;
+    for (const g of c.sample.multicast?.memberships ?? []) (by[g] ??= []).push({ mac: c.sample.mac, name: displayName(c) });
+  }
+  return by;
+}
 
 /**
- * Something derived from the client list, re-rendering only when it changes.
- * `select` must be a module-level function, so it runs once per fetch.
+ * The connected clients in each multicast group, for a client's page (only fetched when `enabled`). It takes
+ * the whole client list, so it is polled every minute rather than refreshed by the live socket.
  */
-export const useClientsSelect = <T>(select: (clients: ClientView[]) => T, enabled = true) => useQuery({ ...clientsQuery, select, enabled });
+export const useMulticastPeers = (enabled: boolean) =>
+  useQuery({
+    queryKey: keys.multicastPeers(),
+    queryFn: async ({ signal }) => groupMembers(await get<ClientView[]>("/api/clients", signal)),
+    refetchInterval: 60_000,
+    enabled,
+  });
 
 /** Names by MAC, for links. */
 export type Names = Readonly<Record<Mac, string>>;
@@ -1019,8 +1038,17 @@ export type Names = Readonly<Record<Mac, string>>;
 const NO_NAMES: Names = Object.freeze({});
 const deviceNames = (devices: DeviceSummary[]): Names => Object.fromEntries(devices.map((d) => [d.mac, d.name ?? d.mac]));
 
-/** AP names (else their MAC) by MAC; the same object until a name changes. */
-export const useDeviceNames = (): Names => useQuery({ ...devicesQuery, select: deviceNames }).data ?? NO_NAMES;
+/**
+ * AP names (else their MAC) by MAC, in the server's order; the same object until a name changes. Kept apart
+ * from `useDevices`, which refetches as the APs report: the live socket refreshes the names when an AP is
+ * adopted, forgotten or renamed (its new name comes with the config), and the slow poll catches the rest.
+ */
+export const useDeviceNames = (): Names =>
+  useQuery({
+    queryKey: keys.deviceNames(),
+    queryFn: async ({ signal }) => deviceNames(await get<DeviceSummary[]>("/api/devices", signal)),
+    refetchInterval: 300_000,
+  }).data ?? NO_NAMES;
 
 /**
  * Client display names by MAC, for the clients that have one; the same object until a name changes.
@@ -1156,6 +1184,9 @@ export const markAlertsRead = () => send("POST", "/api/alerts/read", {});
 /** Event kinds that change what the adoption panel shows. */
 const ADOPTION_EVENTS = new Set(["ap_pending", "ap_adopting", "ap_adopted", "ap_forgotten"]);
 
+/** Event kinds that may change an AP's name, or which APs there are. */
+const NAME_EVENTS = new Set(["ap_seen", "ap_adopted", "ap_forgotten", "config_applied", "settings_changed", "settings_imported"]);
+
 /** Event kinds that change the channel plan and the RF views. */
 const RF_EVENTS = new Set(["ap_scan_done", "channel_plan", "radio_changed"]);
 
@@ -1249,12 +1280,14 @@ export function useLiveUpdates(): void {
       }
       switch (msg.type) {
         case "device":
+          // Only the overview's cards use the whole list; the names have their own query.
           invalidate(keys.devices(), 4000);
           invalidate(keys.device(msg.mac));
           break;
         case "clients":
-          // The message doesn't say which clients changed; at most one client page is open.
-          invalidate(keys.clients(), 4000);
+          // Sent with every report that has clients, without saying which changed. The list holds every
+          // client of the past year, so it follows more slowly; at most one client page is open.
+          invalidate(keys.clients(), 20_000);
           invalidate(keys.client(), 4000);
           break;
         case "event": {
@@ -1265,6 +1298,7 @@ export function useLiveUpdates(): void {
             invalidate(keys.settingsState());
           }
           if (ADOPTION_EVENTS.has(msg.kind)) invalidate(keys.adoption());
+          if (NAME_EVENTS.has(msg.kind)) invalidate(keys.deviceNames(), 5000);
           if (msg.kind.startsWith("ap_upgrade")) invalidate(keys.firmware());
           if (RF_EVENTS.has(msg.kind)) {
             // A scan, a plan run or a channel change can change the plan, and what the radios hear.
