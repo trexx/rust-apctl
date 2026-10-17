@@ -1,9 +1,36 @@
-//! Writing captures: the legacy pcap framing and HTTP/1.1 messages, for informdump's
-//! made-up demo site and for tests.
+//! Writing captures: the legacy pcap framing, Ethernet frames and HTTP/1.1 messages,
+//! for informdump's made-up demo site and for tests.
 
 use std::io::{self, Write};
 
+use etherparse::PacketBuilder;
+
 use crate::capture::Micros;
+
+/// One end of a made-up IPv4 conversation.
+#[derive(Clone, Copy, Debug)]
+pub struct Endpoint {
+    pub mac: [u8; 6],
+    pub ip: [u8; 4],
+    pub port: u16,
+}
+
+/// An Ethernet frame holding one IPv4 TCP segment from `src` to `dst` (TTL 64, a full
+/// window, no flags).
+pub fn tcp_frame(src: Endpoint, dst: Endpoint, seq: u32, payload: &[u8]) -> io::Result<Vec<u8>> {
+    let builder = PacketBuilder::ethernet2(src.mac, dst.mac).ipv4(src.ip, dst.ip, 64).tcp(src.port, dst.port, seq, 65_535);
+    let mut frame = Vec::with_capacity(builder.size(payload.len()));
+    builder.write(&mut frame, payload).map_err(io::Error::other)?;
+    Ok(frame)
+}
+
+/// An Ethernet frame holding one IPv4 UDP datagram from `src` to `dst` (TTL 64).
+pub fn udp_frame(src: Endpoint, dst: Endpoint, payload: &[u8]) -> io::Result<Vec<u8>> {
+    let builder = PacketBuilder::ethernet2(src.mac, dst.mac).ipv4(src.ip, dst.ip, 64).udp(src.port, dst.port);
+    let mut frame = Vec::with_capacity(builder.size(payload.len()));
+    builder.write(&mut frame, payload).map_err(io::Error::other)?;
+    Ok(frame)
+}
 
 /// The header of a legacy pcap (microsecond timestamps) of Ethernet frames.
 pub fn write_pcap_header(out: &mut impl Write, snaplen: u32) -> io::Result<()> {
