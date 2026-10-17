@@ -54,6 +54,11 @@
   box-sizing: border-box;
 }
 
+/* `hidden` wins over the display a class sets (the settings form hides under its review). */
+[hidden] {
+  display: none !important;
+}
+
 body {
   margin: 0;
   background: var(--bg);

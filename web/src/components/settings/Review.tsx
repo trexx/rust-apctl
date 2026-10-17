@@ -106,7 +106,7 @@ export function Review({
 
 /**
  * What every settings editor shares: the form, then Cancel and Review below
- * it; Review swaps the form for the review of `patch` until Back.
+ * it; Review hides the form behind the review of `patch` until Back.
  */
 export function EditorShell({
   target,
@@ -125,32 +125,35 @@ export function EditorShell({
   children: ReactNode;
 }) {
   const [review, setReview] = useState<Fields | null>(null);
-  if (review)
-    return (
-      <Review
-        target={target}
-        patch={review}
-        active={active}
-        onBack={() => setReview(null)}
-        onSaved={onClose}
-      />
-    );
   const nothing = Object.keys(patch).length === 0;
+  // The form stays mounted (hidden) under the review, so Back finds open
+  // sections, revealed passwords and half-typed text as they were.
   return (
-    <div className="settings-form">
-      {children}
-      <div className="actions-row">
-        <button className="btn" onClick={onClose}>
-          Cancel
-        </button>
-        <button
-          className="btn primary"
-          disabled={nothing || invalid}
-          onClick={() => setReview(patch)}
-        >
-          {nothing ? "No changes" : "Review changes"}
-        </button>
+    <>
+      {review && (
+        <Review
+          target={target}
+          patch={review}
+          active={active}
+          onBack={() => setReview(null)}
+          onSaved={onClose}
+        />
+      )}
+      <div className="settings-form" hidden={!!review}>
+        {children}
+        <div className="actions-row">
+          <button className="btn" onClick={onClose}>
+            Cancel
+          </button>
+          <button
+            className="btn primary"
+            disabled={nothing || invalid}
+            onClick={() => setReview(patch)}
+          >
+            {nothing ? "No changes" : "Review changes"}
+          </button>
+        </div>
       </div>
-    </div>
+    </>
   );
 }
