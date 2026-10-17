@@ -308,7 +308,26 @@ pub fn seal(mac: Mac, flags: Flags, iv: [u8; 16], key: &[u8; 16], plaintext: &[u
     let room = if snappy { snap::raw::max_compress_len(plaintext.len()) } else { plaintext.len() };
     let mut out = Vec::with_capacity(HEADER_LEN + room + 16);
     out.resize(HEADER_LEN, 0);
-    let mut out = compress_into(flags, plaintext, out);
+    encrypt_into(mac, flags, iv, key, compress_into(flags, plaintext, out))
+}
+
+/// [`seal`] with the payload written by `write` (e.g. `serde_json::to_writer`)
+/// at the end of the buffer it gets: straight into the packet, unless it is
+/// to be compressed.
+pub fn seal_with(mac: Mac, flags: Flags, iv: [u8; 16], key: &[u8; 16], write: impl FnOnce(&mut Vec<u8>)) -> Vec<u8> {
+    if flags.has(Flags::ZLIB) || flags.has(Flags::SNAPPY) {
+        let mut plaintext = Vec::new();
+        write(&mut plaintext);
+        return seal(mac, flags, iv, key, &plaintext);
+    }
+    let mut out = vec![0; HEADER_LEN];
+    write(&mut out);
+    encrypt_into(mac, flags, iv, key, out)
+}
+
+/// Finishes a packet whose payload follows room for the header in `out`:
+/// encrypted in place as flagged, then the header written.
+fn encrypt_into(mac: Mac, flags: Flags, iv: [u8; 16], key: &[u8; 16], mut out: Vec<u8>) -> Vec<u8> {
     let msg_len = out.len() - HEADER_LEN;
     let mut header = Header {
         packet_version: 0,
@@ -368,6 +387,7 @@ mod tests {
         ];
         for bits in combos {
             let wire = seal(MAC, Flags(bits), IV, &KEY, JSON);
+            assert_eq!(seal_with(MAC, Flags(bits), IV, &KEY, |out| out.extend_from_slice(JSON)), wire, "flags {:?}", Flags(bits));
             let pkt = Packet::parse(&wire).unwrap();
             assert_eq!(pkt.header.mac, MAC);
             assert_eq!(pkt.header.flags, Flags(bits));

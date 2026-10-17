@@ -646,10 +646,11 @@ pub async fn inform(
     response
 }
 
-/// A reply in the request's encryption mode, never compressed, with a fresh IV.
+/// A reply in the request's encryption mode, never compressed, with a fresh
+/// IV, serialised straight into the packet.
 fn sealed(mac: Mac, gcm: bool, key: &[u8; 16], reply: &Value) -> Response {
     let flags = Flags(Flags::ENCRYPTED | if gcm { Flags::GCM } else { 0 });
-    let packet = inform::seal(mac, flags, random_bytes::<16>(), key, reply.to_string().as_bytes());
+    let packet = inform::seal_with(mac, flags, random_bytes::<16>(), key, |out| serde_json::to_writer(out, reply).expect("a JSON value serialises"));
     ([(header::CONTENT_TYPE, "application/x-binary")], packet).into_response()
 }
 
