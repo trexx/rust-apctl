@@ -689,8 +689,8 @@ impl Engine {
         let a = &snap.ap;
         let changed = prev.as_ref().is_none_or(|p| {
             let o = &p.snapshot.ap;
-            !p.online || (&o.hostname, &o.model, &o.model_display, &o.version, &o.ip, &o.serial, &o.hash_id, &o.cfgversion)
-                != (&a.hostname, &a.model, &a.model_display, &a.version, &a.ip, &a.serial, &a.hash_id, &a.cfgversion)
+            !p.online || (&o.hostname, &o.model, &o.model_display, &o.version, &o.ip, &o.serial, &o.hash_id)
+                != (&a.hostname, &a.model, &a.model_display, &a.version, &a.ip, &a.serial, &a.hash_id)
         });
         if changed || due(self.written.devices.get(&mac), ts, REFRESH_SECS) {
             self.written.devices.insert(mac, ts);
@@ -1367,7 +1367,6 @@ impl Engine {
                 d.online = false;
                 offline.push(*mac);
                 events.push(ev(now, EventKind::ApOffline, Some(*mac), None, json!({ "last_seen": d.last_seen })));
-                self.writer.exec(Db::Config, "UPDATE devices SET online = 0 WHERE mac = ?1", vec![Sql::Text(mac.to_string())]);
             }
         }
         // A client is gone when its AP has reported a full client list since it was
@@ -1415,15 +1414,17 @@ impl Engine {
         }
     }
 
-    /// The AP's row in `devices`, as of the inform at `a.ts`.
+    /// The AP's row in `devices`, as of the inform at `a.ts`. The table's
+    /// `name`, `cfgversion` and `online` columns are no longer used: whether an
+    /// AP is online is only known live, and its config version is in `device_config`.
     fn write_device(&self, a: &crate::model::ApSample) {
         self.writer.exec(
             Db::Config,
-            "INSERT INTO devices (mac, hostname, model, model_display, version, ip, serial, hash_id, first_seen, last_seen, uptime, cfgversion, online)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9, ?10, ?11, 1)
+            "INSERT INTO devices (mac, hostname, model, model_display, version, ip, serial, hash_id, first_seen, last_seen, uptime)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9, ?10)
              ON CONFLICT (mac) DO UPDATE SET hostname = excluded.hostname, model = excluded.model, model_display = excluded.model_display,
                version = excluded.version, ip = excluded.ip, serial = excluded.serial, hash_id = excluded.hash_id,
-               last_seen = excluded.last_seen, uptime = excluded.uptime, cfgversion = excluded.cfgversion, online = 1",
+               last_seen = excluded.last_seen, uptime = excluded.uptime",
             vec![
                 Sql::Text(a.mac.to_string()),
                 opt_text(a.hostname.clone()),
@@ -1435,7 +1436,6 @@ impl Engine {
                 opt_text(a.hash_id.clone()),
                 Sql::Integer(a.ts),
                 i(a.uptime),
-                opt_text(a.cfgversion.clone()),
             ],
         );
     }

@@ -191,6 +191,7 @@ pub fn table(name: &str) -> Option<&'static Table> {
 pub const TIERS: [(&str, i64, i64); 3] = [("", 0, 48 * 3600), ("_5m", 300, 30 * 86400), ("_1h", 3600, 365 * 86400)];
 
 const CONFIG_SCHEMA: &str = "
+-- name, cfgversion and online are no longer written; old databases have them filled.
 CREATE TABLE IF NOT EXISTS devices (
     mac TEXT PRIMARY KEY, name TEXT, hostname TEXT, model TEXT, model_display TEXT, version TEXT,
     ip TEXT, serial TEXT, hash_id TEXT, first_seen INTEGER, last_seen INTEGER, uptime INTEGER,

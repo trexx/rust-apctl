@@ -572,11 +572,11 @@ fn pairs<P: rusqlite::Params>(c: &rusqlite::Connection, sql: &str, params: P) ->
     c.prepare(sql)?.query_map(params, |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?)))?.collect()
 }
 
-/// APs' names, else their hostnames.
-const AP_NAMES: &str = "SELECT mac, COALESCE(name, hostname) FROM devices";
+/// APs' names: their hostnames.
+const AP_NAMES: &str = "SELECT mac, hostname FROM devices";
 
 impl Names {
-    /// From the database: APs' names (else hostnames) and clients' hostnames.
+    /// From the database: APs' and clients' hostnames.
     pub fn load(c: &rusqlite::Connection) -> rusqlite::Result<Names> {
         Ok(Names { aps: pairs(c, AP_NAMES, [])?, clients: pairs(c, "SELECT mac, hostname FROM clients", [])? })
     }

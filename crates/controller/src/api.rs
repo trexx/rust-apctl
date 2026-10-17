@@ -361,7 +361,7 @@ struct RadioRow {
 async fn stored_devices(store: &Arc<Store>, only: Option<Mac>) -> Result<Vec<StoredDevice>, ApiError> {
     read(store, Db::Config, move |c| {
         let mut stmt = c.prepare(
-            "SELECT mac, COALESCE(name, hostname), model, model_display, version, ip, serial, first_seen, last_seen FROM devices WHERE ?1 IS NULL OR mac = ?1",
+            "SELECT mac, hostname, model, model_display, version, ip, serial, first_seen, last_seen FROM devices WHERE ?1 IS NULL OR mac = ?1",
         )?;
         // A row whose MAC does not parse is no AP to show.
         let rows = stmt
@@ -1081,7 +1081,7 @@ mod tests {
         let header = inform::Header { packet_version: 0, mac: Mac([0; 6]), flags: inform::Flags(0), iv: [0; 16], payload_version: 1, payload_len: 0 };
         let decoded = wire::decode::Decoded { header, key: wire::decode::KeyUsed::Device, payload };
         engine.handle(crate::engine::Input::Inform { ts: 50, peer: "x".into(), decoded });
-        s.writer.exec(Db::Config, "INSERT INTO devices (mac, name, model, first_seen, last_seen) VALUES ('02:00:00:00:00:02', 'Attic', 'U6', 10, 20)", vec![]);
+        s.writer.exec(Db::Config, "INSERT INTO devices (mac, hostname, model, first_seen, last_seen) VALUES ('02:00:00:00:00:02', 'Attic', 'U6', 10, 20)", vec![]);
         assert!(s.writer.flush(std::time::Duration::from_secs(5)));
         let app = router(s);
 
