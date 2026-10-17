@@ -24,19 +24,13 @@ pub struct Decoded {
 pub fn decode(body: &[u8], keys: &KeyStore, mac_hint: Option<Mac>) -> Result<Decoded> {
     let pkt = Packet::parse(body)?;
     let flags = pkt.header.flags;
-    let mut attempts: Vec<(KeyUsed, [u8; 16])> = Vec::new();
-    if !flags.has(Flags::ENCRYPTED) {
-        attempts.push((KeyUsed::None, DEFAULT_KEY));
-    } else {
-        let hint = mac_hint.filter(|m| *m != pkt.header.mac);
-        for mac in [Some(pkt.header.mac), hint].into_iter().flatten() {
-            if let Some(k) = keys.get(&mac) {
-                attempts.push((KeyUsed::Device, *k));
-            }
-        }
-        attempts.push((KeyUsed::Default, DEFAULT_KEY));
-    }
-    let (key, _, payload) = open_with(&pkt, attempts)
+    let encrypted = flags.has(Flags::ENCRYPTED);
+    // An unencrypted packet needs no key; otherwise the device's (by the header's MAC,
+    // then by the hint), then the default one.
+    let hint = mac_hint.filter(|m| *m != pkt.header.mac);
+    let device = [Some(pkt.header.mac), hint].into_iter().flatten().filter(|_| encrypted).filter_map(|mac| keys.get(&mac));
+    let last = (if encrypted { KeyUsed::Default } else { KeyUsed::None }, DEFAULT_KEY);
+    let (key, _, payload) = open_with(&pkt, device.map(|k| (KeyUsed::Device, *k)).chain([last]))
         .with_context(|| format!("no known key decrypts the packet from {} (flags {:?})", pkt.header.mac, flags))?;
     Ok(Decoded { header: pkt.header, key, payload })
 }
