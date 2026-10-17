@@ -6,6 +6,7 @@
 //! original value that was replaced; any survivor aborts the run.
 
 use std::collections::{BTreeMap, HashMap};
+use std::net::Ipv4Addr;
 use std::path::Path;
 
 use anyhow::{Context, Result, bail};
@@ -25,6 +26,7 @@ pub struct Sanitizer {
     uuid: Regex,
     hex: Regex,
     ipv6: Regex,
+    ipv4: Regex,
     /// Domain suffixes to replace (e.g. the controller's DNS name).
     domains: Vec<String>,
     /// Known hostnames and SSIDs as (original, fake), longest first, and the sizes
@@ -45,6 +47,7 @@ impl Sanitizer {
             uuid: Regex::new(r"(?i)\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b").unwrap(),
             hex: Regex::new(r"(?i)\b[0-9a-f]{16,}\b").unwrap(),
             ipv6: Regex::new(r"(?i)\b(?:[0-9a-f]{1,4}:){2,7}[0-9a-f]{1,4}\b").unwrap(),
+            ipv4: Regex::new(r"\b(?:[0-9]{1,3}\.){3}[0-9]{1,3}\b").unwrap(),
             domains,
             known: Vec::new(),
             known_sizes: (0, 0),
@@ -111,6 +114,22 @@ impl Sanitizer {
                 fake(maps, "ipv6", &m.to_ascii_lowercase(), |n| format!("2001:db8::{n:x}"))
             }
         });
+        // Public IPv4 addresses (the WAN address, the ISP's DNS servers) likewise;
+        // private ones say nothing about where the network is.
+        let mut ipv4 = String::with_capacity(out.len());
+        let mut last = 0;
+        for m in self.ipv4.find_iter(&out) {
+            let (a, b) = (m.start(), m.end());
+            if is_public_ipv4(m.as_str()) && !in_longer_dotted(&out, a, b) {
+                ipv4.push_str(&out[last..a]);
+                ipv4.push_str(&fake(maps, "ipv4", m.as_str(), fake_ipv4));
+                last = b;
+            }
+        }
+        if last > 0 {
+            ipv4.push_str(&out[last..]);
+            out = ipv4;
+        }
         out
     }
 
@@ -194,8 +213,14 @@ impl Sanitizer {
     }
 
     /// Fails if any original value we replaced still appears in `text`.
+    #[cfg(test)]
     pub fn check_clean(&self, text: &str, what: &str) -> Result<()> {
-        let lower = text.to_ascii_lowercase();
+        self.leak_check().check(text, what)
+    }
+
+    /// The replaced values to look for, prepared once for checking many texts.
+    pub fn leak_check(&self) -> LeakCheck {
+        let mut originals = Vec::new();
         for (kind, map) in &self.maps {
             for original in map.keys() {
                 // Names and SSIDs under 4 characters ("tv", "Mac") collide with
@@ -204,12 +229,32 @@ impl Sanitizer {
                     continue;
                 }
                 let original = original.to_ascii_lowercase();
-                let found = if *kind == "secret" { contains_value(&lower, &original) } else { contains_word(&lower, &original) };
                 // MACs also appear without colons (serial numbers, file names).
-                let found = found || (*kind == "mac" && lower.contains(&original.replace(':', "")));
-                if found {
-                    bail!("{what}: a {kind} value ({} chars) survived sanitising", original.len());
-                }
+                let bare = (*kind == "mac").then(|| original.replace(':', ""));
+                originals.push((*kind, original, bare));
+            }
+        }
+        LeakCheck { originals }
+    }
+}
+
+/// The original values a sanitiser replaced, lowercased.
+pub struct LeakCheck {
+    originals: Vec<(&'static str, String, Option<String>)>,
+}
+
+impl LeakCheck {
+    /// Fails if any of the originals still appears in `text`.
+    pub fn check(&self, text: &str, what: &str) -> Result<()> {
+        let lower = text.to_ascii_lowercase();
+        for (kind, original, bare) in &self.originals {
+            let found = match *kind {
+                "secret" => contains_value(&lower, original),
+                "ipv4" => contains_ipv4(&lower, original),
+                _ => contains_word(&lower, original),
+            };
+            if found || bare.as_ref().is_some_and(|b| lower.contains(b.as_str())) {
+                bail!("{what}: a {kind} value ({} chars) survived sanitising", original.len());
             }
         }
         Ok(())
@@ -255,6 +300,53 @@ fn is_service_type(name: &str) -> bool {
     };
     matches!(labels.as_slice(), [service, proto, "local"] if service.starts_with('_') && matches!(*proto, "_tcp" | "_udp"))
         && labels.iter().all(|l| !id_like(l) && *l == l.to_ascii_lowercase())
+}
+
+/// An IPv4 address that tells where a network is: not private, loopback, link-local,
+/// multicast or reserved (netmasks such as 255.255.255.0 are reserved), nor one of
+/// the documentation and benchmarking ranges the fakes come from.
+fn is_public_ipv4(s: &str) -> bool {
+    let Ok(ip) = s.parse::<Ipv4Addr>() else { return false };
+    let [a, b, ..] = ip.octets();
+    !(ip.is_private()
+        || ip.is_loopback()
+        || ip.is_link_local()
+        || ip.is_unspecified()
+        || ip.is_multicast()
+        || ip.is_documentation()
+        || a == 0
+        || a >= 240
+        || (a == 198 && (b == 18 || b == 19)))
+}
+
+/// The `n`-th (from 1) public IPv4 address's fake: the documentation ranges, then the
+/// benchmarking range.
+fn fake_ipv4(n: usize) -> String {
+    let i = n - 1;
+    match ["192.0.2", "198.51.100", "203.0.113"].get(i / 254) {
+        Some(net) => format!("{net}.{}", i % 254 + 1),
+        None => {
+            let j = i - 3 * 254;
+            format!("198.{}.{}.{}", 18 + j / (256 * 254) % 2, j / 254 % 256, j % 254 + 1)
+        }
+    }
+}
+
+/// Whether the address-shaped `text[a..b]` is part of a longer dotted number (an SNMP
+/// OID, a version such as 1.2.3.4.5), which is not an address.
+fn in_longer_dotted(text: &str, a: usize, b: usize) -> bool {
+    let (before, after) = (&text.as_bytes()[..a], &text.as_bytes()[b..]);
+    matches!(before, [.., d, b'.'] if d.is_ascii_digit()) || matches!(after, [b'.', d, ..] if d.is_ascii_digit())
+}
+
+/// [`contains_word`] for an IPv4 address, which, like the sanitiser, does not count one
+/// inside a longer dotted number.
+fn contains_ipv4(text: &str, ip: &str) -> bool {
+    let is_word = |c: Option<char>| c.is_some_and(|c| c.is_ascii_alphanumeric() || c == '_');
+    text.match_indices(ip).any(|(i, _)| {
+        let end = i + ip.len();
+        !is_word(text[..i].chars().next_back()) && !is_word(text[end..].chars().next()) && !in_longer_dotted(text, i, end)
+    })
 }
 
 /// Whole-word match: names inside longer identifiers (a hostname inside an
@@ -320,10 +412,11 @@ pub fn run(input: &Path, output: &Path, files: &[String], domains: Vec<String>, 
     }
     // Check everything against the final maps, so values first seen in a later
     // file are also caught in earlier ones.
+    let leaks = s.leak_check();
     for (path, text) in &written {
-        s.check_clean(text, &path.display().to_string())?;
+        leaks.check(text, &path.display().to_string())?;
         let name = path.file_name().unwrap_or_default().to_string_lossy();
-        s.check_clean(&name, &format!("file name {name}"))?;
+        leaks.check(&name, &format!("file name {name}"))?;
     }
     for (path, text) in written {
         std::fs::write(&path, text).with_context(|| format!("writing {}", path.display()))?;
@@ -392,5 +485,27 @@ mod tests {
         assert!(!contains_word("code: google_chromecast", "chromecast"));
         assert_eq!(s.scrub("host kitchen-tv.lan"), "host name-1.lan");
         assert!(contains_value("ssid=test\n", "test") && !contains_value("testdata/x", "test"));
+    }
+
+    #[test]
+    fn public_ipv4_addresses_become_documentation_addresses() {
+        let mut s = Sanitizer::new(Vec::new());
+        let v = json!({
+            "wan_ip": "81.2.69.160",
+            "dns": ["81.2.69.160", "9.9.9.9", "192.168.1.1", "10.0.0.2", "172.16.4.4", "127.0.0.1", "169.254.1.1"],
+            "system_cfg": "resolv.nameserver.1=9.9.9.9\nnet.netmask=255.255.255.0\nmcast=239.255.255.250\nroute=0.0.0.0",
+            "kept": ["1.3.6.1.4.1.41112", "version 4.3.2.1.5", "192.0.2.7", "8.8.8.8x", "300.1.1.1"],
+            "inform_url": "http://81.2.69.160:8080/inform",
+        });
+        let out = s.json(&v);
+        assert_eq!(out["wan_ip"], "192.0.2.1");
+        assert_eq!(out["dns"], json!(["192.0.2.1", "192.0.2.2", "192.168.1.1", "10.0.0.2", "172.16.4.4", "127.0.0.1", "169.254.1.1"]));
+        assert_eq!(out["system_cfg"], "resolv.nameserver.1=192.0.2.2\nnet.netmask=255.255.255.0\nmcast=239.255.255.250\nroute=0.0.0.0");
+        assert_eq!(out["kept"], v["kept"]);
+        assert_eq!(out["inform_url"], "http://192.0.2.1:8080/inform");
+        s.check_clean(&out.to_string(), "test").unwrap();
+        assert!(s.check_clean("dns 9.9.9.9", "leak").is_err());
+        assert!(s.check_clean("oid 1.9.9.9.9", "not an address").is_ok());
+        assert_eq!((fake_ipv4(254), fake_ipv4(255), fake_ipv4(763), fake_ipv4(763 + 254)), ("192.0.2.254".into(), "198.51.100.1".into(), "198.18.0.1".into(), "198.18.1.1".into()));
     }
 }

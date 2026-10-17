@@ -21,7 +21,7 @@ fn parse(cfg: &str) -> BTreeMap<&str, Vec<&str>> {
 }
 
 /// What changed between two configs, borrowed from them. A key's value is its line's
-/// value, or the values of a repeated key joined with ` | `.
+/// value, or the values of a repeated key joined with ` | `. Each list is in key order.
 #[derive(Debug, Default, PartialEq)]
 pub struct Diff<'a> {
     pub added: Vec<(&'a str, Cow<'a, str>)>,
@@ -49,21 +49,26 @@ impl Diff<'_> {
     /// Renders the diff with `+`, `-` and `~` markers, one key per line, sorted by key.
     /// With `redact`, values of secret-looking keys are masked.
     pub fn render(&self, indent: &str, redact: bool) -> String {
-        let show = |k: &str, v: &str| (if redact && is_secret(k) { "<redacted>" } else { v }).to_string();
-        let mut lines: Vec<(&str, String)> = Vec::new();
-        for (k, v) in &self.added {
-            lines.push((k, format!("{indent}+ {k}={}", show(k, v))));
+        fn show<'v>(redact: bool, k: &str, v: &'v str) -> &'v str {
+            if redact && is_secret(k) { "<redacted>" } else { v }
         }
-        for (k, v) in &self.removed {
-            lines.push((k, format!("{indent}- {k}={}", show(k, v))));
-        }
-        for (k, old, new) in &self.changed {
-            lines.push((k, format!("{indent}~ {k}: {} -> {}", show(k, old), show(k, new))));
-        }
-        lines.sort_by(|a, b| a.0.cmp(b.0));
+        // Each list is in key order (`diff` builds them from sorted maps) and a key is
+        // in only one of them, so merging them sorts the lines.
+        let (mut added, mut removed, mut changed) = (self.added.iter().peekable(), self.removed.iter().peekable(), self.changed.iter().peekable());
         let mut out = String::new();
-        for (_, l) in lines {
-            let _ = writeln!(out, "{l}");
+        loop {
+            let next = [added.peek().map(|a| a.0), removed.peek().map(|r| r.0), changed.peek().map(|c| c.0)];
+            let Some(first) = next.into_iter().flatten().min() else { break };
+            if next[0] == Some(first) {
+                let (k, v) = added.next().unwrap();
+                let _ = writeln!(out, "{indent}+ {k}={}", show(redact, k, v));
+            } else if next[1] == Some(first) {
+                let (k, v) = removed.next().unwrap();
+                let _ = writeln!(out, "{indent}- {k}={}", show(redact, k, v));
+            } else {
+                let (k, old, new) = changed.next().unwrap();
+                let _ = writeln!(out, "{indent}~ {k}: {} -> {}", show(redact, k, old), show(redact, k, new));
+            }
         }
         out
     }
@@ -143,8 +148,7 @@ mod tests {
         assert_eq!(repeated.changed, vec![("a", "1".into(), Cow::Owned::<str>("1 | 2".into()))]);
         assert_eq!(d.counts(), [1, 1, 1]);
         assert_eq!(diff("x.psk=a", "x.psk=b").summary(), serde_json::json!({ "added": 0, "removed": 0, "changed": 1, "diff": "~ x.psk: <redacted> -> <redacted>\n" }));
-        let rendered = d.render("", true);
-        assert!(rendered.starts_with("- radio.1.channel=36\n"));
+        assert_eq!(d.render("  ", false), "  - radio.1.channel=36\n  ~ wireless.1.security: wpa2 -> wpa3\n  + wireless.2.ssid=Test\n");
         let secret = diff("aaa.1.wpa.psk=old", "aaa.1.wpa.psk=new").render("", true);
         assert_eq!(secret, "~ aaa.1.wpa.psk: <redacted> -> <redacted>\n");
         assert_eq!(redact("a=1\nmgmt.authkey=abc"), "a=1\nmgmt.authkey=<redacted>");
@@ -174,6 +178,17 @@ mod capture_fixtures {
         v["system_cfg"].as_str().unwrap().to_string()
     }
 
+    /// `render` as it was before it merged the lists: every line formatted, then sorted.
+    fn render_by_sorting(d: &Diff, indent: &str) -> String {
+        let show = |k: &str, v: &str| (if is_secret(k) { "<redacted>" } else { v }).to_string();
+        let mut lines: Vec<(&str, String)> = Vec::new();
+        lines.extend(d.added.iter().map(|(k, v)| (*k, format!("{indent}+ {k}={}", show(k, v)))));
+        lines.extend(d.removed.iter().map(|(k, v)| (*k, format!("{indent}- {k}={}", show(k, v)))));
+        lines.extend(d.changed.iter().map(|(k, old, new)| (*k, format!("{indent}~ {k}: {} -> {}", show(k, old), show(k, new)))));
+        lines.sort_by(|a, b| a.0.cmp(b.0));
+        lines.into_iter().map(|(_, l)| l + "\n").collect()
+    }
+
     #[test]
     fn each_labelled_change_produces_the_observed_diff() {
         let Some(_) = fixtures() else { return };
@@ -187,6 +202,7 @@ mod capture_fixtures {
                 if let Some(expect) = push.get("expect") {
                     let d = diff(previous.get(&ap).expect("baseline first"), &cfg);
                     check_expectation(&format!("step {} ({label}) on AP {ap}", step["step"]), expect, &d);
+                    assert_eq!(d.render("  ", true), render_by_sorting(&d, "  "), "step {} on AP {ap}: the merged lists are in key order", step["step"]);
                     checked += 1;
                 }
                 previous.insert(ap, cfg);

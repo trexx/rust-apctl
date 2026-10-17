@@ -20,7 +20,7 @@ use anyhow::Result;
 use etherparse::PacketBuilder;
 use inform::{Flags, Mac};
 use serde_json::{Value, json};
-use wire::capture::sample::{self, http};
+use wire::synth::{self, http};
 
 const TEMPLATE_INFORM: &str = include_str!("demo/inform.json");
 const TEMPLATE_STATE: &str = include_str!("demo/state.json");
@@ -587,12 +587,12 @@ struct PcapWriter<W: Write> {
 
 impl<W: Write> PcapWriter<W> {
     fn new(mut out: W) -> Result<Self> {
-        sample::write_pcap_header(&mut out, 262_144)?;
+        synth::write_pcap_header(&mut out, 262_144)?;
         Ok(PcapWriter { out, seq: vec![(1, 1); APS.len()] })
     }
 
     fn record(&mut self, ts_ms: i64, frame: &[u8]) -> Result<()> {
-        Ok(sample::write_pcap_record(&mut self.out, ts_ms * 1000, frame)?)
+        Ok(synth::write_pcap_record(&mut self.out, ts_ms * 1000, frame)?)
     }
 
     fn tcp(&mut self, ts_ms: i64, ap: usize, to_server: bool, data: &[u8]) -> Result<()> {

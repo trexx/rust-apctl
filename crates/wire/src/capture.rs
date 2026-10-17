@@ -52,6 +52,9 @@ pub fn run_with_udp<R: Read + Send>(
     let mut interfaces: Vec<(Linktype, u64, i64)> = Vec::new();
     let mut legacy_linktype = Linktype::ETHERNET;
     let mut legacy_nanos = false;
+    // A pcapng simple packet block has no timestamp: it gets the last one seen, so
+    // shadow mode's capture-following clock does not jump back to 1970.
+    let mut last_ts: Micros = 0;
 
     loop {
         match reader.next() {
@@ -63,8 +66,8 @@ pub fn run_with_udp<R: Read + Send>(
                     }
                     PcapBlockOwned::Legacy(b) => {
                         let frac = if legacy_nanos { b.ts_usec as i64 / 1000 } else { b.ts_usec as i64 };
-                        let ts = b.ts_sec as i64 * 1_000_000 + frac;
-                        tracker.packet(legacy_linktype, ts, b.data, &mut on_event);
+                        last_ts = b.ts_sec as i64 * 1_000_000 + frac;
+                        tracker.packet(legacy_linktype, last_ts, b.data, &mut on_event);
                     }
                     PcapBlockOwned::NG(Block::SectionHeader(_)) => interfaces.clear(),
                     PcapBlockOwned::NG(Block::InterfaceDescription(idb)) => {
@@ -73,12 +76,12 @@ pub fn run_with_udp<R: Read + Send>(
                     PcapBlockOwned::NG(Block::EnhancedPacket(epb)) => {
                         let Some(&(linktype, res, off)) = interfaces.get(epb.if_id as usize) else { continue };
                         let (sec, frac) = epb.decode_ts(off.max(0) as u64, res);
-                        let ts = sec as i64 * 1_000_000 + (frac as i128 * 1_000_000 / res as i128) as i64;
-                        tracker.packet(linktype, ts, epb.data, &mut on_event);
+                        last_ts = sec as i64 * 1_000_000 + (frac as i128 * 1_000_000 / res as i128) as i64;
+                        tracker.packet(linktype, last_ts, epb.data, &mut on_event);
                     }
                     PcapBlockOwned::NG(Block::SimplePacket(spb)) => {
                         if let Some(&(linktype, ..)) = interfaces.first() {
-                            tracker.packet(linktype, 0, spb.data, &mut on_event);
+                            tracker.packet(linktype, last_ts, spb.data, &mut on_event);
                         }
                     }
                     PcapBlockOwned::NG(_) => {}
@@ -142,6 +145,8 @@ struct Conn {
     to_server: HalfStream,
     to_client: HalfStream,
     last_seen: Micros,
+    /// Some segment in either direction carried data.
+    carried: bool,
 }
 
 impl Conn {
@@ -149,13 +154,30 @@ impl Conn {
     fn closed(&self) -> bool {
         self.to_server.closed() && self.to_client.closed()
     }
+
+    /// How long the connection may go unseen before it is forgotten.
+    fn max_idle(&self) -> Micros {
+        if self.closed() {
+            CLOSED_LINGER
+        } else if self.carried {
+            MAX_IDLE
+        } else {
+            MAX_IDLE_EMPTY
+        }
+    }
 }
 
 /// Connections tracked beyond which idle ones are swept, at most once per `SWEEP_EVERY` of capture time.
 const SWEEP_ABOVE: usize = 256;
 const SWEEP_EVERY: Micros = 10_000_000;
+/// Most connections tracked at once. An AP keeps one open, so this is far more than
+/// any site has; it bounds what packets with made-up addresses can make us hold.
+const MAX_CONNS: usize = 16_384;
 /// How long an open connection may idle before it is forgotten (long live captures).
 const MAX_IDLE: Micros = 300_000_000;
+/// The same for one that never carried data (a handshake, a stray ACK): an AP sends
+/// its request as soon as it has connected.
+const MAX_IDLE_EMPTY: Micros = 10_000_000;
 /// How long a closed connection is kept: long enough for the duplicate copies of its
 /// last segments that `-i any` captures, which arrive right behind the originals.
 const CLOSED_LINGER: Micros = 2_000_000;
@@ -197,13 +219,17 @@ impl Tracker {
             return;
         };
 
-        let conn = self.conns.entry(conn_id).or_default();
-        conn.last_seen = ts;
-        let half = if to_server { &mut conn.to_server } else { &mut conn.to_client };
         if tcp.rst() {
             self.conns.remove(&conn_id);
             return;
         }
+        if self.conns.len() >= MAX_CONNS && !self.conns.contains_key(&conn_id) {
+            self.make_room(ts);
+        }
+        let conn = self.conns.entry(conn_id).or_default();
+        conn.last_seen = ts;
+        conn.carried |= !tcp.payload().is_empty();
+        let half = if to_server { &mut conn.to_server } else { &mut conn.to_client };
         half.segment(ts, tcp.sequence_number(), tcp.syn(), tcp.payload());
         half.fin |= tcp.fin();
 
@@ -229,7 +255,22 @@ impl Tracker {
     fn sweep(&mut self, ts: Micros) {
         if self.conns.len() > SWEEP_ABOVE && ts.abs_diff(self.last_sweep) >= SWEEP_EVERY as u64 {
             self.last_sweep = ts;
-            self.conns.retain(|_, c| ts - c.last_seen < if c.closed() { CLOSED_LINGER } else { MAX_IDLE });
+            self.conns.retain(|_, c| ts - c.last_seen < c.max_idle());
+        }
+    }
+
+    /// Called when the map is full and a new connection shows up: sweeps, and if
+    /// that frees too little, forgets an eighth of the map, those that never carried
+    /// data first and then the least recently seen. Packets with made-up addresses
+    /// cost no more than that, and a real connection that is forgotten picks up again
+    /// at its next message.
+    fn make_room(&mut self, ts: Micros) {
+        self.last_sweep = ts;
+        self.conns.retain(|_, c| ts - c.last_seen < c.max_idle());
+        if self.conns.len() > MAX_CONNS - MAX_CONNS / 8 {
+            let mut order: Vec<(bool, Micros)> = self.conns.values().map(|c| (c.carried, c.last_seen)).collect();
+            let (_, &mut cutoff, _) = order.select_nth_unstable(MAX_CONNS / 8);
+            self.conns.retain(|_, c| (c.carried, c.last_seen) > cutoff);
         }
     }
 }
@@ -247,6 +288,10 @@ struct HalfStream {
     /// Since when the stream has been waiting for the bytes before `pending`.
     gap_since: Option<Micros>,
     buf: Vec<u8>,
+    /// How much of `buf` has been cut into messages or skipped. The used bytes are
+    /// dropped only once they are most of the buffer: dropping them after each
+    /// message would move the rest of the buffer every time.
+    consumed: usize,
     /// A FIN was seen.
     fin: bool,
 }
@@ -261,6 +306,12 @@ const MAX_GAP_AGE: Micros = 10_000_000;
 /// Largest unparsed message kept. Inform bodies are a few KB (the largest
 /// decoded ones a few hundred KB), and anything bigger on the port is not an inform.
 const MAX_BUFFER: usize = 8 << 20;
+/// Largest message head (start line and headers). Until a head is complete it is
+/// parsed again with every segment, so one that never ends is given up on early.
+const MAX_HEAD: usize = 64 << 10;
+/// Most chunks in a chunked body: a body is walked again with every segment until
+/// it is complete. Inform replies, a few hundred KB at most, come in far fewer.
+const MAX_CHUNKS: usize = 4096;
 
 impl HalfStream {
     fn segment(&mut self, ts: Micros, seq: u32, syn: bool, payload: &[u8]) {
@@ -325,7 +376,7 @@ impl HalfStream {
             self.gap_since = None;
             return;
         };
-        self.buf.clear();
+        self.clear_buf();
         self.next_seq = self.next_seq.map(|next| next.wrapping_add((lowest - self.pos) as u32));
         self.pos = lowest;
         self.apply_pending(ts);
@@ -339,6 +390,7 @@ impl HalfStream {
     /// Frees the buffers but keeps `next_seq`.
     fn release(&mut self) {
         self.buf = Vec::new();
+        self.consumed = 0;
         self.pending = BTreeMap::new();
         self.pending_bytes = 0;
         self.gap_since = None;
@@ -352,31 +404,48 @@ impl HalfStream {
             return;
         }
         let fresh = &payload[skip..];
-        if self.buf.len() + fresh.len() > MAX_BUFFER {
-            self.buf.clear();
+        if self.buf.len() - self.consumed + fresh.len() > MAX_BUFFER {
+            self.clear_buf();
         }
         self.buf.extend_from_slice(fresh);
         self.pos += fresh.len() as i64;
         self.next_seq = self.next_seq.map(|next| next.wrapping_add(fresh.len() as u32));
     }
 
+    fn clear_buf(&mut self) {
+        self.buf.clear();
+        self.consumed = 0;
+    }
+
     fn take_http(&mut self, request: bool) -> Option<Parsed> {
+        let msg = self.next_http(request);
+        // Each byte is moved at most once more than it is parsed, however many
+        // messages arrive at once.
+        if self.consumed == self.buf.len() {
+            self.clear_buf();
+        } else if self.consumed > self.buf.len() / 2 {
+            self.buf.drain(..self.consumed);
+            self.consumed = 0;
+        }
+        msg
+    }
+
+    fn next_http(&mut self, request: bool) -> Option<Parsed> {
         loop {
-            match parse_http(&self.buf, request, self.closed()) {
+            let rest = &self.buf[self.consumed..];
+            match parse_http(rest, request, self.closed()) {
                 ParseResult::Complete(msg, used) => {
-                    self.buf.drain(..used);
+                    self.consumed += used;
                     return Some(msg);
                 }
                 ParseResult::Partial => return None,
                 ParseResult::Garbage => {
                     // The capture started mid-message: skip to the next message start.
                     let marker: &[u8] = if request { b"POST " } else { b"HTTP/1." };
-                    match find(&self.buf[1..], marker) {
-                        Some(i) => {
-                            self.buf.drain(..i + 1);
-                        }
+                    match find(&rest[1..], marker) {
+                        Some(i) => self.consumed += i + 1,
                         None => {
-                            self.buf.clear();
+                            self.consumed = self.buf.len();
                             return None;
                         }
                     }
@@ -414,14 +483,14 @@ fn parse_http(buf: &[u8], request: bool, closed: bool) -> ParseResult {
                 let inform = req.method == Some("POST") && req.path.is_some_and(|p| p.starts_with("/inform"));
                 (n, req.headers, inform, 0)
             }
-            Ok(httparse::Status::Partial) => return ParseResult::Partial,
+            Ok(httparse::Status::Partial) => return head_partial(buf),
             Err(_) => return ParseResult::Garbage,
         }
     } else {
         let mut resp = httparse::Response::new(&mut storage);
         match resp.parse(buf) {
             Ok(httparse::Status::Complete(n)) => (n, resp.headers, false, resp.code.unwrap_or(0)),
-            Ok(httparse::Status::Partial) => return ParseResult::Partial,
+            Ok(httparse::Status::Partial) => return head_partial(buf),
             Err(_) => return ParseResult::Garbage,
         }
     };
@@ -466,11 +535,17 @@ fn parse_http(buf: &[u8], request: bool, closed: bool) -> ParseResult {
     ParseResult::Complete(msg, head_len + body_len)
 }
 
+/// A head that is not complete yet, unless it is already longer than any we accept.
+fn head_partial(buf: &[u8]) -> ParseResult {
+    if buf.len() > MAX_HEAD { ParseResult::Garbage } else { ParseResult::Partial }
+}
+
 enum Chunked {
     /// The bytes the chunked body takes up (with its trailers), and the size of its data.
     Complete(usize, usize),
     Partial,
-    /// A chunk size that is not hex or larger than any message we keep.
+    /// A chunk size that is not hex or larger than any message we keep, or more
+    /// than `MAX_CHUNKS` chunks.
     Garbage,
 }
 
@@ -479,7 +554,7 @@ enum Chunked {
 fn chunked_len<'b>(mut buf: &'b [u8], mut chunk: impl FnMut(&'b [u8])) -> Chunked {
     let total = buf.len();
     let mut data = 0;
-    loop {
+    for _ in 0..=MAX_CHUNKS {
         let Some(line_end) = find(buf, b"\r\n") else { return Chunked::Partial };
         let size = std::str::from_utf8(&buf[..line_end])
             .ok()
@@ -506,10 +581,21 @@ fn chunked_len<'b>(mut buf: &'b [u8], mut chunk: impl FnMut(&'b [u8])) -> Chunke
         data += size;
         buf = &buf[size + 2..];
     }
+    Chunked::Garbage
 }
 
 fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    haystack.windows(needle.len()).position(|w| w == needle)
+    memchr::memmem::find(haystack, needle)
+}
+
+/// The status and body (chunked encoding undone) of the HTTP response in `buf`, which
+/// holds everything the server sent before it closed the connection. `None` when that
+/// is not one whole, well-formed response.
+pub fn parse_response(buf: &[u8]) -> Option<(u16, Vec<u8>)> {
+    match parse_http(buf, false, true) {
+        ParseResult::Complete(Parsed::Response { status, body }, _) => Some((status, body)),
+        _ => None,
+    }
 }
 
 /// Opens a capture file, or stdin for `-`.
@@ -630,7 +716,7 @@ mod tests {
         let mut t = Tracker::new(vec![8080], Vec::new());
         let conn = |port: u16| ConnId { client: SocketAddr::from(([10, 0, 0, 5], port)), server: SocketAddr::from(([10, 0, 0, 1], 8080)) };
         for port in 0..300u16 {
-            let mut c = Conn::default();
+            let mut c = Conn { carried: true, ..Conn::default() };
             if port % 2 == 0 {
                 (c.to_server.fin, c.to_client.fin) = (true, true);
             }
@@ -641,7 +727,7 @@ mod tests {
         t.sweep(20_000_000);
         assert_eq!(t.conns.len(), 150, "closed ones go after CLOSED_LINGER");
         assert!(t.conns.values().all(|c| !c.closed()));
-        t.conns.extend((300..500u16).map(|p| (conn(p), Conn::default())));
+        t.conns.extend((300..500u16).map(|p| (conn(p), Conn { carried: true, ..Conn::default() })));
         t.sweep(400_000_000);
         assert!(t.conns.is_empty(), "open ones after MAX_IDLE");
     }
@@ -667,23 +753,107 @@ mod tests {
     }
 
     #[test]
+    fn a_whole_response_is_parsed_for_its_reader() {
+        assert_eq!(parse_response(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nokEXTRA"), Some((200, b"ok".to_vec())));
+        assert_eq!(parse_response(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n2\r\nok\r\n1\r\n!\r\n0\r\n\r\n"), Some((200, b"ok!".to_vec())));
+        assert_eq!(parse_response(b"HTTP/1.0 404 Not Found\r\n\r\nall of it"), Some((404, b"all of it".to_vec())));
+        assert_eq!(parse_response(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nok"), None, "truncated");
+        assert_eq!(parse_response(b"not http"), None);
+    }
+
+    #[test]
     fn resynchronises_after_starting_mid_message() {
         let mut h = HalfStream { buf: b"tail of an old body\x00\x01POST /inform HTTP/1.1\r\nContent-Length: 1\r\n\r\nx".to_vec(), ..Default::default() };
         assert!(matches!(h.take_http(true), Some(Parsed::Request { .. })));
     }
+
+    /// Before the buffer kept an offset, each of these drained the rest of a 2 MB buffer.
+    #[test]
+    fn a_burst_of_pipelined_requests_is_cut_in_linear_time() {
+        let one = b"POST /inform HTTP/1.1\r\nContent-Length: 1\r\n\r\nx";
+        let mut h = HalfStream::default();
+        h.segment(0, 0, true, b"");
+        h.segment(0, 1, false, &one.repeat(50_000));
+        let mut n = 0;
+        while let Some(Parsed::Request { body, .. }) = h.take_http(true) {
+            assert_eq!(body, b"x");
+            n += 1;
+            assert!(h.consumed <= h.buf.len() - h.consumed, "compacted once used bytes are the larger part");
+        }
+        assert_eq!((n, h.buf.len(), h.consumed), (50_000, 0, 0));
+        // Garbage with a message start every few bytes is skipped as quickly.
+        let mut h = HalfStream { buf: b"POST POST ".repeat(100_000), ..Default::default() };
+        h.buf.extend_from_slice(one);
+        assert!(matches!(h.take_http(true), Some(Parsed::Request { body, .. }) if body == b"x"));
+        assert!(h.buf.is_empty());
+    }
+
+    #[test]
+    fn a_head_that_never_ends_is_given_up_on() {
+        let mut h = HalfStream::default();
+        h.segment(0, 0, true, b"");
+        let mut seq = 1;
+        let mut send = |h: &mut HalfStream, data: &[u8]| {
+            h.segment(0, seq, false, data);
+            seq += data.len() as u32;
+        };
+        send(&mut h, b"POST /inform HTTP/1.1\r\nX-Long: ");
+        for _ in 0..100 {
+            send(&mut h, &[b'a'; 1400]);
+            assert!(h.take_http(true).is_none());
+            assert!(h.buf.len() <= MAX_HEAD + 1400, "{}", h.buf.len());
+        }
+        send(&mut h, b"\r\n\r\nPOST /inform HTTP/1.1\r\nContent-Length: 2\r\n\r\nok");
+        assert!(matches!(h.take_http(true), Some(Parsed::Request { body, .. }) if body == b"ok"));
+        // A chunked body in more chunks than any reply has.
+        let mut buf = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n".to_vec();
+        buf.extend_from_slice(&b"1\r\nx\r\n".repeat(MAX_CHUNKS + 1));
+        assert!(matches!(chunked_len(&buf[45..], |_| {}), Chunked::Garbage));
+        assert!(matches!(chunked_len(&b"1\r\nx\r\n".repeat(MAX_CHUNKS), |_| {}), Chunked::Partial));
+    }
+
+    #[test]
+    fn connections_are_capped() {
+        let mut t = Tracker::new(vec![8080], Vec::new());
+        let syn = |port: u16| {
+            let mut frame = Vec::new();
+            etherparse::PacketBuilder::ethernet2([2; 6], [4; 6]).ipv4([10, 0, (port >> 8) as u8, port as u8], [10, 0, 0, 1], 64).tcp(port, 8080, 1, 1024).syn().write(&mut frame, b"").unwrap();
+            frame
+        };
+        // A real connection that carried data, then a flood of bare SYNs from made-up addresses.
+        let req = sample::http_request(b"x");
+        let mut frame = Vec::new();
+        etherparse::PacketBuilder::ethernet2([2; 6], [4; 6]).ipv4([10, 0, 0, 5], [10, 0, 0, 1], 64).tcp(40000, 8080, 1, 1024).write(&mut frame, &req).unwrap();
+        let mut events = 0;
+        t.packet(Linktype::ETHERNET, 0, &frame, &mut |_| events += 1);
+        assert_eq!(events, 1);
+        for port in 0..(MAX_CONNS + MAX_CONNS / 4) as u16 {
+            t.packet(Linktype::ETHERNET, 1, &syn(port), &mut |_| {});
+            assert!(t.conns.len() <= MAX_CONNS);
+        }
+        assert!(t.conns.values().any(|c| c.carried), "connections that carried data are kept over ones that did not");
+        // Ones that never carried data are swept after a short while.
+        t.sweep(1 + MAX_IDLE_EMPTY);
+        assert_eq!(t.conns.len(), 1);
+        // A reset of an unknown connection does not create one.
+        let mut frame = Vec::new();
+        etherparse::PacketBuilder::ethernet2([2; 6], [4; 6]).ipv4([10, 0, 9, 9], [10, 0, 0, 1], 64).tcp(9, 8080, 1, 1024).rst().write(&mut frame, b"").unwrap();
+        t.packet(Linktype::ETHERNET, 2 + MAX_IDLE_EMPTY, &frame, &mut |_| {});
+        assert_eq!(t.conns.len(), 1);
+    }
 }
 
-/// Synthetic captures and the capture fixtures, for tests here and in dependent crates (and
-/// informdump's made-up demo site, which writes the same pcap framing).
-#[doc(hidden)]
+/// The capture fixtures and synthetic captures, for tests here and in dependent crates
+/// (which enable the `test-util` feature from their dev-dependencies).
+#[cfg(any(test, feature = "test-util"))]
 pub mod sample {
-    use std::io::{self, Write};
     use std::path::PathBuf;
 
     use etherparse::PacketBuilder;
     use serde_json::Value;
 
     use super::Micros;
+    use crate::synth::{http, write_pcap_header, write_pcap_record};
 
     /// The sanitised capture fixtures, kept outside the repository:
     /// `$APCTL_TESTDATA/2026-10-12-u6m-8.8.11`. `None`, saying why, when they are not
@@ -734,26 +904,6 @@ pub mod sample {
         assert_eq!(removed, list("removed"), "{ctx}: removed keys");
     }
 
-    /// The header of a legacy pcap (microsecond timestamps) of Ethernet frames.
-    pub fn write_pcap_header(out: &mut impl Write, snaplen: u32) -> io::Result<()> {
-        out.write_all(&0xa1b2c3d4u32.to_le_bytes())?;
-        out.write_all(&2u16.to_le_bytes())?;
-        out.write_all(&4u16.to_le_bytes())?;
-        out.write_all(&0i32.to_le_bytes())?;
-        out.write_all(&0u32.to_le_bytes())?;
-        out.write_all(&snaplen.to_le_bytes())?;
-        out.write_all(&1u32.to_le_bytes()) // ethernet
-    }
-
-    /// One legacy pcap record holding all of `frame`.
-    pub fn write_pcap_record(out: &mut impl Write, ts: Micros, frame: &[u8]) -> io::Result<()> {
-        out.write_all(&((ts / 1_000_000) as u32).to_le_bytes())?;
-        out.write_all(&((ts % 1_000_000) as u32).to_le_bytes())?;
-        out.write_all(&(frame.len() as u32).to_le_bytes())?;
-        out.write_all(&(frame.len() as u32).to_le_bytes())?;
-        out.write_all(frame)
-    }
-
     /// A legacy pcap containing the given TCP segments as (to_server, seq, payload).
     pub fn pcap(segments: &[(bool, u32, &[u8])]) -> Vec<u8> {
         let mut out = Vec::new();
@@ -770,14 +920,6 @@ pub mod sample {
             write_pcap_record(&mut out, (1_791_840_600 + i as Micros) * 1_000_000, &frame).unwrap();
         }
         out
-    }
-
-    /// An HTTP/1.1 message: `head` is the start line and headers, each ending in CRLF;
-    /// the Content-Length and the blank line are added.
-    pub fn http(head: &str, body: &[u8]) -> Vec<u8> {
-        let mut m = format!("{head}Content-Length: {}\r\n\r\n", body.len()).into_bytes();
-        m.extend_from_slice(body);
-        m
     }
 
     pub fn http_request(body: &[u8]) -> Vec<u8> {
@@ -828,6 +970,50 @@ mod pcap_tests {
         let mut events = Vec::new();
         run(&data[..data.len() - 5], &[8080], |e| events.push(e)).unwrap();
         assert_eq!(events.len(), 1, "{events:?}");
+    }
+
+    #[test]
+    fn simple_packet_blocks_take_the_last_timestamp() {
+        fn block(out: &mut Vec<u8>, kind: u32, body: &[u8]) {
+            let padded = body.len().next_multiple_of(4);
+            let len = (12 + padded) as u32;
+            out.extend_from_slice(&kind.to_le_bytes());
+            out.extend_from_slice(&len.to_le_bytes());
+            out.extend_from_slice(body);
+            out.resize(out.len() + padded - body.len(), 0);
+            out.extend_from_slice(&len.to_le_bytes());
+        }
+        let frame = |to_server: bool, payload: &[u8]| {
+            let builder = if to_server {
+                etherparse::PacketBuilder::ethernet2([2; 6], [4; 6]).ipv4([10, 0, 0, 5], [10, 0, 0, 1], 64).tcp(40000, 8080, 1, 1024)
+            } else {
+                etherparse::PacketBuilder::ethernet2([4; 6], [2; 6]).ipv4([10, 0, 0, 1], [10, 0, 0, 5], 64).tcp(8080, 40000, 1, 1024)
+            };
+            let mut f = Vec::new();
+            builder.write(&mut f, payload).unwrap();
+            f
+        };
+        let ts: Micros = 1_791_840_600_000_000;
+        let mut data = Vec::new();
+        let mut shb = 0x1a2b3c4du32.to_le_bytes().to_vec();
+        shb.extend_from_slice(&[1, 0, 0, 0]);
+        shb.extend_from_slice(&(-1i64).to_le_bytes());
+        block(&mut data, 0x0a0d0d0a, &shb);
+        block(&mut data, 1, &[1, 0, 0, 0, 0, 0, 4, 0]); // Ethernet, snaplen 256 KiB
+        let req = frame(true, &sample::http_request(b"Q"));
+        let mut epb = 0u32.to_le_bytes().to_vec();
+        for v in [(ts >> 32) as u32, ts as u32, req.len() as u32, req.len() as u32] {
+            epb.extend_from_slice(&v.to_le_bytes());
+        }
+        epb.extend_from_slice(&req);
+        block(&mut data, 6, &epb);
+        let resp = frame(false, &sample::http_response(b"A"));
+        let mut spb = (resp.len() as u32).to_le_bytes().to_vec();
+        spb.extend_from_slice(&resp);
+        block(&mut data, 3, &spb);
+        let mut events = Vec::new();
+        run(&data[..], &[8080], |e| events.push(e)).unwrap();
+        assert!(matches!(&events[..], [HttpEvent::Request { ts: a, .. }, HttpEvent::Response { ts: b, .. }] if *a == ts && *b == ts), "{events:?}");
     }
 
     #[test]

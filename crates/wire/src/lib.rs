@@ -7,6 +7,7 @@ pub mod cfgdiff;
 pub mod decode;
 pub mod exchange;
 pub mod keys;
+pub mod synth;
 
 /// Civil date `(year, month, day)` of a day count since 1970-01-01, proleptic
 /// Gregorian (Howard Hinnant's `civil_from_days`).

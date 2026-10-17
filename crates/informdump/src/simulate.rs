@@ -15,26 +15,29 @@ use wire::capture;
 use wire::exchange::{InformEvent, Pairer};
 use wire::keys::KeyStore;
 
+/// An `http://` URL's authority (`host:port`) and request target (path and query).
+fn split_url(url: &str) -> Option<(&str, String)> {
+    let rest = url.strip_prefix("http://")?;
+    let (authority, target) = rest.split_at(rest.find(['/', '?', '#']).unwrap_or(rest.len()));
+    let target = target.split('#').next().unwrap_or("");
+    Some((authority, if target.starts_with('/') { target.to_string() } else { format!("/{target}") }))
+}
+
 /// POSTs a body with plain HTTP/1.1 and returns (status, body).
 fn post(url: &str, body: &[u8]) -> Result<(u16, Vec<u8>)> {
-    let rest = url.strip_prefix("http://").context("only http:// URLs are supported")?;
-    let (hostport, path) = rest.split_once('/').map_or((rest, "/".to_string()), |(h, p)| (h, format!("/{p}")));
+    let (hostport, path) = split_url(url).context("only http:// URLs are supported")?;
     let mut s = TcpStream::connect(hostport).with_context(|| format!("connecting to {hostport}"))?;
     s.set_read_timeout(Some(Duration::from_secs(10)))?;
     write!(s, "POST {path} HTTP/1.1\r\nHost: {hostport}\r\nContent-Type: application/x-binary\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len())?;
     s.write_all(body)?;
     let mut resp = Vec::new();
     s.read_to_end(&mut resp)?;
-    let head_end = resp.windows(4).position(|w| w == b"\r\n\r\n").context("malformed HTTP response")?;
-    let head = String::from_utf8_lossy(&resp[..head_end]);
-    let status: u16 = head.split_whitespace().nth(1).and_then(|s| s.parse().ok()).context("no status")?;
-    Ok((status, resp[head_end + 4..].to_vec()))
+    capture::parse_response(&resp).context("malformed or truncated HTTP response")
 }
 
 /// Whether `url` is `http://` to this machine: `localhost`, 127.0.0.0/8 or `[::1]`.
 fn is_local(url: &str) -> bool {
-    let Some(rest) = url.strip_prefix("http://") else { return false };
-    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    let Some((authority, _)) = split_url(url) else { return false };
     if authority.contains('@') {
         return false;
     }
@@ -128,7 +131,17 @@ pub fn run(pcap: &str, ports: &[u16], keys: &KeyStore, url: &str, limit: usize, 
 
 #[cfg(test)]
 mod tests {
-    use super::is_local;
+    use super::{is_local, split_url};
+
+    #[test]
+    fn urls_split_where_the_local_check_splits_them() {
+        let split = |url| split_url(url).map(|(a, t)| (a.to_string(), t));
+        assert_eq!(split("http://127.0.0.1:18180/inform"), Some(("127.0.0.1:18180".into(), "/inform".into())));
+        assert_eq!(split("http://localhost?x=1#f"), Some(("localhost".into(), "/?x=1".into())));
+        assert_eq!(split("http://localhost#/elsewhere"), Some(("localhost".into(), "/".into())));
+        assert_eq!(split("http://[::1]:8080"), Some(("[::1]:8080".into(), "/".into())));
+        assert_eq!(split("https://localhost/"), None);
+    }
 
     #[test]
     fn only_local_urls_pass() {

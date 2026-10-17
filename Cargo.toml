@@ -22,6 +22,7 @@ getrandom = "0.4.3"
 hex = "0.4.3"
 httparse = "1.10.1"
 inform = { version = "0.1.0", path = "crates/inform" }
+memchr = "2.8.3"
 mongodb = "2.8"
 pcap-parser = "0.17.0"
 regex = "1.13.1"
