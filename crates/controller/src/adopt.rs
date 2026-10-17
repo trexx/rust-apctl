@@ -189,7 +189,8 @@ pub fn note_pending(live: &mut Live, payload: Value, known: bool, now: Ts, sourc
     new
 }
 
-/// Forgets pending APs not heard from for a while, and adoptions or forgets that timed out.
+/// Forgets pending APs not heard from for a while, and adoptions that timed
+/// out. Forgets that timed out are finished by [`spawn`].
 pub fn expire(live: &mut Live, now: Ts) {
     live.adoption.pending.retain(|_, p| now - p.last_seen < PENDING_TIMEOUT);
     live.adoption.adopting.retain(|_, t| now - *t < ADOPT_TIMEOUT);
@@ -220,7 +221,8 @@ pub fn radio_table(state: &Value, payload: &Value) -> Vec<Value> {
                 "name": r["name"], "radio": band, "channel": "auto", "ht": width(band), "tx_power_mode": "auto",
                 "min_rssi_enabled": false, "hard_noise_floor_enabled": false, "antenna_gain": r["builtin_ant_gain"],
             });
-            for k in &RADIO_KEYS[2..] {
+            // The rest of what it reports, as it reports it.
+            for k in RADIO_KEYS.iter().filter(|k| !matches!(**k, "name" | "radio")) {
                 if !r[k].is_null() {
                     v[k] = r[k].clone();
                 }
@@ -233,7 +235,7 @@ pub fn radio_table(state: &Value, payload: &Value) -> Vec<Value> {
 /// A new AP's record (but for its `site_id`): its details from its inform, a
 /// fresh key (32 hex characters) and syslog key (64), a cfgversion, and its radios.
 pub fn new_device(state: &Value, payload: &Value, mac: &Mac) -> Value {
-    let other = state["devices"].as_array().and_then(|d| d.first()).cloned().unwrap_or(Value::Null);
+    let other = &state["devices"][0];
     let mut d = json!({
         "mac": mac.to_string(), "adopted": true, "type": "uap", "x_authkey": random_hex(16), "syslog_key": random_hex(32),
         "cfgversion": random_hex(8), "config_network": { "type": "dhcp" }, "adopted_at": store::now_ts(),

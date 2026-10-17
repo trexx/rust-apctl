@@ -224,9 +224,13 @@ fn wlan_aps(state: &Value, w: &Value) -> Option<Vec<String>> {
 
 /// GET /api/settings/wlans
 pub async fn wlans(State(s): State<AppState>) -> Result<Json<Value>, ApiError> {
+    // Only the informs of the site's APs are copied out under the lock.
     let (state, informs) = {
         let live = s.live.read().unwrap();
-        (live.state.clone(), live.raw_informs.clone())
+        let informs: HashMap<inform::Mac, Arc<Value>> = live.state.as_deref().map_or_else(HashMap::new, |st| {
+            docs(st, "devices").filter_map(|d| d["mac"].as_str()?.parse().ok()).filter_map(|m| Some((m, live.raw_informs.get(&m)?.clone()))).collect()
+        });
+        (live.state.clone(), informs)
     };
     let Some(state) = state else { return Ok(Json(json!({ "active": s.active, "wlans": [], "networks": [] }))) };
     let list: Vec<Value> = docs(&state, "wlanconf")
@@ -252,7 +256,7 @@ pub async fn wlans(State(s): State<AppState>) -> Result<Json<Value>, ApiError> {
 
 /// For each optional SSID feature, the APs that would broadcast the SSID
 /// without it; and the APs whose support is not known yet (no inform).
-fn feature_support(state: &Value, informs: &HashMap<inform::Mac, std::sync::Arc<Value>>) -> (Value, Vec<String>) {
+fn feature_support(state: &Value, informs: &HashMap<inform::Mac, Arc<Value>>) -> (Value, Vec<String>) {
     let mut unsupported: serde_json::Map<String, Value> = apcfg::SSID_FEATURES.iter().map(|f| (f.to_string(), json!([]))).collect();
     let mut unknown = Vec::new();
     for d in docs(state, "devices") {
@@ -592,9 +596,10 @@ fn default_group(state: &Value) -> Option<String> {
 /// Sets which APs broadcast an SSID: all, or a list (kept in a hidden AP group
 /// of its own, as the official controller does). Groups left unused are removed.
 fn set_wlan_aps(state: &mut Value, id: &str, aps: Option<Vec<String>>) -> Result<(), String> {
-    let known = device_macs(state);
-    let current: Vec<String> = find_wlan(state, id).and_then(|w| w["ap_group_ids"].as_array().cloned()).unwrap_or_default().iter().filter_map(|v| v.as_str().map(str::to_string)).collect();
-    let own = docs(state, "apgroup").find(|g| g["for_wlanconf"].as_bool() == Some(true) && oid(g).is_some_and(|i| current.iter().any(|c| c == i))).and_then(id_of);
+    let own = {
+        let current: Vec<&str> = wlan(state, id).and_then(|w| w["ap_group_ids"].as_array()).into_iter().flatten().filter_map(Value::as_str).collect();
+        docs(state, "apgroup").find(|g| g["for_wlanconf"].as_bool() == Some(true) && oid(g).is_some_and(|i| current.contains(&i))).and_then(id_of)
+    };
     match aps {
         None => {
             let all = default_group(state).ok_or("the settings have no default AP group")?;
@@ -607,6 +612,7 @@ fn set_wlan_aps(state: &mut Value, id: &str, aps: Option<Vec<String>>) -> Result
             if macs.is_empty() {
                 return Err("choose at least one AP, or broadcast from all of them".into());
             }
+            let known = device_macs(state);
             if let Some(m) = macs.iter().find(|m| !known.contains(m)) {
                 return Err(format!("{m} is not one of the APs"));
             }
@@ -656,15 +662,15 @@ fn check_mdns_rules(state: &Value, v: &Value) -> Result<Vec<Value>, String> {
         return Err("at most 16 mDNS rules".into());
     }
     let aps = device_macs(state);
-    let groups: Vec<String> = docs(state, "apgroup").filter_map(id_of).collect();
-    let networks: Vec<String> = docs(state, "networkconf").filter_map(id_of).collect();
+    let groups: Vec<&str> = docs(state, "apgroup").filter_map(oid).collect();
+    let networks: Vec<&str> = docs(state, "networkconf").filter_map(oid).collect();
     let mut out = Vec::new();
     for (i, r) in rules.iter().enumerate() {
         let n = i + 1;
         let scope = enum_field(r, "ap_scope_mode", &["all", "specific", "group"])?.unwrap_or("all");
         let services = enum_field(r, "services_mode", &["all", "specific", "none"])?.unwrap_or("all");
         let mut rule = json!({ "ap_scope_mode": scope, "services_mode": services, "isolation_enabled": bool_field(r, "isolation_enabled")?.unwrap_or(false) });
-        let ids = |key: &str| -> Vec<String> { r[key].as_array().into_iter().flatten().filter_map(|x| x.as_str().map(str::to_string)).collect() };
+        let ids = |key: &str| -> Vec<&str> { r[key].as_array().into_iter().flatten().filter_map(Value::as_str).collect() };
         let nets = ids("networkconf_ids");
         if let Some(bad) = nets.iter().find(|x| !networks.contains(x)) {
             return Err(format!("mDNS rule {n}: {bad} is not a network"));
@@ -850,7 +856,8 @@ pub fn apply_wlan(state: &mut Value, e: &WlanEdit) -> Result<String, String> {
             w[*k] = v.clone();
         }
     }
-    let iot_base = w.clone();
+    // What the edit's own fields are told apart from, below.
+    let iot_base = iot.then(|| w.clone());
 
     copy_fields(
         p,
@@ -881,7 +888,7 @@ pub fn apply_wlan(state: &mut Value, e: &WlanEdit) -> Result<String, String> {
     }
     wlan_links(state, p, &mut w)?;
 
-    if iot {
+    if let Some(iot_base) = &iot_base {
         for (k, v, what) in IOT_TEMPLATE.iter() {
             if w[*k] != *v {
                 // The edit asked for it: refuse. Otherwise the stored value just goes.
@@ -1532,13 +1539,13 @@ fn radio_edit(state: &Value, e: &DeviceEdit, rp: &Value, before: &Value, d: &mut
 /// on that subnet, a DNS server (a second one and a search domain optional).
 fn check_config_network(p: &Value, before: &Value) -> Result<Value, String> {
     use std::net::Ipv4Addr;
-    let ip = |key: &str, required: bool| -> Result<Option<Ipv4Addr>, String> {
+    let ip = |key: &str| -> Result<Option<Ipv4Addr>, String> {
         match p[key].as_str().map(str::trim).filter(|s| !s.is_empty()) {
-            None if required => Err(format!("a static address needs {key}")),
             None => Ok(None),
             Some(s) => s.parse().map(Some).map_err(|_| format!("{key}: {s} is not an IPv4 address")),
         }
     };
+    let req_ip = |key: &str| ip(key)?.ok_or_else(|| format!("a static address needs {key}"));
     let mut out = json!({ "type": "dhcp" });
     if let Some(b) = before["bonding_enabled"].as_bool() {
         out["bonding_enabled"] = json!(b);
@@ -1548,8 +1555,8 @@ fn check_config_network(p: &Value, before: &Value) -> Result<Value, String> {
         Some("static") => {}
         _ => return Err("config_network.type must be dhcp or static".into()),
     }
-    let addr = ip("ip", true)?.unwrap();
-    let mask = ip("netmask", true)?.unwrap();
+    let addr = req_ip("ip")?;
+    let mask = req_ip("netmask")?;
     let m = u32::from(mask);
     if m == 0 || m.leading_ones() + m.trailing_zeros() != 32 || m.trailing_zeros() < 2 {
         return Err(format!("{mask} is not a usable netmask"));
@@ -1562,15 +1569,14 @@ fn check_config_network(p: &Value, before: &Value) -> Result<Value, String> {
     out["ip"] = json!(addr.to_string());
     out["netmask"] = json!(mask.to_string());
     // The official UI also needs a gateway and a DNS server; the subnet check is ours.
-    let gw = ip("gateway", true)?.unwrap();
+    let gw = req_ip("gateway")?;
     if u32::from(gw) & m != net || gw == addr {
         return Err(format!("the gateway {gw} must be another address on {}/{}", Ipv4Addr::from(net), m.leading_ones()));
     }
     out["gateway"] = json!(gw.to_string());
-    for (key, required) in [("dns1", true), ("dns2", false)] {
-        if let Some(d) = ip(key, required)? {
-            out[key] = json!(d.to_string());
-        }
+    out["dns1"] = json!(req_ip("dns1")?.to_string());
+    if let Some(d) = ip("dns2")? {
+        out["dns2"] = json!(d.to_string());
     }
     if let Some(suffix) = p["dnssuffix"].as_str().map(str::trim).filter(|s| !s.is_empty()) {
         if suffix.len() > 253 || !suffix.split('.').all(|l| !l.is_empty() && l.len() <= 63 && l.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')) {
@@ -2126,7 +2132,6 @@ fn rate(v: &Value, what: &str) -> Result<i64, String> {
     }
 }
 
-/// Who uses a user group: SSID and client names.
 /// Who uses each user group (by id): SSID and client names, read in one pass.
 fn group_users(state: &Value) -> HashMap<&str, Vec<String>> {
     let mut out: HashMap<&str, Vec<String>> = HashMap::new();
