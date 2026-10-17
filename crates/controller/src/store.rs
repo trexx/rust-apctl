@@ -665,7 +665,7 @@ pub struct Series {
     pub step: i64,
     pub ts: Vec<Ts>,
     /// Gauges as stored; counters converted to per-second rates.
-    pub fields: BTreeMap<String, Vec<Option<f64>>>,
+    pub fields: BTreeMap<&'static str, Vec<Option<f64>>>,
 }
 
 /// Picks the finest tier that covers the range and keeps the point count sensible.
@@ -682,7 +682,7 @@ pub fn tier_for(from: Ts, to: Ts, now: Ts) -> usize {
 
 pub fn series(conn: &Connection, table: &Table, keys: &[String], from: Ts, to: Ts, tier: usize) -> Result<Series> {
     let (suffix, step, _) = TIERS[tier];
-    let fields: Vec<&str> = table.numbers().collect();
+    let fields: Vec<&'static str> = table.numbers().collect();
     let where_keys: Vec<String> = table.keys.iter().enumerate().map(|(i, k)| format!("{k} = ?{}", i + 3)).collect();
     // One row before `from`, so the first counter rate in range can be computed.
     let sql = format!(
@@ -695,40 +695,42 @@ pub fn series(conn: &Connection, table: &Table, keys: &[String], from: Ts, to: T
     );
     let params = [Value::Integer(from), Value::Integer(to)].into_iter().chain(keys.iter().map(|k| Value::Text(k.clone())));
     let mut stmt = conn.prepare_cached(&sql)?;
-    let rows: Vec<(Ts, Vec<Option<f64>>)> = stmt
-        .query_map(params_from_iter(params), |r| {
-            let ts: Ts = r.get(0)?;
-            let vals = (0..fields.len()).map(|i| r.get::<_, Option<f64>>(i + 1)).collect::<rusqlite::Result<_>>()?;
-            Ok((ts, vals))
-        })?
-        .collect::<rusqlite::Result<_>>()?;
+    let mut rows = stmt.query(params_from_iter(params))?;
 
     // Settings and gauges are returned as stored, counters as rates.
     let n_gauges = table.settings.len() + table.gauges.len();
-    let mut ts_out = Vec::with_capacity(rows.len());
+    let mut ts_out = Vec::new();
     // One column per field, in `fields` order; named at the end.
-    let mut columns: Vec<Vec<Option<f64>>> = vec![Vec::with_capacity(rows.len()); fields.len()];
-    for (i, (ts, vals)) in rows.iter().enumerate() {
-        if *ts < from {
-            continue; // the look-behind row only feeds the first rate
+    let mut columns: Vec<Vec<Option<f64>>> = vec![Vec::new(); fields.len()];
+    // This row's values and the previous row's (for the rates), reused for every row.
+    let (mut vals, mut prev): (Vec<Option<f64>>, Vec<Option<f64>>) = (vec![None; fields.len()], vec![None; fields.len()]);
+    let mut prev_ts = None;
+    while let Some(r) = rows.next()? {
+        let ts: Ts = r.get(0)?;
+        for (j, v) in vals.iter_mut().enumerate() {
+            *v = r.get(j + 1)?;
         }
-        ts_out.push(*ts);
-        for (j, column) in columns.iter_mut().enumerate() {
-            let v = if j < n_gauges {
-                vals[j]
-            } else {
-                // Rate from the previous row; a smaller value means the counter reset.
-                i.checked_sub(1).and_then(|p| {
-                    let (pts, pvals) = &rows[p];
-                    let (cur, prev) = (vals[j]?, pvals[j]?);
-                    let dt = (ts - pts) as f64;
-                    (dt > 0.0).then(|| if cur >= prev { (cur - prev) / dt } else { cur / dt })
-                })
-            };
-            column.push(v);
+        // The look-behind row only feeds the first rate.
+        if ts >= from {
+            ts_out.push(ts);
+            for (j, column) in columns.iter_mut().enumerate() {
+                let v = if j < n_gauges {
+                    vals[j]
+                } else {
+                    // Rate from the previous row; a smaller value means the counter reset.
+                    prev_ts.and_then(|pts: Ts| {
+                        let (cur, last) = (vals[j]?, prev[j]?);
+                        let dt = (ts - pts) as f64;
+                        (dt > 0.0).then(|| if cur >= last { (cur - last) / dt } else { cur / dt })
+                    })
+                };
+                column.push(v);
+            }
         }
+        std::mem::swap(&mut vals, &mut prev);
+        prev_ts = Some(ts);
     }
-    let fields = fields.iter().map(|f| f.to_string()).zip(columns).collect();
+    let fields = fields.into_iter().zip(columns).collect();
     Ok(Series { tier: ["raw", "5m", "1h"][tier], step, ts: ts_out, fields })
 }
 
