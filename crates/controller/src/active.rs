@@ -717,7 +717,7 @@ mod tests {
                 "INSERT INTO device_config (mac, ts, cfgversion, mgmt_cfg, system_cfg) VALUES (?1, 0, ?2, ?3, ?4)",
                 vec![Sql::Text(AP.into()), Sql::Text(version), Sql::Text(wire::cfgdiff::redact(&mgmt)), Sql::Text(wire::cfgdiff::redact(&system))],
             );
-            std::thread::sleep(std::time::Duration::from_millis(1500)); // the writer commits about once a second
+            assert!(writer.flush(std::time::Duration::from_secs(5)), "the push is stored");
         }
         let live: SharedLive = Default::default();
         {
@@ -965,7 +965,7 @@ mod tests {
         // The stored push is masked: a password changed in apctl since would not show.
         let rig = rig_with_stored(true, None, Some((out.rendered.mgmt_cfg, out.rendered.system_cfg, "abcdefabcdefabcd".into())));
         rig.active.writer.exec(Db::Config, "INSERT INTO events (ts, kind, data) VALUES (5, 'settings_changed', '{}')", vec![]);
-        std::thread::sleep(std::time::Duration::from_millis(1500));
+        assert!(rig.active.writer.flush(std::time::Duration::from_secs(5)), "the edit is stored");
         let (_, reply) = inform_as_ap(&rig, &payload, KEY, GCM_ZLIB).await;
         assert_eq!(reply.unwrap().1["_type"], "setparam");
     }

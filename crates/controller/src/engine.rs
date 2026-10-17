@@ -1849,9 +1849,9 @@ mod tests {
         {
             let (_store, writer) = store::Store::open(&dir).unwrap();
             let (tx, _rx) = broadcast::channel(1024);
-            let mut e = Engine::new(writer, Default::default(), Default::default(), tx);
+            let mut e = Engine::new(writer.clone(), Default::default(), Default::default(), tx);
             feed(&mut e, 0);
-            std::thread::sleep(std::time::Duration::from_millis(1500)); // let the writer flush
+            assert!(writer.flush(std::time::Duration::from_secs(5)));
         }
         let (store, writer) = store::Store::open(&dir).unwrap();
         let (tx, mut rx) = broadcast::channel(1024);
