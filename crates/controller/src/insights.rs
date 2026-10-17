@@ -254,7 +254,12 @@ fn band_ok(band: &Option<String>, radio: &str) -> bool {
 /// the raw tier grows with each report, the roll-ups every five minutes.
 const MEMO_SECS: [u64; 3] = [15, 60, 300];
 
-type Memo = HashMap<String, (std::time::Instant, std::sync::Arc<dyn std::any::Any + Send + Sync>)>;
+/// A memoised read: its result and when it was read, once read. Whoever finds
+/// it empty reads it; the others asking meanwhile wait for that read.
+type Slot = std::sync::Arc<tokio::sync::OnceCell<(std::time::Instant, std::sync::Arc<dyn std::any::Any + Send + Sync>)>>;
+
+/// By query: when its slot was made, and the slot.
+type Memo = HashMap<String, (std::time::Instant, Slot)>;
 
 /// What the views last read, by view and query: several tabs, and each tab's
 /// refresh every minute, ask for the same windows again.
@@ -265,7 +270,8 @@ fn memo() -> std::sync::MutexGuard<'static, Memo> {
 }
 
 /// [`read`] from `db` for `view`, reusing what the same query read less than
-/// [`MEMO_SECS`] ago (the window then ends that much earlier).
+/// [`MEMO_SECS`] ago (the window then ends that much earlier). Queries made
+/// while the same query is being read wait for that read rather than read again.
 pub(crate) async fn memo_read<T: Send + Sync + 'static>(
     s: &AppState,
     db: Db,
@@ -278,23 +284,36 @@ pub(crate) async fn memo_read<T: Send + Sync + 'static>(
     // The data directory tells databases apart (tests run several).
     let key = format!("{}|{view}|{range:?}|{from:?}|{to:?}|{band:?}|{mac:?}", s.backups.data_dir.display());
     let ttl = std::time::Duration::from_secs(MEMO_SECS[tier]);
-    let hit = memo().get(&key).filter(|(at, _)| at.elapsed() < ttl).and_then(|(_, v)| v.clone().downcast::<T>().ok());
-    if let Some(v) = hit {
-        return Ok(v);
-    }
-    let v = std::sync::Arc::new(read(&s.store, db, f).await?);
-    let mut m = memo();
-    m.retain(|_, (at, _)| at.elapsed().as_secs() < MEMO_SECS[2]);
-    // Bounded: odd queries (explicit windows) are not all kept.
-    if m.len() < 256 {
-        m.insert(key, (std::time::Instant::now(), v.clone()));
-    }
-    Ok(v)
+    // The slot being read or read recently enough, else a new one.
+    let slot = {
+        let mut m = memo();
+        match m.get(&key) {
+            Some((_, slot)) if slot.get().is_none_or(|(at, _)| at.elapsed() < ttl) => slot.clone(),
+            _ => {
+                m.remove(&key);
+                // A slot left empty (its read failed or was given up) goes too, after a while.
+                m.retain(|_, (made, slot)| slot.get().map_or(*made, |(at, _)| *at).elapsed().as_secs() < MEMO_SECS[2]);
+                let slot = Slot::default();
+                // Bounded: odd queries (explicit windows) are not all kept.
+                if m.len() < 256 {
+                    m.insert(key, (std::time::Instant::now(), slot.clone()));
+                }
+                slot
+            }
+        }
+    };
+    let (_, v) = slot
+        .get_or_try_init(|| async {
+            let v: std::sync::Arc<dyn std::any::Any + Send + Sync> = std::sync::Arc::new(read(&s.store, db, f).await?);
+            Ok::<_, ApiError>((std::time::Instant::now(), v))
+        })
+        .await?;
+    v.clone().downcast::<T>().map_err(|_| ApiError::internal(format!("{view}: memoised as another type")))
 }
 
 /// GET /api/site/activity: Wi-Fi traffic, retries, clients and multicast,
 /// plus airtime (channel use and interference), bucketed.
-pub async fn activity(State(s): State<AppState>, Query(q): Query<RangeQuery>) -> Result<Json<Value>, ApiError> {
+pub async fn activity(State(s): State<AppState>, Query(q): Query<RangeQuery>) -> Result<Json<std::sync::Arc<Value>>, ApiError> {
     let (from, to, tier) = window(&q);
     let bucket = bucket_for(to - from, tier);
     let band = q.band.clone();
@@ -404,7 +423,7 @@ pub async fn activity(State(s): State<AppState>, Query(q): Query<RangeQuery>) ->
         }))
     })
     .await?;
-    Ok(Json((*result).clone()))
+    Ok(Json(result))
 }
 
 /// Bytes moved per key over the window (sum of counter deltas), from the
@@ -2019,6 +2038,23 @@ mod tests {
             Connection::open(dir.join("metrics.db")).unwrap().execute("DELETE FROM vap_stats", []).unwrap();
             assert_eq!(ok(retries(State(s.clone()), q(None)).await), first, "read again within the time it is kept");
             assert_eq!(ok(retries(State(s), q(Some(600))).await), json!([]), "another query reads the database");
+        }
+
+        #[tokio::test]
+        async fn a_query_asked_again_while_it_is_read_is_read_once() {
+            let (s, base, _) = site();
+            static READS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+            let q = RangeQuery { range: None, from: Some(base), to: Some(base + 3600), band: None, mac: None };
+            let one = || {
+                memo_read(&s, Db::Metrics, "read-once", &q, 0, |_| {
+                    READS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                    Ok(7)
+                })
+            };
+            let (a, b, c) = tokio::join!(one(), one(), one());
+            assert_eq!((*a.ok().unwrap(), *b.ok().unwrap(), *c.ok().unwrap()), (7, 7, 7));
+            assert_eq!(READS.load(std::sync::atomic::Ordering::Relaxed), 1);
         }
 
         #[tokio::test]
