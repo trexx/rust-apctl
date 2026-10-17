@@ -84,6 +84,9 @@ pub struct VapSample {
     pub radio: Option<String>,
     pub name: Option<String>,
     pub channel: Option<i64>,
+    /// Channel width (MHz) and transmit power (dBm) of its radio, as this VAP reports them.
+    pub bw: Option<i64>,
+    pub tx_power: Option<i64>,
     pub num_sta: Option<i64>,
     pub rx_bytes: Option<i64>,
     pub tx_bytes: Option<i64>,
@@ -339,6 +342,8 @@ pub fn parse(ts: Ts, p: &Value) -> anyhow::Result<Snapshot> {
             radio: radio.clone(),
             name: string(&v["name"]),
             channel,
+            bw: int(&v["bw"]),
+            tx_power: int(&v["tx_power"]),
             num_sta: int(&v["num_sta"]),
             rx_bytes: int(&v["rx_bytes"]),
             tx_bytes: int(&v["tx_bytes"]),
@@ -406,16 +411,13 @@ pub fn parse(ts: Ts, p: &Value) -> anyhow::Result<Snapshot> {
         .filter_map(|r| {
             let radio = string(&r["radio"])?;
             let ath = &r["athstats"];
+            // Channel, width and power all from the same VAP.
             let first_vap = vaps.iter().find(|v| v.radio.as_deref() == Some(radio.as_str()));
-            let vap_json = vap_table
-                .into_iter()
-                .flatten()
-                .find(|v| v["radio"].as_str() == Some(radio.as_str()));
             Some(RadioSample {
                 name: string(&r["name"]),
                 channel: first_vap.and_then(|v| v.channel),
-                bw: vap_json.and_then(|v| int(&v["bw"])),
-                tx_power: vap_json.and_then(|v| int(&v["tx_power"])),
+                bw: first_vap.and_then(|v| v.bw),
+                tx_power: first_vap.and_then(|v| v.tx_power),
                 cu_total: int(&ath["cu_total"]),
                 cu_self_rx: int(&ath["cu_self_rx"]),
                 cu_self_tx: int(&ath["cu_self_tx"]),
@@ -580,5 +582,20 @@ pub(crate) mod tests {
         });
         let s = parse(1000, &p).unwrap();
         assert_eq!((s.vaps[0].bssid.as_str(), s.neighbors[0].bssid.as_str()), ("02:ab:00:00:00:01", "02:cd:00:00:00:01"));
+    }
+
+    #[test]
+    fn a_radio_takes_its_settings_from_one_vap() {
+        // A VAP without a BSSID (e.g. a mesh link coming up) lists first.
+        let p = serde_json::json!({
+            "mac": "02:00:00:00:00:01",
+            "vap_table": [
+                { "radio": "na", "channel": 100, "bw": 20, "tx_power": 23 },
+                { "bssid": "02:ab:00:00:00:01", "radio": "na", "channel": 36, "bw": 80, "tx_power": 17 },
+            ],
+            "radio_table": [{ "radio": "na" }],
+        });
+        let r = &parse(1000, &p).unwrap().radios[0];
+        assert_eq!((r.channel, r.bw, r.tx_power), (Some(36), Some(80), Some(17)));
     }
 }

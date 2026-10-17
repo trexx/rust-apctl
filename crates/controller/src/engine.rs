@@ -164,23 +164,22 @@ pub enum LiveMsg {
     Clients,
     /// An event was stored: `{"type":"event","kind":...,"device_mac":...,"client_mac":...}`.
     /// The UI refetches the event lists that show it, so the rest is not sent along.
-    Event(#[serde(serialize_with = "event_head")] Event),
+    Event(EventHead),
     /// Syslog lines were stored: `{"type":"log","device_mac":...}`, at most
     /// once a second per AP. The UI refetches the lines it shows, so the text
     /// is not sent along.
     Log { device_mac: Option<Mac> },
-    Alert(crate::alerts::AlertMsg),
+    /// Boxed: an alert is far larger than the other messages.
+    Alert(Box<crate::alerts::AlertMsg>),
 }
 
-/// What the UI is told of an event (see `LiveMsg::Event`).
-fn event_head<S: serde::Serializer>(e: &Event, s: S) -> Result<S::Ok, S::Error> {
-    #[derive(Serialize)]
-    struct Head {
-        kind: EventKind,
-        device_mac: Option<Mac>,
-        client_mac: Option<Mac>,
-    }
-    Head { kind: e.kind, device_mac: e.device_mac, client_mac: e.client_mac }.serialize(s)
+/// What the UI is told of an event (see `LiveMsg::Event`). Without the data,
+/// which can be large (a crash dump), as every subscriber gets its own copy.
+#[derive(Debug, Clone, Copy, Serialize)]
+pub struct EventHead {
+    pub kind: EventKind,
+    pub device_mac: Option<Mac>,
+    pub client_mac: Option<Mac>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -442,6 +441,8 @@ pub struct Engine {
     connected: std::collections::BTreeSet<Mac>,
     /// Where alert-worthy events go: the alert watcher's own channel.
     alerts: Option<crate::alerts::Sink>,
+    /// The time of this run's first tick (the capture's time in shadow mode).
+    first_tick: Option<Ts>,
 }
 
 /// How long a syslog hash_id no key opened is left untried.
@@ -453,7 +454,7 @@ impl Engine {
         Engine {
             writer, keys, renderer: None, live, counters, tx, radios: HashMap::new(), mcast_prev: HashMap::new(), bss_prev: HashMap::new(),
             logevents: Default::default(), isolated: HashMap::new(), last_prune: 0, written: Default::default(), syslog_unknown: HashMap::new(),
-            syslog_ciphers: Default::default(), logs_announced: HashMap::new(), connected: Default::default(), alerts: None,
+            syslog_ciphers: Default::default(), logs_announced: HashMap::new(), connected: Default::default(), alerts: None, first_tick: None,
         }
     }
 
@@ -609,7 +610,7 @@ impl Engine {
         if let Some(a) = &self.alerts {
             a.offer(&ev);
         }
-        let _ = self.tx.send(LiveMsg::Event(ev));
+        let _ = self.tx.send(LiveMsg::Event(EventHead { kind: ev.kind, device_mac: ev.device_mac, client_mac: ev.client_mac }));
     }
 
     fn inform(&mut self, ts: Ts, peer: String, decoded: Decoded) {
@@ -872,9 +873,11 @@ impl Engine {
         }
         // Names for numbered sections ("aaa.3" -> "Home WiFi (5 GHz)"), so the
         // config history can say what a change was about. Sections removed by
-        // this push are only named in the previous config.
+        // this push are only named in the previous config, which is read only
+        // when this push replaces it.
         if !system.is_empty() {
-            let mut labels = if previous.system_cfg.is_empty() { Default::default() } else { section_labels(&previous.system_cfg, &radios) };
+            let new_system = p["system_cfg"].is_string() && !previous.system_cfg.is_empty();
+            let mut labels = if new_system { section_labels(&previous.system_cfg, &radios) } else { Default::default() };
             labels.extend(section_labels(&system, &radios));
             data.insert("labels".into(), Value::Object(labels));
         }
@@ -937,7 +940,12 @@ impl Engine {
     /// Stores an AP's section numbering in the settings, so later renders keep it.
     fn set_config_meta(&self, mac: Mac, meta: Value) {
         // Copied and serialised without the lock, as in `edit_state`.
-        let Some(state) = self.live.read().unwrap().state.clone() else { return };
+        let Some((state, imported_at)) = ({
+            let live = self.live.read().unwrap();
+            live.state.clone().zip(live.state_imported_at)
+        }) else {
+            return;
+        };
         let mac_s = mac.to_string();
         let same_mac = |m: &Value| m["mac"].as_str().is_some_and(|x| x.eq_ignore_ascii_case(&mac_s));
         let current = state["config_meta"].as_array().and_then(|a| a.iter().find(|m| same_mac(m)));
@@ -951,22 +959,27 @@ impl Engine {
         let list = next["config_meta"].as_array_mut().unwrap();
         list.retain(|m| !same_mac(m));
         list.push(meta);
-        self.writer.exec(Db::Config, "UPDATE controller_state SET json = ?1 WHERE id = 1", vec![Sql::Text(next.to_string())]);
-        self.live.write().unwrap().state = Some(Arc::new(next));
+        self.store_state(next, imported_at);
     }
 
-    fn set_state(&mut self, ts: Ts, state: Value) {
+    /// Stores the settings, then swaps them into the live view. Serialised
+    /// before the lock is taken.
+    fn store_state(&self, state: Value, imported_at: Ts) {
         self.writer.exec(
             Db::Config,
             "INSERT OR REPLACE INTO controller_state (id, json, imported_at) VALUES (1, ?1, ?2)",
-            vec![Sql::Text(state.to_string()), Sql::Integer(ts)],
+            vec![Sql::Text(state.to_string()), Sql::Integer(imported_at)],
         );
-        let summary = crate::dryrun::summarize_state(&state);
-        // The new settings may hold the syslog key of an AP given up on.
-        self.syslog_unknown.clear();
         let mut live = self.live.write().unwrap();
         live.state = Some(Arc::new(state));
-        live.state_imported_at = Some(ts);
+        live.state_imported_at = Some(imported_at);
+    }
+
+    fn set_state(&mut self, ts: Ts, state: Value) {
+        let summary = crate::dryrun::summarize_state(&state);
+        self.store_state(state, ts);
+        // The new settings may hold the syslog key of an AP given up on.
+        self.syslog_unknown.clear();
         self.emit(ev(ts, EventKind::SettingsImported, None, None, summary));
     }
 
@@ -980,12 +993,7 @@ impl Engine {
         };
         let mut state = current.as_deref().cloned().ok_or("no settings imported yet")?;
         let what = edit(&mut state)?;
-        self.writer.exec(
-            Db::Config,
-            "INSERT OR REPLACE INTO controller_state (id, json, imported_at) VALUES (1, ?1, ?2)",
-            vec![Sql::Text(state.to_string()), Sql::Integer(imported_at)],
-        );
-        self.live.write().unwrap().state = Some(Arc::new(state));
+        self.store_state(state, imported_at);
         self.syslog_unknown.clear();
         self.emit(ev(ts, EventKind::SettingsChanged, None, None, json!({ "what": what })));
         // The APs pick the change up now rather than at their next interval.
@@ -1001,9 +1009,7 @@ impl Engine {
         let clients = &mut live.clients;
         self.connected.retain(|cmac| {
             let Some(c) = clients.get_mut(cmac).filter(|c| c.sample.ap_mac == mac) else { return true };
-            c.connected = false;
-            events.push(disconnected_event(ts, *cmac, c, "ap_forgotten"));
-            self.writer.exec(Db::Config, "UPDATE clients SET connected = 0 WHERE mac = ?1", vec![Sql::Text(cmac.to_string())]);
+            events.push(disconnect(&self.writer, ts, *cmac, c, "ap_forgotten"));
             false
         });
         drop(live);
@@ -1038,9 +1044,17 @@ impl Engine {
         let mut changed = false;
         let mut live = self.live.write().unwrap();
         for AliasEdit { mac, alias, note } in entries {
-            let (alias, note) = (clean(alias), clean(note));
+            let (alias, mut note) = (clean(alias), clean(note));
             let old = live.aliases.get(&mac).cloned().unwrap_or_default();
-            if (only_if_unset && old.alias.is_some()) || (old.alias == alias && old.note == note) {
+            // An import only adds names: an entry without one, or for a client
+            // already named, changes nothing, and a note it lacks is kept.
+            if only_if_unset {
+                if alias.is_none() || old.alias.is_some() {
+                    continue;
+                }
+                note = note.or(old.note.clone());
+            }
+            if old.alias == alias && old.note == note {
                 continue;
             }
             changed = true;
@@ -1068,22 +1082,27 @@ impl Engine {
 
     fn notification(&self, ts: Ts, p: &Value) {
         let Some(mac) = p["mac"].as_str().and_then(|m| m.parse::<Mac>().ok()) else { return };
-        let mut live = self.live.write().unwrap();
         bump(&self.counters.notifications);
-        if let Some(d) = live.devices.get_mut(&mac) {
-            d.last_seen = ts; // proof of life, but not a status report
-        }
+        // The live view is written for this alone, and only read (or, for an
+        // upgrade notice, written) again where the notification needs it.
+        let since_push = self.live.write().unwrap().devices.get_mut(&mac).and_then(|d| {
+            // Proof of life, but not a status report. An AP reported offline
+            // keeps the time it went quiet, which its return reports.
+            if d.online {
+                d.last_seen = ts;
+            }
+            d.last_config_push.map(|t| ts - t)
+        });
         match p["notif_reason"].as_str() {
             // The AP confirms it applied a pushed config.
             Some("setparam") => {
-                let since_push = live.devices.get(&mac).and_then(|d| d.last_config_push).map(|t| ts - t);
                 let data = json!({ "cfgversion": p["cfgversion"], "seconds_after_push": since_push });
                 self.emit(ev(ts, EventKind::ConfigApplied, Some(mac), None, data));
             }
             Some("event") => {
                 let n = &p["notif_payload"];
                 if n["message_type"].as_str() == Some("STA_ASSOC_TRACKER") {
-                    self.connection_event(&live, ts, mac, n);
+                    self.connection_event(ts, mac, n);
                 } else if let Some(kind) = n["event_string"].as_str() {
                     // AP events: radar (DFS), rogue APs, scan completion, process restarts...
                     let k = match kind {
@@ -1093,7 +1112,7 @@ impl Engine {
                         // "{proc} exited with code {exit_status} and restarted by {caller}"
                         "EVT_AP_RestartProc" => EventKind::ApProcessRestarted,
                         "Upgrade" => {
-                            self.upgrade_notice(&mut live, ts, mac, n);
+                            self.upgrade_notice(&mut self.live.write().unwrap(), ts, mac, n);
                             return;
                         }
                         _ => EventKind::ApEvent,
@@ -1125,22 +1144,28 @@ impl Engine {
     /// A client connection-tracking event (`STA_ASSOC_TRACKER`): association,
     /// success (with association, WPA, IP and DNS timings), soft failure,
     /// roam, leave. Durations arrive in microseconds and are stored in ms.
-    fn connection_event(&self, live: &Live, ts: Ts, ap: Mac, n: &Value) {
+    fn connection_event(&self, ts: Ts, ap: Mac, n: &Value) {
         let Some(client) = n["mac"].as_str().and_then(|m| m.parse::<Mac>().ok()) else { return };
         let num = |k: &str| n[k].as_str().and_then(|v| v.parse::<f64>().ok()).or_else(|| n[k].as_f64());
         let ms = |k: &str| num(k).map(|us| (us / 1000.0).round() as i64);
         let text = |k: &str| n[k].as_str().map(str::to_string);
         let vap = text("vap");
-        let dev = live.devices.get(&ap);
-        let vap_info = dev.and_then(|d| d.snapshot.vaps.iter().find(|v| v.name.as_deref() == vap.as_deref()));
-        let (essid, radio) = vap_info.map(|v| (v.essid.clone(), v.radio.clone())).unwrap_or((None, None));
+        // The live view is read for the VAP alone; the row is built without the lock.
+        let vap_info = {
+            let live = self.live.read().unwrap();
+            let vap = live.devices.get(&ap).and_then(|d| d.snapshot.vaps.iter().find(|v| v.name.as_deref() == vap.as_deref()));
+            vap.map(|v| (v.essid.clone(), v.radio.clone(), v.channel, v.bw))
+        };
         // Channel and width at the time, for the connection log and roaming views.
         let mut detail = n.clone();
-        if let Some(v) = vap_info {
-            let bw = dev.and_then(|d| d.snapshot.radios.iter().find(|r| Some(&r.radio) == v.radio.as_ref())).and_then(|r| r.bw);
-            detail["x_channel"] = json!(v.channel);
-            detail["x_bw"] = json!(bw);
-        }
+        let (essid, radio) = match vap_info {
+            Some((essid, radio, channel, bw)) => {
+                detail["x_channel"] = json!(channel);
+                detail["x_bw"] = json!(bw);
+                (essid, radio)
+            }
+            None => (None, None),
+        };
         let event_type = text("event_type").unwrap_or_default();
         self.writer.exec(
             Db::Config,
@@ -1362,6 +1387,7 @@ impl Engine {
         // last seen and the grace period has passed, or when its AP went offline.
         // Only the connected ones are looked at, not the year of clients kept.
         let mut changed = false;
+        let started = *self.first_tick.get_or_insert(now);
         let Live { devices, clients, .. } = &mut *live;
         self.connected.retain(|cmac| {
             let Some(c) = clients.get_mut(cmac).filter(|c| c.connected) else { return false };
@@ -1369,15 +1395,15 @@ impl Engine {
             // restart) is unknown, not offline: leave its clients alone.
             let reason = match devices.get(&c.sample.ap_mac) {
                 // Its AP never reappeared (e.g. removed): give up after an hour.
-                None => (now - c.last_seen > 3600).then_some("stale"),
+                // Counted from this run's start too: after a long outage the
+                // APs get time to inform before their clients are written off.
+                None => (now - c.last_seen.max(started) > 3600).then_some("stale"),
                 Some(d) if !d.online => Some("ap_offline"),
                 Some(d) => (now - c.last_seen > CLIENT_GRACE_SECS && d.last_full_inform > c.last_seen).then_some("not_seen"),
             };
             let Some(reason) = reason else { return true };
-            c.connected = false;
             changed = true;
-            events.push(disconnected_event(now, *cmac, c, reason));
-            self.writer.exec(Db::Config, "UPDATE clients SET connected = 0 WHERE mac = ?1", vec![Sql::Text(cmac.to_string())]);
+            events.push(disconnect(&self.writer, now, *cmac, c, reason));
             false
         });
         for e in events {
@@ -1533,8 +1559,8 @@ impl Engine {
                 table: &store::CLIENT,
                 ts,
                 values: vec![
-                    Sql::Text(c.mac.to_string()), mac(), Sql::Text(c.bssid.clone()), opt_text(c.essid.clone()), opt_text(c.radio.clone()),
-                    i(c.rssi), i(c.signal), i(c.noise), i(c.tx_rate), i(c.rx_rate), i(c.satisfaction), i(c.latency_avg), i(c.channel),
+                    Sql::Text(c.mac.to_string()), mac(), Sql::Text(c.bssid.clone()), opt_text(c.essid.clone()), opt_text(c.radio.clone()), i(c.channel),
+                    i(c.rssi), i(c.signal), i(c.noise), i(c.tx_rate), i(c.rx_rate), i(c.satisfaction), i(c.latency_avg),
                     i(c.tx_bytes), i(c.rx_bytes), i(c.tx_packets), i(c.rx_packets), i(c.tx_retries),
                     i(t.map(|t| t.tx_pkts)), i(t.map(|t| t.rx_pkts)), i(t.map(|t| t.tx_bytes)), i(t.map(|t| t.rx_bytes)),
                 ],
@@ -1640,7 +1666,11 @@ fn connected_event(ts: Ts, c: &ClientSample, new: bool) -> Event {
     }))
 }
 
-fn disconnected_event(ts: Ts, mac: Mac, c: &ClientView, reason: &str) -> Event {
+/// Marks a client disconnected, in the live view and the database, and
+/// returns the event that says so, for the caller to emit.
+fn disconnect(writer: &Writer, ts: Ts, mac: Mac, c: &mut ClientView, reason: &str) -> Event {
+    c.connected = false;
+    writer.exec(Db::Config, "UPDATE clients SET connected = 0 WHERE mac = ?1", vec![Sql::Text(mac.to_string())]);
     ev(ts, EventKind::ClientDisconnected, Some(c.sample.ap_mac), Some(mac), json!({
         "reason": reason, "last_seen": c.last_seen, "essid": c.sample.essid,
         "connected_for": c.sample.uptime, "last_signal": c.sample.signal,
@@ -1724,15 +1754,30 @@ mod tests {
         engine: Engine,
         live: SharedLive,
         rx: broadcast::Receiver<LiveMsg>,
+        store: Arc<store::Store>,
+        writer: Writer,
         _dir: std::path::PathBuf,
     }
 
     fn harness() -> Harness {
         let dir = std::env::temp_dir().join(format!("apctl-engine-{}-{}", std::process::id(), rand_suffix()));
-        let (_store, writer) = store::Store::open(&dir).unwrap();
+        let (store, writer) = store::Store::open(&dir).unwrap();
         let live: SharedLive = Default::default();
         let (tx, rx) = broadcast::channel(1024);
-        Harness { engine: Engine::new(writer, Default::default(), live.clone(), tx), live, rx, _dir: dir }
+        Harness { engine: Engine::new(writer.clone(), Default::default(), live.clone(), tx), live, rx, store, writer, _dir: dir }
+    }
+
+    /// The data of the stored events of one kind, oldest first (the live
+    /// messages only say that an event was stored).
+    fn stored(h: &Harness, kind: EventKind) -> Vec<Value> {
+        assert!(h.writer.flush(std::time::Duration::from_secs(5)));
+        h.store
+            .read(Db::Config, |c| {
+                let mut stmt = c.prepare("SELECT data FROM events WHERE kind = ?1 ORDER BY id")?;
+                let rows = stmt.query_map([kind.as_str()], |r| r.get::<_, String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
+                Ok(rows.iter().map(|d| serde_json::from_str(d).unwrap()).collect())
+            })
+            .unwrap()
     }
 
     fn rand_suffix() -> u64 {
@@ -1824,6 +1869,31 @@ mod tests {
     }
 
     #[test]
+    fn a_long_outage_gives_the_aps_time_to_inform() {
+        let dir = std::env::temp_dir().join(format!("apctl-outage-{}-{}", std::process::id(), rand_suffix()));
+        {
+            let (_store, writer) = store::Store::open(&dir).unwrap();
+            let (tx, _rx) = broadcast::channel(1024);
+            let mut e = Engine::new(writer.clone(), Default::default(), Default::default(), tx);
+            e.handle(Input::Inform { ts: 0, peer: "x".into(), decoded: decoded(inform(AP1, 1000, &[(C1, "b1")])) });
+            assert!(writer.flush(std::time::Duration::from_secs(5)));
+        }
+        // Back after two hours: the first tick comes before the AP's first inform.
+        let (store, writer) = store::Store::open(&dir).unwrap();
+        let (tx, mut rx) = broadcast::channel(1024);
+        let mut e = Engine::new(writer, Default::default(), Default::default(), tx);
+        e.restore(&store).unwrap();
+        let mut kinds = || std::iter::from_fn(|| rx.try_recv().ok()).filter_map(|m| match m { LiveMsg::Event(ev) => Some(ev.kind), _ => None }).collect::<Vec<_>>();
+        e.handle(Input::Tick(7200));
+        e.handle(Input::Tick(7200 + 3600));
+        assert_eq!(kinds(), Vec::new(), "the client is left alone for the AP's first hour back");
+        // An AP that never informs again: its clients go an hour into the run.
+        e.handle(Input::Tick(7200 + 3601));
+        assert_eq!(kinds(), [EventKind::ClientDisconnected]);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn unchanged_rows_are_written_once_a_minute() {
         let dir = std::env::temp_dir().join(format!("apctl-written-{}-{}", std::process::id(), rand_suffix()));
         let (store, writer) = store::Store::open(&dir).unwrap();
@@ -1865,9 +1935,7 @@ mod tests {
         assert_eq!(h.live.read().unwrap().aliases[&mac].alias.as_deref(), Some("Kitchen speaker"));
         set(&mut h, Some(""), false); // empty clears
         assert!(!h.live.read().unwrap().aliases.contains_key(&mac));
-        let renames: Vec<_> = std::iter::from_fn(|| h.rx.try_recv().ok())
-            .filter_map(|m| match m { LiveMsg::Event(e) if e.kind == EventKind::ClientRenamed => Some(e.data), _ => None })
-            .collect();
+        let renames = stored(&h, EventKind::ClientRenamed);
         assert_eq!(renames.len(), 2, "{renames:?}");
         assert_eq!(renames[1]["from"], "Kitchen speaker");
     }
@@ -1920,6 +1988,21 @@ mod tests {
         let lists = msgs.iter().filter(|m| matches!(m, LiveMsg::Clients)).count();
         assert_eq!((renames, lists), (2, 1), "{msgs:?}");
         assert_eq!(h.live.read().unwrap().aliases.len(), 2);
+    }
+
+    #[test]
+    fn an_import_keeps_notes_of_clients_without_a_name() {
+        let mut h = harness();
+        let (c2, c3): (Mac, Mac) = ("02:00:00:00:01:02".parse().unwrap(), "02:00:00:00:01:03".parse().unwrap());
+        let edit = |mac: Mac, alias: Option<&str>, note: Option<&str>| AliasEdit { mac, alias: alias.map(str::to_string), note: note.map(str::to_string) };
+        let entries = vec![edit(c2, None, Some("behind the TV")), edit(c3, None, Some("guest laptop"))];
+        h.engine.handle(Input::SetAliases { ts: 1, entries, only_if_unset: false });
+        // One import entry names a client that only has a note; another has no name at all.
+        let entries = vec![edit(c2, Some("TV"), None), edit(c3, Some(""), None)];
+        h.engine.handle(Input::SetAliases { ts: 2, entries, only_if_unset: true });
+        let live = h.live.read().unwrap();
+        assert_eq!((live.aliases[&c2].alias.as_deref(), live.aliases[&c2].note.as_deref()), (Some("TV"), Some("behind the TV")));
+        assert_eq!((live.aliases[&c3].alias.as_deref(), live.aliases[&c3].note.as_deref()), (None, Some("guest laptop")));
     }
 
     #[test]
@@ -1982,9 +2065,9 @@ mod tests {
         let logs = std::iter::from_fn(|| h.rx.try_recv().ok()).filter(|m| matches!(m, LiveMsg::Log { .. })).count();
         assert_eq!(logs, 1, "nothing more to announce");
         // An event's data is not sent to the browsers.
-        let e = Event::device(1, EventKind::ApCrash, AP1.parse().unwrap(), json!({ "lines": ["a long crash dump"] }));
-        let text = serde_json::to_string(&LiveMsg::Event(e)).unwrap();
-        assert_eq!(text, r#"{"type":"event","kind":"ap_crash","device_mac":"02:00:00:00:00:01","client_mac":null}"#);
+        h.engine.emit(Event::device(1, EventKind::ApCrash, AP1.parse().unwrap(), json!({ "lines": ["a long crash dump"] })));
+        let text = std::iter::from_fn(|| h.rx.try_recv().ok()).find(|m| matches!(m, LiveMsg::Event(_))).map(|m| serde_json::to_string(&m).unwrap());
+        assert_eq!(text.as_deref(), Some(r#"{"type":"event","kind":"ap_crash","device_mac":"02:00:00:00:00:01","client_mac":null}"#));
     }
 
     #[test]
@@ -2054,9 +2137,7 @@ mod tests {
         feed(&mut h, with(36, 9)); // real change...
         feed(&mut h, with(36, 9)); // ...confirmed
         feed(&mut h, with(36, 9));
-        let changes: Vec<_> = std::iter::from_fn(|| h.rx.try_recv().ok())
-            .filter_map(|m| match m { LiveMsg::Event(e) if e.kind == EventKind::RadioChanged => Some(e.data), _ => None })
-            .collect();
+        let changes = stored(&h, EventKind::RadioChanged);
         assert_eq!(changes.len(), 1, "{changes:?}");
         assert_eq!(changes[0]["from"]["channel"], 44);
         assert_eq!(changes[0]["to"]["channel"], 36);
@@ -2070,20 +2151,18 @@ mod tests {
         events(&mut h);
         h.engine.handle(Input::Tick(100));
         assert_eq!(events(&mut h), vec![("ap_offline", None), ("client_disconnected", Some(C1.into()))]);
+        // A notification while offline does not shorten the time reported offline.
+        h.engine.handle(Input::Inform { ts: 150, peer: "x".into(), decoded: notif(AP1, "event", json!({})) });
         // Back with a low uptime: online again and restarted.
         h.engine.handle(Input::Inform { ts: 200, peer: "x".into(), decoded: decoded(inform(AP1, 50, &[])) });
         assert_eq!(events(&mut h), vec![("ap_online", None), ("ap_restarted", None)]);
+        assert_eq!(stored(&h, EventKind::ApOnline)[0]["offline_for"], 200);
 
         let mac: Mac = AP1.parse().unwrap();
         let push = |cfg: &str| decoded(json!({ "_type": "setparam", "cfgversion": "x", "system_cfg": cfg, "mgmt_cfg": "a=1" }));
         h.engine.handle(Input::Reply { ts: 210, mac, decoded: push("aaa.1.hide_ssid=false\naaa.1.wpa.psk=old") });
         h.engine.handle(Input::Reply { ts: 220, mac, decoded: push("aaa.1.hide_ssid=true\naaa.1.wpa.psk=new") });
-        let mut pushes = Vec::new();
-        while let Ok(m) = h.rx.try_recv() {
-            if let LiveMsg::Event(e) = m {
-                pushes.push(e.data);
-            }
-        }
+        let pushes = stored(&h, EventKind::ConfigPushed);
         assert_eq!(pushes[0]["system_cfg"]["baseline"], true);
         let diff = pushes[1]["system_cfg"]["diff"].as_str().unwrap();
         assert!(diff.contains("~ aaa.1.hide_ssid: false -> true"), "{diff}");
