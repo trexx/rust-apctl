@@ -125,6 +125,8 @@ pub struct Auth {
     failures: Mutex<HashMap<IpAddr, (u32, Ts)>>,
     writer: Writer,
     proxies: Arc<Proxies>,
+    /// Told of every logout, so open live sockets check their session at once.
+    logouts: tokio::sync::watch::Sender<()>,
 }
 
 pub type SharedAuth = Arc<Auth>;
@@ -145,7 +147,7 @@ impl Auth {
         })?;
         // Sessions of users that were removed from the file stop working.
         let sessions = rows.into_iter().filter(|(_, s)| users.hashes.contains_key(&s.user)).collect();
-        Ok(Auth { users, sessions: Mutex::new(sessions), failures: Mutex::new(HashMap::new()), writer, proxies })
+        Ok(Auth { users, sessions: Mutex::new(sessions), failures: Mutex::new(HashMap::new()), writer, proxies, logouts: tokio::sync::watch::Sender::new(()) })
     }
 
     pub fn enabled(&self) -> bool {
@@ -198,9 +200,42 @@ impl Auth {
         self.sessions.lock().unwrap().get_mut(&token_hash(token)).unwrap().expires -= secs;
     }
 
+    /// The session a request belongs to (its token's hash); `None` without
+    /// logins (read-only mode has no sessions).
+    pub(crate) fn session_of(&self, headers: &HeaderMap) -> Option<String> {
+        if !self.enabled() {
+            return None;
+        }
+        session_token(headers).map(|t| token_hash(&t))
+    }
+
+    /// Changes at every logout.
+    pub(crate) fn logouts(&self) -> tokio::sync::watch::Receiver<()> {
+        self.logouts.subscribe()
+    }
+
+    /// Whether a session (by its hash) is still there: not logged out, not expired.
+    pub(crate) fn alive(&self, hash: &str) -> bool {
+        self.sessions.lock().unwrap().get(hash).is_some_and(|s| s.expires > store::now_ts())
+    }
+
+    /// Whether a WebSocket handshake comes from a page of this server. CORS
+    /// does not cover WebSockets, and the SameSite=Lax cookie is sent from
+    /// any page of the same site (a sibling subdomain), so the browser's
+    /// Origin must name the host the request was sent to: the Host header, or
+    /// X-Forwarded-Host from a trusted proxy. A handshake without an Origin
+    /// is not from a browser page, and is let through.
+    pub(crate) fn same_origin(&self, headers: &HeaderMap, peer: Option<IpAddr>, authority: Option<&str>) -> bool {
+        let Some(origin) = headers.get(header::ORIGIN) else { return true };
+        let forwarded = || headers.get_all("x-forwarded-host").iter().filter_map(|v| v.to_str().ok()).flat_map(|v| v.split(',')).next_back().map(str::trim);
+        let host = peer.filter(|p| self.proxies.contains(*p)).and_then(|_| forwarded()).or_else(|| headers.get(header::HOST)?.to_str().ok()).or(authority);
+        origin.to_str().ok().zip(host).is_some_and(|(o, h)| origin_matches(o, h))
+    }
+
     fn revoke(&self, token: &str) {
         let hash = token_hash(token);
         self.sessions.lock().unwrap().remove(&hash);
+        self.logouts.send_replace(());
         self.writer.exec(Db::Config, "DELETE FROM sessions WHERE token_hash = ?1", vec![Sql::Text(hash)]);
     }
 
@@ -300,6 +335,22 @@ impl Proxies {
 /// The address of an X-Forwarded-For hop, with or without a port.
 fn hop_ip(hop: &str) -> Option<IpAddr> {
     hop.parse::<IpAddr>().ok().or_else(|| hop.parse::<SocketAddr>().ok().map(|a| a.ip())).or_else(|| hop.strip_prefix('[')?.strip_suffix(']')?.parse().ok())
+}
+
+/// Whether an Origin (`https://apctl.example:8443`) names this host (`apctl.example:8443`),
+/// a port the scheme implies being the same as none.
+fn origin_matches(origin: &str, host: &str) -> bool {
+    let Some((scheme, authority)) = origin.split_once("://") else { return false };
+    let default = match scheme.to_ascii_lowercase().as_str() {
+        "https" => ":443",
+        "http" => ":80",
+        _ => return false,
+    };
+    let bare = |a: &str| {
+        let a = a.trim().to_ascii_lowercase();
+        a.strip_suffix(default).map(str::to_string).unwrap_or(a)
+    };
+    !authority.is_empty() && bare(authority) == bare(host)
 }
 
 pub fn session_token(headers: &HeaderMap) -> Option<String> {
@@ -556,6 +607,38 @@ mod tests {
         assert!(Proxies::parse(&["10.0.0.0/33".into()]).is_err());
         assert!(Proxies::parse(&["proxy.example".into()]).is_err());
         assert!(Proxies::parse(&["fd00::/8".into()]).unwrap().contains(ip("fd12::1")));
+    }
+
+    #[test]
+    fn live_sockets_are_only_for_pages_of_this_server() {
+        let dir = std::env::temp_dir().join(format!("apctl-origin-{}-{}", std::process::id(), store::now_ts()));
+        let (store, writer) = Store::open(&dir).unwrap();
+        let proxies = Arc::new(Proxies::parse(&["10.42.0.0/16".into()]).unwrap());
+        let auth = Auth::new(Users::default(), &store, writer, proxies).unwrap();
+        let ok = |origin: Option<&str>, host: &str, forwarded: Option<&str>, peer: &str| {
+            let mut h = HeaderMap::new();
+            h.insert(header::HOST, host.parse().unwrap());
+            if let Some(o) = origin {
+                h.insert(header::ORIGIN, o.parse().unwrap());
+            }
+            if let Some(f) = forwarded {
+                h.insert("x-forwarded-host", f.parse().unwrap());
+            }
+            auth.same_origin(&h, Some(peer.parse().unwrap()), None)
+        };
+        let lan = "192.168.1.20";
+        assert!(ok(Some("http://apctl.lan:8080"), "apctl.lan:8080", None, lan));
+        assert!(ok(Some("https://APCTL.example"), "apctl.example:443", None, lan), "default port, any case");
+        assert!(ok(None, "apctl.lan:8080", None, lan), "not a browser page");
+        assert!(!ok(Some("https://other.example"), "apctl.example", None, lan), "a sibling site");
+        assert!(!ok(Some("http://apctl.lan:8081"), "apctl.lan:8080", None, lan));
+        assert!(!ok(Some("null"), "apctl.lan", None, lan));
+        // Behind a trusted proxy the host the browser used is X-Forwarded-Host.
+        assert!(ok(Some("https://apctl.example"), "apctl:8080", Some("apctl.example"), "10.42.0.3"));
+        assert!(!ok(Some("https://other.example"), "apctl:8080", Some("apctl.example"), "10.42.0.3"));
+        // From anyone else it is not believed.
+        assert!(!ok(Some("https://evil.example"), "apctl.lan", Some("evil.example"), lan));
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
