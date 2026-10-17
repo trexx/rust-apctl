@@ -435,6 +435,17 @@ struct DeviceOut<'a> {
     stored_only: bool,
 }
 
+/// A copy of an AP's view with what its page shows: not the snapshot's
+/// clients, neighbours and spectrum, which are not sent with it (see `Snapshot`).
+fn page_view(d: &DeviceView) -> DeviceView {
+    let s = &d.snapshot;
+    let snapshot = crate::model::Snapshot {
+        ap: s.ap.clone(), uplink: s.uplink.clone(), radios: s.radios.clone(), vaps: s.vaps.clone(), clients: vec![], neighbors: vec![], spectrum: vec![],
+        has_vap_table: s.has_vap_table,
+    };
+    DeviceView { snapshot, peer: d.peer.clone(), ..*d }
+}
+
 async fn device(State(s): State<AppState>, Path(mac): Path<String>) -> Result<Response, ApiError> {
     let mac = parse_mac(&mac)?;
     // Copied out under the lock (the clients' samples are shared), and serialised after it.
@@ -442,7 +453,7 @@ async fn device(State(s): State<AppState>, Path(mac): Path<String>) -> Result<Re
         let live = s.live.read().unwrap();
         live.devices.get(&mac).map(|d| {
             let clients: Vec<_> = live.clients.values().filter(|c| c.connected && c.sample.ap_mac == mac).cloned().collect();
-            (d.clone(), clients, live.locating.contains(&mac))
+            (page_view(d), clients, live.locating.contains(&mac))
         })
     };
     if let Some((view, clients, locating)) = found {
@@ -1112,6 +1123,8 @@ mod tests {
             assert_eq!(sorted(stored.pointer(path).unwrap()), live, "{path}");
         }
         assert_eq!(stored["device"]["snapshot"]["ap"]["mac"], "02:00:00:00:00:02");
+        // The snapshot's clients come beside it; its neighbours and spectrum are the RF pages'.
+        assert_eq!(sorted(&one["device"]["snapshot"]), ["ap", "has_vap_table", "radios", "uplink", "vaps"]);
         let clients = get_json(&app, "/api/clients").await;
         assert_eq!((clients[0]["ap_name"].as_str(), clients[0]["connected"].as_bool(), clients[0]["sample"]["essid"].as_str()), (Some("Hall"), Some(true), Some("Home")));
         assert!(clients[0]["alias"].is_null() && clients[0].get("blocked").is_some(), "{}", clients[0]);
