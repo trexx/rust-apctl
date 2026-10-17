@@ -19,6 +19,7 @@
 //! pushing the same config again under a new token.
 
 use std::collections::HashMap;
+use std::net::IpAddr;
 use std::sync::{Arc, Mutex, Weak};
 
 use axum::body::Bytes;
@@ -515,6 +516,27 @@ fn status(code: StatusCode) -> Response {
 /// controller has no such wait).
 const RESET_QUIET_SECS: Ts = 600;
 
+/// Who sent an inform, and the key it was opened with: what answering it needs.
+struct Caller {
+    mac: Mac,
+    gcm: bool,
+    key: [u8; 16],
+    /// The address the inform came from.
+    peer: IpAddr,
+    /// The AP's own address: `peer`, or behind a trusted proxy what it says.
+    source: IpAddr,
+}
+
+impl Caller {
+    /// A reply in the request's encryption mode, never compressed, with a
+    /// fresh IV, serialised straight into the packet.
+    fn seal(&self, reply: &Value) -> Response {
+        let flags = Flags(Flags::ENCRYPTED | if self.gcm { Flags::GCM } else { 0 });
+        let packet = inform::seal_with(self.mac, flags, random_bytes::<16>(), &self.key, |out| serde_json::to_writer(out, reply).expect("a JSON value serialises"));
+        ([(header::CONTENT_TYPE, "application/x-binary")], packet).into_response()
+    }
+}
+
 /// POST /inform
 pub async fn inform(
     State(active): State<Arc<Active>>,
@@ -525,7 +547,6 @@ pub async fn inform(
     let ts = store::now_ts();
     let Ok(header) = Packet::parse(&body).map(|p| p.header) else { return status(StatusCode::BAD_REQUEST) };
     let mac = header.mac;
-    let gcm = header.flags.has(Flags::GCM);
     // An unencrypted packet "opens" with any key: it proves nothing.
     if !header.flags.has(Flags::ENCRYPTED) {
         tracing::warn!("{mac}: refusing an unencrypted inform from {}", peer.ip());
@@ -543,42 +564,58 @@ pub async fn inform(
         tracing::warn!("{mac}: header and payload MACs differ");
         return status(StatusCode::BAD_REQUEST);
     }
-    if device_key.is_none() || used == KeyUsed::Default {
-        let known = device_key.is_some();
-        let adopting = active.live.read().unwrap().adoption.adopting.contains_key(&mac);
-        if known && adopting {
-            // Adopt pressed: hand the AP its own key (in mgmt_cfg), with the factory key.
-            let a = active.clone();
-            let Ok(reply) = tokio::task::spawn_blocking(move || a.adoption_reply(ts, mac, &payload)).await else {
-                return status(StatusCode::INTERNAL_SERVER_ERROR);
-            };
-            tracing::info!("{mac}: adoption: sending its key");
-            return sealed(mac, gcm, &key, &reply);
-        }
-        // Not ours, or ours but reset: answered 404 and listed for adoption.
-        // What apctl remembers about an AP it no longer has (e.g. AES-GCM) goes.
-        // For one it has, the factory key proves nothing (anyone can send this
-        // under its MAC): that is kept until it is adopted again.
-        if !known {
-            active.devices.lock().unwrap().remove(&mac);
-        } else if active.live.read().unwrap().devices.get(&mac).is_some_and(|d| ts - d.last_seen < RESET_QUIET_SECS) {
-            // It informed with its own key moments ago: a reset AP is silent
-            // while it reboots, so this is most likely someone else. Listing
-            // it would let an Adopt hand them the AP's key.
-            tracing::warn!("{mac}: factory-key inform from {} while the AP still informs with its own key: ignored", peer.ip());
-            return status(StatusCode::NOT_FOUND);
-        }
-        let inform = crate::adopt::pending_inform(&payload);
-        drop(payload);
-        let data = json!({ "model": inform["model"], "ip": inform["ip"], "known": known });
-        let source = active.proxies.client_ip(&headers, peer.ip());
-        let new = crate::adopt::note_pending(&mut active.live.write().unwrap(), inform, known, ts, source);
-        if new {
-            tracing::info!("{mac}: {} informing from {}", if known { "reset AP (adoption required)" } else { "AP waiting for adoption" }, peer.ip());
-            let _ = active.engine.send(Input::Note(Event::device(ts, EventKind::ApPending, mac, data))).await;
-        }
+    let caller = Caller { mac, gcm: header.flags.has(Flags::GCM), key, peer: peer.ip(), source: active.proxies.client_ip(&headers, peer.ip()) };
+    // Only an AP apctl manages is tried with a key of its own.
+    if used == KeyUsed::Default {
+        factory_key_inform(&active, ts, &caller, payload, device_key.is_some()).await
+    } else {
+        managed_inform(&active, ts, &caller, header, used, payload).await
+    }
+}
+
+/// An inform under the factory key: an AP apctl is adopting gets its own key;
+/// any other is answered 404 and listed for adoption. `known`: apctl manages
+/// an AP of this MAC.
+async fn factory_key_inform(active: &Arc<Active>, ts: Ts, caller: &Caller, payload: Value, known: bool) -> Response {
+    let mac = caller.mac;
+    let adopting = active.live.read().unwrap().adoption.adopting.contains_key(&mac);
+    if known && adopting {
+        // Adopt pressed: hand the AP its own key (in mgmt_cfg), with the factory key.
+        let a = active.clone();
+        let Ok(reply) = tokio::task::spawn_blocking(move || a.adoption_reply(ts, mac, &payload)).await else {
+            return status(StatusCode::INTERNAL_SERVER_ERROR);
+        };
+        tracing::info!("{mac}: adoption: sending its key");
+        return caller.seal(&reply);
+    }
+    // Not ours, or ours but reset: answered 404 and listed for adoption.
+    // What apctl remembers about an AP it no longer has (e.g. AES-GCM) goes.
+    // For one it has, the factory key proves nothing (anyone can send this
+    // under its MAC): that is kept until it is adopted again.
+    if !known {
+        active.devices.lock().unwrap().remove(&mac);
+    } else if active.live.read().unwrap().devices.get(&mac).is_some_and(|d| ts - d.last_seen < RESET_QUIET_SECS) {
+        // It informed with its own key moments ago: a reset AP is silent
+        // while it reboots, so this is most likely someone else. Listing
+        // it would let an Adopt hand them the AP's key.
+        tracing::warn!("{mac}: factory-key inform from {} while the AP still informs with its own key: ignored", caller.peer);
         return status(StatusCode::NOT_FOUND);
     }
+    let inform = crate::adopt::pending_inform(&payload);
+    drop(payload);
+    let data = json!({ "model": inform["model"], "ip": inform["ip"], "known": known });
+    let new = crate::adopt::note_pending(&mut active.live.write().unwrap(), inform, known, ts, caller.source);
+    if new {
+        tracing::info!("{mac}: {} informing from {}", if known { "reset AP (adoption required)" } else { "AP waiting for adoption" }, caller.peer);
+        let _ = active.engine.send(Input::Note(Event::device(ts, EventKind::ApPending, mac, data))).await;
+    }
+    status(StatusCode::NOT_FOUND)
+}
+
+/// An inform under an AP's own key: the reply to it (a config push, a
+/// command, a heartbeat), and the inform for the engine.
+async fn managed_inform(active: &Arc<Active>, ts: Ts, caller: &Caller, header: inform::Header, used: KeyUsed, payload: Value) -> Response {
+    let (mac, gcm) = (caller.mac, caller.gcm);
     // Its own key: an adoption is complete; a forgotten AP is told to reset
     // (once: the entry goes, so later informs don't finish the forget again).
     let (was_adopting, forgetting) = {
@@ -609,7 +646,7 @@ pub async fn inform(
         tokio::spawn(async move { crate::adopt::finish_forget(&engine, mac, true).await });
         active.devices.lock().unwrap().remove(&mac);
         let reply = json!({ "_type": "setdefault", "server_time_in_utc": (ts * 1000).to_string() });
-        return sealed(mac, gcm, &key, &reply);
+        return caller.seal(&reply);
     }
     {
         let mut devices = active.devices.lock().unwrap();
@@ -626,17 +663,16 @@ pub async fn inform(
         }
     }
 
-    let peer_ip = active.proxies.client_ip(&headers, peer.ip()).to_string();
     // Rendering the config takes a while: off the async workers.
     let a = active.clone();
     let Ok((reply, payload)) = tokio::task::spawn_blocking(move || (a.reply(ts, mac, &payload), payload)).await else {
         return status(StatusCode::INTERNAL_SERVER_ERROR);
     };
     let decoded = Decoded { header, key: used, payload };
-    if active.engine.send(Input::Inform { ts, peer: peer_ip, decoded }).await.is_err() {
+    if active.engine.send(Input::Inform { ts, peer: caller.source.to_string(), decoded }).await.is_err() {
         return status(StatusCode::SERVICE_UNAVAILABLE);
     }
-    let response = sealed(mac, gcm, &key, &reply);
+    let response = caller.seal(&reply);
     // The engine follows the interval it asked for (or the AP would be called
     // offline on a site where informs come more than a minute apart) and
     // records each push.
@@ -644,14 +680,6 @@ pub async fn inform(
         let _ = active.engine.send(Input::Replied { ts, mac, payload: reply }).await;
     }
     response
-}
-
-/// A reply in the request's encryption mode, never compressed, with a fresh
-/// IV, serialised straight into the packet.
-fn sealed(mac: Mac, gcm: bool, key: &[u8; 16], reply: &Value) -> Response {
-    let flags = Flags(Flags::ENCRYPTED | if gcm { Flags::GCM } else { 0 });
-    let packet = inform::seal_with(mac, flags, random_bytes::<16>(), key, |out| serde_json::to_writer(out, reply).expect("a JSON value serialises"));
-    ([(header::CONTENT_TYPE, "application/x-binary")], packet).into_response()
 }
 
 #[cfg(test)]
