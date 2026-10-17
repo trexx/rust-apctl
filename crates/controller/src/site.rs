@@ -11,7 +11,7 @@ use std::sync::LazyLock;
 
 use crate::api::{ApiError, AppState};
 use crate::settings::Kind::{Bool, Int};
-use crate::settings::{COUNTRY_NAMES, Patch, PreviewQuery, band_name, copy_fields, country, dedup_in_order, docs_mut, illegal_fixed_channel, mgmt_flag, num, outdoor_with, setting, setting_mut};
+use crate::settings::{COUNTRIES, Patch, PreviewQuery, band_name, copy_fields, country, dedup_in_order, docs_mut, illegal_fixed_channel, mgmt_flag, num, outdoor_with, setting, setting_mut};
 
 /// A host name or IPv4 address, as NTP and syslog targets take (the official
 /// controller refuses IPv6 there).
@@ -247,7 +247,7 @@ fn site_snmp(doc: &mut Value, sn: &Value, notes: &mut Vec<String>) -> Result<(),
 fn site_region(state: &mut Value, p: &Value) -> Result<(), String> {
     if !p["country"].is_null() {
         let code = num(&p["country"]).ok_or("country must be an ISO 3166 numeric code")?;
-        if !COUNTRY_NAMES.iter().any(|(c, _)| *c == code) {
+        if !COUNTRIES.iter().any(|c| c.code == code) {
             return Err(format!("country {code} is not one apctl has channel rules for"));
         }
         setting_mut(state, "country")["code"] = json!(code.to_string());
@@ -339,13 +339,13 @@ fn site_view(state: &Value, active: bool, secrets: bool) -> Value {
         "has_v3_password": sn["x_password"].as_str().is_some_and(|p| !p.is_empty()),
     });
     // The choices never change: built once.
-    static COUNTRIES: LazyLock<Value> = LazyLock::new(|| COUNTRY_NAMES.iter().map(|(c, n)| json!({ "code": c, "name": n })).collect());
+    static COUNTRY_LIST: LazyLock<Value> = LazyLock::new(|| COUNTRIES.iter().map(|c| json!({ "code": c.code, "name": c.name })).collect());
     static TIMEZONES: LazyLock<Value> = LazyLock::new(|| apcfg::tz::names().collect());
     let mut v = json!({
         "active": active, "mgmt": mgmt, "rsyslogd": rsyslogd, "ntp": ntp, "snmp": snmp,
         "country": country(state), "timezone": setting(state, "locale")["timezone"],
     });
-    v["countries"] = COUNTRIES.clone();
+    v["countries"] = COUNTRY_LIST.clone();
     v["timezones"] = TIMEZONES.clone();
     v
 }

@@ -337,23 +337,44 @@ pub async fn device(State(s): State<AppState>, Path(mac): Path<String>) -> Resul
 
 // ---- Channels -------------------------------------------------------------
 
-/// Countries using the European (ETSI) rules, by ISO 3166 numeric code: EU and
-/// EEA members, the UK and Switzerland.
-const ETSI: &[i64] = &[
-    40, 56, 100, 191, 196, 203, 208, 233, 246, 250, 276, 300, 348, 352, 372, 380, 428, 438, 440, 442, 470, 528, 578, 616, 620, 642, 703, 705, 724, 752,
-    756, 826,
-];
-/// Countries using the US (FCC) rules.
-const FCC: &[i64] = &[840, 124];
+/// The channel rules a country follows.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub(crate) enum Rules {
+    /// European (ETSI): EU and EEA members, the UK and Switzerland.
+    Etsi,
+    /// US (FCC).
+    Fcc,
+}
 
-/// Names of the countries the channel tables above cover, for the site settings.
-pub(crate) const COUNTRY_NAMES: &[(i64, &str)] = &[
-    (40, "Austria"), (56, "Belgium"), (100, "Bulgaria"), (124, "Canada"), (191, "Croatia"), (196, "Cyprus"), (203, "Czechia"), (208, "Denmark"),
-    (233, "Estonia"), (246, "Finland"), (250, "France"), (276, "Germany"), (300, "Greece"), (348, "Hungary"), (352, "Iceland"), (372, "Ireland"),
-    (380, "Italy"), (428, "Latvia"), (438, "Liechtenstein"), (440, "Lithuania"), (442, "Luxembourg"), (470, "Malta"), (528, "Netherlands"), (578, "Norway"),
-    (616, "Poland"), (620, "Portugal"), (642, "Romania"), (703, "Slovakia"), (705, "Slovenia"), (724, "Spain"), (752, "Sweden"), (756, "Switzerland"),
-    (826, "United Kingdom"), (840, "United States"),
-];
+/// A country apctl has channel rules for: its ISO 3166 numeric code, its name
+/// (for the site settings) and its rules.
+pub(crate) struct Country {
+    pub code: i64,
+    pub name: &'static str,
+    pub rules: Rules,
+}
+
+/// The countries apctl has channel rules for; the site's country must be one.
+pub(crate) const COUNTRIES: &[Country] = {
+    use Rules::{Etsi, Fcc};
+    const fn c(code: i64, name: &'static str, rules: Rules) -> Country {
+        Country { code, name, rules }
+    }
+    &[
+        c(40, "Austria", Etsi), c(56, "Belgium", Etsi), c(100, "Bulgaria", Etsi), c(124, "Canada", Fcc), c(191, "Croatia", Etsi), c(196, "Cyprus", Etsi),
+        c(203, "Czechia", Etsi), c(208, "Denmark", Etsi), c(233, "Estonia", Etsi), c(246, "Finland", Etsi), c(250, "France", Etsi), c(276, "Germany", Etsi),
+        c(300, "Greece", Etsi), c(348, "Hungary", Etsi), c(352, "Iceland", Etsi), c(372, "Ireland", Etsi), c(380, "Italy", Etsi), c(428, "Latvia", Etsi),
+        c(438, "Liechtenstein", Etsi), c(440, "Lithuania", Etsi), c(442, "Luxembourg", Etsi), c(470, "Malta", Etsi), c(528, "Netherlands", Etsi),
+        c(578, "Norway", Etsi), c(616, "Poland", Etsi), c(620, "Portugal", Etsi), c(642, "Romania", Etsi), c(703, "Slovakia", Etsi), c(705, "Slovenia", Etsi),
+        c(724, "Spain", Etsi), c(752, "Sweden", Etsi), c(756, "Switzerland", Etsi), c(826, "United Kingdom", Etsi), c(840, "United States", Fcc),
+    ]
+};
+
+/// The rules of a country, if apctl has them.
+fn rules_of(country: Option<i64>) -> Option<Rules> {
+    let code = country?;
+    COUNTRIES.iter().find(|c| c.code == code).map(|c| c.rules)
+}
 
 /// The site's country (ISO 3166 numeric), from the `country` setting.
 pub(crate) fn country(state: &Value) -> Option<i64> {
@@ -365,13 +386,13 @@ pub(crate) fn country(state: &Value) -> Option<i64> {
 /// or the band (6 GHz): nothing is restricted then, the AP's own regulatory
 /// domain decides.
 pub fn legal_channels(country: Option<i64>, band: &str, width: i64, outdoor: bool) -> Option<Vec<i64>> {
-    Some(channel_blocks(country, band, width, outdoor)?.into_iter().flatten().copied().collect())
+    Some(channel_blocks(rules_of(country)?, band, width, outdoor)?.into_iter().flatten().copied().collect())
 }
 
 /// [`legal_channels`] for one channel, without building the list: `None` when
 /// apctl has no rules for the country or the band.
 pub fn is_legal(country: Option<i64>, band: &str, width: i64, outdoor: bool, ch: i64) -> Option<bool> {
-    Some(channel_blocks(country, band, width, outdoor)?.into_iter().any(|b| b.contains(&ch)))
+    Some(channel_blocks(rules_of(country)?, band, width, outdoor)?.into_iter().any(|b| b.contains(&ch)))
 }
 
 /// A fixed channel of an AP's `radio_table` entry that the country and the
@@ -383,20 +404,18 @@ pub(crate) fn illegal_fixed_channel(country: Option<i64>, radio: &Value, outdoor
 }
 
 /// The legal channels of [`legal_channels`], as up to three runs of a table.
-fn channel_blocks(country: Option<i64>, band: &str, width: i64, outdoor: bool) -> Option<[&'static [i64]; 3]> {
+fn channel_blocks(rules: Rules, band: &str, width: i64, outdoor: bool) -> Option<[&'static [i64]; 3]> {
     const NG: [i64; 13] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13];
     const NA_LOW: &[i64] = &[36, 40, 44, 48, 52, 56, 60, 64];
     const NA_MID: &[i64] = &[100, 104, 108, 112, 116, 120, 124, 128, 132, 136, 140];
     const FCC_HIGH: &[i64] = &[144, 149, 153, 157, 161, 165];
-    let etsi = country.is_some_and(|c| ETSI.contains(&c));
-    let fcc = country.is_some_and(|c| FCC.contains(&c));
-    Some(match band {
-        "ng" if etsi => [&NG, &[], &[]],
-        "ng" if fcc => [&NG[..11], &[], &[]],
+    Some(match (band, rules) {
+        ("ng", Rules::Etsi) => [&NG, &[], &[]],
+        ("ng", Rules::Fcc) => [&NG[..11], &[], &[]],
         // 140 has no partner for 40 MHz; 132-140 make no 80 MHz block.
-        "na" if etsi => [if outdoor { &[] } else { NA_LOW }, &NA_MID[..if width == 20 { 11 } else if width == 40 { 10 } else { 8 }], &[]],
+        ("na", Rules::Etsi) => [if outdoor { &[] } else { NA_LOW }, &NA_MID[..if width == 20 { 11 } else if width == 40 { 10 } else { 8 }], &[]],
         // 132-161 make no 160 MHz block; 165 is 20 MHz only.
-        "na" if fcc => [NA_LOW, &NA_MID[..if width <= 80 { 11 } else { 8 }], &FCC_HIGH[..if width == 20 { 6 } else if width <= 80 { 5 } else { 0 }]],
+        ("na", Rules::Fcc) => [NA_LOW, &NA_MID[..if width <= 80 { 11 } else { 8 }], &FCC_HIGH[..if width == 20 { 6 } else if width <= 80 { 5 } else { 0 }]],
         _ => return None,
     })
 }
@@ -407,7 +426,7 @@ pub(crate) fn band_channels(band: &str, width: i64) -> Vec<i64> {
     match band {
         "ng" => (1..=13).collect(),
         // The US list holds every channel the European one does.
-        "na" => legal_channels(FCC.first().copied(), "na", width, false).unwrap_or_default(),
+        "na" => channel_blocks(Rules::Fcc, "na", width, false).map(|b| b.into_iter().flatten().copied().collect()).unwrap_or_default(),
         // 1 to 233 in steps of 4; 233 has no partner for 40 MHz, 225-233 make no 80 MHz block.
         "6e" => (1..=233).step_by(4).filter(|c| width <= 20 || *c <= if width == 40 { 229 } else { 221 }).collect(),
         _ => Vec::new(),
