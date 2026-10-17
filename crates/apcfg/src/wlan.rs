@@ -433,11 +433,12 @@ fn radius_servers(c: &mut Cfg, ctx: &Ctx, w: &Value, k: Prefix) {
     }
 }
 
-/// WEP key as hex plus the key type (`wep64`, `wep128`, otherwise `aes128`).
+/// WEP key as hex plus the key type (`wep64`, `wep128`, otherwise `aes128`). A 5- or 13-character key is
+/// an ASCII passphrase and is always hex-encoded, even when it looks like hex; the official controller
+/// does the same, and sends the placeholder "wrong" (so hex-encoded too) when no key is set.
 fn wep_key(w: &Value) -> (String, &'static str) {
-    let key = str_of(w, "x_wep").unwrap_or_default();
-    let is_hex = key.chars().all(|ch| ch.is_ascii_hexdigit());
-    let hex = if !is_hex && (key.len() == 5 || key.len() == 13) {
+    let key = str_of(w, "x_wep").unwrap_or("wrong");
+    let hex = if key.len() == 5 || key.len() == 13 {
         key.bytes().fold(String::with_capacity(2 * key.len()), |mut hex, b| {
             let _ = write!(hex, "{b:02x}");
             hex
@@ -958,6 +959,17 @@ mod schedule_tests {
         let b = blackout_blocks(&w);
         assert_eq!((b[1].clone(), b[2].len()), (vec![(1380, 1440)], 0));
         assert_eq!(lines(&w, true, false), vec!["wireless.1.schedule_invert=enabled", "wireless.1.schedule_mon=2300-2359"]);
+    }
+
+    #[test]
+    fn wep_keys_of_5_or_13_characters_are_always_hex_encoded() {
+        let key = |w: Value| wep_key(&w);
+        assert_eq!(key(json!({ "x_wep": "abcde" })), ("6162636465".to_string(), "wep64"), "hex-looking, but a passphrase");
+        assert_eq!(key(json!({ "x_wep": "12345" })), ("3132333435".to_string(), "wep64"));
+        assert_eq!(key(json!({ "x_wep": "0123456789abc" })), ("30313233343536373839616263".to_string(), "wep128"));
+        assert_eq!(key(json!({ "x_wep": "0123456789" })), ("0123456789".to_string(), "wep64"), "10 characters are hex already");
+        assert_eq!(key(json!({ "x_wep": "0123456789abcdef0123456789" })).1, "wep128");
+        assert_eq!(key(json!({})), ("77726f6e67".to_string(), "wep64"), "a missing key is \"wrong\"");
     }
 
     #[test]
