@@ -66,7 +66,7 @@ function parseDiff(diff: string): Change[] {
 }
 
 /** Group changes by area and numbered section ("Wi-Fi security — Home WiFi (5 GHz)"). */
-export function group(
+function group(
   changes: Change[],
   labels: Record<string, string>,
 ): [string, (Change & { field: string })[]][] {

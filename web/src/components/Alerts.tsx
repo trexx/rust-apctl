@@ -46,15 +46,14 @@ const DEFAULT_PREFS: Prefs = {
 function loadPrefs(): Prefs {
   try {
     const raw = localStorage.getItem(PREFS_KEY);
-    if (raw)
+    if (raw) {
+      const saved = JSON.parse(raw) as Partial<Prefs>;
       return {
         ...DEFAULT_PREFS,
-        ...JSON.parse(raw),
-        categories: {
-          ...DEFAULT_PREFS.categories,
-          ...JSON.parse(raw).categories,
-        },
+        ...saved,
+        categories: { ...DEFAULT_PREFS.categories, ...saved.categories },
       };
+    }
   } catch {
     // Storage blocked or corrupt: fall back to defaults.
   }
