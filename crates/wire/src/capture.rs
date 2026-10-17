@@ -136,8 +136,8 @@ struct Tracker {
     ports: Vec<u16>,
     udp_ports: Vec<u16>,
     conns: HashMap<ConnId, Conn>,
-    /// Capture time of the last sweep for idle connections.
-    last_sweep: Micros,
+    /// When idle connections were last swept.
+    sweeper: Sweeper,
 }
 
 #[derive(Default)]
@@ -167,9 +167,28 @@ impl Conn {
     }
 }
 
-/// Connections tracked beyond which idle ones are swept, at most once per `SWEEP_EVERY` of capture time.
-const SWEEP_ABOVE: usize = 256;
+/// Entries in a map of connections (here, and the requests waiting in `exchange`) beyond
+/// which stale ones are swept, at most once per `SWEEP_EVERY` of capture time: not on
+/// every packet, which would scan the whole map each time.
+pub(crate) const SWEEP_ABOVE: usize = 256;
 const SWEEP_EVERY: Micros = 10_000_000;
+
+/// When a map of connections was last swept.
+#[derive(Default)]
+pub(crate) struct Sweeper {
+    pub(crate) last: Micros,
+}
+
+impl Sweeper {
+    /// Whether a map of `len` entries is due for a sweep at `ts`; if it is, the sweep counts as done.
+    pub(crate) fn due(&mut self, len: usize, ts: Micros) -> bool {
+        let due = len > SWEEP_ABOVE && ts.abs_diff(self.last) >= SWEEP_EVERY as u64;
+        if due {
+            self.last = ts;
+        }
+        due
+    }
+}
 /// Most connections tracked at once. An AP keeps one open, so this is far more than
 /// any site has; it bounds what packets with made-up addresses can make us hold.
 const MAX_CONNS: usize = 16_384;
@@ -184,7 +203,7 @@ const CLOSED_LINGER: Micros = 2_000_000;
 
 impl Tracker {
     fn new(ports: Vec<u16>, udp_ports: Vec<u16>) -> Self {
-        Tracker { ports, udp_ports, conns: HashMap::new(), last_sweep: 0 }
+        Tracker { ports, udp_ports, conns: HashMap::new(), sweeper: Sweeper::default() }
     }
 
     fn packet(&mut self, linktype: Linktype, ts: Micros, data: &[u8], on_event: &mut impl FnMut(HttpEvent)) {
@@ -250,10 +269,9 @@ impl Tracker {
         self.sweep(ts);
     }
 
-    /// Forgets idle connections. Not on every packet: that would scan the whole map each time.
+    /// Forgets idle connections, when a sweep is due.
     fn sweep(&mut self, ts: Micros) {
-        if self.conns.len() > SWEEP_ABOVE && ts.abs_diff(self.last_sweep) >= SWEEP_EVERY as u64 {
-            self.last_sweep = ts;
+        if self.sweeper.due(self.conns.len(), ts) {
             self.conns.retain(|_, c| ts - c.last_seen < c.max_idle());
         }
     }
@@ -264,7 +282,7 @@ impl Tracker {
     /// cost no more than that, and a real connection that is forgotten picks up again
     /// at its next message.
     fn make_room(&mut self, ts: Micros) {
-        self.last_sweep = ts;
+        self.sweeper.last = ts;
         self.conns.retain(|_, c| ts - c.last_seen < c.max_idle());
         if self.conns.len() > MAX_CONNS - MAX_CONNS / 8 {
             let mut order: Vec<(bool, Micros)> = self.conns.values().map(|c| (c.carried, c.last_seen)).collect();
