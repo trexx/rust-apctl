@@ -126,12 +126,16 @@ fn new_cfgversion() -> String {
     crate::random_hex(8)
 }
 
+/// The longest inform interval apctl asks for (on sites of 18 APs or more).
+/// The insights read this far back for the sample before a window.
+pub const MAX_INFORM_INTERVAL: Ts = 90;
+
 /// Seconds until an AP's next inform, for a site of `n_devices` APs. Matches
 /// the official controller for small sites: five seconds per AP plus jitter,
 /// at least ten.
-fn interval(n_devices: usize) -> i64 {
+fn interval(n_devices: usize) -> Ts {
     let n = n_devices.max(1) as i64;
-    if n < 18 { (n * 5 + (random_bytes::<1>()[0] % 5) as i64).max(10) } else { 60 + (random_bytes::<1>()[0] % 31) as i64 }
+    if n < 18 { (n * 5 + (random_bytes::<1>()[0] % 5) as i64).max(10) } else { MAX_INFORM_INTERVAL - (random_bytes::<1>()[0] % 31) as i64 }
 }
 
 /// A `mgmt_cfg` rendered with the placeholder token, carrying `cfgversion`
@@ -772,6 +776,17 @@ mod tests {
     }
 
     const GCM_ZLIB: Flags = Flags(Flags::ENCRYPTED.0 | Flags::GCM.0 | Flags::ZLIB.0);
+
+    #[test]
+    fn the_inform_interval_stays_within_what_the_insights_allow_for() {
+        for n in 0..40 {
+            for _ in 0..50 {
+                let i = interval(n);
+                assert!((10..=MAX_INFORM_INTERVAL).contains(&i), "{n} APs: {i}");
+            }
+        }
+        assert!((0..1000).any(|_| interval(30) == MAX_INFORM_INTERVAL), "a large site reaches the longest");
+    }
 
     #[tokio::test]
     async fn sends_a_queued_upgrade_once_the_config_is_current() {

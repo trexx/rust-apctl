@@ -184,16 +184,13 @@ pub(crate) fn client_name(live: &Live, mac: Option<inform::Mac>) -> Option<Strin
     live.aliases.get(&mac).and_then(|a| a.alias.clone()).or_else(|| live.clients.get(&mac).and_then(|c| c.sample.hostname.clone()))
 }
 
-/// The longest inform interval the controller asks for (90 s, on sites of 18
-/// APs or more): a raw sample covers at most this long before it.
-const MAX_INFORM_INTERVAL: Ts = 90;
-
 /// Loads a metrics table's samples in range, grouped by key.
 pub(crate) fn load(c: &Connection, spec: Spec, tier: usize, from: Ts, to: Ts) -> anyhow::Result<Loaded> {
     let Spec { table, key, extra, cols, only } = spec;
     let suffix = TIERS[tier].0;
     // Twice the longest interval between two samples, so the one before the window is read.
-    let step = TIERS[tier].1.max(MAX_INFORM_INTERVAL) * 2;
+    // A raw sample covers at most the longest inform interval before it.
+    let step = TIERS[tier].1.max(crate::active::MAX_INFORM_INTERVAL) * 2;
     let mut params = vec![Sql::Integer(from), Sql::Integer(to), Sql::Integer(step)];
     let only = match only {
         None => String::new(),
