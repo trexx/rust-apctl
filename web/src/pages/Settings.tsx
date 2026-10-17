@@ -2,6 +2,7 @@ import { importState, keys, useCanEdit, useSettingsState } from "../api";
 import { ErrorNote, Loading, Outcome, useRunner } from "../components/common";
 import { NotificationSettings } from "../components/Alerts";
 import { BackupSection } from "../components/Backups";
+import { FileButton } from "../components/FileButton";
 import { SiteSettingsPanel } from "../components/SettingsEditor";
 import { ago, clock, useNow } from "../format";
 
@@ -11,8 +12,7 @@ export function Settings() {
   const now = useNow();
   const { busy, msg, run } = useRunner([keys.settingsState()], 500);
 
-  const onFile = (file: File | undefined) => {
-    if (!file) return;
+  const onFile = (file: File) => {
     void run(async () => {
       await importState(JSON.parse(await file.text()));
       return `Imported ${file.name}.`;
@@ -69,21 +69,13 @@ export function Settings() {
               <code>informdump import</code>. It replaces the current settings
               and contains Wi-Fi passwords, so keep the file private.
             </p>
-            <label className="btn">
+            <FileButton
+              accept="application/json,.json"
+              disabled={busy}
+              onFile={onFile}
+            >
               {busy ? "Importing…" : "Choose snapshot file…"}
-              <input
-                type="file"
-                accept="application/json,.json"
-                hidden
-                disabled={busy}
-                onChange={(e) => {
-                  const file = e.target.files?.[0];
-                  // Lets the same file be chosen again, e.g. after a failed import.
-                  e.target.value = "";
-                  onFile(file);
-                }}
-              />
-            </label>
+            </FileButton>
             <Outcome msg={msg} />
           </div>
         )}
