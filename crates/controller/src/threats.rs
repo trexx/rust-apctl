@@ -22,9 +22,9 @@ use std::time::Duration;
 
 use axum::Json;
 use axum::extract::State;
-use rusqlite::{Connection, OptionalExtension};
 use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
+use rusqlite::Connection;
 use rusqlite::types::Value as Sql;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -438,6 +438,12 @@ struct Cache {
     used: Vec<(String, String, Option<String>)>,
     /// Per BSSID: its last change, as last worked out.
     changes: HashMap<String, Change>,
+    /// When `names` and `watching_since` were read.
+    names_at: Ts,
+    /// The stored names of our APs and every client ever seen.
+    names: crate::connections::Names,
+    /// When the first neighbouring network still kept was recorded.
+    watching_since: Option<Ts>,
 }
 
 /// When one of our BSSIDs last changed, for the AP, radio, channel and name it
@@ -517,10 +523,16 @@ pub fn gather(store: &Store, live: &SharedLive, now: Ts) -> anyhow::Result<Asses
         cache.changes.retain(|k, _| own.contains_key(k));
         Ok(())
     })?;
-    drop(cache);
     a.own = own.into_values().collect();
 
-    let mut names = store.read(Db::Config, |c| {
+    store.read(Db::Config, |c| {
+        // The names and the first network heard change slowly, and reading them takes scans.
+        if !(0..CACHE_SECS).contains(&(now - cache.names_at)) {
+            cache.names = crate::connections::Names::load(c)?;
+            cache.watching_since = c.query_row("SELECT MIN(first_seen) FROM neighbors", [], |r| r.get::<_, Option<Ts>>(0))?;
+            cache.names_at = now;
+        }
+        a.watching_since = cache.watching_since.unwrap_or(now);
         let mut stmt = c.prepare(
             "SELECT bssid, ap_mac, radio, essid, channel, security, signal, best_signal, first_seen, last_seen FROM neighbors WHERE last_seen >= ?1",
         )?;
@@ -540,7 +552,6 @@ pub fn gather(store: &Store, live: &SharedLive, now: Ts) -> anyhow::Result<Asses
                 })
             })?
             .collect::<rusqlite::Result<_>>()?;
-        a.watching_since = c.query_row("SELECT MIN(first_seen) FROM neighbors", [], |r| r.get::<_, Option<Ts>>(0)).optional()?.flatten().unwrap_or(now);
         let mut stmt = c.prepare("SELECT kind, bssid, first_reported FROM network_threats")?;
         for row in stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get(2)?)))? {
             let (k, b, t) = row?;
@@ -548,8 +559,10 @@ pub fn gather(store: &Store, live: &SharedLive, now: Ts) -> anyhow::Result<Asses
                 a.reported.insert((k, b), t);
             }
         }
-        Ok(crate::connections::Names::load(c)?)
+        Ok(())
     })?;
+    let mut names = cache.names.clone();
+    drop(cache);
     a.acks = with_acks(store, |acks| acks.clone())?;
     // Our APs and every Wi-Fi client ever seen, with their names (aliases first).
     names.add_live(&live.read().unwrap());
@@ -1115,11 +1128,17 @@ mod tests {
         // Acknowledging shows in the next gather, and is written.
         set_ack(&store, &writer, Kind::Bridged, "02:00:00:00:00:02".into(), Some(Ack { note: None, ts: 7 })).unwrap();
         set_ack(&store, &writer, Kind::Lookalike, "02:00:00:00:00:01".into(), None).unwrap();
+        exec("INSERT INTO neighbors (bssid, ap_mac, first_seen, last_seen) VALUES ('02:00:00:00:00:03', 'x', 50, 200)");
+        exec("INSERT INTO clients (mac, hostname) VALUES ('02:00:00:00:01:02', 'laptop')");
         assert!(writer.flush(Duration::from_secs(5)));
         let a = gather(&store, &live, now + 60).unwrap();
         assert_eq!(a.acks.keys().collect::<Vec<_>>(), [&(Kind::Bridged, "02:00:00:00:00:02".to_string())]);
         let stored: Vec<String> = store.read(Db::Config, |c| Ok(c.prepare("SELECT kind FROM network_acks")?.query_map([], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?)).unwrap();
         assert_eq!(stored, ["bridged"]);
+        // The first network heard and the clients are read again only now and then.
+        assert_eq!((a.watching_since, a.clients.len()), (100, 1));
+        let a = gather(&store, &live, now + CACHE_SECS).unwrap();
+        assert_eq!((a.watching_since, a.clients.len()), (50, 2));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

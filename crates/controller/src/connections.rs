@@ -544,7 +544,7 @@ fn newest(c: &rusqlite::Connection, from: Ts, to: Ts, client: Option<&str>, limi
 }
 
 /// Every AP and client apctl knows, by MAC, with its display name if it has one.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct Names {
     pub aps: HashMap<String, Option<String>>,
     pub clients: HashMap<String, Option<String>>,
