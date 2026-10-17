@@ -79,6 +79,11 @@ enum Cmd {
         /// Device MACs to number first, so APs get stable low fake addresses.
         #[arg(long = "device")]
         devices: Vec<String>,
+        /// Also pass this field, which holds nothing personal (`field`, `parent.field`,
+        /// or a config key with its numbers as `n`). Fields not on the allow-list are
+        /// replaced as text; the run lists them.
+        #[arg(long = "keep")]
+        keep: Vec<String>,
         /// File names inside --input to sanitise.
         files: Vec<String>,
     },
@@ -245,8 +250,8 @@ fn main() -> Result<()> {
             Ok(())
         }
         Cmd::Simulate { pcap, keys, url, limit, every, ports } => simulate::run(&pcap, &ports, &load_keys(Some(&keys))?, &url, limit, every),
-        Cmd::Sanitize { input, output, domains, devices, files } => {
-            sanitize::run(&input, &output, &files, domains, &devices)
+        Cmd::Sanitize { input, output, domains, devices, keep, files } => {
+            sanitize::run(&input, &output, &files, domains, &devices, keep)
         }
         #[cfg(feature = "mongo")]
         Cmd::Import { mongo, db, out } => tokio::runtime::Builder::new_current_thread()

@@ -4,125 +4,363 @@
 //! input always maps to the same output within one run, so diffs between
 //! fixtures stay meaningful. After rewriting, the output is scanned for every
 //! original value that was replaced; any survivor aborts the run.
+//!
+//! It fails closed: a string field passes (with the identifiers inside it rewritten)
+//! only when it is on the allow-list of fields holding settings, states, versions and
+//! the like ([`PASS`], [`PASS_AT`], `--keep`), or when its value is a number or a bare
+//! identifier. Any other value is replaced whole as text people wrote (`text-N`), and
+//! the run lists those fields.
 
-use std::collections::{BTreeMap, HashMap};
-use std::net::Ipv4Addr;
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::net::{Ipv4Addr, Ipv6Addr};
 use std::path::Path;
 
+use aho_corasick::AhoCorasick;
 use anyhow::{Context, Result, bail};
 use regex::Regex;
 use serde_json::Value;
 
 use wire::cfgdiff;
 
-/// original -> replacement, per category so fakes stay readable.
-type Maps = HashMap<&'static str, BTreeMap<String, String>>;
+/// What a fake stands for: it decides the fake's shape, and how the leak check looks
+/// for the original.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+enum Kind {
+    Secret,
+    SshKey,
+    Mac,
+    Uuid,
+    Hex,
+    Ipv4,
+    Ipv6,
+    Domain,
+    /// Hostnames and device names.
+    Name,
+    Ssid,
+    /// Names people gave clients.
+    Alias,
+    /// mDNS service names with a device ID in them.
+    Service,
+    Fingerprint,
+    Qrid,
+    /// Client manufacturers.
+    Vendor,
+    /// Binary UUIDs, base64 encoded.
+    Uuid64,
+    /// Text people wrote (notes, descriptions, SNMP location), and any field not on
+    /// the allow-list.
+    Text,
+}
+
+impl Kind {
+    fn label(self) -> &'static str {
+        match self {
+            Kind::Secret => "secret",
+            Kind::SshKey => "ssh key",
+            Kind::Mac => "mac",
+            Kind::Uuid => "uuid",
+            Kind::Hex => "hex",
+            Kind::Ipv4 => "ipv4",
+            Kind::Ipv6 => "ipv6",
+            Kind::Domain => "domain",
+            Kind::Name => "name",
+            Kind::Ssid => "ssid",
+            Kind::Alias => "alias",
+            Kind::Service => "service",
+            Kind::Fingerprint => "fingerprint",
+            Kind::Qrid => "qrid",
+            Kind::Vendor => "vendor",
+            Kind::Uuid64 => "uuid64",
+            Kind::Text => "text",
+        }
+    }
+
+    /// How the leak check recognises an original of `len` bytes, if it looks at all.
+    fn rule(self, len: usize) -> Option<Rule> {
+        match self {
+            // Secrets are looked for even when short; long ones anywhere at all.
+            Kind::Secret | Kind::SshKey if len < 3 => None,
+            Kind::Secret | Kind::SshKey if len >= 8 => Some(Rule::Anywhere),
+            Kind::Secret | Kind::SshKey => Some(Rule::Alnum),
+            Kind::Ipv4 => Some(Rule::Ipv4),
+            Kind::Ipv6 => Some(Rule::Ipv6),
+            Kind::Domain => Some(Rule::Word),
+            // Names and SSIDs under 4 characters ("tv", "Mac") collide with ordinary
+            // words such as the JSON key "mac"; they identify nothing.
+            _ if len < 4 => None,
+            _ => Some(Rule::Word),
+        }
+    }
+}
+
+/// Where an original found in the output counts as a leak.
+#[derive(Clone, Copy, Debug)]
+enum Rule {
+    Anywhere,
+    /// A whole word: names inside longer identifiers (a hostname inside an mDNS
+    /// service code, `google_chromecast`) are not leaks.
+    Word,
+    /// Not next to a letter or digit (a short secret inside an ordinary word is not one).
+    Alnum,
+    /// A whole word that is not part of a longer dotted number (an OID, a version).
+    Ipv4,
+    /// A whole word that is not part of a longer colon-separated one.
+    Ipv6,
+}
+
+impl Rule {
+    fn leaks(self, text: &[u8], a: usize, b: usize) -> bool {
+        let word = |c: u8| c.is_ascii_alphanumeric() || c == b'_';
+        match self {
+            Rule::Anywhere => true,
+            Rule::Word => stands_alone(text, a, b, word),
+            Rule::Alnum => stands_alone(text, a, b, |c| c.is_ascii_alphanumeric()),
+            Rule::Ipv4 => stands_alone(text, a, b, word) && !in_longer_dotted(text, a, b),
+            Rule::Ipv6 => stands_alone(text, a, b, |c| word(c) || c == b':'),
+        }
+    }
+}
+
+/// Whether `text[a..b]` has no word character (by `word`) right before or after it.
+fn stands_alone(text: &[u8], a: usize, b: usize, word: impl Fn(u8) -> bool) -> bool {
+    !text[..a].last().is_some_and(|&c| word(c)) && !text.get(b).is_some_and(|&c| word(c))
+}
+
+/// Fields (JSON keys, or the last word of a config key) whose values pass: settings,
+/// states, modes, versions, interface and model names. Identifiers inside them are
+/// still rewritten.
+const PASS: &[&str] = &[
+    // Inform and reply payloads.
+    "_type", "architecture", "assoc_status", "auth_algo", "auth_rssi", "auth_utc", "band", "board_rev", "bomrev", "bomrev_id",
+    "bootrom_version", "bridge_name", "bssid", "cfgversion", "cmd", "country_code", "cpu", "event_id", "event_type", "family", "fw_version",
+    "gateway_ip", "group_ip", "hash_id", "id", "include_blocks", "inform_ip", "inform_url", "interval", "ip", "ipv6", "ipv6_addresses",
+    "kernel_version", "keyid", "last_error_str", "loadavg_1", "loadavg_15", "loadavg_5", "mac", "md5", "mem", "message_type", "model",
+    "model_display", "netmask", "notif_reason", "op", "radio", "radio_name", "reason", "reboot_type", "required_version", "resolved",
+    "security", "serial", "server_time_in_utc", "state", "timestamp", "type", "uplink", "uptime", "uptime_str", "url", "usage", "vap",
+    "version",
+    // MongoDB extended JSON.
+    "$date", "$numberlong", "$oid", "subtype",
+    // Controller settings (an import snapshot).
+    "action", "advanced_filtering_preference", "analytics_disapproved_for", "ap_group_mode", "ap_scope_mode", "attr_hidden_id",
+    "attr_no_delete", "auth", "auto_channel_presets_type", "autobackup_cron_expr", "autobackup_timezone", "available_controller_channels",
+    "available_firmware_channels", "bc_filter_list", "broadcasting_aps", "channel", "channel_width", "channels_6e", "channels_na",
+    "channels_ng", "code", "countries", "cron_expr", "data_retention_setting_preference", "default_security_posture", "device_auth",
+    "device_macs", "dhcpd_ip_1", "dhcpd_ip_2", "dhcpd_ip_3", "dhcpd_start", "dhcpd_stop", "dhcpd_unifi_controller", "dhcpd_wins_1",
+    "dhcpd_wins_2", "dhcpdv6_start", "dhcpdv6_stop", "dns_assistance_mode", "dns_assistance_servers", "dot1x_fallback_networkconf_id",
+    "dtim_mode", "enabled_for", "failover_querier", "fastleave_for_network_ids", "firmware_channel", "gateway_type", "ht", "ht_modes_na",
+    "ht_modes_ng", "ikev2_reauthentication_method", "ip_subnet", "ips_mode", "ipv6_client_address_assignment", "ipv6_interface_type",
+    "ipv6_pd_interface", "ipv6_pd_start", "ipv6_pd_stop", "ipv6_ra_priority", "ipv6_setting_preference", "key", "layout_preference",
+    "led_override", "live_chat", "live_updates", "mac_filter_list", "mac_filter_policy", "mdns_proxy_mode", "mgmt_network_id",
+    "minrate_setting_preference", "mode", "mss_clamp", "multicast_suppressor_mode", "netconsole_port", "network_ids", "networkconf_id",
+    "networkgroup", "optimize", "pmf_cipher", "pmf_mode", "port", "portal_customized_bg_color", "portal_customized_bg_type",
+    "portal_customized_box_color", "portal_customized_box_text_color", "portal_customized_button_color",
+    "portal_customized_button_text_color", "portal_customized_languages", "portal_customized_link_color",
+    "portal_customized_logo_position", "portal_customized_text_color", "primary_dns_server", "primary_querier", "purpose", "querier_mode",
+    "querier_subscription_mode", "radios", "radius_macacl_format", "radiusprofile_id", "raw_color_hex", "restricted_subnet_1",
+    "restricted_subnet_2", "restricted_subnet_3", "secondary_dns_server", "server_names", "services_mode", "setting_preference", "site_id", "source",
+    "stp_version", "subscription_mode", "template_engine", "timeout_setting_preference", "timezone", "traffic_direction",
+    "tx_power_mode", "uplink_type", "usergroup_id", "wlan_band", "wlan_bands", "wlangroup_id_na", "wlangroup_id_ng", "wpa_enc",
+    "wpa_mode",
+    // The last word of system_cfg and mgmt_cfg keys.
+    "11k", "acktimeout", "acsdfs", "active", "addmtikie", "advertise_ap_name", "always_send_crash_logs", "anonymous_controller_id",
+    "anonymous_site_id", "antenna", "anti_clogging", "ap_mode", "auth_cache", "authmode", "auto", "autowds", "b", "beacon_rate",
+    "bga_filter", "bits", "blklst", "brightness", "bss_transition", "bypass_types", "capability", "cfgcap_info", "cipher", "clksel",
+    "color", "country_beacon", "countrycode", "devname", "driver", "dtim_period", "dynamic_vlan", "eapol_version", "element_adopt",
+    "ema_samples", "enable", "enabled", "encrypt", "enhance", "enhanced_192", "fd", "forbiasauto", "g", "gain", "green_ap",
+    "group_rekey", "has_groups", "hide_ssid", "idp", "ieee_mode", "ifname", "inspect", "iot", "is_guest", "jumboframes", "l2_isolation",
+    "led_enabled", "level", "log_level", "max_sens", "maxsta", "mcast", "mcastrate", "mcip", "mcs", "mgmt", "mgmt_rate", "mgmt_url",
+    "minrate_below_disable", "minrate_data", "minrssi_backoff", "nameserver", "no2ghz_oui", "none", "opmode", "outdoor", "p2p",
+    "p2p_cross_connect", "pairwise", "parent", "persistent", "phyname", "policy", "promisc", "proxy_arp", "pureg", "puren", "qbssload",
+    "r", "report_crash", "reporterid", "resetbtn", "rfscan", "route", "rssi", "schedule", "schedule_enabled", "schedule_invert",
+    "selfrun_guest_mode", "servers", "shell", "shift", "siteid", "size", "status", "stun_url", "support", "suppressor", "sync",
+    "tdls_prohibit", "threshold", "timeout", "transition", "txpower", "txpower_mode", "uapsd", "up", "use_aes_gcm", "verbose", "vlan",
+    "vport", "vwire", "wds", "wmm", "wpa",
+];
+
+/// Fields that pass only in one place: a JSON key inside the object or array under
+/// another key (`radio_table.name`), or a whole config key with its numbers as `n`.
+const PASS_AT: &[&str] = &[
+    "antenna_table.name", "athstats.name", "bridge_port.device_name", "ethernet_table.name", "if_table.name", "radio_table.name",
+    "sites.name", "vap_table.name", "widgets.name", "wireless.device_name", "mark.n.location", "mark.n.name",
+];
+
+/// Fields known to hold text people wrote: always replaced, without being listed as
+/// unknown at the end of a run.
+const TEXT: &[&str] = &[
+    "comment", "contact", "desc", "location", "name", "note", "snmp_contact", "snmp_location",
+    // Domains and hosts the network uses (NTP servers can be the ISP's).
+    "domain", "domain_name", "ntp_server_1", "ntp_server_2", "ntp_server_3", "ntp_server_4", "server",
+    // The guest portal's texts.
+    "portal_customized_authentication_text", "portal_customized_button_text", "portal_customized_success_text", "portal_customized_title",
+    "portal_customized_welcome_text",
+];
+
+const KEEP_MACS: [&str; 2] = ["ff:ff:ff:ff:ff:ff", "00:00:00:00:00:00"];
+
+/// The fakes handed out so far: original -> fake, per kind, and how many distinct
+/// originals each kind has (a map also holds other spellings of some).
+#[derive(Default)]
+struct Fakes {
+    maps: BTreeMap<Kind, BTreeMap<String, String>>,
+    counts: BTreeMap<Kind, usize>,
+}
+
+impl Fakes {
+    /// The fake for `original`, made by `make` from its number (from 1) on first sight.
+    fn get(&mut self, kind: Kind, original: &str, make: impl FnOnce(usize) -> String) -> String {
+        let map = self.maps.entry(kind).or_default();
+        if let Some(f) = map.get(original) {
+            return f.clone();
+        }
+        let n = self.counts.entry(kind).or_default();
+        *n += 1;
+        let f = make(*n);
+        map.insert(original.to_string(), f.clone());
+        f
+    }
+
+    /// Records another spelling of an original that already has `fake`, so the leak
+    /// check looks for it too.
+    fn also(&mut self, kind: Kind, spelling: &str, fake: &str) {
+        self.maps.entry(kind).or_default().entry(spelling.to_string()).or_insert_with(|| fake.to_string());
+    }
+
+    fn len(&self, kind: Kind) -> usize {
+        self.counts.get(&kind).copied().unwrap_or(0)
+    }
+
+    fn mac(&mut self, mac: &str) -> String {
+        let lower = mac.to_ascii_lowercase();
+        if KEEP_MACS.contains(&lower.as_str()) {
+            return lower;
+        }
+        // Locally administered unicast range, numbered by first appearance.
+        self.get(Kind::Mac, &lower, |n| format!("02:00:00:00:{:02x}:{:02x}", n >> 8, n & 0xff))
+    }
+
+    /// A MAC written without colons (as in serial numbers), keeping its case.
+    fn bare_mac(&mut self, bare: &str) -> String {
+        let fake = self.mac(&colon_mac(bare)).replace(':', "");
+        if bare.chars().any(|c| c.is_ascii_uppercase()) { fake.to_ascii_uppercase() } else { fake }
+    }
+
+    fn knows_mac(&self, mac: &str) -> bool {
+        self.maps.get(&Kind::Mac).is_some_and(|m| m.contains_key(mac))
+    }
+}
 
 pub struct Sanitizer {
-    maps: Maps,
+    fakes: Fakes,
     mac: Regex,
     mac_bare: Regex,
-    mac_shape: Regex,
     uuid: Regex,
     hex: Regex,
     ipv6: Regex,
     ipv4: Regex,
-    /// Domain suffixes to replace (e.g. the controller's DNS name).
+    /// A whole value that is a number, a boolean or a bare identifier.
+    plain: Regex,
+    /// Domain suffixes to replace (e.g. the controller's DNS name), lowercased.
     domains: Vec<String>,
-    /// Known hostnames and SSIDs as (original, fake), longest first, and the sizes
-    /// of the two maps it was built from (the maps only grow).
-    known: Vec<(String, String)>,
+    /// Extra fields to pass (`--keep`), lowercased.
+    keep: HashSet<String>,
+    /// Known hostnames, SSIDs and the domains as one case-insensitive alternation,
+    /// longest first, with each one's fake by its lowercase spelling, and the sizes of
+    /// the two maps it was built from (the maps only grow).
+    known: Option<Regex>,
+    known_fakes: HashMap<String, String>,
     known_sizes: (usize, usize),
+    /// Values (lowercased) that passed whole in an allow-listed field: settings words
+    /// such as "default" or "auto". The same value elsewhere is kept too.
+    kept: HashSet<String>,
+    /// Fields not on the allow-list whose values were replaced as text.
+    unlisted: BTreeSet<String>,
+    /// The field each text original was first seen in, for the leak check's message.
+    text_fields: HashMap<String, String>,
 }
 
-const KEEP_MACS: [&str; 2] = ["ff:ff:ff:ff:ff:ff", "00:00:00:00:00:00"];
-
 impl Sanitizer {
-    pub fn new(domains: Vec<String>) -> Self {
+    pub fn new(domains: Vec<String>, keep: Vec<String>) -> Self {
+        let mut fakes = Fakes::default();
+        let domains: Vec<String> = domains.into_iter().filter(|d| !d.is_empty()).map(|d| d.to_ascii_lowercase()).collect();
+        for d in &domains {
+            fakes.get(Kind::Domain, d, |_| "example.net".into());
+        }
         Sanitizer {
-            maps: HashMap::new(),
+            fakes,
             mac: Regex::new(r"(?i)\b[0-9a-f]{2}(?::[0-9a-f]{2}){5}\b").unwrap(),
             mac_bare: Regex::new(r"(?i)\b[0-9a-f]{12}\b").unwrap(),
-            mac_shape: Regex::new(r"(?i)^[0-9a-f]{2}(?::[0-9a-f]{2}){5}$").unwrap(),
             uuid: Regex::new(r"(?i)\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b").unwrap(),
             hex: Regex::new(r"(?i)\b[0-9a-f]{16,}\b").unwrap(),
-            ipv6: Regex::new(r"(?i)\b(?:[0-9a-f]{1,4}:){2,7}[0-9a-f]{1,4}\b").unwrap(),
+            // Broad: anything with two colons between hex groups, with `::` and an
+            // embedded IPv4 address; what parses as an address is one.
+            ipv6: Regex::new(r"(?i)(?:[0-9a-f]{0,4}:){2,7}(?:(?:[0-9]{1,3}\.){3}[0-9]{1,3}|[0-9a-f]{0,4})").unwrap(),
             ipv4: Regex::new(r"\b(?:[0-9]{1,3}\.){3}[0-9]{1,3}\b").unwrap(),
+            plain: Regex::new(
+                r"(?i)^(?:-?[0-9]+(?:\.[0-9]+)*(?:/[0-9]{1,3})?|true|false|0x[0-9a-f]+|[0-9a-f]{2}(?::[0-9a-f]{2}){5}|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}|[0-9a-f]{16,})$",
+            )
+            .unwrap(),
             domains,
-            known: Vec::new(),
-            known_sizes: (0, 0),
+            keep: keep.into_iter().map(|k| k.to_ascii_lowercase()).collect(),
+            known: None,
+            known_fakes: HashMap::new(),
+            known_sizes: (usize::MAX, 0),
+            kept: HashSet::new(),
+            unlisted: BTreeSet::new(),
+            text_fields: HashMap::new(),
         }
-    }
-
-    fn fake(&mut self, kind: &'static str, original: &str, make: impl FnOnce(usize) -> String) -> String {
-        fake(&mut self.maps, kind, original, make)
-    }
-
-    fn fake_mac(&mut self, mac: &str) -> String {
-        fake_mac(&mut self.maps, mac)
     }
 
     /// Hostnames and SSIDs learned from their own fields can also appear inside
-    /// other values (e.g. `resolv.host.1.name`). Longest first, so a name that
-    /// contains another name is replaced whole. Rebuilt only when a map grew.
+    /// other values (e.g. `resolv.host.1.name`), in any case. Longest first, so a name
+    /// that contains another name is replaced whole. Rebuilt only when a map grew.
     fn refresh_known(&mut self) {
-        let size = |k: &str| self.maps.get(k).map_or(0, BTreeMap::len);
-        let sizes = (size("name"), size("ssid"));
+        let sizes = (self.fakes.len(Kind::Name), self.fakes.len(Kind::Ssid));
         if sizes == self.known_sizes {
             return;
         }
-        self.known = ["name", "ssid"]
-            .iter()
-            .filter_map(|k| self.maps.get(k))
-            .flat_map(|m| m.iter().filter(|(o, _)| o.len() >= 4).map(|(o, f)| (o.clone(), f.clone())))
-            .collect();
-        self.known.sort_by_key(|(o, _)| std::cmp::Reverse(o.len()));
         self.known_sizes = sizes;
+        let mut known: Vec<(&str, &str)> = [Kind::Name, Kind::Ssid]
+            .iter()
+            .filter_map(|k| self.fakes.maps.get(k))
+            .flat_map(|m| m.iter().filter(|(o, _)| o.len() >= 4).map(|(o, f)| (o.as_str(), f.as_str())))
+            .chain(self.domains.iter().map(|d| (d.as_str(), "example.net")))
+            .collect();
+        known.sort_by_key(|(o, _)| std::cmp::Reverse(o.len()));
+        self.known_fakes.clear();
+        for (o, f) in &known {
+            self.known_fakes.entry(o.to_lowercase()).or_insert_with(|| f.to_string());
+        }
+        let alternation: Vec<String> = known.iter().map(|(o, _)| regex::escape(o)).collect();
+        self.known = (!alternation.is_empty()).then(|| Regex::new(&format!("(?i){}", alternation.join("|"))).expect("escaped literals"));
     }
 
     /// Rewrites identifiers that can appear inside any string value.
     fn scrub(&mut self, s: &str) -> String {
-        let mut out = s.to_string();
         self.refresh_known();
-        for (original, fake) in &self.known {
-            if out.contains(original.as_str()) && out != *fake {
-                out = out.replace(original.as_str(), fake);
-            }
-        }
-        for d in &self.domains {
-            out = out.replace(d.as_str(), "example.net");
-        }
-        let maps = &mut self.maps;
-        out = replace_all(&self.uuid, &out, |m| fake(maps, "uuid", &m.to_ascii_lowercase(), |n| format!("00000000-0000-4000-8000-{n:012x}")));
-        out = replace_all(&self.mac, &out, |m| fake_mac(maps, m));
+        let mut out = match &self.known {
+            Some(re) => re.replace_all(s, |c: &regex::Captures| self.known_fakes.get(&c[0].to_lowercase()).cloned().unwrap_or_else(|| c[0].to_string())).into_owned(),
+            None => s.to_string(),
+        };
+        let fakes = &mut self.fakes;
+        out = replace_all(&self.uuid, &out, |m| fakes.get(Kind::Uuid, &m.to_ascii_lowercase(), |n| format!("00000000-0000-4000-8000-{n:012x}")));
+        out = replace_all(&self.mac, &out, |m| fakes.mac(m));
         // A bare 12-hex string is only treated as a MAC when we already know that MAC
         // (serial numbers on these APs are the MAC without colons).
-        out = replace_all(&self.mac_bare, &out, |m| {
-            if maps.get("mac").is_some_and(|mm| mm.contains_key(&colon_mac(m))) { fake_bare_mac(maps, m) } else { m.to_string() }
-        });
+        out = replace_all(&self.mac_bare, &out, |m| if fakes.knows_mac(&colon_mac(m)) { fakes.bare_mac(m) } else { m.to_string() });
         out = replace_all(&self.hex, &out, |m| {
             let len = m.len();
-            fake(maps, "hex", &m.to_ascii_lowercase(), |n| format!("{n:0len$x}"))
+            fakes.get(Kind::Hex, &m.to_ascii_lowercase(), |n| format!("{n:0len$x}"))
         });
-        let mac_shape = &self.mac_shape;
-        out = replace_all(&self.ipv6, &out, |m| {
-            // Keep MACs (already handled), link-local and the like; global
-            // addresses would reveal the ISP prefix.
-            if mac_shape.is_match(m) || m.to_ascii_lowercase().starts_with("fe80") || m.starts_with("::") {
-                m.to_string()
-            } else {
-                fake(maps, "ipv6", &m.to_ascii_lowercase(), |n| format!("2001:db8::{n:x}"))
-            }
-        });
+        out = scrub_ipv6(&self.ipv6, &out, fakes);
         // Public IPv4 addresses (the WAN address, the ISP's DNS servers) likewise;
         // private ones say nothing about where the network is.
         let mut ipv4 = String::with_capacity(out.len());
         let mut last = 0;
         for m in self.ipv4.find_iter(&out) {
             let (a, b) = (m.start(), m.end());
-            if is_public_ipv4(m.as_str()) && !in_longer_dotted(&out, a, b) {
+            if is_public_ipv4(m.as_str()) && !in_longer_dotted(out.as_bytes(), a, b) {
                 ipv4.push_str(&out[last..a]);
-                ipv4.push_str(&fake(maps, "ipv4", m.as_str(), fake_ipv4));
+                ipv4.push_str(&fakes.get(Kind::Ipv4, m.as_str(), fake_ipv4));
                 last = b;
             }
         }
@@ -133,42 +371,83 @@ impl Sanitizer {
         out
     }
 
-    /// Value for a named field: secrets, SSIDs and hostnames get category fakes.
-    fn field(&mut self, key: &str, value: &str) -> String {
+    /// Value for a field: `key` is a JSON key inside the object or array under
+    /// `parent`, or a dotted config key.
+    fn field(&mut self, parent: &str, key: &str, value: &str) -> String {
+        if value.is_empty() {
+            return String::new();
+        }
         let k = key.to_ascii_lowercase();
-        let last = k.rsplit('.').next().unwrap_or(&k);
+        // A config key's last word that is not a number, and the whole key with its
+        // numbers as `n`; a JSON key with its parent.
+        let (last, at) = if k.contains('.') {
+            let last = k.rsplit('.').find(|w| !w.bytes().all(|b| b.is_ascii_digit())).unwrap_or(&k).to_string();
+            let at = k.split('.').map(|w| if w.bytes().all(|b| b.is_ascii_digit()) { "n" } else { w }).collect::<Vec<_>>().join(".");
+            (last, at)
+        } else {
+            (k.clone(), if parent.is_empty() { k.clone() } else { format!("{}.{k}", parent.to_ascii_lowercase()) })
+        };
         // A bare `key` field names a settings document (`"key": "country"`); only
         // dotted config keys ending in `.key` hold secrets.
         let is_secret = cfgdiff::is_secret(&k) && k != "key";
-        if value.is_empty() {
-            value.to_string()
-        } else if is_secret
+        if is_secret
             // The device SSH account name (stored as x_ssh_username in the controller).
             || (k.starts_with("users.") && last == "name")
             || (k.starts_with("cron.") && last == "user")
         {
-            self.fake("secret", value, |n| format!("secret-{n}"))
-        } else if matches!(last, "serial" | "serialno" | "serial_no") && self.mac_bare.is_match(value) && value.len() == 12 {
+            self.fakes.get(Kind::Secret, value, |n| format!("secret-{n}"))
+        } else if at == "sshd.auth.key.n.value" || at == "x_ssh_keys.key" {
+            // The administrator's SSH public keys.
+            self.fakes.get(Kind::SshKey, value, |n| format!("ssh-ed25519 AAAAfake{n}"))
+        } else if matches!(last.as_str(), "serial" | "serialno" | "serial_no") && self.mac_bare.is_match(value) && value.len() == 12 {
             // Serial numbers are the device's MAC without colons, including those
             // of neighbouring APs in scan results: their real BSSIDs follow from them.
-            fake_bare_mac(&mut self.maps, value)
+            self.fakes.bare_mac(value)
         } else if last == "fingerprint" {
             // SSH host key fingerprints identify the device.
-            self.fake("fingerprint", value, |n| format!("SHA256:fingerprint-{n}"))
+            self.fakes.get(Kind::Fingerprint, value, |n| format!("SHA256:fingerprint-{n}"))
         } else if last == "qrid" {
-            self.fake("qrid", value, |n| format!("qrid-{n}"))
+            self.fakes.get(Kind::Qrid, value, |n| format!("qrid-{n}"))
         } else if last == "oui" {
             // Manufacturer names of clients profile the household.
-            self.fake("vendor", value, |n| format!("vendor-{n}"))
+            self.fakes.get(Kind::Vendor, value, |n| format!("vendor-{n}"))
         } else if last == "base64" {
             // Binary UUIDs (`external_id`) as MongoDB exports them.
-            self.fake("uuid64", value, |n| format!("{n:0>22}=="))
-        } else if last == "ssid" || last == "essid" {
-            self.fake("ssid", value, |n| format!("ssid-{n}"))
-        } else if last == "hostname" {
-            self.fake("name", value, |n| format!("name-{n}"))
-        } else {
+            self.fakes.get(Kind::Uuid64, value, |n| format!("{n:0>22}=="))
+        } else if matches!(last.as_str(), "ssid" | "essid") || at == "wlanconf.name" {
+            self.fakes.get(Kind::Ssid, value, |n| format!("ssid-{n}"))
+        } else if matches!(last.as_str(), "hostname" | "ap_name") || at == "devices.name" || at == "resolv.host.n.name" {
+            // Hostnames, and the names of APs (which they also go by).
+            self.fakes.get(Kind::Name, value, |n| format!("name-{n}"))
+        } else if at == "mdns_sd.filter.n.service.n.name" {
+            self.service(value)
+        } else if PASS.contains(&last.as_str()) || PASS_AT.contains(&at.as_str()) || self.keep.contains(&last) || self.keep.contains(&at) {
+            self.kept.insert(value.to_lowercase());
             self.scrub(value)
+        } else if !TEXT.contains(&last.as_str()) && (self.is_plain(value) || self.kept.contains(&value.to_lowercase())) {
+            self.scrub(value)
+        } else {
+            if !TEXT.contains(&last.as_str()) {
+                self.unlisted.insert(at.clone());
+            }
+            self.text_fields.entry(value.to_string()).or_insert(at);
+            self.fakes.get(Kind::Text, value, |n| format!("text-{n}"))
+        }
+    }
+
+    /// A number, a boolean, or one identifier (MAC, UUID, long hex, IP address) that
+    /// [`Self::scrub`] rewrites: harmless from any field.
+    fn is_plain(&self, value: &str) -> bool {
+        self.plain.is_match(value) || value.parse::<Ipv6Addr>().is_ok()
+    }
+
+    /// An mDNS service name a client announced or a filter names: device IDs hide in
+    /// them (`_FC9F5ED42C8A._tcp.local`); plain service types are kept.
+    fn service(&mut self, name: &str) -> String {
+        if is_service_type(name) {
+            name.to_string()
+        } else {
+            self.fakes.get(Kind::Service, name, |n| format!("_service-{n}._tcp.local"))
         }
     }
 
@@ -176,7 +455,7 @@ impl Sanitizer {
     fn cfg(&mut self, blob: &str) -> String {
         blob.lines()
             .map(|l| match l.split_once('=') {
-                Some((k, v)) => format!("{k}={}", self.field(k, v)),
+                Some((k, v)) => format!("{k}={}", self.field("", k, v)),
                 None => self.scrub(l),
             })
             .collect::<Vec<_>>()
@@ -195,14 +474,10 @@ impl Sanitizer {
             Value::String(s) if key.ends_with("_cfg") => Value::String(self.cfg(s)),
             // Names people gave their devices in the other controller.
             Value::String(s) if key == "name" && (parent == "clients" || parent == "user") && !s.is_empty() => {
-                Value::String(self.fake("alias", s, |n| format!("alias-{n}")))
+                Value::String(self.fakes.get(Kind::Alias, s, |n| format!("alias-{n}")))
             }
-            // mDNS services a client announced: device IDs hide in their names
-            // (`_FC9F5ED42C8A._tcp.local`); plain service types are kept.
-            Value::String(s) if key == "name" && parent == "services" && !is_service_type(s) => {
-                Value::String(self.fake("service", s, |n| format!("_service-{n}._tcp.local")))
-            }
-            Value::String(s) => Value::String(self.field(key, s)),
+            Value::String(s) if key == "name" && parent == "services" => Value::String(self.service(s)),
+            Value::String(s) => Value::String(self.field(parent, key, s)),
             other => other.clone(),
         }
     }
@@ -221,63 +496,67 @@ impl Sanitizer {
     /// The replaced values to look for, prepared once for checking many texts.
     pub fn leak_check(&self) -> LeakCheck {
         let mut originals = Vec::new();
-        for (kind, map) in &self.maps {
+        let mut leaks = Vec::new();
+        for (&kind, map) in &self.fakes.maps {
             for original in map.keys() {
-                // Names and SSIDs under 4 characters ("tv", "Mac") collide with
-                // ordinary words such as the JSON key "mac"; they identify nothing.
-                if *kind != "secret" && original.chars().count() < 4 {
+                let Some(rule) = kind.rule(original.len()) else { continue };
+                // A value first replaced as text that a later field kept is a setting word.
+                if kind == Kind::Text && self.kept.contains(&original.to_lowercase()) {
                     continue;
                 }
-                let original = original.to_ascii_lowercase();
+                let field = (kind == Kind::Text).then(|| self.text_fields.get(original).cloned()).flatten();
+                originals.push(original.clone());
+                leaks.push(Leak { kind, rule, len: original.len(), field: field.clone() });
                 // MACs also appear without colons (serial numbers, file names).
-                let bare = (*kind == "mac").then(|| original.replace(':', ""));
-                originals.push((*kind, original, bare));
+                if kind == Kind::Mac {
+                    originals.push(original.replace(':', ""));
+                    leaks.push(Leak { kind, rule: Rule::Anywhere, len: original.len(), field });
+                }
             }
         }
-        LeakCheck { originals }
+        let finder = AhoCorasick::builder().ascii_case_insensitive(true).build(&originals).expect("literal patterns");
+        LeakCheck { finder, leaks }
+    }
+
+    /// The fields not on the allow-list whose values were replaced as text.
+    pub fn unlisted(&self) -> impl Iterator<Item = &str> {
+        self.unlisted.iter().map(String::as_str)
     }
 }
 
-/// The original values a sanitiser replaced, lowercased.
+/// One original the leak check looks for.
+struct Leak {
+    kind: Kind,
+    rule: Rule,
+    len: usize,
+    /// The field a text value came from.
+    field: Option<String>,
+}
+
+/// The original values a sanitiser replaced, found in one pass over a text.
 pub struct LeakCheck {
-    originals: Vec<(&'static str, String, Option<String>)>,
+    finder: AhoCorasick,
+    leaks: Vec<Leak>,
 }
 
 impl LeakCheck {
     /// Fails if any of the originals still appears in `text`.
     pub fn check(&self, text: &str, what: &str) -> Result<()> {
-        let lower = text.to_ascii_lowercase();
-        for (kind, original, bare) in &self.originals {
-            let found = match *kind {
-                "secret" => contains_value(&lower, original),
-                "ipv4" => contains_ipv4(&lower, original),
-                _ => contains_word(&lower, original),
-            };
-            if found || bare.as_ref().is_some_and(|b| lower.contains(b.as_str())) {
-                bail!("{what}: a {kind} value ({} chars) survived sanitising", original.len());
+        let bytes = text.as_bytes();
+        for m in self.finder.find_overlapping_iter(text) {
+            let leak = &self.leaks[m.pattern().as_usize()];
+            if leak.rule.leaks(bytes, m.start(), m.end()) {
+                match &leak.field {
+                    Some(f) => bail!(
+                        "{what}: a text value of field {f} ({} chars) survived sanitising (if {f} holds nothing personal, pass --keep {f})",
+                        leak.len
+                    ),
+                    None => bail!("{what}: a {} value ({} chars) survived sanitising", leak.kind.label(), leak.len),
+                }
             }
         }
         Ok(())
     }
-}
-
-fn fake(maps: &mut Maps, kind: &'static str, original: &str, make: impl FnOnce(usize) -> String) -> String {
-    let map = maps.entry(kind).or_default();
-    if let Some(f) = map.get(original) {
-        return f.clone();
-    }
-    let f = make(map.len() + 1);
-    map.insert(original.to_string(), f.clone());
-    f
-}
-
-fn fake_mac(maps: &mut Maps, mac: &str) -> String {
-    let lower = mac.to_ascii_lowercase();
-    if KEEP_MACS.contains(&lower.as_str()) {
-        return lower;
-    }
-    // Locally administered unicast range, numbered by first appearance.
-    fake(maps, "mac", &lower, |n| format!("02:00:00:00:{:02x}:{:02x}", n >> 8, n & 0xff))
 }
 
 /// `aabbccddeeff` (any case) as `aa:bb:cc:dd:ee:ff`.
@@ -285,10 +564,45 @@ fn colon_mac(bare: &str) -> String {
     bare.to_ascii_lowercase().as_bytes().chunks(2).map(|c| std::str::from_utf8(c).unwrap()).collect::<Vec<_>>().join(":")
 }
 
-/// A MAC written without colons (as in serial numbers), keeping its case.
-fn fake_bare_mac(maps: &mut Maps, bare: &str) -> String {
-    let fake = fake_mac(maps, &colon_mac(bare)).replace(':', "");
-    if bare.chars().any(|c| c.is_ascii_uppercase()) { fake.to_ascii_uppercase() } else { fake }
+/// Replaces the IPv6 addresses in `s` that tell where a network is or which device it
+/// is. Kept are documentation addresses, those in `::/96` (loopback, unspecified, and
+/// suffixes such as a DHCPv6 range's `::2`) and multicast groups other than
+/// solicited-node ones (which end in an interface ID's last 24 bits). Link-local ones
+/// are replaced too: their EUI-64 interface ID is the MAC. Times (`12:34:56`) and MACs
+/// match `re` but do not parse as addresses.
+fn scrub_ipv6(re: &Regex, s: &str, fakes: &mut Fakes) -> String {
+    let bytes = s.as_bytes();
+    let mut out = String::with_capacity(s.len());
+    let mut last = 0;
+    for m in re.find_iter(s) {
+        let (a, mut b) = (m.start(), m.end());
+        let mut ip = m.as_str().parse::<Ipv6Addr>();
+        // A colon right after an address (`fe80::1: up`) is not part of it.
+        let trimmed = ip.is_err() && m.as_str().ends_with(':') && !m.as_str().ends_with("::");
+        if trimmed {
+            b -= 1;
+            ip = s[a..b].parse();
+        }
+        let Ok(ip) = ip else { continue };
+        let word = |c: u8| c.is_ascii_alphanumeric() || c == b'_';
+        let alone = !bytes[..a].last().is_some_and(|&c| word(c) || c == b':') && !bytes.get(b).is_some_and(|&c| word(c) || (c == b':' && !trimmed));
+        let [s0, s1, ..] = ip.segments();
+        let seg = ip.segments();
+        let documentation = (s0 == 0x2001 && s1 == 0x0db8) || s0 & 0xfff0 == 0x3ff0;
+        let suffix = seg[..6] == [0; 6];
+        let solicited_node = seg[..6] == [0xff02, 0, 0, 0, 0, 1] && seg[6] & 0xff00 == 0xff00;
+        if !alone || documentation || suffix || (ip.is_multicast() && !solicited_node) {
+            continue;
+        }
+        let link_local = ip.is_unicast_link_local();
+        let fake = fakes.get(Kind::Ipv6, &ip.to_string(), |n| if link_local { format!("fe80::db8:{n:x}") } else { format!("2001:db8::{n:x}") });
+        fakes.also(Kind::Ipv6, &s[a..b].to_ascii_lowercase(), &fake);
+        out.push_str(&s[last..a]);
+        out.push_str(&fake);
+        last = b;
+    }
+    out.push_str(&s[last..]);
+    out
 }
 
 /// A plain mDNS service type such as `_googlecast._tcp.local`, with no device ID in it.
@@ -334,42 +648,9 @@ fn fake_ipv4(n: usize) -> String {
 
 /// Whether the address-shaped `text[a..b]` is part of a longer dotted number (an SNMP
 /// OID, a version such as 1.2.3.4.5), which is not an address.
-fn in_longer_dotted(text: &str, a: usize, b: usize) -> bool {
-    let (before, after) = (&text.as_bytes()[..a], &text.as_bytes()[b..]);
+fn in_longer_dotted(text: &[u8], a: usize, b: usize) -> bool {
+    let (before, after) = (&text[..a], &text[b..]);
     matches!(before, [.., d, b'.'] if d.is_ascii_digit()) || matches!(after, [b'.', d, ..] if d.is_ascii_digit())
-}
-
-/// [`contains_word`] for an IPv4 address, which, like the sanitiser, does not count one
-/// inside a longer dotted number.
-fn contains_ipv4(text: &str, ip: &str) -> bool {
-    let is_word = |c: Option<char>| c.is_some_and(|c| c.is_ascii_alphanumeric() || c == '_');
-    text.match_indices(ip).any(|(i, _)| {
-        let end = i + ip.len();
-        !is_word(text[..i].chars().next_back()) && !is_word(text[end..].chars().next()) && !in_longer_dotted(text, i, end)
-    })
-}
-
-/// Whole-word match: names inside longer identifiers (a hostname inside an
-/// mDNS service code) are not leaks.
-fn contains_word(text: &str, value: &str) -> bool {
-    // `_` joins identifier parts (`google_chromecast` is one word).
-    let is_word = |c: Option<char>| c.is_some_and(|c| c.is_ascii_alphanumeric() || c == '_');
-    text.match_indices(value).any(|(i, _)| !is_word(text[..i].chars().next_back()) && !is_word(text[i + value.len()..].chars().next()))
-}
-
-/// Substring match for long values; short values (e.g. an SSID called "test")
-/// must stand alone, so they don't match inside ordinary words.
-fn contains_value(text: &str, value: &str) -> bool {
-    if value.len() < 3 {
-        return false;
-    }
-    if value.len() >= 8 {
-        return text.contains(value);
-    }
-    let is_word = |c: Option<char>| c.is_some_and(|c| c.is_ascii_alphanumeric());
-    text.match_indices(value).any(|(i, _)| {
-        !is_word(text[..i].chars().next_back()) && !is_word(text[i + value.len()..].chars().next())
-    })
 }
 
 fn replace_all(re: &Regex, s: &str, mut f: impl FnMut(&str) -> String) -> String {
@@ -384,12 +665,13 @@ fn replace_all(re: &Regex, s: &str, mut f: impl FnMut(&str) -> String) -> String
     out
 }
 
-/// Sanitises the named JSON files from `input` into `output`.
-pub fn run(input: &Path, output: &Path, files: &[String], domains: Vec<String>, seed_macs: &[String]) -> Result<()> {
-    let mut s = Sanitizer::new(domains);
+/// Sanitises the named JSON files from `input` into `output`. `keep` names more fields
+/// to pass (as `field`, `parent.field` or a config key with its numbers as `n`).
+pub fn run(input: &Path, output: &Path, files: &[String], domains: Vec<String>, seed_macs: &[String], keep: Vec<String>) -> Result<()> {
+    let mut s = Sanitizer::new(domains, keep);
     // Seed known device MACs first so they get the lowest, stable fake numbers.
     for m in seed_macs {
-        s.fake_mac(m);
+        s.fakes.mac(m);
     }
     std::fs::create_dir_all(output)?;
     let mut docs = Vec::new();
@@ -399,11 +681,12 @@ pub fn run(input: &Path, output: &Path, files: &[String], domains: Vec<String>, 
         let v: Value = serde_json::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
         docs.push((name, v));
     }
-    // First pass only learns the hostnames and SSIDs, so the second pass can
-    // also replace them where they show up inside unrelated values.
+    // First pass only learns the hostnames, SSIDs and kept setting words, so the
+    // second pass can also replace them where they show up inside unrelated values.
     for (_, v) in &docs {
         s.json(v);
     }
+    s.unlisted.clear();
     let mut written = Vec::new();
     for (name, v) in &docs {
         let clean = serde_json::to_string_pretty(&s.json(v))? + "\n";
@@ -421,8 +704,15 @@ pub fn run(input: &Path, output: &Path, files: &[String], domains: Vec<String>, 
     for (path, text) in written {
         std::fs::write(&path, text).with_context(|| format!("writing {}", path.display()))?;
     }
-    for (kind, map) in &s.maps {
-        eprintln!("replaced {} distinct {kind} values", map.len());
+    for (kind, n) in &s.fakes.counts {
+        eprintln!("replaced {n} distinct {} values", kind.label());
+    }
+    let unlisted: Vec<&str> = s.unlisted().collect();
+    if !unlisted.is_empty() {
+        eprintln!(
+            "replaced as text, not being on the allow-list: {} (pass --keep <field> for those that hold nothing personal)",
+            unlisted.join(", ")
+        );
     }
     Ok(())
 }
@@ -434,7 +724,7 @@ mod tests {
 
     #[test]
     fn replaces_identifiers_consistently_and_checks_for_leaks() {
-        let mut s = Sanitizer::new(vec!["home.example.org".into()]);
+        let mut s = Sanitizer::new(vec!["home.example.org".into()], Vec::new());
         let v = json!({
             "mac": "78:45:58:3c:52:bc",
             "serial": "7845583C52BC",
@@ -475,21 +765,120 @@ mod tests {
         assert_eq!(out["qrid"], "qrid-1");
         assert_eq!(out["clients"][0]["oui"], "vendor-1");
         assert_ne!(out["external_id"]["$binary"]["base64"], "qR9+x3ytPgeIyDW5NH4lkw==");
+        assert_eq!(out["external_id"]["$binary"]["subType"], "04");
         s.check_clean(&text, "test").unwrap();
         assert!(s.check_clean("contains hunter22", "leak").is_err());
         assert_eq!(s.file_name("t_7845583c52bc_x.json"), "t_020000000001_x.json");
         assert_eq!(s.json(&json!({ "key": "country" }))["key"], "country", "a settings document's name");
-        let v = s.json(&json!({ "clients": [{ "name": "Dad's phone" }], "wlanconf": [{ "name": "x" }] }));
+        let v = s.json(&json!({ "clients": [{ "name": "Dad's phone" }], "wlanconf": [{ "name": "My Home" }] }));
         assert_eq!(v["clients"][0]["name"], "alias-1");
-        assert!(contains_word("ssid=chromecast", "chromecast") && !contains_word("_googlecast._tcp", "googlecas"));
-        assert!(!contains_word("code: google_chromecast", "chromecast"));
+        assert_eq!(v["wlanconf"][0]["name"], "ssid-1", "a WLAN's name is its SSID");
         assert_eq!(s.scrub("host kitchen-tv.lan"), "host name-1.lan");
-        assert!(contains_value("ssid=test\n", "test") && !contains_value("testdata/x", "test"));
+    }
+
+    #[test]
+    fn the_leak_check_matches_whole_words_and_short_secrets_alone() {
+        let mut s = Sanitizer::new(Vec::new(), Vec::new());
+        s.json(&json!({ "hostname": "chromecast", "x_passphrase": "test", "wan_ip": "9.9.9.9", "system_cfg": "aaa.1.wpa.psk=longsecret1" }));
+        for clean in ["code: google_chromecast", "_googlecast._tcp", "testdata/x", "oid 1.9.9.9.9", "dns 9.9.9.99"] {
+            assert!(s.check_clean(clean, "clean").is_ok(), "{clean}");
+        }
+        for leak in ["ssid=Chromecast", "ssid=test\n", "dns 9.9.9.9", "xLONGSECRET1x"] {
+            assert!(s.check_clean(leak, "leak").is_err(), "{leak}");
+        }
+    }
+
+    #[test]
+    fn identifying_free_text_is_replaced() {
+        let mut s = Sanitizer::new(Vec::new(), Vec::new());
+        let v = json!({
+            "sites": [{ "name": "default", "desc": "Smith family" }],
+            "setting": [{ "key": "mgmt", "x_ssh_keys": [{ "name": "laptop", "key": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIabcdef", "comment": "sam@laptop.home", "type": "ssh-ed25519" }] }],
+            "devices": [{ "name": "Living Room", "snmp_location": "Hauptstrasse 5", "snmp_contact": "+49 30 1234567" }],
+            "clients": [{ "note": "Grandma's tablet", "noted": true }],
+            "wlanconf": [{ "name": "Smith WiFi", "security": "wpapsk" }],
+            "inform": { "hostname": "Living Room", "lldp_table": [{ "chassis_descr": "Office switch by the desk" }], "port_table": [{ "name": "Port 1" }] },
+            "system_cfg": "sshd.auth.key.1.status=enabled\nsshd.auth.key.1.value=ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIabcdef\nsshd.auth.key.1.type=ssh-ed25519\nsshd.auth.key.1.comment=sam@laptop.home\nsnmp.location=Hauptstrasse 5\nsnmp.contact=+49 30 1234567\nmark.1.name=guest\nmark.1.location=skb\nresolv.host.1.name=Living Room\nswitch.port.1.name=Port 1",
+        });
+        let out = s.json(&v);
+        assert_eq!(out["sites"][0]["name"], "default");
+        assert_eq!(out["sites"][0]["desc"], "text-1");
+        let key = &out["setting"][0]["x_ssh_keys"][0];
+        assert_eq!((key["key"].as_str(), key["comment"].as_str(), key["type"].as_str()), (Some("ssh-ed25519 AAAAfake1"), Some("text-3"), Some("ssh-ed25519")));
+        assert_eq!(out["devices"][0]["name"], "name-1");
+        assert_eq!(out["inform"]["hostname"], "name-1", "an AP's name and hostname are one");
+        assert_eq!(out["clients"][0]["note"], "text-6");
+        assert_eq!(out["wlanconf"][0]["name"], "ssid-1");
+        assert_eq!(out["wlanconf"][0]["security"], "wpapsk");
+        let cfg = out["system_cfg"].as_str().unwrap();
+        for line in ["sshd.auth.key.1.status=enabled", "sshd.auth.key.1.value=ssh-ed25519 AAAAfake1", "sshd.auth.key.1.type=ssh-ed25519",
+                     "sshd.auth.key.1.comment=text-3", "snmp.location=text-4", "snmp.contact=text-5", "mark.1.name=guest", "mark.1.location=skb",
+                     "resolv.host.1.name=name-1"] {
+            assert!(cfg.lines().any(|l| l == line), "{line} in {cfg}");
+        }
+        let text = out.to_string();
+        for private in ["Smith", "AAAAC3Nz", "sam@laptop", "Hauptstrasse", "1234567", "Grandma", "Office switch", "Living Room"] {
+            assert!(!text.contains(private), "{private} in {text}");
+        }
+        s.check_clean(&text, "test").unwrap();
+        assert_eq!(s.unlisted().collect::<Vec<_>>(), ["lldp_table.chassis_descr"], "unknown fields are listed; known text fields are not");
+        assert!(s.check_clean("desc: smith FAMILY", "leak").is_err(), "text is looked for in any case");
+    }
+
+    #[test]
+    fn fields_off_the_allow_list_pass_only_plain_values_or_when_kept() {
+        let mut s = Sanitizer::new(Vec::new(), vec!["custom_mode".into()]);
+        let v = json!({
+            "new_counter": "12345", "new_flag": "true", "new_mac": "78:45:58:3c:52:bc", "new_ip": "81.2.69.160",
+            "mode": "auto", "new_mode": "auto", "new_words": "something new", "custom_mode": "turbo boost",
+        });
+        let out = s.json(&v);
+        assert_eq!((&out["new_counter"], &out["new_flag"], &out["new_mac"], &out["new_ip"]), (&json!("12345"), &json!("true"), &json!("02:00:00:00:00:01"), &json!("192.0.2.1")));
+        assert_eq!(out["new_mode"], "auto", "a value an allow-listed field holds is a setting word");
+        assert_eq!(out["new_words"], "text-1");
+        assert_eq!(out["custom_mode"], "turbo boost", "--keep");
+        assert_eq!(s.unlisted().collect::<Vec<_>>(), ["new_words"]);
+        let err = s.check_clean("x: something new", "leak").unwrap_err().to_string();
+        assert!(err.contains("--keep new_words"), "{err}");
+    }
+
+    #[test]
+    fn names_ssids_and_domains_are_replaced_in_any_case() {
+        let mut s = Sanitizer::new(vec!["Home.Example.org".into()], Vec::new());
+        s.json(&json!({ "hostname": "kitchen-tv", "essid": "My Home" }));
+        assert_eq!(s.scrub("Kitchen-TV.home.example.ORG and my home"), "name-1.example.net and ssid-1");
+        let out = s.json(&json!({ "inform_url": "http://UNIFI.HOME.EXAMPLE.ORG:8080/inform" }));
+        assert_eq!(out["inform_url"], "http://UNIFI.example.net:8080/inform");
+        assert!(s.check_clean("url unifi.home.example.org", "leak").is_err(), "the domain is looked for");
+        s.check_clean(&out.to_string(), "test").unwrap();
+    }
+
+    #[test]
+    fn ipv6_addresses_are_parsed_and_only_harmless_ones_kept() {
+        let mut s = Sanitizer::new(Vec::new(), Vec::new());
+        let v = json!({
+            "ipv6_addresses": ["2a02:8071::1", "2a02:8071:abcd::1", "2A02:8071:0:0:0:0:0:1", "fe80::7a45:58ff:fe3c:52bc", "fe80:0000:0000:0000:7a45:58ff:fe3c:52bc",
+                               "::1", "::", "2001:db8::42", "::ffff:81.2.69.160", "::2", "ff02::1:2", "ff02::1:ff3c:52bc"],
+            "uptime": "12:34:56",
+            "mac": "aa:bb:cc:dd:ee:ff",
+            "last_error_str": "addr 2a02:8071::5: up, scope fe80::1%br0",
+        });
+        let out = s.json(&v);
+        let ips: Vec<&str> = out["ipv6_addresses"].as_array().unwrap().iter().map(|v| v.as_str().unwrap()).collect();
+        assert_eq!(ips, ["2001:db8::1", "2001:db8::2", "2001:db8::1", "fe80::db8:3", "fe80::db8:3", "::1", "::", "2001:db8::42", "2001:db8::4", "::2", "ff02::1:2", "2001:db8::5"]);
+        assert_eq!(out["uptime"], "12:34:56", "a time is not an address");
+        assert_eq!(out["mac"], "02:00:00:00:00:01");
+        assert_eq!(out["last_error_str"], "addr 2001:db8::6: up, scope fe80::db8:7%br0");
+        s.check_clean(&out.to_string(), "test").unwrap();
+        for leak in ["via 2a02:8071::1 ok", "FE80::7A45:58FF:FE3C:52BC", "[2a02:8071:abcd::1]:443"] {
+            assert!(s.check_clean(leak, "leak").is_err(), "{leak}");
+        }
+        assert!(s.check_clean("2a02:8071::1:5", "longer").is_ok());
     }
 
     #[test]
     fn public_ipv4_addresses_become_documentation_addresses() {
-        let mut s = Sanitizer::new(Vec::new());
+        let mut s = Sanitizer::new(Vec::new(), vec!["kept".into()]);
         let v = json!({
             "wan_ip": "81.2.69.160",
             "dns": ["81.2.69.160", "9.9.9.9", "192.168.1.1", "10.0.0.2", "172.16.4.4", "127.0.0.1", "169.254.1.1"],

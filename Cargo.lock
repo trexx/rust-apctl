@@ -1576,6 +1576,7 @@ dependencies = [
 name = "informdump"
 version = "0.1.0"
 dependencies = [
+ "aho-corasick",
  "anyhow",
  "apcfg",
  "clap",
