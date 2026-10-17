@@ -132,7 +132,7 @@ function ClientPage({ mac }: { mac: string }) {
                 }
                 sub={
                   c.connected
-                    ? `${s.essid} · ${band(s.radio)} ch ${s.channel}`
+                    ? `${s.essid ?? "—"} · ${band(s.radio)}${s.channel ? ` ch ${s.channel}` : ""}`
                     : `last seen ${ago(c.last_seen, now)}`
                 }
               />
