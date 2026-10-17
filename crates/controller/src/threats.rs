@@ -31,7 +31,7 @@ use serde_json::{Value, json};
 use crate::api::{ApiError, AppState, Json};
 use crate::clock;
 use crate::engine::{Input, SharedLive};
-use crate::model::{Ts, named_enum};
+use crate::model::{Ts, hardware_num, named_enum, same_hardware};
 use crate::store::{Db, Store, Writer};
 use inform::Mac;
 
@@ -165,17 +165,9 @@ fn near_in(list: &[Client], n: u64) -> impl Iterator<Item = &Client> {
     list[from..].iter().take_while(move |c| c.num <= n + 8)
 }
 
-/// A MAC as a number with the locally-administered bit cleared, so the
-/// variants an AP or phone derives from one address sit next to each other.
+/// A written MAC as a [`hardware_num`].
 fn mac_num(s: &str) -> Option<u64> {
-    let m: Mac = s.parse().ok()?;
-    let mut b = m.0;
-    b[0] &= !0x02;
-    Some(b.iter().fold(0u64, |a, x| (a << 8) | u64::from(*x)))
-}
-
-fn near(a: u64, b: u64, within: u64) -> bool {
-    a.abs_diff(b) <= within
+    Some(hardware_num(&s.parse().ok()?))
 }
 
 /// Folds case, spacing and look-alike characters (digits, symbols and
@@ -288,7 +280,7 @@ pub fn assess(a: &Assessment) -> Vec<Finding> {
     let own: HashMap<&str, &OwnBss> = a.own.iter().map(|b| (b.bssid.as_str(), b)).collect();
     // Addresses our APs and their radios use: anything this close is our hardware.
     let family: Vec<u64> = a.own.iter().map(|b| b.bssid.as_str()).chain(a.aps.keys().map(String::as_str)).filter_map(mac_num).collect();
-    let is_family = |bssid: &str| mac_num(bssid).is_some_and(|n| family.iter().any(|f| near(n, *f, 16)));
+    let is_family = |bssid: &str| mac_num(bssid).is_some_and(|n| family.iter().any(|f| same_hardware(n, *f)));
     // The client next to an address: of several, the first by MAC, with its live name first.
     let client_near = |n: u64| {
         let mac = near_in(&a.clients, n).chain(near_in(&a.live_clients, n)).map(|c| c.mac.as_str()).min()?;

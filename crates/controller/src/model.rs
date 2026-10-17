@@ -13,6 +13,21 @@ use serde_json::Value;
 /// Seconds since the Unix epoch.
 pub type Ts = i64;
 
+/// A MAC as a number with the locally administered bit cleared, so the
+/// addresses a device derives from its own (an AP's BSSIDs, a phone's
+/// hotspot) sit next to it.
+pub fn hardware_num(mac: &Mac) -> u64 {
+    let mut b = mac.0;
+    b[0] &= !0x02;
+    b.iter().fold(0u64, |a, x| (a << 8) | u64::from(*x))
+}
+
+/// Whether two [`hardware_num`]s are likely one device's: within 16 of each
+/// other (an AP's BSSIDs are its MAC plus a little).
+pub fn same_hardware(a: u64, b: u64) -> bool {
+    a.abs_diff(b) <= 16
+}
+
 /// Declares a fieldless enum whose variants are stored and sent by name, with
 /// `as_str`, `parse`, `Display` and serialisation as that name (and, in tests,
 /// `ALL` variants in order).
@@ -582,6 +597,16 @@ pub(crate) mod tests {
             .find(|p| p.to_string_lossy().contains(name_part))
             .unwrap();
         serde_json::from_str(&std::fs::read_to_string(file).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn a_device_s_derived_addresses_are_the_same_hardware() {
+        let num = |s: &str| hardware_num(&s.parse().unwrap());
+        // The locally administered copy of a MAC is the same number.
+        assert_eq!(num("7a:45:58:3c:52:be"), num("78:45:58:3c:52:be"));
+        assert!(same_hardware(num("78:45:58:3c:52:be"), num("7a:45:58:3c:52:ce")), "16 apart");
+        assert!(!same_hardware(num("78:45:58:3c:52:be"), num("78:45:58:3c:52:cf")), "17 apart");
+        assert!(same_hardware(num("78:45:58:3c:52:ff"), num("78:45:58:3c:53:01")), "across a byte");
     }
 
     #[test]

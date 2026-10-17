@@ -1224,20 +1224,16 @@ impl Engine {
     /// Another AP's beacon flagged "isolated" (lost its uplink) that belongs to one
     /// of our APs: reported at most once an hour per AP.
     fn check_isolated(&mut self, ts: Ts, s: &Snapshot) {
-        let num = |m: &Mac| -> u64 {
-            let mut b = m.0;
-            b[0] &= !0x02;
-            b.iter().fold(0u64, |a, x| (a << 8) | u64::from(*x))
-        };
+        use crate::model::{hardware_num, same_hardware};
         let flagged: Vec<&crate::model::NeighborSample> = s.neighbors.iter().filter(|n| n.is_isolated).collect();
         if flagged.is_empty() {
             return;
         }
-        let ours: Vec<(Mac, u64)> = self.live.read().unwrap().devices.keys().map(|m| (*m, num(m))).collect();
+        let ours: Vec<(Mac, u64)> = self.live.read().unwrap().devices.keys().map(|m| (*m, hardware_num(m))).collect();
         for n in flagged {
-            let Ok(b) = n.bssid.parse::<Mac>().map(|m| num(&m)) else { continue };
-            // The nearest of our APs within 16 addresses: each AP's BSSIDs are its MAC plus a little.
-            let Some((ap, _)) = ours.iter().filter(|(_, x)| x.abs_diff(b) <= 16).min_by_key(|(_, x)| x.abs_diff(b)) else { continue };
+            let Ok(b) = n.bssid.parse::<Mac>().map(|m| hardware_num(&m)) else { continue };
+            // The nearest of our APs that is likely the same hardware.
+            let Some((ap, _)) = ours.iter().filter(|(_, x)| same_hardware(*x, b)).min_by_key(|(_, x)| x.abs_diff(b)) else { continue };
             if self.isolated.get(ap).is_some_and(|t| ts - t < 3600) {
                 continue;
             }
