@@ -21,14 +21,8 @@ export function ago(ts: number | null | undefined, now = Date.now() / 1000): str
   return `${duration(d)} ago`;
 }
 
-/** Date formatters for the browser's locale, falling back when the locale is invalid. */
-function formatter(options: Intl.DateTimeFormatOptions): Intl.DateTimeFormat {
-  try {
-    return new Intl.DateTimeFormat(undefined, options);
-  } catch {
-    return new Intl.DateTimeFormat("en-GB", options);
-  }
-}
+/** A date formatter for the browser's locale. */
+const formatter = (options: Intl.DateTimeFormatOptions) => new Intl.DateTimeFormat(undefined, options);
 const timeFmt = formatter({ hour: "2-digit", minute: "2-digit", second: "2-digit" });
 const dayFmt = formatter({ day: "numeric", month: "short" });
 const minuteFmt = formatter({ hour: "2-digit", minute: "2-digit" });
@@ -110,13 +104,7 @@ export function signalClass(dbm: number | null | undefined): "good" | "fair" | "
 /** "−75 dBm", with a real minus sign. */
 export const dbm = (v: number) => `${v < 0 ? "−" : ""}${Math.abs(v)} dBm`;
 
-const compactFmt = (() => {
-  try {
-    return new Intl.NumberFormat(undefined, { notation: "compact" });
-  } catch {
-    return new Intl.NumberFormat("en-GB", { notation: "compact" });
-  }
-})();
+const compactFmt = new Intl.NumberFormat(undefined, { notation: "compact" });
 
 /** A count for people: "950", "12K", "3.4M". */
 export const compact = (n: number | null | undefined) => (n === null || n === undefined ? "—" : compactFmt.format(n));
