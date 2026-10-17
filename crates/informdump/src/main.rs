@@ -139,7 +139,8 @@ struct Common {
     /// Print one JSON object per message (for scripting).
     #[arg(long)]
     json: bool,
-    /// Save every decoded payload as a JSON file in this directory (unredacted).
+    /// Save every decoded payload as a JSON file in this directory (unredacted). Files
+    /// already there are not overwritten.
     #[arg(long)]
     save: Option<PathBuf>,
     /// Print passwords, PSKs and keys instead of masking them.
@@ -174,25 +175,38 @@ pub fn random_iv() -> [u8; 16] {
     iv
 }
 
-/// Writes a file only its owner can read (mode 0600): it holds secrets. A file that
-/// was already there is made private too before anything is written to it (the mode
-/// given when opening only applies to a new file).
-pub fn write_private(path: &Path, data: &[u8]) -> Result<()> {
+/// Creates a file only its owner can read (mode 0600), as it holds secrets. It must not
+/// exist yet: in a shared directory, a file or symlink planted under its name would
+/// otherwise receive them.
+pub fn create_private(path: &Path, data: &[u8]) -> Result<()> {
     let mut opts = std::fs::OpenOptions::new();
-    opts.write(true).create(true).truncate(true);
+    opts.write(true).create_new(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
         opts.mode(0o600);
     }
     let mut f = opts.open(path).with_context(|| format!("creating {}", path.display()))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        f.set_permissions(std::fs::Permissions::from_mode(0o600)).with_context(|| format!("making {} private", path.display()))?;
-    }
     f.write_all(data)?;
     Ok(())
+}
+
+/// Writes a file only its owner can read (mode 0600), replacing one that was already
+/// there: the data goes into a new file next to it, which is then renamed over it. The
+/// rename replaces a symlink instead of following it, and the old file's mode does not
+/// carry over.
+#[cfg(any(feature = "mongo", test))]
+pub fn write_private(path: &Path, data: &[u8]) -> Result<()> {
+    let name = path.file_name().with_context(|| format!("{} is not a file name", path.display()))?;
+    let mut tmp_name = std::ffi::OsString::from(".");
+    tmp_name.push(name);
+    tmp_name.push(format!(".{}.tmp", std::process::id()));
+    let tmp = path.with_file_name(tmp_name);
+    let written = create_private(&tmp, data).and_then(|()| std::fs::rename(&tmp, path).with_context(|| format!("replacing {}", path.display())));
+    if written.is_err() {
+        std::fs::remove_file(&tmp).ok();
+    }
+    written
 }
 
 /// Creates a directory (and its parents) only its owner can enter (mode 0700). One
@@ -249,16 +263,41 @@ fn main() -> Result<()> {
 #[cfg(all(test, unix))]
 mod tests {
     use std::os::unix::fs::PermissionsExt;
+    use std::path::PathBuf;
+
+    fn temp_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("informdump-private-{}-{name}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
 
     #[test]
-    fn an_existing_file_is_made_private() {
-        let path = std::env::temp_dir().join(format!("informdump-private-{}", std::process::id()));
+    fn an_existing_file_is_replaced_by_a_private_one() {
+        let dir = temp_dir("replace");
+        let path = dir.join("snapshot.json");
         std::fs::write(&path, "old").unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
         super::write_private(&path, b"secret").unwrap();
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         let text = std::fs::read_to_string(&path).unwrap();
-        std::fs::remove_file(&path).ok();
-        assert_eq!((mode, text.as_str()), (0o600, "secret"));
+        let files = std::fs::read_dir(&dir).unwrap().count();
+        std::fs::remove_dir_all(&dir).ok();
+        assert_eq!((mode, text.as_str(), files), (0o600, "secret", 1));
+    }
+
+    #[test]
+    fn symlinks_are_not_followed() {
+        let dir = temp_dir("symlink");
+        let target = dir.join("theirs");
+        std::fs::write(&target, "theirs").unwrap();
+        let link = dir.join("link.json");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let created = super::create_private(&link, b"secret");
+        super::write_private(&link, b"secret").unwrap();
+        let theirs = std::fs::read_to_string(&target).unwrap();
+        let replaced = !std::fs::symlink_metadata(&link).unwrap().file_type().is_symlink();
+        std::fs::remove_dir_all(&dir).ok();
+        assert!(created.is_err(), "create_private refuses a name that is taken");
+        assert_eq!((theirs.as_str(), replaced), ("theirs", true), "write_private replaces the link, not its target");
     }
 }

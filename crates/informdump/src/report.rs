@@ -193,7 +193,9 @@ impl Reporter {
         let path = dir.join(save_name(ts, self.seq, mac, kind));
         // If it cannot be created, writing the file says why.
         self.save_dir_ready = self.save_dir_ready || crate::create_private_dir(dir).is_ok();
-        let result = crate::write_private(&path, pretty(payload).as_bytes()).with_context(|| format!("saving {}", path.display()));
+        // Always a new file: a name already taken (by an earlier run, or by someone else
+        // in a shared directory) is not written through.
+        let result = crate::create_private(&path, pretty(payload).as_bytes()).with_context(|| format!("saving {}", path.display()));
         if let Err(e) = result {
             eprintln!("warning: {e:#}");
         }
