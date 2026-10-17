@@ -1,5 +1,5 @@
 import { Suspense } from "react";
-import { Link } from "react-router-dom";
+import { Link } from "react-router";
 import { useWlans } from "../api";
 import type { Wlan } from "../api";
 import { band, bitrate, bytes, pct1 } from "../format";

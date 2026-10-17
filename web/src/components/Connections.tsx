@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { Link } from "react-router-dom";
+import { Link } from "react-router";
 import { useConnections } from "../api";
 import type { ConnAttempt, Roam, TimeSpan, Timings } from "../api";
 import { band, clock } from "../format";

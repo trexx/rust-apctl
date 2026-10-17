@@ -50,7 +50,7 @@ export default defineConfig({
           groups: [
             {
               name: "vendor",
-              test: /[\\/]node_modules[\\/](react|react-dom|scheduler|react-router|react-router-dom|@tanstack|cookie|set-cookie-parser|uplot)[\\/]/,
+              test: /[\\/]node_modules[\\/](react|react-dom|scheduler|react-router|@tanstack|cookie|set-cookie-parser|uplot)[\\/]/,
             },
           ],
         },

@@ -1,5 +1,5 @@
 import { memo, useDeferredValue, useState } from "react";
-import { Link } from "react-router-dom";
+import { Link } from "react-router";
 import { AttemptList } from "../components/Connections";
 import { RangePicker, SpanContext, useTimeSpan } from "../components/Chart";
 import { displayName, useClients } from "../api";

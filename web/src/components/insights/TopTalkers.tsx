@@ -1,4 +1,4 @@
-import { Link } from "react-router-dom";
+import { Link } from "react-router";
 import { useSiteTop } from "../../api";
 import { bytes } from "../../format";
 import { useTimeSpan } from "../Chart";

@@ -1,6 +1,6 @@
 import { memo, useEffect, useEffectEvent, useState } from "react";
 import type { ReactNode, RefObject } from "react";
-import { Link, useSearchParams } from "react-router-dom";
+import { Link, useSearchParams } from "react-router";
 import { useQueryClient } from "@tanstack/react-query";
 import type { QueryKey } from "@tanstack/react-query";
 import { eventData, useDevices } from "../api";

@@ -1,4 +1,4 @@
-import { Link } from "react-router-dom";
+import { Link } from "react-router";
 import { useDeviceNames, useDryRun } from "../api";
 import type { FieldComparison } from "../api";
 import { ErrorNote, Loading } from "../components/common";

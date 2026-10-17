@@ -1,6 +1,6 @@
 import { useState } from "react";
 import type { ReactNode } from "react";
-import { Link } from "react-router-dom";
+import { Link } from "react-router";
 import { eventData, useDeviceNames, useEvents } from "../api";
 import type { AppEvent } from "../api";
 import { DryRun } from "./DryRun";
