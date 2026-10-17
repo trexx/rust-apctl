@@ -74,54 +74,24 @@ pub struct LogLine {
     pub msg: String,
 }
 
-/// Declares `EventKind`: one variant per kind of event, stored and sent by its name.
-macro_rules! event_kinds {
-    ($($kind:ident = $name:literal),* $(,)?) => {
-        /// What an event is about. The names are stored with each event and read
-        /// by the UI, so a name never changes once used.
-        #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-        pub enum EventKind {
-            $($kind,)*
-        }
-
-        impl EventKind {
-            #[cfg(test)]
-            pub const ALL: &[EventKind] = &[$(EventKind::$kind,)*];
-
-            pub const fn as_str(self) -> &'static str {
-                match self {
-                    $(EventKind::$kind => $name,)*
-                }
-            }
-        }
-    };
-}
-
-event_kinds!(
-    ApSeen = "ap_seen", ApOnline = "ap_online", ApOffline = "ap_offline", ApRestarted = "ap_restarted", ApFirmwareChanged = "ap_firmware_changed",
-    ApIsolated = "ap_isolated", ApCrash = "ap_crash", ApProcessRestarted = "ap_process_restarted", ApScanDone = "ap_scan_done", ApEvent = "ap_event",
-    DfsRadar = "dfs_radar", RogueAp = "rogue_ap", NetworkThreat = "network_threat", RadioChanged = "radio_changed",
-    ConfigPushed = "config_pushed", ConfigApplied = "config_applied", DryrunCompared = "dryrun_compared",
-    ApUpgradeSent = "ap_upgrade_sent", ApUpgradeStarted = "ap_upgrade_started", ApUpgradeProgress = "ap_upgrade_progress", ApUpgradeFailed = "ap_upgrade_failed",
-    ApUpgraded = "ap_upgraded",
-    ApPending = "ap_pending", ApAdopting = "ap_adopting", ApAdopted = "ap_adopted", ApForgotten = "ap_forgotten", ApHostKeyMismatch = "ap_host_key_mismatch",
-    ApRestartRequested = "ap_restart_requested", ApProvisionRequested = "ap_provision_requested",
-    ClientConnected = "client_connected", ClientDisconnected = "client_disconnected", ClientConnectFailed = "client_connect_failed", ClientRoamed = "client_roamed",
-    ClientRenamed = "client_renamed", ClientKicked = "client_kicked", ClientSteered = "client_steered", ClientWrongPassword = "client_wrong_password",
-    ClientExperience = "client_experience", ClientReconnectRequested = "client_reconnect_requested", ClientBlocked = "client_blocked",
-    ClientUnblocked = "client_unblocked",
-    SettingsImported = "settings_imported", SettingsChanged = "settings_changed", ChannelPlan = "channel_plan",
-);
-
-impl Serialize for EventKind {
-    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
-        s.serialize_str(self.as_str())
-    }
-}
-
-impl std::fmt::Display for EventKind {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.as_str())
+crate::model::named_enum! {
+    /// What an event is about. The names are stored with each event and read
+    /// by the UI, so a name never changes once used.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+    pub enum EventKind {
+        ApSeen = "ap_seen", ApOnline = "ap_online", ApOffline = "ap_offline", ApRestarted = "ap_restarted", ApFirmwareChanged = "ap_firmware_changed",
+        ApIsolated = "ap_isolated", ApCrash = "ap_crash", ApProcessRestarted = "ap_process_restarted", ApScanDone = "ap_scan_done", ApEvent = "ap_event",
+        DfsRadar = "dfs_radar", RogueAp = "rogue_ap", NetworkThreat = "network_threat", RadioChanged = "radio_changed",
+        ConfigPushed = "config_pushed", ConfigApplied = "config_applied", DryrunCompared = "dryrun_compared",
+        ApUpgradeSent = "ap_upgrade_sent", ApUpgradeStarted = "ap_upgrade_started", ApUpgradeProgress = "ap_upgrade_progress", ApUpgradeFailed = "ap_upgrade_failed",
+        ApUpgraded = "ap_upgraded",
+        ApPending = "ap_pending", ApAdopting = "ap_adopting", ApAdopted = "ap_adopted", ApForgotten = "ap_forgotten", ApHostKeyMismatch = "ap_host_key_mismatch",
+        ApRestartRequested = "ap_restart_requested", ApProvisionRequested = "ap_provision_requested",
+        ClientConnected = "client_connected", ClientDisconnected = "client_disconnected", ClientConnectFailed = "client_connect_failed", ClientRoamed = "client_roamed",
+        ClientRenamed = "client_renamed", ClientKicked = "client_kicked", ClientSteered = "client_steered", ClientWrongPassword = "client_wrong_password",
+        ClientExperience = "client_experience", ClientReconnectRequested = "client_reconnect_requested", ClientBlocked = "client_blocked",
+        ClientUnblocked = "client_unblocked",
+        SettingsImported = "settings_imported", SettingsChanged = "settings_changed", ChannelPlan = "channel_plan",
     }
 }
 

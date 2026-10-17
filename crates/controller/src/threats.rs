@@ -28,11 +28,10 @@ use rusqlite::types::Value as Sql;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use crate::alerts::named_enum;
 use crate::api::{ApiError, AppState, Json};
 use crate::clock;
 use crate::engine::{Input, SharedLive};
-use crate::model::Ts;
+use crate::model::{Ts, named_enum};
 use crate::store::{Db, Store, Writer};
 use inform::Mac;
 
@@ -101,13 +100,10 @@ pub struct HeardBy {
     pub last_seen: Ts,
 }
 
-/// How serious a finding is; sorts most serious first.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Severity {
-    High,
-    Medium,
-    Low,
+named_enum! {
+    /// How serious a finding is; sorts most serious first.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+    pub enum Severity { High = "high", Medium = "medium", Low = "low" }
 }
 
 #[derive(Debug, Clone, Serialize)]

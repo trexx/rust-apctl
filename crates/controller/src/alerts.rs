@@ -26,7 +26,7 @@ use crate::api::{ApiError, AppState, Json, Query};
 use crate::clock;
 use crate::engine::{Event, EventKind, LiveMsg, SharedLive};
 use crate::insights::{RETRY_AT, RETRY_COLS, Spec, retry_pct, retry_totals};
-use crate::model::Ts;
+use crate::model::{Ts, named_enum};
 use crate::settings::band_name;
 use crate::store::{Db, Store, Writer};
 
@@ -40,40 +40,6 @@ const HEALTH_COOLDOWN: Ts = 6 * 3600;
 /// many checks in a row (a minute apart): it stopped reporting, or its AP went.
 const HEALTH_STALE_CHECKS: u32 = 15;
 
-/// Declares a fieldless enum whose variants are stored and sent by name, with
-/// `as_str`, `parse` and serialisation as that name.
-macro_rules! named_enum {
-    ($(#[$attr:meta])* $vis:vis enum $name:ident { $($variant:ident = $str:literal),* $(,)? }) => {
-        $(#[$attr])*
-        $vis enum $name {
-            $($variant,)*
-        }
-
-        impl $name {
-            /// As stored and as the API names it.
-            pub fn as_str(self) -> &'static str {
-                match self {
-                    $($name::$variant => $str,)*
-                }
-            }
-
-            pub fn parse(s: &str) -> Option<$name> {
-                match s {
-                    $($str => Some($name::$variant),)*
-                    _ => None,
-                }
-            }
-        }
-
-        impl serde::Serialize for $name {
-            fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
-                s.serialize_str(self.as_str())
-            }
-        }
-    };
-}
-pub(crate) use named_enum;
-
 named_enum! {
     /// What an alert is about.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -84,6 +50,17 @@ named_enum! {
     /// How urgent an alert is.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub enum Severity { High = "high", Medium = "medium", Low = "low", Info = "info" }
+}
+
+impl From<crate::threats::Severity> for Severity {
+    fn from(s: crate::threats::Severity) -> Severity {
+        use crate::threats::Severity as Threat;
+        match s {
+            Threat::High => Severity::High,
+            Threat::Medium => Severity::Medium,
+            Threat::Low => Severity::Low,
+        }
+    }
 }
 
 named_enum! {
@@ -324,14 +301,11 @@ fn from_event(kind: EventKind, device: Option<Mac>, data: &Value, ap_name: &dyn 
     }
     let s = |k: &str| data[k].as_str().unwrap_or_default().to_string();
     if kind == EventKind::NetworkThreat {
-        let sev = match data["severity"].as_str() {
-            Some("high") => Severity::High,
-            Some("medium") => Severity::Medium,
-            _ => return None,
-        };
+        // A low one (a strong new neighbour) is only listed.
+        let sev = data["severity"].as_str().and_then(crate::threats::Severity::parse).filter(|s| *s != crate::threats::Severity::Low)?;
         let essid = data["essid"].as_str().map_or("A hidden network".to_string(), |e| format!("\"{e}\""));
         let (kind, bssid) = (s("kind"), s("bssid"));
-        let a = Alert::new(Key::SuspiciousNetwork, Category::Security, sev, Entity::Network(format!("{kind}/{bssid}")), format!("Suspicious network: {essid}"), s("detail"));
+        let a = Alert::new(Key::SuspiciousNetwork, Category::Security, sev.into(), Entity::Network(format!("{kind}/{bssid}")), format!("Suspicious network: {essid}"), s("detail"));
         return Some(a.link("/radios?tab=rogue").tagged(format!("threat:{kind}:{bssid}")));
     }
     // Every other alert is about an AP: without one (a crash line from a
@@ -844,6 +818,22 @@ mod tests {
         assert!(from_event(EventKind::ApCrash, None, &panic, &name).is_none());
         assert_eq!(from_event(EventKind::ApCrash, Some(aa), &panic, &name).unwrap().title, "Garage: kernel panic");
         assert!(from_event(EventKind::NetworkThreat, None, &json!({ "severity": "high" }), &name).is_some());
+    }
+
+    #[test]
+    fn a_threat_alert_is_as_urgent_as_its_finding() {
+        use crate::threats::Severity as Threat;
+        let name = |m: Mac| m.to_string();
+        // As the threat watcher writes the event: the finding's severity by name.
+        let event = |s: Threat| from_event(EventKind::NetworkThreat, None, &json!({ "severity": s, "kind": "lookalike", "bssid": "02:00:00:00:00:01" }), &name);
+        assert_eq!(event(Threat::High).unwrap().severity, Severity::High);
+        assert_eq!(event(Threat::Medium).unwrap().severity, Severity::Medium);
+        assert!(event(Threat::Low).is_none(), "a low finding is only listed");
+        assert_eq!(Threat::ALL.iter().map(|&s| Severity::from(s).as_str()).collect::<Vec<_>>(), ["high", "medium", "low"]);
+        // Both are written by name, as before.
+        assert_eq!((json!(Threat::ALL), json!(Severity::Info)), (json!(["high", "medium", "low"]), json!("info")));
+        assert!(Threat::High < Threat::Medium && Threat::Medium < Threat::Low, "sorts most serious first");
+        assert_eq!((json!(EventKind::NetworkThreat), EventKind::NetworkThreat.to_string()), (json!("network_threat"), "network_threat".to_string()));
     }
 
     fn watcher() -> (Watcher, broadcast::Receiver<LiveMsg>) {

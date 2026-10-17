@@ -13,6 +13,52 @@ use serde_json::Value;
 /// Seconds since the Unix epoch.
 pub type Ts = i64;
 
+/// Declares a fieldless enum whose variants are stored and sent by name, with
+/// `as_str`, `parse`, `Display` and serialisation as that name (and, in tests,
+/// `ALL` variants in order).
+macro_rules! named_enum {
+    ($(#[$attr:meta])* $vis:vis enum $name:ident { $($variant:ident = $str:literal),* $(,)? }) => {
+        $(#[$attr])*
+        $vis enum $name {
+            $($variant,)*
+        }
+
+        impl $name {
+            #[cfg(test)]
+            #[allow(dead_code)]
+            pub const ALL: &[$name] = &[$($name::$variant,)*];
+
+            /// As stored and as the API names it.
+            pub const fn as_str(self) -> &'static str {
+                match self {
+                    $($name::$variant => $str,)*
+                }
+            }
+
+            #[allow(dead_code)]
+            pub fn parse(s: &str) -> Option<$name> {
+                match s {
+                    $($str => Some($name::$variant),)*
+                    _ => None,
+                }
+            }
+        }
+
+        impl serde::Serialize for $name {
+            fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+                s.serialize_str(self.as_str())
+            }
+        }
+
+        impl std::fmt::Display for $name {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str(self.as_str())
+            }
+        }
+    };
+}
+pub(crate) use named_enum;
+
 #[derive(Debug, Clone, Serialize)]
 pub struct ApSample {
     pub mac: Mac,
