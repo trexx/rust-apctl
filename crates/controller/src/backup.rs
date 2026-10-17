@@ -20,7 +20,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
-use aes_gcm::aead::{Aead, KeyInit, Payload};
+use aes_gcm::aead::{AeadInOut, KeyInit};
 use aes_gcm::{Aes256Gcm, Nonce};
 use anyhow::{Context, Result, anyhow, bail};
 use axum::Json;
@@ -136,23 +136,27 @@ struct SealWriter<W: Write> {
 }
 
 impl<W: Write> SealWriter<W> {
-    fn new(mut out: W, key: &[u8; 32]) -> Result<Self> {
+    fn new(out: W, key: &[u8; 32]) -> Result<Self> {
         let mut prefix = [0u8; 7];
         getrandom::fill(&mut prefix).map_err(|e| anyhow!("random: {e}"))?;
+        Ok(Self::with_prefix(out, key, prefix)?)
+    }
+
+    fn with_prefix(mut out: W, key: &[u8; 32], prefix: [u8; 7]) -> io::Result<Self> {
         let mut header = MAGIC.to_vec();
         header.push(1);
         header.extend_from_slice(&prefix);
         out.write_all(&header)?;
-        Ok(SealWriter { out, cipher: Aes256Gcm::new(key.into()), header, prefix, counter: 0, buf: Vec::with_capacity(CHUNK) })
+        // Room for the tag too: each chunk is sealed where it lies.
+        Ok(SealWriter { out, cipher: Aes256Gcm::new(key.into()), header, prefix, counter: 0, buf: Vec::with_capacity(CHUNK + TAG) })
     }
 
     fn seal(&mut self, last: bool) -> io::Result<()> {
         let n = nonce(&self.prefix, self.counter, last);
-        let sealed = self
-            .cipher
-            .encrypt(&Nonce::try_from(&n[..]).expect("12 bytes"), Payload { msg: &self.buf, aad: &self.header })
+        self.cipher
+            .encrypt_in_place(&Nonce::try_from(&n[..]).expect("12 bytes"), &self.header, &mut self.buf)
             .map_err(|_| io::Error::other("encryption failed"))?;
-        self.out.write_all(&sealed)?;
+        self.out.write_all(&self.buf)?;
         self.counter = self.counter.checked_add(1).ok_or_else(|| io::Error::other("backup too large"))?;
         self.buf.clear();
         Ok(())
@@ -179,7 +183,9 @@ impl<W: Write> Write for SealWriter<W> {
     }
 }
 
-/// Decrypts a sealed stream, failing on any tampering or truncation.
+/// Decrypts a sealed stream, failing on any tampering or truncation. Two
+/// buffers take turns: the chunk being read (opened where it lies) and the
+/// one after it, read ahead to know whether this one is the last.
 struct OpenReader<R: Read> {
     inp: R,
     cipher: Aes256Gcm,
@@ -188,31 +194,32 @@ struct OpenReader<R: Read> {
     counter: u32,
     plain: Vec<u8>,
     pos: usize,
-    ahead: Option<Vec<u8>>,
+    ahead: Vec<u8>,
     done: bool,
 }
 
-fn read_block<R: Read>(r: &mut R, size: usize) -> io::Result<Vec<u8>> {
-    let mut b = Vec::with_capacity(size);
-    r.take(size as u64).read_to_end(&mut b)?;
-    Ok(b)
+/// Reads the next sealed chunk (or what is left) into `b`.
+fn read_block<R: Read>(r: &mut R, b: &mut Vec<u8>) -> io::Result<()> {
+    b.clear();
+    r.take((CHUNK + TAG) as u64).read_to_end(b)?;
+    Ok(())
 }
 
 impl<R: Read> OpenReader<R> {
+    fn new(mut inp: R, key: &[u8; 32], header: Vec<u8>, prefix: [u8; 7]) -> io::Result<Self> {
+        let mut ahead = Vec::with_capacity(CHUNK + TAG);
+        read_block(&mut inp, &mut ahead)?;
+        let plain = Vec::with_capacity(CHUNK + TAG);
+        Ok(OpenReader { inp, cipher: Aes256Gcm::new(key.into()), header, prefix, counter: 0, plain, pos: 0, ahead, done: false })
+    }
+
     fn next_chunk(&mut self) -> io::Result<()> {
-        let block = match self.ahead.take() {
-            Some(b) => b,
-            None => read_block(&mut self.inp, CHUNK + TAG)?,
-        };
-        let after = read_block(&mut self.inp, CHUNK + TAG)?;
-        let last = after.is_empty();
-        if !last {
-            self.ahead = Some(after);
-        }
+        std::mem::swap(&mut self.plain, &mut self.ahead);
+        read_block(&mut self.inp, &mut self.ahead)?;
+        let last = self.ahead.is_empty();
         let n = nonce(&self.prefix, self.counter, last);
-        self.plain = self
-            .cipher
-            .decrypt(&Nonce::try_from(&n[..]).expect("12 bytes"), Payload { msg: &block, aad: &self.header })
+        self.cipher
+            .decrypt_in_place(&Nonce::try_from(&n[..]).expect("12 bytes"), &self.header, &mut self.plain)
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "the backup is damaged, truncated or was made with a different key"))?;
         self.pos = 0;
         self.counter += 1;
@@ -250,7 +257,7 @@ fn open_payload(path: &Path, key: Option<&[u8; 32]>) -> Result<Box<dyn Read>> {
         f.read_exact(&mut prefix)?;
         let mut header = head.to_vec();
         header.extend_from_slice(&prefix);
-        Box::new(OpenReader { inp: f, cipher: Aes256Gcm::new(key.into()), header, prefix, counter: 0, plain: vec![], pos: 0, ahead: None, done: false })
+        Box::new(OpenReader::new(f, key, header, prefix)?)
     } else if key.is_some() {
         // With a key, only what was sealed with it is trusted: anyone who can
         // put a file in front of apctl could otherwise have it restored.
@@ -1063,7 +1070,8 @@ pub async fn upload(State(s): State<AppState>, body: Body) -> Result<Json<Value>
     tokio::fs::create_dir_all(b.staging()).await?;
     let name = format!("upload-{}-{}.apb", store::now_ts(), crate::settings::random_hex(4));
     let tmp = TempFile(b.staging().join(name));
-    let mut file = tokio::fs::File::create_new(&tmp.0).await?;
+    // Written a megabyte per trip to the blocking pool, not one trip per body chunk.
+    let mut file = tokio::io::BufWriter::with_capacity(1 << 20, tokio::fs::File::create_new(&tmp.0).await?);
     let mut stream = body.into_data_stream();
     // DefaultBodyLimit does not apply to a streamed body: count here.
     let mut size = 0u64;
@@ -1230,6 +1238,46 @@ mod tests {
         assert_eq!(man.files.keys().cloned().collect::<Vec<_>>(), vec!["config.db"]);
         assert_eq!(count(&out.join("config.db"), "SELECT COUNT(*) FROM events"), 0);
         assert_eq!(count(&out.join("config.db"), "SELECT COUNT(*) FROM client_aliases"), 1);
+    }
+
+    /// Seals `data` as apctl did before chunks were sealed in place: a new
+    /// buffer per chunk, from the allocating AEAD calls.
+    fn sealed_the_old_way(data: &[u8], key: &[u8; 32], prefix: [u8; 7]) -> Vec<u8> {
+        use aes_gcm::aead::{Aead, Payload};
+        let cipher = Aes256Gcm::new(key.into());
+        let mut header = MAGIC.to_vec();
+        header.push(1);
+        header.extend_from_slice(&prefix);
+        let mut out = header.clone();
+        let mut seal = |msg: &[u8], i: u32, last: bool| {
+            let n = nonce(&prefix, i, last);
+            out.extend(cipher.encrypt(&Nonce::try_from(&n[..]).unwrap(), Payload { msg, aad: &header }).unwrap());
+        };
+        // Full chunks as they fill, then the rest (perhaps nothing) as the last.
+        let (mut rest, mut i) = (data, 0);
+        while rest.len() >= CHUNK {
+            seal(&rest[..CHUNK], i, false);
+            (rest, i) = (&rest[CHUNK..], i + 1);
+        }
+        seal(rest, i, true);
+        out
+    }
+
+    #[test]
+    fn sealing_in_place_writes_and_reads_the_same_bytes_as_before() {
+        let key = [9u8; 32];
+        let prefix = [1, 2, 3, 4, 5, 6, 7];
+        for len in [0, 10, CHUNK, 2 * CHUNK + CHUNK / 2] {
+            let data: Vec<u8> = (0..len).map(|i| (i * 7 % 251) as u8).collect();
+            let old = sealed_the_old_way(&data, &key, prefix);
+            let mut w = SealWriter::with_prefix(Vec::new(), &key, prefix).unwrap();
+            w.write_all(&data).unwrap();
+            assert!(w.finish().unwrap() == old, "{len} bytes: byte for byte as before");
+            let mut r = OpenReader::new(&old[MAGIC.len() + 1 + 7..], &key, old[..MAGIC.len() + 1 + 7].to_vec(), prefix).unwrap();
+            let mut back = Vec::new();
+            r.read_to_end(&mut back).unwrap();
+            assert!(back == data, "{len} bytes read back");
+        }
     }
 
     #[test]
