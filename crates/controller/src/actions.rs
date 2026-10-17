@@ -70,19 +70,10 @@ pub fn next(live: &mut Live, mac: &Mac) -> Option<Value> {
 /// Sets fields on a client's entry in the settings, creating it (with the
 /// MAC as `aa:bb:..`) if needed.
 pub fn edit_client(state: &mut Value, mac: Mac, fields: &[(&str, Value)]) {
-    let site = crate::settings::site_id(state).map(str::to_string);
-    let list = crate::settings::array_mut(state, "clients");
     // Matched as `controls` reads them, whichever way the entry writes its MAC.
-    let entry = match list.iter().position(|c| entry_mac(c) == Some(mac)) {
-        Some(i) => &mut list[i],
-        None => {
-            let mut c = json!({ "mac": mac.to_string() });
-            if let Some(s) = site {
-                c["site_id"] = json!(s);
-            }
-            list.push(c);
-            list.last_mut().expect("just pushed")
-        }
+    let entry = match state["clients"].as_array().and_then(|l| l.iter().position(|c| entry_mac(c) == Some(mac))) {
+        Some(i) => &mut state["clients"][i],
+        None => crate::settings::push_doc(state, "clients", json!({ "mac": mac.to_string() })),
     };
     for (k, v) in fields {
         entry[*k] = v.clone();

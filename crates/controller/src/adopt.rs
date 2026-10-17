@@ -230,10 +230,9 @@ pub fn radio_table(state: &Value, payload: &Value) -> Vec<Value> {
         .collect()
 }
 
-/// A new AP's record: its details from its inform, a fresh key (32 hex
-/// characters) and syslog key (64), a cfgversion, and its radios.
+/// A new AP's record (but for its `site_id`): its details from its inform, a
+/// fresh key (32 hex characters) and syslog key (64), a cfgversion, and its radios.
 pub fn new_device(state: &Value, payload: &Value, mac: &Mac) -> Value {
-    let site = crate::settings::site_id(state);
     let other = state["devices"].as_array().and_then(|d| d.first()).cloned().unwrap_or(Value::Null);
     let mut d = json!({
         "mac": mac.to_string(), "adopted": true, "type": "uap", "x_authkey": random_hex(16), "syslog_key": random_hex(32),
@@ -247,9 +246,6 @@ pub fn new_device(state: &Value, payload: &Value, mac: &Mac) -> Value {
     }
     if let Some(n) = payload["hostname"].as_str() {
         d["name"] = json!(n);
-    }
-    if let Some(s) = site {
-        d["site_id"] = json!(s);
     }
     // The management network and WLAN groups of the other APs.
     for k in ["mgmt_network_id", "wlangroup_id_ng", "wlangroup_id_na"] {
@@ -275,7 +271,7 @@ pub fn adopt_device(state: &mut Value, mac: &Mac, payload: &Value) -> Result<Str
         return Ok(format!("re-adopting {mac}"));
     }
     let d = new_device(state, payload, mac);
-    crate::settings::array_mut(state, "devices").push(d);
+    crate::settings::push_doc(state, "devices", d);
     Ok(format!("adopted AP {} ({mac})", payload["hostname"].as_str().or(payload["model"].as_str()).unwrap_or("new")))
 }
 

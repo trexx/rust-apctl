@@ -131,16 +131,23 @@ pub(crate) fn setting<'a>(state: &'a Value, key: &str) -> &'a Value {
 
 /// The site's setting document with this key, created when missing.
 pub(crate) fn setting_mut<'a>(state: &'a mut Value, key: &str) -> &'a mut Value {
-    let site = site_id(state).map(str::to_string);
-    let list = array_mut(state, "setting");
-    let i = match list.iter().position(|s| s["key"].as_str() == Some(key) && in_site(site.as_deref(), s)) {
-        Some(i) => i,
-        None => {
-            list.push(json!({ "key": key, "site_id": site }));
-            list.len() - 1
-        }
-    };
-    &mut list[i]
+    let site = site_id(state);
+    match state["setting"].as_array().and_then(|l| l.iter().position(|s| s["key"].as_str() == Some(key) && in_site(site, s))) {
+        Some(i) => &mut state["setting"][i],
+        None => push_doc(state, "setting", json!({ "key": key })),
+    }
+}
+
+/// Adds a document to a collection of the settings, in the site when the
+/// settings have one (a document without `site_id` belongs to every site, as
+/// one with `"site_id": null` does), and returns it.
+pub(crate) fn push_doc<'a>(state: &'a mut Value, collection: &str, mut doc: Value) -> &'a mut Value {
+    if let Some(site) = site_id(state) {
+        doc["site_id"] = json!(site);
+    }
+    let list = array_mut(state, collection);
+    list.push(doc);
+    list.last_mut().expect("just pushed")
 }
 
 /// A list in the settings (a collection), created empty when missing.
@@ -585,7 +592,6 @@ fn default_group(state: &Value) -> Option<String> {
 /// Sets which APs broadcast an SSID: all, or a list (kept in a hidden AP group
 /// of its own, as the official controller does). Groups left unused are removed.
 fn set_wlan_aps(state: &mut Value, id: &str, aps: Option<Vec<String>>) -> Result<(), String> {
-    let site = site_id(state).map(str::to_string);
     let known = device_macs(state);
     let current: Vec<String> = find_wlan(state, id).and_then(|w| w["ap_group_ids"].as_array().cloned()).unwrap_or_default().iter().filter_map(|v| v.as_str().map(str::to_string)).collect();
     let own = docs(state, "apgroup").find(|g| g["for_wlanconf"].as_bool() == Some(true) && oid(g).is_some_and(|i| current.iter().any(|c| c == i))).and_then(id_of);
@@ -608,11 +614,7 @@ fn set_wlan_aps(state: &mut Value, id: &str, aps: Option<Vec<String>>) -> Result
                 Some(g) => g.clone(),
                 None => {
                     let g = new_id();
-                    let mut doc = json!({ "_id": g, "name": "devices_ap_group", "for_wlanconf": true, "attr_no_delete": false, "device_macs": [] });
-                    if let Some(s) = &site {
-                        doc["site_id"] = json!(s);
-                    }
-                    array_mut(state, "apgroup").push(doc);
+                    push_doc(state, "apgroup", json!({ "_id": g, "name": "devices_ap_group", "for_wlanconf": true, "attr_no_delete": false, "device_macs": [] }));
                     g
                 }
             };
@@ -1253,18 +1255,15 @@ pub fn ensure_default_usergroup(state: &mut Value) -> String {
     }
     let doc = new_default_usergroup(state);
     let id = id_of(&doc).unwrap_or_default();
-    array_mut(state, "usergroup").push(doc);
+    push_doc(state, "usergroup", doc);
     id
 }
 
-/// The default user group as [`ensure_default_usergroup`] adds it.
+/// The default user group as [`ensure_default_usergroup`] adds it (but for
+/// its `site_id`).
 fn new_default_usergroup(state: &Value) -> Value {
     let id = docs(state, "wlanconf").find_map(|w| w["usergroup_id"].as_str().filter(|g| !g.is_empty()).map(str::to_string)).unwrap_or_else(new_id);
-    let mut doc = json!({ "_id": id, "name": "Default", "attr_hidden_id": "Default", "attr_no_delete": true, "qos_rate_max_down": -1, "qos_rate_max_up": -1 });
-    if let Some(site) = site_id(state) {
-        doc["site_id"] = json!(site);
-    }
-    doc
+    json!({ "_id": id, "name": "Default", "attr_hidden_id": "Default", "attr_no_delete": true, "qos_rate_max_down": -1, "qos_rate_max_up": -1 })
 }
 
 /// The id of the site's default user group (no speed limit).
@@ -2074,6 +2073,18 @@ mod tests {
     }
 
     #[test]
+    fn new_documents_are_put_in_the_site() {
+        let mut s = state();
+        setting_mut(&mut s, "ntp")["setting_preference"] = json!("auto");
+        assert_eq!(setting(&s, "ntp")["site_id"], "s1");
+        // Without a site, none is written (a null one meant the same: every site).
+        let mut s = json!({ "setting": [{ "key": "ntp", "site_id": null, "x": 1 }] });
+        assert_eq!(setting_mut(&mut s, "ntp")["x"], 1, "a null site_id is in the site");
+        setting_mut(&mut s, "mgmt");
+        assert_eq!(s["setting"][1], json!({ "key": "mgmt" }));
+    }
+
+    #[test]
     fn repeated_entries_go_wherever_they_are() {
         let mut s = state();
         edit(&mut s, json!({ "mac_filter_list": ["02:00:00:00:00:0a", "02:00:00:00:00:0b", "02:00:00:00:00:0A"] })).unwrap();
@@ -2168,18 +2179,11 @@ pub fn apply_usergroup(state: &mut Value, e: &GroupEdit) -> Result<String, Strin
     {
         return Err(format!("another speed limit is called \"{n}\""));
     }
-    let site = site_id(state).map(str::to_string);
-    let list = array_mut(state, "usergroup");
     let (g, created) = match &id {
-        Some(id) => (list.iter_mut().find(|g| oid(g) == Some(id.as_str())).ok_or("unknown speed limit")?, false),
+        Some(id) => (array_mut(state, "usergroup").iter_mut().find(|g| oid(g) == Some(id.as_str())).ok_or("unknown speed limit")?, false),
         None => {
             let n = name.ok_or("the new speed limit needs a name")?;
-            let mut doc = json!({ "_id": new_id(), "name": n, "qos_rate_max_down": -1, "qos_rate_max_up": -1 });
-            if let Some(s) = site {
-                doc["site_id"] = json!(s);
-            }
-            list.push(doc);
-            (list.last_mut().unwrap(), true)
+            (push_doc(state, "usergroup", json!({ "_id": new_id(), "name": n, "qos_rate_max_down": -1, "qos_rate_max_up": -1 })), true)
         }
     };
     if let Some(n) = name {
