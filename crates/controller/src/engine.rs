@@ -1103,7 +1103,7 @@ impl Engine {
                     .map(|b| String::from_utf8_lossy(&b).into_owned())
                     .unwrap_or_else(|_| raw.to_string());
                 let lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
-                let tail: Vec<&str> = lines.iter().rev().take(200).rev().copied().collect();
+                let tail = &lines[lines.len().saturating_sub(200)..];
                 let kind = if reason == "recovery" { "recovered after a crash" } else { "crash report" };
                 self.emit(ev(ts, EventKind::ApCrash, Some(mac), None, json!({ "kind": kind, "source": reason, "lines": tail })));
             }

@@ -166,7 +166,6 @@ pub struct ClientSample {
     /// Seconds connected to this AP.
     pub uptime: Option<i64>,
     pub satisfaction: Option<i64>,
-    pub satisfaction_reason: Option<i64>,
     pub anomalies: Option<i64>,
     pub nss: Option<i64>,
     pub chwidth: Option<i64>,
@@ -393,7 +392,6 @@ pub fn parse(ts: Ts, p: &Value) -> anyhow::Result<Snapshot> {
                 idletime: int(&s["idletime"]),
                 uptime: int(&s["uptime"]),
                 satisfaction: int(&s["satisfaction"]),
-                satisfaction_reason: int(&s["satisfaction_reason"]),
                 anomalies: int(&s["anomalies"]),
                 nss: int(&s["nss"]),
                 chwidth: int(&s["chwidth"]),
@@ -406,37 +404,7 @@ pub fn parse(ts: Ts, p: &Value) -> anyhow::Result<Snapshot> {
         }
     }
 
-    let radios = p["radio_table"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter_map(|r| {
-            let radio = string(&r["radio"])?;
-            let ath = &r["athstats"];
-            // Channel, width and power all from the same VAP.
-            let first_vap = vaps.iter().find(|v| v.radio.as_deref() == Some(radio.as_str()));
-            Some(RadioSample {
-                name: string(&r["name"]),
-                channel: first_vap.and_then(|v| v.channel),
-                bw: first_vap.and_then(|v| v.bw),
-                tx_power: first_vap.and_then(|v| v.tx_power),
-                cu_total: int(&ath["cu_total"]),
-                cu_self_rx: int(&ath["cu_self_rx"]),
-                cu_self_tx: int(&ath["cu_self_tx"]),
-                cu_interf: int(&ath["cu_interf"]),
-                noise_floor: int(&ath["noise_floor"]),
-                tx_packets: int(&ath["n_tx_pkts"]),
-                tx_retries: int(&ath["n_tx_retries"]),
-                rx_packets: int(&ath["n_rx_pkts"]),
-                antenna_gain: int(&r["builtin_ant_gain"]),
-                min_txpower: int(&r["min_txpower"]),
-                max_txpower: int(&r["max_txpower"]),
-                num_sta: clients.iter().filter(|c| c.radio.as_deref() == Some(radio.as_str())).count() as i64,
-                radio,
-            })
-        })
-        .collect();
-
+    let mut radios = Vec::new();
     let mut neighbors = Vec::new();
     let mut spectrum = Vec::new();
     for r in p["radio_table"].as_array().into_iter().flatten() {
@@ -459,13 +427,14 @@ pub fn parse(ts: Ts, p: &Value) -> anyhow::Result<Snapshot> {
                 model: string(&n["model"]),
             });
         }
+        let Some(radio) = radio else { continue };
         for c in r["spectrum_table"].as_array().into_iter().flatten() {
-            let (Some(radio), Some(channel)) = (radio.clone(), int(&c["channel"])) else { continue };
+            let Some(channel) = int(&c["channel"]) else { continue };
             if int(&c["total_samples"]).unwrap_or(0) == 0 {
                 continue; // no survey has run for this channel
             }
             spectrum.push(SpectrumSample {
-                radio,
+                radio: radio.clone(),
                 channel,
                 width: int(&c["width"]),
                 utilization: int(&c["utilization"]),
@@ -473,6 +442,28 @@ pub fn parse(ts: Ts, p: &Value) -> anyhow::Result<Snapshot> {
                 other_bss_count: int(&c["other_bss_count"]),
             });
         }
+        let ath = &r["athstats"];
+        // Channel, width and power all from the same VAP.
+        let first_vap = vaps.iter().find(|v| v.radio.as_deref() == Some(radio.as_str()));
+        radios.push(RadioSample {
+            name: string(&r["name"]),
+            channel: first_vap.and_then(|v| v.channel),
+            bw: first_vap.and_then(|v| v.bw),
+            tx_power: first_vap.and_then(|v| v.tx_power),
+            cu_total: int(&ath["cu_total"]),
+            cu_self_rx: int(&ath["cu_self_rx"]),
+            cu_self_tx: int(&ath["cu_self_tx"]),
+            cu_interf: int(&ath["cu_interf"]),
+            noise_floor: int(&ath["noise_floor"]),
+            tx_packets: int(&ath["n_tx_pkts"]),
+            tx_retries: int(&ath["n_tx_retries"]),
+            rx_packets: int(&ath["n_rx_pkts"]),
+            antenna_gain: int(&r["builtin_ant_gain"]),
+            min_txpower: int(&r["min_txpower"]),
+            max_txpower: int(&r["max_txpower"]),
+            num_sta: clients.iter().filter(|c| c.radio.as_deref() == Some(radio.as_str())).count() as i64,
+            radio,
+        });
     }
 
     // The uplink is the interface named by `uplink` (eth0 for wired APs).
