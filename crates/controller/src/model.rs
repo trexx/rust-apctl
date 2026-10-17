@@ -689,8 +689,9 @@ pub(crate) mod tests {
     #[test]
     fn an_inform_without_a_vap_table_has_no_client_information() {
         let Some(_) = fixtures() else { return };
-        // A notification sent after a config push (the engine does not parse
-        // those): the only kind of inform captured without a VAP table.
+        // A notification (`inform_as_notif`, here a client's association; the
+        // engine does not parse those): the only kind of inform captured
+        // without a VAP table.
         let s = parse(1000, &fixture("000593_020000000002_inform")).unwrap();
         assert!(!s.has_vap_table);
         assert!(s.clients.is_empty());

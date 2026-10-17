@@ -51,5 +51,7 @@ push to each AP: step 10 for AP B and step 15 for AP U.
 
 Samples:
 - `…_000001_…_inform.json` is a normal inform (85 top-level keys).
-- `…_000593_…_inform.json` was sent while the radio restarted after a push. It has 63 keys and no `vap_table`.
+- `…_000593_…_inform.json` is a notification: an inform the AP sends at once to report an event
+  (`inform_as_notif`, `notif_reason: "event"`, here a client's association in `notif_payload`).
+  It has 63 keys and no `vap_table`.
 - `…_000002_…_reply-noop.json` is a routine reply.
