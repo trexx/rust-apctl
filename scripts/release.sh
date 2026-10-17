@@ -37,14 +37,40 @@ if [ "$crate" != "$version" ]; then
   exit 1
 fi
 
-if [ $test = 1 ]; then
-  echo "== tests"
-  log=$(mktemp)
-  if ! cargo test -q --workspace >"$log" 2>&1; then
-    grep -E "FAILED|panicked|error" "$log" | head -20 >&2
-    echo "tests failed (full output: $log)" >&2
+# The image is built from the working tree, so that must be exactly a commit. This
+# script does not tag: a tag of this version that already exists must name that
+# commit (CI publishes the same image from the tag).
+if [ -n "$(git status --porcelain)" ]; then
+  echo "the working tree has uncommitted changes; commit or stash them first" >&2
+  exit 1
+fi
+if tagged=$(git rev-parse -q --verify "refs/tags/$version^{commit}"); then
+  if [ "$tagged" != "$(git rev-parse HEAD)" ]; then
+    echo "tag $version names $tagged, not HEAD" >&2
     exit 1
   fi
+else
+  echo "note: HEAD is not tagged $version"
+fi
+
+if [ $test = 1 ]; then
+  # The same checks as CI (.github/workflows/test.yml). informdump turns on
+  # serde_json's preserve_order, so it is tested on its own.
+  checks=(
+    "cargo test --workspace --exclude informdump --locked"
+    "cargo test -p informdump --locked"
+    "cargo clippy --workspace --all-targets --locked -- -D warnings"
+    "cargo clippy -p informdump --features mongo --all-targets --locked -- -D warnings"
+  )
+  log=$(mktemp)
+  for check in "${checks[@]}"; do
+    echo "== $check"
+    if ! $check >"$log" 2>&1; then
+      grep -E "FAILED|panicked|error|warning" "$log" | head -20 >&2
+      echo "failed: $check (full output: $log)" >&2
+      exit 1
+    fi
+  done
   rm -f "$log"
 fi
 
