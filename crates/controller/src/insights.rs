@@ -1886,7 +1886,7 @@ mod tests {
                         l.clients.insert(c.mac, ClientView { sample: c.clone(), connected: true, first_seen: 0, last_seen: base });
                     }
                     let d = DeviceView {
-                        snapshot, online: true, first_seen: 0, last_seen: base, peer: "x".into(), interval: 10, reconfiguring: false, reconfiguring_since: None,
+                        snapshot, online: true, first_seen: 0, last_seen: base, peer: "x".into(), interval: 10,
                         last_full_inform: base, last_config_push: None,
                     };
                     l.devices.insert(mac, d);

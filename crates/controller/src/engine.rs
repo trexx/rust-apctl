@@ -187,11 +187,6 @@ pub struct DeviceView {
     pub peer: String,
     /// Inform interval most recently requested by the controller.
     pub interval: Ts,
-    /// True while the AP sends short informs (no client data) after a config
-    /// push, i.e. while it applies the new configuration.
-    pub reconfiguring: bool,
-    /// When the current reconfiguration began.
-    pub reconfiguring_since: Option<Ts>,
     /// Time of the last inform that included the client list.
     pub last_full_inform: Ts,
     pub last_config_push: Option<Ts>,
@@ -725,8 +720,6 @@ impl Engine {
                 last_seen: ts,
                 peer,
                 interval: p.interval,
-                reconfiguring: false,
-                reconfiguring_since: None,
                 last_config_push: p.last_config_push,
             },
             None => DeviceView {
@@ -737,8 +730,6 @@ impl Engine {
                 last_seen: ts,
                 peer,
                 interval: DEFAULT_INTERVAL,
-                reconfiguring: false,
-                reconfiguring_since: None,
                 last_config_push: None,
             },
         };

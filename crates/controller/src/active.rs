@@ -1160,7 +1160,7 @@ mod tests {
         let seen = |last_seen: Ts| {
             let snapshot = crate::model::parse(last_seen, &ap_payload("1")).unwrap();
             let d = crate::engine::DeviceView {
-                snapshot, online: true, first_seen: 0, last_seen, peer: "x".into(), interval: 10, reconfiguring: false, reconfiguring_since: None,
+                snapshot, online: true, first_seen: 0, last_seen, peer: "x".into(), interval: 10,
                 last_full_inform: last_seen, last_config_push: None,
             };
             rig.live.write().unwrap().devices.insert(mac, d);
