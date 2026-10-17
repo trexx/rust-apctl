@@ -22,12 +22,10 @@ type SortKey =
   | "uptime"
   | "last_seen";
 
-const name = displayName;
-
 function value(c: ClientView, key: SortKey): string | number {
   switch (key) {
     case "name":
-      return name(c).toLowerCase();
+      return displayName(c).toLowerCase();
     case "ap":
       return (c.ap_name ?? "").toLowerCase();
     case "essid":
@@ -219,7 +217,7 @@ const ClientRow = memo(function ClientRow({
     <tr className={c.connected ? "" : "dim"}>
       <td>
         <Link to={`/clients/${c.sample.mac}`} title={c.note ?? undefined}>
-          {name(c)}
+          {displayName(c)}
         </Link>
         <div className="small muted">
           {c.alias && c.sample.hostname ? `${c.sample.hostname} · ` : ""}
