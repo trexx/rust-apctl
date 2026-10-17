@@ -62,11 +62,11 @@ export function Overview() {
           sub={`clients below ${dbm(SIGNAL.fair)}`}
         />
         <Stat
-          label="Shadow feed"
-          value={status.data ? status.data.counters.informs : "—"}
+          label={s?.mode === "shadow" ? "Shadow feed" : "AP reports"}
+          value={s ? s.counters.informs : "—"}
           sub={
-            status.data
-              ? `informs since start, ${status.data.counters.decode_errors} errors`
+            s
+              ? `informs since start, ${s.counters.decode_errors} errors`
               : ""
           }
         />
@@ -79,7 +79,7 @@ export function Overview() {
         {list.map((d) => (
           <Link key={d.mac} to={`/devices/${d.mac}`} className="card card-link">
             <div className="card-head">
-              <Dot ok={d.online} warn={d.reconfiguring} />
+              <Dot ok={d.online} />
               <span className="card-title" title={d.name ?? d.mac}>
                 {d.name ?? d.mac}
               </span>

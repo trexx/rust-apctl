@@ -22,7 +22,6 @@ export interface DeviceSummary {
   version: string | null;
   ip: string | null;
   online: boolean;
-  reconfiguring: boolean;
   first_seen: number;
   last_seen: number;
   uptime: number | null;
@@ -196,7 +195,6 @@ export interface DeviceDetail {
     last_seen: number;
     peer: string;
     interval: number;
-    reconfiguring: boolean;
     last_config_push: number | null;
     /** Known from the database only: hasn't reported since apctl started. */
     stored_only?: boolean;
@@ -326,7 +324,8 @@ export interface LogLine {
 
 export interface Status {
   version: string;
-  mode: string;
+  /** Active: apctl manages the APs; shadow: it watches another controller's traffic. */
+  mode: "active" | "shadow";
   source: string;
   started: number;
   now: number;
@@ -649,11 +648,11 @@ export interface PlanEntry {
   name: string | null;
   width: number;
   clients: number;
-  current_channel: number | null;
-  current_score: number | null;
-  current_reasons: string[] | null;
-  suggested_channel: number | null;
-  suggested_score: number | null;
+  current_channel: number;
+  current_score: number;
+  current_reasons: string[];
+  suggested_channel: number;
+  suggested_score: number;
   suggested_reasons: string[];
   change: boolean;
   /** Kept as is: excluded, on a wireless uplink, or being upgraded. */
@@ -842,9 +841,12 @@ export interface Wlan {
   series: { ts: number[]; clients: number[]; download_bps: number[]; upload_bps: number[] };
 }
 
+/** What `useConnections` returns. */
+export type Connections = { attempts: ConnAttempt[]; roams: Roam[]; ap_names: Record<string, string>; client_names: Record<string, string> };
+
 /** Connection attempts and roams, newest first: at most `limit` of each (the server's default is 500); `roams: false` skips the roams. */
 export const useConnections = (span: TimeSpan, opts: { client?: Mac; failed?: boolean; limit?: number; roams?: boolean } = {}) =>
-  useSpanQuery<{ attempts: ConnAttempt[]; roams: Roam[]; ap_names: Record<string, string>; client_names: Record<string, string> }>(
+  useSpanQuery<Connections>(
     keys.connections(span, opts),
     "/api/connections",
     span,
@@ -954,6 +956,7 @@ export const checkFirmware = () => send<{ platforms: number }>("POST", "/api/fir
 export const upgradeFirmware = (macs: Mac[]) => send<{ queued: number; skipped: { mac: Mac; why: string }[] }>("POST", "/api/firmware/upgrade", { macs });
 export const upgradeFirmwareUrl = (mac: Mac, url: string) => send("POST", "/api/firmware/upgrade-url", { mac, url });
 export const cancelFirmware = () => send<{ cancelled: number }>("POST", "/api/firmware/cancel", {});
+export const resumeFirmware = () => send<{ resumed: boolean }>("POST", "/api/firmware/resume", {});
 
 export const useMulticast = (span: TimeSpan, mac?: Mac) => useSpanQuery<SiteMulticast>(keys.multicast(span, mac), "/api/site/multicast", span, { mac });
 

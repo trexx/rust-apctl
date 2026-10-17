@@ -80,7 +80,7 @@ function DevicePage({ mac }: { mac: string }) {
         <div className="page">
           <div className="page-head">
             <h1>
-              <Dot ok={d.online} warn={d.reconfiguring} /> {ap.hostname ?? mac}
+              <Dot ok={d.online} /> {ap.hostname ?? mac}
             </h1>
             <span className="muted">
               {ap.model_display ?? ap.model} · {ap.version} · {ap.ip} ·{" "}
@@ -99,11 +99,6 @@ function DevicePage({ mac }: { mac: string }) {
             <Suspense fallback={null}>
               <DeviceSettingsPanel mac={mac} />
             </Suspense>
-          )}
-          {d.reconfiguring && (
-            <div className="banner">
-              Applying a configuration change. Client data resumes in a moment.
-            </div>
           )}
           {d.stored_only && (
             <div className="banner">

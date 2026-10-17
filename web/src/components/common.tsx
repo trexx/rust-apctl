@@ -31,13 +31,8 @@ export function Stat({
   );
 }
 
-export function Dot({ ok, warn }: { ok: boolean; warn?: boolean }) {
-  return (
-    <span
-      className={`dot ${warn ? "dot-warn" : ok ? "dot-ok" : "dot-bad"}`}
-      aria-hidden
-    />
-  );
+export function Dot({ ok }: { ok: boolean }) {
+  return <span className={`dot ${ok ? "dot-ok" : "dot-bad"}`} aria-hidden />;
 }
 
 export function Signal({ dbm }: { dbm: number | null | undefined }) {
