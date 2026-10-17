@@ -15,6 +15,7 @@
 //!   `{"_type":"setdefault"}` with its next inform and resets itself.
 
 use std::collections::{BTreeMap, HashMap};
+use std::net::{IpAddr, Ipv6Addr};
 use std::sync::Arc;
 
 use axum::Json;
@@ -37,6 +38,13 @@ pub const ADOPT_TIMEOUT: Ts = 300;
 pub const FORGET_TIMEOUT: Ts = 90;
 /// At most this many pending APs are listed (the official controller's default).
 const MAX_PENDING: usize = 100;
+/// At most this many of them from one address (an IPv6 /64): anyone can send
+/// informs with the factory key, under any MAC.
+const MAX_PENDING_PER_SOURCE: usize = 4;
+/// A pending AP not heard from for this long is no longer listed.
+const PENDING_TIMEOUT: Ts = 600;
+/// The longest string kept of a pending AP's inform (its model, hostname...).
+const MAX_PENDING_TEXT: usize = 64;
 
 /// An AP waiting to be adopted.
 #[derive(Clone, Debug, Serialize)]
@@ -52,6 +60,9 @@ pub struct Pending {
     pub known: bool,
     pub first_seen: Ts,
     pub last_seen: Ts,
+    /// Where its informs come from (see `source_of`).
+    #[serde(skip)]
+    pub source: IpAddr,
     /// Its last inform, to build its record from.
     #[serde(skip)]
     pub payload: Arc<Value>,
@@ -111,8 +122,14 @@ pub fn syslog_keys(state: Option<&Value>, keys: &KeyStore) -> Vec<(Mac, [u8; 32]
 
 /// What adoption reads of a pending AP's inform (`new_device`, `radio_table`,
 /// the listing): kept instead of the whole inform, which anyone can send.
+/// Only short strings, numbers and flags.
 pub fn pending_inform(payload: &Value) -> Value {
-    let pick = |v: &Value, keys: &[&str]| Value::Object(keys.iter().filter_map(|&k| Some((k.to_string(), v.get(k).filter(|x| !x.is_null())?.clone()))).collect());
+    let small = |v: &Value| match v {
+        Value::String(s) => Some(Value::String(s[..s.floor_char_boundary(MAX_PENDING_TEXT)].to_string())),
+        Value::Number(_) | Value::Bool(_) => Some(v.clone()),
+        _ => None,
+    };
+    let pick = |v: &Value, keys: &[&str]| Value::Object(keys.iter().filter_map(|&k| Some((k.to_string(), small(v.get(k)?)?))).collect());
     let mut out = pick(payload, &["mac", "model", "model_display", "version", "serial", "ip", "hostname"]);
     if let Some(radios) = payload["radio_table"].as_array() {
         out["radio_table"] = radios.iter().take(8).map(|r| pick(r, &RADIO_KEYS)).collect();
@@ -120,17 +137,39 @@ pub fn pending_inform(payload: &Value) -> Value {
     out
 }
 
-/// Records an inform from an AP waiting for adoption (see `pending_inform`);
-/// true the first time.
-pub fn note_pending(live: &mut Live, payload: Value, known: bool, now: Ts) -> bool {
+/// The address pending APs are counted by: an IPv6 sender may use any
+/// address of its /64.
+fn source_of(ip: IpAddr) -> IpAddr {
+    match ip.to_canonical() {
+        IpAddr::V6(v6) => IpAddr::V6(Ipv6Addr::from(u128::from(v6) & (!0u128 << 64))),
+        v4 => v4,
+    }
+}
+
+/// Records an inform from an AP waiting for adoption (see `pending_inform`),
+/// sent from `source`; true the first time. A new AP makes room, if needed,
+/// by dropping the one heard from longest ago: of its source's, else of all.
+pub fn note_pending(live: &mut Live, payload: Value, known: bool, now: Ts, source: IpAddr) -> bool {
     let Some(mac) = payload["mac"].as_str().and_then(|m| m.parse::<Mac>().ok()) else { return false };
     let s = |k: &str| payload[k].as_str().map(str::to_string);
-    let new = !live.adoption.pending.contains_key(&mac);
-    if new && live.adoption.pending.len() >= MAX_PENDING {
-        return false;
+    let source = source_of(source);
+    let pending = &mut live.adoption.pending;
+    let new = !pending.contains_key(&mac);
+    if new {
+        let stalest = |of_source: bool| pending.values().filter(|p| !of_source || p.source == source).min_by_key(|p| p.last_seen).map(|p| p.mac);
+        let full = if pending.values().filter(|p| p.source == source).count() >= MAX_PENDING_PER_SOURCE {
+            stalest(true)
+        } else if pending.len() >= MAX_PENDING {
+            stalest(false)
+        } else {
+            None
+        };
+        if let Some(m) = full {
+            pending.remove(&m);
+        }
     }
-    let first_seen = live.adoption.pending.get(&mac).map_or(now, |p| p.first_seen);
-    live.adoption.pending.insert(
+    let first_seen = pending.get(&mac).map_or(now, |p| p.first_seen);
+    pending.insert(
         mac,
         Pending {
             mac,
@@ -143,6 +182,7 @@ pub fn note_pending(live: &mut Live, payload: Value, known: bool, now: Ts) -> bo
             known,
             first_seen,
             last_seen: now,
+            source,
             payload: Arc::new(payload),
         },
     );
@@ -151,7 +191,7 @@ pub fn note_pending(live: &mut Live, payload: Value, known: bool, now: Ts) -> bo
 
 /// Forgets pending APs not heard from for a while, and adoptions or forgets that timed out.
 pub fn expire(live: &mut Live, now: Ts) {
-    live.adoption.pending.retain(|_, p| now - p.last_seen < 600);
+    live.adoption.pending.retain(|_, p| now - p.last_seen < PENDING_TIMEOUT);
     live.adoption.adopting.retain(|_, t| now - *t < ADOPT_TIMEOUT);
 }
 
@@ -220,10 +260,18 @@ pub fn new_device(state: &Value, payload: &Value, mac: &Mac) -> Value {
     d
 }
 
-/// Adds a pending AP to the settings, from its inform (or, for an AP apctl
-/// knew, keeps its record).
+/// Adds a pending AP to the settings, from its inform. An AP apctl knew
+/// keeps its record, with new keys: the adoption hands the AP its key sealed
+/// with the public factory key, so whoever saw that would otherwise read what
+/// was sent to the AP under the old one (its Wi-Fi passwords).
 pub fn adopt_device(state: &mut Value, mac: &Mac, payload: &Value) -> Result<String, String> {
-    if device_doc(state, mac).is_some() {
+    if let Some(d) = device_doc_mut(state, mac) {
+        d["x_authkey"] = json!(random_hex(16));
+        d["syslog_key"] = json!(random_hex(32));
+        // The key it informed with, which is not this one any more.
+        if let Some(o) = d.as_object_mut() {
+            o.remove("x_inform_authkey");
+        }
         return Ok(format!("re-adopting {mac}"));
     }
     let d = new_device(state, payload, mac);
@@ -302,14 +350,19 @@ pub fn spawn(s: AppState) {
 pub async fn pending(State(s): State<AppState>) -> Json<Value> {
     // Before taking the lock below: it reads the settings too.
     let ssh = crate::ssh::available(&s);
-    let mut live = s.live.write().unwrap();
-    expire(&mut live, store::now_ts());
-    let adopting: Vec<Value> = live.adoption.adopting.iter().map(|(m, t)| json!({ "mac": m, "since": t })).collect();
-    let forgetting: Vec<Value> = live.adoption.forgetting.iter().map(|(m, t)| json!({ "mac": m, "since": t })).collect();
-    Json(json!({
-        "active": s.active, "pending": live.adoption.pending.values().collect::<Vec<_>>(), "adopting": adopting, "forgetting": forgetting,
-        "ssh": ssh,
-    }))
+    let now = store::now_ts();
+    // What `expire` would drop is left out (it runs every ten seconds), and
+    // the lists are serialised after the lock is released.
+    let (pending, adopting, forgetting) = {
+        let live = s.live.read().unwrap();
+        let a = &live.adoption;
+        let pending: Vec<Pending> = a.pending.values().filter(|p| now - p.last_seen < PENDING_TIMEOUT).cloned().collect();
+        let adopting: Vec<(Mac, Ts)> = a.adopting.iter().filter(|(_, t)| now - **t < ADOPT_TIMEOUT).map(|(m, t)| (*m, *t)).collect();
+        let forgetting: Vec<(Mac, Ts)> = a.forgetting.iter().map(|(m, t)| (*m, *t)).collect();
+        (pending, adopting, forgetting)
+    };
+    let since = |l: Vec<(Mac, Ts)>| l.into_iter().map(|(m, t)| json!({ "mac": m, "since": t })).collect::<Vec<_>>();
+    Json(json!({ "active": s.active, "pending": pending, "adopting": since(adopting), "forgetting": since(forgetting), "ssh": ssh }))
 }
 
 /// POST /api/devices/{mac}/adopt: adopt a pending AP.
@@ -408,9 +461,15 @@ mod tests {
         assert_eq!((d["site_id"].as_str(), d["mgmt_network_id"].as_str(), d["name"].as_str()), (Some("s1"), Some("n1"), Some("U6-Mesh")));
         assert_eq!(d["radio_table"][1]["ht"], 40, "the site's default width");
         assert_eq!((d["radio_table"][0]["channel"].as_str(), d["radio_table"][1]["has_ht160"].as_bool()), (Some("auto"), Some(true)));
-        // Adopting again keeps the record (and key).
-        adopt_device(&mut s, &"02:00:00:00:00:09".parse().unwrap(), &inform()).unwrap();
+        // Adopting again keeps the record, with new keys (the old one went out under the factory key).
+        let mac: Mac = "02:00:00:00:00:09".parse().unwrap();
+        device_doc_mut(&mut s, &mac).unwrap()["x_inform_authkey"] = d["x_authkey"].clone();
+        adopt_device(&mut s, &mac, &inform()).unwrap();
         assert_eq!(s["devices"].as_array().unwrap().len(), 2);
+        let again = device_doc(&s, &mac).unwrap();
+        assert_eq!((again["name"].as_str(), again["x_authkey"].as_str().unwrap().len()), (Some("U6-Mesh"), 32));
+        assert!(again["x_authkey"] != d["x_authkey"] && again["syslog_key"] != d["syslog_key"]);
+        assert!(again.get("x_inform_authkey").is_none(), "the AP has yet to inform with it");
     }
 
     #[test]
@@ -433,8 +492,8 @@ mod tests {
         let mut big = inform();
         big["sys_stats"] = json!({ "loadavg_1": "0.1" });
         big["radio_table"][0]["scan_table"] = json!([{ "bssid": "x" }]);
-        assert!(note_pending(&mut live, pending_inform(&big), false, 100));
-        assert!(!note_pending(&mut live, pending_inform(&big), false, 110), "only new the first time");
+        assert!(note_pending(&mut live, pending_inform(&big), false, 100, SRC));
+        assert!(!note_pending(&mut live, pending_inform(&big), false, 110, SRC), "only new the first time");
         let p = &live.adoption.pending[&"02:00:00:00:00:09".parse().unwrap()];
         assert_eq!((p.first_seen, p.last_seen, p.model.as_deref()), (100, 110, Some("U6M")));
         // Only what adoption reads is kept, and a record built from it is the same.
@@ -449,5 +508,45 @@ mod tests {
         assert_eq!(a, b);
         expire(&mut live, 110 + 600);
         assert!(live.adoption.pending.is_empty());
+    }
+
+    const SRC: IpAddr = IpAddr::V4(std::net::Ipv4Addr::new(192, 0, 2, 9));
+
+    #[test]
+    fn only_short_values_of_a_pending_inform_are_kept() {
+        let mut big = inform();
+        big["model"] = json!("é".repeat(100));
+        big["hostname"] = json!({ "nested": "x".repeat(1000) });
+        big["serial"] = json!(["a", "b"]);
+        big["radio_table"][0]["name"] = json!(vec![0; 1000]);
+        let p = pending_inform(&big);
+        assert_eq!(p["model"].as_str().unwrap(), "é".repeat(32), "cut at 64 bytes, between characters");
+        assert!(p.get("hostname").is_none() && p.get("serial").is_none() && p["radio_table"][0].get("name").is_none());
+        assert_eq!((p["radio_table"][1]["has_ht160"].as_bool(), p["radio_table"][0]["nss"].as_i64()), (Some(true), Some(2)));
+    }
+
+    #[test]
+    fn one_address_cannot_fill_the_pending_list() {
+        let mut live = Live::default();
+        let ap = |n: usize| {
+            let mut p = inform();
+            p["mac"] = json!(format!("02:00:00:00:{:02x}:{:02x}", n / 256, n % 256));
+            pending_inform(&p)
+        };
+        let v6 = |last: u16| IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, last));
+        // Each address of a /64 counts as the same sender: it keeps its latest few.
+        for n in 0..10 {
+            assert!(note_pending(&mut live, ap(n), false, n as Ts, v6(n as u16)));
+        }
+        let macs: Vec<String> = live.adoption.pending.keys().map(Mac::to_string).collect();
+        assert_eq!(macs, ["02:00:00:00:00:06", "02:00:00:00:00:07", "02:00:00:00:00:08", "02:00:00:00:00:09"]);
+        // A full list makes room by dropping the one heard from longest ago.
+        let mut live = Live::default();
+        for n in 0..MAX_PENDING {
+            note_pending(&mut live, ap(n), false, 1000 + n as Ts, IpAddr::V4(std::net::Ipv4Addr::from(n as u32)));
+        }
+        assert!(note_pending(&mut live, ap(MAX_PENDING), false, 5000, SRC));
+        assert_eq!(live.adoption.pending.len(), MAX_PENDING);
+        assert!(!live.adoption.pending.contains_key(&"02:00:00:00:00:00".parse().unwrap()));
     }
 }
