@@ -103,7 +103,7 @@ function Schedule({
   nextRun: number | null;
 }) {
   const [s, setS] = useState(initial);
-  const { msg, run } = useRunner([keys.backups()], 1200);
+  const { msg, run } = useRunner([keys.backups()]);
   const dirty = JSON.stringify(s) !== JSON.stringify(initial);
   const save = () => void run(() => saveBackupSettings(s), "Saved.");
   return (
