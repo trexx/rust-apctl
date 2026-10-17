@@ -977,7 +977,7 @@ mod tests {
         let value = |k: &str| mgmt.lines().find_map(|l| l.strip_prefix(k)?.strip_prefix('=')).unwrap().to_string();
         let (version, key_hex) = (value("cfgversion"), value("authkey"));
         assert_ne!(version, old, "a new version, not the record's");
-        let key: [u8; 16] = hex::decode(&key_hex).unwrap().try_into().unwrap();
+        let key: [u8; 16] = inform::parse_key(&key_hex).unwrap();
         assert_ne!(key, KEY, "a new key: the old one went out under the factory key");
         // Another inform under the factory key gets the same reply, without a new render.
         let (_, again) = inform_as_ap(&rig, &ap_payload(""), DEFAULT_KEY, GCM_ZLIB).await;
@@ -1227,7 +1227,7 @@ mod tests {
             live.adoption.adopting.insert(new, 0);
         }
         let key_hex = crate::adopt::device_doc(rig.live.read().unwrap().state.as_deref().unwrap(), &new).unwrap()["x_authkey"].as_str().unwrap().to_string();
-        let key: [u8; 16] = hex::decode(&key_hex).unwrap().try_into().unwrap();
+        let key: [u8; 16] = inform::parse_key(&key_hex).unwrap();
         // Still on the factory key: only mgmt_cfg, carrying its key.
         let (_, reply) = inform_as_ap(&rig, &payload, DEFAULT_KEY, GCM_ZLIB).await;
         let reply = reply.unwrap().1;

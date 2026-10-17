@@ -120,8 +120,7 @@ impl Backups {
 /// Reads a 32-byte key from a file holding 64 hex characters.
 pub fn load_key(path: &Path) -> Result<[u8; 32]> {
     let text = fs::read_to_string(path).with_context(|| format!("reading backup key {}", path.display()))?;
-    let bytes = hex::decode(text.trim()).context("the backup key must be 64 hex characters")?;
-    bytes.try_into().map_err(|_| anyhow!("the backup key must be 64 hex characters (32 bytes)"))
+    inform::parse_key(&text).context("the backup key must be 64 hex characters (32 bytes)")
 }
 
 // ---------------------------------------------------------------- sealing

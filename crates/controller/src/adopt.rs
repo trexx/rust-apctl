@@ -93,11 +93,6 @@ pub fn device_doc_mut<'a>(state: &'a mut Value, mac: &Mac) -> Option<&'a mut Val
     state["devices"].as_array_mut()?.iter_mut().find(|d| is_mac(&d["mac"], mac))
 }
 
-fn parse_key<const N: usize>(hex_key: &str) -> Option<[u8; N]> {
-    let b = hex::decode(hex_key).ok()?;
-    b.try_into().ok()
-}
-
 /// The key an AP apctl manages informs with: its record's `x_authkey`, else
 /// the key file (keys exported from the other controller). `None` when apctl
 /// doesn't manage it; before any settings are imported, the key file decides.
@@ -105,7 +100,7 @@ pub fn device_key(state: Option<&Value>, keys: &KeyStore, mac: &Mac) -> Option<[
     match state {
         Some(state) => {
             let d = device_doc(state, mac)?;
-            d["x_authkey"].as_str().and_then(parse_key).or_else(|| keys.get(mac).copied())
+            d["x_authkey"].as_str().and_then(|k| inform::parse_key(k).ok()).or_else(|| keys.get(mac).copied())
         }
         None => keys.get(mac).copied(),
     }
@@ -115,7 +110,7 @@ pub fn device_key(state: Option<&Value>, keys: &KeyStore, mac: &Mac) -> Option<[
 /// encrypts with its record's `syslog_key`, which apctl makes at adoption).
 pub fn syslog_keys(state: Option<&Value>, keys: &KeyStore) -> Vec<(Mac, [u8; 32])> {
     let devices = state.and_then(|s| s["devices"].as_array()).into_iter().flatten();
-    let stored = devices.filter_map(|d| Some((d["mac"].as_str()?.parse().ok()?, parse_key(d["syslog_key"].as_str()?)?)));
+    let stored = devices.filter_map(|d| Some((d["mac"].as_str()?.parse().ok()?, inform::parse_key(d["syslog_key"].as_str()?).ok()?)));
     stored.chain(keys.syslog_keys().map(|(m, k)| (*m, *k))).collect()
 }
 
@@ -452,6 +447,10 @@ mod tests {
         file.insert("02:00:00:00:00:09", "ffffffffffffffffffffffffffffffff").unwrap();
         assert!(device_key(Some(&s), &file, &"02:00:00:00:00:09".parse().unwrap()).is_none(), "a key alone does not make an AP ours");
         assert!(device_key(None, &file, &"02:00:00:00:00:09".parse().unwrap()).is_some(), "before an import, the key file decides");
+        let mut padded = state();
+        let key = device_doc(&padded, &ap).unwrap()["x_authkey"].as_str().unwrap().to_string();
+        device_doc_mut(&mut padded, &ap).unwrap()["x_authkey"] = json!(format!(" {key}\n"));
+        assert_eq!(device_key(Some(&padded), &keys, &ap), device_key(Some(&s), &keys, &ap), "whitespace around a stored key is ignored");
     }
 
     #[test]

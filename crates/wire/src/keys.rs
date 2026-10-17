@@ -64,9 +64,7 @@ impl KeyStore {
 
     pub fn insert_syslog(&mut self, mac: &str, key: &str) -> Result<()> {
         let mac: Mac = mac.parse()?;
-        let bytes = hex::decode(key.trim()).with_context(|| format!("syslog key for {mac}"))?;
-        let key: [u8; 32] = bytes.try_into().map_err(|_| anyhow::anyhow!("syslog key for {mac}: expected 32 bytes"))?;
-        self.syslog.insert(mac, key);
+        self.syslog.insert(mac, parse_key(key).with_context(|| format!("syslog key for {mac}"))?);
         Ok(())
     }
 

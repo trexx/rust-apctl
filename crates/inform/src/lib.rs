@@ -54,8 +54,10 @@ pub enum Error {
     Decrypt,
     #[error("decompression failed: {0}")]
     Decompress(String),
-    #[error("invalid key: {0}")]
-    InvalidKey(String),
+    #[error("invalid key: not hex")]
+    KeyNotHex(#[source] hex::FromHexError),
+    #[error("invalid key: {got} bytes, expected {expected}")]
+    KeyLength { expected: usize, got: usize },
     #[error("invalid MAC address {0:?}")]
     InvalidMac(String),
 }
@@ -200,12 +202,11 @@ impl Header {
     }
 }
 
-/// Parses a hex authkey (32 hex chars) into a 16-byte AES key.
-pub fn parse_key(hex_key: &str) -> Result<[u8; 16]> {
-    let bytes = hex::decode(hex_key.trim()).map_err(|e| Error::InvalidKey(e.to_string()))?;
-    bytes
-        .try_into()
-        .map_err(|_| Error::InvalidKey("expected 16 bytes".into()))
+/// Parses an `N`-byte key written in hex (an authkey's 32 characters, a syslog
+/// key's 64), ignoring surrounding whitespace.
+pub fn parse_key<const N: usize>(hex_key: &str) -> Result<[u8; N]> {
+    let bytes = hex::decode(hex_key.trim()).map_err(Error::KeyNotHex)?;
+    bytes.try_into().map_err(|b: Vec<u8>| Error::KeyLength { expected: N, got: b.len() })
 }
 
 /// A packet split into its header and the payload exactly as it appeared on the wire.
@@ -381,6 +382,16 @@ mod tests {
     #[test]
     fn default_key_is_md5_of_ubnt() {
         assert_eq!(hex::encode(DEFAULT_KEY), "ba86f2bbe107c7c57eb5f2690775c712");
+    }
+
+    #[test]
+    fn a_key_is_read_without_its_surrounding_whitespace() {
+        assert_eq!(parse_key::<16>(" ba86f2bbe107c7c57eb5f2690775c712\n").unwrap(), DEFAULT_KEY);
+        assert_eq!(parse_key::<2>("abcd").unwrap(), [0xab, 0xcd]);
+        assert!(matches!(parse_key::<16>("abcd"), Err(Error::KeyLength { expected: 16, got: 2 })));
+        let e = parse_key::<2>("abzz").unwrap_err();
+        assert!(matches!(e, Error::KeyNotHex(_)));
+        assert!(std::error::Error::source(&e).is_some_and(|s| s.to_string().contains("'z'")), "the hex error is kept as the source");
     }
 
     #[test]

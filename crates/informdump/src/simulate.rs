@@ -113,7 +113,7 @@ pub fn run(pcap: &str, ports: &[u16], keys: &KeyStore, url: &str, limit: usize, 
             let detail = match kind.as_str() {
                 "setparam" => {
                     let mgmt = reply["mgmt_cfg"].as_str().unwrap_or("");
-                    if let Some(k) = mgmt.lines().find_map(|l| l.strip_prefix("authkey=")).and_then(|k| hex::decode(k).ok()).and_then(|k| <[u8; 16]>::try_from(k).ok()) {
+                    if let Some(k) = mgmt.lines().find_map(|l| l.strip_prefix("authkey=")).and_then(|k| inform::parse_key(k).ok()) {
                         keys_now.insert(mac, k);
                     }
                     let v = reply["cfgversion"].as_str().or_else(|| mgmt.lines().find_map(|l| l.strip_prefix("cfgversion="))).unwrap_or("").to_string();
