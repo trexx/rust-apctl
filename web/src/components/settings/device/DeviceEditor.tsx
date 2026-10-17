@@ -1,7 +1,14 @@
 import { useState } from "react";
 import type { ConfigNetwork, DeviceSettings } from "../../../api";
 import { band } from "../../../format";
-import { Row, Select, Toggle, changed, useSettingsForm } from "../form";
+import {
+  Row,
+  Select,
+  TextInput,
+  Toggle,
+  changed,
+  useSettingsForm,
+} from "../form";
 import type { Fields } from "../form";
 import { EditorShell } from "../Review";
 import { AddressFields } from "./AddressFields";
@@ -102,12 +109,7 @@ export function DeviceEditor({
       onClose={onClose}
     >
       <Row label="Name">
-        <input
-          className="search"
-          maxLength={128}
-          value={form.name}
-          onChange={(e) => set("name", e.target.value)}
-        />
+        <TextInput {...bind("name")} maxLength={128} />
       </Row>
       <Row label="LED">
         <Select
@@ -134,10 +136,11 @@ export function DeviceEditor({
           </label>
         )}
         {has("led_color") && form.led_override !== "off" && (
-          <input
+          <TextInput
+            {...bind("led_override_color")}
             type="color"
-            value={form.led_override_color}
-            onChange={(e) => set("led_override_color", e.target.value)}
+            className=""
+            aria-label="LED colour"
           />
         )}
       </Row>
@@ -219,19 +222,17 @@ export function DeviceEditor({
       </Row>
       {has("snmp") && (
         <Row label="SNMP" hint="sent while SNMP is on in the site settings">
-          <input
-            className="search"
+          <TextInput
+            {...bind("snmp_location")}
             maxLength={255}
             placeholder="location"
-            value={form.snmp_location}
-            onChange={(e) => set("snmp_location", e.target.value)}
+            aria-label="SNMP location"
           />
-          <input
-            className="search"
+          <TextInput
+            {...bind("snmp_contact")}
             maxLength={255}
             placeholder="contact"
-            value={form.snmp_contact}
-            onChange={(e) => set("snmp_contact", e.target.value)}
+            aria-label="SNMP contact"
           />
         </Row>
       )}

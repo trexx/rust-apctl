@@ -1,5 +1,11 @@
 import { createContext, useContext, useId, useState } from "react";
-import type { ChangeEvent, Dispatch, ReactNode, SetStateAction } from "react";
+import type {
+  ChangeEvent,
+  Dispatch,
+  InputHTMLAttributes,
+  ReactNode,
+  SetStateAction,
+} from "react";
 
 /** A settings patch, as sent to the server. */
 export type Fields = Record<string, unknown>;
@@ -71,7 +77,8 @@ const useRowLabel = () => {
 
 /**
  * A labelled form row. Its label names the group, and the `Select`,
- * `NumberInput` and `ListInput` in it (screen readers announce it).
+ * `NumberInput`, `ListInput` and `TextInput` in it (screen readers announce
+ * it).
  */
 export function Row({
   label,
@@ -218,6 +225,34 @@ export function NumberInput({
         onChange(v);
       }}
       onBlur={() => setText(String(shown))}
+    />
+  );
+}
+
+/**
+ * A text field (class "search" unless given), named by its `Row`'s label, or
+ * by its own `aria-label` where a row holds several; `onChange` gets the text.
+ */
+export function TextInput({
+  value,
+  onChange,
+  className,
+  ...props
+}: Omit<InputHTMLAttributes<HTMLInputElement>, "value" | "onChange"> & {
+  value: string | null | undefined;
+  onChange: (v: string) => void;
+}) {
+  const named = useRowLabel();
+  return (
+    <input
+      aria-labelledby={
+        props["aria-label"] ? undefined : named["aria-labelledby"]
+      }
+      aria-describedby={named["aria-describedby"]}
+      className={className ?? "search"}
+      {...props}
+      value={value ?? ""}
+      onChange={(e) => onChange(e.target.value)}
     />
   );
 }

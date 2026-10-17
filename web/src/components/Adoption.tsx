@@ -2,6 +2,7 @@ import { useState } from "react";
 import { adoptAp, adoptOverSsh, keys, useAdoption, useCanEdit } from "../api";
 import { ago } from "../format";
 import { Outcome, useRunner } from "./common";
+import { TextInput } from "./settings/form";
 
 /** APs waiting for adoption, and adopting one by IP over SSH (active mode). */
 export function AdoptionPanel() {
@@ -86,31 +87,31 @@ export function AdoptionPanel() {
           <div className="form-row">
             <div className="form-label">IP address</div>
             <div className="form-control">
-              <input
-                className="search"
+              <TextInput
                 value={ip}
                 placeholder="192.168.1.20"
-                onChange={(e) => setIp(e.target.value)}
+                aria-label="IP address"
+                onChange={setIp}
               />
             </div>
           </div>
           <div className="form-row">
             <div className="form-label">SSH login</div>
             <div className="form-control">
-              <input
-                className="search"
+              <TextInput
                 value={user}
                 placeholder="username"
                 autoComplete="off"
-                onChange={(e) => setUser(e.target.value)}
+                aria-label="SSH user name"
+                onChange={setUser}
               />
-              <input
-                className="search"
+              <TextInput
                 type="password"
                 value={pass}
                 placeholder="password"
                 autoComplete="new-password"
-                onChange={(e) => setPass(e.target.value)}
+                aria-label="SSH password"
+                onChange={setPass}
               />
             </div>
           </div>

@@ -1,7 +1,7 @@
 import { useState } from "react";
 import { wlanPassphrase } from "../../../api";
 import type { WlanSettings } from "../../../api";
-import { Row, Select, Toggle } from "../form";
+import { Row, Select, TextInput, Toggle } from "../form";
 import { PROTECTION } from "./form";
 import type { Protection, WlanSection } from "./form";
 import { SpeedLimitRow } from "./SpeedLimitRow";
@@ -54,12 +54,7 @@ export function Basics({
   return (
     <>
       <Row label="Name (SSID)">
-        <input
-          className="search"
-          maxLength={32}
-          value={f.name ?? ""}
-          onChange={(e) => set("name", e.target.value)}
-        />
+        <TextInput {...bind("name")} maxLength={32} />
       </Row>
       <Row label="Status">
         <Toggle {...bind("enabled")} label="Enabled" />
@@ -88,13 +83,11 @@ export function Basics({
           label="Password"
           hint={wlan ? "leave empty to keep it" : "8 to 63 characters"}
         >
-          <input
-            className="search"
-            type="text"
+          <TextInput
             autoComplete="off"
             placeholder={wlan?.has_passphrase ? "unchanged" : ""}
             value={password}
-            onChange={(e) => setPassword(e.target.value)}
+            onChange={setPassword}
           />
           {wlan?.has_passphrase && <ShowPassphrase id={wlan.id} />}
         </Row>

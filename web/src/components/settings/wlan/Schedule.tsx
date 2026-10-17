@@ -1,5 +1,6 @@
 import { useState } from "react";
 import { hhmm as time } from "../../../format";
+import { TextInput } from "../form";
 import type { Blackout } from "../../../api";
 
 const WEEK = ["sun", "mon", "tue", "wed", "thu", "fri", "sat"] as const;
@@ -51,11 +52,11 @@ export function ScheduleEditor({
         return (
           <div key={i} className="form-row">
             <div className="form-label">
-              <input
-                className="search"
+              <TextInput
                 placeholder="Name (optional)"
-                value={e.name ?? ""}
-                onChange={(ev) => update(i, { name: ev.target.value })}
+                aria-label="Name of the off period"
+                value={e.name}
+                onChange={(name) => update(i, { name })}
               />
             </div>
             <div className="form-control">

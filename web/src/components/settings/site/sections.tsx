@@ -4,6 +4,7 @@ import {
   NumberInput,
   Row,
   Select,
+  TextInput,
   Toggle,
   lines,
   onePerLine,
@@ -76,7 +77,7 @@ export function Ssh({
   d: SiteSettings;
   password: Secret;
 }) {
-  const { form: f, set, bind } = mgmt;
+  const { bind } = mgmt;
   const rules = "12+ characters with upper, lower, digit and symbol, or 20+";
   return (
     <details>
@@ -89,12 +90,7 @@ export function Ssh({
         />
       </Row>
       <Row label="User name">
-        <input
-          className="search"
-          maxLength={32}
-          value={f.x_ssh_username}
-          onChange={(e) => set("x_ssh_username", e.target.value)}
-        />
+        <TextInput {...bind("x_ssh_username")} maxLength={32} />
       </Row>
       <Row
         label="Password"
@@ -102,14 +98,13 @@ export function Ssh({
           d.mgmt.has_ssh_password ? `leave empty to keep it; ${rules}` : rules
         }
       >
-        <input
+        <TextInput
           className="search mono"
-          type="text"
           autoComplete="off"
           placeholder={d.mgmt.has_ssh_password ? "unchanged" : ""}
           size={30}
           value={password.value}
-          onChange={(e) => password.set(e.target.value)}
+          onChange={password.set}
         />
         <button
           className="btn small"
@@ -136,7 +131,7 @@ export function Ssh({
 }
 
 export function Logging({ syslog }: { syslog: SettingsForm<SyslogForm> }) {
-  const { form: f, set, bind } = syslog;
+  const { form: f, bind } = syslog;
   return (
     <details>
       <summary>Logging</summary>
@@ -154,11 +149,11 @@ export function Logging({ syslog }: { syslog: SettingsForm<SyslogForm> }) {
         />
         {f.mode === "server" && (
           <>
-            <input
+            <TextInput
+              {...bind("ip")}
               className="search mono"
               placeholder="server"
-              value={f.ip}
-              onChange={(e) => set("ip", e.target.value)}
+              aria-label="Syslog server"
             />
             <NumberInput {...bind("port")} fallback={514} min={1} max={65535} />
           </>
@@ -170,11 +165,11 @@ export function Logging({ syslog }: { syslog: SettingsForm<SyslogForm> }) {
           <Toggle {...bind("netconsole_enabled")} label="Enabled" />
           {f.netconsole_enabled && (
             <>
-              <input
+              <TextInput
+                {...bind("netconsole_host")}
                 className="search mono"
                 placeholder="host"
-                value={f.netconsole_host}
-                onChange={(e) => set("netconsole_host", e.target.value)}
+                aria-label="Netconsole host"
               />
               <NumberInput
                 {...bind("netconsole_port")}
@@ -199,18 +194,18 @@ export function Snmp({
   d: SiteSettings;
   v3password: Secret;
 }) {
-  const { form: f, set, bind } = snmp;
+  const { form: f, bind } = snmp;
   return (
     <details>
       <summary>SNMP</summary>
       <Row label="SNMP v1/v2c">
         <Toggle {...bind("enabled")} label="Enabled" />
         {f.enabled && (
-          <input
+          <TextInput
+            {...bind("community")}
             className="search mono"
             placeholder="community"
-            value={f.community}
-            onChange={(e) => set("community", e.target.value)}
+            aria-label="Community"
           />
         )}
       </Row>
@@ -218,14 +213,14 @@ export function Snmp({
         <Toggle {...bind("enabledV3")} label="Enabled" />
         {f.enabledV3 && (
           <>
-            <input
+            <TextInput
+              {...bind("username")}
               className="search mono"
               placeholder="user name"
               maxLength={30}
-              value={f.username}
-              onChange={(e) => set("username", e.target.value)}
+              aria-label="SNMPv3 user name"
             />
-            <input
+            <TextInput
               className="search mono"
               autoComplete="off"
               maxLength={32}
@@ -234,8 +229,9 @@ export function Snmp({
                   ? "password unchanged"
                   : "password (8 to 32)"
               }
+              aria-label="SNMPv3 password"
               value={v3password.value}
-              onChange={(e) => v3password.set(e.target.value)}
+              onChange={v3password.set}
             />
           </>
         )}
@@ -245,7 +241,7 @@ export function Snmp({
 }
 
 export function Ntp({ ntp }: { ntp: SettingsForm<NtpForm> }) {
-  const { form: f, set, bind } = ntp;
+  const { form: f, bind } = ntp;
   return (
     <details>
       <summary>Time servers</summary>
@@ -259,12 +255,12 @@ export function Ntp({ ntp }: { ntp: SettingsForm<NtpForm> }) {
         />
         {f.setting_preference === "manual" &&
           NTP_SERVERS.map((k, i) => (
-            <input
+            <TextInput
               key={k}
+              {...bind(k)}
               className="search mono"
               placeholder={i === 0 ? "pool.ntp.org" : ""}
-              value={f[k]}
-              onChange={(e) => set(k, e.target.value)}
+              aria-label={`NTP server ${i + 1}`}
             />
           ))}
       </Row>
