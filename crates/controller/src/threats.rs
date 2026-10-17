@@ -81,8 +81,10 @@ pub struct Assessment {
     pub aps: BTreeMap<String, Option<String>>,
     /// Our network names (from the APs and the imported settings).
     pub ssids: HashSet<String>,
-    /// Wi-Fi clients ever seen: MAC and display name.
-    pub clients: Vec<(String, Option<String>)>,
+    /// Wi-Fi clients ever seen, as stored (read now and then, see [`gather`]).
+    pub clients: Arc<[Client]>,
+    /// What the APs report now and the aliases, whose names win over the stored ones.
+    pub live_clients: Vec<Client>,
     pub heard: Vec<Heard>,
     /// When the first neighbouring network was recorded.
     pub watching_since: Ts,
@@ -137,8 +139,35 @@ pub struct Ack {
     pub ts: Ts,
 }
 
-/// Acknowledgements by (kind, bssid).
-pub type Acks = HashMap<(Kind, String), Ack>;
+/// Acknowledgements by kind, then BSSID (so one is found by `&str`).
+pub type Acks = HashMap<Kind, HashMap<String, Ack>>;
+
+/// The acknowledgement of a finding.
+fn ack_of<'a>(acks: &'a Acks, kind: Kind, bssid: &str) -> Option<&'a Ack> {
+    acks.get(&kind).and_then(|m| m.get(bssid))
+}
+
+/// A Wi-Fi client, for finding the hotspots next to its address.
+#[derive(Debug, Clone)]
+pub struct Client {
+    /// See [`mac_num`].
+    num: u64,
+    mac: String,
+    name: Option<String>,
+}
+
+/// Clients by MAC, with what [`assess`] looks them up by, in address order.
+fn sorted_clients(clients: HashMap<String, Option<String>>) -> Vec<Client> {
+    let mut out: Vec<Client> = clients.into_iter().filter_map(|(mac, name)| Some(Client { num: mac_num(&mac)?, mac, name })).collect();
+    out.sort_unstable_by(|a, b| (a.num, &a.mac).cmp(&(b.num, &b.mac)));
+    out
+}
+
+/// The clients of a list in address order whose address is within 8 of `n`.
+fn near_in(list: &[Client], n: u64) -> impl Iterator<Item = &Client> {
+    let from = list.partition_point(|c| c.num < n.saturating_sub(8));
+    list[from..].iter().take_while(move |c| c.num <= n + 8)
+}
 
 /// A MAC as a number with the locally-administered bit cleared, so the
 /// variants an AP or phone derives from one address sit next to each other.
@@ -264,13 +293,11 @@ pub fn assess(a: &Assessment) -> Vec<Finding> {
     // Addresses our APs and their radios use: anything this close is our hardware.
     let family: Vec<u64> = a.own.iter().map(|b| b.bssid.as_str()).chain(a.aps.keys().map(String::as_str)).filter_map(mac_num).collect();
     let is_family = |bssid: &str| mac_num(bssid).is_some_and(|n| family.iter().any(|f| near(n, *f, 16)));
-    // Clients by address, each with its place in the list (the first one near a BSSID is the one named).
-    let mut clients: Vec<(u64, usize, &str, Option<&String>)> =
-        a.clients.iter().enumerate().filter_map(|(i, (m, n))| mac_num(m).map(|x| (x, i, m.as_str(), n.as_ref()))).collect();
-    clients.sort_unstable();
+    // The client next to an address: of several, the first by MAC, with its live name first.
     let client_near = |n: u64| {
-        let from = clients.partition_point(|c| c.0 < n.saturating_sub(8));
-        clients[from..].iter().take_while(|c| c.0 <= n + 8).min_by_key(|c| c.1).map(|c| (c.2, c.3))
+        let mac = near_in(&a.clients, n).chain(near_in(&a.live_clients, n)).map(|c| c.mac.as_str()).min()?;
+        let name = |list| near_in(list, n).find(|c| c.mac == mac).and_then(|c| c.name.as_ref());
+        Some((mac, name(&a.live_clients).or_else(|| name(&a.clients))))
     };
     // Our network names, folded once (in name order, so the same one is named every time).
     let mut ours: Vec<&String> = a.ssids.iter().collect();
@@ -321,7 +348,7 @@ pub fn assess(a: &Assessment) -> Vec<Finding> {
                 target,
                 detail,
                 first_reported: a.reported.get(&key).copied(),
-                acknowledged: a.acks.get(&key).cloned(),
+                acknowledged: ack_of(&a.acks, kind, bssid).cloned(),
             });
         };
 
@@ -438,10 +465,12 @@ struct Cache {
     used: Vec<(String, String, Option<String>)>,
     /// Per BSSID: its last change, as last worked out.
     changes: HashMap<String, Change>,
-    /// When `names` and `watching_since` were read.
+    /// When `ap_names`, `clients` and `watching_since` were read.
     names_at: Ts,
-    /// The stored names of our APs and every client ever seen.
-    names: crate::connections::Names,
+    /// The stored names of our APs.
+    ap_names: HashMap<String, Option<String>>,
+    /// Every client ever seen, with its stored name, ready for [`assess`].
+    clients: Arc<[Client]>,
     /// When the first neighbouring network still kept was recorded.
     watching_since: Option<Ts>,
 }
@@ -528,7 +557,9 @@ pub fn gather(store: &Store, live: &SharedLive, now: Ts) -> anyhow::Result<Asses
     store.read(Db::Config, |c| {
         // The names and the first network heard change slowly, and reading them takes scans.
         if !(0..CACHE_SECS).contains(&(now - cache.names_at)) {
-            cache.names = crate::connections::Names::load(c)?;
+            let names = crate::connections::Names::load(c)?;
+            cache.ap_names = names.aps;
+            cache.clients = sorted_clients(names.clients).into();
             cache.watching_since = c.query_row("SELECT MIN(first_seen) FROM neighbors", [], |r| r.get::<_, Option<Ts>>(0))?;
             cache.names_at = now;
         }
@@ -561,10 +592,12 @@ pub fn gather(store: &Store, live: &SharedLive, now: Ts) -> anyhow::Result<Asses
         }
         Ok(())
     })?;
-    let mut names = cache.names.clone();
+    // Our APs and every Wi-Fi client ever seen, with their names (aliases
+    // first): the stored clients as they were read, what is live on top.
+    let mut names = crate::connections::Names { aps: cache.ap_names.clone(), clients: HashMap::new() };
+    a.clients = cache.clients.clone();
     drop(cache);
     a.acks = with_acks(store, |acks| acks.clone())?;
-    // Our APs and every Wi-Fi client ever seen, with their names (aliases first).
     names.add_live(&live.read().unwrap());
     for (mac, name) in names.aps {
         let e = a.aps.entry(mac).or_insert(None);
@@ -572,8 +605,7 @@ pub fn gather(store: &Store, live: &SharedLive, now: Ts) -> anyhow::Result<Asses
             *e = name;
         }
     }
-    a.clients = names.clients.into_iter().collect();
-    a.clients.sort();
+    a.live_clients = sorted_clients(names.clients);
     Ok(a)
 }
 
@@ -700,7 +732,7 @@ fn load_acks(c: &Connection) -> rusqlite::Result<Acks> {
     for row in stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get(2)?, r.get(3)?)))? {
         let (k, b, note, ts) = row?;
         if let Some(k) = Kind::parse(&k) {
-            acks.insert((k, b), Ack { note, ts });
+            acks.entry(k).or_default().insert(b, Ack { note, ts });
         }
     }
     Ok(acks)
@@ -744,13 +776,19 @@ struct Served<'a> {
 /// GET /api/rf/threats
 pub async fn list(State(s): State<AppState>) -> Result<Response, ApiError> {
     let (list, watching_since) = findings(&s).await?;
-    let acks = ACKS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    // Each finding's acknowledgement as it is now, copied out so that the lock
+    // is not held for the vendor lookups and the writing out. Read with the
+    // findings, unless that failed: then as the findings had them.
+    let acks: Option<Vec<Option<Ack>>> = {
+        let acks = ACKS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        acks.as_ref().map(|a| list.iter().map(|f| ack_of(a, f.kind, &f.bssid).cloned()).collect())
+    };
     let items: Vec<Served> = list
         .iter()
-        .map(|f| Served {
+        .enumerate()
+        .map(|(i, f)| Served {
             finding: f,
-            // Read with the findings, unless that failed: then as the findings had them.
-            acknowledged: acks.as_ref().map_or(f.acknowledged.as_ref(), |a| a.get(&(f.kind, f.bssid.clone()))),
+            acknowledged: acks.as_ref().map_or(f.acknowledged.as_ref(), |a| a[i].as_ref()),
             // Vendors help tell a neighbour's router from a laptop or phone.
             vendor: s.vendors.lookup_str(&f.bssid),
         })
@@ -762,7 +800,6 @@ pub async fn list(State(s): State<AppState>) -> Result<Response, ApiError> {
     }
     // Written out here: what is sent borrows the findings and acknowledgements.
     let body = serde_json::to_string(&Body { watching_since, findings: items }).map_err(anyhow::Error::from)?;
-    drop(acks);
     Ok(([(header::CONTENT_TYPE, "application/json")], body).into_response())
 }
 
@@ -807,11 +844,13 @@ fn set_ack(store: &Store, writer: &Writer, kind: Kind, bssid: String, ack: Optio
             Some(a) => {
                 let sql = "INSERT OR REPLACE INTO network_acks (kind, bssid, note, ts) VALUES (?1, ?2, ?3, ?4)";
                 writer.exec(Db::Config, sql, vec![k, Sql::Text(bssid.clone()), a.note.clone().map_or(Sql::Null, Sql::Text), Sql::Integer(a.ts)]);
-                acks.insert((kind, bssid), a);
+                acks.entry(kind).or_default().insert(bssid, a);
             }
             None => {
                 writer.exec(Db::Config, "DELETE FROM network_acks WHERE kind = ?1 AND bssid = ?2", vec![k, Sql::Text(bssid.clone())]);
-                acks.remove(&(kind, bssid));
+                if let Some(m) = acks.get_mut(&kind) {
+                    m.remove(&bssid);
+                }
             }
         }
     })
@@ -904,7 +943,7 @@ mod tests {
             a.own.push(OwnBss { bssid: b.into(), ap_mac: ap.into(), essid: Some(e.into()), channel: Some(ch), changed_at: 0 });
             a.ssids.insert(e.into());
         }
-        a.clients.push(("3c:55:76:00:00:03".into(), Some("phone".into())));
+        a.clients = sorted_clients([("3c:55:76:00:00:03".into(), Some("phone".into()))].into()).into();
         // Our APs hear each other normally.
         a.heard.push(heard("78:45:58:3c:52:be", UP, "Home", 48, "WPA2-Personal (AES/CCMP)", -81));
         a.heard.push(heard("78:45:58:3c:51:ae", DOWN, "Home", 44, "WPA2-Personal (AES/CCMP)", -84));
@@ -981,6 +1020,18 @@ mod tests {
         let f = assess(&a);
         assert_eq!((f[0].kind, f[0].target.as_deref()), (Kind::Bridged, Some("3c:55:76:00:00:03")));
         assert!(f[0].detail.contains("phone"));
+        // A live name (an alias) wins over the stored one; a live client with
+        // none keeps the stored one.
+        a.live_clients = sorted_clients([("3c:55:76:00:00:03".into(), Some("Ann's phone".into()))].into());
+        assert!(assess(&a)[0].detail.contains("Ann's phone"));
+        a.live_clients = sorted_clients([("3c:55:76:00:00:03".into(), None)].into());
+        assert!(assess(&a)[0].detail.contains("phone"));
+        // Of two clients next to it, the first by MAC is named, wherever it is listed.
+        a.live_clients = sorted_clients([("3c:55:76:00:00:02".into(), Some("tablet".into()))].into());
+        assert_eq!(assess(&a)[0].target.as_deref(), Some("3c:55:76:00:00:02"));
+        // A client only seen live counts too.
+        a.clients = Arc::from([]);
+        assert_eq!(assess(&a)[0].target.as_deref(), Some("3c:55:76:00:00:02"));
     }
 
     #[test]
@@ -1123,7 +1174,7 @@ mod tests {
         assert!(writer.flush(Duration::from_secs(5)));
         let now = 1_000_000;
         let a = gather(&store, &live, now).unwrap();
-        assert_eq!(a.acks[&(Kind::Lookalike, "02:00:00:00:00:01".to_string())].note.as_deref(), Some("stored"));
+        assert_eq!(a.acks[&Kind::Lookalike]["02:00:00:00:00:01"].note.as_deref(), Some("stored"));
         assert_eq!((a.watching_since, a.clients.len()), (100, 1));
         // Acknowledging shows in the next gather, and is written.
         set_ack(&store, &writer, Kind::Bridged, "02:00:00:00:00:02".into(), Some(Ack { note: None, ts: 7 })).unwrap();
@@ -1132,7 +1183,7 @@ mod tests {
         exec("INSERT INTO clients (mac, hostname) VALUES ('02:00:00:00:01:02', 'laptop')");
         assert!(writer.flush(Duration::from_secs(5)));
         let a = gather(&store, &live, now + 60).unwrap();
-        assert_eq!(a.acks.keys().collect::<Vec<_>>(), [&(Kind::Bridged, "02:00:00:00:00:02".to_string())]);
+        assert_eq!(a.acks.iter().flat_map(|(k, m)| m.keys().map(move |b| (*k, b.as_str()))).collect::<Vec<_>>(), [(Kind::Bridged, "02:00:00:00:00:02")]);
         let stored: Vec<String> = store.read(Db::Config, |c| Ok(c.prepare("SELECT kind FROM network_acks")?.query_map([], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?)).unwrap();
         assert_eq!(stored, ["bridged"]);
         // The first network heard and the clients are read again only now and then.
@@ -1146,7 +1197,7 @@ mod tests {
     fn acknowledgements_are_per_kind_and_bssid() {
         let mut a = site();
         a.heard.push(heard("02:aa:bb:cc:dd:ee", UP, "H0me", 36, "Open", -70));
-        a.acks.insert((Kind::Lookalike, "02:aa:bb:cc:dd:ee".into()), Ack { note: Some("the neighbours".into()), ts: 5 });
+        a.acks.entry(Kind::Lookalike).or_default().insert("02:aa:bb:cc:dd:ee".into(), Ack { note: Some("the neighbours".into()), ts: 5 });
         assert_eq!((Kind::parse("lookalike"), json!(Kind::NewNearby)), (Some(Kind::Lookalike), json!("new_nearby")), "named as stored");
         let f = assess(&a);
         assert_eq!(f[0].acknowledged.as_ref().and_then(|x| x.note.as_deref()), Some("the neighbours"));

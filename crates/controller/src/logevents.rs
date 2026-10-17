@@ -103,13 +103,22 @@ struct Crash {
     lines: Vec<String>,
     /// The size of `lines`, against [`CRASH_BYTES`].
     bytes: usize,
+    /// Set at the first line that did not fit: later ones are not kept (nor
+    /// formatted), so the capture has no holes.
+    full: bool,
 }
 
 impl Crash {
-    fn push(&mut self, line: String) {
+    fn push(&mut self, line: impl FnOnce() -> String) {
+        if self.full {
+            return;
+        }
+        let line = line();
         if self.lines.len() < CRASH_LINES && self.bytes + line.len() <= CRASH_BYTES {
             self.bytes += line.len();
             self.lines.push(line);
+        } else {
+            self.full = true;
         }
     }
 }
@@ -159,7 +168,7 @@ fn mac(s: &str) -> Option<Mac> {
 }
 
 /// Meaning of an 802.11v BSS Transition Management response status.
-pub fn btm_status(code: i64) -> &'static str {
+fn btm_status(code: i64) -> &'static str {
     match code {
         0 => "accepted",
         1 => "rejected (unspecified)",
@@ -180,7 +189,7 @@ impl LogEvents {
     /// clients must not become a flood of events).
     fn fresh(&mut self, kind: EventKind, client: Mac, detail: i64, ts: Ts, secs: Ts) -> bool {
         match self.recent.get_mut(&(kind, client, detail)) {
-            Some(t) if ts - *t < secs => false,
+            Some(t) if (0..secs).contains(&(ts - *t)) => false,
             Some(t) => {
                 *t = ts;
                 true
@@ -255,7 +264,7 @@ impl LogEvents {
                 let client = r.split(']').next().and_then(mac);
                 let status = field(msg, "status ").and_then(|v| v.parse::<i64>().ok());
                 if let (Some(c), Some(st)) = (client, status) {
-                    let req = self.steering.remove(&c).filter(|s| line.ts - s.ts <= 30).unwrap_or_default();
+                    let req = self.steering.remove(&c).filter(|s| (0..=30).contains(&(line.ts - s.ts))).unwrap_or_default();
                     let to = field(msg, "bssid ").filter(|b| *b != "n/a").map(str::to_string);
                     if self.fresh(EventKind::ClientSteered, c, st, line.ts, 600) {
                         out.push(Found {
@@ -291,7 +300,7 @@ impl LogEvents {
             if let Some(c) = client
                 && !reasons.is_empty()
             {
-                let changed = self.anomalies.get(&c).is_none_or(|(r, t)| *r != reasons || line.ts - t >= 1800);
+                let changed = self.anomalies.get(&c).is_none_or(|(r, t)| *r != reasons || !(0..1800).contains(&(line.ts - t)));
                 if changed && bounded(&mut self.anomalies, c, (reasons.clone(), line.ts)) {
                     out.push(Found {
                         kind: EventKind::ClientExperience,
@@ -320,7 +329,7 @@ impl LogEvents {
         let is_fault = fault.is_some();
         let text = || prog.map_or_else(|| msg.to_string(), |p| format!("{p}: {msg}"));
         if let Some(c) = self.crashes.get_mut(&dev) {
-            c.push(text());
+            c.push(text);
             if let Some((CrashKind::Panic, _)) = fault {
                 c.kind = CrashKind::Panic;
                 out.extend(self.flush(dev, line.ts));
@@ -329,8 +338,8 @@ impl LogEvents {
             && self.crash_reported.get(&dev).is_none_or(|t| !(0..CRASH_COOLDOWN).contains(&(line.ts - t)))
             && self.crashes.len() < MAX_CRASHES
         {
-            let mut crash = Crash { started: line.ts, kind, process, lines: Vec::new(), bytes: 0 };
-            crash.push(text());
+            let mut crash = Crash { started: line.ts, kind, process, lines: Vec::new(), bytes: 0, full: false };
+            crash.push(text);
             self.crashes.insert(dev, crash);
             if kind == CrashKind::Panic {
                 out.extend(self.flush(dev, line.ts));
@@ -348,15 +357,15 @@ impl LogEvents {
 
     /// Reports crash captures that have collected long enough.
     pub fn tick(&mut self, now: Ts) -> Vec<Found> {
-        let due: Vec<Mac> = self.crashes.iter().filter(|(_, c)| now - c.started >= CRASH_WINDOW).map(|(k, _)| *k).collect();
+        let due: Vec<Mac> = self.crashes.iter().filter(|(_, c)| !(0..CRASH_WINDOW).contains(&(now - c.started))).map(|(k, _)| *k).collect();
         let mut out: Vec<Found> = due.into_iter().filter_map(|k| self.flush(k, now)).collect();
         self.crash_reported.retain(|_, t| (0..CRASH_COOLDOWN).contains(&(now - *t)));
         // Forget old de-duplication and steering state.
-        self.recent.retain(|_, t| now - *t < 3600);
-        self.steering.retain(|_, s| now - s.ts < 300);
+        self.recent.retain(|_, t| (0..3600).contains(&(now - *t)));
+        self.steering.retain(|_, s| (0..300).contains(&(now - s.ts)));
         let steering = &self.steering;
         self.steering_by_device.retain(|_, c| steering.contains_key(c));
-        self.anomalies.retain(|_, (_, t)| now - *t < 3 * 3600);
+        self.anomalies.retain(|_, (_, t)| (0..3 * 3600).contains(&(now - *t)));
         // Every one is a crash: in AP order rather than the map's.
         out.sort_by_key(|f| f.device);
         out
@@ -377,7 +386,7 @@ mod tests {
 
     /// A netconsole line from the AP: no priority, and the kernel's text as it is.
     fn netconsole(ts: Ts, raw: &str) -> LogLine {
-        crate::syslog::parse(ts, "192.168.1.6".into(), AP.parse().ok(), raw)
+        crate::syslog::parse(ts, "192.168.1.6", AP.parse().ok(), raw)
     }
 
     #[test]
@@ -391,6 +400,27 @@ mod tests {
         assert_eq!(f[0].data["signal"], -76);
         // The same kick logged again moments later is one event.
         assert!(l.feed(&line(101, "stamgr", "kick-sta-on 6c:ac:c2:00:00:01 wifi1ap1 (reason:Low RSSI rssi:19)")).is_empty());
+    }
+
+    #[test]
+    fn a_clock_step_back_does_not_silence_events() {
+        let mut l = LogEvents::default();
+        let kick = "kick-sta-on 6c:ac:c2:00:00:01 wifi1ap1 (reason:Low RSSI rssi:19)";
+        let m = "wireless_agg_stats.log_sta_anomalies(): sta=92:00:00:00:00:05 signal=-48 satisfaction_now=70 anomalies=low_phy_rate";
+        assert_eq!((l.feed(&line(10_000, "stamgr", kick)).len(), l.feed(&line(10_000, "mcad", m)).len()), (1, 1));
+        // The clock goes back an hour: the same lines are new again, not 59 minutes away.
+        assert_eq!((l.feed(&line(6_400, "stamgr", kick)).len(), l.feed(&line(6_400, "mcad", m)).len()), (1, 1));
+        assert!(l.feed(&line(6_410, "stamgr", kick)).is_empty(), "and repeats are held back as usual");
+        // A capture started before the step is reported, not held until the clock catches up.
+        assert!(l.feed(&line(10_000, "kernel", "Internal error: Oops: 17 [#1] SMP ARM")).is_empty());
+        assert_eq!(l.tick(6_420).len(), 1);
+        // What was tracked "in the future" is forgotten.
+        assert!(l.recent.is_empty() || l.recent.values().all(|t| *t <= 6_420));
+        // A steering answer pairs only with a request made before it.
+        let p = "wlan: [0:I:ANY] [UNSPECIFIED] vap-0(wifi1ap1):";
+        l.feed(&line(9_000, "kernel", &format!("{p}BTM: STA 6c:ac:c2:00:00:02 RSSI: -77, candidates: 1, error: 0, flags: ALLOW (0x1)")));
+        let f = l.feed(&line(6_430, "kernel", &format!("{p}BTM: Received response from [6c:ac:c2:00:00:02](len = 5): dialog_token 1, status 0, delay 0, bssid n/a, cancel 0")));
+        assert_eq!(f[0].data["signal"], Value::Null);
     }
 
     #[test]
@@ -523,8 +553,11 @@ mod tests {
         for _ in 0..100 {
             l.feed(&line(1, "kernel", &long));
         }
+        // Once a line did not fit, a short one after it is not kept either: no holes.
+        l.feed(&line(1, "kernel", "short"));
         let c = &l.crashes[&AP.parse::<Mac>().unwrap()];
         assert!(c.bytes <= CRASH_BYTES && c.lines.len() < 10, "{} lines", c.lines.len());
+        assert!(c.full && c.lines.last().is_some_and(|l| l.ends_with('x')));
         // At most so many captures at once, reported in AP order.
         for i in 0..MAX_CRASHES + 10 {
             let mut f = line(0, "kernel", "Internal error: Oops: 17 [#1] SMP ARM");
