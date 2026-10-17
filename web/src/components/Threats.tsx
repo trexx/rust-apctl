@@ -1,8 +1,8 @@
 import { useState } from "react";
-import { Link } from "react-router-dom";
+import { Link } from "react-router";
 import { ackThreat, keys, useCanEdit, useThreats } from "../api";
 import type { ThreatFinding } from "../api";
-import { ago, band, duration } from "../format";
+import { ago, band, duration, useNow } from "../format";
 import { ErrorNote, Loading, Signal, useRunner } from "./common";
 
 const KIND_LABEL: Record<ThreatFinding["kind"], string> = {
@@ -20,6 +20,7 @@ function Finding({ f, readOnly }: { f: ThreatFinding; readOnly: boolean }) {
   const [note, setNote] = useState("");
   // The engine writes asynchronously: refresh once it has.
   const { busy, msg, run } = useRunner([keys.threats()], 1500);
+  const now = useNow();
   const ack = (on: boolean, why?: string) =>
     void run(async () => {
       await ackThreat(f.kind, f.bssid, on, why);
@@ -63,7 +64,7 @@ function Finding({ f, readOnly }: { f: ThreatFinding; readOnly: boolean }) {
           ))}
         </span>
         <span>
-          first seen {ago(f.first_seen)}, last {ago(f.last_seen)}
+          first seen {ago(f.first_seen, now)}, last {ago(f.last_seen, now)}
         </span>
         {f.kind === "bridged" && f.target && (
           <Link to={`/clients/${f.target}`}>view client</Link>
@@ -71,7 +72,7 @@ function Finding({ f, readOnly }: { f: ThreatFinding; readOnly: boolean }) {
       </div>
       {f.acknowledged ? (
         <div className="threat-ack small">
-          Dismissed {ago(f.acknowledged.ts)}
+          Dismissed {ago(f.acknowledged.ts, now)}
           {f.acknowledged.note && <>: “{f.acknowledged.note}”</>}
           {!readOnly && (
             <button

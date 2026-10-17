@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { Link } from "react-router-dom";
+import { Link } from "react-router";
 import { useMulticast } from "../../api";
 import type { SiteMulticast, TimeSpan } from "../../api";
 import { compact } from "../../format";

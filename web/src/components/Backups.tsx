@@ -10,7 +10,7 @@ import {
   useCanEdit,
 } from "../api";
 import type { BackupManifest, BackupMeta, BackupSettings } from "../api";
-import { ago, bytes, dateTime as when, hhmm } from "../format";
+import { ago, bytes, dateTime as when, hhmm, useNow } from "../format";
 import { ErrorNote, Loading, Outcome, useRunner } from "./common";
 
 const HISTORY: [number, string][] = [
@@ -257,6 +257,7 @@ function ConfirmRestore({
 export function BackupSection() {
   const b = useBackups();
   const readOnly = !useCanEdit();
+  const now = useNow();
   const [days, setDays] = useState(0);
   // Only failures are reported; success shows in the list.
   const { busy, msg, run } = useRunner([keys.backups()], 300);
@@ -441,7 +442,7 @@ export function BackupSection() {
                 <tr key={x.name}>
                   <td className="nowrap">
                     {when(x.created)}{" "}
-                    <span className="muted small">({ago(x.created)})</span>
+                    <span className="muted small">({ago(x.created, now)})</span>
                   </td>
                   <td>
                     {KIND[x.kind]}

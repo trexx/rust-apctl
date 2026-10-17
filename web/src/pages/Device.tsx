@@ -1,5 +1,5 @@
 import { Suspense } from "react";
-import { Link, useParams } from "react-router-dom";
+import { Link, useParams } from "react-router";
 import {
   displayName,
   useCanEdit,
@@ -39,6 +39,7 @@ import {
   duration,
   pct,
   phy,
+  useNow,
 } from "../format";
 import { MulticastPanel } from "../components/insights/Multicast";
 import {
@@ -55,6 +56,18 @@ const DeviceSettingsPanel = lazyNamed(
   "DeviceSettingsPanel",
 );
 
+/** The uplink's state: down, else its speed, else "—" (the AP doesn't say). */
+const uplinkText = (u: {
+  up: boolean | null;
+  speed: number | null;
+  full_duplex: boolean | null;
+}) =>
+  u.up === false
+    ? "down"
+    : u.speed
+      ? `${u.speed} Mbps${u.full_duplex ? " FD" : ""}`
+      : "—";
+
 /** Keyed by MAC: nothing typed or shown for one AP carries over to the next. */
 export function Device() {
   const mac = useParams().mac ?? "";
@@ -64,6 +77,7 @@ export function Device() {
 function DevicePage({ mac }: { mac: string }) {
   const [range, setRange] = useTimeSpan(6 * 3600);
   const detail = useDevice(mac);
+  const now = useNow();
   // Read-only users get neither the editor's code nor the AP's settings.
   const canEdit = useCanEdit();
 
@@ -80,7 +94,7 @@ function DevicePage({ mac }: { mac: string }) {
         <div className="page">
           <div className="page-head">
             <h1>
-              <Dot ok={d.online} warn={d.reconfiguring} /> {ap.hostname ?? mac}
+              <Dot ok={d.online} /> {ap.hostname ?? mac}
             </h1>
             <span className="muted">
               {ap.model_display ?? ap.model} · {ap.version} · {ap.ip} ·{" "}
@@ -100,11 +114,6 @@ function DevicePage({ mac }: { mac: string }) {
               <DeviceSettingsPanel mac={mac} />
             </Suspense>
           )}
-          {d.reconfiguring && (
-            <div className="banner">
-              Applying a configuration change. Client data resumes in a moment.
-            </div>
-          )}
           {d.stored_only && (
             <div className="banner">
               This AP hasn't reported since apctl started, so only its stored
@@ -119,8 +128,8 @@ function DevicePage({ mac }: { mac: string }) {
               value={d.online ? "Online" : "Offline"}
               sub={
                 d.interval
-                  ? `seen ${ago(d.last_seen)}, every ~${d.interval}s`
-                  : `last seen ${ago(d.last_seen)}`
+                  ? `seen ${ago(d.last_seen, now)}, every ~${d.interval}s`
+                  : `last seen ${ago(d.last_seen, now)}`
               }
             />
             <Stat label="Uptime" value={duration(ap.uptime)} />
@@ -137,7 +146,7 @@ function DevicePage({ mac }: { mac: string }) {
             <Stat
               label="Memory"
               value={ap.mem_used !== null ? bytes(ap.mem_used) : "—"}
-              sub={`of ${bytes(ap.mem_total)}${up ? ` · uplink ${up.ifname} ${up.speed ? `${up.speed} Mbps${up.full_duplex ? " FD" : ""}` : "down"}` : ""}`}
+              sub={`of ${bytes(ap.mem_total)}${up ? ` · uplink ${up.ifname} ${uplinkText(up)}` : ""}`}
             />
             {up && (
               <Stat
@@ -217,9 +226,10 @@ function DevicePage({ mac }: { mac: string }) {
                           {displayName(c)}
                         </Link>
                       </td>
-                      <td>{c.sample.essid}</td>
+                      <td>{c.sample.essid ?? "—"}</td>
                       <td>
-                        {band(c.sample.radio)} ch {c.sample.channel}
+                        {band(c.sample.radio)}
+                        {c.sample.channel ? ` ch ${c.sample.channel}` : ""}
                       </td>
                       <td>
                         <Signal dbm={c.sample.signal} />

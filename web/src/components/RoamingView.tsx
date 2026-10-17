@@ -1,4 +1,4 @@
-import { Link } from "react-router-dom";
+import { Link } from "react-router";
 import { useRoaming } from "../api";
 import type { Roaming } from "../api";
 import { RangePicker, useTimeSpan } from "./Chart";

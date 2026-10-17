@@ -3,11 +3,12 @@ import { ErrorNote, Loading, Outcome, useRunner } from "../components/common";
 import { NotificationSettings } from "../components/Alerts";
 import { BackupSection } from "../components/Backups";
 import { SiteSettingsPanel } from "../components/SettingsEditor";
-import { ago, clock } from "../format";
+import { ago, clock, useNow } from "../format";
 
 export function Settings() {
   const state = useSettingsState();
   const canEdit = useCanEdit();
+  const now = useNow();
   const { busy, msg, run } = useRunner([keys.settingsState()], 500);
 
   const onFile = (file: File | undefined) => {
@@ -41,7 +42,8 @@ export function Settings() {
           <div className="kv kv-wide">
             <span>Imported</span>
             <span>
-              {clock(state.data!.imported_at!)} ({ago(state.data!.imported_at)})
+              {clock(state.data!.imported_at!, now)} (
+              {ago(state.data!.imported_at, now)})
             </span>
             <span>SSIDs</span>
             <span>{s.wlans.join(", ") || "none"}</span>
