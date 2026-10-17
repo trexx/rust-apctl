@@ -487,10 +487,17 @@ pub fn create(b: &Backups, src_dir: &Path, kind: Kind, days: i64) -> Result<Meta
             let gz = tar.into_inner()?;
             gz.finish()?.finish()?.sync_all()?;
         }
-        fs::rename(&part, dir.join(&name))?;
-        let size = fs::metadata(dir.join(&name))?.len();
+        // The description is in place, whole and synced, before the backup
+        // is: a backup is never without one, and one left without its backup
+        // (by a crash) is removed at the next start.
+        let size = fs::metadata(&part)?.len();
         let meta = Meta { name: name.clone(), kind, version: VERSION.into(), created: now, days, size, encrypted: b.key.is_some() };
-        fs::write(dir.join(format!("{name}.json")), serde_json::to_vec_pretty(&meta)?)?;
+        let mut f = fs::OpenOptions::new().write(true).create_new(true).open(tmp.join("meta.json"))?;
+        f.write_all(&serde_json::to_vec_pretty(&meta)?)?;
+        f.sync_all()?;
+        fs::rename(tmp.join("meta.json"), dir.join(format!("{name}.json")))?;
+        fs::rename(&part, dir.join(&name))?;
+        sync_dir(&dir)?;
         if kind == Kind::Auto
             && let Some(last) = &mut b.known().last_auto
         {
@@ -502,6 +509,7 @@ pub fn create(b: &Backups, src_dir: &Path, kind: Kind, days: i64) -> Result<Meta
         // Nothing half-written stays behind (the name is this call's own).
         let _ = fs::remove_file(&part);
         let _ = fs::remove_file(dir.join(&name));
+        let _ = fs::remove_file(dir.join(format!("{name}.json")));
     }
     let _ = fs::remove_dir_all(&tmp);
     result
@@ -731,12 +739,14 @@ fn sync_dir(dir: &Path) -> Result<()> {
 }
 
 /// Deletes what a backup cut off half way (a crash, a restart) left in the
-/// backups directory: its snapshot copies and its unfinished archive. Only at
-/// start, when no backup can be in progress.
+/// backups directory: its snapshot copies, its unfinished archive and a
+/// description without its backup. Only at start, when no backup can be in
+/// progress.
 fn clean_unfinished(b: &Backups) {
     for e in fs::read_dir(b.dir()).into_iter().flatten().flatten() {
         let name = e.file_name().to_string_lossy().into_owned();
-        if name.starts_with(".tmp-") || name.ends_with(".apb.part") {
+        let orphan = name.strip_suffix(".json").is_some_and(|apb| apb.ends_with(".apb") && !b.dir().join(apb).exists());
+        if name.starts_with(".tmp-") || name.ends_with(".apb.part") || orphan {
             let p = e.path();
             tracing::info!("removing {name}, left by a backup that did not finish");
             let _ = if p.is_dir() { fs::remove_dir_all(&p) } else { fs::remove_file(&p) };
@@ -1253,9 +1263,12 @@ mod tests {
         fs::create_dir_all(b.dir().join(".tmp-1-2-ab")).unwrap();
         fs::write(b.dir().join(".tmp-1-2-ab").join("config.db"), "x").unwrap();
         fs::write(b.dir().join("apctl-0.1.0-20260101-000000.apb.part"), "x").unwrap();
+        fs::write(b.dir().join("apctl-0.1.0-20260101-000000.apb.json"), "{}").unwrap();
         apply_pending(&b);
         let left: Vec<String> = fs::read_dir(b.dir()).unwrap().flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect();
         assert!(left.iter().all(|n| !n.starts_with(".tmp-") && !n.ends_with(".part")), "{left:?}");
+        assert!(!left.iter().any(|n| n.starts_with("apctl-0.1.0-")), "a description without its backup goes: {left:?}");
+        assert!(left.contains(&format!("{}.json", m.name)), "{left:?}");
         assert!(list(&b).iter().any(|x| x.name == m.name), "finished backups are kept");
     }
 
