@@ -571,6 +571,8 @@ impl Engine {
         }
     }
 
+    /// Stores an event and tells the live subscribers; the alert watcher gets
+    /// the event itself, last, so it is not copied.
     fn emit(&self, ev: Event) {
         bump(&self.counters.events);
         self.writer.exec(
@@ -584,10 +586,10 @@ impl Engine {
                 Sql::Text(ev.data.to_string()),
             ],
         );
-        if let Some(a) = &self.alerts {
-            a.offer(&ev);
-        }
         let _ = self.tx.send(LiveMsg::Event(EventHead { kind: ev.kind, device_mac: ev.device_mac, client_mac: ev.client_mac }));
+        if let Some(a) = &self.alerts {
+            a.offer(ev);
+        }
     }
 
     fn inform(&mut self, ts: Ts, peer: String, decoded: Decoded) {
