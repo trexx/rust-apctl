@@ -13,8 +13,8 @@ import {
   useUserGroups,
 } from "../api";
 import type { Mac, Names } from "../api";
-import { speed } from "../format";
 import { Outcome, useRunner } from "./common";
+import { speedLimitOptions } from "./settings/speedLimitOptions";
 
 /** Whether actions can be used: active mode, signed in. */
 function useCanAct(): { can: boolean; why: string | null } {
@@ -139,9 +139,7 @@ export function ClientActions({
     keys.clients(),
     keys.settings("usergroups"),
   ]);
-  const groups = (useUserGroups(can).data?.groups ?? []).filter(
-    (g) => !g.default,
-  );
+  const limits = speedLimitOptions(useUserGroups(can).data?.groups ?? []);
   if (!can && !why) return null;
   const off = !can || busy;
   return (
@@ -201,7 +199,7 @@ export function ClientActions({
             ))}
           </select>
         </label>
-        {groups.length > 0 && (
+        {limits.length > 0 && (
           <label className="small">
             Speed limit{" "}
             <select
@@ -218,12 +216,7 @@ export function ClientActions({
               }}
             >
               <option value="">Same as its SSID</option>
-              {groups.map((g) => (
-                <option key={g.id} value={g.id}>
-                  {g.name} (down {speed(g.qos_rate_max_down)}, up{" "}
-                  {speed(g.qos_rate_max_up)})
-                </option>
-              ))}
+              {limits}
             </select>
           </label>
         )}
