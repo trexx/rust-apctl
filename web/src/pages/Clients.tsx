@@ -128,12 +128,13 @@ function ClientList({ tabs }: { tabs: React.ReactNode }) {
           c.ap_name,
         ].some((v) => v?.toLowerCase().includes(f)),
     )
-    .sort((a, b) => {
-      const x = value(a, sort.key);
-      const y = value(b, sort.key);
+    // Each client's key worked out once, not in every comparison.
+    .map((c) => [value(c, sort.key), c] as const)
+    .sort(([x], [y]) => {
       const cmp = x < y ? -1 : x > y ? 1 : 0;
       return sort.desc ? -cmp : cmp;
-    });
+    })
+    .map(([, c]) => c);
 
   if (clients.isLoading) return <Loading />;
   if (clients.error) return <ErrorNote error={clients.error} />;
