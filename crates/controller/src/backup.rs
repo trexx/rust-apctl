@@ -623,24 +623,47 @@ fn valid_id(id: &str) -> bool {
 /// the current state as a pre-restore backup, then swaps the staged files in.
 /// A settings-only backup leaves the current statistics and logs in place.
 ///
-/// A restore that fails is logged and set aside (`pending.failed`, shown on
-/// the backups page) and apctl starts with the data it has, rather than
-/// failing on every start. Also clears out staging left behind.
+/// A restore that fails before any file has left staging is logged and set
+/// aside (`pending.failed`, shown on the backups page) and apctl starts with
+/// the data it has, rather than failing on every start. One that fails part
+/// way keeps its marker and is taken up again at the next start: the files
+/// already moved have no other copy. Also clears out staging left behind.
 pub fn apply_pending(b: &Backups) {
     clean_unfinished(b);
     let marker = b.staging().join("pending");
-    if let Ok(id) = fs::read_to_string(&marker) {
-        match apply(b, id.trim()) {
-            Ok(()) => {
-                let _ = fs::remove_file(&marker);
-                let _ = fs::remove_file(b.staging().join("pending.failed"));
-                tracing::warn!("restore complete");
+    match fs::read_to_string(&marker) {
+        Ok(id) => {
+            let mut under_way = false;
+            match apply(b, id.trim(), &mut under_way) {
+                Ok(()) => {
+                    // The marker goes before the staged files: a crash in between
+                    // must not show a finished restore as failed.
+                    let _ = fs::remove_file(&marker);
+                    let _ = fs::remove_file(b.staging().join("pending.failed"));
+                    let _ = sync_dir(&b.staging());
+                    let _ = fs::remove_dir_all(b.staging().join(id.trim()));
+                    tracing::warn!("restore complete");
+                }
+                Err(e) if under_way => {
+                    tracing::error!("the staged restore failed part way; it is tried again at the next start: {e:#}");
+                }
+                Err(e) => {
+                    tracing::error!("the staged restore failed; starting with the current data: {e:#}");
+                    let failed = b.staging().join("pending.failed");
+                    if fs::write(&failed, format!("{e:#}")).is_err() || fs::remove_file(&marker).is_err() {
+                        let _ = fs::rename(&marker, &failed);
+                    }
+                }
             }
-            Err(e) => {
-                tracing::error!("the staged restore failed; starting with the current data: {e:#}");
-                let failed = b.staging().join("pending.failed");
-                if fs::write(&failed, format!("{e:#}")).is_err() || fs::remove_file(&marker).is_err() {
-                    let _ = fs::rename(&marker, &failed);
+        }
+        // Files beside their place belong to a restore under way: only
+        // without one are they left over (from a restore since replaced).
+        Err(_) => {
+            for n in DATABASES {
+                let p = b.data_dir.join(format!("{n}.restoring"));
+                if p.exists() {
+                    tracing::info!("removing {}, left by a restore that did not finish", p.display());
+                    let _ = fs::remove_file(&p);
                 }
             }
         }
@@ -648,7 +671,10 @@ pub fn apply_pending(b: &Backups) {
     clean_staging(b);
 }
 
-fn apply(b: &Backups, id: &str) -> Result<()> {
+/// Swaps a staged restore in. `under_way` is set once a file has left
+/// staging (or had in an earlier run): from then on a failure is retried
+/// rather than set aside.
+fn apply(b: &Backups, id: &str, under_way: &mut bool) -> Result<()> {
     if !valid_id(id) {
         bail!("the restore marker names no staged backup ({id:?})");
     }
@@ -662,6 +688,7 @@ fn apply(b: &Backups, id: &str) -> Result<()> {
     // stop), taken up again where it stopped. Its pre-restore copy was made
     // the first time, and a new one would hold part of the restored data.
     let resumed = manifest.files.keys().any(|n| !staged.join(n).exists());
+    *under_way = resumed;
     if b.data_dir.join("config.db").exists() && !resumed {
         let pre = create(b, &b.data_dir, Kind::PreRestore, -1).context("saving the current state before restoring")?;
         tracing::info!("saved the state before the restore as {}", pre.name);
@@ -670,14 +697,11 @@ fn apply(b: &Backups, id: &str) -> Result<()> {
     // Everything beside its place first: if a move fails, the current
     // databases are untouched. Staging is in the data directory, so these are
     // renames, not copies (the files were synced when they were unpacked).
+    // A file moved is in no other place: it is never deleted here.
     for n in manifest.files.keys() {
-        if staged.join(n).exists()
-            && let Err(e) = fs::rename(staged.join(n), restoring(n))
-        {
-            for n in manifest.files.keys() {
-                let _ = fs::remove_file(restoring(n));
-            }
-            return Err(e).with_context(|| format!("moving {n} into place"));
+        if staged.join(n).exists() {
+            fs::rename(staged.join(n), restoring(n)).with_context(|| format!("moving {n} into place"))?;
+            *under_way = true;
         }
     }
     sync_dir(&b.data_dir)?;
@@ -698,9 +722,7 @@ fn apply(b: &Backups, id: &str) -> Result<()> {
         fs::rename(restoring(n), b.data_dir.join(n))?;
         File::open(b.data_dir.join(n))?.sync_all()?;
     }
-    sync_dir(&b.data_dir)?;
-    let _ = fs::remove_dir_all(&staged);
-    Ok(())
+    sync_dir(&b.data_dir)
 }
 
 /// Makes the renames in a directory durable.
@@ -1271,6 +1293,108 @@ mod tests {
         assert_eq!(count(&src.join("config.db"), "SELECT COUNT(*) FROM client_aliases"), 1, "restored");
         assert_eq!(count(&src.join("metrics.db"), "SELECT COUNT(*) FROM ap_stats"), 2, "the rest moved in too");
         assert!(!list(&b).iter().any(|x| x.kind == Kind::PreRestore), "no copy of the half-restored state");
+    }
+
+    /// A restore of all history staged and marked to be applied, made before
+    /// the live config lost its client alias.
+    fn staged_restore(name: &str) -> (PathBuf, Backups, String) {
+        let src = data(name);
+        let b = Backups::new(src.clone(), None);
+        let m = create(&b, &src, Kind::Manual, -1).unwrap();
+        Connection::open(src.join("config.db")).unwrap().execute_batch("DELETE FROM client_aliases;").unwrap();
+        let (id, _) = stage(&b, &b.dir().join(&m.name)).unwrap();
+        fs::write(b.staging().join("pending"), &id).unwrap();
+        (src, b, id)
+    }
+
+    /// Puts something in the way of a path: a directory with a file in it
+    /// cannot be renamed over or removed as a file.
+    fn block(p: &Path) {
+        fs::create_dir_all(p.join("x")).unwrap();
+    }
+
+    fn aliases(src: &Path) -> i64 {
+        count(&src.join("config.db"), "SELECT COUNT(*) FROM client_aliases")
+    }
+
+    fn marked(b: &Backups) -> (bool, bool) {
+        (b.staging().join("pending").exists(), b.staging().join("pending.failed").exists())
+    }
+
+    /// The restore is complete: everything in, nothing left over.
+    fn finished(src: &Path, b: &Backups, id: &str, pre_restore: usize) {
+        assert_eq!(marked(b), (false, false));
+        assert!(!b.staging().join(id).exists(), "the staged files are removed");
+        assert_eq!(aliases(src), 1, "restored");
+        assert_eq!(count(&src.join("metrics.db"), "SELECT COUNT(*) FROM ap_stats"), 2, "the rest moved in too");
+        assert!(DATABASES.iter().all(|n| !src.join(format!("{n}.restoring")).exists()));
+        assert_eq!(list(b).iter().filter(|x| x.kind == Kind::PreRestore).count(), pre_restore);
+    }
+
+    #[test]
+    fn a_restore_that_cannot_begin_is_set_aside() {
+        let (src, b, id) = staged_restore("fail-first");
+        block(&src.join("config.db.restoring"));
+        apply_pending(&b);
+        assert_eq!(marked(&b), (false, true));
+        assert!(fs::read_to_string(b.staging().join("pending.failed")).unwrap().contains("moving config.db"));
+        assert_eq!(aliases(&src), 0, "the current data is kept");
+        assert!(b.staging().join(&id).join("config.db").exists(), "nothing has left staging");
+    }
+
+    #[test]
+    fn a_restore_that_fails_moving_files_aside_is_tried_again() {
+        let (src, b, id) = staged_restore("fail-aside");
+        // config.db goes beside its place, logs.db cannot.
+        block(&src.join("logs.db.restoring"));
+        apply_pending(&b);
+        assert_eq!(marked(&b), (true, false), "kept for the next start");
+        assert!(src.join("config.db.restoring").exists(), "the file moved has no other copy");
+        assert_eq!(aliases(&src), 0, "the current databases are untouched");
+        // Failing again as a resumed restore, it still deletes nothing.
+        apply_pending(&b);
+        assert_eq!(marked(&b), (true, false));
+        assert!(src.join("config.db.restoring").exists());
+        fs::remove_dir_all(src.join("logs.db.restoring")).unwrap();
+        apply_pending(&b);
+        finished(&src, &b, &id, 1);
+    }
+
+    #[test]
+    fn a_restore_that_fails_swapping_files_in_is_tried_again() {
+        let (src, b, id) = staged_restore("fail-swap");
+        // As if a run had moved config.db and logs.db beside their place
+        // (and saved the state before); logs.db's old journal cannot go.
+        for n in ["config.db", "logs.db"] {
+            fs::rename(b.staging().join(&id).join(n), src.join(format!("{n}.restoring"))).unwrap();
+        }
+        block(&src.join("logs.db-wal"));
+        apply_pending(&b);
+        assert_eq!(marked(&b), (true, false), "kept for the next start");
+        assert_eq!(aliases(&src), 1, "config.db is in");
+        assert!(src.join("logs.db.restoring").exists() && src.join("metrics.db.restoring").exists());
+        fs::remove_dir_all(src.join("logs.db-wal")).unwrap();
+        apply_pending(&b);
+        finished(&src, &b, &id, 0);
+    }
+
+    #[test]
+    fn a_restore_cut_off_after_its_last_file_finishes() {
+        let (src, b, id) = staged_restore("cut-last");
+        for n in DATABASES {
+            fs::rename(b.staging().join(&id).join(n), src.join(n)).unwrap();
+        }
+        apply_pending(&b);
+        finished(&src, &b, &id, 0);
+    }
+
+    #[test]
+    fn files_beside_their_place_are_removed_only_without_a_restore_under_way() {
+        let src = data("stale");
+        let b = Backups::new(src.clone(), None);
+        fs::write(src.join("metrics.db.restoring"), "x").unwrap();
+        apply_pending(&b);
+        assert!(!src.join("metrics.db.restoring").exists());
     }
 
     #[test]
