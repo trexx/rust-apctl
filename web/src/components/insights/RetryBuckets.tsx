@@ -5,6 +5,8 @@ import { BandInsight } from "./shared";
 
 /** Lower edges of the retry buckets, worst first (as the official dashboard). */
 const RETRY_EDGES = [25, 20, 15, 10, 5, 0];
+/** The labels under the bars' edges: the worst bucket runs up to 100%. */
+const EDGE_LABELS = ["100%", ...RETRY_EDGES.map((e) => `${e}%`)];
 
 export function RetryBuckets() {
   const [span] = useTimeSpan(86400);
@@ -41,7 +43,7 @@ export function RetryBuckets() {
               })}
             </div>
             <div className="bucket-edges muted small">
-              {["35%+", "25%", "20%", "15%", "10%", "5%", "0%"].map((l) => (
+              {EDGE_LABELS.map((l) => (
                 <span key={l}>{l}</span>
               ))}
             </div>
