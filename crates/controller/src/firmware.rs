@@ -105,7 +105,8 @@ pub fn compare(a: &str, b: &str) -> std::cmp::Ordering {
     let parts = |v: &str| -> Vec<u64> {
         let v = v.trim_start_matches('v');
         let v = v.split('+').next().unwrap_or(v);
-        v.split(['.', '-']).map(|x| x.chars().take_while(|c| c.is_ascii_digit()).collect::<String>().parse().unwrap_or(0)).collect()
+        // A segment's leading digits; none (as in `rc`) is 0.
+        v.split(['.', '-']).map(|x| x[..x.find(|c: char| !c.is_ascii_digit()).unwrap_or(x.len())].parse().unwrap_or(0)).collect()
     };
     let (pa, pb) = (parts(a), parts(b));
     let n = pa.len().min(pb.len());
@@ -636,6 +637,8 @@ mod tests {
         assert_eq!(compare("6.8.10.1", "6.8.9.1"), Greater, "numbers, not text");
         assert_eq!(compare("v6.8.2+15592", "6.8.2"), Equal);
         assert_eq!(compare("6.8.2-rc.1", "6.8.2"), Less, "a pre-release is older than the release");
+        assert_eq!(compare("6.8.2-rc1.1", "6.8.2-rc.1"), Equal, "a segment counts by its leading digits");
+        assert_eq!(compare("6.10b.1", "6.9.1"), Greater);
     }
 
     #[test]
