@@ -949,11 +949,8 @@ async fn series(State(s): State<AppState>, Path(table): Path<String>, Query(q): 
     if keys.len() != t.keys.len() {
         return Err(ApiError::bad(format!("{table} needs key {}", t.keys.join(","))));
     }
-    let now = clock::now_ts();
-    let to = q.to.unwrap_or(now);
-    let from = q.from.unwrap_or(to.saturating_sub(3600));
-    let (from, to) = (from.min(to), from.max(to));
-    let tier = store::tier_for(from, to, now);
+    // An hour by default. No shortest window: a live chart asks for what is newer than its last sample.
+    let (from, to, tier) = crate::series::bounded(q.from, q.to, 3600);
     Ok(Json(read(&s.store, Db::Metrics, move |c| store::series(c, t, &keys, from, to, tier)).await?))
 }
 
