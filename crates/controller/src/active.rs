@@ -541,7 +541,7 @@ impl Caller {
     /// A reply in the request's encryption mode, never compressed, with a
     /// fresh IV, serialised straight into the packet.
     fn seal(&self, reply: &Value) -> Response {
-        let flags = Flags::ENCRYPTED | if self.gcm { Flags::GCM } else { Flags(0) };
+        let flags = Flags::ENCRYPTED | if self.gcm { Flags::GCM } else { Flags::NONE };
         let packet = inform::seal_with(self.mac, flags, random_bytes::<16>(), &self.key, |out| serde_json::to_writer(out, reply).expect("a JSON value serialises"));
         ([(header::CONTENT_TYPE, "application/x-binary")], packet).into_response()
     }
@@ -1089,7 +1089,7 @@ mod tests {
         let Some(_) = fixtures() else { return };
         let rig = rig(true, None);
         // Plain JSON under an adopted AP's MAC "opens" with its key: it must not count.
-        for flags in [Flags(0), Flags::ZLIB, Flags::GCM, Flags::GCM | Flags::ZLIB] {
+        for flags in [Flags::NONE, Flags::ZLIB, Flags::GCM, Flags::GCM | Flags::ZLIB] {
             let (status, _) = inform_as_ap(&rig, &ap_payload("1"), KEY, flags).await;
             assert_eq!(status, StatusCode::BAD_REQUEST, "flags {flags:?}");
         }

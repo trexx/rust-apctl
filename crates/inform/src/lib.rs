@@ -133,6 +133,8 @@ impl<'de> serde::Deserialize<'de> for Mac {
 pub struct Flags(pub u16);
 
 impl Flags {
+    /// No bit set: a plain, uncompressed payload.
+    pub const NONE: Flags = Flags(0);
     pub const ENCRYPTED: Flags = Flags(0x01);
     pub const ZLIB: Flags = Flags(0x02);
     pub const SNAPPY: Flags = Flags(0x04);
@@ -422,7 +424,7 @@ mod tests {
     #[test]
     fn round_trips_every_flag_combination() {
         let combos = [
-            Flags(0),
+            Flags::NONE,
             Flags::ZLIB,
             Flags::SNAPPY,
             Flags::ENCRYPTED,
