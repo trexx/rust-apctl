@@ -973,7 +973,7 @@ fn edit_wlan(state: &mut Value, e: &WlanEdit, over: &[Over]) -> Result<String, S
     // A group can go with a change of APs or of the mDNS rules.
     prune_groups(state);
     check_limits(over, state)?;
-    let channels = apply_channel_locks(state, &locked_aps_before);
+    let channels = apply_channel_locks(state, &locked_aps_before, None);
 
     let after = wlan(state, id).ok_or("unknown SSID")?;
     let mut keys: Vec<&str> = after.as_object().map(|o| o.keys().map(String::as_str).collect()).unwrap_or_default();
@@ -1248,12 +1248,14 @@ pub fn channel_locked_aps(state: &Value) -> Vec<String> {
 /// the official controller does when a lock changes: channel 6 on every AP an
 /// SSID with the lock is broadcast from, and back to auto on an AP in
 /// `released` (it had a locked SSID before the change) that has none left.
+/// With `only`, that AP alone: a newly adopted one (see `adopt_device`).
 /// Returns what changed, in words.
-fn apply_channel_locks(state: &mut Value, released: &[String]) -> Vec<String> {
+pub(crate) fn apply_channel_locks(state: &mut Value, released: &[String], only: Option<&inform::Mac>) -> Vec<String> {
     let locked = channel_locked_aps(state);
     let mut out = Vec::new();
     for d in docs_mut(state, "devices") {
-        let Some(mac) = doc_mac(&d["mac"]).map(|m| m.to_string()) else { continue };
+        let Some(m) = doc_mac(&d["mac"]).filter(|m| only.is_none_or(|o| o == m)) else { continue };
+        let mac = m.to_string();
         let target = if locked.contains(&mac) {
             json!("6")
         } else if released.contains(&mac) {
@@ -1408,7 +1410,7 @@ pub fn delete_wlan(state: &mut Value, id: &str) -> Result<String, String> {
     let mut what = format!("deleted SSID \"{}\"", w["name"].as_str().unwrap_or("?"));
     array_mut(state, "wlanconf").retain(|x| oid(x) != Some(id));
     prune_groups(state);
-    let channels = apply_channel_locks(state, &released);
+    let channels = apply_channel_locks(state, &released, None);
     if !channels.is_empty() {
         what = format!("{what}; {}", channels.join("; "));
     }
@@ -1556,8 +1558,12 @@ fn radio_edit(state: &Value, e: &DeviceEdit, rp: &Value, before: &Value, d: &mut
     if let Some((ch, width)) = illegal_fixed_channel(country(state), r, o) {
         return Err(format!("{label}: channel {ch} is not allowed at {width} MHz here"));
     }
-    if band == "ng" && iot_lock && !same_channel(&r["channel"], inform_radio(before, band).map_or(&Value::Null, |x| &x["channel"])) {
-        return Err("the 2.4 GHz channel is locked by an SSID's IoT setting".into());
+    // The official controller refuses any change here, which strands an AP
+    // that came under the lock on another channel (one adopted after the lock
+    // was switched on stays on auto there); a change to the lock's channel is
+    // let through, so such an AP can join it.
+    if band == "ng" && iot_lock && !same_channel(&r["channel"], inform_radio(before, band).map_or(&Value::Null, |x| &x["channel"])) && !same_channel(&r["channel"], &json!(6)) {
+        return Err("the 2.4 GHz channel is locked by an SSID's IoT setting: it can only go to 6".into());
     }
     copy_fields(rp, r, &[("tx_power_mode", Enum(&["auto", "high", "medium", "low", "custom", "disabled"]))])?;
     let (lo, hi) = (caps["min_txpower"].as_i64().unwrap_or(1), caps["max_txpower"].as_i64().unwrap_or(30));
@@ -2039,10 +2045,14 @@ mod tests {
         // Narrowing the width keeps a channel legal; 140 only works at 20 MHz.
         assert!(dev(&mut s, json!({ "radios": [{ "radio": "na", "channel": 140 }] })).is_err());
         dev(&mut s, json!({ "radios": [{ "radio": "na", "channel": 140, "ht": 20 }] })).unwrap();
-        // An IoT channel lock on an SSID here freezes the 2.4 GHz channel.
+        // An IoT channel lock on an SSID here freezes the 2.4 GHz channel, but
+        // for a move onto the lock's channel 6 (from 1 here, set before the lock).
         s["wlanconf"][0]["iot_channel_lock"] = json!(true);
-        assert!(dev(&mut s, json!({ "radios": [{ "radio": "ng", "channel": 6 }] })).unwrap_err().contains("IoT"));
+        assert!(dev(&mut s, json!({ "radios": [{ "radio": "ng", "channel": 11 }] })).unwrap_err().contains("IoT"));
         dev(&mut s, json!({ "radios": [{ "radio": "ng", "tx_power_mode": "low" }] })).unwrap();
+        dev(&mut s.clone(), json!({ "radios": [{ "radio": "ng", "channel": 6 }] })).unwrap();
+        s["devices"][0]["radio_table"][0]["channel"] = json!("auto");
+        dev(&mut s.clone(), json!({ "radios": [{ "radio": "ng", "channel": "6" }] })).unwrap();
         // The lock keeps channel 6 as "6": asking for 6 again is no change.
         s["devices"][0]["radio_table"][0]["channel"] = json!("6");
         dev(&mut s, json!({ "radios": [{ "radio": "ng", "channel": 6 }] })).unwrap();

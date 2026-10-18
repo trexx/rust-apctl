@@ -264,7 +264,17 @@ pub fn adopt_device(state: &mut Value, mac: &Mac, payload: &Value) -> Result<Str
     }
     let d = new_device(state, payload, mac);
     crate::settings::push_doc(state, "devices", d);
-    Ok(format!("adopted AP {} ({mac})", payload["hostname"].as_str().or(payload["model"].as_str()).unwrap_or("new")))
+    let mut what = format!("adopted AP {} ({mac})", payload["hostname"].as_str().or(payload["model"].as_str()).unwrap_or("new"));
+    // It joins the IoT channel locks of the SSIDs it is to broadcast, as the
+    // APs there when a lock was switched on did. The official controller
+    // applies a lock only then, and leaves an AP adopted later on auto, which
+    // its device editor then refuses to move (and Channel AI leaves locked
+    // APs alone): apctl keeps every AP of a locked SSID on channel 6.
+    let channels = crate::settings::apply_channel_locks(state, &[], Some(mac));
+    if !channels.is_empty() {
+        what = format!("{what}; {}", channels.join("; "));
+    }
+    Ok(what)
 }
 
 /// Removes an AP from the settings and everything that names it.
@@ -466,6 +476,28 @@ mod tests {
         assert_eq!((again["name"].as_str(), again["x_authkey"].as_str().unwrap().len()), (Some("U6-Mesh"), 32));
         assert!(again["x_authkey"] != d["x_authkey"] && again["syslog_key"] != d["syslog_key"]);
         assert!(again.get("x_inform_authkey").is_none(), "the AP has yet to inform with it");
+    }
+
+    #[test]
+    fn a_new_ap_joins_the_channel_locks_of_its_ssids() {
+        let wlan = |groups: Value| json!({ "name": "Things", "wlan_bands": ["2g"], "iot_channel_lock": true, "ap_group_ids": groups, "site_id": "s1" });
+        let mut s = state();
+        s["devices"][0]["radio_table"] = json!([{ "radio": "ng", "channel": 1 }]);
+        s["apgroup"] = json!([{ "_id": "all", "attr_hidden_id": "default", "site_id": "s1" }, { "_id": "g1", "for_wlanconf": true, "device_macs": ["02:00:00:00:00:01"], "site_id": "s1" }]);
+        // A locked SSID on every AP: the new one goes to 6, and the others are left as they are.
+        s["wlanconf"] = json!([wlan(json!(["all"]))]);
+        let mac: Mac = "02:00:00:00:00:09".parse().unwrap();
+        let what = adopt_device(&mut s, &mac, &inform()).unwrap();
+        assert!(what.ends_with("; AP U6-Mesh: 2.4 GHz channel 6"), "{what}");
+        let d = device_doc(&s, &mac).unwrap();
+        assert_eq!((d["radio_table"][0]["channel"].as_str(), d["radio_table"][1]["channel"].as_str()), (Some("6"), Some("auto")));
+        assert_eq!(s["devices"][0]["radio_table"][0]["channel"], 1);
+        // One on other APs only: the new one stays on auto.
+        let mut s = state();
+        s["apgroup"] = json!([{ "_id": "g1", "for_wlanconf": true, "device_macs": ["02:00:00:00:00:01"], "site_id": "s1" }]);
+        s["wlanconf"] = json!([wlan(json!(["g1"]))]);
+        adopt_device(&mut s, &mac, &inform()).unwrap();
+        assert_eq!(device_doc(&s, &mac).unwrap()["radio_table"][0]["channel"], "auto");
     }
 
     #[test]
