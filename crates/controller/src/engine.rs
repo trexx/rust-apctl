@@ -1788,7 +1788,12 @@ fn connected_event(ts: Ts, c: &ClientSample, new: bool) -> Event {
 /// returns the event that says so, for the caller to emit.
 fn disconnect(writer: &Writer, ts: Ts, mac: Mac, c: &mut ClientView, reason: &str) -> Event {
     c.connected = false;
-    writer.exec(Db::Config, "UPDATE clients SET connected = 0 WHERE mac = ?1", vec![Sql::Text(mac.to_string())]);
+    // The row's last_seen is only written once a minute while connected.
+    writer.exec(
+        Db::Config,
+        "UPDATE clients SET connected = 0, last_seen = MAX(COALESCE(last_seen, ?2), ?2) WHERE mac = ?1",
+        vec![Sql::Text(mac.to_string()), Sql::Integer(c.last_seen)],
+    );
     Event::client_on(ts, EventKind::ClientDisconnected, c.sample.ap_mac, mac, json!({
         "reason": reason, "last_seen": c.last_seen, "essid": c.sample.essid,
         "connected_for": c.sample.uptime, "last_signal": c.sample.signal,
@@ -2037,6 +2042,11 @@ mod tests {
         assert_eq!(stored(device).0, 30);
         feed(&mut h.engine, 90, "b");
         assert_eq!((stored(device).0, stored(client).0), (90, 90), "last_seen moves on once a minute");
+        // Gone: the row says when it was last seen, which a restart restores.
+        feed(&mut h.engine, 105, "b");
+        assert_eq!(stored(client).0, 90);
+        h.engine.handle(Input::Tick(400));
+        assert_eq!(stored(client).0, 105);
     }
 
     #[test]
