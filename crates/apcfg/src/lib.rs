@@ -155,6 +155,15 @@ pub fn render_with_meta(input: &Input) -> Result<Output> {
     Ok(Output { rendered: Rendered { mgmt_cfg, system_cfg }, config_meta })
 }
 
+/// Only the `mgmt_cfg` of [`render`]: what adopts an AP. `inform_authkey` is the key
+/// (hex) the AP informs with when that is not the device's stored `x_inform_authkey`:
+/// an AP being adopted uses the factory key, so it is sent its own. What only
+/// `system_cfg` reads cannot make this fail.
+pub fn render_mgmt(input: &Input, inform_authkey: Option<&str>) -> Result<String> {
+    let ctx = Ctx::new(input)?;
+    Ok(mgmt::render_with_key(&ctx, inform_authkey.or_else(|| json::str_of(ctx.device, "x_inform_authkey"))))
+}
+
 /// The `blocked_sta` value of a provisioning reply: MACs of the site's blocked clients,
 /// one per line, no trailing newline.
 pub fn blocked_sta(state: &Value, site_id: &str) -> String {

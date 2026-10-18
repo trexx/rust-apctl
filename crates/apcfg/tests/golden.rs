@@ -71,6 +71,38 @@ fn blocked_sta_lists_blocked_clients() {
     assert_eq!(apcfg::blocked_sta(&state, "00000000000000000000001e"), push["blocked_sta"].as_str().unwrap());
 }
 
+/// The `mgmt_cfg` alone is the full render's, with the key the AP informs with
+/// supplied or stored, and settings only `system_cfg` reads cannot stop it.
+#[test]
+fn mgmt_cfg_alone_matches_the_full_render() {
+    let Some(_) = common::fixtures() else { return };
+    let controller = common::controller();
+    let mut state = state();
+    for ap in [AP_B, AP_U] {
+        let inform = common::inform(ap);
+        let input = apcfg::Input { state: &state, device_mac: ap, inform: Some(&inform), cfgversion: "x", controller: &controller };
+        assert_eq!(apcfg::render_mgmt(&input, None).unwrap(), render(&state, ap, "x").rendered.mgmt_cfg, "{ap}");
+    }
+    // As when adopting: the AP informs with another key than its own, so it is sent its own.
+    let factory = "0123456789abcdef0123456789abcdef";
+    let mut adopting = state.clone();
+    adopting["devices"].as_array_mut().unwrap().iter_mut().find(|d| d["mac"] == AP_B).unwrap()["x_inform_authkey"] = factory.into();
+    let expected = render(&adopting, AP_B, "x").rendered.mgmt_cfg;
+    assert!(expected.contains("\nauthkey="), "{expected}");
+    let inform = common::inform(AP_B);
+    let input = apcfg::Input { state: &state, device_mac: AP_B, inform: Some(&inform), cfgversion: "x", controller: &controller };
+    assert_eq!(apcfg::render_mgmt(&input, Some(factory)).unwrap(), expected);
+    // Without the SSH password hash system_cfg cannot be rendered; mgmt_cfg still can.
+    for s in state["setting"].as_array_mut().unwrap().iter_mut().filter(|s| s["key"] == "mgmt") {
+        let s = s.as_object_mut().unwrap();
+        s.remove("x_ssh_md5passwd");
+        s.remove("x_ssh_sha512passwd");
+    }
+    let input = apcfg::Input { state: &state, device_mac: AP_B, inform: Some(&inform), cfgversion: "x", controller: &controller };
+    assert!(apcfg::render(&input).is_err());
+    assert_eq!(apcfg::render_mgmt(&input, Some(factory)).unwrap(), expected);
+}
+
 #[test]
 fn missing_device_is_an_error() {
     let Some(_) = common::fixtures() else { return };

@@ -65,6 +65,11 @@ pub fn led_enabled(ctx: &Ctx) -> bool {
 }
 
 pub fn render(ctx: &Ctx) -> String {
+    render_with_key(ctx, str_of(ctx.device, "x_inform_authkey"))
+}
+
+/// [`render`] for an AP that informs with the key `used` (hex).
+pub fn render_with_key(ctx: &Ctx, used: Option<&str>) -> String {
     let c = ctx.controller;
     let Address { host, port: inform_port, migrating } = address(ctx);
     let site_name = str_of(ctx.site, "name").unwrap_or("default");
@@ -78,7 +83,7 @@ pub fn render(ctx: &Ctx) -> String {
     let https = if c.https_port == 443 { String::new() } else { format!(":{}", c.https_port) };
     out.set("mgmt_url", format_args!("https://{host}{https}/manage/site/{site_name}"));
     // The key is only resent while the AP still authenticates with an older one.
-    if let (Some(key), Some(used)) = (str_of(ctx.device, "x_authkey"), str_of(ctx.device, "x_inform_authkey"))
+    if let (Some(key), Some(used)) = (str_of(ctx.device, "x_authkey"), used)
         && key != used
     {
         out.set("authkey", key);

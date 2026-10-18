@@ -1,6 +1,7 @@
 //! `system_cfg`: all sections, in the official controller's order.
 
 use std::borrow::Cow;
+use std::collections::HashSet;
 use std::sync::OnceLock;
 
 use anyhow::{Result, bail};
@@ -257,6 +258,7 @@ fn mac_acl(c: &mut Cfg, ctx: &Ctx, vaps: &[Vap]) {
         .map(str::to_ascii_lowercase)
         .collect();
     let locked_elsewhere = hash_set_order(&locked_elsewhere);
+    let locked: HashSet<&str> = locked_elsewhere.iter().copied().collect();
     let mut blocks: Vec<AclBlock> = Vec::new();
     for v in vaps {
         let filtering = flag(&v.w, "mac_filter_enabled", false);
@@ -269,16 +271,14 @@ fn mac_acl(c: &mut Cfg, ctx: &Ctx, vaps: &[Vap]) {
             entries.extend(
                 str_list(&v.w, "mac_filter_list")
                     .map(|m| m.to_ascii_lowercase())
-                    .filter(|m| policy != "allow" || !locked_elsewhere.contains(&m.as_str()))
+                    .filter(|m| policy != "allow" || !locked.contains(m.as_str()))
                     .map(|m| (Cow::Owned(m), "user")),
             );
         }
         if policy == "deny" {
-            for &m in &locked_elsewhere {
-                if !entries.iter().any(|(e, _)| e == m) {
-                    entries.push((Cow::Borrowed(m), "lock2ap"));
-                }
-            }
+            let listed: HashSet<&str> = entries.iter().map(|(e, _)| e.as_ref()).collect();
+            let unlisted: Vec<&str> = locked_elsewhere.iter().copied().filter(|m| !listed.contains(m)).collect();
+            entries.extend(unlisted.into_iter().map(|m| (Cow::Borrowed(m), "lock2ap")));
         }
         blocks.push((v.dev(), policy, entries));
     }
@@ -596,22 +596,23 @@ fn mdns(c: &mut Cfg, ctx: &Ctx, vaps: &[Vap], net: &Net) {
         let own = str_of(w, "networkconf_id");
         let mut entries: Vec<MdnsEntry> = Vec::new();
         if str_of(w, "mdns_proxy_mode") == Some("custom") {
-            let custom: Vec<&Value> = arr(w, "mdns_proxy_custom").iter().filter(|e| applies(e)).collect();
-            let lists_own = custom.iter().any(|e| own.is_some_and(|o| str_list(e, "networkconf_ids").any(|n| n == o)));
+            // Each entry with its services, worked out once.
+            let custom: Vec<(&Value, Vec<&str>)> = arr(w, "mdns_proxy_custom").iter().filter(|e| applies(e)).map(|e| (e, entry_services(e))).collect();
+            let lists_own = custom.iter().any(|(e, _)| own.is_some_and(|o| str_list(e, "networkconf_ids").any(|n| n == o)));
             if !lists_own {
-                let all = custom.iter().any(|e| str_of(e, "services_mode") == Some("all"));
+                let all = custom.iter().any(|(e, _)| str_of(e, "services_mode") == Some("all"));
                 let mut union: Vec<&str> = Vec::new();
-                for s in custom.iter().flat_map(|e| entry_services(e)) {
+                for &s in custom.iter().flat_map(|(_, services)| services) {
                     if !union.contains(&s) {
                         union.push(s);
                     }
                 }
                 entries.push(MdnsEntry { networks: vec![own], mode: if all { "all" } else { "specific" }, services: Cow::Owned(union) });
             }
-            entries.extend(custom.iter().map(|e| MdnsEntry {
+            entries.extend(custom.into_iter().map(|(e, services)| MdnsEntry {
                 networks: str_list(e, "networkconf_ids").map(Some).collect(),
                 mode: str_of(e, "services_mode").unwrap_or("all"),
-                services: Cow::Owned(entry_services(e)),
+                services: Cow::Owned(services),
             }));
         } else {
             entries.push(MdnsEntry { networks: vec![own], mode: "specific", services: Cow::Borrowed(mdns_auto_services()) });

@@ -787,7 +787,8 @@ fn render_wireless(c: &mut Cfg, ctx: &Ctx, radios: &[Radio], vaps: &[Vap], v: &V
         if ng {
             c.set(k.at("minrate_cck_rates.status"), allows_11b(rate));
         }
-        if r.band.key(["minrate_ng_advertising_rates", "minrate_na_advertising_rates", "minrate_6e_advertising_rates"]).is_some_and(|key| b(w, key)) {
+        // Minimum rates are only set on 2.4 and 5 GHz radios (see `min_rate`).
+        if b(w, if ng { "minrate_ng_advertising_rates" } else { "minrate_na_advertising_rates" }) {
             c.set(k.at("minrate_below_disable"), "true");
         }
     }
@@ -894,8 +895,8 @@ fn schedule(c: &mut Cfg, w: &Value, k: Prefix, invert: bool, multi: bool) {
         c.set(k.at("schedule_invert"), "enabled");
     }
     for (d, blocks) in off.iter().enumerate() {
-        let blocks: Vec<(i64, i64)> = if invert {
-            blocks.clone()
+        let blocks: Cow<[(i64, i64)]> = if invert {
+            Cow::Borrowed(blocks)
         } else {
             // The gaps between blackouts.
             let mut on = Vec::new();
@@ -909,7 +910,7 @@ fn schedule(c: &mut Cfg, w: &Value, k: Prefix, invert: bool, multi: bool) {
             if from < 1440 {
                 on.push((from, 1440));
             }
-            on
+            Cow::Owned(on)
         };
         for (i, (s, e)) in blocks.iter().enumerate() {
             let time = format_args!("{}-{}", hhmm(*s), hhmm(*e));

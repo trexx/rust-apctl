@@ -267,22 +267,21 @@ impl Active {
     }
 
     /// The `mgmt_cfg` that adopts an AP, made once per version of the
-    /// settings: anyone can send informs under its MAC with the factory key
-    /// while the adoption lasts, and each new one copies the whole settings.
+    /// settings: every inform under the factory key while the adoption lasts
+    /// (anyone can send them under its MAC) gets the same one. Only mgmt_cfg
+    /// is rendered, so settings it does not read cannot hold up an adoption.
     fn adoption_cfg(&self, state: &Arc<Value>, mac: Mac, payload: &Value) -> anyhow::Result<Arc<str>> {
         if let Some((from, cfg)) = self.adoption_cfgs.lock().unwrap().get(&mac)
             && std::ptr::eq(from.as_ptr(), Arc::as_ptr(state))
         {
             return Ok(cfg.clone());
         }
-        let mut copy = (**state).clone();
-        if let Some(d) = crate::adopt::device_doc_mut(&mut copy, &mac) {
-            // The key it used, so mgmt_cfg includes `authkey`.
-            d["x_inform_authkey"] = json!(hex::encode(DEFAULT_KEY));
-        }
         // A new version, never the record's: an AP adopted again would report
-        // that one, which a push stored for it may still carry.
-        let cfg: Arc<str> = self.render(&copy, mac, payload, &new_cfgversion())?.rendered.mgmt_cfg.into();
+        // that one, which a push stored for it may still carry. With the key
+        // it used, so mgmt_cfg includes `authkey`.
+        let (mac_s, cfgversion) = (mac.to_string(), new_cfgversion());
+        let input = apcfg::Input { state, device_mac: &mac_s, inform: Some(payload), cfgversion: &cfgversion, controller: &self.controller };
+        let cfg: Arc<str> = apcfg::render_mgmt(&input, Some(&hex::encode(DEFAULT_KEY)))?.into();
         let mut cfgs = self.adoption_cfgs.lock().unwrap();
         cfgs.retain(|_, (from, _)| from.strong_count() > 0);
         cfgs.insert(mac, (Arc::downgrade(state), cfg.clone()));
@@ -685,8 +684,18 @@ async fn managed_inform(active: &Arc<Active>, ts: Ts, caller: &Caller, header: i
     let response = caller.seal(&reply);
     // The engine follows the interval it asked for (or the AP would be called
     // offline on a site where informs come more than a minute apart) and
-    // records each push.
-    if reply["_type"] == "setparam" || reply.get("interval").is_some() {
+    // records each push. An AP's interval rarely changes: a heartbeat that
+    // repeats the one the engine has is only counted.
+    let tell = {
+        let live = active.live.read().unwrap();
+        let interval = reply.get("interval").and_then(Value::as_i64);
+        let tell = reply["_type"] == "setparam" || interval.is_some_and(|i| live.devices.get(&mac).is_none_or(|d| d.interval != i));
+        if !tell && interval.is_some() {
+            live.counters.replies.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        tell
+    };
+    if tell {
         let _ = active.engine.send(Input::Replied { ts, mac, payload: reply }).await;
     }
     response
@@ -932,7 +941,24 @@ mod tests {
         inform_as_ap(&rig, &ap_payload(&version), KEY, GCM_ZLIB).await;
         let r = replied(&mut rig);
         assert_eq!((r.len(), r[0]["_type"].as_str()), (1, Some("noop")));
-        assert!(r[0]["interval"].as_i64().is_some());
+        let interval = r[0]["interval"].as_i64().unwrap();
+        // Once the engine has that interval, a heartbeat is only counted.
+        let live = rig.live.clone();
+        let seen = |interval: Ts| {
+            let snapshot = crate::model::parse(0, &ap_payload(&version)).unwrap();
+            let d = crate::engine::DeviceView { snapshot, online: true, first_seen: 0, last_seen: 0, peer: "x".into(), interval, last_full_inform: 0, last_config_push: None };
+            live.write().unwrap().devices.insert(AP.parse().unwrap(), d);
+        };
+        seen(interval);
+        let replies = || live.read().unwrap().counters.replies.load(std::sync::atomic::Ordering::Relaxed);
+        let before = replies();
+        inform_as_ap(&rig, &ap_payload(&version), KEY, GCM_ZLIB).await;
+        assert!(replied(&mut rig).is_empty());
+        assert_eq!(replies(), before + 1);
+        // Another interval than the engine's is heard.
+        seen(interval + 1);
+        inform_as_ap(&rig, &ap_payload(&version), KEY, GCM_ZLIB).await;
+        assert_eq!(replied(&mut rig).len(), 1);
         // A notification's bare noop sets nothing.
         let mut notif = ap_payload(&version);
         notif["inform_as_notif"] = json!(true);
@@ -1276,6 +1302,35 @@ mod tests {
         let (_, reply) = inform_as_ap(&rig, &payload, key, GCM_ZLIB).await;
         assert_eq!(reply.unwrap().1["_type"], "setdefault");
         assert!(rig.live.read().unwrap().adoption.forgetting.is_empty(), "the forget is finished once");
+    }
+
+    #[tokio::test]
+    async fn an_ap_is_adopted_even_when_its_full_config_cannot_be_rendered() {
+        let Some(_) = fixtures() else { return };
+        let rig = rig(true, None);
+        let new: Mac = "02:00:00:00:00:09".parse().unwrap();
+        let mut payload = ap_payload("1");
+        payload["mac"] = json!(new.to_string());
+        {
+            let mut live = rig.live.write().unwrap();
+            let mut state = live.state.as_deref().cloned().unwrap();
+            crate::adopt::adopt_device(&mut state, &new, &payload).unwrap();
+            // As after setting the SSH password in apctl: system_cfg cannot be rendered.
+            for s in state["setting"].as_array_mut().unwrap().iter_mut().filter(|s| s["key"] == "mgmt") {
+                s.as_object_mut().unwrap().retain(|k, _| !k.starts_with("x_ssh_") || !k.ends_with("passwd"));
+            }
+            live.state = Some(Arc::new(state));
+            live.adoption.adopting.insert(new, 0);
+        }
+        let key_hex = crate::adopt::device_doc(rig.live.read().unwrap().state.as_deref().unwrap(), &new).unwrap()["x_authkey"].as_str().unwrap().to_string();
+        let (_, reply) = inform_as_ap(&rig, &payload, DEFAULT_KEY, GCM_ZLIB).await;
+        let reply = reply.unwrap().1;
+        assert_eq!(reply["_type"], "setparam");
+        assert!(reply["mgmt_cfg"].as_str().unwrap().contains(&format!("authkey={key_hex}")));
+        // Its full config waits for the settings to be fixed.
+        let key: [u8; 16] = inform::parse_key(&key_hex).unwrap();
+        let (_, reply) = inform_as_ap(&rig, &payload, key, GCM_ZLIB).await;
+        assert_eq!(reply.unwrap().1["_type"], "noop");
     }
 
     #[tokio::test]

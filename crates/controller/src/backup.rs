@@ -675,6 +675,10 @@ fn valid_id(id: &str) -> bool {
 /// the data it has, rather than failing on every start. One that fails part
 /// way keeps its marker and is taken up again at the next start: the files
 /// already moved have no other copy. Also clears out staging left behind.
+///
+/// Staging and the marker are synced when written, and a restore records
+/// that it has begun (`started`, beside the staged files) before it moves
+/// anything, so a power cut can never pass a lost file for one moved in.
 pub fn apply_pending(b: &Backups) {
     clean_unfinished(b);
     let marker = b.staging().join("pending");
@@ -696,6 +700,10 @@ pub fn apply_pending(b: &Backups) {
                 }
                 Err(e) => {
                     tracing::error!("the staged restore failed; starting with the current data: {e:#}");
+                    // Staged again, it begins afresh, with a copy of the data as it is then.
+                    if valid_id(id.trim()) {
+                        let _ = fs::remove_file(b.staging().join(id.trim()).join("started"));
+                    }
                     let failed = b.staging().join("pending.failed");
                     if fs::write(&failed, format!("{e:#}")).is_err() || fs::remove_file(&marker).is_err() {
                         let _ = fs::rename(&marker, &failed);
@@ -719,8 +727,8 @@ pub fn apply_pending(b: &Backups) {
 }
 
 /// Swaps a staged restore in. `under_way` is set once a file has left
-/// staging (or had in an earlier run): from then on a failure is retried
-/// rather than set aside.
+/// staging (or a run has begun the restore before): from then on a failure
+/// is retried rather than set aside.
 fn apply(b: &Backups, id: &str, under_way: &mut bool) -> Result<()> {
     if !valid_id(id) {
         bail!("the restore marker names no staged backup ({id:?})");
@@ -730,20 +738,31 @@ fn apply(b: &Backups, id: &str, under_way: &mut bool) -> Result<()> {
     check_names(&manifest)?;
     tracing::warn!("restoring the backup made {} by apctl {} (history: {} days)", manifest.created, manifest.version, manifest.days);
     let restoring = |n: &str| b.data_dir.join(format!("{n}.restoring"));
-    // Staging checks that every listed file is there, and files only leave it
-    // below: with one gone, this is a restore cut off part way (a crash, a
-    // stop), taken up again where it stopped. Its pre-restore copy was made
-    // the first time, and a new one would hold part of the restored data.
-    let resumed = manifest.files.keys().any(|n| !staged.join(n).exists());
+    // Written before the first file leaves staging: with it, this is a
+    // restore cut off part way (a crash, a stop), taken up again where it
+    // stopped. Its pre-restore copy was made the first time, and a new one
+    // would hold part of the restored data. (A file beside its place says the
+    // same of a restore an older apctl began.)
+    let started = staged.join("started");
+    let resumed = started.exists() || manifest.files.keys().any(|n| restoring(n).is_file());
     *under_way = resumed;
-    // The copy holds what the restore replaces, whole: a settings-only
-    // restore leaves the statistics and logs where they are, and copying
-    // them too would only make the start (before /healthz answers) slower.
-    let replaced: Vec<&str> = manifest.files.keys().map(String::as_str).filter(|n| b.data_dir.join(n).exists()).collect();
-    if !replaced.is_empty() && !resumed {
-        let pre = create_of(b, &b.data_dir, Kind::PreRestore, -1, &replaced).context("saving the current state before restoring")?;
-        tracing::info!("saved the state before the restore as {}", pre.name);
-        prune(b, Kind::PreRestore, KEEP_PRE_RESTORE);
+    if !resumed {
+        // Staging is synced once checked: a file gone before the restore has
+        // begun means it is damaged, not that the file was moved in.
+        if let Some(n) = manifest.files.keys().find(|n| !staged.join(n).exists()) {
+            bail!("{n} is missing from the staged restore");
+        }
+        // The copy holds what the restore replaces, whole: a settings-only
+        // restore leaves the statistics and logs where they are, and copying
+        // them too would only make the start (before /healthz answers) slower.
+        let replaced: Vec<&str> = manifest.files.keys().map(String::as_str).filter(|n| b.data_dir.join(n).exists()).collect();
+        if !replaced.is_empty() {
+            let pre = create_of(b, &b.data_dir, Kind::PreRestore, -1, &replaced).context("saving the current state before restoring")?;
+            tracing::info!("saved the state before the restore as {}", pre.name);
+            prune(b, Kind::PreRestore, KEEP_PRE_RESTORE);
+        }
+        write_synced(&started, b"")?;
+        sync_dir(&staged)?;
     }
     // Everything beside its place first: if a move fails, the current
     // databases are untouched. Staging is in the data directory, so these are
@@ -779,6 +798,14 @@ fn apply(b: &Backups, id: &str, under_way: &mut bool) -> Result<()> {
 /// Makes the renames in a directory durable.
 fn sync_dir(dir: &Path) -> Result<()> {
     File::open(dir)?.sync_all().with_context(|| format!("syncing {}", dir.display()))
+}
+
+/// Writes a file and syncs it (its directory still needs [`sync_dir`]).
+fn write_synced(path: &Path, data: &[u8]) -> Result<()> {
+    let mut f = File::create(path).with_context(|| format!("writing {}", path.display()))?;
+    f.write_all(data)?;
+    f.sync_all()?;
+    Ok(())
 }
 
 /// Deletes what a backup cut off half way (a crash, a restart) left in the
@@ -892,14 +919,20 @@ fn load_settings(store: &store::Store) -> Result<Settings> {
     Ok(stored.map(|s| serde_json::from_str::<Settings>(&s)).transpose()?.unwrap_or_default())
 }
 
-/// Backups in the directory, newest first.
+/// Backups in the directory, newest first. A description counts only beside
+/// its own backup (`<name>.json`, with a name apctl gives): a copied one would
+/// list a backup twice, and an edited one could name any file to prune.
 pub fn list(b: &Backups) -> Vec<Meta> {
     let mut out: Vec<Meta> = fs::read_dir(b.dir())
         .into_iter()
         .flatten()
         .flatten()
-        .filter(|e| e.file_name().to_string_lossy().ends_with(".apb.json"))
-        .filter_map(|e| serde_json::from_slice::<Meta>(&fs::read(e.path()).ok()?).ok())
+        .filter_map(|e| {
+            let file = e.file_name().into_string().ok()?;
+            let name = file.strip_suffix(".json").filter(|n| valid_name(n))?;
+            let m = serde_json::from_slice::<Meta>(&fs::read(e.path()).ok()?).ok()?;
+            (m.name == name).then_some(m)
+        })
         .filter(|m| b.dir().join(&m.name).exists())
         .collect();
     out.sort_by(|a, b| b.created.cmp(&a.created).then(b.name.cmp(&a.name)));
@@ -926,6 +959,8 @@ fn prune(b: &Backups, kind: Kind, keep: usize) {
 pub fn schedule(b: Backups, store: Arc<store::Store>) {
     tokio::spawn(async move {
         let mut every = tokio::time::interval(Duration::from_secs(60));
+        // A long backup is followed by one check, not one per minute it took.
+        every.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         // After a failed automatic backup, the next try waits an hour.
         let mut retry_at: Ts = 0;
         loop {
@@ -1076,15 +1111,21 @@ fn stage(b: &Backups, path: &Path) -> Result<(String, Manifest)> {
     let dest = b.staging().join(&id);
     fs::create_dir_all(b.staging())?;
     fs::create_dir(&dest)?;
-    let m = match unpack(path, b.key.as_ref(), &dest) {
-        Ok(m) => m,
+    // Synced, files and directories: a file lost from staging by a power cut
+    // would be missing from the restore.
+    let staged = unpack(path, b.key.as_ref(), &dest).and_then(|m| {
+        write_synced(&dest.join("manifest.json"), &serde_json::to_vec_pretty(&m)?)?;
+        sync_dir(&dest)?;
+        sync_dir(&b.staging())?;
+        Ok(m)
+    });
+    match staged {
+        Ok(m) => Ok((id, m)),
         Err(e) => {
             let _ = fs::remove_dir_all(&dest);
-            return Err(e);
+            Err(e)
         }
-    };
-    fs::write(dest.join("manifest.json"), serde_json::to_vec_pretty(&m)?)?;
-    Ok((id, m))
+    }
 }
 
 #[derive(Deserialize)]
@@ -1170,8 +1211,9 @@ pub async fn restore(State(s): State<AppState>, Json(body): Json<RestoreBody>) -
             _ => bail!("say which backup to restore"),
         };
         let previous = fs::read_to_string(b.staging().join("pending")).ok();
-        fs::write(b.staging().join("pending"), &id)?;
+        write_synced(&b.staging().join("pending"), id.as_bytes())?;
         let _ = fs::remove_file(b.staging().join("pending.failed"));
+        sync_dir(&b.staging())?;
         // A restore staged before and now replaced.
         if let Some(p) = previous.as_deref().map(str::trim).filter(|p| *p != id && valid_id(p)) {
             let _ = fs::remove_dir_all(b.staging().join(p));
@@ -1401,6 +1443,23 @@ mod tests {
     }
 
     #[test]
+    fn a_description_counts_only_beside_its_own_backup() {
+        let src = data("stray-meta");
+        let b = Backups::new(src.to_path_buf(), None);
+        let m = create(&b, &src, Kind::Auto, 0).unwrap();
+        let mut stray = m.clone();
+        stray.name = "../config.db".into();
+        fs::write(b.dir().join("apctl-auto-x.apb.json"), serde_json::to_vec(&stray).unwrap()).unwrap();
+        fs::write(b.dir().join("apctl-auto-x.apb"), "x").unwrap();
+        fs::copy(b.dir().join(format!("{}.json", m.name)), b.dir().join("apctl-copy.apb.json")).unwrap();
+        fs::write(b.dir().join("apctl-copy.apb"), "x").unwrap();
+        assert_eq!(list(&b).iter().map(|x| x.name.as_str()).collect::<Vec<_>>(), [m.name.as_str()], "listed once");
+        prune(&b, Kind::Auto, 0);
+        assert!(src.join("config.db").exists(), "the live database is never pruned");
+        assert!(list(&b).is_empty() && !b.dir().join(&m.name).exists());
+    }
+
+    #[test]
     fn unfinished_backups_are_cleared_at_start() {
         let src = data("unfinished");
         let b = Backups::new(src.to_path_buf(), None);
@@ -1443,7 +1502,8 @@ mod tests {
         let (id, _) = stage(&b, &b.dir().join(&m.name)).unwrap();
         fs::write(b.staging().join("pending"), &id).unwrap();
         // As if apctl stopped after moving config.db beside its place, with the
-        // replaced database's journal still there.
+        // replaced database's journal still there (begun by an apctl that did
+        // not mark it so).
         fs::rename(b.staging().join(&id).join("config.db"), src.join("config.db.restoring")).unwrap();
         fs::write(src.join("config.db-wal"), "the old journal").unwrap();
         apply_pending(&b);
@@ -1464,6 +1524,11 @@ mod tests {
         let (id, _) = stage(&b, &b.dir().join(&m.name)).unwrap();
         fs::write(b.staging().join("pending"), &id).unwrap();
         (src, b, id)
+    }
+
+    /// Marks a staged restore as begun, as a run does before it moves anything.
+    fn begun(b: &Backups, id: &str) {
+        fs::write(b.staging().join(id).join("started"), "").unwrap();
     }
 
     /// Puts something in the way of a path: a directory with a file in it
@@ -1499,6 +1564,19 @@ mod tests {
         assert!(fs::read_to_string(b.staging().join("pending.failed")).unwrap().contains("moving config.db"));
         assert_eq!(aliases(&src), 0, "the current data is kept");
         assert!(b.staging().join(&id).join("config.db").exists(), "nothing has left staging");
+        assert!(!b.staging().join(&id).join("started").exists(), "staged again, it begins afresh");
+    }
+
+    #[test]
+    fn a_file_lost_from_staging_is_not_taken_for_one_moved_in() {
+        let (src, b, id) = staged_restore("lost");
+        // As if a power cut lost a staged file before the restore began.
+        fs::remove_file(b.staging().join(&id).join("metrics.db")).unwrap();
+        apply_pending(&b);
+        assert_eq!(marked(&b), (false, true), "set aside, not reported complete");
+        assert!(fs::read_to_string(b.staging().join("pending.failed")).unwrap().contains("metrics.db is missing"));
+        assert_eq!(aliases(&src), 0, "the current data is kept");
+        assert!(b.staging().join(&id).join("config.db").exists(), "nothing has left staging");
     }
 
     #[test]
@@ -1524,6 +1602,7 @@ mod tests {
         let (src, b, id) = staged_restore("fail-swap");
         // As if a run had moved config.db and logs.db beside their place
         // (and saved the state before); logs.db's old journal cannot go.
+        begun(&b, &id);
         for n in ["config.db", "logs.db"] {
             fs::rename(b.staging().join(&id).join(n), src.join(format!("{n}.restoring"))).unwrap();
         }
@@ -1540,6 +1619,7 @@ mod tests {
     #[test]
     fn a_restore_cut_off_after_its_last_file_finishes() {
         let (src, b, id) = staged_restore("cut-last");
+        begun(&b, &id);
         for n in DATABASES {
             fs::rename(b.staging().join(&id).join(n), src.join(n)).unwrap();
         }
