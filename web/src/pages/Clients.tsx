@@ -169,6 +169,7 @@ function ClientList({ tabs }: { tabs: React.ReactNode }) {
         </label>
         <input
           className="search"
+          aria-label="Filter clients"
           placeholder="Filter by name, note, MAC, IP, SSID or AP"
           value={filter}
           onChange={(e) => setFilter(e.target.value)}

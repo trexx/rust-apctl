@@ -437,6 +437,7 @@ function Environment() {
           <span className="spacer" />
           <input
             className="search"
+            aria-label="Filter neighbouring networks"
             placeholder="Filter by name, BSSID, vendor…"
             value={q}
             onChange={(e) => setQ(e.target.value)}
