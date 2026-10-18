@@ -172,7 +172,7 @@ pub fn start_scans(live: &mut Live, band: &Band, now: Ts) -> Vec<Mac> {
 }
 
 /// Marks finished scans: the AP reported scanning and then stopped, its
-/// spectrum table for the band is younger than the request, it went offline,
+/// spectrum table for the band was made after the request, it went offline,
 /// or it timed out.
 pub fn check_scans(live: &mut Live, now: Ts) {
     let Live { scans, raw_informs, devices, .. } = live;
@@ -183,8 +183,10 @@ pub fn check_scans(live: &mut Live, now: Ts) {
             Some(false) if s.seen_scanning => return false,
             _ => {}
         }
-        let renewed = spectrum_age(p, s.band).is_some_and(|age| age < now - s.started);
-        let offline = devices.get(mac).is_some_and(|d| !d.online);
+        // The table's age is as of the full inform that holds it, not now.
+        let d = devices.get(mac);
+        let renewed = d.zip(spectrum_age(p, s.band)).is_some_and(|(d, age)| d.last_full_inform - age > s.started);
+        let offline = d.is_some_and(|d| !d.online);
         !renewed && !offline && now - s.started < SCAN_TIMEOUT
     });
 }
@@ -627,12 +629,19 @@ mod tests {
         let mut live = Live::default();
         let ap: Mac = "02:00:00:00:00:01".parse().unwrap();
         let inform = |age: i64, scanning: Option<bool>| {
-            let mut p = json!({ "wifi_caps2": 128, "uplink": "eth0", "radio_table": [{ "radio": "na", "spectrum_table_time": age }] });
+            let mut p = json!({ "mac": ap.to_string(), "wifi_caps2": 128, "uplink": "eth0", "vap_table": [], "radio_table": [{ "radio": "na", "spectrum_table_time": age }] });
             if let Some(b) = scanning {
                 p["quickscan_scanning"] = json!(b);
             }
             std::sync::Arc::new(p)
         };
+        // The AP's last full inform arrived at `at`.
+        let heard = |live: &mut Live, at: Ts| {
+            let snapshot = crate::model::parse(at, &inform(0, None)).unwrap();
+            let d = crate::engine::DeviceView { snapshot, online: true, first_seen: 0, last_seen: at, peer: String::new(), interval: 10, last_full_inform: at, last_config_push: None };
+            live.devices.insert(ap, d);
+        };
+        heard(&mut live, 995);
         live.raw_informs.insert(ap, inform(56_000, None));
         // (Asked for directly: start_scans only asks APs that are online.)
         crate::actions::queue(&mut live, ap, json!({ "_type": "cmd", "cmd": "quick-scan" }));
@@ -640,12 +649,25 @@ mod tests {
         assert_eq!(crate::actions::next(&mut live, &ap).unwrap()["cmd"], "quick-scan");
         check_scans(&mut live, 1010);
         assert_eq!(live.scans.len(), 1, "the old table does not count");
+        heard(&mut live, 1011);
         live.raw_informs.insert(ap, inform(56_011, Some(true)));
         check_scans(&mut live, 1020);
         assert_eq!(live.scans.len(), 1);
+        heard(&mut live, 1040);
         live.raw_informs.insert(ap, inform(3, None));
         check_scans(&mut live, 1040);
         assert!(live.scans.is_empty(), "a table 3 s old is from this scan");
+        // A table from just before the request, reported before it, is not this
+        // scan's however long ago that report came.
+        live.scans.insert(ap, Scan { band: "na", started: 1100, seen_scanning: false });
+        heard(&mut live, 1098);
+        live.raw_informs.insert(ap, inform(5, None));
+        check_scans(&mut live, 1130);
+        assert_eq!(live.scans.len(), 1, "made at 1093, before the request at 1100");
+        heard(&mut live, 1130);
+        live.raw_informs.insert(ap, inform(10, None));
+        check_scans(&mut live, 1130);
+        assert!(live.scans.is_empty(), "made at 1120");
         // Without an answer, a scan gives up after two minutes.
         live.scans.insert(ap, Scan { band: "na", started: 2000, seen_scanning: false });
         live.raw_informs.insert(ap, inform(56_000, None));
