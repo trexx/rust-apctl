@@ -291,14 +291,21 @@ pub fn assess(a: &Assessment) -> Vec<Finding> {
     let mut ours: Vec<&String> = a.ssids.iter().collect();
     ours.sort();
     let ours: Vec<Name> = ours.into_iter().map(|o| Name::new(o)).collect();
-    // The security our own networks show in scans, to compare copies against.
-    let mut expected: HashMap<&str, &str> = HashMap::new();
+    // Every security our own networks show in scans, to compare copies
+    // against: one name can have several (WPA3 on 6 GHz, WPA2 elsewhere), and
+    // a copy matching any of them is not called different. Sorted, so the
+    // detail names them the same way whatever order the rows came in.
+    let mut expected: HashMap<&str, Vec<&str>> = HashMap::new();
     for h in &a.heard {
         if let (Some(e), Some(s)) = (&h.essid, &h.security)
             && own.contains_key(h.bssid.as_str())
         {
-            expected.insert(e.as_str(), s.as_str());
+            expected.entry(e.as_str()).or_default().push(s.as_str());
         }
+    }
+    for v in expected.values_mut() {
+        v.sort_unstable();
+        v.dedup();
     }
     let watched_for = a.now - a.watching_since;
     let ap_name = |mac: &str| a.aps.get(mac).cloned().flatten();
@@ -387,16 +394,16 @@ pub fn assess(a: &Assessment) -> Vec<Finding> {
         if let Some(e) = essid {
             if a.ssids.contains(e) {
                 let theirs = latest.security.as_deref();
-                let ours = expected.get(e).copied();
+                let ours = expected.get(e).filter(|o| !o.is_empty());
                 let open = theirs.is_some_and(|s| s.to_ascii_lowercase().contains("open") || s.eq_ignore_ascii_case("none"));
                 let detail = if family {
                     format!("Broadcasts your network \"{e}\" from an address next to one of your APs'. It is probably your AP with an SSID apctl has not seen yet; if not, it is imitating it.")
                 } else if open {
                     format!("Broadcasts your network name \"{e}\" with no password. Devices that join it can have their traffic intercepted: a classic evil twin.")
                 } else if let (Some(t), Some(o)) = (theirs, ours)
-                    && t != o
+                    && !o.contains(&t)
                 {
-                    format!("Broadcasts your network name \"{e}\" from a device that is not yours, with different security ({t}, yours is {o}).")
+                    format!("Broadcasts your network name \"{e}\" from a device that is not yours, with different security ({t}, yours is {}).", o.join(" or "))
                 } else {
                     format!("Broadcasts your network name \"{e}\" from a device that is not one of your APs.")
                 };
@@ -969,6 +976,25 @@ mod tests {
         let mut a = site();
         a.heard.push(heard("02:11:22:33:44:55", DOWN, "Home", 6, "WPA-Personal (TKIP)", -70));
         assert!(assess(&a)[0].detail.contains("different security"));
+        // A name ours broadcast with two securities: a copy with either is not
+        // called different, whichever row comes last, and one with neither
+        // names both.
+        let mut a = site();
+        a.heard.push(heard("78:45:58:3c:52:be", UP, "Home", 48, "WPA3-Personal", -81));
+        for (sec, different) in [("WPA2-Personal (AES/CCMP)", false), ("WPA3-Personal", false), ("WPA-Personal (TKIP)", true)] {
+            for order in [false, true] {
+                let mut a = Assessment { heard: a.heard.clone(), own: a.own.clone(), ssids: a.ssids.clone(), aps: a.aps.clone(), now: a.now, ..Default::default() };
+                if order {
+                    a.heard.reverse();
+                }
+                a.heard.push(heard("02:11:22:33:44:55", DOWN, "Home", 6, sec, -70));
+                let detail = assess(&a).remove(0).detail;
+                assert_eq!(detail.contains("different security"), different, "{sec}: {detail}");
+                if different {
+                    assert!(detail.contains("yours is WPA2-Personal (AES/CCMP) or WPA3-Personal"), "{detail}");
+                }
+            }
+        }
         // Next to our AP's own addresses: probably ours, so only medium.
         let mut a = site();
         a.heard.push(heard("7a:45:58:3c:52:bf", UP, "Home", 48, "WPA2-Personal (AES/CCMP)", -80));
