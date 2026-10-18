@@ -1641,7 +1641,7 @@ fn check_config_network(p: &Value, before: &Value) -> Result<Value, String> {
         out["dns2"] = json!(d.to_string());
     }
     if let Some(suffix) = p["dnssuffix"].as_str().map(str::trim).filter(|s| !s.is_empty()) {
-        if suffix.len() > 253 || !suffix.split('.').all(|l| !l.is_empty() && l.len() <= 63 && l.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')) {
+        if !crate::site::is_domain_name(suffix) {
             return Err(format!("{suffix} is not a domain name"));
         }
         out["dnssuffix"] = json!(suffix);
@@ -2092,6 +2092,11 @@ mod tests {
         assert!(dev(&mut s, static_ip("192.168.1.20", "10.0.0.1")).unwrap_err().contains("gateway"));
         assert!(dev(&mut s, static_ip("192.168.1.255", "192.168.1.1")).is_err(), "broadcast address");
         assert!(dev(&mut s, json!({ "config_network": { "type": "static", "ip": "192.168.1.20" } })).is_err(), "netmask needed");
+        let with_suffix = |d: &str| json!({ "config_network": { "type": "static", "ip": "192.168.1.20", "netmask": "255.255.255.0", "gateway": "192.168.1.1", "dns1": "192.168.1.1", "dnssuffix": d } });
+        dev(&mut s.clone(), with_suffix("home-1.lan")).unwrap();
+        for bad in ["-home.lan", "home-.lan", "home..lan", "home_1.lan"] {
+            assert!(dev(&mut s.clone(), with_suffix(bad)).unwrap_err().contains("not a domain name"), "{bad}");
+        }
         dev(&mut s, json!({ "config_network": { "type": "dhcp", "ip": "192.168.1.20" } })).unwrap();
         assert_eq!(s["devices"][0]["config_network"], json!({ "type": "dhcp" }));
     }

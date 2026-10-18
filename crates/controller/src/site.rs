@@ -13,11 +13,16 @@ use crate::settings::Kind::{Bool, Int};
 use crate::settings::{COUNTRIES, Patch, PreviewQuery, band_name, copy_fields, country, dedup_in_order, device_label, docs_mut, illegal_fixed_channel, mgmt_flag, num, outdoor_with, pick, setting, setting_mut, timezone};
 
 /// A host name or IPv4 address, as NTP and syslog targets take (the official
-/// controller refuses IPv6 there). A name's labels are letters, digits and
-/// hyphens, neither starting nor ending with a hyphen.
+/// controller refuses IPv6 there).
 fn is_host(h: &str) -> bool {
+    h.parse::<std::net::Ipv4Addr>().is_ok() || is_domain_name(h)
+}
+
+/// A domain name: labels of letters, digits and hyphens, neither starting nor
+/// ending with a hyphen, and a letter somewhere (so it is no address).
+pub(crate) fn is_domain_name(h: &str) -> bool {
     let label = |l: &str| !l.is_empty() && l.len() <= 63 && !l.starts_with('-') && !l.ends_with('-') && l.chars().all(|c| c.is_ascii_alphanumeric() || c == '-');
-    !h.is_empty() && h.len() <= 253 && (h.parse::<std::net::Ipv4Addr>().is_ok() || h.chars().any(|c| c.is_ascii_alphabetic()) && h.split('.').all(label))
+    h.len() <= 253 && h.chars().any(|c| c.is_ascii_alphabetic()) && h.split('.').all(label)
 }
 
 /// The servers automatic NTP stands for.
