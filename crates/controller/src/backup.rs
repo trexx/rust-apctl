@@ -892,14 +892,20 @@ fn load_settings(store: &store::Store) -> Result<Settings> {
     Ok(stored.map(|s| serde_json::from_str::<Settings>(&s)).transpose()?.unwrap_or_default())
 }
 
-/// Backups in the directory, newest first.
+/// Backups in the directory, newest first. A description counts only beside
+/// its own backup (`<name>.json`, with a name apctl gives): a copied one would
+/// list a backup twice, and an edited one could name any file to prune.
 pub fn list(b: &Backups) -> Vec<Meta> {
     let mut out: Vec<Meta> = fs::read_dir(b.dir())
         .into_iter()
         .flatten()
         .flatten()
-        .filter(|e| e.file_name().to_string_lossy().ends_with(".apb.json"))
-        .filter_map(|e| serde_json::from_slice::<Meta>(&fs::read(e.path()).ok()?).ok())
+        .filter_map(|e| {
+            let file = e.file_name().into_string().ok()?;
+            let name = file.strip_suffix(".json").filter(|n| valid_name(n))?;
+            let m = serde_json::from_slice::<Meta>(&fs::read(e.path()).ok()?).ok()?;
+            (m.name == name).then_some(m)
+        })
         .filter(|m| b.dir().join(&m.name).exists())
         .collect();
     out.sort_by(|a, b| b.created.cmp(&a.created).then(b.name.cmp(&a.name)));
@@ -1400,6 +1406,23 @@ mod tests {
         assert_eq!(b.known().last_auto, Some(m.created), "kept by the backup made");
         fs::remove_file(b.dir().join(format!("{}.json", m.name))).unwrap();
         assert_eq!(b.last_auto(), m.created, "not read again");
+    }
+
+    #[test]
+    fn a_description_counts_only_beside_its_own_backup() {
+        let src = data("stray-meta");
+        let b = Backups::new(src.to_path_buf(), None);
+        let m = create(&b, &src, Kind::Auto, 0).unwrap();
+        let mut stray = m.clone();
+        stray.name = "../config.db".into();
+        fs::write(b.dir().join("apctl-auto-x.apb.json"), serde_json::to_vec(&stray).unwrap()).unwrap();
+        fs::write(b.dir().join("apctl-auto-x.apb"), "x").unwrap();
+        fs::copy(b.dir().join(format!("{}.json", m.name)), b.dir().join("apctl-copy.apb.json")).unwrap();
+        fs::write(b.dir().join("apctl-copy.apb"), "x").unwrap();
+        assert_eq!(list(&b).iter().map(|x| x.name.as_str()).collect::<Vec<_>>(), [m.name.as_str()], "listed once");
+        prune(&b, Kind::Auto, 0);
+        assert!(src.join("config.db").exists(), "the live database is never pruned");
+        assert!(list(&b).is_empty() && !b.dir().join(&m.name).exists());
     }
 
     #[test]
