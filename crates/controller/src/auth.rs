@@ -371,17 +371,25 @@ fn session_token(headers: &HeaderMap) -> Option<String> {
         .map(|(_, v)| v.to_string())
 }
 
-fn cookie(headers: &HeaderMap, value: &str, max_age: Ts) -> String {
-    let https = headers.get("x-forwarded-proto").and_then(|v| v.to_str().ok()) == Some("https");
+/// The session cookie, Secure when the browser used HTTPS: apctl serves
+/// plain HTTP, so that is only known from X-Forwarded-Proto, believed (as
+/// the other forwarded headers are) only from a trusted proxy.
+fn cookie(auth: &Auth, headers: &HeaderMap, peer: Option<IpAddr>, value: &str, max_age: Ts) -> String {
+    let https = peer.is_some_and(|p| auth.proxies.contains(p)) && headers.get("x-forwarded-proto").and_then(|v| v.to_str().ok()) == Some("https");
     format!("{COOKIE}={value}; Path=/; HttpOnly; SameSite=Lax; Max-Age={max_age}{}", if https { "; Secure" } else { "" })
+}
+
+/// The address a request came from (the proxy's, behind one), when the server passes it on.
+fn peer_of(extensions: &axum::http::Extensions) -> Option<IpAddr> {
+    extensions.get::<ConnectInfo<SocketAddr>>().map(|c| c.0.ip())
 }
 
 /// The user of the request's session, if it is a valid one; and the cookie
 /// to send again when using it extended it (see `renewed`).
-fn session(auth: &Auth, headers: &HeaderMap) -> Option<(String, Option<String>)> {
+fn session(auth: &Auth, headers: &HeaderMap, peer: Option<IpAddr>) -> Option<(String, Option<String>)> {
     let token = session_token(headers)?;
     let (user, extended) = auth.check(&token)?;
-    Some((user, extended.then(|| cookie(headers, &token, SESSION_SECS))))
+    Some((user, extended.then(|| cookie(auth, headers, peer, &token, SESSION_SECS))))
 }
 
 /// For the routes that hand out secrets (Wi-Fi passphrases, and backups, which
@@ -418,7 +426,7 @@ pub async fn require_login(State(s): State<AppState>, req: Request, next: Next) 
         }
         return Ok(next.run(req).await);
     }
-    match session(&s.auth, req.headers()) {
+    match session(&s.auth, req.headers(), peer_of(req.extensions())) {
         Some(_) if mutating && !csrf_ok(req.headers()) => Err(csrf_refused()),
         Some((_, cookie)) => Ok(renewed(next.run(req).await, cookie)),
         None => Err(ApiError(StatusCode::UNAUTHORIZED, "login required".into())),
@@ -466,7 +474,7 @@ pub async fn login(
     auth.refund(ip);
     let token = auth.create(&user);
     tracing::info!("{user} logged in from {ip}");
-    Ok(([(header::SET_COOKIE, cookie(&headers, &token, SESSION_SECS))], Json(json!({ "user": user }))).into_response())
+    Ok(([(header::SET_COOKIE, cookie(&auth, &headers, Some(peer.ip()), &token, SESSION_SECS))], Json(json!({ "user": user }))).into_response())
 }
 
 /// Runs `check` on a blocking thread while it holds one of `slots`, or None
@@ -486,22 +494,23 @@ async fn in_slot<T: Send + 'static>(slots: &'static Semaphore, wait: Duration, c
 
 /// A change like any other, so it needs the CSRF header too: another site
 /// cannot log a visitor out.
-pub async fn logout(State(s): State<AppState>, headers: HeaderMap) -> Result<Response, ApiError> {
-    if !csrf_ok(&headers) {
+pub async fn logout(State(s): State<AppState>, req: Request) -> Result<Response, ApiError> {
+    let headers = req.headers();
+    if !csrf_ok(headers) {
         return Err(csrf_refused());
     }
-    if let Some(t) = session_token(&headers) {
+    if let Some(t) = session_token(headers) {
         s.auth.revoke(&t);
     }
-    Ok(([(header::SET_COOKIE, cookie(&headers, "", 0))], Json(json!({ "ok": true }))).into_response())
+    Ok(([(header::SET_COOKIE, cookie(&s.auth, headers, peer_of(req.extensions()), "", 0))], Json(json!({ "ok": true }))).into_response())
 }
 
 /// Who is logged in, and whether login is needed at all.
-pub async fn me(State(s): State<AppState>, headers: HeaderMap) -> Response {
+pub async fn me(State(s): State<AppState>, req: Request) -> Response {
     if !s.auth.enabled() {
         return Json(json!({ "auth": false, "user": null, "read_only": true })).into_response();
     }
-    match session(&s.auth, &headers) {
+    match session(&s.auth, req.headers(), peer_of(req.extensions())) {
         Some((user, cookie)) => renewed(Json(json!({ "auth": true, "user": user, "read_only": false })).into_response(), cookie),
         None => (StatusCode::UNAUTHORIZED, Json(json!({ "auth": true, "user": null }))).into_response(),
     }

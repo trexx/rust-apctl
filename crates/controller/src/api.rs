@@ -1420,10 +1420,16 @@ mod tests {
 
     /// The app's state with one user, that user's session cookie, and the data directory.
     fn logged_in() -> (AppState, tokio::sync::mpsc::Receiver<crate::engine::Input>, String, TestDir) {
+        logged_in_behind(&[])
+    }
+
+    /// As `logged_in`, with these trusted proxies.
+    fn logged_in_behind(proxies: &[&str]) -> (AppState, tokio::sync::mpsc::Receiver<crate::engine::Input>, String, TestDir) {
         let (mut state, engine, dir) = state();
         let file = state.backups.data_dir.join("users");
         std::fs::write(&file, format!("admin:{}\n", crate::auth::hash_password("x").unwrap())).unwrap();
-        state.get_mut().auth = Arc::new(crate::auth::Auth::new(crate::auth::Users::load(&file).unwrap(), &state.store, state.writer.clone(), Default::default()).unwrap());
+        let proxies = Arc::new(crate::auth::Proxies::parse(&proxies.iter().map(|p| p.to_string()).collect::<Vec<_>>()).unwrap());
+        state.get_mut().auth = Arc::new(crate::auth::Auth::new(crate::auth::Users::load(&file).unwrap(), &state.store, state.writer.clone(), proxies).unwrap());
         let cookie = format!("{}={}", crate::auth::COOKIE, state.auth.create("admin"));
         (state, engine, cookie, dir)
     }
@@ -1518,12 +1524,13 @@ mod tests {
 
     #[tokio::test]
     async fn a_session_used_a_day_later_gets_its_cookie_again() {
-        let (state, _engine, cookie, _dir) = logged_in();
+        let (state, _engine, cookie, _dir) = logged_in_behind(&["10.42.0.0/16"]);
         let token = cookie.split_once('=').unwrap().1;
         let auth = state.auth.clone();
         let app = router(state);
-        let set_cookie = |path: &'static str| {
-            let req = Request::get(path).header(header::COOKIE, &cookie).header("x-forwarded-proto", "https").body(Body::empty()).unwrap();
+        let from = |peer: &str, path: &'static str| {
+            let peer = axum::extract::ConnectInfo(std::net::SocketAddr::new(peer.parse().unwrap(), 40000));
+            let req = Request::get(path).header(header::COOKIE, &cookie).header("x-forwarded-proto", "https").extension(peer).body(Body::empty()).unwrap();
             let app = app.clone();
             async move {
                 let res = app.oneshot(req).await.unwrap();
@@ -1531,13 +1538,18 @@ mod tests {
                 res.headers().get(header::SET_COOKIE).map(|v| v.to_str().unwrap().to_string())
             }
         };
-        assert_eq!(set_cookie("/api/status").await, None, "fresh from the login");
+        const PROXY: &str = "10.42.0.3";
+        assert_eq!(from(PROXY, "/api/status").await, None, "fresh from the login");
         for path in ["/api/status", "/api/me"] {
             auth.age_session(token, 2 * 86400);
-            let c = set_cookie(path).await.unwrap_or_else(|| panic!("{path}: no cookie"));
+            let c = from(PROXY, path).await.unwrap_or_else(|| panic!("{path}: no cookie"));
             assert!(c.starts_with(&format!("{}={token};", crate::auth::COOKIE)) && c.contains("Max-Age=2592000") && c.ends_with("; Secure"), "{c}");
-            assert_eq!(set_cookie(path).await, None, "{path}: once a day");
+            assert_eq!(from(PROXY, path).await, None, "{path}: once a day");
         }
+        // X-Forwarded-Proto is believed only from a trusted proxy.
+        auth.age_session(token, 2 * 86400);
+        let c = from("192.168.1.20", "/api/status").await.unwrap();
+        assert!(c.contains("Max-Age=2592000") && !c.contains("Secure"), "{c}");
     }
 
     #[tokio::test]
