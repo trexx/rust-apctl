@@ -22,8 +22,9 @@ const HTML: &str = "text/html; charset=utf-8";
 
 pub async fn handler(uri: Uri, headers: HeaderMap) -> Response {
     let path = uri.path().trim_start_matches('/');
+    // Answered as every API error is, so the UI shows its message.
     if path.starts_with("api/") {
-        return (StatusCode::NOT_FOUND, "unknown API route").into_response();
+        return crate::api::ApiError(StatusCode::NOT_FOUND, "unknown API route".into()).into_response();
     }
     if let Some(file) = Assets::get(path).filter(|_| !path.is_empty()) {
         let cache = if path.starts_with("assets/") { IMMUTABLE } else { NO_CACHE };
@@ -70,6 +71,14 @@ mod tests {
     async fn unknown_assets_are_not_the_app_shell() {
         let r = handler(Uri::from_static("/assets/index-0000dead.js"), HeaderMap::new()).await;
         assert_eq!(r.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn an_unknown_api_route_is_answered_in_json() {
+        let r = handler(Uri::from_static("/api/nope"), HeaderMap::new()).await;
+        assert_eq!(r.status(), StatusCode::NOT_FOUND);
+        let body = axum::body::to_bytes(r.into_body(), 1 << 10).await.unwrap();
+        assert_eq!(serde_json::from_slice::<serde_json::Value>(&body).unwrap(), serde_json::json!({ "error": "unknown API route" }));
     }
 
     #[test]

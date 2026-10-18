@@ -875,8 +875,14 @@ struct Where {
 impl Where {
     /// Adds a condition; its `?` stands for `value`.
     fn and(&mut self, sql: &str, value: Sql) {
+        let mark = self.param(value);
+        self.cond.push(sql.replace('?', &mark));
+    }
+
+    /// Adds a parameter, and returns its placeholder (`?N`) for SQL written outside the conditions.
+    fn param(&mut self, value: Sql) -> String {
         self.params.push(value);
-        self.cond.push(sql.replace('?', &format!("?{}", self.params.len())));
+        format!("?{}", self.params.len())
     }
 
     fn sql(&self) -> String {
@@ -951,13 +957,7 @@ async fn events(State(s): State<AppState>, Query(q): Query<EventQuery>) -> Resul
             // older event when fewer than the limit are new.
             w.and("id > ?", Sql::Integer(after));
             if !kinds.is_empty() {
-                let marks: Vec<String> = kinds
-                    .into_iter()
-                    .map(|k| {
-                        w.params.push(Sql::Text(k));
-                        format!("?{}", w.params.len())
-                    })
-                    .collect();
+                let marks: Vec<String> = kinds.into_iter().map(|k| w.param(Sql::Text(k))).collect();
                 w.cond.push(format!("kind IN ({})", marks.join(", ")));
             }
             format!("SELECT {COLUMNS} FROM events NOT INDEXED WHERE {} ORDER BY ts DESC, id DESC LIMIT {limit}", w.sql())
@@ -970,10 +970,7 @@ async fn events(State(s): State<AppState>, Query(q): Query<EventQuery>) -> Resul
             let filters = w.sql();
             let parts: Vec<String> = kinds
                 .into_iter()
-                .map(|k| {
-                    w.params.push(Sql::Text(k));
-                    format!("SELECT * FROM (SELECT {COLUMNS} FROM events WHERE {filters} AND kind = ?{} ORDER BY ts DESC, id DESC LIMIT {limit})", w.params.len())
-                })
+                .map(|k| format!("SELECT * FROM (SELECT {COLUMNS} FROM events WHERE {filters} AND kind = {} ORDER BY ts DESC, id DESC LIMIT {limit})", w.param(Sql::Text(k))))
                 .collect();
             format!("{} ORDER BY ts DESC, id DESC LIMIT {limit}", parts.join(" UNION ALL "))
         };
@@ -1184,6 +1181,12 @@ mod tests {
         (router(state), engine, dir)
     }
 
+    /// An AP's report, decoded, as the engine gets it at time 50.
+    fn report(payload: Value) -> crate::engine::Input {
+        let header = inform::Header { packet_version: 0, mac: Mac([0; 6]), flags: inform::Flags(0), iv: [0; 16], payload_version: 1, payload_len: 0 };
+        crate::engine::Input::Inform { ts: 50, peer: "x".into(), decoded: wire::decode::Decoded { header, key: wire::decode::KeyUsed::Device, payload } }
+    }
+
     async fn get_json(app: &Router, path: &str) -> Value {
         let res = app.clone().oneshot(Request::get(path).body(Body::empty()).unwrap()).await.unwrap();
         assert_eq!(res.status(), StatusCode::OK);
@@ -1199,13 +1202,11 @@ mod tests {
         let payload = json!({ "mac": "02:00:00:00:00:01", "hostname": "Hall", "uptime": 100, "vap_table": [
             { "bssid": "b1", "essid": "Home", "radio": "na", "channel": 36, "usage": "user", "sta_table": [{ "mac": "02:00:00:00:01:01", "hostname": "phone" }] },
         ] });
-        let header = inform::Header { packet_version: 0, mac: Mac([0; 6]), flags: inform::Flags(0), iv: [0; 16], payload_version: 1, payload_len: 0 };
-        let decoded = wire::decode::Decoded { header, key: wire::decode::KeyUsed::Device, payload };
         // The one in the database is restored as at start, before any inform.
         s.writer.exec(Db::Config, "INSERT INTO devices (mac, hostname, model, first_seen, last_seen) VALUES ('02:00:00:00:00:02', 'Attic', 'U6', 10, 20)", vec![]);
         assert!(s.writer.flush(std::time::Duration::from_secs(5)));
         engine.restore(&s.store).unwrap();
-        engine.handle(crate::engine::Input::Inform { ts: 50, peer: "x".into(), decoded });
+        engine.handle(report(payload));
         let app = router(s);
 
         let list = get_json(&app, "/api/devices").await;
@@ -1283,9 +1284,7 @@ mod tests {
         let (s, _engine, _dir) = state();
         let (tx, _) = broadcast::channel(16);
         let mut engine = crate::engine::Engine::new(s.writer.clone(), Default::default(), s.live.clone(), tx);
-        let header = inform::Header { packet_version: 0, mac: Mac([0; 6]), flags: inform::Flags(0), iv: [0; 16], payload_version: 1, payload_len: 0 };
-        let payload = json!({ "mac": "02:00:00:00:00:01", "hostname": "Hall", "uptime": 100 });
-        engine.handle(crate::engine::Input::Inform { ts: 50, peer: "x".into(), decoded: wire::decode::Decoded { header, key: wire::decode::KeyUsed::Device, payload } });
+        engine.handle(report(json!({ "mac": "02:00:00:00:00:01", "hostname": "Hall", "uptime": 100 })));
         s.writer.exec(Db::Config, "INSERT INTO device_config (mac, ts, mgmt_cfg, system_cfg) VALUES ('02:00:00:00:00:01', 1, 'a=1', 'b=2')", vec![]);
         s.writer.exec(Db::Config, "INSERT INTO dryrun_results (ts, mac, matches, comparison) VALUES (7, '02:00:00:00:00:01', 1, '{}')", vec![]);
         assert!(s.writer.flush(std::time::Duration::from_secs(5)));
@@ -1366,23 +1365,14 @@ mod tests {
         assert_eq!(get(&app, "/api/settings/wlans/w1/passphrase").await.status(), StatusCode::FORBIDDEN);
         assert_eq!(get(&app, "/api/backups/file/apctl-0.1.0-20260101-000000.apb").await.status(), StatusCode::FORBIDDEN);
         // With a login they are served (here: there are no settings yet).
-        let (mut state, _engine, _dir) = state();
-        let file = state.backups.data_dir.join("users");
-        std::fs::write(&file, format!("admin:{}\n", crate::auth::hash_password("x").unwrap())).unwrap();
-        state.get_mut().auth = Arc::new(crate::auth::Auth::new(crate::auth::Users::load(&file).unwrap(), &state.store, state.writer.clone(), Default::default()).unwrap());
-        let cookie = format!("{}={}", crate::auth::COOKIE, state.auth.create("admin").unwrap());
+        let (state, _engine, cookie, _dir) = logged_in();
         let req = Request::get("/api/settings/wlans/w1/passphrase").header(header::COOKIE, cookie).body(Body::empty()).unwrap();
         assert_eq!(router(state).oneshot(req).await.unwrap().status(), StatusCode::CONFLICT);
     }
 
     #[tokio::test]
     async fn changes_need_the_csrf_header() {
-        let (mut state, _engine, _dir) = state();
-        let file = state.backups.data_dir.join("users");
-        std::fs::write(&file, format!("admin:{}\n", crate::auth::hash_password("x").unwrap())).unwrap();
-        let users = crate::auth::Users::load(&file).unwrap();
-        state.get_mut().auth = Arc::new(crate::auth::Auth::new(users, &state.store, state.writer.clone(), Default::default()).unwrap());
-        let cookie = format!("{}={}", crate::auth::COOKIE, state.auth.create("admin").unwrap());
+        let (state, _engine, cookie, _dir) = logged_in();
         let app = router(state);
         let post = |csrf: bool| {
             let mut req = Request::post("/api/alerts/read").header(header::COOKIE, &cookie);
@@ -1430,11 +1420,17 @@ mod tests {
 
     /// The app's state with one user, that user's session cookie, and the data directory.
     fn logged_in() -> (AppState, tokio::sync::mpsc::Receiver<crate::engine::Input>, String, TestDir) {
+        logged_in_behind(&[])
+    }
+
+    /// As `logged_in`, with these trusted proxies.
+    fn logged_in_behind(proxies: &[&str]) -> (AppState, tokio::sync::mpsc::Receiver<crate::engine::Input>, String, TestDir) {
         let (mut state, engine, dir) = state();
         let file = state.backups.data_dir.join("users");
         std::fs::write(&file, format!("admin:{}\n", crate::auth::hash_password("x").unwrap())).unwrap();
-        state.get_mut().auth = Arc::new(crate::auth::Auth::new(crate::auth::Users::load(&file).unwrap(), &state.store, state.writer.clone(), Default::default()).unwrap());
-        let cookie = format!("{}={}", crate::auth::COOKIE, state.auth.create("admin").unwrap());
+        let proxies = Arc::new(crate::auth::Proxies::parse(&proxies.iter().map(|p| p.to_string()).collect::<Vec<_>>()).unwrap());
+        state.get_mut().auth = Arc::new(crate::auth::Auth::new(crate::auth::Users::load(&file).unwrap(), &state.store, state.writer.clone(), proxies).unwrap());
+        let cookie = format!("{}={}", crate::auth::COOKIE, state.auth.create("admin"));
         (state, engine, cookie, dir)
     }
 
@@ -1483,12 +1479,7 @@ mod tests {
     #[tokio::test]
     async fn the_live_socket_checks_the_origin_and_closes_at_logout() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        let (mut state, _engine, _dir) = state();
-        let file = state.backups.data_dir.join("users");
-        std::fs::write(&file, format!("admin:{}\n", crate::auth::hash_password("x").unwrap())).unwrap();
-        let users = crate::auth::Users::load(&file).unwrap();
-        state.get_mut().auth = Arc::new(crate::auth::Auth::new(users, &state.store, state.writer.clone(), Default::default()).unwrap());
-        let cookie = format!("{}={}", crate::auth::COOKIE, state.auth.create("admin").unwrap());
+        let (state, _engine, cookie, _dir) = logged_in();
         let app = router(state);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -1518,8 +1509,14 @@ mod tests {
         assert_eq!(open(None).await.0, "101", "no Origin: not a browser page");
         let (status, mut tcp) = open(Some(format!("http://{addr}"))).await;
         assert_eq!(status, "101");
-        let req = Request::post("/api/logout").header(header::COOKIE, &cookie).body(Body::empty()).unwrap();
-        assert_eq!(app.oneshot(req).await.unwrap().status(), StatusCode::OK);
+        let logout = |csrf: bool| {
+            let req = Request::post("/api/logout").header(header::COOKIE, &cookie);
+            app.clone().oneshot(if csrf { req.header("x-requested-with", "apctl") } else { req }.body(Body::empty()).unwrap())
+        };
+        // Another site cannot log the visitor out.
+        assert_eq!(logout(false).await.unwrap().status(), StatusCode::FORBIDDEN);
+        assert_eq!(open(None).await.0, "101", "still logged in");
+        assert_eq!(logout(true).await.unwrap().status(), StatusCode::OK);
         let mut frame = [0u8; 2];
         tokio::time::timeout(std::time::Duration::from_secs(5), tcp.read_exact(&mut frame)).await.expect("closed at the logout").unwrap();
         assert_eq!(frame[0], 0x88, "a close frame");
@@ -1527,16 +1524,13 @@ mod tests {
 
     #[tokio::test]
     async fn a_session_used_a_day_later_gets_its_cookie_again() {
-        let (mut state, _engine, _dir) = state();
-        let file = state.backups.data_dir.join("users");
-        std::fs::write(&file, format!("admin:{}\n", crate::auth::hash_password("x").unwrap())).unwrap();
-        let users = crate::auth::Users::load(&file).unwrap();
-        state.get_mut().auth = Arc::new(crate::auth::Auth::new(users, &state.store, state.writer.clone(), Default::default()).unwrap());
-        let token = state.auth.create("admin").unwrap();
+        let (state, _engine, cookie, _dir) = logged_in_behind(&["10.42.0.0/16"]);
+        let token = cookie.split_once('=').unwrap().1;
         let auth = state.auth.clone();
         let app = router(state);
-        let set_cookie = |path: &'static str| {
-            let req = Request::get(path).header(header::COOKIE, format!("{}={token}", crate::auth::COOKIE)).header("x-forwarded-proto", "https").body(Body::empty()).unwrap();
+        let from = |peer: &str, path: &'static str| {
+            let peer = axum::extract::ConnectInfo(std::net::SocketAddr::new(peer.parse().unwrap(), 40000));
+            let req = Request::get(path).header(header::COOKIE, &cookie).header("x-forwarded-proto", "https").extension(peer).body(Body::empty()).unwrap();
             let app = app.clone();
             async move {
                 let res = app.oneshot(req).await.unwrap();
@@ -1544,13 +1538,18 @@ mod tests {
                 res.headers().get(header::SET_COOKIE).map(|v| v.to_str().unwrap().to_string())
             }
         };
-        assert_eq!(set_cookie("/api/status").await, None, "fresh from the login");
+        const PROXY: &str = "10.42.0.3";
+        assert_eq!(from(PROXY, "/api/status").await, None, "fresh from the login");
         for path in ["/api/status", "/api/me"] {
-            auth.age_session(&token, 2 * 86400);
-            let c = set_cookie(path).await.unwrap_or_else(|| panic!("{path}: no cookie"));
+            auth.age_session(token, 2 * 86400);
+            let c = from(PROXY, path).await.unwrap_or_else(|| panic!("{path}: no cookie"));
             assert!(c.starts_with(&format!("{}={token};", crate::auth::COOKIE)) && c.contains("Max-Age=2592000") && c.ends_with("; Secure"), "{c}");
-            assert_eq!(set_cookie(path).await, None, "{path}: once a day");
+            assert_eq!(from(PROXY, path).await, None, "{path}: once a day");
         }
+        // X-Forwarded-Proto is believed only from a trusted proxy.
+        auth.age_session(token, 2 * 86400);
+        let c = from("192.168.1.20", "/api/status").await.unwrap();
+        assert!(c.contains("Max-Age=2592000") && !c.contains("Secure"), "{c}");
     }
 
     #[tokio::test]

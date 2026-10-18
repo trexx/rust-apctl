@@ -10,6 +10,7 @@ use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use argon2::Argon2;
@@ -23,6 +24,8 @@ use rusqlite::types::Value as Sql;
 use serde::Deserialize;
 use serde_json::json;
 use sha2::{Digest, Sha256};
+use tokio::sync::Semaphore;
+use tokio::task::JoinError;
 
 use crate::api::{ApiError, AppState, Json};
 use crate::clock;
@@ -154,7 +157,7 @@ impl Auth {
         !self.users.is_empty()
     }
 
-    pub(crate) fn create(&self, user: &str) -> Result<String> {
+    pub(crate) fn create(&self, user: &str) -> String {
         let token = crate::random_hex(32);
         let now = clock::now_ts();
         let session = Session { user: user.to_string(), expires: now + SESSION_SECS };
@@ -169,7 +172,7 @@ impl Auth {
         // session starts here, so this keeps the map to the live ones.
         sessions.retain(|_, s| s.expires > now);
         sessions.insert(hash, session);
-        Ok(token)
+        token
     }
 
     /// Returns the user for a valid session token, extending it, and whether
@@ -230,11 +233,17 @@ impl Auth {
         origin.to_str().ok().zip(host).is_some_and(|(o, h)| origin_matches(o, h))
     }
 
-    fn revoke(&self, token: &str) {
+    /// Ends a session; false when there was none. Anyone can send a cookie,
+    /// so only a session that was there wakes the live sockets and queues a
+    /// write.
+    fn revoke(&self, token: &str) -> bool {
         let hash = token_hash(token);
-        self.sessions.lock().unwrap().remove(&hash);
+        if self.sessions.lock().unwrap().remove(&hash).is_none() {
+            return false;
+        }
         self.logouts.send_replace(());
         self.writer.exec(Db::Config, "DELETE FROM sessions WHERE token_hash = ?1", vec![Sql::Text(hash)]);
+        true
     }
 
     /// Counts a login attempt from `ip`, before the password is checked, so
@@ -362,17 +371,25 @@ fn session_token(headers: &HeaderMap) -> Option<String> {
         .map(|(_, v)| v.to_string())
 }
 
-fn cookie(headers: &HeaderMap, value: &str, max_age: Ts) -> String {
-    let https = headers.get("x-forwarded-proto").and_then(|v| v.to_str().ok()) == Some("https");
+/// The session cookie, Secure when the browser used HTTPS: apctl serves
+/// plain HTTP, so that is only known from X-Forwarded-Proto, believed (as
+/// the other forwarded headers are) only from a trusted proxy.
+fn cookie(auth: &Auth, headers: &HeaderMap, peer: Option<IpAddr>, value: &str, max_age: Ts) -> String {
+    let https = peer.is_some_and(|p| auth.proxies.contains(p)) && headers.get("x-forwarded-proto").and_then(|v| v.to_str().ok()) == Some("https");
     format!("{COOKIE}={value}; Path=/; HttpOnly; SameSite=Lax; Max-Age={max_age}{}", if https { "; Secure" } else { "" })
+}
+
+/// The address a request came from (the proxy's, behind one), when the server passes it on.
+fn peer_of(extensions: &axum::http::Extensions) -> Option<IpAddr> {
+    extensions.get::<ConnectInfo<SocketAddr>>().map(|c| c.0.ip())
 }
 
 /// The user of the request's session, if it is a valid one; and the cookie
 /// to send again when using it extended it (see `renewed`).
-fn session(auth: &Auth, headers: &HeaderMap) -> Option<(String, Option<String>)> {
+fn session(auth: &Auth, headers: &HeaderMap, peer: Option<IpAddr>) -> Option<(String, Option<String>)> {
     let token = session_token(headers)?;
     let (user, extended) = auth.check(&token)?;
-    Some((user, extended.then(|| cookie(headers, &token, SESSION_SECS))))
+    Some((user, extended.then(|| cookie(auth, headers, peer, &token, SESSION_SECS))))
 }
 
 /// For the routes that hand out secrets (Wi-Fi passphrases, and backups, which
@@ -393,6 +410,10 @@ fn csrf_ok(headers: &HeaderMap) -> bool {
     headers.get("x-requested-with").and_then(|v| v.to_str().ok()) == Some("apctl")
 }
 
+fn csrf_refused() -> ApiError {
+    ApiError(StatusCode::FORBIDDEN, "missing X-Requested-With: apctl header".into())
+}
+
 /// Guards every API route except login/logout/me; changes (anything but GET,
 /// HEAD and OPTIONS) also need the CSRF header.
 pub async fn require_login(State(s): State<AppState>, req: Request, next: Next) -> Result<Response, ApiError> {
@@ -405,8 +426,8 @@ pub async fn require_login(State(s): State<AppState>, req: Request, next: Next) 
         }
         return Ok(next.run(req).await);
     }
-    match session(&s.auth, req.headers()) {
-        Some(_) if mutating && !csrf_ok(req.headers()) => Err(ApiError(StatusCode::FORBIDDEN, "missing X-Requested-With: apctl header".into())),
+    match session(&s.auth, req.headers(), peer_of(req.extensions())) {
+        Some(_) if mutating && !csrf_ok(req.headers()) => Err(csrf_refused()),
         Some((_, cookie)) => Ok(renewed(next.run(req).await, cookie)),
         None => Err(ApiError(StatusCode::UNAUTHORIZED, "login required".into())),
     }
@@ -436,16 +457,14 @@ pub async fn login(
     // the async workers, and run at most two at a time. A queue kept full (by
     // many addresses) makes the others wait a few seconds at most, and a login
     // turned away unchecked does not count against its address.
-    static VERIFYING: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(2);
-    let _permit = match tokio::time::timeout(std::time::Duration::from_secs(5), VERIFYING.acquire()).await {
-        Ok(p) => p.expect("the semaphore is never closed"),
-        Err(_) => {
-            auth.refund(ip);
-            return Err(ApiError(StatusCode::SERVICE_UNAVAILABLE, "too many logins at once, try again shortly".into()));
-        }
-    };
+    static VERIFYING: Semaphore = Semaphore::const_new(2);
     let verifier = auth.clone();
-    let (ok, user) = tokio::task::spawn_blocking(move || (verifier.users.verify(&body.username, &body.password), body.username)).await?;
+    let check = move || (verifier.users.verify(&body.username, &body.password), body.username);
+    let Some(checked) = in_slot(&VERIFYING, Duration::from_secs(5), check).await else {
+        auth.refund(ip);
+        return Err(ApiError(StatusCode::SERVICE_UNAVAILABLE, "too many logins at once, try again shortly".into()));
+    };
+    let (ok, user) = checked?;
     if !ok {
         // The name is the client's, up to the whole body: the log gets its start.
         let shown = &user[..user.floor_char_boundary(64)];
@@ -453,24 +472,45 @@ pub async fn login(
         return Err(ApiError(StatusCode::UNAUTHORIZED, "wrong username or password".into()));
     }
     auth.refund(ip);
-    let token = auth.create(&user)?;
+    let token = auth.create(&user);
     tracing::info!("{user} logged in from {ip}");
-    Ok(([(header::SET_COOKIE, cookie(&headers, &token, SESSION_SECS))], Json(json!({ "user": user }))).into_response())
+    Ok(([(header::SET_COOKIE, cookie(&auth, &headers, Some(peer.ip()), &token, SESSION_SECS))], Json(json!({ "user": user }))).into_response())
 }
 
-pub async fn logout(State(s): State<AppState>, headers: HeaderMap) -> Response {
-    if let Some(t) = session_token(&headers) {
+/// Runs `check` on a blocking thread while it holds one of `slots`, or None
+/// when no slot comes free within `wait`. The permit goes into the blocking
+/// closure: a client that hangs up drops its handler, but not the check
+/// already running, which must keep its slot until it ends.
+async fn in_slot<T: Send + 'static>(slots: &'static Semaphore, wait: Duration, check: impl FnOnce() -> T + Send + 'static) -> Option<Result<T, JoinError>> {
+    let permit = tokio::time::timeout(wait, slots.acquire()).await.ok()?.expect("the semaphore is never closed");
+    Some(
+        tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            check()
+        })
+        .await,
+    )
+}
+
+/// A change like any other, so it needs the CSRF header too: another site
+/// cannot log a visitor out.
+pub async fn logout(State(s): State<AppState>, req: Request) -> Result<Response, ApiError> {
+    let headers = req.headers();
+    if !csrf_ok(headers) {
+        return Err(csrf_refused());
+    }
+    if let Some(t) = session_token(headers) {
         s.auth.revoke(&t);
     }
-    ([(header::SET_COOKIE, cookie(&headers, "", 0))], Json(json!({ "ok": true }))).into_response()
+    Ok(([(header::SET_COOKIE, cookie(&s.auth, headers, peer_of(req.extensions()), "", 0))], Json(json!({ "ok": true }))).into_response())
 }
 
 /// Who is logged in, and whether login is needed at all.
-pub async fn me(State(s): State<AppState>, headers: HeaderMap) -> Response {
+pub async fn me(State(s): State<AppState>, req: Request) -> Response {
     if !s.auth.enabled() {
         return Json(json!({ "auth": false, "user": null, "read_only": true })).into_response();
     }
-    match session(&s.auth, &headers) {
+    match session(&s.auth, req.headers(), peer_of(req.extensions())) {
         Some((user, cookie)) => renewed(Json(json!({ "auth": true, "user": user, "read_only": false })).into_response(), cookie),
         None => (StatusCode::UNAUTHORIZED, Json(json!({ "auth": true, "user": null }))).into_response(),
     }
@@ -526,17 +566,23 @@ mod tests {
         let mut users = Users::default();
         users.hashes.insert("admin".into(), hash_password("x").unwrap());
         let auth = Auth::new(users, &store, writer, Default::default()).unwrap();
-        let token = auth.create("admin").unwrap();
+        let token = auth.create("admin");
         assert_eq!(token.len(), 64);
         assert_eq!(auth.check(&token), Some(("admin".into(), false)), "new: not extended yet");
         assert!(!auth.sessions.lock().unwrap().contains_key(&token), "only the hash is stored");
         assert_eq!(auth.check("forged"), None);
-        auth.revoke(&token);
+        // Only a session that was there is announced to the live sockets.
+        let logouts = auth.logouts();
+        assert!(!auth.revoke("forged"));
+        assert!(!logouts.has_changed().unwrap(), "a made-up cookie wakes nobody");
+        assert!(auth.revoke(&token));
+        assert!(logouts.has_changed().unwrap());
         assert_eq!(auth.check(&token), None);
+        assert!(!auth.revoke(&token), "already gone");
         // An expired session nobody presents again is dropped at the next login.
-        let old = auth.create("admin").unwrap();
+        let old = auth.create("admin");
         auth.sessions.lock().unwrap().get_mut(&token_hash(&old)).unwrap().expires = 0;
-        auth.create("admin").unwrap();
+        auth.create("admin");
         assert!(!auth.sessions.lock().unwrap().contains_key(&token_hash(&old)));
         assert_eq!(auth.sessions.lock().unwrap().len(), 1);
     }
@@ -624,6 +670,35 @@ mod tests {
         assert!(!ok(Some("https://other.example"), "apctl:8080", Some("apctl.example"), "10.42.0.3"));
         // From anyone else it is not believed.
         assert!(!ok(Some("https://evil.example"), "apctl.lan", Some("evil.example"), lan));
+    }
+
+    #[tokio::test]
+    async fn a_check_keeps_its_slot_when_the_client_hangs_up() {
+        static SLOTS: Semaphore = Semaphore::const_new(2);
+        let (started, has_started) = std::sync::mpsc::channel();
+        let (finish, may_finish) = std::sync::mpsc::channel::<()>();
+        let handler = tokio::spawn(in_slot(&SLOTS, Duration::from_secs(5), move || {
+            started.send(()).unwrap();
+            may_finish.recv().ok();
+        }));
+        tokio::task::spawn_blocking(move || has_started.recv().unwrap()).await.unwrap();
+        // The client hangs up: its handler is dropped, the check runs on.
+        handler.abort();
+        assert!(handler.await.unwrap_err().is_cancelled());
+        assert_eq!(SLOTS.available_permits(), 1, "the running check keeps its slot");
+        // Both slots taken: turned away once the wait is over.
+        let other = SLOTS.acquire().await.unwrap();
+        assert!(in_slot(&SLOTS, Duration::from_millis(10), || ()).await.is_none());
+        drop(other);
+        // The check ends, and only then gives its slot back.
+        finish.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while SLOTS.available_permits() < 2 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the slot is given back when the check ends");
     }
 
     #[test]
