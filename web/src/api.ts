@@ -361,8 +361,11 @@ export class HttpError extends Error {
   }
 }
 
+/** Tells the app shell the session is gone: it checks /api/me, and shows the login page. */
+const announceUnauthorized = () => window.dispatchEvent(new Event("apctl:unauthorized"));
+
 function unauthorized(): never {
-  window.dispatchEvent(new Event("apctl:unauthorized"));
+  announceUnauthorized();
   throw new AuthError("login required");
 }
 
@@ -1315,8 +1318,10 @@ export function useLiveUpdates(): void {
         if (dropped) refetchAll();
       };
       socket.onmessage = onMessage;
-      socket.onclose = () => {
+      socket.onclose = (e) => {
         if (closed) return;
+        // 1008 (policy): the server closed it because the session ended (logged out or expired).
+        if (e.code === 1008) announceUnauthorized();
         dropped = true;
         reconnectTimer = window.setTimeout(connect, retry);
         retry = Math.min(retry * 2, 30_000);
