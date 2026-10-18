@@ -56,12 +56,12 @@ const DEFAULT_CRON: &str = "0 3 * * *";
 const SCAN_TIMEOUT: Ts = 120;
 
 /// A quick scan in progress on one AP.
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug)]
 pub struct Scan {
-    pub band: String,
+    /// The band's radio name, as in [`BANDS`].
+    pub band: &'static str,
     pub started: Ts,
     /// The AP has reported `quickscan_scanning: true` since.
-    #[serde(skip)]
     seen_scanning: bool,
 }
 
@@ -166,7 +166,7 @@ pub fn start_scans(live: &mut Live, band: &Band, now: Ts) -> Vec<Mac> {
         .collect();
     for mac in &eligible {
         crate::actions::queue(live, *mac, json!({ "_type": "cmd", "cmd": "quick-scan", "scan-band": band.scan_band, "scan-bw": band.scan_width }));
-        live.scans.insert(*mac, Scan { band: band.radio.to_string(), started: now, seen_scanning: false });
+        live.scans.insert(*mac, Scan { band: band.radio, started: now, seen_scanning: false });
     }
     eligible
 }
@@ -183,7 +183,7 @@ pub fn check_scans(live: &mut Live, now: Ts) {
             Some(false) if s.seen_scanning => return false,
             _ => {}
         }
-        let renewed = spectrum_age(p, &s.band).is_some_and(|age| age < now - s.started);
+        let renewed = spectrum_age(p, s.band).is_some_and(|age| age < now - s.started);
         let offline = devices.get(mac).is_some_and(|d| !d.online);
         !renewed && !offline && now - s.started < SCAN_TIMEOUT
     });
@@ -624,7 +624,7 @@ mod tests {
         live.raw_informs.insert(ap, inform(56_000, None));
         // (Asked for directly: start_scans only asks APs that are online.)
         crate::actions::queue(&mut live, ap, json!({ "_type": "cmd", "cmd": "quick-scan" }));
-        live.scans.insert(ap, Scan { band: "na".into(), started: 1000, seen_scanning: false });
+        live.scans.insert(ap, Scan { band: "na", started: 1000, seen_scanning: false });
         assert_eq!(crate::actions::next(&mut live, &ap).unwrap()["cmd"], "quick-scan");
         check_scans(&mut live, 1010);
         assert_eq!(live.scans.len(), 1, "the old table does not count");
@@ -635,7 +635,7 @@ mod tests {
         check_scans(&mut live, 1040);
         assert!(live.scans.is_empty(), "a table 3 s old is from this scan");
         // Without an answer, a scan gives up after two minutes.
-        live.scans.insert(ap, Scan { band: "na".into(), started: 2000, seen_scanning: false });
+        live.scans.insert(ap, Scan { band: "na", started: 2000, seen_scanning: false });
         live.raw_informs.insert(ap, inform(56_000, None));
         check_scans(&mut live, 2000 + SCAN_TIMEOUT);
         assert!(live.scans.is_empty());

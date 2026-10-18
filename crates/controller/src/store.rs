@@ -334,6 +334,11 @@ fn migrate(dir: &Path) -> Result<()> {
             }
         }
     }
+    // One AP's clients over days (its page, from the roll-ups): read through this, not
+    // every client's rows in the window. The raw tier, written at every report, goes without.
+    for (suffix, ..) in &TIERS[1..] {
+        metrics.execute_batch(&format!("CREATE INDEX IF NOT EXISTS client_stats{suffix}_ap ON client_stats{suffix} (ap_mac, ts)"))?;
+    }
     Ok(())
 }
 

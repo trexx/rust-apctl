@@ -484,13 +484,18 @@ pub fn roam_clients(roams: &[Roam]) -> Vec<Value> {
         .collect()
 }
 
-/// The columns [`event_of`] reads.
-const COLUMNS: &str = "SELECT ts, ap_mac, client_mac, vap, essid, radio, event_type, detail, ip_assign_type, dns_responses, dns_timeouts, rssi FROM connections";
+/// The query of the notifications, before its conditions: the columns [`event_of`] reads
+/// (the last four only for rows without `detail`).
+const SELECT_EVENTS: &str = "SELECT ts, ap_mac, client_mac, vap, essid, radio, event_type, detail, ip_assign_type, dns_responses, dns_timeouts, rssi FROM connections";
 
-/// A notification, from a row of [`COLUMNS`].
+/// A notification, from a row of [`SELECT_EVENTS`].
 fn event_of(r: &rusqlite::Row) -> rusqlite::Result<ConnEvent> {
     let detail = r.get_ref(7)?.as_str_or_null()?;
-    // Rows from before the full notification was kept: rebuild what we can.
+    // Rows from before the full notification was kept: rebuild what we can. Every row
+    // written since `detail` was added (2026-10-13) has it, so under the 90-day
+    // retention the last rows without it are gone by 2027-01-11 (90 days after the
+    // upgrade to that version, where it came later). The fallback, and the four columns
+    // it reads, can then go.
     let n = detail.and_then(|d| serde_json::from_str(d).ok()).unwrap_or_else(|| ConnDetail {
         ip_assign_type: r.get::<_, Option<String>>(8).ok().flatten().map(Field::Str),
         dns_responses: r.get::<_, Option<i64>>(9).ok().flatten().map(Field::Int),
@@ -501,7 +506,7 @@ fn event_of(r: &rusqlite::Row) -> rusqlite::Result<ConnEvent> {
     Ok(ConnEvent { ts: r.get(0)?, ap: r.get(1)?, client: r.get(2)?, vap: r.get(3)?, essid: r.get(4)?, radio: r.get(5)?, event_type: r.get(6)?, n })
 }
 
-/// The rows of [`COLUMNS`] in a window, optionally one client's, that also
+/// The rows of [`SELECT_EVENTS`] in a window, optionally one client's, that also
 /// meet `cond`: oldest first, or with `newest` at most that many, newest first.
 fn query_rows(c: &rusqlite::Connection, from: Ts, to: Ts, client: Option<&str>, cond: &str, newest: Option<usize>) -> rusqlite::Result<Vec<ConnEvent>> {
     // Two statements: `(?4 IS NULL OR client_mac = ?4)` would keep SQLite off the per-client index.
@@ -509,7 +514,7 @@ fn query_rows(c: &rusqlite::Connection, from: Ts, to: Ts, client: Option<&str>, 
     let order = if newest.is_some() { "ORDER BY ts DESC, id DESC" } else { "ORDER BY ts, id" };
     // A negative limit is none: the same few statements, kept prepared, whatever the limit.
     let limit = newest.map_or(-1, |n| i64::try_from(n).unwrap_or(i64::MAX));
-    let mut stmt = c.prepare_cached(&format!("{COLUMNS} WHERE {filter} {cond} {order} LIMIT ?3"))?;
+    let mut stmt = c.prepare_cached(&format!("{SELECT_EVENTS} WHERE {filter} {cond} {order} LIMIT ?3"))?;
     let params: Vec<&dyn rusqlite::ToSql> = match &client {
         Some(m) => vec![&from, &to, &limit, m],
         None => vec![&from, &to, &limit],
@@ -702,26 +707,32 @@ pub struct RoamingQuery {
     range: Option<Ts>,
     from: Option<Ts>,
     to: Option<Ts>,
-    /// How many of the newest roams to list (default 100); the totals count them all.
+    /// How many of the newest roams to list (default 100, at most [`ROAMS_LISTED`]); the totals count them all.
     limit: Option<usize>,
 }
+
+/// The most roams `/api/roaming` lists.
+const ROAMS_LISTED: usize = 1000;
 
 /// GET /api/roaming: the newest roams in the window (default two days), with
 /// totals, per-AP-pair and per-client figures over all of them.
 pub async fn roaming(State(s): State<AppState>, Query(q): Query<RoamingQuery>) -> Result<Response, ApiError> {
     let range = RangeQuery { range: q.range.or(Some(2 * 86400)), from: q.from, to: q.to, ..Default::default() };
     let (from, to, tier) = window(&range);
-    // Roams newest first, the figures over all of them and the stored names, reused for a while.
+    // The newest roams that may be listed, the figures over all of them, and the stored names
+    // and (AP, client) pairs of all of them (the figures name them too), reused for a while.
     let got = memo_read(&s, Db::Config, "roaming", &range, tier, move |c| {
         let mut r = roams(&roam_rows(c, from, to, None)?);
         let figures = (roam_totals(&r), roam_pairs(&r), roam_clients(&r));
         let stored = Names::load_for(c, macs_of(&[], &r))?;
+        let macs: BTreeSet<(String, String)> = macs_of(&[], &r).map(|(a, c)| (a.to_string(), c.to_string())).collect();
         r.reverse();
-        Ok((r, figures, stored))
+        r.truncate(ROAMS_LISTED);
+        Ok((r, figures, stored, macs))
     })
     .await?;
-    let (r, (total, pairs, clients), stored) = &*got;
-    let (ap_names, client_names) = names(stored, &s.live.read().unwrap(), macs_of(&[], r));
+    let (r, (total, pairs, clients), stored, macs) = &*got;
+    let (ap_names, client_names) = names(stored, &s.live.read().unwrap(), macs.iter().map(|(a, c)| (a.as_str(), c.as_str())));
     /// The response, written out from the memoised parts as they are (keys in alphabetical order, as `json!` has them).
     #[derive(Serialize)]
     struct Out<'a> {
@@ -734,7 +745,7 @@ pub async fn roaming(State(s): State<AppState>, Query(q): Query<RoamingQuery>) -
         to: Ts,
         total: &'a Value,
     }
-    let roams = &r[..r.len().min(q.limit.unwrap_or(100).min(1000))];
+    let roams = &r[..r.len().min(q.limit.unwrap_or(100))];
     Ok(Json(Out { ap_names, client_names, clients, from, pairs, roams, to, total }).into_response())
 }
 

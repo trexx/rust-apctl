@@ -536,7 +536,8 @@ export interface SiteActivity {
     rx_pps: number[];
     tx_dropped_pct: (number | null)[];
   };
-  airtime: { ts: number[]; total: number[]; external_interference: number[]; own_traffic: number[]; own_rx: number[]; own_tx: number[] };
+  /** Null in a bucket where no radio reported the figure. */
+  airtime: { ts: number[]; total: (number | null)[]; external_interference: (number | null)[]; own_traffic: (number | null)[]; own_rx: (number | null)[]; own_tx: (number | null)[] };
 }
 
 export interface TopEntry {
@@ -608,14 +609,12 @@ export interface RadioOverview {
   tx_power: number | null;
   eirp: number | null;
   clients: number;
-  cu_total_now: number | null;
   noise_floor: number | null;
   avg_utilization: number | null;
   avg_interference: number | null;
   tx_retry_pct: number | null;
   usage_bytes: number;
   avg_client_signal: number | null;
-  spectrum: { channel: number; width: number | null; utilization: number | null; interference: number | null; ts: number }[];
 }
 
 export interface Neighbor {
@@ -975,7 +974,7 @@ const usePolled = <T>(queryKey: QueryKey, path: string) =>
 export const useRadios = (range: number) => usePolled<RadioOverview[]>(keys.rfRadios(range), `/api/rf/radios${qs({ range })}`);
 
 export const useNeighbors = (range: number, band: string) =>
-  usePolled<{ neighbors: Neighbor[]; own_links: OwnLink[] }>(keys.rfNeighbors(range, band), `/api/rf/neighbors${qs({ range, band: bandParam(band) })}`);
+  usePolled<{ neighbors: Neighbor[] }>(keys.rfNeighbors(range, band), `/api/rf/neighbors${qs({ range, band: bandParam(band), neighbors_only: "true" })}`);
 
 /** Only how loudly our APs hear each other (no neighbour list). */
 export const useOwnLinks = (range: number) => usePolled<{ own_links: OwnLink[] }>(keys.rfLinks(range), `/api/rf/neighbors${qs({ range, links_only: "true" })}`);

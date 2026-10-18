@@ -30,10 +30,16 @@ const MAGIC_COOKIE: u32 = 0x2112_A442;
 /// after the type and length (magic cookie and transaction ID) to mask it with.
 fn address(out: &mut Vec<u8>, kind: u16, addr: SocketAddr, xor: Option<&[u8]>) {
     let mut port = addr.port();
-    let (family, mut ip): (u8, Vec<u8>) = match addr.ip().to_canonical() {
-        IpAddr::V4(ip) => (1, ip.octets().to_vec()),
-        IpAddr::V6(ip) => (2, ip.octets().to_vec()),
+    // The address in the first 4 or 16 bytes.
+    let (family, mut octets, len) = match addr.ip().to_canonical() {
+        IpAddr::V4(ip) => {
+            let mut b = [0; 16];
+            b[..4].copy_from_slice(&ip.octets());
+            (1, b, 4)
+        }
+        IpAddr::V6(ip) => (2, ip.octets(), 16),
     };
+    let ip = &mut octets[..len];
     if let Some(mask) = xor {
         port ^= (MAGIC_COOKIE >> 16) as u16;
         ip.iter_mut().zip(mask).for_each(|(b, m)| *b ^= m);
@@ -42,7 +48,7 @@ fn address(out: &mut Vec<u8>, kind: u16, addr: SocketAddr, xor: Option<&[u8]>) {
     out.extend_from_slice(&(4 + ip.len() as u16).to_be_bytes());
     out.extend_from_slice(&[0, family]);
     out.extend_from_slice(&port.to_be_bytes());
-    out.extend_from_slice(&ip);
+    out.extend_from_slice(ip);
 }
 
 /// The answer to a STUN packet from `from`, if it is a Binding Request.

@@ -14,25 +14,30 @@ const PRIVATE: &str = "Private (randomised)";
 #[derive(Default)]
 pub struct Vendors(HashMap<u32, String>);
 
-/// Splits one CSV line into fields, honouring double quotes.
-fn fields(line: &str) -> Vec<String> {
-    let mut out = Vec::new();
-    let mut cur = String::new();
-    let mut quoted = false;
+/// The fields of one CSV line, honouring double quotes, one at a time (the
+/// registry's last field, the address, is not needed and so never copied).
+fn fields(line: &str) -> impl Iterator<Item = String> + '_ {
     let mut chars = line.chars().peekable();
-    while let Some(c) = chars.next() {
-        match c {
-            '"' if quoted && chars.peek() == Some(&'"') => {
-                cur.push('"');
-                chars.next();
-            }
-            '"' => quoted = !quoted,
-            ',' if !quoted => out.push(std::mem::take(&mut cur)),
-            _ => cur.push(c),
+    let mut done = false;
+    std::iter::from_fn(move || {
+        if done {
+            return None;
         }
-    }
-    out.push(cur);
-    out
+        let (mut cur, mut quoted) = (String::new(), false);
+        while let Some(c) = chars.next() {
+            match c {
+                '"' if quoted && chars.peek() == Some(&'"') => {
+                    cur.push('"');
+                    chars.next();
+                }
+                '"' => quoted = !quoted,
+                ',' if !quoted => return Some(cur),
+                _ => cur.push(c),
+            }
+        }
+        done = true;
+        Some(cur)
+    })
 }
 
 impl Vendors {
@@ -40,10 +45,11 @@ impl Vendors {
         let text = std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
         let mut map = HashMap::new();
         for line in text.lines().skip(1) {
-            let f = fields(line);
-            if f.len() >= 3 && f[0] == "MA-L"
-                && let Ok(prefix) = u32::from_str_radix(f[1].trim(), 16) {
-                    map.insert(prefix, f[2].trim().to_string());
+            let mut f = fields(line);
+            if let (Some(registry), Some(prefix), Some(name)) = (f.next(), f.next(), f.next())
+                && registry == "MA-L"
+                && let Ok(prefix) = u32::from_str_radix(prefix.trim(), 16) {
+                    map.insert(prefix, name.trim().to_string());
                 }
         }
         Ok(Vendors(map))
