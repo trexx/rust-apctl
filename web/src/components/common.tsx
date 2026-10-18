@@ -48,7 +48,7 @@ export function Signal({ dbm }: { dbm: number | null | undefined }) {
 /** A bar for a level (a percentage, or out of `max`), named `label` for screen readers. */
 export function Meter({
   value,
-  max = 100,
+  max: limit,
   label,
 }: {
   value: number | null | undefined;
@@ -56,6 +56,7 @@ export function Meter({
   label: string;
 }) {
   const known = value !== null && value !== undefined;
+  const max = limit ?? 100;
   const v = known ? Math.min(100, (value / max) * 100) : 0;
   const level = v >= 80 ? "high" : v >= 50 ? "mid" : "low";
   const text = known ? `${Math.round(value)}` : "unknown";
