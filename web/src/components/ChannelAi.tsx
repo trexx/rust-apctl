@@ -20,7 +20,7 @@ import {
   eventText,
   useRunner,
 } from "./common";
-import { ApChecklist, toggled } from "./settings/form";
+import { ApChecklist, Select, toggled } from "./settings/form";
 
 /**
  * Runs Channel AI actions. The settings checkboxes each send a patch built
@@ -97,7 +97,7 @@ export function PlanActions({
   );
 }
 
-const HOURS = Array.from({ length: 24 }, (_, h) => h);
+const HOURS = Array.from({ length: 24 }, (_, h) => [h, hhmm(h * 60)] as const);
 
 /** Channel AI: the nightly optimisation's settings, Run now, recent runs. */
 export function ChannelAiPanel() {
@@ -161,18 +161,13 @@ export function ChannelAiPanel() {
               onChange={(enabled) => save({ enabled })}
               label="Enabled"
             />
-            <select
+            <Select
               aria-label="Hour"
               value={s.hour}
+              options={HOURS}
               disabled={!can}
-              onChange={(e) => save({ hour: Number(e.target.value) })}
-            >
-              {HOURS.map((h) => (
-                <option key={h} value={h}>
-                  {hhmm(h * 60)}
-                </option>
-              ))}
-            </select>
+              onChange={(hour) => save({ hour })}
+            />
             {(["ng", "na"] as const).map((b) => (
               <Toggle
                 key={b}

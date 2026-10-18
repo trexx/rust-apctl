@@ -13,7 +13,8 @@ import type { BackupManifest, BackupMeta, BackupSettings } from "../api";
 import { ago, bytes, dateTime as when, hhmm, useNow } from "../format";
 import { Outcome, QueryNote, THead, Toggle, useRunner } from "./common";
 import { FileButton } from "./FileButton";
-import { NumberInput, TimeInput } from "./settings/form";
+import { NumberInput, Select, TimeInput } from "./settings/form";
+import type { Option } from "./settings/form";
 
 const HISTORY: [number, string][] = [
   [0, "Settings only"],
@@ -34,6 +35,16 @@ const WEEKDAYS = [
   "Saturday",
   "Sunday",
 ];
+const FREQUENCIES: Option<BackupSettings["frequency"]>[] = [
+  ["daily", "Daily"],
+  ["weekly", "Weekly"],
+  ["monthly", "Monthly"],
+];
+const ON_WEEKDAY = WEEKDAYS.map((d, i) => [i, `on ${d}`] as const);
+const ON_MONTHDAY = Array.from(
+  { length: 28 },
+  (_, i) => [i + 1, `on day ${i + 1}`] as const,
+);
 const KIND: Record<BackupMeta["kind"], string> = {
   auto: "Automatic",
   manual: "Manual",
@@ -149,50 +160,30 @@ function Schedule({
         label="Automatic backups"
       />
       <div className="backup-row">
-        <select
+        <Select
           aria-label="How often"
           value={s.frequency}
+          options={FREQUENCIES}
           disabled={readOnly || !s.enabled}
-          onChange={(e) =>
-            setS({
-              ...s,
-              frequency: e.target.value as BackupSettings["frequency"],
-            })
-          }
-        >
-          <option value="daily">Daily</option>
-          <option value="weekly">Weekly</option>
-          <option value="monthly">Monthly</option>
-        </select>
+          onChange={(frequency) => setS({ ...s, frequency })}
+        />
         {s.frequency === "weekly" && (
-          <select
+          <Select
             aria-label="Day of the week"
             value={local.weekday}
+            options={ON_WEEKDAY}
             disabled={readOnly || !s.enabled}
-            onChange={(e) =>
-              setS({ ...s, ...fromLocal(local.time, Number(e.target.value)) })
-            }
-          >
-            {WEEKDAYS.map((d, i) => (
-              <option key={d} value={i}>
-                on {d}
-              </option>
-            ))}
-          </select>
+            onChange={(w) => setS({ ...s, ...fromLocal(local.time, w) })}
+          />
         )}
         {s.frequency === "monthly" && (
-          <select
+          <Select
             aria-label="Day of the month (UTC)"
             value={s.monthday}
+            options={ON_MONTHDAY}
             disabled={readOnly || !s.enabled}
-            onChange={(e) => setS({ ...s, monthday: Number(e.target.value) })}
-          >
-            {Array.from({ length: 28 }, (_, i) => i + 1).map((d) => (
-              <option key={d} value={d}>
-                on day {d}
-              </option>
-            ))}
-          </select>
+            onChange={(monthday) => setS({ ...s, monthday })}
+          />
         )}
         <label className="small">
           at{" "}
@@ -223,17 +214,12 @@ function Schedule({
         </label>
         <label className="small">
           containing{" "}
-          <select
+          <Select
             value={s.days}
+            options={HISTORY.map(([d, l]) => [d, l.toLowerCase()] as const)}
             disabled={readOnly || !s.enabled}
-            onChange={(e) => setS({ ...s, days: Number(e.target.value) })}
-          >
-            {HISTORY.map(([d, l]) => (
-              <option key={d} value={d}>
-                {l.toLowerCase()}
-              </option>
-            ))}
-          </select>
+            onChange={(days) => setS({ ...s, days })}
+          />
         </label>
         {!readOnly && (
           <button
@@ -377,17 +363,12 @@ export function BackupSection() {
 
       {!readOnly && (
         <div className="backup-row backup-actions">
-          <select
-            value={days}
-            onChange={(e) => setDays(Number(e.target.value))}
+          <Select
             aria-label="What to include"
-          >
-            {HISTORY.map(([v, l]) => (
-              <option key={v} value={v}>
-                {l}
-              </option>
-            ))}
-          </select>
+            value={days}
+            options={HISTORY}
+            onChange={setDays}
+          />
           <button
             className="btn small primary"
             disabled={busy}
