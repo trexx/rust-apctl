@@ -604,16 +604,31 @@ impl Sanitizer {
         }
     }
 
-    /// Rewrites a `key=value` config blob line by line. `under_secret`: its own key or
-    /// one above it is secret.
-    fn cfg(&mut self, blob: &str, under_secret: bool) -> String {
+    /// Rewrites the `key=value` config blob under `key` line by line. `under_secret`: its
+    /// own key or one above it is secret.
+    fn cfg(&mut self, key: &str, blob: &str, under_secret: bool) -> String {
         blob.lines()
             .map(|l| match l.split_once('=') {
                 Some((k, v)) => format!("{k}={}", self.field("", k, under_secret, v)),
-                None => self.scrub(l),
+                None => self.cfg_line(key, l, under_secret),
             })
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    /// A config line that is not `key=value`: the controller's section comments (`# wlans
+    /// (radio)`) pass; anything else is text, listed like a field off the allow-list.
+    fn cfg_line(&mut self, key: &str, line: &str, under_secret: bool) -> String {
+        if line.is_empty() {
+            String::new()
+        } else if under_secret {
+            self.fakes.get(Kind::Secret, line, |n| format!("secret-{n}"))
+        } else if line.starts_with('#') {
+            self.scrub(line)
+        } else {
+            self.unlisted.insert(format!("{} lines without '='", key.to_ascii_lowercase()));
+            self.fakes.get(Kind::Text, line, |n| format!("text-{n}"))
+        }
     }
 
     pub fn json(&mut self, v: &Value) -> Value {
@@ -630,7 +645,7 @@ impl Sanitizer {
             Value::Number(n) if secret && self.is_secret_number(parent, key, under_secret) => {
                 Value::String(self.fakes.get(Kind::Secret, &n.to_string(), |n| format!("secret-{n}")))
             }
-            Value::String(s) if key.ends_with("_cfg") => Value::String(self.cfg(s, secret)),
+            Value::String(s) if key.ends_with("_cfg") => Value::String(self.cfg(key, s, secret)),
             // Names people gave their devices in the other controller.
             Value::String(s) if key == "name" && (parent == "clients" || parent == "user") && !s.is_empty() => {
                 Value::String(self.fakes.get(Kind::Alias, s, |n| format!("alias-{n}")))
@@ -1184,6 +1199,16 @@ mod tests {
         let out = s.json(&json!({ "x_backup": { "system_cfg": "radio.1.channel=36\nmark.1.name=guest" }, "system_cfg": "radio.1.channel=36" }));
         assert_eq!(out["x_backup"]["system_cfg"], "radio.1.channel=secret-1\nmark.1.name=guest");
         assert_eq!(out["system_cfg"], "radio.1.channel=36");
+    }
+
+    #[test]
+    fn a_config_line_without_a_value_passes_only_as_a_comment() {
+        let mut s = Sanitizer::new(Vec::new(), Vec::new());
+        let out = s.json(&json!({ "system_cfg": "# wlans (radio)\nSmith family\n\nradio.1.channel=36", "x_backup": { "mgmt_cfg": "# mgmt" } }));
+        assert_eq!(out["system_cfg"], "# wlans (radio)\ntext-1\n\nradio.1.channel=36");
+        assert_eq!(out["x_backup"]["mgmt_cfg"], "secret-1");
+        assert_eq!(s.unlisted().collect::<Vec<_>>(), ["system_cfg lines without '='"]);
+        assert!(s.check_clean("x: smith family", "leak").is_err());
     }
 
     #[test]
