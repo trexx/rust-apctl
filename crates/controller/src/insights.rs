@@ -1562,6 +1562,8 @@ fn plan_channels(
     let total = |m: &[Block]| -> f64 { m.iter().enumerate().map(|(i, b)| cost(i, b, m)).sum() };
     let (current_total, final_total) = (total(&current), total(&fin));
     let accepted = evict.contains(&Some(true)) || (evict.iter().any(Option::is_some) && final_total * 1.1 < current_total);
+    // A plan not worth applying suggests leaving every AP where it is, and is scored as that.
+    let suggested_total = if accepted { final_total } else { current_total };
     if !accepted {
         fin = current.clone();
         evict = vec![None; n];
@@ -1591,7 +1593,7 @@ fn plan_channels(
             }
         })
         .collect();
-    Plan { band: radio, dfs, allowed, plan, current_total: current_total.round(), suggested_total: final_total.round(), accepted }
+    Plan { band: radio, dfs, allowed, plan, current_total: current_total.round(), suggested_total: suggested_total.round(), accepted }
 }
 
 #[cfg(test)]
