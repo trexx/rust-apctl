@@ -279,8 +279,9 @@ fn seen<'a>(rows: &[&'a Heard]) -> Seen<'a> {
 pub fn assess(a: &Assessment) -> Vec<Finding> {
     let own: HashMap<&str, &OwnBss> = a.own.iter().map(|b| (b.bssid.as_str(), b)).collect();
     // Addresses our APs and their radios use: anything this close is our hardware.
-    let family: Vec<u64> = a.own.iter().map(|b| b.bssid.as_str()).chain(a.aps.keys().map(String::as_str)).filter_map(mac_num).collect();
-    let is_family = |bssid: &str| mac_num(bssid).is_some_and(|n| family.iter().any(|f| same_hardware(n, *f)));
+    let mut family: Vec<u64> = a.own.iter().map(|b| b.bssid.as_str()).chain(a.aps.keys().map(String::as_str)).filter_map(mac_num).collect();
+    family.sort_unstable();
+    let is_family = |n: u64| family.get(family.partition_point(|f| *f < n.saturating_sub(16))).is_some_and(|f| same_hardware(n, *f));
     // The client next to an address: of several, the first by MAC, with its live name first.
     let client_near = |n: u64| {
         let mac = near_in(&a.clients, n).chain(near_in(&a.live_clients, n)).map(|c| c.mac.as_str()).min()?;
@@ -389,7 +390,8 @@ pub fn assess(a: &Assessment) -> Vec<Finding> {
             continue;
         }
 
-        let family = is_family(bssid);
+        let num = mac_num(bssid);
+        let family = num.is_some_and(is_family);
         let essid = latest.essid.as_deref().filter(|e| !e.is_empty());
         if let Some(e) = essid {
             if a.ssids.contains(e) {
@@ -423,7 +425,7 @@ pub fn assess(a: &Assessment) -> Vec<Finding> {
         if family {
             continue;
         }
-        if let Some(n) = mac_num(bssid)
+        if let Some(n) = num
             && let Some((mac, name)) = client_near(n)
         {
             let who = name.cloned().unwrap_or_else(|| mac.to_string());
