@@ -555,15 +555,15 @@ pub async fn wlans(State(s): State<AppState>, Query(q): Query<RangeQuery>) -> Re
     })
     .await?;
     // How our own SSIDs are heard over the air (our APs scan each other).
-    let own: Vec<Sql> = own_bssids(&s.live.read().unwrap()).map(|(_, v)| Sql::Text(v.bssid.clone())).collect();
+    let own: Vec<String> = own_bssids(&s.live.read().unwrap()).map(|(_, v)| v.bssid.clone()).collect();
     let on_air: HashMap<String, String> = if own.is_empty() {
         HashMap::new()
     } else {
         read(&s.store, Db::Config, move |c| {
-            let marks = vec!["?"; own.len()].join(", ");
+            // The BSSIDs as one JSON list: one statement whatever their number.
             let rows = c
-                .prepare(&format!("SELECT bssid, security FROM neighbors WHERE security IS NOT NULL AND bssid IN ({marks}) ORDER BY last_seen"))?
-                .query_map(params_from_iter(own), |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
+                .prepare_cached(WLANS_ON_AIR)?
+                .query_map([serde_json::to_string(&own)?], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
             Ok(rows.into_iter().collect())
         })
@@ -657,6 +657,9 @@ pub async fn wlans(State(s): State<AppState>, Query(q): Query<RangeQuery>) -> Re
         .collect();
     Ok(Json(json!({ "bucket": bucket, "wlans": list })))
 }
+
+/// The security each of a JSON list of BSSIDs is heard with, newest last.
+const WLANS_ON_AIR: &str = "SELECT bssid, security FROM neighbors WHERE security IS NOT NULL AND bssid IN (SELECT value FROM json_each(?1)) ORDER BY last_seen";
 
 /// What `wlans` loads per VAP.
 const WLAN_COLS: &[&str] = &[
@@ -879,7 +882,7 @@ pub async fn neighbors(State(s): State<AppState>, Query(q): Query<NeighborQuery>
     let since = clock::now_ts() - q.range.unwrap_or(86400).clamp(600, 30 * 86400);
     let band = q.band.clone();
     // Our APs' signal to each other only: the rows of our own BSSIDs (the table's key) are enough.
-    let only: Option<Vec<Sql>> = q.links_only.then(|| own_bssids(&s.live.read().unwrap()).map(|(_, v)| Sql::Text(v.bssid.clone())).collect());
+    let only: Option<Vec<String>> = q.links_only.then(|| own_bssids(&s.live.read().unwrap()).map(|(_, v)| v.bssid.clone()).collect());
     let rows = read(&s.store, Db::Config, move |c| {
         if only.as_ref().is_some_and(Vec::is_empty) {
             return Ok(Vec::new());
@@ -890,15 +893,15 @@ pub async fn neighbors(State(s): State<AppState>, Query(q): Query<NeighborQuery>
             params.push(Sql::Text(b));
             cond.push_str(" AND radio = ?2");
         }
+        // The BSSIDs as one JSON list: one statement whatever their number.
         if let Some(own) = only {
-            let marks: Vec<String> = (params.len() + 1..=params.len() + own.len()).map(|i| format!("?{i}")).collect();
-            cond.push_str(&format!(" AND bssid IN ({})", marks.join(", ")));
-            params.extend(own);
+            params.push(Sql::Text(serde_json::to_string(&own)?));
+            cond.push_str(&format!(" AND bssid IN (SELECT value FROM json_each(?{}))", params.len()));
         }
         let sql = format!(
             "SELECT bssid, ap_mac, radio, essid, channel, bw, center_freq, security, signal, best_signal, is_unifi, ap_name, model, first_seen, last_seen FROM neighbors WHERE {cond}"
         );
-        let mut stmt = c.prepare(&sql)?;
+        let mut stmt = c.prepare_cached(&sql)?;
         let rows = stmt
             .query_map(params_from_iter(params), |r| {
                 Ok(Neighbor {
@@ -1007,6 +1010,13 @@ mod tests {
         let (ts, types) = mcast_types(&rows, 1000, 1600, 300, 300);
         assert_eq!(ts, [1200, 1500]);
         assert_eq!((types["mdns"]["tx_pps"].clone(), types["mdns"]["tx_pkts"].as_f64()), (json!([2.0, 4.0]), Some(200.0 + 600.0 + 400.0)));
+    }
+
+    #[test]
+    fn our_bssids_are_looked_up_through_the_key() {
+        let t = TestStore::new("on-air-plan");
+        let plan: String = t.db(Db::Config).query_row(&format!("EXPLAIN QUERY PLAN {WLANS_ON_AIR}"), [r#"["02:00:00:00:01:01"]"#], |r| r.get(3)).unwrap();
+        assert!(plan.contains("USING PRIMARY KEY (bssid=?)"), "{plan}");
     }
 
     #[test]
