@@ -94,13 +94,15 @@ pub struct Radio<'a> {
 /// One WLAN deployed on one radio.
 pub struct Vap<'a> {
     /// [`wlan_id`] of the WLAN: the same for its VAPs on every radio.
-    pub id: String,
+    pub id: &'a str,
     /// The WLAN document after per-radio adjustments (e.g. WPA3 turned off); a copy
     /// only when something was adjusted.
     pub w: Cow<'a, Value>,
     /// Index into the radio list.
     pub radio: usize,
     pub slot: WifiSlot,
+    /// The VLAN its clients are tagged with, `None` for untagged (see `net::wlan_vlan`).
+    pub vlan: Option<u16>,
 }
 
 impl Vap<'_> {
@@ -225,9 +227,9 @@ fn adapt<'a>(ctx: &Ctx, wlan: &'a Value, radio: &Radio) -> Option<Cow<'a, Value>
     Some(w)
 }
 
-/// The WLANs to deploy as `(adjusted WLAN, radio index)`, radio by radio, each radio in
-/// the site's WLAN order.
-pub fn deploy<'a>(ctx: &Ctx<'a>, radios: &[Radio]) -> Vec<(Cow<'a, Value>, usize)> {
+/// The WLANs to deploy as `(wlan id, adjusted WLAN, radio index)`, radio by radio, each
+/// radio in the site's WLAN order.
+pub fn deploy<'a>(ctx: &Ctx<'a>, radios: &[Radio]) -> Vec<(&'a str, Cow<'a, Value>, usize)> {
     if flag(ctx.device, "disabled", false) {
         return Vec::new();
     }
@@ -244,7 +246,7 @@ pub fn deploy<'a>(ctx: &Ctx<'a>, radios: &[Radio]) -> Vec<(Cow<'a, Value>, usize
         for (w, bands) in &wlans {
             let on_band = if bands.is_empty() { matches!(radio.band, Band::Ng | Band::Na) } else { bands.contains(&radio.band) };
             if on_band && let Some(adapted) = adapt(ctx, w, radio) {
-                out.push((adapted, ri));
+                out.push((wlan_id(w), adapted, ri));
             }
         }
     }
@@ -476,8 +478,9 @@ fn wep(c: &mut Cfg, p: Prefix, w: &Value) {
 }
 
 /// `aaa.N.*` and `wireless.N.*` for one VAP. `bridge` is the bridge the VAP is a port of.
-pub fn render_vap(c: &mut Cfg, ctx: &Ctx, radios: &[Radio], vaps: &[Vap], i: usize, bridge: &str) {
-    let v = &vaps[i];
+/// The `aaa.N.*` and `wireless.N.*` blocks of one VAP (`v`, one of `vaps`).
+pub fn render_vap(c: &mut Cfg, ctx: &Ctx, radios: &[Radio], vaps: &[Vap], v: &Vap) {
+    let bridge = &crate::net::bridge_name(v.vlan);
     let w: &Value = &v.w;
     let r = &radios[v.radio];
     let n = v.slot.section;
@@ -601,7 +604,7 @@ pub fn render_vap(c: &mut Cfg, ctx: &Ctx, radios: &[Radio], vaps: &[Vap], i: usi
         c.set(a.at("radius.macacl.status"), "disabled");
     }
     c.set(a.at("hide_ssid"), b(w, "hide_ssid"));
-    render_wireless(c, ctx, radios, vaps, i);
+    render_wireless(c, ctx, radios, vaps, v);
     if flag(w, "iapp_enabled", true)
         && let Some(key) = str_of(w, "x_iapp_key").filter(|k| !k.is_empty())
     {
@@ -697,8 +700,7 @@ fn allows_11b(rate: i64) -> bool {
     matches!(rate, 1000 | 2000 | 5500 | 11000 | 6000 | 9000)
 }
 
-fn render_wireless(c: &mut Cfg, ctx: &Ctx, radios: &[Radio], vaps: &[Vap], i: usize) {
-    let v = &vaps[i];
+fn render_wireless(c: &mut Cfg, ctx: &Ctx, radios: &[Radio], vaps: &[Vap], v: &Vap) {
     let r = &radios[v.radio];
     let w: &Value = &v.w;
     let n = v.slot.section;

@@ -24,18 +24,15 @@ pub struct Net {
     pub bridges: Vec<Bridge>,
     /// VLANs carried on the trunk, in order of first use.
     pub vlans: Vec<u16>,
-    /// Bridge name for each VAP (by index into the VAP list).
-    pub vap_bridge: Vec<String>,
     pub ebtables: Vec<String>,
 }
 
-fn bridge_name(vlan: Option<u16>) -> String {
+pub fn bridge_name(vlan: Option<u16>) -> String {
     vlan.map_or_else(|| "br0".to_string(), |v| format!("br0.{v}"))
 }
 
 /// The VLAN a WLAN's clients are tagged with, if any.
-fn wlan_vlan(ctx: &Ctx, vap: &Vap) -> Option<u16> {
-    let w: &Value = &vap.w;
+pub fn wlan_vlan(ctx: &Ctx, w: &Value) -> Option<u16> {
     if matches!(str_of(w, "security"), Some("wpaeap")) && dynamic_vlan(ctx, w) != 0 {
         return None;
     }
@@ -68,11 +65,9 @@ pub fn build(ctx: &Ctx, radios: &[Radio], vaps: &[Vap]) -> Result<Net> {
     }
     let mut bridges = vec![Bridge { name: bridge_name(None), vlan: None, ports: eth.clone() }];
     let mut vlans: Vec<u16> = Vec::new();
-    let mut vap_bridge = Vec::new();
     let mut ebtables = Vec::new();
     for vap in vaps {
-        let vlan = wlan_vlan(ctx, vap);
-        vap_bridge.push(bridge_name(vlan));
+        let vlan = vap.vlan;
         if radios[vap.radio].disabled {
             continue;
         }
@@ -98,7 +93,7 @@ pub fn build(ctx: &Ctx, radios: &[Radio], vaps: &[Vap]) -> Result<Net> {
         b.ports.extend(eth.iter().map(|e| format!("{e}.{v}")));
         ebtables.push(format!("-t broute -A BROUTING --vlan-id {v} -p 802_1Q -j DROP"));
     }
-    Ok(Net { eth, bridges, vlans, vap_bridge, ebtables })
+    Ok(Net { eth, bridges, vlans, ebtables })
 }
 
 pub fn render_vlan(c: &mut Cfg, net: &Net) {
@@ -221,14 +216,15 @@ mod tests {
             .iter()
             .enumerate()
             .map(|(i, w)| Vap {
-                id: format!("w{i}"),
+                id: crate::wlan::wlan_id(w),
                 w: Cow::Borrowed(w),
                 radio: 0,
                 slot: WifiSlot { section: i as u32 + 1, device_name: format!("ath{i}"), on_radio: i as u32, first_on_radio: i == 0 },
+                vlan: wlan_vlan(&ctx, w),
             })
             .collect();
         let net = build(&ctx, &radios, &vaps).unwrap();
-        (net.vlans, net.vap_bridge)
+        (net.vlans, vaps.iter().map(|v| bridge_name(v.vlan)).collect())
     }
 
     #[test]

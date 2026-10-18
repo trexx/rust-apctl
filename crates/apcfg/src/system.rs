@@ -11,7 +11,7 @@ use crate::javahash::hash_set_order;
 use crate::json::{Text, arr, flag, int_of, mac_eq, on_off, override_of, str_list, str_of, text_of};
 use crate::meta::Meta;
 use crate::net::{self, Net};
-use crate::wlan::{self, Band, Radio, Vap, network_vlan, wlan_id};
+use crate::wlan::{self, Band, Radio, Vap, network_vlan};
 use crate::{Cap, Ctx, LED, mgmt, tz};
 
 pub fn render(ctx: &Ctx) -> Result<(String, Value)> {
@@ -20,10 +20,16 @@ pub fn render(ctx: &Ctx) -> Result<(String, Value)> {
     let mut meta = Meta::load(ctx, i64::from(qca_v2));
     let radios = wlan::radios(ctx);
     let wanted = wlan::deploy(ctx, &radios);
-    let keys: Vec<(String, &str)> = wanted.iter().map(|(w, r)| (wlan_id(w).to_string(), radios[*r].name)).collect();
+    let keys: Vec<(&str, &str)> = wanted.iter().map(|(id, _, r)| (*id, radios[*r].name)).collect();
     let slots = meta.wireless(&keys, |radio, k| if qca_v2 { format!("{radio}ap{k}") } else { format!("ath{k}") });
-    let vaps: Vec<Vap> =
-        wanted.into_iter().zip(slots).zip(keys).map(|(((w, radio), slot), (id, _))| Vap { id, w, radio, slot }).collect();
+    let vaps: Vec<Vap> = wanted
+        .into_iter()
+        .zip(slots)
+        .map(|((id, w, radio), slot)| {
+            let vlan = net::wlan_vlan(ctx, &w);
+            Vap { id, w, radio, slot, vlan }
+        })
+        .collect();
     let net = net::build(ctx, &radios, &vaps)?;
 
     // A typical system_cfg is 10-20 KB.
@@ -34,7 +40,7 @@ pub fn render(ctx: &Ctx) -> Result<(String, Value)> {
     if caps.any(LED) {
         ledbar(&mut c, ctx);
     }
-    wireless(&mut c, ctx, &radios, &vaps, &net);
+    wireless(&mut c, ctx, &radios, &vaps);
     c.header("connectivity");
     // Meshing (connectivity enabled) is not implemented: no uplink or downlink VAPs.
     c.set("connectivity.status", "disabled");
@@ -167,7 +173,7 @@ fn ledbar(c: &mut Cfg, ctx: &Ctx) {
     }
 }
 
-fn wireless(c: &mut Cfg, ctx: &Ctx, radios: &[Radio], vaps: &[Vap], net: &Net) {
+fn wireless(c: &mut Cfg, ctx: &Ctx, radios: &[Radio], vaps: &[Vap]) {
     let caps = ctx.caps;
     c.header("wlans (radio)");
     let mut any_stamgr = false;
@@ -182,8 +188,8 @@ fn wireless(c: &mut Cfg, ctx: &Ctx, radios: &[Radio], vaps: &[Vap], net: &Net) {
         let outdoor = override_of(ctx.device, "outdoor_mode_override", flag(ctx.mgmt, "outdoor_mode_enabled", false));
         c.set("radio.outdoor", on_off(outdoor));
         any_stamgr = wlan::render_radios(c, ctx, radios, vaps);
-        for i in 0..vaps.len() {
-            wlan::render_vap(c, ctx, radios, vaps, i, &net.vap_bridge[i]);
+        for v in vaps {
+            wlan::render_vap(c, ctx, radios, vaps, v);
         }
     }
     let conn = ctx.setting("connectivity");
