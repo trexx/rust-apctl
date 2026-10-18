@@ -1376,9 +1376,6 @@ pub struct DeviceEdit {
 pub fn apply_device(state: &mut Value, e: &DeviceEdit) -> Result<String, String> {
     let (m, mac) = (e.mac, e.mac.to_string());
     let p = &e.patch;
-    if !state["devices"].is_array() {
-        return Err("the settings have no APs".into());
-    }
     let before = crate::adopt::device_doc(state, &m).ok_or("this AP is not in the settings")?.clone();
     let mut d = before.clone();
 
@@ -1479,8 +1476,7 @@ fn radio_edit(state: &Value, e: &DeviceEdit, rp: &Value, before: &Value, d: &mut
     let caps = &e.caps[band];
     let label = band_name(band);
     let r = d["radio_table"].as_array_mut().and_then(|t| t.iter_mut().find(|r| r["radio"].as_str() == Some(band))).ok_or_else(|| format!("this AP has no {label} radio"))?;
-    if !rp["ht"].is_null() {
-        let ht = int_field(rp, "ht", 20, 320)?.unwrap_or(20);
+    if let Some(ht) = int_field(rp, "ht", 20, 320)? {
         let ok = match band {
             "ng" => [20, 40].contains(&ht),
             "na" | "6e" => [20, 40, 80].contains(&ht) || ht == 160 && caps["has_ht160"].as_bool() == Some(true),
@@ -1507,10 +1503,8 @@ fn radio_edit(state: &Value, e: &DeviceEdit, rp: &Value, before: &Value, d: &mut
         return Err("the 2.4 GHz channel is locked by an SSID's IoT setting".into());
     }
     copy_fields(rp, r, &[("tx_power_mode", Enum(&["auto", "high", "medium", "low", "custom", "disabled"]))])?;
-    if !rp["tx_power"].is_null() {
-        let lo = caps["min_txpower"].as_i64().unwrap_or(1);
-        let hi = caps["max_txpower"].as_i64().unwrap_or(30);
-        let tx = int_field(rp, "tx_power", lo, hi).map_err(|_| format!("{label}: power must be {lo} to {hi} dBm"))?.unwrap_or(lo);
+    let (lo, hi) = (caps["min_txpower"].as_i64().unwrap_or(1), caps["max_txpower"].as_i64().unwrap_or(30));
+    if let Some(tx) = int_field(rp, "tx_power", lo, hi).map_err(|_| format!("{label}: power must be {lo} to {hi} dBm"))? {
         r["tx_power"] = json!(tx);
     }
     copy_fields(rp, r, &[("min_rssi_enabled", Bool), ("min_rssi", Int(-90, -67))])?;

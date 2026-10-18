@@ -136,7 +136,12 @@ fn list_of<'a>(key: &'a str, prefix: &str, middle: &str, suffix: &str) -> Option
 
 /// Line by line the same, or the same once [`normalise_unordered`] sorted the unordered lists.
 fn equivalent_lines(o: &[&str], a: &[&str]) -> bool {
-    o == a || o.len() == a.len() && normalise_unordered(o) == normalise_unordered(a)
+    o == a || same_unordered(o, a)
+}
+
+/// The same once [`normalise_unordered`] sorted the unordered lists.
+fn same_unordered(o: &[&str], a: &[&str]) -> bool {
+    o.len() == a.len() && normalise_unordered(o) == normalise_unordered(a)
 }
 
 /// What [`Comparison::matches`] says of one config, without making the diff.
@@ -166,12 +171,13 @@ pub fn compare_field(ours: &str, actual: &str, redacted: bool) -> FieldCompariso
     let (ours, actual) = masked(ours, actual, redacted);
     let (o, a) = (lines(&ours), lines(&actual));
     let d = cfgdiff::diff(&actual, &ours);
+    let identical = o == a;
     FieldComparison {
         expected_lines: o.len(),
         actual_lines: a.len(),
-        identical: o == a,
+        identical,
         same_content: d.is_empty(),
-        equivalent: equivalent_lines(&o, &a),
+        equivalent: identical || same_unordered(&o, &a),
         added: d.added.len(),
         removed: d.removed.len(),
         changed: d.changed.len(),
