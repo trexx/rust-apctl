@@ -181,16 +181,20 @@ pub struct Jobs {
 }
 
 impl Jobs {
-    /// Queues upgrades (an AP already queued or upgrading is not queued again).
-    /// A queue stopped by a failure stays stopped until it is resumed.
-    pub fn enqueue(&mut self, jobs: Vec<Job>) {
+    /// Queues upgrades (an AP already queued or upgrading is not queued again);
+    /// how many were queued. A queue stopped by a failure stays stopped until
+    /// it is resumed.
+    pub fn enqueue(&mut self, jobs: Vec<Job>) -> usize {
+        let mut n = 0;
         for j in jobs {
             let busy = self.current.as_ref().is_some_and(|c| c.mac == j.mac) || self.queue.iter().any(|q| q.mac == j.mac);
             if !busy {
                 self.queue.push_back(j);
+                n += 1;
             }
         }
         self.next();
+        n
     }
 
     /// Starts a queue a failure stopped again; whether it was stopped.
@@ -272,8 +276,7 @@ impl Op {
     pub fn apply(self, jobs: &mut Jobs) -> usize {
         match self {
             Op::Enqueue(new) => {
-                let n = new.len();
-                jobs.enqueue(new);
+                let n = jobs.enqueue(new);
                 tracing::info!("firmware: {n} upgrade(s) queued");
                 n
             }
@@ -688,7 +691,8 @@ mod tests {
         assert!(j.current.is_some());
         // As the engine makes the changes the UI asks for.
         assert_eq!(Op::Enqueue(vec![job("c"), job("d")]).apply(&mut j), 2);
-        assert_eq!(Op::CancelQueued.apply(&mut j), 2);
+        assert_eq!(Op::Enqueue(vec![job("a"), job("c"), job("e")]).apply(&mut j), 1, "a is upgrading and c queued already");
+        assert_eq!(Op::CancelQueued.apply(&mut j), 3);
     }
 
     #[test]

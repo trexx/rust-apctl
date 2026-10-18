@@ -192,10 +192,12 @@ export function FirmwarePanel() {
               )
                 return;
               void run(async () => {
-                await upgradeFirmwareUrl(urlFor, url);
+                const { queued } = await upgradeFirmwareUrl(urlFor, url);
                 setUrlFor(null);
                 setUrl("");
-                return "Queued.";
+                return queued
+                  ? "Queued."
+                  : "Not queued: it is already queued or updating.";
               });
             }}
           >
