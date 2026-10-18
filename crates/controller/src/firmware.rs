@@ -20,7 +20,7 @@ use std::time::Duration;
 
 use axum::extract::State;
 use axum::http::StatusCode;
-use rusqlite::OptionalExtension;
+use rusqlite::{Connection, OptionalExtension};
 use rusqlite::types::Value as Sql;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -31,7 +31,7 @@ use crate::api::{ApiError, AppState, Json};
 use crate::clock;
 use crate::engine::Live;
 use crate::model::Ts;
-use crate::store::{Db, Store, Writer};
+use crate::store::{Db, Writer};
 
 pub const FEED: &str = "https://fw-update.ubnt.com/api/firmware-newest?filter=eq~~product~~unifi-firmware&filter=eq~~channel~~release";
 /// `fw_caps` bit: the AP verifies SHA-256 checksums.
@@ -431,18 +431,16 @@ pub fn schedule(writer: Writer) {
 type Releases = HashMap<String, Release>;
 
 /// The stored releases, and when the feed was last checked (with its error, if it failed).
-fn releases(store: &Store) -> anyhow::Result<(Releases, Option<Ts>, Option<String>)> {
-    store.read(Db::Config, |c| {
-        let list = c
-            .prepare("SELECT platform, version, url, md5, sha256, size, created FROM firmware_releases")?
-            .query_map([], |r| {
-                Ok(Release { platform: r.get(0)?, version: r.get(1)?, url: r.get(2)?, md5: r.get(3)?, sha256: r.get(4)?, size: r.get(5)?, created: r.get(6)? })
-            })?
-            .map(|r| r.map(|r| (r.platform.clone(), r)))
-            .collect::<rusqlite::Result<HashMap<_, _>>>()?;
-        let (ts, err) = c.query_row("SELECT ts, error FROM firmware_check WHERE id = 1", [], |r| Ok((r.get(0)?, r.get(1)?))).optional()?.unwrap_or((None, None));
-        Ok((list, ts, err))
-    })
+fn releases(c: &Connection) -> anyhow::Result<(Releases, Option<Ts>, Option<String>)> {
+    let list = c
+        .prepare("SELECT platform, version, url, md5, sha256, size, created FROM firmware_releases")?
+        .query_map([], |r| {
+            Ok(Release { platform: r.get(0)?, version: r.get(1)?, url: r.get(2)?, md5: r.get(3)?, sha256: r.get(4)?, size: r.get(5)?, created: r.get(6)? })
+        })?
+        .map(|r| r.map(|r| (r.platform.clone(), r)))
+        .collect::<rusqlite::Result<HashMap<_, _>>>()?;
+    let (ts, err) = c.query_row("SELECT ts, error FROM firmware_check WHERE id = 1", [], |r| Ok((r.get(0)?, r.get(1)?))).optional()?.unwrap_or((None, None));
+    Ok((list, ts, err))
 }
 
 /// An AP model's feed platform, and the release for it.
@@ -485,8 +483,7 @@ fn aps(live: &Live) -> Vec<ApInfo> {
 
 /// GET /api/firmware
 pub async fn index(State(s): State<AppState>) -> Result<Json<Value>, ApiError> {
-    let store = s.store.clone();
-    let (rels, checked, error) = tokio::task::spawn_blocking(move || releases(&store)).await??;
+    let (rels, checked, error) = crate::api::read(&s.store, Db::Config, releases).await?;
     let (aps, jobs) = {
         let live = s.live.read().unwrap();
         (aps(&live), serde_json::to_value(&live.firmware).map_err(anyhow::Error::from)?)
@@ -527,8 +524,7 @@ pub struct UpgradeBody {
 /// POST /api/firmware/upgrade: queue release upgrades, one AP at a time.
 pub async fn upgrade(State(s): State<AppState>, Json(b): Json<UpgradeBody>) -> Result<Json<Value>, ApiError> {
     crate::api::require_active(&s, "upgrades need")?;
-    let store = s.store.clone();
-    let (rels, ..) = tokio::task::spawn_blocking(move || releases(&store)).await??;
+    let (rels, ..) = crate::api::read(&s.store, Db::Config, releases).await?;
     let known = aps(&s.live.read().unwrap());
     let mut skipped = Vec::new();
     let mut wanted: Vec<Mac> = Vec::new();
@@ -762,13 +758,13 @@ mod tests {
     #[test]
     fn a_check_replaces_what_the_last_one_listed_whatever_the_clock() {
         let dir = crate::model::tests::TestDir::new("firmware-releases");
-        let (store, writer) = Store::open(&dir).unwrap();
+        let (store, writer) = crate::store::Store::open(&dir).unwrap();
         let rel = |p: &str| Release { platform: p.into(), version: "6.8.2.15592".into(), url: "u".into(), md5: None, sha256: None, size: None, created: None };
         store_releases(&writer, &[rel("U6M"), rel("U7P")], 2_000_000_000);
         // The clock steps back before the next check, which no longer lists U7P.
         store_releases(&writer, &[rel("U6M"), rel("UAL6")], 1_000_000_000);
         flushed(&writer);
-        let (rels, checked, error) = releases(&store).unwrap();
+        let (rels, checked, error) = store.read(Db::Config, releases).unwrap();
         let mut platforms: Vec<&str> = rels.keys().map(String::as_str).collect();
         platforms.sort_unstable();
         assert_eq!((platforms, checked, error), (vec!["U6M", "UAL6"], Some(1_000_000_000), None));
