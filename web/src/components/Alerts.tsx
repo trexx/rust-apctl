@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { Link, useNavigate } from "react-router";
-import { keys, markAlertsRead, useAlerts } from "../api";
+import { keys, markAlertsRead, useAlerts, useCanEdit } from "../api";
 import type { AlertCategory, AlertItem } from "../api";
 import { clock, useNow } from "../format";
 import { Outcome, useDismiss, useRunner } from "./common";
@@ -98,6 +98,8 @@ export function useNotifier() {
 /** The header bell: unread count and the latest alerts. */
 export function AlertBell() {
   const a = useAlerts();
+  // Marking read is a change: read-only mode refuses it.
+  const canEdit = useCanEdit();
   const now = useNow();
   // The server stores the change a moment later.
   const { busy, msg, run } = useRunner([keys.alerts()], 800);
@@ -135,7 +137,7 @@ export function AlertBell() {
               <span className="muted small">{openNow.length} open</span>
             )}
             <span className="spacer" />
-            {unread > 0 && (
+            {canEdit && unread > 0 && (
               <button className="btn small" disabled={busy} onClick={readAll}>
                 Mark all read
               </button>
