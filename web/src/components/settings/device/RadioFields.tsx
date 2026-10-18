@@ -1,5 +1,5 @@
 import type { DeviceSettings, RadioSettings } from "../../../api";
-import { NumberInput, Row, Select, Toggle, binder } from "../form";
+import { NumberInput, RangeInput, Row, Select, Toggle, binder } from "../form";
 import type { Option } from "../form";
 
 /** A radio's editable fields, as the form holds them. */
@@ -145,17 +145,14 @@ export function RadioFields({
       <Row label="Minimum signal" hint="disconnect clients weaker than this">
         <Toggle {...bind("min_rssi_enabled")} label="Enabled" />
         {form.min_rssi_enabled && (
-          <label className="small">
-            <input
-              type="range"
-              aria-label="Minimum signal"
-              min={-90}
-              max={-67}
-              value={form.min_rssi}
-              onChange={(e) => set("min_rssi", Number(e.target.value))}
-            />{" "}
-            {form.min_rssi} dBm
-          </label>
+          <RangeInput
+            {...bind("min_rssi")}
+            aria-label="Minimum signal"
+            fallback={-80}
+            min={-90}
+            max={-67}
+            unit=" dBm"
+          />
         )}
       </Row>
       {r.has_blocker && form.min_rssi_enabled && (
@@ -173,17 +170,14 @@ export function RadioFields({
         >
           <Toggle {...bind("sens_level_enabled")} label="Fixed level" />
           {form.sens_level_enabled && (
-            <label className="small">
-              <input
-                type="range"
-                aria-label="Sensitivity level"
-                min={-90}
-                max={-50}
-                value={form.sens_level}
-                onChange={(e) => set("sens_level", Number(e.target.value))}
-              />{" "}
-              {form.sens_level} dBm
-            </label>
+            <RangeInput
+              {...bind("sens_level")}
+              aria-label="Sensitivity level"
+              fallback={-90}
+              min={-90}
+              max={-50}
+              unit=" dBm"
+            />
           )}
         </Row>
       )}
