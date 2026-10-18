@@ -21,6 +21,7 @@ use tokio::sync::broadcast;
 use crate::clock;
 use crate::engine::{AliasEdit, ClientView, DeviceView, KnownDevice, Live, LiveMsg, SharedLive};
 use crate::model::{ClientSample, Ts};
+use crate::series::{ap_name_of, client_name};
 use crate::store::{self, Db, Store};
 
 /// What the handlers share. Cloned for every request (and by some handlers
@@ -595,7 +596,7 @@ impl Serialize for ListedSample<'_> {
     }
 }
 
-type ClientCopy = (Mac, ClientView, Option<String>, Option<crate::engine::Alias>);
+type ClientCopy = (Mac, ClientView, Option<crate::engine::Alias>);
 
 /// Every client: the ones seen in this run and the ones restored from the
 /// database at start (`Engine::restore` loads them all, so the live view is
@@ -603,22 +604,17 @@ type ClientCopy = (Mac, ClientView, Option<String>, Option<crate::engine::Alias>
 async fn clients(State(s): State<AppState>) -> Response {
     // What each client's entry needs, copied under the lock (the samples are
     // shared, the rest is small); the serialising happens after it.
-    let (state, list) = {
+    // The APs' names once each, rather than once per client.
+    let (state, list, ap_names) = {
         let live = s.live.read().unwrap();
-        let list: Vec<ClientCopy> = live
-            .clients
-            .iter()
-            .map(|(mac, c)| {
-                let ap_name = live.devices.get(&c.sample.ap_mac).and_then(|d| d.snapshot.ap.hostname.clone());
-                (*mac, c.clone(), ap_name, live.aliases.get(mac).cloned())
-            })
-            .collect();
-        (live.state.clone(), list)
+        let list: Vec<ClientCopy> = live.clients.iter().map(|(mac, c)| (*mac, c.clone(), live.aliases.get(mac).cloned())).collect();
+        let ap_names: std::collections::HashMap<Mac, String> = live.devices.keys().filter_map(|m| Some((*m, ap_name_of(&live, m)?))).collect();
+        (live.state.clone(), list, ap_names)
     };
     let controls = crate::actions::ClientControls::new(state.as_deref());
     let rows: Vec<ListedClient> = list
         .iter()
-        .map(|(mac, view, ap_name, alias)| ListedClient {
+        .map(|(mac, view, alias)| ListedClient {
             client: ClientRow {
                 view: ListedView::new(view),
                 alias: alias.as_ref().and_then(|a| a.alias.as_deref()),
@@ -626,7 +622,7 @@ async fn clients(State(s): State<AppState>) -> Response {
                 vendor: s.vendors.lookup(mac),
                 controls: controls.get(mac),
             },
-            ap_name: ap_name.as_deref(),
+            ap_name: ap_names.get(&view.sample.ap_mac).map(String::as_str),
         })
         .collect();
     Json(rows).into_response()
@@ -638,16 +634,10 @@ async fn client_names(State(s): State<AppState>) -> Json<std::collections::HashM
     let live = s.live.read().unwrap();
     let names = live
         .clients
-        .iter()
-        .filter_map(|(mac, c)| Some((mac.to_string(), client_name(&live, mac, c)?.to_string())))
+        .keys()
+        .filter_map(|mac| Some((mac.to_string(), client_name(&live, Some(*mac))?.to_string())))
         .collect();
     Json(names)
-}
-
-/// A client's display name: its alias, else its hostname; none when it has neither.
-fn client_name<'a>(live: &'a crate::engine::Live, mac: &Mac, c: &'a ClientView) -> Option<&'a str> {
-    let alias = live.aliases.get(mac).and_then(|a| a.alias.as_deref());
-    alias.or(c.sample.hostname.as_deref()).filter(|n| !n.is_empty())
 }
 
 /// A client's page: its view (with the multicast tables), plus the peers in its multicast groups.
@@ -668,16 +658,20 @@ struct Peer {
 
 /// The other connected clients in each of `groups`, sorted by name: a scan of the live clients,
 /// made only for a client that joined some.
-fn multicast_peers(live: &crate::engine::Live, mac: &Mac, groups: &[String]) -> std::collections::BTreeMap<String, Vec<Peer>> {
+fn multicast_peers(live: &Live, mac: &Mac, groups: &[String]) -> std::collections::BTreeMap<String, Vec<Peer>> {
     let mut by: std::collections::BTreeMap<String, Vec<Peer>> = std::collections::BTreeMap::new();
     if groups.is_empty() {
         return by;
     }
     for (m, c) in live.clients.iter().filter(|(m, c)| c.connected && *m != mac) {
         let Some(joined) = c.sample.multicast.as_ref().map(|x| &x.memberships) else { continue };
-        for g in joined.iter().filter(|g| groups.contains(g)) {
-            let name = client_name(live, m, c).map_or_else(|| m.to_string(), str::to_string);
-            by.entry(g.clone()).or_default().push(Peer { mac: *m, name });
+        let mut shared = joined.iter().filter(|g| groups.contains(g)).peekable();
+        if shared.peek().is_none() {
+            continue;
+        }
+        let name = client_name(live, Some(*m)).map_or_else(|| m.to_string(), str::to_string);
+        for g in shared {
+            by.entry(g.clone()).or_default().push(Peer { mac: *m, name: name.clone() });
         }
     }
     for peers in by.values_mut() {
