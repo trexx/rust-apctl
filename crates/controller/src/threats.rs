@@ -541,9 +541,10 @@ pub fn gather(store: &Store, state: &ThreatState, live: &SharedLive, now: Ts) ->
             }
         }
         if let Some(state) = &live.state {
-            for w in state.get("wlanconf").and_then(Value::as_array).into_iter().flatten() {
-                if w.get("enabled").and_then(Value::as_bool) != Some(false)
-                    && let Some(n) = w.get("name").and_then(Value::as_str)
+            // This site's networks only: an import may hold other sites' too.
+            for w in crate::settings::docs(state, "wlanconf") {
+                if w["enabled"].as_bool() != Some(false)
+                    && let Some(n) = w["name"].as_str()
                 {
                     a.ssids.insert(n.to_string());
                 }
@@ -1217,6 +1218,21 @@ mod tests {
         assert_eq!((a.watching_since, a.clients.len()), (100, 1));
         let a = gather(&store, &state, &live, now + CACHE_SECS).unwrap();
         assert_eq!((a.watching_since, a.clients.len()), (50, 2));
+    }
+
+    #[test]
+    fn only_this_sites_network_names_are_ours() {
+        let dir = TestDir::new("threats-sites");
+        let (store, _writer) = Store::open(&dir).unwrap();
+        let (live, state): (SharedLive, ThreatState) = Default::default();
+        live.write().unwrap().state = Some(Arc::new(json!({
+            "devices": [{ "mac": UP, "site_id": "s1" }],
+            "wlanconf": [{ "name": "Home", "site_id": "s1" }, { "name": "Shared" }, { "name": "Office", "site_id": "s2" }, { "name": "Off", "site_id": "s1", "enabled": false }],
+        })));
+        let a = gather(&store, &state, &live, 1_000_000).unwrap();
+        let mut ssids: Vec<&str> = a.ssids.iter().map(String::as_str).collect();
+        ssids.sort();
+        assert_eq!(ssids, ["Home", "Shared"], "another site's networks are not ours");
     }
 
     #[test]
