@@ -109,7 +109,16 @@ pub(crate) fn doc_mac(v: &Value) -> Option<inform::Mac> {
     v.as_str()?.parse().ok()
 }
 
-/// The site the APs belong to (apctl manages one).
+/// The site apctl manages: the one its APs belong to.
+///
+/// apctl manages one site. An import may hold several (`informdump import`
+/// reads every site), and each AP's config is rendered from its own site's
+/// documents, but the editors read and change this site's documents only:
+/// every lookup in a collection goes through [`docs`] / [`docs_mut`] (or
+/// [`setting`] / [`setting_mut`]), and new documents go in with [`push_doc`].
+/// The one exception is an AP's record looked up by its MAC
+/// ([`crate::adopt::device_doc`]): keys, adoption and forgetting go by the
+/// AP's own record, whatever site holds it.
 pub fn site_id(state: &Value) -> Option<&str> {
     state["devices"].as_array()?.iter().find_map(|d| d["site_id"].as_str())
 }
@@ -594,11 +603,11 @@ const MINRATE_NG: &[i64] = &[1000, 2000, 5500, 6000, 9000, 11000, 12000, 18000, 
 const MINRATE_NA: &[i64] = &[6000, 9000, 12000, 18000, 24000, 36000, 48000, 54000];
 
 fn find_wlan<'a>(state: &'a mut Value, id: &str) -> Option<&'a mut Value> {
-    state["wlanconf"].as_array_mut()?.iter_mut().find(|w| oid(w) == Some(id))
+    docs_mut(state, "wlanconf").find(|w| oid(w) == Some(id))
 }
 
 fn wlan<'a>(state: &'a Value, id: &str) -> Option<&'a Value> {
-    state["wlanconf"].as_array()?.iter().find(|w| oid(w) == Some(id))
+    docs(state, "wlanconf").find(|w| oid(w) == Some(id))
 }
 
 fn default_group(state: &Value) -> Option<String> {
@@ -636,7 +645,7 @@ fn set_wlan_aps(state: &mut Value, id: &str, aps: Option<Vec<String>>) -> Result
                     g
                 }
             };
-            if let Some(g) = state["apgroup"].as_array_mut().and_then(|l| l.iter_mut().find(|g| oid(g) == Some(gid.as_str()))) {
+            if let Some(g) = docs_mut(state, "apgroup").find(|g| oid(g) == Some(gid.as_str())) {
                 g["device_macs"] = json!(macs);
             }
             let w = find_wlan(state, id).ok_or("unknown SSID")?;
@@ -649,11 +658,12 @@ fn set_wlan_aps(state: &mut Value, id: &str, aps: Option<Vec<String>>) -> Result
     Ok(())
 }
 
-/// Removes per-SSID AP groups no SSID uses any more.
+/// Removes the site's per-SSID AP groups no SSID uses any more.
 fn prune_groups(state: &mut Value) {
-    let used: Vec<String> = state["wlanconf"].as_array().into_iter().flatten().flat_map(|w| w["ap_group_ids"].as_array().into_iter().flatten()).filter_map(Value::as_str).map(str::to_string).collect();
+    let site = site_id(state).map(str::to_string);
+    let used: Vec<String> = docs(state, "wlanconf").flat_map(|w| w["ap_group_ids"].as_array().into_iter().flatten()).filter_map(Value::as_str).map(str::to_string).collect();
     if let Some(groups) = state["apgroup"].as_array_mut() {
-        groups.retain(|g| g["for_wlanconf"].as_bool() != Some(true) || oid(g).is_some_and(|i| used.iter().any(|u| u == i)));
+        groups.retain(|g| !in_site(site.as_deref(), g) || g["for_wlanconf"].as_bool() != Some(true) || oid(g).is_some_and(|i| used.iter().any(|u| u == i)));
     }
 }
 
@@ -1205,7 +1215,7 @@ pub fn channel_locked_aps(state: &Value) -> Vec<String> {
 fn apply_channel_locks(state: &mut Value, released: &[String]) -> Vec<String> {
     let locked = channel_locked_aps(state);
     let mut out = Vec::new();
-    for d in state["devices"].as_array_mut().into_iter().flatten() {
+    for d in docs_mut(state, "devices") {
         let Some(mac) = doc_mac(&d["mac"]).map(|m| m.to_string()) else { continue };
         let target = if locked.contains(&mac) {
             json!("6")
@@ -2093,6 +2103,26 @@ mod tests {
     }
 
     #[test]
+    fn the_editors_change_the_aps_site_only() {
+        let mut s = state();
+        s["wlanconf"].as_array_mut().unwrap().push(json!({ "_id": "w2", "site_id": "s2", "name": "Elsewhere", "ap_group_ids": ["g9"] }));
+        s["apgroup"].as_array_mut().unwrap().push(json!({ "_id": "g9", "site_id": "s2", "for_wlanconf": true }));
+        s["usergroup"] = json!([{ "_id": "u2", "site_id": "s2", "name": "Theirs" }]);
+        s["clients"] = json!([{ "mac": "aa:bb:cc:00:00:01", "site_id": "s2", "blocked": true }]);
+        assert_eq!(apply_wlan(&mut s.clone(), &WlanEdit { id: "w2".into(), patch: json!({ "name": "Mine" }) }).unwrap_err(), "unknown SSID");
+        assert!(delete_wlan(&mut s.clone(), "w2").is_err());
+        assert!(apply_usergroup(&mut s.clone(), &GroupEdit { id: Some("u2".into()), patch: json!({ "name": "Mine" }), delete: false }).is_err());
+        // Pruning this site's per-SSID groups leaves another site's alone.
+        edit(&mut s, json!({ "aps": [AP1] })).unwrap();
+        edit(&mut s, json!({ "aps": null })).unwrap();
+        assert_eq!(s["apgroup"].as_array().unwrap().iter().filter_map(oid).collect::<Vec<_>>(), ["g0", "g9"]);
+        // A client's entry in another site is not this site's.
+        crate::actions::edit_client(&mut s, "aa:bb:cc:00:00:01".parse().unwrap(), &[("blocked", json!(false))]);
+        assert_eq!((s["clients"][0]["blocked"].as_bool(), s["clients"][1]["site_id"].as_str()), (Some(true), Some("s1")));
+        assert!(!crate::actions::controls(Some(&s), &"aa:bb:cc:00:00:01".parse().unwrap()).blocked);
+    }
+
+    #[test]
     fn repeated_entries_go_wherever_they_are() {
         let mut s = state();
         edit(&mut s, json!({ "mac_filter_list": ["02:00:00:00:00:0a", "02:00:00:00:00:0b", "02:00:00:00:00:0A"] })).unwrap();
@@ -2187,7 +2217,7 @@ pub fn apply_usergroup(state: &mut Value, e: &GroupEdit) -> Result<String, Strin
         return Err(format!("another speed limit is called \"{n}\""));
     }
     let (g, created) = match &id {
-        Some(id) => (array_mut(state, "usergroup").iter_mut().find(|g| oid(g) == Some(id.as_str())).ok_or("unknown speed limit")?, false),
+        Some(id) => (docs_mut(state, "usergroup").find(|g| oid(g) == Some(id.as_str())).ok_or("unknown speed limit")?, false),
         None => {
             let n = name.ok_or("the new speed limit needs a name")?;
             (push_doc(state, "usergroup", json!({ "_id": new_id(), "name": n, "qos_rate_max_down": -1, "qos_rate_max_up": -1 })), true)

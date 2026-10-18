@@ -77,7 +77,8 @@ pub struct Adoption {
     pub forgetting: HashMap<Mac, Ts>,
 }
 
-/// The AP's record in the settings.
+/// The AP's record in the settings, whatever its site (see
+/// [`crate::settings::site_id`]).
 pub fn device_doc<'a>(state: &'a Value, mac: &Mac) -> Option<&'a Value> {
     state["devices"].as_array()?.iter().find(|d| doc_mac(&d["mac"]) == Some(*mac))
 }

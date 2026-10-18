@@ -67,12 +67,13 @@ pub fn next(live: &mut Live, mac: &Mac) -> Option<Value> {
     cmd
 }
 
-/// Sets fields on a client's entry in the settings, creating it (with the
-/// MAC as `aa:bb:..`) if needed.
+/// Sets fields on a client's entry in the site's settings, creating it (with
+/// the MAC as `aa:bb:..`) if needed.
 pub fn edit_client(state: &mut Value, mac: Mac, fields: &[(&str, Value)]) {
     // Matched as `controls` reads them, whichever way the entry writes its MAC.
-    let entry = match state["clients"].as_array().and_then(|l| l.iter().position(|c| doc_mac(&c["mac"]) == Some(mac))) {
-        Some(i) => &mut state["clients"][i],
+    let found = crate::settings::docs(state, "clients").position(|c| doc_mac(&c["mac"]) == Some(mac));
+    let entry = match found {
+        Some(i) => crate::settings::docs_mut(state, "clients").nth(i).expect("found above"),
         None => crate::settings::push_doc(state, "clients", json!({ "mac": mac.to_string() })),
     };
     for (k, v) in fields {
@@ -101,10 +102,11 @@ impl<'a> Controls<'a> {
     }
 }
 
-/// One client's controls. For many clients, `ClientControls` looks each one
-/// up without scanning the settings' client list every time.
+/// One client's controls, from the site's entry. For many clients,
+/// `ClientControls` looks each one up without scanning the settings' client
+/// list every time.
 pub fn controls<'a>(state: Option<&'a Value>, mac: &Mac) -> Controls<'a> {
-    Controls::of(state.and_then(|s| s["clients"].as_array()).and_then(|l| l.iter().find(|c| doc_mac(&c["mac"]) == Some(*mac))))
+    Controls::of(state.and_then(|s| crate::settings::docs(s, "clients").find(|c| doc_mac(&c["mac"]) == Some(*mac))))
 }
 
 /// The settings' client entries by MAC, built once for a list of clients.
@@ -112,9 +114,8 @@ pub struct ClientControls<'a>(HashMap<Mac, &'a Value>);
 
 impl<'a> ClientControls<'a> {
     pub fn new(state: Option<&'a Value>) -> Self {
-        let list = state.and_then(|s| s["clients"].as_array()).map(Vec::as_slice).unwrap_or_default();
-        let mut map = HashMap::with_capacity(list.len());
-        for c in list {
+        let mut map = HashMap::new();
+        for c in state.into_iter().flat_map(|s| crate::settings::docs(s, "clients")) {
             // The first entry for a MAC wins, as with a scan of the list.
             if let Some(m) = doc_mac(&c["mac"]) {
                 map.entry(m).or_insert(c);
