@@ -566,11 +566,22 @@ pub async fn density(State(s): State<AppState>, Query(q): Query<RangeQuery>) -> 
     // Worked out where the data is read, off the async workers and the live lock.
     let aps = memo_read(&s, Db::Metrics, "density", &q, tier, move |c| {
         let mut stmt = c.prepare_cached(&format!("SELECT ts, ap_mac, radio, signal FROM client_stats{suffix} WHERE ts >= ?1 AND ts <= ?2 AND signal < 0 AND ap_mac IS NOT NULL"))?;
-        let signals = stmt
-            .query_map([from, to], |r| Ok((r.get::<_, Ts>(0)?, r.get::<_, String>(1)?, r.get::<_, Option<String>>(2)?, r.get::<_, f64>(3)?)))?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
+        // The few AP and band names, each kept once; a sample refers to them by place.
+        let mut names: Vec<String> = Vec::new();
+        let mut name = |v: &str| {
+            names.iter().position(|n| n == v).unwrap_or_else(|| {
+                names.push(v.to_string());
+                names.len() - 1
+            })
+        };
+        let mut signals = Vec::new();
+        let mut rows = stmt.query([from, to])?;
+        while let Some(r) = rows.next()? {
+            let (ap, radio) = (name(r.get_ref(1)?.as_str()?), r.get_ref(2)?.as_str_or_null()?.map(&mut name));
+            signals.push((r.get::<_, Ts>(0)?, ap, radio, r.get::<_, f64>(3)?));
+        }
         let vaps = load(c, Spec { table: "vap_stats", key: "bssid", extra: &["ap_mac", "radio"], cols: DENSITY_COLS, only: None }, tier, from, to)?;
-        Ok(density_of(signals, &vaps, from))
+        Ok(density_of(&signals, &names, &vaps, from))
     })
     .await?;
     let live = s.live.read().unwrap();
@@ -578,18 +589,17 @@ pub async fn density(State(s): State<AppState>, Query(q): Query<RangeQuery>) -> 
     Ok(Json(json!({ "aps": list })))
 }
 
-/// [`density`] per AP, from client signals (ts, AP, band, signal) and the VAPs' counters.
-fn density_of(signals: Vec<(Ts, String, Option<String>, f64)>, vaps: &Loaded, from: Ts) -> Vec<(String, Vec<Value>)> {
-    use std::borrow::Cow;
-    const ALL: Cow<str> = Cow::Borrowed("all");
+/// [`density`] per AP, from client signals (ts, AP, band, signal; AP and band
+/// by their place in `names`) and the VAPs' counters.
+fn density_of(signals: &[(Ts, usize, Option<usize>, f64)], names: &[String], vaps: &Loaded, from: Ts) -> Vec<(String, Vec<Value>)> {
     // ap -> band -> per report time -> client signals
     type Reports = BTreeMap<Ts, Vec<f64>>;
-    let mut per: BTreeMap<String, BTreeMap<Cow<str>, Reports>> = BTreeMap::new();
-    for (ts, ap, radio, sig) in signals {
-        let bands = per.entry(ap).or_default();
-        bands.entry(ALL).or_default().entry(ts).or_default().push(sig);
+    let mut per: BTreeMap<&str, BTreeMap<&str, Reports>> = BTreeMap::new();
+    for &(ts, ap, radio, sig) in signals {
+        let bands = per.entry(names[ap].as_str()).or_default();
+        bands.entry("all").or_default().entry(ts).or_default().push(sig);
         if let Some(r) = radio {
-            bands.entry(Cow::Owned(r)).or_default().entry(ts).or_default().push(sig);
+            bands.entry(names[r].as_str()).or_default().entry(ts).or_default().push(sig);
         }
     }
     // Traffic share per band among APs, and retries.
@@ -630,9 +640,9 @@ fn density_of(signals: Vec<(Ts, String, Option<String>, f64)>, vaps: &Loaded, fr
                 let half = (sigs.len() / 2).max(1);
                 weakest.push(sigs[..half].iter().sum::<f64>() / half as f64);
             }
-            let traffic = bytes.get(&(ap.as_str(), band.as_ref())).copied().unwrap_or(0.0);
-            let total = band_total.get(band.as_ref()).copied().unwrap_or(0.0);
-            let retry = retries.get(&(ap.as_str(), band.as_ref())).map(|r| retry_pct(*r));
+            let traffic = bytes.get(&(ap, band)).copied().unwrap_or(0.0);
+            let total = band_total.get(band).copied().unwrap_or(0.0);
+            let retry = retries.get(&(ap, band)).map(|r| retry_pct(*r));
             groups.push(json!({
                 "band": band,
                 "weakest_signal": (weakest.iter().sum::<f64>() / weakest.len().max(1) as f64).round(),
@@ -642,7 +652,7 @@ fn density_of(signals: Vec<(Ts, String, Option<String>, f64)>, vaps: &Loaded, fr
                 "tx_retry_pct": retry,
             }));
         }
-        out.push((ap, groups));
+        out.push((ap.to_string(), groups));
     }
     out
 }
