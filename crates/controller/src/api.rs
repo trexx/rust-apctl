@@ -484,11 +484,12 @@ async fn devices(State(s): State<AppState>) -> Json<Vec<DeviceRow>> {
     Json(list)
 }
 
-/// An AP's page: its view, its connected clients, and whether it is blinking to be found.
+/// An AP's page: its view, its connected clients (without their multicast tables,
+/// as the client list sends them), and whether it is blinking to be found.
 #[derive(Serialize)]
 struct DeviceDetail<'a> {
     device: DeviceOut<'a>,
-    clients: &'a [ClientView],
+    clients: Vec<ListedView<'a>>,
     locating: bool,
 }
 
@@ -526,7 +527,8 @@ async fn device(State(s): State<AppState>, MacPath(mac): MacPath) -> Result<Resp
             (None, None) => return Err(ApiError(StatusCode::NOT_FOUND, "unknown device".into())),
         }
     };
-    Ok(Json(DeviceDetail { device: DeviceOut { view: &view, stored_only }, clients: &clients, locating }).into_response())
+    let clients = clients.iter().map(ListedView::new).collect();
+    Ok(Json(DeviceDetail { device: DeviceOut { view: &view, stored_only }, clients, locating }).into_response())
 }
 
 /// A client as its page shows it: its view, plus its name, manufacturer and controls.
@@ -552,9 +554,9 @@ struct ListedClient<'a> {
     ap_name: Option<&'a str>,
 }
 
-/// A client's view as the list sends it: the sample without its multicast tables, which
-/// only the client's own page shows (with the peers in its groups), so the list of every
-/// client of the past year doesn't carry them.
+/// A client's view as the list (and an AP's page) sends it: the sample without its multicast
+/// tables, which only the client's own page shows (with the peers in its groups), so the list
+/// of every client of the past year doesn't carry them.
 #[derive(Serialize)]
 struct ListedView<'a> {
     sample: ListedSample<'a>,
@@ -1339,7 +1341,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_clients_page_lists_its_multicast_peers_and_the_list_has_no_multicast() {
+    async fn a_clients_page_lists_its_multicast_peers_and_the_lists_have_no_multicast() {
         let (s, _engine, _dir) = state();
         let (tx, _) = broadcast::channel(16);
         let mut engine = crate::engine::Engine::new(s.writer.clone(), Default::default(), s.live.clone(), tx);
@@ -1362,6 +1364,10 @@ mod tests {
         let list = get_json(&app, "/api/clients").await;
         assert_eq!(list.as_array().unwrap().len(), 6);
         assert!(list.as_array().unwrap().iter().all(|c| c["sample"].get("multicast").is_none() && c["sample"]["essid"] == "Home"), "{list}");
+        // Nor does the AP's page list its clients with them.
+        let ap = get_json(&app, "/api/devices/02:00:00:00:00:01").await["clients"].clone();
+        assert_eq!(ap.as_array().unwrap().len(), 5, "the connected ones");
+        assert!(ap.as_array().unwrap().iter().all(|c| c["sample"].get("multicast").is_none() && c["sample"]["essid"] == "Home" && c["connected"] == true), "{ap}");
         // The other connected clients in each group, by name (else MAC); not the client itself, nor one that left.
         let tv = get_json(&app, "/api/clients/02:00:00:00:01:01").await;
         assert_eq!(tv["sample"]["multicast"]["memberships"], json!([ssdp, mdns]));
