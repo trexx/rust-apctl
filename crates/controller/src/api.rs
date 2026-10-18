@@ -71,8 +71,8 @@ pub struct AppStateInner {
     pub inform_url: Option<String>,
     /// What the insights views read lately (see `insights::memo_read`).
     pub memo: crate::insights::Memo,
-    /// The threat acknowledgements, shared with `threats::watch`.
-    pub threat_acks: Arc<crate::threats::AckCache>,
+    /// What the threat checks keep between runs, shared with `threats::watch`.
+    pub threats: Arc<crate::threats::ThreatState>,
 }
 
 pub fn router(state: AppState) -> Router {
@@ -1174,7 +1174,7 @@ mod tests {
         let state = AppState::new(AppStateInner {
             backups: crate::backup::Backups::new(dir.to_path_buf(), None),
             store, vendors: Default::default(), renderer: crate::dryrun::apcfg_renderer(crate::EMULATE_VERSION.into()), auth, engine, live: Default::default(), tx, started: 0, source: "none".into(),
-            active: false, writer, inform_url: None, memo: Default::default(), threat_acks: Default::default(),
+            active: false, writer, inform_url: None, memo: Default::default(), threats: Default::default(),
         });
         (state, engine_rx, dir)
     }
