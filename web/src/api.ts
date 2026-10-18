@@ -1275,6 +1275,8 @@ export function useLiveUpdates(): void {
             invalidate(keys.dryrun());
             invalidate(keys.settingsState());
           }
+          // An editor keeps what it was opened with (it saves only the fields changed in it); the rest follows.
+          if (msg.kind === "settings_changed" || msg.kind === "settings_imported") invalidate(keys.settings());
           if (ADOPTION_EVENTS.has(msg.kind)) invalidate(keys.adoption());
           if (NAME_EVENTS.has(msg.kind)) invalidate(keys.deviceNames(), 5000);
           if (msg.kind.startsWith("ap_upgrade")) invalidate(keys.firmware());
