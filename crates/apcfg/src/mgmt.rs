@@ -41,11 +41,11 @@ struct Address<'a> {
 ///
 /// A URL that names no port means 80, the http default.
 fn address<'a>(ctx: &Ctx<'a>) -> Address<'a> {
-    let url = |key| str_of(ctx.device, key).and_then(host_port).map(|(h, p)| (h, p.unwrap_or(80)));
-    if let Some((host, port)) = url("migrate_inform_url") {
+    let url = |u: Option<&'a str>| u.and_then(host_port).map(|(h, p)| (h, p.unwrap_or(80)));
+    if let Some((host, port)) = url(str_of(ctx.device, "migrate_inform_url")) {
         return Address { host, port, migrating: true };
     }
-    let stored = url("inform_url");
+    let stored = url(str_of(ctx.device, "inform_url"));
     let override_host = flag(ctx.super_mgmt, "override_inform_host", false)
         .then(|| str_of(ctx.setting("super_identity"), "hostname").unwrap_or("example-domain.ui.com"))
         .filter(|h| !h.trim().is_empty());

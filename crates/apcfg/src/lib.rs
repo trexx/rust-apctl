@@ -493,6 +493,9 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    /// The render's sources, for the tests that check which fields they read.
+    const SOURCES: [&str; 6] = [include_str!("lib.rs"), include_str!("mgmt.rs"), include_str!("net.rs"), include_str!("system.rs"), include_str!("wlan.rs"), include_str!("meta.rs")];
+
     #[test]
     fn ssid_features_follow_the_capability_bits() {
         let device = json!({ "radio_table": [{ "radio": "ng", "radio_caps2": 31 }, { "radio": "na", "radio_caps2": 1 }] });
@@ -519,9 +522,8 @@ mod tests {
     /// import that keeps those loses nothing a render needs.
     #[test]
     fn device_keys_cover_every_field_read() {
-        let sources = [include_str!("lib.rs"), include_str!("mgmt.rs"), include_str!("net.rs"), include_str!("system.rs"), include_str!("wlan.rs"), include_str!("meta.rs")];
         let mut read: Vec<&str> = CAP_KEYS.to_vec();
-        for src in sources {
+        for src in SOURCES {
             for pattern in ["ctx.device, \"", "ctx.device.get(\"", "(device, \""] {
                 for (at, _) in src.match_indices(pattern) {
                     let rest = &src[at + pattern.len()..];
@@ -540,10 +542,9 @@ mod tests {
     /// cache, keyed on it, never reuses a config made from an inform that differed.
     #[test]
     fn inform_inputs_cover_every_field_read() {
-        let sources = [include_str!("lib.rs"), include_str!("mgmt.rs"), include_str!("net.rs"), include_str!("system.rs"), include_str!("wlan.rs"), include_str!("meta.rs")];
         let known = |k: &str| INFORM_KEYS.contains(&k) || INFORM_TABLE_KEYS.iter().any(|(t, f)| *t == k || *f == k);
         let mut read: Vec<&str> = CAP_KEYS.to_vec();
-        for src in sources {
+        for src in SOURCES {
             // Not the tests: their own patterns would match.
             let src = src.split("#[cfg(test)]").next().unwrap();
             for (at, _) in src.match_indices("inform_str(\"") {
