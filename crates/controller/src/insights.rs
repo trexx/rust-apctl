@@ -12,6 +12,7 @@ use serde_json::{Value, json};
 
 use crate::api::{ApiError, AppState, Json, Query, read};
 use crate::clock;
+use crate::engine::{ClientView, Live};
 use crate::model::Ts;
 use crate::series::{Delta, Loaded, Only, RangeQuery, Samples, Spec, ap_name, ap_name_of, bucket_for, client_name, cols_at, deltas, load, memo_read, own_bssids, window};
 use crate::store::{Db, TIERS};
@@ -202,39 +203,46 @@ pub async fn top(State(s): State<AppState>, Query(q): Query<RangeQuery>) -> Resu
         // Per client and AP, so a client's traffic counts towards the AP it was on.
         let spec = Spec { table: "client_stats", key: "mac || '/' || coalesce(ap_mac, '')", extra: &[], cols: &BYTE_COLS, only: ap.as_deref().map(|a| Only::Is("ap_mac", a)) };
         let cl = load(c, spec, tier, from, to)?;
-        let mut per_client: HashMap<String, (f64, f64)> = HashMap::new();
+        let mut per_client: HashMap<&str, (f64, f64)> = HashMap::new();
         for (k, (_, s)) in &cl {
             let mac = k.split_once('/').map_or(k.as_str(), |(m, _)| m);
             let (d, u) = totals(s, [0, 1], from);
-            let e = per_client.entry(mac.to_string()).or_default();
+            let e = per_client.entry(mac).or_default();
             e.0 += d;
             e.1 += u;
         }
-        // Most traffic first (by MAC among equals); the 25 busiest clients.
-        let by_total = |a: &(String, f64, f64), b: &(String, f64, f64)| (b.1 + b.2).total_cmp(&(a.1 + a.2)).then_with(|| a.0.cmp(&b.0));
-        let mut aps: Vec<(String, f64, f64)> = aps.into_iter().map(|(m, (d, u))| (m, d, u)).collect();
-        aps.sort_by(by_total);
-        let mut clients: Vec<(String, f64, f64)> = per_client.into_iter().filter(|(_, (d, u))| d + u > 0.0).map(|(m, (d, u))| (m, d, u)).collect();
-        clients.sort_by(by_total);
-        clients.truncate(25);
-        Ok((aps, clients))
+        // Most traffic first (by MAC among equals).
+        let mut aps: Vec<(String, (f64, f64))> = aps.into_iter().collect();
+        aps.sort_by(|a, b| (b.1.0 + b.1.1).total_cmp(&(a.1.0 + a.1.1)).then_with(|| a.0.cmp(&b.0)));
+        Ok((aps, busiest(per_client, |(d, u)| d + u)))
     })
     .await?;
     let (aps, clients) = &*got;
     let live = s.live.read().unwrap();
-    let ap_list: Vec<Value> = aps.iter().map(|(mac, d, u)| json!({ "name": ap_name(&live, mac), "mac": mac, "download_bytes": d, "upload_bytes": u })).collect();
-    let cl_list: Vec<Value> = clients
-        .iter()
-        .map(|(mac, d, u)| {
-            let m: Option<inform::Mac> = mac.parse().ok();
-            let view = m.and_then(|m| live.clients.get(&m));
-            json!({
-                "mac": mac, "name": client_name(&live, m), "connected": view.is_some_and(|c| c.connected),
-                "vendor": s.vendors.lookup_str(mac), "download_bytes": d, "upload_bytes": u,
-            })
-        })
-        .collect();
+    let ap_list: Vec<Value> = aps.iter().map(|(mac, (d, u))| json!({ "name": ap_name(&live, mac), "mac": mac, "download_bytes": d, "upload_bytes": u })).collect();
+    let cl_list: Vec<Value> = clients.iter().map(|(mac, (d, u))| listed_client(&s, &live, mac, |_| json!({ "download_bytes": d, "upload_bytes": u }))).collect();
     Ok(Json(json!({ "aps": ap_list, "clients": cl_list })))
+}
+
+/// The 25 clients with the most of what `amount` counts (none without any),
+/// most first and by MAC among equals.
+fn busiest<T>(per: HashMap<&str, T>, amount: impl Fn(&T) -> f64) -> Vec<(String, T)> {
+    let mut list: Vec<(&str, T)> = per.into_iter().filter(|(_, t)| amount(t) > 0.0).collect();
+    list.sort_by(|a, b| amount(&b.1).total_cmp(&amount(&a.1)).then_with(|| a.0.cmp(b.0)));
+    list.truncate(25);
+    list.into_iter().map(|(m, t)| (m.to_string(), t)).collect()
+}
+
+/// A client of a top list: its MAC, name, vendor and whether it is connected,
+/// and the fields of `more` (given what it reports now, if anything).
+fn listed_client(s: &AppState, live: &Live, mac: &str, more: impl FnOnce(Option<&ClientView>) -> Value) -> Value {
+    let m: Option<inform::Mac> = mac.parse().ok();
+    let view = m.and_then(|m| live.clients.get(&m));
+    let mut out = json!({ "mac": mac, "name": client_name(live, m), "vendor": s.vendors.lookup_str(mac), "connected": view.is_some_and(|c| c.connected) });
+    if let (Value::Object(o), Value::Object(more)) = (&mut out, more(view)) {
+        o.extend(more);
+    }
+    out
 }
 
 /// Adds an interval's retries, attempts and drops (`at`: their columns) to
@@ -451,11 +459,8 @@ pub async fn multicast(State(s): State<AppState>, Query(q): Query<RangeQuery>) -
                 }
             }
         }
-        // Most packets first (by MAC among equals).
-        let mut clients: Vec<(String, [f64; 4])> = per.into_iter().filter(|(_, t)| t[0] + t[1] > 0.0).map(|(m, t)| (m.to_string(), t)).collect();
-        clients.sort_by(|a, b| (b.1[0] + b.1[1]).total_cmp(&(a.1[0] + a.1[1])).then_with(|| a.0.cmp(&b.0)));
-        clients.truncate(25);
-        Ok((ts, types, clients))
+        // Most packets first.
+        Ok((ts, types, busiest(per, |t| t[0] + t[1])))
     })
     .await?;
     let (ts, types, clients) = &*got;
@@ -463,16 +468,15 @@ pub async fn multicast(State(s): State<AppState>, Query(q): Query<RangeQuery>) -
     let list: Vec<Value> = clients
         .iter()
         .map(|(mac, t)| {
-            let m: Option<inform::Mac> = mac.parse().ok();
-            let view = m.and_then(|m| live.clients.get(&m));
-            let mc = view.and_then(|v| v.sample.multicast.as_ref());
-            json!({
-                "mac": mac, "name": client_name(&live, m), "vendor": s.vendors.lookup_str(mac),
-                "connected": view.is_some_and(|c| c.connected), "ap": view.and_then(|v| ap_name_of(&live, &v.sample.ap_mac)), "radio": view.and_then(|c| c.sample.radio.clone()),
-                "tx_pkts": t[0].round(), "rx_pkts": t[1].round(), "tx_bytes": t[2].round(), "rx_bytes": t[3].round(),
-                "services": mc.map(|m| m.services.clone()).unwrap_or_default(),
-                "delivery": mc.and_then(|m| m.delivery()),
-                "memberships": mc.map_or(0, |m| m.memberships.len()),
+            listed_client(&s, &live, mac, |view| {
+                let mc = view.and_then(|v| v.sample.multicast.as_ref());
+                json!({
+                    "ap": view.and_then(|v| ap_name_of(&live, &v.sample.ap_mac)), "radio": view.and_then(|c| c.sample.radio.clone()),
+                    "tx_pkts": t[0].round(), "rx_pkts": t[1].round(), "tx_bytes": t[2].round(), "rx_bytes": t[3].round(),
+                    "services": mc.map(|m| m.services.clone()).unwrap_or_default(),
+                    "delivery": mc.and_then(|m| m.delivery()),
+                    "memberships": mc.map_or(0, |m| m.memberships.len()),
+                })
             })
         })
         .collect();
