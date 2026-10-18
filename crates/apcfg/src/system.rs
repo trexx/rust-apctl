@@ -352,7 +352,8 @@ fn syslog(c: &mut Cfg, ctx: &Ctx) {
     if enabled && !this && !wants_ap_logs {
         return;
     }
-    let controller_ip = ctx.inform_str("inform_ip");
+    // Logs for this controller go to the address the AP itself informs to.
+    let to_controller = (ctx.inform_str("inform_ip"), Some(Text::Str("5514")));
     c.header("syslog");
     c.set("syslog.status", "enabled");
     c.set("syslog.level", if enabled && flag(s, "debug", false) { 8 } else { 7 });
@@ -361,21 +362,13 @@ fn syslog(c: &mut Cfg, ctx: &Ctx) {
         c.opt("syslog.remote.key", str_of(ctx.device, "syslog_key"));
     }
     if enabled {
-        let (ip, port) = if this {
-            (controller_ip, Some(Text::Str("5514")))
-        } else {
-            (str_of(s, "ip"), text_of(s, "port"))
-        };
+        let (ip, port) = if this { to_controller } else { (str_of(s, "ip"), text_of(s, "port")) };
         c.opt("syslog.remote.ip", ip);
         c.opt("syslog.remote.port", port);
         c.set("syslog.remote.status", "enabled");
     }
     if this || flag(s, "netconsole_enabled", false) {
-        let (host, port) = if this {
-            (controller_ip, Some(Text::Str("5514")))
-        } else {
-            (str_of(s, "netconsole_host"), text_of(s, "netconsole_port"))
-        };
+        let (host, port) = if this { to_controller } else { (str_of(s, "netconsole_host"), text_of(s, "netconsole_port")) };
         c.opt("netconsole.host", host);
         c.opt("netconsole.port", port);
         c.set("netconsole.status", "enabled");

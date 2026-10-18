@@ -431,15 +431,12 @@ fn radius_servers(c: &mut Cfg, ctx: &Ctx, w: &Value, k: Prefix) {
             })
             .take(4)
     };
-    for (i, (ip, port, secret)) in servers("auth_servers", 1812).enumerate() {
-        c.set(format_args!("{k}radius.auth.{}.ip", i + 1), ip);
-        c.set(format_args!("{k}radius.auth.{}.port", i + 1), port);
-        c.set(format_args!("{k}radius.auth.{}.secret", i + 1), secret);
-    }
-    for (i, (ip, port, secret)) in servers("acct_servers", 1813).enumerate() {
-        c.set(format_args!("{k}radius.acct.{}.ip", i + 1), ip);
-        c.set(format_args!("{k}radius.acct.{}.port", i + 1), port);
-        c.set(format_args!("{k}radius.acct.{}.secret", i + 1), secret);
+    for (kind, list, default_port) in [("auth", "auth_servers", 1812), ("acct", "acct_servers", 1813)] {
+        for (i, (ip, port, secret)) in servers(list, default_port).enumerate() {
+            c.set(format_args!("{k}radius.{kind}.{}.ip", i + 1), ip);
+            c.set(format_args!("{k}radius.{kind}.{}.port", i + 1), port);
+            c.set(format_args!("{k}radius.{kind}.{}.secret", i + 1), secret);
+        }
     }
     if b(p, "interim_update_enabled") {
         c.set(k.at("interim_update.status"), "enabled");
@@ -513,13 +510,16 @@ pub fn render_vap(c: &mut Cfg, ctx: &Ctx, radios: &[Radio], vaps: &[Vap], i: usi
         c.set(a.at("tdls_prohibit"), on_off(b(w, "tdls_prohibit")));
         c.set(a.at("bss_transition"), on_off(flag(w, "bss_transition", true)));
     };
-    let eap = matches!(security, "wpaeap" | "osen");
-    if security == "open" || security == "wep" {
+    let head = |c: &mut Cfg, up: bool| {
         c.set(a.at("br.devname"), bridge);
         c.set(a.at("devname"), v.dev());
         c.set(a.at("driver"), "madwifi");
         c.set(a.at("ssid"), ssid);
-        c.set(a.at("status"), on_off(ctx.caps.has(Cap::HostapdVaps) && !r.disabled));
+        c.set(a.at("status"), on_off(up));
+    };
+    let eap = matches!(security, "wpaeap" | "osen");
+    if security == "open" || security == "wep" {
+        head(c, ctx.caps.has(Cap::HostapdVaps) && !r.disabled);
         c.set(a.at("id"), id);
         c.set(a.at("verbose"), 2);
         common_tail(c);
@@ -533,11 +533,7 @@ pub fn render_vap(c: &mut Cfg, ctx: &Ctx, radios: &[Radio], vaps: &[Vap], i: usi
         }
     } else {
         let wpa_mode = str_of(w, "wpa_mode").unwrap_or("auto");
-        c.set(a.at("br.devname"), bridge);
-        c.set(a.at("devname"), v.dev());
-        c.set(a.at("driver"), "madwifi");
-        c.set(a.at("ssid"), ssid);
-        c.set(a.at("status"), on_off(!r.disabled));
+        head(c, !r.disabled);
         c.set(a.at("verbose"), 2);
         c.set(
             a.at("wpa"),
@@ -569,60 +565,12 @@ pub fn render_vap(c: &mut Cfg, ctx: &Ctx, radios: &[Radio], vaps: &[Vap], i: usi
         } else {
             let sae = wpa3 || is_6e;
             if sae {
-                let ft = if transition { b(w, "wpa3_fast_roaming") } else { b(w, "fast_roaming_enabled") };
-                c.set(a.at("wpa3.ft.status"), on_off(ft));
-                if let Some(x) = int_of(w, "sae_anti_clogging").filter(|x| *x > 0) {
-                    c.set(a.at("sae.anti_clogging"), x);
-                }
-                if let Some(x) = int_of(w, "sae_sync").filter(|x| *x > 0) {
-                    c.set(a.at("sae.sync"), x);
-                }
-                let groups = arr(w, "sae_groups");
-                for (gi, g) in groups.iter().enumerate() {
-                    c.opt(format_args!("{a}sae.groups.{}.group", gi + 1), as_text(g));
-                }
-                if !groups.is_empty() {
-                    c.set(a.at("sae.has_groups"), "enabled");
-                }
-                let entries = arr(w, "sae_psk");
-                let default_psk = entries
-                    .iter()
-                    .find(|e| {
-                        str_of(e, "mac").is_none_or(|m| m.eq_ignore_ascii_case("ff:ff:ff:ff:ff:ff"))
-                            && str_of(e, "id").is_none_or(str::is_empty)
-                    })
-                    .and_then(|e| str_of(e, "psk"))
-                    .filter(|p| p.len() <= 64);
-                let mut k = 0;
-                if transition {
-                    c.set(a.at("wpa.psk"), default_psk.unwrap_or(passphrase));
-                } else if default_psk.is_none() {
-                    k += 1;
-                    c.set(format_args!("{a}sae.psk.{k}.psk"), passphrase);
-                    c.set(format_args!("{a}sae.psk.{k}.mac"), "ff:ff:ff:ff:ff:ff");
-                }
-                for e in entries {
-                    k += 1;
-                    c.opt(format_args!("{a}sae.psk.{k}.psk"), str_of(e, "psk"));
-                    c.opt(format_args!("{a}sae.psk.{k}.mac"), str_of(e, "mac"));
-                    c.opt(format_args!("{a}sae.psk.{k}.vlan"), text_of(e, "vlan"));
-                    c.opt(format_args!("{a}sae.psk.{k}.id"), str_of(e, "id"));
-                }
-                if entries.iter().any(|e| e.get("vlan").is_some()) {
-                    c.set(a.at("dynamic_vlan"), if b(w, "sae_psk_vlan_required") { 2 } else { 1 });
-                }
+                sae_keys(c, w, a, transition, passphrase);
             }
             c.set(a.at("wpa.key.1.mgmt"), if sae { "SAE" } else { "WPA-PSK" });
             c.set(a.at("wpa.psk"), passphrase);
             if b(w, "private_preshared_keys_enabled") {
-                c.set(a.at("dynamic_vlan"), 1);
-                c.set(a.at("wpa.psk_file.status"), "enabled");
-                for (pi, key) in arr(w, "private_preshared_keys").iter().enumerate() {
-                    c.opt(format_args!("{a}wpa.psk_file.{}.psk", pi + 1), str_of(key, "password"));
-                    if let Some(vlan) = network_vlan(ctx, str_of(key, "networkconf_id")) {
-                        c.set(format_args!("{a}wpa.psk_file.{}.vlanid", pi + 1), vlan);
-                    }
-                }
+                ppsk(c, ctx, w, a);
             }
         }
         let enc = str_of(w, "wpa_enc").unwrap_or("auto");
@@ -657,6 +605,65 @@ pub fn render_vap(c: &mut Cfg, ctx: &Ctx, radios: &[Radio], vaps: &[Vap], i: usi
         && let Some(key) = str_of(w, "x_iapp_key").filter(|k| !k.is_empty())
     {
         c.set(a.at("iapp_key"), key);
+    }
+}
+
+/// The WPA3 personal (SAE) lines of a VAP: fast roaming, anti-clogging, groups and the
+/// per-station keys (`sae.psk.N`).
+fn sae_keys(c: &mut Cfg, w: &Value, a: Prefix, transition: bool, passphrase: &str) {
+    let ft = if transition { b(w, "wpa3_fast_roaming") } else { b(w, "fast_roaming_enabled") };
+    c.set(a.at("wpa3.ft.status"), on_off(ft));
+    if let Some(x) = int_of(w, "sae_anti_clogging").filter(|x| *x > 0) {
+        c.set(a.at("sae.anti_clogging"), x);
+    }
+    if let Some(x) = int_of(w, "sae_sync").filter(|x| *x > 0) {
+        c.set(a.at("sae.sync"), x);
+    }
+    let groups = arr(w, "sae_groups");
+    for (gi, g) in groups.iter().enumerate() {
+        c.opt(format_args!("{a}sae.groups.{}.group", gi + 1), as_text(g));
+    }
+    if !groups.is_empty() {
+        c.set(a.at("sae.has_groups"), "enabled");
+    }
+    let entries = arr(w, "sae_psk");
+    let default_psk = entries
+        .iter()
+        .find(|e| {
+            str_of(e, "mac").is_none_or(|m| m.eq_ignore_ascii_case("ff:ff:ff:ff:ff:ff"))
+                && str_of(e, "id").is_none_or(str::is_empty)
+        })
+        .and_then(|e| str_of(e, "psk"))
+        .filter(|p| p.len() <= 64);
+    let mut k = 0;
+    if transition {
+        c.set(a.at("wpa.psk"), default_psk.unwrap_or(passphrase));
+    } else if default_psk.is_none() {
+        k += 1;
+        c.set(format_args!("{a}sae.psk.{k}.psk"), passphrase);
+        c.set(format_args!("{a}sae.psk.{k}.mac"), "ff:ff:ff:ff:ff:ff");
+    }
+    for e in entries {
+        k += 1;
+        c.opt(format_args!("{a}sae.psk.{k}.psk"), str_of(e, "psk"));
+        c.opt(format_args!("{a}sae.psk.{k}.mac"), str_of(e, "mac"));
+        c.opt(format_args!("{a}sae.psk.{k}.vlan"), text_of(e, "vlan"));
+        c.opt(format_args!("{a}sae.psk.{k}.id"), str_of(e, "id"));
+    }
+    if entries.iter().any(|e| e.get("vlan").is_some()) {
+        c.set(a.at("dynamic_vlan"), if b(w, "sae_psk_vlan_required") { 2 } else { 1 });
+    }
+}
+
+/// Private pre-shared keys (`wpa.psk_file.N`), each with its network's VLAN when tagged.
+fn ppsk(c: &mut Cfg, ctx: &Ctx, w: &Value, a: Prefix) {
+    c.set(a.at("dynamic_vlan"), 1);
+    c.set(a.at("wpa.psk_file.status"), "enabled");
+    for (pi, key) in arr(w, "private_preshared_keys").iter().enumerate() {
+        c.opt(format_args!("{a}wpa.psk_file.{}.psk", pi + 1), str_of(key, "password"));
+        if let Some(vlan) = network_vlan(ctx, str_of(key, "networkconf_id")) {
+            c.set(format_args!("{a}wpa.psk_file.{}.vlanid", pi + 1), vlan);
+        }
     }
 }
 
