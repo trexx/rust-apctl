@@ -129,6 +129,29 @@ fn stands_alone(text: &[u8], a: usize, b: usize, word: impl Fn(u8) -> bool) -> b
     !text[..a].last().is_some_and(|&c| word(c)) && !text.get(b).is_some_and(|&c| word(c))
 }
 
+/// A field's names, lowercased, as the allow-lists and `--keep` know it.
+struct Names {
+    key: String,
+    /// A config key's last word that is not a number; a JSON key itself.
+    last: String,
+    /// A config key with its numbers as `n`; a JSON key with its parent (`radio_table.name`).
+    at: String,
+}
+
+impl Names {
+    /// `key` is a JSON key inside the object or array under `parent`, or a dotted config key.
+    fn new(parent: &str, key: &str) -> Self {
+        let k = key.to_ascii_lowercase();
+        let number = |w: &str| w.bytes().all(|b| b.is_ascii_digit());
+        let (last, at) = if k.contains('.') {
+            (k.rsplit('.').find(|w| !number(w)).unwrap_or(&k).to_string(), k.split('.').map(|w| if number(w) { "n" } else { w }).collect::<Vec<_>>().join("."))
+        } else {
+            (k.clone(), if parent.is_empty() { k.clone() } else { format!("{}.{k}", parent.to_ascii_lowercase()) })
+        };
+        Names { key: k, last, at }
+    }
+}
+
 /// Fields (JSON keys, or the last word of a config key) whose values pass: settings,
 /// states, modes, versions, interface and model names. Identifiers inside them are
 /// still rewritten.
@@ -435,23 +458,14 @@ impl Sanitizer {
         if value.is_empty() {
             return String::new();
         }
-        let k = key.to_ascii_lowercase();
-        // A config key's last word that is not a number, and the whole key with its
-        // numbers as `n`; a JSON key with its parent.
-        let (last, at) = if k.contains('.') {
-            let last = k.rsplit('.').find(|w| !w.bytes().all(|b| b.is_ascii_digit())).unwrap_or(&k).to_string();
-            let at = k.split('.').map(|w| if w.bytes().all(|b| b.is_ascii_digit()) { "n" } else { w }).collect::<Vec<_>>().join(".");
-            (last, at)
-        } else {
-            (k.clone(), if parent.is_empty() { k.clone() } else { format!("{}.{k}", parent.to_ascii_lowercase()) })
-        };
-        let kept = self.keep.contains(&last) || self.keep.contains(&at);
+        let names = Names::new(parent, key);
+        let kept = self.kept_field(&names);
+        let secret = self.is_secret_field(&names, under_secret);
+        let Names { key: k, last, at } = names;
         if at == "sshd.auth.key.n.value" || at == "x_ssh_keys.key" {
             // The administrator's SSH public keys.
             self.fakes.get(Kind::SshKey, value, |n| format!("ssh-ed25519 AAAAfake{n}"))
-        } else if is_secret_key(&k)
-            // Everything under a secret key, apart from what a field of its own passes.
-            || (under_secret && !PASS_AT_SET.contains(at.as_str()) && !kept)
+        } else if secret
             // The device SSH account name (stored as x_ssh_username in the controller).
             || (k.starts_with("users.") && last == "name")
             || (k.starts_with("cron.") && last == "user")
@@ -495,6 +509,24 @@ impl Sanitizer {
             self.text_fields.entry(value.to_string()).or_insert(at);
             self.fakes.get(Kind::Text, value, |n| format!("text-{n}"))
         }
+    }
+
+    /// Whether `--keep` names a field.
+    fn kept_field(&self, names: &Names) -> bool {
+        self.keep.contains(&names.last) || self.keep.contains(&names.at)
+    }
+
+    /// Whether a field's value is a secret: its key is one, or a key above it is
+    /// (`under_secret`) and neither a field of its own ([`PASS_AT`]) nor `--keep` passes it.
+    fn is_secret_field(&self, names: &Names, under_secret: bool) -> bool {
+        is_secret_key(&names.key) || (under_secret && !PASS_AT_SET.contains(names.at.as_str()) && !self.kept_field(names))
+    }
+
+    /// Whether a number is a secret (a PIN, a numeric passphrase) where a string would
+    /// be one, unless it is a numeric setting that only looks secret.
+    fn is_secret_number(&self, parent: &str, key: &str, under_secret: bool) -> bool {
+        let names = Names::new(parent, key);
+        !SECRET_LOOKING_NUMBERS.contains(&names.last.as_str()) && self.is_secret_field(&names, under_secret)
     }
 
     /// Remembers a value an allow-listed field passed, if it is a short identifier-like
@@ -594,8 +626,7 @@ impl Sanitizer {
         match v {
             Value::Object(m) => Value::Object(m.iter().map(|(k, v)| (self.object_key(k), self.json_at(key, k, secret, v))).collect()),
             Value::Array(a) => Value::Array(a.iter().map(|x| self.json_at(parent, key, under_secret, x)).collect()),
-            // A secret number (a PIN, a numeric passphrase) is replaced like a string.
-            Value::Number(n) if secret && !SECRET_LOOKING_NUMBERS.contains(&key) && !self.keep.contains(&key.to_ascii_lowercase()) => {
+            Value::Number(n) if secret && self.is_secret_number(parent, key, under_secret) => {
                 Value::String(self.fakes.get(Kind::Secret, &n.to_string(), |n| format!("secret-{n}")))
             }
             Value::String(s) if key.ends_with("_cfg") => Value::String(self.cfg(s)),
@@ -1134,6 +1165,16 @@ mod tests {
         assert_eq!(keys, ["02:00:00:00:00:01", "02-00-00-00-00-02", "020000000001", "192.0.2.1", "2001:db8::1", "00000000-0000-4000-8000-000000000001", "10.0.0.1", "na"]);
         s.check_clean(&out.to_string(), "test").unwrap();
         assert!(s.check_clean("pin 123456", "leak").is_err());
+    }
+
+    #[test]
+    fn a_number_under_a_secret_key_passes_where_a_string_would() {
+        let mut s = Sanitizer::new(Vec::new(), vec!["x_radius.port".into(), "x_passphrase".into()]);
+        let v = json!({ "x_radius": { "port": 1812, "pin": 4321, "ip": "10.0.0.1" }, "x_passphrase": 12345678, "SAE_Groups": [19, 20] });
+        let out = s.json(&v);
+        assert_eq!(out["x_radius"], json!({ "port": 1812, "pin": "secret-1", "ip": "secret-2" }), "--keep as parent.field");
+        assert_eq!(out["x_passphrase"], "secret-3", "--keep does not pass a secret key's own value, number or string");
+        assert_eq!(out["SAE_Groups"], json!([19, 20]), "in any case");
     }
 
     #[test]
