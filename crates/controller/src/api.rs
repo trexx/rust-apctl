@@ -1007,6 +1007,21 @@ fn kinds_with_prefix(c: &rusqlite::Connection, prefix: &str) -> rusqlite::Result
     stmt.query_map((prefix, format!("{prefix}{}", char::MAX)), |r| r.get(0))?.collect()
 }
 
+/// A list catching up over at most this many rows (by id) reads them all by id.
+const CATCH_UP_SCAN: i64 = 10_000;
+
+/// Whether a list catching up on the rows of `table` stored after `after`
+/// reads them by id (the rowid), which visits every row stored since: when
+/// there are few. An index on the filters would walk back through every older
+/// row when fewer than the limit are new; but over many rows (a list filtered
+/// to something rare, whose newest row is old) it serves better, as without
+/// `after`, which then only drops the older rows.
+fn catch_up_by_id(c: &rusqlite::Connection, table: &str, after: Option<i64>) -> rusqlite::Result<bool> {
+    let Some(after) = after else { return Ok(false) };
+    let newest: i64 = c.prepare_cached(&format!("SELECT coalesce(max(id), 0) FROM {table}"))?.query_row([], |r| r.get(0))?;
+    Ok(newest - after <= CATCH_UP_SCAN)
+}
+
 async fn events(State(s): State<AppState>, Query(q): Query<EventQuery>) -> Result<Json<Vec<EventRow>>, ApiError> {
     let mut w = Where::default();
     if let Some(d) = &q.device {
@@ -1031,10 +1046,12 @@ async fn events(State(s): State<AppState>, Query(q): Query<EventQuery>) -> Resul
         if !prefixes.is_empty() && kinds.is_empty() {
             return Ok(vec![]);
         }
-        let sql = if let Some(after) = after {
-            // Catching up: the few events stored since, found by id (the
-            // rowid). An index on the filters would walk back through every
-            // older event when fewer than the limit are new.
+        let by_id = catch_up_by_id(c, "events", after)?;
+        if let Some(after) = after.filter(|_| !by_id) {
+            // Unary plus: not by the rowid range, which would visit every event since.
+            w.and("+id > ?", Sql::Integer(after));
+        }
+        let sql = if let Some(after) = after.filter(|_| by_id) {
             w.and("id > ?", Sql::Integer(after));
             if !kinds.is_empty() {
                 let marks: Vec<String> = kinds.into_iter().map(|k| w.param(Sql::Text(k))).collect();
@@ -1076,8 +1093,8 @@ struct LogQuery {
     after: Option<i64>,
 }
 
-/// The SQL for a log query, newest first.
-fn logs_sql(w: &mut Where, device: Option<Mac>, search: Option<&str>, after: Option<i64>, limit: i64) -> String {
+/// The SQL for a log query, newest first; `by_id` as `catch_up_by_id` decides.
+fn logs_sql(w: &mut Where, device: Option<Mac>, search: Option<&str>, after: Option<i64>, by_id: bool, limit: i64) -> String {
     const COLUMNS: &str = "l.ts, l.device_mac, l.src_ip, l.facility, l.severity, l.program, l.msg, l.id";
     if let Some(text) = search {
         // Quote each word so user input cannot break FTS syntax; words are ANDed.
@@ -1099,14 +1116,18 @@ fn logs_sql(w: &mut Where, device: Option<Mac>, search: Option<&str>, after: Opt
             w.sql()
         );
     }
-    // Catching up, the few lines stored since are found by id (the rowid):
-    // the time index would walk back through every older line when fewer
-    // than the limit are new.
-    let from = if let Some(after) = after {
-        w.and("l.id > ?", Sql::Integer(after));
-        "logs l NOT INDEXED"
-    } else {
-        "logs l"
+    // Catching up over few lines, they are read by id (see `catch_up_by_id`);
+    // over many, from an index (the unary plus keeps the rowid range out).
+    let from = match after {
+        Some(after) if by_id => {
+            w.and("l.id > ?", Sql::Integer(after));
+            "logs l NOT INDEXED"
+        }
+        Some(after) => {
+            w.and("+l.id > ?", Sql::Integer(after));
+            "logs l"
+        }
+        None => "logs l",
     };
     format!("SELECT {COLUMNS} FROM {from} WHERE {} ORDER BY l.ts DESC, l.id DESC LIMIT {limit}", w.sql())
 }
@@ -1128,9 +1149,11 @@ async fn logs(State(s): State<AppState>, Query(q): Query<LogQuery>) -> Result<Js
     let device = q.device.as_deref().map(parse_mac).transpose()?;
     let search = q.q.as_deref().filter(|t| !t.trim().is_empty());
     let limit = q.limit.unwrap_or(500).clamp(1, 5000);
-    let mut w = Where::default();
-    let sql = logs_sql(&mut w, device, search, q.after, limit);
+    let (search, after) = (search.map(str::to_string), q.after);
     let rows = read(&s.store, Db::Logs, move |c| {
+        let by_id = search.is_none() && catch_up_by_id(c, "logs", after)?;
+        let mut w = Where::default();
+        let sql = logs_sql(&mut w, device, search.as_deref(), after, by_id, limit);
         let mut stmt = c.prepare(&sql)?;
         let rows = stmt
             .query_map(params_from_iter(w.params), |r| {
@@ -1434,6 +1457,7 @@ mod tests {
             s.writer.exec(Db::Config, "INSERT INTO events (ts, kind, device_mac, data) VALUES (?1, ?2, ?3, '{}')", vec![Sql::Integer(ts), Sql::Text(kind.into()), dev.map_or(Sql::Null, |d| Sql::Text(d.into()))]);
         }
         flushed(&s.writer);
+        let writer = s.writer.clone();
         let app = router(s);
         let ts = |v: Value| v.as_array().unwrap().iter().map(|e| e["ts"].as_i64().unwrap()).collect::<Vec<_>>();
         assert_eq!(ts(get_json(&app, "/api/events?kind=client").await), vec![6, 4, 3, 1]);
@@ -1447,6 +1471,13 @@ mod tests {
         assert_eq!(ts(get_json(&app, "/api/events?kind=client&after=3").await), vec![6, 4]);
         assert_eq!(ts(get_json(&app, "/api/events?kind=client&device=02:00:00:00:00:02&after=1").await), vec![4, 3]);
         assert_eq!(ts(get_json(&app, "/api/events?after=6").await), Vec::<i64>::new());
+        // Catching up over more rows than are read by id: from the filters' indexes, the same rows.
+        writer.exec(Db::Config, "INSERT INTO events (id, ts, kind, device_mac, data) VALUES (?1, 7, 'client_connected', '02:00:00:00:00:02', '{}')", vec![Sql::Integer(CATCH_UP_SCAN + 10)]);
+        flushed(&writer);
+        assert_eq!(ts(get_json(&app, "/api/events?after=4").await), vec![7, 6, 5]);
+        assert_eq!(ts(get_json(&app, "/api/events?kind=client&after=3").await), vec![7, 6, 4]);
+        assert_eq!(ts(get_json(&app, "/api/events?device=02:00:00:00:00:02&after=3").await), vec![7, 4]);
+        assert_eq!(ts(get_json(&app, "/api/events?kind=client&device=02:00:00:00:00:02&after=1").await), vec![7, 4, 3]);
         assert_eq!(get_json(&app, "/api/events?limit=1").await[0]["data"], json!({}), "the stored payload, as stored");
     }
 
@@ -1461,7 +1492,7 @@ mod tests {
         flushed(&s.writer);
         // A search is read from the full-text index, newest first, and stops at the limit.
         let mut w = Where::default();
-        let sql = logs_sql(&mut w, None, Some("sta"), None, 10);
+        let sql = logs_sql(&mut w, None, Some("sta"), None, false, 10);
         let plan: Vec<String> = s
             .store
             .read(Db::Logs, |c| Ok(c.prepare(&format!("EXPLAIN QUERY PLAN {sql}"))?.query_map(params_from_iter(w.params), |r| r.get(3))?.collect::<rusqlite::Result<_>>()?))
@@ -1470,6 +1501,15 @@ mod tests {
         // Only the limited rows are sorted by time, after the index's own order.
         assert_eq!(plan.iter().filter(|p| p.contains("TEMP B-TREE")).count(), 1, "{plan:?}");
         assert!(plan.last().is_some_and(|p| p == "USE TEMP B-TREE FOR ORDER BY") && plan.iter().any(|p| p.starts_with("SCAN (subquery")), "{plan:?}");
+        // Catching up a device's lines over many rows: from its index, not every line since.
+        let plan = |by_id| {
+            let mut w = Where::default();
+            let sql = logs_sql(&mut w, Some("02:00:00:00:00:02".parse().unwrap()), None, Some(1), by_id, 10);
+            s.store.read(Db::Logs, |c| Ok(c.prepare(&format!("EXPLAIN QUERY PLAN {sql}"))?.query_map(params_from_iter(w.params), |r| r.get::<_, String>(3))?.collect::<rusqlite::Result<Vec<_>>>()?)).unwrap()
+        };
+        assert_eq!(plan(false), ["SEARCH l USING INDEX logs_device (device_mac=?)"]);
+        assert!(plan(true)[0].starts_with("SEARCH l USING INTEGER PRIMARY KEY (rowid>?)"), "{:?}", plan(true));
+        let writer = s.writer.clone();
         let app = router(s);
         let ts = |v: Value| v.as_array().unwrap().iter().map(|e| e["ts"].as_i64().unwrap()).collect::<Vec<_>>();
         assert_eq!(ts(get_json(&app, "/api/logs").await), vec![3, 2, 1]);
@@ -1484,6 +1524,11 @@ mod tests {
             "id": 3, "ts": 3, "device_mac": "02:00:00:00:00:01", "src_ip": null, "facility": null, "severity": null, "program": "hostapd", "msg": "wlan1: STA left",
         });
         assert_eq!(get_json(&app, "/api/logs?limit=1").await, json!([line]));
+        // Catching up over more rows than are read by id: from the indexes, the same lines.
+        writer.exec(Db::Logs, "INSERT INTO logs (id, ts, device_mac, msg) VALUES (?1, 4, '02:00:00:00:00:02', 'eth0 link down')", vec![Sql::Integer(CATCH_UP_SCAN + 10)]);
+        flushed(&writer);
+        assert_eq!(ts(get_json(&app, "/api/logs?after=1&device=02:00:00:00:00:02").await), vec![4, 2]);
+        assert_eq!(ts(get_json(&app, "/api/logs?after=2").await), vec![4, 3]);
     }
 
     #[tokio::test]
