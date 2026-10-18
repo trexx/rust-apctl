@@ -484,10 +484,10 @@ pub fn roam_clients(roams: &[Roam]) -> Vec<Value> {
         .collect()
 }
 
-/// The columns [`event_of`] reads.
-const COLUMNS: &str = "SELECT ts, ap_mac, client_mac, vap, essid, radio, event_type, detail, ip_assign_type, dns_responses, dns_timeouts, rssi FROM connections";
+/// The query of the notifications, before its conditions: the columns [`event_of`] reads.
+const SELECT_EVENTS: &str = "SELECT ts, ap_mac, client_mac, vap, essid, radio, event_type, detail, ip_assign_type, dns_responses, dns_timeouts, rssi FROM connections";
 
-/// A notification, from a row of [`COLUMNS`].
+/// A notification, from a row of [`SELECT_EVENTS`].
 fn event_of(r: &rusqlite::Row) -> rusqlite::Result<ConnEvent> {
     let detail = r.get_ref(7)?.as_str_or_null()?;
     // Rows from before the full notification was kept: rebuild what we can.
@@ -501,7 +501,7 @@ fn event_of(r: &rusqlite::Row) -> rusqlite::Result<ConnEvent> {
     Ok(ConnEvent { ts: r.get(0)?, ap: r.get(1)?, client: r.get(2)?, vap: r.get(3)?, essid: r.get(4)?, radio: r.get(5)?, event_type: r.get(6)?, n })
 }
 
-/// The rows of [`COLUMNS`] in a window, optionally one client's, that also
+/// The rows of [`SELECT_EVENTS`] in a window, optionally one client's, that also
 /// meet `cond`: oldest first, or with `newest` at most that many, newest first.
 fn query_rows(c: &rusqlite::Connection, from: Ts, to: Ts, client: Option<&str>, cond: &str, newest: Option<usize>) -> rusqlite::Result<Vec<ConnEvent>> {
     // Two statements: `(?4 IS NULL OR client_mac = ?4)` would keep SQLite off the per-client index.
@@ -509,7 +509,7 @@ fn query_rows(c: &rusqlite::Connection, from: Ts, to: Ts, client: Option<&str>, 
     let order = if newest.is_some() { "ORDER BY ts DESC, id DESC" } else { "ORDER BY ts, id" };
     // A negative limit is none: the same few statements, kept prepared, whatever the limit.
     let limit = newest.map_or(-1, |n| i64::try_from(n).unwrap_or(i64::MAX));
-    let mut stmt = c.prepare_cached(&format!("{COLUMNS} WHERE {filter} {cond} {order} LIMIT ?3"))?;
+    let mut stmt = c.prepare_cached(&format!("{SELECT_EVENTS} WHERE {filter} {cond} {order} LIMIT ?3"))?;
     let params: Vec<&dyn rusqlite::ToSql> = match &client {
         Some(m) => vec![&from, &to, &limit, m],
         None => vec![&from, &to, &limit],
