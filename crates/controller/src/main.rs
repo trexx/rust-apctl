@@ -457,10 +457,13 @@ async fn shutdown(writer: store::Writer) {
     });
 }
 
-/// The address put in STUN answers: the host of the inform URL, resolved once
-/// (IPv4). None if it does not resolve; the socket's own address is used then.
+/// The address put in STUN answers: the host of the inform URL, an address
+/// or a name resolved once (to IPv4). None if it does not resolve; the
+/// socket's own address is used then.
 async fn advertised_ip(inform_url: &str) -> Option<std::net::IpAddr> {
-    let host = inform_url.split("://").nth(1)?.split([':', '/']).next()?;
+    let uri: axum::http::Uri = inform_url.parse().ok()?;
+    // An IPv6 address comes in brackets (http://[fd00::1]:8080/inform).
+    let host = uri.host()?.trim_start_matches('[').trim_end_matches(']');
     if let Ok(ip) = host.parse() {
         return Some(ip);
     }
@@ -479,5 +482,20 @@ async fn advertised_ip(inform_url: &str) -> Option<std::net::IpAddr> {
             tracing::warn!("resolving {host} timed out: STUN answers carry the socket's address");
             None
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn the_advertised_address_is_the_inform_urls_host() {
+        let ip = |s: &str| Some(s.parse::<std::net::IpAddr>().unwrap());
+        assert_eq!(advertised_ip("http://192.0.2.1:8080/inform").await, ip("192.0.2.1"));
+        assert_eq!(advertised_ip("http://192.0.2.1/inform").await, ip("192.0.2.1"));
+        assert_eq!(advertised_ip("http://[fd00::1]:8080/inform").await, ip("fd00::1"));
+        assert_eq!(advertised_ip("http://[fd00::1]/inform").await, ip("fd00::1"));
+        assert_eq!(advertised_ip("not a url").await, None);
     }
 }
