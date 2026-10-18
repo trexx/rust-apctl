@@ -135,7 +135,7 @@ pub fn ap_groups<'a>(ctx: &Ctx<'a>) -> Vec<&'a str> {
     ctx.site_docs("apgroup")
         .filter(|g| {
             str_of(g, "attr_hidden_id") == Some("default")
-                || str_list(g, "device_macs").iter().any(|m| mac_eq(m, &ctx.mac))
+                || str_list(g, "device_macs").any(|m| mac_eq(m, &ctx.mac))
         })
         .filter_map(oid)
         .collect()
@@ -232,15 +232,16 @@ pub fn deploy<'a>(ctx: &Ctx<'a>, radios: &[Radio]) -> Vec<(Cow<'a, Value>, usize
         return Vec::new();
     }
     let groups = ap_groups(ctx);
-    let wlans: Vec<&'a Value> = ctx
+    // Each WLAN with the bands it is limited to (none: 2.4 and 5 GHz).
+    let wlans: Vec<(&'a Value, Vec<Band>)> = ctx
         .site_docs("wlanconf")
         .filter(|w| flag(w, "enabled", true))
         .filter(|w| in_groups(w, &groups))
+        .map(|w| (w, str_list(w, "wlan_bands").filter_map(Band::of_wlan_band).collect()))
         .collect();
     let mut out = Vec::new();
     for (ri, radio) in radios.iter().enumerate() {
-        for w in &wlans {
-            let bands: Vec<Band> = str_list(w, "wlan_bands").into_iter().filter_map(Band::of_wlan_band).collect();
+        for (w, bands) in &wlans {
             let on_band = if bands.is_empty() { matches!(radio.band, Band::Ng | Band::Na) } else { bands.contains(&radio.band) };
             if on_band && let Some(adapted) = adapt(ctx, w, radio) {
                 out.push((adapted, ri));
@@ -794,7 +795,7 @@ fn render_wireless(c: &mut Cfg, ctx: &Ctx, radios: &[Radio], vaps: &[Vap], i: us
         if aggressive {
             c.set(k.at("bcfilt.bypass_types"), "ARP|NSNA|DHCPV4|DHCPV6");
         }
-        let mut macs: Vec<String> = str_list(w, "bc_filter_list").iter().map(|m| m.to_ascii_lowercase()).collect();
+        let mut macs: Vec<String> = str_list(w, "bc_filter_list").map(|m| m.to_ascii_lowercase()).collect();
         macs.extend(gateway_macs(ctx));
         for (mi, mac) in hash_set_order(&macs).iter().enumerate() {
             c.set(format_args!("{k}bcfilt.{}.status", mi + 1), "enabled");
@@ -817,7 +818,7 @@ fn render_wireless(c: &mut Cfg, ctx: &Ctx, radios: &[Radio], vaps: &[Vap], i: us
         c.set(k.at("dns_cache.status"), "enabled");
         c.set(k.at("dns_bypass.status"), "enabled");
         if dns_mode == "manual" {
-            c.set(k.at("dns_bypass.servers"), str_list(w, "dns_assistance_servers").join(","));
+            c.set(k.at("dns_bypass.servers"), str_list(w, "dns_assistance_servers").collect::<Vec<_>>().join(","));
         }
     }
 }

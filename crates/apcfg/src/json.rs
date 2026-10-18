@@ -82,8 +82,9 @@ pub fn arr<'a>(v: &'a Value, key: &str) -> &'a [Value] {
     v.get(key).and_then(Value::as_array).map(Vec::as_slice).unwrap_or(&[])
 }
 
-pub fn str_list<'a>(v: &'a Value, key: &str) -> Vec<&'a str> {
-    arr(v, key).iter().filter_map(Value::as_str).collect()
+/// The strings of an array field (anything else in it is skipped).
+pub fn str_list<'a>(v: &'a Value, key: &str) -> impl Iterator<Item = &'a str> + use<'a> {
+    arr(v, key).iter().filter_map(Value::as_str)
 }
 
 /// A document id, either `{"_id": {"$oid": "..."}}` (extended JSON) or a plain string.

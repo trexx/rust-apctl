@@ -262,7 +262,6 @@ fn mac_acl(c: &mut Cfg, ctx: &Ctx, vaps: &[Vap]) {
         if filtering {
             entries.extend(
                 str_list(&v.w, "mac_filter_list")
-                    .iter()
                     .map(|m| m.to_ascii_lowercase())
                     .filter(|m| policy != "allow" || !locked_elsewhere.contains(&m.as_str()))
                     .map(|m| (Cow::Owned(m), "user")),
@@ -348,7 +347,7 @@ fn syslog(c: &mut Cfg, ctx: &Ctx) {
     if enabled && this && encrypted_only && !ctx.caps.has(Cap::EncryptedSyslog) {
         return;
     }
-    let wants_ap_logs = flag(s, "log_all_contents", false) || str_list(s, "contents").contains(&"access_points");
+    let wants_ap_logs = flag(s, "log_all_contents", false) || str_list(s, "contents").any(|c| c == "access_points");
     if enabled && !this && !wants_ap_logs {
         return;
     }
@@ -561,7 +560,7 @@ fn mdns(c: &mut Cfg, ctx: &Ctx, vaps: &[Vap], net: &Net) {
     let groups = wlan::ap_groups(ctx);
     let applies = |e: &Value| match str_of(e, "ap_scope_mode").unwrap_or("all") {
         "all" => true,
-        "specific" => str_list(e, "ap_macs").iter().any(|m| mac_eq(m, &ctx.mac)),
+        "specific" => str_list(e, "ap_macs").any(|m| mac_eq(m, &ctx.mac)),
         "group" => wlan::in_groups(e, &groups),
         _ => false,
     };
@@ -592,7 +591,7 @@ fn mdns(c: &mut Cfg, ctx: &Ctx, vaps: &[Vap], net: &Net) {
         let mut entries: Vec<MdnsEntry> = Vec::new();
         if str_of(w, "mdns_proxy_mode") == Some("custom") {
             let custom: Vec<&Value> = arr(w, "mdns_proxy_custom").iter().filter(|e| applies(e)).collect();
-            let lists_own = custom.iter().any(|e| own.is_some_and(|o| str_list(e, "networkconf_ids").contains(&o)));
+            let lists_own = custom.iter().any(|e| own.is_some_and(|o| str_list(e, "networkconf_ids").any(|n| n == o)));
             if !lists_own {
                 let all = custom.iter().any(|e| str_of(e, "services_mode") == Some("all"));
                 let mut union: Vec<&str> = Vec::new();
@@ -604,7 +603,7 @@ fn mdns(c: &mut Cfg, ctx: &Ctx, vaps: &[Vap], net: &Net) {
                 entries.push(MdnsEntry { networks: vec![own], mode: if all { "all" } else { "specific" }, services: Cow::Owned(union) });
             }
             entries.extend(custom.iter().map(|e| MdnsEntry {
-                networks: str_list(e, "networkconf_ids").into_iter().map(Some).collect(),
+                networks: str_list(e, "networkconf_ids").map(Some).collect(),
                 mode: str_of(e, "services_mode").unwrap_or("all"),
                 services: Cow::Owned(entry_services(e)),
             }));
