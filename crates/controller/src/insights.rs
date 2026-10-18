@@ -862,8 +862,17 @@ pub async fn wlans(State(s): State<AppState>, Query(q): Query<RangeQuery>) -> Re
     };
     // Now: per network, the APs and bands broadcasting it, clients and scores;
     // copied, so that the live lock is not held while the list is made.
-    // essid -> (where it is broadcast, bands, experience scores, APs)
-    type Now = (Vec<Value>, std::collections::BTreeSet<String>, Vec<f64>, usize);
+    #[derive(Default)]
+    struct Now {
+        /// Where it is broadcast: an entry per SSID.
+        broadcast: Vec<Value>,
+        bands: std::collections::BTreeSet<String>,
+        /// The experience scores of its SSIDs with clients.
+        scores: Vec<f64>,
+        ap_count: usize,
+        /// The security our APs hear it with, from the first of its SSIDs heard.
+        heard: Option<String>,
+    }
     let (mut now, connected, state) = {
         let live = s.live.read().unwrap();
         let mut now: BTreeMap<String, Now> = BTreeMap::new();
@@ -871,16 +880,19 @@ pub async fn wlans(State(s): State<AppState>, Query(q): Query<RangeQuery>) -> Re
             for (i, v) in d.snapshot.vaps.iter().enumerate() {
                 let Some(e) = v.essid.as_deref().filter(|e| !e.is_empty()) else { continue };
                 let n = now.entry(e.to_string()).or_default();
-                n.0.push(json!({ "ap": mac, "name": d.snapshot.ap.hostname, "radio": v.radio, "channel": v.channel, "bssid": v.bssid, "clients": v.num_sta, "online": d.online }));
+                n.broadcast.push(json!({ "ap": mac, "name": d.snapshot.ap.hostname, "radio": v.radio, "channel": v.channel, "bssid": v.bssid, "clients": v.num_sta, "online": d.online }));
                 if let Some(r) = &v.radio {
-                    n.1.insert(r.clone());
+                    n.bands.insert(r.clone());
                 }
                 if let Some(x) = v.satisfaction.filter(|x| *x >= 0 && v.num_sta.unwrap_or(0) > 0) {
-                    n.2.push(x as f64);
+                    n.scores.push(x as f64);
                 }
                 // An AP counts once, at its first SSID of the network.
                 if !d.snapshot.vaps[..i].iter().any(|w| w.essid == v.essid) {
-                    n.3 += 1;
+                    n.ap_count += 1;
+                }
+                if n.heard.is_none() {
+                    n.heard = on_air.get(&v.bssid).cloned();
                 }
             }
         }
@@ -898,7 +910,7 @@ pub async fn wlans(State(s): State<AppState>, Query(q): Query<RangeQuery>) -> Re
     let list: Vec<Value> = names
         .into_iter()
         .map(|essid| {
-            let (bss, bands, scores, ap_count) = now.remove(&essid).unwrap_or_default();
+            let Now { broadcast, bands, scores, ap_count, heard } = now.remove(&essid).unwrap_or_default();
             let clients = connected.get(&essid).copied().unwrap_or(0);
             let agg = per.get(&essid);
             let (ts, series_clients, down_bps, up_bps, peak) = agg.map_or((vec![], vec![], vec![], vec![], 0.0), |a| {
@@ -915,12 +927,11 @@ pub async fn wlans(State(s): State<AppState>, Query(q): Query<RangeQuery>) -> Re
                 (ts, cl, dn, up, peak)
             });
             let retry = agg.map(|a| a.retry).filter(|t| t.iter().sum::<f64>() > 0.0).map(retry_pct);
-            let heard = bss.iter().find_map(|b| b["bssid"].as_str().and_then(|x| on_air.get(x)).cloned());
             json!({
                 "essid": essid,
                 "settings": wlan_settings(state.as_deref(), &essid),
                 "security_on_air": heard,
-                "broadcast": bss,
+                "broadcast": broadcast,
                 "bands": bands,
                 "ap_count": ap_count,
                 "clients": clients,
