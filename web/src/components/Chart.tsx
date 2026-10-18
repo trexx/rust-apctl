@@ -529,16 +529,19 @@ export function RangePicker({
   const fixed = isFixed(value);
   const preset = !fixed && RANGES.some((r) => r.seconds === value.last);
   const text = spanText(value);
-  const [from, to] = spanBounds(value);
-  const len = to - from;
-  const oldest = useNow() - MAX_AGE;
+  // A live window's start moves with the clock: read in render, React
+  // Compiler would keep the first one, so the step reads it when pressed.
+  const now = useNow();
+  const start = fixed ? value.from : now - value.last;
   // Step a whole window back or forward; reaching the present goes live
   // again. At the oldest data kept the window stops, at its length: cutting
   // only its start left none at all, and an empty window shows live data.
   const step = (dir: -1 | 1) => {
-    const now = Math.floor(Date.now() / 1000);
-    const f = Math.max(from + dir * len, now - MAX_AGE);
-    if (f + len >= now - 60) pick({ last: len });
+    const [from, to] = spanBounds(value);
+    const len = to - from;
+    const at = Math.floor(Date.now() / 1000);
+    const f = Math.max(from + dir * len, at - MAX_AGE);
+    if (f + len >= at - 60) pick({ last: len });
     else pick({ from: f, to: f + len });
   };
   return (
@@ -547,7 +550,7 @@ export function RangePicker({
         className="btn small step"
         aria-label="Earlier"
         title="Earlier"
-        disabled={from <= oldest}
+        disabled={start <= now - MAX_AGE}
         onClick={() => step(-1)}
       >
         ‹
