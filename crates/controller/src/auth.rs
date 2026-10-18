@@ -36,6 +36,10 @@ pub const COOKIE: &str = "apctl_session";
 const SESSION_SECS: Ts = 30 * 86400;
 const MAX_FAILURES: u32 = 5;
 const FAILURE_WINDOW: Ts = 300;
+/// How often windows that have passed are swept out.
+const FAILURE_PRUNE_SECS: Ts = 10;
+/// The most addresses counted at once.
+const MAX_THROTTLED: usize = 10_000;
 
 /// Hashes a password for the users file (Argon2id, random salt).
 pub fn hash_password(password: &str) -> Result<String> {
@@ -114,6 +118,14 @@ impl Users {
     }
 }
 
+/// Login attempts per address in the current window (the count, and when
+/// the window started), and when windows that had passed were last swept out.
+#[derive(Default)]
+struct Failures {
+    by_ip: HashMap<IpAddr, (u32, Ts)>,
+    pruned: Ts,
+}
+
 #[derive(Clone)]
 struct Session {
     user: String,
@@ -123,9 +135,7 @@ struct Session {
 pub struct Auth {
     users: Users,
     sessions: Mutex<HashMap<String, Session>>,
-    /// Login attempts per address in the current window (the count, and when
-    /// the window started).
-    failures: Mutex<HashMap<IpAddr, (u32, Ts)>>,
+    failures: Mutex<Failures>,
     writer: Writer,
     proxies: Arc<Proxies>,
     /// Told of every logout, so open live sockets check their session at once.
@@ -150,7 +160,7 @@ impl Auth {
         })?;
         // Sessions of users that were removed from the file stop working.
         let sessions = rows.into_iter().filter(|(_, s)| users.hashes.contains_key(&s.user)).collect();
-        Ok(Auth { users, sessions: Mutex::new(sessions), failures: Mutex::new(HashMap::new()), writer, proxies, logouts: tokio::sync::watch::Sender::new(()) })
+        Ok(Auth { users, sessions: Mutex::new(sessions), failures: Mutex::default(), writer, proxies, logouts: tokio::sync::watch::Sender::new(()) })
     }
 
     pub fn enabled(&self) -> bool {
@@ -252,9 +262,24 @@ impl Auth {
     fn attempt(&self, ip: IpAddr) -> bool {
         let now = clock::now_ts();
         let mut f = self.failures.lock().unwrap();
-        // Forget windows that have passed, so the map stays small.
-        f.retain(|_, (_, since)| now - *since < FAILURE_WINDOW);
-        let e = f.entry(throttled(ip)).or_insert((0, now));
+        let Failures { by_ip, pruned } = &mut *f;
+        // Forget windows that have passed, every few seconds rather than at every attempt.
+        if now - *pruned >= FAILURE_PRUNE_SECS {
+            by_ip.retain(|_, (_, since)| now - *since < FAILURE_WINDOW);
+            *pruned = now;
+        }
+        let key = throttled(ip);
+        if by_ip.len() >= MAX_THROTTLED && !by_ip.contains_key(&key) {
+            // Full (a flood of addresses): make room by forgetting an address
+            // with the fewest attempts, never one that is held off; with every
+            // address held off, a new one waits too.
+            let Some(evict) = by_ip.iter().filter(|(_, e)| e.0 < MAX_FAILURES).min_by_key(|(_, e)| (e.0, e.1)).map(|(k, _)| *k) else { return false };
+            by_ip.remove(&evict);
+        }
+        let e = by_ip.entry(key).or_insert((0, now));
+        if now - e.1 >= FAILURE_WINDOW {
+            *e = (0, now);
+        }
         if e.0 >= MAX_FAILURES {
             return false;
         }
@@ -265,7 +290,7 @@ impl Auth {
     /// An attempt that does not count against the address: a successful
     /// login, or one never checked.
     fn refund(&self, ip: IpAddr) {
-        if let Some(e) = self.failures.lock().unwrap().get_mut(&throttled(ip)) {
+        if let Some(e) = self.failures.lock().unwrap().by_ip.get_mut(&throttled(ip)) {
             e.0 = e.0.saturating_sub(1);
         }
     }
@@ -597,15 +622,37 @@ mod tests {
         assert!(!auth.attempt(ip));
         assert!(auth.attempt("10.0.0.10".parse().unwrap()));
         // Windows that have passed are forgotten.
-        auth.failures.lock().unwrap().get_mut(&ip).unwrap().1 -= FAILURE_WINDOW;
+        auth.failures.lock().unwrap().by_ip.get_mut(&ip).unwrap().1 -= FAILURE_WINDOW;
+        auth.failures.lock().unwrap().pruned -= FAILURE_PRUNE_SECS;
         assert!(auth.attempt("10.0.0.11".parse().unwrap()));
-        assert!(!auth.failures.lock().unwrap().contains_key(&ip));
+        assert!(!auth.failures.lock().unwrap().by_ip.contains_key(&ip));
+        // A window that has passed starts again even before it is swept out.
+        for _ in 0..MAX_FAILURES {
+            assert!(auth.attempt(ip));
+        }
+        auth.failures.lock().unwrap().by_ip.get_mut(&ip).unwrap().1 -= FAILURE_WINDOW;
+        assert!(auth.attempt(ip));
         // IPv6 counts by /64: a host cannot step through its own addresses.
         for i in 0..MAX_FAILURES {
             assert!(auth.attempt(format!("2001:db8:1:2::{i:x}").parse().unwrap()));
         }
         assert!(!auth.attempt("2001:db8:1:2:ffff::1".parse().unwrap()));
         assert!(auth.attempt("2001:db8:1:3::1".parse().unwrap()));
+    }
+
+    #[test]
+    fn a_flood_of_addresses_does_not_forget_one_that_is_held_off() {
+        let t = TestStore::new("throttle-flood");
+        let auth = Auth::new(Users::default(), &t.store, t.writer, Default::default()).unwrap();
+        let attacker: IpAddr = "10.0.0.9".parse().unwrap();
+        for _ in 0..MAX_FAILURES {
+            assert!(auth.attempt(attacker));
+        }
+        for i in 0..MAX_THROTTLED as u32 + 100 {
+            assert!(auth.attempt(IpAddr::V4((0x0b00_0000 + i).into())));
+        }
+        assert_eq!(auth.failures.lock().unwrap().by_ip.len(), MAX_THROTTLED);
+        assert!(!auth.attempt(attacker), "still held off");
     }
 
     #[test]
