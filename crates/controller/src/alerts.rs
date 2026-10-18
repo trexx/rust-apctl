@@ -481,12 +481,14 @@ async fn load_open(store: &Arc<Store>, now: Ts) -> anyhow::Result<(Vec<Alert>, u
 /// Open health alerts to close: of radios not judged for [`HEALTH_STALE_CHECKS`]
 /// checks in a row (`unjudged` counts them), or of APs no longer known.
 fn stale_health(open: &HashMap<OpenKey, Alert>, judged: &HashSet<OpenKey>, unjudged: &mut HashMap<OpenKey, u32>, known: &HashSet<Mac>) -> Vec<OpenKey> {
+    // A count is of checks in a row while open: an alert judged now, or closed
+    // since (by its threshold too), starts from nothing if it opens again.
+    unjudged.retain(|k, _| open.contains_key(k) && !judged.contains(k));
     let mut out = Vec::new();
     for k in open.keys() {
         // A radio's only: the site-wide one is judged every time.
         let Entity::Radio(mac, _) = &k.1 else { continue };
         if judged.contains(k) {
-            unjudged.remove(k);
             continue;
         }
         let n = unjudged.entry(k.clone()).or_default();
@@ -994,6 +996,17 @@ mod tests {
             assert!(stale_health(&book, &HashSet::new(), &mut unjudged, &known).is_empty());
         }
         assert_eq!(stale_health(&book, &HashSet::new(), &mut unjudged, &known), vec![k.clone()]);
+        // Unjudged for a while, then closed by its threshold: the count goes
+        // with it, so the alert opened again gets every check.
+        for _ in 1..HEALTH_STALE_CHECKS {
+            stale_health(&book, &HashSet::new(), &mut unjudged, &known);
+        }
+        let mut closed = book.clone();
+        closed.remove(&k);
+        assert!(stale_health(&closed, &judged, &mut unjudged, &known).is_empty() && unjudged.is_empty());
+        for _ in 1..HEALTH_STALE_CHECKS {
+            assert!(stale_health(&book, &HashSet::new(), &mut unjudged, &known).is_empty());
+        }
         // An AP that is gone closes at once; the site-wide alert is never stale.
         assert_eq!(stale_health(&book, &HashSet::new(), &mut HashMap::new(), &HashSet::new()), vec![k]);
     }
