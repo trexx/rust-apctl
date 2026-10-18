@@ -377,6 +377,7 @@ pub(crate) const MCAST_GAP: Ts = 120;
 #[derive(Default)]
 struct Written {
     devices: HashMap<Mac, Ts>,
+    /// Connected clients only: one that reconnects is written anyway.
     clients: HashMap<Mac, Ts>,
     /// Per AP: each neighbour by BSSID.
     neighbors: HashMap<Mac, Rows<String, crate::model::NeighborSample>>,
@@ -1028,6 +1029,7 @@ impl Engine {
         connected.retain(|cmac| {
             let Some(c) = clients.get_mut(cmac).filter(|c| c.sample.ap_mac == mac) else { return true };
             events.push(disconnect(&self.writer, ts, *cmac, c, "ap_forgotten"));
+            self.written.clients.remove(cmac);
             false
         });
         drop(live);
@@ -1468,6 +1470,7 @@ impl Engine {
             let Some(reason) = reason else { return true };
             changed = true;
             events.push(disconnect(&self.writer, now, *cmac, c, reason));
+            self.written.clients.remove(cmac);
             false
         });
         // Clients gone longer than the database keeps them (see `store::maintenance`).
@@ -1479,7 +1482,6 @@ impl Engine {
             clients.retain(|mac, c| c.last_seen >= cutoff || aliases.contains_key(mac));
             changed |= clients.len() != before;
             connected.retain(|mac| clients.contains_key(mac));
-            self.written.clients.retain(|mac, _| clients.contains_key(mac));
         }
         drop(live);
         for e in events {
@@ -2047,6 +2049,7 @@ mod tests {
         assert_eq!(stored(client).0, 90);
         h.engine.handle(Input::Tick(400));
         assert_eq!(stored(client).0, 105);
+        assert!(h.engine.written.clients.is_empty(), "nothing kept of a client gone");
     }
 
     #[test]
