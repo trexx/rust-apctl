@@ -344,7 +344,10 @@ pub async fn activity(State(s): State<AppState>, Query(q): Query<RangeQuery>) ->
             wifi_dropped: f64,
             dropped: f64,
             mcast: f64,
+            /// Clients summed over the samples, and how many.
             clients: f64,
+            samples: f64,
+            /// Intervals: the rates above are summed over them.
             n: f64,
         }
         let mut per: BTreeMap<Ts, HashMap<&str, Acc>> = BTreeMap::new();
@@ -368,8 +371,13 @@ pub async fn activity(State(s): State<AppState>, Query(q): Query<RangeQuery>) ->
                     a.attempts += at;
                     a.wifi_dropped += g(wifi_dropped);
                 }
-                a.clients += d.now(num_sta).unwrap_or(0.0);
                 a.n += 1.0;
+            }
+            // Clients as `wlans` counts them: from every sample in the window, an SSID's first included.
+            for (t, v) in samples.since(from) {
+                let a = per.entry(t - t % bucket).or_default().entry(bssid.as_str()).or_default();
+                a.clients += v[num_sta].unwrap_or(0.0);
+                a.samples += 1.0;
             }
         }
         let mut ts = Vec::new();
@@ -389,7 +397,7 @@ pub async fn activity(State(s): State<AppState>, Query(q): Query<RangeQuery>) ->
                 t.wifi_dropped += a.wifi_dropped / n;
                 t.dropped += a.dropped / n;
                 t.mcast += a.mcast / n;
-                t.clients += a.clients / n;
+                t.clients += a.clients / a.samples.max(1.0);
                 t
             });
             let (d, u, p, r, mc, cl) = (t.down, t.up, t.pkts, t.retries, t.mcast, t.clients);
@@ -2074,6 +2082,17 @@ mod tests {
                 }
             }
             assert_eq!(out.as_object().unwrap().len(), expected.as_object().unwrap().len());
+        }
+
+        #[tokio::test]
+        async fn activity_counts_the_clients_of_an_ssids_first_report() {
+            let (s, base, dir) = site();
+            // A new SSID on 6 GHz, with one report so far: no interval yet, but its clients are known.
+            let m = Connection::open(dir.join("metrics.db")).unwrap();
+            insert(&m, "vap_stats", &["bssid", "ts", "ap_mac", "essid", "radio", "num_sta"], vec![vec![text("02:00:00:00:03:01"), int(base + 1810), text(A1), text("Home"), text("6e"), int(4)]]);
+            let q = Query(RangeQuery { range: None, from: Some(base), to: Some(base + 3600), band: Some("6e".into()), mac: None });
+            let out = ok(activity(State(s), q).await);
+            assert_eq!((&out["activity"]["clients"], &out["activity"]["download_bps"]), (&json!([4.0]), &json!([0.0])));
         }
 
         #[tokio::test]
