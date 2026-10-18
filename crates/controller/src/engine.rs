@@ -609,8 +609,8 @@ impl Engine {
             vec![
                 Sql::Integer(ev.ts),
                 Sql::Text(ev.kind.as_str().into()),
-                opt_text(ev.device_mac.map(|m| m.to_string())),
-                opt_text(ev.client_mac.map(|m| m.to_string())),
+                ev.device_mac.map(|m| m.to_string()).into(),
+                ev.client_mac.map(|m| m.to_string()).into(),
                 Sql::Text(ev.data.to_string()),
             ],
         );
@@ -778,13 +778,13 @@ impl Engine {
                        radio = excluded.radio, connected = 1",
                     vec![
                         Sql::Text(c.mac.to_string()),
-                        opt_text(c.hostname.clone()),
-                        opt_text(c.ip.clone()),
+                        c.hostname.clone().into(),
+                        c.ip.clone().into(),
                         Sql::Integer(ts),
                         Sql::Text(c.ap_mac.to_string()),
                         Sql::Text(c.bssid.clone()),
-                        opt_text(c.essid.clone()),
-                        opt_text(c.radio.clone()),
+                        c.essid.clone().into(),
+                        c.radio.clone().into(),
                     ],
                 );
             }
@@ -863,9 +863,9 @@ impl Engine {
             vec![
                 Sql::Text(mac.to_string()),
                 Sql::Integer(ts),
-                opt_text(cfgversion.clone()),
-                opt_text(p["mgmt_cfg"].as_str().map(cfgdiff::redact)),
-                opt_text(p["system_cfg"].as_str().map(cfgdiff::redact)),
+                cfgversion.clone().into(),
+                p["mgmt_cfg"].as_str().map(cfgdiff::redact).into(),
+                p["system_cfg"].as_str().map(cfgdiff::redact).into(),
             ],
         );
 
@@ -887,7 +887,7 @@ impl Engine {
                 self.writer.exec(
                     Db::Config,
                     "INSERT INTO dryrun_results (ts, mac, cfgversion, matches, comparison) VALUES (?1, ?2, ?3, ?4, ?5)",
-                    vec![Sql::Integer(ts), Sql::Text(mac.to_string()), opt_text(cfgversion.clone()), Sql::Integer(matches as i64), Sql::Text(payload)],
+                    vec![Sql::Integer(ts), Sql::Text(mac.to_string()), cfgversion.clone().into(), Sql::Integer(matches as i64), Sql::Text(payload)],
                 );
                 Some(match &result {
                     Ok(c) => json!({ "matches": matches, "system_cfg": { "added": c.system_cfg.added, "removed": c.system_cfg.removed, "changed": c.system_cfg.changed, "same_content": c.system_cfg.same_content } }),
@@ -1048,7 +1048,7 @@ impl Engine {
                 self.writer.exec(
                     Db::Config,
                     "INSERT OR REPLACE INTO client_aliases (mac, alias, note, updated) VALUES (?1, ?2, ?3, ?4)",
-                    vec![Sql::Text(mac.to_string()), opt_text(alias.clone()), opt_text(note), Sql::Integer(ts)],
+                    vec![Sql::Text(mac.to_string()), alias.clone().into(), note.into(), Sql::Integer(ts)],
                 );
             }
             if old.alias != alias {
@@ -1158,14 +1158,14 @@ impl Engine {
             Sql::Integer(ts),
             Sql::Text(ap.to_string()),
             Sql::Text(client.to_string()),
-            opt_text(vap),
-            opt_text(essid.clone()),
-            opt_text(radio),
+            vap.into(),
+            essid.clone().into(),
+            radio.into(),
             Sql::Text(event_type.clone()),
-            opt_text(text("ip_assign_type")),
-            i(num("dns_responses").map(|v| v as i64)),
-            i(num("dns_timeouts").map(|v| v as i64)),
-            i(num("avg_rssi").or_else(|| num("auth_rssi")).map(|v| v as i64)),
+            text("ip_assign_type").into(),
+            num("dns_responses").map(|v| v as i64).into(),
+            num("dns_timeouts").map(|v| v as i64).into(),
+            num("avg_rssi").or_else(|| num("auth_rssi")).map(|v| v as i64).into(),
         ];
         // Failed attempts are worth an event; the rest stay in the connection log.
         // A roam is reported as a "soft failure" but is a normal, successful move.
@@ -1331,11 +1331,11 @@ impl Engine {
             "INSERT INTO logs (ts, device_mac, src_ip, facility, severity, program, msg) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             vec![
                 Sql::Integer(line.ts),
-                opt_text(line.device_mac.map(|m| m.to_string())),
+                line.device_mac.map(|m| m.to_string()).into(),
                 Sql::Text(line.src_ip),
-                i(line.facility),
-                i(line.severity),
-                opt_text(line.program),
+                line.facility.into(),
+                line.severity.into(),
+                line.program.into(),
                 Sql::Text(line.msg),
             ],
         );
@@ -1441,15 +1441,15 @@ impl Engine {
                last_seen = excluded.last_seen, uptime = excluded.uptime",
             vec![
                 Sql::Text(a.mac.to_string()),
-                opt_text(a.hostname.clone()),
-                opt_text(a.model.clone()),
-                opt_text(a.model_display.clone()),
-                opt_text(a.version.clone()),
-                opt_text(a.ip.clone()),
-                opt_text(a.serial.clone()),
-                opt_text(a.hash_id.clone()),
+                a.hostname.clone().into(),
+                a.model.clone().into(),
+                a.model_display.clone().into(),
+                a.version.clone().into(),
+                a.ip.clone().into(),
+                a.serial.clone().into(),
+                a.hash_id.clone().into(),
                 Sql::Integer(a.ts),
-                i(a.uptime),
+                a.uptime.into(),
             ],
         );
     }
@@ -1461,13 +1461,13 @@ impl Engine {
         self.writer.send(Write::Metric {
             table: &store::AP,
             ts,
-            values: vec![mac(), f(a.cpu), f(a.mem), f(a.load1), f(a.load5), f(a.load15), i(a.mem_used), i(a.mem_total), i(a.uptime), i(a.satisfaction), i(a.num_sta)],
+            values: vec![mac(), a.cpu.into(), a.mem.into(), a.load1.into(), a.load5.into(), a.load15.into(), a.mem_used.into(), a.mem_total.into(), a.uptime.into(), a.satisfaction.into(), a.num_sta.into()],
         });
         if let Some(u) = &s.uplink {
             self.writer.send(Write::Metric {
                 table: &store::UPLINK,
                 ts,
-                values: vec![mac(), i(u.speed), i(u.rx_bytes), i(u.tx_bytes), i(u.rx_packets), i(u.tx_packets), i(u.rx_errors), i(u.tx_errors), i(u.rx_dropped), i(u.tx_dropped)],
+                values: vec![mac(), u.speed.into(), u.rx_bytes.into(), u.tx_bytes.into(), u.rx_packets.into(), u.tx_packets.into(), u.rx_errors.into(), u.tx_errors.into(), u.rx_dropped.into(), u.tx_dropped.into()],
             });
         }
         if !s.has_vap_table {
@@ -1478,8 +1478,8 @@ impl Engine {
                 table: &store::RADIO,
                 ts,
                 values: vec![
-                    mac(), Sql::Text(r.radio.clone()), i(r.channel), i(r.bw), i(r.tx_power), i(r.cu_total), i(r.cu_self_rx),
-                    i(r.cu_self_tx), i(r.cu_interf), i(r.noise_floor), Sql::Integer(r.num_sta), i(r.tx_packets), i(r.tx_retries),
+                    mac(), Sql::Text(r.radio.clone()), r.channel.into(), r.bw.into(), r.tx_power.into(), r.cu_total.into(), r.cu_self_rx.into(),
+                    r.cu_self_tx.into(), r.cu_interf.into(), r.noise_floor.into(), Sql::Integer(r.num_sta), r.tx_packets.into(), r.tx_retries.into(),
                 ],
             });
         }
@@ -1488,10 +1488,10 @@ impl Engine {
                 table: &store::VAP,
                 ts,
                 values: vec![
-                    Sql::Text(v.bssid.clone()), mac(), opt_text(v.essid.clone()), opt_text(v.radio.clone()),
-                    i(v.num_sta), i(v.ccq), i(v.satisfaction), i(v.avg_client_signal), i(v.latency_avg),
-                    i(v.rx_bytes), i(v.tx_bytes), i(v.rx_packets), i(v.tx_packets), i(v.tx_retries), i(v.tx_dropped),
-                    i(v.tx_mcast), i(v.rx_mcast), i(v.wifi_tx_attempts), i(v.wifi_tx_dropped), i(v.tx_bcast), i(v.rx_bcast),
+                    Sql::Text(v.bssid.clone()), mac(), v.essid.clone().into(), v.radio.clone().into(),
+                    v.num_sta.into(), v.ccq.into(), v.satisfaction.into(), v.avg_client_signal.into(), v.latency_avg.into(),
+                    v.rx_bytes.into(), v.tx_bytes.into(), v.rx_packets.into(), v.tx_packets.into(), v.tx_retries.into(), v.tx_dropped.into(),
+                    v.tx_mcast.into(), v.rx_mcast.into(), v.wifi_tx_attempts.into(), v.wifi_tx_dropped.into(), v.tx_bcast.into(), v.rx_bcast.into(),
                 ],
             });
         }
@@ -1512,9 +1512,9 @@ impl Engine {
                    best_signal = MAX(COALESCE(best_signal, -200), COALESCE(excluded.signal, -200)), noise = excluded.noise,
                    is_unifi = excluded.is_unifi, ap_name = excluded.ap_name, model = excluded.model, last_seen = excluded.last_seen",
                 vec![
-                    Sql::Text(n.bssid.clone()), mac(), opt_text(n.radio.clone()), opt_text(n.essid.clone()), i(n.channel), i(n.bw),
-                    i(n.center_freq), opt_text(n.security.clone()), i(n.signal), i(n.noise), Sql::Integer(n.is_unifi as i64),
-                    opt_text(n.ap_name.clone()), opt_text(n.model.clone()), Sql::Integer(ts),
+                    Sql::Text(n.bssid.clone()), mac(), n.radio.clone().into(), n.essid.clone().into(), n.channel.into(), n.bw.into(),
+                    n.center_freq.into(), n.security.clone().into(), n.signal.into(), n.noise.into(), Sql::Integer(n.is_unifi as i64),
+                    n.ap_name.clone().into(), n.model.clone().into(), Sql::Integer(ts),
                 ],
             );
         }
@@ -1532,7 +1532,7 @@ impl Engine {
             self.writer.exec(
                 Db::Config,
                 "INSERT OR REPLACE INTO spectrum (ap_mac, radio, channel, width, utilization, interference, other_bss_count, ts) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-                vec![mac(), Sql::Text(c.radio.clone()), Sql::Integer(c.channel), i(c.width), i(c.utilization), i(c.interference), i(c.other_bss_count), Sql::Integer(ts)],
+                vec![mac(), Sql::Text(c.radio.clone()), Sql::Integer(c.channel), c.width.into(), c.utilization.into(), c.interference.into(), c.other_bss_count.into(), Sql::Integer(ts)],
             );
         }
         radios.retain(|_, rows| {
@@ -1553,10 +1553,10 @@ impl Engine {
                 table: &store::CLIENT,
                 ts,
                 values: vec![
-                    Sql::Text(c.mac.to_string()), mac(), Sql::Text(c.bssid.clone()), opt_text(c.essid.clone()), opt_text(c.radio.clone()), i(c.channel),
-                    i(c.rssi), i(c.signal), i(c.noise), i(c.tx_rate), i(c.rx_rate), i(c.satisfaction), i(c.latency_avg),
-                    i(c.tx_bytes), i(c.rx_bytes), i(c.tx_packets), i(c.rx_packets), i(c.tx_retries),
-                    i(t.map(|t| t.tx_pkts)), i(t.map(|t| t.rx_pkts)), i(t.map(|t| t.tx_bytes)), i(t.map(|t| t.rx_bytes)),
+                    Sql::Text(c.mac.to_string()), mac(), Sql::Text(c.bssid.clone()), c.essid.clone().into(), c.radio.clone().into(), c.channel.into(),
+                    c.rssi.into(), c.signal.into(), c.noise.into(), c.tx_rate.into(), c.rx_rate.into(), c.satisfaction.into(), c.latency_avg.into(),
+                    c.tx_bytes.into(), c.rx_bytes.into(), c.tx_packets.into(), c.rx_packets.into(), c.tx_retries.into(),
+                    t.map(|t| t.tx_pkts).into(), t.map(|t| t.rx_pkts).into(), t.map(|t| t.tx_bytes).into(), t.map(|t| t.rx_bytes).into(),
                 ],
             });
             let Some(m) = m else { continue };
@@ -1730,18 +1730,6 @@ fn disconnect(writer: &Writer, ts: Ts, mac: Mac, c: &mut ClientView, reason: &st
         "reason": reason, "last_seen": c.last_seen, "essid": c.sample.essid,
         "connected_for": c.sample.uptime, "last_signal": c.sample.signal,
     }))
-}
-
-fn f(v: Option<f64>) -> Sql {
-    v.map_or(Sql::Null, Sql::Real)
-}
-
-fn i(v: Option<i64>) -> Sql {
-    v.map_or(Sql::Null, Sql::Integer)
-}
-
-fn opt_text(v: Option<String>) -> Sql {
-    v.map_or(Sql::Null, Sql::Text)
 }
 
 #[cfg(test)]
