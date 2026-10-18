@@ -26,7 +26,7 @@ use crate::clock;
 use crate::engine::{Event, EventKind, Live};
 use crate::model::Ts;
 use crate::adopt::{device_doc, device_doc_mut};
-use crate::settings::{band_channels, country, device_macs, inform_radio, is_legal, legal_channels, num, setting, setting_mut, uplink};
+use crate::settings::{band_channels, country, device_macs, inform_radio, is_legal, legal_channels, mac_list_value, num, setting, setting_mut, uplink};
 
 /// A band Channel AI handles, and how its quick scan is asked for.
 pub struct Band {
@@ -527,7 +527,7 @@ pub fn apply_settings(state: &mut Value, p: &Value) -> Result<String, String> {
         r["radios_configuration"] = json!(confs);
     }
     if !p["exclude_devices"].is_null() {
-        let macs: Vec<String> = p["exclude_devices"].as_array().ok_or("exclude_devices must be a list")?.iter().filter_map(|v| v.as_str().map(str::to_ascii_lowercase)).collect();
+        let macs = mac_list_value(&p["exclude_devices"], "exclude_devices")?.unwrap_or_default();
         if let Some(m) = macs.iter().find(|m| !known.contains(m)) {
             return Err(format!("{m} is not one of the APs"));
         }
@@ -598,7 +598,9 @@ mod tests {
         apply_settings(&mut s, &json!({ "hour": 6 })).unwrap();
         assert_eq!((settings(Some(&s)).hour, settings(Some(&s)).minute), (6, 30));
         assert!(apply_settings(&mut s, &json!({ "exclude_devices": ["02:00:00:00:00:99"] })).is_err());
-        apply_settings(&mut s, &json!({ "exclude_devices": ["02:00:00:00:00:01"] })).unwrap();
+        assert!(apply_settings(&mut s, &json!({ "exclude_devices": [1] })).is_err());
+        // Any form of the MAC, saved as aa:bb:.. and once.
+        apply_settings(&mut s, &json!({ "exclude_devices": ["02-00-00-00-00-01", "020000000001"] })).unwrap();
         assert_eq!(settings(Some(&s)).exclude_devices, vec!["02:00:00:00:00:01"]);
     }
 

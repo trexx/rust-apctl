@@ -546,7 +546,7 @@ fn mac_list(patch: &Value, key: &str) -> Result<Option<Vec<String>>, String> {
 
 /// [`mac_list`] for the value itself (`key` names it in errors). Any form
 /// `Mac` reads (`aa-bb-..`, bare hex, any case) is saved as `aa:bb:..`.
-fn mac_list_value(v: &Value, key: &str) -> Result<Option<Vec<String>>, String> {
+pub(crate) fn mac_list_value(v: &Value, key: &str) -> Result<Option<Vec<String>>, String> {
     match v {
         Value::Null => Ok(None),
         Value::Array(a) => {
