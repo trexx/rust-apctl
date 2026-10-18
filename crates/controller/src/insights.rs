@@ -1003,18 +1003,52 @@ fn wlan_history(vaps: &Loaded, from: Ts, bucket: Ts) -> BTreeMap<String, WlanAgg
 /// What `radios` loads per VAP.
 const RADIO_VAP_COLS: &[&str] = &["tx_bytes", "rx_bytes", "avg_client_signal", "tx_retries", "wifi_tx_attempts", "wifi_tx_dropped"];
 
+/// One radio's averages over the window, as `radios` lists them.
+#[derive(Default)]
+struct RadioAvg {
+    utilization: Option<f64>,
+    interference: Option<f64>,
+    retry_pct: Option<f64>,
+    /// Bytes both ways over all its SSIDs.
+    usage: f64,
+    signal: Mean,
+}
+
 /// GET /api/rf/radios: each AP radio with its settings now and its averages
 /// over the window (interference, utilisation, traffic, retries, signal).
 pub async fn radios(State(s): State<AppState>, Query(q): Query<RangeQuery>) -> Result<Json<Value>, ApiError> {
     let (from, to, tier) = window(&q);
-    let got = memo_read(&s, Db::Metrics, "radios", &q, tier, move |c| {
-        let r = load(c, Spec { table: "radio_stats", key: "mac || '/' || radio", extra: &[], cols: &["cu_total", "cu_interf"], only: None }, tier, from, to)?;
+    // By `mac/radio`, worked out where the data is read.
+    let avgs = memo_read(&s, Db::Metrics, "radios", &q, tier, move |c| {
+        let mut out: HashMap<String, RadioAvg> = HashMap::new();
+        // Airtime: SQLite averages each radio's samples in the window.
+        let sql = format!("SELECT mac || '/' || radio, AVG(cu_total), AVG(cu_interf) FROM radio_stats{} WHERE ts >= ?1 AND ts <= ?2 GROUP BY mac, radio", TIERS[tier].0);
+        let mut stmt = c.prepare_cached(&sql)?;
+        let mut rows = stmt.query([from, to])?;
+        while let Some(r) = rows.next()? {
+            let e = out.entry(r.get(0)?).or_default();
+            (e.utilization, e.interference) = (r.get(1)?, r.get(2)?);
+        }
         // Retries come from the VAPs: the radio-level counters stay at 0 on some models.
-        let v = load(c, Spec { table: "vap_stats", key: "bssid", extra: &["ap_mac", "radio"], cols: RADIO_VAP_COLS, only: None }, tier, from, to)?;
-        Ok((r, v))
+        let vaps = load(c, Spec { table: "vap_stats", key: "bssid", extra: &["ap_mac", "radio"], cols: RADIO_VAP_COLS, only: None }, tier, from, to)?;
+        for ((ap, band), t) in retry_totals(&vaps, cols_at(RADIO_VAP_COLS, RETRY_COLS), from) {
+            out.entry(format!("{ap}/{band}")).or_default().retry_pct = Some(retry_pct(t));
+        }
+        // Traffic and client signal per radio.
+        let [tx, rx, signal] = cols_at(RADIO_VAP_COLS, ["tx_bytes", "rx_bytes", "avg_client_signal"]);
+        for (ex, samples) in vaps.values() {
+            let e = out.entry(format!("{}/{}", ex[0], ex[1])).or_default();
+            for d in deltas(samples, from) {
+                e.usage += d.inc(tx).unwrap_or(0.0) + d.inc(rx).unwrap_or(0.0);
+            }
+            // The AP reports 0 or -1 when no client is connected.
+            for x in samples.since(from).filter_map(|(_, v)| v[signal]).filter(|v| *v < -10.0) {
+                e.signal.add(x);
+            }
+        }
+        Ok(out)
     })
     .await?;
-    let (rstats, vstats) = &*got;
     let spectrum_rows = read(&s.store, Db::Config, |c| {
         let mut stmt = c.prepare("SELECT ap_mac, radio, channel, width, utilization, interference, other_bss_count, ts FROM spectrum")?;
         let rows = stmt
@@ -1028,22 +1062,6 @@ pub async fn radios(State(s): State<AppState>, Query(q): Query<RangeQuery>) -> R
         Ok(rows)
     })
     .await?;
-    let retry = retry_totals(vstats, cols_at(RADIO_VAP_COLS, RETRY_COLS), from);
-    // The radios' samples by (AP, band), from their `mac/radio` keys.
-    let rstats: HashMap<(&str, &str), &Samples> = rstats.iter().filter_map(|(k, (_, samples))| Some((k.split_once('/')?, samples))).collect();
-    // Traffic and client signal per (AP, band), and the spectrum rows, grouped once.
-    let [tx, rx, signal] = cols_at(RADIO_VAP_COLS, ["tx_bytes", "rx_bytes", "avg_client_signal"]);
-    let mut vap_use: HashMap<(&str, &str), (f64, Mean)> = HashMap::new();
-    for (ex, samples) in vstats.values() {
-        let e = vap_use.entry((ex[0].as_str(), ex[1].as_str())).or_default();
-        for d in deltas(samples, from) {
-            e.0 += d.inc(tx).unwrap_or(0.0) + d.inc(rx).unwrap_or(0.0);
-        }
-        // The AP reports 0 or -1 when no client is connected.
-        for x in samples.since(from).filter_map(|(_, v)| v[signal]).filter(|v| *v < -10.0) {
-            e.1.add(x);
-        }
-    }
     let mut spectrum: HashMap<(&str, &str), Vec<&Value>> = HashMap::new();
     for (m, rd, v) in &spectrum_rows {
         spectrum.entry((m.as_str(), rd.as_str())).or_default().push(v);
@@ -1053,29 +1071,16 @@ pub async fn radios(State(s): State<AppState>, Query(q): Query<RangeQuery>) -> R
     for (mac, d) in &live.devices {
         let mac_s = mac.to_string();
         for r in &d.snapshot.radios {
-            let key = (mac_s.as_str(), r.radio.as_str());
-            let (avg_cu, avg_interf) = match rstats.get(&key) {
-                Some(samples) => {
-                    let (mut cu, mut interf) = (Mean::default(), Mean::default());
-                    for (_, v) in samples.since(from) {
-                        v[0].into_iter().for_each(|x| cu.add(x));
-                        v[1].into_iter().for_each(|x| interf.add(x));
-                    }
-                    (cu.get(), interf.get())
-                }
-                None => (None, None),
-            };
-            let (usage, signal) = vap_use.get(&key).copied().unwrap_or_default();
-            let retry_pct = retry.get(&key).map(|t| retry_pct(*t));
-            let spec = spectrum.get(&key).cloned().unwrap_or_default();
+            let a = avgs.get(&format!("{mac_s}/{}", r.radio));
+            let spec = spectrum.get(&(mac_s.as_str(), r.radio.as_str())).cloned().unwrap_or_default();
             out.push(json!({
                 "mac": mac, "name": d.snapshot.ap.hostname, "radio": r.radio, "channel": r.channel, "bw": r.bw,
                 "tx_power": r.tx_power, "eirp": r.tx_power.zip(r.antenna_gain).map(|(p, g)| p + g),
                 "min_txpower": r.min_txpower, "max_txpower": r.max_txpower,
                 "clients": r.num_sta, "cu_total_now": r.cu_total, "noise_floor": r.noise_floor,
-                "avg_utilization": avg_cu, "avg_interference": avg_interf, "tx_retry_pct": retry_pct,
-                "usage_bytes": usage,
-                "avg_client_signal": signal.get(),
+                "avg_utilization": a.and_then(|a| a.utilization), "avg_interference": a.and_then(|a| a.interference), "tx_retry_pct": a.and_then(|a| a.retry_pct),
+                "usage_bytes": a.map_or(0.0, |a| a.usage),
+                "avg_client_signal": a.and_then(|a| a.signal.get()),
                 "spectrum": spec,
             }));
         }
