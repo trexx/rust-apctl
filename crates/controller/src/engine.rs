@@ -1314,7 +1314,12 @@ impl Engine {
         if flagged.is_empty() {
             return;
         }
-        let ours: Vec<(Mac, u64)> = self.live.read().unwrap().devices.keys().map(|m| (*m, hardware_num(m))).collect();
+        // The APs reporting in this run, and those known from earlier ones that have not
+        // reported yet: after a restart, the isolated AP may be unable to (the two are apart).
+        let ours: Vec<(Mac, u64)> = {
+            let live = self.live.read().unwrap();
+            live.devices.keys().chain(live.known_devices.keys()).map(|m| (*m, hardware_num(m))).collect()
+        };
         for n in flagged {
             let Ok(b) = n.bssid.parse::<Mac>().map(|m| hardware_num(&m)) else { continue };
             // The nearest of our APs that is likely the same hardware.
@@ -2164,6 +2169,22 @@ mod tests {
         h.engine.handle(Input::Inform { ts: 1, peer: "x".into(), decoded: decoded(inform(b, 1000, &[])) });
         // A heard B's BSSID flagged isolated; A's own MAC is within 16 of it too.
         let mut p = inform(a, 1002, &[]);
+        p["radio_table"] = json!([{ "radio": "na", "scan_table": [{ "bssid": "02:00:00:00:00:1a", "is_isolated": true, "signal": -70 }] }]);
+        h.engine.handle(Input::Inform { ts: 2, peer: "x".into(), decoded: decoded(p) });
+        let blamed: Vec<_> = std::iter::from_fn(|| h.rx.try_recv().ok())
+            .filter_map(|m| match m { LiveMsg::Event(e) if e.kind == EventKind::ApIsolated => Some(e.device_mac), _ => None })
+            .collect();
+        assert_eq!(blamed, [b.parse().ok()]);
+    }
+
+    #[test]
+    fn an_isolated_beacon_is_blamed_on_an_ap_known_from_an_earlier_run() {
+        let mut h = harness();
+        let (a, b) = ("02:00:00:00:00:10", "02:00:00:00:00:18");
+        // B is only in the database: it lost its uplink before apctl restarted.
+        let known = KnownDevice { first_seen: 0, last_seen: 0, uptime: None, version: None, hostname: None, model: None, model_display: None, ip: None, serial: None };
+        h.engine.live.write().unwrap().known_devices.insert(b.parse().unwrap(), known);
+        let mut p = inform(a, 1000, &[]);
         p["radio_table"] = json!([{ "radio": "na", "scan_table": [{ "bssid": "02:00:00:00:00:1a", "is_isolated": true, "signal": -70 }] }]);
         h.engine.handle(Input::Inform { ts: 2, peer: "x".into(), decoded: decoded(p) });
         let blamed: Vec<_> = std::iter::from_fn(|| h.rx.try_recv().ok())
