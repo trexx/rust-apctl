@@ -787,7 +787,8 @@ fn render_wireless(c: &mut Cfg, ctx: &Ctx, radios: &[Radio], vaps: &[Vap], v: &V
         if ng {
             c.set(k.at("minrate_cck_rates.status"), allows_11b(rate));
         }
-        if r.band.key(["minrate_ng_advertising_rates", "minrate_na_advertising_rates", "minrate_6e_advertising_rates"]).is_some_and(|key| b(w, key)) {
+        // Minimum rates are only set on 2.4 and 5 GHz radios (see `min_rate`).
+        if b(w, if ng { "minrate_ng_advertising_rates" } else { "minrate_na_advertising_rates" }) {
             c.set(k.at("minrate_below_disable"), "true");
         }
     }
