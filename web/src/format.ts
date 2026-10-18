@@ -183,7 +183,7 @@ export const compact = (n: number | null | undefined) => (n === null || n === un
 export const speed = (kbps: number | null | undefined) => (kbps && kbps > 0 ? `${kbps >= 1000 ? `${+(kbps / 1000).toFixed(2)} Mbps` : `${kbps} kbps`}` : "none");
 
 /** "13 Oct 06:00 – 09:00", or with both dates when the window spans days. */
-export function spanLabel(from: number, to: number): string {
+function spanLabel(from: number, to: number): string {
   const f = new Date(from * 1000);
   const t = new Date(to * 1000);
   const start = `${dayFmt.format(f)} ${minuteFmt.format(f)}`;
