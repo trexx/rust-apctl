@@ -1,6 +1,7 @@
 //! `system_cfg`: all sections, in the official controller's order.
 
 use std::borrow::Cow;
+use std::collections::HashSet;
 use std::sync::OnceLock;
 
 use anyhow::{Result, bail};
@@ -257,6 +258,7 @@ fn mac_acl(c: &mut Cfg, ctx: &Ctx, vaps: &[Vap]) {
         .map(str::to_ascii_lowercase)
         .collect();
     let locked_elsewhere = hash_set_order(&locked_elsewhere);
+    let locked: HashSet<&str> = locked_elsewhere.iter().copied().collect();
     let mut blocks: Vec<AclBlock> = Vec::new();
     for v in vaps {
         let filtering = flag(&v.w, "mac_filter_enabled", false);
@@ -269,16 +271,14 @@ fn mac_acl(c: &mut Cfg, ctx: &Ctx, vaps: &[Vap]) {
             entries.extend(
                 str_list(&v.w, "mac_filter_list")
                     .map(|m| m.to_ascii_lowercase())
-                    .filter(|m| policy != "allow" || !locked_elsewhere.contains(&m.as_str()))
+                    .filter(|m| policy != "allow" || !locked.contains(m.as_str()))
                     .map(|m| (Cow::Owned(m), "user")),
             );
         }
         if policy == "deny" {
-            for &m in &locked_elsewhere {
-                if !entries.iter().any(|(e, _)| e == m) {
-                    entries.push((Cow::Borrowed(m), "lock2ap"));
-                }
-            }
+            let listed: HashSet<&str> = entries.iter().map(|(e, _)| e.as_ref()).collect();
+            let unlisted: Vec<&str> = locked_elsewhere.iter().copied().filter(|m| !listed.contains(m)).collect();
+            entries.extend(unlisted.into_iter().map(|m| (Cow::Borrowed(m), "lock2ap")));
         }
         blocks.push((v.dev(), policy, entries));
     }
