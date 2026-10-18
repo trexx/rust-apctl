@@ -908,6 +908,10 @@ impl Engine {
         };
         let mut state = current.as_deref().cloned().ok_or("no settings imported yet")?;
         let what = edit(&mut state)?;
+        // Saved as they were (e.g. a form sent unchanged): nothing to store, record or tell the APs.
+        if current.as_deref() == Some(&state) {
+            return Ok(what);
+        }
         self.store_state(state, imported_at);
         self.syslog_unknown.clear();
         self.emit(Event::site(ts, EventKind::SettingsChanged, json!({ "what": what })));
@@ -2074,6 +2078,8 @@ mod tests {
         assert_eq!(h.live.read().unwrap().state.as_ref().unwrap()["clients"][0]["blocked"], true);
         assert_eq!(h.live.read().unwrap().state_imported_at, Some(1), "an edit is not an import");
         assert_eq!(edit(&mut h, Box::new(|_| Err("no".into()))), Err("no".into()));
+        // An edit that leaves the settings as they were still reports what it did, but is not recorded.
+        assert_eq!(edit(&mut h, Box::new(|_| Ok("nothing changed".into()))).as_deref(), Ok("nothing changed"));
         let kinds: Vec<_> = events(&mut h).into_iter().map(|e| e.0).collect();
         assert_eq!(kinds, ["settings_imported", "settings_changed"]);
     }
