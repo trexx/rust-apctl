@@ -16,6 +16,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::net::{Ipv4Addr, Ipv6Addr};
 use std::path::Path;
+use std::sync::LazyLock;
 
 use aho_corasick::AhoCorasick;
 use anyhow::{Context, Result, bail};
@@ -207,6 +208,11 @@ const TEXT: &[&str] = &[
     "portal_customized_authentication_text", "portal_customized_button_text", "portal_customized_success_text", "portal_customized_title",
     "portal_customized_welcome_text",
 ];
+
+/// [`PASS`], [`PASS_AT`] and [`TEXT`] as sets: every field of every file is looked up in them.
+static PASS_SET: LazyLock<HashSet<&str>> = LazyLock::new(|| PASS.iter().copied().collect());
+static PASS_AT_SET: LazyLock<HashSet<&str>> = LazyLock::new(|| PASS_AT.iter().copied().collect());
+static TEXT_SET: LazyLock<HashSet<&str>> = LazyLock::new(|| TEXT.iter().copied().collect());
 
 const KEEP_MACS: [&str; 2] = ["ff:ff:ff:ff:ff:ff", "00:00:00:00:00:00"];
 
@@ -445,7 +451,7 @@ impl Sanitizer {
             self.fakes.get(Kind::SshKey, value, |n| format!("ssh-ed25519 AAAAfake{n}"))
         } else if is_secret_key(&k)
             // Everything under a secret key, apart from what a field of its own passes.
-            || (under_secret && !PASS_AT.contains(&at.as_str()) && !kept)
+            || (under_secret && !PASS_AT_SET.contains(at.as_str()) && !kept)
             // The device SSH account name (stored as x_ssh_username in the controller).
             || (k.starts_with("users.") && last == "name")
             || (k.starts_with("cron.") && last == "user")
@@ -476,14 +482,14 @@ impl Sanitizer {
         } else if kept {
             self.remember_kept(value);
             self.scrub(value)
-        } else if PASS.contains(&last.as_str()) || PASS_AT.contains(&at.as_str()) {
+        } else if PASS_SET.contains(last.as_str()) || PASS_AT_SET.contains(at.as_str()) {
             self.remember_kept(value);
             let value = self.url_hosts(value);
             self.scrub(&value)
-        } else if !TEXT.contains(&last.as_str()) && (self.is_plain(value) || self.kept.contains(&value.to_lowercase())) {
+        } else if !TEXT_SET.contains(last.as_str()) && (self.is_plain(value) || self.kept.contains(&value.to_lowercase())) {
             self.scrub(value)
         } else {
-            if !TEXT.contains(&last.as_str()) {
+            if !TEXT_SET.contains(last.as_str()) {
                 self.unlisted.insert(at.clone());
             }
             self.text_fields.entry(value.to_string()).or_insert(at);
