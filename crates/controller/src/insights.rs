@@ -290,22 +290,27 @@ pub async fn density(State(s): State<AppState>, Query(q): Query<RangeQuery>) -> 
     // Worked out where the data is read, off the async workers and the live lock.
     let aps = memo_read(&s, Db::Metrics, "density", &q, tier, move |c| {
         let mut stmt = c.prepare_cached(&format!("SELECT ts, ap_mac, radio, signal FROM client_stats{suffix} WHERE ts >= ?1 AND ts <= ?2 AND signal < 0 AND ap_mac IS NOT NULL"))?;
-        // The few AP and band names, each kept once; a sample refers to them by place.
-        let mut names: Vec<String> = Vec::new();
-        let mut name = |v: &str| {
-            names.iter().position(|n| n == v).unwrap_or_else(|| {
+        // The few AP and band names, each kept once; a group refers to them by place.
+        let (mut names, mut index): (Vec<String>, HashMap<String, usize>) = Default::default();
+        let mut name = |v: &str| match index.get(v) {
+            Some(i) => *i,
+            None => {
                 names.push(v.to_string());
+                index.insert(v.to_string(), names.len() - 1);
                 names.len() - 1
-            })
+            }
         };
-        let mut signals = Vec::new();
+        let all = name("all");
+        let mut signals: Signals = HashMap::new();
         let mut rows = stmt.query([from, to])?;
         while let Some(r) = rows.next()? {
-            let (ap, radio) = (name(r.get_ref(1)?.as_str()?), r.get_ref(2)?.as_str_or_null()?.map(&mut name));
-            signals.push((r.get::<_, Ts>(0)?, ap, radio, r.get::<_, f64>(3)?));
+            let (ts, ap, radio, sig) = (r.get::<_, Ts>(0)?, name(r.get_ref(1)?.as_str()?), r.get_ref(2)?.as_str_or_null()?.map(&mut name), r.get::<_, f64>(3)?);
+            for band in std::iter::once(all).chain(radio) {
+                signals.entry((ap, band)).or_default().entry(ts).or_default().push(sig);
+            }
         }
         let vaps = load(c, Spec { table: "vap_stats", key: "bssid", extra: &["ap_mac", "radio"], cols: DENSITY_COLS, only: None }, tier, from, to)?;
-        Ok(density_of(&signals, &names, &vaps, from))
+        Ok(density_of(signals, &names, &vaps, from))
     })
     .await?;
     let live = s.live.read().unwrap();
@@ -313,19 +318,14 @@ pub async fn density(State(s): State<AppState>, Query(q): Query<RangeQuery>) -> 
     Ok(Json(json!({ "aps": list })))
 }
 
-/// [`density`] per AP, from client signals (ts, AP, band, signal; AP and band
-/// by their place in `names`) and the VAPs' counters.
-fn density_of(signals: &[(Ts, usize, Option<usize>, f64)], names: &[String], vaps: &Loaded, from: Ts) -> Vec<(String, Vec<Value>)> {
-    // ap -> band -> per report time -> client signals
-    type Reports = BTreeMap<Ts, Vec<f64>>;
-    let mut per: BTreeMap<&str, BTreeMap<&str, Reports>> = BTreeMap::new();
-    for &(ts, ap, radio, sig) in signals {
-        let bands = per.entry(names[ap].as_str()).or_default();
-        bands.entry("all").or_default().entry(ts).or_default().push(sig);
-        if let Some(r) = radio {
-            bands.entry(names[r].as_str()).or_default().entry(ts).or_default().push(sig);
-        }
-    }
+/// Client signals per (AP, band), by their places in a list of names, and
+/// report time; each also counts under the band "all".
+type Signals = HashMap<(usize, usize), Reports>;
+/// Per report time, client signals.
+type Reports = BTreeMap<Ts, Vec<f64>>;
+
+/// [`density`] per AP, from the client signals and the VAPs' counters.
+fn density_of(signals: Signals, names: &[String], vaps: &Loaded, from: Ts) -> Vec<(String, Vec<Value>)> {
     // Traffic share per band among APs, and retries.
     let at = cols_at(DENSITY_COLS, BYTE_COLS);
     let mut bytes: HashMap<(&str, &str), f64> = HashMap::new();
@@ -347,36 +347,39 @@ fn density_of(signals: &[(Ts, usize, Option<usize>, f64)], names: &[String], vap
     for ((_, b), v) in &bytes {
         *band_total.entry(b).or_default() += v;
     }
-    let mut out = Vec::new();
-    for (ap, bands) in per {
-        let mut groups = Vec::new();
-        for (band, reports) in bands {
-            // Each report's signals: all of them averaged, then the weaker half.
-            let (mut sum, mut n) = (0.0, 0);
-            let mut weakest = Vec::with_capacity(reports.len());
-            let count = reports.len();
-            for mut sigs in reports.into_values() {
-                for x in &sigs {
-                    sum += x;
-                }
-                n += sigs.len();
-                sigs.sort_by(f64::total_cmp);
-                let half = (sigs.len() / 2).max(1);
-                weakest.push(sigs[..half].iter().sum::<f64>() / half as f64);
+    // By AP, then band.
+    let mut signals: Vec<((&str, &str), Reports)> = signals.into_iter().map(|((ap, band), r)| ((names[ap].as_str(), names[band].as_str()), r)).collect();
+    signals.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+    let mut out: Vec<(String, Vec<Value>)> = Vec::new();
+    for ((ap, band), reports) in signals {
+        // Each report's signals: all of them averaged, then the weaker half.
+        let (mut sum, mut n) = (0.0, 0);
+        let mut weakest = Vec::with_capacity(reports.len());
+        let count = reports.len();
+        for mut sigs in reports.into_values() {
+            for x in &sigs {
+                sum += x;
             }
-            let traffic = bytes.get(&(ap, band)).copied().unwrap_or(0.0);
-            let total = band_total.get(band).copied().unwrap_or(0.0);
-            let retry = retries.get(&(ap, band)).map(|r| retry_pct(*r));
-            groups.push(json!({
-                "band": band,
-                "weakest_signal": (weakest.iter().sum::<f64>() / weakest.len().max(1) as f64).round(),
-                "signal_avg": (sum / n.max(1) as f64).round(),
-                "clients": ((n as f64 / count.max(1) as f64) * 10.0).round() / 10.0,
-                "traffic_pct": if total > 0.0 { 100.0 * traffic / total } else { 0.0 },
-                "tx_retry_pct": retry,
-            }));
+            n += sigs.len();
+            sigs.sort_by(f64::total_cmp);
+            let half = (sigs.len() / 2).max(1);
+            weakest.push(sigs[..half].iter().sum::<f64>() / half as f64);
         }
-        out.push((ap.to_string(), groups));
+        let traffic = bytes.get(&(ap, band)).copied().unwrap_or(0.0);
+        let total = band_total.get(band).copied().unwrap_or(0.0);
+        let retry = retries.get(&(ap, band)).map(|r| retry_pct(*r));
+        let group = json!({
+            "band": band,
+            "weakest_signal": (weakest.iter().sum::<f64>() / weakest.len().max(1) as f64).round(),
+            "signal_avg": (sum / n.max(1) as f64).round(),
+            "clients": ((n as f64 / count.max(1) as f64) * 10.0).round() / 10.0,
+            "traffic_pct": if total > 0.0 { 100.0 * traffic / total } else { 0.0 },
+            "tx_retry_pct": retry,
+        });
+        match out.last_mut() {
+            Some((a, groups)) if a == ap => groups.push(group),
+            _ => out.push((ap.to_string(), vec![group])),
+        }
     }
     out
 }
