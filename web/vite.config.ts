@@ -45,13 +45,15 @@ export default defineConfig({
     rolldownOptions: {
       output: {
         // React, the router, React Query and uPlot change only with an upgrade:
-        // in a chunk of their own, browsers keep them cached across releases.
+        // in chunks of their own, browsers keep them cached across releases.
+        // uPlot is apart, loaded with the first chart shown (see Chart.tsx).
         codeSplitting: {
           groups: [
             {
               name: "vendor",
-              test: /[\\/]node_modules[\\/](react|react-dom|scheduler|react-router|@tanstack|cookie|set-cookie-parser|uplot)[\\/]/,
+              test: /[\\/]node_modules[\\/](react|react-dom|scheduler|react-router|@tanstack|cookie|set-cookie-parser)[\\/]/,
             },
+            { name: "uplot", test: /[\\/]node_modules[\\/]uplot[\\/].*\.m?js$/ },
           ],
         },
       },
