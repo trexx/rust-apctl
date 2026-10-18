@@ -307,13 +307,19 @@ impl Live {
     }
 }
 
-/// What the database remembers about an AP from a previous run.
+/// What the database remembers about an AP from a previous run: what tells
+/// what happened while apctl was away, and what the device list shows of it.
 #[derive(Debug, Clone)]
 pub struct KnownDevice {
     pub first_seen: Ts,
     pub last_seen: Ts,
     pub uptime: Option<i64>,
     pub version: Option<String>,
+    pub hostname: Option<String>,
+    pub model: Option<String>,
+    pub model_display: Option<String>,
+    pub ip: Option<String>,
+    pub serial: Option<String>,
 }
 
 pub type SharedLive = Arc<RwLock<Live>>;
@@ -462,27 +468,28 @@ impl Engine {
     /// not report every client as newly connected.
     pub fn restore(&mut self, store: &store::Store) -> anyhow::Result<()> {
         let (devices, clients, aliases, state) = store.read(Db::Config, |c| {
-            let mut stmt = c.prepare("SELECT mac, first_seen, last_seen, uptime, version, hash_id, ip FROM devices")?;
+            let mut stmt = c.prepare("SELECT mac, first_seen, last_seen, uptime, version, hash_id, ip, hostname, model, model_display, serial FROM devices")?;
             let devices = stmt
                 .query_map([], |r| {
-                    Ok((
-                        r.get::<_, String>(0)?,
-                        KnownDevice { first_seen: r.get::<_, Option<i64>>(1)?.unwrap_or(0), last_seen: r.get::<_, Option<i64>>(2)?.unwrap_or(0), uptime: r.get(3)?, version: r.get(4)? },
-                        r.get::<_, Option<String>>(5)?,
-                        r.get::<_, Option<String>>(6)?,
-                    ))
+                    let known = KnownDevice {
+                        first_seen: r.get::<_, Option<i64>>(1)?.unwrap_or(0), last_seen: r.get::<_, Option<i64>>(2)?.unwrap_or(0), uptime: r.get(3)?, version: r.get(4)?,
+                        ip: r.get(6)?, hostname: r.get(7)?, model: r.get(8)?, model_display: r.get(9)?, serial: r.get(10)?,
+                    };
+                    Ok((r.get::<_, String>(0)?, known, r.get::<_, Option<String>>(5)?))
                 })?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
             let mut stmt = c.prepare("SELECT mac, hostname, ip, first_seen, last_seen, ap_mac, bssid, essid, radio, connected FROM clients")?;
+            // A row whose MACs do not parse is no client to restore.
             let clients = stmt
                 .query_map([], |r| {
-                    Ok((
-                        r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?, r.get::<_, Option<String>>(2)?,
-                        r.get::<_, Option<i64>>(3)?, r.get::<_, Option<i64>>(4)?, r.get::<_, Option<String>>(5)?,
-                        r.get::<_, Option<String>>(6)?, r.get::<_, Option<String>>(7)?, r.get::<_, Option<String>>(8)?,
-                        r.get::<_, i64>(9)? != 0,
-                    ))
+                    let (Ok(mac), Some(Ok(ap_mac))) = (r.get::<_, String>(0)?.parse::<Mac>(), r.get::<_, Option<String>>(5)?.map(|a| a.parse::<Mac>())) else { return Ok(None) };
+                    let sample = ClientSample { mac, ap_mac, hostname: r.get(1)?, ip: r.get(2)?, bssid: r.get::<_, Option<String>>(6)?.unwrap_or_default(), essid: r.get(7)?, radio: r.get(8)?, ..Default::default() };
+                    Ok(Some(ClientView {
+                        sample: Arc::new(sample), connected: r.get::<_, i64>(9)? != 0, first_seen: r.get::<_, Option<i64>>(3)?.unwrap_or(0),
+                        last_seen: r.get::<_, Option<i64>>(4)?.unwrap_or(0),
+                    }))
                 })?
+                .filter_map(Result::transpose)
                 .collect::<rusqlite::Result<Vec<_>>>()?;
             // No row: nothing imported yet. Any other error fails the start rather
             // than running as if the settings were never imported.
@@ -497,24 +504,22 @@ impl Engine {
             Ok((devices, clients, aliases, state))
         })?;
         let mut live = self.live.write().unwrap();
-        for (mac, known, hash_id, ip) in devices {
+        for (mac, known, hash_id) in devices {
             let Ok(mac) = mac.parse::<Mac>() else { continue };
             if let Some(h) = hash_id.as_deref().and_then(crate::syslog::parse_hash_id) {
                 live.by_hash_id.insert(h, mac);
             }
-            if let Some(ip) = ip {
-                live.by_ip.insert(ip, mac);
+            if let Some(ip) = &known.ip {
+                live.by_ip.insert(ip.clone(), mac);
             }
             live.known_devices.insert(mac, known);
         }
         let n_clients = clients.len();
-        for (mac, hostname, ip, first_seen, last_seen, ap_mac, bssid, essid, radio, connected) in clients {
-            let (Ok(mac), Some(Ok(ap_mac))) = (mac.parse::<Mac>(), ap_mac.map(|a| a.parse::<Mac>())) else { continue };
-            let sample = Arc::new(ClientSample { mac, ap_mac, bssid: bssid.unwrap_or_default(), essid, radio, hostname, ip, ..Default::default() });
-            if connected {
-                self.connected.insert(mac);
+        for c in clients {
+            if c.connected {
+                self.connected.insert(c.sample.mac);
             }
-            live.clients.insert(mac, ClientView { sample, connected, first_seen: first_seen.unwrap_or(0), last_seen: last_seen.unwrap_or(0) });
+            live.clients.insert(c.sample.mac, c);
         }
         if let Some((json, at)) = state {
             match serde_json::from_str::<Value>(&json) {
