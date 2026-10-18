@@ -979,17 +979,14 @@ export const resumeFirmware = () => send<{ resumed: boolean }>("POST", "/api/fir
 
 export const useMulticast = (span: TimeSpan, mac?: Mac) => useSpanQuery<SiteMulticast>(keys.multicast(span, mac), "/api/site/multicast", span, { mac });
 
-/** GETs `path` every minute; the previous data stays up while another key's loads. */
-const usePolled = <T>(queryKey: QueryKey, path: string) =>
-  useQuery({ queryKey, queryFn: getting<T>(path), refetchInterval: 60_000, placeholderData: keepPreviousData });
-
-export const useRadios = (range: number) => usePolled<RadioOverview[]>(keys.rfRadios(range), `/api/rf/radios${qs({ range })}`);
+// The RF views cover the last `range` seconds.
+export const useRadios = (range: number) => useSpanQuery<RadioOverview[]>(keys.rfRadios(range), "/api/rf/radios", { last: range });
 
 export const useNeighbors = (range: number, band: string) =>
-  usePolled<{ neighbors: Neighbor[] }>(keys.rfNeighbors(range, band), `/api/rf/neighbors${qs({ range, band: bandParam(band), neighbors_only: "true" })}`);
+  useSpanQuery<{ neighbors: Neighbor[] }>(keys.rfNeighbors(range, band), "/api/rf/neighbors", { last: range }, { band: bandParam(band), neighbors_only: "true" });
 
 /** Only how loudly our APs hear each other (no neighbour list). */
-export const useOwnLinks = (range: number) => usePolled<{ own_links: OwnLink[] }>(keys.rfLinks(range), `/api/rf/neighbors${qs({ range, links_only: "true" })}`);
+export const useOwnLinks = (range: number) => useSpanQuery<{ own_links: OwnLink[] }>(keys.rfLinks(range), "/api/rf/neighbors", { last: range }, { links_only: "true" });
 
 export const useChannelPlan = (band: string, dfs: boolean) =>
   useQuery({
