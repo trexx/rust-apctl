@@ -1058,11 +1058,10 @@ impl Engine {
 
     /// A client connection-tracking event (`STA_ASSOC_TRACKER`): association,
     /// success (with association, WPA, IP and DNS timings), soft failure,
-    /// roam, leave. Durations arrive in microseconds and are stored in ms.
+    /// roam, leave. The timings are read from `detail`, the whole notification.
     fn connection_event(&self, ts: Ts, ap: Mac, n: &Value) {
         let Some(client) = n["mac"].as_str().and_then(|m| m.parse::<Mac>().ok()) else { return };
         let num = |k: &str| n[k].as_str().and_then(|v| v.parse::<f64>().ok()).or_else(|| n[k].as_f64());
-        let ms = |k: &str| num(k).map(|us| (us / 1000.0).round() as i64);
         let text = |k: &str| n[k].as_str().map(str::to_string);
         let vap = text("vap");
         // The live view is read for the VAP alone; the row is built without the lock.
@@ -1082,10 +1081,12 @@ impl Engine {
             None => (None, None),
         };
         let event_type = text("event_type").unwrap_or_default();
+        // The table's `auth_algo`, `assoc_ms`, `auth_ms`, `ip_ms` and `reason` columns
+        // are no longer written: `detail` holds them, as the AP sent them.
         self.writer.exec(
             Db::Config,
-            "INSERT INTO connections (ts, ap_mac, client_mac, vap, essid, radio, event_type, auth_algo, assoc_ms, auth_ms, ip_ms, \
-             ip_assign_type, dns_responses, dns_timeouts, rssi, reason, detail) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
+            "INSERT INTO connections (ts, ap_mac, client_mac, vap, essid, radio, event_type, ip_assign_type, dns_responses, dns_timeouts, rssi, detail) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
             vec![
                 Sql::Integer(ts),
                 Sql::Text(ap.to_string()),
@@ -1094,16 +1095,11 @@ impl Engine {
                 opt_text(essid.clone()),
                 opt_text(radio),
                 Sql::Text(event_type.clone()),
-                opt_text(text("auth_algo")),
-                i(ms("assoc_delta")),
-                i(ms("wpa_auth_delta")),
-                i(ms("ip_delta")),
                 opt_text(text("ip_assign_type")),
                 i(num("dns_responses").map(|v| v as i64)),
                 i(num("dns_timeouts").map(|v| v as i64)),
                 i(num("avg_rssi").or_else(|| num("auth_rssi")).map(|v| v as i64)),
-                opt_text(text("sta_dc_reason")),
-                // The whole notification: failure counters and stage flags for connectivity stats.
+                // The whole notification: timings, failure counters and stage flags for connectivity stats.
                 Sql::Text(detail.to_string()),
             ],
         );
