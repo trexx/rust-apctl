@@ -22,6 +22,10 @@
   --c-purple: #8a63d2;
   --c-red: #d64545;
   --c-teal: #2aa3b8;
+  --c-olive: #7a9a3a;
+  --c-steel: #4a8fa0;
+  --c-pink: #b07ab0;
+  --c-grey: #8a8f98;
   --radius: 10px;
   color-scheme: light;
 }
@@ -50,6 +54,10 @@
     --c-purple: #a585e3;
     --c-red: #ef6a6a;
     --c-teal: #4cc0d4;
+    --c-olive: #a3c060;
+    --c-steel: #72b3c4;
+    --c-pink: #d29ad2;
+    --c-grey: #9aa3b2;
     color-scheme: dark;
   }
 }

@@ -11,17 +11,19 @@ const DIRECTIONS = [
   ["rx", "From clients"],
 ] as const;
 
+// The types beyond the six chart colours take the page's extra --c-* ones,
+// which also have a dark-mode shade.
 const MCAST_COLORS: Record<string, string> = {
   mdns: COLORS.blue,
   ssdp: COLORS.purple,
   arp: COLORS.orange,
   igmp: COLORS.green,
-  mld: "#7a9a3a",
+  mld: "var(--c-olive)",
   stream: COLORS.red,
   dhcp: COLORS.teal,
-  dhcpv6: "#4a8fa0",
-  ipv6_nd: "#b07ab0",
-  other: "#8a8f98",
+  dhcpv6: "var(--c-steel)",
+  ipv6_nd: "var(--c-pink)",
+  other: "var(--c-grey)",
 };
 
 /** Multicast traffic types: a short name for charts and a longer one for tables. */
