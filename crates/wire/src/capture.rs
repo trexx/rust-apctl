@@ -728,7 +728,8 @@ pub fn open_input(path: &str) -> Result<Box<dyn Read + Send>> {
         Ok(Box::new(std::io::stdin()))
     } else {
         let f = std::fs::File::open(path).with_context(|| format!("opening {path}"))?;
-        Ok(Box::new(std::io::BufReader::new(f)))
+        // No BufReader: the pcap reader buffers its input itself.
+        Ok(Box::new(f))
     }
 }
 
