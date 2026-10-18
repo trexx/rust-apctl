@@ -2,8 +2,9 @@
 //! from its SSID's, is limited by a command to the AP it is on, as the official
 //! controller does it:
 //! `{"_type":"cmd","cmd":"rate-update","mac","dl_max","dl_min":64,"ul_max","ul_min":64}`
-//! (kbps, -1 unlimited). It is sent when the client connects or roams, and again
-//! when its limit or the group changes; when the client's own limit is removed,
+//! (kbps, -1 unlimited). It is sent when the client connects, roams to another
+//! AP or associates again (its uptime drops, as when it changes band on the same
+//! AP), and again when its limit or the group changes; when the client's own limit is removed,
 //! its SSID's limit is sent instead. SSID-wide limits are in the config (`apcfg`).
 
 use std::collections::HashMap;
@@ -23,6 +24,8 @@ struct Sent {
     essid: String,
     /// (down, up) kbps.
     limit: (i64, i64),
+    /// The client's association uptime when last looked at: a drop is a new association.
+    uptime: Option<i64>,
 }
 
 /// What the limits depend on in the settings, worked out again only when they
@@ -104,23 +107,33 @@ fn due(live: &Live, l: &mut Limits) -> Vec<(Mac, Value)> {
     }
     let connected = |m: &Mac| live.clients.get(m).is_some_and(|c| c.connected);
     l.sent.retain(|m, _| connected(m));
+    // Only a client with a group of its own, or one sent a command before, can need one.
+    let own = &l.groups.own;
+    let candidates: Vec<Mac> = own.keys().chain(l.sent.keys().filter(|m| !own.contains_key(*m))).copied().collect();
     let mut out = Vec::new();
-    for (client, c) in live.clients.iter().filter(|(_, c)| c.connected) {
-        let (ap, essid) = (c.sample.ap_mac, c.sample.essid.as_deref().unwrap_or_default());
+    for client in &candidates {
+        let Some(c) = live.clients.get(client).filter(|c| c.connected) else { continue };
+        let (ap, essid, uptime) = (c.sample.ap_mac, c.sample.essid.as_deref().unwrap_or_default(), c.sample.uptime);
         let before = l.sent.get(client);
-        // A roam or SSID change starts afresh: the new AP knows nothing of earlier commands.
-        let same_place = before.is_some_and(|b| b.ap == ap && b.essid == essid);
+        // A roam, a new association on the same AP (as the official controller
+        // tells by a drop in uptime) or an SSID change starts afresh: the AP
+        // has forgotten earlier commands.
+        let reassociated = |b: &Sent| matches!((b.uptime, uptime), (Some(was), Some(now)) if now < was);
+        let same_place = before.is_some_and(|b| b.ap == ap && b.essid == essid && !reassociated(b));
         let Some(limit) = l.groups.wanted(client, essid, same_place) else {
             l.sent.remove(client);
             continue;
         };
         if same_place && before.is_some_and(|b| b.limit == limit) {
+            if let Some(b) = l.sent.get_mut(client) {
+                b.uptime = uptime;
+            }
             continue;
         }
         let (down, up) = limit;
         out.push((ap, json!({ "_type": "cmd", "cmd": "rate-update", "mac": client.to_string(), "dl_max": down, "dl_min": 64, "ul_max": up, "ul_min": 64 })));
         tracing::info!("{client}: speed limit down {down} up {up} kbps via {ap}");
-        l.sent.insert(*client, Sent { ap, essid: essid.to_string(), limit });
+        l.sent.insert(*client, Sent { ap, essid: essid.to_string(), limit, uptime });
     }
     out
 }
@@ -200,6 +213,29 @@ mod tests {
         std::sync::Arc::make_mut(&mut live.clients.get_mut(&C.parse().unwrap()).unwrap().sample).ap_mac = AP2.parse().unwrap();
         tick(&mut live, &mut sent);
         assert_eq!(sent_to(&mut live, AP2).len(), 1, "the new AP gets it");
+    }
+
+    #[test]
+    fn a_new_association_on_the_same_ap_is_sent_the_limit_again() {
+        let mut live = live(Some("slow"));
+        let set = |live: &mut Live, uptime, radio: &str| {
+            let s = std::sync::Arc::make_mut(&mut live.clients.get_mut(&C.parse().unwrap()).unwrap().sample);
+            (s.uptime, s.radio) = (Some(uptime), Some(radio.into()));
+        };
+        set(&mut live, 100, "na");
+        let mut sent = Limits::default();
+        tick(&mut live, &mut sent);
+        assert_eq!(sent_to(&mut live, AP1).len(), 1);
+        set(&mut live, 400, "na");
+        tick(&mut live, &mut sent);
+        assert!(sent_to(&mut live, AP1).is_empty(), "still the same association");
+        // Off to the other band (or back after a moment away): its uptime starts again.
+        set(&mut live, 3, "ng");
+        tick(&mut live, &mut sent);
+        assert_eq!(sent_to(&mut live, AP1).len(), 1, "the AP is told again");
+        set(&mut live, 20, "ng");
+        tick(&mut live, &mut sent);
+        assert!(sent_to(&mut live, AP1).is_empty());
     }
 
     #[test]
