@@ -171,6 +171,14 @@ impl Job {
     }
 }
 
+/// How long the upgrade at the head of the queue waits for its AP's turn (an
+/// inform with its settings current) before it fails.
+const TURN_WAIT: Ts = 600;
+/// Why a sent upgrade failed when out of time.
+const TIMED_OUT: &str = "it did not come back with the new firmware in time";
+/// Why an upgrade whose AP never took its turn failed.
+const NOT_TAKEN: &str = "it was not ready for the upgrade in time (offline, or its settings not applied)";
+
 /// The upgrade queue: one AP at a time.
 #[derive(Debug, Default, Serialize)]
 pub struct Jobs {
@@ -241,9 +249,17 @@ impl Jobs {
         Some(j)
     }
 
-    /// A sent upgrade that has not finished in time.
-    pub fn expired(&self, now: Ts) -> Option<Mac> {
-        self.current.as_ref().filter(|j| j.expires.is_some_and(|e| now > e)).map(|j| j.mac)
+    /// The current upgrade if it is out of time, with why: sent and not
+    /// finished, or still waiting for its AP to take its turn (offline, or its
+    /// settings not applied), which it is given [`TURN_WAIT`] for from the
+    /// first call that finds it at the head of the queue.
+    pub fn expired(&mut self, now: Ts) -> Option<(Mac, &'static str)> {
+        let j = self.current.as_mut()?;
+        if j.state == JobState::Queued && j.expires.is_none() {
+            j.expires = Some(now + TURN_WAIT);
+        }
+        let why = if j.state == JobState::Queued { NOT_TAKEN } else { TIMED_OUT };
+        j.expires.is_some_and(|e| now > e).then_some((j.mac, why))
     }
 
     pub fn cancel_queued(&mut self) -> usize {
@@ -694,13 +710,35 @@ mod tests {
         j.enqueue(vec![job("a"), job("b")]);
         command(&mut j, &m("a"), &json!({ "upgrade_duration": 600, "reboot_duration": 100 }), 0).unwrap().unwrap();
         assert_eq!(j.expired(700), None);
-        assert_eq!(j.expired(701), Some(m("a")));
+        assert_eq!(j.expired(701), Some((m("a"), TIMED_OUT)));
         assert_eq!(j.cancel_queued(), 1, "only b; a is already upgrading");
         assert!(j.current.is_some());
         // As the engine makes the changes the UI asks for.
         assert_eq!(Op::Enqueue(vec![job("c"), job("d")]).apply(&mut j), 2);
         assert_eq!(Op::Enqueue(vec![job("a"), job("c"), job("e")]).apply(&mut j), 1, "a is upgrading and c queued already");
         assert_eq!(Op::CancelQueued.apply(&mut j), 3);
+    }
+
+    #[test]
+    fn an_upgrade_whose_ap_never_takes_its_turn_fails() {
+        let mut j = Jobs::default();
+        j.enqueue(vec![job("a"), job("b")]);
+        // Its wait starts when it is first found at the head of the queue.
+        assert_eq!(j.expired(1000), None);
+        assert_eq!(j.current.as_ref().and_then(|c| c.expires), Some(1000 + TURN_WAIT));
+        assert_eq!(j.expired(1000 + TURN_WAIT), None);
+        let (mac, why) = j.expired(1001 + TURN_WAIT).unwrap();
+        assert_eq!((mac, why), (m("a"), NOT_TAKEN));
+        // As a sent one out of time: it fails and the queue stops before b.
+        j.failed(&mac, why);
+        assert!(j.current.is_none() && j.queue.len() == 1);
+        assert_eq!(j.stopped.as_deref(), Some(format!("a failed: {NOT_TAKEN}").as_str()));
+        // Resumed, b gets a wait of its own; taking its turn in time sets the sent deadline.
+        j.resume();
+        assert_eq!(j.expired(5000), None);
+        command(&mut j, &m("b"), &json!({}), 5100).unwrap().unwrap();
+        assert_eq!(j.current.as_ref().and_then(|c| c.expires), Some(5100 + 450));
+        assert_eq!(j.expired(5551), Some((m("b"), TIMED_OUT)), "then it is out of time as a sent one");
     }
 
     #[test]
