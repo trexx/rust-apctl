@@ -387,6 +387,22 @@ impl<T: PartialEq + Clone> Row<T> {
     }
 }
 
+/// Records `value` as reported under `key` at `ts` (see `Row::report`): true
+/// if its row is to be written, as one new or changed, or due again. The key
+/// is copied only for a new row.
+fn report<K, Q, T>(rows: &mut Rows<K, T>, key: &Q, value: &T, ts: Ts, every: Ts) -> bool
+where
+    K: std::borrow::Borrow<Q> + Eq + std::hash::Hash,
+    Q: ToOwned<Owned = K> + Eq + std::hash::Hash + ?Sized,
+    T: PartialEq + Clone,
+{
+    if let Some(row) = rows.get_mut(key) {
+        return row.report(value, ts, every);
+    }
+    rows.insert(key.to_owned(), Row::new(value, ts));
+    true
+}
+
 /// Whether a row last written at `at` (if ever) is due again at `ts`.
 fn due(at: Option<&Ts>, ts: Ts, every: Ts) -> bool {
     at.is_none_or(|at| ts - at >= every || ts < *at)
@@ -1484,14 +1500,7 @@ impl Engine {
         // row once an hour. What the AP no longer reports is forgotten here.
         let rows = self.written.neighbors.entry(s.ap.mac).or_default();
         for n in &s.neighbors {
-            let write = match rows.get_mut(n.bssid.as_str()) {
-                Some(row) => row.report(n, ts, REFRESH_SECS),
-                None => {
-                    rows.insert(n.bssid.clone(), Row::new(n, ts));
-                    true
-                }
-            };
-            if !write {
+            if !report(rows, n.bssid.as_str(), n, ts, REFRESH_SECS) {
                 continue;
             }
             self.writer.exec(
@@ -1512,18 +1521,12 @@ impl Engine {
         rows.retain(|_, r| r.seen == ts);
         let radios = self.written.spectrum.entry(s.ap.mac).or_default();
         for c in &s.spectrum {
+            // Looked up by reference: the radio's name is copied only for a new one.
             if !radios.contains_key(c.radio.as_str()) {
                 radios.insert(c.radio.clone(), Rows::new());
             }
             let rows = radios.get_mut(c.radio.as_str()).expect("inserted above");
-            let write = match rows.get_mut(&c.channel) {
-                Some(row) => row.report(c, ts, SPECTRUM_REFRESH_SECS),
-                None => {
-                    rows.insert(c.channel, Row::new(c, ts));
-                    true
-                }
-            };
-            if !write {
+            if !report(rows, &c.channel, c, ts, SPECTRUM_REFRESH_SECS) {
                 continue;
             }
             self.writer.exec(
