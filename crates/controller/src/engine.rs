@@ -1137,7 +1137,11 @@ impl Engine {
                         // "{proc} exited with code {exit_status} and restarted by {caller}"
                         "EVT_AP_RestartProc" => EventKind::ApProcessRestarted,
                         "Upgrade" => {
-                            self.upgrade_notice(&mut self.live.write().unwrap(), ts, mac, &n);
+                            // The lock is released at the end of the statement, before the event is emitted.
+                            let ev = Self::upgrade_notice(&mut self.live.write().unwrap(), ts, mac, &n);
+                            if let Some(ev) = ev {
+                                self.emit(ev);
+                            }
                             return;
                         }
                         _ => EventKind::ApEvent,
@@ -1299,8 +1303,9 @@ impl Engine {
         }
     }
 
-    /// Upgrade progress from the AP: downloading, writing, or an error.
-    fn upgrade_notice(&self, live: &mut Live, ts: Ts, mac: Mac, n: &Value) {
+    /// Upgrade progress from the AP: downloading, writing, or an error; and
+    /// its event, for the caller to emit once the lock is released.
+    fn upgrade_notice(live: &mut Live, ts: Ts, mac: Mac, n: &Value) -> Option<Event> {
         let s = |k: &str| n[k].as_str().unwrap_or_default().to_string();
         match (n["up_type"].as_str(), n["up_stage"].as_str()) {
             (Some("UpgradeReady"), stage) => {
@@ -1315,7 +1320,7 @@ impl Engine {
                     // Re-arm the deadline as the official controller does on each step.
                     j.expires = Some(ts + 450);
                 }
-                self.emit(Event::device(ts, EventKind::ApUpgradeProgress, mac, json!({ "step": step })));
+                Some(Event::device(ts, EventKind::ApUpgradeProgress, mac, json!({ "step": step })))
             }
             (Some("UpgradeError"), _) => {
                 let reason = s("reason");
@@ -1326,9 +1331,9 @@ impl Engine {
                     r => format!("failed ({r})"),
                 };
                 live.firmware.failed(&mac, &detail);
-                self.emit(Event::device(ts, EventKind::ApUpgradeFailed, mac, json!({ "reason": reason, "detail": detail })));
+                Some(Event::device(ts, EventKind::ApUpgradeFailed, mac, json!({ "reason": reason, "detail": detail })))
             }
-            _ => {}
+            _ => None,
         }
     }
 
@@ -1404,14 +1409,14 @@ impl Engine {
             self.emit(e);
         }
         let mut live = self.live.write().unwrap();
+        let mut events = Vec::new();
         const TIMED_OUT: &str = "it did not come back with the new firmware in time";
         if let Some(mac) = live.firmware.expired(now)
             && let Some(j) = live.firmware.failed(&mac, TIMED_OUT)
         {
             let data = json!({ "reason": "timed out", "detail": TIMED_OUT, "target": j.target });
-            self.emit(Event::device(now, EventKind::ApUpgradeFailed, mac, data));
+            events.push(Event::device(now, EventKind::ApUpgradeFailed, mac, data));
         }
-        let mut events = Vec::new();
         let mut offline = Vec::new();
         for (mac, d) in live.devices.iter_mut() {
             let limit = (d.interval.max(5) * OFFLINE_INTERVALS).max(60);
@@ -1444,9 +1449,6 @@ impl Engine {
             events.push(disconnect(&self.writer, now, *cmac, c, reason));
             false
         });
-        for e in events {
-            self.emit(e);
-        }
         // Clients gone longer than the database keeps them (see `store::maintenance`).
         if now - self.last_prune >= 3600 {
             self.last_prune = now;
@@ -1458,6 +1460,9 @@ impl Engine {
             self.written.clients.retain(|mac, _| clients.contains_key(mac));
         }
         drop(live);
+        for e in events {
+            self.emit(e);
+        }
         for mac in offline {
             let _ = self.tx.send(LiveMsg::Device { mac });
         }
