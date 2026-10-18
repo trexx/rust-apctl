@@ -19,8 +19,8 @@ use serde_json::{Value, json};
 use tokio::sync::broadcast;
 
 use crate::clock;
-use crate::engine::{AliasEdit, DeviceView, KnownDevice, LiveMsg, SharedLive};
-use crate::model::Ts;
+use crate::engine::{AliasEdit, ClientView, DeviceView, KnownDevice, LiveMsg, SharedLive};
+use crate::model::{ClientSample, Ts};
 use crate::store::{self, Db, Store};
 
 /// What the handlers share. Cloned for every request (and by some handlers
@@ -488,7 +488,7 @@ async fn devices(State(s): State<AppState>) -> Json<Vec<DeviceRow>> {
 #[derive(Serialize)]
 struct DeviceDetail<'a> {
     device: DeviceOut<'a>,
-    clients: &'a [crate::engine::ClientView],
+    clients: &'a [ClientView],
     locating: bool,
 }
 
@@ -530,10 +530,11 @@ async fn device(State(s): State<AppState>, MacPath(mac): MacPath) -> Result<Resp
 }
 
 /// A client as its page shows it: its view, plus its name, manufacturer and controls.
+/// The list sends a smaller view (`ListedView`).
 #[derive(Serialize)]
-struct ClientRow<'a> {
+struct ClientRow<'a, V = &'a ClientView> {
     #[serde(flatten)]
-    view: &'a crate::engine::ClientView,
+    view: V,
     alias: Option<&'a str>,
     note: Option<&'a str>,
     vendor: Option<&'a str>,
@@ -541,16 +542,58 @@ struct ClientRow<'a> {
     controls: crate::actions::Controls<'a>,
 }
 
-/// A client in the client list: as on its page, plus the name of the AP it is on.
+/// A client in the client list: as on its page, without the multicast tables, plus the
+/// name of the AP it is on.
 #[derive(Serialize)]
 struct ListedClient<'a> {
     #[serde(flatten)]
-    client: ClientRow<'a>,
+    client: ClientRow<'a, ListedView<'a>>,
     /// Null when that AP has no name, or is not reporting.
     ap_name: Option<&'a str>,
 }
 
-type ClientCopy = (Mac, crate::engine::ClientView, Option<String>, Option<crate::engine::Alias>);
+/// A client's view as the list sends it: the sample without its multicast tables, which
+/// only the client's own page shows (with the peers in its groups), so the list of every
+/// client of the past year doesn't carry them.
+#[derive(Serialize)]
+struct ListedView<'a> {
+    sample: ListedSample<'a>,
+    connected: bool,
+    first_seen: Ts,
+    last_seen: Ts,
+}
+
+impl<'a> ListedView<'a> {
+    fn new(view: &'a ClientView) -> ListedView<'a> {
+        // In full, so that a field added to the view is a compile error here rather than missing from the list.
+        let ClientView { sample, connected, first_seen, last_seen } = view;
+        ListedView { sample: ListedSample(sample), connected: *connected, first_seen: *first_seen, last_seen: *last_seen }
+    }
+}
+
+/// A sample, serialised as it is without `multicast`.
+struct ListedSample<'a>(&'a ClientSample);
+
+impl Serialize for ListedSample<'_> {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        // Destructured in full, as above: a new field must be added here too, or left out by name.
+        macro_rules! all_but_multicast {
+            ($($f:ident),*) => {{
+                let ClientSample { $($f,)* multicast: _ } = self.0;
+                let mut st = s.serialize_struct("ClientSample", [$(stringify!($f)),*].len())?;
+                $(st.serialize_field(stringify!($f), $f)?;)*
+                st.end()
+            }};
+        }
+        all_but_multicast!(
+            mac, ap_mac, bssid, essid, radio, channel, hostname, ip, rssi, signal, noise, tx_rate, rx_rate, tx_bytes, rx_bytes, tx_packets, rx_packets,
+            tx_retries, idletime, uptime, satisfaction, anomalies, nss, wifi_gen, vlan_id, latency_avg, is_11r
+        )
+    }
+}
+
+type ClientCopy = (Mac, ClientView, Option<String>, Option<crate::engine::Alias>);
 
 /// Every client: the ones seen in this run and the ones restored from the
 /// database at start (`Engine::restore` loads them all, so the live view is
@@ -575,7 +618,7 @@ async fn clients(State(s): State<AppState>) -> Response {
         .iter()
         .map(|(mac, view, ap_name, alias)| ListedClient {
             client: ClientRow {
-                view,
+                view: ListedView::new(view),
                 alias: alias.as_ref().and_then(|a| a.alias.as_deref()),
                 note: alias.as_ref().and_then(|a| a.note.as_deref()),
                 vendor: s.vendors.lookup(mac),
@@ -594,20 +637,59 @@ async fn client_names(State(s): State<AppState>) -> Json<std::collections::HashM
     let names = live
         .clients
         .iter()
-        .filter_map(|(mac, c)| {
-            let alias = live.aliases.get(mac).and_then(|a| a.alias.as_deref());
-            let name = alias.or(c.sample.hostname.as_deref()).filter(|n| !n.is_empty())?;
-            Some((mac.to_string(), name.to_string()))
-        })
+        .filter_map(|(mac, c)| Some((mac.to_string(), client_name(&live, mac, c)?.to_string())))
         .collect();
     Json(names)
 }
 
+/// A client's display name: its alias, else its hostname; none when it has neither.
+fn client_name<'a>(live: &'a crate::engine::Live, mac: &Mac, c: &'a ClientView) -> Option<&'a str> {
+    let alias = live.aliases.get(mac).and_then(|a| a.alias.as_deref());
+    alias.or(c.sample.hostname.as_deref()).filter(|n| !n.is_empty())
+}
+
+/// A client's page: its view (with the multicast tables), plus the peers in its multicast groups.
+#[derive(Serialize)]
+struct ClientPage<'a> {
+    #[serde(flatten)]
+    client: ClientRow<'a>,
+    /// For each group it joined, the other connected clients that joined it too (groups without any are left out).
+    peers: std::collections::BTreeMap<String, Vec<Peer>>,
+}
+
+/// Another client in a multicast group, by its display name (else its MAC).
+#[derive(Serialize)]
+struct Peer {
+    mac: Mac,
+    name: String,
+}
+
+/// The other connected clients in each of `groups`, sorted by name: a scan of the live clients,
+/// made only for a client that joined some.
+fn multicast_peers(live: &crate::engine::Live, mac: &Mac, groups: &[String]) -> std::collections::BTreeMap<String, Vec<Peer>> {
+    let mut by: std::collections::BTreeMap<String, Vec<Peer>> = std::collections::BTreeMap::new();
+    if groups.is_empty() {
+        return by;
+    }
+    for (m, c) in live.clients.iter().filter(|(m, c)| c.connected && *m != mac) {
+        let Some(joined) = c.sample.multicast.as_ref().map(|x| &x.memberships) else { continue };
+        for g in joined.iter().filter(|g| groups.contains(g)) {
+            let name = client_name(live, m, c).map_or_else(|| m.to_string(), str::to_string);
+            by.entry(g.clone()).or_default().push(Peer { mac: *m, name });
+        }
+    }
+    for peers in by.values_mut() {
+        peers.sort_by_cached_key(|p| p.name.to_lowercase());
+    }
+    by
+}
+
 async fn client(State(s): State<AppState>, MacPath(mac): MacPath) -> Result<Response, ApiError> {
-    let (view, alias, state) = {
+    let (view, alias, state, peers) = {
         let live = s.live.read().unwrap();
         let view = live.clients.get(&mac).cloned().ok_or_else(|| ApiError(StatusCode::NOT_FOUND, "unknown client".into()))?;
-        (view, live.aliases.get(&mac).cloned().unwrap_or_default(), live.state.clone())
+        let peers = multicast_peers(&live, &mac, view.sample.multicast.as_ref().map_or(&[], |m| &m.memberships));
+        (view, live.aliases.get(&mac).cloned().unwrap_or_default(), live.state.clone(), peers)
     };
     let row = ClientRow {
         view: &view,
@@ -616,7 +698,7 @@ async fn client(State(s): State<AppState>, MacPath(mac): MacPath) -> Result<Resp
         vendor: s.vendors.lookup(&mac),
         controls: crate::actions::controls(state.as_deref(), &mac),
     };
-    Ok(Json(row).into_response())
+    Ok(Json(ClientPage { client: row, peers }).into_response())
 }
 
 async fn state_summary(State(s): State<AppState>) -> ApiResult {
@@ -1243,11 +1325,54 @@ mod tests {
         let keys = |v: &Value| v.as_object().unwrap().keys().cloned().collect::<Vec<_>>().join(",");
         assert_eq!(keys(&clients[0]), "alias,ap_name,blocked,connected,first_seen,last_seen,locked_to,note,sample,usergroup_id,vendor");
         let one = get_json(&app, "/api/clients/02:00:00:00:01:01").await;
-        assert_eq!(keys(&one), "alias,blocked,connected,first_seen,last_seen,locked_to,note,sample,usergroup_id,vendor", "no ap_name, as before");
-        assert_eq!(one["sample"], clients[0]["sample"]);
+        assert_eq!(keys(&one), "alias,blocked,connected,first_seen,last_seen,locked_to,note,peers,sample,usergroup_id,vendor", "no ap_name, as before");
+        // The list's sample is the page's without the multicast tables.
+        let mut page_sample = one["sample"].clone();
+        assert_eq!(page_sample.as_object_mut().unwrap().remove("multicast"), Some(Value::Null));
+        assert_eq!(page_sample, clients[0]["sample"]);
+        assert_eq!(one["peers"], json!({}));
         assert_eq!(get_json(&app, "/api/clients/names").await, json!({ "02:00:00:00:01:01": "phone" }));
         let status = get_json(&app, "/api/status").await;
         assert_eq!((&status["clients_connected"], &status["clients_by_band"], &status["clients_weak"]), (&json!(1), &json!({ "na": 1 }), &json!(0)));
+    }
+
+    #[tokio::test]
+    async fn a_clients_page_lists_its_multicast_peers_and_the_list_has_no_multicast() {
+        let (s, _engine, _dir) = state();
+        let (tx, _) = broadcast::channel(16);
+        let mut engine = crate::engine::Engine::new(s.writer.clone(), Default::default(), s.live.clone(), tx);
+        let joined = |groups: &[&str]| json!({ "types": {}, "memberships": groups.iter().map(|g| json!({ "group_ip": g })).collect::<Vec<_>>() });
+        let (ssdp, mdns) = ("239.255.255.250", "224.0.0.251");
+        let payload = json!({ "mac": "02:00:00:00:00:01", "hostname": "Hall", "uptime": 100, "vap_table": [
+            { "bssid": "b1", "essid": "Home", "radio": "na", "channel": 36, "usage": "user", "sta_table": [
+                { "mac": "02:00:00:00:01:01", "hostname": "tv", "multicast": joined(&[ssdp, mdns]) },
+                { "mac": "02:00:00:00:01:02", "hostname": "Speaker", "multicast": joined(&[ssdp]) },
+                { "mac": "02:00:00:00:01:03", "hostname": "amp", "multicast": joined(&[ssdp]) },
+                { "mac": "02:00:00:00:01:04", "multicast": joined(&[mdns]) },
+                { "mac": "02:00:00:00:01:05", "hostname": "gone", "multicast": joined(&[ssdp, mdns]) },
+                { "mac": "02:00:00:00:01:06", "hostname": "laptop" },
+            ] },
+        ] });
+        engine.handle(report(payload));
+        s.live.write().unwrap().clients.get_mut(&"02:00:00:00:01:05".parse().unwrap()).unwrap().connected = false;
+        let app = router(s);
+
+        let list = get_json(&app, "/api/clients").await;
+        assert_eq!(list.as_array().unwrap().len(), 6);
+        assert!(list.as_array().unwrap().iter().all(|c| c["sample"].get("multicast").is_none() && c["sample"]["essid"] == "Home"), "{list}");
+        // The other connected clients in each group, by name (else MAC); not the client itself, nor one that left.
+        let tv = get_json(&app, "/api/clients/02:00:00:00:01:01").await;
+        assert_eq!(tv["sample"]["multicast"]["memberships"], json!([ssdp, mdns]));
+        assert_eq!(tv["peers"], json!({
+            mdns: [{ "mac": "02:00:00:00:01:04", "name": "02:00:00:00:01:04" }],
+            ssdp: [{ "mac": "02:00:00:00:01:03", "name": "amp" }, { "mac": "02:00:00:00:01:02", "name": "Speaker" }],
+        }));
+        let speaker = get_json(&app, "/api/clients/02:00:00:00:01:02").await;
+        assert_eq!(speaker["peers"], json!({ ssdp: [{ "mac": "02:00:00:00:01:03", "name": "amp" }, { "mac": "02:00:00:00:01:01", "name": "tv" }] }));
+        // A client that joined no group has no peers, and one that left still sees who is in its groups.
+        assert_eq!(get_json(&app, "/api/clients/02:00:00:00:01:06").await["peers"], json!({}));
+        let gone = get_json(&app, "/api/clients/02:00:00:00:01:05").await;
+        assert_eq!(gone["peers"][mdns], json!([{ "mac": "02:00:00:00:01:04", "name": "02:00:00:00:01:04" }, { "mac": "02:00:00:00:01:01", "name": "tv" }]));
     }
 
     async fn get(app: &Router, path: &str) -> Response {

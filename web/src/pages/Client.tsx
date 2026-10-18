@@ -9,7 +9,6 @@ import {
   useClient,
   useDeviceNames,
   useEvents,
-  useMulticastPeers,
   useSeries,
 } from "../api";
 import {
@@ -57,10 +56,6 @@ function ClientPage({ mac }: { mac: string }) {
   const now = useNow();
   const c = client.data;
   const s = c?.sample;
-  // The other clients in its multicast groups.
-  const members = useMulticastPeers(
-    (s?.multicast?.memberships.length ?? 0) > 0,
-  ).data;
   const events = useEvents({ client: mac, limit: 100 });
   const series = useSeries("client", mac, range);
 
@@ -242,8 +237,8 @@ function ClientPage({ mac }: { mac: string }) {
             )}
           </QueryState>
 
-          {s?.multicast && (
-            <ClientMulticast mac={mac} m={s.multicast} members={members} />
+          {c?.sample.multicast && (
+            <ClientMulticast m={c.sample.multicast} peers={c.peers} />
           )}
 
           <h2>Connection log</h2>
@@ -357,14 +352,12 @@ function AliasHeader(p: {
 
 /** What this client sends and receives as multicast/broadcast, from the AP's latest report. */
 function ClientMulticast({
-  mac,
   m,
-  members,
+  peers,
 }: {
-  mac: string;
   m: Multicast;
-  /** The connected clients in each group; undefined while loading. */
-  members: Record<string, GroupMember[]> | undefined;
+  /** The other connected clients in each group (the server's). */
+  peers: Record<string, GroupMember[]>;
 }) {
   const types = Object.entries(m.types)
     .filter(([, c]) => c.tx_pkts + c.rx_pkts > 0)
@@ -372,8 +365,7 @@ function ClientMulticast({
       (a, b) => b[1].rx_pkts + b[1].tx_pkts - (a[1].rx_pkts + a[1].tx_pkts),
     );
   // Other connected clients that joined the same groups.
-  const peers = (group: string) =>
-    (members?.[group] ?? []).filter((c) => c.mac !== mac).map((c) => c.name);
+  const others = (group: string) => (peers[group] ?? []).map((c) => c.name);
   const services = serviceNames(m.services);
   return (
     <>
@@ -438,7 +430,7 @@ function ClientMulticast({
               </thead>
               <tbody>
                 {m.memberships.map((g) => {
-                  const p = peers(g);
+                  const p = others(g);
                   return (
                     <tr key={g}>
                       <td className="mono">{g}</td>

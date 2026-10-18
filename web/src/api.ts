@@ -62,7 +62,8 @@ export interface ClientSample {
   vlan_id: number | null;
   latency_avg: number | null;
   is_11r: boolean | null;
-  multicast: Multicast | null;
+  /** Only on a client's own page (`useClient`), not in the list. */
+  multicast?: Multicast | null;
 }
 
 /** `tx` is what the AP delivered to the client, `rx` what the client sent. */
@@ -102,6 +103,15 @@ export interface ClientView {
   locked_to?: Mac | null;
   /** From the settings: the client's own speed limit (user group). */
   usergroup_id?: string | null;
+}
+
+/** A client in a multicast group, as a client's page lists its peers. */
+export type GroupMember = { mac: Mac; name: string };
+
+/** A client's page: its view, with the multicast tables and the peers in its groups. */
+export interface ClientDetail extends ClientView {
+  /** For each group it joined, the other connected clients that joined it too (groups without any are left out). */
+  peers: Record<string, GroupMember[]>;
 }
 
 /** The name to show for a client: the user's alias, else its hostname, else its MAC. */
@@ -425,7 +435,6 @@ export const keys = {
   device: family<[mac: Mac]>("device"),
   clients: family("clients"),
   clientNames: family("client-names"),
-  multicastPeers: family("multicast-peers"),
   client: family<[mac: Mac]>("client"),
   series: family<[table: string, key: string, span: TimeSpan]>("series"),
   events: family<[filter: EventFilter]>("events"),
@@ -998,31 +1007,6 @@ export const useDevice = (mac: Mac) =>
 /** Every client of the past year, with its latest sample: for the client list. */
 export const useClients = () => useQuery({ queryKey: keys.clients(), queryFn: getting<ClientView[]>("/api/clients") });
 
-/** A client in a multicast group, as a client's page lists its peers. */
-export type GroupMember = { mac: Mac; name: string };
-
-/** The connected clients in each multicast group, by group. */
-function groupMembers(clients: ClientView[]): Record<string, GroupMember[]> {
-  const by: Record<string, GroupMember[]> = {};
-  for (const c of clients) {
-    if (!c.connected) continue;
-    for (const g of c.sample.multicast?.memberships ?? []) (by[g] ??= []).push({ mac: c.sample.mac, name: displayName(c) });
-  }
-  return by;
-}
-
-/**
- * The connected clients in each multicast group, for a client's page (only fetched when `enabled`). It takes
- * the whole client list, so it is polled every minute rather than refreshed by the live socket.
- */
-export const useMulticastPeers = (enabled: boolean) =>
-  useQuery({
-    queryKey: keys.multicastPeers(),
-    queryFn: async ({ signal }) => groupMembers(await get<ClientView[]>("/api/clients", signal)),
-    refetchInterval: 60_000,
-    enabled,
-  });
-
 /** Names by MAC, for links. */
 export type Names = Readonly<Record<Mac, string>>;
 
@@ -1049,9 +1033,9 @@ export const useDeviceNames = (): Names =>
 export const useClientNames = (): Names =>
   useQuery({ queryKey: keys.clientNames(), queryFn: getting<Names>("/api/clients/names"), refetchInterval: 300_000 }).data ?? NO_NAMES;
 
-/** One client; a 404 (HttpError) means it hasn't been seen since apctl started. */
+/** One client, with the peers in its multicast groups; a 404 (HttpError) means it hasn't been seen since apctl started. */
 export const useClient = (mac: Mac) =>
-  useQuery({ queryKey: keys.client(mac), queryFn: getting<ClientView>(`/api/clients/${mac}`) });
+  useQuery({ queryKey: keys.client(mac), queryFn: getting<ClientDetail>(`/api/clients/${mac}`) });
 
 /** `prev` with the samples of `add` (all newer) appended, and those before `from` dropped. */
 function appendSeries(prev: Series, add: Series, from: number): Series {
