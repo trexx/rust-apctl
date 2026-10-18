@@ -157,6 +157,9 @@ fn load_keys(path: Option<&str>) -> Result<KeyStore> {
     match path {
         Some(p) => {
             let store = KeyStore::load(p)?;
+            for why in store.skipped() {
+                eprintln!("warning: {why}");
+            }
             eprintln!("loaded {} device keys from {p}", store.len());
             Ok(store)
         }
@@ -170,7 +173,15 @@ fn run_capture(input: &str, common: Common, all: bool) -> Result<()> {
         keys,
         Options { all, full: common.full, json: common.json, save: common.save, redact: !common.no_redact },
     );
-    capture::run(capture::open_input(input)?, &common.ports, |ev| reporter.handle(ev))
+    warn_if_truncated(capture::run(capture::open_input(input)?, &common.ports, |ev| reporter.handle(ev))?);
+    Ok(())
+}
+
+/// Says so when a capture ended in the middle of a packet.
+fn warn_if_truncated(end: capture::End) {
+    if end == capture::End::Truncated {
+        eprintln!("warning: the capture ends in the middle of a packet (truncated?); ignoring the rest");
+    }
 }
 
 /// A fresh nonce for sealing a packet: random, so it never repeats under one key.

@@ -69,7 +69,7 @@ pub fn run(pcap: &str, ports: &[u16], keys: &KeyStore, url: &str, limit: usize, 
     // the capture is read but not decoded.
     let mut informs: Vec<Value> = Vec::new();
     let mut pairer = Pairer::default();
-    capture::run(capture::open_input(pcap)?, ports, |ev| {
+    let end = capture::run(capture::open_input(pcap)?, ports, |ev| {
         if informs.len() >= limit {
             return;
         }
@@ -77,6 +77,7 @@ pub fn run(pcap: &str, ports: &[u16], keys: &KeyStore, url: &str, limit: usize, 
             informs.push(d.payload);
         }
     })?;
+    crate::warn_if_truncated(end);
     eprintln!("replaying {} informs to {url}", informs.len());
 
     // What each simulated AP currently runs (it adopts pushed versions), and

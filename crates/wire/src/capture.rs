@@ -33,9 +33,18 @@ pub enum HttpEvent {
     Datagram { ts: Micros, src: SocketAddr, dst: SocketAddr, payload: Vec<u8> },
 }
 
+/// How a capture ended.
+#[must_use]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum End {
+    Complete,
+    /// In the middle of a packet (tcpdump killed mid-write): what came before was read.
+    Truncated,
+}
+
 /// Reads packets from `input` and calls `on_event` for every complete HTTP message
 /// whose TCP connection has one of `ports` as its server port.
-pub fn run<R: Read + Send>(input: R, ports: &[u16], on_event: impl FnMut(HttpEvent)) -> Result<()> {
+pub fn run<R: Read + Send>(input: R, ports: &[u16], on_event: impl FnMut(HttpEvent)) -> Result<End> {
     run_with_udp(input, ports, &[], on_event)
 }
 
@@ -45,7 +54,7 @@ pub fn run_with_udp<R: Read + Send>(
     ports: &[u16],
     udp_ports: &[u16],
     mut on_event: impl FnMut(HttpEvent),
-) -> Result<()> {
+) -> Result<End> {
     let mut buffer_size = 1 << 20;
     let mut reader = create_reader(buffer_size, input).map_err(|e| anyhow::anyhow!("reading capture header: {e:?}"))?;
     let mut tracker = Tracker::new(ports.to_vec(), udp_ports.to_vec());
@@ -93,12 +102,9 @@ pub fn run_with_udp<R: Read + Send>(
                 }
                 reader.consume(offset);
             }
-            Err(PcapError::Eof) => return Ok(()),
+            Err(PcapError::Eof) => return Ok(End::Complete),
             // tcpdump killed mid-write leaves half a block at the end: keep what came before.
-            Err(PcapError::UnexpectedEof) => {
-                eprintln!("warning: the capture ends in the middle of a packet (truncated?); ignoring the rest");
-                return Ok(());
-            }
+            Err(PcapError::UnexpectedEof) => return Ok(End::Truncated),
             // A block larger than the buffer (jumbo frames, huge snaplen).
             Err(PcapError::BufferTooSmall) => {
                 if buffer_size >= MAX_BLOCK {
@@ -1176,7 +1182,7 @@ mod pcap_tests {
             (false, 5000, &resp),
         ]);
         let mut events = Vec::new();
-        run(&data[..], &[8080], |e| events.push(e)).unwrap();
+        assert_eq!(run(&data[..], &[8080], |e| events.push(e)).unwrap(), End::Complete);
         assert_eq!(events.len(), 2, "{events:?}");
         match &events[0] {
             HttpEvent::Request { body, conn, ts, .. } => {
@@ -1195,7 +1201,7 @@ mod pcap_tests {
         let resp = sample::http_response(b"RESPONSE");
         let data = sample::pcap(&[(true, 1000, &req), (false, 5000, &resp)]);
         let mut events = Vec::new();
-        run(&data[..data.len() - 5], &[8080], |e| events.push(e)).unwrap();
+        assert_eq!(run(&data[..data.len() - 5], &[8080], |e| events.push(e)).unwrap(), End::Truncated);
         assert_eq!(events.len(), 1, "{events:?}");
     }
 
@@ -1261,7 +1267,7 @@ mod pcap_tests {
         spb.extend_from_slice(&resp);
         block(&mut data, 3, &spb);
         let mut events = Vec::new();
-        run(&data[..], &[8080], |e| events.push(e)).unwrap();
+        assert_eq!(run(&data[..], &[8080], |e| events.push(e)).unwrap(), End::Complete);
         assert!(matches!(&events[..], [HttpEvent::Request { ts: a, .. }, HttpEvent::Response { ts: b, .. }] if *a == ts && *b == ts), "{events:?}");
     }
 
@@ -1291,7 +1297,7 @@ mod pcap_tests {
         interface(&mut data, &[(9, &[0x80 | 20]), (14, &(-10i64).to_le_bytes())]);
         packet(&mut data, 0, (1_791_840_610 << 20) + (1 << 19), &frame(true, &sample::http_request(b"Q")));
         let mut events = Vec::new();
-        run(&data[..], &[8080], |e| events.push(e)).unwrap();
+        assert_eq!(run(&data[..], &[8080], |e| events.push(e)).unwrap(), End::Complete);
         assert!(matches!(&events[..], [HttpEvent::Request { ts, .. }] if *ts == 1_791_840_600_500_000), "{events:?}");
         assert_eq!((ts_units(6), ts_units(9), ts_units(0x80 | 10), ts_units(0x80 | 64), ts_units(20)), (1_000_000, 1_000_000_000, 1024, 1_000_000, 1_000_000));
         // Picoseconds: the fraction does not fit 32 bits.
@@ -1312,7 +1318,7 @@ mod pcap_tests {
         data.resize(data.len() + big as usize, 0);
         data.extend_from_slice(&sample::pcap(&[(true, 1000, &req)])[24..]);
         let mut events = Vec::new();
-        run(&data[..], &[8080], |e| events.push(e)).unwrap();
+        assert_eq!(run(&data[..], &[8080], |e| events.push(e)).unwrap(), End::Complete);
         assert!(matches!(&events[..], [HttpEvent::Request { body, .. }] if body == b"REQUEST-BODY"), "{events:?}");
     }
 }

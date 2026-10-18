@@ -783,7 +783,7 @@ mod tests {
         let mut pairer = wire::exchange::Pairer::default();
         let mut informs = 0;
         let mut syslog = 0;
-        wire::capture::run_with_udp(&buf[..], &[8080], &[5514], |ev| {
+        let end = wire::capture::run_with_udp(&buf[..], &[8080], &[5514], |ev| {
             if matches!(ev, wire::capture::HttpEvent::Datagram { .. }) {
                 syslog += 1;
             } else if let Some(wire::exchange::InformEvent::Inform { decoded, .. }) = pairer.handle(&keys, ev) {
@@ -792,6 +792,7 @@ mod tests {
             }
         })
         .unwrap();
+        assert_eq!(end, wire::capture::End::Complete);
         assert!(informs > 3 * 30, "{informs} informs");
         assert!(syslog > 0);
     }

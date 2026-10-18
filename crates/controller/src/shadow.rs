@@ -135,7 +135,7 @@ fn run_once<R: Read + Send>(
 ) -> anyhow::Result<()> {
     let mut pairer = Pairer::default();
     let mut last_tick = 0;
-    capture::run_with_udp(input, ports, &[syslog_port], |event| {
+    let end = capture::run_with_udp(input, ports, &[syslog_port], |event| {
         // AP syslog sent to the other controller's address.
         if let capture::HttpEvent::Datagram { ts, src, payload, .. } = event {
             let _ = tx.blocking_send(Input::Datagram { ts: ts / 1_000_000, src_ip: src.ip().to_string(), payload });
@@ -178,7 +178,11 @@ fn run_once<R: Read + Send>(
         if let Some(tick) = tick {
             let _ = tx.blocking_send(tick);
         }
-    })
+    })?;
+    if end == capture::End::Truncated {
+        tracing::warn!("the shadow capture ends in the middle of a packet (truncated?); ignoring the rest");
+    }
+    Ok(())
 }
 
 #[cfg(test)]
