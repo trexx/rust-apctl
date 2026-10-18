@@ -32,7 +32,7 @@ import { MulticastPanel } from "../components/insights/Multicast";
 import { RetryBuckets } from "../components/insights/RetryBuckets";
 import { SiteActivity } from "../components/insights/SiteActivity";
 import { TopTalkers } from "../components/insights/TopTalkers";
-import { useTimeSpan } from "../components/Chart";
+import { ZoomContext, useTimeSpan } from "../components/Chart";
 import { ThreatBanner } from "../components/Threats";
 import { AdoptionPanel } from "../components/Adoption";
 
@@ -194,7 +194,12 @@ function RadioRow(p: {
   );
 }
 
+/** Outside SiteActivity's zoom: dragging across its chart zooms the page all the same. */
 function SiteMulticast() {
-  const [span] = useTimeSpan(86400);
-  return <MulticastPanel span={span} />;
+  const [span, setSpan] = useTimeSpan(86400);
+  return (
+    <ZoomContext.Provider value={(from, to) => setSpan({ from, to })}>
+      <MulticastPanel span={span} />
+    </ZoomContext.Provider>
+  );
 }
