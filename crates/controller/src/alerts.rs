@@ -459,6 +459,27 @@ async fn failing_clients(store: &Arc<Store>, now: Ts) -> anyhow::Result<usize> {
     .await?
 }
 
+/// A stored alert, from a row selected as `id, ts, key, category, severity,
+/// entity, title, message, link, tag, resolved_ts`; `None` for an alert of a
+/// kind apctl no longer raises.
+fn stored(r: &rusqlite::Row) -> rusqlite::Result<Option<Alert>> {
+    let (key, cat, sev, entity): (String, String, String, String) = (r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?);
+    let Some((key, entity)) = Key::parse(&key).and_then(|k| Some((k, Entity::parse(k, &entity)?))) else { return Ok(None) };
+    Ok(Some(Alert {
+        id: r.get(0)?,
+        ts: r.get(1)?,
+        key,
+        category: Category::parse(&cat).unwrap_or(Category::Changes),
+        severity: Severity::parse(&sev).unwrap_or(Severity::Info),
+        entity,
+        title: r.get(6)?,
+        message: r.get(7)?,
+        link: r.get(8)?,
+        tag: r.get(9)?,
+        resolved_ts: r.get(10)?,
+    }))
+}
+
 /// What a previous run left: the alerts still open, the highest number a
 /// stored alert's id carries (`{ts}-{number}`), and the AP offline alerts of
 /// the day before `now`, oldest first: (AP, when, whether it was a "keeps
@@ -475,28 +496,9 @@ async fn load_open(store: &Arc<Store>, now: Ts) -> anyhow::Result<(Vec<Alert>, u
                 .collect::<rusqlite::Result<Vec<_>>>()?;
             let sql = "SELECT COALESCE(MAX(CAST(substr(id, instr(id, '-') + 1) AS INTEGER)), 0) FROM alerts";
             let seq = c.query_row(sql, [], |r| r.get::<_, i64>(0))?;
-            let mut stmt = c.prepare("SELECT id, ts, key, category, severity, entity, title, message, link, tag FROM alerts WHERE resolved_ts IS NULL")?;
-            let rows = stmt
-                .query_map([], |r| {
-                    let (key, cat, sev, entity): (String, String, String, String) = (r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?);
-                    // An alert of a kind apctl no longer raises can't be resolved: it is left as stored.
-                    let Some((key, entity)) = Key::parse(&key).and_then(|k| Some((k, Entity::parse(k, &entity)?))) else { return Ok(None) };
-                    Ok(Some(Alert {
-                        id: r.get(0)?,
-                        ts: r.get(1)?,
-                        key,
-                        category: Category::parse(&cat).unwrap_or(Category::Changes),
-                        severity: Severity::parse(&sev).unwrap_or(Severity::Info),
-                        entity,
-                        title: r.get(6)?,
-                        message: r.get(7)?,
-                        link: r.get(8)?,
-                        tag: r.get(9)?,
-                        resolved_ts: None,
-                    }))
-                })?
-                .filter_map(Result::transpose)
-                .collect::<rusqlite::Result<Vec<_>>>()?;
+            // An alert of a kind apctl no longer raises can't be resolved: it is left as stored.
+            let mut stmt = c.prepare("SELECT id, ts, key, category, severity, entity, title, message, link, tag, resolved_ts FROM alerts WHERE resolved_ts IS NULL")?;
+            let rows = stmt.query_map([], stored)?.filter_map(Result::transpose).collect::<rusqlite::Result<Vec<_>>>()?;
             Ok((rows, u64::try_from(seq).unwrap_or(0), offline))
         })
     })
@@ -785,26 +787,33 @@ pub struct ListQuery {
 /// Recent alerts, newest first: by time, then as stored.
 const LIST: &str = "SELECT id, ts, key, category, severity, entity, title, message, link, tag, resolved_ts, read FROM alerts ORDER BY ts DESC, rowid DESC LIMIT ?1";
 
+/// An alert as listed: whether it was read too.
+#[derive(Serialize)]
+struct Listed {
+    #[serde(flatten)]
+    alert: Alert,
+    read: bool,
+}
+
+/// The `limit` most recent alerts, newest first, with the unread count.
+/// One of a kind apctl no longer raises is left out (see [`stored`]).
+fn recent(c: &rusqlite::Connection, limit: i64) -> anyhow::Result<Value> {
+    let mut stmt = c.prepare(LIST)?;
+    let rows = stmt
+        .query_map([limit], |r| Ok(match stored(r)? {
+            Some(alert) => Some(Listed { alert, read: r.get::<_, i64>(11)? != 0 }),
+            None => None,
+        }))?
+        .filter_map(Result::transpose)
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let unread: i64 = c.query_row("SELECT COUNT(*) FROM alerts WHERE read = 0", [], |r| r.get(0))?;
+    Ok(json!({ "alerts": rows, "unread": unread }))
+}
+
 /// GET /api/alerts: recent alerts, newest first, with the unread count.
 pub async fn list(State(s): State<AppState>, Query(q): Query<ListQuery>) -> Result<Json<Value>, ApiError> {
     let limit = q.limit.unwrap_or(50).clamp(1, 500) as i64;
-    let rows = crate::api::read(&s.store, Db::Config, move |c| {
-        let mut stmt = c.prepare(LIST)?;
-        let rows = stmt
-            .query_map([limit], |r| {
-                Ok(json!({
-                    "id": r.get::<_, String>(0)?, "ts": r.get::<_, Ts>(1)?, "key": r.get::<_, String>(2)?, "category": r.get::<_, String>(3)?,
-                    "severity": r.get::<_, String>(4)?, "entity": r.get::<_, String>(5)?, "title": r.get::<_, String>(6)?,
-                    "message": r.get::<_, String>(7)?, "link": r.get::<_, Option<String>>(8)?, "tag": r.get::<_, String>(9)?,
-                    "resolved_ts": r.get::<_, Option<Ts>>(10)?, "read": r.get::<_, i64>(11)? != 0,
-                }))
-            })?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        let unread: i64 = c.query_row("SELECT COUNT(*) FROM alerts WHERE read = 0", [], |r| r.get(0))?;
-        Ok(json!({ "alerts": rows, "unread": unread }))
-    })
-    .await?;
-    Ok(Json(rows))
+    Ok(Json(crate::api::read(&s.store, Db::Config, move |c| recent(c, limit)).await?))
 }
 
 /// POST /api/alerts/read: marks every alert read.
@@ -1133,6 +1142,15 @@ mod tests {
         open.sort();
         assert_eq!(open, ["busy_channel:02:00:00:00:00:01/na", "connect_failures:site"]);
         assert_eq!(again.book.seq, 99);
+        // Listed as the UI reads them (web/src/api.ts's AlertItem); one apctl doesn't know is left out.
+        let listed = w.store.read(Db::Config, |c| recent(c, 50)).unwrap();
+        assert_eq!((listed["alerts"].as_array().map(Vec::len), listed["unread"].as_i64()), (Some(2), Some(3)));
+        let a = &listed["alerts"][1];
+        let mut fields: Vec<&str> = a.as_object().unwrap().keys().map(String::as_str).collect();
+        fields.sort();
+        assert_eq!(fields, ["category", "entity", "id", "key", "link", "message", "read", "resolved_ts", "severity", "tag", "title", "ts"]);
+        assert_eq!((a["key"].as_str(), a["entity"].as_str(), a["category"].as_str(), a["severity"].as_str()), (Some("busy_channel"), Some("02:00:00:00:00:01/na"), Some("health"), Some("medium")));
+        assert_eq!((a["ts"].as_i64(), a["link"].as_str(), &a["resolved_ts"], a["read"].as_bool()), (Some(1000), Some("/devices/02:00:00:00:00:01"), &Value::Null, Some(false)));
     }
 
     #[tokio::test]
