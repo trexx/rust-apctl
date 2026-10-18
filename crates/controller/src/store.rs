@@ -555,22 +555,31 @@ pub struct PushedConfig {
 
 /// One AP's last stored push, with its secrets masked.
 pub fn stored_push(c: &Connection, mac: &inform::Mac) -> rusqlite::Result<Option<PushedConfig>> {
+    Ok(stored_push_at(c, mac)?.map(|(p, _)| p))
+}
+
+/// One AP's last stored push, with its secrets masked, and when it was stored.
+pub fn stored_push_at(c: &Connection, mac: &inform::Mac) -> rusqlite::Result<Option<(PushedConfig, Option<Ts>)>> {
     use rusqlite::OptionalExtension;
-    c.prepare_cached("SELECT mgmt_cfg, system_cfg, cfgversion FROM device_config WHERE mac = ?1")?
+    c.prepare_cached("SELECT mgmt_cfg, system_cfg, cfgversion, ts FROM device_config WHERE mac = ?1")?
         .query_row([mac.to_string()], |r| {
-            Ok(PushedConfig { mgmt_cfg: r.get::<_, Option<String>>(0)?.unwrap_or_default(), system_cfg: r.get::<_, Option<String>>(1)?.unwrap_or_default(), cfgversion: r.get(2)? })
+            let push = PushedConfig { mgmt_cfg: r.get::<_, Option<String>>(0)?.unwrap_or_default(), system_cfg: r.get::<_, Option<String>>(1)?.unwrap_or_default(), cfgversion: r.get(2)? };
+            Ok((push, r.get(3)?))
         })
         .optional()
 }
 
 /// Rolls complete buckets up into the coarser tiers, then applies retention.
 /// Each step runs on its own: one that fails is logged and the rest still run.
+/// The retention of a year of events and clients, of alerts and of sessions
+/// only runs when `hourly`: an hour's delay is nothing to them, and the
+/// clients' (by `last_seen`, which has no index) reads the whole table.
 ///
 /// Both go by the wall clock. A capture replayed from the past writes raw rows
 /// that are older than the roll-up's progress mark (or than the raw tier's
 /// retention), so they are never rolled up; the raw tier still shows them
 /// while they are kept.
-fn maintenance(conns: &mut Conns, now: Ts) {
+fn maintenance(conns: &mut Conns, now: Ts, hourly: bool) {
     let step = |what: &str, result: Result<()>| {
         if let Err(e) = result {
             tracing::warn!("{what} failed: {e:#}");

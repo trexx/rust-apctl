@@ -440,15 +440,13 @@ impl Active {
     /// there would not show in a masked comparison, and never reach the AP.
     fn stored_push(&self, mac: Mac) -> Option<PushedConfig> {
         let read = self.store.read(Db::Config, |c| {
-            use rusqlite::OptionalExtension;
-            let pushed = c.query_row("SELECT ts FROM device_config WHERE mac = ?1", [mac.to_string()], |r| r.get::<_, Option<Ts>>(0)).optional()?;
-            let Some(pushed) = pushed else { return Ok(None) };
+            let Some((push, pushed)) = crate::store::stored_push_at(c, &mac)? else { return Ok(None) };
             let edited: Option<Ts> = c.query_row("SELECT MAX(ts) FROM events WHERE kind = ?1", [EventKind::SettingsChanged.as_str()], |r| r.get(0))?;
             if edited.is_some_and(|e| pushed.is_none_or(|p| p <= e)) {
                 tracing::info!("{mac}: the settings were edited after its last stored push: not comparing with it");
                 return Ok(None);
             }
-            Ok(crate::store::stored_push(c, &mac)?)
+            Ok(Some(push))
         });
         read.unwrap_or_else(|e| {
             tracing::warn!("{mac}: cannot read its last stored push: {e:#}");
