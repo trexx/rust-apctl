@@ -6,7 +6,7 @@ use std::borrow::Cow;
 use anyhow::{Result, bail};
 use serde_json::Value;
 
-use crate::Ctx;
+use crate::{Cap, Ctx};
 use crate::cfg::{Cfg, Prefix};
 use crate::json::{flag, int_of, oid, str_of};
 use crate::meta::Meta;
@@ -166,7 +166,7 @@ pub fn render_netconf(c: &mut Cfg, ctx: &Ctx, net: &Net, radios: &[Radio], vaps:
     let indices = meta.netconf(&names);
     let static_ip = static_ip(ctx);
     // VAPs are brought up by hostapd on APs that run it for every SSID.
-    let hostapd_up = crate::bit(ctx.caps.wifi, 13);
+    let hostapd_up = ctx.caps.has(Cap::HostapdVaps);
     for ((name, kind), n) in ifaces.iter().zip(indices) {
         let k = Prefix::new("netconf", n as usize);
         let mgmt = name == "br0";

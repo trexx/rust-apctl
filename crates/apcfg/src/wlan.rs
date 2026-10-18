@@ -10,7 +10,7 @@ use crate::cfg::{Cfg, Prefix};
 use crate::javahash::hash_set_order;
 use crate::json::{Text, arr, as_text, bool_of, flag, int_of, mac_eq, oid, on_off, str_list, str_of, text_of};
 use crate::meta::WifiSlot;
-use crate::{Ctx, bit};
+use crate::{Cap, Ctx, bit};
 
 /// `radio_caps2` bits for WPA3 features. Both U6-Mesh radios report 31 (all of them);
 /// the assignment of the individual bits is our assumption.
@@ -169,10 +169,10 @@ fn adapt<'a>(ctx: &Ctx, wlan: &'a Value, radio: &Radio) -> Option<Cow<'a, Value>
     let wpa3 = flag(wlan, "wpa3_support", false);
     let transition = flag(wlan, "wpa3_transition", false);
     let ppsk = flag(wlan, "private_preshared_keys_enabled", false) || str_of(wlan, "attr_hidden_id") == Some("UidIot");
-    if ppsk && !bit(ctx.caps.wifi, 20) {
+    if ppsk && !ctx.caps.has(Cap::Ppsk) {
         return None;
     }
-    if (flag(wlan, "hotspot2conf_enabled", false) || security == "osen") && !bit(ctx.caps.fw, 23) {
+    if (flag(wlan, "hotspot2conf_enabled", false) || security == "osen") && !ctx.caps.has(Cap::Hotspot2) {
         return None;
     }
     match security {
@@ -312,7 +312,7 @@ pub fn render_radios(c: &mut Cfg, ctx: &Ctx, radios: &[Radio], vaps: &[Vap]) -> 
         c.set(k.at("channel"), channel);
         let g = if r.band == Band::Ng { "g" } else { "a" };
         c.set(k.at("ieee_mode"), format_args!("11n{g}ht{width}"));
-        let acs_dfs = bit(ctx.caps.wifi2, 4);
+        let acs_dfs = ctx.caps.has(Cap::AcsDfs);
         if r.band == Band::Na && acs_dfs {
             let dfs = ctx.radio_ai_config(Band::Na).is_some_and(|c| flag(c, "dfs", false));
             c.set(k.at("acsdfs"), on_off(dfs));
@@ -327,7 +327,7 @@ pub fn render_radios(c: &mut Cfg, ctx: &Ctx, radios: &[Radio], vaps: &[Vap]) -> 
                 c.set(k.at("blklst"), hash_set_order(&blocked).join(","));
             }
         }
-        if bit(ctx.caps.wifi2, 2) {
+        if ctx.caps.has(Cap::GreenAp) {
             c.set(k.at("green_ap"), if flag(ctx.device, "green_ap_enabled", false) { 2 } else { 0 });
         }
         // Sensitivity values are offsets above -95 dBm (saturating: an imported value
@@ -511,7 +511,7 @@ pub fn render_vap(c: &mut Cfg, ctx: &Ctx, radios: &[Radio], vaps: &[Vap], i: usi
         c.set(a.at("devname"), v.dev());
         c.set(a.at("driver"), "madwifi");
         c.set(a.at("ssid"), ssid);
-        c.set(a.at("status"), on_off(bit(ctx.caps.wifi, 13) && !r.disabled));
+        c.set(a.at("status"), on_off(ctx.caps.has(Cap::HostapdVaps) && !r.disabled));
         c.set(a.at("id"), id);
         c.set(a.at("verbose"), 2);
         common_tail(c);
@@ -718,7 +718,7 @@ fn render_wireless(c: &mut Cfg, ctx: &Ctx, radios: &[Radio], vaps: &[Vap], i: us
     c.set(k.at("usage"), if is_guest { "guest" } else { "user" });
     c.set(k.at("wds"), "disabled");
     c.set(k.at("mcast.enhance"), u8::from(b(w, "mcastenhance_enabled")));
-    c.set(k.at("multicast.inspect"), bit(caps.fw3, 7));
+    c.set(k.at("multicast.inspect"), caps.has(Cap::MulticastInspect));
     c.set(k.at("autowds"), "disabled");
     c.set(k.at("vport"), "disabled");
     c.set(k.at("vwire"), "disabled");
@@ -730,19 +730,19 @@ fn render_wireless(c: &mut Cfg, ctx: &Ctx, radios: &[Radio], vaps: &[Vap], i: us
         c.set(k.at("iot"), "enabled");
         c.set(k.at("qbssload"), "disabled");
     }
-    if bit(caps.wifi2, 6) {
+    if caps.has(Cap::AdvertiseApName) {
         c.set(k.at("advertise_ap_name"), on_off(b(w, "advertise_device_name_in_beacon")));
     }
     let suppressor = str_of(w, "multicast_suppressor_mode");
-    let suppress_cap = bit(caps.wifi2, 22);
+    let suppress_cap = caps.has(Cap::MulticastSuppression);
     if suppress_cap && matches!(suppressor, Some("conservative" | "aggressive")) {
         c.set(k.at("multicast.suppressor"), "enabled");
     }
     c.set(k.at("mcastrate"), text_of(w, "mcast_rate").unwrap_or(Text::Str("auto")));
-    if bit(caps.wifi, 6) {
+    if caps.has(Cap::BgaFilter) {
         c.set(k.at("bga_filter"), "enabled");
     }
-    schedule(c, w, k, bit(caps.fw, 22), bit(caps.fw, 12));
+    schedule(c, w, k, caps.has(Cap::ScheduleInvert), caps.has(Cap::ScheduleBlocks));
     let ng = r.band == Band::Ng;
     let dtim = if ng && b(w, "iot_dtim_lock") {
         3
@@ -787,7 +787,7 @@ fn render_wireless(c: &mut Cfg, ctx: &Ctx, radios: &[Radio], vaps: &[Vap], i: us
             c.set(format_args!("{k}bcfilt.{}.mac", mi + 1), mac);
         }
     }
-    if bit(caps.wifi2, 5) {
+    if caps.has(Cap::RoamingAssistant) {
         let (on, rssi) = match r.band {
             Band::Na => (b(w, "roaming_assistant_na_enabled"), int_of(w, "roaming_assistant_na_rssi").unwrap_or(-75)),
             Band::Six => (b(w, "roaming_assistant_6e_enabled"), int_of(w, "roaming_assistant_6e_rssi").unwrap_or(-88)),
@@ -799,7 +799,7 @@ fn render_wireless(c: &mut Cfg, ctx: &Ctx, radios: &[Radio], vaps: &[Vap], i: us
         }
     }
     let dns_mode = str_of(w, "dns_assistance_mode").unwrap_or("off");
-    if bit(caps.fw3, 3) && dns_mode != "off" {
+    if caps.has(Cap::DnsAssistance) && dns_mode != "off" {
         c.set(k.at("dns_cache.status"), "enabled");
         c.set(k.at("dns_bypass.status"), "enabled");
         if dns_mode == "manual" {

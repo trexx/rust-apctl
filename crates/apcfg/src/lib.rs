@@ -166,66 +166,162 @@ pub fn blocked_sta(state: &Value, site_id: &str) -> String {
         .join("\n")
 }
 
-/// Capability bit fields of the AP.
+/// The AP's capability bit fields, in [`CAP_KEYS`] order.
 #[derive(Default, Clone, Copy)]
-pub(crate) struct Caps {
-    pub fw: u64,
-    pub fw2: u64,
-    pub fw3: u64,
-    pub wifi: u64,
-    pub wifi2: u64,
-    pub hw: u64,
-}
+pub(crate) struct Caps([u64; 6]);
 
 impl Caps {
     fn read(inform: Option<&Value>, device: &Value) -> Caps {
-        let [fw, fw2, fw3, wifi, wifi2, hw] =
-            CAP_KEYS.map(|k| inform.and_then(|i| json::int_of(i, k)).or_else(|| json::int_of(device, k)).unwrap_or(0) as u64);
-        Caps { fw, fw2, fw3, wifi, wifi2, hw }
+        Caps(CAP_KEYS.map(|k| inform.and_then(|i| json::int_of(i, k)).or_else(|| json::int_of(device, k)).unwrap_or(0) as u64))
     }
 
     /// Whether any capability bits are known: from an inform, or stored with the device.
     fn is_known(&self) -> bool {
-        [self.fw, self.fw2, self.fw3, self.wifi, self.wifi2, self.hw] != [0; 6]
+        self.0 != [0; 6]
+    }
+
+    pub fn has(&self, cap: Cap) -> bool {
+        let (field, n) = cap.at();
+        bit(self.0[field as usize], n)
+    }
+
+    /// Whether the AP has any one of these capabilities.
+    pub fn any(&self, caps: &[Cap]) -> bool {
+        caps.iter().any(|&c| self.has(c))
     }
 }
 
-/// The capability fields behind [`Caps`], in its field order: from the AP's inform,
+/// The capability fields behind [`Caps`], in [`Field`] order: from the AP's inform,
 /// else from its device document.
 const CAP_KEYS: [&str; 6] = ["fw_caps", "fw2_caps", "fw3_caps", "wifi_caps", "wifi_caps2", "hw_caps"];
+
+/// A capability field, by its index in [`CAP_KEYS`].
+#[derive(Clone, Copy)]
+enum Field {
+    Fw,
+    Fw2,
+    Fw3,
+    Wifi,
+    Wifi2,
+    Hw,
+}
+
+/// A capability bit the render tests. Each bit number is written down once, in
+/// [`Cap::at`]: the render and the feature tables below both test it through
+/// [`Caps::has`], so they cannot disagree on what an AP supports.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Cap {
+    /// The `switch.*` section, with jumbo frames.
+    Switch,
+    /// SSH passwords as SHA-512 crypt hashes rather than MD5 ones.
+    Sha512Passwd,
+    /// Several schedule blocks a day (`schedule_<day>.<i>`).
+    ScheduleBlocks,
+    /// SNMP v3 (v1/v2c needs no capability).
+    SnmpV3,
+    /// Schedules given as the blackout blocks (`schedule_invert`).
+    ScheduleInvert,
+    /// Hotspot 2.0 and OSEN SSIDs.
+    Hotspot2,
+    /// Encrypted syslog to the controller.
+    EncryptedSyslog,
+    /// The mDNS proxy (`mdns_sd.*`).
+    MdnsProxy,
+    /// DNS assistance (`dns_cache`, `dns_bypass`).
+    DnsAssistance,
+    /// The `pathmon` section.
+    PathMonitor,
+    /// `multicast.inspect` on each VAP.
+    MulticastInspect,
+    /// Band steering.
+    BandSteering,
+    /// Band steering between named 2.4 and 5 GHz VAP pairs.
+    BandSteeringPairs,
+    /// Airtime fairness.
+    AirtimeFairness,
+    /// `bga_filter` on each VAP.
+    BgaFilter,
+    /// Wireless meshing (`mesh.*`).
+    Mesh,
+    /// hostapd brings up every VAP, so netconf leaves them down.
+    HostapdVaps,
+    /// The packet `mark` section.
+    Marks,
+    /// Private pre-shared keys.
+    Ppsk,
+    /// VAP names after their radio (`wifi0ap1`) instead of `athN`.
+    QcaV2,
+    /// Green AP (radio power saving).
+    GreenAp,
+    /// DFS channels for automatic channel selection (`acsdfs`, `blklst`).
+    AcsDfs,
+    /// Roaming assistant (`btm_disassoc`).
+    RoamingAssistant,
+    /// The AP's name in its beacons.
+    AdvertiseApName,
+    /// Multicast suppression.
+    MulticastSuppression,
+    /// An LED whose colour can be set.
+    LedColor,
+    /// An LED whose brightness can be set.
+    Led,
+}
+
+impl Cap {
+    /// The field and bit number of this capability.
+    const fn at(self) -> (Field, u32) {
+        use Field::*;
+        match self {
+            Cap::Switch => (Fw, 4),
+            Cap::Sha512Passwd => (Fw, 10),
+            Cap::ScheduleBlocks => (Fw, 12),
+            Cap::SnmpV3 => (Fw, 14),
+            Cap::ScheduleInvert => (Fw, 22),
+            Cap::Hotspot2 => (Fw, 23),
+            Cap::EncryptedSyslog => (Fw, 24),
+            Cap::MdnsProxy => (Fw2, 28),
+            Cap::DnsAssistance => (Fw3, 3),
+            Cap::PathMonitor => (Fw3, 6),
+            Cap::MulticastInspect => (Fw3, 7),
+            Cap::BandSteering => (Wifi, 2),
+            Cap::BandSteeringPairs => (Wifi, 3),
+            Cap::AirtimeFairness => (Wifi, 5),
+            Cap::BgaFilter => (Wifi, 6),
+            Cap::Mesh => (Wifi, 11),
+            Cap::HostapdVaps => (Wifi, 13),
+            Cap::Marks => (Wifi, 19),
+            Cap::Ppsk => (Wifi, 20),
+            Cap::QcaV2 => (Wifi, 29),
+            Cap::GreenAp => (Wifi2, 2),
+            Cap::AcsDfs => (Wifi2, 4),
+            Cap::RoamingAssistant => (Wifi2, 5),
+            Cap::AdvertiseApName => (Wifi2, 6),
+            Cap::MulticastSuppression => (Wifi2, 22),
+            Cap::LedColor => (Hw, 1),
+            Cap::Led => (Hw, 14),
+        }
+    }
+}
+
+/// Either kind of LED: the `ledbar` section is sent for any.
+pub(crate) const LED: &[Cap] = &[Cap::LedColor, Cap::Led];
 
 pub(crate) fn bit(v: u64, n: u32) -> bool {
     v >> n & 1 == 1
 }
 
-/// A capability bit a feature needs (any one of a list will do).
+/// What an optional feature needs from the AP.
 #[derive(Clone, Copy)]
 enum Need {
-    Fw(u32),
-    Fw2(u32),
-    Fw3(u32),
-    Wifi(u32),
-    Wifi2(u32),
-    Hw(u32),
+    /// Any one of these capabilities.
+    Any(&'static [Cap]),
     /// Every radio supports WPA3 fast roaming (`radio_caps2`).
     RadiosFt,
+    /// Nothing: the render sends it to every AP.
+    Nothing,
 }
 
-impl Need {
-    fn met(self, caps: &Caps, radios_ft: bool) -> bool {
-        match self {
-            Need::Fw(b) => bit(caps.fw, b),
-            Need::Fw2(b) => bit(caps.fw2, b),
-            Need::Fw3(b) => bit(caps.fw3, b),
-            Need::Wifi(b) => bit(caps.wifi, b),
-            Need::Wifi2(b) => bit(caps.wifi2, b),
-            Need::Hw(b) => bit(caps.hw, b),
-            Need::RadiosFt => radios_ft,
-        }
-    }
-}
-
-type FeatureTable<const N: usize> = [(&'static str, &'static [Need]); N];
+type FeatureTable<const N: usize> = [(&'static str, Need); N];
 
 const fn feature_names<const N: usize>(table: FeatureTable<N>) -> [&'static str; N] {
     let mut out = [""; N];
@@ -237,14 +333,31 @@ const fn feature_names<const N: usize>(table: FeatureTable<N>) -> [&'static str;
     out
 }
 
-/// Optional SSID features with the capability bits `render` checks for each.
+/// Which features of a table the AP supports, or `None` while that is unknown: the AP
+/// has not sent an inform and the settings hold no capability bits for it.
+fn feature_support<const N: usize>(table: &FeatureTable<N>, device: &Value, inform: Option<&Value>) -> Option<Vec<(&'static str, bool)>> {
+    let caps = Caps::read(inform, device);
+    if !caps.is_known() {
+        return None;
+    }
+    let radios = json::arr(device, "radio_table");
+    let ft = !radios.is_empty() && radios.iter().all(|r| bit(json::int_of(r, "radio_caps2").unwrap_or(0) as u64, wlan::RCAP2_SAE_FT));
+    let met = |need| match need {
+        Need::Any(caps_needed) => caps.any(caps_needed),
+        Need::RadiosFt => ft,
+        Need::Nothing => true,
+    };
+    Some(table.iter().map(|&(f, need)| (f, met(need))).collect())
+}
+
+/// Optional SSID features with what `render` checks for each.
 const SSID_FEATURE_CAPS: FeatureTable<6> = [
-    ("dns_assistance", &[Need::Fw3(3)]),
-    ("advertise_ap_name", &[Need::Wifi2(6)]),
-    ("roaming_assistant", &[Need::Wifi2(5)]),
-    ("multicast_suppression", &[Need::Wifi2(22)]),
-    ("wpa3_fast_roaming", &[Need::RadiosFt]),
-    ("mdns_proxy", &[Need::Fw2(28)]),
+    ("dns_assistance", Need::Any(&[Cap::DnsAssistance])),
+    ("advertise_ap_name", Need::Any(&[Cap::AdvertiseApName])),
+    ("roaming_assistant", Need::Any(&[Cap::RoamingAssistant])),
+    ("multicast_suppression", Need::Any(&[Cap::MulticastSuppression])),
+    ("wpa3_fast_roaming", Need::RadiosFt),
+    ("mdns_proxy", Need::Any(&[Cap::MdnsProxy])),
 ];
 
 /// Optional SSID features that depend on what the AP supports, with the
@@ -256,13 +369,29 @@ pub const SSID_FEATURES: &[&str] = &feature_names(SSID_FEATURE_CAPS);
 /// `None` while that is unknown: the AP has not sent an inform and the
 /// settings hold no capability bits for it.
 pub fn ssid_feature_support(device: &Value, inform: Option<&Value>) -> Option<Vec<(&'static str, bool)>> {
-    let caps = Caps::read(inform, device);
-    if !caps.is_known() {
-        return None;
-    }
-    let radios = json::arr(device, "radio_table");
-    let ft = !radios.is_empty() && radios.iter().all(|r| bit(json::int_of(r, "radio_caps2").unwrap_or(0) as u64, wlan::RCAP2_SAE_FT));
-    Some(SSID_FEATURE_CAPS.iter().map(|&(f, needs)| (f, needs.iter().any(|n| n.met(&caps, ft)))).collect())
+    feature_support(&SSID_FEATURE_CAPS, device, inform)
+}
+
+const DEVICE_FEATURE_CAPS: FeatureTable<7> = [
+    ("band_steering", Need::Any(&[Cap::BandSteering])),
+    ("airtime_fairness", Need::Any(&[Cap::AirtimeFairness])),
+    ("green_ap", Need::Any(&[Cap::GreenAp])),
+    ("led", Need::Any(LED)),
+    ("led_color", Need::Any(&[Cap::LedColor])),
+    ("jumbo_frames", Need::Any(&[Cap::Switch])),
+    // SNMP v1/v2c, and with it the AP's location and contact, is sent to every AP,
+    // as the official controller does; only v3 needs a capability.
+    ("snmp", Need::Nothing),
+];
+
+/// AP-wide features that depend on the AP's capability bits, as `render`
+/// checks them: without the bit the setting is not sent at all.
+pub const DEVICE_FEATURES: &[&str] = &feature_names(DEVICE_FEATURE_CAPS);
+
+/// Which of [`DEVICE_FEATURES`] the AP supports, or `None` while unknown (see
+/// [`ssid_feature_support`]).
+pub fn device_feature_support(device: &Value, inform: Option<&Value>) -> Option<Vec<(&'static str, bool)>> {
+    feature_support(&DEVICE_FEATURE_CAPS, device, inform)
 }
 
 /// Everything one render needs, resolved once.
@@ -359,30 +488,6 @@ impl<'a> Ctx<'a> {
     }
 }
 
-const DEVICE_FEATURE_CAPS: FeatureTable<7> = [
-    ("band_steering", &[Need::Wifi(2)]),
-    ("airtime_fairness", &[Need::Wifi(5)]),
-    ("green_ap", &[Need::Wifi2(2)]),
-    ("led", &[Need::Hw(1), Need::Hw(14)]),
-    ("led_color", &[Need::Hw(1)]),
-    ("jumbo_frames", &[Need::Fw(4)]),
-    ("snmp", &[Need::Fw(13), Need::Fw(14)]),
-];
-
-/// AP-wide features that depend on the AP's capability bits, as `render`
-/// checks them: without the bit the setting is not sent at all.
-pub const DEVICE_FEATURES: &[&str] = &feature_names(DEVICE_FEATURE_CAPS);
-
-/// Which of [`DEVICE_FEATURES`] the AP supports, or `None` while unknown (see
-/// [`ssid_feature_support`]).
-pub fn device_feature_support(device: &Value, inform: Option<&Value>) -> Option<Vec<(&'static str, bool)>> {
-    let caps = Caps::read(inform, device);
-    if !caps.is_known() {
-        return None;
-    }
-    Some(DEVICE_FEATURE_CAPS.iter().map(|&(f, needs)| (f, needs.iter().any(|n| n.met(&caps, false)))).collect())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -405,7 +510,8 @@ mod tests {
         for partial in [json!({ "hw_caps": 2 }), json!({ "fw3_caps": 8 })] {
             assert!(ssid_feature_support(&device, Some(&partial)).is_some() && device_feature_support(&device, Some(&partial)).is_some(), "{partial}");
         }
-        assert_eq!(device_feature_support(&json!({ "wifi_caps2": 4 }), None).unwrap().iter().filter(|(_, ok)| *ok).map(|(f, _)| *f).collect::<Vec<_>>(), ["green_ap"]);
+        // SNMP needs no capability bit: every AP whose bits are known supports it.
+        assert_eq!(device_feature_support(&json!({ "wifi_caps2": 4 }), None).unwrap().iter().filter(|(_, ok)| *ok).map(|(f, _)| *f).collect::<Vec<_>>(), ["green_ap", "snmp"]);
     }
 
     /// Every device field the sources read (an accessor on `ctx.device` or `device`

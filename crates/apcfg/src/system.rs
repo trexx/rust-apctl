@@ -12,11 +12,11 @@ use crate::json::{Text, arr, flag, int_of, mac_eq, on_off, override_of, str_list
 use crate::meta::Meta;
 use crate::net::{self, Net};
 use crate::wlan::{self, Band, Radio, Vap, network_vlan, wlan_id};
-use crate::{Ctx, bit, mgmt, tz};
+use crate::{Cap, Ctx, LED, mgmt, tz};
 
 pub fn render(ctx: &Ctx) -> Result<(String, Value)> {
     let caps = ctx.caps;
-    let qca_v2 = bit(caps.wifi, 29);
+    let qca_v2 = caps.has(Cap::QcaV2);
     let mut meta = Meta::load(ctx, i64::from(qca_v2));
     let radios = wlan::radios(ctx);
     let wanted = wlan::deploy(ctx, &radios);
@@ -31,7 +31,7 @@ pub fn render(ctx: &Ctx) -> Result<(String, Value)> {
     unifi(&mut c, ctx);
     system(&mut c, ctx);
     users(&mut c, ctx)?;
-    if bit(caps.hw, 1) || bit(caps.hw, 14) {
+    if caps.any(LED) {
         ledbar(&mut c, ctx);
     }
     wireless(&mut c, ctx, &radios, &vaps, &net);
@@ -40,7 +40,7 @@ pub fn render(ctx: &Ctx) -> Result<(String, Value)> {
     c.set("connectivity.status", "disabled");
     net::render_vlan(&mut c, &net);
     net::render_bridge(&mut c, &net, &mut meta);
-    if bit(caps.wifi, 19) {
+    if caps.has(Cap::Marks) {
         c.header("mark");
         for (i, (name, bits, shift, location)) in
             [("guest", 2, 30, "skb"), ("vapid", 5, 11, "ubnt"), ("associd", 11, 0, "ubnt")].iter().enumerate()
@@ -69,10 +69,10 @@ pub fn render(ctx: &Ctx) -> Result<(String, Value)> {
     snmp(&mut c, ctx);
     ntp(&mut c, ctx);
     switch(&mut c, ctx);
-    if bit(caps.fw2, 28) {
+    if caps.has(Cap::MdnsProxy) {
         mdns(&mut c, ctx, &vaps, &net);
     }
-    if bit(caps.fw3, 6) {
+    if caps.has(Cap::PathMonitor) {
         c.header("pathmon");
         c.set("pathmon.status", "enabled");
         c.set("pathmon.interval", 5);
@@ -132,7 +132,7 @@ fn users(c: &mut Cfg, ctx: &Ctx) -> Result<()> {
     let mgmt = ctx.mgmt;
     // The crypt(3) hash is random-salted, so it is an input: the controller stores it
     // next to the password (as the official one caches it in the same field).
-    let field = if bit(ctx.caps.fw, 10) { "x_ssh_sha512passwd" } else { "x_ssh_md5passwd" };
+    let field = if ctx.caps.has(Cap::Sha512Passwd) { "x_ssh_sha512passwd" } else { "x_ssh_md5passwd" };
     let Some(hash) = str_of(mgmt, field) else {
         bail!("setting[mgmt].{field} is missing: store a crypt(3) hash of the SSH password there");
     };
@@ -156,7 +156,7 @@ fn ledbar(c: &mut Cfg, ctx: &Ctx) {
         let pct = int_of(ctx.device, "led_override_color_brightness").unwrap_or(100).clamp(0, 100);
         c.set("ledbar.brightness", 255 * pct / 100);
         c.set("ledbar.active", 3);
-        if bit(ctx.caps.hw, 1) {
+        if ctx.caps.has(Cap::LedColor) {
             let hex = str_of(ctx.device, "led_override_color").unwrap_or("#0000FF").trim_start_matches('#');
             let rgb = u32::from_str_radix(hex, 16).unwrap_or(0xff);
             c.set("ledbar.color.1.color", 3);
@@ -188,7 +188,7 @@ fn wireless(c: &mut Cfg, ctx: &Ctx, radios: &[Radio], vaps: &[Vap], net: &Net) {
     }
     let conn = ctx.setting("connectivity");
     c.header("mesh");
-    if bit(caps.wifi, 11) {
+    if caps.has(Cap::Mesh) {
         c.set("mesh.status", "enabled");
         c.set("mesh.version", 3);
         c.opt("mesh.essid", str_of(conn, "x_mesh_essid"));
@@ -198,10 +198,10 @@ fn wireless(c: &mut Cfg, ctx: &Ctx, radios: &[Radio], vaps: &[Vap], net: &Net) {
     } else {
         c.set("mesh.status", "disabled");
     }
-    if bit(caps.wifi, 2) {
+    if caps.has(Cap::BandSteering) {
         bandsteering(c, ctx, radios, vaps);
     }
-    if bit(caps.wifi, 5) {
+    if caps.has(Cap::AirtimeFairness) {
         c.header("airtime fairness");
         c.set("atf.status", "enabled");
         c.set("atf.mode", on_off(flag(ctx.device, "atf_enabled", false)));
@@ -224,7 +224,7 @@ fn bandsteering(c: &mut Cfg, ctx: &Ctx, radios: &[Radio], vaps: &[Vap]) {
     }
     c.set("bandsteering.status", "enabled");
     c.set("bandsteering.mode", mode);
-    if !bit(ctx.caps.wifi, 3) {
+    if !ctx.caps.has(Cap::BandSteeringPairs) {
         return;
     }
     let mut k = 0;
@@ -345,7 +345,7 @@ fn syslog(c: &mut Cfg, ctx: &Ctx) {
     let enabled = flag(s, "enabled", false);
     let this = flag(s, "this_controller", false);
     let encrypted_only = flag(s, "this_controller_encrypted_only", false);
-    if enabled && this && encrypted_only && !bit(ctx.caps.fw, 24) {
+    if enabled && this && encrypted_only && !ctx.caps.has(Cap::EncryptedSyslog) {
         return;
     }
     let wants_ap_logs = flag(s, "log_all_contents", false) || str_list(s, "contents").contains(&"access_points");
@@ -406,12 +406,12 @@ fn sshd(c: &mut Cfg, ctx: &Ctx) {
     }
 }
 
-/// `snmp.*`, no section header, nothing at all while SNMP is off. v3 needs
-/// firmware capability bit 14; the community is cut to 256 characters.
+/// `snmp.*`, no section header, nothing at all while SNMP is off. v1/v2c goes
+/// to every AP, v3 only to one with [`Cap::SnmpV3`]; the community is cut to 256 characters.
 fn snmp(c: &mut Cfg, ctx: &Ctx) {
     let s = ctx.setting("snmp");
     let v1 = flag(s, "enabled", false);
-    let v3 = flag(s, "enabledV3", false) && bit(ctx.caps.fw, 14);
+    let v3 = flag(s, "enabledV3", false) && ctx.caps.has(Cap::SnmpV3);
     if !v1 && !v3 {
         return;
     }
@@ -455,7 +455,7 @@ const MAX_PORTS: i64 = 52;
 
 fn switch(c: &mut Cfg, ctx: &Ctx) {
     c.header("switch");
-    if !bit(ctx.caps.fw, 4) {
+    if !ctx.caps.has(Cap::Switch) {
         return;
     }
     c.set("switch.status", "disabled");
