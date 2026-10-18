@@ -234,9 +234,11 @@ fn has_blocker(radio: &Value) -> bool {
     radio["radio_caps"].as_i64().is_some_and(|c| c & INTERFERENCE_BLOCKER != 0)
 }
 
-/// The APs an SSID is broadcast from: `None` for all of them.
+/// The APs an SSID is broadcast from: `None` for all of them (its groups hold
+/// the site's default one). One with no groups is broadcast from none, as the
+/// AP config has it.
 fn wlan_aps(state: &Value, w: &Value) -> Option<Vec<String>> {
-    let groups: Vec<&str> = w["ap_group_ids"].as_array()?.iter().filter_map(Value::as_str).collect();
+    let groups: Vec<&str> = w["ap_group_ids"].as_array().into_iter().flatten().filter_map(Value::as_str).collect();
     let mut macs = Vec::new();
     for g in docs(state, "apgroup").filter(|g| oid(g).is_some_and(|id| groups.contains(&id))) {
         if g["attr_hidden_id"].as_str() == Some("default") {
@@ -671,11 +673,7 @@ fn prune_groups(state: &mut Value) {
 
 /// The APs (`aa:bb:..`) an SSID is deployed to.
 fn deployed_to(state: &Value, w: &Value) -> Vec<String> {
-    match wlan_aps(state, w) {
-        None if w["ap_group_ids"].as_array().is_some_and(|a| !a.is_empty()) => device_macs(state),
-        None => Vec::new(),
-        Some(macs) => macs,
-    }
+    wlan_aps(state, w).unwrap_or_else(|| device_macs(state))
 }
 
 /// mDNS proxy rules: where each applies (all APs, specific ones, AP groups),
@@ -1911,6 +1909,7 @@ mod tests {
         let g = s["apgroup"].as_array().unwrap().iter().find(|g| oid(g) == Some(gid.as_str())).unwrap();
         assert_eq!((g["for_wlanconf"].as_bool(), g["device_macs"][0].as_str()), (Some(true), Some(AP2)));
         assert_eq!(wlan_aps(&s, &s["wlanconf"][0]), Some(vec![AP2.to_string()]));
+        assert_eq!(wlan_aps(&s, &json!({ "name": "no groups" })), Some(vec![]), "broadcast from no AP, as the AP config has it");
         // The same group is reused, then removed when the SSID goes back to all APs.
         edit(&mut s, json!({ "aps": [AP1, AP2] })).unwrap();
         assert_eq!(s["wlanconf"][0]["ap_group_ids"][0].as_str(), Some(gid.as_str()));
