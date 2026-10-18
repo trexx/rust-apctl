@@ -700,10 +700,7 @@ fn check_mdns_rules(state: &Value, v: &Value) -> Result<Vec<Value>, String> {
         rule["networkconf_ids"] = json!(nets);
         match scope {
             "specific" => {
-                let mut macs: Vec<String> = Vec::new();
-                for m in ids("ap_macs") {
-                    macs.push(m.parse::<inform::Mac>().map_err(|_| format!("mDNS rule {n}: {m} is not a MAC address"))?.to_string());
-                }
+                let macs = mac_list_value(&r["ap_macs"], &format!("mDNS rule {n}: ap_macs"))?.unwrap_or_default();
                 if macs.is_empty() || macs.iter().any(|m| !aps.contains(m)) {
                     return Err(format!("mDNS rule {n}: choose the APs it applies on"));
                 }
@@ -1864,11 +1861,11 @@ mod tests {
     fn mdns_rules_are_checked() {
         let mut s = state();
         assert!(edit(&mut s, json!({ "mdns_proxy_mode": "custom" })).unwrap_err().contains("at least one rule"));
-        let rule = json!({ "ap_scope_mode": "specific", "ap_macs": [AP2.to_uppercase()], "services_mode": "specific",
+        let rule = json!({ "ap_scope_mode": "specific", "ap_macs": [AP2.to_uppercase(), format!(" {AP2}")], "services_mode": "specific",
             "predefined_services": [{ "code": "apple_airPlay" }, { "code": "apple_airPlay" }], "custom_services": [{ "address": "_myapp._tcp.local" }] });
         edit(&mut s, json!({ "mdns_proxy_mode": "custom", "mdns_proxy_custom": [rule] })).unwrap();
         let r = &s["wlanconf"][0]["mdns_proxy_custom"][0];
-        assert_eq!((r["ap_macs"][0].as_str(), r["predefined_services"].as_array().unwrap().len()), (Some(AP2), 1));
+        assert_eq!((&r["ap_macs"], r["predefined_services"].as_array().unwrap().len()), (&json!([AP2]), 1), "MACs trimmed, written alike and once");
         assert_eq!(r["custom_services"][0]["name"], "_myapp._tcp.local");
         let bad = |r: Value| edit(&mut state(), json!({ "mdns_proxy_mode": "custom", "mdns_proxy_custom": [r] })).is_err();
         assert!(bad(json!({ "services_mode": "specific", "predefined_services": [{ "code": "telnet" }] })));
