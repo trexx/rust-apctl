@@ -724,7 +724,8 @@ const spanParams = (s: TimeSpan) => (isFixed(s) ? { from: s.from, to: s.to } : {
 
 const spanLength = (s: TimeSpan) => (isFixed(s) ? s.to - s.from : s.last);
 
-/** Live ranges refresh; fixed windows in the past don't change. */
+/** Live ranges refresh; fixed windows in the past don't change. Pass it as `refetchInterval: () => refreshFor(…)`, so it is asked again after
+ *  each fetch: a fixed window ending at about now stops refreshing once it is ten minutes past. */
 const refreshFor = (s: TimeSpan, live: number) => (isFixed(s) && s.to < Date.now() / 1000 - 600 ? false : live);
 
 /** A query over a time span: refreshes while the span is live, and keeps the old data on screen while a new span loads. */
@@ -732,7 +733,7 @@ function useSpanQuery<T>(key: QueryKey, path: string, span: TimeSpan, extra: Rec
   return useQuery({
     queryKey: key,
     queryFn: getting<T>(`${path}${qs({ ...spanParams(span), ...extra })}`),
-    refetchInterval: refreshFor(span, 60_000),
+    refetchInterval: () => refreshFor(span, 60_000),
     placeholderData: keepPreviousData,
   });
 }
@@ -1076,7 +1077,7 @@ export function useSeries(table: string, key: string, span: TimeSpan) {
       }
       return get<Series>(url(from), signal);
     },
-    refetchInterval: refreshFor(span, spanLength(span) <= 6 * 3600 ? 15_000 : 300_000),
+    refetchInterval: () => refreshFor(span, spanLength(span) <= 6 * 3600 ? 15_000 : 300_000),
     placeholderData: keepPreviousData,
   });
 }
