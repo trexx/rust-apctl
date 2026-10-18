@@ -536,7 +536,8 @@ export interface SiteActivity {
     rx_pps: number[];
     tx_dropped_pct: (number | null)[];
   };
-  airtime: { ts: number[]; total: number[]; external_interference: number[]; own_traffic: number[]; own_rx: number[]; own_tx: number[] };
+  /** Null in a bucket where no radio reported the figure. */
+  airtime: { ts: number[]; total: (number | null)[]; external_interference: (number | null)[]; own_traffic: (number | null)[]; own_rx: (number | null)[]; own_tx: (number | null)[] };
 }
 
 export interface TopEntry {

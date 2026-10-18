@@ -405,27 +405,33 @@ pub async fn activity(State(s): State<AppState>, Query(q): Query<RangeQuery>) ->
             clients.push(cl);
         }
 
-        // Airtime from the radios: averages across radios per bucket.
-        let spec = Spec { table: "radio_stats", key: "mac || '/' || radio", extra: &["radio"], cols: &["cu_total", "cu_interf", "cu_self_rx", "cu_self_tx"], only: ap.as_deref().map(|a| Only::Is("mac", a)) };
-        let radios = load(c, spec, tier, from, to)?;
-        let mut air: BTreeMap<Ts, Vec<[f64; 4]>> = BTreeMap::new();
-        for (ex, samples) in radios.values() {
-            if !band_ok(&band, &ex[0]) {
-                continue;
-            }
-            for (t, v) in samples.since(from) {
-                let b = t - t % bucket;
-                let g = |i: usize| v[i].unwrap_or(0.0);
-                air.entry(b).or_default().push([g(0), g(1), g(2), g(3)]);
-            }
+        // Airtime from the radios: per bucket, each figure averaged by SQLite over the
+        // radios' samples that have it (a bucket where none has it is null, not 0).
+        let mut params = vec![Sql::Integer(from), Sql::Integer(to), Sql::Integer(bucket)];
+        let mut only = String::new();
+        if let Some(b) = band.as_deref().filter(|b| *b != "all") {
+            params.push(Sql::Text(b.into()));
+            only.push_str(&format!(" AND radio = ?{}", params.len()));
         }
-        let air_ts: Vec<Ts> = air.keys().copied().collect();
-        let avg = |i: usize| -> Vec<f64> { air.values().map(|v| v.iter().map(|x| x[i]).sum::<f64>() / v.len().max(1) as f64).collect() };
-        let total = avg(0);
-        let external = avg(1);
-        let own_rx = avg(2);
-        let own_tx = avg(3);
-        let internal: Vec<f64> = own_rx.iter().zip(&own_tx).map(|(a, b)| a + b).collect();
+        if let Some(a) = &ap {
+            params.push(Sql::Text(a.clone()));
+            only.push_str(&format!(" AND mac = ?{}", params.len()));
+        }
+        let sql = format!(
+            "SELECT ts - ts % ?3 AS b, AVG(cu_total), AVG(cu_interf), AVG(cu_self_rx), AVG(cu_self_tx) FROM radio_stats{} WHERE ts >= ?1 AND ts <= ?2{only} GROUP BY b ORDER BY b",
+            TIERS[tier].0
+        );
+        let mut stmt = c.prepare_cached(&sql)?;
+        let (mut air_ts, mut total, mut external, mut own_rx, mut own_tx) = (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        let mut rows = stmt.query(params_from_iter(params))?;
+        while let Some(r) = rows.next()? {
+            air_ts.push(r.get::<_, Ts>(0)?);
+            total.push(r.get::<_, Option<f64>>(1)?);
+            external.push(r.get::<_, Option<f64>>(2)?);
+            own_rx.push(r.get::<_, Option<f64>>(3)?);
+            own_tx.push(r.get::<_, Option<f64>>(4)?);
+        }
+        let internal: Vec<Option<f64>> = own_rx.iter().zip(&own_tx).map(|(a, b)| a.zip(*b).map(|(a, b)| a + b)).collect();
         Ok(json!({
             "bucket": bucket,
             "activity": {
@@ -1865,9 +1871,11 @@ mod tests {
                     pk += rng.next(5000);
                     re += rng.next(500);
                     let (rx, tx) = (rng.next(20), rng.next(20));
+                    // The second AP's 5 GHz radio leaves out its interference now and then.
+                    let interf = |v: i64| if j == 3 && k % 5 == 0 { Sql::Null } else { int(v) };
                     rows.push(vec![
                         text(ap), text(radio), int(base - 40 + k * 300 + j as i64 * 7), int(if radio == "ng" { 6 } else { 44 }), int(if radio == "ng" { 20 } else { 80 }),
-                        int(rx + tx + rng.next(40)), int(rx), int(tx), int(rng.next(30)), int(rng.next(8)), int(pk), int(re),
+                        int(rx + tx + rng.next(40)), int(rx), int(tx), interf(rng.next(30)), int(rng.next(8)), int(pk), int(re),
                     ]);
                 }
             }
