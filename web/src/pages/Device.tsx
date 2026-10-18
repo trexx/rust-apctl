@@ -32,13 +32,14 @@ import {
 } from "../components/common";
 import {
   ago,
-  band,
+  bandChannel,
   bytes,
   compact,
   duration,
   pct,
   phy,
   rate,
+  uplinkText,
   useNow,
 } from "../format";
 import { MulticastPanel } from "../components/insights/Multicast";
@@ -56,18 +57,6 @@ const DeviceSettingsPanel = lazyNamed(
   "DeviceSettingsPanel",
 );
 
-/** The uplink's state: down, else its speed, else "—" (the AP doesn't say). */
-const uplinkText = (u: {
-  up: boolean | null;
-  speed: number | null;
-  full_duplex: boolean | null;
-}) =>
-  u.up === false
-    ? "down"
-    : u.speed
-      ? `${u.speed} Mbps${u.full_duplex ? " FD" : ""}`
-      : "—";
-
 /** Keyed by MAC: nothing typed or shown for one AP carries over to the next. */
 export function Device() {
   const mac = useParams().mac ?? "";
@@ -81,9 +70,9 @@ function DevicePage({ mac }: { mac: string }) {
   // Read-only users get neither the editor's code nor the AP's settings.
   const canEdit = useCanEdit();
 
-  if (detail.isLoading) return <Loading />;
-  if (detail.error || !detail.data)
-    return <ErrorNote error={detail.error ?? "Unknown device"} />;
+  // What was fetched stays up when a refetch fails.
+  if (!detail.data)
+    return detail.error ? <ErrorNote error={detail.error} /> : <Loading />;
   const { device: d, clients } = detail.data;
   const ap = d.snapshot.ap;
   const up = d.snapshot.uplink;
@@ -227,10 +216,7 @@ function DevicePage({ mac }: { mac: string }) {
                         </Link>
                       </td>
                       <td>{c.sample.essid ?? "—"}</td>
-                      <td>
-                        {band(c.sample.radio)}
-                        {c.sample.channel ? ` ch ${c.sample.channel}` : ""}
-                      </td>
+                      <td>{bandChannel(c.sample.radio, c.sample.channel)}</td>
                       <td>
                         <Signal dbm={c.sample.signal} />
                       </td>

@@ -44,8 +44,8 @@ export function DryRun() {
   const dr = useDryRun();
   const names = useDeviceNames();
   const now = useNow();
-  if (dr.isLoading) return <Loading />;
-  if (dr.error || !dr.data) return <ErrorNote error={dr.error ?? "no data"} />;
+  // What was fetched stays up when a refetch fails.
+  if (!dr.data) return dr.error ? <ErrorNote error={dr.error} /> : <Loading />;
   const d = dr.data;
   // A match whose system_cfg isn't identical differs only in the order of unordered lists.
   const equivalent = (h: DryRunData["history"][number]) =>
@@ -125,8 +125,8 @@ export function DryRun() {
               </tr>
             </thead>
             <tbody>
-              {d.history.map((h, i) => (
-                <tr key={`${h.ts}-${i}`}>
+              {d.history.map((h) => (
+                <tr key={h.id}>
                   <td>{clock(h.ts, now)}</td>
                   <td>{names[h.mac] ?? h.mac}</td>
                   <td className={h.matches ? "ok" : "error"}>

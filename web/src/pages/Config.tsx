@@ -69,10 +69,11 @@ function History() {
       </div>
       <QueryState q={ev}>
         {(events) =>
+          // The previous AP's history is dimmed while this one's loads.
           events.length === 0 ? (
             <div className="muted small">Nothing recorded yet.</div>
           ) : (
-            <div>
+            <div className={ev.isPlaceholderData ? "dim" : undefined}>
               {events.map((e) => {
                 if (e.kind === "config_pushed")
                   return (

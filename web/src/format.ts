@@ -4,6 +4,13 @@ export const BANDS: Record<string, string> = { ng: "2.4 GHz", na: "5 GHz", "6e":
 
 export const band = (radio: string | null | undefined) => (radio ? (BANDS[radio] ?? radio) : "—");
 
+/** "5 GHz ch 36", or the band alone when the channel isn't known. */
+export const bandChannel = (radio: string | null | undefined, channel: number | null | undefined) => `${band(radio)}${channel ? ` ch ${channel}` : ""}`;
+
+/** An uplink's state: down, else its speed, else "—" (the AP doesn't say). */
+export const uplinkText = (u: { up: boolean | null; speed: number | null; full_duplex: boolean | null }) =>
+  u.up === false ? "down" : u.speed ? `${u.speed} Mbps${u.full_duplex ? " FD" : ""}` : "—";
+
 export function duration(seconds: number | null | undefined): string {
   if (seconds === null || seconds === undefined) return "—";
   const s = Math.max(0, Math.floor(seconds));
@@ -102,12 +109,6 @@ function ticker(ms: number): Ticker {
 export function useNow(ms = 60_000): number {
   const t = ticker(ms);
   return useSyncExternalStore(t.subscribe, t.read);
-}
-
-/** Bits per second from bytes per second. */
-export function bitrate(bytesPerSec: number | null | undefined): string {
-  if (bytesPerSec === null || bytesPerSec === undefined) return "—";
-  return rate(bytesPerSec * 8);
 }
 
 /** A rate in bits per second. */

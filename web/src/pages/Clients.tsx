@@ -11,7 +11,7 @@ import {
   Segmented,
   useUrlTab,
 } from "../components/common";
-import { ago, band, duration, phy, useNow } from "../format";
+import { ago, bandChannel, duration, phy, useNow } from "../format";
 
 type SortKey =
   | "name"
@@ -134,8 +134,9 @@ function ClientList({ tabs }: { tabs: React.ReactNode }) {
     })
     .map(([, c]) => c);
 
-  if (clients.isLoading) return <Loading />;
-  if (clients.error) return <ErrorNote error={clients.error} />;
+  // What was fetched stays up when a refetch fails.
+  if (!clients.data)
+    return clients.error ? <ErrorNote error={clients.error} /> : <Loading />;
 
   const th = (key: SortKey, label: string) => (
     <SortHeader
@@ -191,7 +192,9 @@ function ClientList({ tabs }: { tabs: React.ReactNode }) {
           </thead>
           <tbody>
             {rows.map((c) => (
-              <ClientRow key={c.sample.mac} c={c} now={now} />
+              // Only a disconnected row shows how long ago it was seen, so a
+              // connected one needn't re-render as time passes.
+              <ClientRow key={c.sample.mac} c={c} now={c.connected ? 0 : now} />
             ))}
           </tbody>
         </table>
@@ -202,15 +205,15 @@ function ClientList({ tabs }: { tabs: React.ReactNode }) {
 
 /**
  * One client. A refetch keeps an unchanged client's object (React Query's
- * structural sharing), so only the changed rows re-render, and the rest once
- * a minute for their "last seen".
+ * structural sharing), so only the changed rows re-render, and the
+ * disconnected ones once a minute for their "last seen".
  */
 const ClientRow = memo(function ClientRow({
   c,
   now,
 }: {
   c: ClientView;
-  /** What "last seen" counts from (`useNow()`). */
+  /** What "last seen" counts from (`useNow()`); unused while connected. */
   now: number;
 }) {
   return (
@@ -237,10 +240,7 @@ const ClientRow = memo(function ClientRow({
         )}
       </td>
       <td>{c.sample.essid ?? "—"}</td>
-      <td>
-        {band(c.sample.radio)}
-        {c.sample.channel ? ` ch ${c.sample.channel}` : ""}
-      </td>
+      <td>{bandChannel(c.sample.radio, c.sample.channel)}</td>
       <td>{c.connected ? <Signal dbm={c.sample.signal} /> : "—"}</td>
       <td>
         {c.connected

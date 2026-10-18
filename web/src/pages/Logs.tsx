@@ -14,11 +14,16 @@ export function Logs() {
   const device = params.get("device") ?? "";
   const q = params.get("q") ?? "";
   const [text, setText] = useState(q);
+  // The search this page last put in the URL. The router commits it in a
+  // transition, so more may have been typed by the time it lands: then the box
+  // keeps what was typed.
+  const [sent, setSent] = useState<string | null>(null);
   // When the URL's search changes from outside (the Logs link, Back), show it.
   const [shown, setShown] = useState(q);
   if (q !== shown) {
     setShown(q);
-    setText(q);
+    if (q === sent) setSent(null);
+    else setText(q);
   }
   const names = useDeviceNames();
   const logs = useLogs({
@@ -28,9 +33,10 @@ export function Logs() {
   });
 
   // Search as you type, debounced.
-  const search = useEffectEvent((t: string) =>
-    setUrl({ q: t }, { replace: true }),
-  );
+  const search = useEffectEvent((t: string) => {
+    setSent(t);
+    setUrl({ q: t }, { replace: true });
+  });
   useEffect(() => {
     if (text === q) return;
     const t = window.setTimeout(() => search(text), 300);

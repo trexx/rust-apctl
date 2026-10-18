@@ -8,7 +8,6 @@ import {
   useCanEdit,
   useChannelAi,
   useDeviceNames,
-  useDevices,
   useEvents,
 } from "../api";
 import type { ChannelPlanResult } from "../api";
@@ -100,7 +99,6 @@ const HOURS = Array.from({ length: 24 }, (_, h) => h);
 /** Channel AI: the nightly optimisation's settings, Run now, recent runs. */
 export function ChannelAiPanel() {
   const ai = useChannelAi();
-  const devices = useDevices();
   const names = useDeviceNames();
   const canEdit = useCanEdit();
   const runs = useEvents({ kind: "channel_plan", limit: 10 });
@@ -216,21 +214,21 @@ export function ChannelAiPanel() {
         <div className="form-row">
           <div className="form-label">Excluded APs</div>
           <div className="form-control">
-            {(devices.data ?? []).map((ap) => (
-              <label key={ap.mac} className="check">
+            {Object.entries(names).map(([mac, name]) => (
+              <label key={mac} className="check">
                 <input
                   type="checkbox"
-                  checked={s.exclude_devices.includes(ap.mac)}
+                  checked={s.exclude_devices.includes(mac)}
                   disabled={!can}
                   onChange={(e) =>
                     save({
                       exclude_devices: e.target.checked
-                        ? [...s.exclude_devices, ap.mac]
-                        : s.exclude_devices.filter((m) => m !== ap.mac),
+                        ? [...s.exclude_devices, mac]
+                        : s.exclude_devices.filter((m) => m !== mac),
                     })
                   }
                 />
-                {ap.name ?? ap.mac}
+                {name}
               </label>
             ))}
           </div>

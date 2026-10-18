@@ -34,6 +34,8 @@ export interface DeviceSummary {
   radios: RadioSummary[];
   last_config_push: number | null;
   locating?: boolean;
+  /** Known from the database only: hasn't reported since apctl started. */
+  stored_only?: boolean;
 }
 
 export interface ClientSample {
@@ -62,7 +64,8 @@ export interface ClientSample {
   vlan_id: number | null;
   latency_avg: number | null;
   is_11r: boolean | null;
-  multicast: Multicast | null;
+  /** Only on a client's own page (`useClient`), not in the list. */
+  multicast?: Multicast | null;
 }
 
 /** `tx` is what the AP delivered to the client, `rx` what the client sent. */
@@ -102,6 +105,15 @@ export interface ClientView {
   locked_to?: Mac | null;
   /** From the settings: the client's own speed limit (user group). */
   usergroup_id?: string | null;
+}
+
+/** A client in a multicast group, as a client's page lists its peers. */
+export type GroupMember = { mac: Mac; name: string };
+
+/** A client's page: its view, with the multicast tables and the peers in its groups. */
+export interface ClientDetail extends ClientView {
+  /** For each group it joined, the other connected clients that joined it too (groups without any are left out). */
+  peers: Record<string, GroupMember[]>;
 }
 
 /** The name to show for a client: the user's alias, else its hostname, else its MAC. */
@@ -351,8 +363,11 @@ export class HttpError extends Error {
   }
 }
 
+/** Tells the app shell the session is gone: it checks /api/me, and shows the login page. */
+const announceUnauthorized = () => window.dispatchEvent(new Event("apctl:unauthorized"));
+
 function unauthorized(): never {
-  window.dispatchEvent(new Event("apctl:unauthorized"));
+  announceUnauthorized();
   throw new AuthError("login required");
 }
 
@@ -425,7 +440,6 @@ export const keys = {
   device: family<[mac: Mac]>("device"),
   clients: family("clients"),
   clientNames: family("client-names"),
-  multicastPeers: family("multicast-peers"),
   client: family<[mac: Mac]>("client"),
   series: family<[table: string, key: string, span: TimeSpan]>("series"),
   events: family<[filter: EventFilter]>("events"),
@@ -517,7 +531,7 @@ export interface DryRun {
     /** The AP runs a different config version than when the settings were imported. */
     settings_stale?: boolean;
   }[];
-  history: { ts: number; mac: Mac; cfgversion: string | null; matches: boolean; comparison: { system_cfg?: FieldComparison; error?: string } | null }[];
+  history: { id: number; ts: number; mac: Mac; cfgversion: string | null; matches: boolean; comparison: { system_cfg?: FieldComparison; error?: string } | null }[];
 }
 
 /** Refreshed by the live socket when a comparison is recorded or settings are imported. */
@@ -967,17 +981,14 @@ export const resumeFirmware = () => send<{ resumed: boolean }>("POST", "/api/fir
 
 export const useMulticast = (span: TimeSpan, mac?: Mac) => useSpanQuery<SiteMulticast>(keys.multicast(span, mac), "/api/site/multicast", span, { mac });
 
-/** GETs `path` every minute; the previous data stays up while another key's loads. */
-const usePolled = <T>(queryKey: QueryKey, path: string) =>
-  useQuery({ queryKey, queryFn: getting<T>(path), refetchInterval: 60_000, placeholderData: keepPreviousData });
-
-export const useRadios = (range: number) => usePolled<RadioOverview[]>(keys.rfRadios(range), `/api/rf/radios${qs({ range })}`);
+// The RF views cover the last `range` seconds.
+export const useRadios = (range: number) => useSpanQuery<RadioOverview[]>(keys.rfRadios(range), "/api/rf/radios", { last: range });
 
 export const useNeighbors = (range: number, band: string) =>
-  usePolled<{ neighbors: Neighbor[] }>(keys.rfNeighbors(range, band), `/api/rf/neighbors${qs({ range, band: bandParam(band), neighbors_only: "true" })}`);
+  useSpanQuery<{ neighbors: Neighbor[] }>(keys.rfNeighbors(range, band), "/api/rf/neighbors", { last: range }, { band: bandParam(band), neighbors_only: "true" });
 
 /** Only how loudly our APs hear each other (no neighbour list). */
-export const useOwnLinks = (range: number) => usePolled<{ own_links: OwnLink[] }>(keys.rfLinks(range), `/api/rf/neighbors${qs({ range, links_only: "true" })}`);
+export const useOwnLinks = (range: number) => useSpanQuery<{ own_links: OwnLink[] }>(keys.rfLinks(range), "/api/rf/neighbors", { last: range }, { links_only: "true" });
 
 export const useChannelPlan = (band: string, dfs: boolean) =>
   useQuery({
@@ -989,39 +1000,16 @@ export const useChannelPlan = (band: string, dfs: boolean) =>
 export const useStatus = (poll = false) =>
   useQuery({ queryKey: keys.status(), queryFn: getting<Status>("/api/status"), refetchInterval: poll ? 15_000 : false });
 
+const fetchDevices = getting<DeviceSummary[]>("/api/devices");
+
 /** Every AP with its latest report, refreshed by the live socket as they report: for the overview's cards. */
-export const useDevices = () => useQuery({ queryKey: keys.devices(), queryFn: getting<DeviceSummary[]>("/api/devices") });
+export const useDevices = () => useQuery({ queryKey: keys.devices(), queryFn: fetchDevices });
 
 export const useDevice = (mac: Mac) =>
   useQuery({ queryKey: keys.device(mac), queryFn: getting<DeviceDetail>(`/api/devices/${mac}`) });
 
 /** Every client of the past year, with its latest sample: for the client list. */
 export const useClients = () => useQuery({ queryKey: keys.clients(), queryFn: getting<ClientView[]>("/api/clients") });
-
-/** A client in a multicast group, as a client's page lists its peers. */
-export type GroupMember = { mac: Mac; name: string };
-
-/** The connected clients in each multicast group, by group. */
-function groupMembers(clients: ClientView[]): Record<string, GroupMember[]> {
-  const by: Record<string, GroupMember[]> = {};
-  for (const c of clients) {
-    if (!c.connected) continue;
-    for (const g of c.sample.multicast?.memberships ?? []) (by[g] ??= []).push({ mac: c.sample.mac, name: displayName(c) });
-  }
-  return by;
-}
-
-/**
- * The connected clients in each multicast group, for a client's page (only fetched when `enabled`). It takes
- * the whole client list, so it is polled every minute rather than refreshed by the live socket.
- */
-export const useMulticastPeers = (enabled: boolean) =>
-  useQuery({
-    queryKey: keys.multicastPeers(),
-    queryFn: async ({ signal }) => groupMembers(await get<ClientView[]>("/api/clients", signal)),
-    refetchInterval: 60_000,
-    enabled,
-  });
 
 /** Names by MAC, for links. */
 export type Names = Readonly<Record<Mac, string>>;
@@ -1034,12 +1022,18 @@ const deviceNames = (devices: DeviceSummary[]): Names => Object.fromEntries(devi
  * from `useDevices`, which refetches as the APs report: the live socket refreshes the names when an AP is
  * adopted, forgotten or renamed (its new name comes with the config), and the slow poll catches the rest.
  */
-export const useDeviceNames = (): Names =>
-  useQuery({
-    queryKey: keys.deviceNames(),
-    queryFn: async ({ signal }) => deviceNames(await get<DeviceSummary[]>("/api/devices", signal)),
-    refetchInterval: 300_000,
-  }).data ?? NO_NAMES;
+export function useDeviceNames(): Names {
+  const qc = useQueryClient();
+  return (
+    useQuery({
+      queryKey: keys.deviceNames(),
+      // Through the devices query, so that a page showing both (the overview, at mount) makes one request; always
+      // a new one, unless that query's is under way, since a name may have changed since it was cached.
+      queryFn: async () => deviceNames(await qc.fetchQuery({ queryKey: keys.devices(), queryFn: fetchDevices, staleTime: 0 })),
+      refetchInterval: 300_000,
+    }).data ?? NO_NAMES
+  );
+}
 
 /**
  * Client display names by MAC, for the clients that have one; the same object until a name changes.
@@ -1049,9 +1043,9 @@ export const useDeviceNames = (): Names =>
 export const useClientNames = (): Names =>
   useQuery({ queryKey: keys.clientNames(), queryFn: getting<Names>("/api/clients/names"), refetchInterval: 300_000 }).data ?? NO_NAMES;
 
-/** One client; a 404 (HttpError) means it hasn't been seen since apctl started. */
+/** One client, with the peers in its multicast groups; a 404 (HttpError) means it hasn't been seen since apctl started. */
 export const useClient = (mac: Mac) =>
-  useQuery({ queryKey: keys.client(mac), queryFn: getting<ClientView>(`/api/clients/${mac}`) });
+  useQuery({ queryKey: keys.client(mac), queryFn: getting<ClientDetail>(`/api/clients/${mac}`) });
 
 /** `prev` with the samples of `add` (all newer) appended, and those before `from` dropped. */
 function appendSeries(prev: Series, add: Series, from: number): Series {
@@ -1288,6 +1282,8 @@ export function useLiveUpdates(): void {
             invalidate(keys.dryrun());
             invalidate(keys.settingsState());
           }
+          // An editor keeps what it was opened with (it saves only the fields changed in it); the rest follows.
+          if (msg.kind === "settings_changed" || msg.kind === "settings_imported") invalidate(keys.settings());
           if (ADOPTION_EVENTS.has(msg.kind)) invalidate(keys.adoption());
           if (NAME_EVENTS.has(msg.kind)) invalidate(keys.deviceNames(), 5000);
           if (msg.kind.startsWith("ap_upgrade")) invalidate(keys.firmware());
@@ -1331,8 +1327,10 @@ export function useLiveUpdates(): void {
         if (dropped) refetchAll();
       };
       socket.onmessage = onMessage;
-      socket.onclose = () => {
+      socket.onclose = (e) => {
         if (closed) return;
+        // 1008 (policy): the server closed it because the session ended (logged out or expired).
+        if (e.code === 1008) announceUnauthorized();
         dropped = true;
         reconnectTimer = window.setTimeout(connect, retry);
         retry = Math.min(retry * 2, 30_000);
