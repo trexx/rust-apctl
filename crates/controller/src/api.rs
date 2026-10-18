@@ -345,7 +345,7 @@ async fn status(State(s): State<AppState>) -> ApiResult {
     // The overview's client counters, so that it needs no client list: the
     // connected clients by radio, and how many of them have a weak signal.
     let (mut connected, mut weak, mut by_band) = (0, 0, std::collections::BTreeMap::<&str, usize>::new());
-    for c in live.clients.values().filter(|c| c.connected) {
+    for (_, c) in live.connected_clients() {
         connected += 1;
         weak += usize::from(c.sample.signal.is_some_and(|s| s < WEAK_SIGNAL));
         if let Some(radio) = c.sample.radio.as_deref() {
@@ -471,7 +471,7 @@ async fn devices(State(s): State<AppState>) -> Json<Vec<DeviceRow>> {
         let live = s.live.read().unwrap();
         // Connected clients per AP, counted in one pass.
         let mut per_ap: std::collections::HashMap<Mac, usize> = std::collections::HashMap::new();
-        for c in live.clients.values().filter(|c| c.connected) {
+        for (_, c) in live.connected_clients() {
             *per_ap.entry(c.sample.ap_mac).or_default() += 1;
         }
         let mut list: Vec<DeviceRow> =
@@ -520,7 +520,7 @@ async fn device(State(s): State<AppState>, MacPath(mac): MacPath) -> Result<Resp
         let live = s.live.read().unwrap();
         match (live.devices.get(&mac), live.known_devices.get(&mac)) {
             (Some(d), _) => {
-                let clients: Vec<_> = live.clients.values().filter(|c| c.connected && c.sample.ap_mac == mac).cloned().collect();
+                let clients: Vec<_> = live.connected_clients().map(|(_, c)| c).filter(|c| c.sample.ap_mac == mac).cloned().collect();
                 (page_view(d), clients, live.locating.contains(&mac), false)
             }
             // Known but not reporting since apctl started: offline, with what was stored.
@@ -656,14 +656,14 @@ struct Peer {
     name: String,
 }
 
-/// The other connected clients in each of `groups`, sorted by name: a scan of the live clients,
+/// The other connected clients in each of `groups`, sorted by name: a scan of the connected clients,
 /// made only for a client that joined some.
 fn multicast_peers(live: &Live, mac: &Mac, groups: &[String]) -> std::collections::BTreeMap<String, Vec<Peer>> {
     let mut by: std::collections::BTreeMap<String, Vec<Peer>> = std::collections::BTreeMap::new();
     if groups.is_empty() {
         return by;
     }
-    for (m, c) in live.clients.iter().filter(|(m, c)| c.connected && *m != mac) {
+    for (m, c) in live.connected_clients().filter(|(m, _)| *m != mac) {
         let Some(joined) = c.sample.multicast.as_ref().map(|x| &x.memberships) else { continue };
         let mut shared = joined.iter().filter(|g| groups.contains(g)).peekable();
         if shared.peek().is_none() {

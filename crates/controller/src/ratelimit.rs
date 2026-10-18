@@ -191,7 +191,7 @@ mod tests {
             "clients": clients,
         })));
         let sample = crate::model::ClientSample { mac: C.parse().unwrap(), ap_mac: AP1.parse().unwrap(), essid: Some("Home".into()), ..Default::default() };
-        live.clients.insert(C.parse().unwrap(), ClientView { sample: std::sync::Arc::new(sample), connected: true, first_seen: 0, last_seen: 0 });
+        live.put_client(ClientView { sample: std::sync::Arc::new(sample), connected: true, first_seen: 0, last_seen: 0 });
         live
     }
 

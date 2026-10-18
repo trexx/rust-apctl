@@ -217,17 +217,10 @@ impl ApIds {
     }
 }
 
-/// A syslog datagram as an AP with a `syslog_key` sends it: magic, 0x01, 1 (u32),
-/// the AP's hash_id, a nonce, then the text sealed with AES-256-GCM over that header.
+/// A syslog datagram as the AP sends it, under a random nonce.
 fn seal_syslog(ids: &ApIds, text: &str) -> Vec<u8> {
-    use aes_gcm::aead::{Aead, KeyInit, Payload};
-    let mut out = vec![0xab, 0xcd, 0xdc, 0xba, 0x01, 0, 0, 0, 1];
-    out.extend_from_slice(&ids.hash_id);
-    out.extend_from_slice(&crate::random_iv()[..12]);
-    let nonce = aes_gcm::Nonce::try_from(&out[17..29]).expect("12 bytes");
-    let sealed = aes_gcm::Aes256Gcm::new(&ids.syslog_key.into()).encrypt(&nonce, Payload { msg: text.as_bytes(), aad: &out }).expect("AES-GCM sealing");
-    out.extend(sealed);
-    out
+    let nonce: [u8; 12] = crate::random_iv()[..12].try_into().expect("12 bytes");
+    wire::synth::seal_syslog(ids.hash_id, &ids.syslog_key, nonce, text)
 }
 
 fn ip(v: [u8; 4]) -> String {
@@ -791,9 +784,8 @@ fn write_syslog<W: Write>(pcap: &mut PcapWriter<W>, ids: &ApIds, ts: i64, ap: us
 /// `Mon dd hh:mm:ss` in UTC, as BSD syslog writes it.
 fn chrono_like(ts: i64) -> String {
     const MONTHS: [&str; 12] = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
-    let secs = ts.rem_euclid(86_400);
-    let (_, m, d) = wire::civil_from_days(ts.div_euclid(86_400));
-    format!("{} {d:>2} {:02}:{:02}:{:02}", MONTHS[(m - 1) as usize], secs / 3600, secs / 60 % 60, secs % 60)
+    let (_, m, d, h, mi, s) = wire::civil_from_secs(ts);
+    format!("{} {d:>2} {h:02}:{mi:02}:{s:02}", MONTHS[(m - 1) as usize])
 }
 
 #[cfg(test)]

@@ -1096,7 +1096,7 @@ mod tests {
         let mut live = Live::default();
         for (mac, hostname) in [("3c:55:76:00:00:01", None), ("3c:55:76:00:00:02", Some("laptop")), ("3c:55:76:00:00:03", None)] {
             let sample = crate::model::ClientSample { mac: mac.parse().unwrap(), hostname: hostname.map(Into::into), ..Default::default() };
-            live.clients.insert(sample.mac, ClientView { sample: Arc::new(sample), connected: true, first_seen: 0, last_seen: 0 });
+            live.put_client(ClientView { sample: Arc::new(sample), connected: true, first_seen: 0, last_seen: 0 });
         }
         live.aliases.insert("3c:55:76:00:00:04".parse().unwrap(), Alias { alias: Some("tablet".into()), note: None });
         live.aliases.insert("3c:55:76:00:00:02".parse().unwrap(), Alias { alias: Some("my laptop".into()), note: None });
