@@ -610,7 +610,7 @@ impl Engine {
         // acknowledgement or an event (client connection tracking, radar, scans).
         // They carry no client data and must not update the AP's status.
         if decoded.payload["inform_as_notif"].as_bool() == Some(true) {
-            self.notification(ts, &decoded.payload);
+            self.notification(ts, decoded.payload);
             return;
         }
         let snap = match model::parse(ts, &decoded.payload) {
@@ -865,13 +865,13 @@ impl Engine {
                 };
                 let result = render(&req).map(|ours| crate::dryrun::compare(&ours, &mgmt, &system, false));
                 let (matches, payload) = match &result {
-                    Ok(c) => (c.matches(), serde_json::to_value(c).unwrap_or_default()),
-                    Err(e) => (false, json!({ "error": format!("{e:#}") })),
+                    Ok(c) => (c.matches(), serde_json::to_string(c).unwrap_or_default()),
+                    Err(e) => (false, json!({ "error": format!("{e:#}") }).to_string()),
                 };
                 self.writer.exec(
                     Db::Config,
                     "INSERT INTO dryrun_results (ts, mac, cfgversion, matches, comparison) VALUES (?1, ?2, ?3, ?4, ?5)",
-                    vec![Sql::Integer(ts), Sql::Text(mac.to_string()), opt_text(cfgversion.clone()), Sql::Integer(matches as i64), Sql::Text(payload.to_string())],
+                    vec![Sql::Integer(ts), Sql::Text(mac.to_string()), opt_text(cfgversion.clone()), Sql::Integer(matches as i64), Sql::Text(payload)],
                 );
                 Some(match &result {
                     Ok(c) => json!({ "matches": matches, "system_cfg": { "added": c.system_cfg.added, "removed": c.system_cfg.removed, "changed": c.system_cfg.changed, "same_content": c.system_cfg.same_content } }),
@@ -1055,7 +1055,8 @@ impl Engine {
         }
     }
 
-    fn notification(&self, ts: Ts, p: &Value) {
+    /// Taken by value: an event's data is moved out of the notification, not copied.
+    fn notification(&self, ts: Ts, mut p: Value) {
         let Some(mac) = p["mac"].as_str().and_then(|m| m.parse::<Mac>().ok()) else { return };
         bump(&self.counters.notifications);
         // The live view is written for this alone, and only read (or, for an
@@ -1068,6 +1069,7 @@ impl Engine {
             }
             d.last_config_push.map(|t| ts - t)
         });
+        let n = p["notif_payload"].take();
         match p["notif_reason"].as_str() {
             // The AP confirms it applied a pushed config.
             Some("setparam") => {
@@ -1075,7 +1077,6 @@ impl Engine {
                 self.emit(Event::device(ts, EventKind::ConfigApplied, mac, data));
             }
             Some("event") => {
-                let n = &p["notif_payload"];
                 if n["message_type"].as_str() == Some("STA_ASSOC_TRACKER") {
                     self.connection_event(ts, mac, n);
                 } else if let Some(kind) = n["event_string"].as_str() {
@@ -1087,12 +1088,12 @@ impl Engine {
                         // "{proc} exited with code {exit_status} and restarted by {caller}"
                         "EVT_AP_RestartProc" => EventKind::ApProcessRestarted,
                         "Upgrade" => {
-                            self.upgrade_notice(&mut self.live.write().unwrap(), ts, mac, n);
+                            self.upgrade_notice(&mut self.live.write().unwrap(), ts, mac, &n);
                             return;
                         }
                         _ => EventKind::ApEvent,
                     };
-                    self.emit(Event::device(ts, k, mac, n.clone()));
+                    self.emit(Event::device(ts, k, mac, n));
                 }
             }
             // The AP starts an upgrade (ours, or one run on the AP itself).
@@ -1102,7 +1103,7 @@ impl Engine {
             // A crash or recovery report: base64 text from the AP's crash store.
             Some(reason @ ("crashlog" | "recovery")) => {
                 use base64::Engine as _;
-                let raw = p["notif_payload"].as_str().unwrap_or_default();
+                let raw = n.as_str().unwrap_or_default();
                 let text = base64::engine::general_purpose::STANDARD
                     .decode(raw.trim())
                     .map(|b| String::from_utf8_lossy(&b).into_owned())
@@ -1119,7 +1120,7 @@ impl Engine {
     /// A client connection-tracking event (`STA_ASSOC_TRACKER`): association,
     /// success (with association, WPA, IP and DNS timings), soft failure,
     /// roam, leave. The timings are read from `detail`, the whole notification.
-    fn connection_event(&self, ts: Ts, ap: Mac, n: &Value) {
+    fn connection_event(&self, ts: Ts, ap: Mac, mut n: Value) {
         let Some(client) = n["mac"].as_str().and_then(|m| m.parse::<Mac>().ok()) else { return };
         let num = |k: &str| n[k].as_str().and_then(|v| v.parse::<f64>().ok()).or_else(|| n[k].as_f64());
         let text = |k: &str| n[k].as_str().map(str::to_string);
@@ -1130,44 +1131,45 @@ impl Engine {
             let vap = live.devices.get(&ap).and_then(|d| d.snapshot.vaps.iter().find(|v| v.name.as_deref() == vap.as_deref()));
             vap.map(|v| (v.essid.clone(), v.radio.clone(), v.channel, v.bw))
         };
-        // Channel and width at the time, for the connection log and roaming views.
-        let mut detail = n.clone();
-        let (essid, radio) = match vap_info {
-            Some((essid, radio, channel, bw)) => {
-                detail["x_channel"] = json!(channel);
-                detail["x_bw"] = json!(bw);
-                (essid, radio)
-            }
-            None => (None, None),
+        let (essid, radio, at) = match vap_info {
+            Some((essid, radio, channel, bw)) => (essid, radio, Some((channel, bw))),
+            None => (None, None, None),
         };
         let event_type = text("event_type").unwrap_or_default();
         // The table's `auth_algo`, `assoc_ms`, `auth_ms`, `ip_ms` and `reason` columns
         // are no longer written: `detail` holds them, as the AP sent them.
+        let mut row = vec![
+            Sql::Integer(ts),
+            Sql::Text(ap.to_string()),
+            Sql::Text(client.to_string()),
+            opt_text(vap),
+            opt_text(essid.clone()),
+            opt_text(radio),
+            Sql::Text(event_type.clone()),
+            opt_text(text("ip_assign_type")),
+            i(num("dns_responses").map(|v| v as i64)),
+            i(num("dns_timeouts").map(|v| v as i64)),
+            i(num("avg_rssi").or_else(|| num("auth_rssi")).map(|v| v as i64)),
+        ];
+        // Failed attempts are worth an event; the rest stay in the connection log.
+        // A roam is reported as a "soft failure" but is a normal, successful move.
+        let roamed = n["ip_assign_type"].as_str().is_some_and(|t| t.starts_with("roam"));
+        let failed = (event_type == "failure" || (event_type == "soft failure" && !roamed))
+            .then(|| json!({ "essid": essid, "reason": n["sta_dc_reason"], "auth_algo": n["auth_algo"], "rssi": num("auth_rssi") }));
+        // The whole notification, with the channel and width at the time: timings, failure
+        // counters and stage flags for connectivity stats, and the roaming views.
+        if let Some((channel, bw)) = at {
+            n["x_channel"] = json!(channel);
+            n["x_bw"] = json!(bw);
+        }
+        row.push(Sql::Text(n.to_string()));
         self.writer.exec(
             Db::Config,
             "INSERT INTO connections (ts, ap_mac, client_mac, vap, essid, radio, event_type, ip_assign_type, dns_responses, dns_timeouts, rssi, detail) \
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
-            vec![
-                Sql::Integer(ts),
-                Sql::Text(ap.to_string()),
-                Sql::Text(client.to_string()),
-                opt_text(vap),
-                opt_text(essid.clone()),
-                opt_text(radio),
-                Sql::Text(event_type.clone()),
-                opt_text(text("ip_assign_type")),
-                i(num("dns_responses").map(|v| v as i64)),
-                i(num("dns_timeouts").map(|v| v as i64)),
-                i(num("avg_rssi").or_else(|| num("auth_rssi")).map(|v| v as i64)),
-                // The whole notification: timings, failure counters and stage flags for connectivity stats.
-                Sql::Text(detail.to_string()),
-            ],
+            row,
         );
-        // Failed attempts are worth an event; the rest stay in the connection log.
-        // A roam is reported as a "soft failure" but is a normal, successful move.
-        let roamed = n["ip_assign_type"].as_str().is_some_and(|t| t.starts_with("roam"));
-        if event_type == "failure" || (event_type == "soft failure" && !roamed) {
-            let data = json!({ "essid": essid, "reason": n["sta_dc_reason"], "auth_algo": n["auth_algo"], "rssi": num("auth_rssi") });
+        if let Some(data) = failed {
             self.emit(Event::client_on(ts, EventKind::ClientConnectFailed, ap, client, data));
         }
     }
