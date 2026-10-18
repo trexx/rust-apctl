@@ -1076,6 +1076,9 @@ pub struct NeighborQuery {
     /// Only our APs' signal to each other (`neighbors` comes back empty).
     #[serde(default)]
     links_only: bool,
+    /// Only the networks heard (`own_links` comes back empty).
+    #[serde(default)]
+    neighbors_only: bool,
 }
 
 /// A network one of our APs heard, as `/api/rf/neighbors` lists it.
@@ -1114,7 +1117,7 @@ struct OwnLink {
 
 /// GET /api/rf/neighbors: networks heard by our APs, the AP hearing each best,
 /// and our own APs' signal to each other (AP density), once per pair of APs
-/// and band.
+/// and band; either list alone with `links_only` or `neighbors_only`.
 pub async fn neighbors(State(s): State<AppState>, Query(q): Query<NeighborQuery>) -> Result<Json<Value>, ApiError> {
     let since = clock::now_ts() - q.range.unwrap_or(86400).clamp(600, 30 * 86400);
     let band = q.band.clone();
@@ -1167,7 +1170,7 @@ pub async fn neighbors(State(s): State<AppState>, Query(q): Query<NeighborQuery>
     for r in rows {
         if let Some((owner, radio)) = own.get(&r.bssid) {
             // One of our APs heard another of ours.
-            if *owner != r.ap_mac {
+            if *owner != r.ap_mac && !q.neighbors_only {
                 let e = links.entry((r.ap_mac, owner, radio.as_deref())).or_insert(r.signal);
                 *e = (*e).max(r.signal);
             }
@@ -2099,7 +2102,7 @@ mod tests {
             let c = Connection::open(dir.join("config.db")).unwrap();
             let row = |bssid: &str, sig: i64| vec![text(bssid), text(A2), text("na"), text("x"), int(44), int(80), int(5210), int(sig), int(base - 60), int(base)];
             insert(&c, "neighbors", &["bssid", "ap_mac", "radio", "essid", "channel", "bw", "center_freq", "signal", "first_seen", "last_seen"], vec![row(BSS[1].0, -62), row(BSS[2].0, -58)]);
-            let q = Query(NeighborQuery { band: None, range: Some(30 * 86400), links_only: false });
+            let q = Query(NeighborQuery { band: None, range: Some(30 * 86400), links_only: false, neighbors_only: false });
             let out = ok(neighbors(State(s.clone()), q).await);
             let links: Vec<(&str, &str, &str, i64)> = out["own_links"]
                 .as_array()
@@ -2110,9 +2113,12 @@ mod tests {
             assert_eq!(links, [(A1, A2, "na", -60), (A1, A2, "ng", -70), (A2, A1, "na", -58), (A2, A1, "ng", -65)]);
             let names: Vec<&str> = out["neighbors"].as_array().unwrap().iter().map(|n| n["essid"].as_str().unwrap()).collect();
             assert_eq!(names, ["Neighbour", "Other", "Far"], "strongest first");
-            let q = Query(NeighborQuery { band: None, range: Some(30 * 86400), links_only: true });
-            let only = ok(neighbors(State(s), q).await);
+            let q = Query(NeighborQuery { band: None, range: Some(30 * 86400), links_only: true, neighbors_only: false });
+            let only = ok(neighbors(State(s.clone()), q).await);
             assert_eq!((only["neighbors"].as_array().unwrap().len(), &only["own_links"]), (0, &out["own_links"]));
+            let q = Query(NeighborQuery { band: None, range: Some(30 * 86400), links_only: false, neighbors_only: true });
+            let only = ok(neighbors(State(s), q).await);
+            assert_eq!((&only["neighbors"], only["own_links"].as_array().unwrap().len()), (&out["neighbors"], 0));
         }
 
         #[tokio::test]

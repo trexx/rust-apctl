@@ -973,7 +973,7 @@ const usePolled = <T>(queryKey: QueryKey, path: string) =>
 export const useRadios = (range: number) => usePolled<RadioOverview[]>(keys.rfRadios(range), `/api/rf/radios${qs({ range })}`);
 
 export const useNeighbors = (range: number, band: string) =>
-  usePolled<{ neighbors: Neighbor[]; own_links: OwnLink[] }>(keys.rfNeighbors(range, band), `/api/rf/neighbors${qs({ range, band: bandParam(band) })}`);
+  usePolled<{ neighbors: Neighbor[] }>(keys.rfNeighbors(range, band), `/api/rf/neighbors${qs({ range, band: bandParam(band), neighbors_only: "true" })}`);
 
 /** Only how loudly our APs hear each other (no neighbour list). */
 export const useOwnLinks = (range: number) => usePolled<{ own_links: OwnLink[] }>(keys.rfLinks(range), `/api/rf/neighbors${qs({ range, links_only: "true" })}`);
