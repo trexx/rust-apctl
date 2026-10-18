@@ -26,16 +26,23 @@ import {
   useStatus,
 } from "./api";
 import { Overview } from "./pages/Overview";
-import { Clients } from "./pages/Clients";
-import { Events } from "./pages/Events";
-import { Logs } from "./pages/Logs";
-import { Networks } from "./pages/Networks";
 import { AlertBell, useNotifier } from "./components/Alerts";
 import { Loading, Outcome, useRunner } from "./components/common";
 import { lazyNamed } from "./lazy";
 import "./styles.css";
 
-// Pages that are seldom opened, or large, load on demand.
+// The pages opened most load as soon as the first one is shown, so that
+// moving to them doesn't wait; the rest load when first opened.
+const OFTEN = {
+  clients: () => import("./pages/Clients"),
+  networks: () => import("./pages/Networks"),
+  events: () => import("./pages/Events"),
+  logs: () => import("./pages/Logs"),
+};
+const Clients = lazyNamed(OFTEN.clients, "Clients");
+const Networks = lazyNamed(OFTEN.networks, "Networks");
+const Events = lazyNamed(OFTEN.events, "Events");
+const Logs = lazyNamed(OFTEN.logs, "Logs");
 const Device = lazyNamed(() => import("./pages/Device"), "Device");
 const Client = lazyNamed(() => import("./pages/Client"), "Client");
 const Settings = lazyNamed(() => import("./pages/Settings"), "Settings");
@@ -161,6 +168,13 @@ function Shell({ user, readOnly }: { user: string | null; readOnly: boolean }) {
   const qc = useQueryClient();
   const status = useStatus();
   const location = useLocation();
+  useEffect(() => {
+    // A failure here shows again, and is handled, when the page is opened.
+    const t = setTimeout(() => {
+      for (const load of Object.values(OFTEN)) load().catch(() => undefined);
+    }, 1000);
+    return () => clearTimeout(t);
+  }, []);
   return (
     <div className="shell">
       <header className="top">
