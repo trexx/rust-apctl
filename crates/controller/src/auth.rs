@@ -10,6 +10,7 @@ use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use argon2::Argon2;
@@ -23,6 +24,8 @@ use rusqlite::types::Value as Sql;
 use serde::Deserialize;
 use serde_json::json;
 use sha2::{Digest, Sha256};
+use tokio::sync::Semaphore;
+use tokio::task::JoinError;
 
 use crate::api::{ApiError, AppState, Json};
 use crate::clock;
@@ -436,16 +439,14 @@ pub async fn login(
     // the async workers, and run at most two at a time. A queue kept full (by
     // many addresses) makes the others wait a few seconds at most, and a login
     // turned away unchecked does not count against its address.
-    static VERIFYING: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(2);
-    let _permit = match tokio::time::timeout(std::time::Duration::from_secs(5), VERIFYING.acquire()).await {
-        Ok(p) => p.expect("the semaphore is never closed"),
-        Err(_) => {
-            auth.refund(ip);
-            return Err(ApiError(StatusCode::SERVICE_UNAVAILABLE, "too many logins at once, try again shortly".into()));
-        }
-    };
+    static VERIFYING: Semaphore = Semaphore::const_new(2);
     let verifier = auth.clone();
-    let (ok, user) = tokio::task::spawn_blocking(move || (verifier.users.verify(&body.username, &body.password), body.username)).await?;
+    let check = move || (verifier.users.verify(&body.username, &body.password), body.username);
+    let Some(checked) = in_slot(&VERIFYING, Duration::from_secs(5), check).await else {
+        auth.refund(ip);
+        return Err(ApiError(StatusCode::SERVICE_UNAVAILABLE, "too many logins at once, try again shortly".into()));
+    };
+    let (ok, user) = checked?;
     if !ok {
         // The name is the client's, up to the whole body: the log gets its start.
         let shown = &user[..user.floor_char_boundary(64)];
@@ -456,6 +457,21 @@ pub async fn login(
     let token = auth.create(&user)?;
     tracing::info!("{user} logged in from {ip}");
     Ok(([(header::SET_COOKIE, cookie(&headers, &token, SESSION_SECS))], Json(json!({ "user": user }))).into_response())
+}
+
+/// Runs `check` on a blocking thread while it holds one of `slots`, or None
+/// when no slot comes free within `wait`. The permit goes into the blocking
+/// closure: a client that hangs up drops its handler, but not the check
+/// already running, which must keep its slot until it ends.
+async fn in_slot<T: Send + 'static>(slots: &'static Semaphore, wait: Duration, check: impl FnOnce() -> T + Send + 'static) -> Option<Result<T, JoinError>> {
+    let permit = tokio::time::timeout(wait, slots.acquire()).await.ok()?.expect("the semaphore is never closed");
+    Some(
+        tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            check()
+        })
+        .await,
+    )
 }
 
 pub async fn logout(State(s): State<AppState>, headers: HeaderMap) -> Response {
@@ -624,6 +640,35 @@ mod tests {
         assert!(!ok(Some("https://other.example"), "apctl:8080", Some("apctl.example"), "10.42.0.3"));
         // From anyone else it is not believed.
         assert!(!ok(Some("https://evil.example"), "apctl.lan", Some("evil.example"), lan));
+    }
+
+    #[tokio::test]
+    async fn a_check_keeps_its_slot_when_the_client_hangs_up() {
+        static SLOTS: Semaphore = Semaphore::const_new(2);
+        let (started, has_started) = std::sync::mpsc::channel();
+        let (finish, may_finish) = std::sync::mpsc::channel::<()>();
+        let handler = tokio::spawn(in_slot(&SLOTS, Duration::from_secs(5), move || {
+            started.send(()).unwrap();
+            may_finish.recv().ok();
+        }));
+        tokio::task::spawn_blocking(move || has_started.recv().unwrap()).await.unwrap();
+        // The client hangs up: its handler is dropped, the check runs on.
+        handler.abort();
+        assert!(handler.await.unwrap_err().is_cancelled());
+        assert_eq!(SLOTS.available_permits(), 1, "the running check keeps its slot");
+        // Both slots taken: turned away once the wait is over.
+        let other = SLOTS.acquire().await.unwrap();
+        assert!(in_slot(&SLOTS, Duration::from_millis(10), || ()).await.is_none());
+        drop(other);
+        // The check ends, and only then gives its slot back.
+        finish.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while SLOTS.available_permits() < 2 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the slot is given back when the check ends");
     }
 
     #[test]
