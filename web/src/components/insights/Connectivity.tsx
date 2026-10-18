@@ -30,7 +30,7 @@ export function Connectivity() {
               {STAGES.map(([k, label]) => (
                 <div
                   key={k}
-                  className={`stage-bar stage-${pctTone(d[k])}`}
+                  className={`stage-bar fill-${pctTone(d[k])}`}
                   title={`${d[k] ?? 0}% of clients got past ${label}`}
                 >
                   {label}

@@ -33,7 +33,7 @@ export function RetryBuckets() {
                 return (
                   <div key={min} className="bucket">
                     <div
-                      className={`bucket-bar bucket-${tone} ${inBucket.length ? "" : "bucket-empty"}`}
+                      className={`bucket-bar fill-${tone} ${inBucket.length ? "" : "bucket-empty"}`}
                       title={tip || undefined}
                     >
                       {inBucket.length || ""}

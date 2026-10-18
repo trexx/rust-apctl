@@ -3,6 +3,7 @@ import { useDeviceNames, useDryRun } from "../api";
 import type { DryRun as DryRunData, FieldComparison } from "../api";
 import { Dot, ErrorNote, Loading } from "../components/common";
 import { clock, useNow } from "../format";
+import type { Tone } from "../format";
 
 type Status = DryRunData["devices"][number]["status"];
 
@@ -16,9 +17,9 @@ const STATUS: Record<Status, string> = {
 };
 
 /** A status's dot: the same config is good, a difference or an error bad, nothing to compare yet a warning. */
-const TONE: Record<Status, "ok" | "warn" | "bad"> = {
-  match: "ok",
-  equivalent: "ok",
+const TONE: Record<Status, Tone> = {
+  match: "good",
+  equivalent: "good",
   differs: "bad",
   error: "bad",
   no_settings: "warn",
@@ -36,7 +37,7 @@ function FieldResult({ label, c }: { label: string; c: FieldComparison }) {
   const ok = c.identical || c.equivalent;
   return (
     <div className="dr-field">
-      <span className={ok ? "ok" : "error"}>{ok ? "✓" : "✗"}</span>{" "}
+      <span className={ok ? "tone-good" : "error"}>{ok ? "✓" : "✗"}</span>{" "}
       <b>{label}</b>{" "}
       <span className="muted">
         {verdict} · ours {c.expected_lines} lines, actual {c.actual_lines}
@@ -139,7 +140,7 @@ export function DryRun() {
                 <tr key={h.id}>
                   <td>{clock(h.ts, now)}</td>
                   <td>{names[h.mac] ?? h.mac}</td>
-                  <td className={h.matches ? "ok" : "error"}>
+                  <td className={h.matches ? "tone-good" : "error"}>
                     {equivalent(h)
                       ? "equivalent"
                       : h.matches

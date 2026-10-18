@@ -12,6 +12,7 @@ import type {
   Names,
 } from "../api";
 import { band, clock, duration, sameDay, signalClass, useNow } from "../format";
+import type { Tone } from "../format";
 
 export function Stat({
   label,
@@ -32,14 +33,14 @@ export function Stat({
 }
 
 /** A status dot, beside text that says the same: good or bad (`ok`), or one of three tones. */
-export function Dot(p: { ok: boolean } | { tone: "ok" | "warn" | "bad" }) {
-  const tone = "tone" in p ? p.tone : p.ok ? "ok" : "bad";
-  return <span className={`dot dot-${tone}`} aria-hidden />;
+export function Dot(p: { ok: boolean } | { tone: Tone }) {
+  const tone = "tone" in p ? p.tone : p.ok ? "good" : "bad";
+  return <span className={`dot fill-${tone}`} aria-hidden />;
 }
 
 export function Signal({ dbm }: { dbm: number | null | undefined }) {
   return (
-    <span className={`signal signal-${signalClass(dbm)}`}>
+    <span className={`tone-${signalClass(dbm)}`}>
       {dbm === null || dbm === undefined ? "—" : `${Math.round(dbm)} dBm`}
     </span>
   );
@@ -58,7 +59,7 @@ export function Meter({
   const known = value !== null && value !== undefined;
   const max = limit ?? 100;
   const v = known ? Math.min(100, (value / max) * 100) : 0;
-  const level = v >= 80 ? "high" : v >= 50 ? "mid" : "low";
+  const tone: Tone = v >= 80 ? "bad" : v >= 50 ? "warn" : "good";
   const text = known ? `${Math.round(value)}` : "unknown";
   return (
     <span
@@ -72,7 +73,7 @@ export function Meter({
       aria-valuetext={known ? undefined : text}
     >
       <span
-        className={`meter-fill meter-${level}`}
+        className={`meter-fill fill-${tone}`}
         style={{ width: `${v}%` }}
       />
     </span>
@@ -303,11 +304,11 @@ function DeviceLink({ mac, names }: { mac: string | null; names: Names }) {
   return <Link to={`/devices/${mac}`}>{names[mac] ?? mac}</Link>;
 }
 
-type Tone = "bad" | "warn" | "info" | "neutral";
+type EventTone = "bad" | "warn" | "info" | "neutral";
 
 interface EventSpec<K extends EventKind> {
   label: string;
-  tone: Tone | ((d: Partial<EventPayloads[K]>) => Tone);
+  tone: EventTone | ((d: Partial<EventPayloads[K]>) => EventTone);
   /** The detail line (`ts` is the event's); a method so the table below can hold every kind. */
   describe?(d: Partial<EventPayloads[K]>, names: Names, ts: number): string;
 }

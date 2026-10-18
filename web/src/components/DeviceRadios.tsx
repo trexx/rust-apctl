@@ -4,6 +4,7 @@ import type { ClientView, RadioSample, TimeSpan, VapSample } from "../api";
 import { COLORS, Chart } from "./Chart";
 import { QueryState, Signal } from "./common";
 import { SIGNAL, band, bytes, compact, pct, pct1, rate } from "../format";
+import type { Tone } from "../format";
 
 const share = (part: number, whole: number) =>
   pct1(whole > 0 ? (100 * part) / whole : null);
@@ -17,11 +18,11 @@ type NumericKey<T> = {
 }[keyof T];
 
 /** Lower edges of the signal buckets, strongest first, with the colour of `signalClass`. */
-const SIGNAL_BUCKETS: [number, string, string][] = [
+const SIGNAL_BUCKETS: [number, string, Tone][] = [
   [SIGNAL.excellent, "Excellent", "good"],
   [SIGNAL.good, "Good", "good"],
-  [SIGNAL.fair, "Fair", "fair"],
-  [-Infinity, "Poor", "poor"],
+  [SIGNAL.fair, "Fair", "warn"],
+  [-Infinity, "Poor", "bad"],
 ];
 
 /** How many of the radio's clients are in each signal band; those without a signal reading are left out. */
@@ -39,7 +40,7 @@ function SignalDistribution({ clients }: { clients: ClientView[] }) {
           n ? (
             <span
               key={i}
-              className={`dist-${SIGNAL_BUCKETS[i]![2]}`}
+              className={`fill-${SIGNAL_BUCKETS[i]![2]}`}
               style={{ flex: n }}
               title={`${SIGNAL_BUCKETS[i]![1]}: ${n}`}
             />

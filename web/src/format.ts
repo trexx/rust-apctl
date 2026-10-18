@@ -147,18 +147,21 @@ export const pct = (v: number | null | undefined) => (v === null || v === undefi
 /** A percentage with one decimal: "12.5%". */
 export const pct1 = (v: number | null | undefined) => (v === null || v === undefined ? "—" : `${v.toFixed(1)}%`);
 
+/** The tone a level is shown in: good, needing attention, or bad (styles.css's `tone-*` text and `fill-*` fills). */
+export type Tone = "good" | "warn" | "bad";
+
 /**
  * Client signal levels (dBm) commonly used for Wi-Fi: at least `good` is good
  * (at least `excellent` excellent), at least `fair` is fair, below it poor.
  */
 export const SIGNAL = { excellent: -60, good: -65, fair: -75 } as const;
 
-/** Signal quality bucket for colouring. */
-export function signalClass(dbm: number | null | undefined): "good" | "fair" | "poor" | "none" {
+/** A signal's tone: fair is "warn", poor "bad", and "none" when it isn't known. */
+export function signalClass(dbm: number | null | undefined): Tone | "none" {
   if (dbm === null || dbm === undefined) return "none";
   if (dbm >= SIGNAL.good) return "good";
-  if (dbm >= SIGNAL.fair) return "fair";
-  return "poor";
+  if (dbm >= SIGNAL.fair) return "warn";
+  return "bad";
 }
 
 /**
@@ -168,7 +171,7 @@ export function signalClass(dbm: number | null | undefined): "good" | "fair" | "
 export const RETRY = { warn: 20, bad: 25 } as const;
 
 /** A TX retry share's tone: "bad", "warn", or "" (fine or unknown). */
-export const retryTone = (pct: number | null | undefined): "bad" | "warn" | "" =>
+export const retryTone = (pct: number | null | undefined): Exclude<Tone, "good"> | "" =>
   pct === null || pct === undefined ? "" : pct >= RETRY.bad ? "bad" : pct >= RETRY.warn ? "warn" : "";
 
 /** "−75 dBm", with a real minus sign. */

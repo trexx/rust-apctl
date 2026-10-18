@@ -7,12 +7,12 @@
   --grid: rgba(102, 112, 133, 0.15);
   --accent: #2f6fdf;
   --good: #2f9e6e;
-  --fair: #c98a14;
-  --poor: #d64545;
+  --warn: #c98a14;
+  --bad: #d64545;
   --info-bg: #eef4ff;
   --warn-bg: #fff6e5;
   --bad-bg: #fdecec;
-  /* Text on a solid --accent, and on a solid --good / --fair / --poor. */
+  /* Text on a solid --accent, and on a solid --good / --warn / --bad. */
   --on-accent: #fff;
   --on-status: #fff;
   /* The series colours of the charts (Chart.tsx COLORS) and other graphics. */
@@ -36,8 +36,8 @@
     --grid: rgba(154, 163, 178, 0.14);
     --accent: #6f9cf0;
     --good: #45c08a;
-    --fair: #e2a73b;
-    --poor: #ef6a6a;
+    --warn: #e2a73b;
+    --bad: #ef6a6a;
     --info-bg: #1b2638;
     --warn-bg: #2d2617;
     --bad-bg: #331d1f;
@@ -155,7 +155,7 @@ main {
   padding: 16px;
 }
 .error {
-  color: var(--poor);
+  color: var(--bad);
 }
 .dim {
   opacity: 0.55;
@@ -323,15 +323,6 @@ main {
   border-radius: 50%;
   flex: none;
 }
-.dot-ok {
-  background: var(--good);
-}
-.dot-warn {
-  background: var(--fair);
-}
-.dot-bad {
-  background: var(--poor);
-}
 
 .meter {
   display: inline-block;
@@ -346,15 +337,6 @@ main {
   display: block;
   height: 100%;
 }
-.meter-low {
-  background: var(--good);
-}
-.meter-mid {
-  background: var(--fair);
-}
-.meter-high {
-  background: var(--poor);
-}
 .meter-row {
   display: flex;
   align-items: center;
@@ -367,16 +349,6 @@ main {
 .meter-row > .meter-text {
   overflow: hidden;
   text-overflow: ellipsis;
-}
-
-.signal-good {
-  color: var(--good);
-}
-.signal-fair {
-  color: var(--fair);
-}
-.signal-poor {
-  color: var(--poor);
 }
 
 .table {
@@ -524,10 +496,10 @@ input.search {
   font-weight: 500;
 }
 .event-bad .event-kind {
-  color: var(--poor);
+  color: var(--bad);
 }
 .event-warn .event-kind {
-  color: var(--fair);
+  color: var(--warn);
 }
 .event-info .event-kind {
   color: var(--accent);
@@ -571,10 +543,10 @@ input.search {
 .sev-1 .log-msg,
 .sev-2 .log-msg,
 .sev-3 .log-msg {
-  color: var(--poor);
+  color: var(--bad);
 }
 .sev-4 .log-msg {
-  color: var(--fair);
+  color: var(--warn);
 }
 
 @media (max-width: 700px) {
@@ -698,9 +670,6 @@ input.search {
   width: 100%;
 }
 
-.ok {
-  color: var(--good);
-}
 .import {
   margin-top: 16px;
   display: flex;
@@ -766,15 +735,6 @@ input.search {
   font-size: 12px;
   line-height: 22px;
 }
-.bucket-good {
-  background: var(--good);
-}
-.bucket-warn {
-  background: var(--fair);
-}
-.bucket-bad {
-  background: var(--poor);
-}
 .stages {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
@@ -787,18 +747,6 @@ input.search {
   background: var(--grid);
   color: var(--text);
 }
-.stage-good {
-  background: var(--good);
-  color: var(--on-status);
-}
-.stage-warn {
-  background: var(--fair);
-  color: var(--on-status);
-}
-.stage-bad {
-  background: var(--poor);
-  color: var(--on-status);
-}
 .density {
   position: relative;
   padding: 14px 0 0;
@@ -806,12 +754,12 @@ input.search {
 .density-scale {
   height: 10px;
   border-radius: 5px;
-  background: linear-gradient(90deg, var(--poor) 0%, var(--fair) 25%, var(--good) 45%, var(--good) 75%, var(--fair) 90%, var(--poor) 100%);
+  background: linear-gradient(90deg, var(--bad) 0%, var(--warn) 25%, var(--good) 45%, var(--good) 75%, var(--warn) 90%, var(--bad) 100%);
   opacity: 0.35;
 }
 /* AP spacing: quiet is fine, loud (APs very close) is not; -55 dBm sits at 58%. */
 .density-scale.reverse {
-  background: linear-gradient(90deg, var(--good) 0%, var(--good) 50%, var(--fair) 58%, var(--poor) 100%);
+  background: linear-gradient(90deg, var(--good) 0%, var(--good) 50%, var(--warn) 58%, var(--bad) 100%);
 }
 .density-mark {
   position: absolute;
@@ -841,11 +789,11 @@ input.search {
   white-space: nowrap;
 }
 td.warn {
-  color: var(--fair);
+  color: var(--warn);
   font-weight: 600;
 }
 td.bad {
-  color: var(--poor);
+  color: var(--bad);
   font-weight: 600;
 }
 .suggest {
@@ -916,15 +864,6 @@ td.bad {
   gap: 2px;
   margin-top: 4px;
 }
-.dist-good {
-  background: var(--good);
-}
-.dist-fair {
-  background: var(--fair);
-}
-.dist-poor {
-  background: var(--poor);
-}
 .dist-empty {
   background: var(--grid);
 }
@@ -989,12 +928,12 @@ td.bad {
 .threat {
   background: var(--panel);
   border: 1px solid var(--border);
-  border-left: 4px solid var(--poor);
+  border-left: 4px solid var(--bad);
   border-radius: var(--radius);
   padding: 12px 14px;
 }
 .threat-medium {
-  border-left-color: var(--fair);
+  border-left-color: var(--warn);
 }
 .threat-low {
   border-left-color: var(--accent);
@@ -1036,10 +975,10 @@ td.bad {
   border-radius: 6px;
   padding: 1px 6px;
   color: var(--on-status);
-  background: var(--poor);
+  background: var(--bad);
 }
 .sev-medium {
-  background: var(--fair);
+  background: var(--warn);
 }
 .sev-low {
   background: var(--accent);
@@ -1068,24 +1007,39 @@ td.bad {
   align-self: center;
   font-size: 13px;
 }
+/* The three tones (format.ts's `Tone`): as text, and as a solid fill (a dot, meter, bucket, stage or share). */
 .tone-good {
   color: var(--good);
 }
 .tone-warn {
-  color: var(--fair);
+  color: var(--warn);
 }
 .tone-bad {
-  color: var(--poor);
+  color: var(--bad);
+}
+.fill-good,
+.fill-warn,
+.fill-bad {
+  color: var(--on-status);
+}
+.fill-good {
+  background: var(--good);
+}
+.fill-warn {
+  background: var(--warn);
+}
+.fill-bad {
+  background: var(--bad);
 }
 .density-mark.quiet {
   border-color: var(--text-muted);
   opacity: 0.6;
 }
 .density-mark.warn {
-  border-color: var(--fair);
+  border-color: var(--warn);
 }
 .density-mark.bad {
-  border-color: var(--poor);
+  border-color: var(--bad);
 }
 .mcast-types {
   display: flex;
@@ -1179,11 +1133,11 @@ td.bad {
 }
 .tag-bad {
   background: var(--bad-bg);
-  color: var(--poor);
+  color: var(--bad);
 }
 .tag-warn {
   background: var(--warn-bg);
-  color: var(--fair);
+  color: var(--warn);
 }
 .tag-info {
   background: var(--info-bg);
@@ -1237,9 +1191,9 @@ td .tag {
   padding: 3px 8px;
 }
 .cfg-old {
-  color: var(--poor);
+  color: var(--bad);
   text-decoration: line-through;
-  text-decoration-color: color-mix(in srgb, var(--poor) 40%, transparent);
+  text-decoration-color: color-mix(in srgb, var(--bad) 40%, transparent);
 }
 .cfg-new {
   color: var(--good);
@@ -1268,8 +1222,8 @@ td .tag {
   color: var(--text);
 }
 .bell-bad {
-  color: var(--poor);
-  border-color: var(--poor);
+  color: var(--bad);
+  border-color: var(--bad);
 }
 .bell-count {
   position: absolute;
@@ -1279,7 +1233,7 @@ td .tag {
   height: 16px;
   padding: 0 4px;
   border-radius: 8px;
-  background: var(--poor);
+  background: var(--bad);
   color: var(--on-status);
   font-size: 10px;
   line-height: 16px;
@@ -1312,10 +1266,10 @@ td .tag {
   font-weight: 600;
 }
 .sev-border-high {
-  border-left-color: var(--poor);
+  border-left-color: var(--bad);
 }
 .sev-border-medium {
-  border-left-color: var(--fair);
+  border-left-color: var(--warn);
 }
 .sev-border-low {
   border-left-color: var(--accent);
