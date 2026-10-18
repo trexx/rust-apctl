@@ -10,7 +10,7 @@ use std::sync::LazyLock;
 
 use crate::api::{ApiError, AppState, Json, Query};
 use crate::settings::Kind::{Bool, Int};
-use crate::settings::{COUNTRIES, Patch, PreviewQuery, band_name, copy_fields, country, dedup_in_order, docs_mut, illegal_fixed_channel, mgmt_flag, num, outdoor_with, setting, setting_mut};
+use crate::settings::{COUNTRIES, Patch, PreviewQuery, band_name, copy_fields, country, dedup_in_order, docs_mut, illegal_fixed_channel, mgmt_flag, num, outdoor_with, pick, setting, setting_mut, timezone};
 
 /// A host name or IPv4 address, as NTP and syslog targets take (the official
 /// controller refuses IPv6 there). A name's labels are letters, digits and
@@ -326,26 +326,18 @@ pub async fn get_site(State(s): State<AppState>) -> Result<Json<SiteView>, ApiEr
 
 fn site_view(state: &Value, active: bool, secrets: bool) -> Value {
     let m = setting(state, "mgmt");
-    let mut mgmt = json!({ "has_ssh_password": m["x_ssh_password"].as_str().is_some_and(|p| !p.is_empty()) });
-    for k in ["led_enabled", "outdoor_mode_enabled", "x_ssh_enabled", "x_ssh_username", "x_ssh_auth_password_enabled", "x_ssh_bind_wildcard", "x_ssh_keys"] {
-        mgmt[k] = m[k].clone();
-    }
+    let mut mgmt = Value::Object(pick(m, &["led_enabled", "outdoor_mode_enabled", "x_ssh_enabled", "x_ssh_username", "x_ssh_auth_password_enabled", "x_ssh_bind_wildcard", "x_ssh_keys"]));
+    mgmt["has_ssh_password"] = json!(m["x_ssh_password"].as_str().is_some_and(|p| !p.is_empty()));
     let r = setting(state, "rsyslogd");
-    let mut rsyslogd = json!({});
-    for k in ["ip", "port", "debug", "netconsole_enabled", "netconsole_host", "netconsole_port"] {
-        rsyslogd[k] = r[k].clone();
-    }
+    let mut rsyslogd = Value::Object(pick(r, &["ip", "port", "debug", "netconsole_enabled", "netconsole_host", "netconsole_port"]));
     rsyslogd["mode"] = json!(match (r["enabled"].as_bool() == Some(true), r["this_controller"].as_bool() == Some(true)) {
         (false, _) => "off",
         (true, true) => "controller",
         (true, false) => "server",
     });
     let n = setting(state, "ntp");
-    let mut ntp = json!({});
+    let mut ntp = Value::Object(pick(n, &NTP_KEYS));
     ntp["setting_preference"] = n["setting_preference"].clone();
-    for k in NTP_KEYS {
-        ntp[k] = n[k].clone();
-    }
     let sn = setting(state, "snmp");
     let snmp = json!({
         "enabled": sn["enabled"], "enabledV3": sn["enabledV3"], "community": if secrets { sn["community"].clone() } else { Value::Null }, "username": sn["username"],
@@ -353,7 +345,7 @@ fn site_view(state: &Value, active: bool, secrets: bool) -> Value {
     });
     json!({
         "active": active, "mgmt": mgmt, "rsyslogd": rsyslogd, "ntp": ntp, "snmp": snmp,
-        "country": country(state), "timezone": setting(state, "locale")["timezone"],
+        "country": country(state), "timezone": timezone(state),
     })
 }
 

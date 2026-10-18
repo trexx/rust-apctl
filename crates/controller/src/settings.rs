@@ -191,6 +191,11 @@ pub(crate) fn num(v: &Value) -> Option<i64> {
     v.as_i64().or_else(|| v.as_str()?.parse().ok())
 }
 
+/// Some fields of a document, as they are (`null` for one it lacks).
+pub(crate) fn pick(v: &Value, keys: &[&str]) -> serde_json::Map<String, Value> {
+    keys.iter().map(|k| (k.to_string(), v[*k].clone())).collect()
+}
+
 /// The site's APs, as MACs written `aa:bb:..` (however their records write them).
 pub(crate) fn device_macs(state: &Value) -> Vec<String> {
     docs(state, "devices").filter_map(|d| doc_mac(&d["mac"])).map(|m| m.to_string()).collect()
@@ -254,8 +259,8 @@ pub async fn wlans(State(s): State<AppState>) -> Result<Json<Value>, ApiError> {
                 "id": id_of(w), "aps": wlan_aps(&state, w), "protection": protection_of(w), "editable": w["attr_no_edit"].as_bool() != Some(true),
                 "has_passphrase": w["x_passphrase"].as_str().is_some_and(|p| !p.is_empty()),
             });
-            for f in WLAN_FIELDS {
-                v[*f] = w[*f].clone();
+            if let Value::Object(o) = &mut v {
+                o.extend(pick(w, WLAN_FIELDS));
             }
             v
         })
@@ -329,10 +334,7 @@ pub async fn device(State(s): State<AppState>, MacPath(mac): MacPath) -> Result<
         .into_iter()
         .flatten()
         .map(|r| {
-            let mut v = json!({});
-            for f in RADIO_FIELDS {
-                v[*f] = r[*f].clone();
-            }
+            let mut v = Value::Object(pick(r, RADIO_FIELDS));
             let band = r["radio"].as_str().unwrap_or("");
             v["caps"] = radio_caps(inform.as_deref(), band);
             v["channels"] = channels(&state, band, false);
@@ -351,8 +353,8 @@ pub async fn device(State(s): State<AppState>, MacPath(mac): MacPath) -> Result<
         "reported": inform.is_some(), "site_outdoor": site_outdoor, "advanced_features": advanced, "antennas": antennas,
         "ports": d["ethernet_table"].as_array().map_or(0, |t| t.iter().filter_map(|e| e["num_port"].as_i64()).sum::<i64>()),
     });
-    for f in DEVICE_FIELDS {
-        out[*f] = d[*f].clone();
+    if let Value::Object(o) = &mut out {
+        o.extend(pick(d, DEVICE_FIELDS));
     }
     Ok(Json(out))
 }
