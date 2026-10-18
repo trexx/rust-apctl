@@ -9,6 +9,7 @@
 //! kept (`x_ssh_hostkey_fingerprint`). For an AP apctl already knows at that
 //! address, the kept key is checked before any password is sent.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -201,7 +202,7 @@ fn shell_quote(s: &str) -> String {
 fn known_host_key(live: &crate::engine::Live, ip: &str) -> Option<(Mac, String)> {
     let state = live.state.as_deref()?;
     let fingerprint = |mac: &Mac| crate::adopt::device_doc(state, mac).and_then(|d| d["x_ssh_hostkey_fingerprint"].as_str()).map(str::to_string);
-    let by_record = state["devices"].as_array()?.iter().filter(|d| d["ip"].as_str() == Some(ip)).filter_map(|d| d["mac"].as_str()?.parse::<Mac>().ok());
+    let by_record = state["devices"].as_array()?.iter().filter(|d| d["ip"].as_str() == Some(ip)).filter_map(|d| crate::settings::doc_mac(&d["mac"]));
     live.by_ip.get(ip).copied().into_iter().chain(by_record).find_map(|mac| Some((mac, fingerprint(&mac)?)))
 }
 
@@ -243,6 +244,26 @@ fn logins(state: Option<&Value>, given: Option<(String, String)>) -> Vec<(String
     out
 }
 
+/// The edit that readies an AP's record for adoption over SSH: a new record
+/// (and key) unless apctl has one, the URL it is to inform to, and its host
+/// key the first time. `created` is set when this edit made the record, so a
+/// failed adoption removes what it added, and only that: the settings may
+/// have changed in the time the SSH commands took.
+fn ssh_record(st: &mut Value, mac: &Mac, payload: &Value, fingerprint: Option<&str>, created: &AtomicBool) -> Result<String, String> {
+    // A known AP keeps its key: it reaches the AP over SSH, not sealed with the factory key.
+    let new = crate::adopt::device_doc(st, mac).is_none();
+    let what = if new { format!("{} over SSH", crate::adopt::adopt_device(st, mac, payload)?) } else { format!("adopting {mac} over SSH") };
+    let d = crate::adopt::device_doc_mut(st, mac).ok_or("no record")?;
+    d["inform_url"] = payload["inform_url"].clone();
+    if let Some(fp) = fingerprint
+        && d["x_ssh_hostkey_fingerprint"].is_null()
+    {
+        d["x_ssh_hostkey_fingerprint"] = json!(fp);
+    }
+    created.store(new, Ordering::Relaxed);
+    Ok(what)
+}
+
 #[derive(Deserialize)]
 pub struct AdoptBody {
     ip: String,
@@ -267,7 +288,7 @@ pub async fn adopt(State(s): State<AppState>, Json(b): Json<AdoptBody>) -> Resul
     let bad = |f: Failure| ApiError(StatusCode::BAD_GATEWAY, f.to_string());
     // A known AP keeps its host key, checked before any password is sent; a new one is trusted the first time.
     let expected = known_host_key(&s.live.read().unwrap(), &ip);
-    let connected = connect(&ip, b.port.unwrap_or(22), &logins(state.as_deref(), given.clone()), expected.as_ref().map(|e| e.1.clone())).await;
+    let connected = connect(&ip, b.port.unwrap_or(22), &logins(state.as_deref(), given), expected.as_ref().map(|e| e.1.clone())).await;
     let session = match (connected, &expected) {
         (Err(Failure::HostKey), Some((mac, _))) => {
             s.note(Event::device(clock::now_ts(), EventKind::ApHostKeyMismatch, *mac, json!({ "ip": ip }))).await;
@@ -294,24 +315,9 @@ pub async fn adopt(State(s): State<AppState>, Json(b): Json<AdoptBody>) -> Resul
         "hostname": board_value(&board, "board.name"), "inform_url": url,
     });
     let fingerprint = session.fingerprint.clone();
-    let new = known.is_none();
-    crate::actions::apply_edit(&s, Box::new(move |st: &mut Value| {
-        // A known AP keeps its key: it reaches the AP over SSH, not sealed with the factory key.
-        let what = if crate::adopt::device_doc(st, &mac).is_none() {
-            format!("{} over SSH", crate::adopt::adopt_device(st, &mac, &payload)?)
-        } else {
-            format!("adopting {mac} over SSH")
-        };
-        let d = crate::adopt::device_doc_mut(st, &mac).ok_or("no record")?;
-        d["inform_url"] = payload["inform_url"].clone();
-        if let Some(fp) = &fingerprint
-            && d["x_ssh_hostkey_fingerprint"].is_null()
-        {
-            d["x_ssh_hostkey_fingerprint"] = json!(fp);
-        }
-        Ok(what)
-    }))
-    .await?;
+    let created = Arc::new(AtomicBool::new(false));
+    let made = created.clone();
+    crate::actions::apply_edit(&s, Box::new(move |st: &mut Value| ssh_record(st, &mac, &payload, fingerprint.as_deref(), &made))).await?;
     let key = {
         let live = s.live.read().unwrap();
         live.state.as_deref().and_then(|st| crate::adopt::device_doc(st, &mac)).and_then(|d| d["x_authkey"].as_str().map(str::to_string))
@@ -329,7 +335,7 @@ pub async fn adopt(State(s): State<AppState>, Json(b): Json<AdoptBody>) -> Resul
         Err(f) => {
             s.live.write().unwrap().adoption.adopting.remove(&mac);
             // Not adopted after all: a record made for it would make it look like one of ours.
-            if new {
+            if created.load(Ordering::Relaxed) {
                 let undo = move |st: &mut Value| crate::adopt::remove_device(st, &mac).map(|what| format!("{what}: adopting it over SSH failed"));
                 let _ = crate::actions::apply_edit(&s, Box::new(undo)).await;
             }
@@ -426,6 +432,24 @@ mod tests {
         assert_eq!(parse_mac("02:ab:00:00:00:9a\n").map(|m| m.to_string()).as_deref(), Some("02:ab:00:00:00:9a"));
         assert!(parse_mac("cat: no such file").is_none());
         assert!(parse_mac("02:ab-00:00:00:9a").is_none(), "one separator throughout");
+    }
+
+    #[test]
+    fn the_record_edit_says_whether_it_made_the_record() {
+        let mac: Mac = "02:00:00:00:00:09".parse().unwrap();
+        let payload = json!({ "mac": mac.to_string(), "ip": "192.0.2.9", "model": "U6M", "inform_url": "http://192.0.2.1:8080/inform" });
+        let mut st = json!({ "devices": [{ "mac": "02:00:00:00:00:01", "site_id": "s1" }] });
+        let created = AtomicBool::new(false);
+        assert!(ssh_record(&mut st, &mac, &payload, Some("SHA256:abc"), &created).unwrap().starts_with("adopted AP U6M"));
+        assert!(created.load(Ordering::Relaxed));
+        let d = crate::adopt::device_doc(&st, &mac).unwrap();
+        assert_eq!((d["inform_url"].as_str(), d["x_ssh_hostkey_fingerprint"].as_str(), d["x_authkey"].as_str().map(str::len)), (Some("http://192.0.2.1:8080/inform"), Some("SHA256:abc"), Some(32)));
+        // A record already there (made meanwhile, say) is not this edit's: a rollback leaves it, and its key.
+        let key = d["x_authkey"].clone();
+        assert_eq!(ssh_record(&mut st, &mac, &payload, Some("SHA256:other"), &created).unwrap(), format!("adopting {mac} over SSH"));
+        assert!(!created.load(Ordering::Relaxed));
+        let d = crate::adopt::device_doc(&st, &mac).unwrap();
+        assert_eq!((&d["x_authkey"], d["x_ssh_hostkey_fingerprint"].as_str()), (&key, Some("SHA256:abc")), "the first host key is kept");
     }
 
     #[test]

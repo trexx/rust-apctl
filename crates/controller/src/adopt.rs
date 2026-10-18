@@ -29,6 +29,7 @@ use crate::api::{ApiError, AppState, Json, MacPath};
 use crate::clock;
 use crate::engine::{Event, EventKind, Input, Live};
 use crate::model::Ts;
+use crate::settings::doc_mac;
 
 /// How long an AP has to come back with its new key.
 pub const ADOPT_TIMEOUT: Ts = 300;
@@ -76,20 +77,15 @@ pub struct Adoption {
     pub forgetting: HashMap<Mac, Ts>,
 }
 
-/// Whether a record's `mac` is this one (`aa:bb:..`, any case), without
-/// making a string for each record compared.
-fn is_mac(v: &Value, mac: &Mac) -> bool {
-    v.as_str().is_some_and(|s| s.len() == 17 && s.as_bytes()[2] == b':' && s.parse::<Mac>().is_ok_and(|m| m == *mac))
-}
-
-/// The AP's record in the settings.
+/// The AP's record in the settings, whatever its site (see
+/// [`crate::settings::site_id`]).
 pub fn device_doc<'a>(state: &'a Value, mac: &Mac) -> Option<&'a Value> {
-    state["devices"].as_array()?.iter().find(|d| is_mac(&d["mac"], mac))
+    state["devices"].as_array()?.iter().find(|d| doc_mac(&d["mac"]) == Some(*mac))
 }
 
 /// The AP's record in the settings, to change it.
 pub fn device_doc_mut<'a>(state: &'a mut Value, mac: &Mac) -> Option<&'a mut Value> {
-    state["devices"].as_array_mut()?.iter_mut().find(|d| is_mac(&d["mac"], mac))
+    state["devices"].as_array_mut()?.iter_mut().find(|d| doc_mac(&d["mac"]) == Some(*mac))
 }
 
 /// The key an AP apctl manages informs with: its record's `x_authkey`, else
@@ -109,7 +105,7 @@ pub fn device_key(state: Option<&Value>, keys: &KeyStore, mac: &Mac) -> Option<[
 /// encrypts with its record's `syslog_key`, which apctl makes at adoption).
 pub fn syslog_keys(state: Option<&Value>, keys: &KeyStore) -> Vec<(Mac, [u8; 32])> {
     let devices = state.and_then(|s| s["devices"].as_array()).into_iter().flatten();
-    let stored = devices.filter_map(|d| Some((d["mac"].as_str()?.parse().ok()?, inform::parse_key(d["syslog_key"].as_str()?).ok()?)));
+    let stored = devices.filter_map(|d| Some((doc_mac(&d["mac"])?, inform::parse_key(d["syslog_key"].as_str()?).ok()?)));
     stored.chain(keys.syslog_keys().map(|(m, k)| (*m, *k))).collect()
 }
 
@@ -268,12 +264,22 @@ pub fn adopt_device(state: &mut Value, mac: &Mac, payload: &Value) -> Result<Str
     }
     let d = new_device(state, payload, mac);
     crate::settings::push_doc(state, "devices", d);
-    Ok(format!("adopted AP {} ({mac})", payload["hostname"].as_str().or(payload["model"].as_str()).unwrap_or("new")))
+    let mut what = format!("adopted AP {} ({mac})", payload["hostname"].as_str().or(payload["model"].as_str()).unwrap_or("new"));
+    // It joins the IoT channel locks of the SSIDs it is to broadcast, as the
+    // APs there when a lock was switched on did. The official controller
+    // applies a lock only then, and leaves an AP adopted later on auto, which
+    // its device editor then refuses to move (and Channel AI leaves locked
+    // APs alone): apctl keeps every AP of a locked SSID on channel 6.
+    let channels = crate::settings::apply_channel_locks(state, &[], Some(mac));
+    if !channels.is_empty() {
+        what = format!("{what}; {}", channels.join("; "));
+    }
+    Ok(what)
 }
 
 /// Removes an AP from the settings and everything that names it.
 pub fn remove_device(state: &mut Value, mac: &Mac) -> Result<String, String> {
-    let same = |v: &Value| v.as_str().is_some_and(|m| m.parse::<Mac>().ok() == Some(*mac));
+    let same = |v: &Value| doc_mac(v) == Some(*mac);
     let devices = state["devices"].as_array_mut().ok_or("the settings have no APs")?;
     let before = devices.len();
     let name = devices.iter().find(|d| same(&d["mac"])).and_then(|d| d["name"].as_str()).map_or_else(|| mac.to_string(), |n| format!("{n} ({mac})"));
@@ -470,6 +476,28 @@ mod tests {
         assert_eq!((again["name"].as_str(), again["x_authkey"].as_str().unwrap().len()), (Some("U6-Mesh"), 32));
         assert!(again["x_authkey"] != d["x_authkey"] && again["syslog_key"] != d["syslog_key"]);
         assert!(again.get("x_inform_authkey").is_none(), "the AP has yet to inform with it");
+    }
+
+    #[test]
+    fn a_new_ap_joins_the_channel_locks_of_its_ssids() {
+        let wlan = |groups: Value| json!({ "name": "Things", "wlan_bands": ["2g"], "iot_channel_lock": true, "ap_group_ids": groups, "site_id": "s1" });
+        let mut s = state();
+        s["devices"][0]["radio_table"] = json!([{ "radio": "ng", "channel": 1 }]);
+        s["apgroup"] = json!([{ "_id": "all", "attr_hidden_id": "default", "site_id": "s1" }, { "_id": "g1", "for_wlanconf": true, "device_macs": ["02:00:00:00:00:01"], "site_id": "s1" }]);
+        // A locked SSID on every AP: the new one goes to 6, and the others are left as they are.
+        s["wlanconf"] = json!([wlan(json!(["all"]))]);
+        let mac: Mac = "02:00:00:00:00:09".parse().unwrap();
+        let what = adopt_device(&mut s, &mac, &inform()).unwrap();
+        assert!(what.ends_with("; AP U6-Mesh: 2.4 GHz channel 6"), "{what}");
+        let d = device_doc(&s, &mac).unwrap();
+        assert_eq!((d["radio_table"][0]["channel"].as_str(), d["radio_table"][1]["channel"].as_str()), (Some("6"), Some("auto")));
+        assert_eq!(s["devices"][0]["radio_table"][0]["channel"], 1);
+        // One on other APs only: the new one stays on auto.
+        let mut s = state();
+        s["apgroup"] = json!([{ "_id": "g1", "for_wlanconf": true, "device_macs": ["02:00:00:00:00:01"], "site_id": "s1" }]);
+        s["wlanconf"] = json!([wlan(json!(["g1"]))]);
+        adopt_device(&mut s, &mac, &inform()).unwrap();
+        assert_eq!(device_doc(&s, &mac).unwrap()["radio_table"][0]["channel"], "auto");
     }
 
     #[test]

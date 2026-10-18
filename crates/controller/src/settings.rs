@@ -101,7 +101,24 @@ pub fn id_of(v: &Value) -> Option<String> {
     oid(v).map(str::to_string)
 }
 
-/// The site the APs belong to (apctl manages one).
+/// The MAC a settings field holds (an AP record's `mac`, an entry of an AP
+/// group's `device_macs`...), in whichever form it is written: `aa:bb:..`,
+/// `AA-BB-..` or bare hex. Every lookup by MAC goes through this, so a
+/// record is found however it writes its MAC.
+pub(crate) fn doc_mac(v: &Value) -> Option<inform::Mac> {
+    v.as_str()?.parse().ok()
+}
+
+/// The site apctl manages: the one its APs belong to.
+///
+/// apctl manages one site. An import may hold several (`informdump import`
+/// reads every site), and each AP's config is rendered from its own site's
+/// documents, but the editors read and change this site's documents only:
+/// every lookup in a collection goes through [`docs`] / [`docs_mut`] (or
+/// [`setting`] / [`setting_mut`]), and new documents go in with [`push_doc`].
+/// The one exception is an AP's record looked up by its MAC
+/// ([`crate::adopt::device_doc`]): keys, adoption and forgetting go by the
+/// AP's own record, whatever site holds it.
 pub fn site_id(state: &Value) -> Option<&str> {
     state["devices"].as_array()?.iter().find_map(|d| d["site_id"].as_str())
 }
@@ -183,9 +200,14 @@ pub(crate) fn num(v: &Value) -> Option<i64> {
     v.as_i64().or_else(|| v.as_str()?.parse().ok())
 }
 
-/// The site's APs, as lowercase MACs.
+/// Some fields of a document, as they are (`null` for one it lacks).
+pub(crate) fn pick(v: &Value, keys: &[&str]) -> serde_json::Map<String, Value> {
+    keys.iter().map(|k| (k.to_string(), v[*k].clone())).collect()
+}
+
+/// The site's APs, as MACs written `aa:bb:..` (however their records write them).
 pub(crate) fn device_macs(state: &Value) -> Vec<String> {
-    docs(state, "devices").filter_map(|d| d["mac"].as_str().map(str::to_ascii_lowercase)).collect()
+    docs(state, "devices").filter_map(|d| doc_mac(&d["mac"])).map(|m| m.to_string()).collect()
 }
 
 /// Drops repeated entries, keeping the first of each in place.
@@ -207,6 +229,11 @@ pub(crate) fn band_name(band: &str) -> &str {
 /// The `radio_caps` bit of a radio with the "interference blocker" (hard noise floor).
 const INTERFERENCE_BLOCKER: i64 = 131072;
 
+/// Whether an AP record's radio has the interference blocker.
+fn has_blocker(radio: &Value) -> bool {
+    radio["radio_caps"].as_i64().is_some_and(|c| c & INTERFERENCE_BLOCKER != 0)
+}
+
 /// The APs an SSID is broadcast from: `None` for all of them.
 fn wlan_aps(state: &Value, w: &Value) -> Option<Vec<String>> {
     let groups: Vec<&str> = w["ap_group_ids"].as_array()?.iter().filter_map(Value::as_str).collect();
@@ -215,7 +242,7 @@ fn wlan_aps(state: &Value, w: &Value) -> Option<Vec<String>> {
         if g["attr_hidden_id"].as_str() == Some("default") {
             return None;
         }
-        macs.extend(g["device_macs"].as_array().into_iter().flatten().filter_map(Value::as_str).map(str::to_ascii_lowercase));
+        macs.extend(g["device_macs"].as_array().into_iter().flatten().filter_map(doc_mac).map(|m| m.to_string()));
     }
     macs.sort();
     macs.dedup();
@@ -228,7 +255,7 @@ pub async fn wlans(State(s): State<AppState>) -> Result<Json<Value>, ApiError> {
     let (state, informs) = {
         let live = s.live.read().unwrap();
         let informs: HashMap<inform::Mac, Arc<Value>> = live.state.as_deref().map_or_else(HashMap::new, |st| {
-            docs(st, "devices").filter_map(|d| d["mac"].as_str()?.parse().ok()).filter_map(|m| Some((m, live.raw_informs.get(&m)?.clone()))).collect()
+            docs(st, "devices").filter_map(|d| doc_mac(&d["mac"])).filter_map(|m| Some((m, live.raw_informs.get(&m)?.clone()))).collect()
         });
         (live.state.clone(), informs)
     };
@@ -241,14 +268,14 @@ pub async fn wlans(State(s): State<AppState>) -> Result<Json<Value>, ApiError> {
                 "id": id_of(w), "aps": wlan_aps(&state, w), "protection": protection_of(w), "editable": w["attr_no_edit"].as_bool() != Some(true),
                 "has_passphrase": w["x_passphrase"].as_str().is_some_and(|p| !p.is_empty()),
             });
-            for f in WLAN_FIELDS {
-                v[*f] = w[*f].clone();
+            if let Value::Object(o) = &mut v {
+                o.extend(pick(w, WLAN_FIELDS));
             }
             v
         })
         .collect();
     let networks: Vec<Value> = docs(&state, "networkconf").map(|n| json!({ "id": id_of(n), "name": n["name"], "vlan": n["vlan"], "purpose": n["purpose"] })).collect();
-    let aps: Vec<Value> = docs(&state, "devices").map(|d| json!({ "mac": d["mac"].as_str().map(str::to_ascii_lowercase), "name": d["name"] })).collect();
+    let aps: Vec<Value> = docs(&state, "devices").map(|d| json!({ "mac": doc_mac(&d["mac"]), "name": d["name"] })).collect();
     let (unsupported, unknown) = feature_support(&state, &informs);
     let mdns: Vec<Value> = apcfg::MDNS_SERVICES.iter().map(|(code, name, _)| json!({ "code": code, "name": name })).collect();
     Ok(Json(json!({ "active": s.active, "wlans": list, "networks": networks, "aps": aps, "unsupported": unsupported, "unknown": unknown, "mdns_services": mdns })))
@@ -260,14 +287,13 @@ fn feature_support(state: &Value, informs: &HashMap<inform::Mac, Arc<Value>>) ->
     let mut unsupported: serde_json::Map<String, Value> = apcfg::SSID_FEATURES.iter().map(|f| (f.to_string(), json!([]))).collect();
     let mut unknown = Vec::new();
     for d in docs(state, "devices") {
-        let Some(mac) = d["mac"].as_str().map(str::to_ascii_lowercase) else { continue };
-        let inform = mac.parse::<inform::Mac>().ok().and_then(|m| informs.get(&m));
-        match apcfg::ssid_feature_support(d, inform.map(|v| v.as_ref())) {
-            None => unknown.push(mac),
+        let Some(mac) = doc_mac(&d["mac"]) else { continue };
+        match apcfg::ssid_feature_support(d, informs.get(&mac).map(|v| v.as_ref())) {
+            None => unknown.push(mac.to_string()),
             Some(list) => {
                 for (f, ok) in list {
                     if !ok {
-                        unsupported[f].as_array_mut().unwrap().push(json!(mac));
+                        unsupported[f].as_array_mut().unwrap().push(json!(mac.to_string()));
                     }
                 }
             }
@@ -317,16 +343,13 @@ pub async fn device(State(s): State<AppState>, MacPath(mac): MacPath) -> Result<
         .into_iter()
         .flatten()
         .map(|r| {
-            let mut v = json!({});
-            for f in RADIO_FIELDS {
-                v[*f] = r[*f].clone();
-            }
+            let mut v = Value::Object(pick(r, RADIO_FIELDS));
             let band = r["radio"].as_str().unwrap_or("");
             v["caps"] = radio_caps(inform.as_deref(), band);
             v["channels"] = channels(&state, band, false);
             v["channels_outdoor"] = channels(&state, band, true);
             // The "interference blocker" exists only on radios reporting this capability.
-            v["has_blocker"] = json!(r["radio_caps"].as_i64().is_some_and(|c| c & INTERFERENCE_BLOCKER != 0));
+            v["has_blocker"] = json!(has_blocker(r));
             v
         })
         .collect();
@@ -339,8 +362,8 @@ pub async fn device(State(s): State<AppState>, MacPath(mac): MacPath) -> Result<
         "reported": inform.is_some(), "site_outdoor": site_outdoor, "advanced_features": advanced, "antennas": antennas,
         "ports": d["ethernet_table"].as_array().map_or(0, |t| t.iter().filter_map(|e| e["num_port"].as_i64()).sum::<i64>()),
     });
-    for f in DEVICE_FIELDS {
-        out[*f] = d[*f].clone();
+    if let Value::Object(o) = &mut out {
+        o.extend(pick(d, DEVICE_FIELDS));
     }
     Ok(Json(out))
 }
@@ -545,13 +568,19 @@ const PROTECTION: &[Protection] = &[
     Protection { name: "open", security: "open", wpa_mode: "wpa2", wpa3_support: false, wpa3_transition: false },
 ];
 
+/// An SSID's protection as the editor's rules read it: (WPA Personal, WPA3,
+/// WPA2/WPA3 transition). The transition flag means nothing without WPA3.
+fn psk_wpa3(w: &Value) -> (bool, bool, bool) {
+    let wpa3 = w["wpa3_support"].as_bool().unwrap_or(false);
+    (w["security"].as_str() == Some("wpapsk"), wpa3, wpa3 && w["wpa3_transition"].as_bool().unwrap_or(false))
+}
+
 /// The protection choice of a stored SSID, if it is one the editor offers.
-/// An open SSID's `wpa_mode`, and the transition flag without WPA3, mean nothing.
+/// An open SSID's `wpa_mode` means nothing.
 fn protection_of(w: &Value) -> Option<&'static str> {
     let security = w["security"].as_str()?;
     let wpa_mode = if security == "open" { "wpa2" } else { w["wpa_mode"].as_str().unwrap_or("wpa2") };
-    let wpa3 = w["wpa3_support"].as_bool().unwrap_or(false);
-    let transition = wpa3 && w["wpa3_transition"].as_bool().unwrap_or(false);
+    let (_, wpa3, transition) = psk_wpa3(w);
     PROTECTION.iter().find(|p| (p.security, p.wpa_mode, p.wpa3_support, p.wpa3_transition) == (security, wpa_mode, wpa3, transition)).map(|p| p.name)
 }
 
@@ -574,11 +603,11 @@ const MINRATE_NG: &[i64] = &[1000, 2000, 5500, 6000, 9000, 11000, 12000, 18000, 
 const MINRATE_NA: &[i64] = &[6000, 9000, 12000, 18000, 24000, 36000, 48000, 54000];
 
 fn find_wlan<'a>(state: &'a mut Value, id: &str) -> Option<&'a mut Value> {
-    state["wlanconf"].as_array_mut()?.iter_mut().find(|w| oid(w) == Some(id))
+    docs_mut(state, "wlanconf").find(|w| oid(w) == Some(id))
 }
 
 fn wlan<'a>(state: &'a Value, id: &str) -> Option<&'a Value> {
-    state["wlanconf"].as_array()?.iter().find(|w| oid(w) == Some(id))
+    docs(state, "wlanconf").find(|w| oid(w) == Some(id))
 }
 
 fn default_group(state: &Value) -> Option<String> {
@@ -586,7 +615,8 @@ fn default_group(state: &Value) -> Option<String> {
 }
 
 /// Sets which APs broadcast an SSID: all, or a list (kept in a hidden AP group
-/// of its own, as the official controller does). Groups left unused are removed.
+/// of its own, as the official controller does). The caller removes groups
+/// left unused ([`prune_groups`]).
 fn set_wlan_aps(state: &mut Value, id: &str, aps: Option<Vec<String>>) -> Result<(), String> {
     let own = {
         let current: Vec<&str> = wlan(state, id).and_then(|w| w["ap_group_ids"].as_array()).into_iter().flatten().filter_map(Value::as_str).collect();
@@ -616,7 +646,7 @@ fn set_wlan_aps(state: &mut Value, id: &str, aps: Option<Vec<String>>) -> Result
                     g
                 }
             };
-            if let Some(g) = state["apgroup"].as_array_mut().and_then(|l| l.iter_mut().find(|g| oid(g) == Some(gid.as_str()))) {
+            if let Some(g) = docs_mut(state, "apgroup").find(|g| oid(g) == Some(gid.as_str())) {
                 g["device_macs"] = json!(macs);
             }
             let w = find_wlan(state, id).ok_or("unknown SSID")?;
@@ -625,19 +655,21 @@ fn set_wlan_aps(state: &mut Value, id: &str, aps: Option<Vec<String>>) -> Result
             w["broadcasting_aps"] = json!(macs);
         }
     }
-    prune_groups(state);
     Ok(())
 }
 
-/// Removes per-SSID AP groups no SSID uses any more.
+/// Removes the site's per-SSID AP groups no SSID uses any more, as its AP
+/// group or as where one of its mDNS rules applies.
 fn prune_groups(state: &mut Value) {
-    let used: Vec<String> = state["wlanconf"].as_array().into_iter().flatten().flat_map(|w| w["ap_group_ids"].as_array().into_iter().flatten()).filter_map(Value::as_str).map(str::to_string).collect();
+    let site = site_id(state).map(str::to_string);
+    let ids = |v: &Value| v["ap_group_ids"].as_array().into_iter().flatten().filter_map(Value::as_str).map(str::to_string).collect::<Vec<_>>();
+    let used: Vec<String> = docs(state, "wlanconf").flat_map(|w| ids(w).into_iter().chain(w["mdns_proxy_custom"].as_array().into_iter().flatten().flat_map(ids))).collect();
     if let Some(groups) = state["apgroup"].as_array_mut() {
-        groups.retain(|g| g["for_wlanconf"].as_bool() != Some(true) || oid(g).is_some_and(|i| used.iter().any(|u| u == i)));
+        groups.retain(|g| !in_site(site.as_deref(), g) || g["for_wlanconf"].as_bool() != Some(true) || oid(g).is_some_and(|i| used.iter().any(|u| u == i)));
     }
 }
 
-/// The APs (lowercase MACs) an SSID is deployed to.
+/// The APs (`aa:bb:..`) an SSID is deployed to.
 fn deployed_to(state: &Value, w: &Value) -> Vec<String> {
     match wlan_aps(state, w) {
         None if w["ap_group_ids"].as_array().is_some_and(|a| !a.is_empty()) => device_macs(state),
@@ -727,17 +759,45 @@ fn check_mdns_rules(state: &Value, v: &Value) -> Result<Vec<Value>, String> {
     Ok(out)
 }
 
+/// A count the settings have over its limit: what is counted (an AP's band,
+/// the broadcast-filter addresses, the MAC filters sharing an AP group), how
+/// many, and the error that says so.
+struct Over {
+    what: String,
+    count: usize,
+    err: String,
+}
+
+/// Every count the settings have over its limit ([`wlan_limits`], [`list_limits`]).
+fn over_limits(state: &Value) -> Vec<Over> {
+    let mut out = wlan_limits(state);
+    out.extend(list_limits(state));
+    out
+}
+
+/// Refuses settings with a count over its limit that `before` (the
+/// [`over_limits`] before the edit) did not have that high: an edit may not
+/// go over a limit, but settings imported over one can still be edited
+/// otherwise, and brought back under it a step at a time.
+fn check_limits(before: &[Over], state: &Value) -> Result<(), String> {
+    match over_limits(state).into_iter().find(|o| !before.iter().any(|b| b.what == o.what && b.count >= o.count)) {
+        Some(o) => Err(o.err),
+        None => Ok(()),
+    }
+}
+
 /// The official limit of SSIDs per radio band on an AP: 4 when wireless
 /// meshing is on (the radios keep slots for it), else 8 (7 with element
-/// adoption). Disabled SSIDs count too.
-fn check_wlan_limits(state: &Value) -> Result<(), String> {
+/// adoption). Disabled SSIDs count too. Returns the radios over it.
+fn wlan_limits(state: &Value) -> Vec<Over> {
+    let mut out = Vec::new();
     let setting_on = |key: &str, default: bool| setting(state, key)["enabled"].as_bool().unwrap_or(default);
     let (meshing, element_adopt) = (setting_on("connectivity", true), setting_on("element_adopt", false));
     // Each SSID's bands and the APs it goes to, worked out once.
     let wlans: Vec<(Vec<&str>, Vec<String>)> =
         docs(state, "wlanconf").map(|w| (w["wlan_bands"].as_array().into_iter().flatten().filter_map(Value::as_str).collect(), deployed_to(state, w))).collect();
     for d in docs(state, "devices") {
-        let mac = d["mac"].as_str().unwrap_or_default().to_ascii_lowercase();
+        let Some(mac) = doc_mac(&d["mac"]).map(|m| m.to_string()) else { continue };
         let name = d["name"].as_str().unwrap_or(&mac);
         for (band, wb) in [("ng", "2g"), ("na", "5g"), ("6e", "6g")] {
             let radios: Vec<&Value> = d["radio_table"].as_array().into_iter().flatten().filter(|r| r["radio"].as_str() == Some(band)).collect();
@@ -753,11 +813,11 @@ fn check_wlan_limits(state: &Value) -> Result<(), String> {
             };
             let count = wlans.iter().filter(|(bands, aps)| bands.contains(&wb) && aps.contains(&mac)).count();
             if count > limit {
-                return Err(format!("{name} would have {count} SSIDs on its {} radio; it supports {limit}", band_name(band)));
+                out.push(Over { what: format!("{mac} {band}"), count, err: format!("{name} would have {count} SSIDs on its {} radio; it supports {limit}", band_name(band)) });
             }
         }
     }
-    Ok(())
+    out
 }
 
 /// What Force Wi-Fi 4 (`enhanced_iot`) holds an SSID to, with each field's
@@ -820,6 +880,12 @@ pub struct WlanEdit {
 /// Applies an edit to one SSID, with the official controller's rules for each
 /// field and the fields it derives on save.
 pub fn apply_wlan(state: &mut Value, e: &WlanEdit) -> Result<String, String> {
+    let over = over_limits(state);
+    edit_wlan(state, e, &over)
+}
+
+/// [`apply_wlan`], with the counts over their limits before the edit (see [`check_limits`]).
+fn edit_wlan(state: &mut Value, e: &WlanEdit, over: &[Over]) -> Result<String, String> {
     let (id, p) = (e.id.as_str(), &e.patch);
     let before = find_wlan(state, id).ok_or("unknown SSID")?.clone();
     if before["attr_no_edit"].as_bool() == Some(true) {
@@ -904,9 +970,10 @@ pub fn apply_wlan(state: &mut Value, e: &WlanEdit) -> Result<String, String> {
         };
         set_wlan_aps(state, id, aps)?;
     }
-    check_wlan_limits(state)?;
-    check_list_limits(state)?;
-    let channels = apply_channel_locks(state, &locked_aps_before);
+    // A group can go with a change of APs or of the mDNS rules.
+    prune_groups(state);
+    check_limits(over, state)?;
+    let channels = apply_channel_locks(state, &locked_aps_before, None);
 
     let after = wlan(state, id).ok_or("unknown SSID")?;
     let mut keys: Vec<&str> = after.as_object().map(|o| o.keys().map(String::as_str).collect()).unwrap_or_default();
@@ -943,9 +1010,7 @@ fn wlan_security(p: &Value, w: &mut Value) -> Result<(), String> {
         }
     }
     copy_fields(p, w, &[("pmf_mode", Enum(&["disabled", "optional", "required"]))])?;
-    let wpa3 = w["wpa3_support"].as_bool().unwrap_or(false);
-    let transition = w["wpa3_transition"].as_bool().unwrap_or(false);
-    let psk = w["security"].as_str() == Some("wpapsk");
+    let (psk, wpa3, transition) = psk_wpa3(w);
     match (psk && wpa3, transition, w["pmf_mode"].as_str().unwrap_or("disabled")) {
         (true, false, m) if m != "required" => return Err("WPA3 needs protected management frames (PMF) set to required".into()),
         (true, true, "disabled") => return Err("WPA2/WPA3 needs protected management frames (PMF) optional or required".into()),
@@ -967,11 +1032,7 @@ fn wlan_security(p: &Value, w: &mut Value) -> Result<(), String> {
 /// The password, checked against the protection the SSID ends up with (`w`,
 /// once Force Wi-Fi 4 has had its say).
 fn wlan_password(p: &Value, before: &Value, w: &mut Value, changed: &mut Vec<&str>) -> Result<(), String> {
-    let effective = |w: &Value| {
-        let wpa3 = w["wpa3_support"].as_bool().unwrap_or(false);
-        (w["security"].as_str() == Some("wpapsk"), wpa3, wpa3 && w["wpa3_transition"].as_bool().unwrap_or(false))
-    };
-    let (psk, wpa3, transition) = effective(w);
+    let (psk, wpa3, transition) = psk_wpa3(w);
     let given = p["passphrase"].as_str();
     if psk && given.is_none() && w["x_passphrase"].as_str().is_none_or(str::is_empty) {
         return Err("a password is needed for WPA2/WPA3".into());
@@ -980,7 +1041,7 @@ fn wlan_password(p: &Value, before: &Value, w: &mut Value, changed: &mut Vec<&st
     // came about (Force Wi-Fi 4 turns WPA3 off): WPA3 allows up to 255
     // characters, and a longer one kept for WPA2 would reach the APs as a key
     // they cannot use.
-    if given.is_some() || psk && (!p["protection"].is_null() || effective(before) != effective(w)) {
+    if given.is_some() || psk && (!p["protection"].is_null() || psk_wpa3(before) != psk_wpa3(w)) {
         let pass = given.or(w["x_passphrase"].as_str()).unwrap_or_default();
         let printable = pass.chars().all(|c| (' '..='~').contains(&c));
         let hex64 = pass.len() == 64 && pass.chars().all(|c| c.is_ascii_hexdigit());
@@ -1175,7 +1236,7 @@ fn wlan_links(state: &mut Value, p: &Value, w: &mut Value) -> Result<(), String>
     Ok(())
 }
 
-/// APs (lowercase MACs) broadcasting an SSID with the IoT channel lock.
+/// APs (`aa:bb:..`) broadcasting an SSID with the IoT channel lock.
 pub fn channel_locked_aps(state: &Value) -> Vec<String> {
     let mut out: Vec<String> = docs(state, "wlanconf").filter(|w| w["iot_channel_lock"].as_bool() == Some(true)).flat_map(|w| deployed_to(state, w)).collect();
     out.sort();
@@ -1187,12 +1248,14 @@ pub fn channel_locked_aps(state: &Value) -> Vec<String> {
 /// the official controller does when a lock changes: channel 6 on every AP an
 /// SSID with the lock is broadcast from, and back to auto on an AP in
 /// `released` (it had a locked SSID before the change) that has none left.
+/// With `only`, that AP alone: a newly adopted one (see `adopt_device`).
 /// Returns what changed, in words.
-fn apply_channel_locks(state: &mut Value, released: &[String]) -> Vec<String> {
+pub(crate) fn apply_channel_locks(state: &mut Value, released: &[String], only: Option<&inform::Mac>) -> Vec<String> {
     let locked = channel_locked_aps(state);
     let mut out = Vec::new();
-    for d in state["devices"].as_array_mut().into_iter().flatten() {
-        let Some(mac) = d["mac"].as_str().map(str::to_ascii_lowercase) else { continue };
+    for d in docs_mut(state, "devices") {
+        let Some(m) = doc_mac(&d["mac"]).filter(|m| only.is_none_or(|o| o == m)) else { continue };
+        let mac = m.to_string();
         let target = if locked.contains(&mac) {
             json!("6")
         } else if released.contains(&mac) {
@@ -1271,12 +1334,13 @@ pub fn default_usergroup(state: &Value) -> Option<String> {
 }
 
 /// Site-wide list limits: 256 broadcast-filter addresses in all, 512 MAC-filter
-/// addresses over the SSIDs sharing an AP group.
-fn check_list_limits(state: &Value) -> Result<(), String> {
+/// addresses over the SSIDs sharing an AP group. Returns the lists over them.
+fn list_limits(state: &Value) -> Vec<Over> {
+    let mut out = Vec::new();
     let len = |w: &Value, k: &str| w[k].as_array().map_or(0, Vec::len);
     let bc: usize = docs(state, "wlanconf").filter(|w| w["bc_filter_enabled"].as_bool() == Some(true)).map(|w| len(w, "bc_filter_list")).sum();
     if bc > 256 {
-        return Err(format!("{bc} broadcast-filter addresses in all; the limit is 256"));
+        out.push(Over { what: "bcfilter".into(), count: bc, err: format!("{bc} broadcast-filter addresses in all; the limit is 256") });
     }
     // As the official controller counts: the SSIDs sharing an AP group with
     // one (the default group counts as a group like any other).
@@ -1287,10 +1351,10 @@ fn check_list_limits(state: &Value) -> Result<(), String> {
     for (g, _) in &wlans {
         let total: usize = wlans.iter().filter(|(o, _)| o.iter().any(|x| g.contains(x))).map(|(_, n)| n).sum();
         if total > 512 {
-            return Err(format!("{total} MAC-filter addresses on SSIDs sharing an AP group; the limit is 512"));
+            out.push(Over { what: format!("macfilter {}", g.join(",")), count: total, err: format!("{total} MAC-filter addresses on SSIDs sharing an AP group; the limit is 512") });
         }
     }
-    Ok(())
+    out
 }
 
 /// Creates an SSID (`patch` holds at least a name and, unless open, a
@@ -1298,6 +1362,8 @@ fn check_list_limits(state: &Value) -> Result<(), String> {
 /// A refused SSID leaves `state` half-changed: callers work on a copy (the
 /// preview's, or the engine's, which is dropped on an error).
 pub fn create_wlan(state: &mut Value, patch: &Value) -> Result<String, String> {
+    // Counted before the new SSID is there: it adds to every count it is in.
+    let over = over_limits(state);
     let site = site_id(state).ok_or("the settings have no APs")?.to_string();
     let all = default_group(state).ok_or("the settings have no default AP group")?;
     let network = docs(state, "networkconf").find(|n| n["attr_hidden_id"].as_str() == Some("LAN")).or_else(|| docs(state, "networkconf").next()).and_then(id_of);
@@ -1330,7 +1396,7 @@ pub fn create_wlan(state: &mut Value, patch: &Value) -> Result<String, String> {
     }
     let name = patch["name"].as_str().unwrap_or_default().trim().to_string();
     array_mut(state, "wlanconf").push(doc);
-    apply_wlan(state, &WlanEdit { id, patch })?;
+    edit_wlan(state, &WlanEdit { id, patch }, &over)?;
     Ok(format!("added SSID \"{name}\""))
 }
 
@@ -1344,7 +1410,7 @@ pub fn delete_wlan(state: &mut Value, id: &str) -> Result<String, String> {
     let mut what = format!("deleted SSID \"{}\"", w["name"].as_str().unwrap_or("?"));
     array_mut(state, "wlanconf").retain(|x| oid(x) != Some(id));
     prune_groups(state);
-    let channels = apply_channel_locks(state, &released);
+    let channels = apply_channel_locks(state, &released, None);
     if !channels.is_empty() {
         what = format!("{what}; {}", channels.join("; "));
     }
@@ -1369,9 +1435,6 @@ pub struct DeviceEdit {
 pub fn apply_device(state: &mut Value, e: &DeviceEdit) -> Result<String, String> {
     let (m, mac) = (e.mac, e.mac.to_string());
     let p = &e.patch;
-    if !state["devices"].is_array() {
-        return Err("the settings have no APs".into());
-    }
     let before = crate::adopt::device_doc(state, &m).ok_or("this AP is not in the settings")?.clone();
     let mut d = before.clone();
 
@@ -1472,8 +1535,7 @@ fn radio_edit(state: &Value, e: &DeviceEdit, rp: &Value, before: &Value, d: &mut
     let caps = &e.caps[band];
     let label = band_name(band);
     let r = d["radio_table"].as_array_mut().and_then(|t| t.iter_mut().find(|r| r["radio"].as_str() == Some(band))).ok_or_else(|| format!("this AP has no {label} radio"))?;
-    if !rp["ht"].is_null() {
-        let ht = int_field(rp, "ht", 20, 320)?.unwrap_or(20);
+    if let Some(ht) = int_field(rp, "ht", 20, 320)? {
         let ok = match band {
             "ng" => [20, 40].contains(&ht),
             "na" | "6e" => [20, 40, 80].contains(&ht) || ht == 160 && caps["has_ht160"].as_bool() == Some(true),
@@ -1496,20 +1558,21 @@ fn radio_edit(state: &Value, e: &DeviceEdit, rp: &Value, before: &Value, d: &mut
     if let Some((ch, width)) = illegal_fixed_channel(country(state), r, o) {
         return Err(format!("{label}: channel {ch} is not allowed at {width} MHz here"));
     }
-    if band == "ng" && iot_lock && !same_channel(&r["channel"], inform_radio(before, band).map_or(&Value::Null, |x| &x["channel"])) {
-        return Err("the 2.4 GHz channel is locked by an SSID's IoT setting".into());
+    // The official controller refuses any change here, which strands an AP
+    // that came under the lock on another channel (one adopted after the lock
+    // was switched on stays on auto there); a change to the lock's channel is
+    // let through, so such an AP can join it.
+    if band == "ng" && iot_lock && !same_channel(&r["channel"], inform_radio(before, band).map_or(&Value::Null, |x| &x["channel"])) && !same_channel(&r["channel"], &json!(6)) {
+        return Err("the 2.4 GHz channel is locked by an SSID's IoT setting: it can only go to 6".into());
     }
     copy_fields(rp, r, &[("tx_power_mode", Enum(&["auto", "high", "medium", "low", "custom", "disabled"]))])?;
-    if !rp["tx_power"].is_null() {
-        let lo = caps["min_txpower"].as_i64().unwrap_or(1);
-        let hi = caps["max_txpower"].as_i64().unwrap_or(30);
-        let tx = int_field(rp, "tx_power", lo, hi).map_err(|_| format!("{label}: power must be {lo} to {hi} dBm"))?.unwrap_or(lo);
+    let (lo, hi) = (caps["min_txpower"].as_i64().unwrap_or(1), caps["max_txpower"].as_i64().unwrap_or(30));
+    if let Some(tx) = int_field(rp, "tx_power", lo, hi).map_err(|_| format!("{label}: power must be {lo} to {hi} dBm"))? {
         r["tx_power"] = json!(tx);
     }
     copy_fields(rp, r, &[("min_rssi_enabled", Bool), ("min_rssi", Int(-90, -67))])?;
     if let Some(b) = bool_field(rp, "hard_noise_floor_enabled")? {
-        let capable = r["radio_caps"].as_i64().is_some_and(|c| c & INTERFERENCE_BLOCKER != 0);
-        if b && !capable {
+        if b && !has_blocker(r) {
             return Err(format!("{label}: this radio has no interference blocker"));
         }
         r["hard_noise_floor_enabled"] = json!(b);
@@ -1579,7 +1642,7 @@ fn check_config_network(p: &Value, before: &Value) -> Result<Value, String> {
 
 /// A static address must not be another AP's, or one reserved for a client.
 fn check_ip_free(state: &Value, mac: &inform::Mac, ip: &str) -> Result<(), String> {
-    if let Some(o) = docs(state, "devices").find(|o| o["mac"].as_str().is_some_and(|m| m.parse::<inform::Mac>().ok() != Some(*mac)) && o["config_network"]["type"].as_str() == Some("static") && o["config_network"]["ip"].as_str() == Some(ip)) {
+    if let Some(o) = docs(state, "devices").find(|o| doc_mac(&o["mac"]) != Some(*mac) && o["config_network"]["type"].as_str() == Some("static") && o["config_network"]["ip"].as_str() == Some(ip)) {
         return Err(format!("{ip} is already {}'s address", o["name"].as_str().or(o["mac"].as_str()).unwrap_or("another AP")));
     }
     if let Some(c) = docs(state, "clients").find(|c| c["use_fixedip"].as_bool() == Some(true) && c["fixed_ip"].as_str() == Some(ip)) {
@@ -1851,6 +1914,14 @@ mod tests {
         assert_eq!((s["wlanconf"][0]["ap_group_mode"].as_str(), s["apgroup"].as_array().unwrap().len()), (Some("all"), 1));
         assert!(edit(&mut s, json!({ "aps": ["02:00:00:00:00:99"] })).is_err());
         assert!(edit(&mut s, json!({ "aps": [] })).is_err());
+        // A group an mDNS rule applies on stays while the rule does.
+        edit(&mut s, json!({ "aps": [AP2] })).unwrap();
+        let gid = s["wlanconf"][0]["ap_group_ids"][0].as_str().unwrap().to_string();
+        edit(&mut s, json!({ "mdns_proxy_mode": "custom", "mdns_proxy_custom": [{ "ap_scope_mode": "group", "ap_group_ids": [gid] }] })).unwrap();
+        edit(&mut s, json!({ "aps": null })).unwrap();
+        assert_eq!(s["apgroup"].as_array().unwrap().len(), 2);
+        edit(&mut s, json!({ "mdns_proxy_mode": "auto", "mdns_proxy_custom": [] })).unwrap();
+        assert_eq!(s["apgroup"].as_array().unwrap().len(), 1, "gone once no rule names it");
     }
 
     #[test]
@@ -1868,6 +1939,29 @@ mod tests {
             create_wlan(&mut s, &json!({ "name": format!("N{i}"), "passphrase": "password1" })).unwrap();
         }
         assert!(create_wlan(&mut s, &json!({ "name": "N4", "passphrase": "password1" })).unwrap_err().contains("supports 4"));
+    }
+
+    #[test]
+    fn settings_over_a_limit_can_still_be_edited() {
+        let mut s = state();
+        for i in 0..7 {
+            create_wlan(&mut s, &json!({ "name": format!("N{i}"), "passphrase": "password1" })).unwrap();
+        }
+        // A ninth SSID, as an import may have it: every radio is over its limit of 8.
+        let mut ninth = s["wlanconf"][1].clone();
+        (ninth["_id"], ninth["name"]) = (json!("w9"), json!("N9"));
+        s["wlanconf"].as_array_mut().unwrap().push(ninth);
+        edit(&mut s, json!({ "name": "Home again" })).unwrap();
+        assert!(create_wlan(&mut s.clone(), &json!({ "name": "N10", "passphrase": "password1" })).unwrap_err().contains("would have 10"));
+        // Back under the limit on 2.4 GHz (5 GHz stays at 9), then over it again: refused.
+        edit(&mut s, json!({ "wlan_bands": ["5g"] })).unwrap();
+        assert!(edit(&mut s, json!({ "wlan_bands": ["2g", "5g"] })).unwrap_err().contains("9 SSIDs on its 2.4 GHz radio"));
+        // The same for the list limits.
+        let list: Vec<String> = (0..300).map(|i| format!("02:00:00:00:{:02x}:{:02x}", i / 256, i % 256)).collect();
+        (s["wlanconf"][1]["bc_filter_enabled"], s["wlanconf"][1]["bc_filter_list"]) = (json!(true), json!(list));
+        edit(&mut s, json!({ "hide_ssid": true })).unwrap();
+        let more = json!({ "multicast_suppressor_mode": "aggressive", "bc_filter_list": ["02:00:00:00:ff:01"] });
+        assert!(edit(&mut s, more).unwrap_err().contains("301 broadcast-filter"));
     }
 
     #[test]
@@ -1951,10 +2045,14 @@ mod tests {
         // Narrowing the width keeps a channel legal; 140 only works at 20 MHz.
         assert!(dev(&mut s, json!({ "radios": [{ "radio": "na", "channel": 140 }] })).is_err());
         dev(&mut s, json!({ "radios": [{ "radio": "na", "channel": 140, "ht": 20 }] })).unwrap();
-        // An IoT channel lock on an SSID here freezes the 2.4 GHz channel.
+        // An IoT channel lock on an SSID here freezes the 2.4 GHz channel, but
+        // for a move onto the lock's channel 6 (from 1 here, set before the lock).
         s["wlanconf"][0]["iot_channel_lock"] = json!(true);
-        assert!(dev(&mut s, json!({ "radios": [{ "radio": "ng", "channel": 6 }] })).unwrap_err().contains("IoT"));
+        assert!(dev(&mut s, json!({ "radios": [{ "radio": "ng", "channel": 11 }] })).unwrap_err().contains("IoT"));
         dev(&mut s, json!({ "radios": [{ "radio": "ng", "tx_power_mode": "low" }] })).unwrap();
+        dev(&mut s.clone(), json!({ "radios": [{ "radio": "ng", "channel": 6 }] })).unwrap();
+        s["devices"][0]["radio_table"][0]["channel"] = json!("auto");
+        dev(&mut s.clone(), json!({ "radios": [{ "radio": "ng", "channel": "6" }] })).unwrap();
         // The lock keeps channel 6 as "6": asking for 6 again is no change.
         s["devices"][0]["radio_table"][0]["channel"] = json!("6");
         dev(&mut s, json!({ "radios": [{ "radio": "ng", "channel": 6 }] })).unwrap();
@@ -2028,14 +2126,15 @@ mod tests {
             "setting": [{ "key": "connectivity", "enabled": false }],
             "wlanconf": (0..8).map(|i| wlan(i, json!(["2g", "5g"]), json!(["all"]))).collect::<Vec<_>>(),
         });
-        assert!(check_wlan_limits(&s).is_ok(), "eight per radio");
+        let check = |s: &Value| check_limits(&[], s);
+        assert!(check(&s).is_ok(), "eight per radio");
         // A ninth on 5 GHz for the second AP only: the first is still fine.
         s["wlanconf"].as_array_mut().unwrap().push(wlan(8, json!(["5g"]), json!(["one"])));
-        assert!(check_wlan_limits(&s).unwrap_err().starts_with(&format!("{AP2} would have 9 SSIDs on its 5 GHz radio")));
+        assert!(check(&s).unwrap_err().starts_with(&format!("{AP2} would have 9 SSIDs on its 5 GHz radio")));
         // Wireless meshing on: four per radio.
         s["wlanconf"].as_array_mut().unwrap().truncate(5);
         s["setting"][0]["enabled"] = json!(true);
-        assert_eq!(check_wlan_limits(&s).unwrap_err(), "Hall would have 5 SSIDs on its 2.4 GHz radio; it supports 4");
+        assert_eq!(check(&s).unwrap_err(), "Hall would have 5 SSIDs on its 2.4 GHz radio; it supports 4");
     }
 
     #[test]
@@ -2043,9 +2142,9 @@ mod tests {
         let list = |n: usize| (0..n).map(|i| format!("02:00:00:00:{:02x}:{:02x}", i / 256, i % 256)).collect::<Vec<_>>();
         let wlan = |groups: &[&str], n: usize| json!({ "mac_filter_enabled": true, "ap_group_ids": groups, "mac_filter_list": list(n) });
         let s = json!({ "wlanconf": [wlan(&["a", "b"], 300), wlan(&["b"], 300)] });
-        assert!(check_list_limits(&s).unwrap_err().contains("600 MAC-filter"));
+        assert!(check_limits(&[], &s).unwrap_err().contains("600 MAC-filter"));
         let s = json!({ "wlanconf": [wlan(&["a"], 300), wlan(&["c"], 300), wlan(&["c"], 212)] });
-        check_list_limits(&s).unwrap();
+        check_limits(&[], &s).unwrap();
     }
 
     #[test]
@@ -2065,6 +2164,12 @@ mod tests {
         edit(&mut s, json!({ "iot_channel_lock": true })).unwrap();
         let e = DeviceEdit { mac: "02-00-00-00-00-01".parse().unwrap(), patch: json!({ "radios": [{ "radio": "ng", "channel": 1 }] }), caps: Value::Null, wireless_uplink: None, antennas: Value::Null };
         assert!(apply_device(&mut s, &e).unwrap_err().contains("IoT"));
+        // A record that writes its MAC another way is found, and listed as `aa:bb:..`.
+        let mut s = state();
+        s["devices"][1]["mac"] = json!("02-00-00-00-00-02");
+        assert_eq!(device_macs(&s), [AP1, AP2]);
+        assert!(crate::adopt::device_doc(&s, &AP2.parse().unwrap()).is_some());
+        edit(&mut s, json!({ "aps": [AP2] })).unwrap();
     }
 
     #[test]
@@ -2077,6 +2182,26 @@ mod tests {
         assert_eq!(setting_mut(&mut s, "ntp")["x"], 1, "a null site_id is in the site");
         setting_mut(&mut s, "mgmt");
         assert_eq!(s["setting"][1], json!({ "key": "mgmt" }));
+    }
+
+    #[test]
+    fn the_editors_change_the_aps_site_only() {
+        let mut s = state();
+        s["wlanconf"].as_array_mut().unwrap().push(json!({ "_id": "w2", "site_id": "s2", "name": "Elsewhere", "ap_group_ids": ["g9"] }));
+        s["apgroup"].as_array_mut().unwrap().push(json!({ "_id": "g9", "site_id": "s2", "for_wlanconf": true }));
+        s["usergroup"] = json!([{ "_id": "u2", "site_id": "s2", "name": "Theirs" }]);
+        s["clients"] = json!([{ "mac": "aa:bb:cc:00:00:01", "site_id": "s2", "blocked": true }]);
+        assert_eq!(apply_wlan(&mut s.clone(), &WlanEdit { id: "w2".into(), patch: json!({ "name": "Mine" }) }).unwrap_err(), "unknown SSID");
+        assert!(delete_wlan(&mut s.clone(), "w2").is_err());
+        assert!(apply_usergroup(&mut s.clone(), &GroupEdit { id: Some("u2".into()), patch: json!({ "name": "Mine" }), delete: false }).is_err());
+        // Pruning this site's per-SSID groups leaves another site's alone.
+        edit(&mut s, json!({ "aps": [AP1] })).unwrap();
+        edit(&mut s, json!({ "aps": null })).unwrap();
+        assert_eq!(s["apgroup"].as_array().unwrap().iter().filter_map(oid).collect::<Vec<_>>(), ["g0", "g9"]);
+        // A client's entry in another site is not this site's.
+        crate::actions::edit_client(&mut s, "aa:bb:cc:00:00:01".parse().unwrap(), &[("blocked", json!(false))]);
+        assert_eq!((s["clients"][0]["blocked"].as_bool(), s["clients"][1]["site_id"].as_str()), (Some(true), Some("s1")));
+        assert!(!crate::actions::controls(Some(&s), &"aa:bb:cc:00:00:01".parse().unwrap()).blocked);
     }
 
     #[test]
@@ -2174,7 +2299,7 @@ pub fn apply_usergroup(state: &mut Value, e: &GroupEdit) -> Result<String, Strin
         return Err(format!("another speed limit is called \"{n}\""));
     }
     let (g, created) = match &id {
-        Some(id) => (array_mut(state, "usergroup").iter_mut().find(|g| oid(g) == Some(id.as_str())).ok_or("unknown speed limit")?, false),
+        Some(id) => (docs_mut(state, "usergroup").find(|g| oid(g) == Some(id.as_str())).ok_or("unknown speed limit")?, false),
         None => {
             let n = name.ok_or("the new speed limit needs a name")?;
             (push_doc(state, "usergroup", json!({ "_id": new_id(), "name": n, "qos_rate_max_down": -1, "qos_rate_max_up": -1 })), true)
