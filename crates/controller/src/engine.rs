@@ -616,24 +616,34 @@ impl Engine {
         let mac = snap.ap.mac;
         self.write_metrics(&snap);
         self.check_isolated(ts, &snap);
+        bump(&self.counters.informs);
 
         // A handle of its own, so the engine's other fields stay usable while it is locked.
         let shared = self.live.clone();
-        let mut live = shared.write().unwrap();
-        if snap.has_vap_table {
-            live.raw_informs.insert(mac, Arc::new(decoded.payload));
-        }
-        bump(&self.counters.informs);
-        live.attribute(&snap.ap);
-
-        // The previous view is taken out (no copy) and replaced at the end; the lock is held throughout.
-        let prev = live.devices.remove(&mac);
-        let known = if prev.is_none() { live.known_devices.remove(&mac) } else { None };
-        let mut events = lifecycle_events(ts, &snap.ap, prev.as_ref(), known.as_ref());
+        // The AP's comings and goings are worked out under the read lock: the
+        // engine is the only writer of the devices, so the view read here is
+        // the one replaced below.
+        let mut events = {
+            let live = shared.read().unwrap();
+            let prev = live.devices.get(&mac);
+            let known = if prev.is_none() { live.known_devices.get(&mac) } else { None };
+            self.write_device_if_due(ts, &snap.ap, prev);
+            lifecycle_events(ts, &snap.ap, prev, known)
+        };
         if snap.has_vap_table {
             self.radio_events(ts, &snap, &mut events);
         }
-        self.write_device_if_due(ts, &snap.ap, prev.as_ref());
+        // Only for a report that lists clients: the UI refetches its client lists on it.
+        let has_clients = !snap.clients.is_empty();
+
+        // The write lock is held for the swaps alone. What they replace (the last
+        // full inform, the last snapshot) is dropped after it, and the events are
+        // emitted after it.
+        let mut live = shared.write().unwrap();
+        let old_inform = if snap.has_vap_table { live.raw_informs.insert(mac, Arc::new(decoded.payload)) } else { None };
+        live.attribute(&snap.ap);
+        let prev = live.devices.remove(&mac);
+        let known = if prev.is_none() { live.known_devices.remove(&mac) } else { None };
         // An upgrade apctl sent has landed: the AP reports the new version. One
         // event says so, not also a firmware change (see `lifecycle_events`).
         if let Some(v) = &snap.ap.version
@@ -642,15 +652,20 @@ impl Engine {
             events.retain(|e| e.kind != EventKind::ApFirmwareChanged);
             events.push(Event::device(ts, EventKind::ApUpgraded, mac, json!({ "from": j.from, "to": v, "custom": j.custom })));
         }
+        if snap.has_vap_table {
+            self.update_clients(&mut live, ts, &snap.clients, &mut events);
+        }
+        let (view, old_snapshot) = device_view(ts, peer, snap, prev, known.as_ref());
+        live.devices.insert(mac, view);
+        drop(live);
+        drop((old_inform, old_snapshot));
+
         for e in events {
             self.emit(e);
         }
-
-        if snap.has_vap_table {
-            self.update_clients(&mut live, ts, &snap.clients);
+        if has_clients {
+            let _ = self.tx.send(LiveMsg::Clients);
         }
-        live.devices.insert(mac, device_view(ts, peer, snap, prev, known.as_ref()));
-        drop(live);
         let _ = self.tx.send(LiveMsg::Device { mac });
     }
 
@@ -696,7 +711,9 @@ impl Engine {
         }
     }
 
-    fn update_clients(&mut self, live: &mut Live, ts: Ts, clients: &[Arc<ClientSample>]) {
+    /// Updates the clients a full inform lists; their events are added to
+    /// `events`, for the caller to emit once the lock is released.
+    fn update_clients(&mut self, live: &mut Live, ts: Ts, clients: &[Arc<ClientSample>], events: &mut Vec<Event>) {
         use std::collections::btree_map::Entry;
         for c in clients {
             self.connected.insert(c.mac);
@@ -747,11 +764,8 @@ impl Engine {
                     ],
                 );
             }
-            if let Some(e) = event {
-                self.emit(e);
-            }
+            events.extend(event);
         }
-        let _ = self.tx.send(LiveMsg::Clients);
     }
 
     /// A reply sent to an AP: by the other controller (shadow mode, compared in
@@ -1636,31 +1650,36 @@ fn lifecycle_events(ts: Ts, a: &crate::model::ApSample, prev: Option<&DeviceView
     events
 }
 
-/// The AP's live view after an inform at `ts`.
-fn device_view(ts: Ts, peer: String, snap: Snapshot, prev: Option<DeviceView>, known: Option<&KnownDevice>) -> DeviceView {
+/// The AP's live view after an inform at `ts`, and the snapshot it replaces
+/// (if whole), for the caller to drop once the lock is released.
+fn device_view(ts: Ts, peer: String, snap: Snapshot, prev: Option<DeviceView>, known: Option<&KnownDevice>) -> (DeviceView, Option<Snapshot>) {
     let first_seen = prev.as_ref().map(|p| p.first_seen).or(known.map(|k| k.first_seen)).unwrap_or(ts);
     match prev {
-        Some(p) => DeviceView {
+        Some(mut p) => {
             // Without a VAP table the inform says nothing of radios, VAPs or clients: keep the last full picture.
-            last_full_inform: if snap.has_vap_table { ts } else { p.last_full_inform },
-            snapshot: if snap.has_vap_table { snap } else { Snapshot { uplink: snap.uplink.or(p.snapshot.uplink), ap: snap.ap, ..p.snapshot } },
-            online: true,
-            first_seen,
-            last_seen: ts,
-            peer,
-            interval: p.interval,
-            last_config_push: p.last_config_push,
-        },
-        None => DeviceView {
-            last_full_inform: if snap.has_vap_table { ts } else { 0 },
-            snapshot: snap,
-            online: true,
-            first_seen,
-            last_seen: ts,
-            peer,
-            interval: DEFAULT_INTERVAL,
-            last_config_push: None,
-        },
+            let old = if snap.has_vap_table {
+                p.last_full_inform = ts;
+                Some(std::mem::replace(&mut p.snapshot, snap))
+            } else {
+                p.snapshot.uplink = snap.uplink.or(p.snapshot.uplink.take());
+                p.snapshot.ap = snap.ap;
+                None
+            };
+            (DeviceView { online: true, first_seen, last_seen: ts, peer, ..p }, old)
+        }
+        None => {
+            let view = DeviceView {
+                last_full_inform: if snap.has_vap_table { ts } else { 0 },
+                snapshot: snap,
+                online: true,
+                first_seen,
+                last_seen: ts,
+                peer,
+                interval: DEFAULT_INTERVAL,
+                last_config_push: None,
+            };
+            (view, None)
+        }
     }
 }
 
@@ -2199,6 +2218,16 @@ mod tests {
         assert!(live.commands.is_empty() && live.locating.is_empty() && live.reprovision.is_empty() && live.devices.is_empty());
         assert!(live.raw_informs.is_empty() && live.last_config.is_empty() && live.adoption.forgetting.is_empty() && live.by_ip.is_empty());
         assert!(managed.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn only_a_report_with_clients_announces_the_client_list() {
+        let mut h = harness();
+        let lists = |h: &mut Harness| std::iter::from_fn(|| h.rx.try_recv().ok()).filter(|m| matches!(m, LiveMsg::Clients)).count();
+        h.engine.handle(Input::Inform { ts: 0, peer: "x".into(), decoded: decoded(inform(AP1, 1000, &[])) });
+        assert_eq!(lists(&mut h), 0, "no clients: nothing for the client lists");
+        h.engine.handle(Input::Inform { ts: 10, peer: "x".into(), decoded: decoded(inform(AP1, 1010, &[(C1, "b1")])) });
+        assert_eq!(lists(&mut h), 1);
     }
 
     #[test]
