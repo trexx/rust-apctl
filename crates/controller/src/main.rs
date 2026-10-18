@@ -282,8 +282,9 @@ async fn serve(args: ServeArgs) -> Result<()> {
     })?;
 
     if active {
-        let url = inform_url.clone().unwrap_or_else(|| format!("http://unifi:{}/inform", inform_listen.port()));
-        let controller = dryrun::controller(url, emulate_version, reporter_id(&store)?);
+        // The configs pushed name this controller's own address and ports.
+        let (host, inform_port) = inform_address(inform_url.as_deref(), inform_listen);
+        let controller = apcfg::Controller { host, inform_port, stun_port: stun_listen.port(), ..dryrun::controller(emulate_version, reporter_id(&store)?) };
         let active_state = active::Active::new(&store, writer.clone(), live.clone(), keys.clone(), in_tx.clone(), controller, proxies.clone())?;
         start_active(Arc::new(active_state), &live, inform_url.as_deref(), inform_listen, stun_listen).await?;
     }
@@ -457,6 +458,22 @@ async fn shutdown(writer: store::Writer) {
     });
 }
 
+/// The controller's host and inform port as pushed configs give them: those of
+/// `inform_url` (port 80 when it names none, as for any http URL), else the
+/// name `unifi` and the inform listener's port.
+fn inform_address(inform_url: Option<&str>, inform_listen: SocketAddr) -> (String, u16) {
+    let parsed = inform_url.and_then(|u| {
+        let uri: axum::http::Uri = u.parse().ok()?;
+        Some((uri.host()?.to_string(), uri.port_u16().unwrap_or(80)))
+    });
+    if parsed.is_none()
+        && let Some(u) = inform_url
+    {
+        tracing::warn!("--inform-url {u} has no host: configs name the controller unifi:{}", inform_listen.port());
+    }
+    parsed.unwrap_or_else(|| ("unifi".into(), inform_listen.port()))
+}
+
 /// The address put in STUN answers: the host of the inform URL, an address
 /// or a name resolved once (to IPv4). None if it does not resolve; the
 /// socket's own address is used then.
@@ -488,6 +505,17 @@ async fn advertised_ip(inform_url: &str) -> Option<std::net::IpAddr> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn configs_name_the_inform_urls_host_and_port() {
+        let listen: SocketAddr = "0.0.0.0:8081".parse().unwrap();
+        let addr = |u: Option<&str>| inform_address(u, listen);
+        assert_eq!(addr(Some("http://unifi.example.net:8088/inform")), ("unifi.example.net".into(), 8088));
+        assert_eq!(addr(Some("http://unifi.example.net/inform")), ("unifi.example.net".into(), 80));
+        assert_eq!(addr(Some("http://[fd00::1]:8080/inform")), ("[fd00::1]".into(), 8080));
+        assert_eq!(addr(None), ("unifi".into(), 8081));
+        assert_eq!(addr(Some("not a url")), ("unifi".into(), 8081));
+    }
 
     #[tokio::test]
     async fn the_advertised_address_is_the_inform_urls_host() {

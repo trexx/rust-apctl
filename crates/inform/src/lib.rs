@@ -48,8 +48,8 @@ pub enum Error {
     TooShort(usize),
     #[error("bad magic {0:02x?}")]
     BadMagic([u8; 4]),
-    #[error("payload length {declared} does not match the {actual} bytes present")]
-    LengthMismatch { declared: usize, actual: usize },
+    #[error("payload length {declared} is more than the {actual} bytes present")]
+    Truncated { declared: usize, actual: usize },
     #[error("decryption failed (wrong key?)")]
     Decrypt,
     #[error("decompression failed: {0}")]
@@ -133,6 +133,8 @@ impl<'de> serde::Deserialize<'de> for Mac {
 pub struct Flags(pub u16);
 
 impl Flags {
+    /// No bit set: a plain, uncompressed payload.
+    pub const NONE: Flags = Flags(0);
     pub const ENCRYPTED: Flags = Flags(0x01);
     pub const ZLIB: Flags = Flags(0x02);
     pub const SNAPPY: Flags = Flags(0x04);
@@ -180,22 +182,26 @@ pub struct Header {
 }
 
 impl Header {
+    /// Reads the header at the start of `buf`; what follows it is not looked at.
     pub fn parse(buf: &[u8]) -> Result<Header> {
-        if buf.len() < HEADER_LEN {
+        let Some(h) = buf.first_chunk::<HEADER_LEN>() else {
             return Err(Error::TooShort(buf.len()));
+        };
+        // A field of the header, sized at compile time.
+        fn at<const N: usize>(h: &[u8; HEADER_LEN], offset: usize) -> [u8; N] {
+            std::array::from_fn(|i| h[offset + i])
         }
-        let magic: [u8; 4] = buf[0..4].try_into().unwrap();
+        let magic = at(h, 0);
         if &magic != MAGIC {
             return Err(Error::BadMagic(magic));
         }
-        let u32_at = |o: usize| u32::from_be_bytes(buf[o..o + 4].try_into().unwrap());
         Ok(Header {
-            packet_version: u32_at(4),
-            mac: Mac(buf[8..14].try_into().unwrap()),
-            flags: Flags(u16::from_be_bytes([buf[14], buf[15]])),
-            iv: buf[16..32].try_into().unwrap(),
-            payload_version: u32_at(32),
-            payload_len: u32_at(36),
+            packet_version: u32::from_be_bytes(at(h, 4)),
+            mac: Mac(at(h, 8)),
+            flags: Flags(u16::from_be_bytes(at(h, 14))),
+            iv: at(h, 16),
+            payload_version: u32::from_be_bytes(at(h, 32)),
+            payload_len: u32::from_be_bytes(at(h, 36)),
         })
     }
 
@@ -228,12 +234,14 @@ pub struct Packet<'a> {
 }
 
 impl<'a> Packet<'a> {
+    /// Splits a packet. Bytes after the declared payload are ignored; fewer than it
+    /// declares is [`Error::Truncated`].
     pub fn parse(buf: &'a [u8]) -> Result<Packet<'a>> {
         let header = Header::parse(buf)?;
         let body = &buf[HEADER_LEN..];
         let declared = header.payload_len as usize;
         if body.len() < declared {
-            return Err(Error::LengthMismatch { declared, actual: body.len() });
+            return Err(Error::Truncated { declared, actual: body.len() });
         }
         Ok(Packet { header, raw_header: &buf[..HEADER_LEN], body: &body[..declared] })
     }
@@ -416,7 +424,7 @@ mod tests {
     #[test]
     fn round_trips_every_flag_combination() {
         let combos = [
-            Flags(0),
+            Flags::NONE,
             Flags::ZLIB,
             Flags::SNAPPY,
             Flags::ENCRYPTED,
@@ -484,8 +492,12 @@ mod tests {
         assert!(matches!(Header::parse(&bad), Err(Error::BadMagic(_))));
         assert!(matches!(
             Packet::parse(&wire[..wire.len() - 1]),
-            Err(Error::LengthMismatch { .. })
+            Err(Error::Truncated { .. })
         ));
+        // Trailing bytes are left out of the body.
+        let mut long = wire.clone();
+        long.extend_from_slice(b"junk");
+        assert_eq!(Packet::parse(&long).unwrap().body, &wire[HEADER_LEN..]);
     }
 
     #[test]

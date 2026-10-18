@@ -29,15 +29,12 @@ pub fn inform(mac: &str) -> Value {
 
 pub fn controller() -> Controller {
     Controller {
-        inform_url: "http://unifi.example.net:8080/inform".into(),
-        mgmt_url: "https://unifi.example.net:8443".into(),
-        stun_url: "stun://unifi.example.net:3478/".into(),
-        // Taken from the AP's inform (`inform_ip`) instead.
-        syslog_ip: None,
+        host: "unifi.example.net".into(),
         version: "10.6.106".into(),
         // Not part of the settings snapshot (the official controller keeps it in its
         // system.properties); this is the sanitised value from the captures.
         reporter_uuid: "00000000-0000-4000-8000-000000000004".into(),
+        ..Default::default()
     }
 }
 

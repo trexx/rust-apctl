@@ -11,19 +11,25 @@ use crate::javahash::hash_set_order;
 use crate::json::{Text, arr, flag, int_of, mac_eq, on_off, override_of, str_list, str_of, text_of};
 use crate::meta::Meta;
 use crate::net::{self, Net};
-use crate::wlan::{self, Band, Radio, Vap, network_vlan, wlan_id};
-use crate::{Ctx, bit, mgmt, tz};
+use crate::wlan::{self, Band, Radio, Vap, network_vlan};
+use crate::{Cap, Ctx, LED, mgmt, tz};
 
 pub fn render(ctx: &Ctx) -> Result<(String, Value)> {
     let caps = ctx.caps;
-    let qca_v2 = bit(caps.wifi, 29);
+    let qca_v2 = caps.has(Cap::QcaV2);
     let mut meta = Meta::load(ctx, i64::from(qca_v2));
     let radios = wlan::radios(ctx);
     let wanted = wlan::deploy(ctx, &radios);
-    let keys: Vec<(String, &str)> = wanted.iter().map(|(w, r)| (wlan_id(w).to_string(), radios[*r].name)).collect();
+    let keys: Vec<(&str, &str)> = wanted.iter().map(|(id, _, r)| (*id, radios[*r].name)).collect();
     let slots = meta.wireless(&keys, |radio, k| if qca_v2 { format!("{radio}ap{k}") } else { format!("ath{k}") });
-    let vaps: Vec<Vap> =
-        wanted.into_iter().zip(slots).zip(keys).map(|(((w, radio), slot), (id, _))| Vap { id, w, radio, slot }).collect();
+    let vaps: Vec<Vap> = wanted
+        .into_iter()
+        .zip(slots)
+        .map(|((id, w, radio), slot)| {
+            let vlan = net::wlan_vlan(ctx, &w);
+            Vap { id, w, radio, slot, vlan }
+        })
+        .collect();
     let net = net::build(ctx, &radios, &vaps)?;
 
     // A typical system_cfg is 10-20 KB.
@@ -31,16 +37,16 @@ pub fn render(ctx: &Ctx) -> Result<(String, Value)> {
     unifi(&mut c, ctx);
     system(&mut c, ctx);
     users(&mut c, ctx)?;
-    if bit(caps.hw, 1) || bit(caps.hw, 14) {
+    if caps.any(LED) {
         ledbar(&mut c, ctx);
     }
-    wireless(&mut c, ctx, &radios, &vaps, &net);
+    wireless(&mut c, ctx, &radios, &vaps);
     c.header("connectivity");
     // Meshing (connectivity enabled) is not implemented: no uplink or downlink VAPs.
     c.set("connectivity.status", "disabled");
     net::render_vlan(&mut c, &net);
     net::render_bridge(&mut c, &net, &mut meta);
-    if bit(caps.wifi, 19) {
+    if caps.has(Cap::Marks) {
         c.header("mark");
         for (i, (name, bits, shift, location)) in
             [("guest", 2, 30, "skb"), ("vapid", 5, 11, "ubnt"), ("associd", 11, 0, "ubnt")].iter().enumerate()
@@ -69,10 +75,10 @@ pub fn render(ctx: &Ctx) -> Result<(String, Value)> {
     snmp(&mut c, ctx);
     ntp(&mut c, ctx);
     switch(&mut c, ctx);
-    if bit(caps.fw2, 28) {
+    if caps.has(Cap::MdnsProxy) {
         mdns(&mut c, ctx, &vaps, &net);
     }
-    if bit(caps.fw3, 6) {
+    if caps.has(Cap::PathMonitor) {
         c.header("pathmon");
         c.set("pathmon.status", "enabled");
         c.set("pathmon.interval", 5);
@@ -132,7 +138,7 @@ fn users(c: &mut Cfg, ctx: &Ctx) -> Result<()> {
     let mgmt = ctx.mgmt;
     // The crypt(3) hash is random-salted, so it is an input: the controller stores it
     // next to the password (as the official one caches it in the same field).
-    let field = if bit(ctx.caps.fw, 10) { "x_ssh_sha512passwd" } else { "x_ssh_md5passwd" };
+    let field = if ctx.caps.has(Cap::Sha512Passwd) { "x_ssh_sha512passwd" } else { "x_ssh_md5passwd" };
     let Some(hash) = str_of(mgmt, field) else {
         bail!("setting[mgmt].{field} is missing: store a crypt(3) hash of the SSH password there");
     };
@@ -156,7 +162,7 @@ fn ledbar(c: &mut Cfg, ctx: &Ctx) {
         let pct = int_of(ctx.device, "led_override_color_brightness").unwrap_or(100).clamp(0, 100);
         c.set("ledbar.brightness", 255 * pct / 100);
         c.set("ledbar.active", 3);
-        if bit(ctx.caps.hw, 1) {
+        if ctx.caps.has(Cap::LedColor) {
             let hex = str_of(ctx.device, "led_override_color").unwrap_or("#0000FF").trim_start_matches('#');
             let rgb = u32::from_str_radix(hex, 16).unwrap_or(0xff);
             c.set("ledbar.color.1.color", 3);
@@ -167,7 +173,7 @@ fn ledbar(c: &mut Cfg, ctx: &Ctx) {
     }
 }
 
-fn wireless(c: &mut Cfg, ctx: &Ctx, radios: &[Radio], vaps: &[Vap], net: &Net) {
+fn wireless(c: &mut Cfg, ctx: &Ctx, radios: &[Radio], vaps: &[Vap]) {
     let caps = ctx.caps;
     c.header("wlans (radio)");
     let mut any_stamgr = false;
@@ -182,13 +188,13 @@ fn wireless(c: &mut Cfg, ctx: &Ctx, radios: &[Radio], vaps: &[Vap], net: &Net) {
         let outdoor = override_of(ctx.device, "outdoor_mode_override", flag(ctx.mgmt, "outdoor_mode_enabled", false));
         c.set("radio.outdoor", on_off(outdoor));
         any_stamgr = wlan::render_radios(c, ctx, radios, vaps);
-        for i in 0..vaps.len() {
-            wlan::render_vap(c, ctx, radios, vaps, i, &net.vap_bridge[i]);
+        for v in vaps {
+            wlan::render_vap(c, ctx, radios, vaps, v);
         }
     }
     let conn = ctx.setting("connectivity");
     c.header("mesh");
-    if bit(caps.wifi, 11) {
+    if caps.has(Cap::Mesh) {
         c.set("mesh.status", "enabled");
         c.set("mesh.version", 3);
         c.opt("mesh.essid", str_of(conn, "x_mesh_essid"));
@@ -198,10 +204,10 @@ fn wireless(c: &mut Cfg, ctx: &Ctx, radios: &[Radio], vaps: &[Vap], net: &Net) {
     } else {
         c.set("mesh.status", "disabled");
     }
-    if bit(caps.wifi, 2) {
+    if caps.has(Cap::BandSteering) {
         bandsteering(c, ctx, radios, vaps);
     }
-    if bit(caps.wifi, 5) {
+    if caps.has(Cap::AirtimeFairness) {
         c.header("airtime fairness");
         c.set("atf.status", "enabled");
         c.set("atf.mode", on_off(flag(ctx.device, "atf_enabled", false)));
@@ -224,7 +230,7 @@ fn bandsteering(c: &mut Cfg, ctx: &Ctx, radios: &[Radio], vaps: &[Vap]) {
     }
     c.set("bandsteering.status", "enabled");
     c.set("bandsteering.mode", mode);
-    if !bit(ctx.caps.wifi, 3) {
+    if !ctx.caps.has(Cap::BandSteeringPairs) {
         return;
     }
     let mut k = 0;
@@ -262,7 +268,6 @@ fn mac_acl(c: &mut Cfg, ctx: &Ctx, vaps: &[Vap]) {
         if filtering {
             entries.extend(
                 str_list(&v.w, "mac_filter_list")
-                    .iter()
                     .map(|m| m.to_ascii_lowercase())
                     .filter(|m| policy != "allow" || !locked_elsewhere.contains(&m.as_str()))
                     .map(|m| (Cow::Owned(m), "user")),
@@ -345,14 +350,15 @@ fn syslog(c: &mut Cfg, ctx: &Ctx) {
     let enabled = flag(s, "enabled", false);
     let this = flag(s, "this_controller", false);
     let encrypted_only = flag(s, "this_controller_encrypted_only", false);
-    if enabled && this && encrypted_only && !bit(ctx.caps.fw, 24) {
+    if enabled && this && encrypted_only && !ctx.caps.has(Cap::EncryptedSyslog) {
         return;
     }
-    let wants_ap_logs = flag(s, "log_all_contents", false) || str_list(s, "contents").contains(&"access_points");
+    let wants_ap_logs = flag(s, "log_all_contents", false) || str_list(s, "contents").any(|c| c == "access_points");
     if enabled && !this && !wants_ap_logs {
         return;
     }
-    let controller_ip = ctx.controller.syslog_ip.as_deref().or_else(|| ctx.inform_str("inform_ip"));
+    // Logs for this controller go to the address the AP itself informs to.
+    let to_controller = (ctx.inform_str("inform_ip"), Some(Text::Str("5514")));
     c.header("syslog");
     c.set("syslog.status", "enabled");
     c.set("syslog.level", if enabled && flag(s, "debug", false) { 8 } else { 7 });
@@ -361,21 +367,13 @@ fn syslog(c: &mut Cfg, ctx: &Ctx) {
         c.opt("syslog.remote.key", str_of(ctx.device, "syslog_key"));
     }
     if enabled {
-        let (ip, port) = if this {
-            (controller_ip, Some(Text::Str("5514")))
-        } else {
-            (str_of(s, "ip"), text_of(s, "port"))
-        };
+        let (ip, port) = if this { to_controller } else { (str_of(s, "ip"), text_of(s, "port")) };
         c.opt("syslog.remote.ip", ip);
         c.opt("syslog.remote.port", port);
         c.set("syslog.remote.status", "enabled");
     }
     if this || flag(s, "netconsole_enabled", false) {
-        let (host, port) = if this {
-            (controller_ip, Some(Text::Str("5514")))
-        } else {
-            (str_of(s, "netconsole_host"), text_of(s, "netconsole_port"))
-        };
+        let (host, port) = if this { to_controller } else { (str_of(s, "netconsole_host"), text_of(s, "netconsole_port")) };
         c.opt("netconsole.host", host);
         c.opt("netconsole.port", port);
         c.set("netconsole.status", "enabled");
@@ -406,12 +404,12 @@ fn sshd(c: &mut Cfg, ctx: &Ctx) {
     }
 }
 
-/// `snmp.*`, no section header, nothing at all while SNMP is off. v3 needs
-/// firmware capability bit 14; the community is cut to 256 characters.
+/// `snmp.*`, no section header, nothing at all while SNMP is off. v1/v2c goes
+/// to every AP, v3 only to one with [`Cap::SnmpV3`]; the community is cut to 256 characters.
 fn snmp(c: &mut Cfg, ctx: &Ctx) {
     let s = ctx.setting("snmp");
     let v1 = flag(s, "enabled", false);
-    let v3 = flag(s, "enabledV3", false) && bit(ctx.caps.fw, 14);
+    let v3 = flag(s, "enabledV3", false) && ctx.caps.has(Cap::SnmpV3);
     if !v1 && !v3 {
         return;
     }
@@ -455,7 +453,7 @@ const MAX_PORTS: i64 = 52;
 
 fn switch(c: &mut Cfg, ctx: &Ctx) {
     c.header("switch");
-    if !bit(ctx.caps.fw, 4) {
+    if !ctx.caps.has(Cap::Switch) {
         return;
     }
     c.set("switch.status", "disabled");
@@ -568,7 +566,7 @@ fn mdns(c: &mut Cfg, ctx: &Ctx, vaps: &[Vap], net: &Net) {
     let groups = wlan::ap_groups(ctx);
     let applies = |e: &Value| match str_of(e, "ap_scope_mode").unwrap_or("all") {
         "all" => true,
-        "specific" => str_list(e, "ap_macs").iter().any(|m| mac_eq(m, &ctx.mac)),
+        "specific" => str_list(e, "ap_macs").any(|m| mac_eq(m, &ctx.mac)),
         "group" => wlan::in_groups(e, &groups),
         _ => false,
     };
@@ -590,10 +588,7 @@ fn mdns(c: &mut Cfg, ctx: &Ctx, vaps: &[Vap], net: &Net) {
     if isolation {
         c.set("mdns_sd.ap_mode", "enabled");
     }
-    let bridge_of_vlan = |vlan: i64| {
-        let tag = if vlan == 1 { 0 } else { vlan };
-        net.bridges.iter().find(|b| b.vlan == tag).map(|b| b.name.as_str())
-    };
+    let bridge_of_vlan = |vlan: Option<u16>| net.bridges.iter().find(|b| b.vlan == vlan).map(|b| b.name.as_str());
     let (mut f, mut p) = (0, 0);
     for wv in wlans {
         let w: &Value = &wv.w;
@@ -602,7 +597,7 @@ fn mdns(c: &mut Cfg, ctx: &Ctx, vaps: &[Vap], net: &Net) {
         let mut entries: Vec<MdnsEntry> = Vec::new();
         if str_of(w, "mdns_proxy_mode") == Some("custom") {
             let custom: Vec<&Value> = arr(w, "mdns_proxy_custom").iter().filter(|e| applies(e)).collect();
-            let lists_own = custom.iter().any(|e| own.is_some_and(|o| str_list(e, "networkconf_ids").contains(&o)));
+            let lists_own = custom.iter().any(|e| own.is_some_and(|o| str_list(e, "networkconf_ids").any(|n| n == o)));
             if !lists_own {
                 let all = custom.iter().any(|e| str_of(e, "services_mode") == Some("all"));
                 let mut union: Vec<&str> = Vec::new();
@@ -614,7 +609,7 @@ fn mdns(c: &mut Cfg, ctx: &Ctx, vaps: &[Vap], net: &Net) {
                 entries.push(MdnsEntry { networks: vec![own], mode: if all { "all" } else { "specific" }, services: Cow::Owned(union) });
             }
             entries.extend(custom.iter().map(|e| MdnsEntry {
-                networks: str_list(e, "networkconf_ids").into_iter().map(Some).collect(),
+                networks: str_list(e, "networkconf_ids").map(Some).collect(),
                 mode: str_of(e, "services_mode").unwrap_or("all"),
                 services: Cow::Owned(entry_services(e)),
             }));
@@ -640,7 +635,8 @@ fn mdns(c: &mut Cfg, ctx: &Ctx, vaps: &[Vap], net: &Net) {
             }
             for n in &e.networks {
                 f += 1;
-                c.set(format_args!("mdns_sd.filter.{f}.vlan"), network_vlan(ctx, *n));
+                // An untagged network is VLAN 1 here.
+                c.set(format_args!("mdns_sd.filter.{f}.vlan"), network_vlan(ctx, *n).unwrap_or(1));
                 c.set(format_args!("mdns_sd.filter.{f}.policy"), if e.mode == "all" { "allow" } else { "deny" });
                 for (i, d) in devs.iter().enumerate() {
                     c.set(format_args!("mdns_sd.filter.{f}.dst.{}.devname", i + 1), d);
@@ -776,14 +772,7 @@ mod tests {
         let state = json!({ "sites": [{ "_id": "s" }], "devices": [
             { "mac": mac, "site_id": "s", "type": "uap", "fw_caps": 16, "ethernet_table": ethernet_table, "port_overrides": port_overrides },
         ]});
-        let controller = Controller {
-            inform_url: String::new(),
-            mgmt_url: String::new(),
-            stun_url: String::new(),
-            syslog_ip: None,
-            version: String::new(),
-            reporter_uuid: String::new(),
-        };
+        let controller = Controller::default();
         let ctx = Ctx::new(&Input { state: &state, device_mac: mac, inform: None, cfgversion: "1", controller: &controller }).unwrap();
         let mut c = Cfg::default();
         switch(&mut c, &ctx);

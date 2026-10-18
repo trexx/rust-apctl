@@ -108,11 +108,11 @@ impl Meta {
 
     /// Allocates the VAPs `(wlan id, radio name)` in deploy order. `name` builds an
     /// interface name from radio name and global VAP index.
-    pub fn wireless(&mut self, wanted: &[(String, &str)], name: impl Fn(&str, u32) -> String) -> Vec<WifiSlot> {
+    pub fn wireless(&mut self, wanted: &[(&str, &str)], name: impl Fn(&str, u32) -> String) -> Vec<WifiSlot> {
         let kept: Vec<Option<Wifi>> = wanted
             .iter()
             .map(|(id, radio)| {
-                let pos = self.old_wifi.iter().position(|w| &w.id == id && w.radio == *radio)?;
+                let pos = self.old_wifi.iter().position(|w| w.id == *id && w.radio == *radio)?;
                 Some(self.old_wifi.remove(pos))
             })
             .collect();
@@ -136,7 +136,7 @@ impl Meta {
             .enumerate()
             .map(|(i, (w, (id, radio)))| {
                 w.unwrap_or_else(|| Wifi {
-                    id: id.clone(),
+                    id: id.to_string(),
                     radio: radio.to_string(),
                     device_name: name(radio, vap_indices[i]),
                     vap_index: vap_indices[i],
