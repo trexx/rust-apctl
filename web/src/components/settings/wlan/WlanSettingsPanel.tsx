@@ -49,7 +49,12 @@ export function WlanSettingsPanel() {
               {(w.wlan_bands ?? [])
                 .map((b) => band(BAND_RADIO[b] ?? b))
                 .join(" + ")}{" "}
-              · {w.aps === null ? "all APs" : w.aps.map(apName).join(", ")}
+              ·{" "}
+              {w.aps === null
+                ? "all APs"
+                : w.aps.length === 0
+                  ? "no APs"
+                  : w.aps.map(apName).join(", ")}
             </td>
             <td className="nowrap">
               {!readOnly && w.editable && (
