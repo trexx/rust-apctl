@@ -19,8 +19,9 @@ use serde_json::{Value, json};
 use tokio::sync::broadcast;
 
 use crate::clock;
-use crate::engine::{AliasEdit, ClientView, DeviceView, KnownDevice, LiveMsg, SharedLive};
+use crate::engine::{AliasEdit, ClientView, DeviceView, KnownDevice, Live, LiveMsg, SharedLive};
 use crate::model::{ClientSample, Ts};
+use crate::series::{ap_name_of, client_name};
 use crate::store::{self, Db, Store};
 
 /// What the handlers share. Cloned for every request (and by some handlers
@@ -358,7 +359,8 @@ async fn status(State(s): State<AppState>) -> ApiResult {
         "started": s.started,
         "now": clock::now_ts(),
         "counters": &*live.counters,
-        "devices": live.devices.len(),
+        // With the APs known from the database only, as the device list has them.
+        "devices": live.devices.len() + stored_only(&live).count(),
         "devices_online": live.devices.values().filter(|d| d.online).count(),
         "clients_connected": connected,
         "clients_by_band": by_band,
@@ -379,6 +381,11 @@ async fn healthz(State(s): State<AppState>) -> Response {
     "ok".into_response()
 }
 
+/// The APs known from the database only: not reporting since apctl started.
+fn stored_only(live: &Live) -> impl Iterator<Item = (&Mac, &KnownDevice)> {
+    live.known_devices.iter().filter(|(mac, _)| !live.devices.contains_key(mac))
+}
+
 /// An AP known from the database only (see `Live::known_devices`), as a live
 /// device view of it, offline: what was not stored is empty.
 fn stored_view(mac: Mac, k: &KnownDevice) -> DeviceView {
@@ -396,12 +403,19 @@ fn stored_view(mac: Mac, k: &KnownDevice) -> DeviceView {
     }
 }
 
-/// An AP known from the database only, as its row in the device list.
-fn stored_row(mac: Mac, k: &KnownDevice) -> DeviceRow {
+/// An AP's row in the device list, with `clients` connected to it; `locating`
+/// is none for an AP known from the database only (`stored_view`).
+fn device_row(mac: Mac, d: &DeviceView, clients: usize, locating: Option<bool>) -> DeviceRow {
+    let a = &d.snapshot.ap;
     DeviceRow {
-        mac, name: k.hostname.clone(), model: k.model.clone(), model_display: k.model_display.clone(), version: k.version.clone(), ip: k.ip.clone(),
-        online: false, first_seen: k.first_seen, last_seen: k.last_seen, uptime: None, cpu: None, mem: None,
-        load1: None, satisfaction: None, clients: 0, uplink: None, radios: vec![], last_config_push: None, locating: None, stored_only: true,
+        mac, name: a.hostname.clone(), model: a.model.clone(), model_display: a.model_display.clone(), version: a.version.clone(), ip: a.ip.clone(),
+        online: d.online, first_seen: d.first_seen, last_seen: d.last_seen, uptime: a.uptime, cpu: a.cpu, mem: a.mem, load1: a.load1,
+        satisfaction: a.satisfaction, clients,
+        uplink: d.snapshot.uplink.as_ref().map(|u| UplinkRow { speed: u.speed, up: u.up, full_duplex: u.full_duplex }),
+        radios: d.snapshot.radios.iter().map(|r| RadioRow {
+            radio: r.radio.clone(), channel: r.channel, bw: r.bw, tx_power: r.tx_power, cu_total: r.cu_total, noise_floor: r.noise_floor, clients: r.num_sta,
+        }).collect(),
+        last_config_push: d.last_config_push, locating, stored_only: locating.is_none(),
     }
 }
 
@@ -460,29 +474,10 @@ async fn devices(State(s): State<AppState>) -> Json<Vec<DeviceRow>> {
         for c in live.clients.values().filter(|c| c.connected) {
             *per_ap.entry(c.sample.ap_mac).or_default() += 1;
         }
-        let mut list: Vec<DeviceRow> = live
-            .devices
-            .iter()
-            .map(|(mac, d)| {
-                let a = &d.snapshot.ap;
-                DeviceRow {
-                    mac: *mac, name: a.hostname.clone(), model: a.model.clone(), model_display: a.model_display.clone(),
-                    version: a.version.clone(), ip: a.ip.clone(), online: d.online,
-                    first_seen: d.first_seen, last_seen: d.last_seen, uptime: a.uptime, cpu: a.cpu, mem: a.mem, load1: a.load1,
-                    satisfaction: a.satisfaction, clients: per_ap.get(mac).copied().unwrap_or(0),
-                    uplink: d.snapshot.uplink.as_ref().map(|u| UplinkRow { speed: u.speed, up: u.up, full_duplex: u.full_duplex }),
-                    radios: d.snapshot.radios.iter().map(|r| RadioRow {
-                        radio: r.radio.clone(), channel: r.channel, bw: r.bw, tx_power: r.tx_power, cu_total: r.cu_total,
-                        noise_floor: r.noise_floor, clients: r.num_sta,
-                    }).collect(),
-                    last_config_push: d.last_config_push,
-                    locating: Some(live.locating.contains(mac)),
-                    stored_only: false,
-                }
-            })
-            .collect();
+        let mut list: Vec<DeviceRow> =
+            live.devices.iter().map(|(mac, d)| device_row(*mac, d, per_ap.get(mac).copied().unwrap_or(0), Some(live.locating.contains(mac)))).collect();
         // Then the APs not reporting since apctl started, by MAC as the others.
-        let mut stored: Vec<DeviceRow> = live.known_devices.iter().filter(|(mac, _)| !live.devices.contains_key(mac)).map(|(mac, k)| stored_row(*mac, k)).collect();
+        let mut stored: Vec<DeviceRow> = stored_only(&live).map(|(mac, k)| device_row(*mac, &stored_view(*mac, k), 0, None)).collect();
         stored.sort_unstable_by_key(|d| d.mac);
         list.append(&mut stored);
         list
@@ -601,7 +596,7 @@ impl Serialize for ListedSample<'_> {
     }
 }
 
-type ClientCopy = (Mac, ClientView, Option<String>, Option<crate::engine::Alias>);
+type ClientCopy = (Mac, ClientView, Option<crate::engine::Alias>);
 
 /// Every client: the ones seen in this run and the ones restored from the
 /// database at start (`Engine::restore` loads them all, so the live view is
@@ -609,22 +604,17 @@ type ClientCopy = (Mac, ClientView, Option<String>, Option<crate::engine::Alias>
 async fn clients(State(s): State<AppState>) -> Response {
     // What each client's entry needs, copied under the lock (the samples are
     // shared, the rest is small); the serialising happens after it.
-    let (state, list) = {
+    // The APs' names once each, rather than once per client.
+    let (state, list, ap_names) = {
         let live = s.live.read().unwrap();
-        let list: Vec<ClientCopy> = live
-            .clients
-            .iter()
-            .map(|(mac, c)| {
-                let ap_name = live.devices.get(&c.sample.ap_mac).and_then(|d| d.snapshot.ap.hostname.clone());
-                (*mac, c.clone(), ap_name, live.aliases.get(mac).cloned())
-            })
-            .collect();
-        (live.state.clone(), list)
+        let list: Vec<ClientCopy> = live.clients.iter().map(|(mac, c)| (*mac, c.clone(), live.aliases.get(mac).cloned())).collect();
+        let ap_names: std::collections::HashMap<Mac, String> = live.devices.keys().filter_map(|m| Some((*m, ap_name_of(&live, m)?))).collect();
+        (live.state.clone(), list, ap_names)
     };
     let controls = crate::actions::ClientControls::new(state.as_deref());
     let rows: Vec<ListedClient> = list
         .iter()
-        .map(|(mac, view, ap_name, alias)| ListedClient {
+        .map(|(mac, view, alias)| ListedClient {
             client: ClientRow {
                 view: ListedView::new(view),
                 alias: alias.as_ref().and_then(|a| a.alias.as_deref()),
@@ -632,7 +622,7 @@ async fn clients(State(s): State<AppState>) -> Response {
                 vendor: s.vendors.lookup(mac),
                 controls: controls.get(mac),
             },
-            ap_name: ap_name.as_deref(),
+            ap_name: ap_names.get(&view.sample.ap_mac).map(String::as_str),
         })
         .collect();
     Json(rows).into_response()
@@ -644,16 +634,10 @@ async fn client_names(State(s): State<AppState>) -> Json<std::collections::HashM
     let live = s.live.read().unwrap();
     let names = live
         .clients
-        .iter()
-        .filter_map(|(mac, c)| Some((mac.to_string(), client_name(&live, mac, c)?.to_string())))
+        .keys()
+        .filter_map(|mac| Some((mac.to_string(), client_name(&live, Some(*mac))?.to_string())))
         .collect();
     Json(names)
-}
-
-/// A client's display name: its alias, else its hostname; none when it has neither.
-fn client_name<'a>(live: &'a crate::engine::Live, mac: &Mac, c: &'a ClientView) -> Option<&'a str> {
-    let alias = live.aliases.get(mac).and_then(|a| a.alias.as_deref());
-    alias.or(c.sample.hostname.as_deref()).filter(|n| !n.is_empty())
 }
 
 /// A client's page: its view (with the multicast tables), plus the peers in its multicast groups.
@@ -674,16 +658,20 @@ struct Peer {
 
 /// The other connected clients in each of `groups`, sorted by name: a scan of the live clients,
 /// made only for a client that joined some.
-fn multicast_peers(live: &crate::engine::Live, mac: &Mac, groups: &[String]) -> std::collections::BTreeMap<String, Vec<Peer>> {
+fn multicast_peers(live: &Live, mac: &Mac, groups: &[String]) -> std::collections::BTreeMap<String, Vec<Peer>> {
     let mut by: std::collections::BTreeMap<String, Vec<Peer>> = std::collections::BTreeMap::new();
     if groups.is_empty() {
         return by;
     }
     for (m, c) in live.clients.iter().filter(|(m, c)| c.connected && *m != mac) {
         let Some(joined) = c.sample.multicast.as_ref().map(|x| &x.memberships) else { continue };
-        for g in joined.iter().filter(|g| groups.contains(g)) {
-            let name = client_name(live, m, c).map_or_else(|| m.to_string(), str::to_string);
-            by.entry(g.clone()).or_default().push(Peer { mac: *m, name });
+        let mut shared = joined.iter().filter(|g| groups.contains(g)).peekable();
+        if shared.peek().is_none() {
+            continue;
+        }
+        let name = client_name(live, Some(*m)).map_or_else(|| m.to_string(), str::to_string);
+        for g in shared {
+            by.entry(g.clone()).or_default().push(Peer { mac: *m, name: name.clone() });
         }
     }
     for peers in by.values_mut() {
@@ -1019,6 +1007,21 @@ fn kinds_with_prefix(c: &rusqlite::Connection, prefix: &str) -> rusqlite::Result
     stmt.query_map((prefix, format!("{prefix}{}", char::MAX)), |r| r.get(0))?.collect()
 }
 
+/// A list catching up over at most this many rows (by id) reads them all by id.
+const CATCH_UP_SCAN: i64 = 10_000;
+
+/// Whether a list catching up on the rows of `table` stored after `after`
+/// reads them by id (the rowid), which visits every row stored since: when
+/// there are few. An index on the filters would walk back through every older
+/// row when fewer than the limit are new; but over many rows (a list filtered
+/// to something rare, whose newest row is old) it serves better, as without
+/// `after`, which then only drops the older rows.
+fn catch_up_by_id(c: &rusqlite::Connection, table: &str, after: Option<i64>) -> rusqlite::Result<bool> {
+    let Some(after) = after else { return Ok(false) };
+    let newest: i64 = c.prepare_cached(&format!("SELECT coalesce(max(id), 0) FROM {table}"))?.query_row([], |r| r.get(0))?;
+    Ok(newest - after <= CATCH_UP_SCAN)
+}
+
 async fn events(State(s): State<AppState>, Query(q): Query<EventQuery>) -> Result<Json<Vec<EventRow>>, ApiError> {
     let mut w = Where::default();
     if let Some(d) = &q.device {
@@ -1043,10 +1046,12 @@ async fn events(State(s): State<AppState>, Query(q): Query<EventQuery>) -> Resul
         if !prefixes.is_empty() && kinds.is_empty() {
             return Ok(vec![]);
         }
-        let sql = if let Some(after) = after {
-            // Catching up: the few events stored since, found by id (the
-            // rowid). An index on the filters would walk back through every
-            // older event when fewer than the limit are new.
+        let by_id = catch_up_by_id(c, "events", after)?;
+        if let Some(after) = after.filter(|_| !by_id) {
+            // Unary plus: not by the rowid range, which would visit every event since.
+            w.and("+id > ?", Sql::Integer(after));
+        }
+        let sql = if let Some(after) = after.filter(|_| by_id) {
             w.and("id > ?", Sql::Integer(after));
             if !kinds.is_empty() {
                 let marks: Vec<String> = kinds.into_iter().map(|k| w.param(Sql::Text(k))).collect();
@@ -1088,8 +1093,8 @@ struct LogQuery {
     after: Option<i64>,
 }
 
-/// The SQL for a log query, newest first.
-fn logs_sql(w: &mut Where, device: Option<Mac>, search: Option<&str>, after: Option<i64>, limit: i64) -> String {
+/// The SQL for a log query, newest first; `by_id` as `catch_up_by_id` decides.
+fn logs_sql(w: &mut Where, device: Option<Mac>, search: Option<&str>, after: Option<i64>, by_id: bool, limit: i64) -> String {
     const COLUMNS: &str = "l.ts, l.device_mac, l.src_ip, l.facility, l.severity, l.program, l.msg, l.id";
     if let Some(text) = search {
         // Quote each word so user input cannot break FTS syntax; words are ANDed.
@@ -1111,14 +1116,18 @@ fn logs_sql(w: &mut Where, device: Option<Mac>, search: Option<&str>, after: Opt
             w.sql()
         );
     }
-    // Catching up, the few lines stored since are found by id (the rowid):
-    // the time index would walk back through every older line when fewer
-    // than the limit are new.
-    let from = if let Some(after) = after {
-        w.and("l.id > ?", Sql::Integer(after));
-        "logs l NOT INDEXED"
-    } else {
-        "logs l"
+    // Catching up over few lines, they are read by id (see `catch_up_by_id`);
+    // over many, from an index (the unary plus keeps the rowid range out).
+    let from = match after {
+        Some(after) if by_id => {
+            w.and("l.id > ?", Sql::Integer(after));
+            "logs l NOT INDEXED"
+        }
+        Some(after) => {
+            w.and("+l.id > ?", Sql::Integer(after));
+            "logs l"
+        }
+        None => "logs l",
     };
     format!("SELECT {COLUMNS} FROM {from} WHERE {} ORDER BY l.ts DESC, l.id DESC LIMIT {limit}", w.sql())
 }
@@ -1140,9 +1149,11 @@ async fn logs(State(s): State<AppState>, Query(q): Query<LogQuery>) -> Result<Js
     let device = q.device.as_deref().map(parse_mac).transpose()?;
     let search = q.q.as_deref().filter(|t| !t.trim().is_empty());
     let limit = q.limit.unwrap_or(500).clamp(1, 5000);
-    let mut w = Where::default();
-    let sql = logs_sql(&mut w, device, search, q.after, limit);
+    let (search, after) = (search.map(str::to_string), q.after);
     let rows = read(&s.store, Db::Logs, move |c| {
+        let by_id = search.is_none() && catch_up_by_id(c, "logs", after)?;
+        let mut w = Where::default();
+        let sql = logs_sql(&mut w, device, search.as_deref(), after, by_id, limit);
         let mut stmt = c.prepare(&sql)?;
         let rows = stmt
             .query_map(params_from_iter(w.params), |r| {
@@ -1308,6 +1319,8 @@ mod tests {
             "first_seen": 10, "last_seen": 20, "uptime": null, "cpu": null, "mem": null, "load1": null, "satisfaction": null,
             "clients": 0, "uplink": null, "radios": [], "last_config_push": null, "stored_only": true,
         }));
+        let status = get_json(&app, "/api/status").await;
+        assert_eq!((status["devices"].as_i64(), status["devices_online"].as_i64()), (Some(2), Some(1)), "the stored AP counted, offline");
         let one = get_json(&app, "/api/devices/02:00:00:00:00:01").await;
         assert_eq!((one["clients"][0]["sample"]["hostname"].as_str(), one["locating"].as_bool()), (Some("phone"), Some(false)));
         let stored = get_json(&app, "/api/devices/02:00:00:00:00:02").await;
@@ -1444,6 +1457,7 @@ mod tests {
             s.writer.exec(Db::Config, "INSERT INTO events (ts, kind, device_mac, data) VALUES (?1, ?2, ?3, '{}')", vec![Sql::Integer(ts), Sql::Text(kind.into()), dev.map_or(Sql::Null, |d| Sql::Text(d.into()))]);
         }
         flushed(&s.writer);
+        let writer = s.writer.clone();
         let app = router(s);
         let ts = |v: Value| v.as_array().unwrap().iter().map(|e| e["ts"].as_i64().unwrap()).collect::<Vec<_>>();
         assert_eq!(ts(get_json(&app, "/api/events?kind=client").await), vec![6, 4, 3, 1]);
@@ -1457,6 +1471,13 @@ mod tests {
         assert_eq!(ts(get_json(&app, "/api/events?kind=client&after=3").await), vec![6, 4]);
         assert_eq!(ts(get_json(&app, "/api/events?kind=client&device=02:00:00:00:00:02&after=1").await), vec![4, 3]);
         assert_eq!(ts(get_json(&app, "/api/events?after=6").await), Vec::<i64>::new());
+        // Catching up over more rows than are read by id: from the filters' indexes, the same rows.
+        writer.exec(Db::Config, "INSERT INTO events (id, ts, kind, device_mac, data) VALUES (?1, 7, 'client_connected', '02:00:00:00:00:02', '{}')", vec![Sql::Integer(CATCH_UP_SCAN + 10)]);
+        flushed(&writer);
+        assert_eq!(ts(get_json(&app, "/api/events?after=4").await), vec![7, 6, 5]);
+        assert_eq!(ts(get_json(&app, "/api/events?kind=client&after=3").await), vec![7, 6, 4]);
+        assert_eq!(ts(get_json(&app, "/api/events?device=02:00:00:00:00:02&after=3").await), vec![7, 4]);
+        assert_eq!(ts(get_json(&app, "/api/events?kind=client&device=02:00:00:00:00:02&after=1").await), vec![7, 4, 3]);
         assert_eq!(get_json(&app, "/api/events?limit=1").await[0]["data"], json!({}), "the stored payload, as stored");
     }
 
@@ -1471,7 +1492,7 @@ mod tests {
         flushed(&s.writer);
         // A search is read from the full-text index, newest first, and stops at the limit.
         let mut w = Where::default();
-        let sql = logs_sql(&mut w, None, Some("sta"), None, 10);
+        let sql = logs_sql(&mut w, None, Some("sta"), None, false, 10);
         let plan: Vec<String> = s
             .store
             .read(Db::Logs, |c| Ok(c.prepare(&format!("EXPLAIN QUERY PLAN {sql}"))?.query_map(params_from_iter(w.params), |r| r.get(3))?.collect::<rusqlite::Result<_>>()?))
@@ -1480,6 +1501,15 @@ mod tests {
         // Only the limited rows are sorted by time, after the index's own order.
         assert_eq!(plan.iter().filter(|p| p.contains("TEMP B-TREE")).count(), 1, "{plan:?}");
         assert!(plan.last().is_some_and(|p| p == "USE TEMP B-TREE FOR ORDER BY") && plan.iter().any(|p| p.starts_with("SCAN (subquery")), "{plan:?}");
+        // Catching up a device's lines over many rows: from its index, not every line since.
+        let plan = |by_id| {
+            let mut w = Where::default();
+            let sql = logs_sql(&mut w, Some("02:00:00:00:00:02".parse().unwrap()), None, Some(1), by_id, 10);
+            s.store.read(Db::Logs, |c| Ok(c.prepare(&format!("EXPLAIN QUERY PLAN {sql}"))?.query_map(params_from_iter(w.params), |r| r.get::<_, String>(3))?.collect::<rusqlite::Result<Vec<_>>>()?)).unwrap()
+        };
+        assert_eq!(plan(false), ["SEARCH l USING INDEX logs_device (device_mac=?)"]);
+        assert!(plan(true)[0].starts_with("SEARCH l USING INTEGER PRIMARY KEY (rowid>?)"), "{:?}", plan(true));
+        let writer = s.writer.clone();
         let app = router(s);
         let ts = |v: Value| v.as_array().unwrap().iter().map(|e| e["ts"].as_i64().unwrap()).collect::<Vec<_>>();
         assert_eq!(ts(get_json(&app, "/api/logs").await), vec![3, 2, 1]);
@@ -1494,6 +1524,11 @@ mod tests {
             "id": 3, "ts": 3, "device_mac": "02:00:00:00:00:01", "src_ip": null, "facility": null, "severity": null, "program": "hostapd", "msg": "wlan1: STA left",
         });
         assert_eq!(get_json(&app, "/api/logs?limit=1").await, json!([line]));
+        // Catching up over more rows than are read by id: from the indexes, the same lines.
+        writer.exec(Db::Logs, "INSERT INTO logs (id, ts, device_mac, msg) VALUES (?1, 4, '02:00:00:00:00:02', 'eth0 link down')", vec![Sql::Integer(CATCH_UP_SCAN + 10)]);
+        flushed(&writer);
+        assert_eq!(ts(get_json(&app, "/api/logs?after=1&device=02:00:00:00:00:02").await), vec![4, 2]);
+        assert_eq!(ts(get_json(&app, "/api/logs?after=2").await), vec![4, 3]);
     }
 
     #[tokio::test]

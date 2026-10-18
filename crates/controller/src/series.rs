@@ -171,10 +171,12 @@ pub(crate) fn own_bssids(live: &Live) -> impl Iterator<Item = (&inform::Mac, &cr
     live.devices.iter().flat_map(|(m, d)| d.snapshot.vaps.iter().map(move |v| (m, v)))
 }
 
-/// A client's name: the alias given in apctl, else the host name it reports.
-pub(crate) fn client_name(live: &Live, mac: Option<inform::Mac>) -> Option<String> {
+/// A client's display name: the alias given in apctl, else the host name it
+/// reports; none when it has neither (an empty host name is none).
+pub(crate) fn client_name(live: &Live, mac: Option<inform::Mac>) -> Option<&str> {
     let mac = mac?;
-    live.aliases.get(&mac).and_then(|a| a.alias.clone()).or_else(|| live.clients.get(&mac).and_then(|c| c.sample.hostname.clone()))
+    let alias = live.aliases.get(&mac).and_then(|a| a.alias.as_deref());
+    alias.or_else(|| live.clients.get(&mac)?.sample.hostname.as_deref()).filter(|n| !n.is_empty())
 }
 
 /// Loads a metrics table's samples in range, grouped by key.
@@ -302,6 +304,19 @@ pub(crate) async fn memo_read<T: Send + Sync + 'static>(
 mod tests {
     use super::*;
     use crate::model::tests::TestStore;
+
+    #[test]
+    fn a_client_is_named_by_its_alias_else_a_host_name_that_is_not_empty() {
+        let mut live = Live::default();
+        let (a, b): (inform::Mac, inform::Mac) = ("aa:00:00:00:00:01".parse().unwrap(), "aa:00:00:00:00:02".parse().unwrap());
+        for (mac, hostname) in [(a, "phone"), (b, "")] {
+            let sample = crate::model::ClientSample { mac, hostname: Some(hostname.into()), ..Default::default() };
+            live.clients.insert(mac, crate::engine::ClientView { sample: std::sync::Arc::new(sample), connected: true, first_seen: 0, last_seen: 0 });
+        }
+        assert_eq!((client_name(&live, Some(a)), client_name(&live, Some(b)), client_name(&live, None)), (Some("phone"), None, None));
+        live.aliases.insert(b, crate::engine::Alias { alias: Some("Tablet".into()), note: None });
+        assert_eq!(client_name(&live, Some(b)), Some("Tablet"));
+    }
 
     #[test]
     fn windows_are_clamped() {

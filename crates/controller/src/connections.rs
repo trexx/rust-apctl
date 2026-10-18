@@ -612,7 +612,7 @@ impl Names {
 
     /// A client's display name: its alias, else what it reports now, else what was stored.
     fn client(&self, live: &Live, mac: &str) -> Option<String> {
-        client_name(live, mac.parse().ok()).or_else(|| self.clients.get(mac).cloned().flatten())
+        client_name(live, mac.parse().ok()).map(str::to_string).or_else(|| self.clients.get(mac).cloned().flatten())
     }
 
     /// The names of every AP and client `live` knows, as [`Names::ap`] and
@@ -625,7 +625,7 @@ impl Names {
         }
         for mac in live.clients.keys().chain(live.aliases.iter().filter(|(_, a)| a.alias.is_some()).map(|(m, _)| m)) {
             let m = mac.to_string();
-            let name = client_name(live, Some(*mac)).or_else(|| self.clients.remove(&m).flatten());
+            let name = client_name(live, Some(*mac)).map(str::to_string).or_else(|| self.clients.remove(&m).flatten());
             self.clients.insert(m, name);
         }
     }
