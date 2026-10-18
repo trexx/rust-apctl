@@ -43,26 +43,30 @@ export function Signal({ dbm }: { dbm: number | null | undefined }) {
   );
 }
 
+/** A bar for a level (a percentage, or out of `max`), named `label` for screen readers. */
 export function Meter({
   value,
-  max,
+  max = 100,
+  label,
 }: {
   value: number | null | undefined;
   max?: number;
+  label: string;
 }) {
-  const v =
-    value === null || value === undefined
-      ? 0
-      : Math.min(100, (value / (max ?? 100)) * 100);
+  const known = value !== null && value !== undefined;
+  const v = known ? Math.min(100, (value / max) * 100) : 0;
   const level = v >= 80 ? "high" : v >= 50 ? "mid" : "low";
+  const text = known ? `${Math.round(value)}` : "unknown";
   return (
     <span
       className="meter"
-      title={
-        value === null || value === undefined
-          ? "unknown"
-          : `${Math.round(value)}`
-      }
+      title={text}
+      role="meter"
+      aria-label={label}
+      aria-valuemin={0}
+      aria-valuemax={max}
+      aria-valuenow={known ? value : undefined}
+      aria-valuetext={known ? undefined : text}
     >
       <span
         className={`meter-fill meter-${level}`}

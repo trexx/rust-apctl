@@ -293,7 +293,7 @@ function RadioTable({ radios }: { radios: RadioOverview[] }) {
                 )}
                 <td>{r.clients}</td>
                 <td>
-                  <Meter value={r.avg_utilization} />
+                  <Meter value={r.avg_utilization} label="Utilisation" />
                 </td>
                 <td>
                   {r.avg_interference === null

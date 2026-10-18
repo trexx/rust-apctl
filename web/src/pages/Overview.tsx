@@ -106,11 +106,11 @@ export function Overview() {
               <b>{d.clients}</b>
               <span>CPU</span>
               <span className="meter-row">
-                <Meter value={d.cpu} /> {pct(d.cpu)}
+                <Meter value={d.cpu} label="CPU" /> {pct(d.cpu)}
               </span>
               <span>Memory</span>
               <span className="meter-row">
-                <Meter value={d.mem} /> {pct(d.mem)}
+                <Meter value={d.mem} label="Memory" /> {pct(d.mem)}
               </span>
               {d.radios
                 .filter((r) => r.channel !== null)
@@ -184,7 +184,7 @@ function RadioRow(p: {
         className="meter-row"
         title={`Channel utilisation ${p.util ?? "?"}% · channel ${p.channel}, ${p.bw} MHz · ${p.clients} clients`}
       >
-        <Meter value={p.util} />
+        <Meter value={p.util} label={`${p.band} channel utilisation`} />
         <span className="meter-text">
           ch {p.channel} · {p.bw} MHz · {p.clients}{" "}
           {p.clients === 1 ? "client" : "clients"}
