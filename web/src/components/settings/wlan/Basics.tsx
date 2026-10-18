@@ -80,7 +80,12 @@ export function Basics({
       {f.protection !== "open" && (
         <Row
           label="Password"
-          hint={wlan ? "leave empty to keep it" : "8 to 63 characters"}
+          hint={
+            wlan
+              ? "leave empty to keep it"
+              : // WPA3 alone takes longer passwords; WPA2 (also in transition) stops at 63.
+                `8 to ${f.protection === "wpa3" ? 255 : 63} characters`
+          }
         >
           <TextInput
             autoComplete="off"
