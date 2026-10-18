@@ -335,7 +335,7 @@ const EVENTS: { [K in EventKind]: EventSpec<K> } = {
   ap_firmware_changed: {
     label: "Firmware changed",
     tone: "neutral",
-    describe: (d) => `${d.from} → ${d.to}`,
+    describe: (d) => `${d.from ?? "?"} → ${d.to ?? "?"}`,
   },
   // Older events (before 0.3.2) guessed a restart; it was a config being applied.
   ap_radios_restarting: { label: "Applying configuration", tone: "neutral" },
@@ -465,8 +465,18 @@ const EVENTS: { [K in EventKind]: EventSpec<K> } = {
   ap_process_restarted: {
     label: "Process restarted",
     tone: "warn",
-    describe: (d) =>
-      `${d.proc ?? "a process"} exited with code ${d.exit_status ?? "?"} and was restarted by ${d.caller ?? "the system"}`,
+    describe: (d) => {
+      // As the alert says it: a code sent as text is still a code, and a
+      // missing one is left out.
+      const c: unknown = d.exit_status;
+      const code =
+        typeof c === "number"
+          ? String(c)
+          : typeof c === "string" && /^[+-]?\d+$/.test(c.trim())
+            ? c.trim()
+            : null;
+      return `${d.proc ?? "a process"} exited${code !== null ? ` with code ${code}` : ""} and was restarted by ${d.caller ?? "the system"}`;
+    },
   },
   ap_isolated: {
     label: "AP isolated",
@@ -550,13 +560,14 @@ const EVENTS: { [K in EventKind]: EventSpec<K> } = {
     tone: "neutral",
     describe: (d, names) => {
       const moves = d.changes ?? [];
-      return `${d.band ? band(d.band) : d.band} (${d.trigger}): ${
+      const what = [d.band && band(d.band), d.trigger && `(${d.trigger})`];
+      return `${what.filter(Boolean).join(" ") || "Plan"}: ${
         moves.length === 0
           ? "nothing to move"
           : moves
               .map(
                 (m) =>
-                  `${m.name ?? names[m.mac] ?? m.mac} ${m.from ?? "?"} → ${m.to}`,
+                  `${m.name ?? names[m.mac] ?? m.mac} ${m.from ?? "?"} → ${m.to ?? "?"}`,
               )
               .join(", ")
       }${moves.length > 0 && !d.applied ? " (not applied)" : ""}`;
