@@ -664,8 +664,8 @@ impl Engine {
         let has_clients = !snap.clients.is_empty();
 
         // The write lock is held for the swaps alone. What they replace (the last
-        // full inform, the last snapshot) is dropped after it, and the events are
-        // emitted after it.
+        // full inform, the last snapshot, the clients' views) is dropped after it,
+        // and the clients' rows and the events are made after it.
         let mut live = shared.write().unwrap();
         let old_inform = if snap.has_vap_table { live.raw_informs.insert(mac, Arc::new(decoded.payload)) } else { None };
         live.attribute(&snap.ap);
@@ -679,13 +679,12 @@ impl Engine {
             events.retain(|e| e.kind != EventKind::ApFirmwareChanged);
             events.push(Event::device(ts, EventKind::ApUpgraded, mac, json!({ "from": j.from, "to": v, "custom": j.custom })));
         }
-        if snap.has_vap_table {
-            self.update_clients(&mut live, ts, &snap.clients, &mut events);
-        }
+        let updated = if snap.has_vap_table { self.update_clients(&mut live, ts, &snap.clients) } else { Vec::new() };
         let (view, old_snapshot) = device_view(ts, peer, snap, prev, known.as_ref());
         live.devices.insert(mac, view);
         drop(live);
         drop((old_inform, old_snapshot));
+        self.client_rows(ts, updated, &mut events);
 
         for e in events {
             self.emit(e);
@@ -738,19 +737,41 @@ impl Engine {
         }
     }
 
-    /// Updates the clients a full inform lists; their events are added to
-    /// `events`, for the caller to emit once the lock is released.
-    fn update_clients(&mut self, live: &mut Live, ts: Ts, clients: &[Arc<ClientSample>], events: &mut Vec<Event>) {
+    /// Updates the clients a full inform lists in the live view, under its
+    /// lock; returns each with the view it replaced (none for a new one), for
+    /// `client_rows` once the lock is released.
+    fn update_clients(&mut self, live: &mut Live, ts: Ts, clients: &[Arc<ClientSample>]) -> Vec<(Arc<ClientSample>, Option<ClientView>)> {
         use std::collections::btree_map::Entry;
+        let mut updated = Vec::with_capacity(clients.len());
         for c in clients {
             self.connected.insert(c.mac);
-            // One lookup for the event, whether the row changed, and the update.
-            let (event, changed) = match live.clients.entry(c.mac) {
+            let view = ClientView { sample: c.clone(), connected: true, first_seen: ts, last_seen: ts };
+            let old = match live.clients.entry(c.mac) {
                 Entry::Occupied(mut e) => {
-                    let view = e.get_mut();
+                    let first_seen = e.get().first_seen;
+                    Some(std::mem::replace(e.get_mut(), ClientView { first_seen, ..view }))
+                }
+                Entry::Vacant(e) => {
+                    e.insert(view);
+                    None
+                }
+            };
+            updated.push((c.clone(), old));
+        }
+        updated
+    }
+
+    /// The rows and events of the clients `update_clients` updated: a row
+    /// written if it changed (or is due again), and their events added to
+    /// `events`.
+    fn client_rows(&mut self, ts: Ts, updated: Vec<(Arc<ClientSample>, Option<ClientView>)>, events: &mut Vec<Event>) {
+        for (c, old) in updated {
+            let (event, changed) = match &old {
+                None => (Some(connected_event(ts, &c, true)), true),
+                Some(view) => {
                     let p = &view.sample;
                     let event = if !view.connected {
-                        Some(connected_event(ts, c, false))
+                        Some(connected_event(ts, &c, false))
                     } else if p.ap_mac != c.ap_mac || p.bssid != c.bssid {
                         Some(Event::client_on(ts, EventKind::ClientRoamed, c.ap_mac, c.mac, json!({
                             "from": { "ap": p.ap_mac, "radio": p.radio, "channel": p.channel, "essid": p.essid, "signal": p.signal },
@@ -761,12 +782,7 @@ impl Engine {
                     };
                     let changed = !view.connected
                         || (&p.hostname, &p.ip, p.ap_mac, &p.bssid, &p.essid, &p.radio) != (&c.hostname, &c.ip, c.ap_mac, &c.bssid, &c.essid, &c.radio);
-                    *view = ClientView { sample: c.clone(), connected: true, first_seen: view.first_seen, last_seen: ts };
                     (event, changed)
-                }
-                Entry::Vacant(e) => {
-                    e.insert(ClientView { sample: c.clone(), connected: true, first_seen: ts, last_seen: ts });
-                    (Some(connected_event(ts, c, true)), true)
                 }
             };
             // An unchanged row only to move last_seen on (see `REFRESH_SECS`).
