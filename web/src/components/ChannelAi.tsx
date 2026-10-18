@@ -133,10 +133,10 @@ export function ChannelAiPanel() {
               window.confirm(
                 "Scan and move APs to better channels now? APs that move drop their clients for a moment.",
               ) &&
-              void run(async () => {
-                await runChannelAi();
-                return "Running: the APs scan first (up to two minutes), then the plan is applied if it is clearly better.";
-              })
+              void run(
+                () => runChannelAi(),
+                "Running: the APs scan first (up to two minutes), then the plan is applied if it is clearly better.",
+              )
             }
           >
             {d.running ? "Running…" : "Run now"}

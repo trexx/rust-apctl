@@ -61,7 +61,7 @@ export function FirmwarePanel() {
               className="btn small"
               disabled={busy}
               onClick={() =>
-                run(
+                void run(
                   async () =>
                     `The feed lists ${(await checkFirmware()).platforms} platforms.`,
                 )
@@ -233,7 +233,7 @@ export function FirmwarePanel() {
                 className="btn small"
                 disabled={busy}
                 onClick={() =>
-                  run(
+                  void run(
                     async () =>
                       `${(await cancelFirmware()).cancelled} cancelled.`,
                   )
@@ -251,7 +251,7 @@ export function FirmwarePanel() {
                   className="btn small"
                   disabled={busy || !!job}
                   onClick={() =>
-                    run(async () =>
+                    void run(async () =>
                       (await resumeFirmware()).resumed
                         ? "Resuming."
                         : "Nothing to resume.",

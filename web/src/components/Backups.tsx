@@ -372,7 +372,7 @@ export function BackupSection() {
           <button
             className="btn small primary"
             disabled={busy}
-            onClick={() => run(() => createBackup(days))}
+            onClick={() => void run(() => createBackup(days))}
           >
             {busy ? "Working…" : "Back up now"}
           </button>

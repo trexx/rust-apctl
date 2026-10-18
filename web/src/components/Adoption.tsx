@@ -56,10 +56,10 @@ export function AdoptionPanel() {
                       className="btn small primary"
                       disabled={busy}
                       onClick={() =>
-                        void run(async () => {
-                          await adoptAp(p.mac);
-                          return "Adopting: it gets its own key with its next report, then its configuration.";
-                        })
+                        void run(
+                          () => adoptAp(p.mac),
+                          "Adopting: it gets its own key with its next report, then its configuration.",
+                        )
                       }
                     >
                       Adopt
