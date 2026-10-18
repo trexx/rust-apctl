@@ -634,10 +634,12 @@ impl Engine {
             self.radio_events(ts, &snap, &mut events);
         }
         self.write_device_if_due(ts, &snap.ap, prev.as_ref());
-        // An upgrade we sent has landed: the AP reports the new version.
+        // An upgrade apctl sent has landed: the AP reports the new version. One
+        // event says so, not also a firmware change (see `lifecycle_events`).
         if let Some(v) = &snap.ap.version
             && let Some(j) = live.firmware.version_seen(&mac, v)
         {
+            events.retain(|e| e.kind != EventKind::ApFirmwareChanged);
             events.push(Event::device(ts, EventKind::ApUpgraded, mac, json!({ "from": j.from, "to": v, "custom": j.custom })));
         }
         for e in events {
@@ -2197,6 +2199,29 @@ mod tests {
         assert!(live.commands.is_empty() && live.locating.is_empty() && live.reprovision.is_empty() && live.devices.is_empty());
         assert!(live.raw_informs.is_empty() && live.last_config.is_empty() && live.adoption.forgetting.is_empty() && live.by_ip.is_empty());
         assert!(managed.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn an_upgrade_apctl_sent_is_one_event() {
+        let mut h = harness();
+        let mac: Mac = AP1.parse().unwrap();
+        let feed = |h: &mut Harness, ts: Ts, version: &str| {
+            let mut p = inform(AP1, 1000 + ts, &[]);
+            p["version"] = json!(version);
+            h.engine.handle(Input::Inform { ts, peer: "x".into(), decoded: decoded(p) });
+        };
+        feed(&mut h, 0, "6.7.0");
+        let job = crate::firmware::Job {
+            mac, name: None, from: Some("6.7.0".into()), target: "6.8.2".into(), url: String::new(), md5: None, sha256: None, custom: false,
+            state: crate::firmware::JobState::Sent, sent_at: Some(5), expires: None,
+        };
+        h.live.write().unwrap().firmware.current = Some(job);
+        feed(&mut h, 10, "6.8.2");
+        // A change apctl did not send is still reported as such.
+        feed(&mut h, 20, "6.8.3");
+        let kinds: Vec<_> = events(&mut h).into_iter().map(|e| e.0).collect();
+        assert_eq!(kinds, ["ap_seen", "ap_upgraded", "ap_firmware_changed"]);
+        assert_eq!(stored(&h, EventKind::ApUpgraded)[0]["from"], "6.7.0");
     }
 
     fn notif(ap: &str, reason: &str, payload: Value) -> Decoded {
