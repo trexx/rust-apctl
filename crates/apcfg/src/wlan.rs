@@ -895,8 +895,8 @@ fn schedule(c: &mut Cfg, w: &Value, k: Prefix, invert: bool, multi: bool) {
         c.set(k.at("schedule_invert"), "enabled");
     }
     for (d, blocks) in off.iter().enumerate() {
-        let blocks: Vec<(i64, i64)> = if invert {
-            blocks.clone()
+        let blocks: Cow<[(i64, i64)]> = if invert {
+            Cow::Borrowed(blocks)
         } else {
             // The gaps between blackouts.
             let mut on = Vec::new();
@@ -910,7 +910,7 @@ fn schedule(c: &mut Cfg, w: &Value, k: Prefix, invert: bool, multi: bool) {
             if from < 1440 {
                 on.push((from, 1440));
             }
-            on
+            Cow::Owned(on)
         };
         for (i, (s, e)) in blocks.iter().enumerate() {
             let time = format_args!("{}-{}", hhmm(*s), hhmm(*e));
