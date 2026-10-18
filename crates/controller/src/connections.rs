@@ -484,13 +484,18 @@ pub fn roam_clients(roams: &[Roam]) -> Vec<Value> {
         .collect()
 }
 
-/// The query of the notifications, before its conditions: the columns [`event_of`] reads.
+/// The query of the notifications, before its conditions: the columns [`event_of`] reads
+/// (the last four only for rows without `detail`).
 const SELECT_EVENTS: &str = "SELECT ts, ap_mac, client_mac, vap, essid, radio, event_type, detail, ip_assign_type, dns_responses, dns_timeouts, rssi FROM connections";
 
 /// A notification, from a row of [`SELECT_EVENTS`].
 fn event_of(r: &rusqlite::Row) -> rusqlite::Result<ConnEvent> {
     let detail = r.get_ref(7)?.as_str_or_null()?;
-    // Rows from before the full notification was kept: rebuild what we can.
+    // Rows from before the full notification was kept: rebuild what we can. Every row
+    // written since `detail` was added (2026-10-13) has it, so under the 90-day
+    // retention the last rows without it are gone by 2027-01-11 (90 days after the
+    // upgrade to that version, where it came later). The fallback, and the four columns
+    // it reads, can then go.
     let n = detail.and_then(|d| serde_json::from_str(d).ok()).unwrap_or_else(|| ConnDetail {
         ip_assign_type: r.get::<_, Option<String>>(8).ok().flatten().map(Field::Str),
         dns_responses: r.get::<_, Option<i64>>(9).ok().flatten().map(Field::Int),
