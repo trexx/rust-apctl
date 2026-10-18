@@ -104,12 +104,6 @@ export function useNow(ms = 60_000): number {
   return useSyncExternalStore(t.subscribe, t.read);
 }
 
-/** Bits per second from bytes per second. */
-export function bitrate(bytesPerSec: number | null | undefined): string {
-  if (bytesPerSec === null || bytesPerSec === undefined) return "—";
-  return rate(bytesPerSec * 8);
-}
-
 /** A rate in bits per second. */
 export function rate(bps: number): string {
   const units = ["bps", "kbps", "Mbps", "Gbps"];
