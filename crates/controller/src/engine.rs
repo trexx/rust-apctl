@@ -254,7 +254,13 @@ pub struct Live {
     pub last_config: HashMap<Mac, Arc<PushedConfig>>,
     /// The STUN socket (active mode), which connection requests are sent from.
     pub stun: Option<Arc<tokio::net::UdpSocket>>,
+    /// Active mode: drops what it keeps of a forgotten AP (its config digest
+    /// and AES-GCM pin). Called by the engine without the live view's lock.
+    pub forget_managed: Option<ForgetFn>,
 }
+
+/// See `Live::forget_managed`.
+pub type ForgetFn = Arc<dyn Fn(&Mac) + Send + Sync>;
 
 impl Live {
     /// Records the AP's hash_id and address, for attributing syslog. An address
@@ -281,7 +287,7 @@ impl Live {
     fn forget_ap(&mut self, mac: &Mac) {
         let Live {
             devices, aliases: _, clients: _, counters: _, by_hash_id, by_ip, known_devices, state: _, state_imported_at: _, raw_informs, firmware, commands,
-            locating, reprovision, scans, adoption, last_config, stun: _,
+            locating, reprovision, scans, adoption, last_config, stun: _, forget_managed: _,
         } = self;
         devices.remove(mac);
         // Also what was restored from the database, or it could still be reported offline.
@@ -923,6 +929,7 @@ impl Engine {
     fn forget(&mut self, ts: Ts, mac: Mac) {
         let mut live = self.live.write().unwrap();
         live.forget_ap(&mac);
+        let forget_managed = live.forget_managed.clone();
         // Its clients are gone with it, rather than left connected until they go stale.
         let mut events = Vec::new();
         let clients = &mut live.clients;
@@ -932,6 +939,9 @@ impl Engine {
             false
         });
         drop(live);
+        if let Some(f) = forget_managed {
+            f(&mac);
+        }
         let had_clients = !events.is_empty();
         for e in events {
             self.emit(e);
@@ -2170,6 +2180,10 @@ mod tests {
             live.last_config.insert(mac, Default::default());
             live.adoption.forgetting.insert(mac, 1);
         }
+        // What active mode keeps of it goes too.
+        let managed = Arc::new(std::sync::Mutex::new(vec![mac]));
+        let m = managed.clone();
+        h.live.write().unwrap().forget_managed = Some(Arc::new(move |gone: &Mac| m.lock().unwrap().retain(|x| x != gone)));
         events(&mut h);
         h.engine.handle(Input::Forget { ts: 5, mac });
         assert_eq!(events(&mut h), vec![("client_disconnected", Some(C1.into()))]);
@@ -2177,6 +2191,7 @@ mod tests {
         assert!(!live.clients[&C1.parse().unwrap()].connected);
         assert!(live.commands.is_empty() && live.locating.is_empty() && live.reprovision.is_empty() && live.devices.is_empty());
         assert!(live.raw_informs.is_empty() && live.last_config.is_empty() && live.adoption.forgetting.is_empty() && live.by_ip.is_empty());
+        assert!(managed.lock().unwrap().is_empty());
     }
 
     fn notif(ap: &str, reason: &str, payload: Value) -> Decoded {

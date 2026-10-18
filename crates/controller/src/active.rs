@@ -101,7 +101,8 @@ pub struct Active {
     engine: mpsc::Sender<Input>,
     writer: Writer,
     controller: apcfg::Controller,
-    devices: Mutex<HashMap<Mac, Managed>>,
+    /// Shared with the live view's `forget_managed`, which drops an AP's entry when it is forgotten.
+    devices: Arc<Mutex<HashMap<Mac, Managed>>>,
     /// Read for the last push stored for an AP (secrets masked), to adopt its
     /// running config after a restart, when no unmasked push is in memory.
     store: Arc<Store>,
@@ -184,9 +185,17 @@ impl Active {
             }
             devices.insert(m, d);
         }
+        let devices = Arc::new(Mutex::new(devices));
+        // Whichever way an AP is forgotten (reporting or not), the engine drops what is kept here of it.
+        let forgotten = Arc::downgrade(&devices);
+        live.write().unwrap().forget_managed = Some(Arc::new(move |mac: &Mac| {
+            if let Some(devices) = forgotten.upgrade() {
+                devices.lock().unwrap().remove(mac);
+            }
+        }));
         let cpus = std::thread::available_parallelism().map_or(4, |n| n.get());
         let active = Active {
-            live, keys, engine, writer, controller, devices: Mutex::new(devices), store: store.clone(), adoption_cfgs: Default::default(),
+            live, keys, engine, writer, controller, devices, store: store.clone(), adoption_cfgs: Default::default(),
             work: Semaphore::new(cpus), strangers: Semaphore::new((cpus / 2).max(1)), proxies,
         };
         // Rows holding the rendered config (with its secrets) get its digest instead.
@@ -1281,6 +1290,19 @@ mod tests {
         assert_eq!(status, StatusCode::NOT_FOUND);
         let (status, _) = inform_as_ap(&rig, &ap_payload("1"), KEY, Flags::ENCRYPTED).await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "still no CBC");
+    }
+
+    #[tokio::test]
+    async fn a_forgotten_ap_leaves_nothing_behind_in_active_mode() {
+        let Some(_) = fixtures() else { return };
+        let rig = rig(true, None);
+        let mac: Mac = AP.parse().unwrap();
+        inform_as_ap(&rig, &ap_payload("1"), KEY, GCM_ZLIB).await;
+        assert!(rig.active.devices.lock().unwrap().get(&mac).is_some_and(|d| d.gcm && d.content.is_some()));
+        // The engine calls this however the AP is forgotten, reporting or not (see `Engine::forget`).
+        let forget = rig.live.read().unwrap().forget_managed.clone().expect("set by Active::new");
+        forget(&mac);
+        assert!(!rig.active.devices.lock().unwrap().contains_key(&mac));
     }
 
     #[tokio::test]
