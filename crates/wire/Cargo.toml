@@ -13,7 +13,6 @@ test-util = []
 [dependencies]
 anyhow.workspace = true
 etherparse.workspace = true
-hex.workspace = true
 httparse.workspace = true
 inform.workspace = true
 memchr.workspace = true
