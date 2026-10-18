@@ -10,7 +10,7 @@ use std::sync::LazyLock;
 
 use crate::api::{ApiError, AppState, Json, Query};
 use crate::settings::Kind::{Bool, Int};
-use crate::settings::{COUNTRIES, Patch, PreviewQuery, band_name, copy_fields, country, dedup_in_order, docs_mut, illegal_fixed_channel, mgmt_flag, num, outdoor_with, pick, setting, setting_mut, timezone};
+use crate::settings::{COUNTRIES, Patch, PreviewQuery, band_name, copy_fields, country, dedup_in_order, device_label, docs_mut, illegal_fixed_channel, mgmt_flag, num, outdoor_with, pick, setting, setting_mut, timezone};
 
 /// A host name or IPv4 address, as NTP and syslog targets take (the official
 /// controller refuses IPv6 there). A name's labels are letters, digits and
@@ -34,7 +34,7 @@ fn reset_illegal_channels(state: &mut Value) -> Vec<String> {
     let mut out = Vec::new();
     for d in docs_mut(state, "devices") {
         let o = outdoor_with(d, site_outdoor);
-        let name = d["name"].as_str().or(d["mac"].as_str()).unwrap_or("?").to_string();
+        let name = device_label(d, d["mac"].as_str().unwrap_or("?"));
         for r in d["radio_table"].as_array_mut().into_iter().flatten() {
             if let Some((ch, _)) = illegal_fixed_channel(c, r, o) {
                 out.push(format!("AP {name} {} channel {ch} → auto", band_name(r["radio"].as_str().unwrap_or(""))));

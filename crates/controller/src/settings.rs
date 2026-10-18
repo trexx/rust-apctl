@@ -184,6 +184,16 @@ pub(crate) fn inform_radio<'a>(inform: &'a Value, band: &str) -> Option<&'a Valu
     inform["radio_table"].as_array()?.iter().find(|r| r["radio"].as_str() == Some(band))
 }
 
+/// [`inform_radio`], to change.
+pub(crate) fn inform_radio_mut<'a>(inform: &'a mut Value, band: &str) -> Option<&'a mut Value> {
+    inform.get_mut("radio_table")?.as_array_mut()?.iter_mut().find(|r| r["radio"].as_str() == Some(band))
+}
+
+/// An AP as messages name it: its name, else its MAC.
+pub(crate) fn device_label(d: &Value, mac: impl std::fmt::Display) -> String {
+    d["name"].as_str().filter(|n| !n.trim().is_empty()).map_or_else(|| mac.to_string(), str::to_string)
+}
+
 /// A flag of the site's `mgmt` setting (outdoor mode, advanced features...).
 pub(crate) fn mgmt_flag(state: &Value, key: &str) -> bool {
     setting(state, "mgmt")[key].as_bool() == Some(true)
@@ -793,7 +803,7 @@ fn wlan_limits(state: &Value) -> Vec<Over> {
         docs(state, "wlanconf").map(|w| (w["wlan_bands"].as_array().into_iter().flatten().filter_map(Value::as_str).collect(), deployed_to(state, w))).collect();
     for d in docs(state, "devices") {
         let Some(mac) = doc_mac(&d["mac"]).map(|m| m.to_string()) else { continue };
-        let name = d["name"].as_str().unwrap_or(&mac);
+        let name = device_label(d, &mac);
         for (band, wb) in [("ng", "2g"), ("na", "5g"), ("6e", "6g")] {
             let radios: Vec<&Value> = d["radio_table"].as_array().into_iter().flatten().filter(|r| r["radio"].as_str() == Some(band)).collect();
             if radios.is_empty() {
@@ -1258,8 +1268,8 @@ pub(crate) fn apply_channel_locks(state: &mut Value, released: &[String], only: 
         } else {
             continue;
         };
-        let name = d["name"].as_str().unwrap_or(&mac).to_string();
-        let Some(r) = d["radio_table"].as_array_mut().and_then(|t| t.iter_mut().find(|r| r["radio"].as_str() == Some("ng"))) else { continue };
+        let name = device_label(d, &mac);
+        let Some(r) = inform_radio_mut(d, "ng") else { continue };
         if !same_channel(&r["channel"], &target) {
             r["channel"] = target.clone();
             out.push(format!("AP {name}: 2.4 GHz channel {}", target.as_str().unwrap_or_default()));
@@ -1452,7 +1462,7 @@ pub fn apply_device(state: &mut Value, e: &DeviceEdit) -> Result<String, String>
             }
         }
     }
-    let name = d["name"].as_str().unwrap_or(&mac).to_string();
+    let name = device_label(&d, &mac);
     let mut changed: Vec<String> = Vec::new();
     for k in DEVICE_FIELDS {
         if before[*k] != d[*k] {
@@ -1529,7 +1539,7 @@ fn radio_edit(state: &Value, e: &DeviceEdit, rp: &Value, before: &Value, d: &mut
     let band = rp["radio"].as_str().ok_or("each radio needs its band (radio)")?;
     let caps = &e.caps[band];
     let label = band_name(band);
-    let r = d["radio_table"].as_array_mut().and_then(|t| t.iter_mut().find(|r| r["radio"].as_str() == Some(band))).ok_or_else(|| format!("this AP has no {label} radio"))?;
+    let r = inform_radio_mut(d, band).ok_or_else(|| format!("this AP has no {label} radio"))?;
     if let Some(ht) = int_field(rp, "ht", 20, 320)? {
         let ok = match band {
             "ng" => [20, 40].contains(&ht),
@@ -1642,7 +1652,7 @@ fn check_config_network(p: &Value, before: &Value) -> Result<Value, String> {
 /// A static address must not be another AP's, or one reserved for a client.
 fn check_ip_free(state: &Value, mac: &inform::Mac, ip: &str) -> Result<(), String> {
     if let Some(o) = docs(state, "devices").find(|o| doc_mac(&o["mac"]) != Some(*mac) && o["config_network"]["type"].as_str() == Some("static") && o["config_network"]["ip"].as_str() == Some(ip)) {
-        return Err(format!("{ip} is already {}'s address", o["name"].as_str().or(o["mac"].as_str()).unwrap_or("another AP")));
+        return Err(format!("{ip} is already {}'s address", device_label(o, o["mac"].as_str().unwrap_or("another AP"))));
     }
     if let Some(c) = docs(state, "clients").find(|c| c["use_fixedip"].as_bool() == Some(true) && c["fixed_ip"].as_str() == Some(ip)) {
         return Err(format!("{ip} is reserved for the client {}", c["name"].as_str().or(c["hostname"].as_str()).or(c["mac"].as_str()).unwrap_or("?")));

@@ -221,7 +221,7 @@ pub fn set_channels(state: &mut Value, band: &str, changes: &[(String, i64)]) ->
         let d = device_doc(state, &m).ok_or_else(|| format!("{mac} is not in the settings"))?;
         let outdoor = crate::settings::outdoor(state, d);
         let d = device_doc_mut(state, &m).expect("found above");
-        let r = d["radio_table"].as_array_mut().and_then(|t| t.iter_mut().find(|r| r["radio"].as_str() == Some(band))).ok_or_else(|| format!("{mac} has no {band} radio"))?;
+        let r = crate::settings::inform_radio_mut(d, band).ok_or_else(|| format!("{mac} has no {band} radio"))?;
         let width = num(&r["ht"]).unwrap_or(20);
         if is_legal(c, band, width, outdoor, *ch) == Some(false) {
             return Err(format!("channel {ch} is not allowed at {width} MHz here"));

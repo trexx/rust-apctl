@@ -272,6 +272,12 @@ pub fn new_device(state: &Value, payload: &Value, mac: &Mac) -> Value {
     d
 }
 
+/// An AP as adoption's messages name it: its label, with the MAC after a name.
+fn ap_name(d: &Value, mac: &Mac) -> String {
+    let (label, mac) = (crate::settings::device_label(d, mac), mac.to_string());
+    if label == mac { label } else { format!("{label} ({mac})") }
+}
+
 /// Adds a pending AP to the settings, from its inform. An AP apctl knew
 /// keeps its record, with new keys: the adoption hands the AP its key sealed
 /// with the public factory key, so whoever saw that would otherwise read what
@@ -284,8 +290,7 @@ pub fn adopt_device(state: &mut Value, mac: &Mac, payload: &Value) -> Result<Str
         if let Some(o) = d.as_object_mut() {
             o.remove("x_inform_authkey");
         }
-        let name = d["name"].as_str().map_or_else(|| mac.to_string(), |n| format!("{n} ({mac})"));
-        return Ok(format!("re-adopting AP {name} with new keys"));
+        return Ok(format!("re-adopting AP {} with new keys", ap_name(d, mac)));
     }
     let d = new_device(state, payload, mac);
     crate::settings::push_doc(state, "devices", d);
@@ -307,7 +312,7 @@ pub fn remove_device(state: &mut Value, mac: &Mac) -> Result<String, String> {
     let same = |v: &Value| doc_mac(v) == Some(*mac);
     let devices = state["devices"].as_array_mut().ok_or("the settings have no APs")?;
     let before = devices.len();
-    let name = devices.iter().find(|d| same(&d["mac"])).and_then(|d| d["name"].as_str()).map_or_else(|| mac.to_string(), |n| format!("{n} ({mac})"));
+    let name = devices.iter().find(|d| same(&d["mac"])).map_or_else(|| mac.to_string(), |d| ap_name(d, mac));
     devices.retain(|d| !same(&d["mac"]));
     if devices.len() == before {
         return Err("this AP is not in the settings".into());
