@@ -573,6 +573,7 @@ export function RangePicker({
         <button
           className={preset ? "" : "active"}
           onClick={() => setOpen((o) => !o)}
+          aria-pressed={!preset}
           aria-expanded={open}
           title="Pick dates and times"
         >
