@@ -1750,16 +1750,22 @@ mod tests {
     }
 
     #[test]
-    fn one_aps_ssids_are_read_through_the_tables_key() {
+    fn one_aps_ssids_and_clients_are_read_through_an_index() {
         let dir = TestDir::new("insights-plan");
         drop(store::Store::open(&dir).unwrap());
         let c = Connection::open(dir.join("metrics.db")).unwrap();
+        // How SQLite finds the rows: the first step of its plan.
+        let plan = |spec: Spec, tier: usize| -> String {
+            let (sql, params) = load_query(&spec, tier, 1000, 90_000).unwrap();
+            c.query_row(&format!("EXPLAIN QUERY PLAN {sql}"), params_from_iter(params), |r| r.get(3)).unwrap()
+        };
         let bssids = ["02:00:00:00:01:01".to_string(), "02:00:00:00:01:02".to_string()];
         for tier in 0..TIERS.len() {
-            let spec = Spec { table: "vap_stats", key: "bssid", extra: &["radio"], cols: &["tx_bytes"], only: Some(Only::In("bssid", &bssids)) };
-            let (sql, params) = load_query(&spec, tier, 1000, 90_000).unwrap();
-            let plan: Vec<String> = c.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap().query_map(params_from_iter(params), |r| r.get(3)).unwrap().map(Result::unwrap).collect();
-            assert!(plan[0].contains("USING PRIMARY KEY (bssid=?"), "{plan:?}");
+            let p = plan(Spec { table: "vap_stats", key: "bssid", extra: &["radio"], cols: &["tx_bytes"], only: Some(Only::In("bssid", &bssids)) }, tier);
+            assert!(p.contains("USING PRIMARY KEY (bssid=?"), "{p}");
+            // One AP's clients: by AP from the roll-ups (the raw tier has no such index).
+            let p = plan(Spec { table: "client_stats", key: "mac", extra: &[], cols: &BYTE_COLS, only: Some(Only::Is("ap_mac", "02:00:00:00:00:a1")) }, tier);
+            assert_eq!(p.contains("(ap_mac=? AND ts>? AND ts<?)"), tier > 0, "{p}");
         }
     }
 
