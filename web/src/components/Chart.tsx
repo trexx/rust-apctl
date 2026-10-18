@@ -5,6 +5,7 @@ import {
   useLayoutEffect,
   useRef,
   useState,
+  useSyncExternalStore,
 } from "react";
 import { useSearchParams } from "react-router";
 import uPlot from "uplot";
@@ -97,18 +98,25 @@ const sameData = (a: Drawn | null, b: Drawn) =>
   a.values.length === b.values.length &&
   a.values.every((v, i) => v === b.values[i] && a.scales[i] === b.scales[i]);
 
+/** Whether the page is in dark mode, kept once for all charts: one
+ *  media-query listener while any chart is shown, not one per chart. */
+const darkQuery = window.matchMedia("(prefers-color-scheme: dark)");
+const darkListeners = new Set<() => void>();
+const onDarkChange = () => darkListeners.forEach((l) => l());
+const subscribeDark = (onChange: () => void) => {
+  if (darkListeners.size === 0)
+    darkQuery.addEventListener("change", onDarkChange);
+  darkListeners.add(onChange);
+  return () => {
+    darkListeners.delete(onChange);
+    if (darkListeners.size === 0)
+      darkQuery.removeEventListener("change", onDarkChange);
+  };
+};
+const readDark = () => darkQuery.matches;
+
 /** Whether the page is in dark mode now, following changes. */
-function useDarkMode(): boolean {
-  const query = "(prefers-color-scheme: dark)";
-  const [dark, setDark] = useState(() => window.matchMedia(query).matches);
-  useEffect(() => {
-    const m = window.matchMedia(query);
-    const on = () => setDark(m.matches);
-    m.addEventListener("change", on);
-    return () => m.removeEventListener("change", on);
-  }, []);
-  return dark;
-}
+const useDarkMode = () => useSyncExternalStore(subscribeDark, readDark);
 
 interface Props {
   title: string;
