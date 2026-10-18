@@ -19,17 +19,12 @@ pub struct RenderRequest<'a> {
     pub previous_system_cfg: Option<&'a str>,
 }
 
-/// The controller as rendered configs describe it. Its URLs are fallbacks
-/// only: the host comes from the settings and the AP's inform URL.
-pub fn controller(inform_url: String, version: String, reporter_uuid: String) -> apcfg::Controller {
-    apcfg::Controller {
-        inform_url,
-        mgmt_url: "https://unifi:8443".into(),
-        stun_url: "stun://unifi:3478/".into(),
-        syslog_ip: None,
-        version,
-        reporter_uuid,
-    }
+/// The controller as rendered configs describe it: the official controller's
+/// defaults (host `unifi`, ports 8080, 8443 and 3478), which active mode
+/// replaces with its own host and listen ports. The host is a fallback only:
+/// it comes from the settings and the AP's inform URL first.
+pub fn controller(version: String, reporter_uuid: String) -> apcfg::Controller {
+    apcfg::Controller { version, reporter_uuid, ..Default::default() }
 }
 
 /// The real generator (`apcfg`), emulating a given controller version.
@@ -40,7 +35,7 @@ pub fn apcfg_renderer(version: String) -> RenderFn {
             .and_then(|c| c.lines().find_map(|l| l.strip_prefix("unifi.reporterid=")))
             .unwrap_or_default()
             .to_string();
-        let controller = controller("http://unifi:8080/inform".into(), version.clone(), reporter);
+        let controller = controller(version.clone(), reporter);
         let input = apcfg::Input {
             state: req.state,
             device_mac: req.device_mac,

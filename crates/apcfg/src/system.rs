@@ -352,7 +352,7 @@ fn syslog(c: &mut Cfg, ctx: &Ctx) {
     if enabled && !this && !wants_ap_logs {
         return;
     }
-    let controller_ip = ctx.controller.syslog_ip.as_deref().or_else(|| ctx.inform_str("inform_ip"));
+    let controller_ip = ctx.inform_str("inform_ip");
     c.header("syslog");
     c.set("syslog.status", "enabled");
     c.set("syslog.level", if enabled && flag(s, "debug", false) { 8 } else { 7 });
@@ -776,14 +776,7 @@ mod tests {
         let state = json!({ "sites": [{ "_id": "s" }], "devices": [
             { "mac": mac, "site_id": "s", "type": "uap", "fw_caps": 16, "ethernet_table": ethernet_table, "port_overrides": port_overrides },
         ]});
-        let controller = Controller {
-            inform_url: String::new(),
-            mgmt_url: String::new(),
-            stun_url: String::new(),
-            syslog_ip: None,
-            version: String::new(),
-            reporter_uuid: String::new(),
-        };
+        let controller = Controller::default();
         let ctx = Ctx::new(&Input { state: &state, device_mac: mac, inform: None, cfgversion: "1", controller: &controller }).unwrap();
         let mut c = Cfg::default();
         switch(&mut c, &ctx);

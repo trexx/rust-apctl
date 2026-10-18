@@ -42,22 +42,28 @@ use crate::wlan::Band;
 
 /// Facts about the controller itself that the settings snapshot does not hold.
 pub struct Controller {
-    /// The controller's inform URL, e.g. `http://unifi.example.net:8080/inform`. Its host
-    /// is used when neither the settings nor the device name one; its port when the device
-    /// has no stored `inform_url`.
-    pub inform_url: String,
-    /// Base URL of the management UI, e.g. `https://unifi.example.net:8443`. Only the
-    /// port is used unless no other host is known; `/manage/site/<site>` is appended.
-    pub mgmt_url: String,
-    /// STUN URL, e.g. `stun://unifi.example.net:3478/`; supplies the STUN port.
-    pub stun_url: String,
-    /// Where APs send syslog when the site logs to "this controller". When `None`, the
-    /// address the AP itself reports as its controller (`inform_ip` in its inform) is used.
-    pub syslog_ip: Option<String>,
+    /// The controller's host, e.g. `unifi.example.net`: what the AP is given when neither
+    /// a pending migration, the settings nor its stored inform URL names one.
+    pub host: String,
+    /// The port the controller takes informs on: the inform URL's when the device has no
+    /// stored `inform_url` (official default 8080).
+    pub inform_port: u16,
+    /// The management UI's HTTPS port, in `mgmt_url` (official default 8443).
+    pub https_port: u16,
+    /// The port the controller answers STUN on, in `stun_url` (official default 3478).
+    pub stun_port: u16,
     /// Controller version written as `unifi.version` (the official one sends `10.6.106`).
     pub version: String,
     /// Anonymous controller id (`unifi.anonymous_controller_id` and `unifi.reporterid`).
     pub reporter_uuid: String,
+}
+
+impl Default for Controller {
+    /// The official controller's default ports, on the host name `unifi` (the one APs
+    /// look for on a fresh network), with no version or id.
+    fn default() -> Controller {
+        Controller { host: "unifi".into(), inform_port: 8080, https_port: 8443, stun_port: 3478, version: String::new(), reporter_uuid: String::new() }
+    }
 }
 
 pub struct Input<'a> {

@@ -31,15 +31,14 @@ fn migration_host<'a>(ctx: &Ctx<'a>) -> Option<&'a str> {
 
 /// The host the AP should use for the controller, first match wins: a pending
 /// migration URL (`migration`, from [`migration_host`]), the "override inform host"
-/// hostname, the host of the device's stored inform URL, the controller's own inform URL.
+/// hostname, the host of the device's stored inform URL, the controller's own host.
 fn inform_host<'a>(ctx: &Ctx<'a>, migration: Option<&'a str>) -> &'a str {
     let override_host = flag(ctx.super_mgmt, "override_inform_host", false)
         .then(|| str_of(ctx.setting("super_identity"), "hostname").unwrap_or("example-domain.ui.com"));
     migration
         .or(override_host)
         .or_else(|| str_of(ctx.device, "inform_url").and_then(host_port).map(|(h, _)| h))
-        .or_else(|| host_port(&ctx.controller.inform_url).map(|(h, _)| h))
-        .unwrap_or_default()
+        .unwrap_or(&ctx.controller.host)
 }
 
 /// Whether the AP shows its LED, from the device override and the site default.
@@ -55,9 +54,7 @@ pub fn render(ctx: &Ctx) -> String {
     let migration = migration_host(ctx);
     let host = inform_host(ctx, migration);
     let port_of = |url: &str| host_port(url).and_then(|(_, p)| p);
-    let stun_port = port_of(&c.stun_url).unwrap_or(3478);
-    let https_port = port_of(&c.mgmt_url).unwrap_or(8443);
-    let inform_port = str_of(ctx.device, "inform_url").and_then(port_of).or_else(|| port_of(&c.inform_url)).unwrap_or(8080);
+    let inform_port = str_of(ctx.device, "inform_url").and_then(port_of).unwrap_or(c.inform_port);
     let site_name = str_of(ctx.site, "name").unwrap_or("default");
 
     let mut out = Cfg::default();
@@ -65,8 +62,8 @@ pub fn render(ctx: &Ctx) -> String {
     out.set("selfrun_guest_mode", "pass");
     out.set("cfgversion", ctx.cfgversion);
     out.set("led_enabled", led_enabled(ctx));
-    out.set("stun_url", format_args!("stun://{host}:{stun_port}/"));
-    let https = if https_port == 443 { String::new() } else { format!(":{https_port}") };
+    out.set("stun_url", format_args!("stun://{host}:{}/", c.stun_port));
+    let https = if c.https_port == 443 { String::new() } else { format!(":{}", c.https_port) };
     out.set("mgmt_url", format_args!("https://{host}{https}/manage/site/{site_name}"));
     // The key is only resent while the AP still authenticates with an older one.
     if let (Some(key), Some(used)) = (str_of(ctx.device, "x_authkey"), str_of(ctx.device, "x_inform_authkey"))
@@ -88,19 +85,23 @@ mod tests {
     use crate::{Controller, Input};
     use serde_json::{Value, json};
 
-    fn inform_url_line(migrate: Value) -> Option<String> {
+    /// The `mgmt_cfg` of an AP with these extra device fields and settings documents.
+    fn mgmt_cfg(device: Value, settings: Value, controller: &Controller) -> String {
         let mac = "02:00:00:00:00:01";
-        let state = json!({ "sites": [{ "_id": "s" }], "devices": [{ "mac": mac, "site_id": "s", "type": "uap", "migrate_inform_url": migrate }] });
-        let controller = Controller {
-            inform_url: "http://unifi.example.net:8080/inform".into(),
-            mgmt_url: String::new(),
-            stun_url: String::new(),
-            syslog_ip: None,
-            version: String::new(),
-            reporter_uuid: String::new(),
-        };
-        let ctx = Ctx::new(&Input { state: &state, device_mac: mac, inform: None, cfgversion: "1", controller: &controller }).unwrap();
-        render(&ctx).lines().find_map(|l| l.strip_prefix("inform_url=")).map(str::to_string)
+        let mut doc = json!({ "mac": mac, "site_id": "s", "type": "uap" });
+        doc.as_object_mut().unwrap().extend(device.as_object().unwrap().clone());
+        let state = json!({ "sites": [{ "_id": "s", "name": "default" }], "devices": [doc], "setting": settings });
+        let ctx = Ctx::new(&Input { state: &state, device_mac: mac, inform: None, cfgversion: "1", controller }).unwrap();
+        render(&ctx)
+    }
+
+    fn line(cfg: &str, key: &str) -> Option<String> {
+        cfg.lines().find_map(|l| l.strip_prefix(key)?.strip_prefix('=')).map(str::to_string)
+    }
+
+    fn inform_url_line(migrate: Value) -> Option<String> {
+        let controller = Controller { host: "unifi.example.net".into(), ..Default::default() };
+        line(&mgmt_cfg(json!({ "migrate_inform_url": migrate }), json!([]), &controller), "inform_url")
     }
 
     #[test]
@@ -109,6 +110,18 @@ mod tests {
         for none in [json!(null), json!(""), json!("http:///inform"), json!(3)] {
             assert_eq!(inform_url_line(none.clone()), None, "{none}");
         }
+    }
+
+    #[test]
+    fn the_controllers_ports_reach_the_urls() {
+        let controller = Controller { host: "unifi.example.net".into(), inform_port: 8081, https_port: 443, stun_port: 3479, ..Default::default() };
+        let settings = json!([{ "key": "super_mgmt", "override_inform_host": true }, { "key": "super_identity", "hostname": "ctl.example.net" }]);
+        let cfg = mgmt_cfg(json!({}), settings, &controller);
+        assert_eq!(line(&cfg, "stun_url").as_deref(), Some("stun://ctl.example.net:3479/"));
+        assert_eq!(line(&cfg, "mgmt_url").as_deref(), Some("https://ctl.example.net/manage/site/default"), "443 is left out");
+        assert_eq!(line(&cfg, "inform_url").as_deref(), Some("http://ctl.example.net:8081/inform"));
+        let cfg = mgmt_cfg(json!({}), json!([]), &Controller { https_port: 8444, ..Default::default() });
+        assert_eq!(line(&cfg, "mgmt_url").as_deref(), Some("https://unifi:8444/manage/site/default"));
     }
 
     #[test]

@@ -750,12 +750,10 @@ mod tests {
 
     fn controller() -> apcfg::Controller {
         apcfg::Controller {
-            inform_url: "http://unifi.example.net:8080/inform".into(),
-            mgmt_url: "https://unifi.example.net:8443".into(),
-            stun_url: "stun://unifi.example.net:3478/".into(),
-            syslog_ip: None,
+            host: "unifi.example.net".into(),
             version: "10.6.106".into(),
             reporter_uuid: "00000000-0000-4000-8000-000000000004".into(),
+            ..Default::default()
         }
     }
 
