@@ -702,26 +702,32 @@ pub struct RoamingQuery {
     range: Option<Ts>,
     from: Option<Ts>,
     to: Option<Ts>,
-    /// How many of the newest roams to list (default 100); the totals count them all.
+    /// How many of the newest roams to list (default 100, at most [`ROAMS_LISTED`]); the totals count them all.
     limit: Option<usize>,
 }
+
+/// The most roams `/api/roaming` lists.
+const ROAMS_LISTED: usize = 1000;
 
 /// GET /api/roaming: the newest roams in the window (default two days), with
 /// totals, per-AP-pair and per-client figures over all of them.
 pub async fn roaming(State(s): State<AppState>, Query(q): Query<RoamingQuery>) -> Result<Response, ApiError> {
     let range = RangeQuery { range: q.range.or(Some(2 * 86400)), from: q.from, to: q.to, ..Default::default() };
     let (from, to, tier) = window(&range);
-    // Roams newest first, the figures over all of them and the stored names, reused for a while.
+    // The newest roams that may be listed, the figures over all of them, and the stored names
+    // and (AP, client) pairs of all of them (the figures name them too), reused for a while.
     let got = memo_read(&s, Db::Config, "roaming", &range, tier, move |c| {
         let mut r = roams(&roam_rows(c, from, to, None)?);
         let figures = (roam_totals(&r), roam_pairs(&r), roam_clients(&r));
         let stored = Names::load_for(c, macs_of(&[], &r))?;
+        let macs: BTreeSet<(String, String)> = macs_of(&[], &r).map(|(a, c)| (a.to_string(), c.to_string())).collect();
         r.reverse();
-        Ok((r, figures, stored))
+        r.truncate(ROAMS_LISTED);
+        Ok((r, figures, stored, macs))
     })
     .await?;
-    let (r, (total, pairs, clients), stored) = &*got;
-    let (ap_names, client_names) = names(stored, &s.live.read().unwrap(), macs_of(&[], r));
+    let (r, (total, pairs, clients), stored, macs) = &*got;
+    let (ap_names, client_names) = names(stored, &s.live.read().unwrap(), macs.iter().map(|(a, c)| (a.as_str(), c.as_str())));
     /// The response, written out from the memoised parts as they are (keys in alphabetical order, as `json!` has them).
     #[derive(Serialize)]
     struct Out<'a> {
@@ -734,7 +740,7 @@ pub async fn roaming(State(s): State<AppState>, Query(q): Query<RoamingQuery>) -
         to: Ts,
         total: &'a Value,
     }
-    let roams = &r[..r.len().min(q.limit.unwrap_or(100).min(1000))];
+    let roams = &r[..r.len().min(q.limit.unwrap_or(100))];
     Ok(Json(Out { ap_names, client_names, clients, from, pairs, roams, to, total }).into_response())
 }
 
