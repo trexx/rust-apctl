@@ -224,6 +224,9 @@ pub struct Live {
     /// User-given client names, including clients not seen in this run.
     pub aliases: HashMap<Mac, Alias>,
     pub clients: BTreeMap<Mac, ClientView>,
+    /// The MACs of the connected clients, kept by the engine with `clients`,
+    /// so that no reader need walk the year of clients to find them.
+    pub connected: std::collections::BTreeSet<Mac>,
     /// Also held by the engine, which counts without taking the lock.
     pub counters: Arc<Counters>,
     /// For attributing syslog: an AP's `hash_id` (see `syslog::hash_id`) and IP address.
@@ -281,12 +284,34 @@ impl Live {
         }
     }
 
+    /// The connected clients, by MAC.
+    pub fn connected_clients(&self) -> impl Iterator<Item = (&Mac, &ClientView)> {
+        self.connected.iter().filter_map(|m| self.clients.get_key_value(m)).filter(|(_, c)| c.connected)
+    }
+
+    /// Adds or replaces a client, keeping `connected` with it.
+    pub fn put_client(&mut self, c: ClientView) {
+        if c.connected {
+            self.connected.insert(c.sample.mac);
+        } else {
+            self.connected.remove(&c.sample.mac);
+        }
+        self.clients.insert(c.sample.mac, c);
+    }
+
+    /// Fails unless `connected` holds exactly the clients marked connected.
+    #[cfg(test)]
+    pub fn assert_connected(&self) {
+        let marked: std::collections::BTreeSet<Mac> = self.clients.iter().filter(|(_, c)| c.connected).map(|(m, _)| *m).collect();
+        assert_eq!(self.connected, marked, "the connected set is out of step with the clients");
+    }
+
     /// Drops what the live view keeps about a forgotten AP, except its clients
     /// (the engine disconnects those, with events). Every field is named, so a
     /// field added to `Live` has to be decided on here.
     fn forget_ap(&mut self, mac: &Mac) {
         let Live {
-            devices, aliases: _, clients: _, counters: _, by_hash_id, by_ip, known_devices, state: _, state_imported_at: _, raw_informs, firmware, commands,
+            devices, aliases: _, clients: _, connected: _, counters: _, by_hash_id, by_ip, known_devices, state: _, state_imported_at: _, raw_informs, firmware, commands,
             locating, reprovision, scans, adoption, last_config, stun: _, forget_managed: _,
         } = self;
         devices.remove(mac);
@@ -447,9 +472,6 @@ pub struct Engine {
     /// Per AP: the second its stored syslog lines were last announced, and
     /// whether more came in that second (see `log`).
     logs_announced: HashMap<Option<Mac>, (Ts, bool)>,
-    /// The clients connected in the live view, so the tick need not walk the
-    /// year of clients it keeps.
-    connected: std::collections::BTreeSet<Mac>,
     /// Where alert-worthy events go: the alert watcher's own channel.
     alerts: Option<crate::alerts::Sink>,
     /// The time of this run's first tick (the capture's time in shadow mode).
@@ -467,7 +489,7 @@ impl Engine {
         Engine {
             writer, keys, renderer: None, live, counters, tx, radios: HashMap::new(), mcast_prev: HashMap::new(), bss_prev: HashMap::new(),
             logevents: Default::default(), isolated: HashMap::new(), last_prune: 0, written: Default::default(), syslog_unknown: HashMap::new(),
-            syslog_ciphers: Default::default(), logs_announced: HashMap::new(), connected: Default::default(), alerts: None, first_tick: None,
+            syslog_ciphers: Default::default(), logs_announced: HashMap::new(), alerts: None, first_tick: None,
         }
     }
 
@@ -533,10 +555,7 @@ impl Engine {
         }
         let n_clients = clients.len();
         for c in clients {
-            if c.connected {
-                self.connected.insert(c.sample.mac);
-            }
-            live.clients.insert(c.sample.mac, c);
+            live.put_client(c);
         }
         if let Some((json, at)) = state {
             match serde_json::from_str::<Value>(&json) {
@@ -744,7 +763,7 @@ impl Engine {
         use std::collections::btree_map::Entry;
         let mut updated = Vec::with_capacity(clients.len());
         for c in clients {
-            self.connected.insert(c.mac);
+            live.connected.insert(c.mac);
             let view = ClientView { sample: c.clone(), connected: true, first_seen: ts, last_seen: ts };
             let old = match live.clients.entry(c.mac) {
                 Entry::Occupied(mut e) => {
@@ -1005,8 +1024,8 @@ impl Engine {
         let forget_managed = live.forget_managed.clone();
         // Its clients are gone with it, rather than left connected until they go stale.
         let mut events = Vec::new();
-        let clients = &mut live.clients;
-        self.connected.retain(|cmac| {
+        let Live { clients, connected, .. } = &mut *live;
+        connected.retain(|cmac| {
             let Some(c) = clients.get_mut(cmac).filter(|c| c.sample.ap_mac == mac) else { return true };
             events.push(disconnect(&self.writer, ts, *cmac, c, "ap_forgotten"));
             false
@@ -1433,8 +1452,8 @@ impl Engine {
         // Only the connected ones are looked at, not the year of clients kept.
         let mut changed = false;
         let started = *self.first_tick.get_or_insert(now);
-        let Live { devices, clients, .. } = &mut *live;
-        self.connected.retain(|cmac| {
+        let Live { devices, clients, connected, .. } = &mut *live;
+        connected.retain(|cmac| {
             let Some(c) = clients.get_mut(cmac).filter(|c| c.connected) else { return false };
             // An AP we have not heard from yet in this run (e.g. right after a
             // restart) is unknown, not offline: leave its clients alone.
@@ -1455,10 +1474,11 @@ impl Engine {
         if now - self.last_prune >= 3600 {
             self.last_prune = now;
             let cutoff = now - store::CLIENT_RETENTION;
-            let Live { clients, aliases, .. } = &mut *live;
+            let Live { clients, connected, aliases, .. } = &mut *live;
             let before = clients.len();
             clients.retain(|mac, c| c.last_seen >= cutoff || aliases.contains_key(mac));
             changed |= clients.len() != before;
+            connected.retain(|mac| clients.contains_key(mac));
             self.written.clients.retain(|mac, _| clients.contains_key(mac));
         }
         drop(live);
@@ -1871,6 +1891,7 @@ mod tests {
             drop((engine, live, rx, store, writer));
             let mut h = Harness::open(dir, KeyStore::default());
             h.engine.restore(&h.store).unwrap();
+            h.live.read().unwrap().assert_connected();
             h
         }
     }
@@ -1888,7 +1909,10 @@ mod tests {
             .unwrap()
     }
 
+    /// The events sent since the last call. Every scenario reads them, so the
+    /// connected set is checked against the clients here too.
     fn events(h: &mut Harness) -> Vec<(&'static str, Option<String>)> {
+        h.live.read().unwrap().assert_connected();
         let mut out = Vec::new();
         while let Ok(m) = h.rx.try_recv() {
             if let LiveMsg::Event(e) = m {

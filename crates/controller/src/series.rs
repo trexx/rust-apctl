@@ -335,7 +335,7 @@ mod tests {
         let (a, b): (inform::Mac, inform::Mac) = ("aa:00:00:00:00:01".parse().unwrap(), "aa:00:00:00:00:02".parse().unwrap());
         for (mac, hostname) in [(a, "phone"), (b, "")] {
             let sample = crate::model::ClientSample { mac, hostname: Some(hostname.into()), ..Default::default() };
-            live.clients.insert(mac, crate::engine::ClientView { sample: std::sync::Arc::new(sample), connected: true, first_seen: 0, last_seen: 0 });
+            live.put_client(crate::engine::ClientView { sample: std::sync::Arc::new(sample), connected: true, first_seen: 0, last_seen: 0 });
         }
         assert_eq!((client_name(&live, Some(a)), client_name(&live, Some(b)), client_name(&live, None)), (Some("phone"), None, None));
         live.aliases.insert(b, crate::engine::Alias { alias: Some("Tablet".into()), note: None });

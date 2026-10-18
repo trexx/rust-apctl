@@ -620,7 +620,7 @@ pub async fn wlans(State(s): State<AppState>, Query(q): Query<RangeQuery>) -> Re
         }
         // The clients connected now, per network (each client is listed once).
         let mut connected: HashMap<&str, usize> = HashMap::new();
-        for e in live.clients.values().filter(|c| c.connected).filter_map(|c| c.sample.essid.as_deref()) {
+        for e in live.connected_clients().filter_map(|(_, c)| c.sample.essid.as_deref()) {
             *connected.entry(e).or_default() += 1;
         }
         let connected: HashMap<String, usize> = connected.into_iter().map(|(e, n)| (e.to_string(), n)).collect();
@@ -1239,7 +1239,7 @@ mod tests {
                     let snapshot = crate::model::parse(base, &p).unwrap();
                     let mac: inform::Mac = ap.parse().unwrap();
                     for c in &snapshot.clients {
-                        l.clients.insert(c.mac, ClientView { sample: c.clone(), connected: true, first_seen: 0, last_seen: base });
+                        l.put_client(ClientView { sample: c.clone(), connected: true, first_seen: 0, last_seen: base });
                     }
                     let d = DeviceView {
                         snapshot, online: true, first_seen: 0, last_seen: base, peer: "x".into(), interval: 10,
