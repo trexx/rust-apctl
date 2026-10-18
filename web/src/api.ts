@@ -608,14 +608,12 @@ export interface RadioOverview {
   tx_power: number | null;
   eirp: number | null;
   clients: number;
-  cu_total_now: number | null;
   noise_floor: number | null;
   avg_utilization: number | null;
   avg_interference: number | null;
   tx_retry_pct: number | null;
   usage_bytes: number;
   avg_client_signal: number | null;
-  spectrum: { channel: number; width: number | null; utilization: number | null; interference: number | null; ts: number }[];
 }
 
 export interface Neighbor {

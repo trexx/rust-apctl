@@ -1027,32 +1027,11 @@
       "bw": 20,
       "channel": 6,
       "clients": 1,
-      "cu_total_now": 30,
       "eirp": null,
       "mac": "02:00:00:00:00:a1",
-      "max_txpower": null,
-      "min_txpower": null,
       "name": "Hall",
       "noise_floor": -95,
       "radio": "ng",
-      "spectrum": [
-        {
-          "channel": 1,
-          "interference": 40,
-          "other_bss_count": 2,
-          "ts": 100,
-          "utilization": 50,
-          "width": 20
-        },
-        {
-          "channel": 6,
-          "interference": 10,
-          "other_bss_count": 2,
-          "ts": 100,
-          "utilization": 20,
-          "width": 20
-        }
-      ],
       "tx_power": 20,
       "tx_retry_pct": 7.6514108189475705,
       "usage_bytes": 29003113.0
@@ -1064,32 +1043,11 @@
       "bw": 80,
       "channel": 44,
       "clients": 1,
-      "cu_total_now": 20,
       "eirp": null,
       "mac": "02:00:00:00:00:a1",
-      "max_txpower": null,
-      "min_txpower": null,
       "name": "Hall",
       "noise_floor": -96,
       "radio": "na",
-      "spectrum": [
-        {
-          "channel": 36,
-          "interference": 20,
-          "other_bss_count": 2,
-          "ts": 100,
-          "utilization": 30,
-          "width": 80
-        },
-        {
-          "channel": 52,
-          "interference": 2,
-          "other_bss_count": 2,
-          "ts": 100,
-          "utilization": 5,
-          "width": 80
-        }
-      ],
       "tx_power": 20,
       "tx_retry_pct": 4.953410935139067,
       "usage_bytes": 39760206.0
@@ -1101,24 +1059,11 @@
       "bw": 20,
       "channel": 1,
       "clients": 1,
-      "cu_total_now": 30,
       "eirp": null,
       "mac": "02:00:00:00:00:a2",
-      "max_txpower": null,
-      "min_txpower": null,
       "name": "Attic",
       "noise_floor": -95,
       "radio": "ng",
-      "spectrum": [
-        {
-          "channel": 11,
-          "interference": 30,
-          "other_bss_count": 2,
-          "ts": 100,
-          "utilization": 60,
-          "width": 20
-        }
-      ],
       "tx_power": 20,
       "tx_retry_pct": 6.317267666382467,
       "usage_bytes": 23606800.0
@@ -1130,24 +1075,11 @@
       "bw": 80,
       "channel": 36,
       "clients": 0,
-      "cu_total_now": 20,
       "eirp": null,
       "mac": "02:00:00:00:00:a2",
-      "max_txpower": null,
-      "min_txpower": null,
       "name": "Attic",
       "noise_floor": -96,
       "radio": "na",
-      "spectrum": [
-        {
-          "channel": 36,
-          "interference": 10,
-          "other_bss_count": 2,
-          "ts": 100,
-          "utilization": 40,
-          "width": 80
-        }
-      ],
       "tx_power": 20,
       "tx_retry_pct": 4.738083571680892,
       "usage_bytes": 23505802.0

@@ -1049,39 +1049,19 @@ pub async fn radios(State(s): State<AppState>, Query(q): Query<RangeQuery>) -> R
         Ok(out)
     })
     .await?;
-    let spectrum_rows = read(&s.store, Db::Config, |c| {
-        let mut stmt = c.prepare("SELECT ap_mac, radio, channel, width, utilization, interference, other_bss_count, ts FROM spectrum")?;
-        let rows = stmt
-            .query_map([], |r| {
-                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, json!({
-                    "channel": r.get::<_, i64>(2)?, "width": r.get::<_, Option<i64>>(3)?, "utilization": r.get::<_, Option<i64>>(4)?,
-                    "interference": r.get::<_, Option<i64>>(5)?, "other_bss_count": r.get::<_, Option<i64>>(6)?, "ts": r.get::<_, i64>(7)?,
-                })))
-            })?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        Ok(rows)
-    })
-    .await?;
-    let mut spectrum: HashMap<(&str, &str), Vec<&Value>> = HashMap::new();
-    for (m, rd, v) in &spectrum_rows {
-        spectrum.entry((m.as_str(), rd.as_str())).or_default().push(v);
-    }
     let live = s.live.read().unwrap();
     let mut out = Vec::new();
     for (mac, d) in &live.devices {
         let mac_s = mac.to_string();
         for r in &d.snapshot.radios {
             let a = avgs.get(&format!("{mac_s}/{}", r.radio));
-            let spec = spectrum.get(&(mac_s.as_str(), r.radio.as_str())).cloned().unwrap_or_default();
             out.push(json!({
                 "mac": mac, "name": d.snapshot.ap.hostname, "radio": r.radio, "channel": r.channel, "bw": r.bw,
                 "tx_power": r.tx_power, "eirp": r.tx_power.zip(r.antenna_gain).map(|(p, g)| p + g),
-                "min_txpower": r.min_txpower, "max_txpower": r.max_txpower,
-                "clients": r.num_sta, "cu_total_now": r.cu_total, "noise_floor": r.noise_floor,
+                "clients": r.num_sta, "noise_floor": r.noise_floor,
                 "avg_utilization": a.and_then(|a| a.utilization), "avg_interference": a.and_then(|a| a.interference), "tx_retry_pct": a.and_then(|a| a.retry_pct),
                 "usage_bytes": a.map_or(0.0, |a| a.usage),
                 "avg_client_signal": a.and_then(|a| a.signal.get()),
-                "spectrum": spec,
             }));
         }
     }
