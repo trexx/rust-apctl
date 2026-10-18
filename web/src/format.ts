@@ -180,8 +180,8 @@ export function spanLabel(from: number, to: number): string {
   return f.toDateString() === t.toDateString() ? `${start} – ${minuteFmt.format(t)}` : `${start} – ${dayFmt.format(t)} ${minuteFmt.format(t)}`;
 }
 
-/** "last 24h", or the fixed window. */
-export const spanText = (span: TimeSpan): string => ("from" in span ? spanLabel(span.from, span.to) : `last ${duration(span.last).replace(/^1d 0h$/, "24h")}`);
+/** "last 24h", "last 6h", "last 7d", "last 1h 30m", or the fixed window. */
+export const spanText = (span: TimeSpan): string => ("from" in span ? spanLabel(span.from, span.to) : `last ${duration(span.last).replace(/^1d 0h$/, "24h").replace(/ 0[hm]$/, "")}`);
 
 /** Value for an <input type="datetime-local"> in the browser's time zone. */
 export function toLocalInput(ts: number): string {
