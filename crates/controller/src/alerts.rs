@@ -611,7 +611,7 @@ impl Watcher {
             let mut v: Vec<_> = l.devices.iter().map(|(m, d)| (*m, d.snapshot.ap.hostname.clone(), d.last_seen)).collect();
             for (m, k) in &l.known_devices {
                 if !l.devices.contains_key(m) {
-                    v.push((*m, None, k.last_seen));
+                    v.push((*m, k.hostname.clone(), k.last_seen));
                 }
             }
             v
@@ -952,6 +952,19 @@ mod tests {
         assert_eq!(restart(4000).await.aps.check(4000, ap, 3700), None);
         // A day after the first two, a drop is reported again.
         assert!(matches!(restart(91_000).await.aps.check(91_000, ap, 90_700), Some(ApChange::Offline { .. })));
+    }
+
+    #[tokio::test]
+    async fn an_ap_not_heard_from_since_startup_is_named_by_its_stored_hostname() {
+        let (mut w, mut rx, _dir) = watcher();
+        let ap: Mac = "02:00:00:00:00:01".parse().unwrap();
+        let known = crate::engine::KnownDevice {
+            first_seen: 0, last_seen: 1000, uptime: None, version: None, hostname: Some("Garage".into()), model: None, model_display: None, ip: None, serial: None,
+        };
+        w.live.write().unwrap().known_devices.insert(ap, known);
+        w.status_tick(1000 + OFFLINE_AFTER);
+        assert_eq!(told(&mut rx), [("raised", "ap_offline")]);
+        assert_eq!(w.book.open[&(Key::ApOffline, Entity::Ap(ap))].title, "Garage is offline");
     }
 
     #[tokio::test]
