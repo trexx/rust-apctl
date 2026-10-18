@@ -632,11 +632,13 @@ pub struct Names {
 
 /// (MAC, name) rows of a query, by MAC.
 fn pairs<P: rusqlite::Params>(c: &rusqlite::Connection, sql: &str, params: P) -> rusqlite::Result<HashMap<String, Option<String>>> {
-    c.prepare(sql)?.query_map(params, |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?)))?.collect()
+    c.prepare_cached(sql)?.query_map(params, |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?)))?.collect()
 }
 
 /// APs' names: their hostnames.
 const AP_NAMES: &str = "SELECT mac, hostname FROM devices";
+/// The hostnames of a JSON list of clients: one statement whatever their number.
+const CLIENT_NAMES: &str = "SELECT mac, hostname FROM clients WHERE mac IN (SELECT value FROM json_each(?1))";
 
 impl Names {
     /// From the database: APs' and clients' hostnames.
@@ -644,16 +646,9 @@ impl Names {
         Ok(Names { aps: pairs(c, AP_NAMES, [])?, clients: pairs(c, "SELECT mac, hostname FROM clients", [])? })
     }
 
-    /// The same for some clients only (those of `macs`, as [`macs_of`] lists
-    /// them): every AP (there are few), and the clients asked for.
-    fn load_for<'a>(c: &rusqlite::Connection, macs: impl Iterator<Item = (&'a str, &'a str)>) -> rusqlite::Result<Names> {
-        let clients: Vec<&str> = macs.map(|(_, c)| c).collect::<BTreeSet<_>>().into_iter().collect();
-        let mut names = Names { aps: pairs(c, AP_NAMES, [])?, clients: HashMap::new() };
-        for chunk in clients.chunks(500) {
-            let sql = format!("SELECT mac, hostname FROM clients WHERE mac IN ({})", vec!["?"; chunk.len()].join(", "));
-            names.clients.extend(pairs(c, &sql, rusqlite::params_from_iter(chunk))?);
-        }
-        Ok(names)
+    /// The same for some clients only: every AP (there are few), and the clients asked for.
+    fn load_for(c: &rusqlite::Connection, clients: &BTreeSet<&str>) -> anyhow::Result<Names> {
+        Ok(Names { aps: pairs(c, AP_NAMES, [])?, clients: pairs(c, CLIENT_NAMES, [serde_json::to_string(clients)?])? })
     }
 
     /// An AP's display name: what it reports now, else what was stored.
@@ -676,19 +671,17 @@ impl Names {
     }
 }
 
-/// Display names of the APs and clients of `macs`, for the ones that have
-/// one, by AP and by client.
-fn names<'a>(stored: &Names, live: &Live, macs: impl Iterator<Item = (&'a str, &'a str)>) -> (BTreeMap<String, String>, BTreeMap<String, String>) {
-    let (aps, clients): (BTreeSet<&str>, BTreeSet<&str>) = macs.unzip();
+/// Display names of these APs and clients, for the ones that have one.
+fn names<'a>(stored: &Names, live: &Live, aps: impl IntoIterator<Item = &'a str>, clients: impl IntoIterator<Item = &'a str>) -> (BTreeMap<String, String>, BTreeMap<String, String>) {
     let aps = aps.into_iter().filter_map(|m| Some((m.to_string(), stored.ap(live, m)?))).collect();
     let clients = clients.into_iter().filter_map(|m| Some((m.to_string(), stored.client(live, m)?))).collect();
     (aps, clients)
 }
 
-/// (AP, client) of every attempt and both ends of every roam.
-fn macs_of<'a>(attempts: &'a [Attempt], roams: &'a [Roam]) -> impl Iterator<Item = (&'a str, &'a str)> {
+/// The APs and the clients of every attempt and both ends of every roam.
+fn macs_of<'a>(attempts: &'a [Attempt], roams: &'a [Roam]) -> (BTreeSet<&'a str>, BTreeSet<&'a str>) {
     let a = attempts.iter().map(|a| (a.ap.as_str(), a.client.as_str()));
-    a.chain(roams.iter().flat_map(|r| [(r.from.ap.as_str(), r.client.as_str()), (r.to.ap.as_str(), r.client.as_str())]))
+    a.chain(roams.iter().flat_map(|r| [(r.from.ap.as_str(), r.client.as_str()), (r.to.ap.as_str(), r.client.as_str())])).unzip()
 }
 
 /// GET /api/site/connectivity: connection success per client and stage, for
@@ -734,11 +727,12 @@ pub async fn list(State(s): State<AppState>, Query(q): Query<ListQuery>) -> Resu
     let with_roams = q.roams.unwrap_or(true);
     let (list, r, stored) = read(&s.store, Db::Config, move |c| {
         let (list, r) = newest(c, from, to, client.as_deref(), limit, q.failed, with_roams)?;
-        let stored = Names::load_for(c, macs_of(&list, &r))?;
+        let stored = Names::load_for(c, &macs_of(&list, &r).1)?;
         Ok((list, r, stored))
     })
     .await?;
-    let (aps, clients) = names(&stored, &s.live.read().unwrap(), macs_of(&list, &r));
+    let (aps, clients) = macs_of(&list, &r);
+    let (aps, clients) = names(&stored, &s.live.read().unwrap(), aps, clients);
     Ok(Json(json!({ "attempts": list, "roams": r, "ap_names": aps, "client_names": clients })))
 }
 
@@ -765,19 +759,21 @@ pub async fn roaming(State(s): State<AppState>, Query(q): Query<RoamingQuery>) -
     let range = RangeQuery { range: q.range.or(Some(2 * 86400)), from: q.from, to: q.to, ..Default::default() };
     let (from, to, tier) = window(&range);
     // The newest roams that may be listed, the figures over all of them, and the stored names
-    // and (AP, client) pairs of all of them (the figures name them too), reused for a while.
+    // and the APs and clients of all of them (the figures name them too), reused for a while.
     let got = memo_read(&s, Db::Config, "roaming", &range, tier, move |c| {
         let mut r = roams(&roam_rows(c, from, to, None)?);
         let figures = (roam_totals(&r), roam_pairs(&r), roam_clients(&r));
-        let stored = Names::load_for(c, macs_of(&[], &r))?;
-        let macs: BTreeSet<(String, String)> = macs_of(&[], &r).map(|(a, c)| (a.to_string(), c.to_string())).collect();
+        let (aps, clients) = macs_of(&[], &r);
+        let stored = Names::load_for(c, &clients)?;
+        let owned = |set: BTreeSet<&str>| -> Vec<String> { set.into_iter().map(str::to_string).collect() };
+        let macs = (owned(aps), owned(clients));
         r.reverse();
         r.truncate(ROAMS_LISTED);
         Ok((r, figures, stored, macs))
     })
     .await?;
-    let (r, (total, pairs, clients), stored, macs) = &*got;
-    let (ap_names, client_names) = names(stored, &s.live.read().unwrap(), macs.iter().map(|(a, c)| (a.as_str(), c.as_str())));
+    let (r, (total, pairs, clients), stored, (aps, client_macs)) = &*got;
+    let (ap_names, client_names) = names(stored, &s.live.read().unwrap(), aps.iter().map(String::as_str), client_macs.iter().map(String::as_str));
     /// The response, written out from the memoised parts as they are (keys in alphabetical order, as `json!` has them).
     #[derive(Serialize)]
     struct Out<'a> {
@@ -839,6 +835,13 @@ mod tests {
         assert_eq!(v["success_pct"].as_f64(), Some(67.0));
         assert_eq!(v["failed_at"]["dns"], 1);
         assert_eq!(connectivity_stats(&list, Some("ng"))["clients"], 0);
+    }
+
+    #[test]
+    fn client_names_are_read_through_the_key() {
+        let t = TestStore::new("names-plan");
+        let plan: String = t.db(Db::Config).query_row(&format!("EXPLAIN QUERY PLAN {CLIENT_NAMES}"), ["[\"a\"]"], |r| r.get(3)).unwrap();
+        assert!(plan.contains("(mac=?)"), "{plan}");
     }
 
     #[test]
