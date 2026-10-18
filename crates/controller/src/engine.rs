@@ -369,38 +369,39 @@ struct Row<T> {
     seen: Ts,
 }
 
-impl<T: PartialEq + Clone> Row<T> {
-    fn new(value: &T, ts: Ts) -> Self {
-        Row { value: value.clone(), written: ts, seen: ts }
+impl<T: PartialEq> Row<T> {
+    fn new(value: T, ts: Ts) -> Self {
+        Row { value, written: ts, seen: ts }
     }
 
     /// Records `value` as reported at `ts`; true if it is to be written: it
     /// changed, or was last written `every` seconds ago.
-    fn report(&mut self, value: &T, ts: Ts, every: Ts) -> bool {
+    fn report(&mut self, value: T, ts: Ts, every: Ts) -> bool {
         self.seen = ts;
-        if self.value == *value && !due(Some(&self.written), ts, every) {
+        if self.value == value && !due(Some(&self.written), ts, every) {
             return false;
         }
-        self.value.clone_from(value);
+        self.value = value;
         self.written = ts;
         true
     }
 }
 
-/// Records `value` as reported under `key` at `ts` (see `Row::report`): true
-/// if its row is to be written, as one new or changed, or due again. The key
-/// is copied only for a new row.
-fn report<K, Q, T>(rows: &mut Rows<K, T>, key: &Q, value: &T, ts: Ts, every: Ts) -> bool
+/// Records `value` as reported under its `key` at `ts` (see `Row::report`):
+/// its row if it is to be written, as one new or changed, or due again. The
+/// row keeps the value; the key is copied only for a new row.
+fn report<K, Q, T>(rows: &mut Rows<K, T>, value: T, key: impl Fn(&T) -> &Q, ts: Ts, every: Ts) -> Option<&T>
 where
     K: std::borrow::Borrow<Q> + Eq + std::hash::Hash,
     Q: ToOwned<Owned = K> + Eq + std::hash::Hash + ?Sized,
-    T: PartialEq + Clone,
+    T: PartialEq,
 {
-    if let Some(row) = rows.get_mut(key) {
-        return row.report(value, ts, every);
+    if rows.contains_key(key(&value)) {
+        let row = rows.get_mut(key(&value)).expect("present");
+        return row.report(value, ts, every).then_some(&row.value);
     }
-    rows.insert(key.to_owned(), Row::new(value, ts));
-    true
+    let k = key(&value).to_owned();
+    Some(&rows.entry(k).or_insert(Row::new(value, ts)).value)
 }
 
 /// Whether a row last written at `at` (if ever) is due again at `ts`.
@@ -629,7 +630,7 @@ impl Engine {
             self.notification(ts, decoded.payload);
             return;
         }
-        let snap = match model::parse(ts, &decoded.payload) {
+        let mut snap = match model::parse(ts, &decoded.payload) {
             Ok(s) => s,
             Err(e) => {
                 tracing::debug!("unparseable inform: {e:#}");
@@ -638,8 +639,10 @@ impl Engine {
             }
         };
         let mac = snap.ap.mac;
-        self.write_metrics(&snap);
-        self.check_isolated(ts, &snap);
+        // Only stored, not kept in the live view: the rows written of them own them.
+        let (neighbors, spectrum) = (std::mem::take(&mut snap.neighbors), std::mem::take(&mut snap.spectrum));
+        self.check_isolated(ts, mac, &neighbors);
+        self.write_metrics(&snap, neighbors, spectrum);
         bump(&self.counters.informs);
 
         // A handle of its own, so the engine's other fields stay usable while it is locked.
@@ -1305,9 +1308,9 @@ impl Engine {
 
     /// Another AP's beacon flagged "isolated" (lost its uplink) that belongs to one
     /// of our APs: reported at most once an hour per AP.
-    fn check_isolated(&mut self, ts: Ts, s: &Snapshot) {
+    fn check_isolated(&mut self, ts: Ts, heard_by: Mac, neighbors: &[crate::model::NeighborSample]) {
         use crate::model::{hardware_num, same_hardware};
-        let flagged: Vec<&crate::model::NeighborSample> = s.neighbors.iter().filter(|n| n.is_isolated).collect();
+        let flagged: Vec<&crate::model::NeighborSample> = neighbors.iter().filter(|n| n.is_isolated).collect();
         if flagged.is_empty() {
             return;
         }
@@ -1320,7 +1323,7 @@ impl Engine {
                 continue;
             }
             self.isolated.insert(*ap, ts);
-            let data = json!({ "heard_by": s.ap.mac.to_string(), "bssid": n.bssid, "signal": n.signal });
+            let data = json!({ "heard_by": heard_by.to_string(), "bssid": n.bssid, "signal": n.signal });
             self.emit(Event::device(ts, EventKind::ApIsolated, *ap, data));
         }
     }
@@ -1458,7 +1461,8 @@ impl Engine {
         );
     }
 
-    fn write_metrics(&mut self, s: &Snapshot) {
+    /// The inform's metrics, and its scan results (see `Written`).
+    fn write_metrics(&mut self, s: &Snapshot, neighbors: Vec<crate::model::NeighborSample>, spectrum: Vec<crate::model::SpectrumSample>) {
         let ts = s.ap.ts;
         let mac = || Sql::Text(s.ap.mac.to_string());
         let a = &s.ap;
@@ -1503,10 +1507,8 @@ impl Engine {
         // neighbour is written once a minute (last_seen), an unchanged spectrum
         // row once an hour. What the AP no longer reports is forgotten here.
         let rows = self.written.neighbors.entry(s.ap.mac).or_default();
-        for n in &s.neighbors {
-            if !report(rows, n.bssid.as_str(), n, ts, REFRESH_SECS) {
-                continue;
-            }
+        for n in neighbors {
+            let Some(n) = report(rows, n, |n| n.bssid.as_str(), ts, REFRESH_SECS) else { continue };
             self.writer.exec(
                 Db::Config,
                 "INSERT INTO neighbors (bssid, ap_mac, radio, essid, channel, bw, center_freq, security, signal, best_signal, noise, is_unifi, ap_name, model, first_seen, last_seen)
@@ -1524,15 +1526,13 @@ impl Engine {
         }
         rows.retain(|_, r| r.seen == ts);
         let radios = self.written.spectrum.entry(s.ap.mac).or_default();
-        for c in &s.spectrum {
+        for c in spectrum {
             // Looked up by reference: the radio's name is copied only for a new one.
             if !radios.contains_key(c.radio.as_str()) {
                 radios.insert(c.radio.clone(), Rows::new());
             }
             let rows = radios.get_mut(c.radio.as_str()).expect("inserted above");
-            if !report(rows, &c.channel, c, ts, SPECTRUM_REFRESH_SECS) {
-                continue;
-            }
+            let Some(c) = report(rows, c, |c| &c.channel, ts, SPECTRUM_REFRESH_SECS) else { continue };
             self.writer.exec(
                 Db::Config,
                 "INSERT OR REPLACE INTO spectrum (ap_mac, radio, channel, width, utilization, interference, other_bss_count, ts) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
