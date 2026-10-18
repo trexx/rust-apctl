@@ -157,7 +157,7 @@ impl Auth {
         !self.users.is_empty()
     }
 
-    pub(crate) fn create(&self, user: &str) -> Result<String> {
+    pub(crate) fn create(&self, user: &str) -> String {
         let token = crate::random_hex(32);
         let now = clock::now_ts();
         let session = Session { user: user.to_string(), expires: now + SESSION_SECS };
@@ -172,7 +172,7 @@ impl Auth {
         // session starts here, so this keeps the map to the live ones.
         sessions.retain(|_, s| s.expires > now);
         sessions.insert(hash, session);
-        Ok(token)
+        token
     }
 
     /// Returns the user for a valid session token, extending it, and whether
@@ -464,7 +464,7 @@ pub async fn login(
         return Err(ApiError(StatusCode::UNAUTHORIZED, "wrong username or password".into()));
     }
     auth.refund(ip);
-    let token = auth.create(&user)?;
+    let token = auth.create(&user);
     tracing::info!("{user} logged in from {ip}");
     Ok(([(header::SET_COOKIE, cookie(&headers, &token, SESSION_SECS))], Json(json!({ "user": user }))).into_response())
 }
@@ -557,7 +557,7 @@ mod tests {
         let mut users = Users::default();
         users.hashes.insert("admin".into(), hash_password("x").unwrap());
         let auth = Auth::new(users, &store, writer, Default::default()).unwrap();
-        let token = auth.create("admin").unwrap();
+        let token = auth.create("admin");
         assert_eq!(token.len(), 64);
         assert_eq!(auth.check(&token), Some(("admin".into(), false)), "new: not extended yet");
         assert!(!auth.sessions.lock().unwrap().contains_key(&token), "only the hash is stored");
@@ -571,9 +571,9 @@ mod tests {
         assert_eq!(auth.check(&token), None);
         assert!(!auth.revoke(&token), "already gone");
         // An expired session nobody presents again is dropped at the next login.
-        let old = auth.create("admin").unwrap();
+        let old = auth.create("admin");
         auth.sessions.lock().unwrap().get_mut(&token_hash(&old)).unwrap().expires = 0;
-        auth.create("admin").unwrap();
+        auth.create("admin");
         assert!(!auth.sessions.lock().unwrap().contains_key(&token_hash(&old)));
         assert_eq!(auth.sessions.lock().unwrap().len(), 1);
     }

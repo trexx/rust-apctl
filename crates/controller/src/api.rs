@@ -1424,7 +1424,7 @@ mod tests {
         let file = state.backups.data_dir.join("users");
         std::fs::write(&file, format!("admin:{}\n", crate::auth::hash_password("x").unwrap())).unwrap();
         state.get_mut().auth = Arc::new(crate::auth::Auth::new(crate::auth::Users::load(&file).unwrap(), &state.store, state.writer.clone(), Default::default()).unwrap());
-        let cookie = format!("{}={}", crate::auth::COOKIE, state.auth.create("admin").unwrap());
+        let cookie = format!("{}={}", crate::auth::COOKIE, state.auth.create("admin"));
         (state, engine, cookie, dir)
     }
 
