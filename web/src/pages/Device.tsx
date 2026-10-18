@@ -119,25 +119,25 @@ function DevicePage({ mac }: { mac: string }) {
         />
         <Stat label="Uptime" value={duration(ap.uptime)} />
         <Stat
-          label="CPU / memory"
-          value={`${pct(ap.cpu)} / ${pct(ap.mem)}`}
+          label="CPU"
+          value={pct(ap.cpu)}
           sub={`load ${ap.load1 ?? "—"} · ${ap.load5 ?? "—"} · ${ap.load15 ?? "—"}`}
+        />
+        <Stat
+          label="Memory"
+          value={pct(ap.mem)}
+          sub={`${bytes(ap.mem_used)} of ${bytes(ap.mem_total)}`}
         />
         <Stat
           label="Clients"
           value={clients.length}
           sub={`satisfaction ${ap.satisfaction ?? "—"}`}
         />
-        <Stat
-          label="Memory"
-          value={ap.mem_used !== null ? bytes(ap.mem_used) : "—"}
-          sub={`of ${bytes(ap.mem_total)}${up ? ` · uplink ${up.ifname} ${uplinkText(up)}` : ""}`}
-        />
         {up && (
           <Stat
-            label="Uplink received"
-            value={bytes(up.rx_bytes)}
-            sub={`sent ${bytes(up.tx_bytes)} · packets ${compact(up.rx_packets)} in, ${compact(up.tx_packets)} out · since start`}
+            label={`Uplink ${up.ifname}`}
+            value={uplinkText(up)}
+            sub={`${bytes(up.rx_bytes)} received, ${bytes(up.tx_bytes)} sent · packets ${compact(up.rx_packets)} in, ${compact(up.tx_packets)} out · since start`}
           />
         )}
       </div>
