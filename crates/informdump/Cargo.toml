@@ -12,7 +12,6 @@ publish.workspace = true
 mongo = ["dep:mongodb", "dep:tokio", "dep:futures-util", "dep:apcfg"]
 
 [dependencies]
-aes-gcm.workspace = true
 aho-corasick.workspace = true
 anyhow.workspace = true
 apcfg = { workspace = true, optional = true }

@@ -217,17 +217,10 @@ impl ApIds {
     }
 }
 
-/// A syslog datagram as an AP with a `syslog_key` sends it: magic, 0x01, 1 (u32),
-/// the AP's hash_id, a nonce, then the text sealed with AES-256-GCM over that header.
+/// A syslog datagram as the AP sends it, under a random nonce.
 fn seal_syslog(ids: &ApIds, text: &str) -> Vec<u8> {
-    use aes_gcm::aead::{Aead, KeyInit, Payload};
-    let mut out = vec![0xab, 0xcd, 0xdc, 0xba, 0x01, 0, 0, 0, 1];
-    out.extend_from_slice(&ids.hash_id);
-    out.extend_from_slice(&crate::random_iv()[..12]);
-    let nonce = aes_gcm::Nonce::try_from(&out[17..29]).expect("12 bytes");
-    let sealed = aes_gcm::Aes256Gcm::new(&ids.syslog_key.into()).encrypt(&nonce, Payload { msg: text.as_bytes(), aad: &out }).expect("AES-GCM sealing");
-    out.extend(sealed);
-    out
+    let nonce: [u8; 12] = crate::random_iv()[..12].try_into().expect("12 bytes");
+    wire::synth::seal_syslog(ids.hash_id, &ids.syslog_key, nonce, text)
 }
 
 fn ip(v: [u8; 4]) -> String {

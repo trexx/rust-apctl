@@ -29,7 +29,7 @@ use wire::keys::KeyStore;
 use crate::engine::LogLine;
 use crate::model::Ts;
 
-pub const MAGIC: [u8; 4] = [0xab, 0xcd, 0xdc, 0xba];
+pub const MAGIC: [u8; 4] = wire::synth::SYSLOG_MAGIC;
 
 /// A key name and its separator: `key=`, `key: `, and JSON's `"key": `. An
 /// ASCII word boundary: a Unicode one would keep the regex off its fast path
@@ -112,7 +112,7 @@ fn value(s: &str) -> (usize, Option<char>) {
     (s.find(|c: char| c.is_whitespace() || matches!(c, ',' | ';' | '}')).unwrap_or(s.len()), None)
 }
 
-const HEADER: usize = 29;
+const HEADER: usize = wire::synth::SYSLOG_HEADER;
 
 /// The sender's `hash_id` of an encrypted datagram, as a number (shown as 16
 /// hex characters, as the AP's informs carry it: see [`parse_hash_id`]).
@@ -227,16 +227,7 @@ pub(crate) mod tests {
     use super::*;
 
     pub(crate) fn seal(hash_id: [u8; 8], key: [u8; 32], text: &str) -> Vec<u8> {
-        let mut header = Vec::new();
-        header.extend_from_slice(&MAGIC);
-        header.push(1);
-        header.extend_from_slice(&1u32.to_be_bytes());
-        header.extend_from_slice(&hash_id);
-        let nonce = Nonce::try_from(&[9u8; 12][..]).unwrap();
-        header.extend_from_slice(&nonce);
-        let ct = Aes256Gcm::new(&key.into()).encrypt(&nonce, Payload { msg: text.as_bytes(), aad: &header }).unwrap();
-        header.extend_from_slice(&ct);
-        header
+        wire::synth::seal_syslog(hash_id, &key, [9; 12], text)
     }
 
     #[test]

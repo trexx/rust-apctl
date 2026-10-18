@@ -11,6 +11,7 @@ publish.workspace = true
 test-util = []
 
 [dependencies]
+aes-gcm.workspace = true
 anyhow.workspace = true
 etherparse.workspace = true
 httparse.workspace = true
