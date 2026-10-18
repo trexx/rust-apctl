@@ -244,9 +244,9 @@ fn has_blocker(radio: &Value) -> bool {
     radio["radio_caps"].as_i64().is_some_and(|c| c & INTERFERENCE_BLOCKER != 0)
 }
 
-/// The APs an SSID is broadcast from: `None` for all of them (its groups hold
-/// the site's default one). One with no groups is broadcast from none, as the
-/// AP config has it.
+/// The APs an SSID is broadcast from, sorted: `None` for all of them (its
+/// groups hold the site's default one). One with no groups is broadcast from
+/// none, as the AP config has it.
 fn wlan_aps(state: &Value, w: &Value) -> Option<Vec<inform::Mac>> {
     let groups: Vec<&str> = w["ap_group_ids"].as_array().into_iter().flatten().filter_map(Value::as_str).collect();
     let mut macs = Vec::new();
@@ -799,9 +799,9 @@ fn wlan_limits(state: &Value) -> Vec<Over> {
     let mut out = Vec::new();
     let setting_on = |key: &str, default: bool| setting(state, key)["enabled"].as_bool().unwrap_or(default);
     let (meshing, element_adopt) = (setting_on("connectivity", true), setting_on("element_adopt", false));
-    // Each SSID's bands and the APs it goes to, worked out once.
-    let wlans: Vec<(Vec<&str>, Vec<inform::Mac>)> =
-        docs(state, "wlanconf").map(|w| (w["wlan_bands"].as_array().into_iter().flatten().filter_map(Value::as_str).collect(), deployed_to(state, w))).collect();
+    // Each SSID's bands and the APs it goes to (`None`: all, sorted otherwise), worked out once.
+    let wlans: Vec<(Vec<&str>, Option<Vec<inform::Mac>>)> =
+        docs(state, "wlanconf").map(|w| (w["wlan_bands"].as_array().into_iter().flatten().filter_map(Value::as_str).collect(), wlan_aps(state, w))).collect();
     for d in docs(state, "devices") {
         let Some(mac) = doc_mac(&d["mac"]) else { continue };
         let name = device_label(d, mac);
@@ -817,7 +817,7 @@ fn wlan_limits(state: &Value) -> Vec<Over> {
             } else {
                 8
             };
-            let count = wlans.iter().filter(|(bands, aps)| bands.contains(&wb) && aps.contains(&mac)).count();
+            let count = wlans.iter().filter(|(bands, aps)| bands.contains(&wb) && aps.as_ref().is_none_or(|a| a.binary_search(&mac).is_ok())).count();
             if count > limit {
                 out.push(Over { what: format!("{mac} {band}"), count, err: format!("{name} would have {count} SSIDs on its {} radio; it supports {limit}", band_name(band)) });
             }
