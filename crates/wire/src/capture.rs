@@ -161,6 +161,8 @@ struct Tracker {
     ports: Vec<u16>,
     udp_ports: Vec<u16>,
     conns: HashMap<ConnId, Conn>,
+    /// The bytes all connections' buffers hold (the sum of their `held`).
+    held: usize,
     /// When idle connections were last swept.
     sweeper: Sweeper,
 }
@@ -172,12 +174,18 @@ struct Conn {
     last_seen: Micros,
     /// Some segment in either direction carried data.
     carried: bool,
+    /// The bytes its buffers held after its last segment.
+    held: usize,
 }
 
 impl Conn {
     /// Both sides closed and nothing is missing.
     fn closed(&self) -> bool {
         self.to_server.closed() && self.to_client.closed()
+    }
+
+    fn held(&self) -> usize {
+        self.to_server.held() + self.to_client.held()
     }
 
     /// How long the connection may go unseen before it is forgotten.
@@ -216,7 +224,11 @@ impl Sweeper {
 }
 /// Most connections tracked at once. An AP keeps one open, so this is far more than
 /// any site has; it bounds what packets with made-up addresses can make us hold.
-const MAX_CONNS: usize = 16_384;
+pub(crate) const MAX_CONNS: usize = 16_384;
+/// Most bytes all connections' buffers may hold between them. Each may hold up to
+/// `MAX_BUFFER` and `MAX_PENDING_BYTES` per direction, which would be far too much
+/// for `MAX_CONNS` of them; real informs and replies hold a few hundred KB at most.
+const MAX_HELD: usize = 64 << 20;
 /// How long an open connection may idle before it is forgotten (long live captures).
 const MAX_IDLE: Micros = 300_000_000;
 /// The same for one that never carried data (a handshake, a stray ACK): an AP sends
@@ -228,7 +240,7 @@ const CLOSED_LINGER: Micros = 2_000_000;
 
 impl Tracker {
     fn new(ports: Vec<u16>, udp_ports: Vec<u16>) -> Self {
-        Tracker { ports, udp_ports, conns: HashMap::new(), sweeper: Sweeper::default() }
+        Tracker { ports, udp_ports, conns: HashMap::new(), held: 0, sweeper: Sweeper::default() }
     }
 
     fn packet(&mut self, linktype: Linktype, ts: Micros, data: &[u8], on_event: &mut impl FnMut(HttpEvent)) {
@@ -264,7 +276,9 @@ impl Tracker {
         };
 
         if tcp.rst() {
-            self.conns.remove(&conn_id);
+            if let Some(c) = self.conns.remove(&conn_id) {
+                self.held -= c.held;
+            }
             return;
         }
         if self.conns.len() >= MAX_CONNS && !self.conns.contains_key(&conn_id) {
@@ -290,6 +304,12 @@ impl Tracker {
             conn.to_server.release();
             conn.to_client.release();
         }
+        let held = conn.held();
+        self.held = self.held - conn.held + held;
+        conn.held = held;
+        if self.held > MAX_HELD {
+            self.shed();
+        }
 
         self.sweep(ts);
     }
@@ -297,8 +317,32 @@ impl Tracker {
     /// Forgets idle connections, when a sweep is due.
     fn sweep(&mut self, ts: Micros) {
         if self.sweeper.due(self.conns.len(), ts) {
-            self.conns.retain(|_, c| ts - c.last_seen < c.max_idle());
+            self.retain(|c| ts - c.last_seen < c.max_idle());
         }
+    }
+
+    /// Keeps the connections `keep` says to, and counts what they hold.
+    fn retain(&mut self, mut keep: impl FnMut(&Conn) -> bool) {
+        self.conns.retain(|_, c| keep(c));
+        self.held = self.conns.values().map(|c| c.held).sum();
+    }
+
+    /// Called when the buffers hold more than `MAX_HELD`: forgets the connections that
+    /// hold the most until three quarters of it is left, so that the next shed is
+    /// some way off. Those are the ones made-up traffic fills; an AP's connection holds
+    /// a message or two, and one that is forgotten picks up again at its next message.
+    fn shed(&mut self) {
+        let mut sizes: Vec<usize> = self.conns.values().map(|c| c.held).filter(|&h| h > 0).collect();
+        sizes.sort_unstable_by(|a, b| b.cmp(a));
+        let (mut held, mut cutoff) = (self.held, usize::MAX);
+        for size in sizes {
+            if held <= MAX_HELD / 4 * 3 {
+                break;
+            }
+            held -= size;
+            cutoff = size;
+        }
+        self.retain(|c| c.held < cutoff);
     }
 
     /// Called when the map is full and a new connection shows up: sweeps, and if
@@ -308,11 +352,11 @@ impl Tracker {
     /// at its next message.
     fn make_room(&mut self, ts: Micros) {
         self.sweeper.last = ts;
-        self.conns.retain(|_, c| ts - c.last_seen < c.max_idle());
+        self.retain(|c| ts - c.last_seen < c.max_idle());
         if self.conns.len() > MAX_CONNS - MAX_CONNS / 8 {
             let mut order: Vec<(bool, Micros)> = self.conns.values().map(|c| (c.carried, c.last_seen)).collect();
             let (_, &mut cutoff, _) = order.select_nth_unstable(MAX_CONNS / 8);
-            self.conns.retain(|_, c| (c.carried, c.last_seen) > cutoff);
+            self.retain(|c| (c.carried, c.last_seen) > cutoff);
         }
     }
 }
@@ -349,6 +393,9 @@ const MAX_GAP_AGE: Micros = 10_000_000;
 /// Largest unparsed message kept. Inform bodies are a few KB (the largest
 /// decoded ones a few hundred KB), and anything bigger on the port is not an inform.
 const MAX_BUFFER: usize = 8 << 20;
+/// A buffer that grew beyond this is freed when it empties, rather than kept for the
+/// next message: most messages are a few KB.
+const KEEP_CAPACITY: usize = 256 << 10;
 /// Largest message head (start line and headers). Until a head is complete it is
 /// parsed again with every segment, so one that never ends is given up on early.
 const MAX_HEAD: usize = 64 << 10;
@@ -437,6 +484,11 @@ impl HalfStream {
         self.apply_pending(ts);
     }
 
+    /// The bytes its buffers hold.
+    fn held(&self) -> usize {
+        self.buf.capacity() + self.pending_bytes
+    }
+
     /// Closed by its sender with every byte received.
     fn closed(&self) -> bool {
         self.fin_at.is_some_and(|fin_at| self.pos >= fin_at) && self.pending.is_empty()
@@ -468,7 +520,11 @@ impl HalfStream {
     }
 
     fn clear_buf(&mut self) {
-        self.buf.clear();
+        if self.buf.capacity() > KEEP_CAPACITY {
+            self.buf = Vec::new();
+        } else {
+            self.buf.clear();
+        }
         self.consumed = 0;
     }
 
@@ -941,6 +997,39 @@ mod tests {
         buf.extend_from_slice(&b"1\r\nx\r\n".repeat(MAX_CHUNKS + 1));
         assert!(matches!(chunked_len(&buf[45..], |_| {}), Chunked::Garbage));
         assert!(matches!(chunked_len(&b"1\r\nx\r\n".repeat(MAX_CHUNKS), |_| {}), Chunked::Partial));
+    }
+
+    #[test]
+    fn the_buffers_of_all_connections_share_a_budget() {
+        let mut t = Tracker::new(vec![8080], Vec::new());
+        let (_, ctrl) = sample::endpoints();
+        let client = |n: u16| crate::synth::Endpoint { mac: [2; 6], ip: [10, 1, (n >> 8) as u8, n as u8], port: 40000 };
+        let send = |t: &mut Tracker, n: u16, seq: u32, payload: &[u8]| {
+            let frame = crate::synth::tcp_frame(client(n), ctrl, seq, payload).unwrap();
+            t.packet(Linktype::ETHERNET, 0, &frame, &mut |_| {});
+            assert!(t.held <= MAX_HELD, "{}", t.held);
+            assert_eq!(t.held, t.conns.values().map(Conn::held).sum::<usize>());
+        };
+        // An AP partway through its inform, then made-up connections that each send a
+        // few MB of a message far too long to finish.
+        send(&mut t, 0, 1, b"POST /inform HTTP/1.1\r\nContent-Length: 100\r\n\r\nabc");
+        let head = b"POST /inform HTTP/1.1\r\nContent-Length: 7000000\r\n\r\n";
+        let chunk = vec![b'x'; 60_000];
+        for n in 1..=30 {
+            send(&mut t, n, 1, head);
+            for i in 0..50 {
+                send(&mut t, n, 1 + head.len() as u32 + i * chunk.len() as u32, &chunk);
+            }
+        }
+        assert!(t.conns.len() < 31, "some were forgotten: {}", t.conns.len());
+        assert!(t.conns.contains_key(&ConnId { client: SocketAddr::from(([10, 1, 0, 0], 40000)), server: SocketAddr::from(([10, 0, 0, 1], 8080)) }), "not the one holding little");
+        // A buffer that grew for a large message is freed once that is taken.
+        let big = sample::http_request(&vec![b'y'; 1 << 20]);
+        let mut h = HalfStream::default();
+        h.segment(0, 0, true, false, b"");
+        h.segment(0, 1, false, false, &big);
+        assert!(matches!(h.take_http(true), Some(Parsed::Request { body, .. }) if body.len() == 1 << 20));
+        assert_eq!((h.buf.capacity(), h.held()), (0, 0));
     }
 
     #[test]
