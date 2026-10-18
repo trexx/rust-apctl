@@ -97,6 +97,9 @@ export function DeviceEditor({
       const before = radios0[i];
       const after = radios[i];
       const c = before && after ? changed(before, after) : {};
+      // As in the official UI, the power goes only with custom power: the AP
+      // reads it in any mode.
+      if (after?.tx_power_mode !== "custom") delete c.tx_power;
       return Object.keys(c).length ? { radio: x.radio, ...c } : null;
     })
     .filter(Boolean);

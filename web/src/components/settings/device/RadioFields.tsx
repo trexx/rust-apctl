@@ -86,6 +86,14 @@ export function RadioFields({
   // A setting the lists don't offer is still shown as it is, not as the first choice.
   const strayWidth = !widths.includes(form.ht);
   const strayChannel = form.channel !== "auto" && !legal.includes(form.channel);
+  // Custom power starts at the most the radio can do (what High gives), so
+  // the power shown is the one sent; with none, the AP would stay on auto.
+  const setPowerMode = (m: string) =>
+    onChange({
+      ...form,
+      tx_power_mode: m,
+      tx_power: m === "custom" ? (form.tx_power ?? hi) : form.tx_power,
+    });
   return (
     <>
       <Row label="Channel">
@@ -116,13 +124,17 @@ export function RadioFields({
         />
       </Row>
       <Row label="Transmit power">
-        <Select {...bind("tx_power_mode")} options={POWER} />
+        <Select
+          value={form.tx_power_mode}
+          onChange={setPowerMode}
+          options={POWER}
+        />
         {form.tx_power_mode === "custom" && (
           <label className="small">
             <NumberInput
               {...bind("tx_power")}
               aria-label="Custom transmit power"
-              fallback={lo}
+              fallback={hi}
               min={lo}
               max={hi}
             />{" "}
