@@ -1551,6 +1551,10 @@ fn radio_edit(state: &Value, e: &DeviceEdit, rp: &Value, before: &Value, d: &mut
         Value::String(a) if a == "auto" => r["channel"] = json!("auto"),
         v => {
             let ch = num(v).ok_or_else(|| format!("{label}: channel must be auto or a number"))?;
+            // Whatever the country, it must be one of the band's channels (those the editor offers).
+            if !band_channels(band, 20).contains(&ch) {
+                return Err(format!("{label}: {ch} is not a channel of this band"));
+            }
             r["channel"] = json!(ch);
         }
     }
@@ -2102,6 +2106,12 @@ mod tests {
         // Nor for a country outside its tables.
         s["setting"][0]["code"] = json!("392");
         dev(&mut s, json!({ "radios": [{ "radio": "na", "channel": 149, "ht": 80 }] })).unwrap();
+        // Without rules a channel must still be one of the band's.
+        for ch in [999, 0, -4, 38] {
+            assert!(dev(&mut s, json!({ "radios": [{ "radio": "6e", "channel": ch }] })).unwrap_err().contains("not a channel"), "6 GHz {ch}");
+        }
+        assert!(dev(&mut s, json!({ "radios": [{ "radio": "na", "channel": 999 }] })).unwrap_err().contains("not a channel"));
+        assert_eq!(s["devices"][0]["radio_table"][2]["channel"], 37);
     }
 
     #[test]
