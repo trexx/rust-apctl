@@ -3,7 +3,16 @@ import { useSeries, useSiteActivity } from "../api";
 import type { ClientView, RadioSample, TimeSpan, VapSample } from "../api";
 import { COLORS, Chart } from "./Chart";
 import { QueryState, Signal } from "./common";
-import { SIGNAL, band, bytes, compact, pct, pct1, rate } from "../format";
+import {
+  SIGNAL,
+  band,
+  bytes,
+  compact,
+  multicastTone,
+  pct,
+  pct1,
+  rate,
+} from "../format";
 import type { Tone } from "../format";
 
 const share = (part: number, whole: number) =>
@@ -134,7 +143,7 @@ export function RadioPanel({
         <dt>Multicast / broadcast</dt>
         <dd>
           <span
-            className={mcastShare >= 30 ? "tone-warn" : ""}
+            className={`tone-${multicastTone(mcastShare)}`}
             title="Share of all packets on this radio"
           >
             {pct1(mcastShare)} of packets

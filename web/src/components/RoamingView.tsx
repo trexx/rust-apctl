@@ -1,15 +1,11 @@
 import { Link } from "react-router";
 import { useRoaming } from "../api";
 import type { Roaming } from "../api";
-import { pct, spanText, useNow } from "../format";
+import { pct, roamTone, spanText, useNow } from "../format";
 import { RangePicker, useTimeSpan } from "./Chart";
 import { ConnHead, RoamRow, roamId } from "./Connections";
 import { QueryState, Signal, Stat } from "./common";
 import { stableKeys } from "./keys";
-
-/** Same colours as the official roaming map: green above 67 %, orange above 33 %. */
-const healthTone = (pct: number) =>
-  pct > 67 ? "tone-good" : pct > 33 ? "tone-warn" : "tone-bad";
 
 export function RoamingView() {
   const [span, setSpan] = useTimeSpan(2 * 86400);
@@ -53,7 +49,7 @@ function Summary({ data }: { data: Roaming }) {
       <Stat
         label="Successful"
         value={
-          <span className={healthTone((100 * ok) / n)}>
+          <span className={`tone-${roamTone((100 * ok) / n)}`}>
             {pct((100 * ok) / n)}
           </span>
         }
@@ -110,7 +106,7 @@ function Details({ data }: { data: Roaming }) {
                     </div>
                   </td>
                   <td>{p.attempts}</td>
-                  <td className={healthTone(p.success_pct)}>
+                  <td className={`tone-${roamTone(p.success_pct)}`}>
                     {p.success_pct}%
                   </td>
                   <td>{p.forward.fast + p.backward.fast}</td>

@@ -11,7 +11,15 @@ import type {
   LogLine,
   Names,
 } from "../api";
-import { band, clock, duration, sameDay, signalClass, useNow } from "../format";
+import {
+  band,
+  clock,
+  duration,
+  loadTone,
+  sameDay,
+  signalClass,
+  useNow,
+} from "../format";
 import type { Tone } from "../format";
 
 export function Stat({
@@ -59,7 +67,6 @@ export function Meter({
   const known = value !== null && value !== undefined;
   const max = limit ?? 100;
   const v = known ? Math.min(100, (value / max) * 100) : 0;
-  const tone: Tone = v >= 80 ? "bad" : v >= 50 ? "warn" : "good";
   const text = known ? `${Math.round(value)}` : "unknown";
   return (
     <span
@@ -73,7 +80,7 @@ export function Meter({
       aria-valuetext={known ? undefined : text}
     >
       <span
-        className={`meter-fill fill-${tone}`}
+        className={`meter-fill fill-${loadTone(v)}`}
         style={{ width: `${v}%` }}
       />
     </span>

@@ -2,7 +2,16 @@ import { Suspense } from "react";
 import { Link } from "react-router";
 import { useWlans } from "../api";
 import type { Wlan } from "../api";
-import { band, bytes, pct1, rate, retryTone, spanText } from "../format";
+import {
+  band,
+  bytes,
+  experienceTone,
+  multicastTone,
+  pct1,
+  rate,
+  retryTone,
+  spanText,
+} from "../format";
 import {
   COLORS,
   Chart,
@@ -23,10 +32,6 @@ const SpeedLimitsPanel = lazyNamed(
   () => import("../components/SettingsEditor"),
   "SpeedLimitsPanel",
 );
-
-/** Experience bands as the official controller colours them: 90+ excellent, 70+ good. */
-const uxTone = (v: number | null) =>
-  v === null ? "" : v >= 90 ? "tone-good" : v >= 70 ? "tone-warn" : "tone-bad";
 
 /** The SSID's security and other settings, as chips. */
 function SecurityChips({ w }: { w: Wlan }) {
@@ -108,7 +113,9 @@ function WlanPanel({ w }: { w: Wlan }) {
           >
             Experience
           </div>
-          <b className={uxTone(w.satisfaction)}>{w.satisfaction ?? "—"}</b>{" "}
+          <b className={`tone-${experienceTone(w.satisfaction)}`}>
+            {w.satisfaction ?? "—"}
+          </b>{" "}
           <span className="muted small">
             now · {w.satisfaction_avg ?? "—"} avg
           </span>
@@ -124,23 +131,13 @@ function WlanPanel({ w }: { w: Wlan }) {
         </div>
         <div>
           <div className="muted small">TX retries</div>
-          <b
-            className={
-              retryTone(w.tx_retry_pct) && `tone-${retryTone(w.tx_retry_pct)}`
-            }
-          >
+          <b className={`tone-${retryTone(w.tx_retry_pct)}`}>
             {pct1(w.tx_retry_pct)}
           </b>
         </div>
         <div>
           <div className="muted small">Multicast + broadcast</div>
-          <b
-            className={
-              w.multicast_pct !== null && w.multicast_pct >= 30
-                ? "tone-warn"
-                : ""
-            }
-          >
+          <b className={`tone-${multicastTone(w.multicast_pct)}`}>
             {pct1(w.multicast_pct)}
           </b>
           <span className="muted small"> of packets</span>

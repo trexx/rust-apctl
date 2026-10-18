@@ -1,4 +1,5 @@
 import { useConnectivity } from "../../api";
+import { stageTone } from "../../format";
 import { useTimeSpan } from "../Chart";
 import { BandInsight } from "./shared";
 
@@ -8,9 +9,6 @@ const STAGES = [
   ["dhcp_pct", "DHCP"],
   ["dns_pct", "DNS"],
 ] as const;
-
-const pctTone = (p: number | null) =>
-  p === null || p === 0 ? "" : p >= 80 ? "good" : p >= 60 ? "warn" : "bad";
 
 export function Connectivity() {
   const [span] = useTimeSpan(86400);
@@ -30,7 +28,7 @@ export function Connectivity() {
               {STAGES.map(([k, label]) => (
                 <div
                   key={k}
-                  className={`stage-bar fill-${pctTone(d[k])}`}
+                  className={`stage-bar fill-${stageTone(d[k])}`}
                   title={`${d[k] ?? 0}% of clients got past ${label}`}
                 >
                   {label}
@@ -38,7 +36,7 @@ export function Connectivity() {
               ))}
               <div className="stage-success">
                 Success{" "}
-                <b className={`tone-${pctTone(d.success_pct)}`}>
+                <b className={`tone-${stageTone(d.success_pct)}`}>
                   {d.success_pct ?? 0}%
                 </b>
               </div>
