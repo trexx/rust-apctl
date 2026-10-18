@@ -6,7 +6,7 @@ import type {
   ReactNode,
   SetStateAction,
 } from "react";
-import { Toggle } from "../common";
+import { TextField, Toggle } from "../common";
 
 /** A settings patch, as sent to the server. */
 export type Fields = Record<string, unknown>;
@@ -226,25 +226,14 @@ export function NumberInput({
  * A text field (class "search" unless given), named by its `Row`'s label, or
  * by its own `aria-label` where a row holds several; `onChange` gets the text.
  */
-export function TextInput({
-  value,
-  onChange,
-  className,
-  ...props
-}: Omit<InputHTMLAttributes<HTMLInputElement>, "value" | "onChange"> & {
-  value: string | null | undefined;
-  onChange: (v: string) => void;
-}) {
+export function TextInput(
+  props: Omit<InputHTMLAttributes<HTMLInputElement>, "value" | "onChange"> & {
+    value: string | null | undefined;
+    onChange: (v: string) => void;
+  },
+) {
   const named = useRowLabel(props["aria-label"]);
-  return (
-    <input
-      {...named}
-      className={className ?? "search"}
-      {...props}
-      value={value ?? ""}
-      onChange={(e) => onChange(e.target.value)}
-    />
-  );
+  return <TextField {...named} {...props} />;
 }
 
 /**

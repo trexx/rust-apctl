@@ -1,5 +1,5 @@
 import { memo, useEffect, useEffectEvent, useState } from "react";
-import type { ReactNode, RefObject } from "react";
+import type { InputHTMLAttributes, ReactNode, RefObject } from "react";
 import { Link, useSearchParams } from "react-router";
 import { useQueryClient } from "@tanstack/react-query";
 import type { QueryKey } from "@tanstack/react-query";
@@ -135,6 +135,29 @@ export function Toggle({
       />
       {label}
     </label>
+  );
+}
+
+/**
+ * A text field (class "search" unless given) that names itself by its
+ * `aria-label`; `onChange` gets the text. Settings rows use `TextInput`.
+ */
+export function TextField({
+  value,
+  onChange,
+  className,
+  ...props
+}: Omit<InputHTMLAttributes<HTMLInputElement>, "value" | "onChange"> & {
+  value: string | null | undefined;
+  onChange: (v: string) => void;
+}) {
+  return (
+    <input
+      className={className ?? "search"}
+      {...props}
+      value={value ?? ""}
+      onChange={(e) => onChange(e.target.value)}
+    />
   );
 }
 
