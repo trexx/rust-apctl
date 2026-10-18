@@ -561,10 +561,15 @@ struct Watcher {
 }
 
 impl Watcher {
+    /// A watcher with no alert open yet.
+    fn new(store: Arc<Store>, writer: Writer, live: SharedLive, tx: broadcast::Sender<LiveMsg>) -> Watcher {
+        Watcher { book: Alerts { writer, tx, seq: 0, open: HashMap::new() }, store, live, aps: ApWatch::default(), cleared: HashMap::new(), unjudged: HashMap::new() }
+    }
+
     /// Starts with the alerts a previous run left open, and the offline
     /// alerts it sent in the last day, which count towards today's limit.
     async fn start(store: Arc<Store>, writer: Writer, live: SharedLive, tx: broadcast::Sender<LiveMsg>, now: Ts) -> Watcher {
-        let mut w = Watcher { book: Alerts { writer, tx, seq: 0, open: HashMap::new() }, store, live, aps: ApWatch::default(), cleared: HashMap::new(), unjudged: HashMap::new() };
+        let mut w = Watcher::new(store, writer, live, tx);
         match load_open(&w.store, now).await {
             Ok((open, seq, offline)) => {
                 w.book.seq = seq;
@@ -783,7 +788,7 @@ pub async fn mark_read(State(s): State<AppState>) -> Result<Json<Value>, ApiErro
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::tests::TestDir;
+    use crate::model::tests::{TestDir, TestStore, flushed};
 
     #[test]
     fn offline_after_four_minutes_and_at_most_twice_a_day() {
@@ -865,11 +870,9 @@ mod tests {
 
     /// A watcher on a store of its own, its live messages, and the store's directory.
     fn watcher() -> (Watcher, broadcast::Receiver<LiveMsg>, TestDir) {
-        let dir = TestDir::new("alerts");
-        let (store, writer) = Store::open(&dir).unwrap();
+        let t = TestStore::new("alerts");
         let (tx, rx) = broadcast::channel(64);
-        let book = Alerts { writer, tx, seq: 0, open: HashMap::new() };
-        (Watcher { book, store, live: Default::default(), aps: ApWatch::default(), cleared: HashMap::new(), unjudged: HashMap::new() }, rx, dir)
+        (Watcher::new(t.store, t.writer, Default::default(), tx), rx, t.dir)
     }
 
     /// What live subscribers were told: (action, alert key).
@@ -909,19 +912,19 @@ mod tests {
         for _ in 0..11 {
             w.book.raise(1000, notice());
         }
-        assert!(w.book.writer.flush(Duration::from_secs(5)));
+        flushed(&w.book.writer);
         // A restart within the same second carries on from the stored ids.
         let mut again = Watcher::start(w.store.clone(), w.book.writer.clone(), Default::default(), broadcast::channel(4).0, 2000).await;
         let last = again.book.raise(1000, notice());
         assert_eq!(last.id, "1000-12");
-        assert!(w.book.writer.flush(Duration::from_secs(5)));
+        flushed(&w.book.writer);
         let ids: Vec<String> = w.store.read(Db::Config, |c| Ok(c.prepare(LIST)?.query_map([100], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?)).unwrap();
         assert_eq!(ids.len(), 12, "none overwritten");
         assert_eq!((ids[0].as_str(), ids[1].as_str(), ids[2].as_str()), ("1000-12", "1000-11", "1000-10"));
         // Were an id used again, the alert stored under it would stay.
         again.book.seq = 0;
         again.book.raise(1000, Alert { title: "other".into(), ..notice() });
-        assert!(w.book.writer.flush(Duration::from_secs(5)));
+        flushed(&w.book.writer);
         let titles: Vec<String> = w.store.read(Db::Config, |c| Ok(c.prepare("SELECT title FROM alerts")?.query_map([], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?)).unwrap();
         assert!(titles.len() == 12 && titles.iter().all(|t| t == "t"), "{titles:?}");
     }
@@ -934,13 +937,13 @@ mod tests {
         // Two drops reported, the AP back after each.
         w.book.raise(1000, offline(Severity::High).resolved(1060));
         w.book.raise(2000, offline(Severity::High).resolved(2100));
-        assert!(w.book.writer.flush(Duration::from_secs(5)));
+        flushed(&w.book.writer);
         let restart = |now| Watcher::start(w.store.clone(), w.book.writer.clone(), Default::default(), broadcast::channel(4).0, now);
         // The third drop is summarised, as without the restart.
         let mut again = restart(3000).await;
         assert_eq!(again.aps.check(3000, ap, 2700), Some(ApChange::Flapping { times: 3 }));
         again.book.raise(3000, offline(Severity::Medium).resolved(3100));
-        assert!(w.book.writer.flush(Duration::from_secs(5)));
+        flushed(&w.book.writer);
         // The fourth is not reported, even after another restart.
         assert_eq!(restart(4000).await.aps.check(4000, ap, 3700), None);
         // A day after the first two, a drop is reported again.
@@ -960,7 +963,7 @@ mod tests {
         w.judge_connections(1180, 0);
         assert_eq!(told(&mut rx), [("resolved", "connect_failures")]);
         // Stored as the live view showed it.
-        assert!(w.book.writer.flush(std::time::Duration::from_secs(5)));
+        flushed(&w.book.writer);
         let stored: String = w.store.read(Db::Config, |c| Ok(c.query_row("SELECT message FROM alerts WHERE resolved_ts = 1180", [], |r| r.get(0))?)).unwrap();
         assert_eq!(stored, "Clients are connecting again.");
         // Not again within the cooldown.
@@ -1049,7 +1052,7 @@ mod tests {
         w.judge_radios(1000, HashMap::from([((ap, "na".to_string()), RadioHealth { utilisation: Some(90.0), ..Default::default() })]), &set, &set);
         w.judge_connections(1000, 5);
         w.book.writer.exec(Db::Config, "INSERT INTO alerts (id, ts, key, category, severity, entity, title, message, tag) VALUES ('1-99', 1, 'gone', 'health', 'low', 'x', 't', 'm', 'g')", vec![]);
-        assert!(w.book.writer.flush(Duration::from_secs(5)));
+        flushed(&w.book.writer);
         let stored: Vec<(String, String)> = w.store.read(Db::Config, |c| Ok(c.prepare("SELECT key, entity FROM alerts WHERE key != 'gone' ORDER BY key")?.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<rusqlite::Result<_>>()?)).unwrap();
         assert_eq!(stored, [("busy_channel".to_string(), "02:00:00:00:00:01/na".to_string()), ("connect_failures".to_string(), "site".to_string())]);
         // After a restart they are open as they were; one apctl doesn't know is left alone.
@@ -1079,7 +1082,7 @@ mod tests {
         // Too few to judge.
         row("6e", now - 800);
         row("6e", now);
-        assert!(w.book.writer.flush(Duration::from_secs(5)));
+        flushed(&w.book.writer);
         let h = radio_health(&w.store, now).await.unwrap();
         let judged = |radio: &str| h.get(&("02:00:00:00:00:01".parse().unwrap(), radio.to_string())).and_then(|h| h.utilisation);
         assert_eq!((judged("na"), judged("ng"), judged("6e")), (Some(90.0), None, None));

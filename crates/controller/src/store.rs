@@ -31,7 +31,7 @@ pub enum Db {
 }
 
 impl Db {
-    fn file(self) -> &'static str {
+    pub(crate) fn file(self) -> &'static str {
         match self {
             Db::Config => "config.db",
             Db::Metrics => "metrics.db",

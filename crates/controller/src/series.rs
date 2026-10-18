@@ -301,7 +301,7 @@ pub(crate) async fn memo_read<T: Send + Sync + 'static>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::tests::TestDir;
+    use crate::model::tests::TestStore;
 
     #[test]
     fn windows_are_clamped() {
@@ -330,9 +330,8 @@ mod tests {
 
     #[test]
     fn one_aps_ssids_and_clients_are_read_through_an_index() {
-        let dir = TestDir::new("insights-plan");
-        drop(store::Store::open(&dir).unwrap());
-        let c = Connection::open(dir.join("metrics.db")).unwrap();
+        let t = TestStore::new("insights-plan");
+        let c = t.db(Db::Metrics);
         // How SQLite finds the rows: the first step of its plan.
         let plan = |spec: Spec, tier: usize| -> String {
             let (sql, params) = load_query(&spec, tier, 1000, 90_000).unwrap();

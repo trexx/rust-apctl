@@ -640,6 +640,35 @@ pub(crate) mod tests {
         }
     }
 
+    /// A test's own store, in a [`TestDir`] removed when it is dropped.
+    pub struct TestStore {
+        pub store: std::sync::Arc<crate::store::Store>,
+        pub writer: crate::store::Writer,
+        /// Last, so that the directory goes after the store has closed.
+        pub dir: TestDir,
+    }
+
+    impl TestStore {
+        pub fn new(name: &str) -> TestStore {
+            let dir = TestDir::new(name);
+            let (store, writer) = crate::store::Store::open(&dir).unwrap();
+            TestStore { store, writer, dir }
+        }
+
+        /// A connection of the test's own to one of the databases, to put rows in
+        /// or read them back without the writer.
+        pub fn db(&self, db: crate::store::Db) -> rusqlite::Connection {
+            rusqlite::Connection::open(self.dir.join(db.file())).unwrap()
+        }
+    }
+
+    /// Waits until the writes queued so far are committed, failing the test if
+    /// that takes over five seconds.
+    #[track_caller]
+    pub fn flushed(writer: &crate::store::Writer) {
+        assert!(writer.flush(std::time::Duration::from_secs(5)), "the writes were not committed within 5 s");
+    }
+
     #[test]
     fn a_test_dir_goes_when_dropped() {
         let dir = TestDir::new("testdir");

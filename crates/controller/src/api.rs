@@ -1247,7 +1247,7 @@ async fn live_socket(mut socket: WebSocket, mut rx: broadcast::Receiver<Utf8Byte
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::tests::TestDir;
+    use crate::model::tests::{TestDir, flushed};
     use axum::body::Body;
     use axum::http::{Request, header};
     use tower::ServiceExt;
@@ -1296,7 +1296,7 @@ mod tests {
         ] });
         // The one in the database is restored as at start, before any inform.
         s.writer.exec(Db::Config, "INSERT INTO devices (mac, hostname, model, first_seen, last_seen) VALUES ('02:00:00:00:00:02', 'Attic', 'U6', 10, 20)", vec![]);
-        assert!(s.writer.flush(std::time::Duration::from_secs(5)));
+        flushed(&s.writer);
         engine.restore(&s.store).unwrap();
         engine.handle(report(payload));
         let app = router(s);
@@ -1426,7 +1426,7 @@ mod tests {
         engine.handle(report(json!({ "mac": "02:00:00:00:00:01", "hostname": "Hall", "uptime": 100 })));
         s.writer.exec(Db::Config, "INSERT INTO device_config (mac, ts, mgmt_cfg, system_cfg) VALUES ('02:00:00:00:00:01', 1, 'a=1', 'b=2')", vec![]);
         s.writer.exec(Db::Config, "INSERT INTO dryrun_results (ts, mac, matches, comparison) VALUES (7, '02:00:00:00:00:01', 1, '{}')", vec![]);
-        assert!(s.writer.flush(std::time::Duration::from_secs(5)));
+        flushed(&s.writer);
         let app = router(s);
         let d = get_json(&app, "/api/dryrun").await;
         assert_eq!((d["devices"][0]["status"].as_str(), d["history"][0]["ts"].as_i64(), d["history"][0]["id"].as_i64()), (Some("no_settings"), Some(7), Some(1)));
@@ -1443,7 +1443,7 @@ mod tests {
         for (ts, kind, dev) in rows {
             s.writer.exec(Db::Config, "INSERT INTO events (ts, kind, device_mac, data) VALUES (?1, ?2, ?3, '{}')", vec![Sql::Integer(ts), Sql::Text(kind.into()), dev.map_or(Sql::Null, |d| Sql::Text(d.into()))]);
         }
-        assert!(s.writer.flush(std::time::Duration::from_secs(5)));
+        flushed(&s.writer);
         let app = router(s);
         let ts = |v: Value| v.as_array().unwrap().iter().map(|e| e["ts"].as_i64().unwrap()).collect::<Vec<_>>();
         assert_eq!(ts(get_json(&app, "/api/events?kind=client").await), vec![6, 4, 3, 1]);
@@ -1468,7 +1468,7 @@ mod tests {
             let sql = "INSERT INTO logs (ts, device_mac, program, msg) VALUES (?1, ?2, ?3, ?4)";
             s.writer.exec(Db::Logs, sql, vec![Sql::Integer(ts), Sql::Text(mac.into()), Sql::Text(program.into()), Sql::Text(msg.into())]);
         }
-        assert!(s.writer.flush(std::time::Duration::from_secs(5)));
+        flushed(&s.writer);
         // A search is read from the full-text index, newest first, and stops at the limit.
         let mut w = Where::default();
         let sql = logs_sql(&mut w, None, Some("sta"), None, 10);

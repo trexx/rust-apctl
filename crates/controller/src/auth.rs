@@ -529,7 +529,7 @@ fn renewed(mut res: Response, cookie: Option<String>) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::tests::TestDir;
+    use crate::model::tests::{TestDir, TestStore};
 
     #[test]
     fn users_file_and_verification() {
@@ -561,11 +561,10 @@ mod tests {
 
     #[test]
     fn sessions_are_hashed_checked_and_revoked() {
-        let dir = TestDir::new("sessions");
-        let (store, writer) = Store::open(&dir).unwrap();
+        let t = TestStore::new("sessions");
         let mut users = Users::default();
         users.hashes.insert("admin".into(), hash_password("x").unwrap());
-        let auth = Auth::new(users, &store, writer, Default::default()).unwrap();
+        let auth = Auth::new(users, &t.store, t.writer, Default::default()).unwrap();
         let token = auth.create("admin");
         assert_eq!(token.len(), 64);
         assert_eq!(auth.check(&token), Some(("admin".into(), false)), "new: not extended yet");
@@ -589,9 +588,8 @@ mod tests {
 
     #[test]
     fn throttles_after_repeated_failures() {
-        let dir = TestDir::new("throttle");
-        let (store, writer) = Store::open(&dir).unwrap();
-        let auth = Auth::new(Users::default(), &store, writer, Default::default()).unwrap();
+        let t = TestStore::new("throttle");
+        let auth = Auth::new(Users::default(), &t.store, t.writer, Default::default()).unwrap();
         let ip: IpAddr = "10.0.0.9".parse().unwrap();
         for _ in 0..MAX_FAILURES {
             assert!(auth.attempt(ip));
@@ -643,10 +641,9 @@ mod tests {
 
     #[test]
     fn live_sockets_are_only_for_pages_of_this_server() {
-        let dir = TestDir::new("origin");
-        let (store, writer) = Store::open(&dir).unwrap();
+        let t = TestStore::new("origin");
         let proxies = Arc::new(Proxies::parse(&["10.42.0.0/16".into()]).unwrap());
-        let auth = Auth::new(Users::default(), &store, writer, proxies).unwrap();
+        let auth = Auth::new(Users::default(), &t.store, t.writer, proxies).unwrap();
         let ok = |origin: Option<&str>, host: &str, forwarded: Option<&str>, peer: &str| {
             let mut h = HeaderMap::new();
             h.insert(header::HOST, host.parse().unwrap());

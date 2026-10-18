@@ -953,9 +953,8 @@ pub async fn neighbors(State(s): State<AppState>, Query(q): Query<NeighborQuery>
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::tests::TestDir;
+    use crate::model::tests::TestStore;
     use crate::series::col;
-    use crate::store;
 
     #[test]
     fn retries_use_attempts_and_ignore_counter_restarts() {
@@ -1073,12 +1072,11 @@ mod tests {
         }
 
         /// The site: two APs reporting for a little over an hour before `base + 3600`.
-        fn site() -> (AppState, Ts, TestDir) {
+        fn site() -> (AppState, Ts, TestStore) {
             let now = clock::now_ts();
             let base = now - now % 3600 - 3600;
-            let dir = TestDir::new("insights-pin");
-            let (store, writer) = store::Store::open(&dir).unwrap();
-            let m = Connection::open(dir.join("metrics.db")).unwrap();
+            let t = TestStore::new("insights-pin");
+            let m = t.db(Db::Metrics);
             let mut rng = Rng(7);
             // Per SSID: cumulative counters, a restart (the second), rows without attempt
             // counters (the third), unreported scores and signals (the fourth), a missing
@@ -1172,7 +1170,7 @@ mod tests {
                 }
             }
             insert(&m, "mcast_stats", &["mac", "type", "ts", "tx_pps", "rx_pps", "tx_bytes_ps", "rx_bytes_ps", "clients"], rows);
-            let c = Connection::open(dir.join("config.db")).unwrap();
+            let c = t.db(Db::Config);
             let spectrum = [(A1, "na", 36, 80, 30, 20), (A1, "na", 52, 80, 5, 2), (A1, "ng", 1, 20, 50, 40), (A1, "ng", 6, 20, 20, 10), (A2, "na", 36, 80, 40, 10), (A2, "ng", 11, 20, 60, 30)];
             let rows = spectrum.iter().map(|(ap, r, ch, w, u, i)| vec![text(ap), text(r), int(*ch), int(*w), int(*u), int(*i), int(2), int(base + 100)]).collect();
             insert(&c, "spectrum", &["ap_mac", "radio", "channel", "width", "utilization", "interference", "other_bss_count", "ts"], rows);
@@ -1235,15 +1233,15 @@ mod tests {
                     "networkconf": [{ "_id": "n1", "name": "LAN", "site_id": "s1" }],
                 })));
             }
-            let auth = std::sync::Arc::new(crate::auth::Auth::new(Default::default(), &store, writer.clone(), Default::default()).unwrap());
+            let auth = std::sync::Arc::new(crate::auth::Auth::new(Default::default(), &t.store, t.writer.clone(), Default::default()).unwrap());
             let (engine, _) = tokio::sync::mpsc::channel(1);
             let (tx, _) = tokio::sync::broadcast::channel(1);
             let s = AppState::new(crate::api::AppStateInner {
-                backups: crate::backup::Backups::new(dir.to_path_buf(), None),
-                store, vendors: Default::default(), renderer: crate::dryrun::apcfg_renderer("10.6.106".into()), auth, engine, live, tx, started: 0, source: "none".into(),
-                active: false, writer, inform_url: None, memo: Default::default(), threats: Default::default(),
+                backups: crate::backup::Backups::new(t.dir.to_path_buf(), None),
+                store: t.store.clone(), vendors: Default::default(), renderer: crate::dryrun::apcfg_renderer("10.6.106".into()), auth, engine, live, tx, started: 0, source: "none".into(),
+                active: false, writer: t.writer.clone(), inform_url: None, memo: Default::default(), threats: Default::default(),
             });
-            (s, base, dir)
+            (s, base, t)
         }
 
         /// Times as offsets from `base`, so the output does not depend on the day.
@@ -1284,7 +1282,7 @@ mod tests {
         }
 
         async fn outputs() -> Value {
-            let (s, base, _dir) = site();
+            let (s, base, _store) = site();
             let q = |band: Option<&str>, mac: Option<&str>| Query(RangeQuery { range: None, from: Some(base), to: Some(base + 3600), band: band.map(Into::into), mac: mac.map(Into::into) });
             let plan = |band: &str, dfs: bool| Query(PlanQuery { band: Some(band.into()), dfs: Some(dfs) });
             let st = || State(s.clone());
@@ -1327,9 +1325,9 @@ mod tests {
 
         #[tokio::test]
         async fn activity_counts_the_clients_of_an_ssids_first_report() {
-            let (s, base, dir) = site();
+            let (s, base, t) = site();
             // A new SSID on 6 GHz, with one report so far: no interval yet, but its clients are known.
-            let m = Connection::open(dir.join("metrics.db")).unwrap();
+            let m = t.db(Db::Metrics);
             insert(&m, "vap_stats", &["bssid", "ts", "ap_mac", "essid", "radio", "num_sta"], vec![vec![text("02:00:00:00:03:01"), int(base + 1810), text(A1), text("Home"), text("6e"), int(4)]]);
             let q = Query(RangeQuery { range: None, from: Some(base), to: Some(base + 3600), band: Some("6e".into()), mac: None });
             let out = ok(activity(State(s), q).await);
@@ -1338,17 +1336,17 @@ mod tests {
 
         #[tokio::test]
         async fn a_repeated_query_is_answered_from_memory() {
-            let (s, base, dir) = site();
+            let (s, base, t) = site();
             let q = |range| Query(RangeQuery { range, from: Some(base), to: Some(base + 3600), band: None, mac: None });
             let first = ok(retries(State(s.clone()), q(None)).await);
-            Connection::open(dir.join("metrics.db")).unwrap().execute("DELETE FROM vap_stats", []).unwrap();
+            t.db(Db::Metrics).execute("DELETE FROM vap_stats", []).unwrap();
             assert_eq!(ok(retries(State(s.clone()), q(None)).await), first, "read again within the time it is kept");
             assert_eq!(ok(retries(State(s), q(Some(600))).await), json!([]), "another query reads the database");
         }
 
         #[tokio::test]
         async fn a_query_asked_again_while_it_is_read_is_read_once() {
-            let (s, base, _dir) = site();
+            let (s, base, _store) = site();
             static READS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
             let q = RangeQuery { range: None, from: Some(base), to: Some(base + 3600), band: None, mac: None };
             let one = || {
@@ -1365,9 +1363,9 @@ mod tests {
 
         #[tokio::test]
         async fn our_aps_hearing_each_other_are_listed_once_per_band() {
-            let (s, base, dir) = site();
+            let (s, base, t) = site();
             // A2 hears both of A1's 5 GHz SSIDs.
-            let c = Connection::open(dir.join("config.db")).unwrap();
+            let c = t.db(Db::Config);
             let row = |bssid: &str, sig: i64| vec![text(bssid), text(A2), text("na"), text("x"), int(44), int(80), int(5210), int(sig), int(base - 60), int(base)];
             insert(&c, "neighbors", &["bssid", "ap_mac", "radio", "essid", "channel", "bw", "center_freq", "signal", "first_seen", "last_seen"], vec![row(BSS[1].0, -62), row(BSS[2].0, -58)]);
             let q = Query(NeighborQuery { band: None, range: Some(30 * 86400), links_only: false, neighbors_only: false });
@@ -1391,10 +1389,10 @@ mod tests {
 
         #[tokio::test]
         async fn plans_leave_out_old_scans() {
-            let (s, base, dir) = site();
+            let (s, base, t) = site();
             let before = json!(ok(channel_plan(State(s.clone()), Query(PlanQuery { band: Some("na".into()), dfs: Some(true) })).await));
             // A scan from long ago saying the channel the plan picks for A2 is full.
-            let c = Connection::open(dir.join("config.db")).unwrap();
+            let c = t.db(Db::Config);
             let row = vec![text(A2), text("na"), int(52), int(80), int(100), int(100), int(9), int(base - 8 * 86400)];
             insert(&c, "spectrum", &["ap_mac", "radio", "channel", "width", "utilization", "interference", "other_bss_count", "ts"], vec![row]);
             let after = json!(ok(channel_plan(State(s), Query(PlanQuery { band: Some("na".into()), dfs: Some(true) })).await));
@@ -1403,7 +1401,7 @@ mod tests {
 
         #[tokio::test]
         async fn an_outdoor_ap_is_planned_onto_channels_it_may_use_outdoors() {
-            let (s, _, _dir) = site();
+            let (s, _, _store) = site();
             {
                 let mut live = s.live.write().unwrap();
                 let mut state = live.state.as_deref().unwrap().clone();

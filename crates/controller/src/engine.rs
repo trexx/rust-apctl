@@ -1768,7 +1768,7 @@ mod tests {
     }
 
     use super::*;
-    use crate::model::tests::TestDir;
+    use crate::model::tests::{TestDir, flushed};
     use inform::{Flags, Header};
     use wire::decode::KeyUsed;
 
@@ -1808,17 +1808,39 @@ mod tests {
     }
 
     fn harness() -> Harness {
-        let dir = TestDir::new("engine");
-        let (store, writer) = store::Store::open(&dir).unwrap();
-        let live: SharedLive = Default::default();
-        let (tx, rx) = broadcast::channel(1024);
-        Harness { engine: Engine::new(writer.clone(), Default::default(), live.clone(), tx), live, rx, store, writer, _dir: dir }
+        harness_with(KeyStore::default())
+    }
+
+    /// An engine that knows these syslog keys.
+    fn harness_with(keys: KeyStore) -> Harness {
+        Harness::open(TestDir::new("engine"), keys)
+    }
+
+    impl Harness {
+        /// An engine on the store in `dir`, new or left by an engine before.
+        fn open(dir: TestDir, keys: KeyStore) -> Harness {
+            let (store, writer) = store::Store::open(&dir).unwrap();
+            let live: SharedLive = Default::default();
+            let (tx, rx) = broadcast::channel(1024);
+            Harness { engine: Engine::new(writer.clone(), Arc::new(keys), live.clone(), tx), live, rx, store, writer, _dir: dir }
+        }
+
+        /// The engine after apctl restarted: what this one wrote is stored, and a
+        /// new engine on the same store restores what it remembers from it.
+        fn restarted(self) -> Harness {
+            let Harness { engine, live, rx, store, writer, _dir: dir } = self;
+            flushed(&writer);
+            drop((engine, live, rx, store, writer));
+            let mut h = Harness::open(dir, KeyStore::default());
+            h.engine.restore(&h.store).unwrap();
+            h
+        }
     }
 
     /// The data of the stored events of one kind, oldest first (the live
     /// messages only say that an event was stored).
     fn stored(h: &Harness, kind: EventKind) -> Vec<Value> {
-        assert!(h.writer.flush(std::time::Duration::from_secs(5)));
+        flushed(&h.writer);
         h.store
             .read(Db::Config, |c| {
                 let mut stmt = c.prepare("SELECT data FROM events WHERE kind = ?1 ORDER BY id")?;
@@ -1906,57 +1928,32 @@ mod tests {
 
     #[test]
     fn restart_of_the_controller_does_not_reconnect_everyone() {
-        let dir = TestDir::new("restore");
         let feed = |e: &mut Engine, ts| e.handle(Input::Inform { ts, peer: "x".into(), decoded: decoded(inform(AP1, 1000 + ts, &[(C1, "b1")])) });
-        {
-            let (_store, writer) = store::Store::open(&dir).unwrap();
-            let (tx, _rx) = broadcast::channel(1024);
-            let mut e = Engine::new(writer.clone(), Default::default(), Default::default(), tx);
-            feed(&mut e, 0);
-            assert!(writer.flush(std::time::Duration::from_secs(5)));
-        }
-        let (store, writer) = store::Store::open(&dir).unwrap();
-        let (tx, mut rx) = broadcast::channel(1024);
-        let mut e = Engine::new(writer, Default::default(), Default::default(), tx);
-        e.restore(&store).unwrap();
-        e.handle(Input::Tick(25)); // a tick before the first inform must not disconnect anyone
-        feed(&mut e, 30);
-        let kinds: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok())
-            .filter_map(|m| match m { LiveMsg::Event(ev) => Some(ev.kind), _ => None })
-            .collect();
-        assert!(kinds.is_empty(), "{kinds:?}");
+        let mut h = harness();
+        feed(&mut h.engine, 0);
+        let mut h = h.restarted();
+        h.engine.handle(Input::Tick(25)); // a tick before the first inform must not disconnect anyone
+        feed(&mut h.engine, 30);
+        assert_eq!(events(&mut h), []);
     }
 
     #[test]
     fn a_long_outage_gives_the_aps_time_to_inform() {
-        let dir = TestDir::new("outage");
-        {
-            let (_store, writer) = store::Store::open(&dir).unwrap();
-            let (tx, _rx) = broadcast::channel(1024);
-            let mut e = Engine::new(writer.clone(), Default::default(), Default::default(), tx);
-            e.handle(Input::Inform { ts: 0, peer: "x".into(), decoded: decoded(inform(AP1, 1000, &[(C1, "b1")])) });
-            assert!(writer.flush(std::time::Duration::from_secs(5)));
-        }
+        let mut h = harness();
+        h.engine.handle(Input::Inform { ts: 0, peer: "x".into(), decoded: decoded(inform(AP1, 1000, &[(C1, "b1")])) });
         // Back after two hours: the first tick comes before the AP's first inform.
-        let (store, writer) = store::Store::open(&dir).unwrap();
-        let (tx, mut rx) = broadcast::channel(1024);
-        let mut e = Engine::new(writer, Default::default(), Default::default(), tx);
-        e.restore(&store).unwrap();
-        let mut kinds = || std::iter::from_fn(|| rx.try_recv().ok()).filter_map(|m| match m { LiveMsg::Event(ev) => Some(ev.kind), _ => None }).collect::<Vec<_>>();
-        e.handle(Input::Tick(7200));
-        e.handle(Input::Tick(7200 + 3600));
-        assert_eq!(kinds(), Vec::new(), "the client is left alone for the AP's first hour back");
+        let mut h = h.restarted();
+        h.engine.handle(Input::Tick(7200));
+        h.engine.handle(Input::Tick(7200 + 3600));
+        assert_eq!(events(&mut h), [], "the client is left alone for the AP's first hour back");
         // An AP that never informs again: its clients go an hour into the run.
-        e.handle(Input::Tick(7200 + 3601));
-        assert_eq!(kinds(), [EventKind::ClientDisconnected]);
+        h.engine.handle(Input::Tick(7200 + 3601));
+        assert_eq!(events(&mut h), [("client_disconnected", Some(C1.into()))]);
     }
 
     #[test]
     fn unchanged_rows_are_written_once_a_minute() {
-        let dir = TestDir::new("written");
-        let (store, writer) = store::Store::open(&dir).unwrap();
-        let (tx, _rx) = broadcast::channel(1024);
-        let mut e = Engine::new(writer.clone(), Default::default(), Default::default(), tx);
+        let mut h = harness();
         let feed = |e: &mut Engine, ts: Ts, name: &str| {
             let mut p = inform(AP1, 1000 + ts, &[(C1, "b1")]);
             p["hostname"] = json!(name);
@@ -1964,18 +1961,18 @@ mod tests {
             e.handle(Input::Inform { ts, peer: "x".into(), decoded: decoded(p) });
         };
         let stored = |sql: &'static str| -> (i64, String) {
-            assert!(writer.flush(std::time::Duration::from_secs(5)));
-            store.read(Db::Config, |c| Ok(c.query_row(sql, [], |r| Ok((r.get(0)?, r.get(1)?)))?)).unwrap()
+            flushed(&h.writer);
+            h.store.read(Db::Config, |c| Ok(c.query_row(sql, [], |r| Ok((r.get(0)?, r.get(1)?)))?)).unwrap()
         };
         let (device, client) = ("SELECT last_seen, hostname FROM devices", "SELECT last_seen, hostname FROM clients");
-        feed(&mut e, 0, "a");
-        feed(&mut e, 15, "a");
+        feed(&mut h.engine, 0, "a");
+        feed(&mut h.engine, 15, "a");
         assert_eq!((stored(device), stored(client)), ((0, "a".into()), (0, "a".into())), "unchanged: not written again yet");
-        feed(&mut e, 30, "b");
+        feed(&mut h.engine, 30, "b");
         assert_eq!((stored(device), stored(client)), ((30, "b".into()), (30, "b".into())), "a change is written at once");
-        feed(&mut e, 45, "b");
+        feed(&mut h.engine, 45, "b");
         assert_eq!(stored(device).0, 30);
-        feed(&mut e, 90, "b");
+        feed(&mut h.engine, 90, "b");
         assert_eq!((stored(device).0, stored(client).0), (90, 90), "last_seen moves on once a minute");
     }
 
@@ -1990,7 +1987,7 @@ mod tests {
             h.engine.handle(Input::Inform { ts, peer: "x".into(), decoded: decoded(p) });
         };
         let last_seen = |h: &Harness| -> i64 {
-            assert!(h.writer.flush(std::time::Duration::from_secs(5)));
+            flushed(&h.writer);
             h.store.read(Db::Config, |c| Ok(c.query_row("SELECT last_seen FROM neighbors", [], |r| r.get(0))?)).unwrap()
         };
         feed(&mut h, 0, Some(-70));
@@ -2026,42 +2023,39 @@ mod tests {
     fn syslog_keys_are_tried_once_per_unknown_sender() {
         let mut keys = KeyStore::default();
         keys.insert_syslog(AP1, &hex::encode([7u8; 32])).unwrap();
-        let dir = TestDir::new("syslog");
-        let (_store, writer) = store::Store::open(&dir).unwrap();
-        let (tx, _rx) = broadcast::channel(1024);
-        let live: SharedLive = Default::default();
-        let mut e = Engine::new(writer, Arc::new(keys), live.clone(), tx);
-        let send = |e: &mut Engine, ts: Ts, hash_id: u8, key: u8| {
+        let mut h = harness_with(keys);
+        let live = h.live.clone();
+        let send = |h: &mut Harness, ts: Ts, hash_id: u8, key: u8| {
             let payload = crate::syslog::tests::seal([hash_id; 8], [key; 32], "<14>hostapd: hello");
-            e.handle(Input::Datagram { ts, src_ip: "192.0.2.1".into(), payload });
+            h.engine.handle(Input::Datagram { ts, src_ip: "192.0.2.1".into(), payload });
         };
         let logs = || live.read().unwrap().counters.logs.load(Ordering::Relaxed);
         // An AP whose key apctl lacks: remembered, not tried again for a while.
-        send(&mut e, 0, 1, 9);
-        assert_eq!(e.syslog_unknown.get(&u64::from_be_bytes([1; 8])), Some(&0));
-        send(&mut e, 10, 1, 9);
-        assert_eq!(e.syslog_unknown.get(&u64::from_be_bytes([1; 8])), Some(&0), "not retried within the window");
-        e.handle(Input::Tick(SYSLOG_RETRY_SECS));
-        assert!(e.syslog_unknown.is_empty(), "expired");
+        send(&mut h, 0, 1, 9);
+        assert_eq!(h.engine.syslog_unknown.get(&u64::from_be_bytes([1; 8])), Some(&0));
+        send(&mut h, 10, 1, 9);
+        assert_eq!(h.engine.syslog_unknown.get(&u64::from_be_bytes([1; 8])), Some(&0), "not retried within the window");
+        h.engine.handle(Input::Tick(SYSLOG_RETRY_SECS));
+        assert!(h.engine.syslog_unknown.is_empty(), "expired");
         // A known key under a hash_id not seen yet: found by trial and remembered.
-        send(&mut e, 20, 2, 7);
+        send(&mut h, 20, 2, 7);
         assert_eq!(logs(), 1);
         assert_eq!(live.read().unwrap().by_hash_id.get(&u64::from_be_bytes([2; 8])), Some(&AP1.parse().unwrap()));
         // An AP apctl adopted: its key is in the settings only.
-        send(&mut e, 30, 3, 5);
+        send(&mut h, 30, 3, 5);
         assert_eq!(logs(), 1);
         let ap2 = "02:00:00:00:00:02";
-        e.set_state(31, json!({ "devices": [{ "mac": ap2, "syslog_key": hex::encode([5u8; 32]) }] }));
-        assert!(e.syslog_unknown.is_empty(), "new settings, new keys: tried again");
-        send(&mut e, 32, 3, 5);
+        h.engine.set_state(31, json!({ "devices": [{ "mac": ap2, "syslog_key": hex::encode([5u8; 32]) }] }));
+        assert!(h.engine.syslog_unknown.is_empty(), "new settings, new keys: tried again");
+        send(&mut h, 32, 3, 5);
         assert_eq!(logs(), 2);
         assert_eq!(live.read().unwrap().by_hash_id.get(&u64::from_be_bytes([3; 8])), Some(&ap2.parse().unwrap()));
         // So many unknown hash_ids at once: a new one is not tried with every key.
         for i in 0..SYSLOG_UNKNOWN_MAX {
-            e.syslog_unknown.insert(i as u64, 40);
+            h.engine.syslog_unknown.insert(i as u64, 40);
         }
-        send(&mut e, 41, 4, 7);
-        assert_eq!((logs(), e.syslog_unknown.len()), (2, SYSLOG_UNKNOWN_MAX));
+        send(&mut h, 41, 4, 7);
+        assert_eq!((logs(), h.engine.syslog_unknown.len()), (2, SYSLOG_UNKNOWN_MAX));
         assert!(!live.read().unwrap().by_hash_id.contains_key(&u64::from_be_bytes([4; 8])));
     }
 
@@ -2069,25 +2063,21 @@ mod tests {
     fn plain_syslog_names_an_ap_by_its_address_only_without_a_key() {
         let mut keys = KeyStore::default();
         keys.insert_syslog(AP1, &hex::encode([7u8; 32])).unwrap();
-        let dir = TestDir::new("syslog-ip");
-        let (_store, writer) = store::Store::open(&dir).unwrap();
-        let (tx, mut rx) = broadcast::channel(1024);
-        let live: SharedLive = Default::default();
+        let mut h = harness_with(keys);
         let ap2: Mac = "02:00:00:00:00:02".parse().unwrap();
-        live.write().unwrap().by_ip.insert("192.0.2.1".into(), AP1.parse().unwrap());
-        live.write().unwrap().by_ip.insert("192.0.2.2".into(), ap2);
-        let mut e = Engine::new(writer, Arc::new(keys), live.clone(), tx);
-        let mut events = |e: &mut Engine, ts: Ts, src: &str, text: &str| {
-            e.handle(Input::Datagram { ts, src_ip: src.into(), payload: text.as_bytes().to_vec() });
-            std::iter::from_fn(|| rx.try_recv().ok()).filter_map(|m| match m { LiveMsg::Event(e) => Some((e.kind, e.device_mac)), _ => None }).collect::<Vec<_>>()
+        h.live.write().unwrap().by_ip.insert("192.0.2.1".into(), AP1.parse().unwrap());
+        h.live.write().unwrap().by_ip.insert("192.0.2.2".into(), ap2);
+        let events = |h: &mut Harness, ts: Ts, src: &str, text: &str| {
+            h.engine.handle(Input::Datagram { ts, src_ip: src.into(), payload: text.as_bytes().to_vec() });
+            std::iter::from_fn(|| h.rx.try_recv().ok()).filter_map(|m| match m { LiveMsg::Event(e) => Some((e.kind, e.device_mac)), _ => None }).collect::<Vec<_>>()
         };
         let kick = "<14>stamgr: kick-sta-on 6c:ac:c2:00:00:01 wifi1ap1 (reason:Low RSSI rssi:19)";
         // From the address of an AP that encrypts its syslog: not taken for the AP's.
-        assert_eq!(events(&mut e, 1, "192.0.2.1", kick), [(EventKind::ClientKicked, None)]);
+        assert_eq!(events(&mut h, 1, "192.0.2.1", kick), [(EventKind::ClientKicked, None)]);
         // Its netconsole's crash is, as the official controller takes it.
-        assert_eq!(events(&mut e, 2, "192.0.2.1", "[ 12.3] Kernel panic - not syncing: Fatal exception"), [(EventKind::ApCrash, AP1.parse().ok())]);
+        assert_eq!(events(&mut h, 2, "192.0.2.1", "[ 12.3] Kernel panic - not syncing: Fatal exception"), [(EventKind::ApCrash, AP1.parse().ok())]);
         // An AP without a key logs in plain text: its address names it.
-        assert_eq!(events(&mut e, 3, "192.0.2.2", "<14>stamgr: kick-sta-on 6c:ac:c2:00:00:02 wifi1ap1 (reason:Low RSSI rssi:19)"), [(EventKind::ClientKicked, Some(ap2))]);
+        assert_eq!(events(&mut h, 3, "192.0.2.2", "<14>stamgr: kick-sta-on 6c:ac:c2:00:00:02 wifi1ap1 (reason:Low RSSI rssi:19)"), [(EventKind::ClientKicked, Some(ap2))]);
     }
 
     #[test]
@@ -2149,20 +2139,18 @@ mod tests {
 
     #[test]
     fn multicast_rates_count_networks_once_and_clients_each() {
-        let dir = TestDir::new("mcast");
-        let (store, writer) = store::Store::open(&dir).unwrap();
-        let (tx, _rx) = broadcast::channel(1024);
-        let mut e = Engine::new(writer.clone(), Default::default(), Default::default(), tx);
+        let mut h = harness();
         // Per-network "to clients" counters repeat in every client's block.
         let sta = |mac: &str, to: i64, from: i64| json!({ "mac": mac, "multicast": { "types": { "mdns": { "tx_pkts": to, "tx_bytes": to * 100, "rx_pkts": from, "rx_bytes": from * 100 } } } });
         let feed = |e: &mut Engine, ts: Ts, to: i64, from: i64| {
             let p = json!({ "mac": AP1, "uptime": 1000 + ts, "vap_table": [{ "bssid": "b1", "radio": "na", "usage": "user", "sta_table": [sta(C1, to, from), sta("02:00:00:00:01:02", to, 0)] }] });
             e.handle(Input::Inform { ts, peer: "x".into(), decoded: decoded(p) });
         };
-        feed(&mut e, 0, 100, 0);
-        feed(&mut e, 10, 200, 50);
-        assert!(writer.flush(std::time::Duration::from_secs(5)));
-        let row: (f64, f64, f64, f64) = store
+        feed(&mut h.engine, 0, 100, 0);
+        feed(&mut h.engine, 10, 200, 50);
+        flushed(&h.writer);
+        let row: (f64, f64, f64, f64) = h
+            .store
             .read(Db::Metrics, |c| Ok(c.query_row("SELECT tx_pps, rx_pps, rx_bytes_ps, clients FROM mcast_stats WHERE ts = 10 AND type = 'mdns'", [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?))
             .unwrap();
         assert_eq!(row, (10.0, 5.0, 500.0, 1.0));
@@ -2361,7 +2349,7 @@ mod tests {
         h.engine.handle(Input::Reply { ts: 230, mac, decoded: decoded(push) });
         h.engine.handle(Input::Reply { ts: 240, mac, decoded: decoded(json!({ "_type": "setparam", "system_cfg": "x=2" })) });
         assert_eq!(h.live.read().unwrap().last_config[&mac].cfgversion.as_deref(), Some("v1"));
-        assert!(h.writer.flush(std::time::Duration::from_secs(5)));
+        flushed(&h.writer);
         let stored: String = h.store.read(Db::Config, |c| Ok(c.query_row("SELECT cfgversion FROM device_config", [], |r| r.get(0))?)).unwrap();
         assert_eq!(stored, "v1");
     }

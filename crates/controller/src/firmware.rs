@@ -582,6 +582,7 @@ pub async fn resume(State(s): State<AppState>) -> Result<Json<Value>, ApiError> 
 mod tests {
     use super::*;
     use std::cmp::Ordering::*;
+    use crate::model::tests::flushed;
 
     #[test]
     fn reads_the_release_feed() {
@@ -710,7 +711,7 @@ mod tests {
         store_releases(&writer, &[rel("U6M"), rel("U7P")], 2_000_000_000);
         // The clock steps back before the next check, which no longer lists U7P.
         store_releases(&writer, &[rel("U6M"), rel("UAL6")], 1_000_000_000);
-        assert!(writer.flush(Duration::from_secs(5)));
+        flushed(&writer);
         let (rels, checked, error) = releases(&store).unwrap();
         let mut platforms: Vec<&str> = rels.keys().map(String::as_str).collect();
         platforms.sort_unstable();
