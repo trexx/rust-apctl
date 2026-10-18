@@ -369,38 +369,39 @@ struct Row<T> {
     seen: Ts,
 }
 
-impl<T: PartialEq + Clone> Row<T> {
-    fn new(value: &T, ts: Ts) -> Self {
-        Row { value: value.clone(), written: ts, seen: ts }
+impl<T: PartialEq> Row<T> {
+    fn new(value: T, ts: Ts) -> Self {
+        Row { value, written: ts, seen: ts }
     }
 
     /// Records `value` as reported at `ts`; true if it is to be written: it
     /// changed, or was last written `every` seconds ago.
-    fn report(&mut self, value: &T, ts: Ts, every: Ts) -> bool {
+    fn report(&mut self, value: T, ts: Ts, every: Ts) -> bool {
         self.seen = ts;
-        if self.value == *value && !due(Some(&self.written), ts, every) {
+        if self.value == value && !due(Some(&self.written), ts, every) {
             return false;
         }
-        self.value.clone_from(value);
+        self.value = value;
         self.written = ts;
         true
     }
 }
 
-/// Records `value` as reported under `key` at `ts` (see `Row::report`): true
-/// if its row is to be written, as one new or changed, or due again. The key
-/// is copied only for a new row.
-fn report<K, Q, T>(rows: &mut Rows<K, T>, key: &Q, value: &T, ts: Ts, every: Ts) -> bool
+/// Records `value` as reported under its `key` at `ts` (see `Row::report`):
+/// its row if it is to be written, as one new or changed, or due again. The
+/// row keeps the value; the key is copied only for a new row.
+fn report<K, Q, T>(rows: &mut Rows<K, T>, value: T, key: impl Fn(&T) -> &Q, ts: Ts, every: Ts) -> Option<&T>
 where
     K: std::borrow::Borrow<Q> + Eq + std::hash::Hash,
     Q: ToOwned<Owned = K> + Eq + std::hash::Hash + ?Sized,
-    T: PartialEq + Clone,
+    T: PartialEq,
 {
-    if let Some(row) = rows.get_mut(key) {
-        return row.report(value, ts, every);
+    if rows.contains_key(key(&value)) {
+        let row = rows.get_mut(key(&value)).expect("present");
+        return row.report(value, ts, every).then_some(&row.value);
     }
-    rows.insert(key.to_owned(), Row::new(value, ts));
-    true
+    let k = key(&value).to_owned();
+    Some(&rows.entry(k).or_insert(Row::new(value, ts)).value)
 }
 
 /// Whether a row last written at `at` (if ever) is due again at `ts`.
@@ -629,7 +630,7 @@ impl Engine {
             self.notification(ts, decoded.payload);
             return;
         }
-        let snap = match model::parse(ts, &decoded.payload) {
+        let mut snap = match model::parse(ts, &decoded.payload) {
             Ok(s) => s,
             Err(e) => {
                 tracing::debug!("unparseable inform: {e:#}");
@@ -638,8 +639,10 @@ impl Engine {
             }
         };
         let mac = snap.ap.mac;
-        self.write_metrics(&snap);
-        self.check_isolated(ts, &snap);
+        // Only stored, not kept in the live view: the rows written of them own them.
+        let (neighbors, spectrum) = (std::mem::take(&mut snap.neighbors), std::mem::take(&mut snap.spectrum));
+        self.check_isolated(ts, mac, &neighbors);
+        self.write_metrics(&snap, neighbors, spectrum);
         bump(&self.counters.informs);
 
         // A handle of its own, so the engine's other fields stay usable while it is locked.
@@ -661,8 +664,8 @@ impl Engine {
         let has_clients = !snap.clients.is_empty();
 
         // The write lock is held for the swaps alone. What they replace (the last
-        // full inform, the last snapshot) is dropped after it, and the events are
-        // emitted after it.
+        // full inform, the last snapshot, the clients' views) is dropped after it,
+        // and the clients' rows and the events are made after it.
         let mut live = shared.write().unwrap();
         let old_inform = if snap.has_vap_table { live.raw_informs.insert(mac, Arc::new(decoded.payload)) } else { None };
         live.attribute(&snap.ap);
@@ -676,13 +679,12 @@ impl Engine {
             events.retain(|e| e.kind != EventKind::ApFirmwareChanged);
             events.push(Event::device(ts, EventKind::ApUpgraded, mac, json!({ "from": j.from, "to": v, "custom": j.custom })));
         }
-        if snap.has_vap_table {
-            self.update_clients(&mut live, ts, &snap.clients, &mut events);
-        }
+        let updated = if snap.has_vap_table { self.update_clients(&mut live, ts, &snap.clients) } else { Vec::new() };
         let (view, old_snapshot) = device_view(ts, peer, snap, prev, known.as_ref());
         live.devices.insert(mac, view);
         drop(live);
         drop((old_inform, old_snapshot));
+        self.client_rows(ts, updated, &mut events);
 
         for e in events {
             self.emit(e);
@@ -735,19 +737,41 @@ impl Engine {
         }
     }
 
-    /// Updates the clients a full inform lists; their events are added to
-    /// `events`, for the caller to emit once the lock is released.
-    fn update_clients(&mut self, live: &mut Live, ts: Ts, clients: &[Arc<ClientSample>], events: &mut Vec<Event>) {
+    /// Updates the clients a full inform lists in the live view, under its
+    /// lock; returns each with the view it replaced (none for a new one), for
+    /// `client_rows` once the lock is released.
+    fn update_clients(&mut self, live: &mut Live, ts: Ts, clients: &[Arc<ClientSample>]) -> Vec<(Arc<ClientSample>, Option<ClientView>)> {
         use std::collections::btree_map::Entry;
+        let mut updated = Vec::with_capacity(clients.len());
         for c in clients {
             self.connected.insert(c.mac);
-            // One lookup for the event, whether the row changed, and the update.
-            let (event, changed) = match live.clients.entry(c.mac) {
+            let view = ClientView { sample: c.clone(), connected: true, first_seen: ts, last_seen: ts };
+            let old = match live.clients.entry(c.mac) {
                 Entry::Occupied(mut e) => {
-                    let view = e.get_mut();
+                    let first_seen = e.get().first_seen;
+                    Some(std::mem::replace(e.get_mut(), ClientView { first_seen, ..view }))
+                }
+                Entry::Vacant(e) => {
+                    e.insert(view);
+                    None
+                }
+            };
+            updated.push((c.clone(), old));
+        }
+        updated
+    }
+
+    /// The rows and events of the clients `update_clients` updated: a row
+    /// written if it changed (or is due again), and their events added to
+    /// `events`.
+    fn client_rows(&mut self, ts: Ts, updated: Vec<(Arc<ClientSample>, Option<ClientView>)>, events: &mut Vec<Event>) {
+        for (c, old) in updated {
+            let (event, changed) = match &old {
+                None => (Some(connected_event(ts, &c, true)), true),
+                Some(view) => {
                     let p = &view.sample;
                     let event = if !view.connected {
-                        Some(connected_event(ts, c, false))
+                        Some(connected_event(ts, &c, false))
                     } else if p.ap_mac != c.ap_mac || p.bssid != c.bssid {
                         Some(Event::client_on(ts, EventKind::ClientRoamed, c.ap_mac, c.mac, json!({
                             "from": { "ap": p.ap_mac, "radio": p.radio, "channel": p.channel, "essid": p.essid, "signal": p.signal },
@@ -758,12 +782,7 @@ impl Engine {
                     };
                     let changed = !view.connected
                         || (&p.hostname, &p.ip, p.ap_mac, &p.bssid, &p.essid, &p.radio) != (&c.hostname, &c.ip, c.ap_mac, &c.bssid, &c.essid, &c.radio);
-                    *view = ClientView { sample: c.clone(), connected: true, first_seen: view.first_seen, last_seen: ts };
                     (event, changed)
-                }
-                Entry::Vacant(e) => {
-                    e.insert(ClientView { sample: c.clone(), connected: true, first_seen: ts, last_seen: ts });
-                    (Some(connected_event(ts, c, true)), true)
                 }
             };
             // An unchanged row only to move last_seen on (see `REFRESH_SECS`).
@@ -1024,10 +1043,13 @@ impl Engine {
     /// renames and the client list are announced once for the lot: a bulk
     /// import of thousands of names would otherwise overrun the live
     /// subscribers' queue, and send every browser to refetch everything.
+    ///
+    /// Only the names are changed under the live view's lock; they are
+    /// stored, and the renames recorded, once it is released.
     fn set_aliases(&self, ts: Ts, entries: Vec<AliasEdit>, only_if_unset: bool) {
         let clean = |v: Option<String>| v.map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
-        let mut changed = false;
-        let mut renames = Vec::new();
+        // Each change: the client, its new alias and note, and for a rename its old alias and its AP.
+        let mut changes = Vec::new();
         let mut live = self.live.write().unwrap();
         for AliasEdit { mac, alias, note } in entries {
             let (alias, mut note) = (clean(alias), clean(note));
@@ -1043,24 +1065,31 @@ impl Engine {
             if old.alias == alias && old.note == note {
                 continue;
             }
-            changed = true;
             if alias.is_none() && note.is_none() {
                 live.aliases.remove(&mac);
-                self.writer.exec(Db::Config, "DELETE FROM client_aliases WHERE mac = ?1", vec![Sql::Text(mac.to_string())]);
             } else {
                 live.aliases.insert(mac, Alias { alias: alias.clone(), note: note.clone() });
+            }
+            let renamed = (old.alias != alias).then(|| (old.alias, live.clients.get(&mac).map(|c| c.sample.ap_mac)));
+            changes.push((mac, alias, note, renamed));
+        }
+        drop(live);
+        let changed = !changes.is_empty();
+        let mut renames = Vec::new();
+        for (mac, alias, note, renamed) in changes {
+            if alias.is_none() && note.is_none() {
+                self.writer.exec(Db::Config, "DELETE FROM client_aliases WHERE mac = ?1", vec![Sql::Text(mac.to_string())]);
+            } else {
                 self.writer.exec(
                     Db::Config,
                     "INSERT OR REPLACE INTO client_aliases (mac, alias, note, updated) VALUES (?1, ?2, ?3, ?4)",
                     vec![Sql::Text(mac.to_string()), alias.clone().into(), note.into(), Sql::Integer(ts)],
                 );
             }
-            if old.alias != alias {
-                let ap = live.clients.get(&mac).map(|c| c.sample.ap_mac);
-                renames.push(self.record(Event { ts, kind: EventKind::ClientRenamed, device_mac: ap, client_mac: Some(mac), data: json!({ "from": old.alias, "to": alias }) }));
+            if let Some((from, ap)) = renamed {
+                renames.push(self.record(Event { ts, kind: EventKind::ClientRenamed, device_mac: ap, client_mac: Some(mac), data: json!({ "from": from, "to": alias }) }));
             }
         }
-        drop(live);
         // One rename names its client; more are announced as renames of anyone.
         let head = match renames[..] {
             [] => None,
@@ -1108,7 +1137,11 @@ impl Engine {
                         // "{proc} exited with code {exit_status} and restarted by {caller}"
                         "EVT_AP_RestartProc" => EventKind::ApProcessRestarted,
                         "Upgrade" => {
-                            self.upgrade_notice(&mut self.live.write().unwrap(), ts, mac, &n);
+                            // The lock is released at the end of the statement, before the event is emitted.
+                            let ev = Self::upgrade_notice(&mut self.live.write().unwrap(), ts, mac, &n);
+                            if let Some(ev) = ev {
+                                self.emit(ev);
+                            }
                             return;
                         }
                         _ => EventKind::ApEvent,
@@ -1270,8 +1303,9 @@ impl Engine {
         }
     }
 
-    /// Upgrade progress from the AP: downloading, writing, or an error.
-    fn upgrade_notice(&self, live: &mut Live, ts: Ts, mac: Mac, n: &Value) {
+    /// Upgrade progress from the AP: downloading, writing, or an error; and
+    /// its event, for the caller to emit once the lock is released.
+    fn upgrade_notice(live: &mut Live, ts: Ts, mac: Mac, n: &Value) -> Option<Event> {
         let s = |k: &str| n[k].as_str().unwrap_or_default().to_string();
         match (n["up_type"].as_str(), n["up_stage"].as_str()) {
             (Some("UpgradeReady"), stage) => {
@@ -1286,7 +1320,7 @@ impl Engine {
                     // Re-arm the deadline as the official controller does on each step.
                     j.expires = Some(ts + 450);
                 }
-                self.emit(Event::device(ts, EventKind::ApUpgradeProgress, mac, json!({ "step": step })));
+                Some(Event::device(ts, EventKind::ApUpgradeProgress, mac, json!({ "step": step })))
             }
             (Some("UpgradeError"), _) => {
                 let reason = s("reason");
@@ -1297,21 +1331,26 @@ impl Engine {
                     r => format!("failed ({r})"),
                 };
                 live.firmware.failed(&mac, &detail);
-                self.emit(Event::device(ts, EventKind::ApUpgradeFailed, mac, json!({ "reason": reason, "detail": detail })));
+                Some(Event::device(ts, EventKind::ApUpgradeFailed, mac, json!({ "reason": reason, "detail": detail })))
             }
-            _ => {}
+            _ => None,
         }
     }
 
     /// Another AP's beacon flagged "isolated" (lost its uplink) that belongs to one
     /// of our APs: reported at most once an hour per AP.
-    fn check_isolated(&mut self, ts: Ts, s: &Snapshot) {
+    fn check_isolated(&mut self, ts: Ts, heard_by: Mac, neighbors: &[crate::model::NeighborSample]) {
         use crate::model::{hardware_num, same_hardware};
-        let flagged: Vec<&crate::model::NeighborSample> = s.neighbors.iter().filter(|n| n.is_isolated).collect();
+        let flagged: Vec<&crate::model::NeighborSample> = neighbors.iter().filter(|n| n.is_isolated).collect();
         if flagged.is_empty() {
             return;
         }
-        let ours: Vec<(Mac, u64)> = self.live.read().unwrap().devices.keys().map(|m| (*m, hardware_num(m))).collect();
+        // The APs reporting in this run, and those known from earlier ones that have not
+        // reported yet: after a restart, the isolated AP may be unable to (the two are apart).
+        let ours: Vec<(Mac, u64)> = {
+            let live = self.live.read().unwrap();
+            live.devices.keys().chain(live.known_devices.keys()).map(|m| (*m, hardware_num(m))).collect()
+        };
         for n in flagged {
             let Ok(b) = n.bssid.parse::<Mac>().map(|m| hardware_num(&m)) else { continue };
             // The nearest of our APs that is likely the same hardware.
@@ -1320,7 +1359,7 @@ impl Engine {
                 continue;
             }
             self.isolated.insert(*ap, ts);
-            let data = json!({ "heard_by": s.ap.mac.to_string(), "bssid": n.bssid, "signal": n.signal });
+            let data = json!({ "heard_by": heard_by.to_string(), "bssid": n.bssid, "signal": n.signal });
             self.emit(Event::device(ts, EventKind::ApIsolated, *ap, data));
         }
     }
@@ -1357,7 +1396,10 @@ impl Engine {
 
     /// Time-based transitions: APs going quiet and clients disappearing.
     fn tick(&mut self, now: Ts) {
-        self.mcast_prev.retain(|_, (ts, ..)| *ts > now - 3600);
+        // A previous multicast sample is only used up to MCAST_GAP old; the margin is for
+        // informs received before this tick and still queued behind it.
+        let stale = now - 2 * MCAST_GAP;
+        self.mcast_prev.retain(|_, (ts, ..)| *ts > stale);
         self.syslog_unknown.retain(|_, at| (*at..*at + SYSLOG_RETRY_SECS).contains(&now));
         for (device_mac, (_, later)) in &mut self.logs_announced {
             if std::mem::take(later) {
@@ -1365,19 +1407,19 @@ impl Engine {
             }
         }
         self.logs_announced.retain(|_, (at, _)| now - *at < 60);
-        self.bss_prev.retain(|_, (ts, _)| *ts > now - 3600);
+        self.bss_prev.retain(|_, (ts, _)| *ts > stale);
         for e in self.logevents.tick(now) {
             self.emit(e);
         }
         let mut live = self.live.write().unwrap();
+        let mut events = Vec::new();
         const TIMED_OUT: &str = "it did not come back with the new firmware in time";
         if let Some(mac) = live.firmware.expired(now)
             && let Some(j) = live.firmware.failed(&mac, TIMED_OUT)
         {
             let data = json!({ "reason": "timed out", "detail": TIMED_OUT, "target": j.target });
-            self.emit(Event::device(now, EventKind::ApUpgradeFailed, mac, data));
+            events.push(Event::device(now, EventKind::ApUpgradeFailed, mac, data));
         }
-        let mut events = Vec::new();
         let mut offline = Vec::new();
         for (mac, d) in live.devices.iter_mut() {
             let limit = (d.interval.max(5) * OFFLINE_INTERVALS).max(60);
@@ -1410,9 +1452,6 @@ impl Engine {
             events.push(disconnect(&self.writer, now, *cmac, c, reason));
             false
         });
-        for e in events {
-            self.emit(e);
-        }
         // Clients gone longer than the database keeps them (see `store::maintenance`).
         if now - self.last_prune >= 3600 {
             self.last_prune = now;
@@ -1424,6 +1463,9 @@ impl Engine {
             self.written.clients.retain(|mac, _| clients.contains_key(mac));
         }
         drop(live);
+        for e in events {
+            self.emit(e);
+        }
         for mac in offline {
             let _ = self.tx.send(LiveMsg::Device { mac });
         }
@@ -1458,7 +1500,8 @@ impl Engine {
         );
     }
 
-    fn write_metrics(&mut self, s: &Snapshot) {
+    /// The inform's metrics, and its scan results (see `Written`).
+    fn write_metrics(&mut self, s: &Snapshot, neighbors: Vec<crate::model::NeighborSample>, spectrum: Vec<crate::model::SpectrumSample>) {
         let ts = s.ap.ts;
         let mac = || Sql::Text(s.ap.mac.to_string());
         let a = &s.ap;
@@ -1503,10 +1546,8 @@ impl Engine {
         // neighbour is written once a minute (last_seen), an unchanged spectrum
         // row once an hour. What the AP no longer reports is forgotten here.
         let rows = self.written.neighbors.entry(s.ap.mac).or_default();
-        for n in &s.neighbors {
-            if !report(rows, n.bssid.as_str(), n, ts, REFRESH_SECS) {
-                continue;
-            }
+        for n in neighbors {
+            let Some(n) = report(rows, n, |n| n.bssid.as_str(), ts, REFRESH_SECS) else { continue };
             self.writer.exec(
                 Db::Config,
                 "INSERT INTO neighbors (bssid, ap_mac, radio, essid, channel, bw, center_freq, security, signal, best_signal, noise, is_unifi, ap_name, model, first_seen, last_seen)
@@ -1524,15 +1565,13 @@ impl Engine {
         }
         rows.retain(|_, r| r.seen == ts);
         let radios = self.written.spectrum.entry(s.ap.mac).or_default();
-        for c in &s.spectrum {
+        for c in spectrum {
             // Looked up by reference: the radio's name is copied only for a new one.
             if !radios.contains_key(c.radio.as_str()) {
                 radios.insert(c.radio.clone(), Rows::new());
             }
             let rows = radios.get_mut(c.radio.as_str()).expect("inserted above");
-            if !report(rows, &c.channel, c, ts, SPECTRUM_REFRESH_SECS) {
-                continue;
-            }
+            let Some(c) = report(rows, c, |c| &c.channel, ts, SPECTRUM_REFRESH_SECS) else { continue };
             self.writer.exec(
                 Db::Config,
                 "INSERT OR REPLACE INTO spectrum (ap_mac, radio, channel, width, utilization, interference, other_bss_count, ts) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
@@ -2154,6 +2193,11 @@ mod tests {
             .read(Db::Metrics, |c| Ok(c.query_row("SELECT tx_pps, rx_pps, rx_bytes_ps, clients FROM mcast_stats WHERE ts = 10 AND type = 'mdns'", [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?))
             .unwrap();
         assert_eq!(row, (10.0, 5.0, 500.0, 1.0));
+        // The previous samples are kept only as long as they can give a rate.
+        h.engine.handle(Input::Tick(10 + MCAST_GAP));
+        assert_eq!((h.engine.mcast_prev.len(), h.engine.bss_prev.len()), (2, 1));
+        h.engine.handle(Input::Tick(10 + 2 * MCAST_GAP));
+        assert!(h.engine.mcast_prev.is_empty() && h.engine.bss_prev.is_empty());
     }
 
     #[test]
@@ -2164,6 +2208,22 @@ mod tests {
         h.engine.handle(Input::Inform { ts: 1, peer: "x".into(), decoded: decoded(inform(b, 1000, &[])) });
         // A heard B's BSSID flagged isolated; A's own MAC is within 16 of it too.
         let mut p = inform(a, 1002, &[]);
+        p["radio_table"] = json!([{ "radio": "na", "scan_table": [{ "bssid": "02:00:00:00:00:1a", "is_isolated": true, "signal": -70 }] }]);
+        h.engine.handle(Input::Inform { ts: 2, peer: "x".into(), decoded: decoded(p) });
+        let blamed: Vec<_> = std::iter::from_fn(|| h.rx.try_recv().ok())
+            .filter_map(|m| match m { LiveMsg::Event(e) if e.kind == EventKind::ApIsolated => Some(e.device_mac), _ => None })
+            .collect();
+        assert_eq!(blamed, [b.parse().ok()]);
+    }
+
+    #[test]
+    fn an_isolated_beacon_is_blamed_on_an_ap_known_from_an_earlier_run() {
+        let mut h = harness();
+        let (a, b) = ("02:00:00:00:00:10", "02:00:00:00:00:18");
+        // B is only in the database: it lost its uplink before apctl restarted.
+        let known = KnownDevice { first_seen: 0, last_seen: 0, uptime: None, version: None, hostname: None, model: None, model_display: None, ip: None, serial: None };
+        h.engine.live.write().unwrap().known_devices.insert(b.parse().unwrap(), known);
+        let mut p = inform(a, 1000, &[]);
         p["radio_table"] = json!([{ "radio": "na", "scan_table": [{ "bssid": "02:00:00:00:00:1a", "is_isolated": true, "signal": -70 }] }]);
         h.engine.handle(Input::Inform { ts: 2, peer: "x".into(), decoded: decoded(p) });
         let blamed: Vec<_> = std::iter::from_fn(|| h.rx.try_recv().ok())

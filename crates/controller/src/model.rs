@@ -344,6 +344,8 @@ pub struct Snapshot {
     /// the clients beside it, and the RF pages have routes of their own.
     #[serde(skip_serializing)]
     pub clients: Vec<Arc<ClientSample>>,
+    /// Scan results; the engine stores them and takes them out of the
+    /// snapshot it keeps (so empty in the live view), as does `spectrum`.
     #[serde(skip_serializing)]
     pub neighbors: Vec<NeighborSample>,
     /// Only channels with survey samples (empty until a spectrum scan runs).

@@ -28,16 +28,27 @@ pub struct RangeQuery {
     pub mac: Option<String>,
 }
 
+/// The longest window a request can ask for.
+const MAX_WINDOW: Ts = 400 * 86400;
+
 /// The requested window, at least ten minutes and at most 400 days long,
 /// ending no later than now (`to`, default now; from `from`, or `range`
 /// seconds back from its end); and the storage tier to read it from.
 pub fn window(q: &RangeQuery) -> (Ts, Ts, usize) {
     let now = clock::now_ts();
     let to = q.to.unwrap_or(now).clamp(0, now);
-    let from = match q.from {
-        Some(from) => from.clamp(to.saturating_sub(400 * 86400), to.saturating_sub(600)),
-        None => to.saturating_sub(q.range.unwrap_or(86400).clamp(600, 400 * 86400)),
-    };
+    let from = q.from.map(|f| f.min(to.saturating_sub(600)));
+    bounded(from, Some(to), q.range.unwrap_or(86400).clamp(600, MAX_WINDOW))
+}
+
+/// A window ending no later than now (`to`, default now) and starting at
+/// most 400 days before its end (`from`, default `range` seconds back from
+/// it); and the storage tier to read it from. A `from` after `to` is kept:
+/// the window is empty.
+pub(crate) fn bounded(from: Option<Ts>, to: Option<Ts>, range: Ts) -> (Ts, Ts, usize) {
+    let now = clock::now_ts();
+    let to = to.unwrap_or(now).clamp(0, now);
+    let from = from.unwrap_or(to.saturating_sub(range)).max(to.saturating_sub(MAX_WINDOW));
     (from, to, store::tier_for(from, to, now))
 }
 
@@ -59,11 +70,9 @@ pub(crate) struct Delta<'a> {
 }
 
 impl Delta<'_> {
-    /// How much a counter went up over the interval. A counter that went down
-    /// (restarted) counts nothing, as in the official controller, which takes
-    /// the new value as its next baseline.
+    /// How much a counter went up over the interval (see [`increase`]).
     pub fn inc(&self, col: usize) -> Option<f64> {
-        self.cur[col].zip(self.prev[col]).map(|(c, p)| (c - p).max(0.0))
+        self.cur[col].zip(self.prev[col]).map(|(c, p)| increase(p, c))
     }
 
     /// The same per second.
@@ -72,12 +81,27 @@ impl Delta<'_> {
     }
 }
 
+/// How much a counter went up from `prev` to `cur`. A counter that went down
+/// (restarted) counts nothing, as in the official controller, which takes the
+/// new value as its next baseline.
+pub(crate) fn increase(prev: f64, cur: f64) -> f64 {
+    (cur - prev).max(0.0)
+}
+
+/// The seconds between two consecutive samples of a counter taken at `pt` and
+/// `t`, if its increase is counted over them: not across a gap of over two
+/// hours (apctl or the AP was down, and when the traffic went is unknown).
+pub(crate) fn interval(pt: Ts, t: Ts) -> Option<f64> {
+    (t > pt && t - pt <= 2 * 3600).then(|| (t - pt) as f64)
+}
+
 /// The intervals between consecutive samples that end in the window (at or
-/// after `from`); none across a gap of over two hours.
+/// after `from`); none across a gap (see [`interval`]).
 pub(crate) fn deltas(samples: &Samples, from: Ts) -> impl Iterator<Item = Delta<'_>> {
     samples.ts.windows(2).enumerate().filter_map(move |(i, w)| {
         let (pt, t) = (w[0], w[1]);
-        (t >= from && t > pt && t - pt <= 2 * 3600).then(|| Delta { ts: t, dt: (t - pt) as f64, prev: samples.row(i), cur: samples.row(i + 1) })
+        let dt = interval(pt, t).filter(|_| t >= from)?;
+        Some(Delta { ts: t, dt, prev: samples.row(i), cur: samples.row(i + 1) })
     })
 }
 
@@ -338,6 +362,13 @@ mod tests {
         assert_eq!((f, t), (-400 * 86400, 0));
         let (f, t, _) = window(&q(Some(i64::MAX), Some(i64::MAX), Some(i64::MAX)));
         assert!(t <= clock::now_ts() && t - f == 600);
+        // The series route's windows have no shortest length, and one that starts after it ends is empty.
+        let (f, t, tier) = bounded(Some(now - 5), Some(now + 999), 3600);
+        assert!(f == now - 5 && t >= now && t <= clock::now_ts() && tier == 0);
+        let (f, t, _) = bounded(None, Some(now - 60), 3600);
+        assert_eq!((f, t), (now - 3660, now - 60));
+        assert_eq!(bounded(Some(now - 9), Some(now - 10), 3600).0, now - 9);
+        assert_eq!(bounded(Some(i64::MIN), Some(0), 3600), (-400 * 86400, 0, 2));
         // A week ago reads the five-minute tier; a day 60 days back reads hourly.
         assert_eq!(window(&q(None, Some(now - 7 * 86400), Some(now - 6 * 86400))).2, 1);
         assert_eq!(window(&q(None, Some(now - 60 * 86400), Some(now - 59 * 86400))).2, 2);
