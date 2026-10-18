@@ -823,9 +823,14 @@ impl Engine {
             labels.extend(section_labels(&system, &radios));
             data.insert("labels".into(), Value::Object(labels));
         }
-        let cfgversion = p["cfgversion"].as_str().map(str::to_string).or_else(|| {
-            p["mgmt_cfg"].as_str().and_then(|m| m.lines().find_map(|l| l.strip_prefix("cfgversion=")).map(str::to_string))
-        });
+        // Without one in the push: the one its mgmt_cfg carries (this push's, else
+        // the last one's), else the last push's, as the stored copy keeps it
+        // (COALESCE below). A restart, reading the stored copy, sees the same.
+        let cfgversion = p["cfgversion"]
+            .as_str()
+            .map(str::to_string)
+            .or_else(|| mgmt.lines().find_map(|l| l.strip_prefix("cfgversion=")).map(str::to_string))
+            .or_else(|| previous.cfgversion.clone());
         self.writer.exec(
             Db::Config,
             "INSERT INTO device_config (mac, ts, cfgversion, mgmt_cfg, system_cfg) VALUES (?1, ?2, ?3, ?4, ?5)
@@ -2328,5 +2333,14 @@ mod tests {
         let diff = pushes[1]["system_cfg"]["diff"].as_str().unwrap();
         assert!(diff.contains("~ aaa.1.hide_ssid: false -> true"), "{diff}");
         assert!(diff.contains("aaa.1.wpa.psk: <redacted> -> <redacted>") && !diff.contains("new"), "{diff}");
+
+        // A push without a cfgversion keeps the last one, in memory as in the database.
+        let push = json!({ "_type": "setparam", "mgmt_cfg": "cfgversion=v1\na=1", "system_cfg": "x=1" });
+        h.engine.handle(Input::Reply { ts: 230, mac, decoded: decoded(push) });
+        h.engine.handle(Input::Reply { ts: 240, mac, decoded: decoded(json!({ "_type": "setparam", "system_cfg": "x=2" })) });
+        assert_eq!(h.live.read().unwrap().last_config[&mac].cfgversion.as_deref(), Some("v1"));
+        assert!(h.writer.flush(std::time::Duration::from_secs(5)));
+        let stored: String = h.store.read(Db::Config, |c| Ok(c.query_row("SELECT cfgversion FROM device_config", [], |r| r.get(0))?)).unwrap();
+        assert_eq!(stored, "v1");
     }
 }
