@@ -723,7 +723,7 @@ pub fn series(conn: &Connection, table: &Table, keys: &[String], from: Ts, to: T
     let mut columns: Vec<Vec<Option<f64>>> = vec![Vec::new(); fields.len()];
     // This row's values and the previous row's (for the rates), reused for every row.
     let (mut vals, mut prev): (Vec<Option<f64>>, Vec<Option<f64>>) = (vec![None; fields.len()], vec![None; fields.len()]);
-    let mut prev_ts = None;
+    let mut prev_ts: Option<Ts> = None;
     while let Some(r) = rows.next()? {
         let ts: Ts = r.get(0)?;
         for (j, v) in vals.iter_mut().enumerate() {
@@ -736,12 +736,10 @@ pub fn series(conn: &Connection, table: &Table, keys: &[String], from: Ts, to: T
                 let v = if j < n_gauges {
                     vals[j]
                 } else {
-                    // Rate from the previous row; a smaller value means the counter reset.
-                    prev_ts.and_then(|pts: Ts| {
-                        let (cur, last) = (vals[j]?, prev[j]?);
-                        let dt = (ts - pts) as f64;
-                        (dt > 0.0).then(|| if cur >= last { (cur - last) / dt } else { cur / dt })
-                    })
+                    // Rate from the previous row, by the views' rules: nothing for a
+                    // counter that went down, and no rate across a gap.
+                    let dt = prev_ts.and_then(|pts| crate::series::interval(pts, ts));
+                    dt.and_then(|dt| Some(crate::series::increase(prev[j]?, vals[j]?) / dt))
                 };
                 column.push(v);
             }
@@ -803,7 +801,7 @@ mod tests {
         let rx = &s.fields["rx_bytes"];
         assert_eq!(rx[0], None, "no previous sample for the first point");
         assert_eq!(rx[1], Some(1000.0));
-        assert_eq!(rx[31], Some(1000.0), "after the reset");
+        assert_eq!((rx[30], rx[31]), (Some(0.0), Some(1000.0)), "nothing for the reset, then on from the new value");
         assert_eq!(s.fields["speed"][5], Some(1000.0));
 
         // A second series without resets: 20 minutes at 1000 B/s, for the roll-up.
@@ -831,6 +829,28 @@ mod tests {
         maintenance(&mut conns, now + ROLLUP_GRACE_SECS, false);
         let m = &conns[Db::Metrics as usize];
         assert_eq!(series(m, &UPLINK, &["bb".into()], now - 3600, now, 1).unwrap().ts.len(), 4);
+    }
+
+    #[test]
+    fn no_rate_is_given_across_a_gap() {
+        let dir = temp_dir("gap");
+        std::fs::create_dir_all(&dir).unwrap();
+        migrate(&dir).unwrap();
+        let mut conns = open_all(&dir).unwrap();
+        let now = 1_800_000_000;
+        // The sample before the window is three hours older than the first in it.
+        let writes = [(now - 600 - 3 * 3600, 0.0), (now - 500, 1_000_000.0), (now - 490, 1_010_000.0)]
+            .into_iter()
+            .map(|(ts, bytes)| {
+                let mut values = vec![Value::Text("aa".into()), Value::Real(1000.0), Value::Real(bytes)];
+                values.extend(std::iter::repeat_n(Value::Null, UPLINK.counters.len() - 1));
+                Write::Metric { table: &UPLINK, ts, values }
+            })
+            .collect();
+        assert_eq!(apply(&mut conns[Db::Metrics as usize], writes).unwrap(), 0);
+        let s = series(&conns[Db::Metrics as usize], &UPLINK, &["aa".into()], now - 600, now, 0).unwrap();
+        assert_eq!(s.ts, vec![now - 500, now - 490]);
+        assert_eq!(s.fields["rx_bytes"], vec![None, Some(1000.0)]);
     }
 
     #[test]

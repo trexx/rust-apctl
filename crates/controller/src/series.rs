@@ -59,11 +59,9 @@ pub(crate) struct Delta<'a> {
 }
 
 impl Delta<'_> {
-    /// How much a counter went up over the interval. A counter that went down
-    /// (restarted) counts nothing, as in the official controller, which takes
-    /// the new value as its next baseline.
+    /// How much a counter went up over the interval (see [`increase`]).
     pub fn inc(&self, col: usize) -> Option<f64> {
-        self.cur[col].zip(self.prev[col]).map(|(c, p)| (c - p).max(0.0))
+        self.cur[col].zip(self.prev[col]).map(|(c, p)| increase(p, c))
     }
 
     /// The same per second.
@@ -72,12 +70,27 @@ impl Delta<'_> {
     }
 }
 
+/// How much a counter went up from `prev` to `cur`. A counter that went down
+/// (restarted) counts nothing, as in the official controller, which takes the
+/// new value as its next baseline.
+pub(crate) fn increase(prev: f64, cur: f64) -> f64 {
+    (cur - prev).max(0.0)
+}
+
+/// The seconds between two consecutive samples of a counter taken at `pt` and
+/// `t`, if its increase is counted over them: not across a gap of over two
+/// hours (apctl or the AP was down, and when the traffic went is unknown).
+pub(crate) fn interval(pt: Ts, t: Ts) -> Option<f64> {
+    (t > pt && t - pt <= 2 * 3600).then(|| (t - pt) as f64)
+}
+
 /// The intervals between consecutive samples that end in the window (at or
-/// after `from`); none across a gap of over two hours.
+/// after `from`); none across a gap (see [`interval`]).
 pub(crate) fn deltas(samples: &Samples, from: Ts) -> impl Iterator<Item = Delta<'_>> {
     samples.ts.windows(2).enumerate().filter_map(move |(i, w)| {
         let (pt, t) = (w[0], w[1]);
-        (t >= from && t > pt && t - pt <= 2 * 3600).then(|| Delta { ts: t, dt: (t - pt) as f64, prev: samples.row(i), cur: samples.row(i + 1) })
+        let dt = interval(pt, t).filter(|_| t >= from)?;
+        Some(Delta { ts: t, dt, prev: samples.row(i), cur: samples.row(i + 1) })
     })
 }
 
