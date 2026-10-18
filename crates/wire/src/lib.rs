@@ -23,9 +23,17 @@ pub fn civil_from_days(days: i64) -> (i64, i64, i64) {
     (yoe + era * 400 + i64::from(m <= 2), m, d)
 }
 
+/// Civil UTC time `(year, month, day, hour, minute, second)` of seconds since
+/// 1970-01-01, as [`civil_from_days`] counts days.
+pub fn civil_from_secs(ts: i64) -> (i64, i64, i64, i64, i64, i64) {
+    let (y, m, d) = civil_from_days(ts.div_euclid(86_400));
+    let secs = ts.rem_euclid(86_400);
+    (y, m, d, secs / 3600, secs / 60 % 60, secs % 60)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::civil_from_days;
+    use super::{civil_from_days, civil_from_secs};
 
     #[test]
     fn civil_dates() {
@@ -34,5 +42,13 @@ mod tests {
         assert_eq!(civil_from_days(11_016), (2000, 2, 29));
         assert_eq!(civil_from_days(20_738), (2026, 10, 12));
         assert_eq!(civil_from_days(-719_468), (0, 3, 1));
+    }
+
+    #[test]
+    fn civil_times() {
+        assert_eq!(civil_from_secs(0), (1970, 1, 1, 0, 0, 0));
+        assert_eq!(civil_from_secs(-1), (1969, 12, 31, 23, 59, 59));
+        assert_eq!(civil_from_secs(951_782_400 + 86_399), (2000, 2, 29, 23, 59, 59));
+        assert_eq!(civil_from_secs(1_791_801_045), (2026, 10, 12, 10, 30, 45));
     }
 }

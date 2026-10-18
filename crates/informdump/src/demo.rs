@@ -791,9 +791,8 @@ fn write_syslog<W: Write>(pcap: &mut PcapWriter<W>, ids: &ApIds, ts: i64, ap: us
 /// `Mon dd hh:mm:ss` in UTC, as BSD syslog writes it.
 fn chrono_like(ts: i64) -> String {
     const MONTHS: [&str; 12] = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
-    let secs = ts.rem_euclid(86_400);
-    let (_, m, d) = wire::civil_from_days(ts.div_euclid(86_400));
-    format!("{} {d:>2} {:02}:{:02}:{:02}", MONTHS[(m - 1) as usize], secs / 3600, secs / 60 % 60, secs % 60)
+    let (_, m, d, h, mi, s) = wire::civil_from_secs(ts);
+    format!("{} {d:>2} {h:02}:{mi:02}:{s:02}", MONTHS[(m - 1) as usize])
 }
 
 #[cfg(test)]

@@ -446,9 +446,8 @@ fn trim_history(dir: &Path, t: Ts) -> Result<()> {
 
 /// `YYYYMMDD-HHMMSS` in UTC.
 fn stamp(ts: Ts) -> String {
-    let (y, m, d) = crate::clock::civil_from_days(ts.div_euclid(86400));
-    let secs = ts.rem_euclid(86400);
-    format!("{y:04}{m:02}{d:02}-{:02}{:02}{:02}", secs / 3600, (secs % 3600) / 60, secs % 60)
+    let (y, m, d, h, mi, s) = wire::civil_from_secs(ts);
+    format!("{y:04}{m:02}{d:02}-{h:02}{mi:02}{s:02}")
 }
 
 /// One backup is written at a time (an automatic one may coincide with one

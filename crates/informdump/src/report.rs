@@ -283,16 +283,9 @@ fn pretty(v: &Value) -> String {
 
 /// Formats microseconds since the epoch as an RFC 3339 UTC timestamp with milliseconds.
 pub fn format_ts(ts: Micros) -> String {
-    let secs = ts.div_euclid(1_000_000);
     let millis = ts.rem_euclid(1_000_000) / 1000;
-    let sod = secs.rem_euclid(86_400);
-    let (year, month, day) = wire::civil_from_days(secs.div_euclid(86_400));
-    format!(
-        "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}.{millis:03}Z",
-        sod / 3600,
-        sod % 3600 / 60,
-        sod % 60
-    )
+    let (year, month, day, h, mi, s) = wire::civil_from_secs(ts.div_euclid(1_000_000));
+    format!("{year:04}-{month:02}-{day:02}T{h:02}:{mi:02}:{s:02}.{millis:03}Z")
 }
 
 #[cfg(test)]
@@ -337,5 +330,6 @@ mod tests {
     fn formats_timestamps() {
         assert_eq!(format_ts(0), "1970-01-01T00:00:00.000Z");
         assert_eq!(format_ts(1_791_840_601_123_456), "2026-10-12T21:30:01.123Z");
+        assert_eq!(format_ts(-1), "1969-12-31T23:59:59.999Z");
     }
 }
