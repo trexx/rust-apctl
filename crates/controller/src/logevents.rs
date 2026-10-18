@@ -19,7 +19,7 @@ use std::collections::HashMap;
 use inform::Mac;
 use serde_json::{Value, json};
 
-use crate::engine::{EventKind, LogLine};
+use crate::engine::{Event, EventKind, LogLine};
 use crate::model::Ts;
 
 /// Noise floor that `stamgr`'s relative RSSI is measured against.
@@ -39,14 +39,15 @@ const CRASH_BYTES: usize = 64 * 1024;
 const MAX_TRACKED: usize = 10_000;
 /// At most this many candidate APs kept per steering request.
 const MAX_TARGETS: usize = 16;
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct Found {
-    pub kind: EventKind,
-    pub device: Option<Mac>,
-    pub client: Option<Mac>,
-    pub data: Value,
-}
+/// The longest a line's event is held back for repeating it (see
+/// [`LogEvents::fresh`]), and so how long a report is remembered.
+const MAX_REPEAT: Ts = 600;
+/// How long after a steering request the client's answer is paired with it,
+/// and so how long a request is kept.
+const STEER_ANSWER: Ts = 30;
+/// A client's unchanged experience problems are reported again after this
+/// long, and forgotten then.
+const ANOMALIES_AGAIN: Ts = 1800;
 
 #[derive(Default)]
 struct Steering {
@@ -188,6 +189,7 @@ impl LogEvents {
     /// Past [`MAX_TRACKED`] new subjects are not reported (a flood of made-up
     /// clients must not become a flood of events).
     fn fresh(&mut self, kind: EventKind, client: Mac, detail: i64, ts: Ts, secs: Ts) -> bool {
+        debug_assert!(secs <= MAX_REPEAT, "reports are forgotten after MAX_REPEAT");
         match self.recent.get_mut(&(kind, client, detail)) {
             Some(t) if (0..secs).contains(&(ts - *t)) => false,
             Some(t) => {
@@ -198,7 +200,7 @@ impl LogEvents {
         }
     }
 
-    pub fn feed(&mut self, line: &LogLine) -> Vec<Found> {
+    pub fn feed(&mut self, line: &LogLine) -> Vec<Event> {
         let mut out = Vec::new();
         let msg = line.msg.as_str();
         let prog = line.program.as_deref().unwrap_or("");
@@ -230,15 +232,16 @@ impl LogEvents {
             if let Some(c) = client
                 && self.fresh(EventKind::ClientKicked, c, 0, line.ts, 60)
             {
-                out.push(Found { kind: EventKind::ClientKicked, device: line.device_mac, client: Some(c), data: json!({ "reason": reason, "signal": signal, "vap": vap }) });
+                out.push(Event { ts: line.ts, kind: EventKind::ClientKicked, device_mac: line.device_mac, client_mac: Some(c), data: json!({ "reason": reason, "signal": signal, "vap": vap }) });
             }
             return out;
         }
 
         if msg.contains("BTM:") {
-            let vap = msg.split("vap-").nth(1).and_then(|r| r.split_once('(')).and_then(|(_, r)| r.split_once(')')).map(|(v, _)| v.to_string());
             if let Some(c) = msg.split("BTM: STA ").nth(1).and_then(|r| r.split_whitespace().next()).and_then(mac) {
-                // A request: the client's signal and how many APs were offered.
+                // A request: the client's signal and how many APs were offered,
+                // and the VAP it was made on.
+                let vap = msg.split("vap-").nth(1).and_then(|r| r.split_once('(')).and_then(|(_, r)| r.split_once(')')).map(|(v, _)| v.to_string());
                 let s = Steering {
                     ts: line.ts,
                     rssi: field(msg, "RSSI: ").and_then(|v| v.parse().ok()),
@@ -264,13 +267,14 @@ impl LogEvents {
                 let client = r.split(']').next().and_then(mac);
                 let status = field(msg, "status ").and_then(|v| v.parse::<i64>().ok());
                 if let (Some(c), Some(st)) = (client, status) {
-                    let req = self.steering.remove(&c).filter(|s| (0..=30).contains(&(line.ts - s.ts))).unwrap_or_default();
+                    let req = self.steering.remove(&c).filter(|s| (0..=STEER_ANSWER).contains(&(line.ts - s.ts))).unwrap_or_default();
                     let to = field(msg, "bssid ").filter(|b| *b != "n/a").map(str::to_string);
                     if self.fresh(EventKind::ClientSteered, c, st, line.ts, 600) {
-                        out.push(Found {
+                        out.push(Event {
+                            ts: line.ts,
                             kind: EventKind::ClientSteered,
-                            device: line.device_mac,
-                            client: Some(c),
+                            device_mac: line.device_mac,
+                            client_mac: Some(c),
                             data: json!({
                                 "status": st, "result": btm_status(st), "accepted": st == 0, "to_bssid": to,
                                 "signal": req.rssi, "candidates": req.targets, "offered": req.candidates, "vap": req.vap,
@@ -288,7 +292,7 @@ impl LogEvents {
         {
             let vap = msg.split(':').next().filter(|v| v.starts_with("wifi")).map(str::to_string);
             if self.fresh(EventKind::ClientWrongPassword, c, 0, line.ts, 600) {
-                out.push(Found { kind: EventKind::ClientWrongPassword, device: line.device_mac, client: Some(c), data: json!({ "vap": vap }) });
+                out.push(Event { ts: line.ts, kind: EventKind::ClientWrongPassword, device_mac: line.device_mac, client_mac: Some(c), data: json!({ "vap": vap }) });
             }
             return out;
         }
@@ -300,12 +304,13 @@ impl LogEvents {
             if let Some(c) = client
                 && !reasons.is_empty()
             {
-                let changed = self.anomalies.get(&c).is_none_or(|(r, t)| *r != reasons || !(0..1800).contains(&(line.ts - t)));
+                let changed = self.anomalies.get(&c).is_none_or(|(r, t)| *r != reasons || !(0..ANOMALIES_AGAIN).contains(&(line.ts - t)));
                 if changed && bounded(&mut self.anomalies, c, (reasons.clone(), line.ts)) {
-                    out.push(Found {
+                    out.push(Event {
+                        ts: line.ts,
                         kind: EventKind::ClientExperience,
-                        device: line.device_mac,
-                        client: Some(c),
+                        device_mac: line.device_mac,
+                        client_mac: Some(c),
                         data: json!({
                             "anomalies": reasons.split(',').map(str::trim).filter(|x| !x.is_empty()).collect::<Vec<_>>(),
                             "satisfaction": field(msg, "satisfaction_now=").and_then(|v| v.parse::<i64>().ok()),
@@ -321,7 +326,7 @@ impl LogEvents {
     /// Crash capture: everything the AP says for a while after a fault, while
     /// its other events are still reported; a panic is reported at once.
     /// Returns whether the line was a fault.
-    fn crash(&mut self, dev: Mac, line: &LogLine, out: &mut Vec<Found>) -> bool {
+    fn crash(&mut self, dev: Mac, line: &LogLine, out: &mut Vec<Event>) -> bool {
         let (msg, prog) = (line.msg.as_str(), line.program.as_deref());
         // Netconsole sends the kernel's lines with no priority.
         let kernel = prog == Some("kernel") || matches!(line.facility, Some(0) | None);
@@ -348,26 +353,28 @@ impl LogEvents {
         is_fault
     }
 
-    fn flush(&mut self, dev: Mac, now: Ts) -> Option<Found> {
+    fn flush(&mut self, dev: Mac, now: Ts) -> Option<Event> {
         let c = self.crashes.remove(&dev)?;
         self.crash_reported.insert(dev, now);
         let data = json!({ "kind": c.kind.as_str(), "process": c.process, "source": "syslog", "lines": c.lines });
-        Some(Found { kind: EventKind::ApCrash, device: Some(dev), client: None, data })
+        Some(Event::device(now, EventKind::ApCrash, dev, data))
     }
 
     /// Reports crash captures that have collected long enough.
-    pub fn tick(&mut self, now: Ts) -> Vec<Found> {
+    pub fn tick(&mut self, now: Ts) -> Vec<Event> {
         let due: Vec<Mac> = self.crashes.iter().filter(|(_, c)| !(0..CRASH_WINDOW).contains(&(now - c.started))).map(|(k, _)| *k).collect();
-        let mut out: Vec<Found> = due.into_iter().filter_map(|k| self.flush(k, now)).collect();
+        let mut out: Vec<Event> = due.into_iter().filter_map(|k| self.flush(k, now)).collect();
         self.crash_reported.retain(|_, t| (0..CRASH_COOLDOWN).contains(&(now - *t)));
-        // Forget old de-duplication and steering state.
-        self.recent.retain(|_, t| (0..3600).contains(&(now - *t)));
-        self.steering.retain(|_, s| (0..300).contains(&(now - s.ts)));
+        // Forget de-duplication and steering state once no window reads it: a
+        // flood of made-up clients that fills a map shuts real ones out of it
+        // only that long.
+        self.recent.retain(|_, t| (0..MAX_REPEAT).contains(&(now - *t)));
+        self.steering.retain(|_, s| (0..=STEER_ANSWER).contains(&(now - s.ts)));
         let steering = &self.steering;
         self.steering_by_device.retain(|_, c| steering.contains_key(c));
-        self.anomalies.retain(|_, (_, t)| (0..3 * 3600).contains(&(now - *t)));
+        self.anomalies.retain(|_, (_, t)| (0..ANOMALIES_AGAIN).contains(&(now - *t)));
         // Every one is a crash: in AP order rather than the map's.
-        out.sort_by_key(|f| f.device);
+        out.sort_by_key(|f| f.device_mac);
         out
     }
 }
@@ -395,7 +402,7 @@ mod tests {
         let f = l.feed(&line(100, "stamgr", "kick-sta-on 6c:ac:c2:00:00:01 wifi1ap1 (reason:Low RSSI rssi:19)"));
         assert_eq!(f.len(), 1);
         assert_eq!(f[0].kind, EventKind::ClientKicked);
-        assert_eq!(f[0].client, "6c:ac:c2:00:00:01".parse().ok());
+        assert_eq!(f[0].client_mac, "6c:ac:c2:00:00:01".parse().ok());
         assert_eq!(f[0].data["reason"], "Low RSSI");
         assert_eq!(f[0].data["signal"], -76);
         // The same kick logged again moments later is one event.
@@ -518,7 +525,7 @@ mod tests {
         assert!(l.feed(&netconsole(0, "[ 1234.567890] Internal error: Oops: 17 [#1] SMP ARM")).is_empty());
         assert!(l.feed(&netconsole(0, "[ 1234.567900] CPU: 1 PID: 0 Comm: swapper/1 Not tainted")).is_empty());
         let f = l.feed(&netconsole(1, "[ 1234.568000] Kernel panic - not syncing: Fatal exception in interrupt"));
-        assert_eq!((f.len(), f[0].data["kind"].as_str(), f[0].device), (1, Some("kernel panic"), AP.parse().ok()));
+        assert_eq!((f.len(), f[0].data["kind"].as_str(), f[0].device_mac), (1, Some("kernel panic"), AP.parse().ok()));
         let lines: Vec<&str> = f[0].data["lines"].as_array().unwrap().iter().filter_map(Value::as_str).collect();
         assert_eq!(lines[0], "[ 1234.567890] Internal error: Oops: 17 [#1] SMP ARM");
         assert_eq!(lines[1], "[ 1234.567900] CPU: 1 PID: 0 Comm: swapper/1 Not tainted");
@@ -567,7 +574,7 @@ mod tests {
         assert_eq!(l.crashes.len(), MAX_CRASHES);
         let f = l.tick(1000);
         assert_eq!(f.len(), MAX_CRASHES);
-        assert!(f.windows(2).all(|w| w[0].device < w[1].device));
+        assert!(f.windows(2).all(|w| w[0].device_mac < w[1].device_mac));
     }
 
     #[test]
@@ -586,9 +593,16 @@ mod tests {
             l.feed(&line(1, "kernel", &format!("{p}BTM: [0]{{78:45:58:3c:51:ae ch44/op128/phy14}}")));
         }
         assert!(l.steering.values().all(|s| s.targets.len() <= MAX_TARGETS));
-        // Time clears them, and the device's pointer to its last request goes with it.
-        assert!(l.tick(4000).is_empty());
-        assert!(l.recent.is_empty() && l.steering.is_empty() && l.steering_by_device.is_empty());
+        // Time clears them once no window reads them, and the device's pointer
+        // to its last request goes with its request.
+        assert!(l.tick(1 + STEER_ANSWER).is_empty());
+        assert_eq!((l.recent.len(), l.steering.len()), (MAX_TRACKED, MAX_TRACKED), "both still read");
+        assert!(l.tick(2 + STEER_ANSWER).is_empty());
+        assert!(l.steering.is_empty() && l.steering_by_device.is_empty() && l.recent.len() == MAX_TRACKED);
+        assert!(l.tick(1 + MAX_REPEAT).is_empty());
+        assert!(l.recent.is_empty());
+        // So a client new after them is reported again.
+        assert_eq!(l.feed(&line(1 + MAX_REPEAT, "stamgr", &format!("kick-sta-on {} wifi1ap1 (reason:Low RSSI rssi:19)", client(MAX_TRACKED + 60)))).len(), 1);
     }
 
     #[test]

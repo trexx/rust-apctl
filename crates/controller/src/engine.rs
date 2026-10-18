@@ -1322,8 +1322,8 @@ impl Engine {
     }
 
     fn log(&mut self, line: LogLine) {
-        for f in self.logevents.feed(&line) {
-            self.emit(Event { ts: line.ts, kind: f.kind, device_mac: f.device, client_mac: f.client, data: f.data });
+        for e in self.logevents.feed(&line) {
+            self.emit(e);
         }
         bump(&self.counters.logs);
         self.writer.exec(
@@ -1362,8 +1362,8 @@ impl Engine {
         }
         self.logs_announced.retain(|_, (at, _)| now - *at < 60);
         self.bss_prev.retain(|_, (ts, _)| *ts > now - 3600);
-        for f in self.logevents.tick(now) {
-            self.emit(Event { ts: now, kind: f.kind, device_mac: f.device, client_mac: f.client, data: f.data });
+        for e in self.logevents.tick(now) {
+            self.emit(e);
         }
         let mut live = self.live.write().unwrap();
         const TIMED_OUT: &str = "it did not come back with the new firmware in time";
