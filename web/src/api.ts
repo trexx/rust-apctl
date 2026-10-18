@@ -1000,8 +1000,10 @@ export const useChannelPlan = (band: string, dfs: boolean) =>
 export const useStatus = (poll = false) =>
   useQuery({ queryKey: keys.status(), queryFn: getting<Status>("/api/status"), refetchInterval: poll ? 15_000 : false });
 
+const fetchDevices = getting<DeviceSummary[]>("/api/devices");
+
 /** Every AP with its latest report, refreshed by the live socket as they report: for the overview's cards. */
-export const useDevices = () => useQuery({ queryKey: keys.devices(), queryFn: getting<DeviceSummary[]>("/api/devices") });
+export const useDevices = () => useQuery({ queryKey: keys.devices(), queryFn: fetchDevices });
 
 export const useDevice = (mac: Mac) =>
   useQuery({ queryKey: keys.device(mac), queryFn: getting<DeviceDetail>(`/api/devices/${mac}`) });
@@ -1020,12 +1022,18 @@ const deviceNames = (devices: DeviceSummary[]): Names => Object.fromEntries(devi
  * from `useDevices`, which refetches as the APs report: the live socket refreshes the names when an AP is
  * adopted, forgotten or renamed (its new name comes with the config), and the slow poll catches the rest.
  */
-export const useDeviceNames = (): Names =>
-  useQuery({
-    queryKey: keys.deviceNames(),
-    queryFn: async ({ signal }) => deviceNames(await get<DeviceSummary[]>("/api/devices", signal)),
-    refetchInterval: 300_000,
-  }).data ?? NO_NAMES;
+export function useDeviceNames(): Names {
+  const qc = useQueryClient();
+  return (
+    useQuery({
+      queryKey: keys.deviceNames(),
+      // Through the devices query, so that a page showing both (the overview, at mount) makes one request; always
+      // a new one, unless that query's is under way, since a name may have changed since it was cached.
+      queryFn: async () => deviceNames(await qc.fetchQuery({ queryKey: keys.devices(), queryFn: fetchDevices, staleTime: 0 })),
+      refetchInterval: 300_000,
+    }).data ?? NO_NAMES
+  );
+}
 
 /**
  * Client display names by MAC, for the clients that have one; the same object until a name changes.

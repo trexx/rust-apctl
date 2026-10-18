@@ -192,7 +192,9 @@ function ClientList({ tabs }: { tabs: React.ReactNode }) {
           </thead>
           <tbody>
             {rows.map((c) => (
-              <ClientRow key={c.sample.mac} c={c} now={now} />
+              // Only a disconnected row shows how long ago it was seen, so a
+              // connected one needn't re-render as time passes.
+              <ClientRow key={c.sample.mac} c={c} now={c.connected ? 0 : now} />
             ))}
           </tbody>
         </table>
@@ -203,15 +205,15 @@ function ClientList({ tabs }: { tabs: React.ReactNode }) {
 
 /**
  * One client. A refetch keeps an unchanged client's object (React Query's
- * structural sharing), so only the changed rows re-render, and the rest once
- * a minute for their "last seen".
+ * structural sharing), so only the changed rows re-render, and the
+ * disconnected ones once a minute for their "last seen".
  */
 const ClientRow = memo(function ClientRow({
   c,
   now,
 }: {
   c: ClientView;
-  /** What "last seen" counts from (`useNow()`). */
+  /** What "last seen" counts from (`useNow()`); unused while connected. */
   now: number;
 }) {
   return (
