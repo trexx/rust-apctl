@@ -2208,9 +2208,11 @@ mod tests {
         edit(&mut s, json!({ "aps": null })).unwrap();
         assert_eq!(s["apgroup"].as_array().unwrap().iter().filter_map(oid).collect::<Vec<_>>(), ["g0", "g9"]);
         // A client's entry in another site is not this site's.
-        crate::actions::edit_client(&mut s, "aa:bb:cc:00:00:01".parse().unwrap(), &[("blocked", json!(false))]);
+        let c1: inform::Mac = "aa:bb:cc:00:00:01".parse().unwrap();
+        assert!(!crate::actions::controls(Some(&s), &c1).blocked);
+        crate::actions::edit_client(&mut s, c1, &[("usergroup_id", json!("u1"))]);
         assert_eq!((s["clients"][0]["blocked"].as_bool(), s["clients"][1]["site_id"].as_str()), (Some(true), Some("s1")));
-        assert!(!crate::actions::controls(Some(&s), &"aa:bb:cc:00:00:01".parse().unwrap()).blocked);
+        assert!(!crate::actions::controls(Some(&s), &c1).blocked);
     }
 
     #[test]
