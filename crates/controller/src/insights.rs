@@ -72,11 +72,6 @@ impl Delta<'_> {
     pub fn rate(&self, col: usize) -> Option<f64> {
         self.inc(col).map(|d| d / self.dt)
     }
-
-    /// A column's value in the later sample (for gauges).
-    pub fn now(&self, col: usize) -> Option<f64> {
-        self.cur[col]
-    }
 }
 
 /// The intervals between consecutive samples that end in the window (at or
@@ -1800,8 +1795,8 @@ mod tests {
         let samples = Samples::from_rows(vec![s(0, 100.0), s(10, 200.0), s(20, 50.0), s(30, 80.0), s(30 + 7201, 90.0), s(30 + 7211, 100.0)]);
         let r: Vec<(Ts, Option<f64>, Option<f64>)> = deltas(&samples, 0).map(|d| (d.ts, d.rate(0), d.inc(1))).collect();
         assert_eq!(r, [(10, Some(10.0), None), (20, Some(0.0), None), (30, Some(3.0), None), (7241, Some(1.0), None)]);
-        // Only intervals ending in the window; a gauge is read at the end of one.
-        assert_eq!(deltas(&samples, 20).map(|d| d.now(0)).collect::<Vec<_>>(), [Some(50.0), Some(80.0), Some(100.0)]);
+        // Only intervals ending in the window.
+        assert_eq!(deltas(&samples, 20).map(|d| d.ts).collect::<Vec<_>>(), [20, 30, 7241]);
         assert_eq!(cols_at(&["a", "b", "c"], ["c", "a"]), [2, 0]);
     }
 
