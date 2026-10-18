@@ -27,7 +27,7 @@
 }
 
 @media (prefers-color-scheme: dark) {
-  :root:not([data-theme="light"]) {
+  :root {
     --bg: #12151b;
     --panel: #1a1f27;
     --text: #e6e9ef;
@@ -444,6 +444,7 @@ button.plain {
 }
 
 input.search,
+textarea.search,
 select {
   font: inherit;
   color: var(--text);
@@ -454,6 +455,11 @@ select {
 }
 input.search {
   min-width: 280px;
+}
+/* A monospaced field keeps its font over the inherited one above. */
+.search.mono {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12.5px;
 }
 .check {
   display: flex;
@@ -605,7 +611,8 @@ input.search {
     grid-template-columns: 1fr;
     gap: 2px;
   }
-  .log-line {
+  .log-line,
+  .logs-no-device .log-line {
     grid-template-columns: 1fr;
   }
   input.search {
@@ -1036,6 +1043,9 @@ td.warn {
 }
 .stats + .banner {
   margin: 12px 0 0;
+}
+.banner-medium {
+  background: var(--warn-bg);
 }
 .banner-high {
   background: var(--bad-bg);
