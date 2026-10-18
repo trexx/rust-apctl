@@ -1351,6 +1351,10 @@ struct PlanAp {
     clients: i64,
     /// Channel blocks the AP lists as available (its country and width).
     available: Option<Vec<i64>>,
+    /// The primary channels the site's country allows this AP at the width in
+    /// its settings, indoors or outdoors as it is set (what `set_channels`
+    /// checks a plan against); `None`: no rules known, or no settings.
+    legal: Option<Vec<i64>>,
 }
 
 /// A network an AP hears (not one of ours): its name, span and signal.
@@ -1391,6 +1395,8 @@ pub async fn compute_plan(s: &AppState, radio: String, dfs: bool, allowed: Optio
     // What the plan needs from `live`, copied so the lock is not held while it is worked out.
     let (aps, own_bssids) = {
         let live = s.live.read().unwrap();
+        let state = live.state.as_deref();
+        let country = state.and_then(crate::settings::country);
         let aps: Vec<PlanAp> = live
             .devices
             .iter()
@@ -1408,7 +1414,13 @@ pub async fn compute_plan(s: &AppState, radio: String, dfs: bool, allowed: Optio
                         .collect();
                     (!list.is_empty()).then_some(list)
                 });
-                Some(PlanAp { mac: m.to_string(), name: d.snapshot.ap.hostname.clone(), current: block(&radio, ch, width), width, clients: r.num_sta, available })
+                // As `set_channels` judges a channel: at the radio's width in the settings, not the one reported.
+                let legal = state.and_then(|st| {
+                    let doc = crate::adopt::device_doc(st, m)?;
+                    let at = crate::settings::inform_radio(doc, &radio).map_or(width, |r| crate::settings::num(&r["ht"]).unwrap_or(20));
+                    crate::settings::legal_channels(country, &radio, at, crate::settings::outdoor(st, doc))
+                });
+                Some(PlanAp { mac: m.to_string(), name: d.snapshot.ap.hostname.clone(), current: block(&radio, ch, width), width, clients: r.num_sta, available, legal })
             })
             .collect();
         // Our APs' BSSIDs on this band, to separate own signal from neighbours.
@@ -1466,12 +1478,17 @@ fn plan_channels(
         let load = util.unwrap_or(0.0) * 0.5 + interference.map_or(0.0, |i| weight(i) * 0.5);
         measured[i].push((block(&radio, ch, width.unwrap_or(20)), load));
     }
-    // Each AP's candidate blocks, worked out once.
+    // Each AP's candidate blocks, worked out once: among the allowed ones, only
+    // those the AP lists and the country allows it, so that the plan can be applied.
     let cands: Vec<Vec<Block>> = aps
         .iter()
-        .map(|ap| match &allowed {
-            Some(a) => allowed_blocks(&radio, ap.width, a),
-            None => candidates(&radio, ap.width, dfs, ap.available.as_deref()),
+        .map(|ap| {
+            let mut c = match &allowed {
+                Some(a) => allowed_blocks(&radio, ap.width, a),
+                None => candidates(&radio, ap.width, dfs, ap.available.as_deref()),
+            };
+            c.retain(|b| ap.available.as_ref().is_none_or(|a| a.contains(&b.primary)) && ap.legal.as_ref().is_none_or(|l| l.contains(&b.primary)));
+            c
         })
         .collect();
     let is_pinned: Vec<bool> = aps.iter().map(|ap| pinned.contains(&ap.mac)).collect();
@@ -1610,7 +1627,7 @@ mod tests {
 
     #[test]
     fn two_aps_that_hear_each_other_are_split() {
-        let ap = |mac: &str, ch: i64, clients: i64| PlanAp { mac: mac.into(), name: Some(format!("AP {mac}")), current: block("ng", ch, 20), width: 20, clients, available: None };
+        let ap = |mac: &str, ch: i64, clients: i64| PlanAp { mac: mac.into(), name: Some(format!("AP {mac}")), current: block("ng", ch, 20), width: 20, clients, available: None, legal: None };
         let aps = vec![ap("a", 6, 5), ap("b", 6, 1)];
         let own = HashMap::from([("bss-a".to_string(), "a".to_string()), ("bss-b".to_string(), "b".to_string())]);
         // Each hears the other loudly, and "a" hears a neighbour on channel 1.
@@ -1626,6 +1643,24 @@ mod tests {
         assert_ne!(ch["a"], 1, "a keeps off its neighbour");
         let a = plan.plan.iter().find(|p| p.mac == "a").unwrap();
         assert_eq!(a.current_reasons, ["your AP AP b (-50 dBm)"]);
+    }
+
+    #[test]
+    fn plans_use_only_channels_the_ap_lists_and_may_use_where_it_stands() {
+        // Channel AI allows every channel Germany has at 80 MHz, DFS included.
+        let allowed = crate::settings::legal_channels(Some(276), "na", 80, false);
+        let ap = |mac: &str, clients: i64, available: Option<Vec<i64>>, outdoor: bool| PlanAp {
+            mac: mac.into(), name: None, current: block("na", 36, 80), width: 80, clients, available,
+            legal: crate::settings::legal_channels(Some(276), "na", 80, outdoor),
+        };
+        // "in" hears a loud neighbour on 36-48 and lists only 36 and 116; without its list it would take 52.
+        // "out" is outdoors, where 36-64 are not allowed, so it must leave 36.
+        let aps = vec![ap("in", 5, Some(vec![36, 116]), false), ap("out", 1, None, true)];
+        let neigh = vec![("in".to_string(), "x".to_string(), Some("Next door".to_string()), Some(5210.0), Some(80.0), Some(-40.0))];
+        let plan = plan_channels("na".into(), true, allowed, vec![], aps, HashMap::new(), neigh, vec![]);
+        assert!(plan.accepted, "{plan:?}");
+        let to: HashMap<&str, (i64, bool)> = plan.plan.iter().map(|p| (p.mac.as_str(), (p.suggested_channel, p.not_allowed))).collect();
+        assert_eq!((to["in"], to["out"]), ((116, false), (100, true)));
     }
 
     #[test]
@@ -2103,6 +2138,25 @@ mod tests {
             insert(&c, "spectrum", &["ap_mac", "radio", "channel", "width", "utilization", "interference", "other_bss_count", "ts"], vec![row]);
             let after = json!(ok(channel_plan(State(s), Query(PlanQuery { band: Some("na".into()), dfs: Some(true) })).await));
             assert_eq!(before, after);
+        }
+
+        #[tokio::test]
+        async fn an_outdoor_ap_is_planned_onto_channels_it_may_use_outdoors() {
+            let (s, _, _dir) = site();
+            {
+                let mut live = s.live.write().unwrap();
+                let mut state = live.state.as_deref().unwrap().clone();
+                state["setting"] = json!([{ "key": "country", "code": "276", "site_id": "s1" }]);
+                state["devices"][1]["outdoor_mode_override"] = json!("on");
+                state["devices"][1]["radio_table"] = json!([{ "radio": "na", "channel": 36, "ht": 80 }]);
+                live.state = Some(std::sync::Arc::new(state));
+            }
+            // A2 sits on 36, which Germany allows indoors only; of what it lists (36, 52, 100) only 100 is left.
+            let plan = ok(channel_plan(State(s), Query(PlanQuery { band: Some("na".into()), dfs: Some(true) })).await);
+            let a2 = plan.plan.iter().find(|p| p.mac == A2).unwrap();
+            assert_eq!((a2.current_channel, a2.suggested_channel, a2.not_allowed), (36, 100, true));
+            let a1 = plan.plan.iter().find(|p| p.mac == A1).unwrap();
+            assert!(!a1.not_allowed, "indoors, 36-48 is fine");
         }
     }
 }
