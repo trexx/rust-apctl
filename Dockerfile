@@ -9,8 +9,10 @@ RUN npm run build
 # --- manufacturer names (IEEE MAC address registry, public data) ---
 # A small stage of its own, so code changes don't download it again. The layer is
 # cached until OUI_MONTH changes (scripts/release.sh passes the current month), so the
-# list is at most about a month old. (The IEEE server answers 418 to the HTTP client
-# behind ADD <url>, so busybox wget fetches it.)
+# list is at most about a month old. CI images (trexx/actions' build workflow, which
+# passes no build args) are built with a fresh builder and no layer cache, so they always
+# download it. (The IEEE server answers 418 to the HTTP client behind ADD <url>, so
+# busybox wget fetches it.)
 FROM docker.io/library/alpine:3.22 AS oui
 ARG OUI_MONTH=
 RUN echo "registry of ${OUI_MONTH:-the first build}" \
