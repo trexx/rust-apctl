@@ -1,7 +1,9 @@
+import { Suspense } from "react";
 import { Link } from "react-router";
 import {
   useClientNames,
   useDeviceNames,
+  useCanEdit,
   useDevices,
   useEvents,
   useStatus,
@@ -33,11 +35,17 @@ import { SiteActivity } from "../components/insights/SiteActivity";
 import { TopTalkers } from "../components/insights/TopTalkers";
 import { ZoomContext, useTimeSpan } from "../components/Chart";
 import { ThreatBanner } from "../components/Threats";
-import { AdoptionPanel } from "../components/Adoption";
+import { lazyNamed } from "../lazy";
 
 /** An AP's firmware and address, as far as they are known. */
 const about = (d: DeviceSummary) =>
   [d.version, d.ip].filter(Boolean).join(" · ");
+
+// Only editors in active mode adopt APs: everyone else never loads the panel.
+const AdoptionPanel = lazyNamed(
+  () => import("../components/Adoption"),
+  "AdoptionPanel",
+);
 
 export function Overview() {
   const devices = useDevices();
@@ -46,6 +54,7 @@ export function Overview() {
   const status = useStatus(true);
   const s = status.data;
   const names = useDeviceNames();
+  const canEdit = useCanEdit();
   const cnames = useClientNames();
   const now = useNow();
 
@@ -86,7 +95,11 @@ export function Overview() {
       </div>
 
       <ThreatBanner />
-      <AdoptionPanel />
+      {canEdit && s?.mode === "active" && (
+        <Suspense fallback={null}>
+          <AdoptionPanel />
+        </Suspense>
+      )}
       <h2>Access points</h2>
       <div className="cards cards-fill">
         {list.map((d) => (
