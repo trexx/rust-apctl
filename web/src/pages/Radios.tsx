@@ -291,7 +291,7 @@ function RadioTable({ radios }: { radios: RadioOverview[] }) {
                       <span className="muted small"> / {r.bw ?? "?"} MHz</span>
                     </td>
                     <td className="nowrap">
-                      {r.tx_power ?? "—"} dBm
+                      {r.tx_power === null ? "—" : `${r.tx_power} dBm`}
                       {r.eirp !== null && (
                         <span className="muted small"> ({r.eirp} EIRP)</span>
                       )}
