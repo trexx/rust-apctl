@@ -68,12 +68,14 @@ pub fn next(live: &mut Live, mac: &Mac) -> Option<Value> {
 }
 
 /// Sets fields on a client's entry in the site's settings, creating it (with
-/// the MAC as `aa:bb:..`) if needed.
+/// the MAC as `aa:bb:..`) if needed. Clearing (every field null or false) a
+/// client with no entry creates none: it reads as cleared already.
 pub fn edit_client(state: &mut Value, mac: Mac, fields: &[(&str, Value)]) {
     // Matched as `controls` reads them, whichever way the entry writes its MAC.
     let found = crate::settings::docs(state, "clients").position(|c| doc_mac(&c["mac"]) == Some(mac));
     let entry = match found {
         Some(i) => crate::settings::docs_mut(state, "clients").nth(i).expect("found above"),
+        None if fields.iter().all(|(_, v)| v.is_null() || *v == Value::Bool(false)) => return,
         None => crate::settings::push_doc(state, "clients", json!({ "mac": mac.to_string() })),
     };
     for (k, v) in fields {
@@ -194,7 +196,12 @@ pub async fn locate(State(s): State<AppState>, MacPath(mac): MacPath, Json(b): J
 /// POST /api/devices/{mac}/provision: send the AP its config again.
 pub async fn provision(State(s): State<AppState>, MacPath(mac): MacPath) -> Result<Json<Value>, ApiError> {
     let mac = target_ap(&s, mac)?;
-    s.live.write().unwrap().reprovision.insert(mac);
+    {
+        let mut live = s.live.write().unwrap();
+        live.reprovision.insert(mac);
+        // As for a queued command: the AP is asked to inform now.
+        crate::stun::poke(&live, &mac);
+    }
     s.note(Event::device(clock::now_ts(), EventKind::ApProvisionRequested, mac, json!({}))).await;
     Ok(Json(json!({ "queued": true })))
 }
@@ -355,6 +362,11 @@ mod tests {
         edit_client(&mut state, mac("aa:bb:cc:00:00:04"), &[("blocked", json!(true))]);
         edit_client(&mut state, mac("aabbcc000005"), &[("blocked", json!(true))]);
         assert_eq!(state["clients"].as_array().unwrap().len(), 2, "no duplicate");
+        // Unblocking, unlocking or dropping the speed limit of a client without an entry adds none.
+        edit_client(&mut state, mac("aa:bb:cc:00:00:06"), &[("blocked", json!(false))]);
+        edit_client(&mut state, mac("aa:bb:cc:00:00:06"), &[("fixed_ap_enabled", json!(false)), ("fixed_ap_mac", Value::Null)]);
+        edit_client(&mut state, mac("aa:bb:cc:00:00:06"), &[("usergroup_id", Value::Null)]);
+        assert_eq!(state["clients"].as_array().unwrap().len(), 2);
         assert!(controls(Some(&state), &mac("aa:bb:cc:00:00:04")).blocked && controls(Some(&state), &mac("aa:bb:cc:00:00:05")).blocked);
     }
 }

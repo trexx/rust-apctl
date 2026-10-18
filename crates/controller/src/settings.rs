@@ -184,6 +184,16 @@ pub(crate) fn inform_radio<'a>(inform: &'a Value, band: &str) -> Option<&'a Valu
     inform["radio_table"].as_array()?.iter().find(|r| r["radio"].as_str() == Some(band))
 }
 
+/// [`inform_radio`], to change.
+pub(crate) fn inform_radio_mut<'a>(inform: &'a mut Value, band: &str) -> Option<&'a mut Value> {
+    inform.get_mut("radio_table")?.as_array_mut()?.iter_mut().find(|r| r["radio"].as_str() == Some(band))
+}
+
+/// An AP as messages name it: its name, else its MAC.
+pub(crate) fn device_label(d: &Value, mac: impl std::fmt::Display) -> String {
+    d["name"].as_str().filter(|n| !n.trim().is_empty()).map_or_else(|| mac.to_string(), str::to_string)
+}
+
 /// A flag of the site's `mgmt` setting (outdoor mode, advanced features...).
 pub(crate) fn mgmt_flag(state: &Value, key: &str) -> bool {
     setting(state, "mgmt")[key].as_bool() == Some(true)
@@ -234,9 +244,11 @@ fn has_blocker(radio: &Value) -> bool {
     radio["radio_caps"].as_i64().is_some_and(|c| c & INTERFERENCE_BLOCKER != 0)
 }
 
-/// The APs an SSID is broadcast from: `None` for all of them.
+/// The APs an SSID is broadcast from: `None` for all of them (its groups hold
+/// the site's default one). One with no groups is broadcast from none, as the
+/// AP config has it.
 fn wlan_aps(state: &Value, w: &Value) -> Option<Vec<String>> {
-    let groups: Vec<&str> = w["ap_group_ids"].as_array()?.iter().filter_map(Value::as_str).collect();
+    let groups: Vec<&str> = w["ap_group_ids"].as_array().into_iter().flatten().filter_map(Value::as_str).collect();
     let mut macs = Vec::new();
     for g in docs(state, "apgroup").filter(|g| oid(g).is_some_and(|id| groups.contains(&id))) {
         if g["attr_hidden_id"].as_str() == Some("default") {
@@ -671,11 +683,7 @@ fn prune_groups(state: &mut Value) {
 
 /// The APs (`aa:bb:..`) an SSID is deployed to.
 fn deployed_to(state: &Value, w: &Value) -> Vec<String> {
-    match wlan_aps(state, w) {
-        None if w["ap_group_ids"].as_array().is_some_and(|a| !a.is_empty()) => device_macs(state),
-        None => Vec::new(),
-        Some(macs) => macs,
-    }
+    wlan_aps(state, w).unwrap_or_else(|| device_macs(state))
 }
 
 /// mDNS proxy rules: where each applies (all APs, specific ones, AP groups),
@@ -702,10 +710,7 @@ fn check_mdns_rules(state: &Value, v: &Value) -> Result<Vec<Value>, String> {
         rule["networkconf_ids"] = json!(nets);
         match scope {
             "specific" => {
-                let mut macs: Vec<String> = Vec::new();
-                for m in ids("ap_macs") {
-                    macs.push(m.parse::<inform::Mac>().map_err(|_| format!("mDNS rule {n}: {m} is not a MAC address"))?.to_string());
-                }
+                let macs = mac_list_value(&r["ap_macs"], &format!("mDNS rule {n}: ap_macs"))?.unwrap_or_default();
                 if macs.is_empty() || macs.iter().any(|m| !aps.contains(m)) {
                     return Err(format!("mDNS rule {n}: choose the APs it applies on"));
                 }
@@ -798,7 +803,7 @@ fn wlan_limits(state: &Value) -> Vec<Over> {
         docs(state, "wlanconf").map(|w| (w["wlan_bands"].as_array().into_iter().flatten().filter_map(Value::as_str).collect(), deployed_to(state, w))).collect();
     for d in docs(state, "devices") {
         let Some(mac) = doc_mac(&d["mac"]).map(|m| m.to_string()) else { continue };
-        let name = d["name"].as_str().unwrap_or(&mac);
+        let name = device_label(d, &mac);
         for (band, wb) in [("ng", "2g"), ("na", "5g"), ("6e", "6g")] {
             let radios: Vec<&Value> = d["radio_table"].as_array().into_iter().flatten().filter(|r| r["radio"].as_str() == Some(band)).collect();
             if radios.is_empty() {
@@ -1263,8 +1268,8 @@ pub(crate) fn apply_channel_locks(state: &mut Value, released: &[String], only: 
         } else {
             continue;
         };
-        let name = d["name"].as_str().unwrap_or(&mac).to_string();
-        let Some(r) = d["radio_table"].as_array_mut().and_then(|t| t.iter_mut().find(|r| r["radio"].as_str() == Some("ng"))) else { continue };
+        let name = device_label(d, &mac);
+        let Some(r) = inform_radio_mut(d, "ng") else { continue };
         if !same_channel(&r["channel"], &target) {
             r["channel"] = target.clone();
             out.push(format!("AP {name}: 2.4 GHz channel {}", target.as_str().unwrap_or_default()));
@@ -1457,7 +1462,7 @@ pub fn apply_device(state: &mut Value, e: &DeviceEdit) -> Result<String, String>
             }
         }
     }
-    let name = d["name"].as_str().unwrap_or(&mac).to_string();
+    let name = device_label(&d, &mac);
     let mut changed: Vec<String> = Vec::new();
     for k in DEVICE_FIELDS {
         if before[*k] != d[*k] {
@@ -1534,7 +1539,7 @@ fn radio_edit(state: &Value, e: &DeviceEdit, rp: &Value, before: &Value, d: &mut
     let band = rp["radio"].as_str().ok_or("each radio needs its band (radio)")?;
     let caps = &e.caps[band];
     let label = band_name(band);
-    let r = d["radio_table"].as_array_mut().and_then(|t| t.iter_mut().find(|r| r["radio"].as_str() == Some(band))).ok_or_else(|| format!("this AP has no {label} radio"))?;
+    let r = inform_radio_mut(d, band).ok_or_else(|| format!("this AP has no {label} radio"))?;
     if let Some(ht) = int_field(rp, "ht", 20, 320)? {
         let ok = match band {
             "ng" => [20, 40].contains(&ht),
@@ -1551,6 +1556,10 @@ fn radio_edit(state: &Value, e: &DeviceEdit, rp: &Value, before: &Value, d: &mut
         Value::String(a) if a == "auto" => r["channel"] = json!("auto"),
         v => {
             let ch = num(v).ok_or_else(|| format!("{label}: channel must be auto or a number"))?;
+            // Whatever the country, it must be one of the band's channels (those the editor offers).
+            if !band_channels(band, 20).contains(&ch) {
+                return Err(format!("{label}: {ch} is not a channel of this band"));
+            }
             r["channel"] = json!(ch);
         }
     }
@@ -1632,7 +1641,7 @@ fn check_config_network(p: &Value, before: &Value) -> Result<Value, String> {
         out["dns2"] = json!(d.to_string());
     }
     if let Some(suffix) = p["dnssuffix"].as_str().map(str::trim).filter(|s| !s.is_empty()) {
-        if suffix.len() > 253 || !suffix.split('.').all(|l| !l.is_empty() && l.len() <= 63 && l.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')) {
+        if !crate::site::is_domain_name(suffix) {
             return Err(format!("{suffix} is not a domain name"));
         }
         out["dnssuffix"] = json!(suffix);
@@ -1643,7 +1652,7 @@ fn check_config_network(p: &Value, before: &Value) -> Result<Value, String> {
 /// A static address must not be another AP's, or one reserved for a client.
 fn check_ip_free(state: &Value, mac: &inform::Mac, ip: &str) -> Result<(), String> {
     if let Some(o) = docs(state, "devices").find(|o| doc_mac(&o["mac"]) != Some(*mac) && o["config_network"]["type"].as_str() == Some("static") && o["config_network"]["ip"].as_str() == Some(ip)) {
-        return Err(format!("{ip} is already {}'s address", o["name"].as_str().or(o["mac"].as_str()).unwrap_or("another AP")));
+        return Err(format!("{ip} is already {}'s address", device_label(o, o["mac"].as_str().unwrap_or("another AP"))));
     }
     if let Some(c) = docs(state, "clients").find(|c| c["use_fixedip"].as_bool() == Some(true) && c["fixed_ip"].as_str() == Some(ip)) {
         return Err(format!("{ip} is reserved for the client {}", c["name"].as_str().or(c["hostname"].as_str()).or(c["mac"].as_str()).unwrap_or("?")));
@@ -1862,11 +1871,11 @@ mod tests {
     fn mdns_rules_are_checked() {
         let mut s = state();
         assert!(edit(&mut s, json!({ "mdns_proxy_mode": "custom" })).unwrap_err().contains("at least one rule"));
-        let rule = json!({ "ap_scope_mode": "specific", "ap_macs": [AP2.to_uppercase()], "services_mode": "specific",
+        let rule = json!({ "ap_scope_mode": "specific", "ap_macs": [AP2.to_uppercase(), format!(" {AP2}")], "services_mode": "specific",
             "predefined_services": [{ "code": "apple_airPlay" }, { "code": "apple_airPlay" }], "custom_services": [{ "address": "_myapp._tcp.local" }] });
         edit(&mut s, json!({ "mdns_proxy_mode": "custom", "mdns_proxy_custom": [rule] })).unwrap();
         let r = &s["wlanconf"][0]["mdns_proxy_custom"][0];
-        assert_eq!((r["ap_macs"][0].as_str(), r["predefined_services"].as_array().unwrap().len()), (Some(AP2), 1));
+        assert_eq!((&r["ap_macs"], r["predefined_services"].as_array().unwrap().len()), (&json!([AP2]), 1), "MACs trimmed, written alike and once");
         assert_eq!(r["custom_services"][0]["name"], "_myapp._tcp.local");
         let bad = |r: Value| edit(&mut state(), json!({ "mdns_proxy_mode": "custom", "mdns_proxy_custom": [r] })).is_err();
         assert!(bad(json!({ "services_mode": "specific", "predefined_services": [{ "code": "telnet" }] })));
@@ -1907,6 +1916,7 @@ mod tests {
         let g = s["apgroup"].as_array().unwrap().iter().find(|g| oid(g) == Some(gid.as_str())).unwrap();
         assert_eq!((g["for_wlanconf"].as_bool(), g["device_macs"][0].as_str()), (Some(true), Some(AP2)));
         assert_eq!(wlan_aps(&s, &s["wlanconf"][0]), Some(vec![AP2.to_string()]));
+        assert_eq!(wlan_aps(&s, &json!({ "name": "no groups" })), Some(vec![]), "broadcast from no AP, as the AP config has it");
         // The same group is reused, then removed when the SSID goes back to all APs.
         edit(&mut s, json!({ "aps": [AP1, AP2] })).unwrap();
         assert_eq!(s["wlanconf"][0]["ap_group_ids"][0].as_str(), Some(gid.as_str()));
@@ -2082,6 +2092,11 @@ mod tests {
         assert!(dev(&mut s, static_ip("192.168.1.20", "10.0.0.1")).unwrap_err().contains("gateway"));
         assert!(dev(&mut s, static_ip("192.168.1.255", "192.168.1.1")).is_err(), "broadcast address");
         assert!(dev(&mut s, json!({ "config_network": { "type": "static", "ip": "192.168.1.20" } })).is_err(), "netmask needed");
+        let with_suffix = |d: &str| json!({ "config_network": { "type": "static", "ip": "192.168.1.20", "netmask": "255.255.255.0", "gateway": "192.168.1.1", "dns1": "192.168.1.1", "dnssuffix": d } });
+        dev(&mut s.clone(), with_suffix("home-1.lan")).unwrap();
+        for bad in ["-home.lan", "home-.lan", "home..lan", "home_1.lan"] {
+            assert!(dev(&mut s.clone(), with_suffix(bad)).unwrap_err().contains("not a domain name"), "{bad}");
+        }
         dev(&mut s, json!({ "config_network": { "type": "dhcp", "ip": "192.168.1.20" } })).unwrap();
         assert_eq!(s["devices"][0]["config_network"], json!({ "type": "dhcp" }));
     }
@@ -2102,6 +2117,12 @@ mod tests {
         // Nor for a country outside its tables.
         s["setting"][0]["code"] = json!("392");
         dev(&mut s, json!({ "radios": [{ "radio": "na", "channel": 149, "ht": 80 }] })).unwrap();
+        // Without rules a channel must still be one of the band's.
+        for ch in [999, 0, -4, 38] {
+            assert!(dev(&mut s, json!({ "radios": [{ "radio": "6e", "channel": ch }] })).unwrap_err().contains("not a channel"), "6 GHz {ch}");
+        }
+        assert!(dev(&mut s, json!({ "radios": [{ "radio": "na", "channel": 999 }] })).unwrap_err().contains("not a channel"));
+        assert_eq!(s["devices"][0]["radio_table"][2]["channel"], 37);
     }
 
     #[test]
@@ -2199,9 +2220,11 @@ mod tests {
         edit(&mut s, json!({ "aps": null })).unwrap();
         assert_eq!(s["apgroup"].as_array().unwrap().iter().filter_map(oid).collect::<Vec<_>>(), ["g0", "g9"]);
         // A client's entry in another site is not this site's.
-        crate::actions::edit_client(&mut s, "aa:bb:cc:00:00:01".parse().unwrap(), &[("blocked", json!(false))]);
+        let c1: inform::Mac = "aa:bb:cc:00:00:01".parse().unwrap();
+        assert!(!crate::actions::controls(Some(&s), &c1).blocked);
+        crate::actions::edit_client(&mut s, c1, &[("usergroup_id", json!("u1"))]);
         assert_eq!((s["clients"][0]["blocked"].as_bool(), s["clients"][1]["site_id"].as_str()), (Some(true), Some("s1")));
-        assert!(!crate::actions::controls(Some(&s), &"aa:bb:cc:00:00:01".parse().unwrap()).blocked);
+        assert!(!crate::actions::controls(Some(&s), &c1).blocked);
     }
 
     #[test]

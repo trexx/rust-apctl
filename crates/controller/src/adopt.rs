@@ -190,15 +190,41 @@ const RADIO_KEYS: [&str; 14] = [
     "builtin_ant_gain",
 ];
 
+/// The width a new AP's radio starts at, as the official controller sets it on
+/// adoption: the site's default for the band (else the band's own: 20, 80 or
+/// 160 MHz), at most what the band and the radio (as its inform reports it) allow.
+fn start_width(state: &Value, r: &Value, band: &str) -> i64 {
+    let configured = crate::settings::setting(state, "radio_ai")["radios_configuration"]
+        .as_array()
+        .and_then(|l| crate::settings::num(&l.iter().find(|c| c["radio"].as_str() == Some(band))?["channel_width"]))
+        .unwrap_or(match band {
+            "ng" => 20,
+            "na" => 80,
+            _ => 160,
+        });
+    let f = |k: &str| r[k].as_bool() == Some(true);
+    let capable = if f("has_eht320") {
+        320
+    } else if f("has_eht240") {
+        240
+    } else if f("has_ht160") {
+        160
+    } else if f("is_11ac") || f("is_11ax") {
+        80
+    } else {
+        40
+    };
+    let band_max = match band {
+        "ng" => 40,
+        "na" => 160,
+        _ => 320,
+    };
+    configured.min(capable).min(band_max)
+}
+
 /// The radio settings of a new AP, from the radios its inform lists: auto
 /// channel, the site's default width, auto power.
 pub fn radio_table(state: &Value, payload: &Value) -> Vec<Value> {
-    let width = |band: &str| {
-        crate::settings::setting(state, "radio_ai")["radios_configuration"]
-            .as_array()
-            .and_then(|l| l.iter().find(|c| c["radio"].as_str() == Some(band))?["channel_width"].as_i64())
-            .unwrap_or(if band == "ng" { 20 } else { 80 })
-    };
     payload["radio_table"]
         .as_array()
         .into_iter()
@@ -206,7 +232,7 @@ pub fn radio_table(state: &Value, payload: &Value) -> Vec<Value> {
         .filter_map(|r| {
             let band = r["radio"].as_str()?;
             let mut v = json!({
-                "name": r["name"], "radio": band, "channel": "auto", "ht": width(band), "tx_power_mode": "auto",
+                "name": r["name"], "radio": band, "channel": "auto", "ht": start_width(state, r, band), "tx_power_mode": "auto",
                 "min_rssi_enabled": false, "hard_noise_floor_enabled": false, "antenna_gain": r["builtin_ant_gain"],
             });
             // The rest of what it reports, as it reports it.
@@ -246,6 +272,12 @@ pub fn new_device(state: &Value, payload: &Value, mac: &Mac) -> Value {
     d
 }
 
+/// An AP as adoption's messages name it: its label, with the MAC after a name.
+fn ap_name(d: &Value, mac: &Mac) -> String {
+    let (label, mac) = (crate::settings::device_label(d, mac), mac.to_string());
+    if label == mac { label } else { format!("{label} ({mac})") }
+}
+
 /// Adds a pending AP to the settings, from its inform. An AP apctl knew
 /// keeps its record, with new keys: the adoption hands the AP its key sealed
 /// with the public factory key, so whoever saw that would otherwise read what
@@ -258,8 +290,7 @@ pub fn adopt_device(state: &mut Value, mac: &Mac, payload: &Value) -> Result<Str
         if let Some(o) = d.as_object_mut() {
             o.remove("x_inform_authkey");
         }
-        let name = d["name"].as_str().map_or_else(|| mac.to_string(), |n| format!("{n} ({mac})"));
-        return Ok(format!("re-adopting AP {name} with new keys"));
+        return Ok(format!("re-adopting AP {} with new keys", ap_name(d, mac)));
     }
     let d = new_device(state, payload, mac);
     crate::settings::push_doc(state, "devices", d);
@@ -281,7 +312,7 @@ pub fn remove_device(state: &mut Value, mac: &Mac) -> Result<String, String> {
     let same = |v: &Value| doc_mac(v) == Some(*mac);
     let devices = state["devices"].as_array_mut().ok_or("the settings have no APs")?;
     let before = devices.len();
-    let name = devices.iter().find(|d| same(&d["mac"])).and_then(|d| d["name"].as_str()).map_or_else(|| mac.to_string(), |n| format!("{n} ({mac})"));
+    let name = devices.iter().find(|d| same(&d["mac"])).map_or_else(|| mac.to_string(), |d| ap_name(d, mac));
     devices.retain(|d| !same(&d["mac"]));
     if devices.len() == before {
         return Err("this AP is not in the settings".into());
@@ -395,8 +426,9 @@ pub async fn forget(State(s): State<AppState>, MacPath(mac): MacPath) -> Result<
     };
     if online {
         // Removed when it reports (and is told to reset), or after the timeout.
-        s.live.write().unwrap().adoption.forgetting.insert(mac, clock::now_ts());
-        crate::stun::poke(&s.live.read().unwrap(), &mac);
+        let mut live = s.live.write().unwrap();
+        live.adoption.forgetting.insert(mac, clock::now_ts());
+        crate::stun::poke(&live, &mac);
         return Ok(Json(json!({ "forgetting": true })));
     }
     finish_forget(&s.engine, mac, false).await;
@@ -408,9 +440,16 @@ pub async fn finish_forget(engine: &tokio::sync::mpsc::Sender<Input>, mac: Mac, 
     let (tx, rx) = tokio::sync::oneshot::channel();
     let edit: crate::engine::StateEdit = Box::new(move |state: &mut Value| remove_device(state, &mac));
     let _ = engine.send(Input::EditState { ts: clock::now_ts(), edit, done: tx }).await;
-    let _ = rx.await;
-    let _ = engine.send(Input::Forget { ts: clock::now_ts(), mac }).await;
-    let _ = engine.send(Input::Note(Event::device(clock::now_ts(), EventKind::ApForgotten, mac, json!({ "reset": reset })))).await;
+    // Only the forget that removed the record tells of it: another may have
+    // got there first, or an import since left the AP out.
+    match rx.await {
+        Ok(Ok(_)) => {
+            let _ = engine.send(Input::Forget { ts: clock::now_ts(), mac }).await;
+            let _ = engine.send(Input::Note(Event::device(clock::now_ts(), EventKind::ApForgotten, mac, json!({ "reset": reset })))).await;
+        }
+        Ok(Err(e)) => tracing::info!("{mac}: not forgotten: {e}"),
+        Err(_) => tracing::warn!("{mac}: not forgotten: the engine has stopped"),
+    }
 }
 
 #[cfg(test)]
@@ -455,6 +494,48 @@ mod tests {
         assert_eq!(device_key(Some(&padded), &keys, &ap), device_key(Some(&s), &keys, &ap), "whitespace around a stored key is ignored");
     }
 
+    #[tokio::test]
+    async fn only_the_forget_that_removed_the_record_tells_of_it() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let mut s = state();
+        // A stand-in for the engine: edits apply to `s`, everything else is passed on.
+        let (seen_tx, mut seen) = tokio::sync::mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            while let Some(i) = rx.recv().await {
+                match i {
+                    Input::EditState { edit, done, .. } => drop(done.send(edit(&mut s))),
+                    Input::Forget { .. } => seen_tx.send("forget").unwrap(),
+                    Input::Note(e) => seen_tx.send(e.kind.as_str()).unwrap(),
+                    _ => {}
+                }
+            }
+        });
+        let mac: Mac = "02:00:00:00:00:01".parse().unwrap();
+        finish_forget(&tx, mac, false).await;
+        finish_forget(&tx, mac, false).await;
+        drop(tx);
+        let mut got = Vec::new();
+        while let Some(x) = seen.recv().await {
+            got.push(x);
+        }
+        assert_eq!(got, ["forget", "ap_forgotten"], "the second forget found no record");
+    }
+
+    #[test]
+    fn a_new_radio_starts_at_the_sites_width_capped_by_the_radio() {
+        let radios = json!({ "radio_table": [
+            { "name": "wifi0", "radio": "ng", "is_11ax": true },
+            { "name": "wifi1", "radio": "na", "is_11ac": true },
+            { "name": "wifi2", "radio": "6e", "has_ht160": true, "is_11ax": true },
+        ] });
+        let widths = |s: &Value| radio_table(s, &radios).iter().map(|r| r["ht"].as_i64().unwrap()).collect::<Vec<_>>();
+        // None configured: each band's own default, at most what the radio does.
+        assert_eq!(widths(&json!({})), [20, 80, 160]);
+        // Imports keep the site's widths as strings.
+        let s = json!({ "setting": [{ "key": "radio_ai", "radios_configuration": [{ "radio": "ng", "channel_width": "40" }, { "radio": "na", "channel_width": "160" }, { "radio": "6e", "channel_width": 80 }] }] });
+        assert_eq!(widths(&s), [40, 80, 80], "an 802.11ac radio does 80 MHz at most");
+    }
+
     #[test]
     fn adopting_creates_a_record_with_a_new_key_and_radios() {
         let mut s = state();
@@ -465,6 +546,7 @@ mod tests {
         assert_eq!(d["syslog_key"].as_str().unwrap().len(), 64);
         assert_eq!((d["site_id"].as_str(), d["mgmt_network_id"].as_str(), d["name"].as_str()), (Some("s1"), Some("n1"), Some("U6-Mesh")));
         assert_eq!(d["radio_table"][1]["ht"], 40, "the site's default width");
+        assert_eq!(d["radio_table"][0]["ht"], 20, "none set for 2.4 GHz: its own default");
         assert_eq!((d["radio_table"][0]["channel"].as_str(), d["radio_table"][1]["has_ht160"].as_bool()), (Some("auto"), Some(true)));
         // Adopting again keeps the record, with new keys (the old one went out under the factory key).
         let mac: Mac = "02:00:00:00:00:09".parse().unwrap();
