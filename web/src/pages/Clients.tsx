@@ -30,10 +30,11 @@ function value(c: ClientView, key: SortKey): string | number {
       return (c.ap_name ?? "").toLowerCase();
     case "essid":
       return (c.sample.essid ?? "").toLowerCase();
+    // A disconnected client's last sample isn't shown ("—"), so it sorts as unknown.
     case "signal":
-      return c.sample.signal ?? -999;
+      return c.connected ? (c.sample.signal ?? -999) : -1000;
     case "rate":
-      return c.sample.tx_rate ?? 0;
+      return c.connected ? (c.sample.tx_rate ?? 0) : -1;
     case "uptime":
       return c.connected ? (c.sample.uptime ?? 0) : -1;
     case "last_seen":
