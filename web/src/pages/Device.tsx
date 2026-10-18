@@ -30,8 +30,8 @@ import {
   compact,
   duration,
   pct,
-  phy,
   rate,
+  rates,
   uplinkText,
   useNow,
 } from "../format";
@@ -215,9 +215,7 @@ function DevicePage({ mac }: { mac: string }) {
                   <td>
                     <Signal dbm={c.sample.signal} />
                   </td>
-                  <td>
-                    {phy(c.sample.tx_rate)} / {phy(c.sample.rx_rate)}
-                  </td>
+                  <td>{rates(c.sample)}</td>
                   <td>{duration(c.sample.uptime)}</td>
                 </tr>
               ))}

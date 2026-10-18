@@ -12,7 +12,14 @@ import {
   Toggle,
   useUrlTab,
 } from "../components/common";
-import { ago, bandChannel, duration, phy, useNow } from "../format";
+import {
+  ago,
+  bandChannel,
+  duration,
+  rates,
+  useNow,
+  wifiText,
+} from "../format";
 
 type SortKey =
   | "name"
@@ -240,16 +247,8 @@ const ClientRow = memo(function ClientRow({
       <td>{c.sample.essid ?? "—"}</td>
       <td>{bandChannel(c.sample.radio, c.sample.channel)}</td>
       <td>{c.connected ? <Signal dbm={c.sample.signal} /> : "—"}</td>
-      <td>
-        {c.connected
-          ? `${phy(c.sample.tx_rate)} / ${phy(c.sample.rx_rate)}`
-          : "—"}
-      </td>
-      <td>
-        {c.sample.wifi_gen
-          ? `802.11${c.sample.wifi_gen}${c.sample.nss ? ` ${c.sample.nss}×${c.sample.nss}` : ""}`
-          : "—"}
-      </td>
+      <td>{c.connected ? rates(c.sample) : "—"}</td>
+      <td>{wifiText(c.sample)}</td>
       <td>{c.connected ? duration(c.sample.uptime) : "—"}</td>
       <td>{c.connected ? "now" : ago(c.last_seen, now)}</td>
     </tr>

@@ -130,6 +130,12 @@ export function phy(kbps: number | null | undefined): string {
   return kbps >= 1000 ? `${Math.round(kbps / 1000)} Mbps` : `${kbps} kbps`;
 }
 
+/** A client's PHY rates, "down / up": the AP's transmit rate, then its receive rate. */
+export const rates = (s: { tx_rate: number | null; rx_rate: number | null }) => `${phy(s.tx_rate)} / ${phy(s.rx_rate)}`;
+
+/** A client's Wi-Fi standard and spatial streams, "802.11ax 2×2", or "—" when unknown. */
+export const wifiText = (s: { wifi_gen: string | null; nss: number | null }) => (s.wifi_gen ? `802.11${s.wifi_gen}${s.nss ? ` ${s.nss}×${s.nss}` : ""}` : "—");
+
 export function bytes(n: number | null | undefined): string {
   if (n === null || n === undefined) return "—";
   const units = ["B", "KB", "MB", "GB", "TB"];

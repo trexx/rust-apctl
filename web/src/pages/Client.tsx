@@ -29,9 +29,10 @@ import {
   bytes,
   compact,
   duration,
-  phy,
   rate,
+  rates,
   useNow,
+  wifiText,
 } from "../format";
 import { mcastLabel, serviceNames } from "../components/insights/Multicast";
 import { ConnectionLog } from "../components/Connections";
@@ -71,6 +72,7 @@ function ClientPage({ mac }: { mac: string }) {
       head={
         <AliasHeader
           mac={mac}
+          name={name}
           connected={c?.connected}
           alias={c?.alias ?? null}
           note={c?.note ?? null}
@@ -132,10 +134,8 @@ function ClientPage({ mac }: { mac: string }) {
           />
           <Stat
             label="Rate (down/up)"
-            value={`${phy(s.tx_rate)} / ${phy(s.rx_rate)}`}
-            sub={
-              s.wifi_gen ? `802.11${s.wifi_gen}, ${s.nss ?? "?"} streams` : ""
-            }
+            value={rates(s)}
+            sub={s.wifi_gen ? wifiText(s) : ""}
           />
           <Stat
             label="Session"
@@ -252,6 +252,8 @@ function ClientPage({ mac }: { mac: string }) {
 /** The client's name with an inline editor for its alias and note. */
 function AliasHeader(p: {
   mac: string;
+  /** What the page calls the client (`displayName`). */
+  name: string;
   connected?: boolean;
   alias: string | null;
   note: string | null;
@@ -317,7 +319,7 @@ function AliasHeader(p: {
     <div className="alias-head">
       <h1>
         {p.connected !== undefined && <Dot ok={p.connected} />}{" "}
-        {p.alias || p.hostname || p.mac}
+        {p.name}
         {canEdit && (
           <button
             className="btn small"
