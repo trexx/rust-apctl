@@ -926,6 +926,8 @@ fn prune(b: &Backups, kind: Kind, keep: usize) {
 pub fn schedule(b: Backups, store: Arc<store::Store>) {
     tokio::spawn(async move {
         let mut every = tokio::time::interval(Duration::from_secs(60));
+        // A long backup is followed by one check, not one per minute it took.
+        every.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         // After a failed automatic backup, the next try waits an hour.
         let mut retry_at: Ts = 0;
         loop {
