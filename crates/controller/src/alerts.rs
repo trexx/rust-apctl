@@ -630,7 +630,7 @@ impl Watcher {
             let status = |key: Key, severity: Severity, title: String, message: String| Alert::for_device(key, Category::ApStatus, severity, mac, title, message).tagged(format!("ap-status:{mac}"));
             match self.aps.check(now, mac, last_seen) {
                 Some(ApChange::Offline { last_seen }) => {
-                    let message = format!("No contact for {} (last seen {}).", human(now - last_seen), clock(last_seen));
+                    let message = format!("No contact for {} (last seen {}).", human(now - last_seen), time_of_day(last_seen));
                     self.book.open(now, status(Key::ApOffline, Severity::High, format!("{name} is offline"), message));
                 }
                 Some(ApChange::Flapping { times }) => {
@@ -736,7 +736,8 @@ pub fn spawn(store: Arc<Store>, writer: Writer, live: SharedLive, tx: broadcast:
     });
 }
 
-fn clock(ts: Ts) -> String {
+/// The time of day of `ts`, as an alert's message names it.
+fn time_of_day(ts: Ts) -> String {
     let s = ts.rem_euclid(86400);
     format!("{:02}:{:02} UTC", s / 3600, (s % 3600) / 60)
 }
