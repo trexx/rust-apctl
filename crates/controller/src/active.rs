@@ -684,8 +684,18 @@ async fn managed_inform(active: &Arc<Active>, ts: Ts, caller: &Caller, header: i
     let response = caller.seal(&reply);
     // The engine follows the interval it asked for (or the AP would be called
     // offline on a site where informs come more than a minute apart) and
-    // records each push.
-    if reply["_type"] == "setparam" || reply.get("interval").is_some() {
+    // records each push. An AP's interval rarely changes: a heartbeat that
+    // repeats the one the engine has is only counted.
+    let tell = {
+        let live = active.live.read().unwrap();
+        let interval = reply.get("interval").and_then(Value::as_i64);
+        let tell = reply["_type"] == "setparam" || interval.is_some_and(|i| live.devices.get(&mac).is_none_or(|d| d.interval != i));
+        if !tell && interval.is_some() {
+            live.counters.replies.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        tell
+    };
+    if tell {
         let _ = active.engine.send(Input::Replied { ts, mac, payload: reply }).await;
     }
     response
@@ -931,7 +941,24 @@ mod tests {
         inform_as_ap(&rig, &ap_payload(&version), KEY, GCM_ZLIB).await;
         let r = replied(&mut rig);
         assert_eq!((r.len(), r[0]["_type"].as_str()), (1, Some("noop")));
-        assert!(r[0]["interval"].as_i64().is_some());
+        let interval = r[0]["interval"].as_i64().unwrap();
+        // Once the engine has that interval, a heartbeat is only counted.
+        let live = rig.live.clone();
+        let seen = |interval: Ts| {
+            let snapshot = crate::model::parse(0, &ap_payload(&version)).unwrap();
+            let d = crate::engine::DeviceView { snapshot, online: true, first_seen: 0, last_seen: 0, peer: "x".into(), interval, last_full_inform: 0, last_config_push: None };
+            live.write().unwrap().devices.insert(AP.parse().unwrap(), d);
+        };
+        seen(interval);
+        let replies = || live.read().unwrap().counters.replies.load(std::sync::atomic::Ordering::Relaxed);
+        let before = replies();
+        inform_as_ap(&rig, &ap_payload(&version), KEY, GCM_ZLIB).await;
+        assert!(replied(&mut rig).is_empty());
+        assert_eq!(replies(), before + 1);
+        // Another interval than the engine's is heard.
+        seen(interval + 1);
+        inform_as_ap(&rig, &ap_payload(&version), KEY, GCM_ZLIB).await;
+        assert_eq!(replied(&mut rig).len(), 1);
         // A notification's bare noop sets nothing.
         let mut notif = ap_payload(&version);
         notif["inform_as_notif"] = json!(true);
