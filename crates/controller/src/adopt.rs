@@ -29,6 +29,7 @@ use crate::api::{ApiError, AppState, Json, MacPath};
 use crate::clock;
 use crate::engine::{Event, EventKind, Input, Live};
 use crate::model::Ts;
+use crate::settings::doc_mac;
 
 /// How long an AP has to come back with its new key.
 pub const ADOPT_TIMEOUT: Ts = 300;
@@ -76,20 +77,14 @@ pub struct Adoption {
     pub forgetting: HashMap<Mac, Ts>,
 }
 
-/// Whether a record's `mac` is this one (`aa:bb:..`, any case), without
-/// making a string for each record compared.
-fn is_mac(v: &Value, mac: &Mac) -> bool {
-    v.as_str().is_some_and(|s| s.len() == 17 && s.as_bytes()[2] == b':' && s.parse::<Mac>().is_ok_and(|m| m == *mac))
-}
-
 /// The AP's record in the settings.
 pub fn device_doc<'a>(state: &'a Value, mac: &Mac) -> Option<&'a Value> {
-    state["devices"].as_array()?.iter().find(|d| is_mac(&d["mac"], mac))
+    state["devices"].as_array()?.iter().find(|d| doc_mac(&d["mac"]) == Some(*mac))
 }
 
 /// The AP's record in the settings, to change it.
 pub fn device_doc_mut<'a>(state: &'a mut Value, mac: &Mac) -> Option<&'a mut Value> {
-    state["devices"].as_array_mut()?.iter_mut().find(|d| is_mac(&d["mac"], mac))
+    state["devices"].as_array_mut()?.iter_mut().find(|d| doc_mac(&d["mac"]) == Some(*mac))
 }
 
 /// The key an AP apctl manages informs with: its record's `x_authkey`, else
@@ -109,7 +104,7 @@ pub fn device_key(state: Option<&Value>, keys: &KeyStore, mac: &Mac) -> Option<[
 /// encrypts with its record's `syslog_key`, which apctl makes at adoption).
 pub fn syslog_keys(state: Option<&Value>, keys: &KeyStore) -> Vec<(Mac, [u8; 32])> {
     let devices = state.and_then(|s| s["devices"].as_array()).into_iter().flatten();
-    let stored = devices.filter_map(|d| Some((d["mac"].as_str()?.parse().ok()?, inform::parse_key(d["syslog_key"].as_str()?).ok()?)));
+    let stored = devices.filter_map(|d| Some((doc_mac(&d["mac"])?, inform::parse_key(d["syslog_key"].as_str()?).ok()?)));
     stored.chain(keys.syslog_keys().map(|(m, k)| (*m, *k))).collect()
 }
 
@@ -273,7 +268,7 @@ pub fn adopt_device(state: &mut Value, mac: &Mac, payload: &Value) -> Result<Str
 
 /// Removes an AP from the settings and everything that names it.
 pub fn remove_device(state: &mut Value, mac: &Mac) -> Result<String, String> {
-    let same = |v: &Value| v.as_str().is_some_and(|m| m.parse::<Mac>().ok() == Some(*mac));
+    let same = |v: &Value| doc_mac(v) == Some(*mac);
     let devices = state["devices"].as_array_mut().ok_or("the settings have no APs")?;
     let before = devices.len();
     let name = devices.iter().find(|d| same(&d["mac"])).and_then(|d| d["name"].as_str()).map_or_else(|| mac.to_string(), |n| format!("{n} ({mac})"));

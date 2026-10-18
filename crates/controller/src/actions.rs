@@ -27,6 +27,7 @@ use serde_json::{Value, json};
 use crate::api::{ApiError, AppState, Json, MacPath};
 use crate::clock;
 use crate::engine::{Event, EventKind, Input, Live};
+use crate::settings::doc_mac;
 
 /// Commands waiting for an AP's next inform.
 pub fn queue(live: &mut Live, mac: Mac, cmd: Value) {
@@ -70,7 +71,7 @@ pub fn next(live: &mut Live, mac: &Mac) -> Option<Value> {
 /// MAC as `aa:bb:..`) if needed.
 pub fn edit_client(state: &mut Value, mac: Mac, fields: &[(&str, Value)]) {
     // Matched as `controls` reads them, whichever way the entry writes its MAC.
-    let entry = match state["clients"].as_array().and_then(|l| l.iter().position(|c| entry_mac(c) == Some(mac))) {
+    let entry = match state["clients"].as_array().and_then(|l| l.iter().position(|c| doc_mac(&c["mac"]) == Some(mac))) {
         Some(i) => &mut state["clients"][i],
         None => crate::settings::push_doc(state, "clients", json!({ "mac": mac.to_string() })),
     };
@@ -91,10 +92,10 @@ pub struct Controls<'a> {
 
 impl<'a> Controls<'a> {
     fn of(entry: Option<&'a Value>) -> Self {
-        let locked_to = entry.filter(|c| c["fixed_ap_enabled"].as_bool() == Some(true)).and_then(|c| c["fixed_ap_mac"].as_str());
+        let locked_to = entry.filter(|c| c["fixed_ap_enabled"].as_bool() == Some(true)).and_then(|c| doc_mac(&c["fixed_ap_mac"]));
         Controls {
             blocked: entry.and_then(|c| c["blocked"].as_bool()).unwrap_or(false),
-            locked_to: locked_to.map(str::to_ascii_lowercase),
+            locked_to: locked_to.map(|m| m.to_string()),
             usergroup_id: entry.map(|c| &c["usergroup_id"]),
         }
     }
@@ -103,11 +104,7 @@ impl<'a> Controls<'a> {
 /// One client's controls. For many clients, `ClientControls` looks each one
 /// up without scanning the settings' client list every time.
 pub fn controls<'a>(state: Option<&'a Value>, mac: &Mac) -> Controls<'a> {
-    Controls::of(state.and_then(|s| s["clients"].as_array()).and_then(|l| l.iter().find(|c| entry_mac(c) == Some(*mac))))
-}
-
-fn entry_mac(c: &Value) -> Option<Mac> {
-    c["mac"].as_str()?.parse().ok()
+    Controls::of(state.and_then(|s| s["clients"].as_array()).and_then(|l| l.iter().find(|c| doc_mac(&c["mac"]) == Some(*mac))))
 }
 
 /// The settings' client entries by MAC, built once for a list of clients.
@@ -119,7 +116,7 @@ impl<'a> ClientControls<'a> {
         let mut map = HashMap::with_capacity(list.len());
         for c in list {
             // The first entry for a MAC wins, as with a scan of the list.
-            if let Some(m) = entry_mac(c) {
+            if let Some(m) = doc_mac(&c["mac"]) {
                 map.entry(m).or_insert(c);
             }
         }

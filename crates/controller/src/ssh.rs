@@ -201,7 +201,7 @@ fn shell_quote(s: &str) -> String {
 fn known_host_key(live: &crate::engine::Live, ip: &str) -> Option<(Mac, String)> {
     let state = live.state.as_deref()?;
     let fingerprint = |mac: &Mac| crate::adopt::device_doc(state, mac).and_then(|d| d["x_ssh_hostkey_fingerprint"].as_str()).map(str::to_string);
-    let by_record = state["devices"].as_array()?.iter().filter(|d| d["ip"].as_str() == Some(ip)).filter_map(|d| d["mac"].as_str()?.parse::<Mac>().ok());
+    let by_record = state["devices"].as_array()?.iter().filter(|d| d["ip"].as_str() == Some(ip)).filter_map(|d| crate::settings::doc_mac(&d["mac"]));
     live.by_ip.get(ip).copied().into_iter().chain(by_record).find_map(|mac| Some((mac, fingerprint(&mac)?)))
 }
 
