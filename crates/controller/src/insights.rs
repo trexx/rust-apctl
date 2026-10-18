@@ -55,7 +55,13 @@ pub async fn activity(State(s): State<AppState>, Query(q): Query<RangeQuery>) ->
         let [retries, attempts, wifi_dropped] = cols_at(COLS, RETRY_COLS);
         // One AP's SSIDs by their BSSIDs, the table's key (`ap_mac` has no index).
         let bssids = ap.as_deref().map(|a| bssids_of(c, tier, a)).transpose()?;
-        let only = bssids.as_deref().map(|b| Only::In("bssid", b));
+        // Else one band's SSIDs, chosen by SQLite; one AP's are chosen by band below.
+        let one_band = band.as_deref().filter(|b| *b != "all");
+        let only = match (&bssids, one_band) {
+            (Some(b), _) => Some(Only::In("bssid", b)),
+            (None, Some(b)) => Some(Only::Is("radio", b)),
+            (None, None) => None,
+        };
         let vaps = load(c, Spec { table: "vap_stats", key: "bssid", extra: &["radio"], cols: COLS, only }, tier, from, to)?;
         // bucket -> per-bssid accumulators
         #[derive(Default, Clone)]
@@ -77,7 +83,7 @@ pub async fn activity(State(s): State<AppState>, Query(q): Query<RangeQuery>) ->
         }
         let mut per: BTreeMap<Ts, HashMap<&str, Acc>> = BTreeMap::new();
         for (bssid, (ex, samples)) in &vaps {
-            if !band_ok(&band, &ex[0]) {
+            if bssids.is_some() && !band_ok(&band, &ex[0]) {
                 continue;
             }
             for d in deltas(samples, from) {
@@ -142,7 +148,7 @@ pub async fn activity(State(s): State<AppState>, Query(q): Query<RangeQuery>) ->
         // radios' samples that have it (a bucket where none has it is null, not 0).
         let mut params = vec![Sql::Integer(from), Sql::Integer(to), Sql::Integer(bucket)];
         let mut only = String::new();
-        if let Some(b) = band.as_deref().filter(|b| *b != "all") {
+        if let Some(b) = one_band {
             params.push(Sql::Text(b.into()));
             only.push_str(&format!(" AND radio = ?{}", params.len()));
         }
