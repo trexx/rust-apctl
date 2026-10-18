@@ -215,6 +215,11 @@ pub(crate) fn band_name(band: &str) -> &str {
 /// The `radio_caps` bit of a radio with the "interference blocker" (hard noise floor).
 const INTERFERENCE_BLOCKER: i64 = 131072;
 
+/// Whether an AP record's radio has the interference blocker.
+fn has_blocker(radio: &Value) -> bool {
+    radio["radio_caps"].as_i64().is_some_and(|c| c & INTERFERENCE_BLOCKER != 0)
+}
+
 /// The APs an SSID is broadcast from: `None` for all of them.
 fn wlan_aps(state: &Value, w: &Value) -> Option<Vec<String>> {
     let groups: Vec<&str> = w["ap_group_ids"].as_array()?.iter().filter_map(Value::as_str).collect();
@@ -333,7 +338,7 @@ pub async fn device(State(s): State<AppState>, MacPath(mac): MacPath) -> Result<
             v["channels"] = channels(&state, band, false);
             v["channels_outdoor"] = channels(&state, band, true);
             // The "interference blocker" exists only on radios reporting this capability.
-            v["has_blocker"] = json!(r["radio_caps"].as_i64().is_some_and(|c| c & INTERFERENCE_BLOCKER != 0));
+            v["has_blocker"] = json!(has_blocker(r));
             v
         })
         .collect();
@@ -552,13 +557,19 @@ const PROTECTION: &[Protection] = &[
     Protection { name: "open", security: "open", wpa_mode: "wpa2", wpa3_support: false, wpa3_transition: false },
 ];
 
+/// An SSID's protection as the editor's rules read it: (WPA Personal, WPA3,
+/// WPA2/WPA3 transition). The transition flag means nothing without WPA3.
+fn psk_wpa3(w: &Value) -> (bool, bool, bool) {
+    let wpa3 = w["wpa3_support"].as_bool().unwrap_or(false);
+    (w["security"].as_str() == Some("wpapsk"), wpa3, wpa3 && w["wpa3_transition"].as_bool().unwrap_or(false))
+}
+
 /// The protection choice of a stored SSID, if it is one the editor offers.
-/// An open SSID's `wpa_mode`, and the transition flag without WPA3, mean nothing.
+/// An open SSID's `wpa_mode` means nothing.
 fn protection_of(w: &Value) -> Option<&'static str> {
     let security = w["security"].as_str()?;
     let wpa_mode = if security == "open" { "wpa2" } else { w["wpa_mode"].as_str().unwrap_or("wpa2") };
-    let wpa3 = w["wpa3_support"].as_bool().unwrap_or(false);
-    let transition = wpa3 && w["wpa3_transition"].as_bool().unwrap_or(false);
+    let (_, wpa3, transition) = psk_wpa3(w);
     PROTECTION.iter().find(|p| (p.security, p.wpa_mode, p.wpa3_support, p.wpa3_transition) == (security, wpa_mode, wpa3, transition)).map(|p| p.name)
 }
 
@@ -950,9 +961,7 @@ fn wlan_security(p: &Value, w: &mut Value) -> Result<(), String> {
         }
     }
     copy_fields(p, w, &[("pmf_mode", Enum(&["disabled", "optional", "required"]))])?;
-    let wpa3 = w["wpa3_support"].as_bool().unwrap_or(false);
-    let transition = w["wpa3_transition"].as_bool().unwrap_or(false);
-    let psk = w["security"].as_str() == Some("wpapsk");
+    let (psk, wpa3, transition) = psk_wpa3(w);
     match (psk && wpa3, transition, w["pmf_mode"].as_str().unwrap_or("disabled")) {
         (true, false, m) if m != "required" => return Err("WPA3 needs protected management frames (PMF) set to required".into()),
         (true, true, "disabled") => return Err("WPA2/WPA3 needs protected management frames (PMF) optional or required".into()),
@@ -974,11 +983,7 @@ fn wlan_security(p: &Value, w: &mut Value) -> Result<(), String> {
 /// The password, checked against the protection the SSID ends up with (`w`,
 /// once Force Wi-Fi 4 has had its say).
 fn wlan_password(p: &Value, before: &Value, w: &mut Value, changed: &mut Vec<&str>) -> Result<(), String> {
-    let effective = |w: &Value| {
-        let wpa3 = w["wpa3_support"].as_bool().unwrap_or(false);
-        (w["security"].as_str() == Some("wpapsk"), wpa3, wpa3 && w["wpa3_transition"].as_bool().unwrap_or(false))
-    };
-    let (psk, wpa3, transition) = effective(w);
+    let (psk, wpa3, transition) = psk_wpa3(w);
     let given = p["passphrase"].as_str();
     if psk && given.is_none() && w["x_passphrase"].as_str().is_none_or(str::is_empty) {
         return Err("a password is needed for WPA2/WPA3".into());
@@ -987,7 +992,7 @@ fn wlan_password(p: &Value, before: &Value, w: &mut Value, changed: &mut Vec<&st
     // came about (Force Wi-Fi 4 turns WPA3 off): WPA3 allows up to 255
     // characters, and a longer one kept for WPA2 would reach the APs as a key
     // they cannot use.
-    if given.is_some() || psk && (!p["protection"].is_null() || effective(before) != effective(w)) {
+    if given.is_some() || psk && (!p["protection"].is_null() || psk_wpa3(before) != psk_wpa3(w)) {
         let pass = given.or(w["x_passphrase"].as_str()).unwrap_or_default();
         let printable = pass.chars().all(|c| (' '..='~').contains(&c));
         let hex64 = pass.len() == 64 && pass.chars().all(|c| c.is_ascii_hexdigit());
@@ -1509,8 +1514,7 @@ fn radio_edit(state: &Value, e: &DeviceEdit, rp: &Value, before: &Value, d: &mut
     }
     copy_fields(rp, r, &[("min_rssi_enabled", Bool), ("min_rssi", Int(-90, -67))])?;
     if let Some(b) = bool_field(rp, "hard_noise_floor_enabled")? {
-        let capable = r["radio_caps"].as_i64().is_some_and(|c| c & INTERFERENCE_BLOCKER != 0);
-        if b && !capable {
+        if b && !has_blocker(r) {
             return Err(format!("{label}: this radio has no interference blocker"));
         }
         r["hard_noise_floor_enabled"] = json!(b);
