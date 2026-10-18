@@ -213,10 +213,11 @@ pub fn set_channels(state: &mut Value, band: &str, changes: &[(String, i64)]) ->
     let locked = if band == "ng" { crate::settings::channel_locked_aps(state) } else { vec![] };
     let allowed_here = allowed(Some(state), band, true);
     for (mac, ch) in changes {
-        if locked.contains(&mac.to_ascii_lowercase()) {
+        // The locks list MACs as aa:bb:..; the plan's is compared in that form, however it is written.
+        let m: Mac = mac.parse().map_err(|_| format!("{mac} is not in the settings"))?;
+        if locked.contains(&m.to_string()) {
             return Err(format!("{mac}: the 2.4 GHz channel is locked by an SSID's IoT setting"));
         }
-        let m: Mac = mac.parse().map_err(|_| format!("{mac} is not in the settings"))?;
         let d = device_doc(state, &m).ok_or_else(|| format!("{mac} is not in the settings"))?;
         let outdoor = crate::settings::outdoor(state, d);
         let d = device_doc_mut(state, &m).expect("found above");
@@ -608,6 +609,17 @@ mod tests {
         assert!(set_channels(&mut s, "ng", &[("02:00:00:00:00:01".into(), 3)]).is_err(), "not in the allowed list");
         set_channels(&mut s, "na", &[("02:00:00:00:00:01".into(), 36)]).unwrap();
         assert!(set_channels(&mut s, "na", &[("02:00:00:00:00:02".into(), 36)]).is_err(), "not one of the APs");
+    }
+
+    #[test]
+    fn a_channel_locked_ap_is_refused_however_its_mac_is_written() {
+        let mut s = state();
+        s["apgroup"] = json!([{ "_id": "g1", "attr_hidden_id": "default", "device_macs": ["02:00:00:00:00:01"], "site_id": "s1" }]);
+        s["wlanconf"] = json!([{ "_id": "w1", "name": "Things", "iot_channel_lock": true, "ap_group_ids": ["g1"], "site_id": "s1" }]);
+        for mac in ["02:00:00:00:00:01", "02-00-00-00-00-01", "02:00:00:00:00:01".to_uppercase().as_str()] {
+            assert!(set_channels(&mut s, "ng", &[(mac.into(), 11)]).unwrap_err().contains("IoT"), "{mac}");
+        }
+        set_channels(&mut s, "na", &[("02-00-00-00-00-01".into(), 36)]).unwrap();
     }
 
     #[test]
