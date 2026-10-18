@@ -1,7 +1,8 @@
 import { useState } from "react";
 import { adoptAp, adoptOverSsh, keys, useAdoption, useCanEdit } from "../api";
 import { ago, useNow } from "../format";
-import { Outcome, TextField, useRunner } from "./common";
+import { Outcome, useRunner } from "./common";
+import { Row, TextInput } from "./settings/form";
 
 /** APs waiting for adoption, and adopting one by IP over SSH (active mode). */
 export function AdoptionPanel() {
@@ -84,37 +85,26 @@ export function AdoptionPanel() {
             empty to try your site's device login, then the factory one
             (ubnt/ubnt).
           </p>
-          <div className="form-row">
-            <div className="form-label">IP address</div>
-            <div className="form-control">
-              <TextField
-                value={ip}
-                placeholder="192.168.1.20"
-                aria-label="IP address"
-                onChange={setIp}
-              />
-            </div>
-          </div>
-          <div className="form-row">
-            <div className="form-label">SSH login</div>
-            <div className="form-control">
-              <TextField
-                value={user}
-                placeholder="username"
-                autoComplete="off"
-                aria-label="SSH user name"
-                onChange={setUser}
-              />
-              <TextField
-                type="password"
-                value={pass}
-                placeholder="password"
-                autoComplete="new-password"
-                aria-label="SSH password"
-                onChange={setPass}
-              />
-            </div>
-          </div>
+          <Row label="IP address">
+            <TextInput value={ip} placeholder="192.168.1.20" onChange={setIp} />
+          </Row>
+          <Row label="SSH login">
+            <TextInput
+              value={user}
+              placeholder="username"
+              autoComplete="off"
+              aria-label="SSH user name"
+              onChange={setUser}
+            />
+            <TextInput
+              type="password"
+              value={pass}
+              placeholder="password"
+              autoComplete="new-password"
+              aria-label="SSH password"
+              onChange={setPass}
+            />
+          </Row>
           <div className="actions-row">
             <button
               className="btn primary"
