@@ -17,8 +17,13 @@ use crate::api::AppState;
 use crate::engine::Live;
 use crate::settings::{docs, id_of};
 
-/// What was last sent for a client: the AP, the SSID and the limits.
-type Sent = HashMap<Mac, (Mac, String, (i64, i64))>;
+/// What was last sent for a client.
+struct Sent {
+    ap: Mac,
+    essid: String,
+    /// (down, up) kbps.
+    limit: (i64, i64),
+}
 
 /// What the limits depend on in the settings, worked out again only when they
 /// change (every change replaces the settings' Arc).
@@ -26,8 +31,8 @@ type Sent = HashMap<Mac, (Mac, String, (i64, i64))>;
 struct Groups {
     /// The settings these were read from (held, so the address cannot be reused).
     state: Option<Arc<Value>>,
-    /// Each client's own group (its first entry's), if it has one.
-    own: HashMap<Mac, Option<String>>,
+    /// The clients with a group of their own (their first entry's), and that group.
+    own: HashMap<Mac, String>,
     /// Each SSID's group, by name (the first SSID of that name).
     ssid: HashMap<String, Option<String>>,
     default: Option<String>,
@@ -41,11 +46,13 @@ impl Groups {
             return;
         }
         let mut g = Groups { state: Some(state.clone()), default: crate::settings::default_usergroup(state), ..Default::default() };
+        let mut own = HashMap::new();
         for c in state["clients"].as_array().into_iter().flatten() {
             if let Some(mac) = c["mac"].as_str().and_then(|m| m.parse::<Mac>().ok()) {
-                g.own.entry(mac).or_insert_with(|| c["usergroup_id"].as_str().filter(|id| !id.is_empty()).map(str::to_string));
+                own.entry(mac).or_insert_with(|| c["usergroup_id"].as_str().filter(|id| !id.is_empty()).map(str::to_string));
             }
         }
+        g.own = own.into_iter().filter_map(|(mac, group)| Some((mac, group?))).collect();
         for w in docs(state, "wlanconf") {
             if let Some(name) = w["name"].as_str() {
                 // No group (or an empty id, as imports can have) is the Default group.
@@ -64,7 +71,7 @@ impl Groups {
     /// when that differs from its SSID's, else (if a command was sent
     /// `before`) the SSID's.
     fn wanted(&self, client: &Mac, essid: &str, before: bool) -> Option<(i64, i64)> {
-        let own = self.own.get(client).and_then(Option::as_deref);
+        let own = self.own.get(client).map(String::as_str);
         // Most clients have no group of their own and were never sent one.
         if own.is_none() && !before {
             return None;
@@ -83,7 +90,7 @@ impl Groups {
 /// What the watcher keeps between ticks.
 #[derive(Default)]
 struct Limits {
-    sent: Sent,
+    sent: HashMap<Mac, Sent>,
     groups: Groups,
 }
 
@@ -91,6 +98,10 @@ struct Limits {
 fn due(live: &Live, l: &mut Limits) -> Vec<(Mac, Value)> {
     let Some(state) = &live.state else { return Vec::new() };
     l.groups.refresh(state);
+    // The usual case: no client has a group of its own, and none was ever limited.
+    if l.groups.own.is_empty() && l.sent.is_empty() {
+        return Vec::new();
+    }
     let connected = |m: &Mac| live.clients.get(m).is_some_and(|c| c.connected);
     l.sent.retain(|m, _| connected(m));
     let mut out = Vec::new();
@@ -98,18 +109,18 @@ fn due(live: &Live, l: &mut Limits) -> Vec<(Mac, Value)> {
         let (ap, essid) = (c.sample.ap_mac, c.sample.essid.as_deref().unwrap_or_default());
         let before = l.sent.get(client);
         // A roam or SSID change starts afresh: the new AP knows nothing of earlier commands.
-        let same_place = before.is_some_and(|b| b.0 == ap && b.1 == essid);
+        let same_place = before.is_some_and(|b| b.ap == ap && b.essid == essid);
         let Some(limit) = l.groups.wanted(client, essid, same_place) else {
             l.sent.remove(client);
             continue;
         };
-        if same_place && before.is_some_and(|b| b.2 == limit) {
+        if same_place && before.is_some_and(|b| b.limit == limit) {
             continue;
         }
         let (down, up) = limit;
         out.push((ap, json!({ "_type": "cmd", "cmd": "rate-update", "mac": client.to_string(), "dl_max": down, "dl_min": 64, "ul_max": up, "ul_min": 64 })));
         tracing::info!("{client}: speed limit down {down} up {up} kbps via {ap}");
-        l.sent.insert(*client, (ap, essid.to_string(), limit));
+        l.sent.insert(*client, Sent { ap, essid: essid.to_string(), limit });
     }
     out
 }
