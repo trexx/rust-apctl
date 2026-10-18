@@ -281,7 +281,7 @@ impl ApWatch {
             (false, Some(since)) => {
                 self.down.remove(&mac);
                 let alerted = self.sent.get(&mac).and_then(|s| s.last()).is_some_and(|t| *t >= since);
-                Some(ApChange::Online { down_for: last_seen.max(now - 1) - since, alerted })
+                Some(ApChange::Online { down_for: now - since, alerted })
             }
             _ => None,
         }
@@ -793,7 +793,7 @@ mod tests {
         assert_eq!(w.check(1000, ap, 1000 - 240), Some(ApChange::Offline { last_seen: 760 }));
         assert_eq!(w.check(1030, ap, 760), None, "reported once");
         // Back after 5 minutes.
-        assert_eq!(w.check(1060, ap, 1059), Some(ApChange::Online { down_for: 1059 - 760, alerted: true }));
+        assert_eq!(w.check(1060, ap, 1059), Some(ApChange::Online { down_for: 1060 - 760, alerted: true }));
         // Second drop the same day: reported.
         assert!(matches!(w.check(2000, ap, 1700), Some(ApChange::Offline { .. })));
         w.check(2100, ap, 2099);
