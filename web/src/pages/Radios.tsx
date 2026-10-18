@@ -1,6 +1,11 @@
 import { useState } from "react";
 import { Link } from "react-router";
-import { useChannelPlan, useNeighbors, useRadios } from "../api";
+import {
+  useChannelAi,
+  useChannelPlan,
+  useNeighbors,
+  useRadios,
+} from "../api";
 import type { Neighbor, RadioOverview } from "../api";
 import {
   ago,
@@ -21,6 +26,7 @@ import {
   Segmented,
   Signal,
   THead,
+  Toggle,
   useUrlTab,
 } from "../components/common";
 import { ChannelAiPanel, PlanActions } from "../components/ChannelAi";
@@ -139,7 +145,10 @@ function ChannelPlan({
   band: "ng" | "na";
   radios: RadioOverview[];
 }) {
-  const [dfs, setDfs] = useState(false);
+  // As Channel AI's nightly run plans, until changed here.
+  const ai = useChannelAi();
+  const [ownDfs, setDfs] = useState<boolean | null>(null);
+  const dfs = ownDfs ?? ai.data?.settings.dfs ?? false;
   const plan = useChannelPlan(band, dfs);
   return (
     <div className="panel">
@@ -147,14 +156,11 @@ function ChannelPlan({
         <b>Channel plan, {bandName(band)}</b>
         <span className="spacer" />
         {band === "na" && (
-          <label className="small">
-            <input
-              type="checkbox"
-              checked={dfs}
-              onChange={(e) => setDfs(e.target.checked)}
-            />{" "}
-            Consider DFS channels
-          </label>
+          <Toggle
+            value={dfs}
+            onChange={setDfs}
+            label="Consider DFS channels"
+          />
         )}
       </div>
       <p className="muted small">
