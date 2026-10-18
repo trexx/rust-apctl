@@ -29,7 +29,7 @@ use serde_json::{Value, json};
 use crate::api::{ApiError, AppState, Json, Query};
 use crate::engine::Live;
 use crate::api::read;
-use crate::insights::{RangeQuery, ap_name, ap_name_of, client_name, memo_read, window};
+use crate::series::{RangeQuery, ap_name, ap_name_of, client_name, memo_read, window};
 use crate::model::Ts;
 use crate::store::Db;
 

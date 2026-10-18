@@ -69,8 +69,8 @@ pub struct AppStateInner {
     pub writer: crate::store::Writer,
     /// `--inform-url` in active mode (see `ssh::inform_url`).
     pub inform_url: Option<String>,
-    /// What the insights views read lately (see `insights::memo_read`).
-    pub memo: crate::insights::Memo,
+    /// What the insights views read lately (see `series::memo_read`).
+    pub memo: crate::series::Memo,
     /// What the threat checks keep between runs, shared with `threats::watch`.
     pub threats: Arc<crate::threats::ThreatState>,
 }
@@ -140,7 +140,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/site/multicast", get(crate::insights::multicast))
         .route("/api/rf/radios", get(crate::insights::radios))
         .route("/api/rf/neighbors", get(crate::insights::neighbors))
-        .route("/api/rf/channel-plan", get(crate::insights::channel_plan))
+        .route("/api/rf/channel-plan", get(crate::channelplan::channel_plan))
         .route("/api/rf/channel-plan/apply", axum::routing::post(crate::channelai::apply_plan))
         .route("/api/rf/channel-ai", get(crate::channelai::status).put(crate::channelai::put_settings))
         .route("/api/rf/channel-ai/run", axum::routing::post(crate::channelai::run_now))

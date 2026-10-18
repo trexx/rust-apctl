@@ -10,7 +10,7 @@
 //! channels into the APs' radio settings, which go out as a normal config.
 //! APs on a wireless uplink keep their channel, as do excluded ones (the
 //! official controller keeps the exclusion list but no longer reads it;
-//! apctl honours it). The plan itself is apctl's own (see `insights`).
+//! apctl honours it). The plan itself is apctl's own (see `channelplan`).
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -285,7 +285,7 @@ async fn run(s: AppState, bands: Vec<String>, trigger: &'static str, _running: R
             let live = s.live.read().unwrap();
             (allowed(live.state.as_deref(), band, false), pinned(&live, band))
         };
-        let plan = match crate::insights::compute_plan(&s, band.clone(), false, allowed, pinned).await {
+        let plan = match crate::channelplan::compute_plan(&s, band.clone(), false, allowed, pinned).await {
             Ok(p) => p,
             Err(e) => {
                 tracing::warn!("channel AI: no plan for {band}: {}", e.1);

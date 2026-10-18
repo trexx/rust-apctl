@@ -42,7 +42,7 @@ pub fn window(q: &RangeQuery) -> (Ts, Ts, usize) {
 }
 
 /// Bucket width for charts: a few hundred points whatever the range.
-fn bucket_for(range: Ts, tier: usize) -> Ts {
+pub(crate) fn bucket_for(range: Ts, tier: usize) -> Ts {
     let min = TIERS[tier].1.max(60);
     let target = (range / 288).max(min);
     [60, 300, 900, 1800, 3600, 3 * 3600, 6 * 3600, 86400].into_iter().find(|b| *b >= target).unwrap_or(86400)
@@ -110,7 +110,7 @@ impl Samples {
     }
 
     #[cfg(test)]
-    fn from_rows(rows: Vec<(Ts, Vec<Option<f64>>)>) -> Samples {
+    pub(crate) fn from_rows(rows: Vec<(Ts, Vec<Option<f64>>)>) -> Samples {
         let mut s = Samples::new(rows.first().map_or(0, |r| r.1.len()));
         for (t, v) in rows {
             s.ts.push(t);
@@ -147,12 +147,12 @@ pub(crate) struct Spec<'a> {
 }
 
 /// Where a column is in a column list (a list the caller wrote, so a miss is a bug).
-fn col(cols: &[&str], name: &str) -> usize {
+pub(crate) fn col(cols: &[&str], name: &str) -> usize {
     cols.iter().position(|c| *c == name).unwrap_or_else(|| panic!("{name} is not among the loaded columns"))
 }
 
 /// Where each named column is in a column list.
-fn cols_at<const N: usize>(cols: &[&str], names: [&str; N]) -> [usize; N] {
+pub(crate) fn cols_at<const N: usize>(cols: &[&str], names: [&str; N]) -> [usize; N] {
     names.map(|n| col(cols, n))
 }
 
@@ -167,7 +167,7 @@ pub(crate) fn ap_name_of(live: &Live, mac: &inform::Mac) -> Option<String> {
 }
 
 /// Our APs' SSIDs (BSSIDs), with the AP of each.
-fn own_bssids(live: &Live) -> impl Iterator<Item = (&inform::Mac, &crate::model::VapSample)> {
+pub(crate) fn own_bssids(live: &Live) -> impl Iterator<Item = (&inform::Mac, &crate::model::VapSample)> {
     live.devices.iter().flat_map(|(m, d)| d.snapshot.vaps.iter().map(move |v| (m, v)))
 }
 
@@ -343,7 +343,7 @@ mod tests {
             let p = plan(Spec { table: "vap_stats", key: "bssid", extra: &["radio"], cols: &["tx_bytes"], only: Some(Only::In("bssid", &bssids)) }, tier);
             assert!(p.contains("USING PRIMARY KEY (bssid=?"), "{p}");
             // One AP's clients: by AP from the roll-ups (the raw tier has no such index).
-            let p = plan(Spec { table: "client_stats", key: "mac", extra: &[], cols: &BYTE_COLS, only: Some(Only::Is("ap_mac", "02:00:00:00:00:a1")) }, tier);
+            let p = plan(Spec { table: "client_stats", key: "mac", extra: &[], cols: &["tx_bytes", "rx_bytes"], only: Some(Only::Is("ap_mac", "02:00:00:00:00:a1")) }, tier);
             assert_eq!(p.contains("(ap_mac=? AND ts>? AND ts<?)"), tier > 0, "{p}");
         }
     }

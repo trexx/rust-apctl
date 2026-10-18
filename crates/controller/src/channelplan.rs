@@ -15,9 +15,9 @@ use crate::store::Db;
 
 #[derive(Deserialize)]
 pub struct PlanQuery {
-    band: Option<String>,
+    pub(crate) band: Option<String>,
     /// Consider DFS channels on 5 GHz (radar can force the AP off them).
-    dfs: Option<bool>,
+    pub(crate) dfs: Option<bool>,
 }
 
 /// A candidate channel block: its primary channel and frequency span (MHz).

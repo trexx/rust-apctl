@@ -25,7 +25,8 @@ use tokio::sync::{broadcast, mpsc};
 use crate::api::{ApiError, AppState, Json, Query};
 use crate::clock;
 use crate::engine::{Event, EventKind, LiveMsg, SharedLive};
-use crate::insights::{RETRY_AT, RETRY_COLS, Spec, retry_pct, retry_totals};
+use crate::insights::{RETRY_AT, RETRY_COLS, retry_pct, retry_totals};
+use crate::series::Spec;
 use crate::model::{Ts, named_enum};
 use crate::settings::band_name;
 use crate::store::{Db, Store, Writer};
@@ -414,7 +415,7 @@ async fn radio_health(store: &Arc<Store>, now: Ts) -> anyhow::Result<HashMap<(Ma
             }
             // Retries from the SSIDs' counters, counted as the other views count them.
             let spec = Spec { table: "vap_stats", key: "bssid", extra: &["ap_mac", "radio"], cols: &RETRY_COLS, only: None };
-            let vaps = crate::insights::load(c, spec, 0, from, now)?;
+            let vaps = crate::series::load(c, spec, 0, from, now)?;
             for ((ap, band), t) in retry_totals(&vaps, RETRY_AT, from) {
                 let Ok(ap) = ap.parse() else { continue };
                 let h = out.entry((ap, band.to_string())).or_default();
@@ -592,7 +593,7 @@ impl Watcher {
     /// An event as it happens: a one-off alert, if it deserves one.
     fn event(&mut self, now: Ts, e: &Event) {
         // Only events that may make an alert get here (see `alertable`).
-        let name = |m: Mac| crate::insights::ap_name(&self.live.read().unwrap(), &m.to_string()).unwrap_or_else(|| m.to_string());
+        let name = |m: Mac| crate::series::ap_name(&self.live.read().unwrap(), &m.to_string()).unwrap_or_else(|| m.to_string());
         if let Some(a) = from_event(e.kind, e.device_mac, &e.data, &name) {
             self.book.raise(now, a.resolved(now));
         }
@@ -683,7 +684,7 @@ impl Watcher {
                     continue;
                 };
                 if v >= raise_at && !self.book.open.contains_key(&k) && self.cleared.get(&k).is_none_or(|t| !(0..HEALTH_COOLDOWN).contains(&(now - t))) {
-                    let name = crate::insights::ap_name(&self.live.read().unwrap(), &mac.to_string()).unwrap_or_else(|| mac.to_string());
+                    let name = crate::series::ap_name(&self.live.read().unwrap(), &mac.to_string()).unwrap_or_else(|| mac.to_string());
                     let title = format!("High {what} on {name} {}", band_name(&radio));
                     let message = format!("{what} has averaged {v:.0}% over the last 15 minutes (alert at {raise_at:.0}%).");
                     let tag = format!("health:{}:{}", key.as_str(), k.1);

@@ -11,11 +11,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::api::{ApiError, AppState, Json, Query, read};
-use crate::channelai::is_dfs;
 use crate::clock;
-use crate::engine::Live;
 use crate::model::Ts;
-use crate::store::{self, Db, TIERS};
+use crate::series::{Delta, Loaded, Only, RangeQuery, Samples, Spec, ap_name, ap_name_of, bucket_for, client_name, cols_at, deltas, load, memo_read, own_bssids, window};
+use crate::store::{Db, TIERS};
 
 /// The BSSIDs an AP's SSIDs have had in a tier of `vap_stats` (a BSSID stays
 /// on its AP): one step through the table's own index per BSSID, rather than
@@ -955,6 +954,8 @@ pub async fn neighbors(State(s): State<AppState>, Query(q): Query<NeighborQuery>
 mod tests {
     use super::*;
     use crate::model::tests::TestDir;
+    use crate::series::col;
+    use crate::store;
 
     #[test]
     fn retries_use_attempts_and_ignore_counter_restarts() {
@@ -1029,6 +1030,7 @@ mod tests {
     /// to write the expected output again (after a deliberate change).
     mod pin {
         use super::*;
+        use crate::channelplan::{PlanQuery, channel_plan};
         use crate::engine::{ClientView, DeviceView, SharedLive};
 
         const A1: &str = "02:00:00:00:00:a1";
