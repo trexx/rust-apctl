@@ -32,7 +32,7 @@ import { MulticastPanel } from "../components/insights/Multicast";
 import { RetryBuckets } from "../components/insights/RetryBuckets";
 import { SiteActivity } from "../components/insights/SiteActivity";
 import { TopTalkers } from "../components/insights/TopTalkers";
-import { useTimeSpan } from "../components/Chart";
+import { ZoomContext, useTimeSpan } from "../components/Chart";
 import { ThreatBanner } from "../components/Threats";
 import { AdoptionPanel } from "../components/Adoption";
 
@@ -106,11 +106,11 @@ export function Overview() {
               <b>{d.clients}</b>
               <span>CPU</span>
               <span className="meter-row">
-                <Meter value={d.cpu} /> {pct(d.cpu)}
+                <Meter value={d.cpu} label="CPU" /> {pct(d.cpu)}
               </span>
               <span>Memory</span>
               <span className="meter-row">
-                <Meter value={d.mem} /> {pct(d.mem)}
+                <Meter value={d.mem} label="Memory" /> {pct(d.mem)}
               </span>
               {d.radios
                 .filter((r) => r.channel !== null)
@@ -184,7 +184,7 @@ function RadioRow(p: {
         className="meter-row"
         title={`Channel utilisation ${p.util ?? "?"}% · channel ${p.channel}, ${p.bw} MHz · ${p.clients} clients`}
       >
-        <Meter value={p.util} />
+        <Meter value={p.util} label={`${p.band} channel utilisation`} />
         <span className="meter-text">
           ch {p.channel} · {p.bw} MHz · {p.clients}{" "}
           {p.clients === 1 ? "client" : "clients"}
@@ -194,7 +194,12 @@ function RadioRow(p: {
   );
 }
 
+/** Outside SiteActivity's zoom: dragging across its chart zooms the page all the same. */
 function SiteMulticast() {
-  const [span] = useTimeSpan(86400);
-  return <MulticastPanel span={span} />;
+  const [span, setSpan] = useTimeSpan(86400);
+  return (
+    <ZoomContext.Provider value={(from, to) => setSpan({ from, to })}>
+      <MulticastPanel span={span} />
+    </ZoomContext.Provider>
+  );
 }

@@ -161,6 +161,16 @@ export function signalClass(dbm: number | null | undefined): "good" | "fair" | "
   return "poor";
 }
 
+/**
+ * TX retry shares (%) as the official dashboard colours its retry buckets: at
+ * least `bad` is bad, at least `warn` needs attention, below it is fine.
+ */
+export const RETRY = { warn: 20, bad: 25 } as const;
+
+/** A TX retry share's tone: "bad", "warn", or "" (fine or unknown). */
+export const retryTone = (pct: number | null | undefined): "bad" | "warn" | "" =>
+  pct === null || pct === undefined ? "" : pct >= RETRY.bad ? "bad" : pct >= RETRY.warn ? "warn" : "";
+
 /** "−75 dBm", with a real minus sign. */
 export const dbm = (v: number) => `${v < 0 ? "−" : ""}${Math.abs(v)} dBm`;
 
@@ -173,15 +183,15 @@ export const compact = (n: number | null | undefined) => (n === null || n === un
 export const speed = (kbps: number | null | undefined) => (kbps && kbps > 0 ? `${kbps >= 1000 ? `${+(kbps / 1000).toFixed(2)} Mbps` : `${kbps} kbps`}` : "none");
 
 /** "13 Oct 06:00 – 09:00", or with both dates when the window spans days. */
-export function spanLabel(from: number, to: number): string {
+function spanLabel(from: number, to: number): string {
   const f = new Date(from * 1000);
   const t = new Date(to * 1000);
   const start = `${dayFmt.format(f)} ${minuteFmt.format(f)}`;
   return f.toDateString() === t.toDateString() ? `${start} – ${minuteFmt.format(t)}` : `${start} – ${dayFmt.format(t)} ${minuteFmt.format(t)}`;
 }
 
-/** "last 24h", or the fixed window. */
-export const spanText = (span: TimeSpan): string => ("from" in span ? spanLabel(span.from, span.to) : `last ${duration(span.last).replace(/^1d 0h$/, "24h")}`);
+/** "last 24h", "last 6h", "last 7d", "last 1h 30m", or the fixed window. */
+export const spanText = (span: TimeSpan): string => ("from" in span ? spanLabel(span.from, span.to) : `last ${duration(span.last).replace(/^1d 0h$/, "24h").replace(/ 0[hm]$/, "")}`);
 
 /** Value for an <input type="datetime-local"> in the browser's time zone. */
 export function toLocalInput(ts: number): string {

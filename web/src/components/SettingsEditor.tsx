@@ -2,5 +2,4 @@
 export { DeviceSettingsPanel } from "./settings/device/DeviceSettingsPanel";
 export { SiteSettingsPanel } from "./settings/site/SiteEditor";
 export { SpeedLimitsPanel } from "./settings/speedLimits";
-export { WlanEditor } from "./settings/wlan/WlanEditor";
 export { WlanSettingsPanel } from "./settings/wlan/WlanSettingsPanel";

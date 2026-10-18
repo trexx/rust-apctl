@@ -5,6 +5,7 @@ import {
   useLayoutEffect,
   useRef,
   useState,
+  useSyncExternalStore,
 } from "react";
 import { useSearchParams } from "react-router";
 import uPlot from "uplot";
@@ -97,18 +98,25 @@ const sameData = (a: Drawn | null, b: Drawn) =>
   a.values.length === b.values.length &&
   a.values.every((v, i) => v === b.values[i] && a.scales[i] === b.scales[i]);
 
+/** Whether the page is in dark mode, kept once for all charts: one
+ *  media-query listener while any chart is shown, not one per chart. */
+const darkQuery = window.matchMedia("(prefers-color-scheme: dark)");
+const darkListeners = new Set<() => void>();
+const onDarkChange = () => darkListeners.forEach((l) => l());
+const subscribeDark = (onChange: () => void) => {
+  if (darkListeners.size === 0)
+    darkQuery.addEventListener("change", onDarkChange);
+  darkListeners.add(onChange);
+  return () => {
+    darkListeners.delete(onChange);
+    if (darkListeners.size === 0)
+      darkQuery.removeEventListener("change", onDarkChange);
+  };
+};
+const readDark = () => darkQuery.matches;
+
 /** Whether the page is in dark mode now, following changes. */
-function useDarkMode(): boolean {
-  const query = "(prefers-color-scheme: dark)";
-  const [dark, setDark] = useState(() => window.matchMedia(query).matches);
-  useEffect(() => {
-    const m = window.matchMedia(query);
-    const on = () => setDark(m.matches);
-    m.addEventListener("change", on);
-    return () => m.removeEventListener("change", on);
-  }, []);
-  return dark;
-}
+const useDarkMode = () => useSyncExternalStore(subscribeDark, readDark);
 
 interface Props {
   title: string;
@@ -529,16 +537,19 @@ export function RangePicker({
   const fixed = isFixed(value);
   const preset = !fixed && RANGES.some((r) => r.seconds === value.last);
   const text = spanText(value);
-  const [from, to] = spanBounds(value);
-  const len = to - from;
-  const oldest = useNow() - MAX_AGE;
+  // A live window's start moves with the clock: read in render, React
+  // Compiler would keep the first one, so the step reads it when pressed.
+  const now = useNow();
+  const start = fixed ? value.from : now - value.last;
   // Step a whole window back or forward; reaching the present goes live
   // again. At the oldest data kept the window stops, at its length: cutting
   // only its start left none at all, and an empty window shows live data.
   const step = (dir: -1 | 1) => {
-    const now = Math.floor(Date.now() / 1000);
-    const f = Math.max(from + dir * len, now - MAX_AGE);
-    if (f + len >= now - 60) pick({ last: len });
+    const [from, to] = spanBounds(value);
+    const len = to - from;
+    const at = Math.floor(Date.now() / 1000);
+    const f = Math.max(from + dir * len, at - MAX_AGE);
+    if (f + len >= at - 60) pick({ last: len });
     else pick({ from: f, to: f + len });
   };
   return (
@@ -547,7 +558,7 @@ export function RangePicker({
         className="btn small step"
         aria-label="Earlier"
         title="Earlier"
-        disabled={from <= oldest}
+        disabled={start <= now - MAX_AGE}
         onClick={() => step(-1)}
       >
         ‹
@@ -570,6 +581,7 @@ export function RangePicker({
         <button
           className={preset ? "" : "active"}
           onClick={() => setOpen((o) => !o)}
+          aria-pressed={!preset}
           aria-expanded={open}
           title="Pick dates and times"
         >

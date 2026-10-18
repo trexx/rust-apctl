@@ -2,7 +2,7 @@ import { Suspense } from "react";
 import { Link } from "react-router";
 import { useWlans } from "../api";
 import type { Wlan } from "../api";
-import { band, bytes, pct1, rate, spanText } from "../format";
+import { band, bytes, pct1, rate, retryTone, spanText } from "../format";
 import {
   COLORS,
   Chart,
@@ -126,7 +126,7 @@ function WlanPanel({ w }: { w: Wlan }) {
           <div className="muted small">TX retries</div>
           <b
             className={
-              w.tx_retry_pct !== null && w.tx_retry_pct >= 20 ? "tone-warn" : ""
+              retryTone(w.tx_retry_pct) && `tone-${retryTone(w.tx_retry_pct)}`
             }
           >
             {pct1(w.tx_retry_pct)}

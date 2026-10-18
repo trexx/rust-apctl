@@ -844,6 +844,10 @@ td.warn {
   color: var(--fair);
   font-weight: 600;
 }
+td.bad {
+  color: var(--poor);
+  font-weight: 600;
+}
 .suggest {
   color: var(--accent);
 }

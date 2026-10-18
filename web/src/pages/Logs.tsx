@@ -58,6 +58,7 @@ export function Logs() {
         <ApSelect value={device} onChange={setDevice} />
         <input
           className="search"
+          aria-label="Search log text"
           placeholder="Search log text (all words must match)"
           value={text}
           onChange={(e) => setText(e.target.value)}

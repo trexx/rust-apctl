@@ -76,6 +76,10 @@ function DevicePage({ mac }: { mac: string }) {
   const { device: d, clients } = detail.data;
   const ap = d.snapshot.ap;
   const up = d.snapshot.uplink;
+  // A stored AP not heard from yet may know neither its firmware nor its address.
+  const about = [ap.model_display ?? ap.model, ap.version, ap.ip]
+    .filter(Boolean)
+    .join(" · ");
 
   return (
     <ZoomContext.Provider value={(from, to) => setRange({ from, to })}>
@@ -86,7 +90,7 @@ function DevicePage({ mac }: { mac: string }) {
               <Dot ok={d.online} /> {ap.hostname ?? mac}
             </h1>
             <span className="muted">
-              {ap.model_display ?? ap.model} · {ap.version} · {ap.ip} ·{" "}
+              {about && `${about} · `}
               <span className="mono">{mac}</span>
             </span>
             <span className="spacer" />

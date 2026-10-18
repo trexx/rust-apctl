@@ -135,7 +135,7 @@ function ClientPage({ mac }: { mac: string }) {
               <Stat
                 label="Signal"
                 value={<Signal dbm={s.signal} />}
-                sub={`noise ${s.noise ?? "—"} dBm`}
+                sub={`noise ${s.noise === null ? "—" : `${s.noise} dBm`}`}
               />
               <Stat
                 label="Rate (down/up)"

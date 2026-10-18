@@ -31,8 +31,10 @@ export function Stat({
   );
 }
 
-export function Dot({ ok }: { ok: boolean }) {
-  return <span className={`dot ${ok ? "dot-ok" : "dot-bad"}`} aria-hidden />;
+/** A status dot, beside text that says the same: good or bad (`ok`), or one of three tones. */
+export function Dot(p: { ok: boolean } | { tone: "ok" | "warn" | "bad" }) {
+  const tone = "tone" in p ? p.tone : p.ok ? "ok" : "bad";
+  return <span className={`dot dot-${tone}`} aria-hidden />;
 }
 
 export function Signal({ dbm }: { dbm: number | null | undefined }) {
@@ -43,26 +45,31 @@ export function Signal({ dbm }: { dbm: number | null | undefined }) {
   );
 }
 
+/** A bar for a level (a percentage, or out of `max`), named `label` for screen readers. */
 export function Meter({
   value,
-  max,
+  max: limit,
+  label,
 }: {
   value: number | null | undefined;
   max?: number;
+  label: string;
 }) {
-  const v =
-    value === null || value === undefined
-      ? 0
-      : Math.min(100, (value / (max ?? 100)) * 100);
+  const known = value !== null && value !== undefined;
+  const max = limit ?? 100;
+  const v = known ? Math.min(100, (value / max) * 100) : 0;
   const level = v >= 80 ? "high" : v >= 50 ? "mid" : "low";
+  const text = known ? `${Math.round(value)}` : "unknown";
   return (
     <span
       className="meter"
-      title={
-        value === null || value === undefined
-          ? "unknown"
-          : `${Math.round(value)}`
-      }
+      title={text}
+      role="meter"
+      aria-label={label}
+      aria-valuemin={0}
+      aria-valuemax={max}
+      aria-valuenow={known ? value : undefined}
+      aria-valuetext={known ? undefined : text}
     >
       <span
         className={`meter-fill meter-${level}`}
@@ -610,6 +617,19 @@ function eventSpec(kind: string): EventSpec<EventKind> {
   );
 }
 
+/**
+ * A memoised row's comparator. Rows never change, so one re-renders only for
+ * other props or another day, not for every minute the list's clock ticks.
+ * The row's data is compared by identity, not by id: ids start again after a
+ * restore, and React Query keeps an unchanged row's object.
+ */
+export const sameRow = <P extends { now: number }>(a: P, b: P) =>
+  sameDay(a.now, b.now) &&
+  Object.keys(a).length === Object.keys(b).length &&
+  (Object.keys(a) as (keyof P)[]).every(
+    (k) => k === "now" || Object.is(a[k], b[k]),
+  );
+
 interface EventRowProps {
   e: AppEvent;
   names: Names;
@@ -619,7 +639,7 @@ interface EventRowProps {
   now: number;
 }
 
-/** One event. Events never change, so it re-renders only for another id, other names or another day. */
+/** One event. Events never change, so it re-renders only for another event, other names or another day. */
 const EventRow = memo(
   function EventRow({
     e,
@@ -674,12 +694,7 @@ const EventRow = memo(
       </li>
     );
   },
-  (a, b) =>
-    a.e.id === b.e.id &&
-    a.names === b.names &&
-    a.clientNames === b.clientNames &&
-    a.showDevice === b.showDevice &&
-    sameDay(a.now, b.now),
+  sameRow,
 );
 
 export function EventList({
@@ -731,7 +746,7 @@ interface LogRowProps {
   now: number;
 }
 
-/** One log line. Lines never change, so it re-renders only for another id, other names or another day. */
+/** One log line. Lines never change, so it re-renders only for another line, other names or another day. */
 const LogRow = memo(
   function LogRow({ l, names, showDevice, now }: LogRowProps) {
     return (
@@ -750,11 +765,7 @@ const LogRow = memo(
       </div>
     );
   },
-  (a, b) =>
-    a.l.id === b.l.id &&
-    a.names === b.names &&
-    a.showDevice === b.showDevice &&
-    sameDay(a.now, b.now),
+  sameRow,
 );
 
 export function LogList({
