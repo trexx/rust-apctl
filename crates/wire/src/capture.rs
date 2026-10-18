@@ -386,7 +386,15 @@ impl HalfStream {
             }
             self.gap_since.get_or_insert(ts);
         } else {
+            let pos = self.pos;
             self.append(at, payload);
+            // Bytes before the gap are still arriving, so the wait for the rest starts
+            // again. Nor could a gap be skipped below without losing a message these
+            // bytes may just have completed, which the caller has not taken yet; the
+            // queue only shrinks here, so no size limit can force a skip either.
+            if self.pos > pos && self.gap_since.is_some() {
+                self.gap_since = Some(ts);
+            }
             self.apply_pending(ts);
         }
         while self.pending.len() > MAX_PENDING
@@ -710,6 +718,25 @@ mod tests {
         assert_eq!((h.pending_bytes, h.gap_since), (0, None));
         h.segment(12_000_000, at + second.len() as u32, false, false, &first);
         assert!(matches!(h.take_http(true), Some(Parsed::Request { body, .. }) if body == b"lost"), "in sync again");
+    }
+
+    #[test]
+    fn a_message_completed_while_a_later_gap_is_old_is_kept() {
+        let msg = |body: &str| format!("POST /inform HTTP/1.1\r\nContent-Length: {}\r\n\r\n{body}", body.len()).into_bytes();
+        let (first, second, third) = (msg("first"), msg("second"), msg("third"));
+        let mut h = HalfStream::default();
+        h.segment(0, 99, true, false, b"");
+        h.segment(0, 100, false, false, &first[..10]);
+        // The third message queues behind a gap: the rest of the first and all of the second.
+        let third_at = 100 + (first.len() + second.len()) as u32;
+        h.segment(1_000_000, third_at, false, false, &third);
+        // Long after, the rest of the first arrives (the second never does).
+        h.segment(12_000_000, 110, false, false, &first[10..]);
+        assert!(matches!(h.take_http(true), Some(Parsed::Request { body, .. }) if body == b"first"));
+        assert!(h.take_http(true).is_none());
+        // The gap then ages again and is skipped, carrying on with the third.
+        h.segment(23_000_000, third_at, false, false, &third);
+        assert!(matches!(h.take_http(true), Some(Parsed::Request { body, .. }) if body == b"third"));
     }
 
     #[test]
