@@ -84,10 +84,24 @@ export function ErrorNote({ error }: { error: unknown }) {
 }
 
 /**
- * A query's data, or else its error, or else "Loading…". With `panel`, the
- * error and loading states sit in a panel, so the layout doesn't jump when the
- * data (rendered by `children`, usually a panel itself) arrives.
+ * What stands in for a query's data until it is there: its error, or else
+ * "Loading…". A component shows it only while it has no data (`if (!q.data)
+ * return <QueryNote q={q} />`), so a failed background refetch doesn't
+ * replace what was fetched. With `panel`, it sits in a panel, so the layout
+ * doesn't jump when the data (usually a panel itself) arrives.
  */
+export function QueryNote({
+  q,
+  panel,
+}: {
+  q: { error: unknown };
+  panel?: boolean;
+}) {
+  const note = q.error ? <ErrorNote error={q.error} /> : <Loading />;
+  return panel ? <div className="panel">{note}</div> : note;
+}
+
+/** A query's data, rendered by `children`, or else its `QueryNote`. */
 export function QueryState<T>({
   q,
   panel,
@@ -98,8 +112,7 @@ export function QueryState<T>({
   children: (data: T) => ReactNode;
 }) {
   if (q.data !== undefined) return <>{children(q.data)}</>;
-  const note = q.error ? <ErrorNote error={q.error} /> : <Loading />;
-  return panel ? <div className="panel">{note}</div> : note;
+  return <QueryNote q={q} panel={panel} />;
 }
 
 /** An action's outcome, shown under its buttons. */

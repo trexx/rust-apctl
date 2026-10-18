@@ -11,7 +11,7 @@ import {
 } from "../api";
 import type { BackupManifest, BackupMeta, BackupSettings } from "../api";
 import { ago, bytes, dateTime as when, hhmm, useNow } from "../format";
-import { ErrorNote, Loading, Outcome, useRunner } from "./common";
+import { Outcome, QueryNote, useRunner } from "./common";
 import { FileButton } from "./FileButton";
 import { NumberInput, TimeInput } from "./settings/form";
 
@@ -299,8 +299,7 @@ export function BackupSection() {
         reloads when it is back.
       </div>
     );
-  if (b.error) return <ErrorNote error={b.error} />;
-  if (!b.data) return <Loading />;
+  if (!b.data) return <QueryNote q={b} />;
   const d = b.data;
   return (
     <div className="panel" id="backups">

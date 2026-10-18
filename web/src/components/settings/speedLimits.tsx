@@ -1,6 +1,7 @@
 import { useState } from "react";
 import { useCanEdit, useUserGroups } from "../../api";
 import { speed } from "../../format";
+import { QueryNote } from "../common";
 import type { UserGroup } from "../../api";
 import { Row, TextInput } from "./form";
 import type { Fields } from "./form";
@@ -74,7 +75,7 @@ function SpeedLimitEditor({
 export function SpeedLimitsPanel() {
   const g = useUserGroups();
   const readOnly = !useCanEdit();
-  if (!g.data) return null;
+  if (!g.data) return <QueryNote q={g} panel />;
   const { active, groups } = g.data;
   return (
     <ListPanel

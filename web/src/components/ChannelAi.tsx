@@ -12,14 +12,7 @@ import {
 } from "../api";
 import type { ChannelPlanResult } from "../api";
 import { band as bandName, clock, hhmm, useNow } from "../format";
-import {
-  ErrorNote,
-  Loading,
-  Outcome,
-  QueryState,
-  eventText,
-  useRunner,
-} from "./common";
+import { Outcome, QueryNote, QueryState, eventText, useRunner } from "./common";
 
 /**
  * Runs Channel AI actions. The settings checkboxes each send a patch built
@@ -104,8 +97,7 @@ export function ChannelAiPanel() {
   const runs = useEvents({ kind: "channel_plan", limit: 10 });
   const { busy, msg, run } = useRun();
   const now = useNow();
-  if (ai.error) return <ErrorNote error={ai.error} />;
-  if (!ai.data) return <Loading />;
+  if (!ai.data) return <QueryNote q={ai} />;
   const d = ai.data;
   const s = d.settings;
   const can = d.active && canEdit && !busy;
