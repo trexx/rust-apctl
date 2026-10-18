@@ -544,15 +544,18 @@ impl Sanitizer {
         let mut out = String::with_capacity(value.len());
         let mut rest = value;
         while let Some(i) = rest.find("://") {
-            let (head, tail) = rest.split_at(i + 3);
+            let (head, mut tail) = rest.split_at(i + 3);
             out.push_str(head);
-            let end = tail.find(|c: char| matches!(c, '/' | '?' | '#' | '"' | '\'') || c.is_whitespace()).unwrap_or(tail.len());
-            let (mut authority, after) = tail.split_at(end);
-            if let Some((userinfo, host)) = authority.rsplit_once('@') {
+            // Credentials run to the last `@` before the path; the host and port end at
+            // the first character no host name holds (a comma between two URLs, say).
+            let path = tail.find(|c: char| matches!(c, '/' | '?' | '#' | '"' | '\'') || c.is_whitespace()).unwrap_or(tail.len());
+            if let Some((userinfo, _)) = tail[..path].rsplit_once('@') {
                 out.push_str(&self.fakes.get(Kind::Secret, userinfo, |n| format!("secret-{n}")));
                 out.push('@');
-                authority = host;
+                tail = &tail[userinfo.len() + 1..];
             }
+            let host_char = |c: char| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '~' | '%' | ':' | '[' | ']' | '-') || !c.is_ascii();
+            let (authority, after) = tail.split_at(tail.find(|c: char| !host_char(c)).unwrap_or(tail.len()));
             let (host, port) = match authority.rfind(':') {
                 Some(c) if !authority.starts_with('[') || authority[..c].ends_with(']') => authority.split_at(c),
                 _ => (authority, ""),
@@ -1151,6 +1154,11 @@ mod tests {
         assert_eq!(out["url"], "https://secret-1@host-3.example.net/fw.bin");
         assert_eq!(out["mgmt_url"], "http://unifi:8080/inform http://[2001:db8::1]:8080/x http://192.0.2.1/ http://unifi.example.net/");
         assert_eq!(out["stun_url"], "stun://stun.smith.lan:3478/", "--keep vouches for the field");
+        // URLs run together: each host is replaced, whatever separates them.
+        let out = s.json(&json!({ "url": "http://a.smith.lan,http://b.smith.lan/x|https://c.smith.lan:8443;http://u:p,w@d.smith.lan/ (http://müller.smith.lan)" }));
+        assert_eq!(out["url"], "http://host-4.example.net,http://host-5.example.net/x|https://host-6.example.net:8443;http://secret-2@host-7.example.net/ (http://host-8.example.net)");
+        s.check_clean(&out.to_string(), "test").unwrap();
+        assert!(s.check_clean("on b.smith.lan", "leak").is_err());
         s.check_clean(&out["url"].to_string(), "url").unwrap();
         assert!(s.check_clean("on unifi.smith.lan", "leak").is_err(), "a replaced host is looked for");
         // A learned host is replaced wherever it shows up, once names are looked for.
