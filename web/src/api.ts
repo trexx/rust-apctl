@@ -64,7 +64,7 @@ export interface ClientSample {
   vlan_id: number | null;
   latency_avg: number | null;
   is_11r: boolean | null;
-  /** Only on a client's own page (`useClient`), not in the list. */
+  /** Only on a client's own page (`useClient`), not in the list or an AP's page. */
   multicast?: Multicast | null;
 }
 

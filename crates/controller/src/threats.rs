@@ -21,7 +21,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use axum::extract::State;
-use axum::http::{StatusCode, header};
+use axum::http::header;
 use axum::response::{IntoResponse, Response};
 use rusqlite::Connection;
 use rusqlite::types::Value as Sql;
@@ -829,12 +829,12 @@ fn yes() -> bool {
 /// PUT /api/rf/threats/ack
 pub async fn ack(State(s): State<AppState>, Json(b): Json<AckBody>) -> Result<Json<Value>, ApiError> {
     let Some(kind) = Kind::parse(&b.kind) else {
-        return Err(ApiError(StatusCode::BAD_REQUEST, "unknown kind".into()));
+        return Err(ApiError::bad("unknown kind"));
     };
-    let bssid: Mac = b.bssid.parse().map_err(|_| ApiError(StatusCode::BAD_REQUEST, "invalid BSSID".into()))?;
+    let bssid: Mac = b.bssid.parse().map_err(|_| ApiError::bad("invalid BSSID"))?;
     let note = b.note.map(|n| n.trim().to_string()).filter(|n| !n.is_empty());
     if note.as_ref().is_some_and(|n| n.chars().count() > 200) {
-        return Err(ApiError(StatusCode::BAD_REQUEST, "note is too long (200 characters at most)".into()));
+        return Err(ApiError::bad("note is too long (200 characters at most)"));
     }
     let (ts, bssid) = (clock::now_ts(), bssid.to_string());
     let ack = b.ack.then_some(Ack { note, ts });
@@ -920,7 +920,7 @@ pub fn watch(store: Arc<Store>, state: Arc<ThreatState>, live: SharedLive, engin
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::tests::TestDir;
+    use crate::model::tests::{TestDir, TestStore, flushed};
 
     const UP: &str = "78:45:58:3c:51:ac";
     const DOWN: &str = "78:45:58:3c:52:bc";
@@ -1083,9 +1083,8 @@ mod tests {
 
     #[test]
     fn our_bssids_and_their_changes_come_from_every_tier() {
-        let dir = TestDir::new("threats");
-        let (store, _writer) = Store::open(&dir).unwrap();
-        let c = Connection::open(dir.join("metrics.db")).unwrap();
+        let t = TestStore::new("threats");
+        let c = t.db(Db::Metrics);
         let now = 1_000_000_000;
         let vap = |suffix: &str, bssid: &str, ts: Ts, essid: &str, radio: &str| {
             let sql = format!("INSERT INTO vap_stats{suffix} (bssid, ts, ap_mac, essid, radio) VALUES (?1, ?2, ?3, ?4, ?5)");
@@ -1113,7 +1112,7 @@ mod tests {
         radio("", now - 2 * 3600, "na", 36.0);
         radio("_5m", now - 9 * 86400, "na", 52.0);
         vap("_5m", "02:00:00:00:00:02", now - 9 * 86400, "Ancient", "na");
-        let (used, h) = store.read(Db::Metrics, |c| Ok((used_bssids(c, now)?, History::load(c, now)?))).unwrap();
+        let (used, h) = t.store.read(Db::Metrics, |c| Ok((used_bssids(c, now)?, History::load(c, now)?))).unwrap();
         let names: Vec<(&str, Option<&str>)> = used.iter().map(|(b, _, e)| (b.as_str(), e.as_deref())).collect();
         assert_eq!(names, [("02:00:00:00:00:01", Some("Old")), ("02:00:00:00:00:02", Some("Home 2")), ("02:00:00:00:00:03", Some("IoT"))]);
         let own = |bssid: &str, essid: &str, channel: i64| OwnBss { bssid: bssid.into(), ap_mac: UP.into(), essid: Some(essid.into()), channel: Some(channel), changed_at: 0 };
@@ -1139,7 +1138,7 @@ mod tests {
             writer.exec(Db::Config, sql, vec![rusqlite::types::Value::Text(kind.into()), rusqlite::types::Value::Text(bssid.into())]);
         }
         prune(&writer);
-        assert!(writer.flush(Duration::from_secs(5)));
+        flushed(&writer);
         let left: Vec<String> = store
             .read(Db::Config, |c| Ok(c.prepare("SELECT kind FROM network_threats ORDER BY kind")?.query_map([], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?))
             .unwrap();
@@ -1199,7 +1198,7 @@ mod tests {
         exec("INSERT INTO network_acks (kind, bssid, note, ts) VALUES ('lookalike', '02:00:00:00:00:01', 'stored', 1)");
         exec("INSERT INTO neighbors (bssid, ap_mac, first_seen, last_seen) VALUES ('02:00:00:00:00:01', 'x', 100, 200)");
         exec("INSERT INTO clients (mac, hostname) VALUES ('02:00:00:00:01:01', 'phone')");
-        assert!(writer.flush(Duration::from_secs(5)));
+        flushed(&writer);
         let now = 1_000_000;
         let a = gather(&store, &state, &live, now).unwrap();
         assert_eq!(a.acks[&Kind::Lookalike]["02:00:00:00:00:01"].note.as_deref(), Some("stored"));
@@ -1209,7 +1208,7 @@ mod tests {
         set_ack(&store, &state, &writer, Kind::Lookalike, "02:00:00:00:00:01".into(), None).unwrap();
         exec("INSERT INTO neighbors (bssid, ap_mac, first_seen, last_seen) VALUES ('02:00:00:00:00:03', 'x', 50, 200)");
         exec("INSERT INTO clients (mac, hostname) VALUES ('02:00:00:00:01:02', 'laptop')");
-        assert!(writer.flush(Duration::from_secs(5)));
+        flushed(&writer);
         let a = gather(&store, &state, &live, now + 60).unwrap();
         assert_eq!(a.acks.iter().flat_map(|(k, m)| m.keys().map(move |b| (*k, b.as_str()))).collect::<Vec<_>>(), [(Kind::Bridged, "02:00:00:00:00:02")]);
         let stored: Vec<String> = store.read(Db::Config, |c| Ok(c.prepare("SELECT kind FROM network_acks")?.query_map([], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?)).unwrap();

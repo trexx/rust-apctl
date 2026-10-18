@@ -553,10 +553,10 @@ pub fn valid_firmware_url(url: &str) -> bool {
 pub async fn upgrade_url(State(s): State<AppState>, Json(b): Json<UrlBody>) -> Result<Json<Value>, ApiError> {
     crate::api::require_active(&s, "upgrades need")?;
     if !valid_firmware_url(&b.url) {
-        return Err(ApiError(StatusCode::BAD_REQUEST, "use an http(s) or ftp URL ending in .bin or .tar".into()));
+        return Err(ApiError::bad("use an http(s) or ftp URL ending in .bin or .tar"));
     }
     let mac = crate::api::parse_mac(&b.mac)?;
-    let a = aps(&s.live.read().unwrap()).into_iter().find(|a| a.mac == mac).ok_or_else(|| ApiError(StatusCode::NOT_FOUND, "unknown AP".into()))?;
+    let a = aps(&s.live.read().unwrap()).into_iter().find(|a| a.mac == mac).ok_or_else(|| ApiError::not_found("unknown AP"))?;
     if !a.online {
         return Err(ApiError(StatusCode::CONFLICT, "the AP is offline".into()));
     }
@@ -582,6 +582,7 @@ pub async fn resume(State(s): State<AppState>) -> Result<Json<Value>, ApiError> 
 mod tests {
     use super::*;
     use std::cmp::Ordering::*;
+    use crate::model::tests::flushed;
 
     #[test]
     fn reads_the_release_feed() {
@@ -710,7 +711,7 @@ mod tests {
         store_releases(&writer, &[rel("U6M"), rel("U7P")], 2_000_000_000);
         // The clock steps back before the next check, which no longer lists U7P.
         store_releases(&writer, &[rel("U6M"), rel("UAL6")], 1_000_000_000);
-        assert!(writer.flush(Duration::from_secs(5)));
+        flushed(&writer);
         let (rels, checked, error) = releases(&store).unwrap();
         let mut platforms: Vec<&str> = rels.keys().map(String::as_str).collect();
         platforms.sort_unstable();

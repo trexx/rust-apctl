@@ -10,7 +10,7 @@
 //! channels into the APs' radio settings, which go out as a normal config.
 //! APs on a wireless uplink keep their channel, as do excluded ones (the
 //! official controller keeps the exclusion list but no longer reads it;
-//! apctl honours it). The plan itself is apctl's own (see `insights`).
+//! apctl honours it). The plan itself is apctl's own (see `channelplan`).
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -213,10 +213,11 @@ pub fn set_channels(state: &mut Value, band: &str, changes: &[(String, i64)]) ->
     let locked = if band == "ng" { crate::settings::channel_locked_aps(state) } else { vec![] };
     let allowed_here = allowed(Some(state), band, true);
     for (mac, ch) in changes {
-        if locked.contains(&mac.to_ascii_lowercase()) {
+        // The locks list MACs as aa:bb:..; the plan's is compared in that form, however it is written.
+        let m: Mac = mac.parse().map_err(|_| format!("{mac} is not in the settings"))?;
+        if locked.contains(&m.to_string()) {
             return Err(format!("{mac}: the 2.4 GHz channel is locked by an SSID's IoT setting"));
         }
-        let m: Mac = mac.parse().map_err(|_| format!("{mac} is not in the settings"))?;
         let d = device_doc(state, &m).ok_or_else(|| format!("{mac} is not in the settings"))?;
         let outdoor = crate::settings::outdoor(state, d);
         let d = device_doc_mut(state, &m).expect("found above");
@@ -284,7 +285,7 @@ async fn run(s: AppState, bands: Vec<String>, trigger: &'static str, _running: R
             let live = s.live.read().unwrap();
             (allowed(live.state.as_deref(), band, false), pinned(&live, band))
         };
-        let plan = match crate::insights::compute_plan(&s, band.clone(), false, allowed, pinned).await {
+        let plan = match crate::channelplan::compute_plan(&s, band.clone(), false, allowed, pinned).await {
             Ok(p) => p,
             Err(e) => {
                 tracing::warn!("channel AI: no plan for {band}: {}", e.1);
@@ -427,7 +428,7 @@ pub struct BandBody {
 /// POST /api/rf/scan {band}
 pub async fn scan(State(s): State<AppState>, Json(b): Json<BandBody>) -> Result<Json<Value>, ApiError> {
     crate::api::require_active(&s, "this needs")?;
-    let band = Band::named(&b.band).ok_or_else(|| ApiError(StatusCode::BAD_REQUEST, "band must be ng or na".into()))?;
+    let band = Band::named(&b.band).ok_or_else(|| ApiError::bad("band must be ng or na"))?;
     let asked = start_scans(&mut s.live.write().unwrap(), band, clock::now_ts());
     if asked.is_empty() {
         return Err(ApiError(StatusCode::CONFLICT, "no online AP can scan this band".into()));
@@ -461,15 +462,15 @@ pub struct ApplyBody {
 /// Every change must be complete (a malformed one refuses the whole plan).
 pub async fn apply_plan(State(s): State<AppState>, Json(b): Json<Value>) -> Result<Json<Value>, ApiError> {
     crate::api::require_active(&s, "this needs")?;
-    let b: ApplyBody = serde_json::from_value(b).map_err(|e| ApiError(StatusCode::BAD_REQUEST, format!("not a plan: {e}")))?;
+    let b: ApplyBody = serde_json::from_value(b).map_err(|e| ApiError::bad(format!("not a plan: {e}")))?;
     if Band::named(&b.band).is_none() {
-        return Err(ApiError(StatusCode::BAD_REQUEST, "band must be ng or na".into()));
+        return Err(ApiError::bad("band must be ng or na"));
     }
     if b.changes.is_empty() {
-        return Err(ApiError(StatusCode::BAD_REQUEST, "the plan changes nothing".into()));
+        return Err(ApiError::bad("the plan changes nothing"));
     }
     if let Some(c) = b.changes.iter().find(|c| !crate::settings::is_mac(&c.mac)) {
-        return Err(ApiError(StatusCode::BAD_REQUEST, format!("{} is not a MAC address", c.mac)));
+        return Err(ApiError::bad(format!("{} is not a MAC address", c.mac)));
     }
     apply(&s, &b.band, &b.changes, "manual").await?;
     let data = json!({ "band": b.band, "trigger": "manual", "changes": b.changes, "applied": true });
@@ -608,6 +609,17 @@ mod tests {
         assert!(set_channels(&mut s, "ng", &[("02:00:00:00:00:01".into(), 3)]).is_err(), "not in the allowed list");
         set_channels(&mut s, "na", &[("02:00:00:00:00:01".into(), 36)]).unwrap();
         assert!(set_channels(&mut s, "na", &[("02:00:00:00:00:02".into(), 36)]).is_err(), "not one of the APs");
+    }
+
+    #[test]
+    fn a_channel_locked_ap_is_refused_however_its_mac_is_written() {
+        let mut s = state();
+        s["apgroup"] = json!([{ "_id": "g1", "attr_hidden_id": "default", "device_macs": ["02:00:00:00:00:01"], "site_id": "s1" }]);
+        s["wlanconf"] = json!([{ "_id": "w1", "name": "Things", "iot_channel_lock": true, "ap_group_ids": ["g1"], "site_id": "s1" }]);
+        for mac in ["02:00:00:00:00:01", "02-00-00-00-00-01", "02:00:00:00:00:01".to_uppercase().as_str()] {
+            assert!(set_channels(&mut s, "ng", &[(mac.into(), 11)]).unwrap_err().contains("IoT"), "{mac}");
+        }
+        set_channels(&mut s, "na", &[("02-00-00-00-00-01".into(), 36)]).unwrap();
     }
 
     #[test]

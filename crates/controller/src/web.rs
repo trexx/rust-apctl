@@ -24,7 +24,7 @@ pub async fn handler(uri: Uri, headers: HeaderMap) -> Response {
     let path = uri.path().trim_start_matches('/');
     // Answered as every API error is, so the UI shows its message.
     if path.starts_with("api/") {
-        return crate::api::ApiError(StatusCode::NOT_FOUND, "unknown API route".into()).into_response();
+        return crate::api::ApiError::not_found("unknown API route").into_response();
     }
     if let Some(file) = Assets::get(path).filter(|_| !path.is_empty()) {
         let cache = if path.starts_with("assets/") { IMMUTABLE } else { NO_CACHE };

@@ -69,8 +69,8 @@ pub struct AppStateInner {
     pub writer: crate::store::Writer,
     /// `--inform-url` in active mode (see `ssh::inform_url`).
     pub inform_url: Option<String>,
-    /// What the insights views read lately (see `insights::memo_read`).
-    pub memo: crate::insights::Memo,
+    /// What the insights views read lately (see `series::memo_read`).
+    pub memo: crate::series::Memo,
     /// What the threat checks keep between runs, shared with `threats::watch`.
     pub threats: Arc<crate::threats::ThreatState>,
 }
@@ -140,7 +140,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/site/multicast", get(crate::insights::multicast))
         .route("/api/rf/radios", get(crate::insights::radios))
         .route("/api/rf/neighbors", get(crate::insights::neighbors))
-        .route("/api/rf/channel-plan", get(crate::insights::channel_plan))
+        .route("/api/rf/channel-plan", get(crate::channelplan::channel_plan))
         .route("/api/rf/channel-plan/apply", axum::routing::post(crate::channelai::apply_plan))
         .route("/api/rf/channel-ai", get(crate::channelai::status).put(crate::channelai::put_settings))
         .route("/api/rf/channel-ai/run", axum::routing::post(crate::channelai::run_now))
@@ -180,6 +180,16 @@ pub struct ApiError(pub StatusCode, pub String);
 impl ApiError {
     pub fn internal(msg: impl Into<String>) -> Self {
         ApiError(StatusCode::INTERNAL_SERVER_ERROR, msg.into())
+    }
+
+    /// A request that can't be done as asked (400), saying what is wrong with it.
+    pub fn bad(msg: impl Into<String>) -> Self {
+        ApiError(StatusCode::BAD_REQUEST, msg.into())
+    }
+
+    /// What the request names isn't there (404).
+    pub fn not_found(msg: impl Into<String>) -> Self {
+        ApiError(StatusCode::NOT_FOUND, msg.into())
     }
 
     /// Nothing to work on: no settings were imported yet.
@@ -244,13 +254,9 @@ impl From<tokio::task::JoinError> for ApiError {
 
 type ApiResult = Result<Json<Value>, ApiError>;
 
-fn bad(msg: impl Into<String>) -> ApiError {
-    ApiError(StatusCode::BAD_REQUEST, msg.into())
-}
-
 /// A MAC address from the URL or body; 400 when it isn't one.
 pub fn parse_mac(s: &str) -> Result<Mac, ApiError> {
-    s.parse().map_err(|_| bad(format!("invalid MAC {s}")))
+    s.parse().map_err(|_| ApiError::bad(format!("invalid MAC {s}")))
 }
 
 // axum's extractors answer a malformed request in plain text. These wrap them
@@ -484,11 +490,12 @@ async fn devices(State(s): State<AppState>) -> Json<Vec<DeviceRow>> {
     Json(list)
 }
 
-/// An AP's page: its view, its connected clients, and whether it is blinking to be found.
+/// An AP's page: its view, its connected clients (without their multicast tables,
+/// as the client list sends them), and whether it is blinking to be found.
 #[derive(Serialize)]
 struct DeviceDetail<'a> {
     device: DeviceOut<'a>,
-    clients: &'a [ClientView],
+    clients: Vec<ListedView<'a>>,
     locating: bool,
 }
 
@@ -523,10 +530,11 @@ async fn device(State(s): State<AppState>, MacPath(mac): MacPath) -> Result<Resp
             }
             // Known but not reporting since apctl started: offline, with what was stored.
             (None, Some(k)) => (stored_view(mac, k), Vec::new(), false, true),
-            (None, None) => return Err(ApiError(StatusCode::NOT_FOUND, "unknown device".into())),
+            (None, None) => return Err(ApiError::not_found("unknown device")),
         }
     };
-    Ok(Json(DeviceDetail { device: DeviceOut { view: &view, stored_only }, clients: &clients, locating }).into_response())
+    let clients = clients.iter().map(ListedView::new).collect();
+    Ok(Json(DeviceDetail { device: DeviceOut { view: &view, stored_only }, clients, locating }).into_response())
 }
 
 /// A client as its page shows it: its view, plus its name, manufacturer and controls.
@@ -552,9 +560,9 @@ struct ListedClient<'a> {
     ap_name: Option<&'a str>,
 }
 
-/// A client's view as the list sends it: the sample without its multicast tables, which
-/// only the client's own page shows (with the peers in its groups), so the list of every
-/// client of the past year doesn't carry them.
+/// A client's view as the list (and an AP's page) sends it: the sample without its multicast
+/// tables, which only the client's own page shows (with the peers in its groups), so the list
+/// of every client of the past year doesn't carry them.
 #[derive(Serialize)]
 struct ListedView<'a> {
     sample: ListedSample<'a>,
@@ -687,7 +695,7 @@ fn multicast_peers(live: &crate::engine::Live, mac: &Mac, groups: &[String]) -> 
 async fn client(State(s): State<AppState>, MacPath(mac): MacPath) -> Result<Response, ApiError> {
     let (view, alias, state, peers) = {
         let live = s.live.read().unwrap();
-        let view = live.clients.get(&mac).cloned().ok_or_else(|| ApiError(StatusCode::NOT_FOUND, "unknown client".into()))?;
+        let view = live.clients.get(&mac).cloned().ok_or_else(|| ApiError::not_found("unknown client"))?;
         let peers = multicast_peers(&live, &mac, view.sample.multicast.as_ref().map_or(&[], |m| &m.memberships));
         (view, live.aliases.get(&mac).cloned().unwrap_or_default(), live.state.clone(), peers)
     };
@@ -711,7 +719,7 @@ async fn state_summary(State(s): State<AppState>) -> ApiResult {
 
 /// Replaces the imported controller settings with an `informdump import` snapshot.
 async fn import_state(State(s): State<AppState>, Json(state): Json<Value>) -> ApiResult {
-    crate::dryrun::validate_state(&state).map_err(|e| bad(format!("{e:#}")))?;
+    crate::dryrun::validate_state(&state).map_err(|e| ApiError::bad(format!("{e:#}")))?;
     let summary = crate::dryrun::summarize_state(&state);
     s.send(crate::engine::Input::SetState { ts: clock::now_ts(), state }).await?;
     Ok(Json(json!({ "ok": true, "summary": summary })))
@@ -874,10 +882,10 @@ const MAX_NOTE: usize = 500;
 
 fn validate(alias: &Option<String>, note: &Option<String>) -> Result<(), ApiError> {
     if alias.as_ref().is_some_and(|a| a.chars().count() > MAX_ALIAS) {
-        return Err(bad(format!("alias longer than {MAX_ALIAS} characters")));
+        return Err(ApiError::bad(format!("alias longer than {MAX_ALIAS} characters")));
     }
     if note.as_ref().is_some_and(|n| n.chars().count() > MAX_NOTE) {
-        return Err(bad(format!("note longer than {MAX_NOTE} characters")));
+        return Err(ApiError::bad(format!("note longer than {MAX_NOTE} characters")));
     }
     Ok(())
 }
@@ -936,10 +944,10 @@ struct SeriesQuery {
 }
 
 async fn series(State(s): State<AppState>, Path(table): Path<String>, Query(q): Query<SeriesQuery>) -> Result<Json<store::Series>, ApiError> {
-    let t = store::table(&table).ok_or_else(|| bad(format!("unknown series {table}")))?;
+    let t = store::table(&table).ok_or_else(|| ApiError::bad(format!("unknown series {table}")))?;
     let keys: Vec<String> = q.key.split(',').map(str::to_string).collect();
     if keys.len() != t.keys.len() {
-        return Err(bad(format!("{table} needs key {}", t.keys.join(","))));
+        return Err(ApiError::bad(format!("{table} needs key {}", t.keys.join(","))));
     }
     let now = clock::now_ts();
     let to = q.to.unwrap_or(now);
@@ -1239,7 +1247,7 @@ async fn live_socket(mut socket: WebSocket, mut rx: broadcast::Receiver<Utf8Byte
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::tests::TestDir;
+    use crate::model::tests::{TestDir, flushed};
     use axum::body::Body;
     use axum::http::{Request, header};
     use tower::ServiceExt;
@@ -1288,7 +1296,7 @@ mod tests {
         ] });
         // The one in the database is restored as at start, before any inform.
         s.writer.exec(Db::Config, "INSERT INTO devices (mac, hostname, model, first_seen, last_seen) VALUES ('02:00:00:00:00:02', 'Attic', 'U6', 10, 20)", vec![]);
-        assert!(s.writer.flush(std::time::Duration::from_secs(5)));
+        flushed(&s.writer);
         engine.restore(&s.store).unwrap();
         engine.handle(report(payload));
         let app = router(s);
@@ -1339,7 +1347,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_clients_page_lists_its_multicast_peers_and_the_list_has_no_multicast() {
+    async fn a_clients_page_lists_its_multicast_peers_and_the_lists_have_no_multicast() {
         let (s, _engine, _dir) = state();
         let (tx, _) = broadcast::channel(16);
         let mut engine = crate::engine::Engine::new(s.writer.clone(), Default::default(), s.live.clone(), tx);
@@ -1362,6 +1370,10 @@ mod tests {
         let list = get_json(&app, "/api/clients").await;
         assert_eq!(list.as_array().unwrap().len(), 6);
         assert!(list.as_array().unwrap().iter().all(|c| c["sample"].get("multicast").is_none() && c["sample"]["essid"] == "Home"), "{list}");
+        // Nor does the AP's page list its clients with them.
+        let ap = get_json(&app, "/api/devices/02:00:00:00:00:01").await["clients"].clone();
+        assert_eq!(ap.as_array().unwrap().len(), 5, "the connected ones");
+        assert!(ap.as_array().unwrap().iter().all(|c| c["sample"].get("multicast").is_none() && c["sample"]["essid"] == "Home" && c["connected"] == true), "{ap}");
         // The other connected clients in each group, by name (else MAC); not the client itself, nor one that left.
         let tv = get_json(&app, "/api/clients/02:00:00:00:01:01").await;
         assert_eq!(tv["sample"]["multicast"]["memberships"], json!([ssdp, mdns]));
@@ -1414,7 +1426,7 @@ mod tests {
         engine.handle(report(json!({ "mac": "02:00:00:00:00:01", "hostname": "Hall", "uptime": 100 })));
         s.writer.exec(Db::Config, "INSERT INTO device_config (mac, ts, mgmt_cfg, system_cfg) VALUES ('02:00:00:00:00:01', 1, 'a=1', 'b=2')", vec![]);
         s.writer.exec(Db::Config, "INSERT INTO dryrun_results (ts, mac, matches, comparison) VALUES (7, '02:00:00:00:00:01', 1, '{}')", vec![]);
-        assert!(s.writer.flush(std::time::Duration::from_secs(5)));
+        flushed(&s.writer);
         let app = router(s);
         let d = get_json(&app, "/api/dryrun").await;
         assert_eq!((d["devices"][0]["status"].as_str(), d["history"][0]["ts"].as_i64(), d["history"][0]["id"].as_i64()), (Some("no_settings"), Some(7), Some(1)));
@@ -1431,7 +1443,7 @@ mod tests {
         for (ts, kind, dev) in rows {
             s.writer.exec(Db::Config, "INSERT INTO events (ts, kind, device_mac, data) VALUES (?1, ?2, ?3, '{}')", vec![Sql::Integer(ts), Sql::Text(kind.into()), dev.map_or(Sql::Null, |d| Sql::Text(d.into()))]);
         }
-        assert!(s.writer.flush(std::time::Duration::from_secs(5)));
+        flushed(&s.writer);
         let app = router(s);
         let ts = |v: Value| v.as_array().unwrap().iter().map(|e| e["ts"].as_i64().unwrap()).collect::<Vec<_>>();
         assert_eq!(ts(get_json(&app, "/api/events?kind=client").await), vec![6, 4, 3, 1]);
@@ -1456,7 +1468,7 @@ mod tests {
             let sql = "INSERT INTO logs (ts, device_mac, program, msg) VALUES (?1, ?2, ?3, ?4)";
             s.writer.exec(Db::Logs, sql, vec![Sql::Integer(ts), Sql::Text(mac.into()), Sql::Text(program.into()), Sql::Text(msg.into())]);
         }
-        assert!(s.writer.flush(std::time::Duration::from_secs(5)));
+        flushed(&s.writer);
         // A search is read from the full-text index, newest first, and stops at the limit.
         let mut w = Where::default();
         let sql = logs_sql(&mut w, None, Some("sta"), None, 10);

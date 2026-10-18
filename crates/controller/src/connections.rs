@@ -29,7 +29,7 @@ use serde_json::{Value, json};
 use crate::api::{ApiError, AppState, Json, Query};
 use crate::engine::Live;
 use crate::api::read;
-use crate::insights::{RangeQuery, ap_name, ap_name_of, client_name, memo_read, window};
+use crate::series::{RangeQuery, ap_name, ap_name_of, client_name, memo_read, window};
 use crate::model::Ts;
 use crate::store::Db;
 
@@ -752,7 +752,7 @@ pub async fn roaming(State(s): State<AppState>, Query(q): Query<RoamingQuery>) -
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::tests::TestDir;
+    use crate::model::tests::TestStore;
 
     fn conn(ts: Ts, client: &str, ap: &str, event_type: &str, n: Value) -> ConnEvent {
         ConnEvent {
@@ -886,9 +886,8 @@ mod tests {
 
     #[test]
     fn the_newest_attempts_and_roams_are_read_from_the_end() {
-        let dir = TestDir::new("connections");
-        let (store, _writer) = crate::store::Store::open(&dir).unwrap();
-        let c = rusqlite::Connection::open(dir.join("config.db")).unwrap();
+        let t = TestStore::new("connections");
+        let c = t.db(Db::Config);
         // Five clients, one report every 7 s for a day: failures with their fixups up
         // to 20 minutes later, successes, roams between two APs, and a few old rows
         // without the full report.
@@ -931,8 +930,8 @@ mod tests {
             (Some("02:00:00:00:10:02"), true, 50, false),
         ];
         for (client, failed, limit, with_roams) in cases {
-            let (list, r) = store.read(Db::Config, |c| Ok(newest(c, from, to, client, limit, failed, with_roams)?)).unwrap();
-            let all = store.read(Db::Config, |c| Ok(load_rows(c, from, to, client, None, false)?)).unwrap();
+            let (list, r) = t.store.read(Db::Config, |c| Ok(newest(c, from, to, client, limit, failed, with_roams)?)).unwrap();
+            let all = t.store.read(Db::Config, |c| Ok(load_rows(c, from, to, client, None, false)?)).unwrap();
             let mut want_r = if with_roams { roams(&all) } else { Vec::new() };
             want_r.reverse();
             want_r.truncate(limit);
@@ -948,9 +947,8 @@ mod tests {
 
     #[test]
     fn a_few_roams_among_many_attempts_are_found_without_reading_them_all() {
-        let dir = TestDir::new("roams");
-        let (store, _writer) = crate::store::Store::open(&dir).unwrap();
-        let c = rusqlite::Connection::open(dir.join("config.db")).unwrap();
+        let t = TestStore::new("roams");
+        let c = t.db(Db::Config);
         let sql = "INSERT INTO connections (ts, ap_mac, client_mac, vap, essid, radio, event_type, detail) VALUES (?1, ?2, ?3, 'wifi1ap0', 'Home', 'na', ?4, ?5)";
         let (a1, a2) = ("02:00:00:00:00:a1", "02:00:00:00:00:a2");
         let (me, other) = ("02:00:00:00:10:01", "02:00:00:00:10:02");
@@ -971,15 +969,15 @@ mod tests {
         c.execute_batch("COMMIT").unwrap();
         let (from, to) = (1_000_000, 1_000_000 + 86400);
         for client in [Some(me), None] {
-            let (list, r) = store.read(Db::Config, |c| Ok(newest(c, from, to, client, 100, false, true)?)).unwrap();
-            let all = store.read(Db::Config, |c| Ok(load_rows(c, from, to, client, None, false)?)).unwrap();
+            let (list, r) = t.store.read(Db::Config, |c| Ok(newest(c, from, to, client, 100, false, true)?)).unwrap();
+            let all = t.store.read(Db::Config, |c| Ok(load_rows(c, from, to, client, None, false)?)).unwrap();
             let mut want = roams(&all);
             want.reverse();
             assert_eq!(json!(r), json!(want), "{client:?}");
             assert_eq!(r.len(), 3);
             assert_eq!(list.len(), 100);
             // Only the leaves and the reports around them were read.
-            let read = store.read(Db::Config, |c| Ok(roam_rows(c, from, to, client)?)).unwrap();
+            let read = t.store.read(Db::Config, |c| Ok(roam_rows(c, from, to, client)?)).unwrap();
             assert!(read.len() < 40, "{} rows", read.len());
         }
     }

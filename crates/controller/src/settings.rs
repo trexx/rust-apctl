@@ -61,7 +61,7 @@ async fn preview(s: &AppState, before: Arc<Value>, edit: impl FnOnce(&mut Value)
     };
     let work = move || {
         let mut after = (*before).clone();
-        let what = edit(&mut after).map_err(|e| ApiError(StatusCode::BAD_REQUEST, e))?;
+        let what = edit(&mut after).map_err(ApiError::bad)?;
         let mut out = Vec::new();
         for (mac, inform, cfgversion, name, radios) in &aps {
             let mac_s = mac.to_string();
@@ -305,7 +305,7 @@ fn feature_support(state: &Value, informs: &HashMap<inform::Mac, Arc<Value>>) ->
 /// GET /api/settings/wlans/{id}/passphrase: shown on request only.
 pub async fn passphrase(State(s): State<AppState>, Path(id): Path<String>) -> Result<Json<Value>, ApiError> {
     let state = crate::api::current_state(&s)?;
-    let w = docs(&state, "wlanconf").find(|w| oid(w) == Some(id.as_str())).ok_or_else(|| ApiError(StatusCode::NOT_FOUND, "unknown SSID".into()))?;
+    let w = docs(&state, "wlanconf").find(|w| oid(w) == Some(id.as_str())).ok_or_else(|| ApiError::not_found("unknown SSID"))?;
     Ok(Json(json!({ "passphrase": w["x_passphrase"] })))
 }
 
@@ -337,7 +337,7 @@ pub async fn device(State(s): State<AppState>, MacPath(mac): MacPath) -> Result<
         (live.state.clone(), live.raw_informs.get(&mac).cloned())
     };
     let state = state.ok_or_else(ApiError::no_state)?;
-    let d = crate::adopt::device_doc(&state, &mac).ok_or_else(|| ApiError(StatusCode::NOT_FOUND, "this AP is not in the settings".into()))?;
+    let d = crate::adopt::device_doc(&state, &mac).ok_or_else(|| ApiError::not_found("this AP is not in the settings"))?;
     let radios: Vec<Value> = d["radio_table"]
         .as_array()
         .into_iter()

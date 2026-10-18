@@ -19,7 +19,6 @@ use std::net::{IpAddr, Ipv6Addr};
 use std::sync::Arc;
 
 use axum::extract::State;
-use axum::http::StatusCode;
 use inform::Mac;
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -372,7 +371,7 @@ pub async fn pending(State(s): State<AppState>) -> Json<Value> {
 /// POST /api/devices/{mac}/adopt: adopt a pending AP.
 pub async fn adopt(State(s): State<AppState>, MacPath(mac): MacPath) -> Result<Json<Value>, ApiError> {
     crate::api::require_active(&s, "adoption needs")?;
-    let payload = s.live.read().unwrap().adoption.pending.get(&mac).map(|p| p.payload.clone()).ok_or_else(|| ApiError(StatusCode::NOT_FOUND, "this AP is not waiting for adoption".into()))?;
+    let payload = s.live.read().unwrap().adoption.pending.get(&mac).map(|p| p.payload.clone()).ok_or_else(|| ApiError::not_found("this AP is not waiting for adoption"))?;
     let inform = payload.clone();
     crate::actions::apply_edit(&s, Box::new(move |state: &mut Value| adopt_device(state, &mac, &inform))).await?;
     {
@@ -390,7 +389,7 @@ pub async fn forget(State(s): State<AppState>, MacPath(mac): MacPath) -> Result<
     let online = {
         let live = s.live.read().unwrap();
         if live.state.as_deref().and_then(|st| device_doc(st, &mac)).is_none() {
-            return Err(ApiError(StatusCode::NOT_FOUND, "this AP is not in the settings".into()));
+            return Err(ApiError::not_found("this AP is not in the settings"));
         }
         live.devices.get(&mac).is_some_and(|d| d.online)
     };

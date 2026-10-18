@@ -695,7 +695,7 @@ async fn managed_inform(active: &Arc<Active>, ts: Ts, caller: &Caller, header: i
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::tests::TestDir;
+    use crate::model::tests::{TestDir, flushed};
     use axum::body::Body;
     use axum::http::Request;
     use std::net::SocketAddr;
@@ -728,7 +728,7 @@ mod tests {
                 "INSERT INTO device_config (mac, ts, cfgversion, mgmt_cfg, system_cfg) VALUES (?1, 0, ?2, ?3, ?4)",
                 vec![Sql::Text(AP.into()), Sql::Text(version), Sql::Text(wire::cfgdiff::redact(&mgmt)), Sql::Text(wire::cfgdiff::redact(&system))],
             );
-            assert!(writer.flush(std::time::Duration::from_secs(5)), "the push is stored");
+            flushed(&writer);
         }
         let live: SharedLive = Default::default();
         {
@@ -978,7 +978,7 @@ mod tests {
         // The stored push is masked: a password changed in apctl since would not show.
         let rig = rig_with_stored(true, None, Some((out.rendered.mgmt_cfg, out.rendered.system_cfg, "abcdefabcdefabcd".into())));
         rig.active.writer.exec(Db::Config, "INSERT INTO events (ts, kind, data) VALUES (5, 'settings_changed', '{}')", vec![]);
-        assert!(rig.active.writer.flush(std::time::Duration::from_secs(5)), "the edit is stored");
+        flushed(&rig.active.writer);
         let (_, reply) = inform_as_ap(&rig, &payload, KEY, GCM_ZLIB).await;
         assert_eq!(reply.unwrap().1["_type"], "setparam");
     }
@@ -1130,14 +1130,14 @@ mod tests {
         let text = format!("{}\n--\n{}\n--\n{}", render.out.rendered.mgmt_cfg, render.out.rendered.system_cfg, render.blocked);
         let (a, w) = (&rig.active, &rig.active.writer);
         w.exec(Db::Config, "INSERT INTO managed_devices (mac, cfgversion, content, gcm, updated) VALUES (?1, 'abcdefabcdefabcd', ?2, 1, 0)", vec![Sql::Text(AP.into()), Sql::Text(text)]);
-        assert!(w.flush(std::time::Duration::from_secs(5)));
+        flushed(w);
         // After a restart it reads as the digest of the same render: the config is current, under the version it had.
         let (tx, _rx) = mpsc::channel(10);
         let again = Active::new(&a.store, w.clone(), rig.live.clone(), a.keys.clone(), tx, controller(), Default::default()).unwrap();
         assert_eq!(again.devices.lock().unwrap()[&ap].content, Some(render.digest));
         assert_eq!(again.decide_version(ap, "abcdefabcdefabcd", &render, false), "abcdefabcdefabcd");
         // And the row is rewritten with the digest alone.
-        assert!(w.flush(std::time::Duration::from_secs(5)));
+        flushed(w);
         let stored: String = a.store.read(Db::Config, |c| Ok(c.query_row("SELECT content FROM managed_devices WHERE mac = ?1", [AP], |r| r.get(0))?)).unwrap();
         assert_eq!(stored, hex::encode(render.digest));
         assert_eq!(stored_digest(&stored), (render.digest, false));
