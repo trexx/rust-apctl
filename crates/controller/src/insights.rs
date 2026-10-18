@@ -186,30 +186,8 @@ pub(crate) fn client_name(live: &Live, mac: Option<inform::Mac>) -> Option<Strin
 
 /// Loads a metrics table's samples in range, grouped by key.
 pub(crate) fn load(c: &Connection, spec: Spec, tier: usize, from: Ts, to: Ts) -> anyhow::Result<Loaded> {
-    let Spec { table, key, extra, cols, only } = spec;
-    let suffix = TIERS[tier].0;
-    // Twice the longest interval between two samples, so the one before the window is read.
-    // A raw sample covers at most the longest inform interval before it.
-    let step = TIERS[tier].1.max(crate::active::MAX_INFORM_INTERVAL) * 2;
-    let mut params = vec![Sql::Integer(from), Sql::Integer(to), Sql::Integer(step)];
-    let only = match only {
-        None => String::new(),
-        Some(Only::Is(c, v)) => {
-            params.push(Sql::Text(v.into()));
-            format!(" AND {c} = ?4")
-        }
-        Some(Only::In(c, vs)) => {
-            params.extend(vs.iter().map(|v| Sql::Text(v.clone())));
-            format!(" AND {c} IN ({})", (4..4 + vs.len()).map(|i| format!("?{i}")).collect::<Vec<_>>().join(", "))
-        }
-    };
-    // One sample before the window so the first rate in range is known.
-    let sql = format!(
-        "SELECT {key}, ts, {}{}{} FROM {table}{suffix} WHERE ts >= ?1 - ?3 AND ts <= ?2{only} ORDER BY ts",
-        extra.join(", "),
-        if extra.is_empty() { "" } else { ", " },
-        cols.join(", "),
-    );
+    let (sql, params) = load_query(&spec, tier, from, to)?;
+    let Spec { extra, cols, .. } = spec;
     // In time order; the map groups them per key. The views run the same few
     // statements over and over: the read connections keep them prepared.
     let mut stmt = c.prepare_cached(&sql)?;
@@ -239,6 +217,37 @@ pub(crate) fn load(c: &Connection, spec: Spec, tier: usize, from: Ts, to: Ts) ->
         }
     }
     Ok(out)
+}
+
+/// The statement [`load`] runs, and its parameters.
+fn load_query(spec: &Spec, tier: usize, from: Ts, to: Ts) -> anyhow::Result<(String, Vec<Sql>)> {
+    let &Spec { table, key, extra, cols, only } = spec;
+    let suffix = TIERS[tier].0;
+    // Twice the longest interval between two samples, so the one before the window is read.
+    // A raw sample covers at most the longest inform interval before it.
+    let step = TIERS[tier].1.max(crate::active::MAX_INFORM_INTERVAL) * 2;
+    let mut params = vec![Sql::Integer(from), Sql::Integer(to), Sql::Integer(step)];
+    let only = match only {
+        None => String::new(),
+        Some(Only::Is(c, v)) => {
+            params.push(Sql::Text(v.into()));
+            format!(" AND {c} = ?4")
+        }
+        // The values as one JSON list: one statement whatever their number, where a
+        // placeholder each made another statement for every count.
+        Some(Only::In(c, vs)) => {
+            params.push(Sql::Text(serde_json::to_string(vs)?));
+            format!(" AND {c} IN (SELECT value FROM json_each(?4))")
+        }
+    };
+    // One sample before the window so the first rate in range is known.
+    let sql = format!(
+        "SELECT {key}, ts, {}{}{} FROM {table}{suffix} WHERE ts >= ?1 - ?3 AND ts <= ?2{only} ORDER BY ts",
+        extra.join(", "),
+        if extra.is_empty() { "" } else { ", " },
+        cols.join(", "),
+    );
+    Ok((sql, params))
 }
 
 /// The BSSIDs an AP's SSIDs have had in a tier of `vap_stats` (a BSSID stays
@@ -1738,6 +1747,20 @@ mod tests {
         let b = per["Home"].series[&0][&0];
         assert_eq!(b.averages(), (3.0, 100.0, 0.0));
         assert_eq!(per["Home"].down, 2000.0);
+    }
+
+    #[test]
+    fn one_aps_ssids_are_read_through_the_tables_key() {
+        let dir = TestDir::new("insights-plan");
+        drop(store::Store::open(&dir).unwrap());
+        let c = Connection::open(dir.join("metrics.db")).unwrap();
+        let bssids = ["02:00:00:00:01:01".to_string(), "02:00:00:00:01:02".to_string()];
+        for tier in 0..TIERS.len() {
+            let spec = Spec { table: "vap_stats", key: "bssid", extra: &["radio"], cols: &["tx_bytes"], only: Some(Only::In("bssid", &bssids)) };
+            let (sql, params) = load_query(&spec, tier, 1000, 90_000).unwrap();
+            let plan: Vec<String> = c.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap().query_map(params_from_iter(params), |r| r.get(3)).unwrap().map(Result::unwrap).collect();
+            assert!(plan[0].contains("USING PRIMARY KEY (bssid=?"), "{plan:?}");
+        }
     }
 
     #[test]
