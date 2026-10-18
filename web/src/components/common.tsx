@@ -610,6 +610,19 @@ function eventSpec(kind: string): EventSpec<EventKind> {
   );
 }
 
+/**
+ * A memoised row's comparator. Rows never change, so one re-renders only for
+ * other props or another day, not for every minute the list's clock ticks.
+ * The row's data is compared by identity, not by id: ids start again after a
+ * restore, and React Query keeps an unchanged row's object.
+ */
+export const sameRow = <P extends { now: number }>(a: P, b: P) =>
+  sameDay(a.now, b.now) &&
+  Object.keys(a).length === Object.keys(b).length &&
+  (Object.keys(a) as (keyof P)[]).every(
+    (k) => k === "now" || Object.is(a[k], b[k]),
+  );
+
 interface EventRowProps {
   e: AppEvent;
   names: Names;
@@ -619,7 +632,7 @@ interface EventRowProps {
   now: number;
 }
 
-/** One event. Events never change, so it re-renders only for another id, other names or another day. */
+/** One event. Events never change, so it re-renders only for another event, other names or another day. */
 const EventRow = memo(
   function EventRow({
     e,
@@ -674,12 +687,7 @@ const EventRow = memo(
       </li>
     );
   },
-  (a, b) =>
-    a.e.id === b.e.id &&
-    a.names === b.names &&
-    a.clientNames === b.clientNames &&
-    a.showDevice === b.showDevice &&
-    sameDay(a.now, b.now),
+  sameRow,
 );
 
 export function EventList({
@@ -731,7 +739,7 @@ interface LogRowProps {
   now: number;
 }
 
-/** One log line. Lines never change, so it re-renders only for another id, other names or another day. */
+/** One log line. Lines never change, so it re-renders only for another line, other names or another day. */
 const LogRow = memo(
   function LogRow({ l, names, showDevice, now }: LogRowProps) {
     return (
@@ -750,11 +758,7 @@ const LogRow = memo(
       </div>
     );
   },
-  (a, b) =>
-    a.l.id === b.l.id &&
-    a.names === b.names &&
-    a.showDevice === b.showDevice &&
-    sameDay(a.now, b.now),
+  sameRow,
 );
 
 export function LogList({

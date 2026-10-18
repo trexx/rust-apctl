@@ -9,8 +9,8 @@ import type {
   TimeSpan,
   Timings,
 } from "../api";
-import { band, clock, sameDay, useNow } from "../format";
-import { QueryState, Segmented, Signal } from "./common";
+import { band, clock, useNow } from "../format";
+import { QueryState, Segmented, Signal, sameRow } from "./common";
 import { stableKeys } from "./keys";
 
 const STAGE_NAME = [
@@ -103,17 +103,6 @@ interface RowProps {
   client?: string;
   now: number;
 }
-
-/**
- * Rows never change, so one re-renders only for other props or another day,
- * not for every minute the table's clock ticks.
- */
-const sameRow = <P extends RowProps>(a: P, b: P) =>
-  sameDay(a.now, b.now) &&
-  Object.keys(a).length === Object.keys(b).length &&
-  (Object.keys(a) as (keyof P)[]).every(
-    (k) => k === "now" || Object.is(a[k], b[k]),
-  );
 
 /**
  * One connection attempt as a table row: time, (with `client`, the client's
