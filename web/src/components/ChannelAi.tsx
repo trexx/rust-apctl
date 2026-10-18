@@ -70,10 +70,12 @@ export function PlanActions({
             window.confirm(
               `Move ${changes.map((c) => `${c.name ?? c.mac} to channel ${c.to}`).join(", ")}? Clients reconnect briefly.`,
             ) &&
-            void run(
-              async () =>
-                `${(await applyChannelPlan(band, changes)).applied} AP${changes.length === 1 ? "" : "s"} get the new channel with their next report.`,
-            )
+            void run(async () => {
+              const { applied } = await applyChannelPlan(band, changes);
+              return applied === 1
+                ? "1 AP gets the new channel with its next report."
+                : `${applied} APs get the new channel with their next report.`;
+            })
           }
         >
           Apply plan

@@ -3,7 +3,7 @@ import { Link, useNavigate } from "react-router";
 import { keys, markAlertsRead, useAlerts } from "../api";
 import type { AlertCategory, AlertItem } from "../api";
 import { clock, useNow } from "../format";
-import { useDismiss, useRunner } from "./common";
+import { Outcome, useDismiss, useRunner } from "./common";
 
 const CATEGORIES: [AlertCategory, string, string][] = [
   [
@@ -125,7 +125,7 @@ export function AlertBell() {
   const a = useAlerts();
   const now = useNow();
   // The server stores the change a moment later.
-  const { run } = useRunner([keys.alerts()], 800);
+  const { busy, msg, run } = useRunner([keys.alerts()], 800);
   const [open, setOpen] = useState(false);
   const box = useRef<HTMLDivElement>(null);
   useDismiss(box, () => setOpen(false), open);
@@ -161,11 +161,13 @@ export function AlertBell() {
             )}
             <span className="spacer" />
             {unread > 0 && (
-              <button className="btn small" onClick={readAll}>
+              <button className="btn small" disabled={busy} onClick={readAll}>
                 Mark all read
               </button>
             )}
           </div>
+          {/* Only a failure says anything; success shows in the list. */}
+          <Outcome msg={msg} />
           {list.length === 0 ? (
             <div className="muted small">No alerts yet.</div>
           ) : (
