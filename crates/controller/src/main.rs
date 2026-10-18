@@ -178,7 +178,14 @@ async fn serve(args: ServeArgs) -> Result<()> {
         data_dir, keys, shadow, shadow_cmd, inform_ports, listen, syslog_listen, users_file, emulate_version, active, inform_listen,
         oui_file, backup_key, inform_url, stun_listen, trusted_proxies,
     } = args;
+    // The configuration is read first: a mistake in it stops the start before
+    // anything has changed (a staged restore applied) or started listening.
     let proxies = Arc::new(auth::Proxies::parse(&trusted_proxies)?);
+    let users = match &users_file {
+        Some(p) => auth::Users::load(p)?,
+        None => auth::Users::default(),
+    };
+    let backups = backup::Backups::new(data_dir.clone(), backup_key.as_deref().map(backup::load_key).transpose()?);
     let vendors = match vendor::Vendors::load(&oui_file) {
         Ok(v) => {
             tracing::info!("loaded {} manufacturer prefixes from {}", v.len(), oui_file.display());
@@ -195,11 +202,15 @@ async fn serve(args: ServeArgs) -> Result<()> {
     };
     tracing::info!("loaded {} device keys and {} syslog keys", keys.len(), keys.syslog_len());
     let keys = Arc::new(keys);
-
-    let backups = backup::Backups::new(data_dir.clone(), backup_key.as_deref().map(backup::load_key).transpose()?);
+    if users.is_empty() {
+        tracing::warn!("no users configured: the API is read-only and needs no login");
+    } else {
+        tracing::info!("login enabled for {} user(s)", users.len());
+    }
     if backups.key.is_none() {
         tracing::warn!("no --backup-key: backups are written unencrypted");
     }
+
     // A restore chosen in the UI is applied now, before the databases are opened.
     backup::apply_pending(&backups);
     let (store, writer) = store::Store::open(&data_dir)?;
@@ -277,15 +288,6 @@ async fn serve(args: ServeArgs) -> Result<()> {
         start_active(Arc::new(active_state), &live, inform_url.as_deref(), inform_listen, stun_listen).await?;
     }
 
-    let users = match &users_file {
-        Some(p) => auth::Users::load(p)?,
-        None => auth::Users::default(),
-    };
-    if users.is_empty() {
-        tracing::warn!("no users configured: the API is read-only and needs no login");
-    } else {
-        tracing::info!("login enabled for {} user(s)", users.len());
-    }
     let auth = Arc::new(auth::Auth::new(users, &store, writer.clone(), proxies)?);
     let threat_acks: Arc<threats::AckCache> = Default::default();
     threats::watch(store.clone(), threat_acks.clone(), live.clone(), in_tx.clone(), writer.clone());
