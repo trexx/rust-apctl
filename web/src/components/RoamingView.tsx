@@ -1,6 +1,7 @@
 import { Link } from "react-router";
 import { useRoaming } from "../api";
 import type { Roaming } from "../api";
+import { useNow } from "../format";
 import { RangePicker, useTimeSpan } from "./Chart";
 import { ConnHead, RoamRow, roamId } from "./Connections";
 import { QueryState, Signal, Stat } from "./common";
@@ -77,6 +78,7 @@ function Details({ data }: { data: Roaming }) {
   const ap = (m: string) => data.ap_names[m] ?? m;
   const client = (m: string) => data.client_names[m] ?? m;
   const keys = stableKeys(data.roams, roamId);
+  const now = useNow();
   return (
     <>
       <div className="grid2 align-top">
@@ -194,8 +196,9 @@ function Details({ data }: { data: Roaming }) {
                 <RoamRow
                   key={keys[i]}
                   r={x}
-                  apName={ap}
+                  apNames={data.ap_names}
                   client={client(x.client)}
+                  now={now}
                 />
               ))}
             </tbody>
