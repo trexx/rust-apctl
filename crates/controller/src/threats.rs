@@ -87,7 +87,7 @@ pub struct Assessment {
     pub heard: Vec<Heard>,
     /// When the first neighbouring network was recorded.
     pub watching_since: Ts,
-    pub acks: Acks,
+    pub acks: Arc<Acks>,
     /// (kind, bssid) -> when first reported.
     pub reported: HashMap<(Kind, String), Ts>,
 }
@@ -488,8 +488,9 @@ pub struct ThreatState {
     cache: Mutex<Cache>,
     latest: Mutex<Option<Latest>>,
     /// Read from the database once, then kept here as [`ack`] changes them,
-    /// so what is served shows a change at once.
-    acks: Mutex<Option<Acks>>,
+    /// so what is served shows a change at once. Shared with the assessments
+    /// made since, and copied only for a change while one holds them.
+    acks: Mutex<Option<Arc<Acks>>>,
 }
 
 impl ThreatState {
@@ -501,15 +502,15 @@ impl ThreatState {
         self.latest.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    fn acks(&self) -> MutexGuard<'_, Option<Acks>> {
+    fn acks(&self) -> MutexGuard<'_, Option<Arc<Acks>>> {
         self.acks.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     /// Runs `f` on the acknowledgements, read from the database the first time.
-    fn with_acks<T>(&self, store: &Store, f: impl FnOnce(&mut Acks) -> T) -> anyhow::Result<T> {
+    fn with_acks<T>(&self, store: &Store, f: impl FnOnce(&mut Arc<Acks>) -> T) -> anyhow::Result<T> {
         let mut acks = self.acks();
         if acks.is_none() {
-            *acks = Some(store.read(Db::Config, |c| Ok(load_acks(c)?))?);
+            *acks = Some(Arc::new(store.read(Db::Config, |c| Ok(load_acks(c)?))?));
         }
         Ok(f(acks.as_mut().expect("read above")))
     }
@@ -851,6 +852,7 @@ pub async fn ack(State(s): State<AppState>, Json(b): Json<AckBody>) -> Result<Js
 /// served shows it at once, however old the findings are.
 fn set_ack(store: &Store, state: &ThreatState, writer: &Writer, kind: Kind, bssid: String, ack: Option<Ack>) -> anyhow::Result<()> {
     state.with_acks(store, |acks| {
+        let acks = Arc::make_mut(acks);
         let k = Sql::Text(kind.as_str().into());
         match ack {
             Some(a) => {
@@ -1241,7 +1243,7 @@ mod tests {
     fn acknowledgements_are_per_kind_and_bssid() {
         let mut a = site();
         a.heard.push(heard("02:aa:bb:cc:dd:ee", UP, "H0me", 36, "Open", -70));
-        a.acks.entry(Kind::Lookalike).or_default().insert("02:aa:bb:cc:dd:ee".into(), Ack { note: Some("the neighbours".into()), ts: 5 });
+        Arc::make_mut(&mut a.acks).entry(Kind::Lookalike).or_default().insert("02:aa:bb:cc:dd:ee".into(), Ack { note: Some("the neighbours".into()), ts: 5 });
         assert_eq!((Kind::parse("lookalike"), json!(Kind::NewNearby)), (Some(Kind::Lookalike), json!("new_nearby")), "named as stored");
         let f = assess(&a);
         assert_eq!(f[0].acknowledged.as_ref().and_then(|x| x.note.as_deref()), Some("the neighbours"));
