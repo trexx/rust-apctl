@@ -212,7 +212,8 @@ function Shell({ user, readOnly }: { user: string | null; readOnly: boolean }) {
         )}
       </header>
       <main>
-        <ErrorBoundary resetKey={location.pathname}>
+        {/* With the search, so that another tab (?tab=) of a page that failed starts afresh. */}
+        <ErrorBoundary resetKey={location.pathname + location.search}>
           <Suspense fallback={<Loading />}>
             <Routes>
               <Route path="/" element={<Overview />} />
