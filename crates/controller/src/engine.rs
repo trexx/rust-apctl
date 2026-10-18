@@ -1043,10 +1043,13 @@ impl Engine {
     /// renames and the client list are announced once for the lot: a bulk
     /// import of thousands of names would otherwise overrun the live
     /// subscribers' queue, and send every browser to refetch everything.
+    ///
+    /// Only the names are changed under the live view's lock; they are
+    /// stored, and the renames recorded, once it is released.
     fn set_aliases(&self, ts: Ts, entries: Vec<AliasEdit>, only_if_unset: bool) {
         let clean = |v: Option<String>| v.map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
-        let mut changed = false;
-        let mut renames = Vec::new();
+        // Each change: the client, its new alias and note, and for a rename its old alias and its AP.
+        let mut changes = Vec::new();
         let mut live = self.live.write().unwrap();
         for AliasEdit { mac, alias, note } in entries {
             let (alias, mut note) = (clean(alias), clean(note));
@@ -1062,24 +1065,31 @@ impl Engine {
             if old.alias == alias && old.note == note {
                 continue;
             }
-            changed = true;
             if alias.is_none() && note.is_none() {
                 live.aliases.remove(&mac);
-                self.writer.exec(Db::Config, "DELETE FROM client_aliases WHERE mac = ?1", vec![Sql::Text(mac.to_string())]);
             } else {
                 live.aliases.insert(mac, Alias { alias: alias.clone(), note: note.clone() });
+            }
+            let renamed = (old.alias != alias).then(|| (old.alias, live.clients.get(&mac).map(|c| c.sample.ap_mac)));
+            changes.push((mac, alias, note, renamed));
+        }
+        drop(live);
+        let changed = !changes.is_empty();
+        let mut renames = Vec::new();
+        for (mac, alias, note, renamed) in changes {
+            if alias.is_none() && note.is_none() {
+                self.writer.exec(Db::Config, "DELETE FROM client_aliases WHERE mac = ?1", vec![Sql::Text(mac.to_string())]);
+            } else {
                 self.writer.exec(
                     Db::Config,
                     "INSERT OR REPLACE INTO client_aliases (mac, alias, note, updated) VALUES (?1, ?2, ?3, ?4)",
                     vec![Sql::Text(mac.to_string()), alias.clone().into(), note.into(), Sql::Integer(ts)],
                 );
             }
-            if old.alias != alias {
-                let ap = live.clients.get(&mac).map(|c| c.sample.ap_mac);
-                renames.push(self.record(Event { ts, kind: EventKind::ClientRenamed, device_mac: ap, client_mac: Some(mac), data: json!({ "from": old.alias, "to": alias }) }));
+            if let Some((from, ap)) = renamed {
+                renames.push(self.record(Event { ts, kind: EventKind::ClientRenamed, device_mac: ap, client_mac: Some(mac), data: json!({ "from": from, "to": alias }) }));
             }
         }
-        drop(live);
         // One rename names its client; more are announced as renames of anyone.
         let head = match renames[..] {
             [] => None,
