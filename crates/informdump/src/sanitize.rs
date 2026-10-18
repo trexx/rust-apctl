@@ -604,11 +604,12 @@ impl Sanitizer {
         }
     }
 
-    /// Rewrites a `key=value` config blob line by line.
-    fn cfg(&mut self, blob: &str) -> String {
+    /// Rewrites a `key=value` config blob line by line. `under_secret`: its own key or
+    /// one above it is secret.
+    fn cfg(&mut self, blob: &str, under_secret: bool) -> String {
         blob.lines()
             .map(|l| match l.split_once('=') {
-                Some((k, v)) => format!("{k}={}", self.field("", k, false, v)),
+                Some((k, v)) => format!("{k}={}", self.field("", k, under_secret, v)),
                 None => self.scrub(l),
             })
             .collect::<Vec<_>>()
@@ -629,7 +630,7 @@ impl Sanitizer {
             Value::Number(n) if secret && self.is_secret_number(parent, key, under_secret) => {
                 Value::String(self.fakes.get(Kind::Secret, &n.to_string(), |n| format!("secret-{n}")))
             }
-            Value::String(s) if key.ends_with("_cfg") => Value::String(self.cfg(s)),
+            Value::String(s) if key.ends_with("_cfg") => Value::String(self.cfg(s, secret)),
             // Names people gave their devices in the other controller.
             Value::String(s) if key == "name" && (parent == "clients" || parent == "user") && !s.is_empty() => {
                 Value::String(self.fakes.get(Kind::Alias, s, |n| format!("alias-{n}")))
@@ -1175,6 +1176,14 @@ mod tests {
         assert_eq!(out["x_radius"], json!({ "port": 1812, "pin": "secret-1", "ip": "secret-2" }), "--keep as parent.field");
         assert_eq!(out["x_passphrase"], "secret-3", "--keep does not pass a secret key's own value, number or string");
         assert_eq!(out["SAE_Groups"], json!([19, 20]), "in any case");
+    }
+
+    #[test]
+    fn a_config_under_a_secret_key_is_secret_but_for_what_passes_there() {
+        let mut s = Sanitizer::new(Vec::new(), Vec::new());
+        let out = s.json(&json!({ "x_backup": { "system_cfg": "radio.1.channel=36\nmark.1.name=guest" }, "system_cfg": "radio.1.channel=36" }));
+        assert_eq!(out["x_backup"]["system_cfg"], "radio.1.channel=secret-1\nmark.1.name=guest");
+        assert_eq!(out["system_cfg"], "radio.1.channel=36");
     }
 
     #[test]
