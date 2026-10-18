@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Builds, checks and publishes the apctl image, then removes the unnamed build
-# stages every image build leaves behind (about 2.5 GB each).
+# stages the build left behind (about 2.5 GB each).
 #
 #   scripts/release.sh 0.10.1                      # build, test, push
 #   scripts/release.sh 0.10.1 --pin ~/flux/apctl/manifests/statefulset.yaml
@@ -27,8 +27,11 @@ while [ $# -gt 0 ]; do
   esac
 done
 
-# Leftover build stages are removed however the script ends.
-cleanup() { podman image prune -f >/dev/null 2>&1 || true; }
+# Leftover build stages are removed however the script ends: only the unnamed
+# images that were not there before, not every dangling image on the host.
+dangling() { podman images -q --filter dangling=true | sort -u; }
+before=$(dangling)
+cleanup() { comm -13 <(echo "$before") <(dangling) | xargs -r podman rmi >/dev/null 2>&1 || true; }
 trap cleanup EXIT
 
 crate=$(sed -n 's/^version = "\(.*\)"/\1/p' crates/controller/Cargo.toml | head -1)
