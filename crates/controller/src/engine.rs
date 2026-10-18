@@ -1715,29 +1715,30 @@ pub(crate) fn section_labels(cfg: &str, radios: &[crate::model::RadioSample]) ->
 fn lifecycle_events(ts: Ts, a: &crate::model::ApSample, prev: Option<&DeviceView>, known: Option<&KnownDevice>) -> Vec<Event> {
     let mac = a.mac;
     let mut events = Vec::new();
-    match (prev, known) {
-        (None, None) => events.push(Event::device(ts, EventKind::ApSeen, mac, json!({ "ip": a.ip, "model": a.model, "version": a.version }))),
-        // Known from a previous run: only report what we can prove changed while we were away.
-        (None, Some(k)) => {
-            let away = ts - k.last_seen;
-            if let (Some(old), Some(up)) = (k.uptime, a.uptime)
-                && up + 60 < old + away {
-                    events.push(Event::device(ts, EventKind::ApRestarted, mac, json!({ "uptime": up })));
-                }
-            if k.version.is_some() && a.version.is_some() && k.version != a.version {
-                events.push(Event::device(ts, EventKind::ApFirmwareChanged, mac, json!({ "from": k.version, "to": a.version })));
+    // What was last known of the AP: its uptime and when it reported it, and its version.
+    let (uptime, version) = match (prev, known) {
+        (None, None) => {
+            events.push(Event::device(ts, EventKind::ApSeen, mac, json!({ "ip": a.ip, "model": a.model, "version": a.version })));
+            return events;
+        }
+        (Some(p), _) => {
+            if !p.online {
+                events.push(Event::device(ts, EventKind::ApOnline, mac, json!({ "offline_for": ts - p.last_seen })));
             }
+            (p.snapshot.ap.uptime.map(|u| (u, p.snapshot.ap.ts)), &p.snapshot.ap.version)
         }
-        (Some(p), _) if !p.online => events.push(Event::device(ts, EventKind::ApOnline, mac, json!({ "offline_for": ts - p.last_seen }))),
-        _ => {}
+        (None, Some(k)) => (k.uptime.map(|u| (u, k.last_seen)), &k.version),
+    };
+    // Only what can be proved to have changed, in this run or while apctl was
+    // away: up for less than it was then plus the time since (with a minute's
+    // slack), and a version other than a known one.
+    if let (Some((old, at)), Some(up)) = (uptime, a.uptime)
+        && up.saturating_add(60) < old.saturating_add(ts - at)
+    {
+        events.push(Event::device(ts, EventKind::ApRestarted, mac, json!({ "uptime": up })));
     }
-    if let (Some(p), Some(up)) = (prev, a.uptime) {
-        if p.snapshot.ap.uptime.is_some_and(|old| up + 30 < old) {
-            events.push(Event::device(ts, EventKind::ApRestarted, mac, json!({ "uptime": up })));
-        }
-        if p.snapshot.ap.version != a.version && a.version.is_some() {
-            events.push(Event::device(ts, EventKind::ApFirmwareChanged, mac, json!({ "from": p.snapshot.ap.version, "to": a.version })));
-        }
+    if version.is_some() && a.version.is_some() && *version != a.version {
+        events.push(Event::device(ts, EventKind::ApFirmwareChanged, mac, json!({ "from": version, "to": a.version })));
     }
     events
 }
@@ -2435,5 +2436,30 @@ mod tests {
         flushed(&h.writer);
         let stored: String = h.store.read(Db::Config, |c| Ok(c.query_row("SELECT cfgversion FROM device_config", [], |r| r.get(0))?)).unwrap();
         assert_eq!(stored, "v1");
+    }
+
+    #[test]
+    fn a_restart_counts_the_time_since_the_last_uptime() {
+        let mut h = harness();
+        let at = |h: &mut Harness, ts: Ts, uptime: i64, version: Option<&str>| {
+            let mut v = inform(AP1, uptime, &[]);
+            if let Some(version) = version {
+                v["version"] = json!(version);
+            }
+            h.engine.handle(Input::Inform { ts, peer: "x".into(), decoded: decoded(v) });
+        };
+        at(&mut h, 0, 50, None);
+        // The first version it reports is no change of firmware.
+        at(&mut h, 10, 60, Some("6.7.0.1"));
+        h.engine.handle(Input::Tick(200));
+        assert_eq!(events(&mut h), vec![("ap_seen", None), ("ap_offline", None)]);
+        // Away for an hour and back with more uptime than it had, though less
+        // than it would have had: it restarted meanwhile.
+        at(&mut h, 3800, 1000, Some("6.7.0.1"));
+        assert_eq!(events(&mut h), vec![("ap_online", None), ("ap_restarted", None)]);
+        // Informs a little early or late are no restart.
+        at(&mut h, 3815, 1000, Some("6.7.0.1"));
+        at(&mut h, 3820, 1060, Some("6.7.0.1"));
+        assert_eq!(events(&mut h), vec![]);
     }
 }
