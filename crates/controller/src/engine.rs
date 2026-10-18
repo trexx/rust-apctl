@@ -254,7 +254,13 @@ pub struct Live {
     pub last_config: HashMap<Mac, Arc<PushedConfig>>,
     /// The STUN socket (active mode), which connection requests are sent from.
     pub stun: Option<Arc<tokio::net::UdpSocket>>,
+    /// Active mode: drops what it keeps of a forgotten AP (its config digest
+    /// and AES-GCM pin). Called by the engine without the live view's lock.
+    pub forget_managed: Option<ForgetFn>,
 }
+
+/// See `Live::forget_managed`.
+pub type ForgetFn = Arc<dyn Fn(&Mac) + Send + Sync>;
 
 impl Live {
     /// Records the AP's hash_id and address, for attributing syslog. An address
@@ -281,7 +287,7 @@ impl Live {
     fn forget_ap(&mut self, mac: &Mac) {
         let Live {
             devices, aliases: _, clients: _, counters: _, by_hash_id, by_ip, known_devices, state: _, state_imported_at: _, raw_informs, firmware, commands,
-            locating, reprovision, scans, adoption, last_config, stun: _,
+            locating, reprovision, scans, adoption, last_config, stun: _, forget_managed: _,
         } = self;
         devices.remove(mac);
         // Also what was restored from the database, or it could still be reported offline.
@@ -301,13 +307,19 @@ impl Live {
     }
 }
 
-/// What the database remembers about an AP from a previous run.
+/// What the database remembers about an AP from a previous run: what tells
+/// what happened while apctl was away, and what the device list shows of it.
 #[derive(Debug, Clone)]
 pub struct KnownDevice {
     pub first_seen: Ts,
     pub last_seen: Ts,
     pub uptime: Option<i64>,
     pub version: Option<String>,
+    pub hostname: Option<String>,
+    pub model: Option<String>,
+    pub model_display: Option<String>,
+    pub ip: Option<String>,
+    pub serial: Option<String>,
 }
 
 pub type SharedLive = Arc<RwLock<Live>>;
@@ -330,6 +342,10 @@ type RadioSettings = (Option<i64>, Option<i64>, Option<i64>);
 const REFRESH_SECS: Ts = 60;
 /// The same for an unchanged spectrum scan row and its `ts`.
 const SPECTRUM_REFRESH_SECS: Ts = 3600;
+/// The longest interval a multicast rate is worked out over: a client's or a
+/// network's sample further apart from the one before gives no rate. A raw
+/// sample in `mcast_stats` so covers at most this long before it.
+pub(crate) const MCAST_GAP: Ts = 120;
 
 /// What was last written of the rows rewritten on every inform, and when.
 /// Empty at start, so each row is written on its first inform of a run.
@@ -369,6 +385,22 @@ impl<T: PartialEq + Clone> Row<T> {
         self.written = ts;
         true
     }
+}
+
+/// Records `value` as reported under `key` at `ts` (see `Row::report`): true
+/// if its row is to be written, as one new or changed, or due again. The key
+/// is copied only for a new row.
+fn report<K, Q, T>(rows: &mut Rows<K, T>, key: &Q, value: &T, ts: Ts, every: Ts) -> bool
+where
+    K: std::borrow::Borrow<Q> + Eq + std::hash::Hash,
+    Q: ToOwned<Owned = K> + Eq + std::hash::Hash + ?Sized,
+    T: PartialEq + Clone,
+{
+    if let Some(row) = rows.get_mut(key) {
+        return row.report(value, ts, every);
+    }
+    rows.insert(key.to_owned(), Row::new(value, ts));
+    true
 }
 
 /// Whether a row last written at `at` (if ever) is due again at `ts`.
@@ -452,27 +484,28 @@ impl Engine {
     /// not report every client as newly connected.
     pub fn restore(&mut self, store: &store::Store) -> anyhow::Result<()> {
         let (devices, clients, aliases, state) = store.read(Db::Config, |c| {
-            let mut stmt = c.prepare("SELECT mac, first_seen, last_seen, uptime, version, hash_id, ip FROM devices")?;
+            let mut stmt = c.prepare("SELECT mac, first_seen, last_seen, uptime, version, hash_id, ip, hostname, model, model_display, serial FROM devices")?;
             let devices = stmt
                 .query_map([], |r| {
-                    Ok((
-                        r.get::<_, String>(0)?,
-                        KnownDevice { first_seen: r.get::<_, Option<i64>>(1)?.unwrap_or(0), last_seen: r.get::<_, Option<i64>>(2)?.unwrap_or(0), uptime: r.get(3)?, version: r.get(4)? },
-                        r.get::<_, Option<String>>(5)?,
-                        r.get::<_, Option<String>>(6)?,
-                    ))
+                    let known = KnownDevice {
+                        first_seen: r.get::<_, Option<i64>>(1)?.unwrap_or(0), last_seen: r.get::<_, Option<i64>>(2)?.unwrap_or(0), uptime: r.get(3)?, version: r.get(4)?,
+                        ip: r.get(6)?, hostname: r.get(7)?, model: r.get(8)?, model_display: r.get(9)?, serial: r.get(10)?,
+                    };
+                    Ok((r.get::<_, String>(0)?, known, r.get::<_, Option<String>>(5)?))
                 })?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
             let mut stmt = c.prepare("SELECT mac, hostname, ip, first_seen, last_seen, ap_mac, bssid, essid, radio, connected FROM clients")?;
+            // A row whose MACs do not parse is no client to restore.
             let clients = stmt
                 .query_map([], |r| {
-                    Ok((
-                        r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?, r.get::<_, Option<String>>(2)?,
-                        r.get::<_, Option<i64>>(3)?, r.get::<_, Option<i64>>(4)?, r.get::<_, Option<String>>(5)?,
-                        r.get::<_, Option<String>>(6)?, r.get::<_, Option<String>>(7)?, r.get::<_, Option<String>>(8)?,
-                        r.get::<_, i64>(9)? != 0,
-                    ))
+                    let (Ok(mac), Some(Ok(ap_mac))) = (r.get::<_, String>(0)?.parse::<Mac>(), r.get::<_, Option<String>>(5)?.map(|a| a.parse::<Mac>())) else { return Ok(None) };
+                    let sample = ClientSample { mac, ap_mac, hostname: r.get(1)?, ip: r.get(2)?, bssid: r.get::<_, Option<String>>(6)?.unwrap_or_default(), essid: r.get(7)?, radio: r.get(8)?, ..Default::default() };
+                    Ok(Some(ClientView {
+                        sample: Arc::new(sample), connected: r.get::<_, i64>(9)? != 0, first_seen: r.get::<_, Option<i64>>(3)?.unwrap_or(0),
+                        last_seen: r.get::<_, Option<i64>>(4)?.unwrap_or(0),
+                    }))
                 })?
+                .filter_map(Result::transpose)
                 .collect::<rusqlite::Result<Vec<_>>>()?;
             // No row: nothing imported yet. Any other error fails the start rather
             // than running as if the settings were never imported.
@@ -487,24 +520,22 @@ impl Engine {
             Ok((devices, clients, aliases, state))
         })?;
         let mut live = self.live.write().unwrap();
-        for (mac, known, hash_id, ip) in devices {
+        for (mac, known, hash_id) in devices {
             let Ok(mac) = mac.parse::<Mac>() else { continue };
             if let Some(h) = hash_id.as_deref().and_then(crate::syslog::parse_hash_id) {
                 live.by_hash_id.insert(h, mac);
             }
-            if let Some(ip) = ip {
-                live.by_ip.insert(ip, mac);
+            if let Some(ip) = &known.ip {
+                live.by_ip.insert(ip.clone(), mac);
             }
             live.known_devices.insert(mac, known);
         }
         let n_clients = clients.len();
-        for (mac, hostname, ip, first_seen, last_seen, ap_mac, bssid, essid, radio, connected) in clients {
-            let (Ok(mac), Some(Ok(ap_mac))) = (mac.parse::<Mac>(), ap_mac.map(|a| a.parse::<Mac>())) else { continue };
-            let sample = Arc::new(ClientSample { mac, ap_mac, bssid: bssid.unwrap_or_default(), essid, radio, hostname, ip, ..Default::default() });
-            if connected {
-                self.connected.insert(mac);
+        for c in clients {
+            if c.connected {
+                self.connected.insert(c.sample.mac);
             }
-            live.clients.insert(mac, ClientView { sample, connected, first_seen: first_seen.unwrap_or(0), last_seen: last_seen.unwrap_or(0) });
+            live.clients.insert(c.sample.mac, c);
         }
         if let Some((json, at)) = state {
             match serde_json::from_str::<Value>(&json) {
@@ -561,9 +592,16 @@ impl Engine {
         }
     }
 
-    /// Stores an event and tells the live subscribers; the alert watcher gets
-    /// the event itself, last, so it is not copied.
+    /// Stores an event and tells the live subscribers (see `record`).
     fn emit(&self, ev: Event) {
+        let head = self.record(ev);
+        let _ = self.tx.send(LiveMsg::Event(head));
+    }
+
+    /// Stores an event without telling the live subscribers, for the caller
+    /// to announce (`emit` does); the alert watcher gets the event itself,
+    /// last, so it is not copied.
+    fn record(&self, ev: Event) -> EventHead {
         bump(&self.counters.events);
         self.writer.exec(
             Db::Config,
@@ -571,15 +609,16 @@ impl Engine {
             vec![
                 Sql::Integer(ev.ts),
                 Sql::Text(ev.kind.as_str().into()),
-                opt_text(ev.device_mac.map(|m| m.to_string())),
-                opt_text(ev.client_mac.map(|m| m.to_string())),
+                ev.device_mac.map(|m| m.to_string()).into(),
+                ev.client_mac.map(|m| m.to_string()).into(),
                 Sql::Text(ev.data.to_string()),
             ],
         );
-        let _ = self.tx.send(LiveMsg::Event(EventHead { kind: ev.kind, device_mac: ev.device_mac, client_mac: ev.client_mac }));
+        let head = EventHead { kind: ev.kind, device_mac: ev.device_mac, client_mac: ev.client_mac };
         if let Some(a) = &self.alerts {
             a.offer(ev);
         }
+        head
     }
 
     fn inform(&mut self, ts: Ts, peer: String, decoded: Decoded) {
@@ -587,7 +626,7 @@ impl Engine {
         // acknowledgement or an event (client connection tracking, radar, scans).
         // They carry no client data and must not update the AP's status.
         if decoded.payload["inform_as_notif"].as_bool() == Some(true) {
-            self.notification(ts, &decoded.payload);
+            self.notification(ts, decoded.payload);
             return;
         }
         let snap = match model::parse(ts, &decoded.payload) {
@@ -601,39 +640,56 @@ impl Engine {
         let mac = snap.ap.mac;
         self.write_metrics(&snap);
         self.check_isolated(ts, &snap);
+        bump(&self.counters.informs);
 
         // A handle of its own, so the engine's other fields stay usable while it is locked.
         let shared = self.live.clone();
-        let mut live = shared.write().unwrap();
-        if snap.has_vap_table {
-            live.raw_informs.insert(mac, Arc::new(decoded.payload));
-        }
-        bump(&self.counters.informs);
-        live.attribute(&snap.ap);
-
-        // The previous view is taken out (no copy) and replaced at the end; the lock is held throughout.
-        let prev = live.devices.remove(&mac);
-        let known = if prev.is_none() { live.known_devices.remove(&mac) } else { None };
-        let mut events = lifecycle_events(ts, &snap.ap, prev.as_ref(), known.as_ref());
+        // The AP's comings and goings are worked out under the read lock: the
+        // engine is the only writer of the devices, so the view read here is
+        // the one replaced below.
+        let mut events = {
+            let live = shared.read().unwrap();
+            let prev = live.devices.get(&mac);
+            let known = if prev.is_none() { live.known_devices.get(&mac) } else { None };
+            self.write_device_if_due(ts, &snap.ap, prev);
+            lifecycle_events(ts, &snap.ap, prev, known)
+        };
         if snap.has_vap_table {
             self.radio_events(ts, &snap, &mut events);
         }
-        self.write_device_if_due(ts, &snap.ap, prev.as_ref());
-        // An upgrade we sent has landed: the AP reports the new version.
+        // Only for a report that lists clients: the UI refetches its client lists on it.
+        let has_clients = !snap.clients.is_empty();
+
+        // The write lock is held for the swaps alone. What they replace (the last
+        // full inform, the last snapshot) is dropped after it, and the events are
+        // emitted after it.
+        let mut live = shared.write().unwrap();
+        let old_inform = if snap.has_vap_table { live.raw_informs.insert(mac, Arc::new(decoded.payload)) } else { None };
+        live.attribute(&snap.ap);
+        let prev = live.devices.remove(&mac);
+        let known = if prev.is_none() { live.known_devices.remove(&mac) } else { None };
+        // An upgrade apctl sent has landed: the AP reports the new version. One
+        // event says so, not also a firmware change (see `lifecycle_events`).
         if let Some(v) = &snap.ap.version
             && let Some(j) = live.firmware.version_seen(&mac, v)
         {
+            events.retain(|e| e.kind != EventKind::ApFirmwareChanged);
             events.push(Event::device(ts, EventKind::ApUpgraded, mac, json!({ "from": j.from, "to": v, "custom": j.custom })));
         }
+        if snap.has_vap_table {
+            self.update_clients(&mut live, ts, &snap.clients, &mut events);
+        }
+        let (view, old_snapshot) = device_view(ts, peer, snap, prev, known.as_ref());
+        live.devices.insert(mac, view);
+        drop(live);
+        drop((old_inform, old_snapshot));
+
         for e in events {
             self.emit(e);
         }
-
-        if snap.has_vap_table {
-            self.update_clients(&mut live, ts, &snap.clients);
+        if has_clients {
+            let _ = self.tx.send(LiveMsg::Clients);
         }
-        live.devices.insert(mac, device_view(ts, peer, snap, prev, known.as_ref()));
-        drop(live);
         let _ = self.tx.send(LiveMsg::Device { mac });
     }
 
@@ -679,7 +735,9 @@ impl Engine {
         }
     }
 
-    fn update_clients(&mut self, live: &mut Live, ts: Ts, clients: &[Arc<ClientSample>]) {
+    /// Updates the clients a full inform lists; their events are added to
+    /// `events`, for the caller to emit once the lock is released.
+    fn update_clients(&mut self, live: &mut Live, ts: Ts, clients: &[Arc<ClientSample>], events: &mut Vec<Event>) {
         use std::collections::btree_map::Entry;
         for c in clients {
             self.connected.insert(c.mac);
@@ -720,21 +778,18 @@ impl Engine {
                        radio = excluded.radio, connected = 1",
                     vec![
                         Sql::Text(c.mac.to_string()),
-                        opt_text(c.hostname.clone()),
-                        opt_text(c.ip.clone()),
+                        c.hostname.clone().into(),
+                        c.ip.clone().into(),
                         Sql::Integer(ts),
                         Sql::Text(c.ap_mac.to_string()),
                         Sql::Text(c.bssid.clone()),
-                        opt_text(c.essid.clone()),
-                        opt_text(c.radio.clone()),
+                        c.essid.clone().into(),
+                        c.radio.clone().into(),
                     ],
                 );
             }
-            if let Some(e) = event {
-                self.emit(e);
-            }
+            events.extend(event);
         }
-        let _ = self.tx.send(LiveMsg::Clients);
     }
 
     /// A reply sent to an AP: by the other controller (shadow mode, compared in
@@ -792,9 +847,14 @@ impl Engine {
             labels.extend(section_labels(&system, &radios));
             data.insert("labels".into(), Value::Object(labels));
         }
-        let cfgversion = p["cfgversion"].as_str().map(str::to_string).or_else(|| {
-            p["mgmt_cfg"].as_str().and_then(|m| m.lines().find_map(|l| l.strip_prefix("cfgversion=")).map(str::to_string))
-        });
+        // Without one in the push: the one its mgmt_cfg carries (this push's, else
+        // the last one's), else the last push's, as the stored copy keeps it
+        // (COALESCE below). A restart, reading the stored copy, sees the same.
+        let cfgversion = p["cfgversion"]
+            .as_str()
+            .map(str::to_string)
+            .or_else(|| mgmt.lines().find_map(|l| l.strip_prefix("cfgversion=")).map(str::to_string))
+            .or_else(|| previous.cfgversion.clone());
         self.writer.exec(
             Db::Config,
             "INSERT INTO device_config (mac, ts, cfgversion, mgmt_cfg, system_cfg) VALUES (?1, ?2, ?3, ?4, ?5)
@@ -803,9 +863,9 @@ impl Engine {
             vec![
                 Sql::Text(mac.to_string()),
                 Sql::Integer(ts),
-                opt_text(cfgversion.clone()),
-                opt_text(p["mgmt_cfg"].as_str().map(cfgdiff::redact)),
-                opt_text(p["system_cfg"].as_str().map(cfgdiff::redact)),
+                cfgversion.clone().into(),
+                p["mgmt_cfg"].as_str().map(cfgdiff::redact).into(),
+                p["system_cfg"].as_str().map(cfgdiff::redact).into(),
             ],
         );
 
@@ -821,13 +881,13 @@ impl Engine {
                 };
                 let result = render(&req).map(|ours| crate::dryrun::compare(&ours, &mgmt, &system, false));
                 let (matches, payload) = match &result {
-                    Ok(c) => (c.matches(), serde_json::to_value(c).unwrap_or_default()),
-                    Err(e) => (false, json!({ "error": format!("{e:#}") })),
+                    Ok(c) => (c.matches(), serde_json::to_string(c).unwrap_or_default()),
+                    Err(e) => (false, json!({ "error": format!("{e:#}") }).to_string()),
                 };
                 self.writer.exec(
                     Db::Config,
                     "INSERT INTO dryrun_results (ts, mac, cfgversion, matches, comparison) VALUES (?1, ?2, ?3, ?4, ?5)",
-                    vec![Sql::Integer(ts), Sql::Text(mac.to_string()), opt_text(cfgversion.clone()), Sql::Integer(matches as i64), Sql::Text(payload.to_string())],
+                    vec![Sql::Integer(ts), Sql::Text(mac.to_string()), cfgversion.clone().into(), Sql::Integer(matches as i64), Sql::Text(payload)],
                 );
                 Some(match &result {
                     Ok(c) => json!({ "matches": matches, "system_cfg": { "added": c.system_cfg.added, "removed": c.system_cfg.removed, "changed": c.system_cfg.changed, "same_content": c.system_cfg.same_content } }),
@@ -904,6 +964,10 @@ impl Engine {
         };
         let mut state = current.as_deref().cloned().ok_or("no settings imported yet")?;
         let what = edit(&mut state)?;
+        // Saved as they were (e.g. a form sent unchanged): nothing to store, record or tell the APs.
+        if current.as_deref() == Some(&state) {
+            return Ok(what);
+        }
         self.store_state(state, imported_at);
         self.syslog_unknown.clear();
         self.emit(Event::site(ts, EventKind::SettingsChanged, json!({ "what": what })));
@@ -915,6 +979,7 @@ impl Engine {
     fn forget(&mut self, ts: Ts, mac: Mac) {
         let mut live = self.live.write().unwrap();
         live.forget_ap(&mac);
+        let forget_managed = live.forget_managed.clone();
         // Its clients are gone with it, rather than left connected until they go stale.
         let mut events = Vec::new();
         let clients = &mut live.clients;
@@ -924,6 +989,9 @@ impl Engine {
             false
         });
         drop(live);
+        if let Some(f) = forget_managed {
+            f(&mac);
+        }
         let had_clients = !events.is_empty();
         for e in events {
             self.emit(e);
@@ -948,11 +1016,14 @@ impl Engine {
         }
     }
 
-    /// Each rename is its own event (a client's history shows it); the client
-    /// list is announced once for the lot.
+    /// Each rename is its own event (a client's history shows it). The
+    /// renames and the client list are announced once for the lot: a bulk
+    /// import of thousands of names would otherwise overrun the live
+    /// subscribers' queue, and send every browser to refetch everything.
     fn set_aliases(&self, ts: Ts, entries: Vec<AliasEdit>, only_if_unset: bool) {
         let clean = |v: Option<String>| v.map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
         let mut changed = false;
+        let mut renames = Vec::new();
         let mut live = self.live.write().unwrap();
         for AliasEdit { mac, alias, note } in entries {
             let (alias, mut note) = (clean(alias), clean(note));
@@ -977,21 +1048,31 @@ impl Engine {
                 self.writer.exec(
                     Db::Config,
                     "INSERT OR REPLACE INTO client_aliases (mac, alias, note, updated) VALUES (?1, ?2, ?3, ?4)",
-                    vec![Sql::Text(mac.to_string()), opt_text(alias.clone()), opt_text(note), Sql::Integer(ts)],
+                    vec![Sql::Text(mac.to_string()), alias.clone().into(), note.into(), Sql::Integer(ts)],
                 );
             }
             if old.alias != alias {
                 let ap = live.clients.get(&mac).map(|c| c.sample.ap_mac);
-                self.emit(Event { ts, kind: EventKind::ClientRenamed, device_mac: ap, client_mac: Some(mac), data: json!({ "from": old.alias, "to": alias }) });
+                renames.push(self.record(Event { ts, kind: EventKind::ClientRenamed, device_mac: ap, client_mac: Some(mac), data: json!({ "from": old.alias, "to": alias }) }));
             }
         }
         drop(live);
+        // One rename names its client; more are announced as renames of anyone.
+        let head = match renames[..] {
+            [] => None,
+            [one] => Some(one),
+            _ => Some(EventHead { kind: EventKind::ClientRenamed, device_mac: None, client_mac: None }),
+        };
+        if let Some(head) = head {
+            let _ = self.tx.send(LiveMsg::Event(head));
+        }
         if changed {
             let _ = self.tx.send(LiveMsg::Clients);
         }
     }
 
-    fn notification(&self, ts: Ts, p: &Value) {
+    /// Taken by value: an event's data is moved out of the notification, not copied.
+    fn notification(&self, ts: Ts, mut p: Value) {
         let Some(mac) = p["mac"].as_str().and_then(|m| m.parse::<Mac>().ok()) else { return };
         bump(&self.counters.notifications);
         // The live view is written for this alone, and only read (or, for an
@@ -1004,6 +1085,7 @@ impl Engine {
             }
             d.last_config_push.map(|t| ts - t)
         });
+        let n = p["notif_payload"].take();
         match p["notif_reason"].as_str() {
             // The AP confirms it applied a pushed config.
             Some("setparam") => {
@@ -1011,7 +1093,6 @@ impl Engine {
                 self.emit(Event::device(ts, EventKind::ConfigApplied, mac, data));
             }
             Some("event") => {
-                let n = &p["notif_payload"];
                 if n["message_type"].as_str() == Some("STA_ASSOC_TRACKER") {
                     self.connection_event(ts, mac, n);
                 } else if let Some(kind) = n["event_string"].as_str() {
@@ -1023,12 +1104,12 @@ impl Engine {
                         // "{proc} exited with code {exit_status} and restarted by {caller}"
                         "EVT_AP_RestartProc" => EventKind::ApProcessRestarted,
                         "Upgrade" => {
-                            self.upgrade_notice(&mut self.live.write().unwrap(), ts, mac, n);
+                            self.upgrade_notice(&mut self.live.write().unwrap(), ts, mac, &n);
                             return;
                         }
                         _ => EventKind::ApEvent,
                     };
-                    self.emit(Event::device(ts, k, mac, n.clone()));
+                    self.emit(Event::device(ts, k, mac, n));
                 }
             }
             // The AP starts an upgrade (ours, or one run on the AP itself).
@@ -1038,7 +1119,7 @@ impl Engine {
             // A crash or recovery report: base64 text from the AP's crash store.
             Some(reason @ ("crashlog" | "recovery")) => {
                 use base64::Engine as _;
-                let raw = p["notif_payload"].as_str().unwrap_or_default();
+                let raw = n.as_str().unwrap_or_default();
                 let text = base64::engine::general_purpose::STANDARD
                     .decode(raw.trim())
                     .map(|b| String::from_utf8_lossy(&b).into_owned())
@@ -1054,11 +1135,10 @@ impl Engine {
 
     /// A client connection-tracking event (`STA_ASSOC_TRACKER`): association,
     /// success (with association, WPA, IP and DNS timings), soft failure,
-    /// roam, leave. Durations arrive in microseconds and are stored in ms.
-    fn connection_event(&self, ts: Ts, ap: Mac, n: &Value) {
+    /// roam, leave. The timings are read from `detail`, the whole notification.
+    fn connection_event(&self, ts: Ts, ap: Mac, mut n: Value) {
         let Some(client) = n["mac"].as_str().and_then(|m| m.parse::<Mac>().ok()) else { return };
         let num = |k: &str| n[k].as_str().and_then(|v| v.parse::<f64>().ok()).or_else(|| n[k].as_f64());
-        let ms = |k: &str| num(k).map(|us| (us / 1000.0).round() as i64);
         let text = |k: &str| n[k].as_str().map(str::to_string);
         let vap = text("vap");
         // The live view is read for the VAP alone; the row is built without the lock.
@@ -1067,47 +1147,45 @@ impl Engine {
             let vap = live.devices.get(&ap).and_then(|d| d.snapshot.vaps.iter().find(|v| v.name.as_deref() == vap.as_deref()));
             vap.map(|v| (v.essid.clone(), v.radio.clone(), v.channel, v.bw))
         };
-        // Channel and width at the time, for the connection log and roaming views.
-        let mut detail = n.clone();
-        let (essid, radio) = match vap_info {
-            Some((essid, radio, channel, bw)) => {
-                detail["x_channel"] = json!(channel);
-                detail["x_bw"] = json!(bw);
-                (essid, radio)
-            }
-            None => (None, None),
+        let (essid, radio, at) = match vap_info {
+            Some((essid, radio, channel, bw)) => (essid, radio, Some((channel, bw))),
+            None => (None, None, None),
         };
         let event_type = text("event_type").unwrap_or_default();
-        self.writer.exec(
-            Db::Config,
-            "INSERT INTO connections (ts, ap_mac, client_mac, vap, essid, radio, event_type, auth_algo, assoc_ms, auth_ms, ip_ms, \
-             ip_assign_type, dns_responses, dns_timeouts, rssi, reason, detail) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
-            vec![
-                Sql::Integer(ts),
-                Sql::Text(ap.to_string()),
-                Sql::Text(client.to_string()),
-                opt_text(vap),
-                opt_text(essid.clone()),
-                opt_text(radio),
-                Sql::Text(event_type.clone()),
-                opt_text(text("auth_algo")),
-                i(ms("assoc_delta")),
-                i(ms("wpa_auth_delta")),
-                i(ms("ip_delta")),
-                opt_text(text("ip_assign_type")),
-                i(num("dns_responses").map(|v| v as i64)),
-                i(num("dns_timeouts").map(|v| v as i64)),
-                i(num("avg_rssi").or_else(|| num("auth_rssi")).map(|v| v as i64)),
-                opt_text(text("sta_dc_reason")),
-                // The whole notification: failure counters and stage flags for connectivity stats.
-                Sql::Text(detail.to_string()),
-            ],
-        );
+        // The table's `auth_algo`, `assoc_ms`, `auth_ms`, `ip_ms` and `reason` columns
+        // are no longer written: `detail` holds them, as the AP sent them.
+        let mut row = vec![
+            Sql::Integer(ts),
+            Sql::Text(ap.to_string()),
+            Sql::Text(client.to_string()),
+            vap.into(),
+            essid.clone().into(),
+            radio.into(),
+            Sql::Text(event_type.clone()),
+            text("ip_assign_type").into(),
+            num("dns_responses").map(|v| v as i64).into(),
+            num("dns_timeouts").map(|v| v as i64).into(),
+            num("avg_rssi").or_else(|| num("auth_rssi")).map(|v| v as i64).into(),
+        ];
         // Failed attempts are worth an event; the rest stay in the connection log.
         // A roam is reported as a "soft failure" but is a normal, successful move.
         let roamed = n["ip_assign_type"].as_str().is_some_and(|t| t.starts_with("roam"));
-        if event_type == "failure" || (event_type == "soft failure" && !roamed) {
-            let data = json!({ "essid": essid, "reason": n["sta_dc_reason"], "auth_algo": n["auth_algo"], "rssi": num("auth_rssi") });
+        let failed = (event_type == "failure" || (event_type == "soft failure" && !roamed))
+            .then(|| json!({ "essid": essid, "reason": n["sta_dc_reason"], "auth_algo": n["auth_algo"], "rssi": num("auth_rssi") }));
+        // The whole notification, with the channel and width at the time: timings, failure
+        // counters and stage flags for connectivity stats, and the roaming views.
+        if let Some((channel, bw)) = at {
+            n["x_channel"] = json!(channel);
+            n["x_bw"] = json!(bw);
+        }
+        row.push(Sql::Text(n.to_string()));
+        self.writer.exec(
+            Db::Config,
+            "INSERT INTO connections (ts, ap_mac, client_mac, vap, essid, radio, event_type, ip_assign_type, dns_responses, dns_timeouts, rssi, detail) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+            row,
+        );
+        if let Some(data) = failed {
             self.emit(Event::client_on(ts, EventKind::ClientConnectFailed, ap, client, data));
         }
     }
@@ -1253,11 +1331,11 @@ impl Engine {
             "INSERT INTO logs (ts, device_mac, src_ip, facility, severity, program, msg) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             vec![
                 Sql::Integer(line.ts),
-                opt_text(line.device_mac.map(|m| m.to_string())),
+                line.device_mac.map(|m| m.to_string()).into(),
                 Sql::Text(line.src_ip),
-                i(line.facility),
-                i(line.severity),
-                opt_text(line.program),
+                line.facility.into(),
+                line.severity.into(),
+                line.program.into(),
                 Sql::Text(line.msg),
             ],
         );
@@ -1363,15 +1441,15 @@ impl Engine {
                last_seen = excluded.last_seen, uptime = excluded.uptime",
             vec![
                 Sql::Text(a.mac.to_string()),
-                opt_text(a.hostname.clone()),
-                opt_text(a.model.clone()),
-                opt_text(a.model_display.clone()),
-                opt_text(a.version.clone()),
-                opt_text(a.ip.clone()),
-                opt_text(a.serial.clone()),
-                opt_text(a.hash_id.clone()),
+                a.hostname.clone().into(),
+                a.model.clone().into(),
+                a.model_display.clone().into(),
+                a.version.clone().into(),
+                a.ip.clone().into(),
+                a.serial.clone().into(),
+                a.hash_id.clone().into(),
                 Sql::Integer(a.ts),
-                i(a.uptime),
+                a.uptime.into(),
             ],
         );
     }
@@ -1383,13 +1461,13 @@ impl Engine {
         self.writer.send(Write::Metric {
             table: &store::AP,
             ts,
-            values: vec![mac(), f(a.cpu), f(a.mem), f(a.load1), f(a.load5), f(a.load15), i(a.mem_used), i(a.mem_total), i(a.uptime), i(a.satisfaction), i(a.num_sta)],
+            values: vec![mac(), a.cpu.into(), a.mem.into(), a.load1.into(), a.load5.into(), a.load15.into(), a.mem_used.into(), a.mem_total.into(), a.uptime.into(), a.satisfaction.into(), a.num_sta.into()],
         });
         if let Some(u) = &s.uplink {
             self.writer.send(Write::Metric {
                 table: &store::UPLINK,
                 ts,
-                values: vec![mac(), i(u.speed), i(u.rx_bytes), i(u.tx_bytes), i(u.rx_packets), i(u.tx_packets), i(u.rx_errors), i(u.tx_errors), i(u.rx_dropped), i(u.tx_dropped)],
+                values: vec![mac(), u.speed.into(), u.rx_bytes.into(), u.tx_bytes.into(), u.rx_packets.into(), u.tx_packets.into(), u.rx_errors.into(), u.tx_errors.into(), u.rx_dropped.into(), u.tx_dropped.into()],
             });
         }
         if !s.has_vap_table {
@@ -1400,8 +1478,8 @@ impl Engine {
                 table: &store::RADIO,
                 ts,
                 values: vec![
-                    mac(), Sql::Text(r.radio.clone()), i(r.channel), i(r.bw), i(r.tx_power), i(r.cu_total), i(r.cu_self_rx),
-                    i(r.cu_self_tx), i(r.cu_interf), i(r.noise_floor), Sql::Integer(r.num_sta), i(r.tx_packets), i(r.tx_retries),
+                    mac(), Sql::Text(r.radio.clone()), r.channel.into(), r.bw.into(), r.tx_power.into(), r.cu_total.into(), r.cu_self_rx.into(),
+                    r.cu_self_tx.into(), r.cu_interf.into(), r.noise_floor.into(), Sql::Integer(r.num_sta), r.tx_packets.into(), r.tx_retries.into(),
                 ],
             });
         }
@@ -1410,10 +1488,10 @@ impl Engine {
                 table: &store::VAP,
                 ts,
                 values: vec![
-                    Sql::Text(v.bssid.clone()), mac(), opt_text(v.essid.clone()), opt_text(v.radio.clone()),
-                    i(v.num_sta), i(v.ccq), i(v.satisfaction), i(v.avg_client_signal), i(v.latency_avg),
-                    i(v.rx_bytes), i(v.tx_bytes), i(v.rx_packets), i(v.tx_packets), i(v.tx_retries), i(v.tx_dropped),
-                    i(v.tx_mcast), i(v.rx_mcast), i(v.wifi_tx_attempts), i(v.wifi_tx_dropped), i(v.tx_bcast), i(v.rx_bcast),
+                    Sql::Text(v.bssid.clone()), mac(), v.essid.clone().into(), v.radio.clone().into(),
+                    v.num_sta.into(), v.ccq.into(), v.satisfaction.into(), v.avg_client_signal.into(), v.latency_avg.into(),
+                    v.rx_bytes.into(), v.tx_bytes.into(), v.rx_packets.into(), v.tx_packets.into(), v.tx_retries.into(), v.tx_dropped.into(),
+                    v.tx_mcast.into(), v.rx_mcast.into(), v.wifi_tx_attempts.into(), v.wifi_tx_dropped.into(), v.tx_bcast.into(), v.rx_bcast.into(),
                 ],
             });
         }
@@ -1422,14 +1500,7 @@ impl Engine {
         // row once an hour. What the AP no longer reports is forgotten here.
         let rows = self.written.neighbors.entry(s.ap.mac).or_default();
         for n in &s.neighbors {
-            let write = match rows.get_mut(n.bssid.as_str()) {
-                Some(row) => row.report(n, ts, REFRESH_SECS),
-                None => {
-                    rows.insert(n.bssid.clone(), Row::new(n, ts));
-                    true
-                }
-            };
-            if !write {
+            if !report(rows, n.bssid.as_str(), n, ts, REFRESH_SECS) {
                 continue;
             }
             self.writer.exec(
@@ -1441,33 +1512,27 @@ impl Engine {
                    best_signal = MAX(COALESCE(best_signal, -200), COALESCE(excluded.signal, -200)), noise = excluded.noise,
                    is_unifi = excluded.is_unifi, ap_name = excluded.ap_name, model = excluded.model, last_seen = excluded.last_seen",
                 vec![
-                    Sql::Text(n.bssid.clone()), mac(), opt_text(n.radio.clone()), opt_text(n.essid.clone()), i(n.channel), i(n.bw),
-                    i(n.center_freq), opt_text(n.security.clone()), i(n.signal), i(n.noise), Sql::Integer(n.is_unifi as i64),
-                    opt_text(n.ap_name.clone()), opt_text(n.model.clone()), Sql::Integer(ts),
+                    Sql::Text(n.bssid.clone()), mac(), n.radio.clone().into(), n.essid.clone().into(), n.channel.into(), n.bw.into(),
+                    n.center_freq.into(), n.security.clone().into(), n.signal.into(), n.noise.into(), Sql::Integer(n.is_unifi as i64),
+                    n.ap_name.clone().into(), n.model.clone().into(), Sql::Integer(ts),
                 ],
             );
         }
         rows.retain(|_, r| r.seen == ts);
         let radios = self.written.spectrum.entry(s.ap.mac).or_default();
         for c in &s.spectrum {
+            // Looked up by reference: the radio's name is copied only for a new one.
             if !radios.contains_key(c.radio.as_str()) {
                 radios.insert(c.radio.clone(), Rows::new());
             }
             let rows = radios.get_mut(c.radio.as_str()).expect("inserted above");
-            let write = match rows.get_mut(&c.channel) {
-                Some(row) => row.report(c, ts, SPECTRUM_REFRESH_SECS),
-                None => {
-                    rows.insert(c.channel, Row::new(c, ts));
-                    true
-                }
-            };
-            if !write {
+            if !report(rows, &c.channel, c, ts, SPECTRUM_REFRESH_SECS) {
                 continue;
             }
             self.writer.exec(
                 Db::Config,
                 "INSERT OR REPLACE INTO spectrum (ap_mac, radio, channel, width, utilization, interference, other_bss_count, ts) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-                vec![mac(), Sql::Text(c.radio.clone()), Sql::Integer(c.channel), i(c.width), i(c.utilization), i(c.interference), i(c.other_bss_count), Sql::Integer(ts)],
+                vec![mac(), Sql::Text(c.radio.clone()), Sql::Integer(c.channel), c.width.into(), c.utilization.into(), c.interference.into(), c.other_bss_count.into(), Sql::Integer(ts)],
             );
         }
         radios.retain(|_, rows| {
@@ -1488,17 +1553,17 @@ impl Engine {
                 table: &store::CLIENT,
                 ts,
                 values: vec![
-                    Sql::Text(c.mac.to_string()), mac(), Sql::Text(c.bssid.clone()), opt_text(c.essid.clone()), opt_text(c.radio.clone()), i(c.channel),
-                    i(c.rssi), i(c.signal), i(c.noise), i(c.tx_rate), i(c.rx_rate), i(c.satisfaction), i(c.latency_avg),
-                    i(c.tx_bytes), i(c.rx_bytes), i(c.tx_packets), i(c.rx_packets), i(c.tx_retries),
-                    i(t.map(|t| t.tx_pkts)), i(t.map(|t| t.rx_pkts)), i(t.map(|t| t.tx_bytes)), i(t.map(|t| t.rx_bytes)),
+                    Sql::Text(c.mac.to_string()), mac(), Sql::Text(c.bssid.clone()), c.essid.clone().into(), c.radio.clone().into(), c.channel.into(),
+                    c.rssi.into(), c.signal.into(), c.noise.into(), c.tx_rate.into(), c.rx_rate.into(), c.satisfaction.into(), c.latency_avg.into(),
+                    c.tx_bytes.into(), c.rx_bytes.into(), c.tx_packets.into(), c.rx_packets.into(), c.tx_retries.into(),
+                    t.map(|t| t.tx_pkts).into(), t.map(|t| t.rx_pkts).into(), t.map(|t| t.tx_bytes).into(), t.map(|t| t.rx_bytes).into(),
                 ],
             });
             let Some(m) = m else { continue };
             if bss_done.insert(c.bssid.as_str()) {
                 if let Some((pts, prev)) = self.bss_prev.get(&c.bssid)
                     && ts > *pts
-                    && ts - pts <= 120
+                    && ts - pts <= MCAST_GAP
                 {
                     let dt = (ts - pts) as f64;
                     let prev = mcast_types(prev);
@@ -1519,7 +1584,7 @@ impl Engine {
             if let Some((pts, prev)) = self.mcast_prev.get(&c.mac)
                 && prev.bssid == c.bssid
                 && ts > *pts
-                && ts - pts <= 120
+                && ts - pts <= MCAST_GAP
             {
                 let dt = (ts - pts) as f64;
                 let prev = mcast_types(prev);
@@ -1615,31 +1680,36 @@ fn lifecycle_events(ts: Ts, a: &crate::model::ApSample, prev: Option<&DeviceView
     events
 }
 
-/// The AP's live view after an inform at `ts`.
-fn device_view(ts: Ts, peer: String, snap: Snapshot, prev: Option<DeviceView>, known: Option<&KnownDevice>) -> DeviceView {
+/// The AP's live view after an inform at `ts`, and the snapshot it replaces
+/// (if whole), for the caller to drop once the lock is released.
+fn device_view(ts: Ts, peer: String, snap: Snapshot, prev: Option<DeviceView>, known: Option<&KnownDevice>) -> (DeviceView, Option<Snapshot>) {
     let first_seen = prev.as_ref().map(|p| p.first_seen).or(known.map(|k| k.first_seen)).unwrap_or(ts);
     match prev {
-        Some(p) => DeviceView {
+        Some(mut p) => {
             // Without a VAP table the inform says nothing of radios, VAPs or clients: keep the last full picture.
-            last_full_inform: if snap.has_vap_table { ts } else { p.last_full_inform },
-            snapshot: if snap.has_vap_table { snap } else { Snapshot { uplink: snap.uplink.or(p.snapshot.uplink), ap: snap.ap, ..p.snapshot } },
-            online: true,
-            first_seen,
-            last_seen: ts,
-            peer,
-            interval: p.interval,
-            last_config_push: p.last_config_push,
-        },
-        None => DeviceView {
-            last_full_inform: if snap.has_vap_table { ts } else { 0 },
-            snapshot: snap,
-            online: true,
-            first_seen,
-            last_seen: ts,
-            peer,
-            interval: DEFAULT_INTERVAL,
-            last_config_push: None,
-        },
+            let old = if snap.has_vap_table {
+                p.last_full_inform = ts;
+                Some(std::mem::replace(&mut p.snapshot, snap))
+            } else {
+                p.snapshot.uplink = snap.uplink.or(p.snapshot.uplink.take());
+                p.snapshot.ap = snap.ap;
+                None
+            };
+            (DeviceView { online: true, first_seen, last_seen: ts, peer, ..p }, old)
+        }
+        None => {
+            let view = DeviceView {
+                last_full_inform: if snap.has_vap_table { ts } else { 0 },
+                snapshot: snap,
+                online: true,
+                first_seen,
+                last_seen: ts,
+                peer,
+                interval: DEFAULT_INTERVAL,
+                last_config_push: None,
+            };
+            (view, None)
+        }
     }
 }
 
@@ -1660,18 +1730,6 @@ fn disconnect(writer: &Writer, ts: Ts, mac: Mac, c: &mut ClientView, reason: &st
         "reason": reason, "last_seen": c.last_seen, "essid": c.sample.essid,
         "connected_for": c.sample.uptime, "last_signal": c.sample.signal,
     }))
-}
-
-fn f(v: Option<f64>) -> Sql {
-    v.map_or(Sql::Null, Sql::Real)
-}
-
-fn i(v: Option<i64>) -> Sql {
-    v.map_or(Sql::Null, Sql::Integer)
-}
-
-fn opt_text(v: Option<String>) -> Sql {
-    v.map_or(Sql::Null, Sql::Text)
 }
 
 #[cfg(test)]
@@ -2029,16 +2087,21 @@ mod tests {
     }
 
     #[test]
-    fn a_bulk_import_announces_the_client_list_once() {
+    fn a_bulk_import_announces_the_renames_and_the_client_list_once() {
         let mut h = harness();
         let edit = |mac: &str, alias: &str| AliasEdit { mac: mac.parse().unwrap(), alias: Some(alias.into()), note: None };
         let entries = vec![edit(C1, "Speaker"), edit("02:00:00:00:01:02", "Printer"), edit("02:00:00:00:01:03", "")];
         h.engine.handle(Input::SetAliases { ts: 1, entries, only_if_unset: true });
         let msgs: Vec<LiveMsg> = std::iter::from_fn(|| h.rx.try_recv().ok()).collect();
-        let renames = msgs.iter().filter(|m| matches!(m, LiveMsg::Event(e) if e.kind == EventKind::ClientRenamed)).count();
+        let renames: Vec<_> = msgs.iter().filter_map(|m| match m { LiveMsg::Event(e) if e.kind == EventKind::ClientRenamed => Some(e.client_mac), _ => None }).collect();
         let lists = msgs.iter().filter(|m| matches!(m, LiveMsg::Clients)).count();
-        assert_eq!((renames, lists), (2, 1), "{msgs:?}");
+        assert_eq!((renames, lists), (vec![None], 1), "{msgs:?}");
         assert_eq!(h.live.read().unwrap().aliases.len(), 2);
+        assert_eq!(stored(&h, EventKind::ClientRenamed).len(), 2, "each rename is still its own event");
+        // A single rename names its client.
+        h.engine.handle(Input::SetAliases { ts: 2, entries: vec![edit(C1, "Kitchen speaker")], only_if_unset: false });
+        let renames: Vec<_> = std::iter::from_fn(|| h.rx.try_recv().ok()).filter_map(|m| match m { LiveMsg::Event(e) => Some(e.client_mac), _ => None }).collect();
+        assert_eq!(renames, [C1.parse().ok()]);
     }
 
     #[test]
@@ -2074,6 +2137,8 @@ mod tests {
         assert_eq!(h.live.read().unwrap().state.as_ref().unwrap()["clients"][0]["blocked"], true);
         assert_eq!(h.live.read().unwrap().state_imported_at, Some(1), "an edit is not an import");
         assert_eq!(edit(&mut h, Box::new(|_| Err("no".into()))), Err("no".into()));
+        // An edit that leaves the settings as they were still reports what it did, but is not recorded.
+        assert_eq!(edit(&mut h, Box::new(|_| Ok("nothing changed".into()))).as_deref(), Ok("nothing changed"));
         let kinds: Vec<_> = events(&mut h).into_iter().map(|e| e.0).collect();
         assert_eq!(kinds, ["settings_imported", "settings_changed"]);
     }
@@ -2164,6 +2229,10 @@ mod tests {
             live.last_config.insert(mac, Default::default());
             live.adoption.forgetting.insert(mac, 1);
         }
+        // What active mode keeps of it goes too.
+        let managed = Arc::new(std::sync::Mutex::new(vec![mac]));
+        let m = managed.clone();
+        h.live.write().unwrap().forget_managed = Some(Arc::new(move |gone: &Mac| m.lock().unwrap().retain(|x| x != gone)));
         events(&mut h);
         h.engine.handle(Input::Forget { ts: 5, mac });
         assert_eq!(events(&mut h), vec![("client_disconnected", Some(C1.into()))]);
@@ -2171,6 +2240,40 @@ mod tests {
         assert!(!live.clients[&C1.parse().unwrap()].connected);
         assert!(live.commands.is_empty() && live.locating.is_empty() && live.reprovision.is_empty() && live.devices.is_empty());
         assert!(live.raw_informs.is_empty() && live.last_config.is_empty() && live.adoption.forgetting.is_empty() && live.by_ip.is_empty());
+        assert!(managed.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn only_a_report_with_clients_announces_the_client_list() {
+        let mut h = harness();
+        let lists = |h: &mut Harness| std::iter::from_fn(|| h.rx.try_recv().ok()).filter(|m| matches!(m, LiveMsg::Clients)).count();
+        h.engine.handle(Input::Inform { ts: 0, peer: "x".into(), decoded: decoded(inform(AP1, 1000, &[])) });
+        assert_eq!(lists(&mut h), 0, "no clients: nothing for the client lists");
+        h.engine.handle(Input::Inform { ts: 10, peer: "x".into(), decoded: decoded(inform(AP1, 1010, &[(C1, "b1")])) });
+        assert_eq!(lists(&mut h), 1);
+    }
+
+    #[test]
+    fn an_upgrade_apctl_sent_is_one_event() {
+        let mut h = harness();
+        let mac: Mac = AP1.parse().unwrap();
+        let feed = |h: &mut Harness, ts: Ts, version: &str| {
+            let mut p = inform(AP1, 1000 + ts, &[]);
+            p["version"] = json!(version);
+            h.engine.handle(Input::Inform { ts, peer: "x".into(), decoded: decoded(p) });
+        };
+        feed(&mut h, 0, "6.7.0");
+        let job = crate::firmware::Job {
+            mac, name: None, from: Some("6.7.0".into()), target: "6.8.2".into(), url: String::new(), md5: None, sha256: None, custom: false,
+            state: crate::firmware::JobState::Sent, sent_at: Some(5), expires: None,
+        };
+        h.live.write().unwrap().firmware.current = Some(job);
+        feed(&mut h, 10, "6.8.2");
+        // A change apctl did not send is still reported as such.
+        feed(&mut h, 20, "6.8.3");
+        let kinds: Vec<_> = events(&mut h).into_iter().map(|e| e.0).collect();
+        assert_eq!(kinds, ["ap_seen", "ap_upgraded", "ap_firmware_changed"]);
+        assert_eq!(stored(&h, EventKind::ApUpgraded)[0]["from"], "6.7.0");
     }
 
     fn notif(ap: &str, reason: &str, payload: Value) -> Decoded {
@@ -2248,5 +2351,14 @@ mod tests {
         let diff = pushes[1]["system_cfg"]["diff"].as_str().unwrap();
         assert!(diff.contains("~ aaa.1.hide_ssid: false -> true"), "{diff}");
         assert!(diff.contains("aaa.1.wpa.psk: <redacted> -> <redacted>") && !diff.contains("new"), "{diff}");
+
+        // A push without a cfgversion keeps the last one, in memory as in the database.
+        let push = json!({ "_type": "setparam", "mgmt_cfg": "cfgversion=v1\na=1", "system_cfg": "x=1" });
+        h.engine.handle(Input::Reply { ts: 230, mac, decoded: decoded(push) });
+        h.engine.handle(Input::Reply { ts: 240, mac, decoded: decoded(json!({ "_type": "setparam", "system_cfg": "x=2" })) });
+        assert_eq!(h.live.read().unwrap().last_config[&mac].cfgversion.as_deref(), Some("v1"));
+        assert!(h.writer.flush(std::time::Duration::from_secs(5)));
+        let stored: String = h.store.read(Db::Config, |c| Ok(c.query_row("SELECT cfgversion FROM device_config", [], |r| r.get(0))?)).unwrap();
+        assert_eq!(stored, "v1");
     }
 }

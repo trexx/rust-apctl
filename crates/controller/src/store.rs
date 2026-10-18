@@ -448,8 +448,9 @@ fn writer_loop(dir: &Path, rx: Receiver<Msg>) -> Result<()> {
     let mut pending: Vec<Write> = Vec::new();
     let mut acks: Vec<Sender<()>> = Vec::new();
     let mut last_flush = Instant::now();
-    // The first maintenance a minute after start.
+    // The first maintenance a minute after start, with the hourly retention (see `maintenance`).
     let mut last_maintenance = Instant::now().checked_sub(Duration::from_secs(240)).unwrap_or_else(Instant::now);
+    let mut last_hourly: Option<Instant> = None;
     loop {
         match rx.recv_timeout(Duration::from_millis(250)) {
             Ok(Msg::Flush(ack)) => acks.push(ack),
@@ -469,8 +470,12 @@ fn writer_loop(dir: &Path, rx: Receiver<Msg>) -> Result<()> {
         }
         if last_maintenance.elapsed() >= Duration::from_secs(300) {
             flush(&mut conns, &mut pending);
-            maintenance(&mut conns, crate::clock::now_ts());
+            let hourly = last_hourly.is_none_or(|t| t.elapsed() >= Duration::from_secs(3600));
+            maintenance(&mut conns, crate::clock::now_ts(), hourly);
             last_maintenance = Instant::now();
+            if hourly {
+                last_hourly = Some(last_maintenance);
+            }
         }
     }
 }
@@ -550,22 +555,31 @@ pub struct PushedConfig {
 
 /// One AP's last stored push, with its secrets masked.
 pub fn stored_push(c: &Connection, mac: &inform::Mac) -> rusqlite::Result<Option<PushedConfig>> {
+    Ok(stored_push_at(c, mac)?.map(|(p, _)| p))
+}
+
+/// One AP's last stored push, with its secrets masked, and when it was stored.
+pub fn stored_push_at(c: &Connection, mac: &inform::Mac) -> rusqlite::Result<Option<(PushedConfig, Option<Ts>)>> {
     use rusqlite::OptionalExtension;
-    c.prepare_cached("SELECT mgmt_cfg, system_cfg, cfgversion FROM device_config WHERE mac = ?1")?
+    c.prepare_cached("SELECT mgmt_cfg, system_cfg, cfgversion, ts FROM device_config WHERE mac = ?1")?
         .query_row([mac.to_string()], |r| {
-            Ok(PushedConfig { mgmt_cfg: r.get::<_, Option<String>>(0)?.unwrap_or_default(), system_cfg: r.get::<_, Option<String>>(1)?.unwrap_or_default(), cfgversion: r.get(2)? })
+            let push = PushedConfig { mgmt_cfg: r.get::<_, Option<String>>(0)?.unwrap_or_default(), system_cfg: r.get::<_, Option<String>>(1)?.unwrap_or_default(), cfgversion: r.get(2)? };
+            Ok((push, r.get(3)?))
         })
         .optional()
 }
 
 /// Rolls complete buckets up into the coarser tiers, then applies retention.
 /// Each step runs on its own: one that fails is logged and the rest still run.
+/// The retention of a year of events and clients, of alerts and of sessions
+/// only runs when `hourly`: an hour's delay is nothing to them, and the
+/// clients' (by `last_seen`, which has no index) reads the whole table.
 ///
 /// Both go by the wall clock. A capture replayed from the past writes raw rows
 /// that are older than the roll-up's progress mark (or than the raw tier's
 /// retention), so they are never rolled up; the raw tier still shows them
 /// while they are kept.
-fn maintenance(conns: &mut Conns, now: Ts) {
+fn maintenance(conns: &mut Conns, now: Ts, hourly: bool) {
     let step = |what: &str, result: Result<()>| {
         if let Err(e) = result {
             tracing::warn!("{what} failed: {e:#}");
@@ -584,11 +598,14 @@ fn maintenance(conns: &mut Conns, now: Ts) {
         }
     }
     step("retention of logs", delete_before(logs, "logs", Rows::Rowid, now - LOG_RETENTION));
-    step("retention of events", delete_before(config, "events", Rows::Rowid, now - EVENT_RETENTION));
-    step("expiring sessions", config.execute("DELETE FROM sessions WHERE expires < ?1", [now]).map(drop).map_err(Into::into));
     step("retention of dry runs", delete_before(config, "dryrun_results", Rows::Rowid, now - DRYRUN_RETENTION));
     step("retention of connections", delete_before(config, "connections", Rows::Rowid, now - CONNECTION_RETENTION));
     step("retention of neighbours", config.execute("DELETE FROM neighbors WHERE last_seen < ?1", [now - NEIGHBOR_RETENTION]).map(drop).map_err(Into::into));
+    if !hourly {
+        return;
+    }
+    step("retention of events", delete_before(config, "events", Rows::Rowid, now - EVENT_RETENTION));
+    step("expiring sessions", config.execute("DELETE FROM sessions WHERE expires < ?1", [now]).map(drop).map_err(Into::into));
     step("retention of clients", config.execute(FORGET_OLD_CLIENTS, [now - CLIENT_RETENTION]).map(drop).map_err(Into::into));
     step(
         "retention of alerts",
@@ -794,10 +811,10 @@ mod tests {
         assert_eq!(apply(&mut conns[Db::Metrics as usize], writes).unwrap(), 0);
 
         // The last bucket has just ended: rows for it may still be on their way.
-        maintenance(&mut conns, now);
+        maintenance(&mut conns, now, false);
         let m = &conns[Db::Metrics as usize];
         assert_eq!(series(m, &UPLINK, &["bb".into()], now - 3600, now, 1).unwrap().ts.len(), 3);
-        maintenance(&mut conns, now + ROLLUP_GRACE_SECS);
+        maintenance(&mut conns, now + ROLLUP_GRACE_SECS, false);
         let m = &conns[Db::Metrics as usize];
         let five = series(m, &UPLINK, &["bb".into()], now - 3600, now, 1).unwrap();
         assert_eq!(five.step, 300);
@@ -806,7 +823,7 @@ mod tests {
         // Rates from the counters' last value in consecutive buckets.
         assert_eq!(five.fields["rx_bytes"], vec![None, Some(1000.0), Some(1000.0), Some(1000.0)]);
         // Running maintenance again is idempotent and does not redo finished buckets.
-        maintenance(&mut conns, now + ROLLUP_GRACE_SECS);
+        maintenance(&mut conns, now + ROLLUP_GRACE_SECS, false);
         let m = &conns[Db::Metrics as usize];
         assert_eq!(series(m, &UPLINK, &["bb".into()], now - 3600, now, 1).unwrap().ts.len(), 4);
     }
@@ -828,7 +845,7 @@ mod tests {
             })
             .collect();
         assert_eq!(apply(&mut conns[Db::Metrics as usize], writes).unwrap(), 0);
-        maintenance(&mut conns, now + ROLLUP_GRACE_SECS);
+        maintenance(&mut conns, now + ROLLUP_GRACE_SECS, false);
         let five = series(&conns[Db::Metrics as usize], &RADIO, &["aa".into(), "na".into()], now - 600, now, 1).unwrap();
         assert_eq!(five.ts, vec![now - 600]);
         assert_eq!((five.fields["channel"][0], five.fields["bw"][0], five.fields["cu_total"][0]), (Some(149.0), Some(80.0), Some(30.0)));
@@ -875,7 +892,10 @@ mod tests {
             .unwrap();
         // A roll-up that fails (here: a missing table) must not stop the retention.
         conns[Db::Metrics as usize].execute_batch("DROP TABLE ap_stats_5m").unwrap();
-        maintenance(&mut conns, now);
+        maintenance(&mut conns, now, false);
+        let n: i64 = conns[Db::Config as usize].query_row("SELECT COUNT(*) FROM clients", [], |r| r.get(0)).unwrap();
+        assert_eq!(n, 3, "a year's retention only runs hourly");
+        maintenance(&mut conns, now, true);
         let ids = |sql: &str| -> Vec<String> {
             conns[Db::Config as usize].prepare(sql).unwrap().query_map([], |r| r.get(0)).unwrap().collect::<rusqlite::Result<_>>().unwrap()
         };

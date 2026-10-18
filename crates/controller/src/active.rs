@@ -101,7 +101,8 @@ pub struct Active {
     engine: mpsc::Sender<Input>,
     writer: Writer,
     controller: apcfg::Controller,
-    devices: Mutex<HashMap<Mac, Managed>>,
+    /// Shared with the live view's `forget_managed`, which drops an AP's entry when it is forgotten.
+    devices: Arc<Mutex<HashMap<Mac, Managed>>>,
     /// Read for the last push stored for an AP (secrets masked), to adopt its
     /// running config after a restart, when no unmasked push is in memory.
     store: Arc<Store>,
@@ -132,10 +133,14 @@ pub const MAX_INFORM_INTERVAL: Ts = 90;
 
 /// Seconds until an AP's next inform, for a site of `n_devices` APs. Matches
 /// the official controller for small sites: five seconds per AP plus jitter,
-/// at least ten.
-fn interval(n_devices: usize) -> Ts {
+/// at least ten. The jitter is the AP's own, from its MAC, so it spreads the
+/// APs out as well while an AP is asked for the same interval every time:
+/// the engine then has nothing to change for nearly every reply.
+fn interval(mac: Mac, n_devices: usize) -> Ts {
     let n = n_devices.max(1) as i64;
-    if n < 18 { (n * 5 + (random_bytes::<1>()[0] % 5) as i64).max(10) } else { MAX_INFORM_INTERVAL - (random_bytes::<1>()[0] % 31) as i64 }
+    // The device-specific half of the MAC: the vendor half is the same for every AP.
+    let jitter = i64::from(u32::from_be_bytes([0, mac.0[3], mac.0[4], mac.0[5]]));
+    if n < 18 { (n * 5 + jitter % 5).max(10) } else { MAX_INFORM_INTERVAL - jitter % 31 }
 }
 
 /// A `mgmt_cfg` rendered with the placeholder token, carrying `cfgversion`
@@ -180,9 +185,17 @@ impl Active {
             }
             devices.insert(m, d);
         }
+        let devices = Arc::new(Mutex::new(devices));
+        // Whichever way an AP is forgotten (reporting or not), the engine drops what is kept here of it.
+        let forgotten = Arc::downgrade(&devices);
+        live.write().unwrap().forget_managed = Some(Arc::new(move |mac: &Mac| {
+            if let Some(devices) = forgotten.upgrade() {
+                devices.lock().unwrap().remove(mac);
+            }
+        }));
         let cpus = std::thread::available_parallelism().map_or(4, |n| n.get());
         let active = Active {
-            live, keys, engine, writer, controller, devices: Mutex::new(devices), store: store.clone(), adoption_cfgs: Default::default(),
+            live, keys, engine, writer, controller, devices, store: store.clone(), adoption_cfgs: Default::default(),
             work: Semaphore::new(cpus), strangers: Semaphore::new((cpus / 2).max(1)), proxies,
         };
         // Rows holding the rendered config (with its secrets) get its digest instead.
@@ -242,13 +255,13 @@ impl Active {
             (live.state.clone(), live.devices.len())
         };
         let Some(state) = state else {
-            return json!({ "_type": "noop", "interval": interval(n_devices), "server_time_in_utc": server_time });
+            return json!({ "_type": "noop", "interval": interval(mac, n_devices), "server_time_in_utc": server_time });
         };
         match self.adoption_cfg(&state, mac, payload) {
             Ok(mgmt_cfg) => json!({ "_type": "setparam", "mgmt_cfg": mgmt_cfg, "server_time_in_utc": server_time }),
             Err(e) => {
                 tracing::error!("{mac}: cannot render the adoption config: {e:#}");
-                json!({ "_type": "noop", "interval": interval(n_devices), "server_time_in_utc": server_time })
+                json!({ "_type": "noop", "interval": interval(mac, n_devices), "server_time_in_utc": server_time })
             }
         }
     }
@@ -304,10 +317,10 @@ impl Active {
         }
         let Some(state) = state else {
             tracing::warn!("{mac}: no settings imported, replying noop");
-            return noop(interval(n_devices));
+            return noop(interval(mac, n_devices));
         };
         if self.collect_radios(ts, mac, &state, payload) {
-            return noop(interval(n_devices));
+            return noop(interval(mac, n_devices));
         }
         let reported = payload["cfgversion"].as_str().unwrap_or("");
 
@@ -317,12 +330,12 @@ impl Active {
             Ok(r) => r,
             Err(e) => {
                 tracing::error!("{mac}: cannot render config, replying noop: {e:#}");
-                return noop(interval(n_devices));
+                return noop(interval(mac, n_devices));
             }
         };
         let cfgversion = self.decide_version(mac, reported, &render, force);
         if reported == cfgversion {
-            return self.firmware_turn(ts, mac, payload).unwrap_or_else(|| noop(interval(n_devices)));
+            return self.firmware_turn(ts, mac, payload).unwrap_or_else(|| noop(interval(mac, n_devices)));
         }
         if force {
             self.live.write().unwrap().reprovision.remove(&mac);
@@ -440,15 +453,13 @@ impl Active {
     /// there would not show in a masked comparison, and never reach the AP.
     fn stored_push(&self, mac: Mac) -> Option<PushedConfig> {
         let read = self.store.read(Db::Config, |c| {
-            use rusqlite::OptionalExtension;
-            let pushed = c.query_row("SELECT ts FROM device_config WHERE mac = ?1", [mac.to_string()], |r| r.get::<_, Option<Ts>>(0)).optional()?;
-            let Some(pushed) = pushed else { return Ok(None) };
+            let Some((push, pushed)) = crate::store::stored_push_at(c, &mac)? else { return Ok(None) };
             let edited: Option<Ts> = c.query_row("SELECT MAX(ts) FROM events WHERE kind = ?1", [EventKind::SettingsChanged.as_str()], |r| r.get(0))?;
             if edited.is_some_and(|e| pushed.is_none_or(|p| p <= e)) {
                 tracing::info!("{mac}: the settings were edited after its last stored push: not comparing with it");
                 return Ok(None);
             }
-            Ok(crate::store::stored_push(c, &mac)?)
+            Ok(Some(push))
         });
         read.unwrap_or_else(|e| {
             tracing::warn!("{mac}: cannot read its last stored push: {e:#}");
@@ -781,13 +792,17 @@ mod tests {
 
     #[test]
     fn the_inform_interval_stays_within_what_the_insights_allow_for() {
+        let macs: Vec<Mac> = (0..=255u8).map(|b| Mac([0x02, 0, 0, 0, 0x10, b])).collect();
         for n in 0..40 {
-            for _ in 0..50 {
-                let i = interval(n);
+            for &mac in &macs {
+                let i = interval(mac, n);
                 assert!((10..=MAX_INFORM_INTERVAL).contains(&i), "{n} APs: {i}");
+                assert_eq!(interval(mac, n), i, "the same AP is asked for the same interval");
             }
         }
-        assert!((0..1000).any(|_| interval(30) == MAX_INFORM_INTERVAL), "a large site reaches the longest");
+        assert!(macs.iter().any(|&m| interval(m, 30) == MAX_INFORM_INTERVAL), "a large site reaches the longest");
+        let spread: std::collections::HashSet<Ts> = macs.iter().map(|&m| interval(m, 30)).collect();
+        assert_eq!(spread.len(), 31, "and the APs are spread over the whole range");
     }
 
     #[tokio::test]
@@ -1275,6 +1290,19 @@ mod tests {
         assert_eq!(status, StatusCode::NOT_FOUND);
         let (status, _) = inform_as_ap(&rig, &ap_payload("1"), KEY, Flags::ENCRYPTED).await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "still no CBC");
+    }
+
+    #[tokio::test]
+    async fn a_forgotten_ap_leaves_nothing_behind_in_active_mode() {
+        let Some(_) = fixtures() else { return };
+        let rig = rig(true, None);
+        let mac: Mac = AP.parse().unwrap();
+        inform_as_ap(&rig, &ap_payload("1"), KEY, GCM_ZLIB).await;
+        assert!(rig.active.devices.lock().unwrap().get(&mac).is_some_and(|d| d.gcm && d.content.is_some()));
+        // The engine calls this however the AP is forgotten, reporting or not (see `Engine::forget`).
+        let forget = rig.live.read().unwrap().forget_managed.clone().expect("set by Active::new");
+        forget(&mac);
+        assert!(!rig.active.devices.lock().unwrap().contains_key(&mac));
     }
 
     #[tokio::test]
