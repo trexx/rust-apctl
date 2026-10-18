@@ -327,6 +327,10 @@ const WHICH = [
 export function AttemptList({ span }: { span: TimeSpan }) {
   const [failed, setFailed] = useState(false);
   const c = useConnections(span, { failed, limit: ATTEMPT_ROWS, roams: false });
+  // Which attempts the list shows: while the other choice loads, the previous
+  // list stays up (dimmed), and its empty text with it.
+  const [shown, setShown] = useState(failed);
+  if (!c.isPlaceholderData && c.data && shown !== failed) setShown(failed);
   return (
     <div className="panel">
       <div className="panel-head">
@@ -343,17 +347,19 @@ export function AttemptList({ span }: { span: TimeSpan }) {
         />
       </div>
       <QueryState q={c}>
-        {(data) =>
-          data.attempts.length === 0 ? (
-            <div className="muted small">
-              {failed
-                ? "No failed attempts in this range."
-                : "No attempts in this range."}
-            </div>
-          ) : (
-            <AttemptTable data={data} />
-          )
-        }
+        {(data) => (
+          <div className={c.isPlaceholderData ? "dim" : undefined}>
+            {data.attempts.length === 0 ? (
+              <div className="muted small">
+                {shown
+                  ? "No failed attempts in this range."
+                  : "No attempts in this range."}
+              </div>
+            ) : (
+              <AttemptTable data={data} />
+            )}
+          </div>
+        )}
       </QueryState>
     </div>
   );
