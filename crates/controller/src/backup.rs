@@ -379,6 +379,17 @@ fn snapshot(src: &Path, dst: &Path) -> Result<()> {
 /// have a name (alias) are kept whatever their age, as are settings, keys,
 /// device configs and acknowledgements; login sessions never travel.
 fn trim(dir: &Path, cutoff: Option<Ts>) -> Result<()> {
+    if dir.join("config.db").exists() {
+        trim_config(dir, cutoff)?;
+    }
+    if let Some(t) = cutoff {
+        trim_history(dir, t)?;
+    }
+    Ok(())
+}
+
+/// Drops the history older than the cutoff, and the sessions, from config.db.
+fn trim_config(dir: &Path, cutoff: Option<Ts>) -> Result<()> {
     let mut c = scratch(&dir.join("config.db"))?;
     // The deletes in one transaction, then one rewrite to drop the pages they
     // freed. With nothing else to drop, the few session rows are overwritten
@@ -398,34 +409,36 @@ fn trim(dir: &Path, cutoff: Option<Ts>) -> Result<()> {
     if cutoff.is_some() {
         c.execute_batch("VACUUM;")?;
     }
-    drop(c);
-    if let Some(t) = cutoff {
-        // Every metric table in every tier, and the logs (whose full-text index follows by trigger).
-        let metrics: Vec<String> = store::TABLES.iter().flat_map(|t| store::TIERS.iter().map(move |(suffix, ..)| format!("{}{suffix}", t.name))).collect();
-        for (name, tables) in [("metrics.db", metrics), ("logs.db", vec!["logs".to_string()])] {
-            let p = dir.join(name);
-            if !p.exists() {
-                continue;
+    Ok(())
+}
+
+/// Drops the history older than `t` from metrics.db and logs.db.
+fn trim_history(dir: &Path, t: Ts) -> Result<()> {
+    // Every metric table in every tier, and the logs (whose full-text index follows by trigger).
+    let metrics: Vec<String> = store::TABLES.iter().flat_map(|t| store::TIERS.iter().map(move |(suffix, ..)| format!("{}{suffix}", t.name))).collect();
+    for (name, tables) in [("metrics.db", metrics), ("logs.db", vec!["logs".to_string()])] {
+        let p = dir.join(name);
+        if !p.exists() {
+            continue;
+        }
+        // What is deleted is overwritten in place, so the file need not be
+        // rewritten to be rid of it: only when it frees much of the file
+        // (zeroed pages would otherwise bloat the restored database, and
+        // compress so well that the restore's size check could refuse it).
+        let mut c = scratch(&p)?;
+        c.execute_batch("PRAGMA secure_delete=ON;")?;
+        let tx = c.transaction()?;
+        for table in tables {
+            // A database from an older version may lack the newest tables.
+            let exists: bool = tx.query_row("SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1", [&table], |r| r.get::<_, i64>(0))? > 0;
+            if exists {
+                tx.execute(&format!("DELETE FROM \"{table}\" WHERE ts < ?1"), [t])?;
             }
-            // What is deleted is overwritten in place, so the file need not be
-            // rewritten to be rid of it: only when it frees much of the file
-            // (zeroed pages would otherwise bloat the restored database, and
-            // compress so well that the restore's size check could refuse it).
-            let mut c = scratch(&p)?;
-            c.execute_batch("PRAGMA secure_delete=ON;")?;
-            let tx = c.transaction()?;
-            for table in tables {
-                // A database from an older version may lack the newest tables.
-                let exists: bool = tx.query_row("SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1", [&table], |r| r.get::<_, i64>(0))? > 0;
-                if exists {
-                    tx.execute(&format!("DELETE FROM \"{table}\" WHERE ts < ?1"), [t])?;
-                }
-            }
-            tx.commit()?;
-            let pages = |pragma: &str| c.query_row(&format!("PRAGMA {pragma}"), [], |r| r.get::<_, i64>(0));
-            if pages("freelist_count")? * 4 > pages("page_count")? {
-                c.execute_batch("VACUUM;")?;
-            }
+        }
+        tx.commit()?;
+        let pages = |pragma: &str| c.query_row(&format!("PRAGMA {pragma}"), [], |r| r.get::<_, i64>(0));
+        if pages("freelist_count")? * 4 > pages("page_count")? {
+            c.execute_batch("VACUUM;")?;
         }
     }
     Ok(())
@@ -442,8 +455,15 @@ fn stamp(ts: Ts) -> String {
 /// asked for), so each gets its own name.
 static CREATING: Mutex<()> = Mutex::new(());
 
-/// Writes a backup of the databases in `src_dir` and returns its description.
+/// Writes a backup of the databases in `src_dir` and returns its description:
+/// the settings alone (`days` 0), or with the history too.
 pub fn create(b: &Backups, src_dir: &Path, kind: Kind, days: i64) -> Result<Meta> {
+    let names: &[&str] = if days == 0 { &DATABASES[..1] } else { &DATABASES };
+    create_of(b, src_dir, kind, days, names)
+}
+
+/// Writes a backup of the databases `names` in `src_dir` (those that exist).
+fn create_of(b: &Backups, src_dir: &Path, kind: Kind, days: i64, names: &[&str]) -> Result<Meta> {
     let _one = CREATING.lock().unwrap_or_else(PoisonError::into_inner);
     let now = clock::now_ts();
     let dir = b.dir();
@@ -458,11 +478,7 @@ pub fn create(b: &Backups, src_dir: &Path, kind: Kind, days: i64) -> Result<Meta
         .expect("a free name");
     let part = dir.join(format!("{name}.part"));
     let result = (|| -> Result<Meta> {
-        let mut names = vec!["config.db"];
-        if days != 0 {
-            names.extend(["metrics.db", "logs.db"]);
-        }
-        for n in &names {
+        for n in names {
             if src_dir.join(n).exists() {
                 snapshot(&src_dir.join(n), &tmp.join(n))?;
             }
@@ -475,7 +491,7 @@ pub fn create(b: &Backups, src_dir: &Path, kind: Kind, days: i64) -> Result<Meta
         };
         trim(&tmp, cutoff)?;
         let mut files = std::collections::BTreeMap::new();
-        for n in &names {
+        for n in names {
             if tmp.join(n).exists() {
                 files.insert(n.to_string(), sha256_file(&tmp.join(n))?);
             }
@@ -650,8 +666,9 @@ fn valid_id(id: &str) -> bool {
 }
 
 /// Applies a staged restore, if any, before the databases are opened: saves
-/// the current state as a pre-restore backup, then swaps the staged files in.
-/// A settings-only backup leaves the current statistics and logs in place.
+/// the databases it replaces as a pre-restore backup, then swaps the staged
+/// files in. A settings-only backup leaves the current statistics and logs
+/// in place (and out of the pre-restore backup).
 ///
 /// A restore that fails before any file has left staging is logged and set
 /// aside (`pending.failed`, shown on the backups page) and apctl starts with
@@ -719,8 +736,12 @@ fn apply(b: &Backups, id: &str, under_way: &mut bool) -> Result<()> {
     // the first time, and a new one would hold part of the restored data.
     let resumed = manifest.files.keys().any(|n| !staged.join(n).exists());
     *under_way = resumed;
-    if b.data_dir.join("config.db").exists() && !resumed {
-        let pre = create(b, &b.data_dir, Kind::PreRestore, -1).context("saving the current state before restoring")?;
+    // The copy holds what the restore replaces, whole: a settings-only
+    // restore leaves the statistics and logs where they are, and copying
+    // them too would only make the start (before /healthz answers) slower.
+    let replaced: Vec<&str> = manifest.files.keys().map(String::as_str).filter(|n| b.data_dir.join(n).exists()).collect();
+    if !replaced.is_empty() && !resumed {
+        let pre = create_of(b, &b.data_dir, Kind::PreRestore, -1, &replaced).context("saving the current state before restoring")?;
         tracing::info!("saved the state before the restore as {}", pre.name);
         prune(b, Kind::PreRestore, KEEP_PRE_RESTORE);
     }
@@ -1341,9 +1362,30 @@ mod tests {
         apply_pending(&b);
         assert_eq!(count(&src.join("config.db"), "SELECT COUNT(*) FROM client_aliases"), 1, "restored");
         assert!(!b.staging().join("pending").exists());
-        assert!(list(&b).iter().any(|x| x.kind == Kind::PreRestore), "the replaced state was saved");
+        let pre = list(&b).into_iter().find(|x| x.kind == Kind::PreRestore).expect("the replaced state was saved");
+        let saved = unpack(&b.dir().join(&pre.name), b.key.as_ref(), &dir("apply-pre")).unwrap();
+        assert_eq!(saved.files.keys().collect::<Vec<_>>(), ["config.db", "logs.db", "metrics.db"], "a restore of everything saves everything first");
         // Nothing pending: nothing happens.
         apply_pending(&b);
+    }
+
+    #[test]
+    fn a_settings_only_restore_saves_only_the_settings_first() {
+        let src = data("apply-settings");
+        let b = Backups::new(src.to_path_buf(), None);
+        let m = create(&b, &src, Kind::Manual, 0).unwrap();
+        Connection::open(src.join("config.db")).unwrap().execute_batch("DELETE FROM client_aliases;").unwrap();
+        let (id, _) = stage(&b, &b.dir().join(&m.name)).unwrap();
+        fs::write(b.staging().join("pending"), &id).unwrap();
+        apply_pending(&b);
+        assert_eq!(count(&src.join("config.db"), "SELECT COUNT(*) FROM client_aliases"), 1, "restored");
+        assert_eq!(count(&src.join("metrics.db"), "SELECT COUNT(*) FROM ap_stats"), 2, "the statistics are left in place");
+        let pre = list(&b).into_iter().find(|x| x.kind == Kind::PreRestore).expect("the replaced settings were saved");
+        let out = dir("apply-settings-pre");
+        let saved = unpack(&b.dir().join(&pre.name), None, &out).unwrap();
+        assert_eq!(saved.files.keys().collect::<Vec<_>>(), ["config.db"], "only what the restore replaced");
+        assert_eq!(count(&out.join("config.db"), "SELECT COUNT(*) FROM events"), 2, "with all of its history");
+        assert_eq!(count(&out.join("config.db"), "SELECT COUNT(*) FROM client_aliases"), 0, "as it was before the restore");
     }
 
     #[test]
