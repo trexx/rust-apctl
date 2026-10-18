@@ -30,7 +30,7 @@ import {
 } from "../components/common";
 import {
   ago,
-  band,
+  bandChannel,
   bytes,
   compact,
   duration,
@@ -128,7 +128,7 @@ function ClientPage({ mac }: { mac: string }) {
                 }
                 sub={
                   c.connected
-                    ? `${s.essid ?? "—"} · ${band(s.radio)}${s.channel ? ` ch ${s.channel}` : ""}`
+                    ? `${s.essid ?? "—"} · ${bandChannel(s.radio, s.channel)}`
                     : `last seen ${ago(c.last_seen, now)}`
                 }
               />

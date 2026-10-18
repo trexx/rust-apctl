@@ -6,6 +6,7 @@ import {
   useEvents,
   useStatus,
 } from "../api";
+import type { DeviceSummary } from "../api";
 import {
   Dot,
   ErrorNote,
@@ -15,7 +16,16 @@ import {
   QueryState,
   Stat,
 } from "../components/common";
-import { SIGNAL, ago, band, dbm, duration, pct, useNow } from "../format";
+import {
+  SIGNAL,
+  ago,
+  band,
+  dbm,
+  duration,
+  pct,
+  uplinkText,
+  useNow,
+} from "../format";
 import { Connectivity } from "../components/insights/Connectivity";
 import { DeploymentDensity } from "../components/insights/DeploymentDensity";
 import { MulticastPanel } from "../components/insights/Multicast";
@@ -25,6 +35,10 @@ import { TopTalkers } from "../components/insights/TopTalkers";
 import { useTimeSpan } from "../components/Chart";
 import { ThreatBanner } from "../components/Threats";
 import { AdoptionPanel } from "../components/Adoption";
+
+/** An AP's firmware and address, as far as they are known. */
+const about = (d: DeviceSummary) =>
+  [d.version, d.ip].filter(Boolean).join(" · ");
 
 export function Overview() {
   const devices = useDevices();
@@ -111,16 +125,12 @@ export function Overview() {
                   />
                 ))}
               <span>Uplink</span>
-              <span>
-                {d.uplink?.speed
-                  ? `${d.uplink.speed} Mbps${d.uplink.full_duplex ? " FD" : ""}`
-                  : "—"}
-              </span>
+              <span>{d.uplink ? uplinkText(d.uplink) : "—"}</span>
               <span>Uptime</span>
               <span>{duration(d.uptime)}</span>
             </div>
-            <div className="card-foot muted" title={`${d.version} · ${d.ip}`}>
-              {d.version} · {d.ip} ·{" "}
+            <div className="card-foot muted" title={about(d) || undefined}>
+              {about(d) && `${about(d)} · `}
               {d.online
                 ? `seen ${ago(d.last_seen, now)}`
                 : `offline since ${ago(d.last_seen, now)}`}

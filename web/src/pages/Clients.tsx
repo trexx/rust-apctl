@@ -11,7 +11,7 @@ import {
   Segmented,
   useUrlTab,
 } from "../components/common";
-import { ago, band, duration, phy, useNow } from "../format";
+import { ago, bandChannel, duration, phy, useNow } from "../format";
 
 type SortKey =
   | "name"
@@ -238,10 +238,7 @@ const ClientRow = memo(function ClientRow({
         )}
       </td>
       <td>{c.sample.essid ?? "—"}</td>
-      <td>
-        {band(c.sample.radio)}
-        {c.sample.channel ? ` ch ${c.sample.channel}` : ""}
-      </td>
+      <td>{bandChannel(c.sample.radio, c.sample.channel)}</td>
       <td>{c.connected ? <Signal dbm={c.sample.signal} /> : "—"}</td>
       <td>
         {c.connected
