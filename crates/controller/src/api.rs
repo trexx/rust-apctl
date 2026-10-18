@@ -1503,8 +1503,14 @@ mod tests {
         assert_eq!(open(None).await.0, "101", "no Origin: not a browser page");
         let (status, mut tcp) = open(Some(format!("http://{addr}"))).await;
         assert_eq!(status, "101");
-        let req = Request::post("/api/logout").header(header::COOKIE, &cookie).body(Body::empty()).unwrap();
-        assert_eq!(app.oneshot(req).await.unwrap().status(), StatusCode::OK);
+        let logout = |csrf: bool| {
+            let req = Request::post("/api/logout").header(header::COOKIE, &cookie);
+            app.clone().oneshot(if csrf { req.header("x-requested-with", "apctl") } else { req }.body(Body::empty()).unwrap())
+        };
+        // Another site cannot log the visitor out.
+        assert_eq!(logout(false).await.unwrap().status(), StatusCode::FORBIDDEN);
+        assert_eq!(open(None).await.0, "101", "still logged in");
+        assert_eq!(logout(true).await.unwrap().status(), StatusCode::OK);
         let mut frame = [0u8; 2];
         tokio::time::timeout(std::time::Duration::from_secs(5), tcp.read_exact(&mut frame)).await.expect("closed at the logout").unwrap();
         assert_eq!(frame[0], 0x88, "a close frame");

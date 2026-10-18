@@ -233,11 +233,17 @@ impl Auth {
         origin.to_str().ok().zip(host).is_some_and(|(o, h)| origin_matches(o, h))
     }
 
-    fn revoke(&self, token: &str) {
+    /// Ends a session; false when there was none. Anyone can send a cookie,
+    /// so only a session that was there wakes the live sockets and queues a
+    /// write.
+    fn revoke(&self, token: &str) -> bool {
         let hash = token_hash(token);
-        self.sessions.lock().unwrap().remove(&hash);
+        if self.sessions.lock().unwrap().remove(&hash).is_none() {
+            return false;
+        }
         self.logouts.send_replace(());
         self.writer.exec(Db::Config, "DELETE FROM sessions WHERE token_hash = ?1", vec![Sql::Text(hash)]);
+        true
     }
 
     /// Counts a login attempt from `ip`, before the password is checked, so
@@ -396,6 +402,10 @@ fn csrf_ok(headers: &HeaderMap) -> bool {
     headers.get("x-requested-with").and_then(|v| v.to_str().ok()) == Some("apctl")
 }
 
+fn csrf_refused() -> ApiError {
+    ApiError(StatusCode::FORBIDDEN, "missing X-Requested-With: apctl header".into())
+}
+
 /// Guards every API route except login/logout/me; changes (anything but GET,
 /// HEAD and OPTIONS) also need the CSRF header.
 pub async fn require_login(State(s): State<AppState>, req: Request, next: Next) -> Result<Response, ApiError> {
@@ -409,7 +419,7 @@ pub async fn require_login(State(s): State<AppState>, req: Request, next: Next) 
         return Ok(next.run(req).await);
     }
     match session(&s.auth, req.headers()) {
-        Some(_) if mutating && !csrf_ok(req.headers()) => Err(ApiError(StatusCode::FORBIDDEN, "missing X-Requested-With: apctl header".into())),
+        Some(_) if mutating && !csrf_ok(req.headers()) => Err(csrf_refused()),
         Some((_, cookie)) => Ok(renewed(next.run(req).await, cookie)),
         None => Err(ApiError(StatusCode::UNAUTHORIZED, "login required".into())),
     }
@@ -474,11 +484,16 @@ async fn in_slot<T: Send + 'static>(slots: &'static Semaphore, wait: Duration, c
     )
 }
 
-pub async fn logout(State(s): State<AppState>, headers: HeaderMap) -> Response {
+/// A change like any other, so it needs the CSRF header too: another site
+/// cannot log a visitor out.
+pub async fn logout(State(s): State<AppState>, headers: HeaderMap) -> Result<Response, ApiError> {
+    if !csrf_ok(&headers) {
+        return Err(csrf_refused());
+    }
     if let Some(t) = session_token(&headers) {
         s.auth.revoke(&t);
     }
-    ([(header::SET_COOKIE, cookie(&headers, "", 0))], Json(json!({ "ok": true }))).into_response()
+    Ok(([(header::SET_COOKIE, cookie(&headers, "", 0))], Json(json!({ "ok": true }))).into_response())
 }
 
 /// Who is logged in, and whether login is needed at all.
@@ -547,8 +562,14 @@ mod tests {
         assert_eq!(auth.check(&token), Some(("admin".into(), false)), "new: not extended yet");
         assert!(!auth.sessions.lock().unwrap().contains_key(&token), "only the hash is stored");
         assert_eq!(auth.check("forged"), None);
-        auth.revoke(&token);
+        // Only a session that was there is announced to the live sockets.
+        let logouts = auth.logouts();
+        assert!(!auth.revoke("forged"));
+        assert!(!logouts.has_changed().unwrap(), "a made-up cookie wakes nobody");
+        assert!(auth.revoke(&token));
+        assert!(logouts.has_changed().unwrap());
         assert_eq!(auth.check(&token), None);
+        assert!(!auth.revoke(&token), "already gone");
         // An expired session nobody presents again is dropped at the next login.
         let old = auth.create("admin").unwrap();
         auth.sessions.lock().unwrap().get_mut(&token_hash(&old)).unwrap().expires = 0;
