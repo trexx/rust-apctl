@@ -19,7 +19,7 @@ use serde_json::{Value, json};
 use tokio::sync::broadcast;
 
 use crate::clock;
-use crate::engine::{AliasEdit, ClientView, DeviceView, KnownDevice, LiveMsg, SharedLive};
+use crate::engine::{AliasEdit, ClientView, DeviceView, KnownDevice, Live, LiveMsg, SharedLive};
 use crate::model::{ClientSample, Ts};
 use crate::store::{self, Db, Store};
 
@@ -358,7 +358,8 @@ async fn status(State(s): State<AppState>) -> ApiResult {
         "started": s.started,
         "now": clock::now_ts(),
         "counters": &*live.counters,
-        "devices": live.devices.len(),
+        // With the APs known from the database only, as the device list has them.
+        "devices": live.devices.len() + stored_only(&live).count(),
         "devices_online": live.devices.values().filter(|d| d.online).count(),
         "clients_connected": connected,
         "clients_by_band": by_band,
@@ -379,6 +380,11 @@ async fn healthz(State(s): State<AppState>) -> Response {
     "ok".into_response()
 }
 
+/// The APs known from the database only: not reporting since apctl started.
+fn stored_only(live: &Live) -> impl Iterator<Item = (&Mac, &KnownDevice)> {
+    live.known_devices.iter().filter(|(mac, _)| !live.devices.contains_key(mac))
+}
+
 /// An AP known from the database only (see `Live::known_devices`), as a live
 /// device view of it, offline: what was not stored is empty.
 fn stored_view(mac: Mac, k: &KnownDevice) -> DeviceView {
@@ -396,12 +402,19 @@ fn stored_view(mac: Mac, k: &KnownDevice) -> DeviceView {
     }
 }
 
-/// An AP known from the database only, as its row in the device list.
-fn stored_row(mac: Mac, k: &KnownDevice) -> DeviceRow {
+/// An AP's row in the device list, with `clients` connected to it; `locating`
+/// is none for an AP known from the database only (`stored_view`).
+fn device_row(mac: Mac, d: &DeviceView, clients: usize, locating: Option<bool>) -> DeviceRow {
+    let a = &d.snapshot.ap;
     DeviceRow {
-        mac, name: k.hostname.clone(), model: k.model.clone(), model_display: k.model_display.clone(), version: k.version.clone(), ip: k.ip.clone(),
-        online: false, first_seen: k.first_seen, last_seen: k.last_seen, uptime: None, cpu: None, mem: None,
-        load1: None, satisfaction: None, clients: 0, uplink: None, radios: vec![], last_config_push: None, locating: None, stored_only: true,
+        mac, name: a.hostname.clone(), model: a.model.clone(), model_display: a.model_display.clone(), version: a.version.clone(), ip: a.ip.clone(),
+        online: d.online, first_seen: d.first_seen, last_seen: d.last_seen, uptime: a.uptime, cpu: a.cpu, mem: a.mem, load1: a.load1,
+        satisfaction: a.satisfaction, clients,
+        uplink: d.snapshot.uplink.as_ref().map(|u| UplinkRow { speed: u.speed, up: u.up, full_duplex: u.full_duplex }),
+        radios: d.snapshot.radios.iter().map(|r| RadioRow {
+            radio: r.radio.clone(), channel: r.channel, bw: r.bw, tx_power: r.tx_power, cu_total: r.cu_total, noise_floor: r.noise_floor, clients: r.num_sta,
+        }).collect(),
+        last_config_push: d.last_config_push, locating, stored_only: locating.is_none(),
     }
 }
 
@@ -460,29 +473,10 @@ async fn devices(State(s): State<AppState>) -> Json<Vec<DeviceRow>> {
         for c in live.clients.values().filter(|c| c.connected) {
             *per_ap.entry(c.sample.ap_mac).or_default() += 1;
         }
-        let mut list: Vec<DeviceRow> = live
-            .devices
-            .iter()
-            .map(|(mac, d)| {
-                let a = &d.snapshot.ap;
-                DeviceRow {
-                    mac: *mac, name: a.hostname.clone(), model: a.model.clone(), model_display: a.model_display.clone(),
-                    version: a.version.clone(), ip: a.ip.clone(), online: d.online,
-                    first_seen: d.first_seen, last_seen: d.last_seen, uptime: a.uptime, cpu: a.cpu, mem: a.mem, load1: a.load1,
-                    satisfaction: a.satisfaction, clients: per_ap.get(mac).copied().unwrap_or(0),
-                    uplink: d.snapshot.uplink.as_ref().map(|u| UplinkRow { speed: u.speed, up: u.up, full_duplex: u.full_duplex }),
-                    radios: d.snapshot.radios.iter().map(|r| RadioRow {
-                        radio: r.radio.clone(), channel: r.channel, bw: r.bw, tx_power: r.tx_power, cu_total: r.cu_total,
-                        noise_floor: r.noise_floor, clients: r.num_sta,
-                    }).collect(),
-                    last_config_push: d.last_config_push,
-                    locating: Some(live.locating.contains(mac)),
-                    stored_only: false,
-                }
-            })
-            .collect();
+        let mut list: Vec<DeviceRow> =
+            live.devices.iter().map(|(mac, d)| device_row(*mac, d, per_ap.get(mac).copied().unwrap_or(0), Some(live.locating.contains(mac)))).collect();
         // Then the APs not reporting since apctl started, by MAC as the others.
-        let mut stored: Vec<DeviceRow> = live.known_devices.iter().filter(|(mac, _)| !live.devices.contains_key(mac)).map(|(mac, k)| stored_row(*mac, k)).collect();
+        let mut stored: Vec<DeviceRow> = stored_only(&live).map(|(mac, k)| device_row(*mac, &stored_view(*mac, k), 0, None)).collect();
         stored.sort_unstable_by_key(|d| d.mac);
         list.append(&mut stored);
         list
@@ -1308,6 +1302,8 @@ mod tests {
             "first_seen": 10, "last_seen": 20, "uptime": null, "cpu": null, "mem": null, "load1": null, "satisfaction": null,
             "clients": 0, "uplink": null, "radios": [], "last_config_push": null, "stored_only": true,
         }));
+        let status = get_json(&app, "/api/status").await;
+        assert_eq!((status["devices"].as_i64(), status["devices_online"].as_i64()), (Some(2), Some(1)), "the stored AP counted, offline");
         let one = get_json(&app, "/api/devices/02:00:00:00:00:01").await;
         assert_eq!((one["clients"][0]["sample"]["hostname"].as_str(), one["locating"].as_bool()), (Some("phone"), Some(false)));
         let stored = get_json(&app, "/api/devices/02:00:00:00:00:02").await;
