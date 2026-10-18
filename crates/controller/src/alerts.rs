@@ -338,7 +338,15 @@ fn from_event(kind: EventKind, device: Option<Mac>, data: &Value, ap_name: &dyn 
         }
         EventKind::ApProcessRestarted => {
             let title = format!("{} restarted on {name}", data["proc"].as_str().unwrap_or("A process"));
-            let message = format!("It exited with code {} and was restarted by {}.", data["exit_status"], data["caller"].as_str().unwrap_or("the system"));
+            // The AP's notification as it came: a code it sends as text is
+            // still a code, and none at all is left out.
+            let code = match &data["exit_status"] {
+                Value::Number(n) => Some(n.to_string()),
+                Value::String(c) if c.trim().parse::<i64>().is_ok() => Some(c.trim().to_string()),
+                _ => None,
+            };
+            let exited = code.map_or_else(|| "It exited".to_string(), |c| format!("It exited with code {c}"));
+            let message = format!("{exited} and was restarted by {}.", data["caller"].as_str().unwrap_or("the system"));
             on(Key::ApProcessRestarted, Changes, Severity::Low, title, message).tagged(format!("proc:{dev}"))
         }
         EventKind::ApUpgradeFailed => {
@@ -812,6 +820,18 @@ mod tests {
         let u = from_event(EventKind::ApUpgraded, Some(aa), &json!({ "to": "8.8.12" }), &name).unwrap();
         assert_eq!((u.link.as_deref(), u.tag.as_str(), u.severity), (Some("/config?tab=firmware"), "upgrade:02:00:00:00:00:aa", Severity::Info));
         assert!(from_event(EventKind::ClientConnected, Some(aa), &json!({}), &name).is_none());
+        // A process restart's exit code, however the AP sent it.
+        for (status, want) in [
+            (json!(1), "It exited with code 1 and was restarted by procd."),
+            (json!("139"), "It exited with code 139 and was restarted by procd."),
+            (json!(null), "It exited and was restarted by procd."),
+            (json!("killed"), "It exited and was restarted by procd."),
+        ] {
+            let p = from_event(EventKind::ApProcessRestarted, Some(aa), &json!({ "proc": "hostapd", "exit_status": status, "caller": "procd" }), &name).unwrap();
+            assert_eq!((p.title.as_str(), p.message.as_str()), ("hostapd restarted on Garage", want));
+        }
+        let p = from_event(EventKind::ApProcessRestarted, Some(aa), &json!({}), &name).unwrap();
+        assert_eq!((p.title.as_str(), p.message.as_str()), ("A process restarted on Garage", "It exited and was restarted by the system."));
         // Exactly the kinds the engine passes on can make an alert.
         for &kind in EventKind::ALL {
             assert_eq!(from_event(kind, Some(aa), &json!({ "severity": "high" }), &name).is_some(), alertable(kind), "{kind}");
