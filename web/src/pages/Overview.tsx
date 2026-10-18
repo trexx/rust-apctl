@@ -36,9 +36,10 @@ export function Overview() {
   const cnames = useClientNames();
   const now = useNow();
 
-  if (devices.isLoading) return <Loading />;
-  if (devices.error) return <ErrorNote error={devices.error} />;
-  const list = devices.data ?? [];
+  // What was fetched stays up when a refetch fails.
+  if (!devices.data)
+    return devices.error ? <ErrorNote error={devices.error} /> : <Loading />;
+  const list = devices.data;
 
   return (
     <div className="page">

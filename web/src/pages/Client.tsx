@@ -70,8 +70,9 @@ function ClientPage({ mac }: { mac: string }) {
   const name = c ? displayName(c) : mac;
   // Every event in the timeline is this client's (a MAC alone shows as one).
   const cnames = name !== mac ? { [mac]: name } : {};
+  // What was fetched stays up when a refetch fails.
   const unknown =
-    client.error instanceof HttpError && client.error.status === 404;
+    !c && client.error instanceof HttpError && client.error.status === 404;
 
   return (
     <ZoomContext.Provider value={(from, to) => setRange({ from, to })}>
@@ -114,7 +115,7 @@ function ClientPage({ mac }: { mac: string }) {
               only.
             </div>
           ) : (
-            client.error && <ErrorNote error={client.error} />
+            !c && client.error && <ErrorNote error={client.error} />
           )}
 
           {s && c && (

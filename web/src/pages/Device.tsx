@@ -81,9 +81,9 @@ function DevicePage({ mac }: { mac: string }) {
   // Read-only users get neither the editor's code nor the AP's settings.
   const canEdit = useCanEdit();
 
-  if (detail.isLoading) return <Loading />;
-  if (detail.error || !detail.data)
-    return <ErrorNote error={detail.error ?? "Unknown device"} />;
+  // What was fetched stays up when a refetch fails.
+  if (!detail.data)
+    return detail.error ? <ErrorNote error={detail.error} /> : <Loading />;
   const { device: d, clients } = detail.data;
   const ap = d.snapshot.ap;
   const up = d.snapshot.uplink;

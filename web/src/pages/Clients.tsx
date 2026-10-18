@@ -134,8 +134,9 @@ function ClientList({ tabs }: { tabs: React.ReactNode }) {
     })
     .map(([, c]) => c);
 
-  if (clients.isLoading) return <Loading />;
-  if (clients.error) return <ErrorNote error={clients.error} />;
+  // What was fetched stays up when a refetch fails.
+  if (!clients.data)
+    return clients.error ? <ErrorNote error={clients.error} /> : <Loading />;
 
   const th = (key: SortKey, label: string) => (
     <SortHeader

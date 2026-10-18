@@ -19,9 +19,10 @@ export function Settings() {
     });
   };
 
-  if (state.isLoading) return <Loading />;
-  if (state.error) return <ErrorNote error={state.error} />;
-  const s = state.data?.summary;
+  // What was fetched stays up when a refetch fails.
+  if (!state.data)
+    return state.error ? <ErrorNote error={state.error} /> : <Loading />;
+  const s = state.data.summary;
   return (
     <div className="page">
       <div className="page-head">
@@ -42,8 +43,8 @@ export function Settings() {
           <div className="kv kv-wide">
             <span>Imported</span>
             <span>
-              {clock(state.data!.imported_at!, now)} (
-              {ago(state.data!.imported_at, now)})
+              {clock(state.data.imported_at!, now)} (
+              {ago(state.data.imported_at, now)})
             </span>
             <span>SSIDs</span>
             <span>{s.wlans.join(", ") || "none"}</span>
