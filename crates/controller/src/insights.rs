@@ -728,9 +728,7 @@ pub async fn multicast(State(s): State<AppState>, Query(q): Query<RangeQuery>) -
     Ok(Json(json!({ "bucket": bucket, "ts": ts, "types": types, "clients": list })))
 }
 
-/// The longest interval the engine works a multicast rate out over: a raw
-/// sample covers at most this long before it.
-const MCAST_GAP: Ts = 120;
+use crate::engine::MCAST_GAP;
 
 /// One AP's multicast sample of one type: (AP, type, time, [tx pps, rx pps,
 /// tx bytes/s, rx bytes/s]).

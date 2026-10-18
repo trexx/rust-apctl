@@ -330,6 +330,10 @@ type RadioSettings = (Option<i64>, Option<i64>, Option<i64>);
 const REFRESH_SECS: Ts = 60;
 /// The same for an unchanged spectrum scan row and its `ts`.
 const SPECTRUM_REFRESH_SECS: Ts = 3600;
+/// The longest interval a multicast rate is worked out over: a client's or a
+/// network's sample further apart from the one before gives no rate. A raw
+/// sample in `mcast_stats` so covers at most this long before it.
+pub(crate) const MCAST_GAP: Ts = 120;
 
 /// What was last written of the rows rewritten on every inform, and when.
 /// Empty at start, so each row is written on its first inform of a run.
@@ -1498,7 +1502,7 @@ impl Engine {
             if bss_done.insert(c.bssid.as_str()) {
                 if let Some((pts, prev)) = self.bss_prev.get(&c.bssid)
                     && ts > *pts
-                    && ts - pts <= 120
+                    && ts - pts <= MCAST_GAP
                 {
                     let dt = (ts - pts) as f64;
                     let prev = mcast_types(prev);
@@ -1519,7 +1523,7 @@ impl Engine {
             if let Some((pts, prev)) = self.mcast_prev.get(&c.mac)
                 && prev.bssid == c.bssid
                 && ts > *pts
-                && ts - pts <= 120
+                && ts - pts <= MCAST_GAP
             {
                 let dt = (ts - pts) as f64;
                 let prev = mcast_types(prev);
