@@ -478,7 +478,7 @@ impl Sim {
                 "tx_bytes": s.tx as i64, "rx_bytes": s.rx as i64, "tx_packets": (s.tx / 1200.0) as i64, "rx_packets": (s.rx / 600.0) as i64,
                 "tx_retries": (pkts * if signal < -70 { 0.18 } else { 0.04 }) as i64, "idletime": self.rng.range(0, 8), "uptime": ts - s.since,
                 "satisfaction": sat, "satisfaction_reason": 0, "anomalies": if sat < 70 { 1 } else { 0 },
-                "nss": if c.kind == Kind::Iot { 1 } else { 2 }, "chwidth": if na { 3 } else { 1 },
+                "nss": if c.kind == Kind::Iot { 1 } else { 2 },
                 "is_11ax": ax, "is_11ac": na, "is_11n": true, "is_11r": !c.iot, "vlan_id": 1,
                 "wifi_tx_latency_mov": { "avg": if signal < -70 { 12 } else { 2 }, "max": 40, "min": 0 },
             }));
