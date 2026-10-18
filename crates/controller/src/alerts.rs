@@ -287,6 +287,20 @@ impl ApWatch {
             _ => None,
         }
     }
+
+    /// Forgets what no longer counts: offline alerts over a day old (but not
+    /// an offline AP's, which tell whether its return is reported), and
+    /// "keeps dropping off" days before today.
+    fn prune(&mut self, now: Ts) {
+        let down = &self.down;
+        self.sent.retain(|mac, sent| {
+            if !down.contains_key(mac) {
+                sent.retain(|t| *t > now - 86400);
+            }
+            !sent.is_empty()
+        });
+        self.flapping_day.retain(|_, day| *day == now / 86400);
+    }
 }
 
 /// Whether [`from_event`] may turn an event of this kind into an alert: the
@@ -606,6 +620,7 @@ impl Watcher {
 
     /// AP status: offline after a while without contact, back online.
     fn status_tick(&mut self, now: Ts) {
+        self.aps.prune(now);
         let seen: Vec<(Mac, Option<String>, Ts)> = {
             let l = self.live.read().unwrap();
             let mut v: Vec<_> = l.devices.iter().map(|(m, d)| (*m, d.snapshot.ap.hostname.clone(), d.last_seen)).collect();
@@ -656,6 +671,8 @@ impl Watcher {
 
     /// Wi-Fi health over the last window: each radio, and clients failing to connect.
     async fn health_tick(&mut self, now: Ts) {
+        // Clears past the cooldown no longer hold anything back (see `may_raise`).
+        self.cleared.retain(|_, t| (0..HEALTH_COOLDOWN).contains(&(now - *t)));
         let (online, known): (HashSet<Mac>, HashSet<Mac>) = {
             let l = self.live.read().unwrap();
             (l.devices.iter().filter(|(_, d)| d.online).map(|(m, _)| *m).collect(), l.devices.keys().copied().collect())
@@ -821,6 +838,25 @@ mod tests {
         // The next day it is reported again.
         w.check(4100, ap, 4099);
         assert!(matches!(w.check(1000 + 90_000, ap, 1000 + 90_000 - 300), Some(ApChange::Offline { .. })));
+    }
+
+    #[test]
+    fn what_an_ap_watch_remembers_lasts_a_day() {
+        let mut w = ApWatch::default();
+        let (a, b): (Mac, Mac) = ("02:00:00:00:00:01".parse().unwrap(), "02:00:00:00:00:02".parse().unwrap());
+        for t in [1000, 2000, 3000] {
+            w.check(t, a, t - 300);
+            w.check(t + 100, a, t + 99);
+        }
+        assert_eq!(w.check(5000, b, 4700), Some(ApChange::Offline { last_seen: 4700 }));
+        // Within the day the limit holds, pruned or not.
+        w.prune(4000);
+        assert_eq!(w.check(4000, a, 3700), None, "reported twice and summarised once today");
+        w.check(4100, a, 4099);
+        // A day on, only the AP still offline is remembered: its return is reported as alerted.
+        w.prune(5000 + 86400);
+        assert!(w.sent.keys().eq([&b]) && w.flapping_day.is_empty());
+        assert_eq!(w.check(5000 + 86400, b, 5000 + 86400), Some(ApChange::Online { down_for: 86400 + 300, alerted: true }));
     }
 
     #[test]
@@ -998,6 +1034,17 @@ mod tests {
         w.judge_connections(30_000, 0);
         w.judge_connections(29_000, 9);
         assert_eq!(told(&mut rx), [("resolved", "connect_failures"), ("raised", "connect_failures")]);
+    }
+
+    #[tokio::test]
+    async fn clears_past_their_cooldown_are_forgotten() {
+        let (mut w, _rx, _dir) = watcher();
+        let ap: Mac = "02:00:00:00:00:01".parse().unwrap();
+        let now = 100_000;
+        w.cleared.insert((Key::BusyChannel, Entity::Radio(ap, "na".into())), now - HEALTH_COOLDOWN);
+        w.cleared.insert((Key::ConnectFailures, Entity::Site), now - 60);
+        w.health_tick(now).await;
+        assert!(w.cleared.keys().eq([&(Key::ConnectFailures, Entity::Site)]));
     }
 
     #[tokio::test]
