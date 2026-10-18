@@ -350,7 +350,8 @@ export function BackupSection() {
           </span>
         )}
         <span className="muted small">
-          stored on apctl's volume; download one to keep a copy elsewhere
+          stored on apctl's volume
+          {readOnly ? "" : "; download one to keep a copy elsewhere"}
         </span>
       </div>
       {!d.encrypted && (
@@ -455,7 +456,14 @@ export function BackupSection() {
         <div className="table-wrap">
           <table className="table">
             <THead
-              columns={["Made", "Kind", "Contains", "apctl", "Size", ""]}
+              columns={[
+                "Made",
+                "Kind",
+                "Contains",
+                "apctl",
+                "Size",
+                ...(readOnly ? [] : [""]),
+              ]}
             />
             <tbody>
               {d.backups.map((x) => (
@@ -473,40 +481,39 @@ export function BackupSection() {
                   <td className="small">{historyLabel(x.days)}</td>
                   <td className="small">{x.version}</td>
                   <td className="small nowrap">{bytes(x.size)}</td>
-                  <td className="nowrap">
-                    <a
-                      className="btn small"
-                      href={`/api/backups/file/${encodeURIComponent(x.name)}`}
-                      download
-                    >
-                      Download
-                    </a>{" "}
-                    {!readOnly && (
-                      <>
-                        <button
-                          className="btn small"
-                          onClick={() =>
-                            setConfirm({
-                              name: x.name,
-                              label: `the backup from ${when(x.created)}`,
-                            })
-                          }
-                        >
-                          Restore…
-                        </button>{" "}
-                        <button
-                          className="btn small"
-                          onClick={() =>
-                            window.confirm(
-                              `Delete the backup from ${when(x.created)}?`,
-                            ) && void run(() => deleteBackup(x.name))
-                          }
-                        >
-                          Delete
-                        </button>
-                      </>
-                    )}
-                  </td>
+                  {/* Read-only mode withholds the files: they hold AP keys and Wi-Fi passwords. */}
+                  {!readOnly && (
+                    <td className="nowrap">
+                      <a
+                        className="btn small"
+                        href={`/api/backups/file/${encodeURIComponent(x.name)}`}
+                        download
+                      >
+                        Download
+                      </a>{" "}
+                      <button
+                        className="btn small"
+                        onClick={() =>
+                          setConfirm({
+                            name: x.name,
+                            label: `the backup from ${when(x.created)}`,
+                          })
+                        }
+                      >
+                        Restore…
+                      </button>{" "}
+                      <button
+                        className="btn small"
+                        onClick={() =>
+                          window.confirm(
+                            `Delete the backup from ${when(x.created)}?`,
+                          ) && void run(() => deleteBackup(x.name))
+                        }
+                      >
+                        Delete
+                      </button>
+                    </td>
+                  )}
                 </tr>
               ))}
             </tbody>
