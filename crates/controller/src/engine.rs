@@ -1396,7 +1396,10 @@ impl Engine {
 
     /// Time-based transitions: APs going quiet and clients disappearing.
     fn tick(&mut self, now: Ts) {
-        self.mcast_prev.retain(|_, (ts, ..)| *ts > now - 3600);
+        // A previous multicast sample is only used up to MCAST_GAP old; the margin is for
+        // informs received before this tick and still queued behind it.
+        let stale = now - 2 * MCAST_GAP;
+        self.mcast_prev.retain(|_, (ts, ..)| *ts > stale);
         self.syslog_unknown.retain(|_, at| (*at..*at + SYSLOG_RETRY_SECS).contains(&now));
         for (device_mac, (_, later)) in &mut self.logs_announced {
             if std::mem::take(later) {
@@ -1404,7 +1407,7 @@ impl Engine {
             }
         }
         self.logs_announced.retain(|_, (at, _)| now - *at < 60);
-        self.bss_prev.retain(|_, (ts, _)| *ts > now - 3600);
+        self.bss_prev.retain(|_, (ts, _)| *ts > stale);
         for e in self.logevents.tick(now) {
             self.emit(e);
         }
@@ -2190,6 +2193,11 @@ mod tests {
             .read(Db::Metrics, |c| Ok(c.query_row("SELECT tx_pps, rx_pps, rx_bytes_ps, clients FROM mcast_stats WHERE ts = 10 AND type = 'mdns'", [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?))
             .unwrap();
         assert_eq!(row, (10.0, 5.0, 500.0, 1.0));
+        // The previous samples are kept only as long as they can give a rate.
+        h.engine.handle(Input::Tick(10 + MCAST_GAP));
+        assert_eq!((h.engine.mcast_prev.len(), h.engine.bss_prev.len()), (2, 1));
+        h.engine.handle(Input::Tick(10 + 2 * MCAST_GAP));
+        assert!(h.engine.mcast_prev.is_empty() && h.engine.bss_prev.is_empty());
     }
 
     #[test]
