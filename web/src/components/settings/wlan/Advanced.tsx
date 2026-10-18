@@ -63,6 +63,7 @@ export function Advanced({
         {f.dns_assistance_mode === "manual" && (
           <ListInput
             {...bind("dns_assistance_servers")}
+            aria-label="Fallback DNS servers"
             placeholder="e.g. 192.168.1.1, 9.9.9.9"
             parse={words}
             format={(v) => v.join(", ")}
@@ -131,6 +132,7 @@ export function Advanced({
               2.4 GHz{" "}
               <Select
                 {...bind("minrate_ng_data_rate_kbps")}
+                aria-label="2.4 GHz minimum data rate"
                 fallback={1000}
                 options={rates(RATES_NG)}
               />
@@ -139,6 +141,7 @@ export function Advanced({
             {f.minrate_na_enabled === true && (
               <Select
                 {...bind("minrate_na_data_rate_kbps")}
+                aria-label="5 GHz minimum data rate"
                 fallback={6000}
                 options={rates(RATES_NA)}
               />
@@ -167,6 +170,7 @@ export function Advanced({
               {l}{" "}
               <NumberInput
                 {...bind(k)}
+                aria-label={`${l} DTIM period`}
                 fallback={1}
                 min={1}
                 max={255}
@@ -196,7 +200,14 @@ export function Advanced({
             ] as const
           ).map(([k, l]) => (
             <label key={k} className="small">
-              {l} <NumberInput {...bind(k)} fallback={5} min={1} max={60} />
+              {l}{" "}
+              <NumberInput
+                {...bind(k)}
+                aria-label={`SAE ${l}`}
+                fallback={5}
+                min={1}
+                max={60}
+              />
             </label>
           ))}
         </Row>

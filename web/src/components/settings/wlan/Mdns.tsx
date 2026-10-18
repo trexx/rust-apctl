@@ -76,6 +76,7 @@ function MdnsRules({
               <label className="small">
                 on{" "}
                 <Select
+                  aria-label={`Rule ${i + 1}: where`}
                   value={r.ap_scope_mode}
                   onChange={(v) =>
                     update(i, {
@@ -113,6 +114,7 @@ function MdnsRules({
               <label className="small">
                 pass{" "}
                 <Select
+                  aria-label={`Rule ${i + 1}: which services`}
                   value={r.services_mode}
                   onChange={(v) => update(i, { services_mode: v })}
                   options={[
@@ -142,6 +144,7 @@ function MdnsRules({
                     ))}
                   </div>
                   <ListInput
+                    aria-label={`Rule ${i + 1}: other services`}
                     rows={2}
                     placeholder="other services, one per line: _myapp._tcp.local My app"
                     value={r.custom_services}

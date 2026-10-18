@@ -121,6 +121,7 @@ function Schedule({
       </label>
       <div className="backup-row">
         <select
+          aria-label="How often"
           value={s.frequency}
           disabled={readOnly || !s.enabled}
           onChange={(e) =>
@@ -136,6 +137,7 @@ function Schedule({
         </select>
         {s.frequency === "weekly" && (
           <select
+            aria-label="Day of the week"
             value={s.weekday}
             disabled={readOnly || !s.enabled}
             onChange={(e) => setS({ ...s, weekday: Number(e.target.value) })}
@@ -149,6 +151,7 @@ function Schedule({
         )}
         {s.frequency === "monthly" && (
           <select
+            aria-label="Day of the month"
             value={s.monthday}
             disabled={readOnly || !s.enabled}
             onChange={(e) => setS({ ...s, monthday: Number(e.target.value) })}

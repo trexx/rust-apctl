@@ -90,6 +90,7 @@ export function RadioFields({
     <>
       <Row label="Channel">
         <Select
+          aria-label="Channel width"
           value={form.ht}
           onChange={(w) =>
             onChange(keepAllowed(r, { ...form, ht: w }, outdoor))
@@ -120,6 +121,7 @@ export function RadioFields({
           <label className="small">
             <NumberInput
               {...bind("tx_power")}
+              aria-label="Custom transmit power"
               fallback={lo}
               min={lo}
               max={hi}
@@ -134,6 +136,7 @@ export function RadioFields({
           <label className="small">
             <input
               type="range"
+              aria-label="Minimum signal"
               min={-90}
               max={-67}
               value={form.min_rssi}
@@ -161,6 +164,7 @@ export function RadioFields({
             <label className="small">
               <input
                 type="range"
+                aria-label="Sensitivity level"
                 min={-90}
                 max={-50}
                 value={form.sens_level}

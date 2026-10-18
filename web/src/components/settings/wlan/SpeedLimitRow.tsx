@@ -15,7 +15,11 @@ export function SpeedLimitRow({
   const current = typeof value === "string" && value !== def?.id ? value : "";
   return (
     <Row label="Speed limit" hint="per client on this SSID">
-      <select value={current} onChange={(e) => onChange(e.target.value)}>
+      <select
+        aria-label="Speed limit per client"
+        value={current}
+        onChange={(e) => onChange(e.target.value)}
+      >
         <option value="">No limit</option>
         {speedLimitOptions(groups)}
       </select>

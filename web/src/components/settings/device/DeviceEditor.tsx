@@ -125,6 +125,7 @@ export function DeviceEditor({
             brightness{" "}
             <input
               type="range"
+              aria-label="LED brightness"
               min={1}
               max={100}
               value={form.led_override_color_brightness}

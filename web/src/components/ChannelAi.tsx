@@ -163,6 +163,7 @@ export function ChannelAiPanel() {
               Enabled
             </label>
             <select
+              aria-label="Hour"
               value={s.hour}
               disabled={!can}
               onChange={(e) => save({ hour: Number(e.target.value) })}

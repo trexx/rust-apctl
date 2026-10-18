@@ -69,16 +69,25 @@ export function useSettingsForm<F extends object>(
 /** The ids of the enclosing `Row`'s label and hint, which name the controls in it. */
 const RowLabel = createContext<{ label?: string; hint?: string }>({});
 
-/** `aria-labelledby` / `aria-describedby` for a control: its `Row`'s label and hint. */
-const useRowLabel = () => {
+/**
+ * The name and description of a control in a `Row`: the row's label and hint.
+ * A control given its own `aria-label` (one of several in a row) is named by
+ * that instead, and still described by the hint.
+ */
+const useRowLabel = (own?: string) => {
   const { label, hint } = useContext(RowLabel);
-  return { "aria-labelledby": label, "aria-describedby": hint };
+  return {
+    "aria-label": own,
+    "aria-labelledby": own ? undefined : label,
+    "aria-describedby": hint,
+  };
 };
 
 /**
  * A labelled form row. Its label names the group, and the `Select`,
  * `NumberInput`, `ListInput` and `TextInput` in it (screen readers announce
- * it).
+ * it); where a row holds several of them, each but one gets its own
+ * `aria-label`.
  */
 export function Row({
   label,
@@ -151,14 +160,16 @@ export function Select<T extends string | number>({
   options,
   onChange,
   disabled,
+  "aria-label": label,
 }: {
   value: T | null | undefined;
   fallback?: T;
   options: readonly Option<T>[];
   onChange: (v: T) => void;
   disabled?: boolean;
+  "aria-label"?: string;
 }) {
-  const named = useRowLabel();
+  const named = useRowLabel(label);
   return (
     <select
       {...named}
@@ -190,6 +201,7 @@ export function NumberInput({
   max,
   onChange,
   disabled,
+  "aria-label": label,
 }: {
   value: number | null | undefined;
   fallback: number;
@@ -197,8 +209,9 @@ export function NumberInput({
   max: number;
   onChange: (v: number) => void;
   disabled?: boolean;
+  "aria-label"?: string;
 }) {
-  const named = useRowLabel();
+  const named = useRowLabel(label);
   const shown = value ?? fallback;
   const [text, setText] = useState(String(shown));
   const [last, setLast] = useState(shown);
@@ -242,13 +255,10 @@ export function TextInput({
   value: string | null | undefined;
   onChange: (v: string) => void;
 }) {
-  const named = useRowLabel();
+  const named = useRowLabel(props["aria-label"]);
   return (
     <input
-      aria-labelledby={
-        props["aria-label"] ? undefined : named["aria-labelledby"]
-      }
-      aria-describedby={named["aria-describedby"]}
+      {...named}
       className={className ?? "search"}
       {...props}
       value={value ?? ""}
@@ -322,6 +332,7 @@ export function ListInput<T>({
   onChange,
   rows,
   placeholder,
+  "aria-label": label,
 }: {
   value: T[] | null | undefined;
   parse: (text: string) => T[];
@@ -329,8 +340,9 @@ export function ListInput<T>({
   onChange: (v: T[]) => void;
   rows?: number;
   placeholder?: string;
+  "aria-label"?: string;
 }) {
-  const named = useRowLabel();
+  const named = useRowLabel(label);
   const [text, setText] = useState(() => format(value ?? []));
   const props = {
     ...named,

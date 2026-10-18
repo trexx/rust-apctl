@@ -96,6 +96,7 @@ function Finding({ f, readOnly }: { f: ThreatFinding; readOnly: boolean }) {
           >
             <input
               className="search"
+              aria-label="Why it's fine"
               autoFocus
               maxLength={200}
               placeholder="Why it's fine, e.g. “the neighbours' printer” (optional)"
