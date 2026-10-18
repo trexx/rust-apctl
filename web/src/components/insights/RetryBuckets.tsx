@@ -1,5 +1,5 @@
 import { useRetries } from "../../api";
-import { band as bandName, pct1 } from "../../format";
+import { band as bandName, pct1, retryTone } from "../../format";
 import { useTimeSpan } from "../Chart";
 import { BandInsight } from "./shared";
 
@@ -23,7 +23,7 @@ export function RetryBuckets() {
                 const inBucket = radios.filter(
                   (x) => x.tx_retry_pct >= min && x.tx_retry_pct < upper,
                 );
-                const tone = i === 0 ? "bad" : i === 1 ? "warn" : "good";
+                const tone = retryTone(min) || "good";
                 const tip = inBucket
                   .map(
                     (x) =>

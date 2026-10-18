@@ -161,6 +161,16 @@ export function signalClass(dbm: number | null | undefined): "good" | "fair" | "
   return "poor";
 }
 
+/**
+ * TX retry shares (%) as the official dashboard colours its retry buckets: at
+ * least `bad` is bad, at least `warn` needs attention, below it is fine.
+ */
+export const RETRY = { warn: 20, bad: 25 } as const;
+
+/** A TX retry share's tone: "bad", "warn", or "" (fine or unknown). */
+export const retryTone = (pct: number | null | undefined): "bad" | "warn" | "" =>
+  pct === null || pct === undefined ? "" : pct >= RETRY.bad ? "bad" : pct >= RETRY.warn ? "warn" : "";
+
 /** "−75 dBm", with a real minus sign. */
 export const dbm = (v: number) => `${v < 0 ? "−" : ""}${Math.abs(v)} dBm`;
 

@@ -2,7 +2,14 @@ import { useState } from "react";
 import { Link } from "react-router";
 import { useChannelPlan, useNeighbors, useRadios } from "../api";
 import type { Neighbor, RadioOverview } from "../api";
-import { ago, band as bandName, bytes, pct1, useNow } from "../format";
+import {
+  ago,
+  band as bandName,
+  bytes,
+  pct1,
+  retryTone,
+  useNow,
+} from "../format";
 import { ApSpacing } from "../components/insights/ApSpacing";
 import { DeploymentDensity } from "../components/insights/DeploymentDensity";
 import { BandPicker } from "../components/insights/shared";
@@ -300,13 +307,7 @@ function RadioTable({ radios }: { radios: RadioOverview[] }) {
                     ? "—"
                     : `${r.avg_interference.toFixed(0)}%`}
                 </td>
-                <td
-                  className={
-                    r.tx_retry_pct !== null && r.tx_retry_pct >= 15
-                      ? "warn"
-                      : ""
-                  }
-                >
+                <td className={retryTone(r.tx_retry_pct)}>
                   {pct1(r.tx_retry_pct)}
                 </td>
                 <td className="nowrap">
