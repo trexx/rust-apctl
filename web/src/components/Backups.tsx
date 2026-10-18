@@ -40,14 +40,38 @@ const KIND: Record<BackupMeta["kind"], string> = {
   "pre-restore": "Before a restore",
 };
 
-/** Minutes after midnight UTC <-> "HH:MM" in this browser's time zone. */
+/**
+ * apctl keeps the schedule in UTC: the time in minutes after midnight, and the
+ * weekly backup's day (Monday = 0) and the monthly one's date as UTC days. The
+ * form shows the time and the weekday in this browser's time zone, at today's
+ * offset: where the local and the UTC date differ at that time (01:00 local at
+ * UTC+2 is 23:00 UTC the day before), the weekday moves with it. A date can't
+ * move the same way (day 1 would become the last day of the month before), so
+ * the monthly date stays a UTC one and is shown as such.
+ */
 const offsetMin = () => -new Date().getTimezoneOffset();
-const toLocal = (utcMin: number) =>
-  hhmm((((utcMin + offsetMin()) % 1440) + 1440) % 1440);
-const fromLocal = (text: string) => {
-  const [h = 0, m = 0] = text.split(":").map(Number);
-  return (((h * 60 + m - offsetMin()) % 1440) + 1440) % 1440;
+const mod = (n: number, m: number) => ((n % m) + m) % m;
+/** `minute` moved by `by` minutes: the minute of its day, and how many days it moved. */
+const shift = (minute: number, by: number) => ({
+  minute: mod(minute + by, 1440),
+  days: Math.floor((minute + by) / 1440),
+});
+const toLocal = (s: BackupSettings) => {
+  const t = shift(s.minute_utc, offsetMin());
+  return { time: hhmm(t.minute), weekday: mod(s.weekday + t.days, 7) };
 };
+const fromLocal = (time: string, weekday: number) => {
+  const [h = 0, m = 0] = time.split(":").map(Number);
+  const t = shift(h * 60 + m, -offsetMin());
+  return { minute_utc: t.minute, weekday: mod(weekday + t.days, 7) };
+};
+/** The schedule as apctl keeps it, in UTC. */
+const utcText = (s: BackupSettings) =>
+  s.frequency === "weekly"
+    ? `${WEEKDAYS[s.weekday]} ${hhmm(s.minute_utc)} UTC`
+    : s.frequency === "monthly"
+      ? `day ${s.monthday}, ${hhmm(s.minute_utc)} UTC`
+      : `${hhmm(s.minute_utc)} UTC`;
 
 /**
  * Which apctl process answers: when it started, "signed out" when it no
@@ -115,6 +139,7 @@ function Schedule({
   const { msg, run } = useRunner([keys.backups()]);
   const dirty = JSON.stringify(s) !== JSON.stringify(initial);
   const save = () => void run(() => saveBackupSettings(s), "Saved.");
+  const local = toLocal(s);
   return (
     <div className="backup-form">
       <Toggle
@@ -142,9 +167,11 @@ function Schedule({
         {s.frequency === "weekly" && (
           <select
             aria-label="Day of the week"
-            value={s.weekday}
+            value={local.weekday}
             disabled={readOnly || !s.enabled}
-            onChange={(e) => setS({ ...s, weekday: Number(e.target.value) })}
+            onChange={(e) =>
+              setS({ ...s, ...fromLocal(local.time, Number(e.target.value)) })
+            }
           >
             {WEEKDAYS.map((d, i) => (
               <option key={d} value={i}>
@@ -155,7 +182,7 @@ function Schedule({
         )}
         {s.frequency === "monthly" && (
           <select
-            aria-label="Day of the month"
+            aria-label="Day of the month (UTC)"
             value={s.monthday}
             disabled={readOnly || !s.enabled}
             onChange={(e) => setS({ ...s, monthday: Number(e.target.value) })}
@@ -170,12 +197,17 @@ function Schedule({
         <label className="small">
           at{" "}
           <TimeInput
-            value={toLocal(s.minute_utc)}
+            value={local.time}
             disabled={readOnly || !s.enabled}
-            onChange={(t) => setS({ ...s, minute_utc: fromLocal(t) })}
+            onChange={(t) => setS({ ...s, ...fromLocal(t, local.weekday) })}
           />
         </label>
-        <span className="muted small">({hhmm(s.minute_utc)} UTC)</span>
+        <span
+          className="muted small"
+          title="apctl keeps the schedule in UTC, so its local time moves by an hour when daylight saving time starts or ends."
+        >
+          ({utcText(s)})
+        </span>
       </div>
       <div className="backup-row">
         <label className="small">
