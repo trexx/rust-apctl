@@ -194,7 +194,12 @@ pub async fn locate(State(s): State<AppState>, MacPath(mac): MacPath, Json(b): J
 /// POST /api/devices/{mac}/provision: send the AP its config again.
 pub async fn provision(State(s): State<AppState>, MacPath(mac): MacPath) -> Result<Json<Value>, ApiError> {
     let mac = target_ap(&s, mac)?;
-    s.live.write().unwrap().reprovision.insert(mac);
+    {
+        let mut live = s.live.write().unwrap();
+        live.reprovision.insert(mac);
+        // As for a queued command: the AP is asked to inform now.
+        crate::stun::poke(&live, &mac);
+    }
     s.note(Event::device(clock::now_ts(), EventKind::ApProvisionRequested, mac, json!({}))).await;
     Ok(Json(json!({ "queued": true })))
 }

@@ -421,8 +421,9 @@ pub async fn forget(State(s): State<AppState>, MacPath(mac): MacPath) -> Result<
     };
     if online {
         // Removed when it reports (and is told to reset), or after the timeout.
-        s.live.write().unwrap().adoption.forgetting.insert(mac, clock::now_ts());
-        crate::stun::poke(&s.live.read().unwrap(), &mac);
+        let mut live = s.live.write().unwrap();
+        live.adoption.forgetting.insert(mac, clock::now_ts());
+        crate::stun::poke(&live, &mac);
         return Ok(Json(json!({ "forgetting": true })));
     }
     finish_forget(&s.engine, mac, false).await;
