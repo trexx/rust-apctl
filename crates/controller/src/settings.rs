@@ -759,10 +759,38 @@ fn check_mdns_rules(state: &Value, v: &Value) -> Result<Vec<Value>, String> {
     Ok(out)
 }
 
+/// A count the settings have over its limit: what is counted (an AP's band,
+/// the broadcast-filter addresses, the MAC filters sharing an AP group), how
+/// many, and the error that says so.
+struct Over {
+    what: String,
+    count: usize,
+    err: String,
+}
+
+/// Every count the settings have over its limit ([`wlan_limits`], [`list_limits`]).
+fn over_limits(state: &Value) -> Vec<Over> {
+    let mut out = wlan_limits(state);
+    out.extend(list_limits(state));
+    out
+}
+
+/// Refuses settings with a count over its limit that `before` (the
+/// [`over_limits`] before the edit) did not have that high: an edit may not
+/// go over a limit, but settings imported over one can still be edited
+/// otherwise, and brought back under it a step at a time.
+fn check_limits(before: &[Over], state: &Value) -> Result<(), String> {
+    match over_limits(state).into_iter().find(|o| !before.iter().any(|b| b.what == o.what && b.count >= o.count)) {
+        Some(o) => Err(o.err),
+        None => Ok(()),
+    }
+}
+
 /// The official limit of SSIDs per radio band on an AP: 4 when wireless
 /// meshing is on (the radios keep slots for it), else 8 (7 with element
-/// adoption). Disabled SSIDs count too.
-fn check_wlan_limits(state: &Value) -> Result<(), String> {
+/// adoption). Disabled SSIDs count too. Returns the radios over it.
+fn wlan_limits(state: &Value) -> Vec<Over> {
+    let mut out = Vec::new();
     let setting_on = |key: &str, default: bool| setting(state, key)["enabled"].as_bool().unwrap_or(default);
     let (meshing, element_adopt) = (setting_on("connectivity", true), setting_on("element_adopt", false));
     // Each SSID's bands and the APs it goes to, worked out once.
@@ -785,11 +813,11 @@ fn check_wlan_limits(state: &Value) -> Result<(), String> {
             };
             let count = wlans.iter().filter(|(bands, aps)| bands.contains(&wb) && aps.contains(&mac)).count();
             if count > limit {
-                return Err(format!("{name} would have {count} SSIDs on its {} radio; it supports {limit}", band_name(band)));
+                out.push(Over { what: format!("{mac} {band}"), count, err: format!("{name} would have {count} SSIDs on its {} radio; it supports {limit}", band_name(band)) });
             }
         }
     }
-    Ok(())
+    out
 }
 
 /// What Force Wi-Fi 4 (`enhanced_iot`) holds an SSID to, with each field's
@@ -852,6 +880,12 @@ pub struct WlanEdit {
 /// Applies an edit to one SSID, with the official controller's rules for each
 /// field and the fields it derives on save.
 pub fn apply_wlan(state: &mut Value, e: &WlanEdit) -> Result<String, String> {
+    let over = over_limits(state);
+    edit_wlan(state, e, &over)
+}
+
+/// [`apply_wlan`], with the counts over their limits before the edit (see [`check_limits`]).
+fn edit_wlan(state: &mut Value, e: &WlanEdit, over: &[Over]) -> Result<String, String> {
     let (id, p) = (e.id.as_str(), &e.patch);
     let before = find_wlan(state, id).ok_or("unknown SSID")?.clone();
     if before["attr_no_edit"].as_bool() == Some(true) {
@@ -938,8 +972,7 @@ pub fn apply_wlan(state: &mut Value, e: &WlanEdit) -> Result<String, String> {
     }
     // A group can go with a change of APs or of the mDNS rules.
     prune_groups(state);
-    check_wlan_limits(state)?;
-    check_list_limits(state)?;
+    check_limits(over, state)?;
     let channels = apply_channel_locks(state, &locked_aps_before);
 
     let after = wlan(state, id).ok_or("unknown SSID")?;
@@ -1299,12 +1332,13 @@ pub fn default_usergroup(state: &Value) -> Option<String> {
 }
 
 /// Site-wide list limits: 256 broadcast-filter addresses in all, 512 MAC-filter
-/// addresses over the SSIDs sharing an AP group.
-fn check_list_limits(state: &Value) -> Result<(), String> {
+/// addresses over the SSIDs sharing an AP group. Returns the lists over them.
+fn list_limits(state: &Value) -> Vec<Over> {
+    let mut out = Vec::new();
     let len = |w: &Value, k: &str| w[k].as_array().map_or(0, Vec::len);
     let bc: usize = docs(state, "wlanconf").filter(|w| w["bc_filter_enabled"].as_bool() == Some(true)).map(|w| len(w, "bc_filter_list")).sum();
     if bc > 256 {
-        return Err(format!("{bc} broadcast-filter addresses in all; the limit is 256"));
+        out.push(Over { what: "bcfilter".into(), count: bc, err: format!("{bc} broadcast-filter addresses in all; the limit is 256") });
     }
     // As the official controller counts: the SSIDs sharing an AP group with
     // one (the default group counts as a group like any other).
@@ -1315,10 +1349,10 @@ fn check_list_limits(state: &Value) -> Result<(), String> {
     for (g, _) in &wlans {
         let total: usize = wlans.iter().filter(|(o, _)| o.iter().any(|x| g.contains(x))).map(|(_, n)| n).sum();
         if total > 512 {
-            return Err(format!("{total} MAC-filter addresses on SSIDs sharing an AP group; the limit is 512"));
+            out.push(Over { what: format!("macfilter {}", g.join(",")), count: total, err: format!("{total} MAC-filter addresses on SSIDs sharing an AP group; the limit is 512") });
         }
     }
-    Ok(())
+    out
 }
 
 /// Creates an SSID (`patch` holds at least a name and, unless open, a
@@ -1326,6 +1360,8 @@ fn check_list_limits(state: &Value) -> Result<(), String> {
 /// A refused SSID leaves `state` half-changed: callers work on a copy (the
 /// preview's, or the engine's, which is dropped on an error).
 pub fn create_wlan(state: &mut Value, patch: &Value) -> Result<String, String> {
+    // Counted before the new SSID is there: it adds to every count it is in.
+    let over = over_limits(state);
     let site = site_id(state).ok_or("the settings have no APs")?.to_string();
     let all = default_group(state).ok_or("the settings have no default AP group")?;
     let network = docs(state, "networkconf").find(|n| n["attr_hidden_id"].as_str() == Some("LAN")).or_else(|| docs(state, "networkconf").next()).and_then(id_of);
@@ -1358,7 +1394,7 @@ pub fn create_wlan(state: &mut Value, patch: &Value) -> Result<String, String> {
     }
     let name = patch["name"].as_str().unwrap_or_default().trim().to_string();
     array_mut(state, "wlanconf").push(doc);
-    apply_wlan(state, &WlanEdit { id, patch })?;
+    edit_wlan(state, &WlanEdit { id, patch }, &over)?;
     Ok(format!("added SSID \"{name}\""))
 }
 
@@ -1900,6 +1936,29 @@ mod tests {
     }
 
     #[test]
+    fn settings_over_a_limit_can_still_be_edited() {
+        let mut s = state();
+        for i in 0..7 {
+            create_wlan(&mut s, &json!({ "name": format!("N{i}"), "passphrase": "password1" })).unwrap();
+        }
+        // A ninth SSID, as an import may have it: every radio is over its limit of 8.
+        let mut ninth = s["wlanconf"][1].clone();
+        (ninth["_id"], ninth["name"]) = (json!("w9"), json!("N9"));
+        s["wlanconf"].as_array_mut().unwrap().push(ninth);
+        edit(&mut s, json!({ "name": "Home again" })).unwrap();
+        assert!(create_wlan(&mut s.clone(), &json!({ "name": "N10", "passphrase": "password1" })).unwrap_err().contains("would have 10"));
+        // Back under the limit on 2.4 GHz (5 GHz stays at 9), then over it again: refused.
+        edit(&mut s, json!({ "wlan_bands": ["5g"] })).unwrap();
+        assert!(edit(&mut s, json!({ "wlan_bands": ["2g", "5g"] })).unwrap_err().contains("9 SSIDs on its 2.4 GHz radio"));
+        // The same for the list limits.
+        let list: Vec<String> = (0..300).map(|i| format!("02:00:00:00:{:02x}:{:02x}", i / 256, i % 256)).collect();
+        (s["wlanconf"][1]["bc_filter_enabled"], s["wlanconf"][1]["bc_filter_list"]) = (json!(true), json!(list));
+        edit(&mut s, json!({ "hide_ssid": true })).unwrap();
+        let more = json!({ "multicast_suppressor_mode": "aggressive", "bc_filter_list": ["02:00:00:00:ff:01"] });
+        assert!(edit(&mut s, more).unwrap_err().contains("301 broadcast-filter"));
+    }
+
+    #[test]
     fn new_ssids_get_defaults_and_deleting_cleans_up() {
         let mut s = state();
         // A refused SSID leaves its copy of the settings half-changed (the callers drop it).
@@ -2057,14 +2116,15 @@ mod tests {
             "setting": [{ "key": "connectivity", "enabled": false }],
             "wlanconf": (0..8).map(|i| wlan(i, json!(["2g", "5g"]), json!(["all"]))).collect::<Vec<_>>(),
         });
-        assert!(check_wlan_limits(&s).is_ok(), "eight per radio");
+        let check = |s: &Value| check_limits(&[], s);
+        assert!(check(&s).is_ok(), "eight per radio");
         // A ninth on 5 GHz for the second AP only: the first is still fine.
         s["wlanconf"].as_array_mut().unwrap().push(wlan(8, json!(["5g"]), json!(["one"])));
-        assert!(check_wlan_limits(&s).unwrap_err().starts_with(&format!("{AP2} would have 9 SSIDs on its 5 GHz radio")));
+        assert!(check(&s).unwrap_err().starts_with(&format!("{AP2} would have 9 SSIDs on its 5 GHz radio")));
         // Wireless meshing on: four per radio.
         s["wlanconf"].as_array_mut().unwrap().truncate(5);
         s["setting"][0]["enabled"] = json!(true);
-        assert_eq!(check_wlan_limits(&s).unwrap_err(), "Hall would have 5 SSIDs on its 2.4 GHz radio; it supports 4");
+        assert_eq!(check(&s).unwrap_err(), "Hall would have 5 SSIDs on its 2.4 GHz radio; it supports 4");
     }
 
     #[test]
@@ -2072,9 +2132,9 @@ mod tests {
         let list = |n: usize| (0..n).map(|i| format!("02:00:00:00:{:02x}:{:02x}", i / 256, i % 256)).collect::<Vec<_>>();
         let wlan = |groups: &[&str], n: usize| json!({ "mac_filter_enabled": true, "ap_group_ids": groups, "mac_filter_list": list(n) });
         let s = json!({ "wlanconf": [wlan(&["a", "b"], 300), wlan(&["b"], 300)] });
-        assert!(check_list_limits(&s).unwrap_err().contains("600 MAC-filter"));
+        assert!(check_limits(&[], &s).unwrap_err().contains("600 MAC-filter"));
         let s = json!({ "wlanconf": [wlan(&["a"], 300), wlan(&["c"], 300), wlan(&["c"], 212)] });
-        check_list_limits(&s).unwrap();
+        check_limits(&[], &s).unwrap();
     }
 
     #[test]
