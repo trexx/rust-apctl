@@ -897,11 +897,15 @@ impl Engine {
             _ => None,
         };
 
+        // As in `inform`: the write lock is held for the swap alone, and the old
+        // push is dropped and the events emitted after it.
         let mut live = self.live.write().unwrap();
         if let Some(d) = live.devices.get_mut(&mac) {
             d.last_config_push = Some(ts);
         }
-        live.last_config.insert(mac, Arc::new(PushedConfig { mgmt_cfg: mgmt, system_cfg: system, cfgversion }));
+        let old_config = live.last_config.insert(mac, Arc::new(PushedConfig { mgmt_cfg: mgmt, system_cfg: system, cfgversion }));
+        drop(live);
+        drop((old_config, previous));
         self.emit(Event::device(ts, EventKind::ConfigPushed, mac, Value::Object(data)));
         if let Some(summary) = dry {
             self.emit(Event::device(ts, EventKind::DryrunCompared, mac, summary));
