@@ -598,7 +598,7 @@ impl Watcher {
     /// An event as it happens: a one-off alert, if it deserves one.
     fn event(&mut self, now: Ts, e: &Event) {
         // Only events that may make an alert get here (see `alertable`).
-        let name = |m: Mac| crate::series::ap_name(&self.live.read().unwrap(), &m.to_string()).unwrap_or_else(|| m.to_string());
+        let name = |m: Mac| crate::series::ap_name_of(&self.live.read().unwrap(), &m).unwrap_or_else(|| m.to_string());
         if let Some(a) = from_event(e.kind, e.device_mac, &e.data, &name) {
             self.book.raise(now, a.resolved(now));
         }
@@ -670,6 +670,12 @@ impl Watcher {
         }
     }
 
+    /// Whether a health alert may be raised: not open, nor cleared within the
+    /// cooldown (a clear "in the future", after the clock stepped back, is not).
+    fn may_raise(&self, k: &OpenKey, now: Ts) -> bool {
+        !self.book.open.contains_key(k) && self.cleared.get(k).is_none_or(|t| !(0..HEALTH_COOLDOWN).contains(&(now - t)))
+    }
+
     /// Raises or clears each threshold of each online AP's radios, and closes
     /// the alerts of radios no longer judged.
     fn judge_radios(&mut self, now: Ts, radios: HashMap<(Mac, String), RadioHealth>, online: &HashSet<Mac>, known: &HashSet<Mac>) {
@@ -688,8 +694,8 @@ impl Watcher {
                     }
                     continue;
                 };
-                if v >= raise_at && !self.book.open.contains_key(&k) && self.cleared.get(&k).is_none_or(|t| !(0..HEALTH_COOLDOWN).contains(&(now - t))) {
-                    let name = crate::series::ap_name(&self.live.read().unwrap(), &mac.to_string()).unwrap_or_else(|| mac.to_string());
+                if v >= raise_at && self.may_raise(&k, now) {
+                    let name = crate::series::ap_name_of(&self.live.read().unwrap(), &mac).unwrap_or_else(|| mac.to_string());
                     let title = format!("High {what} on {name} {}", band_name(&radio));
                     let message = format!("{what} has averaged {v:.0}% over the last 15 minutes (alert at {raise_at:.0}%).");
                     let tag = format!("health:{}:{}", key.as_str(), k.1);
@@ -711,7 +717,7 @@ impl Watcher {
     /// attempt in the window; clears it when none did.
     fn judge_connections(&mut self, now: Ts, failing: usize) {
         let k = (Key::ConnectFailures, Entity::Site);
-        if failing >= 3 && !self.book.open.contains_key(&k) && self.cleared.get(&k).is_none_or(|t| !(0..HEALTH_COOLDOWN).contains(&(now - t))) {
+        if failing >= 3 && self.may_raise(&k, now) {
             let message = "Every connection attempt these clients made in the last 15 minutes failed.".into();
             let a = Alert::new(Key::ConnectFailures, Category::Health, Severity::Medium, Entity::Site, format!("{failing} clients can't connect"), message);
             self.book.open(now, a.link("/clients?tab=attempts").tagged("health:connect_failures"));
