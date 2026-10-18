@@ -20,6 +20,7 @@ import {
   Signal,
   Stat,
   THead,
+  TextField,
   useRunner,
 } from "../components/common";
 import {
@@ -284,21 +285,19 @@ function AliasHeader(p: {
           });
         }}
       >
-        <input
+        <TextField
           autoFocus
-          className="search"
           maxLength={64}
           placeholder={p.hostname ?? "Name for this device"}
           value={alias}
-          onChange={(e) => setAliasText(e.target.value)}
+          onChange={setAliasText}
           aria-label="Alias"
         />
-        <input
-          className="search"
+        <TextField
           maxLength={500}
           placeholder="Note (optional)"
           value={note}
-          onChange={(e) => setNote(e.target.value)}
+          onChange={setNote}
           aria-label="Note"
         />
         <button type="submit" className="btn primary" disabled={busy}>

@@ -5,6 +5,7 @@ import {
   ApSelect,
   LogList,
   QueryState,
+  TextField,
   useSetParams,
 } from "../components/common";
 
@@ -56,12 +57,11 @@ export function Logs() {
         </span>
         <span className="spacer" />
         <ApSelect value={device} onChange={setDevice} />
-        <input
-          className="search"
+        <TextField
           aria-label="Search log text"
           placeholder="Search log text (all words must match)"
           value={text}
-          onChange={(e) => setText(e.target.value)}
+          onChange={setText}
         />
       </div>
       <div className={logs.isPlaceholderData ? "panel dim" : "panel"}>

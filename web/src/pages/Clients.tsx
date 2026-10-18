@@ -8,6 +8,7 @@ import {
   QueryNote,
   Segmented,
   Signal,
+  TextField,
   Toggle,
   useUrlTab,
 } from "../components/common";
@@ -164,12 +165,11 @@ function ClientList({ tabs }: { tabs: React.ReactNode }) {
           onChange={setShowGone}
           label="include disconnected"
         />
-        <input
-          className="search"
+        <TextField
           aria-label="Filter clients"
           placeholder="Filter by name, note, MAC, IP, SSID or AP"
           value={filter}
-          onChange={(e) => setFilter(e.target.value)}
+          onChange={setFilter}
         />
       </div>
       <div className="panel">

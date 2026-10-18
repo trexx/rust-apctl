@@ -3,7 +3,7 @@ import { Link } from "react-router";
 import { ackThreat, keys, useCanEdit, useThreats } from "../api";
 import type { ThreatFinding } from "../api";
 import { ago, band, duration, useNow } from "../format";
-import { ErrorNote, QueryNote, Signal, useRunner } from "./common";
+import { ErrorNote, QueryNote, Signal, TextField, useRunner } from "./common";
 import { KIND_LABEL } from "./Threats";
 
 const SEVERITY_LABEL = { high: "High", medium: "Medium", low: "Low" };
@@ -87,14 +87,13 @@ function Finding({ f, readOnly }: { f: ThreatFinding; readOnly: boolean }) {
               ack(true, note);
             }}
           >
-            <input
-              className="search"
+            <TextField
               aria-label="Why it's fine"
               autoFocus
               maxLength={200}
               placeholder="Why it's fine, e.g. “the neighbours' printer” (optional)"
               value={note}
-              onChange={(e) => setNote(e.target.value)}
+              onChange={setNote}
             />
             <button className="btn small primary" type="submit" disabled={busy}>
               Dismiss

@@ -26,6 +26,7 @@ import {
   Segmented,
   Signal,
   THead,
+  TextField,
   Toggle,
   useUrlTab,
 } from "../components/common";
@@ -434,12 +435,11 @@ function Environment() {
           <b>Neighbouring networks</b>
           <span className="muted small">{list.length} seen</span>
           <span className="spacer" />
-          <input
-            className="search"
+          <TextField
             aria-label="Filter neighbouring networks"
             placeholder="Filter by name, BSSID, vendor…"
             value={q}
-            onChange={(e) => setQ(e.target.value)}
+            onChange={setQ}
           />
         </div>
         <QueryState q={n}>
