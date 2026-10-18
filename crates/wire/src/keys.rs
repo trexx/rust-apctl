@@ -14,6 +14,8 @@ pub struct KeyStore {
     keys: HashMap<Mac, [u8; 16]>,
     /// AES-256 keys for encrypted remote syslog, from the devices' `syslog_key`.
     syslog: HashMap<Mac, [u8; 32]>,
+    /// Why entries were left out when loading, for the caller to report.
+    skipped: Vec<String>,
 }
 
 impl KeyStore {
@@ -24,13 +26,14 @@ impl KeyStore {
     }
 
     /// The keys in a MAC->key map or an import snapshot. An entry that cannot be read
-    /// (a malformed MAC or key) is reported on stderr and left out: one bad device
-    /// does not cost the keys of the others.
+    /// (a malformed MAC or key) is left out and listed in [`skipped`](Self::skipped):
+    /// one bad device does not cost the keys of the others.
     pub fn from_value(json: &Value) -> Self {
         let mut store = KeyStore::default();
-        let add = |what: &str, r: Result<()>| {
+        let mut skipped = Vec::new();
+        let mut add = |what: &str, r: Result<()>| {
             if let Err(e) = r {
-                eprintln!("warning: skipping {what}: {e:#}");
+                skipped.push(format!("skipping {what}: {e:#}"));
             }
         };
         if let Some(devices) = json.get("devices").and_then(Value::as_array) {
@@ -49,7 +52,13 @@ impl KeyStore {
                 }
             }
         }
+        store.skipped = skipped;
         store
+    }
+
+    /// The entries loading left out, and why.
+    pub fn skipped(&self) -> &[String] {
+        &self.skipped
     }
 
     pub fn insert(&mut self, mac: &str, key: &str) -> Result<()> {
@@ -103,7 +112,7 @@ mod tests {
             { "mac": "00:11:22:33:44:66", "x_authkey": "short", "syslog_key": "07".repeat(32) },
         ]});
         let keys = KeyStore::from_value(&snapshot);
-        assert_eq!((keys.len(), keys.syslog_len()), (1, 1));
+        assert_eq!((keys.len(), keys.syslog_len(), keys.skipped().len()), (1, 1, 3));
         let keys = KeyStore::from_value(&json!({ "00:11:22:33:44:55": good, "00:11:22:33:44:66": 7 }));
         assert_eq!(keys.len(), 1);
     }

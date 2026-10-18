@@ -16,6 +16,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::net::{Ipv4Addr, Ipv6Addr};
 use std::path::Path;
+use std::sync::LazyLock;
 
 use aho_corasick::AhoCorasick;
 use anyhow::{Context, Result, bail};
@@ -128,6 +129,29 @@ fn stands_alone(text: &[u8], a: usize, b: usize, word: impl Fn(u8) -> bool) -> b
     !text[..a].last().is_some_and(|&c| word(c)) && !text.get(b).is_some_and(|&c| word(c))
 }
 
+/// A field's names, lowercased, as the allow-lists and `--keep` know it.
+struct Names {
+    key: String,
+    /// A config key's last word that is not a number; a JSON key itself.
+    last: String,
+    /// A config key with its numbers as `n`; a JSON key with its parent (`radio_table.name`).
+    at: String,
+}
+
+impl Names {
+    /// `key` is a JSON key inside the object or array under `parent`, or a dotted config key.
+    fn new(parent: &str, key: &str) -> Self {
+        let k = key.to_ascii_lowercase();
+        let number = |w: &str| w.bytes().all(|b| b.is_ascii_digit());
+        let (last, at) = if k.contains('.') {
+            (k.rsplit('.').find(|w| !number(w)).unwrap_or(&k).to_string(), k.split('.').map(|w| if number(w) { "n" } else { w }).collect::<Vec<_>>().join("."))
+        } else {
+            (k.clone(), if parent.is_empty() { k.clone() } else { format!("{}.{k}", parent.to_ascii_lowercase()) })
+        };
+        Names { key: k, last, at }
+    }
+}
+
 /// Fields (JSON keys, or the last word of a config key) whose values pass: settings,
 /// states, modes, versions, interface and model names. Identifiers inside them are
 /// still rewritten.
@@ -207,6 +231,11 @@ const TEXT: &[&str] = &[
     "portal_customized_authentication_text", "portal_customized_button_text", "portal_customized_success_text", "portal_customized_title",
     "portal_customized_welcome_text",
 ];
+
+/// [`PASS`], [`PASS_AT`] and [`TEXT`] as sets: every field of every file is looked up in them.
+static PASS_SET: LazyLock<HashSet<&str>> = LazyLock::new(|| PASS.iter().copied().collect());
+static PASS_AT_SET: LazyLock<HashSet<&str>> = LazyLock::new(|| PASS_AT.iter().copied().collect());
+static TEXT_SET: LazyLock<HashSet<&str>> = LazyLock::new(|| TEXT.iter().copied().collect());
 
 const KEEP_MACS: [&str; 2] = ["ff:ff:ff:ff:ff:ff", "00:00:00:00:00:00"];
 
@@ -429,29 +458,20 @@ impl Sanitizer {
         if value.is_empty() {
             return String::new();
         }
-        let k = key.to_ascii_lowercase();
-        // A config key's last word that is not a number, and the whole key with its
-        // numbers as `n`; a JSON key with its parent.
-        let (last, at) = if k.contains('.') {
-            let last = k.rsplit('.').find(|w| !w.bytes().all(|b| b.is_ascii_digit())).unwrap_or(&k).to_string();
-            let at = k.split('.').map(|w| if w.bytes().all(|b| b.is_ascii_digit()) { "n" } else { w }).collect::<Vec<_>>().join(".");
-            (last, at)
-        } else {
-            (k.clone(), if parent.is_empty() { k.clone() } else { format!("{}.{k}", parent.to_ascii_lowercase()) })
-        };
-        let kept = self.keep.contains(&last) || self.keep.contains(&at);
+        let names = Names::new(parent, key);
+        let kept = self.kept_field(&names);
+        let secret = self.is_secret_field(&names, under_secret);
+        let Names { key: k, last, at } = names;
         if at == "sshd.auth.key.n.value" || at == "x_ssh_keys.key" {
             // The administrator's SSH public keys.
             self.fakes.get(Kind::SshKey, value, |n| format!("ssh-ed25519 AAAAfake{n}"))
-        } else if is_secret_key(&k)
-            // Everything under a secret key, apart from what a field of its own passes.
-            || (under_secret && !PASS_AT.contains(&at.as_str()) && !kept)
+        } else if secret
             // The device SSH account name (stored as x_ssh_username in the controller).
             || (k.starts_with("users.") && last == "name")
             || (k.starts_with("cron.") && last == "user")
         {
             self.fakes.get(Kind::Secret, value, |n| format!("secret-{n}"))
-        } else if matches!(last.as_str(), "serial" | "serialno" | "serial_no") && self.mac_bare.is_match(value) && value.len() == 12 {
+        } else if matches!(last.as_str(), "serial" | "serialno" | "serial_no") && is_bare_mac(value) {
             // Serial numbers are the device's MAC without colons, including those
             // of neighbouring APs in scan results: their real BSSIDs follow from them.
             self.fakes.any_mac(value)
@@ -476,19 +496,37 @@ impl Sanitizer {
         } else if kept {
             self.remember_kept(value);
             self.scrub(value)
-        } else if PASS.contains(&last.as_str()) || PASS_AT.contains(&at.as_str()) {
+        } else if PASS_SET.contains(last.as_str()) || PASS_AT_SET.contains(at.as_str()) {
             self.remember_kept(value);
             let value = self.url_hosts(value);
             self.scrub(&value)
-        } else if !TEXT.contains(&last.as_str()) && (self.is_plain(value) || self.kept.contains(&value.to_lowercase())) {
+        } else if !TEXT_SET.contains(last.as_str()) && (self.is_plain(value) || self.kept.contains(&value.to_lowercase())) {
             self.scrub(value)
         } else {
-            if !TEXT.contains(&last.as_str()) {
+            if !TEXT_SET.contains(last.as_str()) {
                 self.unlisted.insert(at.clone());
             }
             self.text_fields.entry(value.to_string()).or_insert(at);
             self.fakes.get(Kind::Text, value, |n| format!("text-{n}"))
         }
+    }
+
+    /// Whether `--keep` names a field.
+    fn kept_field(&self, names: &Names) -> bool {
+        self.keep.contains(&names.last) || self.keep.contains(&names.at)
+    }
+
+    /// Whether a field's value is a secret: its key is one, or a key above it is
+    /// (`under_secret`) and neither a field of its own ([`PASS_AT`]) nor `--keep` passes it.
+    fn is_secret_field(&self, names: &Names, under_secret: bool) -> bool {
+        is_secret_key(&names.key) || (under_secret && !PASS_AT_SET.contains(names.at.as_str()) && !self.kept_field(names))
+    }
+
+    /// Whether a number is a secret (a PIN, a numeric passphrase) where a string would
+    /// be one, unless it is a numeric setting that only looks secret.
+    fn is_secret_number(&self, parent: &str, key: &str, under_secret: bool) -> bool {
+        let names = Names::new(parent, key);
+        !SECRET_LOOKING_NUMBERS.contains(&names.last.as_str()) && self.is_secret_field(&names, under_secret)
     }
 
     /// Remembers a value an allow-listed field passed, if it is a short identifier-like
@@ -506,15 +544,18 @@ impl Sanitizer {
         let mut out = String::with_capacity(value.len());
         let mut rest = value;
         while let Some(i) = rest.find("://") {
-            let (head, tail) = rest.split_at(i + 3);
+            let (head, mut tail) = rest.split_at(i + 3);
             out.push_str(head);
-            let end = tail.find(|c: char| matches!(c, '/' | '?' | '#' | '"' | '\'') || c.is_whitespace()).unwrap_or(tail.len());
-            let (mut authority, after) = tail.split_at(end);
-            if let Some((userinfo, host)) = authority.rsplit_once('@') {
+            // Credentials run to the last `@` before the path; the host and port end at
+            // the first character no host name holds (a comma between two URLs, say).
+            let path = tail.find(|c: char| matches!(c, '/' | '?' | '#' | '"' | '\'') || c.is_whitespace()).unwrap_or(tail.len());
+            if let Some((userinfo, _)) = tail[..path].rsplit_once('@') {
                 out.push_str(&self.fakes.get(Kind::Secret, userinfo, |n| format!("secret-{n}")));
                 out.push('@');
-                authority = host;
+                tail = &tail[userinfo.len() + 1..];
             }
+            let host_char = |c: char| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '~' | '%' | ':' | '[' | ']' | '-') || !c.is_ascii();
+            let (authority, after) = tail.split_at(tail.find(|c: char| !host_char(c)).unwrap_or(tail.len()));
             let (host, port) = match authority.rfind(':') {
                 Some(c) if !authority.starts_with('[') || authority[..c].ends_with(']') => authority.split_at(c),
                 _ => (authority, ""),
@@ -541,7 +582,7 @@ impl Sanitizer {
     /// An object key, rewritten when it is an identifier (`sta_stats` keyed by MAC):
     /// keys are not checked against any list.
     fn object_key(&mut self, key: &str) -> String {
-        if key.len() == 12 && key.bytes().all(|b| b.is_ascii_hexdigit()) {
+        if is_bare_mac(key) {
             self.fakes.any_mac(key)
         } else if self.id_key.is_match(key) || key.parse::<Ipv6Addr>().is_ok() {
             self.scrub_ids(key.to_string())
@@ -566,15 +607,31 @@ impl Sanitizer {
         }
     }
 
-    /// Rewrites a `key=value` config blob line by line.
-    fn cfg(&mut self, blob: &str) -> String {
+    /// Rewrites the `key=value` config blob under `key` line by line. `under_secret`: its
+    /// own key or one above it is secret.
+    fn cfg(&mut self, key: &str, blob: &str, under_secret: bool) -> String {
         blob.lines()
             .map(|l| match l.split_once('=') {
-                Some((k, v)) => format!("{k}={}", self.field("", k, false, v)),
-                None => self.scrub(l),
+                Some((k, v)) => format!("{k}={}", self.field("", k, under_secret, v)),
+                None => self.cfg_line(key, l, under_secret),
             })
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    /// A config line that is not `key=value`: the controller's section comments (`# wlans
+    /// (radio)`) pass; anything else is text, listed like a field off the allow-list.
+    fn cfg_line(&mut self, key: &str, line: &str, under_secret: bool) -> String {
+        if line.is_empty() {
+            String::new()
+        } else if under_secret {
+            self.fakes.get(Kind::Secret, line, |n| format!("secret-{n}"))
+        } else if line.starts_with('#') {
+            self.scrub(line)
+        } else {
+            self.unlisted.insert(format!("{} lines without '='", key.to_ascii_lowercase()));
+            self.fakes.get(Kind::Text, line, |n| format!("text-{n}"))
+        }
     }
 
     pub fn json(&mut self, v: &Value) -> Value {
@@ -588,11 +645,10 @@ impl Sanitizer {
         match v {
             Value::Object(m) => Value::Object(m.iter().map(|(k, v)| (self.object_key(k), self.json_at(key, k, secret, v))).collect()),
             Value::Array(a) => Value::Array(a.iter().map(|x| self.json_at(parent, key, under_secret, x)).collect()),
-            // A secret number (a PIN, a numeric passphrase) is replaced like a string.
-            Value::Number(n) if secret && !SECRET_LOOKING_NUMBERS.contains(&key) && !self.keep.contains(&key.to_ascii_lowercase()) => {
+            Value::Number(n) if secret && self.is_secret_number(parent, key, under_secret) => {
                 Value::String(self.fakes.get(Kind::Secret, &n.to_string(), |n| format!("secret-{n}")))
             }
-            Value::String(s) if key.ends_with("_cfg") => Value::String(self.cfg(s)),
+            Value::String(s) if key.ends_with("_cfg") => Value::String(self.cfg(key, s, secret)),
             // Names people gave their devices in the other controller.
             Value::String(s) if key == "name" && (parent == "clients" || parent == "user") && !s.is_empty() => {
                 Value::String(self.fakes.get(Kind::Alias, s, |n| format!("alias-{n}")))
@@ -608,7 +664,7 @@ impl Sanitizer {
     pub fn file_name(&mut self, name: &str) -> String {
         // `_` is a regex word character, so `\b` would not split `_7845583c52bc_`.
         name.split('_')
-            .map(|part| if part.len() == 12 && part.bytes().all(|b| b.is_ascii_hexdigit()) { self.fakes.any_mac(part) } else { self.scrub(part) })
+            .map(|part| if is_bare_mac(part) { self.fakes.any_mac(part) } else { self.scrub(part) })
             .collect::<Vec<_>>()
             .join("_")
     }
@@ -701,11 +757,16 @@ fn is_mac(s: &str) -> bool {
     let b = s.as_bytes();
     let hex = |r: &[u8]| r.iter().all(u8::is_ascii_hexdigit);
     match b.len() {
-        12 => hex(b),
+        12 => is_bare_mac(s),
         14 => b[4] == b'.' && b[9] == b'.' && b.chunks(5).all(|c| hex(&c[..4])),
         17 => matches!(b[2], b':' | b'-') && b.chunks(3).all(|c| hex(&c[..2]) && c.get(2).is_none_or(|&sep| sep == b[2])),
         _ => false,
     }
+}
+
+/// Whether `s` is a MAC without separators: 12 hex digits.
+fn is_bare_mac(s: &str) -> bool {
+    s.len() == 12 && s.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
 /// `aabbccddeeff` (any case) as `aa:bb:cc:dd:ee:ff`.
@@ -1093,6 +1154,11 @@ mod tests {
         assert_eq!(out["url"], "https://secret-1@host-3.example.net/fw.bin");
         assert_eq!(out["mgmt_url"], "http://unifi:8080/inform http://[2001:db8::1]:8080/x http://192.0.2.1/ http://unifi.example.net/");
         assert_eq!(out["stun_url"], "stun://stun.smith.lan:3478/", "--keep vouches for the field");
+        // URLs run together: each host is replaced, whatever separates them.
+        let out = s.json(&json!({ "url": "http://a.smith.lan,http://b.smith.lan/x|https://c.smith.lan:8443;http://u:p,w@d.smith.lan/ (http://müller.smith.lan)" }));
+        assert_eq!(out["url"], "http://host-4.example.net,http://host-5.example.net/x|https://host-6.example.net:8443;http://secret-2@host-7.example.net/ (http://host-8.example.net)");
+        s.check_clean(&out.to_string(), "test").unwrap();
+        assert!(s.check_clean("on b.smith.lan", "leak").is_err());
         s.check_clean(&out["url"].to_string(), "url").unwrap();
         assert!(s.check_clean("on unifi.smith.lan", "leak").is_err(), "a replaced host is looked for");
         // A learned host is replaced wherever it shows up, once names are looked for.
@@ -1123,6 +1189,34 @@ mod tests {
         assert_eq!(keys, ["02:00:00:00:00:01", "02-00-00-00-00-02", "020000000001", "192.0.2.1", "2001:db8::1", "00000000-0000-4000-8000-000000000001", "10.0.0.1", "na"]);
         s.check_clean(&out.to_string(), "test").unwrap();
         assert!(s.check_clean("pin 123456", "leak").is_err());
+    }
+
+    #[test]
+    fn a_number_under_a_secret_key_passes_where_a_string_would() {
+        let mut s = Sanitizer::new(Vec::new(), vec!["x_radius.port".into(), "x_passphrase".into()]);
+        let v = json!({ "x_radius": { "port": 1812, "pin": 4321, "ip": "10.0.0.1" }, "x_passphrase": 12345678, "SAE_Groups": [19, 20] });
+        let out = s.json(&v);
+        assert_eq!(out["x_radius"], json!({ "port": 1812, "pin": "secret-1", "ip": "secret-2" }), "--keep as parent.field");
+        assert_eq!(out["x_passphrase"], "secret-3", "--keep does not pass a secret key's own value, number or string");
+        assert_eq!(out["SAE_Groups"], json!([19, 20]), "in any case");
+    }
+
+    #[test]
+    fn a_config_under_a_secret_key_is_secret_but_for_what_passes_there() {
+        let mut s = Sanitizer::new(Vec::new(), Vec::new());
+        let out = s.json(&json!({ "x_backup": { "system_cfg": "radio.1.channel=36\nmark.1.name=guest" }, "system_cfg": "radio.1.channel=36" }));
+        assert_eq!(out["x_backup"]["system_cfg"], "radio.1.channel=secret-1\nmark.1.name=guest");
+        assert_eq!(out["system_cfg"], "radio.1.channel=36");
+    }
+
+    #[test]
+    fn a_config_line_without_a_value_passes_only_as_a_comment() {
+        let mut s = Sanitizer::new(Vec::new(), Vec::new());
+        let out = s.json(&json!({ "system_cfg": "# wlans (radio)\nSmith family\n\nradio.1.channel=36", "x_backup": { "mgmt_cfg": "# mgmt" } }));
+        assert_eq!(out["system_cfg"], "# wlans (radio)\ntext-1\n\nradio.1.channel=36");
+        assert_eq!(out["x_backup"]["mgmt_cfg"], "secret-1");
+        assert_eq!(s.unlisted().collect::<Vec<_>>(), ["system_cfg lines without '='"]);
+        assert!(s.check_clean("x: smith family", "leak").is_err());
     }
 
     #[test]

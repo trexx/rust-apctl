@@ -65,13 +65,7 @@ impl Pairer {
     /// forgets the stale ones, and if that frees too little, the eighth that waited
     /// longest. Requests from made-up connections cost no more than that.
     fn make_room(&mut self, ts: Micros) {
-        self.sweeper.last = ts;
-        self.in_flight.retain(|_, (last, _)| ts - *last < MAX_WAIT);
-        if self.in_flight.len() > MAX_CONNS - MAX_CONNS / 8 {
-            let mut order: Vec<Micros> = self.in_flight.values().map(|(last, _)| *last).collect();
-            let (_, &mut cutoff, _) = order.select_nth_unstable(MAX_CONNS / 8);
-            self.in_flight.retain(|_, (last, _)| *last > cutoff);
-        }
+        self.sweeper.make_room(&mut self.in_flight, ts, |(last, _)| ts - *last < MAX_WAIT, |(last, _)| *last);
     }
 
     /// The request a response answers: the next one in order, or for a reply sealed
@@ -113,6 +107,11 @@ impl Pairer {
                 Some(InformEvent::Inform { ts, peer, mac, decoded })
             }
             HttpEvent::Response { conn, ts, status, body } => {
+                // An interim response (`100 Continue`) comes ahead of the real one, which
+                // answers the same request; a 101 ends HTTP on the connection.
+                if (100..200).contains(&status) && status != 101 {
+                    return None;
+                }
                 // A reply is sealed under the MAC of the inform it answers (its header
                 // is sent back), which is in the clear.
                 let sealed_for = inform::Header::parse(&body).ok().map(|h| h.mac);
@@ -227,6 +226,16 @@ mod tests {
             p.handle(&keys, inform(conn(4), a, None));
         }
         assert_eq!(p.in_flight[&conn(4)].1.len(), MAX_QUEUED);
+    }
+
+    #[test]
+    fn an_interim_response_leaves_the_request_waiting() {
+        let a = "02:00:00:00:00:01";
+        let keys = KeyStore::default();
+        let mut p = Pairer::default();
+        p.handle(&keys, inform(conn(1), a, None));
+        assert!(p.handle(&keys, HttpEvent::Response { conn: conn(1), ts: 0, status: 100, body: Vec::new() }).is_none());
+        assert_eq!(reply_mac(p.handle(&keys, reply(conn(1), a))).as_deref(), Some(a));
     }
 
     #[test]

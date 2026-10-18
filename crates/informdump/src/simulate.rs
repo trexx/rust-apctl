@@ -12,6 +12,7 @@ use anyhow::{Context, Result, bail};
 use inform::{Flags, Mac, Packet};
 use serde_json::Value;
 use wire::capture;
+use wire::decode::{Decoded, KeyUsed};
 use wire::exchange::{InformEvent, Pairer};
 use wire::keys::KeyStore;
 
@@ -61,45 +62,59 @@ fn is_local(url: &str) -> bool {
     host.eq_ignore_ascii_case("localhost") || host.parse::<IpAddr>().is_ok_and(|ip| ip.is_loopback())
 }
 
+/// The key a captured inform was sealed with: the factory key, or the AP's own.
+fn captured_key(d: &Decoded, keys: &KeyStore) -> [u8; 16] {
+    match d.key {
+        KeyUsed::Default => inform::DEFAULT_KEY,
+        KeyUsed::Device | KeyUsed::None => keys.get(&d.header.mac).copied().unwrap_or(inform::DEFAULT_KEY),
+    }
+}
+
+/// Readies a captured inform to be sent by an AP that runs `running` (if it took a
+/// pushed config) and seals with `key`: it says it is in factory state when that key
+/// is the factory one, whatever it said in the capture.
+fn prepare(payload: &mut Value, running: Option<&String>, key: &[u8; 16]) {
+    if let Some(v) = running {
+        payload["cfgversion"] = Value::from(v.clone());
+    }
+    payload["default"] = Value::from(*key == inform::DEFAULT_KEY);
+}
+
 pub fn run(pcap: &str, ports: &[u16], keys: &KeyStore, url: &str, limit: usize, every: f64) -> Result<()> {
     if !is_local(url) {
         bail!("refusing to simulate APs against {url}: only local controllers (http:// to 127.0.0.1, ::1 or localhost)");
     }
     // Collect the informs first, in capture order. Once there are enough, the rest of
     // the capture is read but not decoded.
-    let mut informs: Vec<Value> = Vec::new();
+    // Each with the key it was sealed with.
+    let mut informs: Vec<(Value, [u8; 16])> = Vec::new();
     let mut pairer = Pairer::default();
-    capture::run(capture::open_input(pcap)?, ports, |ev| {
+    let end = capture::run(capture::open_input(pcap)?, ports, |ev| {
         if informs.len() >= limit {
             return;
         }
         if let Some(InformEvent::Inform { decoded: Ok(d), .. }) = pairer.handle(keys, ev) {
-            informs.push(d.payload);
+            let key = captured_key(&d, keys);
+            informs.push((d.payload, key));
         }
     })?;
+    crate::warn_if_truncated(end);
     eprintln!("replaying {} informs to {url}", informs.len());
 
     // What each simulated AP currently runs (it adopts pushed versions), and
-    // the key it uses: its own, the factory key after a reset (`setdefault`),
-    // then whatever key an adoption hands it (`authkey=` in mgmt_cfg).
+    // the key it uses: the one its inform was captured with (its own, or the
+    // factory key), the factory key after a reset (`setdefault`), then
+    // whatever key an adoption hands it (`authkey=` in mgmt_cfg).
     let mut running: HashMap<Mac, String> = HashMap::new();
     let mut keys_now: HashMap<Mac, [u8; 16]> = HashMap::new();
     let mut counts: HashMap<String, usize> = HashMap::new();
-    for (i, mut payload) in informs.into_iter().enumerate() {
+    for (i, (mut payload, captured)) in informs.into_iter().enumerate() {
         if i > 0 && every > 0.0 {
             std::thread::sleep(Duration::from_secs_f64(every));
         }
         let mac: Mac = payload["mac"].as_str().context("inform without mac")?.parse()?;
-        let key = match keys_now.get(&mac) {
-            Some(k) => *k,
-            None => *keys.get(&mac).with_context(|| format!("no key for {mac}"))?,
-        };
-        if let Some(v) = running.get(&mac) {
-            payload["cfgversion"] = Value::from(v.clone());
-        }
-        if key == inform::DEFAULT_KEY {
-            payload["default"] = Value::from(true);
-        }
+        let key = keys_now.get(&mac).copied().unwrap_or(captured);
+        prepare(&mut payload, running.get(&mac), &key);
         // These are real AP keys: a GCM nonce must never repeat under one.
         let packet = inform::seal(mac, Flags::ENCRYPTED | Flags::GCM | Flags::ZLIB, crate::random_iv(), &key, payload.to_string().as_bytes());
         let (status, body) = post(url, &packet)?;
@@ -147,7 +162,26 @@ pub fn run(pcap: &str, ports: &[u16], keys: &KeyStore, url: &str, limit: usize, 
 
 #[cfg(test)]
 mod tests {
-    use super::{is_local, split_url, with_port};
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn an_ap_replays_with_the_key_it_was_captured_with_and_says_whether_that_is_the_factory_one() {
+        let mac: Mac = "02:00:00:00:00:01".parse().unwrap();
+        let mut keys = KeyStore::default();
+        let decoded = |keys: &KeyStore, key: &[u8; 16]| wire::decode::decode(&inform::seal(mac, Flags::ENCRYPTED | Flags::GCM, [1; 16], key, br#"{"default":false}"#), keys, None).unwrap();
+        // A factory-reset AP: no stored key needed.
+        assert_eq!(captured_key(&decoded(&keys, &inform::DEFAULT_KEY), &keys), inform::DEFAULT_KEY);
+        keys.insert_for(mac, "000102030405060708090a0b0c0d0e0f").unwrap();
+        let own = *keys.get(&mac).unwrap();
+        assert_eq!(captured_key(&decoded(&keys, &own), &keys), own);
+        assert_eq!(captured_key(&decoded(&keys, &inform::DEFAULT_KEY), &keys), inform::DEFAULT_KEY, "reset, though a key is stored");
+        let mut p = json!({ "default": false, "cfgversion": "old" });
+        prepare(&mut p, Some(&"new".to_string()), &inform::DEFAULT_KEY);
+        assert_eq!(p, json!({ "default": true, "cfgversion": "new" }));
+        prepare(&mut p, None, &own);
+        assert_eq!(p, json!({ "default": false, "cfgversion": "new" }), "adopted: no longer in factory state");
+    }
 
     #[test]
     fn urls_split_where_the_local_check_splits_them() {

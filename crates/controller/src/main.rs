@@ -202,6 +202,9 @@ async fn serve(args: ServeArgs) -> Result<()> {
         Some(p) => KeyStore::load(p)?,
         None => KeyStore::default(),
     };
+    for why in keys.skipped() {
+        tracing::warn!("device keys: {why}");
+    }
     tracing::info!("loaded {} device keys and {} syslog keys", keys.len(), keys.syslog_len());
     let keys = Arc::new(keys);
     if users.is_empty() {
@@ -414,11 +417,14 @@ async fn flush_writes(writer: store::Writer) {
 
 fn debug_syslog(pcap: &str, keys: &str, port: u16) -> Result<()> {
     let keys = KeyStore::load(keys)?;
+    for why in keys.skipped() {
+        tracing::warn!("device keys: {why}");
+    }
     // Every key's cipher, set up once.
     let mut ciphers = syslog::Ciphers::default();
     ciphers.refresh(None, &keys);
     let input = wire::capture::open_input(pcap)?;
-    wire::capture::run_with_udp(input, &[], &[port], |ev| {
+    let end = wire::capture::run_with_udp(input, &[], &[port], |ev| {
         if let wire::capture::HttpEvent::Datagram { ts, src, payload, .. } = ev {
             let found = if payload.starts_with(&syslog::MAGIC) {
                 ciphers.all().find_map(|(mac, cipher)| Some((Some(mac), syslog::decrypt_with(&payload, mac, cipher).ok()?)))
@@ -436,7 +442,11 @@ fn debug_syslog(pcap: &str, keys: &str, port: u16) -> Result<()> {
                 None => println!("{ts} {src}: could not decode {} bytes", payload.len()),
             }
         }
-    })
+    })?;
+    if end == wire::capture::End::Truncated {
+        tracing::warn!("the capture ends in the middle of a packet (truncated?); ignoring the rest");
+    }
+    Ok(())
 }
 
 /// Resolves on Ctrl-C or SIGTERM (what Kubernetes sends). Open WebSockets would

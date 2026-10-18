@@ -174,30 +174,60 @@ fn bssid(ap: &Ap, radio: &str, vap: u8) -> String {
     Mac(b).to_string()
 }
 
-fn hex_key(seed: &str, bytes: usize) -> String {
+/// Deterministic bytes for a seed (a key, an identifier).
+fn seeded(seed: &str) -> impl Iterator<Item = u8> {
     let mut r = Rng(seed.bytes().fold(0xcbf2_9ce4_8422_2325u64, |h, b| (h ^ b as u64).wrapping_mul(0x100_0000_01b3)));
-    hex::encode((0..bytes).map(|_| r.next() as u8).collect::<Vec<u8>>())
+    std::iter::from_fn(move || Some(r.next() as u8))
+}
+
+fn hex_key(seed: &str, bytes: usize) -> String {
+    hex::encode(seeded(seed).take(bytes).collect::<Vec<u8>>())
+}
+
+/// [`seeded`] bytes as an array.
+fn seeded_array<const N: usize>(seed: &str) -> [u8; N] {
+    let mut bytes = seeded(seed);
+    std::array::from_fn(|_| bytes.next().unwrap_or_default())
+}
+
+/// What an AP derives from its MAC, worked out once: its keys and the identifiers its
+/// informs carry.
+struct ApIds {
+    mac: Mac,
+    authkey: [u8; 16],
+    syslog_key: [u8; 32],
+    hash_id: [u8; 8],
+    hash_hex: String,
+    fingerprint: String,
+    qrid: String,
+}
+
+impl ApIds {
+    fn new(ap: &Ap) -> Self {
+        let hash_id = seeded_array(&format!("hash {}", ap.mac));
+        ApIds {
+            mac: Mac(mac_bytes(ap.mac)),
+            authkey: seeded_array(ap.mac),
+            syslog_key: seeded_array(&format!("syslog {}", ap.mac)),
+            hash_id,
+            hash_hex: hex::encode(hash_id),
+            fingerprint: format!("SHA256:{}", hex_key(&format!("fp {}", ap.mac), 21)),
+            qrid: hex_key(&format!("qr {}", ap.mac), 3),
+        }
+    }
 }
 
 /// A syslog datagram as an AP with a `syslog_key` sends it: magic, 0x01, 1 (u32),
 /// the AP's hash_id, a nonce, then the text sealed with AES-256-GCM over that header.
-fn seal_syslog(ap: &Ap, text: &str) -> Vec<u8> {
+fn seal_syslog(ids: &ApIds, text: &str) -> Vec<u8> {
     use aes_gcm::aead::{Aead, KeyInit, Payload};
-    let mut key = [0u8; 32];
-    hex::decode_to_slice(hex_key(&format!("syslog {}", ap.mac), 32), &mut key).expect("hex");
     let mut out = vec![0xab, 0xcd, 0xdc, 0xba, 0x01, 0, 0, 0, 1];
-    out.extend(hex::decode(hex_key(&format!("hash {}", ap.mac), 8)).expect("hex"));
+    out.extend_from_slice(&ids.hash_id);
     out.extend_from_slice(&crate::random_iv()[..12]);
     let nonce = aes_gcm::Nonce::try_from(&out[17..29]).expect("12 bytes");
-    let sealed = aes_gcm::Aes256Gcm::new(&key.into()).encrypt(&nonce, Payload { msg: text.as_bytes(), aad: &out }).expect("AES-GCM sealing");
+    let sealed = aes_gcm::Aes256Gcm::new(&ids.syslog_key.into()).encrypt(&nonce, Payload { msg: text.as_bytes(), aad: &out }).expect("AES-GCM sealing");
     out.extend(sealed);
     out
-}
-
-fn authkey(ap: &Ap) -> [u8; 16] {
-    let mut k = [0u8; 16];
-    hex::decode_to_slice(hex_key(ap.mac, 16), &mut k).expect("hex");
-    k
 }
 
 fn ip(v: [u8; 4]) -> String {
@@ -321,6 +351,7 @@ type Out = (i64, usize, Value);
 struct Sim {
     rng: Rng,
     template: Value,
+    ids: Vec<ApIds>,
     start: i64,
     end_history: i64,
     sessions: Vec<Option<Session>>,
@@ -590,7 +621,8 @@ impl Sim {
         let mac = ap.mac;
         p["mac"] = json!(mac);
         p["serial"] = json!(mac.replace(':', "").to_uppercase());
-        p["hash_id"] = json!(hex_key(&format!("hash {mac}"), 8));
+        let ids = &self.ids[i];
+        p["hash_id"] = json!(ids.hash_hex);
         p["anon_id"] = json!(format!("00000000-0000-4000-8000-0000000000{:02x}", 0x10 + i));
         p["hostname"] = json!(ap.name);
         p["ip"] = json!(ip(ap.ip));
@@ -600,10 +632,11 @@ impl Sim {
         p["uptime"] = json!(uptime);
         p["time"] = json!(ts);
         p["last_error_conns"] = json!([]);
-        p["fingerprint"] = json!(format!("SHA256:{}", hex_key(&format!("fp {mac}"), 21)));
-        p["qrid"] = json!(hex_key(&format!("qr {mac}"), 3));
+        p["fingerprint"] = json!(ids.fingerprint);
+        p["qrid"] = json!(ids.qrid);
         p["satisfaction"] = json!(vaps.iter().filter(|v| v["num_sta"].as_i64().unwrap_or(0) > 0).map(|v| v["satisfaction"].as_i64().unwrap_or(100)).min().unwrap_or(100));
-        p["sys_stats"]["mem_used"] = json!((mem / 100.0 * 939_495_424.0) as i64);
+        let mem_total = p["sys_stats"]["mem_total"].as_f64().unwrap_or_default();
+        p["sys_stats"]["mem_used"] = json!((mem / 100.0 * mem_total) as i64);
         p["sys_stats"]["loadavg_1"] = json!(format!("{:.2}", 0.6 + cpu / 25.0));
         p["sys_stats"]["loadavg_5"] = json!(format!("{:.2}", 0.6 + cpu / 30.0));
         p["sys_stats"]["loadavg_15"] = json!(format!("{:.2}", 0.6 + cpu / 35.0));
@@ -651,9 +684,9 @@ impl<W: Write> PcapWriter<W> {
         Ok(synth::write_pcap_record(&mut self.out, ts_ms * 1000, frame)?)
     }
 
-    fn tcp(&mut self, ts_ms: i64, ap: usize, to_server: bool, data: &[u8]) -> Result<()> {
+    fn tcp(&mut self, ts_ms: i64, ap: usize, ids: &ApIds, to_server: bool, data: &[u8]) -> Result<()> {
         let a = &APS[ap];
-        let (ap_end, controller) = (Endpoint { mac: mac_bytes(a.mac), ip: a.ip, port: 41_000 + ap as u16 }, Endpoint { mac: CONTROLLER_MAC, ip: CONTROLLER_IP, port: 8080 });
+        let (ap_end, controller) = (Endpoint { mac: ids.mac.0, ip: a.ip, port: 41_000 + ap as u16 }, Endpoint { mac: CONTROLLER_MAC, ip: CONTROLLER_IP, port: 8080 });
         for chunk in data.chunks(32_000) {
             let seq = if to_server { &mut self.seq[ap].0 } else { &mut self.seq[ap].1 };
             let frame = if to_server { synth::tcp_frame(ap_end, controller, *seq, chunk)? } else { synth::tcp_frame(controller, ap_end, *seq, chunk)? };
@@ -663,10 +696,10 @@ impl<W: Write> PcapWriter<W> {
         Ok(())
     }
 
-    fn syslog(&mut self, ts_ms: i64, ap: usize, text: &str) -> Result<()> {
+    fn syslog(&mut self, ts_ms: i64, ap: usize, ids: &ApIds, text: &str) -> Result<()> {
         let a = &APS[ap];
-        let (from, to) = (Endpoint { mac: mac_bytes(a.mac), ip: a.ip, port: 38_000 }, Endpoint { mac: CONTROLLER_MAC, ip: CONTROLLER_IP, port: 5514 });
-        let frame = synth::udp_frame(from, to, &seal_syslog(a, text))?;
+        let (from, to) = (Endpoint { mac: ids.mac.0, ip: a.ip, port: 38_000 }, Endpoint { mac: CONTROLLER_MAC, ip: CONTROLLER_IP, port: 5514 });
+        let frame = synth::udp_frame(from, to, &seal_syslog(ids, text))?;
         self.record(ts_ms, &frame)
     }
 }
@@ -683,11 +716,10 @@ pub fn run(hours: f64, live: bool, out: impl Write) -> Result<()> {
 fn stream(now: i64, hours: f64, live: bool, out: impl Write) -> Result<()> {
     let started = Instant::now();
     let start = now - (hours * 3600.0) as i64;
-    let mut template: Value = serde_json::from_str(TEMPLATE_INFORM)?;
-    template["version"] = json!(VERSION);
     let mut sim = Sim {
         rng: Rng(42),
-        template,
+        template: serde_json::from_str(TEMPLATE_INFORM)?,
+        ids: APS.iter().map(ApIds::new).collect(),
         start,
         end_history: now,
         sessions: vec![None; CLIENTS.len()],
@@ -731,18 +763,17 @@ fn stream(now: i64, hours: f64, live: bool, out: impl Write) -> Result<()> {
         let mut logs = logs.into_iter().peekable();
         for (at, i, payload) in batch {
             while let Some((lt, li, line)) = logs.next_if(|l| l.0 <= at) {
-                write_syslog(&mut pcap, lt, li, &line)?;
+                write_syslog(&mut pcap, &sim.ids[li], lt, li, &line)?;
             }
-            let key = authkey(&APS[i]);
-            let mac: Mac = APS[i].mac.parse()?;
-            let body = inform::seal(mac, Flags::ENCRYPTED | Flags::GCM | Flags::ZLIB, crate::random_iv(), &key, payload.to_string().as_bytes());
-            pcap.tcp(at * 1000, i, true, &http("POST /inform HTTP/1.1\r\nHost: controller.home.arpa:8080\r\nContent-Type: application/x-binary\r\n", &body))?;
+            let (mac, key) = (sim.ids[i].mac, &sim.ids[i].authkey);
+            let body = inform::seal(mac, Flags::ENCRYPTED | Flags::GCM | Flags::ZLIB, crate::random_iv(), key, payload.to_string().as_bytes());
+            pcap.tcp(at * 1000, i, &sim.ids[i], true, &http("POST /inform HTTP/1.1\r\nHost: controller.home.arpa:8080\r\nContent-Type: application/x-binary\r\n", &body))?;
             let reply = json!({ "_type": "noop", "interval": step, "server_time_in_utc": (at * 1000).to_string() });
-            let sealed = inform::seal(mac, Flags::ENCRYPTED | Flags::GCM | Flags::ZLIB, crate::random_iv(), &key, reply.to_string().as_bytes());
-            pcap.tcp(at * 1000 + 40, i, false, &http("HTTP/1.1 200 OK\r\nContent-Type: application/x-binary\r\n", &sealed))?;
+            let sealed = inform::seal(mac, Flags::ENCRYPTED | Flags::GCM | Flags::ZLIB, crate::random_iv(), key, reply.to_string().as_bytes());
+            pcap.tcp(at * 1000 + 40, i, &sim.ids[i], false, &http("HTTP/1.1 200 OK\r\nContent-Type: application/x-binary\r\n", &sealed))?;
         }
         for (lt, li, line) in logs {
-            write_syslog(&mut pcap, lt, li, &line)?;
+            write_syslog(&mut pcap, &sim.ids[li], lt, li, &line)?;
         }
         t += step;
     }
@@ -750,11 +781,11 @@ fn stream(now: i64, hours: f64, live: bool, out: impl Write) -> Result<()> {
     Ok(())
 }
 
-fn write_syslog<W: Write>(pcap: &mut PcapWriter<W>, ts: i64, ap: usize, line: &str) -> Result<()> {
+fn write_syslog<W: Write>(pcap: &mut PcapWriter<W>, ids: &ApIds, ts: i64, ap: usize, line: &str) -> Result<()> {
     let a = &APS[ap];
     let stamp = chrono_like(ts);
     let tag = format!("{},U6M-{VERSION}", a.mac.replace(':', ""));
-    pcap.syslog(ts * 1000, ap, &format!("<14>{stamp} {} {tag}: {line}", a.name.replace(' ', "-")))
+    pcap.syslog(ts * 1000, ap, ids, &format!("<14>{stamp} {} {tag}: {line}", a.name.replace(' ', "-")))
 }
 
 /// `Mon dd hh:mm:ss` in UTC, as BSD syslog writes it.
@@ -770,6 +801,11 @@ mod tests {
     use super::*;
 
     #[test]
+    fn the_template_reports_our_firmware_version() {
+        assert_eq!(serde_json::from_str::<Value>(TEMPLATE_INFORM).unwrap()["version"], VERSION);
+    }
+
+    #[test]
     fn syslog_dates() {
         assert_eq!(chrono_like(1_791_830_666), "Oct 12 18:44:26");
         assert_eq!(chrono_like(0), "Jan  1 00:00:00");
@@ -783,7 +819,7 @@ mod tests {
         let mut pairer = wire::exchange::Pairer::default();
         let mut informs = 0;
         let mut syslog = 0;
-        wire::capture::run_with_udp(&buf[..], &[8080], &[5514], |ev| {
+        let end = wire::capture::run_with_udp(&buf[..], &[8080], &[5514], |ev| {
             if matches!(ev, wire::capture::HttpEvent::Datagram { .. }) {
                 syslog += 1;
             } else if let Some(wire::exchange::InformEvent::Inform { decoded, .. }) = pairer.handle(&keys, ev) {
@@ -792,6 +828,7 @@ mod tests {
             }
         })
         .unwrap();
+        assert_eq!(end, wire::capture::End::Complete);
         assert!(informs > 3 * 30, "{informs} informs");
         assert!(syslog > 0);
     }
