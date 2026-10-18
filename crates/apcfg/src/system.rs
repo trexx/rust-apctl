@@ -590,10 +590,7 @@ fn mdns(c: &mut Cfg, ctx: &Ctx, vaps: &[Vap], net: &Net) {
     if isolation {
         c.set("mdns_sd.ap_mode", "enabled");
     }
-    let bridge_of_vlan = |vlan: i64| {
-        let tag = if vlan == 1 { 0 } else { vlan };
-        net.bridges.iter().find(|b| b.vlan == tag).map(|b| b.name.as_str())
-    };
+    let bridge_of_vlan = |vlan: Option<u16>| net.bridges.iter().find(|b| b.vlan == vlan).map(|b| b.name.as_str());
     let (mut f, mut p) = (0, 0);
     for wv in wlans {
         let w: &Value = &wv.w;
@@ -640,7 +637,8 @@ fn mdns(c: &mut Cfg, ctx: &Ctx, vaps: &[Vap], net: &Net) {
             }
             for n in &e.networks {
                 f += 1;
-                c.set(format_args!("mdns_sd.filter.{f}.vlan"), network_vlan(ctx, *n));
+                // An untagged network is VLAN 1 here.
+                c.set(format_args!("mdns_sd.filter.{f}.vlan"), network_vlan(ctx, *n).unwrap_or(1));
                 c.set(format_args!("mdns_sd.filter.{f}.policy"), if e.mode == "all" { "allow" } else { "deny" });
                 for (i, d) in devs.iter().enumerate() {
                     c.set(format_args!("mdns_sd.filter.{f}.dst.{}.devname", i + 1), d);

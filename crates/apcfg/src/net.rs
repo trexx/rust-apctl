@@ -10,12 +10,12 @@ use crate::{Cap, Ctx};
 use crate::cfg::{Cfg, Prefix};
 use crate::json::{flag, int_of, oid, str_of};
 use crate::meta::Meta;
-use crate::wlan::{Radio, Vap, dynamic_vlan, tagged_vlan};
+use crate::wlan::{Radio, Vap, dynamic_vlan, tagged_vlan, vlan_id};
 
 pub struct Bridge {
     pub name: String,
-    /// 0 for the management bridge.
-    pub vlan: i64,
+    /// `None` for the untagged (management) bridge.
+    pub vlan: Option<u16>,
     pub ports: Vec<String>,
 }
 
@@ -23,18 +23,18 @@ pub struct Net {
     pub eth: Vec<String>,
     pub bridges: Vec<Bridge>,
     /// VLANs carried on the trunk, in order of first use.
-    pub vlans: Vec<i64>,
+    pub vlans: Vec<u16>,
     /// Bridge name for each VAP (by index into the VAP list).
     pub vap_bridge: Vec<String>,
     pub ebtables: Vec<String>,
 }
 
-fn bridge_name(vlan: i64) -> String {
-    if vlan == 0 { "br0".to_string() } else { format!("br0.{vlan}") }
+fn bridge_name(vlan: Option<u16>) -> String {
+    vlan.map_or_else(|| "br0".to_string(), |v| format!("br0.{v}"))
 }
 
 /// The VLAN a WLAN's clients are tagged with, if any.
-fn wlan_vlan(ctx: &Ctx, vap: &Vap) -> Option<i64> {
+fn wlan_vlan(ctx: &Ctx, vap: &Vap) -> Option<u16> {
     let w: &Value = &vap.w;
     if matches!(str_of(w, "security"), Some("wpaeap")) && dynamic_vlan(ctx, w) != 0 {
         return None;
@@ -43,7 +43,7 @@ fn wlan_vlan(ctx: &Ctx, vap: &Vap) -> Option<i64> {
         return Some(vlan);
     }
     if flag(w, "vlan_enabled", false) {
-        return int_of(w, "vlan");
+        return int_of(w, "vlan").and_then(vlan_id);
     }
     None
 }
@@ -66,21 +66,20 @@ pub fn build(ctx: &Ctx, radios: &[Radio], vaps: &[Vap]) -> Result<Net> {
     if ctx.inform.is_some_and(|i| flag(i, "has_eth1", false)) {
         eth.push("eth1".to_string());
     }
-    let mut bridges = vec![Bridge { name: bridge_name(0), vlan: 0, ports: eth.clone() }];
-    let mut vlans: Vec<i64> = Vec::new();
+    let mut bridges = vec![Bridge { name: bridge_name(None), vlan: None, ports: eth.clone() }];
+    let mut vlans: Vec<u16> = Vec::new();
     let mut vap_bridge = Vec::new();
     let mut ebtables = Vec::new();
     for vap in vaps {
         let vlan = wlan_vlan(ctx, vap);
-        let tag = vlan.unwrap_or(0);
-        vap_bridge.push(bridge_name(tag));
+        vap_bridge.push(bridge_name(vlan));
         if radios[vap.radio].disabled {
             continue;
         }
-        let pos = match bridges.iter().position(|b| b.vlan == tag) {
+        let pos = match bridges.iter().position(|b| b.vlan == vlan) {
             Some(p) => p,
             None => {
-                bridges.push(Bridge { name: bridge_name(tag), vlan: tag, ports: Vec::new() });
+                bridges.push(Bridge { name: bridge_name(vlan), vlan, ports: Vec::new() });
                 bridges.len() - 1
             }
         };
@@ -95,7 +94,7 @@ pub fn build(ctx: &Ctx, radios: &[Radio], vaps: &[Vap]) -> Result<Net> {
         }
     }
     for v in &vlans {
-        let b = bridges.iter_mut().find(|b| b.vlan == *v).expect("bridge exists for every VLAN");
+        let b = bridges.iter_mut().find(|b| b.vlan == Some(*v)).expect("bridge exists for every VLAN");
         b.ports.extend(eth.iter().map(|e| format!("{e}.{v}")));
         ebtables.push(format!("-t broute -A BROUTING --vlan-id {v} -p 802_1Q -j DROP"));
     }
@@ -196,5 +195,51 @@ pub fn render_ebtables(c: &mut Cfg, net: &Net) {
     c.set("ebtables.add_vlan.status", "disabled");
     for (i, rule) in net.ebtables.iter().enumerate() {
         c.set(format_args!("ebtables.{}.cmd", i + 1), rule);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::meta::WifiSlot;
+    use crate::wlan::Band;
+    use crate::{Controller, Input};
+    use serde_json::json;
+
+    /// The trunk VLANs and each VAP's bridge for these WLANs, which can name the
+    /// networks `n<i>`, tagged with the `vlan` values given.
+    fn trunk(network_vlans: &[Value], wlans: &[Value]) -> (Vec<u16>, Vec<String>) {
+        let mac = "02:00:00:00:00:01";
+        let networks: Vec<Value> =
+            network_vlans.iter().enumerate().map(|(i, v)| json!({ "_id": format!("n{i}"), "site_id": "s", "vlan_enabled": true, "vlan": v })).collect();
+        let state = json!({ "sites": [{ "_id": "s" }], "devices": [{ "mac": mac, "site_id": "s", "type": "uap" }], "networkconf": networks });
+        let controller = Controller::default();
+        let ctx = Ctx::new(&Input { state: &state, device_mac: mac, inform: None, cfgversion: "1", controller: &controller }).unwrap();
+        let doc = json!({ "name": "wifi0", "radio": "ng" });
+        let radios = [Radio { idx: 1, name: "wifi0", band: Band::Ng, doc: &doc, disabled: false }];
+        let vaps: Vec<Vap> = wlans
+            .iter()
+            .enumerate()
+            .map(|(i, w)| Vap {
+                id: format!("w{i}"),
+                w: Cow::Borrowed(w),
+                radio: 0,
+                slot: WifiSlot { section: i as u32 + 1, device_name: format!("ath{i}"), on_radio: i as u32, first_on_radio: i == 0 },
+            })
+            .collect();
+        let net = build(&ctx, &radios, &vaps).unwrap();
+        (net.vlans, net.vap_bridge)
+    }
+
+    #[test]
+    fn vlans_outside_the_valid_range_are_untagged() {
+        let network_vlans = [json!(0), json!(1), json!(4095), json!(-3), json!(10), json!("20"), json!(4094), json!(2)];
+        let wlans: Vec<Value> = (0..network_vlans.len()).map(|i| json!({ "networkconf_id": format!("n{i}") })).collect();
+        let (vlans, bridges) = trunk(&network_vlans, &wlans);
+        assert_eq!(vlans, [10, 20, 4094, 2]);
+        assert_eq!(bridges, ["br0", "br0", "br0", "br0", "br0.10", "br0.20", "br0.4094", "br0.2"]);
+        // The same for a WLAN's own VLAN.
+        let wlans: Vec<Value> = [0, 1, 4095, 30].iter().map(|v| json!({ "vlan_enabled": true, "vlan": v })).collect();
+        assert_eq!(trunk(&[], &wlans), (vec![30], ["br0", "br0", "br0", "br0.30"].map(String::from).to_vec()));
     }
 }

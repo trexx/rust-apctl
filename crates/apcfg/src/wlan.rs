@@ -386,14 +386,22 @@ fn b(w: &Value, key: &str) -> bool {
     flag(w, key, false)
 }
 
-/// The VLAN of a network (1 for an untagged one).
-pub fn network_vlan(ctx: &Ctx, network_id: Option<&str>) -> i64 {
-    network_id.and_then(|id| ctx.network(id)).and_then(tagged_vlan).unwrap_or(1)
+/// A VLAN id that tags frames: 2 to 4094. Anything else means untagged: 0 and 4095
+/// are reserved by 802.1Q, and 1 is the default, untagged VLAN (the official
+/// controller treats a network on VLAN 1 as untagged, and its settings API takes
+/// network VLANs from 2), so an imported value outside the range is ignored.
+pub fn vlan_id(v: i64) -> Option<u16> {
+    u16::try_from(v).ok().filter(|v| (2..=4094).contains(v))
+}
+
+/// The VLAN a network tags its traffic with, `None` for an untagged one.
+pub fn network_vlan(ctx: &Ctx, network_id: Option<&str>) -> Option<u16> {
+    network_id.and_then(|id| ctx.network(id)).and_then(tagged_vlan)
 }
 
 /// The VLAN a network document tags its traffic with, if it is tagged.
-pub fn tagged_vlan(network: &Value) -> Option<i64> {
-    b(network, "vlan_enabled").then(|| int_of(network, "vlan").unwrap_or(2))
+pub fn tagged_vlan(network: &Value) -> Option<u16> {
+    b(network, "vlan_enabled").then(|| int_of(network, "vlan").unwrap_or(2)).and_then(vlan_id)
 }
 
 fn radius_profile<'a>(ctx: &Ctx<'a>, w: &Value) -> Option<&'a Value> {
@@ -611,8 +619,7 @@ pub fn render_vap(c: &mut Cfg, ctx: &Ctx, radios: &[Radio], vaps: &[Vap], i: usi
                 c.set(a.at("wpa.psk_file.status"), "enabled");
                 for (pi, key) in arr(w, "private_preshared_keys").iter().enumerate() {
                     c.opt(format_args!("{a}wpa.psk_file.{}.psk", pi + 1), str_of(key, "password"));
-                    let vlan = network_vlan(ctx, str_of(key, "networkconf_id"));
-                    if vlan != 1 {
+                    if let Some(vlan) = network_vlan(ctx, str_of(key, "networkconf_id")) {
                         c.set(format_args!("{a}wpa.psk_file.{}.vlanid", pi + 1), vlan);
                     }
                 }
