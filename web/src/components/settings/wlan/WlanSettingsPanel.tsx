@@ -9,7 +9,7 @@ import { WlanEditor } from "./WlanEditor";
 export function WlanSettingsPanel() {
   const s = useWlanSettings();
   const readOnly = !useCanEdit();
-  if (!s.data) return <QueryNote q={s} />;
+  if (!s.data) return <QueryNote q={s} panel />;
   const list = s.data;
   if (list.wlans.length === 0 && !list.active) return null;
   const apName = (m: string) => list.aps.find((a) => a.mac === m)?.name ?? m;

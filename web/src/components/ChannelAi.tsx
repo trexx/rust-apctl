@@ -107,7 +107,7 @@ export function ChannelAiPanel() {
   const runs = useEvents({ kind: "channel_plan", limit: 10 });
   const { busy, msg, run } = useRun();
   const now = useNow();
-  if (!ai.data) return <QueryNote q={ai} />;
+  if (!ai.data) return <QueryNote q={ai} panel />;
   const d = ai.data;
   const s = d.settings;
   const can = d.active && canEdit && !busy;

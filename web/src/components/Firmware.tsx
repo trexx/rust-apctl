@@ -38,7 +38,7 @@ export function FirmwarePanel() {
   const [url, setUrl] = useState("");
   // The engine updates the job list a moment after each request.
   const { busy, msg, run } = useRunner([keys.firmware()], 1200);
-  if (!f.data) return <QueryNote q={f} />;
+  if (!f.data) return <QueryNote q={f} panel />;
   const d = f.data;
   const canAct = d.active && !readOnly;
   const updatable = d.aps.filter(

@@ -314,7 +314,7 @@ export function BackupSection() {
         reloads when it is back.
       </div>
     );
-  if (!b.data) return <QueryNote q={b} />;
+  if (!b.data) return <QueryNote q={b} panel />;
   const d = b.data;
   return (
     <div className="panel" id="backups">

@@ -64,7 +64,7 @@ export function SiteSettingsPanel() {
   const q = useSiteSettings();
   const readOnly = !useCanEdit();
   const [editing, setEditing] = useState(false);
-  if (!q.data) return <QueryNote q={q} />;
+  if (!q.data) return <QueryNote q={q} panel />;
   const d = q.data;
   const country = d.countries.find((c) => c.code === d.country)?.name;
   return (

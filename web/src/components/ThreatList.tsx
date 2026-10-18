@@ -123,7 +123,7 @@ export function ThreatList() {
   const t = useThreats();
   const readOnly = !useCanEdit();
   const [showAcked, setShowAcked] = useState(false);
-  if (!t.data) return <QueryNote q={t} />;
+  if (!t.data) return <QueryNote q={t} panel />;
   const open = t.data.findings.filter((f) => !f.acknowledged);
   const acked = t.data.findings.filter((f) => f.acknowledged);
   // As of the last fetch (it refreshes every five minutes).
