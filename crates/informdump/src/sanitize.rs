@@ -451,7 +451,7 @@ impl Sanitizer {
             || (k.starts_with("cron.") && last == "user")
         {
             self.fakes.get(Kind::Secret, value, |n| format!("secret-{n}"))
-        } else if matches!(last.as_str(), "serial" | "serialno" | "serial_no") && self.mac_bare.is_match(value) && value.len() == 12 {
+        } else if matches!(last.as_str(), "serial" | "serialno" | "serial_no") && is_bare_mac(value) {
             // Serial numbers are the device's MAC without colons, including those
             // of neighbouring APs in scan results: their real BSSIDs follow from them.
             self.fakes.any_mac(value)
@@ -541,7 +541,7 @@ impl Sanitizer {
     /// An object key, rewritten when it is an identifier (`sta_stats` keyed by MAC):
     /// keys are not checked against any list.
     fn object_key(&mut self, key: &str) -> String {
-        if key.len() == 12 && key.bytes().all(|b| b.is_ascii_hexdigit()) {
+        if is_bare_mac(key) {
             self.fakes.any_mac(key)
         } else if self.id_key.is_match(key) || key.parse::<Ipv6Addr>().is_ok() {
             self.scrub_ids(key.to_string())
@@ -608,7 +608,7 @@ impl Sanitizer {
     pub fn file_name(&mut self, name: &str) -> String {
         // `_` is a regex word character, so `\b` would not split `_7845583c52bc_`.
         name.split('_')
-            .map(|part| if part.len() == 12 && part.bytes().all(|b| b.is_ascii_hexdigit()) { self.fakes.any_mac(part) } else { self.scrub(part) })
+            .map(|part| if is_bare_mac(part) { self.fakes.any_mac(part) } else { self.scrub(part) })
             .collect::<Vec<_>>()
             .join("_")
     }
@@ -701,11 +701,16 @@ fn is_mac(s: &str) -> bool {
     let b = s.as_bytes();
     let hex = |r: &[u8]| r.iter().all(u8::is_ascii_hexdigit);
     match b.len() {
-        12 => hex(b),
+        12 => is_bare_mac(s),
         14 => b[4] == b'.' && b[9] == b'.' && b.chunks(5).all(|c| hex(&c[..4])),
         17 => matches!(b[2], b':' | b'-') && b.chunks(3).all(|c| hex(&c[..2]) && c.get(2).is_none_or(|&sep| sep == b[2])),
         _ => false,
     }
+}
+
+/// Whether `s` is a MAC without separators: 12 hex digits.
+fn is_bare_mac(s: &str) -> bool {
+    s.len() == 12 && s.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
 /// `aabbccddeeff` (any case) as `aa:bb:cc:dd:ee:ff`.
