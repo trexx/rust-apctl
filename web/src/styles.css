@@ -15,10 +15,12 @@
   /* Text on a solid --accent, and on a solid --good / --fair / --poor. */
   --on-accent: #fff;
   --on-status: #fff;
-  /* The charts' series colours (Chart.tsx COLORS), for other graphics. */
+  /* The series colours of the charts (Chart.tsx COLORS) and other graphics. */
   --c-blue: #3b7ddd;
   --c-orange: #e8833a;
+  --c-green: #2f9e6e;
   --c-purple: #8a63d2;
+  --c-red: #d64545;
   --c-teal: #2aa3b8;
   --radius: 10px;
   color-scheme: light;
@@ -44,7 +46,9 @@
     --on-status: #12151b;
     --c-blue: #6f9cf0;
     --c-orange: #f0995a;
+    --c-green: #45c08a;
     --c-purple: #a585e3;
+    --c-red: #ef6a6a;
     --c-teal: #4cc0d4;
     color-scheme: dark;
   }
