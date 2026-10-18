@@ -11,7 +11,7 @@ import {
 } from "../api";
 import type { BackupManifest, BackupMeta, BackupSettings } from "../api";
 import { ago, bytes, dateTime as when, hhmm, useNow } from "../format";
-import { ErrorNote, Loading, Outcome, useRunner } from "./common";
+import { Outcome, QueryNote, useRunner } from "./common";
 import { FileButton } from "./FileButton";
 import { NumberInput, TimeInput } from "./settings/form";
 
@@ -51,16 +51,16 @@ const fromLocal = (text: string) => {
 
 /**
  * Which apctl process answers: when it started, "signed out" when it no
- * longer knows this session (as after a restore), null when none answers.
+ * longer knows this session (as after a restore), null when none answers
+ * (nor with its status: a proxy's page while it restarts is no answer).
  */
 const whoAnswers = () =>
-  fetch("/api/status", { cache: "no-store" }).then(
-    async (r): Promise<string | null> => {
+  fetch("/api/status", { cache: "no-store" })
+    .then(async (r): Promise<string | null> => {
       if (r.status === 401) return "signed out";
       return r.ok ? String((await r.json()).started) : null;
-    },
-    () => null,
-  );
+    })
+    .catch(() => null);
 
 /**
  * Waits for apctl to come back after a restore, then reloads the page: once
@@ -105,6 +105,13 @@ function Schedule({
   nextRun: number | null;
 }) {
   const [s, setS] = useState(initial);
+  const [base, setBase] = useState(initial);
+  // Saved settings (from here or elsewhere) replace the form's; the outcome
+  // line ("Saved.") stays.
+  if (JSON.stringify(initial) !== JSON.stringify(base)) {
+    setBase(initial);
+    setS(initial);
+  }
   const { msg, run } = useRunner([keys.backups()]);
   const dirty = JSON.stringify(s) !== JSON.stringify(initial);
   const save = () => void run(() => saveBackupSettings(s), "Saved.");
@@ -121,6 +128,7 @@ function Schedule({
       </label>
       <div className="backup-row">
         <select
+          aria-label="How often"
           value={s.frequency}
           disabled={readOnly || !s.enabled}
           onChange={(e) =>
@@ -136,6 +144,7 @@ function Schedule({
         </select>
         {s.frequency === "weekly" && (
           <select
+            aria-label="Day of the week"
             value={s.weekday}
             disabled={readOnly || !s.enabled}
             onChange={(e) => setS({ ...s, weekday: Number(e.target.value) })}
@@ -149,6 +158,7 @@ function Schedule({
         )}
         {s.frequency === "monthly" && (
           <select
+            aria-label="Day of the month"
             value={s.monthday}
             disabled={readOnly || !s.enabled}
             onChange={(e) => setS({ ...s, monthday: Number(e.target.value) })}
@@ -289,8 +299,7 @@ export function BackupSection() {
         reloads when it is back.
       </div>
     );
-  if (b.error) return <ErrorNote error={b.error} />;
-  if (!b.data) return <Loading />;
+  if (!b.data) return <QueryNote q={b} />;
   const d = b.data;
   return (
     <div className="panel" id="backups">
@@ -334,12 +343,7 @@ export function BackupSection() {
         </div>
       )}
 
-      <Schedule
-        key={JSON.stringify(d.settings)}
-        initial={d.settings}
-        readOnly={readOnly}
-        nextRun={d.next_run}
-      />
+      <Schedule initial={d.settings} readOnly={readOnly} nextRun={d.next_run} />
 
       {!readOnly && (
         <div className="backup-row backup-actions">

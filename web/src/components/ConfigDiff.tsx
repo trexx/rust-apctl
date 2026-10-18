@@ -51,8 +51,17 @@ function parseDiff(diff: string): Change[] {
     const rest = m[2]!;
     if (op === "~") {
       const i = rest.indexOf(": ");
-      const [before, after] = rest.slice(i + 2).split(" -> ");
-      out.push({ op: "~", key: rest.slice(0, i), before, after });
+      // "old -> new", where a value can hold " -> " itself: split at the
+      // middle one, which is right when both values hold it equally often
+      // (an edit to such a value), and keep all the text either way.
+      const parts = rest.slice(i + 2).split(" -> ");
+      const mid = Math.max(1, Math.floor(parts.length / 2));
+      out.push({
+        op: "~",
+        key: rest.slice(0, i),
+        before: parts.slice(0, mid).join(" -> "),
+        after: parts.slice(mid).join(" -> "),
+      });
     } else {
       const i = rest.indexOf("=");
       out.push({

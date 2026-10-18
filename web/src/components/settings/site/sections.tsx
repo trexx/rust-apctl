@@ -155,7 +155,13 @@ export function Logging({ syslog }: { syslog: SettingsForm<SyslogForm> }) {
               placeholder="server"
               aria-label="Syslog server"
             />
-            <NumberInput {...bind("port")} fallback={514} min={1} max={65535} />
+            <NumberInput
+              {...bind("port")}
+              aria-label="Syslog server port"
+              fallback={514}
+              min={1}
+              max={65535}
+            />
           </>
         )}
         {f.mode !== "off" && <Toggle {...bind("debug")} label="Debug level" />}
@@ -173,6 +179,7 @@ export function Logging({ syslog }: { syslog: SettingsForm<SyslogForm> }) {
               />
               <NumberInput
                 {...bind("netconsole_port")}
+                aria-label="Netconsole port"
                 fallback={514}
                 min={1}
                 max={65535}

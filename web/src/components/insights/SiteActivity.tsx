@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { useSiteActivity } from "../../api";
-import { rate } from "../../format";
+import { pct, rate } from "../../format";
 import {
   COLORS,
   Chart,
@@ -74,7 +74,7 @@ export function SiteActivity() {
                     ts={activity.ts}
                     height={120}
                     min={0}
-                    format={(v) => `${v.toFixed(0)}%`}
+                    format={pct}
                     series={[
                       {
                         label: "TX retries",
@@ -96,7 +96,7 @@ export function SiteActivity() {
                   ts={airtime.ts}
                   height={240}
                   min={0}
-                  format={(v) => `${v.toFixed(0)}%`}
+                  format={pct}
                   series={[
                     {
                       label: "Total",

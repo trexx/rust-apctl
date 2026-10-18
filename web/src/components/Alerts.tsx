@@ -3,7 +3,7 @@ import { Link, useNavigate } from "react-router";
 import { keys, markAlertsRead, useAlerts } from "../api";
 import type { AlertCategory, AlertItem } from "../api";
 import { clock, useNow } from "../format";
-import { useDismiss, useRunner } from "./common";
+import { Outcome, useDismiss, useRunner } from "./common";
 
 const CATEGORIES: [AlertCategory, string, string][] = [
   [
@@ -33,8 +33,9 @@ interface Prefs {
   categories: Record<AlertCategory, boolean>;
 }
 
-/** The app icon (the same inline image as the page's favicon). */
-const ICON = "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Cpath d='M16 26a3 3 0 1 0 0-6 3 3 0 0 0 0 6zm-7-9a10 10 0 0 1 14 0l-2 2a7 7 0 0 0-10 0zm-4-4a15 15 0 0 1 22 0l-2 2a12 12 0 0 0-18 0z' fill='%232f6fdf'/%3E%3C/svg%3E";
+/** The app icon: the page's favicon (an inline image in index.html). */
+const icon = () =>
+  document.querySelector<HTMLLinkElement>('link[rel="icon"]')?.href;
 
 const PREFS_KEY = "apctl.notifications";
 const DEFAULT_PREFS: Prefs = {
@@ -81,7 +82,7 @@ function show(
   navigate: (to: string) => void,
 ) {
   try {
-    const n = new Notification(title, { body, tag, icon: ICON });
+    const n = new Notification(title, { body, tag, icon: icon() });
     n.onclick = () => {
       window.focus();
       if (link) navigate(link);
@@ -108,12 +109,9 @@ export function useNotifier() {
         Notification.permission !== "granted"
       )
         return;
-      if (a.action === "resolved") {
-        // Replaces the open notification (same tag) with the outcome.
-        show(`Resolved: ${a.title}`, a.message, a.tag, a.link, navigate);
-      } else {
-        show(a.title, a.message, a.tag, a.link, navigate);
-      }
+      // A resolution replaces the open notification (same tag) with the outcome.
+      const title = a.action === "resolved" ? `Resolved: ${a.title}` : a.title;
+      show(title, a.message, a.tag, a.link, navigate);
     };
     window.addEventListener("apctl:alert", onAlert);
     return () => window.removeEventListener("apctl:alert", onAlert);
@@ -125,7 +123,7 @@ export function AlertBell() {
   const a = useAlerts();
   const now = useNow();
   // The server stores the change a moment later.
-  const { run } = useRunner([keys.alerts()], 800);
+  const { busy, msg, run } = useRunner([keys.alerts()], 800);
   const [open, setOpen] = useState(false);
   const box = useRef<HTMLDivElement>(null);
   useDismiss(box, () => setOpen(false), open);
@@ -161,11 +159,13 @@ export function AlertBell() {
             )}
             <span className="spacer" />
             {unread > 0 && (
-              <button className="btn small" onClick={readAll}>
+              <button className="btn small" disabled={busy} onClick={readAll}>
                 Mark all read
               </button>
             )}
           </div>
+          {/* Only a failure says anything; success shows in the list. */}
+          <Outcome msg={msg} />
           {list.length === 0 ? (
             <div className="muted small">No alerts yet.</div>
           ) : (

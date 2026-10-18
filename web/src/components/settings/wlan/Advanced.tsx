@@ -35,7 +35,7 @@ export function Advanced({
   /** "(from the security choice)" can be sent: the server derives PMF on this save. */
   pmfDerives: boolean;
 }) {
-  const { form: f, set, bind } = w;
+  const { form: f, set, setForm, bind } = w;
   const iot = f.enhanced_iot === true;
   const wpa3 = f.protection === "wpa3" || f.protection === "wpa2_wpa3";
   const pmf: Option<PmfMode | "">[] = [
@@ -43,6 +43,17 @@ export function Advanced({
     ["optional", "Optional"],
     ["required", "Required"],
   ];
+  // Custom periods start from the defaults the AP has, so the periods shown
+  // are the ones sent.
+  const setDtimMode = (m: "default" | "custom") =>
+    setForm((x) => ({
+      ...x,
+      dtim_mode: m,
+      ...(m === "custom" && {
+        dtim_ng: x.dtim_ng ?? (x.iot_dtim_lock ? 3 : 1),
+        dtim_na: x.dtim_na ?? 3,
+      }),
+    }));
   return (
     <details>
       <summary>Advanced</summary>
@@ -63,6 +74,7 @@ export function Advanced({
         {f.dns_assistance_mode === "manual" && (
           <ListInput
             {...bind("dns_assistance_servers")}
+            aria-label="Fallback DNS servers"
             placeholder="e.g. 192.168.1.1, 9.9.9.9"
             parse={words}
             format={(v) => v.join(", ")}
@@ -131,6 +143,7 @@ export function Advanced({
               2.4 GHz{" "}
               <Select
                 {...bind("minrate_ng_data_rate_kbps")}
+                aria-label="2.4 GHz minimum data rate"
                 fallback={1000}
                 options={rates(RATES_NG)}
               />
@@ -139,6 +152,7 @@ export function Advanced({
             {f.minrate_na_enabled === true && (
               <Select
                 {...bind("minrate_na_data_rate_kbps")}
+                aria-label="5 GHz minimum data rate"
                 fallback={6000}
                 options={rates(RATES_NA)}
               />
@@ -148,7 +162,8 @@ export function Advanced({
       </Row>
       <Row label="DTIM period">
         <Select
-          {...bind("dtim_mode")}
+          value={f.dtim_mode}
+          onChange={setDtimMode}
           fallback="default"
           disabled={iot}
           options={[
@@ -167,7 +182,8 @@ export function Advanced({
               {l}{" "}
               <NumberInput
                 {...bind(k)}
-                fallback={1}
+                aria-label={`${l} DTIM period`}
+                fallback={k === "dtim_ng" ? 1 : 3}
                 min={1}
                 max={255}
                 disabled={k === "dtim_ng" && f.iot_dtim_lock === true}
@@ -178,7 +194,7 @@ export function Advanced({
       <Row label="Group rekey" hint="seconds; 0 is off">
         <NumberInput
           {...bind("group_rekey")}
-          fallback={0}
+          fallback={3600}
           min={0}
           max={86400}
           disabled={iot}
@@ -196,7 +212,14 @@ export function Advanced({
             ] as const
           ).map(([k, l]) => (
             <label key={k} className="small">
-              {l} <NumberInput {...bind(k)} fallback={5} min={1} max={60} />
+              {l}{" "}
+              <NumberInput
+                {...bind(k)}
+                aria-label={`SAE ${l}`}
+                fallback={5}
+                min={1}
+                max={60}
+              />
             </label>
           ))}
         </Row>

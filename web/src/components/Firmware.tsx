@@ -12,7 +12,7 @@ import {
 } from "../api";
 import type { FirmwareInfo } from "../api";
 import { ago, bytes, clock, useNow } from "../format";
-import { ErrorNote, Loading, Outcome, useRunner } from "./common";
+import { Outcome, QueryNote, useRunner } from "./common";
 import { TextInput } from "./settings/form";
 
 const STATUS: Record<FirmwareInfo["aps"][number]["status"], [string, string]> =
@@ -38,8 +38,7 @@ export function FirmwarePanel() {
   const [url, setUrl] = useState("");
   // The engine updates the job list a moment after each request.
   const { busy, msg, run } = useRunner([keys.firmware()], 1200);
-  if (f.error) return <ErrorNote error={f.error} />;
-  if (!f.data) return <Loading />;
+  if (!f.data) return <QueryNote q={f} />;
   const d = f.data;
   const canAct = d.active && !readOnly;
   const updatable = d.aps.filter(

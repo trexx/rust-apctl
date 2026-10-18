@@ -3,7 +3,7 @@ import { useSeries, useSiteActivity } from "../api";
 import type { ClientView, RadioSample, TimeSpan, VapSample } from "../api";
 import { COLORS, Chart } from "./Chart";
 import { QueryState, Signal } from "./common";
-import { SIGNAL, band, bytes, compact, pct1, rate } from "../format";
+import { SIGNAL, band, bytes, compact, pct, pct1, rate } from "../format";
 
 const share = (part: number, whole: number) =>
   pct1(whole > 0 ? (100 * part) / whole : null);
@@ -136,7 +136,7 @@ export function RadioPanel({
             className={mcastShare >= 30 ? "tone-warn" : ""}
             title="Share of all packets on this radio"
           >
-            {mcastShare.toFixed(1)}% of packets
+            {pct1(mcastShare)} of packets
           </span>
           <span className="muted">
             {" "}
@@ -155,7 +155,7 @@ export function RadioPanel({
           <Chart
             title="Airtime (channel utilisation)"
             ts={data.ts}
-            format={(v) => `${Math.round(v)}%`}
+            format={pct}
             min={0}
             max={100}
             series={[
@@ -256,7 +256,7 @@ export function RadioActivity({
             ts={x.ts}
             height={130}
             format={(v) => `${v.toFixed(v < 10 ? 1 : 0)}/s`}
-            formatRight={(v) => `${Math.round(v)}%`}
+            formatRight={pct}
             rightMax={100}
             series={[
               { label: "TX packets", values: x.tx_pps, color: COLORS.blue },

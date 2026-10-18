@@ -15,17 +15,19 @@
   /* Text on a solid --accent, and on a solid --good / --fair / --poor. */
   --on-accent: #fff;
   --on-status: #fff;
-  /* The charts' series colours (Chart.tsx COLORS), for other graphics. */
+  /* The series colours of the charts (Chart.tsx COLORS) and other graphics. */
   --c-blue: #3b7ddd;
   --c-orange: #e8833a;
+  --c-green: #2f9e6e;
   --c-purple: #8a63d2;
+  --c-red: #d64545;
   --c-teal: #2aa3b8;
   --radius: 10px;
   color-scheme: light;
 }
 
 @media (prefers-color-scheme: dark) {
-  :root:not([data-theme="light"]) {
+  :root {
     --bg: #12151b;
     --panel: #1a1f27;
     --text: #e6e9ef;
@@ -44,7 +46,9 @@
     --on-status: #12151b;
     --c-blue: #6f9cf0;
     --c-orange: #f0995a;
+    --c-green: #45c08a;
     --c-purple: #a585e3;
+    --c-red: #ef6a6a;
     --c-teal: #4cc0d4;
     color-scheme: dark;
   }
@@ -440,6 +444,7 @@ button.plain {
 }
 
 input.search,
+textarea.search,
 select {
   font: inherit;
   color: var(--text);
@@ -450,6 +455,11 @@ select {
 }
 input.search {
   min-width: 280px;
+}
+/* A monospaced field keeps its font over the inherited one above. */
+.search.mono {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12.5px;
 }
 .check {
   display: flex;
@@ -601,7 +611,8 @@ input.search {
     grid-template-columns: 1fr;
     gap: 2px;
   }
-  .log-line {
+  .log-line,
+  .logs-no-device .log-line {
     grid-template-columns: 1fr;
   }
   input.search {
@@ -1032,6 +1043,9 @@ td.warn {
 }
 .stats + .banner {
   margin: 12px 0 0;
+}
+.banner-medium {
+  background: var(--warn-bg);
 }
 .banner-high {
   background: var(--bad-bg);

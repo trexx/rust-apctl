@@ -2,6 +2,7 @@ import { useState } from "react";
 import { useDeviceSettings } from "../../../api";
 import type { RadioSettings } from "../../../api";
 import { band } from "../../../format";
+import { QueryNote } from "../../common";
 import { DeviceEditor } from "./DeviceEditor";
 
 /** One radio's settings in a line. */
@@ -11,7 +12,7 @@ const radioSummary = (r: RadioSettings) =>
 function DevicePanel({ mac }: { mac: string }) {
   const s = useDeviceSettings(mac);
   const [editing, setEditing] = useState(false);
-  if (!s.data) return null;
+  if (!s.data) return <QueryNote q={s} panel />;
   const d = s.data;
   return (
     <div className="panel">

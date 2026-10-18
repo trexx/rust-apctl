@@ -12,14 +12,8 @@ import {
 } from "../api";
 import type { ChannelPlanResult } from "../api";
 import { band as bandName, clock, hhmm, useNow } from "../format";
-import {
-  ErrorNote,
-  Loading,
-  Outcome,
-  QueryState,
-  eventText,
-  useRunner,
-} from "./common";
+import { Outcome, QueryNote, QueryState, eventText, useRunner } from "./common";
+import { ApChecklist, toggled } from "./settings/form";
 
 /**
  * Runs Channel AI actions. The settings checkboxes each send a patch built
@@ -77,10 +71,12 @@ export function PlanActions({
             window.confirm(
               `Move ${changes.map((c) => `${c.name ?? c.mac} to channel ${c.to}`).join(", ")}? Clients reconnect briefly.`,
             ) &&
-            void run(
-              async () =>
-                `${(await applyChannelPlan(band, changes)).applied} AP${changes.length === 1 ? "" : "s"} get the new channel with their next report.`,
-            )
+            void run(async () => {
+              const { applied } = await applyChannelPlan(band, changes);
+              return applied === 1
+                ? "1 AP gets the new channel with its next report."
+                : `${applied} APs get the new channel with their next report.`;
+            })
           }
         >
           Apply plan
@@ -104,8 +100,7 @@ export function ChannelAiPanel() {
   const runs = useEvents({ kind: "channel_plan", limit: 10 });
   const { busy, msg, run } = useRun();
   const now = useNow();
-  if (ai.error) return <ErrorNote error={ai.error} />;
-  if (!ai.data) return <Loading />;
+  if (!ai.data) return <QueryNote q={ai} />;
   const d = ai.data;
   const s = d.settings;
   const can = d.active && canEdit && !busy;
@@ -163,6 +158,7 @@ export function ChannelAiPanel() {
               Enabled
             </label>
             <select
+              aria-label="Hour"
               value={s.hour}
               disabled={!can}
               onChange={(e) => save({ hour: Number(e.target.value) })}
@@ -180,11 +176,7 @@ export function ChannelAiPanel() {
                   checked={s.radios.includes(b)}
                   disabled={!can}
                   onChange={(e) =>
-                    save({
-                      radios: e.target.checked
-                        ? [...s.radios, b]
-                        : s.radios.filter((x) => x !== b),
-                    })
+                    save({ radios: toggled(s.radios, b, e.target.checked) })
                   }
                 />
                 {bandName(b)}
@@ -214,23 +206,12 @@ export function ChannelAiPanel() {
         <div className="form-row">
           <div className="form-label">Excluded APs</div>
           <div className="form-control">
-            {Object.entries(names).map(([mac, name]) => (
-              <label key={mac} className="check">
-                <input
-                  type="checkbox"
-                  checked={s.exclude_devices.includes(mac)}
-                  disabled={!can}
-                  onChange={(e) =>
-                    save({
-                      exclude_devices: e.target.checked
-                        ? [...s.exclude_devices, mac]
-                        : s.exclude_devices.filter((m) => m !== mac),
-                    })
-                  }
-                />
-                {name}
-              </label>
-            ))}
+            <ApChecklist
+              aps={Object.entries(names).map(([mac, name]) => ({ mac, name }))}
+              value={s.exclude_devices}
+              disabled={!can}
+              onChange={(v) => save({ exclude_devices: v })}
+            />
           </div>
         </div>
       </div>

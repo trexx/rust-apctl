@@ -1,9 +1,8 @@
 import { Link } from "react-router";
 import { useSiteTop } from "../../api";
-import { bytes } from "../../format";
+import { bytes, spanText } from "../../format";
 import { useTimeSpan } from "../Chart";
 import { QueryState } from "../common";
-import { spanText } from "./shared";
 
 function TopList({
   title,

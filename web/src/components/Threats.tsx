@@ -3,7 +3,7 @@ import { Link } from "react-router";
 import { ackThreat, keys, useCanEdit, useThreats } from "../api";
 import type { ThreatFinding } from "../api";
 import { ago, band, duration, useNow } from "../format";
-import { ErrorNote, Loading, Signal, useRunner } from "./common";
+import { ErrorNote, QueryNote, Signal, useRunner } from "./common";
 
 const KIND_LABEL: Record<ThreatFinding["kind"], string> = {
   spoofed_bssid: "Cloned AP address",
@@ -96,6 +96,7 @@ function Finding({ f, readOnly }: { f: ThreatFinding; readOnly: boolean }) {
           >
             <input
               className="search"
+              aria-label="Why it's fine"
               autoFocus
               maxLength={200}
               placeholder="Why it's fine, e.g. “the neighbours' printer” (optional)"
@@ -130,8 +131,7 @@ export function ThreatList() {
   const t = useThreats();
   const readOnly = !useCanEdit();
   const [showAcked, setShowAcked] = useState(false);
-  if (t.error) return <ErrorNote error={t.error} />;
-  if (!t.data) return <Loading />;
+  if (!t.data) return <QueryNote q={t} />;
   const open = t.data.findings.filter((f) => !f.acknowledged);
   const acked = t.data.findings.filter((f) => f.acknowledged);
   // As of the last fetch (it refreshes every minute).

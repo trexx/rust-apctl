@@ -76,7 +76,7 @@ export function Loading() {
   return <div className="muted pad">Loading…</div>;
 }
 
-const errorText = (error: unknown) =>
+export const errorText = (error: unknown) =>
   error instanceof Error ? error.message : String(error);
 
 export function ErrorNote({ error }: { error: unknown }) {
@@ -84,10 +84,24 @@ export function ErrorNote({ error }: { error: unknown }) {
 }
 
 /**
- * A query's data, or else its error, or else "Loading…". With `panel`, the
- * error and loading states sit in a panel, so the layout doesn't jump when the
- * data (rendered by `children`, usually a panel itself) arrives.
+ * What stands in for a query's data until it is there: its error, or else
+ * "Loading…". A component shows it only while it has no data (`if (!q.data)
+ * return <QueryNote q={q} />`), so a failed background refetch doesn't
+ * replace what was fetched. With `panel`, it sits in a panel, so the layout
+ * doesn't jump when the data (usually a panel itself) arrives.
  */
+export function QueryNote({
+  q,
+  panel,
+}: {
+  q: { error: unknown };
+  panel?: boolean;
+}) {
+  const note = q.error ? <ErrorNote error={q.error} /> : <Loading />;
+  return panel ? <div className="panel">{note}</div> : note;
+}
+
+/** A query's data, rendered by `children`, or else its `QueryNote`. */
 export function QueryState<T>({
   q,
   panel,
@@ -98,8 +112,7 @@ export function QueryState<T>({
   children: (data: T) => ReactNode;
 }) {
   if (q.data !== undefined) return <>{children(q.data)}</>;
-  const note = q.error ? <ErrorNote error={q.error} /> : <Loading />;
-  return panel ? <div className="panel">{note}</div> : note;
+  return <QueryNote q={q} panel={panel} />;
 }
 
 /** An action's outcome, shown under its buttons. */
@@ -322,7 +335,7 @@ const EVENTS: { [K in EventKind]: EventSpec<K> } = {
   ap_firmware_changed: {
     label: "Firmware changed",
     tone: "neutral",
-    describe: (d) => `${d.from} → ${d.to}`,
+    describe: (d) => `${d.from ?? "?"} → ${d.to ?? "?"}`,
   },
   // Older events (before 0.3.2) guessed a restart; it was a config being applied.
   ap_radios_restarting: { label: "Applying configuration", tone: "neutral" },
@@ -452,8 +465,18 @@ const EVENTS: { [K in EventKind]: EventSpec<K> } = {
   ap_process_restarted: {
     label: "Process restarted",
     tone: "warn",
-    describe: (d) =>
-      `${d.proc ?? "a process"} exited with code ${d.exit_status ?? "?"} and was restarted by ${d.caller ?? "the system"}`,
+    describe: (d) => {
+      // As the alert says it: a code sent as text is still a code, and a
+      // missing one is left out.
+      const c: unknown = d.exit_status;
+      const code =
+        typeof c === "number"
+          ? String(c)
+          : typeof c === "string" && /^[+-]?\d+$/.test(c.trim())
+            ? c.trim()
+            : null;
+      return `${d.proc ?? "a process"} exited${code !== null ? ` with code ${code}` : ""} and was restarted by ${d.caller ?? "the system"}`;
+    },
   },
   ap_isolated: {
     label: "AP isolated",
@@ -537,13 +560,14 @@ const EVENTS: { [K in EventKind]: EventSpec<K> } = {
     tone: "neutral",
     describe: (d, names) => {
       const moves = d.changes ?? [];
-      return `${d.band ? band(d.band) : d.band} (${d.trigger}): ${
+      const what = [d.band && band(d.band), d.trigger && `(${d.trigger})`];
+      return `${what.filter(Boolean).join(" ") || "Plan"}: ${
         moves.length === 0
           ? "nothing to move"
           : moves
               .map(
                 (m) =>
-                  `${m.name ?? names[m.mac] ?? m.mac} ${m.from ?? "?"} → ${m.to}`,
+                  `${m.name ?? names[m.mac] ?? m.mac} ${m.from ?? "?"} → ${m.to ?? "?"}`,
               )
               .join(", ")
       }${moves.length > 0 && !d.applied ? " (not applied)" : ""}`;

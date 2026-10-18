@@ -53,6 +53,7 @@ export function Roaming({ w, list }: WlanSection) {
           <label className="small">
             <input
               type="range"
+              aria-label="Roaming assistant threshold"
               min={-80}
               max={-60}
               value={f.roaming_assistant_na_rssi ?? -75}

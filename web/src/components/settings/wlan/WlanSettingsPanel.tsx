@@ -1,6 +1,6 @@
 import { useCanEdit, useWlanSettings } from "../../../api";
 import { band } from "../../../format";
-import { ErrorNote, Loading } from "../../common";
+import { QueryNote } from "../../common";
 import { ListPanel } from "../ListPanel";
 import { BAND_RADIO, PROTECTION } from "./form";
 import { WlanEditor } from "./WlanEditor";
@@ -9,8 +9,7 @@ import { WlanEditor } from "./WlanEditor";
 export function WlanSettingsPanel() {
   const s = useWlanSettings();
   const readOnly = !useCanEdit();
-  if (s.error) return <ErrorNote error={s.error} />;
-  if (!s.data) return <Loading />;
+  if (!s.data) return <QueryNote q={s} />;
   const list = s.data;
   if (list.wlans.length === 0 && !list.active) return null;
   const apName = (m: string) => list.aps.find((a) => a.mac === m)?.name ?? m;

@@ -1,8 +1,15 @@
-import { useState } from "react";
+import { memo, useState } from "react";
 import { Link } from "react-router";
 import { useConnections } from "../api";
-import type { ConnAttempt, Connections, Roam, TimeSpan, Timings } from "../api";
-import { band, clock, useNow } from "../format";
+import type {
+  ConnAttempt,
+  Connections,
+  Names,
+  Roam,
+  TimeSpan,
+  Timings,
+} from "../api";
+import { band, clock, sameDay, useNow } from "../format";
 import { QueryState, Segmented, Signal } from "./common";
 import { stableKeys } from "./keys";
 
@@ -90,20 +97,34 @@ const where = (
     .filter((x) => x && x !== "—")
     .join(" ");
 
+/** A row's props, of which `now` (the table's `useNow()`) matters only for its date. */
+interface RowProps {
+  apNames: Names;
+  client?: string;
+  now: number;
+}
+
+/**
+ * Rows never change, so one re-renders only for other props or another day,
+ * not for every minute the table's clock ticks.
+ */
+const sameRow = <P extends RowProps>(a: P, b: P) =>
+  sameDay(a.now, b.now) &&
+  Object.keys(a).length === Object.keys(b).length &&
+  (Object.keys(a) as (keyof P)[]).every(
+    (k) => k === "now" || Object.is(a[k], b[k]),
+  );
+
 /**
  * One connection attempt as a table row: time, (with `client`, the client's
  * name), result, AP, network, signal and time to connect.
  */
-function AttemptRow({
+const AttemptRow = memo(function AttemptRow({
   a,
-  apName,
+  apNames,
   client,
-}: {
-  a: ConnAttempt;
-  apName: (mac: string) => string;
-  client?: string;
-}) {
-  const now = useNow();
+  now,
+}: RowProps & { a: ConnAttempt }) {
   return (
     <tr>
       <td className="nowrap small">{clock(a.ts, now)}</td>
@@ -117,7 +138,7 @@ function AttemptRow({
         {a.reason && <div className="muted small">AP reason: {a.reason}</div>}
       </td>
       <td>
-        <Link to={`/devices/${a.ap}`}>{apName(a.ap)}</Link>
+        <Link to={`/devices/${a.ap}`}>{apNames[a.ap] ?? a.ap}</Link>
       </td>
       <td className="small">
         {a.essid ?? "—"}
@@ -131,24 +152,19 @@ function AttemptRow({
       </td>
     </tr>
   );
-}
+}, sameRow);
 
 /**
  * One roam as a table row, in the same columns as `AttemptRow` (`timing`
  * leaves the time-to-connect column empty).
  */
-export function RoamRow({
+export const RoamRow = memo(function RoamRow({
   r,
-  apName,
+  apNames,
   client,
   timing,
-}: {
-  r: Roam;
-  apName: (mac: string) => string;
-  client?: string;
-  timing?: boolean;
-}) {
-  const now = useNow();
+  now,
+}: RowProps & { r: Roam; timing?: boolean }) {
   return (
     <tr>
       <td className="nowrap small">{clock(r.ts, now)}</td>
@@ -174,8 +190,10 @@ export function RoamRow({
         </div>
       </td>
       <td className="small">
-        <Link to={`/devices/${r.from.ap}`}>{apName(r.from.ap)}</Link> →{" "}
-        <Link to={`/devices/${r.to.ap}`}>{apName(r.to.ap)}</Link>
+        <Link to={`/devices/${r.from.ap}`}>
+          {apNames[r.from.ap] ?? r.from.ap}
+        </Link>{" "}
+        → <Link to={`/devices/${r.to.ap}`}>{apNames[r.to.ap] ?? r.to.ap}</Link>
       </td>
       <td className="small">
         {r.to.essid ?? "—"}
@@ -189,7 +207,7 @@ export function RoamRow({
       {timing && <td />}
     </tr>
   );
-}
+}, sameRow);
 
 /**
  * The head of a table of `AttemptRow`s and `RoamRow`s: `client` adds the
@@ -248,7 +266,7 @@ export function ConnectionLog({
 }
 
 function ConnectionTable({ data }: { data: Connections }) {
-  const ap = (m: string) => data.ap_names[m] ?? m;
+  const now = useNow();
   // A roam also shows up as the attempt on the new AP; keep just the roam.
   const roamsTo = new Map<string, number[]>();
   for (const r of data.roams) {
@@ -290,9 +308,20 @@ function ConnectionTable({ data }: { data: Connections }) {
           .slice(0, LOG_ROWS)
           .map((it) =>
             it.kind === "attempt" ? (
-              <AttemptRow key={it.key} a={it.a} apName={ap} />
+              <AttemptRow
+                key={it.key}
+                a={it.a}
+                apNames={data.ap_names}
+                now={now}
+              />
             ) : (
-              <RoamRow key={it.key} r={it.r} apName={ap} timing />
+              <RoamRow
+                key={it.key}
+                r={it.r}
+                apNames={data.ap_names}
+                now={now}
+                timing
+              />
             ),
           )}
       </tbody>
@@ -343,6 +372,7 @@ export function AttemptList({ span }: { span: TimeSpan }) {
 
 function AttemptTable({ data }: { data: Connections }) {
   const keys = stableKeys(data.attempts, attemptId);
+  const now = useNow();
   return (
     <div className="table-wrap">
       <table className="table">
@@ -352,8 +382,9 @@ function AttemptTable({ data }: { data: Connections }) {
             <AttemptRow
               key={keys[i]}
               a={a}
-              apName={(m) => data.ap_names[m] ?? m}
+              apNames={data.ap_names}
               client={data.client_names[a.client] ?? a.client}
+              now={now}
             />
           ))}
         </tbody>

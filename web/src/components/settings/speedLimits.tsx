@@ -1,6 +1,7 @@
 import { useState } from "react";
 import { useCanEdit, useUserGroups } from "../../api";
 import { speed } from "../../format";
+import { QueryNote } from "../common";
 import type { UserGroup } from "../../api";
 import { Row, TextInput } from "./form";
 import type { Fields } from "./form";
@@ -27,6 +28,9 @@ function SpeedLimitEditor({
   const [name, setName] = useState(group?.name ?? "");
   const [down, setDown] = useState(mbpsField(group?.qos_rate_max_down));
   const [up, setUp] = useState(mbpsField(group?.qos_rate_max_up));
+  // A number the browser can't read reaches onChange as "", which would mean
+  // no limit; such a field holds the review back instead.
+  const [unreadable, setUnreadable] = useState({ down: false, up: false });
   // The whole limit is sent, not a difference (the default group, which has
   // no name, isn't editable); an unchanged group sends nothing, so Review
   // says there is nothing to review.
@@ -40,7 +44,12 @@ function SpeedLimitEditor({
     name === group.name &&
     kbps(down) === kbps(mbpsField(group.qos_rate_max_down)) &&
     kbps(up) === kbps(mbpsField(group.qos_rate_max_up));
-  const rate = (label: string, value: string, set: (v: string) => void) => (
+  const rate = (
+    k: "down" | "up",
+    label: string,
+    value: string,
+    set: (v: string) => void,
+  ) => (
     <Row label={label} hint="Mbps per client; empty for no limit">
       <TextInput
         className="search num-input"
@@ -50,6 +59,10 @@ function SpeedLimitEditor({
         step="any"
         value={value}
         onChange={set}
+        onInput={(e) => {
+          const bad = e.currentTarget.validity.badInput;
+          setUnreadable((u) => ({ ...u, [k]: bad }));
+        }}
       />
     </Row>
   );
@@ -58,14 +71,14 @@ function SpeedLimitEditor({
       target={{ kind: "usergroup", id: group?.id ?? null }}
       active={active}
       patch={unchanged ? {} : patch}
-      invalid={!name.trim()}
+      invalid={!name.trim() || unreadable.down || unreadable.up}
       onClose={onClose}
     >
       <Row label="Name">
         <TextInput maxLength={128} value={name} onChange={setName} />
       </Row>
-      {rate("Download", down, setDown)}
-      {rate("Upload", up, setUp)}
+      {rate("down", "Download", down, setDown)}
+      {rate("up", "Upload", up, setUp)}
     </EditorShell>
   );
 }
@@ -74,7 +87,7 @@ function SpeedLimitEditor({
 export function SpeedLimitsPanel() {
   const g = useUserGroups();
   const readOnly = !useCanEdit();
-  if (!g.data) return null;
+  if (!g.data) return <QueryNote q={g} panel />;
   const { active, groups } = g.data;
   return (
     <ListPanel

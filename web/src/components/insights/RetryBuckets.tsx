@@ -1,10 +1,12 @@
 import { useRetries } from "../../api";
-import { band as bandName } from "../../format";
+import { band as bandName, pct1 } from "../../format";
 import { useTimeSpan } from "../Chart";
 import { BandInsight } from "./shared";
 
 /** Lower edges of the retry buckets, worst first (as the official dashboard). */
 const RETRY_EDGES = [25, 20, 15, 10, 5, 0];
+/** The labels under the bars' edges: the worst bucket runs up to 100%. */
+const EDGE_LABELS = ["100%", ...RETRY_EDGES.map((e) => `${e}%`)];
 
 export function RetryBuckets() {
   const [span] = useTimeSpan(86400);
@@ -25,7 +27,7 @@ export function RetryBuckets() {
                 const tip = inBucket
                   .map(
                     (x) =>
-                      `${x.name ?? x.mac} ${bandName(x.radio)}: ${x.tx_retry_pct.toFixed(1)}%`,
+                      `${x.name ?? x.mac} ${bandName(x.radio)}: ${pct1(x.tx_retry_pct)}`,
                   )
                   .join("\n");
                 return (
@@ -41,7 +43,7 @@ export function RetryBuckets() {
               })}
             </div>
             <div className="bucket-edges muted small">
-              {["35%+", "25%", "20%", "15%", "10%", "5%", "0%"].map((l) => (
+              {EDGE_LABELS.map((l) => (
                 <span key={l}>{l}</span>
               ))}
             </div>

@@ -1,4 +1,5 @@
 import { useSyncExternalStore } from "react";
+import type { TimeSpan } from "./api";
 
 export const BANDS: Record<string, string> = { ng: "2.4 GHz", na: "5 GHz", "6e": "6 GHz" };
 
@@ -178,6 +179,9 @@ export function spanLabel(from: number, to: number): string {
   const start = `${dayFmt.format(f)} ${minuteFmt.format(f)}`;
   return f.toDateString() === t.toDateString() ? `${start} – ${minuteFmt.format(t)}` : `${start} – ${dayFmt.format(t)} ${minuteFmt.format(t)}`;
 }
+
+/** "last 24h", or the fixed window. */
+export const spanText = (span: TimeSpan): string => ("from" in span ? spanLabel(span.from, span.to) : `last ${duration(span.last).replace(/^1d 0h$/, "24h")}`);
 
 /** Value for an <input type="datetime-local"> in the browser's time zone. */
 export function toLocalInput(ts: number): string {

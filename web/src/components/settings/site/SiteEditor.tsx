@@ -1,7 +1,7 @@
 import { useState } from "react";
 import { useCanEdit, useSiteSettings } from "../../../api";
 import type { SiteSettings } from "../../../api";
-import { ErrorNote, Loading } from "../../common";
+import { QueryNote } from "../../common";
 import { useSettingsForm } from "../form";
 import type { Fields } from "../form";
 import { EditorShell } from "../Review";
@@ -64,9 +64,7 @@ export function SiteSettingsPanel() {
   const q = useSiteSettings();
   const readOnly = !useCanEdit();
   const [editing, setEditing] = useState(false);
-  if (q.isLoading) return <Loading />;
-  if (q.error) return <ErrorNote error={q.error} />;
-  if (!q.data) return null;
+  if (!q.data) return <QueryNote q={q} />;
   const d = q.data;
   const country = d.countries.find((c) => c.code === d.country)?.name;
   return (

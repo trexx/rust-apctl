@@ -1,7 +1,7 @@
 import { useState } from "react";
 import type { ReactNode } from "react";
 import type { TimeSpan } from "../../api";
-import { band, duration, spanLabel } from "../../format";
+import { band, spanText } from "../../format";
 import { QueryState, Segmented } from "../common";
 
 const RADIOS = (["ng", "na"] as const).map((b) => [b, band(b)] as const);
@@ -62,13 +62,6 @@ export function BandInsight<T>({
       )}
     </QueryState>
   );
-}
-
-/** "last 24 hours", or the fixed window. */
-export function spanText(span: TimeSpan): string {
-  return "from" in span
-    ? spanLabel(span.from, span.to)
-    : `last ${duration(span.last).replace(/^1d 0h$/, "24h")}`;
 }
 
 /** A verdict over a panel's data, coloured by how it came out. */

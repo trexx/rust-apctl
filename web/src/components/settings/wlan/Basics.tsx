@@ -1,7 +1,8 @@
 import { useState } from "react";
 import { wlanPassphrase } from "../../../api";
 import type { WlanSettings } from "../../../api";
-import { Row, Select, TextInput, Toggle } from "../form";
+import { errorText } from "../../common";
+import { ApChecklist, Row, Select, TextInput, Toggle, toggled } from "../form";
 import { PROTECTION } from "./form";
 import type { Protection, WlanSection } from "./form";
 import { SpeedLimitRow } from "./SpeedLimitRow";
@@ -19,9 +20,7 @@ function ShowPassphrase({ id }: { id: string }) {
           setError(null);
           wlanPassphrase(id)
             .then((r) => setShown(r.passphrase ?? ""))
-            .catch((e: unknown) =>
-              setError(e instanceof Error ? e.message : String(e)),
-            );
+            .catch((e: unknown) => setError(errorText(e)));
         }}
       >
         Show current
@@ -48,7 +47,7 @@ export function Basics({
   const { form: f, set, bind } = w;
   const bands = f.wlan_bands ?? [];
   const toggleBand = (b: string, on: boolean) =>
-    set("wlan_bands", on ? [...bands, b] : bands.filter((x) => x !== b));
+    set("wlan_bands", toggled(bands, b, on));
   const aps = f.aps;
   const iot = f.enhanced_iot === true;
   return (
@@ -115,17 +114,13 @@ export function Basics({
           onChange={(v) => set("aps", v ? null : list.aps.map((a) => a.mac))}
           label="All APs"
         />
-        {aps !== null &&
-          list.aps.map((a) => (
-            <Toggle
-              key={a.mac}
-              value={aps.includes(a.mac)}
-              onChange={(v) =>
-                set("aps", v ? [...aps, a.mac] : aps.filter((m) => m !== a.mac))
-              }
-              label={a.name ?? a.mac}
-            />
-          ))}
+        {aps !== null && (
+          <ApChecklist
+            aps={list.aps}
+            value={aps}
+            onChange={(v) => set("aps", v)}
+          />
+        )}
       </Row>
       {list.networks.length > 1 && (
         <Row label="Network">

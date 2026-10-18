@@ -11,7 +11,7 @@ import uPlot from "uplot";
 import "uplot/dist/uPlot.min.css";
 import { isFixed, spanBounds } from "../api";
 import type { TimeSpan } from "../api";
-import { duration, fromLocalInput, spanLabel, toLocalInput } from "../format";
+import { fromLocalInput, spanText, toLocalInput, useNow } from "../format";
 import { Segmented, useDismiss, useSetParams } from "./common";
 
 /** The page's time span: charts show exactly this window, gaps included. */
@@ -46,13 +46,17 @@ export const ZoomContext = createContext<
   ((from: number, to: number) => void) | null
 >(null);
 
+/**
+ * The series colours: the page's `--c-*` variables, so dark mode gets the
+ * dark palette. CSS takes them as they are; the chart reads their values.
+ */
 export const COLORS = {
-  blue: "#3b7ddd",
-  orange: "#e8833a",
-  green: "#2f9e6e",
-  purple: "#8a63d2",
-  red: "#d64545",
-  teal: "#2aa3b8",
+  blue: "var(--c-blue)",
+  orange: "var(--c-orange)",
+  green: "var(--c-green)",
+  purple: "var(--c-purple)",
+  red: "var(--c-red)",
+  teal: "var(--c-teal)",
 };
 
 interface ChartSeries {
@@ -130,6 +134,35 @@ function cssVar(name: string): string {
     .trim();
 }
 
+/** A colour the canvas can draw: a `var(--x)` is read from the page's CSS. */
+function resolve(color: string): string {
+  const v = /^var\((--[\w-]+)\)$/.exec(color)?.[1];
+  return v ? cssVar(v) || "#888" : color;
+}
+
+/**
+ * `color` at `alpha` opacity, in whatever notation it is written: the canvas
+ * reads it back as "#rrggbb", or "rgba(r, g, b, a)" when it is translucent.
+ */
+function withAlpha(color: string, alpha: number): string {
+  const ctx = document.createElement("canvas").getContext("2d");
+  if (ctx) {
+    ctx.fillStyle = color;
+    const c = String(ctx.fillStyle);
+    const hex = /^#([0-9a-f]{2})([0-9a-f]{2})([0-9a-f]{2})$/i.exec(c);
+    if (hex) {
+      const [r, g, b] = hex.slice(1).map((x) => parseInt(x, 16));
+      return `rgba(${r}, ${g}, ${b}, ${alpha})`;
+    }
+    const rgb = /^rgba?\((.*)\)$/.exec(c)?.[1]?.split(",").map(Number);
+    if (rgb && rgb.length >= 3 && rgb.every(Number.isFinite)) {
+      const [r, g, b, a = 1] = rgb;
+      return `rgba(${r}, ${g}, ${b}, ${alpha * a})`;
+    }
+  }
+  return `color-mix(in srgb, ${color} ${alpha * 100}%, transparent)`;
+}
+
 /** A compact time-series chart with a live legend. */
 export function Chart({
   title,
@@ -160,10 +193,18 @@ export function Chart({
     formatRightRef.current = formatRight;
   });
 
-  // Rebuild when the shape (or the colour scheme, for the axes) changes; otherwise only push new data.
+  // Rebuild when the shape (or the colour scheme, for the axes and series) changes; otherwise only push new data.
   const shape =
-    series.map((s) => s.label + s.color + (s.right ? "r" : "")).join("|") +
-    `|${min}|${max}|${height}|${rightMax}|${!!zoom}|${dark}`;
+    series
+      .map(
+        (s) =>
+          s.label +
+          s.color +
+          (s.right ? "r" : "") +
+          (s.fill ? "f" : "") +
+          (s.dashed ? "d" : ""),
+      )
+      .join("|") + `|${min}|${max}|${height}|${rightMax}|${!!zoom}|${dark}`;
   const hasRight = series.some((s) => s.right);
   const current = (): Drawn => ({
     ts,
@@ -253,11 +294,11 @@ export function Chart({
         {},
         ...series.map((s) => ({
           label: s.label,
-          stroke: s.color,
+          stroke: resolve(s.color),
           width: 1.5,
           scale: s.right ? "r" : "y",
           dash: s.dashed ? [4, 3] : undefined,
-          fill: s.fill ? `${s.color}22` : undefined,
+          fill: s.fill ? withAlpha(resolve(s.color), 0.13) : undefined,
           spanGaps: false,
           points: { show: false },
           value: (_u: uPlot, v: number | null) =>
@@ -487,14 +528,18 @@ export function RangePicker({
   };
   const fixed = isFixed(value);
   const preset = !fixed && RANGES.some((r) => r.seconds === value.last);
+  const text = spanText(value);
   const [from, to] = spanBounds(value);
   const len = to - from;
-  // Step a whole window back or forward; reaching the present goes live again.
+  const oldest = useNow() - MAX_AGE;
+  // Step a whole window back or forward; reaching the present goes live
+  // again. At the oldest data kept the window stops, at its length: cutting
+  // only its start left none at all, and an empty window shows live data.
   const step = (dir: -1 | 1) => {
     const now = Math.floor(Date.now() / 1000);
-    const t = to + dir * len;
-    if (t >= now - 60) pick({ last: len });
-    else pick({ from: Math.max(from + dir * len, now - MAX_AGE), to: t });
+    const f = Math.max(from + dir * len, now - MAX_AGE);
+    if (f + len >= now - 60) pick({ last: len });
+    else pick({ from: f, to: f + len });
   };
   return (
     <div className="range-picker" ref={box}>
@@ -502,6 +547,7 @@ export function RangePicker({
         className="btn small step"
         aria-label="Earlier"
         title="Earlier"
+        disabled={from <= oldest}
         onClick={() => step(-1)}
       >
         ‹
@@ -527,11 +573,7 @@ export function RangePicker({
           aria-expanded={open}
           title="Pick dates and times"
         >
-          {fixed
-            ? spanLabel(from, to)
-            : preset
-              ? "Custom…"
-              : `Last ${duration(len)}`}
+          {preset ? "Custom…" : text.charAt(0).toUpperCase() + text.slice(1)}
         </button>
       </Segmented>
       {open && (

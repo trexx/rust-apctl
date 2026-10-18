@@ -86,10 +86,19 @@ export function RadioFields({
   // A setting the lists don't offer is still shown as it is, not as the first choice.
   const strayWidth = !widths.includes(form.ht);
   const strayChannel = form.channel !== "auto" && !legal.includes(form.channel);
+  // Custom power starts at the most the radio can do (what High gives), so
+  // the power shown is the one sent; with none, the AP would stay on auto.
+  const setPowerMode = (m: string) =>
+    onChange({
+      ...form,
+      tx_power_mode: m,
+      tx_power: m === "custom" ? (form.tx_power ?? hi) : form.tx_power,
+    });
   return (
     <>
       <Row label="Channel">
         <Select
+          aria-label="Channel width"
           value={form.ht}
           onChange={(w) =>
             onChange(keepAllowed(r, { ...form, ht: w }, outdoor))
@@ -115,12 +124,17 @@ export function RadioFields({
         />
       </Row>
       <Row label="Transmit power">
-        <Select {...bind("tx_power_mode")} options={POWER} />
+        <Select
+          value={form.tx_power_mode}
+          onChange={setPowerMode}
+          options={POWER}
+        />
         {form.tx_power_mode === "custom" && (
           <label className="small">
             <NumberInput
               {...bind("tx_power")}
-              fallback={lo}
+              aria-label="Custom transmit power"
+              fallback={hi}
               min={lo}
               max={hi}
             />{" "}
@@ -134,6 +148,7 @@ export function RadioFields({
           <label className="small">
             <input
               type="range"
+              aria-label="Minimum signal"
               min={-90}
               max={-67}
               value={form.min_rssi}
@@ -161,6 +176,7 @@ export function RadioFields({
             <label className="small">
               <input
                 type="range"
+                aria-label="Sensitivity level"
                 min={-90}
                 max={-50}
                 value={form.sens_level}
