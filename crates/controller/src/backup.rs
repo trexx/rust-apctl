@@ -989,7 +989,7 @@ pub async fn index(State(s): State<AppState>) -> Result<Json<Value>, ApiError> {
 
 /// PUT /api/backups/settings
 pub async fn put_settings(State(s): State<AppState>, Json(body): Json<Settings>) -> Result<Json<Value>, ApiError> {
-    body.validate().map_err(|e| ApiError(StatusCode::BAD_REQUEST, e))?;
+    body.validate().map_err(ApiError::bad)?;
     let json = serde_json::to_string(&body).map_err(anyhow::Error::from)?;
     // Queued for storing and in effect at once, under the lock so that two
     // saves are stored in the order they take effect.
@@ -1009,7 +1009,7 @@ pub struct CreateBody {
 /// POST /api/backups: make a backup now.
 pub async fn create_now(State(s): State<AppState>, Json(body): Json<CreateBody>) -> Result<Json<Value>, ApiError> {
     if !(-1..=365).contains(&body.days) {
-        return Err(ApiError(StatusCode::BAD_REQUEST, "history must be -1, 0 or 1-365 days".into()));
+        return Err(ApiError::bad("history must be -1, 0 or 1-365 days"));
     }
     let b = s.backups.clone();
     let dir = b.data_dir.clone();
@@ -1029,9 +1029,9 @@ pub async fn create_now(State(s): State<AppState>, Json(body): Json<CreateBody>)
 pub async fn download(State(s): State<AppState>, UrlPath(name): UrlPath<String>) -> Result<Response, ApiError> {
     let b = s.backups.clone();
     if !valid_name(&name) {
-        return Err(ApiError(StatusCode::BAD_REQUEST, "invalid backup name".into()));
+        return Err(ApiError::bad("invalid backup name"));
     }
-    let file = tokio::fs::File::open(b.dir().join(&name)).await.map_err(|_| ApiError(StatusCode::NOT_FOUND, "no such backup".into()))?;
+    let file = tokio::fs::File::open(b.dir().join(&name)).await.map_err(|_| ApiError::not_found("no such backup"))?;
     // The length lets the browser show progress; the file is read a megabyte
     // per trip to the blocking pool, and (as octet-stream) never recompressed.
     let len = file.metadata().await?.len();
@@ -1065,7 +1065,7 @@ pub async fn delete(State(s): State<AppState>, UrlPath(name): UrlPath<String>) -
         })
         .await?;
     if !found {
-        return Err(ApiError(StatusCode::NOT_FOUND, "no such backup".into()));
+        return Err(ApiError::not_found("no such backup"));
     }
     Ok(Json(json!({ "ok": true })))
 }
@@ -1110,7 +1110,7 @@ pub async fn upload(State(s): State<AppState>, body: Body) -> Result<Json<Value>
     // DefaultBodyLimit does not apply to a streamed body: count here.
     let mut size = 0u64;
     while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|e| ApiError(StatusCode::BAD_REQUEST, format!("upload interrupted: {e}")))?;
+        let chunk = chunk.map_err(|e| ApiError::bad(format!("upload interrupted: {e}")))?;
         size += chunk.len() as u64;
         if size > UPLOAD_LIMIT {
             return Err(ApiError(StatusCode::PAYLOAD_TOO_LARGE, "the backup is too large (1 GiB at most)".into()));
@@ -1136,9 +1136,9 @@ fn refused(e: anyhow::Error) -> ApiError {
     use io::ErrorKind::*;
     let kind = e.chain().find_map(|c| c.downcast_ref::<io::Error>()).map(io::Error::kind);
     match kind {
-        Some(NotFound) => ApiError(StatusCode::NOT_FOUND, format!("{e:#}")),
+        Some(NotFound) => ApiError::not_found(format!("{e:#}")),
         Some(StorageFull | QuotaExceeded | PermissionDenied | ReadOnlyFilesystem | OutOfMemory) => ApiError::from(e),
-        _ => ApiError(StatusCode::BAD_REQUEST, format!("{e:#}")),
+        _ => ApiError::bad(format!("{e:#}")),
     }
 }
 

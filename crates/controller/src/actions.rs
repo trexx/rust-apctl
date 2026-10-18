@@ -141,7 +141,7 @@ fn known_ap(s: &AppState, mac: &Mac) -> Result<(), ApiError> {
     if s.live.read().unwrap().devices.contains_key(mac) {
         Ok(())
     } else {
-        Err(ApiError(StatusCode::NOT_FOUND, "unknown AP (or it hasn't reported since apctl started)".into()))
+        Err(ApiError::not_found("unknown AP (or it hasn't reported since apctl started)"))
     }
 }
 
@@ -288,7 +288,7 @@ pub async fn edit_settings(s: &AppState, what: String, edit: impl FnOnce(&mut Va
 pub async fn apply_edit(s: &AppState, edit: crate::engine::StateEdit) -> Result<String, ApiError> {
     crate::api::current_state(s)?;
     let (tx, rx) = tokio::sync::oneshot::channel();
-    s.ask(Input::EditState { ts: clock::now_ts(), edit, done: tx }, rx).await?.map_err(|e| ApiError(StatusCode::BAD_REQUEST, e))
+    s.ask(Input::EditState { ts: clock::now_ts(), edit, done: tx }, rx).await?.map_err(ApiError::bad)
 }
 
 #[cfg(test)]

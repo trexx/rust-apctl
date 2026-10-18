@@ -447,7 +447,7 @@ pub async fn login(
 ) -> Result<Response, ApiError> {
     let auth = s.auth.clone();
     if !auth.enabled() {
-        return Err(ApiError(StatusCode::NOT_FOUND, "login is not enabled".into()));
+        return Err(ApiError::not_found("login is not enabled"));
     }
     let ip = auth.proxies.client_ip(&headers, peer.ip());
     if !auth.attempt(ip) {

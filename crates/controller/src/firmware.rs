@@ -553,10 +553,10 @@ pub fn valid_firmware_url(url: &str) -> bool {
 pub async fn upgrade_url(State(s): State<AppState>, Json(b): Json<UrlBody>) -> Result<Json<Value>, ApiError> {
     crate::api::require_active(&s, "upgrades need")?;
     if !valid_firmware_url(&b.url) {
-        return Err(ApiError(StatusCode::BAD_REQUEST, "use an http(s) or ftp URL ending in .bin or .tar".into()));
+        return Err(ApiError::bad("use an http(s) or ftp URL ending in .bin or .tar"));
     }
     let mac = crate::api::parse_mac(&b.mac)?;
-    let a = aps(&s.live.read().unwrap()).into_iter().find(|a| a.mac == mac).ok_or_else(|| ApiError(StatusCode::NOT_FOUND, "unknown AP".into()))?;
+    let a = aps(&s.live.read().unwrap()).into_iter().find(|a| a.mac == mac).ok_or_else(|| ApiError::not_found("unknown AP"))?;
     if !a.online {
         return Err(ApiError(StatusCode::CONFLICT, "the AP is offline".into()));
     }

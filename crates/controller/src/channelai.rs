@@ -428,7 +428,7 @@ pub struct BandBody {
 /// POST /api/rf/scan {band}
 pub async fn scan(State(s): State<AppState>, Json(b): Json<BandBody>) -> Result<Json<Value>, ApiError> {
     crate::api::require_active(&s, "this needs")?;
-    let band = Band::named(&b.band).ok_or_else(|| ApiError(StatusCode::BAD_REQUEST, "band must be ng or na".into()))?;
+    let band = Band::named(&b.band).ok_or_else(|| ApiError::bad("band must be ng or na"))?;
     let asked = start_scans(&mut s.live.write().unwrap(), band, clock::now_ts());
     if asked.is_empty() {
         return Err(ApiError(StatusCode::CONFLICT, "no online AP can scan this band".into()));
@@ -462,15 +462,15 @@ pub struct ApplyBody {
 /// Every change must be complete (a malformed one refuses the whole plan).
 pub async fn apply_plan(State(s): State<AppState>, Json(b): Json<Value>) -> Result<Json<Value>, ApiError> {
     crate::api::require_active(&s, "this needs")?;
-    let b: ApplyBody = serde_json::from_value(b).map_err(|e| ApiError(StatusCode::BAD_REQUEST, format!("not a plan: {e}")))?;
+    let b: ApplyBody = serde_json::from_value(b).map_err(|e| ApiError::bad(format!("not a plan: {e}")))?;
     if Band::named(&b.band).is_none() {
-        return Err(ApiError(StatusCode::BAD_REQUEST, "band must be ng or na".into()));
+        return Err(ApiError::bad("band must be ng or na"));
     }
     if b.changes.is_empty() {
-        return Err(ApiError(StatusCode::BAD_REQUEST, "the plan changes nothing".into()));
+        return Err(ApiError::bad("the plan changes nothing"));
     }
     if let Some(c) = b.changes.iter().find(|c| !crate::settings::is_mac(&c.mac)) {
-        return Err(ApiError(StatusCode::BAD_REQUEST, format!("{} is not a MAC address", c.mac)));
+        return Err(ApiError::bad(format!("{} is not a MAC address", c.mac)));
     }
     apply(&s, &b.band, &b.changes, "manual").await?;
     let data = json!({ "band": b.band, "trigger": "manual", "changes": b.changes, "applied": true });

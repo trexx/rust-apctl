@@ -1402,7 +1402,7 @@ struct Heard {
 pub async fn compute_plan(s: &AppState, radio: String, dfs: bool, allowed: Option<Vec<i64>>, pinned: Vec<String>) -> Result<Plan, ApiError> {
     // The channel blocks are worked out for 2.4 and 5 GHz only.
     if !matches!(radio.as_str(), "ng" | "na") {
-        return Err(ApiError(axum::http::StatusCode::BAD_REQUEST, "band must be ng or na".into()));
+        return Err(ApiError::bad("band must be ng or na"));
     }
     let since = clock::now_ts() - 7 * 86400;
     let r2 = radio.clone();

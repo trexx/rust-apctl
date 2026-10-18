@@ -21,7 +21,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use axum::extract::State;
-use axum::http::{StatusCode, header};
+use axum::http::header;
 use axum::response::{IntoResponse, Response};
 use rusqlite::Connection;
 use rusqlite::types::Value as Sql;
@@ -829,12 +829,12 @@ fn yes() -> bool {
 /// PUT /api/rf/threats/ack
 pub async fn ack(State(s): State<AppState>, Json(b): Json<AckBody>) -> Result<Json<Value>, ApiError> {
     let Some(kind) = Kind::parse(&b.kind) else {
-        return Err(ApiError(StatusCode::BAD_REQUEST, "unknown kind".into()));
+        return Err(ApiError::bad("unknown kind"));
     };
-    let bssid: Mac = b.bssid.parse().map_err(|_| ApiError(StatusCode::BAD_REQUEST, "invalid BSSID".into()))?;
+    let bssid: Mac = b.bssid.parse().map_err(|_| ApiError::bad("invalid BSSID"))?;
     let note = b.note.map(|n| n.trim().to_string()).filter(|n| !n.is_empty());
     if note.as_ref().is_some_and(|n| n.chars().count() > 200) {
-        return Err(ApiError(StatusCode::BAD_REQUEST, "note is too long (200 characters at most)".into()));
+        return Err(ApiError::bad("note is too long (200 characters at most)"));
     }
     let (ts, bssid) = (clock::now_ts(), bssid.to_string());
     let ack = b.ack.then_some(Ack { note, ts });

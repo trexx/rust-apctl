@@ -182,6 +182,16 @@ impl ApiError {
         ApiError(StatusCode::INTERNAL_SERVER_ERROR, msg.into())
     }
 
+    /// A request that can't be done as asked (400), saying what is wrong with it.
+    pub fn bad(msg: impl Into<String>) -> Self {
+        ApiError(StatusCode::BAD_REQUEST, msg.into())
+    }
+
+    /// What the request names isn't there (404).
+    pub fn not_found(msg: impl Into<String>) -> Self {
+        ApiError(StatusCode::NOT_FOUND, msg.into())
+    }
+
     /// Nothing to work on: no settings were imported yet.
     pub fn no_state() -> Self {
         ApiError(StatusCode::CONFLICT, "no settings imported yet".into())
@@ -244,13 +254,9 @@ impl From<tokio::task::JoinError> for ApiError {
 
 type ApiResult = Result<Json<Value>, ApiError>;
 
-fn bad(msg: impl Into<String>) -> ApiError {
-    ApiError(StatusCode::BAD_REQUEST, msg.into())
-}
-
 /// A MAC address from the URL or body; 400 when it isn't one.
 pub fn parse_mac(s: &str) -> Result<Mac, ApiError> {
-    s.parse().map_err(|_| bad(format!("invalid MAC {s}")))
+    s.parse().map_err(|_| ApiError::bad(format!("invalid MAC {s}")))
 }
 
 // axum's extractors answer a malformed request in plain text. These wrap them
@@ -524,7 +530,7 @@ async fn device(State(s): State<AppState>, MacPath(mac): MacPath) -> Result<Resp
             }
             // Known but not reporting since apctl started: offline, with what was stored.
             (None, Some(k)) => (stored_view(mac, k), Vec::new(), false, true),
-            (None, None) => return Err(ApiError(StatusCode::NOT_FOUND, "unknown device".into())),
+            (None, None) => return Err(ApiError::not_found("unknown device")),
         }
     };
     let clients = clients.iter().map(ListedView::new).collect();
@@ -689,7 +695,7 @@ fn multicast_peers(live: &crate::engine::Live, mac: &Mac, groups: &[String]) -> 
 async fn client(State(s): State<AppState>, MacPath(mac): MacPath) -> Result<Response, ApiError> {
     let (view, alias, state, peers) = {
         let live = s.live.read().unwrap();
-        let view = live.clients.get(&mac).cloned().ok_or_else(|| ApiError(StatusCode::NOT_FOUND, "unknown client".into()))?;
+        let view = live.clients.get(&mac).cloned().ok_or_else(|| ApiError::not_found("unknown client"))?;
         let peers = multicast_peers(&live, &mac, view.sample.multicast.as_ref().map_or(&[], |m| &m.memberships));
         (view, live.aliases.get(&mac).cloned().unwrap_or_default(), live.state.clone(), peers)
     };
@@ -713,7 +719,7 @@ async fn state_summary(State(s): State<AppState>) -> ApiResult {
 
 /// Replaces the imported controller settings with an `informdump import` snapshot.
 async fn import_state(State(s): State<AppState>, Json(state): Json<Value>) -> ApiResult {
-    crate::dryrun::validate_state(&state).map_err(|e| bad(format!("{e:#}")))?;
+    crate::dryrun::validate_state(&state).map_err(|e| ApiError::bad(format!("{e:#}")))?;
     let summary = crate::dryrun::summarize_state(&state);
     s.send(crate::engine::Input::SetState { ts: clock::now_ts(), state }).await?;
     Ok(Json(json!({ "ok": true, "summary": summary })))
@@ -876,10 +882,10 @@ const MAX_NOTE: usize = 500;
 
 fn validate(alias: &Option<String>, note: &Option<String>) -> Result<(), ApiError> {
     if alias.as_ref().is_some_and(|a| a.chars().count() > MAX_ALIAS) {
-        return Err(bad(format!("alias longer than {MAX_ALIAS} characters")));
+        return Err(ApiError::bad(format!("alias longer than {MAX_ALIAS} characters")));
     }
     if note.as_ref().is_some_and(|n| n.chars().count() > MAX_NOTE) {
-        return Err(bad(format!("note longer than {MAX_NOTE} characters")));
+        return Err(ApiError::bad(format!("note longer than {MAX_NOTE} characters")));
     }
     Ok(())
 }
@@ -938,10 +944,10 @@ struct SeriesQuery {
 }
 
 async fn series(State(s): State<AppState>, Path(table): Path<String>, Query(q): Query<SeriesQuery>) -> Result<Json<store::Series>, ApiError> {
-    let t = store::table(&table).ok_or_else(|| bad(format!("unknown series {table}")))?;
+    let t = store::table(&table).ok_or_else(|| ApiError::bad(format!("unknown series {table}")))?;
     let keys: Vec<String> = q.key.split(',').map(str::to_string).collect();
     if keys.len() != t.keys.len() {
-        return Err(bad(format!("{table} needs key {}", t.keys.join(","))));
+        return Err(ApiError::bad(format!("{table} needs key {}", t.keys.join(","))));
     }
     let now = clock::now_ts();
     let to = q.to.unwrap_or(now);
