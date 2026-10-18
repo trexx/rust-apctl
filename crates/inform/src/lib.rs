@@ -341,15 +341,11 @@ pub fn seal(mac: Mac, flags: Flags, iv: [u8; 16], key: &[u8; 16], plaintext: &[u
     encrypt_into(mac, flags, iv, key, compress_into(flags, plaintext, out))
 }
 
-/// [`seal`] with the payload written by `write` (e.g. `serde_json::to_writer`)
-/// at the end of the buffer it gets: straight into the packet, unless it is
-/// to be compressed.
+/// [`seal`] for an uncompressed packet, with the payload written by `write`
+/// (e.g. `serde_json::to_writer`) at the end of the buffer it gets: straight
+/// into the packet. A compressed packet is built with [`seal`].
 pub fn seal_with(mac: Mac, flags: Flags, iv: [u8; 16], key: &[u8; 16], write: impl FnOnce(&mut Vec<u8>)) -> Vec<u8> {
-    if flags.contains(Flags::ZLIB) || flags.contains(Flags::SNAPPY) {
-        let mut plaintext = Vec::new();
-        write(&mut plaintext);
-        return seal(mac, flags, iv, key, &plaintext);
-    }
+    assert!(!flags.contains(Flags::ZLIB) && !flags.contains(Flags::SNAPPY), "seal_with builds uncompressed packets only");
     let mut out = vec![0; HEADER_LEN];
     write(&mut out);
     encrypt_into(mac, flags, iv, key, out)
@@ -436,7 +432,9 @@ mod tests {
         ];
         for bits in combos {
             let wire = seal(MAC, bits, IV, &KEY, JSON);
-            assert_eq!(seal_with(MAC, bits, IV, &KEY, |out| out.extend_from_slice(JSON)), wire, "flags {:?}", bits);
+            if !bits.contains(Flags::ZLIB) && !bits.contains(Flags::SNAPPY) {
+                assert_eq!(seal_with(MAC, bits, IV, &KEY, |out| out.extend_from_slice(JSON)), wire, "flags {:?}", bits);
+            }
             let pkt = Packet::parse(&wire).unwrap();
             assert_eq!(pkt.header.mac, MAC);
             assert_eq!(pkt.header.flags, bits);
