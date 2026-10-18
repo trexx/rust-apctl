@@ -49,11 +49,11 @@ pub struct Release {
     pub created: Option<String>,
 }
 
-/// The newest release per platform from the feed. Entries without a version
-/// or a download link are skipped.
+/// The newest release per platform from the feed, in the order the platforms
+/// first appear. Entries without a version or a download link are skipped.
 pub fn parse_feed(feed: &Value) -> Vec<Release> {
     let s = |v: &Value| v.as_str().filter(|x| !x.is_empty()).map(str::to_string);
-    feed["_embedded"]["firmware"]
+    let all = feed["_embedded"]["firmware"]
         .as_array()
         .into_iter()
         .flatten()
@@ -70,8 +70,20 @@ pub fn parse_feed(feed: &Value) -> Vec<Release> {
                 version.push_str(&format!(".{b}"));
             }
             Some(Release { platform: s(&f["platform"])?, version, url, md5: s(&f["md5"]), sha256: s(&f["sha256"]), size: f["file_size"].as_i64(), created: s(&f["created"]) })
-        })
-        .collect()
+        });
+    let mut out: Vec<Release> = Vec::new();
+    let mut at: HashMap<String, usize> = HashMap::new();
+    for r in all {
+        match at.get(&r.platform) {
+            Some(&i) if compare(&r.version, &out[i].version).is_gt() => out[i] = r,
+            Some(_) => {}
+            None => {
+                at.insert(r.platform.clone(), out.len());
+                out.push(r);
+            }
+        }
+    }
+    out
 }
 
 /// The feed's platform key for an AP model code (a few differ in case).
@@ -614,6 +626,12 @@ mod tests {
         assert_eq!((r[0].platform.as_str(), r[0].version.as_str(), r[0].size), ("U6M", "6.8.2.15592", Some(22586927)));
         assert_eq!(r[0].md5.as_deref(), Some("0fec04452cadd2d025777d36ab2974ea"));
         assert_eq!(r[0].sha256, None);
+        // Two entries for a platform: the newer, wherever it is listed.
+        let entry = |platform: &str, patch: i64| json!({ "platform": platform, "version_major": 6, "version_minor": 8, "version_patch": patch, "version_build": "1", "_links": { "data": { "href": "u" } } });
+        for list in [[entry("U6M", 10), entry("U6M", 9), entry("U7P", 1)], [entry("U6M", 9), entry("U6M", 10), entry("U7P", 1)]] {
+            let r = parse_feed(&json!({ "_embedded": { "firmware": list } }));
+            assert_eq!(r.iter().map(|r| (r.platform.as_str(), r.version.as_str())).collect::<Vec<_>>(), [("U6M", "6.8.10.1"), ("U7P", "6.8.1.1")]);
+        }
     }
 
     #[test]
