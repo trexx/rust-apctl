@@ -1086,10 +1086,8 @@ fn wlan_bands(p: &Value, w: &mut Value) -> Result<Vec<String>, String> {
 /// The roaming assistant, band steering and the IoT locks, which depend on the bands.
 fn wlan_roaming(p: &Value, w: &mut Value, bands: &[String]) -> Result<(), String> {
     let has = |b: &str| bands.iter().any(|x| x == b);
+    // Force Wi-Fi 4 holds the roaming assistant off (IOT_TEMPLATE).
     copy_fields(p, w, &[("roaming_assistant_na_enabled", Bool), ("roaming_assistant_na_rssi", Int(-80, -60))])?;
-    if w["roaming_assistant_na_enabled"].as_bool() == Some(true) && w["enhanced_iot"].as_bool() == Some(true) {
-        return Err("the roaming assistant is not available with Force Wi-Fi 4".into());
-    }
 
     // Band steering: dual-band clients the AP has seen on 5 GHz are kept off 2.4 GHz.
     let dual = has("2g") && has("5g");
@@ -1824,6 +1822,18 @@ mod tests {
         assert!(edit(&mut s, json!({ "wlan_bands": ["2g", "5g"] })).is_err());
         assert!(edit(&mut s, json!({ "protection": "wpa3" })).is_err());
         edit(&mut s, json!({ "enhanced_iot": false, "wlan_bands": ["2g", "5g"] })).unwrap();
+    }
+
+    #[test]
+    fn an_imported_force_wifi4_ssid_with_the_roaming_assistant_can_be_edited() {
+        let mut s = state();
+        let w = &mut s["wlanconf"][0];
+        (w["enhanced_iot"], w["wlan_bands"], w["roaming_assistant_na_enabled"]) = (json!(true), json!(["2g"]), json!(true));
+        // The stored value goes with the save; asking for it is refused.
+        let what = edit(&mut s, json!({ "name": "Things" })).unwrap();
+        assert!(what.contains("roaming_assistant_na_enabled"), "{what}");
+        assert_eq!((s["wlanconf"][0]["name"].as_str(), s["wlanconf"][0]["roaming_assistant_na_enabled"].as_bool()), (Some("Things"), Some(false)));
+        assert!(edit(&mut s, json!({ "roaming_assistant_na_enabled": true })).unwrap_err().contains("roaming assistant"));
     }
 
     #[test]
