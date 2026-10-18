@@ -29,6 +29,7 @@ import {
   QueryState,
   Signal,
   Stat,
+  THead,
 } from "../components/common";
 import {
   ago,
@@ -195,16 +196,16 @@ function DevicePage({ mac }: { mac: string }) {
           <h2>Connected clients</h2>
           <div className="panel">
             <table className="table">
-              <thead>
-                <tr>
-                  <th>Client</th>
-                  <th>SSID</th>
-                  <th>Band</th>
-                  <th>Signal</th>
-                  <th>Rate (down/up)</th>
-                  <th>Connected</th>
-                </tr>
-              </thead>
+              <THead
+                columns={[
+                  "Client",
+                  "SSID",
+                  "Band",
+                  "Signal",
+                  "Rate (down/up)",
+                  "Connected",
+                ]}
+              />
               <tbody>
                 {clients
                   .slice()
@@ -381,14 +382,7 @@ function ActiveClients({ mac, range }: { mac: string; range: TimeSpan }) {
             <div className="muted small">No client traffic in this range.</div>
           ) : (
             <table className="table">
-              <thead>
-                <tr>
-                  <th>Client</th>
-                  <th>Vendor</th>
-                  <th>Download</th>
-                  <th>Upload</th>
-                </tr>
-              </thead>
+              <THead columns={["Client", "Vendor", "Download", "Upload"]} />
               <tbody>
                 {data.clients.slice(0, 10).map((c) => (
                   <tr key={c.mac}>

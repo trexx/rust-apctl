@@ -1,7 +1,7 @@
 import { Link } from "react-router";
 import { useDeviceNames, useDryRun } from "../api";
 import type { DryRun as DryRunData, FieldComparison } from "../api";
-import { Dot, ErrorNote, Loading } from "../components/common";
+import { Dot, ErrorNote, Loading, THead } from "../components/common";
 import { clock, useNow } from "../format";
 import type { Tone } from "../format";
 
@@ -127,14 +127,7 @@ export function DryRun() {
           </div>
         ) : (
           <table className="table">
-            <thead>
-              <tr>
-                <th>Time</th>
-                <th>AP</th>
-                <th>Result</th>
-                <th>system_cfg</th>
-              </tr>
-            </thead>
+            <THead columns={["Time", "AP", "Result", "system_cfg"]} />
             <tbody>
               {d.history.map((h) => (
                 <tr key={h.id}>

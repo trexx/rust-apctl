@@ -4,7 +4,7 @@ import { useMulticast } from "../../api";
 import type { SiteMulticast, TimeSpan } from "../../api";
 import { compact, spanText } from "../../format";
 import { COLORS, Chart, SpanContext } from "../Chart";
-import { QueryState, Segmented } from "../common";
+import { QueryState, Segmented, THead } from "../common";
 
 const DIRECTIONS = [
   ["tx", "To clients"],
@@ -146,19 +146,18 @@ function MulticastView({
         </div>
         {data.clients.length > 0 && (
           <table className="table mcast-clients">
-            <thead>
-              <tr>
-                <th>Client</th>
-                <th title="Multicast and broadcast packets the client sent">
-                  Sent
-                </th>
-                <th title="Multicast and broadcast packets its network delivered while it was connected">
-                  Received
-                </th>
-                <th>Services</th>
-                <th>Delivery</th>
-              </tr>
-            </thead>
+            <THead
+              columns={[
+                "Client",
+                ["Sent", "Multicast and broadcast packets the client sent"],
+                [
+                  "Received",
+                  "Multicast and broadcast packets its network delivered while it was connected",
+                ],
+                "Services",
+                "Delivery",
+              ]}
+            />
             <tbody>
               {data.clients.slice(0, 8).map((c) => (
                 <tr key={c.mac}>

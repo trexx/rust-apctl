@@ -18,8 +18,9 @@ import { RoamingView } from "../components/RoamingView";
 import {
   Meter,
   QueryState,
-  Signal,
   Segmented,
+  Signal,
+  THead,
   useUrlTab,
 } from "../components/common";
 import { ChannelAiPanel, PlanActions } from "../components/ChannelAi";
@@ -169,15 +170,7 @@ function ChannelPlan({
         {(data) => (
           <div className="table-wrap">
             <table className="table">
-              <thead>
-                <tr>
-                  <th>AP</th>
-                  <th>Now</th>
-                  <th>Score</th>
-                  <th>Suggested</th>
-                  <th>Why</th>
-                </tr>
-              </thead>
+              <THead columns={["AP", "Now", "Score", "Suggested", "Why"]} />
               <tbody>
                 {data.plan.map((p) => {
                   const r = radios.find(
@@ -255,21 +248,21 @@ function RadioTable({ radios }: { radios: RadioOverview[] }) {
       </div>
       <div className="table-wrap">
         <table className="table">
-          <thead>
-            <tr>
-              <th>AP</th>
-              <th>Band</th>
-              <th>Channel</th>
-              <th>TX power</th>
-              <th>Clients</th>
-              <th>Utilisation</th>
-              <th>Interference</th>
-              <th>TX retries</th>
-              <th>Noise</th>
-              <th>Client signal</th>
-              <th>Traffic</th>
-            </tr>
-          </thead>
+          <THead
+            columns={[
+              "AP",
+              "Band",
+              "Channel",
+              "TX power",
+              "Clients",
+              "Utilisation",
+              "Interference",
+              "TX retries",
+              "Noise",
+              "Client signal",
+              "Traffic",
+            ]}
+          />
           <tbody>
             {radios.map((r) => (
               <tr
@@ -452,17 +445,17 @@ function Environment() {
             ) : (
               <div className="table-wrap">
                 <table className="table">
-                  <thead>
-                    <tr>
-                      <th>Network</th>
-                      <th>Channel</th>
-                      <th>Signal</th>
-                      <th>Security</th>
-                      <th>Vendor</th>
-                      <th>Heard best by</th>
-                      <th>Last seen</th>
-                    </tr>
-                  </thead>
+                  <THead
+                    columns={[
+                      "Network",
+                      "Channel",
+                      "Signal",
+                      "Security",
+                      "Vendor",
+                      "Heard best by",
+                      "Last seen",
+                    ]}
+                  />
                   <tbody>
                     {list.map((x) => (
                       <tr key={x.bssid}>

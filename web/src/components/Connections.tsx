@@ -10,7 +10,7 @@ import type {
   Timings,
 } from "../api";
 import { band, clock, useNow } from "../format";
-import { QueryState, Segmented, Signal, sameRow } from "./common";
+import { QueryState, Segmented, Signal, THead, sameRow } from "./common";
 import { stableKeys } from "./keys";
 
 const STAGE_NAME = [
@@ -211,17 +211,17 @@ export function ConnHead({
   roamsOnly?: boolean;
 }) {
   return (
-    <thead>
-      <tr>
-        <th>Time</th>
-        {client && <th>Client</th>}
-        <th>Result</th>
-        <th>{roamsOnly ? "From → to" : "Access point"}</th>
-        <th>Network</th>
-        <th>Signal</th>
-        {!roamsOnly && <th>Time to connect</th>}
-      </tr>
-    </thead>
+    <THead
+      columns={[
+        "Time",
+        client && "Client",
+        "Result",
+        roamsOnly ? "From → to" : "Access point",
+        "Network",
+        "Signal",
+        !roamsOnly && "Time to connect",
+      ]}
+    />
   );
 }
 

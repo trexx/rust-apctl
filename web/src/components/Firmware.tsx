@@ -12,7 +12,7 @@ import {
 } from "../api";
 import type { FirmwareInfo } from "../api";
 import { ago, bytes, clock, useNow } from "../format";
-import { Outcome, QueryNote, useRunner } from "./common";
+import { Outcome, QueryNote, THead, useRunner } from "./common";
 import { TextInput } from "./settings/form";
 
 const STATUS: Record<FirmwareInfo["aps"][number]["status"], [string, string]> =
@@ -101,15 +101,15 @@ export function FirmwarePanel() {
         <Outcome msg={msg} />
         <div className="table-wrap">
           <table className="table">
-            <thead>
-              <tr>
-                <th>Access point</th>
-                <th>Running</th>
-                <th>Latest release</th>
-                <th>Status</th>
-                <th />
-              </tr>
-            </thead>
+            <THead
+              columns={[
+                "Access point",
+                "Running",
+                "Latest release",
+                "Status",
+                "",
+              ]}
+            />
             <tbody>
               {d.aps.map((a) => (
                 <tr key={a.mac}>

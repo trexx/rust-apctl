@@ -11,7 +11,7 @@ import {
 } from "../api";
 import type { BackupManifest, BackupMeta, BackupSettings } from "../api";
 import { ago, bytes, dateTime as when, hhmm, useNow } from "../format";
-import { Outcome, QueryNote, useRunner } from "./common";
+import { Outcome, QueryNote, THead, useRunner } from "./common";
 import { FileButton } from "./FileButton";
 import { NumberInput, TimeInput } from "./settings/form";
 
@@ -425,16 +425,9 @@ export function BackupSection() {
       ) : (
         <div className="table-wrap">
           <table className="table">
-            <thead>
-              <tr>
-                <th>Made</th>
-                <th>Kind</th>
-                <th>Contains</th>
-                <th>apctl</th>
-                <th>Size</th>
-                <th />
-              </tr>
-            </thead>
+            <THead
+              columns={["Made", "Kind", "Contains", "apctl", "Size", ""]}
+            />
             <tbody>
               {d.backups.map((x) => (
                 <tr key={x.name}>

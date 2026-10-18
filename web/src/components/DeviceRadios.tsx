@@ -2,7 +2,7 @@ import { useState } from "react";
 import { useSeries, useSiteActivity } from "../api";
 import type { ClientView, RadioSample, TimeSpan, VapSample } from "../api";
 import { COLORS, Chart } from "./Chart";
-import { QueryState, Signal } from "./common";
+import { QueryState, Signal, THead } from "./common";
 import {
   SIGNAL,
   band,
@@ -298,16 +298,16 @@ export function VapTable({
   return (
     <div className="panel">
       <table className="table">
-        <thead>
-          <tr>
-            <th>SSID</th>
-            <th>Band</th>
-            <th>Clients</th>
-            <th>Avg signal</th>
-            <th>Satisfaction</th>
-            <th>BSSID</th>
-          </tr>
-        </thead>
+        <THead
+          columns={[
+            "SSID",
+            "Band",
+            "Clients",
+            "Avg signal",
+            "Satisfaction",
+            "BSSID",
+          ]}
+        />
         <tbody>
           {vaps.map((v) => (
             <VapRow

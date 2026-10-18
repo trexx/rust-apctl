@@ -4,7 +4,7 @@ import type { Roaming } from "../api";
 import { pct, roamTone, spanText, useNow } from "../format";
 import { RangePicker, useTimeSpan } from "./Chart";
 import { ConnHead, RoamRow, roamId } from "./Connections";
-import { QueryState, Signal, Stat } from "./common";
+import { QueryState, Signal, Stat, THead } from "./common";
 import { stableKeys } from "./keys";
 
 export function RoamingView() {
@@ -82,15 +82,9 @@ function Details({ data }: { data: Roaming }) {
             <b>Between access points</b>
           </div>
           <table className="table">
-            <thead>
-              <tr>
-                <th>APs</th>
-                <th>Roams</th>
-                <th>Success</th>
-                <th>Fast</th>
-                <th>Top clients</th>
-              </tr>
-            </thead>
+            <THead
+              columns={["APs", "Roams", "Success", "Fast", "Top clients"]}
+            />
             <tbody>
               {data.pairs.map((p) => (
                 <tr key={p.ap_1 + p.ap_2}>
@@ -129,14 +123,14 @@ function Details({ data }: { data: Roaming }) {
             <b>Clients that roam most</b>
           </div>
           <table className="table">
-            <thead>
-              <tr>
-                <th>Client</th>
-                <th>Roams</th>
-                <th title="Average signal when leaving an AP">Leaves at</th>
-                <th title="apctl's own measures">Questionable</th>
-              </tr>
-            </thead>
+            <THead
+              columns={[
+                "Client",
+                "Roams",
+                ["Leaves at", "Average signal when leaving an AP"],
+                ["Questionable", "apctl's own measures"],
+              ]}
+            />
             <tbody>
               {data.clients.slice(0, 10).map((c) => (
                 <tr key={c.mac}>

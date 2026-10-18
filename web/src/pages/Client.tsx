@@ -26,6 +26,7 @@ import {
   QueryState,
   Signal,
   Stat,
+  THead,
   useRunner,
 } from "../components/common";
 import {
@@ -380,13 +381,7 @@ function ClientMulticast({
             <div className="muted small">None.</div>
           ) : (
             <table className="table">
-              <thead>
-                <tr>
-                  <th>Type</th>
-                  <th>Sent</th>
-                  <th>Received</th>
-                </tr>
-              </thead>
+              <THead columns={["Type", "Sent", "Received"]} />
               <tbody>
                 {types.map(([k, c]) => (
                   <tr key={k}>
@@ -422,12 +417,7 @@ function ClientMulticast({
             </div>
           ) : (
             <table className="table">
-              <thead>
-                <tr>
-                  <th>Group</th>
-                  <th>Also joined by</th>
-                </tr>
-              </thead>
+              <THead columns={["Group", "Also joined by"]} />
               <tbody>
                 {m.memberships.map((g) => {
                   const p = others(g);

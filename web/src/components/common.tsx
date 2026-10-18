@@ -87,6 +87,32 @@ export function Meter({
   );
 }
 
+/** A column's heading: its label, or `[label, title]` to explain it on hover. */
+type Column = string | readonly [label: string, title: string];
+
+/** A table's head row; a column given as `false` or `undefined` is left out. */
+export function THead({
+  columns,
+}: {
+  columns: readonly (Column | false | undefined)[];
+}) {
+  return (
+    <thead>
+      <tr>
+        {columns.map((c, i) => {
+          if (c === false || c === undefined) return null;
+          const [label, title] = typeof c === "string" ? [c] : c;
+          return (
+            <th key={i} title={title}>
+              {label}
+            </th>
+          );
+        })}
+      </tr>
+    </thead>
+  );
+}
+
 export function Loading() {
   return <div className="muted pad">Loading…</div>;
 }
