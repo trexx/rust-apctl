@@ -221,6 +221,19 @@ impl Sweeper {
         }
         due
     }
+
+    /// Makes room in a map of `MAX_CONNS` entries for one more at `ts`: sweeps it (keeping
+    /// what `live` says to), and if that frees too little, forgets the eighth that comes
+    /// first by `age`.
+    pub(crate) fn make_room<K, V, A: Ord>(&mut self, map: &mut HashMap<K, V>, ts: Micros, live: impl Fn(&V) -> bool, age: impl Fn(&V) -> A) {
+        self.last = ts;
+        map.retain(|_, v| live(v));
+        if map.len() > MAX_CONNS - MAX_CONNS / 8 {
+            let mut order: Vec<A> = map.values().map(&age).collect();
+            let (_, cutoff, _) = order.select_nth_unstable(MAX_CONNS / 8);
+            map.retain(|_, v| age(v) > *cutoff);
+        }
+    }
 }
 /// Most connections tracked at once. An AP keeps one open, so this is far more than
 /// any site has; it bounds what packets with made-up addresses can make us hold.
@@ -351,13 +364,8 @@ impl Tracker {
     /// cost no more than that, and a real connection that is forgotten picks up again
     /// at its next message.
     fn make_room(&mut self, ts: Micros) {
-        self.sweeper.last = ts;
-        self.retain(|c| ts - c.last_seen < c.max_idle());
-        if self.conns.len() > MAX_CONNS - MAX_CONNS / 8 {
-            let mut order: Vec<(bool, Micros)> = self.conns.values().map(|c| (c.carried, c.last_seen)).collect();
-            let (_, &mut cutoff, _) = order.select_nth_unstable(MAX_CONNS / 8);
-            self.retain(|c| (c.carried, c.last_seen) > cutoff);
-        }
+        self.sweeper.make_room(&mut self.conns, ts, |c| ts - c.last_seen < c.max_idle(), |c| (c.carried, c.last_seen));
+        self.held = self.conns.values().map(|c| c.held).sum();
     }
 }
 

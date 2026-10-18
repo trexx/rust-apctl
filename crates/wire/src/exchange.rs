@@ -65,13 +65,7 @@ impl Pairer {
     /// forgets the stale ones, and if that frees too little, the eighth that waited
     /// longest. Requests from made-up connections cost no more than that.
     fn make_room(&mut self, ts: Micros) {
-        self.sweeper.last = ts;
-        self.in_flight.retain(|_, (last, _)| ts - *last < MAX_WAIT);
-        if self.in_flight.len() > MAX_CONNS - MAX_CONNS / 8 {
-            let mut order: Vec<Micros> = self.in_flight.values().map(|(last, _)| *last).collect();
-            let (_, &mut cutoff, _) = order.select_nth_unstable(MAX_CONNS / 8);
-            self.in_flight.retain(|_, (last, _)| *last > cutoff);
-        }
+        self.sweeper.make_room(&mut self.in_flight, ts, |(last, _)| ts - *last < MAX_WAIT, |(last, _)| *last);
     }
 
     /// The request a response answers: the next one in order, or for a reply sealed
