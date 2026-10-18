@@ -287,6 +287,20 @@ impl ApWatch {
             _ => None,
         }
     }
+
+    /// Forgets what no longer counts: offline alerts over a day old (but not
+    /// an offline AP's, which tell whether its return is reported), and
+    /// "keeps dropping off" days before today.
+    fn prune(&mut self, now: Ts) {
+        let down = &self.down;
+        self.sent.retain(|mac, sent| {
+            if !down.contains_key(mac) {
+                sent.retain(|t| *t > now - 86400);
+            }
+            !sent.is_empty()
+        });
+        self.flapping_day.retain(|_, day| *day == now / 86400);
+    }
 }
 
 /// Whether [`from_event`] may turn an event of this kind into an alert: the
@@ -445,6 +459,27 @@ async fn failing_clients(store: &Arc<Store>, now: Ts) -> anyhow::Result<usize> {
     .await?
 }
 
+/// A stored alert, from a row selected as `id, ts, key, category, severity,
+/// entity, title, message, link, tag, resolved_ts`; `None` for an alert of a
+/// kind apctl no longer raises.
+fn stored(r: &rusqlite::Row) -> rusqlite::Result<Option<Alert>> {
+    let (key, cat, sev, entity): (String, String, String, String) = (r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?);
+    let Some((key, entity)) = Key::parse(&key).and_then(|k| Some((k, Entity::parse(k, &entity)?))) else { return Ok(None) };
+    Ok(Some(Alert {
+        id: r.get(0)?,
+        ts: r.get(1)?,
+        key,
+        category: Category::parse(&cat).unwrap_or(Category::Changes),
+        severity: Severity::parse(&sev).unwrap_or(Severity::Info),
+        entity,
+        title: r.get(6)?,
+        message: r.get(7)?,
+        link: r.get(8)?,
+        tag: r.get(9)?,
+        resolved_ts: r.get(10)?,
+    }))
+}
+
 /// What a previous run left: the alerts still open, the highest number a
 /// stored alert's id carries (`{ts}-{number}`), and the AP offline alerts of
 /// the day before `now`, oldest first: (AP, when, whether it was a "keeps
@@ -461,28 +496,9 @@ async fn load_open(store: &Arc<Store>, now: Ts) -> anyhow::Result<(Vec<Alert>, u
                 .collect::<rusqlite::Result<Vec<_>>>()?;
             let sql = "SELECT COALESCE(MAX(CAST(substr(id, instr(id, '-') + 1) AS INTEGER)), 0) FROM alerts";
             let seq = c.query_row(sql, [], |r| r.get::<_, i64>(0))?;
-            let mut stmt = c.prepare("SELECT id, ts, key, category, severity, entity, title, message, link, tag FROM alerts WHERE resolved_ts IS NULL")?;
-            let rows = stmt
-                .query_map([], |r| {
-                    let (key, cat, sev, entity): (String, String, String, String) = (r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?);
-                    // An alert of a kind apctl no longer raises can't be resolved: it is left as stored.
-                    let Some((key, entity)) = Key::parse(&key).and_then(|k| Some((k, Entity::parse(k, &entity)?))) else { return Ok(None) };
-                    Ok(Some(Alert {
-                        id: r.get(0)?,
-                        ts: r.get(1)?,
-                        key,
-                        category: Category::parse(&cat).unwrap_or(Category::Changes),
-                        severity: Severity::parse(&sev).unwrap_or(Severity::Info),
-                        entity,
-                        title: r.get(6)?,
-                        message: r.get(7)?,
-                        link: r.get(8)?,
-                        tag: r.get(9)?,
-                        resolved_ts: None,
-                    }))
-                })?
-                .filter_map(Result::transpose)
-                .collect::<rusqlite::Result<Vec<_>>>()?;
+            // An alert of a kind apctl no longer raises can't be resolved: it is left as stored.
+            let mut stmt = c.prepare("SELECT id, ts, key, category, severity, entity, title, message, link, tag, resolved_ts FROM alerts WHERE resolved_ts IS NULL")?;
+            let rows = stmt.query_map([], stored)?.filter_map(Result::transpose).collect::<rusqlite::Result<Vec<_>>>()?;
             Ok((rows, u64::try_from(seq).unwrap_or(0), offline))
         })
     })
@@ -598,7 +614,7 @@ impl Watcher {
     /// An event as it happens: a one-off alert, if it deserves one.
     fn event(&mut self, now: Ts, e: &Event) {
         // Only events that may make an alert get here (see `alertable`).
-        let name = |m: Mac| crate::series::ap_name(&self.live.read().unwrap(), &m.to_string()).unwrap_or_else(|| m.to_string());
+        let name = |m: Mac| crate::series::ap_name_of(&self.live.read().unwrap(), &m).unwrap_or_else(|| m.to_string());
         if let Some(a) = from_event(e.kind, e.device_mac, &e.data, &name) {
             self.book.raise(now, a.resolved(now));
         }
@@ -606,12 +622,13 @@ impl Watcher {
 
     /// AP status: offline after a while without contact, back online.
     fn status_tick(&mut self, now: Ts) {
+        self.aps.prune(now);
         let seen: Vec<(Mac, Option<String>, Ts)> = {
             let l = self.live.read().unwrap();
             let mut v: Vec<_> = l.devices.iter().map(|(m, d)| (*m, d.snapshot.ap.hostname.clone(), d.last_seen)).collect();
             for (m, k) in &l.known_devices {
                 if !l.devices.contains_key(m) {
-                    v.push((*m, None, k.last_seen));
+                    v.push((*m, k.hostname.clone(), k.last_seen));
                 }
             }
             v
@@ -656,18 +673,28 @@ impl Watcher {
 
     /// Wi-Fi health over the last window: each radio, and clients failing to connect.
     async fn health_tick(&mut self, now: Ts) {
+        // Clears past the cooldown no longer hold anything back (see `may_raise`).
+        self.cleared.retain(|_, t| (0..HEALTH_COOLDOWN).contains(&(now - *t)));
         let (online, known): (HashSet<Mac>, HashSet<Mac>) = {
             let l = self.live.read().unwrap();
             (l.devices.iter().filter(|(_, d)| d.online).map(|(m, _)| *m).collect(), l.devices.keys().copied().collect())
         };
-        match radio_health(&self.store, now).await {
+        // Two databases, each read on a blocking thread of its own: side by side.
+        let (radios, failing) = tokio::join!(radio_health(&self.store, now), failing_clients(&self.store, now));
+        match radios {
             Ok(radios) => self.judge_radios(now, radios, &online, &known),
             Err(e) => tracing::warn!("radio health check failed: {e:#}"),
         }
-        match failing_clients(&self.store, now).await {
+        match failing {
             Ok(failing) => self.judge_connections(now, failing),
             Err(e) => tracing::warn!("connection health check failed: {e:#}"),
         }
+    }
+
+    /// Whether a health alert may be raised: not open, nor cleared within the
+    /// cooldown (a clear "in the future", after the clock stepped back, is not).
+    fn may_raise(&self, k: &OpenKey, now: Ts) -> bool {
+        !self.book.open.contains_key(k) && self.cleared.get(k).is_none_or(|t| !(0..HEALTH_COOLDOWN).contains(&(now - t)))
     }
 
     /// Raises or clears each threshold of each online AP's radios, and closes
@@ -688,8 +715,8 @@ impl Watcher {
                     }
                     continue;
                 };
-                if v >= raise_at && !self.book.open.contains_key(&k) && self.cleared.get(&k).is_none_or(|t| !(0..HEALTH_COOLDOWN).contains(&(now - t))) {
-                    let name = crate::series::ap_name(&self.live.read().unwrap(), &mac.to_string()).unwrap_or_else(|| mac.to_string());
+                if v >= raise_at && self.may_raise(&k, now) {
+                    let name = crate::series::ap_name_of(&self.live.read().unwrap(), &mac).unwrap_or_else(|| mac.to_string());
                     let title = format!("High {what} on {name} {}", band_name(&radio));
                     let message = format!("{what} has averaged {v:.0}% over the last 15 minutes (alert at {raise_at:.0}%).");
                     let tag = format!("health:{}:{}", key.as_str(), k.1);
@@ -711,7 +738,7 @@ impl Watcher {
     /// attempt in the window; clears it when none did.
     fn judge_connections(&mut self, now: Ts, failing: usize) {
         let k = (Key::ConnectFailures, Entity::Site);
-        if failing >= 3 && !self.book.open.contains_key(&k) && self.cleared.get(&k).is_none_or(|t| !(0..HEALTH_COOLDOWN).contains(&(now - t))) {
+        if failing >= 3 && self.may_raise(&k, now) {
             let message = "Every connection attempt these clients made in the last 15 minutes failed.".into();
             let a = Alert::new(Key::ConnectFailures, Category::Health, Severity::Medium, Entity::Site, format!("{failing} clients can't connect"), message);
             self.book.open(now, a.link("/clients?tab=attempts").tagged("health:connect_failures"));
@@ -722,9 +749,13 @@ impl Watcher {
 }
 
 /// Starts the alert watcher, fed by the engine through `events` (see [`channel`]).
-pub fn spawn(store: Arc<Store>, writer: Writer, live: SharedLive, tx: broadcast::Sender<LiveMsg>, mut events: mpsc::Receiver<Event>) {
+/// It keeps the engine's time (see [`crate::shadow::Clock`]): in shadow mode a
+/// lagging capture's, and while a capture is replayed it checks no AP's status
+/// or health, whose stored figures are then of the capture's time.
+pub fn spawn(store: Arc<Store>, writer: Writer, live: SharedLive, tx: broadcast::Sender<LiveMsg>, mut events: mpsc::Receiver<Event>, clock: Arc<crate::shadow::Clock>) {
     tokio::spawn(async move {
-        let mut w = Watcher::start(store, writer, live, tx, clock::now_ts()).await;
+        let now = || clock.now().unwrap_or_else(clock::now_ts);
+        let mut w = Watcher::start(store, writer, live, tx, now()).await;
         // Give APs a chance to report after a restart before judging them.
         let mut status = tokio::time::interval_at(tokio::time::Instant::now() + Duration::from_secs(90), Duration::from_secs(30));
         let mut health = tokio::time::interval_at(tokio::time::Instant::now() + Duration::from_secs(120), Duration::from_secs(60));
@@ -732,11 +763,11 @@ pub fn spawn(store: Arc<Store>, writer: Writer, live: SharedLive, tx: broadcast:
             // Events wait in the channel while a check runs.
             tokio::select! {
                 e = events.recv() => match e {
-                    Some(e) => w.event(clock::now_ts(), &e),
+                    Some(e) => w.event(now(), &e),
                     None => return,
                 },
-                _ = status.tick() => w.status_tick(clock::now_ts()),
-                _ = health.tick() => w.health_tick(clock::now_ts()).await,
+                _ = status.tick() => if let Some(now) = clock.now() { w.status_tick(now) },
+                _ = health.tick() => if let Some(now) = clock.now() { w.health_tick(now).await },
             }
         }
     });
@@ -756,26 +787,33 @@ pub struct ListQuery {
 /// Recent alerts, newest first: by time, then as stored.
 const LIST: &str = "SELECT id, ts, key, category, severity, entity, title, message, link, tag, resolved_ts, read FROM alerts ORDER BY ts DESC, rowid DESC LIMIT ?1";
 
+/// An alert as listed: whether it was read too.
+#[derive(Serialize)]
+struct Listed {
+    #[serde(flatten)]
+    alert: Alert,
+    read: bool,
+}
+
+/// The `limit` most recent alerts, newest first, with the unread count.
+/// One of a kind apctl no longer raises is left out (see [`stored`]).
+fn recent(c: &rusqlite::Connection, limit: i64) -> anyhow::Result<Value> {
+    let mut stmt = c.prepare(LIST)?;
+    let rows = stmt
+        .query_map([limit], |r| Ok(match stored(r)? {
+            Some(alert) => Some(Listed { alert, read: r.get::<_, i64>(11)? != 0 }),
+            None => None,
+        }))?
+        .filter_map(Result::transpose)
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let unread: i64 = c.query_row("SELECT COUNT(*) FROM alerts WHERE read = 0", [], |r| r.get(0))?;
+    Ok(json!({ "alerts": rows, "unread": unread }))
+}
+
 /// GET /api/alerts: recent alerts, newest first, with the unread count.
 pub async fn list(State(s): State<AppState>, Query(q): Query<ListQuery>) -> Result<Json<Value>, ApiError> {
     let limit = q.limit.unwrap_or(50).clamp(1, 500) as i64;
-    let rows = crate::api::read(&s.store, Db::Config, move |c| {
-        let mut stmt = c.prepare(LIST)?;
-        let rows = stmt
-            .query_map([limit], |r| {
-                Ok(json!({
-                    "id": r.get::<_, String>(0)?, "ts": r.get::<_, Ts>(1)?, "key": r.get::<_, String>(2)?, "category": r.get::<_, String>(3)?,
-                    "severity": r.get::<_, String>(4)?, "entity": r.get::<_, String>(5)?, "title": r.get::<_, String>(6)?,
-                    "message": r.get::<_, String>(7)?, "link": r.get::<_, Option<String>>(8)?, "tag": r.get::<_, String>(9)?,
-                    "resolved_ts": r.get::<_, Option<Ts>>(10)?, "read": r.get::<_, i64>(11)? != 0,
-                }))
-            })?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        let unread: i64 = c.query_row("SELECT COUNT(*) FROM alerts WHERE read = 0", [], |r| r.get(0))?;
-        Ok(json!({ "alerts": rows, "unread": unread }))
-    })
-    .await?;
-    Ok(Json(rows))
+    Ok(Json(crate::api::read(&s.store, Db::Config, move |c| recent(c, limit)).await?))
 }
 
 /// POST /api/alerts/read: marks every alert read.
@@ -811,6 +849,25 @@ mod tests {
         // The next day it is reported again.
         w.check(4100, ap, 4099);
         assert!(matches!(w.check(1000 + 90_000, ap, 1000 + 90_000 - 300), Some(ApChange::Offline { .. })));
+    }
+
+    #[test]
+    fn what_an_ap_watch_remembers_lasts_a_day() {
+        let mut w = ApWatch::default();
+        let (a, b): (Mac, Mac) = ("02:00:00:00:00:01".parse().unwrap(), "02:00:00:00:00:02".parse().unwrap());
+        for t in [1000, 2000, 3000] {
+            w.check(t, a, t - 300);
+            w.check(t + 100, a, t + 99);
+        }
+        assert_eq!(w.check(5000, b, 4700), Some(ApChange::Offline { last_seen: 4700 }));
+        // Within the day the limit holds, pruned or not.
+        w.prune(4000);
+        assert_eq!(w.check(4000, a, 3700), None, "reported twice and summarised once today");
+        w.check(4100, a, 4099);
+        // A day on, only the AP still offline is remembered: its return is reported as alerted.
+        w.prune(5000 + 86400);
+        assert!(w.sent.keys().eq([&b]) && w.flapping_day.is_empty());
+        assert_eq!(w.check(5000 + 86400, b, 5000 + 86400), Some(ApChange::Online { down_for: 86400 + 300, alerted: true }));
     }
 
     #[test]
@@ -951,6 +1008,19 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_ap_not_heard_from_since_startup_is_named_by_its_stored_hostname() {
+        let (mut w, mut rx, _dir) = watcher();
+        let ap: Mac = "02:00:00:00:00:01".parse().unwrap();
+        let known = crate::engine::KnownDevice {
+            first_seen: 0, last_seen: 1000, uptime: None, version: None, hostname: Some("Garage".into()), model: None, model_display: None, ip: None, serial: None,
+        };
+        w.live.write().unwrap().known_devices.insert(ap, known);
+        w.status_tick(1000 + OFFLINE_AFTER);
+        assert_eq!(told(&mut rx), [("raised", "ap_offline")]);
+        assert_eq!(w.book.open[&(Key::ApOffline, Entity::Ap(ap))].title, "Garage is offline");
+    }
+
+    #[tokio::test]
     async fn connection_failures_open_once_and_clear() {
         let (mut w, mut rx, _dir) = watcher();
         w.judge_connections(1000, 2);
@@ -975,6 +1045,17 @@ mod tests {
         w.judge_connections(30_000, 0);
         w.judge_connections(29_000, 9);
         assert_eq!(told(&mut rx), [("resolved", "connect_failures"), ("raised", "connect_failures")]);
+    }
+
+    #[tokio::test]
+    async fn clears_past_their_cooldown_are_forgotten() {
+        let (mut w, _rx, _dir) = watcher();
+        let ap: Mac = "02:00:00:00:00:01".parse().unwrap();
+        let now = 100_000;
+        w.cleared.insert((Key::BusyChannel, Entity::Radio(ap, "na".into())), now - HEALTH_COOLDOWN);
+        w.cleared.insert((Key::ConnectFailures, Entity::Site), now - 60);
+        w.health_tick(now).await;
+        assert!(w.cleared.keys().eq([&(Key::ConnectFailures, Entity::Site)]));
     }
 
     #[tokio::test]
@@ -1061,6 +1142,15 @@ mod tests {
         open.sort();
         assert_eq!(open, ["busy_channel:02:00:00:00:00:01/na", "connect_failures:site"]);
         assert_eq!(again.book.seq, 99);
+        // Listed as the UI reads them (web/src/api.ts's AlertItem); one apctl doesn't know is left out.
+        let listed = w.store.read(Db::Config, |c| recent(c, 50)).unwrap();
+        assert_eq!((listed["alerts"].as_array().map(Vec::len), listed["unread"].as_i64()), (Some(2), Some(3)));
+        let a = &listed["alerts"][1];
+        let mut fields: Vec<&str> = a.as_object().unwrap().keys().map(String::as_str).collect();
+        fields.sort();
+        assert_eq!(fields, ["category", "entity", "id", "key", "link", "message", "read", "resolved_ts", "severity", "tag", "title", "ts"]);
+        assert_eq!((a["key"].as_str(), a["entity"].as_str(), a["category"].as_str(), a["severity"].as_str()), (Some("busy_channel"), Some("02:00:00:00:00:01/na"), Some("health"), Some("medium")));
+        assert_eq!((a["ts"].as_i64(), a["link"].as_str(), &a["resolved_ts"], a["read"].as_bool()), (Some(1000), Some("/devices/02:00:00:00:00:01"), &Value::Null, Some(false)));
     }
 
     #[tokio::test]

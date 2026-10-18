@@ -20,7 +20,7 @@ use std::time::Duration;
 
 use axum::extract::State;
 use axum::http::StatusCode;
-use rusqlite::OptionalExtension;
+use rusqlite::{Connection, OptionalExtension};
 use rusqlite::types::Value as Sql;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -31,7 +31,7 @@ use crate::api::{ApiError, AppState, Json};
 use crate::clock;
 use crate::engine::Live;
 use crate::model::Ts;
-use crate::store::{Db, Store, Writer};
+use crate::store::{Db, Writer};
 
 pub const FEED: &str = "https://fw-update.ubnt.com/api/firmware-newest?filter=eq~~product~~unifi-firmware&filter=eq~~channel~~release";
 /// `fw_caps` bit: the AP verifies SHA-256 checksums.
@@ -49,11 +49,11 @@ pub struct Release {
     pub created: Option<String>,
 }
 
-/// The newest release per platform from the feed. Entries without a version
-/// or a download link are skipped.
+/// The newest release per platform from the feed, in the order the platforms
+/// first appear. Entries without a version or a download link are skipped.
 pub fn parse_feed(feed: &Value) -> Vec<Release> {
     let s = |v: &Value| v.as_str().filter(|x| !x.is_empty()).map(str::to_string);
-    feed["_embedded"]["firmware"]
+    let all = feed["_embedded"]["firmware"]
         .as_array()
         .into_iter()
         .flatten()
@@ -70,8 +70,20 @@ pub fn parse_feed(feed: &Value) -> Vec<Release> {
                 version.push_str(&format!(".{b}"));
             }
             Some(Release { platform: s(&f["platform"])?, version, url, md5: s(&f["md5"]), sha256: s(&f["sha256"]), size: f["file_size"].as_i64(), created: s(&f["created"]) })
-        })
-        .collect()
+        });
+    let mut out: Vec<Release> = Vec::new();
+    let mut at: HashMap<String, usize> = HashMap::new();
+    for r in all {
+        match at.get(&r.platform) {
+            Some(&i) if compare(&r.version, &out[i].version).is_gt() => out[i] = r,
+            Some(_) => {}
+            None => {
+                at.insert(r.platform.clone(), out.len());
+                out.push(r);
+            }
+        }
+    }
+    out
 }
 
 /// The feed's platform key for an AP model code (a few differ in case).
@@ -93,7 +105,8 @@ pub fn compare(a: &str, b: &str) -> std::cmp::Ordering {
     let parts = |v: &str| -> Vec<u64> {
         let v = v.trim_start_matches('v');
         let v = v.split('+').next().unwrap_or(v);
-        v.split(['.', '-']).map(|x| x.chars().take_while(|c| c.is_ascii_digit()).collect::<String>().parse().unwrap_or(0)).collect()
+        // A segment's leading digits; none (as in `rc`) is 0.
+        v.split(['.', '-']).map(|x| x[..x.find(|c: char| !c.is_ascii_digit()).unwrap_or(x.len())].parse().unwrap_or(0)).collect()
     };
     let (pa, pb) = (parts(a), parts(b));
     let n = pa.len().min(pb.len());
@@ -171,6 +184,14 @@ impl Job {
     }
 }
 
+/// How long the upgrade at the head of the queue waits for its AP's turn (an
+/// inform with its settings current) before it fails.
+const TURN_WAIT: Ts = 600;
+/// Why a sent upgrade failed when out of time.
+const TIMED_OUT: &str = "it did not come back with the new firmware in time";
+/// Why an upgrade whose AP never took its turn failed.
+const NOT_TAKEN: &str = "it was not ready for the upgrade in time (offline, or its settings not applied)";
+
 /// The upgrade queue: one AP at a time.
 #[derive(Debug, Default, Serialize)]
 pub struct Jobs {
@@ -241,9 +262,17 @@ impl Jobs {
         Some(j)
     }
 
-    /// A sent upgrade that has not finished in time.
-    pub fn expired(&self, now: Ts) -> Option<Mac> {
-        self.current.as_ref().filter(|j| j.expires.is_some_and(|e| now > e)).map(|j| j.mac)
+    /// The current upgrade if it is out of time, with why: sent and not
+    /// finished, or still waiting for its AP to take its turn (offline, or its
+    /// settings not applied), which it is given [`TURN_WAIT`] for from the
+    /// first call that finds it at the head of the queue.
+    pub fn expired(&mut self, now: Ts) -> Option<(Mac, &'static str)> {
+        let j = self.current.as_mut()?;
+        if j.state == JobState::Queued && j.expires.is_none() {
+            j.expires = Some(now + TURN_WAIT);
+        }
+        let why = if j.state == JobState::Queued { NOT_TAKEN } else { TIMED_OUT };
+        j.expires.is_some_and(|e| now > e).then_some((j.mac, why))
     }
 
     pub fn cancel_queued(&mut self) -> usize {
@@ -403,18 +432,16 @@ pub fn schedule(writer: Writer) {
 type Releases = HashMap<String, Release>;
 
 /// The stored releases, and when the feed was last checked (with its error, if it failed).
-fn releases(store: &Store) -> anyhow::Result<(Releases, Option<Ts>, Option<String>)> {
-    store.read(Db::Config, |c| {
-        let list = c
-            .prepare("SELECT platform, version, url, md5, sha256, size, created FROM firmware_releases")?
-            .query_map([], |r| {
-                Ok(Release { platform: r.get(0)?, version: r.get(1)?, url: r.get(2)?, md5: r.get(3)?, sha256: r.get(4)?, size: r.get(5)?, created: r.get(6)? })
-            })?
-            .map(|r| r.map(|r| (r.platform.clone(), r)))
-            .collect::<rusqlite::Result<HashMap<_, _>>>()?;
-        let (ts, err) = c.query_row("SELECT ts, error FROM firmware_check WHERE id = 1", [], |r| Ok((r.get(0)?, r.get(1)?))).optional()?.unwrap_or((None, None));
-        Ok((list, ts, err))
-    })
+fn releases(c: &Connection) -> anyhow::Result<(Releases, Option<Ts>, Option<String>)> {
+    let list = c
+        .prepare("SELECT platform, version, url, md5, sha256, size, created FROM firmware_releases")?
+        .query_map([], |r| {
+            Ok(Release { platform: r.get(0)?, version: r.get(1)?, url: r.get(2)?, md5: r.get(3)?, sha256: r.get(4)?, size: r.get(5)?, created: r.get(6)? })
+        })?
+        .map(|r| r.map(|r| (r.platform.clone(), r)))
+        .collect::<rusqlite::Result<HashMap<_, _>>>()?;
+    let (ts, err) = c.query_row("SELECT ts, error FROM firmware_check WHERE id = 1", [], |r| Ok((r.get(0)?, r.get(1)?))).optional()?.unwrap_or((None, None));
+    Ok((list, ts, err))
 }
 
 /// An AP model's feed platform, and the release for it.
@@ -457,8 +484,7 @@ fn aps(live: &Live) -> Vec<ApInfo> {
 
 /// GET /api/firmware
 pub async fn index(State(s): State<AppState>) -> Result<Json<Value>, ApiError> {
-    let store = s.store.clone();
-    let (rels, checked, error) = tokio::task::spawn_blocking(move || releases(&store)).await??;
+    let (rels, checked, error) = crate::api::read(&s.store, Db::Config, releases).await?;
     let (aps, jobs) = {
         let live = s.live.read().unwrap();
         (aps(&live), serde_json::to_value(&live.firmware).map_err(anyhow::Error::from)?)
@@ -499,8 +525,7 @@ pub struct UpgradeBody {
 /// POST /api/firmware/upgrade: queue release upgrades, one AP at a time.
 pub async fn upgrade(State(s): State<AppState>, Json(b): Json<UpgradeBody>) -> Result<Json<Value>, ApiError> {
     crate::api::require_active(&s, "upgrades need")?;
-    let store = s.store.clone();
-    let (rels, ..) = tokio::task::spawn_blocking(move || releases(&store)).await??;
+    let (rels, ..) = crate::api::read(&s.store, Db::Config, releases).await?;
     let known = aps(&s.live.read().unwrap());
     let mut skipped = Vec::new();
     let mut wanted: Vec<Mac> = Vec::new();
@@ -598,6 +623,12 @@ mod tests {
         assert_eq!((r[0].platform.as_str(), r[0].version.as_str(), r[0].size), ("U6M", "6.8.2.15592", Some(22586927)));
         assert_eq!(r[0].md5.as_deref(), Some("0fec04452cadd2d025777d36ab2974ea"));
         assert_eq!(r[0].sha256, None);
+        // Two entries for a platform: the newer, wherever it is listed.
+        let entry = |platform: &str, patch: i64| json!({ "platform": platform, "version_major": 6, "version_minor": 8, "version_patch": patch, "version_build": "1", "_links": { "data": { "href": "u" } } });
+        for list in [[entry("U6M", 10), entry("U6M", 9), entry("U7P", 1)], [entry("U6M", 9), entry("U6M", 10), entry("U7P", 1)]] {
+            let r = parse_feed(&json!({ "_embedded": { "firmware": list } }));
+            assert_eq!(r.iter().map(|r| (r.platform.as_str(), r.version.as_str())).collect::<Vec<_>>(), [("U6M", "6.8.10.1"), ("U7P", "6.8.1.1")]);
+        }
     }
 
     #[test]
@@ -606,6 +637,8 @@ mod tests {
         assert_eq!(compare("6.8.10.1", "6.8.9.1"), Greater, "numbers, not text");
         assert_eq!(compare("v6.8.2+15592", "6.8.2"), Equal);
         assert_eq!(compare("6.8.2-rc.1", "6.8.2"), Less, "a pre-release is older than the release");
+        assert_eq!(compare("6.8.2-rc1.1", "6.8.2-rc.1"), Equal, "a segment counts by its leading digits");
+        assert_eq!(compare("6.10b.1", "6.9.1"), Greater);
     }
 
     #[test]
@@ -694,7 +727,7 @@ mod tests {
         j.enqueue(vec![job("a"), job("b")]);
         command(&mut j, &m("a"), &json!({ "upgrade_duration": 600, "reboot_duration": 100 }), 0).unwrap().unwrap();
         assert_eq!(j.expired(700), None);
-        assert_eq!(j.expired(701), Some(m("a")));
+        assert_eq!(j.expired(701), Some((m("a"), TIMED_OUT)));
         assert_eq!(j.cancel_queued(), 1, "only b; a is already upgrading");
         assert!(j.current.is_some());
         // As the engine makes the changes the UI asks for.
@@ -704,15 +737,37 @@ mod tests {
     }
 
     #[test]
+    fn an_upgrade_whose_ap_never_takes_its_turn_fails() {
+        let mut j = Jobs::default();
+        j.enqueue(vec![job("a"), job("b")]);
+        // Its wait starts when it is first found at the head of the queue.
+        assert_eq!(j.expired(1000), None);
+        assert_eq!(j.current.as_ref().and_then(|c| c.expires), Some(1000 + TURN_WAIT));
+        assert_eq!(j.expired(1000 + TURN_WAIT), None);
+        let (mac, why) = j.expired(1001 + TURN_WAIT).unwrap();
+        assert_eq!((mac, why), (m("a"), NOT_TAKEN));
+        // As a sent one out of time: it fails and the queue stops before b.
+        j.failed(&mac, why);
+        assert!(j.current.is_none() && j.queue.len() == 1);
+        assert_eq!(j.stopped.as_deref(), Some(format!("a failed: {NOT_TAKEN}").as_str()));
+        // Resumed, b gets a wait of its own; taking its turn in time sets the sent deadline.
+        j.resume();
+        assert_eq!(j.expired(5000), None);
+        command(&mut j, &m("b"), &json!({}), 5100).unwrap().unwrap();
+        assert_eq!(j.current.as_ref().and_then(|c| c.expires), Some(5100 + 450));
+        assert_eq!(j.expired(5551), Some((m("b"), TIMED_OUT)), "then it is out of time as a sent one");
+    }
+
+    #[test]
     fn a_check_replaces_what_the_last_one_listed_whatever_the_clock() {
         let dir = crate::model::tests::TestDir::new("firmware-releases");
-        let (store, writer) = Store::open(&dir).unwrap();
+        let (store, writer) = crate::store::Store::open(&dir).unwrap();
         let rel = |p: &str| Release { platform: p.into(), version: "6.8.2.15592".into(), url: "u".into(), md5: None, sha256: None, size: None, created: None };
         store_releases(&writer, &[rel("U6M"), rel("U7P")], 2_000_000_000);
         // The clock steps back before the next check, which no longer lists U7P.
         store_releases(&writer, &[rel("U6M"), rel("UAL6")], 1_000_000_000);
         flushed(&writer);
-        let (rels, checked, error) = releases(&store).unwrap();
+        let (rels, checked, error) = store.read(Db::Config, releases).unwrap();
         let mut platforms: Vec<&str> = rels.keys().map(String::as_str).collect();
         platforms.sort_unstable();
         assert_eq!((platforms, checked, error), (vec!["U6M", "UAL6"], Some(1_000_000_000), None));

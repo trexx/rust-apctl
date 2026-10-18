@@ -251,6 +251,7 @@ async fn serve(args: ServeArgs) -> Result<()> {
     // Alert-worthy events reach the alert watcher on a channel of their own.
     let (alert_sink, alert_events) = alerts::channel();
     engine.set_alerts(alert_sink);
+    let alert_clock = clock.clone();
     let tick_tx = in_tx.clone();
     tokio::spawn(async move {
         let mut every = tokio::time::interval(Duration::from_secs(5));
@@ -296,7 +297,7 @@ async fn serve(args: ServeArgs) -> Result<()> {
     let auth = Arc::new(auth::Auth::new(users, &store, writer.clone(), proxies)?);
     let threat_state: Arc<threats::ThreatState> = Default::default();
     threats::watch(store.clone(), threat_state.clone(), live.clone(), in_tx.clone(), writer.clone());
-    alerts::spawn(store.clone(), writer.clone(), live.clone(), live_tx.clone(), alert_events);
+    alerts::spawn(store.clone(), writer.clone(), live.clone(), live_tx.clone(), alert_events, alert_clock);
     backup::schedule(backups.clone(), store.clone());
     firmware::schedule(writer.clone());
     let state = api::AppState::new(api::AppStateInner {

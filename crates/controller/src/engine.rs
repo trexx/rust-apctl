@@ -1413,11 +1413,10 @@ impl Engine {
         }
         let mut live = self.live.write().unwrap();
         let mut events = Vec::new();
-        const TIMED_OUT: &str = "it did not come back with the new firmware in time";
-        if let Some(mac) = live.firmware.expired(now)
-            && let Some(j) = live.firmware.failed(&mac, TIMED_OUT)
+        if let Some((mac, why)) = live.firmware.expired(now)
+            && let Some(j) = live.firmware.failed(&mac, why)
         {
-            let data = json!({ "reason": "timed out", "detail": TIMED_OUT, "target": j.target });
+            let data = json!({ "reason": "timed out", "detail": why, "target": j.target });
             events.push(Event::device(now, EventKind::ApUpgradeFailed, mac, data));
         }
         let mut offline = Vec::new();

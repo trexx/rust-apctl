@@ -90,8 +90,10 @@ fn fault(msg: &str) -> Option<(CrashKind, Option<String>)> {
         Some((CrashKind::Oops, None))
     } else if let Some(p) = msg.split("sending SIGSEGV to ").nth(1) {
         Some((CrashKind::Segfault, Some(p.split_whitespace().next().unwrap_or(p).trim_end_matches(':').to_string())))
-    } else if msg.contains("unhandled level 2 translation fault") {
-        Some((CrashKind::MemoryFault, msg.split_whitespace().find(|w| w.contains('[')).map(|w| w.to_string())))
+    } else if let Some((before, _)) = msg.split_once("unhandled level 2 translation fault") {
+        // `mcad[1234]: unhandled ...`, maybe after a printk timestamp: the word just before, up to its PID.
+        let name = before.split_whitespace().next_back().and_then(|w| w.split_once('[')).map(|(n, _)| n).filter(|n| !n.is_empty());
+        Some((CrashKind::MemoryFault, name.map(str::to_string)))
     } else {
         None
     }
@@ -486,6 +488,17 @@ mod tests {
         assert!(l.feed(&line(520, "hostapd", "wifi1ap0: STA 0e:00:00:00:00:02 WPA: pairwise key handshake completed (RSN)")).is_empty());
         // Unrelated lines produce nothing.
         assert!(l.feed(&line(400, "dnsmasq", "query[A] example.com")).is_empty());
+    }
+
+    #[test]
+    fn a_memory_fault_names_the_process_before_it() {
+        let name = |msg: &str| fault(msg).and_then(|(_, p)| p);
+        assert_eq!(name("mcad[1234]: unhandled level 2 translation fault (11) at 0x0, esr 0x92000005"), Some("mcad".into()));
+        assert_eq!(name("[ 12345.678] mcad[1234]: unhandled level 2 translation fault (11) at 0x0"), Some("mcad".into()));
+        assert_eq!(name("[12345.678] hostapd[99]: unhandled level 2 translation fault (11) at 0x0"), Some("hostapd".into()));
+        assert_eq!(name("unhandled level 2 translation fault (11) at 0x0"), None);
+        assert_eq!(name("[12345.678] unhandled level 2 translation fault (11) at 0x0"), None, "a timestamp is no process");
+        assert_eq!(name("[ 12345.678] unhandled level 2 translation fault (11) at 0x0"), None);
     }
 
     #[test]
