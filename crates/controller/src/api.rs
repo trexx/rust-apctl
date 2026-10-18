@@ -875,8 +875,14 @@ struct Where {
 impl Where {
     /// Adds a condition; its `?` stands for `value`.
     fn and(&mut self, sql: &str, value: Sql) {
+        let mark = self.param(value);
+        self.cond.push(sql.replace('?', &mark));
+    }
+
+    /// Adds a parameter, and returns its placeholder (`?N`) for SQL written outside the conditions.
+    fn param(&mut self, value: Sql) -> String {
         self.params.push(value);
-        self.cond.push(sql.replace('?', &format!("?{}", self.params.len())));
+        format!("?{}", self.params.len())
     }
 
     fn sql(&self) -> String {
@@ -951,13 +957,7 @@ async fn events(State(s): State<AppState>, Query(q): Query<EventQuery>) -> Resul
             // older event when fewer than the limit are new.
             w.and("id > ?", Sql::Integer(after));
             if !kinds.is_empty() {
-                let marks: Vec<String> = kinds
-                    .into_iter()
-                    .map(|k| {
-                        w.params.push(Sql::Text(k));
-                        format!("?{}", w.params.len())
-                    })
-                    .collect();
+                let marks: Vec<String> = kinds.into_iter().map(|k| w.param(Sql::Text(k))).collect();
                 w.cond.push(format!("kind IN ({})", marks.join(", ")));
             }
             format!("SELECT {COLUMNS} FROM events NOT INDEXED WHERE {} ORDER BY ts DESC, id DESC LIMIT {limit}", w.sql())
@@ -970,10 +970,7 @@ async fn events(State(s): State<AppState>, Query(q): Query<EventQuery>) -> Resul
             let filters = w.sql();
             let parts: Vec<String> = kinds
                 .into_iter()
-                .map(|k| {
-                    w.params.push(Sql::Text(k));
-                    format!("SELECT * FROM (SELECT {COLUMNS} FROM events WHERE {filters} AND kind = ?{} ORDER BY ts DESC, id DESC LIMIT {limit})", w.params.len())
-                })
+                .map(|k| format!("SELECT * FROM (SELECT {COLUMNS} FROM events WHERE {filters} AND kind = {} ORDER BY ts DESC, id DESC LIMIT {limit})", w.param(Sql::Text(k))))
                 .collect();
             format!("{} ORDER BY ts DESC, id DESC LIMIT {limit}", parts.join(" UNION ALL "))
         };
