@@ -435,9 +435,16 @@ pub async fn finish_forget(engine: &tokio::sync::mpsc::Sender<Input>, mac: Mac, 
     let (tx, rx) = tokio::sync::oneshot::channel();
     let edit: crate::engine::StateEdit = Box::new(move |state: &mut Value| remove_device(state, &mac));
     let _ = engine.send(Input::EditState { ts: clock::now_ts(), edit, done: tx }).await;
-    let _ = rx.await;
-    let _ = engine.send(Input::Forget { ts: clock::now_ts(), mac }).await;
-    let _ = engine.send(Input::Note(Event::device(clock::now_ts(), EventKind::ApForgotten, mac, json!({ "reset": reset })))).await;
+    // Only the forget that removed the record tells of it: another may have
+    // got there first, or an import since left the AP out.
+    match rx.await {
+        Ok(Ok(_)) => {
+            let _ = engine.send(Input::Forget { ts: clock::now_ts(), mac }).await;
+            let _ = engine.send(Input::Note(Event::device(clock::now_ts(), EventKind::ApForgotten, mac, json!({ "reset": reset })))).await;
+        }
+        Ok(Err(e)) => tracing::info!("{mac}: not forgotten: {e}"),
+        Err(_) => tracing::warn!("{mac}: not forgotten: the engine has stopped"),
+    }
 }
 
 #[cfg(test)]
@@ -480,6 +487,33 @@ mod tests {
         let key = device_doc(&padded, &ap).unwrap()["x_authkey"].as_str().unwrap().to_string();
         device_doc_mut(&mut padded, &ap).unwrap()["x_authkey"] = json!(format!(" {key}\n"));
         assert_eq!(device_key(Some(&padded), &keys, &ap), device_key(Some(&s), &keys, &ap), "whitespace around a stored key is ignored");
+    }
+
+    #[tokio::test]
+    async fn only_the_forget_that_removed_the_record_tells_of_it() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let mut s = state();
+        // A stand-in for the engine: edits apply to `s`, everything else is passed on.
+        let (seen_tx, mut seen) = tokio::sync::mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            while let Some(i) = rx.recv().await {
+                match i {
+                    Input::EditState { edit, done, .. } => drop(done.send(edit(&mut s))),
+                    Input::Forget { .. } => seen_tx.send("forget").unwrap(),
+                    Input::Note(e) => seen_tx.send(e.kind.as_str()).unwrap(),
+                    _ => {}
+                }
+            }
+        });
+        let mac: Mac = "02:00:00:00:00:01".parse().unwrap();
+        finish_forget(&tx, mac, false).await;
+        finish_forget(&tx, mac, false).await;
+        drop(tx);
+        let mut got = Vec::new();
+        while let Some(x) = seen.recv().await {
+            got.push(x);
+        }
+        assert_eq!(got, ["forget", "ap_forgotten"], "the second forget found no record");
     }
 
     #[test]
