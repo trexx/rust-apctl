@@ -226,29 +226,80 @@ const FIXUP_WITHIN: Ts = 1200;
 /// The reports that are connection attempts (or fix one up).
 const ATTEMPT_TYPES: [&str; 4] = ["failure", "soft failure", "success", "fixup"];
 
+/// An event id as a fixup is matched to a failure by it: equal as [`Field`]s
+/// are (so a NaN matches nothing).
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+enum EventId<'a> {
+    Int(i64),
+    Float(u64),
+    Str(&'a str),
+    Other(&'a Value),
+}
+
+/// What a fixup and the failure it corrects share: client, AP, network and
+/// event id. None for a report without an event id.
+type FixupKey<'a> = (&'a str, &'a str, Option<&'a str>, EventId<'a>);
+
+fn fixup_key(e: &ConnEvent) -> Option<FixupKey<'_>> {
+    let id = match e.n.event_id.as_ref()? {
+        Field::Null => return None,
+        Field::Int(i) => EventId::Int(*i),
+        Field::Float(f) if f.is_nan() => return None,
+        // 0.0 and -0.0 are equal.
+        Field::Float(f) => EventId::Float(if *f == 0.0 { 0 } else { f.to_bits() }),
+        Field::Str(s) => EventId::Str(s),
+        Field::Other(v) => EventId::Other(v),
+    };
+    Some((&e.client, &e.ap, e.vap.as_deref(), id))
+}
+
+/// The reports (sorted by time) with each fixup merged into the latest
+/// failure it corrects, as (report, succeeded on its own, merged with a
+/// fixup); a fixup that corrects none is kept as it is.
+fn merge_fixups(mut events: Vec<ConnEvent>) -> Vec<(ConnEvent, bool, bool)> {
+    // Per report, the failure it corrects (fixups only): the latest one of the
+    // same key in the last 20 minutes. The failures are kept by key, the latest
+    // of each, until 20 minutes after them.
+    let mut into: Vec<Option<usize>> = vec![None; events.len()];
+    {
+        let mut open: HashMap<FixupKey, usize> = HashMap::new();
+        let mut queue: std::collections::VecDeque<(usize, FixupKey)> = std::collections::VecDeque::new();
+        for (i, e) in events.iter().enumerate() {
+            while let Some(&(f, k)) = queue.front()
+                && e.ts - events[f].ts > FIXUP_WITHIN
+            {
+                queue.pop_front();
+                if open.get(&k) == Some(&f) {
+                    open.remove(&k);
+                }
+            }
+            let Some(k) = fixup_key(e) else { continue };
+            if e.event_type == "fixup" {
+                into[i] = open.get(&k).copied();
+            } else if e.event_type.contains("failure") {
+                open.insert(k, i);
+                queue.push_back((i, k));
+            }
+        }
+    }
+    let mut ok: Vec<bool> = events.iter().map(|e| succeeded(&e.event_type, &e.n)).collect();
+    let mut fixed = vec![false; events.len()];
+    for (i, f) in into.iter().enumerate() {
+        if let Some(f) = *f {
+            let (before, after) = events.split_at_mut(i);
+            before[f].n.merge(&after[0].n);
+            ok[f] = ok[f] || ok[i];
+            fixed[f] = true;
+        }
+    }
+    events.into_iter().zip(ok).zip(fixed).zip(into).filter(|(_, into)| into.is_none()).map(|(((e, ok), fixed), _)| (e, ok, fixed)).collect()
+}
+
 /// Connection attempts from the notifications, oldest first.
 pub fn attempts(mut events: Vec<ConnEvent>) -> Vec<Attempt> {
     events.retain(|e| ATTEMPT_TYPES.contains(&e.event_type.as_str()));
     events.sort_by_key(|e| e.ts);
-    // (event, succeeded on its own, merged with a fixup)
-    let mut merged: Vec<(ConnEvent, bool, bool)> = Vec::new();
-    for e in events {
-        let ok = succeeded(&e.event_type, &e.n);
-        if e.event_type == "fixup"
-            && let Some(id) = e.n.event_id.as_ref().filter(|v| **v != Field::Null)
-            // Sorted by time: only the last 20 minutes need looking at.
-            && let Some(prev) = merged.iter_mut().rev().take_while(|(p, _, _)| e.ts - p.ts <= FIXUP_WITHIN).find(|(p, _, _)| {
-                p.ap == e.ap && p.client == e.client && p.vap == e.vap && p.n.event_id.as_ref() == Some(id) && p.event_type.contains("failure")
-            })
-        {
-            prev.0.n.merge(&e.n);
-            prev.1 = prev.1 || ok;
-            prev.2 = true;
-            continue;
-        }
-        merged.push((e, ok, false));
-    }
-    merged
+    merge_fixups(events)
         .into_iter()
         .filter_map(|(e, ok, fixed)| {
             let n = &e.n;
@@ -821,6 +872,53 @@ mod tests {
         let mut other = fixup;
         other.vap = Some("wifi0ap0".into());
         assert_eq!(attempts(vec![fail, other]).len(), 2);
+    }
+
+    #[test]
+    fn fixups_merge_as_a_look_back_over_the_last_twenty_minutes_does() {
+        // The merging as first written: each fixup looks back through the reports of the last 20 minutes.
+        fn by_scan(events: Vec<ConnEvent>) -> Vec<(ConnEvent, bool, bool)> {
+            let mut merged: Vec<(ConnEvent, bool, bool)> = Vec::new();
+            for e in events {
+                let ok = succeeded(&e.event_type, &e.n);
+                if e.event_type == "fixup"
+                    && let Some(id) = e.n.event_id.as_ref().filter(|v| **v != Field::Null)
+                    && let Some(prev) = merged.iter_mut().rev().take_while(|(p, _, _)| e.ts - p.ts <= FIXUP_WITHIN).find(|(p, _, _)| {
+                        p.ap == e.ap && p.client == e.client && p.vap == e.vap && p.n.event_id.as_ref() == Some(id) && p.event_type.contains("failure")
+                    })
+                {
+                    prev.0.n.merge(&e.n);
+                    prev.1 = prev.1 || ok;
+                    prev.2 = true;
+                    continue;
+                }
+                merged.push((e, ok, false));
+            }
+            merged
+        }
+        let mut seed = 3u64;
+        let mut rnd = |n: u64| {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (seed >> 33) % n
+        };
+        let ids = [json!(1), json!(2), json!(2.0), json!(-0.0), json!(0.0), json!("2"), json!(null), json!([1]), json!(true)];
+        let (mut events, mut ts) = (Vec::new(), 0);
+        for _ in 0..4000 {
+            // Often several at the same second, sometimes over twenty minutes apart.
+            ts += if rnd(40) == 0 { 1300 } else { [0, 0, 0, 1, 1, 5, 30, 60][rnd(8) as usize] };
+            let kind = ["failure", "soft failure", "success", "fixup", "fixup"][rnd(5) as usize];
+            let mut n = json!({ "dns_timeouts": rnd(2), "dns_responses": rnd(3), "traffic_delta": rnd(3) * 9000, "auth_rssi": -60 });
+            if rnd(8) > 0 {
+                n["event_id"] = ids[rnd(ids.len() as u64) as usize].clone();
+            }
+            let mut e = conn(ts, ["a", "b"][rnd(2) as usize], ["A", "B"][rnd(2) as usize], kind, n);
+            e.vap = [None, Some("wifi0ap0".to_string()), Some("wifi1ap0".to_string())][rnd(3) as usize].clone();
+            events.push(e);
+        }
+        let merged = merge_fixups(events.clone());
+        let n = merged.iter().filter(|m| m.2).count();
+        assert!(n > 100, "a fair test merges many, not {n}");
+        assert_eq!(format!("{merged:?}"), format!("{:?}", by_scan(events)));
     }
 
     #[test]
