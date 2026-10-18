@@ -214,14 +214,8 @@ pub(crate) fn load(c: &Connection, spec: Spec, tier: usize, from: Ts, to: Ts) ->
     // statements over and over: the read connections keep them prepared.
     let mut stmt = c.prepare_cached(&sql)?;
     let mut out: Loaded = BTreeMap::new();
-    let mut rows = stmt.query(params_from_iter(params))?;
-    while let Some(r) = rows.next()? {
-        // Strings are made only for a new key, or for text that changed.
-        let k = r.get_ref(0)?.as_str()?;
-        if !out.contains_key(k) {
-            out.insert(k.to_string(), (vec![String::new(); extra.len()], Samples::new(cols.len())));
-        }
-        let e = out.get_mut(k).expect("just added");
+    // Adds a row to its key's entry. Strings are made only for a new key, or for text that changed.
+    let add = |e: &mut (Vec<String>, Samples), r: &rusqlite::Row| -> rusqlite::Result<()> {
         // The text columns of the latest sample.
         for (i, t) in e.0.iter_mut().enumerate() {
             let v = r.get_ref(2 + i)?.as_str_or_null()?.unwrap_or_default();
@@ -232,6 +226,16 @@ pub(crate) fn load(c: &Connection, spec: Spec, tier: usize, from: Ts, to: Ts) ->
         e.1.ts.push(r.get(1)?);
         for i in 0..cols.len() {
             e.1.vals.push(r.get(2 + extra.len() + i)?);
+        }
+        Ok(())
+    };
+    let mut rows = stmt.query(params_from_iter(params))?;
+    while let Some(r) = rows.next()? {
+        // One lookup for a key already seen; a new key is added once.
+        let k = r.get_ref(0)?.as_str()?;
+        match out.get_mut(k) {
+            Some(e) => add(e, r)?,
+            None => add(out.entry(k.to_string()).or_insert_with(|| (vec![String::new(); extra.len()], Samples::new(cols.len()))), r)?,
         }
     }
     Ok(out)
