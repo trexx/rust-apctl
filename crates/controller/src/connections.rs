@@ -226,29 +226,80 @@ const FIXUP_WITHIN: Ts = 1200;
 /// The reports that are connection attempts (or fix one up).
 const ATTEMPT_TYPES: [&str; 4] = ["failure", "soft failure", "success", "fixup"];
 
+/// An event id as a fixup is matched to a failure by it: equal as [`Field`]s
+/// are (so a NaN matches nothing).
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+enum EventId<'a> {
+    Int(i64),
+    Float(u64),
+    Str(&'a str),
+    Other(&'a Value),
+}
+
+/// What a fixup and the failure it corrects share: client, AP, network and
+/// event id. None for a report without an event id.
+type FixupKey<'a> = (&'a str, &'a str, Option<&'a str>, EventId<'a>);
+
+fn fixup_key(e: &ConnEvent) -> Option<FixupKey<'_>> {
+    let id = match e.n.event_id.as_ref()? {
+        Field::Null => return None,
+        Field::Int(i) => EventId::Int(*i),
+        Field::Float(f) if f.is_nan() => return None,
+        // 0.0 and -0.0 are equal.
+        Field::Float(f) => EventId::Float(if *f == 0.0 { 0 } else { f.to_bits() }),
+        Field::Str(s) => EventId::Str(s),
+        Field::Other(v) => EventId::Other(v),
+    };
+    Some((&e.client, &e.ap, e.vap.as_deref(), id))
+}
+
+/// The reports (sorted by time) with each fixup merged into the latest
+/// failure it corrects, as (report, succeeded on its own, merged with a
+/// fixup); a fixup that corrects none is kept as it is.
+fn merge_fixups(mut events: Vec<ConnEvent>) -> Vec<(ConnEvent, bool, bool)> {
+    // Per report, the failure it corrects (fixups only): the latest one of the
+    // same key in the last 20 minutes. The failures are kept by key, the latest
+    // of each, until 20 minutes after them.
+    let mut into: Vec<Option<usize>> = vec![None; events.len()];
+    {
+        let mut open: HashMap<FixupKey, usize> = HashMap::new();
+        let mut queue: std::collections::VecDeque<(usize, FixupKey)> = std::collections::VecDeque::new();
+        for (i, e) in events.iter().enumerate() {
+            while let Some(&(f, k)) = queue.front()
+                && e.ts - events[f].ts > FIXUP_WITHIN
+            {
+                queue.pop_front();
+                if open.get(&k) == Some(&f) {
+                    open.remove(&k);
+                }
+            }
+            let Some(k) = fixup_key(e) else { continue };
+            if e.event_type == "fixup" {
+                into[i] = open.get(&k).copied();
+            } else if e.event_type.contains("failure") {
+                open.insert(k, i);
+                queue.push_back((i, k));
+            }
+        }
+    }
+    let mut ok: Vec<bool> = events.iter().map(|e| succeeded(&e.event_type, &e.n)).collect();
+    let mut fixed = vec![false; events.len()];
+    for (i, f) in into.iter().enumerate() {
+        if let Some(f) = *f {
+            let (before, after) = events.split_at_mut(i);
+            before[f].n.merge(&after[0].n);
+            ok[f] = ok[f] || ok[i];
+            fixed[f] = true;
+        }
+    }
+    events.into_iter().zip(ok).zip(fixed).zip(into).filter(|(_, into)| into.is_none()).map(|(((e, ok), fixed), _)| (e, ok, fixed)).collect()
+}
+
 /// Connection attempts from the notifications, oldest first.
 pub fn attempts(mut events: Vec<ConnEvent>) -> Vec<Attempt> {
     events.retain(|e| ATTEMPT_TYPES.contains(&e.event_type.as_str()));
     events.sort_by_key(|e| e.ts);
-    // (event, succeeded on its own, merged with a fixup)
-    let mut merged: Vec<(ConnEvent, bool, bool)> = Vec::new();
-    for e in events {
-        let ok = succeeded(&e.event_type, &e.n);
-        if e.event_type == "fixup"
-            && let Some(id) = e.n.event_id.as_ref().filter(|v| **v != Field::Null)
-            // Sorted by time: only the last 20 minutes need looking at.
-            && let Some(prev) = merged.iter_mut().rev().take_while(|(p, _, _)| e.ts - p.ts <= FIXUP_WITHIN).find(|(p, _, _)| {
-                p.ap == e.ap && p.client == e.client && p.vap == e.vap && p.n.event_id.as_ref() == Some(id) && p.event_type.contains("failure")
-            })
-        {
-            prev.0.n.merge(&e.n);
-            prev.1 = prev.1 || ok;
-            prev.2 = true;
-            continue;
-        }
-        merged.push((e, ok, false));
-    }
-    merged
+    merge_fixups(events)
         .into_iter()
         .filter_map(|(e, ok, fixed)| {
             let n = &e.n;
@@ -581,11 +632,13 @@ pub struct Names {
 
 /// (MAC, name) rows of a query, by MAC.
 fn pairs<P: rusqlite::Params>(c: &rusqlite::Connection, sql: &str, params: P) -> rusqlite::Result<HashMap<String, Option<String>>> {
-    c.prepare(sql)?.query_map(params, |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?)))?.collect()
+    c.prepare_cached(sql)?.query_map(params, |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?)))?.collect()
 }
 
 /// APs' names: their hostnames.
 const AP_NAMES: &str = "SELECT mac, hostname FROM devices";
+/// The hostnames of a JSON list of clients: one statement whatever their number.
+const CLIENT_NAMES: &str = "SELECT mac, hostname FROM clients WHERE mac IN (SELECT value FROM json_each(?1))";
 
 impl Names {
     /// From the database: APs' and clients' hostnames.
@@ -593,16 +646,9 @@ impl Names {
         Ok(Names { aps: pairs(c, AP_NAMES, [])?, clients: pairs(c, "SELECT mac, hostname FROM clients", [])? })
     }
 
-    /// The same for some clients only (those of `macs`, as [`macs_of`] lists
-    /// them): every AP (there are few), and the clients asked for.
-    fn load_for<'a>(c: &rusqlite::Connection, macs: impl Iterator<Item = (&'a str, &'a str)>) -> rusqlite::Result<Names> {
-        let clients: Vec<&str> = macs.map(|(_, c)| c).collect::<BTreeSet<_>>().into_iter().collect();
-        let mut names = Names { aps: pairs(c, AP_NAMES, [])?, clients: HashMap::new() };
-        for chunk in clients.chunks(500) {
-            let sql = format!("SELECT mac, hostname FROM clients WHERE mac IN ({})", vec!["?"; chunk.len()].join(", "));
-            names.clients.extend(pairs(c, &sql, rusqlite::params_from_iter(chunk))?);
-        }
-        Ok(names)
+    /// The same for some clients only: every AP (there are few), and the clients asked for.
+    fn load_for(c: &rusqlite::Connection, clients: &BTreeSet<&str>) -> anyhow::Result<Names> {
+        Ok(Names { aps: pairs(c, AP_NAMES, [])?, clients: pairs(c, CLIENT_NAMES, [serde_json::to_string(clients)?])? })
     }
 
     /// An AP's display name: what it reports now, else what was stored.
@@ -615,35 +661,27 @@ impl Names {
         client_name(live, mac.parse().ok()).map(str::to_string).or_else(|| self.clients.get(mac).cloned().flatten())
     }
 
-    /// The names of every AP and client `live` knows, as [`Names::ap`] and
-    /// [`Names::client`] give them, on top.
-    pub fn add_live(&mut self, live: &Live) {
+    /// The names of every AP `live` knows, as [`Names::ap`] gives them, on top.
+    pub fn add_live_aps(&mut self, live: &Live) {
         for mac in live.devices.keys().chain(live.known_devices.keys()) {
             let m = mac.to_string();
             let name = ap_name_of(live, mac).or_else(|| self.aps.remove(&m).flatten());
             self.aps.insert(m, name);
         }
-        for mac in live.clients.keys().chain(live.aliases.iter().filter(|(_, a)| a.alias.is_some()).map(|(m, _)| m)) {
-            let m = mac.to_string();
-            let name = client_name(live, Some(*mac)).map(str::to_string).or_else(|| self.clients.remove(&m).flatten());
-            self.clients.insert(m, name);
-        }
     }
 }
 
-/// Display names of the APs and clients of `macs`, for the ones that have
-/// one, by AP and by client.
-fn names<'a>(stored: &Names, live: &Live, macs: impl Iterator<Item = (&'a str, &'a str)>) -> (BTreeMap<String, String>, BTreeMap<String, String>) {
-    let (aps, clients): (BTreeSet<&str>, BTreeSet<&str>) = macs.unzip();
+/// Display names of these APs and clients, for the ones that have one.
+fn names<'a>(stored: &Names, live: &Live, aps: impl IntoIterator<Item = &'a str>, clients: impl IntoIterator<Item = &'a str>) -> (BTreeMap<String, String>, BTreeMap<String, String>) {
     let aps = aps.into_iter().filter_map(|m| Some((m.to_string(), stored.ap(live, m)?))).collect();
     let clients = clients.into_iter().filter_map(|m| Some((m.to_string(), stored.client(live, m)?))).collect();
     (aps, clients)
 }
 
-/// (AP, client) of every attempt and both ends of every roam.
-fn macs_of<'a>(attempts: &'a [Attempt], roams: &'a [Roam]) -> impl Iterator<Item = (&'a str, &'a str)> {
+/// The APs and the clients of every attempt and both ends of every roam.
+fn macs_of<'a>(attempts: &'a [Attempt], roams: &'a [Roam]) -> (BTreeSet<&'a str>, BTreeSet<&'a str>) {
     let a = attempts.iter().map(|a| (a.ap.as_str(), a.client.as_str()));
-    a.chain(roams.iter().flat_map(|r| [(r.from.ap.as_str(), r.client.as_str()), (r.to.ap.as_str(), r.client.as_str())]))
+    a.chain(roams.iter().flat_map(|r| [(r.from.ap.as_str(), r.client.as_str()), (r.to.ap.as_str(), r.client.as_str())])).unzip()
 }
 
 /// GET /api/site/connectivity: connection success per client and stage, for
@@ -689,11 +727,12 @@ pub async fn list(State(s): State<AppState>, Query(q): Query<ListQuery>) -> Resu
     let with_roams = q.roams.unwrap_or(true);
     let (list, r, stored) = read(&s.store, Db::Config, move |c| {
         let (list, r) = newest(c, from, to, client.as_deref(), limit, q.failed, with_roams)?;
-        let stored = Names::load_for(c, macs_of(&list, &r))?;
+        let stored = Names::load_for(c, &macs_of(&list, &r).1)?;
         Ok((list, r, stored))
     })
     .await?;
-    let (aps, clients) = names(&stored, &s.live.read().unwrap(), macs_of(&list, &r));
+    let (aps, clients) = macs_of(&list, &r);
+    let (aps, clients) = names(&stored, &s.live.read().unwrap(), aps, clients);
     Ok(Json(json!({ "attempts": list, "roams": r, "ap_names": aps, "client_names": clients })))
 }
 
@@ -720,19 +759,21 @@ pub async fn roaming(State(s): State<AppState>, Query(q): Query<RoamingQuery>) -
     let range = RangeQuery { range: q.range.or(Some(2 * 86400)), from: q.from, to: q.to, ..Default::default() };
     let (from, to, tier) = window(&range);
     // The newest roams that may be listed, the figures over all of them, and the stored names
-    // and (AP, client) pairs of all of them (the figures name them too), reused for a while.
+    // and the APs and clients of all of them (the figures name them too), reused for a while.
     let got = memo_read(&s, Db::Config, "roaming", &range, tier, move |c| {
         let mut r = roams(&roam_rows(c, from, to, None)?);
         let figures = (roam_totals(&r), roam_pairs(&r), roam_clients(&r));
-        let stored = Names::load_for(c, macs_of(&[], &r))?;
-        let macs: BTreeSet<(String, String)> = macs_of(&[], &r).map(|(a, c)| (a.to_string(), c.to_string())).collect();
+        let (aps, clients) = macs_of(&[], &r);
+        let stored = Names::load_for(c, &clients)?;
+        let owned = |set: BTreeSet<&str>| -> Vec<String> { set.into_iter().map(str::to_string).collect() };
+        let macs = (owned(aps), owned(clients));
         r.reverse();
         r.truncate(ROAMS_LISTED);
         Ok((r, figures, stored, macs))
     })
     .await?;
-    let (r, (total, pairs, clients), stored, macs) = &*got;
-    let (ap_names, client_names) = names(stored, &s.live.read().unwrap(), macs.iter().map(|(a, c)| (a.as_str(), c.as_str())));
+    let (r, (total, pairs, clients), stored, (aps, client_macs)) = &*got;
+    let (ap_names, client_names) = names(stored, &s.live.read().unwrap(), aps.iter().map(String::as_str), client_macs.iter().map(String::as_str));
     /// The response, written out from the memoised parts as they are (keys in alphabetical order, as `json!` has them).
     #[derive(Serialize)]
     struct Out<'a> {
@@ -797,6 +838,13 @@ mod tests {
     }
 
     #[test]
+    fn client_names_are_read_through_the_key() {
+        let t = TestStore::new("names-plan");
+        let plan: String = t.db(Db::Config).query_row(&format!("EXPLAIN QUERY PLAN {CLIENT_NAMES}"), ["[\"a\"]"], |r| r.get(3)).unwrap();
+        assert!(plan.contains("(mac=?)"), "{plan}");
+    }
+
+    #[test]
     fn the_report_conditions_name_the_report_types() {
         assert_eq!(ATTEMPTS_ONLY, format!("AND event_type IN ('{}')", ATTEMPT_TYPES.join("', '")));
         assert!(NEAR_A_LEAVE.ends_with(&format!("l.event_type IN ('{}'))", LEAVE_TYPES.join("', '"))), "{NEAR_A_LEAVE}");
@@ -827,6 +875,53 @@ mod tests {
         let mut other = fixup;
         other.vap = Some("wifi0ap0".into());
         assert_eq!(attempts(vec![fail, other]).len(), 2);
+    }
+
+    #[test]
+    fn fixups_merge_as_a_look_back_over_the_last_twenty_minutes_does() {
+        // The merging as first written: each fixup looks back through the reports of the last 20 minutes.
+        fn by_scan(events: Vec<ConnEvent>) -> Vec<(ConnEvent, bool, bool)> {
+            let mut merged: Vec<(ConnEvent, bool, bool)> = Vec::new();
+            for e in events {
+                let ok = succeeded(&e.event_type, &e.n);
+                if e.event_type == "fixup"
+                    && let Some(id) = e.n.event_id.as_ref().filter(|v| **v != Field::Null)
+                    && let Some(prev) = merged.iter_mut().rev().take_while(|(p, _, _)| e.ts - p.ts <= FIXUP_WITHIN).find(|(p, _, _)| {
+                        p.ap == e.ap && p.client == e.client && p.vap == e.vap && p.n.event_id.as_ref() == Some(id) && p.event_type.contains("failure")
+                    })
+                {
+                    prev.0.n.merge(&e.n);
+                    prev.1 = prev.1 || ok;
+                    prev.2 = true;
+                    continue;
+                }
+                merged.push((e, ok, false));
+            }
+            merged
+        }
+        let mut seed = 3u64;
+        let mut rnd = |n: u64| {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (seed >> 33) % n
+        };
+        let ids = [json!(1), json!(2), json!(2.0), json!(-0.0), json!(0.0), json!("2"), json!(null), json!([1]), json!(true)];
+        let (mut events, mut ts) = (Vec::new(), 0);
+        for _ in 0..4000 {
+            // Often several at the same second, sometimes over twenty minutes apart.
+            ts += if rnd(40) == 0 { 1300 } else { [0, 0, 0, 1, 1, 5, 30, 60][rnd(8) as usize] };
+            let kind = ["failure", "soft failure", "success", "fixup", "fixup"][rnd(5) as usize];
+            let mut n = json!({ "dns_timeouts": rnd(2), "dns_responses": rnd(3), "traffic_delta": rnd(3) * 9000, "auth_rssi": -60 });
+            if rnd(8) > 0 {
+                n["event_id"] = ids[rnd(ids.len() as u64) as usize].clone();
+            }
+            let mut e = conn(ts, ["a", "b"][rnd(2) as usize], ["A", "B"][rnd(2) as usize], kind, n);
+            e.vap = [None, Some("wifi0ap0".to_string()), Some("wifi1ap0".to_string())][rnd(3) as usize].clone();
+            events.push(e);
+        }
+        let merged = merge_fixups(events.clone());
+        let n = merged.iter().filter(|m| m.2).count();
+        assert!(n > 100, "a fair test merges many, not {n}");
+        assert_eq!(format!("{merged:?}"), format!("{:?}", by_scan(events)));
     }
 
     #[test]

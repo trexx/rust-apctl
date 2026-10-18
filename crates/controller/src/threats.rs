@@ -30,7 +30,8 @@ use serde_json::{Value, json};
 
 use crate::api::{ApiError, AppState, Json};
 use crate::clock;
-use crate::engine::{Input, SharedLive};
+use crate::engine::{Input, Live, SharedLive};
+use crate::series::client_name;
 use crate::model::{Ts, hardware_num, named_enum, same_hardware};
 use crate::store::{Db, Store, Writer};
 use inform::Mac;
@@ -87,7 +88,7 @@ pub struct Assessment {
     pub heard: Vec<Heard>,
     /// When the first neighbouring network was recorded.
     pub watching_since: Ts,
-    pub acks: Acks,
+    pub acks: Arc<Acks>,
     /// (kind, bssid) -> when first reported.
     pub reported: HashMap<(Kind, String), Ts>,
 }
@@ -279,8 +280,9 @@ fn seen<'a>(rows: &[&'a Heard]) -> Seen<'a> {
 pub fn assess(a: &Assessment) -> Vec<Finding> {
     let own: HashMap<&str, &OwnBss> = a.own.iter().map(|b| (b.bssid.as_str(), b)).collect();
     // Addresses our APs and their radios use: anything this close is our hardware.
-    let family: Vec<u64> = a.own.iter().map(|b| b.bssid.as_str()).chain(a.aps.keys().map(String::as_str)).filter_map(mac_num).collect();
-    let is_family = |bssid: &str| mac_num(bssid).is_some_and(|n| family.iter().any(|f| same_hardware(n, *f)));
+    let mut family: Vec<u64> = a.own.iter().map(|b| b.bssid.as_str()).chain(a.aps.keys().map(String::as_str)).filter_map(mac_num).collect();
+    family.sort_unstable();
+    let is_family = |n: u64| family.get(family.partition_point(|f| *f < n.saturating_sub(16))).is_some_and(|f| same_hardware(n, *f));
     // The client next to an address: of several, the first by MAC, with its live name first.
     let client_near = |n: u64| {
         let mac = near_in(&a.clients, n).chain(near_in(&a.live_clients, n)).map(|c| c.mac.as_str()).min()?;
@@ -389,7 +391,8 @@ pub fn assess(a: &Assessment) -> Vec<Finding> {
             continue;
         }
 
-        let family = is_family(bssid);
+        let num = mac_num(bssid);
+        let family = num.is_some_and(is_family);
         let essid = latest.essid.as_deref().filter(|e| !e.is_empty());
         if let Some(e) = essid {
             if a.ssids.contains(e) {
@@ -423,7 +426,7 @@ pub fn assess(a: &Assessment) -> Vec<Finding> {
         if family {
             continue;
         }
-        if let Some(n) = mac_num(bssid)
+        if let Some(n) = num
             && let Some((mac, name)) = client_near(n)
         {
             let who = name.cloned().unwrap_or_else(|| mac.to_string());
@@ -486,8 +489,9 @@ pub struct ThreatState {
     cache: Mutex<Cache>,
     latest: Mutex<Option<Latest>>,
     /// Read from the database once, then kept here as [`ack`] changes them,
-    /// so what is served shows a change at once.
-    acks: Mutex<Option<Acks>>,
+    /// so what is served shows a change at once. Shared with the assessments
+    /// made since, and copied only for a change while one holds them.
+    acks: Mutex<Option<Arc<Acks>>>,
 }
 
 impl ThreatState {
@@ -499,15 +503,15 @@ impl ThreatState {
         self.latest.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    fn acks(&self) -> MutexGuard<'_, Option<Acks>> {
+    fn acks(&self) -> MutexGuard<'_, Option<Arc<Acks>>> {
         self.acks.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     /// Runs `f` on the acknowledgements, read from the database the first time.
-    fn with_acks<T>(&self, store: &Store, f: impl FnOnce(&mut Acks) -> T) -> anyhow::Result<T> {
+    fn with_acks<T>(&self, store: &Store, f: impl FnOnce(&mut Arc<Acks>) -> T) -> anyhow::Result<T> {
         let mut acks = self.acks();
         if acks.is_none() {
-            *acks = Some(store.read(Db::Config, |c| Ok(load_acks(c)?))?);
+            *acks = Some(Arc::new(store.read(Db::Config, |c| Ok(load_acks(c)?))?));
         }
         Ok(f(acks.as_mut().expect("read above")))
     }
@@ -541,9 +545,10 @@ pub fn gather(store: &Store, state: &ThreatState, live: &SharedLive, now: Ts) ->
             }
         }
         if let Some(state) = &live.state {
-            for w in state.get("wlanconf").and_then(Value::as_array).into_iter().flatten() {
-                if w.get("enabled").and_then(Value::as_bool) != Some(false)
-                    && let Some(n) = w.get("name").and_then(Value::as_str)
+            // This site's networks only: an import may hold other sites' too.
+            for w in crate::settings::docs(state, "wlanconf") {
+                if w["enabled"].as_bool() != Some(false)
+                    && let Some(n) = w["name"].as_str()
                 {
                     a.ssids.insert(n.to_string());
                 }
@@ -636,15 +641,35 @@ pub fn gather(store: &Store, state: &ThreatState, live: &SharedLive, now: Ts) ->
     a.clients = cache.clients.clone();
     drop(cache);
     a.acks = state.with_acks(store, |acks| acks.clone())?;
-    names.add_live(&live.read().unwrap());
+    let live = live.read().unwrap();
+    names.add_live_aps(&live);
     for (mac, name) in names.aps {
         let e = a.aps.entry(mac).or_insert(None);
         if name.is_some() {
             *e = name;
         }
     }
-    a.live_clients = sorted_clients(names.clients);
+    a.live_clients = live_clients(&live, &a.clients);
     Ok(a)
+}
+
+/// The clients `live` knows (what the APs report and the aliases), in
+/// address order, that [`assess`] needs on top of the stored ones: those with
+/// a name now (an alias, else what they report), and those not stored yet.
+fn live_clients(live: &Live, stored: &[Client]) -> Vec<Client> {
+    let aliased = live.aliases.iter().filter(|(m, a)| a.alias.is_some() && !live.clients.contains_key(m)).map(|(m, _)| m);
+    let mut out: Vec<Client> = live
+        .clients
+        .keys()
+        .chain(aliased)
+        .filter_map(|mac| {
+            let (num, name) = (hardware_num(mac), client_name(live, Some(*mac)));
+            let is_stored = || stored[stored.partition_point(|c| c.num < num)..].iter().take_while(|c| c.num == num).any(|c| c.mac.parse().ok() == Some(*mac));
+            (name.is_some() || !is_stored()).then(|| Client { num, mac: mac.to_string(), name: name.map(str::to_string) })
+        })
+        .collect();
+    out.sort_unstable_by(|a, b| (a.num, &a.mac).cmp(&(b.num, &b.mac)));
+    out
 }
 
 /// BSSIDs our APs used in the last 30 days, with their AP and latest name.
@@ -848,6 +873,7 @@ pub async fn ack(State(s): State<AppState>, Json(b): Json<AckBody>) -> Result<Js
 /// served shows it at once, however old the findings are.
 fn set_ack(store: &Store, state: &ThreatState, writer: &Writer, kind: Kind, bssid: String, ack: Option<Ack>) -> anyhow::Result<()> {
     state.with_acks(store, |acks| {
+        let acks = Arc::make_mut(acks);
         let k = Sql::Text(kind.as_str().into());
         match ack {
             Some(a) => {
@@ -1064,6 +1090,23 @@ mod tests {
     }
 
     #[test]
+    fn live_clients_are_the_named_and_the_not_yet_stored() {
+        use crate::engine::{Alias, ClientView};
+        let stored = sorted_clients([("3c:55:76:00:00:01".into(), Some("old name".into())), ("3c:55:76:00:00:02".into(), None)].into());
+        let mut live = Live::default();
+        for (mac, hostname) in [("3c:55:76:00:00:01", None), ("3c:55:76:00:00:02", Some("laptop")), ("3c:55:76:00:00:03", None)] {
+            let sample = crate::model::ClientSample { mac: mac.parse().unwrap(), hostname: hostname.map(Into::into), ..Default::default() };
+            live.clients.insert(sample.mac, ClientView { sample: Arc::new(sample), connected: true, first_seen: 0, last_seen: 0 });
+        }
+        live.aliases.insert("3c:55:76:00:00:04".parse().unwrap(), Alias { alias: Some("tablet".into()), note: None });
+        live.aliases.insert("3c:55:76:00:00:02".parse().unwrap(), Alias { alias: Some("my laptop".into()), note: None });
+        let got = live_clients(&live, &stored);
+        let got: Vec<(&str, Option<&str>)> = got.iter().map(|c| (c.mac.as_str(), c.name.as_deref())).collect();
+        // The first is stored and has no name now: what is stored stands.
+        assert_eq!(got, [("3c:55:76:00:00:02", Some("my laptop")), ("3c:55:76:00:00:03", None), ("3c:55:76:00:00:04", Some("tablet"))]);
+    }
+
+    #[test]
     fn new_strong_networks_once_we_have_watched_a_while() {
         let mut a = site();
         let mut n = heard("02:00:00:00:00:01", UP, "Neighbour", 36, "WPA2-Personal (AES/CCMP)", -55);
@@ -1220,10 +1263,25 @@ mod tests {
     }
 
     #[test]
+    fn only_this_sites_network_names_are_ours() {
+        let dir = TestDir::new("threats-sites");
+        let (store, _writer) = Store::open(&dir).unwrap();
+        let (live, state): (SharedLive, ThreatState) = Default::default();
+        live.write().unwrap().state = Some(Arc::new(json!({
+            "devices": [{ "mac": UP, "site_id": "s1" }],
+            "wlanconf": [{ "name": "Home", "site_id": "s1" }, { "name": "Shared" }, { "name": "Office", "site_id": "s2" }, { "name": "Off", "site_id": "s1", "enabled": false }],
+        })));
+        let a = gather(&store, &state, &live, 1_000_000).unwrap();
+        let mut ssids: Vec<&str> = a.ssids.iter().map(String::as_str).collect();
+        ssids.sort();
+        assert_eq!(ssids, ["Home", "Shared"], "another site's networks are not ours");
+    }
+
+    #[test]
     fn acknowledgements_are_per_kind_and_bssid() {
         let mut a = site();
         a.heard.push(heard("02:aa:bb:cc:dd:ee", UP, "H0me", 36, "Open", -70));
-        a.acks.entry(Kind::Lookalike).or_default().insert("02:aa:bb:cc:dd:ee".into(), Ack { note: Some("the neighbours".into()), ts: 5 });
+        Arc::make_mut(&mut a.acks).entry(Kind::Lookalike).or_default().insert("02:aa:bb:cc:dd:ee".into(), Ack { note: Some("the neighbours".into()), ts: 5 });
         assert_eq!((Kind::parse("lookalike"), json!(Kind::NewNearby)), (Some(Kind::Lookalike), json!("new_nearby")), "named as stored");
         let f = assess(&a);
         assert_eq!(f[0].acknowledged.as_ref().and_then(|x| x.note.as_deref()), Some("the neighbours"));
