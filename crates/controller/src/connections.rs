@@ -615,18 +615,12 @@ impl Names {
         client_name(live, mac.parse().ok()).or_else(|| self.clients.get(mac).cloned().flatten())
     }
 
-    /// The names of every AP and client `live` knows, as [`Names::ap`] and
-    /// [`Names::client`] give them, on top.
-    pub fn add_live(&mut self, live: &Live) {
+    /// The names of every AP `live` knows, as [`Names::ap`] gives them, on top.
+    pub fn add_live_aps(&mut self, live: &Live) {
         for mac in live.devices.keys().chain(live.known_devices.keys()) {
             let m = mac.to_string();
             let name = ap_name_of(live, mac).or_else(|| self.aps.remove(&m).flatten());
             self.aps.insert(m, name);
-        }
-        for mac in live.clients.keys().chain(live.aliases.iter().filter(|(_, a)| a.alias.is_some()).map(|(m, _)| m)) {
-            let m = mac.to_string();
-            let name = client_name(live, Some(*mac)).or_else(|| self.clients.remove(&m).flatten());
-            self.clients.insert(m, name);
         }
     }
 }

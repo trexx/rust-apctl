@@ -30,7 +30,8 @@ use serde_json::{Value, json};
 
 use crate::api::{ApiError, AppState, Json};
 use crate::clock;
-use crate::engine::{Input, SharedLive};
+use crate::engine::{Input, Live, SharedLive};
+use crate::series::client_name;
 use crate::model::{Ts, hardware_num, named_enum, same_hardware};
 use crate::store::{Db, Store, Writer};
 use inform::Mac;
@@ -640,15 +641,35 @@ pub fn gather(store: &Store, state: &ThreatState, live: &SharedLive, now: Ts) ->
     a.clients = cache.clients.clone();
     drop(cache);
     a.acks = state.with_acks(store, |acks| acks.clone())?;
-    names.add_live(&live.read().unwrap());
+    let live = live.read().unwrap();
+    names.add_live_aps(&live);
     for (mac, name) in names.aps {
         let e = a.aps.entry(mac).or_insert(None);
         if name.is_some() {
             *e = name;
         }
     }
-    a.live_clients = sorted_clients(names.clients);
+    a.live_clients = live_clients(&live, &a.clients);
     Ok(a)
+}
+
+/// The clients `live` knows (what the APs report and the aliases), in
+/// address order, that [`assess`] needs on top of the stored ones: those with
+/// a name now (an alias, else what they report), and those not stored yet.
+fn live_clients(live: &Live, stored: &[Client]) -> Vec<Client> {
+    let aliased = live.aliases.iter().filter(|(m, a)| a.alias.is_some() && !live.clients.contains_key(m)).map(|(m, _)| m);
+    let mut out: Vec<Client> = live
+        .clients
+        .keys()
+        .chain(aliased)
+        .filter_map(|mac| {
+            let (num, name) = (hardware_num(mac), client_name(live, Some(*mac)));
+            let is_stored = || stored[stored.partition_point(|c| c.num < num)..].iter().take_while(|c| c.num == num).any(|c| c.mac.parse().ok() == Some(*mac));
+            (name.is_some() || !is_stored()).then(|| Client { num, mac: mac.to_string(), name })
+        })
+        .collect();
+    out.sort_unstable_by(|a, b| (a.num, &a.mac).cmp(&(b.num, &b.mac)));
+    out
 }
 
 /// BSSIDs our APs used in the last 30 days, with their AP and latest name.
@@ -1066,6 +1087,23 @@ mod tests {
         // A client only seen live counts too.
         a.clients = Arc::from([]);
         assert_eq!(assess(&a)[0].target.as_deref(), Some("3c:55:76:00:00:02"));
+    }
+
+    #[test]
+    fn live_clients_are_the_named_and_the_not_yet_stored() {
+        use crate::engine::{Alias, ClientView};
+        let stored = sorted_clients([("3c:55:76:00:00:01".into(), Some("old name".into())), ("3c:55:76:00:00:02".into(), None)].into());
+        let mut live = Live::default();
+        for (mac, hostname) in [("3c:55:76:00:00:01", None), ("3c:55:76:00:00:02", Some("laptop")), ("3c:55:76:00:00:03", None)] {
+            let sample = crate::model::ClientSample { mac: mac.parse().unwrap(), hostname: hostname.map(Into::into), ..Default::default() };
+            live.clients.insert(sample.mac, ClientView { sample: Arc::new(sample), connected: true, first_seen: 0, last_seen: 0 });
+        }
+        live.aliases.insert("3c:55:76:00:00:04".parse().unwrap(), Alias { alias: Some("tablet".into()), note: None });
+        live.aliases.insert("3c:55:76:00:00:02".parse().unwrap(), Alias { alias: Some("my laptop".into()), note: None });
+        let got = live_clients(&live, &stored);
+        let got: Vec<(&str, Option<&str>)> = got.iter().map(|c| (c.mac.as_str(), c.name.as_deref())).collect();
+        // The first is stored and has no name now: what is stored stands.
+        assert_eq!(got, [("3c:55:76:00:00:02", Some("my laptop")), ("3c:55:76:00:00:03", None), ("3c:55:76:00:00:04", Some("tablet"))]);
     }
 
     #[test]
