@@ -576,9 +576,16 @@ impl Engine {
         }
     }
 
-    /// Stores an event and tells the live subscribers; the alert watcher gets
-    /// the event itself, last, so it is not copied.
+    /// Stores an event and tells the live subscribers (see `record`).
     fn emit(&self, ev: Event) {
+        let head = self.record(ev);
+        let _ = self.tx.send(LiveMsg::Event(head));
+    }
+
+    /// Stores an event without telling the live subscribers, for the caller
+    /// to announce (`emit` does); the alert watcher gets the event itself,
+    /// last, so it is not copied.
+    fn record(&self, ev: Event) -> EventHead {
         bump(&self.counters.events);
         self.writer.exec(
             Db::Config,
@@ -591,10 +598,11 @@ impl Engine {
                 Sql::Text(ev.data.to_string()),
             ],
         );
-        let _ = self.tx.send(LiveMsg::Event(EventHead { kind: ev.kind, device_mac: ev.device_mac, client_mac: ev.client_mac }));
+        let head = EventHead { kind: ev.kind, device_mac: ev.device_mac, client_mac: ev.client_mac };
         if let Some(a) = &self.alerts {
             a.offer(ev);
         }
+        head
     }
 
     fn inform(&mut self, ts: Ts, peer: String, decoded: Decoded) {
@@ -992,11 +1000,14 @@ impl Engine {
         }
     }
 
-    /// Each rename is its own event (a client's history shows it); the client
-    /// list is announced once for the lot.
+    /// Each rename is its own event (a client's history shows it). The
+    /// renames and the client list are announced once for the lot: a bulk
+    /// import of thousands of names would otherwise overrun the live
+    /// subscribers' queue, and send every browser to refetch everything.
     fn set_aliases(&self, ts: Ts, entries: Vec<AliasEdit>, only_if_unset: bool) {
         let clean = |v: Option<String>| v.map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
         let mut changed = false;
+        let mut renames = Vec::new();
         let mut live = self.live.write().unwrap();
         for AliasEdit { mac, alias, note } in entries {
             let (alias, mut note) = (clean(alias), clean(note));
@@ -1026,10 +1037,19 @@ impl Engine {
             }
             if old.alias != alias {
                 let ap = live.clients.get(&mac).map(|c| c.sample.ap_mac);
-                self.emit(Event { ts, kind: EventKind::ClientRenamed, device_mac: ap, client_mac: Some(mac), data: json!({ "from": old.alias, "to": alias }) });
+                renames.push(self.record(Event { ts, kind: EventKind::ClientRenamed, device_mac: ap, client_mac: Some(mac), data: json!({ "from": old.alias, "to": alias }) }));
             }
         }
         drop(live);
+        // One rename names its client; more are announced as renames of anyone.
+        let head = match renames[..] {
+            [] => None,
+            [one] => Some(one),
+            _ => Some(EventHead { kind: EventKind::ClientRenamed, device_mac: None, client_mac: None }),
+        };
+        if let Some(head) = head {
+            let _ = self.tx.send(LiveMsg::Event(head));
+        }
         if changed {
             let _ = self.tx.send(LiveMsg::Clients);
         }
@@ -2074,16 +2094,21 @@ mod tests {
     }
 
     #[test]
-    fn a_bulk_import_announces_the_client_list_once() {
+    fn a_bulk_import_announces_the_renames_and_the_client_list_once() {
         let mut h = harness();
         let edit = |mac: &str, alias: &str| AliasEdit { mac: mac.parse().unwrap(), alias: Some(alias.into()), note: None };
         let entries = vec![edit(C1, "Speaker"), edit("02:00:00:00:01:02", "Printer"), edit("02:00:00:00:01:03", "")];
         h.engine.handle(Input::SetAliases { ts: 1, entries, only_if_unset: true });
         let msgs: Vec<LiveMsg> = std::iter::from_fn(|| h.rx.try_recv().ok()).collect();
-        let renames = msgs.iter().filter(|m| matches!(m, LiveMsg::Event(e) if e.kind == EventKind::ClientRenamed)).count();
+        let renames: Vec<_> = msgs.iter().filter_map(|m| match m { LiveMsg::Event(e) if e.kind == EventKind::ClientRenamed => Some(e.client_mac), _ => None }).collect();
         let lists = msgs.iter().filter(|m| matches!(m, LiveMsg::Clients)).count();
-        assert_eq!((renames, lists), (2, 1), "{msgs:?}");
+        assert_eq!((renames, lists), (vec![None], 1), "{msgs:?}");
         assert_eq!(h.live.read().unwrap().aliases.len(), 2);
+        assert_eq!(stored(&h, EventKind::ClientRenamed).len(), 2, "each rename is still its own event");
+        // A single rename names its client.
+        h.engine.handle(Input::SetAliases { ts: 2, entries: vec![edit(C1, "Kitchen speaker")], only_if_unset: false });
+        let renames: Vec<_> = std::iter::from_fn(|| h.rx.try_recv().ok()).filter_map(|m| match m { LiveMsg::Event(e) => Some(e.client_mac), _ => None }).collect();
+        assert_eq!(renames, [C1.parse().ok()]);
     }
 
     #[test]
