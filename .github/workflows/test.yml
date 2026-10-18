@@ -25,7 +25,7 @@ jobs:
       - name: 'Capture fixtures'
         run: |
           if [ -z "${APCTL_TESTDATA:-}" ]; then
-            echo "::notice::APCTL_TESTDATA is not set: the capture-based golden tests are skipped"
+            echo "::notice::APCTL_TESTDATA is not set: the capture-based golden tests return early and show as passed without checking anything"
           fi
       # The web UI is not needed: debug builds serve web/dist from disk if it exists.
       # informdump turns on serde_json's preserve_order; testing it on its own keeps the

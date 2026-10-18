@@ -6,7 +6,7 @@ use std::net::{IpAddr, SocketAddr};
 use anyhow::Result;
 use inform::Mac;
 
-use crate::capture::{ConnId, HttpEvent, Micros, Sweeper};
+use crate::capture::{ConnId, HttpEvent, MAX_CONNS, Micros, Sweeper};
 use crate::decode::{Decoded, decode};
 use crate::keys::KeyStore;
 
@@ -46,8 +46,12 @@ pub struct Pairer {
 
 impl Pairer {
     fn push(&mut self, conn: ConnId, ts: Micros, p: Pending) {
-        if !self.in_flight.contains_key(&conn) && self.sweeper.due(self.in_flight.len() + 1, ts) {
-            self.in_flight.retain(|_, (last, _)| ts - *last < MAX_WAIT);
+        if !self.in_flight.contains_key(&conn) {
+            if self.in_flight.len() >= MAX_CONNS {
+                self.make_room(ts);
+            } else if self.sweeper.due(self.in_flight.len() + 1, ts) {
+                self.in_flight.retain(|_, (last, _)| ts - *last < MAX_WAIT);
+            }
         }
         let (last, queue) = self.in_flight.entry(conn).or_default();
         *last = ts;
@@ -55,6 +59,19 @@ impl Pairer {
             queue.pop_front();
         }
         queue.push_back(p);
+    }
+
+    /// Called when as many connections wait as the capture tracks and another shows up:
+    /// forgets the stale ones, and if that frees too little, the eighth that waited
+    /// longest. Requests from made-up connections cost no more than that.
+    fn make_room(&mut self, ts: Micros) {
+        self.sweeper.last = ts;
+        self.in_flight.retain(|_, (last, _)| ts - *last < MAX_WAIT);
+        if self.in_flight.len() > MAX_CONNS - MAX_CONNS / 8 {
+            let mut order: Vec<Micros> = self.in_flight.values().map(|(last, _)| *last).collect();
+            let (_, &mut cutoff, _) = order.select_nth_unstable(MAX_CONNS / 8);
+            self.in_flight.retain(|_, (last, _)| *last > cutoff);
+        }
     }
 
     /// The request a response answers: the next one in order, or for a reply sealed
@@ -159,6 +176,14 @@ mod tests {
         }
         assert_eq!(p.in_flight.len(), 1000);
         assert_eq!(p.sweeper.last, 20_000_000 + Micros::from(SWEEP_ABOVE as u16), "one sweep, when the map filled up");
+        // However many connections send requests that are never answered, within MAX_WAIT.
+        let mut p = Pairer::default();
+        for i in 0..(MAX_CONNS + MAX_CONNS / 4) as u32 {
+            let c = ConnId { client: SocketAddr::from(([10, 1, (i >> 8) as u8, i as u8], 40000)), server: SocketAddr::from(([10, 0, 0, 1], 8080)) };
+            p.handle(&keys, get(c, Micros::from(i)));
+            assert!(p.in_flight.len() <= MAX_CONNS);
+        }
+        assert!(p.in_flight.values().all(|(last, _)| *last >= (MAX_CONNS / 8) as Micros), "the oldest go first");
     }
 
     fn sealed(mac: &str, json: &str) -> Vec<u8> {

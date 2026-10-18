@@ -11,7 +11,8 @@ use std::net::{IpAddr, SocketAddr};
 
 use anyhow::{Context, Result, bail};
 use etherparse::{NetSlice, SlicedPacket, TransportSlice};
-use pcap_parser::{Block, Linktype, PcapBlockOwned, PcapError, create_reader};
+use pcap_parser::traits::PcapNGPacketBlock;
+use pcap_parser::{Block, IDB_MAGIC, Linktype, PcapBlockOwned, PcapError, create_reader};
 
 /// Time since the Unix epoch, in microseconds.
 pub type Micros = i64;
@@ -71,17 +72,21 @@ pub fn run_with_udp<R: Read + Send>(
                     }
                     PcapBlockOwned::NG(Block::SectionHeader(_)) => interfaces.clear(),
                     PcapBlockOwned::NG(Block::InterfaceDescription(idb)) => {
-                        interfaces.push((idb.linktype, idb.ts_resolution().unwrap_or(1_000_000), idb.ts_offset()));
+                        // pcap-parser reads the offset as little-endian whatever the section's byte order.
+                        let offset = if idb.block_type == IDB_MAGIC { idb.if_tsoffset } else { idb.if_tsoffset.swap_bytes() };
+                        interfaces.push((idb.linktype, ts_units(idb.if_tsresol), offset));
                     }
+                    // A packet naming an interface no block described is skipped: the
+                    // reader still has to move past it, below.
                     PcapBlockOwned::NG(Block::EnhancedPacket(epb)) => {
-                        let Some(&(linktype, res, off)) = interfaces.get(epb.if_id as usize) else { continue };
-                        let (sec, frac) = epb.decode_ts(off.max(0) as u64, res);
-                        last_ts = sec as i64 * 1_000_000 + (frac as i128 * 1_000_000 / res as i128) as i64;
-                        tracker.packet(linktype, last_ts, epb.data, &mut on_event);
+                        if let Some(&(linktype, units, offset)) = interfaces.get(epb.if_id as usize) {
+                            last_ts = epb_micros(epb.ts_high, epb.ts_low, units, offset);
+                            tracker.packet(linktype, last_ts, epb.packet_data(), &mut on_event);
+                        }
                     }
                     PcapBlockOwned::NG(Block::SimplePacket(spb)) => {
                         if let Some(&(linktype, ..)) = interfaces.first() {
-                            tracker.packet(linktype, last_ts, spb.data, &mut on_event);
+                            tracker.packet(linktype, last_ts, spb.packet_data(), &mut on_event);
                         }
                     }
                     PcapBlockOwned::NG(_) => {}
@@ -119,6 +124,26 @@ pub fn run_with_udp<R: Read + Send>(
 /// Largest capture block the reader grows its buffer for.
 const MAX_BLOCK: usize = 64 << 20;
 
+/// Timestamp units per second of a pcapng interface, from its `if_tsresol`: a power of
+/// ten, or of two when the top bit is set. pcap-parser's own `ts_resolution` rejects
+/// every power of two, so it is worked out here; one that does not fit falls back to
+/// the default, microseconds.
+fn ts_units(tsresol: u8) -> u64 {
+    let exp = u32::from(tsresol & 0x7f);
+    let units = if tsresol & 0x80 != 0 { 1u64.checked_shl(exp) } else { 10u64.checked_pow(exp) };
+    units.unwrap_or(1_000_000)
+}
+
+/// An enhanced packet block's time in microseconds since the epoch. Worked out here
+/// because pcap-parser's `decode_ts` cuts the fraction to 32 bits (picoseconds do not
+/// fit) and takes no negative offset.
+fn epb_micros(ts_high: u32, ts_low: u32, units: u64, offset_secs: i64) -> Micros {
+    let ts = u64::from(ts_high) << 32 | u64::from(ts_low);
+    let (secs, frac) = (i128::from(ts / units), i128::from(ts % units));
+    let micros = (i128::from(offset_secs) + secs) * 1_000_000 + frac * 1_000_000 / i128::from(units);
+    micros.clamp(Micros::MIN.into(), Micros::MAX.into()) as Micros
+}
+
 fn slice(linktype: Linktype, data: &[u8]) -> Option<SlicedPacket<'_>> {
     let ip = |d| SlicedPacket::from_ip(d).ok();
     match linktype {
@@ -136,6 +161,8 @@ struct Tracker {
     ports: Vec<u16>,
     udp_ports: Vec<u16>,
     conns: HashMap<ConnId, Conn>,
+    /// The bytes all connections' buffers hold (the sum of their `held`).
+    held: usize,
     /// When idle connections were last swept.
     sweeper: Sweeper,
 }
@@ -147,12 +174,18 @@ struct Conn {
     last_seen: Micros,
     /// Some segment in either direction carried data.
     carried: bool,
+    /// The bytes its buffers held after its last segment.
+    held: usize,
 }
 
 impl Conn {
     /// Both sides closed and nothing is missing.
     fn closed(&self) -> bool {
         self.to_server.closed() && self.to_client.closed()
+    }
+
+    fn held(&self) -> usize {
+        self.to_server.held() + self.to_client.held()
     }
 
     /// How long the connection may go unseen before it is forgotten.
@@ -191,7 +224,11 @@ impl Sweeper {
 }
 /// Most connections tracked at once. An AP keeps one open, so this is far more than
 /// any site has; it bounds what packets with made-up addresses can make us hold.
-const MAX_CONNS: usize = 16_384;
+pub(crate) const MAX_CONNS: usize = 16_384;
+/// Most bytes all connections' buffers may hold between them. Each may hold up to
+/// `MAX_BUFFER` and `MAX_PENDING_BYTES` per direction, which would be far too much
+/// for `MAX_CONNS` of them; real informs and replies hold a few hundred KB at most.
+const MAX_HELD: usize = 64 << 20;
 /// How long an open connection may idle before it is forgotten (long live captures).
 const MAX_IDLE: Micros = 300_000_000;
 /// The same for one that never carried data (a handshake, a stray ACK): an AP sends
@@ -203,7 +240,7 @@ const CLOSED_LINGER: Micros = 2_000_000;
 
 impl Tracker {
     fn new(ports: Vec<u16>, udp_ports: Vec<u16>) -> Self {
-        Tracker { ports, udp_ports, conns: HashMap::new(), sweeper: Sweeper::default() }
+        Tracker { ports, udp_ports, conns: HashMap::new(), held: 0, sweeper: Sweeper::default() }
     }
 
     fn packet(&mut self, linktype: Linktype, ts: Micros, data: &[u8], on_event: &mut impl FnMut(HttpEvent)) {
@@ -239,7 +276,9 @@ impl Tracker {
         };
 
         if tcp.rst() {
-            self.conns.remove(&conn_id);
+            if let Some(c) = self.conns.remove(&conn_id) {
+                self.held -= c.held;
+            }
             return;
         }
         if self.conns.len() >= MAX_CONNS && !self.conns.contains_key(&conn_id) {
@@ -265,6 +304,12 @@ impl Tracker {
             conn.to_server.release();
             conn.to_client.release();
         }
+        let held = conn.held();
+        self.held = self.held - conn.held + held;
+        conn.held = held;
+        if self.held > MAX_HELD {
+            self.shed();
+        }
 
         self.sweep(ts);
     }
@@ -272,8 +317,32 @@ impl Tracker {
     /// Forgets idle connections, when a sweep is due.
     fn sweep(&mut self, ts: Micros) {
         if self.sweeper.due(self.conns.len(), ts) {
-            self.conns.retain(|_, c| ts - c.last_seen < c.max_idle());
+            self.retain(|c| ts - c.last_seen < c.max_idle());
         }
+    }
+
+    /// Keeps the connections `keep` says to, and counts what they hold.
+    fn retain(&mut self, mut keep: impl FnMut(&Conn) -> bool) {
+        self.conns.retain(|_, c| keep(c));
+        self.held = self.conns.values().map(|c| c.held).sum();
+    }
+
+    /// Called when the buffers hold more than `MAX_HELD`: forgets the connections that
+    /// hold the most until three quarters of it is left, so that the next shed is
+    /// some way off. Those are the ones made-up traffic fills; an AP's connection holds
+    /// a message or two, and one that is forgotten picks up again at its next message.
+    fn shed(&mut self) {
+        let mut sizes: Vec<usize> = self.conns.values().map(|c| c.held).filter(|&h| h > 0).collect();
+        sizes.sort_unstable_by(|a, b| b.cmp(a));
+        let (mut held, mut cutoff) = (self.held, usize::MAX);
+        for size in sizes {
+            if held <= MAX_HELD / 4 * 3 {
+                break;
+            }
+            held -= size;
+            cutoff = size;
+        }
+        self.retain(|c| c.held < cutoff);
     }
 
     /// Called when the map is full and a new connection shows up: sweeps, and if
@@ -283,11 +352,11 @@ impl Tracker {
     /// at its next message.
     fn make_room(&mut self, ts: Micros) {
         self.sweeper.last = ts;
-        self.conns.retain(|_, c| ts - c.last_seen < c.max_idle());
+        self.retain(|c| ts - c.last_seen < c.max_idle());
         if self.conns.len() > MAX_CONNS - MAX_CONNS / 8 {
             let mut order: Vec<(bool, Micros)> = self.conns.values().map(|c| (c.carried, c.last_seen)).collect();
             let (_, &mut cutoff, _) = order.select_nth_unstable(MAX_CONNS / 8);
-            self.conns.retain(|_, c| (c.carried, c.last_seen) > cutoff);
+            self.retain(|c| (c.carried, c.last_seen) > cutoff);
         }
     }
 }
@@ -324,6 +393,9 @@ const MAX_GAP_AGE: Micros = 10_000_000;
 /// Largest unparsed message kept. Inform bodies are a few KB (the largest
 /// decoded ones a few hundred KB), and anything bigger on the port is not an inform.
 const MAX_BUFFER: usize = 8 << 20;
+/// A buffer that grew beyond this is freed when it empties, rather than kept for the
+/// next message: most messages are a few KB.
+const KEEP_CAPACITY: usize = 256 << 10;
 /// Largest message head (start line and headers). Until a head is complete it is
 /// parsed again with every segment, so one that never ends is given up on early.
 const MAX_HEAD: usize = 64 << 10;
@@ -361,7 +433,15 @@ impl HalfStream {
             }
             self.gap_since.get_or_insert(ts);
         } else {
+            let pos = self.pos;
             self.append(at, payload);
+            // Bytes before the gap are still arriving, so the wait for the rest starts
+            // again. Nor could a gap be skipped below without losing a message these
+            // bytes may just have completed, which the caller has not taken yet; the
+            // queue only shrinks here, so no size limit can force a skip either.
+            if self.pos > pos && self.gap_since.is_some() {
+                self.gap_since = Some(ts);
+            }
             self.apply_pending(ts);
         }
         while self.pending.len() > MAX_PENDING
@@ -404,6 +484,11 @@ impl HalfStream {
         self.apply_pending(ts);
     }
 
+    /// The bytes its buffers hold.
+    fn held(&self) -> usize {
+        self.buf.capacity() + self.pending_bytes
+    }
+
     /// Closed by its sender with every byte received.
     fn closed(&self) -> bool {
         self.fin_at.is_some_and(|fin_at| self.pos >= fin_at) && self.pending.is_empty()
@@ -435,7 +520,11 @@ impl HalfStream {
     }
 
     fn clear_buf(&mut self) {
-        self.buf.clear();
+        if self.buf.capacity() > KEEP_CAPACITY {
+            self.buf = Vec::new();
+        } else {
+            self.buf.clear();
+        }
         self.consumed = 0;
     }
 
@@ -688,6 +777,25 @@ mod tests {
     }
 
     #[test]
+    fn a_message_completed_while_a_later_gap_is_old_is_kept() {
+        let msg = |body: &str| format!("POST /inform HTTP/1.1\r\nContent-Length: {}\r\n\r\n{body}", body.len()).into_bytes();
+        let (first, second, third) = (msg("first"), msg("second"), msg("third"));
+        let mut h = HalfStream::default();
+        h.segment(0, 99, true, false, b"");
+        h.segment(0, 100, false, false, &first[..10]);
+        // The third message queues behind a gap: the rest of the first and all of the second.
+        let third_at = 100 + (first.len() + second.len()) as u32;
+        h.segment(1_000_000, third_at, false, false, &third);
+        // Long after, the rest of the first arrives (the second never does).
+        h.segment(12_000_000, 110, false, false, &first[10..]);
+        assert!(matches!(h.take_http(true), Some(Parsed::Request { body, .. }) if body == b"first"));
+        assert!(h.take_http(true).is_none());
+        // The gap then ages again and is skipped, carrying on with the third.
+        h.segment(23_000_000, third_at, false, false, &third);
+        assert!(matches!(h.take_http(true), Some(Parsed::Request { body, .. }) if body == b"third"));
+    }
+
+    #[test]
     fn pending_bytes_are_bounded() {
         let mut h = HalfStream::default();
         h.segment(0, 0, true, false, b"");
@@ -892,6 +1000,39 @@ mod tests {
     }
 
     #[test]
+    fn the_buffers_of_all_connections_share_a_budget() {
+        let mut t = Tracker::new(vec![8080], Vec::new());
+        let (_, ctrl) = sample::endpoints();
+        let client = |n: u16| crate::synth::Endpoint { mac: [2; 6], ip: [10, 1, (n >> 8) as u8, n as u8], port: 40000 };
+        let send = |t: &mut Tracker, n: u16, seq: u32, payload: &[u8]| {
+            let frame = crate::synth::tcp_frame(client(n), ctrl, seq, payload).unwrap();
+            t.packet(Linktype::ETHERNET, 0, &frame, &mut |_| {});
+            assert!(t.held <= MAX_HELD, "{}", t.held);
+            assert_eq!(t.held, t.conns.values().map(Conn::held).sum::<usize>());
+        };
+        // An AP partway through its inform, then made-up connections that each send a
+        // few MB of a message far too long to finish.
+        send(&mut t, 0, 1, b"POST /inform HTTP/1.1\r\nContent-Length: 100\r\n\r\nabc");
+        let head = b"POST /inform HTTP/1.1\r\nContent-Length: 7000000\r\n\r\n";
+        let chunk = vec![b'x'; 60_000];
+        for n in 1..=30 {
+            send(&mut t, n, 1, head);
+            for i in 0..50 {
+                send(&mut t, n, 1 + head.len() as u32 + i * chunk.len() as u32, &chunk);
+            }
+        }
+        assert!(t.conns.len() < 31, "some were forgotten: {}", t.conns.len());
+        assert!(t.conns.contains_key(&ConnId { client: SocketAddr::from(([10, 1, 0, 0], 40000)), server: SocketAddr::from(([10, 0, 0, 1], 8080)) }), "not the one holding little");
+        // A buffer that grew for a large message is freed once that is taken.
+        let big = sample::http_request(&vec![b'y'; 1 << 20]);
+        let mut h = HalfStream::default();
+        h.segment(0, 0, true, false, b"");
+        h.segment(0, 1, false, false, &big);
+        assert!(matches!(h.take_http(true), Some(Parsed::Request { body, .. }) if body.len() == 1 << 20));
+        assert_eq!((h.buf.capacity(), h.held()), (0, 0));
+    }
+
+    #[test]
     fn connections_are_capped() {
         let mut t = Tracker::new(vec![8080], Vec::new());
         let syn = |port: u16| {
@@ -900,9 +1041,8 @@ mod tests {
             frame
         };
         // A real connection that carried data, then a flood of bare SYNs from made-up addresses.
-        let req = sample::http_request(b"x");
-        let mut frame = Vec::new();
-        etherparse::PacketBuilder::ethernet2([2; 6], [4; 6]).ipv4([10, 0, 0, 5], [10, 0, 0, 1], 64).tcp(40000, 8080, 1, 1024).write(&mut frame, &req).unwrap();
+        let (ap, ctrl) = sample::endpoints();
+        let frame = crate::synth::tcp_frame(ap, ctrl, 1, &sample::http_request(b"x")).unwrap();
         let mut events = 0;
         t.packet(Linktype::ETHERNET, 0, &frame, &mut |_| events += 1);
         assert_eq!(events, 1);
@@ -928,11 +1068,10 @@ mod tests {
 pub mod sample {
     use std::path::PathBuf;
 
-    use etherparse::PacketBuilder;
     use serde_json::Value;
 
     use super::Micros;
-    use crate::synth::{http, write_pcap_header, write_pcap_record};
+    use crate::synth::{Endpoint, http, tcp_frame, write_pcap_header, write_pcap_record};
 
     /// The sanitised capture fixtures, kept outside the repository:
     /// `$APCTL_TESTDATA/2026-10-12-u6m-8.8.11`. `None`, saying why, when they are not
@@ -983,19 +1122,19 @@ pub mod sample {
         assert_eq!(removed, list("removed"), "{ctx}: removed keys");
     }
 
+    /// The AP (10.0.0.5:40000) and the controller (10.0.0.1:8080) of the synthetic captures.
+    pub fn endpoints() -> (Endpoint, Endpoint) {
+        (Endpoint { mac: [2; 6], ip: [10, 0, 0, 5], port: 40000 }, Endpoint { mac: [4; 6], ip: [10, 0, 0, 1], port: 8080 })
+    }
+
     /// A legacy pcap containing the given TCP segments as (to_server, seq, payload).
     pub fn pcap(segments: &[(bool, u32, &[u8])]) -> Vec<u8> {
         let mut out = Vec::new();
         write_pcap_header(&mut out, 65535).unwrap();
-        let (ap, ctrl) = ([10, 0, 0, 5], [10, 0, 0, 1]);
+        let (ap, ctrl) = endpoints();
         for (i, (to_server, seq, payload)) in segments.iter().enumerate() {
-            let builder = if *to_server {
-                PacketBuilder::ethernet2([2; 6], [4; 6]).ipv4(ap, ctrl, 64).tcp(40000, 8080, *seq, 1024)
-            } else {
-                PacketBuilder::ethernet2([4; 6], [2; 6]).ipv4(ctrl, ap, 64).tcp(8080, 40000, *seq, 1024)
-            };
-            let mut frame = Vec::new();
-            builder.write(&mut frame, payload).unwrap();
+            let (src, dst) = if *to_server { (ap, ctrl) } else { (ctrl, ap) };
+            let frame = tcp_frame(src, dst, *seq, payload).unwrap();
             write_pcap_record(&mut out, (1_791_840_600 + i as Micros) * 1_000_000, &frame).unwrap();
         }
         out
@@ -1051,41 +1190,63 @@ mod pcap_tests {
         assert_eq!(events.len(), 1, "{events:?}");
     }
 
-    #[test]
-    fn simple_packet_blocks_take_the_last_timestamp() {
-        fn block(out: &mut Vec<u8>, kind: u32, body: &[u8]) {
-            let padded = body.len().next_multiple_of(4);
-            let len = (12 + padded) as u32;
-            out.extend_from_slice(&kind.to_le_bytes());
-            out.extend_from_slice(&len.to_le_bytes());
-            out.extend_from_slice(body);
-            out.resize(out.len() + padded - body.len(), 0);
-            out.extend_from_slice(&len.to_le_bytes());
-        }
-        let frame = |to_server: bool, payload: &[u8]| {
-            let builder = if to_server {
-                etherparse::PacketBuilder::ethernet2([2; 6], [4; 6]).ipv4([10, 0, 0, 5], [10, 0, 0, 1], 64).tcp(40000, 8080, 1, 1024)
-            } else {
-                etherparse::PacketBuilder::ethernet2([4; 6], [2; 6]).ipv4([10, 0, 0, 1], [10, 0, 0, 5], 64).tcp(8080, 40000, 1, 1024)
-            };
-            let mut f = Vec::new();
-            builder.write(&mut f, payload).unwrap();
-            f
-        };
-        let ts: Micros = 1_791_840_600_000_000;
-        let mut data = Vec::new();
+    /// One pcapng block: its body padded to four bytes between the two lengths.
+    fn block(out: &mut Vec<u8>, kind: u32, body: &[u8]) {
+        let padded = body.len().next_multiple_of(4);
+        let len = (12 + padded) as u32;
+        out.extend_from_slice(&kind.to_le_bytes());
+        out.extend_from_slice(&len.to_le_bytes());
+        out.extend_from_slice(body);
+        out.resize(out.len() + padded - body.len(), 0);
+        out.extend_from_slice(&len.to_le_bytes());
+    }
+
+    /// A little-endian pcapng section header.
+    fn section(out: &mut Vec<u8>) {
         let mut shb = 0x1a2b3c4du32.to_le_bytes().to_vec();
         shb.extend_from_slice(&[1, 0, 0, 0]);
         shb.extend_from_slice(&(-1i64).to_le_bytes());
-        block(&mut data, 0x0a0d0d0a, &shb);
-        block(&mut data, 1, &[1, 0, 0, 0, 0, 0, 4, 0]); // Ethernet, snaplen 256 KiB
-        let req = frame(true, &sample::http_request(b"Q"));
-        let mut epb = 0u32.to_le_bytes().to_vec();
-        for v in [(ts >> 32) as u32, ts as u32, req.len() as u32, req.len() as u32] {
+        block(out, 0x0a0d0d0a, &shb);
+    }
+
+    /// An Ethernet interface (snaplen 256 KiB) with the given options as (code, value).
+    fn interface(out: &mut Vec<u8>, options: &[(u16, &[u8])]) {
+        let mut idb = vec![1, 0, 0, 0, 0, 0, 4, 0];
+        for (code, value) in options {
+            idb.extend_from_slice(&code.to_le_bytes());
+            idb.extend_from_slice(&(value.len() as u16).to_le_bytes());
+            idb.extend_from_slice(value);
+            idb.resize(idb.len().next_multiple_of(4), 0);
+        }
+        if !options.is_empty() {
+            idb.extend_from_slice(&[0; 4]);
+        }
+        block(out, 1, &idb);
+    }
+
+    /// An enhanced packet block on interface `if_id` with the raw timestamp `ts`.
+    fn packet(out: &mut Vec<u8>, if_id: u32, ts: u64, frame: &[u8]) {
+        let mut epb = if_id.to_le_bytes().to_vec();
+        for v in [(ts >> 32) as u32, ts as u32, frame.len() as u32, frame.len() as u32] {
             epb.extend_from_slice(&v.to_le_bytes());
         }
-        epb.extend_from_slice(&req);
-        block(&mut data, 6, &epb);
+        epb.extend_from_slice(frame);
+        block(out, 6, &epb);
+    }
+
+    fn frame(to_server: bool, payload: &[u8]) -> Vec<u8> {
+        let (ap, ctrl) = sample::endpoints();
+        let (src, dst) = if to_server { (ap, ctrl) } else { (ctrl, ap) };
+        crate::synth::tcp_frame(src, dst, 1, payload).unwrap()
+    }
+
+    #[test]
+    fn simple_packet_blocks_take_the_last_timestamp() {
+        let ts: Micros = 1_791_840_600_000_000;
+        let mut data = Vec::new();
+        section(&mut data);
+        interface(&mut data, &[]);
+        packet(&mut data, 0, ts as u64, &frame(true, &sample::http_request(b"Q")));
         let resp = frame(false, &sample::http_response(b"A"));
         let mut spb = (resp.len() as u32).to_le_bytes().to_vec();
         spb.extend_from_slice(&resp);
@@ -1093,6 +1254,41 @@ mod pcap_tests {
         let mut events = Vec::new();
         run(&data[..], &[8080], |e| events.push(e)).unwrap();
         assert!(matches!(&events[..], [HttpEvent::Request { ts: a, .. }, HttpEvent::Response { ts: b, .. }] if *a == ts && *b == ts), "{events:?}");
+    }
+
+    /// Before, such a packet was never consumed, and the reader spun on it for ever.
+    #[test]
+    fn a_packet_on_an_undescribed_interface_is_skipped() {
+        let mut data = Vec::new();
+        section(&mut data);
+        interface(&mut data, &[]);
+        packet(&mut data, 5, 0, &frame(true, &sample::http_request(b"lost")));
+        packet(&mut data, 0, 1_791_840_600_000_000, &frame(true, &sample::http_request(b"Q")));
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut events = Vec::new();
+            let result = run(&data[..], &[8080], |e| events.push(e));
+            tx.send((result.is_ok(), events)).ok();
+        });
+        let (ok, events) = rx.recv_timeout(std::time::Duration::from_secs(30)).expect("the reader moves on");
+        assert!(ok && matches!(&events[..], [HttpEvent::Request { body, .. }] if body == b"Q"), "{events:?}");
+    }
+
+    #[test]
+    fn pcapng_timestamps_follow_the_interface_resolution_and_offset() {
+        // 2^20 units per second, and an offset that is negative.
+        let mut data = Vec::new();
+        section(&mut data);
+        interface(&mut data, &[(9, &[0x80 | 20]), (14, &(-10i64).to_le_bytes())]);
+        packet(&mut data, 0, (1_791_840_610 << 20) + (1 << 19), &frame(true, &sample::http_request(b"Q")));
+        let mut events = Vec::new();
+        run(&data[..], &[8080], |e| events.push(e)).unwrap();
+        assert!(matches!(&events[..], [HttpEvent::Request { ts, .. }] if *ts == 1_791_840_600_500_000), "{events:?}");
+        assert_eq!((ts_units(6), ts_units(9), ts_units(0x80 | 10), ts_units(0x80 | 64), ts_units(20)), (1_000_000, 1_000_000_000, 1024, 1_000_000, 1_000_000));
+        // Picoseconds: the fraction does not fit 32 bits.
+        let ts = 5_000_000_000_000 + 123_456_789_012u64;
+        assert_eq!(epb_micros((ts >> 32) as u32, ts as u32, ts_units(12), 1_791_840_600), 1_791_840_605_123_456);
+        assert_eq!(epb_micros(u32::MAX, u32::MAX, 1, i64::MAX), Micros::MAX, "clamped, not wrapped");
     }
 
     #[test]

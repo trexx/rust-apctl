@@ -52,9 +52,11 @@ impl Reporter {
 
     pub fn handle(&mut self, ev: HttpEvent) {
         match self.pairer.handle(&self.keys, ev) {
-            Some(InformEvent::Inform { ts, peer, decoded, .. }) => self.request(&peer, ts, decoded),
+            Some(InformEvent::Inform { ts, peer, mac, decoded }) => self.request(&peer, ts, mac, decoded),
             Some(InformEvent::Reply { ts, mac, status, decoded: None }) => {
-                if self.opts.all {
+                if self.opts.json {
+                    self.emit_undecoded(ts, mac, json!({ "kind": "reply", "status": status, "empty": true }));
+                } else if self.opts.all {
                     self.line(ts, mac, "<-", &format!("HTTP {status} (empty body)"));
                 }
             }
@@ -65,10 +67,12 @@ impl Reporter {
         }
     }
 
-    fn request(&mut self, peer: &str, ts: Micros, decoded: Result<Decoded>) {
+    /// `mac_hint` is the MAC in the packet's header, which is in the clear.
+    fn request(&mut self, peer: &str, ts: Micros, mac_hint: Option<Mac>, decoded: Result<Decoded>) {
         let d = match decoded {
             Ok(d) => d,
-            Err(e) => return self.line(ts, None, "->", &format!("inform from {peer} undecodable: {e:#}")),
+            Err(e) if self.opts.json => return self.emit_undecoded(ts, mac_hint, json!({ "kind": "inform", "from": peer, "error": format!("{e:#}") })),
+            Err(e) => return self.line(ts, mac_hint, "->", &format!("inform from {peer} undecodable: {e:#}")),
         };
         let mac = d.header.mac;
         let state = self.devices.entry(mac).or_default();
@@ -103,6 +107,7 @@ impl Reporter {
     fn response(&mut self, ts: Micros, mac_hint: Option<Mac>, status: u16, decoded: Result<Decoded>) {
         let d = match decoded {
             Ok(d) => d,
+            Err(e) if self.opts.json => return self.emit_undecoded(ts, mac_hint, json!({ "kind": "reply", "status": status, "error": format!("{e:#}") })),
             Err(e) => return self.line(ts, mac_hint, "<-", &format!("HTTP {status} reply undecodable: {e:#}")),
         };
         let mac = mac_hint.unwrap_or(d.header.mac);
@@ -186,6 +191,12 @@ impl Reporter {
         println!("{obj}");
     }
 
+    /// A `--json` line for a message with no payload to show: one that could not be
+    /// decoded, or an empty reply. `fields` follow the time and the MAC (null when not known).
+    fn emit_undecoded(&self, ts: Micros, mac: Option<Mac>, fields: Value) {
+        println!("{}", undecoded_json(ts, mac, fields));
+    }
+
     /// Saves a payload unredacted (authkeys, PSKs): owner-only directory and files.
     fn save(&mut self, ts: Micros, mac: Mac, kind: &str, payload: &Value) {
         let Some(dir) = &self.opts.save else { return };
@@ -205,6 +216,14 @@ impl Reporter {
         let mac = mac.map(|m| m.to_string()).unwrap_or_else(|| "??:??:??:??:??:??".into());
         println!("{} {mac} {dir} {text}", format_ts(ts));
     }
+}
+
+fn undecoded_json(ts: Micros, mac: Option<Mac>, fields: Value) -> Value {
+    let mut obj = json!({ "ts": format_ts(ts), "mac": mac.map(|m| m.to_string()) });
+    if let (Some(obj), Value::Object(fields)) = (obj.as_object_mut(), fields) {
+        obj.extend(fields);
+    }
+    obj
 }
 
 /// The `--save` file name of a message. `kind` comes from the decoded reply (its
@@ -304,6 +323,14 @@ mod tests {
         assert_eq!(out["psk"], json!(["<redacted>", "<redacted>"]));
         assert_eq!(out["radio_table"], json!([{ "name": "wifi0", "x_secret": { "inner": "<redacted>" } }]));
         assert!(!out.to_string().contains("hunter22") && out["system_cfg"].as_str().unwrap().contains("radio.1.channel=36"));
+    }
+
+    #[test]
+    fn undecodable_messages_are_json_lines_with_their_mac() {
+        let mac: Mac = "02:00:00:00:00:01".parse().unwrap();
+        let line = undecoded_json(1_791_840_601_123_456, Some(mac), json!({ "kind": "inform", "from": "10.0.0.5", "error": "no key" }));
+        assert_eq!(line.to_string(), r#"{"ts":"2026-10-12T21:30:01.123Z","mac":"02:00:00:00:00:01","kind":"inform","from":"10.0.0.5","error":"no key"}"#);
+        assert_eq!(undecoded_json(0, None, json!({ "kind": "reply", "status": 200, "empty": true }))["mac"], Value::Null);
     }
 
     #[test]
