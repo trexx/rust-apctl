@@ -12,14 +12,7 @@ import {
   retryTone,
   spanText,
 } from "../format";
-import {
-  COLORS,
-  Chart,
-  RangePicker,
-  SpanContext,
-  ZoomContext,
-  useTimeSpan,
-} from "../components/Chart";
+import { COLORS, Chart, SpanPage, useTimeSpan } from "../components/Chart";
 import { QueryState, Signal } from "../components/common";
 import { lazyNamed } from "../lazy";
 
@@ -187,34 +180,33 @@ export function Networks() {
   const [span, setSpan] = useTimeSpan(86400);
   const w = useWlans(span);
   return (
-    <ZoomContext.Provider value={(from, to) => setSpan({ from, to })}>
-      <SpanContext.Provider value={span}>
-        <div className="page">
-          <div className="page-head">
-            <h1>Wi-Fi networks</h1>
-            <span className="muted small">{spanText(span)}</span>
-            <span className="spacer" />
-            <RangePicker value={span} onChange={setSpan} />
-          </div>
-          <Suspense fallback={null}>
-            <WlanSettingsPanel />
-            <SpeedLimitsPanel />
-          </Suspense>
-          <QueryState q={w}>
-            {({ wlans }) =>
-              wlans.length === 0 ? (
-                <div className="muted">No networks seen yet.</div>
-              ) : (
-                <div className="stack">
-                  {wlans.map((x) => (
-                    <WlanPanel key={x.essid} w={x} />
-                  ))}
-                </div>
-              )
-            }
-          </QueryState>
-        </div>
-      </SpanContext.Provider>
-    </ZoomContext.Provider>
+    <SpanPage
+      span={span}
+      onSpan={setSpan}
+      head={
+        <>
+          <h1>Wi-Fi networks</h1>
+          <span className="muted small">{spanText(span)}</span>
+        </>
+      }
+    >
+      <Suspense fallback={null}>
+        <WlanSettingsPanel />
+        <SpeedLimitsPanel />
+      </Suspense>
+      <QueryState q={w}>
+        {({ wlans }) =>
+          wlans.length === 0 ? (
+            <div className="muted">No networks seen yet.</div>
+          ) : (
+            <div className="stack">
+              {wlans.map((x) => (
+                <WlanPanel key={x.essid} w={x} />
+              ))}
+            </div>
+          )
+        }
+      </QueryState>
+    </SpanPage>
   );
 }

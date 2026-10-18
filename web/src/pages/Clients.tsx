@@ -1,7 +1,7 @@
 import { memo, useDeferredValue, useState } from "react";
 import { Link } from "react-router";
 import { AttemptList } from "../components/Connections";
-import { RangePicker, SpanContext, useTimeSpan } from "../components/Chart";
+import { SpanPage, useTimeSpan } from "../components/Chart";
 import { displayName, useClients } from "../api";
 import type { ClientView } from "../api";
 import {
@@ -60,17 +60,18 @@ export function Clients() {
 function Attempts({ tabs }: { tabs: React.ReactNode }) {
   const [span, setSpan] = useTimeSpan(86400);
   return (
-    <SpanContext.Provider value={span}>
-      <div className="page">
-        <div className="page-head">
+    <SpanPage
+      span={span}
+      onSpan={setSpan}
+      head={
+        <>
           <h1>Clients</h1>
           {tabs}
-          <span className="spacer" />
-          <RangePicker value={span} onChange={setSpan} />
-        </div>
-        <AttemptList span={span} />
-      </div>
-    </SpanContext.Provider>
+        </>
+      }
+    >
+      <AttemptList span={span} />
+    </SpanPage>
   );
 }
 

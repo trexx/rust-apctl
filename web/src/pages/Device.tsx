@@ -12,14 +12,7 @@ import {
   useSiteTop,
 } from "../api";
 import type { TimeSpan } from "../api";
-import {
-  COLORS,
-  Chart,
-  RangePicker,
-  SpanContext,
-  ZoomContext,
-  useTimeSpan,
-} from "../components/Chart";
+import { COLORS, Chart, SpanPage, useTimeSpan } from "../components/Chart";
 import {
   Dot,
   ErrorNote,
@@ -83,165 +76,163 @@ function DevicePage({ mac }: { mac: string }) {
     .join(" · ");
 
   return (
-    <ZoomContext.Provider value={(from, to) => setRange({ from, to })}>
-      <SpanContext.Provider value={range}>
-        <div className="page">
-          <div className="page-head">
-            <h1>
-              <Dot ok={d.online} /> {ap.hostname ?? mac}
-            </h1>
-            <span className="muted">
-              {about && `${about} · `}
-              <span className="mono">{mac}</span>
-            </span>
-            <span className="spacer" />
-            <RangePicker value={range} onChange={setRange} />
-          </div>
-          <DeviceActions
-            mac={mac}
-            name={ap.hostname ?? mac}
-            online={d.online}
-            locating={detail.data.locating ?? false}
-          />
-          {canEdit && (
-            <Suspense fallback={null}>
-              <DeviceSettingsPanel mac={mac} />
-            </Suspense>
-          )}
-          {d.stored_only && (
-            <div className="banner">
-              This AP hasn't reported since apctl started, so only its stored
-              details and history are shown. Radios and clients appear with its
-              next report.
-            </div>
-          )}
-
-          <div className="stats">
-            <Stat
-              label="Status"
-              value={d.online ? "Online" : "Offline"}
-              sub={
-                d.interval
-                  ? `seen ${ago(d.last_seen, now)}, every ~${d.interval}s`
-                  : `last seen ${ago(d.last_seen, now)}`
-              }
-            />
-            <Stat label="Uptime" value={duration(ap.uptime)} />
-            <Stat
-              label="CPU / memory"
-              value={`${pct(ap.cpu)} / ${pct(ap.mem)}`}
-              sub={`load ${ap.load1 ?? "—"} · ${ap.load5 ?? "—"} · ${ap.load15 ?? "—"}`}
-            />
-            <Stat
-              label="Clients"
-              value={clients.length}
-              sub={`satisfaction ${ap.satisfaction ?? "—"}`}
-            />
-            <Stat
-              label="Memory"
-              value={ap.mem_used !== null ? bytes(ap.mem_used) : "—"}
-              sub={`of ${bytes(ap.mem_total)}${up ? ` · uplink ${up.ifname} ${uplinkText(up)}` : ""}`}
-            />
-            {up && (
-              <Stat
-                label="Uplink received"
-                value={bytes(up.rx_bytes)}
-                sub={`sent ${bytes(up.tx_bytes)} · packets ${compact(up.rx_packets)} in, ${compact(up.tx_packets)} out · since start`}
-              />
-            )}
-          </div>
-
-          <div className="grid2">
-            <ApCharts mac={mac} range={range} />
-            <UplinkChart mac={mac} range={range} />
-          </div>
-
-          <h2>Radios</h2>
-          <div className="grid2">
-            {d.snapshot.radios.map((r) => (
-              <RadioPanel
-                key={r.radio}
-                mac={mac}
-                radio={r}
-                vaps={d.snapshot.vaps.filter((v) => v.radio === r.radio)}
-                clients={clients.filter((c) => c.sample.radio === r.radio)}
-                range={range}
-              />
-            ))}
-          </div>
-          <div className="grid2">
-            {d.snapshot.radios.map((r) => (
-              <RadioActivity
-                key={r.radio}
-                mac={mac}
-                radio={r.radio}
-                range={range}
-              />
-            ))}
-          </div>
-          <div className="grid1">
-            <ActiveClients mac={mac} range={range} />
-          </div>
-          <div className="grid1">
-            <MulticastPanel
-              mac={mac}
-              span={range}
-              title="Multicast and broadcast on this AP"
-            />
-          </div>
-
-          <h2>SSIDs</h2>
-          <VapTable vaps={d.snapshot.vaps} range={range} />
-
-          <h2>Connected clients</h2>
-          <div className="panel">
-            <table className="table">
-              <THead
-                columns={[
-                  "Client",
-                  "SSID",
-                  "Band",
-                  "Signal",
-                  "Rate (down/up)",
-                  "Connected",
-                ]}
-              />
-              <tbody>
-                {clients
-                  .slice()
-                  .sort(
-                    (a, b) =>
-                      (b.sample.signal ?? -100) - (a.sample.signal ?? -100),
-                  )
-                  .map((c) => (
-                    <tr key={c.sample.mac}>
-                      <td>
-                        <Link to={`/clients/${c.sample.mac}`}>
-                          {displayName(c)}
-                        </Link>
-                      </td>
-                      <td>{c.sample.essid ?? "—"}</td>
-                      <td>{bandChannel(c.sample.radio, c.sample.channel)}</td>
-                      <td>
-                        <Signal dbm={c.sample.signal} />
-                      </td>
-                      <td>
-                        {phy(c.sample.tx_rate)} / {phy(c.sample.rx_rate)}
-                      </td>
-                      <td>{duration(c.sample.uptime)}</td>
-                    </tr>
-                  ))}
-              </tbody>
-            </table>
-          </div>
-
-          <div className="grid2">
-            <DeviceEvents mac={mac} />
-            <DeviceLogs mac={mac} />
-          </div>
+    <SpanPage
+      span={range}
+      onSpan={setRange}
+      head={
+        <>
+          <h1>
+            <Dot ok={d.online} /> {ap.hostname ?? mac}
+          </h1>
+          <span className="muted">
+            {about && `${about} · `}
+            <span className="mono">{mac}</span>
+          </span>
+        </>
+      }
+    >
+      <DeviceActions
+        mac={mac}
+        name={ap.hostname ?? mac}
+        online={d.online}
+        locating={detail.data.locating ?? false}
+      />
+      {canEdit && (
+        <Suspense fallback={null}>
+          <DeviceSettingsPanel mac={mac} />
+        </Suspense>
+      )}
+      {d.stored_only && (
+        <div className="banner">
+          This AP hasn't reported since apctl started, so only its stored
+          details and history are shown. Radios and clients appear with its next
+          report.
         </div>
-      </SpanContext.Provider>
-    </ZoomContext.Provider>
+      )}
+
+      <div className="stats">
+        <Stat
+          label="Status"
+          value={d.online ? "Online" : "Offline"}
+          sub={
+            d.interval
+              ? `seen ${ago(d.last_seen, now)}, every ~${d.interval}s`
+              : `last seen ${ago(d.last_seen, now)}`
+          }
+        />
+        <Stat label="Uptime" value={duration(ap.uptime)} />
+        <Stat
+          label="CPU / memory"
+          value={`${pct(ap.cpu)} / ${pct(ap.mem)}`}
+          sub={`load ${ap.load1 ?? "—"} · ${ap.load5 ?? "—"} · ${ap.load15 ?? "—"}`}
+        />
+        <Stat
+          label="Clients"
+          value={clients.length}
+          sub={`satisfaction ${ap.satisfaction ?? "—"}`}
+        />
+        <Stat
+          label="Memory"
+          value={ap.mem_used !== null ? bytes(ap.mem_used) : "—"}
+          sub={`of ${bytes(ap.mem_total)}${up ? ` · uplink ${up.ifname} ${uplinkText(up)}` : ""}`}
+        />
+        {up && (
+          <Stat
+            label="Uplink received"
+            value={bytes(up.rx_bytes)}
+            sub={`sent ${bytes(up.tx_bytes)} · packets ${compact(up.rx_packets)} in, ${compact(up.tx_packets)} out · since start`}
+          />
+        )}
+      </div>
+
+      <div className="grid2">
+        <ApCharts mac={mac} range={range} />
+        <UplinkChart mac={mac} range={range} />
+      </div>
+
+      <h2>Radios</h2>
+      <div className="grid2">
+        {d.snapshot.radios.map((r) => (
+          <RadioPanel
+            key={r.radio}
+            mac={mac}
+            radio={r}
+            vaps={d.snapshot.vaps.filter((v) => v.radio === r.radio)}
+            clients={clients.filter((c) => c.sample.radio === r.radio)}
+            range={range}
+          />
+        ))}
+      </div>
+      <div className="grid2">
+        {d.snapshot.radios.map((r) => (
+          <RadioActivity
+            key={r.radio}
+            mac={mac}
+            radio={r.radio}
+            range={range}
+          />
+        ))}
+      </div>
+      <div className="grid1">
+        <ActiveClients mac={mac} range={range} />
+      </div>
+      <div className="grid1">
+        <MulticastPanel
+          mac={mac}
+          span={range}
+          title="Multicast and broadcast on this AP"
+        />
+      </div>
+
+      <h2>SSIDs</h2>
+      <VapTable vaps={d.snapshot.vaps} range={range} />
+
+      <h2>Connected clients</h2>
+      <div className="panel">
+        <table className="table">
+          <THead
+            columns={[
+              "Client",
+              "SSID",
+              "Band",
+              "Signal",
+              "Rate (down/up)",
+              "Connected",
+            ]}
+          />
+          <tbody>
+            {clients
+              .slice()
+              .sort(
+                (a, b) => (b.sample.signal ?? -100) - (a.sample.signal ?? -100),
+              )
+              .map((c) => (
+                <tr key={c.sample.mac}>
+                  <td>
+                    <Link to={`/clients/${c.sample.mac}`}>
+                      {displayName(c)}
+                    </Link>
+                  </td>
+                  <td>{c.sample.essid ?? "—"}</td>
+                  <td>{bandChannel(c.sample.radio, c.sample.channel)}</td>
+                  <td>
+                    <Signal dbm={c.sample.signal} />
+                  </td>
+                  <td>
+                    {phy(c.sample.tx_rate)} / {phy(c.sample.rx_rate)}
+                  </td>
+                  <td>{duration(c.sample.uptime)}</td>
+                </tr>
+              ))}
+          </tbody>
+        </table>
+      </div>
+
+      <div className="grid2">
+        <DeviceEvents mac={mac} />
+        <DeviceLogs mac={mac} />
+      </div>
+    </SpanPage>
   );
 }
 

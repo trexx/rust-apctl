@@ -7,6 +7,7 @@ import {
   useState,
   useSyncExternalStore,
 } from "react";
+import type { ReactNode } from "react";
 import { useSearchParams } from "react-router";
 import uPlot from "uplot";
 import "uplot/dist/uPlot.min.css";
@@ -514,6 +515,37 @@ function CustomRange({
         </button>
       </div>
     </div>
+  );
+}
+
+/**
+ * A page whose charts show the time `span`, which dragging across one of them
+ * narrows; its head, `head` and then the range picker, sets it too.
+ */
+export function SpanPage({
+  span,
+  onSpan,
+  head,
+  children,
+}: {
+  span: TimeSpan;
+  onSpan: (s: TimeSpan) => void;
+  head: ReactNode;
+  children: ReactNode;
+}) {
+  return (
+    <ZoomContext.Provider value={(from, to) => onSpan({ from, to })}>
+      <SpanContext.Provider value={span}>
+        <div className="page">
+          <div className="page-head">
+            {head}
+            <span className="spacer" />
+            <RangePicker value={span} onChange={onSpan} />
+          </div>
+          {children}
+        </div>
+      </SpanContext.Provider>
+    </ZoomContext.Provider>
   );
 }
 

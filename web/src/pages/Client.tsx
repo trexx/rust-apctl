@@ -11,14 +11,7 @@ import {
   useEvents,
   useSeries,
 } from "../api";
-import {
-  COLORS,
-  Chart,
-  RangePicker,
-  SpanContext,
-  ZoomContext,
-  useTimeSpan,
-} from "../components/Chart";
+import { COLORS, Chart, SpanPage, useTimeSpan } from "../components/Chart";
 import {
   Dot,
   ErrorNote,
@@ -71,193 +64,187 @@ function ClientPage({ mac }: { mac: string }) {
     !c && client.error instanceof HttpError && client.error.status === 404;
 
   return (
-    <ZoomContext.Provider value={(from, to) => setRange({ from, to })}>
-      <SpanContext.Provider value={range}>
-        <div className="page">
-          <div className="page-head">
-            <AliasHeader
-              mac={mac}
-              connected={c?.connected}
-              alias={c?.alias ?? null}
-              note={c?.note ?? null}
-              hostname={c?.sample.hostname ?? null}
-            />
-            <span className="spacer" />
-            <RangePicker value={range} onChange={setRange} />
-          </div>
-          <ClientActions
-            mac={mac}
-            name={name}
-            connected={c?.connected ?? false}
-            blocked={c?.blocked ?? false}
-            lockedTo={c?.locked_to ?? null}
-            aps={names}
-            usergroupId={c?.usergroup_id ?? null}
-          />
-          {c?.blocked && (
-            <div className="banner">
-              Blocked: no AP lets this device join any SSID.
-            </div>
-          )}
-          {c?.locked_to && (
-            <div className="banner">
-              Locked to {names[c.locked_to] ?? c.locked_to}: the other APs
-              refuse it.
-            </div>
-          )}
-          {unknown ? (
-            <div className="banner">
-              Not seen since the controller started; showing stored history
-              only.
-            </div>
-          ) : (
-            !c && client.error && <ErrorNote error={client.error} />
-          )}
-
-          {s && c && (
-            <div className="stats">
-              <Stat
-                label="Connected to"
-                value={
-                  c.connected ? (
-                    <Link to={`/devices/${s.ap_mac}`}>
-                      {names[s.ap_mac] ?? s.ap_mac}
-                    </Link>
-                  ) : (
-                    "Disconnected"
-                  )
-                }
-                sub={
-                  c.connected
-                    ? `${s.essid ?? "—"} · ${bandChannel(s.radio, s.channel)}`
-                    : `last seen ${ago(c.last_seen, now)}`
-                }
-              />
-              <Stat
-                label="Signal"
-                value={<Signal dbm={s.signal} />}
-                sub={`noise ${s.noise === null ? "—" : `${s.noise} dBm`}`}
-              />
-              <Stat
-                label="Rate (down/up)"
-                value={`${phy(s.tx_rate)} / ${phy(s.rx_rate)}`}
-                sub={
-                  s.wifi_gen
-                    ? `802.11${s.wifi_gen}, ${s.nss ?? "?"} streams`
-                    : ""
-                }
-              />
-              <Stat
-                label="Session"
-                value={duration(s.uptime)}
-                sub={`${bytes(s.tx_bytes)} down · ${bytes(s.rx_bytes)} up · satisfaction ${s.satisfaction ?? "—"}`}
-              />
-            </div>
-          )}
-
-          <QueryState q={series}>
-            {({ ts, fields: f }) => (
-              <div className="grid2">
-                <div className="panel">
-                  <Chart
-                    title="Signal and noise"
-                    ts={ts}
-                    format={(v) => `${Math.round(v)} dBm`}
-                    min={-100}
-                    max={-20}
-                    series={[
-                      {
-                        label: "Signal",
-                        values: f.signal,
-                        color: COLORS.blue,
-                        fill: true,
-                      },
-                      { label: "Noise", values: f.noise, color: COLORS.red },
-                    ]}
-                  />
-                  <Chart
-                    title="PHY rate"
-                    ts={ts}
-                    format={(v) => `${Math.round(v)} Mbps`}
-                    series={[
-                      {
-                        label: "Down (AP→client)",
-                        values: f.tx_rate,
-                        scale: 1 / 1000,
-                        color: COLORS.green,
-                      },
-                      {
-                        label: "Up (client→AP)",
-                        values: f.rx_rate,
-                        scale: 1 / 1000,
-                        color: COLORS.purple,
-                      },
-                    ]}
-                  />
-                </div>
-                <div className="panel">
-                  <Chart
-                    title="Throughput"
-                    ts={ts}
-                    format={rate}
-                    series={[
-                      {
-                        label: "Down",
-                        values: f.tx_bytes,
-                        scale: 8,
-                        color: COLORS.blue,
-                        fill: true,
-                      },
-                      {
-                        label: "Up",
-                        values: f.rx_bytes,
-                        scale: 8,
-                        color: COLORS.purple,
-                      },
-                    ]}
-                  />
-                  <Chart
-                    title="Retries and latency"
-                    ts={ts}
-                    format={(v) => v.toFixed(v < 10 ? 1 : 0)}
-                    series={[
-                      {
-                        label: "TX retries/s",
-                        values: f.tx_retries,
-                        color: COLORS.orange,
-                      },
-                      {
-                        label: "Latency (ms)",
-                        values: f.latency_avg,
-                        color: COLORS.teal,
-                      },
-                    ]}
-                  />
-                </div>
-              </div>
-            )}
-          </QueryState>
-
-          {c?.sample.multicast && (
-            <ClientMulticast m={c.sample.multicast} peers={c.peers} />
-          )}
-
-          <h2>Connection log</h2>
-          <div className="panel">
-            <ConnectionLog client={mac} span={range} />
-          </div>
-
-          <h2>Timeline</h2>
-          <div className="panel">
-            <QueryState q={events}>
-              {(data) => (
-                <EventList events={data} names={names} clientNames={cnames} />
-              )}
-            </QueryState>
-          </div>
+    <SpanPage
+      span={range}
+      onSpan={setRange}
+      head={
+        <AliasHeader
+          mac={mac}
+          connected={c?.connected}
+          alias={c?.alias ?? null}
+          note={c?.note ?? null}
+          hostname={c?.sample.hostname ?? null}
+        />
+      }
+    >
+      <ClientActions
+        mac={mac}
+        name={name}
+        connected={c?.connected ?? false}
+        blocked={c?.blocked ?? false}
+        lockedTo={c?.locked_to ?? null}
+        aps={names}
+        usergroupId={c?.usergroup_id ?? null}
+      />
+      {c?.blocked && (
+        <div className="banner">
+          Blocked: no AP lets this device join any SSID.
         </div>
-      </SpanContext.Provider>
-    </ZoomContext.Provider>
+      )}
+      {c?.locked_to && (
+        <div className="banner">
+          Locked to {names[c.locked_to] ?? c.locked_to}: the other APs refuse
+          it.
+        </div>
+      )}
+      {unknown ? (
+        <div className="banner">
+          Not seen since the controller started; showing stored history only.
+        </div>
+      ) : (
+        !c && client.error && <ErrorNote error={client.error} />
+      )}
+
+      {s && c && (
+        <div className="stats">
+          <Stat
+            label="Connected to"
+            value={
+              c.connected ? (
+                <Link to={`/devices/${s.ap_mac}`}>
+                  {names[s.ap_mac] ?? s.ap_mac}
+                </Link>
+              ) : (
+                "Disconnected"
+              )
+            }
+            sub={
+              c.connected
+                ? `${s.essid ?? "—"} · ${bandChannel(s.radio, s.channel)}`
+                : `last seen ${ago(c.last_seen, now)}`
+            }
+          />
+          <Stat
+            label="Signal"
+            value={<Signal dbm={s.signal} />}
+            sub={`noise ${s.noise === null ? "—" : `${s.noise} dBm`}`}
+          />
+          <Stat
+            label="Rate (down/up)"
+            value={`${phy(s.tx_rate)} / ${phy(s.rx_rate)}`}
+            sub={
+              s.wifi_gen ? `802.11${s.wifi_gen}, ${s.nss ?? "?"} streams` : ""
+            }
+          />
+          <Stat
+            label="Session"
+            value={duration(s.uptime)}
+            sub={`${bytes(s.tx_bytes)} down · ${bytes(s.rx_bytes)} up · satisfaction ${s.satisfaction ?? "—"}`}
+          />
+        </div>
+      )}
+
+      <QueryState q={series}>
+        {({ ts, fields: f }) => (
+          <div className="grid2">
+            <div className="panel">
+              <Chart
+                title="Signal and noise"
+                ts={ts}
+                format={(v) => `${Math.round(v)} dBm`}
+                min={-100}
+                max={-20}
+                series={[
+                  {
+                    label: "Signal",
+                    values: f.signal,
+                    color: COLORS.blue,
+                    fill: true,
+                  },
+                  { label: "Noise", values: f.noise, color: COLORS.red },
+                ]}
+              />
+              <Chart
+                title="PHY rate"
+                ts={ts}
+                format={(v) => `${Math.round(v)} Mbps`}
+                series={[
+                  {
+                    label: "Down (AP→client)",
+                    values: f.tx_rate,
+                    scale: 1 / 1000,
+                    color: COLORS.green,
+                  },
+                  {
+                    label: "Up (client→AP)",
+                    values: f.rx_rate,
+                    scale: 1 / 1000,
+                    color: COLORS.purple,
+                  },
+                ]}
+              />
+            </div>
+            <div className="panel">
+              <Chart
+                title="Throughput"
+                ts={ts}
+                format={rate}
+                series={[
+                  {
+                    label: "Down",
+                    values: f.tx_bytes,
+                    scale: 8,
+                    color: COLORS.blue,
+                    fill: true,
+                  },
+                  {
+                    label: "Up",
+                    values: f.rx_bytes,
+                    scale: 8,
+                    color: COLORS.purple,
+                  },
+                ]}
+              />
+              <Chart
+                title="Retries and latency"
+                ts={ts}
+                format={(v) => v.toFixed(v < 10 ? 1 : 0)}
+                series={[
+                  {
+                    label: "TX retries/s",
+                    values: f.tx_retries,
+                    color: COLORS.orange,
+                  },
+                  {
+                    label: "Latency (ms)",
+                    values: f.latency_avg,
+                    color: COLORS.teal,
+                  },
+                ]}
+              />
+            </div>
+          </div>
+        )}
+      </QueryState>
+
+      {c?.sample.multicast && (
+        <ClientMulticast m={c.sample.multicast} peers={c.peers} />
+      )}
+
+      <h2>Connection log</h2>
+      <div className="panel">
+        <ConnectionLog client={mac} span={range} />
+      </div>
+
+      <h2>Timeline</h2>
+      <div className="panel">
+        <QueryState q={events}>
+          {(data) => (
+            <EventList events={data} names={names} clientNames={cnames} />
+          )}
+        </QueryState>
+      </div>
+    </SpanPage>
   );
 }
 
