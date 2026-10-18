@@ -134,7 +134,7 @@ export function ThreatList() {
   if (!t.data) return <QueryNote q={t} />;
   const open = t.data.findings.filter((f) => !f.acknowledged);
   const acked = t.data.findings.filter((f) => f.acknowledged);
-  // As of the last fetch (it refreshes every minute).
+  // As of the last fetch (it refreshes every five minutes).
   const watched = t.dataUpdatedAt / 1000 - t.data.watching_since;
   return (
     <>
