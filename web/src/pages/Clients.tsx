@@ -5,8 +5,7 @@ import { SpanPage, useTimeSpan } from "../components/Chart";
 import { displayName, useClients } from "../api";
 import type { ClientView } from "../api";
 import {
-  ErrorNote,
-  Loading,
+  QueryNote,
   Segmented,
   Signal,
   Toggle,
@@ -136,9 +135,7 @@ function ClientList({ tabs }: { tabs: React.ReactNode }) {
     })
     .map(([, c]) => c);
 
-  // What was fetched stays up when a refetch fails.
-  if (!clients.data)
-    return clients.error ? <ErrorNote error={clients.error} /> : <Loading />;
+  if (!clients.data) return <QueryNote q={clients} />;
 
   const th = (key: SortKey, label: string) => (
     <SortHeader

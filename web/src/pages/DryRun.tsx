@@ -1,7 +1,7 @@
 import { Link } from "react-router";
 import { useDeviceNames, useDryRun } from "../api";
 import type { DryRun as DryRunData, FieldComparison } from "../api";
-import { Dot, ErrorNote, Loading, THead } from "../components/common";
+import { Dot, QueryNote, THead } from "../components/common";
 import { clock, useNow } from "../format";
 import type { Tone } from "../format";
 
@@ -57,8 +57,7 @@ export function DryRun() {
   const dr = useDryRun();
   const names = useDeviceNames();
   const now = useNow();
-  // What was fetched stays up when a refetch fails.
-  if (!dr.data) return dr.error ? <ErrorNote error={dr.error} /> : <Loading />;
+  if (!dr.data) return <QueryNote q={dr} />;
   const d = dr.data;
   // A match whose system_cfg isn't identical differs only in the order of unordered lists.
   const equivalent = (h: DryRunData["history"][number]) =>

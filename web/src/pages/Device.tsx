@@ -15,10 +15,9 @@ import type { TimeSpan } from "../api";
 import { COLORS, Chart, SpanPage, useTimeSpan } from "../components/Chart";
 import {
   Dot,
-  ErrorNote,
   EventList,
-  Loading,
   LogList,
+  QueryNote,
   QueryState,
   Signal,
   Stat,
@@ -64,9 +63,7 @@ function DevicePage({ mac }: { mac: string }) {
   // Read-only users get neither the editor's code nor the AP's settings.
   const canEdit = useCanEdit();
 
-  // What was fetched stays up when a refetch fails.
-  if (!detail.data)
-    return detail.error ? <ErrorNote error={detail.error} /> : <Loading />;
+  if (!detail.data) return <QueryNote q={detail} />;
   const { device: d, clients } = detail.data;
   const ap = d.snapshot.ap;
   const up = d.snapshot.uplink;

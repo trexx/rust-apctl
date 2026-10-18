@@ -9,10 +9,9 @@ import {
 import type { DeviceSummary } from "../api";
 import {
   Dot,
-  ErrorNote,
   EventList,
-  Loading,
   Meter,
+  QueryNote,
   QueryState,
   Stat,
 } from "../components/common";
@@ -50,9 +49,7 @@ export function Overview() {
   const cnames = useClientNames();
   const now = useNow();
 
-  // What was fetched stays up when a refetch fails.
-  if (!devices.data)
-    return devices.error ? <ErrorNote error={devices.error} /> : <Loading />;
+  if (!devices.data) return <QueryNote q={devices} />;
   const list = devices.data;
 
   return (
