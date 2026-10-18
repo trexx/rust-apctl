@@ -254,6 +254,8 @@ async fn serve(args: ServeArgs) -> Result<()> {
     let tick_tx = in_tx.clone();
     tokio::spawn(async move {
         let mut every = tokio::time::interval(Duration::from_secs(5));
+        // Ticks missed while the engine's queue was full are not made up back to back.
+        every.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             every.tick().await;
             // The capture's time in shadow mode; a replay ticks itself (see `shadow::Clock`).
