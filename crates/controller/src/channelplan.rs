@@ -94,9 +94,8 @@ fn allowed_blocks(radio: &str, width: i64, allowed: &[i64]) -> Vec<Block> {
     for c in allowed {
         let b = block(radio, *c, width);
         let first = ((b.lo + 10.0 - 5000.0) / 5.0).round() as i64;
-        let parts: Vec<i64> = (0..(width / 20).max(1)).map(|i| first + 4 * i).collect();
-        if parts.iter().all(|p| allowed.contains(p)) && !out.iter().any(|o| (o.lo - b.lo).abs() < 1.0) {
-            out.push(block(radio, first, width));
+        if (0..(width / 20).max(1)).all(|i| allowed.contains(&(first + 4 * i))) && !out.iter().any(|o| (o.lo - b.lo).abs() < 1.0) {
+            out.push(Block { primary: first, ..b });
         }
     }
     out
