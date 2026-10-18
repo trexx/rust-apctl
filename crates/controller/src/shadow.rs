@@ -86,8 +86,9 @@ pub fn spawn(source: Source, ports: Vec<u16>, syslog_port: u16, keys: Arc<KeySto
                 // rather than shadow mode for good.
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match &source {
                     Source::Stdin => run_once(std::io::stdin(), &ports, syslog_port, &keys, &tx, &clock),
+                    // The capture reader has its own buffer.
                     Source::Path(p) => match std::fs::File::open(p) {
-                        Ok(f) => run_once(std::io::BufReader::new(f), &ports, syslog_port, &keys, &tx, &clock),
+                        Ok(f) => run_once(f, &ports, syslog_port, &keys, &tx, &clock),
                         Err(e) => Err(anyhow::anyhow!("opening {}: {e}", p.display())),
                     },
                     Source::Command(cmd) => run_command(cmd, &ports, syslog_port, &keys, &tx, &clock),
