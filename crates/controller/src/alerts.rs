@@ -677,11 +677,13 @@ impl Watcher {
             let l = self.live.read().unwrap();
             (l.devices.iter().filter(|(_, d)| d.online).map(|(m, _)| *m).collect(), l.devices.keys().copied().collect())
         };
-        match radio_health(&self.store, now).await {
+        // Two databases, each read on a blocking thread of its own: side by side.
+        let (radios, failing) = tokio::join!(radio_health(&self.store, now), failing_clients(&self.store, now));
+        match radios {
             Ok(radios) => self.judge_radios(now, radios, &online, &known),
             Err(e) => tracing::warn!("radio health check failed: {e:#}"),
         }
-        match failing_clients(&self.store, now).await {
+        match failing {
             Ok(failing) => self.judge_connections(now, failing),
             Err(e) => tracing::warn!("connection health check failed: {e:#}"),
         }
