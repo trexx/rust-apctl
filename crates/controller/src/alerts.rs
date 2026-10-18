@@ -185,9 +185,11 @@ impl Alerts {
         self.seq += 1;
         a.id = format!("{now}-{}", self.seq);
         a.ts = now;
+        // An id is never used twice (see `seq`): were it, the writer logs the
+        // failed insert and the alert stored first stays.
         self.writer.exec(
             Db::Config,
-            "INSERT OR REPLACE INTO alerts (id, ts, key, category, severity, entity, title, message, link, tag, resolved_ts, read) \
+            "INSERT INTO alerts (id, ts, key, category, severity, entity, title, message, link, tag, resolved_ts, read) \
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 0)",
             vec![
                 Sql::Text(a.id.clone()),
@@ -914,6 +916,12 @@ mod tests {
         let ids: Vec<String> = w.store.read(Db::Config, |c| Ok(c.prepare(LIST)?.query_map([100], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?)).unwrap();
         assert_eq!(ids.len(), 12, "none overwritten");
         assert_eq!((ids[0].as_str(), ids[1].as_str(), ids[2].as_str()), ("1000-12", "1000-11", "1000-10"));
+        // Were an id used again, the alert stored under it would stay.
+        again.book.seq = 0;
+        again.book.raise(1000, Alert { title: "other".into(), ..notice() });
+        assert!(w.book.writer.flush(Duration::from_secs(5)));
+        let titles: Vec<String> = w.store.read(Db::Config, |c| Ok(c.prepare("SELECT title FROM alerts")?.query_map([], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?)).unwrap();
+        assert!(titles.len() == 12 && titles.iter().all(|t| t == "t"), "{titles:?}");
     }
 
     #[tokio::test]
