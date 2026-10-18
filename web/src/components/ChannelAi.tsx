@@ -12,7 +12,14 @@ import {
 } from "../api";
 import type { ChannelPlanResult } from "../api";
 import { band as bandName, clock, hhmm, useNow } from "../format";
-import { Outcome, QueryNote, QueryState, eventText, useRunner } from "./common";
+import {
+  Outcome,
+  QueryNote,
+  QueryState,
+  Toggle,
+  eventText,
+  useRunner,
+} from "./common";
 import { ApChecklist, toggled } from "./settings/form";
 
 /**
@@ -148,15 +155,12 @@ export function ChannelAiPanel() {
         <div className="form-row">
           <div className="form-label">Nightly</div>
           <div className="form-control">
-            <label className="check">
-              <input
-                type="checkbox"
-                checked={s.enabled}
-                disabled={!can}
-                onChange={(e) => save({ enabled: e.target.checked })}
-              />
-              Enabled
-            </label>
+            <Toggle
+              value={s.enabled}
+              disabled={!can}
+              onChange={(enabled) => save({ enabled })}
+              label="Enabled"
+            />
             <select
               aria-label="Hour"
               value={s.hour}
@@ -170,17 +174,13 @@ export function ChannelAiPanel() {
               ))}
             </select>
             {(["ng", "na"] as const).map((b) => (
-              <label key={b} className="check">
-                <input
-                  type="checkbox"
-                  checked={s.radios.includes(b)}
-                  disabled={!can}
-                  onChange={(e) =>
-                    save({ radios: toggled(s.radios, b, e.target.checked) })
-                  }
-                />
-                {bandName(b)}
-              </label>
+              <Toggle
+                key={b}
+                value={s.radios.includes(b)}
+                disabled={!can}
+                onChange={(on) => save({ radios: toggled(s.radios, b, on) })}
+                label={bandName(b)}
+              />
             ))}
           </div>
         </div>
@@ -192,15 +192,12 @@ export function ChannelAiPanel() {
           <div className="form-control small">
             <span>2.4 GHz: {d.allowed.ng?.join(", ") ?? "any"}</span>
             <span>5 GHz: {d.allowed.na?.join(", ") ?? "any"}</span>
-            <label className="check">
-              <input
-                type="checkbox"
-                checked={s.dfs}
-                disabled={!can}
-                onChange={(e) => save({ dfs: e.target.checked })}
-              />
-              DFS channels (radar can force an AP off them)
-            </label>
+            <Toggle
+              value={s.dfs}
+              disabled={!can}
+              onChange={(dfs) => save({ dfs })}
+              label="DFS channels (radar can force an AP off them)"
+            />
           </div>
         </div>
         <div className="form-row">

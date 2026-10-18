@@ -113,6 +113,31 @@ export function THead({
   );
 }
 
+/** A checkbox with its label beside it. */
+export function Toggle({
+  value,
+  onChange,
+  label,
+  disabled,
+}: {
+  value: boolean | null | undefined;
+  onChange: (v: boolean) => void;
+  label: string;
+  disabled?: boolean;
+}) {
+  return (
+    <label className="check">
+      <input
+        type="checkbox"
+        checked={value === true}
+        disabled={disabled}
+        onChange={(e) => onChange(e.target.checked)}
+      />
+      {label}
+    </label>
+  );
+}
+
 export function Loading() {
   return <div className="muted pad">Loading…</div>;
 }

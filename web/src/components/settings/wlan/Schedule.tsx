@@ -1,10 +1,10 @@
 import { useState } from "react";
 import { hhmm as time } from "../../../format";
-import { TextInput, TimeInput, toggled } from "../form";
+import { TextInput, TimeInput, Toggle, toggled } from "../form";
 import type { Blackout } from "../../../api";
 
 const WEEK = ["sun", "mon", "tue", "wed", "thu", "fri", "sat"] as const;
-const WEEK_LABEL: Record<string, string> = {
+const WEEK_LABEL: Record<(typeof WEEK)[number], string> = {
   sun: "Su",
   mon: "Mo",
   tue: "Tu",
@@ -61,22 +61,16 @@ export function ScheduleEditor({
             </div>
             <div className="form-control">
               {WEEK.map((d) => (
-                <label key={d} className="check">
-                  <input
-                    type="checkbox"
-                    checked={e.start_days_of_week.includes(d)}
-                    onChange={(ev) =>
-                      update(i, {
-                        start_days_of_week: toggled(
-                          e.start_days_of_week,
-                          d,
-                          ev.target.checked,
-                        ),
-                      })
-                    }
-                  />
-                  {WEEK_LABEL[d]}
-                </label>
+                <Toggle
+                  key={d}
+                  value={e.start_days_of_week.includes(d)}
+                  onChange={(on) =>
+                    update(i, {
+                      start_days_of_week: toggled(e.start_days_of_week, d, on),
+                    })
+                  }
+                  label={WEEK_LABEL[d]}
+                />
               ))}
               <label className="small">
                 off from{" "}

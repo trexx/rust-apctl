@@ -11,7 +11,7 @@ import {
 } from "../api";
 import type { BackupManifest, BackupMeta, BackupSettings } from "../api";
 import { ago, bytes, dateTime as when, hhmm, useNow } from "../format";
-import { Outcome, QueryNote, THead, useRunner } from "./common";
+import { Outcome, QueryNote, THead, Toggle, useRunner } from "./common";
 import { FileButton } from "./FileButton";
 import { NumberInput, TimeInput } from "./settings/form";
 
@@ -117,15 +117,12 @@ function Schedule({
   const save = () => void run(() => saveBackupSettings(s), "Saved.");
   return (
     <div className="backup-form">
-      <label className="check">
-        <input
-          type="checkbox"
-          checked={s.enabled}
-          disabled={readOnly}
-          onChange={(e) => setS({ ...s, enabled: e.target.checked })}
-        />{" "}
-        Automatic backups
-      </label>
+      <Toggle
+        value={s.enabled}
+        disabled={readOnly}
+        onChange={(enabled) => setS({ ...s, enabled })}
+        label="Automatic backups"
+      />
       <div className="backup-row">
         <select
           aria-label="How often"

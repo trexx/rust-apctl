@@ -6,6 +6,7 @@ import type {
   ReactNode,
   SetStateAction,
 } from "react";
+import { Toggle } from "../common";
 
 /** A settings patch, as sent to the server. */
 export type Fields = Record<string, unknown>;
@@ -122,29 +123,8 @@ export function Row({
   );
 }
 
-export function Toggle({
-  value,
-  onChange,
-  label,
-  disabled,
-}: {
-  value: boolean | null | undefined;
-  onChange: (v: boolean) => void;
-  label: string;
-  disabled?: boolean;
-}) {
-  return (
-    <label className="check">
-      <input
-        type="checkbox"
-        checked={value === true}
-        disabled={disabled}
-        onChange={(e) => onChange(e.target.checked)}
-      />
-      {label}
-    </label>
-  );
-}
+// In common.tsx, so the pages outside the settings needn't load this module.
+export { Toggle };
 
 /** One choice of a `Select`: its value, its label and whether it is disabled. */
 export type Option<T> = readonly [

@@ -7,8 +7,9 @@ import type { ClientView } from "../api";
 import {
   ErrorNote,
   Loading,
-  Signal,
   Segmented,
+  Signal,
+  Toggle,
   useUrlTab,
 } from "../components/common";
 import { ago, bandChannel, duration, phy, useNow } from "../format";
@@ -159,14 +160,11 @@ function ClientList({ tabs }: { tabs: React.ReactNode }) {
         {tabs}
         <span className="muted">{rows.length} shown</span>
         <span className="spacer" />
-        <label className="check">
-          <input
-            type="checkbox"
-            checked={showGone}
-            onChange={(e) => setShowGone(e.target.checked)}
-          />{" "}
-          include disconnected
-        </label>
+        <Toggle
+          value={showGone}
+          onChange={setShowGone}
+          label="include disconnected"
+        />
         <input
           className="search"
           aria-label="Filter clients"
