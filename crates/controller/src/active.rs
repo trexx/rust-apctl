@@ -132,10 +132,14 @@ pub const MAX_INFORM_INTERVAL: Ts = 90;
 
 /// Seconds until an AP's next inform, for a site of `n_devices` APs. Matches
 /// the official controller for small sites: five seconds per AP plus jitter,
-/// at least ten.
-fn interval(n_devices: usize) -> Ts {
+/// at least ten. The jitter is the AP's own, from its MAC, so it spreads the
+/// APs out as well while an AP is asked for the same interval every time:
+/// the engine then has nothing to change for nearly every reply.
+fn interval(mac: Mac, n_devices: usize) -> Ts {
     let n = n_devices.max(1) as i64;
-    if n < 18 { (n * 5 + (random_bytes::<1>()[0] % 5) as i64).max(10) } else { MAX_INFORM_INTERVAL - (random_bytes::<1>()[0] % 31) as i64 }
+    // The device-specific half of the MAC: the vendor half is the same for every AP.
+    let jitter = i64::from(u32::from_be_bytes([0, mac.0[3], mac.0[4], mac.0[5]]));
+    if n < 18 { (n * 5 + jitter % 5).max(10) } else { MAX_INFORM_INTERVAL - jitter % 31 }
 }
 
 /// A `mgmt_cfg` rendered with the placeholder token, carrying `cfgversion`
@@ -242,13 +246,13 @@ impl Active {
             (live.state.clone(), live.devices.len())
         };
         let Some(state) = state else {
-            return json!({ "_type": "noop", "interval": interval(n_devices), "server_time_in_utc": server_time });
+            return json!({ "_type": "noop", "interval": interval(mac, n_devices), "server_time_in_utc": server_time });
         };
         match self.adoption_cfg(&state, mac, payload) {
             Ok(mgmt_cfg) => json!({ "_type": "setparam", "mgmt_cfg": mgmt_cfg, "server_time_in_utc": server_time }),
             Err(e) => {
                 tracing::error!("{mac}: cannot render the adoption config: {e:#}");
-                json!({ "_type": "noop", "interval": interval(n_devices), "server_time_in_utc": server_time })
+                json!({ "_type": "noop", "interval": interval(mac, n_devices), "server_time_in_utc": server_time })
             }
         }
     }
@@ -304,10 +308,10 @@ impl Active {
         }
         let Some(state) = state else {
             tracing::warn!("{mac}: no settings imported, replying noop");
-            return noop(interval(n_devices));
+            return noop(interval(mac, n_devices));
         };
         if self.collect_radios(ts, mac, &state, payload) {
-            return noop(interval(n_devices));
+            return noop(interval(mac, n_devices));
         }
         let reported = payload["cfgversion"].as_str().unwrap_or("");
 
@@ -317,12 +321,12 @@ impl Active {
             Ok(r) => r,
             Err(e) => {
                 tracing::error!("{mac}: cannot render config, replying noop: {e:#}");
-                return noop(interval(n_devices));
+                return noop(interval(mac, n_devices));
             }
         };
         let cfgversion = self.decide_version(mac, reported, &render, force);
         if reported == cfgversion {
-            return self.firmware_turn(ts, mac, payload).unwrap_or_else(|| noop(interval(n_devices)));
+            return self.firmware_turn(ts, mac, payload).unwrap_or_else(|| noop(interval(mac, n_devices)));
         }
         if force {
             self.live.write().unwrap().reprovision.remove(&mac);
@@ -779,13 +783,17 @@ mod tests {
 
     #[test]
     fn the_inform_interval_stays_within_what_the_insights_allow_for() {
+        let macs: Vec<Mac> = (0..=255u8).map(|b| Mac([0x02, 0, 0, 0, 0x10, b])).collect();
         for n in 0..40 {
-            for _ in 0..50 {
-                let i = interval(n);
+            for &mac in &macs {
+                let i = interval(mac, n);
                 assert!((10..=MAX_INFORM_INTERVAL).contains(&i), "{n} APs: {i}");
+                assert_eq!(interval(mac, n), i, "the same AP is asked for the same interval");
             }
         }
-        assert!((0..1000).any(|_| interval(30) == MAX_INFORM_INTERVAL), "a large site reaches the longest");
+        assert!(macs.iter().any(|&m| interval(m, 30) == MAX_INFORM_INTERVAL), "a large site reaches the longest");
+        let spread: std::collections::HashSet<Ts> = macs.iter().map(|&m| interval(m, 30)).collect();
+        assert_eq!(spread.len(), 31, "and the APs are spread over the whole range");
     }
 
     #[tokio::test]
