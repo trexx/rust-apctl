@@ -11,7 +11,13 @@ import uPlot from "uplot";
 import "uplot/dist/uPlot.min.css";
 import { isFixed, spanBounds } from "../api";
 import type { TimeSpan } from "../api";
-import { duration, fromLocalInput, spanLabel, toLocalInput } from "../format";
+import {
+  duration,
+  fromLocalInput,
+  spanLabel,
+  toLocalInput,
+  useNow,
+} from "../format";
 import { Segmented, useDismiss, useSetParams } from "./common";
 
 /** The page's time span: charts show exactly this window, gaps included. */
@@ -522,12 +528,15 @@ export function RangePicker({
   const preset = !fixed && RANGES.some((r) => r.seconds === value.last);
   const [from, to] = spanBounds(value);
   const len = to - from;
-  // Step a whole window back or forward; reaching the present goes live again.
+  const oldest = useNow() - MAX_AGE;
+  // Step a whole window back or forward; reaching the present goes live
+  // again. At the oldest data kept the window stops, at its length: cutting
+  // only its start left none at all, and an empty window shows live data.
   const step = (dir: -1 | 1) => {
     const now = Math.floor(Date.now() / 1000);
-    const t = to + dir * len;
-    if (t >= now - 60) pick({ last: len });
-    else pick({ from: Math.max(from + dir * len, now - MAX_AGE), to: t });
+    const f = Math.max(from + dir * len, now - MAX_AGE);
+    if (f + len >= now - 60) pick({ last: len });
+    else pick({ from: f, to: f + len });
   };
   return (
     <div className="range-picker" ref={box}>
@@ -535,6 +544,7 @@ export function RangePicker({
         className="btn small step"
         aria-label="Earlier"
         title="Earlier"
+        disabled={from <= oldest}
         onClick={() => step(-1)}
       >
         ‹
