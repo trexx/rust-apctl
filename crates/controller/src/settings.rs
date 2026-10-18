@@ -615,7 +615,8 @@ fn default_group(state: &Value) -> Option<String> {
 }
 
 /// Sets which APs broadcast an SSID: all, or a list (kept in a hidden AP group
-/// of its own, as the official controller does). Groups left unused are removed.
+/// of its own, as the official controller does). The caller removes groups
+/// left unused ([`prune_groups`]).
 fn set_wlan_aps(state: &mut Value, id: &str, aps: Option<Vec<String>>) -> Result<(), String> {
     let own = {
         let current: Vec<&str> = wlan(state, id).and_then(|w| w["ap_group_ids"].as_array()).into_iter().flatten().filter_map(Value::as_str).collect();
@@ -654,14 +655,15 @@ fn set_wlan_aps(state: &mut Value, id: &str, aps: Option<Vec<String>>) -> Result
             w["broadcasting_aps"] = json!(macs);
         }
     }
-    prune_groups(state);
     Ok(())
 }
 
-/// Removes the site's per-SSID AP groups no SSID uses any more.
+/// Removes the site's per-SSID AP groups no SSID uses any more, as its AP
+/// group or as where one of its mDNS rules applies.
 fn prune_groups(state: &mut Value) {
     let site = site_id(state).map(str::to_string);
-    let used: Vec<String> = docs(state, "wlanconf").flat_map(|w| w["ap_group_ids"].as_array().into_iter().flatten()).filter_map(Value::as_str).map(str::to_string).collect();
+    let ids = |v: &Value| v["ap_group_ids"].as_array().into_iter().flatten().filter_map(Value::as_str).map(str::to_string).collect::<Vec<_>>();
+    let used: Vec<String> = docs(state, "wlanconf").flat_map(|w| ids(w).into_iter().chain(w["mdns_proxy_custom"].as_array().into_iter().flatten().flat_map(ids))).collect();
     if let Some(groups) = state["apgroup"].as_array_mut() {
         groups.retain(|g| !in_site(site.as_deref(), g) || g["for_wlanconf"].as_bool() != Some(true) || oid(g).is_some_and(|i| used.iter().any(|u| u == i)));
     }
@@ -934,6 +936,8 @@ pub fn apply_wlan(state: &mut Value, e: &WlanEdit) -> Result<String, String> {
         };
         set_wlan_aps(state, id, aps)?;
     }
+    // A group can go with a change of APs or of the mDNS rules.
+    prune_groups(state);
     check_wlan_limits(state)?;
     check_list_limits(state)?;
     let channels = apply_channel_locks(state, &locked_aps_before);
@@ -1868,6 +1872,14 @@ mod tests {
         assert_eq!((s["wlanconf"][0]["ap_group_mode"].as_str(), s["apgroup"].as_array().unwrap().len()), (Some("all"), 1));
         assert!(edit(&mut s, json!({ "aps": ["02:00:00:00:00:99"] })).is_err());
         assert!(edit(&mut s, json!({ "aps": [] })).is_err());
+        // A group an mDNS rule applies on stays while the rule does.
+        edit(&mut s, json!({ "aps": [AP2] })).unwrap();
+        let gid = s["wlanconf"][0]["ap_group_ids"][0].as_str().unwrap().to_string();
+        edit(&mut s, json!({ "mdns_proxy_mode": "custom", "mdns_proxy_custom": [{ "ap_scope_mode": "group", "ap_group_ids": [gid] }] })).unwrap();
+        edit(&mut s, json!({ "aps": null })).unwrap();
+        assert_eq!(s["apgroup"].as_array().unwrap().len(), 2);
+        edit(&mut s, json!({ "mdns_proxy_mode": "auto", "mdns_proxy_custom": [] })).unwrap();
+        assert_eq!(s["apgroup"].as_array().unwrap().len(), 1, "gone once no rule names it");
     }
 
     #[test]
