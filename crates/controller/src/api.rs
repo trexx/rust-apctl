@@ -745,10 +745,10 @@ async fn dryrun(State(s): State<AppState>) -> Result<Json<DryRunStatus>, ApiErro
                 stored.insert(mac, Arc::new(p));
             }
         }
-        let mut stmt = c.prepare("SELECT ts, mac, cfgversion, matches, comparison FROM dryrun_results ORDER BY ts DESC LIMIT 100")?;
+        let mut stmt = c.prepare("SELECT id, ts, mac, cfgversion, matches, comparison FROM dryrun_results ORDER BY ts DESC LIMIT 100")?;
         let history = stmt
             .query_map([], |r| {
-                Ok(DryRunHistory { ts: r.get(0)?, mac: r.get(1)?, cfgversion: r.get(2)?, matches: r.get(3)?, comparison: raw_json(r.get(4)?) })
+                Ok(DryRunHistory { id: r.get(0)?, ts: r.get(1)?, mac: r.get(2)?, cfgversion: r.get(3)?, matches: r.get(4)?, comparison: raw_json(r.get(5)?) })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok((stored, history))
@@ -814,6 +814,8 @@ async fn dryrun(State(s): State<AppState>) -> Result<Json<DryRunStatus>, ApiErro
 /// A comparison made at a push, as stored.
 #[derive(Serialize)]
 struct DryRunHistory {
+    /// The row's id: what the page keys the comparisons by.
+    id: i64,
     ts: Ts,
     mac: String,
     cfgversion: Option<String>,
@@ -1415,7 +1417,7 @@ mod tests {
         assert!(s.writer.flush(std::time::Duration::from_secs(5)));
         let app = router(s);
         let d = get_json(&app, "/api/dryrun").await;
-        assert_eq!((d["devices"][0]["status"].as_str(), d["history"][0]["ts"].as_i64()), (Some("no_settings"), Some(7)));
+        assert_eq!((d["devices"][0]["status"].as_str(), d["history"][0]["ts"].as_i64(), d["history"][0]["id"].as_i64()), (Some("no_settings"), Some(7), Some(1)));
         assert_eq!(d["devices"][0], json!({ "mac": "02:00:00:00:00:01", "name": "Hall", "status": "no_settings", "settings_stale": false }));
     }
 

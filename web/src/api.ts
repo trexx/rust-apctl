@@ -34,6 +34,8 @@ export interface DeviceSummary {
   radios: RadioSummary[];
   last_config_push: number | null;
   locating?: boolean;
+  /** Known from the database only: hasn't reported since apctl started. */
+  stored_only?: boolean;
 }
 
 export interface ClientSample {
@@ -529,7 +531,7 @@ export interface DryRun {
     /** The AP runs a different config version than when the settings were imported. */
     settings_stale?: boolean;
   }[];
-  history: { ts: number; mac: Mac; cfgversion: string | null; matches: boolean; comparison: { system_cfg?: FieldComparison; error?: string } | null }[];
+  history: { id: number; ts: number; mac: Mac; cfgversion: string | null; matches: boolean; comparison: { system_cfg?: FieldComparison; error?: string } | null }[];
 }
 
 /** Refreshed by the live socket when a comparison is recorded or settings are imported. */

@@ -125,8 +125,8 @@ export function DryRun() {
               </tr>
             </thead>
             <tbody>
-              {d.history.map((h, i) => (
-                <tr key={`${h.ts}-${i}`}>
+              {d.history.map((h) => (
+                <tr key={h.id}>
                   <td>{clock(h.ts, now)}</td>
                   <td>{names[h.mac] ?? h.mac}</td>
                   <td className={h.matches ? "ok" : "error"}>
