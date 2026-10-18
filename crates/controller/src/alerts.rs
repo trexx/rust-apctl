@@ -185,9 +185,11 @@ impl Alerts {
         self.seq += 1;
         a.id = format!("{now}-{}", self.seq);
         a.ts = now;
+        // An id is never used twice (see `seq`): were it, the writer logs the
+        // failed insert and the alert stored first stays.
         self.writer.exec(
             Db::Config,
-            "INSERT OR REPLACE INTO alerts (id, ts, key, category, severity, entity, title, message, link, tag, resolved_ts, read) \
+            "INSERT INTO alerts (id, ts, key, category, severity, entity, title, message, link, tag, resolved_ts, read) \
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 0)",
             vec![
                 Sql::Text(a.id.clone()),
@@ -279,7 +281,7 @@ impl ApWatch {
             (false, Some(since)) => {
                 self.down.remove(&mac);
                 let alerted = self.sent.get(&mac).and_then(|s| s.last()).is_some_and(|t| *t >= since);
-                Some(ApChange::Online { down_for: last_seen.max(now - 1) - since, alerted })
+                Some(ApChange::Online { down_for: now - since, alerted })
             }
             _ => None,
         }
@@ -338,7 +340,15 @@ fn from_event(kind: EventKind, device: Option<Mac>, data: &Value, ap_name: &dyn 
         }
         EventKind::ApProcessRestarted => {
             let title = format!("{} restarted on {name}", data["proc"].as_str().unwrap_or("A process"));
-            let message = format!("It exited with code {} and was restarted by {}.", data["exit_status"], data["caller"].as_str().unwrap_or("the system"));
+            // The AP's notification as it came: a code it sends as text is
+            // still a code, and none at all is left out.
+            let code = match &data["exit_status"] {
+                Value::Number(n) => Some(n.to_string()),
+                Value::String(c) if c.trim().parse::<i64>().is_ok() => Some(c.trim().to_string()),
+                _ => None,
+            };
+            let exited = code.map_or_else(|| "It exited".to_string(), |c| format!("It exited with code {c}"));
+            let message = format!("{exited} and was restarted by {}.", data["caller"].as_str().unwrap_or("the system"));
             on(Key::ApProcessRestarted, Changes, Severity::Low, title, message).tagged(format!("proc:{dev}"))
         }
         EventKind::ApUpgradeFailed => {
@@ -481,12 +491,14 @@ async fn load_open(store: &Arc<Store>, now: Ts) -> anyhow::Result<(Vec<Alert>, u
 /// Open health alerts to close: of radios not judged for [`HEALTH_STALE_CHECKS`]
 /// checks in a row (`unjudged` counts them), or of APs no longer known.
 fn stale_health(open: &HashMap<OpenKey, Alert>, judged: &HashSet<OpenKey>, unjudged: &mut HashMap<OpenKey, u32>, known: &HashSet<Mac>) -> Vec<OpenKey> {
+    // A count is of checks in a row while open: an alert judged now, or closed
+    // since (by its threshold too), starts from nothing if it opens again.
+    unjudged.retain(|k, _| open.contains_key(k) && !judged.contains(k));
     let mut out = Vec::new();
     for k in open.keys() {
         // A radio's only: the site-wide one is judged every time.
         let Entity::Radio(mac, _) = &k.1 else { continue };
         if judged.contains(k) {
-            unjudged.remove(k);
             continue;
         }
         let n = unjudged.entry(k.clone()).or_default();
@@ -618,7 +630,7 @@ impl Watcher {
             let status = |key: Key, severity: Severity, title: String, message: String| Alert::for_device(key, Category::ApStatus, severity, mac, title, message).tagged(format!("ap-status:{mac}"));
             match self.aps.check(now, mac, last_seen) {
                 Some(ApChange::Offline { last_seen }) => {
-                    let message = format!("No contact for {} (last seen {}).", human(now - last_seen), clock(last_seen));
+                    let message = format!("No contact for {} (last seen {}).", human(now - last_seen), time_of_day(last_seen));
                     self.book.open(now, status(Key::ApOffline, Severity::High, format!("{name} is offline"), message));
                 }
                 Some(ApChange::Flapping { times }) => {
@@ -724,7 +736,8 @@ pub fn spawn(store: Arc<Store>, writer: Writer, live: SharedLive, tx: broadcast:
     });
 }
 
-fn clock(ts: Ts) -> String {
+/// The time of day of `ts`, as an alert's message names it.
+fn time_of_day(ts: Ts) -> String {
     let s = ts.rem_euclid(86400);
     format!("{:02}:{:02} UTC", s / 3600, (s % 3600) / 60)
 }
@@ -781,7 +794,7 @@ mod tests {
         assert_eq!(w.check(1000, ap, 1000 - 240), Some(ApChange::Offline { last_seen: 760 }));
         assert_eq!(w.check(1030, ap, 760), None, "reported once");
         // Back after 5 minutes.
-        assert_eq!(w.check(1060, ap, 1059), Some(ApChange::Online { down_for: 1059 - 760, alerted: true }));
+        assert_eq!(w.check(1060, ap, 1059), Some(ApChange::Online { down_for: 1060 - 760, alerted: true }));
         // Second drop the same day: reported.
         assert!(matches!(w.check(2000, ap, 1700), Some(ApChange::Offline { .. })));
         w.check(2100, ap, 2099);
@@ -810,6 +823,18 @@ mod tests {
         let u = from_event(EventKind::ApUpgraded, Some(aa), &json!({ "to": "8.8.12" }), &name).unwrap();
         assert_eq!((u.link.as_deref(), u.tag.as_str(), u.severity), (Some("/config?tab=firmware"), "upgrade:02:00:00:00:00:aa", Severity::Info));
         assert!(from_event(EventKind::ClientConnected, Some(aa), &json!({}), &name).is_none());
+        // A process restart's exit code, however the AP sent it.
+        for (status, want) in [
+            (json!(1), "It exited with code 1 and was restarted by procd."),
+            (json!("139"), "It exited with code 139 and was restarted by procd."),
+            (json!(null), "It exited and was restarted by procd."),
+            (json!("killed"), "It exited and was restarted by procd."),
+        ] {
+            let p = from_event(EventKind::ApProcessRestarted, Some(aa), &json!({ "proc": "hostapd", "exit_status": status, "caller": "procd" }), &name).unwrap();
+            assert_eq!((p.title.as_str(), p.message.as_str()), ("hostapd restarted on Garage", want));
+        }
+        let p = from_event(EventKind::ApProcessRestarted, Some(aa), &json!({}), &name).unwrap();
+        assert_eq!((p.title.as_str(), p.message.as_str()), ("A process restarted on Garage", "It exited and was restarted by the system."));
         // Exactly the kinds the engine passes on can make an alert.
         for &kind in EventKind::ALL {
             assert_eq!(from_event(kind, Some(aa), &json!({ "severity": "high" }), &name).is_some(), alertable(kind), "{kind}");
@@ -892,6 +917,12 @@ mod tests {
         let ids: Vec<String> = w.store.read(Db::Config, |c| Ok(c.prepare(LIST)?.query_map([100], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?)).unwrap();
         assert_eq!(ids.len(), 12, "none overwritten");
         assert_eq!((ids[0].as_str(), ids[1].as_str(), ids[2].as_str()), ("1000-12", "1000-11", "1000-10"));
+        // Were an id used again, the alert stored under it would stay.
+        again.book.seq = 0;
+        again.book.raise(1000, Alert { title: "other".into(), ..notice() });
+        assert!(w.book.writer.flush(Duration::from_secs(5)));
+        let titles: Vec<String> = w.store.read(Db::Config, |c| Ok(c.prepare("SELECT title FROM alerts")?.query_map([], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?)).unwrap();
+        assert!(titles.len() == 12 && titles.iter().all(|t| t == "t"), "{titles:?}");
     }
 
     #[tokio::test]
@@ -994,6 +1025,17 @@ mod tests {
             assert!(stale_health(&book, &HashSet::new(), &mut unjudged, &known).is_empty());
         }
         assert_eq!(stale_health(&book, &HashSet::new(), &mut unjudged, &known), vec![k.clone()]);
+        // Unjudged for a while, then closed by its threshold: the count goes
+        // with it, so the alert opened again gets every check.
+        for _ in 1..HEALTH_STALE_CHECKS {
+            stale_health(&book, &HashSet::new(), &mut unjudged, &known);
+        }
+        let mut closed = book.clone();
+        closed.remove(&k);
+        assert!(stale_health(&closed, &judged, &mut unjudged, &known).is_empty() && unjudged.is_empty());
+        for _ in 1..HEALTH_STALE_CHECKS {
+            assert!(stale_health(&book, &HashSet::new(), &mut unjudged, &known).is_empty());
+        }
         // An AP that is gone closes at once; the site-wide alert is never stale.
         assert_eq!(stale_health(&book, &HashSet::new(), &mut HashMap::new(), &HashSet::new()), vec![k]);
     }

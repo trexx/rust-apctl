@@ -975,7 +975,7 @@ export const useFirmware = () =>
   });
 export const checkFirmware = () => send<{ platforms: number }>("POST", "/api/firmware/check", {});
 export const upgradeFirmware = (macs: Mac[]) => send<{ queued: number; skipped: { mac: Mac; why: string }[] }>("POST", "/api/firmware/upgrade", { macs });
-export const upgradeFirmwareUrl = (mac: Mac, url: string) => send("POST", "/api/firmware/upgrade-url", { mac, url });
+export const upgradeFirmwareUrl = (mac: Mac, url: string) => send<{ queued: number }>("POST", "/api/firmware/upgrade-url", { mac, url });
 export const cancelFirmware = () => send<{ cancelled: number }>("POST", "/api/firmware/cancel", {});
 export const resumeFirmware = () => send<{ resumed: boolean }>("POST", "/api/firmware/resume", {});
 

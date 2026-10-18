@@ -78,6 +78,38 @@ impl Diff<'_> {
     }
 }
 
+/// Where in a key one of [`SECRET_PARTS`] makes it a secret.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum At {
+    /// At the start of any of its dot-separated segments.
+    SegmentStart,
+    /// As its whole last segment.
+    Last,
+    /// At the end of its last segment.
+    LastEnd,
+    /// Anywhere.
+    Anywhere,
+}
+
+/// What makes a key a secret, case aside. Every one holds its part
+/// somewhere, so text with none of the parts in it holds no secret's key.
+/// `x_` marks secret fields in the controller's database, but only as a
+/// prefix (`max_txpower` must stay visible).
+pub const SECRET_PARTS: [(At, &str); 12] = [
+    (At::SegmentStart, "x_"),
+    (At::Last, "key"),
+    (At::LastEnd, "_key"),
+    (At::Last, "community"),
+    (At::Anywhere, "psk"),
+    (At::Anywhere, "passphrase"),
+    (At::Anywhere, "secret"),
+    (At::Anywhere, "authkey"),
+    (At::Anywhere, "password"),
+    (At::Anywhere, "passwd"),
+    (At::Anywhere, "syslog_key"),
+    (At::Anywhere, "sae_"),
+];
+
 /// Keys whose values are credentials (PSKs, RADIUS secrets, authkeys, passwords,
 /// the SNMP community).
 pub fn is_secret(key: &str) -> bool {
@@ -85,16 +117,13 @@ pub fn is_secret(key: &str) -> bool {
     let starts = |s: &str, p: &str| s.len() >= p.len() && s.as_bytes()[..p.len()].eq_ignore_ascii_case(p.as_bytes());
     let ends = |s: &str, p: &str| s.len() >= p.len() && s.as_bytes()[s.len() - p.len()..].eq_ignore_ascii_case(p.as_bytes());
     let contains = |s: &str, p: &str| s.as_bytes().windows(p.len()).any(|w| w.eq_ignore_ascii_case(p.as_bytes()));
-    // `x_` marks secret fields in the controller's database, but only as a prefix
-    // (`max_txpower` must stay visible).
     let last = key.rsplit('.').next().unwrap_or("");
-    key.split('.').any(|seg| starts(seg, "x_"))
-        || last.eq_ignore_ascii_case("key")
-        || ends(last, "_key")
-        || last.eq_ignore_ascii_case("community")
-        || ["psk", "passphrase", "secret", "authkey", "password", "passwd", "syslog_key", "sae_"]
-            .iter()
-            .any(|s| contains(key, s))
+    SECRET_PARTS.iter().any(|&(at, p)| match at {
+        At::SegmentStart => key.split('.').any(|seg| starts(seg, p)),
+        At::Last => last.eq_ignore_ascii_case(p),
+        At::LastEnd => ends(last, p),
+        At::Anywhere => contains(key, p),
+    })
 }
 
 /// Masks secret values in a whole `key=value` blob.

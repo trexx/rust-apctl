@@ -17,7 +17,7 @@
 //! so a later, different finding for the same BSSID is still reported.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use axum::extract::State;
@@ -291,14 +291,21 @@ pub fn assess(a: &Assessment) -> Vec<Finding> {
     let mut ours: Vec<&String> = a.ssids.iter().collect();
     ours.sort();
     let ours: Vec<Name> = ours.into_iter().map(|o| Name::new(o)).collect();
-    // The security our own networks show in scans, to compare copies against.
-    let mut expected: HashMap<&str, &str> = HashMap::new();
+    // Every security our own networks show in scans, to compare copies
+    // against: one name can have several (WPA3 on 6 GHz, WPA2 elsewhere), and
+    // a copy matching any of them is not called different. Sorted, so the
+    // detail names them the same way whatever order the rows came in.
+    let mut expected: HashMap<&str, Vec<&str>> = HashMap::new();
     for h in &a.heard {
         if let (Some(e), Some(s)) = (&h.essid, &h.security)
             && own.contains_key(h.bssid.as_str())
         {
-            expected.insert(e.as_str(), s.as_str());
+            expected.entry(e.as_str()).or_default().push(s.as_str());
         }
+    }
+    for v in expected.values_mut() {
+        v.sort_unstable();
+        v.dedup();
     }
     let watched_for = a.now - a.watching_since;
     let ap_name = |mac: &str| a.aps.get(mac).cloned().flatten();
@@ -387,16 +394,16 @@ pub fn assess(a: &Assessment) -> Vec<Finding> {
         if let Some(e) = essid {
             if a.ssids.contains(e) {
                 let theirs = latest.security.as_deref();
-                let ours = expected.get(e).copied();
+                let ours = expected.get(e).filter(|o| !o.is_empty());
                 let open = theirs.is_some_and(|s| s.to_ascii_lowercase().contains("open") || s.eq_ignore_ascii_case("none"));
                 let detail = if family {
                     format!("Broadcasts your network \"{e}\" from an address next to one of your APs'. It is probably your AP with an SSID apctl has not seen yet; if not, it is imitating it.")
                 } else if open {
                     format!("Broadcasts your network name \"{e}\" with no password. Devices that join it can have their traffic intercepted: a classic evil twin.")
                 } else if let (Some(t), Some(o)) = (theirs, ours)
-                    && t != o
+                    && !o.contains(&t)
                 {
-                    format!("Broadcasts your network name \"{e}\" from a device that is not yours, with different security ({t}, yours is {o}).")
+                    format!("Broadcasts your network name \"{e}\" from a device that is not yours, with different security ({t}, yours is {}).", o.join(" or "))
                 } else {
                     format!("Broadcasts your network name \"{e}\" from a device that is not one of your APs.")
                 };
@@ -471,10 +478,53 @@ struct Change {
     changed_at: Ts,
 }
 
-static CACHE: std::sync::LazyLock<std::sync::Mutex<Cache>> = std::sync::LazyLock::new(Default::default);
+/// What the threat checks keep between runs: the slow reads, the findings
+/// last worked out and the acknowledgements. One for the process, held in
+/// `AppState` and shared with [`watch`]; a test makes its own.
+#[derive(Default)]
+pub struct ThreatState {
+    cache: Mutex<Cache>,
+    latest: Mutex<Option<Latest>>,
+    /// Read from the database once, then kept here as [`ack`] changes them,
+    /// so what is served shows a change at once.
+    acks: Mutex<Option<Acks>>,
+}
+
+impl ThreatState {
+    fn cache(&self) -> MutexGuard<'_, Cache> {
+        self.cache.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn latest(&self) -> MutexGuard<'_, Option<Latest>> {
+        self.latest.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn acks(&self) -> MutexGuard<'_, Option<Acks>> {
+        self.acks.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Runs `f` on the acknowledgements, read from the database the first time.
+    fn with_acks<T>(&self, store: &Store, f: impl FnOnce(&mut Acks) -> T) -> anyhow::Result<T> {
+        let mut acks = self.acks();
+        if acks.is_none() {
+            *acks = Some(store.read(Db::Config, |c| Ok(load_acks(c)?))?);
+        }
+        Ok(f(acks.as_mut().expect("read above")))
+    }
+
+    /// Serves findings gathered at `at`, unless newer ones are served already
+    /// (a request and `watch` can gather at once). Ones from the future, from
+    /// before the clock stepped back, are replaced.
+    fn publish(&self, at: Ts, findings: Arc<[Finding]>, watching_since: Ts) {
+        let mut l = self.latest();
+        if l.as_ref().is_none_or(|l| !(at + 1..at + LATEST_SECS).contains(&l.at)) {
+            *l = Some(Latest { at, findings, watching_since });
+        }
+    }
+}
 
 /// Loads what `assess` needs from the database and live state.
-pub fn gather(store: &Store, acks: &AckCache, live: &SharedLive, now: Ts) -> anyhow::Result<Assessment> {
+pub fn gather(store: &Store, state: &ThreatState, live: &SharedLive, now: Ts) -> anyhow::Result<Assessment> {
     let mut a = Assessment { now, ..Default::default() };
     let mut own: BTreeMap<String, OwnBss> = BTreeMap::new();
     // The radio each of our live BSSIDs is on.
@@ -501,7 +551,7 @@ pub fn gather(store: &Store, acks: &AckCache, live: &SharedLive, now: Ts) -> any
         }
     }
 
-    let mut cache = CACHE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut cache = state.cache();
     store.read(Db::Metrics, |c| {
         if !(0..CACHE_SECS).contains(&(now - cache.used_at)) {
             cache.used = used_bssids(c, now)?;
@@ -585,7 +635,7 @@ pub fn gather(store: &Store, acks: &AckCache, live: &SharedLive, now: Ts) -> any
     let mut names = crate::connections::Names { aps: cache.ap_names.clone(), clients: HashMap::new() };
     a.clients = cache.clients.clone();
     drop(cache);
-    a.acks = acks.with(store, |acks| acks.clone())?;
+    a.acks = state.with_acks(store, |acks| acks.clone())?;
     names.add_live(&live.read().unwrap());
     for (mac, name) in names.aps {
         let e = a.aps.entry(mac).or_insert(None);
@@ -694,43 +744,6 @@ struct Latest {
 /// How long [`Latest`] is served: a little over `watch`'s minute.
 const LATEST_SECS: Ts = 90;
 
-static LATEST: std::sync::Mutex<Option<Latest>> = std::sync::Mutex::new(None);
-
-fn latest() -> std::sync::MutexGuard<'static, Option<Latest>> {
-    LATEST.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
-}
-
-/// Serves findings gathered at `at`, unless newer ones are served already (a
-/// request and `watch` can gather at once). Ones from the future, from before
-/// the clock stepped back, are replaced.
-fn publish(at: Ts, findings: Arc<[Finding]>, watching_since: Ts) {
-    let mut l = latest();
-    if l.as_ref().is_none_or(|l| !(at + 1..at + LATEST_SECS).contains(&l.at)) {
-        *l = Some(Latest { at, findings, watching_since });
-    }
-}
-
-/// The acknowledgements: read from the database once, then kept here as
-/// [`ack`] changes them, so what is served shows a change at once. One for
-/// the process, shared by `AppState` and [`watch`].
-#[derive(Default)]
-pub struct AckCache(std::sync::Mutex<Option<Acks>>);
-
-impl AckCache {
-    fn lock(&self) -> std::sync::MutexGuard<'_, Option<Acks>> {
-        self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
-    }
-
-    /// Runs `f` on the acknowledgements, read from the database the first time.
-    fn with<T>(&self, store: &Store, f: impl FnOnce(&mut Acks) -> T) -> anyhow::Result<T> {
-        let mut acks = self.lock();
-        if acks.is_none() {
-            *acks = Some(store.read(Db::Config, |c| Ok(load_acks(c)?))?);
-        }
-        Ok(f(acks.as_mut().expect("read above")))
-    }
-}
-
 fn load_acks(c: &Connection) -> rusqlite::Result<Acks> {
     let mut acks = Acks::new();
     let mut stmt = c.prepare("SELECT kind, bssid, note, ts FROM network_acks")?;
@@ -745,17 +758,17 @@ fn load_acks(c: &Connection) -> rusqlite::Result<Acks> {
 
 async fn findings(s: &AppState) -> Result<(Arc<[Finding]>, Ts), ApiError> {
     let now = clock::now_ts();
-    if let Some(l) = latest().as_ref().filter(|l| (0..LATEST_SECS).contains(&(now - l.at))) {
+    if let Some(l) = s.threats.latest().as_ref().filter(|l| (0..LATEST_SECS).contains(&(now - l.at))) {
         return Ok((l.findings.clone(), l.watching_since));
     }
-    let (store, acks, live) = (s.store.clone(), s.threat_acks.clone(), s.live.clone());
+    let (store, state, live) = (s.store.clone(), s.threats.clone(), s.live.clone());
     let (list, watching_since) = tokio::task::spawn_blocking(move || {
-        let a = gather(&store, &acks, &live, now)?;
+        let a = gather(&store, &state, &live, now)?;
         Ok::<_, anyhow::Error>((Arc::<[Finding]>::from(assess(&a)), a.watching_since))
     })
     .await?
     .map_err(ApiError::from)?;
-    publish(now, list.clone(), watching_since);
+    s.threats.publish(now, list.clone(), watching_since);
     Ok((list, watching_since))
 }
 
@@ -776,7 +789,7 @@ pub async fn list(State(s): State<AppState>) -> Result<Response, ApiError> {
     // is not held for the vendor lookups and the writing out. Read with the
     // findings, unless that failed: then as the findings had them.
     let acks: Option<Vec<Option<Ack>>> = {
-        let acks = s.threat_acks.lock();
+        let acks = s.threats.acks();
         acks.as_ref().map(|a| list.iter().map(|f| ack_of(a, f.kind, &f.bssid).cloned()).collect())
     };
     let items: Vec<Served> = list
@@ -825,16 +838,16 @@ pub async fn ack(State(s): State<AppState>, Json(b): Json<AckBody>) -> Result<Js
     }
     let (ts, bssid) = (clock::now_ts(), bssid.to_string());
     let ack = b.ack.then_some(Ack { note, ts });
-    let (store, acks, writer) = (s.store.clone(), s.threat_acks.clone(), s.writer.clone());
-    tokio::task::spawn_blocking(move || set_ack(&store, &acks, &writer, kind, bssid, ack)).await?.map_err(ApiError::from)?;
+    let (store, state, writer) = (s.store.clone(), s.threats.clone(), s.writer.clone());
+    tokio::task::spawn_blocking(move || set_ack(&store, &state, &writer, kind, bssid, ack)).await?.map_err(ApiError::from)?;
     Ok(Json(json!({ "ok": true })))
 }
 
 /// Acknowledges a finding (`Some`) or withdraws the acknowledgement: in memory
 /// and in the database in one step, so the two never disagree, and what is
 /// served shows it at once, however old the findings are.
-fn set_ack(store: &Store, acks: &AckCache, writer: &Writer, kind: Kind, bssid: String, ack: Option<Ack>) -> anyhow::Result<()> {
-    acks.with(store, |acks| {
+fn set_ack(store: &Store, state: &ThreatState, writer: &Writer, kind: Kind, bssid: String, ack: Option<Ack>) -> anyhow::Result<()> {
+    state.with_acks(store, |acks| {
         let k = Sql::Text(kind.as_str().into());
         match ack {
             Some(a) => {
@@ -860,7 +873,7 @@ fn prune(writer: &Writer) {
 }
 
 /// Re-assesses every minute and reports each new, unacknowledged finding once.
-pub fn watch(store: std::sync::Arc<Store>, acks: Arc<AckCache>, live: SharedLive, engine: tokio::sync::mpsc::Sender<Input>, writer: Writer) {
+pub fn watch(store: Arc<Store>, state: Arc<ThreatState>, live: SharedLive, engine: tokio::sync::mpsc::Sender<Input>, writer: Writer) {
     tokio::spawn(async move {
         // Give the APs a few informs to report their networks first.
         tokio::time::sleep(Duration::from_secs(90)).await;
@@ -872,8 +885,8 @@ pub fn watch(store: std::sync::Arc<Store>, acks: Arc<AckCache>, live: SharedLive
                 prune(&writer);
                 pruned = clock::now_ts();
             }
-            let (st, ak, lv, now) = (store.clone(), acks.clone(), live.clone(), clock::now_ts());
-            let found = tokio::task::spawn_blocking(move || gather(&st, &ak, &lv, now).map(|a| (assess(&a), a.watching_since))).await;
+            let (st, th, lv, now) = (store.clone(), state.clone(), live.clone(), clock::now_ts());
+            let found = tokio::task::spawn_blocking(move || gather(&st, &th, &lv, now).map(|a| (assess(&a), a.watching_since))).await;
             let (mut list, watching_since) = match found {
                 Ok(Ok(l)) => l,
                 Ok(Err(e)) => {
@@ -899,7 +912,7 @@ pub fn watch(store: std::sync::Arc<Store>, acks: Arc<AckCache>, live: SharedLive
                 // As the engine records it.
                 f.first_reported = Some(now);
             }
-            publish(now, list.into(), watching_since);
+            state.publish(now, list.into(), watching_since);
         }
     });
 }
@@ -969,6 +982,25 @@ mod tests {
         let mut a = site();
         a.heard.push(heard("02:11:22:33:44:55", DOWN, "Home", 6, "WPA-Personal (TKIP)", -70));
         assert!(assess(&a)[0].detail.contains("different security"));
+        // A name ours broadcast with two securities: a copy with either is not
+        // called different, whichever row comes last, and one with neither
+        // names both.
+        let mut a = site();
+        a.heard.push(heard("78:45:58:3c:52:be", UP, "Home", 48, "WPA3-Personal", -81));
+        for (sec, different) in [("WPA2-Personal (AES/CCMP)", false), ("WPA3-Personal", false), ("WPA-Personal (TKIP)", true)] {
+            for order in [false, true] {
+                let mut a = Assessment { heard: a.heard.clone(), own: a.own.clone(), ssids: a.ssids.clone(), aps: a.aps.clone(), now: a.now, ..Default::default() };
+                if order {
+                    a.heard.reverse();
+                }
+                a.heard.push(heard("02:11:22:33:44:55", DOWN, "Home", 6, sec, -70));
+                let detail = assess(&a).remove(0).detail;
+                assert_eq!(detail.contains("different security"), different, "{sec}: {detail}");
+                if different {
+                    assert!(detail.contains("yours is WPA2-Personal (AES/CCMP) or WPA3-Personal"), "{detail}");
+                }
+            }
+        }
         // Next to our AP's own addresses: probably ours, so only medium.
         let mut a = site();
         a.heard.push(heard("7a:45:58:3c:52:bf", UP, "Home", 48, "WPA2-Personal (AES/CCMP)", -80));
@@ -1146,14 +1178,15 @@ mod tests {
 
     #[test]
     fn older_findings_do_not_replace_newer_ones() {
-        let at = || latest().as_ref().map(|l| l.at);
-        publish(1_000, Arc::from([]), 0);
-        publish(990, Arc::from([]), 0);
+        let s = ThreatState::default();
+        let at = || s.latest().as_ref().map(|l| l.at);
+        s.publish(1_000, Arc::from([]), 0);
+        s.publish(990, Arc::from([]), 0);
         assert_eq!(at(), Some(1_000), "gathered before the ones served");
-        publish(1_030, Arc::from([]), 0);
+        s.publish(1_030, Arc::from([]), 0);
         assert_eq!(at(), Some(1_030));
         // Served ones far ahead are from before the clock stepped back.
-        publish(500, Arc::from([]), 0);
+        s.publish(500, Arc::from([]), 0);
         assert_eq!(at(), Some(500));
     }
 
@@ -1161,29 +1194,29 @@ mod tests {
     fn acknowledgements_and_slow_reads_are_kept_in_memory() {
         let dir = TestDir::new("threats-acks");
         let (store, writer) = Store::open(&dir).unwrap();
-        let (live, acks): (SharedLive, AckCache) = Default::default();
+        let (live, state): (SharedLive, ThreatState) = Default::default();
         let exec = |sql: &'static str| writer.exec(Db::Config, sql, vec![]);
         exec("INSERT INTO network_acks (kind, bssid, note, ts) VALUES ('lookalike', '02:00:00:00:00:01', 'stored', 1)");
         exec("INSERT INTO neighbors (bssid, ap_mac, first_seen, last_seen) VALUES ('02:00:00:00:00:01', 'x', 100, 200)");
         exec("INSERT INTO clients (mac, hostname) VALUES ('02:00:00:00:01:01', 'phone')");
         assert!(writer.flush(Duration::from_secs(5)));
         let now = 1_000_000;
-        let a = gather(&store, &acks, &live, now).unwrap();
+        let a = gather(&store, &state, &live, now).unwrap();
         assert_eq!(a.acks[&Kind::Lookalike]["02:00:00:00:00:01"].note.as_deref(), Some("stored"));
         assert_eq!((a.watching_since, a.clients.len()), (100, 1));
         // Acknowledging shows in the next gather, and is written.
-        set_ack(&store, &acks, &writer, Kind::Bridged, "02:00:00:00:00:02".into(), Some(Ack { note: None, ts: 7 })).unwrap();
-        set_ack(&store, &acks, &writer, Kind::Lookalike, "02:00:00:00:00:01".into(), None).unwrap();
+        set_ack(&store, &state, &writer, Kind::Bridged, "02:00:00:00:00:02".into(), Some(Ack { note: None, ts: 7 })).unwrap();
+        set_ack(&store, &state, &writer, Kind::Lookalike, "02:00:00:00:00:01".into(), None).unwrap();
         exec("INSERT INTO neighbors (bssid, ap_mac, first_seen, last_seen) VALUES ('02:00:00:00:00:03', 'x', 50, 200)");
         exec("INSERT INTO clients (mac, hostname) VALUES ('02:00:00:00:01:02', 'laptop')");
         assert!(writer.flush(Duration::from_secs(5)));
-        let a = gather(&store, &acks, &live, now + 60).unwrap();
+        let a = gather(&store, &state, &live, now + 60).unwrap();
         assert_eq!(a.acks.iter().flat_map(|(k, m)| m.keys().map(move |b| (*k, b.as_str()))).collect::<Vec<_>>(), [(Kind::Bridged, "02:00:00:00:00:02")]);
         let stored: Vec<String> = store.read(Db::Config, |c| Ok(c.prepare("SELECT kind FROM network_acks")?.query_map([], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?)).unwrap();
         assert_eq!(stored, ["bridged"]);
         // The first network heard and the clients are read again only now and then.
         assert_eq!((a.watching_since, a.clients.len()), (100, 1));
-        let a = gather(&store, &acks, &live, now + CACHE_SECS).unwrap();
+        let a = gather(&store, &state, &live, now + CACHE_SECS).unwrap();
         assert_eq!((a.watching_since, a.clients.len()), (50, 2));
     }
 

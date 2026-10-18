@@ -181,16 +181,20 @@ pub struct Jobs {
 }
 
 impl Jobs {
-    /// Queues upgrades (an AP already queued or upgrading is not queued again).
-    /// A queue stopped by a failure stays stopped until it is resumed.
-    pub fn enqueue(&mut self, jobs: Vec<Job>) {
+    /// Queues upgrades (an AP already queued or upgrading is not queued again);
+    /// how many were queued. A queue stopped by a failure stays stopped until
+    /// it is resumed.
+    pub fn enqueue(&mut self, jobs: Vec<Job>) -> usize {
+        let mut n = 0;
         for j in jobs {
             let busy = self.current.as_ref().is_some_and(|c| c.mac == j.mac) || self.queue.iter().any(|q| q.mac == j.mac);
             if !busy {
                 self.queue.push_back(j);
+                n += 1;
             }
         }
         self.next();
+        n
     }
 
     /// Starts a queue a failure stopped again; whether it was stopped.
@@ -272,8 +276,7 @@ impl Op {
     pub fn apply(self, jobs: &mut Jobs) -> usize {
         match self {
             Op::Enqueue(new) => {
-                let n = new.len();
-                jobs.enqueue(new);
+                let n = jobs.enqueue(new);
                 tracing::info!("firmware: {n} upgrade(s) queued");
                 n
             }
@@ -344,25 +347,7 @@ pub fn check(writer: &Writer) -> anyhow::Result<usize> {
     let now = clock::now_ts();
     match result {
         Ok(releases) => {
-            for r in &releases {
-                writer.exec(
-                    Db::Config,
-                    "INSERT OR REPLACE INTO firmware_releases (platform, version, url, md5, sha256, size, created, checked) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-                    vec![
-                        Sql::Text(r.platform.clone()),
-                        Sql::Text(r.version.clone()),
-                        Sql::Text(r.url.clone()),
-                        r.md5.clone().map_or(Sql::Null, Sql::Text),
-                        r.sha256.clone().map_or(Sql::Null, Sql::Text),
-                        r.size.map_or(Sql::Null, Sql::Integer),
-                        r.created.clone().map_or(Sql::Null, Sql::Text),
-                        Sql::Integer(now),
-                    ],
-                );
-            }
-            // Platforms the feed no longer lists.
-            writer.exec(Db::Config, "DELETE FROM firmware_releases WHERE checked < ?1", vec![Sql::Integer(now)]);
-            writer.exec(Db::Config, "INSERT OR REPLACE INTO firmware_check (id, ts, error) VALUES (1, ?1, NULL)", vec![Sql::Integer(now)]);
+            store_releases(writer, &releases, now);
             Ok(releases.len())
         }
         Err(e) => {
@@ -370,6 +355,31 @@ pub fn check(writer: &Writer) -> anyhow::Result<usize> {
             Err(e)
         }
     }
+}
+
+/// Stores what the feed listed, checked at `now`, in place of what it listed before.
+fn store_releases(writer: &Writer, releases: &[Release], now: Ts) {
+    for r in releases {
+        writer.exec(
+            Db::Config,
+            "INSERT OR REPLACE INTO firmware_releases (platform, version, url, md5, sha256, size, created, checked) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            vec![
+                Sql::Text(r.platform.clone()),
+                Sql::Text(r.version.clone()),
+                Sql::Text(r.url.clone()),
+                r.md5.clone().map_or(Sql::Null, Sql::Text),
+                r.sha256.clone().map_or(Sql::Null, Sql::Text),
+                r.size.map_or(Sql::Null, Sql::Integer),
+                r.created.clone().map_or(Sql::Null, Sql::Text),
+                Sql::Integer(now),
+            ],
+        );
+    }
+    // Platforms the feed no longer lists, by name rather than by date:
+    // after the clock steps back, rows checked "later" are as old.
+    let listed = serde_json::to_string(&releases.iter().map(|r| &r.platform).collect::<Vec<_>>()).expect("a list of strings");
+    writer.exec(Db::Config, "DELETE FROM firmware_releases WHERE platform NOT IN (SELECT value FROM json_each(?1))", vec![Sql::Text(listed)]);
+    writer.exec(Db::Config, "INSERT OR REPLACE INTO firmware_check (id, ts, error) VALUES (1, ?1, NULL)", vec![Sql::Integer(now)]);
 }
 
 /// Checks a minute after start, then daily.
@@ -688,7 +698,23 @@ mod tests {
         assert!(j.current.is_some());
         // As the engine makes the changes the UI asks for.
         assert_eq!(Op::Enqueue(vec![job("c"), job("d")]).apply(&mut j), 2);
-        assert_eq!(Op::CancelQueued.apply(&mut j), 2);
+        assert_eq!(Op::Enqueue(vec![job("a"), job("c"), job("e")]).apply(&mut j), 1, "a is upgrading and c queued already");
+        assert_eq!(Op::CancelQueued.apply(&mut j), 3);
+    }
+
+    #[test]
+    fn a_check_replaces_what_the_last_one_listed_whatever_the_clock() {
+        let dir = crate::model::tests::TestDir::new("firmware-releases");
+        let (store, writer) = Store::open(&dir).unwrap();
+        let rel = |p: &str| Release { platform: p.into(), version: "6.8.2.15592".into(), url: "u".into(), md5: None, sha256: None, size: None, created: None };
+        store_releases(&writer, &[rel("U6M"), rel("U7P")], 2_000_000_000);
+        // The clock steps back before the next check, which no longer lists U7P.
+        store_releases(&writer, &[rel("U6M"), rel("UAL6")], 1_000_000_000);
+        assert!(writer.flush(Duration::from_secs(5)));
+        let (rels, checked, error) = releases(&store).unwrap();
+        let mut platforms: Vec<&str> = rels.keys().map(String::as_str).collect();
+        platforms.sort_unstable();
+        assert_eq!((platforms, checked, error), (vec!["U6M", "UAL6"], Some(1_000_000_000), None));
     }
 
     #[test]

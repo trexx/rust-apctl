@@ -289,14 +289,14 @@ async fn serve(args: ServeArgs) -> Result<()> {
     }
 
     let auth = Arc::new(auth::Auth::new(users, &store, writer.clone(), proxies)?);
-    let threat_acks: Arc<threats::AckCache> = Default::default();
-    threats::watch(store.clone(), threat_acks.clone(), live.clone(), in_tx.clone(), writer.clone());
+    let threat_state: Arc<threats::ThreatState> = Default::default();
+    threats::watch(store.clone(), threat_state.clone(), live.clone(), in_tx.clone(), writer.clone());
     alerts::spawn(store.clone(), writer.clone(), live.clone(), live_tx.clone(), alert_events);
     backup::schedule(backups.clone(), store.clone());
     firmware::schedule(writer.clone());
     let state = api::AppState::new(api::AppStateInner {
         backups, active, writer: writer.clone(), store, vendors: Arc::new(vendors), renderer, auth, engine: in_tx.clone(), live, tx: api::live_json(&live_tx), started: clock::now_ts(),
-        source: source_desc, inform_url: inform_url.filter(|_| active), memo: Default::default(), threat_acks,
+        source: source_desc, inform_url: inform_url.filter(|_| active), memo: Default::default(), threats: threat_state,
     });
     channelai::schedule(state.clone());
     ratelimit::spawn(state.clone());

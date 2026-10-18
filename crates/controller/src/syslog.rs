@@ -15,6 +15,7 @@
 //!
 //! The key is the device's 64-hex `syslog_key`.
 
+use std::borrow::Cow;
 use std::sync::{Arc, Weak};
 
 use aes_gcm::aead::{Aead, KeyInit, Payload};
@@ -22,6 +23,7 @@ use aes_gcm::{Aes256Gcm, Nonce};
 use anyhow::{Result, anyhow, bail};
 use inform::Mac;
 use serde_json::Value;
+use wire::cfgdiff::{At, SECRET_PARTS};
 use wire::keys::KeyStore;
 
 use crate::engine::LogLine;
@@ -34,12 +36,32 @@ pub const MAGIC: [u8; 4] = [0xab, 0xcd, 0xdc, 0xba];
 /// on a line with any non-ASCII text.
 static KEY: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| regex::Regex::new(r#"(?i)(?-u:\b)([a-z0-9_.]+)["']?\s*[:=]\s*"#).unwrap());
 
+/// Text that may hold a secret's key: any with one of the parts every secret's
+/// key holds, so most lines are stored without a search for keys. Built from
+/// the list `is_secret` reads, so the two cannot drift apart. A key starts at
+/// a word boundary (see [`KEY`]) and a segment after a dot, so the `x_` that
+/// starts a segment follows one: `tx_bytes` is not let through.
+static HINT: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+    let parts: Vec<String> = SECRET_PARTS
+        .iter()
+        .map(|&(at, p)| match at {
+            At::SegmentStart => format!(r"\b{}", regex::escape(p)),
+            At::Last | At::LastEnd | At::Anywhere => regex::escape(p),
+        })
+        .collect();
+    regex::Regex::new(&format!("(?i-u){}", parts.join("|"))).unwrap()
+});
+
 /// APs log some secrets in clear text (e.g. `authkey: <hex>` when they save a
 /// new management config). The values of keys named like a secret in a
 /// config (`x_passphrase`, `wpa.psk`, `snmp.community`...) are masked before
-/// storage; a quoted value is masked whole, its quotes kept.
-pub fn redact(msg: &str) -> String {
-    let mut out = String::with_capacity(msg.len());
+/// storage; a quoted value is masked whole, its quotes kept. A line without
+/// one is given back as it is.
+pub fn redact(msg: &str) -> Cow<'_, str> {
+    if !HINT.is_match(msg) {
+        return Cow::Borrowed(msg);
+    }
+    let mut out = String::new();
     // How much of `msg` is copied to `out` or masked.
     let mut done = 0;
     // Only a secret's value is skipped: another key's may hold a secret's
@@ -64,8 +86,12 @@ pub fn redact(msg: &str) -> String {
         }
         done = all.end() + len;
     }
+    // Nothing was masked: a masked value ends past the line's start.
+    if done == 0 {
+        return Cow::Borrowed(msg);
+    }
     out.push_str(&msg[done..]);
-    out
+    Cow::Owned(out)
 }
 
 /// The length of the value `s` starts with, and its quote if it is quoted: a
@@ -193,7 +219,7 @@ pub fn parse(ts: Ts, src_ip: &str, device_mac: Option<Mac>, raw: &str) -> LogLin
             program = Some(head.split('[').next().unwrap_or(head).to_string());
             rest = msg;
         }
-    LogLine { ts, device_mac, src_ip: src_ip.to_string(), facility, severity, program, msg: redact(rest.trim()) }
+    LogLine { ts, device_mac, src_ip: src_ip.to_string(), facility, severity, program, msg: redact(rest.trim()).into_owned() }
 }
 
 #[cfg(test)]
@@ -274,6 +300,34 @@ pub(crate) mod tests {
         ] {
             assert_eq!(redact(line), want, "{line}");
         }
+    }
+
+    #[test]
+    fn only_a_line_that_may_hold_a_secret_is_searched() {
+        // Each part that makes a key secret, in a key `is_secret` takes, in
+        // either case: the quick test must let every one through.
+        for &(at, p) in &SECRET_PARTS {
+            for part in [p.to_ascii_lowercase(), p.to_ascii_uppercase()] {
+                let key = match at {
+                    At::SegmentStart => format!("aaa.{part}y"),
+                    At::Last => format!("aaa.{part}"),
+                    At::LastEnd => format!("aaa.b{part}"),
+                    At::Anywhere => format!("a{part}b"),
+                };
+                assert!(wire::cfgdiff::is_secret(&key), "{key}");
+                for line in [format!("{key}=v"), format!("cfg: {key}: v"), format!(r#"{{"{key}": "v"}}"#)] {
+                    assert!(HINT.is_match(&line), "{line}");
+                    assert!(redact(&line).contains("<redacted>"), "{line}");
+                }
+            }
+        }
+        assert!(HINT.is_match("x_passphrase=1") && HINT.is_match("Café x_y=1"));
+        // Lines without one are given back unsearched, and so are lines that
+        // name a part but hold no secret.
+        for line in ["wifi1ap0: STA 02:00:00:00:00:01 IEEE 802.11: associated", "max_txpower=20 tx_bytes=1 rx_x_y=2", "WPA: pairwise key handshake completed (RSN)", "psk: "] {
+            assert!(matches!(redact(line), Cow::Borrowed(l) if l == line), "{line}");
+        }
+        assert!(!HINT.is_match("max_txpower=20 tx_bytes=1"));
     }
 
     #[test]
