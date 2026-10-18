@@ -1,6 +1,6 @@
 import { useState } from "react";
 import type { ReactNode } from "react";
-import { Link } from "react-router";
+import { Link, useSearchParams } from "react-router";
 import { eventData, useDeviceNames, useEvents } from "../api";
 import type { AppEvent } from "../api";
 import { DryRun } from "./DryRun";
@@ -10,6 +10,7 @@ import {
   QueryState,
   Segmented,
   eventText,
+  useSetParams,
   useUrlTab,
 } from "../components/common";
 import { clock, useNow } from "../format";
@@ -46,7 +47,11 @@ function Push({ e, ap, now }: { e: AppEvent; ap: ReactNode; now: number }) {
 }
 
 function History() {
-  const [device, setDevice] = useState("");
+  // The AP lives in the URL (`?device=`), as on the Events and Logs pages.
+  const [params] = useSearchParams();
+  const device = params.get("device") ?? "";
+  const setUrl = useSetParams();
+  const setDevice = (mac: string) => setUrl({ device: mac }, { replace: true });
   const names = useDeviceNames();
   const now = useNow();
   const ev = useEvents({
