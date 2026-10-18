@@ -1,8 +1,8 @@
-import { useState } from "react";
 import { useDeviceSettings } from "../../../api";
 import type { RadioSettings } from "../../../api";
 import { band } from "../../../format";
 import { QueryNote } from "../../common";
+import { EditPanel } from "../EditPanel";
 import { DeviceEditor } from "./DeviceEditor";
 
 /** One radio's settings in a line. */
@@ -11,25 +11,14 @@ const radioSummary = (r: RadioSettings) =>
 
 function DevicePanel({ mac }: { mac: string }) {
   const s = useDeviceSettings(mac);
-  const [editing, setEditing] = useState(false);
   if (!s.data) return <QueryNote q={s} panel />;
   const d = s.data;
   return (
-    <div className="panel">
-      <div className="panel-head">
-        <b>Settings</b>
-        <span className="muted small">
-          {editing ? "" : d.radios.map(radioSummary).join(" · ")}
-        </span>
-        <span className="spacer" />
-        {!editing && (
-          <button className="btn small" onClick={() => setEditing(true)}>
-            Edit
-          </button>
-        )}
-      </div>
-      {editing && <DeviceEditor d={d} onClose={() => setEditing(false)} />}
-    </div>
+    <EditPanel
+      title="Settings"
+      summary={d.radios.map(radioSummary).join(" · ")}
+      editor={(onClose) => <DeviceEditor d={d} onClose={onClose} />}
+    />
   );
 }
 
