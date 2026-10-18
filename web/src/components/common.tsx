@@ -31,8 +31,10 @@ export function Stat({
   );
 }
 
-export function Dot({ ok }: { ok: boolean }) {
-  return <span className={`dot ${ok ? "dot-ok" : "dot-bad"}`} aria-hidden />;
+/** A status dot, beside text that says the same: good or bad (`ok`), or one of three tones. */
+export function Dot(p: { ok: boolean } | { tone: "ok" | "warn" | "bad" }) {
+  const tone = "tone" in p ? p.tone : p.ok ? "ok" : "bad";
+  return <span className={`dot dot-${tone}`} aria-hidden />;
 }
 
 export function Signal({ dbm }: { dbm: number | null | undefined }) {

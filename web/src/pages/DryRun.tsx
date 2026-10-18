@@ -1,16 +1,28 @@
 import { Link } from "react-router";
 import { useDeviceNames, useDryRun } from "../api";
 import type { DryRun as DryRunData, FieldComparison } from "../api";
-import { ErrorNote, Loading } from "../components/common";
+import { Dot, ErrorNote, Loading } from "../components/common";
 import { clock, useNow } from "../format";
 
-const STATUS: Record<DryRunData["devices"][number]["status"], string> = {
+type Status = DryRunData["devices"][number]["status"];
+
+const STATUS: Record<Status, string> = {
   match: "Identical",
   equivalent: "Equivalent",
   differs: "Differs",
   error: "Generator error",
   no_settings: "Import settings first",
   no_config_seen: "No config seen yet",
+};
+
+/** A status's dot: the same config is good, a difference or an error bad, nothing to compare yet a warning. */
+const TONE: Record<Status, "ok" | "warn" | "bad"> = {
+  match: "ok",
+  equivalent: "ok",
+  differs: "bad",
+  error: "bad",
+  no_settings: "warn",
+  no_config_seen: "warn",
 };
 
 function FieldResult({ label, c }: { label: string; c: FieldComparison }) {
@@ -74,9 +86,7 @@ export function DryRun() {
         {d.devices.map((x) => (
           <div key={x.mac} className="card">
             <div className="card-head">
-              <span
-                className={`dot ${x.status === "match" || x.status === "equivalent" ? "dot-ok" : x.status === "differs" || x.status === "error" ? "dot-bad" : "dot-warn"}`}
-              />
+              <Dot tone={TONE[x.status] ?? "warn"} />
               <span className="card-title">{x.name ?? x.mac}</span>
               <span className="muted">{STATUS[x.status] ?? x.status}</span>
             </div>
