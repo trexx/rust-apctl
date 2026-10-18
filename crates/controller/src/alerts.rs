@@ -722,9 +722,13 @@ impl Watcher {
 }
 
 /// Starts the alert watcher, fed by the engine through `events` (see [`channel`]).
-pub fn spawn(store: Arc<Store>, writer: Writer, live: SharedLive, tx: broadcast::Sender<LiveMsg>, mut events: mpsc::Receiver<Event>) {
+/// It keeps the engine's time (see [`crate::shadow::Clock`]): in shadow mode a
+/// lagging capture's, and while a capture is replayed it checks no AP's status
+/// or health, whose stored figures are then of the capture's time.
+pub fn spawn(store: Arc<Store>, writer: Writer, live: SharedLive, tx: broadcast::Sender<LiveMsg>, mut events: mpsc::Receiver<Event>, clock: Arc<crate::shadow::Clock>) {
     tokio::spawn(async move {
-        let mut w = Watcher::start(store, writer, live, tx, clock::now_ts()).await;
+        let now = || clock.now().unwrap_or_else(clock::now_ts);
+        let mut w = Watcher::start(store, writer, live, tx, now()).await;
         // Give APs a chance to report after a restart before judging them.
         let mut status = tokio::time::interval_at(tokio::time::Instant::now() + Duration::from_secs(90), Duration::from_secs(30));
         let mut health = tokio::time::interval_at(tokio::time::Instant::now() + Duration::from_secs(120), Duration::from_secs(60));
@@ -732,11 +736,11 @@ pub fn spawn(store: Arc<Store>, writer: Writer, live: SharedLive, tx: broadcast:
             // Events wait in the channel while a check runs.
             tokio::select! {
                 e = events.recv() => match e {
-                    Some(e) => w.event(clock::now_ts(), &e),
+                    Some(e) => w.event(now(), &e),
                     None => return,
                 },
-                _ = status.tick() => w.status_tick(clock::now_ts()),
-                _ = health.tick() => w.health_tick(clock::now_ts()).await,
+                _ = status.tick() => if let Some(now) = clock.now() { w.status_tick(now) },
+                _ = health.tick() => if let Some(now) = clock.now() { w.health_tick(now).await },
             }
         }
     });
