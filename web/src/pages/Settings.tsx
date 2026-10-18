@@ -1,6 +1,6 @@
 import { importState, keys, useCanEdit, useSettingsState } from "../api";
 import { Outcome, QueryState, useRunner } from "../components/common";
-import { NotificationSettings } from "../components/Alerts";
+import { NotificationSettings } from "../components/NotificationSettings";
 import { BackupSection } from "../components/Backups";
 import { FileButton } from "../components/FileButton";
 import { SiteSettingsPanel } from "../components/SettingsEditor";

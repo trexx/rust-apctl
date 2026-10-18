@@ -13,7 +13,7 @@ import {
 import { ApSpacing } from "../components/insights/ApSpacing";
 import { DeploymentDensity } from "../components/insights/DeploymentDensity";
 import { BandPicker } from "../components/insights/shared";
-import { ThreatList } from "../components/Threats";
+import { ThreatList } from "../components/ThreatList";
 import { RoamingView } from "../components/RoamingView";
 import {
   Meter,
