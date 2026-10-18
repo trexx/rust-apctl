@@ -13,6 +13,7 @@ import {
 import type { ChannelPlanResult } from "../api";
 import { band as bandName, clock, hhmm, useNow } from "../format";
 import { Outcome, QueryNote, QueryState, eventText, useRunner } from "./common";
+import { ApChecklist, toggled } from "./settings/form";
 
 /**
  * Runs Channel AI actions. The settings checkboxes each send a patch built
@@ -175,11 +176,7 @@ export function ChannelAiPanel() {
                   checked={s.radios.includes(b)}
                   disabled={!can}
                   onChange={(e) =>
-                    save({
-                      radios: e.target.checked
-                        ? [...s.radios, b]
-                        : s.radios.filter((x) => x !== b),
-                    })
+                    save({ radios: toggled(s.radios, b, e.target.checked) })
                   }
                 />
                 {bandName(b)}
@@ -209,23 +206,12 @@ export function ChannelAiPanel() {
         <div className="form-row">
           <div className="form-label">Excluded APs</div>
           <div className="form-control">
-            {Object.entries(names).map(([mac, name]) => (
-              <label key={mac} className="check">
-                <input
-                  type="checkbox"
-                  checked={s.exclude_devices.includes(mac)}
-                  disabled={!can}
-                  onChange={(e) =>
-                    save({
-                      exclude_devices: e.target.checked
-                        ? [...s.exclude_devices, mac]
-                        : s.exclude_devices.filter((m) => m !== mac),
-                    })
-                  }
-                />
-                {name}
-              </label>
-            ))}
+            <ApChecklist
+              aps={Object.entries(names).map(([mac, name]) => ({ mac, name }))}
+              value={s.exclude_devices}
+              disabled={!can}
+              onChange={(v) => save({ exclude_devices: v })}
+            />
           </div>
         </div>
       </div>

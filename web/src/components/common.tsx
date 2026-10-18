@@ -76,7 +76,7 @@ export function Loading() {
   return <div className="muted pad">Loading…</div>;
 }
 
-const errorText = (error: unknown) =>
+export const errorText = (error: unknown) =>
   error instanceof Error ? error.message : String(error);
 
 export function ErrorNote({ error }: { error: unknown }) {

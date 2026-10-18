@@ -304,6 +304,35 @@ export function TimeInput({
   );
 }
 
+/** `list` with `x` added (`on`, once) or removed: what a checkbox per item edits. */
+export const toggled = <T,>(list: readonly T[], x: T, on: boolean): T[] =>
+  on
+    ? [...list, ...(list.includes(x) ? [] : [x])]
+    : list.filter((y) => y !== x);
+
+/** A checkbox per AP; those in `value` are ticked. */
+export function ApChecklist({
+  aps,
+  value,
+  onChange,
+  disabled,
+}: {
+  aps: readonly { mac: string; name: string | null }[];
+  value: readonly string[];
+  onChange: (v: string[]) => void;
+  disabled?: boolean;
+}) {
+  return aps.map((a) => (
+    <Toggle
+      key={a.mac}
+      value={value.includes(a.mac)}
+      onChange={(on) => onChange(toggled(value, a.mac, on))}
+      disabled={disabled}
+      label={a.name ?? a.mac}
+    />
+  ));
+}
+
 /** Splits on white space, commas and semicolons: MAC addresses, servers. */
 export const words = (text: string) =>
   text

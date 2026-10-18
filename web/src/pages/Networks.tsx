@@ -2,7 +2,7 @@ import { Suspense } from "react";
 import { Link } from "react-router";
 import { useWlans } from "../api";
 import type { Wlan } from "../api";
-import { band, bytes, pct1, rate } from "../format";
+import { band, bytes, pct1, rate, spanText } from "../format";
 import {
   COLORS,
   Chart,
@@ -12,7 +12,6 @@ import {
   useTimeSpan,
 } from "../components/Chart";
 import { QueryState, Signal } from "../components/common";
-import { spanText } from "../components/insights/shared";
 import { lazyNamed } from "../lazy";
 
 // The settings editor is large: load it on demand.

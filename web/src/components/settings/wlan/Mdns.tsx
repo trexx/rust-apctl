@@ -1,6 +1,14 @@
 import { useState } from "react";
 import type { MdnsRule, WlanSettingsList } from "../../../api";
-import { ListInput, Row, Select, Toggle, lines } from "../form";
+import {
+  ApChecklist,
+  ListInput,
+  Row,
+  Select,
+  Toggle,
+  lines,
+  toggled,
+} from "../form";
 import type { WlanSection } from "./form";
 import { Unsupported } from "./Unsupported";
 
@@ -96,21 +104,13 @@ function MdnsRules({
                   ]}
                 />
               </label>
-              {r.ap_scope_mode === "specific" &&
-                list.aps.map((a) => (
-                  <Toggle
-                    key={a.mac}
-                    value={(r.ap_macs ?? []).includes(a.mac)}
-                    onChange={(v) =>
-                      update(i, {
-                        ap_macs: v
-                          ? [...(r.ap_macs ?? []), a.mac]
-                          : (r.ap_macs ?? []).filter((m) => m !== a.mac),
-                      })
-                    }
-                    label={a.name ?? a.mac}
-                  />
-                ))}
+              {r.ap_scope_mode === "specific" && (
+                <ApChecklist
+                  aps={list.aps}
+                  value={r.ap_macs ?? []}
+                  onChange={(v) => update(i, { ap_macs: v })}
+                />
+              )}
               <label className="small">
                 pass{" "}
                 <Select
@@ -133,10 +133,9 @@ function MdnsRules({
                         value={codes.includes(s.code)}
                         onChange={(v) =>
                           update(i, {
-                            predefined_services: (v
-                              ? [...codes, s.code]
-                              : codes.filter((c) => c !== s.code)
-                            ).map((code) => ({ code })),
+                            predefined_services: toggled(codes, s.code, v).map(
+                              (code) => ({ code }),
+                            ),
                           })
                         }
                         label={s.name}

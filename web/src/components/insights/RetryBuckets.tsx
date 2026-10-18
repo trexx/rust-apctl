@@ -1,5 +1,5 @@
 import { useRetries } from "../../api";
-import { band as bandName } from "../../format";
+import { band as bandName, pct1 } from "../../format";
 import { useTimeSpan } from "../Chart";
 import { BandInsight } from "./shared";
 
@@ -27,7 +27,7 @@ export function RetryBuckets() {
                 const tip = inBucket
                   .map(
                     (x) =>
-                      `${x.name ?? x.mac} ${bandName(x.radio)}: ${x.tx_retry_pct.toFixed(1)}%`,
+                      `${x.name ?? x.mac} ${bandName(x.radio)}: ${pct1(x.tx_retry_pct)}`,
                   )
                   .join("\n");
                 return (

@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { hhmm as time } from "../../../format";
-import { TextInput, TimeInput } from "../form";
+import { TextInput, TimeInput, toggled } from "../form";
 import type { Blackout } from "../../../api";
 
 const WEEK = ["sun", "mon", "tue", "wed", "thu", "fri", "sat"] as const;
@@ -67,9 +67,11 @@ export function ScheduleEditor({
                     checked={e.start_days_of_week.includes(d)}
                     onChange={(ev) =>
                       update(i, {
-                        start_days_of_week: ev.target.checked
-                          ? [...e.start_days_of_week, d]
-                          : e.start_days_of_week.filter((x) => x !== d),
+                        start_days_of_week: toggled(
+                          e.start_days_of_week,
+                          d,
+                          ev.target.checked,
+                        ),
                       })
                     }
                   />

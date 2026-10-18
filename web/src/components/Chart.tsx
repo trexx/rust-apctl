@@ -11,13 +11,7 @@ import uPlot from "uplot";
 import "uplot/dist/uPlot.min.css";
 import { isFixed, spanBounds } from "../api";
 import type { TimeSpan } from "../api";
-import {
-  duration,
-  fromLocalInput,
-  spanLabel,
-  toLocalInput,
-  useNow,
-} from "../format";
+import { fromLocalInput, spanText, toLocalInput, useNow } from "../format";
 import { Segmented, useDismiss, useSetParams } from "./common";
 
 /** The page's time span: charts show exactly this window, gaps included. */
@@ -201,8 +195,16 @@ export function Chart({
 
   // Rebuild when the shape (or the colour scheme, for the axes and series) changes; otherwise only push new data.
   const shape =
-    series.map((s) => s.label + s.color + (s.right ? "r" : "")).join("|") +
-    `|${min}|${max}|${height}|${rightMax}|${!!zoom}|${dark}`;
+    series
+      .map(
+        (s) =>
+          s.label +
+          s.color +
+          (s.right ? "r" : "") +
+          (s.fill ? "f" : "") +
+          (s.dashed ? "d" : ""),
+      )
+      .join("|") + `|${min}|${max}|${height}|${rightMax}|${!!zoom}|${dark}`;
   const hasRight = series.some((s) => s.right);
   const current = (): Drawn => ({
     ts,
@@ -526,6 +528,7 @@ export function RangePicker({
   };
   const fixed = isFixed(value);
   const preset = !fixed && RANGES.some((r) => r.seconds === value.last);
+  const text = spanText(value);
   const [from, to] = spanBounds(value);
   const len = to - from;
   const oldest = useNow() - MAX_AGE;
@@ -570,11 +573,7 @@ export function RangePicker({
           aria-expanded={open}
           title="Pick dates and times"
         >
-          {fixed
-            ? spanLabel(from, to)
-            : preset
-              ? "Custom…"
-              : `Last ${duration(len)}`}
+          {preset ? "Custom…" : text.charAt(0).toUpperCase() + text.slice(1)}
         </button>
       </Segmented>
       {open && (

@@ -1,12 +1,11 @@
 import { Link } from "react-router";
 import { useRoaming } from "../api";
 import type { Roaming } from "../api";
-import { useNow } from "../format";
+import { pct, spanText, useNow } from "../format";
 import { RangePicker, useTimeSpan } from "./Chart";
 import { ConnHead, RoamRow, roamId } from "./Connections";
 import { QueryState, Signal, Stat } from "./common";
 import { stableKeys } from "./keys";
-import { spanText } from "./insights/shared";
 
 /** Same colours as the official roaming map: green above 67 %, orange above 33 %. */
 const healthTone = (pct: number) =>
@@ -55,14 +54,14 @@ function Summary({ data }: { data: Roaming }) {
         label="Successful"
         value={
           <span className={healthTone((100 * ok) / n)}>
-            {Math.round((100 * ok) / n)}%
+            {pct((100 * ok) / n)}
           </span>
         }
         sub={`${n - ok} failed`}
       />
       <Stat
         label="Fast roaming (802.11r)"
-        value={`${Math.round((100 * fast) / n)}%`}
+        value={pct((100 * fast) / n)}
         sub={`${fast} of ${n}`}
       />
       <Stat
