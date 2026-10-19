@@ -22,7 +22,11 @@ pub struct Decoded {
 
 /// Decrypts a packet, trying the device's key first and then the factory default key.
 pub fn decode(body: &[u8], keys: &KeyStore, mac_hint: Option<Mac>) -> Result<Decoded> {
-    let pkt = Packet::parse(body)?;
+    decode_packet(Packet::parse(body)?, keys, mac_hint)
+}
+
+/// [`decode`] for a packet already split.
+pub fn decode_packet(pkt: Packet<'_>, keys: &KeyStore, mac_hint: Option<Mac>) -> Result<Decoded> {
     let flags = pkt.header.flags;
     let encrypted = flags.contains(Flags::ENCRYPTED);
     // An unencrypted packet needs no key; otherwise the device's (by the header's MAC,
