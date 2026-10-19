@@ -1,14 +1,15 @@
 import { useState } from "react";
-import { adoptAp, adoptOverSsh, keys, useAdoption, useCanEdit } from "../api";
+import { adoptAp, adoptOverSsh, keys, useAdoption } from "../api";
 import { ago, useNow } from "../format";
 import { Outcome, useRunner } from "./common";
 import { Row, TextInput } from "./settings/form";
 
-/** APs waiting for adoption, and adopting one by IP over SSH (active mode). */
+/**
+ * APs waiting for adoption, and adopting one by IP over SSH (active mode).
+ * The Overview shows (and so loads) it only to those who can edit.
+ */
 export function AdoptionPanel() {
-  const canEdit = useCanEdit();
-  // Read-only users never see the panel, so don't fetch (or poll) for them.
-  const a = useAdoption(canEdit);
+  const a = useAdoption();
   const now = useNow();
   const [form, setForm] = useState(false);
   const [ip, setIp] = useState("");
@@ -16,7 +17,7 @@ export function AdoptionPanel() {
   const [pass, setPass] = useState("");
   // Event lists refetch when the adoption's events arrive.
   const { busy, msg, run } = useRunner([keys.adoption(), keys.devices()]);
-  if (!a.data || !a.data.active || !canEdit) return null;
+  if (!a.data || !a.data.active) return null;
   const d = a.data;
   const nothing = d.pending.length === 0 && d.adopting.length === 0;
   return (
