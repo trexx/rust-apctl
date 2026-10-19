@@ -150,6 +150,15 @@ fn doc_by_id_mut<'a>(state: &'a mut Value, collection: &str, id: &str) -> Option
     docs_mut(state, collection).find(|d| oid(d) == Some(id))
 }
 
+/// Removes the site's document of a collection with this id (another site's
+/// with the same id stays).
+fn remove_doc(state: &mut Value, collection: &str, id: &str) {
+    let site = site_id(state).map(str::to_string);
+    if let Some(list) = state.get_mut(collection).and_then(Value::as_array_mut) {
+        list.retain(|d| !in_site(site.as_deref(), d) || oid(d) != Some(id));
+    }
+}
+
 /// The id of the site's document of a collection the official controller
 /// marks with this `attr_hidden_id` (the default AP group, user group, LAN).
 fn hidden_doc_id(state: &Value, collection: &str, hidden: &str) -> Option<String> {
@@ -1437,7 +1446,7 @@ pub fn delete_wlan(state: &mut Value, id: &str) -> Result<String, String> {
     }
     let released = if w["iot_channel_lock"].as_bool() == Some(true) { deployed_to(state, w) } else { Vec::new() };
     let mut what = format!("deleted SSID \"{}\"", w["name"].as_str().unwrap_or("?"));
-    array_mut(state, "wlanconf").retain(|x| oid(x) != Some(id));
+    remove_doc(state, "wlanconf", id);
     prune_groups(state);
     let channels = apply_channel_locks(state, &released, None);
     if !channels.is_empty() {
@@ -2264,6 +2273,11 @@ mod tests {
         edit(&mut s, json!({ "aps": [AP1] })).unwrap();
         edit(&mut s, json!({ "aps": null })).unwrap();
         assert_eq!(s["apgroup"].as_array().unwrap().iter().filter_map(oid).collect::<Vec<_>>(), ["g0", "g9"]);
+        // Deleting this site's SSID leaves another site's with the same id.
+        let mut t = s.clone();
+        t["wlanconf"].as_array_mut().unwrap().push(json!({ "_id": "w1", "site_id": "s2", "name": "Twin" }));
+        delete_wlan(&mut t, "w1").unwrap();
+        assert_eq!(t["wlanconf"].as_array().unwrap().iter().filter_map(|w| w["name"].as_str()).collect::<Vec<_>>(), ["Elsewhere", "Twin"]);
         // A client's entry in another site is not this site's.
         let c1: inform::Mac = "aa:bb:cc:00:00:01".parse().unwrap();
         assert!(!crate::actions::controls(Some(&s), &c1).blocked);
@@ -2351,7 +2365,7 @@ pub fn apply_usergroup(state: &mut Value, e: &GroupEdit) -> Result<String, Strin
         if !users.is_empty() {
             return Err(format!("still used by {}", users.join(", ")));
         }
-        array_mut(state, "usergroup").retain(|x| oid(x) != Some(id.as_str()));
+        remove_doc(state, "usergroup", &id);
         return Ok(format!("deleted speed limit \"{}\"", g["name"].as_str().unwrap_or("?")));
     }
     let p = &e.patch;
