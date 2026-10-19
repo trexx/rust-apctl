@@ -17,6 +17,7 @@ import {
   pct,
   pct1,
   rate,
+  toneClass,
 } from "../format";
 import type { Tone } from "../format";
 
@@ -31,7 +32,7 @@ type NumericKey<T> = {
   [K in keyof T]: T[K] extends number | null ? K : never;
 }[keyof T];
 
-/** Lower edges of the signal buckets, strongest first, with the colour of `signalClass`. */
+/** Lower edges of the signal buckets, strongest first, with the tone of `signalTone`. */
 const SIGNAL_BUCKETS: [number, string, Tone][] = [
   [SIGNAL.excellent, "Excellent", "good"],
   [SIGNAL.good, "Good", "good"],
@@ -148,7 +149,7 @@ export function RadioPanel({
         <dt>Multicast / broadcast</dt>
         <dd>
           <span
-            className={`tone-${multicastTone(mcastShare)}`}
+            className={toneClass(multicastTone(mcastShare))}
             title="Share of all packets on this radio"
           >
             {pct1(mcastShare)} of packets

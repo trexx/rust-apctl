@@ -13,6 +13,7 @@ import {
   bytes,
   pct1,
   retryTone,
+  toneClass,
   useNow,
 } from "../format";
 import { ApSpacing } from "../components/insights/ApSpacing";
@@ -308,7 +309,7 @@ function RadioTable({ radios }: { radios: RadioOverview[] }) {
                     ? "—"
                     : `${r.avg_interference.toFixed(0)}%`}
                 </td>
-                <td className={retryTone(r.tx_retry_pct)}>
+                <td className={toneClass(retryTone(r.tx_retry_pct))}>
                   {pct1(r.tx_retry_pct)}
                 </td>
                 <td className="nowrap">

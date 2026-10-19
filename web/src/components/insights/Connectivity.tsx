@@ -1,5 +1,5 @@
 import { useConnectivity } from "../../api";
-import { stageTone } from "../../format";
+import { stageTone, toneClass } from "../../format";
 import { useTimeSpan } from "../Chart";
 import { BandInsight } from "./shared";
 
@@ -28,7 +28,7 @@ export function Connectivity() {
               {STAGES.map(([k, label]) => (
                 <div
                   key={k}
-                  className={`stage-bar fill-${stageTone(d[k])}`}
+                  className={`stage-bar ${toneClass(stageTone(d[k]), "fill")}`}
                   title={`${d[k] ?? 0}% of clients got past ${label}`}
                 >
                   {label}
@@ -36,7 +36,7 @@ export function Connectivity() {
               ))}
               <div className="stage-success">
                 Success{" "}
-                <b className={`tone-${stageTone(d.success_pct)}`}>
+                <b className={toneClass(stageTone(d.success_pct))}>
                   {d.success_pct ?? 0}%
                 </b>
               </div>

@@ -18,7 +18,8 @@ import {
   duration,
   loadTone,
   sameDay,
-  signalClass,
+  signalTone,
+  toneClass,
   useNow,
 } from "../format";
 import type { Tone } from "../format";
@@ -49,7 +50,7 @@ export function Dot(p: { ok: boolean } | { tone: Tone }) {
 
 export function Signal({ dbm }: { dbm: number | null | undefined }) {
   return (
-    <span className={`tone-${signalClass(dbm)}`}>
+    <span className={toneClass(signalTone(dbm))}>
       {dbm === null || dbm === undefined ? "—" : `${Math.round(dbm)} dBm`}
     </span>
   );

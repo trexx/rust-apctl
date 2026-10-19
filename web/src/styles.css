@@ -796,14 +796,6 @@ input.search {
 .nowrap {
   white-space: nowrap;
 }
-td.warn {
-  color: var(--warn);
-  font-weight: 600;
-}
-td.bad {
-  color: var(--bad);
-  font-weight: 600;
-}
 .suggest {
   color: var(--accent);
 }

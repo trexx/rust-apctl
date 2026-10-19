@@ -156,15 +156,18 @@ export const pct1 = (v: number | null | undefined) => (v === null || v === undef
 /** The tone a level is shown in: good, needing attention, or bad (styles.css's `tone-*` text and `fill-*` fills). */
 export type Tone = "good" | "warn" | "bad";
 
+/** The class that shows a tone as text (`tone-*`) or as a fill (`fill-*`); none for "" (no tone). */
+export const toneClass = (t: Tone | "", as: "tone" | "fill" = "tone") => (t ? `${as}-${t}` : "");
+
 /**
  * Client signal levels (dBm) commonly used for Wi-Fi: at least `good` is good
  * (at least `excellent` excellent), at least `fair` is fair, below it poor.
  */
 export const SIGNAL = { excellent: -60, good: -65, fair: -75 } as const;
 
-/** A signal's tone: fair is "warn", poor "bad", and "none" when it isn't known. */
-export function signalClass(dbm: number | null | undefined): Tone | "none" {
-  if (dbm === null || dbm === undefined) return "none";
+/** A signal's tone: fair is "warn", poor "bad", and "" when it isn't known. */
+export function signalTone(dbm: number | null | undefined): Tone | "" {
+  if (dbm === null || dbm === undefined) return "";
   if (dbm >= SIGNAL.good) return "good";
   if (dbm >= SIGNAL.fair) return "warn";
   return "bad";
