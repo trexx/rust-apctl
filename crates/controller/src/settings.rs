@@ -779,18 +779,22 @@ fn check_mdns_rules(state: &Value, v: &Value) -> Result<Vec<Value>, String> {
             _ => {}
         }
         if services == "specific" {
-            let mut codes: Vec<String> = Vec::new();
+            let mut codes: Vec<&str> = Vec::new();
             for c in r["predefined_services"].as_array().into_iter().flatten() {
                 let code = c["code"].as_str().or(c.as_str()).unwrap_or("");
                 if !apcfg::MDNS_SERVICES.iter().any(|(k, _, _)| *k == code) {
                     return Err(format!("mDNS rule {n}: {code} is not a known service"));
                 }
-                if !codes.iter().any(|x| x == code) {
-                    codes.push(code.to_string());
-                }
+                codes.push(code);
+            }
+            dedup_in_order(&mut codes);
+            let custom_list = r["custom_services"].as_array().map_or(&[][..], Vec::as_slice);
+            // apctl's own bound (the official controller sets none), as for the rules.
+            if custom_list.len() > 32 {
+                return Err(format!("mDNS rule {n}: at most 32 custom services"));
             }
             let mut custom = Vec::new();
-            for c in r["custom_services"].as_array().into_iter().flatten() {
+            for c in custom_list {
                 let address = c["address"].as_str().unwrap_or("").trim();
                 let parts: Vec<&str> = address.split('.').collect();
                 let ok = parts.len() == 3
@@ -1952,6 +1956,8 @@ mod tests {
         assert!(bad(json!({ "services_mode": "specific", "custom_services": [{ "address": "myapp.local" }] })));
         assert!(bad(json!({ "services_mode": "specific" })), "no services chosen");
         assert!(bad(json!({ "ap_scope_mode": "specific", "ap_macs": ["02:00:00:00:00:99"] })), "unknown AP");
+        let many: Vec<Value> = (0..33).map(|i| json!({ "address": format!("_app{i}._tcp.local") })).collect();
+        assert!(bad(json!({ "services_mode": "specific", "custom_services": many })), "33 custom services");
         edit(&mut s, json!({ "mdns_proxy_mode": "auto" })).unwrap();
     }
 
