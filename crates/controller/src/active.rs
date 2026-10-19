@@ -22,7 +22,7 @@
 
 use std::collections::HashMap;
 use std::net::IpAddr;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 
 use axum::body::Bytes;
@@ -120,6 +120,8 @@ pub struct Active {
     strangers: Gate,
     /// Reverse proxies whose X-Forwarded-For is believed for the AP's address.
     proxies: Arc<crate::auth::Proxies>,
+    /// Set once "no settings imported" has been logged as a warning.
+    warned_no_state: AtomicBool,
 }
 
 /// A semaphore for informs that holds only so much waiting: an inform that
@@ -261,7 +263,7 @@ impl Active {
         let cpus = std::thread::available_parallelism().map_or(4, |n| n.get());
         let active = Active {
             live, keys, engine, writer, controller, devices, store: store.clone(), adoption_cfgs,
-            work: Gate::new(cpus, 64 << 20), strangers: Gate::new((cpus / 2).max(1), 8 << 20), proxies,
+            work: Gate::new(cpus, 64 << 20), strangers: Gate::new((cpus / 2).max(1), 8 << 20), proxies, warned_no_state: AtomicBool::new(false),
         };
         // Rows holding the rendered config (with its secrets) get its digest instead.
         if !legacy.is_empty() {
@@ -391,7 +393,11 @@ impl Active {
             return cmd;
         }
         let Some(state) = state else {
-            tracing::warn!("{mac}: no settings imported, replying noop");
+            if self.warned_no_state.swap(true, Ordering::Relaxed) {
+                tracing::debug!("{mac}: no settings imported, replying noop");
+            } else {
+                tracing::warn!("{mac}: no settings imported, replying noop to every AP until some are");
+            }
             return noop(interval(mac, n_devices));
         };
         if self.collect_radios(ts, mac, &state, payload) {
