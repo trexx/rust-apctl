@@ -10,7 +10,7 @@ use crate::{Cap, Ctx};
 use crate::cfg::{Cfg, Prefix};
 use crate::json::{flag, int_of, oid, str_of};
 use crate::meta::Meta;
-use crate::wlan::{Radio, Vap, dynamic_vlan, tagged_vlan, vlan_id};
+use crate::wlan::{Radio, Vap, dynamic_vlan, network_vlan, vlan_id};
 
 pub struct Bridge {
     pub name: String,
@@ -36,7 +36,7 @@ pub fn wlan_vlan(ctx: &Ctx, w: &Value) -> Option<u16> {
     if matches!(str_of(w, "security"), Some("wpaeap")) && dynamic_vlan(ctx, w) != 0 {
         return None;
     }
-    if let Some(vlan) = str_of(w, "networkconf_id").and_then(|id| ctx.network(id)).and_then(tagged_vlan) {
+    if let Some(vlan) = network_vlan(ctx, str_of(w, "networkconf_id")) {
         return Some(vlan);
     }
     if flag(w, "vlan_enabled", false) {

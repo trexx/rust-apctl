@@ -403,7 +403,7 @@ pub fn network_vlan(ctx: &Ctx, network_id: Option<&str>) -> Option<u16> {
 }
 
 /// The VLAN a network document tags its traffic with, if it is tagged.
-pub fn tagged_vlan(network: &Value) -> Option<u16> {
+fn tagged_vlan(network: &Value) -> Option<u16> {
     b(network, "vlan_enabled").then(|| int_of(network, "vlan").unwrap_or(2)).and_then(vlan_id)
 }
 
