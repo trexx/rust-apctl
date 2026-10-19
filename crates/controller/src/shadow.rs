@@ -9,7 +9,7 @@ use std::io::Read;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::time::Duration;
 
 use tokio::sync::mpsc;
@@ -126,6 +126,23 @@ fn run_command(cmd: &str, ports: &[u16], syslog_port: u16, keys: &KeyStore, tx: 
     result.unwrap_or_else(|_| Err(anyhow::anyhow!("the capture reader panicked")))
 }
 
+/// A capture's input that ends at the next read once `stop` is set.
+struct Until<'a, R> {
+    input: R,
+    stop: &'a AtomicBool,
+}
+
+impl<R: Read> Read for Until<'_, R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if self.stop.load(Ordering::Relaxed) {
+            return Ok(0);
+        }
+        self.input.read(buf)
+    }
+}
+
+/// Reads one capture into the engine. Once the engine is gone, the capture
+/// ends (a live one would otherwise be read for ever) with an error.
 fn run_once<R: Read + Send>(
     input: R,
     ports: &[u16],
@@ -136,10 +153,21 @@ fn run_once<R: Read + Send>(
 ) -> anyhow::Result<()> {
     let mut pairer = Pairer::default();
     let mut last_tick = 0;
-    let end = capture::run_with_udp(input, ports, &[syslog_port], |event| {
+    let stop = AtomicBool::new(false);
+    // Blocks when the engine is behind, which back-pressures the capture.
+    let send = |input: Input| {
+        if tx.blocking_send(input).is_err() {
+            stop.store(true, Ordering::Relaxed);
+        }
+    };
+    let end = capture::run_with_udp(Until { input, stop: &stop }, ports, &[syslog_port], |event| {
+        // What is left of the reader's buffer is not decoded for nothing.
+        if stop.load(Ordering::Relaxed) {
+            return;
+        }
         // AP syslog sent to the other controller's address.
         if let capture::HttpEvent::Datagram { ts, src, payload, .. } = event {
-            let _ = tx.blocking_send(Input::Datagram { ts: ts / 1_000_000, src_ip: src.ip().to_string(), payload });
+            send(Input::Datagram { ts: ts / 1_000_000, src_ip: src.ip().to_string(), payload });
             return;
         }
         // A message the decoder cannot cope with is skipped, not the whole capture:
@@ -173,13 +201,16 @@ fn run_once<R: Read + Send>(
             InformEvent::Reply { .. } => None,
         };
         if let Some(input) = input {
-            // Blocks when the engine is behind, which back-pressures the capture.
-            let _ = tx.blocking_send(input);
+            send(input);
         }
         if let Some(tick) = tick {
-            let _ = tx.blocking_send(tick);
+            send(tick);
         }
-    })?;
+    });
+    if stop.load(Ordering::Relaxed) {
+        anyhow::bail!("the engine has stopped");
+    }
+    let end = end?;
     if end == capture::End::Truncated {
         tracing::warn!("the shadow capture ends in the middle of a packet (truncated?); ignoring the rest");
     }
@@ -203,5 +234,45 @@ mod tests {
         assert_eq!(clock.now(), None);
         clock.reset();
         assert!(clock.now().is_some());
+    }
+
+    /// An endless live capture: a pcap header, then the same syslog datagram for ever.
+    struct Endless {
+        data: Vec<u8>,
+        /// Where the record starts in `data`, and how far it has been read.
+        record: usize,
+        at: usize,
+        served: usize,
+    }
+
+    impl Read for Endless {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            // Read this far, the capture was not stopped.
+            assert!(self.served < 64 << 20, "the capture is still being read");
+            if self.at == self.data.len() {
+                self.at = self.record;
+            }
+            let n = buf.len().min(self.data.len() - self.at);
+            buf[..n].copy_from_slice(&self.data[self.at..self.at + n]);
+            (self.at, self.served) = (self.at + n, self.served + n);
+            Ok(n)
+        }
+    }
+
+    #[test]
+    fn a_live_capture_stops_once_the_engine_is_gone() {
+        use wire::synth::{Endpoint, udp_frame, write_pcap_header, write_pcap_record};
+        let (ap, controller) = (Endpoint { mac: [2, 0, 0, 0, 0, 1], ip: [192, 0, 2, 10], port: 40000 }, Endpoint { mac: [2, 0, 0, 0, 0, 2], ip: [192, 0, 2, 1], port: 5514 });
+        let mut data = Vec::new();
+        write_pcap_header(&mut data, 65535).unwrap();
+        let record = data.len();
+        write_pcap_record(&mut data, 1_000_000, &udp_frame(ap, controller, b"<14>hostapd: hello").unwrap()).unwrap();
+        let (tx, rx) = mpsc::channel(4);
+        drop(rx);
+        let mut input = Endless { data, record, at: 0, served: 0 };
+        let err = run_once(&mut input, &[8080], 5514, &KeyStore::default(), &tx, &Clock::default()).unwrap_err();
+        assert!(err.to_string().contains("the engine has stopped"), "{err:#}");
+        // It ends within a buffer or so of the first send that failed.
+        assert!(input.served <= 4 << 20, "{} bytes read", input.served);
     }
 }
