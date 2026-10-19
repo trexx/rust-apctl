@@ -2364,18 +2364,18 @@ fn rate(v: &Value, what: &str) -> Result<i64, String> {
     }
 }
 
-/// Who uses each user group (by id): SSID and client names, read in one pass.
+/// What uses a user group: its id, and "SSID x" / "client y" (SSIDs first).
+fn group_uses(state: &Value) -> impl Iterator<Item = (&str, String)> {
+    let ssids = docs(state, "wlanconf").filter_map(|w| Some((w["usergroup_id"].as_str()?, format!("SSID {}", w["name"].as_str().unwrap_or("?")))));
+    let clients = docs(state, "clients").filter_map(|c| Some((c["usergroup_id"].as_str()?, format!("client {}", client_label(c)))));
+    ssids.chain(clients)
+}
+
+/// Who uses each user group (by id), read in one pass.
 fn group_users(state: &Value) -> HashMap<&str, Vec<String>> {
     let mut out: HashMap<&str, Vec<String>> = HashMap::new();
-    for w in docs(state, "wlanconf") {
-        if let Some(id) = w["usergroup_id"].as_str() {
-            out.entry(id).or_default().push(format!("SSID {}", w["name"].as_str().unwrap_or("?")));
-        }
-    }
-    for c in docs(state, "clients") {
-        if let Some(id) = c["usergroup_id"].as_str() {
-            out.entry(id).or_default().push(format!("client {}", client_label(c)));
-        }
+    for (id, user) in group_uses(state) {
+        out.entry(id).or_default().push(user);
     }
     out
 }
@@ -2390,19 +2390,20 @@ pub struct GroupEdit {
 /// Creates, edits or deletes a user group.
 pub fn apply_usergroup(state: &mut Value, e: &GroupEdit) -> Result<String, String> {
     ensure_default_usergroup(state);
-    let id = e.id.clone();
+    let id = e.id.as_deref();
     if e.delete {
         let id = id.ok_or("which speed limit?")?;
-        let g = doc_by_id(state, "usergroup", &id).ok_or("unknown speed limit")?.clone();
+        let g = doc_by_id(state, "usergroup", id).ok_or("unknown speed limit")?;
         if g["attr_no_delete"].as_bool() == Some(true) {
             return Err("the default speed limit cannot be deleted".into());
         }
-        let users = group_users(state).remove(id.as_str()).unwrap_or_default();
+        let what = format!("deleted speed limit \"{}\"", g["name"].as_str().unwrap_or("?"));
+        let users: Vec<String> = group_uses(state).filter(|(g, _)| *g == id).map(|(_, user)| user).collect();
         if !users.is_empty() {
             return Err(format!("still used by {}", users.join(", ")));
         }
-        remove_doc(state, "usergroup", &id);
-        return Ok(format!("deleted speed limit \"{}\"", g["name"].as_str().unwrap_or("?")));
+        remove_doc(state, "usergroup", id);
+        return Ok(what);
     }
     let p = &e.patch;
     let name = p["name"].as_str().map(str::trim);
@@ -2412,11 +2413,11 @@ pub fn apply_usergroup(state: &mut Value, e: &GroupEdit) -> Result<String, Strin
     let down = if p["qos_rate_max_down"].is_null() { None } else { Some(rate(&p["qos_rate_max_down"], "download")?) };
     let up = if p["qos_rate_max_up"].is_null() { None } else { Some(rate(&p["qos_rate_max_up"], "upload")?) };
     if let Some(n) = name
-        && docs(state, "usergroup").any(|g| g["name"].as_str() == Some(n) && oid(g) != id.as_deref())
+        && docs(state, "usergroup").any(|g| g["name"].as_str() == Some(n) && oid(g) != id)
     {
         return Err(format!("another speed limit is called \"{n}\""));
     }
-    let (g, created) = match &id {
+    let (g, created) = match id {
         Some(id) => (doc_by_id_mut(state, "usergroup", id).ok_or("unknown speed limit")?, false),
         None => {
             let n = name.ok_or("the new speed limit needs a name")?;
