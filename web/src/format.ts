@@ -112,17 +112,18 @@ export function useNow(ms = 60_000): number {
   return useSyncExternalStore(t.subscribe, t.read);
 }
 
-/** A rate in bits per second. */
-export function rate(bps: number): string {
-  const units = ["bps", "kbps", "Mbps", "Gbps"];
-  let v = bps;
+/** `v` in the largest of `units` (each `step` times the one before) it reaches: "1.5 MB", "120 kbps", "950 B". */
+function scaled(v: number, step: number, units: readonly string[]): string {
   let i = 0;
-  while (v >= 1000 && i < units.length - 1) {
-    v /= 1000;
+  while (v >= step && i < units.length - 1) {
+    v /= step;
     i++;
   }
   return `${v >= 100 || i === 0 ? v.toFixed(0) : v.toFixed(1)} ${units[i]}`;
 }
+
+/** A rate in bits per second. */
+export const rate = (bps: number) => scaled(bps, 1000, ["bps", "kbps", "Mbps", "Gbps"]);
 
 /** PHY rate reported in kbps. */
 export function phy(kbps: number | null | undefined): string {
@@ -136,17 +137,8 @@ export const rates = (s: { tx_rate: number | null; rx_rate: number | null }) => 
 /** A client's Wi-Fi standard and spatial streams, "802.11ax 2×2", or "—" when unknown. */
 export const wifiText = (s: { wifi_gen: string | null; nss: number | null }) => (s.wifi_gen ? `802.11${s.wifi_gen}${s.nss ? ` ${s.nss}×${s.nss}` : ""}` : "—");
 
-export function bytes(n: number | null | undefined): string {
-  if (n === null || n === undefined) return "—";
-  const units = ["B", "KB", "MB", "GB", "TB"];
-  let v = n;
-  let i = 0;
-  while (v >= 1024 && i < units.length - 1) {
-    v /= 1024;
-    i++;
-  }
-  return `${v >= 100 || i === 0 ? v.toFixed(0) : v.toFixed(1)} ${units[i]}`;
-}
+/** A size in bytes, in units of 1024. */
+export const bytes = (n: number | null | undefined) => (n === null || n === undefined ? "—" : scaled(n, 1024, ["B", "KB", "MB", "GB", "TB"]));
 
 export const pct = (v: number | null | undefined) => (v === null || v === undefined ? "—" : `${Math.round(v)}%`);
 
