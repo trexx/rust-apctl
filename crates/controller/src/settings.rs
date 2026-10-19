@@ -701,17 +701,19 @@ fn set_wlan_aps(state: &mut Value, id: &str, aps: Option<Vec<inform::Mac>>) -> R
             if let Some(m) = macs.iter().find(|m| !known.contains(m)) {
                 return Err(format!("{m} is not one of the APs"));
             }
-            let gid = match &own {
-                Some(g) => g.clone(),
+            let gid = match own {
+                Some(g) => {
+                    if let Some(d) = doc_by_id_mut(state, "apgroup", &g) {
+                        d["device_macs"] = json!(macs);
+                    }
+                    g
+                }
                 None => {
                     let g = new_id();
-                    push_doc(state, "apgroup", json!({ "_id": g, "name": "devices_ap_group", "for_wlanconf": true, "attr_no_delete": false, "device_macs": [] }));
+                    push_doc(state, "apgroup", json!({ "_id": g, "name": "devices_ap_group", "for_wlanconf": true, "attr_no_delete": false, "device_macs": macs }));
                     g
                 }
             };
-            if let Some(g) = doc_by_id_mut(state, "apgroup", &gid) {
-                g["device_macs"] = json!(macs);
-            }
             let w = find_wlan(state, id).ok_or("unknown SSID")?;
             w["ap_group_mode"] = json!("devices");
             w["ap_group_ids"] = json!([gid]);
