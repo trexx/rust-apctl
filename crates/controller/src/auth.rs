@@ -168,7 +168,7 @@ impl Auth {
     }
 
     pub(crate) fn create(&self, user: &str) -> String {
-        let token = crate::random_hex(32);
+        let token = crate::random_hex::<32>();
         let now = clock::now_ts();
         let session = Session { user: user.to_string(), expires: now + SESSION_SECS };
         let hash = token_hash(&token);

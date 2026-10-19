@@ -427,7 +427,7 @@ fn reporter_id(store: &store::Store) -> Result<String> {
         Ok(cfg.and_then(|cfg| cfg.lines().find_map(|l| l.strip_prefix("unifi.reporterid=")).map(str::to_string)))
     })?;
     Ok(seen.unwrap_or_else(|| {
-        let h = random_hex(16);
+        let h = random_hex::<16>();
         format!("{}-{}-4{}-a{}-{}", &h[0..8], &h[8..12], &h[13..16], &h[17..20], &h[20..32])
     }))
 }
@@ -439,11 +439,9 @@ pub(crate) fn random_bytes<const N: usize>() -> [u8; N] {
     b
 }
 
-/// `bytes` random bytes, in hex.
-pub(crate) fn random_hex(bytes: usize) -> String {
-    let mut b = vec![0u8; bytes];
-    getrandom::fill(&mut b).expect("system random source");
-    hex::encode(b)
+/// `N` random bytes, in hex.
+pub(crate) fn random_hex<const N: usize>() -> String {
+    hex::encode(random_bytes::<N>())
 }
 
 /// Active mode's servers: STUN (`inform_url`'s host is the address its answers

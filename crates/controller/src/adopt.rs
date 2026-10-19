@@ -251,8 +251,8 @@ pub fn radio_table(state: &Value, payload: &Value) -> Vec<Value> {
 pub fn new_device(state: &Value, payload: &Value, mac: &Mac) -> Value {
     let other = crate::settings::docs(state, "devices").next().unwrap_or(&Value::Null);
     let mut d = json!({
-        "mac": mac.to_string(), "adopted": true, "type": "uap", "x_authkey": crate::random_hex(16), "syslog_key": crate::random_hex(32),
-        "cfgversion": crate::random_hex(8), "config_network": { "type": "dhcp" }, "adopted_at": clock::now_ts(),
+        "mac": mac.to_string(), "adopted": true, "type": "uap", "x_authkey": crate::random_hex::<16>(), "syslog_key": crate::random_hex::<32>(),
+        "cfgversion": crate::random_hex::<8>(), "config_network": { "type": "dhcp" }, "adopted_at": clock::now_ts(),
         "radio_table": radio_table(state, payload),
     });
     fill_from_inform(&mut d, payload);
@@ -304,8 +304,8 @@ fn ap_name(d: &Value, mac: &Mac) -> String {
 /// was sent to the AP under the old one (its Wi-Fi passwords).
 pub fn adopt_device(state: &mut Value, mac: &Mac, payload: &Value) -> Result<String, String> {
     if let Some(d) = device_doc_mut(state, mac) {
-        d["x_authkey"] = json!(crate::random_hex(16));
-        d["syslog_key"] = json!(crate::random_hex(32));
+        d["x_authkey"] = json!(crate::random_hex::<16>());
+        d["syslog_key"] = json!(crate::random_hex::<32>());
         // The key it informed with, which is not this one any more; and the
         // AES-GCM pin, which the reset AP takes up again (as it is cleared by
         // the official controller when an AP informs reset).

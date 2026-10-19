@@ -494,7 +494,7 @@ fn create_of(b: &Backups, src_dir: &Path, kind: Kind, days: i64, names: &[&str])
     let now = clock::now_ts();
     let dir = b.dir();
     fs::create_dir_all(&dir)?;
-    let tmp = dir.join(format!(".tmp-{now}-{}-{}", std::process::id(), crate::random_hex(4)));
+    let tmp = dir.join(format!(".tmp-{now}-{}-{}", std::process::id(), crate::random_hex::<4>()));
     fs::create_dir(&tmp)?;
     // A name no other backup has: the time to the second, then a counter.
     let base = format!("{}{VERSION}-{}", kind.prefix(), stamp(now));
@@ -1187,7 +1187,7 @@ pub struct RestoreBody {
 pub async fn upload(State(s): State<AppState>, body: Body) -> Result<Json<Value>, ApiError> {
     let b = s.backups.clone();
     tokio::fs::create_dir_all(b.staging()).await?;
-    let name = format!("upload-{}-{}.apb", clock::now_ts(), crate::random_hex(4));
+    let name = format!("upload-{}-{}.apb", clock::now_ts(), crate::random_hex::<4>());
     let tmp = receive(body, TempFile(Some(b.staging().join(name)))).await?;
     let res = tokio::task::spawn_blocking(move || {
         let r = stage(&b, tmp.path());

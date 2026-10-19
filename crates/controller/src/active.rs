@@ -182,7 +182,7 @@ type AdoptionCfg = (Weak<Value>, Arc<str>);
 const PLACEHOLDER: &str = "0000000000000000";
 
 fn new_cfgversion() -> String {
-    crate::random_hex(8)
+    crate::random_hex::<8>()
 }
 
 /// A reply's `server_time_in_utc`: milliseconds, as a string.
