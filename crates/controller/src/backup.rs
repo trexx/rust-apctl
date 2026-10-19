@@ -914,6 +914,14 @@ impl Default for Settings {
     }
 }
 
+/// How much history a backup can hold.
+fn valid_days(days: i64) -> Result<(), String> {
+    if !(-1..=365).contains(&days) {
+        return Err("history must be -1 (all), 0 (settings only) or 1-365 days".into());
+    }
+    Ok(())
+}
+
 impl Settings {
     fn validate(&self) -> Result<(), String> {
         if self.minute_utc >= 1440 || self.weekday > 6 || !(1..=28).contains(&self.monthday) {
@@ -922,10 +930,7 @@ impl Settings {
         if !(1..=100).contains(&self.keep) {
             return Err("keep between 1 and 100 backups".into());
         }
-        if self.days < -1 || self.days > 365 {
-            return Err("history must be -1 (all), 0 (settings only) or 1-365 days".into());
-        }
-        Ok(())
+        valid_days(self.days)
     }
 
     /// Whether a backup is scheduled on this day (days since 1970-01-01, UTC).
@@ -1085,9 +1090,7 @@ pub struct CreateBody {
 
 /// POST /api/backups: make a backup now.
 pub async fn create_now(State(s): State<AppState>, Json(body): Json<CreateBody>) -> Result<Json<Value>, ApiError> {
-    if !(-1..=365).contains(&body.days) {
-        return Err(ApiError::bad("history must be -1, 0 or 1-365 days"));
-    }
+    valid_days(body.days).map_err(ApiError::bad)?;
     let b = s.backups.clone();
     let dir = b.data_dir.clone();
     let writer = s.writer.clone();
