@@ -249,7 +249,7 @@ pub struct McastCounts {
 
 impl McastCounts {
     fn parse(v: &Value) -> McastCounts {
-        let n = |k: &str| v[k].as_i64().unwrap_or(0);
+        let n = |k: &str| int(&v[k]).unwrap_or(0);
         McastCounts { tx_pkts: n("tx_pkts"), tx_bytes: n("tx_bytes"), rx_pkts: n("rx_pkts"), rx_bytes: n("rx_bytes") }
     }
 
@@ -299,7 +299,7 @@ impl Multicast {
             .into_iter()
             .flatten()
             .filter_map(|g| {
-                Some(McastGroup { group_ip: g["group_ip"].as_str()?.to_string(), dst_port: g["dst_port"].as_i64(), kind: string(&g["type"]), counts: McastCounts::parse(g) })
+                Some(McastGroup { group_ip: g["group_ip"].as_str()?.to_string(), dst_port: int(&g["dst_port"]), kind: string(&g["type"]), counts: McastCounts::parse(g) })
             })
             .collect();
         let memberships = v["memberships"].as_array().into_iter().flatten().filter_map(|m| m["group_ip"].as_str().map(str::to_string)).collect();
@@ -307,7 +307,7 @@ impl Multicast {
             .as_array()
             .into_iter()
             .flatten()
-            .filter_map(|x| Some(McastService { name: x["name"].as_str()?.to_string(), pkts: x["pkts"].as_i64().unwrap_or(0), bytes: x["bytes"].as_i64().unwrap_or(0) }))
+            .filter_map(|x| Some(McastService { name: x["name"].as_str()?.to_string(), pkts: int(&x["pkts"]).unwrap_or(0), bytes: int(&x["bytes"]).unwrap_or(0) }))
             .collect();
         Some(Multicast { types, groups, memberships, services })
     }
@@ -361,7 +361,8 @@ pub struct Snapshot {
 fn int(v: &Value) -> Option<i64> {
     match v {
         Value::Number(n) => n.as_i64().or_else(|| n.as_f64().map(|f| f as i64)),
-        Value::String(s) => s.trim().parse::<f64>().ok().map(|f| f as i64),
+        // Exactly when it is an integer (a counter can pass 2^53), else as a decimal.
+        Value::String(s) => s.trim().parse::<i64>().ok().or_else(|| s.trim().parse::<f64>().ok().map(|f| f as i64)),
         _ => None,
     }
 }
@@ -744,6 +745,19 @@ pub(crate) mod tests {
         });
         let s = parse(1000, &p).unwrap();
         assert_eq!((s.vaps[0].bssid.as_str(), s.neighbors[0].bssid.as_str()), ("02:ab:00:00:00:01", "02:cd:00:00:00:01"));
+    }
+
+    #[test]
+    fn numbers_from_the_ap_are_read_leniently_and_exactly() {
+        use serde_json::json;
+        assert_eq!((int(&json!("9007199254740993")), int(&json!(" 3.9 ")), int(&json!(2.5))), (Some(9_007_199_254_740_993), Some(3), Some(2)));
+        let m = Multicast::parse(&json!({
+            "types": { "mdns": { "tx_pkts": "5", "rx_bytes": 7.0 } },
+            "groups": [{ "group_ip": "224.0.0.251", "dst_port": "5353" }],
+            "services": [{ "name": "_googlecast._tcp.local", "pkts": "2" }],
+        }))
+        .unwrap();
+        assert_eq!((m.types["mdns"].tx_pkts, m.types["mdns"].rx_bytes, m.groups[0].dst_port, m.services[0].pkts), (5, 7, Some(5353), 2));
     }
 
     #[test]
