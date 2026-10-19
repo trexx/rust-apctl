@@ -282,6 +282,13 @@ impl Active {
         );
     }
 
+    /// Drops what apctl remembers about an AP it no longer has, in memory and stored.
+    fn unmanage(&self, mac: Mac) {
+        if self.devices.lock().unwrap().remove(&mac).is_some() {
+            self.writer.exec(Db::Config, "DELETE FROM managed_devices WHERE mac = ?1", vec![Sql::Text(mac.to_string())]);
+        }
+    }
+
     fn render(&self, state: &Value, mac: Mac, inform: &Value, cfgversion: &str) -> anyhow::Result<apcfg::Output> {
         let mac_s = mac.to_string();
         let input = apcfg::Input { state, device_mac: &mac_s, inform: Some(inform), cfgversion, controller: &self.controller };
@@ -669,11 +676,12 @@ async fn factory_key_inform(active: &Arc<Active>, ts: Ts, caller: Caller, payloa
         return sealed;
     }
     // Not ours, or ours but reset: answered 404 and listed for adoption.
-    // What apctl remembers about an AP it no longer has (e.g. AES-GCM) goes.
-    // For one it has, the factory key proves nothing (anyone can send this
-    // under its MAC): that is kept until it is adopted again.
+    // What apctl remembers about an AP it no longer has (e.g. AES-GCM) goes,
+    // stored too, so that a restart does not bring it back. For one it has,
+    // the factory key proves nothing (anyone can send this under its MAC):
+    // that is kept until it is adopted again.
     if !known {
-        active.devices.lock().unwrap().remove(&mac);
+        active.unmanage(mac);
     } else if active.live.read().unwrap().devices.get(&mac).is_some_and(|d| ts - d.last_seen < RESET_QUIET_SECS) {
         // It informed with its own key moments ago: a reset AP is silent
         // while it reboots, so this is most likely someone else. Listing
@@ -1514,6 +1522,32 @@ mod tests {
         let mut state = live.state.as_deref().cloned().unwrap();
         crate::adopt::device_doc_mut(&mut state, &AP.parse().unwrap()).unwrap().as_object_mut().unwrap().remove("x_aes_gcm");
         live.state = Some(Arc::new(state));
+    }
+
+    #[tokio::test]
+    async fn a_factory_key_inform_under_a_mac_apctl_no_longer_has_drops_its_stored_record() {
+        let Some(_) = fixtures() else { return };
+        let rig = rig(true, None);
+        let gone = "02:00:00:00:00:77";
+        let w = &rig.active.writer;
+        w.exec(Db::Config, "INSERT INTO managed_devices (mac, cfgversion, content, gcm, updated) VALUES (?1, 'abcdefabcdefabcd', NULL, 1, 0)", vec![Sql::Text(gone.into())]);
+        flushed(w);
+        let restarted = |rig: &Rig| {
+            let (tx, _rx) = mpsc::channel(10);
+            let a = &rig.active;
+            Active::new(&a.store, a.writer.clone(), rig.live.clone(), a.keys.clone(), tx, controller(), Default::default()).unwrap()
+        };
+        let again = Arc::new(restarted(&rig));
+        assert!(again.devices.lock().unwrap().contains_key(&gone.parse().unwrap()));
+        let app = axum::Router::new().route("/inform", axum::routing::post(inform)).with_state(again);
+        let rig = Rig { app, ..rig };
+        let mut stranger = ap_payload("1");
+        stranger["mac"] = json!(gone);
+        let (status, _) = inform_as_ap(&rig, &stranger, DEFAULT_KEY, GCM_ZLIB).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        flushed(&rig.active.writer);
+        // After another restart, nothing of it comes back (its version, its AES-GCM pin).
+        assert!(!restarted(&rig).devices.lock().unwrap().contains_key(&gone.parse().unwrap()));
     }
 
     #[tokio::test]
