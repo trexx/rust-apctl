@@ -1546,7 +1546,9 @@ impl Engine {
     /// The inform's metrics, and its scan results (see `Written`).
     fn write_metrics(&mut self, s: &Snapshot, neighbors: Vec<crate::model::NeighborSample>, spectrum: Vec<crate::model::SpectrumSample>) {
         let ts = s.ap.ts;
-        let mac = || Sql::Text(s.ap.mac.to_string());
+        // Formatted once: nearly every row of the inform carries the AP's MAC.
+        let mac_text = Sql::Text(s.ap.mac.to_string());
+        let mac = || mac_text.clone();
         let a = &s.ap;
         self.writer.send(Write::Metric {
             table: &store::AP,
