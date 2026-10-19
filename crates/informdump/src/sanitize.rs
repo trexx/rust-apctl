@@ -419,35 +419,39 @@ impl Sanitizer {
         self.scrub_ids(out)
     }
 
-    /// Rewrites MACs, UUIDs, long hex and the addresses that say where a network is.
+    /// Rewrites MACs, UUIDs, long hex and the addresses that say where a network is. A
+    /// pass that finds nothing to replace copies nothing.
     fn scrub_ids(&mut self, mut out: String) -> String {
         let fakes = &mut self.fakes;
-        out = replace_all(&self.uuid, &out, |m| fakes.get(Kind::Uuid, &m.to_ascii_lowercase(), |n| format!("00000000-0000-4000-8000-{n:012x}")));
-        out = replace_all(&self.mac, &out, |m| fakes.mac(m));
-        out = replace_all(&self.mac_other, &out, |m| fakes.any_mac(m));
+        if let Some(r) = replace_all(&self.uuid, &out, |m| Some(fakes.get(Kind::Uuid, &m.as_str().to_ascii_lowercase(), |n| format!("00000000-0000-4000-8000-{n:012x}")))) {
+            out = r;
+        }
+        if let Some(r) = replace_all(&self.mac, &out, |m| Some(fakes.mac(m.as_str()))) {
+            out = r;
+        }
+        if let Some(r) = replace_all(&self.mac_other, &out, |m| Some(fakes.any_mac(m.as_str()))) {
+            out = r;
+        }
         // A bare 12-hex string is only treated as a MAC when we already know that MAC
         // (serial numbers on these APs are the MAC without colons).
-        out = replace_all(&self.mac_bare, &out, |m| if fakes.knows_mac(&colon_mac(m)) { fakes.any_mac(m) } else { m.to_string() });
-        out = replace_all(&self.hex, &out, |m| {
+        if let Some(r) = replace_all(&self.mac_bare, &out, |m| fakes.knows_mac(&colon_mac(m.as_str())).then(|| fakes.any_mac(m.as_str()))) {
+            out = r;
+        }
+        if let Some(r) = replace_all(&self.hex, &out, |m| {
             let len = m.len();
-            fakes.get(Kind::Hex, &m.to_ascii_lowercase(), |n| format!("{n:0len$x}"))
-        });
-        out = scrub_ipv6(&self.ipv6, &out, fakes);
+            Some(fakes.get(Kind::Hex, &m.as_str().to_ascii_lowercase(), |n| format!("{n:0len$x}")))
+        }) {
+            out = r;
+        }
+        if let Some(r) = scrub_ipv6(&self.ipv6, &out, fakes) {
+            out = r;
+        }
         // Public IPv4 addresses (the WAN address, the ISP's DNS servers) likewise;
         // private ones say nothing about where the network is.
-        let mut ipv4 = String::with_capacity(out.len());
-        let mut last = 0;
-        for m in self.ipv4.find_iter(&out) {
-            let (a, b) = (m.start(), m.end());
-            if is_public_ipv4(m.as_str()) && !in_longer_dotted(out.as_bytes(), a, b) {
-                ipv4.push_str(&out[last..a]);
-                ipv4.push_str(&fakes.get(Kind::Ipv4, m.as_str(), fake_ipv4));
-                last = b;
-            }
-        }
-        if last > 0 {
-            ipv4.push_str(&out[last..]);
-            out = ipv4;
+        let bytes = out.as_bytes();
+        let public = |m: &regex::Match| is_public_ipv4(m.as_str()) && !in_longer_dotted(bytes, m.start(), m.end());
+        if let Some(r) = replace_all(&self.ipv4, &out, |m| public(&m).then(|| fakes.get(Kind::Ipv4, m.as_str(), fake_ipv4))) {
+            out = r;
         }
         out
     }
@@ -803,10 +807,10 @@ fn colon_mac(bare: &str) -> String {
 /// suffixes such as a DHCPv6 range's `::2`) and multicast groups other than
 /// solicited-node ones (which end in an interface ID's last 24 bits). Link-local ones
 /// are replaced too: their EUI-64 interface ID is the MAC. Times (`12:34:56`) and MACs
-/// match `re` but do not parse as addresses.
-fn scrub_ipv6(re: &Regex, s: &str, fakes: &mut Fakes) -> String {
+/// match `re` but do not parse as addresses. `None` when there was none to replace.
+fn scrub_ipv6(re: &Regex, s: &str, fakes: &mut Fakes) -> Option<String> {
     let bytes = s.as_bytes();
-    let mut out = String::with_capacity(s.len());
+    let mut out: Option<String> = None;
     let mut last = 0;
     for m in re.find_iter(s) {
         let (a, mut b) = (m.start(), m.end());
@@ -831,12 +835,15 @@ fn scrub_ipv6(re: &Regex, s: &str, fakes: &mut Fakes) -> String {
         let link_local = ip.is_unicast_link_local();
         let fake = fakes.get(Kind::Ipv6, &ip.to_string(), |n| if link_local { format!("fe80::db8:{n:x}") } else { format!("2001:db8::{n:x}") });
         fakes.also(Kind::Ipv6, &s[a..b].to_ascii_lowercase(), &fake);
-        out.push_str(&s[last..a]);
-        out.push_str(&fake);
+        let o = out.get_or_insert_with(|| String::with_capacity(s.len()));
+        o.push_str(&s[last..a]);
+        o.push_str(&fake);
         last = b;
     }
-    out.push_str(&s[last..]);
-    out
+    out.map(|mut o| {
+        o.push_str(&s[last..]);
+        o
+    })
 }
 
 /// A plain mDNS service type such as `_googlecast._tcp.local`, with no device ID in it.
@@ -887,16 +894,24 @@ fn in_longer_dotted(text: &[u8], a: usize, b: usize) -> bool {
     matches!(before, [.., d, b'.'] if d.is_ascii_digit()) || matches!(after, [b'.', d, ..] if d.is_ascii_digit())
 }
 
-fn replace_all(re: &Regex, s: &str, mut f: impl FnMut(&str) -> String) -> String {
-    let mut out = String::with_capacity(s.len());
+/// `s` with each match of `re` that `f` gives a replacement for replaced; `None` when
+/// none was.
+fn replace_all(re: &Regex, s: &str, mut f: impl FnMut(regex::Match) -> Option<String>) -> Option<String> {
+    let mut out: Option<String> = None;
     let mut last = 0;
     for m in re.find_iter(s) {
-        out.push_str(&s[last..m.start()]);
-        out.push_str(&f(m.as_str()));
-        last = m.end();
+        let (a, b) = (m.start(), m.end());
+        if let Some(r) = f(m) {
+            let o = out.get_or_insert_with(|| String::with_capacity(s.len()));
+            o.push_str(&s[last..a]);
+            o.push_str(&r);
+            last = b;
+        }
     }
-    out.push_str(&s[last..]);
-    out
+    out.map(|mut o| {
+        o.push_str(&s[last..]);
+        o
+    })
 }
 
 /// Sanitises the named JSON files from `input` into `output`. `keep` names more fields
