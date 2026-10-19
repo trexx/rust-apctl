@@ -186,7 +186,7 @@ fn new_cfgversion() -> String {
 }
 
 /// A reply's `server_time_in_utc`: milliseconds, as a string.
-fn server_time(ts: Ts) -> String {
+pub(crate) fn server_time(ts: Ts) -> String {
     (ts * 1000).to_string()
 }
 

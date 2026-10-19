@@ -362,7 +362,7 @@ pub fn command(jobs: &mut Jobs, mac: &Mac, inform: &Value, now: Ts) -> Option<Re
     if j.from.is_none() {
         j.from = inform["version"].as_str().map(str::to_string);
     }
-    let mut cmd = json!({ "_type": "upgrade", "version": j.target, "url": j.url, "server_time_in_utc": (now * 1000).to_string() });
+    let mut cmd = json!({ "_type": "upgrade", "version": j.target, "url": j.url, "server_time_in_utc": crate::active::server_time(now) });
     if let Some(m) = &j.md5 {
         cmd["md5sum"] = json!(m);
     }
