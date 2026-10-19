@@ -4,8 +4,7 @@ import type { Roaming } from "../api";
 import { pct, roamTone, spanText, useNow } from "../format";
 import { RangePicker, useTimeSpan } from "./Chart";
 import { ConnHead, RoamRow, roamId } from "./Connections";
-import { QueryState, Signal, Stat, THead } from "./common";
-import { stableKeys } from "./keys";
+import { QueryState, Signal, Stat, THead, stableKeys } from "./common";
 
 export function RoamingView() {
   const [span, setSpan] = useTimeSpan(2 * 86400);

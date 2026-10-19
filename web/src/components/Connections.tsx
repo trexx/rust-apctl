@@ -10,8 +10,14 @@ import type {
   Timings,
 } from "../api";
 import { band, clock, useNow } from "../format";
-import { QueryState, Segmented, Signal, THead, sameRow } from "./common";
-import { stableKeys } from "./keys";
+import {
+  QueryState,
+  Segmented,
+  Signal,
+  THead,
+  sameRow,
+  stableKeys,
+} from "./common";
 
 const STAGE_NAME = [
   "",
