@@ -40,3 +40,9 @@ wire = { version = "0.1.0", path = "crates/wire" }
 lto = "thin"
 codegen-units = 1
 strip = true
+
+# Line tables only: backtraces keep file and line, but there are no variables or types
+# for a debugger, which keeps linking light on small machines and CI caches small. For
+# a debugger session: CARGO_PROFILE_DEV_DEBUG=full.
+[profile.dev]
+debug = "line-tables-only"
