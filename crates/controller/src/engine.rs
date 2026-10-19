@@ -5,6 +5,7 @@
 //! shared snapshot (`Live`) and subscribes to a broadcast of changes.
 
 use std::collections::{BTreeMap, HashMap};
+use std::net::IpAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
@@ -31,7 +32,7 @@ const DEFAULT_INTERVAL: Ts = 15;
 pub type StateEdit = Box<dyn FnOnce(&mut Value) -> Result<String, String> + Send>;
 
 pub enum Input {
-    Inform { ts: Ts, peer: String, decoded: Decoded },
+    Inform { ts: Ts, peer: IpAddr, decoded: Decoded },
     /// Replace the imported controller settings (an `informdump import` snapshot).
     SetState { ts: Ts, state: Value },
     /// Active mode: the section numbering a render allocated for an AP.
@@ -159,12 +160,22 @@ pub struct DeviceView {
     pub online: bool,
     pub first_seen: Ts,
     pub last_seen: Ts,
-    pub peer: String,
+    /// The address its last inform came from; none for an AP known from the database only.
+    #[serde(serialize_with = "peer_or_empty")]
+    pub peer: Option<IpAddr>,
     /// Inform interval most recently requested by the controller.
     pub interval: Ts,
     /// Time of the last inform that included the client list.
     pub last_full_inform: Ts,
     pub last_config_push: Option<Ts>,
+}
+
+/// A device view's `peer` as its address, or "" for none.
+fn peer_or_empty<S: serde::Serializer>(peer: &Option<IpAddr>, s: S) -> Result<S::Ok, S::Error> {
+    match peer {
+        Some(ip) => s.collect_str(ip),
+        None => s.serialize_str(""),
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -643,7 +654,7 @@ impl Engine {
         head
     }
 
-    fn inform(&mut self, ts: Ts, peer: String, decoded: Decoded) {
+    fn inform(&mut self, ts: Ts, peer: IpAddr, decoded: Decoded) {
         // Notifications are short informs sent between regular ones: a config
         // acknowledgement or an event (client connection tracking, radar, scans).
         // They carry no client data and must not update the AP's status.
@@ -1776,7 +1787,7 @@ fn lifecycle_events(ts: Ts, a: &crate::model::ApSample, prev: Option<&DeviceView
 
 /// The AP's live view after an inform at `ts`, and the snapshot it replaces
 /// (if whole), for the caller to drop once the lock is released.
-fn device_view(ts: Ts, peer: String, snap: Snapshot, prev: Option<DeviceView>, known: Option<&KnownDevice>) -> (DeviceView, Option<Snapshot>) {
+fn device_view(ts: Ts, peer: IpAddr, snap: Snapshot, prev: Option<DeviceView>, known: Option<&KnownDevice>) -> (DeviceView, Option<Snapshot>) {
     let first_seen = prev.as_ref().map(|p| p.first_seen).or(known.map(|k| k.first_seen)).unwrap_or(ts);
     match prev {
         Some(mut p) => {
@@ -1789,7 +1800,7 @@ fn device_view(ts: Ts, peer: String, snap: Snapshot, prev: Option<DeviceView>, k
                 p.snapshot.ap = snap.ap;
                 None
             };
-            (DeviceView { online: true, first_seen, last_seen: ts, peer, ..p }, old)
+            (DeviceView { online: true, first_seen, last_seen: ts, peer: Some(peer), ..p }, old)
         }
         None => {
             let view = DeviceView {
@@ -1798,7 +1809,7 @@ fn device_view(ts: Ts, peer: String, snap: Snapshot, prev: Option<DeviceView>, k
                 online: true,
                 first_seen,
                 last_seen: ts,
-                peer,
+                peer: Some(peer),
                 interval: DEFAULT_INTERVAL,
                 last_config_push: None,
             };
@@ -1967,7 +1978,7 @@ mod tests {
     fn client_connect_roam_and_disconnect() {
         let mut h = harness();
         let feed = |h: &mut Harness, ts, ap: &str, clients: &[(&str, &str)]| {
-            h.engine.handle(Input::Inform { ts, peer: "10.0.0.1".into(), decoded: decoded(inform(ap, 1000 + ts, clients)) });
+            h.engine.handle(Input::Inform { ts, peer: [10, 0, 0, 1].into(), decoded: decoded(inform(ap, 1000 + ts, clients)) });
         };
         feed(&mut h, 0, AP1, &[(C1, "b1")]);
         feed(&mut h, 1, AP2, &[]);
@@ -1993,15 +2004,25 @@ mod tests {
     }
 
     #[test]
+    fn a_device_views_peer_is_shown_as_its_address() {
+        let mut h = harness();
+        h.engine.handle(Input::Inform { ts: 0, peer: "2001:db8::7".parse().unwrap(), decoded: decoded(inform(AP1, 1000, &[])) });
+        let mut d = h.live.read().unwrap().devices[&AP1.parse().unwrap()].clone();
+        assert_eq!(serde_json::to_value(&d).unwrap()["peer"], "2001:db8::7");
+        d.peer = None;
+        assert_eq!(serde_json::to_value(&d).unwrap()["peer"], "", "known from the database only");
+    }
+
+    #[test]
     fn informs_without_a_client_list_do_not_disconnect_clients() {
         let mut h = harness();
-        h.engine.handle(Input::Inform { ts: 0, peer: "x".into(), decoded: decoded(inform(AP1, 1000, &[(C1, "b1")])) });
+        h.engine.handle(Input::Inform { ts: 0, peer: [10, 0, 0, 1].into(), decoded: decoded(inform(AP1, 1000, &[(C1, "b1")])) });
         events(&mut h);
         // Two minutes of informs that carry no client list (notifications, or any
         // short inform): nothing proves the client left.
         for ts in (5..120).step_by(5) {
             let d = if ts % 10 == 0 { notif(AP1, "event", json!({})) } else { decoded(json!({ "mac": AP1, "uptime": 1000 + ts })) };
-            h.engine.handle(Input::Inform { ts, peer: "x".into(), decoded: d });
+            h.engine.handle(Input::Inform { ts, peer: [10, 0, 0, 1].into(), decoded: d });
             h.engine.handle(Input::Tick(ts));
         }
         let evs = events(&mut h);
@@ -2012,11 +2033,11 @@ mod tests {
     #[test]
     fn an_ap_with_every_network_off_has_no_clients() {
         let mut h = harness();
-        h.engine.handle(Input::Inform { ts: 0, peer: "x".into(), decoded: decoded(inform(AP1, 1000, &[(C1, "b1")])) });
+        h.engine.handle(Input::Inform { ts: 0, peer: [10, 0, 0, 1].into(), decoded: decoded(inform(AP1, 1000, &[(C1, "b1")])) });
         events(&mut h);
         // Every SSID off (e.g. by a schedule): the AP still informs, with an empty VAP table.
         let ts = CLIENT_GRACE_SECS + 5;
-        h.engine.handle(Input::Inform { ts, peer: "x".into(), decoded: decoded(json!({ "mac": AP1, "uptime": 1000 + ts, "vap_table": [] })) });
+        h.engine.handle(Input::Inform { ts, peer: [10, 0, 0, 1].into(), decoded: decoded(json!({ "mac": AP1, "uptime": 1000 + ts, "vap_table": [] })) });
         h.engine.handle(Input::Tick(ts + 1));
         assert_eq!(events(&mut h), vec![("client_disconnected", Some(C1.into()))]);
         let live = h.live.read().unwrap();
@@ -2027,7 +2048,7 @@ mod tests {
 
     #[test]
     fn restart_of_the_controller_does_not_reconnect_everyone() {
-        let feed = |e: &mut Engine, ts| e.handle(Input::Inform { ts, peer: "x".into(), decoded: decoded(inform(AP1, 1000 + ts, &[(C1, "b1")])) });
+        let feed = |e: &mut Engine, ts| e.handle(Input::Inform { ts, peer: [10, 0, 0, 1].into(), decoded: decoded(inform(AP1, 1000 + ts, &[(C1, "b1")])) });
         let mut h = harness();
         feed(&mut h.engine, 0);
         let mut h = h.restarted();
@@ -2039,7 +2060,7 @@ mod tests {
     #[test]
     fn a_long_outage_gives_the_aps_time_to_inform() {
         let mut h = harness();
-        h.engine.handle(Input::Inform { ts: 0, peer: "x".into(), decoded: decoded(inform(AP1, 1000, &[(C1, "b1")])) });
+        h.engine.handle(Input::Inform { ts: 0, peer: [10, 0, 0, 1].into(), decoded: decoded(inform(AP1, 1000, &[(C1, "b1")])) });
         // Back after two hours: the first tick comes before the AP's first inform.
         let mut h = h.restarted();
         h.engine.handle(Input::Tick(7200));
@@ -2057,7 +2078,7 @@ mod tests {
             let mut p = inform(AP1, 1000 + ts, &[(C1, "b1")]);
             p["hostname"] = json!(name);
             p["vap_table"][0]["sta_table"][0]["hostname"] = json!(name);
-            e.handle(Input::Inform { ts, peer: "x".into(), decoded: decoded(p) });
+            e.handle(Input::Inform { ts, peer: [10, 0, 0, 1].into(), decoded: decoded(p) });
         };
         let stored = |sql: &'static str| -> (i64, String) {
             flushed(&h.writer);
@@ -2089,7 +2110,7 @@ mod tests {
             if let Some(signal) = signal {
                 p["radio_table"] = json!([{ "radio": "na", "scan_table": [{ "bssid": "02:cd:00:00:00:01", "signal": signal }] }]);
             }
-            h.engine.handle(Input::Inform { ts, peer: "x".into(), decoded: decoded(p) });
+            h.engine.handle(Input::Inform { ts, peer: [10, 0, 0, 1].into(), decoded: decoded(p) });
         };
         let last_seen = |h: &Harness| -> i64 {
             flushed(&h.writer);
@@ -2253,7 +2274,7 @@ mod tests {
         let sta = |mac: &str, to: i64, from: i64| json!({ "mac": mac, "multicast": { "types": { "mdns": { "tx_pkts": to, "tx_bytes": to * 100, "rx_pkts": from, "rx_bytes": from * 100 } } } });
         let feed = |e: &mut Engine, ts: Ts, to: i64, from: i64| {
             let p = json!({ "mac": AP1, "uptime": 1000 + ts, "vap_table": [{ "bssid": "b1", "radio": "na", "usage": "user", "sta_table": [sta(C1, to, from), sta("02:00:00:00:01:02", to, 0)] }] });
-            e.handle(Input::Inform { ts, peer: "x".into(), decoded: decoded(p) });
+            e.handle(Input::Inform { ts, peer: [10, 0, 0, 1].into(), decoded: decoded(p) });
         };
         feed(&mut h.engine, 0, 100, 0);
         feed(&mut h.engine, 10, 200, 50);
@@ -2274,12 +2295,12 @@ mod tests {
     fn an_isolated_beacon_is_blamed_on_the_nearest_ap() {
         let mut h = harness();
         let (a, b) = ("02:00:00:00:00:10", "02:00:00:00:00:18");
-        h.engine.handle(Input::Inform { ts: 0, peer: "x".into(), decoded: decoded(inform(a, 1000, &[])) });
-        h.engine.handle(Input::Inform { ts: 1, peer: "x".into(), decoded: decoded(inform(b, 1000, &[])) });
+        h.engine.handle(Input::Inform { ts: 0, peer: [10, 0, 0, 1].into(), decoded: decoded(inform(a, 1000, &[])) });
+        h.engine.handle(Input::Inform { ts: 1, peer: [10, 0, 0, 1].into(), decoded: decoded(inform(b, 1000, &[])) });
         // A heard B's BSSID flagged isolated; A's own MAC is within 16 of it too.
         let mut p = inform(a, 1002, &[]);
         p["radio_table"] = json!([{ "radio": "na", "scan_table": [{ "bssid": "02:00:00:00:00:1a", "is_isolated": true, "signal": -70 }] }]);
-        h.engine.handle(Input::Inform { ts: 2, peer: "x".into(), decoded: decoded(p) });
+        h.engine.handle(Input::Inform { ts: 2, peer: [10, 0, 0, 1].into(), decoded: decoded(p) });
         let blamed: Vec<_> = std::iter::from_fn(|| h.rx.try_recv().ok())
             .filter_map(|m| match m { LiveMsg::Event(e) if e.kind == EventKind::ApIsolated => Some(e.device_mac), _ => None })
             .collect();
@@ -2295,7 +2316,7 @@ mod tests {
         h.engine.live.write().unwrap().known_devices.insert(b.parse().unwrap(), known);
         let mut p = inform(a, 1000, &[]);
         p["radio_table"] = json!([{ "radio": "na", "scan_table": [{ "bssid": "02:00:00:00:00:1a", "is_isolated": true, "signal": -70 }] }]);
-        h.engine.handle(Input::Inform { ts: 2, peer: "x".into(), decoded: decoded(p) });
+        h.engine.handle(Input::Inform { ts: 2, peer: [10, 0, 0, 1].into(), decoded: decoded(p) });
         let blamed: Vec<_> = std::iter::from_fn(|| h.rx.try_recv().ok())
             .filter_map(|m| match m { LiveMsg::Event(e) if e.kind == EventKind::ApIsolated => Some(e.device_mac), _ => None })
             .collect();
@@ -2311,7 +2332,7 @@ mod tests {
         let mut e = Engine::new(writer, Default::default(), Default::default(), tx);
         // Twice each, so the second inform's rows are compared with the first's.
         for (ts, name) in [(0, "000001_020000000001_inform"), (1, "000003_020000000002_inform"), (100, "000001_020000000001_inform"), (101, "000003_020000000002_inform")] {
-            e.handle(Input::Inform { ts, peer: "x".into(), decoded: decoded(fixture(name)) });
+            e.handle(Input::Inform { ts, peer: [10, 0, 0, 1].into(), decoded: decoded(fixture(name)) });
         }
         let dir = TestDir::new("fixture-writes");
         assert_eq!(store(&dir).unwrap(), 0);
@@ -2342,7 +2363,7 @@ mod tests {
     fn a_forgotten_ap_leaves_nothing_behind() {
         let mut h = harness();
         let mac: Mac = AP1.parse().unwrap();
-        h.engine.handle(Input::Inform { ts: 0, peer: "x".into(), decoded: decoded(inform(AP1, 1000, &[(C1, "b1")])) });
+        h.engine.handle(Input::Inform { ts: 0, peer: [10, 0, 0, 1].into(), decoded: decoded(inform(AP1, 1000, &[(C1, "b1")])) });
         {
             let mut live = h.live.write().unwrap();
             live.commands.entry(mac).or_default().push_back(json!({ "cmd": "restart" }));
@@ -2369,9 +2390,9 @@ mod tests {
     fn only_a_report_with_clients_announces_the_client_list() {
         let mut h = harness();
         let lists = |h: &mut Harness| std::iter::from_fn(|| h.rx.try_recv().ok()).filter(|m| matches!(m, LiveMsg::Clients)).count();
-        h.engine.handle(Input::Inform { ts: 0, peer: "x".into(), decoded: decoded(inform(AP1, 1000, &[])) });
+        h.engine.handle(Input::Inform { ts: 0, peer: [10, 0, 0, 1].into(), decoded: decoded(inform(AP1, 1000, &[])) });
         assert_eq!(lists(&mut h), 0, "no clients: nothing for the client lists");
-        h.engine.handle(Input::Inform { ts: 10, peer: "x".into(), decoded: decoded(inform(AP1, 1010, &[(C1, "b1")])) });
+        h.engine.handle(Input::Inform { ts: 10, peer: [10, 0, 0, 1].into(), decoded: decoded(inform(AP1, 1010, &[(C1, "b1")])) });
         assert_eq!(lists(&mut h), 1);
     }
 
@@ -2382,7 +2403,7 @@ mod tests {
         let feed = |h: &mut Harness, ts: Ts, version: &str| {
             let mut p = inform(AP1, 1000 + ts, &[]);
             p["version"] = json!(version);
-            h.engine.handle(Input::Inform { ts, peer: "x".into(), decoded: decoded(p) });
+            h.engine.handle(Input::Inform { ts, peer: [10, 0, 0, 1].into(), decoded: decoded(p) });
         };
         feed(&mut h, 0, "6.7.0");
         let job = crate::firmware::Job {
@@ -2405,16 +2426,16 @@ mod tests {
     #[test]
     fn notifications_are_events_not_status() {
         let mut h = harness();
-        h.engine.handle(Input::Inform { ts: 0, peer: "x".into(), decoded: decoded(inform(AP1, 1000, &[(C1, "b1")])) });
+        h.engine.handle(Input::Inform { ts: 0, peer: [10, 0, 0, 1].into(), decoded: decoded(inform(AP1, 1000, &[(C1, "b1")])) });
         events(&mut h);
         // Config acknowledgement and a connection-tracker success: no client changes.
-        h.engine.handle(Input::Inform { ts: 5, peer: "x".into(), decoded: notif(AP1, "setparam", Value::Null) });
+        h.engine.handle(Input::Inform { ts: 5, peer: [10, 0, 0, 1].into(), decoded: notif(AP1, "setparam", Value::Null) });
         let success = json!({ "message_type": "STA_ASSOC_TRACKER", "event_type": "success", "mac": C1, "vap": "wifi1ap0",
             "assoc_delta": "40000", "wpa_auth_delta": "80000", "ip_delta": "100000", "dns_responses": "1", "dns_timeouts": "0", "avg_rssi": "-61" });
-        h.engine.handle(Input::Inform { ts: 6, peer: "x".into(), decoded: notif(AP1, "event", success) });
+        h.engine.handle(Input::Inform { ts: 6, peer: [10, 0, 0, 1].into(), decoded: notif(AP1, "event", success) });
         let failure = json!({ "message_type": "STA_ASSOC_TRACKER", "event_type": "soft failure", "mac": C1, "vap": "wifi1ap0", "sta_dc_reason": "roam", "auth_rssi": "-81" });
-        h.engine.handle(Input::Inform { ts: 7, peer: "x".into(), decoded: notif(AP1, "event", failure) });
-        h.engine.handle(Input::Inform { ts: 8, peer: "x".into(), decoded: notif(AP1, "event", json!({ "event_string": "EVT_AP_RadarDetected", "channel": 52 })) });
+        h.engine.handle(Input::Inform { ts: 7, peer: [10, 0, 0, 1].into(), decoded: notif(AP1, "event", failure) });
+        h.engine.handle(Input::Inform { ts: 8, peer: [10, 0, 0, 1].into(), decoded: notif(AP1, "event", json!({ "event_string": "EVT_AP_RadarDetected", "channel": 52 })) });
         assert_eq!(
             events(&mut h),
             vec![("config_applied", None), ("client_connect_failed", Some(C1.into())), ("dfs_radar", None)]
@@ -2422,7 +2443,7 @@ mod tests {
         // One whose mac is not one is counted as undecodable.
         let mut bad = notif(AP1, "setparam", Value::Null);
         bad.payload["mac"] = json!("nope");
-        h.engine.handle(Input::Inform { ts: 9, peer: "x".into(), decoded: bad });
+        h.engine.handle(Input::Inform { ts: 9, peer: [10, 0, 0, 1].into(), decoded: bad });
         assert_eq!(events(&mut h), vec![]);
         let live = h.live.read().unwrap();
         assert_eq!(live.counters.decode_errors.load(Ordering::Relaxed), 1);
@@ -2441,7 +2462,7 @@ mod tests {
         let mut t = 0;
         let mut feed = |h: &mut Harness, v: Value| {
             t += 10;
-            h.engine.handle(Input::Inform { ts: t, peer: "x".into(), decoded: decoded(v) });
+            h.engine.handle(Input::Inform { ts: t, peer: [10, 0, 0, 1].into(), decoded: decoded(v) });
         };
         feed(&mut h, with(44, 9));
         feed(&mut h, with(44, 23)); // transient after a restart
@@ -2458,15 +2479,15 @@ mod tests {
     #[test]
     fn ap_offline_restart_and_config_push() {
         let mut h = harness();
-        h.engine.handle(Input::Inform { ts: 0, peer: "x".into(), decoded: decoded(inform(AP1, 5000, &[(C1, "b1")])) });
+        h.engine.handle(Input::Inform { ts: 0, peer: [10, 0, 0, 1].into(), decoded: decoded(inform(AP1, 5000, &[(C1, "b1")])) });
         h.engine.handle(Input::Tick(30));
         events(&mut h);
         h.engine.handle(Input::Tick(100));
         assert_eq!(events(&mut h), vec![("ap_offline", None), ("client_disconnected", Some(C1.into()))]);
         // A notification while offline does not shorten the time reported offline.
-        h.engine.handle(Input::Inform { ts: 150, peer: "x".into(), decoded: notif(AP1, "event", json!({})) });
+        h.engine.handle(Input::Inform { ts: 150, peer: [10, 0, 0, 1].into(), decoded: notif(AP1, "event", json!({})) });
         // Back with a low uptime: online again and restarted.
-        h.engine.handle(Input::Inform { ts: 200, peer: "x".into(), decoded: decoded(inform(AP1, 50, &[])) });
+        h.engine.handle(Input::Inform { ts: 200, peer: [10, 0, 0, 1].into(), decoded: decoded(inform(AP1, 50, &[])) });
         assert_eq!(events(&mut h), vec![("ap_online", None), ("ap_restarted", None)]);
         assert_eq!(stored(&h, EventKind::ApOnline)[0]["offline_for"], 200);
 
@@ -2512,7 +2533,7 @@ mod tests {
             if let Some(version) = version {
                 v["version"] = json!(version);
             }
-            h.engine.handle(Input::Inform { ts, peer: "x".into(), decoded: decoded(v) });
+            h.engine.handle(Input::Inform { ts, peer: [10, 0, 0, 1].into(), decoded: decoded(v) });
         };
         at(&mut h, 0, 50, None);
         // The first version it reports is no change of firmware.

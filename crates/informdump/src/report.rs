@@ -3,6 +3,7 @@
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fmt::Write as _;
+use std::net::IpAddr;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
@@ -54,7 +55,7 @@ impl Reporter {
 
     pub fn handle(&mut self, ev: HttpEvent) {
         match self.pairer.handle(&self.keys, ev) {
-            Some(InformEvent::Inform { ts, peer, mac, decoded }) => self.request(&peer, ts, mac, decoded),
+            Some(InformEvent::Inform { ts, peer, mac, decoded }) => self.request(peer, ts, mac, decoded),
             Some(InformEvent::Reply { ts, mac, status, decoded: None }) => {
                 if self.opts.json {
                     self.emit_undecoded(ts, mac, json!({ "kind": "reply", "status": status, "empty": true }));
@@ -70,7 +71,7 @@ impl Reporter {
     }
 
     /// `mac_hint` is the MAC in the packet's header, which is in the clear.
-    fn request(&mut self, peer: &str, ts: Micros, mac_hint: Option<Mac>, decoded: Result<Decoded>) {
+    fn request(&mut self, peer: IpAddr, ts: Micros, mac_hint: Option<Mac>, decoded: Result<Decoded>) {
         let d = match decoded {
             Ok(d) => d,
             Err(e) if self.opts.json => return self.emit_undecoded(ts, mac_hint, json!({ "kind": "inform", "from": peer, "error": format!("{e:#}") })),
