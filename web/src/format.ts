@@ -177,37 +177,37 @@ export function signalTone(dbm: number | null | undefined): Tone | "" {
  * TX retry shares (%) as the official dashboard colours its retry buckets: at
  * least `bad` is bad, at least `warn` needs attention, below it is fine.
  */
-export const RETRY = { warn: 20, bad: 25 } as const;
+const RETRY = { warn: 20, bad: 25 } as const;
 
 /** A TX retry share's tone: "bad", "warn", or "" (fine or unknown). */
 export const retryTone = (pct: number | null | undefined): Exclude<Tone, "good"> | "" =>
   pct === null || pct === undefined ? "" : pct >= RETRY.bad ? "bad" : pct >= RETRY.warn ? "warn" : "";
 
 /** A meter's level (% of its maximum: CPU, memory, channel use): from `warn` it needs attention, from `bad` it is bad. */
-export const LOAD = { warn: 50, bad: 80 } as const;
+const LOAD = { warn: 50, bad: 80 } as const;
 
 export const loadTone = (pct: number): Tone => (pct >= LOAD.bad ? "bad" : pct >= LOAD.warn ? "warn" : "good");
 
 /** The share (%) of clients that get past a connection stage: from `good` it is good, from `warn` it needs attention. */
-export const STAGE = { good: 80, warn: 60 } as const;
+const STAGE = { good: 80, warn: 60 } as const;
 
 /** A connection stage's tone, or "" when no client got past it (or it isn't known). */
 export const stageTone = (pct: number | null): Tone | "" =>
   pct === null || pct === 0 ? "" : pct >= STAGE.good ? "good" : pct >= STAGE.warn ? "warn" : "bad";
 
 /** Wi-Fi experience scores as the official controller colours them: from `good` excellent, from `warn` good. */
-export const EXPERIENCE = { good: 90, warn: 70 } as const;
+const EXPERIENCE = { good: 90, warn: 70 } as const;
 
 export const experienceTone = (v: number | null): Tone | "" =>
   v === null ? "" : v >= EXPERIENCE.good ? "good" : v >= EXPERIENCE.warn ? "warn" : "bad";
 
 /** Roaming success (%) as the official roaming map colours it: green above `good`, orange above `warn`. */
-export const ROAM = { good: 67, warn: 33 } as const;
+const ROAM = { good: 67, warn: 33 } as const;
 
 export const roamTone = (pct: number): Tone => (pct > ROAM.good ? "good" : pct > ROAM.warn ? "warn" : "bad");
 
 /** The multicast and broadcast share (%) of all packets from which it needs attention. */
-export const MULTICAST_WARN = 30;
+const MULTICAST_WARN = 30;
 
 export const multicastTone = (pct: number | null): "warn" | "" => (pct !== null && pct >= MULTICAST_WARN ? "warn" : "");
 
