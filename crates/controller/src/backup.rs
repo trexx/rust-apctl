@@ -65,7 +65,8 @@ pub struct Backups {
 #[derive(Default)]
 struct Known {
     settings: Option<Settings>,
-    /// When the newest automatic backup was made (0: none).
+    /// When the newest automatic backup was made (0: none), once the
+    /// directory has been read for it (`None`: not yet).
     last_auto: Option<Ts>,
 }
 
