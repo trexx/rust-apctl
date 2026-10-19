@@ -2456,16 +2456,15 @@ pub struct ClientGroup {
 /// Sets a client's own speed limit.
 pub fn apply_client_group(state: &mut Value, e: &ClientGroup) -> Result<String, String> {
     let mac = e.mac;
-    let group = e.usergroup_id.clone().filter(|g| !g.is_empty());
-    let name = match &group {
-        Some(g) => doc_by_id(state, "usergroup", g).ok_or("unknown speed limit")?["name"].as_str().unwrap_or("?").to_string(),
-        None => String::new(),
+    let (value, what) = match e.usergroup_id.as_deref().filter(|g| !g.is_empty()) {
+        Some(g) => {
+            let name = doc_by_id(state, "usergroup", g).ok_or("unknown speed limit")?["name"].as_str().unwrap_or("?");
+            (json!(g), format!("client {mac}: speed limit \"{name}\""))
+        }
+        None => (Value::Null, format!("client {mac}: no own speed limit")),
     };
-    crate::actions::edit_client(state, mac, &[("usergroup_id", group.clone().map_or(Value::Null, Value::String))]);
-    Ok(match group {
-        Some(_) => format!("client {mac}: speed limit \"{name}\""),
-        None => format!("client {mac}: no own speed limit"),
-    })
+    crate::actions::edit_client(state, mac, &[("usergroup_id", value)]);
+    Ok(what)
 }
 
 /// GET /api/settings/usergroups
