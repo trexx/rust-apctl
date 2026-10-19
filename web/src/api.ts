@@ -539,7 +539,7 @@ export interface DryRun {
     against_redacted?: boolean;
     error?: string;
     /** The AP runs a different config version than when the settings were imported. */
-    settings_stale?: boolean;
+    settings_stale: boolean;
   }[];
   history: { id: number; ts: number; mac: Mac; cfgversion: string | null; matches: boolean; comparison: { system_cfg?: FieldComparison; error?: string } | null }[];
 }
@@ -682,9 +682,9 @@ export interface PlanEntry {
   suggested_reasons: string[];
   change: boolean;
   /** Kept as is: excluded, on a wireless uplink, or being upgraded. */
-  pinned?: boolean;
+  pinned: boolean;
   /** Its channel is not one Channel AI may use, so it moves regardless. */
-  not_allowed?: boolean;
+  not_allowed: boolean;
 }
 
 export interface ThreatFinding {
