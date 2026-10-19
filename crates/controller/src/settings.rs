@@ -76,7 +76,9 @@ async fn preview(s: &AppState, before: Arc<Value>, edit: impl FnOnce(&mut Value)
                         "mgmt_cfg": summary(&old.0, &new.0), "system_cfg": summary(&old.1, &new.1), "labels": labels,
                     }));
                 }
-                (_, Err(e)) | (Err(e), _) => out.push(json!({ "mac": mac, "name": name, "error": format!("{e:#}") })),
+                // The edit makes a config that did not render render: nothing to compare it with.
+                (Err(e), Ok(_)) => out.push(json!({ "mac": mac, "name": name, "fixes": format!("{e:#}") })),
+                (_, Err(e)) => out.push(json!({ "mac": mac, "name": name, "error": format!("{e:#}") })),
             }
         }
         Ok(json!({ "what": what, "aps": out }))
