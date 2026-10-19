@@ -477,7 +477,6 @@ fn wep(c: &mut Cfg, p: Prefix, w: &Value) {
     c.set(p.at("security.default_key"), idx);
 }
 
-/// `aaa.N.*` and `wireless.N.*` for one VAP. `bridge` is the bridge the VAP is a port of.
 /// The `aaa.N.*` and `wireless.N.*` blocks of one VAP (`v`, one of `vaps`).
 pub fn render_vap(c: &mut Cfg, ctx: &Ctx, radios: &[Radio], vaps: &[Vap], v: &Vap) {
     let bridge = &crate::net::bridge_name(v.vlan);
