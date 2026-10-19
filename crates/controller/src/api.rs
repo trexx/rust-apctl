@@ -155,7 +155,20 @@ pub fn router(state: AppState) -> Router {
     // The live socket is added after compression, which must not touch an upgrade.
     let socket = Router::new().route("/api/ws", get(ws)).route_layer(axum::middleware::from_fn_with_state(state.clone(), crate::auth::require_login));
     // JSON and the UI's scripts and styles compress well (gzip only; images are left alone).
-    public.merge(protected).fallback(crate::web::handler).layer(tower_http::compression::CompressionLayer::new().compress_when(compressible())).merge(socket).with_state(state)
+    let app = public.merge(protected).fallback(crate::web::handler).layer(tower_http::compression::CompressionLayer::new().compress_when(compressible())).merge(socket);
+    with_security_headers(app).with_state(state)
+}
+
+/// On every answer, the UI's and the API's: no page of another site may frame
+/// apctl's (a sibling subdomain gets the session cookie, see `Auth::same_origin`), and no
+/// browser guesses a type other than the one sent.
+fn with_security_headers(app: Router<AppState>) -> Router<AppState> {
+    use axum::http::{HeaderValue, header};
+    use tower_http::set_header::SetResponseHeaderLayer;
+    let set = |name, value| SetResponseHeaderLayer::if_not_present(name, HeaderValue::from_static(value));
+    app.layer(set(header::X_FRAME_OPTIONS, "DENY"))
+        .layer(set(header::CONTENT_SECURITY_POLICY, "frame-ancestors 'none'"))
+        .layer(set(header::X_CONTENT_TYPE_OPTIONS, "nosniff"))
 }
 
 /// What is worth compressing: the defaults (nothing tiny, no images), and no
@@ -1419,6 +1432,19 @@ mod tests {
         let res = get(&app, "/api/ws").await;
         assert!(res.headers().get(header::CONTENT_ENCODING).is_none());
         assert_eq!(get(&app, "/healthz").await.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn no_answer_can_be_framed_or_sniffed() {
+        let (app, _engine, _dir) = app();
+        // The API, an API error, the UI (or its 404 when unbuilt), the live socket's refusal.
+        for path in ["/api/status", "/api/nope", "/", "/clients", "/api/ws", "/healthz"] {
+            let res = get(&app, path).await;
+            let h = |name| res.headers().get(name).map(|v: &axum::http::HeaderValue| v.to_str().unwrap().to_string());
+            assert_eq!(h(header::X_FRAME_OPTIONS).as_deref(), Some("DENY"), "{path}");
+            assert_eq!(h(header::CONTENT_SECURITY_POLICY).as_deref(), Some("frame-ancestors 'none'"), "{path}");
+            assert_eq!(h(header::X_CONTENT_TYPE_OPTIONS).as_deref(), Some("nosniff"), "{path}");
+        }
     }
 
     #[tokio::test]
