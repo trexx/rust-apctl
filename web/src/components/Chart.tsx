@@ -1,4 +1,4 @@
-import { createContext, Suspense, useRef, useState } from "react";
+import { Suspense, useRef, useState } from "react";
 import type { ReactNode } from "react";
 import { useSearchParams } from "react-router";
 import "uplot/dist/uPlot.min.css";
@@ -8,14 +8,7 @@ import { fromLocalInput, spanText, toLocalInput, useNow } from "../format";
 import { lazyNamed } from "../lazy";
 import { Segmented, useDismiss, useSetParams } from "./common";
 import type { ChartProps } from "./Plot";
-
-/** The page's time span: charts show exactly this window, gaps included. */
-export const SpanContext = createContext<TimeSpan | null>(null);
-
-/** When provided, dragging across a chart selects that time window for the whole page. */
-export const ZoomContext = createContext<
-  ((from: number, to: number) => void) | null
->(null);
+import { SpanScope } from "./span";
 
 /**
  * The series colours: the page's `--c-*` variables, so dark mode gets the
@@ -226,18 +219,16 @@ export function SpanPage({
   children: ReactNode;
 }) {
   return (
-    <ZoomContext.Provider value={(from, to) => onSpan({ from, to })}>
-      <SpanContext.Provider value={span}>
-        <div className="page">
-          <div className="page-head">
-            {head}
-            <span className="spacer" />
-            <RangePicker value={span} onChange={onSpan} />
-          </div>
-          {children}
+    <SpanScope span={span} onSpan={onSpan}>
+      <div className="page">
+        <div className="page-head">
+          {head}
+          <span className="spacer" />
+          <RangePicker value={span} onChange={onSpan} />
         </div>
-      </SpanContext.Provider>
-    </ZoomContext.Provider>
+        {children}
+      </div>
+    </SpanScope>
   );
 }
 

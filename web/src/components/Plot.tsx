@@ -8,7 +8,7 @@ import {
 import uPlot from "uplot";
 import { spanBounds } from "../api";
 import type { TimeSpan } from "../api";
-import { SpanContext, ZoomContext } from "./Chart";
+import { SpanContext, ZoomContext } from "./span";
 
 /** Breaks lines where samples are missing for much longer than usual (an AP
  *  offline, apctl not running) by inserting a point with no values. */

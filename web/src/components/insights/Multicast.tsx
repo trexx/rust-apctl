@@ -3,8 +3,9 @@ import { Link } from "react-router";
 import { useMulticast } from "../../api";
 import type { SiteMulticast, TimeSpan } from "../../api";
 import { compact, spanText } from "../../format";
-import { COLORS, Chart, SpanContext } from "../Chart";
+import { COLORS, Chart } from "../Chart";
 import { QueryState, Segmented, THead } from "../common";
+import { SpanContext } from "../span";
 
 const DIRECTIONS = [
   ["tx", "To clients"],
