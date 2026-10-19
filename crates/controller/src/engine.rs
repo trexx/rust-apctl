@@ -1276,7 +1276,10 @@ impl Engine {
         for (mac, cipher) in self.syslog_ciphers.all() {
             if let Ok(text) = crate::syslog::decrypt_with(payload, mac, cipher) {
                 self.syslog_unknown.remove(&hash_id);
-                self.live.write().unwrap().by_hash_id.insert(hash_id, mac);
+                // As `Live::attribute`: an AP has one hash_id.
+                let mut live = self.live.write().unwrap();
+                live.by_hash_id.retain(|_, m| *m != mac);
+                live.by_hash_id.insert(hash_id, mac);
                 return Ok((mac, text));
             }
         }
@@ -2113,21 +2116,25 @@ mod tests {
         send(&mut h, 20, 2, 7);
         assert_eq!(logs(), 1);
         assert_eq!(live.read().unwrap().by_hash_id.get(&u64::from_be_bytes([2; 8])), Some(&AP1.parse().unwrap()));
+        // A hash_id the AP has since (e.g. after a reset) replaces the one before.
+        send(&mut h, 21, 6, 7);
+        let by_hash_id = live.read().unwrap().by_hash_id.clone();
+        assert_eq!(by_hash_id.into_iter().collect::<Vec<_>>(), vec![(u64::from_be_bytes([6; 8]), AP1.parse().unwrap())]);
         // An AP apctl adopted: its key is in the settings only.
         send(&mut h, 30, 3, 5);
-        assert_eq!(logs(), 1);
+        assert_eq!(logs(), 2);
         let ap2 = "02:00:00:00:00:02";
         h.engine.set_state(31, json!({ "devices": [{ "mac": ap2, "syslog_key": hex::encode([5u8; 32]) }] }));
         assert!(h.engine.syslog_unknown.is_empty(), "new settings, new keys: tried again");
         send(&mut h, 32, 3, 5);
-        assert_eq!(logs(), 2);
+        assert_eq!(logs(), 3);
         assert_eq!(live.read().unwrap().by_hash_id.get(&u64::from_be_bytes([3; 8])), Some(&ap2.parse().unwrap()));
         // So many unknown hash_ids at once: a new one is not tried with every key.
         for i in 0..SYSLOG_UNKNOWN_MAX {
             h.engine.syslog_unknown.insert(i as u64, 40);
         }
         send(&mut h, 41, 4, 7);
-        assert_eq!((logs(), h.engine.syslog_unknown.len()), (2, SYSLOG_UNKNOWN_MAX));
+        assert_eq!((logs(), h.engine.syslog_unknown.len()), (3, SYSLOG_UNKNOWN_MAX));
         assert!(!live.read().unwrap().by_hash_id.contains_key(&u64::from_be_bytes([4; 8])));
     }
 
