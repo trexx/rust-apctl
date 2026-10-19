@@ -7,7 +7,7 @@
 //!    inform that finds too many waiting already gets 503, and the AP tries
 //!    again at its next interval). Unknown APs (factory key only) get 404,
 //!    like an unadopted device would from the official controller. An AP that
-//!    has used AES-GCM may not fall
+//!    has used AES-GCM (or whose record says so, `x_aes_gcm`) may not fall
 //!    back to CBC. The MAC in the header must match the payload's.
 //! 2. The inform feeds the engine exactly as in shadow mode (metrics, events).
 //! 3. apctl renders the AP's config from the settings. If the AP reports a
@@ -51,7 +51,8 @@ struct Managed {
     /// The digest of the config that cfgversion stands for (`Render::digest`),
     /// to detect changes. Only the digest is stored: the config holds secrets.
     content: Option<[u8; 32]>,
-    /// Set once the AP has used AES-GCM; CBC is refused after that.
+    /// Set once the AP has used AES-GCM, or from its record's `x_aes_gcm`
+    /// when apctl first hears from it; CBC is refused after that.
     gcm: bool,
     /// The last render (memory only): reused while its inputs are unchanged.
     render: Option<Arc<Render>>,
@@ -625,6 +626,9 @@ pub async fn inform(
     // Which keys may this AP use? Its own if apctl manages it; the factory key always.
     let state = active.live.read().unwrap().state.clone();
     let device_key = crate::adopt::device_key(state.as_deref(), &active.keys, &mac);
+    // Its record's AES-GCM pin, as the official controller keeps it (see `managed_inform`).
+    let pinned = state.as_deref().and_then(|st| crate::adopt::device_doc(st, &mac)).is_some_and(|d| d["x_aes_gcm"].as_bool() == Some(true));
+    drop(state);
     let (used, key, payload, _permit) = match active.open(body, device_key).await {
         Ok(opened) => opened,
         Err(StatusCode::SERVICE_UNAVAILABLE) => {
@@ -645,7 +649,7 @@ pub async fn inform(
     if used == KeyUsed::Default {
         factory_key_inform(&active, ts, caller, payload, device_key.is_some()).await
     } else {
-        managed_inform(&active, ts, caller, header, used, payload).await
+        managed_inform(&active, ts, caller, header, used, payload, pinned).await
     }
 }
 
@@ -689,8 +693,10 @@ async fn factory_key_inform(active: &Arc<Active>, ts: Ts, caller: Caller, payloa
 }
 
 /// An inform under an AP's own key: the reply to it (a config push, a
-/// command, a heartbeat), and the inform for the engine.
-async fn managed_inform(active: &Arc<Active>, ts: Ts, caller: Caller, header: inform::Header, used: KeyUsed, payload: Value) -> Response {
+/// command, a heartbeat), and the inform for the engine. `pinned`: the AP's
+/// record says it uses AES-GCM (`x_aes_gcm`, imported from the other
+/// controller), which pins it from the first inform apctl hears from it.
+async fn managed_inform(active: &Arc<Active>, ts: Ts, caller: Caller, header: inform::Header, used: KeyUsed, payload: Value, pinned: bool) -> Response {
     let (mac, gcm) = (caller.mac, caller.gcm);
     // Its own key: an adoption is complete; a forgotten AP is told to reset
     // (once: the entry goes, so later informs don't finish the forget again).
@@ -726,7 +732,9 @@ async fn managed_inform(active: &Arc<Active>, ts: Ts, caller: Caller, header: in
     }
     {
         let mut devices = active.devices.lock().unwrap();
-        let d = devices.entry(mac).or_default();
+        // Once apctl knows the AP, its own record of AES-GCM decides (an
+        // adoption above starts it afresh).
+        let d = devices.entry(mac).or_insert_with(|| Managed { gcm: pinned, ..Default::default() });
         if d.gcm && !gcm {
             tracing::warn!("{mac}: refusing a CBC inform from a device that uses AES-GCM");
             return StatusCode::BAD_REQUEST.into_response();
@@ -1467,6 +1475,7 @@ mod tests {
     async fn no_cbc_after_gcm_and_cbc_replies_for_cbc_devices() {
         let Some(_) = fixtures() else { return };
         let rig = rig(true, None);
+        no_gcm_on_record(&rig);
         // A CBC-only exchange is answered in CBC.
         let (status, reply) = inform_as_ap(&rig, &ap_payload("1"), KEY, Flags::ENCRYPTED).await;
         assert_eq!(status, StatusCode::OK);
@@ -1475,6 +1484,36 @@ mod tests {
         inform_as_ap(&rig, &ap_payload("1"), KEY, GCM_ZLIB).await;
         let (status, _) = inform_as_ap(&rig, &ap_payload("1"), KEY, Flags::ENCRYPTED).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn an_ap_whose_record_says_aes_gcm_may_not_use_cbc_from_the_first_inform() {
+        let Some(_) = fixtures() else { return };
+        let rig = rig(true, None);
+        let ap: Mac = AP.parse().unwrap();
+        {
+            let mut live = rig.live.write().unwrap();
+            let mut state = live.state.as_deref().cloned().unwrap();
+            crate::adopt::device_doc_mut(&mut state, &ap).unwrap()["x_aes_gcm"] = json!(true);
+            live.state = Some(Arc::new(state));
+        }
+        let (status, _) = inform_as_ap(&rig, &ap_payload("1"), KEY, Flags::ENCRYPTED).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "as imported from the other controller");
+        let (status, _) = inform_as_ap(&rig, &ap_payload("1"), KEY, GCM_ZLIB).await;
+        assert_eq!(status, StatusCode::OK);
+        // Without the flag, CBC is answered until the AP has used AES-GCM.
+        let rig = self::rig(true, None);
+        no_gcm_on_record(&rig);
+        let (status, _) = inform_as_ap(&rig, &ap_payload("1"), KEY, Flags::ENCRYPTED).await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    /// The AP's record without `x_aes_gcm` (the fixture's has it, as imported).
+    fn no_gcm_on_record(rig: &Rig) {
+        let mut live = rig.live.write().unwrap();
+        let mut state = live.state.as_deref().cloned().unwrap();
+        crate::adopt::device_doc_mut(&mut state, &AP.parse().unwrap()).unwrap().as_object_mut().unwrap().remove("x_aes_gcm");
+        live.state = Some(Arc::new(state));
     }
 
     #[tokio::test]
