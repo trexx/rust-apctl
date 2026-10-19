@@ -18,7 +18,7 @@
 //!   it a roam or the client was back within a second; 802.11r ("ft") and the
 //!   AP's roaming triggers (minimum RSSI, roaming assistant) are recorded.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 
 use axum::extract::State;
@@ -429,7 +429,8 @@ pub fn roams(events: &[ConnEvent]) -> Vec<Roam> {
         // Whether each event is a leave, and whether it carries the signal a join needs.
         let leave: Vec<bool> = evs.iter().map(|e| LEAVE_TYPES.contains(&e.event_type.as_str())).collect();
         let joined: Vec<bool> = evs.iter().zip(&leave).map(|(e, l)| !l && num(&e.n.auth_rssi).is_some()).collect();
-        let mut used: HashSet<usize> = HashSet::new();
+        // The joins already paired with a leave.
+        let mut used = vec![false; evs.len()];
         for (li, l) in evs.iter().enumerate() {
             if !leave[li] || num(&l.n.avg_rssi).is_none() {
                 continue;
@@ -439,10 +440,10 @@ pub fn roams(events: &[ConnEvent]) -> Vec<Roam> {
             let (lo, hi) = (evs.partition_point(|j| j.ts < l.ts - 10), evs.partition_point(|j| j.ts <= l.ts + 15));
             let join = (lo..hi)
                 .map(|ji| (ji, evs[ji]))
-                .filter(|(ji, j)| joined[*ji] && !used.contains(ji) && j.ap != l.ap && (j.essid.is_none() || l.essid.is_none() || j.essid == l.essid))
+                .filter(|(ji, j)| joined[*ji] && !used[*ji] && j.ap != l.ap && (j.essid.is_none() || l.essid.is_none() || j.essid == l.essid))
                 .max_by_key(|(_, j)| (band_rank(j.radio.as_deref()), std::cmp::Reverse((j.ts - l.ts).abs())));
             let Some((ji, j)) = join else { continue };
-            used.insert(ji);
+            used[ji] = true;
             let gap = j.ts - l.ts;
             let success = l.event_type == "sta_roam" || gap.abs() <= 1;
             let status = num(&l.n.assoc_status).unwrap_or(0.0) as i64;
@@ -576,12 +577,11 @@ fn query_rows(c: &rusqlite::Connection, from: Ts, to: Ts, client: Option<&str>, 
 /// Only the reports [`attempts`] reads ([`ATTEMPT_TYPES`]).
 const ATTEMPTS_ONLY: &str = "AND event_type IN ('failure', 'soft failure', 'success', 'fixup')";
 
-/// The notifications in a window (optionally one client's, and with
-/// `attempts_only` only the reports [`attempts`] reads), oldest first; or with
-/// `newest`, at most that many, newest first.
-pub fn load_rows(c: &rusqlite::Connection, from: Ts, to: Ts, client: Option<&str>, newest: Option<usize>, attempts_only: bool) -> rusqlite::Result<Vec<ConnEvent>> {
-    // The other reports (associations, leaves) are then not parsed for nothing.
-    query_rows(c, from, to, client, if attempts_only { ATTEMPTS_ONLY } else { "" }, newest)
+/// The reports [`attempts`] reads in a window (optionally one client's),
+/// oldest first; or with `newest`, at most that many, newest first.
+pub fn load_rows(c: &rusqlite::Connection, from: Ts, to: Ts, client: Option<&str>, newest: Option<usize>) -> rusqlite::Result<Vec<ConnEvent>> {
+    // The other reports (associations, leaves) are not parsed for nothing.
+    query_rows(c, from, to, client, ATTEMPTS_ONLY, newest)
 }
 
 /// Only a client's reports from 10 s before to 15 s after one of its leaves ([`LEAVE_TYPES`]).
@@ -607,7 +607,7 @@ fn roam_rows(c: &rusqlite::Connection, from: Ts, to: Ts, client: Option<&str>) -
 fn newest(c: &rusqlite::Connection, from: Ts, to: Ts, client: Option<&str>, limit: usize, failed: bool, with_roams: bool) -> rusqlite::Result<(Vec<Attempt>, Vec<Roam>)> {
     let mut batch = (limit * 4).max(2000);
     let list = loop {
-        let mut events = load_rows(c, from, to, client, Some(batch), true)?;
+        let mut events = load_rows(c, from, to, client, Some(batch))?;
         let all = events.len() < batch;
         // The oldest time read may have more rows than were read.
         let oldest = events.last().map_or(from, |e| e.ts);
@@ -690,7 +690,7 @@ pub async fn connectivity(State(s): State<AppState>, Query(q): Query<RangeQuery>
     let (from, to, tier) = window(&q);
     // Every report in the window is read and parsed: the result is reused for a while.
     let got = memo_read(&s, Db::Config, "connectivity", &q, tier, move |c| {
-        let list = attempts(load_rows(c, from, to, None, None, true)?);
+        let list = attempts(load_rows(c, from, to, None, None)?);
         let mut bands = serde_json::Map::new();
         // All bands, and each band with attempts.
         for b in [None, Some("ng"), Some("na"), Some("6e")] {
@@ -698,7 +698,7 @@ pub async fn connectivity(State(s): State<AppState>, Query(q): Query<RangeQuery>
                 bands.insert(b.unwrap_or("all").into(), connectivity_stats(&list, b));
             }
         }
-        Ok(Value::Object(serde_json::Map::from_iter([("bands".to_string(), Value::Object(bands))])))
+        Ok(json!({ "bands": bands }))
     })
     .await?;
     Ok(Json(got))
@@ -725,14 +725,15 @@ pub async fn list(State(s): State<AppState>, Query(q): Query<ListQuery>) -> Resu
     let client = q.client.map(|c| c.to_ascii_lowercase());
     let limit = q.limit.unwrap_or(500).min(5000);
     let with_roams = q.roams.unwrap_or(true);
-    let (list, r, stored) = read(&s.store, Db::Config, move |c| {
+    let live = s.live.clone();
+    let (list, r, aps, clients) = read(&s.store, Db::Config, move |c| {
         let (list, r) = newest(c, from, to, client.as_deref(), limit, q.failed, with_roams)?;
-        let stored = Names::load_for(c, &macs_of(&list, &r).1)?;
-        Ok((list, r, stored))
+        let (aps, clients) = macs_of(&list, &r);
+        let stored = Names::load_for(c, &clients)?;
+        let (aps, clients) = names(&stored, &live.read().unwrap(), aps, clients);
+        Ok((list, r, aps, clients))
     })
     .await?;
-    let (aps, clients) = macs_of(&list, &r);
-    let (aps, clients) = names(&stored, &s.live.read().unwrap(), aps, clients);
     Ok(Json(json!({ "attempts": list, "roams": r, "ap_names": aps, "client_names": clients })))
 }
 
@@ -1026,7 +1027,7 @@ mod tests {
         ];
         for (client, failed, limit, with_roams) in cases {
             let (list, r) = t.store.read(Db::Config, |c| Ok(newest(c, from, to, client, limit, failed, with_roams)?)).unwrap();
-            let all = t.store.read(Db::Config, |c| Ok(load_rows(c, from, to, client, None, false)?)).unwrap();
+            let all = t.store.read(Db::Config, |c| Ok(query_rows(c, from, to, client, "", None)?)).unwrap();
             let mut want_r = if with_roams { roams(&all) } else { Vec::new() };
             want_r.reverse();
             want_r.truncate(limit);
@@ -1065,7 +1066,7 @@ mod tests {
         let (from, to) = (1_000_000, 1_000_000 + 86400);
         for client in [Some(me), None] {
             let (list, r) = t.store.read(Db::Config, |c| Ok(newest(c, from, to, client, 100, false, true)?)).unwrap();
-            let all = t.store.read(Db::Config, |c| Ok(load_rows(c, from, to, client, None, false)?)).unwrap();
+            let all = t.store.read(Db::Config, |c| Ok(query_rows(c, from, to, client, "", None)?)).unwrap();
             let mut want = roams(&all);
             want.reverse();
             assert_eq!(json!(r), json!(want), "{client:?}");

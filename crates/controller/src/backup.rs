@@ -65,7 +65,8 @@ pub struct Backups {
 #[derive(Default)]
 struct Known {
     settings: Option<Settings>,
-    /// When the newest automatic backup was made (0: none).
+    /// When the newest automatic backup was made (0: none), once the
+    /// directory has been read for it (`None`: not yet).
     last_auto: Option<Ts>,
 }
 
@@ -414,7 +415,7 @@ fn trim_config(dir: &Path, cutoff: Option<Ts>) -> Result<()> {
 
 /// Drops the history older than `t` from metrics.db and logs.db.
 fn trim_history(dir: &Path, t: Ts) -> Result<()> {
-    // Every metric table in every tier, and the logs (whose full-text index follows by trigger).
+    // Every metric table in every tier, and the logs (and their full-text index).
     let metrics: Vec<String> = store::TABLES.iter().flat_map(|t| store::TIERS.iter().map(move |tier| format!("{}{}", t.name, tier.suffix))).collect();
     for (name, tables) in [("metrics.db", metrics), ("logs.db", vec!["logs".to_string()])] {
         let p = dir.join(name);
@@ -431,7 +432,9 @@ fn trim_history(dir: &Path, t: Ts) -> Result<()> {
         for table in tables {
             // A database from an older version may lack the newest tables.
             let exists: bool = tx.query_row("SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1", [&table], |r| r.get::<_, i64>(0))? > 0;
-            if exists {
+            if exists && table == "logs" {
+                trim_logs(&tx, t)?;
+            } else if exists {
                 tx.execute(&format!("DELETE FROM \"{table}\" WHERE ts < ?1"), [t])?;
             }
         }
@@ -439,6 +442,30 @@ fn trim_history(dir: &Path, t: Ts) -> Result<()> {
         let pages = |pragma: &str| c.query_row(&format!("PRAGMA {pragma}"), [], |r| r.get::<_, i64>(0));
         if pages("freelist_count")? * 4 > pages("page_count")? {
             c.execute_batch("VACUUM;")?;
+        }
+    }
+    Ok(())
+}
+
+/// Drops the logs older than `t`. Their full-text index is built again from
+/// the rows kept, rather than told of each row deleted by its trigger: that
+/// would keep the deleted rows' entries in the copy, with a delete marker for
+/// each, until segments are merged.
+fn trim_logs(tx: &rusqlite::Transaction, t: Ts) -> Result<()> {
+    if !tx.query_row("SELECT EXISTS (SELECT 1 FROM logs WHERE ts < ?1)", [t], |r| r.get::<_, bool>(0))? {
+        return Ok(());
+    }
+    match tx.query_row("SELECT sql FROM sqlite_master WHERE type = 'trigger' AND name = 'logs_ad'", [], |r| r.get::<_, String>(0)).optional()? {
+        // The trigger goes back as it was, so the restored database keeps its index up to date.
+        Some(trigger) => {
+            tx.execute_batch("DROP TRIGGER logs_ad;")?;
+            tx.execute("DELETE FROM logs WHERE ts < ?1", [t])?;
+            tx.execute_batch(&trigger)?;
+            tx.execute_batch("INSERT INTO logs_fts (logs_fts) VALUES ('rebuild');")?;
+        }
+        // A database without the index.
+        None => {
+            tx.execute("DELETE FROM logs WHERE ts < ?1", [t])?;
         }
     }
     Ok(())
@@ -678,20 +705,23 @@ fn valid_id(id: &str) -> bool {
 /// Staging and the marker are synced when written, and a restore records
 /// that it has begun (`started`, beside the staged files) before it moves
 /// anything, so a power cut can never pass a lost file for one moved in.
+///
+/// A marker that is there but cannot be read (permissions, a disk error)
+/// leaves the restore's files and staging alone: they may be its only copy.
 pub fn apply_pending(b: &Backups) {
     clean_unfinished(b);
     let marker = b.staging().join("pending");
-    match fs::read_to_string(&marker) {
-        Ok(id) => {
+    match pending(b) {
+        Ok(Some(id)) => {
             let mut under_way = false;
-            match apply(b, id.trim(), &mut under_way) {
+            match apply(b, &id, &mut under_way) {
                 Ok(()) => {
                     // The marker goes before the staged files: a crash in between
                     // must not show a finished restore as failed.
                     let _ = fs::remove_file(&marker);
                     let _ = fs::remove_file(b.staging().join("pending.failed"));
                     let _ = sync_dir(&b.staging());
-                    let _ = fs::remove_dir_all(b.staging().join(id.trim()));
+                    let _ = fs::remove_dir_all(b.staging().join(&id));
                     tracing::warn!("restore complete");
                 }
                 Err(e) if under_way => {
@@ -700,8 +730,8 @@ pub fn apply_pending(b: &Backups) {
                 Err(e) => {
                     tracing::error!("the staged restore failed; starting with the current data: {e:#}");
                     // Staged again, it begins afresh, with a copy of the data as it is then.
-                    if valid_id(id.trim()) {
-                        let _ = fs::remove_file(b.staging().join(id.trim()).join("started"));
+                    if valid_id(&id) {
+                        let _ = fs::remove_file(b.staging().join(&id).join("started"));
                     }
                     let failed = b.staging().join("pending.failed");
                     if fs::write(&failed, format!("{e:#}")).is_err() || fs::remove_file(&marker).is_err() {
@@ -712,7 +742,7 @@ pub fn apply_pending(b: &Backups) {
         }
         // Files beside their place belong to a restore under way: only
         // without one are they left over (from a restore since replaced).
-        Err(_) => {
+        Ok(None) => {
             for n in DATABASES {
                 let p = b.data_dir.join(format!("{n}.restoring"));
                 if p.exists() {
@@ -721,8 +751,21 @@ pub fn apply_pending(b: &Backups) {
                 }
             }
         }
+        Err(e) => {
+            tracing::error!("the restore marker {} cannot be read; starting with the current data, and leaving the restore's files where they are: {e}", marker.display());
+            return;
+        }
     }
     clean_staging(b);
+}
+
+/// The staged restore waiting to be applied, if any: the `pending` marker's id.
+fn pending(b: &Backups) -> io::Result<Option<String>> {
+    match fs::read_to_string(b.staging().join("pending")) {
+        Ok(id) => Ok(Some(id.trim().to_string())),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e),
+    }
 }
 
 /// Swaps a staged restore in. `under_way` is set once a file has left
@@ -824,9 +867,10 @@ fn clean_unfinished(b: &Backups) {
 }
 
 /// Deletes staged restores and uploads that were left behind (older than an
-/// hour), except the restore waiting to be applied.
+/// hour), except the restore waiting to be applied: none while the marker
+/// naming it cannot be read.
 fn clean_staging(b: &Backups) {
-    let keep = fs::read_to_string(b.staging().join("pending")).ok().map(|s| s.trim().to_string());
+    let Ok(keep) = pending(b) else { return };
     for e in fs::read_dir(b.staging()).into_iter().flatten().flatten() {
         let name = e.file_name().to_string_lossy().into_owned();
         if name == "pending" || name == "pending.failed" || keep.as_deref() == Some(name.as_str()) {
@@ -871,6 +915,14 @@ impl Default for Settings {
     }
 }
 
+/// How much history a backup can hold.
+fn valid_days(days: i64) -> Result<(), String> {
+    if !(-1..=365).contains(&days) {
+        return Err("history must be -1 (all), 0 (settings only) or 1-365 days".into());
+    }
+    Ok(())
+}
+
 impl Settings {
     fn validate(&self) -> Result<(), String> {
         if self.minute_utc >= 1440 || self.weekday > 6 || !(1..=28).contains(&self.monthday) {
@@ -879,10 +931,7 @@ impl Settings {
         if !(1..=100).contains(&self.keep) {
             return Err("keep between 1 and 100 backups".into());
         }
-        if self.days < -1 || self.days > 365 {
-            return Err("history must be -1 (all), 0 (settings only) or 1-365 days".into());
-        }
-        Ok(())
+        valid_days(self.days)
     }
 
     /// Whether a backup is scheduled on this day (days since 1970-01-01, UTC).
@@ -1042,9 +1091,7 @@ pub struct CreateBody {
 
 /// POST /api/backups: make a backup now.
 pub async fn create_now(State(s): State<AppState>, Json(body): Json<CreateBody>) -> Result<Json<Value>, ApiError> {
-    if !(-1..=365).contains(&body.days) {
-        return Err(ApiError::bad("history must be -1, 0 or 1-365 days"));
-    }
+    valid_days(body.days).map_err(ApiError::bad)?;
     let b = s.backups.clone();
     let dir = b.data_dir.clone();
     let writer = s.writer.clone();
@@ -1138,35 +1185,50 @@ pub struct RestoreBody {
 /// POST /api/backups/upload: checks an uploaded backup and stages it (not applied yet).
 /// The body is streamed to disk, so large backups need no memory.
 pub async fn upload(State(s): State<AppState>, body: Body) -> Result<Json<Value>, ApiError> {
-    use futures_util::StreamExt;
-    use tokio::io::AsyncWriteExt;
     let b = s.backups.clone();
     tokio::fs::create_dir_all(b.staging()).await?;
     let name = format!("upload-{}-{}.apb", clock::now_ts(), crate::random_hex(4));
-    let tmp = TempFile(b.staging().join(name));
-    // Written a megabyte per trip to the blocking pool, not one trip per body chunk.
-    let mut file = tokio::io::BufWriter::with_capacity(1 << 20, tokio::fs::File::create_new(&tmp.0).await?);
-    let mut stream = body.into_data_stream();
-    // DefaultBodyLimit does not apply to a streamed body: count here.
-    let mut size = 0u64;
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|e| ApiError::bad(format!("upload interrupted: {e}")))?;
-        size += chunk.len() as u64;
-        if size > UPLOAD_LIMIT {
-            return Err(ApiError(StatusCode::PAYLOAD_TOO_LARGE, "the backup is too large (1 GiB at most)".into()));
-        }
-        file.write_all(&chunk).await?;
-    }
-    file.flush().await?;
-    drop(file);
+    let tmp = receive(body, TempFile(Some(b.staging().join(name)))).await?;
     let res = tokio::task::spawn_blocking(move || {
-        let r = stage(&b, &tmp.0);
+        let r = stage(&b, tmp.path());
         drop(tmp);
         r
     })
     .await?
     .map_err(refused)?;
     Ok(Json(json!({ "staged": res.0, "manifest": res.1 })))
+}
+
+/// Writes an upload to `tmp`, at most [`UPLOAD_LIMIT`]. If that fails, the
+/// file is deleted (without blocking) and the error given back.
+async fn receive(body: Body, tmp: TempFile) -> Result<TempFile, ApiError> {
+    use futures_util::StreamExt;
+    use tokio::io::AsyncWriteExt;
+    let received = async {
+        // Written a megabyte per trip to the blocking pool, not one trip per body chunk.
+        let mut file = tokio::io::BufWriter::with_capacity(1 << 20, tokio::fs::File::create_new(tmp.path()).await?);
+        let mut stream = body.into_data_stream();
+        // DefaultBodyLimit does not apply to a streamed body: count here.
+        let mut size = 0u64;
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(|e| ApiError::bad(format!("upload interrupted: {e}")))?;
+            size += chunk.len() as u64;
+            if size > UPLOAD_LIMIT {
+                return Err(ApiError(StatusCode::PAYLOAD_TOO_LARGE, "the backup is too large (1 GiB at most)".into()));
+            }
+            file.write_all(&chunk).await?;
+        }
+        file.flush().await?;
+        Ok(())
+    }
+    .await;
+    match received {
+        Ok(()) => Ok(tmp),
+        Err(e) => {
+            tmp.remove().await;
+            Err(e)
+        }
+    }
 }
 
 /// Why a backup could not be staged or restored. Most reasons are the
@@ -1182,12 +1244,28 @@ fn refused(e: anyhow::Error) -> ApiError {
     }
 }
 
-/// A file deleted when dropped, so an upload cut off half way leaves nothing behind.
-struct TempFile(PathBuf);
+/// A file deleted when dropped, so an upload cut off half way leaves nothing
+/// behind. Where it can, the async code deletes it with [`TempFile::remove`],
+/// which does not block: the drop is for a request cancelled while it waits.
+struct TempFile(Option<PathBuf>);
+
+impl TempFile {
+    fn path(&self) -> &Path {
+        self.0.as_deref().expect("not removed yet")
+    }
+
+    async fn remove(mut self) {
+        if let Some(p) = self.0.take() {
+            let _ = tokio::fs::remove_file(p).await;
+        }
+    }
+}
 
 impl Drop for TempFile {
     fn drop(&mut self) {
-        let _ = fs::remove_file(&self.0);
+        if let Some(p) = &self.0 {
+            let _ = fs::remove_file(p);
+        }
     }
 }
 
@@ -1320,6 +1398,34 @@ mod tests {
         unpack(&b.dir().join(create(&b, &src, Kind::Manual, 7).unwrap().name), None, &out).unwrap();
         assert_eq!(count(&out.join("metrics.db"), "SELECT COUNT(*) FROM ap_stats"), 1);
         assert_eq!(count(&out.join("metrics.db"), "PRAGMA freelist_count"), 0);
+    }
+
+    #[test]
+    fn logs_dropped_from_a_backup_leave_nothing_in_its_index() {
+        let src = data("trim-logs");
+        let now = clock::now_ts();
+        let logs = Connection::open(src.join("logs.db")).unwrap();
+        logs.execute_batch(&format!(
+            "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 5000)
+             INSERT INTO logs (ts, program, msg) SELECT {old}, 'hostapd', 'stalewords ' || i || ' wifi1ap0 STA associated' FROM n;
+             INSERT INTO logs (ts, program, msg) VALUES ({now}, 'mcad', 'freshword one'), ({now}, 'mcad', 'freshword two');",
+            old = now - 40 * 86400
+        ))
+        .unwrap();
+        let b = Backups::new(src.to_path_buf(), None);
+        let out = dir("trim-logs-out");
+        unpack(&b.dir().join(create(&b, &src, Kind::Manual, 7).unwrap().name), None, &out).unwrap();
+        let p = out.join("logs.db");
+        let found = |word: &str| count(&p, &format!("SELECT COUNT(*) FROM logs_fts WHERE logs_fts MATCH '{word}'"));
+        assert_eq!((count(&p, "SELECT COUNT(*) FROM logs"), found("freshword"), found("stalewords")), (2, 2, 0));
+        // Nothing of the dropped rows is left in the file, not even in the index.
+        assert!(!fs::read(&p).unwrap().windows(10).any(|w| w == b"stalewords"));
+        assert_eq!(count(&p, "PRAGMA freelist_count"), 0);
+        // The restored index is whole, and kept up to date as before.
+        let c = Connection::open(&p).unwrap();
+        c.execute_batch("INSERT INTO logs_fts (logs_fts) VALUES ('integrity-check'); DELETE FROM logs WHERE msg = 'freshword one'; INSERT INTO logs (ts, msg) VALUES (1, 'newer');").unwrap();
+        assert_eq!((found("freshword"), found("newer")), (1, 1));
+        c.execute_batch("INSERT INTO logs_fts (logs_fts) VALUES ('integrity-check');").unwrap();
     }
 
     #[test]
@@ -1636,6 +1742,27 @@ mod tests {
     }
 
     #[test]
+    fn a_restore_marker_that_cannot_be_read_leaves_the_restore_alone() {
+        let src = data("unreadable");
+        let b = Backups::new(src.to_path_buf(), None);
+        let id = "r1";
+        fs::create_dir_all(b.staging().join(id)).unwrap();
+        fs::write(b.staging().join(id).join("logs.db"), "staged").unwrap();
+        let old = std::time::SystemTime::now() - Duration::from_secs(2 * 3600);
+        File::open(b.staging().join(id)).unwrap().set_modified(old).unwrap();
+        fs::write(src.join("config.db.restoring"), "the only copy").unwrap();
+        // A marker that is there but cannot be read: not text, then not a file.
+        fs::write(b.staging().join("pending"), [0xff, 0xfe]).unwrap();
+        apply_pending(&b);
+        fs::remove_file(b.staging().join("pending")).unwrap();
+        fs::create_dir(b.staging().join("pending")).unwrap();
+        apply_pending(&b);
+        assert_eq!(fs::read_to_string(src.join("config.db.restoring")).unwrap(), "the only copy");
+        assert!(b.staging().join(id).join("logs.db").exists(), "staging is kept too");
+        assert_eq!(count(&src.join("config.db"), "SELECT COUNT(*) FROM client_aliases"), 1, "and apctl starts with the data it has");
+    }
+
+    #[test]
     fn backups_at_the_same_moment_get_their_own_names() {
         let src = data("same");
         let b = Backups::new(src.to_path_buf(), None);
@@ -1770,6 +1897,21 @@ mod tests {
         fs::write(b.staging().join("pending"), "r1").unwrap();
         apply_pending(&b);
         assert!(fs::read_to_string(b.staging().join("pending.failed")).unwrap().contains("unexpected file"));
+    }
+
+    #[tokio::test]
+    async fn an_upload_cut_off_leaves_nothing_behind() {
+        let d = dir("upload-cut");
+        let p = d.join("upload-1-x.apb");
+        let chunks: Vec<Result<&'static [u8], io::Error>> = vec![Ok(b"APCTLBK1"), Err(io::Error::other("connection reset"))];
+        let err = receive(Body::from_stream(futures_util::stream::iter(chunks)), TempFile(Some(p.clone()))).await.err().expect("refused");
+        assert!(err.1.contains("upload interrupted"), "{}", err.1);
+        assert!(!p.exists());
+        // A whole one is kept for staging, until it is dropped.
+        let tmp = receive(Body::from("APCTLBK1"), TempFile(Some(p.clone()))).await.ok().expect("kept");
+        assert_eq!(fs::read(&p).unwrap(), b"APCTLBK1");
+        drop(tmp);
+        assert!(!p.exists());
     }
 
     #[test]

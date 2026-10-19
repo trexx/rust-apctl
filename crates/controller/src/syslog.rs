@@ -36,11 +36,13 @@ pub const MAGIC: [u8; 4] = wire::synth::SYSLOG_MAGIC;
 /// on a line with any non-ASCII text.
 static KEY: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| regex::Regex::new(r#"(?i)(?-u:\b)([a-z0-9_.]+)["']?\s*[:=]\s*"#).unwrap());
 
-/// Text that may hold a secret's key: any with one of the parts every secret's
-/// key holds, so most lines are stored without a search for keys. Built from
-/// the list `is_secret` reads, so the two cannot drift apart. A key starts at
-/// a word boundary (see [`KEY`]) and a segment after a dot, so the `x_` that
-/// starts a segment follows one: `tx_bytes` is not let through.
+/// Text that may hold a secret's key: one of the parts every secret's key
+/// holds, then the rest of a key and its separator as [`KEY`] reads them, so
+/// most lines are stored without a search for keys. Built from the list
+/// `is_secret` reads, so the two cannot drift apart. A key starts at a word
+/// boundary (see [`KEY`]) and a segment after a dot, so the `x_` that starts a
+/// segment follows one: `tx_bytes` is not let through, nor is the `key` of
+/// "pairwise key handshake" or the `PSK` of "key_mgmt WPA-PSK".
 static HINT: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
     let parts: Vec<String> = SECRET_PARTS
         .iter()
@@ -49,7 +51,9 @@ static HINT: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
             At::Last | At::LastEnd | At::Anywhere => regex::escape(p),
         })
         .collect();
-    regex::Regex::new(&format!("(?i-u){}", parts.join("|"))).unwrap()
+    // The parts in ASCII (the literals the search looks for first); what
+    // follows them in KEY's own terms, Unicode case and spaces included.
+    regex::Regex::new(&format!(r#"(?i)(?-u:{})[a-z0-9_.]*["']?\s*[:=]"#, parts.join("|"))).unwrap()
 });
 
 /// APs log some secrets in clear text (e.g. `authkey: <hex>` when they save a
@@ -61,6 +65,11 @@ pub fn redact(msg: &str) -> Cow<'_, str> {
     if !HINT.is_match(msg) {
         return Cow::Borrowed(msg);
     }
+    mask(msg)
+}
+
+/// [`redact`] without the quick test first.
+fn mask(msg: &str) -> Cow<'_, str> {
     let mut out = String::new();
     // How much of `msg` is copied to `out` or masked.
     let mut done = 0;
@@ -115,9 +124,11 @@ fn value(s: &str) -> (usize, Option<char>) {
 const HEADER: usize = wire::synth::SYSLOG_HEADER;
 
 /// The sender's `hash_id` of an encrypted datagram, as a number (shown as 16
-/// hex characters, as the AP's informs carry it: see [`parse_hash_id`]).
+/// hex characters, as the AP's informs carry it: see [`parse_hash_id`]). Only
+/// of one long enough to decrypt: a shorter one names no sender, so a made-up
+/// one cannot have an AP's syslog taken for an unknown sender's.
 pub fn hash_id(datagram: &[u8]) -> Option<u64> {
-    (datagram.starts_with(&MAGIC) && datagram.len() >= 17).then(|| u64::from_be_bytes(datagram[9..17].try_into().expect("8 bytes")))
+    (datagram.starts_with(&MAGIC) && datagram.len() >= HEADER + 16).then(|| u64::from_be_bytes(datagram[9..17].try_into().expect("8 bytes")))
 }
 
 /// A `hash_id` as an AP's informs carry it, as [`hash_id`] reads it from the
@@ -145,22 +156,33 @@ pub fn decrypt_with(datagram: &[u8], mac: Mac, cipher: &Aes256Gcm) -> Result<Str
 /// than for each datagram.
 #[derive(Default)]
 pub struct Ciphers {
-    /// The settings they were made from, once made. Compared by address: the
-    /// Weak keeps that address from being reused without keeping the settings.
-    from: Option<Option<Weak<Value>>>,
+    from: MadeFrom,
     keys: Vec<(Mac, Aes256Gcm)>,
+}
+
+/// What [`Ciphers`] were made from.
+#[derive(Default)]
+enum MadeFrom {
+    /// Nothing yet.
+    #[default]
+    Unmade,
+    /// The key file alone: there were no settings.
+    NoSettings,
+    /// These settings, compared by address: the Weak keeps that address from
+    /// being reused without keeping the settings.
+    Settings(Weak<Value>),
 }
 
 impl Ciphers {
     /// Makes the ciphers again if the settings changed since the last call.
     pub fn refresh(&mut self, state: Option<&Arc<Value>>, keys: &KeyStore) {
         let same = match (&self.from, state) {
-            (Some(None), None) => true,
-            (Some(Some(w)), Some(s)) => std::ptr::eq(w.as_ptr(), Arc::as_ptr(s)),
+            (MadeFrom::NoSettings, None) => true,
+            (MadeFrom::Settings(w), Some(s)) => std::ptr::eq(w.as_ptr(), Arc::as_ptr(s)),
             _ => false,
         };
         if !same {
-            self.from = Some(state.map(Arc::downgrade));
+            self.from = state.map_or(MadeFrom::NoSettings, |s| MadeFrom::Settings(Arc::downgrade(s)));
             self.keys = crate::adopt::syslog_keys(state.map(|s| &**s), keys).into_iter().map(|(m, k)| (m, Aes256Gcm::new(&k.into()))).collect();
         }
     }
@@ -216,7 +238,7 @@ pub fn parse(ts: Ts, src_ip: &str, device_mac: Option<Mac>, raw: &str) -> LogLin
     let mut program = None;
     if let Some((head, msg)) = rest.split_once(": ")
         && !head.contains(' ') && !head.is_empty() && head.len() < 64 {
-            program = Some(head.split('[').next().unwrap_or(head).to_string());
+            program = Some(head.split_once('[').map_or(head, |(p, _)| p).to_string());
             rest = msg;
         }
     LogLine { ts, device_mac, src_ip: src_ip.to_string(), facility, severity, program, msg: redact(rest.trim()).into_owned() }
@@ -243,6 +265,9 @@ pub(crate) mod tests {
         assert!(decrypt_with(&dgram, mac, &Aes256Gcm::new(&[8u8; 32].into())).is_err(), "wrong key");
         assert!(decrypt_with(b"plain text", mac, &Aes256Gcm::new(&key.into())).is_err());
         assert_eq!(hash_id(b"plain text"), None);
+        // Too short to decrypt (a header and less than a tag): no sender.
+        assert_eq!(hash_id(&dgram[..HEADER + 15]), None);
+        assert!(hash_id(&dgram[..HEADER + 16]).is_some());
     }
 
     #[test]
@@ -319,6 +344,57 @@ pub(crate) mod tests {
             assert!(matches!(redact(line), Cow::Borrowed(l) if l == line), "{line}");
         }
         assert!(!HINT.is_match("max_txpower=20 tx_bytes=1"));
+        // Nor do the lines that name a part without a key's separator after it.
+        for line in [
+            "wifi1ap0: STA 02:00:00:00:00:01 WPA: pairwise key handshake completed (RSN)",
+            "wifi1ap0: STA 02:00:00:00:00:01 WPA: group key handshake completed (RSN)",
+            "wifi1ap0: STA 02:00:00:00:00:01 WPA: sending 1/4 msg of 4-Way Handshake",
+            "wifi1ap0: AKM key_mgmt WPA-PSK SAE, secret not shown",
+            "radius secret rejected; community string ok",
+        ] {
+            assert!(!HINT.is_match(line), "{line}");
+        }
+    }
+
+    #[test]
+    fn the_quick_test_passes_over_no_line_the_search_would_mask() {
+        let check = |line: &str| {
+            if matches!(mask(line), Cow::Owned(_)) {
+                assert!(HINT.is_match(line), "{line:?} is masked, but the quick test passes over it");
+            }
+            assert_eq!(redact(line), mask(line), "{line:?}");
+        };
+        for line in [
+            "x_passphrase=hunter2, psk:abc; channel=36",
+            r#"{"x_passphrase": "a b", "name": "Home"}"#,
+            "'wpa_psk': 'a b' ok",
+            "aaa.1.wpa.psk=x snmp.community=public unifi.key=k iapp_key: 0f sae_password = y",
+            "wifi1ap0: psk=abc",
+            "cfg: authkey: 0123",
+            "wifi1ap0: STA 02:00:00:00:00:01 WPA: pairwise key handshake completed (RSN)",
+            "wifi1ap0: STA 02:00:00:00:00:01 WPA-PSK: x",
+            "psk\u{a0}= x",
+            "psk\u{212a}=1",
+            "Café « psk=hunter2 » ключ=1 x_passphrase: пароль ✓",
+            "naïve_psk=ü",
+        ] {
+            check(line);
+        }
+        // Parts of keys, other text, quotes and separators, every way up to four at a
+        // time: Unicode case (the Kelvin sign is a `k`, the long s an `s`) and spaces too.
+        let pieces = ["key", "Psk", "x_", "sae_", ".", "_", "a", "\"", "'", " ", ":", "=", "\u{212a}", "\u{17f}", "é", "-", "\u{a0}"];
+        let mut line = String::new();
+        for n in 1..=4u32 {
+            for i in 0..pieces.len().pow(n) {
+                line.clear();
+                let mut i = i;
+                for _ in 0..n {
+                    line.push_str(pieces[i % pieces.len()]);
+                    i /= pieces.len();
+                }
+                check(&line);
+            }
+        }
     }
 
     #[test]

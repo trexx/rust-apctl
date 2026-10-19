@@ -51,6 +51,8 @@ const ANOMALIES_AGAIN: Ts = 1800;
 
 #[derive(Default)]
 struct Steering {
+    /// The device that made the request: only its candidate lines are the request's.
+    from: Option<Source>,
     ts: Ts,
     rssi: Option<i64>,
     candidates: Option<i64>,
@@ -88,8 +90,10 @@ fn fault(msg: &str) -> Option<(CrashKind, Option<String>)> {
         Some((CrashKind::Panic, None))
     } else if msg.contains("Oops:") || msg.contains("Oops[#") || msg.contains("Internal error:") {
         Some((CrashKind::Oops, None))
-    } else if let Some(p) = msg.split("sending SIGSEGV to ").nth(1) {
-        Some((CrashKind::Segfault, Some(p.split_whitespace().next().unwrap_or(p).trim_end_matches(':').to_string())))
+    } else if let Some((_, after)) = msg.split_once("sending SIGSEGV to ") {
+        // `... sending SIGSEGV to mcad for ...`: the word after, if there is one.
+        let name = after.split_whitespace().next().map(|w| w.trim_end_matches(':')).filter(|n| !n.is_empty());
+        Some((CrashKind::Segfault, name.map(str::to_string)))
     } else if let Some((before, _)) = msg.split_once("unhandled level 2 translation fault") {
         // `mcad[1234]: unhandled ...`, maybe after a printk timestamp: the word just before, up to its PID.
         let name = before.split_whitespace().next_back().and_then(|w| w.split_once('[')).map(|(n, _)| n).filter(|n| !n.is_empty());
@@ -229,7 +233,7 @@ impl LogEvents {
             let mut parts = rest.split_whitespace();
             let client = parts.next().and_then(mac);
             let vap = parts.next().map(str::to_string);
-            let reason = rest.split("reason:").nth(1).map(|r| r.split(" rssi:").next().unwrap_or(r).trim_end_matches(')').trim().to_string());
+            let reason = rest.split("reason:").nth(1).map(|r| r.split_once(" rssi:").map_or(r, |(r, _)| r).trim_end_matches(')').trim().to_string());
             let signal = field(rest, "rssi:").and_then(|v| v.parse::<i64>().ok()).map(|r| r + NOISE_FLOOR);
             if let Some(c) = client
                 && self.fresh(EventKind::ClientKicked, c, 0, line.ts, 60)
@@ -245,6 +249,7 @@ impl LogEvents {
                 // and the VAP it was made on.
                 let vap = msg.split("vap-").nth(1).and_then(|r| r.split_once('(')).and_then(|(_, r)| r.split_once(')')).map(|(v, _)| v.to_string());
                 let s = Steering {
+                    from: Some(dev_key()),
                     ts: line.ts,
                     rssi: field(msg, "RSSI: ").and_then(|v| v.parse().ok()),
                     candidates: field(msg, "candidates: ").and_then(|v| v.parse().ok()),
@@ -255,8 +260,10 @@ impl LogEvents {
                     bounded(&mut self.steering_by_device, dev_key(), c);
                 }
             } else if let Some(t) = msg.split("BTM: [").nth(1).filter(|t| t.contains("]{"))
-                && let Some(client) = self.steering_by_device.get(&dev_key())
+                && let dev = dev_key()
+                && let Some(client) = self.steering_by_device.get(&dev)
                 && let Some(s) = self.steering.get_mut(client)
+                && s.from.as_ref() == Some(&dev)
                 && s.targets.len() < MAX_TARGETS
             {
                 // A candidate: "[0]{bssid chNN/opNN/phyNN}".
@@ -302,12 +309,13 @@ impl LogEvents {
         if prog == "mcad" && msg.contains("log_sta_anomalies") {
             let client = field(msg, "sta=").and_then(mac);
             // A comma-separated list: read up to the next space.
-            let reasons = msg.split("anomalies=").nth(1).and_then(|r| r.split_whitespace().next()).unwrap_or("").to_string();
+            let reasons = msg.split("anomalies=").nth(1).and_then(|r| r.split_whitespace().next()).unwrap_or("");
             if let Some(c) = client
                 && !reasons.is_empty()
             {
-                let changed = self.anomalies.get(&c).is_none_or(|(r, t)| *r != reasons || !(0..ANOMALIES_AGAIN).contains(&(line.ts - t)));
-                if changed && bounded(&mut self.anomalies, c, (reasons.clone(), line.ts)) {
+                // Copied only when reported: the same reasons come every 10 s or so.
+                let changed = self.anomalies.get(&c).is_none_or(|(r, t)| r != reasons || !(0..ANOMALIES_AGAIN).contains(&(line.ts - t)));
+                if changed && bounded(&mut self.anomalies, c, (reasons.to_string(), line.ts)) {
                     out.push(Event {
                         ts: line.ts,
                         kind: EventKind::ClientExperience,
@@ -453,6 +461,22 @@ mod tests {
     }
 
     #[test]
+    fn candidates_are_the_request_of_the_device_that_lists_them() {
+        let mut l = LogEvents::default();
+        let p = "wlan: [0:I:ANY] [UNSPECIFIED] vap-0(wifi1ap1):";
+        let from = |ap: &str, ts: Ts, msg: String| LogLine { device_mac: ap.parse().ok(), ..line(ts, "kernel", &msg) };
+        let (e, d) = ("02:00:00:00:00:0e", "02:00:00:00:00:0d");
+        // AP E asks the client to move, then AP D does; E's candidates come after.
+        l.feed(&from(e, 10, format!("{p}BTM: STA 6c:ac:c2:00:00:01 RSSI: -77, candidates: 1, error: 0, flags: ALLOW (0x1)")));
+        l.feed(&from(d, 11, format!("{p}BTM: STA 6c:ac:c2:00:00:01 RSSI: -70, candidates: 1, error: 0, flags: ALLOW (0x1)")));
+        l.feed(&from(e, 11, format!("{p}BTM: [0]{{78:45:58:3c:51:ae ch44/op128/phy14}}")));
+        l.feed(&from(d, 11, format!("{p}BTM: [0]{{78:45:58:3c:51:af ch36/op128/phy14}}")));
+        let f = l.feed(&from(d, 12, format!("{p}BTM: Received response from [6c:ac:c2:00:00:01](len = 5): dialog_token 1, status 0, delay 0, bssid n/a, cancel 0")));
+        assert_eq!((f[0].data["signal"].as_i64(), f[0].data["candidates"].as_array().map(Vec::len)), (Some(-70), Some(1)));
+        assert_eq!(f[0].data["candidates"][0]["bssid"], "78:45:58:3c:51:af");
+    }
+
+    #[test]
     fn experience_problems_when_they_change() {
         let mut l = LogEvents::default();
         let m = |r: &str| format!("wireless_agg_stats.log_sta_anomalies(): bssid=78:45:58:3c:51:ae radio=wifi1 vap=wifi1ap0 sta=92:00:00:00:00:05 signal=-48 satisfaction_now=70 anomalies={r}");
@@ -491,7 +515,7 @@ mod tests {
     }
 
     #[test]
-    fn a_memory_fault_names_the_process_before_it() {
+    fn a_fault_names_the_process_it_killed() {
         let name = |msg: &str| fault(msg).and_then(|(_, p)| p);
         assert_eq!(name("mcad[1234]: unhandled level 2 translation fault (11) at 0x0, esr 0x92000005"), Some("mcad".into()));
         assert_eq!(name("[ 12345.678] mcad[1234]: unhandled level 2 translation fault (11) at 0x0"), Some("mcad".into()));
@@ -499,6 +523,11 @@ mod tests {
         assert_eq!(name("unhandled level 2 translation fault (11) at 0x0"), None);
         assert_eq!(name("[12345.678] unhandled level 2 translation fault (11) at 0x0"), None, "a timestamp is no process");
         assert_eq!(name("[ 12345.678] unhandled level 2 translation fault (11) at 0x0"), None);
+        // A segfault names the word after it, if there is one.
+        assert_eq!(name("do_page_fault(): sending SIGSEGV to mcad: for invalid read access"), Some("mcad".into()));
+        for nothing in ["do_page_fault(): sending SIGSEGV to ", "do_page_fault(): sending SIGSEGV to  :"] {
+            assert_eq!(fault(nothing), Some((CrashKind::Segfault, None)), "{nothing:?}");
+        }
     }
 
     #[test]
