@@ -295,6 +295,12 @@ pub(crate) const RETRY_AT: [usize; 3] = [0, 1, 2];
 const BYTE_COLS: [&str; 2] = ["tx_bytes", "rx_bytes"];
 const DENSITY_COLS: &[&str] = &["tx_bytes", "rx_bytes", "tx_retries", "wifi_tx_attempts", "wifi_tx_dropped"];
 
+/// The client signals in one tier, for [`density`]: in time order (the `ts`
+/// index's own), so that each report is summed up once all its signals are read.
+fn density_sql(suffix: &str) -> String {
+    format!("SELECT ts, ap_mac, radio, signal FROM client_stats{suffix} WHERE ts >= ?1 AND ts <= ?2 AND signal < 0 AND ap_mac IS NOT NULL ORDER BY ts")
+}
+
 /// GET /api/site/density: how well each AP's weakest clients hear it. Per
 /// report, the average signal of the weaker half of an AP's clients (per
 /// band and overall), averaged over the window.
@@ -303,7 +309,7 @@ pub async fn density(State(s): State<AppState>, Query(q): Query<RangeQuery>) -> 
     let suffix = TIERS[tier].0;
     // Worked out where the data is read, off the async workers and the live lock.
     let aps = memo_read(&s, Db::Metrics, "density", &q, tier, move |c| {
-        let mut stmt = c.prepare_cached(&format!("SELECT ts, ap_mac, radio, signal FROM client_stats{suffix} WHERE ts >= ?1 AND ts <= ?2 AND signal < 0 AND ap_mac IS NOT NULL"))?;
+        let mut stmt = c.prepare_cached(&density_sql(suffix))?;
         // The few AP and band names, each kept once; a group refers to them by place.
         let (mut names, mut index): (Vec<String>, HashMap<String, usize>) = Default::default();
         let mut name = |v: &str| match index.get(v) {
@@ -316,12 +322,27 @@ pub async fn density(State(s): State<AppState>, Query(q): Query<RangeQuery>) -> 
         };
         let all = name("all");
         let mut signals: Signals = HashMap::new();
+        // The groups with signals at the report time being read.
+        let (mut at, mut open): (Option<Ts>, Vec<(usize, usize)>) = (None, Vec::new());
         let mut rows = stmt.query([from, to])?;
         while let Some(r) = rows.next()? {
             let (ts, ap, radio, sig) = (r.get::<_, Ts>(0)?, name(r.get_ref(1)?.as_str()?), r.get_ref(2)?.as_str_or_null()?.map(&mut name), r.get::<_, f64>(3)?);
-            for band in std::iter::once(all).chain(radio) {
-                signals.entry((ap, band)).or_default().entry(ts).or_default().push(sig);
+            if at != Some(ts) {
+                for g in open.drain(..) {
+                    signals.get_mut(&g).expect("opened").close();
+                }
+                at = Some(ts);
             }
+            for band in std::iter::once(all).chain(radio) {
+                let g = signals.entry((ap, band)).or_default();
+                if g.now.is_empty() {
+                    open.push((ap, band));
+                }
+                g.now.push(sig);
+            }
+        }
+        for g in open {
+            signals.get_mut(&g).expect("opened").close();
         }
         let vaps = load(c, Spec { table: "vap_stats", key: "bssid", extra: &["ap_mac", "radio"], cols: DENSITY_COLS, only: None }, tier, from, to)?;
         Ok(density_of(signals, &names, &vaps, from))
@@ -332,11 +353,38 @@ pub async fn density(State(s): State<AppState>, Query(q): Query<RangeQuery>) -> 
     Ok(Json(json!({ "aps": list })))
 }
 
-/// Client signals per (AP, band), by their places in a list of names, and
-/// report time; each also counts under the band "all".
+/// Client signals per (AP, band), by their places in a list of names; each
+/// also counts under the band "all".
 type Signals = HashMap<(usize, usize), Reports>;
-/// Per report time, client signals.
-type Reports = BTreeMap<Ts, Vec<f64>>;
+
+/// One AP and band's client signals, summed up report by report.
+#[derive(Default)]
+struct Reports {
+    /// Every signal, summed, and how many.
+    sum: f64,
+    n: usize,
+    /// Per report, the average of its weaker half, summed.
+    weakest: f64,
+    reports: usize,
+    /// The signals of the report being read.
+    now: Vec<f64>,
+}
+
+impl Reports {
+    /// Adds the report being read.
+    fn close(&mut self) {
+        if self.now.is_empty() {
+            return;
+        }
+        self.sum += self.now.iter().sum::<f64>();
+        self.n += self.now.len();
+        self.now.sort_by(f64::total_cmp);
+        let half = (self.now.len() / 2).max(1);
+        self.weakest += self.now[..half].iter().sum::<f64>() / half as f64;
+        self.reports += 1;
+        self.now.clear();
+    }
+}
 
 /// [`density`] per AP, from the client signals and the VAPs' counters.
 fn density_of(signals: Signals, names: &[String], vaps: &Loaded, from: Ts) -> Vec<(String, Vec<Value>)> {
@@ -365,26 +413,13 @@ fn density_of(signals: Signals, names: &[String], vaps: &Loaded, from: Ts) -> Ve
     let mut signals: Vec<((&str, &str), Reports)> = signals.into_iter().map(|((ap, band), r)| ((names[ap].as_str(), names[band].as_str()), r)).collect();
     signals.sort_unstable_by(|a, b| a.0.cmp(&b.0));
     let mut out: Vec<(String, Vec<Value>)> = Vec::new();
-    for ((ap, band), reports) in signals {
-        // Each report's signals: all of them averaged, then the weaker half.
-        let (mut sum, mut n) = (0.0, 0);
-        let mut weakest = Vec::with_capacity(reports.len());
-        let count = reports.len();
-        for mut sigs in reports.into_values() {
-            for x in &sigs {
-                sum += x;
-            }
-            n += sigs.len();
-            sigs.sort_by(f64::total_cmp);
-            let half = (sigs.len() / 2).max(1);
-            weakest.push(sigs[..half].iter().sum::<f64>() / half as f64);
-        }
+    for ((ap, band), Reports { sum, n, weakest, reports: count, .. }) in signals {
         let traffic = bytes.get(&(ap, band)).copied().unwrap_or(0.0);
         let total = band_total.get(band).copied().unwrap_or(0.0);
         let retry = retries.get(&(ap, band)).map(|r| retry_pct(*r));
         let group = json!({
             "band": band,
-            "weakest_signal": (weakest.iter().sum::<f64>() / weakest.len().max(1) as f64).round(),
+            "weakest_signal": (weakest / count.max(1) as f64).round(),
             "signal_avg": (sum / n.max(1) as f64).round(),
             "clients": ((n as f64 / count.max(1) as f64) * 10.0).round() / 10.0,
             "traffic_pct": if total > 0.0 { 100.0 * traffic / total } else { 0.0 },
@@ -1023,6 +1058,16 @@ mod tests {
         let (ts, types) = mcast_types(&rows, 1000, 1600, 300, 300);
         assert_eq!(ts, [1200, 1500]);
         assert_eq!((types["mdns"]["tx_pps"].clone(), types["mdns"]["tx_pkts"].as_f64()), (json!([2.0, 4.0]), Some(200.0 + 600.0 + 400.0)));
+    }
+
+    #[test]
+    fn client_signals_are_read_in_time_order_through_the_ts_index_without_a_sort() {
+        let t = TestStore::new("density-plan");
+        let c = t.db(Db::Metrics);
+        for suffix in ["", "_5m", "_1h"] {
+            let plan: Vec<String> = c.prepare(&format!("EXPLAIN QUERY PLAN {}", density_sql(suffix))).unwrap().query_map([0, Ts::MAX], |r| r.get(3)).unwrap().map(Result::unwrap).collect();
+            assert_eq!(plan, [format!("SEARCH client_stats{suffix} USING INDEX client_stats{suffix}_ts (ts>? AND ts<?)")]);
+        }
     }
 
     #[test]
