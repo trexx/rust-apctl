@@ -174,9 +174,10 @@ struct Heard {
 
 /// The channel plan for one band (`ng` or `na`). `allowed` limits the
 /// channels (the Channel AI settings; `None`: every channel the AP or the band
-/// offers), `pinned` APs keep their channel. A plan only moves APs when it is
-/// clearly better overall (by more than 10%), or when an AP is on a channel no
-/// longer allowed.
+/// offers), `pinned` APs keep their channel. An AP on a channel no longer
+/// allowed moves; any other moves only when clearly better off there, and
+/// those moves are made only when the plan is better overall by more than 10%
+/// than making just the ones that must be made.
 pub async fn compute_plan(s: &AppState, radio: String, dfs: bool, allowed: Option<Vec<i64>>, pinned: Vec<String>) -> Result<Plan, ApiError> {
     // The channel blocks are worked out for 2.4 and 5 GHz only.
     if !matches!(radio.as_str(), "ng" | "na") {
@@ -339,42 +340,61 @@ fn plan_channels(
         (total, reasons.into_iter().take(4).map(|r| r.1).collect())
     };
     // Greedy: busiest AP first, then a second pass with everyone placed.
+    let greedy = |movers: &[usize], mut placed: Vec<Block>| -> Vec<Block> {
+        for _ in 0..2 {
+            for &i in movers {
+                if let Some((_, b)) = cands[i].iter().map(|b| (cost(i, b, &placed), *b)).min_by(|a, b| a.0.total_cmp(&b.0)) {
+                    placed[i] = b;
+                }
+            }
+        }
+        placed
+    };
     let mut order: Vec<usize> = (0..n).filter(|i| !is_pinned[*i]).collect();
     order.sort_by_key(|i| -aps[*i].clients);
     let current: Vec<Block> = aps.iter().map(|a| a.current).collect();
-    let mut assigned = current.clone();
-    for _ in 0..2 {
-        for &i in &order {
-            let best = cands[i].iter().map(|b| (cost(i, b, &assigned), *b)).min_by(|a, b| a.0.total_cmp(&b.0));
-            if let Some((_, b)) = best {
-                assigned[i] = b;
-            }
-        }
+    // APs that must move: their channel is not one the settings allow (the
+    // whole block at a wider width) or the country allows, and there is one
+    // that is. A channel the planner would not pick itself (13, 165) may stay.
+    let same = |a: &Block, b: &Block| (a.lo - b.lo).abs() < 1.0 && (a.hi - b.hi).abs() < 1.0;
+    let must: Vec<bool> = aps
+        .iter()
+        .enumerate()
+        .map(|(i, ap)| {
+            let allowed_here = allowed.as_ref().is_none_or(|a| allowed_blocks(&radio, ap.width, a).iter().any(|b| same(b, &ap.current)));
+            let legal_here = ap.legal.as_ref().is_none_or(|l| l.contains(&ap.current.primary));
+            !is_pinned[i] && !cands[i].is_empty() && !(allowed_here && legal_here)
+        })
+        .collect();
+    let moved = |plan: &[Block], i: usize| plan[i].primary != current[i].primary;
+    // Every other AP moves only when clearly better off (by more than 20%,
+    // and 5) with the others where the plan leaves them. A move given up can
+    // spoil another (an AP taking a channel that one was to leave), so they
+    // are judged again, the worst given up first, until every move left pays.
+    let mut fin = greedy(&order, current.clone());
+    loop {
+        let worst = (0..n)
+            .filter(|&i| !must[i] && moved(&fin, i))
+            .map(|i| (cost(i, &fin[i], &fin) + 5.0 - cost(i, &current[i], &fin) * 0.8, i))
+            .filter(|(short, _)| *short >= 0.0)
+            .max_by(|a, b| a.0.total_cmp(&b.0));
+        let Some((_, i)) = worst else { break };
+        fin[i] = current[i];
     }
-    // Which APs move, and whether because their channel is no longer allowed
-    // (otherwise they are clearly better off elsewhere).
-    let mut evict: Vec<Option<bool>> = vec![None; n];
-    let mut fin = current.clone();
-    for (i, ap) in aps.iter().enumerate() {
-        let (cur, sug) = (ap.current, assigned[i]);
-        if is_pinned[i] || cur.primary == sug.primary {
-            continue;
-        }
-        let ev = !cands[i].iter().any(|b| (b.lo - cur.lo).abs() < 1.0 && (b.hi - cur.hi).abs() < 1.0);
-        if ev || cost(i, &sug, &assigned) + 5.0 < cost(i, &cur, &assigned) * 0.8 {
-            fin[i] = sug;
-            evict[i] = Some(ev);
-        }
-    }
+    // The other moves are made only when the plan is better overall by more
+    // than 10% than making just the ones that must be made.
+    let must_order: Vec<usize> = order.iter().copied().filter(|i| must[*i]).collect();
+    let forced = if must_order.is_empty() { current.clone() } else { greedy(&must_order, current.clone()) };
     let total = |m: &[Block]| -> f64 { m.iter().enumerate().map(|(i, b)| cost(i, b, m)).sum() };
-    let (current_total, final_total) = (total(&current), total(&fin));
-    let accepted = evict.contains(&Some(true)) || (evict.iter().any(Option::is_some) && final_total * 1.1 < current_total);
-    // A plan not worth applying suggests leaving every AP where it is, and is scored as that.
-    let suggested_total = if accepted { final_total } else { current_total };
-    if !accepted {
-        fin = current.clone();
-        evict = vec![None; n];
+    let current_total = total(&current);
+    let optional = (0..n).any(|i| !must[i] && moved(&fin, i));
+    if !(optional && total(&fin) * 1.1 < total(&forced)) {
+        fin = forced;
     }
+    // A plan that moves nothing suggests leaving every AP where it is, and is scored as that.
+    let accepted = (0..n).any(|i| moved(&fin, i));
+    let suggested_total = if accepted { total(&fin) } else { current_total };
+    let evict: Vec<Option<bool>> = (0..n).map(|i| moved(&fin, i).then_some(must[i])).collect();
     let plan: Vec<PlanEntry> = aps
         .iter()
         .enumerate()
@@ -469,5 +489,43 @@ mod tests {
         assert!(plan.accepted, "{plan:?}");
         let to: HashMap<&str, (i64, bool)> = plan.plan.iter().map(|p| (p.mac.as_str(), (p.suggested_channel, p.not_allowed))).collect();
         assert_eq!((to["in"], to["out"]), ((116, false), (100, true)));
+    }
+
+    /// A 2.4 GHz AP for a plan: hearing no AP of ours, so taken to be 75 dBm from each.
+    fn ng_ap(mac: &str, ch: i64, clients: i64) -> PlanAp {
+        PlanAp { mac: mac.into(), name: None, current: block("ng", ch, 20), width: 20, clients, available: None, legal: None }
+    }
+
+    /// A network `by` hears on a 2.4 GHz channel.
+    fn ng_neighbour(by: &str, ch: i64, signal: f64) -> NeighborRow {
+        (by.into(), format!("{by}-{ch}"), Some(format!("Net {ch}")), Some(2407.0 + 5.0 * ch as f64), Some(20.0), Some(signal))
+    }
+
+    #[test]
+    fn an_ap_moves_onto_a_channel_only_when_the_one_there_leaves() {
+        // "i" is crowded on 1 and 11 and would take 6 were "j" to leave it; "j"
+        // would do a little better on 1, not enough to move. "k" sits on 13,
+        // which the settings no longer allow, so the plan is applied.
+        let aps = vec![ng_ap("i", 1, 5), ng_ap("j", 6, 2), ng_ap("k", 13, 1)];
+        let neigh = vec![ng_neighbour("i", 1, -45.0), ng_neighbour("i", 11, -45.0), ng_neighbour("j", 1, -60.0), ng_neighbour("j", 11, -50.0), ng_neighbour("k", 1, -40.0), ng_neighbour("k", 6, -40.0)];
+        let plan = plan_channels("ng".into(), false, Some(vec![1, 6, 11]), vec![], aps, HashMap::new(), neigh, vec![]);
+        assert!(plan.accepted, "{plan:?}");
+        let to: HashMap<&str, (i64, bool)> = plan.plan.iter().map(|p| (p.mac.as_str(), (p.suggested_channel, p.change))).collect();
+        assert_eq!(to["k"], (11, true), "{plan:?}");
+        assert_eq!((to["i"], to["j"]), ((1, false), (6, false)), "j stays, so i stays off its channel: {plan:?}");
+    }
+
+    #[test]
+    fn a_channel_the_planner_would_not_pick_is_left_unless_not_allowed() {
+        // Channel 13 is not among the planner's own 1, 6 and 11, nor 165 among
+        // its 5 GHz blocks; nothing is better elsewhere, so neither moves.
+        let plan = plan_channels("ng".into(), false, None, vec![], vec![ng_ap("a", 13, 1)], HashMap::new(), vec![], vec![]);
+        assert!(!plan.accepted && !plan.plan[0].change && !plan.plan[0].not_allowed, "{plan:?}");
+        let ap = PlanAp { mac: "b".into(), name: None, current: block("na", 165, 20), width: 20, clients: 1, available: None, legal: crate::settings::legal_channels(Some(840), "na", 20, false) };
+        let plan = plan_channels("na".into(), false, None, vec![], vec![ap], HashMap::new(), vec![], vec![]);
+        assert!(!plan.accepted && !plan.plan[0].change, "{plan:?}");
+        // Settings that leave 13 out move it.
+        let plan = plan_channels("ng".into(), false, Some(vec![1, 6, 11]), vec![], vec![ng_ap("a", 13, 1)], HashMap::new(), vec![], vec![]);
+        assert!(plan.accepted && plan.plan[0].change && plan.plan[0].not_allowed, "{plan:?}");
     }
 }
