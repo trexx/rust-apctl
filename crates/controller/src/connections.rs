@@ -18,7 +18,7 @@
 //!   it a roam or the client was back within a second; 802.11r ("ft") and the
 //!   AP's roaming triggers (minimum RSSI, roaming assistant) are recorded.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 
 use axum::extract::State;
@@ -429,7 +429,8 @@ pub fn roams(events: &[ConnEvent]) -> Vec<Roam> {
         // Whether each event is a leave, and whether it carries the signal a join needs.
         let leave: Vec<bool> = evs.iter().map(|e| LEAVE_TYPES.contains(&e.event_type.as_str())).collect();
         let joined: Vec<bool> = evs.iter().zip(&leave).map(|(e, l)| !l && num(&e.n.auth_rssi).is_some()).collect();
-        let mut used: HashSet<usize> = HashSet::new();
+        // The joins already paired with a leave.
+        let mut used = vec![false; evs.len()];
         for (li, l) in evs.iter().enumerate() {
             if !leave[li] || num(&l.n.avg_rssi).is_none() {
                 continue;
@@ -439,10 +440,10 @@ pub fn roams(events: &[ConnEvent]) -> Vec<Roam> {
             let (lo, hi) = (evs.partition_point(|j| j.ts < l.ts - 10), evs.partition_point(|j| j.ts <= l.ts + 15));
             let join = (lo..hi)
                 .map(|ji| (ji, evs[ji]))
-                .filter(|(ji, j)| joined[*ji] && !used.contains(ji) && j.ap != l.ap && (j.essid.is_none() || l.essid.is_none() || j.essid == l.essid))
+                .filter(|(ji, j)| joined[*ji] && !used[*ji] && j.ap != l.ap && (j.essid.is_none() || l.essid.is_none() || j.essid == l.essid))
                 .max_by_key(|(_, j)| (band_rank(j.radio.as_deref()), std::cmp::Reverse((j.ts - l.ts).abs())));
             let Some((ji, j)) = join else { continue };
-            used.insert(ji);
+            used[ji] = true;
             let gap = j.ts - l.ts;
             let success = l.event_type == "sta_roam" || gap.abs() <= 1;
             let status = num(&l.n.assoc_status).unwrap_or(0.0) as i64;
