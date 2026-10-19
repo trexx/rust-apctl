@@ -1062,6 +1062,8 @@ async fn events(State(s): State<AppState>, Query(q): Query<EventQuery>) -> Resul
             return Ok(vec![]);
         }
         let by_id = catch_up_by_id(c, "events", after)?;
+        // Bound, as every value is, so that each shape of query is compiled once per connection.
+        let limit = w.param(Sql::Integer(limit));
         if let Some(after) = after.filter(|_| !by_id) {
             // Unary plus: not by the rowid range, which would visit every event since.
             w.and("+id > ?", Sql::Integer(after));
@@ -1086,7 +1088,7 @@ async fn events(State(s): State<AppState>, Query(q): Query<EventQuery>) -> Resul
                 .collect();
             format!("{} ORDER BY ts DESC, id DESC LIMIT {limit}", parts.join(" UNION ALL "))
         };
-        let mut stmt = c.prepare(&sql)?;
+        let mut stmt = c.prepare_cached(&sql)?;
         let rows = stmt
             .query_map(params_from_iter(w.params), |r| {
                 Ok(EventRow { id: r.get(5)?, ts: r.get(0)?, kind: r.get(1)?, device_mac: r.get(2)?, client_mac: r.get(3)?, data: raw_json(r.get(4)?) })
@@ -1111,6 +1113,8 @@ struct LogQuery {
 /// The SQL for a log query, newest first; `by_id` as `catch_up_by_id` decides.
 fn logs_sql(w: &mut Where, device: Option<Mac>, search: Option<&str>, after: Option<i64>, by_id: bool, limit: i64) -> String {
     const COLUMNS: &str = "l.ts, l.device_mac, l.src_ip, l.facility, l.severity, l.program, l.msg, l.id";
+    // Bound, as every value is, so that each shape of query is compiled once per connection.
+    let limit = w.param(Sql::Integer(limit));
     if let Some(text) = search {
         // Quote each word so user input cannot break FTS syntax; words are ANDed.
         let fts: Vec<String> = text.split_whitespace().map(|w| format!("\"{}\"", w.replace('"', "\"\""))).collect();
@@ -1169,7 +1173,7 @@ async fn logs(State(s): State<AppState>, Query(q): Query<LogQuery>) -> Result<Js
         let by_id = search.is_none() && catch_up_by_id(c, "logs", after)?;
         let mut w = Where::default();
         let sql = logs_sql(&mut w, device, search.as_deref(), after, by_id, limit);
-        let mut stmt = c.prepare(&sql)?;
+        let mut stmt = c.prepare_cached(&sql)?;
         let rows = stmt
             .query_map(params_from_iter(w.params), |r| {
                 Ok(LogRow {
@@ -1527,6 +1531,7 @@ mod tests {
         // A search is read from the full-text index, newest first, and stops at the limit.
         let mut w = Where::default();
         let sql = logs_sql(&mut w, None, Some("sta"), None, false, 10);
+        assert!(sql.contains("LIMIT ?1)") && w.params[0] == Sql::Integer(10), "the limit is bound, as every value: {sql}");
         let plan: Vec<String> = s
             .store
             .read(Db::Logs, |c| Ok(c.prepare(&format!("EXPLAIN QUERY PLAN {sql}"))?.query_map(params_from_iter(w.params), |r| r.get(3))?.collect::<rusqlite::Result<_>>()?))
