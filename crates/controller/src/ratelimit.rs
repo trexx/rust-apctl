@@ -106,8 +106,7 @@ fn due(live: &Live, l: &mut Limits) -> Vec<(Mac, Value)> {
     if l.groups.own.is_empty() && l.sent.is_empty() {
         return Vec::new();
     }
-    let connected = |m: &Mac| live.clients.get(m).is_some_and(|c| c.connected);
-    l.sent.retain(|m, _| connected(m));
+    l.sent.retain(|m, _| live.connected.contains(m));
     // Only a client with a group of its own, or one sent a command before, can need one.
     let own = &l.groups.own;
     let candidates: Vec<Mac> = own.keys().chain(l.sent.keys().filter(|m| !own.contains_key(*m))).copied().collect();
