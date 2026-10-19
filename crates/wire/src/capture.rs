@@ -8,6 +8,7 @@ use std::collections::btree_map::Entry;
 use std::collections::{BTreeMap, HashMap};
 use std::io::Read;
 use std::net::{IpAddr, SocketAddr};
+use std::ops::ControlFlow;
 
 use anyhow::{Context, Result, bail};
 use etherparse::{NetSlice, SlicedPacket, TransportSlice};
@@ -41,11 +42,14 @@ pub enum End {
     Complete,
     /// In the middle of a packet (tcpdump killed mid-write): what came before was read.
     Truncated,
+    /// `on_event` asked to stop: the rest of the capture was not read.
+    Stopped,
 }
 
 /// Reads packets from `input` and calls `on_event` for every complete HTTP message
-/// whose TCP connection has one of `ports` as its server port.
-pub fn run<R: Read + Send>(input: R, ports: &[u16], on_event: impl FnMut(HttpEvent)) -> Result<End> {
+/// whose TCP connection has one of `ports` as its server port, until the capture ends
+/// or `on_event` returns `Break`.
+pub fn run<R: Read + Send>(input: R, ports: &[u16], on_event: impl FnMut(HttpEvent) -> ControlFlow<()>) -> Result<End> {
     run_with_udp(input, ports, &[], on_event)
 }
 
@@ -54,7 +58,7 @@ pub fn run_with_udp<R: Read + Send>(
     input: R,
     ports: &[u16],
     udp_ports: &[u16],
-    mut on_event: impl FnMut(HttpEvent),
+    mut on_event: impl FnMut(HttpEvent) -> ControlFlow<()>,
 ) -> Result<End> {
     let mut buffer_size = 1 << 20;
     let mut reader = create_reader(buffer_size, input).map_err(|e| anyhow::anyhow!("reading capture header: {e:?}"))?;
@@ -70,36 +74,44 @@ pub fn run_with_udp<R: Read + Send>(
     loop {
         match reader.next() {
             Ok((offset, block)) => {
-                match block {
+                let flow = match block {
                     PcapBlockOwned::LegacyHeader(h) => {
                         legacy_linktype = h.network;
                         legacy_nanos = h.is_nanosecond_precision();
+                        ControlFlow::Continue(())
                     }
                     PcapBlockOwned::Legacy(b) => {
                         let frac = if legacy_nanos { b.ts_usec as i64 / 1000 } else { b.ts_usec as i64 };
                         last_ts = b.ts_sec as i64 * 1_000_000 + frac;
-                        tracker.packet(legacy_linktype, last_ts, b.data, &mut on_event);
+                        tracker.packet(legacy_linktype, last_ts, b.data, &mut on_event)
                     }
-                    PcapBlockOwned::NG(Block::SectionHeader(_)) => interfaces.clear(),
+                    PcapBlockOwned::NG(Block::SectionHeader(_)) => {
+                        interfaces.clear();
+                        ControlFlow::Continue(())
+                    }
                     PcapBlockOwned::NG(Block::InterfaceDescription(idb)) => {
                         // pcap-parser reads the offset as little-endian whatever the section's byte order.
                         let offset = if idb.block_type == IDB_MAGIC { idb.if_tsoffset } else { idb.if_tsoffset.swap_bytes() };
                         interfaces.push((idb.linktype, ts_units(idb.if_tsresol), offset));
+                        ControlFlow::Continue(())
                     }
                     // A packet naming an interface no block described is skipped: the
                     // reader still has to move past it, below.
-                    PcapBlockOwned::NG(Block::EnhancedPacket(epb)) => {
-                        if let Some(&(linktype, units, offset)) = interfaces.get(epb.if_id as usize) {
+                    PcapBlockOwned::NG(Block::EnhancedPacket(epb)) => match interfaces.get(epb.if_id as usize) {
+                        Some(&(linktype, units, offset)) => {
                             last_ts = epb_micros(epb.ts_high, epb.ts_low, units, offset);
-                            tracker.packet(linktype, last_ts, epb.packet_data(), &mut on_event);
+                            tracker.packet(linktype, last_ts, epb.packet_data(), &mut on_event)
                         }
-                    }
-                    PcapBlockOwned::NG(Block::SimplePacket(spb)) => {
-                        if let Some(&(linktype, ..)) = interfaces.first() {
-                            tracker.packet(linktype, last_ts, spb.packet_data(), &mut on_event);
-                        }
-                    }
-                    PcapBlockOwned::NG(_) => {}
+                        None => ControlFlow::Continue(()),
+                    },
+                    PcapBlockOwned::NG(Block::SimplePacket(spb)) => match interfaces.first() {
+                        Some(&(linktype, ..)) => tracker.packet(linktype, last_ts, spb.packet_data(), &mut on_event),
+                        None => ControlFlow::Continue(()),
+                    },
+                    PcapBlockOwned::NG(_) => ControlFlow::Continue(()),
+                };
+                if flow.is_break() {
+                    return Ok(End::Stopped);
                 }
                 reader.consume(offset);
             }
@@ -263,27 +275,25 @@ impl Tracker {
         Tracker { ports, udp_ports, conns: HashMap::new(), held: 0, sweeper: Sweeper::default() }
     }
 
-    fn packet(&mut self, linktype: Linktype, ts: Micros, data: &[u8], on_event: &mut impl FnMut(HttpEvent)) {
-        let Some(pkt) = slice(linktype, data) else { return };
+    /// Takes one captured packet, and hands `on_event` what it completes; stops at a `Break` from it.
+    fn packet(&mut self, linktype: Linktype, ts: Micros, data: &[u8], on_event: &mut impl FnMut(HttpEvent) -> ControlFlow<()>) -> ControlFlow<()> {
+        let Some(pkt) = slice(linktype, data) else { return ControlFlow::Continue(()) };
         let (src_ip, dst_ip): (IpAddr, IpAddr) = match &pkt.net {
             Some(NetSlice::Ipv4(v4)) => (v4.header().source_addr().into(), v4.header().destination_addr().into()),
             Some(NetSlice::Ipv6(v6)) => (v6.header().source_addr().into(), v6.header().destination_addr().into()),
-            _ => return,
+            _ => return ControlFlow::Continue(()),
         };
         let tcp = match &pkt.transport {
             Some(TransportSlice::Tcp(tcp)) => tcp,
-            Some(TransportSlice::Udp(udp)) => {
-                if self.udp_ports.contains(&udp.destination_port()) {
-                    on_event(HttpEvent::Datagram {
-                        ts,
-                        src: SocketAddr::new(src_ip, udp.source_port()),
-                        dst: SocketAddr::new(dst_ip, udp.destination_port()),
-                        payload: udp.payload().to_vec(),
-                    });
-                }
-                return;
+            Some(TransportSlice::Udp(udp)) if self.udp_ports.contains(&udp.destination_port()) => {
+                return on_event(HttpEvent::Datagram {
+                    ts,
+                    src: SocketAddr::new(src_ip, udp.source_port()),
+                    dst: SocketAddr::new(dst_ip, udp.destination_port()),
+                    payload: udp.payload().to_vec(),
+                });
             }
-            _ => return,
+            _ => return ControlFlow::Continue(()),
         };
         let src = SocketAddr::new(src_ip, tcp.source_port());
         let dst = SocketAddr::new(dst_ip, tcp.destination_port());
@@ -292,14 +302,14 @@ impl Tracker {
         } else if self.ports.contains(&src.port()) {
             (ConnId { client: dst, server: src }, false)
         } else {
-            return;
+            return ControlFlow::Continue(());
         };
 
         if tcp.rst() {
             if let Some(c) = self.conns.remove(&conn_id) {
                 self.held -= c.counted;
             }
-            return;
+            return ControlFlow::Continue(());
         }
         if self.conns.len() >= MAX_CONNS && !self.conns.contains_key(&conn_id) {
             self.make_room(ts);
@@ -315,10 +325,11 @@ impl Tracker {
         // copy of a segment (`-i any`) or one queued behind a gap leaves nothing to cut.
         if (half.pos, half.closed()) != before {
             while let Some(msg) = half.take_http(to_server) {
+                // Stopping leaves the tracker as it is: it is not used again.
                 on_event(match msg {
                     Parsed::Request { inform, forwarded_for, body } => HttpEvent::Request { conn: conn_id, ts, inform, forwarded_for, body },
                     Parsed::Response { status, body } => HttpEvent::Response { conn: conn_id, ts, status, body },
-                });
+                })?;
             }
         }
         // Both sides closed and nothing is missing: release the buffers. The
@@ -337,6 +348,7 @@ impl Tracker {
         }
 
         self.sweep(ts);
+        ControlFlow::Continue(())
     }
 
     /// Forgets idle connections, when a sweep is due.
@@ -1083,7 +1095,7 @@ mod tests {
         let client = |n: u16| crate::synth::Endpoint { mac: [2; 6], ip: [10, 1, (n >> 8) as u8, n as u8], port: 40000 };
         let send = |t: &mut Tracker, n: u16, seq: u32, payload: &[u8]| {
             let frame = crate::synth::tcp_frame(client(n), ctrl, seq, payload).unwrap();
-            t.packet(Linktype::ETHERNET, 0, &frame, &mut |_| {});
+            let _ = t.packet(Linktype::ETHERNET, 0, &frame, &mut |_| ControlFlow::Continue(()));
             assert!(t.held <= MAX_HELD, "{}", t.held);
             assert_eq!(t.held, t.conns.values().map(Conn::held).sum::<usize>());
         };
@@ -1119,10 +1131,11 @@ mod tests {
             let tcp = etherparse::PacketBuilder::ethernet2(ctrl.mac, ap.mac).ipv4(ctrl.ip, ap.ip, 64).tcp(ctrl.port, ap.port, seq, 1024);
             let mut frame = Vec::new();
             if fin { tcp.fin().write(&mut frame, payload) } else { tcp.write(&mut frame, payload) }.unwrap();
-            t.packet(Linktype::ETHERNET, 0, &frame, &mut |e| {
+            let _ = t.packet(Linktype::ETHERNET, 0, &frame, &mut |e| {
                 if let HttpEvent::Response { body, .. } = e {
                     bodies.push(body);
                 }
+                ControlFlow::Continue(())
             });
             bodies.len()
         };
@@ -1146,10 +1159,13 @@ mod tests {
         let (ap, ctrl) = sample::endpoints();
         let frame = crate::synth::tcp_frame(ap, ctrl, 1, &sample::http_request(b"x")).unwrap();
         let mut events = 0;
-        t.packet(Linktype::ETHERNET, 0, &frame, &mut |_| events += 1);
+        let _ = t.packet(Linktype::ETHERNET, 0, &frame, &mut |_| {
+            events += 1;
+            ControlFlow::Continue(())
+        });
         assert_eq!(events, 1);
         for port in 0..(MAX_CONNS + MAX_CONNS / 4) as u16 {
-            t.packet(Linktype::ETHERNET, 1, &syn(port), &mut |_| {});
+            let _ = t.packet(Linktype::ETHERNET, 1, &syn(port), &mut |_| ControlFlow::Continue(()));
             assert!(t.conns.len() <= MAX_CONNS);
         }
         assert!(t.conns.values().any(|c| c.carried), "connections that carried data are kept over ones that did not");
@@ -1159,7 +1175,7 @@ mod tests {
         // A reset of an unknown connection does not create one.
         let mut frame = Vec::new();
         etherparse::PacketBuilder::ethernet2([2; 6], [4; 6]).ipv4([10, 0, 9, 9], [10, 0, 0, 1], 64).tcp(9, 8080, 1, 1024).rst().write(&mut frame, b"").unwrap();
-        t.packet(Linktype::ETHERNET, 2 + MAX_IDLE_EMPTY, &frame, &mut |_| {});
+        let _ = t.packet(Linktype::ETHERNET, 2 + MAX_IDLE_EMPTY, &frame, &mut |_| ControlFlow::Continue(()));
         assert_eq!(t.conns.len(), 1);
     }
 }
@@ -1255,6 +1271,14 @@ pub mod sample {
 mod pcap_tests {
     use super::*;
 
+    /// A callback for [`run`] that keeps every event in `events`.
+    fn push(events: &mut Vec<HttpEvent>) -> impl FnMut(HttpEvent) -> ControlFlow<()> + '_ {
+        |e| {
+            events.push(e);
+            ControlFlow::Continue(())
+        }
+    }
+
     #[test]
     fn extracts_request_and_response_from_a_pcap() {
         let req = sample::http_request(b"REQUEST-BODY");
@@ -1269,7 +1293,7 @@ mod pcap_tests {
             (false, 5000, &resp),
         ]);
         let mut events = Vec::new();
-        assert_eq!(run(&data[..], &[8080], |e| events.push(e)).unwrap(), End::Complete);
+        assert_eq!(run(&data[..], &[8080], push(&mut events)).unwrap(), End::Complete);
         assert_eq!(events.len(), 2, "{events:?}");
         match &events[0] {
             HttpEvent::Request { body, conn, ts, .. } => {
@@ -1288,8 +1312,46 @@ mod pcap_tests {
         let resp = sample::http_response(b"RESPONSE");
         let data = sample::pcap(&[(true, 1000, &req), (false, 5000, &resp)]);
         let mut events = Vec::new();
-        assert_eq!(run(&data[..data.len() - 5], &[8080], |e| events.push(e)).unwrap(), End::Truncated);
+        assert_eq!(run(&data[..data.len() - 5], &[8080], push(&mut events)).unwrap(), End::Truncated);
         assert_eq!(events.len(), 1, "{events:?}");
+    }
+
+    #[test]
+    fn the_callback_can_stop_the_capture() {
+        let req = sample::http_request(b"x");
+        let data = sample::pcap(&[(true, 1000, &req), (true, 1000 + req.len() as u32, &req)]);
+        // A live pipe: the file header, then one record per read. A read past the
+        // capture fails, so only a reader that went on would notice.
+        struct Pipe(Vec<Vec<u8>>);
+        impl Read for Pipe {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                if self.0.is_empty() {
+                    return Err(std::io::Error::other("read past the stop"));
+                }
+                let piece = self.0.remove(0);
+                buf[..piece.len()].copy_from_slice(&piece);
+                Ok(piece.len())
+            }
+        }
+        let pipe = || {
+            let mut pieces = vec![data[..24].to_vec()];
+            let mut at = 24;
+            while at < data.len() {
+                let end = at + 16 + u32::from_le_bytes(data[at + 8..at + 12].try_into().unwrap()) as usize;
+                pieces.push(data[at..end].to_vec());
+                at = end;
+            }
+            Pipe(pieces)
+        };
+        let mut events = 0;
+        let end = run(pipe(), &[8080], |_| {
+            events += 1;
+            ControlFlow::Break(())
+        });
+        assert_eq!((end.unwrap(), events), (End::Stopped, 1));
+        let mut events = Vec::new();
+        assert!(run(pipe(), &[8080], push(&mut events)).is_err());
+        assert_eq!(events.len(), 2, "without a stop, both requests and then the failing read");
     }
 
     /// One pcapng block: its body padded to four bytes between the two lengths.
@@ -1354,7 +1416,7 @@ mod pcap_tests {
         spb.extend_from_slice(&resp);
         block(&mut data, 3, &spb);
         let mut events = Vec::new();
-        assert_eq!(run(&data[..], &[8080], |e| events.push(e)).unwrap(), End::Complete);
+        assert_eq!(run(&data[..], &[8080], push(&mut events)).unwrap(), End::Complete);
         assert!(matches!(&events[..], [HttpEvent::Request { ts: a, .. }, HttpEvent::Response { ts: b, .. }] if *a == ts && *b == ts), "{events:?}");
     }
 
@@ -1369,7 +1431,7 @@ mod pcap_tests {
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             let mut events = Vec::new();
-            let result = run(&data[..], &[8080], |e| events.push(e));
+            let result = run(&data[..], &[8080], push(&mut events));
             tx.send((result.is_ok(), events)).ok();
         });
         let (ok, events) = rx.recv_timeout(std::time::Duration::from_secs(30)).expect("the reader moves on");
@@ -1384,7 +1446,7 @@ mod pcap_tests {
         interface(&mut data, &[(9, &[0x80 | 20]), (14, &(-10i64).to_le_bytes())]);
         packet(&mut data, 0, (1_791_840_610 << 20) + (1 << 19), &frame(true, &sample::http_request(b"Q")));
         let mut events = Vec::new();
-        assert_eq!(run(&data[..], &[8080], |e| events.push(e)).unwrap(), End::Complete);
+        assert_eq!(run(&data[..], &[8080], push(&mut events)).unwrap(), End::Complete);
         assert!(matches!(&events[..], [HttpEvent::Request { ts, .. }] if *ts == 1_791_840_600_500_000), "{events:?}");
         assert_eq!((ts_units(6), ts_units(9), ts_units(0x80 | 10), ts_units(0x80 | 64), ts_units(20)), (1_000_000, 1_000_000_000, 1024, 1_000_000, 1_000_000));
         // Picoseconds: the fraction does not fit 32 bits.
@@ -1405,7 +1467,7 @@ mod pcap_tests {
         data.resize(data.len() + big as usize, 0);
         data.extend_from_slice(&sample::pcap(&[(true, 1000, &req)])[24..]);
         let mut events = Vec::new();
-        assert_eq!(run(&data[..], &[8080], |e| events.push(e)).unwrap(), End::Complete);
+        assert_eq!(run(&data[..], &[8080], push(&mut events)).unwrap(), End::Complete);
         assert!(matches!(&events[..], [HttpEvent::Request { body, .. }] if body == b"REQUEST-BODY"), "{events:?}");
     }
 }

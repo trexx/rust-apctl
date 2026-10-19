@@ -6,6 +6,7 @@
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::{IpAddr, TcpStream};
+use std::ops::ControlFlow;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
@@ -80,24 +81,32 @@ fn prepare(payload: &mut Value, running: Option<&String>, key: &[u8; 16]) {
     payload["default"] = Value::from(*key == inform::DEFAULT_KEY);
 }
 
+/// A captured inform's payload, and the key it was sealed with.
+type Captured = (Value, [u8; 16]);
+
+/// The first `limit` informs of a capture that decode, in capture order. The capture is
+/// read no further than the last of them.
+fn collect(input: impl Read + Send, ports: &[u16], keys: &KeyStore, limit: usize) -> Result<(Vec<Captured>, capture::End)> {
+    let mut informs = Vec::new();
+    let mut pairer = Pairer::default();
+    let end = capture::run(input, ports, |ev| {
+        if let Some(InformEvent::Inform { decoded: Ok(d), .. }) = pairer.handle(keys, ev)
+            && informs.len() < limit
+        {
+            let key = captured_key(&d, keys);
+            informs.push((d.payload, key));
+        }
+        if informs.len() >= limit { ControlFlow::Break(()) } else { ControlFlow::Continue(()) }
+    })?;
+    Ok((informs, end))
+}
+
 pub fn run(pcap: &str, ports: &[u16], keys: &KeyStore, url: &str, limit: usize, every: f64) -> Result<()> {
     if !is_local(url) {
         bail!("refusing to simulate APs against {url}: only local controllers (http:// to 127.0.0.1, ::1 or localhost)");
     }
-    // Collect the informs first, in capture order. Once there are enough, the rest of
-    // the capture is read but not decoded.
-    // Each with the key it was sealed with.
-    let mut informs: Vec<(Value, [u8; 16])> = Vec::new();
-    let mut pairer = Pairer::default();
-    let end = capture::run(capture::open_input(pcap)?, ports, |ev| {
-        if informs.len() >= limit {
-            return;
-        }
-        if let Some(InformEvent::Inform { decoded: Ok(d), .. }) = pairer.handle(keys, ev) {
-            let key = captured_key(&d, keys);
-            informs.push((d.payload, key));
-        }
-    })?;
+    // The informs are collected first; from a live pipe, the replay starts once there are enough.
+    let (informs, end) = collect(capture::open_input(pcap)?, ports, keys, limit)?;
     crate::warn_if_truncated(end);
     eprintln!("replaying {} informs to {url}", informs.len());
 
@@ -181,6 +190,28 @@ mod tests {
         assert_eq!(p, json!({ "default": true, "cfgversion": "new" }));
         prepare(&mut p, None, &own);
         assert_eq!(p, json!({ "default": false, "cfgversion": "new" }), "adopted: no longer in factory state");
+    }
+
+    #[test]
+    fn collecting_stops_reading_the_capture_at_the_limit() {
+        use wire::synth::{Endpoint, http, tcp_frame, write_pcap_header, write_pcap_record};
+        let (ap, ctrl) = (Endpoint { mac: [2; 6], ip: [10, 0, 0, 5], port: 40000 }, Endpoint { mac: [4; 6], ip: [10, 0, 0, 1], port: 8080 });
+        let mac: Mac = "02:00:00:00:00:01".parse().unwrap();
+        let mut pcap = Vec::new();
+        write_pcap_header(&mut pcap, 65535).unwrap();
+        let mut seq = 1;
+        for i in 0..3 {
+            let packet = inform::seal(mac, Flags::ENCRYPTED | Flags::GCM, [i; 16], &inform::DEFAULT_KEY, format!(r#"{{"n":{i}}}"#).as_bytes());
+            let request = http("POST /inform HTTP/1.1\r\n", &packet);
+            write_pcap_record(&mut pcap, i64::from(i) * 1_000_000, &tcp_frame(ap, ctrl, seq, &request).unwrap()).unwrap();
+            seq += request.len() as u32;
+        }
+        let keys = KeyStore::default();
+        let (informs, end) = collect(&pcap[..], &[8080], &keys, 2).unwrap();
+        assert_eq!((informs.iter().map(|(p, _)| p["n"].as_i64().unwrap()).collect::<Vec<_>>(), end), (vec![0, 1], capture::End::Stopped));
+        let (informs, end) = collect(&pcap[..], &[8080], &keys, 10).unwrap();
+        assert_eq!((informs.len(), end), (3, capture::End::Complete));
+        assert_eq!(informs[0].1, inform::DEFAULT_KEY);
     }
 
     #[test]

@@ -818,6 +818,7 @@ mod tests {
                 decoded.unwrap();
                 informs += 1;
             }
+            std::ops::ControlFlow::Continue(())
         })
         .unwrap();
         assert_eq!(end, wire::capture::End::Complete);
