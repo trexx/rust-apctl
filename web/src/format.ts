@@ -112,17 +112,18 @@ export function useNow(ms = 60_000): number {
   return useSyncExternalStore(t.subscribe, t.read);
 }
 
-/** A rate in bits per second. */
-export function rate(bps: number): string {
-  const units = ["bps", "kbps", "Mbps", "Gbps"];
-  let v = bps;
+/** `v` in the largest of `units` (each `step` times the one before) it reaches: "1.5 MB", "120 kbps", "950 B". */
+function scaled(v: number, step: number, units: readonly string[]): string {
   let i = 0;
-  while (v >= 1000 && i < units.length - 1) {
-    v /= 1000;
+  while (v >= step && i < units.length - 1) {
+    v /= step;
     i++;
   }
   return `${v >= 100 || i === 0 ? v.toFixed(0) : v.toFixed(1)} ${units[i]}`;
 }
+
+/** A rate in bits per second. */
+export const rate = (bps: number) => scaled(bps, 1000, ["bps", "kbps", "Mbps", "Gbps"]);
 
 /** PHY rate reported in kbps. */
 export function phy(kbps: number | null | undefined): string {
@@ -130,17 +131,14 @@ export function phy(kbps: number | null | undefined): string {
   return kbps >= 1000 ? `${Math.round(kbps / 1000)} Mbps` : `${kbps} kbps`;
 }
 
-export function bytes(n: number | null | undefined): string {
-  if (n === null || n === undefined) return "—";
-  const units = ["B", "KB", "MB", "GB", "TB"];
-  let v = n;
-  let i = 0;
-  while (v >= 1024 && i < units.length - 1) {
-    v /= 1024;
-    i++;
-  }
-  return `${v >= 100 || i === 0 ? v.toFixed(0) : v.toFixed(1)} ${units[i]}`;
-}
+/** A client's PHY rates, "down / up": the AP's transmit rate, then its receive rate. */
+export const rates = (s: { tx_rate: number | null; rx_rate: number | null }) => `${phy(s.tx_rate)} / ${phy(s.rx_rate)}`;
+
+/** A client's Wi-Fi standard and spatial streams, "802.11ax 2×2", or "—" when unknown. */
+export const wifiText = (s: { wifi_gen: string | null; nss: number | null }) => (s.wifi_gen ? `802.11${s.wifi_gen}${s.nss ? ` ${s.nss}×${s.nss}` : ""}` : "—");
+
+/** A size in bytes, in units of 1024. */
+export const bytes = (n: number | null | undefined) => (n === null || n === undefined ? "—" : scaled(n, 1024, ["B", "KB", "MB", "GB", "TB"]));
 
 export const pct = (v: number | null | undefined) => (v === null || v === undefined ? "—" : `${Math.round(v)}%`);
 
@@ -150,15 +148,18 @@ export const pct1 = (v: number | null | undefined) => (v === null || v === undef
 /** The tone a level is shown in: good, needing attention, or bad (styles.css's `tone-*` text and `fill-*` fills). */
 export type Tone = "good" | "warn" | "bad";
 
+/** The class that shows a tone as text (`tone-*`) or as a fill (`fill-*`); none for "" (no tone). */
+export const toneClass = (t: Tone | "", as: "tone" | "fill" = "tone") => (t ? `${as}-${t}` : "");
+
 /**
  * Client signal levels (dBm) commonly used for Wi-Fi: at least `good` is good
  * (at least `excellent` excellent), at least `fair` is fair, below it poor.
  */
 export const SIGNAL = { excellent: -60, good: -65, fair: -75 } as const;
 
-/** A signal's tone: fair is "warn", poor "bad", and "none" when it isn't known. */
-export function signalClass(dbm: number | null | undefined): Tone | "none" {
-  if (dbm === null || dbm === undefined) return "none";
+/** A signal's tone: fair is "warn", poor "bad", and "" when it isn't known. */
+export function signalTone(dbm: number | null | undefined): Tone | "" {
+  if (dbm === null || dbm === undefined) return "";
   if (dbm >= SIGNAL.good) return "good";
   if (dbm >= SIGNAL.fair) return "warn";
   return "bad";
@@ -168,42 +169,46 @@ export function signalClass(dbm: number | null | undefined): Tone | "none" {
  * TX retry shares (%) as the official dashboard colours its retry buckets: at
  * least `bad` is bad, at least `warn` needs attention, below it is fine.
  */
-export const RETRY = { warn: 20, bad: 25 } as const;
+const RETRY = { warn: 20, bad: 25 } as const;
 
 /** A TX retry share's tone: "bad", "warn", or "" (fine or unknown). */
 export const retryTone = (pct: number | null | undefined): Exclude<Tone, "good"> | "" =>
   pct === null || pct === undefined ? "" : pct >= RETRY.bad ? "bad" : pct >= RETRY.warn ? "warn" : "";
 
 /** A meter's level (% of its maximum: CPU, memory, channel use): from `warn` it needs attention, from `bad` it is bad. */
-export const LOAD = { warn: 50, bad: 80 } as const;
+const LOAD = { warn: 50, bad: 80 } as const;
 
 export const loadTone = (pct: number): Tone => (pct >= LOAD.bad ? "bad" : pct >= LOAD.warn ? "warn" : "good");
 
 /** The share (%) of clients that get past a connection stage: from `good` it is good, from `warn` it needs attention. */
-export const STAGE = { good: 80, warn: 60 } as const;
+const STAGE = { good: 80, warn: 60 } as const;
 
 /** A connection stage's tone, or "" when no client got past it (or it isn't known). */
 export const stageTone = (pct: number | null): Tone | "" =>
   pct === null || pct === 0 ? "" : pct >= STAGE.good ? "good" : pct >= STAGE.warn ? "warn" : "bad";
 
 /** Wi-Fi experience scores as the official controller colours them: from `good` excellent, from `warn` good. */
-export const EXPERIENCE = { good: 90, warn: 70 } as const;
+const EXPERIENCE = { good: 90, warn: 70 } as const;
 
 export const experienceTone = (v: number | null): Tone | "" =>
   v === null ? "" : v >= EXPERIENCE.good ? "good" : v >= EXPERIENCE.warn ? "warn" : "bad";
 
 /** Roaming success (%) as the official roaming map colours it: green above `good`, orange above `warn`. */
-export const ROAM = { good: 67, warn: 33 } as const;
+const ROAM = { good: 67, warn: 33 } as const;
 
 export const roamTone = (pct: number): Tone => (pct > ROAM.good ? "good" : pct > ROAM.warn ? "warn" : "bad");
 
 /** The multicast and broadcast share (%) of all packets from which it needs attention. */
-export const MULTICAST_WARN = 30;
+const MULTICAST_WARN = 30;
 
 export const multicastTone = (pct: number | null): "warn" | "" => (pct !== null && pct >= MULTICAST_WARN ? "warn" : "");
 
-/** "−75 dBm", with a real minus sign. */
-export const dbm = (v: number) => `${v < 0 ? "−" : ""}${Math.abs(v)} dBm`;
+/** A level in whole dBm, "−75 dBm" with a real minus sign, or "—" when it isn't known. */
+export function dbm(v: number | null | undefined): string {
+  if (v === null || v === undefined) return "—";
+  const r = Math.round(v);
+  return `${r < 0 ? "−" : ""}${Math.abs(r)} dBm`;
+}
 
 const compactFmt = new Intl.NumberFormat(undefined, { notation: "compact" });
 

@@ -21,8 +21,8 @@ export function ListPanel<T extends { id: string }>({
 }: {
   title: string;
   note: ReactNode;
-  /** The label of the button that adds one. */
-  add: string;
+  /** The label of the button that adds one; none without it. */
+  add?: string;
   kind: "wlan" | "usergroup";
   items: T[];
   active: boolean;
@@ -80,7 +80,7 @@ export function ListPanel<T extends { id: string }>({
         <b>{title}</b>
         <span className="muted small">{note}</span>
         <span className="spacer" />
-        {!readOnly && editing === null && !removing && (
+        {add && !readOnly && editing === null && !removing && (
           <button className="btn small" onClick={() => setEditing("new")}>
             {add}
           </button>

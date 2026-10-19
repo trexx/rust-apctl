@@ -20,6 +20,7 @@ import {
   Signal,
   Stat,
   THead,
+  TextField,
   useRunner,
 } from "../components/common";
 import {
@@ -27,10 +28,12 @@ import {
   bandChannel,
   bytes,
   compact,
+  dbm,
   duration,
-  phy,
   rate,
+  rates,
   useNow,
+  wifiText,
 } from "../format";
 import { mcastLabel, serviceNames } from "../components/insights/Multicast";
 import { ConnectionLog } from "../components/Connections";
@@ -70,6 +73,7 @@ function ClientPage({ mac }: { mac: string }) {
       head={
         <AliasHeader
           mac={mac}
+          name={name}
           connected={c?.connected}
           alias={c?.alias ?? null}
           note={c?.note ?? null}
@@ -127,14 +131,12 @@ function ClientPage({ mac }: { mac: string }) {
           <Stat
             label="Signal"
             value={<Signal dbm={s.signal} />}
-            sub={`noise ${s.noise === null ? "—" : `${s.noise} dBm`}`}
+            sub={`noise ${dbm(s.noise)}`}
           />
           <Stat
             label="Rate (down/up)"
-            value={`${phy(s.tx_rate)} / ${phy(s.rx_rate)}`}
-            sub={
-              s.wifi_gen ? `802.11${s.wifi_gen}, ${s.nss ?? "?"} streams` : ""
-            }
+            value={rates(s)}
+            sub={s.wifi_gen ? wifiText(s) : ""}
           />
           <Stat
             label="Session"
@@ -151,7 +153,7 @@ function ClientPage({ mac }: { mac: string }) {
               <Chart
                 title="Signal and noise"
                 ts={ts}
-                format={(v) => `${Math.round(v)} dBm`}
+                format={dbm}
                 min={-100}
                 max={-20}
                 series={[
@@ -251,6 +253,8 @@ function ClientPage({ mac }: { mac: string }) {
 /** The client's name with an inline editor for its alias and note. */
 function AliasHeader(p: {
   mac: string;
+  /** What the page calls the client (`displayName`). */
+  name: string;
   connected?: boolean;
   alias: string | null;
   note: string | null;
@@ -284,21 +288,19 @@ function AliasHeader(p: {
           });
         }}
       >
-        <input
+        <TextField
           autoFocus
-          className="search"
           maxLength={64}
           placeholder={p.hostname ?? "Name for this device"}
           value={alias}
-          onChange={(e) => setAliasText(e.target.value)}
+          onChange={setAliasText}
           aria-label="Alias"
         />
-        <input
-          className="search"
+        <TextField
           maxLength={500}
           placeholder="Note (optional)"
           value={note}
-          onChange={(e) => setNote(e.target.value)}
+          onChange={setNote}
           aria-label="Note"
         />
         <button type="submit" className="btn primary" disabled={busy}>
@@ -318,7 +320,7 @@ function AliasHeader(p: {
     <div className="alias-head">
       <h1>
         {p.connected !== undefined && <Dot ok={p.connected} />}{" "}
-        {p.alias || p.hostname || p.mac}
+        {p.name}
         {canEdit && (
           <button
             className="btn small"

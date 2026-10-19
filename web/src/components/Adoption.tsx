@@ -1,13 +1,15 @@
 import { useState } from "react";
-import { adoptAp, adoptOverSsh, keys, useAdoption, useCanEdit } from "../api";
+import { adoptAp, adoptOverSsh, keys, useAdoption } from "../api";
 import { ago, useNow } from "../format";
-import { Outcome, TextField, useRunner } from "./common";
+import { Outcome, useRunner } from "./common";
+import { Row, TextInput } from "./settings/form";
 
-/** APs waiting for adoption, and adopting one by IP over SSH (active mode). */
+/**
+ * APs waiting for adoption, and adopting one by IP over SSH (active mode).
+ * The Overview shows (and so loads) it only to those who can edit.
+ */
 export function AdoptionPanel() {
-  const canEdit = useCanEdit();
-  // Read-only users never see the panel, so don't fetch (or poll) for them.
-  const a = useAdoption(canEdit);
+  const a = useAdoption();
   const now = useNow();
   const [form, setForm] = useState(false);
   const [ip, setIp] = useState("");
@@ -15,7 +17,7 @@ export function AdoptionPanel() {
   const [pass, setPass] = useState("");
   // Event lists refetch when the adoption's events arrive.
   const { busy, msg, run } = useRunner([keys.adoption(), keys.devices()]);
-  if (!a.data || !a.data.active || !canEdit) return null;
+  if (!a.data || !a.data.active) return null;
   const d = a.data;
   const nothing = d.pending.length === 0 && d.adopting.length === 0;
   return (
@@ -55,10 +57,10 @@ export function AdoptionPanel() {
                       className="btn small primary"
                       disabled={busy}
                       onClick={() =>
-                        void run(async () => {
-                          await adoptAp(p.mac);
-                          return "Adopting: it gets its own key with its next report, then its configuration.";
-                        })
+                        void run(
+                          () => adoptAp(p.mac),
+                          "Adopting: it gets its own key with its next report, then its configuration.",
+                        )
                       }
                     >
                       Adopt
@@ -84,37 +86,26 @@ export function AdoptionPanel() {
             empty to try your site's device login, then the factory one
             (ubnt/ubnt).
           </p>
-          <div className="form-row">
-            <div className="form-label">IP address</div>
-            <div className="form-control">
-              <TextField
-                value={ip}
-                placeholder="192.168.1.20"
-                aria-label="IP address"
-                onChange={setIp}
-              />
-            </div>
-          </div>
-          <div className="form-row">
-            <div className="form-label">SSH login</div>
-            <div className="form-control">
-              <TextField
-                value={user}
-                placeholder="username"
-                autoComplete="off"
-                aria-label="SSH user name"
-                onChange={setUser}
-              />
-              <TextField
-                type="password"
-                value={pass}
-                placeholder="password"
-                autoComplete="new-password"
-                aria-label="SSH password"
-                onChange={setPass}
-              />
-            </div>
-          </div>
+          <Row label="IP address">
+            <TextInput value={ip} placeholder="192.168.1.20" onChange={setIp} />
+          </Row>
+          <Row label="SSH login">
+            <TextInput
+              value={user}
+              placeholder="username"
+              autoComplete="off"
+              aria-label="SSH user name"
+              onChange={setUser}
+            />
+            <TextInput
+              type="password"
+              value={pass}
+              placeholder="password"
+              autoComplete="new-password"
+              aria-label="SSH password"
+              onChange={setPass}
+            />
+          </Row>
           <div className="actions-row">
             <button
               className="btn primary"

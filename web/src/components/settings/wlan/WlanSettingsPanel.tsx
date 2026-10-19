@@ -1,4 +1,4 @@
-import { useCanEdit, useWlanSettings } from "../../../api";
+import { useCanEdit, useSettingsState, useWlanSettings } from "../../../api";
 import { band } from "../../../format";
 import { QueryNote } from "../../common";
 import { ListPanel } from "../ListPanel";
@@ -8,8 +8,12 @@ import { WlanEditor } from "./WlanEditor";
 /** The Networks page's settings section: every SSID, editable. */
 export function WlanSettingsPanel() {
   const s = useWlanSettings();
+  // An SSID is added to the imported settings: without them there is nowhere
+  // to add it (and nothing is said until that is known).
+  const state = useSettingsState().data;
+  const imported = !!state?.summary;
   const readOnly = !useCanEdit();
-  if (!s.data) return <QueryNote q={s} />;
+  if (!s.data) return <QueryNote q={s} panel />;
   const list = s.data;
   if (list.wlans.length === 0 && !list.active) return null;
   const apName = (m: string) => list.aps.find((a) => a.mac === m)?.name ?? m;
@@ -17,11 +21,13 @@ export function WlanSettingsPanel() {
     <ListPanel
       title="Settings"
       note={
-        list.active
-          ? "changes are reviewed, then sent to the APs"
-          : "shadow mode: you can try changes and see what they would send"
+        state && !imported
+          ? "no settings imported: import them on the Settings page to add SSIDs"
+          : list.active
+            ? "changes are reviewed, then sent to the APs"
+            : "shadow mode: you can try changes and see what they would send"
       }
-      add="Add SSID"
+      add={imported ? "Add SSID" : undefined}
       kind="wlan"
       items={list.wlans}
       active={list.active}

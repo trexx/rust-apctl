@@ -14,10 +14,12 @@ import type {
 import {
   band,
   clock,
+  dbm,
   duration,
   loadTone,
   sameDay,
-  signalClass,
+  signalTone,
+  toneClass,
   useNow,
 } from "../format";
 import type { Tone } from "../format";
@@ -46,12 +48,8 @@ export function Dot(p: { ok: boolean } | { tone: Tone }) {
   return <span className={`dot fill-${tone}`} aria-hidden />;
 }
 
-export function Signal({ dbm }: { dbm: number | null | undefined }) {
-  return (
-    <span className={`tone-${signalClass(dbm)}`}>
-      {dbm === null || dbm === undefined ? "—" : `${Math.round(dbm)} dBm`}
-    </span>
-  );
+export function Signal({ dbm: v }: { dbm: number | null | undefined }) {
+  return <span className={toneClass(signalTone(v))}>{dbm(v)}</span>;
 }
 
 /** A bar for a level (a percentage, or out of `max`), named `label` for screen readers. */
@@ -397,6 +395,16 @@ interface EventSpec<K extends EventKind> {
 const parts = (...xs: (string | null | undefined | false)[]) =>
   xs.filter(Boolean).join(" · ");
 
+/** A radio's channel, width and power as a radio_changed event records them, "ch 36/80 MHz/20 dBm", leaving out what it lacks. */
+const radioLevels = (l: EventPayloads["radio_changed"]["from"]) =>
+  [
+    `ch ${l?.channel ?? "?"}`,
+    l?.bw && `${l.bw} MHz`,
+    l?.tx_power != null && dbm(l.tx_power),
+  ]
+    .filter(Boolean)
+    .join("/");
+
 /** Every event kind: its label, colour and detail line. */
 const EVENTS: { [K in EventKind]: EventSpec<K> } = {
   ap_seen: {
@@ -453,7 +461,7 @@ const EVENTS: { [K in EventKind]: EventSpec<K> } = {
       parts(
         d.essid,
         d.reason && `reason: ${d.reason}`,
-        !!d.rssi && `${d.rssi} dBm`,
+        !!d.rssi && dbm(d.rssi),
       ),
   },
   dfs_radar: {
@@ -468,7 +476,7 @@ const EVENTS: { [K in EventKind]: EventSpec<K> } = {
       parts(
         d.essid,
         !!d.rogue_channel && `channel ${d.rogue_channel}`,
-        !!d.signal_strength && `${d.signal_strength} dBm`,
+        !!d.signal_strength && dbm(d.signal_strength),
       ),
   },
   network_threat: {
@@ -483,7 +491,7 @@ const EVENTS: { [K in EventKind]: EventSpec<K> } = {
     describe: (d) =>
       parts(
         d.reason && `reason: ${d.reason}`,
-        d.signal != null && `signal ${d.signal} dBm`,
+        d.signal != null && `signal ${dbm(d.signal)}`,
         d.vap,
       ),
   },
@@ -501,11 +509,13 @@ const EVENTS: { [K in EventKind]: EventSpec<K> } = {
     label: "Updating",
     tone: "neutral",
     describe: (d) =>
-      d.step === "downloading"
-        ? "downloading the firmware"
-        : d.step === "writing"
-          ? "checked; writing it to flash"
-          : String(d.step ?? ""),
+      d.step === "preparing"
+        ? "preparing to download the firmware"
+        : d.step === "downloading"
+          ? "downloading the firmware"
+          : d.step === "writing"
+            ? "checked; writing it to flash"
+            : String(d.step ?? ""),
   },
   ap_upgrade_failed: {
     label: "Update failed",
@@ -529,7 +539,7 @@ const EVENTS: { [K in EventKind]: EventSpec<K> } = {
     tone: "info",
     describe: (d) =>
       parts(
-        `asked to move (802.11v)${d.signal != null ? ` at ${d.signal} dBm` : ""}`,
+        `asked to move (802.11v)${d.signal != null ? ` at ${dbm(d.signal)}` : ""}`,
         d.result,
         (d.candidates ?? []).length > 0 &&
           `offered ${(d.candidates ?? []).map((c) => `${c.bssid}${c.channel ? ` ch ${c.channel}` : ""}`).join(", ")}`,
@@ -542,7 +552,7 @@ const EVENTS: { [K in EventKind]: EventSpec<K> } = {
       parts(
         (d.anomalies ?? []).map((a) => a.replace(/_/g, " ")).join(", "),
         d.satisfaction != null && `experience ${d.satisfaction}`,
-        d.signal != null && `signal ${d.signal} dBm`,
+        d.signal != null && `signal ${dbm(d.signal)}`,
       ),
   },
   ap_crash: {
@@ -579,7 +589,7 @@ const EVENTS: { [K in EventKind]: EventSpec<K> } = {
     label: "Radio settings changed",
     tone: "neutral",
     describe: (d) =>
-      `${band(d.radio)}: ch ${d.from?.channel}/${d.from?.bw} MHz/${d.from?.tx_power} dBm → ch ${d.to?.channel}/${d.to?.bw} MHz/${d.to?.tx_power} dBm`,
+      `${band(d.radio)}: ${radioLevels(d.from)} → ${radioLevels(d.to)}`,
   },
   config_pushed: {
     label: "Config pushed",
@@ -599,7 +609,7 @@ const EVENTS: { [K in EventKind]: EventSpec<K> } = {
       parts(
         d.essid,
         `${band(d.radio)} channel ${d.channel ?? "?"}`,
-        d.signal !== undefined && d.signal !== null && `${d.signal} dBm`,
+        d.signal !== undefined && d.signal !== null && dbm(d.signal),
         d.new && "first time seen",
       ),
   },
@@ -607,13 +617,13 @@ const EVENTS: { [K in EventKind]: EventSpec<K> } = {
     label: "Client disconnected",
     tone: "warn",
     describe: (d) =>
-      `${d.reason === "ap_offline" ? "AP went offline" : d.reason === "ap_forgotten" ? "its AP was forgotten" : "no longer seen"}${d.connected_for ? ` after ${duration(d.connected_for)}` : ""}${d.last_signal ? `, last ${d.last_signal} dBm` : ""}`,
+      `${d.reason === "ap_offline" ? "AP went offline" : d.reason === "ap_forgotten" ? "its AP was forgotten" : "no longer seen"}${d.connected_for ? ` after ${duration(d.connected_for)}` : ""}${d.last_signal ? `, last ${dbm(d.last_signal)}` : ""}`,
   },
   client_roamed: {
     label: "Client roamed",
     tone: "info",
     describe: (d, names) =>
-      `from ${names[d.from?.ap ?? ""] ?? "?"} (${band(d.from?.radio)}, ${d.from?.signal ?? "?"} dBm) to ${names[d.to?.ap ?? ""] ?? "?"} (${band(d.to?.radio)}, ${d.to?.signal ?? "?"} dBm)`,
+      `from ${names[d.from?.ap ?? ""] ?? "?"} (${band(d.from?.radio)}, ${dbm(d.from?.signal)}) to ${names[d.to?.ap ?? ""] ?? "?"} (${band(d.to?.radio)}, ${dbm(d.to?.signal)})`,
   },
   client_renamed: {
     label: "Client renamed",
@@ -711,6 +721,17 @@ export const sameRow = <P extends { now: number }>(a: P, b: P) =>
   (Object.keys(a) as (keyof P)[]).every(
     (k) => k === "now" || Object.is(a[k], b[k]),
   );
+
+/** React keys for table rows, from what identifies each row; numbered when two rows share one. */
+export function stableKeys<T>(rows: T[], id: (row: T) => string): string[] {
+  const seen = new Map<string, number>();
+  return rows.map((row) => {
+    const k = id(row);
+    const n = seen.get(k) ?? 0;
+    seen.set(k, n + 1);
+    return n ? `${k}#${n}` : k;
+  });
+}
 
 interface EventRowProps {
   e: AppEvent;

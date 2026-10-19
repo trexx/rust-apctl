@@ -223,6 +223,48 @@ export function NumberInput({
 }
 
 /**
+ * A slider from `min` to `max`, after `prefix` and with its value and `unit`
+ * ("%", " dBm") beside it.
+ */
+export function RangeInput({
+  value,
+  fallback,
+  min,
+  max,
+  unit,
+  prefix,
+  onChange,
+  "aria-label": label,
+}: {
+  value: number | null | undefined;
+  fallback: number;
+  min: number;
+  max: number;
+  unit: string;
+  prefix?: string;
+  onChange: (v: number) => void;
+  "aria-label": string;
+}) {
+  const named = useRowLabel(label);
+  const shown = value ?? fallback;
+  return (
+    <label className="small">
+      {prefix && `${prefix} `}
+      <input
+        {...named}
+        type="range"
+        min={min}
+        max={max}
+        value={shown}
+        onChange={(e) => onChange(Number(e.target.value))}
+      />{" "}
+      {shown}
+      {unit}
+    </label>
+  );
+}
+
+/**
  * A text field (class "search" unless given), named by its `Row`'s label, or
  * by its own `aria-label` where a row holds several; `onChange` gets the text.
  */

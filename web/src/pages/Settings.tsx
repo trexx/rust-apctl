@@ -3,7 +3,7 @@ import { Outcome, QueryState, useRunner } from "../components/common";
 import { NotificationSettings } from "../components/NotificationSettings";
 import { BackupSection } from "../components/Backups";
 import { FileButton } from "../components/FileButton";
-import { SiteSettingsPanel } from "../components/SettingsEditor";
+import { SiteSettingsPanel } from "../components/settings/site/SiteEditor";
 import { ago, clock, useNow } from "../format";
 
 export function Settings() {

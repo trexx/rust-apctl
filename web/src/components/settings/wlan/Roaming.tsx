@@ -1,9 +1,9 @@
-import { Row, Toggle } from "../form";
+import { RangeInput, Row, Toggle } from "../form";
 import type { WlanSection } from "./form";
 import { Unsupported } from "./Unsupported";
 
 export function Roaming({ w, list }: WlanSection) {
-  const { form: f, set, bind } = w;
+  const { form: f, bind } = w;
   const bands = f.wlan_bands ?? [];
   const dual = bands.includes("2g") && bands.includes("5g");
   const aps = f.aps;
@@ -50,19 +50,14 @@ export function Roaming({ w, list }: WlanSection) {
           label="Enabled"
         />
         {f.roaming_assistant_na_enabled === true && (
-          <label className="small">
-            <input
-              type="range"
-              aria-label="Roaming assistant threshold"
-              min={-80}
-              max={-60}
-              value={f.roaming_assistant_na_rssi ?? -75}
-              onChange={(e) =>
-                set("roaming_assistant_na_rssi", Number(e.target.value))
-              }
-            />{" "}
-            {f.roaming_assistant_na_rssi ?? -75} dBm
-          </label>
+          <RangeInput
+            {...bind("roaming_assistant_na_rssi")}
+            aria-label="Roaming assistant threshold"
+            fallback={-75}
+            min={-80}
+            max={-60}
+            unit=" dBm"
+          />
         )}
         <Unsupported
           feature="roaming_assistant"

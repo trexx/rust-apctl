@@ -20,7 +20,7 @@ import {
   eventText,
   useRunner,
 } from "./common";
-import { ApChecklist, toggled } from "./settings/form";
+import { ApChecklist, Row, Select, toggled } from "./settings/form";
 
 /**
  * Runs Channel AI actions. The settings checkboxes each send a patch built
@@ -97,7 +97,7 @@ export function PlanActions({
   );
 }
 
-const HOURS = Array.from({ length: 24 }, (_, h) => h);
+const HOURS = Array.from({ length: 24 }, (_, h) => [h, hhmm(h * 60)] as const);
 
 /** Channel AI: the nightly optimisation's settings, Run now, recent runs. */
 export function ChannelAiPanel() {
@@ -107,7 +107,7 @@ export function ChannelAiPanel() {
   const runs = useEvents({ kind: "channel_plan", limit: 10 });
   const { busy, msg, run } = useRun();
   const now = useNow();
-  if (!ai.data) return <QueryNote q={ai} />;
+  if (!ai.data) return <QueryNote q={ai} panel />;
   const d = ai.data;
   const s = d.settings;
   const can = d.active && canEdit && !busy;
@@ -133,10 +133,10 @@ export function ChannelAiPanel() {
               window.confirm(
                 "Scan and move APs to better channels now? APs that move drop their clients for a moment.",
               ) &&
-              void run(async () => {
-                await runChannelAi();
-                return "Running: the APs scan first (up to two minutes), then the plan is applied if it is clearly better.";
-              })
+              void run(
+                () => runChannelAi(),
+                "Running: the APs scan first (up to two minutes), then the plan is applied if it is clearly better.",
+              )
             }
           >
             {d.running ? "Running…" : "Run now"}
@@ -152,65 +152,52 @@ export function ChannelAiPanel() {
           " In shadow mode your current controller does this; apctl takes over after the cutover."}
       </p>
       <div className="settings-form">
-        <div className="form-row">
-          <div className="form-label">Nightly</div>
-          <div className="form-control">
+        <Row label="Nightly">
+          <Toggle
+            value={s.enabled}
+            disabled={!can}
+            onChange={(enabled) => save({ enabled })}
+            label="Enabled"
+          />
+          <Select
+            aria-label="Hour"
+            value={s.hour}
+            options={HOURS}
+            disabled={!can}
+            onChange={(hour) => save({ hour })}
+          />
+          {(["ng", "na"] as const).map((b) => (
             <Toggle
-              value={s.enabled}
+              key={b}
+              value={s.radios.includes(b)}
               disabled={!can}
-              onChange={(enabled) => save({ enabled })}
-              label="Enabled"
+              onChange={(on) => save({ radios: toggled(s.radios, b, on) })}
+              label={bandName(b)}
             />
-            <select
-              aria-label="Hour"
-              value={s.hour}
-              disabled={!can}
-              onChange={(e) => save({ hour: Number(e.target.value) })}
-            >
-              {HOURS.map((h) => (
-                <option key={h} value={h}>
-                  {hhmm(h * 60)}
-                </option>
-              ))}
-            </select>
-            {(["ng", "na"] as const).map((b) => (
-              <Toggle
-                key={b}
-                value={s.radios.includes(b)}
-                disabled={!can}
-                onChange={(on) => save({ radios: toggled(s.radios, b, on) })}
-                label={bandName(b)}
-              />
-            ))}
-          </div>
-        </div>
-        <div className="form-row">
-          <div className="form-label">
-            Allowed channels
-            <div className="muted small">your country, minus the blacklist</div>
-          </div>
-          <div className="form-control small">
-            <span>2.4 GHz: {d.allowed.ng?.join(", ") ?? "any"}</span>
-            <span>5 GHz: {d.allowed.na?.join(", ") ?? "any"}</span>
-            <Toggle
-              value={s.dfs}
-              disabled={!can}
-              onChange={(dfs) => save({ dfs })}
-              label="DFS channels (radar can force an AP off them)"
-            />
-          </div>
-        </div>
-        <div className="form-row">
-          <div className="form-label">Excluded APs</div>
-          <div className="form-control">
-            <ApChecklist
-              aps={Object.entries(names).map(([mac, name]) => ({ mac, name }))}
-              value={s.exclude_devices}
-              disabled={!can}
-              onChange={(v) => save({ exclude_devices: v })}
-            />
-          </div>
-        </div>
+          ))}
+        </Row>
+        <Row label="Allowed channels" hint="your country, minus the blacklist">
+          <span className="small">
+            2.4 GHz: {d.allowed.ng?.join(", ") ?? "any"}
+          </span>
+          <span className="small">
+            5 GHz: {d.allowed.na?.join(", ") ?? "any"}
+          </span>
+          <Toggle
+            value={s.dfs}
+            disabled={!can}
+            onChange={(dfs) => save({ dfs })}
+            label="DFS channels (radar can force an AP off them)"
+          />
+        </Row>
+        <Row label="Excluded APs">
+          <ApChecklist
+            aps={Object.entries(names).map(([mac, name]) => ({ mac, name }))}
+            value={s.exclude_devices}
+            disabled={!can}
+            onChange={(v) => save({ exclude_devices: v })}
+          />
+        </Row>
       </div>
       <Outcome msg={msg} />
       <div className="small">

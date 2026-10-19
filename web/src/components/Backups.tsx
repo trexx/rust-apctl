@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react";
+import type { ReactNode } from "react";
 import {
   createBackup,
   deleteBackup,
@@ -13,7 +14,8 @@ import type { BackupManifest, BackupMeta, BackupSettings } from "../api";
 import { ago, bytes, dateTime as when, hhmm, useNow } from "../format";
 import { Outcome, QueryNote, THead, Toggle, useRunner } from "./common";
 import { FileButton } from "./FileButton";
-import { NumberInput, TimeInput } from "./settings/form";
+import { NumberInput, Select, TimeInput } from "./settings/form";
+import type { Option } from "./settings/form";
 
 const HISTORY: [number, string][] = [
   [0, "Settings only"],
@@ -34,20 +36,54 @@ const WEEKDAYS = [
   "Saturday",
   "Sunday",
 ];
+const FREQUENCIES: Option<BackupSettings["frequency"]>[] = [
+  ["daily", "Daily"],
+  ["weekly", "Weekly"],
+  ["monthly", "Monthly"],
+];
+const ON_WEEKDAY = WEEKDAYS.map((d, i) => [i, `on ${d}`] as const);
+const ON_MONTHDAY = Array.from(
+  { length: 28 },
+  (_, i) => [i + 1, `on day ${i + 1}`] as const,
+);
 const KIND: Record<BackupMeta["kind"], string> = {
   auto: "Automatic",
   manual: "Manual",
   "pre-restore": "Before a restore",
 };
 
-/** Minutes after midnight UTC <-> "HH:MM" in this browser's time zone. */
+/**
+ * apctl keeps the schedule in UTC: the time in minutes after midnight, and the
+ * weekly backup's day (Monday = 0) and the monthly one's date as UTC days. The
+ * form shows the time and the weekday in this browser's time zone, at today's
+ * offset: where the local and the UTC date differ at that time (01:00 local at
+ * UTC+2 is 23:00 UTC the day before), the weekday moves with it. A date can't
+ * move the same way (day 1 would become the last day of the month before), so
+ * the monthly date stays a UTC one and is shown as such.
+ */
 const offsetMin = () => -new Date().getTimezoneOffset();
-const toLocal = (utcMin: number) =>
-  hhmm((((utcMin + offsetMin()) % 1440) + 1440) % 1440);
-const fromLocal = (text: string) => {
-  const [h = 0, m = 0] = text.split(":").map(Number);
-  return (((h * 60 + m - offsetMin()) % 1440) + 1440) % 1440;
+const mod = (n: number, m: number) => ((n % m) + m) % m;
+/** `minute` moved by `by` minutes: the minute of its day, and how many days it moved. */
+const shift = (minute: number, by: number) => ({
+  minute: mod(minute + by, 1440),
+  days: Math.floor((minute + by) / 1440),
+});
+const toLocal = (s: BackupSettings) => {
+  const t = shift(s.minute_utc, offsetMin());
+  return { time: hhmm(t.minute), weekday: mod(s.weekday + t.days, 7) };
 };
+const fromLocal = (time: string, weekday: number) => {
+  const [h = 0, m = 0] = time.split(":").map(Number);
+  const t = shift(h * 60 + m, -offsetMin());
+  return { minute_utc: t.minute, weekday: mod(weekday + t.days, 7) };
+};
+/** The schedule as apctl keeps it, in UTC. */
+const utcText = (s: BackupSettings) =>
+  s.frequency === "weekly"
+    ? `${WEEKDAYS[s.weekday]} ${hhmm(s.minute_utc)} UTC`
+    : s.frequency === "monthly"
+      ? `day ${s.monthday}, ${hhmm(s.minute_utc)} UTC`
+      : `${hhmm(s.minute_utc)} UTC`;
 
 /**
  * Which apctl process answers: when it started, "signed out" when it no
@@ -115,6 +151,7 @@ function Schedule({
   const { msg, run } = useRunner([keys.backups()]);
   const dirty = JSON.stringify(s) !== JSON.stringify(initial);
   const save = () => void run(() => saveBackupSettings(s), "Saved.");
+  const local = toLocal(s);
   return (
     <div className="backup-form">
       <Toggle
@@ -124,58 +161,45 @@ function Schedule({
         label="Automatic backups"
       />
       <div className="backup-row">
-        <select
+        <Select
           aria-label="How often"
           value={s.frequency}
+          options={FREQUENCIES}
           disabled={readOnly || !s.enabled}
-          onChange={(e) =>
-            setS({
-              ...s,
-              frequency: e.target.value as BackupSettings["frequency"],
-            })
-          }
-        >
-          <option value="daily">Daily</option>
-          <option value="weekly">Weekly</option>
-          <option value="monthly">Monthly</option>
-        </select>
+          onChange={(frequency) => setS({ ...s, frequency })}
+        />
         {s.frequency === "weekly" && (
-          <select
+          <Select
             aria-label="Day of the week"
-            value={s.weekday}
+            value={local.weekday}
+            options={ON_WEEKDAY}
             disabled={readOnly || !s.enabled}
-            onChange={(e) => setS({ ...s, weekday: Number(e.target.value) })}
-          >
-            {WEEKDAYS.map((d, i) => (
-              <option key={d} value={i}>
-                on {d}
-              </option>
-            ))}
-          </select>
+            onChange={(w) => setS({ ...s, ...fromLocal(local.time, w) })}
+          />
         )}
         {s.frequency === "monthly" && (
-          <select
-            aria-label="Day of the month"
+          <Select
+            aria-label="Day of the month (UTC)"
             value={s.monthday}
+            options={ON_MONTHDAY}
             disabled={readOnly || !s.enabled}
-            onChange={(e) => setS({ ...s, monthday: Number(e.target.value) })}
-          >
-            {Array.from({ length: 28 }, (_, i) => i + 1).map((d) => (
-              <option key={d} value={d}>
-                on day {d}
-              </option>
-            ))}
-          </select>
+            onChange={(monthday) => setS({ ...s, monthday })}
+          />
         )}
         <label className="small">
           at{" "}
           <TimeInput
-            value={toLocal(s.minute_utc)}
+            value={local.time}
             disabled={readOnly || !s.enabled}
-            onChange={(t) => setS({ ...s, minute_utc: fromLocal(t) })}
+            onChange={(t) => setS({ ...s, ...fromLocal(t, local.weekday) })}
           />
         </label>
-        <span className="muted small">({hhmm(s.minute_utc)} UTC)</span>
+        <span
+          className="muted small"
+          title="apctl keeps the schedule in UTC, so its local time moves by an hour when daylight saving time starts or ends."
+        >
+          ({utcText(s)})
+        </span>
       </div>
       <div className="backup-row">
         <label className="small">
@@ -191,17 +215,12 @@ function Schedule({
         </label>
         <label className="small">
           containing{" "}
-          <select
+          <Select
             value={s.days}
+            options={HISTORY.map(([d, l]) => [d, l.toLowerCase()] as const)}
             disabled={readOnly || !s.enabled}
-            onChange={(e) => setS({ ...s, days: Number(e.target.value) })}
-          >
-            {HISTORY.map(([d, l]) => (
-              <option key={d} value={d}>
-                {l.toLowerCase()}
-              </option>
-            ))}
-          </select>
+            onChange={(days) => setS({ ...s, days })}
+          />
         </label>
         {!readOnly && (
           <button
@@ -229,7 +248,7 @@ function ConfirmRestore({
   onConfirm,
   onCancel,
 }: {
-  what: React.ReactNode;
+  what: ReactNode;
   busy: boolean;
   onConfirm: () => void;
   onCancel: () => void;
@@ -296,7 +315,7 @@ export function BackupSection() {
         reloads when it is back.
       </div>
     );
-  if (!b.data) return <QueryNote q={b} />;
+  if (!b.data) return <QueryNote q={b} panel />;
   const d = b.data;
   return (
     <div className="panel" id="backups">
@@ -318,7 +337,8 @@ export function BackupSection() {
           </span>
         )}
         <span className="muted small">
-          stored on apctl's volume; download one to keep a copy elsewhere
+          stored on apctl's volume
+          {readOnly ? "" : "; download one to keep a copy elsewhere"}
         </span>
       </div>
       {!d.encrypted && (
@@ -344,21 +364,16 @@ export function BackupSection() {
 
       {!readOnly && (
         <div className="backup-row backup-actions">
-          <select
-            value={days}
-            onChange={(e) => setDays(Number(e.target.value))}
+          <Select
             aria-label="What to include"
-          >
-            {HISTORY.map(([v, l]) => (
-              <option key={v} value={v}>
-                {l}
-              </option>
-            ))}
-          </select>
+            value={days}
+            options={HISTORY}
+            onChange={setDays}
+          />
           <button
             className="btn small primary"
             disabled={busy}
-            onClick={() => run(() => createBackup(days))}
+            onClick={() => void run(() => createBackup(days))}
           >
             {busy ? "Working…" : "Back up now"}
           </button>
@@ -423,7 +438,14 @@ export function BackupSection() {
         <div className="table-wrap">
           <table className="table">
             <THead
-              columns={["Made", "Kind", "Contains", "apctl", "Size", ""]}
+              columns={[
+                "Made",
+                "Kind",
+                "Contains",
+                "apctl",
+                "Size",
+                ...(readOnly ? [] : [""]),
+              ]}
             />
             <tbody>
               {d.backups.map((x) => (
@@ -441,40 +463,39 @@ export function BackupSection() {
                   <td className="small">{historyLabel(x.days)}</td>
                   <td className="small">{x.version}</td>
                   <td className="small nowrap">{bytes(x.size)}</td>
-                  <td className="nowrap">
-                    <a
-                      className="btn small"
-                      href={`/api/backups/file/${encodeURIComponent(x.name)}`}
-                      download
-                    >
-                      Download
-                    </a>{" "}
-                    {!readOnly && (
-                      <>
-                        <button
-                          className="btn small"
-                          onClick={() =>
-                            setConfirm({
-                              name: x.name,
-                              label: `the backup from ${when(x.created)}`,
-                            })
-                          }
-                        >
-                          Restore…
-                        </button>{" "}
-                        <button
-                          className="btn small"
-                          onClick={() =>
-                            window.confirm(
-                              `Delete the backup from ${when(x.created)}?`,
-                            ) && void run(() => deleteBackup(x.name))
-                          }
-                        >
-                          Delete
-                        </button>
-                      </>
-                    )}
-                  </td>
+                  {/* Read-only mode withholds the files: they hold AP keys and Wi-Fi passwords. */}
+                  {!readOnly && (
+                    <td className="nowrap">
+                      <a
+                        className="btn small"
+                        href={`/api/backups/file/${encodeURIComponent(x.name)}`}
+                        download
+                      >
+                        Download
+                      </a>{" "}
+                      <button
+                        className="btn small"
+                        onClick={() =>
+                          setConfirm({
+                            name: x.name,
+                            label: `the backup from ${when(x.created)}`,
+                          })
+                        }
+                      >
+                        Restore…
+                      </button>{" "}
+                      <button
+                        className="btn small"
+                        onClick={() =>
+                          window.confirm(
+                            `Delete the backup from ${when(x.created)}?`,
+                          ) && void run(() => deleteBackup(x.name))
+                        }
+                      >
+                        Delete
+                      </button>
+                    </td>
+                  )}
                 </tr>
               ))}
             </tbody>

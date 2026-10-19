@@ -1,5 +1,5 @@
 import { useEffect } from "react";
-import { keepPreviousData, useQuery, useQueryClient } from "@tanstack/react-query";
+import { hashKey, keepPreviousData, useQuery, useQueryClient } from "@tanstack/react-query";
 import type { QueryKey } from "@tanstack/react-query";
 
 export type Mac = string;
@@ -90,21 +90,30 @@ export interface Multicast {
   services: ServiceCount[];
 }
 
-export interface ClientView {
+/** A client as an AP's page lists it: its latest sample (without the multicast tables), and when it was seen. */
+export interface ListedClientView {
   sample: ClientSample;
   connected: boolean;
   first_seen: number;
   last_seen: number;
-  ap_name?: string | null;
-  vendor?: string | null;
-  alias?: string | null;
-  note?: string | null;
+}
+
+/** A client with its name, manufacturer and controls, as the client list and its own page send it. */
+export interface ClientView extends ListedClientView {
+  vendor: string | null;
+  alias: string | null;
+  note: string | null;
   /** From the settings: blocked from every SSID. */
-  blocked?: boolean;
+  blocked: boolean;
   /** From the settings: the only AP the client may connect to. */
-  locked_to?: Mac | null;
+  locked_to: Mac | null;
   /** From the settings: the client's own speed limit (user group). */
-  usergroup_id?: string | null;
+  usergroup_id: string | null;
+}
+
+/** A client in the client list: its view, and the name of the AP it is on (null when that AP has no name, or is not reporting). */
+export interface ListedClient extends ClientView {
+  ap_name: string | null;
 }
 
 /** A client in a multicast group, as a client's page lists its peers. */
@@ -211,8 +220,9 @@ export interface DeviceDetail {
     /** Known from the database only: hasn't reported since apctl started. */
     stored_only?: boolean;
   };
-  clients: ClientView[];
-  locating?: boolean;
+  /** Its connected clients, without their names (`useClientNames` has them). */
+  clients: ListedClientView[];
+  locating: boolean;
 }
 
 export interface Series {
@@ -285,7 +295,7 @@ export interface EventPayloads {
   client_kicked: { reason?: string | null; signal?: number | null; vap?: string | null };
   ap_upgrade_sent: { target?: string | null };
   ap_upgrade_started: { by?: string | null };
-  ap_upgrade_progress: { step?: string | null };
+  ap_upgrade_progress: { step?: "preparing" | "downloading" | "writing" | null };
   ap_upgrade_failed: { detail?: string | null; reason?: string | null };
   ap_upgraded: { from?: string | null; to?: string | null; custom?: boolean };
   client_wrong_password: { vap?: string | null };
@@ -529,7 +539,7 @@ export interface DryRun {
     against_redacted?: boolean;
     error?: string;
     /** The AP runs a different config version than when the settings were imported. */
-    settings_stale?: boolean;
+    settings_stale: boolean;
   }[];
   history: { id: number; ts: number; mac: Mac; cfgversion: string | null; matches: boolean; comparison: { system_cfg?: FieldComparison; error?: string } | null }[];
 }
@@ -672,9 +682,9 @@ export interface PlanEntry {
   suggested_reasons: string[];
   change: boolean;
   /** Kept as is: excluded, on a wireless uplink, or being upgraded. */
-  pinned?: boolean;
+  pinned: boolean;
   /** Its channel is not one Channel AI may use, so it moves regardless. */
-  not_allowed?: boolean;
+  not_allowed: boolean;
 }
 
 export interface ThreatFinding {
@@ -728,13 +738,20 @@ const spanLength = (s: TimeSpan) => (isFixed(s) ? s.to - s.from : s.last);
  *  each fetch: a fixed window ending at about now stops refreshing once it is ten minutes past. */
 const refreshFor = (s: TimeSpan, live: number) => (isFixed(s) && s.to < Date.now() / 1000 - 600 ? false : live);
 
-/** A query over a time span: refreshes while the span is live, and keeps the old data on screen while a new span loads. */
-function useSpanQuery<T>(key: QueryKey, path: string, span: TimeSpan, extra: Record<string, string | number | undefined> = {}) {
-  return useQuery({
+/** Whether two keys of a span family differ in the span alone (the family's first argument, as in every one of `keys`). */
+const onlySpanDiffers = (a: QueryKey, b: QueryKey) => hashKey([a[0], ...a.slice(2)]) === hashKey([b[0], ...b.slice(2)]);
+
+/**
+ * A query over a time span: refreshes while the span is live, and keeps the old data on screen (`isPlaceholderData`) while
+ * another span loads. Another choice (a band, an AP) shows as loading instead, unless `keepAcrossChoices`, for a caller that
+ * dims the old data while it shows it.
+ */
+function useSpanQuery<T>(key: QueryKey, path: string, span: TimeSpan, extra: Record<string, string | number | undefined> = {}, keepAcrossChoices = false) {
+  return useQuery<T>({
     queryKey: key,
     queryFn: getting<T>(`${path}${qs({ ...spanParams(span), ...extra })}`),
     refetchInterval: () => refreshFor(span, 60_000),
-    placeholderData: keepPreviousData,
+    placeholderData: (prev, prevQuery) => (prevQuery && (keepAcrossChoices || onlySpanDiffers(prevQuery.queryKey, key)) ? prev : undefined),
   });
 }
 
@@ -861,13 +878,17 @@ export interface Wlan {
 /** What `useConnections` returns. */
 export type Connections = { attempts: ConnAttempt[]; roams: Roam[]; ap_names: Record<string, string>; client_names: Record<string, string> };
 
-/** Connection attempts and roams, newest first: at most `limit` of each (the server's default is 500); `roams: false` skips the roams. */
+/**
+ * Connection attempts and roams, newest first: at most `limit` of each (the server's default is 500); `roams: false` skips the roams.
+ * The old list stays on screen while another `opts` loads too (the attempt list dims it).
+ */
 export const useConnections = (span: TimeSpan, opts: { client?: Mac; failed?: boolean; limit?: number; roams?: boolean } = {}) =>
   useSpanQuery<Connections>(
     keys.connections(span, opts),
     "/api/connections",
     span,
     { client: opts.client, failed: opts.failed ? "true" : undefined, limit: opts.limit, roams: opts.roams === false ? "false" : undefined },
+    true,
   );
 
 export const useRoaming = (span: TimeSpan) => useSpanQuery<Roaming>(keys.roaming(span), "/api/roaming", span);
@@ -944,7 +965,8 @@ export interface FirmwareJob {
   from: string | null;
   target: string;
   custom: boolean;
-  state: "queued" | "sent" | "downloading" | "writing";
+  /** Queued, sent with an inform reply, then the AP's own steps. */
+  state: "queued" | "sent" | "preparing" | "downloading" | "writing";
   sent_at: number | null;
   expires: number | null;
 }
@@ -1010,7 +1032,7 @@ export const useDevice = (mac: Mac) =>
   useQuery({ queryKey: keys.device(mac), queryFn: getting<DeviceDetail>(`/api/devices/${mac}`) });
 
 /** Every client of the past year, with its latest sample: for the client list. */
-export const useClients = () => useQuery({ queryKey: keys.clients(), queryFn: getting<ClientView[]>("/api/clients") });
+export const useClients = () => useQuery({ queryKey: keys.clients(), queryFn: getting<ListedClient[]>("/api/clients") });
 
 /** Names by MAC, for links. */
 export type Names = Readonly<Record<Mac, string>>;
@@ -1445,11 +1467,11 @@ export interface WlanSettingsList {
   networks: { id: string; name: string; vlan: number | null; purpose: string | null }[];
   aps: { mac: Mac; name: string | null }[];
   /** For each optional SSID feature, the APs that would broadcast without it. */
-  unsupported?: Record<string, Mac[]>;
+  unsupported: Record<string, Mac[]>;
   /** APs whose feature support is not known yet (no inform). */
-  unknown?: Mac[];
+  unknown: Mac[];
   /** The predefined mDNS service codes. */
-  mdns_services?: { code: string; name: string }[];
+  mdns_services: { code: string; name: string }[];
 }
 
 export interface MdnsRule {
@@ -1529,7 +1551,7 @@ export interface DeviceSettings {
  *  not render; `fixes`: why its config does not render now, which the change mends. */
 export interface SettingsPreview {
   what: string;
-  aps: { mac: Mac; name: string | null; error?: string; fixes?: string; system_cfg?: Record<string, unknown>; mgmt_cfg?: Record<string, unknown>; labels?: Record<string, string> }[];
+  aps: (ConfigPushed & { mac: Mac; name: string | null; error?: string; fixes?: string })[];
 }
 
 export type SettingsTarget =

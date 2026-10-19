@@ -10,7 +10,7 @@ import {
   useCanEdit,
   useFirmware,
 } from "../api";
-import type { FirmwareInfo } from "../api";
+import type { FirmwareInfo, FirmwareJob } from "../api";
 import { ago, bytes, clock, useNow } from "../format";
 import { Outcome, QueryNote, THead, useRunner } from "./common";
 import { TextInput } from "./settings/form";
@@ -23,9 +23,10 @@ const STATUS: Record<FirmwareInfo["aps"][number]["status"], [string, string]> =
     unknown: ["Unknown", ""],
   };
 
-const STEP: Record<string, string> = {
+const STEP: Record<FirmwareJob["state"], string> = {
   queued: "waiting for its next report",
   sent: "told to update",
+  preparing: "preparing to download",
   downloading: "downloading",
   writing: "writing to flash",
 };
@@ -38,7 +39,7 @@ export function FirmwarePanel() {
   const [url, setUrl] = useState("");
   // The engine updates the job list a moment after each request.
   const { busy, msg, run } = useRunner([keys.firmware()], 1200);
-  if (!f.data) return <QueryNote q={f} />;
+  if (!f.data) return <QueryNote q={f} panel />;
   const d = f.data;
   const canAct = d.active && !readOnly;
   const updatable = d.aps.filter(
@@ -61,7 +62,7 @@ export function FirmwarePanel() {
               className="btn small"
               disabled={busy}
               onClick={() =>
-                run(
+                void run(
                   async () =>
                     `The feed lists ${(await checkFirmware()).platforms} platforms.`,
                 )
@@ -233,7 +234,7 @@ export function FirmwarePanel() {
                 className="btn small"
                 disabled={busy}
                 onClick={() =>
-                  run(
+                  void run(
                     async () =>
                       `${(await cancelFirmware()).cancelled} cancelled.`,
                   )
@@ -251,7 +252,7 @@ export function FirmwarePanel() {
                   className="btn small"
                   disabled={busy || !!job}
                   onClick={() =>
-                    run(async () =>
+                    void run(async () =>
                       (await resumeFirmware()).resumed
                         ? "Resuming."
                         : "Nothing to resume.",
@@ -266,7 +267,7 @@ export function FirmwarePanel() {
           {job && (
             <div className="small">
               <b>{job.name ?? job.mac}</b>: {job.from} → {job.target},{" "}
-              {STEP[job.state] ?? job.state}
+              {STEP[job.state]}
               {job.sent_at && ` since ${clock(job.sent_at, now)}`}
               {job.expires && (
                 <span className="muted">

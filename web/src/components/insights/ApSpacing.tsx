@@ -1,5 +1,5 @@
 import { useOwnLinks } from "../../api";
-import { band } from "../../format";
+import { band, dbm } from "../../format";
 import { QueryState } from "../common";
 import type { Verdict } from "./shared";
 import { DensityStrip, VerdictHead } from "./shared";
@@ -44,7 +44,7 @@ export function ApSpacing() {
                 key: `${l.from}-${l.to}-${l.radio}`,
                 signal: l.signal,
                 tone: l.signal > TOO_CLOSE ? "warn" : undefined,
-                title: `${l.from_name ?? l.from} hears ${l.to_name ?? l.to} at ${l.signal} dBm (${band(l.radio)})`,
+                title: `${l.from_name ?? l.from} hears ${l.to_name ?? l.to} at ${dbm(l.signal)} (${band(l.radio)})`,
               }))}
             />
             {links.length === 0 && (

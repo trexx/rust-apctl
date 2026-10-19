@@ -11,6 +11,7 @@ import {
   rate,
   retryTone,
   spanText,
+  toneClass,
 } from "../format";
 import { COLORS, Chart, SpanPage, useTimeSpan } from "../components/Chart";
 import { QueryState, Signal } from "../components/common";
@@ -106,7 +107,7 @@ function WlanPanel({ w }: { w: Wlan }) {
           >
             Experience
           </div>
-          <b className={`tone-${experienceTone(w.satisfaction)}`}>
+          <b className={toneClass(experienceTone(w.satisfaction))}>
             {w.satisfaction ?? "—"}
           </b>{" "}
           <span className="muted small">
@@ -124,13 +125,13 @@ function WlanPanel({ w }: { w: Wlan }) {
         </div>
         <div>
           <div className="muted small">TX retries</div>
-          <b className={`tone-${retryTone(w.tx_retry_pct)}`}>
+          <b className={toneClass(retryTone(w.tx_retry_pct))}>
             {pct1(w.tx_retry_pct)}
           </b>
         </div>
         <div>
           <div className="muted small">Multicast + broadcast</div>
-          <b className={`tone-${multicastTone(w.multicast_pct)}`}>
+          <b className={toneClass(multicastTone(w.multicast_pct))}>
             {pct1(w.multicast_pct)}
           </b>
           <span className="muted small"> of packets</span>

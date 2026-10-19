@@ -1,4 +1,5 @@
 import type { ConfigNetwork } from "../../../api";
+import { TextField } from "../../common";
 import { Select } from "../form";
 
 /** The AP's own address; static needs care, as a wrong one cuts the AP off. */
@@ -16,11 +17,11 @@ export function AddressFields({
   ) => (
     <label className="small">
       {label}{" "}
-      <input
+      <TextField
         className="search mono"
         placeholder={placeholder}
-        value={value[k] ?? ""}
-        onChange={(e) => onChange({ ...value, [k]: e.target.value })}
+        value={value[k]}
+        onChange={(v) => onChange({ ...value, [k]: v })}
       />
     </label>
   );

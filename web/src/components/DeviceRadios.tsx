@@ -1,6 +1,11 @@
 import { useState } from "react";
 import { useSeries, useSiteActivity } from "../api";
-import type { ClientView, RadioSample, TimeSpan, VapSample } from "../api";
+import type {
+  ListedClientView,
+  RadioSample,
+  TimeSpan,
+  VapSample,
+} from "../api";
 import { COLORS, Chart } from "./Chart";
 import { QueryState, Signal, THead } from "./common";
 import {
@@ -8,10 +13,12 @@ import {
   band,
   bytes,
   compact,
+  dbm,
   multicastTone,
   pct,
   pct1,
   rate,
+  toneClass,
 } from "../format";
 import type { Tone } from "../format";
 
@@ -26,7 +33,7 @@ type NumericKey<T> = {
   [K in keyof T]: T[K] extends number | null ? K : never;
 }[keyof T];
 
-/** Lower edges of the signal buckets, strongest first, with the colour of `signalClass`. */
+/** Lower edges of the signal buckets, strongest first, with the tone of `signalTone`. */
 const SIGNAL_BUCKETS: [number, string, Tone][] = [
   [SIGNAL.excellent, "Excellent", "good"],
   [SIGNAL.good, "Good", "good"],
@@ -35,7 +42,7 @@ const SIGNAL_BUCKETS: [number, string, Tone][] = [
 ];
 
 /** How many of the radio's clients are in each signal band; those without a signal reading are left out. */
-function SignalDistribution({ clients }: { clients: ClientView[] }) {
+function SignalDistribution({ clients }: { clients: ListedClientView[] }) {
   const signals = clients.flatMap((c) => c.sample.signal ?? []);
   const counts = SIGNAL_BUCKETS.map(([min], i) => {
     const max = i === 0 ? Infinity : SIGNAL_BUCKETS[i - 1]![0];
@@ -79,7 +86,7 @@ export function RadioPanel({
   mac: string;
   radio: RadioSample;
   vaps: VapSample[];
-  clients: ClientView[];
+  clients: ListedClientView[];
   range: TimeSpan;
 }) {
   const s = useSeries("radio", `${mac},${radio.radio}`, range);
@@ -105,14 +112,14 @@ export function RadioPanel({
           {radio.channel !== null
             ? `channel ${radio.channel} · ${unit(radio.bw, "MHz")}`
             : "no SSIDs on this radio"}{" "}
-          · noise {unit(radio.noise_floor, "dBm")}
+          · noise {dbm(radio.noise_floor)}
         </span>
       </div>
       <dl className="kv">
         <dt>TX power</dt>
         <dd>
-          {unit(radio.tx_power, "dBm")}
-          {eirp !== null && <span className="muted"> · {eirp} dBm EIRP</span>}
+          {dbm(radio.tx_power)}
+          {eirp !== null && <span className="muted"> · {dbm(eirp)} EIRP</span>}
           {radio.min_txpower !== null && radio.max_txpower !== null && (
             <span className="muted small">
               {" "}
@@ -143,7 +150,7 @@ export function RadioPanel({
         <dt>Multicast / broadcast</dt>
         <dd>
           <span
-            className={`tone-${multicastTone(mcastShare)}`}
+            className={toneClass(multicastTone(mcastShare))}
             title="Share of all packets on this radio"
           >
             {pct1(mcastShare)} of packets

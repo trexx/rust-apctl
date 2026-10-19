@@ -1,18 +1,26 @@
 import { useState } from "react";
 import { Link } from "react-router";
-import { useChannelPlan, useNeighbors, useRadios } from "../api";
+import {
+  useChannelAi,
+  useChannelPlan,
+  useNeighbors,
+  useRadios,
+} from "../api";
 import type { Neighbor, RadioOverview } from "../api";
 import {
   ago,
   band as bandName,
   bytes,
+  dbm,
   pct1,
   retryTone,
+  toneClass,
   useNow,
 } from "../format";
 import { ApSpacing } from "../components/insights/ApSpacing";
 import { DeploymentDensity } from "../components/insights/DeploymentDensity";
-import { BandPicker } from "../components/insights/shared";
+import { RadioPicker } from "../components/insights/shared";
+import type { Radio } from "../components/insights/shared";
 import { ThreatList } from "../components/ThreatList";
 import { RoamingView } from "../components/RoamingView";
 import {
@@ -21,6 +29,8 @@ import {
   Segmented,
   Signal,
   THead,
+  TextField,
+  Toggle,
   useUrlTab,
 } from "../components/common";
 import { ChannelAiPanel, PlanActions } from "../components/ChannelAi";
@@ -124,7 +134,7 @@ function Spectrum({ band, shapes }: { band: "ng" | "na"; shapes: Shape[] }) {
             points={pts}
             className={s.own ? "spectrum-shape own" : "spectrum-shape"}
           >
-            <title>{`${s.label}: ${s.signal} dBm, ${s.width} MHz`}</title>
+            <title>{`${s.label}: ${dbm(s.signal)}, ${s.width} MHz`}</title>
           </polygon>
         );
       })}
@@ -139,7 +149,10 @@ function ChannelPlan({
   band: "ng" | "na";
   radios: RadioOverview[];
 }) {
-  const [dfs, setDfs] = useState(false);
+  // As Channel AI's nightly run plans, until changed here.
+  const ai = useChannelAi();
+  const [ownDfs, setDfs] = useState<boolean | null>(null);
+  const dfs = ownDfs ?? ai.data?.settings.dfs ?? false;
   const plan = useChannelPlan(band, dfs);
   return (
     <div className="panel">
@@ -147,14 +160,11 @@ function ChannelPlan({
         <b>Channel plan, {bandName(band)}</b>
         <span className="spacer" />
         {band === "na" && (
-          <label className="small">
-            <input
-              type="checkbox"
-              checked={dfs}
-              onChange={(e) => setDfs(e.target.checked)}
-            />{" "}
-            Consider DFS channels
-          </label>
+          <Toggle
+            value={dfs}
+            onChange={setDfs}
+            label="Consider DFS channels"
+          />
         )}
       </div>
       <p className="muted small">
@@ -284,7 +294,7 @@ function RadioTable({ radios }: { radios: RadioOverview[] }) {
                       <span className="muted small"> / {r.bw ?? "?"} MHz</span>
                     </td>
                     <td className="nowrap">
-                      {r.tx_power ?? "—"} dBm
+                      {dbm(r.tx_power)}
                       {r.eirp !== null && (
                         <span className="muted small"> ({r.eirp} EIRP)</span>
                       )}
@@ -300,12 +310,10 @@ function RadioTable({ radios }: { radios: RadioOverview[] }) {
                     ? "—"
                     : `${r.avg_interference.toFixed(0)}%`}
                 </td>
-                <td className={retryTone(r.tx_retry_pct)}>
+                <td className={toneClass(retryTone(r.tx_retry_pct))}>
                   {pct1(r.tx_retry_pct)}
                 </td>
-                <td className="nowrap">
-                  {r.noise_floor === null ? "—" : `${r.noise_floor} dBm`}
-                </td>
+                <td className="nowrap">{dbm(r.noise_floor)}</td>
                 <td>
                   <Signal dbm={r.avg_client_signal} />
                 </td>
@@ -375,12 +383,9 @@ function occupancy(
 }
 
 function Environment() {
-  const [band, setBand] = useState<"ng" | "na">("na");
+  const [band, setBand] = useState<Radio>("na");
   const [q, setQ] = useState("");
-  const heard = useNeighbors(7 * 86400, band);
-  // Kept while another band loads, the previous band's networks would be drawn
-  // on this band's axis: show "Loading…" instead.
-  const n = heard.isPlaceholderData ? { data: undefined, error: null } : heard;
+  const n = useNeighbors(7 * 86400, band);
   const r = useRadios(86400);
   const now = useNow();
 
@@ -403,11 +408,7 @@ function Environment() {
       <div className="panel">
         <div className="panel-head">
           <b>Channel occupancy</b>
-          <BandPicker
-            value={band}
-            onChange={(b) => setBand(b as "ng" | "na")}
-            all={false}
-          />
+          <RadioPicker value={band} onChange={setBand} />
         </div>
         <QueryState q={n}>
           {() => <Spectrum band={band} shapes={shapes} />}
@@ -428,12 +429,11 @@ function Environment() {
           <b>Neighbouring networks</b>
           <span className="muted small">{list.length} seen</span>
           <span className="spacer" />
-          <input
-            className="search"
+          <TextField
             aria-label="Filter neighbouring networks"
             placeholder="Filter by name, BSSID, vendor…"
             value={q}
-            onChange={(e) => setQ(e.target.value)}
+            onChange={setQ}
           />
         </div>
         <QueryState q={n}>

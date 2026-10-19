@@ -1,17 +1,26 @@
 import { memo, useDeferredValue, useState } from "react";
+import type { ReactNode } from "react";
 import { Link } from "react-router";
 import { AttemptList } from "../components/Connections";
 import { SpanPage, useTimeSpan } from "../components/Chart";
 import { displayName, useClients } from "../api";
-import type { ClientView } from "../api";
+import type { ListedClient } from "../api";
 import {
   QueryNote,
   Segmented,
   Signal,
+  TextField,
   Toggle,
   useUrlTab,
 } from "../components/common";
-import { ago, bandChannel, duration, phy, useNow } from "../format";
+import {
+  ago,
+  bandChannel,
+  duration,
+  rates,
+  useNow,
+  wifiText,
+} from "../format";
 
 type SortKey =
   | "name"
@@ -22,7 +31,7 @@ type SortKey =
   | "uptime"
   | "last_seen";
 
-function value(c: ClientView, key: SortKey): string | number {
+function value(c: ListedClient, key: SortKey): string | number {
   switch (key) {
     case "name":
       return displayName(c).toLowerCase();
@@ -30,10 +39,11 @@ function value(c: ClientView, key: SortKey): string | number {
       return (c.ap_name ?? "").toLowerCase();
     case "essid":
       return (c.sample.essid ?? "").toLowerCase();
+    // A disconnected client's last sample isn't shown ("—"), so it sorts as unknown.
     case "signal":
-      return c.sample.signal ?? -999;
+      return c.connected ? (c.sample.signal ?? -999) : -1000;
     case "rate":
-      return c.sample.tx_rate ?? 0;
+      return c.connected ? (c.sample.tx_rate ?? 0) : -1;
     case "uptime":
       return c.connected ? (c.sample.uptime ?? 0) : -1;
     case "last_seen":
@@ -56,7 +66,7 @@ export function Clients() {
   );
 }
 
-function Attempts({ tabs }: { tabs: React.ReactNode }) {
+function Attempts({ tabs }: { tabs: ReactNode }) {
   const [span, setSpan] = useTimeSpan(86400);
   return (
     <SpanPage
@@ -98,7 +108,7 @@ function SortHeader({
   );
 }
 
-function ClientList({ tabs }: { tabs: React.ReactNode }) {
+function ClientList({ tabs }: { tabs: ReactNode }) {
   const clients = useClients();
   const [filter, setFilter] = useState("");
   const [showGone, setShowGone] = useState(false);
@@ -163,12 +173,11 @@ function ClientList({ tabs }: { tabs: React.ReactNode }) {
           onChange={setShowGone}
           label="include disconnected"
         />
-        <input
-          className="search"
+        <TextField
           aria-label="Filter clients"
           placeholder="Filter by name, note, MAC, IP, SSID or AP"
           value={filter}
-          onChange={(e) => setFilter(e.target.value)}
+          onChange={setFilter}
         />
       </div>
       <div className="panel">
@@ -209,7 +218,7 @@ const ClientRow = memo(function ClientRow({
   c,
   now,
 }: {
-  c: ClientView;
+  c: ListedClient;
   /** What "last seen" counts from (`useNow()`); unused while connected. */
   now: number;
 }) {
@@ -239,16 +248,8 @@ const ClientRow = memo(function ClientRow({
       <td>{c.sample.essid ?? "—"}</td>
       <td>{bandChannel(c.sample.radio, c.sample.channel)}</td>
       <td>{c.connected ? <Signal dbm={c.sample.signal} /> : "—"}</td>
-      <td>
-        {c.connected
-          ? `${phy(c.sample.tx_rate)} / ${phy(c.sample.rx_rate)}`
-          : "—"}
-      </td>
-      <td>
-        {c.sample.wifi_gen
-          ? `802.11${c.sample.wifi_gen}${c.sample.nss ? ` ${c.sample.nss}×${c.sample.nss}` : ""}`
-          : "—"}
-      </td>
+      <td>{c.connected ? rates(c.sample) : "—"}</td>
+      <td>{wifiText(c.sample)}</td>
       <td>{c.connected ? duration(c.sample.uptime) : "—"}</td>
       <td>{c.connected ? "now" : ago(c.last_seen, now)}</td>
     </tr>

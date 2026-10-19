@@ -2,6 +2,7 @@ import { useState } from "react";
 import type { ConfigNetwork, DeviceSettings } from "../../../api";
 import { band } from "../../../format";
 import {
+  RangeInput,
   Row,
   Select,
   TextInput,
@@ -124,20 +125,15 @@ export function DeviceEditor({
           ]}
         />
         {has("led") && form.led_override !== "off" && (
-          <label className="small">
-            brightness{" "}
-            <input
-              type="range"
-              aria-label="LED brightness"
-              min={1}
-              max={100}
-              value={form.led_override_color_brightness}
-              onChange={(e) =>
-                set("led_override_color_brightness", Number(e.target.value))
-              }
-            />{" "}
-            {form.led_override_color_brightness}%
-          </label>
+          <RangeInput
+            {...bind("led_override_color_brightness")}
+            aria-label="LED brightness"
+            prefix="brightness"
+            fallback={100}
+            min={1}
+            max={100}
+            unit="%"
+          />
         )}
         {has("led_color") && form.led_override !== "off" && (
           <TextInput

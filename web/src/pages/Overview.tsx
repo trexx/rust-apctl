@@ -33,7 +33,8 @@ import { MulticastPanel } from "../components/insights/Multicast";
 import { RetryBuckets } from "../components/insights/RetryBuckets";
 import { SiteActivity } from "../components/insights/SiteActivity";
 import { TopTalkers } from "../components/insights/TopTalkers";
-import { ZoomContext, useTimeSpan } from "../components/Chart";
+import { useTimeSpan } from "../components/Chart";
+import { SpanScope } from "../components/span";
 import { ThreatBanner } from "../components/Threats";
 import { lazyNamed } from "../lazy";
 
@@ -208,8 +209,8 @@ function RadioRow(p: {
 function SiteMulticast() {
   const [span, setSpan] = useTimeSpan(86400);
   return (
-    <ZoomContext.Provider value={(from, to) => setSpan({ from, to })}>
+    <SpanScope span={span} onSpan={setSpan}>
       <MulticastPanel span={span} />
-    </ZoomContext.Provider>
+    </SpanScope>
   );
 }

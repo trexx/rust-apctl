@@ -16,7 +16,10 @@ const typescript = (plugins) => ({
 
 export default defineConfig([
   { ignores: ["dist/"] },
-  { files: ["src/**/*.ts"], languageOptions: typescript(["typescript"]) },
+  {
+    files: ["src/**/*.ts", "vite.config.ts"],
+    languageOptions: typescript(["typescript"]),
+  },
   { files: ["src/**/*.tsx"], languageOptions: typescript(["typescript", "jsx"]) },
   {
     files: ["src/**/*.{ts,tsx}"],

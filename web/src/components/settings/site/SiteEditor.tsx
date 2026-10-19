@@ -2,6 +2,7 @@ import { useState } from "react";
 import { useCanEdit, useSiteSettings } from "../../../api";
 import type { SiteSettings } from "../../../api";
 import { QueryNote } from "../../common";
+import { EditPanel } from "../EditPanel";
 import { useSettingsForm } from "../form";
 import type { Fields } from "../form";
 import { EditorShell } from "../Review";
@@ -63,27 +64,15 @@ function SiteEditor({ d, onClose }: { d: SiteSettings; onClose: () => void }) {
 export function SiteSettingsPanel() {
   const q = useSiteSettings();
   const readOnly = !useCanEdit();
-  const [editing, setEditing] = useState(false);
-  if (!q.data) return <QueryNote q={q} />;
+  if (!q.data) return <QueryNote q={q} panel />;
   const d = q.data;
   const country = d.countries.find((c) => c.code === d.country)?.name;
   return (
-    <div className="panel">
-      <div className="panel-head">
-        <b>Site settings</b>
-        <span className="muted small">
-          {editing
-            ? ""
-            : `${country ?? `country ${d.country ?? "?"}`}, ${d.timezone ?? "UTC"}, SSH user ${d.mgmt.x_ssh_username ?? "ubnt"}`}
-        </span>
-        <span className="spacer" />
-        {!editing && !readOnly && (
-          <button className="btn small" onClick={() => setEditing(true)}>
-            Edit
-          </button>
-        )}
-      </div>
-      {editing && <SiteEditor d={d} onClose={() => setEditing(false)} />}
-    </div>
+    <EditPanel
+      title="Site settings"
+      summary={`${country ?? `country ${d.country ?? "?"}`}, ${d.timezone ?? "UTC"}, SSH user ${d.mgmt.x_ssh_username ?? "ubnt"}`}
+      readOnly={readOnly}
+      editor={(onClose) => <SiteEditor d={d} onClose={onClose} />}
+    />
   );
 }

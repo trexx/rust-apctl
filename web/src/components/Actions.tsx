@@ -103,7 +103,7 @@ export function DeviceActions({
               return r.forgetting
                 ? "It resets with its next report and is then removed."
                 : "Removed.";
-            }, "")
+            })
           }
         >
           Forget

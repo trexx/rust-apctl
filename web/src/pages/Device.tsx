@@ -1,7 +1,6 @@
 import { Suspense } from "react";
 import { Link, useParams } from "react-router";
 import {
-  displayName,
   useCanEdit,
   useClientNames,
   useDevice,
@@ -30,8 +29,8 @@ import {
   compact,
   duration,
   pct,
-  phy,
   rate,
+  rates,
   uplinkText,
   useNow,
 } from "../format";
@@ -59,6 +58,7 @@ export function Device() {
 function DevicePage({ mac }: { mac: string }) {
   const [range, setRange] = useTimeSpan(6 * 3600);
   const detail = useDevice(mac);
+  const cnames = useClientNames();
   const now = useNow();
   // Read-only users get neither the editor's code nor the AP's settings.
   const canEdit = useCanEdit();
@@ -92,7 +92,7 @@ function DevicePage({ mac }: { mac: string }) {
         mac={mac}
         name={ap.hostname ?? mac}
         online={d.online}
-        locating={detail.data.locating ?? false}
+        locating={detail.data.locating}
       />
       {canEdit && (
         <Suspense fallback={null}>
@@ -119,25 +119,25 @@ function DevicePage({ mac }: { mac: string }) {
         />
         <Stat label="Uptime" value={duration(ap.uptime)} />
         <Stat
-          label="CPU / memory"
-          value={`${pct(ap.cpu)} / ${pct(ap.mem)}`}
+          label="CPU"
+          value={pct(ap.cpu)}
           sub={`load ${ap.load1 ?? "—"} · ${ap.load5 ?? "—"} · ${ap.load15 ?? "—"}`}
+        />
+        <Stat
+          label="Memory"
+          value={pct(ap.mem)}
+          sub={`${bytes(ap.mem_used)} of ${bytes(ap.mem_total)}`}
         />
         <Stat
           label="Clients"
           value={clients.length}
           sub={`satisfaction ${ap.satisfaction ?? "—"}`}
         />
-        <Stat
-          label="Memory"
-          value={ap.mem_used !== null ? bytes(ap.mem_used) : "—"}
-          sub={`of ${bytes(ap.mem_total)}${up ? ` · uplink ${up.ifname} ${uplinkText(up)}` : ""}`}
-        />
         {up && (
           <Stat
-            label="Uplink received"
-            value={bytes(up.rx_bytes)}
-            sub={`sent ${bytes(up.tx_bytes)} · packets ${compact(up.rx_packets)} in, ${compact(up.tx_packets)} out · since start`}
+            label={`Uplink ${up.ifname}`}
+            value={uplinkText(up)}
+            sub={`${bytes(up.rx_bytes)} received, ${bytes(up.tx_bytes)} sent · packets ${compact(up.rx_packets)} in, ${compact(up.tx_packets)} out · since start`}
           />
         )}
       </div>
@@ -207,7 +207,7 @@ function DevicePage({ mac }: { mac: string }) {
                 <tr key={c.sample.mac}>
                   <td>
                     <Link to={`/clients/${c.sample.mac}`}>
-                      {displayName(c)}
+                      {cnames[c.sample.mac] ?? c.sample.mac}
                     </Link>
                   </td>
                   <td>{c.sample.essid ?? "—"}</td>
@@ -215,9 +215,7 @@ function DevicePage({ mac }: { mac: string }) {
                   <td>
                     <Signal dbm={c.sample.signal} />
                   </td>
-                  <td>
-                    {phy(c.sample.tx_rate)} / {phy(c.sample.rx_rate)}
-                  </td>
+                  <td>{rates(c.sample)}</td>
                   <td>{duration(c.sample.uptime)}</td>
                 </tr>
               ))}
