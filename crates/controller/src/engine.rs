@@ -1427,12 +1427,12 @@ impl Engine {
         let stale = now - 2 * MCAST_GAP;
         self.mcast_prev.retain(|_, (ts, ..)| *ts > stale);
         self.syslog_unknown.retain(|_, at| (*at..*at + SYSLOG_RETRY_SECS).contains(&now));
-        for (device_mac, (_, later)) in &mut self.logs_announced {
+        self.logs_announced.retain(|device_mac, (at, later)| {
             if std::mem::take(later) {
                 let _ = self.tx.send(LiveMsg::Log { device_mac: *device_mac });
             }
-        }
-        self.logs_announced.retain(|_, (at, _)| now - *at < 60);
+            now - *at < 60
+        });
         self.bss_prev.retain(|_, (ts, _)| *ts > stale);
         for e in self.logevents.tick(now) {
             self.emit(e);
