@@ -77,7 +77,7 @@ pub fn apply_site(state: &mut Value, p: &Value) -> Result<String, String> {
     if (country(state), mgmt_flag(state, "outdoor_mode_enabled")) != rules_before {
         notes.extend(reset_illegal_channels(state));
     }
-    if !p["country"].is_null() && !setting(state, "radio_ai").is_null() {
+    if country(state) != rules_before.0 && !setting(state, "radio_ai").is_null() {
         // Channel AI's channel lists follow the country.
         crate::channelai::apply_settings(state, &json!({}))?;
     }
@@ -417,6 +417,22 @@ mod tests {
         edit(&mut s, json!({ "country": 208, "timezone": "Europe/Copenhagen" })).unwrap();
         assert_eq!((setting(&s, "country")["code"].as_str(), setting(&s, "locale")["timezone"].as_str()), (Some("208"), Some("Europe/Copenhagen")));
         assert!(edit(&mut s, json!({ "timezone": "Mars/Olympus" })).is_err());
+    }
+
+    #[test]
+    fn channel_ai_lists_follow_a_new_country_only() {
+        let mut s = state();
+        crate::channelai::apply_settings(&mut s, &json!({})).unwrap();
+        // The US 5 GHz list has 149, Germany's does not.
+        let na = |s: &Value| setting(s, "radio_ai")["channels_na"].clone();
+        let has_149 = |s: &Value| na(s).as_array().unwrap().iter().any(|c| crate::settings::num(c) == Some(149));
+        assert!(!has_149(&s), "{}", na(&s));
+        edit(&mut s, json!({ "country": 840 })).unwrap();
+        assert!(has_149(&s), "{}", na(&s));
+        // The same country again leaves them as they are.
+        setting_mut(&mut s, "radio_ai")["channels_na"] = json!(["36"]);
+        assert_eq!(edit(&mut s, json!({ "country": 840, "timezone": "Europe/Berlin" })).unwrap(), "site settings: locale.timezone");
+        assert_eq!(na(&s), json!(["36"]));
     }
 
     #[test]
