@@ -1211,7 +1211,7 @@ const RESYNC: &str = r#"{"type":"resync"}"#;
 
 /// Serialises each live message once, whatever the number of sockets: a task
 /// forwards the engine's messages as JSON text to the channel they read.
-/// Messages the task itself misses become a resync.
+/// Messages the task itself misses, or fails to serialise, become a resync.
 pub fn live_json(typed: &broadcast::Sender<LiveMsg>) -> broadcast::Sender<Utf8Bytes> {
     let (tx, _) = broadcast::channel(4096);
     let mut rx = typed.subscribe();
@@ -1220,7 +1220,14 @@ pub fn live_json(typed: &broadcast::Sender<LiveMsg>) -> broadcast::Sender<Utf8By
         loop {
             let text = match rx.recv().await {
                 Ok(_) if out.receiver_count() == 0 => continue, // no socket open
-                Ok(m) => Utf8Bytes::from(serde_json::to_string(&m).unwrap_or_default()),
+                Ok(m) => match serde_json::to_string(&m) {
+                    Ok(text) => Utf8Bytes::from(text),
+                    // A resync in its place, as for a missed one (an empty frame is no JSON to the page).
+                    Err(e) => {
+                        tracing::error!("live message not sent: {e}");
+                        Utf8Bytes::from_static(RESYNC)
+                    }
+                },
                 Err(broadcast::error::RecvError::Lagged(_)) => Utf8Bytes::from_static(RESYNC),
                 Err(broadcast::error::RecvError::Closed) => return,
             };
