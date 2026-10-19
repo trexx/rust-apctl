@@ -588,7 +588,7 @@ fn mdns(c: &mut Cfg, ctx: &Ctx, vaps: &[Vap], net: &Net) {
     if isolation {
         c.set("mdns_sd.ap_mode", "enabled");
     }
-    let bridge_of_vlan = |vlan: Option<u16>| net.bridges.iter().find(|b| b.vlan == vlan).map(|b| b.name.as_str());
+    let bridge_of_vlan = |vlan: Option<u16>| net.bridges.iter().find(|b| b.vlan == vlan).map(net::Bridge::name);
     let (mut f, mut p) = (0, 0);
     for wv in wlans {
         let w: &Value = &wv.w;
@@ -619,7 +619,7 @@ fn mdns(c: &mut Cfg, ctx: &Ctx, vaps: &[Vap], net: &Net) {
         }
         let own_bridge = bridge_of_vlan(network_vlan(ctx, own));
         for e in entries {
-            let others: Vec<&str> = e
+            let others: Vec<net::BridgeName> = e
                 .networks
                 .iter()
                 .filter(|n| **n != own)

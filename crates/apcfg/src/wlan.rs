@@ -479,7 +479,7 @@ fn wep(c: &mut Cfg, p: Prefix, w: &Value) {
 
 /// The `aaa.N.*` and `wireless.N.*` blocks of one VAP (`v`, one of `vaps`).
 pub fn render_vap(c: &mut Cfg, ctx: &Ctx, radios: &[Radio], vaps: &[Vap], v: &Vap) {
-    let bridge = &crate::net::bridge_name(v.vlan);
+    let bridge = crate::net::BridgeName(v.vlan);
     let w: &Value = &v.w;
     let r = &radios[v.radio];
     let n = v.slot.section;
