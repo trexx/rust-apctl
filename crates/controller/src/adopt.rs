@@ -249,14 +249,14 @@ pub fn radio_table(state: &Value, payload: &Value) -> Vec<Value> {
 /// A new AP's record (but for its `site_id`): its details from its inform, a
 /// fresh key (32 hex characters) and syslog key (64), a cfgversion, and its radios.
 pub fn new_device(state: &Value, payload: &Value, mac: &Mac) -> Value {
-    let other = &state["devices"][0];
+    let other = crate::settings::docs(state, "devices").next().unwrap_or(&Value::Null);
     let mut d = json!({
         "mac": mac.to_string(), "adopted": true, "type": "uap", "x_authkey": crate::random_hex(16), "syslog_key": crate::random_hex(32),
         "cfgversion": crate::random_hex(8), "config_network": { "type": "dhcp" }, "adopted_at": clock::now_ts(),
         "radio_table": radio_table(state, payload),
     });
     fill_from_inform(&mut d, payload);
-    // The management network and WLAN groups of the other APs.
+    // The management network and WLAN groups of the site's other APs.
     for k in ["mgmt_network_id", "wlangroup_id_ng", "wlangroup_id_na"] {
         if !other[k].is_null() {
             d[k] = other[k].clone();
