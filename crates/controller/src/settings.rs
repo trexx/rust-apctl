@@ -972,8 +972,8 @@ fn edit_wlan(state: &mut Value, e: &WlanEdit, over: &[Over]) -> Result<String, S
             w[*k] = v.clone();
         }
     }
-    // What the edit's own fields are told apart from, below.
-    let iot_base = iot.then(|| w.clone());
+    // What the edit's own fields are told apart from, below: the held fields as they are now.
+    let iot_base: Option<Vec<Value>> = iot.then(|| IOT_TEMPLATE.iter().map(|(k, _, _)| w[*k].clone()).collect());
 
     copy_fields(
         p,
@@ -1005,10 +1005,10 @@ fn edit_wlan(state: &mut Value, e: &WlanEdit, over: &[Over]) -> Result<String, S
     wlan_links(state, p, &mut w)?;
 
     if let Some(iot_base) = &iot_base {
-        for (k, v, what) in IOT_TEMPLATE.iter() {
+        for ((k, v, what), base) in IOT_TEMPLATE.iter().zip(iot_base) {
             if w[*k] != *v {
                 // The edit asked for it: refuse. Otherwise the stored value just goes.
-                if w[*k] != iot_base[*k] {
+                if w[*k] != *base {
                     return Err(format!("{what} is not available with Force Wi-Fi 4"));
                 }
                 w[*k] = v.clone();
