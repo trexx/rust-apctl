@@ -1150,7 +1150,12 @@ impl Engine {
 
     /// Taken by value: an event's data is moved out of the notification, not copied.
     fn notification(&self, ts: Ts, mut p: Value) {
-        let Some(mac) = p["mac"].as_str().and_then(|m| m.parse::<Mac>().ok()) else { return };
+        let Some(mac) = p["mac"].as_str().and_then(|m| m.parse::<Mac>().ok()) else {
+            // As an inform without one.
+            tracing::debug!("notification without a valid mac");
+            bump(&self.counters.decode_errors);
+            return;
+        };
         bump(&self.counters.notifications);
         // The live view is written for this alone, and only read (or, for an
         // upgrade notice, written) again where the notification needs it.
@@ -2414,7 +2419,13 @@ mod tests {
             events(&mut h),
             vec![("config_applied", None), ("client_connect_failed", Some(C1.into())), ("dfs_radar", None)]
         );
+        // One whose mac is not one is counted as undecodable.
+        let mut bad = notif(AP1, "setparam", Value::Null);
+        bad.payload["mac"] = json!("nope");
+        h.engine.handle(Input::Inform { ts: 9, peer: "x".into(), decoded: bad });
+        assert_eq!(events(&mut h), vec![]);
         let live = h.live.read().unwrap();
+        assert_eq!(live.counters.decode_errors.load(Ordering::Relaxed), 1);
         assert!(live.clients[&C1.parse().unwrap()].connected);
         assert_eq!(live.counters.notifications.load(Ordering::Relaxed), 4);
         assert_eq!(live.devices[&AP1.parse().unwrap()].last_full_inform, 0, "notifications are not client lists");
