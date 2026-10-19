@@ -21,19 +21,46 @@ RUN echo "registry of ${OUI_MONTH:-the first build}" \
     && chmod 644 /oui.csv
 
 # --- controller ---
-FROM docker.io/library/rust:1.98-bookworm AS build
+# The dependencies build from the manifests alone, every crate's own source replaced by
+# an empty one: that stage does not wait for the web UI, and a code change leaves it
+# cached. The skeleton stage runs on every change but makes the same files.
+FROM docker.io/library/rust:1.98-bookworm AS skeleton
 WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
 COPY crates/ crates/
-COPY --from=web /web/dist web/dist
+RUN for c in crates/*; do \
+        targets=$(cd "$c" && ls src/lib.rs src/main.rs 2>/dev/null || true); \
+        find "$c" -mindepth 1 -maxdepth 1 ! -name Cargo.toml -exec rm -rf {} +; \
+        mkdir "$c/src"; \
+        for t in $targets; do \
+            case $t in *main.rs) echo 'fn main() {}' ;; *) : ;; esac > "$c/$t"; \
+        done; \
+    done
+
 # The registry and target directory persist between builds (BuildKit cache
 # mounts), so a code change recompiles our crates, not every dependency. The
 # target directory is not part of the image: the binary is copied out of it.
-# The release profile strips the binary.
+# CARGO_BUILD_JOBS limits cargo on a machine short of memory (--build-arg).
+FROM docker.io/library/rust:1.98-bookworm AS deps
+WORKDIR /src
+COPY --from=skeleton /src ./
+ARG CARGO_BUILD_JOBS=default
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
     --mount=type=cache,target=/src/target \
-    cargo build --release --locked -p controller && cp target/release/apctl /apctl
+    cargo build --release --locked -p controller
+
+# The sources are touched: COPY keeps their times, which can be older than the empty
+# ones', and cargo would take our crates as built. The release profile strips the binary.
+FROM deps AS build
+COPY crates/ crates/
+COPY --from=web /web/dist web/dist
+ARG CARGO_BUILD_JOBS=default
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/usr/local/cargo/git \
+    --mount=type=cache,target=/src/target \
+    find crates -name '*.rs' -exec touch {} + \
+    && cargo build --release --locked -p controller && cp target/release/apctl /apctl
 
 # --- capture sidecar for shadow mode: tcpdump writing pcap into a FIFO ---
 FROM docker.io/library/alpine:3.22 AS capture
