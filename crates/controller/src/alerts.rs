@@ -650,9 +650,10 @@ impl Watcher {
             })
             .collect();
         for mac in gone {
-            self.aps.down.remove(&mac);
             self.book.resolve(now, &(Key::ApOffline, Entity::Ap(mac)), || "The AP is no longer managed.".into());
         }
+        // Those without an open alert too (one past the day's limit): it would never come back to clear them.
+        self.aps.down.retain(|m, _| known.contains(m));
         for (mac, name, last_seen) in seen {
             let name = name.unwrap_or_else(|| mac.to_string());
             let status = |key: Key, severity: Severity, title: String, message: String| Alert::for_device(key, Category::ApStatus, severity, mac, title, message).tagged(format!("ap-status:{mac}"));
@@ -1023,6 +1024,28 @@ mod tests {
         w.status_tick(1000 + OFFLINE_AFTER);
         assert_eq!(told(&mut rx), [("raised", "ap_offline")]);
         assert_eq!(w.book.open[&(Key::ApOffline, Entity::Ap(ap))].title, "Garage is offline");
+    }
+
+    #[tokio::test]
+    async fn a_forgotten_ap_is_forgotten_even_when_its_drop_was_not_reported() {
+        let (mut w, mut rx, _dir) = watcher();
+        let ap: Mac = "02:00:00:00:00:01".parse().unwrap();
+        let known = crate::engine::KnownDevice {
+            first_seen: 0, last_seen: 1000, uptime: None, version: None, hostname: None, model: None, model_display: None, ip: None, serial: None,
+        };
+        w.live.write().unwrap().known_devices.insert(ap, known);
+        // Past the day's limit, and "keeps dropping off" already sent today: no alert, but it counts as down.
+        let now = 1000 + OFFLINE_AFTER;
+        w.aps.sent.insert(ap, vec![now - 600, now - 300]);
+        w.aps.flapping_day.insert(ap, now / 86400);
+        w.status_tick(now);
+        assert!(told(&mut rx).is_empty() && w.aps.down.contains_key(&ap));
+        // Forgotten: nothing of it is kept, and a day on not even its alerts' times.
+        w.live.write().unwrap().known_devices.clear();
+        w.status_tick(now + 30);
+        assert!(w.aps.down.is_empty());
+        w.status_tick(now + 86400);
+        assert!(w.aps.sent.is_empty() && w.aps.flapping_day.is_empty());
     }
 
     #[tokio::test]
