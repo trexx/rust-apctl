@@ -37,6 +37,10 @@ pub fn queue(live: &mut Live, mac: Mac, cmd: Value) {
     if let Some(undo) = opposite(&cmd) {
         q.retain(|c| *c != undo);
     }
+    // A client's newer speed limit replaces one still waiting.
+    if cmd["cmd"] == "rate-update" {
+        q.retain(|c| c["cmd"] != "rate-update" || c["mac"] != cmd["mac"]);
+    }
     if !q.contains(&cmd) {
         q.push_back(cmd);
     }
@@ -132,11 +136,10 @@ impl<'a> ClientControls<'a> {
     }
 }
 
-/// The AP a device action is for: active mode, and an AP apctl has heard from.
-fn target_ap(s: &AppState, mac: Mac) -> Result<Mac, ApiError> {
+/// Whether a device action can be done: active mode, and an AP apctl has heard from.
+fn target_ap(s: &AppState, mac: &Mac) -> Result<(), ApiError> {
     crate::api::require_active(s, "this needs")?;
-    known_ap(s, &mac)?;
-    Ok(mac)
+    known_ap(s, mac)
 }
 
 fn known_ap(s: &AppState, mac: &Mac) -> Result<(), ApiError> {
@@ -159,7 +162,7 @@ fn offline() -> ApiError {
 
 /// POST /api/devices/{mac}/restart
 pub async fn restart(State(s): State<AppState>, MacPath(mac): MacPath) -> Result<Json<Value>, ApiError> {
-    let mac = target_ap(&s, mac)?;
+    target_ap(&s, &mac)?;
     {
         let mut live = s.live.write().unwrap();
         if !is_online(&live, &mac) {
@@ -178,7 +181,7 @@ pub struct LocateBody {
 
 /// POST /api/devices/{mac}/locate {on}
 pub async fn locate(State(s): State<AppState>, MacPath(mac): MacPath, Json(b): Json<LocateBody>) -> Result<Json<Value>, ApiError> {
-    let mac = target_ap(&s, mac)?;
+    target_ap(&s, &mac)?;
     let mut live = s.live.write().unwrap();
     // Turning it off can wait for an AP that is away: it is harmless when it comes.
     if b.on && !is_online(&live, &mac) {
@@ -195,7 +198,7 @@ pub async fn locate(State(s): State<AppState>, MacPath(mac): MacPath, Json(b): J
 
 /// POST /api/devices/{mac}/provision: send the AP its config again.
 pub async fn provision(State(s): State<AppState>, MacPath(mac): MacPath) -> Result<Json<Value>, ApiError> {
-    let mac = target_ap(&s, mac)?;
+    target_ap(&s, &mac)?;
     {
         let mut live = s.live.write().unwrap();
         live.reprovision.insert(mac);
@@ -338,6 +341,18 @@ mod tests {
         }
         let cmds: Vec<String> = std::iter::from_fn(|| next(&mut live, &ap)).map(|c| format!("{} {}", c["cmd"].as_str().unwrap(), c["mac"].as_str().unwrap_or(""))).collect();
         assert_eq!(cmds, ["block-sta aa:bb:cc:00:00:02", "kick-sta aa:bb:cc:00:00:03", "unset-locate ", "unblock-sta aa:bb:cc:00:00:01"]);
+    }
+
+    #[test]
+    fn a_newer_speed_limit_replaces_one_still_waiting() {
+        let mut live = Live::default();
+        let ap: Mac = "02:00:00:00:00:01".parse().unwrap();
+        let limit = |client: &str, down: i64| json!({ "_type": "cmd", "cmd": "rate-update", "mac": client, "dl_max": down, "dl_min": 64, "ul_max": -1, "ul_min": 64 });
+        queue(&mut live, ap, limit("aa:bb:cc:00:00:01", 2000));
+        queue(&mut live, ap, limit("aa:bb:cc:00:00:02", 1000));
+        queue(&mut live, ap, limit("aa:bb:cc:00:00:01", -1));
+        let cmds: Vec<(String, i64)> = std::iter::from_fn(|| next(&mut live, &ap)).map(|c| (c["mac"].as_str().unwrap().to_string(), c["dl_max"].as_i64().unwrap())).collect();
+        assert_eq!(cmds, [("aa:bb:cc:00:00:02".to_string(), 1000), ("aa:bb:cc:00:00:01".to_string(), -1)], "one command per client, the latest");
     }
 
     #[test]

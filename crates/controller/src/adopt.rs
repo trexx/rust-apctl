@@ -249,27 +249,47 @@ pub fn radio_table(state: &Value, payload: &Value) -> Vec<Value> {
 /// A new AP's record (but for its `site_id`): its details from its inform, a
 /// fresh key (32 hex characters) and syslog key (64), a cfgversion, and its radios.
 pub fn new_device(state: &Value, payload: &Value, mac: &Mac) -> Value {
-    let other = &state["devices"][0];
+    let other = crate::settings::docs(state, "devices").next().unwrap_or(&Value::Null);
     let mut d = json!({
         "mac": mac.to_string(), "adopted": true, "type": "uap", "x_authkey": crate::random_hex(16), "syslog_key": crate::random_hex(32),
         "cfgversion": crate::random_hex(8), "config_network": { "type": "dhcp" }, "adopted_at": clock::now_ts(),
         "radio_table": radio_table(state, payload),
     });
-    for k in ["model", "version", "serial", "ip"] {
-        if !payload[k].is_null() {
-            d[k] = payload[k].clone();
-        }
-    }
-    if let Some(n) = payload["hostname"].as_str() {
-        d["name"] = json!(n);
-    }
-    // The management network and WLAN groups of the other APs.
+    fill_from_inform(&mut d, payload);
+    // The management network and WLAN groups of the site's other APs.
     for k in ["mgmt_network_id", "wlangroup_id_ng", "wlangroup_id_na"] {
         if !other[k].is_null() {
             d[k] = other[k].clone();
         }
     }
     d
+}
+
+/// Fills an AP's record with its details from an inform: its model, version,
+/// serial and address, and its hostname as its name unless it has one.
+pub fn fill_from_inform(d: &mut Value, payload: &Value) {
+    for k in ["model", "version", "serial", "ip"] {
+        if !payload[k].is_null() {
+            d[k] = payload[k].clone();
+        }
+    }
+    if d["name"].is_null()
+        && let Some(n) = payload["hostname"].as_str()
+    {
+        d["name"] = json!(n);
+    }
+}
+
+/// Has a new AP join the IoT channel locks of the SSIDs it is to broadcast,
+/// as the APs there when a lock was switched on did; `what` says what else
+/// changed. The official controller applies a lock only then, and leaves an
+/// AP adopted later on auto, which its device editor then refuses to move
+/// (and Channel AI leaves locked APs alone): apctl keeps every AP of a locked
+/// SSID on channel 6. An AP's radios are known once its inform lists them
+/// (at once for one adopted from the UI, later for one adopted over SSH).
+pub fn join_channel_locks(state: &mut Value, mac: &Mac, what: String) -> String {
+    let channels = crate::settings::apply_channel_locks(state, &[], Some(mac));
+    if channels.is_empty() { what } else { format!("{what}; {}", channels.join("; ")) }
 }
 
 /// An AP as adoption's messages name it: its label, with the MAC after a name.
@@ -286,25 +306,19 @@ pub fn adopt_device(state: &mut Value, mac: &Mac, payload: &Value) -> Result<Str
     if let Some(d) = device_doc_mut(state, mac) {
         d["x_authkey"] = json!(crate::random_hex(16));
         d["syslog_key"] = json!(crate::random_hex(32));
-        // The key it informed with, which is not this one any more.
+        // The key it informed with, which is not this one any more; and the
+        // AES-GCM pin, which the reset AP takes up again (as it is cleared by
+        // the official controller when an AP informs reset).
         if let Some(o) = d.as_object_mut() {
             o.remove("x_inform_authkey");
+            o.remove("x_aes_gcm");
         }
         return Ok(format!("re-adopting AP {} with new keys", ap_name(d, mac)));
     }
     let d = new_device(state, payload, mac);
     crate::settings::push_doc(state, "devices", d);
-    let mut what = format!("adopted AP {} ({mac})", payload["hostname"].as_str().or(payload["model"].as_str()).unwrap_or("new"));
-    // It joins the IoT channel locks of the SSIDs it is to broadcast, as the
-    // APs there when a lock was switched on did. The official controller
-    // applies a lock only then, and leaves an AP adopted later on auto, which
-    // its device editor then refuses to move (and Channel AI leaves locked
-    // APs alone): apctl keeps every AP of a locked SSID on channel 6.
-    let channels = crate::settings::apply_channel_locks(state, &[], Some(mac));
-    if !channels.is_empty() {
-        what = format!("{what}; {}", channels.join("; "));
-    }
-    Ok(what)
+    let what = format!("adopted AP {} ({mac})", payload["hostname"].as_str().or(payload["model"].as_str()).unwrap_or("new"));
+    Ok(join_channel_locks(state, mac, what))
 }
 
 /// Removes an AP from the settings and everything that names it.
@@ -557,6 +571,20 @@ mod tests {
         assert_eq!((again["name"].as_str(), again["x_authkey"].as_str().unwrap().len()), (Some("U6-Mesh"), 32));
         assert!(again["x_authkey"] != d["x_authkey"] && again["syslog_key"] != d["syslog_key"]);
         assert!(again.get("x_inform_authkey").is_none(), "the AP has yet to inform with it");
+        // A reset AP takes up AES-GCM again, as with the official controller.
+        device_doc_mut(&mut s, &mac).unwrap()["x_aes_gcm"] = json!(true);
+        adopt_device(&mut s, &mac, &inform()).unwrap();
+        assert!(device_doc(&s, &mac).unwrap().get("x_aes_gcm").is_none());
+    }
+
+    #[test]
+    fn a_record_takes_its_details_from_an_inform_but_keeps_its_name() {
+        let mut d = json!({ "name": "Hall" });
+        fill_from_inform(&mut d, &inform());
+        assert_eq!((d["name"].as_str(), d["model"].as_str(), d["ip"].as_str()), (Some("Hall"), Some("U6M"), Some("192.0.2.9")));
+        let mut d = json!({});
+        fill_from_inform(&mut d, &json!({ "hostname": null, "serial": null }));
+        assert_eq!(d, json!({}), "nothing written for what the inform leaves out");
     }
 
     #[test]
