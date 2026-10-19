@@ -610,15 +610,20 @@ impl Sanitizer {
     /// Rewrites the `key=value` config blob under `key` line by line. `under_secret`: its
     /// own key or one above it is secret. A line is `key=value` only when what comes
     /// before its first `=` is a config key ([`is_cfg_key`]); its identifiers are
-    /// rewritten like a JSON key's.
+    /// rewritten like a JSON key's. Line ends (`\n` or `\r\n`, and one after the last
+    /// line) are kept as they are.
     fn cfg(&mut self, key: &str, blob: &str, under_secret: bool) -> String {
-        blob.lines()
-            .map(|l| match l.split_once('=').filter(|(k, _)| is_cfg_key(k)) {
-                Some((k, v)) => {
-                    let value = self.field("", k, under_secret, v);
-                    format!("{}={value}", self.scrub_ids(k.to_string()))
-                }
-                None => self.cfg_line(key, l, under_secret),
+        blob.split('\n')
+            .map(|l| {
+                let (l, cr) = l.strip_suffix('\r').map_or((l, ""), |l| (l, "\r"));
+                let out = match l.split_once('=').filter(|(k, _)| is_cfg_key(k)) {
+                    Some((k, v)) => {
+                        let value = self.field("", k, under_secret, v);
+                        format!("{}={value}", self.scrub_ids(k.to_string()))
+                    }
+                    None => self.cfg_line(key, l, under_secret),
+                };
+                out + cr
             })
             .collect::<Vec<_>>()
             .join("\n")
@@ -1242,6 +1247,14 @@ mod tests {
         for leak in ["# psk=hunter22", "kitchen tv.name=x", "6f1c0e52-2b8a-4c3e-9d4f-0a1b2c3d4e5f"] {
             assert!(s.check_clean(leak, "leak").is_err(), "{leak}");
         }
+    }
+
+    #[test]
+    fn a_config_keeps_its_line_ends() {
+        let mut s = Sanitizer::new(Vec::new(), Vec::new());
+        let out = s.json(&json!({ "system_cfg": "radio.1.channel=36\n", "mgmt_cfg": "a.b=1\r\n# c\r\nc.mode=auto\r\n" }));
+        assert_eq!((&out["system_cfg"], &out["mgmt_cfg"]), (&json!("radio.1.channel=36\n"), &json!("a.b=1\r\n# c\r\nc.mode=auto\r\n")));
+        assert!(s.unlisted().next().is_none());
     }
 
     #[test]
