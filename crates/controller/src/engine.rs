@@ -971,7 +971,7 @@ impl Engine {
         let system = req.previous_system_cfg.unwrap_or_default();
         let result = render(req).map(|ours| crate::dryrun::compare(&ours, mgmt, system, false));
         let (matches, payload) = match &result {
-            Ok(c) => (c.matches(), serde_json::to_string(c).unwrap_or_default()),
+            Ok(c) => (c.matches(), c.stored()),
             Err(e) => (false, json!({ "error": format!("{e:#}") }).to_string()),
         };
         self.writer.exec(

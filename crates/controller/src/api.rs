@@ -781,7 +781,7 @@ async fn dryrun(State(s): State<AppState>) -> Result<Json<DryRunStatus>, ApiErro
                 stored.insert(mac, Arc::new(p));
             }
         }
-        // Without the diffs' text, which the history never shows (only the counts); text that isn't JSON becomes null.
+        // Without the diffs' text, which older rows have and the history never shows (only the counts); text that isn't JSON becomes null.
         let mut stmt = c.prepare_cached(
             "SELECT id, ts, mac, cfgversion, matches, CASE WHEN json_valid(comparison) THEN json_remove(comparison, '$.mgmt_cfg.diff', '$.system_cfg.diff') END
              FROM dryrun_results ORDER BY ts DESC LIMIT 100",
