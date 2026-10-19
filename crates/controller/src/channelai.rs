@@ -16,7 +16,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use axum::extract::State;
-use axum::http::StatusCode;
 use inform::Mac;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -439,7 +438,7 @@ pub async fn scan(State(s): State<AppState>, Json(b): Json<BandBody>) -> Result<
     let band = Band::named(&b.band).ok_or_else(|| ApiError::bad("band must be ng or na"))?;
     let asked = start_scans(&mut s.live.write().unwrap(), band, clock::now_ts());
     if asked.is_empty() {
-        return Err(ApiError(StatusCode::CONFLICT, "no online AP can scan this band".into()));
+        return Err(ApiError::conflict("no online AP can scan this band"));
     }
     Ok(Json(json!({ "scanning": asked })))
 }
@@ -453,7 +452,7 @@ pub struct RunBody {
 pub async fn run_now(State(s): State<AppState>, Json(b): Json<RunBody>) -> Result<Json<Value>, ApiError> {
     crate::api::require_active(&s, "this needs")?;
     // Taken here, so that of two requests at once only one is told it started.
-    let guard = RunGuard::take().ok_or_else(|| ApiError(StatusCode::CONFLICT, "Channel AI is already running".into()))?;
+    let guard = RunGuard::take().ok_or_else(|| ApiError::conflict("Channel AI is already running"))?;
     let bands = b.bands.unwrap_or_else(|| settings(s.live.read().unwrap().state.as_deref()).radios);
     tokio::spawn(run(s.clone(), bands, "manual", guard));
     Ok(Json(json!({ "started": true })))
@@ -653,7 +652,7 @@ mod tests {
         // The AP's last full inform arrived at `at`.
         let heard = |live: &mut Live, at: Ts| {
             let snapshot = crate::model::parse(at, &inform(0, None)).unwrap();
-            let d = crate::engine::DeviceView { snapshot, online: true, first_seen: 0, last_seen: at, peer: String::new(), interval: 10, last_full_inform: at, last_config_push: None };
+            let d = crate::engine::DeviceView { snapshot, online: true, first_seen: 0, last_seen: at, peer: None, interval: 10, last_full_inform: at, last_config_push: None };
             live.devices.insert(ap, d);
         };
         heard(&mut live, 995);

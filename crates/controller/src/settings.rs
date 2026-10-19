@@ -8,7 +8,6 @@
 //! the other controller (the next import would replace them).
 
 use axum::extract::State;
-use axum::http::StatusCode;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, LazyLock};
 
@@ -38,7 +37,7 @@ pub(crate) async fn change<B: Send + 'static>(s: &AppState, q: &PreviewQuery, ap
         return Ok(Json(preview(s, current, move |state| apply(state, &body)).await?));
     }
     if !s.active {
-        return Err(ApiError(StatusCode::CONFLICT, "saving needs active mode: in shadow mode the settings belong to the other controller".into()));
+        return Err(ApiError::conflict("saving needs active mode: in shadow mode the settings belong to the other controller"));
     }
     // Applied once, inside the engine, to the settings as they are then; what
     // changed is what that run says.
@@ -553,7 +552,7 @@ fn channels(state: &Value, band: &str, o: bool) -> Value {
 
 /// A new settings document's id.
 fn new_id() -> String {
-    random_hex(12)
+    random_hex::<12>()
 }
 
 pub(crate) fn is_mac(s: &str) -> bool {
@@ -1453,7 +1452,7 @@ pub fn create_wlan(state: &mut Value, patch: &Value) -> Result<String, String> {
         "_id": id, "site_id": site, "name": "", "enabled": true, "hide_ssid": false, "is_guest": false,
         "security": "wpapsk", "wpa_mode": "wpa2", "wpa_enc": "ccmp", "wpa3_support": false, "wpa3_transition": false, "pmf_mode": "disabled",
         "wlan_bands": ["2g", "5g"], "wlan_band": "both", "ap_group_mode": "all", "ap_group_ids": [all], "broadcasting_aps": [],
-        "networkconf_id": network, "usergroup_id": usergroup, "iapp_enabled": true, "x_iapp_key": random_hex(16), "short_id": short_id,
+        "networkconf_id": network, "usergroup_id": usergroup, "iapp_enabled": true, "x_iapp_key": random_hex::<16>(), "short_id": short_id,
     });
     let rest = json!({
         "setting_preference": "manual", "bss_transition": true, "fast_roaming_enabled": false, "uapsd_enabled": false, "proxy_arp": false,

@@ -355,10 +355,9 @@ impl Drain {
     /// Stops the engine taking inputs (it still handles the queued ones).
     fn start(&self) {
         self.closing.store(true, Ordering::Relaxed);
-        // An idle engine is woken to see the flag by an input that changes
-        // nothing (an empty alias import). A full queue needs none: the
-        // engine looks at the flag after the input it is on.
-        let _ = self.queue.try_send(Input::SetAliases { ts: clock::now_ts(), entries: Vec::new(), only_if_unset: true });
+        // An idle engine is woken to see the flag. A full queue needs no
+        // wake: the engine looks at the flag after the input it is on.
+        let _ = self.queue.try_send(Input::Wake);
     }
 
     /// Waits for the queue to be handled, at most `DRAIN_TIMEOUT`.
@@ -427,7 +426,7 @@ fn reporter_id(store: &store::Store) -> Result<String> {
         Ok(cfg.and_then(|cfg| cfg.lines().find_map(|l| l.strip_prefix("unifi.reporterid=")).map(str::to_string)))
     })?;
     Ok(seen.unwrap_or_else(|| {
-        let h = random_hex(16);
+        let h = random_hex::<16>();
         format!("{}-{}-4{}-a{}-{}", &h[0..8], &h[8..12], &h[13..16], &h[17..20], &h[20..32])
     }))
 }
@@ -439,11 +438,9 @@ pub(crate) fn random_bytes<const N: usize>() -> [u8; N] {
     b
 }
 
-/// `bytes` random bytes, in hex.
-pub(crate) fn random_hex(bytes: usize) -> String {
-    let mut b = vec![0u8; bytes];
-    getrandom::fill(&mut b).expect("system random source");
-    hex::encode(b)
+/// `N` random bytes, in hex.
+pub(crate) fn random_hex<const N: usize>() -> String {
+    hex::encode(random_bytes::<N>())
 }
 
 /// Active mode's servers: STUN (`inform_url`'s host is the address its answers

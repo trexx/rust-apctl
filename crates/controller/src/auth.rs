@@ -168,7 +168,7 @@ impl Auth {
     }
 
     pub(crate) fn create(&self, user: &str) -> String {
-        let token = crate::random_hex(32);
+        let token = crate::random_hex::<32>();
         let now = clock::now_ts();
         let session = Session { user: user.to_string(), expires: now + SESSION_SECS };
         let hash = token_hash(&token);
@@ -422,7 +422,7 @@ fn session(auth: &Auth, headers: &HeaderMap, peer: Option<IpAddr>) -> Option<(St
 /// them. Set on the route itself, so a new one cannot be missed.
 pub async fn withhold_in_read_only(State(s): State<AppState>, req: Request, next: Next) -> Result<Response, ApiError> {
     if !s.auth.enabled() {
-        return Err(ApiError(StatusCode::FORBIDDEN, "this needs a login: no users are configured (see --users-file)".into()));
+        return Err(ApiError::forbidden("this needs a login: no users are configured (see --users-file)"));
     }
     Ok(next.run(req).await)
 }
@@ -436,7 +436,7 @@ fn csrf_ok(headers: &HeaderMap) -> bool {
 }
 
 fn csrf_refused() -> ApiError {
-    ApiError(StatusCode::FORBIDDEN, "missing X-Requested-With: apctl header".into())
+    ApiError::forbidden("missing X-Requested-With: apctl header")
 }
 
 /// Guards every API route except login/logout/me; changes (anything but GET,
@@ -447,14 +447,14 @@ pub async fn require_login(State(s): State<AppState>, req: Request, next: Next) 
         // Without users apctl is read-only, and keeps its secrets (the
         // routes that hold them have `withhold_in_read_only`).
         if mutating {
-            return Err(ApiError(StatusCode::FORBIDDEN, "read-only: no users are configured (see --users-file)".into()));
+            return Err(ApiError::forbidden("read-only: no users are configured (see --users-file)"));
         }
         return Ok(next.run(req).await);
     }
     match session(&s.auth, req.headers(), peer_of(req.extensions())) {
         Some(_) if mutating && !csrf_ok(req.headers()) => Err(csrf_refused()),
         Some((_, cookie)) => Ok(renewed(next.run(req).await, cookie)),
-        None => Err(ApiError(StatusCode::UNAUTHORIZED, "login required".into())),
+        None => Err(ApiError::unauthorized("login required")),
     }
 }
 
@@ -494,7 +494,7 @@ pub async fn login(
         // The name is the client's, up to the whole body: the log gets its start.
         let shown = &user[..user.floor_char_boundary(64)];
         tracing::warn!("failed login for {shown:?}{} from {ip}", if shown.len() < user.len() { "…" } else { "" });
-        return Err(ApiError(StatusCode::UNAUTHORIZED, "wrong username or password".into()));
+        return Err(ApiError::unauthorized("wrong username or password"));
     }
     auth.refund(ip);
     let token = auth.create(&user);

@@ -362,7 +362,7 @@ pub fn command(jobs: &mut Jobs, mac: &Mac, inform: &Value, now: Ts) -> Option<Re
     if j.from.is_none() {
         j.from = inform["version"].as_str().map(str::to_string);
     }
-    let mut cmd = json!({ "_type": "upgrade", "version": j.target, "url": j.url, "server_time_in_utc": (now * 1000).to_string() });
+    let mut cmd = json!({ "_type": "upgrade", "version": j.target, "url": j.url, "server_time_in_utc": crate::active::server_time(now) });
     if let Some(m) = &j.md5 {
         cmd["md5sum"] = json!(m);
     }
@@ -598,7 +598,7 @@ pub async fn upgrade_url(State(s): State<AppState>, Json(b): Json<UrlBody>) -> R
     let mac = crate::api::parse_mac(&b.mac)?;
     let a = aps(&s.live.read().unwrap()).into_iter().find(|a| a.mac == mac).ok_or_else(|| ApiError::not_found("unknown AP"))?;
     if !a.online {
-        return Err(ApiError(StatusCode::CONFLICT, "the AP is offline".into()));
+        return Err(ApiError::ap_offline());
     }
     let job = Job::new(a, "custom".into(), b.url, None, None, true);
     let n = change_queue(&s, Op::Enqueue(vec![job])).await?;

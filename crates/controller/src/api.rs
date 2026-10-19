@@ -181,7 +181,7 @@ fn compressible() -> impl tower_http::compression::Predicate {
 
 /// 409 unless apctl is the active controller. `what` says what needs it ("upgrades need").
 pub fn require_active(s: &AppState, what: &str) -> Result<(), ApiError> {
-    if s.active { Ok(()) } else { Err(ApiError(StatusCode::CONFLICT, format!("{what} active mode: in shadow mode apctl never talks to the APs"))) }
+    if s.active { Ok(()) } else { Err(ApiError::conflict(format!("{what} active mode: in shadow mode apctl never talks to the APs"))) }
 }
 
 /// The imported settings, as they are now.
@@ -206,9 +206,29 @@ impl ApiError {
         ApiError(StatusCode::NOT_FOUND, msg.into())
     }
 
+    /// The request clashes with the current state (409): shadow mode, an AP that is away, a run already going.
+    pub fn conflict(msg: impl Into<String>) -> Self {
+        ApiError(StatusCode::CONFLICT, msg.into())
+    }
+
+    /// Not allowed, whoever asks (403).
+    pub fn forbidden(msg: impl Into<String>) -> Self {
+        ApiError(StatusCode::FORBIDDEN, msg.into())
+    }
+
+    /// Needs a (valid) login (401).
+    pub fn unauthorized(msg: impl Into<String>) -> Self {
+        ApiError(StatusCode::UNAUTHORIZED, msg.into())
+    }
+
+    /// The AP a command is for is offline: queued, it would run whenever the AP is back.
+    pub fn ap_offline() -> Self {
+        Self::conflict("the AP is offline")
+    }
+
     /// Nothing to work on: no settings were imported yet.
     pub fn no_state() -> Self {
-        ApiError(StatusCode::CONFLICT, "no settings imported yet".into())
+        Self::conflict("no settings imported yet")
     }
 
     /// The engine thread is gone (it ended, or panicked).
@@ -417,7 +437,7 @@ fn stored_view(mac: Mac, k: &KnownDevice) -> DeviceView {
         snapshot: crate::model::Snapshot {
             ap, uplink: None, radios: vec![], vaps: vec![], clients: vec![], neighbors: vec![], spectrum: vec![], has_vap_table: false,
         },
-        online: false, first_seen: k.first_seen, last_seen: k.last_seen, peer: String::new(), interval: 0, last_full_inform: 0,
+        online: false, first_seen: k.first_seen, last_seen: k.last_seen, peer: None, interval: 0, last_full_inform: 0,
         last_config_push: None,
     }
 }
@@ -530,7 +550,7 @@ fn page_view(d: &DeviceView) -> DeviceView {
         ap: s.ap.clone(), uplink: s.uplink.clone(), radios: s.radios.clone(), vaps: s.vaps.clone(), clients: vec![], neighbors: vec![], spectrum: vec![],
         has_vap_table: s.has_vap_table,
     };
-    DeviceView { snapshot, peer: d.peer.clone(), ..*d }
+    DeviceView { snapshot, ..*d }
 }
 
 async fn device(State(s): State<AppState>, MacPath(mac): MacPath) -> Result<Response, ApiError> {
@@ -761,7 +781,7 @@ async fn dryrun(State(s): State<AppState>) -> Result<Json<DryRunStatus>, ApiErro
                 stored.insert(mac, Arc::new(p));
             }
         }
-        // Without the diffs' text, which the history never shows (only the counts); text that isn't JSON becomes null.
+        // Without the diffs' text, which older rows have and the history never shows (only the counts); text that isn't JSON becomes null.
         let mut stmt = c.prepare_cached(
             "SELECT id, ts, mac, cfgversion, matches, CASE WHEN json_valid(comparison) THEN json_remove(comparison, '$.mgmt_cfg.diff', '$.system_cfg.diff') END
              FROM dryrun_results ORDER BY ts DESC LIMIT 100",
@@ -1203,7 +1223,7 @@ async fn ws(
     upgrade: WebSocketUpgrade,
 ) -> Response {
     if !s.auth.same_origin(&headers, peer.map(|p| p.0.0.ip()), uri.authority().map(|a| a.as_str())) {
-        return ApiError(StatusCode::FORBIDDEN, "the live socket is only for pages of this server".into()).into_response();
+        return ApiError::forbidden("the live socket is only for pages of this server").into_response();
     }
     let rx = s.tx.subscribe();
     let (auth, session) = (s.auth.clone(), s.auth.session_of(&headers));
@@ -1320,7 +1340,7 @@ mod tests {
     /// An AP's report, decoded, as the engine gets it at time 50.
     fn report(payload: Value) -> crate::engine::Input {
         let header = inform::Header { packet_version: 0, mac: Mac([0; 6]), flags: inform::Flags::NONE, iv: [0; 16], payload_version: 1, payload_len: 0 };
-        crate::engine::Input::Inform { ts: 50, peer: "x".into(), decoded: wire::decode::Decoded { header, key: wire::decode::KeyUsed::Device, payload } }
+        crate::engine::Input::Inform { ts: 50, peer: [10, 0, 0, 1].into(), decoded: wire::decode::Decoded { header, key: wire::decode::KeyUsed::Device, payload } }
     }
 
     async fn get_json(app: &Router, path: &str) -> Value {

@@ -1283,7 +1283,7 @@ mod tests {
                         l.put_client(ClientView { sample: c.clone(), connected: true, first_seen: 0, last_seen: base });
                     }
                     let d = DeviceView {
-                        snapshot, online: true, first_seen: 0, last_seen: base, peer: "x".into(), interval: 10,
+                        snapshot, online: true, first_seen: 0, last_seen: base, peer: None, interval: 10,
                         last_full_inform: base, last_config_push: None,
                     };
                     l.devices.insert(mac, d);

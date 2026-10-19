@@ -14,7 +14,7 @@ use crate::keys::KeyStore;
 pub enum InformEvent {
     /// An AP's inform. `peer` is its address (from X-Forwarded-For behind a proxy, if
     /// that holds an address).
-    Inform { ts: Micros, peer: String, mac: Option<Mac>, decoded: Result<Decoded> },
+    Inform { ts: Micros, peer: IpAddr, mac: Option<Mac>, decoded: Result<Decoded> },
     /// The controller's reply. `mac` is its request's, or when that was not captured,
     /// the one the reply is sealed under. `decoded` is `None` for an empty body.
     Reply { ts: Micros, mac: Option<Mac>, status: u16, decoded: Option<Result<Decoded>> },
@@ -97,7 +97,7 @@ impl Pairer {
                     self.push(conn, ts, Pending::Other);
                     return None;
                 }
-                let peer = forwarded_for.as_deref().and_then(forwarded_ip).unwrap_or(conn.client.ip()).to_string();
+                let peer = forwarded_for.as_deref().and_then(forwarded_ip).unwrap_or(conn.client.ip());
                 let (pkt, mac) = split(&body);
                 let decoded = pkt.map_err(Into::into).and_then(|p| decode_packet(p, keys, None));
                 self.push(conn, ts, Pending::Inform(mac));
@@ -252,7 +252,7 @@ mod tests {
         let keys = KeyStore::default();
         let mut p = Pairer::default();
         let mut peer = |xff: Option<&str>| match p.handle(&keys, inform(conn(1), "02:00:00:00:00:01", xff)) {
-            Some(InformEvent::Inform { peer, .. }) => peer,
+            Some(InformEvent::Inform { peer, .. }) => peer.to_string(),
             other => panic!("{other:?}"),
         };
         assert_eq!(peer(Some(" 203.0.113.9 , 10.0.0.1")), "203.0.113.9");

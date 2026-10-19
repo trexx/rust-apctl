@@ -84,6 +84,18 @@ impl Comparison {
     pub fn matches(&self) -> bool {
         self.mgmt_cfg.equivalent && self.system_cfg.equivalent
     }
+
+    /// As a push's dry run stores it: JSON without the diffs' text, which nothing
+    /// reads back (the history shows the counts).
+    pub fn stored(&self) -> String {
+        let mut v = serde_json::to_value(self).expect("a comparison serialises");
+        for field in ["mgmt_cfg", "system_cfg"] {
+            if let Some(f) = v[field].as_object_mut() {
+                f.remove("diff");
+            }
+        }
+        v.to_string()
+    }
 }
 
 /// Lists the other controller writes in an arbitrary order that can change
@@ -215,6 +227,16 @@ pub fn validate_state(state: &Value) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_stored_comparison_has_the_counts_without_the_diffs() {
+        let c = compare(&("a=1\nb=3".into(), "x=1".into()), "a=1\nb=2", "x=1", false);
+        assert!(!c.mgmt_cfg.diff.is_empty());
+        let stored: serde_json::Value = serde_json::from_str(&c.stored()).unwrap();
+        assert_eq!(stored["mgmt_cfg"]["changed"], 1);
+        assert_eq!(stored["system_cfg"]["identical"], true);
+        assert!(stored["mgmt_cfg"].get("diff").is_none() && stored["system_cfg"].get("diff").is_none(), "{stored}");
+    }
 
     #[test]
     fn compares_order_content_and_masks_secrets() {
