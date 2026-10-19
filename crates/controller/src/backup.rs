@@ -1185,35 +1185,50 @@ pub struct RestoreBody {
 /// POST /api/backups/upload: checks an uploaded backup and stages it (not applied yet).
 /// The body is streamed to disk, so large backups need no memory.
 pub async fn upload(State(s): State<AppState>, body: Body) -> Result<Json<Value>, ApiError> {
-    use futures_util::StreamExt;
-    use tokio::io::AsyncWriteExt;
     let b = s.backups.clone();
     tokio::fs::create_dir_all(b.staging()).await?;
     let name = format!("upload-{}-{}.apb", clock::now_ts(), crate::random_hex(4));
-    let tmp = TempFile(b.staging().join(name));
-    // Written a megabyte per trip to the blocking pool, not one trip per body chunk.
-    let mut file = tokio::io::BufWriter::with_capacity(1 << 20, tokio::fs::File::create_new(&tmp.0).await?);
-    let mut stream = body.into_data_stream();
-    // DefaultBodyLimit does not apply to a streamed body: count here.
-    let mut size = 0u64;
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|e| ApiError::bad(format!("upload interrupted: {e}")))?;
-        size += chunk.len() as u64;
-        if size > UPLOAD_LIMIT {
-            return Err(ApiError(StatusCode::PAYLOAD_TOO_LARGE, "the backup is too large (1 GiB at most)".into()));
-        }
-        file.write_all(&chunk).await?;
-    }
-    file.flush().await?;
-    drop(file);
+    let tmp = receive(body, TempFile(Some(b.staging().join(name)))).await?;
     let res = tokio::task::spawn_blocking(move || {
-        let r = stage(&b, &tmp.0);
+        let r = stage(&b, tmp.path());
         drop(tmp);
         r
     })
     .await?
     .map_err(refused)?;
     Ok(Json(json!({ "staged": res.0, "manifest": res.1 })))
+}
+
+/// Writes an upload to `tmp`, at most [`UPLOAD_LIMIT`]. If that fails, the
+/// file is deleted (without blocking) and the error given back.
+async fn receive(body: Body, tmp: TempFile) -> Result<TempFile, ApiError> {
+    use futures_util::StreamExt;
+    use tokio::io::AsyncWriteExt;
+    let received = async {
+        // Written a megabyte per trip to the blocking pool, not one trip per body chunk.
+        let mut file = tokio::io::BufWriter::with_capacity(1 << 20, tokio::fs::File::create_new(tmp.path()).await?);
+        let mut stream = body.into_data_stream();
+        // DefaultBodyLimit does not apply to a streamed body: count here.
+        let mut size = 0u64;
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(|e| ApiError::bad(format!("upload interrupted: {e}")))?;
+            size += chunk.len() as u64;
+            if size > UPLOAD_LIMIT {
+                return Err(ApiError(StatusCode::PAYLOAD_TOO_LARGE, "the backup is too large (1 GiB at most)".into()));
+            }
+            file.write_all(&chunk).await?;
+        }
+        file.flush().await?;
+        Ok(())
+    }
+    .await;
+    match received {
+        Ok(()) => Ok(tmp),
+        Err(e) => {
+            tmp.remove().await;
+            Err(e)
+        }
+    }
 }
 
 /// Why a backup could not be staged or restored. Most reasons are the
@@ -1229,12 +1244,28 @@ fn refused(e: anyhow::Error) -> ApiError {
     }
 }
 
-/// A file deleted when dropped, so an upload cut off half way leaves nothing behind.
-struct TempFile(PathBuf);
+/// A file deleted when dropped, so an upload cut off half way leaves nothing
+/// behind. Where it can, the async code deletes it with [`TempFile::remove`],
+/// which does not block: the drop is for a request cancelled while it waits.
+struct TempFile(Option<PathBuf>);
+
+impl TempFile {
+    fn path(&self) -> &Path {
+        self.0.as_deref().expect("not removed yet")
+    }
+
+    async fn remove(mut self) {
+        if let Some(p) = self.0.take() {
+            let _ = tokio::fs::remove_file(p).await;
+        }
+    }
+}
 
 impl Drop for TempFile {
     fn drop(&mut self) {
-        let _ = fs::remove_file(&self.0);
+        if let Some(p) = &self.0 {
+            let _ = fs::remove_file(p);
+        }
     }
 }
 
@@ -1866,6 +1897,21 @@ mod tests {
         fs::write(b.staging().join("pending"), "r1").unwrap();
         apply_pending(&b);
         assert!(fs::read_to_string(b.staging().join("pending.failed")).unwrap().contains("unexpected file"));
+    }
+
+    #[tokio::test]
+    async fn an_upload_cut_off_leaves_nothing_behind() {
+        let d = dir("upload-cut");
+        let p = d.join("upload-1-x.apb");
+        let chunks: Vec<Result<&'static [u8], io::Error>> = vec![Ok(b"APCTLBK1"), Err(io::Error::other("connection reset"))];
+        let err = receive(Body::from_stream(futures_util::stream::iter(chunks)), TempFile(Some(p.clone()))).await.err().expect("refused");
+        assert!(err.1.contains("upload interrupted"), "{}", err.1);
+        assert!(!p.exists());
+        // A whole one is kept for staging, until it is dropped.
+        let tmp = receive(Body::from("APCTLBK1"), TempFile(Some(p.clone()))).await.ok().expect("kept");
+        assert_eq!(fs::read(&p).unwrap(), b"APCTLBK1");
+        drop(tmp);
+        assert!(!p.exists());
     }
 
     #[test]
