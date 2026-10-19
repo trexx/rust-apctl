@@ -14,6 +14,7 @@ import type {
 import {
   band,
   clock,
+  dbm,
   duration,
   loadTone,
   sameDay,
@@ -397,6 +398,16 @@ interface EventSpec<K extends EventKind> {
 const parts = (...xs: (string | null | undefined | false)[]) =>
   xs.filter(Boolean).join(" · ");
 
+/** A radio's channel, width and power as a radio_changed event records them, "ch 36/80 MHz/20 dBm", leaving out what it lacks. */
+const radioLevels = (l: EventPayloads["radio_changed"]["from"]) =>
+  [
+    `ch ${l?.channel ?? "?"}`,
+    l?.bw && `${l.bw} MHz`,
+    l?.tx_power != null && dbm(l.tx_power),
+  ]
+    .filter(Boolean)
+    .join("/");
+
 /** Every event kind: its label, colour and detail line. */
 const EVENTS: { [K in EventKind]: EventSpec<K> } = {
   ap_seen: {
@@ -581,7 +592,7 @@ const EVENTS: { [K in EventKind]: EventSpec<K> } = {
     label: "Radio settings changed",
     tone: "neutral",
     describe: (d) =>
-      `${band(d.radio)}: ch ${d.from?.channel}/${d.from?.bw} MHz/${d.from?.tx_power} dBm → ch ${d.to?.channel}/${d.to?.bw} MHz/${d.to?.tx_power} dBm`,
+      `${band(d.radio)}: ${radioLevels(d.from)} → ${radioLevels(d.to)}`,
   },
   config_pushed: {
     label: "Config pushed",
