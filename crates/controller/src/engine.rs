@@ -1336,11 +1336,7 @@ impl Engine {
                     Some("FWCheckOK") => JobState::Writing,
                     _ => JobState::Preparing,
                 };
-                if let Some(j) = live.firmware.current_for(&mac) {
-                    j.state = step;
-                    // Re-arm the deadline as the official controller does on each step.
-                    j.expires = Some(ts + 450);
-                }
+                live.firmware.progress(&mac, step, ts);
                 Some(Event::device(ts, EventKind::ApUpgradeProgress, mac, json!({ "step": step })))
             }
             (Some("UpgradeError"), _) => {
