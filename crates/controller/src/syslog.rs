@@ -156,22 +156,33 @@ pub fn decrypt_with(datagram: &[u8], mac: Mac, cipher: &Aes256Gcm) -> Result<Str
 /// than for each datagram.
 #[derive(Default)]
 pub struct Ciphers {
-    /// The settings they were made from, once made. Compared by address: the
-    /// Weak keeps that address from being reused without keeping the settings.
-    from: Option<Option<Weak<Value>>>,
+    from: MadeFrom,
     keys: Vec<(Mac, Aes256Gcm)>,
+}
+
+/// What [`Ciphers`] were made from.
+#[derive(Default)]
+enum MadeFrom {
+    /// Nothing yet.
+    #[default]
+    Unmade,
+    /// The key file alone: there were no settings.
+    NoSettings,
+    /// These settings, compared by address: the Weak keeps that address from
+    /// being reused without keeping the settings.
+    Settings(Weak<Value>),
 }
 
 impl Ciphers {
     /// Makes the ciphers again if the settings changed since the last call.
     pub fn refresh(&mut self, state: Option<&Arc<Value>>, keys: &KeyStore) {
         let same = match (&self.from, state) {
-            (Some(None), None) => true,
-            (Some(Some(w)), Some(s)) => std::ptr::eq(w.as_ptr(), Arc::as_ptr(s)),
+            (MadeFrom::NoSettings, None) => true,
+            (MadeFrom::Settings(w), Some(s)) => std::ptr::eq(w.as_ptr(), Arc::as_ptr(s)),
             _ => false,
         };
         if !same {
-            self.from = Some(state.map(Arc::downgrade));
+            self.from = state.map_or(MadeFrom::NoSettings, |s| MadeFrom::Settings(Arc::downgrade(s)));
             self.keys = crate::adopt::syslog_keys(state.map(|s| &**s), keys).into_iter().map(|(m, k)| (m, Aes256Gcm::new(&k.into()))).collect();
         }
     }
@@ -227,7 +238,7 @@ pub fn parse(ts: Ts, src_ip: &str, device_mac: Option<Mac>, raw: &str) -> LogLin
     let mut program = None;
     if let Some((head, msg)) = rest.split_once(": ")
         && !head.contains(' ') && !head.is_empty() && head.len() < 64 {
-            program = Some(head.split('[').next().unwrap_or(head).to_string());
+            program = Some(head.split_once('[').map_or(head, |(p, _)| p).to_string());
             rest = msg;
         }
     LogLine { ts, device_mac, src_ip: src_ip.to_string(), facility, severity, program, msg: redact(rest.trim()).into_owned() }
