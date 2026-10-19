@@ -36,11 +36,13 @@ pub const MAGIC: [u8; 4] = wire::synth::SYSLOG_MAGIC;
 /// on a line with any non-ASCII text.
 static KEY: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| regex::Regex::new(r#"(?i)(?-u:\b)([a-z0-9_.]+)["']?\s*[:=]\s*"#).unwrap());
 
-/// Text that may hold a secret's key: any with one of the parts every secret's
-/// key holds, so most lines are stored without a search for keys. Built from
-/// the list `is_secret` reads, so the two cannot drift apart. A key starts at
-/// a word boundary (see [`KEY`]) and a segment after a dot, so the `x_` that
-/// starts a segment follows one: `tx_bytes` is not let through.
+/// Text that may hold a secret's key: one of the parts every secret's key
+/// holds, then the rest of a key and its separator as [`KEY`] reads them, so
+/// most lines are stored without a search for keys. Built from the list
+/// `is_secret` reads, so the two cannot drift apart. A key starts at a word
+/// boundary (see [`KEY`]) and a segment after a dot, so the `x_` that starts a
+/// segment follows one: `tx_bytes` is not let through, nor is the `key` of
+/// "pairwise key handshake" or the `PSK` of "key_mgmt WPA-PSK".
 static HINT: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
     let parts: Vec<String> = SECRET_PARTS
         .iter()
@@ -49,7 +51,9 @@ static HINT: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
             At::Last | At::LastEnd | At::Anywhere => regex::escape(p),
         })
         .collect();
-    regex::Regex::new(&format!("(?i-u){}", parts.join("|"))).unwrap()
+    // The parts in ASCII (the literals the search looks for first); what
+    // follows them in KEY's own terms, Unicode case and spaces included.
+    regex::Regex::new(&format!(r#"(?i)(?-u:{})[a-z0-9_.]*["']?\s*[:=]"#, parts.join("|"))).unwrap()
 });
 
 /// APs log some secrets in clear text (e.g. `authkey: <hex>` when they save a
@@ -61,6 +65,11 @@ pub fn redact(msg: &str) -> Cow<'_, str> {
     if !HINT.is_match(msg) {
         return Cow::Borrowed(msg);
     }
+    mask(msg)
+}
+
+/// [`redact`] without the quick test first.
+fn mask(msg: &str) -> Cow<'_, str> {
     let mut out = String::new();
     // How much of `msg` is copied to `out` or masked.
     let mut done = 0;
@@ -319,6 +328,57 @@ pub(crate) mod tests {
             assert!(matches!(redact(line), Cow::Borrowed(l) if l == line), "{line}");
         }
         assert!(!HINT.is_match("max_txpower=20 tx_bytes=1"));
+        // Nor do the lines that name a part without a key's separator after it.
+        for line in [
+            "wifi1ap0: STA 02:00:00:00:00:01 WPA: pairwise key handshake completed (RSN)",
+            "wifi1ap0: STA 02:00:00:00:00:01 WPA: group key handshake completed (RSN)",
+            "wifi1ap0: STA 02:00:00:00:00:01 WPA: sending 1/4 msg of 4-Way Handshake",
+            "wifi1ap0: AKM key_mgmt WPA-PSK SAE, secret not shown",
+            "radius secret rejected; community string ok",
+        ] {
+            assert!(!HINT.is_match(line), "{line}");
+        }
+    }
+
+    #[test]
+    fn the_quick_test_passes_over_no_line_the_search_would_mask() {
+        let check = |line: &str| {
+            if matches!(mask(line), Cow::Owned(_)) {
+                assert!(HINT.is_match(line), "{line:?} is masked, but the quick test passes over it");
+            }
+            assert_eq!(redact(line), mask(line), "{line:?}");
+        };
+        for line in [
+            "x_passphrase=hunter2, psk:abc; channel=36",
+            r#"{"x_passphrase": "a b", "name": "Home"}"#,
+            "'wpa_psk': 'a b' ok",
+            "aaa.1.wpa.psk=x snmp.community=public unifi.key=k iapp_key: 0f sae_password = y",
+            "wifi1ap0: psk=abc",
+            "cfg: authkey: 0123",
+            "wifi1ap0: STA 02:00:00:00:00:01 WPA: pairwise key handshake completed (RSN)",
+            "wifi1ap0: STA 02:00:00:00:00:01 WPA-PSK: x",
+            "psk\u{a0}= x",
+            "psk\u{212a}=1",
+            "Café « psk=hunter2 » ключ=1 x_passphrase: пароль ✓",
+            "naïve_psk=ü",
+        ] {
+            check(line);
+        }
+        // Parts of keys, other text, quotes and separators, every way up to four at a
+        // time: Unicode case (the Kelvin sign is a `k`, the long s an `s`) and spaces too.
+        let pieces = ["key", "Psk", "x_", "sae_", ".", "_", "a", "\"", "'", " ", ":", "=", "\u{212a}", "\u{17f}", "é", "-", "\u{a0}"];
+        let mut line = String::new();
+        for n in 1..=4u32 {
+            for i in 0..pieces.len().pow(n) {
+                line.clear();
+                let mut i = i;
+                for _ in 0..n {
+                    line.push_str(pieces[i % pieces.len()]);
+                    i /= pieces.len();
+                }
+                check(&line);
+            }
+        }
     }
 
     #[test]
