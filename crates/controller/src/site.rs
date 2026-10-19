@@ -158,17 +158,14 @@ fn site_syslog(doc: &mut Value, r: &Value) -> Result<(), String> {
         Some(_) => return Err("the syslog mode must be off, controller or server".into()),
     }
     doc["this_controller_encrypted_only"] = json!(false);
-    if let Some(ip) = str_field(r, "ip")?.map(str::trim) {
-        if !ip.is_empty() && !is_host(ip) {
-            return Err(format!("{ip} is not a host name or address"));
+    // The syslog server and the netconsole host.
+    for key in ["ip", "netconsole_host"] {
+        if let Some(h) = str_field(r, key)?.map(str::trim) {
+            if !h.is_empty() && !is_host(h) {
+                return Err(format!("{h} is not a host name or address"));
+            }
+            doc[key] = json!(h);
         }
-        doc["ip"] = json!(ip);
-    }
-    if let Some(h) = str_field(r, "netconsole_host")?.map(str::trim) {
-        if !h.is_empty() && !is_host(h) {
-            return Err(format!("{h} is not a host name or address"));
-        }
-        doc["netconsole_host"] = json!(h);
     }
     let doc = &*doc;
     let on = |k: &str| doc[k].as_bool() == Some(true);
