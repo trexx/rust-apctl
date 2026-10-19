@@ -127,6 +127,11 @@ fn new_cfgversion() -> String {
     crate::random_hex(8)
 }
 
+/// A reply's `server_time_in_utc`: milliseconds, as a string.
+fn server_time(ts: Ts) -> String {
+    (ts * 1000).to_string()
+}
+
 /// The longest inform interval apctl asks for (on sites of 18 APs or more).
 /// The insights read this far back for the sample before a window.
 pub const MAX_INFORM_INTERVAL: Ts = 90;
@@ -249,7 +254,7 @@ impl Active {
     /// (it still informs with the factory key). Its full config follows once
     /// it informs with that key.
     fn adoption_reply(&self, ts: Ts, mac: Mac, payload: &Value) -> Value {
-        let server_time = (ts * 1000).to_string();
+        let server_time = server_time(ts);
         let (state, n_devices) = {
             let live = self.live.read().unwrap();
             (live.state.clone(), live.devices.len())
@@ -292,7 +297,7 @@ impl Active {
     /// renders, and waits for room in the engine's queue rather than dropping
     /// what it tells the engine.
     fn reply(&self, ts: Ts, mac: Mac, payload: &Value) -> Value {
-        let server_time = (ts * 1000).to_string();
+        let server_time = server_time(ts);
         let noop = |interval: i64| {
             json!({
                 "_type": "noop", "interval": interval, "fingerprint": [], "live_update": false,
@@ -516,10 +521,6 @@ impl Active {
     }
 }
 
-fn status(code: StatusCode) -> Response {
-    code.into_response()
-}
-
 /// A managed AP that informed with its own key less than this long ago is not
 /// taken for reset when a factory-key inform comes under its MAC (the official
 /// controller has no such wait).
@@ -554,12 +555,12 @@ pub async fn inform(
     body: Bytes,
 ) -> Response {
     let ts = clock::now_ts();
-    let Ok(header) = Packet::parse(&body).map(|p| p.header) else { return status(StatusCode::BAD_REQUEST) };
+    let Ok(header) = Packet::parse(&body).map(|p| p.header) else { return StatusCode::BAD_REQUEST.into_response() };
     let mac = header.mac;
     // An unencrypted packet "opens" with any key: it proves nothing.
     if !header.flags.contains(Flags::ENCRYPTED) {
         tracing::warn!("{mac}: refusing an unencrypted inform from {}", peer.ip());
-        return status(StatusCode::BAD_REQUEST);
+        return StatusCode::BAD_REQUEST.into_response();
     }
 
     // Which keys may this AP use? Its own if apctl manages it; the factory key always.
@@ -567,11 +568,11 @@ pub async fn inform(
     let device_key = crate::adopt::device_key(state.as_deref(), &active.keys, &mac);
     let Some((used, key, payload, _permit)) = active.open(body, device_key).await else {
         tracing::warn!("{mac}: inform from {} could not be decrypted", peer.ip());
-        return status(StatusCode::BAD_REQUEST);
+        return StatusCode::BAD_REQUEST.into_response();
     };
     if payload["mac"].as_str().and_then(|m| m.parse::<Mac>().ok()) != Some(mac) {
         tracing::warn!("{mac}: header and payload MACs differ");
-        return status(StatusCode::BAD_REQUEST);
+        return StatusCode::BAD_REQUEST.into_response();
     }
     let caller = Caller { mac, gcm: header.flags.contains(Flags::GCM), key, peer: peer.ip(), source: active.proxies.client_ip(&headers, peer.ip()) };
     // Only an AP apctl manages is tried with a key of its own.
@@ -592,7 +593,7 @@ async fn factory_key_inform(active: &Arc<Active>, ts: Ts, caller: &Caller, paylo
         // Adopt pressed: hand the AP its own key (in mgmt_cfg), with the factory key.
         let a = active.clone();
         let Ok(reply) = tokio::task::spawn_blocking(move || a.adoption_reply(ts, mac, &payload)).await else {
-            return status(StatusCode::INTERNAL_SERVER_ERROR);
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
         };
         tracing::info!("{mac}: adoption: sending its key");
         return caller.seal(&reply);
@@ -608,7 +609,7 @@ async fn factory_key_inform(active: &Arc<Active>, ts: Ts, caller: &Caller, paylo
         // while it reboots, so this is most likely someone else. Listing
         // it would let an Adopt hand them the AP's key.
         tracing::warn!("{mac}: factory-key inform from {} while the AP still informs with its own key: ignored", caller.peer);
-        return status(StatusCode::NOT_FOUND);
+        return StatusCode::NOT_FOUND.into_response();
     }
     let inform = crate::adopt::pending_inform(&payload);
     drop(payload);
@@ -618,7 +619,7 @@ async fn factory_key_inform(active: &Arc<Active>, ts: Ts, caller: &Caller, paylo
         tracing::info!("{mac}: {} informing from {}", if known { "reset AP (adoption required)" } else { "AP waiting for adoption" }, caller.peer);
         let _ = active.engine.send(Input::Note(Event::device(ts, EventKind::ApPending, mac, data))).await;
     }
-    status(StatusCode::NOT_FOUND)
+    StatusCode::NOT_FOUND.into_response()
 }
 
 /// An inform under an AP's own key: the reply to it (a config push, a
@@ -654,7 +655,7 @@ async fn managed_inform(active: &Arc<Active>, ts: Ts, caller: &Caller, header: i
         let engine = active.engine.clone();
         tokio::spawn(async move { crate::adopt::finish_forget(&engine, mac, true).await });
         active.devices.lock().unwrap().remove(&mac);
-        let reply = json!({ "_type": "setdefault", "server_time_in_utc": (ts * 1000).to_string() });
+        let reply = json!({ "_type": "setdefault", "server_time_in_utc": server_time(ts) });
         return caller.seal(&reply);
     }
     {
@@ -662,7 +663,7 @@ async fn managed_inform(active: &Arc<Active>, ts: Ts, caller: &Caller, header: i
         let d = devices.entry(mac).or_default();
         if d.gcm && !gcm {
             tracing::warn!("{mac}: refusing a CBC inform from a device that uses AES-GCM");
-            return status(StatusCode::BAD_REQUEST);
+            return StatusCode::BAD_REQUEST.into_response();
         }
         if gcm && !d.gcm {
             d.gcm = true;
@@ -675,11 +676,11 @@ async fn managed_inform(active: &Arc<Active>, ts: Ts, caller: &Caller, header: i
     // Rendering the config takes a while: off the async workers.
     let a = active.clone();
     let Ok((reply, payload)) = tokio::task::spawn_blocking(move || (a.reply(ts, mac, &payload), payload)).await else {
-        return status(StatusCode::INTERNAL_SERVER_ERROR);
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     };
     let decoded = Decoded { header, key: used, payload };
     if active.engine.send(Input::Inform { ts, peer: caller.source.to_string(), decoded }).await.is_err() {
-        return status(StatusCode::SERVICE_UNAVAILABLE);
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
     }
     let response = caller.seal(&reply);
     // The engine follows the interval it asked for (or the AP would be called
