@@ -726,14 +726,15 @@ pub async fn list(State(s): State<AppState>, Query(q): Query<ListQuery>) -> Resu
     let client = q.client.map(|c| c.to_ascii_lowercase());
     let limit = q.limit.unwrap_or(500).min(5000);
     let with_roams = q.roams.unwrap_or(true);
-    let (list, r, stored) = read(&s.store, Db::Config, move |c| {
+    let live = s.live.clone();
+    let (list, r, aps, clients) = read(&s.store, Db::Config, move |c| {
         let (list, r) = newest(c, from, to, client.as_deref(), limit, q.failed, with_roams)?;
-        let stored = Names::load_for(c, &macs_of(&list, &r).1)?;
-        Ok((list, r, stored))
+        let (aps, clients) = macs_of(&list, &r);
+        let stored = Names::load_for(c, &clients)?;
+        let (aps, clients) = names(&stored, &live.read().unwrap(), aps, clients);
+        Ok((list, r, aps, clients))
     })
     .await?;
-    let (aps, clients) = macs_of(&list, &r);
-    let (aps, clients) = names(&stored, &s.live.read().unwrap(), aps, clients);
     Ok(Json(json!({ "attempts": list, "roams": r, "ap_names": aps, "client_names": clients })))
 }
 
