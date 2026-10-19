@@ -187,8 +187,25 @@ pub fn table(name: &str) -> Option<&'static Table> {
     TABLES.iter().copied().find(|t| t.name == name || t.name.trim_end_matches("_stats") == name)
 }
 
-/// Resolution tiers: (table suffix, bucket seconds, retention seconds).
-pub const TIERS: [(&str, i64, i64); 3] = [("", 0, 48 * 3600), ("_5m", 300, 30 * 86400), ("_1h", 3600, 365 * 86400)];
+/// A resolution tier of the metric tables.
+#[derive(Clone, Copy)]
+pub struct Tier {
+    /// What the tier's tables add to the table's name.
+    pub suffix: &'static str,
+    /// What `Series` calls it.
+    pub name: &'static str,
+    /// Bucket seconds (0 for raw samples).
+    pub step: i64,
+    /// Retention seconds.
+    pub keep: i64,
+}
+
+/// The tiers, finest first; a tier is known by its index here.
+pub const TIERS: [Tier; 3] = [
+    Tier { suffix: "", name: "raw", step: 0, keep: 48 * 3600 },
+    Tier { suffix: "_5m", name: "5m", step: 300, keep: 30 * 86400 },
+    Tier { suffix: "_1h", name: "1h", step: 3600, keep: 365 * 86400 },
+];
 
 const CONFIG_SCHEMA: &str = "
 -- name, cfgversion and online are no longer written; old databases have them filled.
@@ -318,7 +335,7 @@ fn migrate(dir: &Path) -> Result<()> {
     let metrics = open_rw(&dir.join(Db::Metrics.file()))?;
     metrics.execute_batch("CREATE TABLE IF NOT EXISTS rollup_state (name TEXT PRIMARY KEY, upto INTEGER NOT NULL)")?;
     for t in TABLES {
-        for (suffix, ..) in TIERS {
+        for Tier { suffix, .. } in TIERS {
             let name = format!("{}{suffix}", t.name);
             metrics.execute_batch(&t.create_sql(suffix))?;
             // Columns added in later versions (CREATE IF NOT EXISTS keeps old tables as they are).
@@ -336,7 +353,7 @@ fn migrate(dir: &Path) -> Result<()> {
     }
     // One AP's clients over days (its page, from the roll-ups): read through this, not
     // every client's rows in the window. The raw tier, written at every report, goes without.
-    for (suffix, ..) in &TIERS[1..] {
+    for Tier { suffix, .. } in &TIERS[1..] {
         metrics.execute_batch(&format!("CREATE INDEX IF NOT EXISTS client_stats{suffix}_ap ON client_stats{suffix} (ap_mac, ts)"))?;
     }
     Ok(())
@@ -593,11 +610,11 @@ fn maintenance(conns: &mut Conns, now: Ts, hourly: bool) {
     let [config, metrics, logs] = conns;
     for t in TABLES {
         for w in TIERS.windows(2) {
-            let ((src_suffix, _, src_keep), (dst_suffix, step_secs, _)) = (w[0], w[1]);
-            let (src, dst) = (format!("{}{src_suffix}", t.name), format!("{}{dst_suffix}", t.name));
-            step(&format!("rolling up {dst}"), rollup(metrics, t, &src, &dst, step_secs, src_keep, now));
+            let (src, dst) = (&w[0], &w[1]);
+            let (src_table, dst_table) = (format!("{}{}", t.name, src.suffix), format!("{}{}", t.name, dst.suffix));
+            step(&format!("rolling up {dst_table}"), rollup(metrics, t, &src_table, &dst_table, dst.step, src.keep, now));
         }
-        for (suffix, _, keep) in TIERS {
+        for Tier { suffix, keep, .. } in TIERS {
             let table = format!("{}{suffix}", t.name);
             step(&format!("retention of {table}"), delete_before(metrics, &table, Rows::Metric, now - keep));
         }
@@ -690,9 +707,9 @@ pub struct Series {
 /// Picks the finest tier that covers the range and keeps the point count sensible.
 pub fn tier_for(from: Ts, to: Ts, now: Ts) -> usize {
     let span = to.saturating_sub(from);
-    if span <= 6 * 3600 && from >= now - TIERS[0].2 {
+    if span <= 6 * 3600 && from >= now - TIERS[0].keep {
         0
-    } else if span <= 8 * 86400 && from >= now - TIERS[1].2 {
+    } else if span <= 8 * 86400 && from >= now - TIERS[1].keep {
         1
     } else {
         2
@@ -700,7 +717,7 @@ pub fn tier_for(from: Ts, to: Ts, now: Ts) -> usize {
 }
 
 pub fn series(conn: &Connection, table: &Table, keys: &[String], from: Ts, to: Ts, tier: usize) -> Result<Series> {
-    let (suffix, step, _) = TIERS[tier];
+    let Tier { suffix, step, name, .. } = TIERS[tier];
     let fields: Vec<&'static str> = table.numbers().collect();
     let where_keys: Vec<String> = table.keys.iter().enumerate().map(|(i, k)| format!("{k} = ?{}", i + 3)).collect();
     // One row before `from`, so the first counter rate in range can be computed.
@@ -748,7 +765,7 @@ pub fn series(conn: &Connection, table: &Table, keys: &[String], from: Ts, to: T
         prev_ts = Some(ts);
     }
     let fields = fields.into_iter().zip(columns).collect();
-    Ok(Series { tier: ["raw", "5m", "1h"][tier], step, ts: ts_out, fields })
+    Ok(Series { tier: name, step, ts: ts_out, fields })
 }
 
 /// A writer whose writes are kept, and a function that stores them in new
