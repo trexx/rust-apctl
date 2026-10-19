@@ -181,7 +181,7 @@ fn compressible() -> impl tower_http::compression::Predicate {
 
 /// 409 unless apctl is the active controller. `what` says what needs it ("upgrades need").
 pub fn require_active(s: &AppState, what: &str) -> Result<(), ApiError> {
-    if s.active { Ok(()) } else { Err(ApiError(StatusCode::CONFLICT, format!("{what} active mode: in shadow mode apctl never talks to the APs"))) }
+    if s.active { Ok(()) } else { Err(ApiError::conflict(format!("{what} active mode: in shadow mode apctl never talks to the APs"))) }
 }
 
 /// The imported settings, as they are now.
@@ -206,9 +206,29 @@ impl ApiError {
         ApiError(StatusCode::NOT_FOUND, msg.into())
     }
 
+    /// The request clashes with the current state (409): shadow mode, an AP that is away, a run already going.
+    pub fn conflict(msg: impl Into<String>) -> Self {
+        ApiError(StatusCode::CONFLICT, msg.into())
+    }
+
+    /// Not allowed, whoever asks (403).
+    pub fn forbidden(msg: impl Into<String>) -> Self {
+        ApiError(StatusCode::FORBIDDEN, msg.into())
+    }
+
+    /// Needs a (valid) login (401).
+    pub fn unauthorized(msg: impl Into<String>) -> Self {
+        ApiError(StatusCode::UNAUTHORIZED, msg.into())
+    }
+
+    /// The AP a command is for is offline: queued, it would run whenever the AP is back.
+    pub fn ap_offline() -> Self {
+        Self::conflict("the AP is offline")
+    }
+
     /// Nothing to work on: no settings were imported yet.
     pub fn no_state() -> Self {
-        ApiError(StatusCode::CONFLICT, "no settings imported yet".into())
+        Self::conflict("no settings imported yet")
     }
 
     /// The engine thread is gone (it ended, or panicked).
@@ -1203,7 +1223,7 @@ async fn ws(
     upgrade: WebSocketUpgrade,
 ) -> Response {
     if !s.auth.same_origin(&headers, peer.map(|p| p.0.0.ip()), uri.authority().map(|a| a.as_str())) {
-        return ApiError(StatusCode::FORBIDDEN, "the live socket is only for pages of this server".into()).into_response();
+        return ApiError::forbidden("the live socket is only for pages of this server").into_response();
     }
     let rx = s.tx.subscribe();
     let (auth, session) = (s.auth.clone(), s.auth.session_of(&headers));

@@ -280,7 +280,7 @@ pub struct AdoptBody {
 /// POST /api/devices/adopt-ssh {ip, port?, username?, password?}
 pub async fn adopt(State(s): State<AppState>, Json(b): Json<AdoptBody>) -> Result<Json<Value>, ApiError> {
     crate::api::require_active(&s, "adoption needs")?;
-    let url = inform_url(&s).ok_or_else(|| ApiError(StatusCode::CONFLICT, "apctl doesn't know the URL APs should inform to: set --inform-url".into()))?;
+    let url = inform_url(&s).ok_or_else(|| ApiError::conflict("apctl doesn't know the URL APs should inform to: set --inform-url"))?;
     let ip = canonical_ip(&b.ip).ok_or_else(|| ApiError::bad("enter the AP's IP address"))?;
     let state = s.live.read().unwrap().state.clone();
     let given = match (b.username.filter(|u| !u.is_empty()), b.password) {

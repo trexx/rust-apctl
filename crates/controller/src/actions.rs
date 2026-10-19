@@ -19,7 +19,6 @@
 use std::collections::HashMap;
 
 use axum::extract::State;
-use axum::http::StatusCode;
 use inform::Mac;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -156,17 +155,13 @@ fn is_online(live: &Live, mac: &Mac) -> bool {
     live.devices.get(mac).is_some_and(|d| d.online)
 }
 
-fn offline() -> ApiError {
-    ApiError(StatusCode::CONFLICT, "the AP is offline".into())
-}
-
 /// POST /api/devices/{mac}/restart
 pub async fn restart(State(s): State<AppState>, MacPath(mac): MacPath) -> Result<Json<Value>, ApiError> {
     target_ap(&s, &mac)?;
     {
         let mut live = s.live.write().unwrap();
         if !is_online(&live, &mac) {
-            return Err(offline());
+            return Err(ApiError::ap_offline());
         }
         queue(&mut live, mac, json!({ "_type": "reboot", "reboot_type": "soft" }));
     }
@@ -185,7 +180,7 @@ pub async fn locate(State(s): State<AppState>, MacPath(mac): MacPath, Json(b): J
     let mut live = s.live.write().unwrap();
     // Turning it off can wait for an AP that is away: it is harmless when it comes.
     if b.on && !is_online(&live, &mac) {
-        return Err(offline());
+        return Err(ApiError::ap_offline());
     }
     queue(&mut live, mac, json!({ "_type": "cmd", "cmd": if b.on { "set-locate" } else { "unset-locate" } }));
     if b.on {
@@ -219,9 +214,9 @@ pub async fn kick(State(s): State<AppState>, MacPath(client): MacPath) -> Result
             .get(&client)
             .filter(|c| c.connected)
             .map(|c| c.sample.ap_mac)
-            .ok_or_else(|| ApiError(StatusCode::CONFLICT, "the client is not connected".into()))?;
+            .ok_or_else(|| ApiError::conflict("the client is not connected"))?;
         if !is_online(&live, &ap) {
-            return Err(ApiError(StatusCode::CONFLICT, "the client's AP is offline".into()));
+            return Err(ApiError::conflict("the client's AP is offline"));
         }
         queue(&mut live, ap, json!({ "_type": "cmd", "cmd": "kick-sta", "mac": client.to_string() }));
         ap

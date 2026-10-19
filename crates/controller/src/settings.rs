@@ -8,7 +8,6 @@
 //! the other controller (the next import would replace them).
 
 use axum::extract::State;
-use axum::http::StatusCode;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, LazyLock};
 
@@ -38,7 +37,7 @@ pub(crate) async fn change<B: Send + 'static>(s: &AppState, q: &PreviewQuery, ap
         return Ok(Json(preview(s, current, move |state| apply(state, &body)).await?));
     }
     if !s.active {
-        return Err(ApiError(StatusCode::CONFLICT, "saving needs active mode: in shadow mode the settings belong to the other controller".into()));
+        return Err(ApiError::conflict("saving needs active mode: in shadow mode the settings belong to the other controller"));
     }
     // Applied once, inside the engine, to the settings as they are then; what
     // changed is what that run says.
