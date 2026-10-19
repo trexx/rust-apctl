@@ -168,7 +168,7 @@ struct Tracker {
     ports: Vec<u16>,
     udp_ports: Vec<u16>,
     conns: HashMap<ConnId, Conn>,
-    /// The bytes all connections' buffers hold (the sum of their `held`).
+    /// The bytes all connections' buffers hold (the sum of their `counted`).
     held: usize,
     /// When idle connections were last swept.
     sweeper: Sweeper,
@@ -181,8 +181,8 @@ struct Conn {
     last_seen: Micros,
     /// Some segment in either direction carried data.
     carried: bool,
-    /// The bytes its buffers held after its last segment.
-    held: usize,
+    /// The bytes of its buffers that `Tracker::held` counts: what they held after its last segment.
+    counted: usize,
 }
 
 impl Conn {
@@ -297,7 +297,7 @@ impl Tracker {
 
         if tcp.rst() {
             if let Some(c) = self.conns.remove(&conn_id) {
-                self.held -= c.held;
+                self.held -= c.counted;
             }
             return;
         }
@@ -330,8 +330,8 @@ impl Tracker {
             conn.to_client.release();
         }
         let held = conn.held();
-        self.held = self.held - conn.held + held;
-        conn.held = held;
+        self.held = self.held - conn.counted + held;
+        conn.counted = held;
         if self.held > MAX_HELD {
             self.shed();
         }
@@ -349,7 +349,7 @@ impl Tracker {
     /// Keeps the connections `keep` says to, and counts what they hold.
     fn retain(&mut self, mut keep: impl FnMut(&Conn) -> bool) {
         self.conns.retain(|_, c| keep(c));
-        self.held = self.conns.values().map(|c| c.held).sum();
+        self.held = self.conns.values().map(|c| c.counted).sum();
     }
 
     /// Called when the buffers hold more than `MAX_HELD`: forgets the connections that
@@ -357,7 +357,7 @@ impl Tracker {
     /// some way off. Those are the ones made-up traffic fills; an AP's connection holds
     /// a message or two, and one that is forgotten picks up again at its next message.
     fn shed(&mut self) {
-        let mut sizes: Vec<usize> = self.conns.values().map(|c| c.held).filter(|&h| h > 0).collect();
+        let mut sizes: Vec<usize> = self.conns.values().map(|c| c.counted).filter(|&h| h > 0).collect();
         sizes.sort_unstable_by(|a, b| b.cmp(a));
         let (mut held, mut cutoff) = (self.held, usize::MAX);
         for size in sizes {
@@ -367,7 +367,7 @@ impl Tracker {
             held -= size;
             cutoff = size;
         }
-        self.retain(|c| c.held < cutoff);
+        self.retain(|c| c.counted < cutoff);
     }
 
     /// Called when the map is full and a new connection shows up: sweeps, and if
@@ -377,7 +377,7 @@ impl Tracker {
     /// at its next message.
     fn make_room(&mut self, ts: Micros) {
         self.sweeper.make_room(&mut self.conns, ts, |c| ts - c.last_seen < c.max_idle(), |c| (c.carried, c.last_seen));
-        self.held = self.conns.values().map(|c| c.held).sum();
+        self.held = self.conns.values().map(|c| c.counted).sum();
     }
 }
 
