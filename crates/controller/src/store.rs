@@ -102,6 +102,26 @@ impl Table {
         &INSERTS[self.name]
     }
 
+    /// A series' rows from `tier`, oldest first: `?1` and `?2` bound the time, the
+    /// keys follow from `?3` in key order. One row before `?1` comes too, so the
+    /// first counter rate in range can be computed.
+    fn series_sql(&self, tier: Tier) -> String {
+        let (name, suffix) = (self.name, tier.suffix);
+        let where_keys: Vec<String> = self.keys.iter().enumerate().map(|(i, k)| format!("{k} = ?{}", i + 3)).collect();
+        let where_keys = where_keys.join(" AND ");
+        format!(
+            "SELECT ts, {} FROM {name}{suffix} WHERE {where_keys} AND ts >= (SELECT COALESCE(MAX(ts), ?1) FROM {name}{suffix} WHERE {where_keys} AND ts < ?1) AND ts <= ?2 ORDER BY ts",
+            self.numbers().collect::<Vec<_>>().join(", "),
+        )
+    }
+
+    /// The series statement for each tier, built once per table (as `insert`).
+    fn series(&'static self, tier: usize) -> &'static str {
+        static SERIES: LazyLock<HashMap<(&'static str, usize), String>> =
+            LazyLock::new(|| TABLES.iter().flat_map(|t| TIERS.iter().enumerate().map(move |(i, tier)| ((t.name, i), t.series_sql(*tier)))).collect());
+        &SERIES[&(self.name, tier)]
+    }
+
     /// Aggregates `from` rows into `step`-second buckets of `to`. Gauges are
     /// averaged; counters, settings and texts take the bucket's last value.
     /// SQLite gives bare columns the values of the row holding the single `MAX(ts)`.
@@ -716,21 +736,11 @@ pub fn tier_for(from: Ts, to: Ts, now: Ts) -> usize {
     }
 }
 
-pub fn series(conn: &Connection, table: &Table, keys: &[String], from: Ts, to: Ts, tier: usize) -> Result<Series> {
-    let Tier { suffix, step, name, .. } = TIERS[tier];
+pub fn series(conn: &Connection, table: &'static Table, keys: &[String], from: Ts, to: Ts, tier: usize) -> Result<Series> {
+    let Tier { step, name, .. } = TIERS[tier];
     let fields: Vec<&'static str> = table.numbers().collect();
-    let where_keys: Vec<String> = table.keys.iter().enumerate().map(|(i, k)| format!("{k} = ?{}", i + 3)).collect();
-    // One row before `from`, so the first counter rate in range can be computed.
-    let sql = format!(
-        "SELECT ts, {} FROM {}{suffix} WHERE {} AND ts >= (SELECT COALESCE(MAX(ts), ?1) FROM {}{suffix} WHERE {} AND ts < ?1) AND ts <= ?2 ORDER BY ts",
-        fields.join(", "),
-        table.name,
-        where_keys.join(" AND "),
-        table.name,
-        where_keys.join(" AND "),
-    );
     let params = [Value::Integer(from), Value::Integer(to)].into_iter().chain(keys.iter().map(|k| Value::Text(k.clone())));
-    let mut stmt = conn.prepare_cached(&sql)?;
+    let mut stmt = conn.prepare_cached(table.series(tier))?;
     let mut rows = stmt.query(params_from_iter(params))?;
 
     // Settings and gauges are returned as stored, counters as rates.
