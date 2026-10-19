@@ -403,14 +403,19 @@ fn radio_checks(h: &RadioHealth) -> [(Key, Option<f64>, f64, f64, &'static str);
     ]
 }
 
+/// Each radio's channel use since `?1`, for [`radio_health`]. The upper bound
+/// (`?2`, no limit) keeps SQLite on the `ts` index: with a lower bound alone it
+/// reads every raw row kept, in radio order, to group them.
+const RADIO_USE: &str = "SELECT mac, radio, AVG(cu_total), AVG(cu_interf), COUNT(*), MIN(ts), MAX(ts) FROM radio_stats WHERE ts >= ?1 AND ts <= ?2 GROUP BY mac, radio";
+
 async fn radio_health(store: &Arc<Store>, now: Ts) -> anyhow::Result<HashMap<(Mac, String), RadioHealth>> {
     let store = store.clone();
     tokio::task::spawn_blocking(move || {
         store.read(Db::Metrics, |c| {
             let from = now - HEALTH_WINDOW;
             let mut out: HashMap<(Mac, String), RadioHealth> = HashMap::new();
-            let mut stmt = c.prepare("SELECT mac, radio, AVG(cu_total), AVG(cu_interf), COUNT(*), MIN(ts), MAX(ts) FROM radio_stats WHERE ts >= ?1 GROUP BY mac, radio")?;
-            let rows = stmt.query_map([from], |r| {
+            let mut stmt = c.prepare_cached(RADIO_USE)?;
+            let rows = stmt.query_map([from, Ts::MAX], |r| {
                 Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, Option<f64>>(2)?, r.get::<_, Option<f64>>(3)?, r.get::<_, i64>(4)?, r.get::<_, Ts>(5)?, r.get::<_, Ts>(6)?))
             })?;
             for row in rows {
@@ -798,7 +803,7 @@ struct Listed {
 /// The `limit` most recent alerts, newest first, with the unread count.
 /// One of a kind apctl no longer raises is left out (see [`stored`]).
 fn recent(c: &rusqlite::Connection, limit: i64) -> anyhow::Result<Value> {
-    let mut stmt = c.prepare(LIST)?;
+    let mut stmt = c.prepare_cached(LIST)?;
     let rows = stmt
         .query_map([limit], |r| Ok(match stored(r)? {
             Some(alert) => Some(Listed { alert, read: r.get::<_, i64>(11)? != 0 }),
@@ -1176,6 +1181,13 @@ mod tests {
         let h = radio_health(&w.store, now).await.unwrap();
         let judged = |radio: &str| h.get(&("02:00:00:00:00:01".parse().unwrap(), radio.to_string())).and_then(|h| h.utilisation);
         assert_eq!((judged("na"), judged("ng"), judged("6e")), (Some(90.0), None, None));
+    }
+
+    #[test]
+    fn the_radio_use_is_read_through_the_ts_index() {
+        let t = TestStore::new("alerts-plan");
+        let plan: String = t.db(Db::Metrics).query_row(&format!("EXPLAIN QUERY PLAN {RADIO_USE}"), [0, Ts::MAX], |r| r.get(3)).unwrap();
+        assert_eq!(plan, "SEARCH radio_stats USING INDEX radio_stats_ts (ts>? AND ts<?)");
     }
 
     #[test]
