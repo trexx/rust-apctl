@@ -166,8 +166,8 @@ fn mac_bytes(mac: &str) -> [u8; 6] {
 }
 
 /// A BSSID derived from the AP's MAC, as the firmware numbers its VAPs.
-fn bssid(ap: &Ap, radio: &str, vap: u8) -> String {
-    let mut b = mac_bytes(ap.mac);
+fn bssid(ap: Mac, radio: &str, vap: u8) -> String {
+    let mut b = ap.0;
     b[0] |= 0x02;
     b[3] = b[3].wrapping_add(if radio == "na" { 0x20 } else { 0x10 });
     b[5] = b[5].wrapping_add(vap * 8);
@@ -338,6 +338,16 @@ struct Session {
     signal: i64,
 }
 
+/// What a VAP's stations add up to in one report: bytes down and up since the last, and
+/// their signals and satisfactions summed.
+#[derive(Default, Clone, Copy)]
+struct VapLoad {
+    down: f64,
+    up: f64,
+    signal: i64,
+    satisfaction: i64,
+}
+
 #[derive(Default, Clone)]
 struct ApCounters {
     tx: f64,
@@ -438,10 +448,10 @@ impl Sim {
                     if c.kind == Kind::Phone {
                         let p = format!("wlan: [0:I:ANY] [UNSPECIFIED] vap-0({old_vap}):");
                         self.log(at - 2, old, "kernel", format!("{p}BTM: STA {} RSSI: {}, candidates: 1, error: 0, flags: ALLOW (0x1)", c.mac, s.signal));
-                        self.log(at - 2, old, "kernel", format!("{p}BTM: [0]{{{} ch{}/op128/phy14}}", bssid(&APS[ap], radio, 0), if radio == "na" { APS[ap].na } else { APS[ap].ng }));
+                        self.log(at - 2, old, "kernel", format!("{p}BTM: [0]{{{} ch{}/op128/phy14}}", bssid(self.ids[ap].mac, radio, 0), if radio == "na" { APS[ap].na } else { APS[ap].ng }));
                         let status = if self.rng.unit() < 0.8 { 0 } else { 7 };
                         self.log(at - 1, old, "kernel", format!("{p}BTM: Received response from [{}](len = 5): dialog_token 1, status {status}, delay 0, bssid {}, cancel 0", c.mac,
-                            if status == 0 { bssid(&APS[ap], radio, 0) } else { "n/a".into() }));
+                            if status == 0 { bssid(self.ids[ap].mac, radio, 0) } else { "n/a".into() }));
                     }
                     let fast = !c.iot && c.kind != Kind::Iot;
                     let left_at = s.signal - self.rng.range(4, 10);
@@ -461,10 +471,10 @@ impl Sim {
     /// A full status report from AP `i`, after `dt` seconds of traffic.
     fn inform(&mut self, i: usize, ts: i64, dt: f64) -> Value {
         let hour = ts.rem_euclid(86_400) as f64 / 3600.0;
-        let (stas, vap_traffic) = self.stations(i, ts, dt, hour);
+        let (stas, loads) = self.stations(i, ts, dt, hour);
         let busy = 0.5 + 0.5 * (((hour - 20.0) / 24.0 * std::f64::consts::TAU).cos());
-        let totals = self.count_traffic(i, dt, &vap_traffic);
-        let vaps = self.vaps(i, dt, stas, &vap_traffic);
+        let totals = self.count_traffic(i, dt, &loads);
+        let vaps = self.vaps(i, dt, stas, &loads);
         let mut p = self.template.clone();
         for r in p["radio_table"].as_array_mut().into_iter().flatten() {
             self.radio(r, i, ts, busy, &totals);
@@ -473,12 +483,11 @@ impl Sim {
         p
     }
 
-    /// The station tables of AP `i`'s VAPs (2.4 GHz, 5 GHz, IoT) and the (down, up)
-    /// bytes of each over the last `dt` seconds; moves its clients' counters on.
-    fn stations(&mut self, i: usize, ts: i64, dt: f64, hour: f64) -> ([Vec<Value>; 3], [(f64, f64); 3]) {
-        let ap = &APS[i];
+    /// The station tables of AP `i`'s VAPs (2.4 GHz, 5 GHz, IoT) and what each one's
+    /// stations add up to over the last `dt` seconds; moves its clients' counters on.
+    fn stations(&mut self, i: usize, ts: i64, dt: f64, hour: f64) -> ([Vec<Value>; 3], [VapLoad; 3]) {
         let mut stas: [Vec<Value>; 3] = Default::default();
-        let mut vap_traffic = [(0.0f64, 0.0f64); 3];
+        let mut loads = [VapLoad::default(); 3];
         for (ci, c) in CLIENTS.iter().enumerate() {
             let Some(s) = self.sessions[ci].as_mut().filter(|s| s.ap == i) else { continue };
             let loc = location(c, ts, self.start).unwrap_or(0);
@@ -490,8 +499,8 @@ impl Sim {
             s.rx += up;
             s.tx += down;
             let vi = if c.iot { 2 } else if s.radio == "na" { 1 } else { 0 };
-            vap_traffic[vi].0 += down;
-            vap_traffic[vi].1 += up;
+            loads[vi].down += down;
+            loads[vi].up += up;
             let na = s.radio == "na";
             let rate = match (na, signal) {
                 (true, s) if s > -55 => 1_200_900,
@@ -503,6 +512,8 @@ impl Sim {
             };
             let ax = !matches!(c.kind, Kind::Iot | Kind::Speaker);
             let sat = (100 + (signal + 60).min(0) * 2).clamp(20, 100);
+            loads[vi].signal += signal;
+            loads[vi].satisfaction += sat;
             let pkts = (s.tx + s.rx) / 900.0;
             stas[vi].push(json!({
                 "mac": c.mac, "hostname": c.hostname, "ip": format!("192.168.1.{}", 100 + ci), "authorized": true, "state": 11,
@@ -517,19 +528,19 @@ impl Sim {
             // Now and then (about hourly and every two hours): poor experience, and a kick.
             let weak = c.quirk == Some(Quirk::WeakLink);
             if weak && self.rng.unit() < dt / 3600.0 {
-                self.log(ts, i, "mcad", format!("wireless_agg_stats.log_sta_anomalies(): bssid={} radio=wifi0 vap=wifi0ap1 sta={} signal={signal} satisfaction_now={sat} anomalies=low_rssi,high_tcp_latency", bssid(ap, "ng", 1), c.mac));
+                self.log(ts, i, "mcad", format!("wireless_agg_stats.log_sta_anomalies(): bssid={} radio=wifi0 vap=wifi0ap1 sta={} signal={signal} satisfaction_now={sat} anomalies=low_rssi,high_tcp_latency", bssid(self.ids[i].mac, "ng", 1), c.mac));
             }
             if weak && signal < -76 && self.rng.unit() < dt / 7200.0 {
                 self.log(ts, i, "stamgr", format!("kick-sta-on {} wifi0ap1 (reason:Low RSSI rssi:{})", c.mac, signal + 95));
             }
         }
-        (stas, vap_traffic)
+        (stas, loads)
     }
 
     /// Adds the VAPs' traffic to AP `i`'s own counters, and returns them.
-    fn count_traffic(&mut self, i: usize, dt: f64, vap_traffic: &[(f64, f64); 3]) -> ApCounters {
+    fn count_traffic(&mut self, i: usize, dt: f64, loads: &[VapLoad; 3]) -> ApCounters {
         let c = &mut self.counters[i];
-        let (down, up): (f64, f64) = vap_traffic.iter().fold((0.0, 0.0), |a, v| (a.0 + v.0, a.1 + v.1));
+        let (down, up): (f64, f64) = loads.iter().fold((0.0, 0.0), |a, v| (a.0 + v.down, a.1 + v.up));
         c.tx += up + 400.0 * dt;
         c.rx += down + 900.0 * dt;
         c.pkts += (down + up) / 1000.0;
@@ -538,22 +549,22 @@ impl Sim {
     }
 
     /// AP `i`'s VAP table, each VAP with its stations.
-    fn vaps(&mut self, i: usize, dt: f64, mut stas: [Vec<Value>; 3], vap_traffic: &[(f64, f64); 3]) -> Vec<Value> {
+    fn vaps(&mut self, i: usize, dt: f64, mut stas: [Vec<Value>; 3], loads: &[VapLoad; 3]) -> Vec<Value> {
         let ap = &APS[i];
         [("ng", 0u8, SSID, 0usize), ("na", 0u8, SSID, 1), ("ng", 1u8, IOT_SSID, 2)]
             .into_iter()
             .map(|(radio, idx, essid, vi)| {
                 let vc = &mut self.vap_counters[i][vi];
-                vc.tx += vap_traffic[vi].0 + 2_000.0 * dt;
-                vc.rx += vap_traffic[vi].1 + 500.0 * dt;
-                vc.pkts += (vap_traffic[vi].0 + vap_traffic[vi].1) / 1000.0 + dt;
+                let load = loads[vi];
+                vc.tx += load.down + 2_000.0 * dt;
+                vc.rx += load.up + 500.0 * dt;
+                vc.pkts += (load.down + load.up) / 1000.0 + dt;
                 let sta = std::mem::take(&mut stas[vi]);
                 let n = sta.len() as i64;
-                let avg = if n > 0 { sta.iter().map(|s| s["signal"].as_i64().unwrap_or(0)).sum::<i64>() / n } else { 0 };
-                let sat = if n > 0 { sta.iter().map(|s| s["satisfaction"].as_i64().unwrap_or(0)).sum::<i64>() / n } else { 100 };
+                let (avg, sat) = if n > 0 { (load.signal / n, load.satisfaction / n) } else { (0, 100) };
                 let na = radio == "na";
                 json!({
-                    "bssid": bssid(ap, radio, idx), "essid": essid, "radio": radio, "radio_name": if na { "wifi1" } else { "wifi0" },
+                    "bssid": bssid(self.ids[i].mac, radio, idx), "essid": essid, "radio": radio, "radio_name": if na { "wifi1" } else { "wifi0" },
                     "name": vap_name(radio, vi == 2), "id": format!("{vi}"), "channel": if na { ap.na } else { ap.ng }, "bw": if na { ap.na_bw } else { 20 },
                     "tx_power": if na { ap.power.1 } else { ap.power.0 }, "usage": "user", "up": true, "state": "RUN", "num_sta": n,
                     "tx_bytes": vc.tx as i64, "rx_bytes": vc.rx as i64, "tx_packets": (vc.tx / 1100.0) as i64, "rx_packets": (vc.rx / 500.0) as i64,
@@ -592,7 +603,7 @@ impl Sim {
         for (j, other) in APS.iter().enumerate().filter(|(j, _)| *j != i) {
             let signal = AP_SIGNAL[i][j] + if na { -9 } else { 0 } + self.rng.range(-2, 2);
             let ch = if na { other.na } else { other.ng };
-            scan.push(neighbour(&bssid(other, band, 0), SSID, band, ch, if na { other.na_bw } else { 20 }, signal, true, other.name));
+            scan.push(neighbour(&bssid(self.ids[j].mac, band, 0), SSID, band, ch, if na { other.na_bw } else { 20 }, signal, true, other.name));
         }
         if !na && i == 2 && ts > self.end_history - 3 * 3600 {
             scan.push(neighbour(LOOKALIKE.0, LOOKALIKE.1, "ng", LOOKALIKE.2, 20, LOOKALIKE.3 + self.rng.range(-2, 2), false, ""));
