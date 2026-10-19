@@ -244,7 +244,7 @@ fn busiest<T>(per: HashMap<&str, T>, amount: impl Fn(&T) -> f64) -> Vec<(String,
 fn listed_client(s: &AppState, live: &Live, mac: &str, more: impl FnOnce(Option<&ClientView>) -> Value) -> Value {
     let m: Option<inform::Mac> = mac.parse().ok();
     let view = m.and_then(|m| live.clients.get(&m));
-    let mut out = json!({ "mac": mac, "name": client_name(live, m), "vendor": s.vendors.lookup_str(mac), "connected": view.is_some_and(|c| c.connected) });
+    let mut out = json!({ "mac": mac, "name": client_name(live, m), "vendor": m.and_then(|m| s.vendors.lookup(&m)), "connected": view.is_some_and(|c| c.connected) });
     if let (Value::Object(o), Value::Object(more)) = (&mut out, more(view)) {
         o.extend(more);
     }
