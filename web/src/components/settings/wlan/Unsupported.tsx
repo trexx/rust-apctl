@@ -18,10 +18,10 @@ export function Unsupported({
   if (!on) return null;
   const from = aps ?? list.aps.map((a) => a.mac);
   const name = (m: string) => list.aps.find((a) => a.mac === m)?.name ?? m;
-  const missing = (list.unsupported?.[feature] ?? []).filter((m) =>
+  const missing = (list.unsupported[feature] ?? []).filter((m) =>
     from.includes(m),
   );
-  const unknown = (list.unknown ?? []).filter((m) => from.includes(m));
+  const unknown = list.unknown.filter((m) => from.includes(m));
   if (missing.length === 0 && unknown.length === 0) return null;
   return (
     <div className="form-warn">

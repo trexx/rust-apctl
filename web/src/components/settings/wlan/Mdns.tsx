@@ -53,7 +53,7 @@ function MdnsRules({
   onChange: (v: MdnsRule[]) => void;
   list: WlanSettingsList;
 }) {
-  const services = list.mdns_services ?? [];
+  const services = list.mdns_services;
   const update = (i: number, r: Partial<MdnsRule>) =>
     onChange(
       value.map((x, j) => {

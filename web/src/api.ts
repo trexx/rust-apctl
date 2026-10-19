@@ -1446,11 +1446,11 @@ export interface WlanSettingsList {
   networks: { id: string; name: string; vlan: number | null; purpose: string | null }[];
   aps: { mac: Mac; name: string | null }[];
   /** For each optional SSID feature, the APs that would broadcast without it. */
-  unsupported?: Record<string, Mac[]>;
+  unsupported: Record<string, Mac[]>;
   /** APs whose feature support is not known yet (no inform). */
-  unknown?: Mac[];
+  unknown: Mac[];
   /** The predefined mDNS service codes. */
-  mdns_services?: { code: string; name: string }[];
+  mdns_services: { code: string; name: string }[];
 }
 
 export interface MdnsRule {
