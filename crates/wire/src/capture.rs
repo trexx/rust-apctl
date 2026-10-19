@@ -416,6 +416,11 @@ const MAX_HEAD: usize = 64 << 10;
 /// Most chunks in a chunked body: a body is walked again with every segment until
 /// it is complete. Inform replies, a few hundred KB at most, come in far fewer.
 const MAX_CHUNKS: usize = 4096;
+/// Longest chunk-size line (the size in hex and any extensions). Like a head, it is
+/// looked through again with every segment until it ends, so one that does not end
+/// within this is given up on; a real one is a few bytes. The trailers after the last
+/// chunk are held to `MAX_HEAD`, as a head is.
+const MAX_CHUNK_LINE: usize = 1024;
 
 impl HalfStream {
     fn segment(&mut self, ts: Micros, seq: u32, syn: bool, fin: bool, payload: &[u8]) {
@@ -674,8 +679,8 @@ enum Chunked {
     /// The bytes the chunked body takes up (with its trailers), and the size of its data.
     Complete(usize, usize),
     Partial,
-    /// A chunk size that is not hex or larger than any message we keep, or more
-    /// than `MAX_CHUNKS` chunks.
+    /// A chunk size that is not hex or larger than any message we keep, more than
+    /// `MAX_CHUNKS` chunks, or a chunk-size line or trailers longer than we accept.
     Garbage,
 }
 
@@ -685,7 +690,7 @@ fn chunked_len<'b>(mut buf: &'b [u8], mut chunk: impl FnMut(&'b [u8])) -> Chunke
     let total = buf.len();
     let mut data = 0;
     for _ in 0..=MAX_CHUNKS {
-        let Some(line_end) = find(buf, b"\r\n") else { return Chunked::Partial };
+        let Some(line_end) = find_within(buf, b"\r\n", MAX_CHUNK_LINE) else { return too_long(buf, MAX_CHUNK_LINE) };
         let size = std::str::from_utf8(&buf[..line_end])
             .ok()
             .and_then(|line| usize::from_str_radix(line.split(';').next().unwrap_or_default().trim(), 16).ok());
@@ -695,14 +700,13 @@ fn chunked_len<'b>(mut buf: &'b [u8], mut chunk: impl FnMut(&'b [u8])) -> Chunke
         buf = &buf[line_end + 2..];
         if size == 0 {
             // Skip optional trailers up to the blank line.
-            let Some(end) = find(buf, b"\r\n") else { return Chunked::Partial };
-            if end == 0 {
-                buf = &buf[2..];
+            let end = if buf.starts_with(b"\r\n") {
+                2
             } else {
-                let Some(end) = find(buf, b"\r\n\r\n") else { return Chunked::Partial };
-                buf = &buf[end + 4..];
-            }
-            return Chunked::Complete(total - buf.len(), data);
+                let Some(end) = find_within(buf, b"\r\n\r\n", MAX_HEAD) else { return too_long(buf, MAX_HEAD) };
+                end + 4
+            };
+            return Chunked::Complete(total - buf.len() + end, data);
         }
         if buf.len() < size + 2 {
             return Chunked::Partial;
@@ -714,8 +718,18 @@ fn chunked_len<'b>(mut buf: &'b [u8], mut chunk: impl FnMut(&'b [u8])) -> Chunke
     Chunked::Garbage
 }
 
+/// Partial while `buf`, which has no end in it yet, is shorter than `max`; garbage after.
+fn too_long(buf: &[u8], max: usize) -> Chunked {
+    if buf.len() >= max { Chunked::Garbage } else { Chunked::Partial }
+}
+
 fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     memchr::memmem::find(haystack, needle)
+}
+
+/// Where `needle` first starts in `haystack`, if it lies within the first `max` bytes.
+fn find_within(haystack: &[u8], needle: &[u8], max: usize) -> Option<usize> {
+    find(&haystack[..haystack.len().min(max)], needle)
 }
 
 /// The status and body (chunked encoding undone) of the HTTP response in `buf`, which
@@ -1012,6 +1026,38 @@ mod tests {
         buf.extend_from_slice(&b"1\r\nx\r\n".repeat(MAX_CHUNKS + 1));
         assert!(matches!(chunked_len(&buf[45..], |_| {}), Chunked::Garbage));
         assert!(matches!(chunked_len(&b"1\r\nx\r\n".repeat(MAX_CHUNKS), |_| {}), Chunked::Partial));
+    }
+
+    #[test]
+    fn a_chunk_size_line_or_trailers_that_never_end_are_given_up_on() {
+        let head = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n";
+        for start in [&b"1"[..], b"2\r\nok\r\n0\r\nX-Trailer: "] {
+            let mut h = HalfStream::default();
+            h.segment(0, 0, true, false, b"");
+            let mut seq = 1;
+            let mut send = |h: &mut HalfStream, data: &[u8]| {
+                h.segment(0, seq, false, false, data);
+                seq += data.len() as u32;
+            };
+            send(&mut h, head);
+            send(&mut h, start);
+            for _ in 0..100 {
+                send(&mut h, &[b'a'; 1400]);
+                assert!(h.take_http(false).is_none());
+                assert!(h.buf.len() <= MAX_HEAD + 2 * 1400, "{}", h.buf.len());
+            }
+            send(&mut h, b"\r\n\r\nHTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
+            assert!(matches!(h.take_http(false), Some(Parsed::Response { body, .. }) if body == b"ok"), "{start:?}: in sync again");
+        }
+        assert!(matches!(chunked_len(&[b'1'; MAX_CHUNK_LINE - 1], |_| {}), Chunked::Partial));
+        assert!(matches!(chunked_len(&[b'1'; MAX_CHUNK_LINE], |_| {}), Chunked::Garbage));
+        // Trailers that end are skipped, up to the response behind them.
+        let mut buf = head.to_vec();
+        buf.extend_from_slice(b"2\r\nok\r\n0\r\nX-A: 1\r\nX-B: 2\r\n\r\nHTTP/1.1 204 No Content\r\n\r\n");
+        let mut h = HalfStream { buf, ..Default::default() };
+        assert!(matches!(h.take_http(false), Some(Parsed::Response { status: 200, body }) if body == b"ok"));
+        assert!(matches!(h.take_http(false), Some(Parsed::Response { status: 204, .. })));
+        assert!(h.buf.is_empty());
     }
 
     #[test]
