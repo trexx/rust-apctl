@@ -1126,31 +1126,42 @@ fn wlan_password(p: &Value, before: &Value, w: &mut Value, changed: &mut Vec<&st
     Ok(())
 }
 
+/// The bands an SSID is broadcast on.
+struct Bands {
+    g2: bool,
+    g5: bool,
+    g6: bool,
+}
+
 /// The bands, and the `wlan_band` derived from them. Returns the bands.
-fn wlan_bands(p: &Value, w: &mut Value) -> Result<Vec<String>, String> {
+fn wlan_bands(p: &Value, w: &mut Value) -> Result<Bands, String> {
     if !p["wlan_bands"].is_null() {
         let bands: Option<Vec<&str>> = p["wlan_bands"].as_array().ok_or("wlan_bands must be a list")?.iter().map(Value::as_str).collect();
         let mut bands = bands.filter(|b| !b.is_empty() && b.iter().all(|b| ["2g", "5g", "6g"].contains(b))).ok_or("choose at least one band: 2g, 5g or 6g")?;
         dedup_in_order(&mut bands);
         w["wlan_bands"] = json!(bands);
     }
-    let bands: Vec<String> = w["wlan_bands"].as_array().into_iter().flatten().filter_map(|b| b.as_str().map(str::to_string)).collect();
-    if bands.iter().any(|b| b == "6g") && !(w["wpa3_support"].as_bool() == Some(true) || w["security"].as_str() == Some("open")) {
+    let on = |b: &str| w["wlan_bands"].as_array().into_iter().flatten().any(|x| x.as_str() == Some(b));
+    let bands = Bands { g2: on("2g"), g5: on("5g"), g6: on("6g") };
+    if bands.g6 && !(w["wpa3_support"].as_bool() == Some(true) || w["security"].as_str() == Some("open")) {
         return Err("6 GHz needs WPA3 (or an open network)".into());
     }
-    let has = |b: &str| bands.iter().any(|x| x == b);
-    w["wlan_band"] = json!(if has("2g") && has("5g") { "both" } else if has("5g") { "5g" } else if has("6g") && bands.len() == 1 { "6g" } else { "2g" });
+    w["wlan_band"] = json!(match bands {
+        Bands { g2: true, g5: true, .. } => "both",
+        Bands { g5: true, .. } => "5g",
+        Bands { g2: false, g6: true, .. } => "6g",
+        _ => "2g",
+    });
     Ok(bands)
 }
 
 /// The roaming assistant, band steering and the IoT locks, which depend on the bands.
-fn wlan_roaming(p: &Value, w: &mut Value, bands: &[String]) -> Result<(), String> {
-    let has = |b: &str| bands.iter().any(|x| x == b);
+fn wlan_roaming(p: &Value, w: &mut Value, bands: &Bands) -> Result<(), String> {
     // Force Wi-Fi 4 holds the roaming assistant off (IOT_TEMPLATE).
     copy_fields(p, w, &[("roaming_assistant_na_enabled", Bool), ("roaming_assistant_na_rssi", Int(-80, -60))])?;
 
     // Band steering: dual-band clients the AP has seen on 5 GHz are kept off 2.4 GHz.
-    let dual = has("2g") && has("5g");
+    let dual = bands.g2 && bands.g5;
     if let Some(b) = bool_field(p, "no2ghz_oui")? {
         if b && !dual {
             return Err("band steering needs both 2.4 and 5 GHz".into());
@@ -1165,12 +1176,12 @@ fn wlan_roaming(p: &Value, w: &mut Value, bands: &[String]) -> Result<(), String
     // there. Both need 2.4 GHz and go when it does.
     for key in ["iot_channel_lock", "iot_dtim_lock"] {
         if let Some(b) = bool_field(p, key)? {
-            if b && !has("2g") {
+            if b && !bands.g2 {
                 return Err("the IoT locks need 2.4 GHz".into());
             }
             w[key] = json!(b);
         }
-        if !has("2g") && w[key].as_bool() == Some(true) {
+        if !bands.g2 && w[key].as_bool() == Some(true) {
             w[key] = json!(false);
         }
     }
