@@ -174,7 +174,7 @@ fn totals(samples: &Samples, [tx, rx]: [usize; 2], from: Ts) -> (f64, f64) {
 pub async fn top(State(s): State<AppState>, Query(q): Query<RangeQuery>) -> Result<Json<Value>, ApiError> {
     let (from, to, tier) = window(&q);
     let ap = q.mac.as_ref().map(|m| m.to_ascii_lowercase());
-    let got = memo_read(&s, Db::Metrics, "top", &q, tier, move |c| {
+    let got = memo_read(&s, Db::Metrics, "top", &q.read_by(true), tier, move |c| {
         // One AP's page lists only its clients: the APs are left out.
         let mut aps: HashMap<String, (f64, f64)> = HashMap::new();
         if ap.is_none() {
@@ -288,7 +288,7 @@ pub async fn density(State(s): State<AppState>, Query(q): Query<RangeQuery>) -> 
     let (from, to, tier) = window(&q);
     let suffix = TIERS[tier].0;
     // Worked out where the data is read, off the async workers and the live lock.
-    let aps = memo_read(&s, Db::Metrics, "density", &q, tier, move |c| {
+    let aps = memo_read(&s, Db::Metrics, "density", &q.read_by(false), tier, move |c| {
         let mut stmt = c.prepare_cached(&density_sql(suffix))?;
         // The few AP and band names, each kept once; a group refers to them by place.
         let (mut names, mut index): (Vec<String>, HashMap<String, usize>) = Default::default();
@@ -418,7 +418,7 @@ pub async fn retries(State(s): State<AppState>, Query(q): Query<RangeQuery>) -> 
     let (from, to, tier) = window(&q);
     let spec = Spec { table: "vap_stats", key: "bssid", extra: &["ap_mac", "radio"], cols: &RETRY_COLS, only: None };
     // By AP and band.
-    let totals = memo_read(&s, Db::Metrics, "retries", &q, tier, move |c| {
+    let totals = memo_read(&s, Db::Metrics, "retries", &q.read_by(false), tier, move |c| {
         let vaps = load(c, spec, tier, from, to)?;
         let mut totals: Vec<((String, String), [f64; 3])> = retry_totals(&vaps, RETRY_AT, from).into_iter().map(|((ap, band), t)| ((ap.to_string(), band.to_string()), t)).collect();
         totals.sort_by(|a, b| a.0.cmp(&b.0));
@@ -442,7 +442,7 @@ pub async fn multicast(State(s): State<AppState>, Query(q): Query<RangeQuery>) -
     let (from, to, tier) = window(&q);
     let bucket = bucket_for(to - from, tier);
     let ap = q.mac.as_ref().map(|m| m.to_ascii_lowercase());
-    let got = memo_read(&s, Db::Metrics, "multicast", &q, tier, move |c| {
+    let got = memo_read(&s, Db::Metrics, "multicast", &q.read_by(true), tier, move |c| {
         let (suffix, step) = (TIERS[tier].0, TIERS[tier].1);
         // From a little before the window: what each sample covers starts before it.
         let (one, mut params) = (if ap.is_some() { " AND mac = ?3" } else { "" }, vec![Sql::Integer(from - if step > 0 { step } else { MCAST_GAP }), Sql::Integer(to)]);
@@ -577,7 +577,7 @@ pub async fn wlans(State(s): State<AppState>, Query(q): Query<RangeQuery>) -> Re
     let (from, to, tier) = window(&q);
     let bucket = bucket_for(to - from, tier);
     // The history, summed up per network where it is read.
-    let per = memo_read(&s, Db::Metrics, "wlans", &q, tier, move |c| {
+    let per = memo_read(&s, Db::Metrics, "wlans", &q.read_by(false), tier, move |c| {
         let vaps = load(c, Spec { table: "vap_stats", key: "bssid", extra: &["essid"], cols: WLAN_COLS, only: None }, tier, from, to)?;
         Ok(wlan_history(&vaps, from, bucket))
     })
@@ -823,7 +823,7 @@ struct RadioAvg {
 pub async fn radios(State(s): State<AppState>, Query(q): Query<RangeQuery>) -> Result<Json<Value>, ApiError> {
     let (from, to, tier) = window(&q);
     // By AP, then radio, worked out where the data is read.
-    let avgs = memo_read(&s, Db::Metrics, "radios", &q, tier, move |c| {
+    let avgs = memo_read(&s, Db::Metrics, "radios", &q.read_by(false), tier, move |c| {
         let mut out: HashMap<String, HashMap<String, RadioAvg>> = HashMap::new();
         // Airtime: SQLite averages each radio's samples in the window.
         let sql = format!("SELECT mac, radio, AVG(cu_total), AVG(cu_interf) FROM radio_stats{} WHERE ts >= ?1 AND ts <= ?2 GROUP BY mac, radio", TIERS[tier].0);
@@ -1405,6 +1405,9 @@ mod tests {
             let first = ok(retries(State(s.clone()), q(None)).await);
             t.db(Db::Metrics).execute("DELETE FROM vap_stats", []).unwrap();
             assert_eq!(ok(retries(State(s.clone()), q(None)).await), first, "read again within the time it is kept");
+            // Retries are of every band: asked for one, they are the same read.
+            let band = Query(RangeQuery { band: Some("na".into()), mac: Some("02:00:00:00:00:A1".into()), ..q(None).0 });
+            assert_eq!(ok(retries(State(s.clone()), band).await), first, "the band and AP make no other read");
             assert_eq!(ok(retries(State(s), q(Some(600))).await), json!([]), "another query reads the database");
         }
 

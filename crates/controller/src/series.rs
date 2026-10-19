@@ -28,6 +28,15 @@ pub struct RangeQuery {
     pub mac: Option<String>,
 }
 
+impl RangeQuery {
+    /// The query as a view that reads no band, and with `by_ap` its AP
+    /// (written in lower case), is answered: what [`memo_read`] keys its read by,
+    /// so that the same read is not made and kept again for each band asked.
+    pub(crate) fn read_by(&self, by_ap: bool) -> RangeQuery {
+        RangeQuery { range: self.range, from: self.from, to: self.to, band: None, mac: self.mac.as_ref().filter(|_| by_ap).map(|m| m.to_ascii_lowercase()) }
+    }
+}
+
 /// The longest window a request can ask for.
 const MAX_WINDOW: Ts = 400 * 86400;
 
