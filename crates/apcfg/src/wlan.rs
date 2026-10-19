@@ -923,7 +923,7 @@ fn schedule(c: &mut Cfg, w: &Value, k: Prefix, invert: bool, multi: bool) {
 }
 
 #[cfg(test)]
-mod schedule_tests {
+mod tests {
     use super::*;
     use serde_json::json;
 
