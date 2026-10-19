@@ -741,7 +741,11 @@ async fn dryrun(State(s): State<AppState>) -> Result<Json<DryRunStatus>, ApiErro
                 stored.insert(mac, Arc::new(p));
             }
         }
-        let mut stmt = c.prepare("SELECT id, ts, mac, cfgversion, matches, comparison FROM dryrun_results ORDER BY ts DESC LIMIT 100")?;
+        // Without the diffs' text, which the history never shows (only the counts); text that isn't JSON becomes null.
+        let mut stmt = c.prepare_cached(
+            "SELECT id, ts, mac, cfgversion, matches, CASE WHEN json_valid(comparison) THEN json_remove(comparison, '$.mgmt_cfg.diff', '$.system_cfg.diff') END
+             FROM dryrun_results ORDER BY ts DESC LIMIT 100",
+        )?;
         let history = stmt
             .query_map([], |r| {
                 Ok(DryRunHistory { id: r.get(0)?, ts: r.get(1)?, mac: r.get(2)?, cfgversion: r.get(3)?, matches: r.get(4)?, comparison: raw_json(r.get(5)?) })
@@ -1435,11 +1439,16 @@ mod tests {
         let mut engine = crate::engine::Engine::new(s.writer.clone(), Default::default(), s.live.clone(), tx);
         engine.handle(report(json!({ "mac": "02:00:00:00:00:01", "hostname": "Hall", "uptime": 100 })));
         s.writer.exec(Db::Config, "INSERT INTO device_config (mac, ts, mgmt_cfg, system_cfg) VALUES ('02:00:00:00:00:01', 1, 'a=1', 'b=2')", vec![]);
-        s.writer.exec(Db::Config, "INSERT INTO dryrun_results (ts, mac, matches, comparison) VALUES (7, '02:00:00:00:00:01', 1, '{}')", vec![]);
+        let stored = r#"{"mgmt_cfg":{"added":0,"diff":"- a=1"},"system_cfg":{"added":1,"removed":0,"changed":0,"identical":false,"diff":"+ c=3"}}"#;
+        s.writer.exec(Db::Config, "INSERT INTO dryrun_results (ts, mac, matches, comparison) VALUES (7, '02:00:00:00:00:01', 0, ?1)", vec![Sql::Text(stored.into())]);
+        s.writer.exec(Db::Config, "INSERT INTO dryrun_results (ts, mac, matches, comparison) VALUES (6, '02:00:00:00:00:01', 0, 'not json')", vec![]);
         flushed(&s.writer);
         let app = router(s);
         let d = get_json(&app, "/api/dryrun").await;
         assert_eq!((d["devices"][0]["status"].as_str(), d["history"][0]["ts"].as_i64(), d["history"][0]["id"].as_i64()), (Some("no_settings"), Some(7), Some(1)));
+        // The history's comparisons come without the diffs' text.
+        assert_eq!(d["history"][0]["comparison"], json!({ "mgmt_cfg": { "added": 0 }, "system_cfg": { "added": 1, "removed": 0, "changed": 0, "identical": false } }));
+        assert_eq!(d["history"][1]["comparison"], Value::Null);
         assert_eq!(d["devices"][0], json!({ "mac": "02:00:00:00:00:01", "name": "Hall", "status": "no_settings", "settings_stale": false }));
     }
 
