@@ -264,15 +264,16 @@ fn save_name(ts: Micros, seq: u64, mac: Mac, kind: &str) -> String {
 }
 
 /// Masks secret fields, including secret lines inside `*_cfg` blobs. Under a secret
-/// key every string is masked, however deeply it is nested (`x_ssh_keys: [{...}]`).
+/// key every string is masked, however deeply it is nested (`x_ssh_keys: [{...}]`), a
+/// whole `*_cfg` blob too.
 fn redact_json(v: &Value) -> Value {
     match v {
         Value::Object(m) => Value::Object(
             m.iter()
                 .map(|(k, v)| {
                     let v = match v {
-                        Value::String(s) if k.ends_with("_cfg") => Value::String(cfgdiff::redact(s)),
                         secret if cfgdiff::is_secret(k) => redact_all(secret),
+                        Value::String(s) if k.ends_with("_cfg") => Value::String(cfgdiff::redact(s)),
                         other => redact_json(other),
                     };
                     (k.clone(), v)
@@ -345,6 +346,8 @@ mod tests {
         assert_eq!(out["psk"], json!(["<redacted>", "<redacted>"]));
         assert_eq!(out["radio_table"], json!([{ "name": "wifi0", "x_secret": { "inner": "<redacted>" } }]));
         assert!(!out.to_string().contains("hunter22") && out["system_cfg"].as_str().unwrap().contains("radio.1.channel=36"));
+        let out = redact_json(&json!({ "x_backup_cfg": "radio.1.channel=36", "x_secret": { "mgmt_cfg": "radio.1.channel=36" } }));
+        assert_eq!(out, json!({ "x_backup_cfg": "<redacted>", "x_secret": { "mgmt_cfg": "<redacted>" } }), "a secret config is masked whole");
     }
 
     #[test]
