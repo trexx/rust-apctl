@@ -16,6 +16,7 @@
 //! children before the APs they hang off, and stops the queue on a failure.
 
 use std::collections::{HashMap, VecDeque};
+use std::fmt::Write as _;
 use std::time::Duration;
 
 use axum::extract::State;
@@ -64,10 +65,10 @@ pub fn parse_feed(feed: &Value) -> Vec<Release> {
             let pre = s(&f["version_prerelease"]);
             let mut version = format!("{maj}.{min}.{pat}");
             if let Some(p) = pre {
-                version.push_str(&format!("-{p}"));
+                let _ = write!(version, "-{p}");
             }
             if let Some(b) = build {
-                version.push_str(&format!(".{b}"));
+                let _ = write!(version, ".{b}");
             }
             Some(Release { platform: s(&f["platform"])?, version, url, md5: s(&f["md5"]), sha256: s(&f["sha256"]), size: f["file_size"].as_i64(), created: s(&f["created"]) })
         });
@@ -537,7 +538,7 @@ pub async fn upgrade(State(s): State<AppState>, Json(b): Json<UpgradeBody>) -> R
     }
     let mut chosen: Vec<ApInfo> = known.into_iter().filter(|a| wanted.contains(&a.mac)).collect();
     // Mesh APs first: an AP with mesh children must not restart before them.
-    chosen.sort_by(|x, y| y.mesh.cmp(&x.mesh).then(x.mac.cmp(&y.mac)));
+    chosen.sort_by_key(|a| (!a.mesh, a.mac));
     let mut jobs = Vec::new();
     for a in chosen {
         let (_, rel) = release_for(&rels, a.model.as_deref());
