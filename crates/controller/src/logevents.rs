@@ -233,7 +233,7 @@ impl LogEvents {
             let mut parts = rest.split_whitespace();
             let client = parts.next().and_then(mac);
             let vap = parts.next().map(str::to_string);
-            let reason = rest.split("reason:").nth(1).map(|r| r.split(" rssi:").next().unwrap_or(r).trim_end_matches(')').trim().to_string());
+            let reason = rest.split("reason:").nth(1).map(|r| r.split_once(" rssi:").map_or(r, |(r, _)| r).trim_end_matches(')').trim().to_string());
             let signal = field(rest, "rssi:").and_then(|v| v.parse::<i64>().ok()).map(|r| r + NOISE_FLOOR);
             if let Some(c) = client
                 && self.fresh(EventKind::ClientKicked, c, 0, line.ts, 60)
@@ -309,12 +309,13 @@ impl LogEvents {
         if prog == "mcad" && msg.contains("log_sta_anomalies") {
             let client = field(msg, "sta=").and_then(mac);
             // A comma-separated list: read up to the next space.
-            let reasons = msg.split("anomalies=").nth(1).and_then(|r| r.split_whitespace().next()).unwrap_or("").to_string();
+            let reasons = msg.split("anomalies=").nth(1).and_then(|r| r.split_whitespace().next()).unwrap_or("");
             if let Some(c) = client
                 && !reasons.is_empty()
             {
-                let changed = self.anomalies.get(&c).is_none_or(|(r, t)| *r != reasons || !(0..ANOMALIES_AGAIN).contains(&(line.ts - t)));
-                if changed && bounded(&mut self.anomalies, c, (reasons.clone(), line.ts)) {
+                // Copied only when reported: the same reasons come every 10 s or so.
+                let changed = self.anomalies.get(&c).is_none_or(|(r, t)| r != reasons || !(0..ANOMALIES_AGAIN).contains(&(line.ts - t)));
+                if changed && bounded(&mut self.anomalies, c, (reasons.to_string(), line.ts)) {
                     out.push(Event {
                         ts: line.ts,
                         kind: EventKind::ClientExperience,
