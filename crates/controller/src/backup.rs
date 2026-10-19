@@ -414,7 +414,7 @@ fn trim_config(dir: &Path, cutoff: Option<Ts>) -> Result<()> {
 
 /// Drops the history older than `t` from metrics.db and logs.db.
 fn trim_history(dir: &Path, t: Ts) -> Result<()> {
-    // Every metric table in every tier, and the logs (whose full-text index follows by trigger).
+    // Every metric table in every tier, and the logs (and their full-text index).
     let metrics: Vec<String> = store::TABLES.iter().flat_map(|t| store::TIERS.iter().map(move |(suffix, ..)| format!("{}{suffix}", t.name))).collect();
     for (name, tables) in [("metrics.db", metrics), ("logs.db", vec!["logs".to_string()])] {
         let p = dir.join(name);
@@ -431,7 +431,9 @@ fn trim_history(dir: &Path, t: Ts) -> Result<()> {
         for table in tables {
             // A database from an older version may lack the newest tables.
             let exists: bool = tx.query_row("SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1", [&table], |r| r.get::<_, i64>(0))? > 0;
-            if exists {
+            if exists && table == "logs" {
+                trim_logs(&tx, t)?;
+            } else if exists {
                 tx.execute(&format!("DELETE FROM \"{table}\" WHERE ts < ?1"), [t])?;
             }
         }
@@ -439,6 +441,30 @@ fn trim_history(dir: &Path, t: Ts) -> Result<()> {
         let pages = |pragma: &str| c.query_row(&format!("PRAGMA {pragma}"), [], |r| r.get::<_, i64>(0));
         if pages("freelist_count")? * 4 > pages("page_count")? {
             c.execute_batch("VACUUM;")?;
+        }
+    }
+    Ok(())
+}
+
+/// Drops the logs older than `t`. Their full-text index is built again from
+/// the rows kept, rather than told of each row deleted by its trigger: that
+/// would keep the deleted rows' entries in the copy, with a delete marker for
+/// each, until segments are merged.
+fn trim_logs(tx: &rusqlite::Transaction, t: Ts) -> Result<()> {
+    if !tx.query_row("SELECT EXISTS (SELECT 1 FROM logs WHERE ts < ?1)", [t], |r| r.get::<_, bool>(0))? {
+        return Ok(());
+    }
+    match tx.query_row("SELECT sql FROM sqlite_master WHERE type = 'trigger' AND name = 'logs_ad'", [], |r| r.get::<_, String>(0)).optional()? {
+        // The trigger goes back as it was, so the restored database keeps its index up to date.
+        Some(trigger) => {
+            tx.execute_batch("DROP TRIGGER logs_ad;")?;
+            tx.execute("DELETE FROM logs WHERE ts < ?1", [t])?;
+            tx.execute_batch(&trigger)?;
+            tx.execute_batch("INSERT INTO logs_fts (logs_fts) VALUES ('rebuild');")?;
+        }
+        // A database without the index.
+        None => {
+            tx.execute("DELETE FROM logs WHERE ts < ?1", [t])?;
         }
     }
     Ok(())
@@ -1337,6 +1363,34 @@ mod tests {
         unpack(&b.dir().join(create(&b, &src, Kind::Manual, 7).unwrap().name), None, &out).unwrap();
         assert_eq!(count(&out.join("metrics.db"), "SELECT COUNT(*) FROM ap_stats"), 1);
         assert_eq!(count(&out.join("metrics.db"), "PRAGMA freelist_count"), 0);
+    }
+
+    #[test]
+    fn logs_dropped_from_a_backup_leave_nothing_in_its_index() {
+        let src = data("trim-logs");
+        let now = clock::now_ts();
+        let logs = Connection::open(src.join("logs.db")).unwrap();
+        logs.execute_batch(&format!(
+            "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 5000)
+             INSERT INTO logs (ts, program, msg) SELECT {old}, 'hostapd', 'stalewords ' || i || ' wifi1ap0 STA associated' FROM n;
+             INSERT INTO logs (ts, program, msg) VALUES ({now}, 'mcad', 'freshword one'), ({now}, 'mcad', 'freshword two');",
+            old = now - 40 * 86400
+        ))
+        .unwrap();
+        let b = Backups::new(src.to_path_buf(), None);
+        let out = dir("trim-logs-out");
+        unpack(&b.dir().join(create(&b, &src, Kind::Manual, 7).unwrap().name), None, &out).unwrap();
+        let p = out.join("logs.db");
+        let found = |word: &str| count(&p, &format!("SELECT COUNT(*) FROM logs_fts WHERE logs_fts MATCH '{word}'"));
+        assert_eq!((count(&p, "SELECT COUNT(*) FROM logs"), found("freshword"), found("stalewords")), (2, 2, 0));
+        // Nothing of the dropped rows is left in the file, not even in the index.
+        assert!(!fs::read(&p).unwrap().windows(10).any(|w| w == b"stalewords"));
+        assert_eq!(count(&p, "PRAGMA freelist_count"), 0);
+        // The restored index is whole, and kept up to date as before.
+        let c = Connection::open(&p).unwrap();
+        c.execute_batch("INSERT INTO logs_fts (logs_fts) VALUES ('integrity-check'); DELETE FROM logs WHERE msg = 'freshword one'; INSERT INTO logs (ts, msg) VALUES (1, 'newer');").unwrap();
+        assert_eq!((found("freshword"), found("newer")), (1, 1));
+        c.execute_batch("INSERT INTO logs_fts (logs_fts) VALUES ('integrity-check');").unwrap();
     }
 
     #[test]
