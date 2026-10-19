@@ -425,6 +425,14 @@ impl Writer {
     }
 }
 
+/// The read-only connections kept per database once a read is done. The
+/// Overview and Radios pages ask for some 8 things at once, nearly all from
+/// metrics.db; a read beyond the kept ones opens a connection (the pragmas,
+/// the schema parsed, no prepared statements) and closes it after. A pool only
+/// grows to the reads seen at once, each connection with up to SQLite's
+/// default page cache (2 MB): some 16 MB per database at most.
+const READ_POOL: usize = 8;
+
 pub struct Store {
     dir: PathBuf,
     pools: [Mutex<Vec<Connection>>; 3],
@@ -468,7 +476,7 @@ impl Store {
         };
         let result = f(&conn);
         let mut pool = self.pools[idx].lock().unwrap();
-        if pool.len() < 4 {
+        if pool.len() < READ_POOL {
             pool.push(conn);
         }
         result
