@@ -501,11 +501,13 @@ const EVENTS: { [K in EventKind]: EventSpec<K> } = {
     label: "Updating",
     tone: "neutral",
     describe: (d) =>
-      d.step === "downloading"
-        ? "downloading the firmware"
-        : d.step === "writing"
-          ? "checked; writing it to flash"
-          : String(d.step ?? ""),
+      d.step === "preparing"
+        ? "preparing to download the firmware"
+        : d.step === "downloading"
+          ? "downloading the firmware"
+          : d.step === "writing"
+            ? "checked; writing it to flash"
+            : String(d.step ?? ""),
   },
   ap_upgrade_failed: {
     label: "Update failed",

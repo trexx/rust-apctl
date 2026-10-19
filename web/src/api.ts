@@ -285,7 +285,7 @@ export interface EventPayloads {
   client_kicked: { reason?: string | null; signal?: number | null; vap?: string | null };
   ap_upgrade_sent: { target?: string | null };
   ap_upgrade_started: { by?: string | null };
-  ap_upgrade_progress: { step?: string | null };
+  ap_upgrade_progress: { step?: "preparing" | "downloading" | "writing" | null };
   ap_upgrade_failed: { detail?: string | null; reason?: string | null };
   ap_upgraded: { from?: string | null; to?: string | null; custom?: boolean };
   client_wrong_password: { vap?: string | null };
@@ -944,7 +944,8 @@ export interface FirmwareJob {
   from: string | null;
   target: string;
   custom: boolean;
-  state: "queued" | "sent" | "downloading" | "writing";
+  /** Queued, sent with an inform reply, then the AP's own steps. */
+  state: "queued" | "sent" | "preparing" | "downloading" | "writing";
   sent_at: number | null;
   expires: number | null;
 }
