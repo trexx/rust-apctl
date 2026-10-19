@@ -271,13 +271,18 @@ pub async fn wlans(State(s): State<AppState>) -> Result<Json<Value>, ApiError> {
         });
         (live.state.clone(), informs)
     };
-    let Some(state) = state else { return Ok(Json(json!({ "active": s.active, "wlans": [], "networks": [] }))) };
-    let list: Vec<Value> = docs(&state, "wlanconf")
+    Ok(Json(wlans_view(state.as_deref().unwrap_or(&Value::Null), &informs, s.active)))
+}
+
+/// The SSIDs as the editor shows them, with what it offers for them. Without
+/// settings (nothing imported yet) every list is empty.
+fn wlans_view(state: &Value, informs: &HashMap<inform::Mac, Arc<Value>>, active: bool) -> Value {
+    let list: Vec<Value> = docs(state, "wlanconf")
         // The hidden "element" SSID belongs to the official controller's own adoption feature.
         .filter(|w| w["attr_hidden_id"].as_str().is_none())
         .map(|w| {
             let mut v = json!({
-                "id": id_of(w), "aps": wlan_aps(&state, w), "protection": protection_of(w), "editable": w["attr_no_edit"].as_bool() != Some(true),
+                "id": id_of(w), "aps": wlan_aps(state, w), "protection": protection_of(w), "editable": w["attr_no_edit"].as_bool() != Some(true),
                 "has_passphrase": w["x_passphrase"].as_str().is_some_and(|p| !p.is_empty()),
             });
             if let Value::Object(o) = &mut v {
@@ -286,11 +291,11 @@ pub async fn wlans(State(s): State<AppState>) -> Result<Json<Value>, ApiError> {
             v
         })
         .collect();
-    let networks: Vec<Value> = docs(&state, "networkconf").map(|n| json!({ "id": id_of(n), "name": n["name"], "vlan": n["vlan"], "purpose": n["purpose"] })).collect();
-    let aps: Vec<Value> = docs(&state, "devices").map(|d| json!({ "mac": doc_mac(&d["mac"]), "name": d["name"] })).collect();
-    let (unsupported, unknown) = feature_support(&state, &informs);
+    let networks: Vec<Value> = docs(state, "networkconf").map(|n| json!({ "id": id_of(n), "name": n["name"], "vlan": n["vlan"], "purpose": n["purpose"] })).collect();
+    let aps: Vec<Value> = docs(state, "devices").map(|d| json!({ "mac": doc_mac(&d["mac"]), "name": d["name"] })).collect();
+    let (unsupported, unknown) = feature_support(state, informs);
     let mdns: Vec<Value> = apcfg::MDNS_SERVICES.iter().map(|(code, name, _)| json!({ "code": code, "name": name })).collect();
-    Ok(Json(json!({ "active": s.active, "wlans": list, "networks": networks, "aps": aps, "unsupported": unsupported, "unknown": unknown, "mdns_services": mdns })))
+    json!({ "active": active, "wlans": list, "networks": networks, "aps": aps, "unsupported": unsupported, "unknown": unknown, "mdns_services": mdns })
 }
 
 /// For each optional SSID feature, the APs that would broadcast the SSID
@@ -2206,6 +2211,15 @@ mod tests {
         assert_eq!(device_macs(&s), [AP1, AP2].map(|m| m.parse::<inform::Mac>().unwrap()));
         assert!(crate::adopt::device_doc(&s, &AP2.parse().unwrap()).is_some());
         edit(&mut s, json!({ "aps": [AP2] })).unwrap();
+    }
+
+    #[test]
+    fn the_ssid_list_has_its_full_shape_before_anything_is_imported() {
+        let v = wlans_view(&Value::Null, &HashMap::new(), true);
+        assert_eq!((&v["wlans"], &v["aps"], &v["unknown"]), (&json!([]), &json!([]), &json!([])));
+        assert!(v["unsupported"].is_object() && !v["mdns_services"].as_array().unwrap().is_empty());
+        let v = wlans_view(&state(), &HashMap::new(), true);
+        assert_eq!((v["aps"].as_array().unwrap().len(), &v["unknown"][0]), (2, &json!(AP1)), "no inform yet: support unknown");
     }
 
     #[test]
