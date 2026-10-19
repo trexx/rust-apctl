@@ -355,10 +355,9 @@ impl Drain {
     /// Stops the engine taking inputs (it still handles the queued ones).
     fn start(&self) {
         self.closing.store(true, Ordering::Relaxed);
-        // An idle engine is woken to see the flag by an input that changes
-        // nothing (an empty alias import). A full queue needs none: the
-        // engine looks at the flag after the input it is on.
-        let _ = self.queue.try_send(Input::SetAliases { ts: clock::now_ts(), entries: Vec::new(), only_if_unset: true });
+        // An idle engine is woken to see the flag. A full queue needs no
+        // wake: the engine looks at the flag after the input it is on.
+        let _ = self.queue.try_send(Input::Wake);
     }
 
     /// Waits for the queue to be handled, at most `DRAIN_TIMEOUT`.

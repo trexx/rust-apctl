@@ -62,6 +62,8 @@ pub enum Input {
     /// Change the firmware upgrade queue; `done` gets how many upgrades were
     /// queued or cancelled.
     Firmware { op: crate::firmware::Op, done: tokio::sync::oneshot::Sender<usize> },
+    /// Nothing to do: wakes an idle engine at exit, to see that it is closing.
+    Wake,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -622,6 +624,7 @@ impl Engine {
                 let n = op.apply(&mut self.live.write().unwrap().firmware);
                 let _ = done.send(n);
             }
+            Input::Wake => {}
         }
     }
 
