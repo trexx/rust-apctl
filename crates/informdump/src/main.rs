@@ -255,7 +255,7 @@ fn main() -> Result<()> {
             }
             let d = wire::decode::decode(&body, &store, None)?;
             eprintln!("{:#?}\nkey used: {:?}", d.header, d.key);
-            println!("{}", serde_json::to_string_pretty(&d.payload)?);
+            println!("{}", report::escape_controls(&serde_json::to_string_pretty(&d.payload)?, true));
             Ok(())
         }
         Cmd::Pcap { file, common, all } => run_capture(&file, common, all),
