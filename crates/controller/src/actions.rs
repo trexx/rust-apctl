@@ -136,11 +136,10 @@ impl<'a> ClientControls<'a> {
     }
 }
 
-/// The AP a device action is for: active mode, and an AP apctl has heard from.
-fn target_ap(s: &AppState, mac: Mac) -> Result<Mac, ApiError> {
+/// Whether a device action can be done: active mode, and an AP apctl has heard from.
+fn target_ap(s: &AppState, mac: &Mac) -> Result<(), ApiError> {
     crate::api::require_active(s, "this needs")?;
-    known_ap(s, &mac)?;
-    Ok(mac)
+    known_ap(s, mac)
 }
 
 fn known_ap(s: &AppState, mac: &Mac) -> Result<(), ApiError> {
@@ -163,7 +162,7 @@ fn offline() -> ApiError {
 
 /// POST /api/devices/{mac}/restart
 pub async fn restart(State(s): State<AppState>, MacPath(mac): MacPath) -> Result<Json<Value>, ApiError> {
-    let mac = target_ap(&s, mac)?;
+    target_ap(&s, &mac)?;
     {
         let mut live = s.live.write().unwrap();
         if !is_online(&live, &mac) {
@@ -182,7 +181,7 @@ pub struct LocateBody {
 
 /// POST /api/devices/{mac}/locate {on}
 pub async fn locate(State(s): State<AppState>, MacPath(mac): MacPath, Json(b): Json<LocateBody>) -> Result<Json<Value>, ApiError> {
-    let mac = target_ap(&s, mac)?;
+    target_ap(&s, &mac)?;
     let mut live = s.live.write().unwrap();
     // Turning it off can wait for an AP that is away: it is harmless when it comes.
     if b.on && !is_online(&live, &mac) {
@@ -199,7 +198,7 @@ pub async fn locate(State(s): State<AppState>, MacPath(mac): MacPath, Json(b): J
 
 /// POST /api/devices/{mac}/provision: send the AP its config again.
 pub async fn provision(State(s): State<AppState>, MacPath(mac): MacPath) -> Result<Json<Value>, ApiError> {
-    let mac = target_ap(&s, mac)?;
+    target_ap(&s, &mac)?;
     {
         let mut live = s.live.write().unwrap();
         live.reprovision.insert(mac);
