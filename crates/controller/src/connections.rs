@@ -577,12 +577,11 @@ fn query_rows(c: &rusqlite::Connection, from: Ts, to: Ts, client: Option<&str>, 
 /// Only the reports [`attempts`] reads ([`ATTEMPT_TYPES`]).
 const ATTEMPTS_ONLY: &str = "AND event_type IN ('failure', 'soft failure', 'success', 'fixup')";
 
-/// The notifications in a window (optionally one client's, and with
-/// `attempts_only` only the reports [`attempts`] reads), oldest first; or with
-/// `newest`, at most that many, newest first.
-pub fn load_rows(c: &rusqlite::Connection, from: Ts, to: Ts, client: Option<&str>, newest: Option<usize>, attempts_only: bool) -> rusqlite::Result<Vec<ConnEvent>> {
-    // The other reports (associations, leaves) are then not parsed for nothing.
-    query_rows(c, from, to, client, if attempts_only { ATTEMPTS_ONLY } else { "" }, newest)
+/// The reports [`attempts`] reads in a window (optionally one client's),
+/// oldest first; or with `newest`, at most that many, newest first.
+pub fn load_rows(c: &rusqlite::Connection, from: Ts, to: Ts, client: Option<&str>, newest: Option<usize>) -> rusqlite::Result<Vec<ConnEvent>> {
+    // The other reports (associations, leaves) are not parsed for nothing.
+    query_rows(c, from, to, client, ATTEMPTS_ONLY, newest)
 }
 
 /// Only a client's reports from 10 s before to 15 s after one of its leaves ([`LEAVE_TYPES`]).
@@ -608,7 +607,7 @@ fn roam_rows(c: &rusqlite::Connection, from: Ts, to: Ts, client: Option<&str>) -
 fn newest(c: &rusqlite::Connection, from: Ts, to: Ts, client: Option<&str>, limit: usize, failed: bool, with_roams: bool) -> rusqlite::Result<(Vec<Attempt>, Vec<Roam>)> {
     let mut batch = (limit * 4).max(2000);
     let list = loop {
-        let mut events = load_rows(c, from, to, client, Some(batch), true)?;
+        let mut events = load_rows(c, from, to, client, Some(batch))?;
         let all = events.len() < batch;
         // The oldest time read may have more rows than were read.
         let oldest = events.last().map_or(from, |e| e.ts);
@@ -691,7 +690,7 @@ pub async fn connectivity(State(s): State<AppState>, Query(q): Query<RangeQuery>
     let (from, to, tier) = window(&q);
     // Every report in the window is read and parsed: the result is reused for a while.
     let got = memo_read(&s, Db::Config, "connectivity", &q, tier, move |c| {
-        let list = attempts(load_rows(c, from, to, None, None, true)?);
+        let list = attempts(load_rows(c, from, to, None, None)?);
         let mut bands = serde_json::Map::new();
         // All bands, and each band with attempts.
         for b in [None, Some("ng"), Some("na"), Some("6e")] {
@@ -1028,7 +1027,7 @@ mod tests {
         ];
         for (client, failed, limit, with_roams) in cases {
             let (list, r) = t.store.read(Db::Config, |c| Ok(newest(c, from, to, client, limit, failed, with_roams)?)).unwrap();
-            let all = t.store.read(Db::Config, |c| Ok(load_rows(c, from, to, client, None, false)?)).unwrap();
+            let all = t.store.read(Db::Config, |c| Ok(query_rows(c, from, to, client, "", None)?)).unwrap();
             let mut want_r = if with_roams { roams(&all) } else { Vec::new() };
             want_r.reverse();
             want_r.truncate(limit);
@@ -1067,7 +1066,7 @@ mod tests {
         let (from, to) = (1_000_000, 1_000_000 + 86400);
         for client in [Some(me), None] {
             let (list, r) = t.store.read(Db::Config, |c| Ok(newest(c, from, to, client, 100, false, true)?)).unwrap();
-            let all = t.store.read(Db::Config, |c| Ok(load_rows(c, from, to, client, None, false)?)).unwrap();
+            let all = t.store.read(Db::Config, |c| Ok(query_rows(c, from, to, client, "", None)?)).unwrap();
             let mut want = roams(&all);
             want.reverse();
             assert_eq!(json!(r), json!(want), "{client:?}");
