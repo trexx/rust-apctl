@@ -40,6 +40,7 @@ enum Cmd {
         /// Hex authkey to use (otherwise --keys, then the default key, are tried).
         #[arg(long)]
         key: Option<String>,
+        /// JSON file with device authkeys (a MAC->key map or an import snapshot).
         #[arg(long)]
         keys: Option<String>,
     },
@@ -48,9 +49,6 @@ enum Cmd {
         file: String,
         #[command(flatten)]
         common: Common,
-        /// Show every inform and every noop reply, not just changes.
-        #[arg(long)]
-        all: bool,
     },
     /// Snapshot sites, WLANs and device authkeys from a controller's MongoDB (read-only).
     ///
@@ -126,9 +124,6 @@ enum Cmd {
     Watch {
         #[command(flatten)]
         common: Common,
-        /// Show every inform and every noop reply, not just changes.
-        #[arg(long)]
-        all: bool,
     },
 }
 
@@ -140,6 +135,9 @@ struct Common {
     /// Server ports carrying inform traffic.
     #[arg(long = "port", default_value = "8080")]
     ports: Vec<u16>,
+    /// Show every inform and every noop reply, not just changes.
+    #[arg(long)]
+    all: bool,
     /// Print the full decoded JSON of every shown message.
     #[arg(long)]
     full: bool,
@@ -182,11 +180,11 @@ fn load_keys(path: Option<&str>) -> Result<KeyStore> {
     }
 }
 
-fn run_capture(input: &str, common: Common, all: bool) -> Result<()> {
+fn run_capture(input: &str, common: Common) -> Result<()> {
     let keys = load_keys(common.keys.as_deref())?;
     let mut reporter = Reporter::new(
         keys,
-        Options { all, full: common.full, json: common.json, save: common.save, redact: !common.no_redact },
+        Options { all: common.all, full: common.full, json: common.json, save: common.save, redact: !common.no_redact },
     );
     let end = capture::run(capture::open_input(input)?, &common.ports, |ev| {
         reporter.handle(ev);
@@ -272,8 +270,8 @@ fn main() -> Result<()> {
             println!("{}", report::escape_controls(&serde_json::to_string_pretty(&d.payload)?, true));
             Ok(())
         }
-        Cmd::Pcap { file, common, all } => run_capture(&file, common, all),
-        Cmd::Watch { common, all } => run_capture("-", common, all),
+        Cmd::Pcap { file, common } => run_capture(&file, common),
+        Cmd::Watch { common } => run_capture("-", common),
         Cmd::Demo { hours, live } => demo::run(hours, live, std::io::BufWriter::new(std::io::stdout().lock())),
         Cmd::DemoState => {
             println!("{}", serde_json::to_string_pretty(&demo::state()?)?);
