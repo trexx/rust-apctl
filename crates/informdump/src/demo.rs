@@ -673,16 +673,21 @@ fn neighbour(bssid: &str, essid: &str, band: &str, channel: i64, bw: i64, signal
 struct PcapWriter<W: Write> {
     out: W,
     seq: Vec<(u32, u32)>,
+    /// The time of the last record written, in microseconds.
+    last: i64,
 }
 
 impl<W: Write> PcapWriter<W> {
     fn new(mut out: W) -> Result<Self> {
         synth::write_pcap_header(&mut out, 262_144)?;
-        Ok(PcapWriter { out, seq: vec![(1, 1); APS.len()] })
+        Ok(PcapWriter { out, seq: vec![(1, 1); APS.len()], last: i64::MIN })
     }
 
+    /// Records never go back in time: one due before the last one written (a message
+    /// due in the same second as the reply before it) is written at that one's time.
     fn record(&mut self, ts_ms: i64, frame: &[u8]) -> Result<()> {
-        Ok(synth::write_pcap_record(&mut self.out, ts_ms * 1000, frame)?)
+        self.last = self.last.max(ts_ms * 1000);
+        Ok(synth::write_pcap_record(&mut self.out, self.last, frame)?)
     }
 
     fn tcp(&mut self, ts_ms: i64, ap: usize, ids: &ApIds, to_server: bool, data: &[u8]) -> Result<()> {
@@ -732,6 +737,9 @@ fn stream(now: i64, hours: f64, live: bool, out: impl Write) -> Result<()> {
     let mut pcap = PcapWriter::new(out)?;
     let mut t = start;
     let mut last = vec![start; APS.len()];
+    // No message is due before the previous batch's last: client events happen up to
+    // 40 seconds before their batch, and near real time batches are 10 seconds apart.
+    let mut floor = start;
     loop {
         let wall = now + started.elapsed().as_secs() as i64;
         if t > wall {
@@ -758,9 +766,16 @@ fn stream(now: i64, hours: f64, live: bool, out: impl Write) -> Result<()> {
             let p = sim.inform(i, at, dt);
             batch.push((at, i, p));
         }
+        for b in &mut batch {
+            b.0 = b.0.max(floor);
+        }
         batch.sort_by_key(|b| b.0);
         let mut logs = std::mem::take(&mut sim.syslog);
+        for l in &mut logs {
+            l.0 = l.0.max(floor);
+        }
         logs.sort_by_key(|l| l.0);
+        floor = floor.max(batch.last().map_or(floor, |b| b.0 + 1)).max(logs.last().map_or(floor, |l| l.0 + 1));
         let mut logs = logs.into_iter().peekable();
         for (at, i, payload) in batch {
             while let Some((lt, li, line)) = logs.next_if(|l| l.0 <= at) {
@@ -812,24 +827,44 @@ mod tests {
     }
 
     #[test]
+    fn the_capture_never_goes_back_in_time() {
+        // Sam's phone moves at 18:24 UTC: in the last five minutes of this history, where
+        // the APs report every 10 seconds.
+        for now in [1_791_830_666 - 18 * 60, 1_791_830_666] {
+            let mut buf = Vec::new();
+            stream(now, 0.5, false, &mut buf).unwrap();
+            let (mut at, mut last, mut records) = (24, 0, 0);
+            while at + 16 <= buf.len() {
+                let word = |i: usize| u64::from(u32::from_le_bytes(buf[at + i..at + i + 4].try_into().unwrap()));
+                let ts = word(0) * 1_000_000 + word(4);
+                assert!(ts >= last, "record {records} at {ts} µs, after one at {last} µs");
+                (last, at, records) = (ts, at + 16 + word(8) as usize, records + 1);
+            }
+            assert_eq!(at, buf.len());
+        }
+    }
+
+    #[test]
     fn capture_decodes_with_the_state_keys() {
         use aes_gcm::aead::{Aead, KeyInit, Payload};
         let keys = wire::keys::KeyStore::from_value(&state().unwrap());
         let syslog_keys: std::collections::HashMap<Mac, [u8; 32]> = keys.syslog_keys().map(|(m, k)| (*m, *k)).collect();
         let mut buf = Vec::new();
-        stream(1_791_830_666, 0.5, false, &mut buf).unwrap();
+        // Near real time (the last five minutes) client events are clamped to after the
+        // batch before theirs: a syslog line still says when it was sent.
+        stream(1_791_830_666 - 18 * 60, 0.5, false, &mut buf).unwrap();
         let mut pairer = wire::exchange::Pairer::default();
         let mut informs = 0;
         let mut syslog = 0;
         let end = wire::capture::run_with_udp(&buf[..], &[8080], &[5514], |ev| {
-            if let wire::capture::HttpEvent::Datagram { src, payload, .. } = &ev {
+            if let wire::capture::HttpEvent::Datagram { ts, src, payload, .. } = &ev {
                 // Opened with the key the settings hold for the AP that sent it.
                 let ap = APS.iter().find(|a| src.ip().to_string() == ip(a.ip)).expect("from an AP");
                 let key = syslog_keys[&Mac(mac_bytes(ap.mac))];
                 let (header, sealed) = payload.split_at(wire::synth::SYSLOG_HEADER);
                 let plain = aes_gcm::Aes256Gcm::new(&key.into()).decrypt(&aes_gcm::Nonce::try_from(&header[17..29]).unwrap(), Payload { msg: sealed, aad: header }).expect("decrypts");
                 let text = String::from_utf8(plain).unwrap();
-                assert!(text.starts_with("<14>") && text.contains(&ap.name.replace(' ', "-")), "{text}");
+                assert!(text.starts_with(&format!("<14>{} {} ", chrono_like(ts / 1_000_000), ap.name.replace(' ', "-"))), "{text}");
                 syslog += 1;
             } else if let Some(wire::exchange::InformEvent::Inform { decoded, .. }) = pairer.handle(&keys, ev) {
                 decoded.unwrap();
