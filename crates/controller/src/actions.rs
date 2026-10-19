@@ -37,6 +37,10 @@ pub fn queue(live: &mut Live, mac: Mac, cmd: Value) {
     if let Some(undo) = opposite(&cmd) {
         q.retain(|c| *c != undo);
     }
+    // A client's newer speed limit replaces one still waiting.
+    if cmd["cmd"] == "rate-update" {
+        q.retain(|c| c["cmd"] != "rate-update" || c["mac"] != cmd["mac"]);
+    }
     if !q.contains(&cmd) {
         q.push_back(cmd);
     }
@@ -338,6 +342,18 @@ mod tests {
         }
         let cmds: Vec<String> = std::iter::from_fn(|| next(&mut live, &ap)).map(|c| format!("{} {}", c["cmd"].as_str().unwrap(), c["mac"].as_str().unwrap_or(""))).collect();
         assert_eq!(cmds, ["block-sta aa:bb:cc:00:00:02", "kick-sta aa:bb:cc:00:00:03", "unset-locate ", "unblock-sta aa:bb:cc:00:00:01"]);
+    }
+
+    #[test]
+    fn a_newer_speed_limit_replaces_one_still_waiting() {
+        let mut live = Live::default();
+        let ap: Mac = "02:00:00:00:00:01".parse().unwrap();
+        let limit = |client: &str, down: i64| json!({ "_type": "cmd", "cmd": "rate-update", "mac": client, "dl_max": down, "dl_min": 64, "ul_max": -1, "ul_min": 64 });
+        queue(&mut live, ap, limit("aa:bb:cc:00:00:01", 2000));
+        queue(&mut live, ap, limit("aa:bb:cc:00:00:02", 1000));
+        queue(&mut live, ap, limit("aa:bb:cc:00:00:01", -1));
+        let cmds: Vec<(String, i64)> = std::iter::from_fn(|| next(&mut live, &ap)).map(|c| (c["mac"].as_str().unwrap().to_string(), c["dl_max"].as_i64().unwrap())).collect();
+        assert_eq!(cmds, [("aa:bb:cc:00:00:02".to_string(), 1000), ("aa:bb:cc:00:00:01".to_string(), -1)], "one command per client, the latest");
     }
 
     #[test]
