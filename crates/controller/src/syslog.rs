@@ -124,9 +124,11 @@ fn value(s: &str) -> (usize, Option<char>) {
 const HEADER: usize = wire::synth::SYSLOG_HEADER;
 
 /// The sender's `hash_id` of an encrypted datagram, as a number (shown as 16
-/// hex characters, as the AP's informs carry it: see [`parse_hash_id`]).
+/// hex characters, as the AP's informs carry it: see [`parse_hash_id`]). Only
+/// of one long enough to decrypt: a shorter one names no sender, so a made-up
+/// one cannot have an AP's syslog taken for an unknown sender's.
 pub fn hash_id(datagram: &[u8]) -> Option<u64> {
-    (datagram.starts_with(&MAGIC) && datagram.len() >= 17).then(|| u64::from_be_bytes(datagram[9..17].try_into().expect("8 bytes")))
+    (datagram.starts_with(&MAGIC) && datagram.len() >= HEADER + 16).then(|| u64::from_be_bytes(datagram[9..17].try_into().expect("8 bytes")))
 }
 
 /// A `hash_id` as an AP's informs carry it, as [`hash_id`] reads it from the
@@ -252,6 +254,9 @@ pub(crate) mod tests {
         assert!(decrypt_with(&dgram, mac, &Aes256Gcm::new(&[8u8; 32].into())).is_err(), "wrong key");
         assert!(decrypt_with(b"plain text", mac, &Aes256Gcm::new(&key.into())).is_err());
         assert_eq!(hash_id(b"plain text"), None);
+        // Too short to decrypt (a header and less than a tag): no sender.
+        assert_eq!(hash_id(&dgram[..HEADER + 15]), None);
+        assert!(hash_id(&dgram[..HEADER + 16]).is_some());
     }
 
     #[test]
