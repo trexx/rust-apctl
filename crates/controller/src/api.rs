@@ -21,7 +21,7 @@ use tokio::sync::broadcast;
 use crate::clock;
 use crate::engine::{AliasEdit, ClientView, DeviceView, KnownDevice, Live, LiveMsg, SharedLive};
 use crate::model::{ClientSample, Ts};
-use crate::series::{ap_name_of, client_name};
+use crate::series::client_name;
 use crate::store::{self, Db, Store};
 
 /// What the handlers share. Cloned for every request (and by some handlers
@@ -621,7 +621,7 @@ async fn clients(State(s): State<AppState>) -> Response {
     let (state, list, ap_names) = {
         let live = s.live.read().unwrap();
         let list: Vec<ClientCopy> = live.clients.iter().map(|(mac, c)| (*mac, c.clone(), live.aliases.get(mac).cloned())).collect();
-        let ap_names: std::collections::HashMap<Mac, String> = live.devices.keys().filter_map(|m| Some((*m, ap_name_of(&live, m)?))).collect();
+        let ap_names: std::collections::HashMap<Mac, String> = live.devices.iter().filter_map(|(m, d)| Some((*m, d.snapshot.ap.hostname.clone()?))).collect();
         (live.state.clone(), list, ap_names)
     };
     let controls = crate::actions::ClientControls::new(state.as_deref());
