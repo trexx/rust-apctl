@@ -552,13 +552,12 @@ impl Active {
         if !turn {
             return None;
         }
-        let cmd = {
+        // The failed job's target, for the event.
+        let (cmd, target) = {
             let mut live = self.live.write().unwrap();
             let cmd = crate::firmware::command(&mut live.firmware, &mac, payload, ts)?;
-            if let Err(why) = cmd {
-                live.firmware.failed(&mac, why);
-            }
-            cmd
+            let target = cmd.as_ref().err().and_then(|why| live.firmware.failed(&mac, why)).map(|j| j.target);
+            (cmd, target)
         };
         match cmd {
             Ok(cmd) => {
@@ -568,7 +567,9 @@ impl Active {
                 Some(cmd)
             }
             Err(why) => {
-                let _ = self.engine.blocking_send(Input::Note(Event::device(ts, EventKind::ApUpgradeFailed, mac, json!({ "reason": "no internet", "detail": why }))));
+                tracing::warn!("{mac}: firmware upgrade not sent: {why}");
+                let data = json!({ "reason": "not sent", "detail": why, "target": target });
+                let _ = self.engine.blocking_send(Input::Note(Event::device(ts, EventKind::ApUpgradeFailed, mac, data)));
                 None
             }
         }
@@ -1232,8 +1233,9 @@ mod tests {
         let (_, reply) = inform_as_ap(&rig, &offline, KEY, GCM_ZLIB).await;
         assert_eq!(reply.unwrap().1["_type"], "noop");
         assert!(rig.live.read().unwrap().firmware.current.is_none());
-        let failed = std::iter::from_fn(|| rig.rx.try_recv().ok()).any(|i| matches!(i, Input::Note(e) if e.kind == EventKind::ApUpgradeFailed));
-        assert!(failed);
+        let failed = std::iter::from_fn(|| rig.rx.try_recv().ok()).find_map(|i| if let Input::Note(e) = i && e.kind == EventKind::ApUpgradeFailed { Some(e.data) } else { None }).unwrap();
+        assert_eq!((failed["reason"].as_str(), failed["target"].as_str()), (Some("not sent"), Some("8.8.12.20200")));
+        assert!(failed["detail"].as_str().unwrap().contains("internet"));
     }
 
     #[tokio::test]
