@@ -26,7 +26,8 @@ pub struct ConnId {
 #[derive(Debug)]
 pub enum HttpEvent {
     /// A request: `inform` for a POST to `/inform`. `forwarded_for` is its
-    /// X-Forwarded-For header, the only header anything reads.
+    /// X-Forwarded-For header, the only header anything reads. `body` is empty for a
+    /// request that is not an inform: nothing reads that either.
     Request { conn: ConnId, ts: Micros, inform: bool, forwarded_for: Option<String>, body: Vec<u8> },
     Response { conn: ConnId, ts: Micros, status: u16, body: Vec<u8> },
     /// A UDP datagram to one of the watched UDP ports (e.g. AP syslog on 5514).
@@ -632,14 +633,17 @@ fn parse_http(buf: &[u8], request: bool, closed: bool) -> ParseResult {
 
     let header = |name: &str| headers.iter().find(|h| h.name.eq_ignore_ascii_case(name)).map(|h| h.value);
     let rest = &buf[head_len..];
+    // Only an inform's request body is read; it is still walked over, to find the next message.
+    let keep = !request || inform;
     let chunked = header("transfer-encoding").is_some_and(|v| v.windows(7).any(|w| w.eq_ignore_ascii_case(b"chunked")));
     let (body, body_len) = if chunked {
         match chunked_len(rest, |_| {}) {
-            Chunked::Complete(used, size) => {
+            Chunked::Complete(used, size) if keep => {
                 let mut body = Vec::with_capacity(size);
                 chunked_len(rest, |chunk| body.extend_from_slice(chunk));
                 (body, used)
             }
+            Chunked::Complete(used, _) => (Vec::new(), used),
             Chunked::Partial => return ParseResult::Partial,
             Chunked::Garbage => return ParseResult::Garbage,
         }
@@ -663,7 +667,7 @@ fn parse_http(buf: &[u8], request: bool, closed: bool) -> ParseResult {
         if rest.len() < len {
             return ParseResult::Partial;
         }
-        (rest[..len].to_vec(), len)
+        (if keep { rest[..len].to_vec() } else { Vec::new() }, len)
     };
 
     let msg = if request {
@@ -928,6 +932,13 @@ mod tests {
         // A GET without a length has no body, and is not an inform.
         let mut h = HalfStream { buf: b"GET /status HTTP/1.1\r\n\r\n".to_vec(), ..Default::default() };
         assert!(matches!(h.take_http(true), Some(Parsed::Request { inform: false, body, .. }) if body.is_empty()));
+        // Nor is another request's body copied, though it is skipped over.
+        let other = b"POST /api/login HTTP/1.1\r\nContent-Length: 4\r\n\r\nuserPOST /x HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n2\r\nhi\r\n0\r\n\r\n";
+        let mut h = HalfStream { buf: [&other[..], &sample::http_request(b"x")].concat(), ..Default::default() };
+        for _ in 0..2 {
+            assert!(matches!(h.take_http(true), Some(Parsed::Request { inform: false, body, .. }) if body.is_empty()));
+        }
+        assert!(matches!(h.take_http(true), Some(Parsed::Request { inform: true, body, .. }) if body == b"x"));
         // A response without one runs until the connection closes.
         let mut h = HalfStream { buf: b"HTTP/1.0 200 OK\r\n\r\nall of it".to_vec(), ..Default::default() };
         assert!(h.take_http(false).is_none());
