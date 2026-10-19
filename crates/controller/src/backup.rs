@@ -678,20 +678,23 @@ fn valid_id(id: &str) -> bool {
 /// Staging and the marker are synced when written, and a restore records
 /// that it has begun (`started`, beside the staged files) before it moves
 /// anything, so a power cut can never pass a lost file for one moved in.
+///
+/// A marker that is there but cannot be read (permissions, a disk error)
+/// leaves the restore's files and staging alone: they may be its only copy.
 pub fn apply_pending(b: &Backups) {
     clean_unfinished(b);
     let marker = b.staging().join("pending");
-    match fs::read_to_string(&marker) {
-        Ok(id) => {
+    match pending(b) {
+        Ok(Some(id)) => {
             let mut under_way = false;
-            match apply(b, id.trim(), &mut under_way) {
+            match apply(b, &id, &mut under_way) {
                 Ok(()) => {
                     // The marker goes before the staged files: a crash in between
                     // must not show a finished restore as failed.
                     let _ = fs::remove_file(&marker);
                     let _ = fs::remove_file(b.staging().join("pending.failed"));
                     let _ = sync_dir(&b.staging());
-                    let _ = fs::remove_dir_all(b.staging().join(id.trim()));
+                    let _ = fs::remove_dir_all(b.staging().join(&id));
                     tracing::warn!("restore complete");
                 }
                 Err(e) if under_way => {
@@ -700,8 +703,8 @@ pub fn apply_pending(b: &Backups) {
                 Err(e) => {
                     tracing::error!("the staged restore failed; starting with the current data: {e:#}");
                     // Staged again, it begins afresh, with a copy of the data as it is then.
-                    if valid_id(id.trim()) {
-                        let _ = fs::remove_file(b.staging().join(id.trim()).join("started"));
+                    if valid_id(&id) {
+                        let _ = fs::remove_file(b.staging().join(&id).join("started"));
                     }
                     let failed = b.staging().join("pending.failed");
                     if fs::write(&failed, format!("{e:#}")).is_err() || fs::remove_file(&marker).is_err() {
@@ -712,7 +715,7 @@ pub fn apply_pending(b: &Backups) {
         }
         // Files beside their place belong to a restore under way: only
         // without one are they left over (from a restore since replaced).
-        Err(_) => {
+        Ok(None) => {
             for n in DATABASES {
                 let p = b.data_dir.join(format!("{n}.restoring"));
                 if p.exists() {
@@ -721,8 +724,21 @@ pub fn apply_pending(b: &Backups) {
                 }
             }
         }
+        Err(e) => {
+            tracing::error!("the restore marker {} cannot be read; starting with the current data, and leaving the restore's files where they are: {e}", marker.display());
+            return;
+        }
     }
     clean_staging(b);
+}
+
+/// The staged restore waiting to be applied, if any: the `pending` marker's id.
+fn pending(b: &Backups) -> io::Result<Option<String>> {
+    match fs::read_to_string(b.staging().join("pending")) {
+        Ok(id) => Ok(Some(id.trim().to_string())),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e),
+    }
 }
 
 /// Swaps a staged restore in. `under_way` is set once a file has left
@@ -824,9 +840,10 @@ fn clean_unfinished(b: &Backups) {
 }
 
 /// Deletes staged restores and uploads that were left behind (older than an
-/// hour), except the restore waiting to be applied.
+/// hour), except the restore waiting to be applied: none while the marker
+/// naming it cannot be read.
 fn clean_staging(b: &Backups) {
-    let keep = fs::read_to_string(b.staging().join("pending")).ok().map(|s| s.trim().to_string());
+    let Ok(keep) = pending(b) else { return };
     for e in fs::read_dir(b.staging()).into_iter().flatten().flatten() {
         let name = e.file_name().to_string_lossy().into_owned();
         if name == "pending" || name == "pending.failed" || keep.as_deref() == Some(name.as_str()) {
@@ -1633,6 +1650,27 @@ mod tests {
         fs::write(src.join("metrics.db.restoring"), "x").unwrap();
         apply_pending(&b);
         assert!(!src.join("metrics.db.restoring").exists());
+    }
+
+    #[test]
+    fn a_restore_marker_that_cannot_be_read_leaves_the_restore_alone() {
+        let src = data("unreadable");
+        let b = Backups::new(src.to_path_buf(), None);
+        let id = "r1";
+        fs::create_dir_all(b.staging().join(id)).unwrap();
+        fs::write(b.staging().join(id).join("logs.db"), "staged").unwrap();
+        let old = std::time::SystemTime::now() - Duration::from_secs(2 * 3600);
+        File::open(b.staging().join(id)).unwrap().set_modified(old).unwrap();
+        fs::write(src.join("config.db.restoring"), "the only copy").unwrap();
+        // A marker that is there but cannot be read: not text, then not a file.
+        fs::write(b.staging().join("pending"), [0xff, 0xfe]).unwrap();
+        apply_pending(&b);
+        fs::remove_file(b.staging().join("pending")).unwrap();
+        fs::create_dir(b.staging().join("pending")).unwrap();
+        apply_pending(&b);
+        assert_eq!(fs::read_to_string(src.join("config.db.restoring")).unwrap(), "the only copy");
+        assert!(b.staging().join(id).join("logs.db").exists(), "staging is kept too");
+        assert_eq!(count(&src.join("config.db"), "SELECT COUNT(*) FROM client_aliases"), 1, "and apctl starts with the data it has");
     }
 
     #[test]
