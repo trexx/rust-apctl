@@ -1525,10 +1525,11 @@ export interface DeviceSettings {
   ports: number;
 }
 
-/** What a settings change would send each AP (the shape of a config push). */
+/** What a settings change would send each AP (the shape of a config push). `error`: its config would
+ *  not render; `fixes`: why its config does not render now, which the change mends. */
 export interface SettingsPreview {
   what: string;
-  aps: { mac: Mac; name: string | null; error?: string; system_cfg?: Record<string, unknown>; mgmt_cfg?: Record<string, unknown>; labels?: Record<string, string> }[];
+  aps: { mac: Mac; name: string | null; error?: string; fixes?: string; system_cfg?: Record<string, unknown>; mgmt_cfg?: Record<string, unknown>; labels?: Record<string, string> }[];
 }
 
 export type SettingsTarget =

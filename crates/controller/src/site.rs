@@ -10,7 +10,7 @@ use std::sync::LazyLock;
 
 use crate::api::{ApiError, AppState, Json, Query};
 use crate::settings::Kind::{Bool, Int};
-use crate::settings::{COUNTRIES, Patch, PreviewQuery, band_name, copy_fields, country, dedup_in_order, device_label, docs_mut, illegal_fixed_channel, mgmt_flag, num, outdoor_with, pick, setting, setting_mut, timezone};
+use crate::settings::{COUNTRIES, Patch, PreviewQuery, band_name, copy_fields, country, dedup_in_order, docs_mut, illegal_fixed_channel, mgmt_flag, num, outdoor_with, pick, record_label, setting, setting_mut, str_field, timezone};
 
 /// A host name or IPv4 address, as NTP and syslog targets take (the official
 /// controller refuses IPv6 there).
@@ -39,7 +39,7 @@ fn reset_illegal_channels(state: &mut Value) -> Vec<String> {
     let mut out = Vec::new();
     for d in docs_mut(state, "devices") {
         let o = outdoor_with(d, site_outdoor);
-        let name = device_label(d, d["mac"].as_str().unwrap_or("?"));
+        let name = record_label(d, "?");
         for r in d["radio_table"].as_array_mut().into_iter().flatten() {
             if let Some((ch, _)) = illegal_fixed_channel(c, r, o) {
                 out.push(format!("AP {name} {} channel {ch} → auto", band_name(r["radio"].as_str().unwrap_or(""))));
@@ -77,7 +77,7 @@ pub fn apply_site(state: &mut Value, p: &Value) -> Result<String, String> {
     if (country(state), mgmt_flag(state, "outdoor_mode_enabled")) != rules_before {
         notes.extend(reset_illegal_channels(state));
     }
-    if !p["country"].is_null() && !setting(state, "radio_ai").is_null() {
+    if country(state) != rules_before.0 && !setting(state, "radio_ai").is_null() {
         // Channel AI's channel lists follow the country.
         crate::channelai::apply_settings(state, &json!({}))?;
     }
@@ -111,7 +111,7 @@ fn site_mgmt(doc: &mut Value, m: &Value, notes: &mut Vec<String>) -> Result<(), 
     // The official controller turns this on with every save of these settings; the
     // features it gates (band steering, minimum signal and more) need it.
     doc["advanced_feature_enabled"] = json!(true);
-    if let Some(u) = m["x_ssh_username"].as_str().map(str::trim) {
+    if let Some(u) = str_field(m, "x_ssh_username")?.map(str::trim) {
         let ok = (1..=30).contains(&u.len())
             && u.chars().enumerate().all(|(i, c)| c.is_ascii_alphanumeric() || c == '_' || i > 0 && matches!(c, '-' | '.'))
             && u != "root";
@@ -120,7 +120,7 @@ fn site_mgmt(doc: &mut Value, m: &Value, notes: &mut Vec<String>) -> Result<(), 
         }
         doc["x_ssh_username"] = json!(u);
     }
-    if let Some(pw) = m["x_ssh_password"].as_str() {
+    if let Some(pw) = str_field(m, "x_ssh_password")? {
         set_ssh_password(doc, pw)?;
         notes.push("SSH password".into());
     }
@@ -137,7 +137,7 @@ fn site_mgmt(doc: &mut Value, m: &Value, notes: &mut Vec<String>) -> Result<(), 
 fn site_syslog(doc: &mut Value, r: &Value) -> Result<(), String> {
     copy_fields(r, doc, &[("debug", Bool), ("netconsole_enabled", Bool), ("port", Int(1, 65535)), ("netconsole_port", Int(1, 65535))])?;
     // Off, to apctl ("Network Application"), or to a server, saved as the official UI does.
-    match r["mode"].as_str() {
+    match str_field(r, "mode")? {
         None => {}
         Some("off") => {
             doc["enabled"] = json!(false);
@@ -158,17 +158,14 @@ fn site_syslog(doc: &mut Value, r: &Value) -> Result<(), String> {
         Some(_) => return Err("the syslog mode must be off, controller or server".into()),
     }
     doc["this_controller_encrypted_only"] = json!(false);
-    if let Some(ip) = r["ip"].as_str().map(str::trim) {
-        if !ip.is_empty() && !is_host(ip) {
-            return Err(format!("{ip} is not a host name or address"));
+    // The syslog server and the netconsole host.
+    for key in ["ip", "netconsole_host"] {
+        if let Some(h) = str_field(r, key)?.map(str::trim) {
+            if !h.is_empty() && !is_host(h) {
+                return Err(format!("{h} is not a host name or address"));
+            }
+            doc[key] = json!(h);
         }
-        doc["ip"] = json!(ip);
-    }
-    if let Some(h) = r["netconsole_host"].as_str().map(str::trim) {
-        if !h.is_empty() && !is_host(h) {
-            return Err(format!("{h} is not a host name or address"));
-        }
-        doc["netconsole_host"] = json!(h);
     }
     let doc = &*doc;
     let on = |k: &str| doc[k].as_bool() == Some(true);
@@ -184,7 +181,7 @@ fn site_syslog(doc: &mut Value, r: &Value) -> Result<(), String> {
 /// The APs' time servers (`ntp`).
 fn site_ntp(doc: &mut Value, n: &Value) -> Result<(), String> {
     let was_manual = doc["setting_preference"].as_str() == Some("manual");
-    match n["setting_preference"].as_str() {
+    match str_field(n, "setting_preference")? {
         None => {}
         Some(pref @ ("auto" | "manual")) => doc["setting_preference"] = json!(pref),
         Some(_) => return Err("setting_preference must be auto or manual".into()),
@@ -200,7 +197,7 @@ fn site_ntp(doc: &mut Value, n: &Value) -> Result<(), String> {
         // Manual servers replace all four.
         let mut list = Vec::new();
         for k in NTP_KEYS {
-            if let Some(h) = n[k].as_str().map(str::trim).filter(|h| !h.is_empty()) {
+            if let Some(h) = str_field(n, k)?.map(str::trim).filter(|h| !h.is_empty()) {
                 if !is_host(h) {
                     return Err(format!("{h} is not a host name or IPv4 address"));
                 }
@@ -220,19 +217,19 @@ fn site_ntp(doc: &mut Value, n: &Value) -> Result<(), String> {
 /// SNMP v1/v2c and v3 (`snmp`).
 fn site_snmp(doc: &mut Value, sn: &Value, notes: &mut Vec<String>) -> Result<(), String> {
     copy_fields(sn, doc, &[("enabled", Bool), ("enabledV3", Bool)])?;
-    if let Some(c) = sn["community"].as_str() {
+    if let Some(c) = str_field(sn, "community")? {
         if c.is_empty() || c.len() > 256 || c.contains(char::is_whitespace) {
             return Err("the SNMP community must be 1 to 256 characters without spaces".into());
         }
         doc["community"] = json!(c);
     }
-    if let Some(u) = sn["username"].as_str().map(str::trim) {
+    if let Some(u) = str_field(sn, "username")?.map(str::trim) {
         if !(1..=30).contains(&u.len()) {
             return Err("the SNMPv3 user name must be 1 to 30 characters".into());
         }
         doc["username"] = json!(u);
     }
-    if let Some(pw) = sn["x_password"].as_str() {
+    if let Some(pw) = str_field(sn, "x_password")? {
         if !(8..=32).contains(&pw.len()) || pw.contains(['"', '\'']) {
             return Err("the SNMPv3 password must be 8 to 32 characters without quotes".into());
         }
@@ -257,7 +254,7 @@ fn site_region(state: &mut Value, p: &Value) -> Result<(), String> {
         }
         setting_mut(state, "country")["code"] = json!(code.to_string());
     }
-    if let Some(tz) = p["timezone"].as_str() {
+    if let Some(tz) = str_field(p, "timezone")? {
         if apcfg::tz::posix(tz).is_none() {
             return Err(format!("{tz} is not a time zone apctl knows"));
         }
@@ -409,6 +406,10 @@ mod tests {
         let what = edit(&mut s, json!({ "country": 840 })).unwrap();
         assert!(what.contains("AP Hall 2.4 GHz channel 13 → auto"), "{what}");
         assert_eq!(s["devices"][0]["radio_table"][1]["channel"], "auto");
+        // An AP without a name is named by its MAC, written aa:bb:.. whatever its record holds.
+        let mut s = state();
+        (s["devices"][0]["name"], s["devices"][0]["mac"]) = (json!(""), json!("02-00-00-00-00-01"));
+        assert!(edit(&mut s, json!({ "country": 840 })).unwrap().contains("AP 02:00:00:00:00:01 2.4 GHz"));
         let mut s = state();
         let what = edit(&mut s, json!({ "mgmt": { "outdoor_mode_enabled": true } })).unwrap();
         assert!(what.contains("5 GHz channel 44 → auto"), "{what}");
@@ -416,6 +417,22 @@ mod tests {
         edit(&mut s, json!({ "country": 208, "timezone": "Europe/Copenhagen" })).unwrap();
         assert_eq!((setting(&s, "country")["code"].as_str(), setting(&s, "locale")["timezone"].as_str()), (Some("208"), Some("Europe/Copenhagen")));
         assert!(edit(&mut s, json!({ "timezone": "Mars/Olympus" })).is_err());
+    }
+
+    #[test]
+    fn channel_ai_lists_follow_a_new_country_only() {
+        let mut s = state();
+        crate::channelai::apply_settings(&mut s, &json!({})).unwrap();
+        // The US 5 GHz list has 149, Germany's does not.
+        let na = |s: &Value| setting(s, "radio_ai")["channels_na"].clone();
+        let has_149 = |s: &Value| na(s).as_array().unwrap().iter().any(|c| crate::settings::num(c) == Some(149));
+        assert!(!has_149(&s), "{}", na(&s));
+        edit(&mut s, json!({ "country": 840 })).unwrap();
+        assert!(has_149(&s), "{}", na(&s));
+        // The same country again leaves them as they are.
+        setting_mut(&mut s, "radio_ai")["channels_na"] = json!(["36"]);
+        assert_eq!(edit(&mut s, json!({ "country": 840, "timezone": "Europe/Berlin" })).unwrap(), "site settings: locale.timezone");
+        assert_eq!(na(&s), json!(["36"]));
     }
 
     #[test]
@@ -477,6 +494,10 @@ mod tests {
         let n = setting(&s, "ntp");
         assert_eq!((n["ntp_server_2"].as_str(), n["ntp_server_4"].as_str()), (Some("192.0.2.1"), Some("")), "the list replaces all four");
         assert!(edit(&mut s, json!({ "ntp": { "ntp_server_2": "bad host!" } })).is_err());
+        // Anything but text is refused, not taken as a blank (which would remove the server).
+        assert_eq!(edit(&mut s, json!({ "ntp": { "ntp_server_1": 5 } })).unwrap_err(), "ntp_server_1 must be text");
+        assert!(edit(&mut s, json!({ "timezone": 1 })).is_err() && edit(&mut s, json!({ "mgmt": { "x_ssh_password": true } })).is_err());
+        assert_eq!(setting(&s, "ntp")["ntp_server_1"].as_str(), Some("time.example.net"));
         for bad in ["-time.example.net", "time-.example.net", "time.-example.net"] {
             assert!(edit(&mut s, json!({ "ntp": { "ntp_server_2": bad } })).is_err(), "{bad}");
         }

@@ -66,7 +66,9 @@ export function Review({
                   <span className="muted small">
                     {a.error
                       ? `cannot render its config: ${a.error}`
-                      : changes.length === 0
+                      : a.fixes
+                        ? `its config cannot be rendered now (${a.fixes}); with this change it can`
+                        : changes.length === 0
                         ? "no change to its config"
                         : `${changes.length} config line${changes.length === 1 ? "" : "s"} change`}
                   </span>
