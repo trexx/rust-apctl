@@ -84,7 +84,9 @@ struct Session {
     fingerprint: Option<String>,
 }
 
-/// How long each step (connecting, a login attempt, a command) may take.
+/// How long connecting may take: an address with no AP answers late or never.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long each later step (a login attempt, a command) may take.
 const STEP_TIMEOUT: Duration = Duration::from_secs(15);
 /// The most a command may print: what the AP prints is short, and another
 /// host at that address could send anything.
@@ -94,10 +96,10 @@ const MAX_OUTPUT: usize = 64 << 10;
 type Conn = (russh::client::Handle<Client>, Arc<Mutex<Option<String>>>);
 
 /// A connection with the host key checked, and the key's fingerprint.
-async fn open(config: &Arc<russh::client::Config>, ip: &str, port: u16, expected: &Option<String>) -> Result<Conn, Failure> {
+async fn open(config: &Arc<russh::client::Config>, ip: &str, port: u16, expected: Option<&str>) -> Result<Conn, Failure> {
     let seen = Arc::new(Mutex::new(None));
-    let client = Client { expected: expected.clone(), seen: seen.clone() };
-    match tokio::time::timeout(Duration::from_secs(5), russh::client::connect(config.clone(), (ip, port), client)).await {
+    let client = Client { expected: expected.map(str::to_string), seen: seen.clone() };
+    match tokio::time::timeout(CONNECT_TIMEOUT, russh::client::connect(config.clone(), (ip, port), client)).await {
         Err(_) => Err(Failure::Unreachable("timed out".into())),
         Ok(Err(russh::Error::UnknownKey)) => Err(Failure::HostKey),
         Ok(Err(e)) => Err(Failure::Unreachable(e.to_string())),
@@ -117,7 +119,7 @@ async fn connect(ip: &str, port: u16, logins: &[(String, String)], expected: Opt
         };
         ((handle, seen), r)
     };
-    let (handle, seen) = try_logins(logins, || open(&config, ip, port, &expected), login).await?;
+    let (handle, seen) = try_logins(logins, || open(&config, ip, port, expected.as_deref()), login).await?;
     let fingerprint = seen.lock().unwrap().clone();
     Ok(Session { handle, fingerprint })
 }
