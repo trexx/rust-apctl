@@ -89,8 +89,8 @@ pub struct Assessment {
     /// When the first neighbouring network was recorded.
     pub watching_since: Ts,
     pub acks: Arc<Acks>,
-    /// (kind, bssid) -> when first reported.
-    pub reported: HashMap<(Kind, String), Ts>,
+    /// kind -> bssid -> when first reported.
+    pub reported: HashMap<Kind, HashMap<String, Ts>>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -326,7 +326,6 @@ pub fn assess(a: &Assessment) -> Vec<Finding> {
         let (latest, best) = (all.latest, all.best);
         // `rows` are the sightings the finding rests on, `s` what they add up to.
         let mut push = |kind: Kind, severity: Severity, target: Option<String>, detail: String, rows: &[&Heard], s: &Seen| {
-            let key = (kind, bssid.to_string());
             let mut heard_by: Vec<HeardBy> =
                 rows.iter().map(|h| HeardBy { mac: h.ap_mac.clone(), name: ap_name(&h.ap_mac), signal: h.signal, last_seen: h.last_seen }).collect();
             heard_by.sort_by_key(|h| std::cmp::Reverse(h.signal.unwrap_or(-200)));
@@ -344,7 +343,7 @@ pub fn assess(a: &Assessment) -> Vec<Finding> {
                 last_seen: s.latest.last_seen,
                 target,
                 detail,
-                first_reported: a.reported.get(&key).copied(),
+                first_reported: a.reported.get(&kind).and_then(|m| m.get(bssid)).copied(),
                 acknowledged: ack_of(&a.acks, kind, bssid).cloned(),
             });
         };
@@ -630,7 +629,7 @@ pub fn gather(store: &Store, state: &ThreatState, live: &SharedLive, now: Ts) ->
         for row in stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get(2)?)))? {
             let (k, b, t) = row?;
             if let Some(k) = Kind::parse(&k) {
-                a.reported.insert((k, b), t);
+                a.reported.entry(k).or_default().insert(b, t);
             }
         }
         Ok(())
