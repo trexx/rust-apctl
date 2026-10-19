@@ -769,6 +769,13 @@ fn is_cfg_key(k: &str) -> bool {
     !k.is_empty() && k.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
 }
 
+/// Whether `name` names a file inside a directory: one plain path component, so joining
+/// it to the directory stays there.
+fn is_file_name(name: &str) -> bool {
+    let mut parts = Path::new(name).components();
+    matches!((parts.next(), parts.next()), (Some(std::path::Component::Normal(_)), None))
+}
+
 /// Whether `s` is one whole MAC: with colons or dashes, in dotted groups of four, or bare.
 fn is_mac(s: &str) -> bool {
     let b = s.as_bytes();
@@ -903,9 +910,14 @@ pub fn run(input: &Path, output: &Path, files: &[String], domains: Vec<String>, 
         }
         s.fakes.any_mac(m);
     }
-    std::fs::create_dir_all(output)?;
+    if output.canonicalize().is_ok_and(|o| input.canonicalize().is_ok_and(|i| i == o)) {
+        bail!("--output is the --input directory: the sanitised files would replace the originals");
+    }
     let mut docs = Vec::new();
     for name in files {
+        if !is_file_name(name) {
+            bail!("{name} is not the name of a file in --input (no directories, absolute paths or ..)");
+        }
         let path = input.join(name);
         let text = std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
         let v: Value = serde_json::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
@@ -927,6 +939,9 @@ pub fn run(input: &Path, output: &Path, files: &[String], domains: Vec<String>, 
     for (name, v) in &docs {
         let clean = serde_json::to_string_pretty(&s.json(v))? + "\n";
         let out_name = s.file_name(name);
+        if !is_file_name(&out_name) {
+            bail!("{name} sanitised is no file name");
+        }
         written.push((output.join(&out_name), clean));
     }
     // Check everything against the final maps, so values first seen in a later
@@ -937,6 +952,7 @@ pub fn run(input: &Path, output: &Path, files: &[String], domains: Vec<String>, 
         let name = path.file_name().unwrap_or_default().to_string_lossy();
         leaks.check(&name, &format!("file name {name}"))?;
     }
+    std::fs::create_dir_all(output).with_context(|| format!("creating {}", output.display()))?;
     for (path, text) in written {
         std::fs::write(&path, text).with_context(|| format!("writing {}", path.display()))?;
     }
@@ -1154,6 +1170,30 @@ mod tests {
         assert!(bad_device.is_err_and(|e| e.to_string().contains("is not a MAC")));
         assert!(["78:45:58:3c:52:bc", "78-45-58-3C-52-BC", "7845.583c.52bc", "7845583C52BC"].iter().all(|m| is_mac(m)));
         assert!(!["78:45-58:3c:52:bc", "7845.583c-52bc", "7845583c52b", "78:45:58:3c:52:bg", "192.168.100.200"].iter().any(|m| is_mac(m)));
+    }
+
+    #[test]
+    fn files_are_read_and_written_only_inside_the_directories_and_nothing_is_created_on_a_refusal() {
+        let dir = std::env::temp_dir().join(format!("informdump-sanitize-paths-{}", std::process::id()));
+        let (input, output) = (dir.join("in"), dir.join("out"));
+        std::fs::create_dir_all(&input).unwrap();
+        std::fs::write(input.join("leaks.json"), json!({ "last_error_str": "Smith family router", "new_words": "Smith family router" }).to_string()).unwrap();
+        std::fs::write(input.join("clean.json"), json!({ "mode": "auto" }).to_string()).unwrap();
+        let abs = input.join("clean.json").display().to_string();
+        let sanitise = |out: &Path, name: &str| run(&input, out, &[name.to_string()], Vec::new(), &[], Vec::new()).map_err(|e| e.to_string());
+        let refused: Vec<Result<(), String>> = [abs.as_str(), "../in/clean.json", "./clean.json", "sub/clean.json", "", "leaks.json"].iter().map(|n| sanitise(&output, n)).collect();
+        let created = output.exists();
+        let same = sanitise(&input, "clean.json");
+        let ok = sanitise(&output, "clean.json");
+        let written = std::fs::read_to_string(output.join("clean.json")).unwrap_or_default();
+        std::fs::remove_dir_all(&dir).ok();
+        for (r, why) in refused.iter().zip(["not the name", "not the name", "not the name", "not the name", "not the name", "survived sanitising"]) {
+            assert!(r.as_ref().is_err_and(|e| e.contains(why)), "{r:?}");
+        }
+        assert!(!created, "a refused run creates no output directory");
+        assert!(same.is_err_and(|e| e.contains("would replace the originals")));
+        ok.unwrap();
+        assert_eq!(written, "{\n  \"mode\": \"auto\"\n}\n");
     }
 
     #[test]
