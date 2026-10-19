@@ -581,6 +581,15 @@ fn enum_field<'a>(patch: &'a Value, key: &str, allowed: &[&str]) -> Result<Optio
     }
 }
 
+/// A text field of a patch: `None` when absent; anything but a string is refused.
+pub(crate) fn str_field<'a>(patch: &'a Value, key: &str) -> Result<Option<&'a str>, String> {
+    match &patch[key] {
+        Value::Null => Ok(None),
+        Value::String(s) => Ok(Some(s)),
+        _ => Err(format!("{key} must be text")),
+    }
+}
+
 fn mac_list(patch: &Value, key: &str) -> Result<Option<Vec<inform::Mac>>, String> {
     mac_list_value(&patch[key], key)
 }
@@ -1109,10 +1118,9 @@ fn wlan_password(p: &Value, before: &Value, w: &mut Value, changed: &mut Vec<&st
 /// The bands, and the `wlan_band` derived from them. Returns the bands.
 fn wlan_bands(p: &Value, w: &mut Value) -> Result<Vec<String>, String> {
     if !p["wlan_bands"].is_null() {
-        let bands: Vec<String> = p["wlan_bands"].as_array().ok_or("wlan_bands must be a list")?.iter().filter_map(|b| b.as_str().map(str::to_string)).collect();
-        if bands.is_empty() || bands.iter().any(|b| !["2g", "5g", "6g"].contains(&b.as_str())) {
-            return Err("choose at least one band: 2g, 5g or 6g".into());
-        }
+        let bands: Option<Vec<&str>> = p["wlan_bands"].as_array().ok_or("wlan_bands must be a list")?.iter().map(Value::as_str).collect();
+        let mut bands = bands.filter(|b| !b.is_empty() && b.iter().all(|b| ["2g", "5g", "6g"].contains(b))).ok_or("choose at least one band: 2g, 5g or 6g")?;
+        dedup_in_order(&mut bands);
         w["wlan_bands"] = json!(bands);
     }
     let bands: Vec<String> = w["wlan_bands"].as_array().into_iter().flatten().filter_map(|b| b.as_str().map(str::to_string)).collect();
@@ -1846,6 +1854,10 @@ mod tests {
         assert!(edit(&mut s, json!({ "no2ghz_oui": true })).unwrap_err().contains("both"));
         let w = &s["wlanconf"][0];
         assert_eq!((w["rrm_enabled"].as_bool(), w["tdls_prohibit"].as_bool(), w["log_level"].as_i64()), (Some(true), Some(true), Some(2)));
+        // Each band once; anything but a band's name is refused.
+        assert!(edit(&mut s, json!({ "wlan_bands": ["5g", 2] })).is_err());
+        edit(&mut s, json!({ "wlan_bands": ["2g", "5g", "2g"] })).unwrap();
+        assert_eq!((&s["wlanconf"][0]["wlan_bands"], s["wlanconf"][0]["wlan_band"].as_str()), (&json!(["2g", "5g"]), Some("both")));
     }
 
     #[test]
