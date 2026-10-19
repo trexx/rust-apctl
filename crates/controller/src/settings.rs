@@ -221,6 +221,11 @@ pub(crate) fn device_label(d: &Value, mac: impl std::fmt::Display) -> String {
     d["name"].as_str().filter(|n| !n.trim().is_empty()).map_or_else(|| mac.to_string(), str::to_string)
 }
 
+/// A client as messages name it: its name, else its host name, else its MAC.
+fn client_label(c: &Value) -> &str {
+    c["name"].as_str().or(c["hostname"].as_str()).or(c["mac"].as_str()).unwrap_or("?")
+}
+
 /// [`device_label`] from the AP's record alone: its MAC written `aa:bb:..`
 /// (however the record writes it), else `fallback`.
 pub(crate) fn record_label(d: &Value, fallback: &str) -> String {
@@ -1713,7 +1718,7 @@ fn check_ip_free(state: &Value, mac: &inform::Mac, ip: &str) -> Result<(), Strin
         return Err(format!("{ip} is already {}'s address", record_label(o, "another AP")));
     }
     if let Some(c) = docs(state, "clients").find(|c| c["use_fixedip"].as_bool() == Some(true) && c["fixed_ip"].as_str() == Some(ip)) {
-        return Err(format!("{ip} is reserved for the client {}", c["name"].as_str().or(c["hostname"].as_str()).or(c["mac"].as_str()).unwrap_or("?")));
+        return Err(format!("{ip} is reserved for the client {}", client_label(c)));
     }
     Ok(())
 }
@@ -2369,7 +2374,7 @@ fn group_users(state: &Value) -> HashMap<&str, Vec<String>> {
     }
     for c in docs(state, "clients") {
         if let Some(id) = c["usergroup_id"].as_str() {
-            out.entry(id).or_default().push(format!("client {}", c["name"].as_str().or(c["hostname"].as_str()).or(c["mac"].as_str()).unwrap_or("?")));
+            out.entry(id).or_default().push(format!("client {}", client_label(c)));
         }
     }
     out
