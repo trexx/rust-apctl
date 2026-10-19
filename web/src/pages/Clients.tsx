@@ -1,4 +1,5 @@
 import { memo, useDeferredValue, useState } from "react";
+import type { ReactNode } from "react";
 import { Link } from "react-router";
 import { AttemptList } from "../components/Connections";
 import { SpanPage, useTimeSpan } from "../components/Chart";
@@ -65,7 +66,7 @@ export function Clients() {
   );
 }
 
-function Attempts({ tabs }: { tabs: React.ReactNode }) {
+function Attempts({ tabs }: { tabs: ReactNode }) {
   const [span, setSpan] = useTimeSpan(86400);
   return (
     <SpanPage
@@ -107,7 +108,7 @@ function SortHeader({
   );
 }
 
-function ClientList({ tabs }: { tabs: React.ReactNode }) {
+function ClientList({ tabs }: { tabs: ReactNode }) {
   const clients = useClients();
   const [filter, setFilter] = useState("");
   const [showGone, setShowGone] = useState(false);

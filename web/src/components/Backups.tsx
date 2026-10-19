@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react";
+import type { ReactNode } from "react";
 import {
   createBackup,
   deleteBackup,
@@ -247,7 +248,7 @@ function ConfirmRestore({
   onConfirm,
   onCancel,
 }: {
-  what: React.ReactNode;
+  what: ReactNode;
   busy: boolean;
   onConfirm: () => void;
   onCancel: () => void;
