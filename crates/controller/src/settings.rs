@@ -140,6 +140,22 @@ pub(crate) fn docs_mut<'a>(state: &'a mut Value, collection: &str) -> impl Itera
     state.get_mut(collection).and_then(Value::as_array_mut).into_iter().flatten().filter(move |d| in_site(site.as_deref(), d))
 }
 
+/// The site's document of a collection with this id.
+fn doc_by_id<'a>(state: &'a Value, collection: &str, id: &str) -> Option<&'a Value> {
+    docs(state, collection).find(|d| oid(d) == Some(id))
+}
+
+/// [`doc_by_id`], to change.
+fn doc_by_id_mut<'a>(state: &'a mut Value, collection: &str, id: &str) -> Option<&'a mut Value> {
+    docs_mut(state, collection).find(|d| oid(d) == Some(id))
+}
+
+/// The id of the site's document of a collection the official controller
+/// marks with this `attr_hidden_id` (the default AP group, user group, LAN).
+fn hidden_doc_id(state: &Value, collection: &str, hidden: &str) -> Option<String> {
+    docs(state, collection).find(|d| d["attr_hidden_id"].as_str() == Some(hidden)).and_then(id_of)
+}
+
 /// The site's setting document with this key (`Null` when there is none).
 pub(crate) fn setting<'a>(state: &'a Value, key: &str) -> &'a Value {
     static NULL: Value = Value::Null;
@@ -322,7 +338,7 @@ fn feature_support(state: &Value, informs: &HashMap<inform::Mac, Arc<Value>>) ->
 /// GET /api/settings/wlans/{id}/passphrase: shown on request only.
 pub async fn passphrase(State(s): State<AppState>, Path(id): Path<String>) -> Result<Json<Value>, ApiError> {
     let state = crate::api::current_state(&s)?;
-    let w = docs(&state, "wlanconf").find(|w| oid(w) == Some(id.as_str())).ok_or_else(|| ApiError::not_found("unknown SSID"))?;
+    let w = wlan(&state, &id).ok_or_else(|| ApiError::not_found("unknown SSID"))?;
     Ok(Json(json!({ "passphrase": w["x_passphrase"] })))
 }
 
@@ -621,15 +637,15 @@ const MINRATE_NG: &[i64] = &[1000, 2000, 5500, 6000, 9000, 11000, 12000, 18000, 
 const MINRATE_NA: &[i64] = &[6000, 9000, 12000, 18000, 24000, 36000, 48000, 54000];
 
 fn find_wlan<'a>(state: &'a mut Value, id: &str) -> Option<&'a mut Value> {
-    docs_mut(state, "wlanconf").find(|w| oid(w) == Some(id))
+    doc_by_id_mut(state, "wlanconf", id)
 }
 
 fn wlan<'a>(state: &'a Value, id: &str) -> Option<&'a Value> {
-    docs(state, "wlanconf").find(|w| oid(w) == Some(id))
+    doc_by_id(state, "wlanconf", id)
 }
 
 fn default_group(state: &Value) -> Option<String> {
-    docs(state, "apgroup").find(|g| g["attr_hidden_id"].as_str() == Some("default")).and_then(id_of)
+    hidden_doc_id(state, "apgroup", "default")
 }
 
 /// Sets which APs broadcast an SSID: all, or a list (kept in a hidden AP group
@@ -664,7 +680,7 @@ fn set_wlan_aps(state: &mut Value, id: &str, aps: Option<Vec<inform::Mac>>) -> R
                     g
                 }
             };
-            if let Some(g) = docs_mut(state, "apgroup").find(|g| oid(g) == Some(gid.as_str())) {
+            if let Some(g) = doc_by_id_mut(state, "apgroup", &gid) {
                 g["device_macs"] = json!(macs);
             }
             let w = find_wlan(state, id).ok_or("unknown SSID")?;
@@ -1227,7 +1243,7 @@ fn wlan_links(state: &mut Value, p: &Value, w: &mut Value) -> Result<(), String>
     // Speed limit: a user group; empty means the default group (no limit).
     if let Some(g) = p["usergroup_id"].as_str() {
         let id = if g.is_empty() { ensure_default_usergroup(state) } else { g.to_string() };
-        if !docs(state, "usergroup").any(|x| oid(x) == Some(id.as_str())) {
+        if doc_by_id(state, "usergroup", &id).is_none() {
             return Err("unknown speed limit".into());
         }
         w["usergroup_id"] = json!(id);
@@ -1237,7 +1253,7 @@ fn wlan_links(state: &mut Value, p: &Value, w: &mut Value) -> Result<(), String>
         w["schedule_with_duration"] = json!(check_schedule(&p["schedule_with_duration"])?);
     }
     if let Some(n) = p["networkconf_id"].as_str() {
-        if !docs(state, "networkconf").any(|x| oid(x) == Some(n)) {
+        if doc_by_id(state, "networkconf", n).is_none() {
             return Err("unknown network".into());
         }
         w["networkconf_id"] = json!(n);
@@ -1343,7 +1359,7 @@ fn new_default_usergroup(state: &Value) -> Value {
 
 /// The id of the site's default user group (no speed limit).
 pub fn default_usergroup(state: &Value) -> Option<String> {
-    docs(state, "usergroup").find(|g| g["attr_hidden_id"].as_str() == Some("Default")).and_then(id_of)
+    hidden_doc_id(state, "usergroup", "Default")
 }
 
 /// Site-wide list limits: 256 broadcast-filter addresses in all, 512 MAC-filter
@@ -1379,7 +1395,7 @@ pub fn create_wlan(state: &mut Value, patch: &Value) -> Result<String, String> {
     let over = over_limits(state);
     let site = site_id(state).ok_or("the settings have no APs")?.to_string();
     let all = default_group(state).ok_or("the settings have no default AP group")?;
-    let network = docs(state, "networkconf").find(|n| n["attr_hidden_id"].as_str() == Some("LAN")).or_else(|| docs(state, "networkconf").next()).and_then(id_of);
+    let network = hidden_doc_id(state, "networkconf", "LAN").or_else(|| docs(state, "networkconf").next().and_then(id_of));
     let usergroup = ensure_default_usergroup(state);
     let short_id = docs(state, "wlanconf").filter_map(|w| w["short_id"].as_i64()).max().unwrap_or(0) + 1;
     let id = new_id();
@@ -2327,7 +2343,7 @@ pub fn apply_usergroup(state: &mut Value, e: &GroupEdit) -> Result<String, Strin
     let id = e.id.clone();
     if e.delete {
         let id = id.ok_or("which speed limit?")?;
-        let g = docs(state, "usergroup").find(|g| oid(g) == Some(id.as_str())).ok_or("unknown speed limit")?.clone();
+        let g = doc_by_id(state, "usergroup", &id).ok_or("unknown speed limit")?.clone();
         if g["attr_no_delete"].as_bool() == Some(true) {
             return Err("the default speed limit cannot be deleted".into());
         }
@@ -2351,7 +2367,7 @@ pub fn apply_usergroup(state: &mut Value, e: &GroupEdit) -> Result<String, Strin
         return Err(format!("another speed limit is called \"{n}\""));
     }
     let (g, created) = match &id {
-        Some(id) => (docs_mut(state, "usergroup").find(|g| oid(g) == Some(id.as_str())).ok_or("unknown speed limit")?, false),
+        Some(id) => (doc_by_id_mut(state, "usergroup", id).ok_or("unknown speed limit")?, false),
         None => {
             let n = name.ok_or("the new speed limit needs a name")?;
             (push_doc(state, "usergroup", json!({ "_id": new_id(), "name": n, "qos_rate_max_down": -1, "qos_rate_max_up": -1 })), true)
@@ -2391,7 +2407,7 @@ pub fn apply_client_group(state: &mut Value, e: &ClientGroup) -> Result<String, 
     let mac = e.mac;
     let group = e.usergroup_id.clone().filter(|g| !g.is_empty());
     let name = match &group {
-        Some(g) => docs(state, "usergroup").find(|x| oid(x) == Some(g.as_str())).ok_or("unknown speed limit")?["name"].as_str().unwrap_or("?").to_string(),
+        Some(g) => doc_by_id(state, "usergroup", g).ok_or("unknown speed limit")?["name"].as_str().unwrap_or("?").to_string(),
         None => String::new(),
     };
     crate::actions::edit_client(state, mac, &[("usergroup_id", group.clone().map_or(Value::Null, Value::String))]);
