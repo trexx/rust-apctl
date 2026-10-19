@@ -191,9 +191,10 @@ fn seeded_array<const N: usize>(seed: &str) -> [u8; N] {
 }
 
 /// What an AP derives from its MAC, worked out once: its keys and the identifiers its
-/// informs carry.
+/// informs carry, which the settings (`demo-state`) hold too.
 struct ApIds {
     mac: Mac,
+    serial: String,
     authkey: [u8; 16],
     syslog_key: [u8; 32],
     hash_id: [u8; 8],
@@ -207,6 +208,7 @@ impl ApIds {
         let hash_id = seeded_array(&format!("hash {}", ap.mac));
         ApIds {
             mac: Mac(mac_bytes(ap.mac)),
+            serial: ap.mac.replace(':', "").to_uppercase(),
             authkey: seeded_array(ap.mac),
             syslog_key: seeded_array(&format!("syslog {}", ap.mac)),
             hash_id,
@@ -227,6 +229,11 @@ fn ip(v: [u8; 4]) -> String {
     format!("{}.{}.{}.{}", v[0], v[1], v[2], v[3])
 }
 
+/// Where the APs inform.
+fn inform_url() -> String {
+    format!("http://{}:8080/inform", ip(CONTROLLER_IP))
+}
+
 /// The controller settings to import (`apctl serve --keys`, then the
 /// Settings page): the template site with our APs, networks and clients.
 pub fn state() -> Result<Value> {
@@ -236,15 +243,16 @@ pub fn state() -> Result<Value> {
         .iter()
         .enumerate()
         .map(|(i, ap)| {
+            let ids = ApIds::new(ap);
             let mut d = template.clone();
             d["_id"] = json!({ "$oid": format!("{:024x}", 0xd0 + i) });
             d["mac"] = json!(ap.mac);
             d["name"] = json!(ap.name);
             d["ip"] = json!(ip(ap.ip));
-            d["serial"] = json!(ap.mac.replace(':', "").to_uppercase());
-            d["x_authkey"] = json!(hex_key(ap.mac, 16));
-            d["syslog_key"] = json!(hex_key(&format!("syslog {}", ap.mac), 32));
-            d["inform_url"] = json!(format!("http://{}:8080/inform", ip(CONTROLLER_IP)));
+            d["serial"] = json!(ids.serial);
+            d["x_authkey"] = json!(hex::encode(ids.authkey));
+            d["syslog_key"] = json!(hex::encode(ids.syslog_key));
+            d["inform_url"] = json!(inform_url());
             for r in d["radio_table"].as_array_mut().into_iter().flatten() {
                 let na = r["radio"] == "na";
                 r["channel"] = json!(if na { ap.na } else { ap.ng });
@@ -613,14 +621,14 @@ impl Sim {
         let uptime = self.uptime(i, ts);
         let mac = ap.mac;
         p["mac"] = json!(mac);
-        p["serial"] = json!(mac.replace(':', "").to_uppercase());
         let ids = &self.ids[i];
+        p["serial"] = json!(ids.serial);
         p["hash_id"] = json!(ids.hash_hex);
         p["anon_id"] = json!(format!("00000000-0000-4000-8000-0000000000{:02x}", 0x10 + i));
         p["hostname"] = json!(ap.name);
         p["ip"] = json!(ip(ap.ip));
         p["inform_ip"] = json!(ip(CONTROLLER_IP));
-        p["inform_url"] = json!(format!("http://{}:8080/inform", ip(CONTROLLER_IP)));
+        p["inform_url"] = json!(inform_url());
         p["cfgversion"] = json!(self.cfgversion[i]);
         p["uptime"] = json!(uptime);
         p["time"] = json!(ts);
@@ -805,14 +813,23 @@ mod tests {
 
     #[test]
     fn capture_decodes_with_the_state_keys() {
+        use aes_gcm::aead::{Aead, KeyInit, Payload};
         let keys = wire::keys::KeyStore::from_value(&state().unwrap());
+        let syslog_keys: std::collections::HashMap<Mac, [u8; 32]> = keys.syslog_keys().map(|(m, k)| (*m, *k)).collect();
         let mut buf = Vec::new();
         stream(1_791_830_666, 0.5, false, &mut buf).unwrap();
         let mut pairer = wire::exchange::Pairer::default();
         let mut informs = 0;
         let mut syslog = 0;
         let end = wire::capture::run_with_udp(&buf[..], &[8080], &[5514], |ev| {
-            if matches!(ev, wire::capture::HttpEvent::Datagram { .. }) {
+            if let wire::capture::HttpEvent::Datagram { src, payload, .. } = &ev {
+                // Opened with the key the settings hold for the AP that sent it.
+                let ap = APS.iter().find(|a| src.ip().to_string() == ip(a.ip)).expect("from an AP");
+                let key = syslog_keys[&Mac(mac_bytes(ap.mac))];
+                let (header, sealed) = payload.split_at(wire::synth::SYSLOG_HEADER);
+                let plain = aes_gcm::Aes256Gcm::new(&key.into()).decrypt(&aes_gcm::Nonce::try_from(&header[17..29]).unwrap(), Payload { msg: sealed, aad: header }).expect("decrypts");
+                let text = String::from_utf8(plain).unwrap();
+                assert!(text.starts_with("<14>") && text.contains(&ap.name.replace(' ', "-")), "{text}");
                 syslog += 1;
             } else if let Some(wire::exchange::InformEvent::Inform { decoded, .. }) = pairer.handle(&keys, ev) {
                 decoded.unwrap();
