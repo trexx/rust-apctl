@@ -480,7 +480,9 @@ pub struct Engine {
     last_prune: Ts,
     written: Written,
     /// Syslog hash_ids that none of the keys opened, and when that was tried.
-    /// Time or new settings (which may hold new keys) clear an entry.
+    /// Time or new settings (which may hold new keys) clear an entry. An AP
+    /// whose informs gave its hash_id is tried with its own key first, so an
+    /// entry (even from a made-up datagram) holds up only an AP not heard yet.
     syslog_unknown: HashMap<u64, Ts>,
     /// The syslog keys, ready to decrypt with.
     syslog_ciphers: crate::syslog::Ciphers,
@@ -2190,6 +2192,26 @@ mod tests {
         send(&mut h, 41, 4, 7);
         assert_eq!((logs(), h.engine.syslog_unknown.len()), (3, SYSLOG_UNKNOWN_MAX));
         assert!(!live.read().unwrap().by_hash_id.contains_key(&u64::from_be_bytes([4; 8])));
+    }
+
+    #[test]
+    fn a_datagram_no_key_opens_does_not_hold_up_the_syslog_of_an_ap_its_informs_name() {
+        let mut keys = KeyStore::default();
+        keys.insert_syslog(AP1, &hex::encode([7u8; 32])).unwrap();
+        let mut h = harness_with(keys);
+        let mut p = inform(AP1, 1000, &[]);
+        p["hash_id"] = json!(hex::encode([1u8; 8]));
+        h.engine.handle(Input::Inform { ts: 0, peer: [10, 0, 0, 1].into(), decoded: decoded(p) });
+        let send = |h: &mut Harness, ts: Ts, key: u8| {
+            let payload = crate::syslog::tests::seal([1; 8], [key; 32], "<14>hostapd: hello");
+            h.engine.handle(Input::Datagram { ts, src_ip: "192.0.2.1".into(), payload });
+        };
+        // Under the AP's hash_id, sealed with a key that isn't its own (made up).
+        send(&mut h, 1, 9);
+        assert_eq!(h.engine.syslog_unknown.get(&u64::from_be_bytes([1; 8])), Some(&1));
+        // The AP's own is read with its key at once, not left for the retry window.
+        send(&mut h, 2, 7);
+        assert_eq!(h.live.read().unwrap().counters.logs.load(Ordering::Relaxed), 1);
     }
 
     #[test]
