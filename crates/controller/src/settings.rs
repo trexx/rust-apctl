@@ -221,6 +221,15 @@ pub(crate) fn device_label(d: &Value, mac: impl std::fmt::Display) -> String {
     d["name"].as_str().filter(|n| !n.trim().is_empty()).map_or_else(|| mac.to_string(), str::to_string)
 }
 
+/// [`device_label`] from the AP's record alone: its MAC written `aa:bb:..`
+/// (however the record writes it), else `fallback`.
+pub(crate) fn record_label(d: &Value, fallback: &str) -> String {
+    match doc_mac(&d["mac"]) {
+        Some(m) => device_label(d, m),
+        None => device_label(d, fallback),
+    }
+}
+
 /// A flag of the site's `mgmt` setting (outdoor mode, advanced features...).
 pub(crate) fn mgmt_flag(state: &Value, key: &str) -> bool {
     setting(state, "mgmt")[key].as_bool() == Some(true)
@@ -1687,7 +1696,7 @@ fn check_config_network(p: &Value, before: &Value) -> Result<Value, String> {
 /// A static address must not be another AP's, or one reserved for a client.
 fn check_ip_free(state: &Value, mac: &inform::Mac, ip: &str) -> Result<(), String> {
     if let Some(o) = docs(state, "devices").find(|o| doc_mac(&o["mac"]) != Some(*mac) && o["config_network"]["type"].as_str() == Some("static") && o["config_network"]["ip"].as_str() == Some(ip)) {
-        return Err(format!("{ip} is already {}'s address", device_label(o, o["mac"].as_str().unwrap_or("another AP"))));
+        return Err(format!("{ip} is already {}'s address", record_label(o, "another AP")));
     }
     if let Some(c) = docs(state, "clients").find(|c| c["use_fixedip"].as_bool() == Some(true) && c["fixed_ip"].as_str() == Some(ip)) {
         return Err(format!("{ip} is reserved for the client {}", c["name"].as_str().or(c["hostname"].as_str()).or(c["mac"].as_str()).unwrap_or("?")));

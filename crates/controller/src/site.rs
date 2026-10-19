@@ -10,7 +10,7 @@ use std::sync::LazyLock;
 
 use crate::api::{ApiError, AppState, Json, Query};
 use crate::settings::Kind::{Bool, Int};
-use crate::settings::{COUNTRIES, Patch, PreviewQuery, band_name, copy_fields, country, dedup_in_order, device_label, docs_mut, illegal_fixed_channel, mgmt_flag, num, outdoor_with, pick, setting, setting_mut, timezone};
+use crate::settings::{COUNTRIES, Patch, PreviewQuery, band_name, copy_fields, country, dedup_in_order, docs_mut, illegal_fixed_channel, mgmt_flag, num, outdoor_with, pick, record_label, setting, setting_mut, timezone};
 
 /// A host name or IPv4 address, as NTP and syslog targets take (the official
 /// controller refuses IPv6 there).
@@ -39,7 +39,7 @@ fn reset_illegal_channels(state: &mut Value) -> Vec<String> {
     let mut out = Vec::new();
     for d in docs_mut(state, "devices") {
         let o = outdoor_with(d, site_outdoor);
-        let name = device_label(d, d["mac"].as_str().unwrap_or("?"));
+        let name = record_label(d, "?");
         for r in d["radio_table"].as_array_mut().into_iter().flatten() {
             if let Some((ch, _)) = illegal_fixed_channel(c, r, o) {
                 out.push(format!("AP {name} {} channel {ch} → auto", band_name(r["radio"].as_str().unwrap_or(""))));
@@ -409,6 +409,10 @@ mod tests {
         let what = edit(&mut s, json!({ "country": 840 })).unwrap();
         assert!(what.contains("AP Hall 2.4 GHz channel 13 → auto"), "{what}");
         assert_eq!(s["devices"][0]["radio_table"][1]["channel"], "auto");
+        // An AP without a name is named by its MAC, written aa:bb:.. whatever its record holds.
+        let mut s = state();
+        (s["devices"][0]["name"], s["devices"][0]["mac"]) = (json!(""), json!("02-00-00-00-00-01"));
+        assert!(edit(&mut s, json!({ "country": 840 })).unwrap().contains("AP 02:00:00:00:00:01 2.4 GHz"));
         let mut s = state();
         let what = edit(&mut s, json!({ "mgmt": { "outdoor_mode_enabled": true } })).unwrap();
         assert!(what.contains("5 GHz channel 44 → auto"), "{what}");
