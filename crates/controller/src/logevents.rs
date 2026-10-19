@@ -51,6 +51,8 @@ const ANOMALIES_AGAIN: Ts = 1800;
 
 #[derive(Default)]
 struct Steering {
+    /// The device that made the request: only its candidate lines are the request's.
+    from: Option<Source>,
     ts: Ts,
     rssi: Option<i64>,
     candidates: Option<i64>,
@@ -247,6 +249,7 @@ impl LogEvents {
                 // and the VAP it was made on.
                 let vap = msg.split("vap-").nth(1).and_then(|r| r.split_once('(')).and_then(|(_, r)| r.split_once(')')).map(|(v, _)| v.to_string());
                 let s = Steering {
+                    from: Some(dev_key()),
                     ts: line.ts,
                     rssi: field(msg, "RSSI: ").and_then(|v| v.parse().ok()),
                     candidates: field(msg, "candidates: ").and_then(|v| v.parse().ok()),
@@ -257,8 +260,10 @@ impl LogEvents {
                     bounded(&mut self.steering_by_device, dev_key(), c);
                 }
             } else if let Some(t) = msg.split("BTM: [").nth(1).filter(|t| t.contains("]{"))
-                && let Some(client) = self.steering_by_device.get(&dev_key())
+                && let dev = dev_key()
+                && let Some(client) = self.steering_by_device.get(&dev)
                 && let Some(s) = self.steering.get_mut(client)
+                && s.from.as_ref() == Some(&dev)
                 && s.targets.len() < MAX_TARGETS
             {
                 // A candidate: "[0]{bssid chNN/opNN/phyNN}".
@@ -452,6 +457,22 @@ mod tests {
         assert_eq!(d["vap"], "wifi1ap1");
         // The client repeating the same answer is not reported again within 10 minutes.
         assert!(l.feed(&line(20, "kernel", &format!("{p}BTM: Received response from [6c:ac:c2:00:00:01](len = 5): dialog_token 2, status 7, delay 0, bssid n/a, cancel 0"))).is_empty());
+    }
+
+    #[test]
+    fn candidates_are_the_request_of_the_device_that_lists_them() {
+        let mut l = LogEvents::default();
+        let p = "wlan: [0:I:ANY] [UNSPECIFIED] vap-0(wifi1ap1):";
+        let from = |ap: &str, ts: Ts, msg: String| LogLine { device_mac: ap.parse().ok(), ..line(ts, "kernel", &msg) };
+        let (e, d) = ("02:00:00:00:00:0e", "02:00:00:00:00:0d");
+        // AP E asks the client to move, then AP D does; E's candidates come after.
+        l.feed(&from(e, 10, format!("{p}BTM: STA 6c:ac:c2:00:00:01 RSSI: -77, candidates: 1, error: 0, flags: ALLOW (0x1)")));
+        l.feed(&from(d, 11, format!("{p}BTM: STA 6c:ac:c2:00:00:01 RSSI: -70, candidates: 1, error: 0, flags: ALLOW (0x1)")));
+        l.feed(&from(e, 11, format!("{p}BTM: [0]{{78:45:58:3c:51:ae ch44/op128/phy14}}")));
+        l.feed(&from(d, 11, format!("{p}BTM: [0]{{78:45:58:3c:51:af ch36/op128/phy14}}")));
+        let f = l.feed(&from(d, 12, format!("{p}BTM: Received response from [6c:ac:c2:00:00:01](len = 5): dialog_token 1, status 0, delay 0, bssid n/a, cancel 0")));
+        assert_eq!((f[0].data["signal"].as_i64(), f[0].data["candidates"].as_array().map(Vec::len)), (Some(-70), Some(1)));
+        assert_eq!(f[0].data["candidates"][0]["bssid"], "78:45:58:3c:51:af");
     }
 
     #[test]
