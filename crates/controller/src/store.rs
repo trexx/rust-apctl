@@ -564,6 +564,9 @@ fn flush(conns: &mut Conns, pending: &mut Vec<Write>) -> usize {
 fn apply(conn: &mut Connection, writes: Vec<Write>) -> Result<usize> {
     let tx = conn.transaction()?;
     let (mut failed, mut first_error) = (0, None);
+    // Each metric table's insert, taken from the statement cache once per batch
+    // rather than looked up by its text for every row (a handful of tables).
+    let mut inserts: Vec<(&'static str, rusqlite::CachedStatement)> = Vec::with_capacity(TABLES.len());
     for w in writes {
         let result = match &w {
             // A row of the wrong length is the engine's mistake: refused, not stored in the wrong columns.
@@ -572,7 +575,14 @@ fn apply(conn: &mut Connection, writes: Vec<Write>) -> Result<usize> {
                 let n_keys = table.keys.len();
                 let ts = Value::Integer(*ts);
                 let params = values[..n_keys].iter().chain([&ts]).chain(&values[n_keys..]);
-                tx.prepare_cached(table.insert()).and_then(|mut s| s.execute(params_from_iter(params)))
+                let i = match inserts.iter().position(|(name, _)| *name == table.name) {
+                    Some(i) => Ok(i),
+                    None => tx.prepare_cached(table.insert()).map(|s| {
+                        inserts.push((table.name, s));
+                        inserts.len() - 1
+                    }),
+                };
+                i.and_then(|i| inserts[i].1.execute(params_from_iter(params)))
             }
             Write::Exec { sql, params, .. } => tx.prepare_cached(sql).and_then(|mut s| s.execute(params_from_iter(params))),
         };
@@ -587,6 +597,7 @@ fn apply(conn: &mut Connection, writes: Vec<Write>) -> Result<usize> {
             });
         }
     }
+    drop(inserts);
     tx.commit()?;
     if let Some(e) = first_error {
         tracing::error!("{failed} write(s) failed and were skipped, the first: {e}");
