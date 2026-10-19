@@ -436,8 +436,11 @@ fn debug_syslog(pcap: &str, keys: &str, port: u16) -> Result<()> {
                     if std::env::var_os("APCTL_DEBUG_RAW").is_some() {
                         println!("raw: {:?}", text.chars().take(70).collect::<String>());
                     }
-                    let line = syslog::parse(ts / 1_000_000, &src.ip().to_string(), mac, &text);
-                    println!("{} {:?} prog={:?} sev={:?} {}", line.ts, line.device_mac, line.program, line.severity, line.msg);
+                    // Line by line, as the engine stores them (a datagram can carry several).
+                    for line in text.lines().filter(|l| !l.trim().is_empty()) {
+                        let line = syslog::parse(ts / 1_000_000, &src.ip().to_string(), mac, line);
+                        println!("{} {:?} prog={:?} sev={:?} {}", line.ts, line.device_mac, line.program, line.severity, line.msg);
+                    }
                 }
                 None => println!("{ts} {src}: could not decode {} bytes", payload.len()),
             }
