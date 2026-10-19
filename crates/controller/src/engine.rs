@@ -452,7 +452,8 @@ pub struct Engine {
     tx: broadcast::Sender<LiveMsg>,
     /// Debounced radio settings: right after a restart an AP briefly reports
     /// transient values (e.g. full transmit power) before settling.
-    radios: HashMap<(Mac, String), RadioTrack>,
+    /// Per AP and radio.
+    radios: HashMap<Mac, HashMap<String, RadioTrack>>,
     /// Each client's last sample with multicast counters (and the BSSID they came from).
     mcast_prev: HashMap<Mac, (Ts, Arc<ClientSample>)>,
     /// Each BSSID's last "delivered to clients" counters. The AP reports these
@@ -718,12 +719,17 @@ impl Engine {
     /// Settings changes on the AP's radios, debounced (see `radios`).
     fn radio_events(&mut self, ts: Ts, snap: &Snapshot, events: &mut Vec<Event>) {
         let mac = snap.ap.mac;
+        let tracks = self.radios.entry(mac).or_default();
         for r in &snap.radios {
             let now = (r.channel, r.bw, r.tx_power);
             if now.0.is_none() {
                 continue; // no VAP on this radio, so nothing to compare
             }
-            let track = self.radios.entry((mac, r.radio.clone())).or_default();
+            // The band is copied only for a radio not seen before.
+            if !tracks.contains_key(r.radio.as_str()) {
+                tracks.insert(r.radio.clone(), RadioTrack::default());
+            }
+            let track = tracks.get_mut(r.radio.as_str()).expect("inserted above");
             match track.committed {
                 None => track.committed = Some(now),
                 Some(c) if c == now => track.candidate = None,
@@ -1043,7 +1049,7 @@ impl Engine {
         if had_clients {
             let _ = self.tx.send(LiveMsg::Clients);
         }
-        self.radios.retain(|(m, _), _| *m != mac);
+        self.radios.remove(&mac);
         self.isolated.remove(&mac);
         self.written.devices.remove(&mac);
         self.written.neighbors.remove(&mac);
