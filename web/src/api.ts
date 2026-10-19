@@ -1539,7 +1539,8 @@ export interface DeviceSettings {
 /** What a settings change would send each AP (the shape of a config push). */
 export interface SettingsPreview {
   what: string;
-  aps: { mac: Mac; name: string | null; error?: string; system_cfg?: Record<string, unknown>; mgmt_cfg?: Record<string, unknown>; labels?: Record<string, string> }[];
+  /** Each AP's changes as a config push records them, or why its config couldn't be rendered. */
+  aps: (ConfigPushed & { mac: Mac; name: string | null; error?: string })[];
 }
 
 export type SettingsTarget =
