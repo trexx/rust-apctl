@@ -9,7 +9,7 @@
 
 use axum::extract::State;
 use axum::http::StatusCode;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, LazyLock};
 
 use serde::Deserialize;
@@ -341,8 +341,8 @@ fn wlans_view(state: &Value, informs: &HashMap<inform::Mac, Arc<Value>>, active:
 
 /// For each optional SSID feature, the APs that would broadcast the SSID
 /// without it; and the APs whose support is not known yet (no inform).
-fn feature_support(state: &Value, informs: &HashMap<inform::Mac, Arc<Value>>) -> (Value, Vec<inform::Mac>) {
-    let mut unsupported: serde_json::Map<String, Value> = apcfg::SSID_FEATURES.iter().map(|f| (f.to_string(), json!([]))).collect();
+fn feature_support(state: &Value, informs: &HashMap<inform::Mac, Arc<Value>>) -> (BTreeMap<&'static str, Vec<inform::Mac>>, Vec<inform::Mac>) {
+    let mut unsupported: BTreeMap<&str, Vec<inform::Mac>> = apcfg::SSID_FEATURES.iter().map(|f| (*f, Vec::new())).collect();
     let mut unknown = Vec::new();
     for d in docs(state, "devices") {
         let Some(mac) = doc_mac(&d["mac"]) else { continue };
@@ -351,13 +351,13 @@ fn feature_support(state: &Value, informs: &HashMap<inform::Mac, Arc<Value>>) ->
             Some(list) => {
                 for (f, ok) in list {
                     if !ok {
-                        unsupported[f].as_array_mut().unwrap().push(json!(mac));
+                        unsupported.entry(f).or_default().push(mac);
                     }
                 }
             }
         }
     }
-    (Value::Object(unsupported), unknown)
+    (unsupported, unknown)
 }
 
 /// GET /api/settings/wlans/{id}/passphrase: shown on request only.
