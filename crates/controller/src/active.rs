@@ -111,7 +111,8 @@ pub struct Active {
     /// running config after a restart, when no unmasked push is in memory.
     store: Arc<Store>,
     /// The `mgmt_cfg` handed to each AP being adopted (see `adoption_cfg`).
-    adoption_cfgs: Mutex<HashMap<Mac, AdoptionCfg>>,
+    /// Shared with `forget_managed` too.
+    adoption_cfgs: Arc<Mutex<HashMap<Mac, AdoptionCfg>>>,
     /// Informs opened with an AP's own key, a few at a time.
     work: Gate,
     /// Informs opened with the factory key, which anyone can use: fewer at a
@@ -246,16 +247,20 @@ impl Active {
             devices.insert(m, d);
         }
         let devices = Arc::new(Mutex::new(devices));
+        let adoption_cfgs: Arc<Mutex<HashMap<Mac, AdoptionCfg>>> = Default::default();
         // Whichever way an AP is forgotten (reporting or not), the engine drops what is kept here of it.
-        let forgotten = Arc::downgrade(&devices);
+        let (forgotten, adoptions) = (Arc::downgrade(&devices), Arc::downgrade(&adoption_cfgs));
         live.write().unwrap().forget_managed = Some(Arc::new(move |mac: &Mac| {
             if let Some(devices) = forgotten.upgrade() {
                 devices.lock().unwrap().remove(mac);
             }
+            if let Some(cfgs) = adoptions.upgrade() {
+                cfgs.lock().unwrap().remove(mac);
+            }
         }));
         let cpus = std::thread::available_parallelism().map_or(4, |n| n.get());
         let active = Active {
-            live, keys, engine, writer, controller, devices, store: store.clone(), adoption_cfgs: Default::default(),
+            live, keys, engine, writer, controller, devices, store: store.clone(), adoption_cfgs,
             work: Gate::new(cpus, 64 << 20), strangers: Gate::new((cpus / 2).max(1), 8 << 20), proxies,
         };
         // Rows holding the rendered config (with its secrets) get its digest instead.
@@ -337,6 +342,9 @@ impl Active {
     /// settings: every inform under the factory key while the adoption lasts
     /// (anyone can send them under its MAC) gets the same one. Only mgmt_cfg
     /// is rendered, so settings it does not read cannot hold up an adoption.
+    /// Kept until the adoption ends (see `factory_key_inform`, `managed_inform`)
+    /// or the AP is forgotten; one of settings since replaced, or of an
+    /// adoption that timed out, goes when another is made.
     fn adoption_cfg(&self, state: &Arc<Value>, mac: Mac, payload: &Value) -> anyhow::Result<Arc<str>> {
         if let Some((from, cfg)) = self.adoption_cfgs.lock().unwrap().get(&mac)
             && std::ptr::eq(from.as_ptr(), Arc::as_ptr(state))
@@ -349,8 +357,9 @@ impl Active {
         let (mac_s, cfgversion) = (mac.to_string(), new_cfgversion());
         let input = apcfg::Input { state, device_mac: &mac_s, inform: Some(payload), cfgversion: &cfgversion, controller: &self.controller };
         let cfg: Arc<str> = apcfg::render_mgmt(&input, Some(&hex::encode(DEFAULT_KEY)))?.into();
+        let adopting: Vec<Mac> = self.live.read().unwrap().adoption.adopting.keys().copied().collect();
         let mut cfgs = self.adoption_cfgs.lock().unwrap();
-        cfgs.retain(|_, (from, _)| from.strong_count() > 0);
+        cfgs.retain(|m, (from, _)| from.strong_count() > 0 && adopting.contains(m));
         cfgs.insert(mac, (Arc::downgrade(state), cfg.clone()));
         Ok(cfg)
     }
@@ -675,6 +684,8 @@ async fn factory_key_inform(active: &Arc<Active>, ts: Ts, caller: Caller, payloa
         tracing::info!("{mac}: adoption: sending its key");
         return sealed;
     }
+    // Not being adopted (any more): the adoption's mgmt_cfg goes.
+    active.adoption_cfgs.lock().unwrap().remove(&mac);
     // Not ours, or ours but reset: answered 404 and listed for adoption.
     // What apctl remembers about an AP it no longer has (e.g. AES-GCM) goes,
     // stored too, so that a restart does not bring it back. For one it has,
@@ -1441,9 +1452,33 @@ mod tests {
         inform_as_ap(&rig, &ap_payload("1"), KEY, GCM_ZLIB).await;
         assert!(rig.active.devices.lock().unwrap().get(&mac).is_some_and(|d| d.gcm && d.content.is_some()));
         // The engine calls this however the AP is forgotten, reporting or not (see `Engine::forget`).
+        rig.active.adoption_cfgs.lock().unwrap().insert(mac, (Weak::new(), "authkey=x".into()));
         let forget = rig.live.read().unwrap().forget_managed.clone().expect("set by Active::new");
         forget(&mac);
         assert!(!rig.active.devices.lock().unwrap().contains_key(&mac));
+        assert!(rig.active.adoption_cfgs.lock().unwrap().is_empty(), "nor the mgmt_cfg of an adoption");
+    }
+
+    #[tokio::test]
+    async fn an_adoption_that_timed_out_drops_its_mgmt_cfg() {
+        let Some(_) = fixtures() else { return };
+        let rig = rig(true, None);
+        let new: Mac = "02:00:00:00:00:09".parse().unwrap();
+        let mut payload = ap_payload("1");
+        payload["mac"] = json!(new.to_string());
+        {
+            let mut live = rig.live.write().unwrap();
+            let mut state = live.state.as_deref().cloned().unwrap();
+            crate::adopt::adopt_device(&mut state, &new, &payload).unwrap();
+            live.state = Some(Arc::new(state));
+            live.adoption.adopting.insert(new, 0);
+        }
+        inform_as_ap(&rig, &payload, DEFAULT_KEY, GCM_ZLIB).await;
+        assert!(rig.active.adoption_cfgs.lock().unwrap().contains_key(&new));
+        crate::adopt::expire(&mut rig.live.write().unwrap(), crate::adopt::ADOPT_TIMEOUT);
+        let (status, _) = inform_as_ap(&rig, &payload, DEFAULT_KEY, GCM_ZLIB).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert!(rig.active.adoption_cfgs.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
