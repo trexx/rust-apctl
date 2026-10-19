@@ -354,27 +354,33 @@ pub async fn read<T: Send + 'static>(
 const WEAK_SIGNAL: i64 = -75;
 
 async fn status(State(s): State<AppState>) -> ApiResult {
-    let live = s.live.read().unwrap();
-    // The overview's client counters, so that it needs no client list: the
-    // connected clients by radio, and how many of them have a weak signal.
-    let (mut connected, mut weak, mut by_band) = (0, 0, std::collections::BTreeMap::<&str, usize>::new());
-    for (_, c) in live.connected_clients() {
-        connected += 1;
-        weak += usize::from(c.sample.signal.is_some_and(|s| s < WEAK_SIGNAL));
-        if let Some(radio) = c.sample.radio.as_deref() {
-            *by_band.entry(radio).or_default() += 1;
+    // Counted under the lock, serialised after it (the counters are atomics, read as they are then).
+    let (counters, devices, devices_online, connected, weak, by_band) = {
+        let live = s.live.read().unwrap();
+        // The overview's client counters, so that it needs no client list: the
+        // connected clients by radio, and how many of them have a weak signal.
+        let (mut connected, mut weak, mut by_band) = (0, 0, std::collections::BTreeMap::<&str, usize>::new());
+        for (_, c) in live.connected_clients() {
+            connected += 1;
+            weak += usize::from(c.sample.signal.is_some_and(|s| s < WEAK_SIGNAL));
+            if let Some(radio) = c.sample.radio.as_deref() {
+                *by_band.entry(radio).or_default() += 1;
+            }
         }
-    }
+        // With the APs known from the database only, as the device list has them.
+        let devices = live.devices.len() + stored_only(&live).count();
+        let by_band: std::collections::BTreeMap<String, usize> = by_band.into_iter().map(|(radio, n)| (radio.to_string(), n)).collect();
+        (live.counters.clone(), devices, live.devices.values().filter(|d| d.online).count(), connected, weak, by_band)
+    };
     Ok(Json(json!({
         "version": env!("CARGO_PKG_VERSION"),
         "mode": if s.active { "active" } else { "shadow" },
         "source": s.source,
         "started": s.started,
         "now": clock::now_ts(),
-        "counters": &*live.counters,
-        // With the APs known from the database only, as the device list has them.
-        "devices": live.devices.len() + stored_only(&live).count(),
-        "devices_online": live.devices.values().filter(|d| d.online).count(),
+        "counters": &*counters,
+        "devices": devices,
+        "devices_online": devices_online,
         "clients_connected": connected,
         "clients_by_band": by_band,
         "clients_weak": weak,
