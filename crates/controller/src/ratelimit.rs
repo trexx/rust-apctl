@@ -8,7 +8,7 @@
 //! its SSID's limit is sent instead. SSID-wide limits are in the config (`apcfg`).
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::time::Duration;
 
 use inform::Mac;
@@ -32,8 +32,9 @@ struct Sent {
 /// change (every change replaces the settings' Arc).
 #[derive(Default)]
 struct Groups {
-    /// The settings these were read from (held, so the address cannot be reused).
-    state: Option<Arc<Value>>,
+    /// The settings these were read from, by address: the Weak keeps the
+    /// address from being reused without keeping old settings alive.
+    state: Weak<Value>,
     /// The clients with a group of their own (their first entry's), and that group.
     own: HashMap<Mac, String>,
     /// Each SSID's group, by name (the first SSID of that name).
@@ -45,10 +46,10 @@ struct Groups {
 
 impl Groups {
     fn refresh(&mut self, state: &Arc<Value>) {
-        if self.state.as_ref().is_some_and(|s| Arc::ptr_eq(s, state)) {
+        if std::ptr::eq(self.state.as_ptr(), Arc::as_ptr(state)) {
             return;
         }
-        let mut g = Groups { state: Some(state.clone()), default: crate::settings::default_usergroup(state), ..Default::default() };
+        let mut g = Groups { state: Arc::downgrade(state), default: crate::settings::default_usergroup(state), ..Default::default() };
         let mut own = HashMap::new();
         for c in state["clients"].as_array().into_iter().flatten() {
             if let Some(mac) = c["mac"].as_str().and_then(|m| m.parse::<Mac>().ok()) {
@@ -210,6 +211,7 @@ mod tests {
         assert_eq!((cmds[0]["cmd"].as_str(), cmds[0]["dl_max"].as_i64(), cmds[0]["ul_max"].as_i64(), cmds[0]["mac"].as_str()), (Some("rate-update"), Some(2000), Some(500), Some(C)));
         tick(&mut live, &mut sent);
         assert!(sent_to(&mut live, AP1).is_empty(), "not repeated");
+        assert_eq!(Arc::strong_count(live.state.as_ref().unwrap()), 1, "what was read of the settings does not keep them");
         std::sync::Arc::make_mut(&mut live.clients.get_mut(&C.parse().unwrap()).unwrap().sample).ap_mac = AP2.parse().unwrap();
         tick(&mut live, &mut sent);
         assert_eq!(sent_to(&mut live, AP2).len(), 1, "the new AP gets it");
