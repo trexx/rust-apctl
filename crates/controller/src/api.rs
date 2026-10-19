@@ -556,8 +556,9 @@ struct ListedClient<'a> {
 }
 
 /// A client's view as the list (and an AP's page) sends it: the sample without its multicast
-/// tables, which only the client's own page shows (with the peers in its groups), so the list
-/// of every client of the past year doesn't carry them.
+/// tables, which only the client's own page shows (with the peers in its groups), and without
+/// the packet counters, which no list shows, so the list of every client of the past year
+/// doesn't carry them.
 #[derive(Serialize)]
 struct ListedView<'a> {
     sample: ListedSample<'a>,
@@ -574,24 +575,24 @@ impl<'a> ListedView<'a> {
     }
 }
 
-/// A sample, serialised as it is without `multicast`.
+/// A sample, serialised as it is without `multicast`, `tx_packets` and `rx_packets`.
 struct ListedSample<'a>(&'a ClientSample);
 
 impl Serialize for ListedSample<'_> {
     fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
         use serde::ser::SerializeStruct;
         // Destructured in full, as above: a new field must be added here too, or left out by name.
-        macro_rules! all_but_multicast {
+        macro_rules! all_but {
             ($($f:ident),*) => {{
-                let ClientSample { $($f,)* multicast: _ } = self.0;
+                let ClientSample { $($f,)* multicast: _, tx_packets: _, rx_packets: _ } = self.0;
                 let mut st = s.serialize_struct("ClientSample", [$(stringify!($f)),*].len())?;
                 $(st.serialize_field(stringify!($f), $f)?;)*
                 st.end()
             }};
         }
-        all_but_multicast!(
-            mac, ap_mac, bssid, essid, radio, channel, hostname, ip, rssi, signal, noise, tx_rate, rx_rate, tx_bytes, rx_bytes, tx_packets, rx_packets,
-            tx_retries, idletime, uptime, satisfaction, anomalies, nss, wifi_gen, vlan_id, latency_avg, is_11r
+        all_but!(
+            mac, ap_mac, bssid, essid, radio, channel, hostname, ip, rssi, signal, noise, tx_rate, rx_rate, tx_bytes, rx_bytes, tx_retries,
+            idletime, uptime, satisfaction, anomalies, nss, wifi_gen, vlan_id, latency_avg, is_11r
         )
     }
 }
@@ -1346,9 +1347,11 @@ mod tests {
         assert_eq!(keys(&clients[0]), "alias,ap_name,blocked,connected,first_seen,last_seen,locked_to,note,sample,usergroup_id,vendor");
         let one = get_json(&app, "/api/clients/02:00:00:00:01:01").await;
         assert_eq!(keys(&one), "alias,blocked,connected,first_seen,last_seen,locked_to,note,peers,sample,usergroup_id,vendor", "no ap_name, as before");
-        // The list's sample is the page's without the multicast tables.
+        // The list's sample is the page's without the multicast tables and the packet counters.
         let mut page_sample = one["sample"].clone();
-        assert_eq!(page_sample.as_object_mut().unwrap().remove("multicast"), Some(Value::Null));
+        for k in ["multicast", "tx_packets", "rx_packets"] {
+            assert!(page_sample.as_object_mut().unwrap().remove(k).is_some(), "{k}");
+        }
         assert_eq!(page_sample, clients[0]["sample"]);
         assert_eq!(one["peers"], json!({}));
         assert_eq!(get_json(&app, "/api/clients/names").await, json!({ "02:00:00:00:01:01": "phone" }));
