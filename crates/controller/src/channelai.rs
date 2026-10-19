@@ -206,8 +206,9 @@ async fn wait_for_scans(s: &AppState) {
 }
 
 /// Writes fixed channels on `band` into the APs' radio settings (`changes`:
-/// AP, channel), checking each is legal at the radio's width and allowed.
-pub fn set_channels(state: &mut Value, band: &str, changes: &[(String, i64)]) -> Result<(), String> {
+/// AP, channel), checking each is legal at the radio's width and allowed, and
+/// that the AP is not one whose channel a plan must keep (`held`: see [`pinned`]).
+pub fn set_channels(state: &mut Value, band: &str, changes: &[(String, i64)], held: &[Mac]) -> Result<(), String> {
     if !state["devices"].is_array() {
         return Err("the settings have no APs".into());
     }
@@ -219,6 +220,10 @@ pub fn set_channels(state: &mut Value, band: &str, changes: &[(String, i64)]) ->
         let m: Mac = mac.parse().map_err(|_| format!("{mac} is not in the settings"))?;
         if locked.contains(&m.to_string()) {
             return Err(format!("{mac}: the 2.4 GHz channel is locked by an SSID's IoT setting"));
+        }
+        // A plan made earlier, or sent as it is: the AP may have been excluded, or gone on a wireless uplink, since.
+        if held.contains(&m) {
+            return Err(format!("{mac}: Channel AI keeps this AP's channel (excluded, on a wireless uplink or being upgraded)"));
         }
         let d = device_doc(state, &m).ok_or_else(|| format!("{mac} is not in the settings"))?;
         let outdoor = crate::settings::outdoor(state, d);
@@ -318,8 +323,9 @@ async fn apply(s: &AppState, band: &str, changes: &[Change], trigger: &str) -> R
     let list: Vec<(String, i64)> = changes.iter().map(|c| (c.mac.clone(), c.to)).collect();
     let show = |c: &Change| format!("{} {} → {}", c.name.as_deref().unwrap_or(&c.mac), c.from.map_or_else(|| "auto".to_string(), |f| f.to_string()), c.to);
     let what = format!("channel AI ({trigger}): {}", changes.iter().map(show).collect::<Vec<_>>().join(", "));
+    let held: Vec<Mac> = pinned(&s.live.read().unwrap(), band).iter().filter_map(|m| m.parse().ok()).collect();
     let band = band.to_string();
-    crate::actions::edit_settings(s, what, move |state| set_channels(state, &band, &list)).await
+    crate::actions::edit_settings(s, what, move |state| set_channels(state, &band, &list, &held)).await
 }
 
 /// Runs Channel AI nightly at the setting's hour, in the site's time zone
@@ -605,12 +611,15 @@ mod tests {
     #[test]
     fn plans_are_written_as_fixed_channels_when_legal() {
         let mut s = state();
-        set_channels(&mut s, "ng", &[("02:00:00:00:00:01".into(), 6)]).unwrap();
+        set_channels(&mut s, "ng", &[("02:00:00:00:00:01".into(), 6)], &[]).unwrap();
         assert_eq!(s["devices"][0]["radio_table"][1]["channel"], 6, "an auto radio is pinned");
-        assert!(set_channels(&mut s, "na", &[("02:00:00:00:00:01".into(), 140)]).is_err(), "not at 80 MHz");
-        assert!(set_channels(&mut s, "ng", &[("02:00:00:00:00:01".into(), 3)]).is_err(), "not in the allowed list");
-        set_channels(&mut s, "na", &[("02:00:00:00:00:01".into(), 36)]).unwrap();
-        assert!(set_channels(&mut s, "na", &[("02:00:00:00:00:02".into(), 36)]).is_err(), "not one of the APs");
+        assert!(set_channels(&mut s, "na", &[("02:00:00:00:00:01".into(), 140)], &[]).is_err(), "not at 80 MHz");
+        assert!(set_channels(&mut s, "ng", &[("02:00:00:00:00:01".into(), 3)], &[]).is_err(), "not in the allowed list");
+        set_channels(&mut s, "na", &[("02:00:00:00:00:01".into(), 36)], &[]).unwrap();
+        assert!(set_channels(&mut s, "na", &[("02:00:00:00:00:02".into(), 36)], &[]).is_err(), "not one of the APs");
+        // Nor an AP a plan must leave where it is, however the plan came.
+        let held = ["02:00:00:00:00:01".parse().unwrap()];
+        assert!(set_channels(&mut s, "na", &[("02-00-00-00-00-01".into(), 36)], &held).unwrap_err().contains("keeps this AP's channel"));
     }
 
     #[test]
@@ -619,9 +628,9 @@ mod tests {
         s["apgroup"] = json!([{ "_id": "g1", "attr_hidden_id": "default", "device_macs": ["02:00:00:00:00:01"], "site_id": "s1" }]);
         s["wlanconf"] = json!([{ "_id": "w1", "name": "Things", "iot_channel_lock": true, "ap_group_ids": ["g1"], "site_id": "s1" }]);
         for mac in ["02:00:00:00:00:01", "02-00-00-00-00-01", "02:00:00:00:00:01".to_uppercase().as_str()] {
-            assert!(set_channels(&mut s, "ng", &[(mac.into(), 11)]).unwrap_err().contains("IoT"), "{mac}");
+            assert!(set_channels(&mut s, "ng", &[(mac.into(), 11)], &[]).unwrap_err().contains("IoT"), "{mac}");
         }
-        set_channels(&mut s, "na", &[("02-00-00-00-00-01".into(), 36)]).unwrap();
+        set_channels(&mut s, "na", &[("02-00-00-00-00-01".into(), 36)], &[]).unwrap();
     }
 
     #[test]
