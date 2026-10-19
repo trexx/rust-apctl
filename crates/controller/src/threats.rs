@@ -89,8 +89,8 @@ pub struct Assessment {
     /// When the first neighbouring network was recorded.
     pub watching_since: Ts,
     pub acks: Arc<Acks>,
-    /// (kind, bssid) -> when first reported.
-    pub reported: HashMap<(Kind, String), Ts>,
+    /// kind -> bssid -> when first reported.
+    pub reported: HashMap<Kind, HashMap<String, Ts>>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -326,7 +326,6 @@ pub fn assess(a: &Assessment) -> Vec<Finding> {
         let (latest, best) = (all.latest, all.best);
         // `rows` are the sightings the finding rests on, `s` what they add up to.
         let mut push = |kind: Kind, severity: Severity, target: Option<String>, detail: String, rows: &[&Heard], s: &Seen| {
-            let key = (kind, bssid.to_string());
             let mut heard_by: Vec<HeardBy> =
                 rows.iter().map(|h| HeardBy { mac: h.ap_mac.clone(), name: ap_name(&h.ap_mac), signal: h.signal, last_seen: h.last_seen }).collect();
             heard_by.sort_by_key(|h| std::cmp::Reverse(h.signal.unwrap_or(-200)));
@@ -344,7 +343,7 @@ pub fn assess(a: &Assessment) -> Vec<Finding> {
                 last_seen: s.latest.last_seen,
                 target,
                 detail,
-                first_reported: a.reported.get(&key).copied(),
+                first_reported: a.reported.get(&kind).and_then(|m| m.get(bssid)).copied(),
                 acknowledged: ack_of(&a.acks, kind, bssid).cloned(),
             });
         };
@@ -607,7 +606,7 @@ pub fn gather(store: &Store, state: &ThreatState, live: &SharedLive, now: Ts) ->
             cache.names_at = now;
         }
         a.watching_since = cache.watching_since.unwrap_or(now);
-        let mut stmt = c.prepare(
+        let mut stmt = c.prepare_cached(
             "SELECT bssid, ap_mac, radio, essid, channel, security, signal, best_signal, first_seen, last_seen FROM neighbors WHERE last_seen >= ?1",
         )?;
         a.heard = stmt
@@ -626,11 +625,11 @@ pub fn gather(store: &Store, state: &ThreatState, live: &SharedLive, now: Ts) ->
                 })
             })?
             .collect::<rusqlite::Result<_>>()?;
-        let mut stmt = c.prepare("SELECT kind, bssid, first_reported FROM network_threats")?;
+        let mut stmt = c.prepare_cached("SELECT kind, bssid, first_reported FROM network_threats")?;
         for row in stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get(2)?)))? {
             let (k, b, t) = row?;
             if let Some(k) = Kind::parse(&k) {
-                a.reported.insert((k, b), t);
+                a.reported.entry(k).or_default().insert(b, t);
             }
         }
         Ok(())
@@ -672,6 +671,13 @@ fn live_clients(live: &Live, stored: &[Client]) -> Vec<Client> {
     out
 }
 
+/// The BSSIDs in one tier of `vap_stats` since `?1`, for [`used_bssids`]. The
+/// upper bound (`?2`, no limit) keeps SQLite on the `ts` index: with a lower
+/// bound alone it reads the whole table in BSSID order to group it.
+fn used_bssids_sql(suffix: &str) -> String {
+    format!("SELECT bssid, ap_mac, essid, MAX(ts) FROM vap_stats{suffix} WHERE ts >= ?1 AND ts <= ?2 GROUP BY bssid")
+}
+
 /// BSSIDs our APs used in the last 30 days, with their AP and latest name.
 /// The hourly tier covers all but the last hour or so (the roll-ups run every
 /// five minutes, on complete buckets), the five-minute tier the last two
@@ -680,8 +686,8 @@ fn used_bssids(c: &Connection, now: Ts) -> rusqlite::Result<Vec<(String, String,
     let mut out: BTreeMap<String, (String, Option<String>)> = BTreeMap::new();
     // A rolled-up row carries its bucket's start: the hour holding `now - 30 days` counts too.
     for (suffix, since) in [("", now - 20 * 60), ("_5m", now - 2 * 3600), ("_1h", now - 30 * 86400 - 3599)] {
-        let mut stmt = c.prepare(&format!("SELECT bssid, ap_mac, essid, MAX(ts) FROM vap_stats{suffix} WHERE ts >= ?1 GROUP BY bssid"))?;
-        for row in stmt.query_map([since], |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?, r.get::<_, Option<String>>(2)?)))? {
+        let mut stmt = c.prepare_cached(&used_bssids_sql(suffix))?;
+        for row in stmt.query_map([since, Ts::MAX], |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?, r.get::<_, Option<String>>(2)?)))? {
             let (bssid, ap, essid) = row?;
             out.entry(bssid).or_insert((ap.unwrap_or_default(), essid));
         }
@@ -712,17 +718,26 @@ struct History {
 const HISTORY_SECS: Ts = 8 * 86400;
 
 impl History {
+    /// The channels and the names in one tier since `?1`, each row's time
+    /// moved `end` on. The upper bound (`?2`, no limit) keeps SQLite on the
+    /// `ts` index: with a lower bound alone it reads the whole table.
+    fn sql(suffix: &str, end: Ts) -> [String; 2] {
+        [
+            format!("SELECT mac, radio, channel, MAX(ts) + {end} FROM radio_stats{suffix} WHERE ts >= ?1 AND ts <= ?2 AND channel IS NOT NULL GROUP BY mac, radio, channel"),
+            format!("SELECT bssid, essid, radio, MAX(ts) + {end} FROM vap_stats{suffix} WHERE ts >= ?1 AND ts <= ?2 GROUP BY bssid, essid, radio"),
+        ]
+    }
+
     fn load(c: &Connection, now: Ts) -> rusqlite::Result<History> {
         let mut h = History::default();
         // (tier, since, added to a row's time to reach the end of what it covers)
         for (suffix, since, end) in [("", now - 3600, 0), ("_5m", now - HISTORY_SECS, 299)] {
-            let sql = format!("SELECT mac, radio, channel, MAX(ts) + {end} FROM radio_stats{suffix} WHERE ts >= ?1 AND channel IS NOT NULL GROUP BY mac, radio, channel");
-            for row in c.prepare(&sql)?.query_map([since], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, f64>(2)?, r.get::<_, Ts>(3)?)))? {
+            let [channels, names] = History::sql(suffix, end);
+            for row in c.prepare_cached(&channels)?.query_map([since, Ts::MAX], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, f64>(2)?, r.get::<_, Ts>(3)?)))? {
                 let (mac, radio, ch, ts) = row?;
                 h.channels.entry((mac, radio)).or_default().push((ch, ts));
             }
-            let sql = format!("SELECT bssid, essid, radio, MAX(ts) + {end} FROM vap_stats{suffix} WHERE ts >= ?1 GROUP BY bssid, essid, radio");
-            for row in c.prepare(&sql)?.query_map([since], |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?, r.get::<_, Option<String>>(2)?, r.get::<_, Ts>(3)?)))? {
+            for row in c.prepare_cached(&names)?.query_map([since, Ts::MAX], |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?, r.get::<_, Option<String>>(2)?, r.get::<_, Ts>(3)?)))? {
                 let (bssid, essid, radio, ts) = row?;
                 if let Some(e) = essid {
                     h.names.entry(bssid.clone()).or_default().push((e, ts));
@@ -1288,5 +1303,22 @@ mod tests {
         // The same BSSID copying our name exactly is a different finding.
         a.heard.last_mut().unwrap().essid = Some("Home".into());
         assert!(assess(&a)[0].acknowledged.is_none());
+    }
+
+    #[test]
+    fn the_history_and_our_bssids_are_read_through_the_ts_index() {
+        let t = TestStore::new("threats-plan");
+        let c = t.db(Db::Metrics);
+        // How SQLite finds the rows: the first step of its plan.
+        let plan = |sql: &str| -> String { c.query_row(&format!("EXPLAIN QUERY PLAN {sql}"), [0, Ts::MAX], |r| r.get(3)).unwrap() };
+        for suffix in ["", "_5m", "_1h"] {
+            let p = plan(&used_bssids_sql(suffix));
+            assert_eq!(p, format!("SEARCH vap_stats{suffix} USING INDEX vap_stats{suffix}_ts (ts>? AND ts<?)"));
+        }
+        for suffix in ["", "_5m"] {
+            let [channels, names] = History::sql(suffix, 299);
+            assert_eq!(plan(&channels), format!("SEARCH radio_stats{suffix} USING INDEX radio_stats{suffix}_ts (ts>? AND ts<?)"));
+            assert_eq!(plan(&names), format!("SEARCH vap_stats{suffix} USING INDEX vap_stats{suffix}_ts (ts>? AND ts<?)"));
+        }
     }
 }

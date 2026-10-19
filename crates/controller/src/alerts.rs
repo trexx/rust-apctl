@@ -394,14 +394,33 @@ struct RadioHealth {
     pub interference: Option<f64>,
 }
 
-/// (key, raise when, clear when, title, unit) for each radio threshold.
-fn radio_checks(h: &RadioHealth) -> [(Key, Option<f64>, f64, f64, &'static str); 3] {
+/// One radio threshold, as judged for one radio.
+struct Check {
+    key: Key,
+    /// The radio's figure (%); `None`: not judged this time.
+    value: Option<f64>,
+    /// Raised at or above this.
+    raise_at: f64,
+    /// Cleared below this.
+    clear_at: f64,
+    /// What is measured, as the alert names it.
+    what: &'static str,
+}
+
+/// Each radio threshold, with this radio's figure.
+fn radio_checks(h: &RadioHealth) -> [Check; 3] {
+    let check = |key, value, raise_at, clear_at, what| Check { key, value, raise_at, clear_at, what };
     [
-        (Key::HighRetries, h.retry_pct.filter(|_| h.attempts >= 500.0), 25.0, 20.0, "TX retries"),
-        (Key::BusyChannel, h.utilisation, 80.0, 70.0, "channel utilisation"),
-        (Key::Interference, h.interference, 50.0, 40.0, "interference"),
+        check(Key::HighRetries, h.retry_pct.filter(|_| h.attempts >= 500.0), 25.0, 20.0, "TX retries"),
+        check(Key::BusyChannel, h.utilisation, 80.0, 70.0, "channel utilisation"),
+        check(Key::Interference, h.interference, 50.0, 40.0, "interference"),
     ]
 }
+
+/// Each radio's channel use since `?1`, for [`radio_health`]. The upper bound
+/// (`?2`, no limit) keeps SQLite on the `ts` index: with a lower bound alone it
+/// reads every raw row kept, in radio order, to group them.
+const RADIO_USE: &str = "SELECT mac, radio, AVG(cu_total), AVG(cu_interf), COUNT(*), MIN(ts), MAX(ts) FROM radio_stats WHERE ts >= ?1 AND ts <= ?2 GROUP BY mac, radio";
 
 async fn radio_health(store: &Arc<Store>, now: Ts) -> anyhow::Result<HashMap<(Mac, String), RadioHealth>> {
     let store = store.clone();
@@ -409,8 +428,8 @@ async fn radio_health(store: &Arc<Store>, now: Ts) -> anyhow::Result<HashMap<(Ma
         store.read(Db::Metrics, |c| {
             let from = now - HEALTH_WINDOW;
             let mut out: HashMap<(Mac, String), RadioHealth> = HashMap::new();
-            let mut stmt = c.prepare("SELECT mac, radio, AVG(cu_total), AVG(cu_interf), COUNT(*), MIN(ts), MAX(ts) FROM radio_stats WHERE ts >= ?1 GROUP BY mac, radio")?;
-            let rows = stmt.query_map([from], |r| {
+            let mut stmt = c.prepare_cached(RADIO_USE)?;
+            let rows = stmt.query_map([from, Ts::MAX], |r| {
                 Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, Option<f64>>(2)?, r.get::<_, Option<f64>>(3)?, r.get::<_, i64>(4)?, r.get::<_, Ts>(5)?, r.get::<_, Ts>(6)?))
             })?;
             for row in rows {
@@ -645,9 +664,10 @@ impl Watcher {
             })
             .collect();
         for mac in gone {
-            self.aps.down.remove(&mac);
             self.book.resolve(now, &(Key::ApOffline, Entity::Ap(mac)), || "The AP is no longer managed.".into());
         }
+        // Those without an open alert too (one past the day's limit): it would never come back to clear them.
+        self.aps.down.retain(|m, _| known.contains(m));
         for (mac, name, last_seen) in seen {
             let name = name.unwrap_or_else(|| mac.to_string());
             let status = |key: Key, severity: Severity, title: String, message: String| Alert::for_device(key, Category::ApStatus, severity, mac, title, message).tagged(format!("ap-status:{mac}"));
@@ -705,7 +725,7 @@ impl Watcher {
             if !online.contains(&mac) {
                 continue;
             }
-            for (key, value, raise_at, clear_at, what) in radio_checks(&h) {
+            for Check { key, value, raise_at, clear_at, what } in radio_checks(&h) {
                 let k = (key, Entity::Radio(mac, radio.clone()));
                 let Some(v) = value else {
                     // Retries are not judged on a radio carrying little traffic, but
@@ -752,9 +772,9 @@ impl Watcher {
 /// It keeps the engine's time (see [`crate::shadow::Clock`]): in shadow mode a
 /// lagging capture's, and while a capture is replayed it checks no AP's status
 /// or health, whose stored figures are then of the capture's time.
-pub fn spawn(store: Arc<Store>, writer: Writer, live: SharedLive, tx: broadcast::Sender<LiveMsg>, mut events: mpsc::Receiver<Event>, clock: Arc<crate::shadow::Clock>) {
+pub fn spawn(store: Arc<Store>, writer: Writer, live: SharedLive, tx: broadcast::Sender<LiveMsg>, mut events: mpsc::Receiver<Event>, engine_clock: Arc<crate::shadow::Clock>) {
     tokio::spawn(async move {
-        let now = || clock.now().unwrap_or_else(clock::now_ts);
+        let now = || engine_clock.now().unwrap_or_else(clock::now_ts);
         let mut w = Watcher::start(store, writer, live, tx, now()).await;
         // Give APs a chance to report after a restart before judging them.
         let mut status = tokio::time::interval_at(tokio::time::Instant::now() + Duration::from_secs(90), Duration::from_secs(30));
@@ -766,8 +786,8 @@ pub fn spawn(store: Arc<Store>, writer: Writer, live: SharedLive, tx: broadcast:
                     Some(e) => w.event(now(), &e),
                     None => return,
                 },
-                _ = status.tick() => if let Some(now) = clock.now() { w.status_tick(now) },
-                _ = health.tick() => if let Some(now) = clock.now() { w.health_tick(now).await },
+                _ = status.tick() => if let Some(now) = engine_clock.now() { w.status_tick(now) },
+                _ = health.tick() => if let Some(now) = engine_clock.now() { w.health_tick(now).await },
             }
         }
     });
@@ -798,7 +818,7 @@ struct Listed {
 /// The `limit` most recent alerts, newest first, with the unread count.
 /// One of a kind apctl no longer raises is left out (see [`stored`]).
 fn recent(c: &rusqlite::Connection, limit: i64) -> anyhow::Result<Value> {
-    let mut stmt = c.prepare(LIST)?;
+    let mut stmt = c.prepare_cached(LIST)?;
     let rows = stmt
         .query_map([limit], |r| Ok(match stored(r)? {
             Some(alert) => Some(Listed { alert, read: r.get::<_, i64>(11)? != 0 }),
@@ -1021,6 +1041,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_forgotten_ap_is_forgotten_even_when_its_drop_was_not_reported() {
+        let (mut w, mut rx, _dir) = watcher();
+        let ap: Mac = "02:00:00:00:00:01".parse().unwrap();
+        let known = crate::engine::KnownDevice {
+            first_seen: 0, last_seen: 1000, uptime: None, version: None, hostname: None, model: None, model_display: None, ip: None, serial: None,
+        };
+        w.live.write().unwrap().known_devices.insert(ap, known);
+        // Past the day's limit, and "keeps dropping off" already sent today: no alert, but it counts as down.
+        let now = 1000 + OFFLINE_AFTER;
+        w.aps.sent.insert(ap, vec![now - 600, now - 300]);
+        w.aps.flapping_day.insert(ap, now / 86400);
+        w.status_tick(now);
+        assert!(told(&mut rx).is_empty() && w.aps.down.contains_key(&ap));
+        // Forgotten: nothing of it is kept, and a day on not even its alerts' times.
+        w.live.write().unwrap().known_devices.clear();
+        w.status_tick(now + 30);
+        assert!(w.aps.down.is_empty());
+        w.status_tick(now + 86400);
+        assert!(w.aps.sent.is_empty() && w.aps.flapping_day.is_empty());
+    }
+
+    #[tokio::test]
     async fn connection_failures_open_once_and_clear() {
         let (mut w, mut rx, _dir) = watcher();
         w.judge_connections(1000, 2);
@@ -1179,11 +1221,18 @@ mod tests {
     }
 
     #[test]
+    fn the_radio_use_is_read_through_the_ts_index() {
+        let t = TestStore::new("alerts-plan");
+        let plan: String = t.db(Db::Metrics).query_row(&format!("EXPLAIN QUERY PLAN {RADIO_USE}"), [0, Ts::MAX], |r| r.get(3)).unwrap();
+        assert_eq!(plan, "SEARCH radio_stats USING INDEX radio_stats_ts (ts>? AND ts<?)");
+    }
+
+    #[test]
     fn radio_thresholds_need_enough_traffic() {
         let quiet = RadioHealth { retries_reported: true, retry_pct: Some(60.0), attempts: 100.0, utilisation: Some(10.0), interference: None };
         let checks = radio_checks(&quiet);
-        assert_eq!(checks[0].1, None, "a few retries on an idle radio are not a problem");
+        assert_eq!(checks[0].value, None, "a few retries on an idle radio are not a problem");
         let busy = RadioHealth { retry_pct: Some(30.0), attempts: 5000.0, ..quiet };
-        assert_eq!(radio_checks(&busy)[0].1, Some(30.0));
+        assert_eq!(radio_checks(&busy)[0].value, Some(30.0));
     }
 }
