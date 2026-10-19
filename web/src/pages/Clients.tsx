@@ -4,7 +4,7 @@ import { Link } from "react-router";
 import { AttemptList } from "../components/Connections";
 import { SpanPage, useTimeSpan } from "../components/Chart";
 import { displayName, useClients } from "../api";
-import type { ClientView } from "../api";
+import type { ListedClient } from "../api";
 import {
   QueryNote,
   Segmented,
@@ -31,7 +31,7 @@ type SortKey =
   | "uptime"
   | "last_seen";
 
-function value(c: ClientView, key: SortKey): string | number {
+function value(c: ListedClient, key: SortKey): string | number {
   switch (key) {
     case "name":
       return displayName(c).toLowerCase();
@@ -218,7 +218,7 @@ const ClientRow = memo(function ClientRow({
   c,
   now,
 }: {
-  c: ClientView;
+  c: ListedClient;
   /** What "last seen" counts from (`useNow()`); unused while connected. */
   now: number;
 }) {

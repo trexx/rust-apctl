@@ -1,7 +1,6 @@
 import { Suspense } from "react";
 import { Link, useParams } from "react-router";
 import {
-  displayName,
   useCanEdit,
   useClientNames,
   useDevice,
@@ -59,6 +58,7 @@ export function Device() {
 function DevicePage({ mac }: { mac: string }) {
   const [range, setRange] = useTimeSpan(6 * 3600);
   const detail = useDevice(mac);
+  const cnames = useClientNames();
   const now = useNow();
   // Read-only users get neither the editor's code nor the AP's settings.
   const canEdit = useCanEdit();
@@ -92,7 +92,7 @@ function DevicePage({ mac }: { mac: string }) {
         mac={mac}
         name={ap.hostname ?? mac}
         online={d.online}
-        locating={detail.data.locating ?? false}
+        locating={detail.data.locating}
       />
       {canEdit && (
         <Suspense fallback={null}>
@@ -207,7 +207,7 @@ function DevicePage({ mac }: { mac: string }) {
                 <tr key={c.sample.mac}>
                   <td>
                     <Link to={`/clients/${c.sample.mac}`}>
-                      {displayName(c)}
+                      {cnames[c.sample.mac] ?? c.sample.mac}
                     </Link>
                   </td>
                   <td>{c.sample.essid ?? "—"}</td>

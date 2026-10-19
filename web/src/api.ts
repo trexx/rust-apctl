@@ -90,21 +90,30 @@ export interface Multicast {
   services: ServiceCount[];
 }
 
-export interface ClientView {
+/** A client as an AP's page lists it: its latest sample (without the multicast tables), and when it was seen. */
+export interface ListedClientView {
   sample: ClientSample;
   connected: boolean;
   first_seen: number;
   last_seen: number;
-  ap_name?: string | null;
-  vendor?: string | null;
-  alias?: string | null;
-  note?: string | null;
+}
+
+/** A client with its name, manufacturer and controls, as the client list and its own page send it. */
+export interface ClientView extends ListedClientView {
+  vendor: string | null;
+  alias: string | null;
+  note: string | null;
   /** From the settings: blocked from every SSID. */
-  blocked?: boolean;
+  blocked: boolean;
   /** From the settings: the only AP the client may connect to. */
-  locked_to?: Mac | null;
+  locked_to: Mac | null;
   /** From the settings: the client's own speed limit (user group). */
-  usergroup_id?: string | null;
+  usergroup_id: string | null;
+}
+
+/** A client in the client list: its view, and the name of the AP it is on (null when that AP has no name, or is not reporting). */
+export interface ListedClient extends ClientView {
+  ap_name: string | null;
 }
 
 /** A client in a multicast group, as a client's page lists its peers. */
@@ -211,8 +220,9 @@ export interface DeviceDetail {
     /** Known from the database only: hasn't reported since apctl started. */
     stored_only?: boolean;
   };
-  clients: ClientView[];
-  locating?: boolean;
+  /** Its connected clients, without their names (`useClientNames` has them). */
+  clients: ListedClientView[];
+  locating: boolean;
 }
 
 export interface Series {
@@ -1011,7 +1021,7 @@ export const useDevice = (mac: Mac) =>
   useQuery({ queryKey: keys.device(mac), queryFn: getting<DeviceDetail>(`/api/devices/${mac}`) });
 
 /** Every client of the past year, with its latest sample: for the client list. */
-export const useClients = () => useQuery({ queryKey: keys.clients(), queryFn: getting<ClientView[]>("/api/clients") });
+export const useClients = () => useQuery({ queryKey: keys.clients(), queryFn: getting<ListedClient[]>("/api/clients") });
 
 /** Names by MAC, for links. */
 export type Names = Readonly<Record<Mac, string>>;

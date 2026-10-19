@@ -1,6 +1,11 @@
 import { useState } from "react";
 import { useSeries, useSiteActivity } from "../api";
-import type { ClientView, RadioSample, TimeSpan, VapSample } from "../api";
+import type {
+  ListedClientView,
+  RadioSample,
+  TimeSpan,
+  VapSample,
+} from "../api";
 import { COLORS, Chart } from "./Chart";
 import { QueryState, Signal, THead } from "./common";
 import {
@@ -35,7 +40,7 @@ const SIGNAL_BUCKETS: [number, string, Tone][] = [
 ];
 
 /** How many of the radio's clients are in each signal band; those without a signal reading are left out. */
-function SignalDistribution({ clients }: { clients: ClientView[] }) {
+function SignalDistribution({ clients }: { clients: ListedClientView[] }) {
   const signals = clients.flatMap((c) => c.sample.signal ?? []);
   const counts = SIGNAL_BUCKETS.map(([min], i) => {
     const max = i === 0 ? Infinity : SIGNAL_BUCKETS[i - 1]![0];
@@ -79,7 +84,7 @@ export function RadioPanel({
   mac: string;
   radio: RadioSample;
   vaps: VapSample[];
-  clients: ClientView[];
+  clients: ListedClientView[];
   range: TimeSpan;
 }) {
   const s = useSeries("radio", `${mac},${radio.radio}`, range);
