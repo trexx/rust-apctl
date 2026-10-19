@@ -22,7 +22,7 @@ use crate::store::{Db, TIERS};
 /// a scan of every row for `ap_mac`.
 fn bssids_of(c: &Connection, tier: usize, ap: &str) -> rusqlite::Result<Vec<String>> {
     use rusqlite::OptionalExtension;
-    let mut stmt = c.prepare_cached(&format!("SELECT bssid, ap_mac FROM vap_stats{} WHERE bssid > ?1 ORDER BY bssid LIMIT 1", TIERS[tier].0))?;
+    let mut stmt = c.prepare_cached(&format!("SELECT bssid, ap_mac FROM vap_stats{} WHERE bssid > ?1 ORDER BY bssid LIMIT 1", TIERS[tier].suffix))?;
     let (mut out, mut after) = (Vec::new(), String::new());
     while let Some((bssid, on)) = stmt.query_row([&after], |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?))).optional()? {
         if on.as_deref() == Some(ap) {
@@ -158,7 +158,7 @@ pub async fn activity(State(s): State<AppState>, Query(q): Query<RangeQuery>) ->
         }
         let sql = format!(
             "SELECT ts - ts % ?3 AS b, AVG(cu_total), AVG(cu_interf), AVG(cu_self_rx), AVG(cu_self_tx) FROM radio_stats{} WHERE ts >= ?1 AND ts <= ?2{only} GROUP BY b ORDER BY b",
-            TIERS[tier].0
+            TIERS[tier].suffix
         );
         let mut stmt = c.prepare_cached(&sql)?;
         let (mut air_ts, mut total, mut external, mut own_rx, mut own_tx) = (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new());
@@ -300,7 +300,7 @@ const DENSITY_COLS: &[&str] = &["tx_bytes", "rx_bytes", "tx_retries", "wifi_tx_a
 /// band and overall), averaged over the window.
 pub async fn density(State(s): State<AppState>, Query(q): Query<RangeQuery>) -> Result<Json<Value>, ApiError> {
     let (from, to, tier) = window(&q);
-    let suffix = TIERS[tier].0;
+    let suffix = TIERS[tier].suffix;
     // Worked out where the data is read, off the async workers and the live lock.
     let aps = memo_read(&s, Db::Metrics, "density", &q, tier, move |c| {
         let mut stmt = c.prepare_cached(&format!("SELECT ts, ap_mac, radio, signal FROM client_stats{suffix} WHERE ts >= ?1 AND ts <= ?2 AND signal < 0 AND ap_mac IS NOT NULL"))?;
@@ -428,7 +428,7 @@ pub async fn multicast(State(s): State<AppState>, Query(q): Query<RangeQuery>) -
     let bucket = bucket_for(to - from, tier);
     let ap = q.mac.as_ref().map(|m| m.to_ascii_lowercase());
     let got = memo_read(&s, Db::Metrics, "multicast", &q, tier, move |c| {
-        let (suffix, step) = (TIERS[tier].0, TIERS[tier].1);
+        let (suffix, step) = (TIERS[tier].suffix, TIERS[tier].step);
         // From a little before the window: what each sample covers starts before it.
         let (one, mut params) = (if ap.is_some() { " AND mac = ?3" } else { "" }, vec![Sql::Integer(from - if step > 0 { step } else { MCAST_GAP }), Sql::Integer(to)]);
         params.extend(ap.clone().map(Sql::Text));
@@ -795,7 +795,7 @@ pub async fn radios(State(s): State<AppState>, Query(q): Query<RangeQuery>) -> R
     let avgs = memo_read(&s, Db::Metrics, "radios", &q, tier, move |c| {
         let mut out: HashMap<String, RadioAvg> = HashMap::new();
         // Airtime: SQLite averages each radio's samples in the window.
-        let sql = format!("SELECT mac || '/' || radio, AVG(cu_total), AVG(cu_interf) FROM radio_stats{} WHERE ts >= ?1 AND ts <= ?2 GROUP BY mac, radio", TIERS[tier].0);
+        let sql = format!("SELECT mac || '/' || radio, AVG(cu_total), AVG(cu_interf) FROM radio_stats{} WHERE ts >= ?1 AND ts <= ?2 GROUP BY mac, radio", TIERS[tier].suffix);
         let mut stmt = c.prepare_cached(&sql)?;
         let mut rows = stmt.query([from, to])?;
         while let Some(r) = rows.next()? {

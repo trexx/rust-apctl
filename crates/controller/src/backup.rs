@@ -415,7 +415,7 @@ fn trim_config(dir: &Path, cutoff: Option<Ts>) -> Result<()> {
 /// Drops the history older than `t` from metrics.db and logs.db.
 fn trim_history(dir: &Path, t: Ts) -> Result<()> {
     // Every metric table in every tier, and the logs (whose full-text index follows by trigger).
-    let metrics: Vec<String> = store::TABLES.iter().flat_map(|t| store::TIERS.iter().map(move |(suffix, ..)| format!("{}{suffix}", t.name))).collect();
+    let metrics: Vec<String> = store::TABLES.iter().flat_map(|t| store::TIERS.iter().map(move |tier| format!("{}{}", t.name, tier.suffix))).collect();
     for (name, tables) in [("metrics.db", metrics), ("logs.db", vec!["logs".to_string()])] {
         let p = dir.join(name);
         if !p.exists() {

@@ -21,7 +21,7 @@ use tokio::sync::broadcast;
 use crate::clock;
 use crate::engine::{AliasEdit, ClientView, DeviceView, KnownDevice, Live, LiveMsg, SharedLive};
 use crate::model::{ClientSample, Ts};
-use crate::series::{ap_name_of, client_name};
+use crate::series::client_name;
 use crate::store::{self, Db, Store};
 
 /// What the handlers share. Cloned for every request (and by some handlers
@@ -155,7 +155,20 @@ pub fn router(state: AppState) -> Router {
     // The live socket is added after compression, which must not touch an upgrade.
     let socket = Router::new().route("/api/ws", get(ws)).route_layer(axum::middleware::from_fn_with_state(state.clone(), crate::auth::require_login));
     // JSON and the UI's scripts and styles compress well (gzip only; images are left alone).
-    public.merge(protected).fallback(crate::web::handler).layer(tower_http::compression::CompressionLayer::new().compress_when(compressible())).merge(socket).with_state(state)
+    let app = public.merge(protected).fallback(crate::web::handler).layer(tower_http::compression::CompressionLayer::new().compress_when(compressible())).merge(socket);
+    with_security_headers(app).with_state(state)
+}
+
+/// On every answer, the UI's and the API's: no page of another site may frame
+/// apctl's (a sibling subdomain gets the session cookie, see `Auth::same_origin`), and no
+/// browser guesses a type other than the one sent.
+fn with_security_headers(app: Router<AppState>) -> Router<AppState> {
+    use axum::http::{HeaderValue, header};
+    use tower_http::set_header::SetResponseHeaderLayer;
+    let set = |name, value| SetResponseHeaderLayer::if_not_present(name, HeaderValue::from_static(value));
+    app.layer(set(header::X_FRAME_OPTIONS, "DENY"))
+        .layer(set(header::CONTENT_SECURITY_POLICY, "frame-ancestors 'none'"))
+        .layer(set(header::X_CONTENT_TYPE_OPTIONS, "nosniff"))
 }
 
 /// What is worth compressing: the defaults (nothing tiny, no images), and no
@@ -341,27 +354,33 @@ pub async fn read<T: Send + 'static>(
 const WEAK_SIGNAL: i64 = -75;
 
 async fn status(State(s): State<AppState>) -> ApiResult {
-    let live = s.live.read().unwrap();
-    // The overview's client counters, so that it needs no client list: the
-    // connected clients by radio, and how many of them have a weak signal.
-    let (mut connected, mut weak, mut by_band) = (0, 0, std::collections::BTreeMap::<&str, usize>::new());
-    for (_, c) in live.connected_clients() {
-        connected += 1;
-        weak += usize::from(c.sample.signal.is_some_and(|s| s < WEAK_SIGNAL));
-        if let Some(radio) = c.sample.radio.as_deref() {
-            *by_band.entry(radio).or_default() += 1;
+    // Counted under the lock, serialised after it (the counters are atomics, read as they are then).
+    let (counters, devices, devices_online, connected, weak, by_band) = {
+        let live = s.live.read().unwrap();
+        // The overview's client counters, so that it needs no client list: the
+        // connected clients by radio, and how many of them have a weak signal.
+        let (mut connected, mut weak, mut by_band) = (0, 0, std::collections::BTreeMap::<&str, usize>::new());
+        for (_, c) in live.connected_clients() {
+            connected += 1;
+            weak += usize::from(c.sample.signal.is_some_and(|s| s < WEAK_SIGNAL));
+            if let Some(radio) = c.sample.radio.as_deref() {
+                *by_band.entry(radio).or_default() += 1;
+            }
         }
-    }
+        // With the APs known from the database only, as the device list has them.
+        let devices = live.devices.len() + stored_only(&live).count();
+        let by_band: std::collections::BTreeMap<String, usize> = by_band.into_iter().map(|(radio, n)| (radio.to_string(), n)).collect();
+        (live.counters.clone(), devices, live.devices.values().filter(|d| d.online).count(), connected, weak, by_band)
+    };
     Ok(Json(json!({
         "version": env!("CARGO_PKG_VERSION"),
         "mode": if s.active { "active" } else { "shadow" },
         "source": s.source,
         "started": s.started,
         "now": clock::now_ts(),
-        "counters": &*live.counters,
-        // With the APs known from the database only, as the device list has them.
-        "devices": live.devices.len() + stored_only(&live).count(),
-        "devices_online": live.devices.values().filter(|d| d.online).count(),
+        "counters": &*counters,
+        "devices": devices,
+        "devices_online": devices_online,
         "clients_connected": connected,
         "clients_by_band": by_band,
         "clients_weak": weak,
@@ -609,7 +628,7 @@ async fn clients(State(s): State<AppState>) -> Response {
     let (state, list, ap_names) = {
         let live = s.live.read().unwrap();
         let list: Vec<ClientCopy> = live.clients.iter().map(|(mac, c)| (*mac, c.clone(), live.aliases.get(mac).cloned())).collect();
-        let ap_names: std::collections::HashMap<Mac, String> = live.devices.keys().filter_map(|m| Some((*m, ap_name_of(&live, m)?))).collect();
+        let ap_names: std::collections::HashMap<Mac, String> = live.devices.iter().filter_map(|(m, d)| Some((*m, d.snapshot.ap.hostname.clone()?))).collect();
         (live.state.clone(), list, ap_names)
     };
     let controls = crate::actions::ClientControls::new(state.as_deref());
@@ -742,7 +761,11 @@ async fn dryrun(State(s): State<AppState>) -> Result<Json<DryRunStatus>, ApiErro
                 stored.insert(mac, Arc::new(p));
             }
         }
-        let mut stmt = c.prepare("SELECT id, ts, mac, cfgversion, matches, comparison FROM dryrun_results ORDER BY ts DESC LIMIT 100")?;
+        // Without the diffs' text, which the history never shows (only the counts); text that isn't JSON becomes null.
+        let mut stmt = c.prepare_cached(
+            "SELECT id, ts, mac, cfgversion, matches, CASE WHEN json_valid(comparison) THEN json_remove(comparison, '$.mgmt_cfg.diff', '$.system_cfg.diff') END
+             FROM dryrun_results ORDER BY ts DESC LIMIT 100",
+        )?;
         let history = stmt
             .query_map([], |r| {
                 Ok(DryRunHistory { id: r.get(0)?, ts: r.get(1)?, mac: r.get(2)?, cfgversion: r.get(3)?, matches: r.get(4)?, comparison: raw_json(r.get(5)?) })
@@ -1017,7 +1040,8 @@ const CATCH_UP_SCAN: i64 = 10_000;
 fn catch_up_by_id(c: &rusqlite::Connection, table: &str, after: Option<i64>) -> rusqlite::Result<bool> {
     let Some(after) = after else { return Ok(false) };
     let newest: i64 = c.prepare_cached(&format!("SELECT coalesce(max(id), 0) FROM {table}"))?.query_row([], |r| r.get(0))?;
-    Ok(newest - after <= CATCH_UP_SCAN)
+    // Saturating: `after` comes from the client, and i64::MIN would wrap to "few".
+    Ok(newest.saturating_sub(after) <= CATCH_UP_SCAN)
 }
 
 async fn events(State(s): State<AppState>, Query(q): Query<EventQuery>) -> Result<Json<Vec<EventRow>>, ApiError> {
@@ -1045,6 +1069,8 @@ async fn events(State(s): State<AppState>, Query(q): Query<EventQuery>) -> Resul
             return Ok(vec![]);
         }
         let by_id = catch_up_by_id(c, "events", after)?;
+        // Bound, as every value is, so that each shape of query is compiled once per connection.
+        let limit = w.param(Sql::Integer(limit));
         if let Some(after) = after.filter(|_| !by_id) {
             // Unary plus: not by the rowid range, which would visit every event since.
             w.and("+id > ?", Sql::Integer(after));
@@ -1069,7 +1095,7 @@ async fn events(State(s): State<AppState>, Query(q): Query<EventQuery>) -> Resul
                 .collect();
             format!("{} ORDER BY ts DESC, id DESC LIMIT {limit}", parts.join(" UNION ALL "))
         };
-        let mut stmt = c.prepare(&sql)?;
+        let mut stmt = c.prepare_cached(&sql)?;
         let rows = stmt
             .query_map(params_from_iter(w.params), |r| {
                 Ok(EventRow { id: r.get(5)?, ts: r.get(0)?, kind: r.get(1)?, device_mac: r.get(2)?, client_mac: r.get(3)?, data: raw_json(r.get(4)?) })
@@ -1094,6 +1120,8 @@ struct LogQuery {
 /// The SQL for a log query, newest first; `by_id` as `catch_up_by_id` decides.
 fn logs_sql(w: &mut Where, device: Option<Mac>, search: Option<&str>, after: Option<i64>, by_id: bool, limit: i64) -> String {
     const COLUMNS: &str = "l.ts, l.device_mac, l.src_ip, l.facility, l.severity, l.program, l.msg, l.id";
+    // Bound, as every value is, so that each shape of query is compiled once per connection.
+    let limit = w.param(Sql::Integer(limit));
     if let Some(text) = search {
         // Quote each word so user input cannot break FTS syntax; words are ANDed.
         let fts: Vec<String> = text.split_whitespace().map(|w| format!("\"{}\"", w.replace('"', "\"\""))).collect();
@@ -1152,7 +1180,7 @@ async fn logs(State(s): State<AppState>, Query(q): Query<LogQuery>) -> Result<Js
         let by_id = search.is_none() && catch_up_by_id(c, "logs", after)?;
         let mut w = Where::default();
         let sql = logs_sql(&mut w, device, search.as_deref(), after, by_id, limit);
-        let mut stmt = c.prepare(&sql)?;
+        let mut stmt = c.prepare_cached(&sql)?;
         let rows = stmt
             .query_map(params_from_iter(w.params), |r| {
                 Ok(LogRow {
@@ -1190,7 +1218,7 @@ const RESYNC: &str = r#"{"type":"resync"}"#;
 
 /// Serialises each live message once, whatever the number of sockets: a task
 /// forwards the engine's messages as JSON text to the channel they read.
-/// Messages the task itself misses become a resync.
+/// Messages the task itself misses, or fails to serialise, become a resync.
 pub fn live_json(typed: &broadcast::Sender<LiveMsg>) -> broadcast::Sender<Utf8Bytes> {
     let (tx, _) = broadcast::channel(4096);
     let mut rx = typed.subscribe();
@@ -1199,7 +1227,14 @@ pub fn live_json(typed: &broadcast::Sender<LiveMsg>) -> broadcast::Sender<Utf8By
         loop {
             let text = match rx.recv().await {
                 Ok(_) if out.receiver_count() == 0 => continue, // no socket open
-                Ok(m) => Utf8Bytes::from(serde_json::to_string(&m).unwrap_or_default()),
+                Ok(m) => match serde_json::to_string(&m) {
+                    Ok(text) => Utf8Bytes::from(text),
+                    // A resync in its place, as for a missed one (an empty frame is no JSON to the page).
+                    Err(e) => {
+                        tracing::error!("live message not sent: {e}");
+                        Utf8Bytes::from_static(RESYNC)
+                    }
+                },
                 Err(broadcast::error::RecvError::Lagged(_)) => Utf8Bytes::from_static(RESYNC),
                 Err(broadcast::error::RecvError::Closed) => return,
             };
@@ -1420,6 +1455,19 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn no_answer_can_be_framed_or_sniffed() {
+        let (app, _engine, _dir) = app();
+        // The API, an API error, the UI (or its 404 when unbuilt), the live socket's refusal.
+        for path in ["/api/status", "/api/nope", "/", "/clients", "/api/ws", "/healthz"] {
+            let res = get(&app, path).await;
+            let h = |name| res.headers().get(name).map(|v: &axum::http::HeaderValue| v.to_str().unwrap().to_string());
+            assert_eq!(h(header::X_FRAME_OPTIONS).as_deref(), Some("DENY"), "{path}");
+            assert_eq!(h(header::CONTENT_SECURITY_POLICY).as_deref(), Some("frame-ancestors 'none'"), "{path}");
+            assert_eq!(h(header::X_CONTENT_TYPE_OPTIONS).as_deref(), Some("nosniff"), "{path}");
+        }
+    }
+
+    #[tokio::test]
     async fn live_messages_are_serialised_once_for_the_sockets() {
         let (typed, _) = broadcast::channel(16);
         let json = live_json(&typed);
@@ -1438,11 +1486,16 @@ mod tests {
         let mut engine = crate::engine::Engine::new(s.writer.clone(), Default::default(), s.live.clone(), tx);
         engine.handle(report(json!({ "mac": "02:00:00:00:00:01", "hostname": "Hall", "uptime": 100 })));
         s.writer.exec(Db::Config, "INSERT INTO device_config (mac, ts, mgmt_cfg, system_cfg) VALUES ('02:00:00:00:00:01', 1, 'a=1', 'b=2')", vec![]);
-        s.writer.exec(Db::Config, "INSERT INTO dryrun_results (ts, mac, matches, comparison) VALUES (7, '02:00:00:00:00:01', 1, '{}')", vec![]);
+        let stored = r#"{"mgmt_cfg":{"added":0,"diff":"- a=1"},"system_cfg":{"added":1,"removed":0,"changed":0,"identical":false,"diff":"+ c=3"}}"#;
+        s.writer.exec(Db::Config, "INSERT INTO dryrun_results (ts, mac, matches, comparison) VALUES (7, '02:00:00:00:00:01', 0, ?1)", vec![Sql::Text(stored.into())]);
+        s.writer.exec(Db::Config, "INSERT INTO dryrun_results (ts, mac, matches, comparison) VALUES (6, '02:00:00:00:00:01', 0, 'not json')", vec![]);
         flushed(&s.writer);
         let app = router(s);
         let d = get_json(&app, "/api/dryrun").await;
         assert_eq!((d["devices"][0]["status"].as_str(), d["history"][0]["ts"].as_i64(), d["history"][0]["id"].as_i64()), (Some("no_settings"), Some(7), Some(1)));
+        // The history's comparisons come without the diffs' text.
+        assert_eq!(d["history"][0]["comparison"], json!({ "mgmt_cfg": { "added": 0 }, "system_cfg": { "added": 1, "removed": 0, "changed": 0, "identical": false } }));
+        assert_eq!(d["history"][1]["comparison"], Value::Null);
         assert_eq!(d["devices"][0], json!({ "mac": "02:00:00:00:00:01", "name": "Hall", "status": "no_settings", "settings_stale": false }));
     }
 
@@ -1471,6 +1524,7 @@ mod tests {
         assert_eq!(ts(get_json(&app, "/api/events?kind=client&after=3").await), vec![6, 4]);
         assert_eq!(ts(get_json(&app, "/api/events?kind=client&device=02:00:00:00:00:02&after=1").await), vec![4, 3]);
         assert_eq!(ts(get_json(&app, "/api/events?after=6").await), Vec::<i64>::new());
+        assert_eq!(ts(get_json(&app, &format!("/api/events?after={}&limit=2", i64::MIN)).await), vec![6, 5], "the oldest id there is: everything");
         // Catching up over more rows than are read by id: from the filters' indexes, the same rows.
         writer.exec(Db::Config, "INSERT INTO events (id, ts, kind, device_mac, data) VALUES (?1, 7, 'client_connected', '02:00:00:00:00:02', '{}')", vec![Sql::Integer(CATCH_UP_SCAN + 10)]);
         flushed(&writer);
@@ -1493,6 +1547,7 @@ mod tests {
         // A search is read from the full-text index, newest first, and stops at the limit.
         let mut w = Where::default();
         let sql = logs_sql(&mut w, None, Some("sta"), None, false, 10);
+        assert!(sql.contains("LIMIT ?1)") && w.params[0] == Sql::Integer(10), "the limit is bound, as every value: {sql}");
         let plan: Vec<String> = s
             .store
             .read(Db::Logs, |c| Ok(c.prepare(&format!("EXPLAIN QUERY PLAN {sql}"))?.query_map(params_from_iter(w.params), |r| r.get(3))?.collect::<rusqlite::Result<_>>()?))
@@ -1509,7 +1564,7 @@ mod tests {
         };
         assert_eq!(plan(false), ["SEARCH l USING INDEX logs_device (device_mac=?)"]);
         assert!(plan(true)[0].starts_with("SEARCH l USING INTEGER PRIMARY KEY (rowid>?)"), "{:?}", plan(true));
-        let writer = s.writer.clone();
+        let (writer, s_store) = (s.writer.clone(), s.store.clone());
         let app = router(s);
         let ts = |v: Value| v.as_array().unwrap().iter().map(|e| e["ts"].as_i64().unwrap()).collect::<Vec<_>>();
         assert_eq!(ts(get_json(&app, "/api/logs").await), vec![3, 2, 1]);
@@ -1529,6 +1584,10 @@ mod tests {
         flushed(&writer);
         assert_eq!(ts(get_json(&app, "/api/logs?after=1&device=02:00:00:00:00:02").await), vec![4, 2]);
         assert_eq!(ts(get_json(&app, "/api/logs?after=2").await), vec![4, 3]);
+        assert_eq!(ts(get_json(&app, &format!("/api/logs?after={}&limit=2", i64::MIN)).await), vec![4, 3]);
+        // Far behind: from the indexes, not by id.
+        let by_id = |after| s_store.read(Db::Logs, move |c| Ok(catch_up_by_id(c, "logs", Some(after))?)).unwrap();
+        assert_eq!((by_id(i64::MIN), by_id(-1), by_id(CATCH_UP_SCAN + 9), by_id(i64::MAX)), (false, false, true, true));
     }
 
     #[tokio::test]

@@ -102,6 +102,26 @@ impl Table {
         &INSERTS[self.name]
     }
 
+    /// A series' rows from `tier`, oldest first: `?1` and `?2` bound the time, the
+    /// keys follow from `?3` in key order. One row before `?1` comes too, so the
+    /// first counter rate in range can be computed.
+    fn series_sql(&self, tier: Tier) -> String {
+        let (name, suffix) = (self.name, tier.suffix);
+        let where_keys: Vec<String> = self.keys.iter().enumerate().map(|(i, k)| format!("{k} = ?{}", i + 3)).collect();
+        let where_keys = where_keys.join(" AND ");
+        format!(
+            "SELECT ts, {} FROM {name}{suffix} WHERE {where_keys} AND ts >= (SELECT COALESCE(MAX(ts), ?1) FROM {name}{suffix} WHERE {where_keys} AND ts < ?1) AND ts <= ?2 ORDER BY ts",
+            self.numbers().collect::<Vec<_>>().join(", "),
+        )
+    }
+
+    /// The series statement for each tier, built once per table (as `insert`).
+    fn series(&'static self, tier: usize) -> &'static str {
+        static SERIES: LazyLock<HashMap<(&'static str, usize), String>> =
+            LazyLock::new(|| TABLES.iter().flat_map(|t| TIERS.iter().enumerate().map(move |(i, tier)| ((t.name, i), t.series_sql(*tier)))).collect());
+        &SERIES[&(self.name, tier)]
+    }
+
     /// Aggregates `from` rows into `step`-second buckets of `to`. Gauges are
     /// averaged; counters, settings and texts take the bucket's last value.
     /// SQLite gives bare columns the values of the row holding the single `MAX(ts)`.
@@ -187,8 +207,25 @@ pub fn table(name: &str) -> Option<&'static Table> {
     TABLES.iter().copied().find(|t| t.name == name || t.name.trim_end_matches("_stats") == name)
 }
 
-/// Resolution tiers: (table suffix, bucket seconds, retention seconds).
-pub const TIERS: [(&str, i64, i64); 3] = [("", 0, 48 * 3600), ("_5m", 300, 30 * 86400), ("_1h", 3600, 365 * 86400)];
+/// A resolution tier of the metric tables.
+#[derive(Clone, Copy)]
+pub struct Tier {
+    /// What the tier's tables add to the table's name.
+    pub suffix: &'static str,
+    /// What `Series` calls it.
+    pub name: &'static str,
+    /// Bucket seconds (0 for raw samples).
+    pub step: i64,
+    /// Retention seconds.
+    pub keep: i64,
+}
+
+/// The tiers, finest first; a tier is known by its index here.
+pub const TIERS: [Tier; 3] = [
+    Tier { suffix: "", name: "raw", step: 0, keep: 48 * 3600 },
+    Tier { suffix: "_5m", name: "5m", step: 300, keep: 30 * 86400 },
+    Tier { suffix: "_1h", name: "1h", step: 3600, keep: 365 * 86400 },
+];
 
 const CONFIG_SCHEMA: &str = "
 -- name, cfgversion and online are no longer written; old databases have them filled.
@@ -318,7 +355,7 @@ fn migrate(dir: &Path) -> Result<()> {
     let metrics = open_rw(&dir.join(Db::Metrics.file()))?;
     metrics.execute_batch("CREATE TABLE IF NOT EXISTS rollup_state (name TEXT PRIMARY KEY, upto INTEGER NOT NULL)")?;
     for t in TABLES {
-        for (suffix, ..) in TIERS {
+        for Tier { suffix, .. } in TIERS {
             let name = format!("{}{suffix}", t.name);
             metrics.execute_batch(&t.create_sql(suffix))?;
             // Columns added in later versions (CREATE IF NOT EXISTS keeps old tables as they are).
@@ -336,7 +373,7 @@ fn migrate(dir: &Path) -> Result<()> {
     }
     // One AP's clients over days (its page, from the roll-ups): read through this, not
     // every client's rows in the window. The raw tier, written at every report, goes without.
-    for (suffix, ..) in &TIERS[1..] {
+    for Tier { suffix, .. } in &TIERS[1..] {
         metrics.execute_batch(&format!("CREATE INDEX IF NOT EXISTS client_stats{suffix}_ap ON client_stats{suffix} (ap_mac, ts)"))?;
     }
     Ok(())
@@ -388,6 +425,14 @@ impl Writer {
     }
 }
 
+/// The read-only connections kept per database once a read is done. The
+/// Overview and Radios pages ask for some 8 things at once, nearly all from
+/// metrics.db; a read beyond the kept ones opens a connection (the pragmas,
+/// the schema parsed, no prepared statements) and closes it after. A pool only
+/// grows to the reads seen at once, each connection with up to SQLite's
+/// default page cache (2 MB): some 16 MB per database at most.
+const READ_POOL: usize = 8;
+
 pub struct Store {
     dir: PathBuf,
     pools: [Mutex<Vec<Connection>>; 3],
@@ -431,7 +476,7 @@ impl Store {
         };
         let result = f(&conn);
         let mut pool = self.pools[idx].lock().unwrap();
-        if pool.len() < 4 {
+        if pool.len() < READ_POOL {
             pool.push(conn);
         }
         result
@@ -519,6 +564,9 @@ fn flush(conns: &mut Conns, pending: &mut Vec<Write>) -> usize {
 fn apply(conn: &mut Connection, writes: Vec<Write>) -> Result<usize> {
     let tx = conn.transaction()?;
     let (mut failed, mut first_error) = (0, None);
+    // Each metric table's insert, taken from the statement cache once per batch
+    // rather than looked up by its text for every row (a handful of tables).
+    let mut inserts: Vec<(&'static str, rusqlite::CachedStatement)> = Vec::with_capacity(TABLES.len());
     for w in writes {
         let result = match &w {
             // A row of the wrong length is the engine's mistake: refused, not stored in the wrong columns.
@@ -527,7 +575,14 @@ fn apply(conn: &mut Connection, writes: Vec<Write>) -> Result<usize> {
                 let n_keys = table.keys.len();
                 let ts = Value::Integer(*ts);
                 let params = values[..n_keys].iter().chain([&ts]).chain(&values[n_keys..]);
-                tx.prepare_cached(table.insert()).and_then(|mut s| s.execute(params_from_iter(params)))
+                let i = match inserts.iter().position(|(name, _)| *name == table.name) {
+                    Some(i) => Ok(i),
+                    None => tx.prepare_cached(table.insert()).map(|s| {
+                        inserts.push((table.name, s));
+                        inserts.len() - 1
+                    }),
+                };
+                i.and_then(|i| inserts[i].1.execute(params_from_iter(params)))
             }
             Write::Exec { sql, params, .. } => tx.prepare_cached(sql).and_then(|mut s| s.execute(params_from_iter(params))),
         };
@@ -542,6 +597,7 @@ fn apply(conn: &mut Connection, writes: Vec<Write>) -> Result<usize> {
             });
         }
     }
+    drop(inserts);
     tx.commit()?;
     if let Some(e) = first_error {
         tracing::error!("{failed} write(s) failed and were skipped, the first: {e}");
@@ -593,11 +649,11 @@ fn maintenance(conns: &mut Conns, now: Ts, hourly: bool) {
     let [config, metrics, logs] = conns;
     for t in TABLES {
         for w in TIERS.windows(2) {
-            let ((src_suffix, _, src_keep), (dst_suffix, step_secs, _)) = (w[0], w[1]);
-            let (src, dst) = (format!("{}{src_suffix}", t.name), format!("{}{dst_suffix}", t.name));
-            step(&format!("rolling up {dst}"), rollup(metrics, t, &src, &dst, step_secs, src_keep, now));
+            let (src, dst) = (&w[0], &w[1]);
+            let (src_table, dst_table) = (format!("{}{}", t.name, src.suffix), format!("{}{}", t.name, dst.suffix));
+            step(&format!("rolling up {dst_table}"), rollup(metrics, t, &src_table, &dst_table, dst.step, src.keep, now));
         }
-        for (suffix, _, keep) in TIERS {
+        for Tier { suffix, keep, .. } in TIERS {
             let table = format!("{}{suffix}", t.name);
             step(&format!("retention of {table}"), delete_before(metrics, &table, Rows::Metric, now - keep));
         }
@@ -690,30 +746,20 @@ pub struct Series {
 /// Picks the finest tier that covers the range and keeps the point count sensible.
 pub fn tier_for(from: Ts, to: Ts, now: Ts) -> usize {
     let span = to.saturating_sub(from);
-    if span <= 6 * 3600 && from >= now - TIERS[0].2 {
+    if span <= 6 * 3600 && from >= now - TIERS[0].keep {
         0
-    } else if span <= 8 * 86400 && from >= now - TIERS[1].2 {
+    } else if span <= 8 * 86400 && from >= now - TIERS[1].keep {
         1
     } else {
         2
     }
 }
 
-pub fn series(conn: &Connection, table: &Table, keys: &[String], from: Ts, to: Ts, tier: usize) -> Result<Series> {
-    let (suffix, step, _) = TIERS[tier];
+pub fn series(conn: &Connection, table: &'static Table, keys: &[String], from: Ts, to: Ts, tier: usize) -> Result<Series> {
+    let Tier { step, name, .. } = TIERS[tier];
     let fields: Vec<&'static str> = table.numbers().collect();
-    let where_keys: Vec<String> = table.keys.iter().enumerate().map(|(i, k)| format!("{k} = ?{}", i + 3)).collect();
-    // One row before `from`, so the first counter rate in range can be computed.
-    let sql = format!(
-        "SELECT ts, {} FROM {}{suffix} WHERE {} AND ts >= (SELECT COALESCE(MAX(ts), ?1) FROM {}{suffix} WHERE {} AND ts < ?1) AND ts <= ?2 ORDER BY ts",
-        fields.join(", "),
-        table.name,
-        where_keys.join(" AND "),
-        table.name,
-        where_keys.join(" AND "),
-    );
     let params = [Value::Integer(from), Value::Integer(to)].into_iter().chain(keys.iter().map(|k| Value::Text(k.clone())));
-    let mut stmt = conn.prepare_cached(&sql)?;
+    let mut stmt = conn.prepare_cached(table.series(tier))?;
     let mut rows = stmt.query(params_from_iter(params))?;
 
     // Settings and gauges are returned as stored, counters as rates.
@@ -748,7 +794,7 @@ pub fn series(conn: &Connection, table: &Table, keys: &[String], from: Ts, to: T
         prev_ts = Some(ts);
     }
     let fields = fields.into_iter().zip(columns).collect();
-    Ok(Series { tier: ["raw", "5m", "1h"][tier], step, ts: ts_out, fields })
+    Ok(Series { tier: name, step, ts: ts_out, fields })
 }
 
 /// A writer whose writes are kept, and a function that stores them in new

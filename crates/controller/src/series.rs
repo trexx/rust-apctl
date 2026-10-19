@@ -54,7 +54,7 @@ pub(crate) fn bounded(from: Option<Ts>, to: Option<Ts>, range: Ts) -> (Ts, Ts, u
 
 /// Bucket width for charts: a few hundred points whatever the range.
 pub(crate) fn bucket_for(range: Ts, tier: usize) -> Ts {
-    let min = TIERS[tier].1.max(60);
+    let min = TIERS[tier].step.max(60);
     let target = (range / 288).max(min);
     [60, 300, 900, 1800, 3600, 3 * 3600, 6 * 3600, 86400].into_iter().find(|b| *b >= target).unwrap_or(86400)
 }
@@ -241,10 +241,10 @@ pub(crate) fn load(c: &Connection, spec: Spec, tier: usize, from: Ts, to: Ts) ->
 /// The statement [`load`] runs, and its parameters.
 fn load_query(spec: &Spec, tier: usize, from: Ts, to: Ts) -> anyhow::Result<(String, Vec<Sql>)> {
     let &Spec { table, key, extra, cols, only } = spec;
-    let suffix = TIERS[tier].0;
+    let suffix = TIERS[tier].suffix;
     // Twice the longest interval between two samples, so the one before the window is read.
     // A raw sample covers at most the longest inform interval before it.
-    let step = TIERS[tier].1.max(crate::active::MAX_INFORM_INTERVAL) * 2;
+    let step = TIERS[tier].step.max(crate::active::MAX_INFORM_INTERVAL) * 2;
     let mut params = vec![Sql::Integer(from), Sql::Integer(to), Sql::Integer(step)];
     let only = match only {
         None => String::new(),
