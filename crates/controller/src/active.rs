@@ -527,6 +527,7 @@ impl Active {
 const RESET_QUIET_SECS: Ts = 600;
 
 /// Who sent an inform, and the key it was opened with: what answering it needs.
+#[derive(Clone, Copy)]
 struct Caller {
     mac: Mac,
     gcm: bool,
@@ -577,26 +578,26 @@ pub async fn inform(
     let caller = Caller { mac, gcm: header.flags.contains(Flags::GCM), key, peer: peer.ip(), source: active.proxies.client_ip(&headers, peer.ip()) };
     // Only an AP apctl manages is tried with a key of its own.
     if used == KeyUsed::Default {
-        factory_key_inform(&active, ts, &caller, payload, device_key.is_some()).await
+        factory_key_inform(&active, ts, caller, payload, device_key.is_some()).await
     } else {
-        managed_inform(&active, ts, &caller, header, used, payload).await
+        managed_inform(&active, ts, caller, header, used, payload).await
     }
 }
 
 /// An inform under the factory key: an AP apctl is adopting gets its own key;
 /// any other is answered 404 and listed for adoption. `known`: apctl manages
 /// an AP of this MAC.
-async fn factory_key_inform(active: &Arc<Active>, ts: Ts, caller: &Caller, payload: Value, known: bool) -> Response {
+async fn factory_key_inform(active: &Arc<Active>, ts: Ts, caller: Caller, payload: Value, known: bool) -> Response {
     let mac = caller.mac;
     let adopting = active.live.read().unwrap().adoption.adopting.contains_key(&mac);
     if known && adopting {
         // Adopt pressed: hand the AP its own key (in mgmt_cfg), with the factory key.
         let a = active.clone();
-        let Ok(reply) = tokio::task::spawn_blocking(move || a.adoption_reply(ts, mac, &payload)).await else {
+        let Ok(sealed) = tokio::task::spawn_blocking(move || caller.seal(&a.adoption_reply(ts, mac, &payload))).await else {
             return StatusCode::INTERNAL_SERVER_ERROR.into_response();
         };
         tracing::info!("{mac}: adoption: sending its key");
-        return caller.seal(&reply);
+        return sealed;
     }
     // Not ours, or ours but reset: answered 404 and listed for adoption.
     // What apctl remembers about an AP it no longer has (e.g. AES-GCM) goes.
@@ -624,7 +625,7 @@ async fn factory_key_inform(active: &Arc<Active>, ts: Ts, caller: &Caller, paylo
 
 /// An inform under an AP's own key: the reply to it (a config push, a
 /// command, a heartbeat), and the inform for the engine.
-async fn managed_inform(active: &Arc<Active>, ts: Ts, caller: &Caller, header: inform::Header, used: KeyUsed, payload: Value) -> Response {
+async fn managed_inform(active: &Arc<Active>, ts: Ts, caller: Caller, header: inform::Header, used: KeyUsed, payload: Value) -> Response {
     let (mac, gcm) = (caller.mac, caller.gcm);
     // Its own key: an adoption is complete; a forgotten AP is told to reset
     // (once: the entry goes, so later informs don't finish the forget again).
@@ -673,16 +674,21 @@ async fn managed_inform(active: &Arc<Active>, ts: Ts, caller: &Caller, header: i
         }
     }
 
-    // Rendering the config takes a while: off the async workers.
+    // Rendering the config and sealing the reply take a while: off the async workers.
     let a = active.clone();
-    let Ok((reply, payload)) = tokio::task::spawn_blocking(move || (a.reply(ts, mac, &payload), payload)).await else {
+    let Ok((reply, response, payload)) = tokio::task::spawn_blocking(move || {
+        let reply = a.reply(ts, mac, &payload);
+        let response = caller.seal(&reply);
+        (reply, response, payload)
+    })
+    .await
+    else {
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     };
     let decoded = Decoded { header, key: used, payload };
     if active.engine.send(Input::Inform { ts, peer: caller.source.to_string(), decoded }).await.is_err() {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     }
-    let response = caller.seal(&reply);
     // The engine follows the interval it asked for (or the AP would be called
     // offline on a site where informs come more than a minute apart) and
     // records each push. An AP's interval rarely changes: a heartbeat that
