@@ -699,7 +699,7 @@ pub async fn connectivity(State(s): State<AppState>, Query(q): Query<RangeQuery>
                 bands.insert(b.unwrap_or("all").into(), connectivity_stats(&list, b));
             }
         }
-        Ok(Value::Object(serde_json::Map::from_iter([("bands".to_string(), Value::Object(bands))])))
+        Ok(json!({ "bands": bands }))
     })
     .await?;
     Ok(Json(got))
