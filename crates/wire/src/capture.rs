@@ -307,13 +307,18 @@ impl Tracker {
         conn.last_seen = ts;
         conn.carried |= !tcp.payload().is_empty();
         let half = if to_server { &mut conn.to_server } else { &mut conn.to_client };
+        let before = (half.pos, half.closed());
         half.segment(ts, tcp.sequence_number(), tcp.syn(), tcp.fin(), tcp.payload());
 
-        while let Some(msg) = half.take_http(to_server) {
-            on_event(match msg {
-                Parsed::Request { inform, forwarded_for, body } => HttpEvent::Request { conn: conn_id, ts, inform, forwarded_for, body },
-                Parsed::Response { status, body } => HttpEvent::Response { conn: conn_id, ts, status, body },
-            });
+        // Only new bytes or the end of the stream can complete a message: an ACK, a
+        // copy of a segment (`-i any`) or one queued behind a gap leaves nothing to cut.
+        if (half.pos, half.closed()) != before {
+            while let Some(msg) = half.take_http(to_server) {
+                on_event(match msg {
+                    Parsed::Request { inform, forwarded_for, body } => HttpEvent::Request { conn: conn_id, ts, inform, forwarded_for, body },
+                    Parsed::Response { status, body } => HttpEvent::Response { conn: conn_id, ts, status, body },
+                });
+            }
         }
         // Both sides closed and nothing is missing: release the buffers. The
         // entry itself stays a little longer (`CLOSED_LINGER`), so the duplicate
@@ -1091,6 +1096,31 @@ mod tests {
         h.segment(0, 1, false, false, &big);
         assert!(matches!(h.take_http(true), Some(Parsed::Request { body, .. }) if body.len() == 1 << 20));
         assert_eq!((h.buf.capacity(), h.held()), (0, 0));
+    }
+
+    #[test]
+    fn a_tracked_stream_is_cut_into_messages_when_bytes_or_its_end_arrive() {
+        let mut t = Tracker::new(vec![8080], Vec::new());
+        let (ap, ctrl) = sample::endpoints();
+        let reply = b"HTTP/1.0 200 OK\r\n\r\nall of it";
+        let mut bodies: Vec<Vec<u8>> = Vec::new();
+        let mut send = |t: &mut Tracker, seq: u32, fin: bool, payload: &[u8]| {
+            let tcp = etherparse::PacketBuilder::ethernet2(ctrl.mac, ap.mac).ipv4(ctrl.ip, ap.ip, 64).tcp(ctrl.port, ap.port, seq, 1024);
+            let mut frame = Vec::new();
+            if fin { tcp.fin().write(&mut frame, payload) } else { tcp.write(&mut frame, payload) }.unwrap();
+            t.packet(Linktype::ETHERNET, 0, &frame, &mut |e| {
+                if let HttpEvent::Response { body, .. } = e {
+                    bodies.push(body);
+                }
+            });
+            bodies.len()
+        };
+        assert_eq!(send(&mut t, 1, false, reply), 0, "a response without a length runs to the end of the stream");
+        assert_eq!(send(&mut t, 1, false, reply), 0, "a copy adds nothing");
+        assert_eq!(send(&mut t, 1 + reply.len() as u32, false, b""), 0);
+        assert_eq!(send(&mut t, 1 + reply.len() as u32, true, b""), 1, "a bare FIN ends it");
+        assert_eq!(send(&mut t, 1 + reply.len() as u32, true, b""), 1, "its copy does not cut it again");
+        assert_eq!(bodies, [b"all of it"]);
     }
 
     #[test]
