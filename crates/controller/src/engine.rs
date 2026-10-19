@@ -584,8 +584,8 @@ impl Engine {
     pub fn handle(&mut self, input: Input) {
         match input {
             Input::Inform { ts, peer, decoded } => self.inform(ts, peer, decoded),
-            Input::Reply { ts, mac, decoded } => self.reply(ts, mac, &decoded.payload, true),
-            Input::Replied { ts, mac, payload } => self.reply(ts, mac, &payload, false),
+            Input::Reply { ts, mac, decoded } => self.reply(ts, mac, decoded.payload, true),
+            Input::Replied { ts, mac, payload } => self.reply(ts, mac, payload, false),
             Input::SetConfigMeta { mac, meta } => self.set_config_meta(mac, meta),
             Input::Datagram { ts, src_ip, payload } => self.datagram(ts, &src_ip, &payload),
             Input::Tick(now) => self.tick(now),
@@ -842,7 +842,7 @@ impl Engine {
     ///
     /// The diffs and the dry-run render take a while, so the live view is only
     /// locked to read what they need and then to store the results.
-    fn reply(&self, ts: Ts, mac: Mac, p: &Value, dry_run: bool) {
+    fn reply(&self, ts: Ts, mac: Mac, mut p: Value, dry_run: bool) {
         bump(&self.counters.replies);
         // Nearly every reply repeats the interval the AP already has.
         if let Some(interval) = p["interval"].as_i64() {
@@ -855,26 +855,32 @@ impl Engine {
             return;
         }
         bump(&self.counters.config_pushes);
+        // The push's own configs, moved out rather than copied. One can be
+        // management-only (e.g. after an LED change): it carries mgmt_cfg
+        // alone, and the AP keeps its last full system_cfg.
+        let mut take = |name: &str| match p.get_mut(name).map(Value::take) {
+            Some(Value::String(s)) => Some(s),
+            _ => None,
+        };
+        let (new_mgmt, new_system) = (take("mgmt_cfg"), take("system_cfg"));
         let (radios, previous, state, inform) = {
             let live = self.live.read().unwrap();
             // The last push (unredacted), for the diffs; empty fields if none was seen.
             let previous = live.last_config.get(&mac).cloned().unwrap_or_default();
-            let radios = live.devices.get(&mac).map(|d| d.snapshot.radios.clone()).unwrap_or_default();
-            let has_system = !p["system_cfg"].as_str().unwrap_or(&previous.system_cfg).is_empty();
+            let has_system = new_system.as_ref().map_or(!previous.system_cfg.is_empty(), |s| !s.is_empty());
+            // For the section labels, which only a system_cfg has.
+            let radios = live.devices.get(&mac).filter(|_| has_system).map(|d| d.snapshot.radios.clone()).unwrap_or_default();
             let wanted = dry_run && has_system && self.renderer.is_some();
             let state = live.state.clone().filter(|_| wanted);
             let inform = state.as_ref().and_then(|_| live.raw_informs.get(&mac).cloned());
             (radios, previous, state, inform)
         };
-        // A push can be management-only (e.g. after an LED change): it carries
-        // mgmt_cfg alone, and the AP keeps its last full system_cfg.
-        let field = |name: &str, prev: &str| p[name].as_str().unwrap_or(prev).to_string();
-        let mgmt = field("mgmt_cfg", &previous.mgmt_cfg);
-        let system = field("system_cfg", &previous.system_cfg);
+        let mgmt = new_mgmt.as_deref().unwrap_or(&previous.mgmt_cfg);
+        let system = new_system.as_deref().unwrap_or(&previous.system_cfg);
         let mut data = serde_json::Map::new();
         data.insert("cfgversion".into(), p["cfgversion"].clone());
-        for (field, old) in [("mgmt_cfg", &previous.mgmt_cfg), ("system_cfg", &previous.system_cfg)] {
-            let Some(new) = p[field].as_str() else { continue };
+        for (field, new, old) in [("mgmt_cfg", &new_mgmt, &previous.mgmt_cfg), ("system_cfg", &new_system, &previous.system_cfg)] {
+            let Some(new) = new else { continue };
             let summary = if old.is_empty() {
                 json!({ "baseline": true, "lines": new.lines().count() })
             } else {
@@ -887,9 +893,9 @@ impl Engine {
         // this push are only named in the previous config, which is read only
         // when this push replaces it.
         if !system.is_empty() {
-            let new_system = p["system_cfg"].is_string() && !previous.system_cfg.is_empty();
-            let mut labels = if new_system { section_labels(&previous.system_cfg, &radios) } else { Default::default() };
-            labels.extend(section_labels(&system, &radios));
+            let replaced = new_system.is_some() && !previous.system_cfg.is_empty();
+            let mut labels = if replaced { section_labels(&previous.system_cfg, &radios) } else { Default::default() };
+            labels.extend(section_labels(system, &radios));
             data.insert("labels".into(), Value::Object(labels));
         }
         // Without one in the push: the one its mgmt_cfg carries (this push's, else
@@ -909,11 +915,10 @@ impl Engine {
                 Sql::Text(mac.to_string()),
                 Sql::Integer(ts),
                 cfgversion.clone().into(),
-                p["mgmt_cfg"].as_str().map(cfgdiff::redact).into(),
-                p["system_cfg"].as_str().map(cfgdiff::redact).into(),
+                new_mgmt.as_deref().map(cfgdiff::redact).into(),
+                new_system.as_deref().map(cfgdiff::redact).into(),
             ],
         );
-
         // Dry run: what would apctl have pushed for the same AP at this moment?
         let dry = match (&self.renderer, &state) {
             (Some(render), Some(state)) => {
@@ -922,38 +927,50 @@ impl Engine {
                     device_mac: &mac.to_string(),
                     inform: inform.as_deref(),
                     cfgversion: cfgversion.as_deref().unwrap_or(""),
-                    previous_system_cfg: Some(&system),
+                    previous_system_cfg: Some(system),
                 };
-                let result = render(&req).map(|ours| crate::dryrun::compare(&ours, &mgmt, &system, false));
-                let (matches, payload) = match &result {
-                    Ok(c) => (c.matches(), serde_json::to_string(c).unwrap_or_default()),
-                    Err(e) => (false, json!({ "error": format!("{e:#}") }).to_string()),
-                };
-                self.writer.exec(
-                    Db::Config,
-                    "INSERT INTO dryrun_results (ts, mac, cfgversion, matches, comparison) VALUES (?1, ?2, ?3, ?4, ?5)",
-                    vec![Sql::Integer(ts), Sql::Text(mac.to_string()), cfgversion.clone().into(), Sql::Integer(matches as i64), Sql::Text(payload)],
-                );
-                Some(match &result {
-                    Ok(c) => json!({ "matches": matches, "system_cfg": { "added": c.system_cfg.added, "removed": c.system_cfg.removed, "changed": c.system_cfg.changed, "same_content": c.system_cfg.same_content } }),
-                    Err(e) => json!({ "matches": false, "error": format!("{e:#}") }),
-                })
+                Some(self.dry_run(render, ts, &req, cfgversion.as_deref(), mgmt))
             }
             _ => None,
         };
 
         // As in `inform`: the write lock is held for the swap alone, and the old
         // push is dropped and the events emitted after it.
+        let pushed = PushedConfig {
+            mgmt_cfg: new_mgmt.unwrap_or_else(|| previous.mgmt_cfg.clone()),
+            system_cfg: new_system.unwrap_or_else(|| previous.system_cfg.clone()),
+            cfgversion,
+        };
         let mut live = self.live.write().unwrap();
         if let Some(d) = live.devices.get_mut(&mac) {
             d.last_config_push = Some(ts);
         }
-        let old_config = live.last_config.insert(mac, Arc::new(PushedConfig { mgmt_cfg: mgmt, system_cfg: system, cfgversion }));
+        let old_config = live.last_config.insert(mac, Arc::new(pushed));
         drop(live);
         drop((old_config, previous));
         self.emit(Event::device(ts, EventKind::ConfigPushed, mac, Value::Object(data)));
         if let Some(summary) = dry {
             self.emit(Event::device(ts, EventKind::DryrunCompared, mac, summary));
+        }
+    }
+
+    /// Renders the AP's config for `req` and compares it with the push (its
+    /// `mgmt` and `req.previous_system_cfg`): stored, and summed up for the event.
+    fn dry_run(&self, render: &crate::dryrun::RenderFn, ts: Ts, req: &crate::dryrun::RenderRequest, cfgversion: Option<&str>, mgmt: &str) -> Value {
+        let system = req.previous_system_cfg.unwrap_or_default();
+        let result = render(req).map(|ours| crate::dryrun::compare(&ours, mgmt, system, false));
+        let (matches, payload) = match &result {
+            Ok(c) => (c.matches(), serde_json::to_string(c).unwrap_or_default()),
+            Err(e) => (false, json!({ "error": format!("{e:#}") }).to_string()),
+        };
+        self.writer.exec(
+            Db::Config,
+            "INSERT INTO dryrun_results (ts, mac, cfgversion, matches, comparison) VALUES (?1, ?2, ?3, ?4, ?5)",
+            vec![Sql::Integer(ts), Sql::Text(req.device_mac.to_string()), cfgversion.map(str::to_string).into(), Sql::Integer(matches as i64), Sql::Text(payload)],
+        );
+        match &result {
+            Ok(c) => json!({ "matches": matches, "system_cfg": { "added": c.system_cfg.added, "removed": c.system_cfg.removed, "changed": c.system_cfg.changed, "same_content": c.system_cfg.same_content } }),
+            Err(e) => json!({ "matches": false, "error": format!("{e:#}") }),
         }
     }
 
@@ -2456,8 +2473,22 @@ mod tests {
         h.engine.handle(Input::Reply { ts: 240, mac, decoded: decoded(json!({ "_type": "setparam", "system_cfg": "x=2" })) });
         assert_eq!(h.live.read().unwrap().last_config[&mac].cfgversion.as_deref(), Some("v1"));
         flushed(&h.writer);
-        let stored: String = h.store.read(Db::Config, |c| Ok(c.query_row("SELECT cfgversion FROM device_config", [], |r| r.get(0))?)).unwrap();
-        assert_eq!(stored, "v1");
+        let cfgversion: String = h.store.read(Db::Config, |c| Ok(c.query_row("SELECT cfgversion FROM device_config", [], |r| r.get(0))?)).unwrap();
+        assert_eq!(cfgversion, "v1");
+
+        // A management-only push keeps the last system_cfg.
+        h.engine.handle(Input::Reply { ts: 250, mac, decoded: decoded(json!({ "_type": "setparam", "mgmt_cfg": "cfgversion=v2\na=2" })) });
+        let last = h.live.read().unwrap().last_config[&mac].clone();
+        assert_eq!((last.mgmt_cfg.as_str(), last.system_cfg.as_str(), last.cfgversion.as_deref()), ("cfgversion=v2\na=2", "x=2", Some("v2")));
+        // With settings and a renderer, a push is compared with what apctl would push.
+        h.engine.set_state(260, json!({}));
+        h.engine.set_renderer(Arc::new(|_: &crate::dryrun::RenderRequest| -> anyhow::Result<crate::dryrun::Rendered> { anyhow::bail!("no template") }));
+        h.engine.handle(Input::Reply { ts: 270, mac, decoded: decoded(json!({ "_type": "setparam", "system_cfg": "x=3" })) });
+        assert_eq!(stored(&h, EventKind::DryrunCompared)[0]["error"], "no template");
+        flushed(&h.writer);
+        let row: (String, Option<String>, i64) =
+            h.store.read(Db::Config, |c| Ok(c.query_row("SELECT mac, cfgversion, matches FROM dryrun_results", [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?)).unwrap();
+        assert_eq!(row, (AP1.to_string(), Some("v2".into()), 0));
     }
 
     #[test]
