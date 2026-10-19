@@ -74,9 +74,9 @@ fn captured_key(d: &Decoded, keys: &KeyStore) -> [u8; 16] {
 /// Readies a captured inform to be sent by an AP that runs `running` (if it took a
 /// pushed config) and seals with `key`: it says it is in factory state when that key
 /// is the factory one, whatever it said in the capture.
-fn prepare(payload: &mut Value, running: Option<&String>, key: &[u8; 16]) {
+fn prepare(payload: &mut Value, running: Option<&str>, key: &[u8; 16]) {
     if let Some(v) = running {
-        payload["cfgversion"] = Value::from(v.clone());
+        payload["cfgversion"] = Value::from(v);
     }
     payload["default"] = Value::from(*key == inform::DEFAULT_KEY);
 }
@@ -101,7 +101,7 @@ fn collect(input: impl Read + Send, ports: &[u16], keys: &KeyStore, limit: usize
     Ok((informs, end))
 }
 
-pub fn run(pcap: &str, ports: &[u16], keys: &KeyStore, url: &str, limit: usize, every: f64) -> Result<()> {
+pub fn run(pcap: &str, ports: &[u16], keys: &KeyStore, url: &str, limit: usize, every: Duration) -> Result<()> {
     if !is_local(url) {
         bail!("refusing to simulate APs against {url}: only local controllers (http:// to 127.0.0.1, ::1 or localhost)");
     }
@@ -118,18 +118,18 @@ pub fn run(pcap: &str, ports: &[u16], keys: &KeyStore, url: &str, limit: usize, 
     let mut keys_now: HashMap<Mac, [u8; 16]> = HashMap::new();
     let mut counts: HashMap<String, usize> = HashMap::new();
     for (i, (mut payload, captured)) in informs.into_iter().enumerate() {
-        if i > 0 && every > 0.0 {
-            std::thread::sleep(Duration::from_secs_f64(every));
+        if i > 0 && !every.is_zero() {
+            std::thread::sleep(every);
         }
         let mac: Mac = payload["mac"].as_str().context("inform without mac")?.parse()?;
         let key = keys_now.get(&mac).copied().unwrap_or(captured);
-        prepare(&mut payload, running.get(&mac), &key);
+        prepare(&mut payload, running.get(&mac).map(String::as_str), &key);
         // These are real AP keys: a GCM nonce must never repeat under one.
         let packet = inform::seal(mac, Flags::ENCRYPTED | Flags::GCM | Flags::ZLIB, crate::random_iv(), &key, payload.to_string().as_bytes());
         let (status, body) = post(url, &packet)?;
         // Replies are counted by status, and those with 200 by their type.
-        let (counted, line) = if status != 200 {
-            (format!("HTTP {status}"), format!("HTTP {status}"))
+        let (counted, detail) = if status != 200 {
+            (format!("HTTP {status}"), String::new())
         } else {
             let pkt = Packet::parse(&body)?;
             let reply: Value = serde_json::from_slice(&pkt.open(&key).context("reply does not decrypt with the AP's key")?)?;
@@ -141,12 +141,13 @@ pub fn run(pcap: &str, ports: &[u16], keys: &KeyStore, url: &str, limit: usize, 
                         keys_now.insert(mac, k);
                     }
                     let v = reply["cfgversion"].as_str().or_else(|| mgmt.lines().find_map(|l| l.strip_prefix("cfgversion="))).unwrap_or("").to_string();
-                    let lines = reply["system_cfg"].as_str().map_or(0, |s| s.lines().count());
-                    if reply["system_cfg"].is_string() {
-                        running.insert(mac, v.clone());
-                    }
+                    let lines = reply["system_cfg"].as_str().map(|s| s.lines().count());
                     let adopted = if mgmt.contains("authkey=") { ", new key (adopted)" } else { "" };
-                    format!("cfgversion {v}, system_cfg {lines} lines, flags {:?}{adopted}", pkt.header.flags)
+                    let detail = format!("cfgversion {v}, system_cfg {} lines, flags {:?}{adopted}", lines.unwrap_or(0), pkt.header.flags);
+                    if lines.is_some() {
+                        running.insert(mac, v);
+                    }
+                    detail
                 }
                 "setdefault" => {
                     // Factory reset: the factory key and no config.
@@ -159,11 +160,10 @@ pub fn run(pcap: &str, ports: &[u16], keys: &KeyStore, url: &str, limit: usize, 
                 "reboot" => reply["reboot_type"].as_str().unwrap_or("").to_string(),
                 _ => String::new(),
             };
-            let line = format!("{kind} {detail}");
-            (kind, line)
+            (kind, detail)
         };
+        println!("{mac} reports {:<16} -> {}", payload["cfgversion"].as_str().unwrap_or(""), format!("{counted} {detail}").trim_end());
         *counts.entry(counted).or_default() += 1;
-        println!("{mac} reports {:<16} -> {line}", payload["cfgversion"].as_str().unwrap_or(""));
     }
     eprintln!("replies: {counts:?}");
     Ok(())
@@ -186,7 +186,7 @@ mod tests {
         assert_eq!(captured_key(&decoded(&keys, &own), &keys), own);
         assert_eq!(captured_key(&decoded(&keys, &inform::DEFAULT_KEY), &keys), inform::DEFAULT_KEY, "reset, though a key is stored");
         let mut p = json!({ "default": false, "cfgversion": "old" });
-        prepare(&mut p, Some(&"new".to_string()), &inform::DEFAULT_KEY);
+        prepare(&mut p, Some("new"), &inform::DEFAULT_KEY);
         assert_eq!(p, json!({ "default": true, "cfgversion": "new" }));
         prepare(&mut p, None, &own);
         assert_eq!(p, json!({ "default": false, "cfgversion": "new" }), "adopted: no longer in factory state");

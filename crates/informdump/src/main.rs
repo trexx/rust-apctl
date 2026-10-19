@@ -16,6 +16,7 @@ mod simulate;
 use std::io::Write;
 use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand};
@@ -39,6 +40,7 @@ enum Cmd {
         /// Hex authkey to use (otherwise --keys, then the default key, are tried).
         #[arg(long)]
         key: Option<String>,
+        /// JSON file with device authkeys (a MAC->key map or an import snapshot).
         #[arg(long)]
         keys: Option<String>,
     },
@@ -47,9 +49,6 @@ enum Cmd {
         file: String,
         #[command(flatten)]
         common: Common,
-        /// Show every inform and every noop reply, not just changes.
-        #[arg(long)]
-        all: bool,
     },
     /// Snapshot sites, WLANs and device authkeys from a controller's MongoDB (read-only).
     ///
@@ -101,8 +100,8 @@ enum Cmd {
         #[arg(long, default_value = "40")]
         limit: usize,
         /// Seconds to wait between informs (0: as fast as the controller answers).
-        #[arg(long, default_value = "0")]
-        every: f64,
+        #[arg(long, default_value = "0", value_parser = seconds)]
+        every: Duration,
         /// Server ports carrying inform traffic in the capture.
         #[arg(long = "port", default_value = "8080")]
         ports: Vec<u16>,
@@ -111,8 +110,8 @@ enum Cmd {
     /// stdout, for demos and screenshots: `apctl serve --keys <demo-state output>
     /// --shadow-cmd "informdump demo --live"`.
     Demo {
-        /// Hours of history before now.
-        #[arg(long, default_value = "24")]
+        /// Hours of history before now (at most a year).
+        #[arg(long, default_value = "24", value_parser = history_hours)]
         hours: f64,
         /// Keep reporting in real time after the history.
         #[arg(long)]
@@ -125,9 +124,6 @@ enum Cmd {
     Watch {
         #[command(flatten)]
         common: Common,
-        /// Show every inform and every noop reply, not just changes.
-        #[arg(long)]
-        all: bool,
     },
 }
 
@@ -139,6 +135,9 @@ struct Common {
     /// Server ports carrying inform traffic.
     #[arg(long = "port", default_value = "8080")]
     ports: Vec<u16>,
+    /// Show every inform and every noop reply, not just changes.
+    #[arg(long)]
+    all: bool,
     /// Print the full decoded JSON of every shown message.
     #[arg(long)]
     full: bool,
@@ -152,6 +151,19 @@ struct Common {
     /// Print passwords, PSKs and keys instead of masking them.
     #[arg(long)]
     no_redact: bool,
+}
+
+/// A number of seconds from 0 up (`--every`).
+fn seconds(s: &str) -> Result<Duration, String> {
+    let secs: f64 = s.parse().map_err(|e| format!("{e}"))?;
+    Duration::try_from_secs_f64(secs).map_err(|_| "not a number of seconds from 0 up".into())
+}
+
+/// `demo --hours`: from 0 to a year.
+fn history_hours(s: &str) -> Result<f64, String> {
+    const MAX: f64 = 365.0 * 24.0;
+    let hours: f64 = s.parse().map_err(|e| format!("{e}"))?;
+    if (0.0..=MAX).contains(&hours) { Ok(hours) } else { Err(format!("not from 0 to {MAX} hours")) }
 }
 
 fn load_keys(path: Option<&str>) -> Result<KeyStore> {
@@ -168,11 +180,11 @@ fn load_keys(path: Option<&str>) -> Result<KeyStore> {
     }
 }
 
-fn run_capture(input: &str, common: Common, all: bool) -> Result<()> {
+fn run_capture(input: &str, common: Common) -> Result<()> {
     let keys = load_keys(common.keys.as_deref())?;
     let mut reporter = Reporter::new(
         keys,
-        Options { all, full: common.full, json: common.json, save: common.save, redact: !common.no_redact },
+        Options { all: common.all, full: common.full, json: common.json, save: common.save, redact: !common.no_redact },
     );
     let end = capture::run(capture::open_input(input)?, &common.ports, |ev| {
         reporter.handle(ev);
@@ -255,11 +267,11 @@ fn main() -> Result<()> {
             }
             let d = wire::decode::decode(&body, &store, None)?;
             eprintln!("{:#?}\nkey used: {:?}", d.header, d.key);
-            println!("{}", serde_json::to_string_pretty(&d.payload)?);
+            println!("{}", report::escape_controls(&serde_json::to_string_pretty(&d.payload)?, true));
             Ok(())
         }
-        Cmd::Pcap { file, common, all } => run_capture(&file, common, all),
-        Cmd::Watch { common, all } => run_capture("-", common, all),
+        Cmd::Pcap { file, common } => run_capture(&file, common),
+        Cmd::Watch { common } => run_capture("-", common),
         Cmd::Demo { hours, live } => demo::run(hours, live, std::io::BufWriter::new(std::io::stdout().lock())),
         Cmd::DemoState => {
             println!("{}", serde_json::to_string_pretty(&demo::state()?)?);
@@ -278,6 +290,25 @@ fn main() -> Result<()> {
         Cmd::Import { .. } => anyhow::bail!(
             "this informdump was built without MongoDB support; rebuild it with `cargo build --release -p informdump --features mongo`"
         ),
+    }
+}
+
+#[cfg(test)]
+mod cli_tests {
+    use clap::Parser;
+
+    #[test]
+    fn durations_out_of_range_are_refused_when_parsing() {
+        let parse = |args: &[&str]| super::Cli::try_parse_from([&["informdump"], args].concat()).map(|c| c.cmd);
+        let simulate = |every| parse(&["simulate", "x.pcap", "--keys", "k.json", "--url", "http://127.0.0.1/inform", "--every", every]);
+        for bad in ["inf", "-1", "NaN", "1e300", "soon"] {
+            assert!(simulate(bad).is_err(), "--every {bad}");
+        }
+        assert!(matches!(simulate("0.5"), Ok(super::Cmd::Simulate { every, .. }) if every == std::time::Duration::from_millis(500)));
+        for bad in ["-1", "inf", "NaN", "1e9", "8761"] {
+            assert!(parse(&["demo", "--hours", bad]).is_err(), "--hours {bad}");
+        }
+        assert!(matches!(parse(&["demo", "--hours", "0"]), Ok(super::Cmd::Demo { hours: 0.0, .. })));
     }
 }
 

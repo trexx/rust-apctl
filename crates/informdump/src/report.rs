@@ -1,6 +1,8 @@
 //! Decodes inform HTTP bodies and prints what happened, including config diffs.
 
+use std::borrow::Cow;
 use std::collections::HashMap;
+use std::fmt::Write as _;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
@@ -162,7 +164,7 @@ impl Reporter {
                 Some(d) if d.is_empty() => println!("    {field}: unchanged"),
                 Some(d) => {
                     println!("    {field}: {} added, {} removed, {} changed", d.added.len(), d.removed.len(), d.changed.len());
-                    print!("{}", d.render("      ", self.opts.redact));
+                    print!("{}", escape_controls(&d.render("      ", self.opts.redact), true));
                 }
             }
         }
@@ -173,7 +175,8 @@ impl Reporter {
 
     /// Pretty JSON for printing, with secrets masked unless redaction is off.
     fn printable(&self, v: &Value) -> String {
-        if self.opts.redact { pretty(&redact_json(v)) } else { pretty(v) }
+        let text = if self.opts.redact { pretty(&redact_json(v)) } else { pretty(v) };
+        escape_controls(&text, true).into_owned()
     }
 
     fn emit_json(&self, ts: Micros, mac: Mac, kind: &str, d: Decoded, diffs: Option<Value>) {
@@ -188,13 +191,13 @@ impl Reporter {
         if let Some(diffs) = diffs {
             obj["diffs"] = diffs;
         }
-        println!("{obj}");
+        println!("{}", escape_controls(&obj.to_string(), false));
     }
 
     /// A `--json` line for a message with no payload to show: one that could not be
     /// decoded, or an empty reply. `fields` follow the time and the MAC (null when not known).
     fn emit_undecoded(&self, ts: Micros, mac: Option<Mac>, fields: Value) {
-        println!("{}", undecoded_json(ts, mac, fields));
+        println!("{}", escape_controls(&undecoded_json(ts, mac, fields).to_string(), false));
     }
 
     /// Saves a payload unredacted (authkeys, PSKs): owner-only directory and files.
@@ -213,9 +216,35 @@ impl Reporter {
     }
 
     fn line(&self, ts: Micros, mac: Option<Mac>, dir: &str, text: &str) {
-        let mac = mac.map(|m| m.to_string()).unwrap_or_else(|| "??:??:??:??:??:??".into());
-        println!("{} {mac} {dir} {text}", format_ts(ts));
+        println!("{}", text_line(ts, mac, dir, text));
     }
+}
+
+/// One line of text output. `text` holds decoded strings (a hostname, a reply's type),
+/// which whoever sent the packet chose: its control characters are escaped.
+fn text_line(ts: Micros, mac: Option<Mac>, dir: &str, text: &str) -> String {
+    let mac = mac.map(|m| m.to_string()).unwrap_or_else(|| "??:??:??:??:??:??".into());
+    format!("{} {mac} {dir} {}", format_ts(ts), escape_controls(text, false))
+}
+
+/// `s` with its control characters (escape sequences a terminal acts on, carriage
+/// returns, C1 codes, and line breaks unless `lines`) written as JSON escapes them
+/// (`\u001b`). JSON stays JSON: serde_json leaves only DEL and the C1 codes unescaped,
+/// and only inside strings, where an escape stands for the same character.
+pub fn escape_controls(s: &str, lines: bool) -> Cow<'_, str> {
+    let escaped = |c: char| c.is_control() && !(lines && c == '\n');
+    if !s.chars().any(escaped) {
+        return Cow::Borrowed(s);
+    }
+    let mut out = String::with_capacity(s.len() + 16);
+    for c in s.chars() {
+        if escaped(c) {
+            let _ = write!(out, "\\u{:04x}", u32::from(c));
+        } else {
+            out.push(c);
+        }
+    }
+    Cow::Owned(out)
 }
 
 fn undecoded_json(ts: Micros, mac: Option<Mac>, fields: Value) -> Value {
@@ -235,15 +264,16 @@ fn save_name(ts: Micros, seq: u64, mac: Mac, kind: &str) -> String {
 }
 
 /// Masks secret fields, including secret lines inside `*_cfg` blobs. Under a secret
-/// key every string is masked, however deeply it is nested (`x_ssh_keys: [{...}]`).
+/// key every string is masked, however deeply it is nested (`x_ssh_keys: [{...}]`), a
+/// whole `*_cfg` blob too.
 fn redact_json(v: &Value) -> Value {
     match v {
         Value::Object(m) => Value::Object(
             m.iter()
                 .map(|(k, v)| {
                     let v = match v {
-                        Value::String(s) if k.ends_with("_cfg") => Value::String(cfgdiff::redact(s)),
                         secret if cfgdiff::is_secret(k) => redact_all(secret),
+                        Value::String(s) if k.ends_with("_cfg") => Value::String(cfgdiff::redact(s)),
                         other => redact_json(other),
                     };
                     (k.clone(), v)
@@ -316,6 +346,8 @@ mod tests {
         assert_eq!(out["psk"], json!(["<redacted>", "<redacted>"]));
         assert_eq!(out["radio_table"], json!([{ "name": "wifi0", "x_secret": { "inner": "<redacted>" } }]));
         assert!(!out.to_string().contains("hunter22") && out["system_cfg"].as_str().unwrap().contains("radio.1.channel=36"));
+        let out = redact_json(&json!({ "x_backup_cfg": "radio.1.channel=36", "x_secret": { "mgmt_cfg": "radio.1.channel=36" } }));
+        assert_eq!(out, json!({ "x_backup_cfg": "<redacted>", "x_secret": { "mgmt_cfg": "<redacted>" } }), "a secret config is masked whole");
     }
 
     #[test]
@@ -324,6 +356,20 @@ mod tests {
         let line = undecoded_json(1_791_840_601_123_456, Some(mac), json!({ "kind": "inform", "from": "10.0.0.5", "error": "no key" }));
         assert_eq!(line.to_string(), r#"{"ts":"2026-10-12T21:30:01.123Z","mac":"02:00:00:00:00:01","kind":"inform","from":"10.0.0.5","error":"no key"}"#);
         assert_eq!(undecoded_json(0, None, json!({ "kind": "reply", "status": 200, "empty": true }))["mac"], Value::Null);
+    }
+
+    #[test]
+    fn control_characters_from_a_packet_are_escaped_in_text_and_json() {
+        let mac: Mac = "02:00:00:00:00:01".parse().unwrap();
+        let line = text_line(0, Some(mac), "->", "inform hostname=x\u{1b}]0;owned\u{7}\r\nfake line\u{9b}2J");
+        assert_eq!(line, r"1970-01-01T00:00:00.000Z 02:00:00:00:00:01 -> inform hostname=x\u001b]0;owned\u0007\u000d\u000afake line\u009b2J");
+        assert_eq!(escape_controls("  + a=1\n  ~ b: \u{1b}[2J -> 2\n", true), "  + a=1\n  ~ b: \\u001b[2J -> 2\n");
+        assert!(matches!(escape_controls("plain\ttext", true), Cow::Owned(_)) && matches!(escape_controls("plain text", false), Cow::Borrowed(_)));
+        let payload = json!({ "hostname": "a\u{1b}[2J\u{7f}\u{9b}b", "na\u{9b}me": ["\u{85}"] });
+        for text in [escape_controls(&payload.to_string(), false), escape_controls(&pretty(&payload), true)] {
+            assert!(!text.chars().any(|c| c.is_control() && c != '\n'), "{text:?}");
+            assert_eq!(serde_json::from_str::<Value>(&text).unwrap(), payload, "still JSON, of the same value");
+        }
     }
 
     #[test]

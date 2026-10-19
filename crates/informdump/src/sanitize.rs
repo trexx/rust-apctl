@@ -419,35 +419,39 @@ impl Sanitizer {
         self.scrub_ids(out)
     }
 
-    /// Rewrites MACs, UUIDs, long hex and the addresses that say where a network is.
+    /// Rewrites MACs, UUIDs, long hex and the addresses that say where a network is. A
+    /// pass that finds nothing to replace copies nothing.
     fn scrub_ids(&mut self, mut out: String) -> String {
         let fakes = &mut self.fakes;
-        out = replace_all(&self.uuid, &out, |m| fakes.get(Kind::Uuid, &m.to_ascii_lowercase(), |n| format!("00000000-0000-4000-8000-{n:012x}")));
-        out = replace_all(&self.mac, &out, |m| fakes.mac(m));
-        out = replace_all(&self.mac_other, &out, |m| fakes.any_mac(m));
+        if let Some(r) = replace_all(&self.uuid, &out, |m| Some(fakes.get(Kind::Uuid, &m.as_str().to_ascii_lowercase(), |n| format!("00000000-0000-4000-8000-{n:012x}")))) {
+            out = r;
+        }
+        if let Some(r) = replace_all(&self.mac, &out, |m| Some(fakes.mac(m.as_str()))) {
+            out = r;
+        }
+        if let Some(r) = replace_all(&self.mac_other, &out, |m| Some(fakes.any_mac(m.as_str()))) {
+            out = r;
+        }
         // A bare 12-hex string is only treated as a MAC when we already know that MAC
         // (serial numbers on these APs are the MAC without colons).
-        out = replace_all(&self.mac_bare, &out, |m| if fakes.knows_mac(&colon_mac(m)) { fakes.any_mac(m) } else { m.to_string() });
-        out = replace_all(&self.hex, &out, |m| {
+        if let Some(r) = replace_all(&self.mac_bare, &out, |m| fakes.knows_mac(&colon_mac(m.as_str())).then(|| fakes.any_mac(m.as_str()))) {
+            out = r;
+        }
+        if let Some(r) = replace_all(&self.hex, &out, |m| {
             let len = m.len();
-            fakes.get(Kind::Hex, &m.to_ascii_lowercase(), |n| format!("{n:0len$x}"))
-        });
-        out = scrub_ipv6(&self.ipv6, &out, fakes);
+            Some(fakes.get(Kind::Hex, &m.as_str().to_ascii_lowercase(), |n| format!("{n:0len$x}")))
+        }) {
+            out = r;
+        }
+        if let Some(r) = scrub_ipv6(&self.ipv6, &out, fakes) {
+            out = r;
+        }
         // Public IPv4 addresses (the WAN address, the ISP's DNS servers) likewise;
         // private ones say nothing about where the network is.
-        let mut ipv4 = String::with_capacity(out.len());
-        let mut last = 0;
-        for m in self.ipv4.find_iter(&out) {
-            let (a, b) = (m.start(), m.end());
-            if is_public_ipv4(m.as_str()) && !in_longer_dotted(out.as_bytes(), a, b) {
-                ipv4.push_str(&out[last..a]);
-                ipv4.push_str(&fakes.get(Kind::Ipv4, m.as_str(), fake_ipv4));
-                last = b;
-            }
-        }
-        if last > 0 {
-            ipv4.push_str(&out[last..]);
-            out = ipv4;
+        let bytes = out.as_bytes();
+        let public = |m: &regex::Match| is_public_ipv4(m.as_str()) && !in_longer_dotted(bytes, m.start(), m.end());
+        if let Some(r) = replace_all(&self.ipv4, &out, |m| public(&m).then(|| fakes.get(Kind::Ipv4, m.as_str(), fake_ipv4))) {
+            out = r;
         }
         out
     }
@@ -608,28 +612,39 @@ impl Sanitizer {
     }
 
     /// Rewrites the `key=value` config blob under `key` line by line. `under_secret`: its
-    /// own key or one above it is secret.
+    /// own key or one above it is secret. A line is `key=value` only when what comes
+    /// before its first `=` is a config key ([`is_cfg_key`]); its identifiers are
+    /// rewritten like a JSON key's. Line ends (`\n` or `\r\n`, and one after the last
+    /// line) are kept as they are.
     fn cfg(&mut self, key: &str, blob: &str, under_secret: bool) -> String {
-        blob.lines()
-            .map(|l| match l.split_once('=') {
-                Some((k, v)) => format!("{k}={}", self.field("", k, under_secret, v)),
-                None => self.cfg_line(key, l, under_secret),
+        blob.split('\n')
+            .map(|l| {
+                let (l, cr) = l.strip_suffix('\r').map_or((l, ""), |l| (l, "\r"));
+                let out = match l.split_once('=').filter(|(k, _)| is_cfg_key(k)) {
+                    Some((k, v)) => {
+                        let value = self.field("", k, under_secret, v);
+                        format!("{}={value}", self.scrub_ids(k.to_string()))
+                    }
+                    None => self.cfg_line(key, l, under_secret),
+                };
+                out + cr
             })
             .collect::<Vec<_>>()
             .join("\n")
     }
 
     /// A config line that is not `key=value`: the controller's section comments (`# wlans
-    /// (radio)`) pass; anything else is text, listed like a field off the allow-list.
+    /// (radio)`) pass; anything else, a comment with an `=` in it too, is text, listed
+    /// like a field off the allow-list.
     fn cfg_line(&mut self, key: &str, line: &str, under_secret: bool) -> String {
         if line.is_empty() {
             String::new()
         } else if under_secret {
             self.fakes.get(Kind::Secret, line, |n| format!("secret-{n}"))
-        } else if line.starts_with('#') {
+        } else if line.starts_with('#') && !line.contains('=') {
             self.scrub(line)
         } else {
-            self.unlisted.insert(format!("{} lines without '='", key.to_ascii_lowercase()));
+            self.unlisted.insert(format!("{} lines that are not key=value", key.to_ascii_lowercase()));
             self.fakes.get(Kind::Text, line, |n| format!("text-{n}"))
         }
     }
@@ -752,6 +767,19 @@ fn is_secret_key(key: &str) -> bool {
     cfgdiff::is_secret(key) && !key.eq_ignore_ascii_case("key")
 }
 
+/// Whether `k` is a config key (`radio.1.channel`): letters, digits, `.`, `_` and `-`.
+/// A comment or a line of text with an `=` in it is not one.
+fn is_cfg_key(k: &str) -> bool {
+    !k.is_empty() && k.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+}
+
+/// Whether `name` names a file inside a directory: one plain path component, so joining
+/// it to the directory stays there.
+fn is_file_name(name: &str) -> bool {
+    let mut parts = Path::new(name).components();
+    matches!((parts.next(), parts.next()), (Some(std::path::Component::Normal(_)), None))
+}
+
 /// Whether `s` is one whole MAC: with colons or dashes, in dotted groups of four, or bare.
 fn is_mac(s: &str) -> bool {
     let b = s.as_bytes();
@@ -779,10 +807,10 @@ fn colon_mac(bare: &str) -> String {
 /// suffixes such as a DHCPv6 range's `::2`) and multicast groups other than
 /// solicited-node ones (which end in an interface ID's last 24 bits). Link-local ones
 /// are replaced too: their EUI-64 interface ID is the MAC. Times (`12:34:56`) and MACs
-/// match `re` but do not parse as addresses.
-fn scrub_ipv6(re: &Regex, s: &str, fakes: &mut Fakes) -> String {
+/// match `re` but do not parse as addresses. `None` when there was none to replace.
+fn scrub_ipv6(re: &Regex, s: &str, fakes: &mut Fakes) -> Option<String> {
     let bytes = s.as_bytes();
-    let mut out = String::with_capacity(s.len());
+    let mut out: Option<String> = None;
     let mut last = 0;
     for m in re.find_iter(s) {
         let (a, mut b) = (m.start(), m.end());
@@ -807,12 +835,15 @@ fn scrub_ipv6(re: &Regex, s: &str, fakes: &mut Fakes) -> String {
         let link_local = ip.is_unicast_link_local();
         let fake = fakes.get(Kind::Ipv6, &ip.to_string(), |n| if link_local { format!("fe80::db8:{n:x}") } else { format!("2001:db8::{n:x}") });
         fakes.also(Kind::Ipv6, &s[a..b].to_ascii_lowercase(), &fake);
-        out.push_str(&s[last..a]);
-        out.push_str(&fake);
+        let o = out.get_or_insert_with(|| String::with_capacity(s.len()));
+        o.push_str(&s[last..a]);
+        o.push_str(&fake);
         last = b;
     }
-    out.push_str(&s[last..]);
-    out
+    out.map(|mut o| {
+        o.push_str(&s[last..]);
+        o
+    })
 }
 
 /// A plain mDNS service type such as `_googlecast._tcp.local`, with no device ID in it.
@@ -863,16 +894,24 @@ fn in_longer_dotted(text: &[u8], a: usize, b: usize) -> bool {
     matches!(before, [.., d, b'.'] if d.is_ascii_digit()) || matches!(after, [b'.', d, ..] if d.is_ascii_digit())
 }
 
-fn replace_all(re: &Regex, s: &str, mut f: impl FnMut(&str) -> String) -> String {
-    let mut out = String::with_capacity(s.len());
+/// `s` with each match of `re` that `f` gives a replacement for replaced; `None` when
+/// none was.
+fn replace_all(re: &Regex, s: &str, mut f: impl FnMut(regex::Match) -> Option<String>) -> Option<String> {
+    let mut out: Option<String> = None;
     let mut last = 0;
     for m in re.find_iter(s) {
-        out.push_str(&s[last..m.start()]);
-        out.push_str(&f(m.as_str()));
-        last = m.end();
+        let (a, b) = (m.start(), m.end());
+        if let Some(r) = f(m) {
+            let o = out.get_or_insert_with(|| String::with_capacity(s.len()));
+            o.push_str(&s[last..a]);
+            o.push_str(&r);
+            last = b;
+        }
     }
-    out.push_str(&s[last..]);
-    out
+    out.map(|mut o| {
+        o.push_str(&s[last..]);
+        o
+    })
 }
 
 /// Sanitises the named JSON files from `input` into `output`. `keep` names more fields
@@ -886,9 +925,14 @@ pub fn run(input: &Path, output: &Path, files: &[String], domains: Vec<String>, 
         }
         s.fakes.any_mac(m);
     }
-    std::fs::create_dir_all(output)?;
+    if output.canonicalize().is_ok_and(|o| input.canonicalize().is_ok_and(|i| i == o)) {
+        bail!("--output is the --input directory: the sanitised files would replace the originals");
+    }
     let mut docs = Vec::new();
     for name in files {
+        if !is_file_name(name) {
+            bail!("{name} is not the name of a file in --input (no directories, absolute paths or ..)");
+        }
         let path = input.join(name);
         let text = std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
         let v: Value = serde_json::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
@@ -910,6 +954,9 @@ pub fn run(input: &Path, output: &Path, files: &[String], domains: Vec<String>, 
     for (name, v) in &docs {
         let clean = serde_json::to_string_pretty(&s.json(v))? + "\n";
         let out_name = s.file_name(name);
+        if !is_file_name(&out_name) {
+            bail!("{name} sanitised is no file name");
+        }
         written.push((output.join(&out_name), clean));
     }
     // Check everything against the final maps, so values first seen in a later
@@ -920,6 +967,7 @@ pub fn run(input: &Path, output: &Path, files: &[String], domains: Vec<String>, 
         let name = path.file_name().unwrap_or_default().to_string_lossy();
         leaks.check(&name, &format!("file name {name}"))?;
     }
+    std::fs::create_dir_all(output).with_context(|| format!("creating {}", output.display()))?;
     for (path, text) in written {
         std::fs::write(&path, text).with_context(|| format!("writing {}", path.display()))?;
     }
@@ -1140,6 +1188,30 @@ mod tests {
     }
 
     #[test]
+    fn files_are_read_and_written_only_inside_the_directories_and_nothing_is_created_on_a_refusal() {
+        let dir = std::env::temp_dir().join(format!("informdump-sanitize-paths-{}", std::process::id()));
+        let (input, output) = (dir.join("in"), dir.join("out"));
+        std::fs::create_dir_all(&input).unwrap();
+        std::fs::write(input.join("leaks.json"), json!({ "last_error_str": "Smith family router", "new_words": "Smith family router" }).to_string()).unwrap();
+        std::fs::write(input.join("clean.json"), json!({ "mode": "auto" }).to_string()).unwrap();
+        let abs = input.join("clean.json").display().to_string();
+        let sanitise = |out: &Path, name: &str| run(&input, out, &[name.to_string()], Vec::new(), &[], Vec::new()).map_err(|e| e.to_string());
+        let refused: Vec<Result<(), String>> = [abs.as_str(), "../in/clean.json", "./clean.json", "sub/clean.json", "", "leaks.json"].iter().map(|n| sanitise(&output, n)).collect();
+        let created = output.exists();
+        let same = sanitise(&input, "clean.json");
+        let ok = sanitise(&output, "clean.json");
+        let written = std::fs::read_to_string(output.join("clean.json")).unwrap_or_default();
+        std::fs::remove_dir_all(&dir).ok();
+        for (r, why) in refused.iter().zip(["not the name", "not the name", "not the name", "not the name", "not the name", "survived sanitising"]) {
+            assert!(r.as_ref().is_err_and(|e| e.contains(why)), "{r:?}");
+        }
+        assert!(!created, "a refused run creates no output directory");
+        assert!(same.is_err_and(|e| e.contains("would replace the originals")));
+        ok.unwrap();
+        assert_eq!(written, "{\n  \"mode\": \"auto\"\n}\n");
+    }
+
+    #[test]
     fn hosts_in_urls_are_replaced_unless_a_domain_covers_them() {
         let mut s = Sanitizer::new(vec!["home.example.org".into()], vec!["stun_url".into()]);
         let v = json!({
@@ -1215,8 +1287,29 @@ mod tests {
         let out = s.json(&json!({ "system_cfg": "# wlans (radio)\nSmith family\n\nradio.1.channel=36", "x_backup": { "mgmt_cfg": "# mgmt" } }));
         assert_eq!(out["system_cfg"], "# wlans (radio)\ntext-1\n\nradio.1.channel=36");
         assert_eq!(out["x_backup"]["mgmt_cfg"], "secret-1");
-        assert_eq!(s.unlisted().collect::<Vec<_>>(), ["system_cfg lines without '='"]);
+        assert_eq!(s.unlisted().collect::<Vec<_>>(), ["system_cfg lines that are not key=value"]);
         assert!(s.check_clean("x: smith family", "leak").is_err());
+    }
+
+    #[test]
+    fn a_config_line_is_key_value_only_when_it_starts_with_a_config_key() {
+        let mut s = Sanitizer::new(Vec::new(), Vec::new());
+        let cfg = "# psk=hunter22\nSmith family=home\nKitchen TV.name=x\n7845583c52bc.x=1\nvpn.6f1c0e52-2b8a-4c3e-9d4f-0a1b2c3d4e5f.mode=auto\nradio.1.channel=36";
+        let out = s.json(&json!({ "mac": "78:45:58:3c:52:bc", "system_cfg": cfg }));
+        assert_eq!(out["system_cfg"], "text-1\ntext-2\ntext-3\n020000000001.x=1\nvpn.00000000-0000-4000-8000-000000000001.mode=auto\nradio.1.channel=36");
+        assert_eq!(s.unlisted().collect::<Vec<_>>(), ["system_cfg lines that are not key=value"]);
+        s.check_clean(&out.to_string(), "test").unwrap();
+        for leak in ["# psk=hunter22", "kitchen tv.name=x", "6f1c0e52-2b8a-4c3e-9d4f-0a1b2c3d4e5f"] {
+            assert!(s.check_clean(leak, "leak").is_err(), "{leak}");
+        }
+    }
+
+    #[test]
+    fn a_config_keeps_its_line_ends() {
+        let mut s = Sanitizer::new(Vec::new(), Vec::new());
+        let out = s.json(&json!({ "system_cfg": "radio.1.channel=36\n", "mgmt_cfg": "a.b=1\r\n# c\r\nc.mode=auto\r\n" }));
+        assert_eq!((&out["system_cfg"], &out["mgmt_cfg"]), (&json!("radio.1.channel=36\n"), &json!("a.b=1\r\n# c\r\nc.mode=auto\r\n")));
+        assert!(s.unlisted().next().is_none());
     }
 
     #[test]

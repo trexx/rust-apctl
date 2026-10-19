@@ -12,7 +12,34 @@
     "cargo",
     "dockerfile",
     "github-actions",
-    "npm"
+    "npm",
+    "custom.regex"
+  ],
+  "customManagers": [
+    {
+      "customType": "regex",
+      "description": "The Rust release CI tests with: the Dockerfile's rust image's, so both move together",
+      "managerFilePatterns": [
+        "/(^|/)\\.github/workflows/[^/]+\\.ya?ml$/"
+      ],
+      "matchStrings": [
+        "toolchain: '(?<currentValue>[0-9]+\\.[0-9]+)'"
+      ],
+      "depNameTemplate": "docker.io/library/rust",
+      "datasourceTemplate": "docker"
+    },
+    {
+      "customType": "regex",
+      "description": "Images that workflow steps run by hand (docker run), such as the Node image the web job builds with",
+      "managerFilePatterns": [
+        "/(^|/)\\.github/workflows/[^/]+\\.ya?ml$/"
+      ],
+      "matchStrings": [
+        "(?<depName>docker\\.io/library/[a-z0-9-]+):(?<currentValue>[A-Za-z0-9._-]+)(?:@(?<currentDigest>sha256:[a-f0-9]{64}))?"
+      ],
+      "datasourceTemplate": "docker",
+      "autoReplaceStringTemplate": "{{depName}}:{{newValue}}{{#if newDigest}}@{{newDigest}}{{/if}}"
+    }
   ],
   "packageRules": [
     {
@@ -49,6 +76,30 @@
         "major"
       ],
       "enabled": false
+    },
+    {
+      "description": "The Rust toolchain CI tests with and the Dockerfile's rust image: one release, so one PR",
+      "groupName": "Rust toolchain",
+      "matchDepNames": [
+        "/^(docker\\.io\\/)?(library\\/)?rust$/"
+      ]
+    },
+    {
+      "description": "The toolchain version CI tests with has no place for a digest",
+      "matchManagers": [
+        "custom.regex"
+      ],
+      "matchDepNames": [
+        "docker.io/library/rust"
+      ],
+      "pinDigests": false
+    },
+    {
+      "description": "The Node image of the Dockerfile's web stage and of CI's web job: one PR",
+      "groupName": "Node image",
+      "matchDepNames": [
+        "/^(docker\\.io\\/)?(library\\/)?node$/"
+      ]
     }
   ]
 }

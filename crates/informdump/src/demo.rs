@@ -166,8 +166,8 @@ fn mac_bytes(mac: &str) -> [u8; 6] {
 }
 
 /// A BSSID derived from the AP's MAC, as the firmware numbers its VAPs.
-fn bssid(ap: &Ap, radio: &str, vap: u8) -> String {
-    let mut b = mac_bytes(ap.mac);
+fn bssid(ap: Mac, radio: &str, vap: u8) -> String {
+    let mut b = ap.0;
     b[0] |= 0x02;
     b[3] = b[3].wrapping_add(if radio == "na" { 0x20 } else { 0x10 });
     b[5] = b[5].wrapping_add(vap * 8);
@@ -191,9 +191,10 @@ fn seeded_array<const N: usize>(seed: &str) -> [u8; N] {
 }
 
 /// What an AP derives from its MAC, worked out once: its keys and the identifiers its
-/// informs carry.
+/// informs carry, which the settings (`demo-state`) hold too.
 struct ApIds {
     mac: Mac,
+    serial: String,
     authkey: [u8; 16],
     syslog_key: [u8; 32],
     hash_id: [u8; 8],
@@ -207,6 +208,7 @@ impl ApIds {
         let hash_id = seeded_array(&format!("hash {}", ap.mac));
         ApIds {
             mac: Mac(mac_bytes(ap.mac)),
+            serial: ap.mac.replace(':', "").to_uppercase(),
             authkey: seeded_array(ap.mac),
             syslog_key: seeded_array(&format!("syslog {}", ap.mac)),
             hash_id,
@@ -227,6 +229,11 @@ fn ip(v: [u8; 4]) -> String {
     format!("{}.{}.{}.{}", v[0], v[1], v[2], v[3])
 }
 
+/// Where the APs inform.
+fn inform_url() -> String {
+    format!("http://{}:8080/inform", ip(CONTROLLER_IP))
+}
+
 /// The controller settings to import (`apctl serve --keys`, then the
 /// Settings page): the template site with our APs, networks and clients.
 pub fn state() -> Result<Value> {
@@ -236,15 +243,16 @@ pub fn state() -> Result<Value> {
         .iter()
         .enumerate()
         .map(|(i, ap)| {
+            let ids = ApIds::new(ap);
             let mut d = template.clone();
             d["_id"] = json!({ "$oid": format!("{:024x}", 0xd0 + i) });
             d["mac"] = json!(ap.mac);
             d["name"] = json!(ap.name);
             d["ip"] = json!(ip(ap.ip));
-            d["serial"] = json!(ap.mac.replace(':', "").to_uppercase());
-            d["x_authkey"] = json!(hex_key(ap.mac, 16));
-            d["syslog_key"] = json!(hex_key(&format!("syslog {}", ap.mac), 32));
-            d["inform_url"] = json!(format!("http://{}:8080/inform", ip(CONTROLLER_IP)));
+            d["serial"] = json!(ids.serial);
+            d["x_authkey"] = json!(hex::encode(ids.authkey));
+            d["syslog_key"] = json!(hex::encode(ids.syslog_key));
+            d["inform_url"] = json!(inform_url());
             for r in d["radio_table"].as_array_mut().into_iter().flatten() {
                 let na = r["radio"] == "na";
                 r["channel"] = json!(if na { ap.na } else { ap.ng });
@@ -328,6 +336,16 @@ struct Session {
     rx: f64,
     tx: f64,
     signal: i64,
+}
+
+/// What a VAP's stations add up to in one report: bytes down and up since the last, and
+/// their signals and satisfactions summed.
+#[derive(Default, Clone, Copy)]
+struct VapLoad {
+    down: f64,
+    up: f64,
+    signal: i64,
+    satisfaction: i64,
 }
 
 #[derive(Default, Clone)]
@@ -430,10 +448,10 @@ impl Sim {
                     if c.kind == Kind::Phone {
                         let p = format!("wlan: [0:I:ANY] [UNSPECIFIED] vap-0({old_vap}):");
                         self.log(at - 2, old, "kernel", format!("{p}BTM: STA {} RSSI: {}, candidates: 1, error: 0, flags: ALLOW (0x1)", c.mac, s.signal));
-                        self.log(at - 2, old, "kernel", format!("{p}BTM: [0]{{{} ch{}/op128/phy14}}", bssid(&APS[ap], radio, 0), if radio == "na" { APS[ap].na } else { APS[ap].ng }));
+                        self.log(at - 2, old, "kernel", format!("{p}BTM: [0]{{{} ch{}/op128/phy14}}", bssid(self.ids[ap].mac, radio, 0), if radio == "na" { APS[ap].na } else { APS[ap].ng }));
                         let status = if self.rng.unit() < 0.8 { 0 } else { 7 };
                         self.log(at - 1, old, "kernel", format!("{p}BTM: Received response from [{}](len = 5): dialog_token 1, status {status}, delay 0, bssid {}, cancel 0", c.mac,
-                            if status == 0 { bssid(&APS[ap], radio, 0) } else { "n/a".into() }));
+                            if status == 0 { bssid(self.ids[ap].mac, radio, 0) } else { "n/a".into() }));
                     }
                     let fast = !c.iot && c.kind != Kind::Iot;
                     let left_at = s.signal - self.rng.range(4, 10);
@@ -453,10 +471,10 @@ impl Sim {
     /// A full status report from AP `i`, after `dt` seconds of traffic.
     fn inform(&mut self, i: usize, ts: i64, dt: f64) -> Value {
         let hour = ts.rem_euclid(86_400) as f64 / 3600.0;
-        let (stas, vap_traffic) = self.stations(i, ts, dt, hour);
+        let (stas, loads) = self.stations(i, ts, dt, hour);
         let busy = 0.5 + 0.5 * (((hour - 20.0) / 24.0 * std::f64::consts::TAU).cos());
-        let totals = self.count_traffic(i, dt, &vap_traffic);
-        let vaps = self.vaps(i, dt, stas, &vap_traffic);
+        let totals = self.count_traffic(i, dt, &loads);
+        let vaps = self.vaps(i, dt, stas, &loads);
         let mut p = self.template.clone();
         for r in p["radio_table"].as_array_mut().into_iter().flatten() {
             self.radio(r, i, ts, busy, &totals);
@@ -465,12 +483,11 @@ impl Sim {
         p
     }
 
-    /// The station tables of AP `i`'s VAPs (2.4 GHz, 5 GHz, IoT) and the (down, up)
-    /// bytes of each over the last `dt` seconds; moves its clients' counters on.
-    fn stations(&mut self, i: usize, ts: i64, dt: f64, hour: f64) -> ([Vec<Value>; 3], [(f64, f64); 3]) {
-        let ap = &APS[i];
+    /// The station tables of AP `i`'s VAPs (2.4 GHz, 5 GHz, IoT) and what each one's
+    /// stations add up to over the last `dt` seconds; moves its clients' counters on.
+    fn stations(&mut self, i: usize, ts: i64, dt: f64, hour: f64) -> ([Vec<Value>; 3], [VapLoad; 3]) {
         let mut stas: [Vec<Value>; 3] = Default::default();
-        let mut vap_traffic = [(0.0f64, 0.0f64); 3];
+        let mut loads = [VapLoad::default(); 3];
         for (ci, c) in CLIENTS.iter().enumerate() {
             let Some(s) = self.sessions[ci].as_mut().filter(|s| s.ap == i) else { continue };
             let loc = location(c, ts, self.start).unwrap_or(0);
@@ -482,8 +499,8 @@ impl Sim {
             s.rx += up;
             s.tx += down;
             let vi = if c.iot { 2 } else if s.radio == "na" { 1 } else { 0 };
-            vap_traffic[vi].0 += down;
-            vap_traffic[vi].1 += up;
+            loads[vi].down += down;
+            loads[vi].up += up;
             let na = s.radio == "na";
             let rate = match (na, signal) {
                 (true, s) if s > -55 => 1_200_900,
@@ -495,6 +512,8 @@ impl Sim {
             };
             let ax = !matches!(c.kind, Kind::Iot | Kind::Speaker);
             let sat = (100 + (signal + 60).min(0) * 2).clamp(20, 100);
+            loads[vi].signal += signal;
+            loads[vi].satisfaction += sat;
             let pkts = (s.tx + s.rx) / 900.0;
             stas[vi].push(json!({
                 "mac": c.mac, "hostname": c.hostname, "ip": format!("192.168.1.{}", 100 + ci), "authorized": true, "state": 11,
@@ -509,19 +528,19 @@ impl Sim {
             // Now and then (about hourly and every two hours): poor experience, and a kick.
             let weak = c.quirk == Some(Quirk::WeakLink);
             if weak && self.rng.unit() < dt / 3600.0 {
-                self.log(ts, i, "mcad", format!("wireless_agg_stats.log_sta_anomalies(): bssid={} radio=wifi0 vap=wifi0ap1 sta={} signal={signal} satisfaction_now={sat} anomalies=low_rssi,high_tcp_latency", bssid(ap, "ng", 1), c.mac));
+                self.log(ts, i, "mcad", format!("wireless_agg_stats.log_sta_anomalies(): bssid={} radio=wifi0 vap=wifi0ap1 sta={} signal={signal} satisfaction_now={sat} anomalies=low_rssi,high_tcp_latency", bssid(self.ids[i].mac, "ng", 1), c.mac));
             }
             if weak && signal < -76 && self.rng.unit() < dt / 7200.0 {
                 self.log(ts, i, "stamgr", format!("kick-sta-on {} wifi0ap1 (reason:Low RSSI rssi:{})", c.mac, signal + 95));
             }
         }
-        (stas, vap_traffic)
+        (stas, loads)
     }
 
     /// Adds the VAPs' traffic to AP `i`'s own counters, and returns them.
-    fn count_traffic(&mut self, i: usize, dt: f64, vap_traffic: &[(f64, f64); 3]) -> ApCounters {
+    fn count_traffic(&mut self, i: usize, dt: f64, loads: &[VapLoad; 3]) -> ApCounters {
         let c = &mut self.counters[i];
-        let (down, up): (f64, f64) = vap_traffic.iter().fold((0.0, 0.0), |a, v| (a.0 + v.0, a.1 + v.1));
+        let (down, up): (f64, f64) = loads.iter().fold((0.0, 0.0), |a, v| (a.0 + v.down, a.1 + v.up));
         c.tx += up + 400.0 * dt;
         c.rx += down + 900.0 * dt;
         c.pkts += (down + up) / 1000.0;
@@ -530,22 +549,22 @@ impl Sim {
     }
 
     /// AP `i`'s VAP table, each VAP with its stations.
-    fn vaps(&mut self, i: usize, dt: f64, mut stas: [Vec<Value>; 3], vap_traffic: &[(f64, f64); 3]) -> Vec<Value> {
+    fn vaps(&mut self, i: usize, dt: f64, mut stas: [Vec<Value>; 3], loads: &[VapLoad; 3]) -> Vec<Value> {
         let ap = &APS[i];
         [("ng", 0u8, SSID, 0usize), ("na", 0u8, SSID, 1), ("ng", 1u8, IOT_SSID, 2)]
             .into_iter()
             .map(|(radio, idx, essid, vi)| {
                 let vc = &mut self.vap_counters[i][vi];
-                vc.tx += vap_traffic[vi].0 + 2_000.0 * dt;
-                vc.rx += vap_traffic[vi].1 + 500.0 * dt;
-                vc.pkts += (vap_traffic[vi].0 + vap_traffic[vi].1) / 1000.0 + dt;
+                let load = loads[vi];
+                vc.tx += load.down + 2_000.0 * dt;
+                vc.rx += load.up + 500.0 * dt;
+                vc.pkts += (load.down + load.up) / 1000.0 + dt;
                 let sta = std::mem::take(&mut stas[vi]);
                 let n = sta.len() as i64;
-                let avg = if n > 0 { sta.iter().map(|s| s["signal"].as_i64().unwrap_or(0)).sum::<i64>() / n } else { 0 };
-                let sat = if n > 0 { sta.iter().map(|s| s["satisfaction"].as_i64().unwrap_or(0)).sum::<i64>() / n } else { 100 };
+                let (avg, sat) = if n > 0 { (load.signal / n, load.satisfaction / n) } else { (0, 100) };
                 let na = radio == "na";
                 json!({
-                    "bssid": bssid(ap, radio, idx), "essid": essid, "radio": radio, "radio_name": if na { "wifi1" } else { "wifi0" },
+                    "bssid": bssid(self.ids[i].mac, radio, idx), "essid": essid, "radio": radio, "radio_name": if na { "wifi1" } else { "wifi0" },
                     "name": vap_name(radio, vi == 2), "id": format!("{vi}"), "channel": if na { ap.na } else { ap.ng }, "bw": if na { ap.na_bw } else { 20 },
                     "tx_power": if na { ap.power.1 } else { ap.power.0 }, "usage": "user", "up": true, "state": "RUN", "num_sta": n,
                     "tx_bytes": vc.tx as i64, "rx_bytes": vc.rx as i64, "tx_packets": (vc.tx / 1100.0) as i64, "rx_packets": (vc.rx / 500.0) as i64,
@@ -584,7 +603,7 @@ impl Sim {
         for (j, other) in APS.iter().enumerate().filter(|(j, _)| *j != i) {
             let signal = AP_SIGNAL[i][j] + if na { -9 } else { 0 } + self.rng.range(-2, 2);
             let ch = if na { other.na } else { other.ng };
-            scan.push(neighbour(&bssid(other, band, 0), SSID, band, ch, if na { other.na_bw } else { 20 }, signal, true, other.name));
+            scan.push(neighbour(&bssid(self.ids[j].mac, band, 0), SSID, band, ch, if na { other.na_bw } else { 20 }, signal, true, other.name));
         }
         if !na && i == 2 && ts > self.end_history - 3 * 3600 {
             scan.push(neighbour(LOOKALIKE.0, LOOKALIKE.1, "ng", LOOKALIKE.2, 20, LOOKALIKE.3 + self.rng.range(-2, 2), false, ""));
@@ -613,14 +632,14 @@ impl Sim {
         let uptime = self.uptime(i, ts);
         let mac = ap.mac;
         p["mac"] = json!(mac);
-        p["serial"] = json!(mac.replace(':', "").to_uppercase());
         let ids = &self.ids[i];
+        p["serial"] = json!(ids.serial);
         p["hash_id"] = json!(ids.hash_hex);
         p["anon_id"] = json!(format!("00000000-0000-4000-8000-0000000000{:02x}", 0x10 + i));
         p["hostname"] = json!(ap.name);
         p["ip"] = json!(ip(ap.ip));
         p["inform_ip"] = json!(ip(CONTROLLER_IP));
-        p["inform_url"] = json!(format!("http://{}:8080/inform", ip(CONTROLLER_IP)));
+        p["inform_url"] = json!(inform_url());
         p["cfgversion"] = json!(self.cfgversion[i]);
         p["uptime"] = json!(uptime);
         p["time"] = json!(ts);
@@ -665,16 +684,21 @@ fn neighbour(bssid: &str, essid: &str, band: &str, channel: i64, bw: i64, signal
 struct PcapWriter<W: Write> {
     out: W,
     seq: Vec<(u32, u32)>,
+    /// The time of the last record written, in microseconds.
+    last: i64,
 }
 
 impl<W: Write> PcapWriter<W> {
     fn new(mut out: W) -> Result<Self> {
         synth::write_pcap_header(&mut out, 262_144)?;
-        Ok(PcapWriter { out, seq: vec![(1, 1); APS.len()] })
+        Ok(PcapWriter { out, seq: vec![(1, 1); APS.len()], last: i64::MIN })
     }
 
+    /// Records never go back in time: one due before the last one written (a message
+    /// due in the same second as the reply before it) is written at that one's time.
     fn record(&mut self, ts_ms: i64, frame: &[u8]) -> Result<()> {
-        Ok(synth::write_pcap_record(&mut self.out, ts_ms * 1000, frame)?)
+        self.last = self.last.max(ts_ms * 1000);
+        Ok(synth::write_pcap_record(&mut self.out, self.last, frame)?)
     }
 
     fn tcp(&mut self, ts_ms: i64, ap: usize, ids: &ApIds, to_server: bool, data: &[u8]) -> Result<()> {
@@ -724,6 +748,9 @@ fn stream(now: i64, hours: f64, live: bool, out: impl Write) -> Result<()> {
     let mut pcap = PcapWriter::new(out)?;
     let mut t = start;
     let mut last = vec![start; APS.len()];
+    // No message is due before the previous batch's last: client events happen up to
+    // 40 seconds before their batch, and near real time batches are 10 seconds apart.
+    let mut floor = start;
     loop {
         let wall = now + started.elapsed().as_secs() as i64;
         if t > wall {
@@ -750,9 +777,16 @@ fn stream(now: i64, hours: f64, live: bool, out: impl Write) -> Result<()> {
             let p = sim.inform(i, at, dt);
             batch.push((at, i, p));
         }
+        for b in &mut batch {
+            b.0 = b.0.max(floor);
+        }
         batch.sort_by_key(|b| b.0);
         let mut logs = std::mem::take(&mut sim.syslog);
+        for l in &mut logs {
+            l.0 = l.0.max(floor);
+        }
         logs.sort_by_key(|l| l.0);
+        floor = floor.max(batch.last().map_or(floor, |b| b.0 + 1)).max(logs.last().map_or(floor, |l| l.0 + 1));
         let mut logs = logs.into_iter().peekable();
         for (at, i, payload) in batch {
             while let Some((lt, li, line)) = logs.next_if(|l| l.0 <= at) {
@@ -804,15 +838,44 @@ mod tests {
     }
 
     #[test]
+    fn the_capture_never_goes_back_in_time() {
+        // Sam's phone moves at 18:24 UTC: in the last five minutes of this history, where
+        // the APs report every 10 seconds.
+        for now in [1_791_830_666 - 18 * 60, 1_791_830_666] {
+            let mut buf = Vec::new();
+            stream(now, 0.5, false, &mut buf).unwrap();
+            let (mut at, mut last, mut records) = (24, 0, 0);
+            while at + 16 <= buf.len() {
+                let word = |i: usize| u64::from(u32::from_le_bytes(buf[at + i..at + i + 4].try_into().unwrap()));
+                let ts = word(0) * 1_000_000 + word(4);
+                assert!(ts >= last, "record {records} at {ts} µs, after one at {last} µs");
+                (last, at, records) = (ts, at + 16 + word(8) as usize, records + 1);
+            }
+            assert_eq!(at, buf.len());
+        }
+    }
+
+    #[test]
     fn capture_decodes_with_the_state_keys() {
+        use aes_gcm::aead::{Aead, KeyInit, Payload};
         let keys = wire::keys::KeyStore::from_value(&state().unwrap());
+        let syslog_keys: std::collections::HashMap<Mac, [u8; 32]> = keys.syslog_keys().map(|(m, k)| (*m, *k)).collect();
         let mut buf = Vec::new();
-        stream(1_791_830_666, 0.5, false, &mut buf).unwrap();
+        // Near real time (the last five minutes) client events are clamped to after the
+        // batch before theirs: a syslog line still says when it was sent.
+        stream(1_791_830_666 - 18 * 60, 0.5, false, &mut buf).unwrap();
         let mut pairer = wire::exchange::Pairer::default();
         let mut informs = 0;
         let mut syslog = 0;
         let end = wire::capture::run_with_udp(&buf[..], &[8080], &[5514], |ev| {
-            if matches!(ev, wire::capture::HttpEvent::Datagram { .. }) {
+            if let wire::capture::HttpEvent::Datagram { ts, src, payload, .. } = &ev {
+                // Opened with the key the settings hold for the AP that sent it.
+                let ap = APS.iter().find(|a| src.ip().to_string() == ip(a.ip)).expect("from an AP");
+                let key = syslog_keys[&Mac(mac_bytes(ap.mac))];
+                let (header, sealed) = payload.split_at(wire::synth::SYSLOG_HEADER);
+                let plain = aes_gcm::Aes256Gcm::new(&key.into()).decrypt(&aes_gcm::Nonce::try_from(&header[17..29]).unwrap(), Payload { msg: sealed, aad: header }).expect("decrypts");
+                let text = String::from_utf8(plain).unwrap();
+                assert!(text.starts_with(&format!("<14>{} {} ", chrono_like(ts / 1_000_000), ap.name.replace(' ', "-"))), "{text}");
                 syslog += 1;
             } else if let Some(wire::exchange::InformEvent::Inform { decoded, .. }) = pairer.handle(&keys, ev) {
                 decoded.unwrap();
