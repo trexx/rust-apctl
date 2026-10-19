@@ -36,6 +36,7 @@ mod web;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -221,7 +222,7 @@ async fn serve(args: ServeArgs) -> Result<()> {
     let (store, writer) = store::Store::open(&data_dir)?;
     let live: SharedLive = Default::default();
     let (live_tx, _) = broadcast::channel(4096);
-    let (in_tx, mut in_rx) = mpsc::channel::<Input>(10_000);
+    let (in_tx, in_rx) = mpsc::channel::<Input>(10_000);
 
     let source = match (shadow, shadow_cmd) {
         (Some(s), _) if s == "-" => Some(shadow::Source::Stdin),
@@ -272,6 +273,7 @@ async fn serve(args: ServeArgs) -> Result<()> {
     // The engine is synchronous and at times busy (diffs, dry-run renders): it
     // gets a thread of its own rather than an async worker.
     let runtime = tokio::runtime::Handle::current();
+    let (drain, closing, drained) = Drain::new(in_tx.clone());
     std::thread::Builder::new().name("engine".into()).spawn(move || {
         // However the thread ends, its queue closes with it, which /healthz reports.
         struct Stopped;
@@ -284,9 +286,7 @@ async fn serve(args: ServeArgs) -> Result<()> {
         }
         let _stopped = Stopped;
         let _runtime = runtime.enter();
-        while let Some(input) = in_rx.blocking_recv() {
-            engine.handle(input);
-        }
+        engine_loop(in_rx, &closing, &drained, |input| engine.handle(input));
     })?;
 
     if active {
@@ -313,9 +313,69 @@ async fn serve(args: ServeArgs) -> Result<()> {
     let app = api::router(state);
     let listener = tokio::net::TcpListener::bind(listen).await.with_context(|| format!("binding {listen}"))?;
     tracing::info!("web UI and API on http://{listen}");
-    axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>()).with_graceful_shutdown(shutdown(writer.clone())).await?;
-    flush_writes(writer).await;
+    axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>()).with_graceful_shutdown(shutdown(writer.clone(), drain.clone())).await?;
+    finish(writer, drain).await;
     Ok(())
+}
+
+/// The engine thread's loop: `handle` each input in turn, until the queue
+/// closes. At exit (`closing`), nothing more is taken and what is queued still
+/// is; `drained` tells when it is done.
+fn engine_loop(mut queue: mpsc::Receiver<Input>, closing: &AtomicBool, drained: &tokio::sync::watch::Sender<bool>, mut handle: impl FnMut(Input)) {
+    while let Some(input) = queue.blocking_recv() {
+        handle(input);
+        if closing.load(Ordering::Relaxed) {
+            queue.close();
+        }
+    }
+    let _ = drained.send(true);
+}
+
+/// How long an exit waits for the engine to handle what is queued.
+const DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Ends the engine's work at exit: it stops taking inputs and handles the
+/// ones queued, so that their writes are among those committed last.
+#[derive(Clone)]
+struct Drain {
+    closing: Arc<AtomicBool>,
+    queue: mpsc::Sender<Input>,
+    /// True once the engine's loop has ended; closed if the engine thread panicked.
+    drained: tokio::sync::watch::Receiver<bool>,
+}
+
+impl Drain {
+    /// The drain, and the engine thread's ends: the flag it checks after each input, and what it sets when done.
+    fn new(queue: mpsc::Sender<Input>) -> (Drain, Arc<AtomicBool>, tokio::sync::watch::Sender<bool>) {
+        let closing = Arc::new(AtomicBool::new(false));
+        let (done, drained) = tokio::sync::watch::channel(false);
+        (Drain { closing: closing.clone(), queue, drained }, closing, done)
+    }
+
+    /// Stops the engine taking inputs (it still handles the queued ones).
+    fn start(&self) {
+        self.closing.store(true, Ordering::Relaxed);
+        // An idle engine is woken to see the flag by an input that changes
+        // nothing (an empty alias import). A full queue needs none: the
+        // engine looks at the flag after the input it is on.
+        let _ = self.queue.try_send(Input::SetAliases { ts: clock::now_ts(), entries: Vec::new(), only_if_unset: true });
+    }
+
+    /// Waits for the queue to be handled, at most `DRAIN_TIMEOUT`.
+    async fn wait(&self) {
+        let mut drained = self.drained.clone();
+        if tokio::time::timeout(DRAIN_TIMEOUT, drained.wait_for(|d| *d)).await.is_err() {
+            let left = self.queue.max_capacity() - self.queue.capacity();
+            tracing::warn!("the engine did not get through its queue before exit: {left} input(s) not handled");
+        }
+    }
+}
+
+/// What an exit does last: the engine's queue handled, then the writes committed.
+async fn finish(writer: store::Writer, drain: Drain) {
+    drain.start();
+    drain.wait().await;
+    flush_writes(writer).await;
 }
 
 /// Receives AP syslog on `addr` and hands each datagram to the engine.
@@ -454,8 +514,9 @@ fn debug_syslog(pcap: &str, keys: &str, port: u16) -> Result<()> {
 
 /// Resolves on Ctrl-C or SIGTERM (what Kubernetes sends). Open WebSockets would
 /// keep a graceful shutdown waiting forever, so the process exits after a short
-/// grace period regardless, once the queued writes are committed.
-async fn shutdown(writer: store::Writer) {
+/// grace period regardless, once the engine's queue is handled and the queued
+/// writes are committed. The engine stops taking inputs at once.
+async fn shutdown(writer: store::Writer, drain: Drain) {
     let term = async {
         match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
             Ok(mut s) => {
@@ -469,9 +530,10 @@ async fn shutdown(writer: store::Writer) {
         _ = term => {}
     }
     tracing::info!("shutting down");
+    drain.start();
     tokio::spawn(async move {
         tokio::time::sleep(Duration::from_secs(3)).await;
-        flush_writes(writer).await;
+        finish(writer, drain).await;
         std::process::exit(0);
     });
 }
@@ -533,6 +595,43 @@ mod tests {
         assert_eq!(addr(Some("http://[fd00::1]:8080/inform")), ("[fd00::1]".into(), 8080));
         assert_eq!(addr(None), ("unifi".into(), 8081));
         assert_eq!(addr(Some("not a url")), ("unifi".into(), 8081));
+    }
+
+    #[tokio::test]
+    async fn at_exit_the_engine_handles_what_is_queued_and_takes_nothing_more() {
+        let (tx, rx) = mpsc::channel::<Input>(100);
+        let (drain, closing, drained) = Drain::new(tx.clone());
+        let handled = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let count = handled.clone();
+        // Idle at first: the drain wakes it.
+        let engine = std::thread::spawn(move || {
+            engine_loop(rx, &closing, &drained, |_| {
+                count.fetch_add(1, Ordering::Relaxed);
+            })
+        });
+        drain.start();
+        drain.wait().await;
+        assert!(tx.is_closed() && tx.try_send(Input::DecodeError).is_err(), "nothing more is taken");
+        engine.join().unwrap();
+        assert_eq!(handled.load(Ordering::Relaxed), 1, "the wake-up only");
+
+        // Busy: what is queued is handled before the end, though the queue is full.
+        let (tx, rx) = mpsc::channel::<Input>(50);
+        for _ in 0..50 {
+            tx.try_send(Input::DecodeError).unwrap();
+        }
+        let (drain, closing, drained) = Drain::new(tx.clone());
+        drain.start();
+        let handled = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let count = handled.clone();
+        let engine = std::thread::spawn(move || {
+            engine_loop(rx, &closing, &drained, |_| {
+                count.fetch_add(1, Ordering::Relaxed);
+            })
+        });
+        drain.wait().await;
+        engine.join().unwrap();
+        assert_eq!(handled.load(Ordering::Relaxed), 50);
     }
 
     #[tokio::test]
