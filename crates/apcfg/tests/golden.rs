@@ -80,7 +80,7 @@ fn mgmt_cfg_alone_matches_the_full_render() {
     let mut state = state();
     for ap in [AP_B, AP_U] {
         let inform = common::inform(ap);
-        let input = apcfg::Input { state: &state, device_mac: ap, inform: Some(&inform), cfgversion: "x", controller: &controller };
+        let input = apcfg::Input { state: &state, device_mac: ap, inform: Some(inform), cfgversion: "x", controller: &controller };
         assert_eq!(apcfg::render_mgmt(&input, None).unwrap(), render(&state, ap, "x").rendered.mgmt_cfg, "{ap}");
     }
     // As when adopting: the AP informs with another key than its own, so it is sent its own.
@@ -90,7 +90,7 @@ fn mgmt_cfg_alone_matches_the_full_render() {
     let expected = render(&adopting, AP_B, "x").rendered.mgmt_cfg;
     assert!(expected.contains("\nauthkey="), "{expected}");
     let inform = common::inform(AP_B);
-    let input = apcfg::Input { state: &state, device_mac: AP_B, inform: Some(&inform), cfgversion: "x", controller: &controller };
+    let input = apcfg::Input { state: &state, device_mac: AP_B, inform: Some(inform), cfgversion: "x", controller: &controller };
     assert_eq!(apcfg::render_mgmt(&input, Some(factory)).unwrap(), expected);
     // Without the SSH password hash system_cfg cannot be rendered; mgmt_cfg still can.
     for s in state["setting"].as_array_mut().unwrap().iter_mut().filter(|s| s["key"] == "mgmt") {
@@ -98,7 +98,7 @@ fn mgmt_cfg_alone_matches_the_full_render() {
         s.remove("x_ssh_md5passwd");
         s.remove("x_ssh_sha512passwd");
     }
-    let input = apcfg::Input { state: &state, device_mac: AP_B, inform: Some(&inform), cfgversion: "x", controller: &controller };
+    let input = apcfg::Input { state: &state, device_mac: AP_B, inform: Some(inform), cfgversion: "x", controller: &controller };
     assert!(apcfg::render(&input).is_err());
     assert_eq!(apcfg::render_mgmt(&input, Some(factory)).unwrap(), expected);
 }

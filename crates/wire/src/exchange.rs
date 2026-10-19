@@ -4,10 +4,10 @@ use std::collections::{HashMap, VecDeque};
 use std::net::{IpAddr, SocketAddr};
 
 use anyhow::Result;
-use inform::Mac;
+use inform::{Mac, Packet};
 
 use crate::capture::{ConnId, HttpEvent, MAX_CONNS, Micros, Sweeper};
-use crate::decode::{Decoded, decode};
+use crate::decode::{Decoded, decode_packet};
 use crate::keys::KeyStore;
 
 #[derive(Debug)]
@@ -98,11 +98,8 @@ impl Pairer {
                     return None;
                 }
                 let peer = forwarded_for.as_deref().and_then(forwarded_ip).unwrap_or(conn.client.ip()).to_string();
-                let decoded = decode(&body, keys, None);
-                let mac = match &decoded {
-                    Ok(d) => Some(d.header.mac),
-                    Err(_) => inform::Header::parse(&body).ok().map(|h| h.mac),
-                };
+                let (pkt, mac) = split(&body);
+                let decoded = pkt.map_err(Into::into).and_then(|p| decode_packet(p, keys, None));
                 self.push(conn, ts, Pending::Inform(mac));
                 Some(InformEvent::Inform { ts, peer, mac, decoded })
             }
@@ -114,18 +111,30 @@ impl Pairer {
                 }
                 // A reply is sealed under the MAC of the inform it answers (its header
                 // is sent back), which is in the clear.
-                let sealed_for = inform::Header::parse(&body).ok().map(|h| h.mac);
+                let (pkt, sealed_for) = split(&body);
                 let mac = match self.pop(conn, sealed_for) {
                     Some(Pending::Inform(mac)) => mac.or(sealed_for),
                     // The request was not captured: only look at bodies that are inform packets.
                     None if body.starts_with(inform::MAGIC) => sealed_for,
                     Some(Pending::Other) | None => return None,
                 };
-                let decoded = (!body.is_empty()).then(|| decode(&body, keys, mac));
+                let decoded = (!body.is_empty()).then(|| pkt.map_err(Into::into).and_then(|p| decode_packet(p, keys, mac)));
                 Some(InformEvent::Reply { ts, mac, status, decoded })
             }
             HttpEvent::Datagram { .. } => None,
         }
+    }
+}
+
+/// The inform packet in a body, and the MAC its header names, which a packet cut
+/// short still has.
+fn split(body: &[u8]) -> (inform::Result<Packet<'_>>, Option<Mac>) {
+    match Packet::parse(body) {
+        Ok(p) => {
+            let mac = p.header.mac;
+            (Ok(p), Some(mac))
+        }
+        Err(e) => (Err(e), inform::Header::parse(body).ok().map(|h| h.mac)),
     }
 }
 

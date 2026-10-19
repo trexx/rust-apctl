@@ -2,6 +2,7 @@
 //! frames off untagged VAPs.
 
 use std::borrow::Cow;
+use std::fmt;
 
 use anyhow::{Result, bail};
 use serde_json::Value;
@@ -10,25 +11,39 @@ use crate::{Cap, Ctx};
 use crate::cfg::{Cfg, Prefix};
 use crate::json::{flag, int_of, oid, str_of};
 use crate::meta::Meta;
-use crate::wlan::{Radio, Vap, dynamic_vlan, tagged_vlan, vlan_id};
+use crate::wlan::{Radio, Vap, dynamic_vlan, network_vlan, vlan_id};
 
 pub struct Bridge {
-    pub name: String,
     /// `None` for the untagged (management) bridge.
     pub vlan: Option<u16>,
     pub ports: Vec<String>,
 }
 
+impl Bridge {
+    pub fn name(&self) -> BridgeName {
+        BridgeName(self.vlan)
+    }
+}
+
 pub struct Net {
-    pub eth: Vec<String>,
+    pub eth: Vec<&'static str>,
     pub bridges: Vec<Bridge>,
     /// VLANs carried on the trunk, in order of first use.
     pub vlans: Vec<u16>,
     pub ebtables: Vec<String>,
 }
 
-pub fn bridge_name(vlan: Option<u16>) -> String {
-    vlan.map_or_else(|| "br0".to_string(), |v| format!("br0.{v}"))
+/// The name of the bridge of a VLAN (`None`: untagged), which displays as `br0` or `br0.<vlan>`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct BridgeName(pub Option<u16>);
+
+impl fmt::Display for BridgeName {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.0 {
+            Some(v) => write!(f, "br0.{v}"),
+            None => f.write_str("br0"),
+        }
+    }
 }
 
 /// The VLAN a WLAN's clients are tagged with, if any.
@@ -36,7 +51,7 @@ pub fn wlan_vlan(ctx: &Ctx, w: &Value) -> Option<u16> {
     if matches!(str_of(w, "security"), Some("wpaeap")) && dynamic_vlan(ctx, w) != 0 {
         return None;
     }
-    if let Some(vlan) = str_of(w, "networkconf_id").and_then(|id| ctx.network(id)).and_then(tagged_vlan) {
+    if let Some(vlan) = network_vlan(ctx, str_of(w, "networkconf_id")) {
         return Some(vlan);
     }
     if flag(w, "vlan_enabled", false) {
@@ -59,11 +74,11 @@ pub fn build(ctx: &Ctx, radios: &[Radio], vaps: &[Vap]) -> Result<Net> {
     {
         bail!("management VLAN on network {} is not supported", oid(net).unwrap_or_default());
     }
-    let mut eth = vec!["eth0".to_string()];
+    let mut eth = vec!["eth0"];
     if ctx.inform.is_some_and(|i| flag(i, "has_eth1", false)) {
-        eth.push("eth1".to_string());
+        eth.push("eth1");
     }
-    let mut bridges = vec![Bridge { name: bridge_name(None), vlan: None, ports: eth.clone() }];
+    let mut bridges = vec![Bridge { vlan: None, ports: eth.iter().map(|e| e.to_string()).collect() }];
     let mut vlans: Vec<u16> = Vec::new();
     let mut ebtables = Vec::new();
     for vap in vaps {
@@ -74,7 +89,7 @@ pub fn build(ctx: &Ctx, radios: &[Radio], vaps: &[Vap]) -> Result<Net> {
         let pos = match bridges.iter().position(|b| b.vlan == vlan) {
             Some(p) => p,
             None => {
-                bridges.push(Bridge { name: bridge_name(vlan), vlan, ports: Vec::new() });
+                bridges.push(Bridge { vlan, ports: Vec::new() });
                 bridges.len() - 1
             }
         };
@@ -117,13 +132,13 @@ pub fn render_bridge(c: &mut Cfg, net: &Net, meta: &mut Meta) {
     c.header("bridge");
     // There is always the untagged bridge.
     c.set("bridge.status", "enabled");
-    let names: Vec<&str> = net.bridges.iter().map(|b| b.name.as_str()).collect();
+    let names: Vec<String> = net.bridges.iter().map(|b| b.name().to_string()).collect();
     let indices = meta.bridges(&names);
-    for (b, i) in net.bridges.iter().zip(indices) {
-        c.set(format_args!("bridge.{i}.devname"), &b.name);
+    for ((b, name), i) in net.bridges.iter().zip(&names).zip(indices) {
+        c.set(format_args!("bridge.{i}.devname"), name);
         c.set(format_args!("bridge.{i}.fd"), 1);
         c.set(format_args!("bridge.{i}.stp.status"), "disabled");
-        for (dev, p) in meta.ports(&b.name, &b.ports) {
+        for (dev, p) in meta.ports(name, &b.ports) {
             c.set(format_args!("bridge.{i}.port.{p}.devname"), dev);
         }
     }
@@ -139,8 +154,8 @@ pub fn render_netconf(c: &mut Cfg, ctx: &Ctx, net: &Net, radios: &[Radio], vaps:
         Sub,
     }
     let mut ifaces: Vec<(Cow<str>, Kind)> = Vec::new();
-    ifaces.extend(net.bridges.iter().map(|b| (Cow::Borrowed(b.name.as_str()), Kind::Bridge)));
-    ifaces.extend(net.eth.iter().map(|e| (Cow::Borrowed(e.as_str()), Kind::Eth)));
+    ifaces.extend(net.bridges.iter().map(|b| (Cow::Owned(b.name().to_string()), Kind::Bridge)));
+    ifaces.extend(net.eth.iter().map(|e| (Cow::Borrowed(*e), Kind::Eth)));
     // A VAP shows as disabled only while the AP still reports it (stored vap_table) and
     // its radio is switched off.
     let reported = |dev: &str| {
@@ -224,7 +239,7 @@ mod tests {
             })
             .collect();
         let net = build(&ctx, &radios, &vaps).unwrap();
-        (net.vlans, vaps.iter().map(|v| bridge_name(v.vlan)).collect())
+        (net.vlans, vaps.iter().map(|v| BridgeName(v.vlan).to_string()).collect())
     }
 
     #[test]

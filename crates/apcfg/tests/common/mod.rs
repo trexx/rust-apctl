@@ -8,6 +8,7 @@
 #![allow(dead_code)]
 
 use std::collections::{BTreeMap, HashSet};
+use std::sync::OnceLock;
 
 use apcfg::{Controller, Input, Output};
 use serde_json::{Value, json};
@@ -20,11 +21,14 @@ pub use wire::capture::sample::{EXPECTED_PUSHES, check_expectation, fixtures, lo
 pub const AP_B: &str = "02:00:00:00:00:01";
 pub const AP_U: &str = "02:00:00:00:00:02";
 
-pub fn inform(mac: &str) -> Value {
-    load(match mac {
-        AP_B => "2026-10-12T184427.182Z_000001_020000000001_inform.json",
-        _ => "2026-10-12T184434.812Z_000003_020000000002_inform.json",
-    })
+/// The AP's captured inform, read the first time a test asks for it.
+pub fn inform(mac: &str) -> &'static Value {
+    static B: OnceLock<Value> = OnceLock::new();
+    static U: OnceLock<Value> = OnceLock::new();
+    match mac {
+        AP_B => B.get_or_init(|| load("2026-10-12T184427.182Z_000001_020000000001_inform.json")),
+        _ => U.get_or_init(|| load("2026-10-12T184434.812Z_000003_020000000002_inform.json")),
+    }
 }
 
 pub fn controller() -> Controller {
@@ -43,23 +47,28 @@ pub fn controller() -> Controller {
 /// ten MACs as `lock2ap`, and no push to AP B does, so they are locked to B.
 const LOCKED_TO_B: [&str; 10] = ["11", "0e", "10", "13", "22", "12", "0f", "21", "14", "15"];
 
-/// `controller-state.json` plus the lock-to-AP flags it is missing.
+/// `controller-state.json` plus the lock-to-AP flags it is missing: a copy of it, read
+/// the first time a test asks for it, for the test to change.
 pub fn state() -> Value {
-    let mut state = load("controller-state.json");
-    for client in state["clients"].as_array_mut().unwrap() {
-        let mac = client["mac"].as_str().unwrap().to_string();
-        if LOCKED_TO_B.iter().any(|m| mac == format!("02:00:00:00:00:{m}")) {
-            client["fixed_ap_enabled"] = json!(true);
-            client["fixed_ap_mac"] = json!(AP_B);
-        }
-    }
-    state
+    static STATE: OnceLock<Value> = OnceLock::new();
+    STATE
+        .get_or_init(|| {
+            let mut state = load("controller-state.json");
+            for client in state["clients"].as_array_mut().unwrap() {
+                let mac = client["mac"].as_str().unwrap().to_string();
+                if LOCKED_TO_B.iter().any(|m| mac == format!("02:00:00:00:00:{m}")) {
+                    client["fixed_ap_enabled"] = json!(true);
+                    client["fixed_ap_mac"] = json!(AP_B);
+                }
+            }
+            state
+        })
+        .clone()
 }
 
 pub fn render(state: &Value, mac: &str, cfgversion: &str) -> Output {
-    let inform = inform(mac);
     let controller = controller();
-    let input = Input { state, device_mac: mac, inform: Some(&inform), cfgversion, controller: &controller };
+    let input = Input { state, device_mac: mac, inform: Some(inform(mac)), cfgversion, controller: &controller };
     apcfg::render_with_meta(&input).unwrap_or_else(|e| panic!("render {mac}: {e:#}"))
 }
 

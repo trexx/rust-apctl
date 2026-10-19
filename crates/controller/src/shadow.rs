@@ -6,6 +6,7 @@
 //! (restarted with backoff, e.g. `kubectl exec ... tcpdump -w -`).
 
 use std::io::Read;
+use std::ops::ControlFlow;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::Arc;
@@ -161,24 +162,24 @@ fn run_once<R: Read + Send>(
         }
     };
     let end = capture::run_with_udp(Until { input, stop: &stop }, ports, &[syslog_port], |event| {
-        // What is left of the reader's buffer is not decoded for nothing.
+        // Once the engine is gone the run stops; what is left of the reader's buffer is not decoded.
         if stop.load(Ordering::Relaxed) {
-            return;
+            return ControlFlow::Break(());
         }
         // AP syslog sent to the other controller's address.
         if let capture::HttpEvent::Datagram { ts, src, payload, .. } = event {
             send(Input::Datagram { ts: ts / 1_000_000, src_ip: src.ip().to_string(), payload });
-            return;
+            return ControlFlow::Continue(());
         }
         // A message the decoder cannot cope with is skipped, not the whole capture:
         // the pairer starts afresh, as its half-paired exchanges may be inconsistent.
         let ev = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| pairer.handle(keys, event))) {
             Ok(Some(ev)) => ev,
-            Ok(None) => return,
+            Ok(None) => return ControlFlow::Continue(()),
             Err(_) => {
                 tracing::warn!("skipped a captured message the decoder panicked on");
                 pairer = Pairer::default();
-                return;
+                return ControlFlow::Continue(());
             }
         };
         let mut tick = None;
@@ -206,6 +207,7 @@ fn run_once<R: Read + Send>(
         if let Some(tick) = tick {
             send(tick);
         }
+        ControlFlow::Continue(())
     });
     if stop.load(Ordering::Relaxed) {
         anyhow::bail!("the engine has stopped");

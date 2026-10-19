@@ -505,6 +505,7 @@ fn debug_syslog(pcap: &str, keys: &str, port: u16) -> Result<()> {
                 None => println!("{ts} {src}: could not decode {} bytes", payload.len()),
             }
         }
+        std::ops::ControlFlow::Continue(())
     })?;
     if end == wire::capture::End::Truncated {
         tracing::warn!("the capture ends in the middle of a packet (truncated?); ignoring the rest");

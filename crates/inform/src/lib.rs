@@ -30,10 +30,10 @@ use aes_gcm::aead::consts::U16;
 use aes_gcm::AesGcm;
 
 pub const MAGIC: &[u8; 4] = b"TNBU";
-pub const HEADER_LEN: usize = 40;
+const HEADER_LEN: usize = 40;
 /// Largest payload accepted after decompression. Real informs are tens to a few
 /// hundred KB; the cap stops a small compressed body from inflating to gigabytes.
-pub const MAX_PLAINTEXT: usize = 8 << 20;
+const MAX_PLAINTEXT: usize = 8 << 20;
 
 /// Key used by devices that have not been adopted yet (MD5 of "ubnt").
 pub const DEFAULT_KEY: [u8; 16] = [
@@ -187,6 +187,10 @@ impl Header {
         let Some(h) = buf.first_chunk::<HEADER_LEN>() else {
             return Err(Error::TooShort(buf.len()));
         };
+        Header::from_raw(h)
+    }
+
+    fn from_raw(h: &[u8; HEADER_LEN]) -> Result<Header> {
         // A field of the header, sized at compile time.
         fn at<const N: usize>(h: &[u8; HEADER_LEN], offset: usize) -> [u8; N] {
             std::array::from_fn(|i| h[offset + i])
@@ -229,7 +233,8 @@ pub fn parse_key<const N: usize>(hex_key: &str) -> Result<[u8; N]> {
 #[derive(Clone, Debug)]
 pub struct Packet<'a> {
     pub header: Header,
-    pub raw_header: &'a [u8],
+    /// The header's bytes, which AES-GCM authenticates.
+    raw_header: &'a [u8; HEADER_LEN],
     pub body: &'a [u8],
 }
 
@@ -237,13 +242,15 @@ impl<'a> Packet<'a> {
     /// Splits a packet. Bytes after the declared payload are ignored; fewer than it
     /// declares is [`Error::Truncated`].
     pub fn parse(buf: &'a [u8]) -> Result<Packet<'a>> {
-        let header = Header::parse(buf)?;
-        let body = &buf[HEADER_LEN..];
+        let Some((raw_header, body)) = buf.split_first_chunk::<HEADER_LEN>() else {
+            return Err(Error::TooShort(buf.len()));
+        };
+        let header = Header::from_raw(raw_header)?;
         let declared = header.payload_len as usize;
         if body.len() < declared {
             return Err(Error::Truncated { declared, actual: body.len() });
         }
-        Ok(Packet { header, raw_header: &buf[..HEADER_LEN], body: &body[..declared] })
+        Ok(Packet { header, raw_header, body: &body[..declared] })
     }
 
     /// Decrypts and decompresses the payload, returning the plaintext (normally JSON).

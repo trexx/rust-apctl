@@ -157,9 +157,9 @@ impl Meta {
             .collect()
     }
 
-    fn keyed(old: &[(String, u32)], names: &[&str]) -> Vec<(String, u32)> {
-        let nums = allocate(names.iter().map(|&n| old.iter().find(|(o, _)| o == n).map(|(_, i)| *i)), 1);
-        names.iter().zip(nums).map(|(&n, i)| (n.to_string(), i)).collect()
+    fn keyed(old: &[(String, u32)], names: &[impl AsRef<str>]) -> Vec<(String, u32)> {
+        let nums = allocate(names.iter().map(|n| old.iter().find(|(o, _)| o == n.as_ref()).map(|(_, i)| *i)), 1);
+        names.iter().zip(nums).map(|(n, i)| (n.as_ref().to_string(), i)).collect()
     }
 
     /// `netconf.N` indices for interfaces in output order.
@@ -169,7 +169,7 @@ impl Meta {
     }
 
     /// `bridge.N` indices for bridges in output order.
-    pub fn bridges(&mut self, names: &[&str]) -> Vec<u32> {
+    pub fn bridges(&mut self, names: &[String]) -> Vec<u32> {
         self.bridges = Self::keyed(&self.old_bridges, names);
         self.bridges.iter().map(|(_, i)| *i).collect()
     }
@@ -177,15 +177,15 @@ impl Meta {
     /// Port indices of one bridge's ports, given in insertion order. Ports that already
     /// had an index come first (in insertion order), then the newly numbered ones; that
     /// is the order the official controller writes them in.
-    pub fn ports(&mut self, bridge: &str, devs: &[String]) -> Vec<(String, u32)> {
+    pub fn ports<'d>(&mut self, bridge: &str, devs: &'d [String]) -> Vec<(&'d str, u32)> {
         let old: Vec<Option<u32>> =
             devs.iter().map(|dev| self.old_ports.iter().find(|(b, d, _)| b == bridge && d == dev).map(|(_, _, i)| *i)).collect();
         let nums = allocate(old.iter().copied(), 1);
         let mut out = Vec::with_capacity(devs.len());
         for fresh in [false, true] {
-            out.extend(devs.iter().zip(&old).zip(&nums).filter(|((_, o), _)| o.is_none() == fresh).map(|((d, _), &i)| (d.clone(), i)));
+            out.extend(devs.iter().zip(&old).zip(&nums).filter(|((_, o), _)| o.is_none() == fresh).map(|((d, _), &i)| (d.as_str(), i)));
         }
-        self.ports.extend(out.iter().map(|(d, i)| (bridge.to_string(), d.clone(), *i)));
+        self.ports.extend(out.iter().map(|&(d, i)| (bridge.to_string(), d.to_string(), i)));
         out
     }
 

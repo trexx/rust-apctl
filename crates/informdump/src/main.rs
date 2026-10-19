@@ -14,6 +14,7 @@ mod sanitize;
 mod simulate;
 
 use std::io::Write;
+use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -173,7 +174,11 @@ fn run_capture(input: &str, common: Common, all: bool) -> Result<()> {
         keys,
         Options { all, full: common.full, json: common.json, save: common.save, redact: !common.no_redact },
     );
-    warn_if_truncated(capture::run(capture::open_input(input)?, &common.ports, |ev| reporter.handle(ev))?);
+    let end = capture::run(capture::open_input(input)?, &common.ports, |ev| {
+        reporter.handle(ev);
+        ControlFlow::Continue(())
+    })?;
+    warn_if_truncated(end);
     Ok(())
 }
 

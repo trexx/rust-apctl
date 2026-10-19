@@ -588,7 +588,7 @@ fn mdns(c: &mut Cfg, ctx: &Ctx, vaps: &[Vap], net: &Net) {
     if isolation {
         c.set("mdns_sd.ap_mode", "enabled");
     }
-    let bridge_of_vlan = |vlan: Option<u16>| net.bridges.iter().find(|b| b.vlan == vlan).map(|b| b.name.as_str());
+    let bridge_of_vlan = |vlan: Option<u16>| net.bridges.iter().find(|b| b.vlan == vlan).map(net::Bridge::name);
     let (mut f, mut p) = (0, 0);
     for wv in wlans {
         let w: &Value = &wv.w;
@@ -619,7 +619,7 @@ fn mdns(c: &mut Cfg, ctx: &Ctx, vaps: &[Vap], net: &Net) {
         }
         let own_bridge = bridge_of_vlan(network_vlan(ctx, own));
         for e in entries {
-            let others: Vec<&str> = e
+            let others: Vec<net::BridgeName> = e
                 .networks
                 .iter()
                 .filter(|n| **n != own)
@@ -665,9 +665,10 @@ fn limits(g: &Value) -> (i64, i64) {
 /// The most a radio can carry (Mbps), the ceiling used for "unlimited". The
 /// official controller takes it from its model table; this estimates it per
 /// spatial stream (150 at 2.4 GHz, 600 for Wi-Fi 6 / 433 for Wi-Fi 5 at
-/// 5 GHz), which gives the table's 300 and 2400 for a U6-Mesh.
+/// 5 GHz), which gives the table's 300 and 2400 for a U6-Mesh. `nss` comes from
+/// the AP's inform: one beyond the 16 streams any radio may have is taken as 16.
 fn radio_max_mbps(r: &Radio) -> i64 {
-    let nss = int_of(r.doc, "nss").unwrap_or(2).max(1);
+    let nss = int_of(r.doc, "nss").unwrap_or(2).clamp(1, 16);
     let per_stream = match r.band {
         Band::Ng => 150,
         _ if flag(r.doc, "is_11ax", false) => 600,
@@ -797,6 +798,15 @@ mod tests {
         }
         assert_eq!(switch_lines(json!([{ "num_port": -5 }, { "num_port": 2 }]), json!([])).len(), 2 * 2);
         assert_eq!(switch_lines(json!([]), json!([])), ["switch.port.1.name=Port 1", "switch.port.1.opmode=switch"]);
+    }
+
+    #[test]
+    fn a_radio_reporting_absurd_streams_is_capped() {
+        let max = |doc: Value, band| radio_max_mbps(&Radio { idx: 1, name: "wifi0", band, doc: &doc, disabled: false });
+        assert_eq!((max(json!({ "nss": 2 }), Band::Ng), max(json!({ "nss": 4, "is_11ax": true }), Band::Na)), (300, 2400));
+        assert_eq!(max(json!({}), Band::Na), 866, "two streams when the AP does not say");
+        assert_eq!(max(json!({ "nss": i64::MAX, "is_11ax": true }), Band::Na), 16 * 600);
+        assert_eq!(max(json!({ "nss": -3 }), Band::Ng), 150);
     }
 
     #[test]

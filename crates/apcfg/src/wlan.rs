@@ -403,7 +403,7 @@ pub fn network_vlan(ctx: &Ctx, network_id: Option<&str>) -> Option<u16> {
 }
 
 /// The VLAN a network document tags its traffic with, if it is tagged.
-pub fn tagged_vlan(network: &Value) -> Option<u16> {
+fn tagged_vlan(network: &Value) -> Option<u16> {
     b(network, "vlan_enabled").then(|| int_of(network, "vlan").unwrap_or(2)).and_then(vlan_id)
 }
 
@@ -477,10 +477,9 @@ fn wep(c: &mut Cfg, p: Prefix, w: &Value) {
     c.set(p.at("security.default_key"), idx);
 }
 
-/// `aaa.N.*` and `wireless.N.*` for one VAP. `bridge` is the bridge the VAP is a port of.
 /// The `aaa.N.*` and `wireless.N.*` blocks of one VAP (`v`, one of `vaps`).
 pub fn render_vap(c: &mut Cfg, ctx: &Ctx, radios: &[Radio], vaps: &[Vap], v: &Vap) {
-    let bridge = &crate::net::bridge_name(v.vlan);
+    let bridge = crate::net::BridgeName(v.vlan);
     let w: &Value = &v.w;
     let r = &radios[v.radio];
     let n = v.slot.section;
@@ -799,7 +798,8 @@ fn render_wireless(c: &mut Cfg, ctx: &Ctx, radios: &[Radio], vaps: &[Vap], v: &V
             c.set(k.at("bcfilt.bypass_types"), "ARP|NSNA|DHCPV4|DHCPV6");
         }
         let mut macs: Vec<String> = str_list(w, "bc_filter_list").map(|m| m.to_ascii_lowercase()).collect();
-        macs.extend(gateway_macs(ctx));
+        // The site's gateways always get through.
+        macs.extend_from_slice(ctx.gateway_macs());
         for (mi, mac) in hash_set_order(&macs).iter().enumerate() {
             c.set(format_args!("{k}bcfilt.{}.status", mi + 1), "enabled");
             c.set(format_args!("{k}bcfilt.{}.mac", mi + 1), mac);
@@ -824,15 +824,6 @@ fn render_wireless(c: &mut Cfg, ctx: &Ctx, radios: &[Radio], vaps: &[Vap], v: &V
             c.set(k.at("dns_bypass.servers"), str_list(w, "dns_assistance_servers").collect::<Vec<_>>().join(","));
         }
     }
-}
-
-/// LAN MACs of the site's gateways; broadcast filters always let them through.
-fn gateway_macs(ctx: &Ctx) -> Vec<String> {
-    ctx.site_docs("devices")
-        .filter(|d| matches!(str_of(d, "type"), Some("ugw" | "udm" | "uxg")))
-        .filter_map(|d| str_of(d, "mac"))
-        .map(str::to_ascii_lowercase)
-        .collect()
 }
 
 const DAYS: [&str; 7] = ["sun", "mon", "tue", "wed", "thu", "fri", "sat"];
@@ -924,7 +915,7 @@ fn schedule(c: &mut Cfg, w: &Value, k: Prefix, invert: bool, multi: bool) {
 }
 
 #[cfg(test)]
-mod schedule_tests {
+mod tests {
     use super::*;
     use serde_json::json;
 
