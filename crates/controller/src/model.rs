@@ -478,7 +478,7 @@ pub fn parse(ts: Ts, p: &Value) -> anyhow::Result<Snapshot> {
         for n in r["scan_table"].as_array().into_iter().flatten() {
             let Some(bssid) = string(&n["bssid"]) else { continue };
             neighbors.push(NeighborSample {
-                radio: string(&n["band"]).or(radio.clone()),
+                radio: string(&n["band"]).or_else(|| radio.clone()),
                 bssid: bssid.to_ascii_lowercase(),
                 essid: string(&n["essid"]),
                 channel: int(&n["channel"]),
