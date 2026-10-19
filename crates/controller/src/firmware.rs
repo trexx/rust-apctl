@@ -184,6 +184,11 @@ impl Job {
     }
 }
 
+/// How long a sent upgrade has at least, and each of the AP's steps after it,
+/// before it fails: the official controller's minimum for U6 APs.
+pub const STEP_DEADLINE: Ts = 450;
+/// The most the AP's own upgrade + reboot estimate can give a sent upgrade.
+const MAX_DEADLINE: Ts = 86_400;
 /// How long the upgrade at the head of the queue waits for its AP's turn (an
 /// inform with its settings current) before it fails.
 const TURN_WAIT: Ts = 600;
@@ -233,6 +238,15 @@ impl Jobs {
 
     pub fn current_for(&mut self, mac: &Mac) -> Option<&mut Job> {
         self.current.as_mut().filter(|j| j.mac == *mac)
+    }
+
+    /// The AP reports a step of its upgrade: the deadline is re-armed, as the
+    /// official controller does on each step.
+    pub fn progress(&mut self, mac: &Mac, state: JobState, now: Ts) {
+        if let Some(j) = self.current_for(mac) {
+            j.state = state;
+            j.expires = Some(now + STEP_DEADLINE);
+        }
     }
 
     /// The AP reports its version: the job succeeded if it was upgrading and
@@ -332,17 +346,17 @@ async fn change_queue(s: &AppState, op: Op) -> Result<usize, ApiError> {
 }
 
 /// The upgrade command for an AP's inform reply, if its turn has come. Marks
-/// the job sent and sets its deadline: at least 450 s (the official
-/// controller's minimum for U6 APs), or the AP's own upgrade + reboot estimate.
+/// the job sent and sets its deadline: the AP's own upgrade + reboot estimate,
+/// but at least [`STEP_DEADLINE`] and at most a day.
 pub fn command(jobs: &mut Jobs, mac: &Mac, inform: &Value, now: Ts) -> Option<Result<Value, &'static str>> {
     let j = jobs.current_for(mac).filter(|j| j.state == JobState::Queued)?;
     if !j.custom && inform["internet"].as_bool() == Some(false) {
         return Some(Err("the AP has no internet access to download the firmware"));
     }
-    let estimate = inform["upgrade_duration"].as_i64().unwrap_or(0) + inform["reboot_duration"].as_i64().unwrap_or(0);
+    let estimate = inform["upgrade_duration"].as_i64().unwrap_or(0).saturating_add(inform["reboot_duration"].as_i64().unwrap_or(0));
     j.state = JobState::Sent;
     j.sent_at = Some(now);
-    j.expires = Some(now + estimate.max(450));
+    j.expires = Some(now + estimate.clamp(STEP_DEADLINE, MAX_DEADLINE));
     // What it runs now, so that only a different version counts as the upgrade landing.
     if j.from.is_none() {
         j.from = inform["version"].as_str().map(str::to_string);
@@ -728,12 +742,25 @@ mod tests {
         command(&mut j, &m("a"), &json!({ "upgrade_duration": 600, "reboot_duration": 100 }), 0).unwrap().unwrap();
         assert_eq!(j.expired(700), None);
         assert_eq!(j.expired(701), Some((m("a"), TIMED_OUT)));
+        // Each step the AP reports gives it the step's time again.
+        j.progress(&m("a"), JobState::Downloading, 650);
+        assert_eq!(j.current.as_ref().map(|c| (c.state, c.expires)), Some((JobState::Downloading, Some(650 + STEP_DEADLINE))));
         assert_eq!(j.cancel_queued(), 1, "only b; a is already upgrading");
         assert!(j.current.is_some());
         // As the engine makes the changes the UI asks for.
         assert_eq!(Op::Enqueue(vec![job("c"), job("d")]).apply(&mut j), 2);
         assert_eq!(Op::Enqueue(vec![job("a"), job("c"), job("e")]).apply(&mut j), 1, "a is upgrading and c queued already");
         assert_eq!(Op::CancelQueued.apply(&mut j), 3);
+    }
+
+    #[test]
+    fn the_aps_estimate_is_kept_within_bounds() {
+        for (estimate, expires) in [((i64::MAX, i64::MAX), MAX_DEADLINE), ((-1_000_000, 0), STEP_DEADLINE)] {
+            let mut j = Jobs::default();
+            j.enqueue(vec![job("a")]);
+            command(&mut j, &m("a"), &json!({ "upgrade_duration": estimate.0, "reboot_duration": estimate.1 }), 100).unwrap().unwrap();
+            assert_eq!(j.current.as_ref().and_then(|c| c.expires), Some(100 + expires));
+        }
     }
 
     #[test]

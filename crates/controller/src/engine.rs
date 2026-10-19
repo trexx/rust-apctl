@@ -377,6 +377,7 @@ pub(crate) const MCAST_GAP: Ts = 120;
 #[derive(Default)]
 struct Written {
     devices: HashMap<Mac, Ts>,
+    /// Connected clients only: one that reconnects is written anyway.
     clients: HashMap<Mac, Ts>,
     /// Per AP: each neighbour by BSSID.
     neighbors: HashMap<Mac, Rows<String, crate::model::NeighborSample>>,
@@ -451,7 +452,8 @@ pub struct Engine {
     tx: broadcast::Sender<LiveMsg>,
     /// Debounced radio settings: right after a restart an AP briefly reports
     /// transient values (e.g. full transmit power) before settling.
-    radios: HashMap<(Mac, String), RadioTrack>,
+    /// Per AP and radio.
+    radios: HashMap<Mac, HashMap<String, RadioTrack>>,
     /// Each client's last sample with multicast counters (and the BSSID they came from).
     mcast_prev: HashMap<Mac, (Ts, Arc<ClientSample>)>,
     /// Each BSSID's last "delivered to clients" counters. The AP reports these
@@ -582,8 +584,8 @@ impl Engine {
     pub fn handle(&mut self, input: Input) {
         match input {
             Input::Inform { ts, peer, decoded } => self.inform(ts, peer, decoded),
-            Input::Reply { ts, mac, decoded } => self.reply(ts, mac, &decoded.payload, true),
-            Input::Replied { ts, mac, payload } => self.reply(ts, mac, &payload, false),
+            Input::Reply { ts, mac, decoded } => self.reply(ts, mac, decoded.payload, true),
+            Input::Replied { ts, mac, payload } => self.reply(ts, mac, payload, false),
             Input::SetConfigMeta { mac, meta } => self.set_config_meta(mac, meta),
             Input::Datagram { ts, src_ip, payload } => self.datagram(ts, &src_ip, &payload),
             Input::Tick(now) => self.tick(now),
@@ -717,12 +719,17 @@ impl Engine {
     /// Settings changes on the AP's radios, debounced (see `radios`).
     fn radio_events(&mut self, ts: Ts, snap: &Snapshot, events: &mut Vec<Event>) {
         let mac = snap.ap.mac;
+        let tracks = self.radios.entry(mac).or_default();
         for r in &snap.radios {
             let now = (r.channel, r.bw, r.tx_power);
             if now.0.is_none() {
                 continue; // no VAP on this radio, so nothing to compare
             }
-            let track = self.radios.entry((mac, r.radio.clone())).or_default();
+            // The band is copied only for a radio not seen before.
+            if !tracks.contains_key(r.radio.as_str()) {
+                tracks.insert(r.radio.clone(), RadioTrack::default());
+            }
+            let track = tracks.get_mut(r.radio.as_str()).expect("inserted above");
             match track.committed {
                 None => track.committed = Some(now),
                 Some(c) if c == now => track.candidate = None,
@@ -835,7 +842,7 @@ impl Engine {
     ///
     /// The diffs and the dry-run render take a while, so the live view is only
     /// locked to read what they need and then to store the results.
-    fn reply(&self, ts: Ts, mac: Mac, p: &Value, dry_run: bool) {
+    fn reply(&self, ts: Ts, mac: Mac, mut p: Value, dry_run: bool) {
         bump(&self.counters.replies);
         // Nearly every reply repeats the interval the AP already has.
         if let Some(interval) = p["interval"].as_i64() {
@@ -848,26 +855,32 @@ impl Engine {
             return;
         }
         bump(&self.counters.config_pushes);
+        // The push's own configs, moved out rather than copied. One can be
+        // management-only (e.g. after an LED change): it carries mgmt_cfg
+        // alone, and the AP keeps its last full system_cfg.
+        let mut take = |name: &str| match p.get_mut(name).map(Value::take) {
+            Some(Value::String(s)) => Some(s),
+            _ => None,
+        };
+        let (new_mgmt, new_system) = (take("mgmt_cfg"), take("system_cfg"));
         let (radios, previous, state, inform) = {
             let live = self.live.read().unwrap();
             // The last push (unredacted), for the diffs; empty fields if none was seen.
             let previous = live.last_config.get(&mac).cloned().unwrap_or_default();
-            let radios = live.devices.get(&mac).map(|d| d.snapshot.radios.clone()).unwrap_or_default();
-            let has_system = !p["system_cfg"].as_str().unwrap_or(&previous.system_cfg).is_empty();
+            let has_system = new_system.as_ref().map_or(!previous.system_cfg.is_empty(), |s| !s.is_empty());
+            // For the section labels, which only a system_cfg has.
+            let radios = live.devices.get(&mac).filter(|_| has_system).map(|d| d.snapshot.radios.clone()).unwrap_or_default();
             let wanted = dry_run && has_system && self.renderer.is_some();
             let state = live.state.clone().filter(|_| wanted);
             let inform = state.as_ref().and_then(|_| live.raw_informs.get(&mac).cloned());
             (radios, previous, state, inform)
         };
-        // A push can be management-only (e.g. after an LED change): it carries
-        // mgmt_cfg alone, and the AP keeps its last full system_cfg.
-        let field = |name: &str, prev: &str| p[name].as_str().unwrap_or(prev).to_string();
-        let mgmt = field("mgmt_cfg", &previous.mgmt_cfg);
-        let system = field("system_cfg", &previous.system_cfg);
+        let mgmt = new_mgmt.as_deref().unwrap_or(&previous.mgmt_cfg);
+        let system = new_system.as_deref().unwrap_or(&previous.system_cfg);
         let mut data = serde_json::Map::new();
         data.insert("cfgversion".into(), p["cfgversion"].clone());
-        for (field, old) in [("mgmt_cfg", &previous.mgmt_cfg), ("system_cfg", &previous.system_cfg)] {
-            let Some(new) = p[field].as_str() else { continue };
+        for (field, new, old) in [("mgmt_cfg", &new_mgmt, &previous.mgmt_cfg), ("system_cfg", &new_system, &previous.system_cfg)] {
+            let Some(new) = new else { continue };
             let summary = if old.is_empty() {
                 json!({ "baseline": true, "lines": new.lines().count() })
             } else {
@@ -880,9 +893,9 @@ impl Engine {
         // this push are only named in the previous config, which is read only
         // when this push replaces it.
         if !system.is_empty() {
-            let new_system = p["system_cfg"].is_string() && !previous.system_cfg.is_empty();
-            let mut labels = if new_system { section_labels(&previous.system_cfg, &radios) } else { Default::default() };
-            labels.extend(section_labels(&system, &radios));
+            let replaced = new_system.is_some() && !previous.system_cfg.is_empty();
+            let mut labels = if replaced { section_labels(&previous.system_cfg, &radios) } else { Default::default() };
+            labels.extend(section_labels(system, &radios));
             data.insert("labels".into(), Value::Object(labels));
         }
         // Without one in the push: the one its mgmt_cfg carries (this push's, else
@@ -902,11 +915,10 @@ impl Engine {
                 Sql::Text(mac.to_string()),
                 Sql::Integer(ts),
                 cfgversion.clone().into(),
-                p["mgmt_cfg"].as_str().map(cfgdiff::redact).into(),
-                p["system_cfg"].as_str().map(cfgdiff::redact).into(),
+                new_mgmt.as_deref().map(cfgdiff::redact).into(),
+                new_system.as_deref().map(cfgdiff::redact).into(),
             ],
         );
-
         // Dry run: what would apctl have pushed for the same AP at this moment?
         let dry = match (&self.renderer, &state) {
             (Some(render), Some(state)) => {
@@ -915,38 +927,50 @@ impl Engine {
                     device_mac: &mac.to_string(),
                     inform: inform.as_deref(),
                     cfgversion: cfgversion.as_deref().unwrap_or(""),
-                    previous_system_cfg: Some(&system),
+                    previous_system_cfg: Some(system),
                 };
-                let result = render(&req).map(|ours| crate::dryrun::compare(&ours, &mgmt, &system, false));
-                let (matches, payload) = match &result {
-                    Ok(c) => (c.matches(), serde_json::to_string(c).unwrap_or_default()),
-                    Err(e) => (false, json!({ "error": format!("{e:#}") }).to_string()),
-                };
-                self.writer.exec(
-                    Db::Config,
-                    "INSERT INTO dryrun_results (ts, mac, cfgversion, matches, comparison) VALUES (?1, ?2, ?3, ?4, ?5)",
-                    vec![Sql::Integer(ts), Sql::Text(mac.to_string()), cfgversion.clone().into(), Sql::Integer(matches as i64), Sql::Text(payload)],
-                );
-                Some(match &result {
-                    Ok(c) => json!({ "matches": matches, "system_cfg": { "added": c.system_cfg.added, "removed": c.system_cfg.removed, "changed": c.system_cfg.changed, "same_content": c.system_cfg.same_content } }),
-                    Err(e) => json!({ "matches": false, "error": format!("{e:#}") }),
-                })
+                Some(self.dry_run(render, ts, &req, cfgversion.as_deref(), mgmt))
             }
             _ => None,
         };
 
         // As in `inform`: the write lock is held for the swap alone, and the old
         // push is dropped and the events emitted after it.
+        let pushed = PushedConfig {
+            mgmt_cfg: new_mgmt.unwrap_or_else(|| previous.mgmt_cfg.clone()),
+            system_cfg: new_system.unwrap_or_else(|| previous.system_cfg.clone()),
+            cfgversion,
+        };
         let mut live = self.live.write().unwrap();
         if let Some(d) = live.devices.get_mut(&mac) {
             d.last_config_push = Some(ts);
         }
-        let old_config = live.last_config.insert(mac, Arc::new(PushedConfig { mgmt_cfg: mgmt, system_cfg: system, cfgversion }));
+        let old_config = live.last_config.insert(mac, Arc::new(pushed));
         drop(live);
         drop((old_config, previous));
         self.emit(Event::device(ts, EventKind::ConfigPushed, mac, Value::Object(data)));
         if let Some(summary) = dry {
             self.emit(Event::device(ts, EventKind::DryrunCompared, mac, summary));
+        }
+    }
+
+    /// Renders the AP's config for `req` and compares it with the push (its
+    /// `mgmt` and `req.previous_system_cfg`): stored, and summed up for the event.
+    fn dry_run(&self, render: &crate::dryrun::RenderFn, ts: Ts, req: &crate::dryrun::RenderRequest, cfgversion: Option<&str>, mgmt: &str) -> Value {
+        let system = req.previous_system_cfg.unwrap_or_default();
+        let result = render(req).map(|ours| crate::dryrun::compare(&ours, mgmt, system, false));
+        let (matches, payload) = match &result {
+            Ok(c) => (c.matches(), serde_json::to_string(c).unwrap_or_default()),
+            Err(e) => (false, json!({ "error": format!("{e:#}") }).to_string()),
+        };
+        self.writer.exec(
+            Db::Config,
+            "INSERT INTO dryrun_results (ts, mac, cfgversion, matches, comparison) VALUES (?1, ?2, ?3, ?4, ?5)",
+            vec![Sql::Integer(ts), Sql::Text(req.device_mac.to_string()), cfgversion.map(str::to_string).into(), Sql::Integer(matches as i64), Sql::Text(payload)],
+        );
+        match &result {
+            Ok(c) => json!({ "matches": matches, "system_cfg": { "added": c.system_cfg.added, "removed": c.system_cfg.removed, "changed": c.system_cfg.changed, "same_content": c.system_cfg.same_content } }),
+            Err(e) => json!({ "matches": false, "error": format!("{e:#}") }),
         }
     }
 
@@ -1028,6 +1052,7 @@ impl Engine {
         connected.retain(|cmac| {
             let Some(c) = clients.get_mut(cmac).filter(|c| c.sample.ap_mac == mac) else { return true };
             events.push(disconnect(&self.writer, ts, *cmac, c, "ap_forgotten"));
+            self.written.clients.remove(cmac);
             false
         });
         drop(live);
@@ -1041,7 +1066,7 @@ impl Engine {
         if had_clients {
             let _ = self.tx.send(LiveMsg::Clients);
         }
-        self.radios.retain(|(m, _), _| *m != mac);
+        self.radios.remove(&mac);
         self.isolated.remove(&mac);
         self.written.devices.remove(&mac);
         self.written.neighbors.remove(&mac);
@@ -1125,7 +1150,12 @@ impl Engine {
 
     /// Taken by value: an event's data is moved out of the notification, not copied.
     fn notification(&self, ts: Ts, mut p: Value) {
-        let Some(mac) = p["mac"].as_str().and_then(|m| m.parse::<Mac>().ok()) else { return };
+        let Some(mac) = p["mac"].as_str().and_then(|m| m.parse::<Mac>().ok()) else {
+            // As an inform without one.
+            tracing::debug!("notification without a valid mac");
+            bump(&self.counters.decode_errors);
+            return;
+        };
         bump(&self.counters.notifications);
         // The live view is written for this alone, and only read (or, for an
         // upgrade notice, written) again where the notification needs it.
@@ -1274,7 +1304,10 @@ impl Engine {
         for (mac, cipher) in self.syslog_ciphers.all() {
             if let Ok(text) = crate::syslog::decrypt_with(payload, mac, cipher) {
                 self.syslog_unknown.remove(&hash_id);
-                self.live.write().unwrap().by_hash_id.insert(hash_id, mac);
+                // As `Live::attribute`: an AP has one hash_id.
+                let mut live = self.live.write().unwrap();
+                live.by_hash_id.retain(|_, m| *m != mac);
+                live.by_hash_id.insert(hash_id, mac);
                 return Ok((mac, text));
             }
         }
@@ -1334,11 +1367,7 @@ impl Engine {
                     Some("FWCheckOK") => JobState::Writing,
                     _ => JobState::Preparing,
                 };
-                if let Some(j) = live.firmware.current_for(&mac) {
-                    j.state = step;
-                    // Re-arm the deadline as the official controller does on each step.
-                    j.expires = Some(ts + 450);
-                }
+                live.firmware.progress(&mac, step, ts);
                 Some(Event::device(ts, EventKind::ApUpgradeProgress, mac, json!({ "step": step })))
             }
             (Some("UpgradeError"), _) => {
@@ -1420,12 +1449,12 @@ impl Engine {
         let stale = now - 2 * MCAST_GAP;
         self.mcast_prev.retain(|_, (ts, ..)| *ts > stale);
         self.syslog_unknown.retain(|_, at| (*at..*at + SYSLOG_RETRY_SECS).contains(&now));
-        for (device_mac, (_, later)) in &mut self.logs_announced {
+        self.logs_announced.retain(|device_mac, (at, later)| {
             if std::mem::take(later) {
                 let _ = self.tx.send(LiveMsg::Log { device_mac: *device_mac });
             }
-        }
-        self.logs_announced.retain(|_, (at, _)| now - *at < 60);
+            now - *at < 60
+        });
         self.bss_prev.retain(|_, (ts, _)| *ts > stale);
         for e in self.logevents.tick(now) {
             self.emit(e);
@@ -1468,6 +1497,7 @@ impl Engine {
             let Some(reason) = reason else { return true };
             changed = true;
             events.push(disconnect(&self.writer, now, *cmac, c, reason));
+            self.written.clients.remove(cmac);
             false
         });
         // Clients gone longer than the database keeps them (see `store::maintenance`).
@@ -1479,7 +1509,6 @@ impl Engine {
             clients.retain(|mac, c| c.last_seen >= cutoff || aliases.contains_key(mac));
             changed |= clients.len() != before;
             connected.retain(|mac| clients.contains_key(mac));
-            self.written.clients.retain(|mac, _| clients.contains_key(mac));
         }
         drop(live);
         for e in events {
@@ -1522,7 +1551,9 @@ impl Engine {
     /// The inform's metrics, and its scan results (see `Written`).
     fn write_metrics(&mut self, s: &Snapshot, neighbors: Vec<crate::model::NeighborSample>, spectrum: Vec<crate::model::SpectrumSample>) {
         let ts = s.ap.ts;
-        let mac = || Sql::Text(s.ap.mac.to_string());
+        // Formatted once: nearly every row of the inform carries the AP's MAC.
+        let mac_text = Sql::Text(s.ap.mac.to_string());
+        let mac = || mac_text.clone();
         let a = &s.ap;
         self.writer.send(Write::Metric {
             table: &store::AP,
@@ -1715,29 +1746,30 @@ pub(crate) fn section_labels(cfg: &str, radios: &[crate::model::RadioSample]) ->
 fn lifecycle_events(ts: Ts, a: &crate::model::ApSample, prev: Option<&DeviceView>, known: Option<&KnownDevice>) -> Vec<Event> {
     let mac = a.mac;
     let mut events = Vec::new();
-    match (prev, known) {
-        (None, None) => events.push(Event::device(ts, EventKind::ApSeen, mac, json!({ "ip": a.ip, "model": a.model, "version": a.version }))),
-        // Known from a previous run: only report what we can prove changed while we were away.
-        (None, Some(k)) => {
-            let away = ts - k.last_seen;
-            if let (Some(old), Some(up)) = (k.uptime, a.uptime)
-                && up + 60 < old + away {
-                    events.push(Event::device(ts, EventKind::ApRestarted, mac, json!({ "uptime": up })));
-                }
-            if k.version.is_some() && a.version.is_some() && k.version != a.version {
-                events.push(Event::device(ts, EventKind::ApFirmwareChanged, mac, json!({ "from": k.version, "to": a.version })));
+    // What was last known of the AP: its uptime and when it reported it, and its version.
+    let (uptime, version) = match (prev, known) {
+        (None, None) => {
+            events.push(Event::device(ts, EventKind::ApSeen, mac, json!({ "ip": a.ip, "model": a.model, "version": a.version })));
+            return events;
+        }
+        (Some(p), _) => {
+            if !p.online {
+                events.push(Event::device(ts, EventKind::ApOnline, mac, json!({ "offline_for": ts - p.last_seen })));
             }
+            (p.snapshot.ap.uptime.map(|u| (u, p.snapshot.ap.ts)), &p.snapshot.ap.version)
         }
-        (Some(p), _) if !p.online => events.push(Event::device(ts, EventKind::ApOnline, mac, json!({ "offline_for": ts - p.last_seen }))),
-        _ => {}
+        (None, Some(k)) => (k.uptime.map(|u| (u, k.last_seen)), &k.version),
+    };
+    // Only what can be proved to have changed, in this run or while apctl was
+    // away: up for less than it was then plus the time since (with a minute's
+    // slack), and a version other than a known one.
+    if let (Some((old, at)), Some(up)) = (uptime, a.uptime)
+        && up.saturating_add(60) < old.saturating_add(ts - at)
+    {
+        events.push(Event::device(ts, EventKind::ApRestarted, mac, json!({ "uptime": up })));
     }
-    if let (Some(p), Some(up)) = (prev, a.uptime) {
-        if p.snapshot.ap.uptime.is_some_and(|old| up + 30 < old) {
-            events.push(Event::device(ts, EventKind::ApRestarted, mac, json!({ "uptime": up })));
-        }
-        if p.snapshot.ap.version != a.version && a.version.is_some() {
-            events.push(Event::device(ts, EventKind::ApFirmwareChanged, mac, json!({ "from": p.snapshot.ap.version, "to": a.version })));
-        }
+    if version.is_some() && a.version.is_some() && *version != a.version {
+        events.push(Event::device(ts, EventKind::ApFirmwareChanged, mac, json!({ "from": version, "to": a.version })));
     }
     events
 }
@@ -1787,7 +1819,12 @@ fn connected_event(ts: Ts, c: &ClientSample, new: bool) -> Event {
 /// returns the event that says so, for the caller to emit.
 fn disconnect(writer: &Writer, ts: Ts, mac: Mac, c: &mut ClientView, reason: &str) -> Event {
     c.connected = false;
-    writer.exec(Db::Config, "UPDATE clients SET connected = 0 WHERE mac = ?1", vec![Sql::Text(mac.to_string())]);
+    // The row's last_seen is only written once a minute while connected.
+    writer.exec(
+        Db::Config,
+        "UPDATE clients SET connected = 0, last_seen = MAX(COALESCE(last_seen, ?2), ?2) WHERE mac = ?1",
+        vec![Sql::Text(mac.to_string()), Sql::Integer(c.last_seen)],
+    );
     Event::client_on(ts, EventKind::ClientDisconnected, c.sample.ap_mac, mac, json!({
         "reason": reason, "last_seen": c.last_seen, "essid": c.sample.essid,
         "connected_for": c.sample.uptime, "last_signal": c.sample.signal,
@@ -2036,6 +2073,12 @@ mod tests {
         assert_eq!(stored(device).0, 30);
         feed(&mut h.engine, 90, "b");
         assert_eq!((stored(device).0, stored(client).0), (90, 90), "last_seen moves on once a minute");
+        // Gone: the row says when it was last seen, which a restart restores.
+        feed(&mut h.engine, 105, "b");
+        assert_eq!(stored(client).0, 90);
+        h.engine.handle(Input::Tick(400));
+        assert_eq!(stored(client).0, 105);
+        assert!(h.engine.written.clients.is_empty(), "nothing kept of a client gone");
     }
 
     #[test]
@@ -2103,21 +2146,25 @@ mod tests {
         send(&mut h, 20, 2, 7);
         assert_eq!(logs(), 1);
         assert_eq!(live.read().unwrap().by_hash_id.get(&u64::from_be_bytes([2; 8])), Some(&AP1.parse().unwrap()));
+        // A hash_id the AP has since (e.g. after a reset) replaces the one before.
+        send(&mut h, 21, 6, 7);
+        let by_hash_id = live.read().unwrap().by_hash_id.clone();
+        assert_eq!(by_hash_id.into_iter().collect::<Vec<_>>(), vec![(u64::from_be_bytes([6; 8]), AP1.parse().unwrap())]);
         // An AP apctl adopted: its key is in the settings only.
         send(&mut h, 30, 3, 5);
-        assert_eq!(logs(), 1);
+        assert_eq!(logs(), 2);
         let ap2 = "02:00:00:00:00:02";
         h.engine.set_state(31, json!({ "devices": [{ "mac": ap2, "syslog_key": hex::encode([5u8; 32]) }] }));
         assert!(h.engine.syslog_unknown.is_empty(), "new settings, new keys: tried again");
         send(&mut h, 32, 3, 5);
-        assert_eq!(logs(), 2);
+        assert_eq!(logs(), 3);
         assert_eq!(live.read().unwrap().by_hash_id.get(&u64::from_be_bytes([3; 8])), Some(&ap2.parse().unwrap()));
         // So many unknown hash_ids at once: a new one is not tried with every key.
         for i in 0..SYSLOG_UNKNOWN_MAX {
             h.engine.syslog_unknown.insert(i as u64, 40);
         }
         send(&mut h, 41, 4, 7);
-        assert_eq!((logs(), h.engine.syslog_unknown.len()), (2, SYSLOG_UNKNOWN_MAX));
+        assert_eq!((logs(), h.engine.syslog_unknown.len()), (3, SYSLOG_UNKNOWN_MAX));
         assert!(!live.read().unwrap().by_hash_id.contains_key(&u64::from_be_bytes([4; 8])));
     }
 
@@ -2372,7 +2419,13 @@ mod tests {
             events(&mut h),
             vec![("config_applied", None), ("client_connect_failed", Some(C1.into())), ("dfs_radar", None)]
         );
+        // One whose mac is not one is counted as undecodable.
+        let mut bad = notif(AP1, "setparam", Value::Null);
+        bad.payload["mac"] = json!("nope");
+        h.engine.handle(Input::Inform { ts: 9, peer: "x".into(), decoded: bad });
+        assert_eq!(events(&mut h), vec![]);
         let live = h.live.read().unwrap();
+        assert_eq!(live.counters.decode_errors.load(Ordering::Relaxed), 1);
         assert!(live.clients[&C1.parse().unwrap()].connected);
         assert_eq!(live.counters.notifications.load(Ordering::Relaxed), 4);
         assert_eq!(live.devices[&AP1.parse().unwrap()].last_full_inform, 0, "notifications are not client lists");
@@ -2433,7 +2486,46 @@ mod tests {
         h.engine.handle(Input::Reply { ts: 240, mac, decoded: decoded(json!({ "_type": "setparam", "system_cfg": "x=2" })) });
         assert_eq!(h.live.read().unwrap().last_config[&mac].cfgversion.as_deref(), Some("v1"));
         flushed(&h.writer);
-        let stored: String = h.store.read(Db::Config, |c| Ok(c.query_row("SELECT cfgversion FROM device_config", [], |r| r.get(0))?)).unwrap();
-        assert_eq!(stored, "v1");
+        let cfgversion: String = h.store.read(Db::Config, |c| Ok(c.query_row("SELECT cfgversion FROM device_config", [], |r| r.get(0))?)).unwrap();
+        assert_eq!(cfgversion, "v1");
+
+        // A management-only push keeps the last system_cfg.
+        h.engine.handle(Input::Reply { ts: 250, mac, decoded: decoded(json!({ "_type": "setparam", "mgmt_cfg": "cfgversion=v2\na=2" })) });
+        let last = h.live.read().unwrap().last_config[&mac].clone();
+        assert_eq!((last.mgmt_cfg.as_str(), last.system_cfg.as_str(), last.cfgversion.as_deref()), ("cfgversion=v2\na=2", "x=2", Some("v2")));
+        // With settings and a renderer, a push is compared with what apctl would push.
+        h.engine.set_state(260, json!({}));
+        h.engine.set_renderer(Arc::new(|_: &crate::dryrun::RenderRequest| -> anyhow::Result<crate::dryrun::Rendered> { anyhow::bail!("no template") }));
+        h.engine.handle(Input::Reply { ts: 270, mac, decoded: decoded(json!({ "_type": "setparam", "system_cfg": "x=3" })) });
+        assert_eq!(stored(&h, EventKind::DryrunCompared)[0]["error"], "no template");
+        flushed(&h.writer);
+        let row: (String, Option<String>, i64) =
+            h.store.read(Db::Config, |c| Ok(c.query_row("SELECT mac, cfgversion, matches FROM dryrun_results", [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?)).unwrap();
+        assert_eq!(row, (AP1.to_string(), Some("v2".into()), 0));
+    }
+
+    #[test]
+    fn a_restart_counts_the_time_since_the_last_uptime() {
+        let mut h = harness();
+        let at = |h: &mut Harness, ts: Ts, uptime: i64, version: Option<&str>| {
+            let mut v = inform(AP1, uptime, &[]);
+            if let Some(version) = version {
+                v["version"] = json!(version);
+            }
+            h.engine.handle(Input::Inform { ts, peer: "x".into(), decoded: decoded(v) });
+        };
+        at(&mut h, 0, 50, None);
+        // The first version it reports is no change of firmware.
+        at(&mut h, 10, 60, Some("6.7.0.1"));
+        h.engine.handle(Input::Tick(200));
+        assert_eq!(events(&mut h), vec![("ap_seen", None), ("ap_offline", None)]);
+        // Away for an hour and back with more uptime than it had, though less
+        // than it would have had: it restarted meanwhile.
+        at(&mut h, 3800, 1000, Some("6.7.0.1"));
+        assert_eq!(events(&mut h), vec![("ap_online", None), ("ap_restarted", None)]);
+        // Informs a little early or late are no restart.
+        at(&mut h, 3815, 1000, Some("6.7.0.1"));
+        at(&mut h, 3820, 1060, Some("6.7.0.1"));
+        assert_eq!(events(&mut h), vec![]);
     }
 }
