@@ -35,6 +35,8 @@ pub use json::oid;
 pub use system::MDNS_SERVICES;
 mod wlan;
 
+use std::cell::OnceCell;
+
 use anyhow::{Context, Result, bail};
 use serde_json::Value;
 
@@ -420,6 +422,8 @@ pub(crate) struct Ctx<'a> {
     pub radio_ai: &'a Value,
     /// The radios' country code (`setting[country].code`, US when unset).
     pub country: String,
+    /// See [`Ctx::gateway_macs`].
+    gateway_macs: OnceCell<Vec<String>>,
 }
 
 static NULL: Value = Value::Null;
@@ -464,6 +468,7 @@ impl<'a> Ctx<'a> {
             super_mgmt: setting(state, site_id, "super_mgmt"),
             radio_ai: setting(state, site_id, "radio_ai"),
             country: json::text_of(setting(state, site_id, "country"), "code").map_or_else(|| "840".to_string(), |c| c.to_string()),
+            gateway_macs: OnceCell::new(),
         })
     }
 
@@ -476,6 +481,18 @@ impl<'a> Ctx<'a> {
     /// Documents of a collection that belong to this site (or carry no site at all).
     pub fn site_docs(&self, collection: &str) -> impl Iterator<Item = &'a Value> + '_ {
         site_docs(self.state, self.site_id, collection)
+    }
+
+    /// LAN MACs (lower case) of the site's gateways, looked up the first time a VAP's
+    /// broadcast filter asks for them.
+    pub fn gateway_macs(&self) -> &[String] {
+        self.gateway_macs.get_or_init(|| {
+            self.site_docs("devices")
+                .filter(|d| matches!(json::str_of(d, "type"), Some("ugw" | "udm" | "uxg")))
+                .filter_map(|d| json::str_of(d, "mac"))
+                .map(str::to_ascii_lowercase)
+                .collect()
+        })
     }
 
     pub fn network(&self, id: &str) -> Option<&'a Value> {
