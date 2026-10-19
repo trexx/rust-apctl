@@ -457,8 +457,8 @@ impl Active {
         if table.is_empty() {
             return true;
         }
-        let details: Vec<(&str, Value)> = ["model", "version", "serial", "ip"].into_iter().map(|k| (k, payload[k].clone())).filter(|(_, v)| !v.is_null()).collect();
-        let hostname = payload["hostname"].clone();
+        // What the record takes from the inform, as for an AP adopted from the UI.
+        let details = crate::adopt::pending_inform(payload);
         let (tx, _rx) = tokio::sync::oneshot::channel();
         let edit: crate::engine::StateEdit = Box::new(move |st: &mut Value| {
             let d = crate::adopt::device_doc_mut(st, &mac).ok_or("no record")?;
@@ -467,13 +467,9 @@ impl Active {
                 return Err(format!("{mac} has its radio settings already"));
             }
             d["radio_table"] = json!(table);
-            for (k, v) in details {
-                d[k] = v;
-            }
-            if d["name"].is_null() {
-                d["name"] = hostname;
-            }
-            Ok(format!("radio settings for new AP {mac}"))
+            crate::adopt::fill_from_inform(d, &details);
+            // Its 2.4 GHz radio is known now: it joins the channel locks.
+            Ok(crate::adopt::join_channel_locks(st, &mac, format!("radio settings for new AP {mac}")))
         });
         let _ = self.engine.blocking_send(Input::EditState { ts, edit, done: tx });
         true
@@ -1185,6 +1181,31 @@ mod tests {
         assert!(first(&mut state).is_ok());
         assert!(!crate::adopt::device_doc(&state, &ap).unwrap()["radio_table"].as_array().unwrap().is_empty());
         assert!(edits.remove(0)(&mut state).is_err(), "the second changes nothing");
+    }
+
+    #[tokio::test]
+    async fn an_ap_adopted_over_ssh_joins_the_channel_locks_with_its_radios() {
+        let Some(_) = fixtures() else { return };
+        let mut rig = rig(true, None);
+        let ap: Mac = AP.parse().unwrap();
+        {
+            let mut live = rig.live.write().unwrap();
+            let mut state = live.state.as_deref().cloned().unwrap();
+            crate::adopt::device_doc_mut(&mut state, &ap).unwrap()["radio_table"] = json!([]);
+            // Every SSID it broadcasts has the IoT channel lock.
+            for w in state["wlanconf"].as_array_mut().unwrap() {
+                w["iot_channel_lock"] = json!(true);
+            }
+            live.state = Some(Arc::new(state));
+        }
+        inform_as_ap(&rig, &ap_payload("1"), KEY, GCM_ZLIB).await;
+        let edit = std::iter::from_fn(|| rig.rx.try_recv().ok()).find_map(|i| if let Input::EditState { edit, .. } = i { Some(edit) } else { None }).unwrap();
+        let mut state = rig.live.read().unwrap().state.as_deref().cloned().unwrap();
+        let what = edit(&mut state).unwrap();
+        assert!(what.contains("2.4 GHz channel 6"), "{what}");
+        let radios = crate::adopt::device_doc(&state, &ap).unwrap()["radio_table"].as_array().unwrap().clone();
+        assert_eq!(radios.iter().find(|r| r["radio"] == "ng").unwrap()["channel"], "6");
+        assert!(radios.iter().filter(|r| r["radio"] != "ng").all(|r| r["channel"] == "auto"), "the other bands stay on auto");
     }
 
     #[tokio::test]
