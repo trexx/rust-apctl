@@ -1020,7 +1020,8 @@ const CATCH_UP_SCAN: i64 = 10_000;
 fn catch_up_by_id(c: &rusqlite::Connection, table: &str, after: Option<i64>) -> rusqlite::Result<bool> {
     let Some(after) = after else { return Ok(false) };
     let newest: i64 = c.prepare_cached(&format!("SELECT coalesce(max(id), 0) FROM {table}"))?.query_row([], |r| r.get(0))?;
-    Ok(newest - after <= CATCH_UP_SCAN)
+    // Saturating: `after` comes from the client, and i64::MIN would wrap to "few".
+    Ok(newest.saturating_sub(after) <= CATCH_UP_SCAN)
 }
 
 async fn events(State(s): State<AppState>, Query(q): Query<EventQuery>) -> Result<Json<Vec<EventRow>>, ApiError> {
@@ -1477,6 +1478,7 @@ mod tests {
         assert_eq!(ts(get_json(&app, "/api/events?kind=client&after=3").await), vec![6, 4]);
         assert_eq!(ts(get_json(&app, "/api/events?kind=client&device=02:00:00:00:00:02&after=1").await), vec![4, 3]);
         assert_eq!(ts(get_json(&app, "/api/events?after=6").await), Vec::<i64>::new());
+        assert_eq!(ts(get_json(&app, &format!("/api/events?after={}&limit=2", i64::MIN)).await), vec![6, 5], "the oldest id there is: everything");
         // Catching up over more rows than are read by id: from the filters' indexes, the same rows.
         writer.exec(Db::Config, "INSERT INTO events (id, ts, kind, device_mac, data) VALUES (?1, 7, 'client_connected', '02:00:00:00:00:02', '{}')", vec![Sql::Integer(CATCH_UP_SCAN + 10)]);
         flushed(&writer);
@@ -1515,7 +1517,7 @@ mod tests {
         };
         assert_eq!(plan(false), ["SEARCH l USING INDEX logs_device (device_mac=?)"]);
         assert!(plan(true)[0].starts_with("SEARCH l USING INTEGER PRIMARY KEY (rowid>?)"), "{:?}", plan(true));
-        let writer = s.writer.clone();
+        let (writer, s_store) = (s.writer.clone(), s.store.clone());
         let app = router(s);
         let ts = |v: Value| v.as_array().unwrap().iter().map(|e| e["ts"].as_i64().unwrap()).collect::<Vec<_>>();
         assert_eq!(ts(get_json(&app, "/api/logs").await), vec![3, 2, 1]);
@@ -1535,6 +1537,10 @@ mod tests {
         flushed(&writer);
         assert_eq!(ts(get_json(&app, "/api/logs?after=1&device=02:00:00:00:00:02").await), vec![4, 2]);
         assert_eq!(ts(get_json(&app, "/api/logs?after=2").await), vec![4, 3]);
+        assert_eq!(ts(get_json(&app, &format!("/api/logs?after={}&limit=2", i64::MIN)).await), vec![4, 3]);
+        // Far behind: from the indexes, not by id.
+        let by_id = |after| s_store.read(Db::Logs, move |c| Ok(catch_up_by_id(c, "logs", Some(after))?)).unwrap();
+        assert_eq!((by_id(i64::MIN), by_id(-1), by_id(CATCH_UP_SCAN + 9), by_id(i64::MAX)), (false, false, true, true));
     }
 
     #[tokio::test]
