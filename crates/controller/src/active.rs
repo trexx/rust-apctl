@@ -3,9 +3,11 @@
 //! Off unless `--active` is given. For each inform:
 //!
 //! 1. The packet is decrypted with the AP's own key, then the factory key
-//!    (a few at a time, fewer with the factory key, which anyone can use).
-//!    Unknown APs (factory key only) get 404, like an unadopted device would
-//!    from the official controller. An AP that has used AES-GCM may not fall
+//!    (a few at a time, fewer with the factory key, which anyone can use; an
+//!    inform that finds too many waiting already gets 503, and the AP tries
+//!    again at its next interval). Unknown APs (factory key only) get 404,
+//!    like an unadopted device would from the official controller. An AP that
+//!    has used AES-GCM may not fall
 //!    back to CBC. The MAC in the header must match the payload's.
 //! 2. The inform feeds the engine exactly as in shadow mode (metrics, events).
 //! 3. apctl renders the AP's config from the settings. If the AP reports a
@@ -20,6 +22,7 @@
 
 use std::collections::HashMap;
 use std::net::IpAddr;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 
 use axum::body::Bytes;
@@ -109,13 +112,64 @@ pub struct Active {
     /// The `mgmt_cfg` handed to each AP being adopted (see `adoption_cfg`).
     adoption_cfgs: Mutex<HashMap<Mac, AdoptionCfg>>,
     /// Informs opened with an AP's own key, a few at a time.
-    work: Semaphore,
+    work: Gate,
     /// Informs opened with the factory key, which anyone can use: fewer at a
     /// time, as a small zlib body can inflate to megabytes of JSON.
-    strangers: Semaphore,
+    strangers: Gate,
     /// Reverse proxies whose X-Forwarded-For is believed for the AP's address.
     proxies: Arc<crate::auth::Proxies>,
 }
+
+/// A semaphore for informs that holds only so much waiting: an inform that
+/// would take the bytes waiting for it past `max_waiting` is turned away
+/// (503) instead of held in memory, and its AP tries again at its next
+/// interval. Counted by bytes, so that the APs' small informs can all wait
+/// out a burst (every AP informs at once after a settings change) while a
+/// flood of large bodies cannot pile up.
+struct Gate {
+    permits: Semaphore,
+    waiting: AtomicUsize,
+    max_waiting: usize,
+}
+
+/// What a waiting inform holds besides its body (its task, its connection).
+const WAIT_OVERHEAD: usize = 4 << 10;
+
+/// The bytes counted as waiting for a gate while this lives (also when the
+/// wait is cut short: the AP hung up).
+struct Waiting<'a>(&'a AtomicUsize, usize);
+
+impl Drop for Waiting<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(self.1, Ordering::Relaxed);
+    }
+}
+
+impl Gate {
+    fn new(permits: usize, max_waiting: usize) -> Gate {
+        Gate { permits: Semaphore::new(permits), waiting: AtomicUsize::new(0), max_waiting }
+    }
+
+    /// A permit for an inform of `size` bytes: at once if one is free, else
+    /// after the informs ahead of it; None when too much is waiting already.
+    async fn enter(&self, size: usize) -> Option<SemaphorePermit<'_>> {
+        if let Ok(p) = self.permits.try_acquire() {
+            return Some(p);
+        }
+        let cost = size + WAIT_OVERHEAD;
+        let waiting = Waiting(&self.waiting, cost);
+        if self.waiting.fetch_add(cost, Ordering::Relaxed) + cost > self.max_waiting {
+            return None;
+        }
+        let permit = self.permits.acquire().await.ok();
+        drop(waiting);
+        permit
+    }
+}
+
+/// An opened inform: the key it was opened with, its payload, and the permit
+/// held while it is handled.
+type Opened<'a> = (KeyUsed, [u8; 16], Value, SemaphorePermit<'a>);
 
 /// An adoption's `mgmt_cfg`, and the settings it was made from (by address,
 /// as for `Render::state`).
@@ -201,7 +255,7 @@ impl Active {
         let cpus = std::thread::available_parallelism().map_or(4, |n| n.get());
         let active = Active {
             live, keys, engine, writer, controller, devices, store: store.clone(), adoption_cfgs: Default::default(),
-            work: Semaphore::new(cpus), strangers: Semaphore::new((cpus / 2).max(1)), proxies,
+            work: Gate::new(cpus, 64 << 20), strangers: Gate::new((cpus / 2).max(1), 8 << 20), proxies,
         };
         // Rows holding the rendered config (with its secrets) get its digest instead.
         if !legacy.is_empty() {
@@ -505,19 +559,23 @@ impl Active {
     /// the async workers. The AP's own key is tried first; the factory key,
     /// which anyone can use, gets fewer turns, so that a flood under it leaves
     /// room for the APs. The permit is held while the inform is handled.
-    async fn open(&self, body: Bytes, device_key: Option<[u8; 16]>) -> Option<(KeyUsed, [u8; 16], Value, SemaphorePermit<'_>)> {
+    /// Else the status to answer: 503 when too many informs are waiting
+    /// already (see `Gate`), 400 when no key opens it.
+    async fn open(&self, body: Bytes, device_key: Option<[u8; 16]>) -> Result<Opened<'_>, StatusCode> {
         let decode = |body: Bytes, used: KeyUsed, key: [u8; 16]| {
             tokio::task::spawn_blocking(move || Packet::parse(&body).map_err(anyhow::Error::from).and_then(|pkt| open_with(&pkt, [(used, key)])))
         };
         if let Some(k) = device_key {
-            let permit = self.work.acquire().await.ok()?;
+            let permit = self.work.enter(body.len()).await.ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
             if let Ok(Ok((used, key, payload))) = decode(body.clone(), KeyUsed::Device, k).await {
-                return Some((used, key, payload, permit));
+                return Ok((used, key, payload, permit));
             }
         }
-        let permit = self.strangers.acquire().await.ok()?;
-        let (used, key, payload) = decode(body, KeyUsed::Default, DEFAULT_KEY).await.ok()?.ok()?;
-        Some((used, key, payload, permit))
+        let permit = self.strangers.enter(body.len()).await.ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
+        match decode(body, KeyUsed::Default, DEFAULT_KEY).await {
+            Ok(Ok((used, key, payload))) => Ok((used, key, payload, permit)),
+            _ => Err(StatusCode::BAD_REQUEST),
+        }
     }
 }
 
@@ -567,9 +625,16 @@ pub async fn inform(
     // Which keys may this AP use? Its own if apctl manages it; the factory key always.
     let state = active.live.read().unwrap().state.clone();
     let device_key = crate::adopt::device_key(state.as_deref(), &active.keys, &mac);
-    let Some((used, key, payload, _permit)) = active.open(body, device_key).await else {
-        tracing::warn!("{mac}: inform from {} could not be decrypted", peer.ip());
-        return StatusCode::BAD_REQUEST.into_response();
+    let (used, key, payload, _permit) = match active.open(body, device_key).await {
+        Ok(opened) => opened,
+        Err(StatusCode::SERVICE_UNAVAILABLE) => {
+            tracing::debug!("{mac}: too many informs waiting: turning one from {} away", peer.ip());
+            return StatusCode::SERVICE_UNAVAILABLE.into_response();
+        }
+        Err(code) => {
+            tracing::warn!("{mac}: inform from {} could not be decrypted", peer.ip());
+            return code.into_response();
+        }
     };
     if payload["mac"].as_str().and_then(|m| m.parse::<Mac>().ok()) != Some(mac) {
         tracing::warn!("{mac}: header and payload MACs differ");
@@ -1410,6 +1475,36 @@ mod tests {
         inform_as_ap(&rig, &ap_payload("1"), KEY, GCM_ZLIB).await;
         let (status, _) = inform_as_ap(&rig, &ap_payload("1"), KEY, Flags::ENCRYPTED).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn informs_beyond_what_may_wait_are_turned_away() {
+        let gate = Gate::new(1, 3 * WAIT_OVERHEAD);
+        let first = gate.enter(0).await.expect("a free permit is taken at once");
+        // Two may wait (the bound is in bytes); a third is turned away.
+        let waiting: Vec<_> = (0..2).map(|_| Box::pin(gate.enter(WAIT_OVERHEAD / 2))).collect();
+        let mut waiting: Vec<_> = waiting.into_iter().map(|mut w| {
+            assert!(futures_poll(&mut w).is_none(), "waits for the permit");
+            w
+        }).collect();
+        assert!(gate.enter(WAIT_OVERHEAD / 2).await.is_none());
+        // One that gives up waiting (its AP hung up) makes room again.
+        drop(waiting.pop());
+        let mut third = Box::pin(gate.enter(WAIT_OVERHEAD / 2));
+        assert!(futures_poll(&mut third).is_none());
+        drop(first);
+        assert!(waiting.pop().unwrap().await.is_some());
+        drop(third);
+        assert_eq!(gate.waiting.load(Ordering::Relaxed), 0, "nothing counted as waiting once they are gone");
+    }
+
+    /// Polls a future once.
+    fn futures_poll<F: std::future::Future + Unpin>(f: &mut F) -> Option<F::Output> {
+        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+        match std::pin::Pin::new(f).poll(&mut cx) {
+            std::task::Poll::Ready(v) => Some(v),
+            std::task::Poll::Pending => None,
+        }
     }
 
     #[tokio::test]
