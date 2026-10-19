@@ -7,19 +7,41 @@ import { QueryState, Segmented } from "../common";
 const RADIOS = (["ng", "na"] as const).map((b) => [b, band(b)] as const);
 const BANDS = [["all", "All radios"] as const, ...RADIOS];
 
+/** A radio band: 2.4 GHz ("ng") or 5 GHz ("na"). */
+export type Radio = (typeof RADIOS)[number][0];
+/** A band, or "all" for both. */
+export type BandChoice = (typeof BANDS)[number][0];
+
+/** Both bands or one of them. */
 export function BandPicker({
   value,
   onChange,
-  all,
 }: {
-  value: string;
-  onChange: (b: string) => void;
-  all?: boolean;
+  value: BandChoice;
+  onChange: (b: BandChoice) => void;
 }) {
   return (
     <Segmented
       label="Band"
-      options={all !== false ? BANDS : RADIOS}
+      options={BANDS}
+      value={value}
+      onChange={onChange}
+    />
+  );
+}
+
+/** One of the two bands. */
+export function RadioPicker({
+  value,
+  onChange,
+}: {
+  value: Radio;
+  onChange: (b: Radio) => void;
+}) {
+  return (
+    <Segmented
+      label="Band"
+      options={RADIOS}
       value={value}
       onChange={onChange}
     />
@@ -42,7 +64,7 @@ export function BandInsight<T>({
   title: ReactNode | ((data: T, band: string) => ReactNode);
   children: (data: T, band: string) => ReactNode;
 }) {
-  const [picked, setPicked] = useState("all");
+  const [picked, setPicked] = useState<BandChoice>("all");
   return (
     <QueryState q={q} panel>
       {(data) => (

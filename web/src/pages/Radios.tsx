@@ -17,7 +17,8 @@ import {
 } from "../format";
 import { ApSpacing } from "../components/insights/ApSpacing";
 import { DeploymentDensity } from "../components/insights/DeploymentDensity";
-import { BandPicker } from "../components/insights/shared";
+import { RadioPicker } from "../components/insights/shared";
+import type { Radio } from "../components/insights/shared";
 import { ThreatList } from "../components/ThreatList";
 import { RoamingView } from "../components/RoamingView";
 import {
@@ -382,7 +383,7 @@ function occupancy(
 }
 
 function Environment() {
-  const [band, setBand] = useState<"ng" | "na">("na");
+  const [band, setBand] = useState<Radio>("na");
   const [q, setQ] = useState("");
   const heard = useNeighbors(7 * 86400, band);
   // Kept while another band loads, the previous band's networks would be drawn
@@ -410,11 +411,7 @@ function Environment() {
       <div className="panel">
         <div className="panel-head">
           <b>Channel occupancy</b>
-          <BandPicker
-            value={band}
-            onChange={(b) => setBand(b as "ng" | "na")}
-            all={false}
-          />
+          <RadioPicker value={band} onChange={setBand} />
         </div>
         <QueryState q={n}>
           {() => <Spectrum band={band} shapes={shapes} />}

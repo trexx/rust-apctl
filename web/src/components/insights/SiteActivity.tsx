@@ -11,6 +11,7 @@ import {
 } from "../Chart";
 import { QueryState, Segmented } from "../common";
 import { BandPicker } from "./shared";
+import type { BandChoice } from "./shared";
 
 const VIEWS = [
   ["activity", "Activity"],
@@ -21,7 +22,7 @@ const VIEWS = [
 export function SiteActivity() {
   const [view, setView] = useState<"activity" | "airtime">("activity");
   const [range, setRange] = useTimeSpan(86400);
-  const [band, setBand] = useState("all");
+  const [band, setBand] = useState<BandChoice>("all");
   const a = useSiteActivity(range, band);
   return (
     <ZoomContext.Provider value={(from, to) => setRange({ from, to })}>
