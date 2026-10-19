@@ -63,50 +63,43 @@ pub async fn activity(State(s): State<AppState>, Query(q): Query<RangeQuery>) ->
             (None, None) => None,
         };
         let vaps = load(c, Spec { table: "vap_stats", key: "bssid", extra: &["radio"], cols: COLS, only }, tier, from, to)?;
-        // bucket -> per-bssid accumulators
-        #[derive(Default, Clone)]
-        struct Acc {
-            down: f64,
-            up: f64,
-            pkts: f64,
-            rx_pkts: f64,
-            retries: f64,
-            attempts: f64,
-            wifi_dropped: f64,
-            dropped: f64,
-            mcast: f64,
-            /// Clients summed over the samples, and how many.
-            clients: f64,
-            samples: f64,
-            /// Intervals: the rates above are summed over them.
-            n: f64,
-        }
-        let mut per: BTreeMap<Ts, HashMap<&str, Acc>> = BTreeMap::new();
-        for (bssid, (ex, samples)) in &vaps {
+        // Rates per bucket and SSID (by its place among those loaded), at these places.
+        const DOWN: usize = 0;
+        const UP: usize = 1;
+        const TX_PKTS: usize = 2;
+        const RX_PKTS: usize = 3;
+        const RETRIES: usize = 4;
+        const ATTEMPTS: usize = 5;
+        const WIFI_DROPPED: usize = 6;
+        const DROPPED: usize = 7;
+        const MCAST: usize = 8;
+        let mut per: BTreeMap<Ts, HashMap<usize, Bucket<9>>> = BTreeMap::new();
+        for (vap, (ex, samples)) in vaps.values().enumerate() {
             if bssids.is_some() && !band_ok(&band, &ex[0]) {
                 continue;
             }
             for d in deltas(samples, from) {
-                let a = per.entry(d.ts - d.ts % bucket).or_default().entry(bssid.as_str()).or_default();
+                let a = per.entry(d.ts - d.ts % bucket).or_default().entry(vap).or_default();
                 let g = |i: usize| d.rate(i).unwrap_or(0.0);
-                a.down += g(tx_bytes);
-                a.up += g(rx_bytes);
-                a.pkts += g(tx_packets);
-                a.rx_pkts += g(rx_packets);
+                let r = &mut a.rates;
+                r[DOWN] += g(tx_bytes);
+                r[UP] += g(rx_bytes);
+                r[TX_PKTS] += g(tx_packets);
+                r[RX_PKTS] += g(rx_packets);
                 // Multicast and broadcast, both directions.
-                a.mcast += g(tx_mcast) + g(rx_mcast) + g(tx_bcast) + g(rx_bcast);
-                a.dropped += g(tx_dropped);
+                r[MCAST] += g(tx_mcast) + g(rx_mcast) + g(tx_bcast) + g(rx_bcast);
+                r[DROPPED] += g(tx_dropped);
                 // Intervals without attempt counters (data from older versions) are skipped.
-                if let (Some(r), Some(at)) = (d.rate(retries), d.rate(attempts)) {
-                    a.retries += r;
-                    a.attempts += at;
-                    a.wifi_dropped += g(wifi_dropped);
+                if let (Some(x), Some(at)) = (d.rate(retries), d.rate(attempts)) {
+                    r[RETRIES] += x;
+                    r[ATTEMPTS] += at;
+                    r[WIFI_DROPPED] += g(wifi_dropped);
                 }
-                a.n += 1.0;
+                a.intervals += 1.0;
             }
             // Clients as `wlans` counts them: from every sample in the window, an SSID's first included.
             for (t, v) in samples.since(from) {
-                let a = per.entry(t - t % bucket).or_default().entry(bssid.as_str()).or_default();
+                let a = per.entry(t - t % bucket).or_default().entry(vap).or_default();
                 a.clients += v[num_sta].unwrap_or(0.0);
                 a.samples += 1.0;
             }
@@ -116,23 +109,10 @@ pub async fn activity(State(s): State<AppState>, Query(q): Query<RangeQuery>) ->
         let (mut tx_pps, mut rx_pps, mut dropped) = (Vec::new(), Vec::new(), Vec::new());
         for (b, m) in &per {
             ts.push(*b);
-            // Average per VAP within the bucket, then sum across VAPs (in one pass).
-            let t = m.values().fold(Acc::default(), |mut t, a| {
-                let n = a.n.max(1.0);
-                t.down += a.down / n;
-                t.up += a.up / n;
-                t.pkts += a.pkts / n;
-                t.rx_pkts += a.rx_pkts / n;
-                t.retries += a.retries / n;
-                t.attempts += a.attempts / n;
-                t.wifi_dropped += a.wifi_dropped / n;
-                t.dropped += a.dropped / n;
-                t.mcast += a.mcast / n;
-                t.clients += a.clients / a.samples.max(1.0);
-                t
-            });
-            let (d, u, p, r, mc, cl) = (t.down, t.up, t.pkts, t.retries, t.mcast, t.clients);
-            let (rp, dr, at, wd) = (t.rx_pkts, t.dropped, t.attempts, t.wifi_dropped);
+            // Average per VAP within the bucket, then sum across VAPs.
+            let (cl, t) = bucket_total(m.values());
+            let (d, u, p, r, mc) = (t[DOWN], t[UP], t[TX_PKTS], t[RETRIES], t[MCAST]);
+            let (rp, dr, at, wd) = (t[RX_PKTS], t[DROPPED], t[ATTEMPTS], t[WIFI_DROPPED]);
             tx_pps.push(p);
             rx_pps.push(rp);
             dropped.push(if p + dr > 0.0 { Some(100.0 * dr / (p + dr)) } else { None });
@@ -675,7 +655,7 @@ pub async fn wlans(State(s): State<AppState>, Query(q): Query<RangeQuery>) -> Re
                 let (mut cl, mut dn, mut up) = (vec![], vec![], vec![]);
                 for (t, m) in &a.series {
                     ts.push(*t);
-                    let (c, d, u) = m.values().map(Bucket::averages).fold((0.0, 0.0, 0.0), |s, x| (s.0 + x.0, s.1 + x.1, s.2 + x.2));
+                    let (c, [d, u]) = bucket_total(m.values());
                     cl.push(c);
                     dn.push(d * 8.0);
                     up.push(u * 8.0);
@@ -715,24 +695,40 @@ const WLAN_COLS: &[&str] = &[
     "num_sta", "satisfaction", "avg_client_signal",
 ];
 
-/// One SSID in a bucket of [`WlanAgg::series`].
-#[derive(Default, Clone, Copy)]
-struct Bucket {
+/// One SSID's share of a time bucket ([`activity`], [`WlanAgg::series`]):
+/// rates per second, each summed over its intervals, and its clients.
+#[derive(Clone, Copy)]
+struct Bucket<const N: usize> {
+    rates: [f64; N],
+    intervals: f64,
     /// Clients, summed over its samples.
     clients: f64,
     samples: f64,
-    /// Bytes per second each way, summed over its intervals.
-    down: f64,
-    up: f64,
-    intervals: f64,
 }
 
-impl Bucket {
-    /// Average clients, and bytes per second each way.
-    fn averages(&self) -> (f64, f64, f64) {
-        let i = self.intervals.max(1.0);
-        (self.clients / self.samples.max(1.0), self.down / i, self.up / i)
+impl<const N: usize> Default for Bucket<N> {
+    fn default() -> Self {
+        Bucket { rates: [0.0; N], intervals: 0.0, clients: 0.0, samples: 0.0 }
     }
+}
+
+impl<const N: usize> Bucket<N> {
+    /// Average clients, and each rate averaged over the intervals.
+    fn averages(&self) -> (f64, [f64; N]) {
+        let i = self.intervals.max(1.0);
+        (self.clients / self.samples.max(1.0), self.rates.map(|r| r / i))
+    }
+}
+
+/// The SSIDs' shares of a bucket, each averaged, then summed: clients and rates.
+fn bucket_total<'a, const N: usize>(ssids: impl Iterator<Item = &'a Bucket<N>>) -> (f64, [f64; N]) {
+    ssids.map(Bucket::averages).fold((0.0, [0.0; N]), |(mut c, mut r), (bc, br)| {
+        c += bc;
+        for (r, x) in r.iter_mut().zip(br) {
+            *r += x;
+        }
+        (c, r)
+    })
 }
 
 /// A running mean: (sum, count).
@@ -760,8 +756,8 @@ struct WlanAgg {
     mcast: f64,
     sat: Mean,
     sig: Mean,
-    /// bucket -> SSID (its place among the VAPs loaded) -> its share
-    series: BTreeMap<Ts, HashMap<usize, Bucket>>,
+    /// bucket -> SSID (its place among the VAPs loaded) -> its share: bytes per second down and up
+    series: BTreeMap<Ts, HashMap<usize, Bucket<2>>>,
     /// Retries, attempts and drops over all its SSIDs.
     retry: [f64; 3],
 }
@@ -788,8 +784,8 @@ fn wlan_history(vaps: &Loaded, from: Ts, bucket: Ts) -> BTreeMap<String, WlanAgg
             a.pkts += g(tx_packets) + g(rx_packets);
             a.mcast += g(tx_mcast) + g(rx_mcast) + g(tx_bcast) + g(rx_bcast);
             let e = a.series.entry(d.ts - d.ts % bucket).or_default().entry(vap).or_default();
-            e.down += d.rate(tx_bytes).unwrap_or(0.0);
-            e.up += d.rate(rx_bytes).unwrap_or(0.0);
+            e.rates[0] += d.rate(tx_bytes).unwrap_or(0.0);
+            e.rates[1] += d.rate(rx_bytes).unwrap_or(0.0);
             e.intervals += 1.0;
             add_retries(&mut a.retry, &d, retries);
         }
@@ -1037,7 +1033,7 @@ mod tests {
         vaps.insert("bss".into(), (vec!["Home".into()], Samples::from_rows(vec![row(0, 0.0), row(10, 1000.0), row(20, 2000.0)])));
         let per = wlan_history(&vaps, 0, 60);
         let b = per["Home"].series[&0][&0];
-        assert_eq!(b.averages(), (3.0, 100.0, 0.0));
+        assert_eq!(b.averages(), (3.0, [100.0, 0.0]));
         assert_eq!(per["Home"].down, 2000.0);
     }
 
