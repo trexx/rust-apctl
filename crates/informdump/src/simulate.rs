@@ -101,7 +101,7 @@ fn collect(input: impl Read + Send, ports: &[u16], keys: &KeyStore, limit: usize
     Ok((informs, end))
 }
 
-pub fn run(pcap: &str, ports: &[u16], keys: &KeyStore, url: &str, limit: usize, every: f64) -> Result<()> {
+pub fn run(pcap: &str, ports: &[u16], keys: &KeyStore, url: &str, limit: usize, every: Duration) -> Result<()> {
     if !is_local(url) {
         bail!("refusing to simulate APs against {url}: only local controllers (http:// to 127.0.0.1, ::1 or localhost)");
     }
@@ -118,8 +118,8 @@ pub fn run(pcap: &str, ports: &[u16], keys: &KeyStore, url: &str, limit: usize, 
     let mut keys_now: HashMap<Mac, [u8; 16]> = HashMap::new();
     let mut counts: HashMap<String, usize> = HashMap::new();
     for (i, (mut payload, captured)) in informs.into_iter().enumerate() {
-        if i > 0 && every > 0.0 {
-            std::thread::sleep(Duration::from_secs_f64(every));
+        if i > 0 && !every.is_zero() {
+            std::thread::sleep(every);
         }
         let mac: Mac = payload["mac"].as_str().context("inform without mac")?.parse()?;
         let key = keys_now.get(&mac).copied().unwrap_or(captured);
