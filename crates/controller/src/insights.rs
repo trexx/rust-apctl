@@ -791,26 +791,26 @@ struct RadioAvg {
 /// over the window (interference, utilisation, traffic, retries, signal).
 pub async fn radios(State(s): State<AppState>, Query(q): Query<RangeQuery>) -> Result<Json<Value>, ApiError> {
     let (from, to, tier) = window(&q);
-    // By `mac/radio`, worked out where the data is read.
+    // By AP, then radio, worked out where the data is read.
     let avgs = memo_read(&s, Db::Metrics, "radios", &q, tier, move |c| {
-        let mut out: HashMap<String, RadioAvg> = HashMap::new();
+        let mut out: HashMap<String, HashMap<String, RadioAvg>> = HashMap::new();
         // Airtime: SQLite averages each radio's samples in the window.
-        let sql = format!("SELECT mac || '/' || radio, AVG(cu_total), AVG(cu_interf) FROM radio_stats{} WHERE ts >= ?1 AND ts <= ?2 GROUP BY mac, radio", TIERS[tier].0);
+        let sql = format!("SELECT mac, radio, AVG(cu_total), AVG(cu_interf) FROM radio_stats{} WHERE ts >= ?1 AND ts <= ?2 GROUP BY mac, radio", TIERS[tier].0);
         let mut stmt = c.prepare_cached(&sql)?;
         let mut rows = stmt.query([from, to])?;
         while let Some(r) = rows.next()? {
-            let e = out.entry(r.get(0)?).or_default();
-            (e.utilization, e.interference) = (r.get(1)?, r.get(2)?);
+            let e = out.entry(r.get(0)?).or_default().entry(r.get(1)?).or_default();
+            (e.utilization, e.interference) = (r.get(2)?, r.get(3)?);
         }
         // Retries come from the VAPs: the radio-level counters stay at 0 on some models.
         let vaps = load(c, Spec { table: "vap_stats", key: "bssid", extra: &["ap_mac", "radio"], cols: RADIO_VAP_COLS, only: None }, tier, from, to)?;
         for ((ap, band), t) in retry_totals(&vaps, cols_at(RADIO_VAP_COLS, RETRY_COLS), from) {
-            out.entry(format!("{ap}/{band}")).or_default().retry_pct = Some(retry_pct(t));
+            out.entry(ap.to_string()).or_default().entry(band.to_string()).or_default().retry_pct = Some(retry_pct(t));
         }
         // Traffic and client signal per radio.
         let [tx, rx, signal] = cols_at(RADIO_VAP_COLS, ["tx_bytes", "rx_bytes", "avg_client_signal"]);
         for (ex, samples) in vaps.values() {
-            let e = out.entry(format!("{}/{}", ex[0], ex[1])).or_default();
+            let e = out.entry(ex[0].clone()).or_default().entry(ex[1].clone()).or_default();
             for d in deltas(samples, from) {
                 e.usage += d.inc(tx).unwrap_or(0.0) + d.inc(rx).unwrap_or(0.0);
             }
@@ -825,9 +825,9 @@ pub async fn radios(State(s): State<AppState>, Query(q): Query<RangeQuery>) -> R
     let live = s.live.read().unwrap();
     let mut out = Vec::new();
     for (mac, d) in &live.devices {
-        let mac_s = mac.to_string();
+        let of_ap = avgs.get(&mac.to_string());
         for r in &d.snapshot.radios {
-            let a = avgs.get(&format!("{mac_s}/{}", r.radio));
+            let a = of_ap.and_then(|m| m.get(&r.radio));
             out.push(json!({
                 "mac": mac, "name": d.snapshot.ap.hostname, "radio": r.radio, "channel": r.channel, "bw": r.bw,
                 "tx_power": r.tx_power, "eirp": r.tx_power.zip(r.antenna_gain).map(|(p, g)| p + g),
