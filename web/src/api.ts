@@ -1,5 +1,5 @@
 import { useEffect } from "react";
-import { keepPreviousData, useQuery, useQueryClient } from "@tanstack/react-query";
+import { hashKey, keepPreviousData, useQuery, useQueryClient } from "@tanstack/react-query";
 import type { QueryKey } from "@tanstack/react-query";
 
 export type Mac = string;
@@ -738,13 +738,20 @@ const spanLength = (s: TimeSpan) => (isFixed(s) ? s.to - s.from : s.last);
  *  each fetch: a fixed window ending at about now stops refreshing once it is ten minutes past. */
 const refreshFor = (s: TimeSpan, live: number) => (isFixed(s) && s.to < Date.now() / 1000 - 600 ? false : live);
 
-/** A query over a time span: refreshes while the span is live, and keeps the old data on screen while a new span loads. */
-function useSpanQuery<T>(key: QueryKey, path: string, span: TimeSpan, extra: Record<string, string | number | undefined> = {}) {
-  return useQuery({
+/** Whether two keys of a span family differ in the span alone (the family's first argument, as in every one of `keys`). */
+const onlySpanDiffers = (a: QueryKey, b: QueryKey) => hashKey([a[0], ...a.slice(2)]) === hashKey([b[0], ...b.slice(2)]);
+
+/**
+ * A query over a time span: refreshes while the span is live, and keeps the old data on screen (`isPlaceholderData`) while
+ * another span loads. Another choice (a band, an AP) shows as loading instead, unless `keepAcrossChoices`, for a caller that
+ * dims the old data while it shows it.
+ */
+function useSpanQuery<T>(key: QueryKey, path: string, span: TimeSpan, extra: Record<string, string | number | undefined> = {}, keepAcrossChoices = false) {
+  return useQuery<T>({
     queryKey: key,
     queryFn: getting<T>(`${path}${qs({ ...spanParams(span), ...extra })}`),
     refetchInterval: () => refreshFor(span, 60_000),
-    placeholderData: keepPreviousData,
+    placeholderData: (prev, prevQuery) => (prevQuery && (keepAcrossChoices || onlySpanDiffers(prevQuery.queryKey, key)) ? prev : undefined),
   });
 }
 
@@ -871,13 +878,17 @@ export interface Wlan {
 /** What `useConnections` returns. */
 export type Connections = { attempts: ConnAttempt[]; roams: Roam[]; ap_names: Record<string, string>; client_names: Record<string, string> };
 
-/** Connection attempts and roams, newest first: at most `limit` of each (the server's default is 500); `roams: false` skips the roams. */
+/**
+ * Connection attempts and roams, newest first: at most `limit` of each (the server's default is 500); `roams: false` skips the roams.
+ * The old list stays on screen while another `opts` loads too (the attempt list dims it).
+ */
 export const useConnections = (span: TimeSpan, opts: { client?: Mac; failed?: boolean; limit?: number; roams?: boolean } = {}) =>
   useSpanQuery<Connections>(
     keys.connections(span, opts),
     "/api/connections",
     span,
     { client: opts.client, failed: opts.failed ? "true" : undefined, limit: opts.limit, roams: opts.roams === false ? "false" : undefined },
+    true,
   );
 
 export const useRoaming = (span: TimeSpan) => useSpanQuery<Roaming>(keys.roaming(span), "/api/roaming", span);

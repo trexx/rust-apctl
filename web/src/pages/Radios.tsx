@@ -385,10 +385,7 @@ function occupancy(
 function Environment() {
   const [band, setBand] = useState<Radio>("na");
   const [q, setQ] = useState("");
-  const heard = useNeighbors(7 * 86400, band);
-  // Kept while another band loads, the previous band's networks would be drawn
-  // on this band's axis: show "Loading…" instead.
-  const n = heard.isPlaceholderData ? { data: undefined, error: null } : heard;
+  const n = useNeighbors(7 * 86400, band);
   const r = useRadios(86400);
   const now = useNow();
 
