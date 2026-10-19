@@ -611,7 +611,7 @@ input.search {
   padding: 5px 12px;
   cursor: pointer;
 }
-.btn:hover {
+.btn:hover:not(:disabled) {
   border-color: var(--accent);
 }
 .btn.primary {
