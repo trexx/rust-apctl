@@ -608,11 +608,16 @@ impl Sanitizer {
     }
 
     /// Rewrites the `key=value` config blob under `key` line by line. `under_secret`: its
-    /// own key or one above it is secret.
+    /// own key or one above it is secret. A line is `key=value` only when what comes
+    /// before its first `=` is a config key ([`is_cfg_key`]); its identifiers are
+    /// rewritten like a JSON key's.
     fn cfg(&mut self, key: &str, blob: &str, under_secret: bool) -> String {
         blob.lines()
-            .map(|l| match l.split_once('=') {
-                Some((k, v)) => format!("{k}={}", self.field("", k, under_secret, v)),
+            .map(|l| match l.split_once('=').filter(|(k, _)| is_cfg_key(k)) {
+                Some((k, v)) => {
+                    let value = self.field("", k, under_secret, v);
+                    format!("{}={value}", self.scrub_ids(k.to_string()))
+                }
                 None => self.cfg_line(key, l, under_secret),
             })
             .collect::<Vec<_>>()
@@ -620,16 +625,17 @@ impl Sanitizer {
     }
 
     /// A config line that is not `key=value`: the controller's section comments (`# wlans
-    /// (radio)`) pass; anything else is text, listed like a field off the allow-list.
+    /// (radio)`) pass; anything else, a comment with an `=` in it too, is text, listed
+    /// like a field off the allow-list.
     fn cfg_line(&mut self, key: &str, line: &str, under_secret: bool) -> String {
         if line.is_empty() {
             String::new()
         } else if under_secret {
             self.fakes.get(Kind::Secret, line, |n| format!("secret-{n}"))
-        } else if line.starts_with('#') {
+        } else if line.starts_with('#') && !line.contains('=') {
             self.scrub(line)
         } else {
-            self.unlisted.insert(format!("{} lines without '='", key.to_ascii_lowercase()));
+            self.unlisted.insert(format!("{} lines that are not key=value", key.to_ascii_lowercase()));
             self.fakes.get(Kind::Text, line, |n| format!("text-{n}"))
         }
     }
@@ -750,6 +756,12 @@ impl LeakCheck {
 /// "country"`); only dotted config keys ending in `.key` hold secrets.
 fn is_secret_key(key: &str) -> bool {
     cfgdiff::is_secret(key) && !key.eq_ignore_ascii_case("key")
+}
+
+/// Whether `k` is a config key (`radio.1.channel`): letters, digits, `.`, `_` and `-`.
+/// A comment or a line of text with an `=` in it is not one.
+fn is_cfg_key(k: &str) -> bool {
+    !k.is_empty() && k.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
 }
 
 /// Whether `s` is one whole MAC: with colons or dashes, in dotted groups of four, or bare.
@@ -1215,8 +1227,21 @@ mod tests {
         let out = s.json(&json!({ "system_cfg": "# wlans (radio)\nSmith family\n\nradio.1.channel=36", "x_backup": { "mgmt_cfg": "# mgmt" } }));
         assert_eq!(out["system_cfg"], "# wlans (radio)\ntext-1\n\nradio.1.channel=36");
         assert_eq!(out["x_backup"]["mgmt_cfg"], "secret-1");
-        assert_eq!(s.unlisted().collect::<Vec<_>>(), ["system_cfg lines without '='"]);
+        assert_eq!(s.unlisted().collect::<Vec<_>>(), ["system_cfg lines that are not key=value"]);
         assert!(s.check_clean("x: smith family", "leak").is_err());
+    }
+
+    #[test]
+    fn a_config_line_is_key_value_only_when_it_starts_with_a_config_key() {
+        let mut s = Sanitizer::new(Vec::new(), Vec::new());
+        let cfg = "# psk=hunter22\nSmith family=home\nKitchen TV.name=x\n7845583c52bc.x=1\nvpn.6f1c0e52-2b8a-4c3e-9d4f-0a1b2c3d4e5f.mode=auto\nradio.1.channel=36";
+        let out = s.json(&json!({ "mac": "78:45:58:3c:52:bc", "system_cfg": cfg }));
+        assert_eq!(out["system_cfg"], "text-1\ntext-2\ntext-3\n020000000001.x=1\nvpn.00000000-0000-4000-8000-000000000001.mode=auto\nradio.1.channel=36");
+        assert_eq!(s.unlisted().collect::<Vec<_>>(), ["system_cfg lines that are not key=value"]);
+        s.check_clean(&out.to_string(), "test").unwrap();
+        for leak in ["# psk=hunter22", "kitchen tv.name=x", "6f1c0e52-2b8a-4c3e-9d4f-0a1b2c3d4e5f"] {
+            assert!(s.check_clean(leak, "leak").is_err(), "{leak}");
+        }
     }
 
     #[test]
