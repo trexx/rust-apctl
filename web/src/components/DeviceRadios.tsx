@@ -13,6 +13,7 @@ import {
   band,
   bytes,
   compact,
+  dbm,
   multicastTone,
   pct,
   pct1,
@@ -111,14 +112,14 @@ export function RadioPanel({
           {radio.channel !== null
             ? `channel ${radio.channel} · ${unit(radio.bw, "MHz")}`
             : "no SSIDs on this radio"}{" "}
-          · noise {unit(radio.noise_floor, "dBm")}
+          · noise {dbm(radio.noise_floor)}
         </span>
       </div>
       <dl className="kv">
         <dt>TX power</dt>
         <dd>
-          {unit(radio.tx_power, "dBm")}
-          {eirp !== null && <span className="muted"> · {eirp} dBm EIRP</span>}
+          {dbm(radio.tx_power)}
+          {eirp !== null && <span className="muted"> · {dbm(eirp)} EIRP</span>}
           {radio.min_txpower !== null && radio.max_txpower !== null && (
             <span className="muted small">
               {" "}

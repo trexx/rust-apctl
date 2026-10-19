@@ -1,6 +1,6 @@
 import { useDensity } from "../../api";
 import type { DensityAp } from "../../api";
-import { pct1 } from "../../format";
+import { dbm, pct1 } from "../../format";
 import { useTimeSpan } from "../Chart";
 import type { DensityPin, Verdict } from "./shared";
 import { BandInsight, DensityStrip, VerdictHead } from "./shared";
@@ -61,7 +61,7 @@ export function DeploymentDensity() {
                     : g.weakest_signal < FAR
                       ? "warn"
                       : undefined,
-                title: `${ap.name ?? ap.mac}: weaker clients ${g.weakest_signal} dBm, all clients ${g.signal_avg} dBm, ${g.clients} clients on average, ${pct1(g.traffic_pct)} of traffic${g.tx_retry_pct !== null ? `, ${pct1(g.tx_retry_pct)} TX retries` : ""}${quiet ? " (too little traffic to count)" : ""}`,
+                title: `${ap.name ?? ap.mac}: weaker clients ${dbm(g.weakest_signal)}, all clients ${dbm(g.signal_avg)}, ${g.clients} clients on average, ${pct1(g.traffic_pct)} of traffic${g.tx_retry_pct !== null ? `, ${pct1(g.tx_retry_pct)} TX retries` : ""}${quiet ? " (too little traffic to count)" : ""}`,
               }))}
             />
             {pins.length === 0 && (

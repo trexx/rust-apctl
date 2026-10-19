@@ -28,6 +28,7 @@ import {
   bandChannel,
   bytes,
   compact,
+  dbm,
   duration,
   rate,
   rates,
@@ -130,7 +131,7 @@ function ClientPage({ mac }: { mac: string }) {
           <Stat
             label="Signal"
             value={<Signal dbm={s.signal} />}
-            sub={`noise ${s.noise === null ? "—" : `${s.noise} dBm`}`}
+            sub={`noise ${dbm(s.noise)}`}
           />
           <Stat
             label="Rate (down/up)"
@@ -152,7 +153,7 @@ function ClientPage({ mac }: { mac: string }) {
               <Chart
                 title="Signal and noise"
                 ts={ts}
-                format={(v) => `${Math.round(v)} dBm`}
+                format={dbm}
                 min={-100}
                 max={-20}
                 series={[

@@ -11,6 +11,7 @@ import {
   ago,
   band as bandName,
   bytes,
+  dbm,
   pct1,
   retryTone,
   toneClass,
@@ -133,7 +134,7 @@ function Spectrum({ band, shapes }: { band: "ng" | "na"; shapes: Shape[] }) {
             points={pts}
             className={s.own ? "spectrum-shape own" : "spectrum-shape"}
           >
-            <title>{`${s.label}: ${s.signal} dBm, ${s.width} MHz`}</title>
+            <title>{`${s.label}: ${dbm(s.signal)}, ${s.width} MHz`}</title>
           </polygon>
         );
       })}
@@ -293,7 +294,7 @@ function RadioTable({ radios }: { radios: RadioOverview[] }) {
                       <span className="muted small"> / {r.bw ?? "?"} MHz</span>
                     </td>
                     <td className="nowrap">
-                      {r.tx_power === null ? "—" : `${r.tx_power} dBm`}
+                      {dbm(r.tx_power)}
                       {r.eirp !== null && (
                         <span className="muted small"> ({r.eirp} EIRP)</span>
                       )}
@@ -312,9 +313,7 @@ function RadioTable({ radios }: { radios: RadioOverview[] }) {
                 <td className={toneClass(retryTone(r.tx_retry_pct))}>
                   {pct1(r.tx_retry_pct)}
                 </td>
-                <td className="nowrap">
-                  {r.noise_floor === null ? "—" : `${r.noise_floor} dBm`}
-                </td>
+                <td className="nowrap">{dbm(r.noise_floor)}</td>
                 <td>
                   <Signal dbm={r.avg_client_signal} />
                 </td>

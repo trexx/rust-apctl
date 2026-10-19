@@ -203,8 +203,12 @@ const MULTICAST_WARN = 30;
 
 export const multicastTone = (pct: number | null): "warn" | "" => (pct !== null && pct >= MULTICAST_WARN ? "warn" : "");
 
-/** "−75 dBm", with a real minus sign. */
-export const dbm = (v: number) => `${v < 0 ? "−" : ""}${Math.abs(v)} dBm`;
+/** A level in whole dBm, "−75 dBm" with a real minus sign, or "—" when it isn't known. */
+export function dbm(v: number | null | undefined): string {
+  if (v === null || v === undefined) return "—";
+  const r = Math.round(v);
+  return `${r < 0 ? "−" : ""}${Math.abs(r)} dBm`;
+}
 
 const compactFmt = new Intl.NumberFormat(undefined, { notation: "compact" });
 

@@ -2,7 +2,7 @@ import { useState } from "react";
 import { Link } from "react-router";
 import { ackThreat, keys, useCanEdit, useThreats } from "../api";
 import type { ThreatFinding } from "../api";
-import { ago, band, duration, useNow } from "../format";
+import { ago, band, dbm, duration, useNow } from "../format";
 import { ErrorNote, QueryNote, Signal, TextField, useRunner } from "./common";
 import { KIND_LABEL } from "./Threats";
 
@@ -52,7 +52,7 @@ function Finding({ f, readOnly }: { f: ThreatFinding; readOnly: boolean }) {
             <span key={h.mac}>
               {i > 0 && ", "}
               <Link to={`/devices/${h.mac}`}>{h.name ?? h.mac}</Link>
-              {h.signal !== null && ` (${h.signal} dBm)`}
+              {h.signal !== null && ` (${dbm(h.signal)})`}
             </span>
           ))}
         </span>

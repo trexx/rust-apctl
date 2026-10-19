@@ -1,13 +1,13 @@
 import { useDeviceSettings } from "../../../api";
 import type { RadioSettings } from "../../../api";
-import { band } from "../../../format";
+import { band, dbm } from "../../../format";
 import { QueryNote } from "../../common";
 import { EditPanel } from "../EditPanel";
 import { DeviceEditor } from "./DeviceEditor";
 
 /** One radio's settings in a line. */
 const radioSummary = (r: RadioSettings) =>
-  `${band(r.radio)}: ${r.channel === "auto" ? "auto channel" : `channel ${r.channel}`}, ${r.ht} MHz, power ${r.tx_power_mode === "custom" ? `${r.tx_power} dBm` : r.tx_power_mode}${r.min_rssi_enabled ? `, min signal ${r.min_rssi} dBm` : ""}`;
+  `${band(r.radio)}: ${r.channel === "auto" ? "auto channel" : `channel ${r.channel}`}, ${r.ht} MHz, power ${r.tx_power_mode === "custom" ? `${r.tx_power} dBm` : r.tx_power_mode}${r.min_rssi_enabled ? `, min signal ${dbm(r.min_rssi)}` : ""}`;
 
 function DevicePanel({ mac }: { mac: string }) {
   const s = useDeviceSettings(mac);
