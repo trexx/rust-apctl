@@ -249,8 +249,16 @@ async fn serve(args: ServeArgs) -> Result<()> {
     // The engine owns all mutable state and processes inputs in order.
     let mut engine = Engine::new(writer.clone(), keys.clone(), live.clone(), live_tx.clone());
     engine.restore(&store)?;
-    // The config generator, for dry runs.
-    let renderer = dryrun::apcfg_renderer(emulate_version.clone());
+    // The controller the configs describe: in active mode, the configs pushed
+    // name this controller's own address and ports; else the official defaults.
+    let controller = if active {
+        let (host, inform_port) = inform_address(inform_url.as_deref(), inform_listen);
+        apcfg::Controller { host, inform_port, stun_port: stun_listen.port(), ..dryrun::controller(emulate_version, reporter_id(&store)?) }
+    } else {
+        dryrun::controller(emulate_version, String::new())
+    };
+    // The config generator, for dry runs: what active mode would push.
+    let renderer = dryrun::renderer_for(&controller);
     engine.set_renderer(renderer.clone());
     // Alert-worthy events reach the alert watcher on a channel of their own.
     let (alert_sink, alert_events) = alerts::channel();
@@ -290,9 +298,6 @@ async fn serve(args: ServeArgs) -> Result<()> {
     })?;
 
     if active {
-        // The configs pushed name this controller's own address and ports.
-        let (host, inform_port) = inform_address(inform_url.as_deref(), inform_listen);
-        let controller = apcfg::Controller { host, inform_port, stun_port: stun_listen.port(), ..dryrun::controller(emulate_version, reporter_id(&store)?) };
         let active_state = active::Active::new(&store, writer.clone(), live.clone(), keys.clone(), in_tx.clone(), controller, proxies.clone())?;
         start_active(Arc::new(active_state), &live, inform_url.as_deref(), inform_listen, stun_listen).await?;
     }
