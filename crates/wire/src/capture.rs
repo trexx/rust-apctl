@@ -26,10 +26,10 @@ pub struct ConnId {
 
 #[derive(Debug)]
 pub enum HttpEvent {
-    /// A request: `inform` for a POST to `/inform`. `forwarded_for` is its
-    /// X-Forwarded-For header (several header lines joined by commas, as one list), the
-    /// only header anything reads. `body` is empty for a
-    /// request that is not an inform: nothing reads that either.
+    /// A request: `inform` for a POST to `/inform`. `forwarded_for` is its last
+    /// X-Forwarded-For header line, the only header anything reads: the one whose last
+    /// entry is the list's rightmost hop. `body` is empty for a request that is not an
+    /// inform: nothing reads that either.
     Request { conn: ConnId, ts: Micros, inform: bool, forwarded_for: Option<String>, body: Vec<u8> },
     Response { conn: ConnId, ts: Micros, status: u16, body: Vec<u8> },
     /// A UDP datagram to one of the watched UDP ports (e.g. AP syslog on 5514).
@@ -684,8 +684,7 @@ fn parse_http(buf: &[u8], request: bool, closed: bool) -> ParseResult {
     };
 
     let msg = if request {
-        let lines: Vec<_> = headers.iter().filter(|h| h.name.eq_ignore_ascii_case("x-forwarded-for")).map(|h| String::from_utf8_lossy(h.value)).collect();
-        let forwarded_for = (!lines.is_empty()).then(|| lines.join(","));
+        let forwarded_for = headers.iter().rev().find(|h| h.name.eq_ignore_ascii_case("x-forwarded-for")).map(|h| String::from_utf8_lossy(h.value).into_owned());
         Parsed::Request { inform, forwarded_for, body }
     } else {
         Parsed::Response { status, body }
@@ -940,7 +939,7 @@ mod tests {
         // An unreadable Content-Length is skipped to the next message, not read as empty.
         let mut h = HalfStream { buf: b"POST /inform HTTP/1.1\r\nContent-Length: x1\r\n\r\nabcPOST /inform HTTP/1.1\r\nContent-Length: 1\r\nX-Forwarded-For: 10.0.0.8\r\nx-forwarded-for: 10.0.0.9\r\n\r\nz".to_vec(), ..Default::default() };
         match h.take_http(true) {
-            Some(Parsed::Request { inform: true, forwarded_for, body }) => assert_eq!((forwarded_for.as_deref(), &body[..]), (Some("10.0.0.8,10.0.0.9"), &b"z"[..])),
+            Some(Parsed::Request { inform: true, forwarded_for, body }) => assert_eq!((forwarded_for.as_deref(), &body[..]), (Some("10.0.0.9"), &b"z"[..])),
             other => panic!("{other:?}"),
         }
         // A GET without a length has no body, and is not an inform.
