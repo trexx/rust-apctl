@@ -60,7 +60,16 @@ function ClientPage({ mac }: { mac: string }) {
   const c = client.data;
   const s = c?.sample;
   const events = useEvents({ client: mac, limit: 100 });
-  const series = useSeries("client", mac, range);
+  const series = useSeries("client", mac, range, [
+    "signal",
+    "noise",
+    "tx_rate",
+    "rx_rate",
+    "tx_bytes",
+    "rx_bytes",
+    "tx_retries",
+    "latency_avg",
+  ]);
 
   // The client list and this client's view come from the same live view, so
   // a client the server doesn't know (404) is in neither: only its MAC and

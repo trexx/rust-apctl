@@ -87,7 +87,12 @@ export function RadioPanel({
   clients: ListedClientView[];
   range: TimeSpan;
 }) {
-  const s = useSeries("radio", `${mac},${radio.radio}`, range);
+  const s = useSeries("radio", `${mac},${radio.radio}`, range, [
+    "cu_total",
+    "cu_self_rx",
+    "cu_self_tx",
+    "cu_interf",
+  ]);
   // The radio's own retry counters stay at zero on this firmware, so totals come from its SSIDs.
   const sum = (k: NumericKey<VapSample>) =>
     vaps.reduce((a, v) => a + (v[k] ?? 0), 0);
@@ -373,7 +378,7 @@ function VapRow({
 }
 
 function VapChart({ bssid, range }: { bssid: string; range: TimeSpan }) {
-  const s = useSeries("vap", bssid, range);
+  const s = useSeries("vap", bssid, range, ["tx_bytes", "rx_bytes"]);
   return (
     <QueryState q={s}>
       {(data) => (

@@ -285,7 +285,7 @@ function DeviceLogs({ mac }: { mac: string }) {
 }
 
 function ApCharts({ mac, range }: { mac: string; range: TimeSpan }) {
-  const s = useSeries("ap", mac, range);
+  const s = useSeries("ap", mac, range, ["cpu", "mem", "num_sta"]);
   return (
     <QueryState q={s} panel>
       {({ ts, fields: f }) => (
@@ -322,7 +322,13 @@ function ApCharts({ mac, range }: { mac: string; range: TimeSpan }) {
 }
 
 function UplinkChart({ mac, range }: { mac: string; range: TimeSpan }) {
-  const s = useSeries("uplink", mac, range);
+  const s = useSeries("uplink", mac, range, [
+    "rx_bytes",
+    "tx_bytes",
+    "rx_errors",
+    "tx_errors",
+    "rx_dropped",
+  ]);
   return (
     <QueryState q={s} panel>
       {({ ts, fields: f }) => (

@@ -458,7 +458,7 @@ export const keys = {
   clients: family("clients"),
   clientNames: family("client-names"),
   client: family<[mac: Mac]>("client"),
-  series: family<[table: string, key: string, span: TimeSpan]>("series"),
+  series: family<[table: string, key: string, span: TimeSpan, fields: string]>("series"),
   events: family<[filter: EventFilter]>("events"),
   logs: family<[filter: LogFilter]>("logs"),
   alerts: family("alerts"),
@@ -1100,17 +1100,18 @@ function appendSeries(prev: Series, add: Series, from: number): Series {
 }
 
 /**
- * Time-series for one entity over a time span. A live chart of raw samples
+ * Time-series for one entity over a time span: only the columns `fields` names (the charts draw). A live chart of raw samples
  * (up to 6 hours) asks only for what is newer than its last sample.
  */
-export function useSeries(table: string, key: string, span: TimeSpan) {
+export function useSeries(table: string, key: string, span: TimeSpan, fields: readonly string[]) {
   const qc = useQueryClient();
-  const queryKey = keys.series(table, key, span);
+  const only = fields.join(",");
+  const queryKey = keys.series(table, key, span, only);
   return useQuery({
     queryKey,
     queryFn: async ({ signal }) => {
       const [from, to] = spanBounds(span);
-      const url = (from: number) => `/api/series/${table}${qs({ key, from, to })}`;
+      const url = (from: number) => `/api/series/${table}${qs({ key, fields: only, from, to })}`;
       const prev = isFixed(span) ? undefined : qc.getQueryData<Series>(queryKey);
       const last = prev?.tier === "raw" ? prev.ts.at(-1) : undefined;
       if (prev && last !== undefined && last >= from) {
