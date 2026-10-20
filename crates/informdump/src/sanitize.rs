@@ -11,7 +11,9 @@
 //! identifier. Any other value is replaced whole as text people wrote (`text-N`), and
 //! the run lists those fields. Everything under a secret key is a secret, however
 //! deeply nested; host names in URLs are replaced unless `--domain` covers them; object
-//! keys that are identifiers are rewritten like values.
+//! keys that are identifiers are rewritten like values, and a key that does not look like
+//! a field name is replaced whole: as a secret under a secret key, otherwise as text,
+//! listed like a field off the allow-list.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::net::{Ipv4Addr, Ipv6Addr};
@@ -592,15 +594,27 @@ impl Sanitizer {
         out
     }
 
-    /// An object key, rewritten when it is an identifier (`sta_stats` keyed by MAC):
-    /// keys are not checked against any list.
-    fn object_key(&mut self, key: &str) -> String {
+    /// A key of the object under `parent`, rewritten when it is an identifier (`sta_stats`
+    /// keyed by MAC). Field names pass, under a secret key too, where they are the fields
+    /// of a structured secret (`x_ssh_keys`); any other key (free text, a name with
+    /// spaces) is replaced whole, unless `--keep "<parent> keys"` passes it.
+    /// `under_secret`: `parent` or a key above it is secret.
+    fn object_key(&mut self, parent: &str, key: &str, under_secret: bool) -> String {
+        let at = format!("{} keys", parent.to_ascii_lowercase());
         if is_bare_mac(key) {
             self.fakes.any_mac(key)
         } else if self.id_key.is_match(key) || key.parse::<Ipv6Addr>().is_ok() {
             self.scrub_ids(key.to_string())
-        } else {
+        } else if is_field_name(key) {
             key.to_string()
+        } else if under_secret {
+            self.fakes.get(Kind::Secret, key, |n| format!("secret-{n}"))
+        } else if self.keep.contains(&at) {
+            self.scrub(key)
+        } else {
+            self.unlisted.insert(at.clone());
+            self.text_fields.entry(key.to_string()).or_insert(at);
+            self.fakes.get(Kind::Text, key, |n| format!("text-{n}"))
         }
     }
 
@@ -667,7 +681,7 @@ impl Sanitizer {
     fn json_at(&mut self, parent: &str, key: &str, under_secret: bool, v: &Value) -> Value {
         let secret = under_secret || is_secret_key(key);
         match v {
-            Value::Object(m) => Value::Object(m.iter().map(|(k, v)| (self.object_key(k), self.json_at(key, k, secret, v))).collect()),
+            Value::Object(m) => Value::Object(m.iter().map(|(k, v)| (self.object_key(key, k, secret), self.json_at(key, k, secret, v))).collect()),
             Value::Array(a) => Value::Array(a.iter().map(|x| self.json_at(parent, key, under_secret, x)).collect()),
             Value::Number(n) if secret && self.is_secret_number(parent, key, under_secret) => {
                 Value::String(self.fakes.get(Kind::Secret, &n.to_string(), |n| format!("secret-{n}")))
@@ -783,6 +797,11 @@ fn is_secret_key(key: &str) -> bool {
 /// A comment or a line of text with an `=` in it is not one.
 fn is_cfg_key(k: &str) -> bool {
     !k.is_empty() && k.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+}
+
+/// Whether an object key looks like a field name: letters, digits, `_`, `.`, `$` and `-`.
+fn is_field_name(k: &str) -> bool {
+    !k.is_empty() && k.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'$' | b'-'))
 }
 
 /// Whether `name` names a file inside a directory: one plain path component, so joining
@@ -1131,6 +1150,25 @@ mod tests {
         assert_eq!(out["inform_url"], "http://UNIFI.example.net:8080/inform");
         assert!(s.check_clean("url unifi.home.example.org", "leak").is_err(), "the domain is looked for");
         s.check_clean(&out.to_string(), "test").unwrap();
+    }
+
+    #[test]
+    fn keys_that_are_not_field_names_are_replaced() {
+        let mut s = Sanitizer::new(Vec::new(), Vec::new());
+        let out = s.json(&json!({
+            "x_radius_users": { "Alice Smith": "pw", "bob": "pw2" },
+            "x_ssh_keys": [{ "name": "laptop", "type": "ssh-ed25519" }],
+            "groups": { "Kids' tablets": 3, "$meta": 1, "wifi0ap1": 2 },
+        }));
+        assert_eq!(out["x_radius_users"], json!({ "secret-1": "secret-2", "bob": "secret-3" }), "a field name passes under a secret key too");
+        assert_eq!(out["x_ssh_keys"][0]["type"], "ssh-ed25519", "the fields of a structured secret keep their names");
+        assert_eq!(out["groups"], json!({ "text-1": 3, "$meta": 1, "wifi0ap1": 2 }));
+        assert_eq!(s.unlisted().collect::<Vec<_>>(), ["groups keys"]);
+        s.check_clean(&out.to_string(), "test").unwrap();
+        let err = s.check_clean(r#"{"Kids' tablets": 3}"#, "leak").unwrap_err().to_string();
+        assert!(err.contains("--keep groups keys"), "{err}");
+        let mut s = Sanitizer::new(Vec::new(), vec!["Groups keys".into()]);
+        assert_eq!(s.json(&json!({ "groups": { "Kids' tablets": 3 } })), json!({ "groups": { "Kids' tablets": 3 } }));
     }
 
     #[test]
