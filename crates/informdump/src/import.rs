@@ -33,22 +33,24 @@ pub async fn run(uri: &str, db: &str, out: &Path) -> Result<()> {
     let client = mongodb::Client::with_options(opts)?;
     let db = client.database(db);
 
-    let sites = find_all(&db, "site", doc! {}).await?;
-    let wlans = find_all(&db, "wlanconf", doc! {}).await?;
-    let wlangroups = find_all(&db, "wlangroup", doc! {}).await?;
-    let networks = find_all(&db, "networkconf", doc! {}).await?;
-    let settings = find_all(&db, "setting", doc! {}).await?;
+    let sites = find_all(&db, "site", doc! {}, doc! {}).await?;
+    let wlans = find_all(&db, "wlanconf", doc! {}, doc! {}).await?;
+    let wlangroups = find_all(&db, "wlangroup", doc! {}, doc! {}).await?;
+    let networks = find_all(&db, "networkconf", doc! {}, doc! {}).await?;
+    // Only the settings apctl reads ([`apcfg::SETTING_KEYS`]): the others hold
+    // credentials (mail, cloud access, guest portal) nothing here uses.
+    let settings = find_all(&db, "setting", doc! { "key": { "$in": apcfg::SETTING_KEYS } }, doc! {}).await?;
     // AP groups decide which WLANs each AP broadcasts; config_meta pins the
     // per-AP wireless/aaa indices and VAP names across edits.
-    let apgroups = find_all(&db, "apgroup", doc! {}).await?;
-    let config_meta = find_all(&db, "config_meta", doc! {}).await?;
+    let apgroups = find_all(&db, "apgroup", doc! {}, doc! {}).await?;
+    let config_meta = find_all(&db, "config_meta", doc! {}, doc! {}).await?;
     // User groups are the speed limits of SSIDs and clients.
-    let usergroups = find_all(&db, "usergroup", doc! {}).await?;
+    let usergroups = find_all(&db, "usergroup", doc! {}, doc! {}).await?;
     let keep = |fields: &[&[&str]]| -> Document { fields.concat().into_iter().map(|f| (f.to_string(), Bson::Int32(1))).collect() };
     let projection = keep(&[apcfg::DEVICE_KEYS, DEVICE_FIELDS]);
-    let devices = find_all(&db, "device", projection).await?;
+    let devices = find_all(&db, "device", doc! {}, projection).await?;
     let user_projection = keep(&[apcfg::CLIENT_KEYS, USER_FIELDS]);
-    let users = find_all(&db, "user", user_projection).await?;
+    let users = find_all(&db, "user", doc! {}, user_projection).await?;
     let named = users.iter().filter(|u| u.get("name").and_then(Value::as_str).is_some_and(|n| !n.is_empty())).count();
 
     let with_key = devices.iter().filter(|d| d.get("x_authkey").is_some_and(Value::is_string)).count();
@@ -78,13 +80,13 @@ pub async fn run(uri: &str, db: &str, out: &Path) -> Result<()> {
     Ok(())
 }
 
-async fn find_all(db: &mongodb::Database, coll: &str, projection: Document) -> Result<Vec<Value>> {
+async fn find_all(db: &mongodb::Database, coll: &str, filter: Document, projection: Document) -> Result<Vec<Value>> {
     // Driver 2.x: the 3.x driver refuses servers older than MongoDB 4.4, and
     // the official application still bundles 3.6.
     let options = FindOptions::builder().projection((!projection.is_empty()).then_some(projection)).build();
     let mut cursor = db
         .collection::<Document>(coll)
-        .find(doc! {}, options)
+        .find(filter, options)
         .await
         .with_context(|| format!("querying {coll}"))?;
     let mut out = Vec::new();

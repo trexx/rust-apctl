@@ -133,6 +133,11 @@ pub fn inform_inputs_match(inputs: &Value, inform: &Value) -> bool {
         })
 }
 
+/// The `setting` documents (by `key`) a render reads. The controller reads no others,
+/// so whatever imports settings needs only these: the rest (mail, cloud access and guest
+/// portal credentials, RADIUS secrets) would only spread secrets nothing uses.
+pub const SETTING_KEYS: &[&str] = &["mgmt", "super_mgmt", "super_identity", "radio_ai", "country", "locale", "connectivity", "rsyslogd", "snmp", "ntp"];
+
 /// The fields of a `clients` (user) document a render reads: blocked clients and
 /// clients locked to an AP.
 pub const CLIENT_KEYS: &[&str] = &["mac", "site_id", "blocked", "fixed_ap_enabled", "fixed_ap_mac"];
@@ -575,6 +580,26 @@ mod tests {
         for key in read {
             let kept = DEVICE_KEYS.iter().any(|k| *k == key || k.strip_prefix(key).is_some_and(|row| row.starts_with('.')));
             assert!(kept, "`{key}` is read from the device document but missing from DEVICE_KEYS");
+        }
+    }
+
+    /// Every setting the sources read (`setting("…")` on the context, or with the state
+    /// and site) is in `SETTING_KEYS`.
+    #[test]
+    fn setting_keys_cover_every_setting_read() {
+        let mut read: Vec<&str> = Vec::new();
+        for src in SOURCES {
+            let src = src.split("#[cfg(test)]").next().unwrap();
+            for pattern in [".setting(\"", "setting(state, site_id, \""] {
+                for (at, _) in src.match_indices(pattern) {
+                    let rest = &src[at + pattern.len()..];
+                    read.push(&rest[..rest.find('"').unwrap()]);
+                }
+            }
+        }
+        assert!(read.len() >= 8, "the patterns still find the reads: {read:?}");
+        for key in read {
+            assert!(SETTING_KEYS.contains(&key), "setting `{key}` is read but missing from SETTING_KEYS");
         }
     }
 
