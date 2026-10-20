@@ -50,7 +50,11 @@ const DeviceSettingsPanel = lazyNamed(
   "DeviceSettingsPanel",
 );
 
-/** Keyed by MAC: nothing typed or shown for one AP carries over to the next. */
+/**
+ * Keyed by MAC: nothing typed or shown for one AP carries over to the next
+ * (Back, a link), so one AP's settings edits are never diffed against, and
+ * saved to, another.
+ */
 export function Device() {
   const typed = useParams().mac ?? "";
   const { search } = useLocation();
