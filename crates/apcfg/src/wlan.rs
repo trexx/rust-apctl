@@ -2,7 +2,7 @@
 //! and `wireless.N.*` blocks.
 
 use std::borrow::Cow;
-use std::fmt::Write;
+use std::fmt::{self, Write};
 
 use serde_json::Value;
 
@@ -868,10 +868,14 @@ pub fn blackout_blocks(w: &Value) -> [Vec<(i64, i64)>; 7] {
     days
 }
 
-/// `HHMM`; midnight at the end of a day is written 2359.
-fn hhmm(m: i64) -> String {
-    let m = m.min(1439);
-    format!("{:02}{:02}", m / 60, m % 60)
+/// A minute of the day as `HHMM`; midnight at the end of a day is written 2359.
+struct Hhmm(i64);
+
+impl fmt::Display for Hhmm {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let m = self.0.min(1439);
+        write!(f, "{:02}{:02}", m / 60, m % 60)
+    }
 }
 
 /// The schedule lines of a VAP: blackout blocks when the firmware takes them
@@ -904,7 +908,7 @@ fn schedule(c: &mut Cfg, w: &Value, k: Prefix, invert: bool, multi: bool) {
             Cow::Owned(on)
         };
         for (i, (s, e)) in blocks.iter().enumerate() {
-            let time = format_args!("{}-{}", hhmm(*s), hhmm(*e));
+            let time = format_args!("{}-{}", Hhmm(*s), Hhmm(*e));
             if multi {
                 c.set(format_args!("{k}schedule_{}.{i}", DAYS[d]), time);
             } else {

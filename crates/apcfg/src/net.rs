@@ -13,21 +13,22 @@ use crate::json::{flag, int_of, oid, str_of};
 use crate::meta::Meta;
 use crate::wlan::{Radio, Vap, dynamic_vlan, network_vlan, vlan_id};
 
-pub struct Bridge {
+pub struct Bridge<'a> {
     /// `None` for the untagged (management) bridge.
     pub vlan: Option<u16>,
-    pub ports: Vec<String>,
+    /// The Ethernet ports and VAPs by name; only VLAN subinterfaces' names are made here.
+    pub ports: Vec<Cow<'a, str>>,
 }
 
-impl Bridge {
+impl Bridge<'_> {
     pub fn name(&self) -> BridgeName {
         BridgeName(self.vlan)
     }
 }
 
-pub struct Net {
+pub struct Net<'a> {
     pub eth: Vec<&'static str>,
-    pub bridges: Vec<Bridge>,
+    pub bridges: Vec<Bridge<'a>>,
     /// VLANs carried on the trunk, in order of first use.
     pub vlans: Vec<u16>,
     pub ebtables: Vec<String>,
@@ -65,7 +66,7 @@ pub fn static_ip<'a>(ctx: &Ctx<'a>) -> Option<&'a Value> {
     ctx.device.get("config_network").filter(|cn| str_of(cn, "type") == Some("static"))
 }
 
-pub fn build(ctx: &Ctx, radios: &[Radio], vaps: &[Vap]) -> Result<Net> {
+pub fn build<'a>(ctx: &Ctx, radios: &[Radio], vaps: &'a [Vap]) -> Result<Net<'a>> {
     // A tagged management VLAN changes which bridge carries the AP's own address;
     // until that is implemented, refuse rather than cut the AP off.
     if let Some(net) = str_of(ctx.device, "mgmt_network_id").and_then(|id| ctx.network(id))
@@ -78,7 +79,7 @@ pub fn build(ctx: &Ctx, radios: &[Radio], vaps: &[Vap]) -> Result<Net> {
     if ctx.inform.is_some_and(|i| flag(i, "has_eth1", false)) {
         eth.push("eth1");
     }
-    let mut bridges = vec![Bridge { vlan: None, ports: eth.iter().map(|e| e.to_string()).collect() }];
+    let mut bridges = vec![Bridge { vlan: None, ports: eth.iter().map(|&e| Cow::Borrowed(e)).collect() }];
     let mut vlans: Vec<u16> = Vec::new();
     let mut ebtables = Vec::new();
     for vap in vaps {
@@ -93,7 +94,7 @@ pub fn build(ctx: &Ctx, radios: &[Radio], vaps: &[Vap]) -> Result<Net> {
                 bridges.len() - 1
             }
         };
-        bridges[pos].ports.push(vap.dev().to_string());
+        bridges[pos].ports.push(Cow::Borrowed(vap.dev()));
         if let Some(v) = vlan
             && !vlans.contains(&v)
         {
@@ -105,7 +106,7 @@ pub fn build(ctx: &Ctx, radios: &[Radio], vaps: &[Vap]) -> Result<Net> {
     }
     for v in &vlans {
         let b = bridges.iter_mut().find(|b| b.vlan == Some(*v)).expect("bridge exists for every VLAN");
-        b.ports.extend(eth.iter().map(|e| format!("{e}.{v}")));
+        b.ports.extend(eth.iter().map(|e| Cow::Owned(format!("{e}.{v}"))));
         ebtables.push(format!("-t broute -A BROUTING --vlan-id {v} -p 802_1Q -j DROP"));
     }
     Ok(Net { eth, bridges, vlans, ebtables })

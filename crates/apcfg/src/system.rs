@@ -309,13 +309,20 @@ fn mac_acl(c: &mut Cfg, ctx: &Ctx, vaps: &[Vap]) {
 
 /// The AP's host name: device name reduced to `[0-9A-Za-z-]`, `+` spelled out.
 pub fn hostname(name: &str) -> String {
-    let mut s = name.to_string();
-    if let Some(stripped) = s.strip_suffix('+') {
-        s = format!("{stripped}-Plus");
+    let (body, end) = name.strip_suffix('+').map_or((name, ""), |b| (b, "-Plus"));
+    let mut s = String::with_capacity(name.len() + end.len());
+    for ch in body.chars() {
+        match ch {
+            '+' => s.push_str("-Plus-"),
+            _ if ch.is_ascii_alphanumeric() || ch == '-' => s.push(ch),
+            _ => {}
+        }
     }
-    s = s.replace('+', "-Plus-");
-    let s: String = s.chars().filter(|ch| ch.is_ascii_alphanumeric() || *ch == '-').collect();
-    s.trim_start_matches('-').chars().take(31).collect()
+    s.push_str(end);
+    // ASCII only from here: bytes are characters.
+    s.drain(..s.len() - s.trim_start_matches('-').len());
+    s.truncate(31);
+    s
 }
 
 /// `dhcpc`, `route` and `resolv`.
@@ -849,5 +856,10 @@ mod tests {
         assert_eq!(hostname("Garage AP"), "GarageAP");
         assert_eq!(hostname("U6+"), "U6-Plus");
         assert_eq!(hostname("-a+b"), "a-Plus-b");
+        assert_eq!(hostname("a++"), "a-Plus--Plus");
+        assert_eq!(hostname("+"), "Plus");
+        assert_eq!(hostname("--Büro Süd/2"), "BroSd2");
+        assert_eq!(hostname(&"x".repeat(40)), "x".repeat(31));
+        assert_eq!(hostname("ü+"), "Plus");
     }
 }
