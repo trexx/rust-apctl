@@ -283,17 +283,23 @@ impl Live {
     /// or hash_id the AP no longer has is dropped: plain syslog from whichever
     /// host gets the address next is not the AP's.
     fn attribute(&mut self, a: &crate::model::ApSample) {
-        if let Some(h) = a.hash_id.as_deref().and_then(crate::syslog::parse_hash_id)
-            && self.by_hash_id.get(&h) != Some(&a.mac)
-        {
-            self.by_hash_id.retain(|_, m| *m != a.mac);
-            self.by_hash_id.insert(h, a.mac);
+        if let Some(h) = a.hash_id.as_deref().and_then(crate::syslog::parse_hash_id) {
+            self.set_hash_id(h, a.mac);
         }
         if let Some(ip) = &a.ip
             && self.by_ip.get(ip) != Some(&a.mac)
         {
             self.by_ip.retain(|_, m| *m != a.mac);
             self.by_ip.insert(ip.clone(), a.mac);
+        }
+    }
+
+    /// Records `h` as the AP's syslog hash_id, its only one: one it had before
+    /// is dropped.
+    fn set_hash_id(&mut self, h: u64, mac: Mac) {
+        if self.by_hash_id.get(&h) != Some(&mac) {
+            self.by_hash_id.retain(|_, m| *m != mac);
+            self.by_hash_id.insert(h, mac);
         }
     }
 
@@ -570,7 +576,7 @@ impl Engine {
         for (mac, known, hash_id) in devices {
             let Ok(mac) = mac.parse::<Mac>() else { continue };
             if let Some(h) = hash_id.as_deref().and_then(crate::syslog::parse_hash_id) {
-                live.by_hash_id.insert(h, mac);
+                live.set_hash_id(h, mac);
             }
             if let Some(ip) = &known.ip {
                 live.by_ip.insert(ip.clone(), mac);
@@ -1352,10 +1358,7 @@ impl Engine {
         for (mac, cipher) in self.syslog_ciphers.all() {
             if let Ok(text) = crate::syslog::decrypt_with(payload, mac, cipher) {
                 self.syslog_unknown.remove(&hash_id);
-                // As `Live::attribute`: an AP has one hash_id.
-                let mut live = self.live.write().unwrap();
-                live.by_hash_id.retain(|_, m| *m != mac);
-                live.by_hash_id.insert(hash_id, mac);
+                self.live.write().unwrap().set_hash_id(hash_id, mac);
                 return Ok((mac, text));
             }
         }
