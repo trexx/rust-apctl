@@ -70,10 +70,22 @@ pub struct Pending {
 #[derive(Default, Debug)]
 pub struct Adoption {
     pub pending: BTreeMap<Mac, Pending>,
-    /// Adopt pressed at: the AP should come back with its own key.
-    pub adopting: HashMap<Mac, Ts>,
+    /// Adopt pressed: the AP should come back with its own key.
+    pub adopting: HashMap<Mac, Adopting>,
     /// Forget pressed at: the AP gets `setdefault` with its next inform.
     pub forgetting: HashMap<Mac, Ts>,
+}
+
+/// An adoption under way.
+#[derive(Clone, Copy, Default, Debug)]
+pub struct Adopting {
+    /// When it started.
+    pub since: Ts,
+    /// Adopted over SSH with the key its record had: the key reaches the AP
+    /// over SSH, and is never handed out sealed with the factory key (anyone
+    /// could ask for it under the AP's MAC, and read what earlier pushes sent
+    /// under it). Every other adoption hands out a new key.
+    pub kept_key: bool,
 }
 
 /// The AP's record in the settings, whatever its site (see
@@ -90,13 +102,16 @@ pub fn device_doc_mut<'a>(state: &'a mut Value, mac: &Mac) -> Option<&'a mut Val
 /// The key an AP apctl manages informs with: its record's `x_authkey`, else
 /// the key file (keys exported from the other controller). `None` when apctl
 /// doesn't manage it; before any settings are imported, the key file decides.
-pub fn device_key(state: Option<&Value>, keys: &KeyStore, mac: &Mac) -> Option<[u8; 16]> {
+/// With it, whether the record pins AES-GCM (`x_aes_gcm`): one lookup of the
+/// record serves both, for every inform.
+pub fn device_key(state: Option<&Value>, keys: &KeyStore, mac: &Mac) -> Option<([u8; 16], bool)> {
     match state {
         Some(state) => {
             let d = device_doc(state, mac)?;
-            d["x_authkey"].as_str().and_then(|k| inform::parse_key(k).ok()).or_else(|| keys.get(mac).copied())
+            let key = d["x_authkey"].as_str().and_then(|k| inform::parse_key(k).ok()).or_else(|| keys.get(mac).copied())?;
+            Some((key, d["x_aes_gcm"].as_bool() == Some(true)))
         }
-        None => keys.get(mac).copied(),
+        None => keys.get(mac).map(|k| (*k, false)),
     }
 }
 
@@ -181,7 +196,7 @@ pub fn note_pending(live: &mut Live, payload: Value, known: bool, now: Ts, sourc
 /// out. Forgets that timed out are finished by [`spawn`].
 pub fn expire(live: &mut Live, now: Ts) {
     live.adoption.pending.retain(|_, p| now - p.last_seen < PENDING_TIMEOUT);
-    live.adoption.adopting.retain(|_, t| now - *t < ADOPT_TIMEOUT);
+    live.adoption.adopting.retain(|_, a| now - a.since < ADOPT_TIMEOUT);
 }
 
 /// What `radio_table` reads of each radio in an inform's `radio_table`.
@@ -405,7 +420,7 @@ pub async fn pending(State(s): State<AppState>) -> Json<Value> {
         let live = s.live.read().unwrap();
         let a = &live.adoption;
         let pending: Vec<Pending> = a.pending.values().filter(|p| now - p.last_seen < PENDING_TIMEOUT).cloned().collect();
-        let adopting: Vec<(Mac, Ts)> = a.adopting.iter().filter(|(_, t)| now - **t < ADOPT_TIMEOUT).map(|(m, t)| (*m, *t)).collect();
+        let adopting: Vec<(Mac, Ts)> = a.adopting.iter().filter(|(_, a)| now - a.since < ADOPT_TIMEOUT).map(|(m, a)| (*m, a.since)).collect();
         let forgetting: Vec<(Mac, Ts)> = a.forgetting.iter().map(|(m, t)| (*m, *t)).collect();
         (pending, adopting, forgetting)
     };
@@ -421,7 +436,7 @@ pub async fn adopt(State(s): State<AppState>, MacPath(mac): MacPath) -> Result<J
     crate::actions::apply_edit(&s, Box::new(move |state: &mut Value| adopt_device(state, &mac, &inform))).await?;
     {
         let mut live = s.live.write().unwrap();
-        live.adoption.adopting.insert(mac, clock::now_ts());
+        live.adoption.adopting.insert(mac, Adopting { since: clock::now_ts(), kept_key: false });
         live.adoption.pending.remove(&mac);
     }
     s.note(Event::device(clock::now_ts(), EventKind::ApAdopting, mac, json!({ "model": payload["model"], "ip": payload["ip"] }))).await;
@@ -496,7 +511,7 @@ mod tests {
         let s = state();
         let keys = KeyStore::default();
         let ap: Mac = "02:00:00:00:00:01".parse().unwrap();
-        assert_eq!(device_key(Some(&s), &keys, &ap), Some([0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]));
+        assert_eq!(device_key(Some(&s), &keys, &ap), Some(([0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15], false)));
         assert_eq!(device_key(Some(&s), &keys, &"02:00:00:00:00:09".parse().unwrap()), None, "not in the settings: not ours");
         let mut file = KeyStore::default();
         file.insert("02:00:00:00:00:09", "ffffffffffffffffffffffffffffffff").unwrap();
@@ -506,6 +521,8 @@ mod tests {
         let key = device_doc(&padded, &ap).unwrap()["x_authkey"].as_str().unwrap().to_string();
         device_doc_mut(&mut padded, &ap).unwrap()["x_authkey"] = json!(format!(" {key}\n"));
         assert_eq!(device_key(Some(&padded), &keys, &ap), device_key(Some(&s), &keys, &ap), "whitespace around a stored key is ignored");
+        device_doc_mut(&mut padded, &ap).unwrap()["x_aes_gcm"] = json!(true);
+        assert_eq!(device_key(Some(&padded), &keys, &ap).map(|k| k.1), Some(true), "the record's AES-GCM pin comes with it");
     }
 
     #[tokio::test]

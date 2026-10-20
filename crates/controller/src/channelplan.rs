@@ -52,6 +52,21 @@ fn overlap(a: &Block, lo: f64, hi: f64) -> bool {
     a.lo < hi && lo < a.hi
 }
 
+/// What an AP measured of a block's air, from its survey (`(block, load)` per
+/// entry). Each entry measures the air around its own centre, overlapping
+/// neighbours' included, so a sum over every entry that overlaps the block
+/// would count the same air several times, and more often in the middle of a
+/// band (on 2.4 GHz, seven entries overlap channel 6, four channel 1). The
+/// entries within the block (at 20 MHz, its own) are averaged; when none is
+/// (an entry wider than the block), those that overlap it.
+fn measured_load(b: &Block, measured: &[(Block, f64)]) -> f64 {
+    let mean = |pick: &dyn Fn(&Block) -> bool| {
+        let (sum, n) = measured.iter().filter(|(sb, _)| pick(sb)).fold((0.0, 0), |(s, n), (_, l)| (s + l, n + 1));
+        (n > 0).then(|| sum / f64::from(n))
+    };
+    mean(&|sb| b.lo <= sb.lo && sb.hi <= b.hi).or_else(|| mean(&|sb| overlap(b, sb.lo, sb.hi))).unwrap_or(0.0)
+}
+
 /// Weight of a signal: dB above the noise floor, so loud networks dominate.
 fn weight(signal: f64) -> f64 {
     (signal + 95.0).max(0.0)
@@ -332,12 +347,7 @@ fn plan_channels(
                 why.push((w, format!("your AP {} ({sig:.0} dBm)", aps[o].name.as_deref().unwrap_or(&aps[o].mac))));
             }
         }
-        for (sb, load) in &measured[i] {
-            if overlap(b, sb.lo, sb.hi) {
-                total += load;
-            }
-        }
-        total
+        total + measured_load(b, &measured[i])
     };
     let cost = |i: usize, b: &Block, placed: &[Block]| contributions(i, b, placed, None);
     // The cost with the four biggest reasons, for the plan shown.
@@ -521,6 +531,28 @@ mod tests {
         let to: HashMap<&str, (i64, bool)> = plan.plan.iter().map(|p| (p.mac.as_str(), (p.suggested_channel, p.change))).collect();
         assert_eq!(to["k"], (11, true), "{plan:?}");
         assert_eq!((to["i"], to["j"]), ((1, false), (6, false)), "j stays, so i stays off its channel: {plan:?}");
+    }
+
+    #[test]
+    fn a_survey_counts_each_blocks_air_once() {
+        // The same air everywhere, as a 2.4 GHz scan reports it (13 channels at 20 MHz).
+        let survey: Vec<(Block, f64)> = (1..=13).map(|c| (block("ng", c, 20), 12.5)).collect();
+        for ch in [1, 6, 11, 13] {
+            assert_eq!(measured_load(&block("ng", ch, 20), &survey), 12.5, "channel {ch}");
+        }
+        // A busy channel 6 shows on 6, not on 1 or 11.
+        let mut busy = survey.clone();
+        busy[5].1 = 40.0;
+        assert_eq!((measured_load(&block("ng", 6, 20), &busy), measured_load(&block("ng", 1, 20), &busy)), (40.0, 12.5));
+        // 20 MHz entries in an 80 MHz block are averaged; an 80 MHz entry stands for its 20 MHz parts.
+        let na: Vec<(Block, f64)> = [(36, 10.0), (40, 20.0), (44, 30.0), (48, 40.0)].map(|(c, l)| (block("na", c, 20), l)).into();
+        assert_eq!(measured_load(&block("na", 36, 80), &na), 25.0);
+        assert_eq!(measured_load(&block("na", 40, 20), &[(block("na", 36, 80), 30.0)]), 30.0);
+        assert_eq!(measured_load(&block("na", 149, 80), &na), 0.0, "nothing measured there");
+        // So an AP on 6 alone in an even environment stays there.
+        let spectrum: Vec<SpectrumRow> = (1..=13).map(|c| ("a".to_string(), c, Some(20), Some(-80.0), Some(10.0))).collect();
+        let plan = plan_channels("ng".into(), false, None, vec![], vec![ng_ap("a", 6, 3)], HashMap::new(), vec![], spectrum);
+        assert!(!plan.accepted && !plan.plan[0].change, "{plan:?}");
     }
 
     #[test]

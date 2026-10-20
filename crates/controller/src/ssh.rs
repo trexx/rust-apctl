@@ -252,7 +252,8 @@ fn logins(state: Option<&Value>, given: Option<(String, String)>) -> Vec<(String
 /// failed adoption removes what it added, and only that: the settings may
 /// have changed in the time the SSH commands took.
 fn ssh_record(st: &mut Value, mac: &Mac, payload: &Value, fingerprint: Option<&str>, created: &AtomicBool) -> Result<String, String> {
-    // A known AP keeps its key: it reaches the AP over SSH, not sealed with the factory key.
+    // A known AP keeps its key: it reaches the AP over SSH, and is never sealed
+    // with the factory key (see `Adopting::kept_key`).
     let new = crate::adopt::device_doc(st, mac).is_none();
     let what = if new { format!("{} over SSH", crate::adopt::adopt_device(st, mac, payload)?) } else { format!("adopting {mac} over SSH") };
     let d = crate::adopt::device_doc_mut(st, mac).ok_or("no record")?;
@@ -326,7 +327,8 @@ pub async fn adopt(State(s): State<AppState>, Json(b): Json<AdoptBody>) -> Resul
     }
     .ok_or_else(|| ApiError::internal("the new record has no key"))?;
     // Expected from now on: the AP may inform with its key before the command returns.
-    s.live.write().unwrap().adoption.adopting.insert(mac, clock::now_ts());
+    let adopting = crate::adopt::Adopting { since: clock::now_ts(), kept_key: !created.load(Ordering::Relaxed) };
+    s.live.write().unwrap().adoption.adopting.insert(mac, adopting);
     let out = match session.run(&format!("/usr/bin/syswrapper.sh set-adopt {} {}", shell_quote(&url), shell_quote(&key))).await {
         Ok(out) => out,
         // Back with its key already (that ends the adoption): it worked.

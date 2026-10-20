@@ -1417,7 +1417,7 @@ impl Engine {
                     "FWWriteFailed" => "writing the firmware failed".into(),
                     r => format!("failed ({r})"),
                 };
-                live.firmware.failed(&mac, &detail);
+                live.firmware.upgrade_error(&mac, &detail);
                 Some(Event::device(ts, EventKind::ApUpgradeFailed, mac, json!({ "reason": reason, "detail": detail })))
             }
             _ => None,

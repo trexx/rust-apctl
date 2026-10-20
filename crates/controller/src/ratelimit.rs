@@ -16,7 +16,7 @@ use serde_json::{Value, json};
 
 use crate::api::AppState;
 use crate::engine::Live;
-use crate::settings::{docs, id_of};
+use crate::settings::{doc_mac, docs, id_of};
 
 /// What was last sent for a client.
 struct Sent {
@@ -35,7 +35,7 @@ struct Groups {
     /// The settings these were read from, by address: the Weak keeps the
     /// address from being reused without keeping old settings alive.
     state: Weak<Value>,
-    /// The clients with a group of their own (their first entry's), and that group.
+    /// The clients with a group of their own (their first entry in the site's), and that group.
     own: HashMap<Mac, String>,
     /// Each SSID's group, by name (the first SSID of that name).
     ssid: HashMap<String, Option<String>>,
@@ -51,8 +51,8 @@ impl Groups {
         }
         let mut g = Groups { state: Arc::downgrade(state), default: crate::settings::default_usergroup(state), ..Default::default() };
         let mut own = HashMap::new();
-        for c in state["clients"].as_array().into_iter().flatten() {
-            if let Some(mac) = c["mac"].as_str().and_then(|m| m.parse::<Mac>().ok()) {
+        for c in docs(state, "clients") {
+            if let Some(mac) = doc_mac(&c["mac"]) {
                 own.entry(mac).or_insert_with(|| c["usergroup_id"].as_str().filter(|id| !id.is_empty()).map(str::to_string));
             }
         }
@@ -289,6 +289,23 @@ mod tests {
         live.state = Some(std::sync::Arc::new(state));
         tick(&mut live, &mut sent);
         assert_eq!(sent_to(&mut live, AP1)[0]["dl_max"].as_i64(), Some(8000));
+    }
+
+    #[test]
+    fn only_the_sites_client_entries_count() {
+        // Another site's entry for the client (first in the list) gives it no limit here.
+        let mut live = live(Some("slow"));
+        let mut state = (**live.state.as_ref().unwrap()).clone();
+        state["devices"] = json!([{ "mac": AP1, "site_id": "s1" }]);
+        state["clients"] = json!([{ "mac": C, "usergroup_id": "slow", "site_id": "s2" }, { "mac": C.to_uppercase(), "site_id": "s1" }]);
+        live.state = Some(std::sync::Arc::new(state.clone()));
+        tick(&mut live, &mut Limits::default());
+        assert!(sent_to(&mut live, AP1).is_empty());
+        // The site's own entry does, whichever way it writes the MAC.
+        state["clients"][1]["usergroup_id"] = json!("slow");
+        live.state = Some(std::sync::Arc::new(state));
+        tick(&mut live, &mut Limits::default());
+        assert_eq!(sent_to(&mut live, AP1).len(), 1);
     }
 
     #[test]

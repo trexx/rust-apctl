@@ -248,8 +248,10 @@ struct ApWatch {
     sent: HashMap<Mac, Vec<Ts>>,
     /// APs currently considered offline, with the last contact time.
     down: HashMap<Mac, Ts>,
-    /// Day (UTC) on which a "keeps dropping off" alert was last sent per AP.
+    /// Day (in the site's time zone) on which a "keeps dropping off" alert was last sent per AP.
     flapping_day: HashMap<Mac, Ts>,
+    /// The site's time zone (UTC without one): its days, and the times of day alerts name.
+    tz: Option<String>,
 }
 
 #[derive(Debug, PartialEq)]
@@ -262,7 +264,13 @@ enum ApChange {
 }
 
 impl ApWatch {
+    /// The site's day `ts` falls on.
+    fn day(&self, ts: Ts) -> Ts {
+        clock::local(self.tz.as_deref(), ts).0
+    }
+
     fn check(&mut self, now: Ts, mac: Mac, last_seen: Ts) -> Option<ApChange> {
+        let today = self.day(now);
         let gone = now - last_seen >= OFFLINE_AFTER;
         match (gone, self.down.get(&mac).copied()) {
             (true, None) => {
@@ -272,8 +280,8 @@ impl ApWatch {
                 if sent.len() < 2 {
                     sent.push(now);
                     Some(ApChange::Offline { last_seen })
-                } else if self.flapping_day.get(&mac) != Some(&(now / 86400)) {
-                    self.flapping_day.insert(mac, now / 86400);
+                } else if self.flapping_day.get(&mac) != Some(&today) {
+                    self.flapping_day.insert(mac, today);
                     Some(ApChange::Flapping { times: sent.len() + 1 })
                 } else {
                     None
@@ -299,7 +307,8 @@ impl ApWatch {
             }
             !sent.is_empty()
         });
-        self.flapping_day.retain(|_, day| *day == now / 86400);
+        let today = self.day(now);
+        self.flapping_day.retain(|_, day| *day == today);
     }
 }
 
@@ -605,6 +614,7 @@ impl Watcher {
     /// alerts it sent in the last day, which count towards today's limit.
     async fn start(store: Arc<Store>, writer: Writer, live: SharedLive, tx: broadcast::Sender<LiveMsg>, now: Ts) -> Watcher {
         let mut w = Watcher::new(store, writer, live, tx);
+        w.aps.tz = w.site_tz();
         match load_open(&w.store, now).await {
             Ok((open, seq, offline)) => {
                 w.book.seq = seq;
@@ -613,7 +623,7 @@ impl Watcher {
                 }
                 for (mac, ts, flapping) in offline {
                     if flapping {
-                        w.aps.flapping_day.insert(mac, ts / 86400);
+                        w.aps.flapping_day.insert(mac, w.aps.day(ts));
                     } else {
                         w.aps.sent.entry(mac).or_default().push(ts);
                     }
@@ -621,10 +631,16 @@ impl Watcher {
             }
             Err(e) => tracing::warn!("could not load the open alerts: {e:#}"),
         }
-        // An AP already reported offline before a restart stays so.
-        for (k, a) in &w.book.open {
-            if let (Key::ApOffline, Entity::Ap(mac)) = k {
-                w.aps.down.insert(*mac, a.ts - OFFLINE_AFTER);
+        // An AP already reported offline before a restart stays so, down since
+        // its last contact the engine restored (the alert may have been raised
+        // well after it, e.g. on the first check after a long stop).
+        {
+            let live = w.live.read().unwrap();
+            for (k, a) in &w.book.open {
+                if let (Key::ApOffline, Entity::Ap(mac)) = k {
+                    let last_seen = live.known_devices.get(mac).map_or(i64::MAX, |d| d.last_seen);
+                    w.aps.down.insert(*mac, last_seen.min(a.ts - OFFLINE_AFTER));
+                }
             }
         }
         w
@@ -639,8 +655,14 @@ impl Watcher {
         }
     }
 
+    /// The site's time zone, from the settings.
+    fn site_tz(&self) -> Option<String> {
+        self.live.read().unwrap().state.as_deref().and_then(crate::settings::timezone).map(str::to_string)
+    }
+
     /// AP status: offline after a while without contact, back online.
     fn status_tick(&mut self, now: Ts) {
+        self.aps.tz = self.site_tz();
         self.aps.prune(now);
         let seen: Vec<(Mac, Option<String>, Ts)> = {
             let l = self.live.read().unwrap();
@@ -673,7 +695,7 @@ impl Watcher {
             let status = |key: Key, severity: Severity, title: String, message: String| Alert::for_device(key, Category::ApStatus, severity, mac, title, message).tagged(format!("ap-status:{mac}"));
             match self.aps.check(now, mac, last_seen) {
                 Some(ApChange::Offline { last_seen }) => {
-                    let message = format!("No contact for {} (last seen {}).", human(now - last_seen), time_of_day(last_seen));
+                    let message = format!("No contact for {} (last seen {}).", human(now - last_seen), time_of_day(self.aps.tz.as_deref(), last_seen));
                     self.book.open(now, status(Key::ApOffline, Severity::High, format!("{name} is offline"), message));
                 }
                 Some(ApChange::Flapping { times }) => {
@@ -793,10 +815,13 @@ pub fn spawn(store: Arc<Store>, writer: Writer, live: SharedLive, tx: broadcast:
     });
 }
 
-/// The time of day of `ts`, as an alert's message names it.
-fn time_of_day(ts: Ts) -> String {
-    let s = ts.rem_euclid(86400);
-    format!("{:02}:{:02} UTC", s / 3600, (s % 3600) / 60)
+/// The time of day of `ts` in the site's time zone (UTC without one), as an
+/// alert's message names it: the message is stored, so the UI cannot show it
+/// in another zone.
+fn time_of_day(tz: Option<&str>, ts: Ts) -> String {
+    let zone = tz.filter(|z| apcfg::tz::posix(z).is_some()).unwrap_or("UTC");
+    let (_, minute) = clock::local(Some(zone), ts);
+    format!("{:02}:{:02} {zone}", minute / 60, minute % 60)
 }
 
 #[derive(Deserialize)]
@@ -869,6 +894,25 @@ mod tests {
         // The next day it is reported again.
         w.check(4100, ap, 4099);
         assert!(matches!(w.check(1000 + 90_000, ap, 1000 + 90_000 - 300), Some(ApChange::Offline { .. })));
+    }
+
+    #[test]
+    fn days_and_times_of_day_are_the_sites() {
+        // 2026-01-15 22:30 UTC is 23:30 in Berlin; 23:30 UTC is the next day there.
+        let (t, ap): (Ts, Mac) = (1_768_516_200, "02:00:00:00:00:01".parse().unwrap());
+        assert_eq!((time_of_day(None, t), time_of_day(Some("Europe/Berlin"), t)), ("22:30 UTC".to_string(), "23:30 Europe/Berlin".to_string()));
+        assert_eq!(time_of_day(Some("Mars/Olympus"), t), "22:30 UTC", "a zone apctl does not know");
+        let mut w = ApWatch { tz: Some("Europe/Berlin".into()), ..Default::default() };
+        for at in [t - 3000, t - 2000] {
+            w.check(at, ap, at - 300);
+            w.check(at + 100, ap, at + 99);
+        }
+        assert_eq!(w.check(t, ap, t - 300), Some(ApChange::Flapping { times: 3 }));
+        w.check(t + 100, ap, t + 99);
+        // An hour on, midnight has passed in Berlin (not in UTC): "keeps dropping off" may be sent again.
+        w.prune(t + 3600);
+        assert!(w.flapping_day.is_empty());
+        assert_eq!(w.check(t + 3600, ap, t + 3300), Some(ApChange::Flapping { times: 3 }));
     }
 
     #[test]
@@ -1025,6 +1069,25 @@ mod tests {
         assert_eq!(restart(4000).await.aps.check(4000, ap, 3700), None);
         // A day after the first two, a drop is reported again.
         assert!(matches!(restart(91_000).await.aps.check(91_000, ap, 90_700), Some(ApChange::Offline { .. })));
+    }
+
+    #[tokio::test]
+    async fn an_ap_down_over_a_restart_is_back_after_its_whole_absence() {
+        let (mut w, _rx, _dir) = watcher();
+        let ap: Mac = "02:00:00:00:00:01".parse().unwrap();
+        // Last heard at 1000; apctl was stopped, and the first check after it came back raised the alert.
+        w.book.open(90_000, Alert::for_device(Key::ApOffline, Category::ApStatus, Severity::High, ap, "t".into(), "m".into()));
+        flushed(&w.book.writer);
+        let live: SharedLive = Default::default();
+        let known = crate::engine::KnownDevice {
+            first_seen: 0, last_seen: 1000, uptime: None, version: None, hostname: None, model: None, model_display: None, ip: None, serial: None,
+        };
+        live.write().unwrap().known_devices.insert(ap, known);
+        let again = Watcher::start(w.store.clone(), w.book.writer.clone(), live, broadcast::channel(4).0, 91_000).await;
+        assert_eq!(again.aps.down.get(&ap), Some(&1000));
+        // Nothing restored of it: the alert's time stands for the last contact.
+        let again = Watcher::start(w.store.clone(), w.book.writer.clone(), Default::default(), broadcast::channel(4).0, 91_000).await;
+        assert_eq!(again.aps.down.get(&ap), Some(&(90_000 - OFFLINE_AFTER)));
     }
 
     #[tokio::test]

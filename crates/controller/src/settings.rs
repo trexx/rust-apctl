@@ -960,7 +960,7 @@ fn edit_wlan(state: &mut Value, e: &WlanEdit, over: &[Over]) -> Result<String, S
     let mut w = before.clone();
     let mut changed: Vec<&str> = Vec::new();
 
-    if let Some(name) = p["name"].as_str().map(str::trim) {
+    if let Some(name) = str_field(p, "name")?.map(str::trim) {
         if name.is_empty() || name.len() > 32 {
             return Err("the network name (SSID) must be 1 to 32 bytes".into());
         }
@@ -1099,7 +1099,7 @@ fn wlan_security(p: &Value, w: &mut Value) -> Result<(), String> {
 /// once Force Wi-Fi 4 has had its say).
 fn wlan_password(p: &Value, before: &Value, w: &mut Value, changed: &mut Vec<&str>) -> Result<(), String> {
     let (psk, wpa3, transition) = psk_wpa3(w);
-    let given = p["passphrase"].as_str();
+    let given = str_field(p, "passphrase")?;
     if psk && given.is_none() && w["x_passphrase"].as_str().is_none_or(str::is_empty) {
         return Err("a password is needed for WPA2/WPA3".into());
     }
@@ -1290,7 +1290,7 @@ fn wlan_power_saving(p: &Value, w: &mut Value) -> Result<(), String> {
 /// What the SSID points at: its speed limit, blackout schedule and network.
 fn wlan_links(state: &mut Value, p: &Value, w: &mut Value) -> Result<(), String> {
     // Speed limit: a user group; empty means the default group (no limit).
-    if let Some(g) = p["usergroup_id"].as_str() {
+    if let Some(g) = str_field(p, "usergroup_id")? {
         let id = if g.is_empty() { ensure_default_usergroup(state) } else { g.to_string() };
         if doc_by_id(state, "usergroup", &id).is_none() {
             return Err("unknown speed limit".into());
@@ -1301,7 +1301,7 @@ fn wlan_links(state: &mut Value, p: &Value, w: &mut Value) -> Result<(), String>
     if !p["schedule_with_duration"].is_null() {
         w["schedule_with_duration"] = json!(check_schedule(&p["schedule_with_duration"])?);
     }
-    if let Some(n) = p["networkconf_id"].as_str() {
+    if let Some(n) = str_field(p, "networkconf_id")? {
         if doc_by_id(state, "networkconf", n).is_none() {
             return Err("unknown network".into());
         }
@@ -1400,9 +1400,18 @@ pub fn ensure_default_usergroup(state: &mut Value) -> String {
 }
 
 /// The default user group as [`ensure_default_usergroup`] adds it (but for
-/// its `site_id`).
+/// its `site_id`). Its id is the one most SSIDs point at (the first of a tie)
+/// that no group has: an id a group has is a speed limit, not the default.
 fn new_default_usergroup(state: &Value) -> Value {
-    let id = docs(state, "wlanconf").find_map(|w| w["usergroup_id"].as_str().filter(|g| !g.is_empty()).map(str::to_string)).unwrap_or_else(new_id);
+    let mut uses: Vec<(&str, usize)> = Vec::new();
+    for g in docs(state, "wlanconf").filter_map(|w| w["usergroup_id"].as_str()).filter(|g| !g.is_empty() && doc_by_id(state, "usergroup", g).is_none()) {
+        match uses.iter_mut().find(|(id, _)| *id == g) {
+            Some((_, n)) => *n += 1,
+            None => uses.push((g, 1)),
+        }
+    }
+    // max_by_key keeps the last of equals: reversed, that is the first seen.
+    let id = uses.into_iter().rev().max_by_key(|(_, n)| *n).map_or_else(new_id, |(id, _)| id.to_string());
     json!({ "_id": id, "name": "Default", "attr_hidden_id": "Default", "attr_no_delete": true, "qos_rate_max_down": -1, "qos_rate_max_up": -1 })
 }
 
@@ -1558,7 +1567,7 @@ pub fn apply_device(state: &mut Value, e: &DeviceEdit) -> Result<String, String>
 /// The AP-wide fields: name, LED, modes, SNMP, antenna and its own address.
 fn device_fields(state: &Value, e: &DeviceEdit, before: &Value, d: &mut Value) -> Result<(), String> {
     let p = &e.patch;
-    if let Some(name) = p["name"].as_str() {
+    if let Some(name) = str_field(p, "name")? {
         let name = name.trim();
         if name.chars().count() > 128 {
             return Err("the name can be at most 128 characters".into());
@@ -1566,7 +1575,7 @@ fn device_fields(state: &Value, e: &DeviceEdit, before: &Value, d: &mut Value) -
         d["name"] = json!(name);
     }
     copy_fields(p, d, &[("led_override", Enum(&["default", "on", "off"])), ("led_override_color_brightness", Int(0, 100))])?;
-    if let Some(c) = p["led_override_color"].as_str() {
+    if let Some(c) = str_field(p, "led_override_color")? {
         d["led_override_color"] = json!(led_color(c)?);
     }
     copy_fields(
@@ -1578,7 +1587,7 @@ fn device_fields(state: &Value, e: &DeviceEdit, before: &Value, d: &mut Value) -
         ],
     )?;
     for key in ["snmp_location", "snmp_contact"] {
-        if let Some(v) = p[key].as_str().map(str::trim) {
+        if let Some(v) = str_field(p, key)?.map(str::trim) {
             if v.chars().count() > 255 {
                 return Err(format!("{} can be at most 255 characters", key.replace('_', " ")));
             }
@@ -1636,9 +1645,13 @@ fn radio_edit(state: &Value, e: &DeviceEdit, rp: &Value, before: &Value, d: &mut
             r["channel"] = json!(ch);
         }
     }
-    // A fixed channel must be legal for the (possibly new) width.
-    if let Some((ch, width)) = illegal_fixed_channel(country(state), r, o) {
-        return Err(format!("{label}: channel {ch} is not allowed at {width} MHz here"));
+    // A fixed channel must be legal for the (possibly new) width: by the
+    // country's rules, or where apctl has none, one the band has at that width.
+    if let Some(ch) = num(&r["channel"]) {
+        let width = num(&r["ht"]).unwrap_or(20);
+        if !is_legal(country(state), band, width, o, ch).unwrap_or_else(|| band_channels(band, width).contains(&ch)) {
+            return Err(format!("{label}: channel {ch} is not allowed at {width} MHz here"));
+        }
     }
     // The official controller refuses any change here, which strands an AP
     // that came under the lock on another channel (one adopted after the lock
@@ -1675,7 +1688,7 @@ fn radio_edit(state: &Value, e: &DeviceEdit, rp: &Value, before: &Value, d: &mut
 fn check_config_network(p: &Value, before: &Value) -> Result<Value, String> {
     use std::net::Ipv4Addr;
     let ip = |key: &str| -> Result<Option<Ipv4Addr>, String> {
-        match p[key].as_str().map(str::trim).filter(|s| !s.is_empty()) {
+        match str_field(p, key)?.map(str::trim).filter(|s| !s.is_empty()) {
             None => Ok(None),
             Some(s) => s.parse().map(Some).map_err(|_| format!("{key}: {s} is not an IPv4 address")),
         }
@@ -1713,7 +1726,7 @@ fn check_config_network(p: &Value, before: &Value) -> Result<Value, String> {
     if let Some(d) = ip("dns2")? {
         out["dns2"] = json!(d.to_string());
     }
-    if let Some(suffix) = p["dnssuffix"].as_str().map(str::trim).filter(|s| !s.is_empty()) {
+    if let Some(suffix) = str_field(p, "dnssuffix")?.map(str::trim).filter(|s| !s.is_empty()) {
         if !crate::site::is_domain_name(suffix) {
             return Err(format!("{suffix} is not a domain name"));
         }
@@ -1862,6 +1875,19 @@ mod tests {
         edit(&mut s, json!({ "dns_assistance_mode": "auto" })).unwrap();
         assert_eq!(s["wlanconf"][0]["dns_assistance_servers"][1], "9.9.9.9");
         assert!(edit(&mut s, json!({ "dns_assistance_mode": "fallback" })).is_err());
+    }
+
+    #[test]
+    fn text_fields_refuse_anything_but_text() {
+        let mut s = state();
+        for (k, v) in [("passphrase", json!(12345678)), ("name", json!(5)), ("usergroup_id", json!(3)), ("networkconf_id", json!(false))] {
+            assert_eq!(edit(&mut s, json!({ k: v })).unwrap_err(), format!("{k} must be text"));
+        }
+        for (k, v) in [("name", json!(5)), ("led_override_color", json!(255)), ("snmp_location", json!(["x"]))] {
+            assert_eq!(dev(&mut s, json!({ k: v })).unwrap_err(), format!("{k} must be text"));
+        }
+        assert!(dev(&mut s, json!({ "config_network": { "type": "static", "ip": "192.168.1.20", "netmask": "255.255.255.0", "gateway": "192.168.1.1", "dns1": "192.168.1.1", "dns2": 9 } })).unwrap_err().contains("dns2"));
+        assert_eq!(s["wlanconf"][0]["x_passphrase"], "correct horse");
     }
 
     #[test]
@@ -2214,6 +2240,15 @@ mod tests {
         }
         assert!(dev(&mut s, json!({ "radios": [{ "radio": "na", "channel": 999 }] })).unwrap_err().contains("not a channel"));
         assert_eq!(s["devices"][0]["radio_table"][2]["channel"], 37);
+        // Nor one the band has, but not at the width: the editor never offers these.
+        let mut wide = s.clone();
+        wide["devices"][0]["radio_table"][2]["ht"] = json!("160");
+        assert!(dev(&mut wide, json!({ "radios": [{ "radio": "6e", "channel": 233 }] })).unwrap_err().contains("not allowed at 160 MHz"));
+        assert!(dev(&mut s.clone(), json!({ "radios": [{ "radio": "na", "channel": 165, "ht": 80 }] })).unwrap_err().contains("not allowed at 80 MHz"));
+        // A width change that the kept channel does not fit is refused too.
+        s["devices"][0]["radio_table"][2]["channel"] = json!(233);
+        s["devices"][0]["radio_table"][2]["ht"] = json!(20);
+        assert!(dev(&mut s.clone(), json!({ "radios": [{ "radio": "6e", "ht": 40 }] })).unwrap_err().contains("channel 233"));
     }
 
     #[test]
@@ -2416,7 +2451,7 @@ pub fn apply_usergroup(state: &mut Value, e: &GroupEdit) -> Result<String, Strin
         return Ok(what);
     }
     let p = &e.patch;
-    let name = p["name"].as_str().map(str::trim);
+    let name = str_field(p, "name")?.map(str::trim);
     if name.is_some_and(|n| n.is_empty() || n.chars().count() > 128) {
         return Err("the name must be 1 to 128 characters".into());
     }
@@ -2541,6 +2576,21 @@ mod speed_and_schedule_tests {
         assert_eq!(ensure_default_usergroup(&mut s), "ug-imported");
         assert_eq!(ensure_default_usergroup(&mut s), "ug-imported", "made once");
         assert_eq!(s["usergroup"].as_array().unwrap().len(), 1);
+        // An id a group already has is that group's (a speed limit), never the
+        // default's; of the others the one most SSIDs use wins.
+        let mut s = state();
+        let ssid = |id: &str, g: &str| json!({ "_id": id, "site_id": "s1", "name": id, "security": "open", "usergroup_id": g });
+        s["wlanconf"] = json!([ssid("w1", "ug-slow"), ssid("w2", "ug-a"), ssid("w3", "ug-b"), ssid("w4", "ug-b")]);
+        s["usergroup"] = json!([{ "_id": "ug-slow", "name": "Slow", "site_id": "s1", "qos_rate_max_down": 1000 }]);
+        assert_eq!(ensure_default_usergroup(&mut s), "ug-b");
+        s["wlanconf"] = json!([ssid("w1", "ug-slow")]);
+        s["usergroup"].as_array_mut().unwrap().truncate(1);
+        let id = ensure_default_usergroup(&mut s);
+        assert!(id != "ug-slow" && s["usergroup"].as_array().unwrap().len() == 2, "{id}");
+        // A tie goes to the first SSID's.
+        let mut s = state();
+        s["wlanconf"] = json!([ssid("w1", "ug-a"), ssid("w2", "ug-b")]);
+        assert_eq!(ensure_default_usergroup(&mut s), "ug-a");
     }
 
     #[test]

@@ -125,7 +125,8 @@ fn site_mgmt(doc: &mut Value, m: &Value, notes: &mut Vec<String>) -> Result<(), 
         notes.push("SSH password".into());
     }
     if !m["x_ssh_keys"].is_null() {
-        doc["x_ssh_keys"] = json!(ssh_keys(&m["x_ssh_keys"])?);
+        let keys = ssh_keys(&m["x_ssh_keys"], &doc["x_ssh_keys"])?;
+        doc["x_ssh_keys"] = json!(keys);
     }
     if doc["x_ssh_enabled"].as_bool() != Some(false) && doc["x_ssh_auth_password_enabled"].as_bool() == Some(false) && doc["x_ssh_keys"].as_array().is_none_or(Vec::is_empty) {
         return Err("with password logins off, SSH needs at least one key".into());
@@ -194,18 +195,23 @@ fn site_ntp(doc: &mut Value, n: &Value) -> Result<(), String> {
             }
         }
     } else if NTP_KEYS.iter().any(|k| !n[*k].is_null()) {
-        // Manual servers replace all four.
+        // The servers named replace those stored, and the four close up. Coming
+        // from automatic, the pool's servers are no choice of the user's: the
+        // ones not named are blank.
         let mut list = Vec::new();
         for k in NTP_KEYS {
-            if let Some(h) = str_field(n, k)?.map(str::trim).filter(|h| !h.is_empty()) {
-                if !is_host(h) {
-                    return Err(format!("{h} is not a host name or IPv4 address"));
-                }
-                list.push(h);
+            let h = match str_field(n, k)?.map(str::trim) {
+                Some(h) if !h.is_empty() && !is_host(h) => return Err(format!("{h} is not a host name or IPv4 address")),
+                Some(h) => h,
+                None if was_manual => doc[k].as_str().unwrap_or_default(),
+                None => "",
+            };
+            if !h.is_empty() {
+                list.push(h.to_string());
             }
         }
         for (i, k) in NTP_KEYS.iter().enumerate() {
-            doc[*k] = json!(list.get(i).copied().unwrap_or_default());
+            doc[*k] = json!(list.get(i).map_or("", String::as_str));
         }
     }
     if doc["setting_preference"].as_str() == Some("manual") && NTP_KEYS.iter().all(|k| doc[*k].as_str().is_none_or(str::is_empty)) {
@@ -283,8 +289,10 @@ fn set_ssh_password(doc: &mut Value, pw: &str) -> Result<(), String> {
 }
 
 /// SSH public keys as `{name, key, type, comment}`; a pasted OpenSSH line
-/// (`ssh-ed25519 AAAA... comment`) is split up.
-fn ssh_keys(v: &Value) -> Result<Vec<Value>, String> {
+/// (`ssh-ed25519 AAAA... comment`) is split up. A key without a name of its
+/// own keeps the one it has in `stored` (the editor sends OpenSSH lines,
+/// which have no place for it), else is named after its comment or type.
+fn ssh_keys(v: &Value, stored: &Value) -> Result<Vec<Value>, String> {
     // The official controller takes RSA and Ed25519 keys only.
     const TYPES: &[&str] = &["ssh-ed25519", "ssh-rsa"];
     let mut out = Vec::new();
@@ -299,7 +307,8 @@ fn ssh_keys(v: &Value) -> Result<Vec<Value>, String> {
         if !TYPES.contains(&kind.as_str()) || key.len() < 32 || !key.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '/' | '=')) {
             return Err(format!("not an SSH public key: {}", if key.is_empty() { kind } else { format!("{kind} {}…", key.chars().take(12).collect::<String>()) }));
         }
-        let name = k["name"].as_str().filter(|n| !n.is_empty()).map(str::to_string).unwrap_or_else(|| if comment.is_empty() { kind.clone() } else { comment.clone() });
+        let kept = || stored.as_array().into_iter().flatten().find(|s| s["key"].as_str() == Some(key.as_str()))?["name"].as_str().filter(|n| !n.is_empty());
+        let name = k["name"].as_str().filter(|n| !n.is_empty()).or_else(kept).map(str::to_string).unwrap_or_else(|| if comment.is_empty() { kind.clone() } else { comment.clone() });
         if !out.iter().any(|o: &Value| o["key"].as_str() == Some(key.as_str())) {
             out.push(json!({ "name": name, "type": kind, "key": key, "comment": comment }));
         }
@@ -397,6 +406,24 @@ mod tests {
         let key = "A".repeat(68);
         edit(&mut s, json!({ "mgmt": { "x_ssh_keys": [format!("ssh-ed25519 {key} me@laptop"), { "type": "ssh-ed25519", "key": key, "name": "again" }] } })).unwrap();
         assert_eq!(setting(&s, "mgmt")["x_ssh_keys"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn ssh_keys_keep_their_names_through_the_editor() {
+        let mut s = state();
+        let (a, b) = ("A".repeat(68), "B".repeat(68));
+        // Named in the official controller; the editor sends them back as lines.
+        setting_mut(&mut s, "mgmt")["x_ssh_keys"] = json!([
+            { "name": "Office laptop", "type": "ssh-ed25519", "key": a, "comment": "me@desk" },
+            { "name": "backup", "type": "ssh-rsa", "key": b, "comment": "" },
+        ]);
+        let new = format!("ssh-ed25519 {} new@host", "C".repeat(68));
+        edit(&mut s, json!({ "mgmt": { "x_ssh_keys": [format!("ssh-ed25519 {a} me@desk"), format!("ssh-rsa {b}"), new] } })).unwrap();
+        let names: Vec<_> = setting(&s, "mgmt")["x_ssh_keys"].as_array().unwrap().iter().map(|k| k["name"].as_str().unwrap().to_string()).collect();
+        assert_eq!(names, ["Office laptop", "backup", "new@host"]);
+        // A name given wins.
+        edit(&mut s, json!({ "mgmt": { "x_ssh_keys": [{ "type": "ssh-ed25519", "key": a, "name": "renamed" }] } })).unwrap();
+        assert_eq!(setting(&s, "mgmt")["x_ssh_keys"][0]["name"], "renamed");
     }
 
     #[test]
@@ -502,7 +529,16 @@ mod tests {
             assert!(edit(&mut s, json!({ "ntp": { "ntp_server_2": bad } })).is_err(), "{bad}");
         }
         assert!(is_host("time-1.example.net") && is_host("192.0.2.1"));
+        // A manual patch merges the servers it names into those stored.
+        edit(&mut s, json!({ "ntp": { "ntp_server_3": "ntp.example.org" } })).unwrap();
+        let servers = |s: &Value| NTP_KEYS.map(|k| setting(s, "ntp")[k].as_str().unwrap_or("?").to_string());
+        assert_eq!(servers(&s), ["time.example.net", "192.0.2.1", "ntp.example.org", ""]);
+        edit(&mut s, json!({ "ntp": { "ntp_server_1": "" } })).unwrap();
+        assert_eq!(servers(&s), ["192.0.2.1", "ntp.example.org", "", ""], "a blank one closes up");
         edit(&mut s, json!({ "ntp": { "setting_preference": "auto" } })).unwrap();
         assert_eq!(setting(&s, "ntp")["ntp_server_1"], "0.ubnt.pool.ntp.org");
+        // From automatic, the pool is not kept for the servers not named.
+        edit(&mut s, json!({ "ntp": { "setting_preference": "manual", "ntp_server_2": "time.example.net" } })).unwrap();
+        assert_eq!(servers(&s), ["time.example.net", "", "", ""]);
     }
 }
