@@ -358,6 +358,8 @@ pub struct KnownDevice {
     pub model_display: Option<String>,
     pub ip: Option<String>,
     pub serial: Option<String>,
+    /// Reported offline (an `ap_offline` event), and not back since.
+    pub offline: bool,
 }
 
 pub type SharedLive = Arc<RwLock<Live>>;
@@ -528,12 +530,12 @@ impl Engine {
     /// the first one after it says what it changed.
     pub fn restore(&mut self, store: &store::Store) -> anyhow::Result<()> {
         let (devices, clients, aliases, state, pushes) = store.read(Db::Config, |c| {
-            let mut stmt = c.prepare("SELECT mac, first_seen, last_seen, uptime, version, hash_id, ip, hostname, model, model_display, serial FROM devices")?;
+            let mut stmt = c.prepare("SELECT mac, first_seen, last_seen, uptime, version, hash_id, ip, hostname, model, model_display, serial, offline FROM devices")?;
             let devices = stmt
                 .query_map([], |r| {
                     let known = KnownDevice {
                         first_seen: r.get::<_, Option<i64>>(1)?.unwrap_or(0), last_seen: r.get::<_, Option<i64>>(2)?.unwrap_or(0), uptime: r.get(3)?, version: r.get(4)?,
-                        ip: r.get(6)?, hostname: r.get(7)?, model: r.get(8)?, model_display: r.get(9)?, serial: r.get(10)?,
+                        ip: r.get(6)?, hostname: r.get(7)?, model: r.get(8)?, model_display: r.get(9)?, serial: r.get(10)?, offline: r.get::<_, i64>(11)? != 0,
                     };
                     Ok((r.get::<_, String>(0)?, known, r.get::<_, Option<String>>(5)?))
                 })?
@@ -1504,6 +1506,7 @@ impl Engine {
             let data = json!({ "reason": "timed out", "detail": why, "target": j.target });
             events.push(Event::device(now, EventKind::ApUpgradeFailed, mac, data));
         }
+        let started = *self.first_tick.get_or_insert(now);
         let mut offline = Vec::new();
         for (mac, d) in live.devices.iter_mut() {
             let limit = (d.interval.max(5) * OFFLINE_INTERVALS).max(60);
@@ -1513,11 +1516,20 @@ impl Engine {
                 events.push(Event::device(now, EventKind::ApOffline, *mac, json!({ "last_seen": d.last_seen })));
             }
         }
+        // An AP last recorded online that has not informed in this run, as when it
+        // went down while apctl was away: its interval is not known, so it is
+        // given the longest usual one, counted from this run's start too.
+        for (mac, k) in live.known_devices.iter_mut() {
+            if !k.offline && now - k.last_seen.max(started) > 60 * OFFLINE_INTERVALS {
+                k.offline = true;
+                offline.push(*mac);
+                events.push(Event::device(now, EventKind::ApOffline, *mac, json!({ "last_seen": k.last_seen })));
+            }
+        }
         // A client is gone when its AP has reported a full client list since it was
         // last seen and the grace period has passed, or when its AP went offline.
         // Only the connected ones are looked at, not the year of clients kept.
         let mut changed = false;
-        let started = *self.first_tick.get_or_insert(now);
         let Live { devices, clients, connected, .. } = &mut *live;
         connected.retain(|cmac| {
             let Some(c) = clients.get_mut(cmac).filter(|c| c.connected) else { return false };
@@ -1551,7 +1563,9 @@ impl Engine {
         for e in events {
             self.emit(e);
         }
+        // Remembered, so that a restart still pairs the AP's return with it.
         for mac in offline {
+            self.writer.exec(Db::Config, "UPDATE devices SET offline = 1 WHERE mac = ?1", vec![Sql::Text(mac.to_string())]);
             let _ = self.tx.send(LiveMsg::Device { mac });
         }
         if changed {
@@ -1559,9 +1573,9 @@ impl Engine {
         }
     }
 
-    /// The AP's row in `devices`, as of the inform at `a.ts`. The table's
-    /// `name`, `cfgversion` and `online` columns are no longer used: whether an
-    /// AP is online is only known live, and its config version is in `device_config`.
+    /// The AP's row in `devices`, as of the inform at `a.ts`: back online, if it
+    /// was offline (see `tick`). The table's `name`, `cfgversion` and `online`
+    /// columns are no longer used: its config version is in `device_config`.
     fn write_device(&self, a: &crate::model::ApSample) {
         self.writer.exec(
             Db::Config,
@@ -1569,7 +1583,7 @@ impl Engine {
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9, ?10)
              ON CONFLICT (mac) DO UPDATE SET hostname = excluded.hostname, model = excluded.model, model_display = excluded.model_display,
                version = excluded.version, ip = excluded.ip, serial = excluded.serial, hash_id = excluded.hash_id,
-               last_seen = excluded.last_seen, uptime = excluded.uptime",
+               last_seen = excluded.last_seen, uptime = excluded.uptime, offline = 0",
             vec![
                 Sql::Text(a.mac.to_string()),
                 a.hostname.clone().into(),
@@ -1795,7 +1809,13 @@ fn lifecycle_events(ts: Ts, a: &crate::model::ApSample, prev: Option<&DeviceView
             }
             (p.snapshot.ap.uptime.map(|u| (u, p.snapshot.ap.ts)), &p.snapshot.ap.version)
         }
-        (None, Some(k)) => (k.uptime.map(|u| (u, k.last_seen)), &k.version),
+        (None, Some(k)) => {
+            // Reported offline before a restart: its return is reported now.
+            if k.offline {
+                events.push(Event::device(ts, EventKind::ApOnline, mac, json!({ "offline_for": ts - k.last_seen })));
+            }
+            (k.uptime.map(|u| (u, k.last_seen)), &k.version)
+        }
     };
     // Only what can be proved to have changed, in this run or while apctl was
     // away: up for less than it was then plus the time since (with a minute's
@@ -2084,6 +2104,36 @@ mod tests {
     }
 
     #[test]
+    fn going_offline_and_coming_back_are_paired_across_a_restart() {
+        let feed = |h: &mut Harness, ts: Ts| h.engine.handle(Input::Inform { ts, peer: [10, 0, 0, 1].into(), decoded: decoded(inform(AP1, 1000 + ts, &[])) });
+        // Reported offline, then apctl restarts: its return is reported after it.
+        let mut h = harness();
+        feed(&mut h, 0);
+        h.engine.handle(Input::Tick(100));
+        assert_eq!(events(&mut h), [("ap_seen", None), ("ap_offline", None)]);
+        let mut h = h.restarted();
+        feed(&mut h, 500);
+        assert_eq!(events(&mut h), [("ap_online", None)]);
+        assert_eq!(stored(&h, EventKind::ApOnline)[0]["offline_for"], 500);
+        // Back online, as the next restart knows: nothing more to report.
+        let mut h = h.restarted();
+        feed(&mut h, 510);
+        assert_eq!(events(&mut h), []);
+        // Gone while apctl was away: reported offline once this run has given it time to inform.
+        let mut h = h.restarted();
+        h.engine.handle(Input::Tick(1000));
+        h.engine.handle(Input::Tick(1000 + 60 * OFFLINE_INTERVALS));
+        assert_eq!(events(&mut h), []);
+        h.engine.handle(Input::Tick(1001 + 60 * OFFLINE_INTERVALS));
+        h.engine.handle(Input::Tick(1100 + 60 * OFFLINE_INTERVALS));
+        assert_eq!(events(&mut h), [("ap_offline", None)]);
+        assert_eq!(stored(&h, EventKind::ApOffline)[1]["last_seen"], 510);
+        let mut h = h.restarted();
+        feed(&mut h, 2000);
+        assert_eq!(events(&mut h), [("ap_online", None)]);
+    }
+
+    #[test]
     fn a_long_outage_gives_the_aps_time_to_inform() {
         let mut h = harness();
         h.engine.handle(Input::Inform { ts: 0, peer: [10, 0, 0, 1].into(), decoded: decoded(inform(AP1, 1000, &[(C1, "b1")])) });
@@ -2091,7 +2141,7 @@ mod tests {
         let mut h = h.restarted();
         h.engine.handle(Input::Tick(7200));
         h.engine.handle(Input::Tick(7200 + 3600));
-        assert_eq!(events(&mut h), [], "the client is left alone for the AP's first hour back");
+        assert_eq!(events(&mut h), [("ap_offline", None)], "the client is left alone for the AP's first hour back");
         // An AP that never informs again: its clients go an hour into the run.
         h.engine.handle(Input::Tick(7200 + 3601));
         assert_eq!(events(&mut h), [("client_disconnected", Some(C1.into()))]);
@@ -2358,7 +2408,7 @@ mod tests {
         let mut h = harness();
         let (a, b) = ("02:00:00:00:00:10", "02:00:00:00:00:18");
         // B is only in the database: it lost its uplink before apctl restarted.
-        let known = KnownDevice { first_seen: 0, last_seen: 0, uptime: None, version: None, hostname: None, model: None, model_display: None, ip: None, serial: None };
+        let known = KnownDevice { first_seen: 0, last_seen: 0, uptime: None, version: None, hostname: None, model: None, model_display: None, ip: None, serial: None, offline: false };
         h.engine.live.write().unwrap().known_devices.insert(b.parse().unwrap(), known);
         let mut p = inform(a, 1000, &[]);
         p["radio_table"] = json!([{ "radio": "na", "scan_table": [{ "bssid": "02:00:00:00:00:1a", "is_isolated": true, "signal": -70 }] }]);

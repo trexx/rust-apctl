@@ -229,10 +229,11 @@ pub const TIERS: [Tier; 3] = [
 
 const CONFIG_SCHEMA: &str = "
 -- name, cfgversion and online are no longer written; old databases have them filled.
+-- offline: reported offline and not back since.
 CREATE TABLE IF NOT EXISTS devices (
     mac TEXT PRIMARY KEY, name TEXT, hostname TEXT, model TEXT, model_display TEXT, version TEXT,
     ip TEXT, serial TEXT, hash_id TEXT, first_seen INTEGER, last_seen INTEGER, uptime INTEGER,
-    cfgversion TEXT, online INTEGER NOT NULL DEFAULT 0);
+    cfgversion TEXT, online INTEGER NOT NULL DEFAULT 0, offline INTEGER NOT NULL DEFAULT 0);
 CREATE TABLE IF NOT EXISTS clients (
     mac TEXT PRIMARY KEY, hostname TEXT, ip TEXT, first_seen INTEGER, last_seen INTEGER,
     ap_mac TEXT, bssid TEXT, essid TEXT, radio TEXT, connected INTEGER NOT NULL DEFAULT 0);
@@ -339,7 +340,7 @@ fn open_ro(path: &Path) -> Result<Connection> {
 }
 
 /// Columns added to config tables after their first release.
-const CONFIG_COLUMNS: [(&str, &str, &str); 1] = [("connections", "detail", "TEXT")];
+const CONFIG_COLUMNS: [(&str, &str, &str); 2] = [("connections", "detail", "TEXT"), ("devices", "offline", "INTEGER NOT NULL DEFAULT 0")];
 
 fn migrate(dir: &Path) -> Result<()> {
     let config = open_rw(&dir.join(Db::Config.file()))?;

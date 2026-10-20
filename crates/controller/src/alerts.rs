@@ -1032,7 +1032,7 @@ mod tests {
         let (mut w, mut rx, _dir) = watcher();
         let ap: Mac = "02:00:00:00:00:01".parse().unwrap();
         let known = crate::engine::KnownDevice {
-            first_seen: 0, last_seen: 1000, uptime: None, version: None, hostname: Some("Garage".into()), model: None, model_display: None, ip: None, serial: None,
+            first_seen: 0, last_seen: 1000, uptime: None, version: None, hostname: Some("Garage".into()), model: None, model_display: None, ip: None, serial: None, offline: false,
         };
         w.live.write().unwrap().known_devices.insert(ap, known);
         w.status_tick(1000 + OFFLINE_AFTER);
@@ -1045,7 +1045,7 @@ mod tests {
         let (mut w, mut rx, _dir) = watcher();
         let ap: Mac = "02:00:00:00:00:01".parse().unwrap();
         let known = crate::engine::KnownDevice {
-            first_seen: 0, last_seen: 1000, uptime: None, version: None, hostname: None, model: None, model_display: None, ip: None, serial: None,
+            first_seen: 0, last_seen: 1000, uptime: None, version: None, hostname: None, model: None, model_display: None, ip: None, serial: None, offline: false,
         };
         w.live.write().unwrap().known_devices.insert(ap, known);
         // Past the day's limit, and "keeps dropping off" already sent today: no alert, but it counts as down.
