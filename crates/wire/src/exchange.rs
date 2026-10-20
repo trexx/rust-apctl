@@ -138,11 +138,17 @@ fn split(body: &[u8]) -> (inform::Result<Packet<'_>>, Option<Mac>) {
     }
 }
 
-/// The client's address from an X-Forwarded-For header: its first entry, if that is
-/// an address (some proxies add the port).
+/// The client's address from an X-Forwarded-For header: its last entry, the hop the
+/// proxy in front of the controller added (entries further left are the client's to
+/// write), if that is an address. A hop may carry a port (`203.0.113.7:4711`,
+/// `[2001:db8::1]:4711`) or brackets alone (`[2001:db8::1]`).
 fn forwarded_ip(header: &str) -> Option<IpAddr> {
-    let first = header.split(',').next()?.trim();
-    first.parse().ok().or_else(|| first.parse::<SocketAddr>().ok().map(|a| a.ip()))
+    let hop = header.rsplit(',').next()?.trim();
+    hop.parse::<IpAddr>()
+        .ok()
+        .or_else(|| hop.parse::<SocketAddr>().ok().map(|a| a.ip()))
+        .or_else(|| hop.strip_prefix('[')?.strip_suffix(']')?.parse().ok())
+        .map(|ip| ip.to_canonical())
 }
 
 #[cfg(test)]
@@ -255,11 +261,13 @@ mod tests {
             Some(InformEvent::Inform { peer, .. }) => peer.to_string(),
             other => panic!("{other:?}"),
         };
-        assert_eq!(peer(Some(" 203.0.113.9 , 10.0.0.1")), "203.0.113.9");
+        assert_eq!(peer(Some(" 203.0.113.9 , 10.0.0.1 ")), "10.0.0.1", "the hop the proxy added, not the client's");
         assert_eq!(peer(Some("198.51.100.7:4711")), "198.51.100.7");
         assert_eq!(peer(Some("[2001:db8::1]:80")), "2001:db8::1");
         assert_eq!(peer(Some("2001:db8::2")), "2001:db8::2");
-        assert_eq!(peer(Some("not-an-address, 10.0.0.1")), "10.0.0.5", "not an address: the connection's");
+        assert_eq!(peer(Some("[2001:db8::8]")), "2001:db8::8");
+        assert_eq!(peer(Some("::ffff:192.0.2.4")), "192.0.2.4");
+        assert_eq!(peer(Some("10.0.0.1, not-an-address")), "10.0.0.5", "not an address: the connection's");
         assert_eq!(peer(Some("")), "10.0.0.5");
         assert_eq!(peer(None), "10.0.0.5");
     }
