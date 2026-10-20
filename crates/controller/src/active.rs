@@ -316,8 +316,18 @@ impl Active {
     /// neither the settings nor what it read of the inform changed (most
     /// informs), else a new one. The lock is not held while rendering.
     fn placeholder_render(&self, state: &Arc<Value>, mac: Mac, payload: &Value) -> anyhow::Result<Arc<Render>> {
+        self.render_from(self.current_render(state, mac), state, mac, payload)
+    }
+
+    /// The AP's last render, while the settings it was made from are current.
+    fn current_render(&self, state: &Arc<Value>, mac: Mac) -> Option<Arc<Render>> {
         let last = self.devices.lock().unwrap().get(&mac).and_then(|d| d.render.clone());
-        if let Some(r) = last.filter(|r| std::ptr::eq(r.state.as_ptr(), Arc::as_ptr(state)) && apcfg::inform_inputs_match(&r.inputs, payload)) {
+        last.filter(|r| std::ptr::eq(r.state.as_ptr(), Arc::as_ptr(state)))
+    }
+
+    /// [`Self::placeholder_render`], given [`Self::current_render`].
+    fn render_from(&self, last: Option<Arc<Render>>, state: &Arc<Value>, mac: Mac, payload: &Value) -> anyhow::Result<Arc<Render>> {
+        if let Some(r) = last.filter(|r| apcfg::inform_inputs_match(&r.inputs, payload)) {
             return Ok(r);
         }
         let out = self.render(state, mac, payload, PLACEHOLDER)?;
@@ -394,10 +404,11 @@ impl Active {
         }
         // One read for what the reply needs: whether a command is queued; a
         // resend asked from the UI (the flag stays until the push is built);
-        // the settings; the site's size. Writing only to take a command.
-        let (queued, force, state, n_devices) = {
+        // the settings; the site's size; whether it is the AP's turn for a
+        // firmware upgrade. Writing only to take a command or an upgrade.
+        let (queued, force, state, n_devices, upgrade) = {
             let live = self.live.read().unwrap();
-            (live.commands.contains_key(&mac), live.reprovision.contains(&mac), live.state.clone(), live.devices.len())
+            (live.commands.contains_key(&mac), live.reprovision.contains(&mac), live.state.clone(), live.devices.len(), live.firmware.queued_for(&mac))
         };
         if queued && let Some(cmd) = self.queued_command(mac, &server_time) {
             return cmd;
@@ -410,14 +421,18 @@ impl Active {
             }
             return noop(interval(mac, n_devices));
         };
-        if self.collect_radios(ts, mac, &state, payload) {
+        // A render made from these settings shows that the record had its
+        // radios (`collect_radios` returns before any render while they are
+        // missing), and so has them still: most informs skip the look-up.
+        let last = self.current_render(&state, mac);
+        if last.is_none() && self.collect_radios(ts, mac, &state, payload) {
             return noop(interval(mac, n_devices));
         }
         let reported = payload["cfgversion"].as_str().unwrap_or("");
 
         // What would we push, ignoring the cfgversion token? Rendered once: the
         // token is patched into mgmt_cfg where a version is needed.
-        let render = match self.placeholder_render(&state, mac, payload) {
+        let render = match self.render_from(last, &state, mac, payload) {
             Ok(r) => r,
             Err(e) => {
                 tracing::error!("{mac}: cannot render config, replying noop: {e:#}");
@@ -426,7 +441,7 @@ impl Active {
         };
         let cfgversion = self.decide_version(mac, reported, &render, force);
         if reported == cfgversion {
-            return self.firmware_turn(ts, mac, payload).unwrap_or_else(|| noop(interval(mac, n_devices)));
+            return upgrade.then(|| self.firmware_turn(ts, mac, payload)).flatten().unwrap_or_else(|| noop(interval(mac, n_devices)));
         }
         if force {
             self.live.write().unwrap().reprovision.remove(&mac);
@@ -555,14 +570,10 @@ impl Active {
         })
     }
 
-    /// Once the AP's config is current: the firmware upgrade, if it is its
-    /// turn. An upgrade that cannot be sent fails at once.
+    /// Once the AP's config is current and it is its turn (see
+    /// `Jobs::queued_for`, read with the rest of the reply's needs): the
+    /// firmware upgrade. An upgrade that cannot be sent fails at once.
     fn firmware_turn(&self, ts: Ts, mac: Mac, payload: &Value) -> Option<Value> {
-        // A read for every inform; the write lock only when it is this AP's turn.
-        let turn = self.live.read().unwrap().firmware.current.as_ref().is_some_and(|j| j.mac == mac && j.state == crate::firmware::JobState::Queued);
-        if !turn {
-            return None;
-        }
         // The job's target, for the event (the command says "unknown" for a firmware URL).
         let (cmd, target) = {
             let mut live = self.live.write().unwrap();
@@ -658,7 +669,13 @@ pub async fn inform(
 
     // Which keys may this AP use? Its own if apctl manages it; the factory key always.
     // With its record's AES-GCM pin, as the official controller keeps it (see `managed_inform`).
-    let state = active.live.read().unwrap().state.clone();
+    // In the same read: whether an adoption, a forget or the pending list has
+    // the AP, for `managed_inform`.
+    let (state, busy) = {
+        let live = active.live.read().unwrap();
+        let a = &live.adoption;
+        (live.state.clone(), a.pending.contains_key(&mac) || a.adopting.contains_key(&mac) || a.forgetting.contains_key(&mac))
+    };
     let (device_key, pinned) = crate::adopt::device_key(state.as_deref(), &active.keys, &mac).map_or((None, false), |(k, gcm)| (Some(k), gcm));
     drop(state);
     let (used, key, payload, permit) = match active.open(body, device_key).await {
@@ -681,7 +698,7 @@ pub async fn inform(
     if used == KeyUsed::Default {
         factory_key_inform(&active, ts, caller, payload, device_key.is_some(), permit).await
     } else {
-        managed_inform(&active, ts, caller, Decoded { header, key: used, payload }, pinned, permit).await
+        managed_inform(&active, ts, caller, Decoded { header, key: used, payload }, pinned, busy, permit).await
     }
 }
 
@@ -737,21 +754,20 @@ async fn factory_key_inform(active: &Arc<Active>, ts: Ts, caller: Caller, payloa
 /// command, a heartbeat), and the inform for the engine. `pinned`: the AP's
 /// record says it uses AES-GCM (`x_aes_gcm`, imported from the other
 /// controller), which pins it from the first inform apctl hears from it.
-/// `permit`: the gate's, held while the inform is handled.
-async fn managed_inform(active: &Arc<Active>, ts: Ts, caller: Caller, decoded: Decoded, pinned: bool, permit: OwnedSemaphorePermit) -> Response {
+/// `busy`: an adoption, a forget or the pending list had the AP when the
+/// inform came in. `permit`: the gate's, held while the inform is handled.
+async fn managed_inform(active: &Arc<Active>, ts: Ts, caller: Caller, decoded: Decoded, pinned: bool, busy: bool, permit: OwnedSemaphorePermit) -> Response {
     let payload = &decoded.payload;
     let (mac, gcm) = (caller.mac, caller.gcm);
     // Its own key: an adoption is complete; a forgotten AP is told to reset
     // (once: the entry goes, so later informs don't finish the forget again).
-    let (was_adopting, forgetting) = {
-        let busy = |a: &crate::adopt::Adoption| a.pending.contains_key(&mac) || a.adopting.contains_key(&mac) || a.forgetting.contains_key(&mac);
-        if busy(&active.live.read().unwrap().adoption) {
-            let mut live = active.live.write().unwrap();
-            live.adoption.pending.remove(&mac);
-            (live.adoption.adopting.remove(&mac).is_some(), live.adoption.forgetting.remove(&mac).is_some())
-        } else {
-            (false, false)
-        }
+    // One that came while this inform was opened waits for the next.
+    let (was_adopting, forgetting) = if busy {
+        let mut live = active.live.write().unwrap();
+        live.adoption.pending.remove(&mac);
+        (live.adoption.adopting.remove(&mac).is_some(), live.adoption.forgetting.remove(&mac).is_some())
+    } else {
+        (false, false)
     };
     if was_adopting {
         // A new start: the config is pushed under a new version, and AES-GCM

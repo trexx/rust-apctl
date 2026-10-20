@@ -241,6 +241,12 @@ impl Jobs {
         self.current.as_mut().filter(|j| j.mac == *mac)
     }
 
+    /// Whether the AP's job is next to be sent (its command goes with its next
+    /// inform whose config is current).
+    pub fn queued_for(&self, mac: &Mac) -> bool {
+        self.current.as_ref().is_some_and(|j| j.mac == *mac && j.state == JobState::Queued)
+    }
+
     /// The AP's current job once its command is sent. What the AP reports of
     /// an upgrade before then is not about this job (an upgrade started
     /// elsewhere, or a late notice from an earlier one).
