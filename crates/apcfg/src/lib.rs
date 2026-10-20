@@ -86,6 +86,8 @@ pub const DEVICE_KEYS: &[&str] = &[
     "syslog_key", "config_network", "mgmt_network_id", "led_override", "led_override_color", "led_override_color_brightness",
     "outdoor_mode_override", "bandsteering_mode", "atf_enabled", "green_ap_enabled", "resetbtn_enabled", "jumboframe_enabled",
     "switch_vlan_enabled", "ethernet_table", "port_overrides", "snmp_location", "snmp_contact", "mesh_uplink_1", "mesh_uplink_2",
+    // Whether clients locked to this AP are kept off the others (false while it is offline).
+    "fixed_ap_available",
     // Capability bits, used until the AP's first inform.
     "fw_caps", "fw2_caps", "fw3_caps", "wifi_caps", "wifi_caps2", "hw_caps",
 ];

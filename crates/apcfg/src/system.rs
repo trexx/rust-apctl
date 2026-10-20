@@ -249,11 +249,16 @@ fn bandsteering(c: &mut Cfg, ctx: &Ctx, radios: &[Radio], vaps: &[Vap]) {
 type AclBlock<'a> = (&'a str, &'a str, Vec<(Cow<'a, str>, &'static str)>);
 
 fn mac_acl(c: &mut Cfg, ctx: &Ctx, vaps: &[Vap]) {
-    // Clients pinned ("lock to AP") to some other AP may not join this one.
+    // Clients pinned ("lock to AP") to some other AP may not join this one, while that AP
+    // is known and available: a lock to an AP that is offline (`fixed_ap_available` false)
+    // or not in the state is not enforced, so its clients can use the other APs meanwhile.
+    let available = |ap: &str| {
+        arr(ctx.state, "devices").iter().find(|device| str_of(device, "mac").is_some_and(|m| mac_eq(m, ap))).is_some_and(|device| flag(device, "fixed_ap_available", true))
+    };
     let locked_elsewhere: Vec<String> = ctx
         .site_docs("clients")
         .filter(|u| flag(u, "fixed_ap_enabled", false))
-        .filter(|u| str_of(u, "fixed_ap_mac").is_some_and(|m| !mac_eq(m, &ctx.mac)))
+        .filter(|u| str_of(u, "fixed_ap_mac").is_some_and(|m| !m.is_empty() && !mac_eq(m, &ctx.mac) && available(m)))
         .filter_map(|u| str_of(u, "mac"))
         .map(str::to_ascii_lowercase)
         .collect();

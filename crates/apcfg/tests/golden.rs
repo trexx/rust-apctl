@@ -152,3 +152,30 @@ fn schedules_reach_the_vaps() {
     assert!(cfg.contains(".schedule_invert=enabled"), "{cfg}");
     assert!(cfg.contains(".schedule_mon.0=0100-0600"));
 }
+
+/// A client locked to an AP is kept off the others only while that AP is known and
+/// available: with it offline (`fixed_ap_available: false`), or the lock naming an AP
+/// the state does not have, the client may join any AP.
+#[test]
+fn a_lock_to_an_unavailable_ap_is_not_enforced() {
+    let Some(_) = common::fixtures() else { return };
+    let lock2ap = |state: &Value| render(state, AP_U, "x").rendered.system_cfg.lines().filter(|l| l.ends_with(".type=lock2ap")).count();
+    let mut state = state();
+    assert_eq!(lock2ap(&state), 10, "ten clients locked to AP B");
+    fn ap_b(state: &mut Value) -> &mut Value {
+        state["devices"].as_array_mut().unwrap().iter_mut().find(|d| d["mac"] == AP_B).unwrap()
+    }
+    ap_b(&mut state)["fixed_ap_available"] = serde_json::json!(true);
+    assert_eq!(lock2ap(&state), 10);
+    ap_b(&mut state)["fixed_ap_available"] = serde_json::json!(false);
+    assert_eq!(lock2ap(&state), 0, "AP B is offline");
+    let mut state = common::state();
+    for c in state["clients"].as_array_mut().unwrap().iter_mut().filter(|c| c["fixed_ap_mac"] == AP_B) {
+        c["fixed_ap_mac"] = serde_json::json!("02:00:00:00:99:99");
+    }
+    assert_eq!(lock2ap(&state), 0, "an AP the state does not have");
+    for c in state["clients"].as_array_mut().unwrap().iter_mut().filter(|c| c["fixed_ap_enabled"] == true) {
+        c["fixed_ap_mac"] = serde_json::json!("");
+    }
+    assert_eq!(lock2ap(&state), 0, "no AP named");
+}
