@@ -759,15 +759,16 @@ const onlySpanDiffers = (a: QueryKey, b: QueryKey) => hashKey([a[0], ...a.slice(
 /**
  * A query over a time span: refreshes while the span is live, and keeps the old data on screen (`isPlaceholderData`) while
  * another span loads. Another choice (a band, an AP) shows as loading instead, unless `keepAcrossChoices`, for a caller that
- * dims the old data while it shows it.
+ * dims the old data while it shows it. The server keeps a view's answer for a window longer than 8 days for 5 minutes, so such
+ * a window is asked again only that often, unless the view is `unmemoised`.
  */
-function useSpanQuery<T>(key: QueryKey, path: string, span: TimeSpan, extra: Record<string, string | number | undefined> = {}, keepAcrossChoices = false) {
+function useSpanQuery<T>(key: QueryKey, path: string, span: TimeSpan, extra: Record<string, string | number | undefined> = {}, opts: { keepAcrossChoices?: boolean; unmemoised?: boolean } = {}) {
   return useQuery<T>({
     queryKey: key,
     queryFn: getting<T>(`${path}${qs({ ...spanParams(span), ...extra })}`),
-    refetchInterval: () => refreshFor(span, 60_000),
+    refetchInterval: () => refreshFor(span, !opts.unmemoised && spanLength(span) > 8 * 86400 ? 300_000 : 60_000),
     ...freshFor(span),
-    placeholderData: (prev, prevQuery) => (prevQuery && (keepAcrossChoices || onlySpanDiffers(prevQuery.queryKey, key)) ? prev : undefined),
+    placeholderData: (prev, prevQuery) => (prevQuery && (opts.keepAcrossChoices || onlySpanDiffers(prevQuery.queryKey, key)) ? prev : undefined),
   });
 }
 
@@ -904,7 +905,7 @@ export const useConnections = (span: TimeSpan, opts: { client?: Mac; failed?: bo
     "/api/connections",
     span,
     { client: opts.client, failed: opts.failed ? "true" : undefined, limit: opts.limit, roams: opts.roams === false ? "false" : undefined },
-    true,
+    { keepAcrossChoices: true, unmemoised: true },
   );
 
 export const useRoaming = (span: TimeSpan) => useSpanQuery<Roaming>(keys.roaming(span), "/api/roaming", span);
@@ -1024,10 +1025,10 @@ export const useMulticast = (span: TimeSpan, mac?: Mac) => useSpanQuery<SiteMult
 export const useRadios = (range: number) => useSpanQuery<RadioOverview[]>(keys.rfRadios(range), "/api/rf/radios", { last: range });
 
 export const useNeighbors = (range: number, band: string) =>
-  useSpanQuery<{ neighbors: Neighbor[] }>(keys.rfNeighbors(range, band), "/api/rf/neighbors", { last: range }, { band: bandParam(band), neighbors_only: "true" });
+  useSpanQuery<{ neighbors: Neighbor[] }>(keys.rfNeighbors(range, band), "/api/rf/neighbors", { last: range }, { band: bandParam(band), neighbors_only: "true" }, { unmemoised: true });
 
 /** Only how loudly our APs hear each other (no neighbour list). */
-export const useOwnLinks = (range: number) => useSpanQuery<{ own_links: OwnLink[] }>(keys.rfLinks(range), "/api/rf/neighbors", { last: range }, { links_only: "true" });
+export const useOwnLinks = (range: number) => useSpanQuery<{ own_links: OwnLink[] }>(keys.rfLinks(range), "/api/rf/neighbors", { last: range }, { links_only: "true" }, { unmemoised: true });
 
 /** `enabled` false waits, for a caller that doesn't know `dfs` yet. */
 export const useChannelPlan = (band: string, dfs: boolean, enabled = true) =>
