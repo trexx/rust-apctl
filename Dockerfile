@@ -19,6 +19,9 @@ RUN echo "registry of ${OUI_MONTH:-the first build}" \
     && wget -q -O /oui.csv https://standards-oui.ieee.org/oui/oui.csv \
     && head -1 /oui.csv | grep -q Assignment \
     && chmod 644 /oui.csv
+# The data directory, empty: the runtime image has no shell to make it. Owned by the
+# controller's user there, which Docker copies to a new named volume mounted on it.
+RUN mkdir -p /rootfs/data
 
 # --- controller ---
 # The dependencies build from the manifests alone, every crate's own source replaced by
@@ -77,6 +80,7 @@ ENTRYPOINT ["/bin/sh", "-c", "[ -p \"$FIFO\" ] || mkfifo -m 644 \"$FIFO\"; exec 
 FROM gcr.io/distroless/cc-debian12:nonroot AS runtime
 COPY --from=build /apctl /usr/local/bin/apctl
 COPY --from=oui /oui.csv /usr/share/apctl/oui.csv
+COPY --from=oui --chown=65532:65532 /rootfs/ /
 USER nonroot
 ENV APCTL_DATA_DIR=/data APCTL_LISTEN=0.0.0.0:8090
 EXPOSE 8090
