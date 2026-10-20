@@ -334,6 +334,8 @@ pub async fn adopt(State(s): State<AppState>, Json(b): Json<AdoptBody>) -> Resul
         "hostname": board_value(&board, "board.name"), "inform_url": url,
     });
     let fingerprint = session.fingerprint.clone();
+    // Held until the adoption is expected: no other adoption gives the AP a new key meanwhile.
+    let claim = crate::adopt::Claim::take(&s.live, mac)?;
     let cell = Arc::new(Mutex::new(None));
     let made = cell.clone();
     let edit = move |st: &mut Value| {
@@ -347,6 +349,7 @@ pub async fn adopt(State(s): State<AppState>, Json(b): Json<AdoptBody>) -> Resul
     // Expected from now on: the AP may inform with its key before the command returns.
     let adopting = crate::adopt::Adopting { since: clock::now_ts(), kept_key: !created };
     s.live.write().unwrap().adoption.adopting.insert(mac, adopting);
+    drop(claim);
     let out = match session.run(&format!("/usr/bin/syswrapper.sh set-adopt {} {}", shell_quote(&url), shell_quote(&key))).await {
         Ok(out) => out,
         // Back with its key already (that ends the adoption): it worked.

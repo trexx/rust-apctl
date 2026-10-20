@@ -14,9 +14,9 @@
 //! - Forget removes the AP from the settings. An AP still reporting gets
 //!   `{"_type":"setdefault"}` with its next inform and resets itself.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::net::{IpAddr, Ipv6Addr};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use axum::extract::State;
 use inform::Mac;
@@ -74,6 +74,33 @@ pub struct Adoption {
     pub adopting: HashMap<Mac, Adopting>,
     /// Forget pressed at: the AP gets `setdefault` with its next inform.
     pub forgetting: HashMap<Mac, Ts>,
+    /// APs whose adoption's record edit is under way (see [`Claim`]).
+    pub starting: HashSet<Mac>,
+}
+
+/// An adoption's record edit under way: while it is held, another adoption
+/// of the AP is refused. A second edit would give the AP a new key after the
+/// first one's key may have been handed out, which strands it. Released when
+/// dropped (which takes the `Live` lock: not while holding it).
+pub struct Claim<'a> {
+    live: &'a RwLock<Live>,
+    mac: Mac,
+}
+
+impl Claim<'_> {
+    /// Claims the AP, unless another adoption's record edit holds it already.
+    pub fn take(live: &RwLock<Live>, mac: Mac) -> Result<Claim<'_>, ApiError> {
+        if !live.write().unwrap().adoption.starting.insert(mac) {
+            return Err(ApiError::conflict("this AP is being adopted already"));
+        }
+        Ok(Claim { live, mac })
+    }
+}
+
+impl Drop for Claim<'_> {
+    fn drop(&mut self) {
+        self.live.write().unwrap().adoption.starting.remove(&self.mac);
+    }
 }
 
 /// An adoption under way.
@@ -431,14 +458,32 @@ pub async fn pending(State(s): State<AppState>) -> Json<Value> {
 /// POST /api/devices/{mac}/adopt: adopt a pending AP.
 pub async fn adopt(State(s): State<AppState>, MacPath(mac): MacPath) -> Result<Json<Value>, ApiError> {
     crate::api::require_active(&s, "adoption needs")?;
-    let payload = s.live.read().unwrap().adoption.pending.get(&mac).map(|p| p.payload.clone()).ok_or_else(|| ApiError::not_found("this AP is not waiting for adoption"))?;
+    // Taken out of the list before the edit, so that a second Adopt (or one
+    // over SSH) does not give the AP another key meanwhile.
+    let claim = Claim::take(&s.live, mac)?;
+    let pending = {
+        let mut live = s.live.write().unwrap();
+        let a = &mut live.adoption;
+        if a.adopting.get(&mac).is_some_and(|x| clock::now_ts() - x.since < ADOPT_TIMEOUT) {
+            return Err(ApiError::conflict("this AP is being adopted already"));
+        }
+        a.pending.remove(&mac).ok_or_else(|| ApiError::not_found("this AP is not waiting for adoption"))?
+    };
+    let payload = pending.payload.clone();
     let inform = payload.clone();
-    crate::actions::apply_edit(&s, Box::new(move |state: &mut Value| adopt_device(state, &mac, &inform))).await?;
+    let edited = crate::actions::apply_edit(&s, Box::new(move |state: &mut Value| adopt_device(state, &mac, &inform))).await;
     {
         let mut live = s.live.write().unwrap();
-        live.adoption.adopting.insert(mac, Adopting { since: clock::now_ts(), kept_key: false });
-        live.adoption.pending.remove(&mac);
+        if edited.is_ok() {
+            live.adoption.adopting.insert(mac, Adopting { since: clock::now_ts(), kept_key: false });
+            // Listed again by an inform during the edit: it is no longer waiting.
+            live.adoption.pending.remove(&mac);
+        } else {
+            live.adoption.pending.entry(mac).or_insert(pending);
+        }
     }
+    drop(claim);
+    edited?;
     s.note(Event::device(clock::now_ts(), EventKind::ApAdopting, mac, json!({ "model": payload["model"], "ip": payload["ip"] }))).await;
     Ok(Json(json!({ "adopting": true })))
 }
@@ -523,6 +568,18 @@ mod tests {
         assert_eq!(device_key(Some(&padded), &keys, &ap), device_key(Some(&s), &keys, &ap), "whitespace around a stored key is ignored");
         device_doc_mut(&mut padded, &ap).unwrap()["x_aes_gcm"] = json!(true);
         assert_eq!(device_key(Some(&padded), &keys, &ap).map(|k| k.1), Some(true), "the record's AES-GCM pin comes with it");
+    }
+
+    #[test]
+    fn one_adoption_edit_at_a_time_per_ap() {
+        let live = RwLock::new(Live::default());
+        let (ap, other): (Mac, Mac) = ("02:00:00:00:00:01".parse().unwrap(), "02:00:00:00:00:02".parse().unwrap());
+        let claim = Claim::take(&live, ap).ok().unwrap();
+        assert!(Claim::take(&live, ap).is_err(), "a second adoption waits for the first's edit");
+        let _other = Claim::take(&live, other).ok().unwrap();
+        drop(claim);
+        assert!(!live.read().unwrap().adoption.starting.contains(&ap));
+        assert!(Claim::take(&live, ap).is_ok());
     }
 
     #[tokio::test]
