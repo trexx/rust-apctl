@@ -9,6 +9,14 @@ pub mod exchange;
 pub mod keys;
 pub mod synth;
 
+use std::net::{IpAddr, SocketAddr};
+
+/// The address of an X-Forwarded-For hop: an address alone, with a port
+/// (`203.0.113.7:4711`, `[2001:db8::1]:4711`), or in brackets alone (`[2001:db8::1]`).
+pub fn hop_ip(hop: &str) -> Option<IpAddr> {
+    hop.parse::<IpAddr>().ok().or_else(|| hop.parse::<SocketAddr>().ok().map(|a| a.ip())).or_else(|| hop.strip_prefix('[')?.strip_suffix(']')?.parse().ok())
+}
+
 /// Civil date `(year, month, day)` of a day count since 1970-01-01, proleptic
 /// Gregorian (Howard Hinnant's `civil_from_days`).
 pub fn civil_from_days(days: i64) -> (i64, i64, i64) {

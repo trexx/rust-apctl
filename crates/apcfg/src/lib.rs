@@ -35,6 +35,7 @@ pub use json::oid;
 pub use system::MDNS_SERVICES;
 mod wlan;
 
+use std::borrow::Cow;
 use std::cell::OnceCell;
 
 use anyhow::{Context, Result, bail};
@@ -80,14 +81,19 @@ pub struct Input<'a> {
 }
 
 /// The fields of a `devices` document a render reads (the radios' settings are inside
-/// `radio_table`). Whatever imports device documents must keep at least these.
+/// `radio_table`; `table.field` is that field of each of a table's rows). Whatever
+/// imports device documents must keep at least these.
 pub const DEVICE_KEYS: &[&str] = &[
-    "mac", "site_id", "type", "name", "disabled", "radio_table", "inform_url", "migrate_inform_url", "x_authkey", "x_inform_authkey",
+    "mac", "site_id", "type", "name", "disabled", "radio_table", "inform_url", "migrate_inform_url", "x_authkey",
     "syslog_key", "config_network", "mgmt_network_id", "led_override", "led_override_color", "led_override_color_brightness",
     "outdoor_mode_override", "bandsteering_mode", "atf_enabled", "green_ap_enabled", "resetbtn_enabled", "jumboframe_enabled",
     "switch_vlan_enabled", "ethernet_table", "port_overrides", "snmp_location", "snmp_contact", "mesh_uplink_1", "mesh_uplink_2",
+    // Whether clients locked to this AP are kept off the others (false while it is offline).
+    "fixed_ap_available",
     // Capability bits, used until the AP's first inform.
     "fw_caps", "fw2_caps", "fw3_caps", "wifi_caps", "wifi_caps2", "hw_caps",
+    // A gateway's MACs (`Ctx::gateway_macs`): only these fields of each row.
+    "network_table.mac", "network_table.networkgroup", "vap_table.bssid", "vwire_vap_table.bssid",
 ];
 
 /// The top-level inform fields a render reads: the capability bits ([`Caps`]; until the
@@ -127,6 +133,11 @@ pub fn inform_inputs_match(inputs: &Value, inform: &Value) -> bool {
         })
 }
 
+/// The `setting` documents (by `key`) a render reads. The controller reads no others,
+/// so whatever imports settings needs only these: the rest (mail, cloud access and guest
+/// portal credentials, RADIUS secrets) would only spread secrets nothing uses.
+pub const SETTING_KEYS: &[&str] = &["mgmt", "super_mgmt", "super_identity", "radio_ai", "country", "locale", "connectivity", "rsyslogd", "snmp", "ntp"];
+
 /// The fields of a `clients` (user) document a render reads: blocked clients and
 /// clients locked to an AP.
 pub const CLIENT_KEYS: &[&str] = &["mac", "site_id", "blocked", "fixed_ap_enabled", "fixed_ap_mac"];
@@ -152,18 +163,18 @@ pub fn render(input: &Input) -> Result<Rendered> {
 
 pub fn render_with_meta(input: &Input) -> Result<Output> {
     let ctx = Ctx::new(input)?;
-    let mgmt_cfg = mgmt::render(&ctx);
+    let mgmt_cfg = mgmt::render(&ctx, None);
     let (system_cfg, config_meta) = system::render(&ctx)?;
     Ok(Output { rendered: Rendered { mgmt_cfg, system_cfg }, config_meta })
 }
 
 /// Only the `mgmt_cfg` of [`render`]: what adopts an AP. `inform_authkey` is the key
-/// (hex) the AP informs with when that is not the device's stored `x_inform_authkey`:
-/// an AP being adopted uses the factory key, so it is sent its own. What only
-/// `system_cfg` reads cannot make this fail.
+/// (hex) the AP informs with when that is not its own: an AP being adopted uses the
+/// factory key, so it is sent its own (an `authkey` line). What only `system_cfg` reads
+/// cannot make this fail.
 pub fn render_mgmt(input: &Input, inform_authkey: Option<&str>) -> Result<String> {
     let ctx = Ctx::new(input)?;
-    Ok(mgmt::render_with_key(&ctx, inform_authkey.or_else(|| json::str_of(ctx.device, "x_inform_authkey"))))
+    Ok(mgmt::render(&ctx, inform_authkey))
 }
 
 /// The `blocked_sta` value of a provisioning reply: MACs of the site's blocked clients,
@@ -423,7 +434,7 @@ pub(crate) struct Ctx<'a> {
     /// The radios' country code (`setting[country].code`, US when unset).
     pub country: String,
     /// See [`Ctx::gateway_macs`].
-    gateway_macs: OnceCell<Vec<String>>,
+    gateway_macs: OnceCell<Vec<Cow<'a, str>>>,
 }
 
 static NULL: Value = Value::Null;
@@ -483,15 +494,23 @@ impl<'a> Ctx<'a> {
         site_docs(self.state, self.site_id, collection)
     }
 
-    /// LAN MACs (lower case) of the site's gateways, looked up the first time a VAP's
-    /// broadcast filter asks for them.
-    pub fn gateway_macs(&self) -> &[String] {
+    /// The MACs the site's gateways send from, which every broadcast filter lets
+    /// through, as the official controller collects them for a gateway: its own, its LAN
+    /// networks' (`network_table`), its Ethernet interfaces' with their other MACs, and
+    /// the BSSIDs of its own SSIDs (`vap_table`'s lower case). Blank ones are left out,
+    /// duplicates are not. Looked up the first time a VAP's broadcast filter asks.
+    pub fn gateway_macs(&self) -> &[Cow<'a, str>] {
         self.gateway_macs.get_or_init(|| {
-            self.site_docs("devices")
-                .filter(|d| matches!(json::str_of(d, "type"), Some("ugw" | "udm" | "uxg")))
-                .filter_map(|d| json::str_of(d, "mac"))
-                .map(str::to_ascii_lowercase)
-                .collect()
+            let mut macs = Vec::new();
+            for gw in self.site_docs("devices").filter(|d| matches!(json::str_of(d, "type"), Some("ugw" | "udm" | "uxg"))) {
+                let lan = json::arr(gw, "network_table").iter().filter(|n| json::str_of(n, "networkgroup") == Some("LAN")).filter_map(|n| json::str_of(n, "mac"));
+                let eth = json::arr(gw, "ethernet_table").iter().flat_map(|e| json::str_of(e, "mac").into_iter().chain(json::str_list(e, "other_macs")));
+                let bssids = |table| json::arr(gw, table).iter().filter_map(|v| json::str_of(v, "bssid")).filter(|b| !b.trim().is_empty());
+                macs.extend(json::str_of(gw, "mac").into_iter().chain(lan).chain(eth).filter(|m| !m.trim().is_empty()).map(Cow::Borrowed));
+                macs.extend(bssids("vap_table").map(|b| Cow::Owned(b.to_lowercase())));
+                macs.extend(bssids("vwire_vap_table").map(Cow::Borrowed));
+            }
+            macs
         })
     }
 
@@ -550,7 +569,7 @@ mod tests {
     fn device_keys_cover_every_field_read() {
         let mut read: Vec<&str> = CAP_KEYS.to_vec();
         for src in SOURCES {
-            for pattern in ["ctx.device, \"", "ctx.device.get(\"", "(device, \""] {
+            for pattern in ["ctx.device, \"", "ctx.device.get(\"", "(device, \"", "(gw, \""] {
                 for (at, _) in src.match_indices(pattern) {
                     let rest = &src[at + pattern.len()..];
                     read.push(&rest[..rest.find('"').unwrap()]);
@@ -559,7 +578,28 @@ mod tests {
         }
         assert!(read.len() > 30, "the patterns still find the reads: {read:?}");
         for key in read {
-            assert!(DEVICE_KEYS.contains(&key), "`{key}` is read from the device document but missing from DEVICE_KEYS");
+            let kept = DEVICE_KEYS.iter().any(|k| *k == key || k.strip_prefix(key).is_some_and(|row| row.starts_with('.')));
+            assert!(kept, "`{key}` is read from the device document but missing from DEVICE_KEYS");
+        }
+    }
+
+    /// Every setting the sources read (`setting("…")` on the context, or with the state
+    /// and site) is in `SETTING_KEYS`.
+    #[test]
+    fn setting_keys_cover_every_setting_read() {
+        let mut read: Vec<&str> = Vec::new();
+        for src in SOURCES {
+            let src = src.split("#[cfg(test)]").next().unwrap();
+            for pattern in [".setting(\"", "setting(state, site_id, \""] {
+                for (at, _) in src.match_indices(pattern) {
+                    let rest = &src[at + pattern.len()..];
+                    read.push(&rest[..rest.find('"').unwrap()]);
+                }
+            }
+        }
+        assert!(read.len() >= 8, "the patterns still find the reads: {read:?}");
+        for key in read {
+            assert!(SETTING_KEYS.contains(&key), "setting `{key}` is read but missing from SETTING_KEYS");
         }
     }
 

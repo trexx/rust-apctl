@@ -197,7 +197,7 @@ mod tests {
     fn an_ap_replays_with_the_key_it_was_captured_with_and_says_whether_that_is_the_factory_one() {
         let mac: Mac = "02:00:00:00:00:01".parse().unwrap();
         let mut keys = KeyStore::default();
-        let decoded = |keys: &KeyStore, key: &[u8; 16]| wire::decode::decode(&inform::seal(mac, Flags::ENCRYPTED | Flags::GCM, [1; 16], key, br#"{"default":false}"#), keys, None).unwrap();
+        let decoded = |keys: &KeyStore, key: &[u8; 16]| wire::decode::decode(&inform::seal(mac, Flags::ENCRYPTED | Flags::GCM, [1; 16], key, br#"{"default":false}"#), keys).unwrap();
         // A factory-reset AP: no stored key needed.
         assert_eq!(captured_key(&decoded(&keys, &inform::DEFAULT_KEY), &keys), inform::DEFAULT_KEY);
         keys.insert_for(mac, "000102030405060708090a0b0c0d0e0f").unwrap();

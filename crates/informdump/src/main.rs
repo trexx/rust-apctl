@@ -266,7 +266,7 @@ fn main() -> Result<()> {
                 let mac = inform::Header::parse(&body)?.mac;
                 store.insert_for(mac, &k)?;
             }
-            let d = wire::decode::decode(&body, &store, None)?;
+            let d = wire::decode::decode(&body, &store)?;
             eprintln!("{:#?}\nkey used: {:?}", d.header, d.key);
             println!("{}", report::escape_controls(&serde_json::to_string_pretty(&d.payload)?, true));
             Ok(())

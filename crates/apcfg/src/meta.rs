@@ -204,13 +204,13 @@ impl Meta {
     /// Port indices of one bridge's ports, given in insertion order. Ports that already
     /// had an index come first (in insertion order), then the newly numbered ones; that
     /// is the order the official controller writes them in.
-    pub fn ports<'d>(&mut self, bridge: &str, devs: &'d [String]) -> Vec<(&'d str, u32)> {
+    pub fn ports<'d>(&mut self, bridge: &str, devs: &'d [impl AsRef<str>]) -> Vec<(&'d str, u32)> {
         let old: Vec<Option<u32>> =
-            devs.iter().map(|dev| self.old_ports.iter().find(|(b, d, _)| b == bridge && d == dev).map(|(_, _, i)| *i)).collect();
+            devs.iter().map(|dev| self.old_ports.iter().find(|(b, d, _)| b == bridge && d == dev.as_ref()).map(|(_, _, i)| *i)).collect();
         let nums = allocate(old.iter().copied(), 1);
         let mut out = Vec::with_capacity(devs.len());
         for fresh in [false, true] {
-            out.extend(devs.iter().zip(&old).zip(&nums).filter(|((_, o), _)| o.is_none() == fresh).map(|((d, _), &i)| (d.as_str(), i)));
+            out.extend(devs.iter().zip(&old).zip(&nums).filter(|((_, o), _)| o.is_none() == fresh).map(|((d, _), &i)| (d.as_ref(), i)));
         }
         self.ports.extend(out.iter().map(|&(d, i)| (bridge.to_string(), d.to_string(), i)));
         out

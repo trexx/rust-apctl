@@ -91,7 +91,9 @@ if [ $test = 1 ]; then
   for check in "${checks[@]}"; do
     echo "== $check"
     if ! $check >"$log" 2>&1; then
-      grep -E "FAILED|panicked|error|warning" "$log" | head -20 >&2
+      # No pipe into head: under pipefail, grep killed by SIGPIPE (or matching nothing)
+      # would end the script before it says which check failed.
+      grep -m 20 -E "FAILED|panicked|error|warning" "$log" >&2 || true
       echo "failed: $check (full output: $log)" >&2
       exit 1
     fi

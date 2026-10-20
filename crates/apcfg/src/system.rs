@@ -246,18 +246,23 @@ fn bandsteering(c: &mut Cfg, ctx: &Ctx, radios: &[Radio], vaps: &[Vap]) {
 }
 
 /// One VAP's MAC ACL: device, policy and `(mac, type)` entries.
-type AclBlock<'a> = (&'a str, &'a str, Vec<(Cow<'a, str>, &'static str)>);
+type AclBlock<'a> = (&'a str, &'a str, Vec<(&'a str, &'static str)>);
 
+/// MACs are written and compared as stored, as the official controller does (the
+/// settings editor stores them lower case).
 fn mac_acl(c: &mut Cfg, ctx: &Ctx, vaps: &[Vap]) {
-    // Clients pinned ("lock to AP") to some other AP may not join this one.
-    let locked_elsewhere: Vec<String> = ctx
-        .site_docs("clients")
-        .filter(|u| flag(u, "fixed_ap_enabled", false))
-        .filter(|u| str_of(u, "fixed_ap_mac").is_some_and(|m| !mac_eq(m, &ctx.mac)))
-        .filter_map(|u| str_of(u, "mac"))
-        .map(str::to_ascii_lowercase)
-        .collect();
-    let locked_elsewhere = hash_set_order(&locked_elsewhere);
+    // Clients pinned ("lock to AP") to some other AP may not join this one, while that AP
+    // is known and available: a lock to an AP that is offline (`fixed_ap_available` false)
+    // or not in the state is not enforced, so its clients can use the other APs meanwhile.
+    let available = |ap: &str| {
+        arr(ctx.state, "devices").iter().find(|device| str_of(device, "mac").is_some_and(|m| mac_eq(m, ap))).is_some_and(|device| flag(device, "fixed_ap_available", true))
+    };
+    let locked_elsewhere = hash_set_order(
+        ctx.site_docs("clients")
+            .filter(|u| flag(u, "fixed_ap_enabled", false))
+            .filter(|u| str_of(u, "fixed_ap_mac").is_some_and(|m| !m.is_empty() && !mac_eq(m, &ctx.mac) && available(m)))
+            .filter_map(|u| str_of(u, "mac")),
+    );
     let locked: HashSet<&str> = locked_elsewhere.iter().copied().collect();
     let mut blocks: Vec<AclBlock> = Vec::new();
     for v in vaps {
@@ -266,20 +271,23 @@ fn mac_acl(c: &mut Cfg, ctx: &Ctx, vaps: &[Vap]) {
             continue;
         }
         let policy = if filtering { str_of(&v.w, "mac_filter_policy").unwrap_or("deny") } else { "deny" };
-        let mut entries: Vec<(Cow<str>, &'static str)> = Vec::new();
-        if filtering {
-            entries.extend(
-                str_list(&v.w, "mac_filter_list")
-                    .map(|m| m.to_ascii_lowercase())
-                    .filter(|m| policy != "allow" || !locked.contains(m.as_str()))
-                    .map(|m| (Cow::Owned(m), "user")),
-            );
-        }
-        if policy == "deny" {
-            let listed: HashSet<&str> = entries.iter().map(|(e, _)| e.as_ref()).collect();
-            let unlisted: Vec<&str> = locked_elsewhere.iter().copied().filter(|m| !listed.contains(m)).collect();
-            entries.extend(unlisted.into_iter().map(|m| (Cow::Borrowed(m), "lock2ap")));
-        }
+        let entries: Vec<(&str, &'static str)> = if !filtering {
+            locked_elsewhere.iter().map(|&m| (m, "lock2ap")).collect()
+        } else {
+            // The user's list once per MAC, first occurrence kept.
+            let mut listed = HashSet::new();
+            let user: Vec<&str> = str_list(&v.w, "mac_filter_list").filter(|m| listed.insert(*m)).collect();
+            match policy {
+                "allow" => user.into_iter().filter(|m| !locked.contains(m)).map(|m| (m, "user")).collect(),
+                // Both lists grouped by MAC (the user's entry kept) in a Java HashMap's order.
+                "deny" => hash_set_order(user.into_iter().chain(locked_elsewhere.iter().copied()))
+                    .into_iter()
+                    .map(|m| (m, if listed.contains(m) { "user" } else { "lock2ap" }))
+                    .collect(),
+                // An unknown policy: the official controller logs it and lists nothing.
+                _ => Vec::new(),
+            }
+        };
         blocks.push((v.dev(), policy, entries));
     }
     c.header("mac acl");
@@ -301,13 +309,20 @@ fn mac_acl(c: &mut Cfg, ctx: &Ctx, vaps: &[Vap]) {
 
 /// The AP's host name: device name reduced to `[0-9A-Za-z-]`, `+` spelled out.
 pub fn hostname(name: &str) -> String {
-    let mut s = name.to_string();
-    if let Some(stripped) = s.strip_suffix('+') {
-        s = format!("{stripped}-Plus");
+    let (body, end) = name.strip_suffix('+').map_or((name, ""), |b| (b, "-Plus"));
+    let mut s = String::with_capacity(name.len() + end.len());
+    for ch in body.chars() {
+        match ch {
+            '+' => s.push_str("-Plus-"),
+            _ if ch.is_ascii_alphanumeric() || ch == '-' => s.push(ch),
+            _ => {}
+        }
     }
-    s = s.replace('+', "-Plus-");
-    let s: String = s.chars().filter(|ch| ch.is_ascii_alphanumeric() || *ch == '-').collect();
-    s.trim_start_matches('-').chars().take(31).collect()
+    s.push_str(end);
+    // ASCII only from here: bytes are characters.
+    s.drain(..s.len() - s.trim_start_matches('-').len());
+    s.truncate(31);
+    s
 }
 
 /// `dhcpc`, `route` and `resolv`.
@@ -348,9 +363,11 @@ fn addressing(c: &mut Cfg, ctx: &Ctx) {
 fn syslog(c: &mut Cfg, ctx: &Ctx) {
     let s = ctx.setting("rsyslogd");
     let enabled = flag(s, "enabled", false);
-    let this = flag(s, "this_controller", false);
+    // "To this controller" counts only while remote syslog is on: switched off, the
+    // stored `this_controller` is kept but sends nothing.
+    let this = enabled && flag(s, "this_controller", false);
     let encrypted_only = flag(s, "this_controller_encrypted_only", false);
-    if enabled && this && encrypted_only && !ctx.caps.has(Cap::EncryptedSyslog) {
+    if this && encrypted_only && !ctx.caps.has(Cap::EncryptedSyslog) {
         return;
     }
     let wants_ap_logs = flag(s, "log_all_contents", false) || str_list(s, "contents").any(|c| c == "access_points");
@@ -781,6 +798,31 @@ mod tests {
         c.finish().lines().filter(|l| l.starts_with("switch.port.")).map(str::to_string).collect()
     }
 
+    fn syslog_lines(rsyslogd: Value) -> String {
+        let mac = "02:00:00:00:00:01";
+        let mut rsyslogd = rsyslogd;
+        rsyslogd["key"] = json!("rsyslogd");
+        let state = json!({ "sites": [{ "_id": "s" }], "setting": [rsyslogd], "devices": [{ "mac": mac, "site_id": "s", "type": "uap", "syslog_key": "k" }] });
+        let controller = Controller::default();
+        let inform = json!({ "inform_ip": "192.0.2.1" });
+        let ctx = Ctx::new(&Input { state: &state, device_mac: mac, inform: Some(&inform), cfgversion: "1", controller: &controller }).unwrap();
+        let mut c = Cfg::default();
+        syslog(&mut c, &ctx);
+        c.finish()
+    }
+
+    /// Remote syslog switched off keeps its "this controller" choice stored, but sends
+    /// neither the encrypted syslog nor the netconsole toward the controller.
+    #[test]
+    fn syslog_off_sends_nothing_to_this_controller() {
+        let on = syslog_lines(json!({ "enabled": true, "this_controller": true }));
+        assert!(on.contains("syslog.remote.encrypt=enabled\nsyslog.remote.key=k\n") && on.contains("netconsole.host=192.0.2.1\n"), "{on}");
+        let off = syslog_lines(json!({ "enabled": false, "this_controller": true }));
+        assert_eq!(off, "# syslog\nsyslog.status=enabled\nsyslog.level=7\n");
+        let off_netconsole = syslog_lines(json!({ "enabled": false, "this_controller": true, "netconsole_enabled": true, "netconsole_host": "192.0.2.9", "netconsole_port": "6666" }));
+        assert!(off_netconsole.ends_with("syslog.level=7\nnetconsole.host=192.0.2.9\nnetconsole.port=6666\nnetconsole.status=enabled\n"), "{off_netconsole}");
+    }
+
     #[test]
     fn switch_ports_are_clamped_and_named_by_their_first_override() {
         let overrides = json!([
@@ -814,5 +856,10 @@ mod tests {
         assert_eq!(hostname("Garage AP"), "GarageAP");
         assert_eq!(hostname("U6+"), "U6-Plus");
         assert_eq!(hostname("-a+b"), "a-Plus-b");
+        assert_eq!(hostname("a++"), "a-Plus--Plus");
+        assert_eq!(hostname("+"), "Plus");
+        assert_eq!(hostname("--Büro Süd/2"), "BroSd2");
+        assert_eq!(hostname(&"x".repeat(40)), "x".repeat(31));
+        assert_eq!(hostname("ü+"), "Plus");
     }
 }
