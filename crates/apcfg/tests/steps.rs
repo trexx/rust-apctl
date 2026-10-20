@@ -260,3 +260,51 @@ fn mdns_auto_list_and_ap_scope() {
     assert!(on_b.contains("mdns_sd.filter.1.vlan") && services(&on_b) == 0, "nothing proxied on AP B");
     assert_eq!(services(&on_u), 3, "Chromecast (2 types) and Spotify on AP U");
 }
+
+/// Deleting a radio's first SSID while another stays on that radio (the captures only
+/// delete a virtual VAP): the one that stays keeps its VAP name and on-radio index but
+/// takes over the radio's main `devname`/`status` lines. A WLAN added later at on-radio
+/// index 0 takes them back, so the radio never has two main VAPs or none.
+#[test]
+fn deleting_a_radios_first_ssid_moves_its_main_lines() {
+    let Some(_) = common::fixtures() else { return };
+    // AP B's 2.4 GHz radio (`radio.1`) carries only ssid-6, at on-radio index 0.
+    const FIRST_2G: &str = "00000000000000000000003d";
+    let main_lines = |cfg: &str| cfg.lines().filter(|l| l.starts_with("radio.1.devname=") || l.starts_with("radio.1.status=")).count();
+    let virtual_devs = |cfg: &str| cfg.lines().filter(|l| l.starts_with("radio.1.virtual.") && l.contains(".devname=")).map(str::to_string).collect::<Vec<_>>();
+    let first_2g = |meta: &Value| -> Vec<(String, u64, bool)> {
+        meta["wireless"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|w| w["radio_name"] == "wifi0")
+            .map(|w| (w["id_or_name"].as_str().unwrap().to_string(), w["vap_index_on_radio"].as_u64().unwrap(), w["first_on_radio"].as_bool().unwrap()))
+            .collect()
+    };
+
+    let mut s = state();
+    apply(1, &mut s);
+    let out = render(&s, AP_B, "0");
+    assert_eq!(first_2g(&out.config_meta), [(FIRST_2G.to_string(), 0, true), (TEST_WLAN_ID.to_string(), 1, false)]);
+    store_meta(&mut s, AP_B, out.config_meta);
+
+    s["wlanconf"].as_array_mut().unwrap().retain(|w| w["_id"]["$oid"] != FIRST_2G);
+    let out = render(&s, AP_B, "0");
+    let cfg = &out.rendered.system_cfg;
+    assert_eq!(first_2g(&out.config_meta), [(TEST_WLAN_ID.to_string(), 1, true)]);
+    assert_eq!(main_lines(cfg), 2, "{cfg}");
+    assert!(virtual_devs(cfg).is_empty(), "{:?}", virtual_devs(cfg));
+    store_meta(&mut s, AP_B, out.config_meta);
+
+    let mut new = test_wlan();
+    new["_id"] = json!({"$oid": "0000000000000000000000f3"});
+    new["name"] = json!("ssid-9");
+    new["wlan_bands"] = json!(["2g"]);
+    s["wlanconf"].as_array_mut().unwrap().push(new);
+    let out = render(&s, AP_B, "0");
+    let cfg = &out.rendered.system_cfg;
+    assert_eq!(first_2g(&out.config_meta), [(TEST_WLAN_ID.to_string(), 1, false), ("0000000000000000000000f3".to_string(), 0, true)]);
+    assert_eq!(main_lines(cfg), 2, "{cfg}");
+    assert_eq!(virtual_devs(cfg).len(), 1, "{:?}", virtual_devs(cfg));
+    assert!(virtual_devs(cfg)[0].starts_with("radio.1.virtual.1.devname="));
+}
