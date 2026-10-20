@@ -4,8 +4,8 @@ import react, { reactCompilerPreset } from "@vitejs/plugin-react";
 import babel from "@rolldown/plugin-babel";
 
 // The React Compiler leaves a component it can't compile as it is, without a
-// word (with Babel 8, even for a default value in destructured props). The
-// build lists them and fails, except where a rule is disabled on purpose.
+// word (with Babel 8, even for a default value in destructured props, or a
+// component with a hooks lint rule disabled in it). The build lists them and fails.
 const skipped: string[] = [];
 const compiler = reactCompilerPreset({
   logger: {
@@ -22,7 +22,6 @@ const compiler = reactCompilerPreset({
         | { reason?: string; options?: { reason?: string } }
         | undefined;
       const why = String(d?.reason ?? d?.options?.reason ?? e.detail);
-      if (why.includes("ESLint rules were disabled")) return;
       skipped.push(`${file}:${e.fnLoc?.start?.line ?? "?"}: ${why}`);
     },
   },
@@ -30,6 +29,10 @@ const compiler = reactCompilerPreset({
 const compilerCheck: Plugin = {
   name: "react-compiler-check",
   apply: "build",
+  // Each build (a rebuild under --watch too) reports only what it skipped.
+  buildStart() {
+    skipped.length = 0;
+  },
   buildEnd() {
     if (skipped.length)
       this.error(`React Compiler skipped:\n${skipped.join("\n")}`);

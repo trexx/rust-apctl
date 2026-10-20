@@ -11,7 +11,14 @@ import {
   useCanEdit,
 } from "../api";
 import type { BackupManifest, BackupMeta, BackupSettings } from "../api";
-import { ago, bytes, dateTime as when, hhmm, useNow } from "../format";
+import {
+  ago,
+  bytes,
+  dateTime as when,
+  hhmm,
+  minutesOf,
+  useNow,
+} from "../format";
 import { Outcome, QueryNote, THead, Toggle, useRunner } from "./common";
 import { FileButton } from "./FileButton";
 import { NumberInput, Select, TimeInput } from "./settings/form";
@@ -73,8 +80,7 @@ const toLocal = (s: BackupSettings) => {
   return { time: hhmm(t.minute), weekday: mod(s.weekday + t.days, 7) };
 };
 const fromLocal = (time: string, weekday: number) => {
-  const [h = 0, m = 0] = time.split(":").map(Number);
-  const t = shift(h * 60 + m, -offsetMin());
+  const t = shift(minutesOf(time), -offsetMin());
   return { minute_utc: t.minute, weekday: mod(weekday + t.days, 7) };
 };
 /** The schedule as apctl keeps it, in UTC. */

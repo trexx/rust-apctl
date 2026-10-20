@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { hhmm as time } from "../../../format";
+import { hhmm as time, minutesOf } from "../../../format";
 import { TextInput, TimeInput, Toggle, toggled } from "../form";
 import type { Blackout } from "../../../api";
 
@@ -12,11 +12,6 @@ const WEEK_LABEL: Record<(typeof WEEK)[number], string> = {
   thu: "Th",
   fri: "Fr",
   sat: "Sa",
-};
-
-const minutes = (t: string) => {
-  const [h, m] = t.split(":").map(Number);
-  return (h || 0) * 60 + (m || 0);
 };
 
 /** Blackout periods: when the SSID is off. An end at or before the start runs past midnight. */
@@ -77,7 +72,7 @@ export function ScheduleEditor({
                 <TimeInput
                   value={time(start)}
                   onChange={(t) => {
-                    const s = minutes(t);
+                    const s = minutesOf(t);
                     update(i, {
                       start_hour: Math.floor(s / 60),
                       start_minute: s % 60,
@@ -93,7 +88,7 @@ export function ScheduleEditor({
                   onChange={(t) =>
                     update(i, {
                       duration_minutes:
-                        (minutes(t) - start + 1440) % 1440 || 1440,
+                        (minutesOf(t) - start + 1440) % 1440 || 1440,
                     })
                   }
                 />

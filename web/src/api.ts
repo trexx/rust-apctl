@@ -1,6 +1,7 @@
 import { useEffect } from "react";
 import { hashKey, keepPreviousData, useQuery, useQueryClient } from "@tanstack/react-query";
 import type { QueryKey } from "@tanstack/react-query";
+import { canonicalMac } from "./format";
 
 export type Mac = string;
 
@@ -457,7 +458,7 @@ export const keys = {
   clients: family("clients"),
   clientNames: family("client-names"),
   client: family<[mac: Mac]>("client"),
-  series: family<[table: string, key: string, span: TimeSpan]>("series"),
+  series: family<[table: string, key: string, span: TimeSpan, fields: string]>("series"),
   events: family<[filter: EventFilter]>("events"),
   logs: family<[filter: LogFilter]>("logs"),
   alerts: family("alerts"),
@@ -759,15 +760,16 @@ const onlySpanDiffers = (a: QueryKey, b: QueryKey) => hashKey([a[0], ...a.slice(
 /**
  * A query over a time span: refreshes while the span is live, and keeps the old data on screen (`isPlaceholderData`) while
  * another span loads. Another choice (a band, an AP) shows as loading instead, unless `keepAcrossChoices`, for a caller that
- * dims the old data while it shows it.
+ * dims the old data while it shows it. The server keeps a view's answer for a window longer than 8 days for 5 minutes, so such
+ * a window is asked again only that often, unless the view is `unmemoised`.
  */
-function useSpanQuery<T>(key: QueryKey, path: string, span: TimeSpan, extra: Record<string, string | number | undefined> = {}, keepAcrossChoices = false) {
+function useSpanQuery<T>(key: QueryKey, path: string, span: TimeSpan, extra: Record<string, string | number | undefined> = {}, opts: { keepAcrossChoices?: boolean; unmemoised?: boolean } = {}) {
   return useQuery<T>({
     queryKey: key,
     queryFn: getting<T>(`${path}${qs({ ...spanParams(span), ...extra })}`),
-    refetchInterval: () => refreshFor(span, 60_000),
+    refetchInterval: () => refreshFor(span, !opts.unmemoised && spanLength(span) > 8 * 86400 ? 300_000 : 60_000),
     ...freshFor(span),
-    placeholderData: (prev, prevQuery) => (prevQuery && (keepAcrossChoices || onlySpanDiffers(prevQuery.queryKey, key)) ? prev : undefined),
+    placeholderData: (prev, prevQuery) => (prevQuery && (opts.keepAcrossChoices || onlySpanDiffers(prevQuery.queryKey, key)) ? prev : undefined),
   });
 }
 
@@ -904,7 +906,7 @@ export const useConnections = (span: TimeSpan, opts: { client?: Mac; failed?: bo
     "/api/connections",
     span,
     { client: opts.client, failed: opts.failed ? "true" : undefined, limit: opts.limit, roams: opts.roams === false ? "false" : undefined },
-    true,
+    { keepAcrossChoices: true, unmemoised: true },
   );
 
 export const useRoaming = (span: TimeSpan) => useSpanQuery<Roaming>(keys.roaming(span), "/api/roaming", span);
@@ -1024,10 +1026,10 @@ export const useMulticast = (span: TimeSpan, mac?: Mac) => useSpanQuery<SiteMult
 export const useRadios = (range: number) => useSpanQuery<RadioOverview[]>(keys.rfRadios(range), "/api/rf/radios", { last: range });
 
 export const useNeighbors = (range: number, band: string) =>
-  useSpanQuery<{ neighbors: Neighbor[] }>(keys.rfNeighbors(range, band), "/api/rf/neighbors", { last: range }, { band: bandParam(band), neighbors_only: "true" });
+  useSpanQuery<{ neighbors: Neighbor[] }>(keys.rfNeighbors(range, band), "/api/rf/neighbors", { last: range }, { band: bandParam(band), neighbors_only: "true" }, { unmemoised: true });
 
 /** Only how loudly our APs hear each other (no neighbour list). */
-export const useOwnLinks = (range: number) => useSpanQuery<{ own_links: OwnLink[] }>(keys.rfLinks(range), "/api/rf/neighbors", { last: range }, { links_only: "true" });
+export const useOwnLinks = (range: number) => useSpanQuery<{ own_links: OwnLink[] }>(keys.rfLinks(range), "/api/rf/neighbors", { last: range }, { links_only: "true" }, { unmemoised: true });
 
 /** `enabled` false waits, for a caller that doesn't know `dfs` yet. */
 export const useChannelPlan = (band: string, dfs: boolean, enabled = true) =>
@@ -1098,17 +1100,18 @@ function appendSeries(prev: Series, add: Series, from: number): Series {
 }
 
 /**
- * Time-series for one entity over a time span. A live chart of raw samples
+ * Time-series for one entity over a time span: only the columns `fields` names (the charts draw). A live chart of raw samples
  * (up to 6 hours) asks only for what is newer than its last sample.
  */
-export function useSeries(table: string, key: string, span: TimeSpan) {
+export function useSeries(table: string, key: string, span: TimeSpan, fields: readonly string[]) {
   const qc = useQueryClient();
-  const queryKey = keys.series(table, key, span);
+  const only = fields.join(",");
+  const queryKey = keys.series(table, key, span, only);
   return useQuery({
     queryKey,
     queryFn: async ({ signal }) => {
       const [from, to] = spanBounds(span);
-      const url = (from: number) => `/api/series/${table}${qs({ key, from, to })}`;
+      const url = (from: number) => `/api/series/${table}${qs({ key, fields: only, from, to })}`;
       const prev = isFixed(span) ? undefined : qc.getQueryData<Series>(queryKey);
       const last = prev?.tier === "raw" ? prev.ts.at(-1) : undefined;
       if (prev && last !== undefined && last >= from) {
@@ -1165,8 +1168,8 @@ export const useEvents = (filter: EventFilter) => useNewestList<AppEvent>(keys.e
 
 export const useLogs = (filter: LogFilter) => useNewestList<LogLine>(keys.logs(filter), "/api/logs", filter, 500);
 
-/** A filter's MAC against a message's, as the server compares them (it normalises the filter). */
-const sameMac = (filter: Mac | undefined, mac: Mac | null) => !filter || filter.toLowerCase() === mac?.toLowerCase();
+/** A filter's MAC against a message's (canonical), as the server compares them: it reads the filter in any form it accepts. */
+const sameMac = (filter: Mac | undefined, mac: Mac | null) => !filter || canonicalMac(filter) === mac;
 
 /** Whether a list fetched with `f` would show the event, filtered as the server does: MACs exactly, kinds by comma-separated prefixes. */
 function eventMatches(f: EventFilter, e: { kind: string; device_mac: Mac | null; client_mac: Mac | null }): boolean {
@@ -1310,18 +1313,21 @@ export function useLiveUpdates(): void {
           // Only the overview's cards use the whole list; the names have their own query.
           invalidate(keys.devices(), 4000);
           invalidate(keys.device(msg.mac));
+          // A client page changes when its AP reports (or with an event for the client, below).
+          for (const q of qc.getQueryCache().findAll({ queryKey: keys.client(), type: "active" }))
+            if ((q.state.data as ClientDetail | undefined)?.sample.ap_mac === msg.mac) invalidate(q.queryKey, 4000);
           break;
         case "clients":
           // Sent with every report that has clients, without saying which changed. The list holds every
-          // client of the past year, so it follows more slowly; at most one client page is open.
+          // client of the past year, so it follows more slowly.
           invalidate(keys.clients(), 20_000);
-          invalidate(keys.client(), 4000);
           break;
         case "event": {
           const e = msg;
           invalidateWhere<EventFilter>(keys.events(), (f) => eventMatches(f, e), 2000);
           if (msg.kind === "dryrun_compared" || msg.kind === "settings_imported") {
-            invalidate(keys.dryrun());
+            // Each AP pushed to records one, and every fetch renders and compares every AP's config: follow at most every 5 s.
+            invalidate(keys.dryrun(), 5000);
             invalidate(keys.settingsState());
           }
           // An editor keeps what it was opened with (it saves only the fields changed in it); the rest follows.
@@ -1335,6 +1341,8 @@ export function useLiveUpdates(): void {
           }
           if (msg.kind === "channel_plan") invalidate(keys.channelAi());
           if (msg.kind === "network_threat") invalidate(keys.threats());
+          // Connected, gone, roamed, renamed, blocked: its page shows it.
+          if (msg.client_mac) invalidate(keys.client(msg.client_mac));
           if (msg.kind === "client_renamed") invalidate(keys.clientNames());
           // A client without a name may have reported one as it connected.
           else if (msg.kind === "client_connected" && msg.client_mac && !qc.getQueryData<Names>(keys.clientNames())?.[msg.client_mac])

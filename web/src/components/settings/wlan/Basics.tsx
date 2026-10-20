@@ -7,6 +7,11 @@ import { PROTECTION } from "./form";
 import type { Protection, WlanSection } from "./form";
 import { SpeedLimitRow } from "./SpeedLimitRow";
 
+/** The network purposes an SSID can be put on. */
+const LAN_PURPOSES = ["corporate", "guest", "vlan-only"];
+/** The VLAN of the gateway's inter-VLAN routing network. */
+const INTER_VLAN_ROUTING = 4040;
+
 /** The stored passphrase, fetched when asked for. */
 function ShowPassphrase({ id }: { id: string }) {
   const [shown, setShown] = useState<string | null>(null);
@@ -50,13 +55,27 @@ export function Basics({
     set("wlan_bands", toggled(bands, b, on));
   const aps = f.aps;
   const iot = f.enhanced_iot === true;
+  // As the official UI offers them: the LAN networks, not a WAN or VPN one
+  // (a gateway's settings have those) or the inter-VLAN routing network.
+  const networks = list.networks.filter(
+    (n) =>
+      (n.purpose === null || LAN_PURPOSES.includes(n.purpose)) &&
+      Number(n.vlan) !== INTER_VLAN_ROUTING,
+  );
+  const network = f.networkconf_id;
+  const strayNetwork = !!network && !networks.some((n) => n.id === network);
   return (
     <>
       <Row label="Name (SSID)">
         <TextInput {...bind("name")} maxLength={32} />
       </Row>
       <Row label="Status">
-        <Toggle {...bind("enabled")} label="Enabled" />
+        {/* Unset is on, as the APs are told. */}
+        <Toggle
+          {...bind("enabled")}
+          value={f.enabled !== false}
+          label="Enabled"
+        />
         <Toggle
           {...bind("hide_ssid")}
           label="Hidden (not in the network list)"
@@ -64,17 +83,13 @@ export function Basics({
       </Row>
       <Row label="Security">
         <Select
-          value={f.protection ?? ""}
-          onChange={(v) => setProtection(v || null)}
-          options={[
-            // Shown, not chosen: the SSID's security is one this editor doesn't offer.
-            ...(f.protection === null
-              ? [["", "(other, set elsewhere)", true] as const]
-              : []),
-            ...PROTECTION.map(
-              ([v, l]) => [v, l, iot && v !== "wpa2" && v !== "open"] as const,
-            ),
-          ]}
+          value={f.protection}
+          onChange={setProtection}
+          // Shown, not chosen: the SSID's security is one this editor doesn't offer.
+          stray={() => "(other, set elsewhere)"}
+          options={PROTECTION.map(
+            ([v, l]) => [v, l, iot && v !== "wpa2" && v !== "open"] as const,
+          )}
         />
       </Row>
       {f.protection !== "open" && (
@@ -127,12 +142,17 @@ export function Basics({
           />
         )}
       </Row>
-      {list.networks.length > 1 && (
+      {(networks.length > 1 || strayNetwork) && (
         <Row label="Network">
           <Select
             {...bind("networkconf_id")}
-            fallback=""
-            options={list.networks.map(
+            // A new SSID goes on the server's default network.
+            stray={(v) => {
+              const name = list.networks.find((n) => n.id === v)?.name;
+              if (name) return `${name} (not for SSIDs)`;
+              return v ? "(unknown network)" : "(the default network)";
+            }}
+            options={networks.map(
               (n) =>
                 [
                   n.id,

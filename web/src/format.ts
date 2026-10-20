@@ -46,6 +46,12 @@ export const dateTime = (ts: number) => dateTimeFmt.format(new Date(ts * 1000));
 export const hhmm = (minutes: number) =>
   `${String(Math.floor(minutes / 60) % 24).padStart(2, "0")}:${String(minutes % 60).padStart(2, "0")}`;
 
+/** Minutes after midnight for "HH:MM" (a time input's value), the inverse of `hhmm`. */
+export const minutesOf = (hhmm: string) => {
+  const [h = 0, m = 0] = hhmm.split(":").map(Number);
+  return h * 60 + m;
+};
+
 /** The local date of `now`, worked out once for all the times a list shows with the same `now`. */
 let dayOfNow = { now: NaN, day: "" };
 function dayOf(now: number): string {

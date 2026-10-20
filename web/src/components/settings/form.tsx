@@ -133,12 +133,18 @@ export type Option<T> = readonly [
   disabled?: boolean,
 ];
 
-/** A drop-down over typed values; `fallback` is shown while the value is unset. */
+/**
+ * A drop-down over typed values; `fallback` is shown while the value is unset.
+ * A value none of the options has is shown as it is, first (labelled by
+ * `stray`, else as the value's text), not as the first option: the browser
+ * would show that one, and picking it would change nothing.
+ */
 export function Select<T extends string | number>({
   value,
   fallback,
   options,
   onChange,
+  stray,
   disabled,
   "aria-label": label,
 }: {
@@ -146,20 +152,30 @@ export function Select<T extends string | number>({
   fallback?: T;
   options: readonly Option<T>[];
   onChange: (v: T) => void;
+  /** The label of a value no option has (`""` when unset). */
+  stray?: (v: string) => ReactNode;
   disabled?: boolean;
   "aria-label"?: string;
 }) {
   const named = useRowLabel(label);
+  const current = String(value ?? fallback ?? "");
+  const known = options.some(([v]) => String(v) === current);
   return (
     <select
       {...named}
-      value={String(value ?? fallback ?? "")}
+      value={current}
       disabled={disabled}
       onChange={(e) => {
         const o = options.find(([v]) => String(v) === e.target.value);
         if (o) onChange(o[0]);
       }}
     >
+      {/* Shown only while it is the value: picking another option takes it away. */}
+      {!known && (
+        <option value={current}>
+          {stray ? stray(current) : current || "(not set)"}
+        </option>
+      )}
       {options.map(([v, label, off]) => (
         <option key={v} value={v} disabled={off}>
           {label}

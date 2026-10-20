@@ -12,9 +12,11 @@ import {
   band as bandName,
   bytes,
   dbm,
+  pct,
   pct1,
   retryTone,
   toneClass,
+  unit,
   useNow,
 } from "../format";
 import { ApSpacing } from "../components/insights/ApSpacing";
@@ -293,12 +295,18 @@ function RadioTable({ radios }: { radios: RadioOverview[] }) {
                   <>
                     <td className="nowrap">
                       {r.channel}
-                      <span className="muted small"> / {r.bw ?? "?"} MHz</span>
+                      <span className="muted small">
+                        {" "}
+                        / {unit(r.bw, "MHz")}
+                      </span>
                     </td>
                     <td className="nowrap">
                       {dbm(r.tx_power)}
                       {r.eirp !== null && (
-                        <span className="muted small"> ({r.eirp} EIRP)</span>
+                        <span className="muted small">
+                          {" "}
+                          ({dbm(r.eirp)} EIRP)
+                        </span>
                       )}
                     </td>
                   </>
@@ -307,11 +315,7 @@ function RadioTable({ radios }: { radios: RadioOverview[] }) {
                 <td>
                   <Meter value={r.avg_utilization} label="Utilisation" />
                 </td>
-                <td>
-                  {r.avg_interference === null
-                    ? "—"
-                    : `${r.avg_interference.toFixed(0)}%`}
-                </td>
+                <td>{pct(r.avg_interference)}</td>
                 <td className={toneClass(retryTone(r.tx_retry_pct))}>
                   {pct1(r.tx_retry_pct)}
                 </td>
@@ -469,7 +473,7 @@ function Environment() {
                           {x.channel ?? "—"}
                           <span className="muted small">
                             {" "}
-                            / {x.bw ?? 20} MHz
+                            / {unit(x.bw, "MHz")}
                           </span>
                         </td>
                         <td>

@@ -28,31 +28,21 @@ export function CountryTimezone({
   d: SiteSettings;
 }) {
   const { form: f, set } = top;
-  const known = d.countries.some((c) => c.code === f.country);
   return (
     <>
       <Row label="Country" hint="decides the legal channels and power">
         <Select
-          value={f.country ?? ""}
-          onChange={(v) => v !== "" && set("country", v)}
-          options={[
-            ...(known
-              ? []
-              : [[f.country ?? "", `(code ${f.country ?? "none"})`] as const]),
-            ...d.countries.map((c) => [c.code, c.name] as const),
-          ]}
+          value={f.country}
+          onChange={(v) => set("country", v)}
+          stray={(c) => `(code ${c || "none"})`}
+          options={d.countries.map((c) => [c.code, c.name] as const)}
         />
       </Row>
       <Row label="Time zone" hint="for schedules and the APs' clocks">
         <Select
           value={f.timezone}
           onChange={(v) => set("timezone", v)}
-          options={[
-            ...(d.timezones.includes(f.timezone)
-              ? []
-              : [[f.timezone, f.timezone] as const]),
-            ...d.timezones.map((z) => [z, z] as const),
-          ]}
+          options={d.timezones.map((z) => [z, z] as const)}
         />
       </Row>
     </>

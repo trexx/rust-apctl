@@ -1,7 +1,7 @@
 import {
   useContext,
   useEffect,
-  useLayoutEffect,
+  useEffectEvent,
   useRef,
   useSyncExternalStore,
 } from "react";
@@ -153,27 +153,24 @@ export function Plot({
   format,
   formatRight,
   rightMax,
-  height = 180,
+  height: heightProp,
   min,
   max,
 }: ChartProps) {
+  // Not a default in the parameter: the React Compiler can't compile those.
+  const height = heightProp ?? 180;
   const box = useRef<HTMLDivElement>(null);
   const plot = useRef<uPlot | null>(null);
   const drawn = useRef<Drawn | null>(null);
   const zoom = useContext(ZoomContext);
   const span = useContext(SpanContext);
   const dark = useDarkMode();
-  // Read by uPlot's callbacks, which are only set up when the chart is built.
-  const spanRef = useRef(span);
-  const zoomRef = useRef(zoom);
-  const formatRef = useRef(format);
-  const formatRightRef = useRef(formatRight);
-  useLayoutEffect(() => {
-    spanRef.current = span;
-    zoomRef.current = zoom;
-    formatRef.current = format;
-    formatRightRef.current = formatRight;
-  });
+  // uPlot's callbacks are set up when the chart is built, and read these as they are now.
+  const spanNow = useEffectEvent(() => span);
+  const zoomTo = useEffectEvent((from: number, to: number) => zoom?.(from, to));
+  const formatted = useEffectEvent((v: number, right: boolean) =>
+    (right ? (formatRight ?? format) : format)(v),
+  );
 
   // Rebuild when the shape (or the colour scheme, for the axes and series) changes; otherwise only push new data.
   const shape =
@@ -195,9 +192,9 @@ export function Plot({
     span,
   });
 
-  useEffect(() => {
-    const el = box.current;
-    if (!el) return;
+  // Builds the chart from what is shown now; everything it reads that the
+  // chart's options hold is part of `shape`.
+  const build = useEffectEvent((el: HTMLDivElement) => {
     const text = cssVar("--text-muted") || "#888";
     const grid = cssVar("--grid") || "rgba(128,128,128,0.15)";
     const axis = (): uPlot.Axis => ({
@@ -219,12 +216,11 @@ export function Plot({
             setSelect: [
               (u) => {
                 const { left, width } = u.select;
-                if (width > 4 && zoomRef.current) {
-                  zoomRef.current(
+                if (width > 4)
+                  zoomTo(
                     Math.floor(u.posToVal(left, "x")),
                     Math.ceil(u.posToVal(left + width, "x")),
                   );
-                }
                 u.setSelect({ left: 0, top: 0, width: 0, height: 0 }, false);
               },
             ],
@@ -235,8 +231,10 @@ export function Plot({
         x: {
           time: true,
           // The selected window, so charts line up and missing data shows as a gap.
-          range: (_u, lo, hi) =>
-            spanRef.current ? spanBounds(spanRef.current) : [lo, hi],
+          range: (_u, lo, hi) => {
+            const span = spanNow();
+            return span ? spanBounds(span) : [lo, hi];
+          },
         },
         y: {
           range: (_u, lo, hi) => [
@@ -252,7 +250,7 @@ export function Plot({
           ...axis(),
           size: fitLabels,
           values: (_u, vals) =>
-            vals.map((v) => (v === null ? "" : formatRef.current(v))),
+            vals.map((v) => (v === null ? "" : formatted(v, false))),
         },
         ...(hasRight
           ? [
@@ -263,11 +261,7 @@ export function Plot({
                 grid: { show: false },
                 size: fitLabels,
                 values: (_u: uPlot, vals: number[]) =>
-                  vals.map((v) =>
-                    v === null
-                      ? ""
-                      : (formatRightRef.current ?? formatRef.current)(v),
-                  ),
+                  vals.map((v) => (v === null ? "" : formatted(v, true))),
               },
             ]
           : []),
@@ -284,11 +278,7 @@ export function Plot({
           spanGaps: false,
           points: { show: false },
           value: (_u: uPlot, v: number | null) =>
-            v === null || v === undefined
-              ? "—"
-              : (s.right
-                  ? (formatRightRef.current ?? formatRef.current)
-                  : formatRef.current)(v),
+            v === null || v === undefined ? "—" : formatted(v, !!s.right),
         })),
       ],
     };
@@ -304,8 +294,10 @@ export function Plot({
       plot.current = null;
       drawn.current = null;
     };
-    // Everything else it reads is either part of `shape` or read through a ref.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
+  });
+  useEffect(() => {
+    const el = box.current;
+    return el ? build(el) : undefined;
   }, [shape]);
 
   // Callers build `series` on every render: only draw when the data arrays

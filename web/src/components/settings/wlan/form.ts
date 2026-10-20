@@ -7,7 +7,11 @@ export type PmfMode = NonNullable<WlanFields["pmf_mode"]>;
 /** An SSID's fields as the form holds them (all of them: those it doesn't edit ride along unchanged). */
 export type WlanForm = WlanFields;
 
-/** The form's fields for an SSID, or a new one's when `w` is null. */
+/**
+ * The form's fields for an SSID, or a new one's when `w` is null: with the
+ * values the server creates it with where a control's own fallback differs
+ * (create_wlan), so the form shows and sends what will be created.
+ */
 export function wlanForm(w: WlanSettings | null): WlanForm {
   if (!w)
     return {
@@ -16,6 +20,9 @@ export function wlanForm(w: WlanSettings | null): WlanForm {
       protection: "wpa2_wpa3",
       wlan_bands: ["2g", "5g"],
       aps: null,
+      bss_transition: true,
+      no2ghz_oui: true,
+      group_rekey: 0,
     };
   const { id: _id, editable: _e, has_passphrase: _h, ...rest } = w;
   return rest;

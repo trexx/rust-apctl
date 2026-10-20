@@ -634,7 +634,7 @@ const EVENTS: { [K in EventKind]: EventSpec<K> } = {
     label: "Client roamed",
     tone: "info",
     describe: (d, names) =>
-      `from ${names[d.from?.ap ?? ""] ?? "?"} (${band(d.from?.radio)}, ${dbm(d.from?.signal)}) to ${names[d.to?.ap ?? ""] ?? "?"} (${band(d.to?.radio)}, ${dbm(d.to?.signal)})`,
+      `from ${d.from?.ap ? (names[d.from.ap] ?? d.from.ap) : "?"} (${band(d.from?.radio)}, ${dbm(d.from?.signal)}) to ${d.to?.ap ? (names[d.to.ap] ?? d.to.ap) : "?"} (${band(d.to?.radio)}, ${dbm(d.to?.signal)})`,
   },
   client_renamed: {
     label: "Client renamed",
@@ -777,12 +777,15 @@ const EventRow = memo(
     const spec = eventSpec(e.kind);
     const d = eventData(e);
     const tone = typeof spec.tone === "function" ? spec.tone(d) : spec.tone;
-    const detail = spec.describe?.(d, names, e.ts);
     const threat = eventData<"network_threat">(e);
+    // A push's diffs are parsed once, for its detail line and its changes.
     const push =
       e.kind === "config_pushed"
         ? summarise(eventData<"config_pushed">(e))
         : null;
+    const detail = push
+      ? pushText(eventData<"config_pushed">(e), push)
+      : spec.describe?.(d, names, e.ts);
     const crash =
       e.kind === "ap_crash" ? (eventData<"ap_crash">(e).lines ?? []) : [];
     return (
