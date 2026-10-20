@@ -312,21 +312,16 @@ impl Active {
         apcfg::render_with_meta(&input)
     }
 
-    /// The AP's config with the placeholder cfgversion: the last render while
-    /// neither the settings nor what it read of the inform changed (most
-    /// informs), else a new one. The lock is not held while rendering.
-    fn placeholder_render(&self, state: &Arc<Value>, mac: Mac, payload: &Value) -> anyhow::Result<Arc<Render>> {
-        self.render_from(self.current_render(state, mac), state, mac, payload)
-    }
-
     /// The AP's last render, while the settings it was made from are current.
     fn current_render(&self, state: &Arc<Value>, mac: Mac) -> Option<Arc<Render>> {
         let last = self.devices.lock().unwrap().get(&mac).and_then(|d| d.render.clone());
         last.filter(|r| std::ptr::eq(r.state.as_ptr(), Arc::as_ptr(state)))
     }
 
-    /// [`Self::placeholder_render`], given [`Self::current_render`].
-    fn render_from(&self, last: Option<Arc<Render>>, state: &Arc<Value>, mac: Mac, payload: &Value) -> anyhow::Result<Arc<Render>> {
+    /// The AP's config with the placeholder cfgversion: `last` (its
+    /// [`Self::current_render`]) while what it read of the inform is unchanged
+    /// (most informs), else a new one. The lock is not held while rendering.
+    fn placeholder_render(&self, last: Option<Arc<Render>>, state: &Arc<Value>, mac: Mac, payload: &Value) -> anyhow::Result<Arc<Render>> {
         if let Some(r) = last.filter(|r| apcfg::inform_inputs_match(&r.inputs, payload)) {
             return Ok(r);
         }
@@ -432,7 +427,7 @@ impl Active {
 
         // What would we push, ignoring the cfgversion token? Rendered once: the
         // token is patched into mgmt_cfg where a version is needed.
-        let render = match self.render_from(last, &state, mac, payload) {
+        let render = match self.placeholder_render(last, &state, mac, payload) {
             Ok(r) => r,
             Err(e) => {
                 tracing::error!("{mac}: cannot render config, replying noop: {e:#}");
@@ -1320,7 +1315,7 @@ mod tests {
         let rig = rig(true, None);
         let ap: Mac = AP.parse().unwrap();
         let state = rig.live.read().unwrap().state.clone().unwrap();
-        let render = rig.active.placeholder_render(&state, ap, &ap_payload("1")).unwrap();
+        let render = rig.active.placeholder_render(rig.active.current_render(&state, ap), &state, ap, &ap_payload("1")).unwrap();
         // As written before digests: the rendered text itself, secrets and all.
         let text = format!("{}\n--\n{}\n--\n{}", render.out.rendered.mgmt_cfg, render.out.rendered.system_cfg, render.blocked);
         let (a, w) = (&rig.active, &rig.active.writer);
@@ -1383,7 +1378,7 @@ mod tests {
         let ap: Mac = AP.parse().unwrap();
         let state = rig.live.read().unwrap().state.clone().unwrap();
         let mut payload = ap_payload("1");
-        let render = |state: &Arc<Value>, p: &Value| rig.active.placeholder_render(state, ap, p).unwrap();
+        let render = |state: &Arc<Value>, p: &Value| rig.active.placeholder_render(rig.active.current_render(state, ap), state, ap, p).unwrap();
         let first = render(&state, &payload);
         // What changes with every inform (uptime, counters, the reported version) is not read.
         payload["uptime"] = json!(987654);
