@@ -411,7 +411,7 @@ pub fn parse(ts: Ts, p: &Value) -> anyhow::Result<Snapshot> {
     let mut clients = Vec::new();
     for v in vap_table.into_iter().flatten() {
         // Lower case, as the neighbours' BSSIDs are kept: the two are compared.
-        let Some(bssid) = string(&v["bssid"]).map(|b| b.to_ascii_lowercase()) else { continue };
+        let Some(bssid) = v["bssid"].as_str().filter(|b| !b.is_empty()).map(str::to_ascii_lowercase) else { continue };
         // Clients come from user and guest VAPs; mesh uplink/downlink VAPs are skipped.
         let usage = v["usage"].as_str().unwrap_or("user");
         let essid = string(&v["essid"]);
@@ -489,10 +489,10 @@ pub fn parse(ts: Ts, p: &Value) -> anyhow::Result<Snapshot> {
     for r in p["radio_table"].as_array().into_iter().flatten() {
         let radio = string(&r["radio"]);
         for n in r["scan_table"].as_array().into_iter().flatten() {
-            let Some(bssid) = string(&n["bssid"]) else { continue };
+            let Some(bssid) = n["bssid"].as_str().filter(|b| !b.is_empty()).map(str::to_ascii_lowercase) else { continue };
             neighbors.push(NeighborSample {
                 radio: string(&n["band"]).or_else(|| radio.clone()),
-                bssid: bssid.to_ascii_lowercase(),
+                bssid,
                 essid: string(&n["essid"]),
                 channel: int(&n["channel"]),
                 bw: int(&n["bw"]),
