@@ -493,6 +493,9 @@ pub struct Engine {
     alerts: Option<crate::alerts::Sink>,
     /// The time of this run's first tick (the capture's time in shadow mode).
     first_tick: Option<Ts>,
+    /// Each AP's last push as stored before this run (its secrets masked), until
+    /// a push to it is seen: what that push is compared with.
+    stored_config: HashMap<Mac, PushedConfig>,
 }
 
 /// How long a syslog hash_id no key opened is left untried.
@@ -506,7 +509,7 @@ impl Engine {
         Engine {
             writer, keys, renderer: None, live, counters, tx, radios: HashMap::new(), mcast_prev: HashMap::new(), bss_prev: HashMap::new(),
             logevents: Default::default(), isolated: HashMap::new(), last_prune: 0, written: Default::default(), syslog_unknown: HashMap::new(),
-            syslog_ciphers: Default::default(), logs_announced: HashMap::new(), alerts: None, first_tick: None,
+            syslog_ciphers: Default::default(), logs_announced: HashMap::new(), alerts: None, first_tick: None, stored_config: HashMap::new(),
         }
     }
 
@@ -521,9 +524,10 @@ impl Engine {
     }
 
     /// Loads APs and clients remembered from previous runs, so a restart does
-    /// not report every client as newly connected.
+    /// not report every client as newly connected, and each AP's last push, so
+    /// the first one after it says what it changed.
     pub fn restore(&mut self, store: &store::Store) -> anyhow::Result<()> {
-        let (devices, clients, aliases, state) = store.read(Db::Config, |c| {
+        let (devices, clients, aliases, state, pushes) = store.read(Db::Config, |c| {
             let mut stmt = c.prepare("SELECT mac, first_seen, last_seen, uptime, version, hash_id, ip, hostname, model, model_display, serial FROM devices")?;
             let devices = stmt
                 .query_map([], |r| {
@@ -557,8 +561,9 @@ impl Engine {
             let aliases = stmt
                 .query_map([], |r| Ok((r.get::<_, String>(0)?, Alias { alias: r.get(1)?, note: r.get(2)? })))?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
-            Ok((devices, clients, aliases, state))
+            Ok((devices, clients, aliases, state, store::stored_pushes(c)?))
         })?;
+        self.stored_config = pushes;
         let mut live = self.live.write().unwrap();
         for (mac, known, hash_id) in devices {
             let Ok(mac) = mac.parse::<Mac>() else { continue };
@@ -858,7 +863,7 @@ impl Engine {
     ///
     /// The diffs and the dry-run render take a while, so the live view is only
     /// locked to read what they need and then to store the results.
-    fn reply(&self, ts: Ts, mac: Mac, mut p: Value, dry_run: bool) {
+    fn reply(&mut self, ts: Ts, mac: Mac, mut p: Value, dry_run: bool) {
         bump(&self.counters.replies);
         // Nearly every reply repeats the interval the AP already has.
         if let Some(interval) = p["interval"].as_i64() {
@@ -879,17 +884,21 @@ impl Engine {
             _ => None,
         };
         let (new_mgmt, new_system) = (take("mgmt_cfg"), take("system_cfg"));
-        let (radios, previous, state, inform) = {
+        let stored = self.stored_config.remove(&mac);
+        let (radios, previous, redacted, state, inform) = {
             let live = self.live.read().unwrap();
-            // The last push (unredacted), for the diffs; empty fields if none was seen.
-            let previous = live.last_config.get(&mac).cloned().unwrap_or_default();
+            // The last push, for the diffs: the one seen in this run (unredacted), else
+            // the one stored before it (secrets masked); empty fields if there is none.
+            let seen = live.last_config.get(&mac).cloned();
+            let redacted = seen.is_none() && stored.is_some();
+            let previous = seen.or(stored.map(Arc::new)).unwrap_or_default();
             let has_system = new_system.as_ref().map_or(!previous.system_cfg.is_empty(), |s| !s.is_empty());
             // For the section labels, which only a system_cfg has.
             let radios = live.devices.get(&mac).filter(|_| has_system).map(|d| d.snapshot.radios.clone()).unwrap_or_default();
             let wanted = dry_run && has_system && self.renderer.is_some();
             let state = live.state.clone().filter(|_| wanted);
             let inform = state.as_ref().and_then(|_| live.raw_informs.get(&mac).cloned());
-            (radios, previous, state, inform)
+            (radios, previous, redacted, state, inform)
         };
         let mgmt = new_mgmt.as_deref().unwrap_or(&previous.mgmt_cfg);
         let system = new_system.as_deref().unwrap_or(&previous.system_cfg);
@@ -899,6 +908,8 @@ impl Engine {
             let Some(new) = new else { continue };
             let summary = if old.is_empty() {
                 json!({ "baseline": true, "lines": new.lines().count() })
+            } else if redacted {
+                cfgdiff::diff(old, &cfgdiff::redact(new)).summary()
             } else {
                 cfgdiff::diff(old, new).summary()
             };
@@ -916,7 +927,7 @@ impl Engine {
         }
         // Without one in the push: the one its mgmt_cfg carries (this push's, else
         // the last one's), else the last push's, as the stored copy keeps it
-        // (COALESCE below). A restart, reading the stored copy, sees the same.
+        // (COALESCE below).
         let cfgversion = p["cfgversion"]
             .as_str()
             .map(str::to_string)
@@ -945,16 +956,21 @@ impl Engine {
                     cfgversion: cfgversion.as_deref().unwrap_or(""),
                     previous_system_cfg: Some(system),
                 };
-                Some(self.dry_run(render, ts, &req, cfgversion.as_deref(), mgmt))
+                // Masked when a field the push does not carry is the stored copy's.
+                let masked = redacted && (new_mgmt.is_none() || new_system.is_none());
+                Some(self.dry_run(render, ts, &req, cfgversion.as_deref(), mgmt, masked))
             }
             _ => None,
         };
 
         // As in `inform`: the write lock is held for the swap alone, and the old
-        // push is dropped and the events emitted after it.
+        // push is dropped and the events emitted after it. A field the push does
+        // not carry is the last push's, but only known in full from one seen in
+        // this run: else it is left empty, and readers go to the stored copy.
+        let kept = |old: &String| if redacted { String::new() } else { old.clone() };
         let pushed = PushedConfig {
-            mgmt_cfg: new_mgmt.unwrap_or_else(|| previous.mgmt_cfg.clone()),
-            system_cfg: new_system.unwrap_or_else(|| previous.system_cfg.clone()),
+            mgmt_cfg: new_mgmt.unwrap_or_else(|| kept(&previous.mgmt_cfg)),
+            system_cfg: new_system.unwrap_or_else(|| kept(&previous.system_cfg)),
             cfgversion,
         };
         let mut live = self.live.write().unwrap();
@@ -971,10 +987,11 @@ impl Engine {
     }
 
     /// Renders the AP's config for `req` and compares it with the push (its
-    /// `mgmt` and `req.previous_system_cfg`): stored, and summed up for the event.
-    fn dry_run(&self, render: &crate::dryrun::RenderFn, ts: Ts, req: &crate::dryrun::RenderRequest, cfgversion: Option<&str>, mgmt: &str) -> Value {
+    /// `mgmt` and `req.previous_system_cfg`, with secrets masked if `redacted`):
+    /// stored, and summed up for the event.
+    fn dry_run(&self, render: &crate::dryrun::RenderFn, ts: Ts, req: &crate::dryrun::RenderRequest, cfgversion: Option<&str>, mgmt: &str, redacted: bool) -> Value {
         let system = req.previous_system_cfg.unwrap_or_default();
-        let result = render(req).map(|ours| crate::dryrun::compare(&ours, mgmt, system, false, false));
+        let result = render(req).map(|ours| crate::dryrun::compare(&ours, mgmt, system, redacted, false));
         let (matches, payload) = match &result {
             Ok(c) => (c.matches(), serde_json::to_string(c).expect("a comparison serialises")),
             Err(e) => (false, json!({ "error": format!("{e:#}") }).to_string()),
@@ -1062,6 +1079,7 @@ impl Engine {
     }
 
     fn forget(&mut self, ts: Ts, mac: Mac) {
+        self.stored_config.remove(&mac);
         let mut live = self.live.write().unwrap();
         live.forget_ap(&mac);
         let forget_managed = live.forget_managed.clone();
@@ -2561,6 +2579,28 @@ mod tests {
         let comparison: Value =
             serde_json::from_str(&h.store.read(Db::Config, |c| Ok(c.query_row("SELECT comparison FROM dryrun_results ORDER BY ts DESC", [], |r| r.get::<_, String>(0))?)).unwrap()).unwrap();
         assert_eq!((comparison["mgmt_cfg"]["changed"].as_i64(), comparison["mgmt_cfg"].get("diff"), comparison["system_cfg"].get("diff")), (Some(1), None, None));
+    }
+
+    #[test]
+    fn the_first_push_after_a_restart_is_compared_with_the_stored_one() {
+        let mut h = harness();
+        let mac: Mac = AP1.parse().unwrap();
+        let push = |h: &mut Harness, ts: Ts, v: Value| h.engine.handle(Input::Reply { ts, mac, decoded: decoded(v) });
+        push(&mut h, 10, json!({ "_type": "setparam", "mgmt_cfg": "cfgversion=v1\na=1", "system_cfg": "aaa.1.hide_ssid=false\naaa.1.wpa.psk=old" }));
+        let mut h = h.restarted();
+        // What it changed, not a baseline; the secret, masked in the stored copy, is not compared.
+        push(&mut h, 20, json!({ "_type": "setparam", "mgmt_cfg": "cfgversion=v2\na=1", "system_cfg": "aaa.1.hide_ssid=true\naaa.1.wpa.psk=old" }));
+        let pushed = stored(&h, EventKind::ConfigPushed).pop().unwrap();
+        assert_eq!((pushed["system_cfg"]["diff"].as_str(), pushed["mgmt_cfg"]["diff"].as_str()), (Some("~ aaa.1.hide_ssid: false -> true\n"), Some("~ cfgversion: v1 -> v2\n")));
+        // A management-only push without a cfgversion, after another restart: the
+        // stored version; the system_cfg is the stored one, not known in full.
+        let mut h = h.restarted();
+        push(&mut h, 30, json!({ "_type": "setparam", "mgmt_cfg": "a=2" }));
+        let last = h.live.read().unwrap().last_config[&mac].clone();
+        assert_eq!((last.mgmt_cfg.as_str(), last.system_cfg.as_str(), last.cfgversion.as_deref()), ("a=2", "", Some("v2")));
+        flushed(&h.writer);
+        let row: (String, String) = h.store.read(Db::Config, |c| Ok(c.query_row("SELECT cfgversion, system_cfg FROM device_config", [], |r| Ok((r.get(0)?, r.get(1)?)))?)).unwrap();
+        assert_eq!(row, ("v2".into(), "aaa.1.hide_ssid=true\naaa.1.wpa.psk=<redacted>".into()));
     }
 
     #[test]

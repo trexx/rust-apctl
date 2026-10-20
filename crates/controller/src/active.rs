@@ -510,7 +510,8 @@ impl Active {
     /// same config again. The push seen in this run is compared in full;
     /// after a restart, the stored copy with its secrets masked.
     fn runs_already(&self, mac: Mac, reported: &str, out: &apcfg::Output) -> bool {
-        let seen = self.live.read().unwrap().last_config.get(&mac).cloned();
+        // A field the push seen did not carry, after a restart, is only in the stored copy.
+        let seen = self.live.read().unwrap().last_config.get(&mac).filter(|p| !p.mgmt_cfg.is_empty() && !p.system_cfg.is_empty()).cloned();
         let stored;
         let (push, redacted) = match &seen {
             Some(p) => (&**p, false),
@@ -1092,7 +1093,12 @@ mod tests {
         let probe = rig(true, None);
         let payload = ap_payload("abcdefabcdefabcd");
         let out = probe.active.render(&probe.live.read().unwrap().state.clone().unwrap(), AP.parse().unwrap(), &payload, "abcdefabcdefabcd").unwrap();
-        let rig = rig_with_stored(true, None, Some((out.rendered.mgmt_cfg, out.rendered.system_cfg, "abcdefabcdefabcd".into())));
+        let stored = Some((out.rendered.mgmt_cfg.clone(), out.rendered.system_cfg, "abcdefabcdefabcd".into()));
+        let rig = rig_with_stored(true, None, stored.clone());
+        let (_, reply) = inform_as_ap(&rig, &payload, KEY, GCM_ZLIB).await;
+        assert_eq!(reply.unwrap().1["_type"], "noop");
+        // So it does when the only push seen since was management-only: its system_cfg is only stored.
+        let rig = rig_with_stored(true, Some((out.rendered.mgmt_cfg, String::new(), Some("abcdefabcdefabcd".into()))), stored);
         let (_, reply) = inform_as_ap(&rig, &payload, KEY, GCM_ZLIB).await;
         assert_eq!(reply.unwrap().1["_type"], "noop");
     }

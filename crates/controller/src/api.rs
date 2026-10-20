@@ -758,14 +758,15 @@ async fn import_state(State(s): State<AppState>, Json(state): Json<Value>) -> Ap
 async fn dryrun(State(s): State<AppState>) -> Result<Json<DryRunStatus>, ApiError> {
     // What each AP's render needs, copied under a short lock: the unredacted
     // config seen in this run when there is one. Only full configs count: a
-    // management-only push says nothing about system_cfg.
+    // management-only push says nothing about system_cfg (nor, after a restart,
+    // one without mgmt_cfg about mgmt_cfg).
     let (state, imported_at, aps) = {
         let live = s.live.read().unwrap();
         let aps: Vec<_> = live
             .devices
             .iter()
             .map(|(mac, d)| {
-                let seen = live.last_config.get(mac).filter(|c| !c.system_cfg.is_empty()).cloned();
+                let seen = live.last_config.get(mac).filter(|c| !c.mgmt_cfg.is_empty() && !c.system_cfg.is_empty()).cloned();
                 (*mac, d.snapshot.ap.hostname.clone(), d.snapshot.ap.cfgversion.clone(), seen, live.raw_informs.get(mac).cloned())
             })
             .collect();

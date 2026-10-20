@@ -608,10 +608,17 @@ fn apply(conn: &mut Connection, writes: Vec<Write>) -> Result<usize> {
 /// A config pushed to an AP.
 #[derive(Debug, Clone, Default)]
 pub struct PushedConfig {
+    /// Empty when not known: no push with one was seen (one can be
+    /// management-only), or, in the live view after a restart, none since.
     pub mgmt_cfg: String,
-    /// Empty until a push with a `system_cfg` is seen (one can be management-only).
     pub system_cfg: String,
     pub cfgversion: Option<String>,
+}
+
+const STORED_PUSH: &str = "SELECT mgmt_cfg, system_cfg, cfgversion, ts, mac FROM device_config";
+
+fn stored_push_row(r: &rusqlite::Row) -> rusqlite::Result<PushedConfig> {
+    Ok(PushedConfig { mgmt_cfg: r.get::<_, Option<String>>(0)?.unwrap_or_default(), system_cfg: r.get::<_, Option<String>>(1)?.unwrap_or_default(), cfgversion: r.get(2)? })
 }
 
 /// One AP's last stored push, with its secrets masked.
@@ -622,12 +629,21 @@ pub fn stored_push(c: &Connection, mac: &inform::Mac) -> rusqlite::Result<Option
 /// One AP's last stored push, with its secrets masked, and when it was stored.
 pub fn stored_push_at(c: &Connection, mac: &inform::Mac) -> rusqlite::Result<Option<(PushedConfig, Option<Ts>)>> {
     use rusqlite::OptionalExtension;
-    c.prepare_cached("SELECT mgmt_cfg, system_cfg, cfgversion, ts FROM device_config WHERE mac = ?1")?
-        .query_row([mac.to_string()], |r| {
-            let push = PushedConfig { mgmt_cfg: r.get::<_, Option<String>>(0)?.unwrap_or_default(), system_cfg: r.get::<_, Option<String>>(1)?.unwrap_or_default(), cfgversion: r.get(2)? };
-            Ok((push, r.get(3)?))
-        })
-        .optional()
+    c.prepare_cached(&format!("{STORED_PUSH} WHERE mac = ?1"))?.query_row([mac.to_string()], |r| Ok((stored_push_row(r)?, r.get(3)?))).optional()
+}
+
+/// Every AP's last stored push, with its secrets masked.
+pub fn stored_pushes(c: &Connection) -> rusqlite::Result<HashMap<inform::Mac, PushedConfig>> {
+    let mut stmt = c.prepare(STORED_PUSH)?;
+    let mut rows = stmt.query([])?;
+    let mut out = HashMap::new();
+    while let Some(r) = rows.next()? {
+        // A row whose MAC does not parse is no AP's.
+        if let Ok(mac) = r.get::<_, String>(4)?.parse() {
+            out.insert(mac, stored_push_row(r)?);
+        }
+    }
+    Ok(out)
 }
 
 /// Rolls complete buckets up into the coarser tiers, then applies retention.
