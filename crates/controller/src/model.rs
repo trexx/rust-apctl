@@ -4,6 +4,7 @@
 //! through lenient helpers. A missing field becomes `None` rather than an error:
 //! models and firmware versions differ in what they report.
 
+use std::borrow::Cow;
 use std::sync::Arc;
 
 use inform::Mac;
@@ -270,7 +271,7 @@ pub struct McastGroup {
     pub dst_port: Option<i64>,
     /// Traffic type: mdns, ssdp, igmp, stream, dhcp, arp...
     #[serde(rename = "type")]
-    pub kind: Option<String>,
+    pub kind: Option<Cow<'static, str>>,
     #[serde(flatten)]
     pub counts: McastCounts,
 }
@@ -278,7 +279,7 @@ pub struct McastGroup {
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct Multicast {
     /// Counters per traffic type (arp, dhcp, dhcpv6, igmp, ipv6_nd, mdns, mld, ssdp, stream, other).
-    pub types: std::collections::BTreeMap<String, McastCounts>,
+    pub types: std::collections::BTreeMap<Cow<'static, str>, McastCounts>,
     /// Destination groups the client's traffic used.
     pub groups: Vec<McastGroup>,
     /// Groups the client has joined.
@@ -294,15 +295,23 @@ pub struct McastService {
     pub bytes: i64,
 }
 
+/// The traffic types APs report, so that a client's types and groups name
+/// them without a copy each.
+const MCAST_TYPES: [&str; 10] = ["arp", "dhcp", "dhcpv6", "igmp", "ipv6_nd", "mdns", "mld", "other", "ssdp", "stream"];
+
+fn mcast_type(name: &str) -> Cow<'static, str> {
+    MCAST_TYPES.iter().find(|t| **t == name).map_or_else(|| Cow::Owned(name.to_string()), |t| Cow::Borrowed(*t))
+}
+
 impl Multicast {
     fn parse(v: &Value) -> Option<Multicast> {
-        let types = v["types"].as_object()?.iter().map(|(k, x)| (k.clone(), McastCounts::parse(x))).collect();
+        let types = v["types"].as_object()?.iter().map(|(k, x)| (mcast_type(k), McastCounts::parse(x))).collect();
         let groups = v["groups"]
             .as_array()
             .into_iter()
             .flatten()
             .filter_map(|g| {
-                Some(McastGroup { group_ip: g["group_ip"].as_str()?.to_string(), dst_port: int(&g["dst_port"]), kind: string(&g["type"]), counts: McastCounts::parse(g) })
+                Some(McastGroup { group_ip: g["group_ip"].as_str()?.to_string(), dst_port: int(&g["dst_port"]), kind: g["type"].as_str().filter(|s| !s.is_empty()).map(mcast_type), counts: McastCounts::parse(g) })
             })
             .collect();
         let memberships = v["memberships"].as_array().into_iter().flatten().filter_map(|m| m["group_ip"].as_str().map(str::to_string)).collect();

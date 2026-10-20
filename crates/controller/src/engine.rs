@@ -364,7 +364,7 @@ pub struct KnownDevice {
 
 pub type SharedLive = Arc<RwLock<Live>>;
 
-type McastTypes = BTreeMap<String, crate::model::McastCounts>;
+type McastTypes = BTreeMap<std::borrow::Cow<'static, str>, crate::model::McastCounts>;
 
 /// A sample's multicast counters by traffic type (none if it has none).
 fn mcast_types(c: &ClientSample) -> &McastTypes {
@@ -1727,7 +1727,7 @@ impl Engine {
                     let prev = mcast_types(prev);
                     for (kind, cur) in &m.types {
                         let p = prev.get(kind).copied().unwrap_or(*cur);
-                        let e = mcast.entry(kind).or_default();
+                        let e = mcast.entry(kind.as_ref()).or_default();
                         e.0[0] += rate(cur.tx_pkts, p.tx_pkts, dt);
                         e.0[2] += rate(cur.tx_bytes, p.tx_bytes, dt);
                     }
@@ -1749,7 +1749,7 @@ impl Engine {
                 for (kind, cur) in &m.types {
                     let p = prev.get(kind).copied().unwrap_or(*cur);
                     let (pk, by) = (rate(cur.rx_pkts, p.rx_pkts, dt), rate(cur.rx_bytes, p.rx_bytes, dt));
-                    let e = mcast.entry(kind).or_default();
+                    let e = mcast.entry(kind.as_ref()).or_default();
                     e.0[1] += pk;
                     e.0[3] += by;
                     if pk > 0.0 {
