@@ -435,7 +435,7 @@ fn stored_view(mac: Mac, k: &KnownDevice) -> DeviceView {
     };
     DeviceView {
         snapshot: crate::model::Snapshot {
-            ap, uplink: None, radios: vec![], vaps: vec![], clients: vec![], neighbors: vec![], spectrum: vec![], has_vap_table: false,
+            ap, uplink: None, radios: vec![], vaps: vec![], clients: vec![], has_vap_table: false,
         },
         online: false, first_seen: k.first_seen, last_seen: k.last_seen, peer: None, interval: 0, last_full_inform: 0,
         last_config_push: None,
@@ -547,8 +547,7 @@ struct DeviceOut<'a> {
 fn page_view(d: &DeviceView) -> DeviceView {
     let s = &d.snapshot;
     let snapshot = crate::model::Snapshot {
-        ap: s.ap.clone(), uplink: s.uplink.clone(), radios: s.radios.clone(), vaps: s.vaps.clone(), clients: vec![], neighbors: vec![], spectrum: vec![],
-        has_vap_table: s.has_vap_table,
+        ap: s.ap.clone(), uplink: s.uplink.clone(), radios: s.radios.clone(), vaps: s.vaps.clone(), clients: vec![], has_vap_table: s.has_vap_table,
     };
     DeviceView { snapshot, ..*d }
 }

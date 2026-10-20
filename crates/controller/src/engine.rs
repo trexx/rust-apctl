@@ -674,7 +674,7 @@ impl Engine {
             self.notification(ts, decoded.payload);
             return;
         }
-        let mut snap = match model::parse(ts, &decoded.payload) {
+        let (snap, scans) = match model::parse_with_scans(ts, &decoded.payload) {
             Ok(s) => s,
             Err(e) => {
                 tracing::debug!("unparseable inform: {e:#}");
@@ -684,9 +684,8 @@ impl Engine {
         };
         let mac = snap.ap.mac;
         // Only stored, not kept in the live view: the rows written of them own them.
-        let (neighbors, spectrum) = (std::mem::take(&mut snap.neighbors), std::mem::take(&mut snap.spectrum));
-        self.check_isolated(ts, mac, &neighbors);
-        self.write_metrics(&snap, neighbors, spectrum);
+        self.check_isolated(ts, mac, &scans.neighbors);
+        self.write_metrics(&snap, scans);
         bump(&self.counters.informs);
 
         // A handle of its own, so the engine's other fields stay usable while it is locked.
@@ -1610,7 +1609,7 @@ impl Engine {
     }
 
     /// The inform's metrics, and its scan results (see `Written`).
-    fn write_metrics(&mut self, s: &Snapshot, neighbors: Vec<crate::model::NeighborSample>, spectrum: Vec<crate::model::SpectrumSample>) {
+    fn write_metrics(&mut self, s: &Snapshot, model::Scans { neighbors, spectrum }: model::Scans) {
         let ts = s.ap.ts;
         // Formatted once: nearly every row of the inform carries the AP's MAC.
         let mac_text = Sql::Text(s.ap.mac.to_string());
@@ -1680,18 +1679,20 @@ impl Engine {
         }
         rows.retain(|_, r| r.seen == ts);
         let radios = self.written.spectrum.entry(s.ap.mac).or_default();
-        for c in spectrum {
+        for (radio, channels) in spectrum {
             // Looked up by reference: the radio's name is copied only for a new one.
-            if !radios.contains_key(c.radio.as_str()) {
-                radios.insert(c.radio.clone(), Rows::new());
+            if !radios.contains_key(&radio) {
+                radios.insert(radio.clone(), Rows::new());
             }
-            let rows = radios.get_mut(c.radio.as_str()).expect("inserted above");
-            let Some(c) = report(rows, c, |c| &c.channel, ts, SPECTRUM_REFRESH_SECS) else { continue };
-            self.writer.exec(
-                Db::Config,
-                "INSERT OR REPLACE INTO spectrum (ap_mac, radio, channel, width, utilization, interference, other_bss_count, ts) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-                vec![mac(), Sql::Text(c.radio.clone()), Sql::Integer(c.channel), c.width.into(), c.utilization.into(), c.interference.into(), c.other_bss_count.into(), Sql::Integer(ts)],
-            );
+            let rows = radios.get_mut(&radio).expect("inserted above");
+            for c in channels {
+                let Some(c) = report(rows, c, |c| &c.channel, ts, SPECTRUM_REFRESH_SECS) else { continue };
+                self.writer.exec(
+                    Db::Config,
+                    "INSERT OR REPLACE INTO spectrum (ap_mac, radio, channel, width, utilization, interference, other_bss_count, ts) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                    vec![mac(), Sql::Text(radio.clone()), Sql::Integer(c.channel), c.width.into(), c.utilization.into(), c.interference.into(), c.other_bss_count.into(), Sql::Integer(ts)],
+                );
+            }
         }
         radios.retain(|_, rows| {
             rows.retain(|_, r| r.seen == ts);
