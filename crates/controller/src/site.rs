@@ -195,18 +195,23 @@ fn site_ntp(doc: &mut Value, n: &Value) -> Result<(), String> {
             }
         }
     } else if NTP_KEYS.iter().any(|k| !n[*k].is_null()) {
-        // Manual servers replace all four.
+        // The servers named replace those stored, and the four close up. Coming
+        // from automatic, the pool's servers are no choice of the user's: the
+        // ones not named are blank.
         let mut list = Vec::new();
         for k in NTP_KEYS {
-            if let Some(h) = str_field(n, k)?.map(str::trim).filter(|h| !h.is_empty()) {
-                if !is_host(h) {
-                    return Err(format!("{h} is not a host name or IPv4 address"));
-                }
-                list.push(h);
+            let h = match str_field(n, k)?.map(str::trim) {
+                Some(h) if !h.is_empty() && !is_host(h) => return Err(format!("{h} is not a host name or IPv4 address")),
+                Some(h) => h,
+                None if was_manual => doc[k].as_str().unwrap_or_default(),
+                None => "",
+            };
+            if !h.is_empty() {
+                list.push(h.to_string());
             }
         }
         for (i, k) in NTP_KEYS.iter().enumerate() {
-            doc[*k] = json!(list.get(i).copied().unwrap_or_default());
+            doc[*k] = json!(list.get(i).map_or("", String::as_str));
         }
     }
     if doc["setting_preference"].as_str() == Some("manual") && NTP_KEYS.iter().all(|k| doc[*k].as_str().is_none_or(str::is_empty)) {
@@ -524,7 +529,16 @@ mod tests {
             assert!(edit(&mut s, json!({ "ntp": { "ntp_server_2": bad } })).is_err(), "{bad}");
         }
         assert!(is_host("time-1.example.net") && is_host("192.0.2.1"));
+        // A manual patch merges the servers it names into those stored.
+        edit(&mut s, json!({ "ntp": { "ntp_server_3": "ntp.example.org" } })).unwrap();
+        let servers = |s: &Value| NTP_KEYS.map(|k| setting(s, "ntp")[k].as_str().unwrap_or("?").to_string());
+        assert_eq!(servers(&s), ["time.example.net", "192.0.2.1", "ntp.example.org", ""]);
+        edit(&mut s, json!({ "ntp": { "ntp_server_1": "" } })).unwrap();
+        assert_eq!(servers(&s), ["192.0.2.1", "ntp.example.org", "", ""], "a blank one closes up");
         edit(&mut s, json!({ "ntp": { "setting_preference": "auto" } })).unwrap();
         assert_eq!(setting(&s, "ntp")["ntp_server_1"], "0.ubnt.pool.ntp.org");
+        // From automatic, the pool is not kept for the servers not named.
+        edit(&mut s, json!({ "ntp": { "setting_preference": "manual", "ntp_server_2": "time.example.net" } })).unwrap();
+        assert_eq!(servers(&s), ["time.example.net", "", "", ""]);
     }
 }
