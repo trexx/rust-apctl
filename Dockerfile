@@ -2,7 +2,7 @@
 FROM docker.io/library/node:24-slim AS web
 WORKDIR /web
 COPY web/package.json web/package-lock.json ./
-RUN npm ci --no-fund --no-audit
+RUN --mount=type=cache,target=/root/.npm npm ci --no-fund --no-audit
 COPY web/ ./
 RUN npm run build
 
