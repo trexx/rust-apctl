@@ -241,13 +241,27 @@ impl Jobs {
         self.current.as_mut().filter(|j| j.mac == *mac)
     }
 
+    /// The AP's current job once its command is sent. What the AP reports of
+    /// an upgrade before then is not about this job (an upgrade started
+    /// elsewhere, or a late notice from an earlier one).
+    fn sent_for(&mut self, mac: &Mac) -> Option<&mut Job> {
+        self.current_for(mac).filter(|j| j.state != JobState::Queued)
+    }
+
     /// The AP reports a step of its upgrade: the deadline is re-armed, as the
     /// official controller does on each step.
     pub fn progress(&mut self, mac: &Mac, state: JobState, now: Ts) {
-        if let Some(j) = self.current_for(mac) {
+        if let Some(j) = self.sent_for(mac) {
             j.state = state;
             j.expires = Some(now + STEP_DEADLINE);
         }
+    }
+
+    /// The AP reports that its upgrade failed: [`Jobs::failed`] for a job
+    /// whose command was sent.
+    pub fn upgrade_error(&mut self, mac: &Mac, why: &str) -> Option<Job> {
+        self.sent_for(mac)?;
+        self.failed(mac, why)
     }
 
     /// The AP reports its version: the job succeeded if it was upgrading and
@@ -752,6 +766,22 @@ mod tests {
         assert_eq!(Op::Enqueue(vec![job("c"), job("d")]).apply(&mut j), 2);
         assert_eq!(Op::Enqueue(vec![job("a"), job("c"), job("e")]).apply(&mut j), 1, "a is upgrading and c queued already");
         assert_eq!(Op::CancelQueued.apply(&mut j), 3);
+    }
+
+    #[test]
+    fn notices_before_the_command_is_sent_leave_the_job_alone() {
+        let mut j = Jobs::default();
+        j.enqueue(vec![job("a"), job("b")]);
+        // An upgrade started elsewhere, or a late notice of an earlier one.
+        j.progress(&m("a"), JobState::Downloading, 100);
+        assert!(j.upgrade_error(&m("a"), "download failed").is_none());
+        assert_eq!(j.current.as_ref().map(|c| (c.mac, c.state, c.expires)), Some((m("a"), JobState::Queued, None)));
+        // Its turn still sends the command; after that the notices count.
+        command(&mut j, &m("a"), &json!({}), 110).unwrap().unwrap();
+        j.progress(&m("a"), JobState::Downloading, 120);
+        assert_eq!(j.current.as_ref().map(|c| c.state), Some(JobState::Downloading));
+        assert_eq!(j.upgrade_error(&m("a"), "download failed").map(|f| f.mac), Some(m("a")));
+        assert!(j.current.is_none() && j.stopped.is_some());
     }
 
     #[test]
