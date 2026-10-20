@@ -111,11 +111,14 @@ used, so the login throttle sees each client rather than the proxy.
 Try the UI without any APs. The demo is a made-up site with three APs and about twenty clients:
 
 ```sh
-cargo build --release -p informdump -p controller
-target/release/informdump demo-state > demo.json
-target/release/apctl serve --data-dir demo-data --keys demo.json \
+# Two builds: informdump turns on serde_json features that apctl is not built with.
+cargo build --release -p controller
+cargo build --release -p informdump
+mkdir -p data   # git-ignored, and kept out of image builds
+target/release/informdump demo-state > data/demo.json
+target/release/apctl serve --data-dir data/demo --keys data/demo.json \
   --shadow-cmd "target/release/informdump demo --live"   # charts fill in after a minute or two
-# Optional: upload demo.json on the Settings page for SSIDs and the settings editor.
+# Optional: upload data/demo.json on the Settings page for SSIDs and the settings editor.
 ```
 
 ## Build
