@@ -1636,9 +1636,13 @@ fn radio_edit(state: &Value, e: &DeviceEdit, rp: &Value, before: &Value, d: &mut
             r["channel"] = json!(ch);
         }
     }
-    // A fixed channel must be legal for the (possibly new) width.
-    if let Some((ch, width)) = illegal_fixed_channel(country(state), r, o) {
-        return Err(format!("{label}: channel {ch} is not allowed at {width} MHz here"));
+    // A fixed channel must be legal for the (possibly new) width: by the
+    // country's rules, or where apctl has none, one the band has at that width.
+    if let Some(ch) = num(&r["channel"]) {
+        let width = num(&r["ht"]).unwrap_or(20);
+        if !is_legal(country(state), band, width, o, ch).unwrap_or_else(|| band_channels(band, width).contains(&ch)) {
+            return Err(format!("{label}: channel {ch} is not allowed at {width} MHz here"));
+        }
     }
     // The official controller refuses any change here, which strands an AP
     // that came under the lock on another channel (one adopted after the lock
@@ -2214,6 +2218,15 @@ mod tests {
         }
         assert!(dev(&mut s, json!({ "radios": [{ "radio": "na", "channel": 999 }] })).unwrap_err().contains("not a channel"));
         assert_eq!(s["devices"][0]["radio_table"][2]["channel"], 37);
+        // Nor one the band has, but not at the width: the editor never offers these.
+        let mut wide = s.clone();
+        wide["devices"][0]["radio_table"][2]["ht"] = json!("160");
+        assert!(dev(&mut wide, json!({ "radios": [{ "radio": "6e", "channel": 233 }] })).unwrap_err().contains("not allowed at 160 MHz"));
+        assert!(dev(&mut s.clone(), json!({ "radios": [{ "radio": "na", "channel": 165, "ht": 80 }] })).unwrap_err().contains("not allowed at 80 MHz"));
+        // A width change that the kept channel does not fit is refused too.
+        s["devices"][0]["radio_table"][2]["channel"] = json!(233);
+        s["devices"][0]["radio_table"][2]["ht"] = json!(20);
+        assert!(dev(&mut s.clone(), json!({ "radios": [{ "radio": "6e", "ht": 40 }] })).unwrap_err().contains("channel 233"));
     }
 
     #[test]
