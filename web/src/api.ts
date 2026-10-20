@@ -737,9 +737,15 @@ const spanParams = (s: TimeSpan) => (isFixed(s) ? { from: s.from, to: s.to } : {
 
 const spanLength = (s: TimeSpan) => (isFixed(s) ? s.to - s.from : s.last);
 
+/** A fixed window that ended over ten minutes ago: its data no longer changes. */
+const settled = (s: TimeSpan) => isFixed(s) && s.to < Date.now() / 1000 - 600;
+
 /** Live ranges refresh; fixed windows in the past don't change. Pass it as `refetchInterval: () => refreshFor(…)`, so it is asked again after
  *  each fetch: a fixed window ending at about now stops refreshing once it is ten minutes past. */
-const refreshFor = (s: TimeSpan, live: number) => (isFixed(s) && s.to < Date.now() / 1000 - 600 ? false : live);
+const refreshFor = (s: TimeSpan, live: number) => (settled(s) ? false : live);
+
+/** A settled window's data stays fresh, so a focus or remount doesn't fetch it again; others keep the default staleness. */
+const freshFor = (s: TimeSpan) => (settled(s) ? { staleTime: Infinity } : {});
 
 /** Whether two keys of a span family differ in the span alone (the family's first argument, as in every one of `keys`). */
 const onlySpanDiffers = (a: QueryKey, b: QueryKey) => hashKey([a[0], ...a.slice(2)]) === hashKey([b[0], ...b.slice(2)]);
@@ -754,6 +760,7 @@ function useSpanQuery<T>(key: QueryKey, path: string, span: TimeSpan, extra: Rec
     queryKey: key,
     queryFn: getting<T>(`${path}${qs({ ...spanParams(span), ...extra })}`),
     refetchInterval: () => refreshFor(span, 60_000),
+    ...freshFor(span),
     placeholderData: (prev, prevQuery) => (prevQuery && (keepAcrossChoices || onlySpanDiffers(prevQuery.queryKey, key)) ? prev : undefined),
   });
 }
@@ -1103,6 +1110,7 @@ export function useSeries(table: string, key: string, span: TimeSpan) {
       return get<Series>(url(from), signal);
     },
     refetchInterval: () => refreshFor(span, spanLength(span) <= 6 * 3600 ? 15_000 : 300_000),
+    ...freshFor(span),
     placeholderData: keepPreviousData,
   });
 }
