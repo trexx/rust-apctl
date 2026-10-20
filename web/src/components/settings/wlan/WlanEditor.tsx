@@ -66,7 +66,8 @@ export function WlanEditor({
       }),
     );
   const patch: Fields = wlan ? w.changes() : { ...form };
-  if (password) patch.passphrase = password;
+  // Only while its field shows: an open SSID takes none.
+  if (password && form.protection !== "open") patch.passphrase = password;
   const section = { w, list };
   return (
     <EditorShell

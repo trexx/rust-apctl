@@ -31,7 +31,8 @@ function SiteEditor({ d, onClose }: { d: SiteSettings; onClose: () => void }) {
   const r = syslog.changes();
   if (Object.keys(r).length) patch.rsyslogd = r;
   const sn: Fields = snmp.changes();
-  if (v3password) sn.x_password = v3password;
+  // Only while its field shows, with SNMPv3 on.
+  if (v3password && snmp.form.enabledV3) sn.x_password = v3password;
   if (Object.keys(sn).length) patch.snmp = sn;
   // Manual servers are sent as a whole list.
   if (Object.keys(ntp.changes()).length)
