@@ -240,3 +240,9 @@ export function fromLocalInput(v: string): number | null {
   const t = new Date(v).getTime();
   return Number.isFinite(t) ? Math.floor(t / 1000) : null;
 }
+
+/** A MAC as apctl writes it, "aa:bb:cc:dd:ee:ff", from any form the server reads (colons, dashes or neither, any case); anything else as it is. */
+export function canonicalMac(s: string): string {
+  const hex = /^[0-9a-f]{12}$/i.test(s) || /^[0-9a-f]{2}([:-])([0-9a-f]{2}\1){4}[0-9a-f]{2}$/i.test(s) ? s.replace(/[:-]/g, "").toLowerCase() : null;
+  return hex ? (hex.match(/../g) ?? []).join(":") : s;
+}

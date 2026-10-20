@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { Link, useParams } from "react-router";
+import { Link, Navigate, useLocation, useParams } from "react-router";
 import {
   HttpError,
   displayName,
@@ -27,6 +27,7 @@ import {
   ago,
   bandChannel,
   bytes,
+  canonicalMac,
   compact,
   dbm,
   duration,
@@ -42,7 +43,12 @@ import type { GroupMember, Multicast } from "../api";
 
 /** Keyed by MAC: nothing typed or shown for one client carries over to the next. */
 export function Client() {
-  const mac = useParams().mac ?? "";
+  const typed = useParams().mac ?? "";
+  const { search } = useLocation();
+  // A MAC pasted in another form: the series, live updates and names all key by this one.
+  const mac = canonicalMac(typed);
+  if (mac !== typed)
+    return <Navigate replace to={{ pathname: `/clients/${mac}`, search }} />;
   return <ClientPage key={mac} mac={mac} />;
 }
 
