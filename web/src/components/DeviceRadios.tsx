@@ -97,7 +97,9 @@ export function RadioPanel({
   const dropped = sum("tx_dropped");
   const mcast =
     sum("tx_mcast") + sum("rx_mcast") + sum("tx_bcast") + sum("rx_bcast");
-  const mcastShare = (100 * mcast) / Math.max(1, txPkts + sum("rx_packets"));
+  // As the server's multicast insight: none without packets, at most all of them.
+  const pkts = txPkts + sum("rx_packets");
+  const mcastShare = pkts > 0 ? Math.min(100, (100 * mcast) / pkts) : null;
   const eirp =
     radio.tx_power !== null && radio.antenna_gain !== null
       ? radio.tx_power + radio.antenna_gain
