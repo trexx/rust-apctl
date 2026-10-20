@@ -1,11 +1,16 @@
 import { Link } from "react-router";
 import { useDeviceNames, useDryRun } from "../api";
-import type { DryRun as DryRunData, FieldComparison } from "../api";
+import type {
+  DryRun as DryRunData,
+  FieldComparison,
+  StoredComparison,
+} from "../api";
 import { Dot, QueryNote, THead } from "../components/common";
 import { clock, useNow } from "../format";
 import type { Tone } from "../format";
 
 type Status = DryRunData["devices"][number]["status"];
+type Compared = DryRunData["history"][number];
 
 const STATUS: Record<Status, string> = {
   match: "Identical",
@@ -26,21 +31,27 @@ const TONE: Record<Status, Tone> = {
   no_config_seen: "warn",
 };
 
-function FieldResult({ label, c }: { label: string; c: FieldComparison }) {
-  const verdict = c.identical
+/** How one config compares, in words; `long` explains an equivalent one. */
+const verdict = (c: StoredComparison, long = false) =>
+  c.identical
     ? "identical"
     : c.equivalent
-      ? "equivalent: only the order of unordered lists differs (the current controller doesn't keep it stable)"
+      ? long
+        ? "equivalent: only the order of unordered lists differs (the current controller doesn't keep it stable)"
+        : "equivalent"
       : c.same_content
         ? "same lines, different order"
         : `${c.added} extra, ${c.removed} missing, ${c.changed} different`;
+
+function FieldResult({ label, c }: { label: string; c: FieldComparison }) {
   const ok = c.identical || c.equivalent;
   return (
     <div className="dr-field">
       <span className={ok ? "tone-good" : "error"}>{ok ? "✓" : "✗"}</span>{" "}
       <b>{label}</b>{" "}
       <span className="muted">
-        {verdict} · ours {c.expected_lines} lines, actual {c.actual_lines}
+        {verdict(c, true)} · ours {c.expected_lines} lines, actual{" "}
+        {c.actual_lines}
       </span>
       {!c.identical && c.diff && (
         <details>
@@ -59,9 +70,20 @@ export function DryRun() {
   const now = useNow();
   if (!dr.data) return <QueryNote q={dr} />;
   const d = dr.data;
-  // A match whose system_cfg isn't identical differs only in the order of unordered lists.
-  const equivalent = (h: DryRunData["history"][number]) =>
-    h.matches && h.comparison?.system_cfg?.identical === false;
+  // A match with a config that isn't identical differs only in the order of unordered lists.
+  const equivalent = (h: Compared) =>
+    h.matches &&
+    (h.comparison?.system_cfg?.identical === false ||
+      h.comparison?.mgmt_cfg?.identical === false);
+  /** Each config that isn't identical, and how it compares. */
+  const difference = (h: Compared) =>
+    h.comparison?.error ??
+    (["mgmt_cfg", "system_cfg"] as const)
+      .flatMap((f) => {
+        const c = h.comparison?.[f];
+        return c && !c.identical ? [`${f}: ${verdict(c)}`] : [];
+      })
+      .join("; ");
   const total = d.history.length;
   const matched = d.history.filter((h) => h.matches).length;
   const reordered = d.history.filter(equivalent).length;
@@ -126,7 +148,7 @@ export function DryRun() {
           </div>
         ) : (
           <table className="table">
-            <THead columns={["Time", "AP", "Result", "system_cfg"]} />
+            <THead columns={["Time", "AP", "Result", "Difference"]} />
             <tbody>
               {d.history.map((h) => (
                 <tr key={h.id}>
@@ -137,14 +159,11 @@ export function DryRun() {
                       ? "equivalent"
                       : h.matches
                         ? "identical"
-                        : "differs"}
+                        : h.comparison?.error
+                          ? "error"
+                          : "differs"}
                   </td>
-                  <td className="muted">
-                    {h.comparison?.error ??
-                      (h.comparison?.system_cfg
-                        ? `${h.comparison.system_cfg.added} extra, ${h.comparison.system_cfg.removed} missing, ${h.comparison.system_cfg.changed} different`
-                        : "")}
-                  </td>
+                  <td className="muted">{difference(h)}</td>
                 </tr>
               ))}
             </tbody>
