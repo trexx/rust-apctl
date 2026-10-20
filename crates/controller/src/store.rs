@@ -79,6 +79,15 @@ impl Table {
         self.settings.iter().chain(self.gauges).chain(self.counters).copied()
     }
 
+    /// The numeric columns named in `list` (comma-separated), as their places in
+    /// column order; else the first name that is none of them.
+    pub fn numbers_named<'a>(&self, list: &'a str) -> Result<Vec<usize>, &'a str> {
+        let mut picked = list.split(',').map(|f| self.numbers().position(|n| n == f).ok_or(f)).collect::<Result<Vec<_>, _>>()?;
+        picked.sort_unstable();
+        picked.dedup();
+        Ok(picked)
+    }
+
     /// How many values a metric row has: one for every column but `ts`.
     fn width(&self) -> usize {
         self.keys.len() + self.texts.len() + self.settings.len() + self.gauges.len() + self.counters.len()
@@ -772,9 +781,14 @@ pub fn tier_for(from: Ts, to: Ts, now: Ts) -> usize {
     }
 }
 
-pub fn series(conn: &Connection, table: &'static Table, keys: &[String], from: Ts, to: Ts, tier: usize) -> Result<Series> {
+/// A series of `table`'s numbers, or of those at the places `only` lists (see
+/// `Table::numbers_named`).
+pub fn series(conn: &Connection, table: &'static Table, keys: &[String], only: Option<&[usize]>, from: Ts, to: Ts, tier: usize) -> Result<Series> {
     let Tier { step, name, .. } = TIERS[tier];
-    let fields: Vec<&'static str> = table.numbers().collect();
+    let all: Vec<&'static str> = table.numbers().collect();
+    // Each field's place among the statement's numbers.
+    let places: Vec<usize> = only.map_or_else(|| (0..all.len()).collect(), <[usize]>::to_vec);
+    let fields: Vec<&'static str> = places.iter().map(|&j| all[j]).collect();
     let params = [Value::Integer(from), Value::Integer(to)].into_iter().chain(keys.iter().map(|k| Value::Text(k.clone())));
     let mut stmt = conn.prepare_cached(table.series(tier))?;
     let mut rows = stmt.query(params_from_iter(params))?;
@@ -789,14 +803,14 @@ pub fn series(conn: &Connection, table: &'static Table, keys: &[String], from: T
     let mut prev_ts: Option<Ts> = None;
     while let Some(r) = rows.next()? {
         let ts: Ts = r.get(0)?;
-        for (j, v) in vals.iter_mut().enumerate() {
+        for (v, j) in vals.iter_mut().zip(&places) {
             *v = r.get(j + 1)?;
         }
         // The look-behind row only feeds the first rate.
         if ts >= from {
             ts_out.push(ts);
-            for (j, column) in columns.iter_mut().enumerate() {
-                let v = if j < n_gauges {
+            for ((j, column), place) in columns.iter_mut().enumerate().zip(&places) {
+                let v = if *place < n_gauges {
                     vals[j]
                 } else {
                     // Rate from the previous row, by the views' rules: nothing for a
@@ -859,13 +873,19 @@ mod tests {
         assert_eq!(apply(&mut conns[Db::Metrics as usize], writes).unwrap(), 0);
 
         let m = &conns[Db::Metrics as usize];
-        let s = series(m, &UPLINK, &["aa".into()], now - 1200, now, 0).unwrap();
+        let s = series(m, &UPLINK, &["aa".into()], None, now - 1200, now, 0).unwrap();
         assert_eq!(s.ts.len(), 60);
         let rx = &s.fields["rx_bytes"];
         assert_eq!(rx[0], None, "no previous sample for the first point");
         assert_eq!(rx[1], Some(1000.0));
         assert_eq!((rx[30], rx[31]), (Some(0.0), Some(1000.0)), "nothing for the reset, then on from the new value");
         assert_eq!(s.fields["speed"][5], Some(1000.0));
+        // Some of the numbers only: the same values, the others left out.
+        let only = UPLINK.numbers_named("rx_bytes,speed,rx_bytes").unwrap();
+        let some = series(m, &UPLINK, &["aa".into()], Some(&only), now - 1200, now, 0).unwrap();
+        assert_eq!((some.ts, some.fields.keys().copied().collect::<Vec<_>>()), (s.ts.clone(), vec!["rx_bytes", "speed"]));
+        assert_eq!((&some.fields["rx_bytes"], &some.fields["speed"]), (rx, &s.fields["speed"]));
+        assert_eq!(UPLINK.numbers_named("speed,mac"), Err("mac"));
 
         // A second series without resets: 20 minutes at 1000 B/s, for the roll-up.
         let mut writes = Vec::new();
@@ -879,10 +899,10 @@ mod tests {
         // The last bucket has just ended: rows for it may still be on their way.
         maintenance(&mut conns, now, false);
         let m = &conns[Db::Metrics as usize];
-        assert_eq!(series(m, &UPLINK, &["bb".into()], now - 3600, now, 1).unwrap().ts.len(), 3);
+        assert_eq!(series(m, &UPLINK, &["bb".into()], None, now - 3600, now, 1).unwrap().ts.len(), 3);
         maintenance(&mut conns, now + ROLLUP_GRACE_SECS, false);
         let m = &conns[Db::Metrics as usize];
-        let five = series(m, &UPLINK, &["bb".into()], now - 3600, now, 1).unwrap();
+        let five = series(m, &UPLINK, &["bb".into()], None, now - 3600, now, 1).unwrap();
         assert_eq!(five.step, 300);
         assert_eq!(five.ts, vec![now - 1200, now - 900, now - 600, now - 300]);
         assert_eq!(five.fields["speed"], vec![Some(1000.0); 4]);
@@ -891,7 +911,7 @@ mod tests {
         // Running maintenance again is idempotent and does not redo finished buckets.
         maintenance(&mut conns, now + ROLLUP_GRACE_SECS, false);
         let m = &conns[Db::Metrics as usize];
-        assert_eq!(series(m, &UPLINK, &["bb".into()], now - 3600, now, 1).unwrap().ts.len(), 4);
+        assert_eq!(series(m, &UPLINK, &["bb".into()], None, now - 3600, now, 1).unwrap().ts.len(), 4);
     }
 
     #[test]
@@ -911,7 +931,7 @@ mod tests {
             })
             .collect();
         assert_eq!(apply(&mut conns[Db::Metrics as usize], writes).unwrap(), 0);
-        let s = series(&conns[Db::Metrics as usize], &UPLINK, &["aa".into()], now - 600, now, 0).unwrap();
+        let s = series(&conns[Db::Metrics as usize], &UPLINK, &["aa".into()], None, now - 600, now, 0).unwrap();
         assert_eq!(s.ts, vec![now - 500, now - 490]);
         assert_eq!(s.fields["rx_bytes"], vec![None, Some(1000.0)]);
     }
@@ -934,7 +954,7 @@ mod tests {
             .collect();
         assert_eq!(apply(&mut conns[Db::Metrics as usize], writes).unwrap(), 0);
         maintenance(&mut conns, now + ROLLUP_GRACE_SECS, false);
-        let five = series(&conns[Db::Metrics as usize], &RADIO, &["aa".into(), "na".into()], now - 600, now, 1).unwrap();
+        let five = series(&conns[Db::Metrics as usize], &RADIO, &["aa".into(), "na".into()], None, now - 600, now, 1).unwrap();
         assert_eq!(five.ts, vec![now - 600]);
         assert_eq!((five.fields["channel"][0], five.fields["bw"][0], five.fields["cu_total"][0]), (Some(149.0), Some(80.0), Some(30.0)));
     }
@@ -959,7 +979,7 @@ mod tests {
             .collect();
         assert_eq!(apply(&mut conns[Db::Metrics as usize], writes).unwrap(), 0);
         maintenance(&mut conns, now, false);
-        let five = series(&conns[Db::Metrics as usize], &UPLINK, &["aa".into()], bucket, bucket + 300, 1).unwrap();
+        let five = series(&conns[Db::Metrics as usize], &UPLINK, &["aa".into()], None, bucket, bucket + 300, 1).unwrap();
         assert_eq!(five.ts, vec![bucket]);
         assert_eq!(five.fields["speed"], vec![Some(1500.0)], "the rows before the cutoff count too");
     }

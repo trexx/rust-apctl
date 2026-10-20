@@ -971,6 +971,8 @@ async fn import_aliases(
 struct SeriesQuery {
     /// Key values in the table's key order, comma-separated (e.g. `mac,radio`).
     key: String,
+    /// The numbers wanted, comma-separated (e.g. `cpu,mem`): every one if not given.
+    fields: Option<String>,
     from: Option<Ts>,
     to: Option<Ts>,
 }
@@ -981,9 +983,10 @@ async fn series(State(s): State<AppState>, Path(table): Path<String>, Query(q): 
     if keys.len() != t.keys.len() {
         return Err(ApiError::bad(format!("{table} needs key {}", t.keys.join(","))));
     }
+    let only = q.fields.as_deref().map(|f| t.numbers_named(f)).transpose().map_err(|f| ApiError::bad(format!("{table} has no field {f}")))?;
     // An hour by default. No shortest window: a live chart asks for what is newer than its last sample.
     let (from, to, tier) = crate::series::bounded(q.from, q.to, 3600);
-    Ok(Json(read(&s.store, Db::Metrics, move |c| store::series(c, t, &keys, from, to, tier)).await?))
+    Ok(Json(read(&s.store, Db::Metrics, move |c| store::series(c, t, &keys, only.as_deref(), from, to, tier)).await?))
 }
 
 /// A WHERE clause made of optional filters, with numbered parameters.
@@ -1658,6 +1661,8 @@ mod tests {
         let (status, msg) = error(get("/api/series/clients?from=soon").await.unwrap()).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert!(msg.starts_with("Failed to deserialize query string"), "{msg}");
+        let (status, msg) = error(get("/api/series/ap_stats?key=02:00:00:00:00:01&fields=cpu,nope").await.unwrap()).await;
+        assert_eq!((status, msg.as_str()), (StatusCode::BAD_REQUEST, "ap_stats has no field nope"));
         let put = |content_type: &str, body: &'static str| {
             let req = Request::put("/api/clients/02:00:00:00:01:01/alias").header(header::COOKIE, &cookie).header("x-requested-with", "apctl").header(header::CONTENT_TYPE, content_type);
             app.clone().oneshot(req.body(Body::from(body)).unwrap())
