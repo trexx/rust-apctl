@@ -1400,9 +1400,18 @@ pub fn ensure_default_usergroup(state: &mut Value) -> String {
 }
 
 /// The default user group as [`ensure_default_usergroup`] adds it (but for
-/// its `site_id`).
+/// its `site_id`). Its id is the one most SSIDs point at (the first of a tie)
+/// that no group has: an id a group has is a speed limit, not the default.
 fn new_default_usergroup(state: &Value) -> Value {
-    let id = docs(state, "wlanconf").find_map(|w| w["usergroup_id"].as_str().filter(|g| !g.is_empty()).map(str::to_string)).unwrap_or_else(new_id);
+    let mut uses: Vec<(&str, usize)> = Vec::new();
+    for g in docs(state, "wlanconf").filter_map(|w| w["usergroup_id"].as_str()).filter(|g| !g.is_empty() && doc_by_id(state, "usergroup", g).is_none()) {
+        match uses.iter_mut().find(|(id, _)| *id == g) {
+            Some((_, n)) => *n += 1,
+            None => uses.push((g, 1)),
+        }
+    }
+    // max_by_key keeps the last of equals: reversed, that is the first seen.
+    let id = uses.into_iter().rev().max_by_key(|(_, n)| *n).map_or_else(new_id, |(id, _)| id.to_string());
     json!({ "_id": id, "name": "Default", "attr_hidden_id": "Default", "attr_no_delete": true, "qos_rate_max_down": -1, "qos_rate_max_up": -1 })
 }
 
@@ -2554,6 +2563,21 @@ mod speed_and_schedule_tests {
         assert_eq!(ensure_default_usergroup(&mut s), "ug-imported");
         assert_eq!(ensure_default_usergroup(&mut s), "ug-imported", "made once");
         assert_eq!(s["usergroup"].as_array().unwrap().len(), 1);
+        // An id a group already has is that group's (a speed limit), never the
+        // default's; of the others the one most SSIDs use wins.
+        let mut s = state();
+        let ssid = |id: &str, g: &str| json!({ "_id": id, "site_id": "s1", "name": id, "security": "open", "usergroup_id": g });
+        s["wlanconf"] = json!([ssid("w1", "ug-slow"), ssid("w2", "ug-a"), ssid("w3", "ug-b"), ssid("w4", "ug-b")]);
+        s["usergroup"] = json!([{ "_id": "ug-slow", "name": "Slow", "site_id": "s1", "qos_rate_max_down": 1000 }]);
+        assert_eq!(ensure_default_usergroup(&mut s), "ug-b");
+        s["wlanconf"] = json!([ssid("w1", "ug-slow")]);
+        s["usergroup"].as_array_mut().unwrap().truncate(1);
+        let id = ensure_default_usergroup(&mut s);
+        assert!(id != "ug-slow" && s["usergroup"].as_array().unwrap().len() == 2, "{id}");
+        // A tie goes to the first SSID's.
+        let mut s = state();
+        s["wlanconf"] = json!([ssid("w1", "ug-a"), ssid("w2", "ug-b")]);
+        assert_eq!(ensure_default_usergroup(&mut s), "ug-a");
     }
 
     #[test]
