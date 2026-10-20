@@ -1029,8 +1029,10 @@ export const useNeighbors = (range: number, band: string) =>
 /** Only how loudly our APs hear each other (no neighbour list). */
 export const useOwnLinks = (range: number) => useSpanQuery<{ own_links: OwnLink[] }>(keys.rfLinks(range), "/api/rf/neighbors", { last: range }, { links_only: "true" });
 
-export const useChannelPlan = (band: string, dfs: boolean) =>
+/** `enabled` false waits, for a caller that doesn't know `dfs` yet. */
+export const useChannelPlan = (band: string, dfs: boolean, enabled = true) =>
   useQuery({
+    enabled,
     queryKey: keys.rfPlan(band, dfs),
     queryFn: getting<ChannelPlanResult>(`/api/rf/channel-plan${qs({ band, dfs: dfs ? "true" : undefined })}`),
   });

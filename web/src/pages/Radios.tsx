@@ -149,11 +149,13 @@ function ChannelPlan({
   band: "ng" | "na";
   radios: RadioOverview[];
 }) {
-  // As Channel AI's nightly run plans, until changed here.
+  // As Channel AI's nightly run plans, until changed here. DFS is a 5 GHz
+  // choice: that plan waits for the setting rather than load twice.
   const ai = useChannelAi();
   const [ownDfs, setDfs] = useState<boolean | null>(null);
-  const dfs = ownDfs ?? ai.data?.settings.dfs ?? false;
-  const plan = useChannelPlan(band, dfs);
+  const dfs = band === "na" && (ownDfs ?? ai.data?.settings.dfs ?? false);
+  const known = band !== "na" || ownDfs !== null || !ai.isPending;
+  const plan = useChannelPlan(band, dfs, known);
   return (
     <div className="panel">
       <div className="panel-head">
