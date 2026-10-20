@@ -495,8 +495,8 @@ pub struct Engine {
     alerts: Option<crate::alerts::Sink>,
     /// The time of this run's first tick (the capture's time in shadow mode).
     first_tick: Option<Ts>,
-    /// Each AP's last push as stored before this run (its secrets masked), until
-    /// a push to it is seen: what that push is compared with.
+    /// Each AP's last push as stored before this run (its secrets masked): what
+    /// the pushes to it are compared with, each field until a push carries it.
     stored_config: HashMap<Mac, PushedConfig>,
 }
 
@@ -889,11 +889,11 @@ impl Engine {
         let stored = self.stored_config.remove(&mac);
         let (radios, previous, redacted, state, inform) = {
             let live = self.live.read().unwrap();
-            // The last push, for the diffs: the one seen in this run (unredacted), else
-            // the one stored before it (secrets masked); empty fields if there is none.
+            // The last push, for the diffs, field by field: the one seen in this run
+            // (unredacted), else the one stored before it (secrets masked); empty if
+            // there is none.
             let seen = live.last_config.get(&mac).cloned();
-            let redacted = seen.is_none() && stored.is_some();
-            let previous = seen.or(stored.map(Arc::new)).unwrap_or_default();
+            let (previous, redacted) = previous_push(seen, stored);
             let has_system = new_system.as_ref().map_or(!previous.system_cfg.is_empty(), |s| !s.is_empty());
             // For the section labels, which only a system_cfg has.
             let radios = live.devices.get(&mac).filter(|_| has_system).map(|d| d.snapshot.radios.clone()).unwrap_or_default();
@@ -906,7 +906,7 @@ impl Engine {
         let system = new_system.as_deref().unwrap_or(&previous.system_cfg);
         let mut data = serde_json::Map::new();
         data.insert("cfgversion".into(), p["cfgversion"].clone());
-        for (field, new, old) in [("mgmt_cfg", &new_mgmt, &previous.mgmt_cfg), ("system_cfg", &new_system, &previous.system_cfg)] {
+        for (field, new, old, redacted) in [("mgmt_cfg", &new_mgmt, &previous.mgmt_cfg, redacted[0]), ("system_cfg", &new_system, &previous.system_cfg, redacted[1])] {
             let Some(new) = new else { continue };
             let summary = if old.is_empty() {
                 json!({ "baseline": true, "lines": new.lines().count() })
@@ -959,7 +959,7 @@ impl Engine {
                     previous_system_cfg: Some(system),
                 };
                 // Masked when a field the push does not carry is the stored copy's.
-                let masked = redacted && (new_mgmt.is_none() || new_system.is_none());
+                let masked = (redacted[0] && new_mgmt.is_none()) || (redacted[1] && new_system.is_none());
                 Some(self.dry_run(render, ts, &req, cfgversion.as_deref(), mgmt, masked))
             }
             _ => None,
@@ -968,11 +968,21 @@ impl Engine {
         // As in `inform`: the write lock is held for the swap alone, and the old
         // push is dropped and the events emitted after it. A field the push does
         // not carry is the last push's, but only known in full from one seen in
-        // this run: else it is left empty, and readers go to the stored copy.
-        let kept = |old: &String| if redacted { String::new() } else { old.clone() };
+        // this run: else it is left empty, readers go to the stored copy, and so
+        // does the next push, which keeps it here until a push carries the field.
+        let still_stored = |redacted: bool, new: &Option<String>, old: &String| if redacted && new.is_none() { old.clone() } else { String::new() };
+        let left = PushedConfig {
+            mgmt_cfg: still_stored(redacted[0], &new_mgmt, &previous.mgmt_cfg),
+            system_cfg: still_stored(redacted[1], &new_system, &previous.system_cfg),
+            cfgversion: None,
+        };
+        if !left.mgmt_cfg.is_empty() || !left.system_cfg.is_empty() {
+            self.stored_config.insert(mac, left);
+        }
+        let kept = |redacted: bool, old: &String| if redacted { String::new() } else { old.clone() };
         let pushed = PushedConfig {
-            mgmt_cfg: new_mgmt.unwrap_or_else(|| kept(&previous.mgmt_cfg)),
-            system_cfg: new_system.unwrap_or_else(|| kept(&previous.system_cfg)),
+            mgmt_cfg: new_mgmt.unwrap_or_else(|| kept(redacted[0], &previous.mgmt_cfg)),
+            system_cfg: new_system.unwrap_or_else(|| kept(redacted[1], &previous.system_cfg)),
             cfgversion,
         };
         let mut live = self.live.write().unwrap();
@@ -1757,6 +1767,21 @@ impl Engine {
             });
         }
     }
+}
+
+/// An AP's last push, field by field: the one `seen` in this run, else the
+/// `stored` one, whose fields are flagged (mgmt_cfg, system_cfg) as redacted.
+fn previous_push(seen: Option<Arc<PushedConfig>>, stored: Option<PushedConfig>) -> (Arc<PushedConfig>, [bool; 2]) {
+    let Some(stored) = stored else { return (seen.unwrap_or_default(), [false; 2]) };
+    let Some(seen) = seen else {
+        let redacted = [!stored.mgmt_cfg.is_empty(), !stored.system_cfg.is_empty()];
+        return (Arc::new(stored), redacted);
+    };
+    let pick = |seen: &String, stored: String| if seen.is_empty() && !stored.is_empty() { (stored, true) } else { (seen.clone(), false) };
+    let (mgmt_cfg, mgmt_redacted) = pick(&seen.mgmt_cfg, stored.mgmt_cfg);
+    let (system_cfg, system_redacted) = pick(&seen.system_cfg, stored.system_cfg);
+    let cfgversion = seen.cfgversion.clone().or(stored.cfgversion);
+    (Arc::new(PushedConfig { mgmt_cfg, system_cfg, cfgversion }), [mgmt_redacted, system_redacted])
 }
 
 /// Human names for numbered config sections: SSIDs (with band) for `aaa.N` and
@@ -2664,6 +2689,18 @@ mod tests {
         flushed(&h.writer);
         let row: (String, String) = h.store.read(Db::Config, |c| Ok(c.query_row("SELECT cfgversion, system_cfg FROM device_config", [], |r| Ok((r.get(0)?, r.get(1)?)))?)).unwrap();
         assert_eq!(row, ("v2".into(), "aaa.1.hide_ssid=true\naaa.1.wpa.psk=<redacted>".into()));
+        // The stored system_cfg stays what the next pushes are compared with: a
+        // second management-only push still names its sections, and the next full
+        // push gets a diff, not a baseline.
+        push(&mut h, 35, json!({ "_type": "setparam", "mgmt_cfg": "a=3" }));
+        assert!(stored(&h, EventKind::ConfigPushed).pop().unwrap()["labels"].is_object());
+        push(&mut h, 40, json!({ "_type": "setparam", "mgmt_cfg": "a=4", "system_cfg": "aaa.1.hide_ssid=false\naaa.1.wpa.psk=old" }));
+        let pushed = stored(&h, EventKind::ConfigPushed).pop().unwrap();
+        assert_eq!((pushed["system_cfg"]["diff"].as_str(), pushed["mgmt_cfg"]["diff"].as_str()), (Some("~ aaa.1.hide_ssid: true -> false\n"), Some("~ a: 3 -> 4\n")));
+        // From then on, the push seen in this run.
+        push(&mut h, 50, json!({ "_type": "setparam", "system_cfg": "aaa.1.hide_ssid=false\naaa.1.wpa.psk=new" }));
+        let diff = stored(&h, EventKind::ConfigPushed).pop().unwrap()["system_cfg"]["diff"].as_str().unwrap().to_string();
+        assert!(diff.contains("aaa.1.wpa.psk: <redacted> -> <redacted>"), "{diff}");
     }
 
     #[test]
