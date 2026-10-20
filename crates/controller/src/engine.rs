@@ -1647,7 +1647,11 @@ impl Engine {
         // neighbour is written once a minute (last_seen), an unchanged spectrum
         // row once an hour. What the AP no longer reports is forgotten here.
         let rows = self.written.neighbors.entry(s.ap.mac).or_default();
-        for n in neighbors {
+        for mut n in neighbors {
+            // When the scan heard it, which is when it was last seen as it is: an entry
+            // the AP keeps reporting from an old scan is no sighting now. Its age
+            // grows at every inform, so it is no change of the neighbour.
+            let heard = ts - n.age.take().unwrap_or(0).clamp(0, ts.max(0));
             let Some(n) = report(rows, n, |n| n.bssid.as_str(), ts, REFRESH_SECS) else { continue };
             self.writer.exec(
                 Db::Config,
@@ -1660,7 +1664,7 @@ impl Engine {
                 vec![
                     Sql::Text(n.bssid.clone()), mac(), n.radio.clone().into(), n.essid.clone().into(), n.channel.into(), n.bw.into(),
                     n.center_freq.into(), n.security.clone().into(), n.signal.into(), n.noise.into(), Sql::Integer(n.is_unifi as i64),
-                    n.ap_name.clone().into(), n.model.clone().into(), Sql::Integer(ts),
+                    n.ap_name.clone().into(), n.model.clone().into(), Sql::Integer(heard),
                 ],
             );
         }
@@ -2201,6 +2205,15 @@ mod tests {
         assert!(h.engine.written.neighbors[&AP1.parse().unwrap()].is_empty(), "no longer reported: forgotten");
         feed(&mut h, 50, Some(-60));
         assert_eq!(last_seen(&h), 50, "reported again: written as new");
+        // An entry from an earlier scan was last seen when that scan heard it.
+        let mut p = inform(AP1, 1000 + 70, &[]);
+        p["radio_table"] = json!([{ "radio": "na", "scan_table": [{ "bssid": "02:cd:00:00:00:01", "signal": -50, "age": 1200 }] }]);
+        h.engine.handle(Input::Inform { ts: 2000, peer: [10, 0, 0, 1].into(), decoded: decoded(p.clone()) });
+        assert_eq!(last_seen(&h), 800);
+        // Its age growing is no change: written once a minute, as heard.
+        p["radio_table"][0]["scan_table"][0]["age"] = json!(1215);
+        h.engine.handle(Input::Inform { ts: 2015, peer: [10, 0, 0, 1].into(), decoded: decoded(p) });
+        assert_eq!(h.engine.written.neighbors[&AP1.parse().unwrap()]["02:cd:00:00:00:01"].written, 2000);
     }
 
     #[test]
