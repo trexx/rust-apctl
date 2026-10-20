@@ -1,7 +1,7 @@
 //! Decrypting inform packets with the right key.
 
 use anyhow::{Context, Result};
-use inform::{DEFAULT_KEY, Flags, Mac, Packet};
+use inform::{DEFAULT_KEY, Flags, Packet};
 use serde_json::Value;
 
 use crate::keys::KeyStore;
@@ -21,20 +21,19 @@ pub struct Decoded {
 }
 
 /// Decrypts a packet, trying the device's key first and then the factory default key.
-pub fn decode(body: &[u8], keys: &KeyStore, mac_hint: Option<Mac>) -> Result<Decoded> {
-    decode_packet(Packet::parse(body)?, keys, mac_hint)
+pub fn decode(body: &[u8], keys: &KeyStore) -> Result<Decoded> {
+    decode_packet(Packet::parse(body)?, keys)
 }
 
 /// [`decode`] for a packet already split.
-pub fn decode_packet(pkt: Packet<'_>, keys: &KeyStore, mac_hint: Option<Mac>) -> Result<Decoded> {
+pub fn decode_packet(pkt: Packet<'_>, keys: &KeyStore) -> Result<Decoded> {
     let flags = pkt.header.flags;
     let encrypted = flags.contains(Flags::ENCRYPTED);
-    // An unencrypted packet needs no key; otherwise the device's (by the header's MAC,
-    // then by the hint), then the default one.
-    let hint = mac_hint.filter(|m| *m != pkt.header.mac);
-    let device = [Some(pkt.header.mac), hint].into_iter().flatten().filter(|_| encrypted).filter_map(|mac| keys.get(&mac));
+    // An unencrypted packet needs no key; otherwise the key of the device its header
+    // names (a reply is sealed under the MAC of the inform it answers), then the default one.
+    let device = keys.get(&pkt.header.mac).filter(|_| encrypted);
     let last = (if encrypted { KeyUsed::Default } else { KeyUsed::None }, DEFAULT_KEY);
-    let (key, _, payload) = open_with(&pkt, device.map(|k| (KeyUsed::Device, *k)).chain([last]))
+    let (key, _, payload) = open_with(&pkt, device.map(|k| (KeyUsed::Device, *k)).into_iter().chain([last]))
         .with_context(|| format!("no known key decrypts the packet from {} (flags {:?})", pkt.header.mac, flags))?;
     Ok(Decoded { header: pkt.header, key, payload })
 }
@@ -79,7 +78,7 @@ pub fn open_with(pkt: &Packet<'_>, keys: impl IntoIterator<Item = (KeyUsed, [u8;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use inform::seal;
+    use inform::{Mac, seal};
 
     #[test]
     fn decode_prefers_device_key_and_falls_back_to_default() {
@@ -90,15 +89,15 @@ mod tests {
         let flags = Flags::ENCRYPTED | Flags::GCM;
 
         let wire = seal(mac, flags, [1; 16], &device_key, br#"{"model":"U7PG2"}"#);
-        let d = decode(&wire, &keys, None).unwrap();
+        let d = decode(&wire, &keys).unwrap();
         assert_eq!(d.key, KeyUsed::Device);
         assert_eq!(d.payload["model"], "U7PG2");
 
         let wire = seal(mac, Flags::ENCRYPTED, [2; 16], &DEFAULT_KEY, br#"{"default":true}"#);
-        assert_eq!(decode(&wire, &keys, None).unwrap().key, KeyUsed::Default);
+        assert_eq!(decode(&wire, &keys).unwrap().key, KeyUsed::Default);
 
         let wire = seal(mac, flags, [3; 16], &[9; 16], b"{}");
-        assert!(decode(&wire, &keys, None).is_err());
+        assert!(decode(&wire, &keys).is_err());
     }
 
     #[test]

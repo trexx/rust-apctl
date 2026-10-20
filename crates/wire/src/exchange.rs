@@ -99,7 +99,7 @@ impl Pairer {
                 }
                 let peer = forwarded_for.as_deref().and_then(forwarded_ip).unwrap_or(conn.client.ip());
                 let (pkt, mac) = split(&body);
-                let decoded = pkt.map_err(Into::into).and_then(|p| decode_packet(p, keys, None));
+                let decoded = pkt.map_err(Into::into).and_then(|p| decode_packet(p, keys));
                 self.push(conn, ts, Pending::Inform(mac));
                 Some(InformEvent::Inform { ts, peer, mac, decoded })
             }
@@ -118,7 +118,7 @@ impl Pairer {
                     None if body.starts_with(inform::MAGIC) => sealed_for,
                     Some(Pending::Other) | None => return None,
                 };
-                let decoded = (!body.is_empty()).then(|| pkt.map_err(Into::into).and_then(|p| decode_packet(p, keys, mac)));
+                let decoded = (!body.is_empty()).then(|| pkt.map_err(Into::into).and_then(|p| decode_packet(p, keys)));
                 Some(InformEvent::Reply { ts, mac, status, decoded })
             }
             HttpEvent::Datagram { .. } => None,
