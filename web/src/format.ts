@@ -142,6 +142,9 @@ export const bytes = (n: number | null | undefined) => (n === null || n === unde
 
 export const pct = (v: number | null | undefined) => (v === null || v === undefined ? "—" : `${Math.round(v)}%`);
 
+/** A value with its unit, "80 MHz", or "—" when there is none. */
+export const unit = (v: number | null | undefined, u: string) => (v === null || v === undefined ? "—" : `${v} ${u}`);
+
 /** A percentage with one decimal: "12.5%". */
 export const pct1 = (v: number | null | undefined) => (v === null || v === undefined ? "—" : `${v.toFixed(1)}%`);
 
@@ -239,4 +242,10 @@ export function toLocalInput(ts: number): string {
 export function fromLocalInput(v: string): number | null {
   const t = new Date(v).getTime();
   return Number.isFinite(t) ? Math.floor(t / 1000) : null;
+}
+
+/** A MAC as apctl writes it, "aa:bb:cc:dd:ee:ff", from any form the server reads (colons, dashes or neither, any case); anything else as it is. */
+export function canonicalMac(s: string): string {
+  const hex = /^[0-9a-f]{12}$/i.test(s) || /^[0-9a-f]{2}([:-])([0-9a-f]{2}\1){4}[0-9a-f]{2}$/i.test(s) ? s.replace(/[:-]/g, "").toLowerCase() : null;
+  return hex ? (hex.match(/../g) ?? []).join(":") : s;
 }

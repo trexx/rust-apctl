@@ -19,14 +19,12 @@ import {
   pct1,
   rate,
   toneClass,
+  unit,
 } from "../format";
 import type { Tone } from "../format";
 
 const share = (part: number, whole: number) =>
   pct1(whole > 0 ? (100 * part) / whole : null);
-
-/** A value with its unit, or "—" when there is none. */
-const unit = (v: number | null, u: string) => (v === null ? "—" : `${v} ${u}`);
 
 /** The keys of `T` whose values are numbers (or null). */
 type NumericKey<T> = {
@@ -99,7 +97,9 @@ export function RadioPanel({
   const dropped = sum("tx_dropped");
   const mcast =
     sum("tx_mcast") + sum("rx_mcast") + sum("tx_bcast") + sum("rx_bcast");
-  const mcastShare = (100 * mcast) / Math.max(1, txPkts + sum("rx_packets"));
+  // As the server's multicast insight: none without packets, at most all of them.
+  const pkts = txPkts + sum("rx_packets");
+  const mcastShare = pkts > 0 ? Math.min(100, (100 * mcast) / pkts) : null;
   const eirp =
     radio.tx_power !== null && radio.antenna_gain !== null
       ? radio.tx_power + radio.antenna_gain
@@ -129,10 +129,10 @@ export function RadioPanel({
         </dd>
         <dt>Channel use now</dt>
         <dd>
-          {radio.cu_total ?? "—"}% busy{" "}
+          {pct(radio.cu_total)} busy{" "}
           <span className="muted">
-            · own RX {radio.cu_self_rx ?? "—"}% · own TX{" "}
-            {radio.cu_self_tx ?? "—"}% · interference {radio.cu_interf ?? "—"}%
+            · own RX {pct(radio.cu_self_rx)} · own TX {pct(radio.cu_self_tx)} ·
+            interference {pct(radio.cu_interf)}
           </span>
         </dd>
         <dt>TX</dt>

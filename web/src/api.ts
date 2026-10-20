@@ -251,6 +251,8 @@ export interface CfgChange {
   added?: number;
   removed?: number;
   changed?: number;
+  /** A dry run's: the same key=value pairs, maybe in another order. */
+  same_content?: boolean;
 }
 
 interface RadioLevels {
@@ -290,7 +292,8 @@ export interface EventPayloads {
   config_applied: { seconds_after_push?: number | null };
   client_connect_failed: { essid?: string | null; reason?: string | null; rssi?: number | null };
   dfs_radar: { channel?: number | null };
-  rogue_ap: { essid?: string | null; rogue_channel?: number | null; signal_strength?: number | null };
+  /** The AP's notification as it came; its channel may be text, and the signal's unit isn't documented (probably dBm when negative). */
+  rogue_ap: { essid?: string | null; bssid?: string | null; channel?: number | string | null; signal?: number | null };
   network_threat: { essid?: string | null; detail?: string; severity?: "high" | "medium" | "low" };
   client_kicked: { reason?: string | null; signal?: number | null; vap?: string | null };
   ap_upgrade_sent: { target?: string | null };
@@ -301,18 +304,21 @@ export interface EventPayloads {
   client_wrong_password: { vap?: string | null };
   client_steered: { signal?: number | null; result?: string | null; candidates?: { bssid: string; channel: number | null }[] };
   client_experience: { anomalies?: string[]; satisfaction?: number | null; signal?: number | null };
-  ap_crash: { process?: string | null; kind?: string | null; lines?: string[] };
+  /** `lines`: from the fault on (`source` "syslog"), or the last 200 lines of the AP's crash store ("crashlog", "recovery"). */
+  ap_crash: { process?: string | null; kind?: string | null; source?: string; lines?: string[] };
   ap_process_restarted: { proc?: string | null; exit_status?: number | null; caller?: string | null };
   ap_isolated: { heard_by?: Mac | null };
   ap_scan_done: object;
-  ap_event: object;
+  /** Any other AP notification, as it came: `event_string` names it ("EVT_AP_…"). */
+  ap_event: { event_string?: string; msg?: string };
   radio_changed: { radio?: string | null; from?: RadioLevels; to?: RadioLevels };
   config_pushed: ConfigPushed;
   client_connected: { essid?: string | null; radio?: string | null; channel?: number | null; signal?: number | null; new?: boolean };
   client_disconnected: { reason?: string | null; connected_for?: number | null; last_signal?: number | null };
   client_roamed: { from?: RoamEndData; to?: RoamEndData };
   client_renamed: { from?: string | null; to?: string | null };
-  dryrun_compared: { error?: string | null; matches?: boolean; system_cfg?: CfgChange };
+  /** `mgmt_cfg` is missing from comparisons recorded before it was added. */
+  dryrun_compared: { error?: string | null; matches?: boolean; system_cfg?: CfgChange; mgmt_cfg?: CfgChange };
   settings_imported: { wlans?: unknown[]; networks?: unknown[] };
   settings_changed: { what?: string };
   channel_plan: ChannelPlanRun;
@@ -529,6 +535,8 @@ export interface FieldComparison {
   diff: string;
 }
 
+export type StoredComparison = Omit<FieldComparison, "diff">;
+
 export interface DryRun {
   settings_imported_at: number | null;
   devices: {
@@ -541,7 +549,8 @@ export interface DryRun {
     /** The AP runs a different config version than when the settings were imported. */
     settings_stale: boolean;
   }[];
-  history: { id: number; ts: number; mac: Mac; cfgversion: string | null; matches: boolean; comparison: { system_cfg?: FieldComparison; error?: string } | null }[];
+  /** The comparison made at each push, stored without the diffs. */
+  history: { id: number; ts: number; mac: Mac; cfgversion: string | null; matches: boolean; comparison: { mgmt_cfg?: StoredComparison; system_cfg?: StoredComparison; error?: string } | null }[];
 }
 
 /** Refreshed by the live socket when a comparison is recorded or settings are imported. */
@@ -734,9 +743,15 @@ const spanParams = (s: TimeSpan) => (isFixed(s) ? { from: s.from, to: s.to } : {
 
 const spanLength = (s: TimeSpan) => (isFixed(s) ? s.to - s.from : s.last);
 
+/** A fixed window that ended over ten minutes ago: its data no longer changes. */
+const settled = (s: TimeSpan) => isFixed(s) && s.to < Date.now() / 1000 - 600;
+
 /** Live ranges refresh; fixed windows in the past don't change. Pass it as `refetchInterval: () => refreshFor(…)`, so it is asked again after
  *  each fetch: a fixed window ending at about now stops refreshing once it is ten minutes past. */
-const refreshFor = (s: TimeSpan, live: number) => (isFixed(s) && s.to < Date.now() / 1000 - 600 ? false : live);
+const refreshFor = (s: TimeSpan, live: number) => (settled(s) ? false : live);
+
+/** A settled window's data stays fresh, so a focus or remount doesn't fetch it again; others keep the default staleness. */
+const freshFor = (s: TimeSpan) => (settled(s) ? { staleTime: Infinity } : {});
 
 /** Whether two keys of a span family differ in the span alone (the family's first argument, as in every one of `keys`). */
 const onlySpanDiffers = (a: QueryKey, b: QueryKey) => hashKey([a[0], ...a.slice(2)]) === hashKey([b[0], ...b.slice(2)]);
@@ -751,6 +766,7 @@ function useSpanQuery<T>(key: QueryKey, path: string, span: TimeSpan, extra: Rec
     queryKey: key,
     queryFn: getting<T>(`${path}${qs({ ...spanParams(span), ...extra })}`),
     refetchInterval: () => refreshFor(span, 60_000),
+    ...freshFor(span),
     placeholderData: (prev, prevQuery) => (prevQuery && (keepAcrossChoices || onlySpanDiffers(prevQuery.queryKey, key)) ? prev : undefined),
   });
 }
@@ -1013,8 +1029,10 @@ export const useNeighbors = (range: number, band: string) =>
 /** Only how loudly our APs hear each other (no neighbour list). */
 export const useOwnLinks = (range: number) => useSpanQuery<{ own_links: OwnLink[] }>(keys.rfLinks(range), "/api/rf/neighbors", { last: range }, { links_only: "true" });
 
-export const useChannelPlan = (band: string, dfs: boolean) =>
+/** `enabled` false waits, for a caller that doesn't know `dfs` yet. */
+export const useChannelPlan = (band: string, dfs: boolean, enabled = true) =>
   useQuery({
+    enabled,
     queryKey: keys.rfPlan(band, dfs),
     queryFn: getting<ChannelPlanResult>(`/api/rf/channel-plan${qs({ band, dfs: dfs ? "true" : undefined })}`),
   });
@@ -1100,6 +1118,7 @@ export function useSeries(table: string, key: string, span: TimeSpan) {
       return get<Series>(url(from), signal);
     },
     refetchInterval: () => refreshFor(span, spanLength(span) <= 6 * 3600 ? 15_000 : 300_000),
+    ...freshFor(span),
     placeholderData: keepPreviousData,
   });
 }
@@ -1485,11 +1504,14 @@ export interface MdnsRule {
   isolation_enabled?: boolean;
 }
 
+/** An AP's radio as its settings document holds it: imported documents can hold a number as text ("20"), which `radioForm` reads. */
 export interface RadioSettings {
   radio: string;
   name: string;
-  channel: number | "auto";
-  ht: number;
+  /** "auto", or the channel. */
+  channel: number | string;
+  /** The width in MHz. */
+  ht: number | string;
   tx_power_mode: string;
   tx_power: number | string | null;
   min_rssi_enabled: boolean | null;

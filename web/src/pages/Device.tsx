@@ -1,5 +1,5 @@
 import { Suspense } from "react";
-import { Link, useParams } from "react-router";
+import { Link, Navigate, useLocation, useParams } from "react-router";
 import {
   useCanEdit,
   useClientNames,
@@ -26,6 +26,7 @@ import {
   ago,
   bandChannel,
   bytes,
+  canonicalMac,
   compact,
   duration,
   pct,
@@ -49,9 +50,18 @@ const DeviceSettingsPanel = lazyNamed(
   "DeviceSettingsPanel",
 );
 
-/** Keyed by MAC: nothing typed or shown for one AP carries over to the next. */
+/**
+ * Keyed by MAC: nothing typed or shown for one AP carries over to the next
+ * (Back, a link), so one AP's settings edits are never diffed against, and
+ * saved to, another.
+ */
 export function Device() {
-  const mac = useParams().mac ?? "";
+  const typed = useParams().mac ?? "";
+  const { search } = useLocation();
+  // A MAC pasted in another form: the series, live updates and names all key by this one.
+  const mac = canonicalMac(typed);
+  if (mac !== typed)
+    return <Navigate replace to={{ pathname: `/devices/${mac}`, search }} />;
   return <DevicePage key={mac} mac={mac} />;
 }
 

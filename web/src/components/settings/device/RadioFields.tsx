@@ -19,11 +19,12 @@ type RadioForm = {
   maxsta: number;
 };
 
+/** The form's fields from the settings, with numbers held as text ("20") read as numbers. */
 export function radioForm(r: RadioSettings): RadioForm {
   return {
     radio: r.radio,
-    channel: r.channel,
-    ht: r.ht,
+    channel: r.channel === "auto" ? "auto" : Number(r.channel),
+    ht: Number(r.ht),
     tx_power_mode: r.tx_power_mode,
     tx_power:
       r.tx_power === null || r.tx_power === "auto" ? null : Number(r.tx_power),

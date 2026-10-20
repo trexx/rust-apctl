@@ -4,6 +4,7 @@ import { Link, useSearchParams } from "react-router";
 import { useQueryClient } from "@tanstack/react-query";
 import type { QueryKey } from "@tanstack/react-query";
 import { eventData, useDeviceNames } from "../api";
+import { ChangeGroups, pushText, summarise } from "./ConfigDiff";
 import type {
   AppEvent,
   EventKind,
@@ -405,6 +406,14 @@ const radioLevels = (l: EventPayloads["radio_changed"]["from"]) =>
     .filter(Boolean)
     .join("/");
 
+/** A kernel fault line, as the syslog crash capture recognises one (not a panic's closing line). */
+const FAULT =
+  /(?<!end )Kernel panic|Oops[:[]|Internal error:|sending SIGSEGV to |unhandled level 2 translation fault/;
+
+/** A crash's summary line: its first fault, else its first line (a crash store's tail may start anywhere). */
+const crashLine = (lines: string[] = []) =>
+  lines.find((l) => FAULT.test(l)) ?? lines[0];
+
 /** Every event kind: its label, colour and detail line. */
 const EVENTS: { [K in EventKind]: EventSpec<K> } = {
   ap_seen: {
@@ -475,8 +484,11 @@ const EVENTS: { [K in EventKind]: EventSpec<K> } = {
     describe: (d) =>
       parts(
         d.essid,
-        !!d.rogue_channel && `channel ${d.rogue_channel}`,
-        !!d.signal_strength && dbm(d.signal_strength),
+        d.bssid,
+        !!d.channel && `channel ${d.channel}`,
+        typeof d.signal === "number" &&
+          d.signal !== 0 &&
+          (d.signal < 0 ? dbm(d.signal) : `signal ${d.signal}`),
       ),
   },
   network_threat: {
@@ -559,7 +571,7 @@ const EVENTS: { [K in EventKind]: EventSpec<K> } = {
     label: "AP crash",
     tone: "bad",
     describe: (d) =>
-      parts(d.process ? `${d.process}: ${d.kind}` : d.kind, (d.lines ?? [])[0]),
+      parts(d.process ? `${d.process}: ${d.kind}` : d.kind, crashLine(d.lines)),
   },
   ap_process_restarted: {
     label: "Process restarted",
@@ -584,7 +596,12 @@ const EVENTS: { [K in EventKind]: EventSpec<K> } = {
       `its beacon says it lost its uplink${d.heard_by ? ` (heard by ${names[d.heard_by] ?? d.heard_by})` : ""}`,
   },
   ap_scan_done: { label: "Scan finished", tone: "neutral" },
-  ap_event: { label: "AP event", tone: "neutral" },
+  ap_event: {
+    label: "AP event",
+    tone: "neutral",
+    describe: (d) =>
+      parts((d.event_string ?? "").replace(/^EVT_AP_/, ""), d.msg),
+  },
   radio_changed: {
     label: "Radio settings changed",
     tone: "neutral",
@@ -594,13 +611,7 @@ const EVENTS: { [K in EventKind]: EventSpec<K> } = {
   config_pushed: {
     label: "Config pushed",
     tone: "neutral",
-    describe: (d) => {
-      const s = d.system_cfg;
-      if (!s) return "";
-      return s.baseline
-        ? `baseline captured (${s.lines} lines)`
-        : `${s.added} added, ${s.removed} removed, ${s.changed} changed`;
-    },
+    describe: (d) => pushText(d, summarise(d)),
   },
   client_connected: {
     label: "Client connected",
@@ -638,9 +649,20 @@ const EVENTS: { [K in EventKind]: EventSpec<K> } = {
     tone: "neutral",
     describe: (d) => {
       if (d.error) return `generator error: ${d.error}`;
-      return d.matches
-        ? "apctl would have pushed the identical config"
-        : `differs: ${d.system_cfg?.added ?? 0} extra, ${d.system_cfg?.removed ?? 0} missing, ${d.system_cfg?.changed ?? 0} different lines`;
+      if (d.matches) return "apctl would have pushed the identical config";
+      const lines = (["system_cfg", "mgmt_cfg"] as const).flatMap((f) => {
+        const { added = 0, removed = 0, changed = 0 } = d[f] ?? {};
+        return added + removed + changed > 0
+          ? [
+              `${f} (${added} extra, ${removed} missing, ${changed} different lines)`,
+            ]
+          : [];
+      });
+      // A mismatch with no line of either config different is in their order.
+      if (lines.length > 0) return `differs in ${lines.join(" and ")}`;
+      return d.mgmt_cfg
+        ? "differs: the same lines, in another order"
+        : "differs: system_cfg has the same lines, so its order or mgmt_cfg differs";
     },
   },
   settings_imported: {
@@ -656,7 +678,8 @@ const EVENTS: { [K in EventKind]: EventSpec<K> } = {
   },
   channel_plan: {
     label: "Channel AI",
-    tone: "neutral",
+    // A plan that failed to apply (an AP offline, a push refused) says why.
+    tone: (d) => (d.error ? "warn" : "neutral"),
     describe: (d, names) => {
       const moves = d.changes ?? [];
       const what = [d.band && band(d.band), d.trigger && `(${d.trigger})`];
@@ -669,7 +692,7 @@ const EVENTS: { [K in EventKind]: EventSpec<K> } = {
                   `${m.name ?? names[m.mac] ?? m.mac} ${m.from ?? "?"} → ${m.to ?? "?"}`,
               )
               .join(", ")
-      }${moves.length > 0 && !d.applied ? " (not applied)" : ""}`;
+      }${moves.length > 0 && !d.applied ? ` (not applied${d.error ? `: ${d.error}` : ""})` : ""}`;
     },
   },
   ap_pending: { label: "AP waiting for adoption", tone: "neutral" },
@@ -756,7 +779,12 @@ const EventRow = memo(
     const tone = typeof spec.tone === "function" ? spec.tone(d) : spec.tone;
     const detail = spec.describe?.(d, names, e.ts);
     const threat = eventData<"network_threat">(e);
-    const diff = eventData<"config_pushed">(e).system_cfg?.diff;
+    const push =
+      e.kind === "config_pushed"
+        ? summarise(eventData<"config_pushed">(e))
+        : null;
+    const crash =
+      e.kind === "ap_crash" ? (eventData<"ap_crash">(e).lines ?? []) : [];
     return (
       <li className={`event event-${tone}`}>
         <span className="event-time">{clock(e.ts, now)}</span>
@@ -787,10 +815,19 @@ const EventRow = memo(
               )}
           </span>
           {detail ? <span className="event-detail">{detail}</span> : null}
-          {e.kind === "config_pushed" && typeof diff === "string" && diff && (
+          {push && push.changes.length > 0 && (
             <details>
-              <summary>diff</summary>
-              <pre className="diff">{diff}</pre>
+              <summary>
+                {push.changes.length} change
+                {push.changes.length === 1 ? "" : "s"}
+              </summary>
+              <ChangeGroups groups={push.groups} />
+            </details>
+          )}
+          {crash.length > 1 && (
+            <details>
+              <summary>crash log ({crash.length} lines)</summary>
+              <pre className="diff">{crash.join("\n")}</pre>
             </details>
           )}
         </span>

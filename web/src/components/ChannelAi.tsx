@@ -97,7 +97,9 @@ export function PlanActions({
   );
 }
 
-const HOURS = Array.from({ length: 24 }, (_, h) => [h, hhmm(h * 60)] as const);
+/** The hours to choose from, at the setting's minute (an imported one keeps it). */
+const hours = (minute: number) =>
+  Array.from({ length: 24 }, (_, h) => [h, hhmm(h * 60 + minute)] as const);
 
 /** Channel AI: the nightly optimisation's settings, Run now, recent runs. */
 export function ChannelAiPanel() {
@@ -162,7 +164,7 @@ export function ChannelAiPanel() {
           <Select
             aria-label="Hour"
             value={s.hour}
-            options={HOURS}
+            options={hours(s.minute)}
             disabled={!can}
             onChange={(hour) => save({ hour })}
           />
