@@ -1355,11 +1355,6 @@ pub(crate) fn channel_locked_macs(state: &Value) -> Vec<inform::Mac> {
     out
 }
 
-/// [`channel_locked_macs`] written `aa:bb:..`, as Channel AI's lists of APs hold them.
-pub fn channel_locked_aps(state: &Value) -> Vec<String> {
-    channel_locked_macs(state).iter().map(inform::Mac::to_string).collect()
-}
-
 /// Keeps the 2.4 GHz channel of APs in line with the SSIDs' channel locks, as
 /// the official controller does when a lock changes: channel 6 on every AP an
 /// SSID with the lock is broadcast from, and back to auto on an AP in

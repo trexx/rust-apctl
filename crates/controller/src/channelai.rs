@@ -12,6 +12,7 @@
 //! official controller keeps the exclusion list but no longer reads it;
 //! apctl honours it). The plan itself is apctl's own (see `channelplan`).
 
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
@@ -25,7 +26,7 @@ use crate::clock;
 use crate::engine::{Event, EventKind, Live};
 use crate::model::Ts;
 use crate::adopt::{device_doc, device_doc_mut};
-use crate::settings::{allowed_channels, band_channels, country, dedup_in_order, device_macs, fixed_channel_ok, inform_radio, legal_channels, mac_list_value, num, setting, setting_mut, uplink};
+use crate::settings::{allowed_channels, band_channels, channel_locked_macs, country, dedup_in_order, device_macs, fixed_channel_ok, inform_radio, legal_channels, mac_list_value, num, setting, setting_mut, uplink};
 
 /// A band Channel AI handles, and how its quick scan is asked for.
 pub struct Band {
@@ -132,14 +133,15 @@ pub fn allowed(state: Option<&Value>, band: &str, with_dfs: bool) -> Option<Vec<
 /// APs whose channel on `band` a plan must not change: excluded in the
 /// setting, on a wireless uplink (moving them would cut them off), being
 /// upgraded, or (2.4 GHz) held on channel 6 by an SSID's IoT channel lock.
-pub fn pinned(live: &Live, band: &str) -> Vec<String> {
-    let mut out = settings(live.state.as_deref()).exclude_devices;
+pub fn pinned(live: &Live, band: &str) -> HashSet<Mac> {
+    // The setting's list, in whatever form a MAC is written there.
+    let mut out: HashSet<Mac> = settings(live.state.as_deref()).exclude_devices.iter().filter_map(|m| m.parse().ok()).collect();
     if band == "ng" {
-        out.extend(live.state.as_deref().map(crate::settings::channel_locked_aps).unwrap_or_default());
+        out.extend(live.state.as_deref().map(channel_locked_macs).unwrap_or_default());
     }
-    out.extend(live.raw_informs.iter().filter(|(_, p)| uplink(p).is_wireless()).map(|(mac, _)| mac.to_string()));
+    out.extend(live.raw_informs.iter().filter(|(_, p)| uplink(p).is_wireless()).map(|(mac, _)| *mac));
     if let Some(j) = &live.firmware.current {
-        out.push(j.mac.to_string());
+        out.insert(j.mac);
     }
     out
 }
@@ -207,17 +209,17 @@ async fn wait_for_scans(s: &AppState) {
 /// Writes fixed channels on `band` into the APs' radio settings (`changes`:
 /// AP, channel), checking each is legal at the radio's width and allowed, and
 /// that the AP is not one whose channel a plan must keep (`held`: see [`pinned`]).
-pub fn set_channels(state: &mut Value, band: &str, changes: &[(String, i64)], held: &[Mac]) -> Result<(), String> {
+pub fn set_channels(state: &mut Value, band: &str, changes: &[(String, i64)], held: &HashSet<Mac>) -> Result<(), String> {
     if !state["devices"].is_array() {
         return Err("the settings have no APs".into());
     }
     let c = country(state);
-    let locked = if band == "ng" { crate::settings::channel_locked_aps(state) } else { vec![] };
+    let locked = if band == "ng" { channel_locked_macs(state) } else { vec![] };
     let allowed_here = allowed(Some(state), band, true);
     for (mac, ch) in changes {
-        // The locks list MACs as aa:bb:..; the plan's is compared in that form, however it is written.
         let m: Mac = mac.parse().map_err(|_| format!("{mac} is not in the settings"))?;
-        if locked.contains(&m.to_string()) {
+        // Held too, but told apart.
+        if locked.contains(&m) {
             return Err(format!("{mac}: the 2.4 GHz channel is locked by an SSID's IoT setting"));
         }
         // A plan made earlier, or sent as it is: the AP may have been excluded, or gone on a wireless uplink, since.
@@ -322,7 +324,7 @@ async fn apply(s: &AppState, band: &str, changes: &[Change], trigger: &str) -> R
     let list: Vec<(String, i64)> = changes.iter().map(|c| (c.mac.clone(), c.to)).collect();
     let show = |c: &Change| format!("{} {} → {}", c.name.as_deref().unwrap_or(&c.mac), c.from.map_or_else(|| "auto".to_string(), |f| f.to_string()), c.to);
     let what = format!("channel AI ({trigger}): {}", changes.iter().map(show).collect::<Vec<_>>().join(", "));
-    let held: Vec<Mac> = pinned(&s.live.read().unwrap(), band).iter().filter_map(|m| m.parse().ok()).collect();
+    let held = pinned(&s.live.read().unwrap(), band);
     let band = band.to_string();
     crate::actions::edit_settings(s, what, move |state| set_channels(state, &band, &list, &held)).await
 }
@@ -616,15 +618,23 @@ mod tests {
     #[test]
     fn plans_are_written_as_fixed_channels_when_legal() {
         let mut s = state();
-        set_channels(&mut s, "ng", &[("02:00:00:00:00:01".into(), 6)], &[]).unwrap();
+        set_channels(&mut s, "ng", &[("02:00:00:00:00:01".into(), 6)], &HashSet::new()).unwrap();
         assert_eq!(s["devices"][0]["radio_table"][1]["channel"], 6, "an auto radio is pinned");
-        assert!(set_channels(&mut s, "na", &[("02:00:00:00:00:01".into(), 140)], &[]).is_err(), "not at 80 MHz");
-        assert!(set_channels(&mut s, "ng", &[("02:00:00:00:00:01".into(), 3)], &[]).is_err(), "not in the allowed list");
-        set_channels(&mut s, "na", &[("02:00:00:00:00:01".into(), 36)], &[]).unwrap();
-        assert!(set_channels(&mut s, "na", &[("02:00:00:00:00:02".into(), 36)], &[]).is_err(), "not one of the APs");
+        assert!(set_channels(&mut s, "na", &[("02:00:00:00:00:01".into(), 140)], &HashSet::new()).is_err(), "not at 80 MHz");
+        assert!(set_channels(&mut s, "ng", &[("02:00:00:00:00:01".into(), 3)], &HashSet::new()).is_err(), "not in the allowed list");
+        set_channels(&mut s, "na", &[("02:00:00:00:00:01".into(), 36)], &HashSet::new()).unwrap();
+        assert!(set_channels(&mut s, "na", &[("02:00:00:00:00:02".into(), 36)], &HashSet::new()).is_err(), "not one of the APs");
         // Nor an AP a plan must leave where it is, however the plan came.
-        let held = ["02:00:00:00:00:01".parse().unwrap()];
+        let held = HashSet::from(["02:00:00:00:00:01".parse().unwrap()]);
         assert!(set_channels(&mut s, "na", &[("02-00-00-00-00-01".into(), 36)], &held).unwrap_err().contains("keeps this AP's channel"));
+    }
+
+    #[test]
+    fn an_excluded_ap_is_pinned_however_its_mac_is_written() {
+        let mut s = state();
+        s["setting"][2]["exclude_devices"] = json!(["020000000001", "not a mac"]);
+        let live = Live { state: Some(std::sync::Arc::new(s)), ..Default::default() };
+        assert_eq!(pinned(&live, "na"), HashSet::from(["02:00:00:00:00:01".parse().unwrap()]));
     }
 
     #[test]
@@ -633,9 +643,9 @@ mod tests {
         s["apgroup"] = json!([{ "_id": "g1", "attr_hidden_id": "default", "device_macs": ["02:00:00:00:00:01"], "site_id": "s1" }]);
         s["wlanconf"] = json!([{ "_id": "w1", "name": "Things", "iot_channel_lock": true, "ap_group_ids": ["g1"], "site_id": "s1" }]);
         for mac in ["02:00:00:00:00:01", "02-00-00-00-00-01", "02:00:00:00:00:01".to_uppercase().as_str()] {
-            assert!(set_channels(&mut s, "ng", &[(mac.into(), 11)], &[]).unwrap_err().contains("IoT"), "{mac}");
+            assert!(set_channels(&mut s, "ng", &[(mac.into(), 11)], &HashSet::new()).unwrap_err().contains("IoT"), "{mac}");
         }
-        set_channels(&mut s, "na", &[("02-00-00-00-00-01".into(), 36)], &[]).unwrap();
+        set_channels(&mut s, "na", &[("02-00-00-00-00-01".into(), 36)], &HashSet::new()).unwrap();
     }
 
     #[test]
