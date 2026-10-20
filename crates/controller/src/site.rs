@@ -125,7 +125,8 @@ fn site_mgmt(doc: &mut Value, m: &Value, notes: &mut Vec<String>) -> Result<(), 
         notes.push("SSH password".into());
     }
     if !m["x_ssh_keys"].is_null() {
-        doc["x_ssh_keys"] = json!(ssh_keys(&m["x_ssh_keys"])?);
+        let keys = ssh_keys(&m["x_ssh_keys"], &doc["x_ssh_keys"])?;
+        doc["x_ssh_keys"] = json!(keys);
     }
     if doc["x_ssh_enabled"].as_bool() != Some(false) && doc["x_ssh_auth_password_enabled"].as_bool() == Some(false) && doc["x_ssh_keys"].as_array().is_none_or(Vec::is_empty) {
         return Err("with password logins off, SSH needs at least one key".into());
@@ -283,8 +284,10 @@ fn set_ssh_password(doc: &mut Value, pw: &str) -> Result<(), String> {
 }
 
 /// SSH public keys as `{name, key, type, comment}`; a pasted OpenSSH line
-/// (`ssh-ed25519 AAAA... comment`) is split up.
-fn ssh_keys(v: &Value) -> Result<Vec<Value>, String> {
+/// (`ssh-ed25519 AAAA... comment`) is split up. A key without a name of its
+/// own keeps the one it has in `stored` (the editor sends OpenSSH lines,
+/// which have no place for it), else is named after its comment or type.
+fn ssh_keys(v: &Value, stored: &Value) -> Result<Vec<Value>, String> {
     // The official controller takes RSA and Ed25519 keys only.
     const TYPES: &[&str] = &["ssh-ed25519", "ssh-rsa"];
     let mut out = Vec::new();
@@ -299,7 +302,8 @@ fn ssh_keys(v: &Value) -> Result<Vec<Value>, String> {
         if !TYPES.contains(&kind.as_str()) || key.len() < 32 || !key.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '/' | '=')) {
             return Err(format!("not an SSH public key: {}", if key.is_empty() { kind } else { format!("{kind} {}…", key.chars().take(12).collect::<String>()) }));
         }
-        let name = k["name"].as_str().filter(|n| !n.is_empty()).map(str::to_string).unwrap_or_else(|| if comment.is_empty() { kind.clone() } else { comment.clone() });
+        let kept = || stored.as_array().into_iter().flatten().find(|s| s["key"].as_str() == Some(key.as_str()))?["name"].as_str().filter(|n| !n.is_empty());
+        let name = k["name"].as_str().filter(|n| !n.is_empty()).or_else(kept).map(str::to_string).unwrap_or_else(|| if comment.is_empty() { kind.clone() } else { comment.clone() });
         if !out.iter().any(|o: &Value| o["key"].as_str() == Some(key.as_str())) {
             out.push(json!({ "name": name, "type": kind, "key": key, "comment": comment }));
         }
@@ -397,6 +401,24 @@ mod tests {
         let key = "A".repeat(68);
         edit(&mut s, json!({ "mgmt": { "x_ssh_keys": [format!("ssh-ed25519 {key} me@laptop"), { "type": "ssh-ed25519", "key": key, "name": "again" }] } })).unwrap();
         assert_eq!(setting(&s, "mgmt")["x_ssh_keys"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn ssh_keys_keep_their_names_through_the_editor() {
+        let mut s = state();
+        let (a, b) = ("A".repeat(68), "B".repeat(68));
+        // Named in the official controller; the editor sends them back as lines.
+        setting_mut(&mut s, "mgmt")["x_ssh_keys"] = json!([
+            { "name": "Office laptop", "type": "ssh-ed25519", "key": a, "comment": "me@desk" },
+            { "name": "backup", "type": "ssh-rsa", "key": b, "comment": "" },
+        ]);
+        let new = format!("ssh-ed25519 {} new@host", "C".repeat(68));
+        edit(&mut s, json!({ "mgmt": { "x_ssh_keys": [format!("ssh-ed25519 {a} me@desk"), format!("ssh-rsa {b}"), new] } })).unwrap();
+        let names: Vec<_> = setting(&s, "mgmt")["x_ssh_keys"].as_array().unwrap().iter().map(|k| k["name"].as_str().unwrap().to_string()).collect();
+        assert_eq!(names, ["Office laptop", "backup", "new@host"]);
+        // A name given wins.
+        edit(&mut s, json!({ "mgmt": { "x_ssh_keys": [{ "type": "ssh-ed25519", "key": a, "name": "renamed" }] } })).unwrap();
+        assert_eq!(setting(&s, "mgmt")["x_ssh_keys"][0]["name"], "renamed");
     }
 
     #[test]
