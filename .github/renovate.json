@@ -30,6 +30,17 @@
     },
     {
       "customType": "regex",
+      "description": "The cargo-auditable release the Dockerfile installs",
+      "managerFilePatterns": [
+        "/(^|/)Dockerfile$/"
+      ],
+      "matchStrings": [
+        "cargo install --locked (?<depName>cargo-auditable)@(?<currentValue>[0-9]+\\.[0-9]+\\.[0-9]+)"
+      ],
+      "datasourceTemplate": "crate"
+    },
+    {
+      "customType": "regex",
       "description": "Images that workflow steps run by hand (docker run), such as the Node image the web job builds with",
       "managerFilePatterns": [
         "/(^|/)\\.github/workflows/[^/]+\\.ya?ml$/"

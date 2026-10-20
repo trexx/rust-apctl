@@ -1,6 +1,7 @@
 name: 'Trivy'
 
-# Scans the published image (OS packages of the distroless base).
+# Scans the published image: the OS packages of the distroless base, and the crates
+# apctl was built with (embedded by cargo auditable, see the Dockerfile).
 on:
   schedule:
     - cron: '37 12 * * *'

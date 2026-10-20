@@ -41,14 +41,17 @@ RUN for c in crates/*; do \
 # mounts), so a code change recompiles our crates, not every dependency. The
 # target directory is not part of the image: the binary is copied out of it.
 # CARGO_BUILD_JOBS limits cargo on a machine short of memory (--build-arg).
+# cargo auditable embeds the list of crates in the binary, where the image scan
+# (.github/workflows/trivy.yml) reads it: the scan covers exactly the crates that ship.
 FROM docker.io/library/rust:1.98-bookworm AS deps
+RUN cargo install --locked cargo-auditable@0.7.6
 WORKDIR /src
 COPY --from=skeleton /src ./
 ARG CARGO_BUILD_JOBS=default
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
     --mount=type=cache,target=/src/target \
-    cargo build --release --locked -p controller
+    cargo auditable build --release --locked -p controller
 
 # The sources are touched: COPY keeps their times, which can be older than the empty
 # ones', and cargo would take our crates as built. The release profile strips the binary.
@@ -60,7 +63,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
     --mount=type=cache,target=/src/target \
     find crates -name '*.rs' -exec touch {} + \
-    && cargo build --release --locked -p controller && cp target/release/apctl /apctl
+    && cargo auditable build --release --locked -p controller && cp target/release/apctl /apctl
 
 # --- capture sidecar for shadow mode: tcpdump writing pcap into a FIFO ---
 FROM docker.io/library/alpine:3.22 AS capture
