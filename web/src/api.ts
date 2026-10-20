@@ -1,6 +1,7 @@
 import { useEffect } from "react";
 import { hashKey, keepPreviousData, useQuery, useQueryClient } from "@tanstack/react-query";
 import type { QueryKey } from "@tanstack/react-query";
+import { canonicalMac } from "./format";
 
 export type Mac = string;
 
@@ -1166,8 +1167,8 @@ export const useEvents = (filter: EventFilter) => useNewestList<AppEvent>(keys.e
 
 export const useLogs = (filter: LogFilter) => useNewestList<LogLine>(keys.logs(filter), "/api/logs", filter, 500);
 
-/** A filter's MAC against a message's, as the server compares them (it normalises the filter). */
-const sameMac = (filter: Mac | undefined, mac: Mac | null) => !filter || filter.toLowerCase() === mac?.toLowerCase();
+/** A filter's MAC against a message's (canonical), as the server compares them: it reads the filter in any form it accepts. */
+const sameMac = (filter: Mac | undefined, mac: Mac | null) => !filter || canonicalMac(filter) === mac;
 
 /** Whether a list fetched with `f` would show the event, filtered as the server does: MACs exactly, kinds by comma-separated prefixes. */
 function eventMatches(f: EventFilter, e: { kind: string; device_mac: Mac | null; client_mac: Mac | null }): boolean {
