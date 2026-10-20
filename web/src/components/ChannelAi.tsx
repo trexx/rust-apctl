@@ -1,6 +1,5 @@
 import {
   applyChannelPlan,
-  eventData,
   keys,
   runChannelAi,
   saveChannelAi,
@@ -210,19 +209,13 @@ export function ChannelAiPanel() {
               <div className="muted">None yet.</div>
             ) : (
               <ul className="plain-list">
-                {data.map((e) => {
-                  // The event lists' own text, plus why a plan wasn't applied.
-                  const { error, applied } = eventData<"channel_plan">(e);
-                  return (
-                    <li key={e.id}>
-                      <span className="muted nowrap">{clock(e.ts, now)}</span>{" "}
-                      {eventText(e, names).detail}
-                      {!applied && error && (
-                        <span className="error"> {error}</span>
-                      )}
-                    </li>
-                  );
-                })}
+                {/* The event lists' own text, which says why a plan wasn't applied. */}
+                {data.map((e) => (
+                  <li key={e.id}>
+                    <span className="muted nowrap">{clock(e.ts, now)}</span>{" "}
+                    {eventText(e, names).detail}
+                  </li>
+                ))}
               </ul>
             )
           }
