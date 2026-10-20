@@ -405,6 +405,14 @@ const radioLevels = (l: EventPayloads["radio_changed"]["from"]) =>
     .filter(Boolean)
     .join("/");
 
+/** A kernel fault line, as the syslog crash capture recognises one (not a panic's closing line). */
+const FAULT =
+  /(?<!end )Kernel panic|Oops[:[]|Internal error:|sending SIGSEGV to |unhandled level 2 translation fault/;
+
+/** A crash's summary line: its first fault, else its first line (a crash store's tail may start anywhere). */
+const crashLine = (lines: string[] = []) =>
+  lines.find((l) => FAULT.test(l)) ?? lines[0];
+
 /** Every event kind: its label, colour and detail line. */
 const EVENTS: { [K in EventKind]: EventSpec<K> } = {
   ap_seen: {
@@ -562,7 +570,7 @@ const EVENTS: { [K in EventKind]: EventSpec<K> } = {
     label: "AP crash",
     tone: "bad",
     describe: (d) =>
-      parts(d.process ? `${d.process}: ${d.kind}` : d.kind, (d.lines ?? [])[0]),
+      parts(d.process ? `${d.process}: ${d.kind}` : d.kind, crashLine(d.lines)),
   },
   ap_process_restarted: {
     label: "Process restarted",
@@ -760,6 +768,8 @@ const EventRow = memo(
     const detail = spec.describe?.(d, names, e.ts);
     const threat = eventData<"network_threat">(e);
     const diff = eventData<"config_pushed">(e).system_cfg?.diff;
+    const crash =
+      e.kind === "ap_crash" ? (eventData<"ap_crash">(e).lines ?? []) : [];
     return (
       <li className={`event event-${tone}`}>
         <span className="event-time">{clock(e.ts, now)}</span>
@@ -794,6 +804,12 @@ const EventRow = memo(
             <details>
               <summary>diff</summary>
               <pre className="diff">{diff}</pre>
+            </details>
+          )}
+          {crash.length > 1 && (
+            <details>
+              <summary>crash log ({crash.length} lines)</summary>
+              <pre className="diff">{crash.join("\n")}</pre>
             </details>
           )}
         </span>

@@ -302,7 +302,8 @@ export interface EventPayloads {
   client_wrong_password: { vap?: string | null };
   client_steered: { signal?: number | null; result?: string | null; candidates?: { bssid: string; channel: number | null }[] };
   client_experience: { anomalies?: string[]; satisfaction?: number | null; signal?: number | null };
-  ap_crash: { process?: string | null; kind?: string | null; lines?: string[] };
+  /** `lines`: from the fault on (`source` "syslog"), or the last 200 lines of the AP's crash store ("crashlog", "recovery"). */
+  ap_crash: { process?: string | null; kind?: string | null; source?: string; lines?: string[] };
   ap_process_restarted: { proc?: string | null; exit_status?: number | null; caller?: string | null };
   ap_isolated: { heard_by?: Mac | null };
   ap_scan_done: object;
