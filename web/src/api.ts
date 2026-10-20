@@ -1321,7 +1321,8 @@ export function useLiveUpdates(): void {
           const e = msg;
           invalidateWhere<EventFilter>(keys.events(), (f) => eventMatches(f, e), 2000);
           if (msg.kind === "dryrun_compared" || msg.kind === "settings_imported") {
-            invalidate(keys.dryrun());
+            // Each AP pushed to records one, and every fetch renders and compares every AP's config: follow at most every 5 s.
+            invalidate(keys.dryrun(), 5000);
             invalidate(keys.settingsState());
           }
           // An editor keeps what it was opened with (it saves only the fields changed in it); the rest follows.
