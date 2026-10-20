@@ -13,6 +13,7 @@ import {
   useUserGroups,
 } from "../api";
 import type { Mac, Names } from "../api";
+import { speed } from "../format";
 import { Outcome, useRunner } from "./common";
 import { speedLimitOptions } from "./settings/speedLimitOptions";
 
@@ -139,7 +140,18 @@ export function ClientActions({
     keys.clients(),
     keys.settings("usergroups"),
   ]);
-  const limits = speedLimitOptions(useUserGroups(can).data?.groups ?? []);
+  const groups = useUserGroups(can).data?.groups;
+  const limits = speedLimitOptions(groups ?? []);
+  // A group the options leave out still shows what it does: the default one,
+  // set for the client, is its own limit (none) over its SSID's; one missing
+  // from the settings counts as none, so its SSID's applies.
+  const own = groups?.find((g) => g.id === usergroupId);
+  const strayLimit =
+    !groups || !usergroupId || (own && !own.default)
+      ? null
+      : own
+        ? `${own.name} (down ${speed(own.qos_rate_max_down)}, up ${speed(own.qos_rate_max_up)}), set for this client`
+        : "A limit no longer in the settings: its SSID's applies";
   if (!can && !why) return null;
   const off = !can || busy;
   return (
@@ -192,6 +204,9 @@ export function ClientActions({
             }}
           >
             <option value="">Any AP</option>
+            {lockedTo && !aps[lockedTo] && (
+              <option value={lockedTo}>{lockedTo} (not known)</option>
+            )}
             {Object.entries(aps).map(([ap, apName]) => (
               <option key={ap} value={ap}>
                 {apName}
@@ -216,6 +231,9 @@ export function ClientActions({
               }}
             >
               <option value="">Same as its SSID</option>
+              {strayLimit && usergroupId && (
+                <option value={usergroupId}>{strayLimit}</option>
+              )}
               {limits}
             </select>
           </label>
