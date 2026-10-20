@@ -14,18 +14,14 @@ import {
   useUrlTab,
 } from "../components/common";
 import { clock, useNow } from "../format";
-import { ChangeGroups, summarise } from "../components/ConfigDiff";
+import { ChangeGroups, pushText, summarise } from "../components/ConfigDiff";
 
 function Push({ e, ap, now }: { e: AppEvent; ap: ReactNode; now: number }) {
   const [open, setOpen] = useState(false);
   const d = eventData<"config_pushed">(e);
-  const s = d.system_cfg ?? {};
-  const { changes, groups } = summarise(d);
-  const summary = s.baseline
-    ? `first config seen (${s.lines} lines)`
-    : changes.length === 0
-      ? "no setting changed (re-sent)"
-      : groups.map(([t, l]) => `${t} (${l.length})`).join(", ");
+  const sum = summarise(d);
+  const { changes, groups } = sum;
+  const summary = pushText(d, sum);
   return (
     <div className="cfg-entry">
       <div className="cfg-head">

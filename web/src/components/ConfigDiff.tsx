@@ -112,6 +112,21 @@ export function summarise(d: ConfigPushed): {
   return { changes, groups: group(changes, d.labels ?? {}) };
 }
 
+/** A config push's summary line: the sections it changed and how many settings in each. */
+export function pushText(
+  d: ConfigPushed,
+  { changes, groups }: ReturnType<typeof summarise>,
+): string {
+  const { system_cfg: s, mgmt_cfg: m } = d;
+  if (s?.baseline) return `first config seen (${s.lines} lines)`;
+  if (changes.length > 0)
+    return groups.map(([t, l]) => `${t} (${l.length})`).join(", ");
+  // A management-only push with nothing to compare with.
+  return m?.baseline
+    ? `first management config seen (${m.lines} lines)`
+    : "no setting changed (re-sent)";
+}
+
 export function ChangeGroups({
   groups,
 }: {

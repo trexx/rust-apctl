@@ -4,6 +4,7 @@ import { Link, useSearchParams } from "react-router";
 import { useQueryClient } from "@tanstack/react-query";
 import type { QueryKey } from "@tanstack/react-query";
 import { eventData, useDeviceNames } from "../api";
+import { ChangeGroups, pushText, summarise } from "./ConfigDiff";
 import type {
   AppEvent,
   EventKind,
@@ -610,13 +611,7 @@ const EVENTS: { [K in EventKind]: EventSpec<K> } = {
   config_pushed: {
     label: "Config pushed",
     tone: "neutral",
-    describe: (d) => {
-      const s = d.system_cfg;
-      if (!s) return "";
-      return s.baseline
-        ? `baseline captured (${s.lines} lines)`
-        : `${s.added} added, ${s.removed} removed, ${s.changed} changed`;
-    },
+    describe: (d) => pushText(d, summarise(d)),
   },
   client_connected: {
     label: "Client connected",
@@ -772,7 +767,10 @@ const EventRow = memo(
     const tone = typeof spec.tone === "function" ? spec.tone(d) : spec.tone;
     const detail = spec.describe?.(d, names, e.ts);
     const threat = eventData<"network_threat">(e);
-    const diff = eventData<"config_pushed">(e).system_cfg?.diff;
+    const push =
+      e.kind === "config_pushed"
+        ? summarise(eventData<"config_pushed">(e))
+        : null;
     const crash =
       e.kind === "ap_crash" ? (eventData<"ap_crash">(e).lines ?? []) : [];
     return (
@@ -805,10 +803,13 @@ const EventRow = memo(
               )}
           </span>
           {detail ? <span className="event-detail">{detail}</span> : null}
-          {e.kind === "config_pushed" && typeof diff === "string" && diff && (
+          {push && push.changes.length > 0 && (
             <details>
-              <summary>diff</summary>
-              <pre className="diff">{diff}</pre>
+              <summary>
+                {push.changes.length} change
+                {push.changes.length === 1 ? "" : "s"}
+              </summary>
+              <ChangeGroups groups={push.groups} />
             </details>
           )}
           {crash.length > 1 && (
