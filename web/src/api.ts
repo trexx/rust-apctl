@@ -1488,11 +1488,14 @@ export interface MdnsRule {
   isolation_enabled?: boolean;
 }
 
+/** An AP's radio as its settings document holds it: imported documents can hold a number as text ("20"), which `radioForm` reads. */
 export interface RadioSettings {
   radio: string;
   name: string;
-  channel: number | "auto";
-  ht: number;
+  /** "auto", or the channel. */
+  channel: number | string;
+  /** The width in MHz. */
+  ht: number | string;
   tx_power_mode: string;
   tx_power: number | string | null;
   min_rssi_enabled: boolean | null;
