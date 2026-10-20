@@ -621,10 +621,16 @@ impl Watcher {
             }
             Err(e) => tracing::warn!("could not load the open alerts: {e:#}"),
         }
-        // An AP already reported offline before a restart stays so.
-        for (k, a) in &w.book.open {
-            if let (Key::ApOffline, Entity::Ap(mac)) = k {
-                w.aps.down.insert(*mac, a.ts - OFFLINE_AFTER);
+        // An AP already reported offline before a restart stays so, down since
+        // its last contact the engine restored (the alert may have been raised
+        // well after it, e.g. on the first check after a long stop).
+        {
+            let live = w.live.read().unwrap();
+            for (k, a) in &w.book.open {
+                if let (Key::ApOffline, Entity::Ap(mac)) = k {
+                    let last_seen = live.known_devices.get(mac).map_or(i64::MAX, |d| d.last_seen);
+                    w.aps.down.insert(*mac, last_seen.min(a.ts - OFFLINE_AFTER));
+                }
             }
         }
         w
@@ -1025,6 +1031,25 @@ mod tests {
         assert_eq!(restart(4000).await.aps.check(4000, ap, 3700), None);
         // A day after the first two, a drop is reported again.
         assert!(matches!(restart(91_000).await.aps.check(91_000, ap, 90_700), Some(ApChange::Offline { .. })));
+    }
+
+    #[tokio::test]
+    async fn an_ap_down_over_a_restart_is_back_after_its_whole_absence() {
+        let (mut w, _rx, _dir) = watcher();
+        let ap: Mac = "02:00:00:00:00:01".parse().unwrap();
+        // Last heard at 1000; apctl was stopped, and the first check after it came back raised the alert.
+        w.book.open(90_000, Alert::for_device(Key::ApOffline, Category::ApStatus, Severity::High, ap, "t".into(), "m".into()));
+        flushed(&w.book.writer);
+        let live: SharedLive = Default::default();
+        let known = crate::engine::KnownDevice {
+            first_seen: 0, last_seen: 1000, uptime: None, version: None, hostname: None, model: None, model_display: None, ip: None, serial: None,
+        };
+        live.write().unwrap().known_devices.insert(ap, known);
+        let again = Watcher::start(w.store.clone(), w.book.writer.clone(), live, broadcast::channel(4).0, 91_000).await;
+        assert_eq!(again.aps.down.get(&ap), Some(&1000));
+        // Nothing restored of it: the alert's time stands for the last contact.
+        let again = Watcher::start(w.store.clone(), w.book.writer.clone(), Default::default(), broadcast::channel(4).0, 91_000).await;
+        assert_eq!(again.aps.down.get(&ap), Some(&(90_000 - OFFLINE_AFTER)));
     }
 
     #[tokio::test]
