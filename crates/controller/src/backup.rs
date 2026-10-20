@@ -376,76 +376,104 @@ fn snapshot(src: &Path, dst: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Drops history older than the cutoff from snapshot copies. Clients that
-/// have a name (alias) are kept whatever their age, as are open alerts,
-/// settings, keys, device configs and acknowledgements; login sessions never travel.
-fn trim(dir: &Path, cutoff: Option<Ts>) -> Result<()> {
-    if dir.join("config.db").exists() {
-        trim_config(dir, cutoff)?;
-    }
-    if let Some(t) = cutoff {
-        trim_history(dir, t)?;
-    }
-    Ok(())
-}
-
-/// Drops the history older than the cutoff, and the sessions, from config.db.
-fn trim_config(dir: &Path, cutoff: Option<Ts>) -> Result<()> {
-    let mut c = scratch(&dir.join("config.db"))?;
-    // The deletes in one transaction, then one rewrite to drop the pages they
-    // freed. With nothing else to drop, the few session rows are overwritten
-    // in place instead of rewriting the whole file again.
-    if cutoff.is_none() {
-        c.execute_batch("PRAGMA secure_delete=ON;")?;
-    }
-    let tx = c.transaction()?;
-    tx.execute_batch("DELETE FROM sessions;")?;
-    if let Some(t) = cutoff {
-        for (table, col) in [("events", "ts"), ("connections", "ts"), ("neighbors", "last_seen"), ("spectrum", "ts"), ("dryrun_results", "ts")] {
-            tx.execute(&format!("DELETE FROM {table} WHERE {col} < ?1"), [t])?;
+/// A consistent copy of a live database for a backup without the history
+/// older than `cutoff` (none: all of it). Clients that have a name (alias)
+/// are kept whatever their age, as are open alerts, settings, keys, device
+/// configs and acknowledgements; login sessions never travel.
+fn copy_for_backup(name: &str, src: &Path, dst: &Path, cutoff: Option<Ts>) -> Result<()> {
+    match (name, cutoff) {
+        ("config.db", Some(t)) => trimmed_config(src, dst, t),
+        ("config.db", None) => {
+            snapshot(src, dst)?;
+            // The few session rows are overwritten in place.
+            let c = scratch(dst)?;
+            c.execute_batch("PRAGMA secure_delete=ON; DELETE FROM sessions;")?;
+            Ok(())
         }
-        // As retention does: an alert still open travels, so a restore neither
-        // raises it again nor loses when it started.
-        tx.execute("DELETE FROM alerts WHERE ts < ?1 AND resolved_ts < ?1", [t])?;
-        tx.execute(store::FORGET_OLD_CLIENTS, [t])?;
-    }
-    tx.commit()?;
-    if cutoff.is_some() {
-        c.execute_batch("VACUUM;")?;
-    }
-    Ok(())
-}
-
-/// Drops the history older than `t` from metrics.db and logs.db.
-fn trim_history(dir: &Path, t: Ts) -> Result<()> {
-    // Every metric table in every tier, and the logs (and their full-text index).
-    let metrics: Vec<String> = store::TABLES.iter().flat_map(|t| store::TIERS.iter().map(move |tier| format!("{}{}", t.name, tier.suffix))).collect();
-    for (name, tables) in [("metrics.db", metrics), ("logs.db", vec!["logs".to_string()])] {
-        let p = dir.join(name);
-        if !p.exists() {
-            continue;
-        }
-        // What is deleted is overwritten in place, so the file need not be
-        // rewritten to be rid of it: only when it frees much of the file
-        // (zeroed pages would otherwise bloat the restored database, and
-        // compress so well that the restore's size check could refuse it).
-        let mut c = scratch(&p)?;
-        c.execute_batch("PRAGMA secure_delete=ON;")?;
-        let tx = c.transaction()?;
-        for table in tables {
-            // A database from an older version may lack the newest tables.
-            let exists: bool = tx.query_row("SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1", [&table], |r| r.get::<_, i64>(0))? > 0;
-            if exists && table == "logs" {
-                trim_logs(&tx, t)?;
-            } else if exists {
-                tx.execute(&format!("DELETE FROM \"{table}\" WHERE ts < ?1"), [t])?;
+        (_, cutoff) => {
+            snapshot(src, dst)?;
+            match cutoff {
+                Some(t) => trim_history(dst, t),
+                None => Ok(()),
             }
         }
-        tx.commit()?;
-        let pages = |pragma: &str| c.query_row(&format!("PRAGMA {pragma}"), [], |r| r.get::<_, i64>(0));
-        if pages("freelist_count")? * 4 > pages("page_count")? {
-            c.execute_batch("VACUUM;")?;
+    }
+}
+
+/// config.db's history: each table with the column its rows' time is in.
+const CONFIG_HISTORY: [(&str, &str); 5] = [("events", "ts"), ("connections", "ts"), ("neighbors", "last_seen"), ("spectrum", "ts"), ("dryrun_results", "ts")];
+
+/// A consistent copy of the live config.db without the history older than
+/// `t` and without the sessions. It is built rather than copied whole and
+/// trimmed: a daily settings backup reads a year of events, but writes none.
+fn trimmed_config(src: &Path, dst: &Path, t: Ts) -> Result<()> {
+    // As `scratch`, for the copy alone (unqualified, the journal mode would be
+    // every attached database's), and what the retention deletes below remove
+    // is not left in free pages.
+    let mut c = Connection::open(dst)?;
+    c.execute_batch("PRAGMA main.journal_mode=OFF; PRAGMA main.synchronous=OFF; PRAGMA temp_store=MEMORY; PRAGMA busy_timeout=10000; PRAGMA secure_delete=ON;")?;
+    // Read only, through a URI: `?` and `#` in the path are escaped.
+    let path = src.to_string_lossy().replace('%', "%25").replace('?', "%3f").replace('#', "%23");
+    c.execute("ATTACH DATABASE ?1 AS live", [format!("file:{path}?mode=ro")]).with_context(|| format!("opening {}", src.display()))?;
+    // One transaction: one consistent read of the live database.
+    let tx = c.transaction()?;
+    // The tables (filled as they are made), then their indexes and the rest.
+    let objects: Vec<(String, String, String)> = tx
+        .prepare("SELECT type, name, sql FROM live.sqlite_master WHERE sql IS NOT NULL AND name NOT LIKE 'sqlite%' ORDER BY type != 'table', type != 'index', rowid")?
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+    for (kind, name, sql) in &objects {
+        if sql.starts_with("CREATE VIRTUAL") {
+            bail!("config.db's {name} cannot be copied for a backup: a virtual table");
         }
+        // Unqualified, as stored: made in the copy.
+        tx.execute_batch(sql).with_context(|| format!("copying config.db's {name}"))?;
+        if kind != "table" || name == "sessions" {
+            continue;
+        }
+        let copy = format!("INSERT INTO main.\"{name}\" SELECT * FROM live.\"{name}\"");
+        match CONFIG_HISTORY.iter().find(|(table, _)| table == name) {
+            Some((_, col)) => tx.execute(&format!("{copy} WHERE \"{col}\" >= ?1 OR \"{col}\" IS NULL"), [t])?,
+            None => tx.execute(&copy, [])?,
+        };
+    }
+    // As retention does, on the copy: an alert still open travels, so a restore
+    // neither raises it again nor loses when it started.
+    tx.execute("DELETE FROM alerts WHERE ts < ?1 AND resolved_ts < ?1", [t])?;
+    tx.execute(store::FORGET_OLD_CLIENTS, [t])?;
+    tx.commit()?;
+    c.execute_batch("DETACH DATABASE live;")?;
+    Ok(())
+}
+
+/// Drops the history older than `t` from a copy of metrics.db or logs.db.
+fn trim_history(p: &Path, t: Ts) -> Result<()> {
+    // Every metric table in every tier, or the logs (and their full-text index).
+    let tables: Vec<String> = match p.file_name().and_then(|n| n.to_str()) {
+        Some("metrics.db") => store::TABLES.iter().flat_map(|t| store::TIERS.iter().map(move |tier| format!("{}{}", t.name, tier.suffix))).collect(),
+        Some("logs.db") => vec!["logs".to_string()],
+        _ => return Ok(()),
+    };
+    // What is deleted is overwritten in place, so the file need not be
+    // rewritten to be rid of it: only when it frees much of the file
+    // (zeroed pages would otherwise bloat the restored database, and
+    // compress so well that the restore's size check could refuse it).
+    let mut c = scratch(p)?;
+    c.execute_batch("PRAGMA secure_delete=ON;")?;
+    let tx = c.transaction()?;
+    for table in tables {
+        // A database from an older version may lack the newest tables.
+        let exists: bool = tx.query_row("SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1", [&table], |r| r.get::<_, i64>(0))? > 0;
+        if exists && table == "logs" {
+            trim_logs(&tx, t)?;
+        } else if exists {
+            tx.execute(&format!("DELETE FROM \"{table}\" WHERE ts < ?1"), [t])?;
+        }
+    }
+    tx.commit()?;
+    let pages = |pragma: &str| c.query_row(&format!("PRAGMA {pragma}"), [], |r| r.get::<_, i64>(0));
+    if pages("freelist_count")? * 4 > pages("page_count")? {
+        c.execute_batch("VACUUM;")?;
     }
     Ok(())
 }
@@ -507,18 +535,17 @@ fn create_of(b: &Backups, src_dir: &Path, kind: Kind, days: i64, names: &[&str])
         .expect("a free name");
     let part = dir.join(format!("{name}.part"));
     let result = (|| -> Result<Meta> {
-        for n in names {
-            if src_dir.join(n).exists() {
-                snapshot(&src_dir.join(n), &tmp.join(n))?;
-            }
-        }
         // Settings only drops all history; N days drops what is older; -1 keeps everything.
         let cutoff = match days {
             0 => Some(Ts::MAX),
             d if d > 0 => Some(now - d * 86400),
             _ => None,
         };
-        trim(&tmp, cutoff)?;
+        for n in names {
+            if src_dir.join(n).exists() {
+                copy_for_backup(n, &src_dir.join(n), &tmp.join(n), cutoff)?;
+            }
+        }
         let mut files = std::collections::BTreeMap::new();
         for n in names {
             if tmp.join(n).exists() {
@@ -616,15 +643,21 @@ pub fn unpack(path: &Path, key: Option<&[u8; 32]>, dest: &Path) -> Result<Manife
     for entry in ar.entries()? {
         let mut e = entry?;
         let name = e.path()?.to_string_lossy().to_string();
+        // apctl writes plain files only: no links, directories or sparse files,
+        // whose size is not what the header says.
+        if !e.header().entry_type().is_file() {
+            bail!("unexpected entry in backup: {name}");
+        }
+        // `size` is what reading the entry gives, which a PAX record can set.
         if name == "manifest.json" {
             if manifest.is_some() {
                 bail!("the backup has two manifests");
             }
-            if e.header().size()? > 1 << 20 {
+            if e.size() > 1 << 20 {
                 bail!("the backup's manifest is too large");
             }
             let mut s = String::new();
-            e.read_to_string(&mut s)?;
+            (&mut e).take(1 << 20).read_to_string(&mut s)?;
             let m: Manifest = serde_json::from_str(&s).context("the backup's manifest is unreadable")?;
             // The manifest comes first: a backup apctl cannot restore is refused
             // before anything is unpacked (which can be a hundred times the file).
@@ -649,13 +682,13 @@ pub fn unpack(path: &Path, key: Option<&[u8; 32]>, dest: &Path) -> Result<Manife
         let expected = m.files.get(&name).ok_or_else(|| anyhow!("{name} is not listed in the manifest"))?;
         // Checked before anything is written: with the manifest's total checked
         // against the file's size, a crafted archive cannot fill the disk.
-        if e.header().size()? != expected.size {
+        if e.size() != expected.size {
             bail!("{name} does not match its checksum: the backup is damaged");
         }
         // Hashed while it is written, a megabyte at a time (a file twice in the archive is refused).
         let file = fs::OpenOptions::new().write(true).create_new(true).open(dest.join(&name))?;
         let mut out = BufWriter::with_capacity(1 << 20, Hashing { out: file, hash: Sha256::new(), size: 0 });
-        io::copy(&mut e, &mut out)?;
+        io::copy(&mut (&mut e).take(expected.size), &mut out)?;
         let out = out.into_inner().map_err(|e| e.into_error())?;
         out.out.sync_all()?;
         if (FileInfo { size: out.size, sha256: hex::encode(out.hash.finalize()) }) != *expected {
@@ -1384,6 +1417,14 @@ mod tests {
         assert_eq!(count(&cfg, "SELECT COUNT(*) FROM clients WHERE hostname = 'named'"), 1);
         assert_eq!(count(&cfg, "SELECT COUNT(*) FROM sessions"), 0, "login sessions never travel");
         assert_eq!(ids(&cfg, "alerts"), "open,recent", "open alerts travel whatever their age");
+        // Built table by table: the live schema, and nothing of the rows left out.
+        let schema = |p: &Path| -> Vec<(String, String, Option<String>)> {
+            let c = Connection::open(p).unwrap();
+            let mut stmt = c.prepare("SELECT type, name, sql FROM sqlite_master WHERE name NOT LIKE 'sqlite_sequence' ORDER BY type, name").unwrap();
+            stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).unwrap().collect::<rusqlite::Result<_>>().unwrap()
+        };
+        assert_eq!(schema(&cfg), schema(&src.join("config.db")));
+        assert!(!fs::read(&cfg).unwrap().windows(17).any(|w| w == b"aa:aa:aa:aa:aa:01"), "a forgotten client leaves no trace");
         assert_eq!(count(&out.join("metrics.db"), "SELECT COUNT(*) FROM ap_stats"), 1);
         // The wrong key, or none, is refused.
         assert!(unpack(&b.dir().join(&m.name), Some(&[8u8; 32]), &dir("rt-wrong")).is_err());
@@ -1819,12 +1860,30 @@ mod tests {
 
     /// Writes an unencrypted backup holding `manifest` and then `entries`, as given.
     fn hand_made(path: &Path, manifest: &Manifest, entries: &[(&str, Vec<u8>)]) {
+        let mj = serde_json::to_vec(manifest).unwrap();
+        let all = std::iter::once(("manifest.json", mj)).chain(entries.iter().map(|(n, d)| (*n, d.clone())));
+        crafted(path, all.map(|(n, d)| (tar::EntryType::Regular, n, d.len() as u64, d)).collect());
+    }
+
+    /// The same with entries of any type, each header saying the size given
+    /// whatever data follows it: (type, name, size, data). A sparse file's
+    /// data is its start, and it says it holds 4 GiB (the rest zeros).
+    fn crafted(path: &Path, entries: Vec<(tar::EntryType, &str, u64, Vec<u8>)>) {
         let mut file = MAGIC.to_vec();
         file.push(0);
         let mut tar = tar::Builder::new(flate2::write::GzEncoder::new(file, flate2::Compression::default()));
-        for (name, data) in std::iter::once(("manifest.json", serde_json::to_vec(manifest).unwrap())).chain(entries.iter().map(|(n, d)| (*n, d.clone()))) {
+        for (kind, name, size, data) in entries {
             let mut h = tar::Header::new_gnu();
-            h.set_size(data.len() as u64);
+            h.set_entry_type(kind);
+            h.set_size(size);
+            if kind == tar::EntryType::GNUSparse {
+                let gnu = h.as_gnu_mut().unwrap();
+                gnu.sparse[0].set_offset(0);
+                gnu.sparse[0].set_length(size);
+                gnu.sparse[1].set_offset(1 << 32);
+                gnu.sparse[1].set_length(0);
+                gnu.set_real_size(1 << 32);
+            }
             h.set_cksum();
             tar.append_data(&mut h, name, data.as_slice()).unwrap();
         }
@@ -1839,6 +1898,31 @@ mod tests {
         let err = unpack(&d.join("x.apb"), None, &out).unwrap_err();
         assert!(err.to_string().contains("damaged"), "{err:#}");
         assert!(!out.join("config.db").exists());
+        // A PAX size record makes the entry longer than its header says: that
+        // size is the one checked.
+        let regular = |name, size, data| (tar::EntryType::Regular, name, size, data);
+        let pax = |size: u64| {
+            let record = format!(" size={size}\n");
+            let record = format!("{}{record}", record.len() + (record.len() + 2).to_string().len()).into_bytes();
+            (tar::EntryType::XHeader, "PaxHeaders/x", record.len() as u64, record)
+        };
+        let mj = serde_json::to_vec(&manifest(&[("config.db", 4)])).unwrap();
+        crafted(&d.join("pax.apb"), vec![regular("manifest.json", mj.len() as u64, mj.clone()), pax(4096), regular("config.db", 4, vec![0u8; 4096])]);
+        let err = unpack(&d.join("pax.apb"), None, &d.join("pax")).unwrap_err();
+        assert!(err.to_string().contains("damaged"), "{err:#}");
+        assert!(!d.join("pax").join("config.db").exists());
+        let mut long = mj.clone();
+        long.resize(2 << 20, b' ');
+        crafted(&d.join("pax-manifest.apb"), vec![pax(2 << 20), regular("manifest.json", mj.len() as u64, long)]);
+        let err = unpack(&d.join("pax-manifest.apb"), None, &d.join("pax-manifest")).unwrap_err();
+        assert!(err.to_string().contains("too large"), "{err:#}");
+        // Only plain files: no sparse files, links or directories.
+        for kind in [tar::EntryType::GNUSparse, tar::EntryType::Directory, tar::EntryType::Symlink] {
+            crafted(&d.join("kind.apb"), vec![regular("manifest.json", mj.len() as u64, mj.clone()), (kind, "config.db", 4, vec![0u8; 4])]);
+            let err = unpack(&d.join("kind.apb"), None, &d.join("kind")).unwrap_err();
+            assert!(err.to_string().contains("unexpected entry in backup: config.db"), "{kind:?}: {err:#}");
+            assert!(!d.join("kind").join("config.db").exists());
+        }
     }
 
     #[test]

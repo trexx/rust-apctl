@@ -159,6 +159,30 @@ fn failure(n: &ConnDetail) -> Option<(usize, &'static str)> {
     FAILURES.iter().rev().find(|f| (f.2)(n)).map(|f| (f.0, f.1))
 }
 
+/// Below this signal (dBm), a failure is not the network's fault: not counted.
+const WEAK_SIGNAL: f64 = -75.0;
+
+/// The signal a report was made at.
+fn rssi(n: &ConnDetail) -> Option<f64> {
+    num(&n.auth_rssi).or_else(|| num(&n.avg_rssi))
+}
+
+/// The furthest failure an attempt that did not succeed is counted with:
+/// none if it shows none, or was made at a weak signal.
+fn counted_failure(n: &ConnDetail) -> Option<(usize, &'static str)> {
+    if rssi(n).is_some_and(|r| r < WEAK_SIGNAL) { None } else { failure(n) }
+}
+
+/// A failure report as it comes in, by the connection views' rules: the
+/// label of the failure they count it with, or none if they count it as a
+/// success or not at all. (A fixup that comes later can still make it a success.)
+pub(crate) fn reported_failure(event_type: &str, n: &ConnDetail) -> Option<&'static str> {
+    if !matches!(event_type, "failure" | "soft failure") || succeeded(event_type, n) {
+        return None;
+    }
+    counted_failure(n).map(|(_, label)| label)
+}
+
 /// A soft failure that kept its IP by roaming.
 fn roamed(event_type: &str, n: &ConnDetail) -> bool {
     event_type == "soft failure" && text(&n.ip_assign_type).is_some_and(|v| v.starts_with("roam"))
@@ -303,14 +327,11 @@ pub fn attempts(mut events: Vec<ConnEvent>) -> Vec<Attempt> {
         .into_iter()
         .filter_map(|(e, ok, fixed)| {
             let n = &e.n;
-            let rssi = num(&n.auth_rssi).or_else(|| num(&n.avg_rssi));
+            let rssi = rssi(n);
             let (stage, failure) = if ok {
                 (6, None)
             } else {
-                if rssi.is_some_and(|r| r < -75.0) {
-                    return None;
-                }
-                let (stage, label) = failure(n)?;
+                let (stage, label) = counted_failure(n)?;
                 (stage, Some(label))
             };
             Some(Attempt {
@@ -623,7 +644,8 @@ fn newest(c: &rusqlite::Connection, from: Ts, to: Ts, client: Option<&str>, limi
     Ok((list, r))
 }
 
-/// Every AP and client apctl knows, by MAC, with its display name if it has one.
+/// Clients apctl knows, by MAC, with their display names if they have one,
+/// and (only once `add_live_aps` has put them in) every AP's.
 #[derive(Debug, Default, Clone)]
 pub struct Names {
     pub aps: HashMap<String, Option<String>>,
@@ -635,25 +657,19 @@ fn pairs<P: rusqlite::Params>(c: &rusqlite::Connection, sql: &str, params: P) ->
     c.prepare_cached(sql)?.query_map(params, |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?)))?.collect()
 }
 
-/// APs' names: their hostnames.
-const AP_NAMES: &str = "SELECT mac, hostname FROM devices";
 /// The hostnames of a JSON list of clients: one statement whatever their number.
 const CLIENT_NAMES: &str = "SELECT mac, hostname FROM clients WHERE mac IN (SELECT value FROM json_each(?1))";
 
 impl Names {
-    /// From the database: APs' and clients' hostnames.
+    /// From the database: clients' hostnames. The APs' are in the live view
+    /// (`Live::known_devices` holds the stored ones).
     pub fn load(c: &rusqlite::Connection) -> rusqlite::Result<Names> {
-        Ok(Names { aps: pairs(c, AP_NAMES, [])?, clients: pairs(c, "SELECT mac, hostname FROM clients", [])? })
+        Ok(Names { aps: HashMap::new(), clients: pairs(c, "SELECT mac, hostname FROM clients", [])? })
     }
 
-    /// The same for some clients only: every AP (there are few), and the clients asked for.
+    /// The same for some clients only.
     fn load_for(c: &rusqlite::Connection, clients: &BTreeSet<&str>) -> anyhow::Result<Names> {
-        Ok(Names { aps: pairs(c, AP_NAMES, [])?, clients: pairs(c, CLIENT_NAMES, [serde_json::to_string(clients)?])? })
-    }
-
-    /// An AP's display name: what it reports now, else what was stored.
-    fn ap(&self, live: &Live, mac: &str) -> Option<String> {
-        ap_name(live, mac).or_else(|| self.aps.get(mac).cloned().flatten())
+        Ok(Names { aps: HashMap::new(), clients: pairs(c, CLIENT_NAMES, [serde_json::to_string(clients)?])? })
     }
 
     /// A client's display name: its alias, else what it reports now, else what was stored.
@@ -661,7 +677,7 @@ impl Names {
         client_name(live, mac.parse().ok()).map(str::to_string).or_else(|| self.clients.get(mac).cloned().flatten())
     }
 
-    /// The names of every AP `live` knows, as [`Names::ap`] gives them, on top.
+    /// The names of every AP `live` knows (see `series::ap_name_of`), on top.
     pub fn add_live_aps(&mut self, live: &Live) {
         for mac in live.devices.keys().chain(live.known_devices.keys()) {
             let m = mac.to_string();
@@ -673,7 +689,7 @@ impl Names {
 
 /// Display names of these APs and clients, for the ones that have one.
 fn names<'a>(stored: &Names, live: &Live, aps: impl IntoIterator<Item = &'a str>, clients: impl IntoIterator<Item = &'a str>) -> (BTreeMap<String, String>, BTreeMap<String, String>) {
-    let aps = aps.into_iter().filter_map(|m| Some((m.to_string(), stored.ap(live, m)?))).collect();
+    let aps = aps.into_iter().filter_map(|m| Some((m.to_string(), ap_name(live, m)?))).collect();
     let clients = clients.into_iter().filter_map(|m| Some((m.to_string(), stored.client(live, m)?))).collect();
     (aps, clients)
 }

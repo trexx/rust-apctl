@@ -11,7 +11,7 @@ use std::sync::{Arc, RwLock};
 
 use inform::Mac;
 use rusqlite::types::Value as Sql;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::sync::broadcast;
 use wire::cfgdiff;
@@ -210,7 +210,7 @@ macro_rules! counters {
     };
 }
 
-counters!(informs, notifications, log_errors, replies, config_pushes, decode_errors, logs, events);
+counters!(informs, notifications, log_errors, replies, config_pushes, decode_errors, logs, events, syslog_dropped);
 
 fn bump(counter: &AtomicU64) {
     counter.fetch_add(1, Ordering::Relaxed);
@@ -283,17 +283,23 @@ impl Live {
     /// or hash_id the AP no longer has is dropped: plain syslog from whichever
     /// host gets the address next is not the AP's.
     fn attribute(&mut self, a: &crate::model::ApSample) {
-        if let Some(h) = a.hash_id.as_deref().and_then(crate::syslog::parse_hash_id)
-            && self.by_hash_id.get(&h) != Some(&a.mac)
-        {
-            self.by_hash_id.retain(|_, m| *m != a.mac);
-            self.by_hash_id.insert(h, a.mac);
+        if let Some(h) = a.hash_id.as_deref().and_then(crate::syslog::parse_hash_id) {
+            self.set_hash_id(h, a.mac);
         }
         if let Some(ip) = &a.ip
             && self.by_ip.get(ip) != Some(&a.mac)
         {
             self.by_ip.retain(|_, m| *m != a.mac);
             self.by_ip.insert(ip.clone(), a.mac);
+        }
+    }
+
+    /// Records `h` as the AP's syslog hash_id, its only one: one it had before
+    /// is dropped.
+    fn set_hash_id(&mut self, h: u64, mac: Mac) {
+        if self.by_hash_id.get(&h) != Some(&mac) {
+            self.by_hash_id.retain(|_, m| *m != mac);
+            self.by_hash_id.insert(h, mac);
         }
     }
 
@@ -364,7 +370,7 @@ pub struct KnownDevice {
 
 pub type SharedLive = Arc<RwLock<Live>>;
 
-type McastTypes = BTreeMap<String, crate::model::McastCounts>;
+type McastTypes = BTreeMap<std::borrow::Cow<'static, str>, crate::model::McastCounts>;
 
 /// A sample's multicast counters by traffic type (none if it has none).
 fn mcast_types(c: &ClientSample) -> &McastTypes {
@@ -495,8 +501,8 @@ pub struct Engine {
     alerts: Option<crate::alerts::Sink>,
     /// The time of this run's first tick (the capture's time in shadow mode).
     first_tick: Option<Ts>,
-    /// Each AP's last push as stored before this run (its secrets masked), until
-    /// a push to it is seen: what that push is compared with.
+    /// Each AP's last push as stored before this run (its secrets masked): what
+    /// the pushes to it are compared with, each field until a push carries it.
     stored_config: HashMap<Mac, PushedConfig>,
 }
 
@@ -570,7 +576,7 @@ impl Engine {
         for (mac, known, hash_id) in devices {
             let Ok(mac) = mac.parse::<Mac>() else { continue };
             if let Some(h) = hash_id.as_deref().and_then(crate::syslog::parse_hash_id) {
-                live.by_hash_id.insert(h, mac);
+                live.set_hash_id(h, mac);
             }
             if let Some(ip) = &known.ip {
                 live.by_ip.insert(ip.clone(), mac);
@@ -674,7 +680,7 @@ impl Engine {
             self.notification(ts, decoded.payload);
             return;
         }
-        let mut snap = match model::parse(ts, &decoded.payload) {
+        let (snap, scans) = match model::parse_with_scans(ts, &decoded.payload) {
             Ok(s) => s,
             Err(e) => {
                 tracing::debug!("unparseable inform: {e:#}");
@@ -684,9 +690,8 @@ impl Engine {
         };
         let mac = snap.ap.mac;
         // Only stored, not kept in the live view: the rows written of them own them.
-        let (neighbors, spectrum) = (std::mem::take(&mut snap.neighbors), std::mem::take(&mut snap.spectrum));
-        self.check_isolated(ts, mac, &neighbors);
-        self.write_metrics(&snap, neighbors, spectrum);
+        self.check_isolated(ts, mac, &scans.neighbors);
+        self.write_metrics(&snap, scans);
         bump(&self.counters.informs);
 
         // A handle of its own, so the engine's other fields stay usable while it is locked.
@@ -694,12 +699,12 @@ impl Engine {
         // The AP's comings and goings are worked out under the read lock: the
         // engine is the only writer of the devices, so the view read here is
         // the one replaced below.
-        let mut events = {
+        let (mut events, came_back) = {
             let live = shared.read().unwrap();
             let prev = live.devices.get(&mac);
             let known = if prev.is_none() { live.known_devices.get(&mac) } else { None };
             self.write_device_if_due(ts, &snap.ap, prev);
-            lifecycle_events(ts, &snap.ap, prev, known)
+            (lifecycle_events(ts, &snap.ap, prev, known), prev.is_none_or(|p| !p.online))
         };
         if snap.has_vap_table {
             self.radio_events(ts, &snap, &mut events);
@@ -737,6 +742,44 @@ impl Engine {
             let _ = self.tx.send(LiveMsg::Clients);
         }
         let _ = self.tx.send(LiveMsg::Device { mac });
+        // Online: its first inform of this run, or back from offline.
+        if came_back {
+            self.set_fixed_ap_available(ts, mac, true);
+        }
+    }
+
+    /// Keeps the AP's `fixed_ap_available` in the settings in step with whether
+    /// the engine counts it online, as the official controller does for an AP
+    /// (a device with radios): a client locked to an AP that is away may use
+    /// the others meanwhile (apcfg's `lock2ap`). Written only when it changes,
+    /// as a change of the controller's own, not the user's: no settings event.
+    /// The APs are asked to inform now only when a client is locked to it, when
+    /// the official controller provisions them all; else no AP's config changes.
+    fn set_fixed_ap_available(&mut self, ts: Ts, mac: Mac, available: bool) {
+        let (current, imported_at) = {
+            let live = self.live.read().unwrap();
+            (live.state.clone(), live.state_imported_at.unwrap_or(ts))
+        };
+        let Some(current) = current else { return };
+        let Some(doc) = crate::adopt::device_doc(&current, &mac) else { return };
+        let has_radios = doc["radio_table"].as_array().is_some_and(|r| !r.is_empty());
+        if !has_radios || doc["fixed_ap_available"].as_bool().unwrap_or(true) == available {
+            return;
+        }
+        let mut state = Value::clone(&current);
+        drop(current);
+        if let Some(doc) = crate::adopt::device_doc_mut(&mut state, &mac) {
+            doc["fixed_ap_available"] = json!(available);
+        }
+        let locked = state["clients"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .any(|c| c["fixed_ap_enabled"].as_bool() == Some(true) && crate::settings::doc_mac(&c["fixed_ap_mac"]) == Some(mac));
+        self.store_state(state, imported_at);
+        if locked {
+            crate::stun::poke_all(&self.live.read().unwrap());
+        }
     }
 
     /// Settings changes on the AP's radios, debounced (see `radios`).
@@ -889,11 +932,11 @@ impl Engine {
         let stored = self.stored_config.remove(&mac);
         let (radios, previous, redacted, state, inform) = {
             let live = self.live.read().unwrap();
-            // The last push, for the diffs: the one seen in this run (unredacted), else
-            // the one stored before it (secrets masked); empty fields if there is none.
+            // The last push, for the diffs, field by field: the one seen in this run
+            // (unredacted), else the one stored before it (secrets masked); empty if
+            // there is none.
             let seen = live.last_config.get(&mac).cloned();
-            let redacted = seen.is_none() && stored.is_some();
-            let previous = seen.or(stored.map(Arc::new)).unwrap_or_default();
+            let (previous, redacted) = previous_push(seen, stored);
             let has_system = new_system.as_ref().map_or(!previous.system_cfg.is_empty(), |s| !s.is_empty());
             // For the section labels, which only a system_cfg has.
             let radios = live.devices.get(&mac).filter(|_| has_system).map(|d| d.snapshot.radios.clone()).unwrap_or_default();
@@ -906,7 +949,7 @@ impl Engine {
         let system = new_system.as_deref().unwrap_or(&previous.system_cfg);
         let mut data = serde_json::Map::new();
         data.insert("cfgversion".into(), p["cfgversion"].clone());
-        for (field, new, old) in [("mgmt_cfg", &new_mgmt, &previous.mgmt_cfg), ("system_cfg", &new_system, &previous.system_cfg)] {
+        for (field, new, old, redacted) in [("mgmt_cfg", &new_mgmt, &previous.mgmt_cfg, redacted[0]), ("system_cfg", &new_system, &previous.system_cfg, redacted[1])] {
             let Some(new) = new else { continue };
             let summary = if old.is_empty() {
                 json!({ "baseline": true, "lines": new.lines().count() })
@@ -959,7 +1002,7 @@ impl Engine {
                     previous_system_cfg: Some(system),
                 };
                 // Masked when a field the push does not carry is the stored copy's.
-                let masked = redacted && (new_mgmt.is_none() || new_system.is_none());
+                let masked = (redacted[0] && new_mgmt.is_none()) || (redacted[1] && new_system.is_none());
                 Some(self.dry_run(render, ts, &req, cfgversion.as_deref(), mgmt, masked))
             }
             _ => None,
@@ -968,11 +1011,21 @@ impl Engine {
         // As in `inform`: the write lock is held for the swap alone, and the old
         // push is dropped and the events emitted after it. A field the push does
         // not carry is the last push's, but only known in full from one seen in
-        // this run: else it is left empty, and readers go to the stored copy.
-        let kept = |old: &String| if redacted { String::new() } else { old.clone() };
+        // this run: else it is left empty, readers go to the stored copy, and so
+        // does the next push, which keeps it here until a push carries the field.
+        let still_stored = |redacted: bool, new: &Option<String>, old: &String| if redacted && new.is_none() { old.clone() } else { String::new() };
+        let left = PushedConfig {
+            mgmt_cfg: still_stored(redacted[0], &new_mgmt, &previous.mgmt_cfg),
+            system_cfg: still_stored(redacted[1], &new_system, &previous.system_cfg),
+            cfgversion: None,
+        };
+        if !left.mgmt_cfg.is_empty() || !left.system_cfg.is_empty() {
+            self.stored_config.insert(mac, left);
+        }
+        let kept = |redacted: bool, old: &String| if redacted { String::new() } else { old.clone() };
         let pushed = PushedConfig {
-            mgmt_cfg: new_mgmt.unwrap_or_else(|| kept(&previous.mgmt_cfg)),
-            system_cfg: new_system.unwrap_or_else(|| kept(&previous.system_cfg)),
+            mgmt_cfg: new_mgmt.unwrap_or_else(|| kept(redacted[0], &previous.mgmt_cfg)),
+            system_cfg: new_system.unwrap_or_else(|| kept(redacted[1], &previous.system_cfg)),
             cfgversion,
         };
         let mut live = self.live.write().unwrap();
@@ -1292,11 +1345,19 @@ impl Engine {
             num("dns_timeouts").map(|v| v as i64).into(),
             num("avg_rssi").or_else(|| num("auth_rssi")).map(|v| v as i64).into(),
         ];
-        // Failed attempts are worth an event; the rest stay in the connection log.
-        // A roam is reported as a "soft failure" but is a normal, successful move.
-        let roamed = n["ip_assign_type"].as_str().is_some_and(|t| t.starts_with("roam"));
-        let failed = (event_type == "failure" || (event_type == "soft failure" && !roamed))
-            .then(|| json!({ "essid": essid, "reason": n["sta_dc_reason"], "auth_algo": n["auth_algo"], "rssi": num("auth_rssi") }));
+        // Failed attempts are worth an event, as the connection views count them (a
+        // roam, or a soft failure that got traffic and DNS answers, is none); the
+        // rest stay in the connection log. Without a reason from the AP, the stage
+        // it failed at is the reason.
+        let detail = crate::connections::ConnDetail::deserialize(&n).unwrap_or_default();
+        let failed = crate::connections::reported_failure(&event_type, &detail).map(|label| {
+            let reason = match &n["sta_dc_reason"] {
+                Value::Null => json!(label),
+                Value::String(r) if r.is_empty() => json!(label),
+                r => r.clone(),
+            };
+            json!({ "essid": essid, "reason": reason, "auth_algo": n["auth_algo"], "rssi": num("auth_rssi").or_else(|| num("avg_rssi")) })
+        });
         // The whole notification, with the channel and width at the time: timings, failure
         // counters and stage flags for connectivity stats, and the roaming views.
         if let Some((channel, bw)) = at {
@@ -1343,10 +1404,7 @@ impl Engine {
         for (mac, cipher) in self.syslog_ciphers.all() {
             if let Ok(text) = crate::syslog::decrypt_with(payload, mac, cipher) {
                 self.syslog_unknown.remove(&hash_id);
-                // As `Live::attribute`: an AP has one hash_id.
-                let mut live = self.live.write().unwrap();
-                live.by_hash_id.retain(|_, m| *m != mac);
-                live.by_hash_id.insert(hash_id, mac);
+                self.live.write().unwrap().set_hash_id(hash_id, mac);
                 return Ok((mac, text));
             }
         }
@@ -1567,6 +1625,7 @@ impl Engine {
         for mac in offline {
             self.writer.exec(Db::Config, "UPDATE devices SET offline = 1 WHERE mac = ?1", vec![Sql::Text(mac.to_string())]);
             let _ = self.tx.send(LiveMsg::Device { mac });
+            self.set_fixed_ap_available(now, mac, false);
         }
         if changed {
             let _ = self.tx.send(LiveMsg::Clients);
@@ -1600,7 +1659,7 @@ impl Engine {
     }
 
     /// The inform's metrics, and its scan results (see `Written`).
-    fn write_metrics(&mut self, s: &Snapshot, neighbors: Vec<crate::model::NeighborSample>, spectrum: Vec<crate::model::SpectrumSample>) {
+    fn write_metrics(&mut self, s: &Snapshot, model::Scans { neighbors, spectrum }: model::Scans) {
         let ts = s.ap.ts;
         // Formatted once: nearly every row of the inform carries the AP's MAC.
         let mac_text = Sql::Text(s.ap.mac.to_string());
@@ -1670,18 +1729,20 @@ impl Engine {
         }
         rows.retain(|_, r| r.seen == ts);
         let radios = self.written.spectrum.entry(s.ap.mac).or_default();
-        for c in spectrum {
+        for (radio, channels) in spectrum {
             // Looked up by reference: the radio's name is copied only for a new one.
-            if !radios.contains_key(c.radio.as_str()) {
-                radios.insert(c.radio.clone(), Rows::new());
+            if !radios.contains_key(&radio) {
+                radios.insert(radio.clone(), Rows::new());
             }
-            let rows = radios.get_mut(c.radio.as_str()).expect("inserted above");
-            let Some(c) = report(rows, c, |c| &c.channel, ts, SPECTRUM_REFRESH_SECS) else { continue };
-            self.writer.exec(
-                Db::Config,
-                "INSERT OR REPLACE INTO spectrum (ap_mac, radio, channel, width, utilization, interference, other_bss_count, ts) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-                vec![mac(), Sql::Text(c.radio.clone()), Sql::Integer(c.channel), c.width.into(), c.utilization.into(), c.interference.into(), c.other_bss_count.into(), Sql::Integer(ts)],
-            );
+            let rows = radios.get_mut(&radio).expect("inserted above");
+            for c in channels {
+                let Some(c) = report(rows, c, |c| &c.channel, ts, SPECTRUM_REFRESH_SECS) else { continue };
+                self.writer.exec(
+                    Db::Config,
+                    "INSERT OR REPLACE INTO spectrum (ap_mac, radio, channel, width, utilization, interference, other_bss_count, ts) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                    vec![mac(), Sql::Text(radio.clone()), Sql::Integer(c.channel), c.width.into(), c.utilization.into(), c.interference.into(), c.other_bss_count.into(), Sql::Integer(ts)],
+                );
+            }
         }
         radios.retain(|_, rows| {
             rows.retain(|_, r| r.seen == ts);
@@ -1717,7 +1778,7 @@ impl Engine {
                     let prev = mcast_types(prev);
                     for (kind, cur) in &m.types {
                         let p = prev.get(kind).copied().unwrap_or(*cur);
-                        let e = mcast.entry(kind).or_default();
+                        let e = mcast.entry(kind.as_ref()).or_default();
                         e.0[0] += rate(cur.tx_pkts, p.tx_pkts, dt);
                         e.0[2] += rate(cur.tx_bytes, p.tx_bytes, dt);
                     }
@@ -1739,7 +1800,7 @@ impl Engine {
                 for (kind, cur) in &m.types {
                     let p = prev.get(kind).copied().unwrap_or(*cur);
                     let (pk, by) = (rate(cur.rx_pkts, p.rx_pkts, dt), rate(cur.rx_bytes, p.rx_bytes, dt));
-                    let e = mcast.entry(kind).or_default();
+                    let e = mcast.entry(kind.as_ref()).or_default();
                     e.0[1] += pk;
                     e.0[3] += by;
                     if pk > 0.0 {
@@ -1757,6 +1818,21 @@ impl Engine {
             });
         }
     }
+}
+
+/// An AP's last push, field by field: the one `seen` in this run, else the
+/// `stored` one, whose fields are flagged (mgmt_cfg, system_cfg) as redacted.
+fn previous_push(seen: Option<Arc<PushedConfig>>, stored: Option<PushedConfig>) -> (Arc<PushedConfig>, [bool; 2]) {
+    let Some(stored) = stored else { return (seen.unwrap_or_default(), [false; 2]) };
+    let Some(seen) = seen else {
+        let redacted = [!stored.mgmt_cfg.is_empty(), !stored.system_cfg.is_empty()];
+        return (Arc::new(stored), redacted);
+    };
+    let pick = |seen: &String, stored: String| if seen.is_empty() && !stored.is_empty() { (stored, true) } else { (seen.clone(), false) };
+    let (mgmt_cfg, mgmt_redacted) = pick(&seen.mgmt_cfg, stored.mgmt_cfg);
+    let (system_cfg, system_redacted) = pick(&seen.system_cfg, stored.system_cfg);
+    let cfgversion = seen.cfgversion.clone().or(stored.cfgversion);
+    (Arc::new(PushedConfig { mgmt_cfg, system_cfg, cfgversion }), [mgmt_redacted, system_redacted])
 }
 
 /// Human names for numbered config sections: SSIDs (with band) for `aaa.N` and
@@ -2105,6 +2181,29 @@ mod tests {
         h.engine.handle(Input::Tick(25)); // a tick before the first inform must not disconnect anyone
         feed(&mut h.engine, 30);
         assert_eq!(events(&mut h), []);
+    }
+
+    #[test]
+    fn an_ap_away_is_marked_unavailable_to_the_clients_locked_to_it() {
+        let mut h = harness();
+        h.engine.set_state(0, json!({
+            "devices": [{ "mac": AP1, "radio_table": [{ "radio": "na" }] }, { "mac": AP2 }],
+            "clients": [{ "mac": C1, "fixed_ap_enabled": true, "fixed_ap_mac": AP1 }],
+        }));
+        let feed = |h: &mut Harness, ap: &str, ts: Ts| h.engine.handle(Input::Inform { ts, peer: [10, 0, 0, 1].into(), decoded: decoded(inform(ap, 1000 + ts, &[])) });
+        let available = |h: &Harness, i: usize| h.live.read().unwrap().state.as_ref().unwrap()["devices"][i].get("fixed_ap_available").cloned();
+        feed(&mut h, AP1, 0);
+        feed(&mut h, AP2, 0);
+        assert_eq!(available(&h, 0), None, "online, as without the field: nothing written");
+        h.engine.handle(Input::Tick(100));
+        // Only a device with radios is marked; the settings are stored, but not as a change of the user's.
+        assert_eq!((available(&h, 0), available(&h, 1)), (Some(json!(false)), None));
+        flushed(&h.writer);
+        let stored_state: String = h.store.read(Db::Config, |c| Ok(c.query_row("SELECT json FROM controller_state", [], |r| r.get(0))?)).unwrap();
+        assert!(stored_state.contains("\"fixed_ap_available\":false"), "{stored_state}");
+        feed(&mut h, AP1, 200);
+        assert_eq!(available(&h, 0), Some(json!(true)));
+        assert!(stored(&h, EventKind::SettingsChanged).is_empty());
     }
 
     #[test]
@@ -2542,13 +2641,24 @@ mod tests {
         let success = json!({ "message_type": "STA_ASSOC_TRACKER", "event_type": "success", "mac": C1, "vap": "wifi1ap0",
             "assoc_delta": "40000", "wpa_auth_delta": "80000", "ip_delta": "100000", "dns_responses": "1", "dns_timeouts": "0", "avg_rssi": "-61" });
         h.engine.handle(Input::Inform { ts: 6, peer: [10, 0, 0, 1].into(), decoded: notif(AP1, "event", success) });
-        let failure = json!({ "message_type": "STA_ASSOC_TRACKER", "event_type": "soft failure", "mac": C1, "vap": "wifi1ap0", "sta_dc_reason": "roam", "auth_rssi": "-81" });
-        h.engine.handle(Input::Inform { ts: 7, peer: [10, 0, 0, 1].into(), decoded: notif(AP1, "event", failure) });
+        // Failures as the connection views count them: not one at a weak signal,
+        // nor a soft failure that got traffic and DNS answers.
+        let tracker = |fields: Value| {
+            let mut n = json!({ "message_type": "STA_ASSOC_TRACKER", "mac": C1, "vap": "wifi1ap0" });
+            n.as_object_mut().unwrap().extend(fields.as_object().unwrap().clone());
+            notif(AP1, "event", n)
+        };
+        h.engine.handle(Input::Inform { ts: 7, peer: [10, 0, 0, 1].into(), decoded: tracker(json!({ "event_type": "failure", "wpa_auth_failures": "1", "auth_rssi": "-81" })) });
+        let fine = json!({ "event_type": "soft failure", "dns_timeouts": "1", "traffic_delta": "300000", "dns_responses": "2", "auth_rssi": "-60" });
+        h.engine.handle(Input::Inform { ts: 7, peer: [10, 0, 0, 1].into(), decoded: tracker(fine) });
+        h.engine.handle(Input::Inform { ts: 7, peer: [10, 0, 0, 1].into(), decoded: tracker(json!({ "event_type": "failure", "wpa_auth_failures": "1", "auth_rssi": "-60" })) });
         h.engine.handle(Input::Inform { ts: 8, peer: [10, 0, 0, 1].into(), decoded: notif(AP1, "event", json!({ "event_string": "EVT_AP_RadarDetected", "channel": 52 })) });
         assert_eq!(
             events(&mut h),
             vec![("config_applied", None), ("client_connect_failed", Some(C1.into())), ("dfs_radar", None)]
         );
+        let failed = stored(&h, EventKind::ClientConnectFailed);
+        assert_eq!((&failed[0]["reason"], &failed[0]["rssi"]), (&json!("WPA authentication"), &json!(-60.0)));
         // One whose mac is not one is counted as undecodable.
         let mut bad = notif(AP1, "setparam", Value::Null);
         bad.payload["mac"] = json!("nope");
@@ -2557,7 +2667,7 @@ mod tests {
         let live = h.live.read().unwrap();
         assert_eq!(live.counters.decode_errors.load(Ordering::Relaxed), 1);
         assert!(live.clients[&C1.parse().unwrap()].connected);
-        assert_eq!(live.counters.notifications.load(Ordering::Relaxed), 4);
+        assert_eq!(live.counters.notifications.load(Ordering::Relaxed), 6);
         assert_eq!(live.devices[&AP1.parse().unwrap()].last_full_inform, 0, "notifications are not client lists");
     }
 
@@ -2664,6 +2774,18 @@ mod tests {
         flushed(&h.writer);
         let row: (String, String) = h.store.read(Db::Config, |c| Ok(c.query_row("SELECT cfgversion, system_cfg FROM device_config", [], |r| Ok((r.get(0)?, r.get(1)?)))?)).unwrap();
         assert_eq!(row, ("v2".into(), "aaa.1.hide_ssid=true\naaa.1.wpa.psk=<redacted>".into()));
+        // The stored system_cfg stays what the next pushes are compared with: a
+        // second management-only push still names its sections, and the next full
+        // push gets a diff, not a baseline.
+        push(&mut h, 35, json!({ "_type": "setparam", "mgmt_cfg": "a=3" }));
+        assert!(stored(&h, EventKind::ConfigPushed).pop().unwrap()["labels"].is_object());
+        push(&mut h, 40, json!({ "_type": "setparam", "mgmt_cfg": "a=4", "system_cfg": "aaa.1.hide_ssid=false\naaa.1.wpa.psk=old" }));
+        let pushed = stored(&h, EventKind::ConfigPushed).pop().unwrap();
+        assert_eq!((pushed["system_cfg"]["diff"].as_str(), pushed["mgmt_cfg"]["diff"].as_str()), (Some("~ aaa.1.hide_ssid: true -> false\n"), Some("~ a: 3 -> 4\n")));
+        // From then on, the push seen in this run.
+        push(&mut h, 50, json!({ "_type": "setparam", "system_cfg": "aaa.1.hide_ssid=false\naaa.1.wpa.psk=new" }));
+        let diff = stored(&h, EventKind::ConfigPushed).pop().unwrap()["system_cfg"]["diff"].as_str().unwrap().to_string();
+        assert!(diff.contains("aaa.1.wpa.psk: <redacted> -> <redacted>"), "{diff}");
     }
 
     #[test]

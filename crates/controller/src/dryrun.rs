@@ -27,15 +27,20 @@ pub fn controller(version: String, reporter_uuid: String) -> apcfg::Controller {
     apcfg::Controller { version, reporter_uuid, ..Default::default() }
 }
 
-/// The real generator (`apcfg`), emulating a given controller version.
+/// The real generator (`apcfg`), emulating a given controller version, for a
+/// controller with the official defaults (see `controller`).
 pub fn apcfg_renderer(version: String) -> RenderFn {
+    renderer_for(&controller(version, String::new()))
+}
+
+/// The real generator for the controller `template` describes: active mode's
+/// own, so that a dry run renders what it pushes. The installation ID is the
+/// one the AP's last push names, else the template's.
+pub fn renderer_for(template: &apcfg::Controller) -> RenderFn {
+    let template = copy(template, template.reporter_uuid.clone());
     Arc::new(move |req: &RenderRequest| {
-        let reporter = req
-            .previous_system_cfg
-            .and_then(|c| c.lines().find_map(|l| l.strip_prefix("unifi.reporterid=")))
-            .unwrap_or_default()
-            .to_string();
-        let controller = controller(version.clone(), reporter);
+        let reporter = req.previous_system_cfg.and_then(|c| c.lines().find_map(|l| l.strip_prefix("unifi.reporterid="))).unwrap_or(&template.reporter_uuid);
+        let controller = copy(&template, reporter.to_string());
         let input = apcfg::Input {
             state: req.state,
             device_mac: req.device_mac,
@@ -46,6 +51,11 @@ pub fn apcfg_renderer(version: String) -> RenderFn {
         let r = apcfg::render(&input)?;
         Ok((r.mgmt_cfg, r.system_cfg))
     })
+}
+
+/// `c` with another installation ID.
+fn copy(c: &apcfg::Controller, reporter_uuid: String) -> apcfg::Controller {
+    apcfg::Controller { host: c.host.clone(), inform_port: c.inform_port, https_port: c.https_port, stun_port: c.stun_port, version: c.version.clone(), reporter_uuid }
 }
 
 /// `(mgmt_cfg, system_cfg)` for one AP.
@@ -265,6 +275,25 @@ mod tests {
         for (ours, theirs, redacted) in [(zone_cast, cast_zone, false), ("mdns_sd.filter.2.service.1.name=_airplay._tcp.local", cast_zone, false), ("a=1\nb=2\naaa.1.wpa.psk=other", actual, true), ("a=1\nb=3", "a=1\nb=2", false)] {
             assert_eq!(equivalent(ours, theirs, redacted), compare_field(ours, theirs, redacted, false).equivalent, "{ours:?}");
         }
+    }
+
+    #[test]
+    fn a_dry_run_renders_for_the_controller_it_was_given() {
+        let mac = "02:00:00:00:00:01";
+        let mgmt = serde_json::json!({ "key": "mgmt", "site_id": "s", "x_ssh_md5passwd": "$1$x$y" });
+        let state = serde_json::json!({ "sites": [{ "_id": "s", "name": "default" }], "devices": [{ "mac": mac, "site_id": "s", "type": "uap" }], "setting": [mgmt] });
+        let line = |render: &RenderFn, previous: Option<&str>, key: &str| {
+            let req = RenderRequest { state: &state, device_mac: mac, inform: None, cfgversion: "1", previous_system_cfg: previous };
+            let (mgmt, system) = render(&req).unwrap();
+            mgmt.lines().chain(system.lines()).find_map(|l| l.strip_prefix(key)?.strip_prefix('=')).map(str::to_string)
+        };
+        let ours = apcfg::Controller { host: "ctl.example.net".into(), stun_port: 3479, ..controller("10.6.106".into(), "ours".into()) };
+        let render = renderer_for(&ours);
+        assert_eq!(line(&render, None, "stun_url").as_deref(), Some("stun://ctl.example.net:3479/"));
+        // The installation ID: the last push's, else the template's.
+        assert_eq!(line(&render, None, "unifi.reporterid").as_deref(), Some("ours"));
+        assert_eq!(line(&render, Some("unifi.reporterid=theirs"), "unifi.reporterid").as_deref(), Some("theirs"));
+        assert_eq!(line(&apcfg_renderer("10.6.106".into()), None, "stun_url").as_deref(), Some("stun://unifi:3478/"));
     }
 
     #[test]

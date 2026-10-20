@@ -435,7 +435,7 @@ fn stored_view(mac: Mac, k: &KnownDevice) -> DeviceView {
     };
     DeviceView {
         snapshot: crate::model::Snapshot {
-            ap, uplink: None, radios: vec![], vaps: vec![], clients: vec![], neighbors: vec![], spectrum: vec![], has_vap_table: false,
+            ap, uplink: None, radios: vec![], vaps: vec![], clients: vec![], has_vap_table: false,
         },
         online: false, first_seen: k.first_seen, last_seen: k.last_seen, peer: None, interval: 0, last_full_inform: 0,
         last_config_push: None,
@@ -547,8 +547,7 @@ struct DeviceOut<'a> {
 fn page_view(d: &DeviceView) -> DeviceView {
     let s = &d.snapshot;
     let snapshot = crate::model::Snapshot {
-        ap: s.ap.clone(), uplink: s.uplink.clone(), radios: s.radios.clone(), vaps: s.vaps.clone(), clients: vec![], neighbors: vec![], spectrum: vec![],
-        has_vap_table: s.has_vap_table,
+        ap: s.ap.clone(), uplink: s.uplink.clone(), radios: s.radios.clone(), vaps: s.vaps.clone(), clients: vec![], has_vap_table: s.has_vap_table,
     };
     DeviceView { snapshot, ..*d }
 }
@@ -648,7 +647,8 @@ async fn clients(State(s): State<AppState>) -> Response {
     let (state, list, ap_names) = {
         let live = s.live.read().unwrap();
         let list: Vec<ClientCopy> = live.clients.iter().map(|(mac, c)| (*mac, c.clone(), live.aliases.get(mac).cloned())).collect();
-        let ap_names: std::collections::HashMap<Mac, String> = live.devices.iter().filter_map(|(m, d)| Some((*m, d.snapshot.ap.hostname.clone()?))).collect();
+        let aps = live.devices.keys().chain(live.known_devices.keys());
+        let ap_names: std::collections::HashMap<Mac, String> = aps.filter_map(|m| Some((*m, crate::series::ap_name_of(&live, m)?))).collect();
         (live.state.clone(), list, ap_names)
     };
     let controls = crate::actions::ClientControls::new(state.as_deref());
@@ -972,6 +972,8 @@ async fn import_aliases(
 struct SeriesQuery {
     /// Key values in the table's key order, comma-separated (e.g. `mac,radio`).
     key: String,
+    /// The numbers wanted, comma-separated (e.g. `cpu,mem`): every one if not given.
+    fields: Option<String>,
     from: Option<Ts>,
     to: Option<Ts>,
 }
@@ -982,9 +984,10 @@ async fn series(State(s): State<AppState>, Path(table): Path<String>, Query(q): 
     if keys.len() != t.keys.len() {
         return Err(ApiError::bad(format!("{table} needs key {}", t.keys.join(","))));
     }
+    let only = q.fields.as_deref().map(|f| t.numbers_named(f)).transpose().map_err(|f| ApiError::bad(format!("{table} has no field {f}")))?;
     // An hour by default. No shortest window: a live chart asks for what is newer than its last sample.
     let (from, to, tier) = crate::series::bounded(q.from, q.to, 3600);
-    Ok(Json(read(&s.store, Db::Metrics, move |c| store::series(c, t, &keys, from, to, tier)).await?))
+    Ok(Json(read(&s.store, Db::Metrics, move |c| store::series(c, t, &keys, only.as_deref(), from, to, tier)).await?))
 }
 
 /// A WHERE clause made of optional filters, with numbered parameters.
@@ -1361,6 +1364,7 @@ mod tests {
         ] });
         // The one in the database is restored as at start, before any inform.
         s.writer.exec(Db::Config, "INSERT INTO devices (mac, hostname, model, first_seen, last_seen) VALUES ('02:00:00:00:00:02', 'Attic', 'U6', 10, 20)", vec![]);
+        s.writer.exec(Db::Config, "INSERT INTO clients (mac, first_seen, last_seen, ap_mac, bssid) VALUES ('02:00:00:00:01:02', 10, 20, '02:00:00:00:00:02', 'b2')", vec![]);
         flushed(&s.writer);
         engine.restore(&s.store).unwrap();
         engine.handle(report(payload));
@@ -1399,6 +1403,8 @@ mod tests {
         let clients = get_json(&app, "/api/clients").await;
         assert_eq!((clients[0]["ap_name"].as_str(), clients[0]["connected"].as_bool(), clients[0]["sample"]["essid"].as_str()), (Some("Hall"), Some(true), Some("Home")));
         assert!(clients[0]["alias"].is_null() && clients[0].get("blocked").is_some(), "{}", clients[0]);
+        // A client of the AP not reporting since the start: the AP by its stored name.
+        assert_eq!((clients[1]["ap_name"].as_str(), clients[1]["connected"].as_bool()), (Some("Attic"), Some(false)));
         let keys = |v: &Value| v.as_object().unwrap().keys().cloned().collect::<Vec<_>>().join(",");
         assert_eq!(keys(&clients[0]), "alias,ap_name,blocked,connected,first_seen,last_seen,locked_to,note,sample,usergroup_id,vendor");
         let one = get_json(&app, "/api/clients/02:00:00:00:01:01").await;
@@ -1659,6 +1665,8 @@ mod tests {
         let (status, msg) = error(get("/api/series/clients?from=soon").await.unwrap()).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert!(msg.starts_with("Failed to deserialize query string"), "{msg}");
+        let (status, msg) = error(get("/api/series/ap_stats?key=02:00:00:00:00:01&fields=cpu,nope").await.unwrap()).await;
+        assert_eq!((status, msg.as_str()), (StatusCode::BAD_REQUEST, "ap_stats has no field nope"));
         let put = |content_type: &str, body: &'static str| {
             let req = Request::put("/api/clients/02:00:00:00:01:01/alias").header(header::COOKIE, &cookie).header("x-requested-with", "apctl").header(header::CONTENT_TYPE, content_type);
             app.clone().oneshot(req.body(Body::from(body)).unwrap())

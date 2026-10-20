@@ -4,6 +4,7 @@
 //! through lenient helpers. A missing field becomes `None` rather than an error:
 //! models and firmware versions differ in what they report.
 
+use std::borrow::Cow;
 use std::sync::Arc;
 
 use inform::Mac;
@@ -194,10 +195,9 @@ pub struct NeighborSample {
     pub age: Option<i64>,
 }
 
-/// One channel from a spectrum (channel survey) scan.
+/// One channel from a spectrum (channel survey) scan of one radio.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct SpectrumSample {
-    pub radio: String,
     pub channel: i64,
     pub width: Option<i64>,
     pub utilization: Option<i64>,
@@ -270,7 +270,7 @@ pub struct McastGroup {
     pub dst_port: Option<i64>,
     /// Traffic type: mdns, ssdp, igmp, stream, dhcp, arp...
     #[serde(rename = "type")]
-    pub kind: Option<String>,
+    pub kind: Option<Cow<'static, str>>,
     #[serde(flatten)]
     pub counts: McastCounts,
 }
@@ -278,7 +278,7 @@ pub struct McastGroup {
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct Multicast {
     /// Counters per traffic type (arp, dhcp, dhcpv6, igmp, ipv6_nd, mdns, mld, ssdp, stream, other).
-    pub types: std::collections::BTreeMap<String, McastCounts>,
+    pub types: std::collections::BTreeMap<Cow<'static, str>, McastCounts>,
     /// Destination groups the client's traffic used.
     pub groups: Vec<McastGroup>,
     /// Groups the client has joined.
@@ -294,15 +294,23 @@ pub struct McastService {
     pub bytes: i64,
 }
 
+/// The traffic types APs report, so that a client's types and groups name
+/// them without a copy each.
+const MCAST_TYPES: [&str; 10] = ["arp", "dhcp", "dhcpv6", "igmp", "ipv6_nd", "mdns", "mld", "other", "ssdp", "stream"];
+
+fn mcast_type(name: &str) -> Cow<'static, str> {
+    MCAST_TYPES.iter().find(|t| **t == name).map_or_else(|| Cow::Owned(name.to_string()), |t| Cow::Borrowed(*t))
+}
+
 impl Multicast {
     fn parse(v: &Value) -> Option<Multicast> {
-        let types = v["types"].as_object()?.iter().map(|(k, x)| (k.clone(), McastCounts::parse(x))).collect();
+        let types = v["types"].as_object()?.iter().map(|(k, x)| (mcast_type(k), McastCounts::parse(x))).collect();
         let groups = v["groups"]
             .as_array()
             .into_iter()
             .flatten()
             .filter_map(|g| {
-                Some(McastGroup { group_ip: g["group_ip"].as_str()?.to_string(), dst_port: int(&g["dst_port"]), kind: string(&g["type"]), counts: McastCounts::parse(g) })
+                Some(McastGroup { group_ip: g["group_ip"].as_str()?.to_string(), dst_port: int(&g["dst_port"]), kind: g["type"].as_str().filter(|s| !s.is_empty()).map(mcast_type), counts: McastCounts::parse(g) })
             })
             .collect();
         let memberships = v["memberships"].as_array().into_iter().flatten().filter_map(|m| m["group_ip"].as_str().map(str::to_string)).collect();
@@ -343,17 +351,9 @@ pub struct Snapshot {
     pub radios: Vec<RadioSample>,
     pub vaps: Vec<VapSample>,
     /// Shared with the live client list, which holds the same samples.
-    /// Not sent with the AP (nor its neighbours and spectrum): its page gets
-    /// the clients beside it, and the RF pages have routes of their own.
+    /// Not sent with the AP: its page gets the clients beside it.
     #[serde(skip_serializing)]
     pub clients: Vec<Arc<ClientSample>>,
-    /// Scan results; the engine stores them and takes them out of the
-    /// snapshot it keeps (so empty in the live view), as does `spectrum`.
-    #[serde(skip_serializing)]
-    pub neighbors: Vec<NeighborSample>,
-    /// Only channels with survey samples (empty until a spectrum scan runs).
-    #[serde(skip_serializing)]
-    pub spectrum: Vec<SpectrumSample>,
     /// False for an inform without a VAP table: the absence of clients then
     /// says nothing about whether they are still connected. Only notifications
     /// (which are not parsed) have been seen without one. An empty table is a
@@ -390,8 +390,25 @@ fn wifi_gen(sta: &Value) -> Option<&'static str> {
         .map(|(_, g)| g)
 }
 
-/// Parses an inform payload. `ts` is when it was received (capture time in shadow mode).
+/// An inform's scan results: stored, not kept in the live view (the RF pages
+/// read them from the database).
+#[derive(Debug, Default)]
+pub struct Scans {
+    pub neighbors: Vec<NeighborSample>,
+    /// Per radio, the channels with survey samples (none until a spectrum scan runs).
+    pub spectrum: Vec<(String, Vec<SpectrumSample>)>,
+}
+
+/// Parses an inform payload, without its scans (for tests that want the
+/// snapshot alone).
+#[cfg(test)]
 pub fn parse(ts: Ts, p: &Value) -> anyhow::Result<Snapshot> {
+    parse_with_scans(ts, p).map(|(s, _)| s)
+}
+
+/// Parses an inform payload and its scan results. `ts` is when it was received
+/// (capture time in shadow mode).
+pub fn parse_with_scans(ts: Ts, p: &Value) -> anyhow::Result<(Snapshot, Scans)> {
     let mac: Mac = p["mac"].as_str().ok_or_else(|| anyhow::anyhow!("inform without mac"))?.parse()?;
     let sys = &p["sys_stats"];
     let stats = &p["system-stats"];
@@ -402,7 +419,7 @@ pub fn parse(ts: Ts, p: &Value) -> anyhow::Result<Snapshot> {
     let mut clients = Vec::new();
     for v in vap_table.into_iter().flatten() {
         // Lower case, as the neighbours' BSSIDs are kept: the two are compared.
-        let Some(bssid) = string(&v["bssid"]).map(|b| b.to_ascii_lowercase()) else { continue };
+        let Some(bssid) = v["bssid"].as_str().filter(|b| !b.is_empty()).map(str::to_ascii_lowercase) else { continue };
         // Clients come from user and guest VAPs; mesh uplink/downlink VAPs are skipped.
         let usage = v["usage"].as_str().unwrap_or("user");
         let essid = string(&v["essid"]);
@@ -480,10 +497,10 @@ pub fn parse(ts: Ts, p: &Value) -> anyhow::Result<Snapshot> {
     for r in p["radio_table"].as_array().into_iter().flatten() {
         let radio = string(&r["radio"]);
         for n in r["scan_table"].as_array().into_iter().flatten() {
-            let Some(bssid) = string(&n["bssid"]) else { continue };
+            let Some(bssid) = n["bssid"].as_str().filter(|b| !b.is_empty()).map(str::to_ascii_lowercase) else { continue };
             neighbors.push(NeighborSample {
                 radio: string(&n["band"]).or_else(|| radio.clone()),
-                bssid: bssid.to_ascii_lowercase(),
+                bssid,
                 essid: string(&n["essid"]),
                 channel: int(&n["channel"]),
                 bw: int(&n["bw"]),
@@ -499,19 +516,22 @@ pub fn parse(ts: Ts, p: &Value) -> anyhow::Result<Snapshot> {
             });
         }
         let Some(radio) = radio else { continue };
+        let mut surveyed = Vec::new();
         for c in r["spectrum_table"].as_array().into_iter().flatten() {
             let Some(channel) = int(&c["channel"]) else { continue };
             if int(&c["total_samples"]).unwrap_or(0) == 0 {
                 continue; // no survey has run for this channel
             }
-            spectrum.push(SpectrumSample {
-                radio: radio.clone(),
+            surveyed.push(SpectrumSample {
                 channel,
                 width: int(&c["width"]),
                 utilization: int(&c["utilization"]),
                 interference: int(&c["interference"]),
                 other_bss_count: int(&c["other_bss_count"]),
             });
+        }
+        if !surveyed.is_empty() {
+            spectrum.push((radio.clone(), surveyed));
         }
         let ath = &r["athstats"];
         // Channel, width and power all from the same VAP.
@@ -584,7 +604,7 @@ pub fn parse(ts: Ts, p: &Value) -> anyhow::Result<Snapshot> {
         num_sta: has_vap_table.then_some(clients.len() as i64),
     };
 
-    Ok(Snapshot { ap, uplink, radios, vaps, clients, neighbors, spectrum, has_vap_table })
+    Ok((Snapshot { ap, uplink, radios, vaps, clients, has_vap_table }, Scans { neighbors, spectrum }))
 }
 
 #[cfg(test)]
@@ -747,8 +767,8 @@ pub(crate) mod tests {
             "vap_table": [{ "bssid": "02:AB:00:00:00:01", "essid": "Home", "radio": "na" }],
             "radio_table": [{ "radio": "na", "scan_table": [{ "bssid": "02:CD:00:00:00:01", "essid": "Next door" }] }],
         });
-        let s = parse(1000, &p).unwrap();
-        assert_eq!((s.vaps[0].bssid.as_str(), s.neighbors[0].bssid.as_str()), ("02:ab:00:00:00:01", "02:cd:00:00:00:01"));
+        let (s, scans) = parse_with_scans(1000, &p).unwrap();
+        assert_eq!((s.vaps[0].bssid.as_str(), scans.neighbors[0].bssid.as_str()), ("02:ab:00:00:00:01", "02:cd:00:00:00:01"));
     }
 
     #[test]

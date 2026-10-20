@@ -243,14 +243,23 @@ async fn serve(args: ServeArgs) -> Result<()> {
     }
 
     if let Some(addr) = syslog_listen {
-        spawn_syslog(addr, in_tx.clone()).await?;
+        let counters = live.read().unwrap().counters.clone();
+        spawn_syslog(addr, in_tx.clone(), counters).await?;
     }
 
     // The engine owns all mutable state and processes inputs in order.
     let mut engine = Engine::new(writer.clone(), keys.clone(), live.clone(), live_tx.clone());
     engine.restore(&store)?;
-    // The config generator, for dry runs.
-    let renderer = dryrun::apcfg_renderer(emulate_version.clone());
+    // The controller the configs describe: in active mode, the configs pushed
+    // name this controller's own address and ports; else the official defaults.
+    let controller = if active {
+        let (host, inform_port) = inform_address(inform_url.as_deref(), inform_listen);
+        apcfg::Controller { host, inform_port, stun_port: stun_listen.port(), ..dryrun::controller(emulate_version, reporter_id(&store)?) }
+    } else {
+        dryrun::controller(emulate_version, String::new())
+    };
+    // The config generator, for dry runs: what active mode would push.
+    let renderer = dryrun::renderer_for(&controller);
     engine.set_renderer(renderer.clone());
     // Alert-worthy events reach the alert watcher on a channel of their own.
     let (alert_sink, alert_events) = alerts::channel();
@@ -290,9 +299,6 @@ async fn serve(args: ServeArgs) -> Result<()> {
     })?;
 
     if active {
-        // The configs pushed name this controller's own address and ports.
-        let (host, inform_port) = inform_address(inform_url.as_deref(), inform_listen);
-        let controller = apcfg::Controller { host, inform_port, stun_port: stun_listen.port(), ..dryrun::controller(emulate_version, reporter_id(&store)?) };
         let active_state = active::Active::new(&store, writer.clone(), live.clone(), keys.clone(), in_tx.clone(), controller, proxies.clone())?;
         start_active(Arc::new(active_state), &live, inform_url.as_deref(), inform_listen, stun_listen).await?;
     }
@@ -378,14 +384,15 @@ async fn finish(writer: store::Writer, drain: Drain) {
 }
 
 /// Receives AP syslog on `addr` and hands each datagram to the engine.
-async fn spawn_syslog(addr: SocketAddr, tx: mpsc::Sender<Input>) -> Result<()> {
+async fn spawn_syslog(addr: SocketAddr, tx: mpsc::Sender<Input>, counters: Arc<engine::Counters>) -> Result<()> {
     let socket = tokio::net::UdpSocket::bind(addr).await.with_context(|| format!("binding syslog {addr}"))?;
     tracing::info!("receiving AP syslog on udp://{addr}");
     tokio::spawn(async move {
         let mut buf = vec![0u8; 8192];
         // Syslog shares the engine's queue with the informs: when the queue is
         // full, datagrams are dropped (and counted) rather than holding up the
-        // APs' informs behind a flood.
+        // APs' informs behind a flood. The drops are logged at most once a
+        // minute, at the next datagram, whether that one gets through or not.
         let (mut dropped, mut last_warning) = (0u64, None::<std::time::Instant>);
         loop {
             match socket.recv_from(&mut buf).await {
@@ -396,12 +403,13 @@ async fn spawn_syslog(addr: SocketAddr, tx: mpsc::Sender<Input>) -> Result<()> {
                         Ok(()) => {}
                         Err(mpsc::error::TrySendError::Full(_)) => {
                             dropped += 1;
-                            if last_warning.is_none_or(|t| t.elapsed() >= Duration::from_secs(60)) {
-                                tracing::warn!("engine busy: dropped {dropped} syslog datagram(s)");
-                                (dropped, last_warning) = (0, Some(std::time::Instant::now()));
-                            }
+                            counters.syslog_dropped.fetch_add(1, Ordering::Relaxed);
                         }
                         Err(mpsc::error::TrySendError::Closed(_)) => return,
+                    }
+                    if dropped > 0 && last_warning.is_none_or(|t| t.elapsed() >= Duration::from_secs(60)) {
+                        tracing::warn!("engine busy: dropped {dropped} syslog datagram(s)");
+                        (dropped, last_warning) = (0, Some(std::time::Instant::now()));
                     }
                 }
                 Err(e) => {
