@@ -71,8 +71,8 @@ fn blocked_sta_lists_blocked_clients() {
     assert_eq!(apcfg::blocked_sta(&state, "00000000000000000000001e"), push["blocked_sta"].as_str().unwrap());
 }
 
-/// The `mgmt_cfg` alone is the full render's, with the key the AP informs with
-/// supplied or stored, and settings only `system_cfg` reads cannot stop it.
+/// The `mgmt_cfg` alone is the full render's, plus the AP's own key when it informs
+/// with another, and settings only `system_cfg` reads cannot stop it.
 #[test]
 fn mgmt_cfg_alone_matches_the_full_render() {
     let Some(_) = common::fixtures() else { return };
@@ -83,12 +83,15 @@ fn mgmt_cfg_alone_matches_the_full_render() {
         let input = apcfg::Input { state: &state, device_mac: ap, inform: Some(inform), cfgversion: "x", controller: &controller };
         assert_eq!(apcfg::render_mgmt(&input, None).unwrap(), render(&state, ap, "x").rendered.mgmt_cfg, "{ap}");
     }
-    // As when adopting: the AP informs with another key than its own, so it is sent its own.
+    // As when adopting: the AP informs with another key than its own, so it is sent its
+    // own, after `mgmt_url`.
     let factory = "0123456789abcdef0123456789abcdef";
-    let mut adopting = state.clone();
-    adopting["devices"].as_array_mut().unwrap().iter_mut().find(|d| d["mac"] == AP_B).unwrap()["x_inform_authkey"] = factory.into();
-    let expected = render(&adopting, AP_B, "x").rendered.mgmt_cfg;
-    assert!(expected.contains("\nauthkey="), "{expected}");
+    let full = render(&state, AP_B, "x").rendered.mgmt_cfg;
+    assert!(!full.contains("\nauthkey="), "{full}");
+    let own = state["devices"].as_array().unwrap().iter().find(|d| d["mac"] == AP_B).unwrap()["x_authkey"].as_str().unwrap().to_string();
+    let at = full.find("\nmgmt_url=").unwrap() + 1;
+    let end = at + full[at..].find('\n').unwrap() + 1;
+    let expected = format!("{}authkey={own}\n{}", &full[..end], &full[end..]);
     let inform = common::inform(AP_B);
     let input = apcfg::Input { state: &state, device_mac: AP_B, inform: Some(inform), cfgversion: "x", controller: &controller };
     assert_eq!(apcfg::render_mgmt(&input, Some(factory)).unwrap(), expected);

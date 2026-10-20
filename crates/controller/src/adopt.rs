@@ -321,11 +321,9 @@ pub fn adopt_device(state: &mut Value, mac: &Mac, payload: &Value) -> Result<Str
     if let Some(d) = device_doc_mut(state, mac) {
         d["x_authkey"] = json!(crate::random_hex::<16>());
         d["syslog_key"] = json!(crate::random_hex::<32>());
-        // The key it informed with, which is not this one any more; and the
-        // AES-GCM pin, which the reset AP takes up again (as it is cleared by
-        // the official controller when an AP informs reset).
+        // The AES-GCM pin, which the reset AP takes up again (as it is cleared
+        // by the official controller when an AP informs reset).
         if let Some(o) = d.as_object_mut() {
-            o.remove("x_inform_authkey");
             o.remove("x_aes_gcm");
         }
         return Ok(format!("re-adopting AP {} with new keys", ap_name(d, mac)));
@@ -581,13 +579,11 @@ mod tests {
         assert_eq!((d["radio_table"][0]["channel"].as_str(), d["radio_table"][1]["has_ht160"].as_bool()), (Some("auto"), Some(true)));
         // Adopting again keeps the record, with new keys (the old one went out under the factory key).
         let mac: Mac = "02:00:00:00:00:09".parse().unwrap();
-        device_doc_mut(&mut s, &mac).unwrap()["x_inform_authkey"] = d["x_authkey"].clone();
         adopt_device(&mut s, &mac, &inform()).unwrap();
         assert_eq!(s["devices"].as_array().unwrap().len(), 2);
         let again = device_doc(&s, &mac).unwrap();
         assert_eq!((again["name"].as_str(), again["x_authkey"].as_str().unwrap().len()), (Some("U6-Mesh"), 32));
         assert!(again["x_authkey"] != d["x_authkey"] && again["syslog_key"] != d["syslog_key"]);
-        assert!(again.get("x_inform_authkey").is_none(), "the AP has yet to inform with it");
         // A reset AP takes up AES-GCM again, as with the official controller.
         device_doc_mut(&mut s, &mac).unwrap()["x_aes_gcm"] = json!(true);
         adopt_device(&mut s, &mac, &inform()).unwrap();

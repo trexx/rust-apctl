@@ -64,12 +64,9 @@ pub fn led_enabled(ctx: &Ctx) -> bool {
     override_of(ctx.device, "led_override", flag(ctx.mgmt, "led_enabled", true))
 }
 
-pub fn render(ctx: &Ctx) -> String {
-    render_with_key(ctx, str_of(ctx.device, "x_inform_authkey"))
-}
-
-/// [`render`] for an AP that informs with the key `used` (hex).
-pub fn render_with_key(ctx: &Ctx, used: Option<&str>) -> String {
+/// The `mgmt_cfg` for an AP that informs with the key `used` (hex), when that is known
+/// to be another than its own: it is then sent its own.
+pub fn render(ctx: &Ctx, used: Option<&str>) -> String {
     let c = ctx.controller;
     let Address { host, port: inform_port, migrating } = address(ctx);
     let site_name = str_of(ctx.site, "name").unwrap_or("default");
@@ -111,7 +108,7 @@ mod tests {
         doc.as_object_mut().unwrap().extend(device.as_object().unwrap().clone());
         let state = json!({ "sites": [{ "_id": "s", "name": "default" }], "devices": [doc], "setting": settings });
         let ctx = Ctx::new(&Input { state: &state, device_mac: mac, inform: None, cfgversion: "1", controller }).unwrap();
-        render(&ctx)
+        render(&ctx, None)
     }
 
     fn line(cfg: &str, key: &str) -> Option<String> {

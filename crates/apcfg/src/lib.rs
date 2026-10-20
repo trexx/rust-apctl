@@ -82,7 +82,7 @@ pub struct Input<'a> {
 /// The fields of a `devices` document a render reads (the radios' settings are inside
 /// `radio_table`). Whatever imports device documents must keep at least these.
 pub const DEVICE_KEYS: &[&str] = &[
-    "mac", "site_id", "type", "name", "disabled", "radio_table", "inform_url", "migrate_inform_url", "x_authkey", "x_inform_authkey",
+    "mac", "site_id", "type", "name", "disabled", "radio_table", "inform_url", "migrate_inform_url", "x_authkey",
     "syslog_key", "config_network", "mgmt_network_id", "led_override", "led_override_color", "led_override_color_brightness",
     "outdoor_mode_override", "bandsteering_mode", "atf_enabled", "green_ap_enabled", "resetbtn_enabled", "jumboframe_enabled",
     "switch_vlan_enabled", "ethernet_table", "port_overrides", "snmp_location", "snmp_contact", "mesh_uplink_1", "mesh_uplink_2",
@@ -154,18 +154,18 @@ pub fn render(input: &Input) -> Result<Rendered> {
 
 pub fn render_with_meta(input: &Input) -> Result<Output> {
     let ctx = Ctx::new(input)?;
-    let mgmt_cfg = mgmt::render(&ctx);
+    let mgmt_cfg = mgmt::render(&ctx, None);
     let (system_cfg, config_meta) = system::render(&ctx)?;
     Ok(Output { rendered: Rendered { mgmt_cfg, system_cfg }, config_meta })
 }
 
 /// Only the `mgmt_cfg` of [`render`]: what adopts an AP. `inform_authkey` is the key
-/// (hex) the AP informs with when that is not the device's stored `x_inform_authkey`:
-/// an AP being adopted uses the factory key, so it is sent its own. What only
-/// `system_cfg` reads cannot make this fail.
+/// (hex) the AP informs with when that is not its own: an AP being adopted uses the
+/// factory key, so it is sent its own (an `authkey` line). What only `system_cfg` reads
+/// cannot make this fail.
 pub fn render_mgmt(input: &Input, inform_authkey: Option<&str>) -> Result<String> {
     let ctx = Ctx::new(input)?;
-    Ok(mgmt::render_with_key(&ctx, inform_authkey.or_else(|| json::str_of(ctx.device, "x_inform_authkey"))))
+    Ok(mgmt::render(&ctx, inform_authkey))
 }
 
 /// The `blocked_sta` value of a provisioning reply: MACs of the site's blocked clients,
