@@ -687,8 +687,14 @@ pub async fn inform(
 /// an AP of this MAC. `permit`: the gate's, held while the inform is handled.
 async fn factory_key_inform(active: &Arc<Active>, ts: Ts, caller: Caller, payload: Value, known: bool, permit: OwnedSemaphorePermit) -> Response {
     let mac = caller.mac;
-    let adopting = active.live.read().unwrap().adoption.adopting.contains_key(&mac);
-    if known && adopting {
+    let adopting = active.live.read().unwrap().adoption.adopting.get(&mac).copied();
+    if known && adopting.is_some_and(|a| a.kept_key) {
+        // Adopted over SSH with the key it had: that key went over SSH, and
+        // is not for whoever sends a factory-key inform under the AP's MAC.
+        tracing::warn!("{mac}: factory-key inform from {} while adopting it over SSH with its kept key: not answered", caller.peer);
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    if known && adopting.is_some() {
         // Adopt pressed: hand the AP its own key (in mgmt_cfg), with the factory key.
         let a = active.clone();
         let Ok((sealed, _permit)) = blocking(permit, move || caller.seal(&a.adoption_reply(ts, mac, &payload))).await else {
@@ -1139,7 +1145,7 @@ mod tests {
             let mut state = live.state.as_deref().cloned().unwrap();
             crate::adopt::adopt_device(&mut state, &ap, &ap_payload("1")).unwrap();
             live.state = Some(Arc::new(state));
-            live.adoption.adopting.insert(ap, 0);
+            live.adoption.adopting.insert(ap, Default::default());
         }
         let (_, reply) = inform_as_ap(&rig, &ap_payload(""), DEFAULT_KEY, GCM_ZLIB).await;
         let mgmt = reply.unwrap().1["mgmt_cfg"].as_str().unwrap().to_string();
@@ -1419,7 +1425,7 @@ mod tests {
             let mut state = live.state.as_deref().cloned().unwrap();
             crate::adopt::adopt_device(&mut state, &new, &payload).unwrap();
             live.state = Some(Arc::new(state));
-            live.adoption.adopting.insert(new, 0);
+            live.adoption.adopting.insert(new, Default::default());
         }
         let key_hex = crate::adopt::device_doc(rig.live.read().unwrap().state.as_deref().unwrap(), &new).unwrap()["x_authkey"].as_str().unwrap().to_string();
         let key: [u8; 16] = inform::parse_key(&key_hex).unwrap();
@@ -1444,6 +1450,23 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_ssh_adoption_with_a_kept_key_never_hands_it_out() {
+        let Some(_) = fixtures() else { return };
+        let rig = rig(true, None);
+        let ap: Mac = AP.parse().unwrap();
+        let key = crate::adopt::device_key(rig.live.read().unwrap().state.as_deref(), &rig.active.keys, &ap).expect("a managed AP");
+        rig.live.write().unwrap().adoption.adopting.insert(ap, crate::adopt::Adopting { since: clock::now_ts(), kept_key: true });
+        // Anyone can send this under the AP's MAC: it gets no mgmt_cfg (and no key).
+        let (status, reply) = inform_as_ap(&rig, &ap_payload("1"), DEFAULT_KEY, GCM_ZLIB).await;
+        assert_eq!((status, reply), (StatusCode::NOT_FOUND, None));
+        assert!(rig.live.read().unwrap().adoption.pending.is_empty(), "not listed for adoption either");
+        // The AP itself comes back with the key it was given over SSH.
+        let (status, _) = inform_as_ap(&rig, &ap_payload("1"), key, GCM_ZLIB).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(rig.live.read().unwrap().adoption.adopting.is_empty());
+    }
+
+    #[tokio::test]
     async fn an_ap_is_adopted_even_when_its_full_config_cannot_be_rendered() {
         let Some(_) = fixtures() else { return };
         let rig = rig(true, None);
@@ -1459,7 +1482,7 @@ mod tests {
                 s.as_object_mut().unwrap().retain(|k, _| !k.starts_with("x_ssh_") || !k.ends_with("passwd"));
             }
             live.state = Some(Arc::new(state));
-            live.adoption.adopting.insert(new, 0);
+            live.adoption.adopting.insert(new, Default::default());
         }
         let key_hex = crate::adopt::device_doc(rig.live.read().unwrap().state.as_deref().unwrap(), &new).unwrap()["x_authkey"].as_str().unwrap().to_string();
         let (_, reply) = inform_as_ap(&rig, &payload, DEFAULT_KEY, GCM_ZLIB).await;
@@ -1511,7 +1534,7 @@ mod tests {
             let mut state = live.state.as_deref().cloned().unwrap();
             crate::adopt::adopt_device(&mut state, &new, &payload).unwrap();
             live.state = Some(Arc::new(state));
-            live.adoption.adopting.insert(new, 0);
+            live.adoption.adopting.insert(new, Default::default());
         }
         inform_as_ap(&rig, &payload, DEFAULT_KEY, GCM_ZLIB).await;
         assert!(rig.active.adoption_cfgs.lock().unwrap().contains_key(&new));
