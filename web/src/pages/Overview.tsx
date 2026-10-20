@@ -24,6 +24,7 @@ import {
   dbm,
   duration,
   pct,
+  unit,
   uplinkText,
   useNow,
 } from "../format";
@@ -193,11 +194,11 @@ function RadioRow(p: {
       <span>{p.band}</span>
       <span
         className="meter-row"
-        title={`Channel utilisation ${p.util ?? "?"}% · channel ${p.channel}, ${p.bw} MHz · ${p.clients} clients`}
+        title={`Channel utilisation ${pct(p.util)} · channel ${p.channel ?? "—"}, ${unit(p.bw, "MHz")} · ${p.clients} clients`}
       >
         <Meter value={p.util} label={`${p.band} channel utilisation`} />
         <span className="meter-text">
-          ch {p.channel} · {p.bw} MHz · {p.clients}{" "}
+          ch {p.channel ?? "—"} · {unit(p.bw, "MHz")} · {p.clients}{" "}
           {p.clients === 1 ? "client" : "clients"}
         </span>
       </span>

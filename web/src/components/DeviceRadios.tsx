@@ -19,14 +19,12 @@ import {
   pct1,
   rate,
   toneClass,
+  unit,
 } from "../format";
 import type { Tone } from "../format";
 
 const share = (part: number, whole: number) =>
   pct1(whole > 0 ? (100 * part) / whole : null);
-
-/** A value with its unit, or "—" when there is none. */
-const unit = (v: number | null, u: string) => (v === null ? "—" : `${v} ${u}`);
 
 /** The keys of `T` whose values are numbers (or null). */
 type NumericKey<T> = {
@@ -129,10 +127,10 @@ export function RadioPanel({
         </dd>
         <dt>Channel use now</dt>
         <dd>
-          {radio.cu_total ?? "—"}% busy{" "}
+          {pct(radio.cu_total)} busy{" "}
           <span className="muted">
-            · own RX {radio.cu_self_rx ?? "—"}% · own TX{" "}
-            {radio.cu_self_tx ?? "—"}% · interference {radio.cu_interf ?? "—"}%
+            · own RX {pct(radio.cu_self_rx)} · own TX {pct(radio.cu_self_tx)} ·
+            interference {pct(radio.cu_interf)}
           </span>
         </dd>
         <dt>TX</dt>

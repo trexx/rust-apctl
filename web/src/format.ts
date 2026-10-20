@@ -142,6 +142,9 @@ export const bytes = (n: number | null | undefined) => (n === null || n === unde
 
 export const pct = (v: number | null | undefined) => (v === null || v === undefined ? "—" : `${Math.round(v)}%`);
 
+/** A value with its unit, "80 MHz", or "—" when there is none. */
+export const unit = (v: number | null | undefined, u: string) => (v === null || v === undefined ? "—" : `${v} ${u}`);
+
 /** A percentage with one decimal: "12.5%". */
 export const pct1 = (v: number | null | undefined) => (v === null || v === undefined ? "—" : `${v.toFixed(1)}%`);
 
