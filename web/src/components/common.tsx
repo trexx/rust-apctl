@@ -595,7 +595,12 @@ const EVENTS: { [K in EventKind]: EventSpec<K> } = {
       `its beacon says it lost its uplink${d.heard_by ? ` (heard by ${names[d.heard_by] ?? d.heard_by})` : ""}`,
   },
   ap_scan_done: { label: "Scan finished", tone: "neutral" },
-  ap_event: { label: "AP event", tone: "neutral" },
+  ap_event: {
+    label: "AP event",
+    tone: "neutral",
+    describe: (d) =>
+      parts((d.event_string ?? "").replace(/^EVT_AP_/, ""), d.msg),
+  },
   radio_changed: {
     label: "Radio settings changed",
     tone: "neutral",

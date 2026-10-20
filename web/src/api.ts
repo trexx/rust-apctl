@@ -307,7 +307,8 @@ export interface EventPayloads {
   ap_process_restarted: { proc?: string | null; exit_status?: number | null; caller?: string | null };
   ap_isolated: { heard_by?: Mac | null };
   ap_scan_done: object;
-  ap_event: object;
+  /** Any other AP notification, as it came: `event_string` names it ("EVT_AP_…"). */
+  ap_event: { event_string?: string; msg?: string };
   radio_changed: { radio?: string | null; from?: RadioLevels; to?: RadioLevels };
   config_pushed: ConfigPushed;
   client_connected: { essid?: string | null; radio?: string | null; channel?: number | null; signal?: number | null; new?: boolean };
