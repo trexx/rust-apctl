@@ -1,0 +1,30 @@
+name: 'Image'
+
+# Builds the runtime image without pushing it whenever what it is built from changes:
+# Renovate automerges minor and digest bumps of the Dockerfile's images once the checks
+# pass, and a bump that breaks the image (the OUI download, a glibc mismatch between the
+# rust and distroless images) must fail here, not at the next release.
+on:
+  push:
+    branches: [ 'master' ]
+    paths: [ 'Dockerfile', '.dockerignore', 'Cargo.lock', 'web/package-lock.json', '.github/workflows/image.yml' ]
+  pull_request:
+    paths: [ 'Dockerfile', '.dockerignore', 'Cargo.lock', 'web/package-lock.json', '.github/workflows/image.yml' ]
+
+jobs:
+  build:
+    runs-on: 'ubuntu-26.04'
+    timeout-minutes: 60
+    permissions:
+      contents: 'read'
+    steps:
+      - uses: 'actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1' # v7.0.1
+      - run: 'docker build --target runtime --tag apctl:check .'
+      - name: 'The image runs and reports the crate version'
+        run: |
+          CRATE="$(sed -n 's/^version = "\(.*\)"/\1/p' crates/controller/Cargo.toml | head -n 1)"
+          REPORTED="$(docker run --rm apctl:check --version)"
+          if [ "${REPORTED}" != "controller ${CRATE}" ]; then
+            echo "::error::The image reports '${REPORTED}', expected 'controller ${CRATE}'"
+            exit 1
+          fi
