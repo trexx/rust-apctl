@@ -616,15 +616,21 @@ pub fn unpack(path: &Path, key: Option<&[u8; 32]>, dest: &Path) -> Result<Manife
     for entry in ar.entries()? {
         let mut e = entry?;
         let name = e.path()?.to_string_lossy().to_string();
+        // apctl writes plain files only: no links, directories or sparse files,
+        // whose size is not what the header says.
+        if !e.header().entry_type().is_file() {
+            bail!("unexpected entry in backup: {name}");
+        }
+        // `size` is what reading the entry gives, which a PAX record can set.
         if name == "manifest.json" {
             if manifest.is_some() {
                 bail!("the backup has two manifests");
             }
-            if e.header().size()? > 1 << 20 {
+            if e.size() > 1 << 20 {
                 bail!("the backup's manifest is too large");
             }
             let mut s = String::new();
-            e.read_to_string(&mut s)?;
+            (&mut e).take(1 << 20).read_to_string(&mut s)?;
             let m: Manifest = serde_json::from_str(&s).context("the backup's manifest is unreadable")?;
             // The manifest comes first: a backup apctl cannot restore is refused
             // before anything is unpacked (which can be a hundred times the file).
@@ -649,13 +655,13 @@ pub fn unpack(path: &Path, key: Option<&[u8; 32]>, dest: &Path) -> Result<Manife
         let expected = m.files.get(&name).ok_or_else(|| anyhow!("{name} is not listed in the manifest"))?;
         // Checked before anything is written: with the manifest's total checked
         // against the file's size, a crafted archive cannot fill the disk.
-        if e.header().size()? != expected.size {
+        if e.size() != expected.size {
             bail!("{name} does not match its checksum: the backup is damaged");
         }
         // Hashed while it is written, a megabyte at a time (a file twice in the archive is refused).
         let file = fs::OpenOptions::new().write(true).create_new(true).open(dest.join(&name))?;
         let mut out = BufWriter::with_capacity(1 << 20, Hashing { out: file, hash: Sha256::new(), size: 0 });
-        io::copy(&mut e, &mut out)?;
+        io::copy(&mut (&mut e).take(expected.size), &mut out)?;
         let out = out.into_inner().map_err(|e| e.into_error())?;
         out.out.sync_all()?;
         if (FileInfo { size: out.size, sha256: hex::encode(out.hash.finalize()) }) != *expected {
@@ -1819,12 +1825,30 @@ mod tests {
 
     /// Writes an unencrypted backup holding `manifest` and then `entries`, as given.
     fn hand_made(path: &Path, manifest: &Manifest, entries: &[(&str, Vec<u8>)]) {
+        let mj = serde_json::to_vec(manifest).unwrap();
+        let all = std::iter::once(("manifest.json", mj)).chain(entries.iter().map(|(n, d)| (*n, d.clone())));
+        crafted(path, all.map(|(n, d)| (tar::EntryType::Regular, n, d.len() as u64, d)).collect());
+    }
+
+    /// The same with entries of any type, each header saying the size given
+    /// whatever data follows it: (type, name, size, data). A sparse file's
+    /// data is its start, and it says it holds 4 GiB (the rest zeros).
+    fn crafted(path: &Path, entries: Vec<(tar::EntryType, &str, u64, Vec<u8>)>) {
         let mut file = MAGIC.to_vec();
         file.push(0);
         let mut tar = tar::Builder::new(flate2::write::GzEncoder::new(file, flate2::Compression::default()));
-        for (name, data) in std::iter::once(("manifest.json", serde_json::to_vec(manifest).unwrap())).chain(entries.iter().map(|(n, d)| (*n, d.clone()))) {
+        for (kind, name, size, data) in entries {
             let mut h = tar::Header::new_gnu();
-            h.set_size(data.len() as u64);
+            h.set_entry_type(kind);
+            h.set_size(size);
+            if kind == tar::EntryType::GNUSparse {
+                let gnu = h.as_gnu_mut().unwrap();
+                gnu.sparse[0].set_offset(0);
+                gnu.sparse[0].set_length(size);
+                gnu.sparse[1].set_offset(1 << 32);
+                gnu.sparse[1].set_length(0);
+                gnu.set_real_size(1 << 32);
+            }
             h.set_cksum();
             tar.append_data(&mut h, name, data.as_slice()).unwrap();
         }
@@ -1839,6 +1863,31 @@ mod tests {
         let err = unpack(&d.join("x.apb"), None, &out).unwrap_err();
         assert!(err.to_string().contains("damaged"), "{err:#}");
         assert!(!out.join("config.db").exists());
+        // A PAX size record makes the entry longer than its header says: that
+        // size is the one checked.
+        let regular = |name, size, data| (tar::EntryType::Regular, name, size, data);
+        let pax = |size: u64| {
+            let record = format!(" size={size}\n");
+            let record = format!("{}{record}", record.len() + (record.len() + 2).to_string().len()).into_bytes();
+            (tar::EntryType::XHeader, "PaxHeaders/x", record.len() as u64, record)
+        };
+        let mj = serde_json::to_vec(&manifest(&[("config.db", 4)])).unwrap();
+        crafted(&d.join("pax.apb"), vec![regular("manifest.json", mj.len() as u64, mj.clone()), pax(4096), regular("config.db", 4, vec![0u8; 4096])]);
+        let err = unpack(&d.join("pax.apb"), None, &d.join("pax")).unwrap_err();
+        assert!(err.to_string().contains("damaged"), "{err:#}");
+        assert!(!d.join("pax").join("config.db").exists());
+        let mut long = mj.clone();
+        long.resize(2 << 20, b' ');
+        crafted(&d.join("pax-manifest.apb"), vec![pax(2 << 20), regular("manifest.json", mj.len() as u64, long)]);
+        let err = unpack(&d.join("pax-manifest.apb"), None, &d.join("pax-manifest")).unwrap_err();
+        assert!(err.to_string().contains("too large"), "{err:#}");
+        // Only plain files: no sparse files, links or directories.
+        for kind in [tar::EntryType::GNUSparse, tar::EntryType::Directory, tar::EntryType::Symlink] {
+            crafted(&d.join("kind.apb"), vec![regular("manifest.json", mj.len() as u64, mj.clone()), (kind, "config.db", 4, vec![0u8; 4])]);
+            let err = unpack(&d.join("kind.apb"), None, &d.join("kind")).unwrap_err();
+            assert!(err.to_string().contains("unexpected entry in backup: config.db"), "{kind:?}: {err:#}");
+            assert!(!d.join("kind").join("config.db").exists());
+        }
     }
 
     #[test]
