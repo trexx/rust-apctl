@@ -30,6 +30,10 @@ const compiler = reactCompilerPreset({
 const compilerCheck: Plugin = {
   name: "react-compiler-check",
   apply: "build",
+  // Each build (a rebuild under --watch too) reports only what it skipped.
+  buildStart() {
+    skipped.length = 0;
+  },
   buildEnd() {
     if (skipped.length)
       this.error(`React Compiler skipped:\n${skipped.join("\n")}`);
