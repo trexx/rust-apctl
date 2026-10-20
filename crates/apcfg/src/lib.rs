@@ -35,6 +35,7 @@ pub use json::oid;
 pub use system::MDNS_SERVICES;
 mod wlan;
 
+use std::borrow::Cow;
 use std::cell::OnceCell;
 
 use anyhow::{Context, Result, bail};
@@ -80,7 +81,8 @@ pub struct Input<'a> {
 }
 
 /// The fields of a `devices` document a render reads (the radios' settings are inside
-/// `radio_table`). Whatever imports device documents must keep at least these.
+/// `radio_table`; `table.field` is that field of each of a table's rows). Whatever
+/// imports device documents must keep at least these.
 pub const DEVICE_KEYS: &[&str] = &[
     "mac", "site_id", "type", "name", "disabled", "radio_table", "inform_url", "migrate_inform_url", "x_authkey",
     "syslog_key", "config_network", "mgmt_network_id", "led_override", "led_override_color", "led_override_color_brightness",
@@ -90,6 +92,8 @@ pub const DEVICE_KEYS: &[&str] = &[
     "fixed_ap_available",
     // Capability bits, used until the AP's first inform.
     "fw_caps", "fw2_caps", "fw3_caps", "wifi_caps", "wifi_caps2", "hw_caps",
+    // A gateway's MACs (`Ctx::gateway_macs`): only these fields of each row.
+    "network_table.mac", "network_table.networkgroup", "vap_table.bssid", "vwire_vap_table.bssid",
 ];
 
 /// The top-level inform fields a render reads: the capability bits ([`Caps`]; until the
@@ -425,7 +429,7 @@ pub(crate) struct Ctx<'a> {
     /// The radios' country code (`setting[country].code`, US when unset).
     pub country: String,
     /// See [`Ctx::gateway_macs`].
-    gateway_macs: OnceCell<Vec<String>>,
+    gateway_macs: OnceCell<Vec<Cow<'a, str>>>,
 }
 
 static NULL: Value = Value::Null;
@@ -485,15 +489,23 @@ impl<'a> Ctx<'a> {
         site_docs(self.state, self.site_id, collection)
     }
 
-    /// LAN MACs (lower case) of the site's gateways, looked up the first time a VAP's
-    /// broadcast filter asks for them.
-    pub fn gateway_macs(&self) -> &[String] {
+    /// The MACs the site's gateways send from, which every broadcast filter lets
+    /// through, as the official controller collects them for a gateway: its own, its LAN
+    /// networks' (`network_table`), its Ethernet interfaces' with their other MACs, and
+    /// the BSSIDs of its own SSIDs (`vap_table`'s lower case). Blank ones are left out,
+    /// duplicates are not. Looked up the first time a VAP's broadcast filter asks.
+    pub fn gateway_macs(&self) -> &[Cow<'a, str>] {
         self.gateway_macs.get_or_init(|| {
-            self.site_docs("devices")
-                .filter(|d| matches!(json::str_of(d, "type"), Some("ugw" | "udm" | "uxg")))
-                .filter_map(|d| json::str_of(d, "mac"))
-                .map(str::to_ascii_lowercase)
-                .collect()
+            let mut macs = Vec::new();
+            for gw in self.site_docs("devices").filter(|d| matches!(json::str_of(d, "type"), Some("ugw" | "udm" | "uxg"))) {
+                let lan = json::arr(gw, "network_table").iter().filter(|n| json::str_of(n, "networkgroup") == Some("LAN")).filter_map(|n| json::str_of(n, "mac"));
+                let eth = json::arr(gw, "ethernet_table").iter().flat_map(|e| json::str_of(e, "mac").into_iter().chain(json::str_list(e, "other_macs")));
+                let bssids = |table| json::arr(gw, table).iter().filter_map(|v| json::str_of(v, "bssid")).filter(|b| !b.trim().is_empty());
+                macs.extend(json::str_of(gw, "mac").into_iter().chain(lan).chain(eth).filter(|m| !m.trim().is_empty()).map(Cow::Borrowed));
+                macs.extend(bssids("vap_table").map(|b| Cow::Owned(b.to_lowercase())));
+                macs.extend(bssids("vwire_vap_table").map(Cow::Borrowed));
+            }
+            macs
         })
     }
 
@@ -552,7 +564,7 @@ mod tests {
     fn device_keys_cover_every_field_read() {
         let mut read: Vec<&str> = CAP_KEYS.to_vec();
         for src in SOURCES {
-            for pattern in ["ctx.device, \"", "ctx.device.get(\"", "(device, \""] {
+            for pattern in ["ctx.device, \"", "ctx.device.get(\"", "(device, \"", "(gw, \""] {
                 for (at, _) in src.match_indices(pattern) {
                     let rest = &src[at + pattern.len()..];
                     read.push(&rest[..rest.find('"').unwrap()]);
@@ -561,7 +573,8 @@ mod tests {
         }
         assert!(read.len() > 30, "the patterns still find the reads: {read:?}");
         for key in read {
-            assert!(DEVICE_KEYS.contains(&key), "`{key}` is read from the device document but missing from DEVICE_KEYS");
+            let kept = DEVICE_KEYS.iter().any(|k| *k == key || k.strip_prefix(key).is_some_and(|row| row.starts_with('.')));
+            assert!(kept, "`{key}` is read from the device document but missing from DEVICE_KEYS");
         }
     }
 

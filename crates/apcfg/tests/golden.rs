@@ -209,3 +209,28 @@ fn mac_filter_entries_are_listed_once_in_the_official_order() {
         "15 lock2ap",
     ]);
 }
+
+/// A broadcast filter lets through every MAC the site's gateway sends from: its own,
+/// its LAN networks', its Ethernet interfaces' (and their other MACs) and its own SSIDs'
+/// BSSIDs, merged with the SSID's list in Java HashSet order. The capture's site has no
+/// UniFi gateway, so the order here is worked out by hand.
+#[test]
+fn a_broadcast_filter_lets_every_gateway_mac_through() {
+    let Some(_) = common::fixtures() else { return };
+    let mut state = state();
+    let site = state["wlanconf"][0]["site_id"].clone();
+    state["devices"].as_array_mut().unwrap().push(serde_json::json!({
+        "mac": "02:00:00:00:01:00", "site_id": site, "type": "udm",
+        "network_table": [{ "networkgroup": "LAN", "mac": "02:00:00:00:01:01" }, { "networkgroup": "WAN", "mac": "02:00:00:00:01:02" }, { "networkgroup": "LAN", "mac": " " }],
+        "ethernet_table": [{ "mac": "02:00:00:00:01:00", "other_macs": ["02:00:00:00:01:03", ""] }],
+        "vap_table": [{ "bssid": "02:00:00:00:01:AA" }, { "bssid": "" }], "vwire_vap_table": [{ "bssid": "02:00:00:00:01:0b" }],
+    }));
+    let cfg = render(&state, AP_B, "x").rendered.system_cfg;
+    // ssid-6's list on its VAP, the one whose filter has the fewest entries.
+    let mut lists: std::collections::BTreeMap<&str, Vec<&str>> = Default::default();
+    for (key, mac) in cfg.lines().filter(|l| l.contains(".bcfilt.") && l.contains(".mac=")).filter_map(|l| l.split_once('=')) {
+        lists.entry(key.split(".bcfilt.").next().unwrap()).or_default().push(&mac[12..]);
+    }
+    let shortest = lists.values().min_by_key(|l| l.len()).unwrap();
+    assert_eq!(shortest, &["01:00", "01:aa", "00:03", "00:0b", "00:13", "01:03", "00:1b", "01:0b", "01:01", "00:0f", "00:15"]);
+}

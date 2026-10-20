@@ -797,10 +797,10 @@ fn render_wireless(c: &mut Cfg, ctx: &Ctx, radios: &[Radio], vaps: &[Vap], v: &V
         if aggressive {
             c.set(k.at("bcfilt.bypass_types"), "ARP|NSNA|DHCPV4|DHCPV6");
         }
-        let mut macs: Vec<String> = str_list(w, "bc_filter_list").map(|m| m.to_ascii_lowercase()).collect();
-        // The site's gateways always get through.
-        macs.extend_from_slice(ctx.gateway_macs());
-        for (mi, mac) in hash_set_order(macs.iter().map(String::as_str)).iter().enumerate() {
+        // The site's gateways always get through. MACs are written as stored, as the
+        // official controller does.
+        let macs = str_list(w, "bc_filter_list").chain(ctx.gateway_macs().iter().map(AsRef::as_ref));
+        for (mi, mac) in hash_set_order(macs).iter().enumerate() {
             c.set(format_args!("{k}bcfilt.{}.status", mi + 1), "enabled");
             c.set(format_args!("{k}bcfilt.{}.mac", mi + 1), mac);
         }
