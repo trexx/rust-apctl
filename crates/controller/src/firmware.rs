@@ -237,7 +237,8 @@ impl Jobs {
         }
     }
 
-    pub fn current_for(&mut self, mac: &Mac) -> Option<&mut Job> {
+    /// The AP's job, if it is the current one.
+    fn current_for(&mut self, mac: &Mac) -> Option<&mut Job> {
         self.current.as_mut().filter(|j| j.mac == *mac)
     }
 
@@ -274,7 +275,7 @@ impl Jobs {
     /// the version changed. When the version it started from is not known, the
     /// first one it reports after the upgrade was sent is taken as that.
     pub fn version_seen(&mut self, mac: &Mac, version: &str) -> Option<Job> {
-        let j = self.current.as_mut().filter(|j| j.mac == *mac && j.state != JobState::Queued)?;
+        let j = self.sent_for(mac)?;
         match &j.from {
             None => {
                 j.from = Some(version.to_string());
