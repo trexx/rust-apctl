@@ -74,19 +74,33 @@ impl Vendors {
         self.by_prefix.len()
     }
 
-    /// The manufacturer for a MAC. Locally administered addresses (random MACs
-    /// used by phones and laptops for privacy) have no registered owner.
+    /// The manufacturer for a client's MAC. Locally administered addresses
+    /// (random MACs used by phones and laptops for privacy) have no registered
+    /// owner.
     pub fn lookup(&self, mac: &Mac) -> Option<&str> {
-        let b = mac.0;
-        if b[0] & 0x02 != 0 {
+        if is_local(mac) {
             return Some(PRIVATE);
         }
-        self.by_prefix.get(&(u32::from(b[0]) << 16 | u32::from(b[1]) << 8 | u32::from(b[2]))).map(|&i| &*self.names[i as usize])
+        self.registered(mac)
     }
 
-    pub fn lookup_str(&self, mac: &str) -> Option<&str> {
-        mac.parse::<Mac>().ok().and_then(|m| self.lookup(&m))
+    /// The manufacturer for a BSSID (a neighbouring network's, as text). A
+    /// locally administered one has none: APs give their second and further
+    /// SSIDs such addresses, made from the radio's, so it is no privacy MAC.
+    pub fn lookup_str(&self, bssid: &str) -> Option<&str> {
+        bssid.parse::<Mac>().ok().filter(|m| !is_local(m)).and_then(|m| self.registered(&m))
     }
+
+    /// The owner of the address's prefix in the registry.
+    fn registered(&self, mac: &Mac) -> Option<&str> {
+        let b = mac.0;
+        self.by_prefix.get(&(u32::from(b[0]) << 16 | u32::from(b[1]) << 8 | u32::from(b[2]))).map(|&i| &*self.names[i as usize])
+    }
+}
+
+/// A locally administered address: not from the registry.
+fn is_local(mac: &Mac) -> bool {
+    mac.0[0] & 0x02 != 0
 }
 
 #[cfg(test)]
@@ -110,7 +124,9 @@ mod tests {
         assert_eq!(v.lookup_str("78:45:58:3c:52:bc"), Some("Ubiquiti Inc"));
         assert_eq!((v.lookup_str("04:18:d6:00:00:01"), v.len(), v.names.len()), (Some("Ubiquiti Inc"), 3, 2), "a name kept once");
         assert_eq!(v.lookup_str("28:6f:b9:00:00:01"), Some("Nokia Shanghai Bell Co., Ltd."));
-        assert_eq!(v.lookup_str("86:00:00:00:00:06"), Some("Private (randomised)"));
+        // A client's random MAC, and an AP's further SSID: no maker either way.
+        assert_eq!(v.lookup(&"86:00:00:00:00:06".parse().unwrap()), Some("Private (randomised)"));
+        assert_eq!(v.lookup_str("7a:45:58:3c:52:bc"), None);
         assert_eq!(v.lookup_str("00:00:01:00:00:00"), None);
     }
 }
