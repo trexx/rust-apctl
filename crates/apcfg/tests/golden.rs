@@ -179,3 +179,30 @@ fn a_lock_to_an_unavailable_ap_is_not_enforced() {
     }
     assert_eq!(lock2ap(&state), 0, "no AP named");
 }
+
+/// The MAC filter's entries as the official controller lists them: each MAC once, an
+/// allow list in its own order without the clients locked elsewhere, and a deny list
+/// merged with the lock-to-AP entries (the user's entry kept) in Java HashMap order.
+/// The capture only has an allow list, so the order here is worked out by hand.
+#[test]
+fn mac_filter_entries_are_listed_once_in_the_official_order() {
+    let Some(_) = common::fixtures() else { return };
+    let mut state = state();
+    let list = ["02:00:00:00:00:30", "02:00:00:00:00:11", "02:00:00:00:00:30", "02:00:00:00:00:31"];
+    let entries = |state: &mut Value, policy: &str| {
+        for w in state["wlanconf"].as_array_mut().unwrap() {
+            w["mac_filter_enabled"] = serde_json::json!(true);
+            w["mac_filter_policy"] = serde_json::json!(policy);
+            w["mac_filter_list"] = serde_json::json!(list);
+        }
+        let cfg = render(state, AP_U, "x").rendered.system_cfg;
+        let macs: Vec<&str> = cfg.lines().filter_map(|l| l.strip_prefix("macacl.1.acl.")).filter(|l| l.contains(".mac=")).map(|l| &l[l.len() - 2..]).collect();
+        let types: Vec<&str> = cfg.lines().filter_map(|l| l.strip_prefix("macacl.1.acl.")).filter_map(|l| l.split_once(".type=")).map(|(_, t)| t).collect();
+        macs.into_iter().zip(types).map(|(m, t)| format!("{m} {t}")).collect::<Vec<_>>()
+    };
+    assert_eq!(entries(&mut state, "allow"), ["30 user", "31 user"]);
+    assert_eq!(entries(&mut state, "deny"), [
+        "10 lock2ap", "21 lock2ap", "31 user", "30 user", "14 lock2ap", "13 lock2ap", "12 lock2ap", "11 user", "22 lock2ap", "0f lock2ap", "0e lock2ap",
+        "15 lock2ap",
+    ]);
+}

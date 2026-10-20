@@ -246,8 +246,10 @@ fn bandsteering(c: &mut Cfg, ctx: &Ctx, radios: &[Radio], vaps: &[Vap]) {
 }
 
 /// One VAP's MAC ACL: device, policy and `(mac, type)` entries.
-type AclBlock<'a> = (&'a str, &'a str, Vec<(Cow<'a, str>, &'static str)>);
+type AclBlock<'a> = (&'a str, &'a str, Vec<(&'a str, &'static str)>);
 
+/// MACs are written and compared as stored, as the official controller does (the
+/// settings editor stores them lower case).
 fn mac_acl(c: &mut Cfg, ctx: &Ctx, vaps: &[Vap]) {
     // Clients pinned ("lock to AP") to some other AP may not join this one, while that AP
     // is known and available: a lock to an AP that is offline (`fixed_ap_available` false)
@@ -255,14 +257,12 @@ fn mac_acl(c: &mut Cfg, ctx: &Ctx, vaps: &[Vap]) {
     let available = |ap: &str| {
         arr(ctx.state, "devices").iter().find(|device| str_of(device, "mac").is_some_and(|m| mac_eq(m, ap))).is_some_and(|device| flag(device, "fixed_ap_available", true))
     };
-    let locked_elsewhere: Vec<String> = ctx
-        .site_docs("clients")
-        .filter(|u| flag(u, "fixed_ap_enabled", false))
-        .filter(|u| str_of(u, "fixed_ap_mac").is_some_and(|m| !m.is_empty() && !mac_eq(m, &ctx.mac) && available(m)))
-        .filter_map(|u| str_of(u, "mac"))
-        .map(str::to_ascii_lowercase)
-        .collect();
-    let locked_elsewhere = hash_set_order(&locked_elsewhere);
+    let locked_elsewhere = hash_set_order(
+        ctx.site_docs("clients")
+            .filter(|u| flag(u, "fixed_ap_enabled", false))
+            .filter(|u| str_of(u, "fixed_ap_mac").is_some_and(|m| !m.is_empty() && !mac_eq(m, &ctx.mac) && available(m)))
+            .filter_map(|u| str_of(u, "mac")),
+    );
     let locked: HashSet<&str> = locked_elsewhere.iter().copied().collect();
     let mut blocks: Vec<AclBlock> = Vec::new();
     for v in vaps {
@@ -271,20 +271,23 @@ fn mac_acl(c: &mut Cfg, ctx: &Ctx, vaps: &[Vap]) {
             continue;
         }
         let policy = if filtering { str_of(&v.w, "mac_filter_policy").unwrap_or("deny") } else { "deny" };
-        let mut entries: Vec<(Cow<str>, &'static str)> = Vec::new();
-        if filtering {
-            entries.extend(
-                str_list(&v.w, "mac_filter_list")
-                    .map(|m| m.to_ascii_lowercase())
-                    .filter(|m| policy != "allow" || !locked.contains(m.as_str()))
-                    .map(|m| (Cow::Owned(m), "user")),
-            );
-        }
-        if policy == "deny" {
-            let listed: HashSet<&str> = entries.iter().map(|(e, _)| e.as_ref()).collect();
-            let unlisted: Vec<&str> = locked_elsewhere.iter().copied().filter(|m| !listed.contains(m)).collect();
-            entries.extend(unlisted.into_iter().map(|m| (Cow::Borrowed(m), "lock2ap")));
-        }
+        let entries: Vec<(&str, &'static str)> = if !filtering {
+            locked_elsewhere.iter().map(|&m| (m, "lock2ap")).collect()
+        } else {
+            // The user's list once per MAC, first occurrence kept.
+            let mut listed = HashSet::new();
+            let user: Vec<&str> = str_list(&v.w, "mac_filter_list").filter(|m| listed.insert(*m)).collect();
+            match policy {
+                "allow" => user.into_iter().filter(|m| !locked.contains(m)).map(|m| (m, "user")).collect(),
+                // Both lists grouped by MAC (the user's entry kept) in a Java HashMap's order.
+                "deny" => hash_set_order(user.into_iter().chain(locked_elsewhere.iter().copied()))
+                    .into_iter()
+                    .map(|m| (m, if listed.contains(m) { "user" } else { "lock2ap" }))
+                    .collect(),
+                // An unknown policy: the official controller logs it and lists nothing.
+                _ => Vec::new(),
+            }
+        };
         blocks.push((v.dev(), policy, entries));
     }
     c.header("mac acl");

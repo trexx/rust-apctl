@@ -327,7 +327,7 @@ pub fn render_radios(c: &mut Cfg, ctx: &Ctx, radios: &[Radio], vaps: &[Vap]) -> 
                 .filter_map(|b| str_of(b, "channel"))
                 .collect();
             if !blocked.is_empty() {
-                c.set(k.at("blklst"), hash_set_order(&blocked).join(","));
+                c.set(k.at("blklst"), hash_set_order(blocked).join(","));
             }
         }
         if ctx.caps.has(Cap::GreenAp) {
@@ -800,7 +800,7 @@ fn render_wireless(c: &mut Cfg, ctx: &Ctx, radios: &[Radio], vaps: &[Vap], v: &V
         let mut macs: Vec<String> = str_list(w, "bc_filter_list").map(|m| m.to_ascii_lowercase()).collect();
         // The site's gateways always get through.
         macs.extend_from_slice(ctx.gateway_macs());
-        for (mi, mac) in hash_set_order(&macs).iter().enumerate() {
+        for (mi, mac) in hash_set_order(macs.iter().map(String::as_str)).iter().enumerate() {
             c.set(format_args!("{k}bcfilt.{}.status", mi + 1), "enabled");
             c.set(format_args!("{k}bcfilt.{}.mac", mi + 1), mac);
         }

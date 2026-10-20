@@ -16,9 +16,9 @@ fn string_hash(s: &str) -> u32 {
 
 /// Deduplicates `items` (first occurrence wins) and returns them in the order a
 /// default-constructed `HashSet` filled one element at a time would iterate them.
-pub fn hash_set_order<S: AsRef<str>>(items: &[S]) -> Vec<&str> {
-    let mut seen = HashSet::with_capacity(items.len());
-    let mut unique: Vec<&str> = items.iter().map(AsRef::as_ref).filter(|s| seen.insert(*s)).collect();
+pub fn hash_set_order<'a>(items: impl IntoIterator<Item = &'a str>) -> Vec<&'a str> {
+    let mut seen = HashSet::new();
+    let mut unique: Vec<&str> = items.into_iter().filter(|s| seen.insert(*s)).collect();
     // Default capacity 16, load factor 0.75: the table doubles once size exceeds 3/4.
     let mut capacity = 16usize;
     while unique.len() * 4 > capacity * 3 {
@@ -41,9 +41,9 @@ mod tests {
         // radio_ai.channels_blacklist for 2.4 GHz, in stored order, and the `blklst`
         // value the official controller sent for it.
         let stored = ["2", "3", "4", "5", "7", "8", "9", "10", "12", "13", "14"];
-        assert_eq!(hash_set_order(&stored).join(","), "12,2,13,3,14,4,5,7,8,9,10");
+        assert_eq!(hash_set_order(stored).join(","), "12,2,13,3,14,4,5,7,8,9,10");
         // Duplicates are dropped, the first one kept.
-        assert_eq!(hash_set_order(&["13", "2", "13", "12", "2"]).join(","), "12,13,2");
+        assert_eq!(hash_set_order(["13", "2", "13", "12", "2"]).join(","), "12,13,2");
     }
 
     #[test]
