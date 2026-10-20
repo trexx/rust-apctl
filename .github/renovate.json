@@ -41,9 +41,10 @@
     },
     {
       "customType": "regex",
-      "description": "Images that workflow steps run by hand (docker run), such as the Node image the web job builds with",
+      "description": "Images that workflow steps and the README's build commands run by hand (docker run), such as the Node image the web job builds with",
       "managerFilePatterns": [
-        "/(^|/)\\.github/workflows/[^/]+\\.ya?ml$/"
+        "/(^|/)\\.github/workflows/[^/]+\\.ya?ml$/",
+        "/^README\\.md$/"
       ],
       "matchStrings": [
         "(?<depName>docker\\.io/library/[a-z0-9-]+):(?<currentValue>[A-Za-z0-9._-]+)(?:@(?<currentDigest>sha256:[a-f0-9]{64}))?"
