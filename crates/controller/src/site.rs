@@ -5,7 +5,6 @@
 
 use axum::extract::State;
 use serde_json::{Value, json};
-use std::collections::HashMap;
 use std::sync::LazyLock;
 
 use crate::api::{ApiError, AppState, Json, Query};
@@ -52,9 +51,12 @@ fn reset_illegal_channels(state: &mut Value) -> Vec<String> {
 
 const SECRETS: &[&str] = &["x_ssh_password", "x_ssh_sha512passwd", "x_ssh_md5passwd", "x_password"];
 
+/// The `setting` documents [`apply_site`] can change (Channel AI's follows the country).
+const SITE_KEYS: [&str; 7] = ["mgmt", "rsyslogd", "ntp", "snmp", "country", "locale", "radio_ai"];
+
 /// Applies a patch: `{ mgmt: {...}, rsyslogd: {...}, snmp: {...}, ntp: {...}, country, timezone }`.
 pub fn apply_site(state: &mut Value, p: &Value) -> Result<String, String> {
-    let before = state["setting"].clone();
+    let before = SITE_KEYS.map(|k| setting(state, k).clone());
     let rules_before = (country(state), mgmt_flag(state, "outdoor_mode_enabled"));
     let mut notes: Vec<String> = Vec::new();
     if !p["mgmt"].is_null() {
@@ -82,23 +84,21 @@ pub fn apply_site(state: &mut Value, p: &Value) -> Result<String, String> {
         crate::channelai::apply_settings(state, &json!({}))?;
     }
 
-    let mut changed = changed_settings(&before, &state["setting"]);
+    let mut changed = changed_settings(&before, state);
     changed.extend(notes);
     dedup_in_order(&mut changed);
     Ok(if changed.is_empty() { "site settings: nothing changed".into() } else { format!("site settings: {}", changed.join(", ")) })
 }
 
-/// The `setting` fields that differ, as "key.field" (secrets left out: they
-/// are summed up as e.g. "SSH password" by the editors).
-fn changed_settings(before: &Value, after: &Value) -> Vec<String> {
-    let old: HashMap<(Option<&str>, Option<&str>), &Value> = before.as_array().into_iter().flatten().map(|o| ((o["key"].as_str(), o["site_id"].as_str()), o)).collect();
+/// The fields of the [`SITE_KEYS`] documents that differ from `before` (taken
+/// in that order), as "key.field" (secrets left out: they are summed up as
+/// e.g. "SSH password" by the editors).
+fn changed_settings(before: &[Value; SITE_KEYS.len()], state: &Value) -> Vec<String> {
     let mut changed = Vec::new();
-    for s in after.as_array().into_iter().flatten() {
-        let key = s["key"].as_str();
-        let old = old.get(&(key, s["site_id"].as_str())).copied().unwrap_or(&Value::Null);
-        for (k, v) in s.as_object().into_iter().flatten() {
+    for (key, old) in SITE_KEYS.iter().zip(before) {
+        for (k, v) in setting(state, key).as_object().into_iter().flatten() {
             if old[k] != *v && !SECRETS.contains(&k.as_str()) && !matches!(k.as_str(), "key" | "site_id") {
-                changed.push(if k == "x_ssh_keys" { "SSH keys".to_string() } else { format!("{}.{k}", key.unwrap_or("?")) });
+                changed.push(if k == "x_ssh_keys" { "SSH keys".to_string() } else { format!("{key}.{k}") });
             }
         }
     }
