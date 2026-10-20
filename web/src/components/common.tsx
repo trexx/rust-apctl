@@ -634,7 +634,7 @@ const EVENTS: { [K in EventKind]: EventSpec<K> } = {
     label: "Client roamed",
     tone: "info",
     describe: (d, names) =>
-      `from ${names[d.from?.ap ?? ""] ?? "?"} (${band(d.from?.radio)}, ${dbm(d.from?.signal)}) to ${names[d.to?.ap ?? ""] ?? "?"} (${band(d.to?.radio)}, ${dbm(d.to?.signal)})`,
+      `from ${d.from?.ap ? (names[d.from.ap] ?? d.from.ap) : "?"} (${band(d.from?.radio)}, ${dbm(d.from?.signal)}) to ${d.to?.ap ? (names[d.to.ap] ?? d.to.ap) : "?"} (${band(d.to?.radio)}, ${dbm(d.to?.signal)})`,
   },
   client_renamed: {
     label: "Client renamed",
