@@ -376,76 +376,104 @@ fn snapshot(src: &Path, dst: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Drops history older than the cutoff from snapshot copies. Clients that
-/// have a name (alias) are kept whatever their age, as are open alerts,
-/// settings, keys, device configs and acknowledgements; login sessions never travel.
-fn trim(dir: &Path, cutoff: Option<Ts>) -> Result<()> {
-    if dir.join("config.db").exists() {
-        trim_config(dir, cutoff)?;
-    }
-    if let Some(t) = cutoff {
-        trim_history(dir, t)?;
-    }
-    Ok(())
-}
-
-/// Drops the history older than the cutoff, and the sessions, from config.db.
-fn trim_config(dir: &Path, cutoff: Option<Ts>) -> Result<()> {
-    let mut c = scratch(&dir.join("config.db"))?;
-    // The deletes in one transaction, then one rewrite to drop the pages they
-    // freed. With nothing else to drop, the few session rows are overwritten
-    // in place instead of rewriting the whole file again.
-    if cutoff.is_none() {
-        c.execute_batch("PRAGMA secure_delete=ON;")?;
-    }
-    let tx = c.transaction()?;
-    tx.execute_batch("DELETE FROM sessions;")?;
-    if let Some(t) = cutoff {
-        for (table, col) in [("events", "ts"), ("connections", "ts"), ("neighbors", "last_seen"), ("spectrum", "ts"), ("dryrun_results", "ts")] {
-            tx.execute(&format!("DELETE FROM {table} WHERE {col} < ?1"), [t])?;
+/// A consistent copy of a live database for a backup without the history
+/// older than `cutoff` (none: all of it). Clients that have a name (alias)
+/// are kept whatever their age, as are open alerts, settings, keys, device
+/// configs and acknowledgements; login sessions never travel.
+fn copy_for_backup(name: &str, src: &Path, dst: &Path, cutoff: Option<Ts>) -> Result<()> {
+    match (name, cutoff) {
+        ("config.db", Some(t)) => trimmed_config(src, dst, t),
+        ("config.db", None) => {
+            snapshot(src, dst)?;
+            // The few session rows are overwritten in place.
+            let c = scratch(dst)?;
+            c.execute_batch("PRAGMA secure_delete=ON; DELETE FROM sessions;")?;
+            Ok(())
         }
-        // As retention does: an alert still open travels, so a restore neither
-        // raises it again nor loses when it started.
-        tx.execute("DELETE FROM alerts WHERE ts < ?1 AND resolved_ts < ?1", [t])?;
-        tx.execute(store::FORGET_OLD_CLIENTS, [t])?;
-    }
-    tx.commit()?;
-    if cutoff.is_some() {
-        c.execute_batch("VACUUM;")?;
-    }
-    Ok(())
-}
-
-/// Drops the history older than `t` from metrics.db and logs.db.
-fn trim_history(dir: &Path, t: Ts) -> Result<()> {
-    // Every metric table in every tier, and the logs (and their full-text index).
-    let metrics: Vec<String> = store::TABLES.iter().flat_map(|t| store::TIERS.iter().map(move |tier| format!("{}{}", t.name, tier.suffix))).collect();
-    for (name, tables) in [("metrics.db", metrics), ("logs.db", vec!["logs".to_string()])] {
-        let p = dir.join(name);
-        if !p.exists() {
-            continue;
-        }
-        // What is deleted is overwritten in place, so the file need not be
-        // rewritten to be rid of it: only when it frees much of the file
-        // (zeroed pages would otherwise bloat the restored database, and
-        // compress so well that the restore's size check could refuse it).
-        let mut c = scratch(&p)?;
-        c.execute_batch("PRAGMA secure_delete=ON;")?;
-        let tx = c.transaction()?;
-        for table in tables {
-            // A database from an older version may lack the newest tables.
-            let exists: bool = tx.query_row("SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1", [&table], |r| r.get::<_, i64>(0))? > 0;
-            if exists && table == "logs" {
-                trim_logs(&tx, t)?;
-            } else if exists {
-                tx.execute(&format!("DELETE FROM \"{table}\" WHERE ts < ?1"), [t])?;
+        (_, cutoff) => {
+            snapshot(src, dst)?;
+            match cutoff {
+                Some(t) => trim_history(dst, t),
+                None => Ok(()),
             }
         }
-        tx.commit()?;
-        let pages = |pragma: &str| c.query_row(&format!("PRAGMA {pragma}"), [], |r| r.get::<_, i64>(0));
-        if pages("freelist_count")? * 4 > pages("page_count")? {
-            c.execute_batch("VACUUM;")?;
+    }
+}
+
+/// config.db's history: each table with the column its rows' time is in.
+const CONFIG_HISTORY: [(&str, &str); 5] = [("events", "ts"), ("connections", "ts"), ("neighbors", "last_seen"), ("spectrum", "ts"), ("dryrun_results", "ts")];
+
+/// A consistent copy of the live config.db without the history older than
+/// `t` and without the sessions. It is built rather than copied whole and
+/// trimmed: a daily settings backup reads a year of events, but writes none.
+fn trimmed_config(src: &Path, dst: &Path, t: Ts) -> Result<()> {
+    // As `scratch`, for the copy alone (unqualified, the journal mode would be
+    // every attached database's), and what the retention deletes below remove
+    // is not left in free pages.
+    let mut c = Connection::open(dst)?;
+    c.execute_batch("PRAGMA main.journal_mode=OFF; PRAGMA main.synchronous=OFF; PRAGMA temp_store=MEMORY; PRAGMA busy_timeout=10000; PRAGMA secure_delete=ON;")?;
+    // Read only, through a URI: `?` and `#` in the path are escaped.
+    let path = src.to_string_lossy().replace('%', "%25").replace('?', "%3f").replace('#', "%23");
+    c.execute("ATTACH DATABASE ?1 AS live", [format!("file:{path}?mode=ro")]).with_context(|| format!("opening {}", src.display()))?;
+    // One transaction: one consistent read of the live database.
+    let tx = c.transaction()?;
+    // The tables (filled as they are made), then their indexes and the rest.
+    let objects: Vec<(String, String, String)> = tx
+        .prepare("SELECT type, name, sql FROM live.sqlite_master WHERE sql IS NOT NULL AND name NOT LIKE 'sqlite%' ORDER BY type != 'table', type != 'index', rowid")?
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+    for (kind, name, sql) in &objects {
+        if sql.starts_with("CREATE VIRTUAL") {
+            bail!("config.db's {name} cannot be copied for a backup: a virtual table");
         }
+        // Unqualified, as stored: made in the copy.
+        tx.execute_batch(sql).with_context(|| format!("copying config.db's {name}"))?;
+        if kind != "table" || name == "sessions" {
+            continue;
+        }
+        let copy = format!("INSERT INTO main.\"{name}\" SELECT * FROM live.\"{name}\"");
+        match CONFIG_HISTORY.iter().find(|(table, _)| table == name) {
+            Some((_, col)) => tx.execute(&format!("{copy} WHERE \"{col}\" >= ?1 OR \"{col}\" IS NULL"), [t])?,
+            None => tx.execute(&copy, [])?,
+        };
+    }
+    // As retention does, on the copy: an alert still open travels, so a restore
+    // neither raises it again nor loses when it started.
+    tx.execute("DELETE FROM alerts WHERE ts < ?1 AND resolved_ts < ?1", [t])?;
+    tx.execute(store::FORGET_OLD_CLIENTS, [t])?;
+    tx.commit()?;
+    c.execute_batch("DETACH DATABASE live;")?;
+    Ok(())
+}
+
+/// Drops the history older than `t` from a copy of metrics.db or logs.db.
+fn trim_history(p: &Path, t: Ts) -> Result<()> {
+    // Every metric table in every tier, or the logs (and their full-text index).
+    let tables: Vec<String> = match p.file_name().and_then(|n| n.to_str()) {
+        Some("metrics.db") => store::TABLES.iter().flat_map(|t| store::TIERS.iter().map(move |tier| format!("{}{}", t.name, tier.suffix))).collect(),
+        Some("logs.db") => vec!["logs".to_string()],
+        _ => return Ok(()),
+    };
+    // What is deleted is overwritten in place, so the file need not be
+    // rewritten to be rid of it: only when it frees much of the file
+    // (zeroed pages would otherwise bloat the restored database, and
+    // compress so well that the restore's size check could refuse it).
+    let mut c = scratch(p)?;
+    c.execute_batch("PRAGMA secure_delete=ON;")?;
+    let tx = c.transaction()?;
+    for table in tables {
+        // A database from an older version may lack the newest tables.
+        let exists: bool = tx.query_row("SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1", [&table], |r| r.get::<_, i64>(0))? > 0;
+        if exists && table == "logs" {
+            trim_logs(&tx, t)?;
+        } else if exists {
+            tx.execute(&format!("DELETE FROM \"{table}\" WHERE ts < ?1"), [t])?;
+        }
+    }
+    tx.commit()?;
+    let pages = |pragma: &str| c.query_row(&format!("PRAGMA {pragma}"), [], |r| r.get::<_, i64>(0));
+    if pages("freelist_count")? * 4 > pages("page_count")? {
+        c.execute_batch("VACUUM;")?;
     }
     Ok(())
 }
@@ -507,18 +535,17 @@ fn create_of(b: &Backups, src_dir: &Path, kind: Kind, days: i64, names: &[&str])
         .expect("a free name");
     let part = dir.join(format!("{name}.part"));
     let result = (|| -> Result<Meta> {
-        for n in names {
-            if src_dir.join(n).exists() {
-                snapshot(&src_dir.join(n), &tmp.join(n))?;
-            }
-        }
         // Settings only drops all history; N days drops what is older; -1 keeps everything.
         let cutoff = match days {
             0 => Some(Ts::MAX),
             d if d > 0 => Some(now - d * 86400),
             _ => None,
         };
-        trim(&tmp, cutoff)?;
+        for n in names {
+            if src_dir.join(n).exists() {
+                copy_for_backup(n, &src_dir.join(n), &tmp.join(n), cutoff)?;
+            }
+        }
         let mut files = std::collections::BTreeMap::new();
         for n in names {
             if tmp.join(n).exists() {
@@ -1390,6 +1417,14 @@ mod tests {
         assert_eq!(count(&cfg, "SELECT COUNT(*) FROM clients WHERE hostname = 'named'"), 1);
         assert_eq!(count(&cfg, "SELECT COUNT(*) FROM sessions"), 0, "login sessions never travel");
         assert_eq!(ids(&cfg, "alerts"), "open,recent", "open alerts travel whatever their age");
+        // Built table by table: the live schema, and nothing of the rows left out.
+        let schema = |p: &Path| -> Vec<(String, String, Option<String>)> {
+            let c = Connection::open(p).unwrap();
+            let mut stmt = c.prepare("SELECT type, name, sql FROM sqlite_master WHERE name NOT LIKE 'sqlite_sequence' ORDER BY type, name").unwrap();
+            stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).unwrap().collect::<rusqlite::Result<_>>().unwrap()
+        };
+        assert_eq!(schema(&cfg), schema(&src.join("config.db")));
+        assert!(!fs::read(&cfg).unwrap().windows(17).any(|w| w == b"aa:aa:aa:aa:aa:01"), "a forgotten client leaves no trace");
         assert_eq!(count(&out.join("metrics.db"), "SELECT COUNT(*) FROM ap_stats"), 1);
         // The wrong key, or none, is refused.
         assert!(unpack(&b.dir().join(&m.name), Some(&[8u8; 32]), &dir("rt-wrong")).is_err());
