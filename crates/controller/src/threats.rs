@@ -570,8 +570,9 @@ pub fn gather(store: &Store, state: &ThreatState, live: &SharedLive, now: Ts) ->
             }
             own.entry(bssid.clone()).or_insert_with(|| OwnBss { bssid: bssid.clone(), ap_mac: ap.clone(), essid: essid.clone(), channel: None, changed_at: 0 });
         }
-        // Read only when a BSSID's last change has to be worked out again.
-        let mut history: Option<History> = None;
+        // Read only when a BSSID's last change has to be worked out again: in
+        // full, or only the last hour's rows (`recent`) for one whose key is unchanged.
+        let (mut history, mut recent): (Option<History>, Option<History>) = (None, None);
         for b in own.values_mut() {
             if let Some(e) = &b.essid {
                 a.ssids.insert(e.clone());
@@ -580,6 +581,17 @@ pub fn gather(store: &Store, state: &ThreatState, live: &SharedLive, now: Ts) ->
             let key = (b.ap_mac.clone(), radio, b.channel, b.essid.clone());
             b.changed_at = match cache.changes.get(&b.bssid) {
                 Some(ch) if ch.of == key && (0..CACHE_SECS).contains(&(now - ch.at)) => ch.changed_at,
+                // Expired, its key unchanged: only rows written since it was worked out
+                // (and a little before, for late ones) can move it, all of them raw.
+                Some(ch) if ch.of == key && (0..History::RECENT_SECS - 300).contains(&(now - ch.at)) => {
+                    let h = match &mut recent {
+                        Some(h) => h,
+                        None => recent.insert(History::load_recent(c, now)?),
+                    };
+                    let changed_at = ch.changed_at.max(h.last_change(b, key.1.as_deref()));
+                    cache.changes.insert(b.bssid.clone(), Change { of: key, at: now, changed_at });
+                    changed_at
+                }
                 _ => {
                     let h = match &mut history {
                         Some(h) => h,
@@ -728,10 +740,22 @@ impl History {
         ]
     }
 
+    /// How far back the raw tier is read.
+    const RECENT_SECS: Ts = 3600;
+
     fn load(c: &Connection, now: Ts) -> rusqlite::Result<History> {
+        History::load_tiers(c, &[("", now - History::RECENT_SECS, 0), ("_5m", now - HISTORY_SECS, 299)])
+    }
+
+    /// The raw tier's rows alone, as [`History::load`] reads them.
+    fn load_recent(c: &Connection, now: Ts) -> rusqlite::Result<History> {
+        History::load_tiers(c, &[("", now - History::RECENT_SECS, 0)])
+    }
+
+    /// `tiers`: (table suffix, since, added to a row's time to reach the end of what it covers).
+    fn load_tiers(c: &Connection, tiers: &[(&str, Ts, Ts)]) -> rusqlite::Result<History> {
         let mut h = History::default();
-        // (tier, since, added to a row's time to reach the end of what it covers)
-        for (suffix, since, end) in [("", now - 3600, 0), ("_5m", now - HISTORY_SECS, 299)] {
+        for &(suffix, since, end) in tiers {
             let [channels, names] = History::sql(suffix, end);
             for row in c.prepare_cached(&channels)?.query_map([since, Ts::MAX], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, f64>(2)?, r.get::<_, Ts>(3)?)))? {
                 let (mac, radio, ch, ts) = row?;
@@ -1183,6 +1207,28 @@ mod tests {
         assert_eq!(h.last_change(&own("02:00:00:00:00:03", "IoT", 6), None), now - 120);
         assert_eq!(h.last_change(&own("02:00:00:00:00:03", "IoT", 1), Some("ng")), now - 600 + 299);
         assert_eq!(h.last_change(&own("02:00:00:00:00:01", "Old", 6), None), 0, "only in the hourly tier");
+    }
+
+    #[test]
+    fn a_bssids_last_change_is_brought_up_to_date_from_the_raw_rows_alone() {
+        let t = TestStore::new("threats-recent");
+        let c = t.db(Db::Metrics);
+        let (live, state): (SharedLive, ThreatState) = Default::default();
+        let now = 1_000_000_000;
+        let vap = |suffix: &str, ts: Ts, essid: &str| {
+            let sql = format!("INSERT INTO vap_stats{suffix} (bssid, ts, ap_mac, essid) VALUES ('02:00:00:00:00:02', ?1, ?2, ?3)");
+            c.execute(&sql, rusqlite::params![ts, UP, essid]).unwrap();
+        };
+        vap("", now - 1000, "Old");
+        vap("", now - 500, "Home");
+        let changed = |at: Ts| gather(&t.store, &state, &live, at).unwrap().own[0].changed_at;
+        assert_eq!(changed(now), now - 1000);
+        // Renamed and back while the entry was kept; then a five-minute row that only a full read would see.
+        vap("", now + 300, "Other");
+        vap("", now + 400, "Home");
+        vap("_5m", now + 350, "Rolled");
+        assert_eq!(changed(now + 60), now - 1000, "kept");
+        assert_eq!(changed(now + CACHE_SECS), now + 300, "the same key: the raw rows since");
     }
 
     #[test]

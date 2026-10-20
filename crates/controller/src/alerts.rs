@@ -246,6 +246,9 @@ fn human(secs: Ts) -> String {
 struct ApWatch {
     /// Offline alerts sent per AP: times, for the two-a-day limit.
     sent: HashMap<Mac, Vec<Ts>>,
+    /// Every drop per AP in the last day, alerted or not: the count a "keeps
+    /// dropping off" alert gives (after a restart, those alerted only).
+    drops: HashMap<Mac, Vec<Ts>>,
     /// APs currently considered offline, with the last contact time.
     down: HashMap<Mac, Ts>,
     /// Day (in the site's time zone) on which a "keeps dropping off" alert was last sent per AP.
@@ -275,6 +278,10 @@ impl ApWatch {
         match (gone, self.down.get(&mac).copied()) {
             (true, None) => {
                 self.down.insert(mac, last_seen);
+                let drops = self.drops.entry(mac).or_default();
+                drops.retain(|t| *t > now - 86400);
+                drops.push(now);
+                let times = drops.len();
                 let sent = self.sent.entry(mac).or_default();
                 sent.retain(|t| *t > now - 86400);
                 if sent.len() < 2 {
@@ -282,7 +289,7 @@ impl ApWatch {
                     Some(ApChange::Offline { last_seen })
                 } else if self.flapping_day.get(&mac) != Some(&today) {
                     self.flapping_day.insert(mac, today);
-                    Some(ApChange::Flapping { times: sent.len() + 1 })
+                    Some(ApChange::Flapping { times })
                 } else {
                     None
                 }
@@ -296,9 +303,9 @@ impl ApWatch {
         }
     }
 
-    /// Forgets what no longer counts: offline alerts over a day old (but not
-    /// an offline AP's, which tell whether its return is reported), and
-    /// "keeps dropping off" days before today.
+    /// Forgets what no longer counts: drops and offline alerts over a day old
+    /// (but not an offline AP's alerts, which tell whether its return is
+    /// reported), and "keeps dropping off" days before today.
     fn prune(&mut self, now: Ts) {
         let down = &self.down;
         self.sent.retain(|mac, sent| {
@@ -306,6 +313,10 @@ impl ApWatch {
                 sent.retain(|t| *t > now - 86400);
             }
             !sent.is_empty()
+        });
+        self.drops.retain(|_, drops| {
+            drops.retain(|t| *t > now - 86400);
+            !drops.is_empty()
         });
         let today = self.day(now);
         self.flapping_day.retain(|_, day| *day == today);
@@ -622,6 +633,7 @@ impl Watcher {
                     w.book.open.insert((a.key, a.entity.clone()), a);
                 }
                 for (mac, ts, flapping) in offline {
+                    w.aps.drops.entry(mac).or_default().push(ts);
                     if flapping {
                         w.aps.flapping_day.insert(mac, w.aps.day(ts));
                     } else {
@@ -793,7 +805,9 @@ impl Watcher {
 /// Starts the alert watcher, fed by the engine through `events` (see [`channel`]).
 /// It keeps the engine's time (see [`crate::shadow::Clock`]): in shadow mode a
 /// lagging capture's, and while a capture is replayed it checks no AP's status
-/// or health, whose stored figures are then of the capture's time.
+/// or health, whose stored figures are then of the capture's time, and makes
+/// no alert of its events (they are history, not news). An event's alert
+/// carries the event's own time.
 pub fn spawn(store: Arc<Store>, writer: Writer, live: SharedLive, tx: broadcast::Sender<LiveMsg>, mut events: mpsc::Receiver<Event>, engine_clock: Arc<crate::shadow::Clock>) {
     tokio::spawn(async move {
         let now = || engine_clock.now().unwrap_or_else(clock::now_ts);
@@ -805,7 +819,7 @@ pub fn spawn(store: Arc<Store>, writer: Writer, live: SharedLive, tx: broadcast:
             // Events wait in the channel while a check runs.
             tokio::select! {
                 e = events.recv() => match e {
-                    Some(e) => w.event(now(), &e),
+                    Some(e) => if engine_clock.now().is_some() { w.event(e.ts, &e) },
                     None => return,
                 },
                 _ = status.tick() => if let Some(now) = engine_clock.now() { w.status_tick(now) },
@@ -897,6 +911,22 @@ mod tests {
     }
 
     #[test]
+    fn keeps_dropping_off_counts_every_drop_of_the_last_day() {
+        let mut w = ApWatch::default();
+        let ap: Mac = "02:00:00:00:00:01".parse().unwrap();
+        let hour = 3600;
+        // Drops every hour from 10:00 to 20:00: two alerted, one summarised, eight silent.
+        for h in 10..=20 {
+            w.check(h * hour, ap, h * hour - 300);
+            w.check(h * hour + 100, ap, h * hour + 99);
+        }
+        // 09:00 the next day: the alerted drops are still within the day, so it is summarised, with all twelve.
+        let next = 86400 + 9 * hour;
+        w.prune(next);
+        assert_eq!(w.check(next, ap, next - 300), Some(ApChange::Flapping { times: 12 }));
+    }
+
+    #[test]
     fn days_and_times_of_day_are_the_sites() {
         // 2026-01-15 22:30 UTC is 23:30 in Berlin; 23:30 UTC is the next day there.
         let (t, ap): (Ts, Mac) = (1_768_516_200, "02:00:00:00:00:01".parse().unwrap());
@@ -912,7 +942,7 @@ mod tests {
         // An hour on, midnight has passed in Berlin (not in UTC): "keeps dropping off" may be sent again.
         w.prune(t + 3600);
         assert!(w.flapping_day.is_empty());
-        assert_eq!(w.check(t + 3600, ap, t + 3300), Some(ApChange::Flapping { times: 3 }));
+        assert_eq!(w.check(t + 3600, ap, t + 3300), Some(ApChange::Flapping { times: 4 }), "four drops within the last day");
     }
 
     #[test]

@@ -5,11 +5,10 @@
 
 use axum::extract::State;
 use serde_json::{Value, json};
-use std::collections::HashMap;
 use std::sync::LazyLock;
 
 use crate::api::{ApiError, AppState, Json, Query};
-use crate::settings::Kind::{Bool, Int};
+use crate::settings::Kind::{Bool, Enum, Int};
 use crate::settings::{COUNTRIES, Patch, PreviewQuery, band_name, copy_fields, country, dedup_in_order, docs_mut, illegal_fixed_channel, mgmt_flag, num, outdoor_with, pick, record_label, setting, setting_mut, str_field, timezone};
 
 /// A host name or IPv4 address, as NTP and syslog targets take (the official
@@ -41,7 +40,7 @@ fn reset_illegal_channels(state: &mut Value) -> Vec<String> {
         let o = outdoor_with(d, site_outdoor);
         let name = record_label(d, "?");
         for r in d["radio_table"].as_array_mut().into_iter().flatten() {
-            if let Some((ch, _)) = illegal_fixed_channel(c, r, o) {
+            if let Some(ch) = illegal_fixed_channel(c, r, o) {
                 out.push(format!("AP {name} {} channel {ch} → auto", band_name(r["radio"].as_str().unwrap_or(""))));
                 r["channel"] = json!("auto");
             }
@@ -52,9 +51,12 @@ fn reset_illegal_channels(state: &mut Value) -> Vec<String> {
 
 const SECRETS: &[&str] = &["x_ssh_password", "x_ssh_sha512passwd", "x_ssh_md5passwd", "x_password"];
 
+/// The `setting` documents [`apply_site`] can change (Channel AI's follows the country).
+const SITE_KEYS: [&str; 7] = ["mgmt", "rsyslogd", "ntp", "snmp", "country", "locale", "radio_ai"];
+
 /// Applies a patch: `{ mgmt: {...}, rsyslogd: {...}, snmp: {...}, ntp: {...}, country, timezone }`.
 pub fn apply_site(state: &mut Value, p: &Value) -> Result<String, String> {
-    let before = state["setting"].clone();
+    let before = SITE_KEYS.map(|k| setting(state, k).clone());
     let rules_before = (country(state), mgmt_flag(state, "outdoor_mode_enabled"));
     let mut notes: Vec<String> = Vec::new();
     if !p["mgmt"].is_null() {
@@ -82,23 +84,21 @@ pub fn apply_site(state: &mut Value, p: &Value) -> Result<String, String> {
         crate::channelai::apply_settings(state, &json!({}))?;
     }
 
-    let mut changed = changed_settings(&before, &state["setting"]);
+    let mut changed = changed_settings(&before, state);
     changed.extend(notes);
     dedup_in_order(&mut changed);
     Ok(if changed.is_empty() { "site settings: nothing changed".into() } else { format!("site settings: {}", changed.join(", ")) })
 }
 
-/// The `setting` fields that differ, as "key.field" (secrets left out: they
-/// are summed up as e.g. "SSH password" by the editors).
-fn changed_settings(before: &Value, after: &Value) -> Vec<String> {
-    let old: HashMap<(Option<&str>, Option<&str>), &Value> = before.as_array().into_iter().flatten().map(|o| ((o["key"].as_str(), o["site_id"].as_str()), o)).collect();
+/// The fields of the [`SITE_KEYS`] documents that differ from `before` (taken
+/// in that order), as "key.field" (secrets left out: they are summed up as
+/// e.g. "SSH password" by the editors).
+fn changed_settings(before: &[Value; SITE_KEYS.len()], state: &Value) -> Vec<String> {
     let mut changed = Vec::new();
-    for s in after.as_array().into_iter().flatten() {
-        let key = s["key"].as_str();
-        let old = old.get(&(key, s["site_id"].as_str())).copied().unwrap_or(&Value::Null);
-        for (k, v) in s.as_object().into_iter().flatten() {
+    for (key, old) in SITE_KEYS.iter().zip(before) {
+        for (k, v) in setting(state, key).as_object().into_iter().flatten() {
             if old[k] != *v && !SECRETS.contains(&k.as_str()) && !matches!(k.as_str(), "key" | "site_id") {
-                changed.push(if k == "x_ssh_keys" { "SSH keys".to_string() } else { format!("{}.{k}", key.unwrap_or("?")) });
+                changed.push(if k == "x_ssh_keys" { "SSH keys".to_string() } else { format!("{key}.{k}") });
             }
         }
     }
@@ -182,10 +182,14 @@ fn site_syslog(doc: &mut Value, r: &Value) -> Result<(), String> {
 /// The APs' time servers (`ntp`).
 fn site_ntp(doc: &mut Value, n: &Value) -> Result<(), String> {
     let was_manual = doc["setting_preference"].as_str() == Some("manual");
-    match str_field(n, "setting_preference")? {
-        None => {}
-        Some(pref @ ("auto" | "manual")) => doc["setting_preference"] = json!(pref),
-        Some(_) => return Err("setting_preference must be auto or manual".into()),
+    copy_fields(n, doc, &[("setting_preference", Enum(&["auto", "manual"]))])?;
+    // The servers named, checked whatever the mode.
+    let mut named: [Option<&str>; 4] = [None; 4];
+    for (h, k) in named.iter_mut().zip(NTP_KEYS) {
+        *h = str_field(n, k)?.map(str::trim);
+        if let Some(h) = h.filter(|h| !h.is_empty() && !is_host(h)) {
+            return Err(format!("{h} is not a host name or IPv4 address"));
+        }
     }
     if doc["setting_preference"].as_str() == Some("auto") {
         // Going back to automatic restores the pool, as the official controller does.
@@ -194,14 +198,17 @@ fn site_ntp(doc: &mut Value, n: &Value) -> Result<(), String> {
                 doc[*k] = json!(h);
             }
         }
-    } else if NTP_KEYS.iter().any(|k| !n[*k].is_null()) {
+        // Automatic uses the pool: other servers named with it are refused (the pool's own, as read back, pass).
+        if let Some(h) = named.iter().zip(NTP_KEYS).find_map(|(h, k)| h.filter(|h| !h.is_empty() && doc[k].as_str() != Some(h))) {
+            return Err(format!("{h}: time servers are set only with manual NTP"));
+        }
+    } else if named.iter().any(Option::is_some) {
         // The servers named replace those stored, and the four close up. Coming
         // from automatic, the pool's servers are no choice of the user's: the
         // ones not named are blank.
         let mut list = Vec::new();
-        for k in NTP_KEYS {
-            let h = match str_field(n, k)?.map(str::trim) {
-                Some(h) if !h.is_empty() && !is_host(h) => return Err(format!("{h} is not a host name or IPv4 address")),
+        for (h, k) in named.into_iter().zip(NTP_KEYS) {
+            let h = match h {
                 Some(h) => h,
                 None if was_manual => doc[k].as_str().unwrap_or_default(),
                 None => "",
@@ -537,6 +544,12 @@ mod tests {
         assert_eq!(servers(&s), ["192.0.2.1", "ntp.example.org", "", ""], "a blank one closes up");
         edit(&mut s, json!({ "ntp": { "setting_preference": "auto" } })).unwrap();
         assert_eq!(setting(&s, "ntp")["ntp_server_1"], "0.ubnt.pool.ntp.org");
+        // On automatic, servers are still checked, and other than the pool's refused.
+        assert_eq!(edit(&mut s, json!({ "ntp": { "ntp_server_1": 5 } })).unwrap_err(), "ntp_server_1 must be text");
+        assert!(edit(&mut s, json!({ "ntp": { "ntp_server_1": "bad host!" } })).unwrap_err().contains("not a host name"));
+        assert!(edit(&mut s, json!({ "ntp": { "setting_preference": "auto", "ntp_server_2": "time.example.net" } })).unwrap_err().contains("only with manual"));
+        let pool = setting(&s, "ntp").clone();
+        assert_eq!(edit(&mut s, json!({ "ntp": pool })).unwrap(), "site settings: nothing changed");
         // From automatic, the pool is not kept for the servers not named.
         edit(&mut s, json!({ "ntp": { "setting_preference": "manual", "ntp_server_2": "time.example.net" } })).unwrap();
         assert_eq!(servers(&s), ["time.example.net", "", "", ""]);

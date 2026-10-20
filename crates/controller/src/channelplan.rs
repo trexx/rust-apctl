@@ -2,7 +2,7 @@
 //! networks each AP hears, our APs' signal to each other, and measured
 //! interference. Channel AI applies its plans (see `channelai`).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use axum::extract::State;
 use inform::Mac;
@@ -194,7 +194,7 @@ struct Heard {
 /// allowed moves; any other moves only when clearly better off there, and
 /// those moves are made only when the plan is better overall by more than 10%
 /// than making just the ones that must be made.
-pub async fn compute_plan(s: &AppState, radio: String, dfs: bool, allowed: Option<Vec<i64>>, pinned: Vec<String>) -> Result<Plan, ApiError> {
+pub async fn compute_plan(s: &AppState, radio: String, dfs: bool, allowed: Option<Vec<i64>>, pinned: HashSet<Mac>) -> Result<Plan, ApiError> {
     // The channel blocks are worked out for 2.4 and 5 GHz only.
     if !matches!(radio.as_str(), "ng" | "na") {
         return Err(ApiError::bad("band must be ng or na"));
@@ -273,7 +273,7 @@ fn plan_channels(
     radio: String,
     dfs: bool,
     allowed: Option<Vec<i64>>,
-    pinned: Vec<String>,
+    pinned: HashSet<Mac>,
     aps: Vec<PlanAp>,
     own_bssids: HashMap<String, String>,
     neigh: Vec<NeighborRow>,
@@ -322,7 +322,7 @@ fn plan_channels(
             c
         })
         .collect();
-    let is_pinned: Vec<bool> = aps.iter().map(|ap| pinned.contains(&ap.mac)).collect();
+    let is_pinned: Vec<bool> = aps.iter().map(|ap| ap.mac.parse().is_ok_and(|m: Mac| pinned.contains(&m))).collect();
     // What AP `i` would put up with on block `b`, the others placed as in `placed`
     // (its own entry there is ignored), with (weight, reason) per contribution when `why`.
     let contributions = |i: usize, b: &Block, placed: &[Block], mut why: Option<&mut Vec<(f64, String)>>| -> f64 {
@@ -482,7 +482,7 @@ mod tests {
             ("b".to_string(), "bss-a".to_string(), None, None, None, Some(-50.0)),
             ("a".to_string(), "x".to_string(), Some("Next door".to_string()), Some(2412.0), Some(20.0), Some(-60.0)),
         ];
-        let plan = plan_channels("ng".into(), false, None, vec![], aps, own, neigh, vec![]);
+        let plan = plan_channels("ng".into(), false, None, HashSet::new(), aps, own, neigh, vec![]);
         assert!(plan.accepted, "{plan:?}");
         let ch: HashMap<&str, i64> = plan.plan.iter().map(|p| (p.mac.as_str(), p.suggested_channel)).collect();
         assert_ne!(ch["a"], ch["b"]);
@@ -503,7 +503,7 @@ mod tests {
         // "out" is outdoors, where 36-64 are not allowed, so it must leave 36.
         let aps = vec![ap("in", 5, Some(vec![36, 116]), false), ap("out", 1, None, true)];
         let neigh = vec![("in".to_string(), "x".to_string(), Some("Next door".to_string()), Some(5210.0), Some(80.0), Some(-40.0))];
-        let plan = plan_channels("na".into(), true, allowed, vec![], aps, HashMap::new(), neigh, vec![]);
+        let plan = plan_channels("na".into(), true, allowed, HashSet::new(), aps, HashMap::new(), neigh, vec![]);
         assert!(plan.accepted, "{plan:?}");
         let to: HashMap<&str, (i64, bool)> = plan.plan.iter().map(|p| (p.mac.as_str(), (p.suggested_channel, p.not_allowed))).collect();
         assert_eq!((to["in"], to["out"]), ((116, false), (100, true)));
@@ -526,7 +526,7 @@ mod tests {
         // which the settings no longer allow, so the plan is applied.
         let aps = vec![ng_ap("i", 1, 5), ng_ap("j", 6, 2), ng_ap("k", 13, 1)];
         let neigh = vec![ng_neighbour("i", 1, -45.0), ng_neighbour("i", 11, -45.0), ng_neighbour("j", 1, -60.0), ng_neighbour("j", 11, -50.0), ng_neighbour("k", 1, -40.0), ng_neighbour("k", 6, -40.0)];
-        let plan = plan_channels("ng".into(), false, Some(vec![1, 6, 11]), vec![], aps, HashMap::new(), neigh, vec![]);
+        let plan = plan_channels("ng".into(), false, Some(vec![1, 6, 11]), HashSet::new(), aps, HashMap::new(), neigh, vec![]);
         assert!(plan.accepted, "{plan:?}");
         let to: HashMap<&str, (i64, bool)> = plan.plan.iter().map(|p| (p.mac.as_str(), (p.suggested_channel, p.change))).collect();
         assert_eq!(to["k"], (11, true), "{plan:?}");
@@ -551,7 +551,7 @@ mod tests {
         assert_eq!(measured_load(&block("na", 149, 80), &na), 0.0, "nothing measured there");
         // So an AP on 6 alone in an even environment stays there.
         let spectrum: Vec<SpectrumRow> = (1..=13).map(|c| ("a".to_string(), c, Some(20), Some(-80.0), Some(10.0))).collect();
-        let plan = plan_channels("ng".into(), false, None, vec![], vec![ng_ap("a", 6, 3)], HashMap::new(), vec![], spectrum);
+        let plan = plan_channels("ng".into(), false, None, HashSet::new(), vec![ng_ap("a", 6, 3)], HashMap::new(), vec![], spectrum);
         assert!(!plan.accepted && !plan.plan[0].change, "{plan:?}");
     }
 
@@ -559,13 +559,13 @@ mod tests {
     fn a_channel_the_planner_would_not_pick_is_left_unless_not_allowed() {
         // Channel 13 is not among the planner's own 1, 6 and 11, nor 165 among
         // its 5 GHz blocks; nothing is better elsewhere, so neither moves.
-        let plan = plan_channels("ng".into(), false, None, vec![], vec![ng_ap("a", 13, 1)], HashMap::new(), vec![], vec![]);
+        let plan = plan_channels("ng".into(), false, None, HashSet::new(), vec![ng_ap("a", 13, 1)], HashMap::new(), vec![], vec![]);
         assert!(!plan.accepted && !plan.plan[0].change && !plan.plan[0].not_allowed, "{plan:?}");
         let ap = PlanAp { mac: "b".into(), name: None, current: block("na", 165, 20), width: 20, clients: 1, available: None, legal: crate::settings::legal_channels(Some(840), "na", 20, false) };
-        let plan = plan_channels("na".into(), false, None, vec![], vec![ap], HashMap::new(), vec![], vec![]);
+        let plan = plan_channels("na".into(), false, None, HashSet::new(), vec![ap], HashMap::new(), vec![], vec![]);
         assert!(!plan.accepted && !plan.plan[0].change, "{plan:?}");
         // Settings that leave 13 out move it.
-        let plan = plan_channels("ng".into(), false, Some(vec![1, 6, 11]), vec![], vec![ng_ap("a", 13, 1)], HashMap::new(), vec![], vec![]);
+        let plan = plan_channels("ng".into(), false, Some(vec![1, 6, 11]), HashSet::new(), vec![ng_ap("a", 13, 1)], HashMap::new(), vec![], vec![]);
         assert!(plan.accepted && plan.plan[0].change && plan.plan[0].not_allowed, "{plan:?}");
     }
 }

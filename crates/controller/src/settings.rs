@@ -485,12 +485,27 @@ pub fn is_legal(country: Option<i64>, band: &str, width: i64, outdoor: bool, ch:
     Some(channel_blocks(rules_of(country)?, band, width, outdoor)?.into_iter().any(|b| b.contains(&ch)))
 }
 
-/// A fixed channel of an AP's `radio_table` entry that the country and the
-/// AP's indoor/outdoor mode do not allow at its width: `(channel, width)`.
-pub(crate) fn illegal_fixed_channel(country: Option<i64>, radio: &Value, outdoor: bool) -> Option<(i64, i64)> {
+/// Whether an AP may be fixed on a channel at a width: by the country's rules
+/// (indoor or outdoor), or where apctl has none, when the band has the channel
+/// at that width. A band apctl has no channels for is not checked.
+pub(crate) fn fixed_channel_ok(country: Option<i64>, band: &str, width: i64, outdoor: bool, ch: i64) -> bool {
+    is_legal(country, band, width, outdoor, ch).unwrap_or_else(|| {
+        let all = band_channels(band, width);
+        all.is_empty() || all.contains(&ch)
+    })
+}
+
+/// The legal channels of a band at a width: [`legal_channels`], or where apctl
+/// has no rules, [`band_channels`].
+pub(crate) fn allowed_channels(country: Option<i64>, band: &str, width: i64, outdoor: bool) -> Vec<i64> {
+    legal_channels(country, band, width, outdoor).unwrap_or_else(|| band_channels(band, width))
+}
+
+/// A fixed channel of an AP's `radio_table` entry that [`fixed_channel_ok`] refuses at its width.
+pub(crate) fn illegal_fixed_channel(country: Option<i64>, radio: &Value, outdoor: bool) -> Option<i64> {
     let ch = num(&radio["channel"])?;
     let width = num(&radio["ht"]).unwrap_or(20);
-    (is_legal(country, radio["radio"].as_str().unwrap_or(""), width, outdoor, ch) == Some(false)).then_some((ch, width))
+    (!fixed_channel_ok(country, radio["radio"].as_str().unwrap_or(""), width, outdoor, ch)).then_some(ch)
 }
 
 /// The legal channels of [`legal_channels`], as up to three runs of a table.
@@ -543,7 +558,7 @@ fn channels(state: &Value, band: &str, o: bool) -> Value {
     let widths: &[i64] = if band == "ng" { &[20, 40] } else { &[20, 40, 80, 160] };
     let mut out = serde_json::Map::new();
     for w in widths {
-        out.insert(w.to_string(), json!(legal_channels(c, band, *w, o).unwrap_or_else(|| band_channels(band, *w))));
+        out.insert(w.to_string(), json!(allowed_channels(c, band, *w, o)));
     }
     Value::Object(out)
 }
@@ -591,6 +606,25 @@ pub(crate) fn str_field<'a>(patch: &'a Value, key: &str) -> Result<Option<&'a st
         Value::Null => Ok(None),
         Value::String(s) => Ok(Some(s)),
         _ => Err(format!("{key} must be text")),
+    }
+}
+
+/// A list of text (`key` names it in errors): `None` when absent; anything but
+/// a list, or an element that is not a string, is refused.
+pub(crate) fn str_list<'a>(v: &'a Value, key: &str) -> Result<Option<Vec<&'a str>>, String> {
+    match v {
+        Value::Null => Ok(None),
+        Value::Array(a) => a.iter().map(|x| x.as_str().ok_or_else(|| format!("{key}: {x} is not text"))).collect::<Result<_, _>>().map(Some),
+        _ => Err(format!("{key} must be a list of text")),
+    }
+}
+
+/// A list of objects (`key` names it in errors): empty when absent; anything but a list is refused.
+fn obj_list<'a>(v: &'a Value, key: &str) -> Result<&'a [Value], String> {
+    match v {
+        Value::Null => Ok(&[]),
+        Value::Array(a) => Ok(a),
+        _ => Err(format!("{key} must be a list")),
     }
 }
 
@@ -759,8 +793,8 @@ fn check_mdns_rules(state: &Value, v: &Value) -> Result<Vec<Value>, String> {
         let scope = enum_field(r, "ap_scope_mode", &["all", "specific", "group"])?.unwrap_or("all");
         let services = enum_field(r, "services_mode", &["all", "specific", "none"])?.unwrap_or("all");
         let mut rule = json!({ "ap_scope_mode": scope, "services_mode": services, "isolation_enabled": bool_field(r, "isolation_enabled")?.unwrap_or(false) });
-        let ids = |key: &str| -> Vec<&str> { r[key].as_array().into_iter().flatten().filter_map(Value::as_str).collect() };
-        let nets = ids("networkconf_ids");
+        let ids = |key: &str| -> Result<Vec<&str>, String> { Ok(str_list(&r[key], &format!("mDNS rule {n}: {key}"))?.unwrap_or_default()) };
+        let nets = ids("networkconf_ids")?;
         if let Some(bad) = nets.iter().find(|x| !networks.contains(x)) {
             return Err(format!("mDNS rule {n}: {bad} is not a network"));
         }
@@ -774,7 +808,7 @@ fn check_mdns_rules(state: &Value, v: &Value) -> Result<Vec<Value>, String> {
                 rule["ap_macs"] = json!(macs);
             }
             "group" => {
-                let g = ids("ap_group_ids");
+                let g = ids("ap_group_ids")?;
                 if g.is_empty() || g.iter().any(|x| !groups.contains(x)) {
                     return Err(format!("mDNS rule {n}: choose the AP groups it applies on"));
                 }
@@ -784,7 +818,7 @@ fn check_mdns_rules(state: &Value, v: &Value) -> Result<Vec<Value>, String> {
         }
         if services == "specific" {
             let mut codes: Vec<&str> = Vec::new();
-            for c in r["predefined_services"].as_array().into_iter().flatten() {
+            for c in obj_list(&r["predefined_services"], &format!("mDNS rule {n}: predefined_services"))? {
                 let code = c["code"].as_str().or(c.as_str()).unwrap_or("");
                 if !apcfg::MDNS_SERVICES.iter().any(|(k, _, _)| *k == code) {
                     return Err(format!("mDNS rule {n}: {code} is not a known service"));
@@ -792,7 +826,7 @@ fn check_mdns_rules(state: &Value, v: &Value) -> Result<Vec<Value>, String> {
                 codes.push(code);
             }
             dedup_in_order(&mut codes);
-            let custom_list = r["custom_services"].as_array().map_or(&[][..], Vec::as_slice);
+            let custom_list = obj_list(&r["custom_services"], &format!("mDNS rule {n}: custom_services"))?;
             // apctl's own bound (the official controller sets none), as for the rules.
             if custom_list.len() > 32 {
                 return Err(format!("mDNS rule {n}: at most 32 custom services"));
@@ -947,11 +981,18 @@ pub struct WlanEdit {
 /// field and the fields it derives on save.
 pub fn apply_wlan(state: &mut Value, e: &WlanEdit) -> Result<String, String> {
     let over = over_limits(state);
-    edit_wlan(state, e, &over)
+    let (what, channels) = edit_wlan(state, e, &over)?;
+    Ok(with_notes(what, &channels))
+}
+
+/// `what`, followed by the notes (each AP's channel moves), `; `-separated.
+fn with_notes(what: String, notes: &[String]) -> String {
+    if notes.is_empty() { what } else { format!("{what}; {}", notes.join("; ")) }
 }
 
 /// [`apply_wlan`], with the counts over their limits before the edit (see [`check_limits`]).
-fn edit_wlan(state: &mut Value, e: &WlanEdit, over: &[Over]) -> Result<String, String> {
+/// Returns what changed on the SSID and, apart, the channel moves the edit made on its APs.
+fn edit_wlan(state: &mut Value, e: &WlanEdit, over: &[Over]) -> Result<(String, Vec<String>), String> {
     let (id, p) = (e.id.as_str(), &e.patch);
     let before = find_wlan(state, id).ok_or("unknown SSID")?.clone();
     if before["attr_no_edit"].as_bool() == Some(true) {
@@ -1046,11 +1087,8 @@ fn edit_wlan(state: &mut Value, e: &WlanEdit, over: &[Over]) -> Result<String, S
     keys.retain(|k| *k != "x_passphrase" && before[*k] != after[*k]);
     changed.extend(keys);
     let name = after["name"].as_str().unwrap_or("?");
-    let mut what = if changed.is_empty() { format!("SSID \"{name}\": nothing changed") } else { format!("SSID \"{name}\": {}", changed.join(", ")) };
-    if !channels.is_empty() {
-        what = format!("{what}; {}", channels.join("; "));
-    }
-    Ok(what)
+    let what = if changed.is_empty() { format!("SSID \"{name}\": nothing changed") } else { format!("SSID \"{name}\": {}", changed.join(", ")) };
+    Ok((what, channels))
 }
 
 /// Protection, PMF and the WPA3 timers.
@@ -1192,11 +1230,10 @@ fn wlan_dns_and_mdns(state: &Value, p: &Value, w: &mut Value) -> Result<(), Stri
     // DNS Assistance: the AP caches DNS and, when the network's server is slow
     // or fails, sends queries to fallback servers (its own choice, or these).
     copy_fields(p, w, &[("dns_assistance_mode", Enum(&["off", "auto", "manual"]))])?;
-    if !p["dns_assistance_servers"].is_null() {
-        let list = p["dns_assistance_servers"].as_array().ok_or("dns_assistance_servers must be a list")?;
+    if let Some(list) = str_list(&p["dns_assistance_servers"], "dns_assistance_servers")? {
         let mut servers: Vec<String> = Vec::new();
         for v in list {
-            let ip = v.as_str().map(str::trim).filter(|s| !s.is_empty());
+            let ip = Some(v.trim()).filter(|s| !s.is_empty());
             match ip.map(|s| (s, s.parse::<std::net::Ipv4Addr>())) {
                 None => {}
                 Some((s, Ok(_))) => servers.push(s.to_string()),
@@ -1302,10 +1339,27 @@ fn wlan_links(state: &mut Value, p: &Value, w: &mut Value) -> Result<(), String>
         w["schedule_with_duration"] = json!(check_schedule(&p["schedule_with_duration"])?);
     }
     if let Some(n) = str_field(p, "networkconf_id")? {
-        if doc_by_id(state, "networkconf", n).is_none() {
-            return Err("unknown network".into());
+        let net = doc_by_id(state, "networkconf", n).ok_or("unknown network")?;
+        // A network stored already (an import's, say) stays, whatever it is.
+        if w["networkconf_id"].as_str() != Some(n) {
+            ssid_network(net)?;
         }
         w["networkconf_id"] = json!(n);
+    }
+    Ok(())
+}
+
+/// Whether an SSID may be put on a network, as the official UI offers them: a
+/// LAN one (corporate, guest or VLAN-only; one without a purpose is taken
+/// too), not a WAN or VPN one, nor the inter-VLAN routing network (VLAN 4040).
+fn ssid_network(net: &Value) -> Result<(), String> {
+    let name = net["name"].as_str().unwrap_or("?");
+    match net["purpose"].as_str().filter(|p| !p.is_empty()) {
+        None | Some("corporate" | "guest" | "vlan-only") => {}
+        Some(purpose) => return Err(format!("network \"{name}\" ({purpose}) cannot carry an SSID")),
+    }
+    if num(&net["vlan"]) == Some(4040) {
+        return Err(format!("network \"{name}\" is the inter-VLAN routing network (VLAN 4040), which cannot carry an SSID"));
     }
     Ok(())
 }
@@ -1316,11 +1370,6 @@ pub(crate) fn channel_locked_macs(state: &Value) -> Vec<inform::Mac> {
     out.sort();
     out.dedup();
     out
-}
-
-/// [`channel_locked_macs`] written `aa:bb:..`, as Channel AI's lists of APs hold them.
-pub fn channel_locked_aps(state: &Value) -> Vec<String> {
-    channel_locked_macs(state).iter().map(inform::Mac::to_string).collect()
 }
 
 /// Keeps the 2.4 GHz channel of APs in line with the SSIDs' channel locks, as
@@ -1371,7 +1420,7 @@ fn check_schedule(v: &Value) -> Result<Vec<Value>, String> {
     }
     let mut out = Vec::new();
     for e in list {
-        let days: Vec<String> = e["start_days_of_week"].as_array().into_iter().flatten().filter_map(|d| d.as_str().map(str::to_ascii_lowercase)).collect();
+        let days: Vec<String> = str_list(&e["start_days_of_week"], "start_days_of_week")?.unwrap_or_default().into_iter().map(str::to_ascii_lowercase).collect();
         if days.is_empty() || days.iter().any(|d| !DAY_NAMES.contains(&d.as_str())) {
             return Err("each blackout period needs its days (sun to sat)".into());
         }
@@ -1482,9 +1531,13 @@ pub fn create_wlan(state: &mut Value, patch: &Value) -> Result<String, String> {
         patch["protection"] = json!("wpa2");
     }
     let name = patch["name"].as_str().unwrap_or_default().trim().to_string();
+    // The network asked for is checked even when it is the one chosen by default.
+    if let Some(net) = str_field(&patch, "networkconf_id")?.and_then(|n| doc_by_id(state, "networkconf", n)) {
+        ssid_network(net)?;
+    }
     array_mut(state, "wlanconf").push(doc);
-    edit_wlan(state, &WlanEdit { id, patch }, &over)?;
-    Ok(format!("added SSID \"{name}\""))
+    let (_, channels) = edit_wlan(state, &WlanEdit { id, patch }, &over)?;
+    Ok(with_notes(format!("added SSID \"{name}\""), &channels))
 }
 
 /// Deletes an SSID and its own AP group.
@@ -1494,14 +1547,11 @@ pub fn delete_wlan(state: &mut Value, id: &str) -> Result<String, String> {
         return Err("this SSID cannot be deleted".into());
     }
     let released = if w["iot_channel_lock"].as_bool() == Some(true) { deployed_to(state, w) } else { Vec::new() };
-    let mut what = format!("deleted SSID \"{}\"", w["name"].as_str().unwrap_or("?"));
+    let what = format!("deleted SSID \"{}\"", w["name"].as_str().unwrap_or("?"));
     remove_doc(state, "wlanconf", id);
     prune_groups(state);
     let channels = apply_channel_locks(state, &released, None);
-    if !channels.is_empty() {
-        what = format!("{what}; {}", channels.join("; "));
-    }
-    Ok(what)
+    Ok(with_notes(what, &channels))
 }
 
 // ---- APs ------------------------------------------------------------------
@@ -1530,18 +1580,28 @@ pub fn apply_device(state: &mut Value, e: &DeviceEdit) -> Result<String, String>
     let o = outdoor(state, &d);
     // SSIDs locking this AP's 2.4 GHz channel for IoT devices.
     let iot_lock = channel_locked_macs(state).contains(&m);
-    for rp in p["radios"].as_array().into_iter().flatten() {
-        radio_edit(state, e, rp, &before, &mut d, o, iot_lock)?;
+    let radio_edits = obj_list(&p["radios"], "radios")?;
+    for rp in radio_edits {
+        radio_edit(e, rp, &before, &mut d, iot_lock)?;
     }
 
-    // Outdoor mode may have made a radio's fixed channel illegal.
-    if o != outdoor(state, &before) {
-        let c = country(state);
-        for r in d["radio_table"].as_array().into_iter().flatten() {
-            if let Some((ch, _)) = illegal_fixed_channel(c, r, o) {
-                let band = band_name(r["radio"].as_str().unwrap_or(""));
-                return Err(format!("{band}: channel {ch} is not allowed {} here; pick another first", if o { "outdoors" } else { "indoors" }));
-            }
+    // A fixed channel must be legal for its (possibly new) width, on the radios
+    // edited, or on all of them when outdoor mode changed.
+    let outdoor_changed = o != outdoor(state, &before);
+    let c = country(state);
+    for r in d["radio_table"].as_array().into_iter().flatten() {
+        let band = r["radio"].as_str().unwrap_or("");
+        let edited = radio_edits.iter().any(|rp| rp["radio"].as_str() == Some(band));
+        if !edited && !outdoor_changed {
+            continue;
+        }
+        if let Some(ch) = illegal_fixed_channel(c, r, o) {
+            let label = band_name(band);
+            return Err(if edited {
+                format!("{label}: channel {ch} is not allowed at {} MHz here", num(&r["ht"]).unwrap_or(20))
+            } else {
+                format!("{label}: channel {ch} is not allowed {} here; pick another first", if o { "outdoors" } else { "indoors" })
+            });
         }
     }
     let name = device_label(&d, m);
@@ -1616,8 +1676,8 @@ fn device_fields(state: &Value, e: &DeviceEdit, before: &Value, d: &mut Value) -
 }
 
 /// An edit to one of the AP's radios (`rp`, by band): width, channel, power and
-/// the rest, checked against what the radio reports and the country.
-fn radio_edit(state: &Value, e: &DeviceEdit, rp: &Value, before: &Value, d: &mut Value, o: bool, iot_lock: bool) -> Result<(), String> {
+/// the rest, checked against what the radio reports ([`apply_device`] then checks a fixed channel against the country).
+fn radio_edit(e: &DeviceEdit, rp: &Value, before: &Value, d: &mut Value, iot_lock: bool) -> Result<(), String> {
     let band = rp["radio"].as_str().ok_or("each radio needs its band (radio)")?;
     let caps = &e.caps[band];
     let label = band_name(band);
@@ -1643,14 +1703,6 @@ fn radio_edit(state: &Value, e: &DeviceEdit, rp: &Value, before: &Value, d: &mut
                 return Err(format!("{label}: {ch} is not a channel of this band"));
             }
             r["channel"] = json!(ch);
-        }
-    }
-    // A fixed channel must be legal for the (possibly new) width: by the
-    // country's rules, or where apctl has none, one the band has at that width.
-    if let Some(ch) = num(&r["channel"]) {
-        let width = num(&r["ht"]).unwrap_or(20);
-        if !is_legal(country(state), band, width, o, ch).unwrap_or_else(|| band_channels(band, width).contains(&ch)) {
-            return Err(format!("{label}: channel {ch} is not allowed at {width} MHz here"));
         }
     }
     // The official controller refuses any change here, which strands an AP
@@ -1888,6 +1940,8 @@ mod tests {
         }
         assert!(dev(&mut s, json!({ "config_network": { "type": "static", "ip": "192.168.1.20", "netmask": "255.255.255.0", "gateway": "192.168.1.1", "dns1": "192.168.1.1", "dns2": 9 } })).unwrap_err().contains("dns2"));
         assert_eq!(s["wlanconf"][0]["x_passphrase"], "correct horse");
+        assert_eq!(edit(&mut s, json!({ "dns_assistance_servers": [5] })).unwrap_err(), "dns_assistance_servers: 5 is not text");
+        assert_eq!(edit(&mut s, json!({ "dns_assistance_servers": "1.1.1.1" })).unwrap_err(), "dns_assistance_servers must be a list of text");
     }
 
     #[test]
@@ -1965,6 +2019,9 @@ mod tests {
         assert_eq!(s["wlanconf"][0]["iot_channel_lock"], false);
         assert_eq!(s["devices"][0]["radio_table"][0]["channel"], "auto");
         assert!(edit(&mut s, json!({ "iot_dtim_lock": true })).is_err());
+        // A new SSID with the lock reports its APs' moves too.
+        let what = create_wlan(&mut s, &json!({ "name": "IoT", "passphrase": "password1", "iot_channel_lock": true })).unwrap();
+        assert!(what.starts_with("added SSID \"IoT\"; ") && what.contains("Hall: 2.4 GHz channel 6"), "{what}");
     }
 
     #[test]
@@ -1999,6 +2056,9 @@ mod tests {
         assert!(bad(json!({ "ap_scope_mode": "specific", "ap_macs": ["02:00:00:00:00:99"] })), "unknown AP");
         let many: Vec<Value> = (0..33).map(|i| json!({ "address": format!("_app{i}._tcp.local") })).collect();
         assert!(bad(json!({ "services_mode": "specific", "custom_services": many })), "33 custom services");
+        // Lists of anything else are refused, not read as empty.
+        assert!(bad(json!({ "networkconf_ids": [5] })) && bad(json!({ "networkconf_ids": "n1" })));
+        assert!(bad(json!({ "services_mode": "specific", "predefined_services": [{ "code": "apple_airPlay" }], "custom_services": { "address": "_myapp._tcp.local" } })));
         edit(&mut s, json!({ "mdns_proxy_mode": "auto" })).unwrap();
     }
 
@@ -2066,6 +2126,25 @@ mod tests {
             create_wlan(&mut s, &json!({ "name": format!("N{i}"), "passphrase": "password1" })).unwrap();
         }
         assert!(create_wlan(&mut s, &json!({ "name": "N4", "passphrase": "password1" })).unwrap_err().contains("supports 4"));
+    }
+
+    #[test]
+    fn ssids_go_only_on_networks_the_official_ui_offers() {
+        let mut s = state();
+        s["networkconf"].as_array_mut().unwrap().extend([
+            json!({ "_id": "wan", "name": "Internet", "purpose": "wan", "site_id": "s1" }),
+            json!({ "_id": "ivr", "name": "Routing", "purpose": "corporate", "vlan": "4040", "site_id": "s1" }),
+            json!({ "_id": "iot", "name": "IoT", "purpose": "vlan-only", "vlan": 30, "site_id": "s1" }),
+        ]);
+        assert_eq!(edit(&mut s, json!({ "networkconf_id": "wan" })).unwrap_err(), "network \"Internet\" (wan) cannot carry an SSID");
+        assert!(edit(&mut s, json!({ "networkconf_id": "ivr" })).unwrap_err().contains("VLAN 4040"));
+        assert!(create_wlan(&mut s.clone(), &json!({ "name": "Up", "passphrase": "password1", "networkconf_id": "wan" })).unwrap_err().contains("cannot carry"));
+        edit(&mut s, json!({ "networkconf_id": "iot" })).unwrap();
+        create_wlan(&mut s, &json!({ "name": "Things", "passphrase": "password1", "networkconf_id": "iot" })).unwrap();
+        // One stored already (an import's) is left alone: the SSID's other fields can be edited, and the network sent back as it is.
+        s["wlanconf"][0]["networkconf_id"] = json!("wan");
+        edit(&mut s, json!({ "hide_ssid": true, "networkconf_id": "wan" })).unwrap();
+        assert_eq!((s["wlanconf"][0]["hide_ssid"].as_bool(), s["wlanconf"][0]["networkconf_id"].as_str()), (Some(true), Some("wan")));
     }
 
     #[test]
@@ -2147,7 +2226,7 @@ mod tests {
                 assert_eq!(is_legal(c, band, width, o, ch), list.as_ref().map(|l| l.contains(&ch)), "{c:?} {band} {width} {o} {ch}");
             }
         }
-        assert_eq!(illegal_fixed_channel(Some(276), &json!({ "radio": "na", "ht": "40", "channel": "140" }), false), Some((140, 40)));
+        assert_eq!(illegal_fixed_channel(Some(276), &json!({ "radio": "na", "ht": "40", "channel": "140" }), false), Some(140));
         assert_eq!(illegal_fixed_channel(Some(276), &json!({ "radio": "na", "ht": 20, "channel": 140 }), false), None);
         assert_eq!(illegal_fixed_channel(Some(276), &json!({ "radio": "na", "channel": "auto" }), true), None);
     }
@@ -2245,6 +2324,7 @@ mod tests {
         wide["devices"][0]["radio_table"][2]["ht"] = json!("160");
         assert!(dev(&mut wide, json!({ "radios": [{ "radio": "6e", "channel": 233 }] })).unwrap_err().contains("not allowed at 160 MHz"));
         assert!(dev(&mut s.clone(), json!({ "radios": [{ "radio": "na", "channel": 165, "ht": 80 }] })).unwrap_err().contains("not allowed at 80 MHz"));
+        assert!(dev(&mut s.clone(), json!({ "radios": { "radio": "na", "channel": 36 } })).unwrap_err().contains("radios must be a list"));
         // A width change that the kept channel does not fit is refused too.
         s["devices"][0]["radio_table"][2]["channel"] = json!(233);
         s["devices"][0]["radio_table"][2]["ht"] = json!(20);
@@ -2628,6 +2708,7 @@ mod speed_and_schedule_tests {
             json!([{ "start_days_of_week": ["mon"], "start_hour": 24, "duration_minutes": 10 }]),
             json!([{ "start_days_of_week": ["mon"], "start_hour": 1, "duration_minutes": 0 }]),
             json!([{ "start_days_of_week": ["funday"], "start_hour": 1, "duration_minutes": 10 }]),
+            json!([{ "start_days_of_week": ["mon", 1], "start_hour": 1, "duration_minutes": 10 }]),
         ] {
             assert!(apply_wlan(&mut s, &WlanEdit { id: "w1".into(), patch: json!({ "schedule_with_duration": bad }) }).is_err(), "{bad}");
         }
