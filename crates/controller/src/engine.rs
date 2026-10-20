@@ -210,7 +210,7 @@ macro_rules! counters {
     };
 }
 
-counters!(informs, notifications, log_errors, replies, config_pushes, decode_errors, logs, events);
+counters!(informs, notifications, log_errors, replies, config_pushes, decode_errors, logs, events, syslog_dropped);
 
 fn bump(counter: &AtomicU64) {
     counter.fetch_add(1, Ordering::Relaxed);
