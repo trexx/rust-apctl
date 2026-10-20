@@ -1,13 +1,14 @@
 //! Pairs captured HTTP requests and responses into inform exchanges.
 
 use std::collections::{HashMap, VecDeque};
-use std::net::{IpAddr, SocketAddr};
+use std::net::IpAddr;
 
 use anyhow::Result;
 use inform::{Mac, Packet};
 
 use crate::capture::{ConnId, HttpEvent, MAX_CONNS, Micros, Sweeper};
 use crate::decode::{Decoded, decode_packet};
+use crate::hop_ip;
 use crate::keys::KeyStore;
 
 #[derive(Debug)]
@@ -140,15 +141,9 @@ fn split(body: &[u8]) -> (inform::Result<Packet<'_>>, Option<Mac>) {
 
 /// The client's address from an X-Forwarded-For header: its last entry, the hop the
 /// proxy in front of the controller added (entries further left are the client's to
-/// write), if that is an address. A hop may carry a port (`203.0.113.7:4711`,
-/// `[2001:db8::1]:4711`) or brackets alone (`[2001:db8::1]`).
+/// write), if that is an address ([`hop_ip`]).
 fn forwarded_ip(header: &str) -> Option<IpAddr> {
-    let hop = header.rsplit(',').next()?.trim();
-    hop.parse::<IpAddr>()
-        .ok()
-        .or_else(|| hop.parse::<SocketAddr>().ok().map(|a| a.ip()))
-        .or_else(|| hop.strip_prefix('[')?.strip_suffix(']')?.parse().ok())
-        .map(|ip| ip.to_canonical())
+    hop_ip(header.rsplit(',').next()?.trim()).map(|ip| ip.to_canonical())
 }
 
 #[cfg(test)]

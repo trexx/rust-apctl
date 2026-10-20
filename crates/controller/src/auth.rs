@@ -372,7 +372,7 @@ impl Proxies {
 
 /// The address of an X-Forwarded-For hop, with or without a port.
 fn hop_ip(hop: &str) -> Option<IpAddr> {
-    hop.parse::<IpAddr>().ok().or_else(|| hop.parse::<SocketAddr>().ok().map(|a| a.ip())).or_else(|| hop.strip_prefix('[')?.strip_suffix(']')?.parse().ok())
+    wire::hop_ip(hop)
 }
 
 /// Whether an Origin (`https://apctl.example:8443`) names this host (`apctl.example:8443`),
