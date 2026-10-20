@@ -3,7 +3,7 @@ import { useCanEdit, useUserGroups } from "../../api";
 import { speed } from "../../format";
 import { QueryNote } from "../common";
 import type { UserGroup } from "../../api";
-import { Row, TextInput } from "./form";
+import { Row, TextInput, useSettingsForm } from "./form";
 import type { Fields } from "./form";
 import { EditorShell } from "./Review";
 import { ListPanel } from "./ListPanel";
@@ -25,31 +25,25 @@ function SpeedLimitEditor({
   onClose: () => void;
   active: boolean;
 }) {
-  const [name, setName] = useState(group?.name ?? "");
-  const [down, setDown] = useState(mbpsField(group?.qos_rate_max_down));
-  const [up, setUp] = useState(mbpsField(group?.qos_rate_max_up));
+  // Compared with what the editor opened with, not with the group as it is
+  // refetched: someone else's edit meanwhile is neither a change here nor undone.
+  const { original, form, set } = useSettingsForm(() => ({
+    name: group?.name ?? "",
+    down: mbpsField(group?.qos_rate_max_down),
+    up: mbpsField(group?.qos_rate_max_up),
+  }));
   // A number the browser can't read reaches onChange as "", which would mean
   // no limit; such a field holds the review back instead.
   const [unreadable, setUnreadable] = useState({ down: false, up: false });
-  // The whole limit is sent, not a difference (the default group, which has
-  // no name, isn't editable); an unchanged group sends nothing, so Review
-  // says there is nothing to review.
-  const patch: Fields = {
-    name,
-    qos_rate_max_down: kbps(down),
-    qos_rate_max_up: kbps(up),
-  };
-  const unchanged =
-    group !== null &&
-    name === group.name &&
-    kbps(down) === kbps(mbpsField(group.qos_rate_max_down)) &&
-    kbps(up) === kbps(mbpsField(group.qos_rate_max_up));
-  const rate = (
-    k: "down" | "up",
-    label: string,
-    value: string,
-    set: (v: string) => void,
-  ) => (
+  // Only what was changed is sent (a new group starts with no limits); an
+  // unchanged group sends nothing, so Review says there is nothing to review.
+  const patch: Fields = {};
+  if (form.name !== original.name) patch.name = form.name;
+  if (kbps(form.down) !== kbps(original.down))
+    patch.qos_rate_max_down = kbps(form.down);
+  if (kbps(form.up) !== kbps(original.up))
+    patch.qos_rate_max_up = kbps(form.up);
+  const rate = (k: "down" | "up", label: string) => (
     <Row label={label} hint="Mbps per client; empty for no limit">
       <TextInput
         className="search num-input"
@@ -57,8 +51,8 @@ function SpeedLimitEditor({
         min={0.002}
         max={100}
         step="any"
-        value={value}
-        onChange={set}
+        value={form[k]}
+        onChange={(v) => set(k, v)}
         onInput={(e) => {
           const bad = e.currentTarget.validity.badInput;
           setUnreadable((u) => ({ ...u, [k]: bad }));
@@ -70,15 +64,19 @@ function SpeedLimitEditor({
     <EditorShell
       target={{ kind: "usergroup", id: group?.id ?? null }}
       active={active}
-      patch={unchanged ? {} : patch}
-      invalid={!name.trim() || unreadable.down || unreadable.up}
+      patch={patch}
+      invalid={!form.name.trim() || unreadable.down || unreadable.up}
       onClose={onClose}
     >
       <Row label="Name">
-        <TextInput maxLength={128} value={name} onChange={setName} />
+        <TextInput
+          maxLength={128}
+          value={form.name}
+          onChange={(v) => set("name", v)}
+        />
       </Row>
-      {rate("down", "Download", down, setDown)}
-      {rate("up", "Upload", up, setUp)}
+      {rate("down", "Download")}
+      {rate("up", "Upload")}
     </EditorShell>
   );
 }
