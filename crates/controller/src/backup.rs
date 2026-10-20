@@ -377,8 +377,8 @@ fn snapshot(src: &Path, dst: &Path) -> Result<()> {
 }
 
 /// Drops history older than the cutoff from snapshot copies. Clients that
-/// have a name (alias) are kept whatever their age, as are settings, keys,
-/// device configs and acknowledgements; login sessions never travel.
+/// have a name (alias) are kept whatever their age, as are open alerts,
+/// settings, keys, device configs and acknowledgements; login sessions never travel.
 fn trim(dir: &Path, cutoff: Option<Ts>) -> Result<()> {
     if dir.join("config.db").exists() {
         trim_config(dir, cutoff)?;
@@ -401,9 +401,12 @@ fn trim_config(dir: &Path, cutoff: Option<Ts>) -> Result<()> {
     let tx = c.transaction()?;
     tx.execute_batch("DELETE FROM sessions;")?;
     if let Some(t) = cutoff {
-        for (table, col) in [("events", "ts"), ("connections", "ts"), ("alerts", "ts"), ("neighbors", "last_seen"), ("spectrum", "ts"), ("dryrun_results", "ts")] {
+        for (table, col) in [("events", "ts"), ("connections", "ts"), ("neighbors", "last_seen"), ("spectrum", "ts"), ("dryrun_results", "ts")] {
             tx.execute(&format!("DELETE FROM {table} WHERE {col} < ?1"), [t])?;
         }
+        // As retention does: an alert still open travels, so a restore neither
+        // raises it again nor loses when it started.
+        tx.execute("DELETE FROM alerts WHERE ts < ?1 AND resolved_ts < ?1", [t])?;
         tx.execute(store::FORGET_OLD_CLIENTS, [t])?;
     }
     tx.commit()?;
@@ -1342,7 +1345,10 @@ mod tests {
             "INSERT INTO events (ts, kind, data) VALUES ({old}, 'old', '{{}}'), ({now}, 'new', '{{}}');
              INSERT INTO clients (mac, hostname, last_seen) VALUES ('aa:aa:aa:aa:aa:01', 'gone', {old}), ('aa:aa:aa:aa:aa:02', 'named', {old}), ('aa:aa:aa:aa:aa:03', 'recent', {now});
              INSERT INTO client_aliases (mac, alias, updated) VALUES ('aa:aa:aa:aa:aa:02', 'Printer', {now});
-             INSERT INTO sessions (token_hash, username, created, expires) VALUES ('5e55107-hash-of-a-token', 'u', {now}, {now});",
+             INSERT INTO sessions (token_hash, username, created, expires) VALUES ('5e55107-hash-of-a-token', 'u', {now}, {now});
+             INSERT INTO alerts (id, ts, key, category, severity, entity, title, message, tag, resolved_ts) VALUES
+                 ('open', {old}, 'k1', 'c', 'warning', 'e', 't', 'm', 'g', NULL), ('closed', {old}, 'k2', 'c', 'warning', 'e', 't', 'm', 'g', {old}),
+                 ('recent', {now}, 'k3', 'c', 'warning', 'e', 't', 'm', 'g', {now});",
             old = now - 40 * 86400
         ))
         .unwrap();
@@ -1353,6 +1359,11 @@ mod tests {
 
     fn count(path: &Path, sql: &str) -> i64 {
         Connection::open(path).unwrap().query_row(sql, [], |r| r.get(0)).unwrap()
+    }
+
+    /// The ids in a table, in order and comma-separated.
+    fn ids(path: &Path, table: &str) -> String {
+        Connection::open(path).unwrap().query_row(&format!("SELECT group_concat(id, ',') FROM (SELECT id FROM {table} ORDER BY id)"), [], |r| r.get(0)).unwrap()
     }
 
     #[test]
@@ -1372,6 +1383,7 @@ mod tests {
         assert_eq!(count(&cfg, "SELECT COUNT(*) FROM clients"), 2, "named and recent clients kept");
         assert_eq!(count(&cfg, "SELECT COUNT(*) FROM clients WHERE hostname = 'named'"), 1);
         assert_eq!(count(&cfg, "SELECT COUNT(*) FROM sessions"), 0, "login sessions never travel");
+        assert_eq!(ids(&cfg, "alerts"), "open,recent", "open alerts travel whatever their age");
         assert_eq!(count(&out.join("metrics.db"), "SELECT COUNT(*) FROM ap_stats"), 1);
         // The wrong key, or none, is refused.
         assert!(unpack(&b.dir().join(&m.name), Some(&[8u8; 32]), &dir("rt-wrong")).is_err());
@@ -1439,6 +1451,7 @@ mod tests {
         assert_eq!(man.files.keys().cloned().collect::<Vec<_>>(), vec!["config.db"]);
         assert_eq!(count(&out.join("config.db"), "SELECT COUNT(*) FROM events"), 0);
         assert_eq!(count(&out.join("config.db"), "SELECT COUNT(*) FROM client_aliases"), 1);
+        assert_eq!(ids(&out.join("config.db"), "alerts"), "open", "open alerts travel, resolved ones do not");
     }
 
     /// Seals `data` as apctl did before chunks were sealed in place: a new
