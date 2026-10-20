@@ -960,7 +960,7 @@ fn edit_wlan(state: &mut Value, e: &WlanEdit, over: &[Over]) -> Result<String, S
     let mut w = before.clone();
     let mut changed: Vec<&str> = Vec::new();
 
-    if let Some(name) = p["name"].as_str().map(str::trim) {
+    if let Some(name) = str_field(p, "name")?.map(str::trim) {
         if name.is_empty() || name.len() > 32 {
             return Err("the network name (SSID) must be 1 to 32 bytes".into());
         }
@@ -1099,7 +1099,7 @@ fn wlan_security(p: &Value, w: &mut Value) -> Result<(), String> {
 /// once Force Wi-Fi 4 has had its say).
 fn wlan_password(p: &Value, before: &Value, w: &mut Value, changed: &mut Vec<&str>) -> Result<(), String> {
     let (psk, wpa3, transition) = psk_wpa3(w);
-    let given = p["passphrase"].as_str();
+    let given = str_field(p, "passphrase")?;
     if psk && given.is_none() && w["x_passphrase"].as_str().is_none_or(str::is_empty) {
         return Err("a password is needed for WPA2/WPA3".into());
     }
@@ -1290,7 +1290,7 @@ fn wlan_power_saving(p: &Value, w: &mut Value) -> Result<(), String> {
 /// What the SSID points at: its speed limit, blackout schedule and network.
 fn wlan_links(state: &mut Value, p: &Value, w: &mut Value) -> Result<(), String> {
     // Speed limit: a user group; empty means the default group (no limit).
-    if let Some(g) = p["usergroup_id"].as_str() {
+    if let Some(g) = str_field(p, "usergroup_id")? {
         let id = if g.is_empty() { ensure_default_usergroup(state) } else { g.to_string() };
         if doc_by_id(state, "usergroup", &id).is_none() {
             return Err("unknown speed limit".into());
@@ -1301,7 +1301,7 @@ fn wlan_links(state: &mut Value, p: &Value, w: &mut Value) -> Result<(), String>
     if !p["schedule_with_duration"].is_null() {
         w["schedule_with_duration"] = json!(check_schedule(&p["schedule_with_duration"])?);
     }
-    if let Some(n) = p["networkconf_id"].as_str() {
+    if let Some(n) = str_field(p, "networkconf_id")? {
         if doc_by_id(state, "networkconf", n).is_none() {
             return Err("unknown network".into());
         }
@@ -1567,7 +1567,7 @@ pub fn apply_device(state: &mut Value, e: &DeviceEdit) -> Result<String, String>
 /// The AP-wide fields: name, LED, modes, SNMP, antenna and its own address.
 fn device_fields(state: &Value, e: &DeviceEdit, before: &Value, d: &mut Value) -> Result<(), String> {
     let p = &e.patch;
-    if let Some(name) = p["name"].as_str() {
+    if let Some(name) = str_field(p, "name")? {
         let name = name.trim();
         if name.chars().count() > 128 {
             return Err("the name can be at most 128 characters".into());
@@ -1575,7 +1575,7 @@ fn device_fields(state: &Value, e: &DeviceEdit, before: &Value, d: &mut Value) -
         d["name"] = json!(name);
     }
     copy_fields(p, d, &[("led_override", Enum(&["default", "on", "off"])), ("led_override_color_brightness", Int(0, 100))])?;
-    if let Some(c) = p["led_override_color"].as_str() {
+    if let Some(c) = str_field(p, "led_override_color")? {
         d["led_override_color"] = json!(led_color(c)?);
     }
     copy_fields(
@@ -1587,7 +1587,7 @@ fn device_fields(state: &Value, e: &DeviceEdit, before: &Value, d: &mut Value) -
         ],
     )?;
     for key in ["snmp_location", "snmp_contact"] {
-        if let Some(v) = p[key].as_str().map(str::trim) {
+        if let Some(v) = str_field(p, key)?.map(str::trim) {
             if v.chars().count() > 255 {
                 return Err(format!("{} can be at most 255 characters", key.replace('_', " ")));
             }
@@ -1688,7 +1688,7 @@ fn radio_edit(state: &Value, e: &DeviceEdit, rp: &Value, before: &Value, d: &mut
 fn check_config_network(p: &Value, before: &Value) -> Result<Value, String> {
     use std::net::Ipv4Addr;
     let ip = |key: &str| -> Result<Option<Ipv4Addr>, String> {
-        match p[key].as_str().map(str::trim).filter(|s| !s.is_empty()) {
+        match str_field(p, key)?.map(str::trim).filter(|s| !s.is_empty()) {
             None => Ok(None),
             Some(s) => s.parse().map(Some).map_err(|_| format!("{key}: {s} is not an IPv4 address")),
         }
@@ -1726,7 +1726,7 @@ fn check_config_network(p: &Value, before: &Value) -> Result<Value, String> {
     if let Some(d) = ip("dns2")? {
         out["dns2"] = json!(d.to_string());
     }
-    if let Some(suffix) = p["dnssuffix"].as_str().map(str::trim).filter(|s| !s.is_empty()) {
+    if let Some(suffix) = str_field(p, "dnssuffix")?.map(str::trim).filter(|s| !s.is_empty()) {
         if !crate::site::is_domain_name(suffix) {
             return Err(format!("{suffix} is not a domain name"));
         }
@@ -1875,6 +1875,19 @@ mod tests {
         edit(&mut s, json!({ "dns_assistance_mode": "auto" })).unwrap();
         assert_eq!(s["wlanconf"][0]["dns_assistance_servers"][1], "9.9.9.9");
         assert!(edit(&mut s, json!({ "dns_assistance_mode": "fallback" })).is_err());
+    }
+
+    #[test]
+    fn text_fields_refuse_anything_but_text() {
+        let mut s = state();
+        for (k, v) in [("passphrase", json!(12345678)), ("name", json!(5)), ("usergroup_id", json!(3)), ("networkconf_id", json!(false))] {
+            assert_eq!(edit(&mut s, json!({ k: v })).unwrap_err(), format!("{k} must be text"));
+        }
+        for (k, v) in [("name", json!(5)), ("led_override_color", json!(255)), ("snmp_location", json!(["x"]))] {
+            assert_eq!(dev(&mut s, json!({ k: v })).unwrap_err(), format!("{k} must be text"));
+        }
+        assert!(dev(&mut s, json!({ "config_network": { "type": "static", "ip": "192.168.1.20", "netmask": "255.255.255.0", "gateway": "192.168.1.1", "dns1": "192.168.1.1", "dns2": 9 } })).unwrap_err().contains("dns2"));
+        assert_eq!(s["wlanconf"][0]["x_passphrase"], "correct horse");
     }
 
     #[test]
@@ -2438,7 +2451,7 @@ pub fn apply_usergroup(state: &mut Value, e: &GroupEdit) -> Result<String, Strin
         return Ok(what);
     }
     let p = &e.patch;
-    let name = p["name"].as_str().map(str::trim);
+    let name = str_field(p, "name")?.map(str::trim);
     if name.is_some_and(|n| n.is_empty() || n.chars().count() > 128) {
         return Err("the name must be 1 to 128 characters".into());
     }
