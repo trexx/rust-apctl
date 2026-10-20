@@ -25,7 +25,7 @@ use crate::clock;
 use crate::engine::{Event, EventKind, Live};
 use crate::model::Ts;
 use crate::adopt::{device_doc, device_doc_mut};
-use crate::settings::{band_channels, country, dedup_in_order, device_macs, inform_radio, is_legal, legal_channels, mac_list_value, num, setting, setting_mut, uplink};
+use crate::settings::{allowed_channels, band_channels, country, dedup_in_order, device_macs, fixed_channel_ok, inform_radio, legal_channels, mac_list_value, num, setting, setting_mut, uplink};
 
 /// A band Channel AI handles, and how its quick scan is asked for.
 pub struct Band {
@@ -229,7 +229,7 @@ pub fn set_channels(state: &mut Value, band: &str, changes: &[(String, i64)], he
         let d = device_doc_mut(state, &m).expect("found above");
         let r = crate::settings::inform_radio_mut(d, band).ok_or_else(|| format!("{mac} has no {band} radio"))?;
         let width = num(&r["ht"]).unwrap_or(20);
-        if is_legal(c, band, width, outdoor, *ch) == Some(false) {
+        if !fixed_channel_ok(c, band, width, outdoor, *ch) {
             return Err(format!("channel {ch} is not allowed at {width} MHz here"));
         }
         if allowed_here.as_ref().is_some_and(|a| !a.contains(ch)) {
@@ -546,7 +546,7 @@ pub fn apply_settings(state: &mut Value, p: &Value) -> Result<String, String> {
     };
     let dfs = na_dfs(r);
     for band in BANDS.iter().map(|b| b.radio) {
-        let chans: Vec<String> = legal_channels(c, band, 20, false).unwrap_or_else(|| band_channels(band, 20)).into_iter().filter(|ch| !blacklisted(band, *ch) && (dfs || !is_dfs(*ch))).map(|ch| ch.to_string()).collect();
+        let chans: Vec<String> = allowed_channels(c, band, 20, false).into_iter().filter(|ch| !blacklisted(band, *ch) && (dfs || !is_dfs(*ch))).map(|ch| ch.to_string()).collect();
         r[format!("channels_{band}")] = json!(chans);
     }
     let changed: Vec<&str> = ["enabled", "cron_expr", "radios", "radios_configuration", "exclude_devices", "channels_ng", "channels_na"].into_iter().filter(|k| before[*k] != r[*k]).collect();

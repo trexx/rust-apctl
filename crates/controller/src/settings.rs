@@ -485,12 +485,27 @@ pub fn is_legal(country: Option<i64>, band: &str, width: i64, outdoor: bool, ch:
     Some(channel_blocks(rules_of(country)?, band, width, outdoor)?.into_iter().any(|b| b.contains(&ch)))
 }
 
-/// A fixed channel of an AP's `radio_table` entry that the country and the
-/// AP's indoor/outdoor mode do not allow at its width: `(channel, width)`.
-pub(crate) fn illegal_fixed_channel(country: Option<i64>, radio: &Value, outdoor: bool) -> Option<(i64, i64)> {
+/// Whether an AP may be fixed on a channel at a width: by the country's rules
+/// (indoor or outdoor), or where apctl has none, when the band has the channel
+/// at that width. A band apctl has no channels for is not checked.
+pub(crate) fn fixed_channel_ok(country: Option<i64>, band: &str, width: i64, outdoor: bool, ch: i64) -> bool {
+    is_legal(country, band, width, outdoor, ch).unwrap_or_else(|| {
+        let all = band_channels(band, width);
+        all.is_empty() || all.contains(&ch)
+    })
+}
+
+/// The legal channels of a band at a width: [`legal_channels`], or where apctl
+/// has no rules, [`band_channels`].
+pub(crate) fn allowed_channels(country: Option<i64>, band: &str, width: i64, outdoor: bool) -> Vec<i64> {
+    legal_channels(country, band, width, outdoor).unwrap_or_else(|| band_channels(band, width))
+}
+
+/// A fixed channel of an AP's `radio_table` entry that [`fixed_channel_ok`] refuses at its width.
+pub(crate) fn illegal_fixed_channel(country: Option<i64>, radio: &Value, outdoor: bool) -> Option<i64> {
     let ch = num(&radio["channel"])?;
     let width = num(&radio["ht"]).unwrap_or(20);
-    (is_legal(country, radio["radio"].as_str().unwrap_or(""), width, outdoor, ch) == Some(false)).then_some((ch, width))
+    (!fixed_channel_ok(country, radio["radio"].as_str().unwrap_or(""), width, outdoor, ch)).then_some(ch)
 }
 
 /// The legal channels of [`legal_channels`], as up to three runs of a table.
@@ -543,7 +558,7 @@ fn channels(state: &Value, band: &str, o: bool) -> Value {
     let widths: &[i64] = if band == "ng" { &[20, 40] } else { &[20, 40, 80, 160] };
     let mut out = serde_json::Map::new();
     for w in widths {
-        out.insert(w.to_string(), json!(legal_channels(c, band, *w, o).unwrap_or_else(|| band_channels(band, *w))));
+        out.insert(w.to_string(), json!(allowed_channels(c, band, *w, o)));
     }
     Value::Object(out)
 }
@@ -1531,18 +1546,32 @@ pub fn apply_device(state: &mut Value, e: &DeviceEdit) -> Result<String, String>
     let o = outdoor(state, &d);
     // SSIDs locking this AP's 2.4 GHz channel for IoT devices.
     let iot_lock = channel_locked_macs(state).contains(&m);
-    for rp in p["radios"].as_array().into_iter().flatten() {
-        radio_edit(state, e, rp, &before, &mut d, o, iot_lock)?;
+    let radio_edits = match &p["radios"] {
+        Value::Null => &[][..],
+        Value::Array(a) => a.as_slice(),
+        _ => return Err("radios must be a list".into()),
+    };
+    for rp in radio_edits {
+        radio_edit(e, rp, &before, &mut d, iot_lock)?;
     }
 
-    // Outdoor mode may have made a radio's fixed channel illegal.
-    if o != outdoor(state, &before) {
-        let c = country(state);
-        for r in d["radio_table"].as_array().into_iter().flatten() {
-            if let Some((ch, _)) = illegal_fixed_channel(c, r, o) {
-                let band = band_name(r["radio"].as_str().unwrap_or(""));
-                return Err(format!("{band}: channel {ch} is not allowed {} here; pick another first", if o { "outdoors" } else { "indoors" }));
-            }
+    // A fixed channel must be legal for its (possibly new) width, on the radios
+    // edited, or on all of them when outdoor mode changed.
+    let outdoor_changed = o != outdoor(state, &before);
+    let c = country(state);
+    for r in d["radio_table"].as_array().into_iter().flatten() {
+        let band = r["radio"].as_str().unwrap_or("");
+        let edited = radio_edits.iter().any(|rp| rp["radio"].as_str() == Some(band));
+        if !edited && !outdoor_changed {
+            continue;
+        }
+        if let Some(ch) = illegal_fixed_channel(c, r, o) {
+            let label = band_name(band);
+            return Err(if edited {
+                format!("{label}: channel {ch} is not allowed at {} MHz here", num(&r["ht"]).unwrap_or(20))
+            } else {
+                format!("{label}: channel {ch} is not allowed {} here; pick another first", if o { "outdoors" } else { "indoors" })
+            });
         }
     }
     let name = device_label(&d, m);
@@ -1617,8 +1646,8 @@ fn device_fields(state: &Value, e: &DeviceEdit, before: &Value, d: &mut Value) -
 }
 
 /// An edit to one of the AP's radios (`rp`, by band): width, channel, power and
-/// the rest, checked against what the radio reports and the country.
-fn radio_edit(state: &Value, e: &DeviceEdit, rp: &Value, before: &Value, d: &mut Value, o: bool, iot_lock: bool) -> Result<(), String> {
+/// the rest, checked against what the radio reports ([`apply_device`] then checks a fixed channel against the country).
+fn radio_edit(e: &DeviceEdit, rp: &Value, before: &Value, d: &mut Value, iot_lock: bool) -> Result<(), String> {
     let band = rp["radio"].as_str().ok_or("each radio needs its band (radio)")?;
     let caps = &e.caps[band];
     let label = band_name(band);
@@ -1644,14 +1673,6 @@ fn radio_edit(state: &Value, e: &DeviceEdit, rp: &Value, before: &Value, d: &mut
                 return Err(format!("{label}: {ch} is not a channel of this band"));
             }
             r["channel"] = json!(ch);
-        }
-    }
-    // A fixed channel must be legal for the (possibly new) width: by the
-    // country's rules, or where apctl has none, one the band has at that width.
-    if let Some(ch) = num(&r["channel"]) {
-        let width = num(&r["ht"]).unwrap_or(20);
-        if !is_legal(country(state), band, width, o, ch).unwrap_or_else(|| band_channels(band, width).contains(&ch)) {
-            return Err(format!("{label}: channel {ch} is not allowed at {width} MHz here"));
         }
     }
     // The official controller refuses any change here, which strands an AP
@@ -2151,7 +2172,7 @@ mod tests {
                 assert_eq!(is_legal(c, band, width, o, ch), list.as_ref().map(|l| l.contains(&ch)), "{c:?} {band} {width} {o} {ch}");
             }
         }
-        assert_eq!(illegal_fixed_channel(Some(276), &json!({ "radio": "na", "ht": "40", "channel": "140" }), false), Some((140, 40)));
+        assert_eq!(illegal_fixed_channel(Some(276), &json!({ "radio": "na", "ht": "40", "channel": "140" }), false), Some(140));
         assert_eq!(illegal_fixed_channel(Some(276), &json!({ "radio": "na", "ht": 20, "channel": 140 }), false), None);
         assert_eq!(illegal_fixed_channel(Some(276), &json!({ "radio": "na", "channel": "auto" }), true), None);
     }
@@ -2249,6 +2270,7 @@ mod tests {
         wide["devices"][0]["radio_table"][2]["ht"] = json!("160");
         assert!(dev(&mut wide, json!({ "radios": [{ "radio": "6e", "channel": 233 }] })).unwrap_err().contains("not allowed at 160 MHz"));
         assert!(dev(&mut s.clone(), json!({ "radios": [{ "radio": "na", "channel": 165, "ht": 80 }] })).unwrap_err().contains("not allowed at 80 MHz"));
+        assert!(dev(&mut s.clone(), json!({ "radios": { "radio": "na", "channel": 36 } })).unwrap_err().contains("radios must be a list"));
         // A width change that the kept channel does not fit is refused too.
         s["devices"][0]["radio_table"][2]["channel"] = json!(233);
         s["devices"][0]["radio_table"][2]["ht"] = json!(20);

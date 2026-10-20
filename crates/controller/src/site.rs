@@ -41,7 +41,7 @@ fn reset_illegal_channels(state: &mut Value) -> Vec<String> {
         let o = outdoor_with(d, site_outdoor);
         let name = record_label(d, "?");
         for r in d["radio_table"].as_array_mut().into_iter().flatten() {
-            if let Some((ch, _)) = illegal_fixed_channel(c, r, o) {
+            if let Some(ch) = illegal_fixed_channel(c, r, o) {
                 out.push(format!("AP {name} {} channel {ch} → auto", band_name(r["radio"].as_str().unwrap_or(""))));
                 r["channel"] = json!("auto");
             }
