@@ -667,7 +667,8 @@ const EVENTS: { [K in EventKind]: EventSpec<K> } = {
   },
   channel_plan: {
     label: "Channel AI",
-    tone: "neutral",
+    // A plan that failed to apply (an AP offline, a push refused) says why.
+    tone: (d) => (d.error ? "warn" : "neutral"),
     describe: (d, names) => {
       const moves = d.changes ?? [];
       const what = [d.band && band(d.band), d.trigger && `(${d.trigger})`];
@@ -680,7 +681,7 @@ const EVENTS: { [K in EventKind]: EventSpec<K> } = {
                   `${m.name ?? names[m.mac] ?? m.mac} ${m.from ?? "?"} → ${m.to ?? "?"}`,
               )
               .join(", ")
-      }${moves.length > 0 && !d.applied ? " (not applied)" : ""}`;
+      }${moves.length > 0 && !d.applied ? ` (not applied${d.error ? `: ${d.error}` : ""})` : ""}`;
     },
   },
   ap_pending: { label: "AP waiting for adoption", tone: "neutral" },
