@@ -1080,7 +1080,7 @@ mod tests {
         flushed(&w.book.writer);
         let live: SharedLive = Default::default();
         let known = crate::engine::KnownDevice {
-            first_seen: 0, last_seen: 1000, uptime: None, version: None, hostname: None, model: None, model_display: None, ip: None, serial: None,
+            first_seen: 0, last_seen: 1000, uptime: None, version: None, hostname: None, model: None, model_display: None, ip: None, serial: None, offline: true,
         };
         live.write().unwrap().known_devices.insert(ap, known);
         let again = Watcher::start(w.store.clone(), w.book.writer.clone(), live, broadcast::channel(4).0, 91_000).await;
