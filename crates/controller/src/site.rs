@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use std::sync::LazyLock;
 
 use crate::api::{ApiError, AppState, Json, Query};
-use crate::settings::Kind::{Bool, Int};
+use crate::settings::Kind::{Bool, Enum, Int};
 use crate::settings::{COUNTRIES, Patch, PreviewQuery, band_name, copy_fields, country, dedup_in_order, docs_mut, illegal_fixed_channel, mgmt_flag, num, outdoor_with, pick, record_label, setting, setting_mut, str_field, timezone};
 
 /// A host name or IPv4 address, as NTP and syslog targets take (the official
@@ -182,10 +182,14 @@ fn site_syslog(doc: &mut Value, r: &Value) -> Result<(), String> {
 /// The APs' time servers (`ntp`).
 fn site_ntp(doc: &mut Value, n: &Value) -> Result<(), String> {
     let was_manual = doc["setting_preference"].as_str() == Some("manual");
-    match str_field(n, "setting_preference")? {
-        None => {}
-        Some(pref @ ("auto" | "manual")) => doc["setting_preference"] = json!(pref),
-        Some(_) => return Err("setting_preference must be auto or manual".into()),
+    copy_fields(n, doc, &[("setting_preference", Enum(&["auto", "manual"]))])?;
+    // The servers named, checked whatever the mode.
+    let mut named: [Option<&str>; 4] = [None; 4];
+    for (h, k) in named.iter_mut().zip(NTP_KEYS) {
+        *h = str_field(n, k)?.map(str::trim);
+        if let Some(h) = h.filter(|h| !h.is_empty() && !is_host(h)) {
+            return Err(format!("{h} is not a host name or IPv4 address"));
+        }
     }
     if doc["setting_preference"].as_str() == Some("auto") {
         // Going back to automatic restores the pool, as the official controller does.
@@ -194,14 +198,17 @@ fn site_ntp(doc: &mut Value, n: &Value) -> Result<(), String> {
                 doc[*k] = json!(h);
             }
         }
-    } else if NTP_KEYS.iter().any(|k| !n[*k].is_null()) {
+        // Automatic uses the pool: other servers named with it are refused (the pool's own, as read back, pass).
+        if let Some(h) = named.iter().zip(NTP_KEYS).find_map(|(h, k)| h.filter(|h| !h.is_empty() && doc[k].as_str() != Some(h))) {
+            return Err(format!("{h}: time servers are set only with manual NTP"));
+        }
+    } else if named.iter().any(Option::is_some) {
         // The servers named replace those stored, and the four close up. Coming
         // from automatic, the pool's servers are no choice of the user's: the
         // ones not named are blank.
         let mut list = Vec::new();
-        for k in NTP_KEYS {
-            let h = match str_field(n, k)?.map(str::trim) {
-                Some(h) if !h.is_empty() && !is_host(h) => return Err(format!("{h} is not a host name or IPv4 address")),
+        for (h, k) in named.into_iter().zip(NTP_KEYS) {
+            let h = match h {
                 Some(h) => h,
                 None if was_manual => doc[k].as_str().unwrap_or_default(),
                 None => "",
@@ -537,6 +544,12 @@ mod tests {
         assert_eq!(servers(&s), ["192.0.2.1", "ntp.example.org", "", ""], "a blank one closes up");
         edit(&mut s, json!({ "ntp": { "setting_preference": "auto" } })).unwrap();
         assert_eq!(setting(&s, "ntp")["ntp_server_1"], "0.ubnt.pool.ntp.org");
+        // On automatic, servers are still checked, and other than the pool's refused.
+        assert_eq!(edit(&mut s, json!({ "ntp": { "ntp_server_1": 5 } })).unwrap_err(), "ntp_server_1 must be text");
+        assert!(edit(&mut s, json!({ "ntp": { "ntp_server_1": "bad host!" } })).unwrap_err().contains("not a host name"));
+        assert!(edit(&mut s, json!({ "ntp": { "setting_preference": "auto", "ntp_server_2": "time.example.net" } })).unwrap_err().contains("only with manual"));
+        let pool = setting(&s, "ntp").clone();
+        assert_eq!(edit(&mut s, json!({ "ntp": pool })).unwrap(), "site settings: nothing changed");
         // From automatic, the pool is not kept for the servers not named.
         edit(&mut s, json!({ "ntp": { "setting_preference": "manual", "ntp_server_2": "time.example.net" } })).unwrap();
         assert_eq!(servers(&s), ["time.example.net", "", "", ""]);
