@@ -2,9 +2,6 @@
 //!
 //! Accepts either a plain `{"aa:bb:cc:dd:ee:ff": "<32 hex chars>"}` map or an
 //! import snapshot written by `informdump import` (`{"devices": [{"mac", "x_authkey"}]}`).
-//! A snapshot device whose `x_inform_authkey` (the key the official controller last saw
-//! it inform with) differs from `x_authkey` has not switched to its new key yet: that
-//! key is kept too, and tried after `x_authkey`.
 
 use std::collections::HashMap;
 
@@ -15,8 +12,6 @@ use serde_json::Value;
 #[derive(Default)]
 pub struct KeyStore {
     keys: HashMap<Mac, [u8; 16]>,
-    /// A device's `x_inform_authkey` where it differs from its `x_authkey`.
-    inform_keys: HashMap<Mac, [u8; 16]>,
     /// AES-256 keys for encrypted remote syslog, from the devices' `syslog_key`.
     syslog: HashMap<Mac, [u8; 32]>,
     /// Why entries were left out when loading, for the caller to report.
@@ -45,12 +40,6 @@ impl KeyStore {
             for d in devices {
                 if let (Some(mac), Some(key)) = (d["mac"].as_str(), d["x_authkey"].as_str()) {
                     add("an authkey", store.insert(mac, key));
-                }
-                if let (Some(mac), Some(key)) = (d["mac"].as_str(), d["x_inform_authkey"].as_str())
-                    && !key.is_empty()
-                    && Some(key) != d["x_authkey"].as_str()
-                {
-                    add("an inform authkey", store.insert_inform(mac, key));
                 }
                 if let (Some(mac), Some(key)) = (d["mac"].as_str(), d["syslog_key"].as_str()) {
                     add("a syslog key", store.insert_syslog(mac, key));
@@ -82,12 +71,6 @@ impl KeyStore {
         Ok(())
     }
 
-    fn insert_inform(&mut self, mac: &str, key: &str) -> Result<()> {
-        let mac: Mac = mac.parse()?;
-        self.inform_keys.insert(mac, parse_key(key).with_context(|| format!("inform key for {mac}"))?);
-        Ok(())
-    }
-
     pub fn insert_syslog(&mut self, mac: &str, key: &str) -> Result<()> {
         let mac: Mac = mac.parse()?;
         self.syslog.insert(mac, parse_key(key).with_context(|| format!("syslog key for {mac}"))?);
@@ -98,15 +81,8 @@ impl KeyStore {
         self.syslog.iter()
     }
 
-    /// The device's key (`x_authkey`).
     pub fn get(&self, mac: &Mac) -> Option<&[u8; 16]> {
         self.keys.get(mac)
-    }
-
-    /// Every key the device may inform with: its own, then the one it last informed
-    /// with if that differs.
-    pub fn device_keys(&self, mac: &Mac) -> impl Iterator<Item = &[u8; 16]> + use<'_> {
-        self.keys.get(mac).into_iter().chain(self.inform_keys.get(mac))
     }
 
     pub fn len(&self) -> usize {
@@ -139,22 +115,5 @@ mod tests {
         assert_eq!((keys.len(), keys.syslog_len(), keys.skipped().len()), (1, 1, 3));
         let keys = KeyStore::from_value(&json!({ "00:11:22:33:44:55": good, "00:11:22:33:44:66": 7 }));
         assert_eq!(keys.len(), 1);
-    }
-
-    #[test]
-    fn a_key_the_device_has_yet_to_switch_from_is_tried_second() {
-        let (new, old) = ("000102030405060708090a0b0c0d0e0f", "0f0e0d0c0b0a09080706050403020100");
-        let snapshot = json!({ "devices": [
-            { "mac": "00:11:22:33:44:55", "x_authkey": new, "x_inform_authkey": old },
-            { "mac": "00:11:22:33:44:66", "x_authkey": new, "x_inform_authkey": new },
-            { "mac": "00:11:22:33:44:77", "x_authkey": new, "x_inform_authkey": "" },
-        ]});
-        let keys = KeyStore::from_value(&snapshot);
-        assert!(keys.skipped().is_empty(), "{:?}", keys.skipped());
-        let of = |mac: &str| keys.device_keys(&mac.parse().unwrap()).copied().collect::<Vec<_>>();
-        assert_eq!(of("00:11:22:33:44:55"), [parse_key(new).unwrap(), parse_key(old).unwrap()]);
-        assert_eq!(of("00:11:22:33:44:66"), [parse_key(new).unwrap()]);
-        assert_eq!(of("00:11:22:33:44:77"), [parse_key(new).unwrap()]);
-        assert!(of("00:11:22:33:44:88").is_empty());
     }
 }
