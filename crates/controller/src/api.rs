@@ -647,7 +647,8 @@ async fn clients(State(s): State<AppState>) -> Response {
     let (state, list, ap_names) = {
         let live = s.live.read().unwrap();
         let list: Vec<ClientCopy> = live.clients.iter().map(|(mac, c)| (*mac, c.clone(), live.aliases.get(mac).cloned())).collect();
-        let ap_names: std::collections::HashMap<Mac, String> = live.devices.iter().filter_map(|(m, d)| Some((*m, d.snapshot.ap.hostname.clone()?))).collect();
+        let aps = live.devices.keys().chain(live.known_devices.keys());
+        let ap_names: std::collections::HashMap<Mac, String> = aps.filter_map(|m| Some((*m, crate::series::ap_name_of(&live, m)?))).collect();
         (live.state.clone(), list, ap_names)
     };
     let controls = crate::actions::ClientControls::new(state.as_deref());
@@ -1363,6 +1364,7 @@ mod tests {
         ] });
         // The one in the database is restored as at start, before any inform.
         s.writer.exec(Db::Config, "INSERT INTO devices (mac, hostname, model, first_seen, last_seen) VALUES ('02:00:00:00:00:02', 'Attic', 'U6', 10, 20)", vec![]);
+        s.writer.exec(Db::Config, "INSERT INTO clients (mac, first_seen, last_seen, ap_mac, bssid) VALUES ('02:00:00:00:01:02', 10, 20, '02:00:00:00:00:02', 'b2')", vec![]);
         flushed(&s.writer);
         engine.restore(&s.store).unwrap();
         engine.handle(report(payload));
@@ -1401,6 +1403,8 @@ mod tests {
         let clients = get_json(&app, "/api/clients").await;
         assert_eq!((clients[0]["ap_name"].as_str(), clients[0]["connected"].as_bool(), clients[0]["sample"]["essid"].as_str()), (Some("Hall"), Some(true), Some("Home")));
         assert!(clients[0]["alias"].is_null() && clients[0].get("blocked").is_some(), "{}", clients[0]);
+        // A client of the AP not reporting since the start: the AP by its stored name.
+        assert_eq!((clients[1]["ap_name"].as_str(), clients[1]["connected"].as_bool()), (Some("Attic"), Some(false)));
         let keys = |v: &Value| v.as_object().unwrap().keys().cloned().collect::<Vec<_>>().join(",");
         assert_eq!(keys(&clients[0]), "alias,ap_name,blocked,connected,first_seen,last_seen,locked_to,note,sample,usergroup_id,vendor");
         let one = get_json(&app, "/api/clients/02:00:00:00:01:01").await;

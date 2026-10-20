@@ -189,14 +189,18 @@ pub(crate) fn cols_at<const N: usize>(cols: &[&str], names: [&str; N]) -> [usize
     names.map(|n| col(cols, n))
 }
 
-/// An AP's name (its host name), if it is reporting.
+/// An AP's name (its host name): the one it reports, else, for an AP not
+/// reporting since the start, the one stored.
 pub(crate) fn ap_name(live: &Live, mac: &str) -> Option<String> {
     ap_name_of(live, &mac.parse().ok()?)
 }
 
 /// The same by MAC.
 pub(crate) fn ap_name_of(live: &Live, mac: &inform::Mac) -> Option<String> {
-    live.devices.get(mac).and_then(|d| d.snapshot.ap.hostname.clone())
+    match live.devices.get(mac) {
+        Some(d) => d.snapshot.ap.hostname.clone(),
+        None => live.known_devices.get(mac).and_then(|k| k.hostname.clone()),
+    }
 }
 
 /// Our APs' SSIDs (BSSIDs), with the AP of each.
