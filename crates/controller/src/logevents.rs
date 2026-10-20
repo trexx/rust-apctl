@@ -338,11 +338,20 @@ impl LogEvents {
     /// Returns whether the line was a fault.
     fn crash(&mut self, dev: Mac, line: &LogLine, out: &mut Vec<Event>) -> bool {
         let (msg, prog) = (line.msg.as_str(), line.program.as_deref());
-        // Netconsole sends the kernel's lines with no priority.
-        let kernel = prog == Some("kernel") || matches!(line.facility, Some(0) | None);
-        let fault = if kernel { fault(msg) } else { None };
-        let is_fault = fault.is_some();
         let text = || prog.map_or_else(|| msg.to_string(), |p| format!("{p}: {msg}"));
+        let fault = match (prog, line.facility) {
+            // Netconsole sends the kernel's lines with no priority, and the parser
+            // may have taken their first word for a program (`mcad[1234]: unhandled
+            // ...`, `Oops: ...`): such a line is read as sent, and a memory fault
+            // whose name went with its PID is the program's.
+            (_, None) => fault(&text()).map(|(kind, name)| {
+                let program = prog.filter(|&p| kind == CrashKind::MemoryFault && p != "kernel").map(str::to_string);
+                (kind, name.or(program))
+            }),
+            (Some("kernel"), _) | (_, Some(0)) => fault(msg),
+            _ => None,
+        };
+        let is_fault = fault.is_some();
         if let Some(c) = self.crashes.get_mut(&dev) {
             c.push(text);
             if let Some((CrashKind::Panic, _)) = fault {
@@ -580,6 +589,14 @@ mod tests {
         assert_eq!(l.tick(2200)[0].data["process"], "hostapd");
         // Netconsole lines make no other events (syslog carries the same lines).
         assert!(l.feed(&netconsole(3000, "wlan: [0:I:ANY] [UNSPECIFIED] vap-0(wifi1ap1):BTM: Received response from [6c:ac:c2:00:00:01](len = 5): dialog_token 1, status 7")).is_empty());
+        // A memory fault without printk times: the parser takes `mcad[1234]` for its program.
+        assert!(l.feed(&netconsole(3100, "mcad[1234]: unhandled level 2 translation fault (11) at 0x00000000, esr 0x92000006")).is_empty());
+        let f = l.tick(3300);
+        assert_eq!((f[0].data["kind"].as_str(), f[0].data["process"].as_str()), (Some("process crashed (memory fault)"), Some("mcad")));
+        assert_eq!(f[0].data["lines"][0], "mcad: unhandled level 2 translation fault (11) at 0x00000000, esr 0x92000006");
+        // An oops header without printk times, which the parser splits the same way.
+        assert!(l.feed(&netconsole(4000, "Oops: 0000 [#1] PREEMPT SMP")).is_empty());
+        assert_eq!(l.tick(4200)[0].data["kind"], "kernel oops");
     }
 
     #[test]

@@ -358,6 +358,8 @@ pub struct KnownDevice {
     pub model_display: Option<String>,
     pub ip: Option<String>,
     pub serial: Option<String>,
+    /// Reported offline (an `ap_offline` event), and not back since.
+    pub offline: bool,
 }
 
 pub type SharedLive = Arc<RwLock<Live>>;
@@ -493,6 +495,9 @@ pub struct Engine {
     alerts: Option<crate::alerts::Sink>,
     /// The time of this run's first tick (the capture's time in shadow mode).
     first_tick: Option<Ts>,
+    /// Each AP's last push as stored before this run (its secrets masked), until
+    /// a push to it is seen: what that push is compared with.
+    stored_config: HashMap<Mac, PushedConfig>,
 }
 
 /// How long a syslog hash_id no key opened is left untried.
@@ -506,7 +511,7 @@ impl Engine {
         Engine {
             writer, keys, renderer: None, live, counters, tx, radios: HashMap::new(), mcast_prev: HashMap::new(), bss_prev: HashMap::new(),
             logevents: Default::default(), isolated: HashMap::new(), last_prune: 0, written: Default::default(), syslog_unknown: HashMap::new(),
-            syslog_ciphers: Default::default(), logs_announced: HashMap::new(), alerts: None, first_tick: None,
+            syslog_ciphers: Default::default(), logs_announced: HashMap::new(), alerts: None, first_tick: None, stored_config: HashMap::new(),
         }
     }
 
@@ -521,15 +526,16 @@ impl Engine {
     }
 
     /// Loads APs and clients remembered from previous runs, so a restart does
-    /// not report every client as newly connected.
+    /// not report every client as newly connected, and each AP's last push, so
+    /// the first one after it says what it changed.
     pub fn restore(&mut self, store: &store::Store) -> anyhow::Result<()> {
-        let (devices, clients, aliases, state) = store.read(Db::Config, |c| {
-            let mut stmt = c.prepare("SELECT mac, first_seen, last_seen, uptime, version, hash_id, ip, hostname, model, model_display, serial FROM devices")?;
+        let (devices, clients, aliases, state, pushes) = store.read(Db::Config, |c| {
+            let mut stmt = c.prepare("SELECT mac, first_seen, last_seen, uptime, version, hash_id, ip, hostname, model, model_display, serial, offline FROM devices")?;
             let devices = stmt
                 .query_map([], |r| {
                     let known = KnownDevice {
                         first_seen: r.get::<_, Option<i64>>(1)?.unwrap_or(0), last_seen: r.get::<_, Option<i64>>(2)?.unwrap_or(0), uptime: r.get(3)?, version: r.get(4)?,
-                        ip: r.get(6)?, hostname: r.get(7)?, model: r.get(8)?, model_display: r.get(9)?, serial: r.get(10)?,
+                        ip: r.get(6)?, hostname: r.get(7)?, model: r.get(8)?, model_display: r.get(9)?, serial: r.get(10)?, offline: r.get::<_, i64>(11)? != 0,
                     };
                     Ok((r.get::<_, String>(0)?, known, r.get::<_, Option<String>>(5)?))
                 })?
@@ -557,8 +563,9 @@ impl Engine {
             let aliases = stmt
                 .query_map([], |r| Ok((r.get::<_, String>(0)?, Alias { alias: r.get(1)?, note: r.get(2)? })))?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
-            Ok((devices, clients, aliases, state))
+            Ok((devices, clients, aliases, state, store::stored_pushes(c)?))
         })?;
+        self.stored_config = pushes;
         let mut live = self.live.write().unwrap();
         for (mac, known, hash_id) in devices {
             let Ok(mac) = mac.parse::<Mac>() else { continue };
@@ -858,7 +865,7 @@ impl Engine {
     ///
     /// The diffs and the dry-run render take a while, so the live view is only
     /// locked to read what they need and then to store the results.
-    fn reply(&self, ts: Ts, mac: Mac, mut p: Value, dry_run: bool) {
+    fn reply(&mut self, ts: Ts, mac: Mac, mut p: Value, dry_run: bool) {
         bump(&self.counters.replies);
         // Nearly every reply repeats the interval the AP already has.
         if let Some(interval) = p["interval"].as_i64() {
@@ -879,17 +886,21 @@ impl Engine {
             _ => None,
         };
         let (new_mgmt, new_system) = (take("mgmt_cfg"), take("system_cfg"));
-        let (radios, previous, state, inform) = {
+        let stored = self.stored_config.remove(&mac);
+        let (radios, previous, redacted, state, inform) = {
             let live = self.live.read().unwrap();
-            // The last push (unredacted), for the diffs; empty fields if none was seen.
-            let previous = live.last_config.get(&mac).cloned().unwrap_or_default();
+            // The last push, for the diffs: the one seen in this run (unredacted), else
+            // the one stored before it (secrets masked); empty fields if there is none.
+            let seen = live.last_config.get(&mac).cloned();
+            let redacted = seen.is_none() && stored.is_some();
+            let previous = seen.or(stored.map(Arc::new)).unwrap_or_default();
             let has_system = new_system.as_ref().map_or(!previous.system_cfg.is_empty(), |s| !s.is_empty());
             // For the section labels, which only a system_cfg has.
             let radios = live.devices.get(&mac).filter(|_| has_system).map(|d| d.snapshot.radios.clone()).unwrap_or_default();
             let wanted = dry_run && has_system && self.renderer.is_some();
             let state = live.state.clone().filter(|_| wanted);
             let inform = state.as_ref().and_then(|_| live.raw_informs.get(&mac).cloned());
-            (radios, previous, state, inform)
+            (radios, previous, redacted, state, inform)
         };
         let mgmt = new_mgmt.as_deref().unwrap_or(&previous.mgmt_cfg);
         let system = new_system.as_deref().unwrap_or(&previous.system_cfg);
@@ -899,6 +910,8 @@ impl Engine {
             let Some(new) = new else { continue };
             let summary = if old.is_empty() {
                 json!({ "baseline": true, "lines": new.lines().count() })
+            } else if redacted {
+                cfgdiff::diff(old, &cfgdiff::redact(new)).summary()
             } else {
                 cfgdiff::diff(old, new).summary()
             };
@@ -916,7 +929,7 @@ impl Engine {
         }
         // Without one in the push: the one its mgmt_cfg carries (this push's, else
         // the last one's), else the last push's, as the stored copy keeps it
-        // (COALESCE below). A restart, reading the stored copy, sees the same.
+        // (COALESCE below).
         let cfgversion = p["cfgversion"]
             .as_str()
             .map(str::to_string)
@@ -945,16 +958,21 @@ impl Engine {
                     cfgversion: cfgversion.as_deref().unwrap_or(""),
                     previous_system_cfg: Some(system),
                 };
-                Some(self.dry_run(render, ts, &req, cfgversion.as_deref(), mgmt))
+                // Masked when a field the push does not carry is the stored copy's.
+                let masked = redacted && (new_mgmt.is_none() || new_system.is_none());
+                Some(self.dry_run(render, ts, &req, cfgversion.as_deref(), mgmt, masked))
             }
             _ => None,
         };
 
         // As in `inform`: the write lock is held for the swap alone, and the old
-        // push is dropped and the events emitted after it.
+        // push is dropped and the events emitted after it. A field the push does
+        // not carry is the last push's, but only known in full from one seen in
+        // this run: else it is left empty, and readers go to the stored copy.
+        let kept = |old: &String| if redacted { String::new() } else { old.clone() };
         let pushed = PushedConfig {
-            mgmt_cfg: new_mgmt.unwrap_or_else(|| previous.mgmt_cfg.clone()),
-            system_cfg: new_system.unwrap_or_else(|| previous.system_cfg.clone()),
+            mgmt_cfg: new_mgmt.unwrap_or_else(|| kept(&previous.mgmt_cfg)),
+            system_cfg: new_system.unwrap_or_else(|| kept(&previous.system_cfg)),
             cfgversion,
         };
         let mut live = self.live.write().unwrap();
@@ -971,12 +989,13 @@ impl Engine {
     }
 
     /// Renders the AP's config for `req` and compares it with the push (its
-    /// `mgmt` and `req.previous_system_cfg`): stored, and summed up for the event.
-    fn dry_run(&self, render: &crate::dryrun::RenderFn, ts: Ts, req: &crate::dryrun::RenderRequest, cfgversion: Option<&str>, mgmt: &str) -> Value {
+    /// `mgmt` and `req.previous_system_cfg`, with secrets masked if `redacted`):
+    /// stored, and summed up for the event.
+    fn dry_run(&self, render: &crate::dryrun::RenderFn, ts: Ts, req: &crate::dryrun::RenderRequest, cfgversion: Option<&str>, mgmt: &str, redacted: bool) -> Value {
         let system = req.previous_system_cfg.unwrap_or_default();
-        let result = render(req).map(|ours| crate::dryrun::compare(&ours, mgmt, system, false));
+        let result = render(req).map(|ours| crate::dryrun::compare(&ours, mgmt, system, redacted, false));
         let (matches, payload) = match &result {
-            Ok(c) => (c.matches(), c.stored()),
+            Ok(c) => (c.matches(), serde_json::to_string(c).expect("a comparison serialises")),
             Err(e) => (false, json!({ "error": format!("{e:#}") }).to_string()),
         };
         self.writer.exec(
@@ -984,8 +1003,11 @@ impl Engine {
             "INSERT INTO dryrun_results (ts, mac, cfgversion, matches, comparison) VALUES (?1, ?2, ?3, ?4, ?5)",
             vec![Sql::Integer(ts), Sql::Text(req.device_mac.to_string()), cfgversion.map(str::to_string).into(), Sql::Integer(matches as i64), Sql::Text(payload)],
         );
+        // Each field's counts: a mismatch names the field that differs, and says
+        // when only the order of its lines does (no line added, removed or changed).
+        let counts = |f: &crate::dryrun::FieldComparison| json!({ "added": f.added, "removed": f.removed, "changed": f.changed, "same_content": f.same_content });
         match &result {
-            Ok(c) => json!({ "matches": matches, "system_cfg": { "added": c.system_cfg.added, "removed": c.system_cfg.removed, "changed": c.system_cfg.changed, "same_content": c.system_cfg.same_content } }),
+            Ok(c) => json!({ "matches": matches, "mgmt_cfg": counts(&c.mgmt_cfg), "system_cfg": counts(&c.system_cfg) }),
             Err(e) => json!({ "matches": false, "error": format!("{e:#}") }),
         }
     }
@@ -1059,6 +1081,7 @@ impl Engine {
     }
 
     fn forget(&mut self, ts: Ts, mac: Mac) {
+        self.stored_config.remove(&mac);
         let mut live = self.live.write().unwrap();
         live.forget_ap(&mac);
         let forget_managed = live.forget_managed.clone();
@@ -1483,6 +1506,7 @@ impl Engine {
             let data = json!({ "reason": "timed out", "detail": why, "target": j.target });
             events.push(Event::device(now, EventKind::ApUpgradeFailed, mac, data));
         }
+        let started = *self.first_tick.get_or_insert(now);
         let mut offline = Vec::new();
         for (mac, d) in live.devices.iter_mut() {
             let limit = (d.interval.max(5) * OFFLINE_INTERVALS).max(60);
@@ -1492,11 +1516,20 @@ impl Engine {
                 events.push(Event::device(now, EventKind::ApOffline, *mac, json!({ "last_seen": d.last_seen })));
             }
         }
+        // An AP last recorded online that has not informed in this run, as when it
+        // went down while apctl was away: its interval is not known, so it is
+        // given the longest usual one, counted from this run's start too.
+        for (mac, k) in live.known_devices.iter_mut() {
+            if !k.offline && now - k.last_seen.max(started) > 60 * OFFLINE_INTERVALS {
+                k.offline = true;
+                offline.push(*mac);
+                events.push(Event::device(now, EventKind::ApOffline, *mac, json!({ "last_seen": k.last_seen })));
+            }
+        }
         // A client is gone when its AP has reported a full client list since it was
         // last seen and the grace period has passed, or when its AP went offline.
         // Only the connected ones are looked at, not the year of clients kept.
         let mut changed = false;
-        let started = *self.first_tick.get_or_insert(now);
         let Live { devices, clients, connected, .. } = &mut *live;
         connected.retain(|cmac| {
             let Some(c) = clients.get_mut(cmac).filter(|c| c.connected) else { return false };
@@ -1530,7 +1563,9 @@ impl Engine {
         for e in events {
             self.emit(e);
         }
+        // Remembered, so that a restart still pairs the AP's return with it.
         for mac in offline {
+            self.writer.exec(Db::Config, "UPDATE devices SET offline = 1 WHERE mac = ?1", vec![Sql::Text(mac.to_string())]);
             let _ = self.tx.send(LiveMsg::Device { mac });
         }
         if changed {
@@ -1538,9 +1573,9 @@ impl Engine {
         }
     }
 
-    /// The AP's row in `devices`, as of the inform at `a.ts`. The table's
-    /// `name`, `cfgversion` and `online` columns are no longer used: whether an
-    /// AP is online is only known live, and its config version is in `device_config`.
+    /// The AP's row in `devices`, as of the inform at `a.ts`: back online, if it
+    /// was offline (see `tick`). The table's `name`, `cfgversion` and `online`
+    /// columns are no longer used: its config version is in `device_config`.
     fn write_device(&self, a: &crate::model::ApSample) {
         self.writer.exec(
             Db::Config,
@@ -1548,7 +1583,7 @@ impl Engine {
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9, ?10)
              ON CONFLICT (mac) DO UPDATE SET hostname = excluded.hostname, model = excluded.model, model_display = excluded.model_display,
                version = excluded.version, ip = excluded.ip, serial = excluded.serial, hash_id = excluded.hash_id,
-               last_seen = excluded.last_seen, uptime = excluded.uptime",
+               last_seen = excluded.last_seen, uptime = excluded.uptime, offline = 0",
             vec![
                 Sql::Text(a.mac.to_string()),
                 a.hostname.clone().into(),
@@ -1612,7 +1647,11 @@ impl Engine {
         // neighbour is written once a minute (last_seen), an unchanged spectrum
         // row once an hour. What the AP no longer reports is forgotten here.
         let rows = self.written.neighbors.entry(s.ap.mac).or_default();
-        for n in neighbors {
+        for mut n in neighbors {
+            // When the scan heard it, which is when it was last seen as it is: an entry
+            // the AP keeps reporting from an old scan is no sighting now. Its age
+            // grows at every inform, so it is no change of the neighbour.
+            let heard = ts - n.age.take().unwrap_or(0).clamp(0, ts.max(0));
             let Some(n) = report(rows, n, |n| n.bssid.as_str(), ts, REFRESH_SECS) else { continue };
             self.writer.exec(
                 Db::Config,
@@ -1625,7 +1664,7 @@ impl Engine {
                 vec![
                     Sql::Text(n.bssid.clone()), mac(), n.radio.clone().into(), n.essid.clone().into(), n.channel.into(), n.bw.into(),
                     n.center_freq.into(), n.security.clone().into(), n.signal.into(), n.noise.into(), Sql::Integer(n.is_unifi as i64),
-                    n.ap_name.clone().into(), n.model.clone().into(), Sql::Integer(ts),
+                    n.ap_name.clone().into(), n.model.clone().into(), Sql::Integer(heard),
                 ],
             );
         }
@@ -1774,7 +1813,13 @@ fn lifecycle_events(ts: Ts, a: &crate::model::ApSample, prev: Option<&DeviceView
             }
             (p.snapshot.ap.uptime.map(|u| (u, p.snapshot.ap.ts)), &p.snapshot.ap.version)
         }
-        (None, Some(k)) => (k.uptime.map(|u| (u, k.last_seen)), &k.version),
+        (None, Some(k)) => {
+            // Reported offline before a restart: its return is reported now.
+            if k.offline {
+                events.push(Event::device(ts, EventKind::ApOnline, mac, json!({ "offline_for": ts - k.last_seen })));
+            }
+            (k.uptime.map(|u| (u, k.last_seen)), &k.version)
+        }
     };
     // Only what can be proved to have changed, in this run or while apctl was
     // away: up for less than it was then plus the time since (with a minute's
@@ -2063,6 +2108,36 @@ mod tests {
     }
 
     #[test]
+    fn going_offline_and_coming_back_are_paired_across_a_restart() {
+        let feed = |h: &mut Harness, ts: Ts| h.engine.handle(Input::Inform { ts, peer: [10, 0, 0, 1].into(), decoded: decoded(inform(AP1, 1000 + ts, &[])) });
+        // Reported offline, then apctl restarts: its return is reported after it.
+        let mut h = harness();
+        feed(&mut h, 0);
+        h.engine.handle(Input::Tick(100));
+        assert_eq!(events(&mut h), [("ap_seen", None), ("ap_offline", None)]);
+        let mut h = h.restarted();
+        feed(&mut h, 500);
+        assert_eq!(events(&mut h), [("ap_online", None)]);
+        assert_eq!(stored(&h, EventKind::ApOnline)[0]["offline_for"], 500);
+        // Back online, as the next restart knows: nothing more to report.
+        let mut h = h.restarted();
+        feed(&mut h, 510);
+        assert_eq!(events(&mut h), []);
+        // Gone while apctl was away: reported offline once this run has given it time to inform.
+        let mut h = h.restarted();
+        h.engine.handle(Input::Tick(1000));
+        h.engine.handle(Input::Tick(1000 + 60 * OFFLINE_INTERVALS));
+        assert_eq!(events(&mut h), []);
+        h.engine.handle(Input::Tick(1001 + 60 * OFFLINE_INTERVALS));
+        h.engine.handle(Input::Tick(1100 + 60 * OFFLINE_INTERVALS));
+        assert_eq!(events(&mut h), [("ap_offline", None)]);
+        assert_eq!(stored(&h, EventKind::ApOffline)[1]["last_seen"], 510);
+        let mut h = h.restarted();
+        feed(&mut h, 2000);
+        assert_eq!(events(&mut h), [("ap_online", None)]);
+    }
+
+    #[test]
     fn a_long_outage_gives_the_aps_time_to_inform() {
         let mut h = harness();
         h.engine.handle(Input::Inform { ts: 0, peer: [10, 0, 0, 1].into(), decoded: decoded(inform(AP1, 1000, &[(C1, "b1")])) });
@@ -2070,7 +2145,7 @@ mod tests {
         let mut h = h.restarted();
         h.engine.handle(Input::Tick(7200));
         h.engine.handle(Input::Tick(7200 + 3600));
-        assert_eq!(events(&mut h), [], "the client is left alone for the AP's first hour back");
+        assert_eq!(events(&mut h), [("ap_offline", None)], "the client is left alone for the AP's first hour back");
         // An AP that never informs again: its clients go an hour into the run.
         h.engine.handle(Input::Tick(7200 + 3601));
         assert_eq!(events(&mut h), [("client_disconnected", Some(C1.into()))]);
@@ -2130,6 +2205,15 @@ mod tests {
         assert!(h.engine.written.neighbors[&AP1.parse().unwrap()].is_empty(), "no longer reported: forgotten");
         feed(&mut h, 50, Some(-60));
         assert_eq!(last_seen(&h), 50, "reported again: written as new");
+        // An entry from an earlier scan was last seen when that scan heard it.
+        let mut p = inform(AP1, 1000 + 70, &[]);
+        p["radio_table"] = json!([{ "radio": "na", "scan_table": [{ "bssid": "02:cd:00:00:00:01", "signal": -50, "age": 1200 }] }]);
+        h.engine.handle(Input::Inform { ts: 2000, peer: [10, 0, 0, 1].into(), decoded: decoded(p.clone()) });
+        assert_eq!(last_seen(&h), 800);
+        // Its age growing is no change: written once a minute, as heard.
+        p["radio_table"][0]["scan_table"][0]["age"] = json!(1215);
+        h.engine.handle(Input::Inform { ts: 2015, peer: [10, 0, 0, 1].into(), decoded: decoded(p) });
+        assert_eq!(h.engine.written.neighbors[&AP1.parse().unwrap()]["02:cd:00:00:00:01"].written, 2000);
     }
 
     #[test]
@@ -2337,7 +2421,7 @@ mod tests {
         let mut h = harness();
         let (a, b) = ("02:00:00:00:00:10", "02:00:00:00:00:18");
         // B is only in the database: it lost its uplink before apctl restarted.
-        let known = KnownDevice { first_seen: 0, last_seen: 0, uptime: None, version: None, hostname: None, model: None, model_display: None, ip: None, serial: None };
+        let known = KnownDevice { first_seen: 0, last_seen: 0, uptime: None, version: None, hostname: None, model: None, model_display: None, ip: None, serial: None, offline: false };
         h.engine.live.write().unwrap().known_devices.insert(b.parse().unwrap(), known);
         let mut p = inform(a, 1000, &[]);
         p["radio_table"] = json!([{ "radio": "na", "scan_table": [{ "bssid": "02:00:00:00:00:1a", "is_isolated": true, "signal": -70 }] }]);
@@ -2548,6 +2632,38 @@ mod tests {
         let row: (String, Option<String>, i64) =
             h.store.read(Db::Config, |c| Ok(c.query_row("SELECT mac, cfgversion, matches FROM dryrun_results", [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?)).unwrap();
         assert_eq!(row, (AP1.to_string(), Some("v2".into()), 0));
+        // The event names the field that differs, and when only the order does;
+        // the stored comparison has the counts without the diffs' text.
+        h.engine.set_renderer(Arc::new(|_: &crate::dryrun::RenderRequest| -> anyhow::Result<crate::dryrun::Rendered> { Ok(("cfgversion=v2\na=9".into(), "y=1\nx=4".into())) }));
+        h.engine.handle(Input::Reply { ts: 280, mac, decoded: decoded(json!({ "_type": "setparam", "system_cfg": "x=4\ny=1" })) });
+        let counts = |added, removed, changed, same_content| json!({ "added": added, "removed": removed, "changed": changed, "same_content": same_content });
+        let compared = stored(&h, EventKind::DryrunCompared);
+        assert_eq!(compared[1], json!({ "matches": false, "mgmt_cfg": counts(0, 0, 1, false), "system_cfg": counts(0, 0, 0, true) }));
+        let comparison: Value =
+            serde_json::from_str(&h.store.read(Db::Config, |c| Ok(c.query_row("SELECT comparison FROM dryrun_results ORDER BY ts DESC", [], |r| r.get::<_, String>(0))?)).unwrap()).unwrap();
+        assert_eq!((comparison["mgmt_cfg"]["changed"].as_i64(), comparison["mgmt_cfg"].get("diff"), comparison["system_cfg"].get("diff")), (Some(1), None, None));
+    }
+
+    #[test]
+    fn the_first_push_after_a_restart_is_compared_with_the_stored_one() {
+        let mut h = harness();
+        let mac: Mac = AP1.parse().unwrap();
+        let push = |h: &mut Harness, ts: Ts, v: Value| h.engine.handle(Input::Reply { ts, mac, decoded: decoded(v) });
+        push(&mut h, 10, json!({ "_type": "setparam", "mgmt_cfg": "cfgversion=v1\na=1", "system_cfg": "aaa.1.hide_ssid=false\naaa.1.wpa.psk=old" }));
+        let mut h = h.restarted();
+        // What it changed, not a baseline; the secret, masked in the stored copy, is not compared.
+        push(&mut h, 20, json!({ "_type": "setparam", "mgmt_cfg": "cfgversion=v2\na=1", "system_cfg": "aaa.1.hide_ssid=true\naaa.1.wpa.psk=old" }));
+        let pushed = stored(&h, EventKind::ConfigPushed).pop().unwrap();
+        assert_eq!((pushed["system_cfg"]["diff"].as_str(), pushed["mgmt_cfg"]["diff"].as_str()), (Some("~ aaa.1.hide_ssid: false -> true\n"), Some("~ cfgversion: v1 -> v2\n")));
+        // A management-only push without a cfgversion, after another restart: the
+        // stored version; the system_cfg is the stored one, not known in full.
+        let mut h = h.restarted();
+        push(&mut h, 30, json!({ "_type": "setparam", "mgmt_cfg": "a=2" }));
+        let last = h.live.read().unwrap().last_config[&mac].clone();
+        assert_eq!((last.mgmt_cfg.as_str(), last.system_cfg.as_str(), last.cfgversion.as_deref()), ("a=2", "", Some("v2")));
+        flushed(&h.writer);
+        let row: (String, String) = h.store.read(Db::Config, |c| Ok(c.query_row("SELECT cfgversion, system_cfg FROM device_config", [], |r| Ok((r.get(0)?, r.get(1)?)))?)).unwrap();
+        assert_eq!(row, ("v2".into(), "aaa.1.hide_ssid=true\naaa.1.wpa.psk=<redacted>".into()));
     }
 
     #[test]

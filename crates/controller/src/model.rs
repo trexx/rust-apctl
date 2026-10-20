@@ -189,6 +189,9 @@ pub struct NeighborSample {
     pub is_isolated: bool,
     pub ap_name: Option<String>,
     pub model: Option<String>,
+    /// How long ago, in seconds, the scan heard it: the AP reports what its
+    /// scans found, an entry as it was when last heard (for half an hour or more).
+    pub age: Option<i64>,
 }
 
 /// One channel from a spectrum (channel survey) scan.
@@ -492,6 +495,7 @@ pub fn parse(ts: Ts, p: &Value) -> anyhow::Result<Snapshot> {
                 is_isolated: n["is_isolated"].as_bool() == Some(true),
                 ap_name: string(&n["ap_name"]),
                 model: string(&n["model"]),
+                age: int(&n["age"]),
             });
         }
         let Some(radio) = radio else { continue };

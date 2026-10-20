@@ -229,10 +229,11 @@ pub const TIERS: [Tier; 3] = [
 
 const CONFIG_SCHEMA: &str = "
 -- name, cfgversion and online are no longer written; old databases have them filled.
+-- offline: reported offline and not back since.
 CREATE TABLE IF NOT EXISTS devices (
     mac TEXT PRIMARY KEY, name TEXT, hostname TEXT, model TEXT, model_display TEXT, version TEXT,
     ip TEXT, serial TEXT, hash_id TEXT, first_seen INTEGER, last_seen INTEGER, uptime INTEGER,
-    cfgversion TEXT, online INTEGER NOT NULL DEFAULT 0);
+    cfgversion TEXT, online INTEGER NOT NULL DEFAULT 0, offline INTEGER NOT NULL DEFAULT 0);
 CREATE TABLE IF NOT EXISTS clients (
     mac TEXT PRIMARY KEY, hostname TEXT, ip TEXT, first_seen INTEGER, last_seen INTEGER,
     ap_mac TEXT, bssid TEXT, essid TEXT, radio TEXT, connected INTEGER NOT NULL DEFAULT 0);
@@ -339,7 +340,7 @@ fn open_ro(path: &Path) -> Result<Connection> {
 }
 
 /// Columns added to config tables after their first release.
-const CONFIG_COLUMNS: [(&str, &str, &str); 1] = [("connections", "detail", "TEXT")];
+const CONFIG_COLUMNS: [(&str, &str, &str); 2] = [("connections", "detail", "TEXT"), ("devices", "offline", "INTEGER NOT NULL DEFAULT 0")];
 
 fn migrate(dir: &Path) -> Result<()> {
     let config = open_rw(&dir.join(Db::Config.file()))?;
@@ -608,10 +609,17 @@ fn apply(conn: &mut Connection, writes: Vec<Write>) -> Result<usize> {
 /// A config pushed to an AP.
 #[derive(Debug, Clone, Default)]
 pub struct PushedConfig {
+    /// Empty when not known: no push with one was seen (one can be
+    /// management-only), or, in the live view after a restart, none since.
     pub mgmt_cfg: String,
-    /// Empty until a push with a `system_cfg` is seen (one can be management-only).
     pub system_cfg: String,
     pub cfgversion: Option<String>,
+}
+
+const STORED_PUSH: &str = "SELECT mgmt_cfg, system_cfg, cfgversion, ts, mac FROM device_config";
+
+fn stored_push_row(r: &rusqlite::Row) -> rusqlite::Result<PushedConfig> {
+    Ok(PushedConfig { mgmt_cfg: r.get::<_, Option<String>>(0)?.unwrap_or_default(), system_cfg: r.get::<_, Option<String>>(1)?.unwrap_or_default(), cfgversion: r.get(2)? })
 }
 
 /// One AP's last stored push, with its secrets masked.
@@ -622,12 +630,21 @@ pub fn stored_push(c: &Connection, mac: &inform::Mac) -> rusqlite::Result<Option
 /// One AP's last stored push, with its secrets masked, and when it was stored.
 pub fn stored_push_at(c: &Connection, mac: &inform::Mac) -> rusqlite::Result<Option<(PushedConfig, Option<Ts>)>> {
     use rusqlite::OptionalExtension;
-    c.prepare_cached("SELECT mgmt_cfg, system_cfg, cfgversion, ts FROM device_config WHERE mac = ?1")?
-        .query_row([mac.to_string()], |r| {
-            let push = PushedConfig { mgmt_cfg: r.get::<_, Option<String>>(0)?.unwrap_or_default(), system_cfg: r.get::<_, Option<String>>(1)?.unwrap_or_default(), cfgversion: r.get(2)? };
-            Ok((push, r.get(3)?))
-        })
-        .optional()
+    c.prepare_cached(&format!("{STORED_PUSH} WHERE mac = ?1"))?.query_row([mac.to_string()], |r| Ok((stored_push_row(r)?, r.get(3)?))).optional()
+}
+
+/// Every AP's last stored push, with its secrets masked.
+pub fn stored_pushes(c: &Connection) -> rusqlite::Result<HashMap<inform::Mac, PushedConfig>> {
+    let mut stmt = c.prepare(STORED_PUSH)?;
+    let mut rows = stmt.query([])?;
+    let mut out = HashMap::new();
+    while let Some(r) = rows.next()? {
+        // A row whose MAC does not parse is no AP's.
+        if let Ok(mac) = r.get::<_, String>(4)?.parse() {
+            out.insert(mac, stored_push_row(r)?);
+        }
+    }
+    Ok(out)
 }
 
 /// Rolls complete buckets up into the coarser tiers, then applies retention.
@@ -687,7 +704,7 @@ fn rollup(metrics: &mut Connection, t: &Table, src: &str, dst: &str, step: i64, 
     let done = read_state(metrics, &state_key)?;
     // Only complete buckets, and never further back than the source keeps.
     let upto = ((now - ROLLUP_GRACE_SECS) / step) * step;
-    let start = done.max(now - src_keep);
+    let start = done.max((now - src_keep) / step * step);
     if upto <= start {
         return Ok(());
     }
@@ -920,6 +937,31 @@ mod tests {
         let five = series(&conns[Db::Metrics as usize], &RADIO, &["aa".into(), "na".into()], now - 600, now, 1).unwrap();
         assert_eq!(five.ts, vec![now - 600]);
         assert_eq!((five.fields["channel"][0], five.fields["bw"][0], five.fields["cu_total"][0]), (Some(149.0), Some(80.0), Some(30.0)));
+    }
+
+    #[test]
+    fn a_bucket_the_source_retention_cuts_through_is_rolled_up_whole() {
+        let dir = temp_dir("cut");
+        std::fs::create_dir_all(&dir).unwrap();
+        migrate(&dir).unwrap();
+        let mut conns = open_all(&dir).unwrap();
+        // Nothing rolled up for longer than raw rows are kept (an outage): the
+        // oldest bucket still in the raw table starts before the raw tier's cutoff.
+        let now = 1_800_000_000 + 150;
+        let bucket = 1_800_000_000 - TIERS[0].keep;
+        let writes = (0..30)
+            .map(|i| {
+                let speed = if i < 15 { 1000.0 } else { 2000.0 };
+                let mut values = vec![Value::Text("aa".into()), Value::Real(speed), Value::Real(0.0)];
+                values.extend(std::iter::repeat_n(Value::Null, UPLINK.counters.len() - 1));
+                Write::Metric { table: &UPLINK, ts: bucket + i * 10, values }
+            })
+            .collect();
+        assert_eq!(apply(&mut conns[Db::Metrics as usize], writes).unwrap(), 0);
+        maintenance(&mut conns, now, false);
+        let five = series(&conns[Db::Metrics as usize], &UPLINK, &["aa".into()], bucket, bucket + 300, 1).unwrap();
+        assert_eq!(five.ts, vec![bucket]);
+        assert_eq!(five.fields["speed"], vec![Some(1500.0)], "the rows before the cutoff count too");
     }
 
     #[test]

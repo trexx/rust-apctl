@@ -758,14 +758,15 @@ async fn import_state(State(s): State<AppState>, Json(state): Json<Value>) -> Ap
 async fn dryrun(State(s): State<AppState>) -> Result<Json<DryRunStatus>, ApiError> {
     // What each AP's render needs, copied under a short lock: the unredacted
     // config seen in this run when there is one. Only full configs count: a
-    // management-only push says nothing about system_cfg.
+    // management-only push says nothing about system_cfg (nor, after a restart,
+    // one without mgmt_cfg about mgmt_cfg).
     let (state, imported_at, aps) = {
         let live = s.live.read().unwrap();
         let aps: Vec<_> = live
             .devices
             .iter()
             .map(|(mac, d)| {
-                let seen = live.last_config.get(mac).filter(|c| !c.system_cfg.is_empty()).cloned();
+                let seen = live.last_config.get(mac).filter(|c| !c.mgmt_cfg.is_empty() && !c.system_cfg.is_empty()).cloned();
                 (*mac, d.snapshot.ap.hostname.clone(), d.snapshot.ap.cfgversion.clone(), seen, live.raw_informs.get(mac).cloned())
             })
             .collect();
@@ -832,7 +833,7 @@ async fn dryrun(State(s): State<AppState>) -> Result<Json<DryRunStatus>, ApiErro
             };
             match renderer(&req) {
                 Ok(ours) => {
-                    let c = crate::dryrun::compare(&ours, &actual.mgmt_cfg, &actual.system_cfg, redacted);
+                    let c = crate::dryrun::compare(&ours, &actual.mgmt_cfg, &actual.system_cfg, redacted, true);
                     let status = if c.mgmt_cfg.identical && c.system_cfg.identical {
                         DryRunState::Match
                     } else if c.matches() {
@@ -1773,6 +1774,22 @@ mod tests {
         let mut frame = [0u8; 2];
         tokio::time::timeout(std::time::Duration::from_secs(5), tcp.read_exact(&mut frame)).await.expect("closed at the logout").unwrap();
         assert_eq!(frame[0], 0x88, "a close frame");
+    }
+
+    #[tokio::test]
+    async fn a_session_cookie_planted_before_ours_does_not_lock_the_user_out() {
+        let (state, _engine, cookie, _dir) = logged_in();
+        let app = router(state);
+        // As a sibling subdomain can set it: for the parent domain, sent first.
+        let both = format!("{}=planted; {cookie}", crate::auth::COOKIE);
+        let send = |req: axum::http::request::Builder| app.clone().oneshot(req.header(header::COOKIE, &both).body(Body::empty()).unwrap());
+        assert_eq!(send(Request::get("/api/status")).await.unwrap().status(), StatusCode::OK);
+        let me = send(Request::get("/api/me")).await.unwrap();
+        let me: Value = serde_json::from_slice(&axum::body::to_bytes(me.into_body(), 1 << 16).await.unwrap()).unwrap();
+        assert_eq!(me["user"], "admin");
+        // A logout ends the valid session among them.
+        assert_eq!(send(Request::post("/api/logout").header("x-requested-with", "apctl")).await.unwrap().status(), StatusCode::OK);
+        assert_eq!(send(Request::get("/api/status")).await.unwrap().status(), StatusCode::UNAUTHORIZED);
     }
 
     #[tokio::test]

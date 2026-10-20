@@ -100,8 +100,8 @@ struct ServeArgs {
     /// Shadow mode: command whose stdout is a pcap stream (restarted if it exits).
     #[arg(long, env = "APCTL_SHADOW_CMD")]
     pub shadow_cmd: Option<String>,
-    /// Inform port(s) in the capture.
-    #[arg(long = "inform-port", env = "APCTL_INFORM_PORT", default_value = "8080")]
+    /// Inform port(s) in the capture, comma-separated or repeated.
+    #[arg(long = "inform-port", env = "APCTL_INFORM_PORT", default_value = "8080", value_delimiter = ',')]
     pub inform_ports: Vec<u16>,
     /// Address for the web UI and API.
     #[arg(long, env = "APCTL_LISTEN", default_value = "127.0.0.1:8090")]
@@ -593,6 +593,16 @@ mod tests {
         assert_eq!(addr(Some("http://[fd00::1]:8080/inform")), ("[fd00::1]".into(), 8080));
         assert_eq!(addr(None), ("unifi".into(), 8081));
         assert_eq!(addr(Some("not a url")), ("unifi".into(), 8081));
+    }
+
+    #[test]
+    fn inform_ports_take_a_comma_list_or_repeated_flags() {
+        let ports = |args: &[&str]| match Cli::try_parse_from([&["apctl", "serve"], args].concat()).unwrap().cmd {
+            Cmd::Serve(a) => a.inform_ports,
+            _ => unreachable!(),
+        };
+        assert_eq!(ports(&["--inform-port", "8080,8443"]), [8080, 8443]);
+        assert_eq!(ports(&["--inform-port", "8080", "--inform-port", "8443"]), [8080, 8443]);
     }
 
     #[tokio::test]

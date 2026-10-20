@@ -211,13 +211,19 @@ impl Auth {
         self.sessions.lock().unwrap().get_mut(&token_hash(token)).unwrap().expires -= secs;
     }
 
-    /// The session a request belongs to (its token's hash); `None` without
+    /// The session a request belongs to (its token's hash): the first of its
+    /// session cookies that is still there, else the first; `None` without
     /// logins (read-only mode has no sessions).
     pub(crate) fn session_of(&self, headers: &HeaderMap) -> Option<String> {
         if !self.enabled() {
             return None;
         }
-        session_token(headers).map(|t| token_hash(&t))
+        let mut hashes = session_tokens(headers).map(token_hash);
+        let first = hashes.next()?;
+        if self.alive(&first) {
+            return Some(first);
+        }
+        Some(hashes.find(|h| self.alive(h)).unwrap_or(first))
     }
 
     /// Changes at every logout.
@@ -385,15 +391,18 @@ fn origin_matches(origin: &str, host: &str) -> bool {
     !authority.is_empty() && bare(authority) == bare(host)
 }
 
-fn session_token(headers: &HeaderMap) -> Option<String> {
+/// Every session cookie a request carries, in order. There can be several: a
+/// sibling subdomain can set one for the parent domain, with a longer Path
+/// that browsers send before apctl's own.
+fn session_tokens(headers: &HeaderMap) -> impl Iterator<Item = &str> {
     headers
         .get_all(header::COOKIE)
         .iter()
         .filter_map(|v| v.to_str().ok())
         .flat_map(|v| v.split(';'))
         .filter_map(|kv| kv.trim().split_once('='))
-        .find(|(k, _)| *k == COOKIE)
-        .map(|(_, v)| v.to_string())
+        .filter(|(k, _)| *k == COOKIE)
+        .map(|(_, v)| v)
 }
 
 /// The session cookie, Secure when the browser used HTTPS: apctl serves
@@ -409,12 +418,11 @@ fn peer_of(extensions: &axum::http::Extensions) -> Option<IpAddr> {
     extensions.get::<ConnectInfo<SocketAddr>>().map(|c| c.0.ip())
 }
 
-/// The user of the request's session, if it is a valid one; and the cookie
-/// to send again when using it extended it (see `renewed`).
+/// The user of the request's first valid session, if any; and the cookie to
+/// send again when using it extended it (see `renewed`).
 fn session(auth: &Auth, headers: &HeaderMap, peer: Option<IpAddr>) -> Option<(String, Option<String>)> {
-    let token = session_token(headers)?;
-    let (user, extended) = auth.check(&token)?;
-    Some((user, extended.then(|| cookie(auth, headers, peer, &token, SESSION_SECS))))
+    let (token, (user, extended)) = session_tokens(headers).find_map(|t| Some((t, auth.check(t)?)))?;
+    Some((user, extended.then(|| cookie(auth, headers, peer, token, SESSION_SECS))))
 }
 
 /// For the routes that hand out secrets (Wi-Fi passphrases, and backups, which
@@ -524,8 +532,8 @@ pub async fn logout(State(s): State<AppState>, req: Request) -> Result<Response,
     if !csrf_ok(headers) {
         return Err(csrf_refused());
     }
-    if let Some(t) = session_token(headers) {
-        s.auth.revoke(&t);
+    for t in session_tokens(headers) {
+        s.auth.revoke(t);
     }
     Ok(([(header::SET_COOKIE, cookie(&s.auth, headers, peer_of(req.extensions()), "", 0))], Json(json!({ "ok": true }))).into_response())
 }
@@ -749,6 +757,8 @@ mod tests {
     fn parses_the_session_cookie() {
         let mut h = HeaderMap::new();
         h.insert(header::COOKIE, "a=1; apctl_session=abc; b=2".parse().unwrap());
-        assert_eq!(session_token(&h).as_deref(), Some("abc"));
+        assert_eq!(session_tokens(&h).collect::<Vec<_>>(), ["abc"]);
+        h.append(header::COOKIE, "apctl_session=def".parse().unwrap());
+        assert_eq!(session_tokens(&h).collect::<Vec<_>>(), ["abc", "def"]);
     }
 }
