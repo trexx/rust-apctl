@@ -1776,6 +1776,22 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_session_cookie_planted_before_ours_does_not_lock_the_user_out() {
+        let (state, _engine, cookie, _dir) = logged_in();
+        let app = router(state);
+        // As a sibling subdomain can set it: for the parent domain, sent first.
+        let both = format!("{}=planted; {cookie}", crate::auth::COOKIE);
+        let send = |req: axum::http::request::Builder| app.clone().oneshot(req.header(header::COOKIE, &both).body(Body::empty()).unwrap());
+        assert_eq!(send(Request::get("/api/status")).await.unwrap().status(), StatusCode::OK);
+        let me = send(Request::get("/api/me")).await.unwrap();
+        let me: Value = serde_json::from_slice(&axum::body::to_bytes(me.into_body(), 1 << 16).await.unwrap()).unwrap();
+        assert_eq!(me["user"], "admin");
+        // A logout ends the valid session among them.
+        assert_eq!(send(Request::post("/api/logout").header("x-requested-with", "apctl")).await.unwrap().status(), StatusCode::OK);
+        assert_eq!(send(Request::get("/api/status")).await.unwrap().status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
     async fn a_session_used_a_day_later_gets_its_cookie_again() {
         let (state, _engine, cookie, _dir) = logged_in_behind(&["10.42.0.0/16"]);
         let token = cookie.split_once('=').unwrap().1;
