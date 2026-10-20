@@ -687,7 +687,7 @@ fn rollup(metrics: &mut Connection, t: &Table, src: &str, dst: &str, step: i64, 
     let done = read_state(metrics, &state_key)?;
     // Only complete buckets, and never further back than the source keeps.
     let upto = ((now - ROLLUP_GRACE_SECS) / step) * step;
-    let start = done.max(now - src_keep);
+    let start = done.max((now - src_keep) / step * step);
     if upto <= start {
         return Ok(());
     }
@@ -920,6 +920,31 @@ mod tests {
         let five = series(&conns[Db::Metrics as usize], &RADIO, &["aa".into(), "na".into()], now - 600, now, 1).unwrap();
         assert_eq!(five.ts, vec![now - 600]);
         assert_eq!((five.fields["channel"][0], five.fields["bw"][0], five.fields["cu_total"][0]), (Some(149.0), Some(80.0), Some(30.0)));
+    }
+
+    #[test]
+    fn a_bucket_the_source_retention_cuts_through_is_rolled_up_whole() {
+        let dir = temp_dir("cut");
+        std::fs::create_dir_all(&dir).unwrap();
+        migrate(&dir).unwrap();
+        let mut conns = open_all(&dir).unwrap();
+        // Nothing rolled up for longer than raw rows are kept (an outage): the
+        // oldest bucket still in the raw table starts before the raw tier's cutoff.
+        let now = 1_800_000_000 + 150;
+        let bucket = 1_800_000_000 - TIERS[0].keep;
+        let writes = (0..30)
+            .map(|i| {
+                let speed = if i < 15 { 1000.0 } else { 2000.0 };
+                let mut values = vec![Value::Text("aa".into()), Value::Real(speed), Value::Real(0.0)];
+                values.extend(std::iter::repeat_n(Value::Null, UPLINK.counters.len() - 1));
+                Write::Metric { table: &UPLINK, ts: bucket + i * 10, values }
+            })
+            .collect();
+        assert_eq!(apply(&mut conns[Db::Metrics as usize], writes).unwrap(), 0);
+        maintenance(&mut conns, now, false);
+        let five = series(&conns[Db::Metrics as usize], &UPLINK, &["aa".into()], bucket, bucket + 300, 1).unwrap();
+        assert_eq!(five.ts, vec![bucket]);
+        assert_eq!(five.fields["speed"], vec![Some(1500.0)], "the rows before the cutoff count too");
     }
 
     #[test]
