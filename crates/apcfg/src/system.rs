@@ -348,9 +348,11 @@ fn addressing(c: &mut Cfg, ctx: &Ctx) {
 fn syslog(c: &mut Cfg, ctx: &Ctx) {
     let s = ctx.setting("rsyslogd");
     let enabled = flag(s, "enabled", false);
-    let this = flag(s, "this_controller", false);
+    // "To this controller" counts only while remote syslog is on: switched off, the
+    // stored `this_controller` is kept but sends nothing.
+    let this = enabled && flag(s, "this_controller", false);
     let encrypted_only = flag(s, "this_controller_encrypted_only", false);
-    if enabled && this && encrypted_only && !ctx.caps.has(Cap::EncryptedSyslog) {
+    if this && encrypted_only && !ctx.caps.has(Cap::EncryptedSyslog) {
         return;
     }
     let wants_ap_logs = flag(s, "log_all_contents", false) || str_list(s, "contents").any(|c| c == "access_points");
@@ -779,6 +781,31 @@ mod tests {
         let mut c = Cfg::default();
         switch(&mut c, &ctx);
         c.finish().lines().filter(|l| l.starts_with("switch.port.")).map(str::to_string).collect()
+    }
+
+    fn syslog_lines(rsyslogd: Value) -> String {
+        let mac = "02:00:00:00:00:01";
+        let mut rsyslogd = rsyslogd;
+        rsyslogd["key"] = json!("rsyslogd");
+        let state = json!({ "sites": [{ "_id": "s" }], "setting": [rsyslogd], "devices": [{ "mac": mac, "site_id": "s", "type": "uap", "syslog_key": "k" }] });
+        let controller = Controller::default();
+        let inform = json!({ "inform_ip": "192.0.2.1" });
+        let ctx = Ctx::new(&Input { state: &state, device_mac: mac, inform: Some(&inform), cfgversion: "1", controller: &controller }).unwrap();
+        let mut c = Cfg::default();
+        syslog(&mut c, &ctx);
+        c.finish()
+    }
+
+    /// Remote syslog switched off keeps its "this controller" choice stored, but sends
+    /// neither the encrypted syslog nor the netconsole toward the controller.
+    #[test]
+    fn syslog_off_sends_nothing_to_this_controller() {
+        let on = syslog_lines(json!({ "enabled": true, "this_controller": true }));
+        assert!(on.contains("syslog.remote.encrypt=enabled\nsyslog.remote.key=k\n") && on.contains("netconsole.host=192.0.2.1\n"), "{on}");
+        let off = syslog_lines(json!({ "enabled": false, "this_controller": true }));
+        assert_eq!(off, "# syslog\nsyslog.status=enabled\nsyslog.level=7\n");
+        let off_netconsole = syslog_lines(json!({ "enabled": false, "this_controller": true, "netconsole_enabled": true, "netconsole_host": "192.0.2.9", "netconsole_port": "6666" }));
+        assert!(off_netconsole.ends_with("syslog.level=7\nnetconsole.host=192.0.2.9\nnetconsole.port=6666\nnetconsole.status=enabled\n"), "{off_netconsole}");
     }
 
     #[test]
