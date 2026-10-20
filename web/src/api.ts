@@ -290,7 +290,8 @@ export interface EventPayloads {
   config_applied: { seconds_after_push?: number | null };
   client_connect_failed: { essid?: string | null; reason?: string | null; rssi?: number | null };
   dfs_radar: { channel?: number | null };
-  rogue_ap: { essid?: string | null; rogue_channel?: number | null; signal_strength?: number | null };
+  /** The AP's notification as it came; its channel may be text, and the signal's unit isn't documented (probably dBm when negative). */
+  rogue_ap: { essid?: string | null; bssid?: string | null; channel?: number | string | null; signal?: number | null };
   network_threat: { essid?: string | null; detail?: string; severity?: "high" | "medium" | "low" };
   client_kicked: { reason?: string | null; signal?: number | null; vap?: string | null };
   ap_upgrade_sent: { target?: string | null };

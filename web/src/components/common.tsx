@@ -475,8 +475,11 @@ const EVENTS: { [K in EventKind]: EventSpec<K> } = {
     describe: (d) =>
       parts(
         d.essid,
-        !!d.rogue_channel && `channel ${d.rogue_channel}`,
-        !!d.signal_strength && dbm(d.signal_strength),
+        d.bssid,
+        !!d.channel && `channel ${d.channel}`,
+        typeof d.signal === "number" &&
+          d.signal !== 0 &&
+          (d.signal < 0 ? dbm(d.signal) : `signal ${d.signal}`),
       ),
   },
   network_threat: {
