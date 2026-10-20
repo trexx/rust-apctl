@@ -1339,10 +1339,27 @@ fn wlan_links(state: &mut Value, p: &Value, w: &mut Value) -> Result<(), String>
         w["schedule_with_duration"] = json!(check_schedule(&p["schedule_with_duration"])?);
     }
     if let Some(n) = str_field(p, "networkconf_id")? {
-        if doc_by_id(state, "networkconf", n).is_none() {
-            return Err("unknown network".into());
+        let net = doc_by_id(state, "networkconf", n).ok_or("unknown network")?;
+        // A network stored already (an import's, say) stays, whatever it is.
+        if w["networkconf_id"].as_str() != Some(n) {
+            ssid_network(net)?;
         }
         w["networkconf_id"] = json!(n);
+    }
+    Ok(())
+}
+
+/// Whether an SSID may be put on a network, as the official UI offers them: a
+/// LAN one (corporate, guest or VLAN-only; one without a purpose is taken
+/// too), not a WAN or VPN one, nor the inter-VLAN routing network (VLAN 4040).
+fn ssid_network(net: &Value) -> Result<(), String> {
+    let name = net["name"].as_str().unwrap_or("?");
+    match net["purpose"].as_str().filter(|p| !p.is_empty()) {
+        None | Some("corporate" | "guest" | "vlan-only") => {}
+        Some(purpose) => return Err(format!("network \"{name}\" ({purpose}) cannot carry an SSID")),
+    }
+    if num(&net["vlan"]) == Some(4040) {
+        return Err(format!("network \"{name}\" is the inter-VLAN routing network (VLAN 4040), which cannot carry an SSID"));
     }
     Ok(())
 }
@@ -1514,6 +1531,10 @@ pub fn create_wlan(state: &mut Value, patch: &Value) -> Result<String, String> {
         patch["protection"] = json!("wpa2");
     }
     let name = patch["name"].as_str().unwrap_or_default().trim().to_string();
+    // The network asked for is checked even when it is the one chosen by default.
+    if let Some(net) = str_field(&patch, "networkconf_id")?.and_then(|n| doc_by_id(state, "networkconf", n)) {
+        ssid_network(net)?;
+    }
     array_mut(state, "wlanconf").push(doc);
     let (_, channels) = edit_wlan(state, &WlanEdit { id, patch }, &over)?;
     Ok(with_notes(format!("added SSID \"{name}\""), &channels))
@@ -2105,6 +2126,25 @@ mod tests {
             create_wlan(&mut s, &json!({ "name": format!("N{i}"), "passphrase": "password1" })).unwrap();
         }
         assert!(create_wlan(&mut s, &json!({ "name": "N4", "passphrase": "password1" })).unwrap_err().contains("supports 4"));
+    }
+
+    #[test]
+    fn ssids_go_only_on_networks_the_official_ui_offers() {
+        let mut s = state();
+        s["networkconf"].as_array_mut().unwrap().extend([
+            json!({ "_id": "wan", "name": "Internet", "purpose": "wan", "site_id": "s1" }),
+            json!({ "_id": "ivr", "name": "Routing", "purpose": "corporate", "vlan": "4040", "site_id": "s1" }),
+            json!({ "_id": "iot", "name": "IoT", "purpose": "vlan-only", "vlan": 30, "site_id": "s1" }),
+        ]);
+        assert_eq!(edit(&mut s, json!({ "networkconf_id": "wan" })).unwrap_err(), "network \"Internet\" (wan) cannot carry an SSID");
+        assert!(edit(&mut s, json!({ "networkconf_id": "ivr" })).unwrap_err().contains("VLAN 4040"));
+        assert!(create_wlan(&mut s.clone(), &json!({ "name": "Up", "passphrase": "password1", "networkconf_id": "wan" })).unwrap_err().contains("cannot carry"));
+        edit(&mut s, json!({ "networkconf_id": "iot" })).unwrap();
+        create_wlan(&mut s, &json!({ "name": "Things", "passphrase": "password1", "networkconf_id": "iot" })).unwrap();
+        // One stored already (an import's) is left alone: the SSID's other fields can be edited, and the network sent back as it is.
+        s["wlanconf"][0]["networkconf_id"] = json!("wan");
+        edit(&mut s, json!({ "hide_ssid": true, "networkconf_id": "wan" })).unwrap();
+        assert_eq!((s["wlanconf"][0]["hide_ssid"].as_bool(), s["wlanconf"][0]["networkconf_id"].as_str()), (Some(true), Some("wan")));
     }
 
     #[test]
