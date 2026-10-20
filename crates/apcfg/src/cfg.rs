@@ -9,7 +9,7 @@
 //!
 //! Keys are written straight into the output: callers pass a [`Prefix`] key or
 //! `format_args!`, not a formatted `String` (a render writes several hundred lines,
-//! and the controller renders on every inform).
+//! for every AP each time the settings change).
 
 use std::fmt::{self, Display, Write};
 
