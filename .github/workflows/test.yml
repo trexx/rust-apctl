@@ -6,6 +6,12 @@ on:
   pull_request:
   workflow_call:
 
+# A newer push to a pull request cancels the run of the old one. Called from another
+# workflow, github.workflow is the caller's, so the group is not the caller's own.
+concurrency:
+  group: 'test-${{ github.workflow }}-${{ github.ref }}'
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   rust:
     runs-on: 'ubuntu-26.04'

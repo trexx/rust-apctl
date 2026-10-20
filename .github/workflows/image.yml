@@ -4,12 +4,18 @@ name: 'Image'
 # Renovate automerges minor and digest bumps of the Dockerfile's images once the checks
 # pass, and a bump that breaks the image (the OUI download, a glibc mismatch between the
 # rust and distroless images) must fail here, not at the next release.
+# The manifests too: the release profile and crate features are exercised only here.
 on:
   push:
     branches: [ 'master' ]
-    paths: [ 'Dockerfile', '.dockerignore', 'Cargo.lock', 'web/package-lock.json', '.github/workflows/image.yml' ]
+    paths: [ 'Dockerfile', '.dockerignore', 'Cargo.toml', 'crates/*/Cargo.toml', 'Cargo.lock', 'web/package-lock.json', '.github/workflows/image.yml' ]
   pull_request:
-    paths: [ 'Dockerfile', '.dockerignore', 'Cargo.lock', 'web/package-lock.json', '.github/workflows/image.yml' ]
+    paths: [ 'Dockerfile', '.dockerignore', 'Cargo.toml', 'crates/*/Cargo.toml', 'Cargo.lock', 'web/package-lock.json', '.github/workflows/image.yml' ]
+
+# A newer push to a pull request (Renovate rebasing it) cancels the build of the old one.
+concurrency:
+  group: 'image-${{ github.ref }}'
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   build:
