@@ -159,6 +159,30 @@ fn failure(n: &ConnDetail) -> Option<(usize, &'static str)> {
     FAILURES.iter().rev().find(|f| (f.2)(n)).map(|f| (f.0, f.1))
 }
 
+/// Below this signal (dBm), a failure is not the network's fault: not counted.
+const WEAK_SIGNAL: f64 = -75.0;
+
+/// The signal a report was made at.
+fn rssi(n: &ConnDetail) -> Option<f64> {
+    num(&n.auth_rssi).or_else(|| num(&n.avg_rssi))
+}
+
+/// The furthest failure an attempt that did not succeed is counted with:
+/// none if it shows none, or was made at a weak signal.
+fn counted_failure(n: &ConnDetail) -> Option<(usize, &'static str)> {
+    if rssi(n).is_some_and(|r| r < WEAK_SIGNAL) { None } else { failure(n) }
+}
+
+/// A failure report as it comes in, by the connection views' rules: the
+/// label of the failure they count it with, or none if they count it as a
+/// success or not at all. (A fixup that comes later can still make it a success.)
+pub(crate) fn reported_failure(event_type: &str, n: &ConnDetail) -> Option<&'static str> {
+    if !matches!(event_type, "failure" | "soft failure") || succeeded(event_type, n) {
+        return None;
+    }
+    counted_failure(n).map(|(_, label)| label)
+}
+
 /// A soft failure that kept its IP by roaming.
 fn roamed(event_type: &str, n: &ConnDetail) -> bool {
     event_type == "soft failure" && text(&n.ip_assign_type).is_some_and(|v| v.starts_with("roam"))
@@ -303,14 +327,11 @@ pub fn attempts(mut events: Vec<ConnEvent>) -> Vec<Attempt> {
         .into_iter()
         .filter_map(|(e, ok, fixed)| {
             let n = &e.n;
-            let rssi = num(&n.auth_rssi).or_else(|| num(&n.avg_rssi));
+            let rssi = rssi(n);
             let (stage, failure) = if ok {
                 (6, None)
             } else {
-                if rssi.is_some_and(|r| r < -75.0) {
-                    return None;
-                }
-                let (stage, label) = failure(n)?;
+                let (stage, label) = counted_failure(n)?;
                 (stage, Some(label))
             };
             Some(Attempt {

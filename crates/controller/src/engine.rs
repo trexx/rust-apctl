@@ -11,7 +11,7 @@ use std::sync::{Arc, RwLock};
 
 use inform::Mac;
 use rusqlite::types::Value as Sql;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::sync::broadcast;
 use wire::cfgdiff;
@@ -1307,11 +1307,19 @@ impl Engine {
             num("dns_timeouts").map(|v| v as i64).into(),
             num("avg_rssi").or_else(|| num("auth_rssi")).map(|v| v as i64).into(),
         ];
-        // Failed attempts are worth an event; the rest stay in the connection log.
-        // A roam is reported as a "soft failure" but is a normal, successful move.
-        let roamed = n["ip_assign_type"].as_str().is_some_and(|t| t.starts_with("roam"));
-        let failed = (event_type == "failure" || (event_type == "soft failure" && !roamed))
-            .then(|| json!({ "essid": essid, "reason": n["sta_dc_reason"], "auth_algo": n["auth_algo"], "rssi": num("auth_rssi") }));
+        // Failed attempts are worth an event, as the connection views count them (a
+        // roam, or a soft failure that got traffic and DNS answers, is none); the
+        // rest stay in the connection log. Without a reason from the AP, the stage
+        // it failed at is the reason.
+        let detail = crate::connections::ConnDetail::deserialize(&n).unwrap_or_default();
+        let failed = crate::connections::reported_failure(&event_type, &detail).map(|label| {
+            let reason = match &n["sta_dc_reason"] {
+                Value::Null => json!(label),
+                Value::String(r) if r.is_empty() => json!(label),
+                r => r.clone(),
+            };
+            json!({ "essid": essid, "reason": reason, "auth_algo": n["auth_algo"], "rssi": num("auth_rssi").or_else(|| num("avg_rssi")) })
+        });
         // The whole notification, with the channel and width at the time: timings, failure
         // counters and stage flags for connectivity stats, and the roaming views.
         if let Some((channel, bw)) = at {
@@ -2571,13 +2579,24 @@ mod tests {
         let success = json!({ "message_type": "STA_ASSOC_TRACKER", "event_type": "success", "mac": C1, "vap": "wifi1ap0",
             "assoc_delta": "40000", "wpa_auth_delta": "80000", "ip_delta": "100000", "dns_responses": "1", "dns_timeouts": "0", "avg_rssi": "-61" });
         h.engine.handle(Input::Inform { ts: 6, peer: [10, 0, 0, 1].into(), decoded: notif(AP1, "event", success) });
-        let failure = json!({ "message_type": "STA_ASSOC_TRACKER", "event_type": "soft failure", "mac": C1, "vap": "wifi1ap0", "sta_dc_reason": "roam", "auth_rssi": "-81" });
-        h.engine.handle(Input::Inform { ts: 7, peer: [10, 0, 0, 1].into(), decoded: notif(AP1, "event", failure) });
+        // Failures as the connection views count them: not one at a weak signal,
+        // nor a soft failure that got traffic and DNS answers.
+        let tracker = |fields: Value| {
+            let mut n = json!({ "message_type": "STA_ASSOC_TRACKER", "mac": C1, "vap": "wifi1ap0" });
+            n.as_object_mut().unwrap().extend(fields.as_object().unwrap().clone());
+            notif(AP1, "event", n)
+        };
+        h.engine.handle(Input::Inform { ts: 7, peer: [10, 0, 0, 1].into(), decoded: tracker(json!({ "event_type": "failure", "wpa_auth_failures": "1", "auth_rssi": "-81" })) });
+        let fine = json!({ "event_type": "soft failure", "dns_timeouts": "1", "traffic_delta": "300000", "dns_responses": "2", "auth_rssi": "-60" });
+        h.engine.handle(Input::Inform { ts: 7, peer: [10, 0, 0, 1].into(), decoded: tracker(fine) });
+        h.engine.handle(Input::Inform { ts: 7, peer: [10, 0, 0, 1].into(), decoded: tracker(json!({ "event_type": "failure", "wpa_auth_failures": "1", "auth_rssi": "-60" })) });
         h.engine.handle(Input::Inform { ts: 8, peer: [10, 0, 0, 1].into(), decoded: notif(AP1, "event", json!({ "event_string": "EVT_AP_RadarDetected", "channel": 52 })) });
         assert_eq!(
             events(&mut h),
             vec![("config_applied", None), ("client_connect_failed", Some(C1.into())), ("dfs_radar", None)]
         );
+        let failed = stored(&h, EventKind::ClientConnectFailed);
+        assert_eq!((&failed[0]["reason"], &failed[0]["rssi"]), (&json!("WPA authentication"), &json!(-60.0)));
         // One whose mac is not one is counted as undecodable.
         let mut bad = notif(AP1, "setparam", Value::Null);
         bad.payload["mac"] = json!("nope");
@@ -2586,7 +2605,7 @@ mod tests {
         let live = h.live.read().unwrap();
         assert_eq!(live.counters.decode_errors.load(Ordering::Relaxed), 1);
         assert!(live.clients[&C1.parse().unwrap()].connected);
-        assert_eq!(live.counters.notifications.load(Ordering::Relaxed), 4);
+        assert_eq!(live.counters.notifications.load(Ordering::Relaxed), 6);
         assert_eq!(live.devices[&AP1.parse().unwrap()].last_full_inform, 0, "notifications are not client lists");
     }
 
