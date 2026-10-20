@@ -48,10 +48,14 @@ These screenshots use mock data from `informdump demo`.
 
 ```sh
 printf '%s' 'a long password' | docker run --rm -i ghcr.io/trexx/rust-apctl hash-password | sed 's/^/admin:/' > users
-docker run -d -v apctl-data:/data -v $PWD/users:/users:ro -e APCTL_USERS_FILE=/users \
+docker run -d -v apctl-data:/data -v $PWD/users:/users:ro -v $PWD/import.json:/import.json:ro -e APCTL_USERS_FILE=/users \
   -e APCTL_SYSLOG_LISTEN=0.0.0.0:5514 -p 8090:8090 -p 8080:8080 -p 5514:5514/udp -p 3478:3478/udp \
-  ghcr.io/trexx/rust-apctl serve --active --keys /data/import.json
+  ghcr.io/trexx/rust-apctl serve --active --keys /import.json
 ```
+
+`import.json` is the snapshot `informdump import` wrote, readable only by its owner. The
+container runs as uid 65532, which must be able to read it: `sudo chown 65532 import.json`
+for Docker, `podman unshare chown 65532 import.json` for rootless Podman.
 
 On Kubernetes (active mode), with the APs' ports on the node and the data on local storage:
 
