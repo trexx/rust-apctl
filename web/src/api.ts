@@ -1311,12 +1311,14 @@ export function useLiveUpdates(): void {
           // Only the overview's cards use the whole list; the names have their own query.
           invalidate(keys.devices(), 4000);
           invalidate(keys.device(msg.mac));
+          // A client page changes when its AP reports (or with an event for the client, below).
+          for (const q of qc.getQueryCache().findAll({ queryKey: keys.client(), type: "active" }))
+            if ((q.state.data as ClientDetail | undefined)?.sample.ap_mac === msg.mac) invalidate(q.queryKey, 4000);
           break;
         case "clients":
           // Sent with every report that has clients, without saying which changed. The list holds every
-          // client of the past year, so it follows more slowly; at most one client page is open.
+          // client of the past year, so it follows more slowly.
           invalidate(keys.clients(), 20_000);
-          invalidate(keys.client(), 4000);
           break;
         case "event": {
           const e = msg;
@@ -1337,6 +1339,8 @@ export function useLiveUpdates(): void {
           }
           if (msg.kind === "channel_plan") invalidate(keys.channelAi());
           if (msg.kind === "network_threat") invalidate(keys.threats());
+          // Connected, gone, roamed, renamed, blocked: its page shows it.
+          if (msg.client_mac) invalidate(keys.client(msg.client_mac));
           if (msg.kind === "client_renamed") invalidate(keys.clientNames());
           // A client without a name may have reported one as it connected.
           else if (msg.kind === "client_connected" && msg.client_mac && !qc.getQueryData<Names>(keys.clientNames())?.[msg.client_mac])
