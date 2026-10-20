@@ -656,10 +656,9 @@ pub async fn inform(
     }
 
     // Which keys may this AP use? Its own if apctl manages it; the factory key always.
+    // With its record's AES-GCM pin, as the official controller keeps it (see `managed_inform`).
     let state = active.live.read().unwrap().state.clone();
-    let device_key = crate::adopt::device_key(state.as_deref(), &active.keys, &mac);
-    // Its record's AES-GCM pin, as the official controller keeps it (see `managed_inform`).
-    let pinned = state.as_deref().and_then(|st| crate::adopt::device_doc(st, &mac)).is_some_and(|d| d["x_aes_gcm"].as_bool() == Some(true));
+    let (device_key, pinned) = crate::adopt::device_key(state.as_deref(), &active.keys, &mac).map_or((None, false), |(k, gcm)| (Some(k), gcm));
     drop(state);
     let (used, key, payload, permit) = match active.open(body, device_key).await {
         Ok(opened) => opened,
@@ -1457,7 +1456,7 @@ mod tests {
         let Some(_) = fixtures() else { return };
         let rig = rig(true, None);
         let ap: Mac = AP.parse().unwrap();
-        let key = crate::adopt::device_key(rig.live.read().unwrap().state.as_deref(), &rig.active.keys, &ap).expect("a managed AP");
+        let (key, _) = crate::adopt::device_key(rig.live.read().unwrap().state.as_deref(), &rig.active.keys, &ap).expect("a managed AP");
         rig.live.write().unwrap().adoption.adopting.insert(ap, crate::adopt::Adopting { since: clock::now_ts(), kept_key: true });
         // Anyone can send this under the AP's MAC: it gets no mgmt_cfg (and no key).
         let (status, reply) = inform_as_ap(&rig, &ap_payload("1"), DEFAULT_KEY, GCM_ZLIB).await;

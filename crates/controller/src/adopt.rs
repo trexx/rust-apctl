@@ -102,13 +102,16 @@ pub fn device_doc_mut<'a>(state: &'a mut Value, mac: &Mac) -> Option<&'a mut Val
 /// The key an AP apctl manages informs with: its record's `x_authkey`, else
 /// the key file (keys exported from the other controller). `None` when apctl
 /// doesn't manage it; before any settings are imported, the key file decides.
-pub fn device_key(state: Option<&Value>, keys: &KeyStore, mac: &Mac) -> Option<[u8; 16]> {
+/// With it, whether the record pins AES-GCM (`x_aes_gcm`): one lookup of the
+/// record serves both, for every inform.
+pub fn device_key(state: Option<&Value>, keys: &KeyStore, mac: &Mac) -> Option<([u8; 16], bool)> {
     match state {
         Some(state) => {
             let d = device_doc(state, mac)?;
-            d["x_authkey"].as_str().and_then(|k| inform::parse_key(k).ok()).or_else(|| keys.get(mac).copied())
+            let key = d["x_authkey"].as_str().and_then(|k| inform::parse_key(k).ok()).or_else(|| keys.get(mac).copied())?;
+            Some((key, d["x_aes_gcm"].as_bool() == Some(true)))
         }
-        None => keys.get(mac).copied(),
+        None => keys.get(mac).map(|k| (*k, false)),
     }
 }
 
@@ -508,7 +511,7 @@ mod tests {
         let s = state();
         let keys = KeyStore::default();
         let ap: Mac = "02:00:00:00:00:01".parse().unwrap();
-        assert_eq!(device_key(Some(&s), &keys, &ap), Some([0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]));
+        assert_eq!(device_key(Some(&s), &keys, &ap), Some(([0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15], false)));
         assert_eq!(device_key(Some(&s), &keys, &"02:00:00:00:00:09".parse().unwrap()), None, "not in the settings: not ours");
         let mut file = KeyStore::default();
         file.insert("02:00:00:00:00:09", "ffffffffffffffffffffffffffffffff").unwrap();
@@ -518,6 +521,8 @@ mod tests {
         let key = device_doc(&padded, &ap).unwrap()["x_authkey"].as_str().unwrap().to_string();
         device_doc_mut(&mut padded, &ap).unwrap()["x_authkey"] = json!(format!(" {key}\n"));
         assert_eq!(device_key(Some(&padded), &keys, &ap), device_key(Some(&s), &keys, &ap), "whitespace around a stored key is ignored");
+        device_doc_mut(&mut padded, &ap).unwrap()["x_aes_gcm"] = json!(true);
+        assert_eq!(device_key(Some(&padded), &keys, &ap).map(|k| k.1), Some(true), "the record's AES-GCM pin comes with it");
     }
 
     #[tokio::test]
