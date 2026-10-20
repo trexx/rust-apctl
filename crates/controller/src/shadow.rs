@@ -50,28 +50,36 @@ const REPLAY_TICK_SECS: i64 = 5;
 /// A live capture can lag (tcpdump buffering, a slow pipe): the wall-clock
 /// ticks are moved back by the lag, or an AP would look gone between two of
 /// its informs. A capture further behind than `REPLAY_LAG_SECS` is a replay:
-/// it sends the ticks itself, in capture time, and the wall-clock ticks pause.
+/// it sends the ticks itself, in capture time, and the wall-clock ticks pause
+/// until it ends, or until it has gone `REPLAY_LAG_SECS` without an inform (a
+/// live feed that stalled behind): time then runs on from where the capture
+/// got to, so the APs it no longer shows informing time out.
 #[derive(Debug, Default)]
 pub struct Clock {
     lag: AtomicI64,
+    /// The wall-clock time of the latest inform noted.
+    seen: AtomicI64,
 }
 
 impl Clock {
     /// The engine's time now, or `None` while a replay ticks in its own time.
     pub fn now(&self) -> Option<Ts> {
-        let lag = self.lag.load(Ordering::Relaxed);
-        (lag <= REPLAY_LAG_SECS).then(|| crate::clock::now_ts() - lag)
+        let lag = self.lag.load(Ordering::Acquire);
+        let wall = crate::clock::now_ts();
+        (lag <= REPLAY_LAG_SECS || wall - self.seen.load(Ordering::Relaxed) > REPLAY_LAG_SECS).then_some(wall - lag)
     }
 
     /// Notes an inform's capture time; true if the capture is being replayed.
     fn observe(&self, ts: Ts) -> bool {
-        let lag = (crate::clock::now_ts() - ts).max(0);
-        self.lag.store(lag, Ordering::Relaxed);
+        let wall = crate::clock::now_ts();
+        let lag = (wall - ts).max(0);
+        self.seen.store(wall, Ordering::Relaxed);
+        self.lag.store(lag, Ordering::Release);
         lag > REPLAY_LAG_SECS
     }
 
     fn reset(&self) {
-        self.lag.store(0, Ordering::Relaxed);
+        self.lag.store(0, Ordering::Release);
     }
 }
 
@@ -234,6 +242,9 @@ mod tests {
         // A replay sends its own ticks.
         assert!(clock.observe(now - 3600));
         assert_eq!(clock.now(), None);
+        // One that has sent nothing for a while has stalled: its time runs on.
+        clock.seen.store(now - REPLAY_LAG_SECS - 10, Ordering::Relaxed);
+        assert!(clock.now().is_some_and(|t| (now - 3600..now - 3598).contains(&t)));
         clock.reset();
         assert!(clock.now().is_some());
     }
