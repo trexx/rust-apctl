@@ -84,9 +84,6 @@ export function RadioFields({
   const legal = allowed(r, outdoor, form.ht);
   const lo = r.caps?.min_txpower ?? 1;
   const hi = r.caps?.max_txpower ?? 30;
-  // A setting the lists don't offer is still shown as it is, not as the first choice.
-  const strayWidth = !widths.includes(form.ht);
-  const strayChannel = form.channel !== "auto" && !legal.includes(form.channel);
   // Custom power starts at the most the radio can do (what High gives), so
   // the power shown is the one sent; with none, the AP would stay on auto.
   const setPowerMode = (m: string) =>
@@ -104,18 +101,14 @@ export function RadioFields({
           onChange={(w) =>
             onChange(keepAllowed(r, { ...form, ht: w }, outdoor))
           }
-          options={[
-            ...(strayWidth ? [[form.ht, `${form.ht} MHz`] as const] : []),
-            ...widths.map((w) => [w, `${w} MHz`] as const),
-          ]}
+          stray={(w) => `${w} MHz`}
+          options={widths.map((w) => [w, `${w} MHz`] as const)}
         />
         <Select
           {...bind("channel")}
+          stray={(c) => `${c} (not allowed here)`}
           options={[
             ["auto", "Auto"],
-            ...(strayChannel
-              ? [[form.channel, `${form.channel} (not allowed here)`] as const]
-              : []),
             ...legal.map((c) => {
               // DFS is a 5 GHz rule; 6 GHz reuses the channel numbers.
               const dfs = r.radio === "na" && c >= 52 && c <= 144;

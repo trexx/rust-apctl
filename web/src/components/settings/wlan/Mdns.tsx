@@ -95,12 +95,10 @@ function MdnsRules({
                           : r.ap_macs,
                     })
                   }
+                  stray={() => "AP groups (set elsewhere)"}
                   options={[
                     ["all", "all APs"],
                     ["specific", "these APs"],
-                    ...(r.ap_scope_mode === "group"
-                      ? [["group", "AP groups (set elsewhere)"] as const]
-                      : []),
                   ]}
                 />
               </label>

@@ -148,6 +148,7 @@ export function DeviceEditor({
         {d.antennas.length > 1 && (
           <Select
             {...bind("antenna_id")}
+            stray={() => "(not set)"}
             options={d.antennas.map((a) => [a.id, a.name] as const)}
           />
         )}

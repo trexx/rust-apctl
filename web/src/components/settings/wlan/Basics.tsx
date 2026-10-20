@@ -69,17 +69,13 @@ export function Basics({
       </Row>
       <Row label="Security">
         <Select
-          value={f.protection ?? ""}
-          onChange={(v) => setProtection(v || null)}
-          options={[
-            // Shown, not chosen: the SSID's security is one this editor doesn't offer.
-            ...(f.protection === null
-              ? [["", "(other, set elsewhere)", true] as const]
-              : []),
-            ...PROTECTION.map(
-              ([v, l]) => [v, l, iot && v !== "wpa2" && v !== "open"] as const,
-            ),
-          ]}
+          value={f.protection}
+          onChange={setProtection}
+          // Shown, not chosen: the SSID's security is one this editor doesn't offer.
+          stray={() => "(other, set elsewhere)"}
+          options={PROTECTION.map(
+            ([v, l]) => [v, l, iot && v !== "wpa2" && v !== "open"] as const,
+          )}
         />
       </Row>
       {f.protection !== "open" && (
@@ -136,7 +132,8 @@ export function Basics({
         <Row label="Network">
           <Select
             {...bind("networkconf_id")}
-            fallback=""
+            // A new SSID goes on the server's default network.
+            stray={(v) => (v ? "(unknown network)" : "(the default network)")}
             options={list.networks.map(
               (n) =>
                 [
