@@ -69,8 +69,10 @@ pub struct FieldComparison {
     pub added: usize,
     pub removed: usize,
     pub changed: usize,
-    /// Redacted key diff from the actual config to ours (`+` only in ours).
-    pub diff: String,
+    /// Redacted key diff from the actual config to ours (`+` only in ours), when
+    /// asked for: a push's dry run stores the counts alone, as the history shows.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub diff: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -83,18 +85,6 @@ impl Comparison {
     /// Identical, or differing only in the order of unordered lists.
     pub fn matches(&self) -> bool {
         self.mgmt_cfg.equivalent && self.system_cfg.equivalent
-    }
-
-    /// As a push's dry run stores it: JSON without the diffs' text, which nothing
-    /// reads back (the history shows the counts).
-    pub fn stored(&self) -> String {
-        let mut v = serde_json::to_value(self).expect("a comparison serialises");
-        for field in ["mgmt_cfg", "system_cfg"] {
-            if let Some(f) = v[field].as_object_mut() {
-                f.remove("diff");
-            }
-        }
-        v.to_string()
     }
 }
 
@@ -173,8 +163,8 @@ fn lines(s: &str) -> Vec<&str> {
 
 /// Compares our config with the actual one. With `redacted`, secret values are
 /// masked on both sides first (used when only a redacted copy of the actual
-/// config is available).
-pub fn compare_field(ours: &str, actual: &str, redacted: bool) -> FieldComparison {
+/// config is available). The diff's text is made only `with_diff`.
+pub fn compare_field(ours: &str, actual: &str, redacted: bool, with_diff: bool) -> FieldComparison {
     let (ours, actual) = masked(ours, actual, redacted);
     let (o, a) = (lines(&ours), lines(&actual));
     let d = cfgdiff::diff(&actual, &ours);
@@ -188,14 +178,14 @@ pub fn compare_field(ours: &str, actual: &str, redacted: bool) -> FieldCompariso
         added: d.added.len(),
         removed: d.removed.len(),
         changed: d.changed.len(),
-        diff: d.render("", true),
+        diff: with_diff.then(|| d.render("", true)),
     }
 }
 
-pub fn compare(ours: &Rendered, actual_mgmt: &str, actual_system: &str, redacted: bool) -> Comparison {
+pub fn compare(ours: &Rendered, actual_mgmt: &str, actual_system: &str, redacted: bool, with_diff: bool) -> Comparison {
     Comparison {
-        mgmt_cfg: compare_field(&ours.0, actual_mgmt, redacted),
-        system_cfg: compare_field(&ours.1, actual_system, redacted),
+        mgmt_cfg: compare_field(&ours.0, actual_mgmt, redacted, with_diff),
+        system_cfg: compare_field(&ours.1, actual_system, redacted, with_diff),
     }
 }
 
@@ -229,10 +219,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_stored_comparison_has_the_counts_without_the_diffs() {
-        let c = compare(&("a=1\nb=3".into(), "x=1".into()), "a=1\nb=2", "x=1", false);
-        assert!(!c.mgmt_cfg.diff.is_empty());
-        let stored: serde_json::Value = serde_json::from_str(&c.stored()).unwrap();
+    fn a_comparison_without_diffs_has_the_counts() {
+        let ours = ("a=1\nb=3".into(), "x=1".into());
+        assert!(compare(&ours, "a=1\nb=2", "x=1", false, true).mgmt_cfg.diff.is_some_and(|d| !d.is_empty()));
+        let stored = serde_json::to_value(compare(&ours, "a=1\nb=2", "x=1", false, false)).unwrap();
         assert_eq!(stored["mgmt_cfg"]["changed"], 1);
         assert_eq!(stored["system_cfg"]["identical"], true);
         assert!(stored["mgmt_cfg"].get("diff").is_none() && stored["system_cfg"].get("diff").is_none(), "{stored}");
@@ -241,38 +231,39 @@ mod tests {
     #[test]
     fn compares_order_content_and_masks_secrets() {
         let actual = "a=1\nb=2\naaa.1.wpa.psk=hunter2\n";
-        let same = compare_field("a=1\nb=2\naaa.1.wpa.psk=hunter2", actual, false);
+        let same = compare_field("a=1\nb=2\naaa.1.wpa.psk=hunter2", actual, false, true);
         assert!(same.identical && same.same_content);
 
-        let reordered = compare_field("b=2\na=1\naaa.1.wpa.psk=hunter2", actual, false);
+        let reordered = compare_field("b=2\na=1\naaa.1.wpa.psk=hunter2", actual, false, true);
         assert!(!reordered.identical && reordered.same_content);
 
-        let different = compare_field("a=1\nb=3\naaa.1.wpa.psk=other\nc=4", actual, false);
+        let different = compare_field("a=1\nb=3\naaa.1.wpa.psk=other\nc=4", actual, false, true);
         assert_eq!((different.added, different.removed, different.changed), (1, 0, 2));
-        assert!(!different.diff.contains("hunter2") && !different.diff.contains("other"), "{}", different.diff);
+        let diff = different.diff.unwrap();
+        assert!(!diff.contains("hunter2") && !diff.contains("other"), "{diff}");
 
         // The other controller's mDNS service order changes between its restarts.
         let cast_zone = "mdns_sd.filter.2.service.1.name=_googlecast._tcp.local\nmdns_sd.filter.2.service.2.name=_googlezone._tcp.local";
         let zone_cast = "mdns_sd.filter.2.service.1.name=_googlezone._tcp.local\nmdns_sd.filter.2.service.2.name=_googlecast._tcp.local";
-        let swapped = compare_field(zone_cast, cast_zone, false);
+        let swapped = compare_field(zone_cast, cast_zone, false, true);
         assert!(!swapped.identical && !swapped.same_content && swapped.equivalent);
-        let real_change = compare_field("mdns_sd.filter.2.service.1.name=_airplay._tcp.local", "mdns_sd.filter.2.service.1.name=_googlecast._tcp.local", false);
+        let real_change = compare_field("mdns_sd.filter.2.service.1.name=_airplay._tcp.local", "mdns_sd.filter.2.service.1.name=_googlecast._tcp.local", false, true);
         assert!(!real_change.equivalent);
         // So do a VAP's broadcast-filter MACs and the lock-to-AP entries, but no other MAC list.
         let acl = |kind: &str, a: &str, b: &str| {
             format!("wireless.1.bcfilt.1.mac={a}\nwireless.1.bcfilt.2.mac={b}\nmacacl.3.acl.1.type={kind}\nmacacl.3.acl.1.mac={a}\nmacacl.3.acl.2.type={kind}\nmacacl.3.acl.2.mac={b}")
         };
-        assert!(compare_field(&acl("lock2ap", "aa", "bb"), &acl("lock2ap", "bb", "aa"), false).equivalent);
-        assert!(!compare_field(&acl("deny", "aa", "bb"), &acl("deny", "bb", "aa"), false).equivalent);
-        assert!(!compare_field("wireless.1.bcfilt.1.mac=aa\nwireless.2.bcfilt.1.mac=bb", "wireless.1.bcfilt.1.mac=bb\nwireless.2.bcfilt.1.mac=aa", false).equivalent, "per VAP");
+        assert!(compare_field(&acl("lock2ap", "aa", "bb"), &acl("lock2ap", "bb", "aa"), false, true).equivalent);
+        assert!(!compare_field(&acl("deny", "aa", "bb"), &acl("deny", "bb", "aa"), false, true).equivalent);
+        assert!(!compare_field("wireless.1.bcfilt.1.mac=aa\nwireless.2.bcfilt.1.mac=bb", "wireless.1.bcfilt.1.mac=bb\nwireless.2.bcfilt.1.mac=aa", false, true).equivalent, "per VAP");
 
         // Against a redacted copy, secret values cannot differ.
-        let r = compare_field("a=1\nb=2\naaa.1.wpa.psk=other", &cfgdiff::redact(actual), true);
+        let r = compare_field("a=1\nb=2\naaa.1.wpa.psk=other", &cfgdiff::redact(actual), true, true);
         assert!(r.identical);
 
         // The quick check agrees with the full comparison.
         for (ours, theirs, redacted) in [(zone_cast, cast_zone, false), ("mdns_sd.filter.2.service.1.name=_airplay._tcp.local", cast_zone, false), ("a=1\nb=2\naaa.1.wpa.psk=other", actual, true), ("a=1\nb=3", "a=1\nb=2", false)] {
-            assert_eq!(equivalent(ours, theirs, redacted), compare_field(ours, theirs, redacted).equivalent, "{ours:?}");
+            assert_eq!(equivalent(ours, theirs, redacted), compare_field(ours, theirs, redacted, false).equivalent, "{ours:?}");
         }
     }
 

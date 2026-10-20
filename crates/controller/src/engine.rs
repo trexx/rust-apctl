@@ -974,9 +974,9 @@ impl Engine {
     /// `mgmt` and `req.previous_system_cfg`): stored, and summed up for the event.
     fn dry_run(&self, render: &crate::dryrun::RenderFn, ts: Ts, req: &crate::dryrun::RenderRequest, cfgversion: Option<&str>, mgmt: &str) -> Value {
         let system = req.previous_system_cfg.unwrap_or_default();
-        let result = render(req).map(|ours| crate::dryrun::compare(&ours, mgmt, system, false));
+        let result = render(req).map(|ours| crate::dryrun::compare(&ours, mgmt, system, false, false));
         let (matches, payload) = match &result {
-            Ok(c) => (c.matches(), c.stored()),
+            Ok(c) => (c.matches(), serde_json::to_string(c).expect("a comparison serialises")),
             Err(e) => (false, json!({ "error": format!("{e:#}") }).to_string()),
         };
         self.writer.exec(
@@ -984,8 +984,11 @@ impl Engine {
             "INSERT INTO dryrun_results (ts, mac, cfgversion, matches, comparison) VALUES (?1, ?2, ?3, ?4, ?5)",
             vec![Sql::Integer(ts), Sql::Text(req.device_mac.to_string()), cfgversion.map(str::to_string).into(), Sql::Integer(matches as i64), Sql::Text(payload)],
         );
+        // Each field's counts: a mismatch names the field that differs, and says
+        // when only the order of its lines does (no line added, removed or changed).
+        let counts = |f: &crate::dryrun::FieldComparison| json!({ "added": f.added, "removed": f.removed, "changed": f.changed, "same_content": f.same_content });
         match &result {
-            Ok(c) => json!({ "matches": matches, "system_cfg": { "added": c.system_cfg.added, "removed": c.system_cfg.removed, "changed": c.system_cfg.changed, "same_content": c.system_cfg.same_content } }),
+            Ok(c) => json!({ "matches": matches, "mgmt_cfg": counts(&c.mgmt_cfg), "system_cfg": counts(&c.system_cfg) }),
             Err(e) => json!({ "matches": false, "error": format!("{e:#}") }),
         }
     }
@@ -2548,6 +2551,16 @@ mod tests {
         let row: (String, Option<String>, i64) =
             h.store.read(Db::Config, |c| Ok(c.query_row("SELECT mac, cfgversion, matches FROM dryrun_results", [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?)).unwrap();
         assert_eq!(row, (AP1.to_string(), Some("v2".into()), 0));
+        // The event names the field that differs, and when only the order does;
+        // the stored comparison has the counts without the diffs' text.
+        h.engine.set_renderer(Arc::new(|_: &crate::dryrun::RenderRequest| -> anyhow::Result<crate::dryrun::Rendered> { Ok(("cfgversion=v2\na=9".into(), "y=1\nx=4".into())) }));
+        h.engine.handle(Input::Reply { ts: 280, mac, decoded: decoded(json!({ "_type": "setparam", "system_cfg": "x=4\ny=1" })) });
+        let counts = |added, removed, changed, same_content| json!({ "added": added, "removed": removed, "changed": changed, "same_content": same_content });
+        let compared = stored(&h, EventKind::DryrunCompared);
+        assert_eq!(compared[1], json!({ "matches": false, "mgmt_cfg": counts(0, 0, 1, false), "system_cfg": counts(0, 0, 0, true) }));
+        let comparison: Value =
+            serde_json::from_str(&h.store.read(Db::Config, |c| Ok(c.query_row("SELECT comparison FROM dryrun_results ORDER BY ts DESC", [], |r| r.get::<_, String>(0))?)).unwrap()).unwrap();
+        assert_eq!((comparison["mgmt_cfg"]["changed"].as_i64(), comparison["mgmt_cfg"].get("diff"), comparison["system_cfg"].get("diff")), (Some(1), None, None));
     }
 
     #[test]

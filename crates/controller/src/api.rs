@@ -832,7 +832,7 @@ async fn dryrun(State(s): State<AppState>) -> Result<Json<DryRunStatus>, ApiErro
             };
             match renderer(&req) {
                 Ok(ours) => {
-                    let c = crate::dryrun::compare(&ours, &actual.mgmt_cfg, &actual.system_cfg, redacted);
+                    let c = crate::dryrun::compare(&ours, &actual.mgmt_cfg, &actual.system_cfg, redacted, true);
                     let status = if c.mgmt_cfg.identical && c.system_cfg.identical {
                         DryRunState::Match
                     } else if c.matches() {
