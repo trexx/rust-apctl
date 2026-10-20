@@ -56,7 +56,12 @@ export function Basics({
         <TextInput {...bind("name")} maxLength={32} />
       </Row>
       <Row label="Status">
-        <Toggle {...bind("enabled")} label="Enabled" />
+        {/* Unset is on, as the APs are told. */}
+        <Toggle
+          {...bind("enabled")}
+          value={f.enabled !== false}
+          label="Enabled"
+        />
         <Toggle
           {...bind("hide_ssid")}
           label="Hidden (not in the network list)"

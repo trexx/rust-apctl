@@ -117,7 +117,12 @@ export function Advanced({
         />
       </Row>
       <Row label="Client isolation" hint="clients can't reach each other">
-        <Toggle {...bind("l2_isolation")} label="Enabled" />
+        {/* Unset follows the guest setting, as the APs are told. */}
+        <Toggle
+          {...bind("l2_isolation")}
+          value={f.l2_isolation ?? f.is_guest === true}
+          label="Enabled"
+        />
       </Row>
       <Row label="Guest network">
         <Toggle {...bind("is_guest")} label="Guest" />

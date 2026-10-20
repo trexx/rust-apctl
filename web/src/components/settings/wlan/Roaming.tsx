@@ -38,7 +38,13 @@ export function Roaming({ w, list }: WlanSection) {
         <Toggle {...bind("rrm_enabled")} label="Enabled" />
       </Row>
       <Row label="BSS transition" hint="802.11v: APs suggest a better AP">
-        <Toggle {...bind("bss_transition")} disabled={iot} label="Enabled" />
+        {/* Unset is on, as the APs are told. */}
+        <Toggle
+          {...bind("bss_transition")}
+          value={f.bss_transition !== false}
+          disabled={iot}
+          label="Enabled"
+        />
       </Row>
       <Row
         label="Roaming assistant (5 GHz)"
