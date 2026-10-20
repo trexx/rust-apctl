@@ -947,11 +947,18 @@ pub struct WlanEdit {
 /// field and the fields it derives on save.
 pub fn apply_wlan(state: &mut Value, e: &WlanEdit) -> Result<String, String> {
     let over = over_limits(state);
-    edit_wlan(state, e, &over)
+    let (what, channels) = edit_wlan(state, e, &over)?;
+    Ok(with_notes(what, &channels))
+}
+
+/// `what`, followed by the notes (each AP's channel moves), `; `-separated.
+fn with_notes(what: String, notes: &[String]) -> String {
+    if notes.is_empty() { what } else { format!("{what}; {}", notes.join("; ")) }
 }
 
 /// [`apply_wlan`], with the counts over their limits before the edit (see [`check_limits`]).
-fn edit_wlan(state: &mut Value, e: &WlanEdit, over: &[Over]) -> Result<String, String> {
+/// Returns what changed on the SSID and, apart, the channel moves the edit made on its APs.
+fn edit_wlan(state: &mut Value, e: &WlanEdit, over: &[Over]) -> Result<(String, Vec<String>), String> {
     let (id, p) = (e.id.as_str(), &e.patch);
     let before = find_wlan(state, id).ok_or("unknown SSID")?.clone();
     if before["attr_no_edit"].as_bool() == Some(true) {
@@ -1046,11 +1053,8 @@ fn edit_wlan(state: &mut Value, e: &WlanEdit, over: &[Over]) -> Result<String, S
     keys.retain(|k| *k != "x_passphrase" && before[*k] != after[*k]);
     changed.extend(keys);
     let name = after["name"].as_str().unwrap_or("?");
-    let mut what = if changed.is_empty() { format!("SSID \"{name}\": nothing changed") } else { format!("SSID \"{name}\": {}", changed.join(", ")) };
-    if !channels.is_empty() {
-        what = format!("{what}; {}", channels.join("; "));
-    }
-    Ok(what)
+    let what = if changed.is_empty() { format!("SSID \"{name}\": nothing changed") } else { format!("SSID \"{name}\": {}", changed.join(", ")) };
+    Ok((what, channels))
 }
 
 /// Protection, PMF and the WPA3 timers.
@@ -1483,8 +1487,8 @@ pub fn create_wlan(state: &mut Value, patch: &Value) -> Result<String, String> {
     }
     let name = patch["name"].as_str().unwrap_or_default().trim().to_string();
     array_mut(state, "wlanconf").push(doc);
-    edit_wlan(state, &WlanEdit { id, patch }, &over)?;
-    Ok(format!("added SSID \"{name}\""))
+    let (_, channels) = edit_wlan(state, &WlanEdit { id, patch }, &over)?;
+    Ok(with_notes(format!("added SSID \"{name}\""), &channels))
 }
 
 /// Deletes an SSID and its own AP group.
@@ -1494,14 +1498,11 @@ pub fn delete_wlan(state: &mut Value, id: &str) -> Result<String, String> {
         return Err("this SSID cannot be deleted".into());
     }
     let released = if w["iot_channel_lock"].as_bool() == Some(true) { deployed_to(state, w) } else { Vec::new() };
-    let mut what = format!("deleted SSID \"{}\"", w["name"].as_str().unwrap_or("?"));
+    let what = format!("deleted SSID \"{}\"", w["name"].as_str().unwrap_or("?"));
     remove_doc(state, "wlanconf", id);
     prune_groups(state);
     let channels = apply_channel_locks(state, &released, None);
-    if !channels.is_empty() {
-        what = format!("{what}; {}", channels.join("; "));
-    }
-    Ok(what)
+    Ok(with_notes(what, &channels))
 }
 
 // ---- APs ------------------------------------------------------------------
@@ -1965,6 +1966,9 @@ mod tests {
         assert_eq!(s["wlanconf"][0]["iot_channel_lock"], false);
         assert_eq!(s["devices"][0]["radio_table"][0]["channel"], "auto");
         assert!(edit(&mut s, json!({ "iot_dtim_lock": true })).is_err());
+        // A new SSID with the lock reports its APs' moves too.
+        let what = create_wlan(&mut s, &json!({ "name": "IoT", "passphrase": "password1", "iot_channel_lock": true })).unwrap();
+        assert!(what.starts_with("added SSID \"IoT\"; ") && what.contains("Hall: 2.4 GHz channel 6"), "{what}");
     }
 
     #[test]
