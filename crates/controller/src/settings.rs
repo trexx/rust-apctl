@@ -609,6 +609,25 @@ pub(crate) fn str_field<'a>(patch: &'a Value, key: &str) -> Result<Option<&'a st
     }
 }
 
+/// A list of text (`key` names it in errors): `None` when absent; anything but
+/// a list, or an element that is not a string, is refused.
+pub(crate) fn str_list<'a>(v: &'a Value, key: &str) -> Result<Option<Vec<&'a str>>, String> {
+    match v {
+        Value::Null => Ok(None),
+        Value::Array(a) => a.iter().map(|x| x.as_str().ok_or_else(|| format!("{key}: {x} is not text"))).collect::<Result<_, _>>().map(Some),
+        _ => Err(format!("{key} must be a list of text")),
+    }
+}
+
+/// A list of objects (`key` names it in errors): empty when absent; anything but a list is refused.
+fn obj_list<'a>(v: &'a Value, key: &str) -> Result<&'a [Value], String> {
+    match v {
+        Value::Null => Ok(&[]),
+        Value::Array(a) => Ok(a),
+        _ => Err(format!("{key} must be a list")),
+    }
+}
+
 fn mac_list(patch: &Value, key: &str) -> Result<Option<Vec<inform::Mac>>, String> {
     mac_list_value(&patch[key], key)
 }
@@ -774,8 +793,8 @@ fn check_mdns_rules(state: &Value, v: &Value) -> Result<Vec<Value>, String> {
         let scope = enum_field(r, "ap_scope_mode", &["all", "specific", "group"])?.unwrap_or("all");
         let services = enum_field(r, "services_mode", &["all", "specific", "none"])?.unwrap_or("all");
         let mut rule = json!({ "ap_scope_mode": scope, "services_mode": services, "isolation_enabled": bool_field(r, "isolation_enabled")?.unwrap_or(false) });
-        let ids = |key: &str| -> Vec<&str> { r[key].as_array().into_iter().flatten().filter_map(Value::as_str).collect() };
-        let nets = ids("networkconf_ids");
+        let ids = |key: &str| -> Result<Vec<&str>, String> { Ok(str_list(&r[key], &format!("mDNS rule {n}: {key}"))?.unwrap_or_default()) };
+        let nets = ids("networkconf_ids")?;
         if let Some(bad) = nets.iter().find(|x| !networks.contains(x)) {
             return Err(format!("mDNS rule {n}: {bad} is not a network"));
         }
@@ -789,7 +808,7 @@ fn check_mdns_rules(state: &Value, v: &Value) -> Result<Vec<Value>, String> {
                 rule["ap_macs"] = json!(macs);
             }
             "group" => {
-                let g = ids("ap_group_ids");
+                let g = ids("ap_group_ids")?;
                 if g.is_empty() || g.iter().any(|x| !groups.contains(x)) {
                     return Err(format!("mDNS rule {n}: choose the AP groups it applies on"));
                 }
@@ -799,7 +818,7 @@ fn check_mdns_rules(state: &Value, v: &Value) -> Result<Vec<Value>, String> {
         }
         if services == "specific" {
             let mut codes: Vec<&str> = Vec::new();
-            for c in r["predefined_services"].as_array().into_iter().flatten() {
+            for c in obj_list(&r["predefined_services"], &format!("mDNS rule {n}: predefined_services"))? {
                 let code = c["code"].as_str().or(c.as_str()).unwrap_or("");
                 if !apcfg::MDNS_SERVICES.iter().any(|(k, _, _)| *k == code) {
                     return Err(format!("mDNS rule {n}: {code} is not a known service"));
@@ -807,7 +826,7 @@ fn check_mdns_rules(state: &Value, v: &Value) -> Result<Vec<Value>, String> {
                 codes.push(code);
             }
             dedup_in_order(&mut codes);
-            let custom_list = r["custom_services"].as_array().map_or(&[][..], Vec::as_slice);
+            let custom_list = obj_list(&r["custom_services"], &format!("mDNS rule {n}: custom_services"))?;
             // apctl's own bound (the official controller sets none), as for the rules.
             if custom_list.len() > 32 {
                 return Err(format!("mDNS rule {n}: at most 32 custom services"));
@@ -1211,11 +1230,10 @@ fn wlan_dns_and_mdns(state: &Value, p: &Value, w: &mut Value) -> Result<(), Stri
     // DNS Assistance: the AP caches DNS and, when the network's server is slow
     // or fails, sends queries to fallback servers (its own choice, or these).
     copy_fields(p, w, &[("dns_assistance_mode", Enum(&["off", "auto", "manual"]))])?;
-    if !p["dns_assistance_servers"].is_null() {
-        let list = p["dns_assistance_servers"].as_array().ok_or("dns_assistance_servers must be a list")?;
+    if let Some(list) = str_list(&p["dns_assistance_servers"], "dns_assistance_servers")? {
         let mut servers: Vec<String> = Vec::new();
         for v in list {
-            let ip = v.as_str().map(str::trim).filter(|s| !s.is_empty());
+            let ip = Some(v.trim()).filter(|s| !s.is_empty());
             match ip.map(|s| (s, s.parse::<std::net::Ipv4Addr>())) {
                 None => {}
                 Some((s, Ok(_))) => servers.push(s.to_string()),
@@ -1390,7 +1408,7 @@ fn check_schedule(v: &Value) -> Result<Vec<Value>, String> {
     }
     let mut out = Vec::new();
     for e in list {
-        let days: Vec<String> = e["start_days_of_week"].as_array().into_iter().flatten().filter_map(|d| d.as_str().map(str::to_ascii_lowercase)).collect();
+        let days: Vec<String> = str_list(&e["start_days_of_week"], "start_days_of_week")?.unwrap_or_default().into_iter().map(str::to_ascii_lowercase).collect();
         if days.is_empty() || days.iter().any(|d| !DAY_NAMES.contains(&d.as_str())) {
             return Err("each blackout period needs its days (sun to sat)".into());
         }
@@ -1546,11 +1564,7 @@ pub fn apply_device(state: &mut Value, e: &DeviceEdit) -> Result<String, String>
     let o = outdoor(state, &d);
     // SSIDs locking this AP's 2.4 GHz channel for IoT devices.
     let iot_lock = channel_locked_macs(state).contains(&m);
-    let radio_edits = match &p["radios"] {
-        Value::Null => &[][..],
-        Value::Array(a) => a.as_slice(),
-        _ => return Err("radios must be a list".into()),
-    };
+    let radio_edits = obj_list(&p["radios"], "radios")?;
     for rp in radio_edits {
         radio_edit(e, rp, &before, &mut d, iot_lock)?;
     }
@@ -1910,6 +1924,8 @@ mod tests {
         }
         assert!(dev(&mut s, json!({ "config_network": { "type": "static", "ip": "192.168.1.20", "netmask": "255.255.255.0", "gateway": "192.168.1.1", "dns1": "192.168.1.1", "dns2": 9 } })).unwrap_err().contains("dns2"));
         assert_eq!(s["wlanconf"][0]["x_passphrase"], "correct horse");
+        assert_eq!(edit(&mut s, json!({ "dns_assistance_servers": [5] })).unwrap_err(), "dns_assistance_servers: 5 is not text");
+        assert_eq!(edit(&mut s, json!({ "dns_assistance_servers": "1.1.1.1" })).unwrap_err(), "dns_assistance_servers must be a list of text");
     }
 
     #[test]
@@ -2024,6 +2040,9 @@ mod tests {
         assert!(bad(json!({ "ap_scope_mode": "specific", "ap_macs": ["02:00:00:00:00:99"] })), "unknown AP");
         let many: Vec<Value> = (0..33).map(|i| json!({ "address": format!("_app{i}._tcp.local") })).collect();
         assert!(bad(json!({ "services_mode": "specific", "custom_services": many })), "33 custom services");
+        // Lists of anything else are refused, not read as empty.
+        assert!(bad(json!({ "networkconf_ids": [5] })) && bad(json!({ "networkconf_ids": "n1" })));
+        assert!(bad(json!({ "services_mode": "specific", "predefined_services": [{ "code": "apple_airPlay" }], "custom_services": { "address": "_myapp._tcp.local" } })));
         edit(&mut s, json!({ "mdns_proxy_mode": "auto" })).unwrap();
     }
 
@@ -2654,6 +2673,7 @@ mod speed_and_schedule_tests {
             json!([{ "start_days_of_week": ["mon"], "start_hour": 24, "duration_minutes": 10 }]),
             json!([{ "start_days_of_week": ["mon"], "start_hour": 1, "duration_minutes": 0 }]),
             json!([{ "start_days_of_week": ["funday"], "start_hour": 1, "duration_minutes": 10 }]),
+            json!([{ "start_days_of_week": ["mon", 1], "start_hour": 1, "duration_minutes": 10 }]),
         ] {
             assert!(apply_wlan(&mut s, &WlanEdit { id: "w1".into(), patch: json!({ "schedule_with_duration": bad }) }).is_err(), "{bad}");
         }
