@@ -699,12 +699,12 @@ impl Engine {
         // The AP's comings and goings are worked out under the read lock: the
         // engine is the only writer of the devices, so the view read here is
         // the one replaced below.
-        let mut events = {
+        let (mut events, came_back) = {
             let live = shared.read().unwrap();
             let prev = live.devices.get(&mac);
             let known = if prev.is_none() { live.known_devices.get(&mac) } else { None };
             self.write_device_if_due(ts, &snap.ap, prev);
-            lifecycle_events(ts, &snap.ap, prev, known)
+            (lifecycle_events(ts, &snap.ap, prev, known), prev.is_none_or(|p| !p.online))
         };
         if snap.has_vap_table {
             self.radio_events(ts, &snap, &mut events);
@@ -742,6 +742,44 @@ impl Engine {
             let _ = self.tx.send(LiveMsg::Clients);
         }
         let _ = self.tx.send(LiveMsg::Device { mac });
+        // Online: its first inform of this run, or back from offline.
+        if came_back {
+            self.set_fixed_ap_available(ts, mac, true);
+        }
+    }
+
+    /// Keeps the AP's `fixed_ap_available` in the settings in step with whether
+    /// the engine counts it online, as the official controller does for an AP
+    /// (a device with radios): a client locked to an AP that is away may use
+    /// the others meanwhile (apcfg's `lock2ap`). Written only when it changes,
+    /// as a change of the controller's own, not the user's: no settings event.
+    /// The APs are asked to inform now only when a client is locked to it, when
+    /// the official controller provisions them all; else no AP's config changes.
+    fn set_fixed_ap_available(&mut self, ts: Ts, mac: Mac, available: bool) {
+        let (current, imported_at) = {
+            let live = self.live.read().unwrap();
+            (live.state.clone(), live.state_imported_at.unwrap_or(ts))
+        };
+        let Some(current) = current else { return };
+        let Some(doc) = crate::adopt::device_doc(&current, &mac) else { return };
+        let has_radios = doc["radio_table"].as_array().is_some_and(|r| !r.is_empty());
+        if !has_radios || doc["fixed_ap_available"].as_bool().unwrap_or(true) == available {
+            return;
+        }
+        let mut state = Value::clone(&current);
+        drop(current);
+        if let Some(doc) = crate::adopt::device_doc_mut(&mut state, &mac) {
+            doc["fixed_ap_available"] = json!(available);
+        }
+        let locked = state["clients"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .any(|c| c["fixed_ap_enabled"].as_bool() == Some(true) && crate::settings::doc_mac(&c["fixed_ap_mac"]) == Some(mac));
+        self.store_state(state, imported_at);
+        if locked {
+            crate::stun::poke_all(&self.live.read().unwrap());
+        }
     }
 
     /// Settings changes on the AP's radios, debounced (see `radios`).
@@ -1587,6 +1625,7 @@ impl Engine {
         for mac in offline {
             self.writer.exec(Db::Config, "UPDATE devices SET offline = 1 WHERE mac = ?1", vec![Sql::Text(mac.to_string())]);
             let _ = self.tx.send(LiveMsg::Device { mac });
+            self.set_fixed_ap_available(now, mac, false);
         }
         if changed {
             let _ = self.tx.send(LiveMsg::Clients);
@@ -2142,6 +2181,29 @@ mod tests {
         h.engine.handle(Input::Tick(25)); // a tick before the first inform must not disconnect anyone
         feed(&mut h.engine, 30);
         assert_eq!(events(&mut h), []);
+    }
+
+    #[test]
+    fn an_ap_away_is_marked_unavailable_to_the_clients_locked_to_it() {
+        let mut h = harness();
+        h.engine.set_state(0, json!({
+            "devices": [{ "mac": AP1, "radio_table": [{ "radio": "na" }] }, { "mac": AP2 }],
+            "clients": [{ "mac": C1, "fixed_ap_enabled": true, "fixed_ap_mac": AP1 }],
+        }));
+        let feed = |h: &mut Harness, ap: &str, ts: Ts| h.engine.handle(Input::Inform { ts, peer: [10, 0, 0, 1].into(), decoded: decoded(inform(ap, 1000 + ts, &[])) });
+        let available = |h: &Harness, i: usize| h.live.read().unwrap().state.as_ref().unwrap()["devices"][i].get("fixed_ap_available").cloned();
+        feed(&mut h, AP1, 0);
+        feed(&mut h, AP2, 0);
+        assert_eq!(available(&h, 0), None, "online, as without the field: nothing written");
+        h.engine.handle(Input::Tick(100));
+        // Only a device with radios is marked; the settings are stored, but not as a change of the user's.
+        assert_eq!((available(&h, 0), available(&h, 1)), (Some(json!(false)), None));
+        flushed(&h.writer);
+        let stored_state: String = h.store.read(Db::Config, |c| Ok(c.query_row("SELECT json FROM controller_state", [], |r| r.get(0))?)).unwrap();
+        assert!(stored_state.contains("\"fixed_ap_available\":false"), "{stored_state}");
+        feed(&mut h, AP1, 200);
+        assert_eq!(available(&h, 0), Some(json!(true)));
+        assert!(stored(&h, EventKind::SettingsChanged).is_empty());
     }
 
     #[test]
