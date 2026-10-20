@@ -376,7 +376,9 @@ pub fn command(jobs: &mut Jobs, mac: &Mac, inform: &Value, now: Ts) -> Option<Re
     if j.from.is_none() {
         j.from = inform["version"].as_str().map(str::to_string);
     }
-    let mut cmd = json!({ "_type": "upgrade", "version": j.target, "url": j.url, "server_time_in_utc": crate::active::server_time(now) });
+    // For a firmware URL the official controller expects (and sends) "unknown".
+    let version = if j.custom { "unknown" } else { j.target.as_str() };
+    let mut cmd = json!({ "_type": "upgrade", "version": version, "url": j.url, "server_time_in_utc": crate::active::server_time(now) });
     if let Some(m) = &j.md5 {
         cmd["md5sum"] = json!(m);
     }
@@ -766,6 +768,15 @@ mod tests {
         assert_eq!(Op::Enqueue(vec![job("c"), job("d")]).apply(&mut j), 2);
         assert_eq!(Op::Enqueue(vec![job("a"), job("c"), job("e")]).apply(&mut j), 1, "a is upgrading and c queued already");
         assert_eq!(Op::CancelQueued.apply(&mut j), 3);
+    }
+
+    #[test]
+    fn a_firmware_url_is_sent_as_version_unknown() {
+        let mut j = Jobs::default();
+        j.enqueue(vec![Job { target: "custom".into(), custom: true, md5: None, sha256: None, ..job("a") }]);
+        let cmd = command(&mut j, &m("a"), &json!({ "internet": false }), 0).unwrap().unwrap();
+        assert_eq!((cmd["version"].as_str(), cmd["url"].as_str()), (Some("unknown"), Some("https://x/fw.bin")));
+        assert_eq!(j.current.as_ref().map(|c| c.target.as_str()), Some("custom"), "the UI's label stays");
     }
 
     #[test]

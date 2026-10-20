@@ -562,17 +562,20 @@ impl Active {
         if !turn {
             return None;
         }
-        // The failed job's target, for the event.
+        // The job's target, for the event (the command says "unknown" for a firmware URL).
         let (cmd, target) = {
             let mut live = self.live.write().unwrap();
             let cmd = crate::firmware::command(&mut live.firmware, &mac, payload, ts)?;
-            let target = cmd.as_ref().err().and_then(|why| live.firmware.failed(&mac, why)).map(|j| j.target);
+            let target = match &cmd {
+                Ok(_) => live.firmware.current.as_ref().map(|j| j.target.clone()),
+                Err(why) => live.firmware.failed(&mac, why).map(|j| j.target),
+            };
             (cmd, target)
         };
         match cmd {
             Ok(cmd) => {
-                tracing::warn!("{mac}: sending firmware upgrade to {}", cmd["version"]);
-                let data = json!({ "target": cmd["version"], "url": cmd["url"] });
+                tracing::warn!("{mac}: sending firmware upgrade to {}", target.as_deref().unwrap_or("?"));
+                let data = json!({ "target": target, "url": cmd["url"] });
                 let _ = self.engine.blocking_send(Input::Note(Event::device(ts, EventKind::ApUpgradeSent, mac, data)));
                 Some(cmd)
             }
