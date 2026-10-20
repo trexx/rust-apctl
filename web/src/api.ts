@@ -251,6 +251,8 @@ export interface CfgChange {
   added?: number;
   removed?: number;
   changed?: number;
+  /** A dry run's: the same key=value pairs, maybe in another order. */
+  same_content?: boolean;
 }
 
 interface RadioLevels {
@@ -315,7 +317,8 @@ export interface EventPayloads {
   client_disconnected: { reason?: string | null; connected_for?: number | null; last_signal?: number | null };
   client_roamed: { from?: RoamEndData; to?: RoamEndData };
   client_renamed: { from?: string | null; to?: string | null };
-  dryrun_compared: { error?: string | null; matches?: boolean; system_cfg?: CfgChange };
+  /** `mgmt_cfg` is missing from comparisons recorded before it was added. */
+  dryrun_compared: { error?: string | null; matches?: boolean; system_cfg?: CfgChange; mgmt_cfg?: CfgChange };
   settings_imported: { wlans?: unknown[]; networks?: unknown[] };
   settings_changed: { what?: string };
   channel_plan: ChannelPlanRun;
@@ -532,6 +535,8 @@ export interface FieldComparison {
   diff: string;
 }
 
+export type StoredComparison = Omit<FieldComparison, "diff">;
+
 export interface DryRun {
   settings_imported_at: number | null;
   devices: {
@@ -544,7 +549,8 @@ export interface DryRun {
     /** The AP runs a different config version than when the settings were imported. */
     settings_stale: boolean;
   }[];
-  history: { id: number; ts: number; mac: Mac; cfgversion: string | null; matches: boolean; comparison: { system_cfg?: FieldComparison; error?: string } | null }[];
+  /** The comparison made at each push, stored without the diffs. */
+  history: { id: number; ts: number; mac: Mac; cfgversion: string | null; matches: boolean; comparison: { mgmt_cfg?: StoredComparison; system_cfg?: StoredComparison; error?: string } | null }[];
 }
 
 /** Refreshed by the live socket when a comparison is recorded or settings are imported. */

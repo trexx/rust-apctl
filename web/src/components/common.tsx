@@ -649,9 +649,20 @@ const EVENTS: { [K in EventKind]: EventSpec<K> } = {
     tone: "neutral",
     describe: (d) => {
       if (d.error) return `generator error: ${d.error}`;
-      return d.matches
-        ? "apctl would have pushed the identical config"
-        : `differs: ${d.system_cfg?.added ?? 0} extra, ${d.system_cfg?.removed ?? 0} missing, ${d.system_cfg?.changed ?? 0} different lines`;
+      if (d.matches) return "apctl would have pushed the identical config";
+      const lines = (["system_cfg", "mgmt_cfg"] as const).flatMap((f) => {
+        const { added = 0, removed = 0, changed = 0 } = d[f] ?? {};
+        return added + removed + changed > 0
+          ? [
+              `${f} (${added} extra, ${removed} missing, ${changed} different lines)`,
+            ]
+          : [];
+      });
+      // A mismatch with no line of either config different is in their order.
+      if (lines.length > 0) return `differs in ${lines.join(" and ")}`;
+      return d.mgmt_cfg
+        ? "differs: the same lines, in another order"
+        : "differs: system_cfg has the same lines, so its order or mgmt_cfg differs";
     },
   },
   settings_imported: {
