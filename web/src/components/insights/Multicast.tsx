@@ -5,7 +5,6 @@ import type { SiteMulticast, TimeSpan } from "../../api";
 import { compact, spanText } from "../../format";
 import { COLORS, Chart } from "../Chart";
 import { QueryState, Segmented, THead } from "../common";
-import { SpanContext } from "../span";
 
 const DIRECTIONS = [
   ["tx", "To clients"],
@@ -47,7 +46,7 @@ const TYPE_ORDER = Object.keys(MCAST_TYPES);
 export const mcastLabel = (type: string, long = false) =>
   MCAST_TYPES[type]?.[long ? 1 : 0] ?? type;
 
-/** Multicast and broadcast by traffic type, and the clients behind it. */
+/** Multicast and broadcast by traffic type, and the clients behind it; inside a SpanScope of `span`, which its chart reads. */
 export function MulticastPanel({
   mac,
   span,
@@ -118,20 +117,18 @@ function MulticastView({
       </div>
       <div className="mcast-stack">
         <div>
-          <SpanContext.Provider value={span}>
-            <Chart
-              title={`Packets per second by type, ${dir === "tx" ? "delivered to clients" : "sent by clients"}`}
-              ts={data.ts}
-              height={160}
-              min={0}
-              format={(v) => `${v.toFixed(v < 10 ? 1 : 0)}/s`}
-              series={kinds.map(([k, v]) => ({
-                label: mcastLabel(k),
-                values: v[`${dir}_pps`],
-                color: MCAST_COLORS[k] ?? COLORS.teal,
-              }))}
-            />
-          </SpanContext.Provider>
+          <Chart
+            title={`Packets per second by type, ${dir === "tx" ? "delivered to clients" : "sent by clients"}`}
+            ts={data.ts}
+            height={160}
+            min={0}
+            format={(v) => `${v.toFixed(v < 10 ? 1 : 0)}/s`}
+            series={kinds.map(([k, v]) => ({
+              label: mcastLabel(k),
+              values: v[`${dir}_pps`],
+              color: MCAST_COLORS[k] ?? COLORS.teal,
+            }))}
+          />
           <div className="mcast-types small">
             {ranked.map(([k, v]) => (
               <span key={k}>
