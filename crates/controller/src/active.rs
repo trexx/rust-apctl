@@ -33,7 +33,7 @@ use inform::{DEFAULT_KEY, Flags, Mac, Packet};
 use rusqlite::types::Value as Sql;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use tokio::sync::{Semaphore, SemaphorePermit, mpsc};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
 use wire::decode::{Decoded, KeyUsed, open_with};
 use wire::keys::KeyStore;
 
@@ -131,7 +131,7 @@ pub struct Active {
 /// out a burst (every AP informs at once after a settings change) while a
 /// flood of large bodies cannot pile up.
 struct Gate {
-    permits: Semaphore,
+    permits: Arc<Semaphore>,
     waiting: AtomicUsize,
     max_waiting: usize,
 }
@@ -151,13 +151,14 @@ impl Drop for Waiting<'_> {
 
 impl Gate {
     fn new(permits: usize, max_waiting: usize) -> Gate {
-        Gate { permits: Semaphore::new(permits), waiting: AtomicUsize::new(0), max_waiting }
+        Gate { permits: Arc::new(Semaphore::new(permits)), waiting: AtomicUsize::new(0), max_waiting }
     }
 
     /// A permit for an inform of `size` bytes: at once if one is free, else
     /// after the informs ahead of it; None when too much is waiting already.
-    async fn enter(&self, size: usize) -> Option<SemaphorePermit<'_>> {
-        if let Ok(p) = self.permits.try_acquire() {
+    /// Owned, so that work started under it can take it along (see [`blocking`]).
+    async fn enter(&self, size: usize) -> Option<OwnedSemaphorePermit> {
+        if let Ok(p) = self.permits.clone().try_acquire_owned() {
             return Some(p);
         }
         let cost = size + WAIT_OVERHEAD;
@@ -165,15 +166,24 @@ impl Gate {
         if self.waiting.fetch_add(cost, Ordering::Relaxed) + cost > self.max_waiting {
             return None;
         }
-        let permit = self.permits.acquire().await.ok();
+        let permit = self.permits.clone().acquire_owned().await.ok();
         drop(waiting);
         permit
     }
 }
 
+/// Runs `f` off the async workers, holding a gate's `permit` until it is done
+/// and handing it back with the result. An AP that hangs up drops the
+/// handler's future, but not the blocking work it started: the permit stays
+/// with that work, so a flood of informs cut short cannot run more of it at a
+/// time than the gate allows.
+fn blocking<T: Send + 'static>(permit: OwnedSemaphorePermit, f: impl FnOnce() -> T + Send + 'static) -> tokio::task::JoinHandle<(T, OwnedSemaphorePermit)> {
+    tokio::task::spawn_blocking(move || (f(), permit))
+}
+
 /// An opened inform: the key it was opened with, its payload, and the permit
 /// held while it is handled.
-type Opened<'a> = (KeyUsed, [u8; 16], Value, SemaphorePermit<'a>);
+type Opened = (KeyUsed, [u8; 16], Value, OwnedSemaphorePermit);
 
 /// An adoption's `mgmt_cfg`, and the settings it was made from (by address,
 /// as for `Render::state`).
@@ -581,19 +591,19 @@ impl Active {
     /// room for the APs. The permit is held while the inform is handled.
     /// Else the status to answer: 503 when too many informs are waiting
     /// already (see `Gate`), 400 when no key opens it.
-    async fn open(&self, body: Bytes, device_key: Option<[u8; 16]>) -> Result<Opened<'_>, StatusCode> {
-        let decode = |body: Bytes, used: KeyUsed, key: [u8; 16]| {
-            tokio::task::spawn_blocking(move || Packet::parse(&body).map_err(anyhow::Error::from).and_then(|pkt| open_with(&pkt, [(used, key)])))
+    async fn open(&self, body: Bytes, device_key: Option<[u8; 16]>) -> Result<Opened, StatusCode> {
+        let decode = |body: Bytes, used: KeyUsed, key: [u8; 16], permit| {
+            blocking(permit, move || Packet::parse(&body).map_err(anyhow::Error::from).and_then(|pkt| open_with(&pkt, [(used, key)])))
         };
         if let Some(k) = device_key {
             let permit = self.work.enter(body.len()).await.ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
-            if let Ok(Ok((used, key, payload))) = decode(body.clone(), KeyUsed::Device, k).await {
+            if let Ok((Ok((used, key, payload)), permit)) = decode(body.clone(), KeyUsed::Device, k, permit).await {
                 return Ok((used, key, payload, permit));
             }
         }
         let permit = self.strangers.enter(body.len()).await.ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
-        match decode(body, KeyUsed::Default, DEFAULT_KEY).await {
-            Ok(Ok((used, key, payload))) => Ok((used, key, payload, permit)),
+        match decode(body, KeyUsed::Default, DEFAULT_KEY, permit).await {
+            Ok((Ok((used, key, payload)), permit)) => Ok((used, key, payload, permit)),
             _ => Err(StatusCode::BAD_REQUEST),
         }
     }
@@ -648,7 +658,7 @@ pub async fn inform(
     // Its record's AES-GCM pin, as the official controller keeps it (see `managed_inform`).
     let pinned = state.as_deref().and_then(|st| crate::adopt::device_doc(st, &mac)).is_some_and(|d| d["x_aes_gcm"].as_bool() == Some(true));
     drop(state);
-    let (used, key, payload, _permit) = match active.open(body, device_key).await {
+    let (used, key, payload, permit) = match active.open(body, device_key).await {
         Ok(opened) => opened,
         Err(StatusCode::SERVICE_UNAVAILABLE) => {
             tracing::debug!("{mac}: too many informs waiting: turning one from {} away", peer.ip());
@@ -666,22 +676,22 @@ pub async fn inform(
     let caller = Caller { mac, gcm: header.flags.contains(Flags::GCM), key, peer: peer.ip(), source: active.proxies.client_ip(&headers, peer.ip()) };
     // Only an AP apctl manages is tried with a key of its own.
     if used == KeyUsed::Default {
-        factory_key_inform(&active, ts, caller, payload, device_key.is_some()).await
+        factory_key_inform(&active, ts, caller, payload, device_key.is_some(), permit).await
     } else {
-        managed_inform(&active, ts, caller, header, used, payload, pinned).await
+        managed_inform(&active, ts, caller, Decoded { header, key: used, payload }, pinned, permit).await
     }
 }
 
 /// An inform under the factory key: an AP apctl is adopting gets its own key;
 /// any other is answered 404 and listed for adoption. `known`: apctl manages
-/// an AP of this MAC.
-async fn factory_key_inform(active: &Arc<Active>, ts: Ts, caller: Caller, payload: Value, known: bool) -> Response {
+/// an AP of this MAC. `permit`: the gate's, held while the inform is handled.
+async fn factory_key_inform(active: &Arc<Active>, ts: Ts, caller: Caller, payload: Value, known: bool, permit: OwnedSemaphorePermit) -> Response {
     let mac = caller.mac;
     let adopting = active.live.read().unwrap().adoption.adopting.contains_key(&mac);
     if known && adopting {
         // Adopt pressed: hand the AP its own key (in mgmt_cfg), with the factory key.
         let a = active.clone();
-        let Ok(sealed) = tokio::task::spawn_blocking(move || caller.seal(&a.adoption_reply(ts, mac, &payload))).await else {
+        let Ok((sealed, _permit)) = blocking(permit, move || caller.seal(&a.adoption_reply(ts, mac, &payload))).await else {
             return StatusCode::INTERNAL_SERVER_ERROR.into_response();
         };
         tracing::info!("{mac}: adoption: sending its key");
@@ -718,7 +728,9 @@ async fn factory_key_inform(active: &Arc<Active>, ts: Ts, caller: Caller, payloa
 /// command, a heartbeat), and the inform for the engine. `pinned`: the AP's
 /// record says it uses AES-GCM (`x_aes_gcm`, imported from the other
 /// controller), which pins it from the first inform apctl hears from it.
-async fn managed_inform(active: &Arc<Active>, ts: Ts, caller: Caller, header: inform::Header, used: KeyUsed, payload: Value, pinned: bool) -> Response {
+/// `permit`: the gate's, held while the inform is handled.
+async fn managed_inform(active: &Arc<Active>, ts: Ts, caller: Caller, decoded: Decoded, pinned: bool, permit: OwnedSemaphorePermit) -> Response {
+    let payload = &decoded.payload;
     let (mac, gcm) = (caller.mac, caller.gcm);
     // Its own key: an adoption is complete; a forgotten AP is told to reset
     // (once: the entry goes, so later informs don't finish the forget again).
@@ -771,16 +783,15 @@ async fn managed_inform(active: &Arc<Active>, ts: Ts, caller: Caller, header: in
 
     // Rendering the config and sealing the reply take a while: off the async workers.
     let a = active.clone();
-    let Ok((reply, response, payload)) = tokio::task::spawn_blocking(move || {
-        let reply = a.reply(ts, mac, &payload);
+    let Ok(((reply, response, decoded), _permit)) = blocking(permit, move || {
+        let reply = a.reply(ts, mac, &decoded.payload);
         let response = caller.seal(&reply);
-        (reply, response, payload)
+        (reply, response, decoded)
     })
     .await
     else {
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     };
-    let decoded = Decoded { header, key: used, payload };
     if active.engine.send(Input::Inform { ts, peer: caller.source, decoded }).await.is_err() {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     }
@@ -1633,6 +1644,24 @@ mod tests {
         assert!(waiting.pop().unwrap().await.is_some());
         drop(third);
         assert_eq!(gate.waiting.load(Ordering::Relaxed), 0, "nothing counted as waiting once they are gone");
+    }
+
+    #[tokio::test]
+    async fn blocking_work_keeps_its_permit_when_the_handler_is_dropped() {
+        let gate = Gate::new(1, 0);
+        let permit = gate.enter(0).await.unwrap();
+        let (go, wait) = std::sync::mpsc::channel::<()>();
+        // The handler waiting on it goes (its AP hung up); the work goes on.
+        drop(blocking(permit, move || wait.recv()));
+        assert_eq!(gate.permits.available_permits(), 0, "held by the work still running");
+        go.send(()).unwrap();
+        for _ in 0..200 {
+            if gate.permits.available_permits() == 1 {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("the permit is given back once the work is done");
     }
 
     /// Polls a future once.
