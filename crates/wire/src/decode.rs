@@ -32,7 +32,7 @@ pub fn decode_packet(pkt: Packet<'_>, keys: &KeyStore, mac_hint: Option<Mac>) ->
     // An unencrypted packet needs no key; otherwise the device's (by the header's MAC,
     // then by the hint), then the default one.
     let hint = mac_hint.filter(|m| *m != pkt.header.mac);
-    let device = [Some(pkt.header.mac), hint].into_iter().flatten().filter(|_| encrypted).filter_map(|mac| keys.get(&mac));
+    let device = [Some(pkt.header.mac), hint].into_iter().flatten().filter(|_| encrypted).flat_map(|mac| keys.device_keys(&mac));
     let last = (if encrypted { KeyUsed::Default } else { KeyUsed::None }, DEFAULT_KEY);
     let (key, _, payload) = open_with(&pkt, device.map(|k| (KeyUsed::Device, *k)).chain([last]))
         .with_context(|| format!("no known key decrypts the packet from {} (flags {:?})", pkt.header.mac, flags))?;
@@ -99,6 +99,20 @@ mod tests {
 
         let wire = seal(mac, flags, [3; 16], &[9; 16], b"{}");
         assert!(decode(&wire, &keys, None).is_err());
+    }
+
+    #[test]
+    fn an_inform_under_the_key_the_device_has_yet_to_switch_from_decodes() {
+        let mac: Mac = "00:11:22:33:44:55".parse().unwrap();
+        let old = "0f0e0d0c0b0a09080706050403020100";
+        let keys = KeyStore::from_value(&serde_json::json!({ "devices": [
+            { "mac": "00:11:22:33:44:55", "x_authkey": "000102030405060708090a0b0c0d0e0f", "x_inform_authkey": old },
+        ]}));
+        let old = inform::parse_key(old).unwrap();
+        for flags in [Flags::ENCRYPTED | Flags::GCM, Flags::ENCRYPTED | Flags::ZLIB] {
+            let d = decode(&seal(mac, flags, [5; 16], &old, br#"{"a":1}"#), &keys, None).unwrap();
+            assert_eq!((d.key, &d.payload["a"]), (KeyUsed::Device, &1.into()), "{flags:?}");
+        }
     }
 
     #[test]

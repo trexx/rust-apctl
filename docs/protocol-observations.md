@@ -48,9 +48,13 @@ Anything we only infer, rather than observe, is marked *inferred*.
 
 ## AP behaviour after a radio change
 
-For about 25 s after a push that restarts a radio, the AP sends rapid (every 0.3–6 s)
-cut-down informs: 63 keys, with **no `vap_table` and no radio stats**. After that, normal
-informs resume and show the new channel, width and power.
+After a push that restarts a radio (a channel or width change), the AP's informs keep
+their interval and shape (85 keys, with `vap_table`) and report the new channel. In between,
+for about 25 s, come notifications (`inform_as_notif: true`, sent at once rather than on the
+interval): first one with `notif_reason: "setparam"` (62 keys) acknowledging the push, then
+a burst of `notif_reason: "event"` ones (63 keys, every 0.3–6 s) carrying client association
+events in `notif_payload` as the clients re-associate. Clients that roam make the other AP
+send them too.
 
-**The controller must treat a missing `vap_table` as "radio restarting", not as every
-client disconnecting.** Otherwise each push would produce a burst of false disconnect events.
+A notification has **no `vap_table`**: the controller must not read it as an inform whose
+VAPs and clients are gone, or every radio change would look like all clients disconnecting.

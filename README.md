@@ -48,10 +48,14 @@ These screenshots use mock data from `informdump demo`.
 
 ```sh
 printf '%s' 'a long password' | docker run --rm -i ghcr.io/trexx/rust-apctl hash-password | sed 's/^/admin:/' > users
-docker run -d -v apctl-data:/data -v $PWD/users:/users:ro -e APCTL_USERS_FILE=/users \
+docker run -d -v apctl-data:/data -v $PWD/users:/users:ro -v $PWD/import.json:/import.json:ro -e APCTL_USERS_FILE=/users \
   -e APCTL_SYSLOG_LISTEN=0.0.0.0:5514 -p 8090:8090 -p 8080:8080 -p 5514:5514/udp -p 3478:3478/udp \
-  ghcr.io/trexx/rust-apctl serve --active --keys /data/import.json
+  ghcr.io/trexx/rust-apctl serve --active --keys /import.json
 ```
+
+`import.json` is the snapshot `informdump import` wrote, readable only by its owner. The
+container runs as uid 65532, which must be able to read it: `sudo chown 65532 import.json`
+for Docker, `podman unshare chown 65532 import.json` for rootless Podman.
 
 On Kubernetes (active mode), with the APs' ports on the node and the data on local storage:
 
@@ -107,11 +111,14 @@ used, so the login throttle sees each client rather than the proxy.
 Try the UI without any APs. The demo is a made-up site with three APs and about twenty clients:
 
 ```sh
-cargo build --release -p informdump -p controller
-target/release/informdump demo-state > demo.json
-target/release/apctl serve --data-dir demo-data --keys demo.json \
+# Two builds: informdump turns on serde_json features that apctl is not built with.
+cargo build --release -p controller
+cargo build --release -p informdump
+mkdir -p data   # git-ignored, and kept out of image builds
+target/release/informdump demo-state > data/demo.json
+target/release/apctl serve --data-dir data/demo --keys data/demo.json \
   --shadow-cmd "target/release/informdump demo --live"   # charts fill in after a minute or two
-# Optional: upload demo.json on the Settings page for SSIDs and the settings editor.
+# Optional: upload data/demo.json on the Settings page for SSIDs and the settings editor.
 ```
 
 ## Build
@@ -123,8 +130,12 @@ cargo build --release -p controller   # or: podman build --target runtime .
 
 `crates/informdump` decodes, imports, sanitises and simulates inform traffic. Run
 `informdump --help` for its commands. `informdump import` reads the official controller's
-MongoDB and needs `cargo build --release -p informdump --features mongo`. Pushing a version
-tag (e.g. `0.15.1`) publishes the image.
+MongoDB and needs `cargo build --release -p informdump --features mongo`.
+
+Pushing a version tag (e.g. `0.15.1`) makes CI publish the image; nothing else pushes it.
+`scripts/release.sh 0.15.1` runs CI's checks and builds and checks the image locally before
+the tag goes out, and `scripts/release.sh 0.15.1 --pin <manifest>` afterwards waits for
+CI's image and pins its digest in a manifest.
 
 ## License
 

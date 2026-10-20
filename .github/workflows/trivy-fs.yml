@@ -1,7 +1,9 @@
 name: 'Trivy FS'
 
-# Scans Cargo.lock and web/package-lock.json. The image scan cannot see the
-# crates inside the stripped apctl binary, so dependencies are checked here.
+# Scans web/package-lock.json: the web UI's packages are bundled into the binary,
+# where the image scan cannot see them. Cargo.lock is skipped (trivy.yaml): the
+# image scan reads the crates the binary was built with (cargo auditable), and the
+# lock file also lists crates no image ships, such as informdump's MongoDB driver.
 on:
   schedule:
     - cron: '47 12 * * *'

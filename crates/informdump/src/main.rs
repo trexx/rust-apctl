@@ -80,7 +80,8 @@ enum Cmd {
         #[arg(long = "device")]
         devices: Vec<String>,
         /// Also pass this field, which holds nothing personal (`field`, `parent.field`,
-        /// or a config key with its numbers as `n`). Fields not on the allow-list are
+        /// a config key with its numbers as `n`, or `parent keys` for the keys of an
+        /// object). Fields not on the allow-list, and keys that are not field names, are
         /// replaced as text; the run lists them.
         #[arg(long = "keep")]
         keep: Vec<String>,

@@ -1,7 +1,9 @@
 name: 'Build'
 
 # Push a version tag matching crates/controller/Cargo.toml (e.g. 0.15.1) to
-# publish ghcr.io/trexx/rust-apctl:<version> and :latest.
+# publish ghcr.io/trexx/rust-apctl:<version> and :latest. This is the image's only
+# publisher: scripts/release.sh builds and checks locally, and --pin pins the
+# digest published here.
 on:
   push:
     tags: [ '[0-9]+.[0-9]+.[0-9]+' ]

@@ -1,0 +1,7 @@
+# Read by Trivy from the directory it runs in: the filesystem scan
+# (.github/workflows/trivy-fs.yml) runs from the repository root.
+scan:
+  # The image scan covers the crates that ship (cargo auditable); the lock file
+  # also lists optional ones no image contains.
+  skip-files:
+    - Cargo.lock
