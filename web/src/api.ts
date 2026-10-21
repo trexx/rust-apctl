@@ -1375,7 +1375,9 @@ export function useLiveUpdates(): void {
       const proto = location.protocol === "https:" ? "wss" : "ws";
       const socket = new WebSocket(`${proto}://${location.host}/api/ws`);
       ws = socket;
+      let opened = false;
       socket.onopen = () => {
+        opened = true;
         retry = 1000;
         // Whatever changed while disconnected (e.g. during a restart) was never announced.
         if (dropped) refetchAll();
@@ -1383,8 +1385,9 @@ export function useLiveUpdates(): void {
       socket.onmessage = onMessage;
       socket.onclose = (e) => {
         if (closed) return;
-        // 1008 (policy): the server closed it because the session ended (logged out or expired).
-        if (e.code === 1008) announceUnauthorized();
+        // 1008 (policy): the server closed it because the session ended (logged out or expired). One that never opened may have
+        // been refused for a session that ended while it was down (the browser hides the 401): /api/me tells.
+        if (e.code === 1008 || !opened) announceUnauthorized();
         dropped = true;
         reconnectTimer = window.setTimeout(connect, retry);
         retry = Math.min(retry * 2, 30_000);
