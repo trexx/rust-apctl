@@ -24,16 +24,17 @@ pub struct RangeQuery {
     pub to: Option<Ts>,
     /// `ng`, `na` or `6e`; all bands when absent.
     pub band: Option<String>,
-    /// One AP only (activity).
-    pub mac: Option<String>,
+    /// One AP only (activity), in any form a MAC is written in; another value
+    /// is rejected (400).
+    pub mac: Option<inform::Mac>,
 }
 
 impl RangeQuery {
-    /// The query as a view that reads no band, and with `by_ap` its AP
-    /// (written in lower case), is answered: what [`memo_read`] keys its read by,
-    /// so that the same read is not made and kept again for each band asked.
+    /// The query as a view that reads no band, and with `by_ap` its AP, is
+    /// answered: what [`memo_read`] keys its read by, so that the same read is
+    /// not made and kept again for each band asked.
     pub(crate) fn read_by(&self, by_ap: bool) -> RangeQuery {
-        RangeQuery { range: self.range, from: self.from, to: self.to, band: None, mac: self.mac.as_ref().filter(|_| by_ap).map(|m| m.to_ascii_lowercase()) }
+        RangeQuery { range: self.range, from: self.from, to: self.to, band: None, mac: self.mac.filter(|_| by_ap) }
     }
 }
 

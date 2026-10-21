@@ -985,7 +985,8 @@ struct SeriesQuery {
 
 async fn series(State(s): State<AppState>, Path(table): Path<String>, Query(q): Query<SeriesQuery>) -> Result<Json<store::Series>, ApiError> {
     let t = store::table(&table).ok_or_else(|| ApiError::bad(format!("unknown series {table}")))?;
-    let keys: Vec<String> = q.key.split(',').map(str::to_string).collect();
+    // A MAC (or BSSID) in any form it is written in is looked up as stored.
+    let keys: Vec<String> = q.key.split(',').map(|k| k.parse::<Mac>().map_or_else(|_| k.to_string(), |m| m.to_string())).collect();
     if keys.len() != t.keys.len() {
         return Err(ApiError::bad(format!("{table} needs key {}", t.keys.join(","))));
     }
@@ -1540,6 +1541,19 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_series_key_matches_any_form_of_a_mac() {
+        let (s, _engine, _dir) = state();
+        let at = clock::now_ts() - 60;
+        s.writer.exec(Db::Metrics, "INSERT INTO radio_stats (mac, radio, ts, cu_total) VALUES ('02:00:00:00:00:0a', 'na', ?1, 40)", vec![Sql::Integer(at)]);
+        flushed(&s.writer);
+        let app = router(s);
+        for key in ["02:00:00:00:00:0a", "02-00-00-00-00-0A", "02000000000A"] {
+            let got = get_json(&app, &format!("/api/series/radio_stats?key={key},na&fields=cu_total")).await;
+            assert_eq!(got["ts"], json!([at]), "{key}");
+        }
+    }
+
+    #[tokio::test]
     async fn events_by_kind_prefix_newest_first() {
         let (s, _engine, _dir) = state();
         let rows = [
@@ -1680,6 +1694,8 @@ mod tests {
         assert!(msg.starts_with("Failed to deserialize query string"), "{msg}");
         let (status, msg) = error(get("/api/series/ap_stats?key=02:00:00:00:00:01&fields=cpu,nope").await.unwrap()).await;
         assert_eq!((status, msg.as_str()), (StatusCode::BAD_REQUEST, "ap_stats has no field nope"));
+        let (status, msg) = error(get("/api/site/activity?mac=02:00:00:00:00").await.unwrap()).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "not an empty chart: {msg}");
         let put = |content_type: &str, body: &'static str| {
             let req = Request::put("/api/clients/02:00:00:00:01:01/alias").header(header::COOKIE, &cookie).header("x-requested-with", "apctl").header(header::CONTENT_TYPE, content_type);
             app.clone().oneshot(req.body(Body::from(body)).unwrap())
