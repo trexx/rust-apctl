@@ -8,6 +8,7 @@ import {
   words,
 } from "../form";
 import type { Option } from "../form";
+import { badRekey } from "./form";
 import type { PmfMode, WlanSection } from "./form";
 import { Unsupported } from "./Unsupported";
 
@@ -204,6 +205,9 @@ export function Advanced({
           max={86400}
           disabled={iot}
         />
+        {badRekey(w) && (
+          <span className="error small">off (0), or 60 to 86400 seconds</span>
+        )}
       </Row>
       {wpa3 && (
         <Row

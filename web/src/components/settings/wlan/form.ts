@@ -30,6 +30,15 @@ export function wlanForm(w: WlanSettings | null): WlanForm {
   return rest;
 }
 
+/**
+ * A group rekey the server refuses (it takes off, 0, or 60 to 86400 seconds),
+ * set in this editor: a stored one is not sent unless changed.
+ */
+export function badRekey({ form, original }: SettingsForm<WlanForm>) {
+  const n = form.group_rekey ?? 0;
+  return n !== original.group_rekey && n > 0 && n < 60;
+}
+
 /** What each section of the SSID editor gets. */
 export interface WlanSection {
   w: SettingsForm<WlanForm>;
