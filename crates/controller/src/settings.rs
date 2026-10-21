@@ -400,6 +400,40 @@ fn radio_caps(inform: Option<&Value>, band: &str) -> Value {
     })
 }
 
+/// What the AP reports about a radio that an edit is checked against.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct RadioCaps {
+    /// The power range, dBm.
+    pub min_txpower: i64,
+    pub max_txpower: i64,
+    pub has_ht160: bool,
+}
+
+impl Default for RadioCaps {
+    /// A radio that reports nothing: 1 to 30 dBm, no 160 MHz.
+    fn default() -> Self {
+        RadioCaps { min_txpower: 1, max_txpower: 30, has_ht160: false }
+    }
+}
+
+impl RadioCaps {
+    /// Each band's caps from an inform's `radio_table` (the first entry of a
+    /// band, as [`inform_radio`] finds it); none without an inform.
+    pub fn of_inform(inform: Option<&Value>) -> HashMap<String, RadioCaps> {
+        let mut out = HashMap::new();
+        for r in inform.and_then(|p| p["radio_table"].as_array()).into_iter().flatten() {
+            let Some(band) = r["radio"].as_str() else { continue };
+            let d = RadioCaps::default();
+            out.entry(band.to_string()).or_insert(RadioCaps {
+                min_txpower: r["min_txpower"].as_i64().unwrap_or(d.min_txpower),
+                max_txpower: r["max_txpower"].as_i64().unwrap_or(d.max_txpower),
+                has_ht160: r["has_ht160"].as_bool() == Some(true),
+            });
+        }
+        out
+    }
+}
+
 /// GET /api/settings/devices/{mac}
 pub async fn device(State(s): State<AppState>, MacPath(mac): MacPath) -> Result<Json<Value>, ApiError> {
     let (state, inform) = {
@@ -1581,7 +1615,7 @@ pub struct DeviceEdit {
     pub mac: inform::Mac,
     pub patch: Value,
     /// What the AP reports about its radios, by band (power range, 160 MHz support).
-    pub caps: Value,
+    pub caps: HashMap<String, RadioCaps>,
     /// The band of the radio carrying the AP's wireless (mesh) uplink.
     pub wireless_uplink: Option<String>,
     /// The antennas the AP reports (`antenna_table`).
@@ -1699,13 +1733,13 @@ fn device_fields(state: &Value, e: &DeviceEdit, before: &Value, d: &mut Value) -
 /// the rest, checked against what the radio reports ([`apply_device`] then checks a fixed channel against the country).
 fn radio_edit(e: &DeviceEdit, rp: &Value, before: &Value, d: &mut Value, iot_lock: bool) -> Result<(), String> {
     let band = rp["radio"].as_str().ok_or("each radio needs its band (radio)")?;
-    let caps = &e.caps[band];
+    let caps = e.caps.get(band).copied().unwrap_or_default();
     let label = band_name(band);
     let r = inform_radio_mut(d, band).ok_or_else(|| format!("this AP has no {label} radio"))?;
     if let Some(ht) = int_field(rp, "ht", 20, 320)? {
         let ok = match band {
             "ng" => [20, 40].contains(&ht),
-            "na" | "6e" => [20, 40, 80].contains(&ht) || ht == 160 && caps["has_ht160"].as_bool() == Some(true),
+            "na" | "6e" => [20, 40, 80].contains(&ht) || ht == 160 && caps.has_ht160,
             _ => false,
         };
         if !ok {
@@ -1733,7 +1767,7 @@ fn radio_edit(e: &DeviceEdit, rp: &Value, before: &Value, d: &mut Value, iot_loc
         return Err("the 2.4 GHz channel is locked by an SSID's IoT setting: it can only go to 6".into());
     }
     copy_fields(rp, r, &[("tx_power_mode", Enum(&["auto", "high", "medium", "low", "custom", "disabled"]))])?;
-    let (lo, hi) = (caps["min_txpower"].as_i64().unwrap_or(1), caps["max_txpower"].as_i64().unwrap_or(30));
+    let (lo, hi) = (caps.min_txpower, caps.max_txpower);
     if let Some(tx) = int_field(rp, "tx_power", lo, hi).map_err(|_| format!("{label}: power must be {lo} to {hi} dBm"))? {
         r["tx_power"] = json!(tx);
     }
@@ -1858,7 +1892,7 @@ pub async fn delete_wlan_route(State(s): State<AppState>, Path(id): Path<String>
 /// PUT /api/settings/devices/{mac} {patch}
 pub async fn put_device(State(s): State<AppState>, MacPath(mac): MacPath, Query(q): Query<PreviewQuery>, Json(b): Json<Patch>) -> Result<Json<Value>, ApiError> {
     let inform = s.live.read().unwrap().raw_informs.get(&mac).cloned();
-    let caps = json!({ "ng": radio_caps(inform.as_deref(), "ng"), "na": radio_caps(inform.as_deref(), "na"), "6e": radio_caps(inform.as_deref(), "6e") });
+    let caps = RadioCaps::of_inform(inform.as_deref());
     // A mesh AP's uplink radio must stay on.
     let wireless_uplink = match inform.as_deref().map(uplink) {
         Some(Uplink::Wireless(band)) => band,
@@ -2268,7 +2302,7 @@ mod tests {
     }
 
     fn dev(s: &mut Value, patch: Value) -> Result<String, String> {
-        let caps = json!({ "na": { "min_txpower": 6, "max_txpower": 26, "has_ht160": false }, "ng": { "min_txpower": 6, "max_txpower": 22 } });
+        let caps = RadioCaps::of_inform(Some(&json!({ "radio_table": [{ "radio": "na", "min_txpower": 6, "max_txpower": 26, "has_ht160": false }, { "radio": "ng", "min_txpower": 6, "max_txpower": 22 }] })));
         apply_device(s, &DeviceEdit { mac: AP1.parse().unwrap(), patch, caps, wireless_uplink: None, antennas: Value::Null })
     }
 
@@ -2376,7 +2410,7 @@ mod tests {
         assert_eq!(uplink(&json!({ "vap_table": [] })), Uplink::Wired, "no uplink named: wired");
         assert_eq!(uplink(&inform("ath0")), Uplink::Wireless(None), "a placeholder names no VAP: wireless, band unknown");
         let mut s = state();
-        let e = DeviceEdit { mac: AP1.parse().unwrap(), patch: json!({ "radios": [{ "radio": "na", "tx_power_mode": "disabled" }] }), caps: Value::Null, wireless_uplink: Some("na".into()), antennas: Value::Null };
+        let e = DeviceEdit { mac: AP1.parse().unwrap(), patch: json!({ "radios": [{ "radio": "na", "tx_power_mode": "disabled" }] }), caps: HashMap::new(), wireless_uplink: Some("na".into()), antennas: Value::Null };
         assert!(apply_device(&mut s, &e).unwrap_err().contains("uplink"));
     }
 
@@ -2465,7 +2499,7 @@ mod tests {
         // An AP named another way is still the one an SSID's channel lock holds.
         let mut s = state();
         edit(&mut s, json!({ "iot_channel_lock": true })).unwrap();
-        let e = DeviceEdit { mac: "02-00-00-00-00-01".parse().unwrap(), patch: json!({ "radios": [{ "radio": "ng", "channel": 1 }] }), caps: Value::Null, wireless_uplink: None, antennas: Value::Null };
+        let e = DeviceEdit { mac: "02-00-00-00-00-01".parse().unwrap(), patch: json!({ "radios": [{ "radio": "ng", "channel": 1 }] }), caps: HashMap::new(), wireless_uplink: None, antennas: Value::Null };
         assert!(apply_device(&mut s, &e).unwrap_err().contains("IoT"));
         // A record that writes its MAC another way is found, and listed as `aa:bb:..`.
         let mut s = state();
@@ -2509,7 +2543,7 @@ mod tests {
         // An AP of the other site is judged by its own site's rules: not edited here.
         let mut t = s.clone();
         t["devices"].as_array_mut().unwrap().push(json!({ "mac": "02:00:00:00:00:09", "name": "Far", "site_id": "s2", "radio_table": [] }));
-        let far = DeviceEdit { mac: "02:00:00:00:00:09".parse().unwrap(), patch: json!({ "name": "Near" }), caps: Value::Null, wireless_uplink: None, antennas: Value::Null };
+        let far = DeviceEdit { mac: "02:00:00:00:00:09".parse().unwrap(), patch: json!({ "name": "Near" }), caps: HashMap::new(), wireless_uplink: None, antennas: Value::Null };
         assert_eq!(apply_device(&mut t, &far).unwrap_err(), "this AP belongs to another site");
         // Pruning this site's per-SSID groups leaves another site's alone.
         edit(&mut s, json!({ "aps": [AP1] })).unwrap();
@@ -2541,7 +2575,7 @@ mod tests {
     fn radio_extras_are_range_checked() {
         let mut s = state();
         let antennas = json!([{ "id": 4, "name": "Combined", "wifi0_gain": 3, "wifi1_gain": 5 }, { "id": 5, "name": "External" }]);
-        let caps = json!({ "na": { "min_txpower": 6, "max_txpower": 26 }, "ng": { "min_txpower": 6, "max_txpower": 22 } });
+        let caps = RadioCaps::of_inform(Some(&json!({ "radio_table": [{ "radio": "na", "min_txpower": 6, "max_txpower": 26 }, { "radio": "ng", "min_txpower": 6, "max_txpower": 22 }] })));
         let any = |s: &mut Value, patch: Value| apply_device(s, &DeviceEdit { mac: AP1.parse().unwrap(), patch, caps: caps.clone(), wireless_uplink: None, antennas: antennas.clone() });
         let edit = |s: &mut Value, r: Value| any(s, json!({ "radios": [r] }));
         edit(&mut s, json!({ "radio": "na", "loadbalance_enabled": true, "maxsta": 40, "sens_level_enabled": true, "sens_level": -80 })).unwrap();
