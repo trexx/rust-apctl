@@ -153,7 +153,10 @@ export function Basics({
           />
         </Row>
       )}
-      <SpeedLimitRow {...bind("usergroup_id")} />
+      <SpeedLimitRow
+        {...bind("usergroup_id")}
+        stored={w.original.usergroup_id}
+      />
     </>
   );
 }
