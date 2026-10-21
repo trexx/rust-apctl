@@ -1,7 +1,7 @@
 import { useState } from "react";
 import { adoptAp, adoptOverSsh, keys, useAdoption } from "../api";
 import { ago, useNow } from "../format";
-import { Outcome, useRunner } from "./common";
+import { Outcome, QueryNote, useRunner } from "./common";
 import { Row, TextInput } from "./settings/form";
 
 /**
@@ -17,7 +17,9 @@ export function AdoptionPanel() {
   const [pass, setPass] = useState("");
   // Event lists refetch when the adoption's events arrive.
   const { busy, msg, run } = useRunner([keys.adoption(), keys.devices()]);
-  if (!a.data || !a.data.active) return null;
+  // Nothing while it loads, or in shadow mode; a failure shows, as other panels' do.
+  if (!a.data) return a.error ? <QueryNote q={a} panel /> : null;
+  if (!a.data.active) return null;
   const d = a.data;
   const nothing = d.pending.length === 0 && d.adopting.length === 0;
   return (
