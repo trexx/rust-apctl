@@ -119,7 +119,8 @@ pub(crate) fn doc_mac(v: &Value) -> Option<inform::Mac> {
 /// [`setting`] / [`setting_mut`]), and new documents go in with [`push_doc`].
 /// The one exception is an AP's record looked up by its MAC
 /// ([`crate::adopt::device_doc`]): keys, adoption and forgetting go by the
-/// AP's own record, whatever site holds it.
+/// AP's own record, whatever site holds it. The AP editor edits the site's
+/// APs only ([`site_device`]): its rules are this site's.
 pub fn site_id(state: &Value) -> Option<&str> {
     state["devices"].as_array()?.iter().find_map(|d| d["site_id"].as_str())
 }
@@ -164,6 +165,16 @@ fn remove_doc(state: &mut Value, collection: &str, id: &str) {
 /// marks with this `attr_hidden_id` (the default AP group, user group, LAN).
 fn hidden_doc_id(state: &Value, collection: &str, hidden: &str) -> Option<String> {
     docs(state, collection).find(|d| d["attr_hidden_id"].as_str() == Some(hidden)).and_then(id_of)
+}
+
+/// The site's AP with this MAC. An AP of another site (of a multi-site import)
+/// is refused: its country, outdoor default and neighbours are its own site's.
+fn site_device<'a>(state: &'a Value, mac: &inform::Mac) -> Result<&'a Value, &'static str> {
+    match docs(state, "devices").find(|d| doc_mac(&d["mac"]) == Some(*mac)) {
+        Some(d) => Ok(d),
+        None if crate::adopt::device_doc(state, mac).is_some() => Err("this AP belongs to another site"),
+        None => Err("this AP is not in the settings"),
+    }
 }
 
 /// The site's setting document with this key (`Null` when there is none).
@@ -394,7 +405,7 @@ pub async fn device(State(s): State<AppState>, MacPath(mac): MacPath) -> Result<
         (live.state.clone(), live.raw_informs.get(&mac).cloned())
     };
     let state = state.ok_or_else(ApiError::no_state)?;
-    let d = crate::adopt::device_doc(&state, &mac).ok_or_else(|| ApiError::not_found("this AP is not in the settings"))?;
+    let d = site_device(&state, &mac).map_err(ApiError::not_found)?;
     let radios: Vec<Value> = d["radio_table"]
         .as_array()
         .into_iter()
@@ -1572,7 +1583,7 @@ pub struct DeviceEdit {
 pub fn apply_device(state: &mut Value, e: &DeviceEdit) -> Result<String, String> {
     let m = e.mac;
     let p = &e.patch;
-    let before = crate::adopt::device_doc(state, &m).ok_or("this AP is not in the settings")?.clone();
+    let before = site_device(state, &m)?.clone();
     let mut d = before.clone();
 
     device_fields(state, e, &before, &mut d)?;
@@ -1620,7 +1631,7 @@ pub fn apply_device(state: &mut Value, e: &DeviceEdit) -> Result<String, String>
             changed.push(format!("{} radio: {}", band_name(a["radio"].as_str().unwrap_or("")), keys.join(", ")));
         }
     }
-    *crate::adopt::device_doc_mut(state, &m).expect("found above") = d;
+    *docs_mut(state, "devices").find(|d| doc_mac(&d["mac"]) == Some(m)).expect("found above") = d;
     Ok(if changed.is_empty() { format!("AP {name}: nothing changed") } else { format!("AP {name}: {}", changed.join("; ")) })
 }
 
@@ -2470,6 +2481,11 @@ mod tests {
         assert_eq!(apply_wlan(&mut s.clone(), &WlanEdit { id: "w2".into(), patch: json!({ "name": "Mine" }) }).unwrap_err(), "unknown SSID");
         assert!(delete_wlan(&mut s.clone(), "w2").is_err());
         assert!(apply_usergroup(&mut s.clone(), &GroupEdit { id: Some("u2".into()), patch: json!({ "name": "Mine" }), delete: false }).is_err());
+        // An AP of the other site is judged by its own site's rules: not edited here.
+        let mut t = s.clone();
+        t["devices"].as_array_mut().unwrap().push(json!({ "mac": "02:00:00:00:00:09", "name": "Far", "site_id": "s2", "radio_table": [] }));
+        let far = DeviceEdit { mac: "02:00:00:00:00:09".parse().unwrap(), patch: json!({ "name": "Near" }), caps: Value::Null, wireless_uplink: None, antennas: Value::Null };
+        assert_eq!(apply_device(&mut t, &far).unwrap_err(), "this AP belongs to another site");
         // Pruning this site's per-SSID groups leaves another site's alone.
         edit(&mut s, json!({ "aps": [AP1] })).unwrap();
         edit(&mut s, json!({ "aps": null })).unwrap();
