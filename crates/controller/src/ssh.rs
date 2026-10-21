@@ -300,8 +300,16 @@ pub struct AdoptBody {
     password: Option<String>,
 }
 
-/// POST /api/devices/adopt-ssh {ip, port?, username?, password?}
+/// POST /api/devices/adopt-ssh {ip, port?, username?, password?}. Run as a
+/// task of its own: a request dropped mid-way (the page left, the proxy giving
+/// up) must not stop it between its record edit and what follows (`set-adopt`,
+/// and undoing the record if that fails).
 pub async fn adopt(State(s): State<AppState>, Json(b): Json<AdoptBody>) -> Result<Json<Value>, ApiError> {
+    tokio::spawn(adopt_over_ssh(s, b)).await?
+}
+
+/// [`adopt`]'s work.
+async fn adopt_over_ssh(s: AppState, b: AdoptBody) -> Result<Json<Value>, ApiError> {
     crate::api::require_active(&s, "adoption needs")?;
     let url = inform_url(&s).ok_or_else(|| ApiError::conflict("apctl doesn't know the URL APs should inform to: set --inform-url"))?;
     let ip = canonical_ip(&b.ip).ok_or_else(|| ApiError::bad("enter the AP's IP address"))?;

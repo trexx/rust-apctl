@@ -474,8 +474,16 @@ pub async fn pending(State(s): State<AppState>) -> Json<Value> {
     Json(json!({ "active": s.active, "pending": pending, "adopting": since(adopting), "forgetting": since(forgetting), "ssh": ssh }))
 }
 
-/// POST /api/devices/{mac}/adopt: adopt a pending AP.
+/// POST /api/devices/{mac}/adopt: adopt a pending AP. Run as a task of its
+/// own: a request dropped mid-way (the page left, the proxy giving up) must not
+/// stop it between its record edit and what follows (listing it as being
+/// adopted, or as pending again).
 pub async fn adopt(State(s): State<AppState>, MacPath(mac): MacPath) -> Result<Json<Value>, ApiError> {
+    tokio::spawn(adopt_pending(s, mac)).await?
+}
+
+/// [`adopt`]'s work.
+async fn adopt_pending(s: AppState, mac: Mac) -> Result<Json<Value>, ApiError> {
     crate::api::require_active(&s, "adoption needs")?;
     // Taken out of the list before the edit, so that a second Adopt (or one
     // over SSH) does not give the AP another key meanwhile.
