@@ -2944,9 +2944,13 @@ mod tests {
         h.engine.handle(Input::Reply { ts: 220, mac, decoded: push("aaa.1.hide_ssid=true\naaa.1.wpa.psk=new") });
         let pushes = stored(&h, EventKind::ConfigPushed);
         assert_eq!(pushes[0]["system_cfg"]["baseline"], true);
-        let diff = pushes[1]["system_cfg"]["diff"].as_str().unwrap();
-        assert!(diff.contains("~ aaa.1.hide_ssid: false -> true"), "{diff}");
-        assert!(diff.contains("aaa.1.wpa.psk: <redacted> -> <redacted>") && !diff.contains("new"), "{diff}");
+        assert_eq!(
+            pushes[1]["system_cfg"]["changes"],
+            json!([
+                { "op": "~", "key": "aaa.1.hide_ssid", "old": "false", "new": "true" },
+                { "op": "~", "key": "aaa.1.wpa.psk", "old": "<redacted>", "new": "<redacted>" },
+            ])
+        );
 
         // A push without a cfgversion keeps the last one, in memory as in the database.
         let push = json!({ "_type": "setparam", "mgmt_cfg": "cfgversion=v1\na=1", "system_cfg": "x=1" });
@@ -2992,7 +2996,11 @@ mod tests {
         // What it changed, not a baseline; the secret, masked in the stored copy, is not compared.
         push(&mut h, 20, json!({ "_type": "setparam", "mgmt_cfg": "cfgversion=v2\na=1", "system_cfg": "aaa.1.hide_ssid=true\naaa.1.wpa.psk=old" }));
         let pushed = stored(&h, EventKind::ConfigPushed).pop().unwrap();
-        assert_eq!((pushed["system_cfg"]["diff"].as_str(), pushed["mgmt_cfg"]["diff"].as_str()), (Some("~ aaa.1.hide_ssid: false -> true\n"), Some("~ cfgversion: v1 -> v2\n")));
+        let changes = |p: &Value| (p["system_cfg"]["changes"].clone(), p["mgmt_cfg"]["changes"].clone());
+        assert_eq!(
+            changes(&pushed),
+            (json!([{ "op": "~", "key": "aaa.1.hide_ssid", "old": "false", "new": "true" }]), json!([{ "op": "~", "key": "cfgversion", "old": "v1", "new": "v2" }]))
+        );
         // A management-only push without a cfgversion, after another restart: the
         // stored version; the system_cfg is the stored one, not known in full.
         let mut h = h.restarted();
@@ -3009,11 +3017,11 @@ mod tests {
         assert_eq!(stored(&h, EventKind::ConfigPushed).pop().unwrap().get("labels"), None);
         push(&mut h, 40, json!({ "_type": "setparam", "mgmt_cfg": "a=4", "system_cfg": "aaa.1.hide_ssid=false\naaa.1.wpa.psk=old" }));
         let pushed = stored(&h, EventKind::ConfigPushed).pop().unwrap();
-        assert_eq!((pushed["system_cfg"]["diff"].as_str(), pushed["mgmt_cfg"]["diff"].as_str()), (Some("~ aaa.1.hide_ssid: true -> false\n"), Some("~ a: 3 -> 4\n")));
+        assert_eq!(changes(&pushed), (json!([{ "op": "~", "key": "aaa.1.hide_ssid", "old": "true", "new": "false" }]), json!([{ "op": "~", "key": "a", "old": "3", "new": "4" }])));
         // From then on, the push seen in this run.
         push(&mut h, 50, json!({ "_type": "setparam", "system_cfg": "aaa.1.hide_ssid=false\naaa.1.wpa.psk=new" }));
-        let diff = stored(&h, EventKind::ConfigPushed).pop().unwrap()["system_cfg"]["diff"].as_str().unwrap().to_string();
-        assert!(diff.contains("aaa.1.wpa.psk: <redacted> -> <redacted>"), "{diff}");
+        let pushed = stored(&h, EventKind::ConfigPushed).pop().unwrap();
+        assert_eq!(pushed["system_cfg"]["changes"], json!([{ "op": "~", "key": "aaa.1.wpa.psk", "old": "<redacted>", "new": "<redacted>" }]));
     }
 
     #[test]
