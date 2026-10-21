@@ -1,26 +1,11 @@
-//! AP remote syslog on UDP 5514.
-//!
-//! Adopted APs send each message as its own datagram, either plain text or
-//! encrypted:
-//!
-//! ```text
-//! offset size
-//!      0    4  magic 0xABCDDCBA
-//!      4    1  0x01
-//!      5    4  1 (u32 BE)
-//!      9    8  device hash_id (the 16-hex `hash_id` from its informs, raw)
-//!     17   12  AES-GCM nonce
-//!     29    n  AES-256-GCM ciphertext + 16-byte tag; AAD = bytes 0..29
-//! ```
-//!
-//! The key is the device's 64-hex `syslog_key`.
+//! AP remote syslog: a datagram per message, plain text or, with the AP's
+//! 64-hex `syslog_key`, encrypted as `wire::syslog_frame` describes.
 
 use std::borrow::Cow;
 use std::sync::{Arc, Weak};
 
 use aes_gcm::Aes256Gcm;
 use aes_gcm::aead::KeyInit;
-use anyhow::{Result, anyhow, bail};
 use inform::Mac;
 use serde_json::Value;
 use wire::cfgdiff::{At, SECRET_PARTS};
@@ -28,8 +13,6 @@ use wire::keys::KeyStore;
 
 use crate::engine::LogLine;
 use crate::model::Ts;
-
-pub const MAGIC: [u8; 4] = wire::syslog_frame::MAGIC;
 
 /// A key name and its separator: `key=`, `key: `, and JSON's `"key": `. An
 /// ASCII word boundary: a Unicode one would keep the regex off its fast path
@@ -137,14 +120,12 @@ pub fn parse_hash_id(hex: &str) -> Option<u64> {
     Some(u64::from_be_bytes(b))
 }
 
-/// Decrypts an encrypted datagram with `mac`'s cipher (see [`Ciphers`]).
-pub fn decrypt_with(datagram: &[u8], mac: Mac, cipher: &Aes256Gcm) -> Result<String> {
-    if !wire::syslog_frame::is_sealed(datagram) {
-        bail!("not an encrypted syslog datagram ({} bytes)", datagram.len());
-    }
-    let plain = wire::syslog_frame::open(cipher, datagram).ok_or_else(|| anyhow!("syslog decryption failed for {mac}"))?;
+/// The text of an encrypted datagram, with an AP's cipher (see [`Ciphers`]);
+/// None if it is no such datagram or the key does not fit.
+pub fn decrypt(datagram: &[u8], cipher: &Aes256Gcm) -> Option<String> {
+    let plain = wire::syslog_frame::open(cipher, datagram)?;
     // Valid UTF-8 (the usual case) is taken as it is, not copied.
-    Ok(String::from_utf8(plain).unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned()))
+    Some(String::from_utf8(plain).unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned()))
 }
 
 /// The ciphers of every syslog key known (`adopt::syslog_keys`: the settings'
@@ -250,16 +231,15 @@ pub(crate) mod tests {
 
     #[test]
     fn decrypts_encrypted_datagrams() {
-        let mac: Mac = "02:00:00:00:00:01".parse().unwrap();
         let key = [7u8; 32];
         let dgram = seal([1, 2, 3, 4, 5, 6, 7, 8], key, "<14>hostapd: wifi1ap0: STA aa:bb AUTHENTICATED");
         assert_eq!(hash_id(&dgram), parse_hash_id("0102030405060708"));
         assert_eq!(hash_id(&dgram).map(|h| format!("{h:016x}")).as_deref(), Some("0102030405060708"));
         assert_eq!((parse_hash_id("0102030405060708"), parse_hash_id("01020304050607"), parse_hash_id("010203040506070g")), (Some(0x0102030405060708), None, None));
-        let text = decrypt_with(&dgram, mac, &Aes256Gcm::new(&key.into())).unwrap();
+        let text = decrypt(&dgram, &Aes256Gcm::new(&key.into())).unwrap();
         assert!(text.starts_with("<14>hostapd"));
-        assert!(decrypt_with(&dgram, mac, &Aes256Gcm::new(&[8u8; 32].into())).is_err(), "wrong key");
-        assert!(decrypt_with(b"plain text", mac, &Aes256Gcm::new(&key.into())).is_err());
+        assert!(decrypt(&dgram, &Aes256Gcm::new(&[8u8; 32].into())).is_none(), "wrong key");
+        assert!(decrypt(b"plain text", &Aes256Gcm::new(&key.into())).is_none());
         assert_eq!(hash_id(b"plain text"), None);
         // Too short to decrypt (a header and less than a tag): no sender.
         use wire::syslog_frame::{HEADER, TAG};
@@ -278,7 +258,7 @@ pub(crate) mod tests {
         let state = Arc::new(serde_json::json!({ "devices": [{ "mac": "02:00:00:00:00:02", "syslog_key": hex::encode([5u8; 32]) }] }));
         c.refresh(Some(&state), &keys);
         let dgram = tests::seal([3; 8], [5; 32], "<14>hostapd: hello");
-        assert!(decrypt_with(&dgram, ap, c.get(&ap).unwrap()).is_ok());
+        assert!(decrypt(&dgram, c.get(&ap).unwrap()).is_some());
         assert_eq!(Arc::strong_count(&state), 1, "the settings are not held");
         // Another version of the settings, even an equal one, is read again.
         let other = Arc::new(serde_json::json!({ "devices": [] }));

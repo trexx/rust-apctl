@@ -508,8 +508,8 @@ fn debug_syslog(pcap: &str, keys: &str, port: u16) -> Result<()> {
     let input = wire::capture::open_input(pcap)?;
     let end = wire::capture::run_with_udp(input, &[], &[port], |ev| {
         if let wire::capture::HttpEvent::Datagram { ts, src, payload, .. } = ev {
-            let found = if payload.starts_with(&syslog::MAGIC) {
-                ciphers.all().find_map(|(mac, cipher)| Some((Some(mac), syslog::decrypt_with(&payload, mac, cipher).ok()?)))
+            let found = if payload.starts_with(&wire::syslog_frame::MAGIC) {
+                ciphers.all().find_map(|(mac, cipher)| Some((Some(mac), syslog::decrypt(&payload, cipher)?)))
             } else {
                 Some((None, String::from_utf8_lossy(&payload).into_owned()))
             };

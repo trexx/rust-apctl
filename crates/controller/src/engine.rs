@@ -1416,7 +1416,7 @@ impl Engine {
         self.syslog_ciphers.refresh(state, &self.keys);
         if let Some(mac) = by_hash
             && let Some(cipher) = self.syslog_ciphers.get(&mac)
-            && let Ok(text) = crate::syslog::decrypt_with(payload, mac, cipher)
+            && let Some(text) = crate::syslog::decrypt(payload, cipher)
         {
             return Ok((mac, text));
         }
@@ -1435,7 +1435,7 @@ impl Engine {
             anyhow::bail!("no syslog key for hash_id {hash_id:016x} (too many unknown senders to try)");
         }
         for (mac, cipher) in self.syslog_ciphers.all() {
-            if let Ok(text) = crate::syslog::decrypt_with(payload, mac, cipher) {
+            if let Some(text) = crate::syslog::decrypt(payload, cipher) {
                 self.syslog_unknown.remove(&hash_id);
                 self.live.write().unwrap().set_hash_id(hash_id, mac);
                 return Ok((mac, text));
@@ -1456,7 +1456,7 @@ impl Engine {
         };
         let result = match hash_id {
             Some(h) => self.decrypt_syslog(ts, payload, h, by_hash, state.as_ref()).map(|(mac, text)| (Some(mac), Cow::Owned(text))),
-            None if payload.starts_with(&crate::syslog::MAGIC) => Err(anyhow::anyhow!("encrypted syslog datagram too short ({} bytes)", payload.len())),
+            None if payload.starts_with(&wire::syslog_frame::MAGIC) => Err(anyhow::anyhow!("encrypted syslog datagram too short ({} bytes)", payload.len())),
             None => Ok((None, String::from_utf8_lossy(payload))),
         };
         match result {
