@@ -1464,6 +1464,7 @@ mod tests {
         // The other connected clients in each group, by name (else MAC); not the client itself, nor one that left.
         let tv = get_json(&app, "/api/clients/02:00:00:00:01:01").await;
         assert_eq!(tv["sample"]["multicast"]["memberships"], json!([ssdp, mdns]));
+        assert_eq!(tv["sample"]["multicast"]["delivery"], "flooding", "joined, with no group the AP tracks");
         assert_eq!(tv["peers"], json!({
             mdns: [{ "mac": "02:00:00:00:01:04", "name": "02:00:00:00:01:04" }],
             ssdp: [{ "mac": "02:00:00:00:01:03", "name": "amp" }, { "mac": "02:00:00:00:01:02", "name": "Speaker" }],
