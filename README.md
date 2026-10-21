@@ -112,9 +112,8 @@ used, so the login throttle sees each client rather than the proxy.
 Try the UI without any APs. The demo is a made-up site with three APs and about twenty clients:
 
 ```sh
-# Two builds: informdump turns on serde_json features that apctl is not built with.
-cargo build --release -p controller
-cargo build --release -p informdump
+cargo build --release                 # apctl
+cargo build --release -p informdump   # on its own: it turns on serde_json features apctl is not built with
 mkdir -p data   # git-ignored, and kept out of image builds
 target/release/informdump demo-state > data/demo.json
 target/release/apctl serve --data-dir data/demo --keys data/demo.json \
