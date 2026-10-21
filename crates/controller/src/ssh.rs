@@ -359,10 +359,11 @@ async fn adopt_over_ssh(s: AppState, b: AdoptBody) -> Result<Json<Value>, ApiErr
         Ok(what)
     };
     crate::actions::apply_edit(&s, Box::new(edit)).await?;
-    let Made { created, key } = cell.lock().unwrap().ok_or_else(|| ApiError::internal("the record edit said nothing of its key"))?;
-    let key = hex::encode(key);
+    let Made { created, key: made_key } = cell.lock().unwrap().ok_or_else(|| ApiError::internal("the record edit said nothing of its key"))?;
+    let key = hex::encode(made_key);
     // Expected from now on: the AP may inform with its key before the command returns.
-    let adopting = crate::adopt::Adopting { since: clock::now_ts(), kept_key: !created };
+    let since = clock::now_ts();
+    let adopting = crate::adopt::Adopting { since, kept_key: !created };
     {
         let mut live = s.live.write().unwrap();
         live.adoption.adopting.insert(mac, adopting);
@@ -370,16 +371,25 @@ async fn adopt_over_ssh(s: AppState, b: AdoptBody) -> Result<Json<Value>, ApiErr
     }
     let out = match session.run(&format!("/usr/bin/syswrapper.sh set-adopt {} {}", shell_quote(&url), shell_quote(&key))).await {
         Ok(out) => out,
-        // Back with its key already (that ends the adoption): it worked.
-        Err(f) if !s.live.read().unwrap().adoption.adopting.contains_key(&mac) => {
+        // Tested and taken in one write: an AP back with its key already has ended the adoption, so it worked.
+        Err(f) if s.live.write().unwrap().adoption.adopting.remove(&mac).is_none() => {
             tracing::warn!("{mac}: set-adopt reported a failure, but the AP informs with its key: {f}");
             String::new()
         }
         Err(f) => {
-            s.live.write().unwrap().adoption.adopting.remove(&mac);
-            // Not adopted after all: a record made for it would make it look like one of ours.
+            // Not adopted after all: a record made for it would make it look like one of ours. Left
+            // alone if it is no longer this adoption's (another gave it a new key), or the AP informed
+            // with its key after all (from now on it is no longer expected): removing it would strand
+            // the AP until it is reset.
             if created {
-                let undo = move |st: &mut Value| crate::adopt::remove_device(st, &mac).map(|what| format!("{what}: adopting it over SSH failed"));
+                let live = s.live.clone();
+                let undo = move |st: &mut Value| {
+                    let heard = live.read().unwrap().devices.get(&mac).is_some_and(|d| d.last_seen >= since);
+                    if heard || record_key(st, &mac) != Some(made_key) {
+                        return Ok(format!("{mac}: adopting it over SSH failed, but its record stays"));
+                    }
+                    crate::adopt::remove_device(st, &mac).map(|what| format!("{what}: adopting it over SSH failed"))
+                };
                 let _ = crate::actions::apply_edit(&s, Box::new(undo)).await;
             }
             return Err(bad(f));
