@@ -1533,9 +1533,20 @@ pub fn ensure_default_usergroup(state: &mut Value) -> String {
 }
 
 /// The default user group as [`ensure_default_usergroup`] adds it (but for
-/// its `site_id`). Its id is the one most SSIDs point at (the first of a tie)
-/// that no group has: an id a group has is a speed limit, not the default.
+/// its `site_id`): with the id SSIDs point at ([`orphan_usergroup_id`]), else a new one.
 fn new_default_usergroup(state: &Value) -> Value {
+    default_usergroup_doc(&orphan_usergroup_id(state).map_or_else(new_id, str::to_string))
+}
+
+/// The default user group's document, with this id.
+fn default_usergroup_doc(id: &str) -> Value {
+    json!({ "_id": id, "name": "Default", "attr_hidden_id": "Default", "attr_no_delete": true, "qos_rate_max_down": -1, "qos_rate_max_up": -1 })
+}
+
+/// The id a default user group made now keeps: the one most SSIDs point at
+/// (the first of a tie) that no group has (an id a group has is a speed limit,
+/// not the default). `None` when no SSID points at a missing group.
+fn orphan_usergroup_id(state: &Value) -> Option<&str> {
     let mut uses: Vec<(&str, usize)> = Vec::new();
     for g in docs(state, "wlanconf").filter_map(|w| w["usergroup_id"].as_str()).filter(|g| !g.is_empty() && doc_by_id(state, "usergroup", g).is_none()) {
         match uses.iter_mut().find(|(id, _)| *id == g) {
@@ -1544,8 +1555,7 @@ fn new_default_usergroup(state: &Value) -> Value {
         }
     }
     // max_by_key keeps the last of equals: reversed, that is the first seen.
-    let id = uses.into_iter().rev().max_by_key(|(_, n)| *n).map_or_else(new_id, |(id, _)| id.to_string());
-    json!({ "_id": id, "name": "Default", "attr_hidden_id": "Default", "attr_no_delete": true, "qos_rate_max_down": -1, "qos_rate_max_up": -1 })
+    uses.into_iter().rev().max_by_key(|(_, n)| *n).map(|(id, _)| id)
 }
 
 /// The id of the site's default user group (no speed limit).
@@ -2821,7 +2831,12 @@ pub fn apply_client_group(state: &mut Value, e: &ClientGroup) -> Result<String, 
 /// GET /api/settings/usergroups
 pub async fn usergroups(State(s): State<AppState>) -> Result<Json<Value>, ApiError> {
     let state = crate::api::current_state(&s)?;
-    let users = group_users(&state);
+    Ok(Json(json!({ "active": s.active, "groups": usergroup_list(&state) })))
+}
+
+/// The site's user groups as the editors show them, with what uses each.
+fn usergroup_list(state: &Value) -> Vec<Value> {
+    let users = group_users(state);
     let group = |g: &Value| {
         let id = id_of(g).unwrap_or_default();
         let used_by = users.get(id.as_str()).map(Vec::as_slice).unwrap_or_default();
@@ -2830,12 +2845,13 @@ pub async fn usergroups(State(s): State<AppState>) -> Result<Json<Value>, ApiErr
             "qos_rate_max_down": g["qos_rate_max_down"], "qos_rate_max_up": g["qos_rate_max_up"], "used_by": used_by,
         })
     };
-    let mut groups: Vec<Value> = docs(&state, "usergroup").map(group).collect();
-    // Settings without a default group get it on their first save; shown as it will be.
-    if default_usergroup(&state).is_none() {
-        groups.push(group(&new_default_usergroup(&state)));
+    let mut groups: Vec<Value> = docs(state, "usergroup").map(group).collect();
+    // Settings without a default group get it on their first save; shown as it will be, with
+    // the id it will keep, else "" (the editors' name for the default group while it isn't made).
+    if default_usergroup(state).is_none() {
+        groups.push(group(&default_usergroup_doc(orphan_usergroup_id(state).unwrap_or(""))));
     }
-    Ok(Json(json!({ "active": s.active, "groups": groups })))
+    groups
 }
 
 /// POST /api/settings/usergroups {patch}
@@ -2897,6 +2913,12 @@ mod speed_and_schedule_tests {
         let mut s = state();
         s["wlanconf"] = json!([ssid("w1", "ug-a"), ssid("w2", "ug-b")]);
         assert_eq!(ensure_default_usergroup(&mut s), "ug-a");
+        // Shown before it is made: with the id it will keep, else "" (not a new random one each time).
+        let shown = |s: &Value| usergroup_list(s).into_iter().find(|g| g["default"] == true).map(|g| g["id"].clone());
+        assert_eq!(shown(&state()), Some(json!("ug-imported")));
+        let mut s = state();
+        s["wlanconf"][0].as_object_mut().unwrap().remove("usergroup_id");
+        assert_eq!((shown(&s), shown(&s)), (Some(json!("")), Some(json!(""))));
     }
 
     #[test]
