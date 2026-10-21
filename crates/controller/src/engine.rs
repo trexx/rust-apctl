@@ -4,6 +4,7 @@
 //! The engine runs as one task that owns all mutable state; the API reads a
 //! shared snapshot (`Live`) and subscribes to a broadcast of changes.
 
+use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap};
 use std::net::IpAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -372,7 +373,7 @@ pub struct KnownDevice {
 
 pub type SharedLive = Arc<RwLock<Live>>;
 
-type McastTypes = BTreeMap<std::borrow::Cow<'static, str>, crate::model::McastCounts>;
+type McastTypes = BTreeMap<Cow<'static, str>, crate::model::McastCounts>;
 
 /// A sample's multicast counters by traffic type (none if it has none).
 fn mcast_types(c: &ClientSample) -> &McastTypes {
@@ -614,11 +615,9 @@ impl Engine {
         );
         // An AP stored as offline is unavailable to the clients locked to it,
         // whatever the settings were saved (or restored from a backup) with.
-        let (presence, imported_at) = (presence(&live), live.state_imported_at);
+        let presence = presence(&live);
         drop(live);
-        if let Some(at) = imported_at {
-            self.set_fixed_ap_available(at, presence);
-        }
+        self.set_fixed_ap_available(presence);
         Ok(())
     }
 
@@ -757,7 +756,7 @@ impl Engine {
         let _ = self.tx.send(LiveMsg::Device { mac });
         // Online: its first inform of this run, or back from offline.
         if came_back {
-            self.set_fixed_ap_available(ts, HashMap::from([(mac, true)]));
+            self.set_fixed_ap_available(HashMap::from([(mac, true)]));
         }
     }
 
@@ -770,25 +769,19 @@ impl Engine {
     /// The APs are asked to inform now only when a client is locked to one of
     /// them, when the official controller provisions them all; else no AP's
     /// config changes.
-    fn set_fixed_ap_available(&mut self, ts: Ts, aps: HashMap<Mac, bool>) {
-        let (current, imported_at) = {
-            let live = self.live.read().unwrap();
-            (live.state.clone(), live.state_imported_at.unwrap_or(ts))
-        };
-        let Some(current) = current else { return };
-        if !current["devices"].as_array().is_some_and(|d| d.iter().any(|d| availability_change(d, &aps).is_some())) {
-            return;
-        }
-        let mut state = Value::clone(&current);
-        drop(current);
-        let changed = mark_available(&mut state, &aps);
-        let locked = state["clients"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .any(|c| c["fixed_ap_enabled"].as_bool() == Some(true) && crate::settings::doc_mac(&c["fixed_ap_mac"]).is_some_and(|m| changed.contains(&m)));
-        self.store_state(state, imported_at);
-        if locked {
+    fn set_fixed_ap_available(&mut self, aps: HashMap<Mac, bool>) {
+        let locked = self.change_state(|state| {
+            if !state["devices"].as_array().is_some_and(|d| d.iter().any(|d| availability_change(d, &aps).is_some())) {
+                return false;
+            }
+            let changed = mark_available(state.to_mut(), &aps);
+            state["clients"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .any(|c| c["fixed_ap_enabled"].as_bool() == Some(true) && crate::settings::doc_mac(&c["fixed_ap_mac"]).is_some_and(|m| changed.contains(&m)))
+        });
+        if locked.is_some_and(|(locked, _)| locked) {
             crate::stun::poke_all(&self.live.read().unwrap());
         }
     }
@@ -1077,27 +1070,42 @@ impl Engine {
 
     /// Stores an AP's section numbering in the settings, so later renders keep it.
     fn set_config_meta(&self, mac: Mac, meta: Value) {
-        // Copied and serialised without the lock, as in `edit_state`.
-        let Some((state, imported_at)) = ({
-            let live = self.live.read().unwrap();
-            live.state.clone().zip(live.state_imported_at)
-        }) else {
-            return;
-        };
         let mac_s = mac.to_string();
         let same_mac = |m: &Value| m["mac"].as_str().is_some_and(|x| x.eq_ignore_ascii_case(&mac_s));
-        let current = state["config_meta"].as_array().and_then(|a| a.iter().find(|m| same_mac(m)));
-        if current == Some(&meta) {
-            return;
+        self.change_state(|state| {
+            let current = state["config_meta"].as_array().and_then(|a| a.iter().find(|m| same_mac(m)));
+            if current == Some(&meta) {
+                return;
+            }
+            let next = state.to_mut();
+            if !next["config_meta"].is_array() {
+                next["config_meta"] = json!([]);
+            }
+            let list = next["config_meta"].as_array_mut().unwrap();
+            list.retain(|m| !same_mac(m));
+            list.push(meta);
+        });
+    }
+
+    /// Changes the settings: `f` gets them to copy (`to_mut`) only when it
+    /// changes them, and a copy that differs is stored, under the time the
+    /// settings were imported (an edit is no import). None without settings;
+    /// else what `f` returned and whether they were stored. The copy is made and
+    /// serialised without the lock.
+    fn change_state<R>(&self, f: impl FnOnce(&mut Cow<Value>) -> R) -> Option<(R, bool)> {
+        let (current, imported_at) = {
+            let live = self.live.read().unwrap();
+            live.state.clone().zip(live.state_imported_at)?
+        };
+        let mut state = Cow::Borrowed(&*current);
+        let r = f(&mut state);
+        let Cow::Owned(next) = state else { return Some((r, false)) };
+        if next == *current {
+            return Some((r, false));
         }
-        let mut next = (*state).clone();
-        if !next["config_meta"].is_array() {
-            next["config_meta"] = json!([]);
-        }
-        let list = next["config_meta"].as_array_mut().unwrap();
-        list.retain(|m| !same_mac(m));
-        list.push(meta);
+        drop(current);
         self.store_state(next, imported_at);
+        Some((r, true))
     }
 
     /// Stores the settings, then swaps them into the live view. Serialised
@@ -1128,17 +1136,20 @@ impl Engine {
     /// between reading and swapping them in: the copy, the edit (which may hash
     /// a password) and the serialising run without holding the lock.
     fn edit_state(&mut self, ts: Ts, edit: StateEdit) -> Result<String, String> {
-        let (current, imported_at) = {
-            let live = self.live.read().unwrap();
-            (live.state.clone(), live.state_imported_at.unwrap_or(ts))
-        };
-        let mut state = current.as_deref().cloned().ok_or("no settings imported yet")?;
-        let what = edit(&mut state)?;
-        // Saved as they were (e.g. a form sent unchanged): nothing to store, record or tell the APs.
-        if current.as_deref() == Some(&state) {
+        // A refused edit leaves the settings as they were.
+        let (what, stored) = self
+            .change_state(|state| {
+                let mut next = Value::clone(state);
+                let what = edit(&mut next)?;
+                *state = Cow::Owned(next);
+                Ok::<_, String>(what)
+            })
+            .ok_or("no settings imported yet")?;
+        let what = what?;
+        // Saved as they were (e.g. a form sent unchanged): nothing to record or tell the APs.
+        if !stored {
             return Ok(what);
         }
-        self.store_state(state, imported_at);
         self.syslog_unknown.clear();
         self.emit(Event::site(ts, EventKind::SettingsChanged, json!({ "what": what })));
         // The APs pick the change up now rather than at their next interval.
@@ -1444,7 +1455,7 @@ impl Engine {
             (hash_id.and_then(|h| live.by_hash_id.get(&h).copied()), by_ip, (hash_id.is_some() || by_ip.is_some()).then(|| live.state.clone()).flatten())
         };
         let result = match hash_id {
-            Some(h) => self.decrypt_syslog(ts, payload, h, by_hash, state.as_ref()).map(|(mac, text)| (Some(mac), std::borrow::Cow::Owned(text))),
+            Some(h) => self.decrypt_syslog(ts, payload, h, by_hash, state.as_ref()).map(|(mac, text)| (Some(mac), Cow::Owned(text))),
             None if payload.starts_with(&crate::syslog::MAGIC) => Err(anyhow::anyhow!("encrypted syslog datagram too short ({} bytes)", payload.len())),
             None => Ok((None, String::from_utf8_lossy(payload))),
         };
@@ -1659,7 +1670,7 @@ impl Engine {
             let _ = self.tx.send(LiveMsg::Device { mac });
         }
         if !offline.is_empty() {
-            self.set_fixed_ap_available(now, offline.into_iter().map(|m| (m, false)).collect());
+            self.set_fixed_ap_available(offline.into_iter().map(|m| (m, false)).collect());
         }
         if changed {
             let _ = self.tx.send(LiveMsg::Clients);
@@ -2333,7 +2344,7 @@ mod tests {
         h.engine.set_state(130, json!({ "devices": [{ "mac": AP1, "radio_table": radios }, { "mac": AP2, "radio_table": radios, "fixed_ap_available": true }] }));
         assert_eq!((available(&h, 0), available(&h, 1)), (None, Some(json!(false))));
         // Settings saved while it was there, with AP2 stored offline: a restart marks it.
-        h.engine.set_fixed_ap_available(140, HashMap::from([(AP2.parse().unwrap(), true)]));
+        h.engine.set_fixed_ap_available(HashMap::from([(AP2.parse().unwrap(), true)]));
         assert_eq!(available(&h, 1), Some(json!(true)));
         let h = h.restarted();
         assert_eq!((available(&h, 0), available(&h, 1)), (None, Some(json!(false))), "AP1 is not known yet; AP2 is stored offline");
