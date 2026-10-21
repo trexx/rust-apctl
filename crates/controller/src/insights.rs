@@ -33,21 +33,25 @@ fn bssids_of(c: &Connection, tier: usize, ap: &str, band: Option<&str>) -> rusql
     Ok(out)
 }
 
-/// The SSID counters the site-wide views read: activity's, which hold those
-/// of top, density and retries too.
+/// The SSID counters the site-wide views read: those of activity, top,
+/// density and retries, the networks' ([`wlans`]) and the radios' ([`radios`]).
 const VAP_COLS: &[&str] = &[
     "tx_bytes", "rx_bytes", "tx_packets", "rx_packets", "tx_retries", "tx_mcast", "rx_mcast", "tx_dropped", "num_sta", "tx_bcast", "rx_bcast",
-    "wifi_tx_attempts", "wifi_tx_dropped",
+    "wifi_tx_attempts", "wifi_tx_dropped", "satisfaction", "avg_client_signal",
 ];
 
-/// Every SSID's counters ([`VAP_COLS`]) over the window, with its AP and band
-/// (`ap_mac`, `radio`), given to `f` off the async workers. Read once for the
-/// site-wide views the Overview asks for together (activity, top, density,
-/// retries), each of which works out its own figures from it, and kept as a
-/// view's read is (see [`memo_read`]).
+/// The text columns the site-wide views read of an SSID: its AP and band
+/// ([`AP_BAND`], first, as [`retry_totals`] reads them) and its network name.
+const SITE_VAP_EXTRA: &[&str] = &["ap_mac", "radio", "essid"];
+
+/// Every SSID's counters ([`VAP_COLS`]) over the window, with [`SITE_VAP_EXTRA`],
+/// given to `f` off the async workers. Read once for the site-wide views (the
+/// Overview's activity, top, density and retries, the networks and the radios,
+/// which the pages ask for over the same window), each of which works out its
+/// own figures from it, and kept as a view's read is (see [`memo_read`]).
 async fn with_site_vaps<T: Send + 'static>(s: &AppState, q: &RangeQuery, f: impl FnOnce(&Loaded) -> T + Send + 'static) -> Result<T, ApiError> {
     let (from, to, tier) = window(q);
-    let spec = Spec { table: "vap_stats", key: "bssid", extra: AP_BAND, cols: VAP_COLS, only: None };
+    let spec = Spec { table: "vap_stats", key: "bssid", extra: SITE_VAP_EXTRA, cols: VAP_COLS, only: None };
     let vaps = memo_read(s, Db::Metrics, "site-vaps", &q.read_by(false), tier, move |c| load(c, spec, tier, from, to)).await?;
     Ok(tokio::task::spawn_blocking(move || f(&vaps)).await?)
 }
@@ -627,12 +631,8 @@ fn wlan_settings(state: Option<&Value>, essid: &str) -> Value {
 pub async fn wlans(State(s): State<AppState>, Query(q): Query<RangeQuery>) -> Result<Json<Value>, ApiError> {
     let (from, to, tier) = window(&q);
     let bucket = bucket_for(to - from, tier);
-    // The history, summed up per network where it is read.
-    let per = memo_read(&s, Db::Metrics, "wlans", &q.read_by(false), tier, move |c| {
-        let vaps = load(c, Spec { table: "vap_stats", key: "bssid", extra: &["essid"], cols: WLAN_COLS, only: None }, tier, from, to)?;
-        Ok(wlan_history(&vaps, from, bucket))
-    })
-    .await?;
+    // The history, summed up per network.
+    let per = with_site_vaps(&s, &q, move |vaps| wlan_history(vaps, from, bucket)).await?;
     // How our own SSIDs are heard over the air (our APs scan each other).
     let own: Vec<String> = own_bssids(&s.live.read().unwrap()).map(|(_, v)| v.bssid.clone()).collect();
     let on_air: HashMap<String, String> = if own.is_empty() {
@@ -740,12 +740,6 @@ pub async fn wlans(State(s): State<AppState>, Query(q): Query<RangeQuery>) -> Re
 /// The security each of a JSON list of BSSIDs is heard with, newest last.
 const WLANS_ON_AIR: &str = "SELECT bssid, security FROM neighbors WHERE security IS NOT NULL AND bssid IN (SELECT value FROM json_each(?1)) ORDER BY last_seen";
 
-/// What `wlans` loads per VAP.
-const WLAN_COLS: &[&str] = &[
-    "tx_bytes", "rx_bytes", "tx_packets", "rx_packets", "tx_mcast", "rx_mcast", "tx_bcast", "rx_bcast", "tx_retries", "wifi_tx_attempts", "wifi_tx_dropped",
-    "num_sta", "satisfaction", "avg_client_signal",
-];
-
 /// One SSID's share of a time bucket ([`activity`], [`WlanAgg::series`]):
 /// rates per second, each summed over its intervals, and its clients.
 #[derive(Clone, Copy)]
@@ -813,14 +807,14 @@ struct WlanAgg {
     retry: Retries,
 }
 
-/// The VAPs' history ([`WLAN_COLS`], with the network name) summed up per network.
+/// The VAPs' history ([`VAP_COLS`], with [`SITE_VAP_EXTRA`]) summed up per network.
 fn wlan_history(vaps: &Loaded, from: Ts, bucket: Ts) -> BTreeMap<String, WlanAgg> {
     let [tx_bytes, rx_bytes, tx_packets, rx_packets, tx_mcast, rx_mcast, tx_bcast, rx_bcast, num_sta, satisfaction, signal] =
-        cols_at(WLAN_COLS, ["tx_bytes", "rx_bytes", "tx_packets", "rx_packets", "tx_mcast", "rx_mcast", "tx_bcast", "rx_bcast", "num_sta", "satisfaction", "avg_client_signal"]);
-    let retry_at = cols_at(WLAN_COLS, Retries::COLS);
+        cols_at(VAP_COLS, ["tx_bytes", "rx_bytes", "tx_packets", "rx_packets", "tx_mcast", "rx_mcast", "tx_bcast", "rx_bcast", "num_sta", "satisfaction", "avg_client_signal"]);
+    let retry_at = cols_at(VAP_COLS, Retries::COLS);
     let mut per: BTreeMap<String, WlanAgg> = BTreeMap::new();
     for (vap, (ex, samples)) in vaps.values().enumerate() {
-        let essid = &ex[0];
+        let essid = &ex[2];
         if essid.is_empty() {
             continue;
         }
@@ -857,9 +851,6 @@ fn wlan_history(vaps: &Loaded, from: Ts, bucket: Ts) -> BTreeMap<String, WlanAgg
     per
 }
 
-/// What `radios` loads per VAP.
-const RADIO_VAP_COLS: &[&str] = &["tx_bytes", "rx_bytes", "avg_client_signal", "tx_retries", "wifi_tx_attempts", "wifi_tx_dropped"];
-
 /// One radio's averages over the window, as `radios` lists them.
 #[derive(Default)]
 struct RadioAvg {
@@ -875,37 +866,24 @@ struct RadioAvg {
 /// over the window (interference, utilisation, traffic, retries, signal).
 pub async fn radios(State(s): State<AppState>, Query(q): Query<RangeQuery>) -> Result<Json<Value>, ApiError> {
     let (from, to, tier) = window(&q);
-    // By AP, then radio, worked out where the data is read.
-    let avgs = memo_read(&s, Db::Metrics, "radios", &q.read_by(false), tier, move |c| {
-        let mut out: HashMap<String, HashMap<String, RadioAvg>> = HashMap::new();
-        // Airtime: SQLite averages each radio's samples in the window.
+    // Airtime by AP and radio: SQLite averages each radio's samples in the window.
+    let airtime = memo_read(&s, Db::Metrics, "radios", &q.read_by(false), tier, move |c| {
         let sql = format!("SELECT mac, radio, AVG(cu_total), AVG(cu_interf) FROM radio_stats{} WHERE ts >= ?1 AND ts <= ?2 GROUP BY mac, radio", TIERS[tier].suffix);
         let mut stmt = c.prepare_cached(&sql)?;
         let mut rows = stmt.query([from, to])?;
+        let mut out: Vec<(String, String, Option<f64>, Option<f64>)> = Vec::new();
         while let Some(r) = rows.next()? {
-            let e = out.entry(r.get(0)?).or_default().entry(r.get(1)?).or_default();
-            (e.utilization, e.interference) = (r.get(2)?, r.get(3)?);
-        }
-        // Retries come from the VAPs: the radio-level counters stay at 0 on some models.
-        let vaps = load(c, Spec { table: "vap_stats", key: "bssid", extra: AP_BAND, cols: RADIO_VAP_COLS, only: None }, tier, from, to)?;
-        for ((ap, band), t) in retry_totals(&vaps, cols_at(RADIO_VAP_COLS, Retries::COLS), from) {
-            out.entry(ap.to_string()).or_default().entry(band.to_string()).or_default().retry_pct = t.pct();
-        }
-        // Traffic and client signal per radio.
-        let [tx, rx, signal] = cols_at(RADIO_VAP_COLS, ["tx_bytes", "rx_bytes", "avg_client_signal"]);
-        for (ex, samples) in vaps.values() {
-            let e = out.entry(ex[0].clone()).or_default().entry(ex[1].clone()).or_default();
-            for d in deltas(samples, from) {
-                e.usage += d.inc(tx).unwrap_or(0.0) + d.inc(rx).unwrap_or(0.0);
-            }
-            // The AP reports 0 or -1 when no client is connected.
-            for x in samples.since(from).filter_map(|(_, v)| v[signal]).filter(|v| *v < -10.0) {
-                e.signal.add(x);
-            }
+            out.push((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?));
         }
         Ok(out)
     })
     .await?;
+    // By AP, then radio: the SSIDs' figures, then the airtime.
+    let mut avgs = with_site_vaps(&s, &q, move |vaps| radio_vap_avgs(vaps, from)).await?;
+    for (ap, radio, utilization, interference) in airtime.iter() {
+        let e = avgs.entry(ap.clone()).or_default().entry(radio.clone()).or_default();
+        (e.utilization, e.interference) = (*utilization, *interference);
+    }
     let live = s.live.read().unwrap();
     let mut out = Vec::new();
     for (mac, d) in &live.devices {
@@ -923,6 +901,28 @@ pub async fn radios(State(s): State<AppState>, Query(q): Query<RangeQuery>) -> R
         }
     }
     Ok(Json(Value::Array(out)))
+}
+
+/// [`radios`]' figures from the SSIDs' counters ([`VAP_COLS`]), by AP, then
+/// radio: retries (the radio-level counters stay at 0 on some models), traffic
+/// and client signal.
+fn radio_vap_avgs(vaps: &Loaded, from: Ts) -> HashMap<String, HashMap<String, RadioAvg>> {
+    let mut out: HashMap<String, HashMap<String, RadioAvg>> = HashMap::new();
+    for ((ap, band), t) in retry_totals(vaps, cols_at(VAP_COLS, Retries::COLS), from) {
+        out.entry(ap.to_string()).or_default().entry(band.to_string()).or_default().retry_pct = t.pct();
+    }
+    let [tx, rx, signal] = cols_at(VAP_COLS, ["tx_bytes", "rx_bytes", "avg_client_signal"]);
+    for (ex, samples) in vaps.values() {
+        let e = out.entry(ex[0].clone()).or_default().entry(ex[1].clone()).or_default();
+        for d in deltas(samples, from) {
+            e.usage += d.inc(tx).unwrap_or(0.0) + d.inc(rx).unwrap_or(0.0);
+        }
+        // The AP reports 0 or -1 when no client is connected.
+        for x in samples.since(from).filter_map(|(_, v)| v[signal]).filter(|v| *v < -10.0) {
+            e.signal.add(x);
+        }
+    }
+    out
 }
 
 #[derive(Deserialize)]
@@ -1076,13 +1076,13 @@ mod tests {
     fn network_throughput_is_averaged_over_intervals_not_samples() {
         // A new SSID: three reports in the bucket, so two intervals of 100 bytes/s down.
         let row = |t: Ts, tx: f64| {
-            let mut v = vec![None; WLAN_COLS.len()];
-            v[col(WLAN_COLS, "tx_bytes")] = Some(tx);
-            v[col(WLAN_COLS, "num_sta")] = Some(3.0);
+            let mut v = vec![None; VAP_COLS.len()];
+            v[col(VAP_COLS, "tx_bytes")] = Some(tx);
+            v[col(VAP_COLS, "num_sta")] = Some(3.0);
             (t, v)
         };
         let mut vaps: Loaded = BTreeMap::new();
-        vaps.insert("bss".into(), (vec!["Home".into()], Samples::from_rows(vec![row(0, 0.0), row(10, 1000.0), row(20, 2000.0)])));
+        vaps.insert("bss".into(), (vec!["ap".into(), "na".into(), "Home".into()], Samples::from_rows(vec![row(0, 0.0), row(10, 1000.0), row(20, 2000.0)])));
         let per = wlan_history(&vaps, 0, 60);
         let b = per["Home"].series[&0][&0];
         assert_eq!(b.averages(), (3.0, [100.0, 0.0]));
