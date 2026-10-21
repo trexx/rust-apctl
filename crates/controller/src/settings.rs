@@ -552,10 +552,18 @@ pub(crate) fn allowed_channels(country: Option<i64>, band: &str, width: i64, out
     legal_channels(country, band, width, outdoor).unwrap_or_else(|| band_channels(band, width))
 }
 
-/// A fixed channel of an AP's `radio_table` entry that [`fixed_channel_ok`] refuses at its width.
-pub(crate) fn illegal_fixed_channel(country: Option<i64>, radio: &Value, outdoor: bool) -> Option<i64> {
+/// The width (MHz) a radio of one of the site's APs (its `radio_table` entry)
+/// is set to, as the render reads it before its country and radio caps: `ht`,
+/// else the site's Channel AI width for the band, else the band's default
+/// ([`apcfg::configured_width`]).
+pub(crate) fn configured_width(state: &Value, radio: &Value) -> i64 {
+    apcfg::configured_width(state, site_id(state).unwrap_or_default(), radio)
+}
+
+/// A fixed channel of an AP's `radio_table` entry that [`fixed_channel_ok`]
+/// refuses at `width` (its [`configured_width`]).
+pub(crate) fn illegal_fixed_channel(country: Option<i64>, radio: &Value, width: i64, outdoor: bool) -> Option<i64> {
     let ch = num(&radio["channel"])?;
-    let width = num(&radio["ht"]).unwrap_or(20);
     (!fixed_channel_ok(country, radio["radio"].as_str().unwrap_or(""), width, outdoor, ch)).then_some(ch)
 }
 
@@ -1653,10 +1661,11 @@ pub fn apply_device(state: &mut Value, e: &DeviceEdit) -> Result<String, String>
         if !edited && !outdoor_changed {
             continue;
         }
-        if let Some(ch) = illegal_fixed_channel(c, r, o) {
+        let width = configured_width(state, r);
+        if let Some(ch) = illegal_fixed_channel(c, r, width, o) {
             let label = band_name(band);
             return Err(if edited {
-                format!("{label}: channel {ch} is not allowed at {} MHz here", num(&r["ht"]).unwrap_or(20))
+                format!("{label}: channel {ch} is not allowed at {width} MHz here")
             } else {
                 format!("{label}: channel {ch} is not allowed {} here; pick another first", if o { "outdoors" } else { "indoors" })
             });
@@ -2300,9 +2309,16 @@ mod tests {
                 assert_eq!(is_legal(c, band, width, o, ch), list.as_ref().map(|l| l.contains(&ch)), "{c:?} {band} {width} {o} {ch}");
             }
         }
-        assert_eq!(illegal_fixed_channel(Some(276), &json!({ "radio": "na", "ht": "40", "channel": "140" }), false), Some(140));
-        assert_eq!(illegal_fixed_channel(Some(276), &json!({ "radio": "na", "ht": 20, "channel": 140 }), false), None);
-        assert_eq!(illegal_fixed_channel(Some(276), &json!({ "radio": "na", "channel": "auto" }), true), None);
+        // A fixed channel is judged at the radio's width as the render reads it: `ht`, else
+        // the site's Channel AI width for the band, else 20 (2.4 GHz) or 80 (5 GHz).
+        let illegal = |s: &Value, r: Value, o| illegal_fixed_channel(Some(276), &r, configured_width(s, &r), o);
+        let s = json!({ "devices": [{ "site_id": "s1" }] });
+        assert_eq!(illegal(&s, json!({ "radio": "na", "ht": "40", "channel": "140" }), false), Some(140));
+        assert_eq!(illegal(&s, json!({ "radio": "na", "ht": 20, "channel": 140 }), false), None);
+        assert_eq!(illegal(&s, json!({ "radio": "na", "channel": "auto" }), true), None);
+        assert_eq!(illegal(&s, json!({ "radio": "na", "channel": 140 }), false), Some(140), "no ht: 80 MHz");
+        let ai = json!({ "devices": [{ "site_id": "s1" }], "setting": [{ "key": "radio_ai", "site_id": "s1", "radios_configuration": [{ "radio": "na", "channel_width": 20 }] }] });
+        assert_eq!(illegal(&ai, json!({ "radio": "na", "channel": 140 }), false), None, "no ht: Channel AI's 20 MHz");
     }
 
     fn dev(s: &mut Value, patch: Value) -> Result<String, String> {

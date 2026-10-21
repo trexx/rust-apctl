@@ -9,7 +9,7 @@ use std::sync::LazyLock;
 
 use crate::api::{ApiError, AppState, Json, Query};
 use crate::settings::Kind::{Bool, Enum, Int};
-use crate::settings::{COUNTRIES, Patch, PreviewQuery, band_name, copy_fields, country, dedup_in_order, docs_mut, illegal_fixed_channel, mgmt_flag, num, outdoor_with, pick, record_label, setting, setting_mut, str_field, timezone};
+use crate::settings::{COUNTRIES, Patch, PreviewQuery, band_name, configured_width, copy_fields, country, dedup_in_order, docs, docs_mut, illegal_fixed_channel, mgmt_flag, num, outdoor_with, pick, record_label, setting, setting_mut, str_field, timezone};
 
 /// A host name or IPv4 address, as NTP and syslog targets take (the official
 /// controller refuses IPv6 there).
@@ -35,12 +35,14 @@ const NTP_KEYS: [&str; 4] = ["ntp_server_1", "ntp_server_2", "ntp_server_3", "nt
 fn reset_illegal_channels(state: &mut Value) -> Vec<String> {
     let c = country(state);
     let site_outdoor = mgmt_flag(state, "outdoor_mode_enabled");
+    // Each AP's radios' widths, read before the records are borrowed to change them.
+    let widths: Vec<Vec<i64>> = docs(state, "devices").map(|d| d["radio_table"].as_array().into_iter().flatten().map(|r| configured_width(state, r)).collect()).collect();
     let mut out = Vec::new();
-    for d in docs_mut(state, "devices") {
+    for (d, widths) in docs_mut(state, "devices").zip(widths) {
         let o = outdoor_with(d, site_outdoor);
         let name = record_label(d, "?");
-        for r in d["radio_table"].as_array_mut().into_iter().flatten() {
-            if let Some(ch) = illegal_fixed_channel(c, r, o) {
+        for (r, width) in d["radio_table"].as_array_mut().into_iter().flatten().zip(widths) {
+            if let Some(ch) = illegal_fixed_channel(c, r, width, o) {
                 out.push(format!("AP {name} {} channel {ch} → auto", band_name(r["radio"].as_str().unwrap_or(""))));
                 r["channel"] = json!("auto");
             }
