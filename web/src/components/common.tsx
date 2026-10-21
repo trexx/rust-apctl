@@ -423,7 +423,7 @@ const crashLine = (lines: string[] = []) =>
  * stored before it did, the AP's own field if it is a number sent as text;
  * null when there is none.
  */
-const exitCode = (c: unknown) =>
+const exitCode = (c: number | string | undefined) =>
   typeof c === "number"
     ? String(c)
     : typeof c === "string" && /^[+-]?\d+$/.test(c.trim())

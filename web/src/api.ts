@@ -323,7 +323,7 @@ export interface EventPayloads {
    */
   ap_crash: { process?: string | null; kind?: string | null; source?: string; lines?: string[]; summary?: string };
   /** The AP's notification. `exit_status`: its exit code as a number (left out when it sent none); events stored before may hold it as text. */
-  ap_process_restarted: { proc?: string | null; exit_status?: number; caller?: string | null; summary?: string };
+  ap_process_restarted: { proc?: string | null; exit_status?: number | string; caller?: string | null };
   ap_isolated: { heard_by?: Mac | null };
   ap_scan_done: object;
   /** Any other AP notification, as it came: `event_string` names it ("EVT_AP_…"). */
