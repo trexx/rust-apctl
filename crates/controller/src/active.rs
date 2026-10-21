@@ -23,7 +23,7 @@
 use std::collections::HashMap;
 use std::net::IpAddr;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::{Arc, Mutex};
 
 use axum::body::Bytes;
 use axum::extract::{ConnectInfo, State};
@@ -41,6 +41,7 @@ use crate::clock;
 use crate::engine::{Event, EventKind, Input, SharedLive};
 use crate::model::Ts;
 use crate::random_bytes;
+use crate::settings::MadeFrom;
 use crate::store::{Db, PushedConfig, Store, Writer};
 
 /// What apctl remembers about an AP it manages.
@@ -67,10 +68,8 @@ struct Managed {
 /// A render of an AP's config with the placeholder cfgversion, and what it
 /// was made from.
 struct Render {
-    /// The settings rendered from, by address. Every change replaces their
-    /// Arc; the Weak keeps the address from being reused by another version
-    /// without keeping old settings alive for an AP that went quiet.
-    state: Weak<Value>,
+    /// The settings rendered from (old ones are not kept alive for an AP that went quiet).
+    state: MadeFrom,
     /// What the generator reads from the inform (`apcfg::inform_inputs`).
     inputs: Value,
     out: apcfg::Output,
@@ -191,9 +190,8 @@ fn blocking<T: Send + 'static>(permit: OwnedSemaphorePermit, f: impl FnOnce() ->
 /// held while it is handled.
 type Opened = (KeyUsed, [u8; 16], Value, OwnedSemaphorePermit);
 
-/// An adoption's `mgmt_cfg`, and the settings it was made from (by address,
-/// as for `Render::state`).
-type AdoptionCfg = (Weak<Value>, Arc<str>);
+/// An adoption's `mgmt_cfg`, and the settings it was made from.
+type AdoptionCfg = (MadeFrom, Arc<str>);
 
 const PLACEHOLDER: &str = "0000000000000000";
 
@@ -327,7 +325,7 @@ impl Active {
     /// The AP's last render, while the settings it was made from are current.
     fn current_render(&self, state: &Arc<Value>, mac: Mac) -> Option<Arc<Render>> {
         let last = self.devices.lock().unwrap().get(&mac).and_then(|d| d.render.clone());
-        last.filter(|r| std::ptr::eq(r.state.as_ptr(), Arc::as_ptr(state)))
+        last.filter(|r| r.state.is(state))
     }
 
     /// The AP's config with the placeholder cfgversion: `last` (its
@@ -341,7 +339,7 @@ impl Active {
         let site_id = crate::adopt::device_doc(state, &mac).and_then(|d| d["site_id"].as_str()).unwrap_or("");
         let blocked = apcfg::blocked_sta(state, site_id);
         let digest = content_digest(&out.rendered.mgmt_cfg, &out.rendered.system_cfg, &blocked);
-        let r = Arc::new(Render { state: Arc::downgrade(state), inputs: apcfg::inform_inputs(payload), out, blocked, digest });
+        let r = Arc::new(Render { state: MadeFrom::of(state), inputs: apcfg::inform_inputs(payload), out, blocked, digest });
         self.devices.lock().unwrap().entry(mac).or_default().render = Some(r.clone());
         Ok(r)
     }
@@ -376,7 +374,7 @@ impl Active {
     /// adoption that timed out, goes when another is made.
     fn adoption_cfg(&self, state: &Arc<Value>, mac: Mac, payload: &Value) -> anyhow::Result<Arc<str>> {
         if let Some((from, cfg)) = self.adoption_cfgs.lock().unwrap().get(&mac)
-            && std::ptr::eq(from.as_ptr(), Arc::as_ptr(state))
+            && from.is(state)
         {
             return Ok(cfg.clone());
         }
@@ -388,8 +386,8 @@ impl Active {
         let cfg: Arc<str> = apcfg::render_mgmt(&input, Some(&hex::encode(DEFAULT_KEY)))?.into();
         let adopting: Vec<Mac> = self.live.read().unwrap().adoption.adopting.keys().copied().collect();
         let mut cfgs = self.adoption_cfgs.lock().unwrap();
-        cfgs.retain(|m, (from, _)| from.strong_count() > 0 && adopting.contains(m));
-        cfgs.insert(mac, (Arc::downgrade(state), cfg.clone()));
+        cfgs.retain(|m, (from, _)| from.alive() && adopting.contains(m));
+        cfgs.insert(mac, (MadeFrom::of(state), cfg.clone()));
         Ok(cfg)
     }
 
@@ -682,7 +680,7 @@ pub async fn inform(
     let (state, busy) = {
         let live = active.live.read().unwrap();
         let a = &live.adoption;
-        (live.state.clone(), a.pending.contains_key(&mac) || a.adopting.contains_key(&mac) || a.forgetting.contains_key(&mac))
+        (live.state.clone(), a.pending.contains_key(&mac) || a.adopting.get(&mac).is_some_and(|x| x.current(ts)) || a.forgetting.contains_key(&mac))
     };
     let (device_key, pinned) = crate::adopt::device_key(state.as_deref(), &active.keys, &mac).map_or((None, false), |(k, gcm)| (Some(k), gcm));
     drop(state);
@@ -715,7 +713,8 @@ pub async fn inform(
 /// an AP of this MAC. `permit`: the gate's, held while the inform is handled.
 async fn factory_key_inform(active: &Arc<Active>, ts: Ts, caller: Caller, payload: Value, known: bool, permit: OwnedSemaphorePermit) -> Response {
     let mac = caller.mac;
-    let adopting = active.live.read().unwrap().adoption.adopting.get(&mac).copied();
+    // One that timed out is no adoption (`expire` drops it within seconds).
+    let adopting = active.live.read().unwrap().adoption.adopting.get(&mac).copied().filter(|a| a.current(ts));
     if known && adopting.is_some_and(|a| a.kept_key) {
         // Adopted over SSH with the key it had: that key went over SSH, and
         // is not for whoever sends a factory-key inform under the AP's MAC.
@@ -773,7 +772,7 @@ async fn managed_inform(active: &Arc<Active>, ts: Ts, caller: Caller, decoded: D
     let (was_adopting, forgetting) = if busy {
         let mut live = active.live.write().unwrap();
         live.adoption.pending.remove(&mac);
-        (live.adoption.adopting.remove(&mac).is_some(), live.adoption.forgetting.remove(&mac).is_some())
+        (live.adoption.adopting.remove(&mac).is_some_and(|a| a.current(ts)), live.adoption.forgetting.remove(&mac).is_some())
     } else {
         (false, false)
     };
@@ -790,7 +789,7 @@ async fn managed_inform(active: &Arc<Active>, ts: Ts, caller: Caller, decoded: D
     if forgetting {
         tracing::warn!("{mac}: forgotten: telling it to reset");
         let engine = active.engine.clone();
-        tokio::spawn(async move { crate::adopt::finish_forget(&engine, mac, true).await });
+        tokio::spawn(async move { crate::adopt::finish_forget(&engine, mac, true).await.ok() });
         active.devices.lock().unwrap().remove(&mac);
         let reply = json!({ "_type": "setdefault", "server_time_in_utc": server_time(ts) });
         return caller.seal(&reply);
@@ -1175,7 +1174,7 @@ mod tests {
             let mut state = live.state.as_deref().cloned().unwrap();
             crate::adopt::adopt_device(&mut state, &ap, &ap_payload("1")).unwrap();
             live.state = Some(Arc::new(state));
-            live.adoption.adopting.insert(ap, Default::default());
+            live.adoption.adopting.insert(ap, crate::adopt::Adopting { since: clock::now_ts(), kept_key: false });
         }
         let (_, reply) = inform_as_ap(&rig, &ap_payload(""), DEFAULT_KEY, GCM_ZLIB).await;
         let mgmt = reply.unwrap().1["mgmt_cfg"].as_str().unwrap().to_string();
@@ -1465,7 +1464,7 @@ mod tests {
             let mut state = live.state.as_deref().cloned().unwrap();
             crate::adopt::adopt_device(&mut state, &new, &payload).unwrap();
             live.state = Some(Arc::new(state));
-            live.adoption.adopting.insert(new, Default::default());
+            live.adoption.adopting.insert(new, crate::adopt::Adopting { since: clock::now_ts(), kept_key: false });
         }
         let key_hex = crate::adopt::device_doc(rig.live.read().unwrap().state.as_deref().unwrap(), &new).unwrap()["x_authkey"].as_str().unwrap().to_string();
         let key: [u8; 16] = inform::parse_key(&key_hex).unwrap();
@@ -1522,7 +1521,7 @@ mod tests {
                 s.as_object_mut().unwrap().retain(|k, _| !k.starts_with("x_ssh_") || !k.ends_with("passwd"));
             }
             live.state = Some(Arc::new(state));
-            live.adoption.adopting.insert(new, Default::default());
+            live.adoption.adopting.insert(new, crate::adopt::Adopting { since: clock::now_ts(), kept_key: false });
         }
         let key_hex = crate::adopt::device_doc(rig.live.read().unwrap().state.as_deref().unwrap(), &new).unwrap()["x_authkey"].as_str().unwrap().to_string();
         let (_, reply) = inform_as_ap(&rig, &payload, DEFAULT_KEY, GCM_ZLIB).await;
@@ -1555,7 +1554,7 @@ mod tests {
         inform_as_ap(&rig, &ap_payload("1"), KEY, GCM_ZLIB).await;
         assert!(rig.active.devices.lock().unwrap().get(&mac).is_some_and(|d| d.gcm && d.content.is_some()));
         // The engine calls this however the AP is forgotten, reporting or not (see `Engine::forget`).
-        rig.active.adoption_cfgs.lock().unwrap().insert(mac, (Weak::new(), "authkey=x".into()));
+        rig.active.adoption_cfgs.lock().unwrap().insert(mac, (MadeFrom::default(), "authkey=x".into()));
         let forget = rig.live.read().unwrap().forget_managed.clone().expect("set by Active::new");
         forget(&mac);
         assert!(!rig.active.devices.lock().unwrap().contains_key(&mac));
@@ -1574,11 +1573,12 @@ mod tests {
             let mut state = live.state.as_deref().cloned().unwrap();
             crate::adopt::adopt_device(&mut state, &new, &payload).unwrap();
             live.state = Some(Arc::new(state));
-            live.adoption.adopting.insert(new, Default::default());
+            live.adoption.adopting.insert(new, crate::adopt::Adopting { since: clock::now_ts(), kept_key: false });
         }
         inform_as_ap(&rig, &payload, DEFAULT_KEY, GCM_ZLIB).await;
         assert!(rig.active.adoption_cfgs.lock().unwrap().contains_key(&new));
-        crate::adopt::expire(&mut rig.live.write().unwrap(), crate::adopt::ADOPT_TIMEOUT);
+        // Timed out, though `expire` has not dropped it yet: no adoption any more.
+        rig.live.write().unwrap().adoption.adopting.insert(new, crate::adopt::Adopting { since: clock::now_ts() - crate::adopt::ADOPT_TIMEOUT, kept_key: false });
         let (status, _) = inform_as_ap(&rig, &payload, DEFAULT_KEY, GCM_ZLIB).await;
         assert_eq!(status, StatusCode::NOT_FOUND);
         assert!(rig.active.adoption_cfgs.lock().unwrap().is_empty());

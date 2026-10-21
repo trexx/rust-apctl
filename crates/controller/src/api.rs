@@ -72,8 +72,9 @@ pub struct AppStateInner {
     /// `--inform-url` in active mode (see `ssh::inform_url`).
     pub inform_url: Option<String>,
     /// The port apctl takes AP syslog on (`--syslog-listen`'s); None without a listener.
-    #[allow(dead_code)] // until GET /api/settings/site sends it (p11-features drops this)
     pub syslog_listen: Option<u16>,
+    /// The key file's keys (`--keys`), which informs fall back on (see `adopt::device_key`).
+    pub keys: Arc<wire::keys::KeyStore>,
     /// What the insights views read lately (see `series::memo_read`).
     pub memo: crate::series::Memo,
     /// What the threat checks keep between runs, shared with `threats::watch`.
@@ -1342,7 +1343,7 @@ mod tests {
         let state = AppState::new(AppStateInner {
             backups: crate::backup::Backups::new(dir.to_path_buf(), None),
             store, vendors: Default::default(), renderer: crate::dryrun::apcfg_renderer(crate::EMULATE_VERSION.into()), auth, engine, live: Default::default(), tx, started: 0, source: "none".into(),
-            active: false, writer, inform_url: None, syslog_listen: None, memo: Default::default(), threats: Default::default(),
+            active: false, writer, inform_url: None, syslog_listen: None, keys: Default::default(), memo: Default::default(), threats: Default::default(),
         });
         (state, engine_rx, dir)
     }

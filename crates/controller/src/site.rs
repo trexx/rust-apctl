@@ -3,13 +3,14 @@
 //! Changes go through [`crate::settings::change`], so they can be previewed
 //! per AP like SSID and AP edits.
 
+use apcfg::flag;
 use axum::extract::State;
 use serde_json::{Value, json};
 use std::sync::LazyLock;
 
 use crate::api::{ApiError, AppState, Json, Query};
 use crate::settings::Kind::{Bool, Enum, Int};
-use crate::settings::{COUNTRIES, Patch, PreviewQuery, band_name, configured_width, copy_fields, country, dedup_in_order, docs, docs_mut, illegal_fixed_channel, mgmt_flag, num, outdoor_with, pick, record_label, setting, setting_mut, str_field, timezone};
+use crate::settings::{COUNTRIES, Patch, PreviewQuery, band_name, configured_width, copy_fields, country, dedup_in_order, docs, docs_mut, illegal_fixed_channel, mgmt_flag, num, pick, record_label, setting, setting_mut, str_field, timezone};
 
 /// A host name or IPv4 address, as NTP and syslog targets take (the official
 /// controller refuses IPv6 there).
@@ -39,7 +40,7 @@ fn reset_illegal_channels(state: &mut Value) -> Vec<String> {
     let widths: Vec<Vec<i64>> = docs(state, "devices").map(|d| d["radio_table"].as_array().into_iter().flatten().map(|r| configured_width(state, r)).collect()).collect();
     let mut out = Vec::new();
     for (d, widths) in docs_mut(state, "devices").zip(widths) {
-        let o = outdoor_with(d, site_outdoor);
+        let o = apcfg::override_of(d, "outdoor_mode_override", site_outdoor);
         let name = record_label(d, "?");
         for (r, width) in d["radio_table"].as_array_mut().into_iter().flatten().zip(widths) {
             if let Some(ch) = illegal_fixed_channel(c, r, width, o) {
@@ -130,7 +131,7 @@ fn site_mgmt(doc: &mut Value, m: &Value, notes: &mut Vec<String>) -> Result<(), 
         let keys = ssh_keys(&m["x_ssh_keys"], &doc["x_ssh_keys"])?;
         doc["x_ssh_keys"] = json!(keys);
     }
-    if doc["x_ssh_enabled"].as_bool() != Some(false) && doc["x_ssh_auth_password_enabled"].as_bool() == Some(false) && doc["x_ssh_keys"].as_array().is_none_or(Vec::is_empty) {
+    if flag(doc, "x_ssh_enabled", true) && !flag(doc, "x_ssh_auth_password_enabled", true) && doc["x_ssh_keys"].as_array().is_none_or(Vec::is_empty) {
         return Err("with password logins off, SSH needs at least one key".into());
     }
     Ok(())
@@ -171,7 +172,7 @@ fn site_syslog(doc: &mut Value, r: &Value) -> Result<(), String> {
         }
     }
     let doc = &*doc;
-    let on = |k: &str| doc[k].as_bool() == Some(true);
+    let on = |k: &str| flag(doc, k, false);
     if on("enabled") && !on("this_controller") && doc["ip"].as_str().is_none_or(str::is_empty) {
         return Err("remote syslog needs a server".into());
     }
@@ -251,10 +252,10 @@ fn site_snmp(doc: &mut Value, sn: &Value, notes: &mut Vec<String>) -> Result<(),
         doc["x_password"] = json!(pw);
         notes.push("SNMPv3 password".into());
     }
-    if doc["enabled"].as_bool() == Some(true) && doc["community"].as_str().is_none_or(str::is_empty) {
+    if flag(doc, "enabled", false) && doc["community"].as_str().is_none_or(str::is_empty) {
         return Err("SNMP v1/v2c needs a community".into());
     }
-    if doc["enabledV3"].as_bool() == Some(true) && (doc["username"].as_str().is_none_or(str::is_empty) || doc["x_password"].as_str().is_none_or(str::is_empty)) {
+    if flag(doc, "enabledV3", false) && (doc["username"].as_str().is_none_or(str::is_empty) || doc["x_password"].as_str().is_none_or(str::is_empty)) {
         return Err("SNMPv3 needs a user name and password".into());
     }
     Ok(())
@@ -301,9 +302,20 @@ fn set_ssh_password(doc: &mut Value, pw: &str) -> Result<(), String> {
 /// (`ssh-ed25519 AAAA... comment`) is split up. A key without a name of its
 /// own keeps the one it has in `stored` (the editor sends OpenSSH lines,
 /// which have no place for it), else is named after its comment or type.
+/// A comment or name given is refused with control characters (the AP config
+/// carries the comment, else the name, and can't hold them) or over 255 characters.
 fn ssh_keys(v: &Value, stored: &Value) -> Result<Vec<Value>, String> {
     // The official controller takes RSA and Ed25519 keys only.
     const TYPES: &[&str] = &["ssh-ed25519", "ssh-rsa"];
+    let text = |what: &str, t: &str| {
+        if t.contains(char::is_control) {
+            Err(format!("an SSH key's {what} must not hold control characters (tabs, line breaks)"))
+        } else if t.chars().count() > 255 {
+            Err(format!("an SSH key's {what} can be at most 255 characters"))
+        } else {
+            Ok(())
+        }
+    };
     let mut out = Vec::new();
     for k in v.as_array().ok_or("x_ssh_keys must be a list")? {
         let (kind, key, comment) = match k {
@@ -316,6 +328,10 @@ fn ssh_keys(v: &Value, stored: &Value) -> Result<Vec<Value>, String> {
         if !TYPES.contains(&kind.as_str()) || key.len() < 32 || !key.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '/' | '=')) {
             return Err(format!("not an SSH public key: {}", if key.is_empty() { kind } else { format!("{kind} {}…", key.chars().take(12).collect::<String>()) }));
         }
+        text("comment", &comment)?;
+        if let Some(n) = k["name"].as_str() {
+            text("name", n)?;
+        }
         let kept = || stored.as_array().into_iter().flatten().find(|s| s["key"].as_str() == Some(key.as_str()))?["name"].as_str().filter(|n| !n.is_empty());
         let name = k["name"].as_str().filter(|n| !n.is_empty()).or_else(kept).map(str::to_string).unwrap_or_else(|| if comment.is_empty() { kind.clone() } else { comment.clone() });
         if !out.iter().any(|o: &Value| o["key"].as_str() == Some(key.as_str())) {
@@ -325,13 +341,16 @@ fn ssh_keys(v: &Value, stored: &Value) -> Result<Vec<Value>, String> {
     Ok(out)
 }
 
-/// The site settings as shown, with the choices of country and time zone.
+/// The site settings as shown, with the choices of country and time zone, and
+/// the port apctl takes the APs' syslog on (`null` without a listener), which
+/// "to this controller" sends them to.
 #[derive(serde::Serialize)]
 pub struct SiteView {
     #[serde(flatten)]
     settings: Value,
     countries: &'static Value,
     timezones: &'static Value,
+    syslog_port: Option<u16>,
 }
 
 /// GET /api/settings/site. Read-only mode (no users) leaves out the SNMP
@@ -341,7 +360,7 @@ pub async fn get_site(State(s): State<AppState>) -> Result<Json<SiteView>, ApiEr
     // The choices never change: built once, and serialised from there.
     static COUNTRY_LIST: LazyLock<Value> = LazyLock::new(|| COUNTRIES.iter().map(|c| json!({ "code": c.code, "name": c.name })).collect());
     static TIMEZONES: LazyLock<Value> = LazyLock::new(|| apcfg::tz::names().collect());
-    Ok(Json(SiteView { settings: site_view(&state, s.active, s.auth.enabled()), countries: &COUNTRY_LIST, timezones: &TIMEZONES }))
+    Ok(Json(SiteView { settings: site_view(&state, s.active, s.auth.enabled()), countries: &COUNTRY_LIST, timezones: &TIMEZONES, syslog_port: s.syslog_listen }))
 }
 
 fn site_view(state: &Value, active: bool, secrets: bool) -> Value {
@@ -350,7 +369,7 @@ fn site_view(state: &Value, active: bool, secrets: bool) -> Value {
     mgmt["has_ssh_password"] = json!(m["x_ssh_password"].as_str().is_some_and(|p| !p.is_empty()));
     let r = setting(state, "rsyslogd");
     let mut rsyslogd = Value::Object(pick(r, &["ip", "port", "debug", "netconsole_enabled", "netconsole_host", "netconsole_port"]));
-    rsyslogd["mode"] = json!(match (r["enabled"].as_bool() == Some(true), r["this_controller"].as_bool() == Some(true)) {
+    rsyslogd["mode"] = json!(match (flag(r, "enabled", false), flag(r, "this_controller", false)) {
         (false, _) => "off",
         (true, true) => "controller",
         (true, false) => "server",
@@ -415,6 +434,12 @@ mod tests {
         let key = "A".repeat(68);
         edit(&mut s, json!({ "mgmt": { "x_ssh_keys": [format!("ssh-ed25519 {key} me@laptop"), { "type": "ssh-ed25519", "key": key, "name": "again" }] } })).unwrap();
         assert_eq!(setting(&s, "mgmt")["x_ssh_keys"].as_array().unwrap().len(), 1);
+        // A comment or name the AP config could not carry as it is: refused.
+        let obj = |field: &str, v: String| json!({ "mgmt": { "x_ssh_keys": [{ "type": "ssh-ed25519", "key": key, field: v }] } });
+        for (field, v) in [("comment", "laptop\tme".to_string()), ("name", "bell\u{7}".into()), ("comment", "x".repeat(256))] {
+            assert!(edit(&mut s, obj(field, v)).unwrap_err().contains(&format!("SSH key's {field}")), "{field}");
+        }
+        assert!(edit(&mut s, json!({ "mgmt": { "x_ssh_keys": [format!("ssh-ed25519 {key} me\u{7}")] } })).unwrap_err().contains("control characters"));
     }
 
     #[test]
@@ -558,5 +583,18 @@ mod tests {
         assert_eq!(edit(&mut s.clone(), json!({ "ntp": { "setting_preference": "manual" } })).unwrap_err(), "manual NTP needs at least one server");
         edit(&mut s, json!({ "ntp": { "setting_preference": "manual", "ntp_server_2": "time.example.net" } })).unwrap();
         assert_eq!(servers(&s), ["time.example.net", "", "", ""]);
+    }
+
+    #[test]
+    fn every_time_zone_offered_is_one_the_clock_reads() {
+        // 2026-01-15 and 2026-07-15, 00:00 UTC.
+        let (jan, jul) = (1_768_435_200, 1_784_073_600);
+        for name in apcfg::tz::names() {
+            let tz = apcfg::tz::posix(name).unwrap();
+            let (a, b) = (crate::clock::utc_offset(tz, jan), crate::clock::utc_offset(tz, jul));
+            assert!(a.is_some() && b.is_some(), "{name}: {tz}");
+            // Summer time falls in one of the two months: a rule with it was read in full.
+            assert_eq!(a != b, tz.contains(','), "{name}: {tz}");
+        }
     }
 }

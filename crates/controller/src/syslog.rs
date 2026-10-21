@@ -2,7 +2,7 @@
 //! 64-hex `syslog_key`, encrypted as `wire::syslog_frame` describes.
 
 use std::borrow::Cow;
-use std::sync::{Arc, Weak};
+use std::sync::Arc;
 
 use aes_gcm::Aes256Gcm;
 use aes_gcm::aead::KeyInit;
@@ -145,9 +145,8 @@ enum MadeFrom {
     Unmade,
     /// The key file alone: there were no settings.
     NoSettings,
-    /// These settings, compared by address: the Weak keeps that address from
-    /// being reused without keeping the settings.
-    Settings(Weak<Value>),
+    /// These settings.
+    Settings(crate::settings::MadeFrom),
 }
 
 impl Ciphers {
@@ -155,11 +154,11 @@ impl Ciphers {
     pub fn refresh(&mut self, state: Option<&Arc<Value>>, keys: &KeyStore) {
         let same = match (&self.from, state) {
             (MadeFrom::NoSettings, None) => true,
-            (MadeFrom::Settings(w), Some(s)) => std::ptr::eq(w.as_ptr(), Arc::as_ptr(s)),
+            (MadeFrom::Settings(m), Some(s)) => m.is(s),
             _ => false,
         };
         if !same {
-            self.from = state.map_or(MadeFrom::NoSettings, |s| MadeFrom::Settings(Arc::downgrade(s)));
+            self.from = state.map_or(MadeFrom::NoSettings, |s| MadeFrom::Settings(crate::settings::MadeFrom::of(s)));
             self.keys = crate::adopt::syslog_keys(state.map(|s| &**s), keys).into_iter().map(|(m, k)| (m, Aes256Gcm::new(&k.into()))).collect();
         }
     }

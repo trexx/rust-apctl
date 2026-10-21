@@ -8,7 +8,7 @@
 //! its SSID's limit is sent instead. SSID-wide limits are in the config (`apcfg`).
 
 use std::collections::HashMap;
-use std::sync::{Arc, Weak};
+use std::sync::Arc;
 use std::time::Duration;
 
 use inform::Mac;
@@ -16,7 +16,7 @@ use serde_json::{Value, json};
 
 use crate::api::AppState;
 use crate::engine::Live;
-use crate::settings::{doc_mac, docs, id_of};
+use crate::settings::{MadeFrom, doc_mac, docs, id_of};
 
 /// What was last sent for a client.
 struct Sent {
@@ -32,9 +32,8 @@ struct Sent {
 /// change (every change replaces the settings' Arc).
 #[derive(Default)]
 struct Groups {
-    /// The settings these were read from, by address: the Weak keeps the
-    /// address from being reused without keeping old settings alive.
-    state: Weak<Value>,
+    /// The settings these were read from.
+    state: MadeFrom,
     /// The clients with a group of their own (their first entry in the site's), and that group.
     own: HashMap<Mac, String>,
     /// Each SSID's group as the config applies it (see `apcfg::ssid_usergroup`), by
@@ -47,10 +46,10 @@ struct Groups {
 
 impl Groups {
     fn refresh(&mut self, state: &Arc<Value>) {
-        if std::ptr::eq(self.state.as_ptr(), Arc::as_ptr(state)) {
+        if self.state.is(state) {
             return;
         }
-        let mut g = Groups { state: Arc::downgrade(state), default: crate::settings::default_usergroup(state), ..Default::default() };
+        let mut g = Groups { state: MadeFrom::of(state), default: crate::settings::default_usergroup(state), ..Default::default() };
         let mut own = HashMap::new();
         for c in docs(state, "clients") {
             if let Some(mac) = doc_mac(&c["mac"]) {

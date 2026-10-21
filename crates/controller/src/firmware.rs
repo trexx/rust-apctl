@@ -12,8 +12,11 @@
 //! the AP's `fw_caps` has bit 0x04000000), and the AP downloads the file
 //! itself. Progress comes back as notifications (`event_string` "Upgrade":
 //! downloading, writing, or an error with its reason), success as the new
-//! version in an inform. apctl upgrades strictly one AP at a time, mesh
-//! children before the APs they hang off, and stops the queue on a failure.
+//! version in an inform. apctl upgrades strictly one AP at a time, and stops
+//! the queue on a failure. Of the APs one request asks for, those uplinked over
+//! Wi-Fi (mesh) go first, so a wired parent does not restart before its mesh
+//! children; meshed APs are not ordered by depth among themselves, and APs of a
+//! later request queue after those already waiting.
 
 use std::collections::{HashMap, VecDeque};
 use std::fmt::Write as _;

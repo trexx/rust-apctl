@@ -1623,7 +1623,7 @@ impl Engine {
             }
         }
         for mac in &offline {
-            drop_online_only(&mut live, mac);
+            crate::actions::drop_online_only(&mut live, mac);
         }
         // A client is gone when its AP has reported a full client list since it was
         // last seen and the grace period has passed, or when its AP went offline.
@@ -2029,24 +2029,6 @@ fn numeric_exit_status(n: &mut Value) {
                 o.remove("exit_status");
             }
         }
-    }
-}
-
-/// Drops the AP's queued commands that need it online (see `crate::actions`):
-/// a restart, locate or client kick still waiting when it went away would
-/// otherwise run whenever it is back. A locate dropped so is no longer on.
-fn drop_online_only(live: &mut Live, mac: &Mac) {
-    let Some(q) = live.commands.get_mut(mac) else { return };
-    let mut located = false;
-    q.retain(|c| {
-        located |= c["cmd"] == "set-locate";
-        c["_type"] != "reboot" && !matches!(c["cmd"].as_str(), Some("set-locate" | "kick-sta"))
-    });
-    if q.is_empty() {
-        live.commands.remove(mac);
-    }
-    if located {
-        live.locating.remove(mac);
     }
 }
 

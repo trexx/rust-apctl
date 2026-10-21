@@ -248,9 +248,9 @@ pub fn expire(live: &mut Live, now: Ts) {
 }
 
 /// What `radio_table` reads of each radio in an inform's `radio_table`.
-const RADIO_KEYS: [&str; 14] = [
-    "name", "radio", "radio_caps", "radio_caps2", "has_dfs", "has_fccdfs", "has_ht160", "is_11ac", "is_11ax", "nss", "min_txpower", "max_txpower", "builtin_antenna",
-    "builtin_ant_gain",
+const RADIO_KEYS: [&str; 16] = [
+    "name", "radio", "radio_caps", "radio_caps2", "has_dfs", "has_fccdfs", "has_ht160", "has_eht240", "has_eht320", "is_11ac", "is_11ax", "nss", "min_txpower",
+    "max_txpower", "builtin_antenna", "builtin_ant_gain",
 ];
 
 /// The width a new AP's radio starts at, as the official controller sets it on
@@ -265,18 +265,7 @@ fn start_width(state: &Value, r: &Value, band: &str) -> i64 {
             "na" => 80,
             _ => 160,
         });
-    let f = |k: &str| r[k].as_bool() == Some(true);
-    let capable = if f("has_eht320") {
-        320
-    } else if f("has_eht240") {
-        240
-    } else if f("has_ht160") {
-        160
-    } else if f("is_11ac") || f("is_11ax") {
-        80
-    } else {
-        40
-    };
+    let capable = apcfg::capable_width(r);
     let band_max = match band {
         "ng" => 40,
         "na" => 160,
@@ -351,7 +340,7 @@ pub fn fill_from_inform(d: &mut Value, payload: &Value) {
 /// SSID on channel 6. An AP's radios are known once its inform lists them
 /// (at once for one adopted from the UI, later for one adopted over SSH).
 pub fn join_channel_locks(state: &mut Value, mac: &Mac, what: String) -> String {
-    let channels = crate::settings::apply_channel_locks(state, &[], Some(mac));
+    let channels = crate::settings::apply_channel_locks(state, &[*mac], &[]);
     if channels.is_empty() { what } else { format!("{what}; {}", channels.join("; ")) }
 }
 
@@ -447,7 +436,7 @@ pub fn spawn(s: AppState) {
             };
             for mac in overdue {
                 tracing::info!("{mac}: forgotten without reporting again");
-                finish_forget(&s.engine, mac, false).await;
+                let _ = finish_forget(&s.engine, mac, false).await;
             }
         }
     });
@@ -510,7 +499,14 @@ async fn adopt_pending(s: AppState, mac: Mac) -> Result<Json<Value>, ApiError> {
 }
 
 /// POST /api/devices/{mac}/forget: remove an AP; if it reports again it resets itself.
+/// Run as a task of its own, as [`adopt`] is: a request dropped mid-way must not
+/// stop an offline AP's forget between its record edit and the engine forgetting it.
 pub async fn forget(State(s): State<AppState>, MacPath(mac): MacPath) -> Result<Json<Value>, ApiError> {
+    tokio::spawn(forget_ap(s, mac)).await?
+}
+
+/// [`forget`]'s work.
+async fn forget_ap(s: AppState, mac: Mac) -> Result<Json<Value>, ApiError> {
     crate::api::require_active(&s, "adoption needs")?;
     let online = {
         let live = s.live.read().unwrap();
@@ -526,12 +522,13 @@ pub async fn forget(State(s): State<AppState>, MacPath(mac): MacPath) -> Result<
         crate::stun::poke(&live, &mac);
         return Ok(Json(json!({ "forgetting": true })));
     }
-    finish_forget(&s.engine, mac, false).await;
+    finish_forget(&s.engine, mac, false).await?;
     Ok(Json(json!({ "forgotten": true })))
 }
 
-/// Removes a forgotten AP from the settings and apctl's records.
-pub async fn finish_forget(engine: &tokio::sync::mpsc::Sender<Input>, mac: Mac, reset: bool) {
+/// Removes a forgotten AP from the settings and apctl's records. An error
+/// when it removed nothing: the record was gone (404), or the engine has stopped.
+pub async fn finish_forget(engine: &tokio::sync::mpsc::Sender<Input>, mac: Mac, reset: bool) -> Result<(), ApiError> {
     let (tx, rx) = tokio::sync::oneshot::channel();
     let edit: crate::engine::StateEdit = Box::new(move |state: &mut Value| remove_device(state, &mac));
     let _ = engine.send(Input::EditState { ts: clock::now_ts(), edit, done: tx }).await;
@@ -541,9 +538,16 @@ pub async fn finish_forget(engine: &tokio::sync::mpsc::Sender<Input>, mac: Mac, 
         Ok(Ok(_)) => {
             let _ = engine.send(Input::Forget { ts: clock::now_ts(), mac }).await;
             let _ = engine.send(Input::Note(Event::device(clock::now_ts(), EventKind::ApForgotten, mac, json!({ "reset": reset })))).await;
+            Ok(())
         }
-        Ok(Err(e)) => tracing::info!("{mac}: not forgotten: {e}"),
-        Err(_) => tracing::warn!("{mac}: not forgotten: the engine has stopped"),
+        Ok(Err(e)) => {
+            tracing::info!("{mac}: not forgotten: {e}");
+            Err(ApiError::not_found(e))
+        }
+        Err(_) => {
+            tracing::warn!("{mac}: not forgotten: the engine has stopped");
+            Err(ApiError::engine_stopped())
+        }
     }
 }
 
@@ -638,8 +642,8 @@ mod tests {
             }
         });
         let mac: Mac = "02:00:00:00:00:01".parse().unwrap();
-        finish_forget(&tx, mac, false).await;
-        finish_forget(&tx, mac, false).await;
+        assert!(finish_forget(&tx, mac, false).await.is_ok());
+        assert_eq!(finish_forget(&tx, mac, false).await.err().map(|e| e.0), Some(axum::http::StatusCode::NOT_FOUND));
         drop(tx);
         let mut got = Vec::new();
         while let Some(x) = seen.recv().await {
@@ -661,6 +665,10 @@ mod tests {
         // Imports keep the site's widths as strings.
         let s = json!({ "setting": [{ "key": "radio_ai", "radios_configuration": [{ "radio": "ng", "channel_width": "40" }, { "radio": "na", "channel_width": "160" }, { "radio": "6e", "channel_width": 80 }] }] });
         assert_eq!(widths(&s), [40, 80, 80], "an 802.11ac radio does 80 MHz at most");
+        // A Wi-Fi 7 radio keeps its 320 MHz flag in the record, which the render caps its width by.
+        let wifi7 = json!({ "radio_table": [{ "name": "wifi2", "radio": "6e", "has_ht160": true, "has_eht320": true, "is_11ax": true }] });
+        let r = &radio_table(&json!({ "setting": [{ "key": "radio_ai", "radios_configuration": [{ "radio": "6e", "channel_width": 320 }] }] }), &wifi7)[0];
+        assert_eq!((r["ht"].as_i64(), r["has_eht320"].as_bool()), (Some(320), Some(true)));
     }
 
     #[test]
