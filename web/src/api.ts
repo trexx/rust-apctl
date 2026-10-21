@@ -226,11 +226,12 @@ export interface DeviceDetail {
   locating: boolean;
 }
 
-export interface Series {
+/** `fields`: a column for each field asked for (`useSeries` types them by its list, so a chart draws only what it fetched). */
+export interface Series<F extends string> {
   tier: "raw" | "5m" | "1h";
   step: number;
   ts: number[];
-  fields: Record<string, (number | null)[]>;
+  fields: Record<F, (number | null)[]>;
 }
 
 export interface AppEvent {
@@ -319,7 +320,7 @@ export interface EventPayloads {
   radio_changed: { radio?: string | null; from?: RadioLevels; to?: RadioLevels };
   config_pushed: ConfigPushed;
   client_connected: { essid?: string | null; radio?: string | null; channel?: number | null; signal?: number | null; new?: boolean };
-  client_disconnected: { reason?: string | null; connected_for?: number | null; last_signal?: number | null };
+  client_disconnected: { reason?: "stale" | "ap_offline" | "not_seen" | "ap_forgotten" | null; connected_for?: number | null; last_signal?: number | null };
   client_roamed: { from?: RoamEndData; to?: RoamEndData };
   client_renamed: { from?: string | null; to?: string | null };
   /** `mgmt_cfg` is missing from comparisons recorded before it was added. */
@@ -369,7 +370,8 @@ export interface Status {
   clients_by_band: Record<string, number>;
   /** Connected clients with a signal below -75 dBm. */
   clients_weak: number;
-  counters: Record<string, number>;
+  /** Since apctl started. */
+  counters: Record<"informs" | "notifications" | "log_errors" | "replies" | "config_pushes" | "decode_errors" | "logs" | "events" | "syslog_dropped", number>;
 }
 
 /** Raised for 401s; the app shell then shows the login page. */
@@ -1095,11 +1097,11 @@ export const useClient = (mac: Mac) =>
   useQuery({ queryKey: keys.client(mac), queryFn: getting<ClientDetail>(`/api/clients/${mac}`) });
 
 /** `prev` with the samples of `add` (all newer) appended, and those before `from` dropped. */
-function appendSeries(prev: Series, add: Series, from: number): Series {
+function appendSeries<F extends string>(prev: Series<F>, add: Series<F>, from: number): Series<F> {
   const keep = prev.ts.findIndex((t) => t >= from);
   const start = keep < 0 ? prev.ts.length : keep;
-  const fields: Series["fields"] = {};
-  for (const [f, values] of Object.entries(prev.fields)) fields[f] = [...values.slice(start), ...(add.fields[f] ?? add.ts.map(() => null))];
+  const fields = {} as Series<F>["fields"];
+  for (const [f, values] of Object.entries(prev.fields) as [F, (number | null)[]][]) fields[f] = [...values.slice(start), ...(add.fields[f] ?? add.ts.map(() => null))];
   return { ...prev, ts: [...prev.ts.slice(start), ...add.ts], fields };
 }
 
@@ -1107,7 +1109,7 @@ function appendSeries(prev: Series, add: Series, from: number): Series {
  * Time-series for one entity over a time span: only the columns `fields` names (the charts draw). A live chart of raw samples
  * (up to 6 hours) asks only for what is newer than its last sample.
  */
-export function useSeries(table: string, key: string, span: TimeSpan, fields: readonly string[]) {
+export function useSeries<F extends string>(table: string, key: string, span: TimeSpan, fields: readonly F[]) {
   const qc = useQueryClient();
   const only = fields.join(",");
   const queryKey = keys.series(table, key, span, only);
@@ -1116,13 +1118,13 @@ export function useSeries(table: string, key: string, span: TimeSpan, fields: re
     queryFn: async ({ signal }) => {
       const [from, to] = spanBounds(span);
       const url = (from: number) => `/api/series/${table}${qs({ key, fields: only, from, to })}`;
-      const prev = isFixed(span) ? undefined : qc.getQueryData<Series>(queryKey);
+      const prev = isFixed(span) ? undefined : qc.getQueryData<Series<F>>(queryKey);
       const last = prev?.tier === "raw" ? prev.ts.at(-1) : undefined;
       if (prev && last !== undefined && last >= from) {
-        const add = await get<Series>(url(last + 1), signal);
+        const add = await get<Series<F>>(url(last + 1), signal);
         if (add.tier === "raw") return appendSeries(prev, add, from);
       }
-      return get<Series>(url(from), signal);
+      return get<Series<F>>(url(from), signal);
     },
     refetchInterval: () => refreshFor(span, spanLength(span) <= 6 * 3600 ? 15_000 : 300_000),
     ...freshFor(span),
