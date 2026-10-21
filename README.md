@@ -42,7 +42,8 @@ These screenshots use mock data from `informdump demo`.
   config pushes with apctl's.
 - **Active** (`--active`): apctl is the controller. It uses 8080/tcp (inform),
   5514/udp (syslog) and 3478/udp (STUN), and takes over the APs' keys from
-  `informdump import`.
+  `informdump import`. The configs it pushes name the ports it listens on, so APs
+  sending syslog "to this controller" use the `--syslog-listen` port.
 
 ## Run
 
@@ -133,9 +134,10 @@ cargo build --release -p controller   # or: podman build --target runtime .
 MongoDB and needs `cargo build --release -p informdump --features mongo`.
 
 Pushing a version tag (e.g. `0.15.1`) makes CI publish the image; nothing else pushes it.
-`scripts/release.sh 0.15.1` runs CI's checks and builds and checks the image locally before
-the tag goes out, and `scripts/release.sh 0.15.1 --pin <manifest>` afterwards waits for
-CI's image and pins its digest in a manifest.
+`scripts/check.sh` runs CI's Rust checks. `scripts/release.sh 0.15.1` runs them and
+builds and checks the image locally before the tag goes out, and
+`scripts/release.sh 0.15.1 --pin <manifest>` afterwards waits for CI's image and pins its
+digest in a manifest.
 
 ## License
 

@@ -79,14 +79,10 @@ else
 fi
 
 if [ $test = 1 ]; then
-  # The same checks as CI (.github/workflows/test.yml). informdump turns on
-  # serde_json's preserve_order, so it is tested on its own.
-  checks=(
-    "cargo test --workspace --exclude informdump --locked"
-    "cargo test -p informdump --locked"
-    "cargo clippy --workspace --all-targets --locked -- -D warnings"
-    "cargo clippy -p informdump --features mongo --all-targets --locked -- -D warnings"
-  )
+  # The same checks as CI: scripts/check.sh lists them, run here one by one to keep
+  # each one's output and say which failed.
+  mapfile -t checks < <(scripts/check.sh --list)
+  [ ${#checks[@]} -gt 0 ] || { echo "scripts/check.sh lists no checks" >&2; exit 1; }
   log=$(mktemp)
   for check in "${checks[@]}"; do
     echo "== $check"

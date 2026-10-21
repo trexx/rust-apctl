@@ -222,7 +222,7 @@ impl ApIds {
 /// A syslog datagram as the AP sends it, under a random nonce.
 fn seal_syslog(ids: &ApIds, text: &str) -> Vec<u8> {
     let nonce: [u8; 12] = crate::random_iv()[..12].try_into().expect("12 bytes");
-    wire::synth::seal_syslog(ids.hash_id, &ids.syslog_key, nonce, text)
+    wire::syslog_frame::seal(ids.hash_id, &ids.syslog_key, nonce, text)
 }
 
 fn ip(v: [u8; 4]) -> String {
@@ -263,20 +263,6 @@ pub fn state() -> Result<Value> {
             d
         })
         .collect();
-    // Both networks on every AP.
-    let all = s["apgroup"].as_array().and_then(|g| g.iter().find(|g| g["attr_hidden_id"] == "default")).map(|g| g["_id"]["$oid"].clone());
-    for w in s["wlanconf"].as_array_mut().into_iter().flatten() {
-        if let Some(all) = &all
-            && w.get("ap_group_ids").is_some()
-        {
-            w["ap_group_ids"] = json!([all]);
-        }
-    }
-    for g in s["apgroup"].as_array_mut().into_iter().flatten() {
-        if g.get("device_macs").is_some() {
-            g["device_macs"] = json!(APS.iter().map(|a| a.mac).collect::<Vec<_>>());
-        }
-    }
     s["clients"] = CLIENTS
         .iter()
         .enumerate()
@@ -411,6 +397,11 @@ impl Sim {
                     .filter(|(_, s)| *s > -84)
             });
             let at = ts - self.rng.range(1, 40);
+            // An AP that lost power says nothing more: its clients' sessions end with it,
+            // and they associate afresh wherever they go.
+            if self.sessions[ci].as_ref().is_some_and(|s| !self.ap_up(s.ap, ts)) {
+                self.sessions[ci] = None;
+            }
             let cur = self.sessions[ci].as_ref().map(|s| s.ap);
             match (cur, want) {
                 (None, Some((ap, signal))) => {
@@ -771,6 +762,10 @@ fn stream(now: i64, hours: f64, live: bool, out: impl Write) -> Result<()> {
             let at = t + i as i64 * 3;
             if APS[i].reboot.is_some() && !sim.ap_up(i, t - step) {
                 sim.log(at - 30, i, "syswrapper", "Restarting system after power loss".into());
+                // A restarted AP counts its traffic from zero again.
+                sim.counters[i] = ApCounters::default();
+                sim.vap_counters[i] = Default::default();
+                *last = at - step;
             }
             let dt = (at - *last).max(1) as f64;
             *last = at;
@@ -826,6 +821,26 @@ fn chrono_like(ts: i64) -> String {
 mod tests {
     use super::*;
 
+    /// The demo settings have the shape of an import: only the settings apctl reads,
+    /// and SSIDs that let in the demo's own clients (no MAC allow-list) on every AP.
+    #[test]
+    fn the_demo_settings_are_ones_an_import_would_give() {
+        let s = state().unwrap();
+        for setting in s["setting"].as_array().unwrap() {
+            let key = setting["key"].as_str().unwrap();
+            assert!(apcfg::SETTING_KEYS.contains(&key), "setting {key} is not one apctl reads");
+        }
+        let controller = apcfg::Controller::default();
+        // The APs' capabilities.
+        let inform: Value = serde_json::from_str(TEMPLATE_INFORM).unwrap();
+        for ap in APS {
+            let input = apcfg::Input { state: &s, device_mac: ap.mac, inform: Some(&inform), cfgversion: "1", controller: &controller };
+            let cfg = apcfg::render(&input).unwrap().system_cfg;
+            assert!(!cfg.contains("acl.policy=allow"), "{}: a MAC allow-list", ap.name);
+            assert_eq!(cfg.lines().filter(|l| l.starts_with("wireless.") && l.contains(".ssid=")).count(), 3, "{}: Homestead on both radios, IoT on 2.4 GHz", ap.name);
+        }
+    }
+
     #[test]
     fn the_template_reports_our_firmware_version() {
         assert_eq!(serde_json::from_str::<Value>(TEMPLATE_INFORM).unwrap()["version"], VERSION);
@@ -855,9 +870,53 @@ mod tests {
         }
     }
 
+    /// While an AP is without power it sends nothing (no informs, notifications or
+    /// syslog), nor does it see its clients off as it goes, and once it is back its
+    /// traffic counters start again from zero.
+    #[test]
+    fn a_powered_off_ap_is_silent_and_counts_afresh() {
+        let now = 1_791_830_666;
+        let (studio, (before_end, away)) = APS.iter().enumerate().find_map(|(i, a)| Some((i, a.reboot?))).unwrap();
+        let (down, boot) = (now - before_end, now - before_end + away - 60);
+        let mut buf = Vec::new();
+        // From shortly before the outage.
+        stream(now, (before_end + 600) as f64 / 3600.0, false, &mut buf).unwrap();
+        let keys = wire::keys::KeyStore::from_value(&state().unwrap());
+        let studio_ip: std::net::IpAddr = ip(APS[studio].ip).parse().unwrap();
+        let mut pairer = wire::exchange::Pairer::default();
+        let (mut heard, mut tx_bytes, mut leaving) = (Vec::new(), Vec::new(), Vec::new());
+        let end = wire::capture::run_with_udp(&buf[..], &[8080], &[5514], |ev| {
+            if let wire::capture::HttpEvent::Datagram { ts, src, .. } = &ev {
+                if src.ip() == studio_ip {
+                    heard.push(*ts / 1_000_000);
+                }
+            } else if let Some(wire::exchange::InformEvent::Inform { ts, peer, decoded, .. }) = pairer.handle(&keys, ev)
+                && peer == studio_ip
+            {
+                let payload = decoded.unwrap().payload;
+                heard.push(ts / 1_000_000);
+                if let Some(event @ ("sta_leave" | "sta_roam")) = payload["notif_payload"]["event_type"].as_str() {
+                    leaving.push((ts / 1_000_000, event.to_string()));
+                }
+                if let Some(tx) = payload["if_table"][0]["tx_bytes"].as_i64() {
+                    tx_bytes.push((ts / 1_000_000, tx));
+                }
+            }
+            std::ops::ControlFlow::Continue(())
+        })
+        .unwrap();
+        assert_eq!(end, wire::capture::End::Complete);
+        assert!(heard.iter().any(|t| *t < down) && heard.iter().any(|t| *t > boot));
+        assert!(!leaving.iter().any(|(t, _)| (down - 60..boot).contains(t)), "Studio saw clients off as it lost power: {leaving:?}");
+        assert!(heard.iter().all(|t| !(down..boot).contains(t)), "Studio heard while without power: {:?}", heard.iter().filter(|t| (down..boot).contains(*t)).collect::<Vec<_>>());
+        let before = tx_bytes.iter().rfind(|(t, _)| *t < down).unwrap().1;
+        let after = tx_bytes.iter().find(|(t, _)| *t > boot).unwrap().1;
+        assert!(after < before, "counters after the restart: {after}, before: {before}");
+    }
+
     #[test]
     fn capture_decodes_with_the_state_keys() {
-        use aes_gcm::aead::{Aead, KeyInit, Payload};
+        use aes_gcm::aead::KeyInit;
         let keys = wire::keys::KeyStore::from_value(&state().unwrap());
         let syslog_keys: std::collections::HashMap<Mac, [u8; 32]> = keys.syslog_keys().map(|(m, k)| (*m, *k)).collect();
         let mut buf = Vec::new();
@@ -872,8 +931,7 @@ mod tests {
                 // Opened with the key the settings hold for the AP that sent it.
                 let ap = APS.iter().find(|a| src.ip().to_string() == ip(a.ip)).expect("from an AP");
                 let key = syslog_keys[&Mac(mac_bytes(ap.mac))];
-                let (header, sealed) = payload.split_at(wire::synth::SYSLOG_HEADER);
-                let plain = aes_gcm::Aes256Gcm::new(&key.into()).decrypt(&aes_gcm::Nonce::try_from(&header[17..29]).unwrap(), Payload { msg: sealed, aad: header }).expect("decrypts");
+                let plain = wire::syslog_frame::open(&aes_gcm::Aes256Gcm::new(&key.into()), payload).expect("decrypts");
                 let text = String::from_utf8(plain).unwrap();
                 assert!(text.starts_with(&format!("<14>{} {} ", chrono_like(ts / 1_000_000), ap.name.replace(' ', "-"))), "{text}");
                 syslog += 1;

@@ -42,9 +42,10 @@ pub fn controller() -> Controller {
     }
 }
 
-/// Clients pinned to AP B ("lock to AP"). The import does not export the `user`
-/// fields `fixed_ap_enabled`/`fixed_ap_mac`, but every push to AP U denies exactly these
-/// ten MACs as `lock2ap`, and no push to AP B does, so they are locked to B.
+/// Clients pinned to AP B ("lock to AP"). The fixture snapshot predates the import
+/// keeping the `user` fields `fixed_ap_enabled`/`fixed_ap_mac` (acf5fe0), but every push
+/// to AP U denies exactly these ten MACs as `lock2ap`, and no push to AP B does, so they
+/// are locked to B.
 const LOCKED_TO_B: [&str; 10] = ["11", "0e", "10", "13", "22", "12", "0f", "21", "14", "15"];
 
 /// `controller-state.json` plus the lock-to-AP flags it is missing: a copy of it, read

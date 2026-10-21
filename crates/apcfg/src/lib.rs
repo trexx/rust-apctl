@@ -4,9 +4,8 @@
 //! The output follows the official UniFi Network Application (10.6.x) line for line,
 //! including key order, section comments and duplicate keys, so a rendered config can be
 //! compared byte for byte with a captured one. The input is a snapshot of the official
-//! controller's settings (the shape of `informdump import`: `sites`, `wlanconf`,
-//! `networkconf`, `setting`, `apgroup`, `config_meta`, `devices`, `clients`) plus the AP's
-//! latest inform for its capability bits.
+//! controller's settings (the shape of `informdump import`, with the collections in
+//! [`COLLECTIONS`]) plus the AP's latest inform for its capability bits.
 //!
 //! No I/O happens here. Anything random (the `cfgversion` token, password hashes) is an
 //! input.
@@ -31,8 +30,10 @@ mod net;
 mod system;
 pub mod tz;
 
-pub use json::oid;
-pub use system::MDNS_SERVICES;
+pub use json::{bool_of, flag, int_of, oid};
+pub use net::ssid_vlan;
+pub use system::{MDNS_SERVICES, ssid_usergroup, usergroup_limits};
+pub use wlan::configured_width;
 mod wlan;
 
 use std::borrow::Cow;
@@ -44,6 +45,7 @@ use serde_json::Value;
 use crate::wlan::Band;
 
 /// Facts about the controller itself that the settings snapshot does not hold.
+#[derive(Clone)]
 pub struct Controller {
     /// The controller's host, e.g. `unifi.example.net`: what the AP is given when neither
     /// a pending migration, the settings nor its stored inform URL names one.
@@ -55,6 +57,9 @@ pub struct Controller {
     pub https_port: u16,
     /// The port the controller answers STUN on, in `stun_url` (official default 3478).
     pub stun_port: u16,
+    /// The port the controller takes the APs' syslog and netconsole on, when the site
+    /// sends them "to this controller" (official default 5514).
+    pub syslog_port: u16,
     /// Controller version written as `unifi.version` (the official one sends `10.6.106`).
     pub version: String,
     /// Anonymous controller id (`unifi.anonymous_controller_id` and `unifi.reporterid`).
@@ -65,7 +70,7 @@ impl Default for Controller {
     /// The official controller's default ports, on the host name `unifi` (the one APs
     /// look for on a fresh network), with no version or id.
     fn default() -> Controller {
-        Controller { host: "unifi".into(), inform_port: 8080, https_port: 8443, stun_port: 3478, version: String::new(), reporter_uuid: String::new() }
+        Controller { host: "unifi".into(), inform_port: 8080, https_port: 8443, stun_port: 3478, syslog_port: 5514, version: String::new(), reporter_uuid: String::new() }
     }
 }
 
@@ -133,10 +138,17 @@ pub fn inform_inputs_match(inputs: &Value, inform: &Value) -> bool {
         })
 }
 
-/// The `setting` documents (by `key`) a render reads. The controller reads no others,
-/// so whatever imports settings needs only these: the rest (mail, cloud access and guest
-/// portal credentials, RADIUS secrets) would only spread secrets nothing uses.
-pub const SETTING_KEYS: &[&str] = &["mgmt", "super_mgmt", "super_identity", "radio_ai", "country", "locale", "connectivity", "rsyslogd", "snmp", "ntp"];
+/// The collections of the settings snapshot a render reads, by their names in the
+/// snapshot (`informdump import` reads `sites`, `devices` and `clients` from the
+/// official controller's `site`, `device` and `user`). Whatever imports settings must
+/// fill at least these.
+pub const COLLECTIONS: &[&str] = &["sites", "wlanconf", "networkconf", "setting", "apgroup", "config_meta", "usergroup", "radiusprofile", "devices", "clients"];
+
+/// The `setting` documents (by `key`) a render or the controller reads; the controller
+/// reads only `enabled` of `element_adopt` (the SSID limit per radio). Whatever imports
+/// settings needs only these: the rest (mail, cloud access and guest portal
+/// credentials, RADIUS secrets) would only spread secrets nothing uses.
+pub const SETTING_KEYS: &[&str] = &["mgmt", "super_mgmt", "super_identity", "radio_ai", "country", "locale", "connectivity", "rsyslogd", "snmp", "ntp", "element_adopt"];
 
 /// The fields of a `clients` (user) document a render reads: blocked clients and
 /// clients locked to an AP.
@@ -449,6 +461,11 @@ fn setting<'a>(state: &'a Value, site_id: &str, key: &str) -> &'a Value {
     site_docs(state, site_id, "setting").find(|s| json::str_of(s, "key") == Some(key)).unwrap_or(&NULL)
 }
 
+/// The site's network (`networkconf`) with this id.
+fn network<'a>(state: &'a Value, site_id: &str, id: &str) -> Option<&'a Value> {
+    site_docs(state, site_id, "networkconf").find(|n| json::oid(n) == Some(id))
+}
+
 impl<'a> Ctx<'a> {
     fn new(input: &Input<'a>) -> Result<Ctx<'a>> {
         let state = input.state;
@@ -515,7 +532,7 @@ impl<'a> Ctx<'a> {
     }
 
     pub fn network(&self, id: &str) -> Option<&'a Value> {
-        self.site_docs("networkconf").find(|n| json::oid(n) == Some(id))
+        network(self.state, self.site_id, id)
     }
 
     /// SSH account name: also the user cron jobs run as.
@@ -529,7 +546,7 @@ impl<'a> Ctx<'a> {
 
     /// The `radio_ai` settings for one band (`radios_configuration`).
     pub fn radio_ai_config(&self, band: Band) -> Option<&'a Value> {
-        json::arr(self.radio_ai, "radios_configuration").iter().find(|c| json::str_of(c, "radio") == Some(band.as_str()))
+        wlan::radio_ai_config(self.radio_ai, band)
     }
 }
 
@@ -600,6 +617,29 @@ mod tests {
         assert!(read.len() >= 8, "the patterns still find the reads: {read:?}");
         for key in read {
             assert!(SETTING_KEYS.contains(&key), "setting `{key}` is read but missing from SETTING_KEYS");
+        }
+    }
+
+    /// Every collection the sources read (`site_docs` on the context, or with the state
+    /// and site, and `arr` on the state) is in `COLLECTIONS`, so an import that fills
+    /// those loses nothing a render needs.
+    #[test]
+    fn collections_cover_every_collection_read() {
+        let mut read: Vec<&str> = Vec::new();
+        for src in SOURCES {
+            let src = src.split("#[cfg(test)]").next().unwrap();
+            for pattern in ["site_docs(\"", "site_docs(state, site_id, \"", "arr(state, \"", "arr(ctx.state, \""] {
+                for (at, _) in src.match_indices(pattern) {
+                    let rest = &src[at + pattern.len()..];
+                    read.push(&rest[..rest.find('"').unwrap()]);
+                }
+            }
+        }
+        for c in ["sites", "radiusprofile", "usergroup", "config_meta", "clients"] {
+            assert!(read.contains(&c), "the patterns still find the reads of {c}: {read:?}");
+        }
+        for c in read {
+            assert!(COLLECTIONS.contains(&c), "collection `{c}` is read but missing from COLLECTIONS");
         }
     }
 

@@ -43,11 +43,43 @@ impl Diff<'_> {
         [self.added.len(), self.removed.len(), self.changed.len()]
     }
 
-    /// The counts and the redacted rendering, as config history and previews show a
-    /// change: `{"added", "removed", "changed", "diff"}`.
+    /// The counts, the redacted rendering and the same lines as data, as config history
+    /// and previews show a change: `{"added", "removed", "changed", "diff", "changes"}`,
+    /// where `changes` is `[{"op": "+"|"-"|"~", "key", "old"?, "new"?}]` in key order
+    /// (`old` on `-` and `~`, `new` on `+` and `~`), redacted as `diff` is.
     pub fn summary(&self) -> Value {
         let [added, removed, changed] = self.counts();
-        json!({ "added": added, "removed": removed, "changed": changed, "diff": self.render("", true) })
+        let show = |k: &str, v: &str| -> Value { if is_secret(k) { json!("<redacted>") } else { json!(v) } };
+        let changes: Vec<Value> = self
+            .lines()
+            .map(|line| match line {
+                Line::Added(k, v) => json!({ "op": "+", "key": k, "new": show(k, v) }),
+                Line::Removed(k, v) => json!({ "op": "-", "key": k, "old": show(k, v) }),
+                Line::Changed(k, old, new) => json!({ "op": "~", "key": k, "old": show(k, old), "new": show(k, new) }),
+            })
+            .collect();
+        json!({ "added": added, "removed": removed, "changed": changed, "diff": self.render("", true), "changes": changes })
+    }
+
+    /// Every added, removed and changed key, sorted by key.
+    fn lines(&self) -> impl Iterator<Item = Line<'_>> {
+        // Each list is in key order (`diff` builds them from sorted maps) and a key is
+        // in only one of them, so merging them sorts the lines.
+        let (mut added, mut removed, mut changed) = (self.added.iter().peekable(), self.removed.iter().peekable(), self.changed.iter().peekable());
+        std::iter::from_fn(move || {
+            let next = [added.peek().map(|a| a.0), removed.peek().map(|r| r.0), changed.peek().map(|c| c.0)];
+            let first = next.into_iter().flatten().min()?;
+            Some(if next[0] == Some(first) {
+                let (k, v) = added.next()?;
+                Line::Added(k, v)
+            } else if next[1] == Some(first) {
+                let (k, v) = removed.next()?;
+                Line::Removed(k, v)
+            } else {
+                let (k, old, new) = changed.next()?;
+                Line::Changed(k, old, new)
+            })
+        })
     }
 
     /// Renders the diff with `+`, `-` and `~` markers, one key per line, sorted by key.
@@ -56,26 +88,23 @@ impl Diff<'_> {
         fn show<'v>(redact: bool, k: &str, v: &'v str) -> &'v str {
             if redact && is_secret(k) { "<redacted>" } else { v }
         }
-        // Each list is in key order (`diff` builds them from sorted maps) and a key is
-        // in only one of them, so merging them sorts the lines.
-        let (mut added, mut removed, mut changed) = (self.added.iter().peekable(), self.removed.iter().peekable(), self.changed.iter().peekable());
         let mut out = String::new();
-        loop {
-            let next = [added.peek().map(|a| a.0), removed.peek().map(|r| r.0), changed.peek().map(|c| c.0)];
-            let Some(first) = next.into_iter().flatten().min() else { break };
-            if next[0] == Some(first) {
-                let (k, v) = added.next().unwrap();
-                let _ = writeln!(out, "{indent}+ {k}={}", show(redact, k, v));
-            } else if next[1] == Some(first) {
-                let (k, v) = removed.next().unwrap();
-                let _ = writeln!(out, "{indent}- {k}={}", show(redact, k, v));
-            } else {
-                let (k, old, new) = changed.next().unwrap();
-                let _ = writeln!(out, "{indent}~ {k}: {} -> {}", show(redact, k, old), show(redact, k, new));
-            }
+        for line in self.lines() {
+            let _ = match line {
+                Line::Added(k, v) => writeln!(out, "{indent}+ {k}={}", show(redact, k, v)),
+                Line::Removed(k, v) => writeln!(out, "{indent}- {k}={}", show(redact, k, v)),
+                Line::Changed(k, old, new) => writeln!(out, "{indent}~ {k}: {} -> {}", show(redact, k, old), show(redact, k, new)),
+            };
         }
         out
     }
+}
+
+/// One key of a [`Diff`], with its values.
+enum Line<'d> {
+    Added(&'d str, &'d str),
+    Removed(&'d str, &'d str),
+    Changed(&'d str, &'d str, &'d str),
 }
 
 /// Where in a key one of [`SECRET_PARTS`] makes it a secret.
@@ -201,7 +230,19 @@ mod tests {
         assert!(diff("a=1\nb=x\n# note\na=2\n", "b=x\na=1\n\na=2\n").is_empty(), "a repeated key's values in order, wherever they are");
         assert_eq!(diff("a=2\na=1\nc\n", "a=1\na=2\nc=\n").changed, vec![("a", "2 | 1".into(), "1 | 2".into())]);
         assert_eq!(d.counts(), [1, 1, 1]);
-        assert_eq!(diff("x.psk=a", "x.psk=b").summary(), serde_json::json!({ "added": 0, "removed": 0, "changed": 1, "diff": "~ x.psk: <redacted> -> <redacted>\n" }));
+        assert_eq!(
+            diff("x.psk=a", "x.psk=b").summary(),
+            json!({ "added": 0, "removed": 0, "changed": 1, "diff": "~ x.psk: <redacted> -> <redacted>\n", "changes": [{ "op": "~", "key": "x.psk", "old": "<redacted>", "new": "<redacted>" }] })
+        );
+        // The values as data: one side holding " -> " stays on its side.
+        let renamed = diff("aaa.1.ssid=Home -> Up\nb=1\nc.key=k\n", "aaa.1.ssid=Attic\nc.key=j\nd=\n").summary();
+        assert_eq!(renamed["changes"], json!([
+            { "op": "~", "key": "aaa.1.ssid", "old": "Home -> Up", "new": "Attic" },
+            { "op": "-", "key": "b", "old": "1" },
+            { "op": "~", "key": "c.key", "old": "<redacted>", "new": "<redacted>" },
+            { "op": "+", "key": "d", "new": "" },
+        ]));
+        assert_eq!(renamed["diff"], "~ aaa.1.ssid: Home -> Up -> Attic\n- b=1\n~ c.key: <redacted> -> <redacted>\n+ d=\n");
         assert_eq!(d.render("  ", false), "  - radio.1.channel=36\n  ~ wireless.1.security: wpa2 -> wpa3\n  + wireless.2.ssid=Test\n");
         let secret = diff("aaa.1.wpa.psk=old", "aaa.1.wpa.psk=new").render("", true);
         assert_eq!(secret, "~ aaa.1.wpa.psk: <redacted> -> <redacted>\n");

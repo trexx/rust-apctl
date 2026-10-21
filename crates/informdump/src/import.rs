@@ -1,5 +1,5 @@
-//! Read-only snapshot of an existing controller's MongoDB: sites, WLANs and
-//! devices with their authkeys. Only `find` is ever issued.
+//! Read-only snapshot of an existing controller's MongoDB: the collections rendering
+//! reads ([`apcfg::COLLECTIONS`]), devices with their authkeys. Only `find` is ever issued.
 //!
 //! The output contains secrets (device authkeys, WLAN passphrases): it is
 //! written with mode 0600 and must never be committed.
@@ -26,6 +26,34 @@ const USER_FIELDS: &[&str] = &[
     "usergroup_id",
 ];
 
+/// The official controller's collection each snapshot collection is read from.
+fn source(collection: &str) -> &str {
+    match collection {
+        "sites" => "site",
+        "devices" => "device",
+        "clients" => "user",
+        c => c,
+    }
+}
+
+/// Collections carried over besides the ones rendering reads ([`apcfg::COLLECTIONS`]):
+/// the WLAN groups the devices name.
+const EXTRA_COLLECTIONS: &[&str] = &["wlangroup"];
+
+/// Settings of which only these fields are kept, with `_id`, `key` and `site_id`: the
+/// rest of `element_adopt` is its pairing secrets, which nothing reads.
+const SETTING_FIELDS: &[(&str, &[&str])] = &[("element_adopt", &["enabled"])];
+
+/// Drops the fields [`SETTING_FIELDS`] leaves out.
+fn trim_settings(settings: &mut [Value]) {
+    for s in settings {
+        let Some(&(_, fields)) = SETTING_FIELDS.iter().find(|(k, _)| s["key"].as_str() == Some(k)) else { continue };
+        if let Some(o) = s.as_object_mut() {
+            o.retain(|k, _| matches!(k.as_str(), "_id" | "key" | "site_id") || fields.contains(&k.as_str()));
+        }
+    }
+}
+
 pub async fn run(uri: &str, db: &str, out: &Path) -> Result<()> {
     let mut opts = ClientOptions::parse(uri).await.context("parsing MongoDB URI")?;
     opts.direct_connection = Some(true);
@@ -33,49 +61,34 @@ pub async fn run(uri: &str, db: &str, out: &Path) -> Result<()> {
     let client = mongodb::Client::with_options(opts)?;
     let db = client.database(db);
 
-    let sites = find_all(&db, "site", doc! {}, doc! {}).await?;
-    let wlans = find_all(&db, "wlanconf", doc! {}, doc! {}).await?;
-    let wlangroups = find_all(&db, "wlangroup", doc! {}, doc! {}).await?;
-    let networks = find_all(&db, "networkconf", doc! {}, doc! {}).await?;
-    // Only the settings apctl reads ([`apcfg::SETTING_KEYS`]): the others hold
-    // credentials (mail, cloud access, guest portal) nothing here uses.
-    let settings = find_all(&db, "setting", doc! { "key": { "$in": apcfg::SETTING_KEYS } }, doc! {}).await?;
-    // AP groups decide which WLANs each AP broadcasts; config_meta pins the
-    // per-AP wireless/aaa indices and VAP names across edits.
-    let apgroups = find_all(&db, "apgroup", doc! {}, doc! {}).await?;
-    let config_meta = find_all(&db, "config_meta", doc! {}, doc! {}).await?;
-    // User groups are the speed limits of SSIDs and clients.
-    let usergroups = find_all(&db, "usergroup", doc! {}, doc! {}).await?;
     let keep = |fields: &[&[&str]]| -> Document { fields.concat().into_iter().map(|f| (f.to_string(), Bson::Int32(1))).collect() };
-    let projection = keep(&[apcfg::DEVICE_KEYS, DEVICE_FIELDS]);
-    let devices = find_all(&db, "device", doc! {}, projection).await?;
-    let user_projection = keep(&[apcfg::CLIENT_KEYS, USER_FIELDS]);
-    let users = find_all(&db, "user", doc! {}, user_projection).await?;
-    let named = users.iter().filter(|u| u.get("name").and_then(Value::as_str).is_some_and(|n| !n.is_empty())).count();
-
+    let mut snapshot = serde_json::Map::new();
+    snapshot.insert("source".into(), json!("unifi-network-application"));
+    let mut read = Vec::new();
+    for &c in apcfg::COLLECTIONS.iter().chain(EXTRA_COLLECTIONS) {
+        let (filter, projection) = match c {
+            // Only the settings apctl reads ([`apcfg::SETTING_KEYS`]): the others hold
+            // credentials (mail, cloud access, guest portal) nothing here uses.
+            "setting" => (doc! { "key": { "$in": apcfg::SETTING_KEYS } }, doc! {}),
+            "devices" => (doc! {}, keep(&[apcfg::DEVICE_KEYS, DEVICE_FIELDS])),
+            "clients" => (doc! {}, keep(&[apcfg::CLIENT_KEYS, USER_FIELDS])),
+            _ => (doc! {}, doc! {}),
+        };
+        let mut docs = find_all(&db, source(c), filter, projection).await?;
+        if c == "setting" {
+            trim_settings(&mut docs);
+        }
+        read.push(format!("{} {c}", docs.len()));
+        snapshot.insert(c.to_string(), Value::Array(docs));
+    }
+    let devices = snapshot["devices"].as_array().map_or(&[][..], Vec::as_slice);
     let with_key = devices.iter().filter(|d| d.get("x_authkey").is_some_and(Value::is_string)).count();
     let aps = devices.iter().filter(|d| d.get("type").and_then(Value::as_str) == Some("uap")).count();
-    eprintln!(
-        "read {} sites, {} WLANs, {} WLAN groups, {} AP groups, {} networks, {} settings, {} config_meta, \
-         {} user groups, {} devices ({} APs, {} with authkeys), {} clients ({} named)",
-        sites.len(), wlans.len(), wlangroups.len(), apgroups.len(), networks.len(), settings.len(),
-        config_meta.len(), usergroups.len(), devices.len(), aps, with_key, users.len(), named
-    );
+    let clients = snapshot["clients"].as_array().map_or(&[][..], Vec::as_slice);
+    let named = clients.iter().filter(|u| u.get("name").and_then(Value::as_str).is_some_and(|n| !n.is_empty())).count();
+    eprintln!("read {}; {aps} APs, {with_key} with authkeys; {named} named clients", read.join(", "));
 
-    let snapshot = json!({
-        "source": "unifi-network-application",
-        "sites": sites,
-        "wlanconf": wlans,
-        "wlangroup": wlangroups,
-        "networkconf": networks,
-        "setting": settings,
-        "apgroup": apgroups,
-        "config_meta": config_meta,
-        "usergroup": usergroups,
-        "devices": devices,
-        "clients": users,
-    });
-    crate::write_private(out, &serde_json::to_vec_pretty(&snapshot)?)?;
+    crate::write_private(out, &serde_json::to_vec_pretty(&Value::Object(snapshot))?)?;
     eprintln!("wrote {} (mode 0600; contains secrets, keep it out of git)", out.display());
     Ok(())
 }
@@ -94,4 +107,20 @@ async fn find_all(db: &mongodb::Database, coll: &str, filter: Document, projecti
         out.push(Bson::Document(d).into_relaxed_extjson());
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn element_adoption_keeps_only_whether_it_is_on() {
+        let mut settings = vec![
+            json!({ "_id": "a", "key": "element_adopt", "site_id": "s", "enabled": true, "x_element_psk": "secret", "x_pregenerated_dh_key": "k" }),
+            json!({ "_id": "b", "key": "mgmt", "site_id": "s", "x_ssh_password": "kept" }),
+        ];
+        trim_settings(&mut settings);
+        assert_eq!(settings[0], json!({ "_id": "a", "key": "element_adopt", "site_id": "s", "enabled": true }));
+        assert_eq!(settings[1]["x_ssh_password"], "kept");
+    }
 }
