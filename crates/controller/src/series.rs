@@ -283,9 +283,6 @@ fn load_query(spec: &Spec, tier: usize, from: Ts, to: Ts) -> anyhow::Result<(Str
     Ok((sql, params))
 }
 
-/// The longest a view's read is reused (see `Tier::memo_secs`).
-const LONGEST_MEMO_SECS: u64 = TIERS[TIERS.len() - 1].memo_secs;
-
 /// A memoised read: its result and when it was read, once read. Whoever finds
 /// it empty reads it; the others asking meanwhile wait for that read.
 type Slot = std::sync::Arc<tokio::sync::OnceCell<(std::time::Instant, std::sync::Arc<dyn std::any::Any + Send + Sync>)>>;
@@ -303,11 +300,11 @@ struct MemoKey {
     mac: Option<inform::Mac>,
 }
 
-/// What the views last read, by view and query (when its slot was made, and
-/// the slot): several tabs, and each tab's refresh every minute, ask for the
-/// same windows again. Kept in `AppState`.
+/// What the views last read, by view and query (when its slot was made, how
+/// long its read is reused, and the slot): several tabs, and each tab's refresh
+/// every minute, ask for the same windows again. Kept in `AppState`.
 #[derive(Default)]
-pub struct Memo(std::sync::Mutex<HashMap<MemoKey, (std::time::Instant, Slot)>>);
+pub struct Memo(std::sync::Mutex<HashMap<MemoKey, (std::time::Instant, std::time::Duration, Slot)>>);
 
 /// [`read`] from `db` for `view`, reusing what the same query read less than
 /// its tier's `memo_secs` ago (the window then ends that much earlier). Queries
@@ -327,15 +324,16 @@ pub(crate) async fn memo_read<T: Send + Sync + 'static>(
     let slot = {
         let mut m = s.memo.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         match m.get(&key) {
-            Some((_, slot)) if slot.get().is_none_or(|(at, _)| at.elapsed() < ttl) => slot.clone(),
+            Some((_, _, slot)) if slot.get().is_none_or(|(at, _)| at.elapsed() < ttl) => slot.clone(),
             _ => {
                 m.remove(&key);
-                // A slot left empty (its read failed or was given up) goes too, after a while.
-                m.retain(|_, (made, slot)| slot.get().map_or(*made, |(at, _)| *at).elapsed().as_secs() < LONGEST_MEMO_SECS);
+                // Each read goes when it is no longer reused; a slot left empty (its
+                // read failed or was given up) as long after it was made.
+                m.retain(|_, (made, ttl, slot)| slot.get().map_or(*made, |(at, _)| *at).elapsed() < *ttl);
                 let slot = Slot::default();
                 // Bounded: odd queries (explicit windows) are not all kept.
                 if m.len() < 256 {
-                    m.insert(key, (std::time::Instant::now(), slot.clone()));
+                    m.insert(key, (std::time::Instant::now(), ttl, slot.clone()));
                 }
                 slot
             }
