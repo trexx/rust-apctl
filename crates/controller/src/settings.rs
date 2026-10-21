@@ -761,7 +761,12 @@ pub(crate) fn security_label(w: &Value) -> String {
     }
     match w["security"].as_str() {
         Some("open") => "Open".into(),
-        Some("wpapsk") => format!("{} Personal", w["wpa_mode"].as_str().unwrap_or("wpa2").to_uppercase()),
+        // `wpa_mode` is auto (WPA/WPA2 mixed), wpa1 or wpa2.
+        Some("wpapsk") => match w["wpa_mode"].as_str().unwrap_or("wpa2") {
+            "auto" => "WPA/WPA2 Personal".into(),
+            "wpa1" => "WPA Personal".into(),
+            m => format!("{} Personal", m.to_uppercase()),
+        },
         Some("wpaeap") => "WPA Enterprise".into(),
         Some(o) => o.to_string(),
         None => "?".into(),
@@ -1994,7 +1999,8 @@ mod tests {
         let label = |w: Value| security_label(&w);
         assert_eq!(label(s["wlanconf"][0].clone()), "WPA3 Personal");
         assert_eq!(label(json!({ "security": "wpapsk", "wpa_mode": "wpa2", "wpa3_support": true, "wpa3_transition": true })), "WPA2/WPA3 Personal");
-        assert_eq!(label(json!({ "security": "wpapsk", "wpa_mode": "wpa1" })), "WPA1 Personal");
+        assert_eq!(label(json!({ "security": "wpapsk", "wpa_mode": "wpa1" })), "WPA Personal");
+        assert_eq!(label(json!({ "security": "wpapsk", "wpa_mode": "auto" })), "WPA/WPA2 Personal");
         assert_eq!((label(json!({ "security": "open", "wpa3_support": true })), label(json!({ "security": "wpaeap" }))), ("Open".into(), "WPA Enterprise".into()));
     }
 
