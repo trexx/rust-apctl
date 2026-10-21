@@ -630,6 +630,9 @@ fn query_rows(c: &rusqlite::Connection, from: Ts, to: Ts, client: Option<&str>, 
 
 /// Only the reports [`attempts`] reads ([`ATTEMPT_TYPES`]).
 const ATTEMPTS_ONLY: &str = "AND event_type IN ('failure', 'soft failure', 'success', 'fixup')";
+/// The same without the successes, for the failed attempts only: a success
+/// neither merges with a fixup nor is merged into, so it cannot make one.
+const FAILURES_ONLY: &str = "AND event_type IN ('failure', 'soft failure', 'fixup')";
 
 /// The reports [`attempts`] reads in a window (optionally one client's),
 /// oldest first; or with `newest`, at most that many, newest first.
@@ -660,8 +663,9 @@ fn roam_rows(c: &rusqlite::Connection, from: Ts, to: Ts, client: Option<&str>) -
 /// rarely holds `limit` of them, and the reports in between need not be read.
 fn newest(c: &rusqlite::Connection, from: Ts, to: Ts, client: Option<&str>, limit: usize, failed: bool, with_roams: bool) -> rusqlite::Result<(Vec<Attempt>, Vec<Roam>)> {
     let mut batch = (limit * 4).max(2000);
+    let reports = if failed { FAILURES_ONLY } else { ATTEMPTS_ONLY };
     let list = loop {
-        let mut events = load_rows(c, from, to, client, Some(batch))?;
+        let mut events = query_rows(c, from, to, client, reports, Some(batch))?;
         let all = events.len() < batch;
         // The oldest time read may have more rows than were read.
         let oldest = events.last().map_or(from, |e| e.ts);
@@ -677,43 +681,25 @@ fn newest(c: &rusqlite::Connection, from: Ts, to: Ts, client: Option<&str>, limi
     Ok((list, r))
 }
 
-/// Clients apctl has stored, by MAC, with their stored names if they have one.
-/// The APs' names are in the live view (see `series::ap_name_of`).
-#[derive(Debug, Default, Clone)]
-pub struct Names {
-    pub clients: HashMap<String, Option<String>>,
-}
-
-/// (MAC, name) rows of a query, by MAC.
-fn pairs<P: rusqlite::Params>(c: &rusqlite::Connection, sql: &str, params: P) -> rusqlite::Result<HashMap<String, Option<String>>> {
-    c.prepare_cached(sql)?.query_map(params, |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?)))?.collect()
-}
+/// Stored client hostnames by MAC, for the clients that are stored.
+type StoredNames = HashMap<String, Option<String>>;
 
 /// The hostnames of a JSON list of clients: one statement whatever their number.
 const CLIENT_NAMES: &str = "SELECT mac, hostname FROM clients WHERE mac IN (SELECT value FROM json_each(?1))";
 
-impl Names {
-    /// From the database: clients' hostnames.
-    pub fn load(c: &rusqlite::Connection) -> rusqlite::Result<Names> {
-        Ok(Names { clients: pairs(c, "SELECT mac, hostname FROM clients", [])? })
-    }
-
-    /// The same for some clients only.
-    fn load_for(c: &rusqlite::Connection, clients: &BTreeSet<&str>) -> anyhow::Result<Names> {
-        Ok(Names { clients: pairs(c, CLIENT_NAMES, [serde_json::to_string(clients)?])? })
-    }
-
-    /// A client's display name: its alias, else what it reports now, else what was stored.
-    fn client(&self, live: &Live, mac: &str) -> Option<String> {
-        client_name(live, mac.parse().ok()).map(str::to_string).or_else(|| self.clients.get(mac).cloned().flatten())
-    }
-
+/// The stored hostnames of these clients ([`CLIENT_NAMES`]). The APs' names
+/// are in the live view (see `series::ap_name_of`).
+fn stored_client_names(c: &rusqlite::Connection, clients: &BTreeSet<&str>) -> anyhow::Result<StoredNames> {
+    let mut stmt = c.prepare_cached(CLIENT_NAMES)?;
+    Ok(stmt.query_map([serde_json::to_string(clients)?], |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?)))?.collect::<rusqlite::Result<_>>()?)
 }
 
-/// Display names of these APs and clients, for the ones that have one.
-fn names<'a>(stored: &Names, live: &Live, aps: impl IntoIterator<Item = &'a str>, clients: impl IntoIterator<Item = &'a str>) -> (BTreeMap<String, String>, BTreeMap<String, String>) {
+/// Display names of these APs and clients, for the ones that have one: a
+/// client's is its alias, else what it reports now, else what was stored.
+fn names<'a>(stored: &StoredNames, live: &Live, aps: impl IntoIterator<Item = &'a str>, clients: impl IntoIterator<Item = &'a str>) -> (BTreeMap<String, String>, BTreeMap<String, String>) {
     let aps = aps.into_iter().filter_map(|m| Some((m.to_string(), ap_name(live, m)?))).collect();
-    let clients = clients.into_iter().filter_map(|m| Some((m.to_string(), stored.client(live, m)?))).collect();
+    let client = |m: &str| client_name(live, m.parse().ok()).map(str::to_string).or_else(|| stored.get(m).cloned().flatten());
+    let clients = clients.into_iter().filter_map(|m| Some((m.to_string(), client(m)?))).collect();
     (aps, clients)
 }
 
@@ -768,7 +754,7 @@ pub async fn list(State(s): State<AppState>, Query(q): Query<ListQuery>) -> Resu
     let (list, r, aps, clients) = read(&s.store, Db::Config, move |c| {
         let (list, r) = newest(c, from, to, client.as_deref(), limit, q.failed, with_roams)?;
         let (aps, clients) = macs_of(&list, &r);
-        let stored = Names::load_for(c, &clients)?;
+        let stored = stored_client_names(c, &clients)?;
         let (aps, clients) = names(&stored, &live.read().unwrap(), aps, clients);
         Ok((list, r, aps, clients))
     })
@@ -804,7 +790,7 @@ pub async fn roaming(State(s): State<AppState>, Query(q): Query<RoamingQuery>) -
         let mut r = roams(&roam_rows(c, from, to, None)?);
         let figures = (roam_totals(&r), roam_pairs(&r), roam_clients(&r));
         let (aps, clients) = macs_of(&[], &r);
-        let stored = Names::load_for(c, &clients)?;
+        let stored = stored_client_names(c, &clients)?;
         let owned = |set: BTreeSet<&str>| -> Vec<String> { set.into_iter().map(str::to_string).collect() };
         let macs = (owned(aps), owned(clients));
         r.reverse();
@@ -888,6 +874,8 @@ mod tests {
     fn the_report_conditions_name_the_report_types() {
         let names = |types: &[Report]| types.iter().map(|t| Report::NAMES.iter().find(|(r, _)| r == t).unwrap().1).collect::<Vec<_>>().join("', '");
         assert_eq!(ATTEMPTS_ONLY, format!("AND event_type IN ('{}')", names(&ATTEMPT_TYPES)));
+        let failures: Vec<Report> = ATTEMPT_TYPES.into_iter().filter(|t| *t != Report::Success).collect();
+        assert_eq!(FAILURES_ONLY, format!("AND event_type IN ('{}')", names(&failures)));
         assert!(NEAR_A_LEAVE.ends_with(&format!("l.event_type IN ('{}'))", names(&LEAVE_TYPES))), "{NEAR_A_LEAVE}");
         for (r, name) in Report::NAMES {
             assert_eq!(Report::parse(name), r);

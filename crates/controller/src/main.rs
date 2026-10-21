@@ -109,7 +109,7 @@ struct ServeArgs {
     #[arg(long, env = "APCTL_LISTEN", default_value = "127.0.0.1:8090")]
     pub listen: SocketAddr,
     /// UDP address to receive AP syslog on (e.g. 0.0.0.0:5514). Shadow mode also
-    /// picks syslog sent to the other controller out of the capture.
+    /// picks syslog sent to the other controller (on its port, 5514) out of the capture.
     #[arg(long, env = "APCTL_SYSLOG_LISTEN")]
     pub syslog_listen: Option<SocketAddr>,
     /// File of `username:argon2-hash` lines (see `apctl hash-password`).
@@ -130,7 +130,8 @@ struct ServeArgs {
     /// Where to receive informs in active mode.
     #[arg(long, env = "APCTL_INFORM_LISTEN", default_value = "0.0.0.0:8080")]
     pub inform_listen: SocketAddr,
-    /// The URL APs should inform to, given to APs adopted over SSH (e.g.
+    /// Active mode: the URL APs should inform to, given to APs adopted over SSH, and
+    /// whose host and port configs name (http://host[:port]/inform, e.g.
     /// http://unifi.example:8080/inform). Defaults to the one the managed APs use.
     #[arg(long, env = "APCTL_INFORM_URL")]
     pub inform_url: Option<String>,
@@ -186,6 +187,9 @@ async fn serve(args: ServeArgs) -> Result<()> {
     // The configuration is read first: a mistake in it stops the start before
     // anything has changed (a staged restore applied) or started listening.
     let proxies = Arc::new(auth::Proxies::parse(&trusted_proxies)?);
+    // Only active mode gives it out (to APs adopted over SSH, and in configs).
+    let inform_url = inform_url.filter(|_| active);
+    let inform_at = inform_url.as_deref().map(inform_address).transpose()?;
     let users = match &users_file {
         Some(p) => auth::Users::load(p)?,
         None => auth::Users::default(),
@@ -237,7 +241,8 @@ async fn serve(args: ServeArgs) -> Result<()> {
     match source {
         Some(src) => {
             tracing::info!("shadow mode: reading inform traffic from {src}");
-            let syslog_port = syslog_listen.map_or(5514, |a| a.port());
+            // Syslog sent to the other controller, which takes it on its fixed port.
+            let syslog_port = apcfg::Controller::default().syslog_port;
             shadow::spawn(src, inform_ports, syslog_port, keys.clone(), in_tx.clone(), clock.clone());
         }
         None if active => {}
@@ -255,7 +260,8 @@ async fn serve(args: ServeArgs) -> Result<()> {
     // The controller the configs describe: in active mode, the configs pushed
     // name this controller's own address and ports; else the official defaults.
     let controller = if active {
-        let (host, inform_port) = inform_address(inform_url.as_deref(), inform_listen);
+        // Without --inform-url, the name `unifi` and the inform listener's port.
+        let (host, inform_port) = inform_at.clone().unwrap_or_else(|| ("unifi".into(), inform_listen.port()));
         let official = dryrun::controller(emulate_version, reporter_id(&store)?);
         // Syslog "to this controller" goes where apctl listens; without a listener, to the official port.
         let syslog_port = match syslog_listen {
@@ -311,7 +317,7 @@ async fn serve(args: ServeArgs) -> Result<()> {
 
     if active {
         let active_state = active::Active::new(&store, writer.clone(), live.clone(), keys.clone(), in_tx.clone(), controller, proxies.clone())?;
-        start_active(Arc::new(active_state), &live, inform_url.as_deref(), inform_listen, stun_listen).await?;
+        start_active(Arc::new(active_state), &live, inform_at.as_ref().map(|(host, _)| host.as_str()), inform_listen, stun_listen).await?;
     }
 
     let auth = Arc::new(auth::Auth::new(users, &store, writer.clone(), proxies)?);
@@ -322,7 +328,7 @@ async fn serve(args: ServeArgs) -> Result<()> {
     firmware::schedule(writer.clone());
     let state = api::AppState::new(api::AppStateInner {
         backups, active, writer: writer.clone(), store, vendors: Arc::new(vendors), renderer, auth, engine: in_tx.clone(), live, tx: api::live_json(&live_tx), started: clock::now_ts(),
-        source: source_desc, inform_url: inform_url.filter(|_| active), memo: Default::default(), threats: threat_state,
+        source: source_desc, inform_url, syslog_listen: syslog_listen.map(|a| a.port()), memo: Default::default(), threats: threat_state,
     });
     channelai::schedule(state.clone());
     ratelimit::spawn(state.clone());
@@ -442,7 +448,7 @@ fn reporter_id(store: &store::Store) -> Result<String> {
         let cfg: Option<String> = c
             .query_row("SELECT system_cfg FROM device_config WHERE instr(system_cfg, 'unifi.reporterid=') > 0 LIMIT 1", [], |r| r.get(0))
             .optional()?;
-        Ok(cfg.and_then(|cfg| cfg.lines().find_map(|l| l.strip_prefix("unifi.reporterid=")).map(str::to_string)))
+        Ok(cfg.as_deref().and_then(dryrun::reporter_of).map(str::to_string))
     })?;
     Ok(seen.unwrap_or_else(|| {
         let h = random_hex::<16>();
@@ -462,11 +468,11 @@ pub(crate) fn random_hex<const N: usize>() -> String {
     hex::encode(random_bytes::<N>())
 }
 
-/// Active mode's servers: STUN (`inform_url`'s host is the address its answers
-/// give), and the APs' informs, on listeners of their own.
-async fn start_active(state: Arc<active::Active>, live: &SharedLive, inform_url: Option<&str>, inform_listen: SocketAddr, stun_listen: SocketAddr) -> Result<()> {
-    let advertised = match inform_url {
-        Some(u) => advertised_ip(u).await,
+/// Active mode's servers: STUN (`inform_host`, `--inform-url`'s host, is the
+/// address its answers give), and the APs' informs, on listeners of their own.
+async fn start_active(state: Arc<active::Active>, live: &SharedLive, inform_host: Option<&str>, inform_listen: SocketAddr, stun_listen: SocketAddr) -> Result<()> {
+    let advertised = match inform_host {
+        Some(h) => advertised_ip(h).await,
         None => None,
     };
     if let Err(e) = stun::serve(stun_listen, advertised, live).await {
@@ -502,8 +508,8 @@ fn debug_syslog(pcap: &str, keys: &str, port: u16) -> Result<()> {
     let input = wire::capture::open_input(pcap)?;
     let end = wire::capture::run_with_udp(input, &[], &[port], |ev| {
         if let wire::capture::HttpEvent::Datagram { ts, src, payload, .. } = ev {
-            let found = if payload.starts_with(&syslog::MAGIC) {
-                ciphers.all().find_map(|(mac, cipher)| Some((Some(mac), syslog::decrypt_with(&payload, mac, cipher).ok()?)))
+            let found = if payload.starts_with(&wire::syslog_frame::MAGIC) {
+                ciphers.all().find_map(|(mac, cipher)| Some((Some(mac), syslog::decrypt(&payload, cipher)?)))
             } else {
                 Some((None, String::from_utf8_lossy(&payload).into_owned()))
             };
@@ -555,29 +561,25 @@ async fn shutdown(writer: store::Writer, drain: Drain) {
     });
 }
 
-/// The controller's host and inform port as pushed configs give them: those of
-/// `inform_url` (port 80 when it names none, as for any http URL), else the
-/// name `unifi` and the inform listener's port.
-fn inform_address(inform_url: Option<&str>, inform_listen: SocketAddr) -> (String, u16) {
-    let parsed = inform_url.and_then(|u| {
-        let uri: axum::http::Uri = u.parse().ok()?;
-        Some((uri.host()?.to_string(), uri.port_u16().unwrap_or(80)))
-    });
-    if parsed.is_none()
-        && let Some(u) = inform_url
-    {
-        tracing::warn!("--inform-url {u} has no host: configs name the controller unifi:{}", inform_listen.port());
+/// The controller's host and inform port as pushed configs give them, from
+/// `--inform-url`: an http URL with a host and the path /inform, as the APs
+/// inform to. The port is 80 when it names none; an IPv6 address keeps its brackets.
+fn inform_address(inform_url: &str) -> Result<(String, u16)> {
+    let wrong = || format!("--inform-url {inform_url:?} is not an inform URL like http://unifi.example:8080/inform");
+    let uri: axum::http::Uri = inform_url.parse().with_context(wrong)?;
+    let host = uri.host().filter(|h| !h.is_empty());
+    match (uri.scheme_str(), host, uri.path_and_query().map(|p| p.as_str())) {
+        (Some("http"), Some(host), Some("/inform")) => Ok((host.to_string(), uri.port_u16().unwrap_or(80))),
+        _ => Err(anyhow::anyhow!(wrong())),
     }
-    parsed.unwrap_or_else(|| ("unifi".into(), inform_listen.port()))
 }
 
-/// The address put in STUN answers: the host of the inform URL, an address
-/// or a name resolved once (to IPv4). None if it does not resolve; the
-/// socket's own address is used then.
-async fn advertised_ip(inform_url: &str) -> Option<std::net::IpAddr> {
-    let uri: axum::http::Uri = inform_url.parse().ok()?;
+/// The address put in STUN answers: the inform URL's host, an address or a
+/// name resolved once (to IPv4). None if it does not resolve; the socket's own
+/// address is used then.
+async fn advertised_ip(host: &str) -> Option<std::net::IpAddr> {
     // An IPv6 address comes in brackets (http://[fd00::1]:8080/inform).
-    let host = uri.host()?.trim_start_matches('[').trim_end_matches(']');
+    let host = host.trim_start_matches('[').trim_end_matches(']');
     if let Ok(ip) = host.parse() {
         return Some(ip);
     }
@@ -605,13 +607,14 @@ mod tests {
 
     #[test]
     fn configs_name_the_inform_urls_host_and_port() {
-        let listen: SocketAddr = "0.0.0.0:8081".parse().unwrap();
-        let addr = |u: Option<&str>| inform_address(u, listen);
-        assert_eq!(addr(Some("http://unifi.example.net:8088/inform")), ("unifi.example.net".into(), 8088));
-        assert_eq!(addr(Some("http://unifi.example.net/inform")), ("unifi.example.net".into(), 80));
-        assert_eq!(addr(Some("http://[fd00::1]:8080/inform")), ("[fd00::1]".into(), 8080));
-        assert_eq!(addr(None), ("unifi".into(), 8081));
-        assert_eq!(addr(Some("not a url")), ("unifi".into(), 8081));
+        let addr = |u: &str| inform_address(u).ok();
+        assert_eq!(addr("http://unifi.example.net:8088/inform"), Some(("unifi.example.net".into(), 8088)));
+        assert_eq!(addr("http://unifi.example.net/inform"), Some(("unifi.example.net".into(), 80)));
+        assert_eq!(addr("http://[fd00::1]:8080/inform"), Some(("[fd00::1]".into(), 8080)));
+        // What an AP could not inform to stops the start.
+        for wrong in ["not a url", "unifi.lan:8080/inform", "https://unifi.lan:8443/inform", "http://unifi.lan:8080/", "http://unifi.lan:8080/inform?x=1", "http:///inform", ""] {
+            assert_eq!(addr(wrong), None, "{wrong}");
+        }
     }
 
     #[test]
@@ -664,10 +667,8 @@ mod tests {
     #[tokio::test]
     async fn the_advertised_address_is_the_inform_urls_host() {
         let ip = |s: &str| Some(s.parse::<std::net::IpAddr>().unwrap());
-        assert_eq!(advertised_ip("http://192.0.2.1:8080/inform").await, ip("192.0.2.1"));
-        assert_eq!(advertised_ip("http://192.0.2.1/inform").await, ip("192.0.2.1"));
-        assert_eq!(advertised_ip("http://[fd00::1]:8080/inform").await, ip("fd00::1"));
-        assert_eq!(advertised_ip("http://[fd00::1]/inform").await, ip("fd00::1"));
-        assert_eq!(advertised_ip("not a url").await, None);
+        let host = |u: &str| inform_address(u).unwrap().0;
+        assert_eq!(advertised_ip(&host("http://192.0.2.1:8080/inform")).await, ip("192.0.2.1"));
+        assert_eq!(advertised_ip(&host("http://[fd00::1]:8080/inform")).await, ip("fd00::1"));
     }
 }

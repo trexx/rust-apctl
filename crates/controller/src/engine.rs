@@ -4,6 +4,7 @@
 //! The engine runs as one task that owns all mutable state; the API reads a
 //! shared snapshot (`Live`) and subscribes to a broadcast of changes.
 
+use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap};
 use std::net::IpAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -372,7 +373,7 @@ pub struct KnownDevice {
 
 pub type SharedLive = Arc<RwLock<Live>>;
 
-type McastTypes = BTreeMap<std::borrow::Cow<'static, str>, crate::model::McastCounts>;
+type McastTypes = BTreeMap<Cow<'static, str>, crate::model::McastCounts>;
 
 /// A sample's multicast counters by traffic type (none if it has none).
 fn mcast_types(c: &ClientSample) -> &McastTypes {
@@ -411,7 +412,8 @@ struct Written {
 /// Rows by key.
 type Rows<K, T> = HashMap<K, Row<T>>;
 
-/// A row as last written, when, and when it was last reported.
+/// A row as last written with the stamp it was written with, and when it was
+/// last reported.
 struct Row<T> {
     value: T,
     written: Ts,
@@ -419,27 +421,30 @@ struct Row<T> {
 }
 
 impl<T: PartialEq> Row<T> {
-    fn new(value: T, ts: Ts) -> Self {
-        Row { value, written: ts, seen: ts }
+    fn new(value: T, ts: Ts, stamp: Ts) -> Self {
+        Row { value, written: stamp, seen: ts }
     }
 
-    /// Records `value` as reported at `ts`; true if it is to be written: it
-    /// changed, or was last written `every` seconds ago.
-    fn report(&mut self, value: T, ts: Ts, every: Ts) -> bool {
+    /// Records `value` as reported at `ts`, with `stamp` the time its row
+    /// carries (the report's time, or for a neighbour when the scan heard it);
+    /// true if it is to be written: it changed, or its stamp moved `every`
+    /// seconds either way since it was last written. A neighbour's stamp may
+    /// come a second earlier than the last one, from the AP's rounding.
+    fn report(&mut self, value: T, ts: Ts, stamp: Ts, every: Ts) -> bool {
         self.seen = ts;
-        if self.value == value && !due(Some(&self.written), ts, every) {
+        if self.value == value && (stamp - self.written).abs() < every {
             return false;
         }
         self.value = value;
-        self.written = ts;
+        self.written = stamp;
         true
     }
 }
 
-/// Records `value` as reported under its `key` at `ts` (see `Row::report`):
-/// its row if it is to be written, as one new or changed, or due again. The
-/// row keeps the value; the key is copied only for a new row.
-fn report<K, Q, T>(rows: &mut Rows<K, T>, value: T, key: impl Fn(&T) -> &Q, ts: Ts, every: Ts) -> Option<&T>
+/// Records `value` as reported under its `key` at `ts` with `stamp` (see
+/// `Row::report`): its row if it is to be written, as one new or changed, or
+/// due again. The row keeps the value; the key is copied only for a new row.
+fn report<K, Q, T>(rows: &mut Rows<K, T>, value: T, key: impl Fn(&T) -> &Q, ts: Ts, stamp: Ts, every: Ts) -> Option<&T>
 where
     K: std::borrow::Borrow<Q> + Eq + std::hash::Hash,
     Q: ToOwned<Owned = K> + Eq + std::hash::Hash + ?Sized,
@@ -447,10 +452,10 @@ where
 {
     if rows.contains_key(key(&value)) {
         let row = rows.get_mut(key(&value)).expect("present");
-        return row.report(value, ts, every).then_some(&row.value);
+        return row.report(value, ts, stamp, every).then_some(&row.value);
     }
     let k = key(&value).to_owned();
-    Some(&rows.entry(k).or_insert(Row::new(value, ts)).value)
+    Some(&rows.entry(k).or_insert(Row::new(value, ts, stamp)).value)
 }
 
 /// Whether a row last written at `at` (if ever) is due again at `ts`.
@@ -484,7 +489,7 @@ pub struct Engine {
     bss_prev: HashMap<String, (Ts, Arc<ClientSample>)>,
     /// Events found in syslog lines.
     logevents: crate::logevents::LogEvents,
-    /// When each AP was last reported isolated.
+    /// When the beacon each AP was last reported isolated for was heard.
     isolated: HashMap<Mac, Ts>,
     /// When long-gone clients were last dropped from the live view.
     last_prune: Ts,
@@ -610,11 +615,9 @@ impl Engine {
         );
         // An AP stored as offline is unavailable to the clients locked to it,
         // whatever the settings were saved (or restored from a backup) with.
-        let (presence, imported_at) = (presence(&live), live.state_imported_at);
+        let presence = presence(&live);
         drop(live);
-        if let Some(at) = imported_at {
-            self.set_fixed_ap_available(at, presence);
-        }
+        self.set_fixed_ap_available(presence);
         Ok(())
     }
 
@@ -753,7 +756,7 @@ impl Engine {
         let _ = self.tx.send(LiveMsg::Device { mac });
         // Online: its first inform of this run, or back from offline.
         if came_back {
-            self.set_fixed_ap_available(ts, HashMap::from([(mac, true)]));
+            self.set_fixed_ap_available(HashMap::from([(mac, true)]));
         }
     }
 
@@ -766,25 +769,19 @@ impl Engine {
     /// The APs are asked to inform now only when a client is locked to one of
     /// them, when the official controller provisions them all; else no AP's
     /// config changes.
-    fn set_fixed_ap_available(&mut self, ts: Ts, aps: HashMap<Mac, bool>) {
-        let (current, imported_at) = {
-            let live = self.live.read().unwrap();
-            (live.state.clone(), live.state_imported_at.unwrap_or(ts))
-        };
-        let Some(current) = current else { return };
-        if !current["devices"].as_array().is_some_and(|d| d.iter().any(|d| availability_change(d, &aps).is_some())) {
-            return;
-        }
-        let mut state = Value::clone(&current);
-        drop(current);
-        let changed = mark_available(&mut state, &aps);
-        let locked = state["clients"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .any(|c| c["fixed_ap_enabled"].as_bool() == Some(true) && crate::settings::doc_mac(&c["fixed_ap_mac"]).is_some_and(|m| changed.contains(&m)));
-        self.store_state(state, imported_at);
-        if locked {
+    fn set_fixed_ap_available(&mut self, aps: HashMap<Mac, bool>) {
+        let locked = self.change_state(|state| {
+            if !state["devices"].as_array().is_some_and(|d| d.iter().any(|d| availability_change(d, &aps).is_some())) {
+                return false;
+            }
+            let changed = mark_available(state.to_mut(), &aps);
+            state["clients"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .any(|c| c["fixed_ap_enabled"].as_bool() == Some(true) && crate::settings::doc_mac(&c["fixed_ap_mac"]).is_some_and(|m| changed.contains(&m)))
+        });
+        if locked.is_some_and(|(locked, _)| locked) {
             crate::stun::poke_all(&self.live.read().unwrap());
         }
     }
@@ -1073,27 +1070,42 @@ impl Engine {
 
     /// Stores an AP's section numbering in the settings, so later renders keep it.
     fn set_config_meta(&self, mac: Mac, meta: Value) {
-        // Copied and serialised without the lock, as in `edit_state`.
-        let Some((state, imported_at)) = ({
-            let live = self.live.read().unwrap();
-            live.state.clone().zip(live.state_imported_at)
-        }) else {
-            return;
-        };
         let mac_s = mac.to_string();
         let same_mac = |m: &Value| m["mac"].as_str().is_some_and(|x| x.eq_ignore_ascii_case(&mac_s));
-        let current = state["config_meta"].as_array().and_then(|a| a.iter().find(|m| same_mac(m)));
-        if current == Some(&meta) {
-            return;
+        self.change_state(|state| {
+            let current = state["config_meta"].as_array().and_then(|a| a.iter().find(|m| same_mac(m)));
+            if current == Some(&meta) {
+                return;
+            }
+            let next = state.to_mut();
+            if !next["config_meta"].is_array() {
+                next["config_meta"] = json!([]);
+            }
+            let list = next["config_meta"].as_array_mut().unwrap();
+            list.retain(|m| !same_mac(m));
+            list.push(meta);
+        });
+    }
+
+    /// Changes the settings: `f` gets them to copy (`to_mut`) only when it
+    /// changes them, and a copy that differs is stored, under the time the
+    /// settings were imported (an edit is no import). None without settings;
+    /// else what `f` returned and whether they were stored. The copy is made and
+    /// serialised without the lock.
+    fn change_state<R>(&self, f: impl FnOnce(&mut Cow<Value>) -> R) -> Option<(R, bool)> {
+        let (current, imported_at) = {
+            let live = self.live.read().unwrap();
+            live.state.clone().zip(live.state_imported_at)?
+        };
+        let mut state = Cow::Borrowed(&*current);
+        let r = f(&mut state);
+        let Cow::Owned(next) = state else { return Some((r, false)) };
+        if next == *current {
+            return Some((r, false));
         }
-        let mut next = (*state).clone();
-        if !next["config_meta"].is_array() {
-            next["config_meta"] = json!([]);
-        }
-        let list = next["config_meta"].as_array_mut().unwrap();
-        list.retain(|m| !same_mac(m));
-        list.push(meta);
+        drop(current);
         self.store_state(next, imported_at);
+        Some((r, true))
     }
 
     /// Stores the settings, then swaps them into the live view. Serialised
@@ -1124,17 +1136,20 @@ impl Engine {
     /// between reading and swapping them in: the copy, the edit (which may hash
     /// a password) and the serialising run without holding the lock.
     fn edit_state(&mut self, ts: Ts, edit: StateEdit) -> Result<String, String> {
-        let (current, imported_at) = {
-            let live = self.live.read().unwrap();
-            (live.state.clone(), live.state_imported_at.unwrap_or(ts))
-        };
-        let mut state = current.as_deref().cloned().ok_or("no settings imported yet")?;
-        let what = edit(&mut state)?;
-        // Saved as they were (e.g. a form sent unchanged): nothing to store, record or tell the APs.
-        if current.as_deref() == Some(&state) {
+        // A refused edit leaves the settings as they were.
+        let (what, stored) = self
+            .change_state(|state| {
+                let mut next = Value::clone(state);
+                let what = edit(&mut next)?;
+                *state = Cow::Owned(next);
+                Ok::<_, String>(what)
+            })
+            .ok_or("no settings imported yet")?;
+        let what = what?;
+        // Saved as they were (e.g. a form sent unchanged): nothing to record or tell the APs.
+        if !stored {
             return Ok(what);
         }
-        self.store_state(state, imported_at);
         self.syslog_unknown.clear();
         self.emit(Event::site(ts, EventKind::SettingsChanged, json!({ "what": what })));
         // The APs pick the change up now rather than at their next interval.
@@ -1401,7 +1416,7 @@ impl Engine {
         self.syslog_ciphers.refresh(state, &self.keys);
         if let Some(mac) = by_hash
             && let Some(cipher) = self.syslog_ciphers.get(&mac)
-            && let Ok(text) = crate::syslog::decrypt_with(payload, mac, cipher)
+            && let Some(text) = crate::syslog::decrypt(payload, cipher)
         {
             return Ok((mac, text));
         }
@@ -1420,7 +1435,7 @@ impl Engine {
             anyhow::bail!("no syslog key for hash_id {hash_id:016x} (too many unknown senders to try)");
         }
         for (mac, cipher) in self.syslog_ciphers.all() {
-            if let Ok(text) = crate::syslog::decrypt_with(payload, mac, cipher) {
+            if let Some(text) = crate::syslog::decrypt(payload, cipher) {
                 self.syslog_unknown.remove(&hash_id);
                 self.live.write().unwrap().set_hash_id(hash_id, mac);
                 return Ok((mac, text));
@@ -1440,8 +1455,8 @@ impl Engine {
             (hash_id.and_then(|h| live.by_hash_id.get(&h).copied()), by_ip, (hash_id.is_some() || by_ip.is_some()).then(|| live.state.clone()).flatten())
         };
         let result = match hash_id {
-            Some(h) => self.decrypt_syslog(ts, payload, h, by_hash, state.as_ref()).map(|(mac, text)| (Some(mac), std::borrow::Cow::Owned(text))),
-            None if payload.starts_with(&crate::syslog::MAGIC) => Err(anyhow::anyhow!("encrypted syslog datagram too short ({} bytes)", payload.len())),
+            Some(h) => self.decrypt_syslog(ts, payload, h, by_hash, state.as_ref()).map(|(mac, text)| (Some(mac), Cow::Owned(text))),
+            None if payload.starts_with(&wire::syslog_frame::MAGIC) => Err(anyhow::anyhow!("encrypted syslog datagram too short ({} bytes)", payload.len())),
             None => Ok((None, String::from_utf8_lossy(payload))),
         };
         match result {
@@ -1501,10 +1516,14 @@ impl Engine {
     }
 
     /// Another AP's beacon flagged "isolated" (lost its uplink) that belongs to one
-    /// of our APs: reported at most once an hour per AP.
+    /// of our APs: reported at most once an hour per AP. An entry the AP keeps from
+    /// a scan before this run, or from one before the last report, is no news.
     fn check_isolated(&mut self, ts: Ts, heard_by: Mac, neighbors: &[crate::model::NeighborSample]) {
         use crate::model::{hardware_num, same_hardware};
-        let flagged: Vec<&crate::model::NeighborSample> = neighbors.iter().filter(|n| n.is_isolated).collect();
+        let started = self.first_tick.unwrap_or(ts);
+        // When the scan heard it (as in write_metrics, which takes the age later).
+        let heard = |n: &crate::model::NeighborSample| ts - n.age.unwrap_or(0).clamp(0, ts.max(0));
+        let flagged: Vec<&crate::model::NeighborSample> = neighbors.iter().filter(|n| n.is_isolated && heard(n) >= started).collect();
         if flagged.is_empty() {
             return;
         }
@@ -1518,10 +1537,11 @@ impl Engine {
             let Ok(b) = n.bssid.parse::<Mac>().map(|m| hardware_num(&m)) else { continue };
             // The nearest of our APs that is likely the same hardware.
             let Some((ap, _)) = ours.iter().filter(|(_, x)| same_hardware(*x, b)).min_by_key(|(_, x)| x.abs_diff(b)) else { continue };
-            if self.isolated.get(ap).is_some_and(|t| ts - t < 3600) {
+            let heard = heard(n);
+            if self.isolated.get(ap).is_some_and(|t| heard - t < 3600) {
                 continue;
             }
-            self.isolated.insert(*ap, ts);
+            self.isolated.insert(*ap, heard);
             let data = json!({ "heard_by": heard_by.to_string(), "bssid": n.bssid, "signal": n.signal });
             self.emit(Event::device(ts, EventKind::ApIsolated, *ap, data));
         }
@@ -1609,12 +1629,14 @@ impl Engine {
         // last seen and the grace period has passed, or when its AP went offline.
         // Only the connected ones are looked at, not the year of clients kept.
         let mut changed = false;
-        let Live { devices, clients, connected, .. } = &mut *live;
+        let Live { devices, known_devices, clients, connected, .. } = &mut *live;
         connected.retain(|cmac| {
             let Some(c) = clients.get_mut(cmac).filter(|c| c.connected) else { return false };
             // An AP we have not heard from yet in this run (e.g. right after a
-            // restart) is unknown, not offline: leave its clients alone.
+            // restart) is unknown, not offline, until the wait above marks it
+            // offline: until then, leave its clients alone.
             let reason = match devices.get(&c.sample.ap_mac) {
+                None if known_devices.get(&c.sample.ap_mac).is_some_and(|k| k.offline) => Some("ap_offline"),
                 // Its AP never reappeared (e.g. removed): give up after an hour.
                 // Counted from this run's start too: after a long outage the
                 // APs get time to inform before their clients are written off.
@@ -1648,7 +1670,7 @@ impl Engine {
             let _ = self.tx.send(LiveMsg::Device { mac });
         }
         if !offline.is_empty() {
-            self.set_fixed_ap_available(now, offline.into_iter().map(|m| (m, false)).collect());
+            self.set_fixed_ap_available(offline.into_iter().map(|m| (m, false)).collect());
         }
         if changed {
             let _ = self.tx.send(LiveMsg::Clients);
@@ -1726,15 +1748,16 @@ impl Engine {
             });
         }
         // Scan results repeat in every inform until the next scan: an unchanged
-        // neighbour is written once a minute (last_seen), an unchanged spectrum
+        // neighbour heard again is written once a minute (last_seen), an unchanged spectrum
         // row once an hour. What the AP no longer reports is forgotten here.
         let rows = self.written.neighbors.entry(s.ap.mac).or_default();
         for mut n in neighbors {
             // When the scan heard it, which is when it was last seen as it is: an entry
             // the AP keeps reporting from an old scan is no sighting now. Its age
-            // grows at every inform, so it is no change of the neighbour.
+            // grows at every inform, so it is no change of the neighbour, and its
+            // row is due again only when it is heard again.
             let heard = ts - n.age.take().unwrap_or(0).clamp(0, ts.max(0));
-            let Some(n) = report(rows, n, |n| n.bssid.as_str(), ts, REFRESH_SECS) else { continue };
+            let Some(n) = report(rows, n, |n| n.bssid.as_str(), ts, heard, REFRESH_SECS) else { continue };
             self.writer.exec(
                 Db::Config,
                 "INSERT INTO neighbors (bssid, ap_mac, radio, essid, channel, bw, center_freq, security, signal, best_signal, noise, is_unifi, ap_name, model, first_seen, last_seen)
@@ -1759,7 +1782,7 @@ impl Engine {
             }
             let rows = radios.get_mut(&radio).expect("inserted above");
             for c in channels {
-                let Some(c) = report(rows, c, |c| &c.channel, ts, SPECTRUM_REFRESH_SECS) else { continue };
+                let Some(c) = report(rows, c, |c| &c.channel, ts, ts, SPECTRUM_REFRESH_SECS) else { continue };
                 self.writer.exec(
                     Db::Config,
                     "INSERT OR REPLACE INTO spectrum (ap_mac, radio, channel, width, utilization, interference, other_bss_count, ts) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
@@ -2321,7 +2344,7 @@ mod tests {
         h.engine.set_state(130, json!({ "devices": [{ "mac": AP1, "radio_table": radios }, { "mac": AP2, "radio_table": radios, "fixed_ap_available": true }] }));
         assert_eq!((available(&h, 0), available(&h, 1)), (None, Some(json!(false))));
         // Settings saved while it was there, with AP2 stored offline: a restart marks it.
-        h.engine.set_fixed_ap_available(140, HashMap::from([(AP2.parse().unwrap(), true)]));
+        h.engine.set_fixed_ap_available(HashMap::from([(AP2.parse().unwrap(), true)]));
         assert_eq!(available(&h, 1), Some(json!(true)));
         let h = h.restarted();
         assert_eq!((available(&h, 0), available(&h, 1)), (None, Some(json!(false))), "AP1 is not known yet; AP2 is stored offline");
@@ -2364,12 +2387,25 @@ mod tests {
         h.engine.handle(Input::Inform { ts: 0, peer: [10, 0, 0, 1].into(), decoded: decoded(inform(AP1, 1000, &[(C1, "b1")])) });
         // Back after two hours: the first tick comes before the AP's first inform.
         let mut h = h.restarted();
+        let limit = crate::active::MAX_INFORM_INTERVAL * OFFLINE_INTERVALS;
+        h.engine.handle(Input::Tick(7200));
+        h.engine.handle(Input::Tick(7200 + limit));
+        assert_eq!(events(&mut h), [], "the AP and its client are left alone while the AP has time to inform");
+        // An AP that never informs again goes offline, and its clients with it.
+        h.engine.handle(Input::Tick(7201 + limit));
+        assert_eq!(events(&mut h), [("ap_offline", None), ("client_disconnected", Some(C1.into()))]);
+        assert_eq!(stored(&h, EventKind::ClientDisconnected)[0]["reason"], "ap_offline");
+        // A client of an AP that is not known at all (e.g. forgotten): it goes an hour into the run.
+        let mut h = harness();
+        h.engine.handle(Input::Inform { ts: 0, peer: [10, 0, 0, 1].into(), decoded: decoded(inform(AP1, 1000, &[(C1, "b1")])) });
+        let mut h = h.restarted();
+        h.engine.live.write().unwrap().known_devices.clear();
         h.engine.handle(Input::Tick(7200));
         h.engine.handle(Input::Tick(7200 + 3600));
-        assert_eq!(events(&mut h), [("ap_offline", None)], "the client is left alone for the AP's first hour back");
-        // An AP that never informs again: its clients go an hour into the run.
+        assert_eq!(events(&mut h), []);
         h.engine.handle(Input::Tick(7200 + 3601));
         assert_eq!(events(&mut h), [("client_disconnected", Some(C1.into()))]);
+        assert_eq!(stored(&h, EventKind::ClientDisconnected)[0]["reason"], "stale");
     }
 
     #[test]
@@ -2431,10 +2467,18 @@ mod tests {
         p["radio_table"] = json!([{ "radio": "na", "scan_table": [{ "bssid": "02:cd:00:00:00:01", "signal": -50, "age": 1200 }] }]);
         h.engine.handle(Input::Inform { ts: 2000, peer: [10, 0, 0, 1].into(), decoded: decoded(p.clone()) });
         assert_eq!(last_seen(&h), 800);
-        // Its age growing is no change: written once a minute, as heard.
-        p["radio_table"][0]["scan_table"][0]["age"] = json!(1215);
-        h.engine.handle(Input::Inform { ts: 2015, peer: [10, 0, 0, 1].into(), decoded: decoded(p) });
-        assert_eq!(h.engine.written.neighbors[&AP1.parse().unwrap()]["02:cd:00:00:00:01"].written, 2000);
+        // Its age growing is no change, and as it was heard no later, it is not written again,
+        // nor for the AP's rounding putting it a second earlier.
+        let row = |h: &Harness| h.engine.written.neighbors[&AP1.parse().unwrap()]["02:cd:00:00:00:01"].written;
+        for (ts, age) in [(2015, 1215), (2100, 1300), (2200, 1401)] {
+            p["radio_table"][0]["scan_table"][0]["age"] = json!(age);
+            h.engine.handle(Input::Inform { ts, peer: [10, 0, 0, 1].into(), decoded: decoded(p.clone()) });
+            assert_eq!(row(&h), 800);
+        }
+        // Heard again by a new scan: written.
+        p["radio_table"][0]["scan_table"][0]["age"] = json!(0);
+        h.engine.handle(Input::Inform { ts: 2210, peer: [10, 0, 0, 1].into(), decoded: decoded(p) });
+        assert_eq!(last_seen(&h), 2210);
     }
 
     #[test]
@@ -2635,6 +2679,24 @@ mod tests {
             .filter_map(|m| match m { LiveMsg::Event(e) if e.kind == EventKind::ApIsolated => Some(e.device_mac), _ => None })
             .collect();
         assert_eq!(blamed, [b.parse().ok()]);
+    }
+
+    #[test]
+    fn an_isolated_beacon_kept_from_an_earlier_scan_is_no_news() {
+        let mut h = harness();
+        let (a, b) = ("02:00:00:00:00:10", "02:00:00:00:00:18");
+        h.engine.handle(Input::Tick(100));
+        h.engine.handle(Input::Inform { ts: 100, peer: [10, 0, 0, 1].into(), decoded: decoded(inform(b, 1000, &[])) });
+        let isolated = |h: &mut Harness, ts: Ts, age: Ts| {
+            let mut p = inform(a, 1000 + ts, &[]);
+            p["radio_table"] = json!([{ "radio": "na", "scan_table": [{ "bssid": "02:00:00:00:00:1a", "is_isolated": true, "signal": -70, "age": age }] }]);
+            h.engine.handle(Input::Inform { ts, peer: [10, 0, 0, 1].into(), decoded: decoded(p) });
+            std::iter::from_fn(|| h.rx.try_recv().ok()).filter(|m| matches!(m, LiveMsg::Event(e) if e.kind == EventKind::ApIsolated)).count()
+        };
+        assert_eq!(isolated(&mut h, 120, 50), 0, "heard before this run");
+        assert_eq!(isolated(&mut h, 130, 0), 1);
+        assert_eq!(isolated(&mut h, 4000, 3870), 0, "the same sighting, an hour on");
+        assert_eq!(isolated(&mut h, 4010, 270), 1, "heard again an hour after");
     }
 
     #[test]
@@ -2882,9 +2944,13 @@ mod tests {
         h.engine.handle(Input::Reply { ts: 220, mac, decoded: push("aaa.1.hide_ssid=true\naaa.1.wpa.psk=new") });
         let pushes = stored(&h, EventKind::ConfigPushed);
         assert_eq!(pushes[0]["system_cfg"]["baseline"], true);
-        let diff = pushes[1]["system_cfg"]["diff"].as_str().unwrap();
-        assert!(diff.contains("~ aaa.1.hide_ssid: false -> true"), "{diff}");
-        assert!(diff.contains("aaa.1.wpa.psk: <redacted> -> <redacted>") && !diff.contains("new"), "{diff}");
+        assert_eq!(
+            pushes[1]["system_cfg"]["changes"],
+            json!([
+                { "op": "~", "key": "aaa.1.hide_ssid", "old": "false", "new": "true" },
+                { "op": "~", "key": "aaa.1.wpa.psk", "old": "<redacted>", "new": "<redacted>" },
+            ])
+        );
 
         // A push without a cfgversion keeps the last one, in memory as in the database.
         let push = json!({ "_type": "setparam", "mgmt_cfg": "cfgversion=v1\na=1", "system_cfg": "x=1" });
@@ -2930,7 +2996,11 @@ mod tests {
         // What it changed, not a baseline; the secret, masked in the stored copy, is not compared.
         push(&mut h, 20, json!({ "_type": "setparam", "mgmt_cfg": "cfgversion=v2\na=1", "system_cfg": "aaa.1.hide_ssid=true\naaa.1.wpa.psk=old" }));
         let pushed = stored(&h, EventKind::ConfigPushed).pop().unwrap();
-        assert_eq!((pushed["system_cfg"]["diff"].as_str(), pushed["mgmt_cfg"]["diff"].as_str()), (Some("~ aaa.1.hide_ssid: false -> true\n"), Some("~ cfgversion: v1 -> v2\n")));
+        let changes = |p: &Value| (p["system_cfg"]["changes"].clone(), p["mgmt_cfg"]["changes"].clone());
+        assert_eq!(
+            changes(&pushed),
+            (json!([{ "op": "~", "key": "aaa.1.hide_ssid", "old": "false", "new": "true" }]), json!([{ "op": "~", "key": "cfgversion", "old": "v1", "new": "v2" }]))
+        );
         // A management-only push without a cfgversion, after another restart: the
         // stored version; the system_cfg is the stored one, not known in full.
         let mut h = h.restarted();
@@ -2947,11 +3017,11 @@ mod tests {
         assert_eq!(stored(&h, EventKind::ConfigPushed).pop().unwrap().get("labels"), None);
         push(&mut h, 40, json!({ "_type": "setparam", "mgmt_cfg": "a=4", "system_cfg": "aaa.1.hide_ssid=false\naaa.1.wpa.psk=old" }));
         let pushed = stored(&h, EventKind::ConfigPushed).pop().unwrap();
-        assert_eq!((pushed["system_cfg"]["diff"].as_str(), pushed["mgmt_cfg"]["diff"].as_str()), (Some("~ aaa.1.hide_ssid: true -> false\n"), Some("~ a: 3 -> 4\n")));
+        assert_eq!(changes(&pushed), (json!([{ "op": "~", "key": "aaa.1.hide_ssid", "old": "true", "new": "false" }]), json!([{ "op": "~", "key": "a", "old": "3", "new": "4" }])));
         // From then on, the push seen in this run.
         push(&mut h, 50, json!({ "_type": "setparam", "system_cfg": "aaa.1.hide_ssid=false\naaa.1.wpa.psk=new" }));
-        let diff = stored(&h, EventKind::ConfigPushed).pop().unwrap()["system_cfg"]["diff"].as_str().unwrap().to_string();
-        assert!(diff.contains("aaa.1.wpa.psk: <redacted> -> <redacted>"), "{diff}");
+        let pushed = stored(&h, EventKind::ConfigPushed).pop().unwrap();
+        assert_eq!(pushed["system_cfg"]["changes"], json!([{ "op": "~", "key": "aaa.1.wpa.psk", "old": "<redacted>", "new": "<redacted>" }]));
     }
 
     #[test]

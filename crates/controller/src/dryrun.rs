@@ -33,13 +33,18 @@ pub fn apcfg_renderer(version: String) -> RenderFn {
     renderer_for(&controller(version, String::new()))
 }
 
+/// The installation ID a system_cfg names (`unifi.reporterid`).
+pub fn reporter_of(system_cfg: &str) -> Option<&str> {
+    system_cfg.lines().find_map(|l| l.strip_prefix("unifi.reporterid="))
+}
+
 /// The real generator for the controller `template` describes: active mode's
 /// own, so that a dry run renders what it pushes. The installation ID is the
 /// one the AP's last push names, else the template's.
 pub fn renderer_for(template: &apcfg::Controller) -> RenderFn {
     let template = template.clone();
     Arc::new(move |req: &RenderRequest| {
-        let reporter = req.previous_system_cfg.and_then(|c| c.lines().find_map(|l| l.strip_prefix("unifi.reporterid=")));
+        let reporter = req.previous_system_cfg.and_then(reporter_of);
         // A copy only when the AP names another installation (in active mode, the last push is usually our own).
         let other;
         let controller = match reporter {

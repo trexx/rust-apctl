@@ -549,7 +549,7 @@ impl Active {
         let (push, redacted) = match &seen {
             Some(p) => (&**p, false),
             None => {
-                let Some(p) = self.stored_push(mac) else { return false };
+                let Some(p) = self.stored_push(mac).filter(PushedConfig::complete) else { return false };
                 stored = p;
                 (&stored, true)
             }

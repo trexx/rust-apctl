@@ -1342,7 +1342,7 @@ mod tests {
             let s = AppState::new(crate::api::AppStateInner {
                 backups: crate::backup::Backups::new(t.dir.to_path_buf(), None),
                 store: t.store.clone(), vendors: Default::default(), renderer: crate::dryrun::apcfg_renderer("10.6.106".into()), auth, engine, live, tx, started: 0, source: "none".into(),
-                active: false, writer: t.writer.clone(), inform_url: None, memo: Default::default(), threats: Default::default(),
+                active: false, writer: t.writer.clone(), inform_url: None, syslog_listen: None, memo: Default::default(), threats: Default::default(),
             });
             (s, base, t)
         }

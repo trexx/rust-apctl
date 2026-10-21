@@ -147,17 +147,31 @@ fn ack_of<'a>(acks: &'a Acks, kind: Kind, bssid: &str) -> Option<&'a Ack> {
 /// A Wi-Fi client, for finding the hotspots next to its address.
 #[derive(Debug, Clone)]
 pub struct Client {
-    /// See [`mac_num`].
+    /// See [`hardware_num`].
     num: u64,
-    mac: String,
+    mac: Mac,
     name: Option<String>,
 }
 
-/// Clients by MAC, with what [`assess`] looks them up by, in address order.
-fn sorted_clients(clients: HashMap<String, Option<String>>) -> Vec<Client> {
-    let mut out: Vec<Client> = clients.into_iter().filter_map(|(mac, name)| Some(Client { num: mac_num(&mac)?, mac, name })).collect();
-    out.sort_unstable_by(|a, b| (a.num, &a.mac).cmp(&(b.num, &b.mac)));
+/// Clients with their names, with what [`assess`] looks them up by, in address order.
+fn sorted_clients(clients: impl IntoIterator<Item = (Mac, Option<String>)>) -> Vec<Client> {
+    let mut out: Vec<Client> = clients.into_iter().map(|(mac, name)| Client { num: hardware_num(&mac), mac, name }).collect();
+    out.sort_unstable_by_key(|c| (c.num, c.mac));
     out
+}
+
+/// Every client stored, with its stored hostname; a MAC that does not parse is no client's.
+fn stored_clients(c: &rusqlite::Connection) -> rusqlite::Result<Vec<Client>> {
+    let mut stmt = c.prepare_cached("SELECT mac, hostname FROM clients")?;
+    let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?)))?;
+    let mut out = Vec::new();
+    for row in rows {
+        let (mac, name) = row?;
+        if let Ok(mac) = mac.parse() {
+            out.push((mac, name));
+        }
+    }
+    Ok(sorted_clients(out))
 }
 
 /// The clients of a list in address order whose address is within 8 of `n`.
@@ -285,7 +299,7 @@ pub fn assess(a: &Assessment) -> Vec<Finding> {
     let is_family = |n: u64| family.get(family.partition_point(|f| *f < n.saturating_sub(16))).is_some_and(|f| same_hardware(n, *f));
     // The client next to an address: of several, the first by MAC, with its live name first.
     let client_near = |n: u64| {
-        let mac = near_in(&a.clients, n).chain(near_in(&a.live_clients, n)).map(|c| c.mac.as_str()).min()?;
+        let mac = near_in(&a.clients, n).chain(near_in(&a.live_clients, n)).map(|c| c.mac).min()?;
         let name = |list| near_in(list, n).find(|c| c.mac == mac).and_then(|c| c.name.as_ref());
         Some((mac, name(&a.live_clients).or_else(|| name(&a.clients))))
     };
@@ -609,7 +623,7 @@ pub fn gather(store: &Store, state: &ThreatState, live: &SharedLive, now: Ts) ->
     store.read(Db::Config, |c| {
         // The names and the first network heard change slowly, and reading them takes scans.
         if !(0..CACHE_SECS).contains(&(now - cache.names_at)) {
-            cache.clients = sorted_clients(crate::connections::Names::load(c)?.clients).into();
+            cache.clients = stored_clients(c)?.into();
             cache.watching_since = c.query_row("SELECT MIN(first_seen) FROM neighbors", [], |r| r.get::<_, Option<Ts>>(0))?;
             cache.names_at = now;
         }
@@ -669,11 +683,11 @@ fn live_clients(live: &Live, stored: &[Client]) -> Vec<Client> {
         .chain(aliased)
         .filter_map(|mac| {
             let (num, name) = (hardware_num(mac), client_name(live, Some(*mac)));
-            let is_stored = || stored[stored.partition_point(|c| c.num < num)..].iter().take_while(|c| c.num == num).any(|c| c.mac.parse().ok() == Some(*mac));
-            (name.is_some() || !is_stored()).then(|| Client { num, mac: mac.to_string(), name: name.map(str::to_string) })
+            let is_stored = || stored[stored.partition_point(|c| c.num < num)..].iter().take_while(|c| c.num == num).any(|c| c.mac == *mac);
+            (name.is_some() || !is_stored()).then(|| Client { num, mac: *mac, name: name.map(str::to_string) })
         })
         .collect();
-    out.sort_unstable_by(|a, b| (a.num, &a.mac).cmp(&(b.num, &b.mac)));
+    out.sort_unstable_by_key(|c| (c.num, c.mac));
     out
 }
 
@@ -1012,7 +1026,7 @@ mod tests {
             a.own.push(OwnBss { bssid: b.into(), ap_mac: ap.into(), essid: Some(e.into()), channel: Some(ch), changed_at: 0 });
             a.ssids.insert(e.into());
         }
-        a.clients = sorted_clients([("3c:55:76:00:00:03".into(), Some("phone".into()))].into()).into();
+        a.clients = sorted_clients([("3c:55:76:00:00:03".parse().unwrap(), Some("phone".into()))]).into();
         // Our APs hear each other normally.
         a.heard.push(heard("78:45:58:3c:52:be", UP, "Home", 48, "WPA2-Personal (AES/CCMP)", -81));
         a.heard.push(heard("78:45:58:3c:51:ae", DOWN, "Home", 44, "WPA2-Personal (AES/CCMP)", -84));
@@ -1110,12 +1124,12 @@ mod tests {
         assert!(f[0].detail.contains("phone"));
         // A live name (an alias) wins over the stored one; a live client with
         // none keeps the stored one.
-        a.live_clients = sorted_clients([("3c:55:76:00:00:03".into(), Some("Ann's phone".into()))].into());
+        a.live_clients = sorted_clients([("3c:55:76:00:00:03".parse().unwrap(), Some("Ann's phone".into()))]);
         assert!(assess(&a)[0].detail.contains("Ann's phone"));
-        a.live_clients = sorted_clients([("3c:55:76:00:00:03".into(), None)].into());
+        a.live_clients = sorted_clients([("3c:55:76:00:00:03".parse().unwrap(), None)]);
         assert!(assess(&a)[0].detail.contains("phone"));
         // Of two clients next to it, the first by MAC is named, wherever it is listed.
-        a.live_clients = sorted_clients([("3c:55:76:00:00:02".into(), Some("tablet".into()))].into());
+        a.live_clients = sorted_clients([("3c:55:76:00:00:02".parse().unwrap(), Some("tablet".into()))]);
         assert_eq!(assess(&a)[0].target.as_deref(), Some("3c:55:76:00:00:02"));
         // A client only seen live counts too.
         a.clients = Arc::from([]);
@@ -1125,7 +1139,7 @@ mod tests {
     #[test]
     fn live_clients_are_the_named_and_the_not_yet_stored() {
         use crate::engine::{Alias, ClientView};
-        let stored = sorted_clients([("3c:55:76:00:00:01".into(), Some("old name".into())), ("3c:55:76:00:00:02".into(), None)].into());
+        let stored = sorted_clients([("3c:55:76:00:00:01".parse().unwrap(), Some("old name".into())), ("3c:55:76:00:00:02".parse().unwrap(), None)]);
         let mut live = Live::default();
         for (mac, hostname) in [("3c:55:76:00:00:01", None), ("3c:55:76:00:00:02", Some("laptop")), ("3c:55:76:00:00:03", None)] {
             let sample = crate::model::ClientSample { mac: mac.parse().unwrap(), hostname: hostname.map(Into::into), ..Default::default() };
@@ -1134,9 +1148,10 @@ mod tests {
         live.aliases.insert("3c:55:76:00:00:04".parse().unwrap(), Alias { alias: Some("tablet".into()), note: None });
         live.aliases.insert("3c:55:76:00:00:02".parse().unwrap(), Alias { alias: Some("my laptop".into()), note: None });
         let got = live_clients(&live, &stored);
-        let got: Vec<(&str, Option<&str>)> = got.iter().map(|c| (c.mac.as_str(), c.name.as_deref())).collect();
+        let got: Vec<(String, Option<&str>)> = got.iter().map(|c| (c.mac.to_string(), c.name.as_deref())).collect();
         // The first is stored and has no name now: what is stored stands.
-        assert_eq!(got, [("3c:55:76:00:00:02", Some("my laptop")), ("3c:55:76:00:00:03", None), ("3c:55:76:00:00:04", Some("tablet"))]);
+        let want = [("3c:55:76:00:00:02", Some("my laptop")), ("3c:55:76:00:00:03", None), ("3c:55:76:00:00:04", Some("tablet"))];
+        assert_eq!(got, want.map(|(m, n)| (m.to_string(), n)));
     }
 
     #[test]

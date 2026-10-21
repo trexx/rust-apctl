@@ -275,7 +275,8 @@ pub struct McastGroup {
     pub counts: McastCounts,
 }
 
-#[derive(Debug, Clone, Default, Serialize)]
+/// Serialised with its [`delivery`](Multicast::delivery), as the client's page shows it.
+#[derive(Debug, Clone, Default)]
 pub struct Multicast {
     /// Counters per traffic type (arp, dhcp, dhcpv6, igmp, ipv6_nd, mdns, mld, ssdp, stream, other).
     pub types: std::collections::BTreeMap<Cow<'static, str>, McastCounts>,
@@ -300,6 +301,21 @@ const MCAST_TYPES: [&str; 10] = ["arp", "dhcp", "dhcpv6", "igmp", "ipv6_nd", "md
 
 fn mcast_type(name: &str) -> Cow<'static, str> {
     MCAST_TYPES.iter().find(|t| **t == name).map_or_else(|| Cow::Owned(name.to_string()), |t| Cow::Borrowed(*t))
+}
+
+impl Serialize for Multicast {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        #[derive(Serialize)]
+        struct View<'a> {
+            types: &'a std::collections::BTreeMap<Cow<'static, str>, McastCounts>,
+            groups: &'a [McastGroup],
+            memberships: &'a [String],
+            services: &'a [McastService],
+            delivery: Option<&'static str>,
+        }
+        let Multicast { types, groups, memberships, services } = self;
+        View { types, groups, memberships, services, delivery: self.delivery() }.serialize(s)
+    }
 }
 
 impl Multicast {

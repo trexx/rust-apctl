@@ -71,6 +71,9 @@ pub struct AppStateInner {
     pub writer: crate::store::Writer,
     /// `--inform-url` in active mode (see `ssh::inform_url`).
     pub inform_url: Option<String>,
+    /// The port apctl takes AP syslog on (`--syslog-listen`'s); None without a listener.
+    #[allow(dead_code)] // until GET /api/settings/site sends it (p11-features drops this)
+    pub syslog_listen: Option<u16>,
     /// What the insights views read lately (see `series::memo_read`).
     pub memo: crate::series::Memo,
     /// What the threat checks keep between runs, shared with `threats::watch`.
@@ -772,15 +775,11 @@ async fn dryrun(State(s): State<AppState>) -> Result<Json<DryRunStatus>, ApiErro
         (live.state.clone(), live.state_imported_at, aps)
     };
     // Then from the database, in one go: the stored redacted copy for APs not
-    // pushed to since start, and the comparisons made at each push.
-    let need: Vec<Mac> = aps.iter().filter(|a| a.3.is_none()).map(|a| a.0).collect();
+    // pushed to since start (a full one, as above), and the comparisons made at each push.
+    let need: std::collections::HashSet<Mac> = aps.iter().filter(|a| a.3.is_none()).map(|a| a.0).collect();
     let (stored, history) = read(&s.store, Db::Config, move |c| {
-        let mut stored = std::collections::HashMap::new();
-        for mac in need {
-            if let Some(p) = crate::store::stored_push(c, &mac)?.filter(|p| !p.system_cfg.is_empty()) {
-                stored.insert(mac, Arc::new(p));
-            }
-        }
+        let stored: std::collections::HashMap<Mac, Arc<_>> =
+            crate::store::stored_pushes(c)?.into_iter().filter(|(mac, p)| need.contains(mac) && p.complete()).map(|(mac, p)| (mac, Arc::new(p))).collect();
         // Without the diffs' text, which older rows have and the history never shows (only the counts); text that isn't JSON becomes null.
         let mut stmt = c.prepare_cached(
             "SELECT id, ts, mac, cfgversion, matches, CASE WHEN json_valid(comparison) THEN json_remove(comparison, '$.mgmt_cfg.diff', '$.system_cfg.diff') END
@@ -1265,7 +1264,11 @@ pub fn live_json(typed: &broadcast::Sender<LiveMsg>) -> broadcast::Sender<Utf8By
                         Utf8Bytes::from_static(RESYNC)
                     }
                 },
-                Err(broadcast::error::RecvError::Lagged(_)) => Utf8Bytes::from_static(RESYNC),
+                // What is still buffered is stale once the pages refetch: skipped.
+                Err(broadcast::error::RecvError::Lagged(_)) => {
+                    rx = rx.resubscribe();
+                    Utf8Bytes::from_static(RESYNC)
+                }
                 Err(broadcast::error::RecvError::Closed) => return,
             };
             let _ = out.send(text);
@@ -1303,7 +1306,9 @@ async fn live_socket(mut socket: WebSocket, mut rx: broadcast::Receiver<Utf8Byte
                         return;
                     }
                 }
+                // The page refetches everything: what is still buffered is stale, and skipped.
                 Err(broadcast::error::RecvError::Lagged(_)) => {
+                    rx = rx.resubscribe();
                     if socket.send(Message::Text(Utf8Bytes::from_static(RESYNC))).await.is_err() {
                         return;
                     }
@@ -1337,7 +1342,7 @@ mod tests {
         let state = AppState::new(AppStateInner {
             backups: crate::backup::Backups::new(dir.to_path_buf(), None),
             store, vendors: Default::default(), renderer: crate::dryrun::apcfg_renderer(crate::EMULATE_VERSION.into()), auth, engine, live: Default::default(), tx, started: 0, source: "none".into(),
-            active: false, writer, inform_url: None, memo: Default::default(), threats: Default::default(),
+            active: false, writer, inform_url: None, syslog_listen: None, memo: Default::default(), threats: Default::default(),
         });
         (state, engine_rx, dir)
     }
@@ -1459,6 +1464,7 @@ mod tests {
         // The other connected clients in each group, by name (else MAC); not the client itself, nor one that left.
         let tv = get_json(&app, "/api/clients/02:00:00:00:01:01").await;
         assert_eq!(tv["sample"]["multicast"]["memberships"], json!([ssdp, mdns]));
+        assert_eq!(tv["sample"]["multicast"]["delivery"], "flooding", "joined, with no group the AP tracks");
         assert_eq!(tv["peers"], json!({
             mdns: [{ "mac": "02:00:00:00:01:04", "name": "02:00:00:00:01:04" }],
             ssdp: [{ "mac": "02:00:00:00:01:03", "name": "amp" }, { "mac": "02:00:00:00:01:02", "name": "Speaker" }],
@@ -1511,6 +1517,16 @@ mod tests {
         typed.send(LiveMsg::Device { mac: ap }).unwrap();
         assert_eq!(socket.recv().await.unwrap().as_str(), r#"{"type":"log","device_mac":"02:00:00:00:00:01"}"#);
         assert_eq!(socket.recv().await.unwrap().as_str(), r#"{"type":"device","mac":"02:00:00:00:00:01"}"#);
+        // Fallen behind: a resync, and what was missed is not sent after it.
+        let (typed, _) = broadcast::channel(2);
+        let json = live_json(&typed);
+        let mut socket = json.subscribe();
+        for _ in 0..5 {
+            typed.send(LiveMsg::Device { mac: ap }).unwrap();
+        }
+        assert_eq!(socket.recv().await.unwrap().as_str(), RESYNC);
+        typed.send(LiveMsg::Clients).unwrap();
+        assert_eq!(socket.recv().await.unwrap().as_str(), r#"{"type":"clients"}"#);
     }
 
     #[tokio::test]
@@ -1524,13 +1540,21 @@ mod tests {
         s.writer.exec(Db::Config, "INSERT INTO dryrun_results (ts, mac, matches, comparison) VALUES (7, '02:00:00:00:00:01', 0, ?1)", vec![Sql::Text(stored.into())]);
         s.writer.exec(Db::Config, "INSERT INTO dryrun_results (ts, mac, matches, comparison) VALUES (6, '02:00:00:00:00:01', 0, 'not json')", vec![]);
         flushed(&s.writer);
-        let app = router(s);
+        let app = router(s.clone());
         let d = get_json(&app, "/api/dryrun").await;
         assert_eq!((d["devices"][0]["status"].as_str(), d["history"][0]["ts"].as_i64(), d["history"][0]["id"].as_i64()), (Some("no_settings"), Some(7), Some(1)));
         // The history's comparisons come without the diffs' text.
         assert_eq!(d["history"][0]["comparison"], json!({ "mgmt_cfg": { "added": 0 }, "system_cfg": { "added": 1, "removed": 0, "changed": 0, "identical": false } }));
         assert_eq!(d["history"][1]["comparison"], Value::Null);
         assert_eq!(d["devices"][0], json!({ "mac": "02:00:00:00:00:01", "name": "Hall", "status": "no_settings", "settings_stale": false }));
+        // With settings, the stored push is compared with; one without its mgmt_cfg is no config seen.
+        s.live.write().unwrap().state = Some(Arc::new(json!({})));
+        let d = get_json(&app, "/api/dryrun").await;
+        assert_ne!(d["devices"][0]["status"], "no_config_seen");
+        s.writer.exec(Db::Config, "UPDATE device_config SET mgmt_cfg = ''", vec![]);
+        flushed(&s.writer);
+        let d = get_json(&app, "/api/dryrun").await;
+        assert_eq!(d["devices"][0]["status"], "no_config_seen");
     }
 
     #[test]
