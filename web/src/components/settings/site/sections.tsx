@@ -80,7 +80,7 @@ export function Ssh({
         />
       </Row>
       <Row label="User name">
-        <TextInput {...bind("x_ssh_username")} maxLength={32} />
+        <TextInput {...bind("x_ssh_username")} maxLength={30} />
       </Row>
       <Row
         label="Password"
