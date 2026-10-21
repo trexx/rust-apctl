@@ -1135,7 +1135,7 @@ fn edit_wlan(state: &mut Value, e: &WlanEdit, over: &[Over]) -> Result<(String, 
     }
     wlan_password(p, &before, &mut w, &mut changed)?;
 
-    let locked_aps_before = if flag(&before, "iot_channel_lock", false) { deployed_to(state, &before) } else { Vec::new() };
+    let locked_before = locked_aps(state, &before);
     *find_wlan(state, id).ok_or("unknown SSID")? = w;
     // "aps": null means all APs; no "aps" leaves them as they are.
     if p.get("aps").is_some() {
@@ -1148,7 +1148,11 @@ fn edit_wlan(state: &mut Value, e: &WlanEdit, over: &[Over]) -> Result<(String, 
     // A group can go with a change of APs or of the mDNS rules.
     prune_groups(state);
     check_limits(over, state)?;
-    let channels = apply_channel_locks(state, &locked_aps_before, None);
+    // The lock moves only the APs it newly holds or lets go of.
+    let locked_after = locked_aps(state, wlan(state, id).ok_or("unknown SSID")?);
+    let added: Vec<inform::Mac> = locked_after.iter().filter(|m| !locked_before.contains(m)).copied().collect();
+    let released: Vec<inform::Mac> = locked_before.into_iter().filter(|m| !locked_after.contains(m)).collect();
+    let channels = apply_channel_locks(state, &added, &released);
 
     let after = wlan(state, id).ok_or("unknown SSID")?;
     let mut keys: Vec<&str> = after.as_object().map(|o| o.keys().map(String::as_str).collect()).unwrap_or_default();
@@ -1440,20 +1444,27 @@ pub(crate) fn channel_locked_macs(state: &Value) -> Vec<inform::Mac> {
     out
 }
 
-/// Keeps the 2.4 GHz channel of APs in line with the SSIDs' channel locks, as
-/// the official controller does when a lock changes: channel 6 on every AP an
-/// SSID with the lock is broadcast from, and back to auto on an AP in
-/// `released` (it had a locked SSID before the change) that has none left.
-/// With `only`, that AP alone: a newly adopted one (see `adopt_device`).
-/// Returns what changed, in words.
-pub(crate) fn apply_channel_locks(state: &mut Value, released: &[inform::Mac], only: Option<&inform::Mac>) -> Vec<String> {
+/// The APs an SSID's IoT channel lock holds: those it is broadcast from, when it has the lock.
+fn locked_aps(state: &Value, w: &Value) -> Vec<inform::Mac> {
+    if flag(w, "iot_channel_lock", false) { deployed_to(state, w) } else { Vec::new() }
+}
+
+/// Moves the 2.4 GHz channel of APs as a change of the SSIDs' channel locks
+/// asks, as the official controller does when a lock is switched on or off:
+/// channel 6 on an AP of `added` that a lock holds (it came under one: an SSID's
+/// lock went on, or the SSID went to more APs, or the AP was just adopted), and
+/// back to auto on an AP of `released` (a lock let go of it) that no lock holds
+/// any more. Other APs keep their channel: an AP that came under a lock on another
+/// channel stays there until a change of the lock takes it in. Returns what
+/// changed, in words.
+pub(crate) fn apply_channel_locks(state: &mut Value, added: &[inform::Mac], released: &[inform::Mac]) -> Vec<String> {
     let locked = channel_locked_macs(state);
     let mut out = Vec::new();
     for d in docs_mut(state, "devices") {
-        let Some(mac) = doc_mac(&d["mac"]).filter(|m| only.is_none_or(|o| o == m)) else { continue };
-        let target = if locked.contains(&mac) {
+        let Some(mac) = doc_mac(&d["mac"]) else { continue };
+        let target = if added.contains(&mac) && locked.contains(&mac) {
             json!("6")
-        } else if released.contains(&mac) {
+        } else if released.contains(&mac) && !locked.contains(&mac) {
             json!("auto")
         } else {
             continue;
@@ -1615,11 +1626,11 @@ pub fn delete_wlan(state: &mut Value, id: &str) -> Result<String, String> {
     if flag(w, "attr_no_delete", false) {
         return Err("this SSID cannot be deleted".into());
     }
-    let released = if flag(w, "iot_channel_lock", false) { deployed_to(state, w) } else { Vec::new() };
+    let released = locked_aps(state, w);
     let what = format!("deleted SSID \"{}\"", w["name"].as_str().unwrap_or("?"));
     remove_doc(state, "wlanconf", id);
     prune_groups(state);
-    let channels = apply_channel_locks(state, &released, None);
+    let channels = apply_channel_locks(state, &[], &released);
     Ok(with_notes(what, &channels))
 }
 
@@ -2098,6 +2109,25 @@ mod tests {
         // A new SSID with the lock reports its APs' moves too.
         let what = create_wlan(&mut s, &json!({ "name": "IoT", "passphrase": "password1", "iot_channel_lock": true })).unwrap();
         assert!(what.starts_with("added SSID \"IoT\"; ") && what.contains("Hall: 2.4 GHz channel 6"), "{what}");
+    }
+
+    #[test]
+    fn only_a_change_of_the_lock_moves_channels() {
+        let mut s = state();
+        edit(&mut s, json!({ "iot_channel_lock": true, "aps": [AP1] })).unwrap();
+        // An AP that came under the lock on another channel (it was imported so) stays there through other edits.
+        s["devices"][0]["radio_table"][0]["channel"] = json!(11);
+        let what = edit(&mut s, json!({ "name": "Home 2", "hide_ssid": true })).unwrap();
+        assert!(!what.contains("channel"), "{what}");
+        assert_eq!(s["devices"][0]["radio_table"][0]["channel"], 11);
+        // An AP the lock takes in moves; the one it held already does not.
+        let what = edit(&mut s, json!({ "aps": [AP1, AP2] })).unwrap();
+        assert!(what.contains("Attic: 2.4 GHz channel 6") && !what.contains("Hall"), "{what}");
+        assert_eq!(s["devices"][0]["radio_table"][0]["channel"], 11);
+        // An AP another SSID's lock still holds is not let go.
+        create_wlan(&mut s, &json!({ "name": "IoT", "passphrase": "password1", "iot_channel_lock": true, "aps": [AP2] })).unwrap();
+        edit(&mut s, json!({ "iot_channel_lock": false })).unwrap();
+        assert_eq!((s["devices"][0]["radio_table"][0]["channel"].as_str(), s["devices"][1]["radio_table"][0]["channel"].as_str()), (Some("auto"), Some("6")));
     }
 
     #[test]

@@ -340,7 +340,7 @@ pub fn fill_from_inform(d: &mut Value, payload: &Value) {
 /// SSID on channel 6. An AP's radios are known once its inform lists them
 /// (at once for one adopted from the UI, later for one adopted over SSH).
 pub fn join_channel_locks(state: &mut Value, mac: &Mac, what: String) -> String {
-    let channels = crate::settings::apply_channel_locks(state, &[], Some(mac));
+    let channels = crate::settings::apply_channel_locks(state, &[*mac], &[]);
     if channels.is_empty() { what } else { format!("{what}; {}", channels.join("; ")) }
 }
 
