@@ -19,6 +19,7 @@ use serde_json::{Value, json};
 use tokio::sync::broadcast;
 
 use crate::clock;
+use crate::connections::WEAK_SIGNAL;
 use crate::engine::{AliasEdit, ClientView, DeviceView, KnownDevice, Live, LiveMsg, SharedLive};
 use crate::model::{ClientSample, Ts};
 use crate::series::client_name;
@@ -370,9 +371,6 @@ pub async fn read<T: Send + 'static>(
     tokio::task::spawn_blocking(move || store.read(db, f)).await?.map_err(ApiError::from)
 }
 
-/// A connected client's signal below this (dBm) is weak: the UI's "fair" threshold.
-const WEAK_SIGNAL: i64 = -75;
-
 async fn status(State(s): State<AppState>) -> ApiResult {
     // Counted under the lock, serialised after it (the counters are atomics, read as they are then).
     let (counters, devices, devices_online, connected, weak, by_band) = {
@@ -404,6 +402,7 @@ async fn status(State(s): State<AppState>) -> ApiResult {
         "clients_connected": connected,
         "clients_by_band": by_band,
         "clients_weak": weak,
+        "weak_signal_dbm": WEAK_SIGNAL,
     })))
 }
 
@@ -1425,6 +1424,7 @@ mod tests {
         assert_eq!(get_json(&app, "/api/clients/names").await, json!({ "02:00:00:00:01:01": "phone" }));
         let status = get_json(&app, "/api/status").await;
         assert_eq!((&status["clients_connected"], &status["clients_by_band"], &status["clients_weak"]), (&json!(1), &json!({ "na": 1 }), &json!(0)));
+        assert_eq!(status["weak_signal_dbm"], -75, "the threshold the count uses, for its label");
     }
 
     #[tokio::test]

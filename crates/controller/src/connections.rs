@@ -159,8 +159,10 @@ fn failure(n: &ConnDetail) -> Option<(usize, &'static str)> {
     FAILURES.iter().rev().find(|f| (f.2)(n)).map(|f| (f.0, f.1))
 }
 
-/// Below this signal (dBm), a failure is not the network's fault: not counted.
-const WEAK_SIGNAL: f64 = -75.0;
+/// Below this signal (dBm), a client's signal is weak: a failure at it is not
+/// the network's fault, so not counted; also the overview's weak-signal count
+/// (GET /api/status), and the UI's "fair" threshold.
+pub const WEAK_SIGNAL: i64 = -75;
 
 /// The signal a report was made at.
 fn rssi(n: &ConnDetail) -> Option<f64> {
@@ -170,7 +172,7 @@ fn rssi(n: &ConnDetail) -> Option<f64> {
 /// The furthest failure an attempt that did not succeed is counted with:
 /// none if it shows none, or was made at a weak signal.
 fn counted_failure(n: &ConnDetail) -> Option<(usize, &'static str)> {
-    if rssi(n).is_some_and(|r| r < WEAK_SIGNAL) { None } else { failure(n) }
+    if rssi(n).is_some_and(|r| r < WEAK_SIGNAL as f64) { None } else { failure(n) }
 }
 
 /// A failure report as it comes in, by the connection views' rules: the
