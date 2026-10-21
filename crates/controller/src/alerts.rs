@@ -517,6 +517,10 @@ fn stored(r: &rusqlite::Row) -> rusqlite::Result<Option<Alert>> {
     }))
 }
 
+/// The severity of the "keeps dropping off" summary, the only `ap_offline`
+/// alert raised with it: [`load_open`] tells the two kinds apart by it.
+const FLAPPING: Severity = Severity::Medium;
+
 /// What a previous run left: the alerts still open, the highest number a
 /// stored alert's id carries (`{ts}-{number}`), and the AP offline alerts of
 /// the day before `now`, oldest first: (AP, when, whether it was a "keeps
@@ -525,10 +529,9 @@ async fn load_open(store: &Arc<Store>, now: Ts) -> anyhow::Result<(Vec<Alert>, u
     let store = store.clone();
     tokio::task::spawn_blocking(move || {
         store.read(Db::Config, |c| {
-            // "Keeps dropping off" is the only offline alert raised as medium.
-            let mut stmt = c.prepare("SELECT entity, ts, severity = 'medium' FROM alerts WHERE key = 'ap_offline' AND ts > ?1 ORDER BY ts")?;
+            let mut stmt = c.prepare("SELECT entity, ts, severity = ?2 FROM alerts WHERE key = 'ap_offline' AND ts > ?1 ORDER BY ts")?;
             let offline = stmt
-                .query_map([now - 86400], |r| Ok((r.get::<_, String>(0)?.parse().ok(), r.get(1)?, r.get(2)?)))?
+                .query_map(rusqlite::params![now - 86400, FLAPPING.as_str()], |r| Ok((r.get::<_, String>(0)?.parse().ok(), r.get(1)?, r.get(2)?)))?
                 .filter_map(|r| r.map(|(mac, ts, flapping)| Some((mac?, ts, flapping))).transpose())
                 .collect::<rusqlite::Result<Vec<_>>>()?;
             let sql = "SELECT COALESCE(MAX(CAST(substr(id, instr(id, '-') + 1) AS INTEGER)), 0) FROM alerts";
@@ -710,7 +713,7 @@ impl Watcher {
                 }
                 Some(ApChange::Flapping { times }) => {
                     let message = format!("Offline {times} times in the last day; further drops today are not reported separately.");
-                    self.book.open(now, status(Key::ApOffline, Severity::Medium, format!("{name} keeps dropping off"), message));
+                    self.book.open(now, status(Key::ApOffline, FLAPPING, format!("{name} keeps dropping off"), message));
                 }
                 Some(ApChange::Online { down_for, alerted }) => {
                     let note = format!("Back after {}.", human(down_for));
@@ -1091,7 +1094,7 @@ mod tests {
         // The third drop is summarised, as without the restart.
         let mut again = restart(3000).await;
         assert_eq!(again.aps.check(3000, ap, 2700), Some(ApChange::Flapping { times: 3 }));
-        again.book.raise(3000, offline(Severity::Medium).resolved(3100));
+        again.book.raise(3000, offline(FLAPPING).resolved(3100));
         flushed(&w.book.writer);
         // The fourth is not reported, even after another restart.
         assert_eq!(restart(4000).await.aps.check(4000, ap, 3700), None);
