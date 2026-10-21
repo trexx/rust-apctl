@@ -5,7 +5,7 @@
 //! GCM). For rehearsing a cutover against a local apctl; never point it at a
 //! production controller.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::io::{Read, Write};
 use std::net::{IpAddr, TcpStream};
 use std::ops::ControlFlow;
@@ -97,21 +97,48 @@ fn turns_on_gcm(mgmt: &str) -> bool {
     mgmt.lines().any(|l| l.trim_end() == "use_aes_gcm=true")
 }
 
-/// The first `limit` informs of a capture that decode, in capture order. The capture is
-/// read no further than the last of them.
-fn collect(input: impl Read + Send, ports: &[u16], keys: &KeyStore, limit: usize) -> Result<(Vec<Captured>, capture::End)> {
+/// The informs of a capture that did not decode (a key missing from `--keys`, or a
+/// wrong one), for the caller to report.
+#[derive(Default, Debug)]
+struct Undecoded {
+    count: usize,
+    /// The MACs their headers name.
+    macs: BTreeSet<Mac>,
+    first_error: Option<String>,
+}
+
+impl Undecoded {
+    /// What to tell the user, if any inform was skipped.
+    fn report(&self) -> Option<String> {
+        let first = self.first_error.as_deref()?;
+        let macs: Vec<String> = self.macs.iter().map(Mac::to_string).collect();
+        let macs = if macs.is_empty() { "unknown".to_string() } else { macs.join(", ") };
+        Some(format!("skipped {} informs that did not decode (MACs {macs}); first error: {first}", self.count))
+    }
+}
+
+/// The first `limit` informs of a capture that decode, in capture order, and those
+/// before the last of them that did not. The capture is read no further than that.
+fn collect(input: impl Read + Send, ports: &[u16], keys: &KeyStore, limit: usize) -> Result<(Vec<Captured>, capture::End, Undecoded)> {
     let mut informs = Vec::new();
+    let mut undecoded = Undecoded::default();
     let mut pairer = Pairer::default();
     let end = capture::run(input, ports, |ev| {
-        if let Some(InformEvent::Inform { decoded: Ok(d), .. }) = pairer.handle(keys, ev)
-            && informs.len() < limit
-        {
-            let key = captured_key(&d, keys);
-            informs.push((d.payload, key, sealing(d.header.flags)));
+        match pairer.handle(keys, ev) {
+            Some(InformEvent::Inform { decoded: Ok(d), .. }) if informs.len() < limit => {
+                let key = captured_key(&d, keys);
+                informs.push((d.payload, key, sealing(d.header.flags)));
+            }
+            Some(InformEvent::Inform { mac, decoded: Err(e), .. }) => {
+                undecoded.count += 1;
+                undecoded.macs.extend(mac);
+                undecoded.first_error.get_or_insert_with(|| format!("{e:#}"));
+            }
+            _ => {}
         }
         if informs.len() >= limit { ControlFlow::Break(()) } else { ControlFlow::Continue(()) }
     })?;
-    Ok((informs, end))
+    Ok((informs, end, undecoded))
 }
 
 pub fn run(pcap: &str, ports: &[u16], keys: &KeyStore, url: &str, limit: usize, every: Duration) -> Result<()> {
@@ -119,8 +146,15 @@ pub fn run(pcap: &str, ports: &[u16], keys: &KeyStore, url: &str, limit: usize, 
         bail!("refusing to simulate APs against {url}: only local controllers (http:// to 127.0.0.1, ::1 or localhost)");
     }
     // The informs are collected first; from a live pipe, the replay starts once there are enough.
-    let (informs, end) = collect(capture::open_input(pcap)?, ports, keys, limit)?;
+    let (informs, end, undecoded) = collect(capture::open_input(pcap)?, ports, keys, limit)?;
     crate::warn_if_truncated(end);
+    let skipped = undecoded.report();
+    if informs.is_empty() {
+        bail!("no inform to replay: {}", skipped.unwrap_or_else(|| format!("the capture holds none on ports {ports:?}")));
+    }
+    if let Some(skipped) = skipped {
+        eprintln!("{skipped}");
+    }
     eprintln!("replaying {} informs to {url}", informs.len());
 
     // What each simulated AP currently runs (it adopts pushed versions), and
@@ -226,12 +260,20 @@ mod tests {
             seq += request.len() as u32;
         }
         let keys = KeyStore::default();
-        let (informs, end) = collect(&pcap[..], &[8080], &keys, 2).unwrap();
+        let (informs, end, undecoded) = collect(&pcap[..], &[8080], &keys, 2).unwrap();
         assert_eq!((informs.iter().map(|(p, ..)| p["n"].as_i64().unwrap()).collect::<Vec<_>>(), end), (vec![0, 1], capture::End::Stopped));
-        let (informs, end) = collect(&pcap[..], &[8080], &keys, 10).unwrap();
+        assert_eq!(undecoded.report(), None);
+        // Then one from an AP whose key is not known.
+        let other: Mac = "02:00:00:00:00:02".parse().unwrap();
+        let packet = inform::seal(other, Flags::ENCRYPTED | Flags::GCM, [9; 16], &[7; 16], br#"{"n":3}"#);
+        let request = http("POST /inform HTTP/1.1\r\n", &packet);
+        write_pcap_record(&mut pcap, 3_000_000, &tcp_frame(ap, ctrl, seq, &request).unwrap()).unwrap();
+        let (informs, end, undecoded) = collect(&pcap[..], &[8080], &keys, 10).unwrap();
         assert_eq!((informs.len(), end), (3, capture::End::Complete));
         assert_eq!(informs[0].1, inform::DEFAULT_KEY);
         assert_eq!(informs[0].2, Flags::GCM, "sealed as captured");
+        assert_eq!((undecoded.count, undecoded.macs.iter().collect::<Vec<_>>()), (1, vec![&other]));
+        assert!(undecoded.report().unwrap().starts_with("skipped 1 informs that did not decode (MACs 02:00:00:00:00:02); first error: "), "{:?}", undecoded.report());
     }
 
     #[test]
