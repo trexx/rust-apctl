@@ -66,7 +66,7 @@ pub struct Backups {
 struct Known {
     settings: Option<Settings>,
     /// When the newest automatic backup was made (0: none), once the
-    /// directory has been read for it (`None`: not yet).
+    /// directory has been read for it (`None`: not yet), deleted since or not.
     last_auto: Option<Ts>,
 }
 
@@ -1187,14 +1187,11 @@ pub async fn delete(State(s): State<AppState>, UrlPath(name): UrlPath<String>) -
     let b = s.backups.clone();
     let found = valid_name(&name)
         && tokio::task::spawn_blocking(move || {
+            // The schedule still counts from it if it was the newest automatic one
+            // (`last_auto`): deleted, it is not made again before its next time.
             let found = b.dir().join(&name).exists();
             if found {
                 remove(&b, &name);
-                // It may have been the newest automatic one: found again when next needed.
-                // (Pruning keeps the newest, so it never needs this.)
-                if name.starts_with(Kind::Auto.prefix()) {
-                    b.known().last_auto = None;
-                }
             }
             found
         })
