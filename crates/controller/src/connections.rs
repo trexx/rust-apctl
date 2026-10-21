@@ -630,6 +630,9 @@ fn query_rows(c: &rusqlite::Connection, from: Ts, to: Ts, client: Option<&str>, 
 
 /// Only the reports [`attempts`] reads ([`ATTEMPT_TYPES`]).
 const ATTEMPTS_ONLY: &str = "AND event_type IN ('failure', 'soft failure', 'success', 'fixup')";
+/// The same without the successes, for the failed attempts only: a success
+/// neither merges with a fixup nor is merged into, so it cannot make one.
+const FAILURES_ONLY: &str = "AND event_type IN ('failure', 'soft failure', 'fixup')";
 
 /// The reports [`attempts`] reads in a window (optionally one client's),
 /// oldest first; or with `newest`, at most that many, newest first.
@@ -660,8 +663,9 @@ fn roam_rows(c: &rusqlite::Connection, from: Ts, to: Ts, client: Option<&str>) -
 /// rarely holds `limit` of them, and the reports in between need not be read.
 fn newest(c: &rusqlite::Connection, from: Ts, to: Ts, client: Option<&str>, limit: usize, failed: bool, with_roams: bool) -> rusqlite::Result<(Vec<Attempt>, Vec<Roam>)> {
     let mut batch = (limit * 4).max(2000);
+    let reports = if failed { FAILURES_ONLY } else { ATTEMPTS_ONLY };
     let list = loop {
-        let mut events = load_rows(c, from, to, client, Some(batch))?;
+        let mut events = query_rows(c, from, to, client, reports, Some(batch))?;
         let all = events.len() < batch;
         // The oldest time read may have more rows than were read.
         let oldest = events.last().map_or(from, |e| e.ts);
@@ -888,6 +892,8 @@ mod tests {
     fn the_report_conditions_name_the_report_types() {
         let names = |types: &[Report]| types.iter().map(|t| Report::NAMES.iter().find(|(r, _)| r == t).unwrap().1).collect::<Vec<_>>().join("', '");
         assert_eq!(ATTEMPTS_ONLY, format!("AND event_type IN ('{}')", names(&ATTEMPT_TYPES)));
+        let failures: Vec<Report> = ATTEMPT_TYPES.into_iter().filter(|t| *t != Report::Success).collect();
+        assert_eq!(FAILURES_ONLY, format!("AND event_type IN ('{}')", names(&failures)));
         assert!(NEAR_A_LEAVE.ends_with(&format!("l.event_type IN ('{}'))", names(&LEAVE_TYPES))), "{NEAR_A_LEAVE}");
         for (r, name) in Report::NAMES {
             assert_eq!(Report::parse(name), r);
