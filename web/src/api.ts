@@ -1123,6 +1123,13 @@ export const useClientNames = (): Names =>
 export const useClient = (mac: Mac) =>
   useQuery({ queryKey: keys.client(mac), queryFn: getting<ClientDetail>(`/api/clients/${mac}`) });
 
+/**
+ * When the live socket last reconnected or was told to resync: a list or live series cached before then
+ * is fetched whole, since what it missed was never announced (and a restored backup restarts the ids and
+ * no longer holds every sample cached).
+ */
+let liveResetAt = 0;
+
 /** `prev` with the samples of `add` (all newer) appended, and those before `from` dropped. */
 function appendSeries<F extends string>(prev: Series<F>, add: Series<F>, from: number): Series<F> {
   const keep = prev.ts.findIndex((t) => t >= from);
@@ -1134,7 +1141,8 @@ function appendSeries<F extends string>(prev: Series<F>, add: Series<F>, from: n
 
 /**
  * Time-series for one entity over a time span: only the columns `fields` names (the charts draw). A live chart of raw samples
- * (up to 6 hours) asks only for what is newer than its last sample.
+ * (up to 6 hours) asks only for what is newer than its last sample, unless it was cached before the live socket last reconnected
+ * or its last sample is later than the browser's now (a clock stepped back), when it is fetched whole.
  */
 export function useSeries<F extends string>(table: string, key: string, span: TimeSpan, fields: readonly F[]) {
   const qc = useQueryClient();
@@ -1145,9 +1153,10 @@ export function useSeries<F extends string>(table: string, key: string, span: Ti
     queryFn: async ({ signal }) => {
       const [from, to] = spanBounds(span);
       const url = (from: number) => `/api/series/${table}${qs({ key, fields: only, from, to })}`;
-      const prev = isFixed(span) ? undefined : qc.getQueryData<Series<F>>(queryKey);
+      const cached = isFixed(span) ? undefined : qc.getQueryState<Series<F>>(queryKey);
+      const prev = cached && cached.dataUpdatedAt > liveResetAt ? cached.data : undefined;
       const last = prev?.tier === "raw" ? prev.ts.at(-1) : undefined;
-      if (prev && last !== undefined && last >= from) {
+      if (prev && last !== undefined && last >= from && last <= to) {
         const add = await get<Series<F>>(url(last + 1), signal);
         if (add.tier === "raw") return appendSeries(prev, add, from);
       }
@@ -1162,12 +1171,6 @@ export function useSeries<F extends string>(table: string, key: string, span: Ti
 /** `limit`: how many of the newest to show, within the server's maximum (2000 events, 5000 log lines), or a refetch keeps more than a fresh fetch. */
 export type EventFilter = { device?: Mac; client?: Mac; kind?: string; limit: number };
 export type LogFilter = { device?: Mac; q?: string; limit: number };
-
-/**
- * When the live socket last reconnected or was told to resync: a list cached before then is
- * fetched whole, since what it missed was never announced (and a restored backup restarts the ids).
- */
-let liveResetAt = 0;
 
 /** `prev` with the rows of `add` (stored after them), newest first as the server sorts them, and only the `limit` newest. */
 function mergeNewest<T extends { id: number; ts: number }>(prev: T[], add: T[], limit: number): T[] {
