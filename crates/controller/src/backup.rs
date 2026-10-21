@@ -80,20 +80,16 @@ impl Backups {
     }
 
     /// The backup settings: the stored ones, read once (the defaults when
-    /// none are stored, or, with a warning, while they cannot be read).
+    /// none are stored). An error while they cannot be read: the schedule
+    /// then makes and prunes nothing rather than act on the defaults.
     /// The lock is never held while the database or the directory is read.
-    fn settings(&self, store: &store::Store) -> Settings {
+    fn settings(&self, store: &store::Store) -> Result<Settings> {
         if let Some(s) = &self.known().settings {
-            return s.clone();
+            return Ok(s.clone());
         }
-        match load_settings(store) {
-            // Settings saved meanwhile are newer than the ones read.
-            Ok(s) => self.known().settings.get_or_insert(s).clone(),
-            Err(e) => {
-                tracing::warn!("the backup settings could not be read, the defaults apply: {e:#}");
-                Settings::default()
-            }
-        }
+        // Settings saved meanwhile are newer than the ones read.
+        let s = load_settings(store)?;
+        Ok(self.known().settings.get_or_insert(s).clone())
     }
 
     /// When the newest automatic backup was made (0: none).
@@ -930,7 +926,9 @@ pub enum Frequency {
     Monthly,
 }
 
+/// A field missing from the stored settings (one added since) takes its default.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
 pub struct Settings {
     pub enabled: bool,
     pub frequency: Frequency,
@@ -1047,6 +1045,7 @@ pub fn schedule(b: Backups, store: Arc<store::Store>) {
         every.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         // After a failed automatic backup, the next try waits an hour.
         let mut retry_at: Ts = 0;
+        let mut unreadable = false;
         loop {
             every.tick().await;
             let (b2, st) = (b.clone(), store.clone());
@@ -1055,6 +1054,18 @@ pub fn schedule(b: Backups, store: Arc<store::Store>) {
                 (b2.settings(&st), b2.last_auto())
             });
             let Ok((s, last)) = checked.await else { continue };
+            // The defaults could re-enable a schedule turned off, and prune
+            // backups the stored `keep` keeps: no backup until they are read.
+            let s = match s {
+                Ok(s) => s,
+                Err(e) => {
+                    if !std::mem::replace(&mut unreadable, true) {
+                        tracing::warn!("the backup settings could not be read, no automatic backup is made until they can: {e:#}");
+                    }
+                    continue;
+                }
+            };
+            unreadable = false;
             if !s.enabled {
                 continue;
             }
@@ -1096,7 +1107,11 @@ pub async fn index(State(s): State<AppState>) -> Result<Json<Value>, ApiError> {
     let store = s.store.clone();
     let (settings, list, staged, failed) = tokio::task::spawn_blocking(move || {
         let staged = b.staging().join("pending").exists();
-        (b.settings(&store), list(&b), staged, fs::read_to_string(b.staging().join("pending.failed")).ok())
+        let settings = b.settings(&store).unwrap_or_else(|e| {
+            tracing::warn!("the backup settings could not be read, the defaults are shown: {e:#}");
+            Settings::default()
+        });
+        (settings, list(&b), staged, fs::read_to_string(b.staging().join("pending.failed")).ok())
     })
     .await?;
     let next = settings.enabled.then(|| settings.next_due(clock::now_ts()));
@@ -2071,5 +2086,22 @@ mod tests {
         assert_eq!(serde_json::to_value(&monthly).unwrap()["frequency"], "monthly");
         assert_eq!(serde_json::to_value(Kind::PreRestore).unwrap(), "pre-restore");
         assert_eq!(serde_json::from_str::<Kind>("\"auto\"").unwrap(), Kind::Auto);
+    }
+
+    #[test]
+    fn unreadable_settings_are_an_error_not_the_defaults() {
+        let d = dir("settings");
+        let (store, writer) = store::Store::open(&d).unwrap();
+        let b = Backups::new(d.to_path_buf(), None);
+        let put = |json: &str| {
+            writer.exec(Db::Config, "INSERT OR REPLACE INTO backup_settings (id, json) VALUES (1, ?1)", vec![rusqlite::types::Value::Text(json.into())]);
+            crate::model::tests::flushed(&writer);
+        };
+        // Stored before a field was added: the new field takes its default.
+        put(r#"{"enabled":false,"frequency":"weekly","minute_utc":60,"weekday":2,"monthday":1,"keep":100}"#);
+        assert_eq!(load_settings(&store).unwrap(), Settings { enabled: false, frequency: Frequency::Weekly, minute_utc: 60, weekday: 2, keep: 100, ..Settings::default() });
+        // Not readable at all: no defaults for the schedule to act on.
+        put("not json");
+        assert!(b.settings(&store).is_err());
     }
 }
