@@ -302,9 +302,20 @@ fn set_ssh_password(doc: &mut Value, pw: &str) -> Result<(), String> {
 /// (`ssh-ed25519 AAAA... comment`) is split up. A key without a name of its
 /// own keeps the one it has in `stored` (the editor sends OpenSSH lines,
 /// which have no place for it), else is named after its comment or type.
+/// A comment or name given is refused with control characters (the AP config
+/// carries the comment, else the name, and can't hold them) or over 255 characters.
 fn ssh_keys(v: &Value, stored: &Value) -> Result<Vec<Value>, String> {
     // The official controller takes RSA and Ed25519 keys only.
     const TYPES: &[&str] = &["ssh-ed25519", "ssh-rsa"];
+    let text = |what: &str, t: &str| {
+        if t.contains(char::is_control) {
+            Err(format!("an SSH key's {what} must not hold control characters (tabs, line breaks)"))
+        } else if t.chars().count() > 255 {
+            Err(format!("an SSH key's {what} can be at most 255 characters"))
+        } else {
+            Ok(())
+        }
+    };
     let mut out = Vec::new();
     for k in v.as_array().ok_or("x_ssh_keys must be a list")? {
         let (kind, key, comment) = match k {
@@ -316,6 +327,10 @@ fn ssh_keys(v: &Value, stored: &Value) -> Result<Vec<Value>, String> {
         };
         if !TYPES.contains(&kind.as_str()) || key.len() < 32 || !key.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '/' | '=')) {
             return Err(format!("not an SSH public key: {}", if key.is_empty() { kind } else { format!("{kind} {}…", key.chars().take(12).collect::<String>()) }));
+        }
+        text("comment", &comment)?;
+        if let Some(n) = k["name"].as_str() {
+            text("name", n)?;
         }
         let kept = || stored.as_array().into_iter().flatten().find(|s| s["key"].as_str() == Some(key.as_str()))?["name"].as_str().filter(|n| !n.is_empty());
         let name = k["name"].as_str().filter(|n| !n.is_empty()).or_else(kept).map(str::to_string).unwrap_or_else(|| if comment.is_empty() { kind.clone() } else { comment.clone() });
@@ -416,6 +431,12 @@ mod tests {
         let key = "A".repeat(68);
         edit(&mut s, json!({ "mgmt": { "x_ssh_keys": [format!("ssh-ed25519 {key} me@laptop"), { "type": "ssh-ed25519", "key": key, "name": "again" }] } })).unwrap();
         assert_eq!(setting(&s, "mgmt")["x_ssh_keys"].as_array().unwrap().len(), 1);
+        // A comment or name the AP config could not carry as it is: refused.
+        let obj = |field: &str, v: String| json!({ "mgmt": { "x_ssh_keys": [{ "type": "ssh-ed25519", "key": key, field: v }] } });
+        for (field, v) in [("comment", "laptop\tme".to_string()), ("name", "bell\u{7}".into()), ("comment", "x".repeat(256))] {
+            assert!(edit(&mut s, obj(field, v)).unwrap_err().contains(&format!("SSH key's {field}")), "{field}");
+        }
+        assert!(edit(&mut s, json!({ "mgmt": { "x_ssh_keys": [format!("ssh-ed25519 {key} me\u{7}")] } })).unwrap_err().contains("control characters"));
     }
 
     #[test]
