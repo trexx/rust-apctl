@@ -198,13 +198,19 @@ fn shell_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', r"'\''"))
 }
 
-/// The host key apctl kept for an AP it knows at this address (its record's
-/// IP, or the address it informs from), and that AP.
+/// The host key apctl kept for an AP it knows at this address, and that AP:
+/// the AP informing from it, else one whose record has this IP (written at
+/// adoption, never refreshed) unless it informs from another address now.
 fn known_host_key(live: &crate::engine::Live, ip: &str) -> Option<(Mac, String)> {
     let state = live.state.as_deref()?;
     let fingerprint = |mac: &Mac| crate::adopt::device_doc(state, mac).and_then(|d| d["x_ssh_hostkey_fingerprint"].as_str()).map(str::to_string);
+    // The AP there now is the one to check against: its key, or none kept.
+    if let Some(mac) = live.by_ip.get(ip) {
+        return Some((*mac, fingerprint(mac)?));
+    }
+    let moved = |mac: &Mac| live.by_ip.values().any(|m| m == mac);
     let by_record = state["devices"].as_array()?.iter().filter(|d| d["ip"].as_str() == Some(ip)).filter_map(|d| crate::settings::doc_mac(&d["mac"]));
-    live.by_ip.get(ip).copied().into_iter().chain(by_record).find_map(|mac| Some((mac, fingerprint(&mac)?)))
+    by_record.filter(|mac| !moved(mac)).find_map(|mac| Some((mac, fingerprint(&mac)?)))
 }
 
 /// A MAC as the AP prints it (`/sys/class/net/eth0/address`, `board.hwaddr`):
@@ -505,6 +511,12 @@ mod tests {
         // An AP that informs from another address than its record says.
         live.by_ip.insert("192.0.2.7".into(), ap);
         assert_eq!(known_host_key(&live, "192.0.2.7"), Some((ap, "SHA256:abc".into())));
+        // Its record's address is no longer its own (DHCP moved it): another AP there is not checked against its key.
+        assert_eq!(known_host_key(&live, "192.0.2.5"), None);
+        // Nor when the AP informing from an address has no key kept, whatever a stale record says.
+        live.by_ip.clear();
+        live.by_ip.insert("192.0.2.5".into(), "02:00:00:00:00:02".parse().unwrap());
+        assert_eq!(known_host_key(&live, "192.0.2.5"), None);
     }
 
     #[test]
