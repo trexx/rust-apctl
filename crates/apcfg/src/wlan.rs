@@ -81,6 +81,40 @@ impl std::fmt::Display for Band<'_> {
     }
 }
 
+/// A WLAN's `security`. A value the official controller does not know counts as open,
+/// as it does there.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Security {
+    Open,
+    Wep,
+    /// WPA personal (`wpapsk`), WPA3 SAE included.
+    Psk,
+    /// Authenticated by RADIUS: WPA enterprise (`wpaeap`), or OSEN (`osen`, Hotspot 2.0).
+    Eap { osen: bool },
+}
+
+impl Security {
+    pub fn of(w: &Value) -> Security {
+        match str_of(w, "security") {
+            Some("wep") => Security::Wep,
+            Some("wpapsk") => Security::Psk,
+            Some("wpaeap") => Security::Eap { osen: false },
+            Some("osen") => Security::Eap { osen: true },
+            _ => Security::Open,
+        }
+    }
+
+    /// WPA enterprise or OSEN: the official controller's test for RADIUS servers and
+    /// dynamic VLANs.
+    pub fn is_eap(self) -> bool {
+        matches!(self, Security::Eap { .. })
+    }
+
+    pub fn is_osen(self) -> bool {
+        self == Security::Eap { osen: true }
+    }
+}
+
 pub struct Radio<'a> {
     /// 1-based position in the name-sorted radio table (`radio.R`).
     pub idx: usize,
@@ -98,6 +132,8 @@ pub struct Vap<'a> {
     /// The WLAN document after per-radio adjustments (e.g. WPA3 turned off); a copy
     /// only when something was adjusted.
     pub w: Cow<'a, Value>,
+    /// The WLAN's security (no adjustment changes it).
+    pub security: Security,
     /// Index into the radio list.
     pub radio: usize,
     pub slot: WifiSlot,
@@ -167,18 +203,18 @@ fn adapt<'a>(ctx: &Ctx, wlan: &'a Value, radio: &Radio) -> Option<Cow<'a, Value>
     let mut w = Cow::Borrowed(wlan);
     let caps2 = int_of(radio.doc, "radio_caps2").unwrap_or(0) as u64;
     let rcap = |b| bit(caps2, b);
-    let security = str_of(wlan, "security").unwrap_or("open");
+    let security = Security::of(wlan);
     let wpa3 = flag(wlan, "wpa3_support", false);
     let transition = flag(wlan, "wpa3_transition", false);
     let ppsk = flag(wlan, "private_preshared_keys_enabled", false) || str_of(wlan, "attr_hidden_id") == Some("UidIot");
     if ppsk && !ctx.caps.has(Cap::Ppsk) {
         return None;
     }
-    if (flag(wlan, "hotspot2conf_enabled", false) || security == "osen") && !ctx.caps.has(Cap::Hotspot2) {
+    if (flag(wlan, "hotspot2conf_enabled", false) || security.is_osen()) && !ctx.caps.has(Cap::Hotspot2) {
         return None;
     }
     match security {
-        "wpapsk" if wpa3 => {
+        Security::Psk if wpa3 => {
             if !rcap(RCAP2_SAE) {
                 if !transition {
                     return None;
@@ -199,7 +235,7 @@ fn adapt<'a>(ctx: &Ctx, wlan: &'a Value, radio: &Radio) -> Option<Cow<'a, Value>
                 set(&mut w, "wpa_mode", "wpa2");
             }
         }
-        "wpaeap" | "osen" => {
+        Security::Eap { .. } => {
             if flag(wlan, "wpa3_enhanced_192", false) {
                 if !rcap(RCAP2_WPA3_192) {
                     return None;
@@ -211,7 +247,7 @@ fn adapt<'a>(ctx: &Ctx, wlan: &'a Value, radio: &Radio) -> Option<Cow<'a, Value>
                 set(&mut w, "wpa_mode", "wpa2");
             }
         }
-        "open" if wpa3 => {
+        Security::Open if wpa3 => {
             if !rcap(RCAP2_OWE) {
                 if !transition {
                     return None;
@@ -221,8 +257,8 @@ fn adapt<'a>(ctx: &Ctx, wlan: &'a Value, radio: &Radio) -> Option<Cow<'a, Value>
             }
             set(&mut w, "fast_roaming_enabled", false);
         }
-        "wpapsk" => {}
-        _ => set(&mut w, "fast_roaming_enabled", false),
+        Security::Psk => {}
+        Security::Open | Security::Wep => set(&mut w, "fast_roaming_enabled", false),
     }
     Some(w)
 }
@@ -484,7 +520,7 @@ pub fn render_vap(c: &mut Cfg, ctx: &Ctx, radios: &[Radio], vaps: &[Vap], v: &Va
     let r = &radios[v.radio];
     let n = v.slot.section;
     let a = Prefix::new("aaa", n as usize);
-    let security = str_of(w, "security").unwrap_or("open");
+    let security = v.security;
     let is_6e = r.band == Band::Six;
     let wpa3 = b(w, "wpa3_support");
     let transition = b(w, "wpa3_transition");
@@ -520,18 +556,18 @@ pub fn render_vap(c: &mut Cfg, ctx: &Ctx, radios: &[Radio], vaps: &[Vap], v: &Va
         c.set(a.at("ssid"), ssid);
         c.set(a.at("status"), on_off(up));
     };
-    let eap = matches!(security, "wpaeap" | "osen");
-    if security == "open" || security == "wep" {
+    let eap = security.is_eap();
+    if matches!(security, Security::Open | Security::Wep) {
         head(c, ctx.caps.has(Cap::HostapdVaps) && !r.disabled);
         c.set(a.at("id"), id);
         c.set(a.at("verbose"), 2);
         common_tail(c);
-        if security == "open" && wpa3 && !transition {
+        if security == Security::Open && wpa3 && !transition {
             // OWE transition pairs (an open VAP plus a hidden OWE companion) are not
             // implemented; a transition WLAN is deployed as its open half only.
             c.set(a.at("wpa.key.1.mgmt"), "OWE");
         }
-        if security == "wep" {
+        if security == Security::Wep {
             wep(c, a, w);
         }
     } else {
@@ -559,7 +595,7 @@ pub fn render_vap(c: &mut Cfg, ctx: &Ctx, radios: &[Radio], vaps: &[Vap], v: &Va
             if b(w, "wpa3_enhanced_192") {
                 c.set(a.at("wpa3.enhanced_192"), "enabled");
             }
-            c.set(a.at("wpa.key.1.mgmt"), if security == "osen" { "OSEN" } else { "WPA-EAP" });
+            c.set(a.at("wpa.key.1.mgmt"), if security.is_osen() { "OSEN" } else { "WPA-EAP" });
             c.set(a.at("wpa.psk"), passphrase);
             c.set(a.at("auth_cache"), on_off(flag(w, "auth_cache", true)));
             radius_servers(c, ctx, w, a);
@@ -704,7 +740,7 @@ fn render_wireless(c: &mut Cfg, ctx: &Ctx, radios: &[Radio], vaps: &[Vap], v: &V
     let w: &Value = &v.w;
     let n = v.slot.section;
     let k = Prefix::new("wireless", n as usize);
-    let security = str_of(w, "security").unwrap_or("open");
+    let security = v.security;
     let is_guest = b(w, "is_guest");
     let rate = min_rate(w, r.band);
     let caps = ctx.caps;
@@ -713,10 +749,10 @@ fn render_wireless(c: &mut Cfg, ctx: &Ctx, radios: &[Radio], vaps: &[Vap], v: &V
     c.set(k.at("devname"), v.dev());
     c.opt(k.at("id"), text_of(w, "short_id"));
     c.set(k.at("status"), on_off(!r.disabled));
-    c.set(k.at("authmode"), if security == "open" { 0 } else { 1 });
+    c.set(k.at("authmode"), if security == Security::Open { 0 } else { 1 });
     c.set(k.at("l2_isolation"), on_off(bool_of(w, "l2_isolation").unwrap_or(is_guest)));
     c.set(k.at("is_guest"), is_guest);
-    if security == "wep" {
+    if security == Security::Wep {
         wep(c, k, w);
     } else {
         c.set(k.at("security"), "none");

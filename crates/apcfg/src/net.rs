@@ -11,7 +11,7 @@ use crate::{Cap, Ctx};
 use crate::cfg::{Cfg, Prefix};
 use crate::json::{flag, int_of, oid, str_of};
 use crate::meta::Meta;
-use crate::wlan::{Radio, Vap, dynamic_vlan, network_vlan, vlan_id};
+use crate::wlan::{Radio, Security, Vap, dynamic_vlan, network_vlan, vlan_id};
 
 pub struct Bridge<'a> {
     /// `None` for the untagged (management) bridge.
@@ -47,9 +47,11 @@ impl fmt::Display for BridgeName {
     }
 }
 
-/// The VLAN a WLAN's clients are tagged with, if any.
+/// The VLAN a WLAN's clients are tagged with, if any: none when a RADIUS server
+/// assigns them one (dynamic VLAN on a WPA enterprise or OSEN WLAN, as the official
+/// controller decides).
 pub fn wlan_vlan(ctx: &Ctx, w: &Value) -> Option<u16> {
-    if matches!(str_of(w, "security"), Some("wpaeap")) && dynamic_vlan(ctx, w) != 0 {
+    if Security::of(w).is_eap() && dynamic_vlan(ctx, w) != 0 {
         return None;
     }
     if let Some(vlan) = network_vlan(ctx, str_of(w, "networkconf_id")) {
@@ -218,12 +220,16 @@ mod tests {
     use serde_json::json;
 
     /// The trunk VLANs and each VAP's bridge for these WLANs, which can name the
-    /// networks `n<i>`, tagged with the `vlan` values given.
+    /// networks `n<i>`, tagged with the `vlan` values given, and the RADIUS profile
+    /// `dynamic`, which assigns VLANs.
     fn trunk(network_vlans: &[Value], wlans: &[Value]) -> (Vec<u16>, Vec<String>) {
         let mac = "02:00:00:00:00:01";
         let networks: Vec<Value> =
             network_vlans.iter().enumerate().map(|(i, v)| json!({ "_id": format!("n{i}"), "site_id": "s", "vlan_enabled": true, "vlan": v })).collect();
-        let state = json!({ "sites": [{ "_id": "s" }], "devices": [{ "mac": mac, "site_id": "s", "type": "uap" }], "networkconf": networks });
+        let state = json!({
+            "sites": [{ "_id": "s" }], "devices": [{ "mac": mac, "site_id": "s", "type": "uap" }], "networkconf": networks,
+            "radiusprofile": [{ "_id": "dynamic", "site_id": "s", "vlan_wlan_mode": "required" }],
+        });
         let controller = Controller::default();
         let ctx = Ctx::new(&Input { state: &state, device_mac: mac, inform: None, cfgversion: "1", controller: &controller }).unwrap();
         let doc = json!({ "name": "wifi0", "radio": "ng" });
@@ -234,6 +240,7 @@ mod tests {
             .map(|(i, w)| Vap {
                 id: crate::wlan::wlan_id(w),
                 w: Cow::Borrowed(w),
+                security: Security::of(w),
                 radio: 0,
                 slot: WifiSlot { section: i as u32 + 1, device_name: format!("ath{i}"), on_radio: i as u32, first_on_radio: i == 0 },
                 vlan: wlan_vlan(&ctx, w),
@@ -253,5 +260,14 @@ mod tests {
         // The same for a WLAN's own VLAN.
         let wlans: Vec<Value> = [0, 1, 4095, 30].iter().map(|v| json!({ "vlan_enabled": true, "vlan": v })).collect();
         assert_eq!(trunk(&[], &wlans), (vec![30], ["br0", "br0", "br0", "br0.30"].map(String::from).to_vec()));
+    }
+
+    /// Clients of a WPA enterprise or OSEN WLAN whose RADIUS server assigns VLANs stay
+    /// on the untagged bridge; other WLANs keep their network's VLAN.
+    #[test]
+    fn dynamic_vlans_untag_enterprise_and_osen_wlans() {
+        let wlan = |security: &str, profile: Option<&str>| json!({ "security": security, "networkconf_id": "n0", "radiusprofile_id": profile });
+        let wlans = [wlan("wpaeap", Some("dynamic")), wlan("osen", Some("dynamic")), wlan("wpapsk", Some("dynamic")), wlan("wpaeap", None), wlan("osen", Some("gone"))];
+        assert_eq!(trunk(&[json!(10)], &wlans).1, ["br0", "br0", "br0.10", "br0.10", "br0.10"]);
     }
 }

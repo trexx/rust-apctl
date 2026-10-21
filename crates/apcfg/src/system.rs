@@ -28,7 +28,7 @@ pub fn render(ctx: &Ctx) -> Result<(String, Value)> {
         .zip(slots)
         .map(|((id, w, radio), slot)| {
             let vlan = net::wlan_vlan(ctx, &w);
-            Vap { id, w, radio, slot, vlan }
+            Vap { id, security: wlan::Security::of(&w), w, radio, slot, vlan }
         })
         .collect();
     let net = net::build(ctx, &radios, &vaps)?;
