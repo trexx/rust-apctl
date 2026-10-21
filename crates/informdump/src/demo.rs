@@ -222,7 +222,7 @@ impl ApIds {
 /// A syslog datagram as the AP sends it, under a random nonce.
 fn seal_syslog(ids: &ApIds, text: &str) -> Vec<u8> {
     let nonce: [u8; 12] = crate::random_iv()[..12].try_into().expect("12 bytes");
-    wire::synth::seal_syslog(ids.hash_id, &ids.syslog_key, nonce, text)
+    wire::syslog_frame::seal(ids.hash_id, &ids.syslog_key, nonce, text)
 }
 
 fn ip(v: [u8; 4]) -> String {
@@ -857,7 +857,7 @@ mod tests {
 
     #[test]
     fn capture_decodes_with_the_state_keys() {
-        use aes_gcm::aead::{Aead, KeyInit, Payload};
+        use aes_gcm::aead::KeyInit;
         let keys = wire::keys::KeyStore::from_value(&state().unwrap());
         let syslog_keys: std::collections::HashMap<Mac, [u8; 32]> = keys.syslog_keys().map(|(m, k)| (*m, *k)).collect();
         let mut buf = Vec::new();
@@ -872,8 +872,7 @@ mod tests {
                 // Opened with the key the settings hold for the AP that sent it.
                 let ap = APS.iter().find(|a| src.ip().to_string() == ip(a.ip)).expect("from an AP");
                 let key = syslog_keys[&Mac(mac_bytes(ap.mac))];
-                let (header, sealed) = payload.split_at(wire::synth::SYSLOG_HEADER);
-                let plain = aes_gcm::Aes256Gcm::new(&key.into()).decrypt(&aes_gcm::Nonce::try_from(&header[17..29]).unwrap(), Payload { msg: sealed, aad: header }).expect("decrypts");
+                let plain = wire::syslog_frame::open(&aes_gcm::Aes256Gcm::new(&key.into()), payload).expect("decrypts");
                 let text = String::from_utf8(plain).unwrap();
                 assert!(text.starts_with(&format!("<14>{} {} ", chrono_like(ts / 1_000_000), ap.name.replace(' ', "-"))), "{text}");
                 syslog += 1;

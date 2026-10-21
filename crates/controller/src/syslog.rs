@@ -18,8 +18,8 @@
 use std::borrow::Cow;
 use std::sync::{Arc, Weak};
 
-use aes_gcm::aead::{Aead, KeyInit, Payload};
-use aes_gcm::{Aes256Gcm, Nonce};
+use aes_gcm::Aes256Gcm;
+use aes_gcm::aead::KeyInit;
 use anyhow::{Result, anyhow, bail};
 use inform::Mac;
 use serde_json::Value;
@@ -29,7 +29,7 @@ use wire::keys::KeyStore;
 use crate::engine::LogLine;
 use crate::model::Ts;
 
-pub const MAGIC: [u8; 4] = wire::synth::SYSLOG_MAGIC;
+pub const MAGIC: [u8; 4] = wire::syslog_frame::MAGIC;
 
 /// A key name and its separator: `key=`, `key: `, and JSON's `"key": `. An
 /// ASCII word boundary: a Unicode one would keep the regex off its fast path
@@ -121,14 +121,12 @@ fn value(s: &str) -> (usize, Option<char>) {
     (s.find(|c: char| c.is_whitespace() || matches!(c, ',' | ';' | '}')).unwrap_or(s.len()), None)
 }
 
-const HEADER: usize = wire::synth::SYSLOG_HEADER;
-
 /// The sender's `hash_id` of an encrypted datagram, as a number (shown as 16
 /// hex characters, as the AP's informs carry it: see [`parse_hash_id`]). Only
 /// of one long enough to decrypt: a shorter one names no sender, so a made-up
 /// one cannot have an AP's syslog taken for an unknown sender's.
 pub fn hash_id(datagram: &[u8]) -> Option<u64> {
-    (datagram.starts_with(&MAGIC) && datagram.len() >= HEADER + 16).then(|| u64::from_be_bytes(datagram[9..17].try_into().expect("8 bytes")))
+    wire::syslog_frame::hash_id(datagram).map(u64::from_be_bytes)
 }
 
 /// A `hash_id` as an AP's informs carry it, as [`hash_id`] reads it from the
@@ -141,12 +139,10 @@ pub fn parse_hash_id(hex: &str) -> Option<u64> {
 
 /// Decrypts an encrypted datagram with `mac`'s cipher (see [`Ciphers`]).
 pub fn decrypt_with(datagram: &[u8], mac: Mac, cipher: &Aes256Gcm) -> Result<String> {
-    if !datagram.starts_with(&MAGIC) || datagram.len() < HEADER + 16 {
+    if !wire::syslog_frame::is_sealed(datagram) {
         bail!("not an encrypted syslog datagram ({} bytes)", datagram.len());
     }
-    let plain = cipher
-        .decrypt(&Nonce::try_from(&datagram[17..29]).expect("12 bytes"), Payload { msg: &datagram[HEADER..], aad: &datagram[..HEADER] })
-        .map_err(|_| anyhow!("syslog decryption failed for {mac}"))?;
+    let plain = wire::syslog_frame::open(cipher, datagram).ok_or_else(|| anyhow!("syslog decryption failed for {mac}"))?;
     // Valid UTF-8 (the usual case) is taken as it is, not copied.
     Ok(String::from_utf8(plain).unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned()))
 }
@@ -249,7 +245,7 @@ pub(crate) mod tests {
     use super::*;
 
     pub(crate) fn seal(hash_id: [u8; 8], key: [u8; 32], text: &str) -> Vec<u8> {
-        wire::synth::seal_syslog(hash_id, &key, [9; 12], text)
+        wire::syslog_frame::seal(hash_id, &key, [9; 12], text)
     }
 
     #[test]
@@ -266,8 +262,9 @@ pub(crate) mod tests {
         assert!(decrypt_with(b"plain text", mac, &Aes256Gcm::new(&key.into())).is_err());
         assert_eq!(hash_id(b"plain text"), None);
         // Too short to decrypt (a header and less than a tag): no sender.
-        assert_eq!(hash_id(&dgram[..HEADER + 15]), None);
-        assert!(hash_id(&dgram[..HEADER + 16]).is_some());
+        use wire::syslog_frame::{HEADER, TAG};
+        assert_eq!(hash_id(&dgram[..HEADER + TAG - 1]), None);
+        assert!(hash_id(&dgram[..HEADER + TAG]).is_some());
     }
 
     #[test]

@@ -8,6 +8,7 @@ pub mod decode;
 pub mod exchange;
 pub mod keys;
 pub mod synth;
+pub mod syslog_frame;
 
 use std::net::{IpAddr, SocketAddr};
 

@@ -1,5 +1,6 @@
-//! Writing captures: the legacy pcap framing, Ethernet frames, HTTP/1.1 messages and
-//! encrypted syslog datagrams, for informdump's made-up demo site and for tests.
+//! Writing captures: the legacy pcap framing, Ethernet frames and HTTP/1.1 messages,
+//! for informdump's made-up demo site and for tests (the syslog datagrams they carry
+//! are [`crate::syslog_frame`]'s).
 
 use std::io::{self, Write};
 
@@ -58,35 +59,4 @@ pub fn http(head: &str, body: &[u8]) -> Vec<u8> {
     let mut m = format!("{head}Content-Length: {}\r\n\r\n", body.len()).into_bytes();
     m.extend_from_slice(body);
     m
-}
-
-/// The first bytes of an encrypted syslog datagram.
-pub const SYSLOG_MAGIC: [u8; 4] = [0xab, 0xcd, 0xdc, 0xba];
-/// The length of an encrypted syslog datagram's header, which is also its AAD.
-pub const SYSLOG_HEADER: usize = 29;
-
-/// A syslog datagram as an AP with a `syslog_key` sends it: magic, 0x01, 1 (u32),
-/// the AP's hash_id, the nonce, then the text sealed with AES-256-GCM over that header.
-pub fn seal_syslog(hash_id: [u8; 8], key: &[u8; 32], nonce: [u8; 12], text: &str) -> Vec<u8> {
-    use aes_gcm::aead::{Aead, KeyInit, Payload};
-    let mut out = Vec::with_capacity(SYSLOG_HEADER + text.len() + 16);
-    out.extend_from_slice(&SYSLOG_MAGIC);
-    out.push(1);
-    out.extend_from_slice(&1u32.to_be_bytes());
-    out.extend_from_slice(&hash_id);
-    out.extend_from_slice(&nonce);
-    let sealed = aes_gcm::Aes256Gcm::new(key.into()).encrypt(&nonce.into(), Payload { msg: text.as_bytes(), aad: &out }).expect("AES-GCM sealing");
-    out.extend(sealed);
-    out
-}
-
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn a_syslog_datagram_starts_with_its_header() {
-        let d = super::seal_syslog([1; 8], &[2; 32], [3; 12], "hi");
-        assert_eq!(d[..17], [0xab, 0xcd, 0xdc, 0xba, 1, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1]);
-        assert_eq!(d[17..29], [3; 12]);
-        assert_eq!(d.len(), super::SYSLOG_HEADER + 2 + 16);
-    }
 }
