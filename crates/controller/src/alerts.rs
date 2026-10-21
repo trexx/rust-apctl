@@ -370,18 +370,16 @@ fn from_event(kind: EventKind, device: Option<Mac>, data: &Value, ap_name: &dyn 
                 Some(p) => format!("{p} crashed on {name}"),
                 None => format!("{name}: {}", data["kind"].as_str().unwrap_or("crash")),
             };
-            let first = data["lines"].as_array().and_then(|l| l.first()).and_then(Value::as_str).unwrap_or("See the event for details.");
-            on(Key::ApCrash, Changes, Severity::Medium, title, first.to_string()).tagged(format!("crash:{dev}"))
+            // The event's summary line (the fault, as the event shows it); a row stored before it had one is summed up the same way.
+            let lines: Vec<&str> = data["lines"].as_array().into_iter().flatten().filter_map(Value::as_str).collect();
+            let summary = data["summary"].as_str().or_else(|| crate::logevents::crash_summary(&lines)).unwrap_or("See the event for details.");
+            on(Key::ApCrash, Changes, Severity::Medium, title, summary.to_string()).tagged(format!("crash:{dev}"))
         }
         EventKind::ApProcessRestarted => {
             let title = format!("{} restarted on {name}", data["proc"].as_str().unwrap_or("A process"));
-            // The AP's notification as it came: a code it sends as text is
-            // still a code, and none at all is left out.
-            let code = match &data["exit_status"] {
-                Value::Number(n) => Some(n.to_string()),
-                Value::String(c) if c.trim().parse::<i64>().is_ok() => Some(c.trim().to_string()),
-                _ => None,
-            };
+            // Stored as a number (none when the AP sent none); a row stored
+            // before may hold the code as the AP sent it, as text.
+            let code = data["exit_status"].as_i64().or_else(|| data["exit_status"].as_str().and_then(|c| c.trim().parse::<i64>().ok()));
             let exited = code.map_or_else(|| "It exited".to_string(), |c| format!("It exited with code {c}"));
             let message = format!("{exited} and was restarted by {}.", data["caller"].as_str().unwrap_or("the system"));
             on(Key::ApProcessRestarted, Changes, Severity::Low, title, message).tagged(format!("proc:{dev}"))
@@ -981,7 +979,7 @@ mod tests {
         let u = from_event(EventKind::ApUpgraded, Some(aa), &json!({ "to": "8.8.12" }), &name).unwrap();
         assert_eq!((u.link.as_deref(), u.tag.as_str(), u.severity), (Some("/config?tab=firmware"), "upgrade:02:00:00:00:00:aa", Severity::Info));
         assert!(from_event(EventKind::ClientConnected, Some(aa), &json!({}), &name).is_none());
-        // A process restart's exit code, however the AP sent it.
+        // A process restart's exit code, stored as a number (as text in rows stored before).
         for (status, want) in [
             (json!(1), "It exited with code 1 and was restarted by procd."),
             (json!("139"), "It exited with code 139 and was restarted by procd."),
@@ -1001,6 +999,13 @@ mod tests {
         let panic = json!({ "kind": "kernel panic", "lines": ["Kernel panic"] });
         assert!(from_event(EventKind::ApCrash, None, &panic, &name).is_none());
         assert_eq!(from_event(EventKind::ApCrash, Some(aa), &panic, &name).unwrap().title, "Garage: kernel panic");
+        // A crash quotes its summary line; a row stored without one, its first fault line.
+        let crash = |data: Value| from_event(EventKind::ApCrash, Some(aa), &data, &name).unwrap().message;
+        let lines = json!(["[  1.0] booting", "[  9.2] Internal error: Oops: 17 [#1]", "[  9.3] PC is at x"]);
+        assert_eq!(crash(json!({ "kind": "oops", "lines": lines, "summary": "[  9.2] Internal error: Oops: 17 [#1]" })), "[  9.2] Internal error: Oops: 17 [#1]");
+        assert_eq!(crash(json!({ "kind": "oops", "lines": lines })), "[  9.2] Internal error: Oops: 17 [#1]");
+        assert_eq!(crash(json!({ "kind": "oops", "lines": ["just a line"] })), "just a line");
+        assert_eq!(crash(json!({ "kind": "oops" })), "See the event for details.");
         assert!(from_event(EventKind::NetworkThreat, None, &json!({ "severity": "high" }), &name).is_some());
     }
 
