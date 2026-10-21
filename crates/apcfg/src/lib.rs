@@ -30,10 +30,10 @@ mod net;
 mod system;
 pub mod tz;
 
-pub use json::{bool_of, flag, int_of, oid};
+pub use json::{as_int, bool_of, flag, int_of, oid, override_of};
 pub use net::ssid_vlan;
 pub use system::{MDNS_SERVICES, ssid_usergroup, usergroup_limits};
-pub use wlan::configured_width;
+pub use wlan::{capable_width, configured_width};
 mod wlan;
 
 use std::borrow::Cow;
@@ -43,6 +43,17 @@ use anyhow::{Context, Result, bail};
 use serde_json::Value;
 
 use crate::wlan::Band;
+
+/// The country (ISO 3166 numeric code) an AP is given when the site's `country`
+/// setting has none: the United States, as the official controller does.
+pub const DEFAULT_COUNTRY: i64 = 840;
+
+/// The SSH account the site's APs get (`users.1.name`, also the user cron jobs run as):
+/// the `mgmt` setting's `x_ssh_username`, else `ubnt`. A stored empty name is sent as
+/// it is, as the official controller does.
+pub fn ssh_username(mgmt: &Value) -> &str {
+    json::str_of(mgmt, "x_ssh_username").unwrap_or("ubnt")
+}
 
 /// Facts about the controller itself that the settings snapshot does not hold.
 #[derive(Clone)]
@@ -495,7 +506,7 @@ impl<'a> Ctx<'a> {
             mgmt: setting(state, site_id, "mgmt"),
             super_mgmt: setting(state, site_id, "super_mgmt"),
             radio_ai: setting(state, site_id, "radio_ai"),
-            country: json::text_of(setting(state, site_id, "country"), "code").map_or_else(|| "840".to_string(), |c| c.to_string()),
+            country: json::text_of(setting(state, site_id, "country"), "code").map_or_else(|| DEFAULT_COUNTRY.to_string(), |c| c.to_string()),
             gateway_macs: OnceCell::new(),
         })
     }
@@ -535,9 +546,9 @@ impl<'a> Ctx<'a> {
         network(self.state, self.site_id, id)
     }
 
-    /// SSH account name: also the user cron jobs run as.
+    /// The site's [`ssh_username`].
     pub fn ssh_username(&self) -> &'a str {
-        json::str_of(self.mgmt, "x_ssh_username").unwrap_or("ubnt")
+        ssh_username(self.mgmt)
     }
 
     pub fn inform_str(&self, key: &str) -> Option<&'a str> {

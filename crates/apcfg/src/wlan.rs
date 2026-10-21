@@ -324,9 +324,15 @@ fn width(ctx: &Ctx, r: &Radio) -> i64 {
         Band::Na => 160,
         _ => 320,
     };
-    let configured = configured(ctx.radio_ai, r.doc, r.band);
-    let f = |k| flag(r.doc, k, false);
-    let capable = if f("has_eht320") {
+    country_max.min(configured(ctx.radio_ai, r.doc, r.band)).min(capable_width(r.doc))
+}
+
+/// The widest channel (MHz) a radio can use, by its `radio_table` entry's capability
+/// flags: 320 (`has_eht320`), 240 (`has_eht240`), 160 (`has_ht160`), 80 (`is_11ac` or
+/// `is_11ax`), else 40. The render caps a radio's width by it.
+pub fn capable_width(radio: &Value) -> i64 {
+    let f = |k| flag(radio, k, false);
+    if f("has_eht320") {
         320
     } else if f("has_eht240") {
         240
@@ -336,8 +342,7 @@ fn width(ctx: &Ctx, r: &Radio) -> i64 {
         80
     } else {
         40
-    };
-    country_max.min(configured).min(capable)
+    }
 }
 
 /// `radio.R.*` for every radio. Returns whether any radio wrote a `stamgr.R` block.
