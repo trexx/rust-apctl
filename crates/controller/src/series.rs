@@ -283,34 +283,46 @@ fn load_query(spec: &Spec, tier: usize, from: Ts, to: Ts) -> anyhow::Result<(Str
     Ok((sql, params))
 }
 
-/// How long a view's read is reused, per tier (of the window, see [`window`]):
-/// the raw tier grows with each report, the roll-ups every five minutes.
-const MEMO_SECS: [u64; 3] = [15, 60, 300];
+/// The longest a view's read is reused (see `Tier::memo_secs`).
+const LONGEST_MEMO_SECS: u64 = TIERS[TIERS.len() - 1].memo_secs;
 
 /// A memoised read: its result and when it was read, once read. Whoever finds
 /// it empty reads it; the others asking meanwhile wait for that read.
 type Slot = std::sync::Arc<tokio::sync::OnceCell<(std::time::Instant, std::sync::Arc<dyn std::any::Any + Send + Sync>)>>;
 
+/// What a memoised read is found by: the view, the type of what it read (so
+/// that two views of the same name cannot be handed each other's), and the query.
+#[derive(PartialEq, Eq, Hash)]
+struct MemoKey {
+    view: &'static str,
+    read: std::any::TypeId,
+    range: Option<Ts>,
+    from: Option<Ts>,
+    to: Option<Ts>,
+    band: Option<String>,
+    mac: Option<inform::Mac>,
+}
+
 /// What the views last read, by view and query (when its slot was made, and
 /// the slot): several tabs, and each tab's refresh every minute, ask for the
 /// same windows again. Kept in `AppState`.
 #[derive(Default)]
-pub struct Memo(std::sync::Mutex<HashMap<String, (std::time::Instant, Slot)>>);
+pub struct Memo(std::sync::Mutex<HashMap<MemoKey, (std::time::Instant, Slot)>>);
 
 /// [`read`] from `db` for `view`, reusing what the same query read less than
-/// [`MEMO_SECS`] ago (the window then ends that much earlier). Queries made
-/// while the same query is being read wait for that read rather than read again.
+/// its tier's `memo_secs` ago (the window then ends that much earlier). Queries
+/// made while the same query is being read wait for that read rather than read again.
 pub(crate) async fn memo_read<T: Send + Sync + 'static>(
     s: &AppState,
     db: Db,
-    view: &str,
+    view: &'static str,
     q: &RangeQuery,
     tier: usize,
     f: impl FnOnce(&Connection) -> anyhow::Result<T> + Send + 'static,
 ) -> Result<std::sync::Arc<T>, ApiError> {
-    let RangeQuery { range, from, to, band, mac } = q;
-    let key = format!("{view}|{range:?}|{from:?}|{to:?}|{band:?}|{mac:?}");
-    let ttl = std::time::Duration::from_secs(MEMO_SECS[tier]);
+    let RangeQuery { range, from, to, ref band, mac } = *q;
+    let key = MemoKey { view, read: std::any::TypeId::of::<T>(), range, from, to, band: band.clone(), mac };
+    let ttl = std::time::Duration::from_secs(TIERS[tier].memo_secs);
     // The slot being read or read recently enough, else a new one.
     let slot = {
         let mut m = s.memo.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -319,7 +331,7 @@ pub(crate) async fn memo_read<T: Send + Sync + 'static>(
             _ => {
                 m.remove(&key);
                 // A slot left empty (its read failed or was given up) goes too, after a while.
-                m.retain(|_, (made, slot)| slot.get().map_or(*made, |(at, _)| *at).elapsed().as_secs() < MEMO_SECS[2]);
+                m.retain(|_, (made, slot)| slot.get().map_or(*made, |(at, _)| *at).elapsed().as_secs() < LONGEST_MEMO_SECS);
                 let slot = Slot::default();
                 // Bounded: odd queries (explicit windows) are not all kept.
                 if m.len() < 256 {

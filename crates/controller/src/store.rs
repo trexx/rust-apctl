@@ -227,13 +227,17 @@ pub struct Tier {
     pub step: i64,
     /// Retention seconds.
     pub keep: i64,
+    /// How long a view's read of a window on this tier is reused (seconds, see
+    /// `series::memo_read`): the raw tier grows with each report, the roll-ups
+    /// every five minutes.
+    pub memo_secs: u64,
 }
 
 /// The tiers, finest first; a tier is known by its index here.
 pub const TIERS: [Tier; 3] = [
-    Tier { suffix: "", name: "raw", step: 0, keep: 48 * 3600 },
-    Tier { suffix: "_5m", name: "5m", step: 300, keep: 30 * 86400 },
-    Tier { suffix: "_1h", name: "1h", step: 3600, keep: 365 * 86400 },
+    Tier { suffix: "", name: "raw", step: 0, keep: 48 * 3600, memo_secs: 15 },
+    Tier { suffix: "_5m", name: "5m", step: 300, keep: 30 * 86400, memo_secs: 60 },
+    Tier { suffix: "_1h", name: "1h", step: 3600, keep: 365 * 86400, memo_secs: 300 },
 ];
 
 const CONFIG_SCHEMA: &str = "
