@@ -655,10 +655,6 @@ fn new_id() -> String {
     random_hex::<12>()
 }
 
-pub(crate) fn is_mac(s: &str) -> bool {
-    s.parse::<inform::Mac>().is_ok()
-}
-
 fn bool_field(patch: &Value, key: &str) -> Result<Option<bool>, String> {
     match &patch[key] {
         Value::Null => Ok(None),
