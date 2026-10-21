@@ -766,7 +766,7 @@ async fn dryrun(State(s): State<AppState>) -> Result<Json<DryRunStatus>, ApiErro
             .devices
             .iter()
             .map(|(mac, d)| {
-                let seen = live.last_config.get(mac).filter(|c| !c.mgmt_cfg.is_empty() && !c.system_cfg.is_empty()).cloned();
+                let seen = live.last_config.get(mac).filter(|c| c.complete()).cloned();
                 (*mac, d.snapshot.ap.hostname.clone(), d.snapshot.ap.cfgversion.clone(), seen, live.raw_informs.get(mac).cloned())
             })
             .collect();

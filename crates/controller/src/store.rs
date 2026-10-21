@@ -619,10 +619,20 @@ fn apply(conn: &mut Connection, writes: Vec<Write>) -> Result<usize> {
 #[derive(Debug, Clone, Default)]
 pub struct PushedConfig {
     /// Empty when not known: no push with one was seen (one can be
-    /// management-only), or, in the live view after a restart, none since.
+    /// management-only), or, in the live view (`Live::last_config`), not known
+    /// in full in this run (only the stored copy, with its secrets masked, has
+    /// it): readers then go to the stored copy. See `complete`.
     pub mgmt_cfg: String,
     pub system_cfg: String,
     pub cfgversion: Option<String>,
+}
+
+impl PushedConfig {
+    /// Both configs are known: in the live view, the AP's whole config as
+    /// pushed, which can stand for it without the stored copy.
+    pub fn complete(&self) -> bool {
+        !self.mgmt_cfg.is_empty() && !self.system_cfg.is_empty()
+    }
 }
 
 const STORED_PUSH: &str = "SELECT mgmt_cfg, system_cfg, cfgversion, ts, mac FROM device_config";

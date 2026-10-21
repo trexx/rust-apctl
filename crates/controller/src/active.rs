@@ -531,7 +531,7 @@ impl Active {
     /// after a restart, the stored copy with its secrets masked.
     fn runs_already(&self, mac: Mac, reported: &str, out: &apcfg::Output) -> bool {
         // A field the push seen did not carry, after a restart, is only in the stored copy.
-        let seen = self.live.read().unwrap().last_config.get(&mac).filter(|p| !p.mgmt_cfg.is_empty() && !p.system_cfg.is_empty()).cloned();
+        let seen = self.live.read().unwrap().last_config.get(&mac).filter(|p| p.complete()).cloned();
         let stored;
         let (push, redacted) = match &seen {
             Some(p) => (&**p, false),
