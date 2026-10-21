@@ -231,15 +231,16 @@ fn board_value<'a>(text: &'a str, key: &str) -> Option<&'a str> {
 }
 
 /// The usernames and passwords to try: the ones given, else the site's device
-/// login, then the factory ones.
+/// login (its password, with the user the APs get: [`apcfg::ssh_username`]),
+/// then the factory ones.
 fn logins(state: Option<&Value>, given: Option<(String, String)>) -> Vec<(String, String)> {
     if let Some(g) = given {
         return vec![g];
     }
     let mut out: Vec<(String, String)> = Vec::new();
-    if let Some(m) = state.map(|st| crate::settings::setting(st, "mgmt"))
-        && let (Some(u), Some(p)) = (m["x_ssh_username"].as_str(), m["x_ssh_password"].as_str())
-    {
+    let site = state.map(|st| crate::settings::setting(st, "mgmt")).and_then(|m| Some((apcfg::ssh_username(m), m["x_ssh_password"].as_str()?)));
+    // A stored empty user name reaches the APs as it is, but no SSH login has it.
+    if let Some((u, p)) = site.filter(|(u, _)| !u.is_empty()) {
         out.push((u.to_string(), p.to_string()));
     }
     for (u, p) in [("ubnt", "ubnt"), ("ui", "ui")] {
@@ -425,6 +426,9 @@ mod tests {
         let state = json!({ "devices": [{ "site_id": "s1" }], "setting": [{ "key": "mgmt", "site_id": "s1", "x_ssh_username": "ui", "x_ssh_password": "ui" }] });
         let users: Vec<String> = logins(Some(&state), None).into_iter().map(|x| x.0).collect();
         assert_eq!(users, ["ui", "ubnt"]);
+        // A site with only a password set: the APs' user is ubnt, with that password.
+        let state = json!({ "devices": [{ "site_id": "s1" }], "setting": [{ "key": "mgmt", "site_id": "s1", "x_ssh_password": "pw" }] });
+        assert_eq!(logins(Some(&state), None)[..2], [("ubnt".to_string(), "pw".to_string()), ("ubnt".to_string(), "ubnt".to_string())]);
     }
 
     /// `try_logins` against an AP that accepts `password` and closes a
