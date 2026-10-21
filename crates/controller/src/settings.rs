@@ -1513,7 +1513,12 @@ pub fn create_wlan(state: &mut Value, patch: &Value) -> Result<String, String> {
     let over = over_limits(state);
     let site = site_id(state).ok_or("the settings have no APs")?.to_string();
     let all = default_group(state).ok_or("the settings have no default AP group")?;
-    let network = hidden_doc_id(state, "networkconf", "LAN").or_else(|| docs(state, "networkconf").next().and_then(id_of));
+    // The default network, when the patch names none (a named one is checked as an edit's is):
+    // the hidden LAN one, else the first that may carry an SSID.
+    let network = match str_field(patch, "networkconf_id")? {
+        Some(_) => None,
+        None => hidden_doc_id(state, "networkconf", "LAN").or_else(|| docs(state, "networkconf").find(|n| ssid_network(n).is_ok()).and_then(id_of)),
+    };
     let usergroup = ensure_default_usergroup(state);
     let short_id = docs(state, "wlanconf").filter_map(|w| w["short_id"].as_i64()).max().unwrap_or(0) + 1;
     let id = new_id();
@@ -1542,10 +1547,6 @@ pub fn create_wlan(state: &mut Value, patch: &Value) -> Result<String, String> {
         patch["protection"] = json!("wpa2");
     }
     let name = patch["name"].as_str().unwrap_or_default().trim().to_string();
-    // The network asked for is checked even when it is the one chosen by default.
-    if let Some(net) = str_field(&patch, "networkconf_id")?.and_then(|n| doc_by_id(state, "networkconf", n)) {
-        ssid_network(net)?;
-    }
     array_mut(state, "wlanconf").push(doc);
     let (_, channels) = edit_wlan(state, &WlanEdit { id, patch }, &over)?;
     Ok(with_notes(format!("added SSID \"{name}\""), &channels))
@@ -2152,6 +2153,11 @@ mod tests {
         assert!(create_wlan(&mut s.clone(), &json!({ "name": "Up", "passphrase": "password1", "networkconf_id": "wan" })).unwrap_err().contains("cannot carry"));
         edit(&mut s, json!({ "networkconf_id": "iot" })).unwrap();
         create_wlan(&mut s, &json!({ "name": "Things", "passphrase": "password1", "networkconf_id": "iot" })).unwrap();
+        // Without a hidden LAN network, a new SSID goes on the first network that may carry one.
+        let mut t = s.clone();
+        t["networkconf"].as_array_mut().unwrap().retain(|n| n["_id"] != "n1");
+        create_wlan(&mut t, &json!({ "name": "Default", "passphrase": "password1" })).unwrap();
+        assert_eq!(t["wlanconf"].as_array().unwrap().last().unwrap()["networkconf_id"], "iot");
         // One stored already (an import's) is left alone: the SSID's other fields can be edited, and the network sent back as it is.
         s["wlanconf"][0]["networkconf_id"] = json!("wan");
         edit(&mut s, json!({ "hide_ssid": true, "networkconf_id": "wan" })).unwrap();
