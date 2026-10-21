@@ -11,7 +11,7 @@ use axum::extract::State;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, LazyLock};
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use apcfg::{flag, oid};
@@ -397,17 +397,9 @@ const DEVICE_FIELDS: &[&str] = &[
     "green_ap_enabled", "resetbtn_enabled", "jumboframe_enabled", "config_network", "snmp_location", "snmp_contact",
 ];
 
-/// What the AP itself reports about a radio: power range, widths, channels.
-fn radio_caps(inform: Option<&Value>, band: &str) -> Value {
-    let Some(r) = inform.and_then(|p| inform_radio(p, band)) else { return Value::Null };
-    json!({
-        "min_txpower": r["min_txpower"], "max_txpower": r["max_txpower"], "has_ht160": r["has_ht160"], "has_dfs": r["has_dfs"],
-        "is_11ax": r["is_11ax"], "nss": r["nss"],
-    })
-}
-
-/// What the AP reports about a radio that an edit is checked against.
-#[derive(Clone, Copy, Debug, PartialEq)]
+/// What the AP reports about a radio that an edit is checked against; the
+/// editor shows it as the radio's `caps`.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize)]
 pub struct RadioCaps {
     /// The power range, dBm.
     pub min_txpower: i64,
@@ -449,6 +441,7 @@ pub async fn device(State(s): State<AppState>, MacPath(mac): MacPath) -> Result<
     };
     let state = state.ok_or_else(ApiError::no_state)?;
     let d = site_device(&state, &mac).map_err(ApiError::not_found)?;
+    let caps = RadioCaps::of_inform(inform.as_deref());
     let radios: Vec<Value> = d["radio_table"]
         .as_array()
         .into_iter()
@@ -456,7 +449,8 @@ pub async fn device(State(s): State<AppState>, MacPath(mac): MacPath) -> Result<
         .map(|r| {
             let mut v = Value::Object(pick(r, RADIO_FIELDS));
             let band = r["radio"].as_str().unwrap_or("");
-            v["caps"] = radio_caps(inform.as_deref(), band);
+            // What the edit is checked against: the defaults for a radio the AP does not report on.
+            v["caps"] = json!(caps.get(band).copied().unwrap_or_default());
             v["channels"] = channels(&state, band, false);
             v["channels_outdoor"] = channels(&state, band, true);
             // The "interference blocker" exists only on radios reporting this capability.
@@ -2455,7 +2449,7 @@ mod tests {
             apply_device(s, &DeviceEdit { mac: AP1.parse().unwrap(), patch, caps: caps.clone(), wireless_uplink: None, antennas: Value::Null })
         };
         let wifi7 = caps(json!({ "radio": "6e", "has_ht160": true, "has_eht320": true, "is_11ax": true }));
-        assert_eq!(wifi7["6e"].max_width, 320);
+        assert_eq!(json!(wifi7["6e"]), json!({ "min_txpower": 1, "max_txpower": 30, "max_width": 320 }), "the editor's caps, defaults filled in");
         width(&mut s, &wifi7, "6e", 320).unwrap();
         width(&mut s, &wifi7, "6e", 240).unwrap();
         assert_eq!(s["devices"][0]["radio_table"][2]["ht"], 240);
