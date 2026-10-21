@@ -581,4 +581,17 @@ mod tests {
         edit(&mut s, json!({ "ntp": { "setting_preference": "manual", "ntp_server_2": "time.example.net" } })).unwrap();
         assert_eq!(servers(&s), ["time.example.net", "", "", ""]);
     }
+
+    #[test]
+    fn every_time_zone_offered_is_one_the_clock_reads() {
+        // 2026-01-15 and 2026-07-15, 00:00 UTC.
+        let (jan, jul) = (1_768_435_200, 1_784_073_600);
+        for name in apcfg::tz::names() {
+            let tz = apcfg::tz::posix(name).unwrap();
+            let (a, b) = (crate::clock::utc_offset(tz, jan), crate::clock::utc_offset(tz, jul));
+            assert!(a.is_some() && b.is_some(), "{name}: {tz}");
+            // Summer time falls in one of the two months: a rule with it was read in full.
+            assert_eq!(a != b, tz.contains(','), "{name}: {tz}");
+        }
+    }
 }
