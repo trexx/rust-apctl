@@ -680,7 +680,7 @@ pub async fn inform(
     let (state, busy) = {
         let live = active.live.read().unwrap();
         let a = &live.adoption;
-        (live.state.clone(), a.pending.contains_key(&mac) || a.adopting.contains_key(&mac) || a.forgetting.contains_key(&mac))
+        (live.state.clone(), a.pending.contains_key(&mac) || a.adopting.get(&mac).is_some_and(|x| x.current(ts)) || a.forgetting.contains_key(&mac))
     };
     let (device_key, pinned) = crate::adopt::device_key(state.as_deref(), &active.keys, &mac).map_or((None, false), |(k, gcm)| (Some(k), gcm));
     drop(state);
@@ -713,7 +713,8 @@ pub async fn inform(
 /// an AP of this MAC. `permit`: the gate's, held while the inform is handled.
 async fn factory_key_inform(active: &Arc<Active>, ts: Ts, caller: Caller, payload: Value, known: bool, permit: OwnedSemaphorePermit) -> Response {
     let mac = caller.mac;
-    let adopting = active.live.read().unwrap().adoption.adopting.get(&mac).copied();
+    // One that timed out is no adoption (`expire` drops it within seconds).
+    let adopting = active.live.read().unwrap().adoption.adopting.get(&mac).copied().filter(|a| a.current(ts));
     if known && adopting.is_some_and(|a| a.kept_key) {
         // Adopted over SSH with the key it had: that key went over SSH, and
         // is not for whoever sends a factory-key inform under the AP's MAC.
@@ -771,7 +772,7 @@ async fn managed_inform(active: &Arc<Active>, ts: Ts, caller: Caller, decoded: D
     let (was_adopting, forgetting) = if busy {
         let mut live = active.live.write().unwrap();
         live.adoption.pending.remove(&mac);
-        (live.adoption.adopting.remove(&mac).is_some(), live.adoption.forgetting.remove(&mac).is_some())
+        (live.adoption.adopting.remove(&mac).is_some_and(|a| a.current(ts)), live.adoption.forgetting.remove(&mac).is_some())
     } else {
         (false, false)
     };
@@ -1173,7 +1174,7 @@ mod tests {
             let mut state = live.state.as_deref().cloned().unwrap();
             crate::adopt::adopt_device(&mut state, &ap, &ap_payload("1")).unwrap();
             live.state = Some(Arc::new(state));
-            live.adoption.adopting.insert(ap, Default::default());
+            live.adoption.adopting.insert(ap, crate::adopt::Adopting { since: clock::now_ts(), kept_key: false });
         }
         let (_, reply) = inform_as_ap(&rig, &ap_payload(""), DEFAULT_KEY, GCM_ZLIB).await;
         let mgmt = reply.unwrap().1["mgmt_cfg"].as_str().unwrap().to_string();
@@ -1463,7 +1464,7 @@ mod tests {
             let mut state = live.state.as_deref().cloned().unwrap();
             crate::adopt::adopt_device(&mut state, &new, &payload).unwrap();
             live.state = Some(Arc::new(state));
-            live.adoption.adopting.insert(new, Default::default());
+            live.adoption.adopting.insert(new, crate::adopt::Adopting { since: clock::now_ts(), kept_key: false });
         }
         let key_hex = crate::adopt::device_doc(rig.live.read().unwrap().state.as_deref().unwrap(), &new).unwrap()["x_authkey"].as_str().unwrap().to_string();
         let key: [u8; 16] = inform::parse_key(&key_hex).unwrap();
@@ -1520,7 +1521,7 @@ mod tests {
                 s.as_object_mut().unwrap().retain(|k, _| !k.starts_with("x_ssh_") || !k.ends_with("passwd"));
             }
             live.state = Some(Arc::new(state));
-            live.adoption.adopting.insert(new, Default::default());
+            live.adoption.adopting.insert(new, crate::adopt::Adopting { since: clock::now_ts(), kept_key: false });
         }
         let key_hex = crate::adopt::device_doc(rig.live.read().unwrap().state.as_deref().unwrap(), &new).unwrap()["x_authkey"].as_str().unwrap().to_string();
         let (_, reply) = inform_as_ap(&rig, &payload, DEFAULT_KEY, GCM_ZLIB).await;
@@ -1572,11 +1573,12 @@ mod tests {
             let mut state = live.state.as_deref().cloned().unwrap();
             crate::adopt::adopt_device(&mut state, &new, &payload).unwrap();
             live.state = Some(Arc::new(state));
-            live.adoption.adopting.insert(new, Default::default());
+            live.adoption.adopting.insert(new, crate::adopt::Adopting { since: clock::now_ts(), kept_key: false });
         }
         inform_as_ap(&rig, &payload, DEFAULT_KEY, GCM_ZLIB).await;
         assert!(rig.active.adoption_cfgs.lock().unwrap().contains_key(&new));
-        crate::adopt::expire(&mut rig.live.write().unwrap(), crate::adopt::ADOPT_TIMEOUT);
+        // Timed out, though `expire` has not dropped it yet: no adoption any more.
+        rig.live.write().unwrap().adoption.adopting.insert(new, crate::adopt::Adopting { since: clock::now_ts() - crate::adopt::ADOPT_TIMEOUT, kept_key: false });
         let (status, _) = inform_as_ap(&rig, &payload, DEFAULT_KEY, GCM_ZLIB).await;
         assert_eq!(status, StatusCode::NOT_FOUND);
         assert!(rig.active.adoption_cfgs.lock().unwrap().is_empty());
