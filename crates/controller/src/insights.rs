@@ -52,9 +52,22 @@ async fn with_site_vaps<T: Send + 'static>(s: &AppState, q: &RangeQuery, f: impl
     Ok(tokio::task::spawn_blocking(move || f(&vaps)).await?)
 }
 
+/// Which parts of [`activity`] a request wants: `parts=activity` leaves the
+/// airtime out (an AP's radio page charts its own); both without it.
+#[derive(Deserialize, Default)]
+pub struct ActivityParts {
+    parts: Option<Parts>,
+}
+
+#[derive(Deserialize, PartialEq)]
+#[serde(rename_all = "lowercase")]
+enum Parts {
+    Activity,
+}
+
 /// GET /api/site/activity: Wi-Fi traffic, retries, clients and multicast,
-/// plus airtime (channel use and interference), bucketed.
-pub async fn activity(State(s): State<AppState>, Query(q): Query<RangeQuery>) -> Result<Json<Value>, ApiError> {
+/// plus airtime (channel use and interference, `null` with `parts=activity`), bucketed.
+pub async fn activity(State(s): State<AppState>, Query(q): Query<RangeQuery>, Query(p): Query<ActivityParts>) -> Result<Json<Value>, ApiError> {
     let (from, to, tier) = window(&q);
     let bucket = bucket_for(to - from, tier);
     let one_band = q.band.clone().filter(|b| b != "all");
@@ -78,6 +91,9 @@ pub async fn activity(State(s): State<AppState>, Query(q): Query<RangeQuery>) ->
         })
         .await?
     };
+    if p.parts == Some(Parts::Activity) {
+        return Ok(Json(json!({ "bucket": bucket, "activity": *vaps, "airtime": null })));
+    }
     // Airtime from the radios: per bucket, each figure averaged by SQLite over the
     // radios' samples that have it (a bucket where none has it is null, not 0).
     let airtime = memo_read(&s, Db::Metrics, "airtime", &q, tier, move |c| {
@@ -1389,10 +1405,10 @@ mod tests {
             let plan = |band: &str, dfs: bool| Query(PlanQuery { band: Some(band.into()), dfs: Some(dfs) });
             let st = || State(s.clone());
             let mut out = json!({
-                "activity": ok(activity(st(), q(None, None)).await),
-                "activity_na": ok(activity(st(), q(Some("na"), None)).await),
-                "activity_a1": ok(activity(st(), q(None, Some(A1))).await),
-                "activity_a1_na": ok(activity(st(), q(Some("na"), Some(A1))).await),
+                "activity": ok(activity(st(), q(None, None), Query(Default::default())).await),
+                "activity_na": ok(activity(st(), q(Some("na"), None), Query(Default::default())).await),
+                "activity_a1": ok(activity(st(), q(None, Some(A1)), Query(Default::default())).await),
+                "activity_a1_na": ok(activity(st(), q(Some("na"), Some(A1)), Query(Default::default())).await),
                 "top": ok(top(st(), q(None, None)).await),
                 "top_a2": ok(top(st(), q(None, Some(A2))).await),
                 "density": ok(density(st(), q(None, None)).await),
@@ -1433,8 +1449,20 @@ mod tests {
             let m = t.db(Db::Metrics);
             insert(&m, "vap_stats", &["bssid", "ts", "ap_mac", "essid", "radio", "num_sta"], vec![vec![text("02:00:00:00:03:01"), int(base + 1810), text(A1), text("Home"), text("6e"), int(4)]]);
             let q = Query(RangeQuery { range: None, from: Some(base), to: Some(base + 3600), band: Some("6e".into()), mac: None });
-            let out = ok(activity(State(s), q).await);
+            let out = ok(activity(State(s), q, Query(Default::default())).await);
             assert_eq!((&out["activity"]["clients"], &out["activity"]["download_bps"]), (&json!([4.0]), &json!([0.0])));
+        }
+
+        #[tokio::test]
+        async fn activity_alone_leaves_the_airtime_out() {
+            let (s, base, _t) = site();
+            let q = || Query(RangeQuery { range: None, from: Some(base), to: Some(base + 3600), band: Some("na".into()), mac: Some(A1.parse().unwrap()) });
+            let both = ok(activity(State(s.clone()), q(), Query(Default::default())).await);
+            let parts: ActivityParts = serde_json::from_value(json!({ "parts": "activity" })).unwrap();
+            let alone = ok(activity(State(s), q(), Query(parts)).await);
+            assert!(both["airtime"]["ts"].as_array().is_some_and(|t| !t.is_empty()));
+            assert_eq!((&alone["activity"], &alone["airtime"]), (&both["activity"], &Value::Null));
+            assert!(serde_json::from_value::<ActivityParts>(json!({ "parts": "airtime" })).is_err(), "an unknown part is refused");
         }
 
         #[tokio::test]
