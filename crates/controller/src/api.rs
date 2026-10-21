@@ -775,15 +775,11 @@ async fn dryrun(State(s): State<AppState>) -> Result<Json<DryRunStatus>, ApiErro
         (live.state.clone(), live.state_imported_at, aps)
     };
     // Then from the database, in one go: the stored redacted copy for APs not
-    // pushed to since start, and the comparisons made at each push.
-    let need: Vec<Mac> = aps.iter().filter(|a| a.3.is_none()).map(|a| a.0).collect();
+    // pushed to since start (a full one, as above), and the comparisons made at each push.
+    let need: std::collections::HashSet<Mac> = aps.iter().filter(|a| a.3.is_none()).map(|a| a.0).collect();
     let (stored, history) = read(&s.store, Db::Config, move |c| {
-        let mut stored = std::collections::HashMap::new();
-        for mac in need {
-            if let Some(p) = crate::store::stored_push(c, &mac)?.filter(|p| !p.system_cfg.is_empty()) {
-                stored.insert(mac, Arc::new(p));
-            }
-        }
+        let stored: std::collections::HashMap<Mac, Arc<_>> =
+            crate::store::stored_pushes(c)?.into_iter().filter(|(mac, p)| need.contains(mac) && p.complete()).map(|(mac, p)| (mac, Arc::new(p))).collect();
         // Without the diffs' text, which older rows have and the history never shows (only the counts); text that isn't JSON becomes null.
         let mut stmt = c.prepare_cached(
             "SELECT id, ts, mac, cfgversion, matches, CASE WHEN json_valid(comparison) THEN json_remove(comparison, '$.mgmt_cfg.diff', '$.system_cfg.diff') END
@@ -1543,13 +1539,21 @@ mod tests {
         s.writer.exec(Db::Config, "INSERT INTO dryrun_results (ts, mac, matches, comparison) VALUES (7, '02:00:00:00:00:01', 0, ?1)", vec![Sql::Text(stored.into())]);
         s.writer.exec(Db::Config, "INSERT INTO dryrun_results (ts, mac, matches, comparison) VALUES (6, '02:00:00:00:00:01', 0, 'not json')", vec![]);
         flushed(&s.writer);
-        let app = router(s);
+        let app = router(s.clone());
         let d = get_json(&app, "/api/dryrun").await;
         assert_eq!((d["devices"][0]["status"].as_str(), d["history"][0]["ts"].as_i64(), d["history"][0]["id"].as_i64()), (Some("no_settings"), Some(7), Some(1)));
         // The history's comparisons come without the diffs' text.
         assert_eq!(d["history"][0]["comparison"], json!({ "mgmt_cfg": { "added": 0 }, "system_cfg": { "added": 1, "removed": 0, "changed": 0, "identical": false } }));
         assert_eq!(d["history"][1]["comparison"], Value::Null);
         assert_eq!(d["devices"][0], json!({ "mac": "02:00:00:00:00:01", "name": "Hall", "status": "no_settings", "settings_stale": false }));
+        // With settings, the stored push is compared with; one without its mgmt_cfg is no config seen.
+        s.live.write().unwrap().state = Some(Arc::new(json!({})));
+        let d = get_json(&app, "/api/dryrun").await;
+        assert_ne!(d["devices"][0]["status"], "no_config_seen");
+        s.writer.exec(Db::Config, "UPDATE device_config SET mgmt_cfg = ''", vec![]);
+        flushed(&s.writer);
+        let d = get_json(&app, "/api/dryrun").await;
+        assert_eq!(d["devices"][0]["status"], "no_config_seen");
     }
 
     #[test]

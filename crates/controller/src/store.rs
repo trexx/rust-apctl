@@ -641,8 +641,9 @@ pub struct PushedConfig {
 }
 
 impl PushedConfig {
-    /// Both configs are known: in the live view, the AP's whole config as
-    /// pushed, which can stand for it without the stored copy.
+    /// Both configs are known: the AP's whole config as pushed, which is what
+    /// a comparison needs. In the live view, it can stand for it without the
+    /// stored copy; a stored copy without it is no config seen.
     pub fn complete(&self) -> bool {
         !self.mgmt_cfg.is_empty() && !self.system_cfg.is_empty()
     }
@@ -652,11 +653,6 @@ const STORED_PUSH: &str = "SELECT mgmt_cfg, system_cfg, cfgversion, ts, mac FROM
 
 fn stored_push_row(r: &rusqlite::Row) -> rusqlite::Result<PushedConfig> {
     Ok(PushedConfig { mgmt_cfg: r.get::<_, Option<String>>(0)?.unwrap_or_default(), system_cfg: r.get::<_, Option<String>>(1)?.unwrap_or_default(), cfgversion: r.get(2)? })
-}
-
-/// One AP's last stored push, with its secrets masked.
-pub fn stored_push(c: &Connection, mac: &inform::Mac) -> rusqlite::Result<Option<PushedConfig>> {
-    Ok(stored_push_at(c, mac)?.map(|(p, _)| p))
 }
 
 /// One AP's last stored push, with its secrets masked, and when it was stored.
