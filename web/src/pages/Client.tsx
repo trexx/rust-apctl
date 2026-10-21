@@ -408,11 +408,11 @@ function ClientMulticast({
           <div className="panel-head">
             <b>Groups joined</b>
             <span className="muted small">
-              {m.memberships.length === 0
-                ? "none"
-                : m.groups.length
-                  ? "delivered only to members"
-                  : "flooded to everyone"}
+              {m.delivery === "optimized"
+                ? "delivered only to members"
+                : m.delivery === "flooding"
+                  ? "flooded to everyone"
+                  : "none"}
             </span>
           </div>
           {m.memberships.length === 0 ? (
