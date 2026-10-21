@@ -12,10 +12,6 @@ import { badRekey } from "./form";
 import type { PmfMode, WlanSection } from "./form";
 import { Unsupported } from "./Unsupported";
 
-const RATES_NG = [
-  1000, 2000, 5500, 6000, 9000, 11000, 12000, 18000, 24000, 36000, 48000, 54000,
-];
-const RATES_NA = [6000, 9000, 12000, 18000, 24000, 36000, 48000, 54000];
 const rates = (list: number[]): Option<number>[] =>
   list.map((kbps) => [kbps, `${kbps / 1000} Mbps`]);
 
@@ -151,7 +147,7 @@ export function Advanced({
                 {...bind("minrate_ng_data_rate_kbps")}
                 aria-label="2.4 GHz minimum data rate"
                 fallback={1000}
-                options={rates(RATES_NG)}
+                options={rates(list.min_rates.ng)}
               />
             </label>
             <Toggle {...bind("minrate_na_enabled")} label="5 GHz" />
@@ -160,7 +156,7 @@ export function Advanced({
                 {...bind("minrate_na_data_rate_kbps")}
                 aria-label="5 GHz minimum data rate"
                 fallback={6000}
-                options={rates(RATES_NA)}
+                options={rates(list.min_rates.na)}
               />
             )}
           </>

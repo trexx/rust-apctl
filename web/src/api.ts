@@ -901,7 +901,7 @@ export interface Wlan {
     hidden: boolean;
     guest: boolean;
     network: string | null;
-    vlan: string | number | null;
+    vlan: number | null;
     bands: string[] | null;
     fast_roaming: boolean;
     bss_transition: boolean;
@@ -1529,6 +1529,8 @@ export interface WlanSettingsList {
   wlans: WlanSettings[];
   /** `for_ssid`: an SSID may be put on it (a LAN network, not the inter-VLAN routing one), as the server checks it. */
   networks: { id: string; name: string; vlan: number | null; purpose: string | null; for_ssid: boolean }[];
+  /** The minimum data rates an SSID may require, per band, in kbps (what the server accepts). */
+  min_rates: { ng: number[]; na: number[] };
   aps: { mac: Mac; name: string | null }[];
   /** For each optional SSID feature, the APs that would broadcast without it. */
   unsupported: Record<string, Mac[]>;

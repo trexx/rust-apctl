@@ -46,9 +46,7 @@ function SecurityChips({ w }: { w: Wlan }) {
             {s.security}
           </span>
           {s.network && <span className="tag">network {s.network}</span>}
-          {s.vlan !== null && s.vlan !== undefined && (
-            <span className="tag">VLAN {String(s.vlan)}</span>
-          )}
+          {s.vlan !== null && <span className="tag">VLAN {s.vlan}</span>}
           {s.hidden && <span className="tag">hidden</span>}
           {s.guest && <span className="tag">guest</span>}
           {s.fast_roaming && <span className="tag">fast roaming</span>}
