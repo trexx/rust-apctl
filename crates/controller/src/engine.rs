@@ -2788,6 +2788,29 @@ mod tests {
     }
 
     #[test]
+    fn crash_reports_and_restarts_are_summed_up_when_stored() {
+        use base64::Engine as _;
+        let mut h = harness();
+        let crash = |h: &mut Harness, ts: Ts, text: &str| {
+            let payload = json!(base64::engine::general_purpose::STANDARD.encode(text));
+            h.engine.handle(Input::Inform { ts, peer: [10, 0, 0, 1].into(), decoded: notif(AP1, "crashlog", payload) });
+        };
+        // The fault line, not the first of the lines kept.
+        crash(&mut h, 1, "boot line\n[ 12.3] Kernel panic - not syncing: Fatal exception\nreboot");
+        crash(&mut h, 2, "no fault here\nnor here");
+        crash(&mut h, 3, "\n");
+        let summaries: Vec<Value> = stored(&h, EventKind::ApCrash).into_iter().map(|d| d.get("summary").cloned().unwrap_or(Value::Null)).collect();
+        assert_eq!(summaries, [json!("[ 12.3] Kernel panic - not syncing: Fatal exception"), json!("no fault here"), Value::Null]);
+        // A code sent as text is stored as a number; one that is no number is left out.
+        for (ts, code) in [(4, json!("139")), (5, json!(1)), (6, json!("n/a"))] {
+            let n = json!({ "event_string": "EVT_AP_RestartProc", "proc": "mcad", "exit_status": code, "caller": "init" });
+            h.engine.handle(Input::Inform { ts, peer: [10, 0, 0, 1].into(), decoded: notif(AP1, "event", n) });
+        }
+        let codes: Vec<Option<Value>> = stored(&h, EventKind::ApProcessRestarted).into_iter().map(|d| d.get("exit_status").cloned()).collect();
+        assert_eq!(codes, [Some(json!(139)), Some(json!(1)), None]);
+    }
+
+    #[test]
     fn radio_changes_are_debounced() {
         let mut h = harness();
         let with = |channel: i64, power: i64| {
