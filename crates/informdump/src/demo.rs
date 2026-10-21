@@ -397,6 +397,11 @@ impl Sim {
                     .filter(|(_, s)| *s > -84)
             });
             let at = ts - self.rng.range(1, 40);
+            // An AP that lost power says nothing more: its clients' sessions end with it,
+            // and they associate afresh wherever they go.
+            if self.sessions[ci].as_ref().is_some_and(|s| !self.ap_up(s.ap, ts)) {
+                self.sessions[ci] = None;
+            }
             let cur = self.sessions[ci].as_ref().map(|s| s.ap);
             match (cur, want) {
                 (None, Some((ap, signal))) => {
@@ -757,6 +762,10 @@ fn stream(now: i64, hours: f64, live: bool, out: impl Write) -> Result<()> {
             let at = t + i as i64 * 3;
             if APS[i].reboot.is_some() && !sim.ap_up(i, t - step) {
                 sim.log(at - 30, i, "syswrapper", "Restarting system after power loss".into());
+                // A restarted AP counts its traffic from zero again.
+                sim.counters[i] = ApCounters::default();
+                sim.vap_counters[i] = Default::default();
+                *last = at - step;
             }
             let dt = (at - *last).max(1) as f64;
             *last = at;
@@ -859,6 +868,50 @@ mod tests {
             }
             assert_eq!(at, buf.len());
         }
+    }
+
+    /// While an AP is without power it sends nothing (no informs, notifications or
+    /// syslog), nor does it see its clients off as it goes, and once it is back its
+    /// traffic counters start again from zero.
+    #[test]
+    fn a_powered_off_ap_is_silent_and_counts_afresh() {
+        let now = 1_791_830_666;
+        let (studio, (before_end, away)) = APS.iter().enumerate().find_map(|(i, a)| Some((i, a.reboot?))).unwrap();
+        let (down, boot) = (now - before_end, now - before_end + away - 60);
+        let mut buf = Vec::new();
+        // From shortly before the outage.
+        stream(now, (before_end + 600) as f64 / 3600.0, false, &mut buf).unwrap();
+        let keys = wire::keys::KeyStore::from_value(&state().unwrap());
+        let studio_ip: std::net::IpAddr = ip(APS[studio].ip).parse().unwrap();
+        let mut pairer = wire::exchange::Pairer::default();
+        let (mut heard, mut tx_bytes, mut leaving) = (Vec::new(), Vec::new(), Vec::new());
+        let end = wire::capture::run_with_udp(&buf[..], &[8080], &[5514], |ev| {
+            if let wire::capture::HttpEvent::Datagram { ts, src, .. } = &ev {
+                if src.ip() == studio_ip {
+                    heard.push(*ts / 1_000_000);
+                }
+            } else if let Some(wire::exchange::InformEvent::Inform { ts, peer, decoded, .. }) = pairer.handle(&keys, ev)
+                && peer == studio_ip
+            {
+                let payload = decoded.unwrap().payload;
+                heard.push(ts / 1_000_000);
+                if let Some(event @ ("sta_leave" | "sta_roam")) = payload["notif_payload"]["event_type"].as_str() {
+                    leaving.push((ts / 1_000_000, event.to_string()));
+                }
+                if let Some(tx) = payload["if_table"][0]["tx_bytes"].as_i64() {
+                    tx_bytes.push((ts / 1_000_000, tx));
+                }
+            }
+            std::ops::ControlFlow::Continue(())
+        })
+        .unwrap();
+        assert_eq!(end, wire::capture::End::Complete);
+        assert!(heard.iter().any(|t| *t < down) && heard.iter().any(|t| *t > boot));
+        assert!(!leaving.iter().any(|(t, _)| (down - 60..boot).contains(t)), "Studio saw clients off as it lost power: {leaving:?}");
+        assert!(heard.iter().all(|t| !(down..boot).contains(t)), "Studio heard while without power: {:?}", heard.iter().filter(|t| (down..boot).contains(*t)).collect::<Vec<_>>());
+        let before = tx_bytes.iter().rfind(|(t, _)| *t < down).unwrap().1;
+        let after = tx_bytes.iter().find(|(t, _)| *t > boot).unwrap().1;
+        assert!(after < before, "counters after the restart: {after}, before: {before}");
     }
 
     #[test]
