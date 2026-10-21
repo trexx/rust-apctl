@@ -333,7 +333,7 @@ fn wlans_view(state: &Value, informs: &HashMap<inform::Mac, Arc<Value>>, active:
         .filter(|w| w["attr_hidden_id"].as_str().is_none())
         .map(|w| {
             let mut v = json!({
-                "id": id_of(w), "aps": wlan_aps(state, w), "protection": protection_of(w), "editable": w["attr_no_edit"].as_bool() != Some(true),
+                "id": id_of(w), "aps": wlan_aps(state, w), "protection": protection_of(w).map(|p| p.name), "editable": w["attr_no_edit"].as_bool() != Some(true),
                 "has_passphrase": w["x_passphrase"].as_str().is_some_and(|p| !p.is_empty()),
             });
             if let Value::Object(o) = &mut v {
@@ -664,20 +664,21 @@ pub(crate) fn mac_list_value(v: &Value, key: &str) -> Result<Option<Vec<inform::
 
 // ---- SSIDs ----------------------------------------------------------------
 
-/// A security choice as the official UI offers it, and the fields it sets.
+/// A security choice as the official UI offers it, the fields it sets (each
+/// with `wpa_mode` "wpa2") and how it reads for people.
 struct Protection {
     name: &'static str,
+    label: &'static str,
     security: &'static str,
-    wpa_mode: &'static str,
     wpa3_support: bool,
     wpa3_transition: bool,
 }
 
 const PROTECTION: &[Protection] = &[
-    Protection { name: "wpa2", security: "wpapsk", wpa_mode: "wpa2", wpa3_support: false, wpa3_transition: false },
-    Protection { name: "wpa2_wpa3", security: "wpapsk", wpa_mode: "wpa2", wpa3_support: true, wpa3_transition: true },
-    Protection { name: "wpa3", security: "wpapsk", wpa_mode: "wpa2", wpa3_support: true, wpa3_transition: false },
-    Protection { name: "open", security: "open", wpa_mode: "wpa2", wpa3_support: false, wpa3_transition: false },
+    Protection { name: "wpa2", label: "WPA2 Personal", security: "wpapsk", wpa3_support: false, wpa3_transition: false },
+    Protection { name: "wpa2_wpa3", label: "WPA2/WPA3 Personal", security: "wpapsk", wpa3_support: true, wpa3_transition: true },
+    Protection { name: "wpa3", label: "WPA3 Personal", security: "wpapsk", wpa3_support: true, wpa3_transition: false },
+    Protection { name: "open", label: "Open", security: "open", wpa3_support: false, wpa3_transition: false },
 ];
 
 /// An SSID's protection as the editor's rules read it: (WPA Personal, WPA3,
@@ -689,25 +690,27 @@ fn psk_wpa3(w: &Value) -> (bool, bool, bool) {
 
 /// The protection choice of a stored SSID, if it is one the editor offers.
 /// An open SSID's `wpa_mode` means nothing.
-fn protection_of(w: &Value) -> Option<&'static str> {
+fn protection_of(w: &Value) -> Option<&'static Protection> {
     let security = w["security"].as_str()?;
-    let wpa_mode = if security == "open" { "wpa2" } else { w["wpa_mode"].as_str().unwrap_or("wpa2") };
+    if security != "open" && w["wpa_mode"].as_str().is_some_and(|m| m != "wpa2") {
+        return None;
+    }
     let (_, wpa3, transition) = psk_wpa3(w);
-    PROTECTION.iter().find(|p| (p.security, p.wpa_mode, p.wpa3_support, p.wpa3_transition) == (security, wpa_mode, wpa3, transition)).map(|p| p.name)
+    PROTECTION.iter().find(|p| (p.security, p.wpa3_support, p.wpa3_transition) == (security, wpa3, transition))
 }
 
-/// How an SSID's security reads for people: the editor's choices by name,
-/// anything else from its fields.
+/// How an SSID's security reads for people: the editor's choices by their
+/// label, anything else from its fields.
 pub(crate) fn security_label(w: &Value) -> String {
-    match (protection_of(w), w["security"].as_str()) {
-        (Some("open"), _) | (None, Some("open")) => "Open".into(),
-        (Some("wpa2"), _) => "WPA2 Personal".into(),
-        (Some("wpa2_wpa3"), _) => "WPA2/WPA3 Personal".into(),
-        (Some(_), _) => "WPA3 Personal".into(),
-        (None, Some("wpapsk")) => format!("{} Personal", w["wpa_mode"].as_str().unwrap_or("wpa2").to_uppercase()),
-        (None, Some("wpaeap")) => "WPA Enterprise".into(),
-        (None, Some(o)) => o.to_string(),
-        (None, None) => "?".into(),
+    if let Some(p) = protection_of(w) {
+        return p.label.into();
+    }
+    match w["security"].as_str() {
+        Some("open") => "Open".into(),
+        Some("wpapsk") => format!("{} Personal", w["wpa_mode"].as_str().unwrap_or("wpa2").to_uppercase()),
+        Some("wpaeap") => "WPA Enterprise".into(),
+        Some(o) => o.to_string(),
+        None => "?".into(),
     }
 }
 
@@ -1109,7 +1112,7 @@ fn wlan_security(p: &Value, w: &mut Value) -> Result<(), String> {
             format!("protection must be one of {}", PROTECTION.iter().map(|x| x.name).collect::<Vec<_>>().join(", "))
         })?;
         w["security"] = json!(x.security);
-        w["wpa_mode"] = json!(x.wpa_mode);
+        w["wpa_mode"] = json!("wpa2");
         w["wpa3_support"] = json!(x.wpa3_support);
         w["wpa3_transition"] = json!(x.wpa3_transition);
         if x.security == "wpapsk" {
@@ -1921,11 +1924,17 @@ mod tests {
         edit(&mut s, json!({ "protection": "wpa2_wpa3" })).unwrap();
         let w = &s["wlanconf"][0];
         assert_eq!((w["wpa3_support"].as_bool(), w["wpa3_transition"].as_bool(), w["pmf_mode"].as_str()), (Some(true), Some(true), Some("optional")));
-        assert_eq!(protection_of(w), Some("wpa2_wpa3"));
+        assert_eq!(protection_of(w).map(|p| p.name), Some("wpa2_wpa3"));
         assert!(edit(&mut s, json!({ "pmf_mode": "disabled" })).unwrap_err().contains("PMF"));
         edit(&mut s, json!({ "protection": "wpa3" })).unwrap();
         assert_eq!(s["wlanconf"][0]["pmf_mode"], "required");
         assert!(edit(&mut s, json!({ "pmf_mode": "optional" })).is_err(), "WPA3 alone needs PMF required");
+        // Each choice reads by its label; anything else from its fields.
+        let label = |w: Value| security_label(&w);
+        assert_eq!(label(s["wlanconf"][0].clone()), "WPA3 Personal");
+        assert_eq!(label(json!({ "security": "wpapsk", "wpa_mode": "wpa2", "wpa3_support": true, "wpa3_transition": true })), "WPA2/WPA3 Personal");
+        assert_eq!(label(json!({ "security": "wpapsk", "wpa_mode": "wpa1" })), "WPA1 Personal");
+        assert_eq!((label(json!({ "security": "open", "wpa3_support": true })), label(json!({ "security": "wpaeap" }))), ("Open".into(), "WPA Enterprise".into()));
     }
 
     #[test]
@@ -1982,7 +1991,7 @@ mod tests {
         assert_eq!(w["wlan_bands"], json!(["2g"]));
         assert_eq!((w["wpa3_support"].as_bool(), w["pmf_mode"].as_str(), w["proxy_arp"].as_bool()), (Some(false), Some("disabled"), Some(false)));
         assert_eq!((w["dns_assistance_mode"].as_str(), w["no2ghz_oui"].as_bool()), (Some("off"), Some(false)));
-        assert_eq!(protection_of(w), Some("wpa2"));
+        assert_eq!(protection_of(w).map(|p| p.name), Some("wpa2"));
         // While it is on, asking for one of them is refused.
         assert!(edit(&mut s, json!({ "dns_assistance_mode": "auto" })).unwrap_err().contains("Force Wi-Fi 4"));
         assert!(edit(&mut s, json!({ "wlan_bands": ["2g", "5g"] })).is_err());
@@ -2009,7 +2018,7 @@ mod tests {
         // Turning WPA3 off this way leaves WPA2, where 100 characters are no key.
         assert!(edit(&mut s, json!({ "enhanced_iot": true })).unwrap_err().contains("enter a new one"));
         edit(&mut s, json!({ "enhanced_iot": true, "passphrase": "short enough" })).unwrap();
-        assert_eq!(protection_of(&s["wlanconf"][0]), Some("wpa2"));
+        assert_eq!(protection_of(&s["wlanconf"][0]).map(|p| p.name), Some("wpa2"));
         // A kept password that fits passes as before.
         let mut s = state();
         edit(&mut s, json!({ "protection": "wpa2_wpa3" })).unwrap();
