@@ -962,6 +962,8 @@ export interface BackupMeta {
   days: number;
   size: number;
   encrypted: boolean;
+  /** The database files it holds ("config.db", "metrics.db", …); empty for one listed before the server named them. */
+  files: string[];
 }
 
 export interface BackupManifest {

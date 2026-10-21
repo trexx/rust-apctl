@@ -32,8 +32,15 @@ const HISTORY: [number, string][] = [
   [365, "Settings + 365 days"],
   [-1, "Everything"],
 ];
-const historyLabel = (d: number) =>
-  HISTORY.find((h) => h[0] === d)?.[1] ?? `Settings + ${d} days`;
+/**
+ * What a backup holds: its history (`days`), but an "everything" one without
+ * the statistics database (the copy a settings-only restore saves first) says
+ * so. `files` is empty for backups listed before the server named them.
+ */
+const historyLabel = (d: number, files: string[]) =>
+  d === -1 && files.length > 0 && !files.includes("metrics.db")
+    ? "Settings and events (no statistics or logs)"
+    : (HISTORY.find((h) => h[0] === d)?.[1] ?? `Settings + ${d} days`);
 const WEEKDAYS = [
   "Monday",
   "Tuesday",
@@ -402,8 +409,12 @@ export function BackupSection() {
         <div className="banner">
           <b>{uploaded.file}</b> checks out: made{" "}
           {when(uploaded.manifest.created)} by apctl {uploaded.manifest.version}
-          , {historyLabel(uploaded.manifest.days).toLowerCase()},{" "}
-          {Object.keys(uploaded.manifest.files).join(", ")}.{" "}
+          ,{" "}
+          {historyLabel(
+            uploaded.manifest.days,
+            Object.keys(uploaded.manifest.files),
+          ).toLowerCase()}
+          , {Object.keys(uploaded.manifest.files).join(", ")}.{" "}
           <button
             className="btn small primary"
             onClick={() =>
@@ -466,7 +477,7 @@ export function BackupSection() {
                       <span className="tag tag-warn">unencrypted</span>
                     )}
                   </td>
-                  <td className="small">{historyLabel(x.days)}</td>
+                  <td className="small">{historyLabel(x.days, x.files)}</td>
                   <td className="small">{x.version}</td>
                   <td className="small nowrap">{bytes(x.size)}</td>
                   {/* Read-only mode withholds the files: they hold AP keys and Wi-Fi passwords. */}
