@@ -35,13 +35,8 @@ jobs:
             echo "::notice::APCTL_TESTDATA is not set: the capture-based golden tests return early and show as passed without checking anything"
           fi
       # The web UI is not needed: debug builds serve web/dist from disk if it exists.
-      # informdump turns on serde_json's preserve_order; testing it on its own keeps the
-      # other crates on the features the shipped binary is built with.
-      - run: 'cargo test --workspace --exclude informdump --locked'
-      - run: 'cargo test -p informdump --locked'
-      - run: 'cargo clippy --workspace --all-targets --locked -- -D warnings'
-      # informdump's MongoDB import is behind a feature; keep it compiling and linted.
-      - run: 'cargo clippy -p informdump --features mongo --all-targets --locked -- -D warnings'
+      # The checks are listed in scripts/check.sh, which the release gate runs too.
+      - run: 'scripts/check.sh'
 
   web:
     runs-on: 'ubuntu-26.04'
