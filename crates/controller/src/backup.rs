@@ -929,9 +929,9 @@ pub enum Frequency {
     Monthly,
 }
 
-/// A field missing from the stored settings (one added since) takes its default.
+/// Also PUT /api/backups/settings' body, which names every field: one left
+/// out is refused, not reset to its default (see `load_settings` for the stored row).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(default)]
 pub struct Settings {
     pub enabled: bool,
     pub frequency: Frequency,
@@ -999,9 +999,16 @@ impl Settings {
 }
 
 /// The stored backup settings; the defaults when none are stored.
+/// The stored settings; a field missing from them (one added since) takes its default.
 fn load_settings(store: &store::Store) -> Result<Settings> {
     let stored = store.read(Db::Config, |c| Ok(c.query_row("SELECT json FROM backup_settings WHERE id = 1", [], |r| r.get::<_, String>(0)).optional()?))?;
-    Ok(stored.map(|s| serde_json::from_str::<Settings>(&s)).transpose()?.unwrap_or_default())
+    let Some(stored) = stored else { return Ok(Settings::default()) };
+    let mut settings = serde_json::to_value(Settings::default())?;
+    match (&mut settings, serde_json::from_str::<Value>(&stored)?) {
+        (Value::Object(settings), Value::Object(stored)) => settings.extend(stored),
+        (_, other) => settings = other,
+    }
+    Ok(serde_json::from_value(settings)?)
 }
 
 /// Backups in the directory, newest first. A description counts only beside
@@ -2106,5 +2113,9 @@ mod tests {
         // Not readable at all: no defaults for the schedule to act on.
         put("not json");
         assert!(b.settings(&store).is_err());
+        put("[]");
+        assert!(load_settings(&store).is_err());
+        // The API's body names every field.
+        assert!(serde_json::from_value::<Settings>(json!({ "enabled": true })).is_err());
     }
 }
