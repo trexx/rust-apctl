@@ -1130,8 +1130,9 @@ export function useSeries(table: string, key: string, span: TimeSpan, fields: re
   });
 }
 
-export type EventFilter = { device?: Mac; client?: Mac; kind?: string; limit?: number };
-export type LogFilter = { device?: Mac; q?: string; limit?: number };
+/** `limit`: how many of the newest to show, within the server's maximum (2000 events, 5000 log lines), or a refetch keeps more than a fresh fetch. */
+export type EventFilter = { device?: Mac; client?: Mac; kind?: string; limit: number };
+export type LogFilter = { device?: Mac; q?: string; limit: number };
 
 /**
  * When the live socket last reconnected or was told to resync: a list cached before then is
@@ -1149,7 +1150,7 @@ function mergeNewest<T extends { id: number; ts: number }>(prev: T[], add: T[], 
  * cached asks only for the rows stored after its newest, and keeps the `limit` newest; the
  * previous list stays up (`isPlaceholderData`) while another filter's loads.
  */
-function useNewestList<T extends { id: number; ts: number }>(queryKey: QueryKey, path: string, filter: Record<string, string | number | undefined> & { limit?: number }, defaultLimit: number) {
+function useNewestList<T extends { id: number; ts: number }>(queryKey: QueryKey, path: string, filter: Record<string, string | number | undefined> & { limit: number }) {
   const qc = useQueryClient();
   return useQuery({
     queryKey,
@@ -1159,7 +1160,7 @@ function useNewestList<T extends { id: number; ts: number }>(queryKey: QueryKey,
       if (cached && prev?.length && cached.dataUpdatedAt > liveResetAt) {
         const after = prev.reduce((max, r) => Math.max(max, r.id), 0);
         const add = await get<T[]>(`${path}${qs({ ...filter, after })}`, signal);
-        return add.length ? mergeNewest(prev, add, filter.limit ?? defaultLimit) : prev;
+        return add.length ? mergeNewest(prev, add, filter.limit) : prev;
       }
       return get<T[]>(`${path}${qs(filter)}`, signal);
     },
@@ -1167,10 +1168,9 @@ function useNewestList<T extends { id: number; ts: number }>(queryKey: QueryKey,
   });
 }
 
-// The server's default limits: 200 events, 500 log lines.
-export const useEvents = (filter: EventFilter) => useNewestList<AppEvent>(keys.events(filter), "/api/events", filter, 200);
+export const useEvents = (filter: EventFilter) => useNewestList<AppEvent>(keys.events(filter), "/api/events", filter);
 
-export const useLogs = (filter: LogFilter) => useNewestList<LogLine>(keys.logs(filter), "/api/logs", filter, 500);
+export const useLogs = (filter: LogFilter) => useNewestList<LogLine>(keys.logs(filter), "/api/logs", filter);
 
 /** A filter's MAC against a message's (canonical), as the server compares them: it reads the filter in any form it accepts. */
 const sameMac = (filter: Mac | undefined, mac: Mac | null) => !filter || canonicalMac(filter) === mac;
