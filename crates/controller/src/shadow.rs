@@ -69,6 +69,15 @@ impl Clock {
         (lag <= REPLAY_LAG_SECS || wall - self.seen.load(Ordering::Relaxed) > REPLAY_LAG_SECS).then_some(wall - lag)
     }
 
+    /// Whether an event made at `ts` is news, not history: no more than
+    /// `REPLAY_LAG_SECS` older than the engine's time (the wall clock's while a
+    /// replay ticks in its own). Decided by the event's own time, as it reaches
+    /// a reader after the capture's reader has moved on (up to the engine's
+    /// queue ahead): a replay's tail is history after the clock is reset too.
+    pub fn is_news(&self, ts: Ts) -> bool {
+        ts >= self.now().unwrap_or_else(crate::clock::now_ts) - REPLAY_LAG_SECS
+    }
+
     /// Notes an inform's capture time; true if the capture is being replayed.
     fn observe(&self, ts: Ts) -> bool {
         let wall = crate::clock::now_ts();
@@ -247,6 +256,20 @@ mod tests {
         assert!(clock.now().is_some_and(|t| (now - 3600..now - 3598).contains(&t)));
         clock.reset();
         assert!(clock.now().is_some());
+    }
+
+    #[test]
+    fn events_are_news_by_their_own_time() {
+        let clock = Clock::default();
+        let now = crate::clock::now_ts();
+        // A live capture 90 s behind: its events are news.
+        clock.observe(now - 90);
+        assert!(clock.is_news(now - 90));
+        // A replay's events are history, also those still queued once it has ended.
+        clock.observe(now - 3600);
+        assert!(!clock.is_news(now - 3600));
+        clock.reset();
+        assert!(!clock.is_news(now - 3590) && clock.is_news(now));
     }
 
     /// An endless live capture: a pcap header, then the same syslog datagram for ever.

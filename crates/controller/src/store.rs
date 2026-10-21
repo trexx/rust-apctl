@@ -227,13 +227,17 @@ pub struct Tier {
     pub step: i64,
     /// Retention seconds.
     pub keep: i64,
+    /// How long a view's read of a window on this tier is reused (seconds, see
+    /// `series::memo_read`): the raw tier grows with each report, the roll-ups
+    /// every five minutes.
+    pub memo_secs: u64,
 }
 
 /// The tiers, finest first; a tier is known by its index here.
 pub const TIERS: [Tier; 3] = [
-    Tier { suffix: "", name: "raw", step: 0, keep: 48 * 3600 },
-    Tier { suffix: "_5m", name: "5m", step: 300, keep: 30 * 86400 },
-    Tier { suffix: "_1h", name: "1h", step: 3600, keep: 365 * 86400 },
+    Tier { suffix: "", name: "raw", step: 0, keep: 48 * 3600, memo_secs: 15 },
+    Tier { suffix: "_5m", name: "5m", step: 300, keep: 30 * 86400, memo_secs: 60 },
+    Tier { suffix: "_1h", name: "1h", step: 3600, keep: 365 * 86400, memo_secs: 300 },
 ];
 
 const CONFIG_SCHEMA: &str = "
@@ -326,6 +330,15 @@ pub const CLIENT_RETENTION: Ts = 365 * 86400;
 pub const FORGET_OLD_CLIENTS: &str = "DELETE FROM clients WHERE COALESCE(last_seen, 0) < ?1 AND mac NOT IN (SELECT mac FROM client_aliases)";
 /// Resolved alerts are kept this long; open ones until they resolve.
 const ALERT_RETENTION: Ts = 90 * 86400;
+/// Deletes the alerts raised and resolved before ?1 (an open one is kept, so
+/// that it neither comes again nor loses when it started): the retention
+/// above, and a backup's history trim.
+pub const FORGET_RESOLVED_ALERTS: &str = "DELETE FROM alerts WHERE ts < ?1 AND resolved_ts < ?1";
+/// config.db's history: each table with the column its rows' time is in (never
+/// null), by which a backup's history trim keeps the newer rows; `maintenance`
+/// deletes old rows by the same columns (spectrum is replaced, not aged out).
+/// A history table added goes here and, with its retention, there.
+pub const CONFIG_HISTORY: [(&str, &str); 5] = [("events", "ts"), ("connections", "ts"), ("neighbors", "last_seen"), ("spectrum", "ts"), ("dryrun_results", "ts")];
 
 fn open_rw(path: &Path) -> Result<Connection> {
     let conn = Connection::open(path).with_context(|| format!("opening {}", path.display()))?;
@@ -619,10 +632,20 @@ fn apply(conn: &mut Connection, writes: Vec<Write>) -> Result<usize> {
 #[derive(Debug, Clone, Default)]
 pub struct PushedConfig {
     /// Empty when not known: no push with one was seen (one can be
-    /// management-only), or, in the live view after a restart, none since.
+    /// management-only), or, in the live view (`Live::last_config`), not known
+    /// in full in this run (only the stored copy, with its secrets masked, has
+    /// it): readers then go to the stored copy. See `complete`.
     pub mgmt_cfg: String,
     pub system_cfg: String,
     pub cfgversion: Option<String>,
+}
+
+impl PushedConfig {
+    /// Both configs are known: in the live view, the AP's whole config as
+    /// pushed, which can stand for it without the stored copy.
+    pub fn complete(&self) -> bool {
+        !self.mgmt_cfg.is_empty() && !self.system_cfg.is_empty()
+    }
 }
 
 const STORED_PUSH: &str = "SELECT mgmt_cfg, system_cfg, cfgversion, ts, mac FROM device_config";
@@ -694,10 +717,7 @@ fn maintenance(conns: &mut Conns, now: Ts, hourly: bool) {
     step("retention of events", delete_before(config, "events", Rows::Rowid, now - EVENT_RETENTION));
     step("expiring sessions", config.execute("DELETE FROM sessions WHERE expires < ?1", [now]).map(drop).map_err(Into::into));
     step("retention of clients", config.execute(FORGET_OLD_CLIENTS, [now - CLIENT_RETENTION]).map(drop).map_err(Into::into));
-    step(
-        "retention of alerts",
-        config.execute("DELETE FROM alerts WHERE ts < ?1 AND resolved_ts < ?1", [now - ALERT_RETENTION]).map(drop).map_err(Into::into),
-    );
+    step("retention of alerts", config.execute(FORGET_RESOLVED_ALERTS, [now - ALERT_RETENTION]).map(drop).map_err(Into::into));
 }
 
 /// How long after a bucket ends it is rolled up: rows still queued in the

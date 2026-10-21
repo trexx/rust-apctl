@@ -1,7 +1,9 @@
 //! apctl (working title): a controller for Ubiquiti access points.
 //!
-//! Milestone 2 runs in shadow mode: it learns everything from a capture of
-//! another controller's traffic and never talks to the APs itself.
+//! It runs in one of two modes. In shadow mode it learns everything from a
+//! capture of another controller's traffic and never talks to the APs itself;
+//! in active mode (`--active`) it answers the APs' informs, pushes their
+//! config, answers STUN and adopts APs over SSH.
 
 mod actions;
 mod adopt;

@@ -25,6 +25,8 @@ use crate::store::{self, Db, PushedConfig, Write, Writer};
 pub const CLIENT_GRACE_SECS: Ts = 60;
 /// An AP is offline after missing this many of its inform intervals.
 pub const OFFLINE_INTERVALS: Ts = 4;
+/// Nor sooner than this after its last inform, however short its interval.
+const MIN_OFFLINE_SECS: Ts = 60;
 const DEFAULT_INTERVAL: Ts = 15;
 
 /// A change to the settings, applied by the engine: it edits, then says what
@@ -606,6 +608,13 @@ impl Engine {
             live.known_devices.len(),
             live.aliases.len()
         );
+        // An AP stored as offline is unavailable to the clients locked to it,
+        // whatever the settings were saved (or restored from a backup) with.
+        let (presence, imported_at) = (presence(&live), live.state_imported_at);
+        drop(live);
+        if let Some(at) = imported_at {
+            self.set_fixed_ap_available(at, presence);
+        }
         Ok(())
     }
 
@@ -744,38 +753,36 @@ impl Engine {
         let _ = self.tx.send(LiveMsg::Device { mac });
         // Online: its first inform of this run, or back from offline.
         if came_back {
-            self.set_fixed_ap_available(ts, mac, true);
+            self.set_fixed_ap_available(ts, HashMap::from([(mac, true)]));
         }
     }
 
-    /// Keeps the AP's `fixed_ap_available` in the settings in step with whether
-    /// the engine counts it online, as the official controller does for an AP
+    /// Keeps the APs' `fixed_ap_available` in the settings in step with whether
+    /// the engine counts them online, as the official controller does for an AP
     /// (a device with radios): a client locked to an AP that is away may use
-    /// the others meanwhile (apcfg's `lock2ap`). Written only when it changes,
+    /// the others meanwhile (apcfg's `lock2ap`). `aps` maps an AP to whether it
+    /// is available; one edit writes them all, and only when a value changes,
     /// as a change of the controller's own, not the user's: no settings event.
-    /// The APs are asked to inform now only when a client is locked to it, when
-    /// the official controller provisions them all; else no AP's config changes.
-    fn set_fixed_ap_available(&mut self, ts: Ts, mac: Mac, available: bool) {
+    /// The APs are asked to inform now only when a client is locked to one of
+    /// them, when the official controller provisions them all; else no AP's
+    /// config changes.
+    fn set_fixed_ap_available(&mut self, ts: Ts, aps: HashMap<Mac, bool>) {
         let (current, imported_at) = {
             let live = self.live.read().unwrap();
             (live.state.clone(), live.state_imported_at.unwrap_or(ts))
         };
         let Some(current) = current else { return };
-        let Some(doc) = crate::adopt::device_doc(&current, &mac) else { return };
-        let has_radios = doc["radio_table"].as_array().is_some_and(|r| !r.is_empty());
-        if !has_radios || doc["fixed_ap_available"].as_bool().unwrap_or(true) == available {
+        if !current["devices"].as_array().is_some_and(|d| d.iter().any(|d| availability_change(d, &aps).is_some())) {
             return;
         }
         let mut state = Value::clone(&current);
         drop(current);
-        if let Some(doc) = crate::adopt::device_doc_mut(&mut state, &mac) {
-            doc["fixed_ap_available"] = json!(available);
-        }
+        let changed = mark_available(&mut state, &aps);
         let locked = state["clients"]
             .as_array()
             .into_iter()
             .flatten()
-            .any(|c| c["fixed_ap_enabled"].as_bool() == Some(true) && crate::settings::doc_mac(&c["fixed_ap_mac"]) == Some(mac));
+            .any(|c| c["fixed_ap_enabled"].as_bool() == Some(true) && crate::settings::doc_mac(&c["fixed_ap_mac"]).is_some_and(|m| changed.contains(&m)));
         self.store_state(state, imported_at);
         if locked {
             crate::stun::poke_all(&self.live.read().unwrap());
@@ -938,8 +945,8 @@ impl Engine {
             let seen = live.last_config.get(&mac).cloned();
             let (previous, redacted) = previous_push(seen, stored);
             let has_system = new_system.as_ref().map_or(!previous.system_cfg.is_empty(), |s| !s.is_empty());
-            // For the section labels, which only a system_cfg has.
-            let radios = live.devices.get(&mac).filter(|_| has_system).map(|d| d.snapshot.radios.clone()).unwrap_or_default();
+            // For the section labels, which only a push with a system_cfg gets.
+            let radios = live.devices.get(&mac).filter(|_| new_system.as_ref().is_some_and(|s| !s.is_empty())).map(|d| d.snapshot.radios.clone()).unwrap_or_default();
             let wanted = dry_run && has_system && self.renderer.is_some();
             let state = live.state.clone().filter(|_| wanted);
             let inform = state.as_ref().and_then(|_| live.raw_informs.get(&mac).cloned());
@@ -961,12 +968,11 @@ impl Engine {
             data.insert(field.into(), summary);
         }
         // Names for numbered sections ("aaa.3" -> "Home WiFi (5 GHz)"), so the
-        // config history can say what a change was about. Sections removed by
-        // this push are only named in the previous config, which is read only
-        // when this push replaces it.
-        if !system.is_empty() {
-            let replaced = new_system.is_some() && !previous.system_cfg.is_empty();
-            let mut labels = if replaced { section_labels(&previous.system_cfg, &radios) } else { Default::default() };
+        // config history can say what a change was about. Only a system_cfg has
+        // them, so a management-only push gets none. Sections removed by this
+        // push are only named in the previous config.
+        if let Some(system) = new_system.as_deref().filter(|s| !s.is_empty()) {
+            let mut labels = section_labels(&previous.system_cfg, &radios);
             labels.extend(section_labels(system, &radios));
             data.insert("labels".into(), Value::Object(labels));
         }
@@ -1103,7 +1109,10 @@ impl Engine {
         live.state_imported_at = Some(imported_at);
     }
 
-    fn set_state(&mut self, ts: Ts, state: Value) {
+    fn set_state(&mut self, ts: Ts, mut state: Value) {
+        // The import's `fixed_ap_available` is the other controller's view of
+        // the APs; the engine's own replaces it for every AP whose state it knows.
+        mark_available(&mut state, &presence(&self.live.read().unwrap()));
         let summary = crate::dryrun::summarize_state(&state);
         self.store_state(state, ts);
         // The new settings may hold the syslog key of an AP given up on.
@@ -1287,6 +1296,10 @@ impl Engine {
                         }
                         _ => EventKind::ApEvent,
                     };
+                    let mut n = n;
+                    if k == EventKind::ApProcessRestarted {
+                        numeric_exit_status(&mut n);
+                    }
                     self.emit(Event::device(ts, k, mac, n));
                 }
             }
@@ -1305,7 +1318,11 @@ impl Engine {
                 let lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
                 let tail = &lines[lines.len().saturating_sub(200)..];
                 let kind = if reason == "recovery" { "recovered after a crash" } else { "crash report" };
-                self.emit(Event::device(ts, EventKind::ApCrash, mac, json!({ "kind": kind, "source": reason, "lines": tail })));
+                let mut data = json!({ "kind": kind, "source": reason, "lines": tail });
+                if let Some(summary) = crate::logevents::crash_summary(tail) {
+                    data["summary"] = json!(summary);
+                }
+                self.emit(Event::device(ts, EventKind::ApCrash, mac, data));
             }
             _ => {}
         }
@@ -1320,11 +1337,12 @@ impl Engine {
         let text = |k: &str| n[k].as_str().map(str::to_string);
         let vap = text("vap");
         // The live view is read for the VAP alone; the row is built without the lock.
-        let vap_info = {
+        // A notification naming no VAP gets none (not one of the AP's unnamed ones).
+        let vap_info = vap.as_deref().and_then(|name| {
             let live = self.live.read().unwrap();
-            let vap = live.devices.get(&ap).and_then(|d| d.snapshot.vaps.iter().find(|v| v.name.as_deref() == vap.as_deref()));
+            let vap = live.devices.get(&ap).and_then(|d| d.snapshot.vaps.iter().find(|v| v.name.as_deref() == Some(name)));
             vap.map(|v| (v.essid.clone(), v.radio.clone(), v.channel, v.bw))
-        };
+        });
         let (essid, radio, at) = match vap_info {
             Some((essid, radio, channel, bw)) => (essid, radio, Some((channel, bw))),
             None => (None, None, None),
@@ -1350,7 +1368,7 @@ impl Engine {
         // rest stay in the connection log. Without a reason from the AP, the stage
         // it failed at is the reason.
         let detail = crate::connections::ConnDetail::deserialize(&n).unwrap_or_default();
-        let failed = crate::connections::reported_failure(&event_type, &detail).map(|label| {
+        let failed = crate::connections::reported_failure(crate::connections::Report::parse(&event_type), &detail).map(|label| {
             let reason = match &n["sta_dc_reason"] {
                 Value::Null => json!(label),
                 Value::String(r) if r.is_empty() => json!(label),
@@ -1567,7 +1585,7 @@ impl Engine {
         let started = *self.first_tick.get_or_insert(now);
         let mut offline = Vec::new();
         for (mac, d) in live.devices.iter_mut() {
-            let limit = (d.interval.max(5) * OFFLINE_INTERVALS).max(60);
+            let limit = (d.interval.max(5) * OFFLINE_INTERVALS).max(MIN_OFFLINE_SECS);
             if d.online && now - d.last_seen > limit {
                 d.online = false;
                 offline.push(*mac);
@@ -1576,13 +1594,16 @@ impl Engine {
         }
         // An AP last recorded online that has not informed in this run, as when it
         // went down while apctl was away: its interval is not known, so it is
-        // given the longest usual one, counted from this run's start too.
+        // given the longest one active mode asks for, counted from this run's start too.
         for (mac, k) in live.known_devices.iter_mut() {
-            if !k.offline && now - k.last_seen.max(started) > 60 * OFFLINE_INTERVALS {
+            if !k.offline && now - k.last_seen.max(started) > crate::active::MAX_INFORM_INTERVAL * OFFLINE_INTERVALS {
                 k.offline = true;
                 offline.push(*mac);
                 events.push(Event::device(now, EventKind::ApOffline, *mac, json!({ "last_seen": k.last_seen })));
             }
+        }
+        for mac in &offline {
+            drop_online_only(&mut live, mac);
         }
         // A client is gone when its AP has reported a full client list since it was
         // last seen and the grace period has passed, or when its AP went offline.
@@ -1622,10 +1643,12 @@ impl Engine {
             self.emit(e);
         }
         // Remembered, so that a restart still pairs the AP's return with it.
-        for mac in offline {
+        for &mac in &offline {
             self.writer.exec(Db::Config, "UPDATE devices SET offline = 1 WHERE mac = ?1", vec![Sql::Text(mac.to_string())]);
             let _ = self.tx.send(LiveMsg::Device { mac });
-            self.set_fixed_ap_available(now, mac, false);
+        }
+        if !offline.is_empty() {
+            self.set_fixed_ap_available(now, offline.into_iter().map(|m| (m, false)).collect());
         }
         if changed {
             let _ = self.tx.send(LiveMsg::Clients);
@@ -1968,6 +1991,73 @@ fn disconnect(writer: &Writer, ts: Ts, mac: Mac, c: &mut ClientView, reason: &st
     }))
 }
 
+/// A process-restart notification's `exit_status` as a number: the AP may send
+/// the code as text. One that is no number is left out, as one not sent.
+fn numeric_exit_status(n: &mut Value) {
+    let code = match &n["exit_status"] {
+        Value::Number(c) => c.as_i64(),
+        Value::String(c) => c.trim().parse::<i64>().ok(),
+        _ => None,
+    };
+    match code {
+        Some(c) => n["exit_status"] = json!(c),
+        None => {
+            if let Some(o) = n.as_object_mut() {
+                o.remove("exit_status");
+            }
+        }
+    }
+}
+
+/// Drops the AP's queued commands that need it online (see `crate::actions`):
+/// a restart, locate or client kick still waiting when it went away would
+/// otherwise run whenever it is back. A locate dropped so is no longer on.
+fn drop_online_only(live: &mut Live, mac: &Mac) {
+    let Some(q) = live.commands.get_mut(mac) else { return };
+    let mut located = false;
+    q.retain(|c| {
+        located |= c["cmd"] == "set-locate";
+        c["_type"] != "reboot" && !matches!(c["cmd"].as_str(), Some("set-locate" | "kick-sta"))
+    });
+    if q.is_empty() {
+        live.commands.remove(mac);
+    }
+    if located {
+        live.locating.remove(mac);
+    }
+}
+
+/// Whether each AP the engine knows the state of is available: online or not
+/// for one heard from in this run, unavailable for one stored as offline. One
+/// last stored online that has not informed in this run yet is left out (its
+/// state is not known yet).
+fn presence(live: &Live) -> HashMap<Mac, bool> {
+    let stored_offline = live.known_devices.iter().filter(|(_, k)| k.offline).map(|(m, _)| (*m, false));
+    live.devices.iter().map(|(m, d)| (*m, d.online)).chain(stored_offline).collect()
+}
+
+/// The AP and its new `fixed_ap_available`, when this device record is an AP
+/// (it has radios) in `aps` whose stored value (none reads as available) differs.
+fn availability_change(doc: &Value, aps: &HashMap<Mac, bool>) -> Option<(Mac, bool)> {
+    let mac = crate::settings::doc_mac(&doc["mac"])?;
+    let available = *aps.get(&mac)?;
+    let has_radios = doc["radio_table"].as_array().is_some_and(|r| !r.is_empty());
+    (has_radios && doc["fixed_ap_available"].as_bool().unwrap_or(true) != available).then_some((mac, available))
+}
+
+/// Writes `fixed_ap_available` into the records of the APs in `aps` whose value
+/// differs (see `availability_change`), and returns those APs.
+fn mark_available(state: &mut Value, aps: &HashMap<Mac, bool>) -> Vec<Mac> {
+    let mut changed = Vec::new();
+    for doc in state["devices"].as_array_mut().into_iter().flatten() {
+        if let Some((mac, available)) = availability_change(doc, aps) {
+            doc["fixed_ap_available"] = json!(available);
+            changed.push(mac);
+        }
+    }
+    changed
+}
+
 #[cfg(test)]
 mod tests {
 
@@ -2207,6 +2297,37 @@ mod tests {
     }
 
     #[test]
+    fn imported_and_restored_settings_get_the_engines_view_of_the_aps() {
+        let mut h = harness();
+        let feed = |h: &mut Harness, ap: &str, ts: Ts| h.engine.handle(Input::Inform { ts, peer: [10, 0, 0, 1].into(), decoded: decoded(inform(ap, 1000 + ts, &[])) });
+        let available = |h: &Harness, i: usize| h.live.read().unwrap().state.as_ref().unwrap()["devices"][i].get("fixed_ap_available").cloned();
+        let radios = json!([{ "radio": "na" }]);
+        feed(&mut h, AP1, 0);
+        feed(&mut h, AP2, 0);
+        h.engine.handle(Input::Tick(30));
+        // AP1 informs to apctl, so the other controller's `false` is replaced;
+        // AP3 is not heard of, so its value is kept as imported.
+        let ap3 = "02:00:00:00:00:03";
+        h.engine.set_state(40, json!({ "devices": [
+            { "mac": AP1, "radio_table": radios, "fixed_ap_available": false },
+            { "mac": AP2, "radio_table": radios },
+            { "mac": ap3, "radio_table": radios, "fixed_ap_available": false },
+        ] }));
+        assert_eq!((available(&h, 0), available(&h, 1), available(&h, 2)), (Some(json!(true)), None, Some(json!(false))));
+        // AP2 goes away, then the settings are imported again saying it is there.
+        feed(&mut h, AP1, 100);
+        h.engine.handle(Input::Tick(120));
+        assert_eq!(available(&h, 1), Some(json!(false)));
+        h.engine.set_state(130, json!({ "devices": [{ "mac": AP1, "radio_table": radios }, { "mac": AP2, "radio_table": radios, "fixed_ap_available": true }] }));
+        assert_eq!((available(&h, 0), available(&h, 1)), (None, Some(json!(false))));
+        // Settings saved while it was there, with AP2 stored offline: a restart marks it.
+        h.engine.set_fixed_ap_available(140, HashMap::from([(AP2.parse().unwrap(), true)]));
+        assert_eq!(available(&h, 1), Some(json!(true)));
+        let h = h.restarted();
+        assert_eq!((available(&h, 0), available(&h, 1)), (None, Some(json!(false))), "AP1 is not known yet; AP2 is stored offline");
+    }
+
+    #[test]
     fn going_offline_and_coming_back_are_paired_across_a_restart() {
         let feed = |h: &mut Harness, ts: Ts| h.engine.handle(Input::Inform { ts, peer: [10, 0, 0, 1].into(), decoded: decoded(inform(AP1, 1000 + ts, &[])) });
         // Reported offline, then apctl restarts: its return is reported after it.
@@ -2225,10 +2346,11 @@ mod tests {
         // Gone while apctl was away: reported offline once this run has given it time to inform.
         let mut h = h.restarted();
         h.engine.handle(Input::Tick(1000));
-        h.engine.handle(Input::Tick(1000 + 60 * OFFLINE_INTERVALS));
+        let limit = crate::active::MAX_INFORM_INTERVAL * OFFLINE_INTERVALS;
+        h.engine.handle(Input::Tick(1000 + limit));
         assert_eq!(events(&mut h), []);
-        h.engine.handle(Input::Tick(1001 + 60 * OFFLINE_INTERVALS));
-        h.engine.handle(Input::Tick(1100 + 60 * OFFLINE_INTERVALS));
+        h.engine.handle(Input::Tick(1001 + limit));
+        h.engine.handle(Input::Tick(1100 + limit));
         assert_eq!(events(&mut h), [("ap_offline", None)]);
         assert_eq!(stored(&h, EventKind::ApOffline)[1]["last_seen"], 510);
         let mut h = h.restarted();
@@ -2568,6 +2690,27 @@ mod tests {
     }
 
     #[test]
+    fn an_ap_going_offline_drops_the_commands_that_need_it_online() {
+        let mut h = harness();
+        let mac: Mac = AP1.parse().unwrap();
+        h.engine.handle(Input::Inform { ts: 0, peer: [10, 0, 0, 1].into(), decoded: decoded(inform(AP1, 1000, &[])) });
+        let block = json!({ "_type": "cmd", "cmd": "block-sta", "mac": C1 });
+        {
+            let mut live = h.live.write().unwrap();
+            crate::actions::queue(&mut live, mac, json!({ "_type": "reboot", "reboot_type": "soft" }));
+            crate::actions::queue(&mut live, mac, json!({ "_type": "cmd", "cmd": "set-locate" }));
+            live.locating.insert(mac);
+            crate::actions::queue(&mut live, mac, json!({ "_type": "cmd", "cmd": "kick-sta", "mac": C1 }));
+            crate::actions::queue(&mut live, mac, block.clone());
+        }
+        h.engine.handle(Input::Tick(100));
+        // Blocking is carried by its config anyway: kept, as it does no harm.
+        let live = h.live.read().unwrap();
+        assert_eq!(live.commands[&mac], [block]);
+        assert!(live.locating.is_empty());
+    }
+
+    #[test]
     fn a_forgotten_ap_leaves_nothing_behind() {
         let mut h = harness();
         let mac: Mac = AP1.parse().unwrap();
@@ -2669,6 +2812,29 @@ mod tests {
         assert!(live.clients[&C1.parse().unwrap()].connected);
         assert_eq!(live.counters.notifications.load(Ordering::Relaxed), 6);
         assert_eq!(live.devices[&AP1.parse().unwrap()].last_full_inform, 0, "notifications are not client lists");
+    }
+
+    #[test]
+    fn crash_reports_and_restarts_are_summed_up_when_stored() {
+        use base64::Engine as _;
+        let mut h = harness();
+        let crash = |h: &mut Harness, ts: Ts, text: &str| {
+            let payload = json!(base64::engine::general_purpose::STANDARD.encode(text));
+            h.engine.handle(Input::Inform { ts, peer: [10, 0, 0, 1].into(), decoded: notif(AP1, "crashlog", payload) });
+        };
+        // The fault line, not the first of the lines kept.
+        crash(&mut h, 1, "boot line\n[ 12.3] Kernel panic - not syncing: Fatal exception\nreboot");
+        crash(&mut h, 2, "no fault here\nnor here");
+        crash(&mut h, 3, "\n");
+        let summaries: Vec<Value> = stored(&h, EventKind::ApCrash).into_iter().map(|d| d.get("summary").cloned().unwrap_or(Value::Null)).collect();
+        assert_eq!(summaries, [json!("[ 12.3] Kernel panic - not syncing: Fatal exception"), json!("no fault here"), Value::Null]);
+        // A code sent as text is stored as a number; one that is no number is left out.
+        for (ts, code) in [(4, json!("139")), (5, json!(1)), (6, json!("n/a"))] {
+            let n = json!({ "event_string": "EVT_AP_RestartProc", "proc": "mcad", "exit_status": code, "caller": "init" });
+            h.engine.handle(Input::Inform { ts, peer: [10, 0, 0, 1].into(), decoded: notif(AP1, "event", n) });
+        }
+        let codes: Vec<Option<Value>> = stored(&h, EventKind::ApProcessRestarted).into_iter().map(|d| d.get("exit_status").cloned()).collect();
+        assert_eq!(codes, [Some(json!(139)), Some(json!(1)), None]);
     }
 
     #[test]
@@ -2775,10 +2941,10 @@ mod tests {
         let row: (String, String) = h.store.read(Db::Config, |c| Ok(c.query_row("SELECT cfgversion, system_cfg FROM device_config", [], |r| Ok((r.get(0)?, r.get(1)?)))?)).unwrap();
         assert_eq!(row, ("v2".into(), "aaa.1.hide_ssid=true\naaa.1.wpa.psk=<redacted>".into()));
         // The stored system_cfg stays what the next pushes are compared with: a
-        // second management-only push still names its sections, and the next full
-        // push gets a diff, not a baseline.
+        // second management-only push (which names no sections) leaves it, and
+        // the next full push gets a diff, not a baseline.
         push(&mut h, 35, json!({ "_type": "setparam", "mgmt_cfg": "a=3" }));
-        assert!(stored(&h, EventKind::ConfigPushed).pop().unwrap()["labels"].is_object());
+        assert_eq!(stored(&h, EventKind::ConfigPushed).pop().unwrap().get("labels"), None);
         push(&mut h, 40, json!({ "_type": "setparam", "mgmt_cfg": "a=4", "system_cfg": "aaa.1.hide_ssid=false\naaa.1.wpa.psk=old" }));
         let pushed = stored(&h, EventKind::ConfigPushed).pop().unwrap();
         assert_eq!((pushed["system_cfg"]["diff"].as_str(), pushed["mgmt_cfg"]["diff"].as_str()), (Some("~ aaa.1.hide_ssid: true -> false\n"), Some("~ a: 3 -> 4\n")));

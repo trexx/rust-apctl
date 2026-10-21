@@ -805,9 +805,9 @@ impl Watcher {
 /// Starts the alert watcher, fed by the engine through `events` (see [`channel`]).
 /// It keeps the engine's time (see [`crate::shadow::Clock`]): in shadow mode a
 /// lagging capture's, and while a capture is replayed it checks no AP's status
-/// or health, whose stored figures are then of the capture's time, and makes
-/// no alert of its events (they are history, not news). An event's alert
-/// carries the event's own time.
+/// or health, whose stored figures are then of the capture's time; it makes
+/// no alert of an event that is history, not news (`Clock::is_news`, by the
+/// event's own time). An event's alert carries the event's own time.
 pub fn spawn(store: Arc<Store>, writer: Writer, live: SharedLive, tx: broadcast::Sender<LiveMsg>, mut events: mpsc::Receiver<Event>, engine_clock: Arc<crate::shadow::Clock>) {
     tokio::spawn(async move {
         let now = || engine_clock.now().unwrap_or_else(clock::now_ts);
@@ -819,7 +819,7 @@ pub fn spawn(store: Arc<Store>, writer: Writer, live: SharedLive, tx: broadcast:
             // Events wait in the channel while a check runs.
             tokio::select! {
                 e = events.recv() => match e {
-                    Some(e) => if engine_clock.now().is_some() { w.event(e.ts, &e) },
+                    Some(e) => if engine_clock.is_news(e.ts) { w.event(e.ts, &e) },
                     None => return,
                 },
                 _ = status.tick() => if let Some(now) = engine_clock.now() { w.status_tick(now) },

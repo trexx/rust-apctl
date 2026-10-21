@@ -58,7 +58,7 @@ pub async fn activity(State(s): State<AppState>, Query(q): Query<RangeQuery>) ->
     let (from, to, tier) = window(&q);
     let bucket = bucket_for(to - from, tier);
     let one_band = q.band.clone().filter(|b| b != "all");
-    let ap = q.mac.as_ref().map(|m| m.to_ascii_lowercase());
+    let ap = q.mac.map(|m| m.to_string());
     // Site-wide, the SSIDs' counters are those the other site views read.
     let vaps = if ap.is_none() && one_band.is_none() {
         std::sync::Arc::new(with_site_vaps(&s, &q, move |vaps| vap_activity(vaps, from, bucket)).await?)
@@ -190,7 +190,7 @@ fn totals(samples: &Samples, [tx, rx]: [usize; 2], from: Ts) -> (f64, f64) {
 /// GET /api/site/top: APs and clients by traffic over the window.
 pub async fn top(State(s): State<AppState>, Query(q): Query<RangeQuery>) -> Result<Json<Value>, ApiError> {
     let (from, to, tier) = window(&q);
-    let ap = q.mac.as_ref().map(|m| m.to_ascii_lowercase());
+    let ap = q.mac.map(|m| m.to_string());
     // One AP's page lists only its clients: the APs are left out.
     let aps = if ap.is_some() {
         Vec::new()
@@ -460,7 +460,7 @@ pub async fn retries(State(s): State<AppState>, Query(q): Query<RangeQuery>) -> 
 pub async fn multicast(State(s): State<AppState>, Query(q): Query<RangeQuery>) -> Result<Json<Value>, ApiError> {
     let (from, to, tier) = window(&q);
     let bucket = bucket_for(to - from, tier);
-    let ap = q.mac.as_ref().map(|m| m.to_ascii_lowercase());
+    let ap = q.mac.map(|m| m.to_string());
     let got = memo_read(&s, Db::Metrics, "multicast", &q.read_by(true), tier, move |c| {
         let (suffix, step) = (TIERS[tier].suffix, TIERS[tier].step);
         // From a little before the window: what each sample covers starts before it.
@@ -1366,7 +1366,7 @@ mod tests {
 
         async fn outputs() -> Value {
             let (s, base, _store) = site();
-            let q = |band: Option<&str>, mac: Option<&str>| Query(RangeQuery { range: None, from: Some(base), to: Some(base + 3600), band: band.map(Into::into), mac: mac.map(Into::into) });
+            let q = |band: Option<&str>, mac: Option<&str>| Query(RangeQuery { range: None, from: Some(base), to: Some(base + 3600), band: band.map(Into::into), mac: mac.map(|m| m.parse().unwrap()) });
             let plan = |band: &str, dfs: bool| Query(PlanQuery { band: Some(band.into()), dfs: Some(dfs) });
             let st = || State(s.clone());
             let mut out = json!({
@@ -1426,7 +1426,7 @@ mod tests {
             t.db(Db::Metrics).execute("DELETE FROM vap_stats", []).unwrap();
             assert_eq!(ok(retries(State(s.clone()), q(None)).await), first, "read again within the time it is kept");
             // Retries are of every band: asked for one, they are the same read.
-            let band = Query(RangeQuery { band: Some("na".into()), mac: Some("02:00:00:00:00:A1".into()), ..q(None).0 });
+            let band = Query(RangeQuery { band: Some("na".into()), mac: "02:00:00:00:00:A1".parse().ok(), ..q(None).0 });
             assert_eq!(ok(retries(State(s.clone()), band).await), first, "the band and AP make no other read");
             assert_eq!(ok(retries(State(s), q(Some(600))).await), json!([]), "another query reads the database");
         }

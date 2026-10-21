@@ -351,8 +351,9 @@ impl Proxies {
             return peer;
         }
         let mut client = peer;
-        for hop in headers.get_all("x-forwarded-for").iter().filter_map(|v| v.to_str().ok()).flat_map(|v| v.split(',')).rev() {
-            let Some(ip) = hop_ip(hop.trim()) else {
+        // A line that is not text is one hop that is no address, not left out.
+        for hop in headers.get_all("x-forwarded-for").iter().map(|v| v.to_str().unwrap_or("?")).flat_map(|v| v.split(',')).rev() {
+            let Some(ip) = wire::hop_ip(hop.trim()) else {
                 // Skipping it would believe the hops left of it, which the
                 // client wrote: the last proxy's address is kept instead, so
                 // the clients behind it share their login attempts. Said once,
@@ -368,11 +369,6 @@ impl Proxies {
         }
         client
     }
-}
-
-/// The address of an X-Forwarded-For hop, with or without a port.
-fn hop_ip(hop: &str) -> Option<IpAddr> {
-    wire::hop_ip(hop)
 }
 
 /// Whether an Origin (`https://apctl.example:8443`) names this host (`apctl.example:8443`),
@@ -689,6 +685,11 @@ mod tests {
         // A hop that is no address: the client's own hops left of it are not believed.
         h.insert("x-forwarded-for", "6.6.6.6, unknown, 10.42.0.3".parse().unwrap());
         assert_eq!(proxies.client_ip(&h, ip("10.42.0.5")), ip("10.42.0.3"));
+        // Nor past a line that is not text, which a proxy may have appended to.
+        let mut h = HeaderMap::new();
+        h.append("x-forwarded-for", "6.6.6.6".parse().unwrap());
+        h.append("x-forwarded-for", axum::http::HeaderValue::from_bytes(b"\xff, 10.42.0.3").unwrap());
+        assert_eq!(proxies.client_ip(&h, ip("10.42.0.5")), ip("10.42.0.5"));
         assert!(Proxies::parse(&["10.0.0.0/33".into()]).is_err());
         assert!(Proxies::parse(&["proxy.example".into()]).is_err());
         assert!(Proxies::parse(&["fd00::/8".into()]).unwrap().contains(ip("fd12::1")));

@@ -462,10 +462,8 @@ struct Cache {
     used: Vec<(String, String, Option<String>)>,
     /// Per BSSID: its last change, as last worked out.
     changes: HashMap<String, Change>,
-    /// When `ap_names`, `clients` and `watching_since` were read.
+    /// When `clients` and `watching_since` were read.
     names_at: Ts,
-    /// The stored names of our APs.
-    ap_names: HashMap<String, Option<String>>,
     /// Every client ever seen, with its stored name, ready for [`assess`].
     clients: Arc<[Client]>,
     /// When the first neighbouring network still kept was recorded.
@@ -611,9 +609,7 @@ pub fn gather(store: &Store, state: &ThreatState, live: &SharedLive, now: Ts) ->
     store.read(Db::Config, |c| {
         // The names and the first network heard change slowly, and reading them takes scans.
         if !(0..CACHE_SECS).contains(&(now - cache.names_at)) {
-            let names = crate::connections::Names::load(c)?;
-            cache.ap_names = names.aps;
-            cache.clients = sorted_clients(names.clients).into();
+            cache.clients = sorted_clients(crate::connections::Names::load(c)?.clients).into();
             cache.watching_since = c.query_row("SELECT MIN(first_seen) FROM neighbors", [], |r| r.get::<_, Option<Ts>>(0))?;
             cache.names_at = now;
         }
@@ -648,16 +644,14 @@ pub fn gather(store: &Store, state: &ThreatState, live: &SharedLive, now: Ts) ->
     })?;
     // Our APs and every Wi-Fi client ever seen, with their names (aliases
     // first): the stored clients as they were read, what is live on top.
-    let mut names = crate::connections::Names { aps: cache.ap_names.clone(), clients: HashMap::new() };
     a.clients = cache.clients.clone();
     drop(cache);
     a.acks = state.with_acks(store, |acks| acks.clone())?;
     let live = live.read().unwrap();
-    names.add_live_aps(&live);
-    for (mac, name) in names.aps {
-        let e = a.aps.entry(mac).or_insert(None);
-        if name.is_some() {
-            *e = name;
+    for mac in live.devices.keys().chain(live.known_devices.keys()) {
+        let e = a.aps.entry(mac.to_string()).or_insert(None);
+        if let Some(name) = crate::series::ap_name_of(&live, mac) {
+            *e = Some(name);
         }
     }
     a.live_clients = live_clients(&live, &a.clients);

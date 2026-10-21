@@ -80,20 +80,16 @@ impl Backups {
     }
 
     /// The backup settings: the stored ones, read once (the defaults when
-    /// none are stored, or, with a warning, while they cannot be read).
+    /// none are stored). An error while they cannot be read: the schedule
+    /// then makes and prunes nothing rather than act on the defaults.
     /// The lock is never held while the database or the directory is read.
-    fn settings(&self, store: &store::Store) -> Settings {
+    fn settings(&self, store: &store::Store) -> Result<Settings> {
         if let Some(s) = &self.known().settings {
-            return s.clone();
+            return Ok(s.clone());
         }
-        match load_settings(store) {
-            // Settings saved meanwhile are newer than the ones read.
-            Ok(s) => self.known().settings.get_or_insert(s).clone(),
-            Err(e) => {
-                tracing::warn!("the backup settings could not be read, the defaults apply: {e:#}");
-                Settings::default()
-            }
-        }
+        // Settings saved meanwhile are newer than the ones read.
+        let s = load_settings(store)?;
+        Ok(self.known().settings.get_or_insert(s).clone())
     }
 
     /// When the newest automatic backup was made (0: none).
@@ -322,6 +318,11 @@ pub struct Meta {
     pub days: i64,
     pub size: u64,
     pub encrypted: bool,
+    /// The databases it holds ("config.db", "metrics.db", ...): a pre-restore
+    /// copy (`days` -1) holds only those the restore replaced. Empty for a
+    /// backup described before this was kept.
+    #[serde(default)]
+    pub files: Vec<String>,
 }
 
 fn sha256_file(path: &Path) -> Result<FileInfo> {
@@ -400,9 +401,6 @@ fn copy_for_backup(name: &str, src: &Path, dst: &Path, cutoff: Option<Ts>) -> Re
     }
 }
 
-/// config.db's history: each table with the column its rows' time is in.
-const CONFIG_HISTORY: [(&str, &str); 5] = [("events", "ts"), ("connections", "ts"), ("neighbors", "last_seen"), ("spectrum", "ts"), ("dryrun_results", "ts")];
-
 /// A consistent copy of the live config.db without the history older than
 /// `t` and without the sessions. It is built rather than copied whole and
 /// trimmed: a daily settings backup reads a year of events, but writes none.
@@ -432,14 +430,14 @@ fn trimmed_config(src: &Path, dst: &Path, t: Ts) -> Result<()> {
             continue;
         }
         let copy = format!("INSERT INTO main.\"{name}\" SELECT * FROM live.\"{name}\"");
-        match CONFIG_HISTORY.iter().find(|(table, _)| table == name) {
-            Some((_, col)) => tx.execute(&format!("{copy} WHERE \"{col}\" >= ?1 OR \"{col}\" IS NULL"), [t])?,
+        match store::CONFIG_HISTORY.iter().find(|(table, _)| table == name) {
+            Some((_, col)) => tx.execute(&format!("{copy} WHERE \"{col}\" >= ?1"), [t])?,
             None => tx.execute(&copy, [])?,
         };
     }
     // As retention does, on the copy: an alert still open travels, so a restore
     // neither raises it again nor loses when it started.
-    tx.execute("DELETE FROM alerts WHERE ts < ?1 AND resolved_ts < ?1", [t])?;
+    tx.execute(store::FORGET_RESOLVED_ALERTS, [t])?;
     tx.execute(store::FORGET_OLD_CLIENTS, [t])?;
     tx.commit()?;
     c.execute_batch("DETACH DATABASE live;")?;
@@ -583,7 +581,8 @@ fn create_of(b: &Backups, src_dir: &Path, kind: Kind, days: i64, names: &[&str])
         // is: a backup is never without one, and one left without its backup
         // (by a crash) is removed at the next start.
         let size = fs::metadata(&part)?.len();
-        let meta = Meta { name: name.clone(), kind, version: VERSION.into(), created: now, days, size, encrypted: b.key.is_some() };
+        let files = manifest.files.into_keys().collect();
+        let meta = Meta { name: name.clone(), kind, version: VERSION.into(), created: now, days, size, encrypted: b.key.is_some(), files };
         let mut f = fs::OpenOptions::new().write(true).create_new(true).open(tmp.join("meta.json"))?;
         f.write_all(&serde_json::to_vec_pretty(&meta)?)?;
         f.sync_all()?;
@@ -930,7 +929,9 @@ pub enum Frequency {
     Monthly,
 }
 
+/// A field missing from the stored settings (one added since) takes its default.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
 pub struct Settings {
     pub enabled: bool,
     pub frequency: Frequency,
@@ -1047,6 +1048,7 @@ pub fn schedule(b: Backups, store: Arc<store::Store>) {
         every.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         // After a failed automatic backup, the next try waits an hour.
         let mut retry_at: Ts = 0;
+        let mut unreadable = false;
         loop {
             every.tick().await;
             let (b2, st) = (b.clone(), store.clone());
@@ -1055,6 +1057,18 @@ pub fn schedule(b: Backups, store: Arc<store::Store>) {
                 (b2.settings(&st), b2.last_auto())
             });
             let Ok((s, last)) = checked.await else { continue };
+            // The defaults could re-enable a schedule turned off, and prune
+            // backups the stored `keep` keeps: no backup until they are read.
+            let s = match s {
+                Ok(s) => s,
+                Err(e) => {
+                    if !std::mem::replace(&mut unreadable, true) {
+                        tracing::warn!("the backup settings could not be read, no automatic backup is made until they can: {e:#}");
+                    }
+                    continue;
+                }
+            };
+            unreadable = false;
             if !s.enabled {
                 continue;
             }
@@ -1096,7 +1110,11 @@ pub async fn index(State(s): State<AppState>) -> Result<Json<Value>, ApiError> {
     let store = s.store.clone();
     let (settings, list, staged, failed) = tokio::task::spawn_blocking(move || {
         let staged = b.staging().join("pending").exists();
-        (b.settings(&store), list(&b), staged, fs::read_to_string(b.staging().join("pending.failed")).ok())
+        let settings = b.settings(&store).unwrap_or_else(|e| {
+            tracing::warn!("the backup settings could not be read, the defaults are shown: {e:#}");
+            Settings::default()
+        });
+        (settings, list(&b), staged, fs::read_to_string(b.staging().join("pending.failed")).ok())
     })
     .await?;
     let next = settings.enabled.then(|| settings.next_due(clock::now_ts()));
@@ -1582,6 +1600,7 @@ mod tests {
         assert_eq!(count(&src.join("config.db"), "SELECT COUNT(*) FROM client_aliases"), 1, "restored");
         assert_eq!(count(&src.join("metrics.db"), "SELECT COUNT(*) FROM ap_stats"), 2, "the statistics are left in place");
         let pre = list(&b).into_iter().find(|x| x.kind == Kind::PreRestore).expect("the replaced settings were saved");
+        assert_eq!((pre.days, pre.files.as_slice()), (-1, ["config.db".to_string()].as_slice()), "listed with what it holds");
         let out = dir("apply-settings-pre");
         let saved = unpack(&b.dir().join(&pre.name), None, &out).unwrap();
         assert_eq!(saved.files.keys().collect::<Vec<_>>(), ["config.db"], "only what the restore replaced");
@@ -2071,5 +2090,24 @@ mod tests {
         assert_eq!(serde_json::to_value(&monthly).unwrap()["frequency"], "monthly");
         assert_eq!(serde_json::to_value(Kind::PreRestore).unwrap(), "pre-restore");
         assert_eq!(serde_json::from_str::<Kind>("\"auto\"").unwrap(), Kind::Auto);
+        let before = json!({ "name": "apctl-x.apb", "kind": "auto", "version": "0.1.0", "created": 1, "days": 0, "size": 1, "encrypted": false });
+        assert!(serde_json::from_value::<Meta>(before).unwrap().files.is_empty(), "described before the files were");
+    }
+
+    #[test]
+    fn unreadable_settings_are_an_error_not_the_defaults() {
+        let d = dir("settings");
+        let (store, writer) = store::Store::open(&d).unwrap();
+        let b = Backups::new(d.to_path_buf(), None);
+        let put = |json: &str| {
+            writer.exec(Db::Config, "INSERT OR REPLACE INTO backup_settings (id, json) VALUES (1, ?1)", vec![rusqlite::types::Value::Text(json.into())]);
+            crate::model::tests::flushed(&writer);
+        };
+        // Stored before a field was added: the new field takes its default.
+        put(r#"{"enabled":false,"frequency":"weekly","minute_utc":60,"weekday":2,"monthday":1,"keep":100}"#);
+        assert_eq!(load_settings(&store).unwrap(), Settings { enabled: false, frequency: Frequency::Weekly, minute_utc: 60, weekday: 2, keep: 100, ..Settings::default() });
+        // Not readable at all: no defaults for the schedule to act on.
+        put("not json");
+        assert!(b.settings(&store).is_err());
     }
 }

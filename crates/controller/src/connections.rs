@@ -29,7 +29,7 @@ use serde_json::{Value, json};
 use crate::api::{ApiError, AppState, Json, Query};
 use crate::engine::Live;
 use crate::api::read;
-use crate::series::{RangeQuery, ap_name, ap_name_of, client_name, memo_read, window};
+use crate::series::{RangeQuery, ap_name, client_name, memo_read, window};
 use crate::model::Ts;
 use crate::store::Db;
 
@@ -125,8 +125,39 @@ pub struct ConnEvent {
     pub vap: Option<String>,
     pub essid: Option<String>,
     pub radio: Option<String>,
-    pub event_type: String,
+    pub event_type: Report,
     pub n: ConnDetail,
+}
+
+/// What a connection-tracking notification reports, from its `event_type`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Report {
+    Failure,
+    SoftFailure,
+    Success,
+    /// A later report that corrects a failure (see `merge_fixups`).
+    Fixup,
+    /// The client left for another AP (`sta_roam`) or left (`sta_leave`).
+    Roam,
+    Leave,
+    /// Any other (an association, ...): neither an attempt nor a leave.
+    Other,
+}
+
+impl Report {
+    /// Each type but `Other`, with its `event_type` as the APs send it.
+    const NAMES: [(Report, &str); 6] = [
+        (Report::Failure, "failure"), (Report::SoftFailure, "soft failure"), (Report::Success, "success"), (Report::Fixup, "fixup"),
+        (Report::Roam, "sta_roam"), (Report::Leave, "sta_leave"),
+    ];
+
+    pub fn parse(event_type: &str) -> Report {
+        Report::NAMES.iter().find(|(_, n)| *n == event_type).map_or(Report::Other, |(r, _)| *r)
+    }
+
+    fn is_failure(self) -> bool {
+        matches!(self, Report::Failure | Report::SoftFailure)
+    }
 }
 
 /// Connection stages in the order a client passes them.
@@ -159,8 +190,10 @@ fn failure(n: &ConnDetail) -> Option<(usize, &'static str)> {
     FAILURES.iter().rev().find(|f| (f.2)(n)).map(|f| (f.0, f.1))
 }
 
-/// Below this signal (dBm), a failure is not the network's fault: not counted.
-const WEAK_SIGNAL: f64 = -75.0;
+/// Below this signal (dBm), a client's signal is weak: a failure at it is not
+/// the network's fault, so not counted; also the overview's weak-signal count
+/// (GET /api/status), and the UI's "fair" threshold.
+pub const WEAK_SIGNAL: i64 = -75;
 
 /// The signal a report was made at.
 fn rssi(n: &ConnDetail) -> Option<f64> {
@@ -170,26 +203,26 @@ fn rssi(n: &ConnDetail) -> Option<f64> {
 /// The furthest failure an attempt that did not succeed is counted with:
 /// none if it shows none, or was made at a weak signal.
 fn counted_failure(n: &ConnDetail) -> Option<(usize, &'static str)> {
-    if rssi(n).is_some_and(|r| r < WEAK_SIGNAL) { None } else { failure(n) }
+    if rssi(n).is_some_and(|r| r < WEAK_SIGNAL as f64) { None } else { failure(n) }
 }
 
 /// A failure report as it comes in, by the connection views' rules: the
 /// label of the failure they count it with, or none if they count it as a
 /// success or not at all. (A fixup that comes later can still make it a success.)
-pub(crate) fn reported_failure(event_type: &str, n: &ConnDetail) -> Option<&'static str> {
-    if !matches!(event_type, "failure" | "soft failure") || succeeded(event_type, n) {
+pub(crate) fn reported_failure(event_type: Report, n: &ConnDetail) -> Option<&'static str> {
+    if !event_type.is_failure() || succeeded(event_type, n) {
         return None;
     }
     counted_failure(n).map(|(_, label)| label)
 }
 
 /// A soft failure that kept its IP by roaming.
-fn roamed(event_type: &str, n: &ConnDetail) -> bool {
-    event_type == "soft failure" && text(&n.ip_assign_type).is_some_and(|v| v.starts_with("roam"))
+fn roamed(event_type: Report, n: &ConnDetail) -> bool {
+    event_type == Report::SoftFailure && text(&n.ip_assign_type).is_some_and(|v| v.starts_with("roam"))
 }
 
-fn succeeded(event_type: &str, n: &ConnDetail) -> bool {
-    event_type != "failure"
+fn succeeded(event_type: Report, n: &ConnDetail) -> bool {
+    event_type != Report::Failure
         && (roamed(event_type, n) || (n.traffic_delta.is_none() && text(&n.dns_resp_seen) == Some("yes")) || (pos(&n.traffic_delta) && pos(&n.dns_responses)))
 }
 
@@ -248,7 +281,7 @@ pub struct Attempt {
 const FIXUP_WITHIN: Ts = 1200;
 
 /// The reports that are connection attempts (or fix one up).
-const ATTEMPT_TYPES: [&str; 4] = ["failure", "soft failure", "success", "fixup"];
+const ATTEMPT_TYPES: [Report; 4] = [Report::Failure, Report::SoftFailure, Report::Success, Report::Fixup];
 
 /// An event id as a fixup is matched to a failure by it: equal as [`Field`]s
 /// are (so a NaN matches nothing).
@@ -298,15 +331,15 @@ fn merge_fixups(mut events: Vec<ConnEvent>) -> Vec<(ConnEvent, bool, bool)> {
                 }
             }
             let Some(k) = fixup_key(e) else { continue };
-            if e.event_type == "fixup" {
+            if e.event_type == Report::Fixup {
                 into[i] = open.get(&k).copied();
-            } else if e.event_type.contains("failure") {
+            } else if e.event_type.is_failure() {
                 open.insert(k, i);
                 queue.push_back((i, k));
             }
         }
     }
-    let mut ok: Vec<bool> = events.iter().map(|e| succeeded(&e.event_type, &e.n)).collect();
+    let mut ok: Vec<bool> = events.iter().map(|e| succeeded(e.event_type, &e.n)).collect();
     let mut fixed = vec![false; events.len()];
     for (i, f) in into.iter().enumerate() {
         if let Some(f) = *f {
@@ -321,7 +354,7 @@ fn merge_fixups(mut events: Vec<ConnEvent>) -> Vec<(ConnEvent, bool, bool)> {
 
 /// Connection attempts from the notifications, oldest first.
 pub fn attempts(mut events: Vec<ConnEvent>) -> Vec<Attempt> {
-    events.retain(|e| ATTEMPT_TYPES.contains(&e.event_type.as_str()));
+    events.retain(|e| ATTEMPT_TYPES.contains(&e.event_type));
     events.sort_by_key(|e| e.ts);
     merge_fixups(events)
         .into_iter()
@@ -336,7 +369,7 @@ pub fn attempts(mut events: Vec<ConnEvent>) -> Vec<Attempt> {
             };
             Some(Attempt {
                 ts: e.ts,
-                roam: roamed(&e.event_type, n),
+                roam: roamed(e.event_type, n),
                 channel: int(&n.x_channel),
                 bw: int(&n.x_bw),
                 success: ok,
@@ -436,7 +469,7 @@ fn band_rank(radio: Option<&str>) -> u8 {
 }
 
 /// The reports of a client leaving an AP.
-const LEAVE_TYPES: [&str; 2] = ["sta_roam", "sta_leave"];
+const LEAVE_TYPES: [Report; 2] = [Report::Roam, Report::Leave];
 
 /// Roams: a client leaving one AP paired with it joining another.
 pub fn roams(events: &[ConnEvent]) -> Vec<Roam> {
@@ -448,7 +481,7 @@ pub fn roams(events: &[ConnEvent]) -> Vec<Roam> {
     for (client, mut evs) in by_client {
         evs.sort_by_key(|e| e.ts);
         // Whether each event is a leave, and whether it carries the signal a join needs.
-        let leave: Vec<bool> = evs.iter().map(|e| LEAVE_TYPES.contains(&e.event_type.as_str())).collect();
+        let leave: Vec<bool> = evs.iter().map(|e| LEAVE_TYPES.contains(&e.event_type)).collect();
         let joined: Vec<bool> = evs.iter().zip(&leave).map(|(e, l)| !l && num(&e.n.auth_rssi).is_some()).collect();
         // The joins already paired with a leave.
         let mut used = vec![false; evs.len()];
@@ -466,7 +499,7 @@ pub fn roams(events: &[ConnEvent]) -> Vec<Roam> {
             let Some((ji, j)) = join else { continue };
             used[ji] = true;
             let gap = j.ts - l.ts;
-            let success = l.event_type == "sta_roam" || gap.abs() <= 1;
+            let success = l.event_type == Report::Roam || gap.abs() <= 1;
             let status = num(&l.n.assoc_status).unwrap_or(0.0) as i64;
             out.push(Roam {
                 ts: j.ts.max(l.ts),
@@ -576,7 +609,7 @@ fn event_of(r: &rusqlite::Row) -> rusqlite::Result<ConnEvent> {
         avg_rssi: r.get::<_, Option<i64>>(11).ok().flatten().map(Field::Int),
         ..Default::default()
     });
-    Ok(ConnEvent { ts: r.get(0)?, ap: r.get(1)?, client: r.get(2)?, vap: r.get(3)?, essid: r.get(4)?, radio: r.get(5)?, event_type: r.get(6)?, n })
+    Ok(ConnEvent { ts: r.get(0)?, ap: r.get(1)?, client: r.get(2)?, vap: r.get(3)?, essid: r.get(4)?, radio: r.get(5)?, event_type: Report::parse(r.get_ref(6)?.as_str()?), n })
 }
 
 /// The rows of [`SELECT_EVENTS`] in a window, optionally one client's, that also
@@ -644,11 +677,10 @@ fn newest(c: &rusqlite::Connection, from: Ts, to: Ts, client: Option<&str>, limi
     Ok((list, r))
 }
 
-/// Clients apctl knows, by MAC, with their display names if they have one,
-/// and (only once `add_live_aps` has put them in) every AP's.
+/// Clients apctl has stored, by MAC, with their stored names if they have one.
+/// The APs' names are in the live view (see `series::ap_name_of`).
 #[derive(Debug, Default, Clone)]
 pub struct Names {
-    pub aps: HashMap<String, Option<String>>,
     pub clients: HashMap<String, Option<String>>,
 }
 
@@ -661,15 +693,14 @@ fn pairs<P: rusqlite::Params>(c: &rusqlite::Connection, sql: &str, params: P) ->
 const CLIENT_NAMES: &str = "SELECT mac, hostname FROM clients WHERE mac IN (SELECT value FROM json_each(?1))";
 
 impl Names {
-    /// From the database: clients' hostnames. The APs' are in the live view
-    /// (`Live::known_devices` holds the stored ones).
+    /// From the database: clients' hostnames.
     pub fn load(c: &rusqlite::Connection) -> rusqlite::Result<Names> {
-        Ok(Names { aps: HashMap::new(), clients: pairs(c, "SELECT mac, hostname FROM clients", [])? })
+        Ok(Names { clients: pairs(c, "SELECT mac, hostname FROM clients", [])? })
     }
 
     /// The same for some clients only.
     fn load_for(c: &rusqlite::Connection, clients: &BTreeSet<&str>) -> anyhow::Result<Names> {
-        Ok(Names { aps: HashMap::new(), clients: pairs(c, CLIENT_NAMES, [serde_json::to_string(clients)?])? })
+        Ok(Names { clients: pairs(c, CLIENT_NAMES, [serde_json::to_string(clients)?])? })
     }
 
     /// A client's display name: its alias, else what it reports now, else what was stored.
@@ -677,14 +708,6 @@ impl Names {
         client_name(live, mac.parse().ok()).map(str::to_string).or_else(|| self.clients.get(mac).cloned().flatten())
     }
 
-    /// The names of every AP `live` knows (see `series::ap_name_of`), on top.
-    pub fn add_live_aps(&mut self, live: &Live) {
-        for mac in live.devices.keys().chain(live.known_devices.keys()) {
-            let m = mac.to_string();
-            let name = ap_name_of(live, mac).or_else(|| self.aps.remove(&m).flatten());
-            self.aps.insert(m, name);
-        }
-    }
 }
 
 /// Display names of these APs and clients, for the ones that have one.
@@ -725,7 +748,7 @@ pub struct ListQuery {
     range: Option<Ts>,
     from: Option<Ts>,
     to: Option<Ts>,
-    /// One client only.
+    /// One client only, in any form a MAC is written in (else 400).
     client: Option<String>,
     /// Only failed attempts.
     #[serde(default)]
@@ -738,7 +761,7 @@ pub struct ListQuery {
 /// GET /api/connections: connection attempts and roams, newest first.
 pub async fn list(State(s): State<AppState>, Query(q): Query<ListQuery>) -> Result<Json<Value>, ApiError> {
     let (from, to, _) = window(&RangeQuery { range: q.range, from: q.from, to: q.to, ..Default::default() });
-    let client = q.client.map(|c| c.to_ascii_lowercase());
+    let client = q.client.as_deref().map(crate::api::parse_mac).transpose()?.map(|m| m.to_string());
     let limit = q.limit.unwrap_or(500).min(5000);
     let with_roams = q.roams.unwrap_or(true);
     let live = s.live.clone();
@@ -820,7 +843,7 @@ mod tests {
             vap: Some("wifi1ap0".into()),
             essid: Some("Home".into()),
             radio: Some("na".into()),
-            event_type: event_type.into(),
+            event_type: Report::parse(event_type),
             n: serde_json::from_value(n).unwrap(),
         }
     }
@@ -863,8 +886,13 @@ mod tests {
 
     #[test]
     fn the_report_conditions_name_the_report_types() {
-        assert_eq!(ATTEMPTS_ONLY, format!("AND event_type IN ('{}')", ATTEMPT_TYPES.join("', '")));
-        assert!(NEAR_A_LEAVE.ends_with(&format!("l.event_type IN ('{}'))", LEAVE_TYPES.join("', '"))), "{NEAR_A_LEAVE}");
+        let names = |types: &[Report]| types.iter().map(|t| Report::NAMES.iter().find(|(r, _)| r == t).unwrap().1).collect::<Vec<_>>().join("', '");
+        assert_eq!(ATTEMPTS_ONLY, format!("AND event_type IN ('{}')", names(&ATTEMPT_TYPES)));
+        assert!(NEAR_A_LEAVE.ends_with(&format!("l.event_type IN ('{}'))", names(&LEAVE_TYPES))), "{NEAR_A_LEAVE}");
+        for (r, name) in Report::NAMES {
+            assert_eq!(Report::parse(name), r);
+        }
+        assert_eq!(Report::parse("failure2"), Report::Other, "no type matched by a part of its name");
     }
 
     #[test]
@@ -900,11 +928,11 @@ mod tests {
         fn by_scan(events: Vec<ConnEvent>) -> Vec<(ConnEvent, bool, bool)> {
             let mut merged: Vec<(ConnEvent, bool, bool)> = Vec::new();
             for e in events {
-                let ok = succeeded(&e.event_type, &e.n);
-                if e.event_type == "fixup"
+                let ok = succeeded(e.event_type, &e.n);
+                if e.event_type == Report::Fixup
                     && let Some(id) = e.n.event_id.as_ref().filter(|v| **v != Field::Null)
                     && let Some(prev) = merged.iter_mut().rev().take_while(|(p, _, _)| e.ts - p.ts <= FIXUP_WITHIN).find(|(p, _, _)| {
-                        p.ap == e.ap && p.client == e.client && p.vap == e.vap && p.n.event_id.as_ref() == Some(id) && p.event_type.contains("failure")
+                        p.ap == e.ap && p.client == e.client && p.vap == e.vap && p.n.event_id.as_ref() == Some(id) && p.event_type.is_failure()
                     })
                 {
                     prev.0.n.merge(&e.n);

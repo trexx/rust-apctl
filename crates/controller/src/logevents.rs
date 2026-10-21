@@ -103,6 +103,15 @@ fn fault(msg: &str) -> Option<(CrashKind, Option<String>)> {
     }
 }
 
+/// The line that sums up a crash report: the first that reports a fault (as
+/// `fault` reads it), else the first. None when there are no lines. Stored as
+/// the `ap_crash` event's `summary`.
+pub fn crash_summary<S: AsRef<str>>(lines: &[S]) -> Option<&str> {
+    let mut lines = lines.iter().map(AsRef::as_ref);
+    let first = lines.clone().next()?;
+    Some(lines.find(|l| fault(l).is_some()).unwrap_or(first))
+}
+
 struct Crash {
     started: Ts,
     kind: CrashKind,
@@ -375,7 +384,11 @@ impl LogEvents {
     fn flush(&mut self, dev: Mac, now: Ts) -> Option<Event> {
         let c = self.crashes.remove(&dev)?;
         self.crash_reported.insert(dev, now);
-        let data = json!({ "kind": c.kind.as_str(), "process": c.process, "source": "syslog", "lines": c.lines });
+        let mut data = json!({ "kind": c.kind.as_str(), "process": c.process, "source": "syslog" });
+        if let Some(summary) = crash_summary(&c.lines) {
+            data["summary"] = json!(summary);
+        }
+        data["lines"] = json!(c.lines);
         Some(Event::device(now, EventKind::ApCrash, dev, data))
     }
 
@@ -506,6 +519,7 @@ mod tests {
         assert_eq!(f.len(), 1);
         assert_eq!((f[0].kind, f[0].data["process"].as_str()), (EventKind::ApCrash, Some("mcad")));
         assert_eq!(f[0].data["lines"].as_array().map(Vec::len), Some(2));
+        assert_eq!(f[0].data["summary"], "kernel: do_page_fault(): sending SIGSEGV to mcad for invalid read access from 00000000");
         // Another crash within 10 minutes of the report is not reported.
         assert!(l.feed(&line(300, "kernel", "Kernel panic - not syncing: Fatal exception")).is_empty());
         assert!(l.tick(700).is_empty());
