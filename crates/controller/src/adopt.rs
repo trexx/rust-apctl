@@ -80,26 +80,40 @@ pub struct Adoption {
 
 /// An adoption's record edit under way: while it is held, another adoption
 /// of the AP is refused. A second edit would give the AP a new key after the
-/// first one's key may have been handed out, which strands it. Released when
-/// dropped (which takes the `Live` lock: not while holding it).
+/// first one's key may have been handed out, which strands it. Released with
+/// [`Claim::release`] inside the write that marks the AP as being adopted, or
+/// when dropped (which takes the `Live` lock: not while holding it).
 pub struct Claim<'a> {
     live: &'a RwLock<Live>,
     mac: Mac,
+    released: bool,
 }
 
 impl Claim<'_> {
-    /// Claims the AP, unless another adoption's record edit holds it already.
+    /// Claims the AP, unless another adoption holds it: one whose record edit
+    /// is under way, or one under way (Adopt pressed, or over SSH) that has not
+    /// timed out. The same rule for both ways of adopting.
     pub fn take(live: &RwLock<Live>, mac: Mac) -> Result<Claim<'_>, ApiError> {
-        if !live.write().unwrap().adoption.starting.insert(mac) {
+        let mut l = live.write().unwrap();
+        let a = &mut l.adoption;
+        if a.adopting.get(&mac).is_some_and(|x| x.current(clock::now_ts())) || !a.starting.insert(mac) {
             return Err(ApiError::conflict("this AP is being adopted already"));
         }
-        Ok(Claim { live, mac })
+        Ok(Claim { live, mac, released: false })
+    }
+
+    /// Releases the claim within a write of `Live` the caller holds.
+    pub fn release(mut self, live: &mut Live) {
+        live.adoption.starting.remove(&self.mac);
+        self.released = true;
     }
 }
 
 impl Drop for Claim<'_> {
     fn drop(&mut self) {
-        self.live.write().unwrap().adoption.starting.remove(&self.mac);
+        if !self.released {
+            self.live.write().unwrap().adoption.starting.remove(&self.mac);
+        }
     }
 }
 
@@ -113,6 +127,13 @@ pub struct Adopting {
     /// could ask for it under the AP's MAC, and read what earlier pushes sent
     /// under it). Every other adoption hands out a new key.
     pub kept_key: bool,
+}
+
+impl Adopting {
+    /// Whether it is still under way at `now`: the AP has [`ADOPT_TIMEOUT`] to come back with its key.
+    pub fn current(&self, now: Ts) -> bool {
+        now - self.since < ADOPT_TIMEOUT
+    }
 }
 
 /// The AP's record in the settings, whatever its site (see
@@ -223,7 +244,7 @@ pub fn note_pending(live: &mut Live, payload: Value, known: bool, now: Ts, sourc
 /// out. Forgets that timed out are finished by [`spawn`].
 pub fn expire(live: &mut Live, now: Ts) {
     live.adoption.pending.retain(|_, p| now - p.last_seen < PENDING_TIMEOUT);
-    live.adoption.adopting.retain(|_, a| now - a.since < ADOPT_TIMEOUT);
+    live.adoption.adopting.retain(|_, a| a.current(now));
 }
 
 /// What `radio_table` reads of each radio in an inform's `radio_table`.
@@ -445,7 +466,7 @@ pub async fn pending(State(s): State<AppState>) -> Json<Value> {
         let live = s.live.read().unwrap();
         let a = &live.adoption;
         let pending: Vec<Pending> = a.pending.values().filter(|p| now - p.last_seen < PENDING_TIMEOUT).cloned().collect();
-        let adopting: Vec<(Mac, Ts)> = a.adopting.iter().filter(|(_, a)| now - a.since < ADOPT_TIMEOUT).map(|(m, a)| (*m, a.since)).collect();
+        let adopting: Vec<(Mac, Ts)> = a.adopting.iter().filter(|(_, a)| a.current(now)).map(|(m, a)| (*m, a.since)).collect();
         let forgetting: Vec<(Mac, Ts)> = a.forgetting.iter().map(|(m, t)| (*m, *t)).collect();
         (pending, adopting, forgetting)
     };
@@ -459,14 +480,8 @@ pub async fn adopt(State(s): State<AppState>, MacPath(mac): MacPath) -> Result<J
     // Taken out of the list before the edit, so that a second Adopt (or one
     // over SSH) does not give the AP another key meanwhile.
     let claim = Claim::take(&s.live, mac)?;
-    let pending = {
-        let mut live = s.live.write().unwrap();
-        let a = &mut live.adoption;
-        if a.adopting.get(&mac).is_some_and(|x| clock::now_ts() - x.since < ADOPT_TIMEOUT) {
-            return Err(ApiError::conflict("this AP is being adopted already"));
-        }
-        a.pending.remove(&mac).ok_or_else(|| ApiError::not_found("this AP is not waiting for adoption"))?
-    };
+    let pending = s.live.write().unwrap().adoption.pending.remove(&mac);
+    let pending = pending.ok_or_else(|| ApiError::not_found("this AP is not waiting for adoption"))?;
     let payload = pending.payload.clone();
     let inform = payload.clone();
     let edited = crate::actions::apply_edit(&s, Box::new(move |state: &mut Value| adopt_device(state, &mac, &inform))).await;
@@ -479,8 +494,8 @@ pub async fn adopt(State(s): State<AppState>, MacPath(mac): MacPath) -> Result<J
         } else {
             live.adoption.pending.entry(mac).or_insert(pending);
         }
+        claim.release(&mut live);
     }
-    drop(claim);
     edited?;
     s.note(Event::device(clock::now_ts(), EventKind::ApAdopting, mac, json!({ "model": payload["model"], "ip": payload["ip"] }))).await;
     Ok(Json(json!({ "adopting": true })))
@@ -527,6 +542,24 @@ pub async fn finish_forget(engine: &tokio::sync::mpsc::Sender<Input>, mac: Mac, 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_ap_being_adopted_cannot_be_claimed_again() {
+        let live = RwLock::new(Live::default());
+        let mac: Mac = "02:00:00:00:00:01".parse().unwrap();
+        let now = clock::now_ts();
+        live.write().unwrap().adoption.adopting.insert(mac, Adopting { since: now, kept_key: false });
+        assert!(Claim::take(&live, mac).is_err(), "Adopt pressed: an adoption over SSH is refused too");
+        // One that timed out is no adoption under way.
+        live.write().unwrap().adoption.adopting.insert(mac, Adopting { since: now - ADOPT_TIMEOUT, kept_key: false });
+        let Ok(claim) = Claim::take(&live, mac) else { panic!("a timed-out adoption holds no claim") };
+        assert!(Claim::take(&live, mac).is_err(), "its record edit is under way");
+        // Released within the caller's write: no second lock is taken.
+        claim.release(&mut live.write().unwrap());
+        assert!(live.read().unwrap().adoption.starting.is_empty());
+        assert!(Claim::take(&live, mac).is_ok());
+        assert!(live.read().unwrap().adoption.starting.is_empty(), "or when dropped");
+    }
 
     fn state() -> Value {
         json!({

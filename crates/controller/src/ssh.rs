@@ -354,8 +354,11 @@ pub async fn adopt(State(s): State<AppState>, Json(b): Json<AdoptBody>) -> Resul
     let key = hex::encode(key);
     // Expected from now on: the AP may inform with its key before the command returns.
     let adopting = crate::adopt::Adopting { since: clock::now_ts(), kept_key: !created };
-    s.live.write().unwrap().adoption.adopting.insert(mac, adopting);
-    drop(claim);
+    {
+        let mut live = s.live.write().unwrap();
+        live.adoption.adopting.insert(mac, adopting);
+        claim.release(&mut live);
+    }
     let out = match session.run(&format!("/usr/bin/syswrapper.sh set-adopt {} {}", shell_quote(&url), shell_quote(&key))).await {
         Ok(out) => out,
         // Back with its key already (that ends the adoption): it worked.
