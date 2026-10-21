@@ -793,9 +793,7 @@ const EventRow = memo(
     // A push's diffs are parsed once, for its detail line and its changes.
     const push = pushed ? summarise(pushed) : null;
     const detail =
-      pushed && push
-        ? pushText(pushed, push)
-        : spec.describe?.(d, names, e.ts);
+      pushed && push ? pushText(pushed, push) : spec.describe?.(d, names, e.ts);
     const crash = payload(e, "ap_crash")?.lines ?? [];
     return (
       <li className={`event event-${tone}`}>
