@@ -10,7 +10,12 @@ import {
   useCanEdit,
   useFirmware,
 } from "../api";
-import type { FirmwareInfo, FirmwareJob } from "../api";
+import type {
+  FirmwareInfo,
+  FirmwareJob,
+  FirmwareQueued,
+  FirmwareSkip,
+} from "../api";
 import { ago, bytes, clock, useNow } from "../format";
 import { Outcome, QueryNote, THead, useRunner } from "./common";
 import { TextInput } from "./settings/form";
@@ -22,6 +27,33 @@ const STATUS: Record<FirmwareInfo["aps"][number]["status"], [string, string]> =
     ahead: ["Ahead of release", "tag-info"],
     unknown: ["Unknown", ""],
   };
+
+const SKIP: Record<FirmwareSkip, string> = {
+  up_to_date: "up to date",
+  ahead: "ahead of the release",
+  unknown: "no release for it",
+  offline: "offline",
+  not_found: "not a known AP",
+};
+
+const ALREADY = "already queued or updating";
+
+/** An upgrade request's outcome for `asked` APs: how many were queued, and which were not and why. */
+function queuedText(
+  r: FirmwareQueued,
+  asked: number,
+  name: (mac: string) => string,
+): string {
+  if (asked === 1)
+    return r.queued
+      ? "Queued."
+      : `Not queued: ${r.skipped[0] ? SKIP[r.skipped[0].why] : `it is ${ALREADY}`}.`;
+  const parts = [`${r.queued} queued`];
+  const already = asked - r.queued - r.skipped.length;
+  if (already > 0) parts.push(`${already} ${ALREADY}`);
+  parts.push(...r.skipped.map((k) => `${name(k.mac)}: ${SKIP[k.why]}`));
+  return `${parts.join("; ")}.`;
+}
 
 const STEP: Record<FirmwareJob["state"], string> = {
   queued: "waiting for its next report",
@@ -46,7 +78,10 @@ export function FirmwarePanel() {
     (a) => a.status === "update_available" && a.online,
   );
   const job = d.jobs.current;
-  const urlName = d.aps.find((a) => a.mac === urlFor)?.name ?? urlFor;
+  const nameOf = (mac: string) => d.aps.find((a) => a.mac === mac)?.name ?? mac;
+  const upgrade = async (macs: string[]) =>
+    queuedText(await upgradeFirmware(macs), macs.length, nameOf);
+  const urlName = urlFor && nameOf(urlFor);
   return (
     <div className="stack">
       <div className="panel">
@@ -78,11 +113,7 @@ export function FirmwarePanel() {
               onClick={() =>
                 window.confirm(
                   `Update ${updatable.length} APs, one at a time? Each restarts and drops its clients for a few minutes.`,
-                ) &&
-                void run(
-                  async () =>
-                    `${(await upgradeFirmware(updatable.map((a) => a.mac))).queued} queued.`,
-                )
+                ) && void run(() => upgrade(updatable.map((a) => a.mac)))
               }
             >
               Update all ({updatable.length})
@@ -155,10 +186,7 @@ export function FirmwarePanel() {
                               `Update ${a.name ?? a.mac} from ${a.version} to ${a.release?.version}? It restarts and drops its clients for a few minutes.`,
                             )
                           )
-                            void run(
-                              async () =>
-                                `${(await upgradeFirmware([a.mac])).queued ? "Queued" : "Not queued"}.`,
-                            );
+                            void run(() => upgrade([a.mac]));
                         }}
                       >
                         Update
@@ -195,9 +223,7 @@ export function FirmwarePanel() {
                 const { queued } = await upgradeFirmwareUrl(urlFor, url);
                 setUrlFor(null);
                 setUrl("");
-                return queued
-                  ? "Queued."
-                  : "Not queued: it is already queued or updating.";
+                return queued ? "Queued." : `Not queued: it is ${ALREADY}.`;
               });
             }}
           >
