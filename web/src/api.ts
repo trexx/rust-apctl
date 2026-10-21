@@ -1135,7 +1135,7 @@ function appendSeries<F extends string>(prev: Series<F>, add: Series<F>, from: n
   const keep = prev.ts.findIndex((t) => t >= from);
   const start = keep < 0 ? prev.ts.length : keep;
   const fields = {} as Series<F>["fields"];
-  for (const [f, values] of Object.entries(prev.fields) as [F, (number | null)[]][]) fields[f] = [...values.slice(start), ...(add.fields[f] ?? add.ts.map(() => null))];
+  for (const [f, values] of Object.entries(prev.fields) as [F, (number | null)[]][]) fields[f] = [...values.slice(start), ...add.fields[f]];
   return { ...prev, ts: [...prev.ts.slice(start), ...add.ts], fields };
 }
 

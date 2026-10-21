@@ -36,8 +36,7 @@ function withGaps(ts: number[], cols: (number | null)[][]): uPlot.AlignedData {
 
 export interface ChartSeries {
   label: string;
-  /** Missing (a field the server didn't send) draws nothing. */
-  values: (number | null)[] | undefined;
+  values: (number | null)[];
   color: string;
   /** Fill the area under the line (use for one series per chart at most). */
   fill?: boolean;
@@ -50,17 +49,15 @@ export interface ChartSeries {
   scale?: number;
 }
 
-const NO_VALUES: (number | null)[] = [];
-
 const scaled = (s: ChartSeries) =>
   s.scale === undefined || s.scale === 1
-    ? (s.values ?? NO_VALUES)
-    : (s.values ?? NO_VALUES).map((v) => (v === null ? null : v * s.scale!));
+    ? s.values
+    : s.values.map((v) => (v === null ? null : v * s.scale!));
 
 /** What was last drawn: the chart skips drawing the same arrays again. */
 interface Drawn {
   ts: number[];
-  values: ((number | null)[] | undefined)[];
+  values: (number | null)[][];
   scales: (number | undefined)[];
   span: TimeSpan | null;
 }
