@@ -318,6 +318,11 @@ pub struct Meta {
     pub days: i64,
     pub size: u64,
     pub encrypted: bool,
+    /// The databases it holds ("config.db", "metrics.db", ...): a pre-restore
+    /// copy (`days` -1) holds only those the restore replaced. Empty for a
+    /// backup described before this was kept.
+    #[serde(default)]
+    pub files: Vec<String>,
 }
 
 fn sha256_file(path: &Path) -> Result<FileInfo> {
@@ -576,7 +581,8 @@ fn create_of(b: &Backups, src_dir: &Path, kind: Kind, days: i64, names: &[&str])
         // is: a backup is never without one, and one left without its backup
         // (by a crash) is removed at the next start.
         let size = fs::metadata(&part)?.len();
-        let meta = Meta { name: name.clone(), kind, version: VERSION.into(), created: now, days, size, encrypted: b.key.is_some() };
+        let files = manifest.files.into_keys().collect();
+        let meta = Meta { name: name.clone(), kind, version: VERSION.into(), created: now, days, size, encrypted: b.key.is_some(), files };
         let mut f = fs::OpenOptions::new().write(true).create_new(true).open(tmp.join("meta.json"))?;
         f.write_all(&serde_json::to_vec_pretty(&meta)?)?;
         f.sync_all()?;
@@ -1594,6 +1600,7 @@ mod tests {
         assert_eq!(count(&src.join("config.db"), "SELECT COUNT(*) FROM client_aliases"), 1, "restored");
         assert_eq!(count(&src.join("metrics.db"), "SELECT COUNT(*) FROM ap_stats"), 2, "the statistics are left in place");
         let pre = list(&b).into_iter().find(|x| x.kind == Kind::PreRestore).expect("the replaced settings were saved");
+        assert_eq!((pre.days, pre.files.as_slice()), (-1, ["config.db".to_string()].as_slice()), "listed with what it holds");
         let out = dir("apply-settings-pre");
         let saved = unpack(&b.dir().join(&pre.name), None, &out).unwrap();
         assert_eq!(saved.files.keys().collect::<Vec<_>>(), ["config.db"], "only what the restore replaced");
@@ -2083,6 +2090,8 @@ mod tests {
         assert_eq!(serde_json::to_value(&monthly).unwrap()["frequency"], "monthly");
         assert_eq!(serde_json::to_value(Kind::PreRestore).unwrap(), "pre-restore");
         assert_eq!(serde_json::from_str::<Kind>("\"auto\"").unwrap(), Kind::Auto);
+        let before = json!({ "name": "apctl-x.apb", "kind": "auto", "version": "0.1.0", "created": 1, "days": 0, "size": 1, "encrypted": false });
+        assert!(serde_json::from_value::<Meta>(before).unwrap().files.is_empty(), "described before the files were");
     }
 
     #[test]
