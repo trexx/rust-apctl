@@ -328,7 +328,7 @@ async fn serve(args: ServeArgs) -> Result<()> {
     firmware::schedule(writer.clone());
     let state = api::AppState::new(api::AppStateInner {
         backups, active, writer: writer.clone(), store, vendors: Arc::new(vendors), renderer, auth, engine: in_tx.clone(), live, tx: api::live_json(&live_tx), started: clock::now_ts(),
-        source: source_desc, inform_url, memo: Default::default(), threats: threat_state,
+        source: source_desc, inform_url, syslog_listen: syslog_listen.map(|a| a.port()), memo: Default::default(), threats: threat_state,
     });
     channelai::schedule(state.clone());
     ratelimit::spawn(state.clone());
