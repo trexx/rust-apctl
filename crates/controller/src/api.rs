@@ -578,7 +578,7 @@ struct ClientRow<'a, V = &'a ClientView> {
 struct ListedClient<'a> {
     #[serde(flatten)]
     client: ClientRow<'a, ListedView<'a>>,
-    /// Null when that AP has no name, or is not reporting.
+    /// Null when that AP has no name (see `series::ap_name_of`), or was forgotten.
     ap_name: Option<&'a str>,
 }
 
