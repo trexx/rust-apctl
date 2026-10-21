@@ -1296,6 +1296,10 @@ impl Engine {
                         }
                         _ => EventKind::ApEvent,
                     };
+                    let mut n = n;
+                    if k == EventKind::ApProcessRestarted {
+                        numeric_exit_status(&mut n);
+                    }
                     self.emit(Event::device(ts, k, mac, n));
                 }
             }
@@ -1314,7 +1318,11 @@ impl Engine {
                 let lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
                 let tail = &lines[lines.len().saturating_sub(200)..];
                 let kind = if reason == "recovery" { "recovered after a crash" } else { "crash report" };
-                self.emit(Event::device(ts, EventKind::ApCrash, mac, json!({ "kind": kind, "source": reason, "lines": tail })));
+                let mut data = json!({ "kind": kind, "source": reason, "lines": tail });
+                if let Some(summary) = crate::logevents::crash_summary(tail) {
+                    data["summary"] = json!(summary);
+                }
+                self.emit(Event::device(ts, EventKind::ApCrash, mac, data));
             }
             _ => {}
         }
@@ -1329,11 +1337,12 @@ impl Engine {
         let text = |k: &str| n[k].as_str().map(str::to_string);
         let vap = text("vap");
         // The live view is read for the VAP alone; the row is built without the lock.
-        let vap_info = {
+        // A notification naming no VAP gets none (not one of the AP's unnamed ones).
+        let vap_info = vap.as_deref().and_then(|name| {
             let live = self.live.read().unwrap();
-            let vap = live.devices.get(&ap).and_then(|d| d.snapshot.vaps.iter().find(|v| v.name.as_deref() == vap.as_deref()));
+            let vap = live.devices.get(&ap).and_then(|d| d.snapshot.vaps.iter().find(|v| v.name.as_deref() == Some(name)));
             vap.map(|v| (v.essid.clone(), v.radio.clone(), v.channel, v.bw))
-        };
+        });
         let (essid, radio, at) = match vap_info {
             Some((essid, radio, channel, bw)) => (essid, radio, Some((channel, bw))),
             None => (None, None, None),
@@ -1980,6 +1989,24 @@ fn disconnect(writer: &Writer, ts: Ts, mac: Mac, c: &mut ClientView, reason: &st
         "reason": reason, "last_seen": c.last_seen, "essid": c.sample.essid,
         "connected_for": c.sample.uptime, "last_signal": c.sample.signal,
     }))
+}
+
+/// A process-restart notification's `exit_status` as a number: the AP may send
+/// the code as text. One that is no number is left out, as one not sent.
+fn numeric_exit_status(n: &mut Value) {
+    let code = match &n["exit_status"] {
+        Value::Number(c) => c.as_i64(),
+        Value::String(c) => c.trim().parse::<i64>().ok(),
+        _ => None,
+    };
+    match code {
+        Some(c) => n["exit_status"] = json!(c),
+        None => {
+            if let Some(o) = n.as_object_mut() {
+                o.remove("exit_status");
+            }
+        }
+    }
 }
 
 /// Drops the AP's queued commands that need it online (see `crate::actions`):
