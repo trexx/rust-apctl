@@ -79,10 +79,11 @@ else
 fi
 
 if [ $test = 1 ]; then
-  # The same checks as CI: scripts/check.sh lists them, run here one by one to keep
-  # each one's output and say which failed.
+  # The same checks as CI: scripts/check.sh lists the Rust ones and runs the web one;
+  # run here one by one to keep each one's output and say which failed.
   mapfile -t checks < <(scripts/check.sh --list)
   [ ${#checks[@]} -gt 0 ] || { echo "scripts/check.sh lists no checks" >&2; exit 1; }
+  checks+=("scripts/check.sh --web")
   log=$(mktemp)
   for check in "${checks[@]}"; do
     echo "== $check"

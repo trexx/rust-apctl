@@ -133,10 +133,10 @@ cargo build --release -p controller   # or: podman build --target runtime .
 MongoDB and needs `cargo build --release -p informdump --features mongo`.
 
 Pushing a version tag (e.g. `0.15.1`) makes CI publish the image; nothing else pushes it.
-`scripts/check.sh` runs CI's Rust checks. `scripts/release.sh 0.15.1` runs them and
-builds and checks the image locally before the tag goes out, and
-`scripts/release.sh 0.15.1 --pin <manifest>` afterwards waits for CI's image and pins its
-digest in a manifest.
+`scripts/check.sh` runs CI's Rust checks and `scripts/check.sh --web` its web check.
+`scripts/release.sh 0.15.1` runs them all and builds and checks the image locally before
+the tag goes out, and `scripts/release.sh 0.15.1 --pin <manifest>` afterwards waits for
+CI's image and pins its digest in a manifest.
 
 ## License
 
