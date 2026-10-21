@@ -813,7 +813,8 @@ fn stream(now: i64, hours: f64, live: bool, out: impl Write) -> Result<()> {
             let body = inform::seal(mac, Flags::ENCRYPTED | Flags::GCM | Flags::ZLIB, crate::random_iv(), key, payload.to_string().as_bytes());
             pcap.tcp(at * 1000, i, &sim.ids[i], true, &http("POST /inform HTTP/1.1\r\nHost: controller.home.arpa:8080\r\nContent-Type: application/x-binary\r\n", &body))?;
             let reply = json!({ "_type": "noop", "interval": step, "server_time_in_utc": (at * 1000).to_string() });
-            let sealed = inform::seal(mac, Flags::ENCRYPTED | Flags::GCM | Flags::ZLIB, crate::random_iv(), key, reply.to_string().as_bytes());
+            // Replies are never compressed, as the official controller's and apctl's.
+            let sealed = inform::seal_with(mac, Flags::ENCRYPTED | Flags::GCM, crate::random_iv(), key, |out| serde_json::to_writer(out, &reply).expect("a JSON value serialises"));
             pcap.tcp(at * 1000 + 40, i, &sim.ids[i], false, &http("HTTP/1.1 200 OK\r\nContent-Type: application/x-binary\r\n", &sealed))?;
         }
         for (lt, li, line) in logs {
@@ -956,8 +957,7 @@ mod tests {
         // batch before theirs: a syslog line still says when it was sent.
         stream(1_791_830_666 - 18 * 60, 0.5, false, &mut buf).unwrap();
         let mut pairer = wire::exchange::Pairer::default();
-        let mut informs = 0;
-        let mut syslog = 0;
+        let (mut informs, mut replies, mut syslog) = (0, 0, 0);
         let end = wire::capture::run_with_udp(&buf[..], &[8080], &[5514], |ev| {
             if let wire::capture::HttpEvent::Datagram { ts, src, payload, .. } = &ev {
                 // Opened with the key the settings hold for the AP that sent it.
@@ -967,15 +967,24 @@ mod tests {
                 let text = String::from_utf8(plain).unwrap();
                 assert!(text.starts_with(&format!("<14>{} {} ", chrono_like(ts / 1_000_000), ap.name.replace(' ', "-"))), "{text}");
                 syslog += 1;
-            } else if let Some(wire::exchange::InformEvent::Inform { decoded, .. }) = pairer.handle(&keys, ev) {
-                decoded.unwrap();
-                informs += 1;
+            } else {
+                match pairer.handle(&keys, ev) {
+                    Some(wire::exchange::InformEvent::Inform { decoded, .. }) => {
+                        decoded.unwrap();
+                        informs += 1;
+                    }
+                    Some(wire::exchange::InformEvent::Reply { decoded: Some(decoded), .. }) => {
+                        assert_eq!(decoded.unwrap().header.flags, Flags::ENCRYPTED | Flags::GCM, "replies are not compressed");
+                        replies += 1;
+                    }
+                    _ => {}
+                }
             }
             std::ops::ControlFlow::Continue(())
         })
         .unwrap();
         assert_eq!(end, wire::capture::End::Complete);
-        assert!(informs > 3 * 30, "{informs} informs");
+        assert!(informs > 3 * 30 && replies == informs, "{informs} informs, {replies} replies");
         assert!(syslog > 0);
     }
 }
