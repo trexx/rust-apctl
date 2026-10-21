@@ -411,7 +411,8 @@ struct Written {
 /// Rows by key.
 type Rows<K, T> = HashMap<K, Row<T>>;
 
-/// A row as last written, when, and when it was last reported.
+/// A row as last written with the stamp it was written with, and when it was
+/// last reported.
 struct Row<T> {
     value: T,
     written: Ts,
@@ -419,27 +420,30 @@ struct Row<T> {
 }
 
 impl<T: PartialEq> Row<T> {
-    fn new(value: T, ts: Ts) -> Self {
-        Row { value, written: ts, seen: ts }
+    fn new(value: T, ts: Ts, stamp: Ts) -> Self {
+        Row { value, written: stamp, seen: ts }
     }
 
-    /// Records `value` as reported at `ts`; true if it is to be written: it
-    /// changed, or was last written `every` seconds ago.
-    fn report(&mut self, value: T, ts: Ts, every: Ts) -> bool {
+    /// Records `value` as reported at `ts`, with `stamp` the time its row
+    /// carries (the report's time, or for a neighbour when the scan heard it);
+    /// true if it is to be written: it changed, or its stamp moved `every`
+    /// seconds either way since it was last written. A neighbour's stamp may
+    /// come a second earlier than the last one, from the AP's rounding.
+    fn report(&mut self, value: T, ts: Ts, stamp: Ts, every: Ts) -> bool {
         self.seen = ts;
-        if self.value == value && !due(Some(&self.written), ts, every) {
+        if self.value == value && (stamp - self.written).abs() < every {
             return false;
         }
         self.value = value;
-        self.written = ts;
+        self.written = stamp;
         true
     }
 }
 
-/// Records `value` as reported under its `key` at `ts` (see `Row::report`):
-/// its row if it is to be written, as one new or changed, or due again. The
-/// row keeps the value; the key is copied only for a new row.
-fn report<K, Q, T>(rows: &mut Rows<K, T>, value: T, key: impl Fn(&T) -> &Q, ts: Ts, every: Ts) -> Option<&T>
+/// Records `value` as reported under its `key` at `ts` with `stamp` (see
+/// `Row::report`): its row if it is to be written, as one new or changed, or
+/// due again. The row keeps the value; the key is copied only for a new row.
+fn report<K, Q, T>(rows: &mut Rows<K, T>, value: T, key: impl Fn(&T) -> &Q, ts: Ts, stamp: Ts, every: Ts) -> Option<&T>
 where
     K: std::borrow::Borrow<Q> + Eq + std::hash::Hash,
     Q: ToOwned<Owned = K> + Eq + std::hash::Hash + ?Sized,
@@ -447,10 +451,10 @@ where
 {
     if rows.contains_key(key(&value)) {
         let row = rows.get_mut(key(&value)).expect("present");
-        return row.report(value, ts, every).then_some(&row.value);
+        return row.report(value, ts, stamp, every).then_some(&row.value);
     }
     let k = key(&value).to_owned();
-    Some(&rows.entry(k).or_insert(Row::new(value, ts)).value)
+    Some(&rows.entry(k).or_insert(Row::new(value, ts, stamp)).value)
 }
 
 /// Whether a row last written at `at` (if ever) is due again at `ts`.
@@ -1728,15 +1732,16 @@ impl Engine {
             });
         }
         // Scan results repeat in every inform until the next scan: an unchanged
-        // neighbour is written once a minute (last_seen), an unchanged spectrum
+        // neighbour heard again is written once a minute (last_seen), an unchanged spectrum
         // row once an hour. What the AP no longer reports is forgotten here.
         let rows = self.written.neighbors.entry(s.ap.mac).or_default();
         for mut n in neighbors {
             // When the scan heard it, which is when it was last seen as it is: an entry
             // the AP keeps reporting from an old scan is no sighting now. Its age
-            // grows at every inform, so it is no change of the neighbour.
+            // grows at every inform, so it is no change of the neighbour, and its
+            // row is due again only when it is heard again.
             let heard = ts - n.age.take().unwrap_or(0).clamp(0, ts.max(0));
-            let Some(n) = report(rows, n, |n| n.bssid.as_str(), ts, REFRESH_SECS) else { continue };
+            let Some(n) = report(rows, n, |n| n.bssid.as_str(), ts, heard, REFRESH_SECS) else { continue };
             self.writer.exec(
                 Db::Config,
                 "INSERT INTO neighbors (bssid, ap_mac, radio, essid, channel, bw, center_freq, security, signal, best_signal, noise, is_unifi, ap_name, model, first_seen, last_seen)
@@ -1761,7 +1766,7 @@ impl Engine {
             }
             let rows = radios.get_mut(&radio).expect("inserted above");
             for c in channels {
-                let Some(c) = report(rows, c, |c| &c.channel, ts, SPECTRUM_REFRESH_SECS) else { continue };
+                let Some(c) = report(rows, c, |c| &c.channel, ts, ts, SPECTRUM_REFRESH_SECS) else { continue };
                 self.writer.exec(
                     Db::Config,
                     "INSERT OR REPLACE INTO spectrum (ap_mac, radio, channel, width, utilization, interference, other_bss_count, ts) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
@@ -2446,10 +2451,18 @@ mod tests {
         p["radio_table"] = json!([{ "radio": "na", "scan_table": [{ "bssid": "02:cd:00:00:00:01", "signal": -50, "age": 1200 }] }]);
         h.engine.handle(Input::Inform { ts: 2000, peer: [10, 0, 0, 1].into(), decoded: decoded(p.clone()) });
         assert_eq!(last_seen(&h), 800);
-        // Its age growing is no change: written once a minute, as heard.
-        p["radio_table"][0]["scan_table"][0]["age"] = json!(1215);
-        h.engine.handle(Input::Inform { ts: 2015, peer: [10, 0, 0, 1].into(), decoded: decoded(p) });
-        assert_eq!(h.engine.written.neighbors[&AP1.parse().unwrap()]["02:cd:00:00:00:01"].written, 2000);
+        // Its age growing is no change, and as it was heard no later, it is not written again,
+        // nor for the AP's rounding putting it a second earlier.
+        let row = |h: &Harness| h.engine.written.neighbors[&AP1.parse().unwrap()]["02:cd:00:00:00:01"].written;
+        for (ts, age) in [(2015, 1215), (2100, 1300), (2200, 1401)] {
+            p["radio_table"][0]["scan_table"][0]["age"] = json!(age);
+            h.engine.handle(Input::Inform { ts, peer: [10, 0, 0, 1].into(), decoded: decoded(p.clone()) });
+            assert_eq!(row(&h), 800);
+        }
+        // Heard again by a new scan: written.
+        p["radio_table"][0]["scan_table"][0]["age"] = json!(0);
+        h.engine.handle(Input::Inform { ts: 2210, peer: [10, 0, 0, 1].into(), decoded: decoded(p) });
+        assert_eq!(last_seen(&h), 2210);
     }
 
     #[test]
