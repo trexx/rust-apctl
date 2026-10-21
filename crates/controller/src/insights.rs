@@ -47,7 +47,7 @@ const VAP_COLS: &[&str] = &[
 /// view's read is (see [`memo_read`]).
 async fn with_site_vaps<T: Send + 'static>(s: &AppState, q: &RangeQuery, f: impl FnOnce(&Loaded) -> T + Send + 'static) -> Result<T, ApiError> {
     let (from, to, tier) = window(q);
-    let spec = Spec { table: "vap_stats", key: "bssid", extra: &["ap_mac", "radio"], cols: VAP_COLS, only: None };
+    let spec = Spec { table: "vap_stats", key: "bssid", extra: AP_BAND, cols: VAP_COLS, only: None };
     let vaps = memo_read(s, Db::Metrics, "site-vaps", &q.read_by(false), tier, move |c| load(c, spec, tier, from, to)).await?;
     Ok(tokio::task::spawn_blocking(move || f(&vaps)).await?)
 }
@@ -117,7 +117,7 @@ pub async fn activity(State(s): State<AppState>, Query(q): Query<RangeQuery>) ->
 fn vap_activity(vaps: &Loaded, from: Ts, bucket: Ts) -> Value {
     let [tx_bytes, rx_bytes, tx_packets, rx_packets, tx_mcast, rx_mcast, tx_bcast, rx_bcast, tx_dropped, num_sta] =
         cols_at(VAP_COLS, ["tx_bytes", "rx_bytes", "tx_packets", "rx_packets", "tx_mcast", "rx_mcast", "tx_bcast", "rx_bcast", "tx_dropped", "num_sta"]);
-    let [retries, attempts, wifi_dropped] = cols_at(VAP_COLS, RETRY_COLS);
+    let retry_at = cols_at(VAP_COLS, Retries::COLS);
     // Rates per bucket and SSID (by its place among those loaded), at these places.
     const DOWN: usize = 0;
     const UP: usize = 1;
@@ -141,11 +141,10 @@ fn vap_activity(vaps: &Loaded, from: Ts, bucket: Ts) -> Value {
             // Multicast and broadcast, both directions.
             r[MCAST] += g(tx_mcast) + g(rx_mcast) + g(tx_bcast) + g(rx_bcast);
             r[DROPPED] += g(tx_dropped);
-            // Intervals without attempt counters (data from older versions) are skipped.
-            if let (Some(x), Some(at)) = (d.rate(retries), d.rate(attempts)) {
-                r[RETRIES] += x;
-                r[ATTEMPTS] += at;
-                r[WIFI_DROPPED] += g(wifi_dropped);
+            if let Some(x) = Retries::of(&d, retry_at, Delta::rate) {
+                r[RETRIES] += x.retries;
+                r[ATTEMPTS] += x.attempts;
+                r[WIFI_DROPPED] += x.dropped;
             }
             a.intervals += 1.0;
         }
@@ -170,8 +169,7 @@ fn vap_activity(vaps: &Loaded, from: Ts, bucket: Ts) -> Value {
         dropped.push(if p + dr > 0.0 { Some(100.0 * dr / (p + dr)) } else { None });
         down.push(d * 8.0);
         up.push(u * 8.0);
-        // Same definitions as the retry buckets and the AP pages.
-        retry.push(if r + at + wd > 0.0 { Some(100.0 * r / (r + at + wd)) } else { None });
+        retry.push(Retries { retries: r, attempts: at, dropped: wd }.pct());
         mcast.push(if p + rp > 0.0 { Some((100.0 * mc / (p + rp)).min(100.0)) } else { None });
         clients.push(cl);
     }
@@ -252,46 +250,64 @@ fn listed_client(s: &AppState, live: &Live, mac: &str, more: impl FnOnce(Option<
     out
 }
 
-/// Adds an interval's retries, attempts and drops (`at`: their columns) to
-/// `t`; an interval without attempt counters (data from older versions) is
-/// skipped. False when skipped.
-fn add_retries(t: &mut [f64; 3], d: &Delta, at: [usize; 3]) -> bool {
-    let (Some(r), Some(a)) = (d.inc(at[0]), d.inc(at[1])) else { return false };
-    t[0] += r;
-    t[1] += a;
-    t[2] += d.inc(at[2]).unwrap_or(0.0);
-    true
+/// TX retries, attempts and drops (counter increases, or per-second rates),
+/// from which every view and the alerts work out a TX retry rate.
+#[derive(Clone, Copy, Default, Debug, PartialEq)]
+pub(crate) struct Retries {
+    pub retries: f64,
+    pub attempts: f64,
+    pub dropped: f64,
 }
 
+impl Retries {
+    /// The counters, in the order [`Retries::of`] takes their columns.
+    pub const COLS: [&'static str; 3] = ["tx_retries", "wifi_tx_attempts", "wifi_tx_dropped"];
+
+    /// An interval's retries, attempts and drops, read with `read` ([`Delta::inc`]
+    /// or [`Delta::rate`]) from their columns `at` (see [`Retries::COLS`]). `None`
+    /// without attempt counters (data from older versions): left out, not read as 100 %.
+    pub fn of<'a>(d: &Delta<'a>, at: [usize; 3], read: fn(&Delta<'a>, usize) -> Option<f64>) -> Option<Retries> {
+        let (Some(retries), Some(attempts)) = (read(d, at[0]), read(d, at[1])) else { return None };
+        Some(Retries { retries, attempts, dropped: read(d, at[2]).unwrap_or(0.0) })
+    }
+
+    /// The TX retry rate as the share of all transmissions: retries / (retries +
+    /// attempts + dropped); none when nothing was sent.
+    pub fn pct(self) -> Option<f64> {
+        let all = self.retries + self.attempts + self.dropped;
+        (all > 0.0).then(|| 100.0 * self.retries / all)
+    }
+}
+
+impl std::ops::AddAssign for Retries {
+    fn add_assign(&mut self, o: Retries) {
+        self.retries += o.retries;
+        self.attempts += o.attempts;
+        self.dropped += o.dropped;
+    }
+}
+
+/// The text columns [`retry_totals`] reads an SSID's AP and band from, in this
+/// order: the `extra` of the [`Spec`] its counters are loaded with.
+pub(crate) const AP_BAND: &[&str] = &["ap_mac", "radio"];
+
 /// Retries, attempts and drops summed per (AP, band) from SSID counters
-/// (`at`: their columns; the text columns are AP and band).
-pub(crate) fn retry_totals(vaps: &Loaded, at: [usize; 3], from: Ts) -> HashMap<(&str, &str), [f64; 3]> {
-    let mut out: HashMap<(&str, &str), [f64; 3]> = HashMap::new();
+/// loaded with `extra: AP_BAND` (`at`: the columns of [`Retries::COLS`]).
+/// An SSID without attempt counters in the window is left out.
+pub(crate) fn retry_totals(vaps: &Loaded, at: [usize; 3], from: Ts) -> HashMap<(&str, &str), Retries> {
+    let mut out: HashMap<(&str, &str), Retries> = HashMap::new();
     for (ex, samples) in vaps.values() {
-        let (mut t, mut any) = ([0.0; 3], false);
-        for d in deltas(samples, from) {
-            any |= add_retries(&mut t, &d, at);
+        let mut t: Option<Retries> = None;
+        for x in deltas(samples, from).filter_map(|d| Retries::of(&d, at, Delta::inc)) {
+            *t.get_or_insert_default() += x;
         }
-        if any {
-            let e = out.entry((ex[0].as_str(), ex[1].as_str())).or_default();
-            for (e, x) in e.iter_mut().zip(t) {
-                *e += x;
-            }
+        if let Some(t) = t {
+            *out.entry((ex[0].as_str(), ex[1].as_str())).or_default() += t;
         }
     }
     out
 }
 
-/// TX retry rate as the share of all transmissions: retries / (retries + attempts + dropped).
-pub(crate) fn retry_pct([r, a, d]: [f64; 3]) -> f64 {
-    let all = r + a + d;
-    if all > 0.0 { 100.0 * r / all } else { 0.0 }
-}
-
-/// The counters TX retry rates come from, in the order `retry_totals` reads them.
-pub(crate) const RETRY_COLS: [&str; 3] = ["tx_retries", "wifi_tx_attempts", "wifi_tx_dropped"];
-/// Where they are when only they are loaded.
-pub(crate) const RETRY_AT: [usize; 3] = [0, 1, 2];
 /// Bytes both ways, in the order `totals` reads them.
 const BYTE_COLS: [&str; 2] = ["tx_bytes", "rx_bytes"];
 
@@ -397,13 +413,10 @@ fn density_of(signals: &Signals, names: &[String], vaps: &Loaded, from: Ts) -> V
             *bytes.entry((ex[0].as_str(), band)).or_default() += d + u;
         }
     }
-    let mut retries = retry_totals(vaps, cols_at(VAP_COLS, RETRY_COLS), from);
-    let per_band: Vec<(&str, [f64; 3])> = retries.iter().map(|((ap, _), t)| (*ap, *t)).collect();
+    let mut retries = retry_totals(vaps, cols_at(VAP_COLS, Retries::COLS), from);
+    let per_band: Vec<(&str, Retries)> = retries.iter().map(|((ap, _), t)| (*ap, *t)).collect();
     for (ap, t) in per_band {
-        let e = retries.entry((ap, "all")).or_default();
-        for (e, x) in e.iter_mut().zip(t) {
-            *e += x;
-        }
+        *retries.entry((ap, "all")).or_default() += t;
     }
     let mut band_total: HashMap<&str, f64> = HashMap::new();
     for ((_, b), v) in &bytes {
@@ -416,7 +429,7 @@ fn density_of(signals: &Signals, names: &[String], vaps: &Loaded, from: Ts) -> V
     for ((ap, band), &Reports { sum, n, weakest, reports: count, .. }) in signals {
         let traffic = bytes.get(&(ap, band)).copied().unwrap_or(0.0);
         let total = band_total.get(band).copied().unwrap_or(0.0);
-        let retry = retries.get(&(ap, band)).map(|r| retry_pct(*r));
+        let retry = retries.get(&(ap, band)).and_then(|r| r.pct());
         let group = json!({
             "band": band,
             "weakest_signal": (weakest / count.max(1) as f64).round(),
@@ -433,13 +446,14 @@ fn density_of(signals: &Signals, names: &[String], vaps: &Loaded, from: Ts) -> V
     out
 }
 
-/// GET /api/site/retries: each AP radio's TX retry rate over the window.
+/// GET /api/site/retries: each AP radio's TX retry rate over the window (a
+/// radio that sent nothing has none, and is left out).
 pub async fn retries(State(s): State<AppState>, Query(q): Query<RangeQuery>) -> Result<Json<Value>, ApiError> {
     let (from, _, _) = window(&q);
     // By AP and band.
     let totals = with_site_vaps(&s, &q, move |vaps| {
-        let mut totals: Vec<((String, String), [f64; 3])> =
-            retry_totals(vaps, cols_at(VAP_COLS, RETRY_COLS), from).into_iter().map(|((ap, band), t)| ((ap.to_string(), band.to_string()), t)).collect();
+        let mut totals: Vec<((String, String), Retries)> =
+            retry_totals(vaps, cols_at(VAP_COLS, Retries::COLS), from).into_iter().map(|((ap, band), t)| ((ap.to_string(), band.to_string()), t)).collect();
         totals.sort_by(|a, b| a.0.cmp(&b.0));
         totals
     })
@@ -447,8 +461,8 @@ pub async fn retries(State(s): State<AppState>, Query(q): Query<RangeQuery>) -> 
     let live = s.live.read().unwrap();
     let out: Vec<Value> = totals
         .iter()
-        .map(|((ap, band), t)| {
-            json!({ "name": ap_name(&live, ap), "mac": ap, "radio": band, "tx_retry_pct": retry_pct(*t), "retries": t[0], "attempts": t[1], "dropped": t[2] })
+        .filter_map(|((ap, band), t)| {
+            Some(json!({ "name": ap_name(&live, ap), "mac": ap, "radio": band, "tx_retry_pct": t.pct()?, "retries": t.retries, "attempts": t.attempts, "dropped": t.dropped }))
         })
         .collect();
     Ok(Json(Value::Array(out)))
@@ -572,19 +586,21 @@ fn mcast_types(rows: &[McastRow], from: Ts, to: Ts, bucket: Ts, step: Ts) -> (Ve
     (ts, types)
 }
 
-/// Non-secret settings of a network from the imported controller settings.
+/// Non-secret settings of a network from the imported controller settings,
+/// read as the render reads them (its defaults, `"true"` as true; the VLAN its
+/// clients are tagged with).
 fn wlan_settings(state: Option<&Value>, essid: &str) -> Value {
     use crate::settings::{docs, id_of};
+    use apcfg::flag;
     let Some(state) = state else { return Value::Null };
     let Some(w) = docs(state, "wlanconf").find(|w| w["name"].as_str() == Some(essid)) else { return Value::Null };
     let network = w["networkconf_id"].as_str().and_then(|id| docs(state, "networkconf").find(|n| id_of(n).as_deref() == Some(id))).and_then(|n| n["name"].as_str());
     let security = crate::settings::security_label(w);
+    let vlan = apcfg::ssid_vlan(state, crate::settings::site_id(state).unwrap_or_default(), w);
     json!({
-        "enabled": w["enabled"].as_bool().unwrap_or(true), "security": security, "hidden": w["hide_ssid"].as_bool().unwrap_or(false),
-        "guest": w["is_guest"].as_bool().unwrap_or(false), "network": network,
-        "vlan": if w["vlan_enabled"].as_bool() == Some(true) { w["vlan"].clone() } else { Value::Null },
-        "bands": w["wlan_bands"].clone(), "fast_roaming": w["fast_roaming_enabled"].as_bool().unwrap_or(false),
-        "bss_transition": w["bss_transition"].as_bool().unwrap_or(false), "pmf": w["pmf_mode"].as_str(),
+        "enabled": flag(w, "enabled", true), "security": security, "hidden": flag(w, "hide_ssid", false), "guest": flag(w, "is_guest", false),
+        "network": network, "vlan": vlan, "bands": w["wlan_bands"].clone(), "fast_roaming": flag(w, "fast_roaming_enabled", false),
+        "bss_transition": flag(w, "bss_transition", true), "pmf": w["pmf_mode"].as_str(),
     })
 }
 
@@ -682,7 +698,7 @@ pub async fn wlans(State(s): State<AppState>, Query(q): Query<RangeQuery>) -> Re
                 let peak = cl.iter().copied().fold(0.0, f64::max);
                 (ts, cl, dn, up, peak)
             });
-            let retry = agg.map(|a| a.retry).filter(|t| t.iter().sum::<f64>() > 0.0).map(retry_pct);
+            let retry = agg.and_then(|a| a.retry.pct());
             json!({
                 "essid": essid,
                 "settings": wlan_settings(state.as_deref(), &essid),
@@ -778,14 +794,14 @@ struct WlanAgg {
     /// bucket -> SSID (its place among the VAPs loaded) -> its share: bytes per second down and up
     series: BTreeMap<Ts, HashMap<usize, Bucket<2>>>,
     /// Retries, attempts and drops over all its SSIDs.
-    retry: [f64; 3],
+    retry: Retries,
 }
 
 /// The VAPs' history ([`WLAN_COLS`], with the network name) summed up per network.
 fn wlan_history(vaps: &Loaded, from: Ts, bucket: Ts) -> BTreeMap<String, WlanAgg> {
     let [tx_bytes, rx_bytes, tx_packets, rx_packets, tx_mcast, rx_mcast, tx_bcast, rx_bcast, num_sta, satisfaction, signal] =
         cols_at(WLAN_COLS, ["tx_bytes", "rx_bytes", "tx_packets", "rx_packets", "tx_mcast", "rx_mcast", "tx_bcast", "rx_bcast", "num_sta", "satisfaction", "avg_client_signal"]);
-    let retries = cols_at(WLAN_COLS, RETRY_COLS);
+    let retry_at = cols_at(WLAN_COLS, Retries::COLS);
     let mut per: BTreeMap<String, WlanAgg> = BTreeMap::new();
     for (vap, (ex, samples)) in vaps.values().enumerate() {
         let essid = &ex[0];
@@ -806,7 +822,9 @@ fn wlan_history(vaps: &Loaded, from: Ts, bucket: Ts) -> BTreeMap<String, WlanAgg
             e.rates[0] += d.rate(tx_bytes).unwrap_or(0.0);
             e.rates[1] += d.rate(rx_bytes).unwrap_or(0.0);
             e.intervals += 1.0;
-            add_retries(&mut a.retry, &d, retries);
+            if let Some(x) = Retries::of(&d, retry_at, Delta::inc) {
+                a.retry += x;
+            }
         }
         for (t, v) in samples.since(from) {
             let e = a.series.entry(t - t % bucket).or_default().entry(vap).or_default();
@@ -853,9 +871,9 @@ pub async fn radios(State(s): State<AppState>, Query(q): Query<RangeQuery>) -> R
             (e.utilization, e.interference) = (r.get(2)?, r.get(3)?);
         }
         // Retries come from the VAPs: the radio-level counters stay at 0 on some models.
-        let vaps = load(c, Spec { table: "vap_stats", key: "bssid", extra: &["ap_mac", "radio"], cols: RADIO_VAP_COLS, only: None }, tier, from, to)?;
-        for ((ap, band), t) in retry_totals(&vaps, cols_at(RADIO_VAP_COLS, RETRY_COLS), from) {
-            out.entry(ap.to_string()).or_default().entry(band.to_string()).or_default().retry_pct = Some(retry_pct(t));
+        let vaps = load(c, Spec { table: "vap_stats", key: "bssid", extra: AP_BAND, cols: RADIO_VAP_COLS, only: None }, tier, from, to)?;
+        for ((ap, band), t) in retry_totals(&vaps, cols_at(RADIO_VAP_COLS, Retries::COLS), from) {
+            out.entry(ap.to_string()).or_default().entry(band.to_string()).or_default().retry_pct = t.pct();
         }
         // Traffic and client signal per radio.
         let [tx, rx, signal] = cols_at(RADIO_VAP_COLS, ["tx_bytes", "rx_bytes", "avg_client_signal"]);
@@ -1028,15 +1046,15 @@ mod tests {
         let samples = vec![s(0, 100.0, 1000.0, 0.0), s(10, 130.0, 1100.0, 10.0), s(20, 5.0, 20.0, 0.0), s(30, 25.0, 120.0, 0.0)];
         let mut vaps: Loaded = BTreeMap::new();
         vaps.insert("bss".into(), (vec!["ap".into(), "na".into()], Samples::from_rows(samples)));
-        let t = retry_totals(&vaps, RETRY_AT, 0)[&("ap", "na")];
+        let t = retry_totals(&vaps, [0, 1, 2], 0)[&("ap", "na")];
         // 30+20 retries, 100+100 attempts, 10 dropped; the restart at t=20 adds nothing.
-        assert_eq!(t, [50.0, 200.0, 10.0]);
-        assert!((retry_pct(t) - 100.0 * 50.0 / 260.0).abs() < 1e-9);
-        assert_eq!(retry_pct([0.0, 0.0, 0.0]), 0.0);
+        assert_eq!(t, Retries { retries: 50.0, attempts: 200.0, dropped: 10.0 });
+        assert!((t.pct().unwrap() - 100.0 * 50.0 / 260.0).abs() < 1e-9);
+        assert_eq!(Retries::default().pct(), None, "nothing sent: no rate");
         // Older rows without attempt counters are left out rather than read as 100 %.
         let mut vaps: Loaded = BTreeMap::new();
         vaps.insert("bss".into(), (vec!["ap".into(), "na".into()], Samples::from_rows(vec![(0, vec![Some(1.0), None, None]), (10, vec![Some(9.0), None, None])])));
-        assert!(retry_totals(&vaps, RETRY_AT, 0).is_empty());
+        assert!(retry_totals(&vaps, [0, 1, 2], 0).is_empty());
     }
 
     #[test]
@@ -1096,14 +1114,16 @@ mod tests {
     fn wlan_settings_from_an_import() {
         let state = json!({
             "wlanconf": [{ "name": "Home", "security": "wpapsk", "wpa_mode": "wpa2", "wpa3_support": true, "wpa3_transition": true,
-                "networkconf_id": "abc", "hide_ssid": false, "vlan_enabled": false, "fast_roaming_enabled": true, "wlan_bands": ["5g"] },
-                { "name": "Guest", "security": "open", "is_guest": true, "vlan_enabled": true, "vlan": "20" }],
-            "networkconf": [{ "_id": { "$oid": "abc" }, "name": "LAN" }],
+                "networkconf_id": "abc", "hide_ssid": false, "vlan_enabled": true, "vlan": "30", "fast_roaming_enabled": true, "wlan_bands": ["5g"], "bss_transition": false },
+                { "name": "Guest", "security": "open", "is_guest": "true", "networkconf_id": "guest" }],
+            "networkconf": [{ "_id": { "$oid": "abc" }, "name": "LAN" }, { "_id": "guest", "name": "Guests", "purpose": "guest", "vlan_enabled": true, "vlan": "20" }],
         });
+        // The VLAN is the network's when it is tagged, else the SSID's own; an unset BSS transition is on, as the render has it.
         let h = wlan_settings(Some(&state), "Home");
-        assert_eq!((h["security"].as_str(), h["network"].as_str(), h["vlan"].is_null(), h["fast_roaming"].as_bool()), (Some("WPA2/WPA3 Personal"), Some("LAN"), true, Some(true)));
+        assert_eq!((h["security"].as_str(), h["network"].as_str(), h["vlan"].as_i64(), h["fast_roaming"].as_bool()), (Some("WPA2/WPA3 Personal"), Some("LAN"), Some(30), Some(true)));
+        assert_eq!(h["bss_transition"], false);
         let g = wlan_settings(Some(&state), "Guest");
-        assert_eq!((g["security"].as_str(), g["guest"].as_bool(), g["vlan"].as_str()), (Some("Open"), Some(true), Some("20")));
+        assert_eq!((g["security"].as_str(), g["guest"].as_bool(), g["vlan"].as_i64(), g["bss_transition"].as_bool()), (Some("Open"), Some(true), Some(20), Some(true)));
         assert!(wlan_settings(Some(&state), "Other").is_null());
     }
 

@@ -46,8 +46,14 @@ use crate::store::{Db, PushedConfig, Store, Writer};
 /// What apctl remembers about an AP it manages.
 #[derive(Clone, Default)]
 struct Managed {
-    /// The cfgversion of the config apctl considers current for this AP.
+    /// The cfgversion of the config apctl considers current for this AP; none
+    /// before apctl's first push to it.
     cfgversion: Option<String>,
+    /// Adopted afresh (it only had `mgmt_cfg` so far): its first push gets a new
+    /// version, never the one it reports, as an AP that runs the other
+    /// controller's config already may at cutover (see `runs_already`). Stored
+    /// as an empty `managed_devices.cfgversion` until that push.
+    adopted: bool,
     /// The digest of the config that cfgversion stands for (`Render::digest`),
     /// to detect changes. Only the digest is stored: the config holds secrets.
     content: Option<[u8; 32]>,
@@ -243,7 +249,9 @@ impl Active {
             let rows = stmt
                 .query_map([], |r| {
                     let content = r.get::<_, Option<String>>(2)?.map(|c| stored_digest(&c));
-                    let managed = Managed { cfgversion: r.get(1)?, content: content.map(|c| c.0), gcm: r.get::<_, i64>(3)? != 0, render: None };
+                    let cfgversion: Option<String> = r.get(1)?;
+                    let adopted = cfgversion.as_deref() == Some("");
+                    let managed = Managed { cfgversion: cfgversion.filter(|v| !v.is_empty()), adopted, content: content.map(|c| c.0), gcm: r.get::<_, i64>(3)? != 0, render: None };
                     Ok((r.get::<_, String>(0)?, managed, content.is_some_and(|c| c.1)))
                 })?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -291,7 +299,11 @@ impl Active {
             "INSERT OR REPLACE INTO managed_devices (mac, cfgversion, content, gcm, updated) VALUES (?1, ?2, ?3, ?4, ?5)",
             vec![
                 Sql::Text(mac.to_string()),
-                d.cfgversion.clone().map_or(Sql::Null, Sql::Text),
+                match (&d.cfgversion, d.adopted) {
+                    (Some(v), _) => Sql::Text(v.clone()),
+                    (None, true) => Sql::Text(String::new()),
+                    (None, false) => Sql::Null,
+                },
                 d.content.map_or(Sql::Null, |c| Sql::Text(hex::encode(c))),
                 Sql::Integer(d.gcm as i64),
                 Sql::Integer(clock::now_ts()),
@@ -500,23 +512,24 @@ impl Active {
     /// already runs this config (see `runs_already`).
     fn decide_version(&self, mac: Mac, reported: &str, render: &Render, force: bool) -> String {
         // The lock is never held while rendering.
-        let (current, changed) = {
+        let (current, adopted, changed) = {
             let devices = self.devices.lock().unwrap();
             let d = devices.get(&mac);
             let same = d.and_then(|d| d.content) == Some(render.digest);
-            (d.and_then(|d| d.cfgversion.clone()), force || !same)
+            (d.and_then(|d| d.cfgversion.clone()), d.is_some_and(|d| d.adopted), force || !same)
         };
-        if !changed {
-            return current.unwrap_or_default();
+        if let (false, Some(current)) = (changed, &current) {
+            return current.clone();
         }
-        // A resend asked for is always a push.
-        let adopt = !force && current.is_none() && self.runs_already(mac, reported, &render.out);
+        // A resend asked for is always a push; so is the first config of an AP adopted afresh.
+        let adopt = !force && current.is_none() && !adopted && self.runs_already(mac, reported, &render.out);
         let version = if adopt { reported.to_string() } else { new_cfgversion() };
         tracing::info!("{mac}: config {} (cfgversion {version})", if adopt { "already in place, adopting the AP's version" } else { "changed" });
         let snapshot = {
             let mut devices = self.devices.lock().unwrap();
             let d = devices.entry(mac).or_default();
             d.cfgversion = Some(version.clone());
+            d.adopted = false;
             d.content = Some(render.digest);
             d.clone()
         };
@@ -766,10 +779,8 @@ async fn managed_inform(active: &Arc<Active>, ts: Ts, caller: Caller, decoded: D
     };
     if was_adopting {
         // A new start: the config is pushed under a new version, and AES-GCM
-        // is pinned again from this inform. The empty version is never
-        // current, and keeps the AP from being taken for one that runs its
-        // config already (as at cutover): it only had `mgmt_cfg` so far.
-        let fresh = Managed { cfgversion: Some(String::new()), ..Default::default() };
+        // is pinned again from this inform.
+        let fresh = Managed { adopted: true, ..Default::default() };
         active.devices.lock().unwrap().insert(mac, fresh.clone());
         active.persist(mac, &fresh);
         active.adoption_cfgs.lock().unwrap().remove(&mac);
@@ -1331,6 +1342,16 @@ mod tests {
         let stored: String = a.store.read(Db::Config, |c| Ok(c.query_row("SELECT content FROM managed_devices WHERE mac = ?1", [AP], |r| r.get(0))?)).unwrap();
         assert_eq!(stored, hex::encode(render.digest));
         assert_eq!(stored_digest(&stored), (render.digest, false));
+        // An AP adopted afresh stays so through a restart (an empty version on disk): its first push gets a new version.
+        w.exec(Db::Config, "INSERT OR REPLACE INTO managed_devices (mac, cfgversion, content, gcm, updated) VALUES (?1, '', NULL, 0, 0)", vec![Sql::Text(AP.into())]);
+        flushed(w);
+        let (tx, _rx) = mpsc::channel(10);
+        let again = Active::new(&a.store, w.clone(), rig.live.clone(), a.keys.clone(), tx, controller(), Default::default()).unwrap();
+        let d = again.devices.lock().unwrap()[&ap].clone();
+        assert_eq!((d.cfgversion, d.adopted), (None, true));
+        let version = again.decide_version(ap, "abcdefabcdefabcd", &render, false);
+        assert!(version != "abcdefabcdefabcd" && !version.is_empty(), "{version}");
+        assert!(!again.devices.lock().unwrap()[&ap].adopted);
     }
 
     #[test]

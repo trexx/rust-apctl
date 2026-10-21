@@ -248,7 +248,7 @@ pub async fn compute_plan(s: &AppState, radio: String, dfs: bool, allowed: Optio
                 // As `set_channels` judges a channel: at the radio's width in the settings, not the one reported.
                 let legal = state.and_then(|st| {
                     let doc = *docs.get(m)?;
-                    let at = crate::settings::inform_radio(doc, &radio).map_or(width, |r| crate::settings::num(&r["ht"]).unwrap_or(20));
+                    let at = crate::settings::inform_radio(doc, &radio).map_or(width, |r| crate::settings::configured_width(st, r));
                     crate::settings::legal_channels(country, &radio, at, crate::settings::outdoor(st, doc))
                 });
                 Some(PlanAp { mac: m.to_string(), name: d.snapshot.ap.hostname.clone(), current: block(&radio, ch, width), width, clients: r.num_sta, available, legal })

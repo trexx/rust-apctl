@@ -25,7 +25,7 @@ use tokio::sync::{broadcast, mpsc};
 use crate::api::{ApiError, AppState, Json, Query};
 use crate::clock;
 use crate::engine::{Event, EventKind, LiveMsg, SharedLive};
-use crate::insights::{RETRY_AT, RETRY_COLS, retry_pct, retry_totals};
+use crate::insights::{AP_BAND, Retries, retry_totals};
 use crate::series::Spec;
 use crate::model::{Ts, named_enum};
 use crate::settings::band_name;
@@ -370,18 +370,16 @@ fn from_event(kind: EventKind, device: Option<Mac>, data: &Value, ap_name: &dyn 
                 Some(p) => format!("{p} crashed on {name}"),
                 None => format!("{name}: {}", data["kind"].as_str().unwrap_or("crash")),
             };
-            let first = data["lines"].as_array().and_then(|l| l.first()).and_then(Value::as_str).unwrap_or("See the event for details.");
-            on(Key::ApCrash, Changes, Severity::Medium, title, first.to_string()).tagged(format!("crash:{dev}"))
+            // The event's summary line (the fault, as the event shows it); a row stored before it had one is summed up the same way.
+            let lines: Vec<&str> = data["lines"].as_array().into_iter().flatten().filter_map(Value::as_str).collect();
+            let summary = data["summary"].as_str().or_else(|| crate::logevents::crash_summary(&lines)).unwrap_or("See the event for details.");
+            on(Key::ApCrash, Changes, Severity::Medium, title, summary.to_string()).tagged(format!("crash:{dev}"))
         }
         EventKind::ApProcessRestarted => {
             let title = format!("{} restarted on {name}", data["proc"].as_str().unwrap_or("A process"));
-            // The AP's notification as it came: a code it sends as text is
-            // still a code, and none at all is left out.
-            let code = match &data["exit_status"] {
-                Value::Number(n) => Some(n.to_string()),
-                Value::String(c) if c.trim().parse::<i64>().is_ok() => Some(c.trim().to_string()),
-                _ => None,
-            };
+            // Stored as a number (none when the AP sent none); a row stored
+            // before may hold the code as the AP sent it, as text.
+            let code = data["exit_status"].as_i64().or_else(|| data["exit_status"].as_str().and_then(|c| c.trim().parse::<i64>().ok()));
             let exited = code.map_or_else(|| "It exited".to_string(), |c| format!("It exited with code {c}"));
             let message = format!("{exited} and was restarted by {}.", data["caller"].as_str().unwrap_or("the system"));
             on(Key::ApProcessRestarted, Changes, Severity::Low, title, message).tagged(format!("proc:{dev}"))
@@ -467,16 +465,14 @@ async fn radio_health(store: &Arc<Store>, now: Ts) -> anyhow::Result<HashMap<(Ma
                 }
             }
             // Retries from the SSIDs' counters, counted as the other views count them.
-            let spec = Spec { table: "vap_stats", key: "bssid", extra: &["ap_mac", "radio"], cols: &RETRY_COLS, only: None };
+            let spec = Spec { table: "vap_stats", key: "bssid", extra: AP_BAND, cols: &Retries::COLS, only: None };
             let vaps = crate::series::load(c, spec, 0, from, now)?;
-            for ((ap, band), t) in retry_totals(&vaps, RETRY_AT, from) {
+            for ((ap, band), t) in retry_totals(&vaps, crate::series::cols_at(&Retries::COLS, Retries::COLS), from) {
                 let Ok(ap) = ap.parse() else { continue };
                 let h = out.entry((ap, band.to_string())).or_default();
                 h.retries_reported = true;
-                h.attempts = t[1];
-                if t.iter().sum::<f64>() > 0.0 {
-                    h.retry_pct = Some(retry_pct(t));
-                }
+                h.attempts = t.attempts;
+                h.retry_pct = t.pct();
             }
             Ok(out)
         })
@@ -519,6 +515,10 @@ fn stored(r: &rusqlite::Row) -> rusqlite::Result<Option<Alert>> {
     }))
 }
 
+/// The severity of the "keeps dropping off" summary, the only `ap_offline`
+/// alert raised with it: [`load_open`] tells the two kinds apart by it.
+const FLAPPING: Severity = Severity::Medium;
+
 /// What a previous run left: the alerts still open, the highest number a
 /// stored alert's id carries (`{ts}-{number}`), and the AP offline alerts of
 /// the day before `now`, oldest first: (AP, when, whether it was a "keeps
@@ -527,10 +527,9 @@ async fn load_open(store: &Arc<Store>, now: Ts) -> anyhow::Result<(Vec<Alert>, u
     let store = store.clone();
     tokio::task::spawn_blocking(move || {
         store.read(Db::Config, |c| {
-            // "Keeps dropping off" is the only offline alert raised as medium.
-            let mut stmt = c.prepare("SELECT entity, ts, severity = 'medium' FROM alerts WHERE key = 'ap_offline' AND ts > ?1 ORDER BY ts")?;
+            let mut stmt = c.prepare("SELECT entity, ts, severity = ?2 FROM alerts WHERE key = 'ap_offline' AND ts > ?1 ORDER BY ts")?;
             let offline = stmt
-                .query_map([now - 86400], |r| Ok((r.get::<_, String>(0)?.parse().ok(), r.get(1)?, r.get(2)?)))?
+                .query_map(rusqlite::params![now - 86400, FLAPPING.as_str()], |r| Ok((r.get::<_, String>(0)?.parse().ok(), r.get(1)?, r.get(2)?)))?
                 .filter_map(|r| r.map(|(mac, ts, flapping)| Some((mac?, ts, flapping))).transpose())
                 .collect::<rusqlite::Result<Vec<_>>>()?;
             let sql = "SELECT COALESCE(MAX(CAST(substr(id, instr(id, '-') + 1) AS INTEGER)), 0) FROM alerts";
@@ -712,7 +711,7 @@ impl Watcher {
                 }
                 Some(ApChange::Flapping { times }) => {
                     let message = format!("Offline {times} times in the last day; further drops today are not reported separately.");
-                    self.book.open(now, status(Key::ApOffline, Severity::Medium, format!("{name} keeps dropping off"), message));
+                    self.book.open(now, status(Key::ApOffline, FLAPPING, format!("{name} keeps dropping off"), message));
                 }
                 Some(ApChange::Online { down_for, alerted }) => {
                     let note = format!("Back after {}.", human(down_for));
@@ -980,7 +979,7 @@ mod tests {
         let u = from_event(EventKind::ApUpgraded, Some(aa), &json!({ "to": "8.8.12" }), &name).unwrap();
         assert_eq!((u.link.as_deref(), u.tag.as_str(), u.severity), (Some("/config?tab=firmware"), "upgrade:02:00:00:00:00:aa", Severity::Info));
         assert!(from_event(EventKind::ClientConnected, Some(aa), &json!({}), &name).is_none());
-        // A process restart's exit code, however the AP sent it.
+        // A process restart's exit code, stored as a number (as text in rows stored before).
         for (status, want) in [
             (json!(1), "It exited with code 1 and was restarted by procd."),
             (json!("139"), "It exited with code 139 and was restarted by procd."),
@@ -1000,6 +999,13 @@ mod tests {
         let panic = json!({ "kind": "kernel panic", "lines": ["Kernel panic"] });
         assert!(from_event(EventKind::ApCrash, None, &panic, &name).is_none());
         assert_eq!(from_event(EventKind::ApCrash, Some(aa), &panic, &name).unwrap().title, "Garage: kernel panic");
+        // A crash quotes its summary line; a row stored without one, its first fault line.
+        let crash = |data: Value| from_event(EventKind::ApCrash, Some(aa), &data, &name).unwrap().message;
+        let lines = json!(["[  1.0] booting", "[  9.2] Internal error: Oops: 17 [#1]", "[  9.3] PC is at x"]);
+        assert_eq!(crash(json!({ "kind": "oops", "lines": lines, "summary": "[  9.2] Internal error: Oops: 17 [#1]" })), "[  9.2] Internal error: Oops: 17 [#1]");
+        assert_eq!(crash(json!({ "kind": "oops", "lines": lines })), "[  9.2] Internal error: Oops: 17 [#1]");
+        assert_eq!(crash(json!({ "kind": "oops", "lines": ["just a line"] })), "just a line");
+        assert_eq!(crash(json!({ "kind": "oops" })), "See the event for details.");
         assert!(from_event(EventKind::NetworkThreat, None, &json!({ "severity": "high" }), &name).is_some());
     }
 
@@ -1093,7 +1099,7 @@ mod tests {
         // The third drop is summarised, as without the restart.
         let mut again = restart(3000).await;
         assert_eq!(again.aps.check(3000, ap, 2700), Some(ApChange::Flapping { times: 3 }));
-        again.book.raise(3000, offline(Severity::Medium).resolved(3100));
+        again.book.raise(3000, offline(FLAPPING).resolved(3100));
         flushed(&w.book.writer);
         // The fourth is not reported, even after another restart.
         assert_eq!(restart(4000).await.aps.check(4000, ap, 3700), None);

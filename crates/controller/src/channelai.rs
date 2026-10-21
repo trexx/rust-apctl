@@ -26,7 +26,7 @@ use crate::clock;
 use crate::engine::{Event, EventKind, Live};
 use crate::model::Ts;
 use crate::adopt::{device_doc, device_doc_mut};
-use crate::settings::{allowed_channels, band_channels, channel_locked_macs, country, dedup_in_order, device_macs, fixed_channel_ok, inform_radio, legal_channels, mac_list_value, num, setting, setting_mut, uplink};
+use crate::settings::{allowed_channels, band_channels, channel_locked_macs, configured_width, country, dedup_in_order, device_macs, fixed_channel_ok, inform_radio, legal_channels, mac_list_value, num, setting, setting_mut, uplink};
 
 /// A band Channel AI handles, and how its quick scan is asked for.
 pub struct Band {
@@ -228,17 +228,16 @@ pub fn set_channels(state: &mut Value, band: &str, changes: &[(String, i64)], he
         }
         let d = device_doc(state, &m).ok_or_else(|| format!("{mac} is not in the settings"))?;
         let outdoor = crate::settings::outdoor(state, d);
-        let d = device_doc_mut(state, &m).expect("found above");
-        let r = crate::settings::inform_radio_mut(d, band).ok_or_else(|| format!("{mac} has no {band} radio"))?;
-        let width = num(&r["ht"]).unwrap_or(20);
+        // Judged at the width the AP runs, which the plan leaves as it is.
+        let width = inform_radio(d, band).map(|r| configured_width(state, r)).ok_or_else(|| format!("{mac} has no {band} radio"))?;
         if !fixed_channel_ok(c, band, width, outdoor, *ch) {
             return Err(format!("channel {ch} is not allowed at {width} MHz here"));
         }
         if allowed_here.as_ref().is_some_and(|a| !a.contains(ch)) {
             return Err(format!("channel {ch} is not one of the channels Channel AI may use"));
         }
-        r["channel"] = json!(ch);
-        r["ht"] = json!(width);
+        let d = device_doc_mut(state, &m).expect("found above");
+        crate::settings::inform_radio_mut(d, band).expect("found above")["channel"] = json!(ch);
     }
     Ok(())
 }
@@ -543,7 +542,7 @@ pub fn apply_settings(state: &mut Value, p: &Value) -> Result<String, String> {
     let blacklist = r["channels_blacklist"].as_array().cloned().unwrap_or_default();
     let blacklisted = |band: &str, ch: i64| {
         blacklist.iter().any(|b| {
-            b["radio"].as_str() == Some(band) && num(&b["channel"]) == Some(ch) && b["channel_width"].as_str().is_none_or(|w| w == "20")
+            b["radio"].as_str() == Some(band) && num(&b["channel"]) == Some(ch) && num(&b["channel_width"]).is_none_or(|w| w == 20)
         })
     };
     let dfs = na_dfs(r);
@@ -598,6 +597,12 @@ mod tests {
         assert!(r["channels_na"].as_array().unwrap().iter().any(|c| c == "100"));
         // ng: Germany's 1-13 minus the blacklist (2 and 13 here).
         assert_eq!(r["channels_ng"].as_array().unwrap().len(), 11);
+        // An entry for another width (stored as a number or as text) is not a 20 MHz one.
+        let mut t = state();
+        t["setting"][2]["channels_blacklist"] = json!([{ "radio": "ng", "channel": "2", "channel_width": 40 }, { "radio": "ng", "channel": 3, "channel_width": 20 }]);
+        apply_settings(&mut t, &json!({ "hour": 4 })).unwrap();
+        let ng = |t: &Value| radio_ai(t).unwrap()["channels_ng"].as_array().unwrap().iter().filter_map(|c| c.as_str().map(str::to_string)).collect::<Vec<_>>();
+        assert!(ng(&t).contains(&"2".to_string()) && !ng(&t).contains(&"3".to_string()), "{:?}", ng(&t));
         assert!(apply_settings(&mut s, &json!({ "hour": 24 })).is_err());
         // Each band once; anything but a band's name is refused.
         apply_settings(&mut s, &json!({ "radios": ["na", "na"] })).unwrap();
@@ -624,6 +629,11 @@ mod tests {
         assert!(set_channels(&mut s, "ng", &[("02:00:00:00:00:01".into(), 3)], &HashSet::new()).is_err(), "not in the allowed list");
         set_channels(&mut s, "na", &[("02:00:00:00:00:01".into(), 36)], &HashSet::new()).unwrap();
         assert!(set_channels(&mut s, "na", &[("02:00:00:00:00:02".into(), 36)], &HashSet::new()).is_err(), "not one of the APs");
+        // A radio without `ht` runs at Channel AI's width for the band (40 here): judged at it, and left without one.
+        s["devices"][0]["radio_table"][0].as_object_mut().unwrap().remove("ht");
+        assert_eq!(set_channels(&mut s, "na", &[("02:00:00:00:00:01".into(), 140)], &HashSet::new()).unwrap_err(), "channel 140 is not allowed at 40 MHz here");
+        set_channels(&mut s, "na", &[("02:00:00:00:00:01".into(), 40)], &HashSet::new()).unwrap();
+        assert_eq!((&s["devices"][0]["radio_table"][0]["channel"], &s["devices"][0]["radio_table"][0]["ht"]), (&json!(40), &Value::Null));
         // Nor an AP a plan must leave where it is, however the plan came.
         let held = HashSet::from(["02:00:00:00:00:01".parse().unwrap()]);
         assert!(set_channels(&mut s, "na", &[("02-00-00-00-00-01".into(), 36)], &held).unwrap_err().contains("keeps this AP's channel"));

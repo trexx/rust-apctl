@@ -9,7 +9,7 @@ use std::sync::LazyLock;
 
 use crate::api::{ApiError, AppState, Json, Query};
 use crate::settings::Kind::{Bool, Enum, Int};
-use crate::settings::{COUNTRIES, Patch, PreviewQuery, band_name, copy_fields, country, dedup_in_order, docs_mut, illegal_fixed_channel, mgmt_flag, num, outdoor_with, pick, record_label, setting, setting_mut, str_field, timezone};
+use crate::settings::{COUNTRIES, Patch, PreviewQuery, band_name, configured_width, copy_fields, country, dedup_in_order, docs, docs_mut, illegal_fixed_channel, mgmt_flag, num, outdoor_with, pick, record_label, setting, setting_mut, str_field, timezone};
 
 /// A host name or IPv4 address, as NTP and syslog targets take (the official
 /// controller refuses IPv6 there).
@@ -35,12 +35,14 @@ const NTP_KEYS: [&str; 4] = ["ntp_server_1", "ntp_server_2", "ntp_server_3", "nt
 fn reset_illegal_channels(state: &mut Value) -> Vec<String> {
     let c = country(state);
     let site_outdoor = mgmt_flag(state, "outdoor_mode_enabled");
+    // Each AP's radios' widths, read before the records are borrowed to change them.
+    let widths: Vec<Vec<i64>> = docs(state, "devices").map(|d| d["radio_table"].as_array().into_iter().flatten().map(|r| configured_width(state, r)).collect()).collect();
     let mut out = Vec::new();
-    for d in docs_mut(state, "devices") {
+    for (d, widths) in docs_mut(state, "devices").zip(widths) {
         let o = outdoor_with(d, site_outdoor);
         let name = record_label(d, "?");
-        for r in d["radio_table"].as_array_mut().into_iter().flatten() {
-            if let Some(ch) = illegal_fixed_channel(c, r, o) {
+        for (r, width) in d["radio_table"].as_array_mut().into_iter().flatten().zip(widths) {
+            if let Some(ch) = illegal_fixed_channel(c, r, width, o) {
                 out.push(format!("AP {name} {} channel {ch} → auto", band_name(r["radio"].as_str().unwrap_or(""))));
                 r["channel"] = json!("auto");
             }
@@ -202,10 +204,10 @@ fn site_ntp(doc: &mut Value, n: &Value) -> Result<(), String> {
         if let Some(h) = named.iter().zip(NTP_KEYS).find_map(|(h, k)| h.filter(|h| !h.is_empty() && doc[k].as_str() != Some(h))) {
             return Err(format!("{h}: time servers are set only with manual NTP"));
         }
-    } else if named.iter().any(Option::is_some) {
+    } else if named.iter().any(Option::is_some) || !was_manual && doc["setting_preference"].as_str() == Some("manual") {
         // The servers named replace those stored, and the four close up. Coming
         // from automatic, the pool's servers are no choice of the user's: the
-        // ones not named are blank.
+        // ones not named are blank (all four when none is named).
         let mut list = Vec::new();
         for (h, k) in named.into_iter().zip(NTP_KEYS) {
             let h = match h {
@@ -503,6 +505,8 @@ mod tests {
         edit(&mut s, json!({ "snmp": { "enabled": true, "community": "c0mmunity" } })).unwrap();
         assert!(edit(&mut s, json!({ "snmp": { "enabledV3": true, "username": "mon" } })).unwrap_err().contains("password"));
         assert!(edit(&mut s, json!({ "snmp": { "enabledV3": true, "username": "mon", "x_password": "short" } })).is_err());
+        assert!(edit(&mut s, json!({ "snmp": { "enabledV3": true, "username": "mon", "x_password": "pass\tword1" } })).unwrap_err().contains("control characters"));
+        assert!(edit(&mut s, json!({ "snmp": { "enabledV3": true, "username": "m\ron", "x_password": "password1" } })).unwrap_err().contains("control characters"));
         let what = edit(&mut s, json!({ "snmp": { "enabledV3": true, "username": "mon", "x_password": "v3-secret-pw" } })).unwrap();
         assert!(what.contains("SNMPv3 password") && !what.contains("v3-secret"), "{what}");
         // Shown to logged-in users; never the v3 password, and nothing in read-only mode.
@@ -550,7 +554,8 @@ mod tests {
         assert!(edit(&mut s, json!({ "ntp": { "setting_preference": "auto", "ntp_server_2": "time.example.net" } })).unwrap_err().contains("only with manual"));
         let pool = setting(&s, "ntp").clone();
         assert_eq!(edit(&mut s, json!({ "ntp": pool })).unwrap(), "site settings: nothing changed");
-        // From automatic, the pool is not kept for the servers not named.
+        // From automatic, the pool is not kept for the servers not named: manual alone has none.
+        assert_eq!(edit(&mut s.clone(), json!({ "ntp": { "setting_preference": "manual" } })).unwrap_err(), "manual NTP needs at least one server");
         edit(&mut s, json!({ "ntp": { "setting_preference": "manual", "ntp_server_2": "time.example.net" } })).unwrap();
         assert_eq!(servers(&s), ["time.example.net", "", "", ""]);
     }
