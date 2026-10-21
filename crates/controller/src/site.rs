@@ -341,13 +341,16 @@ fn ssh_keys(v: &Value, stored: &Value) -> Result<Vec<Value>, String> {
     Ok(out)
 }
 
-/// The site settings as shown, with the choices of country and time zone.
+/// The site settings as shown, with the choices of country and time zone, and
+/// the port apctl takes the APs' syslog on (`null` without a listener), which
+/// "to this controller" sends them to.
 #[derive(serde::Serialize)]
 pub struct SiteView {
     #[serde(flatten)]
     settings: Value,
     countries: &'static Value,
     timezones: &'static Value,
+    syslog_port: Option<u16>,
 }
 
 /// GET /api/settings/site. Read-only mode (no users) leaves out the SNMP
@@ -357,7 +360,7 @@ pub async fn get_site(State(s): State<AppState>) -> Result<Json<SiteView>, ApiEr
     // The choices never change: built once, and serialised from there.
     static COUNTRY_LIST: LazyLock<Value> = LazyLock::new(|| COUNTRIES.iter().map(|c| json!({ "code": c.code, "name": c.name })).collect());
     static TIMEZONES: LazyLock<Value> = LazyLock::new(|| apcfg::tz::names().collect());
-    Ok(Json(SiteView { settings: site_view(&state, s.active, s.auth.enabled()), countries: &COUNTRY_LIST, timezones: &TIMEZONES }))
+    Ok(Json(SiteView { settings: site_view(&state, s.active, s.auth.enabled()), countries: &COUNTRY_LIST, timezones: &TIMEZONES, syslog_port: s.syslog_listen }))
 }
 
 fn site_view(state: &Value, active: bool, secrets: bool) -> Value {

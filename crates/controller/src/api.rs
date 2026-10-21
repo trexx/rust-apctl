@@ -72,7 +72,6 @@ pub struct AppStateInner {
     /// `--inform-url` in active mode (see `ssh::inform_url`).
     pub inform_url: Option<String>,
     /// The port apctl takes AP syslog on (`--syslog-listen`'s); None without a listener.
-    #[allow(dead_code)] // until GET /api/settings/site sends it (p11-features drops this)
     pub syslog_listen: Option<u16>,
     /// What the insights views read lately (see `series::memo_read`).
     pub memo: crate::series::Memo,
