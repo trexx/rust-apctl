@@ -334,11 +334,25 @@ const ALERT_RETENTION: Ts = 90 * 86400;
 /// that it neither comes again nor loses when it started): the retention
 /// above, and a backup's history trim.
 pub const FORGET_RESOLVED_ALERTS: &str = "DELETE FROM alerts WHERE ts < ?1 AND resolved_ts < ?1";
-/// config.db's history: each table with the column its rows' time is in (never
-/// null), by which a backup's history trim keeps the newer rows; `maintenance`
-/// deletes old rows by the same columns (spectrum is replaced, not aged out).
-/// A history table added goes here and, with its retention, there.
-pub const CONFIG_HISTORY: [(&str, &str); 5] = [("events", "ts"), ("connections", "ts"), ("neighbors", "last_seen"), ("spectrum", "ts"), ("dryrun_results", "ts")];
+/// One of config.db's history tables (see `CONFIG_HISTORY`).
+pub struct History {
+    pub table: &'static str,
+    /// The column its rows' time is in (never null).
+    pub time: &'static str,
+    /// How long `maintenance` keeps its rows; None for spectrum, whose rows are replaced, not aged out.
+    keep: Option<Ts>,
+    rows: Rows,
+}
+
+/// config.db's history: what `maintenance` deletes once older than its
+/// retention, and what a backup's history trim keeps only the newer rows of.
+pub const CONFIG_HISTORY: [History; 5] = [
+    History { table: "events", time: "ts", keep: Some(EVENT_RETENTION), rows: Rows::Rowid },
+    History { table: "connections", time: "ts", keep: Some(CONNECTION_RETENTION), rows: Rows::Rowid },
+    History { table: "neighbors", time: "last_seen", keep: Some(NEIGHBOR_RETENTION), rows: Rows::WithoutRowid },
+    History { table: "spectrum", time: "ts", keep: None, rows: Rows::WithoutRowid },
+    History { table: "dryrun_results", time: "ts", keep: Some(DRYRUN_RETENTION), rows: Rows::Rowid },
+];
 
 fn open_rw(path: &Path) -> Result<Connection> {
     let conn = Connection::open(path).with_context(|| format!("opening {}", path.display()))?;
@@ -677,9 +691,9 @@ pub fn stored_pushes(c: &Connection) -> rusqlite::Result<HashMap<inform::Mac, Pu
 
 /// Rolls complete buckets up into the coarser tiers, then applies retention.
 /// Each step runs on its own: one that fails is logged and the rest still run.
-/// The retention of a year of events and clients, of alerts and of sessions
-/// only runs when `hourly`: an hour's delay is nothing to them, and the
-/// clients' (by `last_seen`, which has no index) reads the whole table.
+/// The retention of a year of clients, of alerts and of sessions only runs
+/// when `hourly`: an hour's delay is nothing to them, and the clients' (by
+/// `last_seen`, which has no index) reads the whole table.
 ///
 /// Both go by the wall clock. A capture replayed from the past writes raw rows
 /// that are older than the roll-up's progress mark (or than the raw tier's
@@ -700,17 +714,19 @@ fn maintenance(conns: &mut Conns, now: Ts, hourly: bool) {
         }
         for Tier { suffix, keep, .. } in TIERS {
             let table = format!("{}{suffix}", t.name);
-            step(&format!("retention of {table}"), delete_before(metrics, &table, Rows::Metric, now - keep));
+            step(&format!("retention of {table}"), delete_before(metrics, &table, "ts", Rows::WithoutRowid, now - keep));
         }
     }
-    step("retention of logs", delete_before(logs, "logs", Rows::Rowid, now - LOG_RETENTION));
-    step("retention of dry runs", delete_before(config, "dryrun_results", Rows::Rowid, now - DRYRUN_RETENTION));
-    step("retention of connections", delete_before(config, "connections", Rows::Rowid, now - CONNECTION_RETENTION));
-    step("retention of neighbours", config.execute("DELETE FROM neighbors WHERE last_seen < ?1", [now - NEIGHBOR_RETENTION]).map(drop).map_err(Into::into));
+    step("retention of logs", delete_before(logs, "logs", "ts", Rows::Rowid, now - LOG_RETENTION));
+    // With nothing due, one probe of the time index each.
+    for History { table, time, keep, rows } in CONFIG_HISTORY {
+        if let Some(keep) = keep {
+            step(&format!("retention of {table}"), delete_before(config, table, time, rows, now - keep));
+        }
+    }
     if !hourly {
         return;
     }
-    step("retention of events", delete_before(config, "events", Rows::Rowid, now - EVENT_RETENTION));
     step("expiring sessions", config.execute("DELETE FROM sessions WHERE expires < ?1", [now]).map(drop).map_err(Into::into));
     step("retention of clients", config.execute(FORGET_OLD_CLIENTS, [now - CLIENT_RETENTION]).map(drop).map_err(Into::into));
     step("retention of alerts", config.execute(FORGET_RESOLVED_ALERTS, [now - ALERT_RETENTION]).map(drop).map_err(Into::into));
@@ -756,20 +772,20 @@ fn write_state(conn: &Connection, key: &str, upto: Ts) -> Result<()> {
 /// How `delete_before` removes a table's old rows.
 #[derive(Clone, Copy, PartialEq)]
 enum Rows {
-    /// A metric table: WITHOUT ROWID, and small per run because this runs every
-    /// 5 minutes, so one statement.
-    Metric,
+    /// A WITHOUT ROWID table (the metrics, neighbours): small per run because
+    /// this runs every 5 minutes, so one statement.
+    WithoutRowid,
     /// A rowid table: in batches, so the writer never holds a long lock.
     Rowid,
 }
 
-/// Deletes rows older than `cutoff`.
-fn delete_before(conn: &Connection, table: &str, rows: Rows, cutoff: Ts) -> Result<()> {
-    if rows == Rows::Metric {
-        conn.execute(&format!("DELETE FROM {table} WHERE ts < ?1"), [cutoff])?;
+/// Deletes the rows whose `time` is before `cutoff`.
+fn delete_before(conn: &Connection, table: &str, time: &str, rows: Rows, cutoff: Ts) -> Result<()> {
+    if rows == Rows::WithoutRowid {
+        conn.execute(&format!("DELETE FROM {table} WHERE {time} < ?1"), [cutoff])?;
         return Ok(());
     }
-    let sql = format!("DELETE FROM {table} WHERE rowid IN (SELECT rowid FROM {table} WHERE ts < ?1 LIMIT 5000)");
+    let sql = format!("DELETE FROM {table} WHERE rowid IN (SELECT rowid FROM {table} WHERE {time} < ?1 LIMIT 5000)");
     while conn.execute(&sql, [cutoff])? == 5000 {}
     Ok(())
 }
@@ -1033,6 +1049,8 @@ mod tests {
         conns[Db::Config as usize]
             .execute_batch(&format!(
                 "INSERT INTO clients (mac, last_seen) VALUES ('gone', {old}), ('named', {old}), ('recent', {recent});
+                 INSERT INTO events (ts, kind) VALUES ({old}, 'gone'), ({recent}, 'recent');
+                 INSERT INTO neighbors (bssid, ap_mac, first_seen, last_seen) VALUES ('gone', 'a', {old}, {old}), ('recent', 'a', {old}, {recent});
                  INSERT INTO client_aliases (mac, alias, updated) VALUES ('named', 'n', 0);
                  INSERT INTO alerts (id, ts, key, category, severity, entity, title, message, tag, resolved_ts)
                    VALUES ('done', {old}, 'k', 'c', 's', 'e', 't', 'm', 't', {old}), ('open', {old}, 'k', 'c', 's', 'e', 't', 'm', 't', NULL),
@@ -1044,12 +1062,14 @@ mod tests {
         maintenance(&mut conns, now, false);
         let n: i64 = conns[Db::Config as usize].query_row("SELECT COUNT(*) FROM clients", [], |r| r.get(0)).unwrap();
         assert_eq!(n, 3, "a year's retention only runs hourly");
-        maintenance(&mut conns, now, true);
-        let ids = |sql: &str| -> Vec<String> {
+        let ids = |conns: &Conns, sql: &str| -> Vec<String> {
             conns[Db::Config as usize].prepare(sql).unwrap().query_map([], |r| r.get(0)).unwrap().collect::<rusqlite::Result<_>>().unwrap()
         };
-        assert_eq!(ids("SELECT mac FROM clients ORDER BY mac"), ["named", "recent"]);
-        assert_eq!(ids("SELECT id FROM alerts ORDER BY id"), ["new", "open"]);
+        assert_eq!(ids(&conns, "SELECT kind FROM events"), ["recent"], "the history's runs every time");
+        assert_eq!(ids(&conns, "SELECT bssid FROM neighbors"), ["recent"]);
+        maintenance(&mut conns, now, true);
+        assert_eq!(ids(&conns, "SELECT mac FROM clients ORDER BY mac"), ["named", "recent"]);
+        assert_eq!(ids(&conns, "SELECT id FROM alerts ORDER BY id"), ["new", "open"]);
     }
 
     #[test]

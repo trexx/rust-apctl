@@ -430,8 +430,8 @@ fn trimmed_config(src: &Path, dst: &Path, t: Ts) -> Result<()> {
             continue;
         }
         let copy = format!("INSERT INTO main.\"{name}\" SELECT * FROM live.\"{name}\"");
-        match store::CONFIG_HISTORY.iter().find(|(table, _)| table == name) {
-            Some((_, col)) => tx.execute(&format!("{copy} WHERE \"{col}\" >= ?1"), [t])?,
+        match store::CONFIG_HISTORY.iter().find(|h| h.table == name) {
+            Some(h) => tx.execute(&format!("{copy} WHERE \"{}\" >= ?1", h.time), [t])?,
             None => tx.execute(&copy, [])?,
         };
     }
