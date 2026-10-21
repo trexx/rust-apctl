@@ -254,7 +254,16 @@ async fn serve(args: ServeArgs) -> Result<()> {
     // name this controller's own address and ports; else the official defaults.
     let controller = if active {
         let (host, inform_port) = inform_address(inform_url.as_deref(), inform_listen);
-        apcfg::Controller { host, inform_port, stun_port: stun_listen.port(), ..dryrun::controller(emulate_version, reporter_id(&store)?) }
+        let official = dryrun::controller(emulate_version, reporter_id(&store)?);
+        // Syslog "to this controller" goes where apctl listens; without a listener, to the official port.
+        let syslog_port = match syslog_listen {
+            Some(addr) => addr.port(),
+            None => {
+                tracing::warn!("active mode without --syslog-listen: APs sending syslog to this controller send it to port {}, where apctl does not listen", official.syslog_port);
+                official.syslog_port
+            }
+        };
+        apcfg::Controller { host, inform_port, stun_port: stun_listen.port(), syslog_port, ..official }
     } else {
         dryrun::controller(emulate_version, String::new())
     };

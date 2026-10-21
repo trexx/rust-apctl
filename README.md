@@ -42,7 +42,8 @@ These screenshots use mock data from `informdump demo`.
   config pushes with apctl's.
 - **Active** (`--active`): apctl is the controller. It uses 8080/tcp (inform),
   5514/udp (syslog) and 3478/udp (STUN), and takes over the APs' keys from
-  `informdump import`.
+  `informdump import`. The configs it pushes name the ports it listens on, so APs
+  sending syslog "to this controller" use the `--syslog-listen` port.
 
 ## Run
 

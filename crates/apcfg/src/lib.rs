@@ -44,6 +44,7 @@ use serde_json::Value;
 use crate::wlan::Band;
 
 /// Facts about the controller itself that the settings snapshot does not hold.
+#[derive(Clone)]
 pub struct Controller {
     /// The controller's host, e.g. `unifi.example.net`: what the AP is given when neither
     /// a pending migration, the settings nor its stored inform URL names one.
@@ -55,6 +56,9 @@ pub struct Controller {
     pub https_port: u16,
     /// The port the controller answers STUN on, in `stun_url` (official default 3478).
     pub stun_port: u16,
+    /// The port the controller takes the APs' syslog and netconsole on, when the site
+    /// sends them "to this controller" (official default 5514).
+    pub syslog_port: u16,
     /// Controller version written as `unifi.version` (the official one sends `10.6.106`).
     pub version: String,
     /// Anonymous controller id (`unifi.anonymous_controller_id` and `unifi.reporterid`).
@@ -65,7 +69,7 @@ impl Default for Controller {
     /// The official controller's default ports, on the host name `unifi` (the one APs
     /// look for on a fresh network), with no version or id.
     fn default() -> Controller {
-        Controller { host: "unifi".into(), inform_port: 8080, https_port: 8443, stun_port: 3478, version: String::new(), reporter_uuid: String::new() }
+        Controller { host: "unifi".into(), inform_port: 8080, https_port: 8443, stun_port: 3478, syslog_port: 5514, version: String::new(), reporter_uuid: String::new() }
     }
 }
 

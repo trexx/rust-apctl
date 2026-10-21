@@ -375,7 +375,8 @@ fn syslog(c: &mut Cfg, ctx: &Ctx) {
         return;
     }
     // Logs for this controller go to the address the AP itself informs to.
-    let to_controller = (ctx.inform_str("inform_ip"), Some(Text::Str("5514")));
+    let port = ctx.controller.syslog_port.to_string();
+    let to_controller = (ctx.inform_str("inform_ip"), Some(Text::Str(&port)));
     c.header("syslog");
     c.set("syslog.status", "enabled");
     c.set("syslog.level", if enabled && flag(s, "debug", false) { 8 } else { 7 });
@@ -799,13 +800,16 @@ mod tests {
     }
 
     fn syslog_lines(rsyslogd: Value) -> String {
+        syslog_lines_for(rsyslogd, &Controller::default())
+    }
+
+    fn syslog_lines_for(rsyslogd: Value, controller: &Controller) -> String {
         let mac = "02:00:00:00:00:01";
         let mut rsyslogd = rsyslogd;
         rsyslogd["key"] = json!("rsyslogd");
         let state = json!({ "sites": [{ "_id": "s" }], "setting": [rsyslogd], "devices": [{ "mac": mac, "site_id": "s", "type": "uap", "syslog_key": "k" }] });
-        let controller = Controller::default();
         let inform = json!({ "inform_ip": "192.0.2.1" });
-        let ctx = Ctx::new(&Input { state: &state, device_mac: mac, inform: Some(&inform), cfgversion: "1", controller: &controller }).unwrap();
+        let ctx = Ctx::new(&Input { state: &state, device_mac: mac, inform: Some(&inform), cfgversion: "1", controller }).unwrap();
         let mut c = Cfg::default();
         syslog(&mut c, &ctx);
         c.finish()
@@ -821,6 +825,16 @@ mod tests {
         assert_eq!(off, "# syslog\nsyslog.status=enabled\nsyslog.level=7\n");
         let off_netconsole = syslog_lines(json!({ "enabled": false, "this_controller": true, "netconsole_enabled": true, "netconsole_host": "192.0.2.9", "netconsole_port": "6666" }));
         assert!(off_netconsole.ends_with("syslog.level=7\nnetconsole.host=192.0.2.9\nnetconsole.port=6666\nnetconsole.status=enabled\n"), "{off_netconsole}");
+    }
+
+    /// "To this controller" names the port the controller takes syslog on.
+    #[test]
+    fn syslog_to_this_controller_uses_its_port() {
+        let on = json!({ "enabled": true, "this_controller": true });
+        let official = syslog_lines(on.clone());
+        assert!(official.contains("syslog.remote.ip=192.0.2.1\nsyslog.remote.port=5514\n") && official.contains("netconsole.port=5514\n"), "{official}");
+        let ours = syslog_lines_for(on, &Controller { syslog_port: 1514, ..Default::default() });
+        assert!(ours.contains("syslog.remote.port=1514\n") && ours.contains("netconsole.port=1514\n") && !ours.contains("5514"), "{ours}");
     }
 
     #[test]

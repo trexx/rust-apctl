@@ -37,25 +37,22 @@ pub fn apcfg_renderer(version: String) -> RenderFn {
 /// own, so that a dry run renders what it pushes. The installation ID is the
 /// one the AP's last push names, else the template's.
 pub fn renderer_for(template: &apcfg::Controller) -> RenderFn {
-    let template = copy(template, template.reporter_uuid.clone());
+    let template = template.clone();
     Arc::new(move |req: &RenderRequest| {
-        let reporter = req.previous_system_cfg.and_then(|c| c.lines().find_map(|l| l.strip_prefix("unifi.reporterid="))).unwrap_or(&template.reporter_uuid);
-        let controller = copy(&template, reporter.to_string());
-        let input = apcfg::Input {
-            state: req.state,
-            device_mac: req.device_mac,
-            inform: req.inform,
-            cfgversion: req.cfgversion,
-            controller: &controller,
+        let reporter = req.previous_system_cfg.and_then(|c| c.lines().find_map(|l| l.strip_prefix("unifi.reporterid=")));
+        // A copy only when the AP names another installation (in active mode, the last push is usually our own).
+        let other;
+        let controller = match reporter {
+            Some(r) if r != template.reporter_uuid => {
+                other = apcfg::Controller { reporter_uuid: r.to_string(), ..template.clone() };
+                &other
+            }
+            _ => &template,
         };
+        let input = apcfg::Input { state: req.state, device_mac: req.device_mac, inform: req.inform, cfgversion: req.cfgversion, controller };
         let r = apcfg::render(&input)?;
         Ok((r.mgmt_cfg, r.system_cfg))
     })
-}
-
-/// `c` with another installation ID.
-fn copy(c: &apcfg::Controller, reporter_uuid: String) -> apcfg::Controller {
-    apcfg::Controller { host: c.host.clone(), inform_port: c.inform_port, https_port: c.https_port, stun_port: c.stun_port, version: c.version.clone(), reporter_uuid }
 }
 
 /// `(mgmt_cfg, system_cfg)` for one AP.
@@ -281,15 +278,17 @@ mod tests {
     fn a_dry_run_renders_for_the_controller_it_was_given() {
         let mac = "02:00:00:00:00:01";
         let mgmt = serde_json::json!({ "key": "mgmt", "site_id": "s", "x_ssh_md5passwd": "$1$x$y" });
-        let state = serde_json::json!({ "sites": [{ "_id": "s", "name": "default" }], "devices": [{ "mac": mac, "site_id": "s", "type": "uap" }], "setting": [mgmt] });
+        let rsyslogd = serde_json::json!({ "key": "rsyslogd", "site_id": "s", "enabled": true, "this_controller": true });
+        let state = serde_json::json!({ "sites": [{ "_id": "s", "name": "default" }], "devices": [{ "mac": mac, "site_id": "s", "type": "uap" }], "setting": [mgmt, rsyslogd] });
         let line = |render: &RenderFn, previous: Option<&str>, key: &str| {
             let req = RenderRequest { state: &state, device_mac: mac, inform: None, cfgversion: "1", previous_system_cfg: previous };
             let (mgmt, system) = render(&req).unwrap();
             mgmt.lines().chain(system.lines()).find_map(|l| l.strip_prefix(key)?.strip_prefix('=')).map(str::to_string)
         };
-        let ours = apcfg::Controller { host: "ctl.example.net".into(), stun_port: 3479, ..controller("10.6.106".into(), "ours".into()) };
+        let ours = apcfg::Controller { host: "ctl.example.net".into(), stun_port: 3479, syslog_port: 1514, ..controller("10.6.106".into(), "ours".into()) };
         let render = renderer_for(&ours);
         assert_eq!(line(&render, None, "stun_url").as_deref(), Some("stun://ctl.example.net:3479/"));
+        assert_eq!(line(&render, Some("unifi.reporterid=theirs"), "syslog.remote.port").as_deref(), Some("1514"), "every field but the ID is the template's");
         // The installation ID: the last push's, else the template's.
         assert_eq!(line(&render, None, "unifi.reporterid").as_deref(), Some("ours"));
         assert_eq!(line(&render, Some("unifi.reporterid=theirs"), "unifi.reporterid").as_deref(), Some("theirs"));
