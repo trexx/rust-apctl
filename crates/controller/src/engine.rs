@@ -25,6 +25,8 @@ use crate::store::{self, Db, PushedConfig, Write, Writer};
 pub const CLIENT_GRACE_SECS: Ts = 60;
 /// An AP is offline after missing this many of its inform intervals.
 pub const OFFLINE_INTERVALS: Ts = 4;
+/// Nor sooner than this after its last inform, however short its interval.
+const MIN_OFFLINE_SECS: Ts = 60;
 const DEFAULT_INTERVAL: Ts = 15;
 
 /// A change to the settings, applied by the engine: it edits, then says what
@@ -1575,7 +1577,7 @@ impl Engine {
         let started = *self.first_tick.get_or_insert(now);
         let mut offline = Vec::new();
         for (mac, d) in live.devices.iter_mut() {
-            let limit = (d.interval.max(5) * OFFLINE_INTERVALS).max(60);
+            let limit = (d.interval.max(5) * OFFLINE_INTERVALS).max(MIN_OFFLINE_SECS);
             if d.online && now - d.last_seen > limit {
                 d.online = false;
                 offline.push(*mac);
@@ -1584,9 +1586,9 @@ impl Engine {
         }
         // An AP last recorded online that has not informed in this run, as when it
         // went down while apctl was away: its interval is not known, so it is
-        // given the longest usual one, counted from this run's start too.
+        // given the longest one active mode asks for, counted from this run's start too.
         for (mac, k) in live.known_devices.iter_mut() {
-            if !k.offline && now - k.last_seen.max(started) > 60 * OFFLINE_INTERVALS {
+            if !k.offline && now - k.last_seen.max(started) > crate::active::MAX_INFORM_INTERVAL * OFFLINE_INTERVALS {
                 k.offline = true;
                 offline.push(*mac);
                 events.push(Event::device(now, EventKind::ApOffline, *mac, json!({ "last_seen": k.last_seen })));
@@ -2297,10 +2299,11 @@ mod tests {
         // Gone while apctl was away: reported offline once this run has given it time to inform.
         let mut h = h.restarted();
         h.engine.handle(Input::Tick(1000));
-        h.engine.handle(Input::Tick(1000 + 60 * OFFLINE_INTERVALS));
+        let limit = crate::active::MAX_INFORM_INTERVAL * OFFLINE_INTERVALS;
+        h.engine.handle(Input::Tick(1000 + limit));
         assert_eq!(events(&mut h), []);
-        h.engine.handle(Input::Tick(1001 + 60 * OFFLINE_INTERVALS));
-        h.engine.handle(Input::Tick(1100 + 60 * OFFLINE_INTERVALS));
+        h.engine.handle(Input::Tick(1001 + limit));
+        h.engine.handle(Input::Tick(1100 + limit));
         assert_eq!(events(&mut h), [("ap_offline", None)]);
         assert_eq!(stored(&h, EventKind::ApOffline)[1]["last_seen"], 510);
         let mut h = h.restarted();
