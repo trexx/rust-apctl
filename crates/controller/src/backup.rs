@@ -396,9 +396,6 @@ fn copy_for_backup(name: &str, src: &Path, dst: &Path, cutoff: Option<Ts>) -> Re
     }
 }
 
-/// config.db's history: each table with the column its rows' time is in.
-const CONFIG_HISTORY: [(&str, &str); 5] = [("events", "ts"), ("connections", "ts"), ("neighbors", "last_seen"), ("spectrum", "ts"), ("dryrun_results", "ts")];
-
 /// A consistent copy of the live config.db without the history older than
 /// `t` and without the sessions. It is built rather than copied whole and
 /// trimmed: a daily settings backup reads a year of events, but writes none.
@@ -428,14 +425,14 @@ fn trimmed_config(src: &Path, dst: &Path, t: Ts) -> Result<()> {
             continue;
         }
         let copy = format!("INSERT INTO main.\"{name}\" SELECT * FROM live.\"{name}\"");
-        match CONFIG_HISTORY.iter().find(|(table, _)| table == name) {
-            Some((_, col)) => tx.execute(&format!("{copy} WHERE \"{col}\" >= ?1 OR \"{col}\" IS NULL"), [t])?,
+        match store::CONFIG_HISTORY.iter().find(|(table, _)| table == name) {
+            Some((_, col)) => tx.execute(&format!("{copy} WHERE \"{col}\" >= ?1"), [t])?,
             None => tx.execute(&copy, [])?,
         };
     }
     // As retention does, on the copy: an alert still open travels, so a restore
     // neither raises it again nor loses when it started.
-    tx.execute("DELETE FROM alerts WHERE ts < ?1 AND resolved_ts < ?1", [t])?;
+    tx.execute(store::FORGET_RESOLVED_ALERTS, [t])?;
     tx.execute(store::FORGET_OLD_CLIENTS, [t])?;
     tx.commit()?;
     c.execute_batch("DETACH DATABASE live;")?;

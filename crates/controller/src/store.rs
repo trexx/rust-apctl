@@ -330,6 +330,15 @@ pub const CLIENT_RETENTION: Ts = 365 * 86400;
 pub const FORGET_OLD_CLIENTS: &str = "DELETE FROM clients WHERE COALESCE(last_seen, 0) < ?1 AND mac NOT IN (SELECT mac FROM client_aliases)";
 /// Resolved alerts are kept this long; open ones until they resolve.
 const ALERT_RETENTION: Ts = 90 * 86400;
+/// Deletes the alerts raised and resolved before ?1 (an open one is kept, so
+/// that it neither comes again nor loses when it started): the retention
+/// above, and a backup's history trim.
+pub const FORGET_RESOLVED_ALERTS: &str = "DELETE FROM alerts WHERE ts < ?1 AND resolved_ts < ?1";
+/// config.db's history: each table with the column its rows' time is in (never
+/// null), by which a backup's history trim keeps the newer rows; `maintenance`
+/// deletes old rows by the same columns (spectrum is replaced, not aged out).
+/// A history table added goes here and, with its retention, there.
+pub const CONFIG_HISTORY: [(&str, &str); 5] = [("events", "ts"), ("connections", "ts"), ("neighbors", "last_seen"), ("spectrum", "ts"), ("dryrun_results", "ts")];
 
 fn open_rw(path: &Path) -> Result<Connection> {
     let conn = Connection::open(path).with_context(|| format!("opening {}", path.display()))?;
@@ -708,10 +717,7 @@ fn maintenance(conns: &mut Conns, now: Ts, hourly: bool) {
     step("retention of events", delete_before(config, "events", Rows::Rowid, now - EVENT_RETENTION));
     step("expiring sessions", config.execute("DELETE FROM sessions WHERE expires < ?1", [now]).map(drop).map_err(Into::into));
     step("retention of clients", config.execute(FORGET_OLD_CLIENTS, [now - CLIENT_RETENTION]).map(drop).map_err(Into::into));
-    step(
-        "retention of alerts",
-        config.execute("DELETE FROM alerts WHERE ts < ?1 AND resolved_ts < ?1", [now - ALERT_RETENTION]).map(drop).map_err(Into::into),
-    );
+    step("retention of alerts", config.execute(FORGET_RESOLVED_ALERTS, [now - ALERT_RETENTION]).map(drop).map_err(Into::into));
 }
 
 /// How long after a bucket ends it is rolled up: rows still queued in the
