@@ -448,7 +448,7 @@ fn reporter_id(store: &store::Store) -> Result<String> {
         let cfg: Option<String> = c
             .query_row("SELECT system_cfg FROM device_config WHERE instr(system_cfg, 'unifi.reporterid=') > 0 LIMIT 1", [], |r| r.get(0))
             .optional()?;
-        Ok(cfg.and_then(|cfg| cfg.lines().find_map(|l| l.strip_prefix("unifi.reporterid=")).map(str::to_string)))
+        Ok(cfg.as_deref().and_then(dryrun::reporter_of).map(str::to_string))
     })?;
     Ok(seen.unwrap_or_else(|| {
         let h = random_hex::<16>();
