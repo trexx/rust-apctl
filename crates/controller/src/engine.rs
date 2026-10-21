@@ -1368,7 +1368,7 @@ impl Engine {
         // rest stay in the connection log. Without a reason from the AP, the stage
         // it failed at is the reason.
         let detail = crate::connections::ConnDetail::deserialize(&n).unwrap_or_default();
-        let failed = crate::connections::reported_failure(&event_type, &detail).map(|label| {
+        let failed = crate::connections::reported_failure(crate::connections::Report::parse(&event_type), &detail).map(|label| {
             let reason = match &n["sta_dc_reason"] {
                 Value::Null => json!(label),
                 Value::String(r) if r.is_empty() => json!(label),
