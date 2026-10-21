@@ -344,11 +344,15 @@ fn wlans_view(state: &Value, informs: &HashMap<inform::Mac, Arc<Value>>, active:
             v
         })
         .collect();
-    let networks: Vec<Value> = docs(state, "networkconf").map(|n| json!({ "id": id_of(n), "name": n["name"], "vlan": n["vlan"], "purpose": n["purpose"] })).collect();
+    // `for_ssid`: whether an SSID may be put on it ([`ssid_network`]).
+    let networks: Vec<Value> =
+        docs(state, "networkconf").map(|n| json!({ "id": id_of(n), "name": n["name"], "vlan": n["vlan"], "purpose": n["purpose"], "for_ssid": ssid_network(n).is_ok() })).collect();
     let aps: Vec<Value> = docs(state, "devices").map(|d| json!({ "mac": doc_mac(&d["mac"]), "name": d["name"] })).collect();
     let (unsupported, unknown) = feature_support(state, informs);
     let mdns: Vec<Value> = apcfg::MDNS_SERVICES.iter().map(|(code, name, _)| json!({ "code": code, "name": name })).collect();
-    json!({ "active": active, "wlans": list, "networks": networks, "aps": aps, "unsupported": unsupported, "unknown": unknown, "mdns_services": mdns })
+    // The minimum data rates (kbps) an SSID may be given, per band.
+    let min_rates = json!({ "ng": MINRATE_NG, "na": MINRATE_NA });
+    json!({ "active": active, "wlans": list, "networks": networks, "aps": aps, "unsupported": unsupported, "unknown": unknown, "mdns_services": mdns, "min_rates": min_rates })
 }
 
 /// For each optional SSID feature, the APs that would broadcast the SSID
@@ -2514,8 +2518,12 @@ mod tests {
         let v = wlans_view(&Value::Null, &HashMap::new(), true);
         assert_eq!((&v["wlans"], &v["aps"], &v["unknown"]), (&json!([]), &json!([]), &json!([])));
         assert!(v["unsupported"].is_object() && !v["mdns_services"].as_array().unwrap().is_empty());
-        let v = wlans_view(&state(), &HashMap::new(), true);
+        assert_eq!((&v["min_rates"]["ng"][2], &v["min_rates"]["na"][0]), (&json!(5500), &json!(6000)));
+        let mut s = state();
+        s["networkconf"].as_array_mut().unwrap().extend([json!({ "_id": "wan", "purpose": "wan", "site_id": "s1" }), json!({ "_id": "x", "purpose": "", "site_id": "s1" })]);
+        let v = wlans_view(&s, &HashMap::new(), true);
         assert_eq!((v["aps"].as_array().unwrap().len(), &v["unknown"][0]), (2, &json!(AP1)), "no inform yet: support unknown");
+        assert_eq!(v["networks"].as_array().unwrap().iter().map(|n| n["for_ssid"].as_bool().unwrap()).collect::<Vec<_>>(), [true, false, true], "an empty purpose is none");
     }
 
     #[test]
