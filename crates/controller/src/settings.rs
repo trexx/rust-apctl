@@ -9,7 +9,7 @@
 
 use axum::extract::State;
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::sync::{Arc, LazyLock};
+use std::sync::{Arc, LazyLock, Weak};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -83,6 +83,29 @@ async fn preview(s: &AppState, before: Arc<Value>, edit: impl FnOnce(&mut Value)
         Ok(json!({ "what": what, "aps": out }))
     };
     tokio::task::spawn_blocking(work).await?
+}
+
+/// What something worked out from the settings was made from: these settings,
+/// by address. Every change replaces the settings' Arc, so the same address is
+/// the same settings; the Weak keeps the address from being reused by another
+/// version without keeping old settings alive. The default matches none.
+#[derive(Clone, Debug, Default)]
+pub struct MadeFrom(Weak<Value>);
+
+impl MadeFrom {
+    pub fn of(state: &Arc<Value>) -> Self {
+        MadeFrom(Arc::downgrade(state))
+    }
+
+    /// Whether it was made from these settings.
+    pub fn is(&self, state: &Arc<Value>) -> bool {
+        std::ptr::eq(self.0.as_ptr(), Arc::as_ptr(state))
+    }
+
+    /// Whether the settings it was made from are still held somewhere (current, or about to go).
+    pub fn alive(&self) -> bool {
+        self.0.strong_count() > 0
+    }
 }
 
 /// Fields of an SSID the editor shows and edits (secrets are never listed).
