@@ -155,6 +155,7 @@
    "wan_dhcpv6_pd_size_auto": false
   }
  ],
+ "radiusprofile": [],
  "setting": [
   {
    "_id": {
@@ -473,6 +474,19 @@
   }
  ],
  "source": "unifi-network-application",
+ "usergroup": [
+  {
+   "_id": {
+    "$oid": "00000000000000000000003a"
+   },
+   "attr_hidden_id": "Default",
+   "attr_no_delete": true,
+   "name": "Default",
+   "qos_rate_max_down": -1,
+   "qos_rate_max_up": -1,
+   "site_id": "00000000000000000000001e"
+  }
+ ],
  "wlanconf": [
   {
    "_id": {

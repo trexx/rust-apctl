@@ -821,11 +821,21 @@ fn chrono_like(ts: i64) -> String {
 mod tests {
     use super::*;
 
-    /// The demo settings have the shape of an import: only the settings apctl reads,
-    /// and SSIDs that let in the demo's own clients (no MAC allow-list) on every AP.
+    /// The demo settings have the shape of an import: its collections, only the settings
+    /// apctl reads, SSIDs whose user group exists, and that let in the demo's own clients
+    /// (no MAC allow-list) on every AP.
     #[test]
     fn the_demo_settings_are_ones_an_import_would_give() {
         let s = state().unwrap();
+        let mut keys: Vec<&str> = s.as_object().unwrap().keys().map(String::as_str).collect();
+        let mut import: Vec<&str> = crate::snapshot::collections().chain(["source"]).collect();
+        keys.sort_unstable();
+        import.sort_unstable();
+        assert_eq!(keys, import);
+        for w in s["wlanconf"].as_array().unwrap() {
+            let group = w["usergroup_id"].as_str().unwrap();
+            assert!(s["usergroup"].as_array().unwrap().iter().any(|g| apcfg::oid(g) == Some(group)), "{}: user group {group}", w["name"]);
+        }
         for setting in s["setting"].as_array().unwrap() {
             let key = setting["key"].as_str().unwrap();
             assert!(apcfg::SETTING_KEYS.contains(&key), "setting {key} is not one apctl reads");
