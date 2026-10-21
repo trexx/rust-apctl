@@ -4,9 +4,8 @@
 //! The output follows the official UniFi Network Application (10.6.x) line for line,
 //! including key order, section comments and duplicate keys, so a rendered config can be
 //! compared byte for byte with a captured one. The input is a snapshot of the official
-//! controller's settings (the shape of `informdump import`: `sites`, `wlanconf`,
-//! `networkconf`, `setting`, `apgroup`, `config_meta`, `devices`, `clients`) plus the AP's
-//! latest inform for its capability bits.
+//! controller's settings (the shape of `informdump import`, with the collections in
+//! [`COLLECTIONS`]) plus the AP's latest inform for its capability bits.
 //!
 //! No I/O happens here. Anything random (the `cfgversion` token, password hashes) is an
 //! input.
@@ -137,10 +136,17 @@ pub fn inform_inputs_match(inputs: &Value, inform: &Value) -> bool {
         })
 }
 
-/// The `setting` documents (by `key`) a render reads. The controller reads no others,
-/// so whatever imports settings needs only these: the rest (mail, cloud access and guest
-/// portal credentials, RADIUS secrets) would only spread secrets nothing uses.
-pub const SETTING_KEYS: &[&str] = &["mgmt", "super_mgmt", "super_identity", "radio_ai", "country", "locale", "connectivity", "rsyslogd", "snmp", "ntp"];
+/// The collections of the settings snapshot a render reads, by their names in the
+/// snapshot (`informdump import` reads `sites`, `devices` and `clients` from the
+/// official controller's `site`, `device` and `user`). Whatever imports settings must
+/// fill at least these.
+pub const COLLECTIONS: &[&str] = &["sites", "wlanconf", "networkconf", "setting", "apgroup", "config_meta", "usergroup", "radiusprofile", "devices", "clients"];
+
+/// The `setting` documents (by `key`) a render or the controller reads; the controller
+/// reads only `enabled` of `element_adopt` (the SSID limit per radio). Whatever imports
+/// settings needs only these: the rest (mail, cloud access and guest portal
+/// credentials, RADIUS secrets) would only spread secrets nothing uses.
+pub const SETTING_KEYS: &[&str] = &["mgmt", "super_mgmt", "super_identity", "radio_ai", "country", "locale", "connectivity", "rsyslogd", "snmp", "ntp", "element_adopt"];
 
 /// The fields of a `clients` (user) document a render reads: blocked clients and
 /// clients locked to an AP.
@@ -604,6 +610,29 @@ mod tests {
         assert!(read.len() >= 8, "the patterns still find the reads: {read:?}");
         for key in read {
             assert!(SETTING_KEYS.contains(&key), "setting `{key}` is read but missing from SETTING_KEYS");
+        }
+    }
+
+    /// Every collection the sources read (`site_docs` on the context, or with the state
+    /// and site, and `arr` on the state) is in `COLLECTIONS`, so an import that fills
+    /// those loses nothing a render needs.
+    #[test]
+    fn collections_cover_every_collection_read() {
+        let mut read: Vec<&str> = Vec::new();
+        for src in SOURCES {
+            let src = src.split("#[cfg(test)]").next().unwrap();
+            for pattern in ["site_docs(\"", "site_docs(state, site_id, \"", "arr(state, \"", "arr(ctx.state, \""] {
+                for (at, _) in src.match_indices(pattern) {
+                    let rest = &src[at + pattern.len()..];
+                    read.push(&rest[..rest.find('"').unwrap()]);
+                }
+            }
+        }
+        for c in ["sites", "radiusprofile", "usergroup", "config_meta", "clients"] {
+            assert!(read.contains(&c), "the patterns still find the reads of {c}: {read:?}");
+        }
+        for c in read {
+            assert!(COLLECTIONS.contains(&c), "collection `{c}` is read but missing from COLLECTIONS");
         }
     }
 
