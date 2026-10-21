@@ -104,8 +104,10 @@ pub fn id_of(v: &Value) -> Option<String> {
 
 /// The MAC a settings field holds (an AP record's `mac`, an entry of an AP
 /// group's `device_macs`...), in whichever form it is written: `aa:bb:..`,
-/// `AA-BB-..` or bare hex. Every lookup by MAC goes through this, so a
-/// record is found however it writes its MAC.
+/// `AA-BB-..` or bare hex. Every lookup by MAC in the controller goes through
+/// this, so its editors find a record however it writes its MAC. The render
+/// (apcfg) compares the text, ignoring case only: the controller writes
+/// `aa:bb:..`, so only an uploaded or hand-made state can differ.
 pub(crate) fn doc_mac(v: &Value) -> Option<inform::Mac> {
     v.as_str()?.parse().ok()
 }
