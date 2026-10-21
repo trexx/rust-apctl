@@ -489,7 +489,8 @@ export const keys = {
   settingsState: family("settings-state"),
   dryrun: family("dryrun"),
   threats: family("threats"),
-  siteActivity: family<[span: TimeSpan, band: string, mac: Mac | undefined]>("site-activity"),
+  siteActivity: family<[span: TimeSpan, band: string]>("site-activity"),
+  radioActivity: family<[span: TimeSpan, band: string, mac: Mac]>("radio-activity"),
   siteTop: family<[span: TimeSpan, mac: Mac | undefined]>("site-top"),
   connectivity: family<[span: TimeSpan]>("connectivity"),
   retries: family<[span: TimeSpan]>("retries"),
@@ -805,8 +806,12 @@ function useSpanQuery<T, C extends unknown[] = []>(
   });
 }
 
-export const useSiteActivity = (span: TimeSpan, band: string, mac?: Mac) =>
-  useSpanQuery<SiteActivity, [string, Mac | undefined]>(keys.siteActivity, span, [band, mac], "/api/site/activity", { band: bandParam(band), mac });
+export const useSiteActivity = (span: TimeSpan, band: string) =>
+  useSpanQuery<SiteActivity, [string]>(keys.siteActivity, span, [band], "/api/site/activity", { band: bandParam(band) });
+
+/** One radio's client activity alone (`parts=activity`): the server skips the airtime, which its radio's own series chart. */
+export const useRadioActivity = (span: TimeSpan, band: string, mac: Mac) =>
+  useSpanQuery<Pick<SiteActivity, "bucket" | "activity">, [string, Mac]>(keys.radioActivity, span, [band, mac], "/api/site/activity", { band: bandParam(band), mac, parts: "activity" });
 
 export const useSiteTop = (span: TimeSpan, mac?: Mac) =>
   useSpanQuery<{ aps: TopEntry[]; clients: TopEntry[] }, [Mac | undefined]>(keys.siteTop, span, [mac], "/api/site/top", { mac });
