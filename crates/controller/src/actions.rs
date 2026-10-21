@@ -12,8 +12,8 @@
 //!
 //! Commands are queued per AP and sent one per inform, before any config push;
 //! restart, locate and reconnect need the AP online (it would otherwise run
-//! them whenever it is back), and the engine drops them when the AP goes
-//! offline before they are sent.
+//! them whenever it is back: [`needs_online`]), and are dropped when the AP goes
+//! offline before they are sent ([`drop_online_only`], run by the engine).
 //! All of this needs active mode: in shadow mode apctl never answers the APs,
 //! and changing settings there would only diverge from the other controller.
 
@@ -59,6 +59,38 @@ fn opposite(cmd: &Value) -> Option<Value> {
     let mut o = cmd.clone();
     o["cmd"] = json!(undo);
     Some(o)
+}
+
+/// Whether a command needs the AP online: a restart, locate or client kick
+/// would otherwise run whenever an AP that is away is back (a restart days later).
+pub fn needs_online(cmd: &Value) -> bool {
+    cmd["_type"] == "reboot" || matches!(cmd["cmd"].as_str(), Some("set-locate" | "kick-sta"))
+}
+
+/// Queues a command, unless it [`needs_online`] and the AP is away.
+fn queue_online(live: &mut Live, mac: Mac, cmd: Value) -> Result<(), ApiError> {
+    if needs_online(&cmd) && !is_online(live, &mac) {
+        return Err(ApiError::ap_offline());
+    }
+    queue(live, mac, cmd);
+    Ok(())
+}
+
+/// Drops the AP's queued commands that need it online ([`needs_online`]): it
+/// went away before they were sent. A locate dropped so is no longer on.
+pub fn drop_online_only(live: &mut Live, mac: &Mac) {
+    let Some(q) = live.commands.get_mut(mac) else { return };
+    let mut located = false;
+    q.retain(|c| {
+        located |= c["cmd"] == "set-locate";
+        !needs_online(c)
+    });
+    if q.is_empty() {
+        live.commands.remove(mac);
+    }
+    if located {
+        live.locating.remove(mac);
+    }
 }
 
 /// The next queued command for an AP, if any.
@@ -150,8 +182,7 @@ fn known_ap(s: &AppState, mac: &Mac) -> Result<(), ApiError> {
     }
 }
 
-/// Whether an AP is online: a command queued for one that is away would run
-/// whenever it is back (a restart days later).
+/// Whether an AP is online.
 fn is_online(live: &Live, mac: &Mac) -> bool {
     live.devices.get(mac).is_some_and(|d| d.online)
 }
@@ -159,13 +190,7 @@ fn is_online(live: &Live, mac: &Mac) -> bool {
 /// POST /api/devices/{mac}/restart
 pub async fn restart(State(s): State<AppState>, MacPath(mac): MacPath) -> Result<Json<Value>, ApiError> {
     target_ap(&s, &mac)?;
-    {
-        let mut live = s.live.write().unwrap();
-        if !is_online(&live, &mac) {
-            return Err(ApiError::ap_offline());
-        }
-        queue(&mut live, mac, json!({ "_type": "reboot", "reboot_type": "soft" }));
-    }
+    queue_online(&mut s.live.write().unwrap(), mac, json!({ "_type": "reboot", "reboot_type": "soft" }))?;
     s.note(Event::device(clock::now_ts(), EventKind::ApRestartRequested, mac, json!({}))).await;
     Ok(Json(json!({ "queued": true })))
 }
@@ -180,10 +205,7 @@ pub async fn locate(State(s): State<AppState>, MacPath(mac): MacPath, Json(b): J
     target_ap(&s, &mac)?;
     let mut live = s.live.write().unwrap();
     // Turning it off can wait for an AP that is away: it is harmless when it comes.
-    if b.on && !is_online(&live, &mac) {
-        return Err(ApiError::ap_offline());
-    }
-    queue(&mut live, mac, json!({ "_type": "cmd", "cmd": if b.on { "set-locate" } else { "unset-locate" } }));
+    queue_online(&mut live, mac, json!({ "_type": "cmd", "cmd": if b.on { "set-locate" } else { "unset-locate" } }))?;
     if b.on {
         live.locating.insert(mac);
     } else {
@@ -216,10 +238,7 @@ pub async fn kick(State(s): State<AppState>, MacPath(client): MacPath) -> Result
             .filter(|c| c.connected)
             .map(|c| c.sample.ap_mac)
             .ok_or_else(|| ApiError::conflict("the client is not connected"))?;
-        if !is_online(&live, &ap) {
-            return Err(ApiError::conflict("the client's AP is offline"));
-        }
-        queue(&mut live, ap, json!({ "_type": "cmd", "cmd": "kick-sta", "mac": client.to_string() }));
+        queue_online(&mut live, ap, json!({ "_type": "cmd", "cmd": "kick-sta", "mac": client.to_string() })).map_err(|_| ApiError::conflict("the client's AP is offline"))?;
         ap
     };
     s.note(Event::client(clock::now_ts(), EventKind::ClientReconnectRequested, client, json!({ "ap": ap }))).await;
@@ -300,6 +319,27 @@ pub async fn apply_edit(s: &AppState, edit: crate::engine::StateEdit) -> Result<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_ap_going_away_loses_the_commands_that_need_it_online() {
+        let mut live = Live::default();
+        let ap: Mac = "02:00:00:00:00:01".parse().unwrap();
+        let cmds = [
+            json!({ "_type": "reboot", "reboot_type": "soft" }), json!({ "_type": "cmd", "cmd": "set-locate" }),
+            json!({ "_type": "cmd", "cmd": "kick-sta", "mac": "02:00:00:00:00:99" }), json!({ "_type": "cmd", "cmd": "block-sta", "mac": "02:00:00:00:00:99" }),
+        ];
+        assert_eq!(cmds.iter().map(needs_online).collect::<Vec<_>>(), [true, true, true, false]);
+        for c in cmds {
+            queue(&mut live, ap, c);
+        }
+        live.locating.insert(ap);
+        drop_online_only(&mut live, &ap);
+        assert_eq!(next(&mut live, &ap).unwrap()["cmd"], "block-sta");
+        assert!(next(&mut live, &ap).is_none() && live.locating.is_empty());
+        // Refused for an AP that is away, but for what can wait.
+        assert!(queue_online(&mut live, ap, json!({ "_type": "reboot", "reboot_type": "soft" })).is_err());
+        assert!(queue_online(&mut live, ap, json!({ "_type": "cmd", "cmd": "unset-locate" })).is_ok());
+    }
 
     #[test]
     fn commands_queue_in_order_without_double_clicks() {
