@@ -1660,6 +1660,8 @@ export interface SiteSettings {
     netconsole_host: string | null;
     netconsole_port: number | string | null;
   };
+  /** The port apctl's syslog listener is on, where "controller" mode sends the APs; null when it runs without one (--syslog-listen). */
+  syslog_port: number | null;
   snmp: { enabled: boolean | null; enabledV3: boolean | null; community: string | null; username: string | null; has_v3_password: boolean };
   ntp: { setting_preference: "auto" | "manual" | null; ntp_server_1: string | null; ntp_server_2: string | null; ntp_server_3: string | null; ntp_server_4: string | null };
   country: number | null;
