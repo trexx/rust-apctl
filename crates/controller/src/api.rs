@@ -1696,6 +1696,8 @@ mod tests {
         assert_eq!((status, msg.as_str()), (StatusCode::BAD_REQUEST, "ap_stats has no field nope"));
         let (status, msg) = error(get("/api/site/activity?mac=02:00:00:00:00").await.unwrap()).await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "not an empty chart: {msg}");
+        assert_eq!(error(get("/api/connections?client=nope").await.unwrap()).await, (StatusCode::BAD_REQUEST, "invalid MAC nope".into()));
+        assert_eq!(get("/api/connections?client=AA-BB-CC-DD-EE-FF").await.unwrap().status(), StatusCode::OK);
         let put = |content_type: &str, body: &'static str| {
             let req = Request::put("/api/clients/02:00:00:00:01:01/alias").header(header::COOKIE, &cookie).header("x-requested-with", "apctl").header(header::CONTENT_TYPE, content_type);
             app.clone().oneshot(req.body(Body::from(body)).unwrap())

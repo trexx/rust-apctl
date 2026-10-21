@@ -748,7 +748,7 @@ pub struct ListQuery {
     range: Option<Ts>,
     from: Option<Ts>,
     to: Option<Ts>,
-    /// One client only.
+    /// One client only, in any form a MAC is written in (else 400).
     client: Option<String>,
     /// Only failed attempts.
     #[serde(default)]
@@ -761,7 +761,7 @@ pub struct ListQuery {
 /// GET /api/connections: connection attempts and roams, newest first.
 pub async fn list(State(s): State<AppState>, Query(q): Query<ListQuery>) -> Result<Json<Value>, ApiError> {
     let (from, to, _) = window(&RangeQuery { range: q.range, from: q.from, to: q.to, ..Default::default() });
-    let client = q.client.map(|c| c.to_ascii_lowercase());
+    let client = q.client.as_deref().map(crate::api::parse_mac).transpose()?.map(|m| m.to_string());
     let limit = q.limit.unwrap_or(500).min(5000);
     let with_roams = q.roams.unwrap_or(true);
     let live = s.live.clone();
