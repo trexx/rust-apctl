@@ -202,10 +202,10 @@ fn site_ntp(doc: &mut Value, n: &Value) -> Result<(), String> {
         if let Some(h) = named.iter().zip(NTP_KEYS).find_map(|(h, k)| h.filter(|h| !h.is_empty() && doc[k].as_str() != Some(h))) {
             return Err(format!("{h}: time servers are set only with manual NTP"));
         }
-    } else if named.iter().any(Option::is_some) {
+    } else if named.iter().any(Option::is_some) || !was_manual && doc["setting_preference"].as_str() == Some("manual") {
         // The servers named replace those stored, and the four close up. Coming
         // from automatic, the pool's servers are no choice of the user's: the
-        // ones not named are blank.
+        // ones not named are blank (all four when none is named).
         let mut list = Vec::new();
         for (h, k) in named.into_iter().zip(NTP_KEYS) {
             let h = match h {
@@ -550,7 +550,8 @@ mod tests {
         assert!(edit(&mut s, json!({ "ntp": { "setting_preference": "auto", "ntp_server_2": "time.example.net" } })).unwrap_err().contains("only with manual"));
         let pool = setting(&s, "ntp").clone();
         assert_eq!(edit(&mut s, json!({ "ntp": pool })).unwrap(), "site settings: nothing changed");
-        // From automatic, the pool is not kept for the servers not named.
+        // From automatic, the pool is not kept for the servers not named: manual alone has none.
+        assert_eq!(edit(&mut s.clone(), json!({ "ntp": { "setting_preference": "manual" } })).unwrap_err(), "manual NTP needs at least one server");
         edit(&mut s, json!({ "ntp": { "setting_preference": "manual", "ntp_server_2": "time.example.net" } })).unwrap();
         assert_eq!(servers(&s), ["time.example.net", "", "", ""]);
     }
