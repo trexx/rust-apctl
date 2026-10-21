@@ -3,13 +3,14 @@
 //! Changes go through [`crate::settings::change`], so they can be previewed
 //! per AP like SSID and AP edits.
 
+use apcfg::flag;
 use axum::extract::State;
 use serde_json::{Value, json};
 use std::sync::LazyLock;
 
 use crate::api::{ApiError, AppState, Json, Query};
 use crate::settings::Kind::{Bool, Enum, Int};
-use crate::settings::{COUNTRIES, Patch, PreviewQuery, band_name, configured_width, copy_fields, country, dedup_in_order, docs, docs_mut, illegal_fixed_channel, mgmt_flag, num, outdoor_with, pick, record_label, setting, setting_mut, str_field, timezone};
+use crate::settings::{COUNTRIES, Patch, PreviewQuery, band_name, configured_width, copy_fields, country, dedup_in_order, docs, docs_mut, illegal_fixed_channel, mgmt_flag, num, pick, record_label, setting, setting_mut, str_field, timezone};
 
 /// A host name or IPv4 address, as NTP and syslog targets take (the official
 /// controller refuses IPv6 there).
@@ -39,7 +40,7 @@ fn reset_illegal_channels(state: &mut Value) -> Vec<String> {
     let widths: Vec<Vec<i64>> = docs(state, "devices").map(|d| d["radio_table"].as_array().into_iter().flatten().map(|r| configured_width(state, r)).collect()).collect();
     let mut out = Vec::new();
     for (d, widths) in docs_mut(state, "devices").zip(widths) {
-        let o = outdoor_with(d, site_outdoor);
+        let o = apcfg::override_of(d, "outdoor_mode_override", site_outdoor);
         let name = record_label(d, "?");
         for (r, width) in d["radio_table"].as_array_mut().into_iter().flatten().zip(widths) {
             if let Some(ch) = illegal_fixed_channel(c, r, width, o) {
@@ -130,7 +131,7 @@ fn site_mgmt(doc: &mut Value, m: &Value, notes: &mut Vec<String>) -> Result<(), 
         let keys = ssh_keys(&m["x_ssh_keys"], &doc["x_ssh_keys"])?;
         doc["x_ssh_keys"] = json!(keys);
     }
-    if doc["x_ssh_enabled"].as_bool() != Some(false) && doc["x_ssh_auth_password_enabled"].as_bool() == Some(false) && doc["x_ssh_keys"].as_array().is_none_or(Vec::is_empty) {
+    if flag(doc, "x_ssh_enabled", true) && !flag(doc, "x_ssh_auth_password_enabled", true) && doc["x_ssh_keys"].as_array().is_none_or(Vec::is_empty) {
         return Err("with password logins off, SSH needs at least one key".into());
     }
     Ok(())
@@ -171,7 +172,7 @@ fn site_syslog(doc: &mut Value, r: &Value) -> Result<(), String> {
         }
     }
     let doc = &*doc;
-    let on = |k: &str| doc[k].as_bool() == Some(true);
+    let on = |k: &str| flag(doc, k, false);
     if on("enabled") && !on("this_controller") && doc["ip"].as_str().is_none_or(str::is_empty) {
         return Err("remote syslog needs a server".into());
     }
@@ -251,10 +252,10 @@ fn site_snmp(doc: &mut Value, sn: &Value, notes: &mut Vec<String>) -> Result<(),
         doc["x_password"] = json!(pw);
         notes.push("SNMPv3 password".into());
     }
-    if doc["enabled"].as_bool() == Some(true) && doc["community"].as_str().is_none_or(str::is_empty) {
+    if flag(doc, "enabled", false) && doc["community"].as_str().is_none_or(str::is_empty) {
         return Err("SNMP v1/v2c needs a community".into());
     }
-    if doc["enabledV3"].as_bool() == Some(true) && (doc["username"].as_str().is_none_or(str::is_empty) || doc["x_password"].as_str().is_none_or(str::is_empty)) {
+    if flag(doc, "enabledV3", false) && (doc["username"].as_str().is_none_or(str::is_empty) || doc["x_password"].as_str().is_none_or(str::is_empty)) {
         return Err("SNMPv3 needs a user name and password".into());
     }
     Ok(())
@@ -350,7 +351,7 @@ fn site_view(state: &Value, active: bool, secrets: bool) -> Value {
     mgmt["has_ssh_password"] = json!(m["x_ssh_password"].as_str().is_some_and(|p| !p.is_empty()));
     let r = setting(state, "rsyslogd");
     let mut rsyslogd = Value::Object(pick(r, &["ip", "port", "debug", "netconsole_enabled", "netconsole_host", "netconsole_port"]));
-    rsyslogd["mode"] = json!(match (r["enabled"].as_bool() == Some(true), r["this_controller"].as_bool() == Some(true)) {
+    rsyslogd["mode"] = json!(match (flag(r, "enabled", false), flag(r, "this_controller", false)) {
         (false, _) => "off",
         (true, true) => "controller",
         (true, false) => "server",
