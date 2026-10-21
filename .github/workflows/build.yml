@@ -18,7 +18,7 @@ jobs:
       - uses: 'actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1' # v7.0.1
       - name: 'Tag matches the controller version'
         run: |
-          CRATE="$(sed -n 's/^version = "\(.*\)"/\1/p' crates/controller/Cargo.toml | head -n 1)"
+          CRATE="$(scripts/version.sh)"
           if [ "${CRATE}" != "${GITHUB_REF_NAME}" ]; then
             echo "::error::Tag ${GITHUB_REF_NAME} does not match crates/controller/Cargo.toml (${CRATE})"
             exit 1
@@ -36,3 +36,17 @@ jobs:
     permissions:
       contents: read
       packages: write
+
+  # The image CI published runs and reports the version, before release.sh --pin pins it.
+  check:
+    needs: [ 'build' ]
+    runs-on: 'ubuntu-26.04'
+    timeout-minutes: 10
+    permissions:
+      contents: 'read'
+      packages: 'read'
+    steps:
+      - uses: 'actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1' # v7.0.1
+      - run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+          scripts/image-check.sh "ghcr.io/${{ github.repository_owner }}/rust-apctl:${GITHUB_REF_NAME}"

@@ -1,12 +1,19 @@
 #!/usr/bin/env bash
-# The Rust checks a change must pass, listed once for CI (.github/workflows/test.yml)
-# and the release gate (scripts/release.sh). informdump turns on serde_json's
-# preserve_order, so it is tested on its own: the other crates are tested with the
-# features the shipped binary is built with. informdump's MongoDB import is behind a
-# feature; the last check keeps it compiling and linted.
+# The checks a change must pass, listed once for CI (.github/workflows/test.yml) and
+# the release gate (scripts/release.sh).
 #
-#   scripts/check.sh          # runs them in order, stopping at the first failure
+# Rust: informdump turns on serde_json's preserve_order, so it is tested on its own:
+# the other crates are tested with the features the shipped binary is built with.
+# informdump's MongoDB import is behind a feature; the last check keeps it compiling
+# and linted.
+#
+# Web: lint (eslint, no warnings), type-check and build web/, in the Node image the
+# Dockerfile builds it with, run by docker or podman. npm's download cache is
+# $HOME/.npm, mounted into the container.
+#
+#   scripts/check.sh          # runs the Rust checks in order, stopping at the first failure
 #   scripts/check.sh --list   # prints them, one per line
+#   scripts/check.sh --web    # runs the web check
 set -euo pipefail
 
 checks=(
@@ -16,10 +23,19 @@ checks=(
   "cargo clippy -p informdump --features mongo --all-targets --locked -- -D warnings"
 )
 
-if [ "${1:-}" = --list ]; then
-  printf '%s\n' "${checks[@]}"
-  exit 0
-fi
+case ${1:-} in
+  --list)
+    printf '%s\n' "${checks[@]}"
+    exit 0 ;;
+  --web)
+    cd "$(dirname "$0")/.."
+    engine=$(command -v docker || command -v podman) || { echo "the web check needs docker or podman" >&2; exit 1; }
+    mkdir -p "$HOME/.npm"
+    exec "$engine" run --rm -v "$PWD/web:/web:Z" -v "$HOME/.npm:/root/.npm:Z" -w /web docker.io/library/node:24-slim \
+      sh -c "npm ci --no-fund --no-audit && npm run lint && npm run build" ;;
+  "") ;;
+  *) echo "usage: scripts/check.sh [--list | --web]" >&2; exit 2 ;;
+esac
 cd "$(dirname "$0")/.."
 for check in "${checks[@]}"; do
   echo "== $check"

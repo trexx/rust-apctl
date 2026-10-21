@@ -43,10 +43,10 @@ impl Diff<'_> {
         [self.added.len(), self.removed.len(), self.changed.len()]
     }
 
-    /// The counts, the redacted rendering and the same lines as data, as config history
-    /// and previews show a change: `{"added", "removed", "changed", "diff", "changes"}`,
-    /// where `changes` is `[{"op": "+"|"-"|"~", "key", "old"?, "new"?}]` in key order
-    /// (`old` on `-` and `~`, `new` on `+` and `~`), redacted as `diff` is.
+    /// The counts and the lines as data, as config history and previews show a change:
+    /// `{"added", "removed", "changed", "changes"}`, where `changes` is
+    /// `[{"op": "+"|"-"|"~", "key", "old"?, "new"?}]` in key order (`old` on `-` and `~`,
+    /// `new` on `+` and `~`), with secret-looking keys' values redacted as [`Diff::render`] does.
     pub fn summary(&self) -> Value {
         let [added, removed, changed] = self.counts();
         let show = |k: &str, v: &str| -> Value { if is_secret(k) { json!("<redacted>") } else { json!(v) } };
@@ -58,7 +58,7 @@ impl Diff<'_> {
                 Line::Changed(k, old, new) => json!({ "op": "~", "key": k, "old": show(k, old), "new": show(k, new) }),
             })
             .collect();
-        json!({ "added": added, "removed": removed, "changed": changed, "diff": self.render("", true), "changes": changes })
+        json!({ "added": added, "removed": removed, "changed": changed, "changes": changes })
     }
 
     /// Every added, removed and changed key, sorted by key.
@@ -232,17 +232,17 @@ mod tests {
         assert_eq!(d.counts(), [1, 1, 1]);
         assert_eq!(
             diff("x.psk=a", "x.psk=b").summary(),
-            json!({ "added": 0, "removed": 0, "changed": 1, "diff": "~ x.psk: <redacted> -> <redacted>\n", "changes": [{ "op": "~", "key": "x.psk", "old": "<redacted>", "new": "<redacted>" }] })
+            json!({ "added": 0, "removed": 0, "changed": 1, "changes": [{ "op": "~", "key": "x.psk", "old": "<redacted>", "new": "<redacted>" }] })
         );
         // The values as data: one side holding " -> " stays on its side.
-        let renamed = diff("aaa.1.ssid=Home -> Up\nb=1\nc.key=k\n", "aaa.1.ssid=Attic\nc.key=j\nd=\n").summary();
-        assert_eq!(renamed["changes"], json!([
+        let renamed = diff("aaa.1.ssid=Home -> Up\nb=1\nc.key=k\n", "aaa.1.ssid=Attic\nc.key=j\nd=\n");
+        assert_eq!(renamed.summary()["changes"], json!([
             { "op": "~", "key": "aaa.1.ssid", "old": "Home -> Up", "new": "Attic" },
             { "op": "-", "key": "b", "old": "1" },
             { "op": "~", "key": "c.key", "old": "<redacted>", "new": "<redacted>" },
             { "op": "+", "key": "d", "new": "" },
         ]));
-        assert_eq!(renamed["diff"], "~ aaa.1.ssid: Home -> Up -> Attic\n- b=1\n~ c.key: <redacted> -> <redacted>\n+ d=\n");
+        assert_eq!(renamed.render("", true), "~ aaa.1.ssid: Home -> Up -> Attic\n- b=1\n~ c.key: <redacted> -> <redacted>\n+ d=\n");
         assert_eq!(d.render("  ", false), "  - radio.1.channel=36\n  ~ wireless.1.security: wpa2 -> wpa3\n  + wireless.2.ssid=Test\n");
         let secret = diff("aaa.1.wpa.psk=old", "aaa.1.wpa.psk=new").render("", true);
         assert_eq!(secret, "~ aaa.1.wpa.psk: <redacted> -> <redacted>\n");

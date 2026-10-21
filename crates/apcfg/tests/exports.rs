@@ -1,7 +1,9 @@
 //! The readers apcfg exports for the controller, which must read the settings the way
 //! the render does: checked on their own and against a render.
 
-use apcfg::{Controller, Input, bool_of, configured_width, flag, int_of, render, ssid_usergroup, ssid_vlan, usergroup_limits};
+use apcfg::{
+    Controller, DEFAULT_COUNTRY, Input, as_int, bool_of, capable_width, configured_width, flag, int_of, override_of, render, ssh_username, ssid_usergroup, ssid_vlan, usergroup_limits,
+};
 use serde_json::{Value, json};
 
 const MAC: &str = "02:00:00:00:00:01";
@@ -55,6 +57,20 @@ fn readers_take_numbers_and_strings_as_the_render_does() {
     assert_eq!((bool_of(&v, "t"), bool_of(&v, "f"), bool_of(&v, "bad"), bool_of(&v, "none")), (Some(true), Some(false), None, None));
     assert!(flag(&v, "none", true) && !flag(&v, "bad", false));
     assert_eq!((int_of(&v, "n"), int_of(&v, "x"), int_of(&v, "t")), (Some(12), Some(3), None));
+    assert_eq!([as_int(&json!(80.0)), as_int(&json!(" 20 ")), as_int(&json!(1.5)), as_int(&json!(true)), as_int(&json!(null))], [Some(80), Some(20), None, None, None]);
+    let device = json!({ "on": "on", "off": "off", "default": "default" });
+    assert!(override_of(&device, "on", false) && !override_of(&device, "off", true));
+    assert!(override_of(&device, "default", true) && !override_of(&device, "none", false), "anything else follows the site");
+    assert_eq!([ssh_username(&json!({ "x_ssh_username": "admin" })), ssh_username(&json!({})), ssh_username(&json!({ "x_ssh_username": 7 }))], ["admin", "ubnt", "ubnt"]);
+    assert_eq!(ssh_username(&json!({ "x_ssh_username": "" })), "", "an empty name is sent as stored");
+}
+
+#[test]
+fn a_radios_capable_width_follows_its_flags() {
+    let width = |r: Value| capable_width(&r);
+    assert_eq!(width(json!({ "has_eht320": true, "has_eht240": true, "has_ht160": true })), 320);
+    assert_eq!((width(json!({ "has_eht240": "true" })), width(json!({ "has_ht160": true, "is_11ac": true }))), (240, 160));
+    assert_eq!((width(json!({ "is_11ax": true })), width(json!({ "is_11ac": true })), width(json!({ "has_eht320": false }))), (80, 80, 40));
 }
 
 #[test]
@@ -110,4 +126,20 @@ fn the_render_agrees_with_the_exports() {
     let radios = s["devices"][0]["radio_table"].as_array().unwrap();
     assert_eq!(line(&cfg, "radio.1.ieee_mode"), Some(format!("11nght{}", configured_width(&s, "s", &radios[0])).as_str()));
     assert_eq!(line(&cfg, "radio.2.ieee_mode"), Some(format!("11naht{}", configured_width(&s, "s", &radios[1])).as_str()));
+    assert_eq!(line(&cfg, "users.1.name"), Some(ssh_username(&s["setting"][1])));
+    assert_eq!(line(&cfg, "radio.1.countrycode"), Some(DEFAULT_COUNTRY.to_string().as_str()), "a site without a country setting");
+}
+
+/// The render caps a radio's width by what it can do: an 11ax radio set to 160 MHz
+/// without `has_ht160` gets 80, and the user's own name is the SSH account.
+#[test]
+fn the_render_caps_widths_and_names_the_ssh_user_as_the_exports_do() {
+    let mut s = state(json!([wlan("Home", json!({}))]), json!([]));
+    s["devices"][0]["radio_table"][1] = json!({ "name": "wifi1", "radio": "na", "is_11ax": true, "ht": 160 });
+    s["setting"][1]["x_ssh_username"] = json!("admin");
+    let cfg = system_cfg(&s);
+    let r = &s["devices"][0]["radio_table"][1];
+    assert_eq!(line(&cfg, "radio.2.ieee_mode"), Some(format!("11naht{}", configured_width(&s, "s", r).min(capable_width(r))).as_str()));
+    assert_eq!(line(&cfg, "radio.2.ieee_mode"), Some("11naht80"));
+    assert_eq!(line(&cfg, "users.1.name"), Some("admin"));
 }

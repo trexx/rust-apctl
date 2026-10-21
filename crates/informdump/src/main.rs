@@ -12,6 +12,8 @@ mod import;
 mod report;
 mod sanitize;
 mod simulate;
+#[cfg(any(feature = "mongo", test))]
+mod snapshot;
 
 use std::io::Write;
 use std::ops::ControlFlow;
@@ -97,9 +99,9 @@ enum Cmd {
         /// Inform URL of a local controller, e.g. http://127.0.0.1:18180/inform.
         #[arg(long)]
         url: String,
-        /// Maximum number of informs to send.
+        /// Maximum number of informs to send (at least 1).
         #[arg(long, default_value = "40")]
-        limit: usize,
+        limit: std::num::NonZeroUsize,
         /// Seconds to wait between informs (0: as fast as the controller answers).
         #[arg(long, default_value = "0", value_parser = seconds)]
         every: Duration,
@@ -278,7 +280,7 @@ fn main() -> Result<()> {
             println!("{}", serde_json::to_string_pretty(&demo::state()?)?);
             Ok(())
         }
-        Cmd::Simulate { pcap, keys, url, limit, every, ports } => simulate::run(&pcap, &ports, &load_keys(Some(&keys))?, &url, limit, every),
+        Cmd::Simulate { pcap, keys, url, limit, every, ports } => simulate::run(&pcap, &ports, &load_keys(Some(&keys))?, &url, limit.get(), every),
         Cmd::Sanitize { input, output, domains, devices, keep, files } => {
             sanitize::run(&input, &output, &files, domains, &devices, keep)
         }
@@ -299,13 +301,16 @@ mod cli_tests {
     use clap::Parser;
 
     #[test]
-    fn durations_out_of_range_are_refused_when_parsing() {
+    fn values_out_of_range_are_refused_when_parsing() {
         let parse = |args: &[&str]| super::Cli::try_parse_from([&["informdump"], args].concat()).map(|c| c.cmd);
         let simulate = |every| parse(&["simulate", "x.pcap", "--keys", "k.json", "--url", "http://127.0.0.1/inform", "--every", every]);
         for bad in ["inf", "-1", "NaN", "1e300", "soon"] {
             assert!(simulate(bad).is_err(), "--every {bad}");
         }
         assert!(matches!(simulate("0.5"), Ok(super::Cmd::Simulate { every, .. }) if every == std::time::Duration::from_millis(500)));
+        let limit = |n| parse(&["simulate", "x.pcap", "--keys", "k.json", "--url", "http://127.0.0.1/inform", "--limit", n]);
+        assert!(limit("0").is_err(), "--limit 0 would read nothing");
+        assert!(matches!(limit("1"), Ok(super::Cmd::Simulate { limit, .. }) if limit.get() == 1));
         for bad in ["-1", "inf", "NaN", "1e9", "8761"] {
             assert!(parse(&["demo", "--hours", bad]).is_err(), "--hours {bad}");
         }

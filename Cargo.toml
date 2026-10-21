@@ -1,6 +1,10 @@
 [workspace]
 resolver = "3"
 members = ["crates/*"]
+# A bare `cargo build`/`cargo test` leaves informdump out: its serde_json features
+# (preserve_order) would apply to every crate built with it, unlike the shipped apctl.
+# It is built and tested with `-p informdump`.
+default-members = ["crates/apcfg", "crates/controller", "crates/inform", "crates/wire"]
 
 [workspace.package]
 edition = "2024"

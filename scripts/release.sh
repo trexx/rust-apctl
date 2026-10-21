@@ -52,7 +52,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
-crate=$(sed -n 's/^version = "\(.*\)"/\1/p' crates/controller/Cargo.toml | head -1)
+crate=$(scripts/version.sh)
 if [ "$crate" != "$version" ]; then
   echo "crates/controller/Cargo.toml says $crate, not $version" >&2
   exit 1
@@ -79,10 +79,11 @@ else
 fi
 
 if [ $test = 1 ]; then
-  # The same checks as CI: scripts/check.sh lists them, run here one by one to keep
-  # each one's output and say which failed.
+  # The same checks as CI: scripts/check.sh lists the Rust ones and runs the web one;
+  # run here one by one to keep each one's output and say which failed.
   mapfile -t checks < <(scripts/check.sh --list)
   [ ${#checks[@]} -gt 0 ] || { echo "scripts/check.sh lists no checks" >&2; exit 1; }
+  checks+=("scripts/check.sh --web")
   log=$(mktemp)
   for check in "${checks[@]}"; do
     echo "== $check"
@@ -103,12 +104,7 @@ echo "== building $built"
 # --force-rm: a failed build must not leave working containers (they pin their images).
 # OUI_MONTH: the manufacturer list is downloaded again once a month.
 podman build -q --force-rm --target runtime --build-arg OUI_MONTH="$(date +%Y-%m)" -t "$built" .
-reported=$(podman run --rm "$built" --version)
-if [ "$reported" != "controller $version" ]; then
-  echo "the image reports '$reported', expected 'controller $version'" >&2
-  exit 1
-fi
-echo "built and checked $built"
+scripts/image-check.sh "$built"
 
 if [ -z "$pin" ]; then
   exit 0

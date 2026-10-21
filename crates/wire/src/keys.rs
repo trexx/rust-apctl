@@ -28,7 +28,8 @@ impl KeyStore {
     /// The keys in a MAC->key map or an import snapshot. An entry that cannot be read
     /// (a malformed MAC, or a key that is malformed or not a string) is left out and
     /// listed in [`skipped`](Self::skipped): one bad device does not cost the keys of
-    /// the others. A device without a key (waiting for adoption) is not listed.
+    /// the others. A device without a key (waiting for adoption) is not listed, nor is
+    /// one without a MAC unless it has a key.
     pub fn from_value(json: &Value) -> Self {
         let mut store = KeyStore::default();
         let mut skipped = Vec::new();
@@ -39,7 +40,12 @@ impl KeyStore {
         };
         if let Some(devices) = json.get("devices").and_then(Value::as_array) {
             for d in devices {
-                let Some(mac) = d["mac"].as_str() else { continue };
+                let Some(mac) = d["mac"].as_str() else {
+                    if !d["x_authkey"].is_null() || !d["syslog_key"].is_null() {
+                        add("a device", Err(anyhow!("a device with a key has no MAC: {}", kind(&d["mac"]))));
+                    }
+                    continue;
+                };
                 match &d["x_authkey"] {
                     Value::Null => {}
                     Value::String(key) => add("an authkey", store.insert(mac, key)),
@@ -138,5 +144,7 @@ mod tests {
         // A device waiting for adoption has no key: nothing to report.
         let keys = KeyStore::from_value(&json!({ "devices": [{ "mac": "00:11:22:33:44:55" }, { "mac": "00:11:22:33:44:66", "x_authkey": 7, "syslog_key": [] }] }));
         assert_eq!(keys.skipped().len(), 2, "{:?}", keys.skipped());
+        let keys = KeyStore::from_value(&json!({ "devices": [{ "x_authkey": good }, { "mac": 7, "syslog_key": "07".repeat(32) }, { "name": "keyless" }] }));
+        assert_eq!(keys.skipped(), ["skipping a device: a device with a key has no MAC: null", "skipping a device: a device with a key has no MAC: a number"]);
     }
 }

@@ -317,7 +317,8 @@ fn peak_rate(kind: Kind) -> f64 {
 #[derive(Clone, Default)]
 struct Session {
     ap: usize,
-    radio: &'static str,
+    /// Its index in [`VAPS`].
+    vap: usize,
     since: i64,
     rx: f64,
     tx: f64,
@@ -353,7 +354,7 @@ struct Sim {
     end_history: i64,
     sessions: Vec<Option<Session>>,
     counters: Vec<ApCounters>,
-    vap_counters: Vec<[ApCounters; 3]>,
+    vap_counters: Vec<[ApCounters; VAPS.len()]>,
     syslog: Vec<(i64, usize, String)>,
     cfgversion: Vec<String>,
 }
@@ -405,14 +406,14 @@ impl Sim {
             let cur = self.sessions[ci].as_ref().map(|s| s.ap);
             match (cur, want) {
                 (None, Some((ap, signal))) => {
+                    let vi = vap_of(c, signal);
+                    let vap = VAPS[vi].name;
                     // The doorbell sometimes fails its handshake first.
                     if c.quirk == Some(Quirk::FailsHandshake) && self.rng.unit() < 0.5 {
-                        out.push((at - 6, ap, self.notif(ap, json!({ "message_type": "STA_ASSOC_TRACKER", "event_type": "failure", "mac": c.mac, "vap": "wifi0ap1",
+                        out.push((at - 6, ap, self.notif(ap, json!({ "message_type": "STA_ASSOC_TRACKER", "event_type": "failure", "mac": c.mac, "vap": vap,
                             "assoc_delta": "21000", "wpa_auth_failures": "1", "auth_rssi": signal.to_string(), "sta_dc_reason": "4-way handshake timeout" }))));
-                        self.log(at - 6, ap, "hostapd", format!("wifi0ap1: AP-STA-POSSIBLE-PSK-MISMATCH {}", c.mac));
+                        self.log(at - 6, ap, "hostapd", format!("{vap}: AP-STA-POSSIBLE-PSK-MISMATCH {}", c.mac));
                     }
-                    let radio = if c.iot || signal < -72 { "ng" } else { "na" };
-                    let vap = vap_name(radio, c.iot);
                     let assoc = self.rng.range(8_000, 40_000);
                     let auth = assoc + self.rng.range(20_000, 90_000);
                     let ipd = auth + self.rng.range(40_000, 900_000);
@@ -423,36 +424,37 @@ impl Sim {
                         "auth_algo": "wpa2", "ip_assign_type": "dhcp" }))));
                     self.log(at, ap, "hostapd", format!("{vap}: STA {} IEEE 802.11: associated", c.mac));
                     self.log(at, ap, "hostapd", format!("{vap}: STA {} WPA: pairwise key handshake completed (RSN)", c.mac));
-                    self.sessions[ci] = Some(Session { ap, radio, since: at, signal, ..Default::default() });
+                    self.sessions[ci] = Some(Session { ap, vap: vi, since: at, signal, ..Default::default() });
                 }
                 (Some(old), None) => {
                     let s = self.sessions[ci].take().unwrap();
                     out.push((at, old, self.notif(old, json!({ "message_type": "STA_ASSOC_TRACKER", "event_type": "sta_leave", "mac": c.mac,
-                        "vap": vap_name(s.radio, c.iot), "avg_rssi": s.signal.to_string() }))));
-                    self.log(at, old, "hostapd", format!("{}: STA {} IEEE 802.11: disassociated", vap_name(s.radio, c.iot), c.mac));
+                        "vap": VAPS[s.vap].name, "avg_rssi": s.signal.to_string() }))));
+                    self.log(at, old, "hostapd", format!("{}: STA {} IEEE 802.11: disassociated", VAPS[s.vap].name, c.mac));
                 }
                 (Some(old), Some((ap, signal))) if old != ap => {
                     let s = self.sessions[ci].take().unwrap();
-                    let radio = if c.iot || signal < -72 { "ng" } else { "na" };
-                    let old_vap = vap_name(s.radio, c.iot);
+                    let vi = vap_of(c, signal);
+                    let to = &VAPS[vi];
+                    let old_vap = VAPS[s.vap].name;
                     // Phones get a steering request first; most accept.
                     if c.kind == Kind::Phone {
                         let p = format!("wlan: [0:I:ANY] [UNSPECIFIED] vap-0({old_vap}):");
                         self.log(at - 2, old, "kernel", format!("{p}BTM: STA {} RSSI: {}, candidates: 1, error: 0, flags: ALLOW (0x1)", c.mac, s.signal));
-                        self.log(at - 2, old, "kernel", format!("{p}BTM: [0]{{{} ch{}/op128/phy14}}", bssid(self.ids[ap].mac, radio, 0), if radio == "na" { APS[ap].na } else { APS[ap].ng }));
+                        self.log(at - 2, old, "kernel", format!("{p}BTM: [0]{{{} ch{}/op128/phy14}}", bssid(self.ids[ap].mac, to.radio, to.idx), if to.radio == "na" { APS[ap].na } else { APS[ap].ng }));
                         let status = if self.rng.unit() < 0.8 { 0 } else { 7 };
                         self.log(at - 1, old, "kernel", format!("{p}BTM: Received response from [{}](len = 5): dialog_token 1, status {status}, delay 0, bssid {}, cancel 0", c.mac,
-                            if status == 0 { bssid(self.ids[ap].mac, radio, 0) } else { "n/a".into() }));
+                            if status == 0 { bssid(self.ids[ap].mac, to.radio, to.idx) } else { "n/a".into() }));
                     }
                     let fast = !c.iot && c.kind != Kind::Iot;
                     let left_at = s.signal - self.rng.range(4, 10);
                     let assoc = self.rng.range(4_000, 15_000);
                     out.push((at, old, self.notif(old, json!({ "message_type": "STA_ASSOC_TRACKER", "event_type": "sta_roam", "mac": c.mac, "vap": old_vap,
                         "avg_rssi": left_at.to_string(), "assoc_status": "0" }))));
-                    out.push((at + 1, ap, self.notif(ap, json!({ "message_type": "STA_ASSOC_TRACKER", "event_type": "soft failure", "mac": c.mac, "vap": vap_name(radio, c.iot),
+                    out.push((at + 1, ap, self.notif(ap, json!({ "message_type": "STA_ASSOC_TRACKER", "event_type": "soft failure", "mac": c.mac, "vap": to.name,
                         "ip_assign_type": "roam", "auth_rssi": signal.to_string(), "auth_algo": if fast { "ft" } else { "wpa2" },
                         "assoc_delta": assoc.to_string() }))));
-                    self.sessions[ci] = Some(Session { ap, radio, since: s.since, signal, rx: s.rx, tx: s.tx });
+                    self.sessions[ci] = Some(Session { ap, vap: vi, since: s.since, signal, rx: s.rx, tx: s.tx });
                 }
                 _ => {}
             }
@@ -476,9 +478,9 @@ impl Sim {
 
     /// The station tables of AP `i`'s VAPs (2.4 GHz, 5 GHz, IoT) and what each one's
     /// stations add up to over the last `dt` seconds; moves its clients' counters on.
-    fn stations(&mut self, i: usize, ts: i64, dt: f64, hour: f64) -> ([Vec<Value>; 3], [VapLoad; 3]) {
-        let mut stas: [Vec<Value>; 3] = Default::default();
-        let mut loads = [VapLoad::default(); 3];
+    fn stations(&mut self, i: usize, ts: i64, dt: f64, hour: f64) -> ([Vec<Value>; VAPS.len()], [VapLoad; VAPS.len()]) {
+        let mut stas: [Vec<Value>; VAPS.len()] = Default::default();
+        let mut loads = [VapLoad::default(); VAPS.len()];
         for (ci, c) in CLIENTS.iter().enumerate() {
             let Some(s) = self.sessions[ci].as_mut().filter(|s| s.ap == i) else { continue };
             let loc = location(c, ts, self.start).unwrap_or(0);
@@ -489,10 +491,11 @@ impl Sim {
             let up = down * if c.kind == Kind::Server { 0.9 } else { 0.12 };
             s.rx += up;
             s.tx += down;
-            let vi = if c.iot { 2 } else if s.radio == "na" { 1 } else { 0 };
+            let vi = s.vap;
+            let vap = &VAPS[vi];
             loads[vi].down += down;
             loads[vi].up += up;
-            let na = s.radio == "na";
+            let na = vap.radio == "na";
             let rate = match (na, signal) {
                 (true, s) if s > -55 => 1_200_900,
                 (true, s) if s > -65 => 864_800,
@@ -519,17 +522,18 @@ impl Sim {
             // Now and then (about hourly and every two hours): poor experience, and a kick.
             let weak = c.quirk == Some(Quirk::WeakLink);
             if weak && self.rng.unit() < dt / 3600.0 {
-                self.log(ts, i, "mcad", format!("wireless_agg_stats.log_sta_anomalies(): bssid={} radio=wifi0 vap=wifi0ap1 sta={} signal={signal} satisfaction_now={sat} anomalies=low_rssi,high_tcp_latency", bssid(self.ids[i].mac, "ng", 1), c.mac));
+                let (bssid, radio) = (bssid(self.ids[i].mac, vap.radio, vap.idx), if na { "wifi1" } else { "wifi0" });
+                self.log(ts, i, "mcad", format!("wireless_agg_stats.log_sta_anomalies(): bssid={bssid} radio={radio} vap={} sta={} signal={signal} satisfaction_now={sat} anomalies=low_rssi,high_tcp_latency", vap.name, c.mac));
             }
             if weak && signal < -76 && self.rng.unit() < dt / 7200.0 {
-                self.log(ts, i, "stamgr", format!("kick-sta-on {} wifi0ap1 (reason:Low RSSI rssi:{})", c.mac, signal + 95));
+                self.log(ts, i, "stamgr", format!("kick-sta-on {} {} (reason:Low RSSI rssi:{})", c.mac, vap.name, signal + 95));
             }
         }
         (stas, loads)
     }
 
     /// Adds the VAPs' traffic to AP `i`'s own counters, and returns them.
-    fn count_traffic(&mut self, i: usize, dt: f64, loads: &[VapLoad; 3]) -> ApCounters {
+    fn count_traffic(&mut self, i: usize, dt: f64, loads: &[VapLoad; VAPS.len()]) -> ApCounters {
         let c = &mut self.counters[i];
         let (down, up): (f64, f64) = loads.iter().fold((0.0, 0.0), |a, v| (a.0 + v.down, a.1 + v.up));
         c.tx += up + 400.0 * dt;
@@ -540,11 +544,11 @@ impl Sim {
     }
 
     /// AP `i`'s VAP table, each VAP with its stations.
-    fn vaps(&mut self, i: usize, dt: f64, mut stas: [Vec<Value>; 3], loads: &[VapLoad; 3]) -> Vec<Value> {
+    fn vaps(&mut self, i: usize, dt: f64, mut stas: [Vec<Value>; VAPS.len()], loads: &[VapLoad; VAPS.len()]) -> Vec<Value> {
         let ap = &APS[i];
-        [("ng", 0u8, SSID, 0usize), ("na", 0u8, SSID, 1), ("ng", 1u8, IOT_SSID, 2)]
-            .into_iter()
-            .map(|(radio, idx, essid, vi)| {
+        VAPS.iter()
+            .enumerate()
+            .map(|(vi, &Vap { radio, idx, essid, name })| {
                 let vc = &mut self.vap_counters[i][vi];
                 let load = loads[vi];
                 vc.tx += load.down + 2_000.0 * dt;
@@ -556,7 +560,7 @@ impl Sim {
                 let na = radio == "na";
                 json!({
                     "bssid": bssid(self.ids[i].mac, radio, idx), "essid": essid, "radio": radio, "radio_name": if na { "wifi1" } else { "wifi0" },
-                    "name": vap_name(radio, vi == 2), "id": format!("{vi}"), "channel": if na { ap.na } else { ap.ng }, "bw": if na { ap.na_bw } else { 20 },
+                    "name": name, "id": format!("{vi}"), "channel": if na { ap.na } else { ap.ng }, "bw": if na { ap.na_bw } else { 20 },
                     "tx_power": if na { ap.power.1 } else { ap.power.0 }, "usage": "user", "up": true, "state": "RUN", "num_sta": n,
                     "tx_bytes": vc.tx as i64, "rx_bytes": vc.rx as i64, "tx_packets": (vc.tx / 1100.0) as i64, "rx_packets": (vc.rx / 500.0) as i64,
                     "tx_retries": (vc.tx / 1100.0 * if na { 0.04 } else { 0.11 }) as i64, "tx_dropped": 0, "rx_dropped": 0, "tx_errors": 0, "ccq": 0,
@@ -655,11 +659,29 @@ impl Sim {
     }
 }
 
-fn vap_name(radio: &str, iot: bool) -> &'static str {
-    match (radio, iot) {
-        (_, true) => "wifi0ap1",
-        ("na", _) => "wifi1ap0",
-        _ => "wifi0ap0",
+/// One of every AP's VAPs: its band, its index on that radio, its SSID and its interface.
+struct Vap {
+    radio: &'static str,
+    idx: u8,
+    essid: &'static str,
+    name: &'static str,
+}
+
+const VAPS: [Vap; 3] = [
+    Vap { radio: "ng", idx: 0, essid: SSID, name: "wifi0ap0" },
+    Vap { radio: "na", idx: 0, essid: SSID, name: "wifi1ap0" },
+    Vap { radio: "ng", idx: 1, essid: IOT_SSID, name: "wifi0ap1" },
+];
+
+/// The VAP (index in [`VAPS`]) a client joins at a signal: an IoT device the IoT SSID,
+/// anything else 5 GHz unless the signal is weak.
+fn vap_of(c: &Client, signal: i64) -> usize {
+    if c.iot {
+        2
+    } else if signal < -72 {
+        0
+    } else {
+        1
     }
 }
 
@@ -791,7 +813,8 @@ fn stream(now: i64, hours: f64, live: bool, out: impl Write) -> Result<()> {
             let body = inform::seal(mac, Flags::ENCRYPTED | Flags::GCM | Flags::ZLIB, crate::random_iv(), key, payload.to_string().as_bytes());
             pcap.tcp(at * 1000, i, &sim.ids[i], true, &http("POST /inform HTTP/1.1\r\nHost: controller.home.arpa:8080\r\nContent-Type: application/x-binary\r\n", &body))?;
             let reply = json!({ "_type": "noop", "interval": step, "server_time_in_utc": (at * 1000).to_string() });
-            let sealed = inform::seal(mac, Flags::ENCRYPTED | Flags::GCM | Flags::ZLIB, crate::random_iv(), key, reply.to_string().as_bytes());
+            // Replies are never compressed, as the official controller's and apctl's.
+            let sealed = inform::seal_with(mac, Flags::ENCRYPTED | Flags::GCM, crate::random_iv(), key, |out| serde_json::to_writer(out, &reply).expect("a JSON value serialises"));
             pcap.tcp(at * 1000 + 40, i, &sim.ids[i], false, &http("HTTP/1.1 200 OK\r\nContent-Type: application/x-binary\r\n", &sealed))?;
         }
         for (lt, li, line) in logs {
@@ -821,11 +844,21 @@ fn chrono_like(ts: i64) -> String {
 mod tests {
     use super::*;
 
-    /// The demo settings have the shape of an import: only the settings apctl reads,
-    /// and SSIDs that let in the demo's own clients (no MAC allow-list) on every AP.
+    /// The demo settings have the shape of an import: its collections, only the settings
+    /// apctl reads, SSIDs whose user group exists, and that let in the demo's own clients
+    /// (no MAC allow-list) on every AP.
     #[test]
     fn the_demo_settings_are_ones_an_import_would_give() {
         let s = state().unwrap();
+        let mut keys: Vec<&str> = s.as_object().unwrap().keys().map(String::as_str).collect();
+        let mut import: Vec<&str> = crate::snapshot::collections().chain(["source"]).collect();
+        keys.sort_unstable();
+        import.sort_unstable();
+        assert_eq!(keys, import);
+        for w in s["wlanconf"].as_array().unwrap() {
+            let group = w["usergroup_id"].as_str().unwrap();
+            assert!(s["usergroup"].as_array().unwrap().iter().any(|g| apcfg::oid(g) == Some(group)), "{}: user group {group}", w["name"]);
+        }
         for setting in s["setting"].as_array().unwrap() {
             let key = setting["key"].as_str().unwrap();
             assert!(apcfg::SETTING_KEYS.contains(&key), "setting {key} is not one apctl reads");
@@ -924,8 +957,7 @@ mod tests {
         // batch before theirs: a syslog line still says when it was sent.
         stream(1_791_830_666 - 18 * 60, 0.5, false, &mut buf).unwrap();
         let mut pairer = wire::exchange::Pairer::default();
-        let mut informs = 0;
-        let mut syslog = 0;
+        let (mut informs, mut replies, mut syslog) = (0, 0, 0);
         let end = wire::capture::run_with_udp(&buf[..], &[8080], &[5514], |ev| {
             if let wire::capture::HttpEvent::Datagram { ts, src, payload, .. } = &ev {
                 // Opened with the key the settings hold for the AP that sent it.
@@ -935,15 +967,24 @@ mod tests {
                 let text = String::from_utf8(plain).unwrap();
                 assert!(text.starts_with(&format!("<14>{} {} ", chrono_like(ts / 1_000_000), ap.name.replace(' ', "-"))), "{text}");
                 syslog += 1;
-            } else if let Some(wire::exchange::InformEvent::Inform { decoded, .. }) = pairer.handle(&keys, ev) {
-                decoded.unwrap();
-                informs += 1;
+            } else {
+                match pairer.handle(&keys, ev) {
+                    Some(wire::exchange::InformEvent::Inform { decoded, .. }) => {
+                        decoded.unwrap();
+                        informs += 1;
+                    }
+                    Some(wire::exchange::InformEvent::Reply { decoded: Some(decoded), .. }) => {
+                        assert_eq!(decoded.unwrap().header.flags, Flags::ENCRYPTED | Flags::GCM, "replies are not compressed");
+                        replies += 1;
+                    }
+                    _ => {}
+                }
             }
             std::ops::ControlFlow::Continue(())
         })
         .unwrap();
         assert_eq!(end, wire::capture::End::Complete);
-        assert!(informs > 3 * 30, "{informs} informs");
+        assert!(informs > 3 * 30 && replies == informs, "{informs} informs, {replies} replies");
         assert!(syslog > 0);
     }
 }

@@ -32,6 +32,7 @@ pub fn int_of(v: &Value, key: &str) -> Option<i64> {
     as_int(v.get(key)?)
 }
 
+/// [`int_of`] for a value at hand.
 pub fn as_int(v: &Value) -> Option<i64> {
     match v {
         Value::Number(n) => n.as_i64().or_else(|| n.as_f64().filter(|f| f.fract() == 0.0).map(|f| f as i64)),
@@ -100,7 +101,8 @@ pub fn oid(v: &Value) -> Option<&str> {
     }
 }
 
-/// A device's `on`/`off` override of a site-wide setting; anything else follows the site.
+/// A device's `on`/`off` override (`led_override`, `outdoor_mode_override`) of a site-wide
+/// setting; anything else, or no override, follows the site.
 pub fn override_of(device: &Value, key: &str, site: bool) -> bool {
     match str_of(device, key) {
         Some("on") => true,
