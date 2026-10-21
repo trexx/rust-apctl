@@ -2539,7 +2539,7 @@ mod tests {
         s["clients"] = json!([{ "mac": "aa:bb:cc:00:00:01", "site_id": "s2", "blocked": true }]);
         assert_eq!(apply_wlan(&mut s.clone(), &WlanEdit { id: "w2".into(), patch: json!({ "name": "Mine" }) }).unwrap_err(), "unknown SSID");
         assert!(delete_wlan(&mut s.clone(), "w2").is_err());
-        assert!(apply_usergroup(&mut s.clone(), &GroupEdit { id: Some("u2".into()), patch: json!({ "name": "Mine" }), delete: false }).is_err());
+        assert!(apply_usergroup(&mut s.clone(), &GroupEdit::Edit("u2".into(), json!({ "name": "Mine" }))).is_err());
         // An AP of the other site is judged by its own site's rules: not edited here.
         let mut t = s.clone();
         t["devices"].as_array_mut().unwrap().push(json!({ "mac": "02:00:00:00:00:09", "name": "Far", "site_id": "s2", "radio_table": [] }));
@@ -2620,32 +2620,34 @@ fn group_users(state: &Value) -> HashMap<&str, Vec<String>> {
     out
 }
 
-/// A change to a user group: a new one (`id` none), an edit, or a deletion.
-pub struct GroupEdit {
-    pub id: Option<String>,
-    pub patch: Value,
-    pub delete: bool,
+/// A new user group (its fields), or an edit to one (its id and the fields to change).
+pub enum GroupEdit {
+    Create(Value),
+    Edit(String, Value),
 }
 
-/// Creates, edits or deletes a user group.
+/// Deletes a user group no SSID or client uses; the default one stays.
+pub fn remove_usergroup(state: &mut Value, id: &str) -> Result<String, String> {
+    let g = doc_by_id(state, "usergroup", id).ok_or("unknown speed limit")?;
+    if g["attr_no_delete"].as_bool() == Some(true) {
+        return Err("the default speed limit cannot be deleted".into());
+    }
+    let what = format!("deleted speed limit \"{}\"", g["name"].as_str().unwrap_or("?"));
+    let users: Vec<String> = group_uses(state).filter(|(g, _)| *g == id).map(|(_, user)| user).collect();
+    if !users.is_empty() {
+        return Err(format!("still used by {}", users.join(", ")));
+    }
+    remove_doc(state, "usergroup", id);
+    Ok(what)
+}
+
+/// Creates or edits a user group.
 pub fn apply_usergroup(state: &mut Value, e: &GroupEdit) -> Result<String, String> {
     ensure_default_usergroup(state);
-    let id = e.id.as_deref();
-    if e.delete {
-        let id = id.ok_or("which speed limit?")?;
-        let g = doc_by_id(state, "usergroup", id).ok_or("unknown speed limit")?;
-        if g["attr_no_delete"].as_bool() == Some(true) {
-            return Err("the default speed limit cannot be deleted".into());
-        }
-        let what = format!("deleted speed limit \"{}\"", g["name"].as_str().unwrap_or("?"));
-        let users: Vec<String> = group_uses(state).filter(|(g, _)| *g == id).map(|(_, user)| user).collect();
-        if !users.is_empty() {
-            return Err(format!("still used by {}", users.join(", ")));
-        }
-        remove_doc(state, "usergroup", id);
-        return Ok(what);
-    }
-    let p = &e.patch;
+    let (id, p) = match e {
+        GroupEdit::Create(p) => (None, p),
+        GroupEdit::Edit(id, p) => (Some(id.as_str()), p),
+    };
     let name = str_field(p, "name")?.map(str::trim);
     if name.is_some_and(|n| n.is_empty() || n.chars().count() > 128) {
         return Err("the name must be 1 to 128 characters".into());
@@ -2729,17 +2731,17 @@ pub async fn usergroups(State(s): State<AppState>) -> Result<Json<Value>, ApiErr
 
 /// POST /api/settings/usergroups {patch}
 pub async fn post_usergroup(State(s): State<AppState>, Query(q): Query<PreviewQuery>, Json(b): Json<Patch>) -> Result<Json<Value>, ApiError> {
-    change(&s, &q, apply_usergroup, GroupEdit { id: None, patch: b.patch, delete: false }).await
+    change(&s, &q, apply_usergroup, GroupEdit::Create(b.patch)).await
 }
 
 /// PUT /api/settings/usergroups/{id} {patch}
 pub async fn put_usergroup(State(s): State<AppState>, Path(id): Path<String>, Query(q): Query<PreviewQuery>, Json(b): Json<Patch>) -> Result<Json<Value>, ApiError> {
-    change(&s, &q, apply_usergroup, GroupEdit { id: Some(id), patch: b.patch, delete: false }).await
+    change(&s, &q, apply_usergroup, GroupEdit::Edit(id, b.patch)).await
 }
 
 /// DELETE /api/settings/usergroups/{id}
 pub async fn delete_usergroup(State(s): State<AppState>, Path(id): Path<String>, Query(q): Query<PreviewQuery>) -> Result<Json<Value>, ApiError> {
-    change(&s, &q, apply_usergroup, GroupEdit { id: Some(id), patch: Value::Null, delete: true }).await
+    change(&s, &q, |state: &mut Value, id: &String| remove_usergroup(state, id), id).await
 }
 
 #[derive(Deserialize)]
@@ -2791,21 +2793,24 @@ mod speed_and_schedule_tests {
     #[test]
     fn speed_limits_are_checked_and_not_deleted_while_used() {
         let mut s = state();
-        let group = |id: Option<&str>, patch: Value, delete: bool| GroupEdit { id: id.map(str::to_string), patch, delete };
+        let group = |id: Option<&str>, patch: Value| match id {
+            Some(id) => GroupEdit::Edit(id.into(), patch),
+            None => GroupEdit::Create(patch),
+        };
         let client = |mac: &str, g: Option<&str>| ClientGroup { mac: mac.parse().unwrap(), usergroup_id: g.map(str::to_string) };
-        let what = apply_usergroup(&mut s, &group(None, json!({ "name": "Kids", "qos_rate_max_down": 5000, "qos_rate_max_up": -1 }), false)).unwrap();
+        let what = apply_usergroup(&mut s, &group(None, json!({ "name": "Kids", "qos_rate_max_down": 5000, "qos_rate_max_up": -1 }))).unwrap();
         assert!(what.contains("down 5 Mbps, up none"), "{what}");
         let id = id_of(s["usergroup"].as_array().unwrap().iter().find(|g| g["name"] == "Kids").unwrap()).unwrap();
-        assert!(apply_usergroup(&mut s, &group(Some(&id), json!({ "qos_rate_max_down": 1 }), false)).is_err(), "0 and 1 kbps are not allowed");
-        apply_usergroup(&mut s, &group(Some(&id), json!({ "qos_rate_max_down": "6000" }), false)).unwrap();
-        assert!(apply_usergroup(&mut s, &group(None, json!({ "name": "Kids" }), false)).is_err(), "names are unique");
+        assert!(apply_usergroup(&mut s, &group(Some(&id), json!({ "qos_rate_max_down": 1 }))).is_err(), "0 and 1 kbps are not allowed");
+        apply_usergroup(&mut s, &group(Some(&id), json!({ "qos_rate_max_down": "6000" }))).unwrap();
+        assert!(apply_usergroup(&mut s, &group(None, json!({ "name": "Kids" }))).is_err(), "names are unique");
         apply_client_group(&mut s, &client("AA-BB-CC-00-00-01", Some(&id))).unwrap();
         assert_eq!((s["clients"].as_array().unwrap().len(), s["clients"][0]["usergroup_id"].as_str()), (1, Some(id.as_str())), "the entry, however the MAC is written");
-        let err = apply_usergroup(&mut s, &group(Some(&id), Value::Null, true)).unwrap_err();
+        let err = remove_usergroup(&mut s, &id).unwrap_err();
         assert!(err.contains("client tv"), "{err}");
         apply_client_group(&mut s, &client("aabbcc000001", None)).unwrap();
-        apply_usergroup(&mut s, &group(Some(&id), Value::Null, true)).unwrap();
-        assert!(apply_usergroup(&mut s, &group(Some("ug-imported"), Value::Null, true)).is_err(), "the default stays");
+        remove_usergroup(&mut s, &id).unwrap();
+        assert!(remove_usergroup(&mut s, "ug-imported").is_err(), "the default stays");
         // An SSID back to "no limit" points at the default group.
         apply_wlan(&mut s, &WlanEdit { id: "w1".into(), patch: json!({ "usergroup_id": "" }) }).unwrap();
         assert_eq!(s["wlanconf"][0]["usergroup_id"], "ug-imported");
