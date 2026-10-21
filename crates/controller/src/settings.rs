@@ -412,13 +412,14 @@ pub struct RadioCaps {
     /// The power range, dBm.
     pub min_txpower: i64,
     pub max_txpower: i64,
-    pub has_ht160: bool,
+    /// The widest channel (MHz) it can use, as the render caps its width ([`apcfg::capable_width`]).
+    pub max_width: i64,
 }
 
 impl Default for RadioCaps {
-    /// A radio that reports nothing: 1 to 30 dBm, no 160 MHz.
+    /// A radio that reports nothing: 1 to 30 dBm, up to 80 MHz.
     fn default() -> Self {
-        RadioCaps { min_txpower: 1, max_txpower: 30, has_ht160: false }
+        RadioCaps { min_txpower: 1, max_txpower: 30, max_width: 80 }
     }
 }
 
@@ -433,7 +434,7 @@ impl RadioCaps {
             out.entry(band.to_string()).or_insert(RadioCaps {
                 min_txpower: r["min_txpower"].as_i64().unwrap_or(d.min_txpower),
                 max_txpower: r["max_txpower"].as_i64().unwrap_or(d.max_txpower),
-                has_ht160: r["has_ht160"].as_bool() == Some(true),
+                max_width: apcfg::capable_width(r),
             });
         }
         out
@@ -609,12 +610,22 @@ pub(crate) fn outdoor(state: &Value, d: &Value) -> bool {
     apcfg::override_of(d, "outdoor_mode_override", mgmt_flag(state, "outdoor_mode_enabled"))
 }
 
-/// Channel choices per width for the editor.
+/// The channel widths (MHz) of a band, narrowest first; a radio has those up
+/// to its [`RadioCaps::max_width`].
+fn band_widths(band: &str) -> &'static [i64] {
+    match band {
+        "ng" => &[20, 40],
+        "na" => &[20, 40, 80, 160],
+        "6e" => &[20, 40, 80, 160, 240, 320],
+        _ => &[],
+    }
+}
+
+/// Channel choices per width of the band for the editor.
 fn channels(state: &Value, band: &str, o: bool) -> Value {
     let c = country(state);
-    let widths: &[i64] = if band == "ng" { &[20, 40] } else { &[20, 40, 80, 160] };
     let mut out = serde_json::Map::new();
-    for w in widths {
+    for w in band_widths(band) {
         out.insert(w.to_string(), json!(allowed_channels(c, band, *w, o)));
     }
     Value::Object(out)
@@ -1624,7 +1635,7 @@ pub fn delete_wlan(state: &mut Value, id: &str) -> Result<String, String> {
 pub struct DeviceEdit {
     pub mac: inform::Mac,
     pub patch: Value,
-    /// What the AP reports about its radios, by band (power range, 160 MHz support).
+    /// What the AP reports about its radios, by band (power range, widest channel).
     pub caps: HashMap<String, RadioCaps>,
     /// The band of the radio carrying the AP's wireless (mesh) uplink.
     pub wireless_uplink: Option<String>,
@@ -1748,12 +1759,7 @@ fn radio_edit(e: &DeviceEdit, rp: &Value, before: &Value, d: &mut Value, iot_loc
     let label = band_name(band);
     let r = inform_radio_mut(d, band).ok_or_else(|| format!("this AP has no {label} radio"))?;
     if let Some(ht) = int_field(rp, "ht", 20, 320)? {
-        let ok = match band {
-            "ng" => [20, 40].contains(&ht),
-            "na" | "6e" => [20, 40, 80].contains(&ht) || ht == 160 && caps.has_ht160,
-            _ => false,
-        };
-        if !ok {
+        if !band_widths(band).contains(&ht) || ht > caps.max_width {
             return Err(format!("{label}: {ht} MHz is not available on this radio"));
         }
         r["ht"] = json!(ht);
@@ -2340,7 +2346,7 @@ mod tests {
     }
 
     fn dev(s: &mut Value, patch: Value) -> Result<String, String> {
-        let caps = RadioCaps::of_inform(Some(&json!({ "radio_table": [{ "radio": "na", "min_txpower": 6, "max_txpower": 26, "has_ht160": false }, { "radio": "ng", "min_txpower": 6, "max_txpower": 22 }] })));
+        let caps = RadioCaps::of_inform(Some(&json!({ "radio_table": [{ "radio": "na", "min_txpower": 6, "max_txpower": 26, "is_11ac": true, "has_ht160": false }, { "radio": "ng", "min_txpower": 6, "max_txpower": 22 }] })));
         apply_device(s, &DeviceEdit { mac: AP1.parse().unwrap(), patch, caps, wireless_uplink: None, antennas: Value::Null })
     }
 
@@ -2437,6 +2443,37 @@ mod tests {
         s["devices"][0]["radio_table"][2]["channel"] = json!(233);
         s["devices"][0]["radio_table"][2]["ht"] = json!(20);
         assert!(dev(&mut s.clone(), json!({ "radios": [{ "radio": "6e", "ht": 40 }] })).unwrap_err().contains("channel 233"));
+    }
+
+    #[test]
+    fn widths_go_up_to_what_the_radio_reports() {
+        let mut s = state();
+        s["devices"][0]["radio_table"].as_array_mut().unwrap().push(json!({ "name": "wifi2", "radio": "6e", "channel": "auto", "ht": 160 }));
+        let caps = |r: Value| RadioCaps::of_inform(Some(&json!({ "radio_table": [r] })));
+        let width = |s: &mut Value, caps: &HashMap<String, RadioCaps>, band: &str, ht: i64| {
+            let patch = json!({ "radios": [{ "radio": band, "ht": ht }] });
+            apply_device(s, &DeviceEdit { mac: AP1.parse().unwrap(), patch, caps: caps.clone(), wireless_uplink: None, antennas: Value::Null })
+        };
+        let wifi7 = caps(json!({ "radio": "6e", "has_ht160": true, "has_eht320": true, "is_11ax": true }));
+        assert_eq!(wifi7["6e"].max_width, 320);
+        width(&mut s, &wifi7, "6e", 320).unwrap();
+        width(&mut s, &wifi7, "6e", 240).unwrap();
+        assert_eq!(s["devices"][0]["radio_table"][2]["ht"], 240);
+        assert!(width(&mut s, &wifi7, "6e", 120).unwrap_err().contains("120 MHz is not available"));
+        let wifi6e = caps(json!({ "radio": "6e", "has_ht160": true, "is_11ax": true }));
+        assert!(width(&mut s, &wifi6e, "6e", 320).unwrap_err().contains("320 MHz is not available"));
+        width(&mut s, &wifi6e, "6e", 160).unwrap();
+        // 5 GHz goes to 160 MHz at most, whatever the radio reports; 2.4 GHz to 40.
+        let na = caps(json!({ "radio": "na", "has_ht160": true, "has_eht320": true }));
+        assert!(width(&mut s, &na, "na", 320).is_err());
+        assert!(width(&mut s, &caps(json!({ "radio": "na", "is_11ac": true })), "na", 160).is_err());
+        assert!(width(&mut s, &caps(json!({ "radio": "na" })), "na", 80).is_err(), "an 802.11n radio does 40 MHz at most");
+        // The editor is offered every width of the band.
+        let offered = channels(&s, "6e", false);
+        let mut widths: Vec<i64> = offered.as_object().unwrap().keys().map(|k| k.parse().unwrap()).collect();
+        widths.sort();
+        assert_eq!(widths, [20, 40, 80, 160, 240, 320]);
+        assert_eq!(offered["320"].as_array().unwrap().last(), Some(&json!(221)));
     }
 
     #[test]
@@ -2617,7 +2654,7 @@ mod tests {
     fn radio_extras_are_range_checked() {
         let mut s = state();
         let antennas = json!([{ "id": 4, "name": "Combined", "wifi0_gain": 3, "wifi1_gain": 5 }, { "id": 5, "name": "External" }]);
-        let caps = RadioCaps::of_inform(Some(&json!({ "radio_table": [{ "radio": "na", "min_txpower": 6, "max_txpower": 26 }, { "radio": "ng", "min_txpower": 6, "max_txpower": 22 }] })));
+        let caps = RadioCaps::of_inform(Some(&json!({ "radio_table": [{ "radio": "na", "min_txpower": 6, "max_txpower": 26, "is_11ac": true }, { "radio": "ng", "min_txpower": 6, "max_txpower": 22 }] })));
         let any = |s: &mut Value, patch: Value| apply_device(s, &DeviceEdit { mac: AP1.parse().unwrap(), patch, caps: caps.clone(), wireless_uplink: None, antennas: antennas.clone() });
         let edit = |s: &mut Value, r: Value| any(s, json!({ "radios": [r] }));
         edit(&mut s, json!({ "radio": "na", "loadbalance_enabled": true, "maxsta": 40, "sens_level_enabled": true, "sens_level": -80 })).unwrap();

@@ -248,9 +248,9 @@ pub fn expire(live: &mut Live, now: Ts) {
 }
 
 /// What `radio_table` reads of each radio in an inform's `radio_table`.
-const RADIO_KEYS: [&str; 14] = [
-    "name", "radio", "radio_caps", "radio_caps2", "has_dfs", "has_fccdfs", "has_ht160", "is_11ac", "is_11ax", "nss", "min_txpower", "max_txpower", "builtin_antenna",
-    "builtin_ant_gain",
+const RADIO_KEYS: [&str; 16] = [
+    "name", "radio", "radio_caps", "radio_caps2", "has_dfs", "has_fccdfs", "has_ht160", "has_eht240", "has_eht320", "is_11ac", "is_11ax", "nss", "min_txpower",
+    "max_txpower", "builtin_antenna", "builtin_ant_gain",
 ];
 
 /// The width a new AP's radio starts at, as the official controller sets it on
@@ -265,18 +265,7 @@ fn start_width(state: &Value, r: &Value, band: &str) -> i64 {
             "na" => 80,
             _ => 160,
         });
-    let f = |k: &str| r[k].as_bool() == Some(true);
-    let capable = if f("has_eht320") {
-        320
-    } else if f("has_eht240") {
-        240
-    } else if f("has_ht160") {
-        160
-    } else if f("is_11ac") || f("is_11ax") {
-        80
-    } else {
-        40
-    };
+    let capable = apcfg::capable_width(r);
     let band_max = match band {
         "ng" => 40,
         "na" => 160,
@@ -661,6 +650,10 @@ mod tests {
         // Imports keep the site's widths as strings.
         let s = json!({ "setting": [{ "key": "radio_ai", "radios_configuration": [{ "radio": "ng", "channel_width": "40" }, { "radio": "na", "channel_width": "160" }, { "radio": "6e", "channel_width": 80 }] }] });
         assert_eq!(widths(&s), [40, 80, 80], "an 802.11ac radio does 80 MHz at most");
+        // A Wi-Fi 7 radio keeps its 320 MHz flag in the record, which the render caps its width by.
+        let wifi7 = json!({ "radio_table": [{ "name": "wifi2", "radio": "6e", "has_ht160": true, "has_eht320": true, "is_11ax": true }] });
+        let r = &radio_table(&json!({ "setting": [{ "key": "radio_ai", "radios_configuration": [{ "radio": "6e", "channel_width": 320 }] }] }), &wifi7)[0];
+        assert_eq!((r["ht"].as_i64(), r["has_eht320"].as_bool()), (Some(320), Some(true)));
     }
 
     #[test]
