@@ -613,10 +613,13 @@ fn enum_field<'a>(patch: &'a Value, key: &str, allowed: &[&str]) -> Result<Optio
     }
 }
 
-/// A text field of a patch: `None` when absent; anything but a string is refused.
+/// A text field of a patch: `None` when absent; anything but a string is
+/// refused, and so is text with control characters (tab, line breaks): the AP
+/// config can't hold them, so what is saved would differ from what the AP gets.
 pub(crate) fn str_field<'a>(patch: &'a Value, key: &str) -> Result<Option<&'a str>, String> {
     match &patch[key] {
         Value::Null => Ok(None),
+        Value::String(s) if s.contains(char::is_control) => Err(format!("{key} must not hold control characters (tabs, line breaks)")),
         Value::String(s) => Ok(Some(s)),
         _ => Err(format!("{key} must be text")),
     }
@@ -1965,6 +1968,11 @@ mod tests {
         assert_eq!(s["wlanconf"][0]["x_passphrase"], "correct horse");
         assert_eq!(edit(&mut s, json!({ "dns_assistance_servers": [5] })).unwrap_err(), "dns_assistance_servers: 5 is not text");
         assert_eq!(edit(&mut s, json!({ "dns_assistance_servers": "1.1.1.1" })).unwrap_err(), "dns_assistance_servers must be a list of text");
+        // Control characters would be dropped from the AP's config: refused.
+        assert!(edit(&mut s, json!({ "name": "Ho\tme" })).unwrap_err().contains("control characters"));
+        for (k, v) in [("name", "Hall\n"), ("snmp_location", "attic\u{7}")] {
+            assert_eq!(dev(&mut s, json!({ k: v })).unwrap_err(), format!("{k} must not hold control characters (tabs, line breaks)"));
+        }
     }
 
     #[test]

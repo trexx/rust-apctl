@@ -503,6 +503,8 @@ mod tests {
         edit(&mut s, json!({ "snmp": { "enabled": true, "community": "c0mmunity" } })).unwrap();
         assert!(edit(&mut s, json!({ "snmp": { "enabledV3": true, "username": "mon" } })).unwrap_err().contains("password"));
         assert!(edit(&mut s, json!({ "snmp": { "enabledV3": true, "username": "mon", "x_password": "short" } })).is_err());
+        assert!(edit(&mut s, json!({ "snmp": { "enabledV3": true, "username": "mon", "x_password": "pass\tword1" } })).unwrap_err().contains("control characters"));
+        assert!(edit(&mut s, json!({ "snmp": { "enabledV3": true, "username": "m\ron", "x_password": "password1" } })).unwrap_err().contains("control characters"));
         let what = edit(&mut s, json!({ "snmp": { "enabledV3": true, "username": "mon", "x_password": "v3-secret-pw" } })).unwrap();
         assert!(what.contains("SNMPv3 password") && !what.contains("v3-secret"), "{what}");
         // Shown to logged-in users; never the v3 password, and nothing in read-only mode.
