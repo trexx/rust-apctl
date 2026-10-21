@@ -541,16 +541,6 @@ struct DeviceOut<'a> {
     stored_only: bool,
 }
 
-/// A copy of an AP's view with what its page shows: not the snapshot's
-/// clients, neighbours and spectrum, which are not sent with it (see `Snapshot`).
-fn page_view(d: &DeviceView) -> DeviceView {
-    let s = &d.snapshot;
-    let snapshot = crate::model::Snapshot {
-        ap: s.ap.clone(), uplink: s.uplink.clone(), radios: s.radios.clone(), vaps: s.vaps.clone(), clients: vec![], has_vap_table: s.has_vap_table,
-    };
-    DeviceView { snapshot, ..*d }
-}
-
 async fn device(State(s): State<AppState>, MacPath(mac): MacPath) -> Result<Response, ApiError> {
     // Copied out under the lock (the clients' samples are shared), and serialised after it.
     let (view, clients, locating, stored_only) = {
@@ -558,7 +548,7 @@ async fn device(State(s): State<AppState>, MacPath(mac): MacPath) -> Result<Resp
         match (live.devices.get(&mac), live.known_devices.get(&mac)) {
             (Some(d), _) => {
                 let clients: Vec<_> = live.connected_clients().map(|(_, c)| c).filter(|c| c.sample.ap_mac == mac).cloned().collect();
-                (page_view(d), clients, live.locating.contains(&mac), false)
+                (d.clone(), clients, live.locating.contains(&mac), false)
             }
             // Known but not reporting since apctl started: offline, with what was stored.
             (None, Some(k)) => (stored_view(mac, k), Vec::new(), false, true),
