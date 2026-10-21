@@ -225,8 +225,13 @@ impl Header {
 /// Parses an `N`-byte key written in hex (an authkey's 32 characters, a syslog
 /// key's 64), ignoring surrounding whitespace.
 pub fn parse_key<const N: usize>(hex_key: &str) -> Result<[u8; N]> {
-    let bytes = hex::decode(hex_key.trim()).map_err(Error::KeyNotHex)?;
-    bytes.try_into().map_err(|b: Vec<u8>| Error::KeyLength { expected: N, got: b.len() })
+    let hex_key = hex_key.trim();
+    let mut out = [0u8; N];
+    hex::decode_to_slice(hex_key, &mut out).map_err(|e| match e {
+        hex::FromHexError::InvalidStringLength => Error::KeyLength { expected: N, got: hex_key.len() / 2 },
+        e => Error::KeyNotHex(e),
+    })?;
+    Ok(out)
 }
 
 /// A packet split into its header and the payload exactly as it appeared on the wire.
@@ -419,6 +424,8 @@ mod tests {
         assert_eq!(parse_key::<16>(" ba86f2bbe107c7c57eb5f2690775c712\n").unwrap(), DEFAULT_KEY);
         assert_eq!(parse_key::<2>("abcd").unwrap(), [0xab, 0xcd]);
         assert!(matches!(parse_key::<16>("abcd"), Err(Error::KeyLength { expected: 16, got: 2 })));
+        assert!(matches!(parse_key::<2>("abcdef"), Err(Error::KeyLength { expected: 2, got: 3 })));
+        assert!(matches!(parse_key::<2>("abc"), Err(Error::KeyNotHex(hex::FromHexError::OddLength))));
         let e = parse_key::<2>("abzz").unwrap_err();
         assert!(matches!(e, Error::KeyNotHex(_)));
         assert!(std::error::Error::source(&e).is_some_and(|s| s.to_string().contains("'z'")), "the hex error is kept as the source");
