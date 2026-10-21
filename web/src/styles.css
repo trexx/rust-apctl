@@ -533,8 +533,9 @@ input.search {
   padding: 2px 0;
   border-bottom: 1px solid var(--border);
 }
+/* The time column, as the full list's, fits a line's date (when not today) and AM/PM. */
 .logs-no-device .log-line {
-  grid-template-columns: 70px 50px 70px 1fr;
+  grid-template-columns: 130px 50px 70px 1fr;
 }
 .log-time,
 .log-sev {
