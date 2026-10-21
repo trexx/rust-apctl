@@ -945,8 +945,8 @@ impl Engine {
             let seen = live.last_config.get(&mac).cloned();
             let (previous, redacted) = previous_push(seen, stored);
             let has_system = new_system.as_ref().map_or(!previous.system_cfg.is_empty(), |s| !s.is_empty());
-            // For the section labels, which only a system_cfg has.
-            let radios = live.devices.get(&mac).filter(|_| has_system).map(|d| d.snapshot.radios.clone()).unwrap_or_default();
+            // For the section labels, which only a push with a system_cfg gets.
+            let radios = live.devices.get(&mac).filter(|_| new_system.as_ref().is_some_and(|s| !s.is_empty())).map(|d| d.snapshot.radios.clone()).unwrap_or_default();
             let wanted = dry_run && has_system && self.renderer.is_some();
             let state = live.state.clone().filter(|_| wanted);
             let inform = state.as_ref().and_then(|_| live.raw_informs.get(&mac).cloned());
@@ -968,12 +968,11 @@ impl Engine {
             data.insert(field.into(), summary);
         }
         // Names for numbered sections ("aaa.3" -> "Home WiFi (5 GHz)"), so the
-        // config history can say what a change was about. Sections removed by
-        // this push are only named in the previous config, which is read only
-        // when this push replaces it.
-        if !system.is_empty() {
-            let replaced = new_system.is_some() && !previous.system_cfg.is_empty();
-            let mut labels = if replaced { section_labels(&previous.system_cfg, &radios) } else { Default::default() };
+        // config history can say what a change was about. Only a system_cfg has
+        // them, so a management-only push gets none. Sections removed by this
+        // push are only named in the previous config.
+        if let Some(system) = new_system.as_deref().filter(|s| !s.is_empty()) {
+            let mut labels = section_labels(&previous.system_cfg, &radios);
             labels.extend(section_labels(system, &radios));
             data.insert("labels".into(), Value::Object(labels));
         }
@@ -2892,10 +2891,10 @@ mod tests {
         let row: (String, String) = h.store.read(Db::Config, |c| Ok(c.query_row("SELECT cfgversion, system_cfg FROM device_config", [], |r| Ok((r.get(0)?, r.get(1)?)))?)).unwrap();
         assert_eq!(row, ("v2".into(), "aaa.1.hide_ssid=true\naaa.1.wpa.psk=<redacted>".into()));
         // The stored system_cfg stays what the next pushes are compared with: a
-        // second management-only push still names its sections, and the next full
-        // push gets a diff, not a baseline.
+        // second management-only push (which names no sections) leaves it, and
+        // the next full push gets a diff, not a baseline.
         push(&mut h, 35, json!({ "_type": "setparam", "mgmt_cfg": "a=3" }));
-        assert!(stored(&h, EventKind::ConfigPushed).pop().unwrap()["labels"].is_object());
+        assert_eq!(stored(&h, EventKind::ConfigPushed).pop().unwrap().get("labels"), None);
         push(&mut h, 40, json!({ "_type": "setparam", "mgmt_cfg": "a=4", "system_cfg": "aaa.1.hide_ssid=false\naaa.1.wpa.psk=old" }));
         let pushed = stored(&h, EventKind::ConfigPushed).pop().unwrap();
         assert_eq!((pushed["system_cfg"]["diff"].as_str(), pushed["mgmt_cfg"]["diff"].as_str()), (Some("~ aaa.1.hide_ssid: true -> false\n"), Some("~ a: 3 -> 4\n")));
