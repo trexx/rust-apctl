@@ -109,7 +109,7 @@ struct ServeArgs {
     #[arg(long, env = "APCTL_LISTEN", default_value = "127.0.0.1:8090")]
     pub listen: SocketAddr,
     /// UDP address to receive AP syslog on (e.g. 0.0.0.0:5514). Shadow mode also
-    /// picks syslog sent to the other controller out of the capture.
+    /// picks syslog sent to the other controller (on its port, 5514) out of the capture.
     #[arg(long, env = "APCTL_SYSLOG_LISTEN")]
     pub syslog_listen: Option<SocketAddr>,
     /// File of `username:argon2-hash` lines (see `apctl hash-password`).
@@ -241,7 +241,8 @@ async fn serve(args: ServeArgs) -> Result<()> {
     match source {
         Some(src) => {
             tracing::info!("shadow mode: reading inform traffic from {src}");
-            let syslog_port = syslog_listen.map_or(5514, |a| a.port());
+            // Syslog sent to the other controller, which takes it on its fixed port.
+            let syslog_port = apcfg::Controller::default().syslog_port;
             shadow::spawn(src, inform_ports, syslog_port, keys.clone(), in_tx.clone(), clock.clone());
         }
         None if active => {}
