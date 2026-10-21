@@ -47,20 +47,28 @@ impl fmt::Display for BridgeName {
     }
 }
 
-/// The VLAN a WLAN's clients are tagged with, if any: none when a RADIUS server
-/// assigns them one (dynamic VLAN on a WPA enterprise or OSEN WLAN, as the official
-/// controller decides).
-pub fn wlan_vlan(ctx: &Ctx, w: &Value) -> Option<u16> {
-    if Security::of(w).is_eap() && dynamic_vlan(ctx, w) != 0 {
+/// The VLAN a WLAN's clients are tagged with, as the render tags them: its network's
+/// VLAN when that is tagged, else the WLAN's own `vlan` when `vlan_enabled`, else none
+/// (untagged). Also none when a RADIUS server assigns each client its VLAN (dynamic
+/// VLAN on a WPA enterprise or OSEN WLAN, as the official controller decides).
+/// `site_id` is the WLAN's site (its `site_id`): its networks and RADIUS profiles are
+/// looked up there.
+pub fn ssid_vlan(state: &Value, site_id: &str, w: &Value) -> Option<u16> {
+    if Security::of(w).is_eap() && dynamic_vlan(state, site_id, w) != 0 {
         return None;
     }
-    if let Some(vlan) = network_vlan(ctx, str_of(w, "networkconf_id")) {
+    if let Some(vlan) = network_vlan(state, site_id, str_of(w, "networkconf_id")) {
         return Some(vlan);
     }
     if flag(w, "vlan_enabled", false) {
         return int_of(w, "vlan").and_then(vlan_id);
     }
     None
+}
+
+/// [`ssid_vlan`] of a WLAN on this AP.
+pub fn wlan_vlan(ctx: &Ctx, w: &Value) -> Option<u16> {
+    ssid_vlan(ctx.state, ctx.site_id, w)
 }
 
 /// The AP's `config_network` when it has a static address.

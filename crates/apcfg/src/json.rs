@@ -10,6 +10,8 @@ pub fn str_of<'a>(v: &'a Value, key: &str) -> Option<&'a str> {
     v.get(key).and_then(Value::as_str)
 }
 
+/// A boolean field: `true`/`false`, or the strings `"true"`/`"false"`; `None` when
+/// missing or anything else.
 pub fn bool_of(v: &Value, key: &str) -> Option<bool> {
     match v.get(key)? {
         Value::Bool(b) => Some(*b),
@@ -24,6 +26,8 @@ pub fn flag(v: &Value, key: &str, default: bool) -> bool {
     bool_of(v, key).unwrap_or(default)
 }
 
+/// An integer field: an integer, a float without a fraction (`2000.0`) or a numeric
+/// string (`"20"`); `None` when missing or anything else.
 pub fn int_of(v: &Value, key: &str) -> Option<i64> {
     as_int(v.get(key)?)
 }

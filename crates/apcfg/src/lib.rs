@@ -30,8 +30,10 @@ mod net;
 mod system;
 pub mod tz;
 
-pub use json::oid;
-pub use system::MDNS_SERVICES;
+pub use json::{bool_of, flag, int_of, oid};
+pub use net::ssid_vlan;
+pub use system::{MDNS_SERVICES, ssid_usergroup, usergroup_limits};
+pub use wlan::configured_width;
 mod wlan;
 
 use std::borrow::Cow;
@@ -459,6 +461,11 @@ fn setting<'a>(state: &'a Value, site_id: &str, key: &str) -> &'a Value {
     site_docs(state, site_id, "setting").find(|s| json::str_of(s, "key") == Some(key)).unwrap_or(&NULL)
 }
 
+/// The site's network (`networkconf`) with this id.
+fn network<'a>(state: &'a Value, site_id: &str, id: &str) -> Option<&'a Value> {
+    site_docs(state, site_id, "networkconf").find(|n| json::oid(n) == Some(id))
+}
+
 impl<'a> Ctx<'a> {
     fn new(input: &Input<'a>) -> Result<Ctx<'a>> {
         let state = input.state;
@@ -525,7 +532,7 @@ impl<'a> Ctx<'a> {
     }
 
     pub fn network(&self, id: &str) -> Option<&'a Value> {
-        self.site_docs("networkconf").find(|n| json::oid(n) == Some(id))
+        network(self.state, self.site_id, id)
     }
 
     /// SSH account name: also the user cron jobs run as.
@@ -539,7 +546,7 @@ impl<'a> Ctx<'a> {
 
     /// The `radio_ai` settings for one band (`radios_configuration`).
     pub fn radio_ai_config(&self, band: Band) -> Option<&'a Value> {
-        json::arr(self.radio_ai, "radios_configuration").iter().find(|c| json::str_of(c, "radio") == Some(band.as_str()))
+        wlan::radio_ai_config(self.radio_ai, band)
     }
 }
 

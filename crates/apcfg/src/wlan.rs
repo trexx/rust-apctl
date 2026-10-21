@@ -64,6 +64,11 @@ impl<'a> Band<'a> {
         }
     }
 
+    /// The band of a `radio_table` entry (2.4 GHz when it names none).
+    fn of_radio(radio: &'a Value) -> Band<'a> {
+        Band::parse(str_of(radio, "radio").unwrap_or("ng"))
+    }
+
     /// The band of a WLAN's `wlan_bands` entry (`2g`, `5g`, `6g`).
     fn of_wlan_band(b: &str) -> Option<Band<'static>> {
         match b {
@@ -161,7 +166,7 @@ pub fn radios<'a>(ctx: &Ctx<'a>) -> Vec<Radio<'a>> {
         .map(|(i, r)| Radio {
             idx: i + 1,
             name: str_of(r, "name").unwrap_or_default(),
-            band: Band::parse(str_of(r, "radio").unwrap_or("ng")),
+            band: Band::of_radio(r),
             doc: r,
             disabled: str_of(r, "tx_power_mode").is_some_and(|m| m.eq_ignore_ascii_case("disabled")),
         })
@@ -289,6 +294,29 @@ pub fn deploy<'a>(ctx: &Ctx<'a>, radios: &[Radio]) -> Vec<(&'a str, Cow<'a, Valu
     out
 }
 
+/// The channel width (MHz) a radio is set to, before the render caps it by its band
+/// and what the radio can do: its `radio_table` entry's `ht`, else the site's
+/// `radio_ai` `channel_width` for its band, else 20 (2.4 GHz), 80 (5 GHz) or 160.
+/// `site_id` is the AP's site; `radio` is the entry, whose `radio` names the band.
+pub fn configured_width(state: &Value, site_id: &str, radio: &Value) -> i64 {
+    let radio_ai = crate::setting(state, site_id, "radio_ai");
+    configured(radio_ai, radio, Band::of_radio(radio))
+}
+
+/// [`configured_width`] with the site's `radio_ai` setting at hand.
+fn configured(radio_ai: &Value, radio: &Value, band: Band) -> i64 {
+    int_of(radio, "ht").or_else(|| radio_ai_config(radio_ai, band).and_then(|c| int_of(c, "channel_width"))).unwrap_or(match band {
+        Band::Ng => 20,
+        Band::Na => 80,
+        _ => 160,
+    })
+}
+
+/// The `radio_ai` settings for one band (`radios_configuration`).
+pub(crate) fn radio_ai_config<'a>(radio_ai: &'a Value, band: Band) -> Option<&'a Value> {
+    arr(radio_ai, "radios_configuration").iter().find(|c| str_of(c, "radio") == Some(band.as_str()))
+}
+
 /// Effective channel width in MHz.
 fn width(ctx: &Ctx, r: &Radio) -> i64 {
     let country_max = match r.band {
@@ -296,13 +324,7 @@ fn width(ctx: &Ctx, r: &Radio) -> i64 {
         Band::Na => 160,
         _ => 320,
     };
-    let configured = int_of(r.doc, "ht")
-        .or_else(|| ctx.radio_ai_config(r.band).and_then(|c| int_of(c, "channel_width")))
-        .unwrap_or(match r.band {
-            Band::Ng => 20,
-            Band::Na => 80,
-            _ => 160,
-        });
+    let configured = configured(ctx.radio_ai, r.doc, r.band);
     let f = |k| flag(r.doc, k, false);
     let capable = if f("has_eht320") {
         320
@@ -433,9 +455,9 @@ pub fn vlan_id(v: i64) -> Option<u16> {
     u16::try_from(v).ok().filter(|v| (2..=4094).contains(v))
 }
 
-/// The VLAN a network tags its traffic with, `None` for an untagged one.
-pub fn network_vlan(ctx: &Ctx, network_id: Option<&str>) -> Option<u16> {
-    network_id.and_then(|id| ctx.network(id)).and_then(tagged_vlan)
+/// The VLAN a network of the site tags its traffic with, `None` for an untagged one.
+pub fn network_vlan(state: &Value, site_id: &str, network_id: Option<&str>) -> Option<u16> {
+    network_id.and_then(|id| crate::network(state, site_id, id)).and_then(tagged_vlan)
 }
 
 /// The VLAN a network document tags its traffic with, if it is tagged.
@@ -443,14 +465,14 @@ fn tagged_vlan(network: &Value) -> Option<u16> {
     b(network, "vlan_enabled").then(|| int_of(network, "vlan").unwrap_or(2)).and_then(vlan_id)
 }
 
-fn radius_profile<'a>(ctx: &Ctx<'a>, w: &Value) -> Option<&'a Value> {
+fn radius_profile<'a>(state: &'a Value, site_id: &str, w: &Value) -> Option<&'a Value> {
     let id = str_of(w, "radiusprofile_id")?;
-    ctx.site_docs("radiusprofile").find(|p| oid(p) == Some(id))
+    crate::site_docs(state, site_id, "radiusprofile").find(|p| oid(p) == Some(id))
 }
 
-/// Dynamic VLAN mode of an EAP WLAN: 0 off, 1 optional, 2 required.
-pub fn dynamic_vlan(ctx: &Ctx, w: &Value) -> u8 {
-    match radius_profile(ctx, w).and_then(|p| str_of(p, "vlan_wlan_mode")) {
+/// Dynamic VLAN mode of an EAP WLAN of the site: 0 off, 1 optional, 2 required.
+pub fn dynamic_vlan(state: &Value, site_id: &str, w: &Value) -> u8 {
+    match radius_profile(state, site_id, w).and_then(|p| str_of(p, "vlan_wlan_mode")) {
         Some("optional") => 1,
         Some("required") => 2,
         _ => 0,
@@ -459,7 +481,7 @@ pub fn dynamic_vlan(ctx: &Ctx, w: &Value) -> u8 {
 
 /// `radius.auth.*`, `radius.acct.*` and interim updates from the WLAN's RADIUS profile.
 fn radius_servers(c: &mut Cfg, ctx: &Ctx, w: &Value, k: Prefix) {
-    let Some(p) = radius_profile(ctx, w) else { return };
+    let Some(p) = radius_profile(ctx.state, ctx.site_id, w) else { return };
     let servers = |list: &str, default_port: i64| {
         arr(p, list)
             .iter()
@@ -599,7 +621,7 @@ pub fn render_vap(c: &mut Cfg, ctx: &Ctx, radios: &[Radio], vaps: &[Vap], v: &Va
             c.set(a.at("wpa.psk"), passphrase);
             c.set(a.at("auth_cache"), on_off(flag(w, "auth_cache", true)));
             radius_servers(c, ctx, w, a);
-            c.set(a.at("dynamic_vlan"), dynamic_vlan(ctx, w));
+            c.set(a.at("dynamic_vlan"), dynamic_vlan(ctx.state, ctx.site_id, w));
             c.set(a.at("hs20.status"), "disabled");
         } else {
             let sae = wpa3 || is_6e;
@@ -700,7 +722,7 @@ fn ppsk(c: &mut Cfg, ctx: &Ctx, w: &Value, a: Prefix) {
     c.set(a.at("wpa.psk_file.status"), "enabled");
     for (pi, key) in arr(w, "private_preshared_keys").iter().enumerate() {
         c.opt(format_args!("{a}wpa.psk_file.{}.psk", pi + 1), str_of(key, "password"));
-        if let Some(vlan) = network_vlan(ctx, str_of(key, "networkconf_id")) {
+        if let Some(vlan) = network_vlan(ctx.state, ctx.site_id, str_of(key, "networkconf_id")) {
             c.set(format_args!("{a}wpa.psk_file.{}.vlanid", pi + 1), vlan);
         }
     }

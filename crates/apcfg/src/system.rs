@@ -635,13 +635,13 @@ fn mdns(c: &mut Cfg, ctx: &Ctx, vaps: &[Vap], net: &Net) {
         } else {
             entries.push(MdnsEntry { networks: vec![own], mode: "specific", services: Cow::Borrowed(mdns_auto_services()) });
         }
-        let own_bridge = bridge_of_vlan(network_vlan(ctx, own));
+        let own_bridge = bridge_of_vlan(network_vlan(ctx.state, ctx.site_id, own));
         for e in entries {
             let others: Vec<net::BridgeName> = e
                 .networks
                 .iter()
                 .filter(|n| **n != own)
-                .filter_map(|n| bridge_of_vlan(network_vlan(ctx, *n)))
+                .filter_map(|n| bridge_of_vlan(network_vlan(ctx.state, ctx.site_id, *n)))
                 .filter(|b| Some(*b) != own_bridge)
                 .collect();
             if let (false, Some(own_bridge)) = (others.is_empty(), own_bridge) {
@@ -655,7 +655,7 @@ fn mdns(c: &mut Cfg, ctx: &Ctx, vaps: &[Vap], net: &Net) {
             for n in &e.networks {
                 f += 1;
                 // An untagged network is VLAN 1 here.
-                c.set(format_args!("mdns_sd.filter.{f}.vlan"), network_vlan(ctx, *n).unwrap_or(1));
+                c.set(format_args!("mdns_sd.filter.{f}.vlan"), network_vlan(ctx.state, ctx.site_id, *n).unwrap_or(1));
                 c.set(format_args!("mdns_sd.filter.{f}.policy"), if e.mode == "all" { "allow" } else { "deny" });
                 for (i, d) in devs.iter().enumerate() {
                     c.set(format_args!("mdns_sd.filter.{f}.dst.{}.devname", i + 1), d);
@@ -675,9 +675,22 @@ fn is_dfs_channel(ch: i64) -> bool {
     (52..=144).contains(&ch)
 }
 
-/// A user group's limits (kbps; -1 or missing: unlimited).
-fn limits(g: &Value) -> (i64, i64) {
+/// A user group's speed limits as the render reads them: `(down, up)` in kbps from
+/// `qos_rate_max_down`/`qos_rate_max_up` (numbers or numeric strings); -1, or a missing
+/// or unreadable value, is unlimited (-1).
+pub fn usergroup_limits(g: &Value) -> (i64, i64) {
     (int_of(g, "qos_rate_max_down").unwrap_or(-1), int_of(g, "qos_rate_max_up").unwrap_or(-1))
+}
+
+/// The user group (speed limit) a WLAN's clients get, as the render resolves it: the
+/// site's group its `usergroup_id` names, else (no id, an empty one, or one naming no
+/// group of the site) the site's Default group (`attr_hidden_id` "Default"); `None`
+/// when the site has no such group either. `site_id` is the WLAN's site.
+pub fn ssid_usergroup<'a>(state: &'a Value, site_id: &str, w: &Value) -> Option<&'a Value> {
+    let groups = || crate::site_docs(state, site_id, "usergroup");
+    str_of(w, "usergroup_id")
+        .and_then(|id| groups().find(|g| crate::json::oid(g) == Some(id)))
+        .or_else(|| groups().find(|g| str_of(g, "attr_hidden_id") == Some("Default")))
 }
 
 /// The most a radio can carry (Mbps), the ceiling used for "unlimited". The
@@ -701,8 +714,7 @@ fn radio_max_mbps(r: &Radio) -> i64 {
 /// limits are not here: they go to the AP as `rate-update` commands.
 fn qos(c: &mut Cfg, ctx: &Ctx, radios: &[Radio], vaps: &[Vap]) {
     c.header("qos");
-    let groups: Vec<&Value> = ctx.site_docs("usergroup").collect();
-    if !groups.iter().any(|g| limits(g) != (-1, -1)) || vaps.is_empty() {
+    if !ctx.site_docs("usergroup").any(|g| usergroup_limits(g) != (-1, -1)) || vaps.is_empty() {
         c.set("qos.status", "disabled");
         return;
     }
@@ -726,11 +738,9 @@ fn qos(c: &mut Cfg, ctx: &Ctx, radios: &[Radio], vaps: &[Vap]) {
         c.set(format_args!("qos.if.{k}.devname"), v.dev());
         c.set(format_args!("qos.if.{k}.devspeed"), radio_max_mbps(&radios[v.radio]));
     }
-    let default = groups.iter().find(|g| str_of(g, "attr_hidden_id") == Some("Default")).copied();
     for (i, v) in vaps.iter().enumerate() {
         let m = i + 1;
-        let group = str_of(&v.w, "usergroup_id").and_then(|id| groups.iter().find(|g| crate::json::oid(g) == Some(id)).copied()).or(default);
-        let (down, up) = group.map_or((-1, -1), limits);
+        let (down, up) = ssid_usergroup(ctx.state, ctx.site_id, &v.w).map_or((-1, -1), usergroup_limits);
         let ceiling = radio_max_mbps(&radios[v.radio]);
         c.set(format_args!("qos.vap.{m}.id"), m);
         c.set(format_args!("qos.vap.{m}.devname"), v.dev());
