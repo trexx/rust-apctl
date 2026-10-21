@@ -244,9 +244,20 @@ export interface AppEvent {
   data: Record<string, unknown> | null;
 }
 
+/** One changed key of a config file: `old` on a removed or changed one, `new` on an added or changed one (secrets redacted, as in `diff`). */
+export interface CfgKeyChange {
+  op: "+" | "-" | "~";
+  key: string;
+  old?: string;
+  new?: string;
+}
+
 /** What a config push records for one config file (system_cfg or mgmt_cfg). */
 export interface CfgChange {
+  /** The changes as text, a line each: "+ key=value", "- key=value", "~ key: old -> new". */
   diff?: string;
+  /** The same changes, structured; missing from pushes recorded before it was added. */
+  changes?: CfgKeyChange[];
   /** The first config seen for the AP: nothing to compare with. */
   baseline?: boolean;
   lines?: number;

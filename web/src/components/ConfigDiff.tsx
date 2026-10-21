@@ -1,5 +1,5 @@
 import type { ReactNode } from "react";
-import type { ConfigPushed } from "../api";
+import type { CfgChange, CfgKeyChange, ConfigPushed } from "../api";
 
 /** What each top-level section of an AP's config is about. */
 const AREA: Record<string, string> = {
@@ -35,15 +35,9 @@ const AREA: Record<string, string> = {
   qos: "QoS",
 };
 
-interface Change {
-  op: "+" | "-" | "~";
-  key: string;
-  before?: string;
-  after?: string;
-}
-
-function parseDiff(diff: string): Change[] {
-  const out: Change[] = [];
+/** The changes a diff's text lists, for pushes recorded before the server sent them structured. */
+function parseDiff(diff: string): CfgKeyChange[] {
+  const out: CfgKeyChange[] = [];
   for (const line of diff.split("\n")) {
     const m = line.match(/^([~+-]) (.*)$/);
     if (!m) continue;
@@ -59,15 +53,15 @@ function parseDiff(diff: string): Change[] {
       out.push({
         op: "~",
         key: rest.slice(0, i),
-        before: parts.slice(0, mid).join(" -> "),
-        after: parts.slice(mid).join(" -> "),
+        old: parts.slice(0, mid).join(" -> "),
+        new: parts.slice(mid).join(" -> "),
       });
     } else {
       const i = rest.indexOf("=");
       out.push({
         op: op as "+" | "-",
         key: i < 0 ? rest : rest.slice(0, i),
-        [op === "+" ? "after" : "before"]: i < 0 ? "" : rest.slice(i + 1),
+        [op === "+" ? "new" : "old"]: i < 0 ? "" : rest.slice(i + 1),
       });
     }
   }
@@ -76,10 +70,10 @@ function parseDiff(diff: string): Change[] {
 
 /** Group changes by area and numbered section ("Wi-Fi security — Home WiFi (5 GHz)"). */
 function group(
-  changes: Change[],
+  changes: CfgKeyChange[],
   labels: Record<string, string>,
-): [string, (Change & { field: string })[]][] {
-  const groups = new Map<string, (Change & { field: string })[]>();
+): [string, (CfgKeyChange & { field: string })[]][] {
+  const groups = new Map<string, (CfgKeyChange & { field: string })[]>();
   for (const c of changes) {
     const parts = c.key.split(".");
     const [top = "", second = ""] = parts;
@@ -99,16 +93,15 @@ function group(
 
 /** The settings changes in a config push (or a preview of one), grouped by section. */
 export function summarise(d: ConfigPushed): {
-  changes: Change[];
+  changes: CfgKeyChange[];
   groups: ReturnType<typeof group>;
 } {
-  const diffs = [d.system_cfg?.diff, d.mgmt_cfg?.diff].filter(
-    (x): x is string => typeof x === "string" && !!x,
-  );
+  const listed = (c: CfgChange | undefined) =>
+    c?.changes ?? (c?.diff ? parseDiff(c.diff) : []);
   // The version stamp changes with every push; it says nothing about the settings.
-  const changes = diffs
-    .flatMap(parseDiff)
-    .filter((c) => c.key !== "cfgversion");
+  const changes = [...listed(d.system_cfg), ...listed(d.mgmt_cfg)].filter(
+    (c) => c.key !== "cfgversion",
+  );
   return { changes, groups: group(changes, d.labels ?? {}) };
 }
 
@@ -145,18 +138,18 @@ export function ChangeGroups({
                   <td className="small">
                     {c.op === "~" ? (
                       <>
-                        <span className="cfg-old">{c.before}</span> →{" "}
-                        <span className="cfg-new">{c.after}</span>
+                        <span className="cfg-old">{c.old}</span> →{" "}
+                        <span className="cfg-new">{c.new}</span>
                       </>
                     ) : c.op === "+" ? (
                       <>
                         <span className="muted">added</span>{" "}
-                        <span className="cfg-new">{c.after}</span>
+                        <span className="cfg-new">{c.new}</span>
                       </>
                     ) : (
                       <>
                         <span className="muted">removed</span>{" "}
-                        <span className="cfg-old">{c.before}</span>
+                        <span className="cfg-old">{c.old}</span>
                       </>
                     )}
                   </td>
