@@ -798,6 +798,7 @@ async fn dryrun(State(s): State<AppState>) -> Result<Json<DryRunStatus>, ApiErro
 
     // The renders run on the blocking pool.
     let renderer = s.renderer.clone();
+    let active = s.active;
     let devices = tokio::task::spawn_blocking(move || {
         // The settings' AP records by MAC, looked up once (the first for a MAC counts).
         let mut docs: std::collections::HashMap<Mac, &Value> = std::collections::HashMap::new();
@@ -810,11 +811,7 @@ async fn dryrun(State(s): State<AppState>) -> Result<Json<DryRunStatus>, ApiErro
         let mut devices = Vec::new();
         for (mac, name, running_version, seen, inform) in aps {
             let actual = seen.map(|c| (c, false)).or_else(|| stored.remove(&mac).map(|c| (c, true)));
-            // The snapshot records the cfgversion the other controller expected for
-            // each AP at import time. If the AP now runs another one, that controller
-            // has pushed new config since: the settings are probably out of date.
-            let snapshot_version = docs.get(&mac).and_then(|d| d["cfgversion"].as_str());
-            let settings_stale = matches!((snapshot_version, &running_version), (Some(a), Some(b)) if a != b);
+            let settings_stale = settings_stale(active, docs.get(&mac).and_then(|d| d["cfgversion"].as_str()), running_version.as_deref());
             let entry = |status| DryRunDevice { mac, name: name.clone(), status, settings_stale, comparison: None, against_redacted: None, error: None };
             let Some(state) = state.as_deref() else {
                 devices.push(entry(DryRunState::NoSettings));
@@ -872,6 +869,15 @@ struct DryRunStatus {
 }
 
 /// An AP's dry run now: how what apctl would push compares with what it runs.
+/// The imported settings record the cfgversion the other controller expected
+/// for each AP at import time. If the AP now runs another one, that controller
+/// has pushed new config since: the settings are probably out of date. Never in
+/// active mode, where the version an AP runs is apctl's own (see
+/// `active::decide_version`) and a re-import would undo apctl's edits.
+fn settings_stale(active: bool, imported: Option<&str>, running: Option<&str>) -> bool {
+    !active && matches!((imported, running), (Some(a), Some(b)) if a != b)
+}
+
 #[derive(Serialize)]
 struct DryRunDevice {
     mac: Mac,
@@ -1524,6 +1530,13 @@ mod tests {
         assert_eq!(d["history"][0]["comparison"], json!({ "mgmt_cfg": { "added": 0 }, "system_cfg": { "added": 1, "removed": 0, "changed": 0, "identical": false } }));
         assert_eq!(d["history"][1]["comparison"], Value::Null);
         assert_eq!(d["devices"][0], json!({ "mac": "02:00:00:00:00:01", "name": "Hall", "status": "no_settings", "settings_stale": false }));
+    }
+
+    #[test]
+    fn imported_settings_are_stale_only_in_shadow_mode() {
+        assert!(settings_stale(false, Some("a"), Some("b")));
+        assert!(!settings_stale(false, Some("a"), Some("a")) && !settings_stale(false, None, Some("b")) && !settings_stale(false, Some("a"), None));
+        assert!(!settings_stale(true, Some("a"), Some("b")), "in active mode the AP runs apctl's version");
     }
 
     #[tokio::test]
