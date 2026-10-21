@@ -1594,6 +1594,9 @@ impl Engine {
                 events.push(Event::device(now, EventKind::ApOffline, *mac, json!({ "last_seen": k.last_seen })));
             }
         }
+        for mac in &offline {
+            drop_online_only(&mut live, mac);
+        }
         // A client is gone when its AP has reported a full client list since it was
         // last seen and the grace period has passed, or when its AP went offline.
         // Only the connected ones are looked at, not the year of clients kept.
@@ -1978,6 +1981,24 @@ fn disconnect(writer: &Writer, ts: Ts, mac: Mac, c: &mut ClientView, reason: &st
         "reason": reason, "last_seen": c.last_seen, "essid": c.sample.essid,
         "connected_for": c.sample.uptime, "last_signal": c.sample.signal,
     }))
+}
+
+/// Drops the AP's queued commands that need it online (see `crate::actions`):
+/// a restart, locate or client kick still waiting when it went away would
+/// otherwise run whenever it is back. A locate dropped so is no longer on.
+fn drop_online_only(live: &mut Live, mac: &Mac) {
+    let Some(q) = live.commands.get_mut(mac) else { return };
+    let mut located = false;
+    q.retain(|c| {
+        located |= c["cmd"] == "set-locate";
+        c["_type"] != "reboot" && !matches!(c["cmd"].as_str(), Some("set-locate" | "kick-sta"))
+    });
+    if q.is_empty() {
+        live.commands.remove(mac);
+    }
+    if located {
+        live.locating.remove(mac);
+    }
 }
 
 /// Whether each AP the engine knows the state of is available: online or not
@@ -2640,6 +2661,27 @@ mod tests {
         h.engine.emit(Event::device(1, EventKind::ApCrash, AP1.parse().unwrap(), json!({ "lines": ["a long crash dump"] })));
         let text = std::iter::from_fn(|| h.rx.try_recv().ok()).find(|m| matches!(m, LiveMsg::Event(_))).map(|m| serde_json::to_string(&m).unwrap());
         assert_eq!(text.as_deref(), Some(r#"{"type":"event","kind":"ap_crash","device_mac":"02:00:00:00:00:01","client_mac":null}"#));
+    }
+
+    #[test]
+    fn an_ap_going_offline_drops_the_commands_that_need_it_online() {
+        let mut h = harness();
+        let mac: Mac = AP1.parse().unwrap();
+        h.engine.handle(Input::Inform { ts: 0, peer: [10, 0, 0, 1].into(), decoded: decoded(inform(AP1, 1000, &[])) });
+        let block = json!({ "_type": "cmd", "cmd": "block-sta", "mac": C1 });
+        {
+            let mut live = h.live.write().unwrap();
+            crate::actions::queue(&mut live, mac, json!({ "_type": "reboot", "reboot_type": "soft" }));
+            crate::actions::queue(&mut live, mac, json!({ "_type": "cmd", "cmd": "set-locate" }));
+            live.locating.insert(mac);
+            crate::actions::queue(&mut live, mac, json!({ "_type": "cmd", "cmd": "kick-sta", "mac": C1 }));
+            crate::actions::queue(&mut live, mac, block.clone());
+        }
+        h.engine.handle(Input::Tick(100));
+        // Blocking is carried by its config anyway: kept, as it does no harm.
+        let live = h.live.read().unwrap();
+        assert_eq!(live.commands[&mac], [block]);
+        assert!(live.locating.is_empty());
     }
 
     #[test]

@@ -12,7 +12,8 @@
 //!
 //! Commands are queued per AP and sent one per inform, before any config push;
 //! restart, locate and reconnect need the AP online (it would otherwise run
-//! them whenever it is back).
+//! them whenever it is back), and the engine drops them when the AP goes
+//! offline before they are sent.
 //! All of this needs active mode: in shadow mode apctl never answers the APs,
 //! and changing settings there would only diverge from the other controller.
 
