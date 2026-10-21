@@ -37,7 +37,8 @@ struct Groups {
     state: Weak<Value>,
     /// The clients with a group of their own (their first entry in the site's), and that group.
     own: HashMap<Mac, String>,
-    /// Each SSID's group, by name (the first SSID of that name).
+    /// Each SSID's group as the config applies it (see `apcfg::ssid_usergroup`), by
+    /// name (the first SSID of that name): none when the site has no Default group.
     ssid: HashMap<String, Option<String>>,
     default: Option<String>,
     /// (down, up) kbps per group.
@@ -57,15 +58,16 @@ impl Groups {
             }
         }
         g.own = own.into_iter().filter_map(|(mac, group)| Some((mac, group?))).collect();
+        let site = crate::settings::site_id(state).unwrap_or_default();
         for w in docs(state, "wlanconf") {
             if let Some(name) = w["name"].as_str() {
-                // No group (or an empty id, as imports can have) is the Default group.
-                g.ssid.entry(name.to_string()).or_insert_with(|| w["usergroup_id"].as_str().filter(|id| !id.is_empty()).map(str::to_string));
+                // No group, an empty id or one naming no group is the Default group, as in the config.
+                g.ssid.entry(name.to_string()).or_insert_with(|| apcfg::ssid_usergroup(state, site, w).and_then(id_of));
             }
         }
         for u in docs(state, "usergroup") {
             if let Some(id) = id_of(u) {
-                g.limits.entry(id).or_insert((u["qos_rate_max_down"].as_i64().unwrap_or(-1), u["qos_rate_max_up"].as_i64().unwrap_or(-1)));
+                g.limits.entry(id).or_insert(apcfg::usergroup_limits(u));
             }
         }
         *self = g;
@@ -276,19 +278,23 @@ mod tests {
     }
 
     #[test]
-    fn an_ssid_with_an_empty_group_has_the_default_groups_limit() {
-        let mut live = live(Some("slow"));
-        let mut state = (**live.state.as_ref().unwrap()).clone();
-        state["usergroup"][0]["qos_rate_max_down"] = json!(8000);
-        state["wlanconf"][0]["usergroup_id"] = json!("");
-        live.state = Some(std::sync::Arc::new(state.clone()));
-        let mut sent = Limits::default();
-        tick(&mut live, &mut sent);
-        sent_to(&mut live, AP1);
-        state["clients"][0]["usergroup_id"] = Value::Null;
-        live.state = Some(std::sync::Arc::new(state));
-        tick(&mut live, &mut sent);
-        assert_eq!(sent_to(&mut live, AP1)[0]["dl_max"].as_i64(), Some(8000));
+    fn an_ssid_with_an_empty_or_unknown_group_has_the_default_groups_limit() {
+        // As the config applies it: an empty id or one naming no group is the Default
+        // group, and a limit stored as text or as a whole float is still a limit.
+        for (ssid_group, limit) in [("", json!(8000)), ("deleted", json!("8000")), ("", json!(8000.0))] {
+            let mut live = live(Some("slow"));
+            let mut state = (**live.state.as_ref().unwrap()).clone();
+            state["usergroup"][0]["qos_rate_max_down"] = limit;
+            state["wlanconf"][0]["usergroup_id"] = json!(ssid_group);
+            live.state = Some(std::sync::Arc::new(state.clone()));
+            let mut sent = Limits::default();
+            tick(&mut live, &mut sent);
+            sent_to(&mut live, AP1);
+            state["clients"][0]["usergroup_id"] = Value::Null;
+            live.state = Some(std::sync::Arc::new(state));
+            tick(&mut live, &mut sent);
+            assert_eq!(sent_to(&mut live, AP1)[0]["dl_max"].as_i64(), Some(8000), "{ssid_group:?}");
+        }
     }
 
     #[test]
