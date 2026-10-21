@@ -2362,6 +2362,46 @@ mod tests {
         s["wlanconf"].as_array_mut().unwrap().truncate(5);
         s["setting"][0]["enabled"] = json!(true);
         assert_eq!(check(&s).unwrap_err(), "Hall would have 5 SSIDs on its 2.4 GHz radio; it supports 4");
+        // Element adoption on: seven per radio.
+        s["setting"] = json!([{ "key": "connectivity", "enabled": false }, { "key": "element_adopt", "enabled": true }]);
+        s["wlanconf"] = json!((0..8).map(|i| wlan(i, json!(["2g"]), json!(["all"]))).collect::<Vec<_>>());
+        assert_eq!(check(&s).unwrap_err(), "Hall would have 8 SSIDs on its 2.4 GHz radio; it supports 7");
+        s["wlanconf"].as_array_mut().unwrap().truncate(7);
+        check(&s).unwrap();
+    }
+
+    /// Every `setting` document the controller reads (by key) is one an import
+    /// keeps (`apcfg::SETTING_KEYS`): a key missing there is gone after a re-import.
+    #[test]
+    fn setting_keys_cover_every_setting_the_controller_reads() {
+        const SOURCES: &[&str] = &[include_str!("settings.rs"), include_str!("site.rs"), include_str!("channelai.rs"), include_str!("adopt.rs"), include_str!("ssh.rs")];
+        let mut read: Vec<String> = Vec::new();
+        for src in SOURCES {
+            // Test modules (each runs to the next `}` at the start of a line) are left out.
+            let mut rest: &str = src;
+            let mut code = String::new();
+            while let Some(at) = rest.find("#[cfg(test)]") {
+                code.push_str(&rest[..at]);
+                rest = rest[at..].find("\n}\n").map_or("", |end| &rest[at + end..]);
+            }
+            code.push_str(rest);
+            for pattern in ["setting(", "setting_mut(", "setting_on("] {
+                for (at, _) in code.match_indices(pattern) {
+                    let args = &code[at + pattern.len()..];
+                    let args = &args[..args.find(')').unwrap()];
+                    // `setting(state, "key")`, `setting_on("key", ..)`: the first quoted argument.
+                    if let Some(q) = args.find('"') {
+                        read.push(args[q + 1..q + 1 + args[q + 1..].find('"').unwrap()].to_string());
+                    }
+                }
+            }
+        }
+        for key in ["mgmt", "country", "element_adopt", "radio_ai", "ntp"] {
+            assert!(read.iter().any(|r| r == key), "the patterns still find the reads of {key}: {read:?}");
+        }
+        for key in &read {
+            assert!(apcfg::SETTING_KEYS.contains(&key.as_str()), "setting `{key}` is read but missing from apcfg::SETTING_KEYS");
+        }
     }
 
     #[test]
