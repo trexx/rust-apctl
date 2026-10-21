@@ -226,11 +226,12 @@ export interface DeviceDetail {
   locating: boolean;
 }
 
-export interface Series {
+/** `fields`: a column for each field asked for (`useSeries` types them by its list, so a chart draws only what it fetched). */
+export interface Series<F extends string> {
   tier: "raw" | "5m" | "1h";
   step: number;
   ts: number[];
-  fields: Record<string, (number | null)[]>;
+  fields: Record<F, (number | null)[]>;
 }
 
 export interface AppEvent {
@@ -243,9 +244,20 @@ export interface AppEvent {
   data: Record<string, unknown> | null;
 }
 
+/** One changed key of a config file: `old` on a removed or changed one, `new` on an added or changed one (secrets redacted, as in `diff`). */
+export interface CfgKeyChange {
+  op: "+" | "-" | "~";
+  key: string;
+  old?: string;
+  new?: string;
+}
+
 /** What a config push records for one config file (system_cfg or mgmt_cfg). */
 export interface CfgChange {
+  /** The changes as text, a line each: "+ key=value", "- key=value", "~ key: old -> new". */
   diff?: string;
+  /** The same changes, structured; missing from pushes recorded before it was added. */
+  changes?: CfgKeyChange[];
   /** The first config seen for the AP: nothing to compare with. */
   baseline?: boolean;
   lines?: number;
@@ -305,9 +317,13 @@ export interface EventPayloads {
   client_wrong_password: { vap?: string | null };
   client_steered: { signal?: number | null; result?: string | null; candidates?: { bssid: string; channel: number | null }[] };
   client_experience: { anomalies?: string[]; satisfaction?: number | null; signal?: number | null };
-  /** `lines`: from the fault on (`source` "syslog"), or the last 200 lines of the AP's crash store ("crashlog", "recovery"). */
-  ap_crash: { process?: string | null; kind?: string | null; source?: string; lines?: string[] };
-  ap_process_restarted: { proc?: string | null; exit_status?: number | null; caller?: string | null };
+  /**
+   * `lines`: from the fault on (`source` "syslog"), or the last 200 lines of the AP's crash store ("crashlog", "recovery").
+   * `summary`: the first fault line, else the first line (absent without lines, and in events stored before it was added).
+   */
+  ap_crash: { process?: string | null; kind?: string | null; source?: string; lines?: string[]; summary?: string };
+  /** The AP's notification. `exit_status`: its exit code as a number (left out when it sent none); events stored before may hold it as text. */
+  ap_process_restarted: { proc?: string | null; exit_status?: number; caller?: string | null; summary?: string };
   ap_isolated: { heard_by?: Mac | null };
   ap_scan_done: object;
   /** Any other AP notification, as it came: `event_string` names it ("EVT_AP_…"). */
@@ -315,7 +331,7 @@ export interface EventPayloads {
   radio_changed: { radio?: string | null; from?: RadioLevels; to?: RadioLevels };
   config_pushed: ConfigPushed;
   client_connected: { essid?: string | null; radio?: string | null; channel?: number | null; signal?: number | null; new?: boolean };
-  client_disconnected: { reason?: string | null; connected_for?: number | null; last_signal?: number | null };
+  client_disconnected: { reason?: "stale" | "ap_offline" | "not_seen" | "ap_forgotten" | null; connected_for?: number | null; last_signal?: number | null };
   client_roamed: { from?: RoamEndData; to?: RoamEndData };
   client_renamed: { from?: string | null; to?: string | null };
   /** `mgmt_cfg` is missing from comparisons recorded before it was added. */
@@ -337,8 +353,11 @@ export interface EventPayloads {
 
 export type EventKind = keyof EventPayloads;
 
-/** An event's payload as its kind's type: `eventData<"config_pushed">(e)`. */
+/** An event's payload, unchecked: for a caller that already picked the kind's handling by `e.kind` (as `EVENTS` does). */
 export const eventData = <K extends EventKind>(e: AppEvent) => (e.data ?? {}) as Partial<EventPayloads[K]>;
+
+/** An event's payload as `kind`'s type if the event is of that kind, else null: `payload(e, "config_pushed")`. */
+export const payload = <K extends EventKind>(e: AppEvent, kind: K): Partial<EventPayloads[K]> | null => (e.kind === kind ? eventData<K>(e) : null);
 
 export interface LogLine {
   id: number;
@@ -363,9 +382,12 @@ export interface Status {
   clients_connected: number;
   /** Connected clients by radio ("ng", "na", …). */
   clients_by_band: Record<string, number>;
-  /** Connected clients with a signal below -75 dBm. */
+  /** Connected clients with a signal below `weak_signal_dbm`. */
   clients_weak: number;
-  counters: Record<string, number>;
+  /** The signal (dBm) below which a client counts as weak. */
+  weak_signal_dbm: number;
+  /** Since apctl started. */
+  counters: Record<"informs" | "notifications" | "log_errors" | "replies" | "config_pushes" | "decode_errors" | "logs" | "events" | "syslog_dropped", number>;
 }
 
 /** Raised for 401s; the app shell then shows the login page. */
@@ -476,9 +498,9 @@ export const keys = {
   multicast: family<[span: TimeSpan, mac: Mac | undefined]>("multicast"),
   backups: family("backups"),
   firmware: family("firmware"),
-  rfRadios: family<[range: number]>("rf-radios"),
-  rfNeighbors: family<[range: number, band: string]>("rf-neighbors"),
-  rfLinks: family<[range: number]>("rf-links"),
+  rfRadios: family<[span: TimeSpan]>("rf-radios"),
+  rfNeighbors: family<[span: TimeSpan, band: string]>("rf-neighbors"),
+  rfLinks: family<[span: TimeSpan]>("rf-links"),
   rfPlan: family<[band: string, dfs: boolean]>("rf-plan"),
   channelAi: family("channel-ai"),
   adoption: family("adoption"),
@@ -754,16 +776,24 @@ const refreshFor = (s: TimeSpan, live: number) => (settled(s) ? false : live);
 /** A settled window's data stays fresh, so a focus or remount doesn't fetch it again; others keep the default staleness. */
 const freshFor = (s: TimeSpan) => (settled(s) ? { staleTime: Infinity } : {});
 
-/** Whether two keys of a span family differ in the span alone (the family's first argument, as in every one of `keys`). */
+/** Whether two keys `useSpanQuery` built differ in the span alone (it puts the span first, after the family's name). */
 const onlySpanDiffers = (a: QueryKey, b: QueryKey) => hashKey([a[0], ...a.slice(2)]) === hashKey([b[0], ...b.slice(2)]);
 
 /**
- * A query over a time span: refreshes while the span is live, and keeps the old data on screen (`isPlaceholderData`) while
- * another span loads. Another choice (a band, an AP) shows as loading instead, unless `keepAcrossChoices`, for a caller that
- * dims the old data while it shows it. The server keeps a view's answer for a window longer than 8 days for 5 minutes, so such
- * a window is asked again only that often, unless the view is `unmemoised`.
+ * A query over a time span, keyed `family(span, ...choices)`: refreshes while the span is live, and keeps the old data on screen
+ * (`isPlaceholderData`) while another span loads. Another choice (a band, an AP) shows as loading instead, unless `keepAcrossChoices`,
+ * for a caller that dims the old data while it shows it. The server keeps a view's answer for a window longer than 8 days for 5 minutes,
+ * so such a window is asked again only that often, unless the view is `unmemoised`. `C`: the family's choices, after the span.
  */
-function useSpanQuery<T>(key: QueryKey, path: string, span: TimeSpan, extra: Record<string, string | number | undefined> = {}, opts: { keepAcrossChoices?: boolean; unmemoised?: boolean } = {}) {
+function useSpanQuery<T, C extends unknown[] = []>(
+  family: (span: TimeSpan, ...choices: C) => QueryKey,
+  span: TimeSpan,
+  choices: C,
+  path: string,
+  extra: Record<string, string | number | undefined> = {},
+  opts: { keepAcrossChoices?: boolean; unmemoised?: boolean } = {},
+) {
+  const key = family(span, ...choices);
   return useQuery<T>({
     queryKey: key,
     queryFn: getting<T>(`${path}${qs({ ...spanParams(span), ...extra })}`),
@@ -774,16 +804,16 @@ function useSpanQuery<T>(key: QueryKey, path: string, span: TimeSpan, extra: Rec
 }
 
 export const useSiteActivity = (span: TimeSpan, band: string, mac?: Mac) =>
-  useSpanQuery<SiteActivity>(keys.siteActivity(span, band, mac), "/api/site/activity", span, { band: bandParam(band), mac });
+  useSpanQuery<SiteActivity, [string, Mac | undefined]>(keys.siteActivity, span, [band, mac], "/api/site/activity", { band: bandParam(band), mac });
 
 export const useSiteTop = (span: TimeSpan, mac?: Mac) =>
-  useSpanQuery<{ aps: TopEntry[]; clients: TopEntry[] }>(keys.siteTop(span, mac), "/api/site/top", span, { mac });
+  useSpanQuery<{ aps: TopEntry[]; clients: TopEntry[] }, [Mac | undefined]>(keys.siteTop, span, [mac], "/api/site/top", { mac });
 
-export const useConnectivity = (span: TimeSpan) => useSpanQuery<{ bands: Record<string, Connectivity> }>(keys.connectivity(span), "/api/site/connectivity", span);
+export const useConnectivity = (span: TimeSpan) => useSpanQuery<{ bands: Record<string, Connectivity> }>(keys.connectivity, span, [], "/api/site/connectivity");
 
-export const useRetries = (span: TimeSpan) => useSpanQuery<RadioRetries[]>(keys.retries(span), "/api/site/retries", span);
+export const useRetries = (span: TimeSpan) => useSpanQuery<RadioRetries[]>(keys.retries, span, [], "/api/site/retries");
 
-export const useDensity = (span: TimeSpan) => useSpanQuery<{ aps: DensityAp[] }>(keys.density(span), "/api/site/density", span);
+export const useDensity = (span: TimeSpan) => useSpanQuery<{ aps: DensityAp[] }>(keys.density, span, [], "/api/site/density");
 
 /** Milliseconds each stage of joining took. */
 export interface Timings {
@@ -901,17 +931,18 @@ export type Connections = { attempts: ConnAttempt[]; roams: Roam[]; ap_names: Re
  * The old list stays on screen while another `opts` loads too (the attempt list dims it).
  */
 export const useConnections = (span: TimeSpan, opts: { client?: Mac; failed?: boolean; limit?: number; roams?: boolean } = {}) =>
-  useSpanQuery<Connections>(
-    keys.connections(span, opts),
-    "/api/connections",
+  useSpanQuery<Connections, [object]>(
+    keys.connections,
     span,
+    [opts],
+    "/api/connections",
     { client: opts.client, failed: opts.failed ? "true" : undefined, limit: opts.limit, roams: opts.roams === false ? "false" : undefined },
     { keepAcrossChoices: true, unmemoised: true },
   );
 
-export const useRoaming = (span: TimeSpan) => useSpanQuery<Roaming>(keys.roaming(span), "/api/roaming", span);
+export const useRoaming = (span: TimeSpan) => useSpanQuery<Roaming>(keys.roaming, span, [], "/api/roaming");
 
-export const useWlans = (span: TimeSpan) => useSpanQuery<{ bucket: number; wlans: Wlan[] }>(keys.wlans(span), "/api/wlans", span);
+export const useWlans = (span: TimeSpan) => useSpanQuery<{ bucket: number; wlans: Wlan[] }>(keys.wlans, span, [], "/api/wlans");
 
 export interface BackupSettings {
   enabled: boolean;
@@ -931,6 +962,8 @@ export interface BackupMeta {
   days: number;
   size: number;
   encrypted: boolean;
+  /** The database files it holds ("config.db", "metrics.db", …); empty for one listed before the server named them. */
+  files: string[];
 }
 
 export interface BackupManifest {
@@ -1020,16 +1053,16 @@ export const upgradeFirmwareUrl = (mac: Mac, url: string) => send<{ queued: numb
 export const cancelFirmware = () => send<{ cancelled: number }>("POST", "/api/firmware/cancel", {});
 export const resumeFirmware = () => send<{ resumed: boolean }>("POST", "/api/firmware/resume", {});
 
-export const useMulticast = (span: TimeSpan, mac?: Mac) => useSpanQuery<SiteMulticast>(keys.multicast(span, mac), "/api/site/multicast", span, { mac });
+export const useMulticast = (span: TimeSpan, mac?: Mac) => useSpanQuery<SiteMulticast, [Mac | undefined]>(keys.multicast, span, [mac], "/api/site/multicast", { mac });
 
 // The RF views cover the last `range` seconds.
-export const useRadios = (range: number) => useSpanQuery<RadioOverview[]>(keys.rfRadios(range), "/api/rf/radios", { last: range });
+export const useRadios = (range: number) => useSpanQuery<RadioOverview[]>(keys.rfRadios, { last: range }, [], "/api/rf/radios");
 
 export const useNeighbors = (range: number, band: string) =>
-  useSpanQuery<{ neighbors: Neighbor[] }>(keys.rfNeighbors(range, band), "/api/rf/neighbors", { last: range }, { band: bandParam(band), neighbors_only: "true" }, { unmemoised: true });
+  useSpanQuery<{ neighbors: Neighbor[] }, [string]>(keys.rfNeighbors, { last: range }, [band], "/api/rf/neighbors", { band: bandParam(band), neighbors_only: "true" }, { unmemoised: true });
 
 /** Only how loudly our APs hear each other (no neighbour list). */
-export const useOwnLinks = (range: number) => useSpanQuery<{ own_links: OwnLink[] }>(keys.rfLinks(range), "/api/rf/neighbors", { last: range }, { links_only: "true" }, { unmemoised: true });
+export const useOwnLinks = (range: number) => useSpanQuery<{ own_links: OwnLink[] }>(keys.rfLinks, { last: range }, [], "/api/rf/neighbors", { links_only: "true" }, { unmemoised: true });
 
 /** `enabled` false waits, for a caller that doesn't know `dfs` yet. */
 export const useChannelPlan = (band: string, dfs: boolean, enabled = true) =>
@@ -1091,11 +1124,11 @@ export const useClient = (mac: Mac) =>
   useQuery({ queryKey: keys.client(mac), queryFn: getting<ClientDetail>(`/api/clients/${mac}`) });
 
 /** `prev` with the samples of `add` (all newer) appended, and those before `from` dropped. */
-function appendSeries(prev: Series, add: Series, from: number): Series {
+function appendSeries<F extends string>(prev: Series<F>, add: Series<F>, from: number): Series<F> {
   const keep = prev.ts.findIndex((t) => t >= from);
   const start = keep < 0 ? prev.ts.length : keep;
-  const fields: Series["fields"] = {};
-  for (const [f, values] of Object.entries(prev.fields)) fields[f] = [...values.slice(start), ...(add.fields[f] ?? add.ts.map(() => null))];
+  const fields = {} as Series<F>["fields"];
+  for (const [f, values] of Object.entries(prev.fields) as [F, (number | null)[]][]) fields[f] = [...values.slice(start), ...(add.fields[f] ?? add.ts.map(() => null))];
   return { ...prev, ts: [...prev.ts.slice(start), ...add.ts], fields };
 }
 
@@ -1103,7 +1136,7 @@ function appendSeries(prev: Series, add: Series, from: number): Series {
  * Time-series for one entity over a time span: only the columns `fields` names (the charts draw). A live chart of raw samples
  * (up to 6 hours) asks only for what is newer than its last sample.
  */
-export function useSeries(table: string, key: string, span: TimeSpan, fields: readonly string[]) {
+export function useSeries<F extends string>(table: string, key: string, span: TimeSpan, fields: readonly F[]) {
   const qc = useQueryClient();
   const only = fields.join(",");
   const queryKey = keys.series(table, key, span, only);
@@ -1112,13 +1145,13 @@ export function useSeries(table: string, key: string, span: TimeSpan, fields: re
     queryFn: async ({ signal }) => {
       const [from, to] = spanBounds(span);
       const url = (from: number) => `/api/series/${table}${qs({ key, fields: only, from, to })}`;
-      const prev = isFixed(span) ? undefined : qc.getQueryData<Series>(queryKey);
+      const prev = isFixed(span) ? undefined : qc.getQueryData<Series<F>>(queryKey);
       const last = prev?.tier === "raw" ? prev.ts.at(-1) : undefined;
       if (prev && last !== undefined && last >= from) {
-        const add = await get<Series>(url(last + 1), signal);
+        const add = await get<Series<F>>(url(last + 1), signal);
         if (add.tier === "raw") return appendSeries(prev, add, from);
       }
-      return get<Series>(url(from), signal);
+      return get<Series<F>>(url(from), signal);
     },
     refetchInterval: () => refreshFor(span, spanLength(span) <= 6 * 3600 ? 15_000 : 300_000),
     ...freshFor(span),
@@ -1126,8 +1159,9 @@ export function useSeries(table: string, key: string, span: TimeSpan, fields: re
   });
 }
 
-export type EventFilter = { device?: Mac; client?: Mac; kind?: string; limit?: number };
-export type LogFilter = { device?: Mac; q?: string; limit?: number };
+/** `limit`: how many of the newest to show, within the server's maximum (2000 events, 5000 log lines), or a refetch keeps more than a fresh fetch. */
+export type EventFilter = { device?: Mac; client?: Mac; kind?: string; limit: number };
+export type LogFilter = { device?: Mac; q?: string; limit: number };
 
 /**
  * When the live socket last reconnected or was told to resync: a list cached before then is
@@ -1145,7 +1179,7 @@ function mergeNewest<T extends { id: number; ts: number }>(prev: T[], add: T[], 
  * cached asks only for the rows stored after its newest, and keeps the `limit` newest; the
  * previous list stays up (`isPlaceholderData`) while another filter's loads.
  */
-function useNewestList<T extends { id: number; ts: number }>(queryKey: QueryKey, path: string, filter: Record<string, string | number | undefined> & { limit?: number }, defaultLimit: number) {
+function useNewestList<T extends { id: number; ts: number }>(queryKey: QueryKey, path: string, filter: Record<string, string | number | undefined> & { limit: number }) {
   const qc = useQueryClient();
   return useQuery({
     queryKey,
@@ -1155,7 +1189,7 @@ function useNewestList<T extends { id: number; ts: number }>(queryKey: QueryKey,
       if (cached && prev?.length && cached.dataUpdatedAt > liveResetAt) {
         const after = prev.reduce((max, r) => Math.max(max, r.id), 0);
         const add = await get<T[]>(`${path}${qs({ ...filter, after })}`, signal);
-        return add.length ? mergeNewest(prev, add, filter.limit ?? defaultLimit) : prev;
+        return add.length ? mergeNewest(prev, add, filter.limit) : prev;
       }
       return get<T[]>(`${path}${qs(filter)}`, signal);
     },
@@ -1163,10 +1197,9 @@ function useNewestList<T extends { id: number; ts: number }>(queryKey: QueryKey,
   });
 }
 
-// The server's default limits: 200 events, 500 log lines.
-export const useEvents = (filter: EventFilter) => useNewestList<AppEvent>(keys.events(filter), "/api/events", filter, 200);
+export const useEvents = (filter: EventFilter) => useNewestList<AppEvent>(keys.events(filter), "/api/events", filter);
 
-export const useLogs = (filter: LogFilter) => useNewestList<LogLine>(keys.logs(filter), "/api/logs", filter, 500);
+export const useLogs = (filter: LogFilter) => useNewestList<LogLine>(keys.logs(filter), "/api/logs", filter);
 
 /** A filter's MAC against a message's (canonical), as the server compares them: it reads the filter in any form it accepts. */
 const sameMac = (filter: Mac | undefined, mac: Mac | null) => !filter || canonicalMac(filter) === mac;
@@ -1371,7 +1404,9 @@ export function useLiveUpdates(): void {
       const proto = location.protocol === "https:" ? "wss" : "ws";
       const socket = new WebSocket(`${proto}://${location.host}/api/ws`);
       ws = socket;
+      let opened = false;
       socket.onopen = () => {
+        opened = true;
         retry = 1000;
         // Whatever changed while disconnected (e.g. during a restart) was never announced.
         if (dropped) refetchAll();
@@ -1379,8 +1414,9 @@ export function useLiveUpdates(): void {
       socket.onmessage = onMessage;
       socket.onclose = (e) => {
         if (closed) return;
-        // 1008 (policy): the server closed it because the session ended (logged out or expired).
-        if (e.code === 1008) announceUnauthorized();
+        // 1008 (policy): the server closed it because the session ended (logged out or expired). One that never opened may have
+        // been refused for a session that ended while it was down (the browser hides the 401): /api/me tells.
+        if (e.code === 1008 || !opened) announceUnauthorized();
         dropped = true;
         reconnectTimer = window.setTimeout(connect, retry);
         retry = Math.min(retry * 2, 30_000);
@@ -1491,7 +1527,8 @@ export interface WlanSettings extends WlanFields {
 export interface WlanSettingsList {
   active: boolean;
   wlans: WlanSettings[];
-  networks: { id: string; name: string; vlan: number | null; purpose: string | null }[];
+  /** `for_ssid`: an SSID may be put on it (a LAN network, not the inter-VLAN routing one), as the server checks it. */
+  networks: { id: string; name: string; vlan: number | null; purpose: string | null; for_ssid: boolean }[];
   aps: { mac: Mac; name: string | null }[];
   /** For each optional SSID feature, the APs that would broadcast without it. */
   unsupported: Record<string, Mac[]>;

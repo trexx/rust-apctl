@@ -7,11 +7,6 @@ import { PROTECTION } from "./form";
 import type { Protection, WlanSection } from "./form";
 import { SpeedLimitRow } from "./SpeedLimitRow";
 
-/** The network purposes an SSID can be put on. */
-const LAN_PURPOSES = ["corporate", "guest", "vlan-only"];
-/** The VLAN of the gateway's inter-VLAN routing network. */
-const INTER_VLAN_ROUTING = 4040;
-
 /** The stored passphrase, fetched when asked for. */
 function ShowPassphrase({ id }: { id: string }) {
   const [shown, setShown] = useState<string | null>(null);
@@ -55,13 +50,9 @@ export function Basics({
     set("wlan_bands", toggled(bands, b, on));
   const aps = f.aps;
   const iot = f.enhanced_iot === true;
-  // As the official UI offers them: the LAN networks, not a WAN or VPN one
-  // (a gateway's settings have those) or the inter-VLAN routing network.
-  const networks = list.networks.filter(
-    (n) =>
-      (n.purpose === null || LAN_PURPOSES.includes(n.purpose)) &&
-      Number(n.vlan) !== INTER_VLAN_ROUTING,
-  );
+  // The networks the server lets an SSID go on, as the official UI offers
+  // them: not a WAN or VPN one (a gateway's settings have those).
+  const networks = list.networks.filter((n) => n.for_ssid);
   const network = f.networkconf_id;
   const strayNetwork = !!network && !networks.some((n) => n.id === network);
   return (

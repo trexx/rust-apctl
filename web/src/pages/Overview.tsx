@@ -18,7 +18,6 @@ import {
   Stat,
 } from "../components/common";
 import {
-  SIGNAL,
   ago,
   band,
   dbm,
@@ -83,7 +82,7 @@ export function Overview() {
         <Stat
           label="Weak signal"
           value={s?.clients_weak ?? 0}
-          sub={`clients below ${dbm(SIGNAL.fair)}`}
+          sub={s ? `clients below ${dbm(s.weak_signal_dbm)}` : ""}
         />
         <Stat
           label={s?.mode === "shadow" ? "Shadow feed" : "AP reports"}

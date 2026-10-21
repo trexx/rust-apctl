@@ -27,7 +27,8 @@ export const mgmtForm = ({ mgmt }: SiteSettings): MgmtForm => ({
   led_enabled: mgmt.led_enabled ?? true,
   outdoor_mode_enabled: mgmt.outdoor_mode_enabled ?? false,
   x_ssh_enabled: mgmt.x_ssh_enabled ?? true,
-  x_ssh_username: mgmt.x_ssh_username ?? "",
+  // Unset, the APs are given "ubnt", as the summary says.
+  x_ssh_username: mgmt.x_ssh_username ?? "ubnt",
   x_ssh_auth_password_enabled: mgmt.x_ssh_auth_password_enabled ?? true,
   x_ssh_bind_wildcard: mgmt.x_ssh_bind_wildcard ?? false,
   x_ssh_keys: (mgmt.x_ssh_keys ?? []).map(keyLine),
