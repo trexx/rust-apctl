@@ -371,8 +371,10 @@ export interface Status {
   clients_connected: number;
   /** Connected clients by radio ("ng", "na", …). */
   clients_by_band: Record<string, number>;
-  /** Connected clients with a signal below -75 dBm. */
+  /** Connected clients with a signal below `weak_signal_dbm`. */
   clients_weak: number;
+  /** The signal (dBm) below which a client counts as weak. */
+  weak_signal_dbm: number;
   /** Since apctl started. */
   counters: Record<"informs" | "notifications" | "log_errors" | "replies" | "config_pushes" | "decode_errors" | "logs" | "events" | "syslog_dropped", number>;
 }
