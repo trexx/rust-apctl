@@ -73,7 +73,9 @@ pub struct Settings {
     pub minute: i64,
     pub radios: Vec<String>,
     pub dfs: bool,
-    pub exclude_devices: Vec<String>,
+    /// The APs whose channels plans keep, `aa:bb:..` however the setting writes them
+    /// (unreadable entries left out).
+    pub exclude_devices: Vec<Mac>,
 }
 
 fn radio_ai(state: &Value) -> Option<&Value> {
@@ -103,7 +105,14 @@ pub fn settings(state: Option<&Value>) -> Settings {
     let list = |k: &str| -> Vec<String> { r.and_then(|r| r[k].as_array()).into_iter().flatten().filter_map(|v| v.as_str().map(str::to_ascii_lowercase)).collect() };
     let radios = r.map_or_else(|| BANDS.iter().map(|b| b.radio.to_string()).collect(), |_| list("radios"));
     let dfs = r.is_some_and(na_dfs);
-    Settings { enabled: r.and_then(|r| r["enabled"].as_bool()).unwrap_or(false), hour, minute, radios, dfs, exclude_devices: list("exclude_devices") }
+    Settings { enabled: r.and_then(|r| r["enabled"].as_bool()).unwrap_or(false), hour, minute, radios, dfs, exclude_devices: r.map(excluded).unwrap_or_default() }
+}
+
+/// The `radio_ai` setting's `exclude_devices`, in whatever form a MAC is written there, each once.
+fn excluded(r: &Value) -> Vec<Mac> {
+    let mut out: Vec<Mac> = r["exclude_devices"].as_array().into_iter().flatten().filter_map(crate::settings::doc_mac).collect();
+    dedup_in_order(&mut out);
+    out
 }
 
 /// Whether a 5 GHz channel is a DFS one (radar can force the AP off it).
@@ -134,8 +143,7 @@ pub fn allowed(state: Option<&Value>, band: &str, with_dfs: bool) -> Option<Vec<
 /// setting, on a wireless uplink (moving them would cut them off), being
 /// upgraded, or (2.4 GHz) held on channel 6 by an SSID's IoT channel lock.
 pub fn pinned(live: &Live, band: &str) -> HashSet<Mac> {
-    // The setting's list, in whatever form a MAC is written there.
-    let mut out: HashSet<Mac> = settings(live.state.as_deref()).exclude_devices.iter().filter_map(|m| m.parse().ok()).collect();
+    let mut out: HashSet<Mac> = settings(live.state.as_deref()).exclude_devices.into_iter().collect();
     if band == "ng" {
         out.extend(live.state.as_deref().map(channel_locked_macs).unwrap_or_default());
     }
@@ -530,7 +538,9 @@ pub fn apply_settings(state: &mut Value, p: &Value) -> Result<String, String> {
     }
     if !p["exclude_devices"].is_null() {
         let macs = mac_list_value(&p["exclude_devices"], "exclude_devices")?.unwrap_or_default();
-        if let Some(m) = macs.iter().find(|m| !known.contains(m)) {
+        // One excluded already may stay, for an AP that is gone since too.
+        let stored = excluded(r);
+        if let Some(m) = macs.iter().find(|m| !known.contains(m) && !stored.contains(m)) {
             return Err(format!("{m} is not one of the APs"));
         }
         r["exclude_devices"] = json!(macs);
@@ -614,7 +624,13 @@ mod tests {
         assert!(apply_settings(&mut s, &json!({ "exclude_devices": [1] })).is_err());
         // Any form of the MAC, saved as aa:bb:.. and once.
         apply_settings(&mut s, &json!({ "exclude_devices": ["02-00-00-00-00-01", "020000000001"] })).unwrap();
-        assert_eq!(settings(Some(&s)).exclude_devices, vec!["02:00:00:00:00:01"]);
+        assert_eq!(json!(settings(Some(&s)).exclude_devices), json!(["02:00:00:00:00:01"]));
+        // An AP excluded before it was forgotten can stay excluded, or go.
+        setting_mut(&mut s, "radio_ai")["exclude_devices"] = json!(["02:00:00:00:00:01", "02-00-00-00-00-99", "?"]);
+        assert_eq!(json!(settings(Some(&s)).exclude_devices), json!(["02:00:00:00:00:01", "02:00:00:00:00:99"]));
+        apply_settings(&mut s, &json!({ "exclude_devices": ["02:00:00:00:00:01", "02:00:00:00:00:99"] })).unwrap();
+        apply_settings(&mut s, &json!({ "exclude_devices": ["02:00:00:00:00:01"] })).unwrap();
+        assert!(apply_settings(&mut s, &json!({ "exclude_devices": ["02:00:00:00:00:99"] })).is_err(), "gone from the list: no longer an AP to exclude");
     }
 
     #[test]
