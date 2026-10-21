@@ -263,20 +263,6 @@ pub fn state() -> Result<Value> {
             d
         })
         .collect();
-    // Both networks on every AP.
-    let all = s["apgroup"].as_array().and_then(|g| g.iter().find(|g| g["attr_hidden_id"] == "default")).map(|g| g["_id"]["$oid"].clone());
-    for w in s["wlanconf"].as_array_mut().into_iter().flatten() {
-        if let Some(all) = &all
-            && w.get("ap_group_ids").is_some()
-        {
-            w["ap_group_ids"] = json!([all]);
-        }
-    }
-    for g in s["apgroup"].as_array_mut().into_iter().flatten() {
-        if g.get("device_macs").is_some() {
-            g["device_macs"] = json!(APS.iter().map(|a| a.mac).collect::<Vec<_>>());
-        }
-    }
     s["clients"] = CLIENTS
         .iter()
         .enumerate()
@@ -825,6 +811,26 @@ fn chrono_like(ts: i64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The demo settings have the shape of an import: only the settings apctl reads,
+    /// and SSIDs that let in the demo's own clients (no MAC allow-list) on every AP.
+    #[test]
+    fn the_demo_settings_are_ones_an_import_would_give() {
+        let s = state().unwrap();
+        for setting in s["setting"].as_array().unwrap() {
+            let key = setting["key"].as_str().unwrap();
+            assert!(apcfg::SETTING_KEYS.contains(&key), "setting {key} is not one apctl reads");
+        }
+        let controller = apcfg::Controller::default();
+        // The APs' capabilities.
+        let inform: Value = serde_json::from_str(TEMPLATE_INFORM).unwrap();
+        for ap in APS {
+            let input = apcfg::Input { state: &s, device_mac: ap.mac, inform: Some(&inform), cfgversion: "1", controller: &controller };
+            let cfg = apcfg::render(&input).unwrap().system_cfg;
+            assert!(!cfg.contains("acl.policy=allow"), "{}: a MAC allow-list", ap.name);
+            assert_eq!(cfg.lines().filter(|l| l.starts_with("wireless.") && l.contains(".ssid=")).count(), 3, "{}: Homestead on both radios, IoT on 2.4 GHz", ap.name);
+        }
+    }
 
     #[test]
     fn the_template_reports_our_firmware_version() {

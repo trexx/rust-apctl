@@ -31,3 +31,5 @@ wire.workspace = true
 [dev-dependencies]
 # Opens the demo's encrypted syslog datagrams.
 aes-gcm.workspace = true
+# Checks the demo settings against what rendering reads.
+apcfg.workspace = true
