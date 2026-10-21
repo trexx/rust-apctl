@@ -1518,7 +1518,7 @@
         },
         "settings": {
           "bands": null,
-          "bss_transition": false,
+          "bss_transition": true,
           "enabled": true,
           "fast_roaming": false,
           "guest": false,

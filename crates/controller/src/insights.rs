@@ -572,19 +572,21 @@ fn mcast_types(rows: &[McastRow], from: Ts, to: Ts, bucket: Ts, step: Ts) -> (Ve
     (ts, types)
 }
 
-/// Non-secret settings of a network from the imported controller settings.
+/// Non-secret settings of a network from the imported controller settings,
+/// read as the render reads them (its defaults, `"true"` as true; the VLAN its
+/// clients are tagged with).
 fn wlan_settings(state: Option<&Value>, essid: &str) -> Value {
     use crate::settings::{docs, id_of};
+    use apcfg::flag;
     let Some(state) = state else { return Value::Null };
     let Some(w) = docs(state, "wlanconf").find(|w| w["name"].as_str() == Some(essid)) else { return Value::Null };
     let network = w["networkconf_id"].as_str().and_then(|id| docs(state, "networkconf").find(|n| id_of(n).as_deref() == Some(id))).and_then(|n| n["name"].as_str());
     let security = crate::settings::security_label(w);
+    let vlan = apcfg::ssid_vlan(state, crate::settings::site_id(state).unwrap_or_default(), w);
     json!({
-        "enabled": w["enabled"].as_bool().unwrap_or(true), "security": security, "hidden": w["hide_ssid"].as_bool().unwrap_or(false),
-        "guest": w["is_guest"].as_bool().unwrap_or(false), "network": network,
-        "vlan": if w["vlan_enabled"].as_bool() == Some(true) { w["vlan"].clone() } else { Value::Null },
-        "bands": w["wlan_bands"].clone(), "fast_roaming": w["fast_roaming_enabled"].as_bool().unwrap_or(false),
-        "bss_transition": w["bss_transition"].as_bool().unwrap_or(false), "pmf": w["pmf_mode"].as_str(),
+        "enabled": flag(w, "enabled", true), "security": security, "hidden": flag(w, "hide_ssid", false), "guest": flag(w, "is_guest", false),
+        "network": network, "vlan": vlan, "bands": w["wlan_bands"].clone(), "fast_roaming": flag(w, "fast_roaming_enabled", false),
+        "bss_transition": flag(w, "bss_transition", true), "pmf": w["pmf_mode"].as_str(),
     })
 }
 
@@ -1096,14 +1098,16 @@ mod tests {
     fn wlan_settings_from_an_import() {
         let state = json!({
             "wlanconf": [{ "name": "Home", "security": "wpapsk", "wpa_mode": "wpa2", "wpa3_support": true, "wpa3_transition": true,
-                "networkconf_id": "abc", "hide_ssid": false, "vlan_enabled": false, "fast_roaming_enabled": true, "wlan_bands": ["5g"] },
-                { "name": "Guest", "security": "open", "is_guest": true, "vlan_enabled": true, "vlan": "20" }],
-            "networkconf": [{ "_id": { "$oid": "abc" }, "name": "LAN" }],
+                "networkconf_id": "abc", "hide_ssid": false, "vlan_enabled": true, "vlan": "30", "fast_roaming_enabled": true, "wlan_bands": ["5g"], "bss_transition": false },
+                { "name": "Guest", "security": "open", "is_guest": "true", "networkconf_id": "guest" }],
+            "networkconf": [{ "_id": { "$oid": "abc" }, "name": "LAN" }, { "_id": "guest", "name": "Guests", "purpose": "guest", "vlan_enabled": true, "vlan": "20" }],
         });
+        // The VLAN is the network's when it is tagged, else the SSID's own; an unset BSS transition is on, as the render has it.
         let h = wlan_settings(Some(&state), "Home");
-        assert_eq!((h["security"].as_str(), h["network"].as_str(), h["vlan"].is_null(), h["fast_roaming"].as_bool()), (Some("WPA2/WPA3 Personal"), Some("LAN"), true, Some(true)));
+        assert_eq!((h["security"].as_str(), h["network"].as_str(), h["vlan"].as_i64(), h["fast_roaming"].as_bool()), (Some("WPA2/WPA3 Personal"), Some("LAN"), Some(30), Some(true)));
+        assert_eq!(h["bss_transition"], false);
         let g = wlan_settings(Some(&state), "Guest");
-        assert_eq!((g["security"].as_str(), g["guest"].as_bool(), g["vlan"].as_str()), (Some("Open"), Some(true), Some("20")));
+        assert_eq!((g["security"].as_str(), g["guest"].as_bool(), g["vlan"].as_i64(), g["bss_transition"].as_bool()), (Some("Open"), Some(true), Some(20), Some(true)));
         assert!(wlan_settings(Some(&state), "Other").is_null());
     }
 
