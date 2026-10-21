@@ -790,7 +790,7 @@ async fn managed_inform(active: &Arc<Active>, ts: Ts, caller: Caller, decoded: D
     if forgetting {
         tracing::warn!("{mac}: forgotten: telling it to reset");
         let engine = active.engine.clone();
-        tokio::spawn(async move { crate::adopt::finish_forget(&engine, mac, true).await });
+        tokio::spawn(async move { crate::adopt::finish_forget(&engine, mac, true).await.ok() });
         active.devices.lock().unwrap().remove(&mac);
         let reply = json!({ "_type": "setdefault", "server_time_in_utc": server_time(ts) });
         return caller.seal(&reply);

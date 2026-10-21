@@ -436,7 +436,7 @@ pub fn spawn(s: AppState) {
             };
             for mac in overdue {
                 tracing::info!("{mac}: forgotten without reporting again");
-                finish_forget(&s.engine, mac, false).await;
+                let _ = finish_forget(&s.engine, mac, false).await;
             }
         }
     });
@@ -499,7 +499,14 @@ async fn adopt_pending(s: AppState, mac: Mac) -> Result<Json<Value>, ApiError> {
 }
 
 /// POST /api/devices/{mac}/forget: remove an AP; if it reports again it resets itself.
+/// Run as a task of its own, as [`adopt`] is: a request dropped mid-way must not
+/// stop an offline AP's forget between its record edit and the engine forgetting it.
 pub async fn forget(State(s): State<AppState>, MacPath(mac): MacPath) -> Result<Json<Value>, ApiError> {
+    tokio::spawn(forget_ap(s, mac)).await?
+}
+
+/// [`forget`]'s work.
+async fn forget_ap(s: AppState, mac: Mac) -> Result<Json<Value>, ApiError> {
     crate::api::require_active(&s, "adoption needs")?;
     let online = {
         let live = s.live.read().unwrap();
@@ -515,12 +522,13 @@ pub async fn forget(State(s): State<AppState>, MacPath(mac): MacPath) -> Result<
         crate::stun::poke(&live, &mac);
         return Ok(Json(json!({ "forgetting": true })));
     }
-    finish_forget(&s.engine, mac, false).await;
+    finish_forget(&s.engine, mac, false).await?;
     Ok(Json(json!({ "forgotten": true })))
 }
 
-/// Removes a forgotten AP from the settings and apctl's records.
-pub async fn finish_forget(engine: &tokio::sync::mpsc::Sender<Input>, mac: Mac, reset: bool) {
+/// Removes a forgotten AP from the settings and apctl's records. An error
+/// when it removed nothing: the record was gone (404), or the engine has stopped.
+pub async fn finish_forget(engine: &tokio::sync::mpsc::Sender<Input>, mac: Mac, reset: bool) -> Result<(), ApiError> {
     let (tx, rx) = tokio::sync::oneshot::channel();
     let edit: crate::engine::StateEdit = Box::new(move |state: &mut Value| remove_device(state, &mac));
     let _ = engine.send(Input::EditState { ts: clock::now_ts(), edit, done: tx }).await;
@@ -530,9 +538,16 @@ pub async fn finish_forget(engine: &tokio::sync::mpsc::Sender<Input>, mac: Mac, 
         Ok(Ok(_)) => {
             let _ = engine.send(Input::Forget { ts: clock::now_ts(), mac }).await;
             let _ = engine.send(Input::Note(Event::device(clock::now_ts(), EventKind::ApForgotten, mac, json!({ "reset": reset })))).await;
+            Ok(())
         }
-        Ok(Err(e)) => tracing::info!("{mac}: not forgotten: {e}"),
-        Err(_) => tracing::warn!("{mac}: not forgotten: the engine has stopped"),
+        Ok(Err(e)) => {
+            tracing::info!("{mac}: not forgotten: {e}");
+            Err(ApiError::not_found(e))
+        }
+        Err(_) => {
+            tracing::warn!("{mac}: not forgotten: the engine has stopped");
+            Err(ApiError::engine_stopped())
+        }
     }
 }
 
@@ -627,8 +642,8 @@ mod tests {
             }
         });
         let mac: Mac = "02:00:00:00:00:01".parse().unwrap();
-        finish_forget(&tx, mac, false).await;
-        finish_forget(&tx, mac, false).await;
+        assert!(finish_forget(&tx, mac, false).await.is_ok());
+        assert_eq!(finish_forget(&tx, mac, false).await.err().map(|e| e.0), Some(axum::http::StatusCode::NOT_FOUND));
         drop(tx);
         let mut got = Vec::new();
         while let Some(x) = seen.recv().await {
