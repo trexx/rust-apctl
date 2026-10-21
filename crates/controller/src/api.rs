@@ -1268,7 +1268,11 @@ pub fn live_json(typed: &broadcast::Sender<LiveMsg>) -> broadcast::Sender<Utf8By
                         Utf8Bytes::from_static(RESYNC)
                     }
                 },
-                Err(broadcast::error::RecvError::Lagged(_)) => Utf8Bytes::from_static(RESYNC),
+                // What is still buffered is stale once the pages refetch: skipped.
+                Err(broadcast::error::RecvError::Lagged(_)) => {
+                    rx = rx.resubscribe();
+                    Utf8Bytes::from_static(RESYNC)
+                }
                 Err(broadcast::error::RecvError::Closed) => return,
             };
             let _ = out.send(text);
@@ -1306,7 +1310,9 @@ async fn live_socket(mut socket: WebSocket, mut rx: broadcast::Receiver<Utf8Byte
                         return;
                     }
                 }
+                // The page refetches everything: what is still buffered is stale, and skipped.
                 Err(broadcast::error::RecvError::Lagged(_)) => {
+                    rx = rx.resubscribe();
                     if socket.send(Message::Text(Utf8Bytes::from_static(RESYNC))).await.is_err() {
                         return;
                     }
@@ -1514,6 +1520,16 @@ mod tests {
         typed.send(LiveMsg::Device { mac: ap }).unwrap();
         assert_eq!(socket.recv().await.unwrap().as_str(), r#"{"type":"log","device_mac":"02:00:00:00:00:01"}"#);
         assert_eq!(socket.recv().await.unwrap().as_str(), r#"{"type":"device","mac":"02:00:00:00:00:01"}"#);
+        // Fallen behind: a resync, and what was missed is not sent after it.
+        let (typed, _) = broadcast::channel(2);
+        let json = live_json(&typed);
+        let mut socket = json.subscribe();
+        for _ in 0..5 {
+            typed.send(LiveMsg::Device { mac: ap }).unwrap();
+        }
+        assert_eq!(socket.recv().await.unwrap().as_str(), RESYNC);
+        typed.send(LiveMsg::Clients).unwrap();
+        assert_eq!(socket.recv().await.unwrap().as_str(), r#"{"type":"clients"}"#);
     }
 
     #[tokio::test]
