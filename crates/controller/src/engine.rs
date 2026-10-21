@@ -606,6 +606,13 @@ impl Engine {
             live.known_devices.len(),
             live.aliases.len()
         );
+        // An AP stored as offline is unavailable to the clients locked to it,
+        // whatever the settings were saved (or restored from a backup) with.
+        let (presence, imported_at) = (presence(&live), live.state_imported_at);
+        drop(live);
+        if let Some(at) = imported_at {
+            self.set_fixed_ap_available(at, presence);
+        }
         Ok(())
     }
 
@@ -744,38 +751,36 @@ impl Engine {
         let _ = self.tx.send(LiveMsg::Device { mac });
         // Online: its first inform of this run, or back from offline.
         if came_back {
-            self.set_fixed_ap_available(ts, mac, true);
+            self.set_fixed_ap_available(ts, HashMap::from([(mac, true)]));
         }
     }
 
-    /// Keeps the AP's `fixed_ap_available` in the settings in step with whether
-    /// the engine counts it online, as the official controller does for an AP
+    /// Keeps the APs' `fixed_ap_available` in the settings in step with whether
+    /// the engine counts them online, as the official controller does for an AP
     /// (a device with radios): a client locked to an AP that is away may use
-    /// the others meanwhile (apcfg's `lock2ap`). Written only when it changes,
+    /// the others meanwhile (apcfg's `lock2ap`). `aps` maps an AP to whether it
+    /// is available; one edit writes them all, and only when a value changes,
     /// as a change of the controller's own, not the user's: no settings event.
-    /// The APs are asked to inform now only when a client is locked to it, when
-    /// the official controller provisions them all; else no AP's config changes.
-    fn set_fixed_ap_available(&mut self, ts: Ts, mac: Mac, available: bool) {
+    /// The APs are asked to inform now only when a client is locked to one of
+    /// them, when the official controller provisions them all; else no AP's
+    /// config changes.
+    fn set_fixed_ap_available(&mut self, ts: Ts, aps: HashMap<Mac, bool>) {
         let (current, imported_at) = {
             let live = self.live.read().unwrap();
             (live.state.clone(), live.state_imported_at.unwrap_or(ts))
         };
         let Some(current) = current else { return };
-        let Some(doc) = crate::adopt::device_doc(&current, &mac) else { return };
-        let has_radios = doc["radio_table"].as_array().is_some_and(|r| !r.is_empty());
-        if !has_radios || doc["fixed_ap_available"].as_bool().unwrap_or(true) == available {
+        if !current["devices"].as_array().is_some_and(|d| d.iter().any(|d| availability_change(d, &aps).is_some())) {
             return;
         }
         let mut state = Value::clone(&current);
         drop(current);
-        if let Some(doc) = crate::adopt::device_doc_mut(&mut state, &mac) {
-            doc["fixed_ap_available"] = json!(available);
-        }
+        let changed = mark_available(&mut state, &aps);
         let locked = state["clients"]
             .as_array()
             .into_iter()
             .flatten()
-            .any(|c| c["fixed_ap_enabled"].as_bool() == Some(true) && crate::settings::doc_mac(&c["fixed_ap_mac"]) == Some(mac));
+            .any(|c| c["fixed_ap_enabled"].as_bool() == Some(true) && crate::settings::doc_mac(&c["fixed_ap_mac"]).is_some_and(|m| changed.contains(&m)));
         self.store_state(state, imported_at);
         if locked {
             crate::stun::poke_all(&self.live.read().unwrap());
@@ -1103,7 +1108,10 @@ impl Engine {
         live.state_imported_at = Some(imported_at);
     }
 
-    fn set_state(&mut self, ts: Ts, state: Value) {
+    fn set_state(&mut self, ts: Ts, mut state: Value) {
+        // The import's `fixed_ap_available` is the other controller's view of
+        // the APs; the engine's own replaces it for every AP whose state it knows.
+        mark_available(&mut state, &presence(&self.live.read().unwrap()));
         let summary = crate::dryrun::summarize_state(&state);
         self.store_state(state, ts);
         // The new settings may hold the syslog key of an AP given up on.
@@ -1622,10 +1630,12 @@ impl Engine {
             self.emit(e);
         }
         // Remembered, so that a restart still pairs the AP's return with it.
-        for mac in offline {
+        for &mac in &offline {
             self.writer.exec(Db::Config, "UPDATE devices SET offline = 1 WHERE mac = ?1", vec![Sql::Text(mac.to_string())]);
             let _ = self.tx.send(LiveMsg::Device { mac });
-            self.set_fixed_ap_available(now, mac, false);
+        }
+        if !offline.is_empty() {
+            self.set_fixed_ap_available(now, offline.into_iter().map(|m| (m, false)).collect());
         }
         if changed {
             let _ = self.tx.send(LiveMsg::Clients);
@@ -1968,6 +1978,37 @@ fn disconnect(writer: &Writer, ts: Ts, mac: Mac, c: &mut ClientView, reason: &st
     }))
 }
 
+/// Whether each AP the engine knows the state of is available: online or not
+/// for one heard from in this run, unavailable for one stored as offline. One
+/// last stored online that has not informed in this run yet is left out (its
+/// state is not known yet).
+fn presence(live: &Live) -> HashMap<Mac, bool> {
+    let stored_offline = live.known_devices.iter().filter(|(_, k)| k.offline).map(|(m, _)| (*m, false));
+    live.devices.iter().map(|(m, d)| (*m, d.online)).chain(stored_offline).collect()
+}
+
+/// The AP and its new `fixed_ap_available`, when this device record is an AP
+/// (it has radios) in `aps` whose stored value (none reads as available) differs.
+fn availability_change(doc: &Value, aps: &HashMap<Mac, bool>) -> Option<(Mac, bool)> {
+    let mac = crate::settings::doc_mac(&doc["mac"])?;
+    let available = *aps.get(&mac)?;
+    let has_radios = doc["radio_table"].as_array().is_some_and(|r| !r.is_empty());
+    (has_radios && doc["fixed_ap_available"].as_bool().unwrap_or(true) != available).then_some((mac, available))
+}
+
+/// Writes `fixed_ap_available` into the records of the APs in `aps` whose value
+/// differs (see `availability_change`), and returns those APs.
+fn mark_available(state: &mut Value, aps: &HashMap<Mac, bool>) -> Vec<Mac> {
+    let mut changed = Vec::new();
+    for doc in state["devices"].as_array_mut().into_iter().flatten() {
+        if let Some((mac, available)) = availability_change(doc, aps) {
+            doc["fixed_ap_available"] = json!(available);
+            changed.push(mac);
+        }
+    }
+    changed
+}
+
 #[cfg(test)]
 mod tests {
 
@@ -2204,6 +2245,37 @@ mod tests {
         feed(&mut h, AP1, 200);
         assert_eq!(available(&h, 0), Some(json!(true)));
         assert!(stored(&h, EventKind::SettingsChanged).is_empty());
+    }
+
+    #[test]
+    fn imported_and_restored_settings_get_the_engines_view_of_the_aps() {
+        let mut h = harness();
+        let feed = |h: &mut Harness, ap: &str, ts: Ts| h.engine.handle(Input::Inform { ts, peer: [10, 0, 0, 1].into(), decoded: decoded(inform(ap, 1000 + ts, &[])) });
+        let available = |h: &Harness, i: usize| h.live.read().unwrap().state.as_ref().unwrap()["devices"][i].get("fixed_ap_available").cloned();
+        let radios = json!([{ "radio": "na" }]);
+        feed(&mut h, AP1, 0);
+        feed(&mut h, AP2, 0);
+        h.engine.handle(Input::Tick(30));
+        // AP1 informs to apctl, so the other controller's `false` is replaced;
+        // AP3 is not heard of, so its value is kept as imported.
+        let ap3 = "02:00:00:00:00:03";
+        h.engine.set_state(40, json!({ "devices": [
+            { "mac": AP1, "radio_table": radios, "fixed_ap_available": false },
+            { "mac": AP2, "radio_table": radios },
+            { "mac": ap3, "radio_table": radios, "fixed_ap_available": false },
+        ] }));
+        assert_eq!((available(&h, 0), available(&h, 1), available(&h, 2)), (Some(json!(true)), None, Some(json!(false))));
+        // AP2 goes away, then the settings are imported again saying it is there.
+        feed(&mut h, AP1, 100);
+        h.engine.handle(Input::Tick(120));
+        assert_eq!(available(&h, 1), Some(json!(false)));
+        h.engine.set_state(130, json!({ "devices": [{ "mac": AP1, "radio_table": radios }, { "mac": AP2, "radio_table": radios, "fixed_ap_available": true }] }));
+        assert_eq!((available(&h, 0), available(&h, 1)), (None, Some(json!(false))));
+        // Settings saved while it was there, with AP2 stored offline: a restart marks it.
+        h.engine.set_fixed_ap_available(140, HashMap::from([(AP2.parse().unwrap(), true)]));
+        assert_eq!(available(&h, 1), Some(json!(true)));
+        let h = h.restarted();
+        assert_eq!((available(&h, 0), available(&h, 1)), (None, Some(json!(false))), "AP1 is not known yet; AP2 is stored offline");
     }
 
     #[test]
