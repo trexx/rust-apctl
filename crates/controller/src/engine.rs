@@ -1609,12 +1609,14 @@ impl Engine {
         // last seen and the grace period has passed, or when its AP went offline.
         // Only the connected ones are looked at, not the year of clients kept.
         let mut changed = false;
-        let Live { devices, clients, connected, .. } = &mut *live;
+        let Live { devices, known_devices, clients, connected, .. } = &mut *live;
         connected.retain(|cmac| {
             let Some(c) = clients.get_mut(cmac).filter(|c| c.connected) else { return false };
             // An AP we have not heard from yet in this run (e.g. right after a
-            // restart) is unknown, not offline: leave its clients alone.
+            // restart) is unknown, not offline, until the wait above marks it
+            // offline: until then, leave its clients alone.
             let reason = match devices.get(&c.sample.ap_mac) {
+                None if known_devices.get(&c.sample.ap_mac).is_some_and(|k| k.offline) => Some("ap_offline"),
                 // Its AP never reappeared (e.g. removed): give up after an hour.
                 // Counted from this run's start too: after a long outage the
                 // APs get time to inform before their clients are written off.
@@ -2364,12 +2366,25 @@ mod tests {
         h.engine.handle(Input::Inform { ts: 0, peer: [10, 0, 0, 1].into(), decoded: decoded(inform(AP1, 1000, &[(C1, "b1")])) });
         // Back after two hours: the first tick comes before the AP's first inform.
         let mut h = h.restarted();
+        let limit = crate::active::MAX_INFORM_INTERVAL * OFFLINE_INTERVALS;
+        h.engine.handle(Input::Tick(7200));
+        h.engine.handle(Input::Tick(7200 + limit));
+        assert_eq!(events(&mut h), [], "the AP and its client are left alone while the AP has time to inform");
+        // An AP that never informs again goes offline, and its clients with it.
+        h.engine.handle(Input::Tick(7201 + limit));
+        assert_eq!(events(&mut h), [("ap_offline", None), ("client_disconnected", Some(C1.into()))]);
+        assert_eq!(stored(&h, EventKind::ClientDisconnected)[0]["reason"], "ap_offline");
+        // A client of an AP that is not known at all (e.g. forgotten): it goes an hour into the run.
+        let mut h = harness();
+        h.engine.handle(Input::Inform { ts: 0, peer: [10, 0, 0, 1].into(), decoded: decoded(inform(AP1, 1000, &[(C1, "b1")])) });
+        let mut h = h.restarted();
+        h.engine.live.write().unwrap().known_devices.clear();
         h.engine.handle(Input::Tick(7200));
         h.engine.handle(Input::Tick(7200 + 3600));
-        assert_eq!(events(&mut h), [("ap_offline", None)], "the client is left alone for the AP's first hour back");
-        // An AP that never informs again: its clients go an hour into the run.
+        assert_eq!(events(&mut h), []);
         h.engine.handle(Input::Tick(7200 + 3601));
         assert_eq!(events(&mut h), [("client_disconnected", Some(C1.into()))]);
+        assert_eq!(stored(&h, EventKind::ClientDisconnected)[0]["reason"], "stale");
     }
 
     #[test]
