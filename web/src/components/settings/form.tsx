@@ -337,7 +337,10 @@ export const toggled = <T,>(list: readonly T[], x: T, on: boolean): T[] =>
     ? [...list, ...(list.includes(x) ? [] : [x])]
     : list.filter((y) => y !== x);
 
-/** A checkbox per AP; those in `value` are ticked. */
+/**
+ * A checkbox per AP; those in `value` are ticked. An entry of `value` that isn't
+ * one of `aps` (a forgotten AP) shows ticked, by its MAC, so it can be unticked.
+ */
 export function ApChecklist({
   aps,
   value,
@@ -349,13 +352,17 @@ export function ApChecklist({
   onChange: (v: string[]) => void;
   disabled?: boolean;
 }) {
-  return aps.map((a) => (
+  const stray = value.filter((m) => !aps.some((a) => a.mac === m));
+  return [
+    ...aps.map((a) => ({ mac: a.mac, label: a.name ?? a.mac })),
+    ...stray.map((m) => ({ mac: m, label: `${m} (not a known AP)` })),
+  ].map((a) => (
     <Toggle
       key={a.mac}
       value={value.includes(a.mac)}
       onChange={(on) => onChange(toggled(value, a.mac, on))}
       disabled={disabled}
-      label={a.name ?? a.mac}
+      label={a.label}
     />
   ));
 }

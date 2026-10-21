@@ -143,18 +143,19 @@ function ClientPage({ mac }: { mac: string }) {
                 : `last seen ${ago(c.last_seen, now)}`
             }
           />
+          {/* A disconnected client's last signal and rate aren't current: "—", as the client list shows them. */}
           <Stat
             label="Signal"
-            value={<Signal dbm={s.signal} />}
-            sub={`noise ${dbm(s.noise)}`}
+            value={c.connected ? <Signal dbm={s.signal} /> : "—"}
+            sub={c.connected ? `noise ${dbm(s.noise)}` : ""}
           />
           <Stat
             label="Rate (down/up)"
-            value={rates(s)}
+            value={c.connected ? rates(s) : "—"}
             sub={s.wifi_gen ? wifiText(s) : ""}
           />
           <Stat
-            label="Session"
+            label={c.connected ? "Session" : "Last session"}
             value={duration(s.uptime)}
             sub={`${bytes(s.tx_bytes)} down · ${bytes(s.rx_bytes)} up · satisfaction ${s.satisfaction ?? "—"}`}
           />
@@ -408,11 +409,11 @@ function ClientMulticast({
           <div className="panel-head">
             <b>Groups joined</b>
             <span className="muted small">
-              {m.memberships.length === 0
-                ? "none"
-                : m.groups.length
-                  ? "delivered only to members"
-                  : "flooded to everyone"}
+              {m.delivery === "optimized"
+                ? "delivered only to members"
+                : m.delivery === "flooding"
+                  ? "flooded to everyone"
+                  : "none"}
             </span>
           </div>
           {m.memberships.length === 0 ? (

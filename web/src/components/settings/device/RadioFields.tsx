@@ -52,6 +52,14 @@ export const keepAllowed = (
     ? { ...f, channel: "auto" }
     : f;
 
+/** The channel widths (MHz) a band has, before the radio's own limit. */
+const WIDTHS = (radio: string): number[] =>
+  radio === "ng"
+    ? [20, 40]
+    : radio === "6e"
+      ? [20, 40, 80, 160, 240, 320]
+      : [20, 40, 80, 160];
+
 const POWER: Option<string>[] = [
   ["auto", "Auto"],
   ["high", "High"],
@@ -77,13 +85,10 @@ export function RadioFields({
   const set = <K extends keyof RadioForm>(k: K, v: RadioForm[K]) =>
     onChange({ ...form, [k]: v });
   const bind = binder(form, set);
-  const widths =
-    r.radio === "ng"
-      ? [20, 40]
-      : [20, 40, 80, ...(r.caps?.has_ht160 ? [160] : [])];
+  const widths = WIDTHS(r.radio).filter((w) => w <= r.caps.max_width);
   const legal = allowed(r, outdoor, form.ht);
-  const lo = r.caps?.min_txpower ?? 1;
-  const hi = r.caps?.max_txpower ?? 30;
+  const lo = r.caps.min_txpower;
+  const hi = r.caps.max_txpower;
   // Custom power starts at the most the radio can do (what High gives), so
   // the power shown is the one sent; with none, the AP would stay on auto.
   const setPowerMode = (m: string) =>

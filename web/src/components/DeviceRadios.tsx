@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { useSeries, useSiteActivity } from "../api";
+import { useRadioActivity, useSeries } from "../api";
 import type {
   ListedClientView,
   RadioSample,
@@ -220,7 +220,7 @@ export function RadioActivity({
   radio: string;
   range: TimeSpan;
 }) {
-  const a = useSiteActivity(range, radio, mac);
+  const a = useRadioActivity(range, radio, mac);
   return (
     <QueryState q={a} panel>
       {({ activity: x }) => (

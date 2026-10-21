@@ -89,6 +89,8 @@ export interface Multicast {
   groups: (McastCounts & { group_ip: string; dst_port: number | null; type: string | null })[];
   memberships: string[];
   services: ServiceCount[];
+  /** How the AP delivers the client's groups: "optimized" only to members, "flooding" to everyone; null when it joined none. */
+  delivery: "optimized" | "flooding" | null;
 }
 
 /** A client as an AP's page lists it: its latest sample (without the multicast tables), and when it was seen. */
@@ -244,7 +246,7 @@ export interface AppEvent {
   data: Record<string, unknown> | null;
 }
 
-/** One changed key of a config file: `old` on a removed or changed one, `new` on an added or changed one (secrets redacted, as in `diff`). */
+/** One changed key of a config file: `old` on a removed or changed one, `new` on an added or changed one (secrets redacted). */
 export interface CfgKeyChange {
   op: "+" | "-" | "~";
   key: string;
@@ -254,9 +256,9 @@ export interface CfgKeyChange {
 
 /** What a config push records for one config file (system_cfg or mgmt_cfg). */
 export interface CfgChange {
-  /** The changes as text, a line each: "+ key=value", "- key=value", "~ key: old -> new". */
+  /** Older pushes only (before `changes`): the changes as text, a line each: "+ key=value", "- key=value", "~ key: old -> new". */
   diff?: string;
-  /** The same changes, structured; missing from pushes recorded before it was added. */
+  /** The changes, structured; missing from older pushes, which have `diff` instead. */
   changes?: CfgKeyChange[];
   /** The first config seen for the AP: nothing to compare with. */
   baseline?: boolean;
@@ -323,7 +325,7 @@ export interface EventPayloads {
    */
   ap_crash: { process?: string | null; kind?: string | null; source?: string; lines?: string[]; summary?: string };
   /** The AP's notification. `exit_status`: its exit code as a number (left out when it sent none); events stored before may hold it as text. */
-  ap_process_restarted: { proc?: string | null; exit_status?: number; caller?: string | null; summary?: string };
+  ap_process_restarted: { proc?: string | null; exit_status?: number | string; caller?: string | null };
   ap_isolated: { heard_by?: Mac | null };
   ap_scan_done: object;
   /** Any other AP notification, as it came: `event_string` names it ("EVT_AP_…"). */
@@ -487,7 +489,8 @@ export const keys = {
   settingsState: family("settings-state"),
   dryrun: family("dryrun"),
   threats: family("threats"),
-  siteActivity: family<[span: TimeSpan, band: string, mac: Mac | undefined]>("site-activity"),
+  siteActivity: family<[span: TimeSpan, band: string]>("site-activity"),
+  radioActivity: family<[span: TimeSpan, band: string, mac: Mac]>("radio-activity"),
   siteTop: family<[span: TimeSpan, mac: Mac | undefined]>("site-top"),
   connectivity: family<[span: TimeSpan]>("connectivity"),
   retries: family<[span: TimeSpan]>("retries"),
@@ -803,8 +806,12 @@ function useSpanQuery<T, C extends unknown[] = []>(
   });
 }
 
-export const useSiteActivity = (span: TimeSpan, band: string, mac?: Mac) =>
-  useSpanQuery<SiteActivity, [string, Mac | undefined]>(keys.siteActivity, span, [band, mac], "/api/site/activity", { band: bandParam(band), mac });
+export const useSiteActivity = (span: TimeSpan, band: string) =>
+  useSpanQuery<SiteActivity, [string]>(keys.siteActivity, span, [band], "/api/site/activity", { band: bandParam(band) });
+
+/** One radio's client activity alone (`parts=activity`): the server skips the airtime, which its radio's own series chart. */
+export const useRadioActivity = (span: TimeSpan, band: string, mac: Mac) =>
+  useSpanQuery<Pick<SiteActivity, "bucket" | "activity">, [string, Mac]>(keys.radioActivity, span, [band, mac], "/api/site/activity", { band: bandParam(band), mac, parts: "activity" });
 
 export const useSiteTop = (span: TimeSpan, mac?: Mac) =>
   useSpanQuery<{ aps: TopEntry[]; clients: TopEntry[] }, [Mac | undefined]>(keys.siteTop, span, [mac], "/api/site/top", { mac });
@@ -1048,7 +1055,10 @@ export const useFirmware = () =>
     refetchInterval: (q) => (q.state.data?.jobs.current || q.state.data?.jobs.queue.length ? 5_000 : 60_000),
   });
 export const checkFirmware = () => send<{ platforms: number }>("POST", "/api/firmware/check", {});
-export const upgradeFirmware = (macs: Mac[]) => send<{ queued: number; skipped: { mac: Mac; why: string }[] }>("POST", "/api/firmware/upgrade", { macs });
+/** Why an AP asked for was not queued; one already queued or updating is neither queued nor skipped. */
+export type FirmwareSkip = "up_to_date" | "ahead" | "unknown" | "offline" | "not_found";
+export type FirmwareQueued = { queued: number; skipped: { mac: Mac; why: FirmwareSkip }[] };
+export const upgradeFirmware = (macs: Mac[]) => send<FirmwareQueued>("POST", "/api/firmware/upgrade", { macs });
 export const upgradeFirmwareUrl = (mac: Mac, url: string) => send<{ queued: number }>("POST", "/api/firmware/upgrade-url", { mac, url });
 export const cancelFirmware = () => send<{ cancelled: number }>("POST", "/api/firmware/cancel", {});
 export const resumeFirmware = () => send<{ resumed: boolean }>("POST", "/api/firmware/resume", {});
@@ -1123,18 +1133,26 @@ export const useClientNames = (): Names =>
 export const useClient = (mac: Mac) =>
   useQuery({ queryKey: keys.client(mac), queryFn: getting<ClientDetail>(`/api/clients/${mac}`) });
 
+/**
+ * When the live socket last reconnected or was told to resync: a list or live series cached before then
+ * is fetched whole, since what it missed was never announced (and a restored backup restarts the ids and
+ * no longer holds every sample cached).
+ */
+let liveResetAt = 0;
+
 /** `prev` with the samples of `add` (all newer) appended, and those before `from` dropped. */
 function appendSeries<F extends string>(prev: Series<F>, add: Series<F>, from: number): Series<F> {
   const keep = prev.ts.findIndex((t) => t >= from);
   const start = keep < 0 ? prev.ts.length : keep;
   const fields = {} as Series<F>["fields"];
-  for (const [f, values] of Object.entries(prev.fields) as [F, (number | null)[]][]) fields[f] = [...values.slice(start), ...(add.fields[f] ?? add.ts.map(() => null))];
+  for (const [f, values] of Object.entries(prev.fields) as [F, (number | null)[]][]) fields[f] = [...values.slice(start), ...add.fields[f]];
   return { ...prev, ts: [...prev.ts.slice(start), ...add.ts], fields };
 }
 
 /**
  * Time-series for one entity over a time span: only the columns `fields` names (the charts draw). A live chart of raw samples
- * (up to 6 hours) asks only for what is newer than its last sample.
+ * (up to 6 hours) asks only for what is newer than its last sample, unless it was cached before the live socket last reconnected
+ * or its last sample is later than the browser's now (a clock stepped back), when it is fetched whole.
  */
 export function useSeries<F extends string>(table: string, key: string, span: TimeSpan, fields: readonly F[]) {
   const qc = useQueryClient();
@@ -1145,9 +1163,10 @@ export function useSeries<F extends string>(table: string, key: string, span: Ti
     queryFn: async ({ signal }) => {
       const [from, to] = spanBounds(span);
       const url = (from: number) => `/api/series/${table}${qs({ key, fields: only, from, to })}`;
-      const prev = isFixed(span) ? undefined : qc.getQueryData<Series<F>>(queryKey);
+      const cached = isFixed(span) ? undefined : qc.getQueryState<Series<F>>(queryKey);
+      const prev = cached && cached.dataUpdatedAt > liveResetAt ? cached.data : undefined;
       const last = prev?.tier === "raw" ? prev.ts.at(-1) : undefined;
-      if (prev && last !== undefined && last >= from) {
+      if (prev && last !== undefined && last >= from && last <= to) {
         const add = await get<Series<F>>(url(last + 1), signal);
         if (add.tier === "raw") return appendSeries(prev, add, from);
       }
@@ -1162,12 +1181,6 @@ export function useSeries<F extends string>(table: string, key: string, span: Ti
 /** `limit`: how many of the newest to show, within the server's maximum (2000 events, 5000 log lines), or a refetch keeps more than a fresh fetch. */
 export type EventFilter = { device?: Mac; client?: Mac; kind?: string; limit: number };
 export type LogFilter = { device?: Mac; q?: string; limit: number };
-
-/**
- * When the live socket last reconnected or was told to resync: a list cached before then is
- * fetched whole, since what it missed was never announced (and a restored backup restarts the ids).
- */
-let liveResetAt = 0;
 
 /** `prev` with the rows of `add` (stored after them), newest first as the server sorts them, and only the `limit` newest. */
 function mergeNewest<T extends { id: number; ts: number }>(prev: T[], add: T[], limit: number): T[] {
@@ -1572,7 +1585,8 @@ export interface RadioSettings {
   loadbalance_enabled: boolean | null;
   maxsta: number | null;
   has_blocker: boolean;
-  caps: { min_txpower: number | null; max_txpower: number | null; has_ht160: boolean | null } | null;
+  /** What the radio can do, from its inform (1 to 30 dBm and 80 MHz without one): the ranges the server checks an edit against. */
+  caps: { min_txpower: number; max_txpower: number; max_width: number };
   /** Legal channels by width (MHz) in the site's country, indoors and in outdoor mode. */
   channels: Record<string, number[]>;
   channels_outdoor: Record<string, number[]>;
@@ -1653,6 +1667,8 @@ export interface SiteSettings {
     netconsole_host: string | null;
     netconsole_port: number | string | null;
   };
+  /** The port apctl's syslog listener is on, where "controller" mode sends the APs; null when it runs without one (--syslog-listen). */
+  syslog_port: number | null;
   snmp: { enabled: boolean | null; enabledV3: boolean | null; community: string | null; username: string | null; has_v3_password: boolean };
   ntp: { setting_preference: "auto" | "manual" | null; ntp_server_1: string | null; ntp_server_2: string | null; ntp_server_3: string | null; ntp_server_4: string | null };
   country: number | null;

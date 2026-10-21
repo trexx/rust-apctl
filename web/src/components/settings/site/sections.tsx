@@ -120,14 +120,25 @@ export function Ssh({
   );
 }
 
-export function Logging({ syslog }: { syslog: SettingsForm<SyslogForm> }) {
+export function Logging({
+  syslog,
+  d,
+}: {
+  syslog: SettingsForm<SyslogForm>;
+  d: SiteSettings;
+}) {
   const { form: f, bind } = syslog;
+  const port = d.syslog_port;
   return (
     <details>
       <summary>Logging</summary>
       <Row
         label="Syslog"
-        hint="to apctl needs its syslog listener (--syslog-listen on port 5514)"
+        hint={
+          port === null
+            ? "to apctl needs its syslog listener (--syslog-listen)"
+            : `to apctl: APs send to its listener on port ${port}`
+        }
       >
         <Select
           {...bind("mode")}
@@ -156,6 +167,12 @@ export function Logging({ syslog }: { syslog: SettingsForm<SyslogForm> }) {
         )}
         {f.mode !== "off" && <Toggle {...bind("debug")} label="Debug level" />}
       </Row>
+      {f.mode === "controller" && port === null && (
+        <div className="form-warn">
+          apctl runs without its syslog listener (--syslog-listen), so nothing
+          receives the logs the APs send it.
+        </div>
+      )}
       {f.mode === "server" && (
         <Row label="Netconsole" hint="kernel messages, for crash debugging">
           <Toggle {...bind("netconsole_enabled")} label="Enabled" />

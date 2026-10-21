@@ -131,10 +131,13 @@ function scaled(v: number, step: number, units: readonly string[]): string {
 /** A rate in bits per second. */
 export const rate = (bps: number) => scaled(bps, 1000, ["bps", "kbps", "Mbps", "Gbps"]);
 
+/** A Wi-Fi rate in kbps as Mbps, with its decimal below 100 Mbps, where rates such as 5.5 and 6.5 Mbps are distinct: "5.5 Mbps", "866 Mbps". */
+export const mbps = (kbps: number) => `${kbps >= 100_000 ? Math.round(kbps / 1000) : +(kbps / 1000).toFixed(1)} Mbps`;
+
 /** PHY rate reported in kbps. */
 export function phy(kbps: number | null | undefined): string {
   if (!kbps) return "—";
-  return kbps >= 1000 ? `${Math.round(kbps / 1000)} Mbps` : `${kbps} kbps`;
+  return kbps >= 1000 ? mbps(kbps) : `${kbps} kbps`;
 }
 
 /** A client's PHY rates, "down / up": the AP's transmit rate, then its receive rate. */

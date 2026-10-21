@@ -50,7 +50,7 @@ function SiteEditor({ d, onClose }: { d: SiteSettings; onClose: () => void }) {
       <CountryTimezone top={top} d={d} />
       <ApDefaults mgmt={mgmt} />
       <Ssh mgmt={mgmt} d={d} password={{ value: password, set: setPassword }} />
-      <Logging syslog={syslog} />
+      <Logging syslog={syslog} d={d} />
       <Snmp
         snmp={snmp}
         d={d}
