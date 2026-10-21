@@ -23,6 +23,8 @@ export function wlanForm(w: WlanSettings | null): WlanForm {
       bss_transition: true,
       no2ghz_oui: true,
       group_rekey: 0,
+      // Unset, client isolation follows Guest; a new SSID has it off.
+      l2_isolation: false,
     };
   const { id: _id, editable: _e, has_passphrase: _h, ...rest } = w;
   return rest;
