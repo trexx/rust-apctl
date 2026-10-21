@@ -13,9 +13,12 @@ import {
   useUserGroups,
 } from "../api";
 import type { Mac, Names } from "../api";
-import { speed } from "../format";
 import { Outcome, useRunner } from "./common";
-import { speedLimitOptions } from "./settings/speedLimitOptions";
+import { Select } from "./settings/form";
+import {
+  speedLimitLabel,
+  speedLimitOptions,
+} from "./settings/speedLimitOptions";
 
 /** Whether actions can be used: active mode, signed in. */
 function useCanAct(): { can: boolean; why: string | null } {
@@ -145,13 +148,12 @@ export function ClientActions({
   // A group the options leave out still shows what it does: the default one,
   // set for the client, is its own limit (none) over its SSID's; one missing
   // from the settings counts as none, so its SSID's applies.
-  const own = groups?.find((g) => g.id === usergroupId);
-  const strayLimit =
-    !groups || !usergroupId || (own && !own.default)
-      ? null
-      : own
-        ? `${own.name} (down ${speed(own.qos_rate_max_down)}, up ${speed(own.qos_rate_max_up)}), set for this client`
-        : "A limit no longer in the settings: its SSID's applies";
+  const strayLimit = (id: string) => {
+    const own = groups?.find((g) => g.id === id);
+    return own
+      ? `${speedLimitLabel(own)}, set for this client`
+      : "A limit no longer in the settings: its SSID's applies";
+  };
   if (!can && !why) return null;
   const off = !can || busy;
   return (
@@ -190,11 +192,11 @@ export function ClientActions({
         </button>
         <label className="small">
           Lock to AP{" "}
-          <select
+          <Select
             disabled={off}
             value={lockedTo ?? ""}
-            onChange={(e) => {
-              const ap = e.target.value || null;
+            onChange={(v) => {
+              const ap = v || null;
               void run(
                 () => lockClient(mac, ap),
                 ap
@@ -202,26 +204,18 @@ export function ClientActions({
                   : "Unlocked: it can use any AP.",
               );
             }}
-          >
-            <option value="">Any AP</option>
-            {lockedTo && !aps[lockedTo] && (
-              <option value={lockedTo}>{lockedTo} (not known)</option>
-            )}
-            {Object.entries(aps).map(([ap, apName]) => (
-              <option key={ap} value={ap}>
-                {apName}
-              </option>
-            ))}
-          </select>
+            stray={(v) => `${v} (not known)`}
+            options={[["", "Any AP"], ...Object.entries(aps)]}
+          />
         </label>
         {limits.length > 0 && (
           <label className="small">
             Speed limit{" "}
-            <select
+            <Select
               disabled={off}
               value={usergroupId ?? ""}
-              onChange={(e) => {
-                const g = e.target.value || null;
+              onChange={(v) => {
+                const g = v || null;
                 void run(
                   () => setClientSpeedLimit(mac, g),
                   g
@@ -229,13 +223,9 @@ export function ClientActions({
                     : "Its own limit is removed: the SSID's limit applies again.",
                 );
               }}
-            >
-              <option value="">Same as its SSID</option>
-              {strayLimit && usergroupId && (
-                <option value={usergroupId}>{strayLimit}</option>
-              )}
-              {limits}
-            </select>
+              stray={strayLimit}
+              options={[["", "Same as its SSID"], ...limits]}
+            />
           </label>
         )}
       </div>
