@@ -63,8 +63,8 @@ fn blocked_sta_lists_blocked_clients() {
     let Some(_) = common::fixtures() else { return };
     let mut state = state();
     assert_eq!(apcfg::blocked_sta(&state, "00000000000000000000001e"), "");
-    // The import does not export the `blocked` flag; the captured `blocked_sta` says
-    // which known client has it.
+    // The fixture snapshot predates the import keeping the `blocked` flag (acf5fe0); the
+    // captured `blocked_sta` says which known client has it.
     let client = state["clients"].as_array_mut().unwrap().iter_mut().find(|c| c["mac"] == "02:00:00:00:00:25").unwrap();
     client["blocked"] = serde_json::json!(true);
     let push = last_push(AP_B);
