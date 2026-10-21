@@ -342,8 +342,11 @@ export interface EventPayloads {
 
 export type EventKind = keyof EventPayloads;
 
-/** An event's payload as its kind's type: `eventData<"config_pushed">(e)`. */
+/** An event's payload, unchecked: for a caller that already picked the kind's handling by `e.kind` (as `EVENTS` does). */
 export const eventData = <K extends EventKind>(e: AppEvent) => (e.data ?? {}) as Partial<EventPayloads[K]>;
+
+/** An event's payload as `kind`'s type if the event is of that kind, else null: `payload(e, "config_pushed")`. */
+export const payload = <K extends EventKind>(e: AppEvent, kind: K): Partial<EventPayloads[K]> | null => (e.kind === kind ? eventData<K>(e) : null);
 
 export interface LogLine {
   id: number;

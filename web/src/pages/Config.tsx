@@ -1,8 +1,8 @@
 import { useState } from "react";
 import type { ReactNode } from "react";
 import { Link, useSearchParams } from "react-router";
-import { eventData, useDeviceNames, useEvents } from "../api";
-import type { AppEvent } from "../api";
+import { payload, useDeviceNames, useEvents } from "../api";
+import type { ConfigPushed } from "../api";
 import { DryRun } from "./DryRun";
 import { FirmwarePanel } from "../components/Firmware";
 import {
@@ -16,16 +16,25 @@ import {
 import { clock, useNow } from "../format";
 import { ChangeGroups, pushText, summarise } from "../components/ConfigDiff";
 
-function Push({ e, ap, now }: { e: AppEvent; ap: ReactNode; now: number }) {
+function Push({
+  ts,
+  d,
+  ap,
+  now,
+}: {
+  ts: number;
+  d: ConfigPushed;
+  ap: ReactNode;
+  now: number;
+}) {
   const [open, setOpen] = useState(false);
-  const d = eventData<"config_pushed">(e);
   const sum = summarise(d);
   const { changes, groups } = sum;
   const summary = pushText(d, sum);
   return (
     <div className="cfg-entry">
       <div className="cfg-head">
-        <span className="muted small nowrap">{clock(e.ts, now)}</span>
+        <span className="muted small nowrap">{clock(ts, now)}</span>
         <b>Config sent</b>
         <span>to {ap}</span>
         <span className="muted small cfg-summary">{summary}</span>
@@ -76,9 +85,16 @@ function History() {
           ) : (
             <div className={ev.isPlaceholderData ? "dim" : undefined}>
               {events.map((e) => {
-                if (e.kind === "config_pushed")
+                const pushed = payload(e, "config_pushed");
+                if (pushed)
                   return (
-                    <Push key={e.id} e={e} ap={ap(e.device_mac)} now={now} />
+                    <Push
+                      key={e.id}
+                      ts={e.ts}
+                      d={pushed}
+                      ap={ap(e.device_mac)}
+                      now={now}
+                    />
                   );
                 const { label, detail } = eventText(e, names);
                 return (

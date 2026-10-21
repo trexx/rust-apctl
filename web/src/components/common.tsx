@@ -3,7 +3,7 @@ import type { InputHTMLAttributes, ReactNode, RefObject } from "react";
 import { Link, useSearchParams } from "react-router";
 import { useQueryClient } from "@tanstack/react-query";
 import type { QueryKey } from "@tanstack/react-query";
-import { eventData, useDeviceNames } from "../api";
+import { eventData, payload, useDeviceNames } from "../api";
 import { ChangeGroups, pushText, summarise } from "./ConfigDiff";
 import type {
   AppEvent,
@@ -788,24 +788,22 @@ const EventRow = memo(
     const spec = eventSpec(e.kind);
     const d = eventData(e);
     const tone = typeof spec.tone === "function" ? spec.tone(d) : spec.tone;
-    const threat = eventData<"network_threat">(e);
+    const threat = payload(e, "network_threat");
+    const pushed = payload(e, "config_pushed");
     // A push's diffs are parsed once, for its detail line and its changes.
-    const push =
-      e.kind === "config_pushed"
-        ? summarise(eventData<"config_pushed">(e))
-        : null;
-    const detail = push
-      ? pushText(eventData<"config_pushed">(e), push)
-      : spec.describe?.(d, names, e.ts);
-    const crash =
-      e.kind === "ap_crash" ? (eventData<"ap_crash">(e).lines ?? []) : [];
+    const push = pushed ? summarise(pushed) : null;
+    const detail =
+      pushed && push
+        ? pushText(pushed, push)
+        : spec.describe?.(d, names, e.ts);
+    const crash = payload(e, "ap_crash")?.lines ?? [];
     return (
       <li className={`event event-${tone}`}>
         <span className="event-time">{clock(e.ts, now)}</span>
         <span className="event-kind">{spec.label}</span>
         <span className="event-what">
           <span className="event-subject">
-            {e.kind === "network_threat" && (
+            {threat && (
               <>
                 {threat.essid ? `"${threat.essid}"` : "Hidden network"}
                 <span className="muted"> heard by </span>
