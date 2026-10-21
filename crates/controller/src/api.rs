@@ -441,9 +441,19 @@ fn stored_view(mac: Mac, k: &KnownDevice) -> DeviceView {
     }
 }
 
-/// An AP's row in the device list, with `clients` connected to it; `locating`
-/// is none for an AP known from the database only (`stored_view`).
-fn device_row(mac: Mac, d: &DeviceView, clients: usize, locating: Option<bool>) -> DeviceRow {
+/// Where a device row comes from: an AP reporting in this run, with whether it
+/// is blinking to be found, or one known from the database only (`stored_view`).
+enum RowSource {
+    Live { locating: bool },
+    Stored,
+}
+
+/// An AP's row in the device list, with `clients` connected to it.
+fn device_row(mac: Mac, d: &DeviceView, clients: usize, source: RowSource) -> DeviceRow {
+    let (locating, stored_only) = match source {
+        RowSource::Live { locating } => (Some(locating), false),
+        RowSource::Stored => (None, true),
+    };
     let a = &d.snapshot.ap;
     DeviceRow {
         mac, name: a.hostname.clone(), model: a.model.clone(), model_display: a.model_display.clone(), version: a.version.clone(), ip: a.ip.clone(),
@@ -453,7 +463,7 @@ fn device_row(mac: Mac, d: &DeviceView, clients: usize, locating: Option<bool>) 
         radios: d.snapshot.radios.iter().map(|r| RadioRow {
             radio: r.radio.clone(), channel: r.channel, bw: r.bw, tx_power: r.tx_power, cu_total: r.cu_total, noise_floor: r.noise_floor, clients: r.num_sta,
         }).collect(),
-        last_config_push: d.last_config_push, locating, stored_only: locating.is_none(),
+        last_config_push: d.last_config_push, locating, stored_only,
     }
 }
 
@@ -513,9 +523,9 @@ async fn devices(State(s): State<AppState>) -> Json<Vec<DeviceRow>> {
             *per_ap.entry(c.sample.ap_mac).or_default() += 1;
         }
         let mut list: Vec<DeviceRow> =
-            live.devices.iter().map(|(mac, d)| device_row(*mac, d, per_ap.get(mac).copied().unwrap_or(0), Some(live.locating.contains(mac)))).collect();
+            live.devices.iter().map(|(mac, d)| device_row(*mac, d, per_ap.get(mac).copied().unwrap_or(0), RowSource::Live { locating: live.locating.contains(mac) })).collect();
         // Then the APs not reporting since apctl started, by MAC as the others.
-        let mut stored: Vec<DeviceRow> = stored_only(&live).map(|(mac, k)| device_row(*mac, &stored_view(*mac, k), 0, None)).collect();
+        let mut stored: Vec<DeviceRow> = stored_only(&live).map(|(mac, k)| device_row(*mac, &stored_view(*mac, k), 0, RowSource::Stored)).collect();
         stored.sort_unstable_by_key(|d| d.mac);
         list.append(&mut stored);
         list
