@@ -937,7 +937,6 @@ struct Neighbor<'a> {
     best_signal: Option<i64>,
     is_unifi: bool,
     ap_name: Option<String>,
-    model: Option<String>,
     first_seen: Ts,
     last_seen: Ts,
     /// The name of the AP that hears it best.
@@ -980,15 +979,15 @@ pub async fn neighbors(State(s): State<AppState>, Query(q): Query<NeighborQuery>
             cond.push_str(&format!(" AND bssid IN (SELECT value FROM json_each(?{}))", params.len()));
         }
         let sql = format!(
-            "SELECT bssid, ap_mac, radio, essid, channel, bw, center_freq, security, signal, best_signal, is_unifi, ap_name, model, first_seen, last_seen FROM neighbors WHERE {cond}"
+            "SELECT bssid, ap_mac, radio, essid, channel, bw, center_freq, security, signal, best_signal, is_unifi, ap_name, first_seen, last_seen FROM neighbors WHERE {cond}"
         );
         let mut stmt = c.prepare_cached(&sql)?;
         let rows = stmt
             .query_map(params_from_iter(params), |r| {
                 Ok(Neighbor {
                     bssid: r.get(0)?, ap_mac: r.get(1)?, radio: r.get(2)?, essid: r.get(3)?, channel: r.get(4)?, bw: r.get(5)?, center_freq: r.get(6)?,
-                    security: r.get(7)?, signal: r.get(8)?, best_signal: r.get(9)?, is_unifi: r.get::<_, i64>(10)? != 0, ap_name: r.get(11)?, model: r.get(12)?,
-                    first_seen: r.get(13)?, last_seen: r.get(14)?, nearest_ap: None, vendor: None,
+                    security: r.get(7)?, signal: r.get(8)?, best_signal: r.get(9)?, is_unifi: r.get::<_, i64>(10)? != 0, ap_name: r.get(11)?,
+                    first_seen: r.get(12)?, last_seen: r.get(13)?, nearest_ap: None, vendor: None,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
