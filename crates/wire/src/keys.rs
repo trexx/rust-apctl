@@ -5,7 +5,7 @@
 
 use std::collections::HashMap;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow};
 use inform::{Mac, parse_key};
 use serde_json::Value;
 
@@ -26,8 +26,9 @@ impl KeyStore {
     }
 
     /// The keys in a MAC->key map or an import snapshot. An entry that cannot be read
-    /// (a malformed MAC or key) is left out and listed in [`skipped`](Self::skipped):
-    /// one bad device does not cost the keys of the others.
+    /// (a malformed MAC, or a key that is malformed or not a string) is left out and
+    /// listed in [`skipped`](Self::skipped): one bad device does not cost the keys of
+    /// the others. A device without a key (waiting for adoption) is not listed.
     pub fn from_value(json: &Value) -> Self {
         let mut store = KeyStore::default();
         let mut skipped = Vec::new();
@@ -38,17 +39,23 @@ impl KeyStore {
         };
         if let Some(devices) = json.get("devices").and_then(Value::as_array) {
             for d in devices {
-                if let (Some(mac), Some(key)) = (d["mac"].as_str(), d["x_authkey"].as_str()) {
-                    add("an authkey", store.insert(mac, key));
+                let Some(mac) = d["mac"].as_str() else { continue };
+                match &d["x_authkey"] {
+                    Value::Null => {}
+                    Value::String(key) => add("an authkey", store.insert(mac, key)),
+                    other => add("an authkey", Err(anyhow!("key for {mac} is not a string: {}", kind(other)))),
                 }
-                if let (Some(mac), Some(key)) = (d["mac"].as_str(), d["syslog_key"].as_str()) {
-                    add("a syslog key", store.insert_syslog(mac, key));
+                match &d["syslog_key"] {
+                    Value::Null => {}
+                    Value::String(key) => add("a syslog key", store.insert_syslog(mac, key)),
+                    other => add("a syslog key", Err(anyhow!("syslog key for {mac} is not a string: {}", kind(other)))),
                 }
             }
         } else if let Some(map) = json.as_object() {
             for (mac, key) in map {
-                if let Some(key) = key.as_str() {
-                    add("an authkey", store.insert(mac, key));
+                match key.as_str() {
+                    Some(key) => add("an authkey", store.insert(mac, key)),
+                    None => add("an authkey", Err(anyhow!("key for {mac} is not a string: {}", kind(key)))),
                 }
             }
         }
@@ -98,6 +105,18 @@ impl KeyStore {
     }
 }
 
+/// What a JSON value is, for an error message (not the value: it may be a key).
+fn kind(v: &Value) -> &'static str {
+    match v {
+        Value::Null => "null",
+        Value::Bool(_) => "a boolean",
+        Value::Number(_) => "a number",
+        Value::String(_) => "a string",
+        Value::Array(_) => "an array",
+        Value::Object(_) => "an object",
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -113,7 +132,11 @@ mod tests {
         ]});
         let keys = KeyStore::from_value(&snapshot);
         assert_eq!((keys.len(), keys.syslog_len(), keys.skipped().len()), (1, 1, 3));
-        let keys = KeyStore::from_value(&json!({ "00:11:22:33:44:55": good, "00:11:22:33:44:66": 7 }));
-        assert_eq!(keys.len(), 1);
+        let keys = KeyStore::from_value(&json!({ "00:11:22:33:44:55": good, "00:11:22:33:44:66": 7, "00:11:22:33:44:77": null }));
+        assert_eq!((keys.len(), keys.skipped().len()), (1, 2), "{:?}", keys.skipped());
+        assert!(keys.skipped()[0].contains("00:11:22:33:44:66 is not a string: a number"), "{:?}", keys.skipped());
+        // A device waiting for adoption has no key: nothing to report.
+        let keys = KeyStore::from_value(&json!({ "devices": [{ "mac": "00:11:22:33:44:55" }, { "mac": "00:11:22:33:44:66", "x_authkey": 7, "syslog_key": [] }] }));
+        assert_eq!(keys.skipped().len(), 2, "{:?}", keys.skipped());
     }
 }
