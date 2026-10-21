@@ -556,9 +556,10 @@ pub fn gather(store: &Store, state: &ThreatState, live: &SharedLive, now: Ts) ->
             }
         }
         if let Some(state) = &live.state {
-            // This site's networks only: an import may hold other sites' too.
+            // This site's networks only: an import may hold other sites' too. Enabled
+            // ones (as the render reads it: a text "false" is off too).
             for w in crate::settings::docs(state, "wlanconf") {
-                if w["enabled"].as_bool() != Some(false)
+                if apcfg::flag(w, "enabled", true)
                     && let Some(n) = w["name"].as_str()
                 {
                     a.ssids.insert(n.to_string());
@@ -1339,7 +1340,7 @@ mod tests {
         let (live, state): (SharedLive, ThreatState) = Default::default();
         live.write().unwrap().state = Some(Arc::new(json!({
             "devices": [{ "mac": UP, "site_id": "s1" }],
-            "wlanconf": [{ "name": "Home", "site_id": "s1" }, { "name": "Shared" }, { "name": "Office", "site_id": "s2" }, { "name": "Off", "site_id": "s1", "enabled": false }],
+            "wlanconf": [{ "name": "Home", "site_id": "s1" }, { "name": "Shared" }, { "name": "Office", "site_id": "s2" }, { "name": "Off", "site_id": "s1", "enabled": false }, { "name": "Off too", "site_id": "s1", "enabled": "false" }],
         })));
         let a = gather(&store, &state, &live, 1_000_000).unwrap();
         let mut ssids: Vec<&str> = a.ssids.iter().map(String::as_str).collect();
