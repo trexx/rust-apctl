@@ -485,9 +485,9 @@ export const keys = {
   multicast: family<[span: TimeSpan, mac: Mac | undefined]>("multicast"),
   backups: family("backups"),
   firmware: family("firmware"),
-  rfRadios: family<[range: number]>("rf-radios"),
-  rfNeighbors: family<[range: number, band: string]>("rf-neighbors"),
-  rfLinks: family<[range: number]>("rf-links"),
+  rfRadios: family<[span: TimeSpan]>("rf-radios"),
+  rfNeighbors: family<[span: TimeSpan, band: string]>("rf-neighbors"),
+  rfLinks: family<[span: TimeSpan]>("rf-links"),
   rfPlan: family<[band: string, dfs: boolean]>("rf-plan"),
   channelAi: family("channel-ai"),
   adoption: family("adoption"),
@@ -763,16 +763,24 @@ const refreshFor = (s: TimeSpan, live: number) => (settled(s) ? false : live);
 /** A settled window's data stays fresh, so a focus or remount doesn't fetch it again; others keep the default staleness. */
 const freshFor = (s: TimeSpan) => (settled(s) ? { staleTime: Infinity } : {});
 
-/** Whether two keys of a span family differ in the span alone (the family's first argument, as in every one of `keys`). */
+/** Whether two keys `useSpanQuery` built differ in the span alone (it puts the span first, after the family's name). */
 const onlySpanDiffers = (a: QueryKey, b: QueryKey) => hashKey([a[0], ...a.slice(2)]) === hashKey([b[0], ...b.slice(2)]);
 
 /**
- * A query over a time span: refreshes while the span is live, and keeps the old data on screen (`isPlaceholderData`) while
- * another span loads. Another choice (a band, an AP) shows as loading instead, unless `keepAcrossChoices`, for a caller that
- * dims the old data while it shows it. The server keeps a view's answer for a window longer than 8 days for 5 minutes, so such
- * a window is asked again only that often, unless the view is `unmemoised`.
+ * A query over a time span, keyed `family(span, ...choices)`: refreshes while the span is live, and keeps the old data on screen
+ * (`isPlaceholderData`) while another span loads. Another choice (a band, an AP) shows as loading instead, unless `keepAcrossChoices`,
+ * for a caller that dims the old data while it shows it. The server keeps a view's answer for a window longer than 8 days for 5 minutes,
+ * so such a window is asked again only that often, unless the view is `unmemoised`. `C`: the family's choices, after the span.
  */
-function useSpanQuery<T>(key: QueryKey, path: string, span: TimeSpan, extra: Record<string, string | number | undefined> = {}, opts: { keepAcrossChoices?: boolean; unmemoised?: boolean } = {}) {
+function useSpanQuery<T, C extends unknown[] = []>(
+  family: (span: TimeSpan, ...choices: C) => QueryKey,
+  span: TimeSpan,
+  choices: C,
+  path: string,
+  extra: Record<string, string | number | undefined> = {},
+  opts: { keepAcrossChoices?: boolean; unmemoised?: boolean } = {},
+) {
+  const key = family(span, ...choices);
   return useQuery<T>({
     queryKey: key,
     queryFn: getting<T>(`${path}${qs({ ...spanParams(span), ...extra })}`),
@@ -783,16 +791,16 @@ function useSpanQuery<T>(key: QueryKey, path: string, span: TimeSpan, extra: Rec
 }
 
 export const useSiteActivity = (span: TimeSpan, band: string, mac?: Mac) =>
-  useSpanQuery<SiteActivity>(keys.siteActivity(span, band, mac), "/api/site/activity", span, { band: bandParam(band), mac });
+  useSpanQuery<SiteActivity, [string, Mac | undefined]>(keys.siteActivity, span, [band, mac], "/api/site/activity", { band: bandParam(band), mac });
 
 export const useSiteTop = (span: TimeSpan, mac?: Mac) =>
-  useSpanQuery<{ aps: TopEntry[]; clients: TopEntry[] }>(keys.siteTop(span, mac), "/api/site/top", span, { mac });
+  useSpanQuery<{ aps: TopEntry[]; clients: TopEntry[] }, [Mac | undefined]>(keys.siteTop, span, [mac], "/api/site/top", { mac });
 
-export const useConnectivity = (span: TimeSpan) => useSpanQuery<{ bands: Record<string, Connectivity> }>(keys.connectivity(span), "/api/site/connectivity", span);
+export const useConnectivity = (span: TimeSpan) => useSpanQuery<{ bands: Record<string, Connectivity> }>(keys.connectivity, span, [], "/api/site/connectivity");
 
-export const useRetries = (span: TimeSpan) => useSpanQuery<RadioRetries[]>(keys.retries(span), "/api/site/retries", span);
+export const useRetries = (span: TimeSpan) => useSpanQuery<RadioRetries[]>(keys.retries, span, [], "/api/site/retries");
 
-export const useDensity = (span: TimeSpan) => useSpanQuery<{ aps: DensityAp[] }>(keys.density(span), "/api/site/density", span);
+export const useDensity = (span: TimeSpan) => useSpanQuery<{ aps: DensityAp[] }>(keys.density, span, [], "/api/site/density");
 
 /** Milliseconds each stage of joining took. */
 export interface Timings {
@@ -910,17 +918,18 @@ export type Connections = { attempts: ConnAttempt[]; roams: Roam[]; ap_names: Re
  * The old list stays on screen while another `opts` loads too (the attempt list dims it).
  */
 export const useConnections = (span: TimeSpan, opts: { client?: Mac; failed?: boolean; limit?: number; roams?: boolean } = {}) =>
-  useSpanQuery<Connections>(
-    keys.connections(span, opts),
-    "/api/connections",
+  useSpanQuery<Connections, [object]>(
+    keys.connections,
     span,
+    [opts],
+    "/api/connections",
     { client: opts.client, failed: opts.failed ? "true" : undefined, limit: opts.limit, roams: opts.roams === false ? "false" : undefined },
     { keepAcrossChoices: true, unmemoised: true },
   );
 
-export const useRoaming = (span: TimeSpan) => useSpanQuery<Roaming>(keys.roaming(span), "/api/roaming", span);
+export const useRoaming = (span: TimeSpan) => useSpanQuery<Roaming>(keys.roaming, span, [], "/api/roaming");
 
-export const useWlans = (span: TimeSpan) => useSpanQuery<{ bucket: number; wlans: Wlan[] }>(keys.wlans(span), "/api/wlans", span);
+export const useWlans = (span: TimeSpan) => useSpanQuery<{ bucket: number; wlans: Wlan[] }>(keys.wlans, span, [], "/api/wlans");
 
 export interface BackupSettings {
   enabled: boolean;
@@ -1029,16 +1038,16 @@ export const upgradeFirmwareUrl = (mac: Mac, url: string) => send<{ queued: numb
 export const cancelFirmware = () => send<{ cancelled: number }>("POST", "/api/firmware/cancel", {});
 export const resumeFirmware = () => send<{ resumed: boolean }>("POST", "/api/firmware/resume", {});
 
-export const useMulticast = (span: TimeSpan, mac?: Mac) => useSpanQuery<SiteMulticast>(keys.multicast(span, mac), "/api/site/multicast", span, { mac });
+export const useMulticast = (span: TimeSpan, mac?: Mac) => useSpanQuery<SiteMulticast, [Mac | undefined]>(keys.multicast, span, [mac], "/api/site/multicast", { mac });
 
 // The RF views cover the last `range` seconds.
-export const useRadios = (range: number) => useSpanQuery<RadioOverview[]>(keys.rfRadios(range), "/api/rf/radios", { last: range });
+export const useRadios = (range: number) => useSpanQuery<RadioOverview[]>(keys.rfRadios, { last: range }, [], "/api/rf/radios");
 
 export const useNeighbors = (range: number, band: string) =>
-  useSpanQuery<{ neighbors: Neighbor[] }>(keys.rfNeighbors(range, band), "/api/rf/neighbors", { last: range }, { band: bandParam(band), neighbors_only: "true" }, { unmemoised: true });
+  useSpanQuery<{ neighbors: Neighbor[] }, [string]>(keys.rfNeighbors, { last: range }, [band], "/api/rf/neighbors", { band: bandParam(band), neighbors_only: "true" }, { unmemoised: true });
 
 /** Only how loudly our APs hear each other (no neighbour list). */
-export const useOwnLinks = (range: number) => useSpanQuery<{ own_links: OwnLink[] }>(keys.rfLinks(range), "/api/rf/neighbors", { last: range }, { links_only: "true" }, { unmemoised: true });
+export const useOwnLinks = (range: number) => useSpanQuery<{ own_links: OwnLink[] }>(keys.rfLinks, { last: range }, [], "/api/rf/neighbors", { links_only: "true" }, { unmemoised: true });
 
 /** `enabled` false waits, for a caller that doesn't know `dfs` yet. */
 export const useChannelPlan = (band: string, dfs: boolean, enabled = true) =>
