@@ -1572,7 +1572,8 @@ export interface RadioSettings {
   loadbalance_enabled: boolean | null;
   maxsta: number | null;
   has_blocker: boolean;
-  caps: { min_txpower: number | null; max_txpower: number | null; has_ht160: boolean | null } | null;
+  /** What the radio can do, from its inform (1 to 30 dBm and 80 MHz without one): the ranges the server checks an edit against. */
+  caps: { min_txpower: number; max_txpower: number; max_width: number };
   /** Legal channels by width (MHz) in the site's country, indoors and in outdoor mode. */
   channels: Record<string, number[]>;
   channels_outdoor: Record<string, number[]>;
