@@ -29,7 +29,7 @@ use serde_json::{Value, json};
 use crate::api::{ApiError, AppState, Json, Query};
 use crate::engine::Live;
 use crate::api::read;
-use crate::series::{RangeQuery, ap_name, ap_name_of, client_name, memo_read, window};
+use crate::series::{RangeQuery, ap_name, client_name, memo_read, window};
 use crate::model::Ts;
 use crate::store::Db;
 
@@ -646,11 +646,10 @@ fn newest(c: &rusqlite::Connection, from: Ts, to: Ts, client: Option<&str>, limi
     Ok((list, r))
 }
 
-/// Clients apctl knows, by MAC, with their display names if they have one,
-/// and (only once `add_live_aps` has put them in) every AP's.
+/// Clients apctl has stored, by MAC, with their stored names if they have one.
+/// The APs' names are in the live view (see `series::ap_name_of`).
 #[derive(Debug, Default, Clone)]
 pub struct Names {
-    pub aps: HashMap<String, Option<String>>,
     pub clients: HashMap<String, Option<String>>,
 }
 
@@ -663,15 +662,14 @@ fn pairs<P: rusqlite::Params>(c: &rusqlite::Connection, sql: &str, params: P) ->
 const CLIENT_NAMES: &str = "SELECT mac, hostname FROM clients WHERE mac IN (SELECT value FROM json_each(?1))";
 
 impl Names {
-    /// From the database: clients' hostnames. The APs' are in the live view
-    /// (`Live::known_devices` holds the stored ones).
+    /// From the database: clients' hostnames.
     pub fn load(c: &rusqlite::Connection) -> rusqlite::Result<Names> {
-        Ok(Names { aps: HashMap::new(), clients: pairs(c, "SELECT mac, hostname FROM clients", [])? })
+        Ok(Names { clients: pairs(c, "SELECT mac, hostname FROM clients", [])? })
     }
 
     /// The same for some clients only.
     fn load_for(c: &rusqlite::Connection, clients: &BTreeSet<&str>) -> anyhow::Result<Names> {
-        Ok(Names { aps: HashMap::new(), clients: pairs(c, CLIENT_NAMES, [serde_json::to_string(clients)?])? })
+        Ok(Names { clients: pairs(c, CLIENT_NAMES, [serde_json::to_string(clients)?])? })
     }
 
     /// A client's display name: its alias, else what it reports now, else what was stored.
@@ -679,14 +677,6 @@ impl Names {
         client_name(live, mac.parse().ok()).map(str::to_string).or_else(|| self.clients.get(mac).cloned().flatten())
     }
 
-    /// The names of every AP `live` knows (see `series::ap_name_of`), on top.
-    pub fn add_live_aps(&mut self, live: &Live) {
-        for mac in live.devices.keys().chain(live.known_devices.keys()) {
-            let m = mac.to_string();
-            let name = ap_name_of(live, mac).or_else(|| self.aps.remove(&m).flatten());
-            self.aps.insert(m, name);
-        }
-    }
 }
 
 /// Display names of these APs and clients, for the ones that have one.
