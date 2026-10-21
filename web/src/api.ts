@@ -1512,7 +1512,8 @@ export interface WlanSettings extends WlanFields {
 export interface WlanSettingsList {
   active: boolean;
   wlans: WlanSettings[];
-  networks: { id: string; name: string; vlan: number | null; purpose: string | null }[];
+  /** `for_ssid`: an SSID may be put on it (a LAN network, not the inter-VLAN routing one), as the server checks it. */
+  networks: { id: string; name: string; vlan: number | null; purpose: string | null; for_ssid: boolean }[];
   aps: { mac: Mac; name: string | null }[];
   /** For each optional SSID feature, the APs that would broadcast without it. */
   unsupported: Record<string, Mac[]>;
