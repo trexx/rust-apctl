@@ -143,18 +143,19 @@ function ClientPage({ mac }: { mac: string }) {
                 : `last seen ${ago(c.last_seen, now)}`
             }
           />
+          {/* A disconnected client's last signal and rate aren't current: "—", as the client list shows them. */}
           <Stat
             label="Signal"
-            value={<Signal dbm={s.signal} />}
-            sub={`noise ${dbm(s.noise)}`}
+            value={c.connected ? <Signal dbm={s.signal} /> : "—"}
+            sub={c.connected ? `noise ${dbm(s.noise)}` : ""}
           />
           <Stat
             label="Rate (down/up)"
-            value={rates(s)}
+            value={c.connected ? rates(s) : "—"}
             sub={s.wifi_gen ? wifiText(s) : ""}
           />
           <Stat
-            label="Session"
+            label={c.connected ? "Session" : "Last session"}
             value={duration(s.uptime)}
             sub={`${bytes(s.tx_bytes)} down · ${bytes(s.rx_bytes)} up · satisfaction ${s.satisfaction ?? "—"}`}
           />
