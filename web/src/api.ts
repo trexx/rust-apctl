@@ -305,9 +305,13 @@ export interface EventPayloads {
   client_wrong_password: { vap?: string | null };
   client_steered: { signal?: number | null; result?: string | null; candidates?: { bssid: string; channel: number | null }[] };
   client_experience: { anomalies?: string[]; satisfaction?: number | null; signal?: number | null };
-  /** `lines`: from the fault on (`source` "syslog"), or the last 200 lines of the AP's crash store ("crashlog", "recovery"). */
-  ap_crash: { process?: string | null; kind?: string | null; source?: string; lines?: string[] };
-  ap_process_restarted: { proc?: string | null; exit_status?: number | null; caller?: string | null };
+  /**
+   * `lines`: from the fault on (`source` "syslog"), or the last 200 lines of the AP's crash store ("crashlog", "recovery").
+   * `summary`: the first fault line, else the first line (absent without lines, and in events stored before it was added).
+   */
+  ap_crash: { process?: string | null; kind?: string | null; source?: string; lines?: string[]; summary?: string };
+  /** The AP's notification. `exit_status`: its exit code as a number (left out when it sent none); events stored before may hold it as text. */
+  ap_process_restarted: { proc?: string | null; exit_status?: number; caller?: string | null; summary?: string };
   ap_isolated: { heard_by?: Mac | null };
   ap_scan_done: object;
   /** Any other AP notification, as it came: `event_string` names it ("EVT_AP_…"). */

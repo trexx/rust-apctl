@@ -410,9 +410,25 @@ const radioLevels = (l: EventPayloads["radio_changed"]["from"]) =>
 const FAULT =
   /(?<!end )Kernel panic|Oops[:[]|Internal error:|sending SIGSEGV to |unhandled level 2 translation fault/;
 
-/** A crash's summary line: its first fault, else its first line (a crash store's tail may start anywhere). */
+/**
+ * A crash's summary line, for events stored before the server recorded
+ * `summary`: its first fault, else its first line (a crash store's tail may
+ * start anywhere).
+ */
 const crashLine = (lines: string[] = []) =>
   lines.find((l) => FAULT.test(l)) ?? lines[0];
+
+/**
+ * A process's exit code as text: the number the server stores, or, in events
+ * stored before it did, the AP's own field if it is a number sent as text;
+ * null when there is none.
+ */
+const exitCode = (c: unknown) =>
+  typeof c === "number"
+    ? String(c)
+    : typeof c === "string" && /^[+-]?\d+$/.test(c.trim())
+      ? c.trim()
+      : null;
 
 /** Every event kind: its label, colour and detail line. */
 const EVENTS: { [K in EventKind]: EventSpec<K> } = {
@@ -571,21 +587,16 @@ const EVENTS: { [K in EventKind]: EventSpec<K> } = {
     label: "AP crash",
     tone: "bad",
     describe: (d) =>
-      parts(d.process ? `${d.process}: ${d.kind}` : d.kind, crashLine(d.lines)),
+      parts(
+        d.process ? `${d.process}: ${d.kind}` : d.kind,
+        d.summary ?? crashLine(d.lines),
+      ),
   },
   ap_process_restarted: {
     label: "Process restarted",
     tone: "warn",
     describe: (d) => {
-      // As the alert says it: a code sent as text is still a code, and a
-      // missing one is left out.
-      const c: unknown = d.exit_status;
-      const code =
-        typeof c === "number"
-          ? String(c)
-          : typeof c === "string" && /^[+-]?\d+$/.test(c.trim())
-            ? c.trim()
-            : null;
+      const code = exitCode(d.exit_status);
       return `${d.proc ?? "a process"} exited${code !== null ? ` with code ${code}` : ""} and was restarted by ${d.caller ?? "the system"}`;
     },
   },
