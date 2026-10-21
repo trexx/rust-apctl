@@ -488,7 +488,7 @@ pub struct Engine {
     bss_prev: HashMap<String, (Ts, Arc<ClientSample>)>,
     /// Events found in syslog lines.
     logevents: crate::logevents::LogEvents,
-    /// When each AP was last reported isolated.
+    /// When the beacon each AP was last reported isolated for was heard.
     isolated: HashMap<Mac, Ts>,
     /// When long-gone clients were last dropped from the live view.
     last_prune: Ts,
@@ -1505,10 +1505,14 @@ impl Engine {
     }
 
     /// Another AP's beacon flagged "isolated" (lost its uplink) that belongs to one
-    /// of our APs: reported at most once an hour per AP.
+    /// of our APs: reported at most once an hour per AP. An entry the AP keeps from
+    /// a scan before this run, or from one before the last report, is no news.
     fn check_isolated(&mut self, ts: Ts, heard_by: Mac, neighbors: &[crate::model::NeighborSample]) {
         use crate::model::{hardware_num, same_hardware};
-        let flagged: Vec<&crate::model::NeighborSample> = neighbors.iter().filter(|n| n.is_isolated).collect();
+        let started = self.first_tick.unwrap_or(ts);
+        // When the scan heard it (as in write_metrics, which takes the age later).
+        let heard = |n: &crate::model::NeighborSample| ts - n.age.unwrap_or(0).clamp(0, ts.max(0));
+        let flagged: Vec<&crate::model::NeighborSample> = neighbors.iter().filter(|n| n.is_isolated && heard(n) >= started).collect();
         if flagged.is_empty() {
             return;
         }
@@ -1522,10 +1526,11 @@ impl Engine {
             let Ok(b) = n.bssid.parse::<Mac>().map(|m| hardware_num(&m)) else { continue };
             // The nearest of our APs that is likely the same hardware.
             let Some((ap, _)) = ours.iter().filter(|(_, x)| same_hardware(*x, b)).min_by_key(|(_, x)| x.abs_diff(b)) else { continue };
-            if self.isolated.get(ap).is_some_and(|t| ts - t < 3600) {
+            let heard = heard(n);
+            if self.isolated.get(ap).is_some_and(|t| heard - t < 3600) {
                 continue;
             }
-            self.isolated.insert(*ap, ts);
+            self.isolated.insert(*ap, heard);
             let data = json!({ "heard_by": heard_by.to_string(), "bssid": n.bssid, "signal": n.signal });
             self.emit(Event::device(ts, EventKind::ApIsolated, *ap, data));
         }
@@ -2663,6 +2668,24 @@ mod tests {
             .filter_map(|m| match m { LiveMsg::Event(e) if e.kind == EventKind::ApIsolated => Some(e.device_mac), _ => None })
             .collect();
         assert_eq!(blamed, [b.parse().ok()]);
+    }
+
+    #[test]
+    fn an_isolated_beacon_kept_from_an_earlier_scan_is_no_news() {
+        let mut h = harness();
+        let (a, b) = ("02:00:00:00:00:10", "02:00:00:00:00:18");
+        h.engine.handle(Input::Tick(100));
+        h.engine.handle(Input::Inform { ts: 100, peer: [10, 0, 0, 1].into(), decoded: decoded(inform(b, 1000, &[])) });
+        let isolated = |h: &mut Harness, ts: Ts, age: Ts| {
+            let mut p = inform(a, 1000 + ts, &[]);
+            p["radio_table"] = json!([{ "radio": "na", "scan_table": [{ "bssid": "02:00:00:00:00:1a", "is_isolated": true, "signal": -70, "age": age }] }]);
+            h.engine.handle(Input::Inform { ts, peer: [10, 0, 0, 1].into(), decoded: decoded(p) });
+            std::iter::from_fn(|| h.rx.try_recv().ok()).filter(|m| matches!(m, LiveMsg::Event(e) if e.kind == EventKind::ApIsolated)).count()
+        };
+        assert_eq!(isolated(&mut h, 120, 50), 0, "heard before this run");
+        assert_eq!(isolated(&mut h, 130, 0), 1);
+        assert_eq!(isolated(&mut h, 4000, 3870), 0, "the same sighting, an hour on");
+        assert_eq!(isolated(&mut h, 4010, 270), 1, "heard again an hour after");
     }
 
     #[test]
