@@ -1,3 +1,4 @@
+import { mbps } from "../../../format";
 import {
   ListInput,
   NumberInput,
@@ -13,7 +14,7 @@ import type { PmfMode, WlanSection } from "./form";
 import { Unsupported } from "./Unsupported";
 
 const rates = (list: number[]): Option<number>[] =>
-  list.map((kbps) => [kbps, `${kbps / 1000} Mbps`]);
+  list.map((kbps) => [kbps, mbps(kbps)]);
 
 const LOG_LEVELS: Option<number>[] = [
   [-1, "AP default"],
