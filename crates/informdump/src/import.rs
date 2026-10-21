@@ -1,5 +1,6 @@
 //! Read-only snapshot of an existing controller's MongoDB: the collections rendering
 //! reads ([`apcfg::COLLECTIONS`]), devices with their authkeys. Only `find` is ever issued.
+//! What is read and kept, without the driver, is in [`crate::snapshot`].
 //!
 //! The output contains secrets (device authkeys, WLAN passphrases): it is
 //! written with mode 0600 and must never be committed.
@@ -11,6 +12,8 @@ use futures_util::TryStreamExt;
 use mongodb::bson::{Bson, Document, doc};
 use mongodb::options::{ClientOptions, FindOptions};
 use serde_json::{Value, json};
+
+use crate::snapshot::{collections, source, trim_settings};
 
 /// Device fields worth carrying over besides the ones rendering reads
 /// ([`apcfg::DEVICE_KEYS`]). Everything else (stats caches, etc.) is skipped.
@@ -26,34 +29,6 @@ const USER_FIELDS: &[&str] = &[
     "usergroup_id",
 ];
 
-/// The official controller's collection each snapshot collection is read from.
-fn source(collection: &str) -> &str {
-    match collection {
-        "sites" => "site",
-        "devices" => "device",
-        "clients" => "user",
-        c => c,
-    }
-}
-
-/// Collections carried over besides the ones rendering reads ([`apcfg::COLLECTIONS`]):
-/// the WLAN groups the devices name.
-const EXTRA_COLLECTIONS: &[&str] = &["wlangroup"];
-
-/// Settings of which only these fields are kept, with `_id`, `key` and `site_id`: the
-/// rest of `element_adopt` is its pairing secrets, which nothing reads.
-const SETTING_FIELDS: &[(&str, &[&str])] = &[("element_adopt", &["enabled"])];
-
-/// Drops the fields [`SETTING_FIELDS`] leaves out.
-fn trim_settings(settings: &mut [Value]) {
-    for s in settings {
-        let Some(&(_, fields)) = SETTING_FIELDS.iter().find(|(k, _)| s["key"].as_str() == Some(k)) else { continue };
-        if let Some(o) = s.as_object_mut() {
-            o.retain(|k, _| matches!(k.as_str(), "_id" | "key" | "site_id") || fields.contains(&k.as_str()));
-        }
-    }
-}
-
 pub async fn run(uri: &str, db: &str, out: &Path) -> Result<()> {
     let mut opts = ClientOptions::parse(uri).await.context("parsing MongoDB URI")?;
     opts.direct_connection = Some(true);
@@ -65,7 +40,7 @@ pub async fn run(uri: &str, db: &str, out: &Path) -> Result<()> {
     let mut snapshot = serde_json::Map::new();
     snapshot.insert("source".into(), json!("unifi-network-application"));
     let mut read = Vec::new();
-    for &c in apcfg::COLLECTIONS.iter().chain(EXTRA_COLLECTIONS) {
+    for c in collections() {
         let (filter, projection) = match c {
             // Only the settings apctl reads ([`apcfg::SETTING_KEYS`]): the others hold
             // credentials (mail, cloud access, guest portal) nothing here uses.
@@ -107,20 +82,4 @@ async fn find_all(db: &mongodb::Database, coll: &str, filter: Document, projecti
         out.push(Bson::Document(d).into_relaxed_extjson());
     }
     Ok(out)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn element_adoption_keeps_only_whether_it_is_on() {
-        let mut settings = vec![
-            json!({ "_id": "a", "key": "element_adopt", "site_id": "s", "enabled": true, "x_element_psk": "secret", "x_pregenerated_dh_key": "k" }),
-            json!({ "_id": "b", "key": "mgmt", "site_id": "s", "x_ssh_password": "kept" }),
-        ];
-        trim_settings(&mut settings);
-        assert_eq!(settings[0], json!({ "_id": "a", "key": "element_adopt", "site_id": "s", "enabled": true }));
-        assert_eq!(settings[1]["x_ssh_password"], "kept");
-    }
 }

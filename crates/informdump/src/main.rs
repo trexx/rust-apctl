@@ -12,6 +12,8 @@ mod import;
 mod report;
 mod sanitize;
 mod simulate;
+#[cfg(any(feature = "mongo", test))]
+mod snapshot;
 
 use std::io::Write;
 use std::ops::ControlFlow;
