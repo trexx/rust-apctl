@@ -80,7 +80,7 @@ RUN apk add --no-cache tcpdump
 ENTRYPOINT ["/bin/sh", "-c", "[ -p \"$FIFO\" ] || mkfifo -m 644 \"$FIFO\"; exec tcpdump -p -i any -U -s 0 -w \"$FIFO\" \"$FILTER\""]
 
 # --- runtime ---
-FROM gcr.io/distroless/cc-debian12:nonroot AS runtime
+FROM gcr.io/distroless/cc-debian12:nonroot@sha256:9dac0a79194e45a7da0158a9c6da57b217585af0786db3845d1f0ec1a0dd182f AS runtime
 COPY --from=build /apctl /usr/local/bin/apctl
 COPY --from=oui /oui.csv /usr/share/apctl/oui.csv
 COPY --from=oui --chown=65532:65532 /rootfs/ /
