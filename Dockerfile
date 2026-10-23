@@ -1,5 +1,5 @@
 # --- web UI ---
-FROM docker.io/library/node:24-slim AS web
+FROM docker.io/library/node:24-slim@sha256:55fb5f5a527ea2c5c4a95f963e48ef90aa38c7b346054fdc8ee9957a2b55d205 AS web
 WORKDIR /web
 COPY web/package.json web/package-lock.json ./
 RUN --mount=type=cache,target=/root/.npm npm ci --no-fund --no-audit
