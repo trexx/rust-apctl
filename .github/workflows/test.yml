@@ -24,7 +24,7 @@ jobs:
         with:
           # The release of the Dockerfile's rust image: Renovate bumps both in one PR
           # (.github/renovate.json).
-          toolchain: '1.98'
+          toolchain: '1.99'
           components: 'clippy'
       - uses: 'Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0' # v2.9.3
       # The tests built on real captures need fixtures kept outside the repository
