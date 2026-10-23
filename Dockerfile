@@ -14,7 +14,7 @@ RUN npm run build
 # download it. (The IEEE server answers 418 to the HTTP client behind ADD <url>, so
 # busybox wget fetches it.) Each line is cut after the name: the controller reads no
 # more (vendor.rs), and the addresses are much of the file.
-FROM docker.io/library/alpine:3.22 AS oui
+FROM docker.io/library/alpine:3.24@sha256:be2656061b536c1883c4034790e21d0a09c5aaaf51968b89368a3c0371ea2c9a AS oui
 ARG OUI_MONTH=
 RUN echo "registry of ${OUI_MONTH:-the first build}" \
     && wget -q -O /oui-full.csv https://standards-oui.ieee.org/oui/oui.csv \
@@ -72,7 +72,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     && cargo auditable build --release --locked -p controller && cp target/release/apctl /apctl
 
 # --- capture sidecar for shadow mode: tcpdump writing pcap into a FIFO ---
-FROM docker.io/library/alpine:3.22 AS capture
+FROM docker.io/library/alpine:3.24@sha256:be2656061b536c1883c4034790e21d0a09c5aaaf51968b89368a3c0371ea2c9a AS capture
 RUN apk add --no-cache tcpdump
 # The FIFO must be readable by the non-root controller. Alpine's tcpdump keeps
 # its user (no -Z), which matters: switching user needs CAP_SETUID, and the pod
