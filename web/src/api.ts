@@ -610,9 +610,6 @@ export interface RadioRetries {
   name: string | null;
   radio: string;
   tx_retry_pct: number;
-  retries: number;
-  attempts: number;
-  dropped: number;
 }
 
 export interface DensityAp {
@@ -711,7 +708,7 @@ export interface ThreatFinding {
   channel: number | null;
   radio: string | null;
   best_signal: number | null;
-  heard_by: { mac: Mac; name: string | null; signal: number | null; last_seen: number }[];
+  heard_by: { mac: Mac; name: string | null; signal: number | null }[];
   first_seen: number;
   last_seen: number;
   target: string | null;
@@ -895,7 +892,7 @@ export interface Wlan {
     pmf: string | null;
   } | null;
   security_on_air: string | null;
-  broadcast: { ap: Mac; name: string | null; radio: string | null; channel: number | null; bssid: string; clients: number | null; online: boolean }[];
+  broadcast: { ap: Mac; name: string | null; radio: string | null; channel: number | null; bssid: string }[];
   bands: string[];
   clients: number;
   peak_clients: number;
