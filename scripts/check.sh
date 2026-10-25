@@ -8,12 +8,15 @@
 # and linted.
 #
 # Web: lint (eslint, no warnings), type-check and build web/, in the Node image the
-# Dockerfile builds it with, run by docker or podman. npm's download cache is
-# $HOME/.npm, mounted into the container.
+# Dockerfile builds it with, run by $APCTL_ENGINE, else docker, else podman (the rule
+# scripts/image-check.sh follows). npm's download cache is $HOME/.npm, mounted into the
+# container. What it writes (web/node_modules, web/dist, the cache) is the caller's:
+# rootful Docker runs it as the caller's user; rootless engines (podman, rootless
+# Docker) already map the container's root to the caller.
 #
-#   scripts/check.sh          # runs the Rust checks in order, stopping at the first failure
-#   scripts/check.sh --list   # prints them, one per line
-#   scripts/check.sh --web    # runs the web check
+#   scripts/check.sh                                # runs the Rust checks in order, stopping at the first failure
+#   scripts/check.sh --list                         # prints them, one per line
+#   [APCTL_ENGINE=podman] scripts/check.sh --web    # runs the web check
 set -euo pipefail
 
 checks=(
@@ -29,9 +32,20 @@ case ${1:-} in
     exit 0 ;;
   --web)
     cd "$(dirname "$0")/.."
-    engine=$(command -v docker || command -v podman) || { echo "the web check needs docker or podman" >&2; exit 1; }
+    engine=${APCTL_ENGINE:-$(command -v docker || command -v podman)} || { echo "the web check needs docker or podman" >&2; exit 1; }
+    as_caller=()
+    if [ "$(id -u)" != 0 ]; then
+      # podman --version names podman, also behind a docker shim; rootless Docker lists
+      # rootless among its security options.
+      about="$("$engine" --version 2>&1 || true) $("$engine" info --format '{{.SecurityOptions}}' 2>/dev/null || true)"
+      case $about in
+        *podman* | *rootless*) ;;
+        *) as_caller=(--user "$(id -u):$(id -g)" -e HOME=/tmp) ;;
+      esac
+    fi
     mkdir -p "$HOME/.npm"
-    exec "$engine" run --rm -v "$PWD/web:/web:Z" -v "$HOME/.npm:/root/.npm:Z" -w /web docker.io/library/node:26-slim@sha256:36793bcbb160a6a16cede1e62b93f84e26b78a972a8a4c0b879c1c12f22761ec \
+    exec "$engine" run --rm ${as_caller[@]+"${as_caller[@]}"} -v "$PWD/web:/web:Z" -v "$HOME/.npm:/npm:Z" -e npm_config_cache=/npm -w /web \
+      docker.io/library/node:26-slim@sha256:36793bcbb160a6a16cede1e62b93f84e26b78a972a8a4c0b879c1c12f22761ec \
       sh -c "npm ci --no-fund --no-audit && npm run lint && npm run build" ;;
   "") ;;
   *) echo "usage: scripts/check.sh [--list | --web]" >&2; exit 2 ;;
