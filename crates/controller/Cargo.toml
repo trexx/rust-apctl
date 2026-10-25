@@ -12,7 +12,7 @@ anyhow.workspace = true
 apcfg.workspace = true
 argon2 = "0.6.0"
 axum = { version = "0.8.9", features = ["ws"] }
-base64 = "0.22"
+base64 = "0.23"
 clap = { workspace = true, features = ["derive", "env"] }
 flate2.workspace = true
 futures-util.workspace = true
@@ -30,7 +30,7 @@ sha2 = "0.11.1"
 tar = "0.4.46"
 tokio = { workspace = true, features = ["fs", "io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
 tokio-util = { version = "0.7.20", features = ["io"] }
-tower-http = { version = "0.6.11", features = ["compression-gzip", "set-header"] }
+tower-http = { version = "0.7.0", features = ["compression-gzip", "set-header"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 ureq = "3.4.2"

@@ -128,7 +128,7 @@ Open <http://127.0.0.1:8090> and log in as `admin` with `demo-password`. Then up
 ## Build
 
 ```sh
-podman run --rm -v $PWD/web:/app:Z -w /app docker.io/library/node:24-slim sh -c "npm ci && npm run build"
+podman run --rm -v $PWD/web:/app:Z -w /app docker.io/library/node:26-slim@sha256:36793bcbb160a6a16cede1e62b93f84e26b78a972a8a4c0b879c1c12f22761ec sh -c "npm ci && npm run build"
 cargo build --release -p controller   # or: podman build --target runtime .
 ```
 

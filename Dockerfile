@@ -1,5 +1,5 @@
 # --- web UI ---
-FROM docker.io/library/node:24-slim AS web
+FROM docker.io/library/node:26-slim@sha256:36793bcbb160a6a16cede1e62b93f84e26b78a972a8a4c0b879c1c12f22761ec AS web
 WORKDIR /web
 COPY web/package.json web/package-lock.json ./
 RUN --mount=type=cache,target=/root/.npm npm ci --no-fund --no-audit
@@ -14,7 +14,7 @@ RUN npm run build
 # download it. (The IEEE server answers 418 to the HTTP client behind ADD <url>, so
 # busybox wget fetches it.) Each line is cut after the name: the controller reads no
 # more (vendor.rs), and the addresses are much of the file.
-FROM docker.io/library/alpine:3.22 AS oui
+FROM docker.io/library/alpine:3.24@sha256:be2656061b536c1883c4034790e21d0a09c5aaaf51968b89368a3c0371ea2c9a AS oui
 ARG OUI_MONTH=
 RUN echo "registry of ${OUI_MONTH:-the first build}" \
     && wget -q -O /oui-full.csv https://standards-oui.ieee.org/oui/oui.csv \
@@ -30,7 +30,7 @@ RUN mkdir -p /rootfs/data
 # The dependencies build from the manifests alone, every crate's own source replaced by
 # an empty one: that stage does not wait for the web UI, and a code change leaves it
 # cached. The skeleton stage runs on every change but makes the same files.
-FROM docker.io/library/rust:1.98-bookworm AS skeleton
+FROM docker.io/library/rust:1.99-bookworm@sha256:48b7f435b8fc6378ce43b44f15e3a47fd8919b2825f835c39bd4bd3da50af5b8 AS skeleton
 WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
 COPY crates/ crates/
@@ -49,7 +49,7 @@ RUN for c in crates/*; do \
 # CARGO_BUILD_JOBS limits cargo on a machine short of memory (--build-arg).
 # cargo auditable embeds the list of crates in the binary, where the image scan
 # (.github/workflows/trivy.yml) reads it: the scan covers exactly the crates that ship.
-FROM docker.io/library/rust:1.98-bookworm AS deps
+FROM docker.io/library/rust:1.99-bookworm@sha256:48b7f435b8fc6378ce43b44f15e3a47fd8919b2825f835c39bd4bd3da50af5b8 AS deps
 RUN cargo install --locked cargo-auditable@0.7.6
 WORKDIR /src
 COPY --from=skeleton /src ./
@@ -72,7 +72,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     && cargo auditable build --release --locked -p controller && cp target/release/apctl /apctl
 
 # --- capture sidecar for shadow mode: tcpdump writing pcap into a FIFO ---
-FROM docker.io/library/alpine:3.22 AS capture
+FROM docker.io/library/alpine:3.24@sha256:be2656061b536c1883c4034790e21d0a09c5aaaf51968b89368a3c0371ea2c9a AS capture
 RUN apk add --no-cache tcpdump
 # The FIFO must be readable by the non-root controller. Alpine's tcpdump keeps
 # its user (no -Z), which matters: switching user needs CAP_SETUID, and the pod
@@ -80,7 +80,7 @@ RUN apk add --no-cache tcpdump
 ENTRYPOINT ["/bin/sh", "-c", "[ -p \"$FIFO\" ] || mkfifo -m 644 \"$FIFO\"; exec tcpdump -p -i any -U -s 0 -w \"$FIFO\" \"$FILTER\""]
 
 # --- runtime ---
-FROM gcr.io/distroless/cc-debian12:nonroot AS runtime
+FROM gcr.io/distroless/cc-debian12:nonroot@sha256:9dac0a79194e45a7da0158a9c6da57b217585af0786db3845d1f0ec1a0dd182f AS runtime
 COPY --from=build /apctl /usr/local/bin/apctl
 COPY --from=oui /oui.csv /usr/share/apctl/oui.csv
 COPY --from=oui --chown=65532:65532 /rootfs/ /
