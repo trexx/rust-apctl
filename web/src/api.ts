@@ -1560,14 +1560,16 @@ export interface MdnsRule {
   isolation_enabled?: boolean;
 }
 
-/** An AP's radio as its settings document holds it: imported documents can hold a number as text ("20"), which `radioForm` reads. */
+/** An AP's radio as its settings document holds it: imported documents can hold a number as text (a channel of "36"), which `radioForm` reads. */
 export interface RadioSettings {
   radio: string;
   name: string;
   /** "auto", or the channel. */
   channel: number | string;
-  /** The width in MHz. */
-  ht: number | string;
+  /** The width (MHz) it is set to: its own, else the site's for the band, else the band's default. */
+  ht: number;
+  /** The width (MHz) it runs at: `ht`, capped by its band and by `caps.max_width`. The server judges a fixed channel at it. */
+  width: number;
   tx_power_mode: string;
   tx_power: number | string | null;
   min_rssi_enabled: boolean | null;
@@ -1581,7 +1583,7 @@ export interface RadioSettings {
   loadbalance_enabled: boolean | null;
   maxsta: number | null;
   has_blocker: boolean;
-  /** What the radio can do, from its inform (1 to 30 dBm and 80 MHz without one): the ranges the server checks an edit against. */
+  /** What the radio can do, from the AP's record (the power range also from its inform, else 1 to 30 dBm): the ranges the server checks an edit against. */
   caps: { min_txpower: number; max_txpower: number; max_width: number };
   /** Legal channels by width (MHz) in the site's country, indoors and in outdoor mode. */
   channels: Record<string, number[]>;

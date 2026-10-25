@@ -5,9 +5,9 @@ import { QueryNote } from "../../common";
 import { EditPanel } from "../EditPanel";
 import { DeviceEditor } from "./DeviceEditor";
 
-/** One radio's settings in a line. */
+/** One radio's settings in a line (the width it runs at, and the one set when that is wider). */
 const radioSummary = (r: RadioSettings) =>
-  `${band(r.radio)}: ${r.channel === "auto" ? "auto channel" : `channel ${r.channel}`}, ${r.ht} MHz, power ${r.tx_power_mode === "custom" ? `${r.tx_power} dBm` : r.tx_power_mode}${r.min_rssi_enabled ? `, min signal ${dbm(r.min_rssi)}` : ""}`;
+  `${band(r.radio)}: ${r.channel === "auto" ? "auto channel" : `channel ${r.channel}`}, ${r.width} MHz${r.ht > r.width ? ` (set to ${r.ht})` : ""}, power ${r.tx_power_mode === "custom" ? `${r.tx_power} dBm` : r.tx_power_mode}${r.min_rssi_enabled ? `, min signal ${dbm(r.min_rssi)}` : ""}`;
 
 /**
  * The AP page's settings section, for those who can edit (the page shows it
