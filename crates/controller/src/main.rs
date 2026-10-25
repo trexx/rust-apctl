@@ -331,6 +331,7 @@ async fn serve(args: ServeArgs) -> Result<()> {
         source: source_desc, inform_url, syslog_listen: syslog_listen.map(|a| a.port()), keys, memo: Default::default(), threats: threat_state,
     });
     channelai::schedule(state.clone());
+    series::Memo::spawn_sweep(state.clone());
     ratelimit::spawn(state.clone());
     adopt::spawn(state.clone());
     let app = api::router(state);
