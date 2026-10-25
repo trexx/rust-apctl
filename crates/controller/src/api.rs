@@ -919,7 +919,7 @@ async fn set_alias(
 
 #[derive(Deserialize)]
 struct ImportEntry {
-    mac: String,
+    mac: Mac,
     alias: Option<String>,
     note: Option<String>,
 }
@@ -940,7 +940,7 @@ async fn import_aliases(
     let mut parsed = Vec::with_capacity(entries.len());
     for e in entries {
         validate(&e.alias, &e.note)?;
-        parsed.push(AliasEdit { mac: parse_mac(&e.mac)?, alias: e.alias, note: e.note });
+        parsed.push(AliasEdit { mac: e.mac, alias: e.alias, note: e.note });
     }
     let n = parsed.len();
     // All in one message: one pass of the engine, one client-list update.
@@ -999,8 +999,9 @@ impl Where {
 
 #[derive(Deserialize)]
 struct EventQuery {
-    device: Option<String>,
-    client: Option<String>,
+    /// MACs in any form a MAC is written in (else 400).
+    device: Option<Mac>,
+    client: Option<Mac>,
     kind: Option<String>,
     limit: Option<i64>,
     /// Only the events stored after the one with this id (a list catching up).
@@ -1052,11 +1053,11 @@ fn catch_up_by_id(c: &rusqlite::Connection, table: &str, after: Option<i64>) -> 
 
 async fn events(State(s): State<AppState>, Query(q): Query<EventQuery>) -> Result<Json<Vec<EventRow>>, ApiError> {
     let mut w = Where::default();
-    if let Some(d) = &q.device {
-        w.and("device_mac = ?", Sql::Text(parse_mac(d)?.to_string()));
+    if let Some(d) = q.device {
+        w.and("device_mac = ?", Sql::Text(d.to_string()));
     }
-    if let Some(c) = &q.client {
-        w.and("client_mac = ?", Sql::Text(parse_mac(c)?.to_string()));
+    if let Some(c) = q.client {
+        w.and("client_mac = ?", Sql::Text(c.to_string()));
     }
     // Prefix match, so `client` selects all client events; several kinds
     // can be given separated by commas.
@@ -1115,7 +1116,8 @@ async fn events(State(s): State<AppState>, Query(q): Query<EventQuery>) -> Resul
 
 #[derive(Deserialize)]
 struct LogQuery {
-    device: Option<String>,
+    /// In any form a MAC is written in (else 400).
+    device: Option<Mac>,
     /// Full-text query (SQLite FTS5 syntax).
     q: Option<String>,
     limit: Option<i64>,
@@ -1178,7 +1180,7 @@ struct LogRow {
 }
 
 async fn logs(State(s): State<AppState>, Query(q): Query<LogQuery>) -> Result<Json<Vec<LogRow>>, ApiError> {
-    let device = q.device.as_deref().map(parse_mac).transpose()?;
+    let device = q.device;
     let search = q.q.as_deref().filter(|t| !t.trim().is_empty());
     let limit = q.limit.unwrap_or(500).clamp(1, 5000);
     let (search, after) = (search.map(str::to_string), q.after);
@@ -1705,7 +1707,13 @@ mod tests {
         assert_eq!((status, msg.as_str()), (StatusCode::BAD_REQUEST, "ap_stats has no field nope"));
         let (status, msg) = error(get("/api/site/activity?mac=02:00:00:00:00").await.unwrap()).await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "not an empty chart: {msg}");
-        assert_eq!(error(get("/api/connections?client=nope").await.unwrap()).await, (StatusCode::BAD_REQUEST, "invalid MAC nope".into()));
+        // A MAC in a query is read as the query is: the same answer on every route.
+        for path in ["/api/connections?client=nope", "/api/events?device=nope", "/api/events?client=nope", "/api/logs?device=nope"] {
+            let (status, msg) = error(get(path).await.unwrap()).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{path}");
+            assert!(msg.starts_with("Failed to deserialize query string") && msg.contains("nope"), "{path}: {msg}");
+        }
+        assert_eq!(get("/api/events?device=02-00-00-00-00-01").await.unwrap().status(), StatusCode::OK);
         assert_eq!(get("/api/connections?client=AA-BB-CC-DD-EE-FF").await.unwrap().status(), StatusCode::OK);
         let put = |content_type: &str, body: &'static str| {
             let req = Request::put("/api/clients/02:00:00:00:01:01/alias").header(header::COOKIE, &cookie).header("x-requested-with", "apctl").header(header::CONTENT_TYPE, content_type);
@@ -1718,6 +1726,11 @@ mod tests {
         assert_eq!(status, StatusCode::UNSUPPORTED_MEDIA_TYPE, "the rejection's own status: {msg}");
         let (status, _) = error(put("application/json", "{\"alias\": 5}").await.unwrap()).await;
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        // So is a MAC in a body that isn't one.
+        let req = Request::post("/api/clients/aliases").header(header::COOKIE, &cookie).header("x-requested-with", "apctl").header(header::CONTENT_TYPE, "application/json");
+        let (status, msg) = error(app.clone().oneshot(req.body(Body::from("[{\"mac\": \"nope\"}]")).unwrap()).await.unwrap()).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(msg.contains("[0].mac") && msg.contains("nope"), "{msg}");
     }
 
     /// The app's state with one user, that user's session cookie, and the data directory.
