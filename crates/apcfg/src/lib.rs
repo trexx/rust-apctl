@@ -454,8 +454,9 @@ pub(crate) struct Ctx<'a> {
     pub mgmt: &'a Value,
     pub super_mgmt: &'a Value,
     pub radio_ai: &'a Value,
-    /// The radios' country code (`setting[country].code`, US when unset).
-    pub country: String,
+    /// The radios' country code (`setting[country].code`, read as [`as_int`] reads a
+    /// number; US when unset or no number).
+    pub country: i64,
     /// See [`Ctx::gateway_macs`].
     gateway_macs: OnceCell<Vec<Cow<'a, str>>>,
 }
@@ -506,7 +507,7 @@ impl<'a> Ctx<'a> {
             mgmt: setting(state, site_id, "mgmt"),
             super_mgmt: setting(state, site_id, "super_mgmt"),
             radio_ai: setting(state, site_id, "radio_ai"),
-            country: json::text_of(setting(state, site_id, "country"), "code").map_or_else(|| DEFAULT_COUNTRY.to_string(), |c| c.to_string()),
+            country: json::int_of(setting(state, site_id, "country"), "code").unwrap_or(DEFAULT_COUNTRY),
             gateway_macs: OnceCell::new(),
         })
     }

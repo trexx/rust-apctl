@@ -371,7 +371,7 @@ pub fn render_radios(c: &mut Cfg, ctx: &Ctx, radios: &[Radio], vaps: &[Vap]) -> 
         c.set(k.at("acktimeout"), 64);
         c.set(k.at("ampdu.status"), "enabled");
         c.set(k.at("clksel"), 1);
-        c.set(k.at("countrycode"), &ctx.country);
+        c.set(k.at("countrycode"), ctx.country);
         c.set(k.at("cwm.enable"), 0);
         c.set(k.at("cwm.mode"), u8::from(r.band == Band::Ng && width != 20));
         c.set(k.at("forbiasauto"), 0);

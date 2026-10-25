@@ -172,3 +172,24 @@ fn the_render_deploys_ssids_on_the_bands_the_export_names() {
     assert_eq!(wlan_bands(&s["wlanconf"][3]), ["5g"]);
     assert_eq!(wlan_bands(&json!({ "wlan_bands": ["6g", "2g"] })), ["6g", "2g"]);
 }
+
+/// The site's country is a number however it is stored, as the controller's channel
+/// rules read it: the APs get it as one, and the US and Canada get the FCC DFS reset.
+#[test]
+fn the_country_is_read_as_a_number() {
+    let mut s = state(json!([wlan("Home", json!({}))]), json!([]));
+    s["devices"][0]["radio_table"][1] = json!({ "name": "wifi1", "radio": "na", "is_11ax": true, "has_fccdfs": true, "channel": 100 });
+    let country = |s: &mut Value, code: Value| {
+        s["setting"].as_array_mut().unwrap().retain(|d| d["key"] != "country");
+        s["setting"].as_array_mut().unwrap().push(json!({ "key": "country", "site_id": "s", "code": code }));
+        let cfg = system_cfg(s);
+        let dfs_reset = cfg.lines().any(|l| l.ends_with(".cmd=syswrapper.sh dfs-reset"));
+        (line(&cfg, "radio.countrycode").map(str::to_string), line(&cfg, "radio.2.countrycode").map(str::to_string), dfs_reset)
+    };
+    let code = |c: &str, dfs| (Some(c.to_string()), Some(c.to_string()), dfs);
+    for stored in [json!("840"), json!(840), json!(840.0), json!(" 840"), json!("0840"), json!("x"), json!(true)] {
+        assert_eq!(country(&mut s, stored.clone()), code("840", true), "{stored}");
+    }
+    assert_eq!(country(&mut s, json!(124.0)), code("124", true));
+    assert_eq!(country(&mut s, json!("276")), code("276", false), "a radio with only FCC DFS");
+}

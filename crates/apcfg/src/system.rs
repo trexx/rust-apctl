@@ -183,7 +183,7 @@ fn wireless(c: &mut Cfg, ctx: &Ctx, radios: &[Radio], vaps: &[Vap]) {
         c.header("no wlan provisioned as no radio found");
     } else {
         c.set("radio.status", "enabled");
-        c.set("radio.countrycode", &ctx.country);
+        c.set("radio.countrycode", ctx.country);
         c.set("aaa.status", "enabled");
         c.set("wireless.status", "enabled");
         let outdoor = override_of(ctx.device, "outdoor_mode_override", flag(ctx.mgmt, "outdoor_mode_enabled", false));
@@ -761,7 +761,7 @@ fn qos(c: &mut Cfg, ctx: &Ctx, radios: &[Radio], vaps: &[Vap]) {
 
 fn cron(c: &mut Cfg, ctx: &Ctx, radios: &[Radio], vaps: &[Vap]) {
     let schedules = vaps.iter().any(|v| !arr(&v.w, "schedule_with_duration").is_empty());
-    let fcc = ctx.country == "840" || ctx.country == "124";
+    let fcc = matches!(ctx.country, 840 | 124);
     let dfs = radios.iter().any(|r| {
         r.band == Band::Na
             && flag(r.doc, if fcc { "has_fccdfs" } else { "has_dfs" }, false)
