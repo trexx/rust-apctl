@@ -253,17 +253,11 @@ const RADIO_KEYS: [&str; 16] = [
     "max_txpower", "builtin_antenna", "builtin_ant_gain",
 ];
 
-/// The width a new AP's radio starts at, as the official controller sets it on
-/// adoption: the site's default for the band (else the band's own: 20, 80 or
-/// 160 MHz), at most what the band and the radio (as its inform reports it)
-/// allow. An inform's radio has no `ht`, so this is the width the render would
-/// run it at ([`crate::settings::radio_width`]).
-fn start_width(state: &Value, r: &Value) -> i64 {
-    crate::settings::radio_width(state, r)
-}
-
 /// The radio settings of a new AP, from the radios its inform lists: auto
-/// channel, the site's default width, auto power.
+/// channel, the site's default width, auto power. An inform's radio has no `ht`,
+/// so its [`crate::settings::radio_width`] is the site's default for the band
+/// (else the band's own), capped by the band and the radio, as the official
+/// controller sets it on adoption.
 pub fn radio_table(state: &Value, payload: &Value) -> Vec<Value> {
     payload["radio_table"]
         .as_array()
@@ -272,7 +266,7 @@ pub fn radio_table(state: &Value, payload: &Value) -> Vec<Value> {
         .filter_map(|r| {
             let band = r["radio"].as_str()?;
             let mut v = json!({
-                "name": r["name"], "radio": band, "channel": "auto", "ht": start_width(state, r), "tx_power_mode": "auto",
+                "name": r["name"], "radio": band, "channel": "auto", "ht": crate::settings::radio_width(state, r), "tx_power_mode": "auto",
                 "min_rssi_enabled": false, "hard_noise_floor_enabled": false, "antenna_gain": r["builtin_ant_gain"],
             });
             // The rest of what it reports, as it reports it.
