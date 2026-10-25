@@ -1010,17 +1010,15 @@ impl Settings {
     }
 }
 
-/// The stored backup settings; the defaults when none are stored.
-/// The stored settings; a field missing from them (one added since) takes its default.
+/// The stored backup settings, a field missing from them (one added since)
+/// taking its default; the defaults when none are stored.
 fn load_settings(store: &store::Store) -> Result<Settings> {
     let stored = store.read(Db::Config, |c| Ok(c.query_row("SELECT json FROM backup_settings WHERE id = 1", [], |r| r.get::<_, String>(0)).optional()?))?;
     let Some(stored) = stored else { return Ok(Settings::default()) };
-    let mut settings = serde_json::to_value(Settings::default())?;
-    match (&mut settings, serde_json::from_str::<Value>(&stored)?) {
-        (Value::Object(settings), Value::Object(stored)) => settings.extend(stored),
-        (_, other) => settings = other,
-    }
-    Ok(serde_json::from_value(settings)?)
+    let Value::Object(stored) = serde_json::from_str(&stored)? else { bail!("the stored backup settings are not an object") };
+    let Value::Object(mut settings) = serde_json::to_value(Settings::default())? else { unreachable!("Settings serialise as an object") };
+    settings.extend(stored);
+    Ok(serde_json::from_value(Value::Object(settings))?)
 }
 
 /// Backups in the directory, newest first. A description counts only beside
@@ -2134,7 +2132,7 @@ mod tests {
         put("not json");
         assert!(b.settings(&store).is_err());
         put("[]");
-        assert!(load_settings(&store).is_err());
+        assert_eq!(load_settings(&store).unwrap_err().to_string(), "the stored backup settings are not an object");
         // The API's body names every field.
         assert!(serde_json::from_value::<Settings>(json!({ "enabled": true })).is_err());
     }
