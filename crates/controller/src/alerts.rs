@@ -549,12 +549,18 @@ async fn load_open(store: &Arc<Store>, now: Ts) -> anyhow::Result<(Vec<Alert>, u
             let sql = "SELECT COALESCE(MAX(CAST(substr(id, instr(id, '-') + 1) AS INTEGER)), 0) FROM alerts";
             let seq = c.query_row(sql, [], |r| r.get::<_, i64>(0))?;
             // An alert of a kind apctl no longer raises can't be resolved: it is left as stored.
-            let mut stmt = c.prepare("SELECT id, ts, key, category, severity, entity, title, message, link, tag, resolved_ts FROM alerts WHERE resolved_ts IS NULL")?;
-            let rows = stmt.query_map([], stored)?.filter_map(Result::transpose).collect::<rusqlite::Result<Vec<_>>>()?;
+            let rows = open_alerts(c)?;
             Ok((rows, u64::try_from(seq).unwrap_or(0), offline))
         })
     })
     .await?
+}
+
+/// The alerts still open, but those of a kind apctl no longer raises, which can't
+/// be resolved: they are left as stored (see [`stored`]).
+fn open_alerts(c: &rusqlite::Connection) -> rusqlite::Result<Vec<Alert>> {
+    let mut stmt = c.prepare_cached("SELECT id, ts, key, category, severity, entity, title, message, link, tag, resolved_ts FROM alerts WHERE resolved_ts IS NULL")?;
+    stmt.query_map([], stored)?.filter_map(Result::transpose).collect()
 }
 
 /// Open health alerts to close: of radios not judged for [`HEALTH_STALE_CHECKS`]
@@ -870,8 +876,10 @@ struct Listed {
     read: bool,
 }
 
-/// The `limit` most recent alerts, newest first, with the unread count.
-/// One of a kind apctl no longer raises is left out (see [`stored`]).
+/// The `limit` most recent alerts, newest first, with the unread count and the
+/// counts of all open alerts (`open`) and of the high ones among them (`open_high`,
+/// which turn the bell red). One of a kind apctl no longer raises is left out of
+/// the list and of the open counts (see [`stored`]).
 fn recent(c: &rusqlite::Connection, limit: i64) -> anyhow::Result<Value> {
     let mut stmt = c.prepare_cached(LIST)?;
     let rows = stmt
@@ -882,10 +890,12 @@ fn recent(c: &rusqlite::Connection, limit: i64) -> anyhow::Result<Value> {
         .filter_map(Result::transpose)
         .collect::<rusqlite::Result<Vec<_>>>()?;
     let unread: i64 = c.query_row("SELECT COUNT(*) FROM alerts WHERE read = 0", [], |r| r.get(0))?;
-    Ok(json!({ "alerts": rows, "unread": unread }))
+    let open = open_alerts(c)?;
+    let open_high = open.iter().filter(|a| a.severity == Severity::High).count();
+    Ok(json!({ "alerts": rows, "unread": unread, "open": open.len(), "open_high": open_high }))
 }
 
-/// GET /api/alerts: recent alerts, newest first, with the unread count.
+/// GET /api/alerts: recent alerts, newest first, with the unread and open counts ([`recent`]).
 pub async fn list(State(s): State<AppState>, Query(q): Query<ListQuery>) -> Result<Json<Value>, ApiError> {
     let limit = q.limit.unwrap_or(50).clamp(1, 500) as i64;
     Ok(Json(crate::api::read(&s.store, Db::Config, move |c| recent(c, limit)).await?))
@@ -1355,6 +1365,13 @@ mod tests {
         // Listed as the UI reads them (web/src/api.ts's AlertItem); one apctl doesn't know is left out.
         let listed = w.store.read(Db::Config, |c| recent(c, 50)).unwrap();
         assert_eq!((listed["alerts"].as_array().map(Vec::len), listed["unread"].as_i64()), (Some(2), Some(3)));
+        assert_eq!((listed["open"].as_i64(), listed["open_high"].as_i64()), (Some(2), Some(0)));
+        // The open counts are of every open alert, not only of those listed; a high one counts apart.
+        w.book.open(500, Alert::for_device(Key::ApOffline, Category::ApStatus, Severity::High, ap, "t".into(), "m".into()));
+        w.book.raise(600, Alert::new(Key::ApRestarted, Category::Changes, Severity::Low, Entity::Ap(ap), "t".into(), "m".into()).resolved(600));
+        flushed(&w.book.writer);
+        let one = w.store.read(Db::Config, |c| recent(c, 1)).unwrap();
+        assert_eq!((one["alerts"].as_array().map(Vec::len), one["open"].as_i64(), one["open_high"].as_i64()), (Some(1), Some(3), Some(1)));
         let a = &listed["alerts"][1];
         let mut fields: Vec<&str> = a.as_object().unwrap().keys().map(String::as_str).collect();
         fields.sort();
