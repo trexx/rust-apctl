@@ -190,6 +190,9 @@ pub struct NeighborSample {
     pub is_isolated: bool,
     pub ap_name: Option<String>,
     pub model: Option<String>,
+    /// A Ubiquiti AP's own MAC, which its beacon carries as the serial number
+    /// (others send none, or zeros).
+    pub serial: Option<Mac>,
     /// How long ago, in seconds, the scan heard it: the AP reports what its
     /// scans found, an entry as it was when last heard (for half an hour or more).
     pub age: Option<i64>,
@@ -528,6 +531,7 @@ pub fn parse_with_scans(ts: Ts, p: &Value) -> anyhow::Result<(Snapshot, Scans)> 
                 is_isolated: n["is_isolated"].as_bool() == Some(true),
                 ap_name: string(&n["ap_name"]),
                 model: string(&n["model"]),
+                serial: n["serialno"].as_str().and_then(|s| s.parse::<Mac>().ok()).filter(|m| m.0 != [0; 6]),
                 age: int(&n["age"]),
             });
         }

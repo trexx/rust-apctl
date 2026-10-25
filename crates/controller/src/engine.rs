@@ -1534,16 +1534,27 @@ impl Engine {
             live.devices.keys().chain(live.known_devices.keys()).map(|m| (*m, hardware_num(m))).collect()
         };
         for n in flagged {
-            let Ok(b) = n.bssid.parse::<Mac>().map(|m| hardware_num(&m)) else { continue };
-            // The nearest of our APs that is likely the same hardware.
-            let Some((ap, _)) = ours.iter().filter(|(_, x)| same_hardware(*x, b)).min_by_key(|(_, x)| x.abs_diff(b)) else { continue };
+            // The AP the beacon names as its own (as the official controller reads it), or
+            // without a name, the one of ours its BSSID likely derives from: an AP's BSSIDs
+            // are its MAC plus a little, so the nearest at or below it, else the nearest.
+            let ap = match n.serial {
+                Some(serial) if ours.iter().any(|(m, _)| *m == serial) => serial,
+                Some(_) => continue,
+                None => {
+                    let Ok(b) = n.bssid.parse::<Mac>().map(|m| hardware_num(&m)) else { continue };
+                    let near = || ours.iter().filter(|(_, x)| same_hardware(*x, b));
+                    let below = near().filter(|(_, x)| *x <= b).max_by_key(|(_, x)| *x);
+                    let Some((ap, _)) = below.or_else(|| near().min_by_key(|(_, x)| x.abs_diff(b))) else { continue };
+                    *ap
+                }
+            };
             let heard = heard(n);
-            if self.isolated.get(ap).is_some_and(|t| heard - t < 3600) {
+            if self.isolated.get(&ap).is_some_and(|t| heard - t < 3600) {
                 continue;
             }
-            self.isolated.insert(*ap, heard);
+            self.isolated.insert(ap, heard);
             let data = json!({ "heard_by": heard_by.to_string(), "bssid": n.bssid, "signal": n.signal });
-            self.emit(Event::device(ts, EventKind::ApIsolated, *ap, data));
+            self.emit(Event::device(ts, EventKind::ApIsolated, ap, data));
         }
     }
 
@@ -2648,19 +2659,31 @@ mod tests {
     }
 
     #[test]
-    fn an_isolated_beacon_is_blamed_on_the_nearest_ap() {
-        let mut h = harness();
-        let (a, b) = ("02:00:00:00:00:10", "02:00:00:00:00:18");
-        h.engine.handle(Input::Inform { ts: 0, peer: [10, 0, 0, 1].into(), decoded: decoded(inform(a, 1000, &[])) });
-        h.engine.handle(Input::Inform { ts: 1, peer: [10, 0, 0, 1].into(), decoded: decoded(inform(b, 1000, &[])) });
-        // A heard B's BSSID flagged isolated; A's own MAC is within 16 of it too.
-        let mut p = inform(a, 1002, &[]);
-        p["radio_table"] = json!([{ "radio": "na", "scan_table": [{ "bssid": "02:00:00:00:00:1a", "is_isolated": true, "signal": -70 }] }]);
-        h.engine.handle(Input::Inform { ts: 2, peer: [10, 0, 0, 1].into(), decoded: decoded(p) });
-        let blamed: Vec<_> = std::iter::from_fn(|| h.rx.try_recv().ok())
-            .filter_map(|m| match m { LiveMsg::Event(e) if e.kind == EventKind::ApIsolated => Some(e.device_mac), _ => None })
-            .collect();
-        assert_eq!(blamed, [b.parse().ok()]);
+    fn an_isolated_beacon_is_blamed_on_the_ap_it_derives_from() {
+        // Which AP each beacon (BSSID, serial number) is blamed on, with our APs at `aps`.
+        let blamed = |aps: [&str; 2], scan: Vec<(&str, Option<&str>)>| {
+            let mut h = harness();
+            for (i, ap) in aps.iter().enumerate() {
+                h.engine.handle(Input::Inform { ts: i as Ts, peer: [10, 0, 0, 1].into(), decoded: decoded(inform(ap, 1000, &[])) });
+            }
+            let mut p = inform(aps[0], 1002, &[]);
+            let scan: Vec<Value> = scan.iter().map(|(bssid, serial)| json!({ "bssid": bssid, "serialno": serial, "is_isolated": true, "signal": -70 })).collect();
+            p["radio_table"] = json!([{ "radio": "na", "scan_table": scan }]);
+            h.engine.handle(Input::Inform { ts: 2, peer: [10, 0, 0, 1].into(), decoded: decoded(p) });
+            std::iter::from_fn(|| h.rx.try_recv().ok())
+                .filter_map(|m| match m { LiveMsg::Event(e) if e.kind == EventKind::ApIsolated => e.device_mac.map(|m| m.to_string()), _ => None })
+                .collect::<Vec<_>>()
+        };
+        // Both MACs are within 16 of the BSSID: the one at or below it, even when the other is nearer.
+        assert_eq!(blamed(["02:00:00:00:00:10", "02:00:00:00:00:18"], vec![("02:00:00:00:00:1a", None)]), ["02:00:00:00:00:18"]);
+        assert_eq!(blamed(["02:00:00:00:00:10", "02:00:00:00:00:20"], vec![("02:00:00:00:00:1c", None)]), ["02:00:00:00:00:10"]);
+        // None at or below it: the nearest above.
+        assert_eq!(blamed(["02:00:00:00:00:10", "02:00:00:00:00:30"], vec![("02:00:00:00:00:0c", None)]), ["02:00:00:00:00:10"]);
+        // A beacon naming its AP: that one, wherever its BSSID is, and none when it is not ours.
+        assert_eq!(blamed(["02:00:00:00:00:10", "02:00:00:00:00:20"], vec![("02:00:00:00:00:1c", Some("020000000020"))]), ["02:00:00:00:00:20"]);
+        assert!(blamed(["02:00:00:00:00:10", "02:00:00:00:00:20"], vec![("02:00:00:00:00:1c", Some("020000000099"))]).is_empty());
+        // Zeros name no AP.
+        assert_eq!(blamed(["02:00:00:00:00:10", "02:00:00:00:00:20"], vec![("02:00:00:00:00:1c", Some("00:00:00:00:00:00"))]), ["02:00:00:00:00:10"]);
     }
 
     #[test]
