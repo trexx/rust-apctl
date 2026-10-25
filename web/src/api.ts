@@ -598,7 +598,7 @@ export interface SiteActivity {
     tx_dropped_pct: (number | null)[];
   };
   /** Null in a bucket where no radio reported the figure. */
-  airtime: { ts: number[]; total: (number | null)[]; external_interference: (number | null)[]; own_traffic: (number | null)[]; own_rx: (number | null)[]; own_tx: (number | null)[] };
+  airtime: { ts: number[]; total: (number | null)[]; external_interference: (number | null)[]; own_traffic: (number | null)[] };
 }
 
 export interface TopEntry {
@@ -916,7 +916,6 @@ export interface Wlan {
   security_on_air: string | null;
   broadcast: { ap: Mac; name: string | null; radio: string | null; channel: number | null; bssid: string; clients: number | null; online: boolean }[];
   bands: string[];
-  ap_count: number;
   clients: number;
   peak_clients: number;
   satisfaction: number | null;
