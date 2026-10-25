@@ -88,7 +88,6 @@ export interface ServiceCount {
 
 export interface Multicast {
   types: Record<string, McastCounts>;
-  groups: (McastCounts & { group_ip: string; dst_port: number | null; type: string | null })[];
   memberships: string[];
   services: ServiceCount[];
   /** How the AP delivers the client's groups: "optimized" only to members, "flooding" to everyone; null when it joined none. */
