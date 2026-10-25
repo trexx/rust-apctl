@@ -65,9 +65,11 @@ export interface ClientSample {
   vlan_id: number | null;
   latency_avg: number | null;
   is_11r: boolean | null;
-  /** Only on a client's own page (`useClient`), not in the list or an AP's page. */
-  multicast?: Multicast | null;
+  multicast: Multicast | null;
 }
+
+/** A client's sample as the lists send it (the client list and an AP's page): the fields they show. */
+export type ListedSample = Pick<ClientSample, "mac" | "ap_mac" | "essid" | "radio" | "channel" | "hostname" | "ip" | "signal" | "tx_rate" | "rx_rate" | "uptime" | "wifi_gen" | "nss">;
 
 /** `tx` is what the AP delivered to the client, `rx` what the client sent. */
 export interface McastCounts {
@@ -86,16 +88,15 @@ export interface ServiceCount {
 
 export interface Multicast {
   types: Record<string, McastCounts>;
-  groups: (McastCounts & { group_ip: string; dst_port: number | null; type: string | null })[];
   memberships: string[];
   services: ServiceCount[];
   /** How the AP delivers the client's groups: "optimized" only to members, "flooding" to everyone; null when it joined none. */
   delivery: "optimized" | "flooding" | null;
 }
 
-/** A client as an AP's page lists it: its latest sample (without the multicast tables), and when it was seen. */
+/** A client as an AP's page lists it: the listed fields of its latest sample, and when it was seen. */
 export interface ListedClientView {
-  sample: ClientSample;
+  sample: ListedSample;
   connected: boolean;
   first_seen: number;
   last_seen: number;
@@ -122,8 +123,9 @@ export interface ListedClient extends ClientView {
 /** A client in a multicast group, as a client's page lists its peers. */
 export type GroupMember = { mac: Mac; name: string };
 
-/** A client's page: its view, with the multicast tables and the peers in its groups. */
+/** A client's page: its view with its whole sample (the multicast tables too), and the peers in its groups. */
 export interface ClientDetail extends ClientView {
+  sample: ClientSample;
   /** For each group it joined, the other connected clients that joined it too (groups without any are left out). */
   peers: Record<string, GroupMember[]>;
 }
@@ -479,7 +481,7 @@ export const keys = {
   devices: family("devices"),
   deviceNames: family("device-names"),
   device: family<[mac: Mac]>("device"),
-  clients: family("clients"),
+  clients: family<[all: boolean]>("clients"),
   clientNames: family("client-names"),
   client: family<[mac: Mac]>("client"),
   series: family<[table: string, key: string, span: TimeSpan, fields: string]>("series"),
@@ -596,7 +598,7 @@ export interface SiteActivity {
     tx_dropped_pct: (number | null)[];
   };
   /** Null in a bucket where no radio reported the figure. */
-  airtime: { ts: number[]; total: (number | null)[]; external_interference: (number | null)[]; own_traffic: (number | null)[]; own_rx: (number | null)[]; own_tx: (number | null)[] };
+  airtime: { ts: number[]; total: (number | null)[]; external_interference: (number | null)[]; own_traffic: (number | null)[] };
 }
 
 export interface TopEntry {
@@ -676,9 +678,9 @@ export interface RadioOverview {
   avg_client_signal: number | null;
 }
 
+/** A neighbouring network, one per BSSID, strongest first (`best_signal`, else `signal`). */
 export interface Neighbor {
   bssid: string;
-  ap_mac: Mac;
   radio: string | null;
   essid: string | null;
   channel: number | null;
@@ -687,10 +689,7 @@ export interface Neighbor {
   security: string | null;
   signal: number | null;
   best_signal: number | null;
-  is_unifi: boolean;
-  ap_name: string | null;
   last_seen: number;
-  first_seen: number;
   vendor: string | null;
   nearest_ap: string | null;
 }
@@ -917,7 +916,6 @@ export interface Wlan {
   security_on_air: string | null;
   broadcast: { ap: Mac; name: string | null; radio: string | null; channel: number | null; bssid: string; clients: number | null; online: boolean }[];
   bands: string[];
-  ap_count: number;
   clients: number;
   peak_clients: number;
   satisfaction: number | null;
@@ -1055,8 +1053,8 @@ export const useFirmware = () =>
     refetchInterval: (q) => (q.state.data?.jobs.current || q.state.data?.jobs.queue.length ? 5_000 : 60_000),
   });
 export const checkFirmware = () => send<{ platforms: number }>("POST", "/api/firmware/check", {});
-/** Why an AP asked for was not queued; one already queued or updating is neither queued nor skipped. */
-export type FirmwareSkip = "up_to_date" | "ahead" | "unknown" | "offline" | "not_found";
+/** Why an AP asked for wasn't queued; "queued": it already is, or is updating. */
+export type FirmwareSkip = "up_to_date" | "ahead" | "unknown" | "offline" | "not_found" | "queued";
 export type FirmwareQueued = { queued: number; skipped: { mac: Mac; why: FirmwareSkip }[] };
 export const upgradeFirmware = (macs: Mac[]) => send<FirmwareQueued>("POST", "/api/firmware/upgrade", { macs });
 export const upgradeFirmwareUrl = (mac: Mac, url: string) => send<{ queued: number }>("POST", "/api/firmware/upgrade-url", { mac, url });
@@ -1094,8 +1092,16 @@ export const useDevices = () => useQuery({ queryKey: keys.devices(), queryFn: fe
 export const useDevice = (mac: Mac) =>
   useQuery({ queryKey: keys.device(mac), queryFn: getting<DeviceDetail>(`/api/devices/${mac}`) });
 
-/** Every client of the past year, with its latest sample: for the client list. */
-export const useClients = () => useQuery({ queryKey: keys.clients(), queryFn: getting<ListedClient[]>("/api/clients") });
+/**
+ * The client list: the connected clients, or with `all` every client of the past year. Switching keeps the
+ * rows shown until the other list arrives.
+ */
+export const useClients = (all: boolean) =>
+  useQuery({
+    queryKey: keys.clients(all),
+    queryFn: getting<ListedClient[]>(`/api/clients${qs({ connected: all ? undefined : "true" })}`),
+    placeholderData: keepPreviousData,
+  });
 
 /** Names by MAC, for links. */
 export type Names = Readonly<Record<Mac, string>>;
@@ -1107,19 +1113,21 @@ const deviceNames = (devices: DeviceSummary[]): Names => Object.fromEntries(devi
  * AP names (else their MAC) by MAC, in the server's order; the same object until a name changes. Kept apart
  * from `useDevices`, which refetches as the APs report: the live socket refreshes the names when an AP is
  * adopted, forgotten or renamed (its new name comes with the config), and the slow poll catches the rest.
+ * The query itself, for a view that must wait for the names (a list of every AP); links use `useDeviceNames`.
  */
-export function useDeviceNames(): Names {
+export function useDeviceNamesQuery() {
   const qc = useQueryClient();
-  return (
-    useQuery({
-      queryKey: keys.deviceNames(),
-      // Through the devices query, so that a page showing both (the overview, at mount) makes one request; always
-      // a new one, unless that query's is under way, since a name may have changed since it was cached.
-      queryFn: async () => deviceNames(await qc.fetchQuery({ queryKey: keys.devices(), queryFn: fetchDevices, staleTime: 0 })),
-      refetchInterval: 300_000,
-    }).data ?? NO_NAMES
-  );
+  return useQuery({
+    queryKey: keys.deviceNames(),
+    // Through the devices query, so that a page showing both (the overview, at mount) makes one request; always
+    // a new one, unless that query's is under way, since a name may have changed since it was cached.
+    queryFn: async () => deviceNames(await qc.fetchQuery({ queryKey: keys.devices(), queryFn: fetchDevices, staleTime: 0 })),
+    refetchInterval: 300_000,
+  });
 }
+
+/** The AP names, as `useDeviceNamesQuery` has them, and none until they are known: for links, which fall back to the MAC. */
+export const useDeviceNames = (): Names => useDeviceNamesQuery().data ?? NO_NAMES;
 
 /**
  * Client display names by MAC, for the clients that have one; the same object until a name changes.
@@ -1364,7 +1372,7 @@ export function useLiveUpdates(): void {
             if ((q.state.data as ClientDetail | undefined)?.sample.ap_mac === msg.mac) invalidate(q.queryKey, 4000);
           break;
         case "clients":
-          // Sent with every report that has clients, without saying which changed. The list holds every
+          // Sent with every report that has clients, without saying which changed. The list may hold every
           // client of the past year, so it follows more slowly.
           invalidate(keys.clients(), 20_000);
           break;
@@ -1729,7 +1737,7 @@ export const useChannelAi = () =>
   });
 export const startScan = (band: string) => send<{ scanning: Mac[] }>("POST", "/api/rf/scan", { band });
 export const runChannelAi = (bands?: string[]) => send<{ started: boolean }>("POST", "/api/rf/channel-ai/run", { bands });
-export const applyChannelPlan = (band: string, changes: { mac: Mac; name: string | null; from: number | null; to: number | null }[]) =>
+export const applyChannelPlan = (band: string, changes: { mac: Mac; name: string | null; from: number | null; to: number }[]) =>
   send<{ applied: number }>("POST", "/api/rf/channel-plan/apply", { band, changes });
 export const saveChannelAi = (patch: Record<string, unknown>) => send<{ saved: boolean; what: string }>("PUT", "/api/rf/channel-ai", { patch });
 

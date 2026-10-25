@@ -31,12 +31,15 @@ type SortKey =
   | "uptime"
   | "last_seen";
 
+/** The AP column's text: the AP's name, else its MAC. */
+const apText = (c: ListedClient) => c.ap_name ?? c.sample.ap_mac;
+
 function value(c: ListedClient, key: SortKey): string | number {
   switch (key) {
     case "name":
       return displayName(c).toLowerCase();
     case "ap":
-      return (c.ap_name ?? "").toLowerCase();
+      return apText(c).toLowerCase();
     case "essid":
       return (c.sample.essid ?? "").toLowerCase();
     // A disconnected client's last sample isn't shown ("—"), so it sorts as unknown.
@@ -109,9 +112,11 @@ function SortHeader({
 }
 
 function ClientList({ tabs }: { tabs: ReactNode }) {
-  const clients = useClients();
   const [filter, setFilter] = useState("");
   const [showGone, setShowGone] = useState(false);
+  // The disconnected clients are fetched only when shown; the connected list
+  // stays up while they load (and the full list while it is narrowed again).
+  const clients = useClients(showGone);
   const [sort, setSort] = useState<Sort>({
     key: "signal",
     desc: true,
@@ -134,7 +139,7 @@ function ClientList({ tabs }: { tabs: ReactNode }) {
           c.sample.mac,
           c.sample.ip,
           c.sample.essid,
-          c.ap_name,
+          apText(c),
         ].some((v) => v?.toLowerCase().includes(f)),
     )
     // Each client's key worked out once, not in every comparison.
@@ -238,9 +243,7 @@ const ClientRow = memo(function ClientRow({
       <td className="mono">{c.sample.ip ?? "—"}</td>
       <td>
         {c.sample.ap_mac ? (
-          <Link to={`/devices/${c.sample.ap_mac}`}>
-            {c.ap_name ?? c.sample.ap_mac}
-          </Link>
+          <Link to={`/devices/${c.sample.ap_mac}`}>{apText(c)}</Link>
         ) : (
           "—"
         )}

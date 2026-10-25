@@ -362,7 +362,7 @@ function occupancy(
     if (nb.channel === null || nb.signal === null) continue;
     const w = nb.bw ?? 20;
     out.push({
-      key: nb.bssid + nb.ap_mac,
+      key: nb.bssid,
       label: nb.essid || "hidden network",
       freq:
         nb.center_freq && nb.bw && nb.bw > 20
@@ -397,17 +397,15 @@ function Environment() {
 
   const shapes = occupancy(n.data?.neighbors ?? [], r.data ?? [], band);
   const term = q.trim().toLowerCase();
-  // One row per network (the server merges what our APs heard, and leaves out
-  // our own BSSIDs).
-  const list = (n.data?.neighbors ?? [])
-    .filter(
-      (x) =>
-        !term ||
-        [x.essid, x.bssid, x.vendor, x.nearest_ap].some((v) =>
-          v?.toLowerCase().includes(term),
-        ),
-    )
-    .sort((a, b) => (b.best_signal ?? -200) - (a.best_signal ?? -200));
+  // One row per network, strongest first (the server merges what our APs
+  // heard, leaves out our own BSSIDs and sorts them).
+  const list = (n.data?.neighbors ?? []).filter(
+    (x) =>
+      !term ||
+      [x.essid, x.bssid, x.vendor, x.nearest_ap].some((v) =>
+        v?.toLowerCase().includes(term),
+      ),
+  );
 
   return (
     <>

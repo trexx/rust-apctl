@@ -34,9 +34,8 @@ const SKIP: Record<FirmwareSkip, string> = {
   unknown: "no release for it",
   offline: "offline",
   not_found: "not a known AP",
+  queued: "already queued or updating",
 };
-
-const ALREADY = "already queued or updating";
 
 /** An upgrade request's outcome for `asked` APs: how many were queued, and which were not and why. */
 function queuedText(
@@ -47,12 +46,9 @@ function queuedText(
   if (asked === 1)
     return r.queued
       ? "Queued."
-      : `Not queued: ${r.skipped[0] ? SKIP[r.skipped[0].why] : `it is ${ALREADY}`}.`;
-  const parts = [`${r.queued} queued`];
-  const already = asked - r.queued - r.skipped.length;
-  if (already > 0) parts.push(`${already} ${ALREADY}`);
-  parts.push(...r.skipped.map((k) => `${name(k.mac)}: ${SKIP[k.why]}`));
-  return `${parts.join("; ")}.`;
+      : `Not queued: ${r.skipped.map((k) => SKIP[k.why]).join(", ")}.`;
+  const skipped = r.skipped.map((k) => `${name(k.mac)}: ${SKIP[k.why]}`);
+  return `${[`${r.queued} queued`, ...skipped].join("; ")}.`;
 }
 
 const STEP: Record<FirmwareJob["state"], string> = {
@@ -223,7 +219,7 @@ export function FirmwarePanel() {
                 const { queued } = await upgradeFirmwareUrl(urlFor, url);
                 setUrlFor(null);
                 setUrl("");
-                return queued ? "Queued." : `Not queued: it is ${ALREADY}.`;
+                return queued ? "Queued." : `Not queued: it is ${SKIP.queued}.`;
               });
             }}
           >
