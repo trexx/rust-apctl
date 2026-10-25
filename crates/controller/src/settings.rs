@@ -972,9 +972,8 @@ fn wlan_limits(state: &Value) -> Vec<Over> {
     let mut out = Vec::new();
     let setting_on = |key: &str, default: bool| flag(setting(state, key), "enabled", default);
     let (meshing, element_adopt) = (setting_on("connectivity", true), setting_on("element_adopt", false));
-    // Each SSID's bands and the APs it goes to (`None`: all, sorted otherwise), worked out once.
-    let wlans: Vec<(Vec<&str>, Option<Vec<inform::Mac>>)> =
-        docs(state, "wlanconf").map(|w| (w["wlan_bands"].as_array().into_iter().flatten().filter_map(Value::as_str).collect(), wlan_aps(state, w))).collect();
+    // Each SSID's bands as the render deploys it and the APs it goes to (`None`: all, sorted otherwise), worked out once.
+    let wlans: Vec<(Vec<&str>, Option<Vec<inform::Mac>>)> = docs(state, "wlanconf").map(|w| (apcfg::wlan_bands(w), wlan_aps(state, w))).collect();
     for d in docs(state, "devices") {
         let Some(mac) = doc_mac(&d["mac"]) else { continue };
         let name = device_label(d, mac);
@@ -1253,7 +1252,7 @@ struct Bands {
     g6: bool,
 }
 
-/// The bands, and the `wlan_band` derived from them. Returns the bands.
+/// The bands ([`apcfg::wlan_bands`]), and the `wlan_band` derived from them. Returns the bands.
 fn wlan_bands(p: &Value, w: &mut Value) -> Result<Bands, String> {
     if !p["wlan_bands"].is_null() {
         let bands: Option<Vec<&str>> = p["wlan_bands"].as_array().ok_or("wlan_bands must be a list")?.iter().map(Value::as_str).collect();
@@ -1261,8 +1260,11 @@ fn wlan_bands(p: &Value, w: &mut Value) -> Result<Bands, String> {
         dedup_in_order(&mut bands);
         w["wlan_bands"] = json!(bands);
     }
-    let on = |b: &str| w["wlan_bands"].as_array().into_iter().flatten().any(|x| x.as_str() == Some(b));
-    let bands = Bands { g2: on("2g"), g5: on("5g"), g6: on("6g") };
+    // As the render deploys it: 2.4 and 5 GHz when the stored list names no band,
+    // which the record then says.
+    let read = apcfg::wlan_bands(w);
+    let bands = Bands { g2: read.contains(&"2g"), g5: read.contains(&"5g"), g6: read.contains(&"6g") };
+    w["wlan_bands"] = json!(read);
     if bands.g6 && !(flag(w, "wpa3_support", false) || w["security"].as_str() == Some("open")) {
         return Err("6 GHz needs WPA3 (or an open network)".into());
     }
@@ -2077,6 +2079,21 @@ mod tests {
     }
 
     #[test]
+    fn an_ssid_stored_without_bands_is_on_2_4_and_5_ghz_as_the_render_deploys_it() {
+        for stored in [Value::Null, json!([])] {
+            let mut s = state();
+            edit(&mut s, json!({ "no2ghz_oui": true, "iot_channel_lock": true })).unwrap();
+            s["wlanconf"][0]["wlan_bands"] = stored.clone();
+            // A rename keeps band steering, the lock and its APs' channel 6; the record then names the bands.
+            edit(&mut s, json!({ "name": "Renamed" })).unwrap();
+            let w = &s["wlanconf"][0];
+            assert_eq!((w["no2ghz_oui"].as_bool(), w["iot_channel_lock"].as_bool(), w["wlan_band"].as_str()), (Some(true), Some(true), Some("both")), "{stored}");
+            assert_eq!(w["wlan_bands"], json!(["2g", "5g"]));
+            assert_eq!(s["devices"][0]["radio_table"][0]["channel"], "6");
+        }
+    }
+
+    #[test]
     fn force_wifi4_clears_and_then_holds_the_newer_features() {
         let mut s = state();
         edit(&mut s, json!({ "protection": "wpa2_wpa3", "proxy_arp": true, "dns_assistance_mode": "auto", "no2ghz_oui": true })).unwrap();
@@ -2600,6 +2617,11 @@ mod tests {
         assert_eq!(check(&s).unwrap_err(), "Hall would have 8 SSIDs on its 2.4 GHz radio; it supports 7");
         s["wlanconf"].as_array_mut().unwrap().truncate(7);
         check(&s).unwrap();
+        // An SSID that names no band goes on 2.4 and 5 GHz, and counts on both.
+        s["wlanconf"].as_array_mut().unwrap().push(json!({ "_id": "w9", "name": "Old", "ap_group_ids": ["all"] }));
+        assert_eq!(check(&s).unwrap_err(), "Hall would have 8 SSIDs on its 2.4 GHz radio; it supports 7");
+        s["wlanconf"] = json!((0..7).map(|i| wlan(i, json!(["5g"]), json!(["all"]))).chain([wlan(9, json!([]), json!(["all"]))]).collect::<Vec<_>>());
+        assert!(check(&s).unwrap_err().contains("8 SSIDs on its 5 GHz radio"));
     }
 
     /// Every `setting` document the controller reads (by key) is one an import

@@ -619,7 +619,7 @@ fn wlan_settings(state: Option<&Value>, essid: &str) -> Value {
     let vlan = apcfg::ssid_vlan(state, crate::settings::site_id(state).unwrap_or_default(), w);
     json!({
         "enabled": flag(w, "enabled", true), "security": security, "hidden": flag(w, "hide_ssid", false), "guest": flag(w, "is_guest", false),
-        "network": network, "vlan": vlan, "bands": w["wlan_bands"].clone(), "fast_roaming": flag(w, "fast_roaming_enabled", false),
+        "network": network, "vlan": vlan, "bands": apcfg::wlan_bands(w), "fast_roaming": flag(w, "fast_roaming_enabled", false),
         "bss_transition": flag(w, "bss_transition", true), "pmf": w["pmf_mode"].as_str(),
     })
 }

@@ -1517,7 +1517,10 @@
           ]
         },
         "settings": {
-          "bands": null,
+          "bands": [
+            "2g",
+            "5g"
+          ],
           "bss_transition": true,
           "enabled": true,
           "fast_roaming": false,
