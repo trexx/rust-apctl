@@ -1233,13 +1233,15 @@ async fn ws(
     headers: axum::http::HeaderMap,
     uri: axum::http::Uri,
     peer: Option<axum::Extension<axum::extract::ConnectInfo<std::net::SocketAddr>>>,
+    session: Option<axum::Extension<crate::auth::SessionId>>,
     upgrade: WebSocketUpgrade,
 ) -> Response {
     if !s.auth.same_origin(&headers, peer.map(|p| p.0.0.ip()), uri.authority().map(|a| a.as_str())) {
         return ApiError::forbidden("the live socket is only for pages of this server").into_response();
     }
     let rx = s.tx.subscribe();
-    let (auth, session) = (s.auth.clone(), s.auth.session_of(&headers));
+    // The session require_login let the request in with, which the socket keeps checking.
+    let (auth, session) = (s.auth.clone(), session.map(|s| s.0.0));
     upgrade.on_upgrade(move |socket| live_socket(socket, rx, auth, session))
 }
 
