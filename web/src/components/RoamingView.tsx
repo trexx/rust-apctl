@@ -28,7 +28,14 @@ export function RoamingView() {
 }
 
 function Summary({ data }: { data: Roaming }) {
-  const { roams: n, successes: ok, fast } = data.total;
+  const {
+    roams: n,
+    successes: ok,
+    fast,
+    clients,
+    to_weaker: weaker,
+    quick_returns: back,
+  } = data.total;
   if (n === 0)
     return (
       <div className="muted small">
@@ -36,14 +43,12 @@ function Summary({ data }: { data: Roaming }) {
         same network.
       </div>
     );
-  const weaker = data.clients.reduce((a, c) => a + c.to_weaker, 0);
-  const back = data.clients.reduce((a, c) => a + c.quick_returns, 0);
   return (
     <div className="stats">
       <Stat
         label="Roams"
         value={n}
-        sub={`${data.clients.length} client${data.clients.length === 1 ? "" : "s"}`}
+        sub={`${clients} client${clients === 1 ? "" : "s"}`}
       />
       <Stat
         label="Successful"
@@ -104,7 +109,7 @@ function Details({ data }: { data: Roaming }) {
                   </td>
                   <td>{p.forward.fast + p.backward.fast}</td>
                   <td className="small">
-                    {p.top_clients.slice(0, 3).map((c, i) => (
+                    {p.top_clients.map((c, i) => (
                       <span key={c.mac}>
                         {i > 0 && ", "}
                         <Link to={`/clients/${c.mac}`}>{client(c.mac)}</Link> (
@@ -131,7 +136,7 @@ function Details({ data }: { data: Roaming }) {
               ]}
             />
             <tbody>
-              {data.clients.slice(0, 10).map((c) => (
+              {data.clients.map((c) => (
                 <tr key={c.mac}>
                   <td>
                     <Link to={`/clients/${c.mac}`}>{client(c.mac)}</Link>
