@@ -161,37 +161,66 @@ where
     Err(last)
 }
 
+/// How a command on the AP ended: an exit status, or the signal that killed it.
+#[derive(Debug)]
+enum Exit {
+    Status(u32),
+    Signal(String),
+}
+
 impl Session {
     /// Runs a command and returns what it printed; an error if it exited
-    /// non-zero or didn't finish in time.
+    /// non-zero, was killed by a signal or didn't finish in time.
     async fn run(&self, cmd: &str) -> Result<String, Failure> {
-        let mut out = Vec::new();
-        let mut status = None;
+        // What it printed on stdout and on stderr, together at most MAX_OUTPUT.
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let mut exit = None;
         let run = async {
             let mut ch = self.handle.channel_open_session().await.map_err(|e| Failure::Command(e.to_string()))?;
             ch.exec(true, cmd).await.map_err(|e| Failure::Command(e.to_string()))?;
             // The exit status comes after the end of the output, so read until the channel closes.
             while let Some(msg) = ch.wait().await {
-                match msg {
-                    russh::ChannelMsg::Data { data } => {
-                        if out.len() + data.len() > MAX_OUTPUT {
-                            return Err(Failure::Command(format!("more than {MAX_OUTPUT} bytes of output")));
-                        }
-                        out.extend_from_slice(&data)
+                let (stderr, data) = match msg {
+                    russh::ChannelMsg::Data { data } => (false, data),
+                    russh::ChannelMsg::ExtendedData { data, ext: 1 } => (true, data),
+                    russh::ChannelMsg::ExitStatus { exit_status } => {
+                        exit = Some(Exit::Status(exit_status));
+                        continue;
                     }
-                    russh::ChannelMsg::ExitStatus { exit_status } => status = Some(exit_status),
+                    russh::ChannelMsg::ExitSignal { signal_name, .. } => {
+                        exit = Some(Exit::Signal(match signal_name {
+                            russh::Sig::Custom(name) => name,
+                            sig => format!("{sig:?}"),
+                        }));
+                        continue;
+                    }
                     russh::ChannelMsg::Close => break,
-                    _ => {}
+                    _ => continue,
+                };
+                if out.len() + err.len() + data.len() > MAX_OUTPUT {
+                    return Err(Failure::Command(format!("more than {MAX_OUTPUT} bytes of output")));
                 }
+                let buf = if stderr { &mut err } else { &mut out };
+                buf.extend_from_slice(&data);
             }
             Ok(())
         };
         tokio::time::timeout(STEP_TIMEOUT, run).await.map_err(|_| Failure::Command("timed out".into()))??;
-        let out = String::from_utf8_lossy(&out).into_owned();
-        match status {
-            Some(code) if code != 0 => Err(Failure::Command(format!("exit status {code}: {}", out.trim()))),
-            _ => Ok(out),
-        }
+        outcome(&out, &err, exit)
+    }
+}
+
+/// What a command's run comes to: its output, or for a non-zero exit status or a
+/// signal a failure that says what it printed (stdout, else stderr). A channel
+/// closed without either counts as done: the AP may drop the session as set-adopt
+/// takes effect.
+fn outcome(out: &[u8], err: &[u8], exit: Option<Exit>) -> Result<String, Failure> {
+    let text = |b: &[u8]| String::from_utf8_lossy(b).trim().to_string();
+    let said = || Some(text(out)).filter(|t| !t.is_empty()).unwrap_or_else(|| text(err));
+    match exit {
+        Some(Exit::Status(code)) if code != 0 => Err(Failure::Command(format!("exit status {code}: {}", said()))),
+        Some(Exit::Signal(sig)) => Err(Failure::Command(format!("killed by signal {sig}: {}", said()))),
+        _ => Ok(String::from_utf8_lossy(out).into_owned()),
     }
 }
 
@@ -542,6 +571,15 @@ mod tests {
         // Unless the key file has the AP's key, which its informs open with: the record takes it.
         let (_, made) = ssh_record(&mut st, &mac, &payload, None, false, Some([7; 16])).unwrap();
         assert_eq!((made.key, crate::adopt::device_doc(&st, &mac).unwrap()["x_authkey"].as_str()), ([7; 16], Some("07".repeat(16).as_str())));
+    }
+
+    #[test]
+    fn a_failed_command_says_why() {
+        assert_eq!(outcome(b"ok\n", b"", Some(Exit::Status(0))), Ok("ok\n".into()));
+        assert_eq!(outcome(b"", b"set-adopt: bad key\n", Some(Exit::Status(1))), Err(Failure::Command("exit status 1: set-adopt: bad key".into())), "stderr when stdout is empty");
+        assert_eq!(outcome(b"usage\n", b"error", Some(Exit::Status(2))), Err(Failure::Command("exit status 2: usage".into())));
+        assert_eq!(outcome(b"", b"", Some(Exit::Signal("KILL".into()))), Err(Failure::Command("killed by signal KILL: ".into())), "killed: no success");
+        assert_eq!(outcome(b"", b"", None), Ok(String::new()), "closed without a status");
     }
 
     #[test]
