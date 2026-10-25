@@ -743,9 +743,11 @@ impl Watcher {
     async fn health_tick(&mut self, now: Ts) {
         // Clears past the cooldown no longer hold anything back (see `may_raise`).
         self.cleared.retain(|_, t| (0..HEALTH_COOLDOWN).contains(&(now - *t)));
+        // Known: reporting, or remembered as status_tick counts them (an AP not heard
+        // from yet after a restart keeps its alerts for the unjudged checks).
         let (online, known): (HashSet<Mac>, HashSet<Mac>) = {
             let l = self.live.read().unwrap();
-            (l.devices.iter().filter(|(_, d)| d.online).map(|(m, _)| *m).collect(), l.devices.keys().copied().collect())
+            (l.devices.iter().filter(|(_, d)| d.online).map(|(m, _)| *m).collect(), l.devices.keys().chain(l.known_devices.keys()).copied().collect())
         };
         // Two databases, each read on a blocking thread of its own: side by side.
         let (radios, failing) = tokio::join!(radio_health(&self.store, now), failing_clients(&self.store, now));
@@ -1248,6 +1250,22 @@ mod tests {
         w.cleared.insert((Key::ConnectFailures, Entity::Site), now - 60);
         w.health_tick(now).await;
         assert!(w.cleared.keys().eq([&(Key::ConnectFailures, Entity::Site)]));
+    }
+
+    #[tokio::test]
+    async fn health_alerts_of_an_ap_not_heard_from_yet_after_a_restart_stay_open() {
+        let (mut w, mut rx, _dir) = watcher();
+        let ap: Mac = "02:00:00:00:00:01".parse().unwrap();
+        let k = (Key::BusyChannel, Entity::Radio(ap, "na".into()));
+        w.book.open(1000, Alert::new(Key::BusyChannel, Category::Health, Severity::Medium, k.1.clone(), "t".into(), "m".into()));
+        told(&mut rx);
+        w.live.write().unwrap().known_devices.insert(ap, crate::engine::KnownDevice { last_seen: 900, ..Default::default() });
+        w.health_tick(2000).await;
+        assert!(told(&mut rx).is_empty() && w.book.open.contains_key(&k) && !w.cleared.contains_key(&k));
+        // Forgotten: it closes at once.
+        w.live.write().unwrap().known_devices.clear();
+        w.health_tick(2060).await;
+        assert_eq!(told(&mut rx), [("resolved", "busy_channel")]);
     }
 
     #[tokio::test]
