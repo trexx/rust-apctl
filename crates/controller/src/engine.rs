@@ -1136,6 +1136,8 @@ impl Engine {
         // The new settings may hold the syslog key of an AP given up on.
         self.syslog_unknown.clear();
         self.emit(Event::site(ts, EventKind::SettingsImported, summary));
+        // Every AP's config may have changed: as after an edit, they pick it up now.
+        crate::stun::poke_all(&self.live.read().unwrap());
     }
 
     /// The engine is the only writer of the settings, so they cannot change
