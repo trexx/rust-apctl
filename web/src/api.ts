@@ -98,12 +98,23 @@ export interface Multicast {
 export interface ListedClientView {
   sample: ListedSample;
   connected: boolean;
-  first_seen: number;
   last_seen: number;
 }
 
-/** A client with its name, manufacturer and controls, as the client list and its own page send it. */
-export interface ClientView extends ListedClientView {
+/** A client in the client list: its view, its alias and note, and the name of the AP it is on (null when that AP has no name, or is not reporting). */
+export interface ListedClient extends ListedClientView {
+  alias: string | null;
+  note: string | null;
+  ap_name: string | null;
+}
+
+/** A client in a multicast group, as a client's page lists its peers. */
+export type GroupMember = { mac: Mac; name: string };
+
+/** A client's page: its whole sample (the multicast tables too), its name, manufacturer and controls, and the peers in its groups. */
+export interface ClientDetail extends ListedClientView {
+  sample: ClientSample;
+  first_seen: number;
   vendor: string | null;
   alias: string | null;
   note: string | null;
@@ -113,25 +124,12 @@ export interface ClientView extends ListedClientView {
   locked_to: Mac | null;
   /** From the settings: the client's own speed limit (user group). */
   usergroup_id: string | null;
-}
-
-/** A client in the client list: its view, and the name of the AP it is on (null when that AP has no name, or is not reporting). */
-export interface ListedClient extends ClientView {
-  ap_name: string | null;
-}
-
-/** A client in a multicast group, as a client's page lists its peers. */
-export type GroupMember = { mac: Mac; name: string };
-
-/** A client's page: its view with its whole sample (the multicast tables too), and the peers in its groups. */
-export interface ClientDetail extends ClientView {
-  sample: ClientSample;
   /** For each group it joined, the other connected clients that joined it too (groups without any are left out). */
   peers: Record<string, GroupMember[]>;
 }
 
 /** The name to show for a client: the user's alias, else its hostname, else its MAC. */
-export const displayName = (c: ClientView) => c.alias || c.sample.hostname || c.sample.mac;
+export const displayName = (c: { alias: string | null; sample: Pick<ClientSample, "hostname" | "mac"> }) => c.alias || c.sample.hostname || c.sample.mac;
 
 export interface VapSample {
   bssid: string;

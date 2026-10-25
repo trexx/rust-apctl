@@ -93,6 +93,8 @@ function ClientPage({ mac }: { mac: string }) {
           alias={c?.alias ?? null}
           note={c?.note ?? null}
           hostname={c?.sample.hostname ?? null}
+          vendor={c?.vendor ?? null}
+          firstSeen={c ? `first seen ${ago(c.first_seen, now)}` : null}
         />
       }
     >
@@ -275,6 +277,9 @@ function AliasHeader(p: {
   alias: string | null;
   note: string | null;
   hostname: string | null;
+  /** The manufacturer, by the MAC's prefix. */
+  vendor: string | null;
+  firstSeen: string | null;
 }) {
   const canEdit = useCanEdit();
   const [editing, setEditing] = useState(false);
@@ -350,6 +355,8 @@ function AliasHeader(p: {
       <div className="muted small">
         {p.alias && p.hostname ? <>{p.hostname} · </> : null}
         <span className="mono">{p.mac}</span>
+        {p.vendor ? <> · {p.vendor}</> : null}
+        {p.firstSeen ? <> · {p.firstSeen}</> : null}
         {p.note ? <> · {p.note}</> : null}
       </div>
     </div>
