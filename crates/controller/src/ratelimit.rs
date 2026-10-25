@@ -49,7 +49,7 @@ impl Groups {
         if self.state.is(state) {
             return;
         }
-        let mut g = Groups { state: MadeFrom::of(state), default: crate::settings::default_usergroup(state), ..Default::default() };
+        let mut g = Groups { state: MadeFrom::of(state), default: crate::usergroups::default_usergroup(state), ..Default::default() };
         let mut own = HashMap::new();
         for c in docs(state, "clients") {
             if let Some(mac) = doc_mac(&c["mac"]) {
