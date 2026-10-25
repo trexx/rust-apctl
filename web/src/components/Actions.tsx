@@ -13,7 +13,7 @@ import {
   useUserGroups,
 } from "../api";
 import type { Mac, Names } from "../api";
-import { Outcome, useRunner } from "./common";
+import { Outcome, errorText, useRunner } from "./common";
 import { Select } from "./settings/form";
 import {
   speedLimitLabel,
@@ -132,8 +132,8 @@ export function ClientActions({
   connected: boolean;
   blocked: boolean;
   lockedTo: Mac | null;
-  /** AP names by MAC, for the lock. */
-  aps: Names;
+  /** The AP names query (`useDeviceNamesQuery`), for the lock: it waits for them, as a locked AP would show as unknown until then. */
+  aps: { data?: Names; error: unknown };
   usergroupId: string | null;
 }) {
   const { can, why } = useCanAct();
@@ -192,21 +192,32 @@ export function ClientActions({
         </button>
         <label className="small">
           Lock to AP{" "}
-          <Select
-            disabled={off}
-            value={lockedTo ?? ""}
-            onChange={(v) => {
-              const ap = v || null;
-              void run(
-                () => lockClient(mac, ap),
-                ap
-                  ? "Locked: the other APs refuse it once their config is updated."
-                  : "Unlocked: it can use any AP.",
-              );
-            }}
-            stray={(v) => `${v} (not known)`}
-            options={[["", "Any AP"], ...Object.entries(aps)]}
-          />
+          {aps.data ? (
+            <Select
+              disabled={off}
+              value={lockedTo ?? ""}
+              onChange={(v) => {
+                const ap = v || null;
+                void run(
+                  () => lockClient(mac, ap),
+                  ap
+                    ? "Locked: the other APs refuse it once their config is updated."
+                    : "Unlocked: it can use any AP.",
+                );
+              }}
+              stray={(v) => `${v} (not known)`}
+              options={[["", "Any AP"], ...Object.entries(aps.data)]}
+            />
+          ) : aps.error ? (
+            <span className="error">{errorText(aps.error)}</span>
+          ) : (
+            <Select
+              disabled
+              value=""
+              onChange={() => {}}
+              options={[["", "loading APs…"]]}
+            />
+          )}
         </label>
         {limits.length > 0 && (
           <label className="small">

@@ -7,7 +7,7 @@ import {
   setAlias,
   useCanEdit,
   useClient,
-  useDeviceNames,
+  useDeviceNamesQuery,
   useEvents,
   useSeries,
 } from "../api";
@@ -55,7 +55,8 @@ export function Client() {
 function ClientPage({ mac }: { mac: string }) {
   const [range, setRange] = useTimeSpan(6 * 3600);
   const client = useClient(mac);
-  const names = useDeviceNames();
+  const apNames = useDeviceNamesQuery();
+  const names = apNames.data ?? {};
   const now = useNow();
   const c = client.data;
   const s = c?.sample;
@@ -104,7 +105,7 @@ function ClientPage({ mac }: { mac: string }) {
         connected={c?.connected ?? false}
         blocked={c?.blocked ?? false}
         lockedTo={c?.locked_to ?? null}
-        aps={names}
+        aps={apNames}
         usergroupId={c?.usergroup_id ?? null}
       />
       {c?.blocked && (
