@@ -574,11 +574,11 @@ async fn device(State(s): State<AppState>, MacPath(mac): MacPath) -> Result<Resp
 }
 
 /// A client as its page shows it: its view, plus its name, manufacturer and controls.
-/// The list sends a smaller view (`ListedView`).
+/// The list sends less (`ListedClient`).
 #[derive(Serialize)]
-struct ClientRow<'a, V = &'a ClientView> {
+struct ClientRow<'a> {
     #[serde(flatten)]
-    view: V,
+    view: &'a ClientView,
     alias: Option<&'a str>,
     note: Option<&'a str>,
     vendor: Option<&'a str>,
@@ -586,12 +586,14 @@ struct ClientRow<'a, V = &'a ClientView> {
     controls: crate::actions::Controls<'a>,
 }
 
-/// A client in the client list: as on its page, without the multicast tables, plus the
-/// name of the AP it is on.
+/// A client in the client list: the smaller view, its name, and the name of the AP it is on.
+/// The manufacturer and the controls are only on its page.
 #[derive(Serialize)]
 struct ListedClient<'a> {
     #[serde(flatten)]
-    client: ClientRow<'a, ListedView<'a>>,
+    view: ListedView<'a>,
+    alias: Option<&'a str>,
+    note: Option<&'a str>,
     /// Null when that AP has no name (see `series::ap_name_of`), or was forgotten.
     ap_name: Option<&'a str>,
 }
@@ -603,15 +605,14 @@ struct ListedClient<'a> {
 struct ListedView<'a> {
     sample: ListedSample<'a>,
     connected: bool,
-    first_seen: Ts,
     last_seen: Ts,
 }
 
 impl<'a> ListedView<'a> {
     fn new(view: &'a ClientView) -> ListedView<'a> {
         // In full, so that a field added to the view is a compile error here rather than missing from the list.
-        let ClientView { sample, connected, first_seen, last_seen } = view;
-        ListedView { sample: ListedSample(sample), connected: *connected, first_seen: *first_seen, last_seen: *last_seen }
+        let ClientView { sample, connected, first_seen: _, last_seen } = view;
+        ListedView { sample: ListedSample(sample), connected: *connected, last_seen: *last_seen }
     }
 }
 
@@ -638,7 +639,7 @@ impl Serialize for ListedSample<'_> {
     }
 }
 
-type ClientCopy = (Mac, ClientView, Option<crate::engine::Alias>);
+type ClientCopy = (ClientView, Option<crate::engine::Alias>);
 
 #[derive(Deserialize)]
 struct ClientsQuery {
@@ -654,25 +655,20 @@ async fn clients(State(s): State<AppState>, Query(q): Query<ClientsQuery>) -> Re
     // What each client's entry needs, copied under the lock (the samples are
     // shared, the rest is small); the serialising happens after it.
     // The APs' names once each, rather than once per client.
-    let (state, list, ap_names) = {
+    let (list, ap_names) = {
         let live = s.live.read().unwrap();
-        let list: Vec<ClientCopy> =
-            live.clients.iter().filter(|(_, c)| c.connected || !q.connected).map(|(mac, c)| (*mac, c.clone(), live.aliases.get(mac).cloned())).collect();
+        let pick = |(mac, c): (&Mac, &ClientView)| (c.clone(), live.aliases.get(mac).cloned());
+        let list: Vec<ClientCopy> = if q.connected { live.connected_clients().map(pick).collect() } else { live.clients.iter().map(pick).collect() };
         let aps = live.devices.keys().chain(live.known_devices.keys());
         let ap_names: std::collections::HashMap<Mac, String> = aps.filter_map(|m| Some((*m, crate::series::ap_name_of(&live, m)?))).collect();
-        (live.state.clone(), list, ap_names)
+        (list, ap_names)
     };
-    let controls = crate::actions::ClientControls::new(state.as_deref());
     let rows: Vec<ListedClient> = list
         .iter()
-        .map(|(mac, view, alias)| ListedClient {
-            client: ClientRow {
-                view: ListedView::new(view),
-                alias: alias.as_ref().and_then(|a| a.alias.as_deref()),
-                note: alias.as_ref().and_then(|a| a.note.as_deref()),
-                vendor: s.vendors.lookup(mac),
-                controls: controls.get(mac),
-            },
+        .map(|(view, alias)| ListedClient {
+            view: ListedView::new(view),
+            alias: alias.as_ref().and_then(|a| a.alias.as_deref()),
+            note: alias.as_ref().and_then(|a| a.note.as_deref()),
             ap_name: ap_names.get(&view.sample.ap_mac).map(String::as_str),
         })
         .collect();
@@ -1427,11 +1423,12 @@ mod tests {
         assert_eq!(sorted(&one["device"]["snapshot"]), ["ap", "has_vap_table", "radios", "uplink", "vaps"]);
         let clients = get_json(&app, "/api/clients").await;
         assert_eq!((clients[0]["ap_name"].as_str(), clients[0]["connected"].as_bool(), clients[0]["sample"]["essid"].as_str()), (Some("Hall"), Some(true), Some("Home")));
-        assert!(clients[0]["alias"].is_null() && clients[0].get("blocked").is_some(), "{}", clients[0]);
+        assert!(clients[0]["alias"].is_null(), "{}", clients[0]);
         // A client of the AP not reporting since the start: the AP by its stored name.
         assert_eq!((clients[1]["ap_name"].as_str(), clients[1]["connected"].as_bool()), (Some("Attic"), Some(false)));
         let keys = |v: &Value| v.as_object().unwrap().keys().cloned().collect::<Vec<_>>().join(",");
-        assert_eq!(keys(&clients[0]), "alias,ap_name,blocked,connected,first_seen,last_seen,locked_to,note,sample,usergroup_id,vendor");
+        assert_eq!(keys(&clients[0]), "alias,ap_name,connected,last_seen,note,sample", "no manufacturer, controls or first_seen: those are the page's");
+        assert_eq!(get_json(&app, "/api/clients?connected=true").await, json!([clients[0]]), "only the connected one, the same row");
         let one = get_json(&app, "/api/clients/02:00:00:00:01:01").await;
         assert_eq!(keys(&one), "alias,blocked,connected,first_seen,last_seen,locked_to,note,peers,sample,usergroup_id,vendor", "no ap_name, as before");
         // The list's sample is the page's with only what the lists read.
