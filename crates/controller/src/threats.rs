@@ -1002,8 +1002,8 @@ mod tests {
     use super::*;
     use crate::model::tests::{TestDir, TestStore, flushed};
 
-    const UP: &str = "78:45:58:3c:51:ac";
-    const DOWN: &str = "78:45:58:3c:52:bc";
+    const UP: &str = "02:00:00:3c:51:ac";
+    const DOWN: &str = "02:00:00:3c:52:bc";
 
     fn heard(bssid: &str, by: &str, essid: &str, channel: i64, security: &str, signal: i64) -> Heard {
         Heard {
@@ -1025,9 +1025,9 @@ mod tests {
         a.aps.insert(UP.into(), Some("Upstairs".into()));
         a.aps.insert(DOWN.into(), Some("Garage".into()));
         for (b, ap, e, ch) in [
-            ("78:45:58:3c:51:ae", UP, "Home", 44),
+            ("02:00:00:3c:51:ae", UP, "Home", 44),
             ("7a:45:58:3c:51:ae", UP, "Home IoT", 1),
-            ("78:45:58:3c:52:be", DOWN, "Home", 48),
+            ("02:00:00:3c:52:be", DOWN, "Home", 48),
             ("7a:45:58:3c:52:be", DOWN, "Home IoT", 1),
         ] {
             a.own.push(OwnBss { bssid: b.into(), ap_mac: ap.into(), essid: Some(e.into()), channel: Some(ch), changed_at: 0 });
@@ -1035,8 +1035,8 @@ mod tests {
         }
         a.clients = sorted_clients([("3c:55:76:00:00:03".parse().unwrap(), Some("phone".into()))]).into();
         // Our APs hear each other normally.
-        a.heard.push(heard("78:45:58:3c:52:be", UP, "Home", 48, "WPA2-Personal (AES/CCMP)", -81));
-        a.heard.push(heard("78:45:58:3c:51:ae", DOWN, "Home", 44, "WPA2-Personal (AES/CCMP)", -84));
+        a.heard.push(heard("02:00:00:3c:52:be", UP, "Home", 48, "WPA2-Personal (AES/CCMP)", -81));
+        a.heard.push(heard("02:00:00:3c:51:ae", DOWN, "Home", 44, "WPA2-Personal (AES/CCMP)", -84));
         // A neighbour.
         a.heard.push(heard("2a:00:00:00:00:07", UP, "Neighbour Net", 44, "WPA2-Personal (AES/CCMP)", -74));
         a
@@ -1066,7 +1066,7 @@ mod tests {
         // called different, whichever row comes last, and one with neither
         // names both.
         let mut a = site();
-        a.heard.push(heard("78:45:58:3c:52:be", UP, "Home", 48, "WPA3-Personal", -81));
+        a.heard.push(heard("02:00:00:3c:52:be", UP, "Home", 48, "WPA3-Personal", -81));
         for (sec, different) in [("WPA2-Personal (AES/CCMP)", false), ("WPA3-Personal", false), ("WPA-Personal (TKIP)", true)] {
             for order in [false, true] {
                 let mut a = Assessment { heard: a.heard.clone(), own: a.own.clone(), ssids: a.ssids.clone(), aps: a.aps.clone(), now: a.now, ..Default::default() };
@@ -1090,17 +1090,17 @@ mod tests {
     #[test]
     fn our_bssid_on_another_channel_is_spoofing_unless_we_moved() {
         let mut a = site();
-        a.heard.push(heard("78:45:58:3c:52:be", UP, "Home", 149, "WPA2-Personal (AES/CCMP)", -60));
+        a.heard.push(heard("02:00:00:3c:52:be", UP, "Home", 149, "WPA2-Personal (AES/CCMP)", -60));
         // (replaces the normal sighting: one row per BSSID and hearing AP)
-        a.heard.retain(|h| !(h.bssid == "78:45:58:3c:52:be" && h.channel == Some(48)));
-        assert_eq!(kinds(&a), vec![(Kind::SpoofedBssid, Severity::High, "78:45:58:3c:52:be".into())]);
+        a.heard.retain(|h| !(h.bssid == "02:00:00:3c:52:be" && h.channel == Some(48)));
+        assert_eq!(kinds(&a), vec![(Kind::SpoofedBssid, Severity::High, "02:00:00:3c:52:be".into())]);
         // The scan predates our own channel change: not reported.
-        a.own.iter_mut().find(|o| o.bssid == "78:45:58:3c:52:be").unwrap().changed_at = 20_000;
+        a.own.iter_mut().find(|o| o.bssid == "02:00:00:3c:52:be").unwrap().changed_at = 20_000;
         assert!(kinds(&a).is_empty());
         // Our BSSID with someone else's name.
         let mut a = site();
-        a.heard.retain(|h| h.bssid != "78:45:58:3c:52:be");
-        a.heard.push(heard("78:45:58:3c:52:be", UP, "Free WiFi", 48, "Open", -60));
+        a.heard.retain(|h| h.bssid != "02:00:00:3c:52:be");
+        a.heard.push(heard("02:00:00:3c:52:be", UP, "Free WiFi", 48, "Open", -60));
         assert!(assess(&a)[0].detail.contains("calls itself \"Free WiFi\""));
     }
 

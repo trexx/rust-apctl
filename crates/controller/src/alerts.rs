@@ -893,7 +893,7 @@ mod tests {
     #[test]
     fn offline_after_four_minutes_and_at_most_twice_a_day() {
         let mut w = ApWatch::default();
-        let ap: Mac = "78:45:58:3c:52:bc".parse().unwrap();
+        let ap: Mac = "02:00:00:3c:52:bc".parse().unwrap();
         // Missing for 3 minutes: nothing.
         assert_eq!(w.check(1000, ap, 1000 - 180), None);
         // 4 minutes: offline.
