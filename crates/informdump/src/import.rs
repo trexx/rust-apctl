@@ -13,21 +13,7 @@ use mongodb::bson::{Bson, Document, doc};
 use mongodb::options::{ClientOptions, FindOptions};
 use serde_json::{Value, json};
 
-use crate::snapshot::{collections, source, trim_settings};
-
-/// Device fields worth carrying over besides the ones rendering reads
-/// ([`apcfg::DEVICE_KEYS`]). Everything else (stats caches, etc.) is skipped.
-const DEVICE_FIELDS: &[&str] = &[
-    "model", "version", "serial", "ip", "adopted", "x_aes_gcm", "cfgversion", "wlangroup_id_na", "wlangroup_id_ng",
-];
-
-/// Client fields besides the ones rendering reads ([`apcfg::CLIENT_KEYS`]): the
-/// names and notes people gave their devices.
-const USER_FIELDS: &[&str] = &[
-    "name", "note", "noted", "hostname", "oui", "first_seen", "last_seen", "is_wired", "is_guest",
-    // speed limit (user group) of the client
-    "usergroup_id",
-];
+use crate::snapshot::{client_fields, device_fields, source, trim_settings};
 
 pub async fn run(uri: &str, db: &str, out: &Path) -> Result<()> {
     let mut opts = ClientOptions::parse(uri).await.context("parsing MongoDB URI")?;
@@ -36,17 +22,17 @@ pub async fn run(uri: &str, db: &str, out: &Path) -> Result<()> {
     let client = mongodb::Client::with_options(opts)?;
     let db = client.database(db);
 
-    let keep = |fields: &[&[&str]]| -> Document { fields.concat().into_iter().map(|f| (f.to_string(), Bson::Int32(1))).collect() };
+    let keep = |fields: Vec<&str>| -> Document { fields.into_iter().map(|f| (f.to_string(), Bson::Int32(1))).collect() };
     let mut snapshot = serde_json::Map::new();
     snapshot.insert("source".into(), json!("unifi-network-application"));
     let mut read = Vec::new();
-    for c in collections() {
+    for &c in apcfg::COLLECTIONS {
         let (filter, projection) = match c {
             // Only the settings apctl reads ([`apcfg::SETTING_KEYS`]): the others hold
             // credentials (mail, cloud access, guest portal) nothing here uses.
             "setting" => (doc! { "key": { "$in": apcfg::SETTING_KEYS } }, doc! {}),
-            "devices" => (doc! {}, keep(&[apcfg::DEVICE_KEYS, DEVICE_FIELDS])),
-            "clients" => (doc! {}, keep(&[apcfg::CLIENT_KEYS, USER_FIELDS])),
+            "devices" => (doc! {}, keep(device_fields())),
+            "clients" => (doc! {}, keep(client_fields())),
             _ => (doc! {}, doc! {}),
         };
         let mut docs = find_all(&db, source(c), filter, projection).await?;

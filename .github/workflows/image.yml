@@ -8,9 +8,9 @@ name: 'Image'
 on:
   push:
     branches: [ 'master' ]
-    paths: [ 'Dockerfile', '.dockerignore', 'Cargo.toml', 'crates/*/Cargo.toml', 'Cargo.lock', 'web/package-lock.json', '.github/workflows/image.yml', 'scripts/image-check.sh' ]
+    paths: [ 'Dockerfile', '.dockerignore', 'Cargo.toml', 'crates/*/Cargo.toml', 'Cargo.lock', 'web/package-lock.json', '.github/workflows/image.yml', 'scripts/image-check.sh', 'scripts/version.sh' ]
   pull_request:
-    paths: [ 'Dockerfile', '.dockerignore', 'Cargo.toml', 'crates/*/Cargo.toml', 'Cargo.lock', 'web/package-lock.json', '.github/workflows/image.yml', 'scripts/image-check.sh' ]
+    paths: [ 'Dockerfile', '.dockerignore', 'Cargo.toml', 'crates/*/Cargo.toml', 'Cargo.lock', 'web/package-lock.json', '.github/workflows/image.yml', 'scripts/image-check.sh', 'scripts/version.sh' ]
 
 # A newer push to a pull request (Renovate rebasing it) cancels the build of the old one.
 concurrency:

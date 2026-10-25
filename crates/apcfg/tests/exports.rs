@@ -2,7 +2,7 @@
 //! the render does: checked on their own and against a render.
 
 use apcfg::{
-    Controller, DEFAULT_COUNTRY, Input, as_int, bool_of, capable_width, configured_width, flag, int_of, override_of, render, ssh_username, ssid_usergroup, ssid_vlan, usergroup_limits,
+    Controller, DEFAULT_COUNTRY, Input, as_int, bool_of, capable_width, configured_width, flag, int_of, override_of, radio_width, render, ssh_username, ssid_usergroup, ssid_vlan, usergroup_limits, wlan_bands,
 };
 use serde_json::{Value, json};
 
@@ -124,22 +124,72 @@ fn the_render_agrees_with_the_exports() {
     let (down, up) = usergroup_limits(ssid_usergroup(&s, "s", w).unwrap());
     assert_eq!((line(&cfg, "qos.vap.1.dwnlink.maxspeed"), line(&cfg, "qos.vap.1.uplink.1.maxspeed")), (Some(down.to_string().as_str()), Some(up.to_string().as_str())));
     let radios = s["devices"][0]["radio_table"].as_array().unwrap();
-    assert_eq!(line(&cfg, "radio.1.ieee_mode"), Some(format!("11nght{}", configured_width(&s, "s", &radios[0])).as_str()));
-    assert_eq!(line(&cfg, "radio.2.ieee_mode"), Some(format!("11naht{}", configured_width(&s, "s", &radios[1])).as_str()));
+    assert_eq!(line(&cfg, "radio.1.ieee_mode"), Some(format!("11nght{}", radio_width(&s, "s", &radios[0])).as_str()));
+    assert_eq!(line(&cfg, "radio.2.ieee_mode"), Some(format!("11naht{}", radio_width(&s, "s", &radios[1])).as_str()));
+    assert_eq!((configured_width(&s, "s", &radios[1]), radio_width(&s, "s", &radios[1])), (40, 40));
     assert_eq!(line(&cfg, "users.1.name"), Some(ssh_username(&s["setting"][1])));
     assert_eq!(line(&cfg, "radio.1.countrycode"), Some(DEFAULT_COUNTRY.to_string().as_str()), "a site without a country setting");
 }
 
-/// The render caps a radio's width by what it can do: an 11ax radio set to 160 MHz
-/// without `has_ht160` gets 80, and the user's own name is the SSH account.
+/// The render caps a radio's width by what it can do and by its band, as
+/// [`radio_width`] does: an 11ax radio set to 160 MHz without `has_ht160` gets 80, a
+/// 2.4 GHz radio set to 80 gets 40; and the user's own name is the SSH account.
 #[test]
 fn the_render_caps_widths_and_names_the_ssh_user_as_the_exports_do() {
     let mut s = state(json!([wlan("Home", json!({}))]), json!([]));
+    s["devices"][0]["radio_table"][0]["ht"] = json!(80);
     s["devices"][0]["radio_table"][1] = json!({ "name": "wifi1", "radio": "na", "is_11ax": true, "ht": 160 });
     s["setting"][1]["x_ssh_username"] = json!("admin");
     let cfg = system_cfg(&s);
-    let r = &s["devices"][0]["radio_table"][1];
-    assert_eq!(line(&cfg, "radio.2.ieee_mode"), Some(format!("11naht{}", configured_width(&s, "s", r).min(capable_width(r))).as_str()));
+    let radios = s["devices"][0]["radio_table"].as_array().unwrap();
+    assert_eq!([configured_width(&s, "s", &radios[0]), configured_width(&s, "s", &radios[1])], [80, 160], "what is set");
+    assert_eq!([radio_width(&s, "s", &radios[0]), radio_width(&s, "s", &radios[1])], [40, 80], "what runs");
+    assert_eq!(capable_width(&radios[1]), 80);
+    assert_eq!(line(&cfg, "radio.1.ieee_mode"), Some(format!("11nght{}", radio_width(&s, "s", &radios[0])).as_str()));
+    assert_eq!(line(&cfg, "radio.2.ieee_mode"), Some(format!("11naht{}", radio_width(&s, "s", &radios[1])).as_str()));
     assert_eq!(line(&cfg, "radio.2.ieee_mode"), Some("11naht80"));
     assert_eq!(line(&cfg, "users.1.name"), Some("admin"));
+}
+
+/// The bands an SSID goes on: those its `wlan_bands` names, else 2.4 and 5 GHz, as the
+/// render deploys it.
+#[test]
+fn the_render_deploys_ssids_on_the_bands_the_export_names() {
+    let cases = [("Both", json!({})), ("Empty", json!({ "wlan_bands": [] })), ("Unknown", json!({ "wlan_bands": ["7g", 5] })), ("Five", json!({ "wlan_bands": ["5g", "7g"] }))];
+    let s = state(Value::Array(cases.iter().map(|(name, extra)| wlan(name, extra.clone())).collect()), json!([]));
+    let cfg = system_cfg(&s);
+    // The radios (`wifi0`, `wifi1`) an SSID's `wireless.N` sections are on.
+    let on = |ssid: &str| -> Vec<&str> {
+        let sections = cfg.lines().filter_map(|l| l.strip_prefix("wireless.")?.strip_suffix(&format!(".ssid={ssid}")));
+        sections.map(|n| line(&cfg, &format!("wireless.{n}.parent")).unwrap()).collect()
+    };
+    for (i, (name, _)) in cases.iter().enumerate() {
+        let radios: Vec<&str> = wlan_bands(&s["wlanconf"][i]).iter().map(|b| if *b == "2g" { "wifi0" } else { "wifi1" }).collect();
+        assert_eq!(on(name), radios, "{name}");
+    }
+    assert_eq!(wlan_bands(&s["wlanconf"][0]), ["2g", "5g"]);
+    assert_eq!(wlan_bands(&s["wlanconf"][2]), ["2g", "5g"], "names no band it knows");
+    assert_eq!(wlan_bands(&s["wlanconf"][3]), ["5g"]);
+    assert_eq!(wlan_bands(&json!({ "wlan_bands": ["6g", "2g"] })), ["6g", "2g"]);
+}
+
+/// The site's country is a number however it is stored, as the controller's channel
+/// rules read it: the APs get it as one, and the US and Canada get the FCC DFS reset.
+#[test]
+fn the_country_is_read_as_a_number() {
+    let mut s = state(json!([wlan("Home", json!({}))]), json!([]));
+    s["devices"][0]["radio_table"][1] = json!({ "name": "wifi1", "radio": "na", "is_11ax": true, "has_fccdfs": true, "channel": 100 });
+    let country = |s: &mut Value, code: Value| {
+        s["setting"].as_array_mut().unwrap().retain(|d| d["key"] != "country");
+        s["setting"].as_array_mut().unwrap().push(json!({ "key": "country", "site_id": "s", "code": code }));
+        let cfg = system_cfg(s);
+        let dfs_reset = cfg.lines().any(|l| l.ends_with(".cmd=syswrapper.sh dfs-reset"));
+        (line(&cfg, "radio.countrycode").map(str::to_string), line(&cfg, "radio.2.countrycode").map(str::to_string), dfs_reset)
+    };
+    let code = |c: &str, dfs| (Some(c.to_string()), Some(c.to_string()), dfs);
+    for stored in [json!("840"), json!(840), json!(840.0), json!(" 840"), json!("0840"), json!("x"), json!(true)] {
+        assert_eq!(country(&mut s, stored.clone()), code("840", true), "{stored}");
+    }
+    assert_eq!(country(&mut s, json!(124.0)), code("124", true));
+    assert_eq!(country(&mut s, json!("276")), code("276", false), "a radio with only FCC DFS");
 }

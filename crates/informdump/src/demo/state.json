@@ -696,27 +696,5 @@
    "x_iapp_key": "demo-secret",
    "x_passphrase": "demo-secret"
   }
- ],
- "wlangroup": [
-  {
-   "_id": {
-    "$oid": "00000000000000000000003f"
-   },
-   "attr_hidden_id": "Default",
-   "attr_no_delete": true,
-   "name": "Default",
-   "site_id": "00000000000000000000001e"
-  },
-  {
-   "_id": {
-    "$oid": "000000000000000000000040"
-   },
-   "attr_hidden": true,
-   "attr_hidden_id": "Off",
-   "attr_no_delete": true,
-   "attr_no_edit": true,
-   "name": "Off",
-   "site_id": "00000000000000000000001e"
-  }
  ]
 }

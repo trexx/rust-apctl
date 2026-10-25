@@ -110,8 +110,8 @@ enum Cmd {
         ports: Vec<u16>,
     },
     /// Write a made-up site's capture (three APs, their clients, syslog) as pcap to
-    /// stdout, for demos and screenshots: `apctl serve --keys <demo-state output>
-    /// --shadow-cmd "informdump demo --live"`.
+    /// stdout, for demos and screenshots: apctl's `--shadow-cmd "informdump demo
+    /// --live"`, as the README's Demo section runs it.
     Demo {
         /// Hours of history before now (at most a year).
         #[arg(long, default_value = "24", value_parser = history_hours)]
@@ -120,8 +120,9 @@ enum Cmd {
         #[arg(long)]
         live: bool,
     },
-    /// Print the made-up site's controller settings and AP keys (for `apctl serve
-    /// --keys` and the Settings page) that go with `informdump demo`.
+    /// Print the made-up site's controller settings and AP keys that go with
+    /// `informdump demo`: for `apctl serve --keys`, and to upload on the Settings page
+    /// (which needs a login: `--users-file`).
     DemoState,
     /// Follow a live capture on stdin and print config pushes and new devices as they happen.
     Watch {

@@ -41,15 +41,29 @@
     },
     {
       "customType": "regex",
-      "description": "Images that workflow steps and the README's build commands run by hand (docker run), such as the Node image the web job builds with",
+      "description": "Images that workflow steps, scripts and the README's build commands run by hand (docker or podman run), such as the Node image scripts/check.sh --web builds with",
       "managerFilePatterns": [
         "/(^|/)\\.github/workflows/[^/]+\\.ya?ml$/",
+        "/^scripts/[^/]+\\.sh$/",
         "/^README\\.md$/"
       ],
       "matchStrings": [
         "(?<depName>docker\\.io/library/[a-z0-9-]+):(?<currentValue>[A-Za-z0-9._-]+)(?:@(?<currentDigest>sha256:[a-f0-9]{64}))?"
       ],
       "datasourceTemplate": "docker",
+      "autoReplaceStringTemplate": "{{depName}}:{{newValue}}{{#if newDigest}}@{{newDigest}}{{/if}}"
+    },
+    {
+      "customType": "regex",
+      "description": "The skopeo image the release script inspects and pins images with (tags carry a v)",
+      "managerFilePatterns": [
+        "/^scripts/release\\.sh$/"
+      ],
+      "matchStrings": [
+        "(?<depName>quay\\.io/skopeo/stable):(?<currentValue>v[0-9]+\\.[0-9]+\\.[0-9]+)(?:@(?<currentDigest>sha256:[a-f0-9]{64}))?"
+      ],
+      "datasourceTemplate": "docker",
+      "versioningTemplate": "regex:^v(?<major>\\d+)\\.(?<minor>\\d+)\\.(?<patch>\\d+)$",
       "autoReplaceStringTemplate": "{{depName}}:{{newValue}}{{#if newDigest}}@{{newDigest}}{{/if}}"
     }
   ],
@@ -107,7 +121,7 @@
       "pinDigests": false
     },
     {
-      "description": "The Node image of the Dockerfile's web stage and of CI's web job: one PR",
+      "description": "The Node image of the Dockerfile's web stage, of scripts/check.sh --web (CI's web job and the release gate) and of the README: one PR",
       "groupName": "Node image",
       "matchDepNames": [
         "/^(docker\\.io\\/)?(library\\/)?node$/"

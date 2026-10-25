@@ -1,6 +1,9 @@
-//! Turning captured traffic into decoded inform exchanges: pcap reading, TCP/HTTP
-//! reassembly, key lookup and decryption. Shared by `informdump` and the controller's
-//! shadow mode.
+//! What `informdump` and the controller share beyond the inform protocol itself:
+//! turning captured traffic into decoded inform exchanges (pcap reading, TCP/HTTP
+//! reassembly, key lookup and decryption, for `informdump` and shadow mode), and the
+//! pieces active mode needs too: config diffs ([`cfgdiff`]: previews, config history,
+//! stored-config redaction), syslog framing ([`syslog_frame`]: the syslog listener),
+//! and small address and civil-date helpers.
 
 pub mod capture;
 pub mod cfgdiff;
