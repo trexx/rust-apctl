@@ -493,7 +493,7 @@ pub async fn retries(State(s): State<AppState>, Query(q): Query<RangeQuery>) -> 
     let out: Vec<Value> = totals
         .iter()
         .filter_map(|((ap, band), t)| {
-            Some(json!({ "name": ap_name(&live, ap), "mac": ap, "radio": band, "tx_retry_pct": t.pct()?, "retries": t.retries, "attempts": t.attempts, "dropped": t.dropped }))
+            Some(json!({ "name": ap_name(&live, ap), "mac": ap, "radio": band, "tx_retry_pct": t.pct()? }))
         })
         .collect();
     Ok(Json(Value::Array(out)))
@@ -678,7 +678,7 @@ pub async fn wlans(State(s): State<AppState>, Query(q): Query<RangeQuery>) -> Re
             for v in &d.snapshot.vaps {
                 let Some(e) = v.essid.as_deref().filter(|e| !e.is_empty()) else { continue };
                 let n = now.entry(e.to_string()).or_default();
-                n.broadcast.push(json!({ "ap": mac, "name": d.snapshot.ap.hostname, "radio": v.radio, "channel": v.channel, "bssid": v.bssid, "clients": v.num_sta, "online": d.online }));
+                n.broadcast.push(json!({ "ap": mac, "name": d.snapshot.ap.hostname, "radio": v.radio, "channel": v.channel, "bssid": v.bssid }));
                 if let Some(r) = &v.radio {
                     n.bands.insert(r.clone());
                 }

@@ -1192,39 +1192,27 @@
   ],
   "retries": [
     {
-      "attempts": 135582.0,
-      "dropped": 289.0,
       "mac": "02:00:00:00:00:a1",
       "name": "Hall",
       "radio": "na",
-      "retries": 7081.0,
       "tx_retry_pct": 4.953410935139067
     },
     {
-      "attempts": 86289.0,
-      "dropped": 213.0,
       "mac": "02:00:00:00:00:a1",
       "name": "Hall",
       "radio": "ng",
-      "retries": 7167.0,
       "tx_retry_pct": 7.6514108189475705
     },
     {
-      "attempts": 83442.0,
-      "dropped": 157.0,
       "mac": "02:00:00:00:00:a2",
       "name": "Attic",
       "radio": "na",
-      "retries": 4158.0,
       "tx_retry_pct": 4.738083571680892
     },
     {
-      "attempts": 93219.0,
-      "dropped": 178.0,
       "mac": "02:00:00:00:00:a2",
       "name": "Attic",
       "radio": "ng",
-      "retries": 6298.0,
       "tx_retry_pct": 6.317267666382467
     }
   ],
@@ -1304,36 +1292,28 @@
             "ap": "02:00:00:00:00:a1",
             "bssid": "02:00:00:00:01:01",
             "channel": 6,
-            "clients": 1,
             "name": "Hall",
-            "online": true,
             "radio": "ng"
           },
           {
             "ap": "02:00:00:00:00:a1",
             "bssid": "02:00:00:00:01:02",
             "channel": 44,
-            "clients": 1,
             "name": "Hall",
-            "online": true,
             "radio": "na"
           },
           {
             "ap": "02:00:00:00:00:a2",
             "bssid": "02:00:00:00:02:01",
             "channel": 1,
-            "clients": 1,
             "name": "Attic",
-            "online": true,
             "radio": "ng"
           },
           {
             "ap": "02:00:00:00:00:a2",
             "bssid": "02:00:00:00:02:02",
             "channel": 36,
-            "clients": 0,
             "name": "Attic",
-            "online": true,
             "radio": "na"
           }
         ],
@@ -1431,9 +1411,7 @@
             "ap": "02:00:00:00:00:a1",
             "bssid": "02:00:00:00:01:03",
             "channel": 44,
-            "clients": 0,
             "name": "Hall",
-            "online": true,
             "radio": "na"
           }
         ],

@@ -98,7 +98,6 @@ pub struct HeardBy {
     pub mac: String,
     pub name: Option<String>,
     pub signal: Option<i64>,
-    pub last_seen: Ts,
 }
 
 named_enum! {
@@ -347,7 +346,7 @@ pub fn assess(a: &Assessment) -> Vec<Finding> {
         // `rows` are the sightings the finding rests on, `s` what they add up to.
         let mut push = |kind: Kind, severity: Severity, target: Option<String>, detail: String, rows: &[&Heard], s: &Seen| {
             let mut heard_by: Vec<HeardBy> =
-                rows.iter().map(|h| HeardBy { mac: h.ap_mac.clone(), name: ap_name(&h.ap_mac), signal: h.signal, last_seen: h.last_seen }).collect();
+                rows.iter().map(|h| HeardBy { mac: h.ap_mac.clone(), name: ap_name(&h.ap_mac), signal: h.signal }).collect();
             heard_by.sort_by_key(|h| std::cmp::Reverse(h.signal.unwrap_or(-200)));
             out.push(Finding {
                 kind,
