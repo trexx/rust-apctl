@@ -128,7 +128,7 @@ Open <http://127.0.0.1:8090> and log in as `admin` with `demo-password`. Then up
 ## Build
 
 ```sh
-podman run --rm -v $PWD/web:/app:Z -w /app docker.io/library/node:26-slim@sha256:36793bcbb160a6a16cede1e62b93f84e26b78a972a8a4c0b879c1c12f22761ec sh -c "npm ci && npm run build"
+scripts/check.sh --web                # lints and builds web/dist in the Dockerfile's Node image
 cargo build --release -p controller   # or: podman build --target runtime .
 ```
 
@@ -137,7 +137,8 @@ cargo build --release -p controller   # or: podman build --target runtime .
 MongoDB and needs `cargo build --release -p informdump --features mongo`.
 
 Pushing a version tag (e.g. `0.15.1`) makes CI publish the image; nothing else pushes it.
-`scripts/check.sh` runs CI's Rust checks and `scripts/check.sh --web` its web check.
+`scripts/check.sh` runs CI's Rust checks and `scripts/check.sh --web` its web check
+(with `APCTL_ENGINE`, else docker, else podman; the files it writes are yours either way).
 `scripts/release.sh 0.15.1` runs them all and builds and checks the image locally before
 the tag goes out, and `scripts/release.sh 0.15.1 --pin <manifest>` afterwards waits for
 CI's image and pins its digest in a manifest.

@@ -41,11 +41,10 @@
     },
     {
       "customType": "regex",
-      "description": "Images that workflow steps, scripts and the README's build commands run by hand (docker or podman run), such as the Node image scripts/check.sh --web builds with",
+      "description": "Images that workflow steps and scripts run by hand (docker or podman run), such as the Node image scripts/check.sh --web builds with",
       "managerFilePatterns": [
         "/(^|/)\\.github/workflows/[^/]+\\.ya?ml$/",
-        "/^scripts/[^/]+\\.sh$/",
-        "/^README\\.md$/"
+        "/^scripts/[^/]+\\.sh$/"
       ],
       "matchStrings": [
         "(?<depName>docker\\.io/library/[a-z0-9-]+):(?<currentValue>[A-Za-z0-9._-]+)(?:@(?<currentDigest>sha256:[a-f0-9]{64}))?"
@@ -121,7 +120,7 @@
       "pinDigests": false
     },
     {
-      "description": "The Node image of the Dockerfile's web stage, of scripts/check.sh --web (CI's web job and the release gate) and of the README: one PR",
+      "description": "The Node image of the Dockerfile's web stage and of scripts/check.sh --web (CI's web job and the release gate): one PR",
       "groupName": "Node image",
       "matchDepNames": [
         "/^(docker\\.io\\/)?(library\\/)?node$/"
