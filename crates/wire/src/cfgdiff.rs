@@ -7,12 +7,12 @@ use std::fmt::Write;
 use serde_json::{Value, json};
 
 /// The `(key, value)` lines of `cfg`, borrowed from it, sorted by key. A key can repeat;
-/// its values stay in order (the sort is stable).
+/// its values stay in order (the sort is stable). A value keeps its trailing blanks,
+/// as the AP reads them (an SSID `Home ` is not `Home`).
 fn parse(cfg: &str) -> Vec<(&str, &str)> {
     let mut lines: Vec<(&str, &str)> = cfg
         .lines()
-        .map(str::trim_end)
-        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .filter(|line| !line.trim_end().is_empty() && !line.starts_with('#'))
         .map(|line| line.split_once('=').unwrap_or((line, "")))
         .collect();
     lines.sort_by_key(|&(k, _)| k);
@@ -229,6 +229,7 @@ mod tests {
         assert_eq!(repeated.changed, vec![("a", "1".into(), Cow::Owned::<str>("1 | 2".into()))]);
         assert!(diff("a=1\nb=x\n# note\na=2\n", "b=x\na=1\n\na=2\n").is_empty(), "a repeated key's values in order, wherever they are");
         assert_eq!(diff("a=2\na=1\nc\n", "a=1\na=2\nc=\n").changed, vec![("a", "2 | 1".into(), "1 | 2".into())]);
+        assert_eq!(diff("aaa.1.ssid=Home \nb=1\t\n", "aaa.1.ssid=Home\r\n  \nb=1\n").changed, vec![("aaa.1.ssid", "Home ".into(), "Home".into()), ("b", "1\t".into(), "1".into())], "trailing blanks are part of a value");
         assert_eq!(d.counts(), [1, 1, 1]);
         assert_eq!(
             diff("x.psk=a", "x.psk=b").summary(),
