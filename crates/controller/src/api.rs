@@ -436,7 +436,7 @@ fn stored_view(mac: Mac, k: &KnownDevice) -> DeviceView {
         snapshot: crate::model::Snapshot {
             ap, uplink: None, radios: vec![], vaps: vec![], clients: vec![], has_vap_table: false,
         },
-        online: false, first_seen: k.first_seen, last_seen: k.last_seen, peer: None, interval: 0, last_full_inform: 0,
+        online: false, first_seen: k.first_seen, last_seen: k.last_seen, interval: 0, last_full_inform: 0,
         last_config_push: None,
     }
 }
@@ -1334,7 +1334,7 @@ mod tests {
     /// An AP's report, decoded, as the engine gets it at time 50.
     fn report(payload: Value) -> crate::engine::Input {
         let header = inform::Header { packet_version: 0, mac: Mac([0; 6]), flags: inform::Flags::NONE, iv: [0; 16], payload_version: 1, payload_len: 0 };
-        crate::engine::Input::Inform { ts: 50, peer: [10, 0, 0, 1].into(), decoded: wire::decode::Decoded { header, key: wire::decode::KeyUsed::Device, payload } }
+        crate::engine::Input::Inform { ts: 50, decoded: wire::decode::Decoded { header, key: wire::decode::KeyUsed::Device, payload } }
     }
 
     async fn get_json(app: &Router, path: &str) -> Value {

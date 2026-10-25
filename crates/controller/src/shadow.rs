@@ -201,13 +201,13 @@ fn run_once<R: Read + Send>(
         };
         let mut tick = None;
         let input = match ev {
-            InformEvent::Inform { ts, peer, decoded: Ok(decoded), .. } => {
+            InformEvent::Inform { ts, decoded: Ok(decoded), .. } => {
                 let ts = ts / 1_000_000;
                 if clock.observe(ts) && ts >= last_tick + REPLAY_TICK_SECS {
                     last_tick = ts;
                     tick = Some(Input::Tick(ts));
                 }
-                Some(Input::Inform { ts, peer, decoded })
+                Some(Input::Inform { ts, decoded })
             }
             InformEvent::Inform { decoded: Err(e), mac, .. } => {
                 tracing::debug!("undecodable inform from {mac:?}: {e:#}");
