@@ -456,21 +456,7 @@ pub async fn device(State(s): State<AppState>, MacPath(mac): MacPath) -> Result<
     let state = state.ok_or_else(ApiError::no_state)?;
     let d = site_device(&state, &mac).map_err(ApiError::not_found)?;
     let reported = inform.as_deref().map_or(&Value::Null, |p| &p["radio_table"]);
-    let radios: Vec<Value> = d["radio_table"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .map(|r| {
-            let mut v = Value::Object(pick(r, RADIO_FIELDS));
-            let band = r["radio"].as_str().unwrap_or("");
-            v["caps"] = json!(RadioCaps::of(r, reported));
-            v["channels"] = channels(&state, band, false);
-            v["channels_outdoor"] = channels(&state, band, true);
-            // The "interference blocker" exists only on radios reporting this capability.
-            v["has_blocker"] = json!(has_blocker(r));
-            v
-        })
-        .collect();
+    let radios: Vec<Value> = d["radio_table"].as_array().into_iter().flatten().map(|r| radio_view(&state, r, reported)).collect();
     let supported: Vec<&str> = apcfg::device_feature_support(d, inform.as_deref()).map_or_else(|| apcfg::DEVICE_FEATURES.to_vec(), |l| l.into_iter().filter(|(_, ok)| *ok).map(|(f, _)| f).collect());
     let site_outdoor = mgmt_flag(&state, "outdoor_mode_enabled");
     let advanced = mgmt_flag(&state, "advanced_feature_enabled");
@@ -484,6 +470,22 @@ pub async fn device(State(s): State<AppState>, MacPath(mac): MacPath) -> Result<
         o.extend(pick(d, DEVICE_FIELDS));
     }
     Ok(Json(out))
+}
+
+/// One radio of an AP's record (its `radio_table` entry) as the AP editor shows it;
+/// `reported` is the AP's inform's `radio_table` ([`RadioCaps::of`]).
+fn radio_view(state: &Value, r: &Value, reported: &Value) -> Value {
+    let mut v = Value::Object(pick(r, RADIO_FIELDS));
+    let band = r["radio"].as_str().unwrap_or("");
+    // The width set (`ht`, else Channel AI's or the band's default), and the one the radio runs at.
+    v["ht"] = json!(apcfg::configured_width(state, site_id(state).unwrap_or_default(), r));
+    v["width"] = json!(radio_width(state, r));
+    v["caps"] = json!(RadioCaps::of(r, reported));
+    v["channels"] = channels(state, band, false);
+    v["channels_outdoor"] = channels(state, band, true);
+    // The "interference blocker" exists only on radios reporting this capability.
+    v["has_blocker"] = json!(has_blocker(r));
+    v
 }
 
 // ---- Channels -------------------------------------------------------------
@@ -2542,6 +2544,16 @@ mod tests {
         s["devices"][0]["radio_table"][1] = json!({ "name": "wifi1", "radio": "na", "channel": 149, "ht": 160, "is_11ax": true });
         dev(&mut s, json!({ "radios": [{ "radio": "na", "tx_power_mode": "low" }] })).unwrap();
         assert_eq!(radio_width(&s, &s["devices"][0]["radio_table"][1]), 80);
+        // The editor is sent both: the width set and the one it runs at.
+        let v = radio_view(&s, &s["devices"][0]["radio_table"][1], &Value::Null);
+        assert_eq!((&v["ht"], &v["width"], &v["caps"]["max_width"]), (&json!(160), &json!(80), &json!(80)));
+        // A radio without `ht` is set to Channel AI's width, else the band's default, as a number.
+        let no_ht = json!({ "radio": "na", "channel": 149, "is_11ax": true });
+        assert_eq!((&radio_view(&s, &no_ht, &Value::Null)["ht"], &radio_view(&s, &no_ht, &Value::Null)["width"]), (&json!(80), &json!(80)));
+        setting_mut(&mut s, "radio_ai")["radios_configuration"] = json!([{ "radio": "na", "channel_width": 40 }]);
+        assert_eq!((&radio_view(&s, &no_ht, &Value::Null)["ht"], &radio_view(&s, &no_ht, &Value::Null)["width"]), (&json!(40), &json!(40)));
+        assert_eq!(radio_view(&s, &json!({ "radio": "na", "ht": "40" }), &Value::Null)["ht"], json!(40), "a width stored as text is sent as a number");
+        s["setting"].as_array_mut().unwrap().retain(|x| x["key"] != "radio_ai");
         // So is the channel Channel AI or a plan would set.
         crate::channelai::set_channels(&mut s, "na", &[(AP1.parse().unwrap(), 153)], &HashSet::new()).unwrap();
         assert_eq!(s["devices"][0]["radio_table"][1]["channel"], 153);
