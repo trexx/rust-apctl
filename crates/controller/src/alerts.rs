@@ -33,6 +33,10 @@ use crate::store::{Db, Store, Writer};
 
 /// An AP is offline after this long without contact.
 const OFFLINE_AFTER: Ts = 240;
+/// An AP not heard from since the watcher started is offline this long after
+/// the start: as long as the engine gives it before it lists the AP offline
+/// (its interval is not known yet, so the longest active mode asks for).
+const UNHEARD_AFTER: Ts = crate::active::MAX_INFORM_INTERVAL * crate::engine::OFFLINE_INTERVALS;
 /// How long a Wi-Fi health condition must hold.
 const HEALTH_WINDOW: Ts = 900;
 /// The same health alert is not raised again sooner than this after it cleared.
@@ -255,8 +259,8 @@ struct ApWatch {
     flapping_day: HashMap<Mac, Ts>,
     /// The site's time zone (UTC without one): its days, and the times of day alerts name.
     tz: Option<String>,
-    /// When the watcher started: an AP not heard from since is given
-    /// [`OFFLINE_AFTER`] from then, as the engine counts it from its start.
+    /// When the watcher started: an AP not heard from since (and not down
+    /// already) is given [`UNHEARD_AFTER`] from then.
     started: Ts,
 }
 
@@ -277,7 +281,14 @@ impl ApWatch {
 
     fn check(&mut self, now: Ts, mac: Mac, last_seen: Ts) -> Option<ApChange> {
         let today = self.day(now);
-        let gone = now - last_seen.max(self.started) >= OFFLINE_AFTER;
+        let gone = if self.down.contains_key(&mac) {
+            // Down (as a restart restores it too): back only once heard again.
+            now - last_seen >= OFFLINE_AFTER
+        } else if last_seen < self.started {
+            now - self.started >= UNHEARD_AFTER
+        } else {
+            now - last_seen >= OFFLINE_AFTER
+        };
         match (gone, self.down.get(&mac).copied()) {
             (true, None) => {
                 self.down.insert(mac, last_seen);
@@ -1118,14 +1129,16 @@ mod tests {
         let live: SharedLive = Default::default();
         let known = crate::engine::KnownDevice { last_seen: 1000, ..Default::default() };
         live.write().unwrap().known_devices.insert(ap, known);
-        // apctl was away for an hour: the first check, 90 s in, does not call it offline yet.
+        // apctl was away for an hour: the first check, 90 s in, does not call it offline yet,
+        // nor 4 minutes in, while the engine still lists it as online.
         let mut again = Watcher::start(w.store.clone(), w.book.writer.clone(), live, w.book.tx.clone(), 4600).await;
         again.status_tick(4690);
-        assert!(told(&mut rx).is_empty());
-        // Still silent 4 minutes in: offline, since its real last contact.
         again.status_tick(4600 + OFFLINE_AFTER);
+        assert!(told(&mut rx).is_empty());
+        // Still silent when the engine lists it offline: offline, since its real last contact.
+        again.status_tick(4600 + UNHEARD_AFTER);
         assert_eq!(told(&mut rx), [("raised", "ap_offline")]);
-        assert!(again.book.open[&(Key::ApOffline, Entity::Ap(ap))].message.starts_with("No contact for 64 min"), "{}", again.book.open[&(Key::ApOffline, Entity::Ap(ap))].message);
+        assert!(again.book.open[&(Key::ApOffline, Entity::Ap(ap))].message.starts_with("No contact for 66 min"), "{}", again.book.open[&(Key::ApOffline, Entity::Ap(ap))].message);
         assert_eq!(again.aps.down.get(&ap), Some(&1000));
     }
 
@@ -1144,6 +1157,28 @@ mod tests {
         // Nothing restored of it: the alert's time stands for the last contact.
         let again = Watcher::start(w.store.clone(), w.book.writer.clone(), Default::default(), broadcast::channel(4).0, 91_000).await;
         assert_eq!(again.aps.down.get(&ap), Some(&(90_000 - OFFLINE_AFTER)));
+    }
+
+    #[tokio::test]
+    async fn an_ap_still_down_after_a_restart_stays_alerted() {
+        let (mut w, mut rx, _dir) = watcher();
+        let ap: Mac = "02:00:00:00:00:01".parse().unwrap();
+        w.book.open(1240, Alert::for_device(Key::ApOffline, Category::ApStatus, Severity::High, ap, "t".into(), "m".into()));
+        flushed(&w.book.writer);
+        let live: SharedLive = Default::default();
+        live.write().unwrap().known_devices.insert(ap, crate::engine::KnownDevice { last_seen: 1000, offline: true, ..Default::default() });
+        let mut again = Watcher::start(w.store.clone(), w.book.writer.clone(), live.clone(), w.book.tx.clone(), 5000).await;
+        told(&mut rx);
+        // Not heard from through the start's grace and past it: no "back online", no second offline alert.
+        for now in [5090, 5300, 5400, 6000] {
+            again.status_tick(now);
+        }
+        assert!(told(&mut rx).is_empty());
+        assert!(again.book.open.contains_key(&(Key::ApOffline, Entity::Ap(ap))));
+        // Heard again: back, after its whole absence.
+        live.write().unwrap().known_devices.get_mut(&ap).unwrap().last_seen = 6020;
+        again.status_tick(6030);
+        assert_eq!(told(&mut rx), [("resolved", "ap_offline"), ("raised", "ap_online")]);
     }
 
     #[tokio::test]
