@@ -1053,8 +1053,8 @@ export const useFirmware = () =>
     refetchInterval: (q) => (q.state.data?.jobs.current || q.state.data?.jobs.queue.length ? 5_000 : 60_000),
   });
 export const checkFirmware = () => send<{ platforms: number }>("POST", "/api/firmware/check", {});
-/** Why an AP asked for was not queued; one already queued or updating is neither queued nor skipped. */
-export type FirmwareSkip = "up_to_date" | "ahead" | "unknown" | "offline" | "not_found";
+/** Why an AP asked for wasn't queued; "queued": it already is, or is updating. */
+export type FirmwareSkip = "up_to_date" | "ahead" | "unknown" | "offline" | "not_found" | "queued";
 export type FirmwareQueued = { queued: number; skipped: { mac: Mac; why: FirmwareSkip }[] };
 export const upgradeFirmware = (macs: Mac[]) => send<FirmwareQueued>("POST", "/api/firmware/upgrade", { macs });
 export const upgradeFirmwareUrl = (mac: Mac, url: string) => send<{ queued: number }>("POST", "/api/firmware/upgrade-url", { mac, url });
