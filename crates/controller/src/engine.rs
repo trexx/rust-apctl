@@ -259,8 +259,6 @@ pub struct Live {
     pub firmware: crate::firmware::Jobs,
     /// Commands waiting for each AP's next inform (restart, locate, kick...).
     pub commands: HashMap<Mac, std::collections::VecDeque<Value>>,
-    /// APs told to flash their LED.
-    pub locating: std::collections::HashSet<Mac>,
     /// APs to send their config again on the next inform.
     pub reprovision: std::collections::HashSet<Mac>,
     /// Quick scans (RF environment) asked of each AP and not finished yet.
@@ -334,7 +332,7 @@ impl Live {
     fn forget_ap(&mut self, mac: &Mac) {
         let Live {
             devices, aliases: _, clients: _, connected: _, counters: _, by_hash_id, by_ip, known_devices, state: _, state_imported_at: _, raw_informs, firmware, commands,
-            locating, reprovision, scans, adoption, last_config, stun: _, forget_managed: _,
+            reprovision, scans, adoption, last_config, stun: _, forget_managed: _,
         } = self;
         devices.remove(mac);
         // Also what was restored from the database, or it could still be reported offline.
@@ -348,7 +346,6 @@ impl Live {
         // Nothing queued for it may reach it if it is adopted again.
         firmware.remove(mac);
         commands.remove(mac);
-        locating.remove(mac);
         reprovision.remove(mac);
         scans.remove(mac);
     }
@@ -2767,7 +2764,6 @@ mod tests {
             let mut live = h.live.write().unwrap();
             crate::actions::queue(&mut live, mac, json!({ "_type": "reboot", "reboot_type": "soft" }));
             crate::actions::queue(&mut live, mac, json!({ "_type": "cmd", "cmd": "set-locate" }));
-            live.locating.insert(mac);
             crate::actions::queue(&mut live, mac, json!({ "_type": "cmd", "cmd": "kick-sta", "mac": C1 }));
             crate::actions::queue(&mut live, mac, block.clone());
         }
@@ -2775,7 +2771,7 @@ mod tests {
         // Blocking is carried by its config anyway: kept, as it does no harm.
         let live = h.live.read().unwrap();
         assert_eq!(live.commands[&mac], [block]);
-        assert!(live.locating.is_empty());
+        assert!(!crate::actions::locating(&live, &mac));
     }
 
     #[test]
@@ -2786,7 +2782,6 @@ mod tests {
         {
             let mut live = h.live.write().unwrap();
             live.commands.entry(mac).or_default().push_back(json!({ "cmd": "restart" }));
-            live.locating.insert(mac);
             live.reprovision.insert(mac);
             live.last_config.insert(mac, Default::default());
             live.adoption.forgetting.insert(mac, 1);
@@ -2800,7 +2795,7 @@ mod tests {
         assert_eq!(events(&mut h), vec![("client_disconnected", Some(C1.into()))]);
         let live = h.live.read().unwrap();
         assert!(!live.clients[&C1.parse().unwrap()].connected);
-        assert!(live.commands.is_empty() && live.locating.is_empty() && live.reprovision.is_empty() && live.devices.is_empty());
+        assert!(live.commands.is_empty() && live.reprovision.is_empty() && live.devices.is_empty());
         assert!(live.raw_informs.is_empty() && live.last_config.is_empty() && live.adoption.forgetting.is_empty() && live.by_ip.is_empty());
         assert!(managed.lock().unwrap().is_empty());
     }

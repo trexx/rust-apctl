@@ -77,20 +77,27 @@ fn queue_online(live: &mut Live, mac: Mac, cmd: Value) -> Result<(), ApiError> {
 }
 
 /// Drops the AP's queued commands that need it online ([`needs_online`]): it
-/// went away before they were sent. A locate dropped so is no longer on.
+/// went away before they were sent.
 pub fn drop_online_only(live: &mut Live, mac: &Mac) {
     let Some(q) = live.commands.get_mut(mac) else { return };
-    let mut located = false;
-    q.retain(|c| {
-        located |= c["cmd"] == "set-locate";
-        !needs_online(c)
-    });
+    q.retain(|c| !needs_online(c));
     if q.is_empty() {
         live.commands.remove(mac);
     }
-    if located {
-        live.locating.remove(mac);
-    }
+}
+
+/// Whether an AP's LED is flashing: as the last locate command still queued
+/// for it asks, else as the AP reports it (its last full inform's `locating`,
+/// which the official controller shows too). One sent shows from the AP's next
+/// inform on.
+pub fn locating(live: &Live, mac: &Mac) -> bool {
+    let asked = |c: &Value| match c["cmd"].as_str() {
+        Some("set-locate") => Some(true),
+        Some("unset-locate") => Some(false),
+        _ => None,
+    };
+    let queued = live.commands.get(mac).and_then(|q| q.iter().rev().find_map(asked));
+    queued.unwrap_or_else(|| live.raw_informs.get(mac).is_some_and(|p| apcfg::flag(p, "locating", false)))
 }
 
 /// The next queued command for an AP, if any.
@@ -206,11 +213,6 @@ pub async fn locate(State(s): State<AppState>, MacPath(mac): MacPath, Json(b): J
     let mut live = s.live.write().unwrap();
     // Turning it off can wait for an AP that is away: it is harmless when it comes.
     queue_online(&mut live, mac, json!({ "_type": "cmd", "cmd": if b.on { "set-locate" } else { "unset-locate" } }))?;
-    if b.on {
-        live.locating.insert(mac);
-    } else {
-        live.locating.remove(&mac);
-    }
     Ok(Json(json!({ "locating": b.on })))
 }
 
@@ -321,6 +323,24 @@ mod tests {
     use super::*;
 
     #[test]
+    fn an_ap_is_locating_as_it_reports_unless_a_locate_waits() {
+        let mut live = Live::default();
+        let ap: Mac = "02:00:00:00:00:01".parse().unwrap();
+        assert!(!locating(&live, &ap));
+        // After a restart, or started from another controller: the AP's own report.
+        live.raw_informs.insert(ap, std::sync::Arc::new(json!({ "locating": true })));
+        assert!(locating(&live, &ap));
+        // Off asked, not yet sent: off; then sent, the AP's next report tells.
+        queue(&mut live, ap, json!({ "_type": "cmd", "cmd": "unset-locate" }));
+        assert!(!locating(&live, &ap));
+        next(&mut live, &ap);
+        live.raw_informs.insert(ap, std::sync::Arc::new(json!({ "locating": false })));
+        assert!(!locating(&live, &ap));
+        queue(&mut live, ap, json!({ "_type": "cmd", "cmd": "set-locate" }));
+        assert!(locating(&live, &ap));
+    }
+
+    #[test]
     fn an_ap_going_away_loses_the_commands_that_need_it_online() {
         let mut live = Live::default();
         let ap: Mac = "02:00:00:00:00:01".parse().unwrap();
@@ -332,10 +352,11 @@ mod tests {
         for c in cmds {
             queue(&mut live, ap, c);
         }
-        live.locating.insert(ap);
+        assert!(locating(&live, &ap));
         drop_online_only(&mut live, &ap);
+        assert!(!locating(&live, &ap), "a locate dropped so is not on");
         assert_eq!(next(&mut live, &ap).unwrap()["cmd"], "block-sta");
-        assert!(next(&mut live, &ap).is_none() && live.locating.is_empty());
+        assert!(next(&mut live, &ap).is_none());
         // Refused for an AP that is away, but for what can wait.
         assert!(queue_online(&mut live, ap, json!({ "_type": "reboot", "reboot_type": "soft" })).is_err());
         assert!(queue_online(&mut live, ap, json!({ "_type": "cmd", "cmd": "unset-locate" })).is_ok());
