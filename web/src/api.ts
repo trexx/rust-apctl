@@ -1740,7 +1740,7 @@ export const useChannelAi = () =>
   });
 export const startScan = (band: string) => send<{ scanning: Mac[] }>("POST", "/api/rf/scan", { band });
 export const runChannelAi = (bands?: string[]) => send<{ started: boolean }>("POST", "/api/rf/channel-ai/run", { bands });
-export const applyChannelPlan = (band: string, changes: { mac: Mac; name: string | null; from: number | null; to: number | null }[]) =>
+export const applyChannelPlan = (band: string, changes: { mac: Mac; name: string | null; from: number | null; to: number }[]) =>
   send<{ applied: number }>("POST", "/api/rf/channel-plan/apply", { band, changes });
 export const saveChannelAi = (patch: Record<string, unknown>) => send<{ saved: boolean; what: string }>("PUT", "/api/rf/channel-ai", { patch });
 
