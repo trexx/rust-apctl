@@ -411,8 +411,9 @@ const SSID_FEATURE_CAPS: FeatureTable<6> = [
     ("mdns_proxy", Need::Any(&[Cap::MdnsProxy])),
 ];
 
-/// Optional SSID features that depend on what the AP supports, with the
-/// capability bit `render` checks for each one. An AP without it gets the SSID
+/// The optional SSID features [`ssid_feature_support`] reports on, by name. `render`
+/// sends each only to an AP with its capability bit, except `wpa3_fast_roaming`, which
+/// needs the FT bit of every radio (`radio_caps2`). An AP without it gets the SSID
 /// without the feature (no config lines), as the official controller does.
 pub const SSID_FEATURES: &[&str] = &feature_names(SSID_FEATURE_CAPS);
 
@@ -435,8 +436,9 @@ const DEVICE_FEATURE_CAPS: FeatureTable<7> = [
     ("snmp", Need::Nothing),
 ];
 
-/// AP-wide features that depend on the AP's capability bits, as `render`
-/// checks them: without the bit the setting is not sent at all.
+/// The AP-wide features [`device_feature_support`] reports on, by name. `render` sends
+/// each only to an AP with its capability bit (without it the setting is not sent at
+/// all), except `snmp`, which every AP gets.
 pub const DEVICE_FEATURES: &[&str] = &feature_names(DEVICE_FEATURE_CAPS);
 
 /// Which of [`DEVICE_FEATURES`] the AP supports, or `None` while unknown (see
