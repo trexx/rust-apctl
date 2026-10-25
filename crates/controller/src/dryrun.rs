@@ -169,8 +169,9 @@ fn masked<'a>(ours: &'a str, actual: &'a str, redacted: bool) -> (Cow<'a, str>, 
     if redacted { (cfgdiff::redact(ours).into(), cfgdiff::redact(actual).into()) } else { (ours.into(), actual.into()) }
 }
 
+/// The lines of a config, as they are, without blank ones (as cfgdiff reads it).
 fn lines(s: &str) -> Vec<&str> {
-    s.lines().filter(|l| !l.is_empty()).collect()
+    s.lines().filter(|l| !l.trim_end().is_empty()).collect()
 }
 
 /// Compares our config with the actual one. With `redacted`, secret values are
