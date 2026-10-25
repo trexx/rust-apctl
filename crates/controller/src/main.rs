@@ -225,6 +225,10 @@ async fn serve(args: ServeArgs) -> Result<()> {
         tracing::warn!("no --backup-key: backups are written unencrypted");
     }
 
+    // The web listener too is part of the configuration: a --listen that cannot
+    // be bound stops the start here. Connections wait until the API is up.
+    let listener = tokio::net::TcpListener::bind(listen).await.with_context(|| format!("binding {listen}"))?;
+
     // A restore chosen in the UI is applied now, before the databases are opened.
     backup::apply_pending(&backups);
     let (store, writer) = store::Store::open(&data_dir)?;
@@ -337,7 +341,6 @@ async fn serve(args: ServeArgs) -> Result<()> {
     ratelimit::spawn(state.clone());
     adopt::spawn(state.clone());
     let app = api::router(state);
-    let listener = tokio::net::TcpListener::bind(listen).await.with_context(|| format!("binding {listen}"))?;
     tracing::info!("web UI and API on http://{listen}");
     axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>()).with_graceful_shutdown(shutdown(writer.clone(), drain.clone())).await?;
     finish(writer, drain).await;
