@@ -142,6 +142,8 @@ pub enum Skip {
     Offline,
     /// Not an AP apctl knows (or not a MAC at all).
     NotFound,
+    /// Queued or upgrading already.
+    Queued,
 }
 
 pub fn status(current: Option<&str>, release: Option<&Release>, required: Option<&str>) -> Status {
@@ -211,20 +213,19 @@ pub struct Jobs {
 }
 
 impl Jobs {
-    /// Queues upgrades (an AP already queued or upgrading is not queued again);
-    /// how many were queued. A queue stopped by a failure stays stopped until
-    /// it is resumed.
-    pub fn enqueue(&mut self, jobs: Vec<Job>) -> usize {
-        let mut n = 0;
+    /// Queues upgrades but for the APs already queued or upgrading, which it
+    /// returns. A queue stopped by a failure stays stopped until it is resumed.
+    pub fn enqueue(&mut self, jobs: Vec<Job>) -> Vec<Mac> {
+        let mut busy = Vec::new();
         for j in jobs {
-            let busy = self.current.as_ref().is_some_and(|c| c.mac == j.mac) || self.queue.iter().any(|q| q.mac == j.mac);
-            if !busy {
+            if self.current.as_ref().is_some_and(|c| c.mac == j.mac) || self.queue.iter().any(|q| q.mac == j.mac) {
+                busy.push(j.mac);
+            } else {
                 self.queue.push_back(j);
-                n += 1;
             }
         }
         self.next();
-        n
+        busy
     }
 
     /// Starts a queue a failure stopped again; whether it was stopped.
@@ -339,33 +340,44 @@ pub enum Op {
     Resume,
 }
 
+/// What a change to the queue did.
+#[derive(Debug, Default, PartialEq)]
+pub struct Changed {
+    /// How many upgrades it queued or cancelled (resuming: 1 if the queue was stopped).
+    pub n: usize,
+    /// The APs it did not queue, as they were queued or upgrading already.
+    pub busy: Vec<Mac>,
+}
+
 impl Op {
-    /// Makes the change; how many upgrades it queued or cancelled (resuming: 1 if the queue was stopped).
-    pub fn apply(self, jobs: &mut Jobs) -> usize {
+    /// Makes the change.
+    pub fn apply(self, jobs: &mut Jobs) -> Changed {
         match self {
             Op::Enqueue(new) => {
-                let n = jobs.enqueue(new);
+                let asked = new.len();
+                let busy = jobs.enqueue(new);
+                let n = asked - busy.len();
                 tracing::info!("firmware: {n} upgrade(s) queued");
-                n
+                Changed { n, busy }
             }
             Op::CancelQueued => {
                 let n = jobs.cancel_queued();
                 tracing::info!("firmware: {n} queued upgrade(s) cancelled");
-                n
+                Changed { n, busy: Vec::new() }
             }
             Op::Resume => {
                 let resumed = jobs.resume();
                 if resumed {
                     tracing::info!("firmware: the upgrade queue resumed");
                 }
-                usize::from(resumed)
+                Changed { n: usize::from(resumed), busy: Vec::new() }
             }
         }
     }
 }
 
 /// Has the engine change the queue.
-async fn change_queue(s: &AppState, op: Op) -> Result<usize, ApiError> {
+async fn change_queue(s: &AppState, op: Op) -> Result<Changed, ApiError> {
     let (done, rx) = tokio::sync::oneshot::channel();
     s.ask(crate::engine::Input::Firmware { op, done }, rx).await
 }
@@ -595,8 +607,9 @@ pub async fn upgrade(State(s): State<AppState>, Json(b): Json<UpgradeBody>) -> R
             }
         }
     }
-    let n = change_queue(&s, Op::Enqueue(jobs)).await?;
-    Ok(Json(json!({ "queued": n, "skipped": skipped })))
+    let changed = change_queue(&s, Op::Enqueue(jobs)).await?;
+    skipped.extend(changed.busy.iter().map(|m| json!({ "mac": m, "why": Skip::Queued })));
+    Ok(Json(json!({ "queued": changed.n, "skipped": skipped })))
 }
 
 #[derive(Deserialize)]
@@ -627,20 +640,20 @@ pub async fn upgrade_url(State(s): State<AppState>, Json(b): Json<UrlBody>) -> R
         return Err(ApiError::ap_offline());
     }
     let job = Job::new(a, "custom".into(), b.url, None, None, true);
-    let n = change_queue(&s, Op::Enqueue(vec![job])).await?;
+    let n = change_queue(&s, Op::Enqueue(vec![job])).await?.n;
     Ok(Json(json!({ "queued": n })))
 }
 
 /// POST /api/firmware/cancel: drop queued upgrades (one already sent cannot be stopped).
 pub async fn cancel(State(s): State<AppState>) -> Result<Json<Value>, ApiError> {
-    let n = change_queue(&s, Op::CancelQueued).await?;
+    let n = change_queue(&s, Op::CancelQueued).await?.n;
     Ok(Json(json!({ "cancelled": n })))
 }
 
 /// POST /api/firmware/resume: start a queue a failed upgrade stopped again.
 pub async fn resume(State(s): State<AppState>) -> Result<Json<Value>, ApiError> {
     crate::api::require_active(&s, "upgrades need")?;
-    let n = change_queue(&s, Op::Resume).await?;
+    let n = change_queue(&s, Op::Resume).await?.n;
     Ok(Json(json!({ "resumed": n > 0 })))
 }
 
@@ -692,7 +705,7 @@ mod tests {
         // A release below what the AP needs is not offered.
         assert_eq!(status(Some("6.7.0.1"), Some(&rel), Some("7.0.0")), Status::Unknown);
         assert_eq!(status(Some("6.7.0.1"), None, None), Status::Unknown);
-        assert_eq!((json!(Status::UpdateAvailable), json!(Skip::NotFound)), (json!("update_available"), json!("not_found")), "named as the UI expects");
+        assert_eq!((json!(Status::UpdateAvailable), json!(Skip::NotFound), json!(Skip::Queued)), (json!("update_available"), json!("not_found"), json!("queued")), "named as the UI expects");
     }
 
     /// A test AP's MAC, by a one-hex-digit name.
@@ -740,9 +753,9 @@ mod tests {
         // Queuing more does not start a stopped queue; resuming does, once.
         j.enqueue(vec![job("d")]);
         assert!(j.current.is_none() && j.stopped.is_some() && j.queue.len() == 2);
-        assert_eq!(Op::Resume.apply(&mut j), 1);
+        assert_eq!(Op::Resume.apply(&mut j).n, 1);
         assert_eq!(j.current.as_ref().map(|c| c.mac), Some(m("c")));
-        assert_eq!(Op::Resume.apply(&mut j), 0, "not stopped");
+        assert_eq!(Op::Resume.apply(&mut j).n, 0, "not stopped");
     }
 
     #[test]
@@ -775,9 +788,9 @@ mod tests {
         assert_eq!(j.cancel_queued(), 1, "only b; a is already upgrading");
         assert!(j.current.is_some());
         // As the engine makes the changes the UI asks for.
-        assert_eq!(Op::Enqueue(vec![job("c"), job("d")]).apply(&mut j), 2);
-        assert_eq!(Op::Enqueue(vec![job("a"), job("c"), job("e")]).apply(&mut j), 1, "a is upgrading and c queued already");
-        assert_eq!(Op::CancelQueued.apply(&mut j), 3);
+        assert_eq!(Op::Enqueue(vec![job("c"), job("d")]).apply(&mut j), Changed { n: 2, busy: vec![] });
+        assert_eq!(Op::Enqueue(vec![job("a"), job("c"), job("e")]).apply(&mut j), Changed { n: 1, busy: vec![m("a"), m("c")] }, "a is upgrading and c queued already");
+        assert_eq!(Op::CancelQueued.apply(&mut j).n, 3);
     }
 
     #[test]

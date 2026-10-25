@@ -62,9 +62,8 @@ pub enum Input {
     /// Change the settings (apctl's copy of the controller settings), store
     /// them, and record the change; `done` gets what changed, or the refusal.
     EditState { ts: Ts, edit: StateEdit, done: tokio::sync::oneshot::Sender<Result<String, String>> },
-    /// Change the firmware upgrade queue; `done` gets how many upgrades were
-    /// queued or cancelled.
-    Firmware { op: crate::firmware::Op, done: tokio::sync::oneshot::Sender<usize> },
+    /// Change the firmware upgrade queue; `done` gets what changed.
+    Firmware { op: crate::firmware::Op, done: tokio::sync::oneshot::Sender<crate::firmware::Changed> },
     /// Nothing to do: wakes an idle engine at exit, to see that it is closing.
     Wake,
 }
@@ -658,8 +657,8 @@ impl Engine {
                 let _ = done.send(self.edit_state(ts, edit));
             }
             Input::Firmware { op, done } => {
-                let n = op.apply(&mut self.live.write().unwrap().firmware);
-                let _ = done.send(n);
+                let changed = op.apply(&mut self.live.write().unwrap().firmware);
+                let _ = done.send(changed);
             }
             Input::Wake => {}
         }
