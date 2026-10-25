@@ -95,9 +95,14 @@ spec:
 ```
 
 Expose port 8090 with a Service for the web UI. For shadow mode, drop `--active` and the
-host ports, and feed it a capture with `--shadow` or `--shadow-cmd`; the
-`ghcr.io/trexx/rust-apctl-capture` image is a tcpdump sidecar for that. `apctl serve --help`
-lists every option.
+host ports, and feed it a capture with `--shadow` or `--shadow-cmd`. The
+`ghcr.io/trexx/rust-apctl-capture` image is a tcpdump sidecar for that. It writes into the
+pipe its `FIFO` names (creating it), capturing what `FILTER` selects (all traffic when
+empty), and needs the `NET_RAW` and `NET_ADMIN` capabilities. Run it next to apctl in a pod
+that sees the other controller's traffic (`hostNetwork` on its node), with an `emptyDir`
+mounted at `/capture` in both containers, `FIFO=/capture/pcap` and
+`FILTER='tcp port 8080 or udp port 5514'` (informs and syslog) on the sidecar, and
+`--shadow /capture/pcap` on apctl. `apctl serve --help` lists every option.
 
 Without `--users-file` (`APCTL_USERS_FILE`), apctl is read-only and needs no login: anyone
 who can reach port 8090 sees everything except the Wi-Fi passphrases, the SNMP community
