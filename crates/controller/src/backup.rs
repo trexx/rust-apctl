@@ -92,12 +92,14 @@ impl Backups {
         Ok(self.known().settings.get_or_insert(s).clone())
     }
 
-    /// When the newest automatic backup was made (0: none).
+    /// When the newest automatic backup was made (0: none), deleted since or
+    /// not: what [`LAST_AUTO`] says, or the newest one listed if newer.
     fn last_auto(&self) -> Ts {
         if let Some(t) = self.known().last_auto {
             return t;
         }
-        let found = list(self).iter().filter(|m| m.kind == Kind::Auto).map(|m| m.created).max().unwrap_or(0);
+        let noted = fs::read_to_string(self.dir().join(LAST_AUTO)).ok().and_then(|t| t.trim().parse().ok()).unwrap_or(0);
+        let found = list(self).iter().filter(|m| m.kind == Kind::Auto).map(|m| m.created).fold(noted, Ts::max);
         // One made meanwhile is the newest.
         let mut k = self.known();
         let t = k.last_auto.map_or(found, |t| t.max(found));
@@ -588,6 +590,11 @@ fn create_of(b: &Backups, src_dir: &Path, kind: Kind, days: i64, names: &[&str])
         f.sync_all()?;
         fs::rename(tmp.join("meta.json"), dir.join(format!("{name}.json")))?;
         fs::rename(&part, dir.join(&name))?;
+        if kind == Kind::Auto
+            && let Err(e) = write_synced(&dir.join(LAST_AUTO), now.to_string().as_bytes())
+        {
+            tracing::warn!("cannot note when the automatic backup was made: {e:#}");
+        }
         sync_dir(&dir)?;
         if kind == Kind::Auto {
             let mut k = b.known();
@@ -871,6 +878,11 @@ fn apply(b: &Backups, id: &str, under_way: &mut bool) -> Result<()> {
     }
     sync_dir(&b.data_dir)
 }
+
+/// In the backups directory, when the newest automatic backup was made (seconds
+/// since the epoch): the schedule counts from it after a restart even when that
+/// backup was deleted, rather than make it again.
+const LAST_AUTO: &str = ".last-auto";
 
 /// Makes the renames in a directory durable.
 fn sync_dir(dir: &Path) -> Result<()> {
@@ -1195,7 +1207,8 @@ pub async fn delete(State(s): State<AppState>, UrlPath(name): UrlPath<String>) -
     let found = valid_name(&name)
         && tokio::task::spawn_blocking(move || {
             // The schedule still counts from it if it was the newest automatic one
-            // (`last_auto`): deleted, it is not made again before its next time.
+            // (`last_auto`, kept across restarts): deleted, it is not made again
+            // before its next time.
             let found = b.dir().join(&name).exists();
             if found {
                 remove(&b, &name);
@@ -1622,6 +1635,13 @@ mod tests {
         assert_eq!(b.known().last_auto, Some(m.created), "kept by the backup made");
         fs::remove_file(b.dir().join(format!("{}.json", m.name))).unwrap();
         assert_eq!(b.last_auto(), m.created, "not read again");
+        // After a restart, a deleted one still counts.
+        remove(&b, &m.name);
+        let again = Backups::new(src.to_path_buf(), None);
+        assert_eq!(again.last_auto(), m.created);
+        clean_unfinished(&again);
+        assert!(b.dir().join(LAST_AUTO).exists(), "no leftover of an unfinished backup");
+        assert_eq!(list(&again).iter().map(|m| m.kind).collect::<Vec<_>>(), [Kind::Manual], "nor a backup");
     }
 
     #[test]
