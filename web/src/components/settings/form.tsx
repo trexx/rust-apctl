@@ -7,6 +7,7 @@ import type {
   SetStateAction,
 } from "react";
 import { TextField, Toggle } from "../common";
+import { canonicalMac } from "../../format";
 
 /** A settings patch, as sent to the server. */
 export type Fields = Record<string, unknown>;
@@ -338,8 +339,10 @@ export const toggled = <T,>(list: readonly T[], x: T, on: boolean): T[] =>
     : list.filter((y) => y !== x);
 
 /**
- * A checkbox per AP; those in `value` are ticked. An entry of `value` that isn't
- * one of `aps` (a forgotten AP) shows ticked, by its MAC, so it can be unticked.
+ * A checkbox per AP; those in `value` are ticked. `value`'s MACs are read in any
+ * form the server accepts, and a change sends them all as "aa:bb:…". An entry of
+ * `value` that isn't one of `aps` (a forgotten AP) shows ticked, by its MAC, so
+ * it can be unticked.
  */
 export function ApChecklist({
   aps,
@@ -352,15 +355,16 @@ export function ApChecklist({
   onChange: (v: string[]) => void;
   disabled?: boolean;
 }) {
-  const stray = value.filter((m) => !aps.some((a) => a.mac === m));
+  const macs = [...new Set(value.map(canonicalMac))];
+  const stray = macs.filter((m) => !aps.some((a) => a.mac === m));
   return [
     ...aps.map((a) => ({ mac: a.mac, label: a.name ?? a.mac })),
     ...stray.map((m) => ({ mac: m, label: `${m} (not a known AP)` })),
   ].map((a) => (
     <Toggle
       key={a.mac}
-      value={value.includes(a.mac)}
-      onChange={(on) => onChange(toggled(value, a.mac, on))}
+      value={macs.includes(a.mac)}
+      onChange={(on) => onChange(toggled(macs, a.mac, on))}
       disabled={disabled}
       label={a.label}
     />
