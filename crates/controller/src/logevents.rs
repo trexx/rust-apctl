@@ -426,7 +426,7 @@ impl LogEvents {
 mod tests {
     use super::*;
 
-    const AP: &str = "78:45:58:3c:52:bc";
+    const AP: &str = "02:00:00:3c:52:bc";
 
     /// A syslog line from the AP: the kernel's with facility 0, the rest as user programs'.
     fn line(ts: Ts, prog: &str, msg: &str) -> LogLine {
@@ -479,14 +479,14 @@ mod tests {
         let p = "wlan: [0:I:ANY] [UNSPECIFIED] vap-0(wifi1ap1):";
         assert!(l.feed(&line(10, "kernel", &format!("{p}BTM: STA 6c:ac:c2:00:00:01 RSSI: -77, candidates: 1, error: 0, flags: ALLOW (0x1)"))).is_empty());
         assert!(l.feed(&line(10, "kernel", &format!("{p}BTM: RSSI: [-74 -> -68 -> -74 -> -78]"))).is_empty());
-        assert!(l.feed(&line(10, "kernel", &format!("{p}BTM: [0]{{78:45:58:3c:51:ae ch44/op128/phy14}}"))).is_empty());
+        assert!(l.feed(&line(10, "kernel", &format!("{p}BTM: [0]{{02:00:00:3c:51:ae ch44/op128/phy14}}"))).is_empty());
         let f = l.feed(&line(11, "kernel", &format!("{p}BTM: Received response from [6c:ac:c2:00:00:01](len = 5): dialog_token 1, status 7, delay 0, bssid n/a, cancel 0")));
         assert_eq!(f.len(), 1);
         let d = &f[0].data;
         assert_eq!((f[0].kind, d["status"].as_i64(), d["accepted"].as_bool()), (EventKind::ClientSteered, Some(7), Some(false)));
         assert_eq!(d["result"], "rejected: no suitable AP to move to");
         assert_eq!(d["signal"], -77);
-        assert_eq!(d["candidates"][0]["bssid"], "78:45:58:3c:51:ae");
+        assert_eq!(d["candidates"][0]["bssid"], "02:00:00:3c:51:ae");
         assert_eq!(d["candidates"][0]["channel"], 44);
         assert_eq!(d["vap"], "wifi1ap1");
         // The client repeating the same answer is not reported again within 10 minutes.
@@ -502,17 +502,17 @@ mod tests {
         // AP E asks the client to move, then AP D does; E's candidates come after.
         l.feed(&from(e, 10, format!("{p}BTM: STA 6c:ac:c2:00:00:01 RSSI: -77, candidates: 1, error: 0, flags: ALLOW (0x1)")));
         l.feed(&from(d, 11, format!("{p}BTM: STA 6c:ac:c2:00:00:01 RSSI: -70, candidates: 1, error: 0, flags: ALLOW (0x1)")));
-        l.feed(&from(e, 11, format!("{p}BTM: [0]{{78:45:58:3c:51:ae ch44/op128/phy14}}")));
-        l.feed(&from(d, 11, format!("{p}BTM: [0]{{78:45:58:3c:51:af ch36/op128/phy14}}")));
+        l.feed(&from(e, 11, format!("{p}BTM: [0]{{02:00:00:3c:51:ae ch44/op128/phy14}}")));
+        l.feed(&from(d, 11, format!("{p}BTM: [0]{{02:00:00:3c:51:af ch36/op128/phy14}}")));
         let f = l.feed(&from(d, 12, format!("{p}BTM: Received response from [6c:ac:c2:00:00:01](len = 5): dialog_token 1, status 0, delay 0, bssid n/a, cancel 0")));
         assert_eq!((f[0].data["signal"].as_i64(), f[0].data["candidates"].as_array().map(Vec::len)), (Some(-70), Some(1)));
-        assert_eq!(f[0].data["candidates"][0]["bssid"], "78:45:58:3c:51:af");
+        assert_eq!(f[0].data["candidates"][0]["bssid"], "02:00:00:3c:51:af");
     }
 
     #[test]
     fn experience_problems_when_they_change() {
         let mut l = LogEvents::default();
-        let m = |r: &str| format!("wireless_agg_stats.log_sta_anomalies(): bssid=78:45:58:3c:51:ae radio=wifi1 vap=wifi1ap0 sta=92:00:00:00:00:05 signal=-48 satisfaction_now=70 anomalies={r}");
+        let m = |r: &str| format!("wireless_agg_stats.log_sta_anomalies(): bssid=02:00:00:3c:51:ae radio=wifi1 vap=wifi1ap0 sta=92:00:00:00:00:05 signal=-48 satisfaction_now=70 anomalies={r}");
         let f = l.feed(&line(0, "mcad", &m("low_phy_rate")));
         assert_eq!((f.len(), f[0].data["satisfaction"].as_i64()), (1, Some(70)));
         assert_eq!(f[0].data["anomalies"][0], "low_phy_rate");
@@ -699,7 +699,7 @@ mod tests {
         assert_eq!(kicks, MAX_TRACKED, "made-up clients past the limit are not reported");
         assert_eq!((l.recent.len(), l.steering.len()), (MAX_TRACKED, MAX_TRACKED));
         for _ in 0..100 {
-            l.feed(&line(1, "kernel", &format!("{p}BTM: [0]{{78:45:58:3c:51:ae ch44/op128/phy14}}")));
+            l.feed(&line(1, "kernel", &format!("{p}BTM: [0]{{02:00:00:3c:51:ae ch44/op128/phy14}}")));
         }
         assert!(l.steering.values().all(|s| s.targets.len() <= MAX_TARGETS));
         // Time clears them once no window reads them, and the device's pointer
@@ -723,7 +723,7 @@ mod tests {
             "BTM: vap-(".to_string(),
             "vap-)BTM: STA 6c:ac:c2:00:00:01 (".to_string(),
             format!("{p}BTM: STA 6c:ac:c2:00:00:01 RSSI: -77, candidates: 1, error: 0, flags: ALLOW (0x1)"),
-            format!("{p}BTM: [0]{{78:45:58:3c:51:ae ch44/op128/phy14}}"),
+            format!("{p}BTM: [0]{{02:00:00:3c:51:ae ch44/op128/phy14}}"),
             format!("{p}BTM: Received response from [6c:ac:c2:00:00:01](len = 5): dialog_token 1, status 7, delay 0, bssid n/a, cancel 0"),
             "kick-sta-on 6c:ac:c2:00:00:01 wifi1ap1 (reason:Low RSSI rssi:19)".to_string(),
             "wireless_agg_stats.log_sta_anomalies(): sta=92:00:00:00:00:05 signal=-48 satisfaction_now=70 anomalies=low_phy_rate".to_string(),

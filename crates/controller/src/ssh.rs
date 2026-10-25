@@ -6,8 +6,10 @@
 //! `/usr/bin/syswrapper.sh set-adopt <inform url> <key>`: the AP then informs
 //! here with its new key. apctl first reads the AP's MAC (and model) so it can
 //! create its record and key. The host key is accepted the first time and
-//! kept (`x_ssh_hostkey_fingerprint`). For an AP apctl already knows at that
-//! address, the kept key is checked before any password is sent.
+//! kept (`x_ssh_hostkey_fingerprint`, which adoption also fills from the
+//! fingerprint an AP's inform reports). For an AP apctl already knows at that
+//! address, the key it expects ([`expected_host_key`]) is checked before any
+//! password is sent.
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -198,13 +200,21 @@ fn shell_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', r"'\''"))
 }
 
-/// The host key apctl kept for an AP it knows at this address, and that AP:
+/// The fingerprint of the host key an AP of the settings must present: the one
+/// its informs report (`fingerprint`, sent under its own key; the official
+/// controller keeps its record up to date with it), else the one its record kept.
+fn expected_host_key(live: &crate::engine::Live, state: &Value, mac: &Mac) -> Option<String> {
+    let reported = live.raw_informs.get(mac).and_then(|p| p["fingerprint"].as_str()).filter(|f| !f.is_empty());
+    reported.or_else(|| crate::adopt::device_doc(state, mac)?["x_ssh_hostkey_fingerprint"].as_str()).map(str::to_string)
+}
+
+/// The host key apctl expects of an AP it knows at this address, and that AP:
 /// the AP informing from it, else one whose record has this IP (written at
 /// adoption, never refreshed) unless it informs from another address now.
 fn known_host_key(live: &crate::engine::Live, ip: &str) -> Option<(Mac, String)> {
     let state = live.state.as_deref()?;
-    let fingerprint = |mac: &Mac| crate::adopt::device_doc(state, mac).and_then(|d| d["x_ssh_hostkey_fingerprint"].as_str()).map(str::to_string);
-    // The AP there now is the one to check against: its key, or none kept.
+    let fingerprint = |mac: &Mac| expected_host_key(live, state, mac);
+    // The AP there now is the one to check against: its key, or none known.
     if let Some(mac) = live.by_ip.get(ip) {
         return Some((*mac, fingerprint(mac)?));
     }
@@ -339,9 +349,9 @@ async fn adopt_over_ssh(s: AppState, b: AdoptBody) -> Result<Json<Value>, ApiErr
         .or_else(|| board_value(&board, "board.hwaddr").and_then(parse_mac))
         .ok_or_else(|| ApiError(StatusCode::BAD_GATEWAY, "could not read the AP's MAC address: is this a UniFi AP?".into()))?;
     // An AP apctl knows by its MAC but not at this address: check its key too.
-    let known = state.as_deref().and_then(|st| crate::adopt::device_doc(st, &mac));
-    if let (Some(k), Some(seen)) = (known.and_then(|d| d["x_ssh_hostkey_fingerprint"].as_str()), &session.fingerprint)
-        && k != seen
+    let known = state.as_deref().and_then(|st| expected_host_key(&s.live.read().unwrap(), st, &mac));
+    if let (Some(k), Some(seen)) = (known, &session.fingerprint)
+        && k != *seen
     {
         s.note(Event::device(clock::now_ts(), EventKind::ApHostKeyMismatch, mac, json!({ "ip": ip }))).await;
         return Err(bad(Failure::HostKey));
@@ -549,6 +559,14 @@ mod tests {
         live.by_ip.clear();
         live.by_ip.insert("192.0.2.5".into(), "02:00:00:00:00:02".parse().unwrap());
         assert_eq!(known_host_key(&live, "192.0.2.5"), None);
+        // The key an AP's informs report goes before the record's: kept or not, it is the one expected.
+        live.raw_informs.insert("02:00:00:00:00:02".parse().unwrap(), std::sync::Arc::new(json!({ "fingerprint": "SHA256:new" })));
+        assert_eq!(known_host_key(&live, "192.0.2.5"), Some(("02:00:00:00:00:02".parse().unwrap(), "SHA256:new".into())));
+        live.raw_informs.insert(ap, std::sync::Arc::new(json!({ "fingerprint": "SHA256:changed" })));
+        let state = live.state.clone().unwrap();
+        assert_eq!(expected_host_key(&live, &state, &ap).as_deref(), Some("SHA256:changed"));
+        live.raw_informs.insert(ap, std::sync::Arc::new(json!({ "fingerprint": "" })));
+        assert_eq!(expected_host_key(&live, &state, &ap).as_deref(), Some("SHA256:abc"), "none reported: the record's");
     }
 
     #[test]

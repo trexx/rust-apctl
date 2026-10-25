@@ -10,7 +10,7 @@ use std::sync::LazyLock;
 
 use crate::api::{ApiError, AppState, Json, Query};
 use crate::settings::Kind::{Bool, Enum, Int};
-use crate::settings::{COUNTRIES, Patch, PreviewQuery, band_name, configured_width, copy_fields, country, dedup_in_order, docs, docs_mut, illegal_fixed_channel, mgmt_flag, num, pick, record_label, setting, setting_mut, str_field, timezone};
+use crate::settings::{COUNTRIES, Patch, PreviewQuery, band_name, copy_fields, country, dedup_in_order, docs, docs_mut, illegal_fixed_channel, mgmt_flag, num, pick, radio_width, record_label, setting, setting_mut, str_field, timezone};
 
 /// A host name or IPv4 address, as NTP and syslog targets take (the official
 /// controller refuses IPv6 there).
@@ -37,7 +37,7 @@ fn reset_illegal_channels(state: &mut Value) -> Vec<String> {
     let c = country(state);
     let site_outdoor = mgmt_flag(state, "outdoor_mode_enabled");
     // Each AP's radios' widths, read before the records are borrowed to change them.
-    let widths: Vec<Vec<i64>> = docs(state, "devices").map(|d| d["radio_table"].as_array().into_iter().flatten().map(|r| configured_width(state, r)).collect()).collect();
+    let widths: Vec<Vec<i64>> = docs(state, "devices").map(|d| d["radio_table"].as_array().into_iter().flatten().map(|r| radio_width(state, r)).collect()).collect();
     let mut out = Vec::new();
     for (d, widths) in docs_mut(state, "devices").zip(widths) {
         let o = apcfg::override_of(d, "outdoor_mode_override", site_outdoor);
@@ -478,6 +478,15 @@ mod tests {
         edit(&mut s, json!({ "country": 208, "timezone": "Europe/Copenhagen" })).unwrap();
         assert_eq!((setting(&s, "country")["code"].as_str(), setting(&s, "locale")["timezone"].as_str()), (Some("208"), Some("Europe/Copenhagen")));
         assert!(edit(&mut s, json!({ "timezone": "Mars/Olympus" })).is_err());
+        // A fixed channel is judged at the width the radio runs: 160 MHz set on a radio
+        // that does 80 at most keeps 149 in the US.
+        let mut s = state();
+        s["devices"][0]["radio_table"][0] = json!({ "radio": "na", "channel": 149, "ht": 160, "is_11ax": true });
+        edit(&mut s, json!({ "country": 840 })).unwrap();
+        assert_eq!(s["devices"][0]["radio_table"][0]["channel"], 149);
+        s["devices"][0]["radio_table"][0]["has_ht160"] = json!(true);
+        edit(&mut s, json!({ "country": 124 })).unwrap();
+        assert_eq!(s["devices"][0]["radio_table"][0]["channel"], "auto", "160 MHz has no block at 149");
     }
 
     #[test]
@@ -586,10 +595,11 @@ mod tests {
     }
 
     #[test]
-    fn every_time_zone_offered_is_one_the_clock_reads() {
+    fn every_time_zone_known_is_one_the_clock_reads() {
         // 2026-01-15 and 2026-07-15, 00:00 UTC.
         let (jan, jul) = (1_768_435_200, 1_784_073_600);
-        for name in apcfg::tz::names() {
+        // Those offered and the links a stored zone may name.
+        for name in apcfg::tz::all_names() {
             let tz = apcfg::tz::posix(name).unwrap();
             let (a, b) = (crate::clock::utc_offset(tz, jan), crate::clock::utc_offset(tz, jul));
             assert!(a.is_some() && b.is_some(), "{name}: {tz}");

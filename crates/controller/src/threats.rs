@@ -185,13 +185,18 @@ fn mac_num(s: &str) -> Option<u64> {
     Some(hardware_num(&s.parse().ok()?))
 }
 
-/// Folds case, spacing and look-alike characters (digits, symbols and
-/// Cyrillic letters that pass for Latin ones).
+/// Spacing and punctuation a name may differ by and still read the same:
+/// separators and invisible characters.
+fn is_spacing(c: char) -> bool {
+    c.is_whitespace() || matches!(c, '-' | '_' | '.' | '\'' | '\u{200b}'..='\u{200d}' | '\u{2060}' | '\u{feff}')
+}
+
+/// Folds case, spacing ([`is_spacing`]) and look-alike characters (digits,
+/// symbols and Cyrillic letters that pass for Latin ones).
 fn fold(s: &str) -> String {
     let mut out = String::new();
-    for c in s.chars().flat_map(char::to_lowercase) {
+    for c in s.chars().flat_map(char::to_lowercase).filter(|c| !is_spacing(*c)) {
         let m = match c {
-            ' ' | '-' | '_' | '.' | '\'' | '\u{200b}'..='\u{200d}' | '\u{2060}' | '\u{feff}' | '\u{00a0}' => continue,
             '0' | 'о' | 'ο' => 'o',
             '1' | 'i' | '!' | '|' | 'і' | 'ӏ' | 'ι' => 'l',
             '3' | 'е' | 'ε' => 'e',
@@ -233,13 +238,14 @@ fn within_edits(a: &[char], b: &[char], max: usize) -> bool {
 /// A network name with the forms [`similar`] compares, worked out once.
 struct Name<'a> {
     raw: &'a str,
+    /// Lower case, without spacing or punctuation ([`is_spacing`]).
     lower: String,
     folded: Vec<char>,
 }
 
 impl<'a> Name<'a> {
     fn new(raw: &'a str) -> Name<'a> {
-        Name { raw, lower: raw.trim().to_lowercase(), folded: fold(raw).chars().collect() }
+        Name { raw, lower: raw.chars().flat_map(char::to_lowercase).filter(|c| !is_spacing(*c)).collect(), folded: fold(raw).chars().collect() }
     }
 }
 
@@ -255,7 +261,7 @@ fn similar(name: &Name, ours: &Name) -> Option<&'static str> {
         return None;
     }
     if name.lower == ours.lower {
-        return Some("the same name with different capitals or spacing");
+        return Some("the same name with different capitals, spacing or punctuation");
     }
     let (a, b) = (&name.folded, &ours.folded);
     let len = b.len();
@@ -996,8 +1002,8 @@ mod tests {
     use super::*;
     use crate::model::tests::{TestDir, TestStore, flushed};
 
-    const UP: &str = "78:45:58:3c:51:ac";
-    const DOWN: &str = "78:45:58:3c:52:bc";
+    const UP: &str = "02:00:00:3c:51:ac";
+    const DOWN: &str = "02:00:00:3c:52:bc";
 
     fn heard(bssid: &str, by: &str, essid: &str, channel: i64, security: &str, signal: i64) -> Heard {
         Heard {
@@ -1019,9 +1025,9 @@ mod tests {
         a.aps.insert(UP.into(), Some("Upstairs".into()));
         a.aps.insert(DOWN.into(), Some("Garage".into()));
         for (b, ap, e, ch) in [
-            ("78:45:58:3c:51:ae", UP, "Home", 44),
+            ("02:00:00:3c:51:ae", UP, "Home", 44),
             ("7a:45:58:3c:51:ae", UP, "Home IoT", 1),
-            ("78:45:58:3c:52:be", DOWN, "Home", 48),
+            ("02:00:00:3c:52:be", DOWN, "Home", 48),
             ("7a:45:58:3c:52:be", DOWN, "Home IoT", 1),
         ] {
             a.own.push(OwnBss { bssid: b.into(), ap_mac: ap.into(), essid: Some(e.into()), channel: Some(ch), changed_at: 0 });
@@ -1029,8 +1035,8 @@ mod tests {
         }
         a.clients = sorted_clients([("3c:55:76:00:00:03".parse().unwrap(), Some("phone".into()))]).into();
         // Our APs hear each other normally.
-        a.heard.push(heard("78:45:58:3c:52:be", UP, "Home", 48, "WPA2-Personal (AES/CCMP)", -81));
-        a.heard.push(heard("78:45:58:3c:51:ae", DOWN, "Home", 44, "WPA2-Personal (AES/CCMP)", -84));
+        a.heard.push(heard("02:00:00:3c:52:be", UP, "Home", 48, "WPA2-Personal (AES/CCMP)", -81));
+        a.heard.push(heard("02:00:00:3c:51:ae", DOWN, "Home", 44, "WPA2-Personal (AES/CCMP)", -84));
         // A neighbour.
         a.heard.push(heard("2a:00:00:00:00:07", UP, "Neighbour Net", 44, "WPA2-Personal (AES/CCMP)", -74));
         a
@@ -1060,7 +1066,7 @@ mod tests {
         // called different, whichever row comes last, and one with neither
         // names both.
         let mut a = site();
-        a.heard.push(heard("78:45:58:3c:52:be", UP, "Home", 48, "WPA3-Personal", -81));
+        a.heard.push(heard("02:00:00:3c:52:be", UP, "Home", 48, "WPA3-Personal", -81));
         for (sec, different) in [("WPA2-Personal (AES/CCMP)", false), ("WPA3-Personal", false), ("WPA-Personal (TKIP)", true)] {
             for order in [false, true] {
                 let mut a = Assessment { heard: a.heard.clone(), own: a.own.clone(), ssids: a.ssids.clone(), aps: a.aps.clone(), now: a.now, ..Default::default() };
@@ -1084,17 +1090,17 @@ mod tests {
     #[test]
     fn our_bssid_on_another_channel_is_spoofing_unless_we_moved() {
         let mut a = site();
-        a.heard.push(heard("78:45:58:3c:52:be", UP, "Home", 149, "WPA2-Personal (AES/CCMP)", -60));
+        a.heard.push(heard("02:00:00:3c:52:be", UP, "Home", 149, "WPA2-Personal (AES/CCMP)", -60));
         // (replaces the normal sighting: one row per BSSID and hearing AP)
-        a.heard.retain(|h| !(h.bssid == "78:45:58:3c:52:be" && h.channel == Some(48)));
-        assert_eq!(kinds(&a), vec![(Kind::SpoofedBssid, Severity::High, "78:45:58:3c:52:be".into())]);
+        a.heard.retain(|h| !(h.bssid == "02:00:00:3c:52:be" && h.channel == Some(48)));
+        assert_eq!(kinds(&a), vec![(Kind::SpoofedBssid, Severity::High, "02:00:00:3c:52:be".into())]);
         // The scan predates our own channel change: not reported.
-        a.own.iter_mut().find(|o| o.bssid == "78:45:58:3c:52:be").unwrap().changed_at = 20_000;
+        a.own.iter_mut().find(|o| o.bssid == "02:00:00:3c:52:be").unwrap().changed_at = 20_000;
         assert!(kinds(&a).is_empty());
         // Our BSSID with someone else's name.
         let mut a = site();
-        a.heard.retain(|h| h.bssid != "78:45:58:3c:52:be");
-        a.heard.push(heard("78:45:58:3c:52:be", UP, "Free WiFi", 48, "Open", -60));
+        a.heard.retain(|h| h.bssid != "02:00:00:3c:52:be");
+        a.heard.push(heard("02:00:00:3c:52:be", UP, "Free WiFi", 48, "Open", -60));
         assert!(assess(&a)[0].detail.contains("calls itself \"Free WiFi\""));
     }
 
@@ -1103,6 +1109,11 @@ mod tests {
         assert!(lookalike("H0me", "Home").is_some());
         assert!(lookalike("home", "Home").is_some());
         assert!(lookalike("Home WiFi_5G", "Home WiFi").is_some());
+        // Spacing and punctuation are told as such, not as look-alike characters.
+        for name in ["HomeWiFi", "Home-WiFi", "Home_WiFi", " home wifi", "Home\u{a0}WiFi"] {
+            assert_eq!(lookalike(name, "Home WiFi"), Some("the same name with different capitals, spacing or punctuation"), "{name}");
+        }
+        assert_eq!(lookalike("H0me WiFi", "Home WiFi"), Some("looks the same, with look-alike characters swapped in (such as 0 for O)"));
         assert!(lookalike("Home WіFi", "Home WiFi").is_some()); // Cyrillic i
         assert!(lookalike("Home WiFii", "Home WiFi").is_some());
         assert!(lookalike("Housing Office", "Home WiFi").is_none());

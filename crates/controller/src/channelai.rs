@@ -26,7 +26,7 @@ use crate::clock;
 use crate::engine::{Event, EventKind, Live};
 use crate::model::Ts;
 use crate::adopt::{device_doc, device_doc_mut};
-use crate::settings::{allowed_channels, band_channels, channel_locked_macs, configured_width, country, dedup_in_order, device_macs, fixed_channel_ok, inform_radio, legal_channels, mac_list_value, num, setting, setting_mut, uplink};
+use crate::settings::{allowed_channels, band_channels, channel_locked_macs, country, dedup_in_order, device_macs, fixed_channel_ok, inform_radio, legal_channels, mac_list_value, num, radio_width, setting, setting_mut, uplink};
 
 /// A band Channel AI handles, and how its quick scan is asked for.
 pub struct Band {
@@ -236,7 +236,7 @@ pub fn set_channels(state: &mut Value, band: &str, changes: &[(Mac, i64)], held:
         let d = device_doc(state, &mac).ok_or_else(|| format!("{mac} is not in the settings"))?;
         let outdoor = crate::settings::outdoor(state, d);
         // Judged at the width the AP runs, which the plan leaves as it is.
-        let width = inform_radio(d, band).map(|r| configured_width(state, r)).ok_or_else(|| format!("{mac} has no {band} radio"))?;
+        let width = inform_radio(d, band).map(|r| radio_width(state, r)).ok_or_else(|| format!("{mac} has no {band} radio"))?;
         if !fixed_channel_ok(c, band, width, outdoor, ch) {
             return Err(format!("channel {ch} is not allowed at {width} MHz here"));
         }

@@ -32,6 +32,7 @@ mod stun;
 mod store;
 mod syslog;
 mod threats;
+mod usergroups;
 mod vendor;
 mod web;
 

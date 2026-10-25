@@ -118,9 +118,9 @@ pub fn router(state: AppState) -> Router {
         .route("/api/settings/wlans/{id}", axum::routing::put(crate::settings::put_wlan).delete(crate::settings::delete_wlan_route))
         .route("/api/settings/wlans/{id}/passphrase", get(crate::settings::passphrase).route_layer(secret.clone()))
         .route("/api/settings/devices/{mac}", get(crate::settings::device).put(crate::settings::put_device))
-        .route("/api/settings/usergroups", get(crate::settings::usergroups).post(crate::settings::post_usergroup))
-        .route("/api/settings/usergroups/{id}", axum::routing::put(crate::settings::put_usergroup).delete(crate::settings::delete_usergroup))
-        .route("/api/clients/{mac}/speed-limit", axum::routing::put(crate::settings::put_client_group))
+        .route("/api/settings/usergroups", get(crate::usergroups::usergroups).post(crate::usergroups::post_usergroup))
+        .route("/api/settings/usergroups/{id}", axum::routing::put(crate::usergroups::put_usergroup).delete(crate::usergroups::delete_usergroup))
+        .route("/api/clients/{mac}/speed-limit", axum::routing::put(crate::usergroups::put_client_group))
         .route("/api/dryrun", get(dryrun))
         .route("/api/site/activity", get(crate::insights::activity))
         .route("/api/site/top", get(crate::insights::top))
@@ -527,7 +527,7 @@ async fn devices(State(s): State<AppState>) -> Json<Vec<DeviceRow>> {
             *per_ap.entry(c.sample.ap_mac).or_default() += 1;
         }
         let mut list: Vec<DeviceRow> =
-            live.devices.iter().map(|(mac, d)| device_row(*mac, d, per_ap.get(mac).copied().unwrap_or(0), RowSource::Live { locating: live.locating.contains(mac) })).collect();
+            live.devices.iter().map(|(mac, d)| device_row(*mac, d, per_ap.get(mac).copied().unwrap_or(0), RowSource::Live { locating: crate::actions::locating(&live, mac) })).collect();
         // Then the APs not reporting since apctl started, by MAC as the others.
         let mut stored: Vec<DeviceRow> = stored_only(&live).map(|(mac, k)| device_row(*mac, &stored_view(*mac, k), 0, RowSource::Stored)).collect();
         stored.sort_unstable_by_key(|d| d.mac);
@@ -562,7 +562,7 @@ async fn device(State(s): State<AppState>, MacPath(mac): MacPath) -> Result<Resp
         match (live.devices.get(&mac), live.known_devices.get(&mac)) {
             (Some(d), _) => {
                 let clients: Vec<_> = live.connected_clients().map(|(_, c)| c).filter(|c| c.sample.ap_mac == mac).cloned().collect();
-                (d.clone(), clients, live.locating.contains(&mac), false)
+                (d.clone(), clients, crate::actions::locating(&live, &mac), false)
             }
             // Known but not reporting since apctl started: offline, with what was stored.
             (None, Some(k)) => (stored_view(mac, k), Vec::new(), false, true),

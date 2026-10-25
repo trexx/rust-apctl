@@ -181,7 +181,7 @@ pub fn pending_inform(payload: &Value) -> Value {
         _ => None,
     };
     let pick = |v: &Value, keys: &[&str]| Value::Object(keys.iter().filter_map(|&k| Some((k.to_string(), small(v.get(k)?)?))).collect());
-    let mut out = pick(payload, &["mac", "model", "model_display", "version", "serial", "ip", "hostname"]);
+    let mut out = pick(payload, &["mac", "model", "model_display", "version", "serial", "ip", "hostname", "fingerprint"]);
     if let Some(radios) = payload["radio_table"].as_array() {
         out["radio_table"] = radios.iter().take(8).map(|r| pick(r, &RADIO_KEYS)).collect();
     }
@@ -255,23 +255,11 @@ const RADIO_KEYS: [&str; 16] = [
 
 /// The width a new AP's radio starts at, as the official controller sets it on
 /// adoption: the site's default for the band (else the band's own: 20, 80 or
-/// 160 MHz), at most what the band and the radio (as its inform reports it) allow.
-fn start_width(state: &Value, r: &Value, band: &str) -> i64 {
-    let configured = crate::settings::setting(state, "radio_ai")["radios_configuration"]
-        .as_array()
-        .and_then(|l| crate::settings::num(&l.iter().find(|c| c["radio"].as_str() == Some(band))?["channel_width"]))
-        .unwrap_or(match band {
-            "ng" => 20,
-            "na" => 80,
-            _ => 160,
-        });
-    let capable = apcfg::capable_width(r);
-    let band_max = match band {
-        "ng" => 40,
-        "na" => 160,
-        _ => 320,
-    };
-    configured.min(capable).min(band_max)
+/// 160 MHz), at most what the band and the radio (as its inform reports it)
+/// allow. An inform's radio has no `ht`, so this is the width the render would
+/// run it at ([`crate::settings::radio_width`]).
+fn start_width(state: &Value, r: &Value) -> i64 {
+    crate::settings::radio_width(state, r)
 }
 
 /// The radio settings of a new AP, from the radios its inform lists: auto
@@ -284,7 +272,7 @@ pub fn radio_table(state: &Value, payload: &Value) -> Vec<Value> {
         .filter_map(|r| {
             let band = r["radio"].as_str()?;
             let mut v = json!({
-                "name": r["name"], "radio": band, "channel": "auto", "ht": start_width(state, r, band), "tx_power_mode": "auto",
+                "name": r["name"], "radio": band, "channel": "auto", "ht": start_width(state, r), "tx_power_mode": "auto",
                 "min_rssi_enabled": false, "hard_noise_floor_enabled": false, "antenna_gain": r["builtin_ant_gain"],
             });
             // The rest of what it reports, as it reports it.
@@ -318,17 +306,28 @@ pub fn new_device(state: &Value, payload: &Value, mac: &Mac) -> Value {
 }
 
 /// Fills an AP's record with its details from an inform: its model, version,
-/// serial and address, and its hostname as its name unless it has one.
+/// serial and address, its SSH host key's fingerprint ([`keep_host_key`]),
+/// and its hostname as its name unless it has one.
 pub fn fill_from_inform(d: &mut Value, payload: &Value) {
     for k in ["model", "version", "serial", "ip"] {
         if !payload[k].is_null() {
             d[k] = payload[k].clone();
         }
     }
+    keep_host_key(d, payload);
     if d["name"].is_null()
         && let Some(n) = payload["hostname"].as_str()
     {
         d["name"] = json!(n);
+    }
+}
+
+/// Keeps the fingerprint of the SSH host key an inform reports in the AP's
+/// record (`x_ssh_hostkey_fingerprint`), as the official controller does: an
+/// adoption over SSH checks the AP against it.
+fn keep_host_key(d: &mut Value, payload: &Value) {
+    if let Some(fp) = payload["fingerprint"].as_str().filter(|f| !f.is_empty()) {
+        d["x_ssh_hostkey_fingerprint"] = json!(fp);
     }
 }
 
@@ -363,6 +362,8 @@ pub fn adopt_device(state: &mut Value, mac: &Mac, payload: &Value) -> Result<Str
         if let Some(o) = d.as_object_mut() {
             o.remove("x_aes_gcm");
         }
+        // A reset AP may have a new host key.
+        keep_host_key(d, payload);
         return Ok(format!("re-adopting AP {} with new keys", ap_name(d, mac)));
     }
     let d = new_device(state, payload, mac);
@@ -505,24 +506,42 @@ pub async fn forget(State(s): State<AppState>, MacPath(mac): MacPath) -> Result<
     tokio::spawn(forget_ap(s, mac)).await?
 }
 
+/// What a forget has to do for an AP.
+#[derive(Debug, PartialEq)]
+enum ToForget {
+    /// Remove its record: at once when it is offline, else when it reports (and is told to reset).
+    Record { online: bool },
+    /// Its record left the settings another way (an import without it), but
+    /// apctl still lists it: only apctl's own records of it are left.
+    Listed,
+}
+
+impl ToForget {
+    fn of(live: &Live, mac: &Mac) -> Result<ToForget, ApiError> {
+        if live.state.as_deref().and_then(|st| device_doc(st, mac)).is_some() {
+            Ok(ToForget::Record { online: live.devices.get(mac).is_some_and(|d| d.online) })
+        } else if live.devices.contains_key(mac) || live.known_devices.contains_key(mac) {
+            Ok(ToForget::Listed)
+        } else {
+            Err(ApiError::not_found("apctl does not know this AP"))
+        }
+    }
+}
+
 /// [`forget`]'s work.
 async fn forget_ap(s: AppState, mac: Mac) -> Result<Json<Value>, ApiError> {
     crate::api::require_active(&s, "adoption needs")?;
-    let online = {
-        let live = s.live.read().unwrap();
-        if live.state.as_deref().and_then(|st| device_doc(st, &mac)).is_none() {
-            return Err(ApiError::not_found("this AP is not in the settings"));
+    let to_forget = ToForget::of(&s.live.read().unwrap(), &mac)?;
+    match to_forget {
+        ToForget::Record { online: true } => {
+            let mut live = s.live.write().unwrap();
+            live.adoption.forgetting.insert(mac, clock::now_ts());
+            crate::stun::poke(&live, &mac);
+            return Ok(Json(json!({ "forgetting": true })));
         }
-        live.devices.get(&mac).is_some_and(|d| d.online)
-    };
-    if online {
-        // Removed when it reports (and is told to reset), or after the timeout.
-        let mut live = s.live.write().unwrap();
-        live.adoption.forgetting.insert(mac, clock::now_ts());
-        crate::stun::poke(&live, &mac);
-        return Ok(Json(json!({ "forgetting": true })));
+        ToForget::Record { online: false } => finish_forget(&s.engine, mac, false).await?,
+        ToForget::Listed => forgotten(&s.engine, mac, false).await,
     }
-    finish_forget(&s.engine, mac, false).await?;
     Ok(Json(json!({ "forgotten": true })))
 }
 
@@ -536,8 +555,7 @@ pub async fn finish_forget(engine: &tokio::sync::mpsc::Sender<Input>, mac: Mac, 
     // got there first, or an import since left the AP out.
     match rx.await {
         Ok(Ok(_)) => {
-            let _ = engine.send(Input::Forget { ts: clock::now_ts(), mac }).await;
-            let _ = engine.send(Input::Note(Event::device(clock::now_ts(), EventKind::ApForgotten, mac, json!({ "reset": reset })))).await;
+            forgotten(engine, mac, reset).await;
             Ok(())
         }
         Ok(Err(e)) => {
@@ -549,6 +567,12 @@ pub async fn finish_forget(engine: &tokio::sync::mpsc::Sender<Input>, mac: Mac, 
             Err(ApiError::engine_stopped())
         }
     }
+}
+
+/// Has the engine drop apctl's records of an AP, and tells of it.
+async fn forgotten(engine: &tokio::sync::mpsc::Sender<Input>, mac: Mac, reset: bool) {
+    let _ = engine.send(Input::Forget { ts: clock::now_ts(), mac }).await;
+    let _ = engine.send(Input::Note(Event::device(clock::now_ts(), EventKind::ApForgotten, mac, json!({ "reset": reset })))).await;
 }
 
 #[cfg(test)]
@@ -653,6 +677,18 @@ mod tests {
     }
 
     #[test]
+    fn an_ap_listed_without_a_record_can_be_forgotten() {
+        let mut live = Live { state: Some(Arc::new(state())), ..Live::default() };
+        let (ours, gone): (Mac, Mac) = ("02:00:00:00:00:01".parse().unwrap(), "02:00:00:00:00:02".parse().unwrap());
+        assert_eq!(ToForget::of(&live, &ours).ok(), Some(ToForget::Record { online: false }));
+        assert_eq!(ToForget::of(&live, &gone).err().map(|e| e.0), Some(axum::http::StatusCode::NOT_FOUND), "not known at all");
+        // Stored from an earlier run, its record since left out by an import.
+        let known = crate::engine::KnownDevice { first_seen: 1, last_seen: 2, uptime: None, version: None, hostname: None, model: None, model_display: None, ip: None, serial: None, offline: true };
+        live.known_devices.insert(gone, known);
+        assert_eq!(ToForget::of(&live, &gone).ok(), Some(ToForget::Listed));
+    }
+
+    #[test]
     fn a_new_radio_starts_at_the_sites_width_capped_by_the_radio() {
         let radios = json!({ "radio_table": [
             { "name": "wifi0", "radio": "ng", "is_11ax": true },
@@ -694,6 +730,19 @@ mod tests {
         device_doc_mut(&mut s, &mac).unwrap()["x_aes_gcm"] = json!(true);
         adopt_device(&mut s, &mac, &inform()).unwrap();
         assert!(device_doc(&s, &mac).unwrap().get("x_aes_gcm").is_none());
+        // The SSH host key an inform reports is kept, and a reset AP's new one replaces it.
+        let reporting = |fp: &str| {
+            let mut p = inform();
+            p["fingerprint"] = json!(fp);
+            pending_inform(&p)
+        };
+        let mac2: Mac = "02:00:00:00:00:0a".parse().unwrap();
+        adopt_device(&mut s, &mac2, &reporting("SHA256:first")).unwrap();
+        assert_eq!(device_doc(&s, &mac2).unwrap()["x_ssh_hostkey_fingerprint"], "SHA256:first");
+        adopt_device(&mut s, &mac2, &reporting("SHA256:after-reset")).unwrap();
+        assert_eq!(device_doc(&s, &mac2).unwrap()["x_ssh_hostkey_fingerprint"], "SHA256:after-reset");
+        adopt_device(&mut s, &mac2, &inform()).unwrap();
+        assert_eq!(device_doc(&s, &mac2).unwrap()["x_ssh_hostkey_fingerprint"], "SHA256:after-reset", "none reported: the kept one stays");
     }
 
     #[test]

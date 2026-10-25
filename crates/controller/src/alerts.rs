@@ -255,6 +255,9 @@ struct ApWatch {
     flapping_day: HashMap<Mac, Ts>,
     /// The site's time zone (UTC without one): its days, and the times of day alerts name.
     tz: Option<String>,
+    /// When the watcher started: an AP not heard from since is given
+    /// [`OFFLINE_AFTER`] from then, as the engine counts it from its start.
+    started: Ts,
 }
 
 #[derive(Debug, PartialEq)]
@@ -274,7 +277,7 @@ impl ApWatch {
 
     fn check(&mut self, now: Ts, mac: Mac, last_seen: Ts) -> Option<ApChange> {
         let today = self.day(now);
-        let gone = now - last_seen >= OFFLINE_AFTER;
+        let gone = now - last_seen.max(self.started) >= OFFLINE_AFTER;
         match (gone, self.down.get(&mac).copied()) {
             (true, None) => {
                 self.down.insert(mac, last_seen);
@@ -465,7 +468,7 @@ async fn radio_health(store: &Arc<Store>, now: Ts) -> anyhow::Result<HashMap<(Ma
                 }
             }
             // Retries from the SSIDs' counters, counted as the other views count them.
-            let spec = Spec { table: "vap_stats", key: "bssid", extra: AP_BAND, cols: &Retries::COLS, only: None };
+            let spec = Spec { table: "vap_stats", key: "bssid", extra: &AP_BAND, cols: &Retries::COLS, only: None };
             let vaps = crate::series::load(c, spec, 0, from, now)?;
             for ((ap, band), t) in retry_totals(&vaps, crate::series::cols_at(&Retries::COLS, Retries::COLS), from) {
                 let Ok(ap) = ap.parse() else { continue };
@@ -625,6 +628,7 @@ impl Watcher {
     async fn start(store: Arc<Store>, writer: Writer, live: SharedLive, tx: broadcast::Sender<LiveMsg>, now: Ts) -> Watcher {
         let mut w = Watcher::new(store, writer, live, tx);
         w.aps.tz = w.site_tz();
+        w.aps.started = now;
         match load_open(&w.store, now).await {
             Ok((open, seq, offline)) => {
                 w.book.seq = seq;
@@ -889,7 +893,7 @@ mod tests {
     #[test]
     fn offline_after_four_minutes_and_at_most_twice_a_day() {
         let mut w = ApWatch::default();
-        let ap: Mac = "78:45:58:3c:52:bc".parse().unwrap();
+        let ap: Mac = "02:00:00:3c:52:bc".parse().unwrap();
         // Missing for 3 minutes: nothing.
         assert_eq!(w.check(1000, ap, 1000 - 180), None);
         // 4 minutes: offline.
@@ -1097,14 +1101,34 @@ mod tests {
         flushed(&w.book.writer);
         let restart = |now| Watcher::start(w.store.clone(), w.book.writer.clone(), Default::default(), broadcast::channel(4).0, now);
         // The third drop is summarised, as without the restart.
-        let mut again = restart(3000).await;
+        let mut again = restart(2700).await;
         assert_eq!(again.aps.check(3000, ap, 2700), Some(ApChange::Flapping { times: 3 }));
         again.book.raise(3000, offline(FLAPPING).resolved(3100));
         flushed(&w.book.writer);
         // The fourth is not reported, even after another restart.
-        assert_eq!(restart(4000).await.aps.check(4000, ap, 3700), None);
+        assert_eq!(restart(3700).await.aps.check(4000, ap, 3700), None);
         // A day after the first two, a drop is reported again.
-        assert!(matches!(restart(91_000).await.aps.check(91_000, ap, 90_700), Some(ApChange::Offline { .. })));
+        assert!(matches!(restart(90_700).await.aps.check(91_000, ap, 90_700), Some(ApChange::Offline { .. })));
+    }
+
+    #[tokio::test]
+    async fn an_ap_not_heard_from_since_a_restart_is_given_its_time_from_then() {
+        let (w, mut rx, _dir) = watcher();
+        let ap: Mac = "02:00:00:00:00:01".parse().unwrap();
+        let live: SharedLive = Default::default();
+        let known = crate::engine::KnownDevice {
+            first_seen: 0, last_seen: 1000, uptime: None, version: None, hostname: None, model: None, model_display: None, ip: None, serial: None, offline: false,
+        };
+        live.write().unwrap().known_devices.insert(ap, known);
+        // apctl was away for an hour: the first check, 90 s in, does not call it offline yet.
+        let mut again = Watcher::start(w.store.clone(), w.book.writer.clone(), live, w.book.tx.clone(), 4600).await;
+        again.status_tick(4690);
+        assert!(told(&mut rx).is_empty());
+        // Still silent 4 minutes in: offline, since its real last contact.
+        again.status_tick(4600 + OFFLINE_AFTER);
+        assert_eq!(told(&mut rx), [("raised", "ap_offline")]);
+        assert!(again.book.open[&(Key::ApOffline, Entity::Ap(ap))].message.starts_with("No contact for 64 min"), "{}", again.book.open[&(Key::ApOffline, Entity::Ap(ap))].message);
+        assert_eq!(again.aps.down.get(&ap), Some(&1000));
     }
 
     #[tokio::test]
