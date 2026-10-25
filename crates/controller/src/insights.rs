@@ -500,8 +500,8 @@ pub async fn retries(State(s): State<AppState>, Query(q): Query<RangeQuery>) -> 
 }
 
 /// GET /api/site/multicast: multicast and broadcast by traffic type over time
-/// (all APs, or one with `mac`), and the 25 clients with the most multicast
-/// traffic. `tx` is what the APs delivered to clients, `rx` what clients sent.
+/// (all APs, or one with `mac`), and the 8 clients with the most multicast
+/// traffic (as many as its table shows). `tx` is what the APs delivered to clients, `rx` what clients sent.
 pub async fn multicast(State(s): State<AppState>, Query(q): Query<RangeQuery>) -> Result<Json<Value>, ApiError> {
     let (from, to, tier) = window(&q);
     let bucket = bucket_for(to - from, tier);
