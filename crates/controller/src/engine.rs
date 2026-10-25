@@ -158,6 +158,8 @@ pub struct EventHead {
     pub client_mac: Option<Mac>,
 }
 
+/// An AP as the live view holds it. Its page is sent this, without the fields only the
+/// engine and the other modules read (`skip_serializing`).
 #[derive(Debug, Clone, Serialize)]
 pub struct DeviceView {
     pub snapshot: Snapshot,
@@ -165,21 +167,15 @@ pub struct DeviceView {
     pub first_seen: Ts,
     pub last_seen: Ts,
     /// The address its last inform came from; none for an AP known from the database only.
-    #[serde(serialize_with = "peer_or_empty")]
+    #[serde(skip_serializing)]
     pub peer: Option<IpAddr>,
     /// Inform interval most recently requested by the controller.
     pub interval: Ts,
     /// Time of the last inform that included the client list.
+    #[serde(skip_serializing)]
     pub last_full_inform: Ts,
+    #[serde(skip_serializing)]
     pub last_config_push: Option<Ts>,
-}
-
-/// A device view's `peer` as its address, or "" for none.
-fn peer_or_empty<S: serde::Serializer>(peer: &Option<IpAddr>, s: S) -> Result<S::Ok, S::Error> {
-    match peer {
-        Some(ip) => s.collect_str(ip),
-        None => s.serialize_str(""),
-    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -2233,13 +2229,15 @@ mod tests {
     }
 
     #[test]
-    fn a_device_views_peer_is_shown_as_its_address() {
+    fn a_device_view_is_sent_without_the_engines_own_fields() {
         let mut h = harness();
         h.engine.handle(Input::Inform { ts: 0, peer: "2001:db8::7".parse().unwrap(), decoded: decoded(inform(AP1, 1000, &[])) });
-        let mut d = h.live.read().unwrap().devices[&AP1.parse().unwrap()].clone();
-        assert_eq!(serde_json::to_value(&d).unwrap()["peer"], "2001:db8::7");
-        d.peer = None;
-        assert_eq!(serde_json::to_value(&d).unwrap()["peer"], "", "known from the database only");
+        let d = h.live.read().unwrap().devices[&AP1.parse().unwrap()].clone();
+        assert_eq!(d.peer, Some("2001:db8::7".parse().unwrap()));
+        let v = serde_json::to_value(&d).unwrap();
+        let keys: Vec<&str> = v.as_object().unwrap().keys().map(String::as_str).collect();
+        assert_eq!(keys, ["first_seen", "interval", "last_seen", "online", "snapshot"]);
+        assert!(v["snapshot"].get("has_vap_table").is_none() && v["snapshot"].get("clients").is_none());
     }
 
     #[test]

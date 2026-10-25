@@ -377,7 +377,7 @@ pub async fn read<T: Send + 'static>(
 
 async fn status(State(s): State<AppState>) -> ApiResult {
     // Counted under the lock, serialised after it (the counters are atomics, read as they are then).
-    let (counters, devices, devices_online, connected, weak, by_band) = {
+    let (counters, connected, weak, by_band) = {
         let live = s.live.read().unwrap();
         // The overview's client counters, so that it needs no client list: the
         // connected clients by radio, and how many of them have a weak signal.
@@ -389,20 +389,16 @@ async fn status(State(s): State<AppState>) -> ApiResult {
                 *by_band.entry(radio).or_default() += 1;
             }
         }
-        // With the APs known from the database only, as the device list has them.
-        let devices = live.devices.len() + stored_only(&live).count();
         let by_band: std::collections::BTreeMap<String, usize> = by_band.into_iter().map(|(radio, n)| (radio.to_string(), n)).collect();
-        (live.counters.clone(), devices, live.devices.values().filter(|d| d.online).count(), connected, weak, by_band)
+        (live.counters.clone(), connected, weak, by_band)
     };
     Ok(Json(json!({
+        // No page shows it; kept for scripts and probes asking what runs.
         "version": env!("CARGO_PKG_VERSION"),
         "mode": if s.active { "active" } else { "shadow" },
         "source": s.source,
         "started": s.started,
-        "now": clock::now_ts(),
         "counters": &*counters,
-        "devices": devices,
-        "devices_online": devices_online,
         "clients_connected": connected,
         "clients_by_band": by_band,
         "clients_weak": weak,
@@ -445,33 +441,18 @@ fn stored_view(mac: Mac, k: &KnownDevice) -> DeviceView {
     }
 }
 
-/// Where a device row comes from: an AP reporting in this run, with whether it
-/// is blinking to be found, or one known from the database only (`stored_view`).
-enum RowSource {
-    Live { locating: bool },
-    Stored,
-}
-
 /// An AP's row in the device list, with `clients` connected to it.
-fn device_row(mac: Mac, d: &DeviceView, clients: usize, source: RowSource) -> DeviceRow {
-    let (locating, stored_only) = match source {
-        RowSource::Live { locating } => (Some(locating), false),
-        RowSource::Stored => (None, true),
-    };
+fn device_row(mac: Mac, d: &DeviceView, clients: usize) -> DeviceRow {
     let a = &d.snapshot.ap;
     DeviceRow {
         mac, name: a.hostname.clone(), model: a.model.clone(), model_display: a.model_display.clone(), version: a.version.clone(), ip: a.ip.clone(),
-        online: d.online, first_seen: d.first_seen, last_seen: d.last_seen, uptime: a.uptime, cpu: a.cpu, mem: a.mem, load1: a.load1,
-        satisfaction: a.satisfaction, clients,
+        online: d.online, last_seen: d.last_seen, uptime: a.uptime, cpu: a.cpu, mem: a.mem, clients,
         uplink: d.snapshot.uplink.as_ref().map(|u| UplinkRow { speed: u.speed, up: u.up, full_duplex: u.full_duplex }),
-        radios: d.snapshot.radios.iter().map(|r| RadioRow {
-            radio: r.radio.clone(), channel: r.channel, bw: r.bw, tx_power: r.tx_power, cu_total: r.cu_total, noise_floor: r.noise_floor, clients: r.num_sta,
-        }).collect(),
-        last_config_push: d.last_config_push, locating, stored_only,
+        radios: d.snapshot.radios.iter().map(|r| RadioRow { radio: r.radio.clone(), channel: r.channel, bw: r.bw, cu_total: r.cu_total, clients: r.num_sta }).collect(),
     }
 }
 
-/// An AP in the device list.
+/// An AP in the device list: what the overview's cards show. The rest is on its page.
 #[derive(Serialize)]
 struct DeviceRow {
     mac: Mac,
@@ -481,21 +462,13 @@ struct DeviceRow {
     version: Option<String>,
     ip: Option<String>,
     online: bool,
-    first_seen: Ts,
     last_seen: Ts,
     uptime: Option<i64>,
     cpu: Option<f64>,
     mem: Option<f64>,
-    load1: Option<f64>,
-    satisfaction: Option<i64>,
     clients: usize,
     uplink: Option<UplinkRow>,
     radios: Vec<RadioRow>,
-    last_config_push: Option<Ts>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    locating: Option<bool>,
-    #[serde(skip_serializing_if = "std::ops::Not::not")]
-    stored_only: bool,
 }
 
 #[derive(Serialize)]
@@ -510,9 +483,7 @@ struct RadioRow {
     radio: String,
     channel: Option<i64>,
     bw: Option<i64>,
-    tx_power: Option<i64>,
     cu_total: Option<i64>,
-    noise_floor: Option<i64>,
     clients: i64,
 }
 
@@ -526,10 +497,9 @@ async fn devices(State(s): State<AppState>) -> Json<Vec<DeviceRow>> {
         for (_, c) in live.connected_clients() {
             *per_ap.entry(c.sample.ap_mac).or_default() += 1;
         }
-        let mut list: Vec<DeviceRow> =
-            live.devices.iter().map(|(mac, d)| device_row(*mac, d, per_ap.get(mac).copied().unwrap_or(0), RowSource::Live { locating: crate::actions::locating(&live, mac) })).collect();
+        let mut list: Vec<DeviceRow> = live.devices.iter().map(|(mac, d)| device_row(*mac, d, per_ap.get(mac).copied().unwrap_or(0))).collect();
         // Then the APs not reporting since apctl started, by MAC as the others.
-        let mut stored: Vec<DeviceRow> = stored_only(&live).map(|(mac, k)| device_row(*mac, &stored_view(*mac, k), 0, RowSource::Stored)).collect();
+        let mut stored: Vec<DeviceRow> = stored_only(&live).map(|(mac, k)| device_row(*mac, &stored_view(*mac, k), 0)).collect();
         stored.sort_unstable_by_key(|d| d.mac);
         list.append(&mut stored);
         list
@@ -767,7 +737,7 @@ async fn dryrun(State(s): State<AppState>) -> Result<Json<DryRunStatus>, ApiErro
     // config seen in this run when there is one. Only full configs count: a
     // management-only push says nothing about system_cfg (nor, after a restart,
     // one without mgmt_cfg about mgmt_cfg).
-    let (state, imported_at, aps) = {
+    let (state, aps) = {
         let live = s.live.read().unwrap();
         let aps: Vec<_> = live
             .devices
@@ -777,7 +747,7 @@ async fn dryrun(State(s): State<AppState>) -> Result<Json<DryRunStatus>, ApiErro
                 (*mac, d.snapshot.ap.hostname.clone(), d.snapshot.ap.cfgversion.clone(), seen, live.raw_informs.get(mac).cloned())
             })
             .collect();
-        (live.state.clone(), live.state_imported_at, aps)
+        (live.state.clone(), aps)
     };
     // Then from the database, in one go: the stored redacted copy for APs not
     // pushed to since start (a full one, as above), and the comparisons made at each push.
@@ -852,7 +822,7 @@ async fn dryrun(State(s): State<AppState>) -> Result<Json<DryRunStatus>, ApiErro
         devices
     })
     .await?;
-    Ok(Json(DryRunStatus { settings_imported_at: imported_at, devices, history }))
+    Ok(Json(DryRunStatus { devices, history }))
 }
 
 /// A comparison made at a push, as stored.
@@ -869,7 +839,6 @@ struct DryRunHistory {
 
 #[derive(Serialize)]
 struct DryRunStatus {
-    settings_imported_at: Option<Ts>,
     devices: Vec<DryRunDevice>,
     history: Vec<DryRunHistory>,
 }
@@ -1395,11 +1364,8 @@ mod tests {
         assert_eq!((list[0]["name"].as_str(), list[0]["clients"].as_i64(), list[0]["online"].as_bool()), (Some("Hall"), Some(1), Some(true)));
         assert_eq!(list[1], json!({
             "mac": "02:00:00:00:00:02", "name": "Attic", "model": "U6", "model_display": null, "version": null, "ip": null, "online": false,
-            "first_seen": 10, "last_seen": 20, "uptime": null, "cpu": null, "mem": null, "load1": null, "satisfaction": null,
-            "clients": 0, "uplink": null, "radios": [], "last_config_push": null, "stored_only": true,
+            "last_seen": 20, "uptime": null, "cpu": null, "mem": null, "clients": 0, "uplink": null, "radios": [],
         }));
-        let status = get_json(&app, "/api/status").await;
-        assert_eq!((status["devices"].as_i64(), status["devices_online"].as_i64()), (Some(2), Some(1)), "the stored AP counted, offline");
         let one = get_json(&app, "/api/devices/02:00:00:00:00:01").await;
         assert_eq!((one["clients"][0]["sample"]["hostname"].as_str(), one["locating"].as_bool()), (Some("phone"), Some(false)));
         let stored = get_json(&app, "/api/devices/02:00:00:00:00:02").await;
@@ -1420,7 +1386,7 @@ mod tests {
         }
         assert_eq!(stored["device"]["snapshot"]["ap"]["mac"], "02:00:00:00:00:02");
         // The snapshot's clients come beside it; its neighbours and spectrum are the RF pages'.
-        assert_eq!(sorted(&one["device"]["snapshot"]), ["ap", "has_vap_table", "radios", "uplink", "vaps"]);
+        assert_eq!(sorted(&one["device"]["snapshot"]), ["ap", "radios", "uplink", "vaps"]);
         let clients = get_json(&app, "/api/clients").await;
         assert_eq!((clients[0]["ap_name"].as_str(), clients[0]["connected"].as_bool(), clients[0]["sample"]["essid"].as_str()), (Some("Hall"), Some(true), Some("Home")));
         assert!(clients[0]["alias"].is_null(), "{}", clients[0]);
@@ -1561,6 +1527,7 @@ mod tests {
         let app = router(s.clone());
         let d = get_json(&app, "/api/dryrun").await;
         assert_eq!((d["devices"][0]["status"].as_str(), d["history"][0]["ts"].as_i64(), d["history"][0]["id"].as_i64()), (Some("no_settings"), Some(7), Some(1)));
+        assert_eq!(d.as_object().unwrap().keys().collect::<Vec<_>>(), ["devices", "history"], "the import time is the settings summary's");
         // The history's comparisons come without the diffs' text.
         assert_eq!(d["history"][0]["comparison"], json!({ "mgmt_cfg": { "added": 0 }, "system_cfg": { "added": 1, "removed": 0, "changed": 0, "identical": false } }));
         assert_eq!(d["history"][1]["comparison"], Value::Null);
