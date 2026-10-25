@@ -249,7 +249,8 @@ pub async fn top(State(s): State<AppState>, Query(q): Query<RangeQuery>) -> Resu
             e.0 += d;
             e.1 += u;
         }
-        Ok(busiest(per_client, |(d, u)| d + u))
+        // As many as the lists show: the Overview's 15 (an AP's page shows 10).
+        Ok(busiest(per_client, 15, |(d, u)| d + u))
     })
     .await?;
     let live = s.live.read().unwrap();
@@ -258,12 +259,12 @@ pub async fn top(State(s): State<AppState>, Query(q): Query<RangeQuery>) -> Resu
     Ok(Json(json!({ "aps": ap_list, "clients": cl_list })))
 }
 
-/// The 25 clients with the most of what `amount` counts (none without any),
+/// The `n` clients with the most of what `amount` counts (none without any),
 /// most first and by MAC among equals.
-fn busiest<T>(per: HashMap<&str, T>, amount: impl Fn(&T) -> f64) -> Vec<(String, T)> {
+fn busiest<T>(per: HashMap<&str, T>, n: usize, amount: impl Fn(&T) -> f64) -> Vec<(String, T)> {
     let mut list: Vec<(&str, T)> = per.into_iter().filter(|(_, t)| amount(t) > 0.0).collect();
     list.sort_by(|a, b| amount(&b.1).total_cmp(&amount(&a.1)).then_with(|| a.0.cmp(b.0)));
-    list.truncate(25);
+    list.truncate(n);
     list.into_iter().map(|(m, t)| (m.to_string(), t)).collect()
 }
 
@@ -543,8 +544,8 @@ pub async fn multicast(State(s): State<AppState>, Query(q): Query<RangeQuery>) -
                 }
             }
         }
-        // Most packets first.
-        Ok((ts, types, busiest(per, |t| t[0] + t[1])))
+        // Most packets first, as many as the list shows.
+        Ok((ts, types, busiest(per, 8, |t| t[0] + t[1])))
     })
     .await?;
     let (ts, types, clients) = &*got;
