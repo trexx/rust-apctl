@@ -40,9 +40,16 @@ const VAP_COLS: &[&str] = &[
     "wifi_tx_attempts", "wifi_tx_dropped", "satisfaction", "avg_client_signal",
 ];
 
-/// The text columns the site-wide views read of an SSID: its AP and band
-/// ([`AP_BAND`], first, as [`retry_totals`] reads them) and its network name.
-const SITE_VAP_EXTRA: &[&str] = &["ap_mac", "radio", "essid"];
+/// The text columns the site-wide views read of an SSID, at [`AP`], [`BAND`]
+/// and [`ESSID`]: its AP and band first, as [`retry_totals`] reads them
+/// ([`AP_BAND`]), then its network name.
+const SITE_VAP_EXTRA: &[&str] = &[AP_BAND[AP], AP_BAND[BAND], "essid"];
+
+/// Where an SSID's AP, band and network name are among the text columns it
+/// is loaded with ([`AP_BAND`], [`SITE_VAP_EXTRA`]).
+const AP: usize = 0;
+const BAND: usize = 1;
+const ESSID: usize = 2;
 
 /// Every SSID's counters ([`VAP_COLS`]) over the window, with [`SITE_VAP_EXTRA`],
 /// given to `f` off the async workers. Read once for the site-wide views (the
@@ -217,7 +224,7 @@ pub async fn top(State(s): State<AppState>, Query(q): Query<RangeQuery>) -> Resu
             let mut aps: HashMap<String, (f64, f64)> = HashMap::new();
             for (ex, samples) in vaps.values() {
                 let (d, u) = totals(samples, cols_at(VAP_COLS, BYTE_COLS), from);
-                let e = aps.entry(ex[0].clone()).or_default();
+                let e = aps.entry(ex[AP].clone()).or_default();
                 e.0 += d;
                 e.1 += u;
             }
@@ -307,12 +314,13 @@ impl std::ops::AddAssign for Retries {
     }
 }
 
-/// The text columns [`retry_totals`] reads an SSID's AP and band from, in this
-/// order: the `extra` of the [`Spec`] its counters are loaded with.
-pub(crate) const AP_BAND: &[&str] = &["ap_mac", "radio"];
+/// The text columns [`retry_totals`] reads an SSID's AP and band from, at
+/// [`AP`] and [`BAND`]: the start of the `extra` of the [`Spec`] its counters
+/// are loaded with.
+pub(crate) const AP_BAND: [&str; 2] = ["ap_mac", "radio"];
 
 /// Retries, attempts and drops summed per (AP, band) from SSID counters
-/// loaded with `extra: AP_BAND` (`at`: the columns of [`Retries::COLS`]).
+/// loaded with an `extra` that starts with [`AP_BAND`] (`at`: the columns of [`Retries::COLS`]).
 /// An SSID without attempt counters in the window is left out.
 pub(crate) fn retry_totals(vaps: &Loaded, at: [usize; 3], from: Ts) -> HashMap<(&str, &str), Retries> {
     let mut out: HashMap<(&str, &str), Retries> = HashMap::new();
@@ -322,7 +330,7 @@ pub(crate) fn retry_totals(vaps: &Loaded, at: [usize; 3], from: Ts) -> HashMap<(
             *t.get_or_insert_default() += x;
         }
         if let Some(t) = t {
-            *out.entry((ex[0].as_str(), ex[1].as_str())).or_default() += t;
+            *out.entry((ex[AP].as_str(), ex[BAND].as_str())).or_default() += t;
         }
     }
     out
@@ -429,8 +437,8 @@ fn density_of(signals: &Signals, names: &[String], vaps: &Loaded, from: Ts) -> V
     let mut bytes: HashMap<(&str, &str), f64> = HashMap::new();
     for (ex, samples) in vaps.values() {
         let (d, u) = totals(samples, at, from);
-        for band in ["all", ex[1].as_str()] {
-            *bytes.entry((ex[0].as_str(), band)).or_default() += d + u;
+        for band in ["all", ex[BAND].as_str()] {
+            *bytes.entry((ex[AP].as_str(), band)).or_default() += d + u;
         }
     }
     let mut retries = retry_totals(vaps, cols_at(VAP_COLS, Retries::COLS), from);
@@ -814,7 +822,7 @@ fn wlan_history(vaps: &Loaded, from: Ts, bucket: Ts) -> BTreeMap<String, WlanAgg
     let retry_at = cols_at(VAP_COLS, Retries::COLS);
     let mut per: BTreeMap<String, WlanAgg> = BTreeMap::new();
     for (vap, (ex, samples)) in vaps.values().enumerate() {
-        let essid = &ex[2];
+        let essid = &ex[ESSID];
         if essid.is_empty() {
             continue;
         }
@@ -913,7 +921,7 @@ fn radio_vap_avgs(vaps: &Loaded, from: Ts) -> HashMap<String, HashMap<String, Ra
     }
     let [tx, rx, signal] = cols_at(VAP_COLS, ["tx_bytes", "rx_bytes", "avg_client_signal"]);
     for (ex, samples) in vaps.values() {
-        let e = out.entry(ex[0].clone()).or_default().entry(ex[1].clone()).or_default();
+        let e = out.entry(ex[AP].clone()).or_default().entry(ex[BAND].clone()).or_default();
         for d in deltas(samples, from) {
             e.usage += d.inc(tx).unwrap_or(0.0) + d.inc(rx).unwrap_or(0.0);
         }

@@ -468,7 +468,7 @@ async fn radio_health(store: &Arc<Store>, now: Ts) -> anyhow::Result<HashMap<(Ma
                 }
             }
             // Retries from the SSIDs' counters, counted as the other views count them.
-            let spec = Spec { table: "vap_stats", key: "bssid", extra: AP_BAND, cols: &Retries::COLS, only: None };
+            let spec = Spec { table: "vap_stats", key: "bssid", extra: &AP_BAND, cols: &Retries::COLS, only: None };
             let vaps = crate::series::load(c, spec, 0, from, now)?;
             for ((ap, band), t) in retry_totals(&vaps, crate::series::cols_at(&Retries::COLS, Retries::COLS), from) {
                 let Ok(ap) = ap.parse() else { continue };
