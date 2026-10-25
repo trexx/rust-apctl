@@ -226,9 +226,15 @@ async fn serve(args: ServeArgs) -> Result<()> {
         tracing::warn!("no --backup-key: backups are written unencrypted");
     }
 
-    // The web listener too is part of the configuration: a --listen that cannot
-    // be bound stops the start here. Connections wait until the API is up.
+    // The listeners too are part of the configuration: a --listen, --syslog-listen or
+    // (active) --inform-listen that cannot be bound stops the start here. Connections
+    // and datagrams wait until they are served.
     let listener = tokio::net::TcpListener::bind(listen).await.with_context(|| format!("binding {listen}"))?;
+    let syslog_socket = match syslog_listen {
+        Some(addr) => Some((tokio::net::UdpSocket::bind(addr).await.with_context(|| format!("binding syslog {addr}"))?, addr)),
+        None => None,
+    };
+    let inform_socket = if active { Some(tokio::net::TcpListener::bind(inform_listen).await.with_context(|| format!("binding {inform_listen}"))?) } else { None };
 
     // A restore chosen in the UI is applied now, before the databases are opened.
     backup::apply_pending(&backups);
@@ -256,9 +262,9 @@ async fn serve(args: ServeArgs) -> Result<()> {
         None => tracing::warn!("no shadow source configured: nothing will be ingested"),
     }
 
-    if let Some(addr) = syslog_listen {
+    if let Some((socket, addr)) = syslog_socket {
         let counters = live.read().unwrap().counters.clone();
-        spawn_syslog(addr, in_tx.clone(), counters).await?;
+        spawn_syslog(socket, addr, in_tx.clone(), counters);
     }
 
     // The engine owns all mutable state and processes inputs in order.
@@ -322,9 +328,9 @@ async fn serve(args: ServeArgs) -> Result<()> {
         engine_loop(in_rx, &closing, &drained, |input| engine.handle(input));
     })?;
 
-    if active {
+    if let Some(socket) = inform_socket {
         let active_state = active::Active::new(&store, writer.clone(), live.clone(), keys.clone(), in_tx.clone(), controller, proxies.clone())?;
-        start_active(Arc::new(active_state), &live, inform_at.as_ref().map(|(host, _)| host.as_str()), inform_listen, stun_listen).await?;
+        start_active(Arc::new(active_state), &live, inform_at.as_ref().map(|(host, _)| host.as_str()), socket, inform_listen, stun_listen).await;
     }
 
     let auth = Arc::new(auth::Auth::new(users, &store, writer.clone(), proxies)?);
@@ -407,9 +413,8 @@ async fn finish(writer: store::Writer, drain: Drain) {
     flush_writes(writer).await;
 }
 
-/// Receives AP syslog on `addr` and hands each datagram to the engine.
-async fn spawn_syslog(addr: SocketAddr, tx: mpsc::Sender<Input>, counters: Arc<engine::Counters>) -> Result<()> {
-    let socket = tokio::net::UdpSocket::bind(addr).await.with_context(|| format!("binding syslog {addr}"))?;
+/// Receives AP syslog on `socket` (bound to `addr`) and hands each datagram to the engine.
+fn spawn_syslog(socket: tokio::net::UdpSocket, addr: SocketAddr, tx: mpsc::Sender<Input>, counters: Arc<engine::Counters>) {
     tracing::info!("receiving AP syslog on udp://{addr}");
     tokio::spawn(async move {
         let mut buf = vec![0u8; 8192];
@@ -444,7 +449,6 @@ async fn spawn_syslog(addr: SocketAddr, tx: mpsc::Sender<Input>, counters: Arc<e
             }
         }
     });
-    Ok(())
 }
 
 /// The other controller's installation ID, so rendered configs stay identical
@@ -476,8 +480,9 @@ pub(crate) fn random_hex<const N: usize>() -> String {
 }
 
 /// Active mode's servers: STUN (`inform_host`, `--inform-url`'s host, is the
-/// address its answers give), and the APs' informs, on listeners of their own.
-async fn start_active(state: Arc<active::Active>, live: &SharedLive, inform_host: Option<&str>, inform_listen: SocketAddr, stun_listen: SocketAddr) -> Result<()> {
+/// address its answers give), and the APs' informs on `inform_socket`, bound to `inform_listen`.
+/// STUN that cannot be served is only a warning.
+async fn start_active(state: Arc<active::Active>, live: &SharedLive, inform_host: Option<&str>, inform_socket: tokio::net::TcpListener, inform_listen: SocketAddr, stun_listen: SocketAddr) {
     let advertised = match inform_host {
         Some(h) => advertised_ip(h).await,
         None => None,
@@ -486,14 +491,12 @@ async fn start_active(state: Arc<active::Active>, live: &SharedLive, inform_host
         tracing::warn!("STUN not available on {stun_listen}: {e}");
     }
     let inform_app = axum::Router::new().route("/inform", axum::routing::post(active::inform)).with_state(state);
-    let inform_socket = tokio::net::TcpListener::bind(inform_listen).await.with_context(|| format!("binding {inform_listen}"))?;
     tracing::warn!("ACTIVE MODE: answering AP informs on http://{inform_listen}/inform and pushing config");
     tokio::spawn(async move {
         if let Err(e) = axum::serve(inform_socket, inform_app.into_make_service_with_connect_info::<SocketAddr>()).await {
             tracing::error!("inform server stopped: {e}");
         }
     });
-    Ok(())
 }
 
 /// Commits the writes still queued (they are batched about once a second).
