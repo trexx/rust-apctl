@@ -82,11 +82,6 @@ fn radio_ai(state: &Value) -> Option<&Value> {
     Some(setting(state, "radio_ai")).filter(|r| !r.is_null())
 }
 
-/// Whether the `radio_ai` setting allows DFS channels on 5 GHz.
-fn na_dfs(r: &Value) -> bool {
-    r["radios_configuration"].as_array().and_then(|l| l.iter().find(|c| c["radio"].as_str() == Some("na"))).and_then(|c| c["dfs"].as_bool()).unwrap_or(false)
-}
-
 /// `M H * * *` (the only form the official UI writes); 03:00 otherwise, its default.
 fn parse_cron(expr: &str) -> (i64, i64) {
     let f: Vec<&str> = expr.split_whitespace().collect();
@@ -104,7 +99,7 @@ pub fn settings(state: Option<&Value>) -> Settings {
     let (hour, minute) = parse_cron(r.and_then(|r| r["cron_expr"].as_str()).unwrap_or(DEFAULT_CRON));
     let list = |k: &str| -> Vec<String> { r.and_then(|r| r[k].as_array()).into_iter().flatten().filter_map(|v| v.as_str().map(str::to_ascii_lowercase)).collect() };
     let radios = r.map_or_else(|| BANDS.iter().map(|b| b.radio.to_string()).collect(), |_| list("radios"));
-    let dfs = r.is_some_and(na_dfs);
+    let dfs = r.is_some_and(apcfg::radio_ai_na_dfs);
     Settings { enabled: r.and_then(|r| r["enabled"].as_bool()).unwrap_or(false), hour, minute, radios, dfs, exclude_devices: r.map(excluded).unwrap_or_default() }
 }
 
@@ -113,11 +108,6 @@ fn excluded(r: &Value) -> Vec<Mac> {
     let mut out: Vec<Mac> = r["exclude_devices"].as_array().into_iter().flatten().filter_map(crate::settings::doc_mac).collect();
     dedup_in_order(&mut out);
     out
-}
-
-/// Whether a 5 GHz channel is a DFS one (radar can force the AP off it).
-pub(crate) fn is_dfs(ch: i64) -> bool {
-    (52..=144).contains(&ch)
 }
 
 /// The channels a plan may use on a band: the setting's list (kept by the
@@ -132,7 +122,7 @@ pub fn allowed(state: Option<&Value>, band: &str, with_dfs: bool) -> Option<Vec<
     let mut list: Vec<i64> = r[format!("channels_{band}")].as_array()?.iter().filter_map(num).filter(|c| legal.as_ref().is_none_or(|l| l.contains(c))).collect();
     if with_dfs && band == "na" {
         let all = legal.unwrap_or_else(|| band_channels(band, 20));
-        let extra: Vec<i64> = all.into_iter().filter(|c| is_dfs(*c) && !list.contains(c)).collect();
+        let extra: Vec<i64> = all.into_iter().filter(|c| apcfg::is_dfs_channel(*c) && !list.contains(c)).collect();
         list.extend(extra);
     }
     list.sort();
@@ -552,9 +542,9 @@ pub fn apply_settings(state: &mut Value, p: &Value) -> Result<String, String> {
             b["radio"].as_str() == Some(band) && num(&b["channel"]) == Some(ch) && num(&b["channel_width"]).is_none_or(|w| w == 20)
         })
     };
-    let dfs = na_dfs(r);
+    let dfs = apcfg::radio_ai_na_dfs(r);
     for band in BANDS.iter().map(|b| b.radio) {
-        let chans: Vec<String> = allowed_channels(c, band, 20, false).into_iter().filter(|ch| !blacklisted(band, *ch) && (dfs || !is_dfs(*ch))).map(|ch| ch.to_string()).collect();
+        let chans: Vec<String> = allowed_channels(c, band, 20, false).into_iter().filter(|ch| !blacklisted(band, *ch) && (dfs || !apcfg::is_dfs_channel(*ch))).map(|ch| ch.to_string()).collect();
         r[format!("channels_{band}")] = json!(chans);
     }
     let changed: Vec<&str> = ["enabled", "cron_expr", "radios", "radios_configuration", "exclude_devices", "channels_ng", "channels_na"].into_iter().filter(|k| before[*k] != r[*k]).collect();
@@ -593,6 +583,12 @@ mod tests {
         assert_eq!(allowed(Some(&s), "ng", false), Some(vec![1, 6, 11]));
         assert_eq!(parse_cron("*/5 * * * *"), (3, 0));
         assert!(allowed(None, "na", false).is_none());
+        // DFS is read as the render reads it for the AP's ACS: a "true" stored as text is on.
+        let mut s = s;
+        s["setting"][2]["radios_configuration"][0]["dfs"] = json!("true");
+        assert!(settings(Some(&s)).dfs);
+        apply_settings(&mut s, &json!({ "hour": 4 })).unwrap();
+        assert!(radio_ai(&s).unwrap()["channels_na"].as_array().unwrap().iter().any(|c| c == "100"), "the DFS channels stay in the list");
     }
 
     #[test]

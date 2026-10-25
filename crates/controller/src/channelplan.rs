@@ -9,7 +9,6 @@ use inform::Mac;
 use serde::{Deserialize, Serialize};
 
 use crate::api::{ApiError, AppState, Json, Query, read};
-use crate::channelai::is_dfs;
 use crate::clock;
 use crate::series::own_bssids;
 use crate::store::Db;
@@ -83,7 +82,7 @@ fn candidates(radio: &str, width: i64, dfs: bool, available: Option<&[i64]>) -> 
             .collect();
     }
     if let Some(a) = available.filter(|a| !a.is_empty()) {
-        return a.iter().copied().filter(|c| dfs || !is_dfs(*c)).map(|c| block(radio, c, width)).collect();
+        return a.iter().copied().filter(|c| dfs || !apcfg::is_dfs_channel(*c)).map(|c| block(radio, c, width)).collect();
     }
     let mut chans: Vec<i64> = vec![36, 40, 44, 48, 149, 153, 157, 161];
     if dfs {
