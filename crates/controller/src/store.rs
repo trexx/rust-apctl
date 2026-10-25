@@ -370,8 +370,10 @@ fn open_ro(path: &Path) -> Result<Connection> {
     let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX)
         .with_context(|| format!("opening {} read-only", path.display()))?;
     conn.execute_batch("PRAGMA busy_timeout=5000; PRAGMA temp_store=MEMORY;")?;
-    // Room for every series query (6 tables in 3 tiers) besides the rest.
-    conn.set_prepared_statement_cache_capacity(32);
+    // The series route alone prepares some 18 statements (6 tables in 3 tiers) and the
+    // insights views some 30 more on metrics.db, besides the background checks': room
+    // for them all, so the pool's most used connection keeps them compiled.
+    conn.set_prepared_statement_cache_capacity(64);
     Ok(conn)
 }
 
