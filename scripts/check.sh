@@ -31,7 +31,7 @@ case ${1:-} in
     cd "$(dirname "$0")/.."
     engine=$(command -v docker || command -v podman) || { echo "the web check needs docker or podman" >&2; exit 1; }
     mkdir -p "$HOME/.npm"
-    exec "$engine" run --rm -v "$PWD/web:/web:Z" -v "$HOME/.npm:/root/.npm:Z" -w /web docker.io/library/node:24-slim \
+    exec "$engine" run --rm -v "$PWD/web:/web:Z" -v "$HOME/.npm:/root/.npm:Z" -w /web docker.io/library/node:26-slim@sha256:36793bcbb160a6a16cede1e62b93f84e26b78a972a8a4c0b879c1c12f22761ec \
       sh -c "npm ci --no-fund --no-audit && npm run lint && npm run build" ;;
   "") ;;
   *) echo "usage: scripts/check.sh [--list | --web]" >&2; exit 2 ;;
