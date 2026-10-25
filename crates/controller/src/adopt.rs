@@ -255,23 +255,11 @@ const RADIO_KEYS: [&str; 16] = [
 
 /// The width a new AP's radio starts at, as the official controller sets it on
 /// adoption: the site's default for the band (else the band's own: 20, 80 or
-/// 160 MHz), at most what the band and the radio (as its inform reports it) allow.
-fn start_width(state: &Value, r: &Value, band: &str) -> i64 {
-    let configured = crate::settings::setting(state, "radio_ai")["radios_configuration"]
-        .as_array()
-        .and_then(|l| crate::settings::num(&l.iter().find(|c| c["radio"].as_str() == Some(band))?["channel_width"]))
-        .unwrap_or(match band {
-            "ng" => 20,
-            "na" => 80,
-            _ => 160,
-        });
-    let capable = apcfg::capable_width(r);
-    let band_max = match band {
-        "ng" => 40,
-        "na" => 160,
-        _ => 320,
-    };
-    configured.min(capable).min(band_max)
+/// 160 MHz), at most what the band and the radio (as its inform reports it)
+/// allow. An inform's radio has no `ht`, so this is the width the render would
+/// run it at ([`crate::settings::radio_width`]).
+fn start_width(state: &Value, r: &Value) -> i64 {
+    crate::settings::radio_width(state, r)
 }
 
 /// The radio settings of a new AP, from the radios its inform lists: auto
@@ -284,7 +272,7 @@ pub fn radio_table(state: &Value, payload: &Value) -> Vec<Value> {
         .filter_map(|r| {
             let band = r["radio"].as_str()?;
             let mut v = json!({
-                "name": r["name"], "radio": band, "channel": "auto", "ht": start_width(state, r, band), "tx_power_mode": "auto",
+                "name": r["name"], "radio": band, "channel": "auto", "ht": start_width(state, r), "tx_power_mode": "auto",
                 "min_rssi_enabled": false, "hard_noise_floor_enabled": false, "antenna_gain": r["builtin_ant_gain"],
             });
             // The rest of what it reports, as it reports it.

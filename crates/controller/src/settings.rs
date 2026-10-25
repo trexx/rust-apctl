@@ -420,7 +420,7 @@ const DEVICE_FIELDS: &[&str] = &[
     "green_ap_enabled", "resetbtn_enabled", "jumboframe_enabled", "config_network", "snmp_location", "snmp_contact",
 ];
 
-/// What the AP reports about a radio that an edit is checked against; the
+/// What one of an AP's radios can do, that an edit is checked against; the
 /// editor shows it as the radio's `caps`.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize)]
 pub struct RadioCaps {
@@ -431,28 +431,16 @@ pub struct RadioCaps {
     pub max_width: i64,
 }
 
-impl Default for RadioCaps {
-    /// A radio that reports nothing: 1 to 30 dBm, up to 80 MHz.
-    fn default() -> Self {
-        RadioCaps { min_txpower: 1, max_txpower: 30, max_width: 80 }
-    }
-}
-
 impl RadioCaps {
-    /// Each band's caps from an inform's `radio_table` (the first entry of a
-    /// band, as [`inform_radio`] finds it); none without an inform.
-    pub fn of_inform(inform: Option<&Value>) -> HashMap<String, RadioCaps> {
-        let mut out = HashMap::new();
-        for r in inform.and_then(|p| p["radio_table"].as_array()).into_iter().flatten() {
-            let Some(band) = r["radio"].as_str() else { continue };
-            let d = RadioCaps::default();
-            out.entry(band.to_string()).or_insert(RadioCaps {
-                min_txpower: r["min_txpower"].as_i64().unwrap_or(d.min_txpower),
-                max_txpower: r["max_txpower"].as_i64().unwrap_or(d.max_txpower),
-                max_width: apcfg::capable_width(r),
-            });
-        }
-        out
+    /// The caps of a radio of an AP's record (its `radio_table` entry, which the
+    /// render reads): the widest channel by the record's capability flags; the
+    /// power range by the record, else by the radio of the band the AP reports
+    /// (`reported`, its inform's `radio_table`), else 1 to 30 dBm.
+    pub fn of(radio: &Value, reported: &Value) -> RadioCaps {
+        let band = radio["radio"].as_str().unwrap_or("");
+        let inform = reported.as_array().into_iter().flatten().find(|r| r["radio"].as_str() == Some(band));
+        let power = |k: &str, default: i64| num(&radio[k]).or_else(|| inform.and_then(|r| num(&r[k]))).unwrap_or(default);
+        RadioCaps { min_txpower: power("min_txpower", 1), max_txpower: power("max_txpower", 30), max_width: apcfg::capable_width(radio) }
     }
 }
 
@@ -464,7 +452,7 @@ pub async fn device(State(s): State<AppState>, MacPath(mac): MacPath) -> Result<
     };
     let state = state.ok_or_else(ApiError::no_state)?;
     let d = site_device(&state, &mac).map_err(ApiError::not_found)?;
-    let caps = RadioCaps::of_inform(inform.as_deref());
+    let reported = inform.as_deref().map_or(&Value::Null, |p| &p["radio_table"]);
     let radios: Vec<Value> = d["radio_table"]
         .as_array()
         .into_iter()
@@ -472,8 +460,7 @@ pub async fn device(State(s): State<AppState>, MacPath(mac): MacPath) -> Result<
         .map(|r| {
             let mut v = Value::Object(pick(r, RADIO_FIELDS));
             let band = r["radio"].as_str().unwrap_or("");
-            // What the edit is checked against: the defaults for a radio the AP does not report on.
-            v["caps"] = json!(caps.get(band).copied().unwrap_or_default());
+            v["caps"] = json!(RadioCaps::of(r, reported));
             v["channels"] = channels(&state, band, false);
             v["channels_outdoor"] = channels(&state, band, true);
             // The "interference blocker" exists only on radios reporting this capability.
@@ -578,15 +565,15 @@ pub(crate) fn allowed_channels(country: Option<i64>, band: &str, width: i64, out
 }
 
 /// The width (MHz) a radio of one of the site's APs (its `radio_table` entry)
-/// is set to, as the render reads it before its country and radio caps: `ht`,
-/// else the site's Channel AI width for the band, else the band's default
-/// ([`apcfg::configured_width`]).
-pub(crate) fn configured_width(state: &Value, radio: &Value) -> i64 {
-    apcfg::configured_width(state, site_id(state).unwrap_or_default(), radio)
+/// runs at, as the render sends it: what is set (`ht`, else the site's Channel
+/// AI width for the band, else the band's default), at most what the band and
+/// the record's radio allow ([`apcfg::radio_width`]).
+pub(crate) fn radio_width(state: &Value, radio: &Value) -> i64 {
+    apcfg::radio_width(state, site_id(state).unwrap_or_default(), radio)
 }
 
 /// A fixed channel of an AP's `radio_table` entry that [`fixed_channel_ok`]
-/// refuses at `width` (its [`configured_width`]).
+/// refuses at `width` (its [`radio_width`]).
 pub(crate) fn illegal_fixed_channel(country: Option<i64>, radio: &Value, width: i64, outdoor: bool) -> Option<i64> {
     let ch = num(&radio["channel"])?;
     (!fixed_channel_ok(country, radio["radio"].as_str().unwrap_or(""), width, outdoor, ch)).then_some(ch)
@@ -1674,8 +1661,9 @@ pub fn delete_wlan(state: &mut Value, id: &str) -> Result<String, String> {
 pub struct DeviceEdit {
     pub mac: inform::Mac,
     pub patch: Value,
-    /// What the AP reports about its radios, by band (power range, widest channel).
-    pub caps: HashMap<String, RadioCaps>,
+    /// The radios the AP reports (its inform's `radio_table`): their power range
+    /// where its record has none ([`RadioCaps::of`]).
+    pub reported: Value,
     /// The band of the radio carrying the AP's wireless (mesh) uplink.
     pub wireless_uplink: Option<String>,
     /// The antennas the AP reports (`antenna_table`).
@@ -1709,7 +1697,7 @@ pub fn apply_device(state: &mut Value, e: &DeviceEdit) -> Result<String, String>
         if !edited && !outdoor_changed {
             continue;
         }
-        let width = configured_width(state, r);
+        let width = radio_width(state, r);
         if let Some(ch) = illegal_fixed_channel(c, r, width, o) {
             let label = band_name(band);
             return Err(if edited {
@@ -1791,12 +1779,12 @@ fn device_fields(state: &Value, e: &DeviceEdit, before: &Value, d: &mut Value) -
 }
 
 /// An edit to one of the AP's radios (`rp`, by band): width, channel, power and
-/// the rest, checked against what the radio reports ([`apply_device`] then checks a fixed channel against the country).
+/// the rest, checked against what the radio can do ([`RadioCaps`]; [`apply_device`] then checks a fixed channel against the country).
 fn radio_edit(e: &DeviceEdit, rp: &Value, before: &Value, d: &mut Value, iot_lock: bool) -> Result<(), String> {
     let band = rp["radio"].as_str().ok_or("each radio needs its band (radio)")?;
-    let caps = e.caps.get(band).copied().unwrap_or_default();
     let label = band_name(band);
     let r = inform_radio_mut(d, band).ok_or_else(|| format!("this AP has no {label} radio"))?;
+    let caps = RadioCaps::of(r, &e.reported);
     if let Some(ht) = int_field(rp, "ht", 20, 320)? {
         if !band_widths(band).contains(&ht) || ht > caps.max_width {
             return Err(format!("{label}: {ht} MHz is not available on this radio"));
@@ -1948,14 +1936,15 @@ pub async fn delete_wlan_route(State(s): State<AppState>, Path(id): Path<String>
 /// PUT /api/settings/devices/{mac} {patch}
 pub async fn put_device(State(s): State<AppState>, MacPath(mac): MacPath, Query(q): Query<PreviewQuery>, Json(b): Json<Patch>) -> Result<Json<Value>, ApiError> {
     let inform = s.live.read().unwrap().raw_informs.get(&mac).cloned();
-    let caps = RadioCaps::of_inform(inform.as_deref());
     // A mesh AP's uplink radio must stay on.
     let wireless_uplink = match inform.as_deref().map(uplink) {
         Some(Uplink::Wireless(band)) => band,
         _ => None,
     };
     let antennas = inform.as_deref().map_or(Value::Null, |p| p["antenna_table"].clone());
-    change(&s, &q, apply_device, DeviceEdit { mac, patch: b.patch, caps, wireless_uplink, antennas }).await
+    // What RadioCaps::of reads of it, not the radios' scan and spectrum tables.
+    let reported: Vec<Value> = inform.as_deref().and_then(|p| p["radio_table"].as_array()).into_iter().flatten().map(|r| Value::Object(pick(r, &["radio", "min_txpower", "max_txpower"]))).collect();
+    change(&s, &q, apply_device, DeviceEdit { mac, patch: b.patch, reported: Value::Array(reported), wireless_uplink, antennas }).await
 }
 
 /// How an AP reaches the network.
@@ -1992,7 +1981,11 @@ mod tests {
     const AP2: &str = "02:00:00:00:00:02";
 
     fn state() -> Value {
-        let radio = |band: &str, ch: Value, ht: i64| json!({ "name": if band == "ng" { "wifi0" } else { "wifi1" }, "radio": band, "channel": ch, "ht": ht, "tx_power_mode": "auto", "radio_caps": 131072 });
+        // What adoption copies from the inform too: an 802.11ac 5 GHz radio (80 MHz at most) and its power range.
+        let radio = |band: &str, ch: Value, ht: i64| {
+            let na = band == "na";
+            json!({ "name": if na { "wifi1" } else { "wifi0" }, "radio": band, "channel": ch, "ht": ht, "tx_power_mode": "auto", "radio_caps": 131072, "is_11ac": na, "min_txpower": 6, "max_txpower": if na { 26 } else { 22 } })
+        };
         json!({
             "devices": [
                 { "mac": AP1, "name": "Hall", "site_id": "s1", "radio_table": [radio("ng", json!(1), 20), radio("na", json!(44), 80)] },
@@ -2392,9 +2385,13 @@ mod tests {
                 assert_eq!(is_legal(c, band, width, o, ch), list.as_ref().map(|l| l.contains(&ch)), "{c:?} {band} {width} {o} {ch}");
             }
         }
-        // A fixed channel is judged at the radio's width as the render reads it: `ht`, else
-        // the site's Channel AI width for the band, else 20 (2.4 GHz) or 80 (5 GHz).
-        let illegal = |s: &Value, r: Value, o| illegal_fixed_channel(Some(276), &r, configured_width(s, &r), o);
+        // A fixed channel is judged at the radio's width as the render sends it: `ht`, else
+        // the site's Channel AI width for the band, else 20 (2.4 GHz) or 80 (5 GHz), at most
+        // what the radio can do (these are 802.11ac: 80 MHz).
+        let illegal = |s: &Value, mut r: Value, o| {
+            r["is_11ac"] = json!(true);
+            illegal_fixed_channel(Some(276), &r, radio_width(s, &r), o)
+        };
         let s = json!({ "devices": [{ "site_id": "s1" }] });
         assert_eq!(illegal(&s, json!({ "radio": "na", "ht": "40", "channel": "140" }), false), Some(140));
         assert_eq!(illegal(&s, json!({ "radio": "na", "ht": 20, "channel": 140 }), false), None);
@@ -2405,8 +2402,7 @@ mod tests {
     }
 
     fn dev(s: &mut Value, patch: Value) -> Result<String, String> {
-        let caps = RadioCaps::of_inform(Some(&json!({ "radio_table": [{ "radio": "na", "min_txpower": 6, "max_txpower": 26, "is_11ac": true, "has_ht160": false }, { "radio": "ng", "min_txpower": 6, "max_txpower": 22 }] })));
-        apply_device(s, &DeviceEdit { mac: AP1.parse().unwrap(), patch, caps, wireless_uplink: None, antennas: Value::Null })
+        apply_device(s, &DeviceEdit { mac: AP1.parse().unwrap(), patch, reported: Value::Null, wireless_uplink: None, antennas: Value::Null })
     }
 
     #[test]
@@ -2480,7 +2476,7 @@ mod tests {
         assert!(dev(&mut s, json!({ "radios": [{ "radio": "na", "channel": 100 }] })).is_ok());
         assert!(dev(&mut s, json!({ "radios": [{ "radio": "na", "channel": 140 }] })).is_err());
         // apctl has no 6 GHz rules: a fixed channel and width are the AP's to judge.
-        s["devices"][0]["radio_table"].as_array_mut().unwrap().push(json!({ "name": "wifi2", "radio": "6e", "channel": "auto", "ht": 160 }));
+        s["devices"][0]["radio_table"].as_array_mut().unwrap().push(json!({ "name": "wifi2", "radio": "6e", "channel": "auto", "ht": 160, "is_11ax": true, "has_ht160": true }));
         dev(&mut s, json!({ "radios": [{ "radio": "6e", "channel": 37, "ht": 80 }] })).unwrap();
         assert_eq!(s["devices"][0]["radio_table"][2]["channel"], 37);
         // Nor for a country outside its tables.
@@ -2505,34 +2501,66 @@ mod tests {
     }
 
     #[test]
-    fn widths_go_up_to_what_the_radio_reports() {
+    fn widths_go_up_to_what_the_record_says_the_radio_can_do() {
         let mut s = state();
-        s["devices"][0]["radio_table"].as_array_mut().unwrap().push(json!({ "name": "wifi2", "radio": "6e", "channel": "auto", "ht": 160 }));
-        let caps = |r: Value| RadioCaps::of_inform(Some(&json!({ "radio_table": [r] })));
-        let width = |s: &mut Value, caps: &HashMap<String, RadioCaps>, band: &str, ht: i64| {
-            let patch = json!({ "radios": [{ "radio": band, "ht": ht }] });
-            apply_device(s, &DeviceEdit { mac: AP1.parse().unwrap(), patch, caps: caps.clone(), wireless_uplink: None, antennas: Value::Null })
+        let six = |flags: Value| {
+            let mut r = json!({ "name": "wifi2", "radio": "6e", "channel": "auto", "ht": 160 });
+            r.as_object_mut().unwrap().extend(flags.as_object().unwrap().clone());
+            r
         };
-        let wifi7 = caps(json!({ "radio": "6e", "has_ht160": true, "has_eht320": true, "is_11ax": true }));
-        assert_eq!(json!(wifi7["6e"]), json!({ "min_txpower": 1, "max_txpower": 30, "max_width": 320 }), "the editor's caps, defaults filled in");
-        width(&mut s, &wifi7, "6e", 320).unwrap();
-        width(&mut s, &wifi7, "6e", 240).unwrap();
+        let width = |s: &mut Value, band: &str, ht: i64, reported: &Value| {
+            let patch = json!({ "radios": [{ "radio": band, "ht": ht }] });
+            apply_device(s, &DeviceEdit { mac: AP1.parse().unwrap(), patch, reported: reported.clone(), wireless_uplink: None, antennas: Value::Null })
+        };
+        let none = Value::Null;
+        let wifi7 = six(json!({ "has_ht160": true, "has_eht320": true, "is_11ax": true }));
+        assert_eq!(json!(RadioCaps::of(&wifi7, &none)), json!({ "min_txpower": 1, "max_txpower": 30, "max_width": 320 }), "the editor's caps, defaults filled in");
+        s["devices"][0]["radio_table"].as_array_mut().unwrap().push(wifi7);
+        width(&mut s, "6e", 320, &none).unwrap();
+        width(&mut s, "6e", 240, &none).unwrap();
         assert_eq!(s["devices"][0]["radio_table"][2]["ht"], 240);
-        assert!(width(&mut s, &wifi7, "6e", 120).unwrap_err().contains("120 MHz is not available"));
-        let wifi6e = caps(json!({ "radio": "6e", "has_ht160": true, "is_11ax": true }));
-        assert!(width(&mut s, &wifi6e, "6e", 320).unwrap_err().contains("320 MHz is not available"));
-        width(&mut s, &wifi6e, "6e", 160).unwrap();
-        // 5 GHz goes to 160 MHz at most, whatever the radio reports; 2.4 GHz to 40.
-        let na = caps(json!({ "radio": "na", "has_ht160": true, "has_eht320": true }));
-        assert!(width(&mut s, &na, "na", 320).is_err());
-        assert!(width(&mut s, &caps(json!({ "radio": "na", "is_11ac": true })), "na", 160).is_err());
-        assert!(width(&mut s, &caps(json!({ "radio": "na" })), "na", 80).is_err(), "an 802.11n radio does 40 MHz at most");
+        assert!(width(&mut s, "6e", 120, &none).unwrap_err().contains("120 MHz is not available"));
+        // The record decides, as it does for the render: an AP reporting 320 MHz since
+        // its adoption still runs 160 by its record.
+        s["devices"][0]["radio_table"][2] = six(json!({ "has_ht160": true, "is_11ax": true }));
+        let reports_320 = json!([{ "radio": "6e", "has_ht160": true, "has_eht320": true, "is_11ax": true }]);
+        assert!(width(&mut s, "6e", 320, &reports_320).unwrap_err().contains("320 MHz is not available"));
+        width(&mut s, "6e", 160, &none).unwrap();
+        // 5 GHz goes to 160 MHz at most, whatever the radio can do; 2.4 GHz to 40.
+        let na = |flags: Value, ht: i64| {
+            let mut t = state();
+            t["devices"][0]["radio_table"][1] = json!({ "radio": "na", "channel": "auto", "ht": 40 });
+            t["devices"][0]["radio_table"][1].as_object_mut().unwrap().extend(flags.as_object().unwrap().clone());
+            width(&mut t, "na", ht, &none)
+        };
+        assert!(na(json!({ "has_ht160": true, "has_eht320": true }), 320).is_err());
+        na(json!({ "has_ht160": true, "has_eht320": true }), 160).unwrap();
+        assert!(na(json!({ "is_11ac": true }), 160).is_err());
+        assert!(na(json!({}), 80).is_err(), "an 802.11n radio does 40 MHz at most");
+        // The power range comes from the record, else from the AP's report of the band.
+        let r = json!({ "radio": "na", "min_txpower": "4", "max_txpower": 23 });
+        let reported = json!([{ "radio": "ng", "min_txpower": 6, "max_txpower": 22 }, { "radio": "na", "min_txpower": 6, "max_txpower": 26 }]);
+        assert_eq!(RadioCaps::of(&r, &reported), RadioCaps { min_txpower: 4, max_txpower: 23, max_width: 40 });
+        assert_eq!(RadioCaps::of(&json!({ "radio": "na", "is_11ac": true }), &reported), RadioCaps { min_txpower: 6, max_txpower: 26, max_width: 80 });
         // The editor is offered every width of the band.
         let offered = channels(&s, "6e", false);
         let mut widths: Vec<i64> = offered.as_object().unwrap().keys().map(|k| k.parse().unwrap()).collect();
         widths.sort();
         assert_eq!(widths, [20, 40, 80, 160, 240, 320]);
         assert_eq!(offered["320"].as_array().unwrap().last(), Some(&json!(221)));
+    }
+
+    #[test]
+    fn channels_are_judged_at_the_width_the_radio_runs() {
+        // A US 802.11ax radio without 160 MHz set to 160 runs at 80, where 149 is legal.
+        let mut s = state();
+        s["setting"][0]["code"] = json!("840");
+        s["devices"][0]["radio_table"][1] = json!({ "name": "wifi1", "radio": "na", "channel": 149, "ht": 160, "is_11ax": true });
+        dev(&mut s, json!({ "radios": [{ "radio": "na", "tx_power_mode": "low" }] })).unwrap();
+        assert_eq!(radio_width(&s, &s["devices"][0]["radio_table"][1]), 80);
+        // So is the channel Channel AI or a plan would set.
+        crate::channelai::set_channels(&mut s, "na", &[(AP1.parse().unwrap(), 153)], &HashSet::new()).unwrap();
+        assert_eq!(s["devices"][0]["radio_table"][1]["channel"], 153);
     }
 
     #[test]
@@ -2544,7 +2572,7 @@ mod tests {
         assert_eq!(uplink(&json!({ "vap_table": [] })), Uplink::Wired, "no uplink named: wired");
         assert_eq!(uplink(&inform("ath0")), Uplink::Wireless(None), "a placeholder names no VAP: wireless, band unknown");
         let mut s = state();
-        let e = DeviceEdit { mac: AP1.parse().unwrap(), patch: json!({ "radios": [{ "radio": "na", "tx_power_mode": "disabled" }] }), caps: HashMap::new(), wireless_uplink: Some("na".into()), antennas: Value::Null };
+        let e = DeviceEdit { mac: AP1.parse().unwrap(), patch: json!({ "radios": [{ "radio": "na", "tx_power_mode": "disabled" }] }), reported: Value::Null, wireless_uplink: Some("na".into()), antennas: Value::Null };
         assert!(apply_device(&mut s, &e).unwrap_err().contains("uplink"));
     }
 
@@ -2633,7 +2661,7 @@ mod tests {
         // An AP named another way is still the one an SSID's channel lock holds.
         let mut s = state();
         edit(&mut s, json!({ "iot_channel_lock": true })).unwrap();
-        let e = DeviceEdit { mac: "02-00-00-00-00-01".parse().unwrap(), patch: json!({ "radios": [{ "radio": "ng", "channel": 1 }] }), caps: HashMap::new(), wireless_uplink: None, antennas: Value::Null };
+        let e = DeviceEdit { mac: "02-00-00-00-00-01".parse().unwrap(), patch: json!({ "radios": [{ "radio": "ng", "channel": 1 }] }), reported: Value::Null, wireless_uplink: None, antennas: Value::Null };
         assert!(apply_device(&mut s, &e).unwrap_err().contains("IoT"));
         // A record that writes its MAC another way is found, and listed as `aa:bb:..`.
         let mut s = state();
@@ -2681,7 +2709,7 @@ mod tests {
         // An AP of the other site is judged by its own site's rules: not edited here.
         let mut t = s.clone();
         t["devices"].as_array_mut().unwrap().push(json!({ "mac": "02:00:00:00:00:09", "name": "Far", "site_id": "s2", "radio_table": [] }));
-        let far = DeviceEdit { mac: "02:00:00:00:00:09".parse().unwrap(), patch: json!({ "name": "Near" }), caps: HashMap::new(), wireless_uplink: None, antennas: Value::Null };
+        let far = DeviceEdit { mac: "02:00:00:00:00:09".parse().unwrap(), patch: json!({ "name": "Near" }), reported: Value::Null, wireless_uplink: None, antennas: Value::Null };
         assert_eq!(apply_device(&mut t, &far).unwrap_err(), "this AP belongs to another site");
         // Pruning this site's per-SSID groups leaves another site's alone.
         edit(&mut s, json!({ "aps": [AP1] })).unwrap();
@@ -2713,8 +2741,7 @@ mod tests {
     fn radio_extras_are_range_checked() {
         let mut s = state();
         let antennas = json!([{ "id": 4, "name": "Combined", "wifi0_gain": 3, "wifi1_gain": 5 }, { "id": 5, "name": "External" }]);
-        let caps = RadioCaps::of_inform(Some(&json!({ "radio_table": [{ "radio": "na", "min_txpower": 6, "max_txpower": 26, "is_11ac": true }, { "radio": "ng", "min_txpower": 6, "max_txpower": 22 }] })));
-        let any = |s: &mut Value, patch: Value| apply_device(s, &DeviceEdit { mac: AP1.parse().unwrap(), patch, caps: caps.clone(), wireless_uplink: None, antennas: antennas.clone() });
+        let any = |s: &mut Value, patch: Value| apply_device(s, &DeviceEdit { mac: AP1.parse().unwrap(), patch, reported: Value::Null, wireless_uplink: None, antennas: antennas.clone() });
         let edit = |s: &mut Value, r: Value| any(s, json!({ "radios": [r] }));
         edit(&mut s, json!({ "radio": "na", "loadbalance_enabled": true, "maxsta": 40, "sens_level_enabled": true, "sens_level": -80 })).unwrap();
         let r = &s["devices"][0]["radio_table"][1];
