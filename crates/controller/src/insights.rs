@@ -18,14 +18,14 @@ use crate::series::{Delta, Loaded, Only, RangeQuery, Samples, Spec, ap_name, ap_
 use crate::store::{Db, TIERS};
 
 /// The BSSIDs an AP's SSIDs have had in a tier of `vap_stats` (a BSSID stays
-/// on its AP, and its radio), on one band if `band`: one step through the
-/// table's own index per BSSID, rather than a scan of every row for `ap_mac`.
-fn bssids_of(c: &Connection, tier: usize, ap: &str, band: Option<&str>) -> rusqlite::Result<Vec<String>> {
+/// on its AP, and its radio): one step through the table's own index per
+/// BSSID, rather than a scan of every row for `ap_mac`.
+fn bssids_of(c: &Connection, tier: usize, ap: &str) -> rusqlite::Result<Vec<String>> {
     use rusqlite::OptionalExtension;
-    let mut stmt = c.prepare_cached(&format!("SELECT bssid, ap_mac, radio FROM vap_stats{} WHERE bssid > ?1 ORDER BY bssid LIMIT 1", TIERS[tier].suffix))?;
+    let mut stmt = c.prepare_cached(&format!("SELECT bssid, ap_mac FROM vap_stats{} WHERE bssid > ?1 ORDER BY bssid LIMIT 1", TIERS[tier].suffix))?;
     let (mut out, mut after) = (Vec::new(), String::new());
-    while let Some((bssid, on, radio)) = stmt.query_row([&after], |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?, r.get::<_, Option<String>>(2)?))).optional()? {
-        if on.as_deref() == Some(ap) && band.is_none_or(|b| radio.as_deref() == Some(b)) {
+    while let Some((bssid, on)) = stmt.query_row([&after], |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?))).optional()? {
+        if on.as_deref() == Some(ap) {
             out.push(bssid.clone());
         }
         after = bssid;
@@ -83,27 +83,24 @@ pub async fn activity(State(s): State<AppState>, Query(q): Query<RangeQuery>, Qu
     let bucket = bucket_for(to - from, tier);
     let one_band = q.band.clone().filter(|b| b != "all");
     let ap = q.mac.map(|m| m.to_string());
-    // Site-wide, the SSIDs' counters are those the other site views read.
-    let vaps = if ap.is_none() && one_band.is_none() {
-        std::sync::Arc::new(with_site_vaps(&s, &q, move |vaps| vap_activity(vaps, from, bucket)).await?)
-    } else {
-        let (ap, band) = (ap.clone(), one_band.clone());
-        memo_read(&s, Db::Metrics, "activity-vaps", &q, tier, move |c| {
-            // One AP's SSIDs (on the band asked) by their BSSIDs, the table's key
-            // (`ap_mac` has no index); else one band's, chosen by SQLite.
-            let bssids = ap.as_deref().map(|a| bssids_of(c, tier, a, band.as_deref())).transpose()?;
-            let only = match (&bssids, band.as_deref()) {
-                (Some(b), _) => Some(Only::In("bssid", b)),
-                (None, Some(b)) => Some(Only::Is("radio", b)),
-                (None, None) => None,
-            };
-            let vaps = load(c, Spec { table: "vap_stats", key: "bssid", extra: &[], cols: VAP_COLS, only }, tier, from, to)?;
-            Ok(vap_activity(&vaps, from, bucket))
-        })
-        .await?
+    let band = one_band.clone();
+    let vaps = match &ap {
+        // Site-wide, the SSIDs' counters are those the other site views read.
+        None => with_site_vaps(&s, &q, move |vaps| vap_activity(on_band(vaps, band.as_deref()), from, bucket)).await?,
+        // One AP's SSIDs by their BSSIDs, the table's key (`ap_mac` has no index),
+        // read once for all its bands: each radio's chart on its page asks for one.
+        Some(a) => {
+            let a = a.clone();
+            let vaps = memo_read(&s, Db::Metrics, "ap-vaps", &q.read_by(true), tier, move |c| {
+                let bssids = bssids_of(c, tier, &a)?;
+                load(c, Spec { table: "vap_stats", key: "bssid", extra: &AP_BAND, cols: VAP_COLS, only: Some(Only::In("bssid", &bssids)) }, tier, from, to)
+            })
+            .await?;
+            tokio::task::spawn_blocking(move || vap_activity(on_band(&vaps, band.as_deref()), from, bucket)).await?
+        }
     };
     if p.parts == Some(Parts::Activity) {
-        return Ok(Json(json!({ "bucket": bucket, "activity": *vaps, "airtime": null })));
+        return Ok(Json(json!({ "bucket": bucket, "activity": vaps, "airtime": null })));
     }
     // Airtime from the radios: per bucket, each figure averaged by SQLite over the
     // radios' samples that have it (a bucket where none has it is null, not 0).
@@ -136,12 +133,18 @@ pub async fn activity(State(s): State<AppState>, Query(q): Query<RangeQuery>, Qu
         Ok(json!({ "ts": air_ts, "total": total, "external_interference": external, "own_traffic": internal, "own_rx": own_rx, "own_tx": own_tx }))
     })
     .await?;
-    Ok(Json(json!({ "bucket": bucket, "activity": *vaps, "airtime": *airtime })))
+    Ok(Json(json!({ "bucket": bucket, "activity": vaps, "airtime": *airtime })))
+}
+
+/// The SSIDs of `vaps` (loaded with an `extra` that starts with [`AP_BAND`]) on
+/// one band, or all of them.
+fn on_band<'a>(vaps: &'a Loaded, band: Option<&'a str>) -> impl Iterator<Item = &'a (Vec<String>, Samples)> {
+    vaps.values().filter(move |(ex, _)| band.is_none_or(|b| ex[BAND] == b))
 }
 
 /// [`activity`]'s figures from the SSIDs' counters ([`VAP_COLS`]): bucketed
 /// traffic, packets, retries, drops, multicast and clients.
-fn vap_activity(vaps: &Loaded, from: Ts, bucket: Ts) -> Value {
+fn vap_activity<'a>(vaps: impl Iterator<Item = &'a (Vec<String>, Samples)>, from: Ts, bucket: Ts) -> Value {
     let [tx_bytes, rx_bytes, tx_packets, rx_packets, tx_mcast, rx_mcast, tx_bcast, rx_bcast, tx_dropped, num_sta] =
         cols_at(VAP_COLS, ["tx_bytes", "rx_bytes", "tx_packets", "rx_packets", "tx_mcast", "rx_mcast", "tx_bcast", "rx_bcast", "tx_dropped", "num_sta"]);
     let retry_at = cols_at(VAP_COLS, Retries::COLS);
@@ -156,7 +159,7 @@ fn vap_activity(vaps: &Loaded, from: Ts, bucket: Ts) -> Value {
     const DROPPED: usize = 7;
     const MCAST: usize = 8;
     let mut per: BTreeMap<Ts, HashMap<usize, Bucket<9>>> = BTreeMap::new();
-    for (vap, (_, samples)) in vaps.values().enumerate() {
+    for (vap, (_, samples)) in vaps.enumerate() {
         for d in deltas(samples, from) {
             let a = per.entry(d.ts - d.ts % bucket).or_default().entry(vap).or_default();
             let g = |i: usize| d.rate(i).unwrap_or(0.0);
