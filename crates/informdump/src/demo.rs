@@ -846,7 +846,7 @@ mod tests {
     fn the_demo_settings_are_ones_an_import_would_give() {
         let s = state().unwrap();
         let mut keys: Vec<&str> = s.as_object().unwrap().keys().map(String::as_str).collect();
-        let mut import: Vec<&str> = crate::snapshot::collections().chain(["source"]).collect();
+        let mut import: Vec<&str> = apcfg::COLLECTIONS.iter().copied().chain(["source"]).collect();
         keys.sort_unstable();
         import.sort_unstable();
         assert_eq!(keys, import);

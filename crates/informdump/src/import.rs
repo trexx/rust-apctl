@@ -13,7 +13,7 @@ use mongodb::bson::{Bson, Document, doc};
 use mongodb::options::{ClientOptions, FindOptions};
 use serde_json::{Value, json};
 
-use crate::snapshot::{collections, source, trim_settings};
+use crate::snapshot::{source, trim_settings};
 
 /// Device fields worth carrying over besides the ones rendering reads
 /// ([`apcfg::DEVICE_KEYS`]). Everything else (stats caches, etc.) is skipped.
@@ -40,7 +40,7 @@ pub async fn run(uri: &str, db: &str, out: &Path) -> Result<()> {
     let mut snapshot = serde_json::Map::new();
     snapshot.insert("source".into(), json!("unifi-network-application"));
     let mut read = Vec::new();
-    for c in collections() {
+    for &c in apcfg::COLLECTIONS {
         let (filter, projection) = match c {
             // Only the settings apctl reads ([`apcfg::SETTING_KEYS`]): the others hold
             // credentials (mail, cloud access, guest portal) nothing here uses.

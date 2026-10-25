@@ -3,15 +3,6 @@
 
 use serde_json::Value;
 
-/// Collections carried over besides the ones rendering reads ([`apcfg::COLLECTIONS`]):
-/// the WLAN groups the devices name.
-pub const EXTRA_COLLECTIONS: &[&str] = &["wlangroup"];
-
-/// Every collection a snapshot holds, in the order they are read.
-pub fn collections() -> impl Iterator<Item = &'static str> {
-    apcfg::COLLECTIONS.iter().chain(EXTRA_COLLECTIONS).copied()
-}
-
 /// The official controller's collection each snapshot collection is read from.
 pub fn source(collection: &str) -> &str {
     match collection {
@@ -54,9 +45,9 @@ mod tests {
 
     #[test]
     fn each_collection_is_read_once_from_the_officials_name() {
-        let read: Vec<_> = collections().collect();
+        let read = apcfg::COLLECTIONS;
         assert!(read.iter().enumerate().all(|(i, c)| !read[..i].contains(c)), "{read:?}");
-        for c in ["sites", "setting", "devices", "clients", "wlangroup"] {
+        for c in ["sites", "setting", "devices", "clients"] {
             assert!(read.contains(&c), "import reads {c} by this name");
         }
         assert_eq!([source("sites"), source("devices"), source("clients"), source("wlanconf")], ["site", "device", "user", "wlanconf"]);
