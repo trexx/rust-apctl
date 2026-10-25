@@ -1819,34 +1819,35 @@ impl Engine {
                 ],
             });
             let Some(m) = m else { continue };
+            // One lookup per map: the last sample is read where it is kept, then replaced.
             if bss_done.insert(c.bssid.as_str()) {
-                if let Some((pts, prev)) = self.bss_prev.get(&c.bssid)
-                    && ts > *pts
-                    && ts - pts <= MCAST_GAP
-                {
-                    let dt = (ts - pts) as f64;
-                    let prev = mcast_types(prev);
-                    for (kind, cur) in &m.types {
-                        let p = prev.get(kind).copied().unwrap_or(*cur);
-                        let e = mcast.entry(kind.as_ref()).or_default();
-                        e.0[0] += rate(cur.tx_pkts, p.tx_pkts, dt);
-                        e.0[2] += rate(cur.tx_bytes, p.tx_bytes, dt);
-                    }
-                }
                 match self.bss_prev.get_mut(&c.bssid) {
-                    Some(prev) => *prev = (ts, c.clone()),
+                    Some(last) => {
+                        let (pts, prev) = &*last;
+                        if ts > *pts && ts - pts <= MCAST_GAP {
+                            let dt = (ts - pts) as f64;
+                            let prev = mcast_types(prev);
+                            for (kind, cur) in &m.types {
+                                let p = prev.get(kind).copied().unwrap_or(*cur);
+                                let e = mcast.entry(kind.as_ref()).or_default();
+                                e.0[0] += rate(cur.tx_pkts, p.tx_pkts, dt);
+                                e.0[2] += rate(cur.tx_bytes, p.tx_bytes, dt);
+                            }
+                        }
+                        *last = (ts, c.clone());
+                    }
                     None => {
                         self.bss_prev.insert(c.bssid.clone(), (ts, c.clone()));
                     }
                 }
             }
-            if let Some((pts, prev)) = self.mcast_prev.get(&c.mac)
+            if let Some((pts, prev)) = self.mcast_prev.insert(c.mac, (ts, c.clone()))
                 && prev.bssid == c.bssid
-                && ts > *pts
+                && ts > pts
                 && ts - pts <= MCAST_GAP
             {
                 let dt = (ts - pts) as f64;
-                let prev = mcast_types(prev);
+                let prev = mcast_types(&prev);
                 for (kind, cur) in &m.types {
                     let p = prev.get(kind).copied().unwrap_or(*cur);
                     let (pk, by) = (rate(cur.rx_pkts, p.rx_pkts, dt), rate(cur.rx_bytes, p.rx_bytes, dt));
@@ -1858,7 +1859,6 @@ impl Engine {
                     }
                 }
             }
-            self.mcast_prev.insert(c.mac, (ts, c.clone()));
         }
         for (kind, (r, n)) in mcast {
             self.writer.send(Write::Metric {
