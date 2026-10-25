@@ -185,13 +185,18 @@ fn mac_num(s: &str) -> Option<u64> {
     Some(hardware_num(&s.parse().ok()?))
 }
 
-/// Folds case, spacing and look-alike characters (digits, symbols and
-/// Cyrillic letters that pass for Latin ones).
+/// Spacing and punctuation a name may differ by and still read the same:
+/// separators and invisible characters.
+fn is_spacing(c: char) -> bool {
+    c.is_whitespace() || matches!(c, '-' | '_' | '.' | '\'' | '\u{200b}'..='\u{200d}' | '\u{2060}' | '\u{feff}')
+}
+
+/// Folds case, spacing ([`is_spacing`]) and look-alike characters (digits,
+/// symbols and Cyrillic letters that pass for Latin ones).
 fn fold(s: &str) -> String {
     let mut out = String::new();
-    for c in s.chars().flat_map(char::to_lowercase) {
+    for c in s.chars().flat_map(char::to_lowercase).filter(|c| !is_spacing(*c)) {
         let m = match c {
-            ' ' | '-' | '_' | '.' | '\'' | '\u{200b}'..='\u{200d}' | '\u{2060}' | '\u{feff}' | '\u{00a0}' => continue,
             '0' | 'о' | 'ο' => 'o',
             '1' | 'i' | '!' | '|' | 'і' | 'ӏ' | 'ι' => 'l',
             '3' | 'е' | 'ε' => 'e',
@@ -233,13 +238,14 @@ fn within_edits(a: &[char], b: &[char], max: usize) -> bool {
 /// A network name with the forms [`similar`] compares, worked out once.
 struct Name<'a> {
     raw: &'a str,
+    /// Lower case, without spacing or punctuation ([`is_spacing`]).
     lower: String,
     folded: Vec<char>,
 }
 
 impl<'a> Name<'a> {
     fn new(raw: &'a str) -> Name<'a> {
-        Name { raw, lower: raw.trim().to_lowercase(), folded: fold(raw).chars().collect() }
+        Name { raw, lower: raw.chars().flat_map(char::to_lowercase).filter(|c| !is_spacing(*c)).collect(), folded: fold(raw).chars().collect() }
     }
 }
 
@@ -255,7 +261,7 @@ fn similar(name: &Name, ours: &Name) -> Option<&'static str> {
         return None;
     }
     if name.lower == ours.lower {
-        return Some("the same name with different capitals or spacing");
+        return Some("the same name with different capitals, spacing or punctuation");
     }
     let (a, b) = (&name.folded, &ours.folded);
     let len = b.len();
@@ -1103,6 +1109,11 @@ mod tests {
         assert!(lookalike("H0me", "Home").is_some());
         assert!(lookalike("home", "Home").is_some());
         assert!(lookalike("Home WiFi_5G", "Home WiFi").is_some());
+        // Spacing and punctuation are told as such, not as look-alike characters.
+        for name in ["HomeWiFi", "Home-WiFi", "Home_WiFi", " home wifi", "Home\u{a0}WiFi"] {
+            assert_eq!(lookalike(name, "Home WiFi"), Some("the same name with different capitals, spacing or punctuation"), "{name}");
+        }
+        assert_eq!(lookalike("H0me WiFi", "Home WiFi"), Some("looks the same, with look-alike characters swapped in (such as 0 for O)"));
         assert!(lookalike("Home WіFi", "Home WiFi").is_some()); // Cyrillic i
         assert!(lookalike("Home WiFii", "Home WiFi").is_some());
         assert!(lookalike("Housing Office", "Home WiFi").is_none());
