@@ -54,7 +54,7 @@ export default defineConfig({
           groups: [
             {
               name: "vendor",
-              test: /[\\/]node_modules[\\/](react|react-dom|scheduler|react-router|@tanstack|cookie|set-cookie-parser)[\\/]/,
+              test: /[\\/]node_modules[\\/](react|react-dom|scheduler|react-router|@tanstack)[\\/]/,
             },
             { name: "uplot", test: /[\\/]node_modules[\\/]uplot[\\/].*\.m?js$/ },
           ],
