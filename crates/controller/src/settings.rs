@@ -367,6 +367,8 @@ fn wlans_view(state: &Value, informs: &HashMap<inform::Mac, Arc<Value>>, active:
             if let Value::Object(o) = &mut v {
                 o.extend(pick(w, WLAN_FIELDS));
             }
+            // The bands as deployed, which an edit starts from (`edit_wlan`).
+            v["wlan_bands"] = json!(apcfg::wlan_bands(w));
             v
         })
         .collect();
@@ -1078,6 +1080,9 @@ fn edit_wlan(state: &mut Value, e: &WlanEdit, over: &[Over]) -> Result<(String, 
         return Err("this SSID cannot be edited".into());
     }
     let mut w = before.clone();
+    // The bands as the render deploys them (2.4 and 5 GHz when the stored list names
+    // none), before anything below compares the record with the edit.
+    w["wlan_bands"] = json!(apcfg::wlan_bands(&w));
     let mut changed: Vec<&str> = Vec::new();
 
     if let Some(name) = str_field(p, "name")?.map(str::trim) {
@@ -1261,11 +1266,8 @@ fn wlan_bands(p: &Value, w: &mut Value) -> Result<Bands, String> {
         dedup_in_order(&mut bands);
         w["wlan_bands"] = json!(bands);
     }
-    // As the render deploys it: 2.4 and 5 GHz when the stored list names no band,
-    // which the record then says.
     let read = apcfg::wlan_bands(w);
     let bands = Bands { g2: read.contains(&"2g"), g5: read.contains(&"5g"), g6: read.contains(&"6g") };
-    w["wlan_bands"] = json!(read);
     if bands.g6 && !(flag(w, "wpa3_support", false) || w["security"].as_str() == Some("open")) {
         return Err("6 GHz needs WPA3 (or an open network)".into());
     }
@@ -2078,6 +2080,13 @@ mod tests {
         assert!(what.contains("roaming_assistant_na_enabled"), "{what}");
         assert_eq!((s["wlanconf"][0]["name"].as_str(), s["wlanconf"][0]["roaming_assistant_na_enabled"].as_bool()), (Some("Things"), Some(false)));
         assert!(edit(&mut s, json!({ "roaming_assistant_na_enabled": true })).unwrap_err().contains("roaming assistant"));
+        // One stored without bands (none, or an empty list: 2.4 and 5 GHz) is edited too, and kept on 2.4 GHz.
+        for bands in [Value::Null, json!([])] {
+            let mut s = state();
+            (s["wlanconf"][0]["enhanced_iot"], s["wlanconf"][0]["wlan_bands"]) = (json!(true), bands);
+            edit(&mut s, json!({ "name": "Things" })).unwrap();
+            assert_eq!((&s["wlanconf"][0]["wlan_bands"], &s["wlanconf"][0]["wlan_band"]), (&json!(["2g"]), &json!("2g")));
+        }
     }
 
     #[test]
@@ -2662,6 +2671,9 @@ mod tests {
         let v = wlans_view(&s, &HashMap::new(), true);
         assert_eq!((v["aps"].as_array().unwrap().len(), &v["unknown"][0]), (2, &json!(AP1)), "no inform yet: support unknown");
         assert_eq!(v["networks"].as_array().unwrap().iter().map(|n| n["for_ssid"].as_bool().unwrap()).collect::<Vec<_>>(), [true, false, true], "an empty purpose is none");
+        // An SSID stored without bands is listed on the two the APs broadcast it on.
+        s["wlanconf"][0]["wlan_bands"] = json!([]);
+        assert_eq!(wlans_view(&s, &HashMap::new(), true)["wlans"][0]["wlan_bands"], json!(["2g", "5g"]));
     }
 
     #[test]
