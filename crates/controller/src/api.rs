@@ -596,10 +596,9 @@ struct ListedClient<'a> {
     ap_name: Option<&'a str>,
 }
 
-/// A client's view as the list (and an AP's page) sends it: the sample without its multicast
-/// tables, which only the client's own page shows (with the peers in its groups), and without
-/// the packet counters, which no list shows, so the list of every client of the past year
-/// doesn't carry them.
+/// A client's view as the list (and an AP's page) sends it: the sample with only what the lists
+/// show. The multicast tables (with the peers in its groups), the counters and the rest are only
+/// on the client's own page, so the list of every client of the past year doesn't carry them.
 #[derive(Serialize)]
 struct ListedView<'a> {
     sample: ListedSample<'a>,
@@ -616,40 +615,49 @@ impl<'a> ListedView<'a> {
     }
 }
 
-/// A sample, serialised as it is without `multicast`, `tx_packets` and `rx_packets`.
+/// A sample, serialised with only the fields the lists read.
 struct ListedSample<'a>(&'a ClientSample);
 
 impl Serialize for ListedSample<'_> {
     fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
         use serde::ser::SerializeStruct;
         // Destructured in full, as above: a new field must be added here too, or left out by name.
-        macro_rules! all_but {
-            ($($f:ident),*) => {{
-                let ClientSample { $($f,)* multicast: _, tx_packets: _, rx_packets: _ } = self.0;
+        macro_rules! only {
+            ($($f:ident),*; not $($g:ident),*) => {{
+                let ClientSample { $($f,)* $($g: _,)* } = self.0;
                 let mut st = s.serialize_struct("ClientSample", [$(stringify!($f)),*].len())?;
                 $(st.serialize_field(stringify!($f), $f)?;)*
                 st.end()
             }};
         }
-        all_but!(
-            mac, ap_mac, bssid, essid, radio, channel, hostname, ip, rssi, signal, noise, tx_rate, rx_rate, tx_bytes, rx_bytes, tx_retries,
-            idletime, uptime, satisfaction, anomalies, nss, wifi_gen, vlan_id, latency_avg, is_11r
+        only!(
+            mac, ap_mac, essid, radio, channel, hostname, ip, signal, tx_rate, rx_rate, uptime, wifi_gen, nss;
+            not multicast, tx_packets, rx_packets, bssid, rssi, noise, tx_bytes, rx_bytes, tx_retries, idletime, satisfaction, anomalies, vlan_id,
+            latency_avg, is_11r
         )
     }
 }
 
 type ClientCopy = (Mac, ClientView, Option<crate::engine::Alias>);
 
+#[derive(Deserialize)]
+struct ClientsQuery {
+    /// Only the connected clients.
+    #[serde(default)]
+    connected: bool,
+}
+
 /// Every client: the ones seen in this run and the ones restored from the
 /// database at start (`Engine::restore` loads them all, so the live view is
-/// the whole list).
-async fn clients(State(s): State<AppState>) -> Response {
+/// the whole list); with `?connected=true`, only the connected ones.
+async fn clients(State(s): State<AppState>, Query(q): Query<ClientsQuery>) -> Response {
     // What each client's entry needs, copied under the lock (the samples are
     // shared, the rest is small); the serialising happens after it.
     // The APs' names once each, rather than once per client.
     let (state, list, ap_names) = {
         let live = s.live.read().unwrap();
-        let list: Vec<ClientCopy> = live.clients.iter().map(|(mac, c)| (*mac, c.clone(), live.aliases.get(mac).cloned())).collect();
+        let list: Vec<ClientCopy> =
+            live.clients.iter().filter(|(_, c)| c.connected || !q.connected).map(|(mac, c)| (*mac, c.clone(), live.aliases.get(mac).cloned())).collect();
         let aps = live.devices.keys().chain(live.known_devices.keys());
         let ap_names: std::collections::HashMap<Mac, String> = aps.filter_map(|m| Some((*m, crate::series::ap_name_of(&live, m)?))).collect();
         (live.state.clone(), list, ap_names)
@@ -1426,12 +1434,14 @@ mod tests {
         assert_eq!(keys(&clients[0]), "alias,ap_name,blocked,connected,first_seen,last_seen,locked_to,note,sample,usergroup_id,vendor");
         let one = get_json(&app, "/api/clients/02:00:00:00:01:01").await;
         assert_eq!(keys(&one), "alias,blocked,connected,first_seen,last_seen,locked_to,note,peers,sample,usergroup_id,vendor", "no ap_name, as before");
-        // The list's sample is the page's without the multicast tables and the packet counters.
+        // The list's sample is the page's with only what the lists read.
         let mut page_sample = one["sample"].clone();
-        for k in ["multicast", "tx_packets", "rx_packets"] {
+        let dropped = "multicast tx_packets rx_packets bssid rssi noise tx_bytes rx_bytes tx_retries idletime satisfaction anomalies vlan_id latency_avg is_11r";
+        for k in dropped.split(' ') {
             assert!(page_sample.as_object_mut().unwrap().remove(k).is_some(), "{k}");
         }
         assert_eq!(page_sample, clients[0]["sample"]);
+        assert_eq!(keys(&clients[0]["sample"]), "ap_mac,channel,essid,hostname,ip,mac,nss,radio,rx_rate,signal,tx_rate,uptime,wifi_gen");
         assert_eq!(one["peers"], json!({}));
         assert_eq!(get_json(&app, "/api/clients/names").await, json!({ "02:00:00:00:01:01": "phone" }));
         let status = get_json(&app, "/api/status").await;
@@ -1462,6 +1472,10 @@ mod tests {
 
         let list = get_json(&app, "/api/clients").await;
         assert_eq!(list.as_array().unwrap().len(), 6);
+        let connected = get_json(&app, "/api/clients?connected=true").await;
+        assert_eq!(connected.as_array().unwrap().len(), 5, "without the one that left");
+        assert!(connected.as_array().unwrap().iter().all(|c| c["connected"] == true));
+        assert_eq!(get_json(&app, "/api/clients?connected=false").await.as_array().unwrap().len(), 6, "false: all of them");
         assert!(list.as_array().unwrap().iter().all(|c| c["sample"].get("multicast").is_none() && c["sample"]["essid"] == "Home"), "{list}");
         // Nor does the AP's page list its clients with them.
         let ap = get_json(&app, "/api/devices/02:00:00:00:00:01").await["clients"].clone();
