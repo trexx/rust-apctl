@@ -517,7 +517,7 @@ impl Sim {
             // Now and then (about hourly and every two hours): poor experience, and a kick.
             let weak = c.quirk == Some(Quirk::WeakLink);
             if weak && self.rng.unit() < dt / 3600.0 {
-                let (bssid, radio) = (bssid(self.ids[i].mac, vap.radio, vap.idx), if na { "wifi1" } else { "wifi0" });
+                let (bssid, radio) = (bssid(self.ids[i].mac, vap.radio, vap.idx), vap.radio_name());
                 self.log(ts, i, "mcad", format!("wireless_agg_stats.log_sta_anomalies(): bssid={bssid} radio={radio} vap={} sta={} signal={signal} satisfaction_now={sat} anomalies=low_rssi,high_tcp_latency", vap.name, c.mac));
             }
             if weak && signal < -76 && self.rng.unit() < dt / 7200.0 {
@@ -543,7 +543,7 @@ impl Sim {
         let ap = &APS[i];
         VAPS.iter()
             .enumerate()
-            .map(|(vi, &Vap { radio, idx, essid, name })| {
+            .map(|(vi, vap @ &Vap { radio, idx, essid, name })| {
                 let vc = &mut self.vap_counters[i][vi];
                 let load = loads[vi];
                 vc.tx += load.down + 2_000.0 * dt;
@@ -554,7 +554,7 @@ impl Sim {
                 let (avg, sat) = if n > 0 { (load.signal / n, load.satisfaction / n) } else { (0, 100) };
                 let na = radio == "na";
                 json!({
-                    "bssid": bssid(self.ids[i].mac, radio, idx), "essid": essid, "radio": radio, "radio_name": if na { "wifi1" } else { "wifi0" },
+                    "bssid": bssid(self.ids[i].mac, radio, idx), "essid": essid, "radio": radio, "radio_name": vap.radio_name(),
                     "name": name, "id": format!("{vi}"), "channel": if na { ap.na } else { ap.ng }, "bw": if na { ap.na_bw } else { 20 },
                     "tx_power": if na { ap.power.1 } else { ap.power.0 }, "usage": "user", "up": true, "state": "RUN", "num_sta": n,
                     "tx_bytes": vc.tx as i64, "rx_bytes": vc.rx as i64, "tx_packets": (vc.tx / 1100.0) as i64, "rx_packets": (vc.rx / 500.0) as i64,
@@ -662,6 +662,14 @@ struct Vap {
     name: &'static str,
 }
 
+impl Vap {
+    /// Its radio's interface (`wifi0`), which its own name starts with.
+    fn radio_name(&self) -> &'static str {
+        let name: &'static str = self.name;
+        &name[..name.find("ap").expect("VAP names are <radio>ap<n>")]
+    }
+}
+
 const VAPS: [Vap; 3] = [
     Vap { radio: "ng", idx: 0, essid: SSID, name: "wifi0ap0" },
     Vap { radio: "na", idx: 0, essid: SSID, name: "wifi1ap0" },
@@ -671,13 +679,14 @@ const VAPS: [Vap; 3] = [
 /// The VAP (index in [`VAPS`]) a client joins at a signal: an IoT device the IoT SSID,
 /// anything else 5 GHz unless the signal is weak.
 fn vap_of(c: &Client, signal: i64) -> usize {
-    if c.iot {
-        2
+    let (radio, essid) = if c.iot {
+        ("ng", IOT_SSID)
     } else if signal < -72 {
-        0
+        ("ng", SSID)
     } else {
-        1
-    }
+        ("na", SSID)
+    };
+    VAPS.iter().position(|v| v.radio == radio && v.essid == essid).expect("VAPS has every band and SSID a client joins")
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -866,6 +875,22 @@ mod tests {
             let cfg = apcfg::render(&input).unwrap().system_cfg;
             assert!(!cfg.contains("acl.policy=allow"), "{}: a MAC allow-list", ap.name);
             assert_eq!(cfg.lines().filter(|l| l.starts_with("wireless.") && l.contains(".ssid=")).count(), 3, "{}: Homestead on both radios, IoT on 2.4 GHz", ap.name);
+        }
+    }
+
+    /// Clients join the VAP of their SSID and band, each VAP on its band's radio.
+    #[test]
+    fn clients_join_the_vap_of_their_ssid_and_band() {
+        for v in &VAPS {
+            assert_eq!(v.radio_name(), if v.radio == "na" { "wifi1" } else { "wifi0" }, "{}", v.name);
+        }
+        for c in CLIENTS {
+            let joined = |signal| (VAPS[vap_of(c, signal)].radio, VAPS[vap_of(c, signal)].essid);
+            if c.iot {
+                assert_eq!([joined(-50), joined(-80)], [("ng", IOT_SSID); 2], "{}", c.hostname);
+            } else {
+                assert_eq!([joined(-50), joined(-80)], [("na", SSID), ("ng", SSID)], "{}", c.hostname);
+            }
         }
     }
 
