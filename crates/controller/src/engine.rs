@@ -589,7 +589,7 @@ impl Engine {
             let aliases = stmt
                 .query_map([], |r| Ok((r.get::<_, String>(0)?, Alias { alias: r.get(1)?, note: r.get(2)? })))?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
-            Ok((devices, clients, aliases, state, store::stored_pushes(c)?))
+            Ok((devices, clients, aliases, state, store::stored_pushes(c, None)?))
         })?;
         self.stored_config = pushes;
         let mut live = self.live.write().unwrap();

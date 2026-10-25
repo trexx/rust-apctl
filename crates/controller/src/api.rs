@@ -777,10 +777,13 @@ async fn dryrun(State(s): State<AppState>) -> Result<Json<DryRunStatus>, ApiErro
     };
     // Then from the database, in one go: the stored redacted copy for APs not
     // pushed to since start (a full one, as above), and the comparisons made at each push.
-    let need: std::collections::HashSet<Mac> = aps.iter().filter(|a| a.3.is_none()).map(|a| a.0).collect();
+    let need: Vec<Mac> = aps.iter().filter(|a| a.3.is_none()).map(|a| a.0).collect();
     let (stored, history) = read(&s.store, Db::Config, move |c| {
-        let stored: std::collections::HashMap<Mac, Arc<_>> =
-            crate::store::stored_pushes(c)?.into_iter().filter(|(mac, p)| need.contains(mac) && p.complete()).map(|(mac, p)| (mac, Arc::new(p))).collect();
+        let stored: std::collections::HashMap<Mac, Arc<_>> = if need.is_empty() {
+            Default::default()
+        } else {
+            crate::store::stored_pushes(c, Some(&need))?.into_iter().filter(|(_, p)| p.complete()).map(|(mac, p)| (mac, Arc::new(p))).collect()
+        };
         // Without the diffs' text, which older rows have and the history never shows (only the counts); text that isn't JSON becomes null.
         let mut stmt = c.prepare_cached(
             "SELECT id, ts, mac, cfgversion, matches, CASE WHEN json_valid(comparison) THEN json_remove(comparison, '$.mgmt_cfg.diff', '$.system_cfg.diff') END
