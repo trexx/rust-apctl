@@ -1520,9 +1520,7 @@ impl Engine {
     fn check_isolated(&mut self, ts: Ts, heard_by: Mac, neighbors: &[crate::model::NeighborSample]) {
         use crate::model::{hardware_num, same_hardware};
         let started = self.first_tick.unwrap_or(ts);
-        // When the scan heard it (as in write_metrics, which takes the age later).
-        let heard = |n: &crate::model::NeighborSample| ts - n.age.unwrap_or(0).clamp(0, ts.max(0));
-        let flagged: Vec<&crate::model::NeighborSample> = neighbors.iter().filter(|n| n.is_isolated && heard(n) >= started).collect();
+        let flagged: Vec<&crate::model::NeighborSample> = neighbors.iter().filter(|n| n.is_isolated && n.heard(ts) >= started).collect();
         if flagged.is_empty() {
             return;
         }
@@ -1547,7 +1545,7 @@ impl Engine {
                     *ap
                 }
             };
-            let heard = heard(n);
+            let heard = n.heard(ts);
             if self.isolated.get(&ap).is_some_and(|t| heard - t < 3600) {
                 continue;
             }
@@ -1765,8 +1763,9 @@ impl Engine {
             // When the scan heard it, which is when it was last seen as it is: an entry
             // the AP keeps reporting from an old scan is no sighting now. Its age
             // grows at every inform, so it is no change of the neighbour, and its
-            // row is due again only when it is heard again.
-            let heard = ts - n.age.take().unwrap_or(0).clamp(0, ts.max(0));
+            // row is due again only when it is heard again (so the age is left out of the row).
+            let heard = n.heard(ts);
+            n.age = None;
             let Some(n) = report(rows, n, |n| n.bssid.as_str(), ts, heard, REFRESH_SECS) else { continue };
             self.writer.exec(
                 Db::Config,

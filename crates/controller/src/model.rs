@@ -198,6 +198,14 @@ pub struct NeighborSample {
     pub age: Option<i64>,
 }
 
+impl NeighborSample {
+    /// When the scan heard it, at `ts`: the AP reports an entry as last heard,
+    /// [`age`](Self::age) seconds before (never before the epoch or after `ts`).
+    pub fn heard(&self, ts: Ts) -> Ts {
+        ts - self.age.unwrap_or(0).clamp(0, ts.max(0))
+    }
+}
+
 /// One channel from a spectrum (channel survey) scan of one radio.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct SpectrumSample {
