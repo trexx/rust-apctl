@@ -28,6 +28,12 @@ export function CountryTimezone({
   d: SiteSettings;
 }) {
   const { form: f, set } = top;
+  // The site's own zone stays among the choices when the list leaves it out
+  // (a link such as US/Pacific, or Etc/GMT+5), so it can be picked again.
+  const zones =
+    d.timezone === null || d.timezones.includes(d.timezone)
+      ? d.timezones
+      : [...d.timezones, d.timezone].sort();
   return (
     <>
       <Row label="Country" hint="decides the legal channels and power">
@@ -42,7 +48,7 @@ export function CountryTimezone({
         <Select
           value={f.timezone}
           onChange={(v) => set("timezone", v)}
-          options={d.timezones.map((z) => [z, z] as const)}
+          options={zones.map((z) => [z, z] as const)}
         />
       </Row>
     </>
