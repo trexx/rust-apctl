@@ -268,6 +268,13 @@ fn adapt<'a>(ctx: &Ctx, wlan: &'a Value, radio: &Radio) -> Option<Cow<'a, Value>
     Some(w)
 }
 
+/// The bands a WLAN is deployed on, by their stored names (`2g`, `5g`, `6g`): those its
+/// `wlan_bands` names, or 2.4 and 5 GHz when it names none (missing, empty or unknown).
+pub fn wlan_bands(wlan: &Value) -> Vec<&str> {
+    let bands: Vec<&str> = str_list(wlan, "wlan_bands").filter(|b| Band::of_wlan_band(b).is_some()).collect();
+    if bands.is_empty() { vec!["2g", "5g"] } else { bands }
+}
+
 /// The WLANs to deploy as `(wlan id, adjusted WLAN, radio index)`, radio by radio, each
 /// radio in the site's WLAN order.
 pub fn deploy<'a>(ctx: &Ctx<'a>, radios: &[Radio]) -> Vec<(&'a str, Cow<'a, Value>, usize)> {
@@ -275,18 +282,16 @@ pub fn deploy<'a>(ctx: &Ctx<'a>, radios: &[Radio]) -> Vec<(&'a str, Cow<'a, Valu
         return Vec::new();
     }
     let groups = ap_groups(ctx);
-    // Each WLAN with the bands it is limited to (none: 2.4 and 5 GHz).
     let wlans: Vec<(&'a Value, Vec<Band>)> = ctx
         .site_docs("wlanconf")
         .filter(|w| flag(w, "enabled", true))
         .filter(|w| in_groups(w, &groups))
-        .map(|w| (w, str_list(w, "wlan_bands").filter_map(Band::of_wlan_band).collect()))
+        .map(|w| (w, wlan_bands(w).into_iter().filter_map(Band::of_wlan_band).collect()))
         .collect();
     let mut out = Vec::new();
     for (ri, radio) in radios.iter().enumerate() {
         for (w, bands) in &wlans {
-            let on_band = if bands.is_empty() { matches!(radio.band, Band::Ng | Band::Na) } else { bands.contains(&radio.band) };
-            if on_band && let Some(adapted) = adapt(ctx, w, radio) {
+            if bands.contains(&radio.band) && let Some(adapted) = adapt(ctx, w, radio) {
                 out.push((wlan_id(w), adapted, ri));
             }
         }

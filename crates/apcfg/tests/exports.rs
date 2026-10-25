@@ -2,7 +2,7 @@
 //! the render does: checked on their own and against a render.
 
 use apcfg::{
-    Controller, DEFAULT_COUNTRY, Input, as_int, bool_of, capable_width, configured_width, flag, int_of, override_of, radio_width, render, ssh_username, ssid_usergroup, ssid_vlan, usergroup_limits,
+    Controller, DEFAULT_COUNTRY, Input, as_int, bool_of, capable_width, configured_width, flag, int_of, override_of, radio_width, render, ssh_username, ssid_usergroup, ssid_vlan, usergroup_limits, wlan_bands,
 };
 use serde_json::{Value, json};
 
@@ -149,4 +149,26 @@ fn the_render_caps_widths_and_names_the_ssh_user_as_the_exports_do() {
     assert_eq!(line(&cfg, "radio.2.ieee_mode"), Some(format!("11naht{}", radio_width(&s, "s", &radios[1])).as_str()));
     assert_eq!(line(&cfg, "radio.2.ieee_mode"), Some("11naht80"));
     assert_eq!(line(&cfg, "users.1.name"), Some("admin"));
+}
+
+/// The bands an SSID goes on: those its `wlan_bands` names, else 2.4 and 5 GHz, as the
+/// render deploys it.
+#[test]
+fn the_render_deploys_ssids_on_the_bands_the_export_names() {
+    let cases = [("Both", json!({})), ("Empty", json!({ "wlan_bands": [] })), ("Unknown", json!({ "wlan_bands": ["7g", 5] })), ("Five", json!({ "wlan_bands": ["5g", "7g"] }))];
+    let s = state(Value::Array(cases.iter().map(|(name, extra)| wlan(name, extra.clone())).collect()), json!([]));
+    let cfg = system_cfg(&s);
+    // The radios (`wifi0`, `wifi1`) an SSID's `wireless.N` sections are on.
+    let on = |ssid: &str| -> Vec<&str> {
+        let sections = cfg.lines().filter_map(|l| l.strip_prefix("wireless.")?.strip_suffix(&format!(".ssid={ssid}")));
+        sections.map(|n| line(&cfg, &format!("wireless.{n}.parent")).unwrap()).collect()
+    };
+    for (i, (name, _)) in cases.iter().enumerate() {
+        let radios: Vec<&str> = wlan_bands(&s["wlanconf"][i]).iter().map(|b| if *b == "2g" { "wifi0" } else { "wifi1" }).collect();
+        assert_eq!(on(name), radios, "{name}");
+    }
+    assert_eq!(wlan_bands(&s["wlanconf"][0]), ["2g", "5g"]);
+    assert_eq!(wlan_bands(&s["wlanconf"][2]), ["2g", "5g"], "names no band it knows");
+    assert_eq!(wlan_bands(&s["wlanconf"][3]), ["5g"]);
+    assert_eq!(wlan_bands(&json!({ "wlan_bands": ["6g", "2g"] })), ["6g", "2g"]);
 }
