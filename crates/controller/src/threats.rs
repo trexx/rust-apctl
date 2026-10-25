@@ -1025,9 +1025,9 @@ mod tests {
         a.aps.insert(DOWN.into(), Some("Garage".into()));
         for (b, ap, e, ch) in [
             ("02:00:00:3c:51:ae", UP, "Home", 44),
-            ("7a:45:58:3c:51:ae", UP, "Home IoT", 1),
+            ("02:00:00:3c:51:af", UP, "Home IoT", 1),
             ("02:00:00:3c:52:be", DOWN, "Home", 48),
-            ("7a:45:58:3c:52:be", DOWN, "Home IoT", 1),
+            ("02:00:00:3c:52:bf", DOWN, "Home IoT", 1),
         ] {
             a.own.push(OwnBss { bssid: b.into(), ap_mac: ap.into(), essid: Some(e.into()), channel: Some(ch), changed_at: 0 });
             a.ssids.insert(e.into());
@@ -1082,8 +1082,8 @@ mod tests {
         }
         // Next to our AP's own addresses: probably ours, so only medium.
         let mut a = site();
-        a.heard.push(heard("7a:45:58:3c:52:bf", UP, "Home", 48, "WPA2-Personal (AES/CCMP)", -80));
-        assert_eq!(kinds(&a), vec![(Kind::Impersonation, Severity::Medium, "7a:45:58:3c:52:bf".into())]);
+        a.heard.push(heard("02:00:00:3c:52:c0", UP, "Home", 48, "WPA2-Personal (AES/CCMP)", -80));
+        assert_eq!(kinds(&a), vec![(Kind::Impersonation, Severity::Medium, "02:00:00:3c:52:c0".into())]);
     }
 
     #[test]
