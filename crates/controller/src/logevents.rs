@@ -122,6 +122,10 @@ struct Crash {
     /// Set at the first line that did not fit: later ones are not kept (nor
     /// formatted), so the capture has no holes.
     full: bool,
+    /// Set at the first netconsole line. The kernel's lines then come twice (an
+    /// AP sending syslog to this controller sends netconsole to it as well), and
+    /// only netconsole's are kept.
+    netconsole: bool,
 }
 
 impl Crash {
@@ -362,16 +366,23 @@ impl LogEvents {
         };
         let is_fault = fault.is_some();
         if let Some(c) = self.crashes.get_mut(&dev) {
-            c.push(text);
+            c.netconsole |= line.facility.is_none();
+            let copy = c.netconsole && line.facility.is_some() && (prog == Some("kernel") || line.facility == Some(0));
             if let Some((CrashKind::Panic, _)) = fault {
                 c.kind = CrashKind::Panic;
-                out.extend(self.flush(dev, line.ts));
+            }
+            // A panic is reported at once; one in a copy, with netconsole's line.
+            if !copy {
+                c.push(text);
+                if c.kind == CrashKind::Panic {
+                    out.extend(self.flush(dev, line.ts));
+                }
             }
         } else if let Some((kind, process)) = fault
             && self.crash_reported.get(&dev).is_none_or(|t| !(0..CRASH_COOLDOWN).contains(&(line.ts - t)))
             && self.crashes.len() < MAX_CRASHES
         {
-            let mut crash = Crash { started: line.ts, kind, process, lines: Vec::new(), bytes: 0, full: false };
+            let mut crash = Crash { started: line.ts, kind, process, lines: Vec::new(), bytes: 0, full: false, netconsole: line.facility.is_none() };
             crash.push(text);
             self.crashes.insert(dev, crash);
             if kind == CrashKind::Panic {
@@ -611,6 +622,31 @@ mod tests {
         // An oops header without printk times, which the parser splits the same way.
         assert!(l.feed(&netconsole(4000, "Oops: 0000 [#1] PREEMPT SMP")).is_empty());
         assert_eq!(l.tick(4200)[0].data["kind"], "kernel oops");
+    }
+
+    #[test]
+    fn kernel_lines_sent_both_ways_are_kept_once() {
+        let mut l = LogEvents::default();
+        // Syslog's copy of the oops comes first, then netconsole's, then the rest both ways.
+        let both = |l: &mut LogEvents, ts: Ts, msg: &str| {
+            let mut f = l.feed(&line(ts, "kernel", msg));
+            f.extend(l.feed(&netconsole(ts, msg)));
+            f
+        };
+        assert!(both(&mut l, 0, "[ 1234.567890] Internal error: Oops: 17 [#1] SMP ARM").is_empty());
+        assert!(both(&mut l, 0, "[ 1234.567900] CPU: 1 PID: 0 Comm: swapper/1 Not tainted").is_empty());
+        // Other programs' lines come by syslog only, and are kept.
+        assert!(l.feed(&line(0, "mcad", "restarting")).is_empty());
+        let f = both(&mut l, 1, "[ 1234.568000] Kernel panic - not syncing: Fatal exception in interrupt");
+        assert_eq!((f.len(), f[0].data["kind"].as_str()), (1, Some("kernel panic")), "reported once, at netconsole's line");
+        let lines: Vec<&str> = f[0].data["lines"].as_array().unwrap().iter().filter_map(Value::as_str).collect();
+        assert_eq!(lines, [
+            "kernel: [ 1234.567890] Internal error: Oops: 17 [#1] SMP ARM",
+            "[ 1234.567890] Internal error: Oops: 17 [#1] SMP ARM",
+            "[ 1234.567900] CPU: 1 PID: 0 Comm: swapper/1 Not tainted",
+            "mcad: restarting",
+            "[ 1234.568000] Kernel panic - not syncing: Fatal exception in interrupt",
+        ]);
     }
 
     #[test]
