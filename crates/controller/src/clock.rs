@@ -56,6 +56,12 @@ fn offset(s: &str) -> (Option<i64>, &str) {
     (hms(&s[..end]), &s[end..])
 }
 
+/// The day of the week of a day number (days since 1970-01-01), Sunday = 0
+/// as in POSIX rules: 1970-01-01 was a Thursday.
+pub fn weekday(day: i64) -> i64 {
+    (day + 4).rem_euclid(7)
+}
+
 /// A change rule, `Mm.w.d` (day d of week w of month m), `Jn` (day n of
 /// 1..=365, never counting February 29) or `n` (day n of 0..=365), with an
 /// optional `/time`: the local day number of the change and its time, in
@@ -68,7 +74,7 @@ fn rule_day(rule: &str, year: i64) -> Option<(i64, i64)> {
         let mut parts = mwd.split('.');
         let (m, w, d) = (num(parts.next()?, 1..=12)?, num(parts.next()?, 1..=5)?, num(parts.next()?, 0..=6)?);
         let first = days_from_civil(year, m, 1);
-        let first_wd = (first + 4).rem_euclid(7); // 1970-01-01 was a Thursday
+        let first_wd = weekday(first);
         let mut day = 1 + (d - first_wd).rem_euclid(7) + (w - 1) * 7;
         while day > days_in_month(year, m) {
             day -= 7;
@@ -124,6 +130,13 @@ mod tests {
 
     fn ts(y: i64, m: i64, d: i64, h: i64, min: i64) -> Ts {
         days_from_civil(y, m, d) * 86400 + h * 3600 + min * 60
+    }
+
+    #[test]
+    fn weekdays_count_from_sunday() {
+        assert_eq!(weekday(0), 4, "1970-01-01, a Thursday");
+        assert_eq!(weekday(-1), 3);
+        assert_eq!(weekday(days_from_civil(2026, 10, 25)), 0, "a Sunday");
     }
 
     #[test]

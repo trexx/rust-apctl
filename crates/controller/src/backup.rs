@@ -974,8 +974,8 @@ impl Settings {
     /// Whether a backup is scheduled on this day (days since 1970-01-01, UTC).
     fn runs_on(&self, day: Ts) -> bool {
         match self.frequency {
-            // 1970-01-01 was a Thursday (weekday 3 with Monday = 0).
-            Frequency::Weekly => (day + 3).rem_euclid(7) == Ts::from(self.weekday),
+            // The setting counts from Monday = 0.
+            Frequency::Weekly => (crate::clock::weekday(day) + 6) % 7 == Ts::from(self.weekday),
             Frequency::Monthly => crate::clock::civil_from_days(day).2 == i64::from(self.monthday),
             Frequency::Daily => true,
         }
