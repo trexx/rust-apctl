@@ -367,6 +367,8 @@ pub struct Snapshot {
     /// says nothing about whether they are still connected. Only notifications
     /// (which are not parsed) have been seen without one. An empty table is a
     /// report like any other: an AP with every network off has no clients.
+    /// The engine's alone: not sent with the AP.
+    #[serde(skip_serializing)]
     pub has_vap_table: bool,
 }
 

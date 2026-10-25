@@ -692,7 +692,7 @@ mod tests {
         // The AP's last full inform arrived at `at`.
         let heard = |live: &mut Live, at: Ts| {
             let snapshot = crate::model::parse(at, &inform(0, None)).unwrap();
-            let d = crate::engine::DeviceView { snapshot, online: true, first_seen: 0, last_seen: at, peer: None, interval: 10, last_full_inform: at, last_config_push: None };
+            let d = crate::engine::DeviceView { snapshot, online: true, first_seen: 0, last_seen: at, interval: 10, last_full_inform: at, last_config_push: None };
             live.devices.insert(ap, d);
         };
         heard(&mut live, 995);

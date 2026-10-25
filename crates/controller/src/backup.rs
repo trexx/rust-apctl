@@ -93,16 +93,20 @@ impl Backups {
     }
 
     /// When the newest automatic backup was made (0: none), deleted since or
-    /// not: what [`LAST_AUTO`] says, or the newest one listed if newer.
+    /// not: what [`LAST_AUTO`] says, or the newest one listed if newer. A time
+    /// ahead of the clock (one set ahead once, then put right) counts for
+    /// none: the schedule would wait for it to come, making no backup.
     fn last_auto(&self) -> Ts {
-        if let Some(t) = self.known().last_auto {
+        let now = clock::now_ts();
+        let past = |t: &Ts| *t <= now;
+        if let Some(t) = self.known().last_auto.filter(past) {
             return t;
         }
-        let noted = fs::read_to_string(self.dir().join(LAST_AUTO)).ok().and_then(|t| t.trim().parse().ok()).unwrap_or(0);
-        let found = list(self).iter().filter(|m| m.kind == Kind::Auto).map(|m| m.created).fold(noted, Ts::max);
+        let noted = fs::read_to_string(self.dir().join(LAST_AUTO)).ok().and_then(|t| t.trim().parse().ok()).filter(past).unwrap_or(0);
+        let found = list(self).iter().filter(|m| m.kind == Kind::Auto).map(|m| m.created).filter(past).fold(noted, Ts::max);
         // One made meanwhile is the newest.
         let mut k = self.known();
-        let t = k.last_auto.map_or(found, |t| t.max(found));
+        let t = k.last_auto.filter(past).map_or(found, |t| t.max(found));
         k.last_auto = Some(t);
         t
     }
@@ -590,15 +594,14 @@ fn create_of(b: &Backups, src_dir: &Path, kind: Kind, days: i64, names: &[&str])
         f.sync_all()?;
         fs::rename(tmp.join("meta.json"), dir.join(format!("{name}.json")))?;
         fs::rename(&part, dir.join(&name))?;
-        if kind == Kind::Auto
-            && let Err(e) = write_synced(&dir.join(LAST_AUTO), now.to_string().as_bytes())
-        {
-            tracing::warn!("cannot note when the automatic backup was made: {e:#}");
-        }
         sync_dir(&dir)?;
+        // Noted once the backup is there for good: a failed one is not taken for made. Only
+        // the schedule makes automatic backups (one at a time, under CREATING): this is the newest.
         if kind == Kind::Auto {
-            let mut k = b.known();
-            k.last_auto = Some(k.last_auto.map_or(now, |t| t.max(now)));
+            if let Err(e) = write_synced(&dir.join(LAST_AUTO), now.to_string().as_bytes()).and_then(|()| sync_dir(&dir)) {
+                tracing::warn!("cannot note when the automatic backup was made: {e:#}");
+            }
+            b.known().last_auto = Some(now);
         }
         Ok(meta)
     })();
@@ -1637,6 +1640,12 @@ mod tests {
         remove(&b, &m.name);
         let again = Backups::new(src.to_path_buf(), None);
         assert_eq!(again.last_auto(), m.created);
+        // A time ahead of the clock (set ahead once, then put right) is no backup made, noted or kept.
+        let ahead = Backups::new(src.to_path_buf(), None);
+        fs::write(b.dir().join(LAST_AUTO), (clock::now_ts() + 86400).to_string()).unwrap();
+        assert_eq!(ahead.last_auto(), 0);
+        ahead.known().last_auto = Some(clock::now_ts() + 86400);
+        assert_eq!(ahead.last_auto(), 0, "read again");
         clean_unfinished(&again);
         assert!(b.dir().join(LAST_AUTO).exists(), "no leftover of an unfinished backup");
         assert_eq!(list(&again).iter().map(|m| m.kind).collect::<Vec<_>>(), [Kind::Manual], "nor a backup");

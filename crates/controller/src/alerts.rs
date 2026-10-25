@@ -1116,9 +1116,7 @@ mod tests {
         let (w, mut rx, _dir) = watcher();
         let ap: Mac = "02:00:00:00:00:01".parse().unwrap();
         let live: SharedLive = Default::default();
-        let known = crate::engine::KnownDevice {
-            first_seen: 0, last_seen: 1000, uptime: None, version: None, hostname: None, model: None, model_display: None, ip: None, serial: None, offline: false,
-        };
+        let known = crate::engine::KnownDevice { last_seen: 1000, ..Default::default() };
         live.write().unwrap().known_devices.insert(ap, known);
         // apctl was away for an hour: the first check, 90 s in, does not call it offline yet.
         let mut again = Watcher::start(w.store.clone(), w.book.writer.clone(), live, w.book.tx.clone(), 4600).await;
@@ -1139,9 +1137,7 @@ mod tests {
         w.book.open(90_000, Alert::for_device(Key::ApOffline, Category::ApStatus, Severity::High, ap, "t".into(), "m".into()));
         flushed(&w.book.writer);
         let live: SharedLive = Default::default();
-        let known = crate::engine::KnownDevice {
-            first_seen: 0, last_seen: 1000, uptime: None, version: None, hostname: None, model: None, model_display: None, ip: None, serial: None, offline: true,
-        };
+        let known = crate::engine::KnownDevice { last_seen: 1000, offline: true, ..Default::default() };
         live.write().unwrap().known_devices.insert(ap, known);
         let again = Watcher::start(w.store.clone(), w.book.writer.clone(), live, broadcast::channel(4).0, 91_000).await;
         assert_eq!(again.aps.down.get(&ap), Some(&1000));
@@ -1154,9 +1150,7 @@ mod tests {
     async fn an_ap_not_heard_from_since_startup_is_named_by_its_stored_hostname() {
         let (mut w, mut rx, _dir) = watcher();
         let ap: Mac = "02:00:00:00:00:01".parse().unwrap();
-        let known = crate::engine::KnownDevice {
-            first_seen: 0, last_seen: 1000, uptime: None, version: None, hostname: Some("Garage".into()), model: None, model_display: None, ip: None, serial: None, offline: false,
-        };
+        let known = crate::engine::KnownDevice { last_seen: 1000, hostname: Some("Garage".into()), ..Default::default() };
         w.live.write().unwrap().known_devices.insert(ap, known);
         w.status_tick(1000 + OFFLINE_AFTER);
         assert_eq!(told(&mut rx), [("raised", "ap_offline")]);
@@ -1167,9 +1161,7 @@ mod tests {
     async fn a_forgotten_ap_is_forgotten_even_when_its_drop_was_not_reported() {
         let (mut w, mut rx, _dir) = watcher();
         let ap: Mac = "02:00:00:00:00:01".parse().unwrap();
-        let known = crate::engine::KnownDevice {
-            first_seen: 0, last_seen: 1000, uptime: None, version: None, hostname: None, model: None, model_display: None, ip: None, serial: None, offline: false,
-        };
+        let known = crate::engine::KnownDevice { last_seen: 1000, ..Default::default() };
         w.live.write().unwrap().known_devices.insert(ap, known);
         // Past the day's limit, and "keeps dropping off" already sent today: no alert, but it counts as down.
         let now = 1000 + OFFLINE_AFTER;

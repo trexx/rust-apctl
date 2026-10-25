@@ -17,8 +17,6 @@
 //! All of this needs active mode: in shadow mode apctl never answers the APs,
 //! and changing settings there would only diverge from the other controller.
 
-use std::collections::HashMap;
-
 use axum::extract::State;
 use inform::Mac;
 use serde::{Deserialize, Serialize};
@@ -147,32 +145,9 @@ impl<'a> Controls<'a> {
     }
 }
 
-/// One client's controls, from the site's entry. For many clients,
-/// `ClientControls` looks each one up without scanning the settings' client
-/// list every time.
+/// One client's controls, from the site's entry.
 pub fn controls<'a>(state: Option<&'a Value>, mac: &Mac) -> Controls<'a> {
     Controls::of(state.and_then(|s| crate::settings::docs(s, "clients").find(|c| doc_mac(&c["mac"]) == Some(*mac))))
-}
-
-/// The settings' client entries by MAC, built once for a list of clients.
-pub struct ClientControls<'a>(HashMap<Mac, &'a Value>);
-
-impl<'a> ClientControls<'a> {
-    pub fn new(state: Option<&'a Value>) -> Self {
-        let mut map = HashMap::new();
-        for c in state.into_iter().flat_map(|s| crate::settings::docs(s, "clients")) {
-            // The first entry for a MAC wins, as with a scan of the list.
-            if let Some(m) = doc_mac(&c["mac"]) {
-                map.entry(m).or_insert(c);
-            }
-        }
-        ClientControls(map)
-    }
-
-    /// `controls` for one client.
-    pub fn get(&self, mac: &Mac) -> Controls<'a> {
-        Controls::of(self.0.get(mac).copied())
-    }
 }
 
 /// Whether a device action can be done: active mode, and an AP apctl has heard from.
@@ -425,10 +400,6 @@ mod tests {
         let c = controls(Some(&state), &mac("AA:BB:CC:00:00:02"));
         assert_eq!((c.blocked, c.locked_to.as_deref()), (false, Some("02:00:00:00:00:01")));
         assert_eq!(serde_json::to_value(controls(Some(&state), &mac("aa:bb:cc:00:00:01"))).unwrap(), json!({ "blocked": true, "locked_to": null, "usergroup_id": null }));
-        let all = ClientControls::new(Some(&state));
-        for m in ["aa:bb:cc:00:00:01", "AA:BB:CC:00:00:02", "aa:bb:cc:00:00:03"] {
-            assert_eq!(controls(Some(&state), &mac(m)), all.get(&mac(m)), "{m}");
-        }
         // An entry that writes its MAC another way is the one edited, as the one shown.
         let mut state = json!({ "clients": [{ "mac": "AA-BB-CC-00-00-04" }, { "mac": "aabbcc000005" }] });
         edit_client(&mut state, mac("aa:bb:cc:00:00:04"), &[("blocked", json!(true))]);

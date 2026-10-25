@@ -14,7 +14,7 @@
 //! - crashes, as the official controller detects them in netconsole output:
 //!   kernel oopses and panics, and processes killed by faults.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 
 use inform::Mac;
 use serde_json::{Value, json};
@@ -122,18 +122,57 @@ struct Crash {
     /// Set at the first line that did not fit: later ones are not kept (nor
     /// formatted), so the capture has no holes.
     full: bool,
-    /// Set at the first netconsole line. The kernel's lines then come twice (an
-    /// AP sending syslog to this controller sends netconsole to it as well), and
-    /// only netconsole's are kept.
-    netconsole: bool,
+    /// The kernel's lines kept that have come only one way so far, by way
+    /// (syslog, netconsole), each as netconsole's copy reads (see [`Way`]).
+    /// An AP sending syslog to this controller may send netconsole to it as
+    /// well: a kernel line that already came the other way is a copy.
+    one_way: [VecDeque<String>; 2],
+}
+
+/// How a kernel line came: by syslog (with a priority), or by netconsole
+/// (without), with its text as netconsole's copy of it reads once parsed.
+enum Way {
+    Syslog(String),
+    Netconsole(String),
+}
+
+impl Way {
+    /// A kernel syslog line's text (`msg`, the kernel's as it printed it) as
+    /// netconsole's copy reads: parsed the same way, which may take its first
+    /// word for a program and drop that word's PID.
+    fn of_syslog(msg: &str) -> Way {
+        let l = crate::syslog::parse(0, "", None, msg);
+        Way::Syslog(match l.program {
+            Some(p) => format!("{p}: {}", l.msg),
+            None => l.msg,
+        })
+    }
 }
 
 impl Crash {
-    fn push(&mut self, line: impl FnOnce() -> String) {
+    /// Whether a kernel line is the copy of one that came the other way (which
+    /// it then consumes); else it is noted as having come its own way.
+    fn is_copy(&mut self, way: Way) -> bool {
+        let [syslog, netconsole] = &mut self.one_way;
+        let (own, other, text) = match way {
+            Way::Syslog(t) => (syslog, netconsole, t),
+            Way::Netconsole(t) => (netconsole, syslog, t),
+        };
+        if let Some(i) = other.iter().position(|t| *t == text) {
+            other.remove(i);
+            return true;
+        }
+        if own.len() == CRASH_LINES {
+            own.pop_front();
+        }
+        own.push_back(text);
+        false
+    }
+
+    fn push(&mut self, line: String) {
         if self.full {
             return;
         }
-        let line = line();
         if self.lines.len() < CRASH_LINES && self.bytes + line.len() <= CRASH_BYTES {
             self.bytes += line.len();
             self.lines.push(line);
@@ -351,13 +390,15 @@ impl LogEvents {
     /// Returns whether the line was a fault.
     fn crash(&mut self, dev: Mac, line: &LogLine, out: &mut Vec<Event>) -> bool {
         let (msg, prog) = (line.msg.as_str(), line.program.as_deref());
-        let text = || prog.map_or_else(|| msg.to_string(), |p| format!("{p}: {msg}"));
+        let netconsole = line.facility.is_none();
+        let kernel = netconsole || prog == Some("kernel") || line.facility == Some(0);
+        // Netconsole sends the kernel's lines with no priority, and the parser may
+        // have taken their first word for a program (`mcad[1234]: unhandled ...`,
+        // `Oops: ...`): such a line is read as sent, joined again.
+        let joined = prog.filter(|_| netconsole).map(|p| format!("{p}: {msg}"));
         let fault = match (prog, line.facility) {
-            // Netconsole sends the kernel's lines with no priority, and the parser
-            // may have taken their first word for a program (`mcad[1234]: unhandled
-            // ...`, `Oops: ...`): such a line is read as sent, and a memory fault
-            // whose name went with its PID is the program's.
-            (_, None) => fault(&text()).map(|(kind, name)| {
+            // A memory fault whose name went with its PID is the program's.
+            (_, None) => fault(joined.as_deref().unwrap_or(msg)).map(|(kind, name)| {
                 let program = prog.filter(|&p| kind == CrashKind::MemoryFault && p != "kernel").map(str::to_string);
                 (kind, name.or(program))
             }),
@@ -365,24 +406,32 @@ impl LogEvents {
             _ => None,
         };
         let is_fault = fault.is_some();
+        // The line as a capture keeps it, and how it came if it is the kernel's.
+        let text = |joined: Option<String>| joined.unwrap_or_else(|| prog.map_or_else(|| msg.to_string(), |p| format!("{p}: {msg}")));
+        let way = |text: &String| if netconsole { Way::Netconsole(text.clone()) } else { Way::of_syslog(msg) };
         if let Some(c) = self.crashes.get_mut(&dev) {
-            c.netconsole |= line.facility.is_none();
-            let copy = c.netconsole && line.facility.is_some() && (prog == Some("kernel") || line.facility == Some(0));
+            if !c.full {
+                let text = text(joined);
+                if kernel && c.is_copy(way(&text)) {
+                    return is_fault;
+                }
+                c.push(text);
+            }
+            // A panic is reported at once (at whichever copy came first).
             if let Some((CrashKind::Panic, _)) = fault {
                 c.kind = CrashKind::Panic;
             }
-            // A panic is reported at once; one in a copy, with netconsole's line.
-            if !copy {
-                c.push(text);
-                if c.kind == CrashKind::Panic {
-                    out.extend(self.flush(dev, line.ts));
-                }
+            if c.kind == CrashKind::Panic {
+                out.extend(self.flush(dev, line.ts));
             }
         } else if let Some((kind, process)) = fault
             && self.crash_reported.get(&dev).is_none_or(|t| !(0..CRASH_COOLDOWN).contains(&(line.ts - t)))
             && self.crashes.len() < MAX_CRASHES
         {
-            let mut crash = Crash { started: line.ts, kind, process, lines: Vec::new(), bytes: 0, full: false, netconsole: line.facility.is_none() };
+            let mut crash = Crash { started: line.ts, kind, process, lines: Vec::new(), bytes: 0, full: false, one_way: Default::default() };
+            let text = text(joined);
+            // A fault is always the kernel's (see `fault` above): its copy may follow.
+            crash.is_copy(way(&text));
             crash.push(text);
             self.crashes.insert(dev, crash);
             if kind == CrashKind::Panic {
@@ -642,10 +691,36 @@ mod tests {
         let lines: Vec<&str> = f[0].data["lines"].as_array().unwrap().iter().filter_map(Value::as_str).collect();
         assert_eq!(lines, [
             "kernel: [ 1234.567890] Internal error: Oops: 17 [#1] SMP ARM",
-            "[ 1234.567890] Internal error: Oops: 17 [#1] SMP ARM",
-            "[ 1234.567900] CPU: 1 PID: 0 Comm: swapper/1 Not tainted",
+            "kernel: [ 1234.567900] CPU: 1 PID: 0 Comm: swapper/1 Not tainted",
             "mcad: restarting",
-            "[ 1234.568000] Kernel panic - not syncing: Fatal exception in interrupt",
+            "kernel: [ 1234.568000] Kernel panic - not syncing: Fatal exception in interrupt",
+        ], "the copy that came first, of each");
+        // Netconsole's first, then syslog's, with lines that came one way only: each kept once, in the order it came.
+        let mut l = LogEvents::default();
+        let way = |l: &mut LogEvents, ts: Ts, netconsole_first: bool, msg: &str| {
+            if netconsole_first {
+                assert!(l.feed(&netconsole(ts, msg)).is_empty());
+            } else {
+                assert!(l.feed(&line(ts, "kernel", msg)).is_empty());
+            }
+        };
+        way(&mut l, 100, true, "mcad[1234]: unhandled level 2 translation fault (11) at 0x00000000, esr 0x92000006");
+        way(&mut l, 100, true, "[ 99.000001] CPU: 1 PID: 1234 Comm: mcad Not tainted");
+        way(&mut l, 100, false, "mcad[1234]: unhandled level 2 translation fault (11) at 0x00000000, esr 0x92000006");
+        // Below the console's level: by syslog only, and kept.
+        way(&mut l, 101, false, "[ 99.000002] wlan: debug only");
+        way(&mut l, 101, false, "[ 99.000001] CPU: 1 PID: 1234 Comm: mcad Not tainted");
+        // A continuation line of a syslog datagram has no priority either: kept, and it doesn't drop syslog's kernel lines.
+        assert!(l.feed(&netconsole(101, "  continued")).is_empty());
+        way(&mut l, 102, false, "[ 99.000003] Code: e59f0010");
+        let f = l.tick(1000);
+        let lines: Vec<&str> = f[0].data["lines"].as_array().unwrap().iter().filter_map(Value::as_str).collect();
+        assert_eq!(lines, [
+            "mcad: unhandled level 2 translation fault (11) at 0x00000000, esr 0x92000006",
+            "[ 99.000001] CPU: 1 PID: 1234 Comm: mcad Not tainted",
+            "kernel: [ 99.000002] wlan: debug only",
+            "continued",
+            "kernel: [ 99.000003] Code: e59f0010",
         ]);
     }
 
