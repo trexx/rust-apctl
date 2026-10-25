@@ -6,8 +6,8 @@
 //!   succeeded unless it is a failure, when it was a roam (soft failure with
 //!   an IP kept by roaming), saw traffic and DNS answers, or (older firmware)
 //!   saw a DNS response. A failure is placed at the furthest stage any of its
-//!   failure counters belongs to; failures on a signal below -75 dBm are left
-//!   out. A later `fixup` for the same client, AP, network and event id
+//!   failure counters belongs to; failures on a signal below -75 dBm, or with
+//!   no signal reported, are left out. A later `fixup` for the same client, AP, network and event id
 //!   (within 20 minutes) merges into the attempt, which then succeeded if
 //!   either part did.
 //! - Timings come from the cumulative microsecond deltas: association, then
@@ -201,9 +201,10 @@ fn rssi(n: &ConnDetail) -> Option<f64> {
 }
 
 /// The furthest failure an attempt that did not succeed is counted with:
-/// none if it shows none, or was made at a weak signal.
+/// none if it shows none, or was made at a weak signal or at none reported
+/// (the official controller drops the failure counters of both).
 fn counted_failure(n: &ConnDetail) -> Option<(usize, &'static str)> {
-    if rssi(n).is_some_and(|r| r < WEAK_SIGNAL as f64) { None } else { failure(n) }
+    if rssi(n).is_none_or(|r| r < WEAK_SIGNAL as f64) { None } else { failure(n) }
 }
 
 /// A failure or success report as it comes in, by the connection views' rules:
@@ -217,9 +218,9 @@ pub(crate) fn reported_failure(event_type: Report, n: &ConnDetail) -> Option<&'s
     counted_failure(n).map(|(_, label)| label)
 }
 
-/// A soft failure that kept its IP by roaming.
+/// A soft failure that kept its IP by roaming: `ip_assign_type` exactly "roam", as the official controller reads it.
 fn roamed(event_type: Report, n: &ConnDetail) -> bool {
-    event_type == Report::SoftFailure && text(&n.ip_assign_type).is_some_and(|v| v.starts_with("roam"))
+    event_type == Report::SoftFailure && text(&n.ip_assign_type) == Some("roam")
 }
 
 fn succeeded(event_type: Report, n: &ConnDetail) -> bool {
@@ -883,7 +884,7 @@ mod tests {
             // b: failed at DNS only.
             conn(10, "b", "ap", "failure", json!({ "dns_timeouts": 2, "auth_rssi": -60 })),
             // c: a roam reported as a soft failure is a success.
-            conn(10, "c", "ap", "soft failure", json!({ "ip_assign_type": "roamed" })),
+            conn(10, "c", "ap", "soft failure", json!({ "ip_assign_type": "roam" })),
             // d: failed authentication on a weak signal: not the network's fault, ignored.
             conn(10, "d", "ap", "failure", json!({ "auth_failures": 1, "auth_rssi": -82 })),
             // e: association events are not attempts.
@@ -1004,6 +1005,22 @@ mod tests {
     }
 
     #[test]
+    fn a_failure_needs_a_fair_signal_reported_and_a_roam_says_exactly_roam() {
+        let soft = |client: &str, how: &str| conn(10, client, "ap", "soft failure", json!({ "ip_assign_type": how, "ip_failures": 1, "auth_rssi": -60 }));
+        let events = vec![
+            // No signal reported: dropped, as on a weak one.
+            conn(10, "f", "ap", "failure", json!({ "ip_failures": 1 })),
+            conn(10, "g", "ap", "failure", json!({ "ip_failures": 1, "avg_rssi": -70 })),
+            soft("r", "roam"),
+            soft("s", "roamed"),
+        ];
+        let list = attempts(events);
+        let got: Vec<_> = list.iter().map(|a| (a.client.as_str(), a.success, a.roam, a.failure)).collect();
+        assert_eq!(got, [("g", false, false, Some("DHCP timeout")), ("r", true, true, None), ("s", false, false, Some("DHCP timeout"))]);
+        assert_eq!(reported_failure(Report::Failure, &serde_json::from_value(json!({ "ip_failures": 1 })).unwrap()), None);
+    }
+
+    #[test]
     fn roam_totals_count_successes_and_fast_roams() {
         let end = |ap: &str| RoamEnd { ap: ap.into(), essid: None, radio: None, channel: None, bw: None, rssi: None };
         let roam = |success, fast| Roam { ts: 1, client: "c".into(), from: end("a"), to: end("b"), success, gap_s: None, fast, min_rssi: false, assistant: false };
@@ -1097,10 +1114,10 @@ mod tests {
                 3 => ("sta_leave", json!({ "avg_rssi": -78 })),
                 4 => ("association", json!({ "auth_rssi": -50 })),
                 5 => ("success", json!({ "traffic_delta": 120000, "dns_responses": 0, "dns_timeouts": 2, "auth_rssi": -58 })),
-                _ => ("soft failure", json!({ "ip_assign_type": "roamed" })),
+                _ => ("soft failure", json!({ "ip_assign_type": "roam" })),
             };
             let detail = if i < 300 { None } else { Some(detail.to_string()) };
-            c.execute(sql, rusqlite::params![ts, ap, client, kind, "roamed", -70, detail]).unwrap();
+            c.execute(sql, rusqlite::params![ts, ap, client, kind, "roam", -70, detail]).unwrap();
         }
         c.execute_batch("COMMIT").unwrap();
         let (from, to) = (1_000_000 + 3600, 1_000_000 + 12_000 * 7);
