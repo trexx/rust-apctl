@@ -553,7 +553,7 @@ pub fn roam_pairs(roams: &[Roam]) -> Vec<Value> {
             let ok = ab.successes + ba.successes;
             let mut top: Vec<(&str, u64)> = clients.into_iter().collect();
             top.sort_by(|x, y| y.1.cmp(&x.1).then(x.0.cmp(y.0)));
-            top.truncate(10);
+            top.truncate(TOP_CLIENTS_LISTED);
             json!({
                 "ap_1": a, "ap_2": b, "attempts": attempts, "successes": ok,
                 "success_pct": if attempts > 0 { (100.0 * ok as f64 / attempts as f64).round() } else { 0.0 },
@@ -564,29 +564,39 @@ pub fn roam_pairs(roams: &[Roam]) -> Vec<Value> {
         .collect()
 }
 
-/// Per client: roams, failures, the signal it left at, and (apctl's own
-/// measures, not in the official controller) roams to a clearly weaker AP
-/// and quick returns to the AP it just left ("ping-pong").
-pub fn roam_clients(roams: &[Roam]) -> Vec<Value> {
+/// A client's roams (see [`roam_clients`]). In alphabetical order, as `json!` writes keys.
+#[derive(Debug, Serialize)]
+pub struct RoamClient {
+    pub avg_leave_rssi: Option<f64>,
+    pub failed: usize,
+    pub fast: usize,
+    pub mac: String,
+    pub quick_returns: usize,
+    pub roams: usize,
+    pub to_weaker: usize,
+}
+
+/// Per client, most roams first (by MAC among equals): roams, failures, the
+/// signal it left at, and (apctl's own measures, not in the official
+/// controller) roams to a clearly weaker AP and quick returns to the AP it
+/// just left ("ping-pong").
+pub fn roam_clients(roams: &[Roam]) -> Vec<RoamClient> {
     let mut per: BTreeMap<&str, Vec<&Roam>> = BTreeMap::new();
     for r in roams {
         per.entry(&r.client).or_default().push(r);
     }
-    // Most roams first (by MAC among equals).
     let mut per: Vec<(&str, Vec<&Roam>)> = per.into_iter().collect();
     per.sort_by_key(|(_, rs)| std::cmp::Reverse(rs.len()));
     per.into_iter()
         .map(|(c, mut rs)| {
             rs.sort_by_key(|r| r.ts);
             let sig: Vec<f64> = rs.iter().filter_map(|r| r.from.rssi).collect();
-            let weaker = rs.iter().filter(|r| matches!((r.from.rssi, r.to.rssi), (Some(f), Some(t)) if t < f - 3.0)).count();
-            let back = rs.windows(2).filter(|w| w[1].to.ap == w[0].from.ap && w[1].ts - w[0].ts <= 120).count();
-            json!({
-                "mac": c, "roams": rs.len(), "failed": rs.iter().filter(|r| !r.success).count(),
-                "fast": rs.iter().filter(|r| r.fast).count(),
-                "avg_leave_rssi": (!sig.is_empty()).then(|| (sig.iter().sum::<f64>() / sig.len() as f64).round()),
-                "to_weaker": weaker, "quick_returns": back,
-            })
+            RoamClient {
+                mac: c.to_string(), roams: rs.len(), failed: rs.iter().filter(|r| !r.success).count(), fast: rs.iter().filter(|r| r.fast).count(),
+                avg_leave_rssi: (!sig.is_empty()).then(|| (sig.iter().sum::<f64>() / sig.len() as f64).round()),
+                to_weaker: rs.iter().filter(|r| matches!((r.from.rssi, r.to.rssi), (Some(f), Some(t)) if t < f - 3.0)).count(),
+                quick_returns: rs.windows(2).filter(|w| w[1].to.ap == w[0].from.ap && w[1].ts - w[0].ts <= 120).count(),
+            }
         })
         .collect()
 }
@@ -761,9 +771,14 @@ pub async fn list(State(s): State<AppState>, Query(q): Query<ListQuery>) -> Resu
     Ok(Json(json!({ "attempts": list, "roams": r, "ap_names": aps, "client_names": clients })))
 }
 
-/// Roams, successful ones and fast (802.11r) ones.
-fn roam_totals(roams: &[Roam]) -> Value {
-    json!({ "roams": roams.len(), "successes": roams.iter().filter(|r| r.success).count(), "fast": roams.iter().filter(|r| r.fast).count() })
+/// Roams, successful ones and fast (802.11r) ones; the clients that roamed (`clients`, from
+/// [`roam_clients`]), and their roams to a weaker AP and quick returns.
+fn roam_totals(roams: &[Roam], clients: &[RoamClient]) -> Value {
+    json!({
+        "roams": roams.len(), "successes": roams.iter().filter(|r| r.success).count(), "fast": roams.iter().filter(|r| r.fast).count(),
+        "clients": clients.len(), "to_weaker": clients.iter().map(|c| c.to_weaker).sum::<usize>(),
+        "quick_returns": clients.iter().map(|c| c.quick_returns).sum::<usize>(),
+    })
 }
 
 #[derive(Deserialize)]
@@ -777,42 +792,67 @@ pub struct RoamingQuery {
 
 /// The most roams `/api/roaming` lists.
 const ROAMS_LISTED: usize = 1000;
+/// The clients `/api/roaming` lists: those with the most roams (the totals count them all).
+const CLIENTS_LISTED: usize = 10;
+/// The clients with the most roams it lists for each pair of APs.
+const TOP_CLIENTS_LISTED: usize = 3;
 
-/// GET /api/roaming: the newest roams in the window (default two days), with
-/// totals, per-AP-pair and per-client figures over all of them.
+/// GET /api/roaming: the newest roams in the window (default two days), with totals and
+/// per-AP-pair figures over all of them, and the clients with the most roams.
 pub async fn roaming(State(s): State<AppState>, Query(q): Query<RoamingQuery>) -> Result<Response, ApiError> {
     let range = RangeQuery { range: q.range.or(Some(2 * 86400)), from: q.from, to: q.to, ..Default::default() };
     let (from, to, tier) = window(&range);
-    // The newest roams that may be listed, the figures over all of them, and the stored names
-    // and the APs and clients of all of them (the figures name them too), reused for a while.
-    let got = memo_read(&s, Db::Config, "roaming", &range, tier, move |c| {
-        let mut r = roams(&roam_rows(c, from, to, None)?);
-        let figures = (roam_totals(&r), roam_pairs(&r), roam_clients(&r));
-        let (aps, clients) = macs_of(&[], &r);
-        let stored = stored_client_names(c, &clients)?;
-        let owned = |set: BTreeSet<&str>| -> Vec<String> { set.into_iter().map(str::to_string).collect() };
-        let macs = (owned(aps), owned(clients));
-        r.reverse();
-        r.truncate(ROAMS_LISTED);
-        Ok((r, figures, stored, macs))
-    })
-    .await?;
-    let (r, (total, pairs, clients), stored, (aps, client_macs)) = &*got;
-    let (ap_names, client_names) = names(stored, &s.live.read().unwrap(), aps.iter().map(String::as_str), client_macs.iter().map(String::as_str));
+    let got = memo_read(&s, Db::Config, "roaming", &range, tier, move |c| roaming_figures(c, roams(&roam_rows(c, from, to, None)?))).await?;
+    let RoamingFigures { roams, total, pairs, clients, stored, aps, named } = &*got;
+    let roams = &roams[..roams.len().min(q.limit.unwrap_or(100))];
+    // The clients shown: the listed ones, each pair's top ones and those of the roams listed.
+    let shown: BTreeSet<&str> = named.iter().map(String::as_str).chain(roams.iter().map(|r| r.client.as_str())).collect();
+    let (ap_names, client_names) = names(stored, &s.live.read().unwrap(), aps.iter().map(String::as_str), shown);
     /// The response, written out from the memoised parts as they are (keys in alphabetical order, as `json!` has them).
     #[derive(Serialize)]
     struct Out<'a> {
         ap_names: BTreeMap<String, String>,
         client_names: BTreeMap<String, String>,
-        clients: &'a [Value],
+        clients: &'a [RoamClient],
         from: Ts,
         pairs: &'a [Value],
         roams: &'a [Roam],
         to: Ts,
         total: &'a Value,
     }
-    let roams = &r[..r.len().min(q.limit.unwrap_or(100))];
     Ok(Json(Out { ap_names, client_names, clients, from, pairs, roams, to, total }).into_response())
+}
+
+/// What `/api/roaming` reuses for a while (see [`roaming_figures`]).
+struct RoamingFigures {
+    /// The newest roams that may be listed ([`ROAMS_LISTED`]), newest first.
+    roams: Vec<Roam>,
+    total: Value,
+    pairs: Vec<Value>,
+    /// The [`CLIENTS_LISTED`] clients with the most roams.
+    clients: Vec<RoamClient>,
+    /// The stored hostnames of the clients that may be named: of `named` and of `roams`.
+    stored: StoredNames,
+    /// The APs of every roam (the pairs name them all).
+    aps: Vec<String>,
+    /// The clients named whatever the roams listed: `clients` and the pairs' top clients.
+    named: Vec<String>,
+}
+
+/// The figures of these roams (oldest first) and what naming the listed ones needs.
+fn roaming_figures(c: &rusqlite::Connection, mut roams: Vec<Roam>) -> anyhow::Result<RoamingFigures> {
+    let mut clients = roam_clients(&roams);
+    let total = roam_totals(&roams, &clients);
+    clients.truncate(CLIENTS_LISTED);
+    let pairs = roam_pairs(&roams);
+    let aps = macs_of(&[], &roams).0.into_iter().map(str::to_string).collect();
+    roams.reverse();
+    roams.truncate(ROAMS_LISTED);
+    let tops = pairs.iter().flat_map(|p| p["top_clients"].as_array().into_iter().flatten().filter_map(|t| t["mac"].as_str()));
+    let named: BTreeSet<&str> = clients.iter().map(|c| c.mac.as_str()).chain(tops).collect();
+    let stored = stored_client_names(c, &named.iter().copied().chain(roams.iter().map(|r| r.client.as_str())).collect())?;
+    let named = named.into_iter().map(str::to_string).collect();
+    Ok(RoamingFigures { roams, total, pairs, clients, stored, aps, named })
 }
 
 #[cfg(test)]
@@ -967,8 +1007,29 @@ mod tests {
     fn roam_totals_count_successes_and_fast_roams() {
         let end = |ap: &str| RoamEnd { ap: ap.into(), essid: None, radio: None, channel: None, bw: None, rssi: None };
         let roam = |success, fast| Roam { ts: 1, client: "c".into(), from: end("a"), to: end("b"), success, gap_s: None, fast, min_rssi: false, assistant: false };
-        let t = roam_totals(&[roam(true, true), roam(true, false), roam(false, false)]);
-        assert_eq!(t, json!({ "roams": 3, "successes": 2, "fast": 1 }));
+        let r = [roam(true, true), roam(true, false), roam(false, false)];
+        let t = roam_totals(&r, &roam_clients(&r));
+        assert_eq!(t, json!({ "roams": 3, "successes": 2, "fast": 1, "clients": 1, "to_weaker": 0, "quick_returns": 0 }));
+    }
+
+    #[test]
+    fn roaming_lists_the_busiest_clients_and_totals_them_all() {
+        let t = TestStore::new("roaming");
+        let end = |ap: &str, rssi| RoamEnd { ap: ap.into(), essid: None, radio: None, channel: None, bw: None, rssi: Some(rssi) };
+        // Client i roams i + 1 times from A to B, each time to a weaker signal.
+        let mut r = Vec::new();
+        for i in 0..12 {
+            for k in 0..=i {
+                r.push(Roam { ts: 1000 * k + i, client: format!("c{i:02}"), from: end("A", -60.0), to: end("B", -70.0), success: true, gap_s: None, fast: false, min_rssi: false, assistant: false });
+            }
+        }
+        r.sort_by_key(|x| x.ts);
+        let f = t.store.read(Db::Config, |c| roaming_figures(c, r)).unwrap();
+        assert_eq!((&f.total["roams"], &f.total["clients"], &f.total["to_weaker"], &f.total["quick_returns"]), (&json!(78), &json!(12), &json!(78), &json!(0)));
+        assert_eq!(f.clients.iter().map(|c| c.mac.as_str()).collect::<Vec<_>>(), ["c11", "c10", "c09", "c08", "c07", "c06", "c05", "c04", "c03", "c02"]);
+        assert_eq!(f.pairs[0]["top_clients"], json!([{ "mac": "c11", "roams": 12 }, { "mac": "c10", "roams": 11 }, { "mac": "c09", "roams": 10 }]));
+        assert_eq!(f.named.len(), 10, "the listed clients, the top ones among them");
+        assert_eq!((f.aps.as_slice(), f.roams.len(), f.roams[0].ts), (["A".to_string(), "B".to_string()].as_slice(), 78, 11_011), "newest first");
     }
 
     #[test]
@@ -995,7 +1056,8 @@ mod tests {
         assert_eq!((p[0]["forward"]["attempts"].as_u64(), p[0]["backward"]["attempts"].as_u64()), (Some(1), Some(1)));
         // A -> B at -78 -> -55 (better), then B -> A 107 s later at -80 -> -60 (back to where it was).
         let c = roam_clients(&r);
-        assert_eq!((c[0]["roams"].as_u64(), c[0]["to_weaker"].as_u64(), c[0]["quick_returns"].as_u64()), (Some(2), Some(0), Some(1)));
+        assert_eq!((c[0].roams, c[0].to_weaker, c[0].quick_returns), (2, 0, 1));
+        assert_eq!(json!(c[0]), json!({ "mac": "c", "roams": 2, "failed": 1, "fast": 1, "avg_leave_rssi": -79.0, "to_weaker": 0, "quick_returns": 1 }));
     }
 
     #[test]
