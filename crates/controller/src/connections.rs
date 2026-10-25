@@ -206,11 +206,12 @@ fn counted_failure(n: &ConnDetail) -> Option<(usize, &'static str)> {
     if rssi(n).is_some_and(|r| r < WEAK_SIGNAL as f64) { None } else { failure(n) }
 }
 
-/// A failure report as it comes in, by the connection views' rules: the
-/// label of the failure they count it with, or none if they count it as a
-/// success or not at all. (A fixup that comes later can still make it a success.)
+/// A failure or success report as it comes in, by the connection views' rules:
+/// the label of the failure they count it with, or none if they count it as a
+/// success or not at all. (A fixup that comes later can still make a failure
+/// report a success; a fixup itself is left out, as it corrects an earlier one.)
 pub(crate) fn reported_failure(event_type: Report, n: &ConnDetail) -> Option<&'static str> {
-    if !event_type.is_failure() || succeeded(event_type, n) {
+    if !(event_type.is_failure() || event_type == Report::Success) || succeeded(event_type, n) {
         return None;
     }
     counted_failure(n).map(|(_, label)| label)
@@ -628,11 +629,10 @@ fn query_rows(c: &rusqlite::Connection, from: Ts, to: Ts, client: Option<&str>, 
     stmt.query_map(params.as_slice(), event_of)?.collect()
 }
 
-/// Only the reports [`attempts`] reads ([`ATTEMPT_TYPES`]).
+/// Only the reports [`attempts`] reads ([`ATTEMPT_TYPES`]). The failed attempts
+/// only need them all too: a `success` report may show a failure (DNS answers
+/// not seen) and is then one.
 const ATTEMPTS_ONLY: &str = "AND event_type IN ('failure', 'soft failure', 'success', 'fixup')";
-/// The same without the successes, for the failed attempts only: a success
-/// neither merges with a fixup nor is merged into, so it cannot make one.
-const FAILURES_ONLY: &str = "AND event_type IN ('failure', 'soft failure', 'fixup')";
 
 /// The reports [`attempts`] reads in a window (optionally one client's),
 /// oldest first; or with `newest`, at most that many, newest first.
@@ -663,9 +663,8 @@ fn roam_rows(c: &rusqlite::Connection, from: Ts, to: Ts, client: Option<&str>) -
 /// rarely holds `limit` of them, and the reports in between need not be read.
 fn newest(c: &rusqlite::Connection, from: Ts, to: Ts, client: Option<&str>, limit: usize, failed: bool, with_roams: bool) -> rusqlite::Result<(Vec<Attempt>, Vec<Roam>)> {
     let mut batch = (limit * 4).max(2000);
-    let reports = if failed { FAILURES_ONLY } else { ATTEMPTS_ONLY };
     let list = loop {
-        let mut events = query_rows(c, from, to, client, reports, Some(batch))?;
+        let mut events = query_rows(c, from, to, client, ATTEMPTS_ONLY, Some(batch))?;
         let all = events.len() < batch;
         // The oldest time read may have more rows than were read.
         let oldest = events.last().map_or(from, |e| e.ts);
@@ -874,8 +873,6 @@ mod tests {
     fn the_report_conditions_name_the_report_types() {
         let names = |types: &[Report]| types.iter().map(|t| Report::NAMES.iter().find(|(r, _)| r == t).unwrap().1).collect::<Vec<_>>().join("', '");
         assert_eq!(ATTEMPTS_ONLY, format!("AND event_type IN ('{}')", names(&ATTEMPT_TYPES)));
-        let failures: Vec<Report> = ATTEMPT_TYPES.into_iter().filter(|t| *t != Report::Success).collect();
-        assert_eq!(FAILURES_ONLY, format!("AND event_type IN ('{}')", names(&failures)));
         assert!(NEAR_A_LEAVE.ends_with(&format!("l.event_type IN ('{}'))", names(&LEAVE_TYPES))), "{NEAR_A_LEAVE}");
         for (r, name) in Report::NAMES {
             assert_eq!(Report::parse(name), r);
@@ -1017,8 +1014,8 @@ mod tests {
         let t = TestStore::new("connections");
         let c = t.db(Db::Config);
         // Five clients, one report every 7 s for a day: failures with their fixups up
-        // to 20 minutes later, successes, roams between two APs, and a few old rows
-        // without the full report.
+        // to 20 minutes later, successes (some showing a failure), roams between two
+        // APs, and a few old rows without the full report.
         let mut seed = 1u64;
         let mut rnd = |n: u64| {
             seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
@@ -1031,12 +1028,13 @@ mod tests {
             let client = format!("02:00:00:00:10:0{}", rnd(5));
             let ap = if rnd(2) == 0 { "02:00:00:00:00:a1" } else { "02:00:00:00:00:a2" };
             let id = i / 3;
-            let (kind, detail) = match rnd(6) {
+            let (kind, detail) = match rnd(7) {
                 0 => ("failure", json!({ "event_id": id, "dns_timeouts": 1, "auth_rssi": -60 })),
                 1 => ("fixup", json!({ "event_id": id - rnd(200) as i64, "dns_responses": 2, "traffic_delta": 9000 })),
                 2 => ("success", json!({ "traffic_delta": 120000, "dns_responses": 1, "auth_rssi": -55 })),
                 3 => ("sta_leave", json!({ "avg_rssi": -78 })),
                 4 => ("association", json!({ "auth_rssi": -50 })),
+                5 => ("success", json!({ "traffic_delta": 120000, "dns_responses": 0, "dns_timeouts": 2, "auth_rssi": -58 })),
                 _ => ("soft failure", json!({ "ip_assign_type": "roamed" })),
             };
             let detail = if i < 300 { None } else { Some(detail.to_string()) };

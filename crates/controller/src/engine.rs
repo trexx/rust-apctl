@@ -2867,13 +2867,16 @@ mod tests {
         let fine = json!({ "event_type": "soft failure", "dns_timeouts": "1", "traffic_delta": "300000", "dns_responses": "2", "auth_rssi": "-60" });
         h.engine.handle(Input::Inform { ts: 7, peer: [10, 0, 0, 1].into(), decoded: tracker(fine) });
         h.engine.handle(Input::Inform { ts: 7, peer: [10, 0, 0, 1].into(), decoded: tracker(json!({ "event_type": "failure", "wpa_auth_failures": "1", "auth_rssi": "-60" })) });
+        // A success report showing a failure is one too (older firmware: no traffic counter).
+        h.engine.handle(Input::Inform { ts: 7, peer: [10, 0, 0, 1].into(), decoded: tracker(json!({ "event_type": "success", "dns_resp_seen": "no", "auth_rssi": "-60" })) });
         h.engine.handle(Input::Inform { ts: 8, peer: [10, 0, 0, 1].into(), decoded: notif(AP1, "event", json!({ "event_string": "EVT_AP_RadarDetected", "channel": 52 })) });
         assert_eq!(
             events(&mut h),
-            vec![("config_applied", None), ("client_connect_failed", Some(C1.into())), ("dfs_radar", None)]
+            vec![("config_applied", None), ("client_connect_failed", Some(C1.into())), ("client_connect_failed", Some(C1.into())), ("dfs_radar", None)]
         );
         let failed = stored(&h, EventKind::ClientConnectFailed);
         assert_eq!((&failed[0]["reason"], &failed[0]["rssi"]), (&json!("WPA authentication"), &json!(-60.0)));
+        assert_eq!(failed[1]["reason"], "DNS response not seen");
         // One whose mac is not one is counted as undecodable.
         let mut bad = notif(AP1, "setparam", Value::Null);
         bad.payload["mac"] = json!("nope");
@@ -2882,7 +2885,7 @@ mod tests {
         let live = h.live.read().unwrap();
         assert_eq!(live.counters.decode_errors.load(Ordering::Relaxed), 1);
         assert!(live.clients[&C1.parse().unwrap()].connected);
-        assert_eq!(live.counters.notifications.load(Ordering::Relaxed), 6);
+        assert_eq!(live.counters.notifications.load(Ordering::Relaxed), 7);
         assert_eq!(live.devices[&AP1.parse().unwrap()].last_full_inform, 0, "notifications are not client lists");
     }
 
