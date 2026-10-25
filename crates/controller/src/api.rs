@@ -393,8 +393,6 @@ async fn status(State(s): State<AppState>) -> ApiResult {
         (live.counters.clone(), connected, weak, by_band)
     };
     Ok(Json(json!({
-        // No page shows it; kept for scripts and probes asking what runs.
-        "version": env!("CARGO_PKG_VERSION"),
         "mode": if s.active { "active" } else { "shadow" },
         "source": s.source,
         "started": s.started,
@@ -1412,6 +1410,7 @@ mod tests {
         let status = get_json(&app, "/api/status").await;
         assert_eq!((&status["clients_connected"], &status["clients_by_band"], &status["clients_weak"]), (&json!(1), &json!({ "na": 1 }), &json!(0)));
         assert_eq!(status["weak_signal_dbm"], -75, "the threshold the count uses, for its label");
+        assert_eq!(keys(&status), "clients_by_band,clients_connected,clients_weak,counters,mode,source,started,weak_signal_dbm", "what the pages read");
     }
 
     #[tokio::test]
