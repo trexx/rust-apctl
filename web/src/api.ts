@@ -65,9 +65,11 @@ export interface ClientSample {
   vlan_id: number | null;
   latency_avg: number | null;
   is_11r: boolean | null;
-  /** Only on a client's own page (`useClient`), not in the list or an AP's page. */
-  multicast?: Multicast | null;
+  multicast: Multicast | null;
 }
+
+/** A client's sample as the lists send it (the client list and an AP's page): the fields they show. */
+export type ListedSample = Pick<ClientSample, "mac" | "ap_mac" | "essid" | "radio" | "channel" | "hostname" | "ip" | "signal" | "tx_rate" | "rx_rate" | "uptime" | "wifi_gen" | "nss">;
 
 /** `tx` is what the AP delivered to the client, `rx` what the client sent. */
 export interface McastCounts {
@@ -93,9 +95,9 @@ export interface Multicast {
   delivery: "optimized" | "flooding" | null;
 }
 
-/** A client as an AP's page lists it: its latest sample (without the multicast tables), and when it was seen. */
+/** A client as an AP's page lists it: the listed fields of its latest sample, and when it was seen. */
 export interface ListedClientView {
-  sample: ClientSample;
+  sample: ListedSample;
   connected: boolean;
   first_seen: number;
   last_seen: number;
@@ -122,8 +124,9 @@ export interface ListedClient extends ClientView {
 /** A client in a multicast group, as a client's page lists its peers. */
 export type GroupMember = { mac: Mac; name: string };
 
-/** A client's page: its view, with the multicast tables and the peers in its groups. */
+/** A client's page: its view with its whole sample (the multicast tables too), and the peers in its groups. */
 export interface ClientDetail extends ClientView {
+  sample: ClientSample;
   /** For each group it joined, the other connected clients that joined it too (groups without any are left out). */
   peers: Record<string, GroupMember[]>;
 }
@@ -479,7 +482,7 @@ export const keys = {
   devices: family("devices"),
   deviceNames: family("device-names"),
   device: family<[mac: Mac]>("device"),
-  clients: family("clients"),
+  clients: family<[all: boolean]>("clients"),
   clientNames: family("client-names"),
   client: family<[mac: Mac]>("client"),
   series: family<[table: string, key: string, span: TimeSpan, fields: string]>("series"),
@@ -1094,8 +1097,16 @@ export const useDevices = () => useQuery({ queryKey: keys.devices(), queryFn: fe
 export const useDevice = (mac: Mac) =>
   useQuery({ queryKey: keys.device(mac), queryFn: getting<DeviceDetail>(`/api/devices/${mac}`) });
 
-/** Every client of the past year, with its latest sample: for the client list. */
-export const useClients = () => useQuery({ queryKey: keys.clients(), queryFn: getting<ListedClient[]>("/api/clients") });
+/**
+ * The client list: the connected clients, or with `all` every client of the past year. Switching keeps the
+ * rows shown until the other list arrives.
+ */
+export const useClients = (all: boolean) =>
+  useQuery({
+    queryKey: keys.clients(all),
+    queryFn: getting<ListedClient[]>(`/api/clients${qs({ connected: all ? undefined : "true" })}`),
+    placeholderData: keepPreviousData,
+  });
 
 /** Names by MAC, for links. */
 export type Names = Readonly<Record<Mac, string>>;
@@ -1364,7 +1375,7 @@ export function useLiveUpdates(): void {
             if ((q.state.data as ClientDetail | undefined)?.sample.ap_mac === msg.mac) invalidate(q.queryKey, 4000);
           break;
         case "clients":
-          // Sent with every report that has clients, without saying which changed. The list holds every
+          // Sent with every report that has clients, without saying which changed. The list may hold every
           // client of the past year, so it follows more slowly.
           invalidate(keys.clients(), 20_000);
           break;

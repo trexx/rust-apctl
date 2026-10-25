@@ -109,9 +109,11 @@ function SortHeader({
 }
 
 function ClientList({ tabs }: { tabs: ReactNode }) {
-  const clients = useClients();
   const [filter, setFilter] = useState("");
   const [showGone, setShowGone] = useState(false);
+  // The disconnected clients are fetched only when shown; the connected list
+  // stays up while they load (and the full list while it is narrowed again).
+  const clients = useClients(showGone);
   const [sort, setSort] = useState<Sort>({
     key: "signal",
     desc: true,
