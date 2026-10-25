@@ -120,17 +120,16 @@ pub async fn activity(State(s): State<AppState>, Query(q): Query<RangeQuery>, Qu
             TIERS[tier].suffix
         );
         let mut stmt = c.prepare_cached(&sql)?;
-        let (mut air_ts, mut total, mut external, mut own_rx, mut own_tx) = (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        let (mut air_ts, mut total, mut external, mut own) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
         let mut rows = stmt.query(params_from_iter(params))?;
         while let Some(r) = rows.next()? {
             air_ts.push(r.get::<_, Ts>(0)?);
             total.push(r.get::<_, Option<f64>>(1)?);
             external.push(r.get::<_, Option<f64>>(2)?);
-            own_rx.push(r.get::<_, Option<f64>>(3)?);
-            own_tx.push(r.get::<_, Option<f64>>(4)?);
+            // Our own traffic: what the radios received and sent.
+            own.push(r.get::<_, Option<f64>>(3)?.zip(r.get::<_, Option<f64>>(4)?).map(|(rx, tx)| rx + tx));
         }
-        let internal: Vec<Option<f64>> = own_rx.iter().zip(&own_tx).map(|(a, b)| a.zip(*b).map(|(a, b)| a + b)).collect();
-        Ok(json!({ "ts": air_ts, "total": total, "external_interference": external, "own_traffic": internal, "own_rx": own_rx, "own_tx": own_tx }))
+        Ok(json!({ "ts": air_ts, "total": total, "external_interference": external, "own_traffic": own }))
     })
     .await?;
     Ok(Json(json!({ "bucket": bucket, "activity": vaps, "airtime": *airtime })))
@@ -668,7 +667,6 @@ pub async fn wlans(State(s): State<AppState>, Query(q): Query<RangeQuery>) -> Re
         bands: std::collections::BTreeSet<String>,
         /// The experience scores of its SSIDs with clients.
         scores: Vec<f64>,
-        ap_count: usize,
         /// The security our APs hear it with, from the first of its SSIDs heard.
         heard: Option<String>,
     }
@@ -676,7 +674,7 @@ pub async fn wlans(State(s): State<AppState>, Query(q): Query<RangeQuery>) -> Re
         let live = s.live.read().unwrap();
         let mut now: BTreeMap<String, Now> = BTreeMap::new();
         for (mac, d) in &live.devices {
-            for (i, v) in d.snapshot.vaps.iter().enumerate() {
+            for v in &d.snapshot.vaps {
                 let Some(e) = v.essid.as_deref().filter(|e| !e.is_empty()) else { continue };
                 let n = now.entry(e.to_string()).or_default();
                 n.broadcast.push(json!({ "ap": mac, "name": d.snapshot.ap.hostname, "radio": v.radio, "channel": v.channel, "bssid": v.bssid, "clients": v.num_sta, "online": d.online }));
@@ -685,10 +683,6 @@ pub async fn wlans(State(s): State<AppState>, Query(q): Query<RangeQuery>) -> Re
                 }
                 if let Some(x) = v.satisfaction.filter(|x| *x >= 0 && v.num_sta.unwrap_or(0) > 0) {
                     n.scores.push(x as f64);
-                }
-                // An AP counts once, at its first SSID of the network.
-                if !d.snapshot.vaps[..i].iter().any(|w| w.essid == v.essid) {
-                    n.ap_count += 1;
                 }
                 if n.heard.is_none() {
                     n.heard = on_air.get(&v.bssid).cloned();
@@ -709,7 +703,7 @@ pub async fn wlans(State(s): State<AppState>, Query(q): Query<RangeQuery>) -> Re
     let list: Vec<Value> = names
         .into_iter()
         .map(|essid| {
-            let Now { broadcast, bands, scores, ap_count, heard } = now.remove(&essid).unwrap_or_default();
+            let Now { broadcast, bands, scores, heard } = now.remove(&essid).unwrap_or_default();
             let clients = connected.get(&essid).copied().unwrap_or(0);
             let agg = per.get(&essid);
             let (ts, series_clients, down_bps, up_bps, peak) = agg.map_or((vec![], vec![], vec![], vec![], 0.0), |a| {
@@ -732,7 +726,6 @@ pub async fn wlans(State(s): State<AppState>, Query(q): Query<RangeQuery>) -> Re
                 "security_on_air": heard,
                 "broadcast": broadcast,
                 "bands": bands,
-                "ap_count": ap_count,
                 "clients": clients,
                 "peak_clients": peak.round().max(clients as f64),
                 "satisfaction": mean(&scores),
