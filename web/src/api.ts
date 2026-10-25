@@ -678,9 +678,9 @@ export interface RadioOverview {
   avg_client_signal: number | null;
 }
 
+/** A neighbouring network, one per BSSID, strongest first (`best_signal`, else `signal`). */
 export interface Neighbor {
   bssid: string;
-  ap_mac: Mac;
   radio: string | null;
   essid: string | null;
   channel: number | null;
@@ -689,10 +689,7 @@ export interface Neighbor {
   security: string | null;
   signal: number | null;
   best_signal: number | null;
-  is_unifi: boolean;
-  ap_name: string | null;
   last_seen: number;
-  first_seen: number;
   vendor: string | null;
   nearest_ap: string | null;
 }
