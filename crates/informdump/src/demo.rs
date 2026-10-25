@@ -1,11 +1,6 @@
 //! A made-up site for demos, screenshots and UI work: three access points and
 //! their clients over a day, written as a pcap stream that apctl's shadow mode
-//! reads like a capture of real traffic.
-//!
-//! ```text
-//! informdump demo-state > demo.json
-//! apctl serve --data-dir demo-data --keys demo.json --shadow-cmd "informdump demo --live"
-//! ```
+//! reads like a capture of real traffic. The README's Demo section runs it.
 //!
 //! Everything is generated: names, MACs (real manufacturer prefixes so clients
 //! get vendor names, made-up device parts), keys, neighbours and the routine.
