@@ -982,11 +982,20 @@ struct OwnLink {
 pub async fn neighbors(State(s): State<AppState>, Query(q): Query<NeighborQuery>) -> Result<Json<Value>, ApiError> {
     let since = clock::now_ts() - q.range.unwrap_or(86400).clamp(600, 30 * 86400);
     let band = q.band.clone();
-    // Our own BSSIDs (the table's key): the rows our APs' signal to each other is
-    // read from (every AP hears every other), all of them with `links_only`, none
-    // with `neighbors_only`.
+    // Our own BSSIDs, each with its AP and band (to tell our APs apart from the
+    // neighbours), and our APs' names, copied so that the live lock is not held
+    // while the lists are made.
+    let (own, names) = {
+        let live = s.live.read().unwrap();
+        let own: HashMap<String, (String, Option<String>)> = own_bssids(&live).map(|(m, v)| (v.bssid.clone(), (m.to_string(), v.radio.clone()))).collect();
+        let names: HashMap<String, String> = live.devices.iter().filter_map(|(m, d)| Some((m.to_string(), d.snapshot.ap.hostname.clone()?))).collect();
+        (own, names)
+    };
+    // Our own BSSIDs are the table's key for the rows our APs' signal to each
+    // other is read from (every AP hears every other): all of them with
+    // `links_only`, none with `neighbors_only`.
     let (links_only, neighbors_only) = (q.links_only, q.neighbors_only);
-    let own_list: Vec<String> = if links_only || neighbors_only { own_bssids(&s.live.read().unwrap()).map(|(_, v)| v.bssid.clone()).collect() } else { Vec::new() };
+    let own_list: Vec<String> = if links_only || neighbors_only { own.keys().cloned().collect() } else { Vec::new() };
     let rows = read(&s.store, Db::Config, move |c| {
         if links_only && own_list.is_empty() {
             return Ok(Vec::new());
@@ -1015,14 +1024,6 @@ pub async fn neighbors(State(s): State<AppState>, Query(q): Query<NeighborQuery>
         Ok(rows)
     })
     .await?;
-    // Our own BSSIDs (to tell our APs apart from the neighbours) and our APs' names, copied
-    // so that the live lock is not held while the lists are made.
-    let (own, names) = {
-        let live = s.live.read().unwrap();
-        let own: HashMap<String, (String, Option<String>)> = own_bssids(&live).map(|(m, v)| (v.bssid.clone(), (m.to_string(), v.radio.clone()))).collect();
-        let names: HashMap<String, String> = live.devices.iter().filter_map(|(m, d)| Some((m.to_string(), d.snapshot.ap.hostname.clone()?))).collect();
-        (own, names)
-    };
     let name = |mac: &str| names.get(mac).cloned();
     let signal = |n: &Neighbor| n.signal.unwrap_or(-200);
     let mut by_bssid: BTreeMap<String, Neighbor> = BTreeMap::new();
