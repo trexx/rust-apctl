@@ -9,9 +9,7 @@ export interface RadioSummary {
   radio: string;
   channel: number | null;
   bw: number | null;
-  tx_power: number | null;
   cu_total: number | null;
-  noise_floor: number | null;
   clients: number;
 }
 
@@ -23,20 +21,13 @@ export interface DeviceSummary {
   version: string | null;
   ip: string | null;
   online: boolean;
-  first_seen: number;
   last_seen: number;
   uptime: number | null;
   cpu: number | null;
   mem: number | null;
-  load1: number | null;
-  satisfaction: number | null;
   clients: number;
   uplink: { speed: number | null; up: boolean | null; full_duplex: boolean | null } | null;
   radios: RadioSummary[];
-  last_config_push: number | null;
-  locating?: boolean;
-  /** Known from the database only: hasn't reported since apctl started. */
-  stored_only?: boolean;
 }
 
 export interface ClientSample {
@@ -212,14 +203,11 @@ export interface DeviceDetail {
       } | null;
       radios: RadioSample[];
       vaps: VapSample[];
-      has_vap_table: boolean;
     };
     online: boolean;
     first_seen: number;
     last_seen: number;
-    peer: string;
     interval: number;
-    last_config_push: number | null;
     /** Known from the database only: hasn't reported since apctl started. */
     stored_only?: boolean;
   };
@@ -373,14 +361,10 @@ export interface LogLine {
 }
 
 export interface Status {
-  version: string;
   /** Active: apctl manages the APs; shadow: it watches another controller's traffic. */
   mode: "active" | "shadow";
   source: string;
   started: number;
-  now: number;
-  devices: number;
-  devices_online: number;
   clients_connected: number;
   /** Connected clients by radio ("ng", "na", …). */
   clients_by_band: Record<string, number>;
@@ -564,7 +548,6 @@ export interface FieldComparison {
 export type StoredComparison = Omit<FieldComparison, "diff">;
 
 export interface DryRun {
-  settings_imported_at: number | null;
   devices: {
     mac: Mac;
     name: string | null;
