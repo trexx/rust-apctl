@@ -115,7 +115,7 @@ skopeo() {
   if command -v skopeo >/dev/null; then
     command skopeo "$@"
   else
-    podman run --rm quay.io/skopeo/stable:v1.20.0 "$@"
+    podman run --rm quay.io/skopeo/stable:v1.22.3@sha256:24940638e4abb0edfedc78a680554f316069d0212a00159276759421a059e611 "$@"
   fi
 }
 
