@@ -107,13 +107,13 @@ export function AlertBell() {
   const box = useRef<HTMLDivElement>(null);
   useDismiss(box, () => setOpen(false), open);
   const unread = a.data?.unread ?? 0;
+  const openNow = a.data?.open ?? 0;
   const list = a.data?.alerts ?? [];
-  const openNow = list.filter((x) => x.resolved_ts === null);
   const readAll = () => void run(markAlertsRead);
   return (
     <div className="bell-wrap" ref={box}>
       <button
-        className={`bell ${openNow.some((x) => x.severity === "high") ? "bell-bad" : ""}`}
+        className={`bell ${a.data?.open_high ? "bell-bad" : ""}`}
         aria-label={`Alerts, ${unread} unread`}
         aria-haspopup="dialog"
         aria-expanded={open}
@@ -133,9 +133,7 @@ export function AlertBell() {
         <div className="bell-pop panel" role="dialog" aria-label="Alerts">
           <div className="panel-head">
             <b>Alerts</b>
-            {openNow.length > 0 && (
-              <span className="muted small">{openNow.length} open</span>
-            )}
+            {openNow > 0 && <span className="muted small">{openNow} open</span>}
             <span className="spacer" />
             {canEdit && unread > 0 && (
               <button className="btn small" disabled={busy} onClick={readAll}>
@@ -149,7 +147,7 @@ export function AlertBell() {
             <div className="muted small">No alerts yet.</div>
           ) : (
             <ul className="alert-list">
-              {list.slice(0, 20).map((x) => (
+              {list.map((x) => (
                 <li
                   key={x.id}
                   className={`alert-item sev-border-${x.severity} ${x.read ? "" : "unread"}`}

@@ -1241,8 +1241,15 @@ export interface AlertItem {
   read?: boolean;
 }
 
-export const useAlerts = () =>
-  useQuery({ queryKey: keys.alerts(), queryFn: getting<{ alerts: AlertItem[]; unread: number }>("/api/alerts?limit=50"), refetchInterval: 120_000 });
+/** The newest 20 alerts, and counts over all of them: unread, open (not resolved) and open with high severity. */
+export interface RecentAlerts {
+  alerts: AlertItem[];
+  unread: number;
+  open: number;
+  open_high: number;
+}
+
+export const useAlerts = () => useQuery({ queryKey: keys.alerts(), queryFn: getting<RecentAlerts>("/api/alerts?limit=20"), refetchInterval: 120_000 });
 
 export const markAlertsRead = () => send("POST", "/api/alerts/read", {});
 
