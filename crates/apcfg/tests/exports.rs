@@ -2,7 +2,8 @@
 //! the render does: checked on their own and against a render.
 
 use apcfg::{
-    Controller, DEFAULT_COUNTRY, Input, as_int, bool_of, capable_width, configured_width, flag, int_of, override_of, radio_width, render, ssh_username, ssid_usergroup, ssid_vlan, usergroup_limits, wlan_bands,
+    Controller, DEFAULT_COUNTRY, Input, as_int, bool_of, capable_width, configured_width, country_code, flag, int_of, is_dfs_channel, override_of, radio_ai_na_dfs, radio_width, render, ssh_username,
+    ssid_usergroup, ssid_vlan, usergroup_limits, wlan_bands,
 };
 use serde_json::{Value, json};
 
@@ -173,8 +174,9 @@ fn the_render_deploys_ssids_on_the_bands_the_export_names() {
     assert_eq!(wlan_bands(&json!({ "wlan_bands": ["6g", "2g"] })), ["6g", "2g"]);
 }
 
-/// The site's country is a number however it is stored, as the controller's channel
-/// rules read it: the APs get it as one, and the US and Canada get the FCC DFS reset.
+/// The site's country is a number however it is stored, as [`country_code`] reads it
+/// for the controller's channel rules: the APs get it as one (the US for a code that is
+/// no number), and the US and Canada get the FCC DFS reset.
 #[test]
 fn the_country_is_read_as_a_number() {
     let mut s = state(json!([wlan("Home", json!({}))]), json!([]));
@@ -187,9 +189,43 @@ fn the_country_is_read_as_a_number() {
         (line(&cfg, "radio.countrycode").map(str::to_string), line(&cfg, "radio.2.countrycode").map(str::to_string), dfs_reset)
     };
     let code = |c: &str, dfs| (Some(c.to_string()), Some(c.to_string()), dfs);
-    for stored in [json!("840"), json!(840), json!(840.0), json!(" 840"), json!("0840"), json!("x"), json!(true)] {
+    for stored in [json!("840"), json!(840), json!(840.0), json!(" 840"), json!("0840"), json!("x"), json!(true), json!("124.0"), Value::Null] {
         assert_eq!(country(&mut s, stored.clone()), code("840", true), "{stored}");
+        assert_eq!(country_code(&stored), DEFAULT_COUNTRY, "{stored}");
     }
     assert_eq!(country(&mut s, json!(124.0)), code("124", true));
     assert_eq!(country(&mut s, json!("276")), code("276", false), "a radio with only FCC DFS");
+    assert_eq!((country_code(&json!(124.0)), country_code(&json!("276"))), (124, 276));
+}
+
+/// What the render does with DFS, as the exports read it: 5 GHz automatic channel
+/// selection may use DFS channels (`acsdfs`) when radio_ai's `na` entry allows it, and
+/// a radio fixed to a DFS channel gets the nightly DFS reset.
+#[test]
+fn the_render_treats_dfs_as_the_exports_do() {
+    let allowed = [
+        (json!([{ "radio": "na", "dfs": true }]), true),
+        (json!([{ "radio": "na", "dfs": "true" }]), true),
+        (json!([{ "radio": "na", "dfs": false }]), false),
+        (json!([{ "radio": "na", "dfs": "yes" }]), false),
+        (json!([{ "radio": "na" }]), false),
+        (json!([{ "radio": "ng", "dfs": true }]), false),
+        (json!([]), false),
+    ];
+    for (radios_configuration, on) in allowed {
+        let mut s = state(json!([wlan("Home", json!({}))]), radios_configuration.clone());
+        // The bit (wifi_caps2 bit 4) of APs whose channel selection can be told about DFS.
+        s["devices"][0]["wifi_caps2"] = json!(1 << 4);
+        assert_eq!(radio_ai_na_dfs(&s["setting"][0]), on, "{radios_configuration}");
+        assert_eq!(line(&system_cfg(&s), "radio.2.acsdfs"), Some(if on { "enabled" } else { "disabled" }), "{radios_configuration}");
+    }
+    assert!(!radio_ai_na_dfs(&Value::Null), "a site without a radio_ai setting");
+
+    let mut s = state(json!([wlan("Home", json!({}))]), json!([]));
+    for ch in [36, 48, 52, 100, 144, 149, 165] {
+        s["devices"][0]["radio_table"][1] = json!({ "name": "wifi1", "radio": "na", "is_11ax": true, "has_fccdfs": true, "channel": ch });
+        let dfs_reset = system_cfg(&s).lines().any(|l| l.ends_with(".cmd=syswrapper.sh dfs-reset"));
+        assert_eq!(dfs_reset, is_dfs_channel(ch), "channel {ch}");
+    }
+    assert_eq!([36, 48, 52, 100, 144, 149, 165].map(is_dfs_channel), [false, false, true, true, true, false, false]);
 }

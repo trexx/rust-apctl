@@ -32,8 +32,8 @@ pub mod tz;
 
 pub use json::{as_int, bool_of, flag, int_of, oid, override_of};
 pub use net::ssid_vlan;
-pub use system::{MDNS_SERVICES, ssid_usergroup, usergroup_limits};
-pub use wlan::{capable_width, configured_width, radio_width, wlan_bands};
+pub use system::{MDNS_SERVICES, is_dfs_channel, ssid_usergroup, usergroup_limits};
+pub use wlan::{capable_width, configured_width, radio_ai_na_dfs, radio_width, wlan_bands};
 mod wlan;
 
 use std::borrow::Cow;
@@ -42,11 +42,17 @@ use std::cell::OnceCell;
 use anyhow::{Context, Result, bail};
 use serde_json::Value;
 
-use crate::wlan::Band;
-
 /// The country (ISO 3166 numeric code) an AP is given when the site's `country`
-/// setting has none: the United States, as the official controller does.
+/// setting has no code it can read: the United States, as the official controller
+/// does for a missing one.
 pub const DEFAULT_COUNTRY: i64 = 840;
+
+/// The country (ISO 3166 numeric code) the APs are given for the `code` of the site's
+/// `country` setting: the code read as [`as_int`] reads a number, else
+/// [`DEFAULT_COUNTRY`], for a missing code as for one that is no number.
+pub fn country_code(code: &Value) -> i64 {
+    json::as_int(code).unwrap_or(DEFAULT_COUNTRY)
+}
 
 /// The SSH account the site's APs get (`users.1.name`, also the user cron jobs run as):
 /// the `mgmt` setting's `x_ssh_username`, else `ubnt`. A stored empty name is sent as
@@ -454,8 +460,7 @@ pub(crate) struct Ctx<'a> {
     pub mgmt: &'a Value,
     pub super_mgmt: &'a Value,
     pub radio_ai: &'a Value,
-    /// The radios' country code (`setting[country].code`, read as [`as_int`] reads a
-    /// number; US when unset or no number).
+    /// The radios' country code: [`country_code`] of `setting[country].code`.
     pub country: i64,
     /// See [`Ctx::gateway_macs`].
     gateway_macs: OnceCell<Vec<Cow<'a, str>>>,
@@ -507,7 +512,7 @@ impl<'a> Ctx<'a> {
             mgmt: setting(state, site_id, "mgmt"),
             super_mgmt: setting(state, site_id, "super_mgmt"),
             radio_ai: setting(state, site_id, "radio_ai"),
-            country: json::int_of(setting(state, site_id, "country"), "code").unwrap_or(DEFAULT_COUNTRY),
+            country: country_code(&setting(state, site_id, "country")["code"]),
             gateway_macs: OnceCell::new(),
         })
     }
@@ -554,11 +559,6 @@ impl<'a> Ctx<'a> {
 
     pub fn inform_str(&self, key: &str) -> Option<&'a str> {
         self.inform.and_then(|i| json::str_of(i, key))
-    }
-
-    /// The `radio_ai` settings for one band (`radios_configuration`).
-    pub fn radio_ai_config(&self, band: Band) -> Option<&'a Value> {
-        wlan::radio_ai_config(self.radio_ai, band)
     }
 }
 

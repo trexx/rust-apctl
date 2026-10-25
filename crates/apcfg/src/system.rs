@@ -670,8 +670,9 @@ fn mdns(c: &mut Cfg, ctx: &Ctx, vaps: &[Vap], net: &Net) {
     }
 }
 
-/// 5 GHz channels that need radar detection (DFS).
-fn is_dfs_channel(ch: i64) -> bool {
+/// Whether a 5 GHz channel needs radar detection (DFS): 52 to 144. The render gives
+/// an AP whose 5 GHz radio is fixed to one the nightly `dfs-reset` job.
+pub fn is_dfs_channel(ch: i64) -> bool {
     (52..=144).contains(&ch)
 }
 

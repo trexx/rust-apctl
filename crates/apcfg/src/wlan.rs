@@ -318,8 +318,16 @@ fn configured(radio_ai: &Value, radio: &Value, band: Band) -> i64 {
 }
 
 /// The `radio_ai` settings for one band (`radios_configuration`).
-pub(crate) fn radio_ai_config<'a>(radio_ai: &'a Value, band: Band) -> Option<&'a Value> {
+fn radio_ai_config<'a>(radio_ai: &'a Value, band: Band) -> Option<&'a Value> {
     arr(radio_ai, "radios_configuration").iter().find(|c| str_of(c, "radio") == Some(band.as_str()))
+}
+
+/// Whether the site's `radio_ai` setting (the document) lets the APs' automatic channel
+/// selection use DFS channels on 5 GHz: the `na` entry of its `radios_configuration` has
+/// `dfs` on (read as [`flag`] reads it, so `"true"` counts). Off without that entry. The
+/// render sends it as `acsdfs` to APs that can do DFS in their channel selection.
+pub fn radio_ai_na_dfs(radio_ai: &Value) -> bool {
+    radio_ai_config(radio_ai, Band::Na).is_some_and(|c| flag(c, "dfs", false))
 }
 
 /// The channel width (MHz) a radio runs at, the one the render sends: its
@@ -392,8 +400,7 @@ pub fn render_radios(c: &mut Cfg, ctx: &Ctx, radios: &[Radio], vaps: &[Vap]) -> 
         c.set(k.at("ieee_mode"), format_args!("11n{g}ht{width}"));
         let acs_dfs = ctx.caps.has(Cap::AcsDfs);
         if r.band == Band::Na && acs_dfs {
-            let dfs = ctx.radio_ai_config(Band::Na).is_some_and(|c| flag(c, "dfs", false));
-            c.set(k.at("acsdfs"), on_off(dfs));
+            c.set(k.at("acsdfs"), on_off(radio_ai_na_dfs(ctx.radio_ai)));
         }
         if channel.is("auto") && acs_dfs {
             let blocked: Vec<&str> = arr(ctx.radio_ai, "channels_blacklist")
