@@ -458,6 +458,19 @@ where
     Some(&rows.entry(k).or_insert(Row::new(value, ts, stamp)).value)
 }
 
+/// The value under `k` in `m`, made by `new` when there is none: the key is
+/// copied only for a new entry.
+fn slot<'m, K, Q, V>(m: &'m mut HashMap<K, V>, k: &Q, new: impl FnOnce() -> V) -> &'m mut V
+where
+    K: std::borrow::Borrow<Q> + Eq + std::hash::Hash,
+    Q: ToOwned<Owned = K> + Eq + std::hash::Hash + ?Sized,
+{
+    if !m.contains_key(k) {
+        m.insert(k.to_owned(), new());
+    }
+    m.get_mut(k).expect("inserted above")
+}
+
 /// Whether a row last written at `at` (if ever) is due again at `ts`.
 fn due(at: Option<&Ts>, ts: Ts, every: Ts) -> bool {
     at.is_none_or(|at| ts - at >= every || ts < *at)
@@ -795,11 +808,7 @@ impl Engine {
             if now.0.is_none() {
                 continue; // no VAP on this radio, so nothing to compare
             }
-            // The band is copied only for a radio not seen before.
-            if !tracks.contains_key(r.radio.as_str()) {
-                tracks.insert(r.radio.clone(), RadioTrack::default());
-            }
-            let track = tracks.get_mut(r.radio.as_str()).expect("inserted above");
+            let track = slot(tracks, r.radio.as_str(), RadioTrack::default);
             match track.committed {
                 None => track.committed = Some(now),
                 Some(c) if c == now => track.candidate = None,
@@ -1785,11 +1794,7 @@ impl Engine {
         rows.retain(|_, r| r.seen == ts);
         let radios = self.written.spectrum.entry(s.ap.mac).or_default();
         for (radio, channels) in spectrum {
-            // Looked up by reference: the radio's name is copied only for a new one.
-            if !radios.contains_key(&radio) {
-                radios.insert(radio.clone(), Rows::new());
-            }
-            let rows = radios.get_mut(&radio).expect("inserted above");
+            let rows = slot(radios, radio.as_str(), Rows::new);
             for c in channels {
                 let Some(c) = report(rows, c, |c| &c.channel, ts, ts, SPECTRUM_REFRESH_SECS) else { continue };
                 self.writer.exec(
