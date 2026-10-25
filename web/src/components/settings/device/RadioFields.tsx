@@ -52,14 +52,6 @@ export const keepAllowed = (
     ? { ...f, channel: "auto" }
     : f;
 
-/** The channel widths (MHz) a band has, before the radio's own limit. */
-const WIDTHS = (radio: string): number[] =>
-  radio === "ng"
-    ? [20, 40]
-    : radio === "6e"
-      ? [20, 40, 80, 160, 240, 320]
-      : [20, 40, 80, 160];
-
 const POWER: Option<string>[] = [
   ["auto", "Auto"],
   ["high", "High"],
@@ -85,7 +77,11 @@ export function RadioFields({
   const set = <K extends keyof RadioForm>(k: K, v: RadioForm[K]) =>
     onChange({ ...form, [k]: v });
   const bind = binder(form, set);
-  const widths = WIDTHS(r.radio).filter((w) => w <= r.caps.max_width);
+  // The band's widths are the server's channel lists' keys (integer keys come
+  // narrowest first), up to the radio's own limit.
+  const widths = Object.keys(r.channels)
+    .map(Number)
+    .filter((w) => w <= r.caps.max_width);
   const legal = allowed(r, outdoor, form.ht);
   const lo = r.caps.min_txpower;
   const hi = r.caps.max_txpower;
