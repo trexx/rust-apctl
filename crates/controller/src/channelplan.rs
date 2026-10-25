@@ -220,7 +220,7 @@ pub async fn compute_plan(s: &AppState, radio: String, dfs: bool, allowed: Optio
     let (aps, own_bssids) = {
         let live = s.live.read().unwrap();
         let state = live.state.as_deref();
-        let country = state.and_then(crate::settings::country);
+        let country = state.map_or(apcfg::DEFAULT_COUNTRY, crate::settings::country);
         // The APs' records in the settings, found once (the first of a MAC listed twice, as `device_doc` finds it).
         let mut docs: HashMap<Mac, &serde_json::Value> = HashMap::new();
         for d in state.into_iter().flat_map(|st| crate::settings::docs(st, "devices")) {
@@ -494,10 +494,10 @@ mod tests {
     #[test]
     fn plans_use_only_channels_the_ap_lists_and_may_use_where_it_stands() {
         // Channel AI allows every channel Germany has at 80 MHz, DFS included.
-        let allowed = crate::settings::legal_channels(Some(276), "na", 80, false);
+        let allowed = crate::settings::legal_channels(276, "na", 80, false);
         let ap = |mac: &str, clients: i64, available: Option<Vec<i64>>, outdoor: bool| PlanAp {
             mac: mac.into(), name: None, current: block("na", 36, 80), width: 80, clients, available,
-            legal: crate::settings::legal_channels(Some(276), "na", 80, outdoor),
+            legal: crate::settings::legal_channels(276, "na", 80, outdoor),
         };
         // "in" hears a loud neighbour on 36-48 and lists only 36 and 116; without its list it would take 52.
         // "out" is outdoors, where 36-64 are not allowed, so it must leave 36.
@@ -561,7 +561,7 @@ mod tests {
         // its 5 GHz blocks; nothing is better elsewhere, so neither moves.
         let plan = plan_channels("ng".into(), false, None, HashSet::new(), vec![ng_ap("a", 13, 1)], HashMap::new(), vec![], vec![]);
         assert!(!plan.accepted && !plan.plan[0].change && !plan.plan[0].not_allowed, "{plan:?}");
-        let ap = PlanAp { mac: "b".into(), name: None, current: block("na", 165, 20), width: 20, clients: 1, available: None, legal: crate::settings::legal_channels(Some(840), "na", 20, false) };
+        let ap = PlanAp { mac: "b".into(), name: None, current: block("na", 165, 20), width: 20, clients: 1, available: None, legal: crate::settings::legal_channels(840, "na", 20, false) };
         let plan = plan_channels("na".into(), false, None, HashSet::new(), vec![ap], HashMap::new(), vec![], vec![]);
         assert!(!plan.accepted && !plan.plan[0].change, "{plan:?}");
         // Settings that leave 13 out move it.

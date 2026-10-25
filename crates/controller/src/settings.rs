@@ -524,39 +524,35 @@ pub(crate) const COUNTRIES: &[Country] = {
 };
 
 /// The rules of a country, if apctl has them.
-fn rules_of(country: Option<i64>) -> Option<Rules> {
-    let code = country?;
-    COUNTRIES.iter().find(|c| c.code == code).map(|c| c.rules)
+fn rules_of(country: i64) -> Option<Rules> {
+    COUNTRIES.iter().find(|c| c.code == country).map(|c| c.rules)
 }
 
-/// The site's country (ISO 3166 numeric), from the `country` setting; without
-/// one, the country the render gives the APs ([`apcfg::DEFAULT_COUNTRY`]).
-/// `None` for a code that is no number.
-pub(crate) fn country(state: &Value) -> Option<i64> {
-    match &setting(state, "country")["code"] {
-        Value::Null => Some(apcfg::DEFAULT_COUNTRY),
-        code => num(code),
-    }
+/// The site's country (ISO 3166 numeric) as the render gives it to the APs
+/// ([`apcfg::country_code`]): the `country` setting's code, or for none or an
+/// unreadable one, [`apcfg::DEFAULT_COUNTRY`].
+pub(crate) fn country(state: &Value) -> i64 {
+    apcfg::country_code(&setting(state, "country")["code"])
 }
 
 /// Legal primary channels for a band and width in the site's country (indoor,
 /// or outdoor when `outdoor`). `None` when apctl has no rules for the country
 /// or the band (6 GHz): nothing is restricted then, the AP's own regulatory
 /// domain decides.
-pub fn legal_channels(country: Option<i64>, band: &str, width: i64, outdoor: bool) -> Option<Vec<i64>> {
+pub fn legal_channels(country: i64, band: &str, width: i64, outdoor: bool) -> Option<Vec<i64>> {
     Some(channel_blocks(rules_of(country)?, band, width, outdoor)?.into_iter().flatten().copied().collect())
 }
 
 /// [`legal_channels`] for one channel, without building the list: `None` when
 /// apctl has no rules for the country or the band.
-pub fn is_legal(country: Option<i64>, band: &str, width: i64, outdoor: bool, ch: i64) -> Option<bool> {
+pub fn is_legal(country: i64, band: &str, width: i64, outdoor: bool, ch: i64) -> Option<bool> {
     Some(channel_blocks(rules_of(country)?, band, width, outdoor)?.into_iter().any(|b| b.contains(&ch)))
 }
 
 /// Whether an AP may be fixed on a channel at a width: by the country's rules
 /// (indoor or outdoor), or where apctl has none, when the band has the channel
 /// at that width. A band apctl has no channels for is not checked.
-pub(crate) fn fixed_channel_ok(country: Option<i64>, band: &str, width: i64, outdoor: bool, ch: i64) -> bool {
+pub(crate) fn fixed_channel_ok(country: i64, band: &str, width: i64, outdoor: bool, ch: i64) -> bool {
     is_legal(country, band, width, outdoor, ch).unwrap_or_else(|| {
         let all = band_channels(band, width);
         all.is_empty() || all.contains(&ch)
@@ -565,7 +561,7 @@ pub(crate) fn fixed_channel_ok(country: Option<i64>, band: &str, width: i64, out
 
 /// The legal channels of a band at a width: [`legal_channels`], or where apctl
 /// has no rules, [`band_channels`].
-pub(crate) fn allowed_channels(country: Option<i64>, band: &str, width: i64, outdoor: bool) -> Vec<i64> {
+pub(crate) fn allowed_channels(country: i64, band: &str, width: i64, outdoor: bool) -> Vec<i64> {
     legal_channels(country, band, width, outdoor).unwrap_or_else(|| band_channels(band, width))
 }
 
@@ -579,7 +575,7 @@ pub(crate) fn radio_width(state: &Value, radio: &Value) -> i64 {
 
 /// A fixed channel of an AP's `radio_table` entry that [`fixed_channel_ok`]
 /// refuses at `width` (its [`radio_width`]).
-pub(crate) fn illegal_fixed_channel(country: Option<i64>, radio: &Value, width: i64, outdoor: bool) -> Option<i64> {
+pub(crate) fn illegal_fixed_channel(country: i64, radio: &Value, width: i64, outdoor: bool) -> Option<i64> {
     let ch = num(&radio["channel"])?;
     (!fixed_channel_ok(country, radio["radio"].as_str().unwrap_or(""), width, outdoor, ch)).then_some(ch)
 }
@@ -2289,7 +2285,13 @@ mod tests {
         assert!(edit(&mut s, json!({ "hide_ssid": true })).is_err());
         // Without a country setting the APs get the United States', and so do the channel rules.
         s["setting"].as_array_mut().unwrap().retain(|x| x["key"] != "country");
-        assert_eq!(country(&s), Some(apcfg::DEFAULT_COUNTRY));
+        assert_eq!(country(&s), apcfg::DEFAULT_COUNTRY);
+        // So does an unreadable code, as the render reads it: the APs are told the US.
+        for code in [json!("x"), json!(true), json!("124.0")] {
+            setting_mut(&mut s, "country")["code"] = code;
+            assert_eq!(country(&s), apcfg::DEFAULT_COUNTRY);
+        }
+        assert_eq!(legal_channels(country(&s), "ng", 20, false).unwrap().len(), 11, "no 12 or 13");
     }
 
     #[test]
@@ -2351,24 +2353,24 @@ mod tests {
 
     #[test]
     fn channels_follow_the_country_and_width() {
-        let eu = |band, width, outdoor| legal_channels(Some(276), band, width, outdoor).unwrap();
+        let eu = |band, width, outdoor| legal_channels(276, band, width, outdoor).unwrap();
         assert_eq!(eu("ng", 20, false), (1..=13).collect::<Vec<_>>());
         assert!(eu("na", 20, false).contains(&140) && !eu("na", 40, false).contains(&140));
         assert!(!eu("na", 80, false).contains(&132) && !eu("na", 20, false).contains(&149));
         assert!(!eu("na", 20, true).contains(&36), "outdoors only 100-140 in Europe");
-        assert!(legal_channels(Some(840), "na", 20, false).unwrap().contains(&165));
-        assert_eq!(legal_channels(Some(840), "ng", 20, false).unwrap().len(), 11);
+        assert!(legal_channels(840, "na", 20, false).unwrap().contains(&165));
+        assert_eq!(legal_channels(840, "ng", 20, false).unwrap().len(), 11);
         // No rules for the country or the band: nothing is restricted.
-        assert_eq!((legal_channels(None, "ng", 20, false), legal_channels(Some(392), "na", 80, false), legal_channels(Some(276), "6e", 20, false)), (None, None, None));
+        assert_eq!((legal_channels(392, "ng", 20, false), legal_channels(392, "na", 80, false), legal_channels(276, "6e", 20, false)), (None, None, None));
         assert_eq!(band_channels("6e", 20).len(), 59);
         assert_eq!((band_channels("6e", 160).last(), band_channels("na", 20).last()), (Some(&221), Some(&165)));
-        assert_eq!(legal_channels(Some(840), "na", 160, false).unwrap().last(), Some(&128));
-        assert_eq!(legal_channels(Some(840), "na", 80, false).unwrap().last(), Some(&161));
+        assert_eq!(legal_channels(840, "na", 160, false).unwrap().last(), Some(&128));
+        assert_eq!(legal_channels(840, "na", 80, false).unwrap().last(), Some(&161));
         // One channel is checked against the same rules.
-        for (c, band, width, o) in [(Some(276), "ng", 20, false), (Some(840), "ng", 40, false), (Some(276), "na", 40, true), (Some(276), "na", 80, false), (Some(840), "na", 20, false), (Some(840), "na", 160, false), (None, "na", 20, false), (Some(276), "6e", 20, false)] {
+        for (c, band, width, o) in [(276, "ng", 20, false), (840, "ng", 40, false), (276, "na", 40, true), (276, "na", 80, false), (840, "na", 20, false), (840, "na", 160, false), (392, "na", 20, false), (276, "6e", 20, false)] {
             let list = legal_channels(c, band, width, o);
             for ch in 1..=233 {
-                assert_eq!(is_legal(c, band, width, o, ch), list.as_ref().map(|l| l.contains(&ch)), "{c:?} {band} {width} {o} {ch}");
+                assert_eq!(is_legal(c, band, width, o, ch), list.as_ref().map(|l| l.contains(&ch)), "{c} {band} {width} {o} {ch}");
             }
         }
         // A fixed channel is judged at the radio's width as the render sends it: `ht`, else
@@ -2376,7 +2378,7 @@ mod tests {
         // what the radio can do (these are 802.11ac: 80 MHz).
         let illegal = |s: &Value, mut r: Value, o| {
             r["is_11ac"] = json!(true);
-            illegal_fixed_channel(Some(276), &r, radio_width(s, &r), o)
+            illegal_fixed_channel(276, &r, radio_width(s, &r), o)
         };
         let s = json!({ "devices": [{ "site_id": "s1" }] });
         assert_eq!(illegal(&s, json!({ "radio": "na", "ht": "40", "channel": "140" }), false), Some(140));
