@@ -6,7 +6,7 @@ import {
   startScan,
   useCanEdit,
   useChannelAi,
-  useDeviceNames,
+  useDeviceNamesQuery,
   useEvents,
 } from "../api";
 import type { ChannelPlanResult } from "../api";
@@ -103,7 +103,7 @@ const hours = (minute: number) =>
 /** Channel AI: the nightly optimisation's settings, Run now, recent runs. */
 export function ChannelAiPanel() {
   const ai = useChannelAi();
-  const names = useDeviceNames();
+  const apNames = useDeviceNamesQuery();
   const canEdit = useCanEdit();
   const runs = useEvents({ kind: "channel_plan", limit: 10 });
   const { busy, msg, run } = useRun();
@@ -192,12 +192,20 @@ export function ChannelAiPanel() {
           />
         </Row>
         <Row label="Excluded APs">
-          <ApChecklist
-            aps={Object.entries(names).map(([mac, name]) => ({ mac, name }))}
-            value={s.exclude_devices}
-            disabled={!can}
-            onChange={(v) => save({ exclude_devices: v })}
-          />
+          {/* Once the APs are known: until then, every excluded AP would show as unknown. */}
+          <QueryState q={apNames}>
+            {(names) => (
+              <ApChecklist
+                aps={Object.entries(names).map(([mac, name]) => ({
+                  mac,
+                  name,
+                }))}
+                value={s.exclude_devices}
+                disabled={!can}
+                onChange={(v) => save({ exclude_devices: v })}
+              />
+            )}
+          </QueryState>
         </Row>
       </div>
       <Outcome msg={msg} />
@@ -213,7 +221,7 @@ export function ChannelAiPanel() {
                 {data.map((e) => (
                   <li key={e.id}>
                     <span className="muted nowrap">{clock(e.ts, now)}</span>{" "}
-                    {eventText(e, names).detail}
+                    {eventText(e, apNames.data ?? {}).detail}
                   </li>
                 ))}
               </ul>

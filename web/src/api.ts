@@ -1113,19 +1113,21 @@ const deviceNames = (devices: DeviceSummary[]): Names => Object.fromEntries(devi
  * AP names (else their MAC) by MAC, in the server's order; the same object until a name changes. Kept apart
  * from `useDevices`, which refetches as the APs report: the live socket refreshes the names when an AP is
  * adopted, forgotten or renamed (its new name comes with the config), and the slow poll catches the rest.
+ * The query itself, for a view that must wait for the names (a list of every AP); links use `useDeviceNames`.
  */
-export function useDeviceNames(): Names {
+export function useDeviceNamesQuery() {
   const qc = useQueryClient();
-  return (
-    useQuery({
-      queryKey: keys.deviceNames(),
-      // Through the devices query, so that a page showing both (the overview, at mount) makes one request; always
-      // a new one, unless that query's is under way, since a name may have changed since it was cached.
-      queryFn: async () => deviceNames(await qc.fetchQuery({ queryKey: keys.devices(), queryFn: fetchDevices, staleTime: 0 })),
-      refetchInterval: 300_000,
-    }).data ?? NO_NAMES
-  );
+  return useQuery({
+    queryKey: keys.deviceNames(),
+    // Through the devices query, so that a page showing both (the overview, at mount) makes one request; always
+    // a new one, unless that query's is under way, since a name may have changed since it was cached.
+    queryFn: async () => deviceNames(await qc.fetchQuery({ queryKey: keys.devices(), queryFn: fetchDevices, staleTime: 0 })),
+    refetchInterval: 300_000,
+  });
 }
+
+/** The AP names, as `useDeviceNamesQuery` has them, and none until they are known: for links, which fall back to the MAC. */
+export const useDeviceNames = (): Names => useDeviceNamesQuery().data ?? NO_NAMES;
 
 /**
  * Client display names by MAC, for the clients that have one; the same object until a name changes.
