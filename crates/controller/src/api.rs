@@ -1485,6 +1485,7 @@ mod tests {
         let tv = get_json(&app, "/api/clients/02:00:00:00:01:01").await;
         assert_eq!(tv["sample"]["multicast"]["memberships"], json!([ssdp, mdns]));
         assert_eq!(tv["sample"]["multicast"]["delivery"], "flooding", "joined, with no group the AP tracks");
+        assert!(tv["sample"]["multicast"].get("groups").is_none(), "the groups only decide the delivery");
         assert_eq!(tv["peers"], json!({
             mdns: [{ "mac": "02:00:00:00:01:04", "name": "02:00:00:00:01:04" }],
             ssdp: [{ "mac": "02:00:00:00:01:03", "name": "amp" }, { "mac": "02:00:00:00:01:02", "name": "Speaker" }],
