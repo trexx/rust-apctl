@@ -317,14 +317,21 @@ pub(crate) fn radio_ai_config<'a>(radio_ai: &'a Value, band: Band) -> Option<&'a
     arr(radio_ai, "radios_configuration").iter().find(|c| str_of(c, "radio") == Some(band.as_str()))
 }
 
-/// Effective channel width in MHz.
-fn width(ctx: &Ctx, r: &Radio) -> i64 {
-    let country_max = match r.band {
+/// The channel width (MHz) a radio runs at, the one the render sends: its
+/// [`configured_width`] capped by its band (40 MHz at 2.4 GHz, 160 at 5, 320 at 6)
+/// and by its [`capable_width`]. Arguments as for [`configured_width`].
+pub fn radio_width(state: &Value, site_id: &str, radio: &Value) -> i64 {
+    running(crate::setting(state, site_id, "radio_ai"), radio, Band::of_radio(radio))
+}
+
+/// [`radio_width`] with the site's `radio_ai` setting at hand.
+fn running(radio_ai: &Value, radio: &Value, band: Band) -> i64 {
+    let band_max = match band {
         Band::Ng => 40,
         Band::Na => 160,
         _ => 320,
     };
-    country_max.min(configured(ctx.radio_ai, r.doc, r.band)).min(capable_width(r.doc))
+    band_max.min(configured(radio_ai, radio, band)).min(capable_width(radio))
 }
 
 /// The widest channel (MHz) a radio can use, by its `radio_table` entry's capability
@@ -353,7 +360,7 @@ pub fn render_radios(c: &mut Cfg, ctx: &Ctx, radios: &[Radio], vaps: &[Vap]) -> 
         let d = r.doc;
         let k = Prefix::new("radio", r.idx);
         let on_radio: Vec<&Vap> = vaps.iter().filter(|v| v.radio == ri).collect();
-        let width = width(ctx, r);
+        let width = running(ctx.radio_ai, d, r.band);
         c.set(k.at("phyname"), r.name);
         c.set(k.at("ack.auto"), "disabled");
         c.set(k.at("acktimeout"), 64);

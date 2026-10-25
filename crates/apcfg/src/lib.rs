@@ -33,7 +33,7 @@ pub mod tz;
 pub use json::{as_int, bool_of, flag, int_of, oid, override_of};
 pub use net::ssid_vlan;
 pub use system::{MDNS_SERVICES, ssid_usergroup, usergroup_limits};
-pub use wlan::{capable_width, configured_width};
+pub use wlan::{capable_width, configured_width, radio_width};
 mod wlan;
 
 use std::borrow::Cow;
