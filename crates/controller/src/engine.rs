@@ -1088,10 +1088,10 @@ impl Engine {
     }
 
     /// Changes the settings: `f` gets them to copy (`to_mut`) only when it
-    /// changes them, and a copy that differs is stored, under the time the
-    /// settings were imported (an edit is no import). None without settings;
-    /// else what `f` returned and whether they were stored. The copy is made and
-    /// serialised without the lock.
+    /// changes them, and a copy is stored, under the time the settings were
+    /// imported (an edit is no import). None without settings; else what `f`
+    /// returned and whether they were stored. The copy is made and serialised
+    /// without the lock.
     fn change_state<R>(&self, f: impl FnOnce(&mut Cow<Value>) -> R) -> Option<(R, bool)> {
         let (current, imported_at) = {
             let live = self.live.read().unwrap();
@@ -1100,9 +1100,6 @@ impl Engine {
         let mut state = Cow::Borrowed(&*current);
         let r = f(&mut state);
         let Cow::Owned(next) = state else { return Some((r, false)) };
-        if next == *current {
-            return Some((r, false));
-        }
         drop(current);
         self.store_state(next, imported_at);
         Some((r, true))
@@ -1141,7 +1138,9 @@ impl Engine {
             .change_state(|state| {
                 let mut next = Value::clone(state);
                 let what = edit(&mut next)?;
-                *state = Cow::Owned(next);
+                if next != **state {
+                    *state = Cow::Owned(next);
+                }
                 Ok::<_, String>(what)
             })
             .ok_or("no settings imported yet")?;
