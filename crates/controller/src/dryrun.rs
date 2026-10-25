@@ -272,7 +272,7 @@ mod tests {
 
         // A value that differs only by trailing blanks differs (an SSID `Home ` is not `Home`).
         let blank = compare_field("wireless.1.ssid=Home ", "wireless.1.ssid=Home", false, false);
-        assert!(!blank.identical && !blank.equivalent);
+        assert!(!blank.identical && !blank.equivalent && !blank.same_content);
         assert!(!equivalent("wireless.1.ssid=Home ", "wireless.1.ssid=Home", false));
 
         // Against a redacted copy, secret values cannot differ.
