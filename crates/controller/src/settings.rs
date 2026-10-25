@@ -2862,7 +2862,7 @@ pub fn apply_usergroup(state: &mut Value, e: &GroupEdit) -> Result<String, Strin
     if let Some(u) = up {
         g["qos_rate_max_up"] = json!(u);
     }
-    let show = |v: &Value| match v.as_i64() {
+    let show = |v: &Value| match num(v) {
         Some(n) if n > 0 => format!("{} Mbps", n as f64 / 1000.0),
         _ => "none".into(),
     };
@@ -3002,6 +3002,11 @@ mod speed_and_schedule_tests {
         let id = id_of(s["usergroup"].as_array().unwrap().iter().find(|g| g["name"] == "Kids").unwrap()).unwrap();
         assert!(apply_usergroup(&mut s, &group(Some(&id), json!({ "qos_rate_max_down": 1 }))).is_err(), "0 and 1 kbps are not allowed");
         apply_usergroup(&mut s, &group(Some(&id), json!({ "qos_rate_max_down": "6000" }))).unwrap();
+        // A rate stored as text (an import) is told as the number it is.
+        let kids = s["usergroup"].as_array_mut().unwrap().iter_mut().find(|g| g["name"] == "Kids").unwrap();
+        kids["qos_rate_max_up"] = json!("2500");
+        let what = apply_usergroup(&mut s, &group(Some(&id), json!({ "name": "Kids" }))).unwrap();
+        assert!(what.contains("down 6 Mbps, up 2.5 Mbps"), "{what}");
         assert!(apply_usergroup(&mut s, &group(None, json!({ "name": "Kids" }))).is_err(), "names are unique");
         apply_client_group(&mut s, &client("AA-BB-CC-00-00-01", Some(&id))).unwrap();
         assert_eq!((s["clients"].as_array().unwrap().len(), s["clients"][0]["usergroup_id"].as_str()), (1, Some(id.as_str())), "the entry, however the MAC is written");
