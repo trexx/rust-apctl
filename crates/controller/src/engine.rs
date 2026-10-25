@@ -1373,8 +1373,9 @@ impl Engine {
             None => (None, None, None),
         };
         let event_type = text("event_type").unwrap_or_default();
-        // The table's `auth_algo`, `assoc_ms`, `auth_ms`, `ip_ms` and `reason` columns
-        // are no longer written: `detail` holds them, as the AP sent them.
+        // The table's columns from `auth_algo` to `reason` are no longer written:
+        // `detail` holds their values, as the AP sent them (rows from before it
+        // was added are read from them).
         let mut row = vec![
             Sql::Integer(ts),
             Sql::Text(ap.to_string()),
@@ -1383,10 +1384,6 @@ impl Engine {
             essid.clone().into(),
             radio.into(),
             Sql::Text(event_type.clone()),
-            text("ip_assign_type").into(),
-            num("dns_responses").map(|v| v as i64).into(),
-            num("dns_timeouts").map(|v| v as i64).into(),
-            num("avg_rssi").or_else(|| num("auth_rssi")).map(|v| v as i64).into(),
         ];
         // Failed attempts are worth an event, as the connection views count them (a
         // roam, or a soft failure that got traffic and DNS answers, is none); the
@@ -1410,8 +1407,7 @@ impl Engine {
         row.push(Sql::Text(n.to_string()));
         self.writer.exec(
             Db::Config,
-            "INSERT INTO connections (ts, ap_mac, client_mac, vap, essid, radio, event_type, ip_assign_type, dns_responses, dns_timeouts, rssi, detail) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+            "INSERT INTO connections (ts, ap_mac, client_mac, vap, essid, radio, event_type, detail) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             row,
         );
         if let Some(data) = failed {
