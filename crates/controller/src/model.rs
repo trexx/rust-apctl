@@ -190,9 +190,20 @@ pub struct NeighborSample {
     pub is_isolated: bool,
     pub ap_name: Option<String>,
     pub model: Option<String>,
+    /// A Ubiquiti AP's own MAC, which its beacon carries as the serial number
+    /// (others send none, or zeros).
+    pub serial: Option<Mac>,
     /// How long ago, in seconds, the scan heard it: the AP reports what its
     /// scans found, an entry as it was when last heard (for half an hour or more).
     pub age: Option<i64>,
+}
+
+impl NeighborSample {
+    /// When the scan heard it, at `ts`: the AP reports an entry as last heard,
+    /// [`age`](Self::age) seconds before (never before the epoch or after `ts`).
+    pub fn heard(&self, ts: Ts) -> Ts {
+        ts - self.age.unwrap_or(0).clamp(0, ts.max(0))
+    }
 }
 
 /// One channel from a spectrum (channel survey) scan of one radio.
@@ -264,24 +275,14 @@ impl McastCounts {
     }
 }
 
-#[derive(Debug, Clone, Serialize)]
-pub struct McastGroup {
-    pub group_ip: String,
-    pub dst_port: Option<i64>,
-    /// Traffic type: mdns, ssdp, igmp, stream, dhcp, arp...
-    #[serde(rename = "type")]
-    pub kind: Option<Cow<'static, str>>,
-    #[serde(flatten)]
-    pub counts: McastCounts,
-}
-
 /// Serialised with its [`delivery`](Multicast::delivery), as the client's page shows it.
 #[derive(Debug, Clone, Default)]
 pub struct Multicast {
     /// Counters per traffic type (arp, dhcp, dhcpv6, igmp, ipv6_nd, mdns, mld, ssdp, stream, other).
     pub types: std::collections::BTreeMap<Cow<'static, str>, McastCounts>,
-    /// Destination groups the client's traffic used.
-    pub groups: Vec<McastGroup>,
+    /// Whether the AP listed destination groups for the client's traffic: it
+    /// tracks the groups (see [`delivery`](Multicast::delivery)).
+    pub has_groups: bool,
     /// Groups the client has joined.
     pub memberships: Vec<String>,
     /// mDNS service types the client's traffic concerned (e.g. `_googlecast._tcp.local`).
@@ -295,8 +296,8 @@ pub struct McastService {
     pub bytes: i64,
 }
 
-/// The traffic types APs report, so that a client's types and groups name
-/// them without a copy each.
+/// The traffic types APs report, so that a client's types name them without
+/// a copy each.
 const MCAST_TYPES: [&str; 10] = ["arp", "dhcp", "dhcpv6", "igmp", "ipv6_nd", "mdns", "mld", "other", "ssdp", "stream"];
 
 fn mcast_type(name: &str) -> Cow<'static, str> {
@@ -308,27 +309,19 @@ impl Serialize for Multicast {
         #[derive(Serialize)]
         struct View<'a> {
             types: &'a std::collections::BTreeMap<Cow<'static, str>, McastCounts>,
-            groups: &'a [McastGroup],
             memberships: &'a [String],
             services: &'a [McastService],
             delivery: Option<&'static str>,
         }
-        let Multicast { types, groups, memberships, services } = self;
-        View { types, groups, memberships, services, delivery: self.delivery() }.serialize(s)
+        let Multicast { types, has_groups: _, memberships, services } = self;
+        View { types, memberships, services, delivery: self.delivery() }.serialize(s)
     }
 }
 
 impl Multicast {
     fn parse(v: &Value) -> Option<Multicast> {
         let types = v["types"].as_object()?.iter().map(|(k, x)| (mcast_type(k), McastCounts::parse(x))).collect();
-        let groups = v["groups"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .filter_map(|g| {
-                Some(McastGroup { group_ip: g["group_ip"].as_str()?.to_string(), dst_port: int(&g["dst_port"]), kind: g["type"].as_str().filter(|s| !s.is_empty()).map(mcast_type), counts: McastCounts::parse(g) })
-            })
-            .collect();
+        let has_groups = v["groups"].as_array().is_some_and(|g| g.iter().any(|g| g["group_ip"].is_string()));
         let memberships = v["memberships"].as_array().into_iter().flatten().filter_map(|m| m["group_ip"].as_str().map(str::to_string)).collect();
         let services = v["services"]
             .as_array()
@@ -336,7 +329,7 @@ impl Multicast {
             .flatten()
             .filter_map(|x| Some(McastService { name: x["name"].as_str()?.to_string(), pkts: int(&x["pkts"]).unwrap_or(0), bytes: int(&x["bytes"]).unwrap_or(0) }))
             .collect();
-        Some(Multicast { types, groups, memberships, services })
+        Some(Multicast { types, has_groups, memberships, services })
     }
 
     /// "optimized" when the client joined groups and the AP tracks them,
@@ -344,7 +337,7 @@ impl Multicast {
     pub fn delivery(&self) -> Option<&'static str> {
         if self.memberships.is_empty() {
             None
-        } else if self.groups.is_empty() {
+        } else if !self.has_groups {
             Some("flooding")
         } else {
             Some("optimized")
@@ -528,6 +521,7 @@ pub fn parse_with_scans(ts: Ts, p: &Value) -> anyhow::Result<(Snapshot, Scans)> 
                 is_isolated: n["is_isolated"].as_bool() == Some(true),
                 ap_name: string(&n["ap_name"]),
                 model: string(&n["model"]),
+                serial: n["serialno"].as_str().and_then(|s| s.parse::<Mac>().ok()).filter(|m| m.0 != [0; 6]),
                 age: int(&n["age"]),
             });
         }
@@ -797,7 +791,8 @@ pub(crate) mod tests {
             "services": [{ "name": "_googlecast._tcp.local", "pkts": "2" }],
         }))
         .unwrap();
-        assert_eq!((m.types["mdns"].tx_pkts, m.types["mdns"].rx_bytes, m.groups[0].dst_port, m.services[0].pkts), (5, 7, Some(5353), 2));
+        assert_eq!((m.types["mdns"].tx_pkts, m.types["mdns"].rx_bytes, m.has_groups, m.services[0].pkts), (5, 7, true, 2));
+        assert!(!Multicast::parse(&json!({ "types": {}, "groups": [{ "dst_port": 5353 }] })).unwrap().has_groups, "a group without its address is none");
     }
 
     #[test]

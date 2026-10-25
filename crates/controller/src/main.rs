@@ -130,9 +130,11 @@ struct ServeArgs {
     /// Where to receive informs in active mode.
     #[arg(long, env = "APCTL_INFORM_LISTEN", default_value = "0.0.0.0:8080")]
     pub inform_listen: SocketAddr,
-    /// Active mode: the URL APs should inform to, given to APs adopted over SSH, and
-    /// whose host and port configs name (http://host[:port]/inform, e.g.
-    /// http://unifi.example:8080/inform). Defaults to the one the managed APs use.
+    /// Active mode: the URL APs adopted over SSH are told to inform to
+    /// (http://host[:port]/inform, e.g. http://unifi.example:8080/inform). Configs
+    /// name its host and port only for an AP whose record has no inform URL: a
+    /// managed AP keeps its record's, as with the official controller. Defaults to
+    /// the one the managed APs use.
     #[arg(long, env = "APCTL_INFORM_URL")]
     pub inform_url: Option<String>,
     /// Where to answer STUN in active mode (the APs' `stun_url`; also used to
@@ -222,6 +224,10 @@ async fn serve(args: ServeArgs) -> Result<()> {
     if backups.key.is_none() {
         tracing::warn!("no --backup-key: backups are written unencrypted");
     }
+
+    // The web listener too is part of the configuration: a --listen that cannot
+    // be bound stops the start here. Connections wait until the API is up.
+    let listener = tokio::net::TcpListener::bind(listen).await.with_context(|| format!("binding {listen}"))?;
 
     // A restore chosen in the UI is applied now, before the databases are opened.
     backup::apply_pending(&backups);
@@ -331,10 +337,10 @@ async fn serve(args: ServeArgs) -> Result<()> {
         source: source_desc, inform_url, syslog_listen: syslog_listen.map(|a| a.port()), keys, memo: Default::default(), threats: threat_state,
     });
     channelai::schedule(state.clone());
+    series::Memo::spawn_sweep(state.clone());
     ratelimit::spawn(state.clone());
     adopt::spawn(state.clone());
     let app = api::router(state);
-    let listener = tokio::net::TcpListener::bind(listen).await.with_context(|| format!("binding {listen}"))?;
     tracing::info!("web UI and API on http://{listen}");
     axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>()).with_graceful_shutdown(shutdown(writer.clone(), drain.clone())).await?;
     finish(writer, drain).await;

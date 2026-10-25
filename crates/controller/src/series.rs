@@ -304,7 +304,32 @@ struct MemoKey {
 /// long its read is reused, and the slot): several tabs, and each tab's refresh
 /// every minute, ask for the same windows again. Kept in `AppState`.
 #[derive(Default)]
-pub struct Memo(std::sync::Mutex<HashMap<MemoKey, (std::time::Instant, std::time::Duration, Slot)>>);
+pub struct Memo(std::sync::Mutex<MemoMap>);
+
+type MemoMap = HashMap<MemoKey, (std::time::Instant, std::time::Duration, Slot)>;
+
+impl Memo {
+    fn lock(&self) -> std::sync::MutexGuard<'_, MemoMap> {
+        self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Lets go of each read no longer reused, and of a slot left empty (its read
+    /// failed or was given up) as long after it was made.
+    fn sweep(m: &mut MemoMap) {
+        m.retain(|_, (made, ttl, slot)| slot.get().map_or(*made, |(at, _)| *at).elapsed() < *ttl);
+    }
+
+    /// Sweeps the memo every minute, so what the views read is let go of when the
+    /// last tab closes too, not at the next query.
+    pub fn spawn_sweep(s: AppState) {
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                Memo::sweep(&mut s.memo.lock());
+            }
+        });
+    }
+}
 
 /// [`read`] from `db` for `view`, reusing what the same query read less than
 /// its tier's `memo_secs` ago (the window then ends that much earlier). Queries
@@ -322,14 +347,12 @@ pub(crate) async fn memo_read<T: Send + Sync + 'static>(
     let ttl = std::time::Duration::from_secs(TIERS[tier].memo_secs);
     // The slot being read or read recently enough, else a new one.
     let slot = {
-        let mut m = s.memo.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut m = s.memo.lock();
         match m.get(&key) {
             Some((_, _, slot)) if slot.get().is_none_or(|(at, _)| at.elapsed() < ttl) => slot.clone(),
             _ => {
                 m.remove(&key);
-                // Each read goes when it is no longer reused; a slot left empty (its
-                // read failed or was given up) as long after it was made.
-                m.retain(|_, (made, ttl, slot)| slot.get().map_or(*made, |(at, _)| *at).elapsed() < *ttl);
+                Memo::sweep(&mut m);
                 let slot = Slot::default();
                 // Bounded: odd queries (explicit windows) are not all kept.
                 if m.len() < 256 {

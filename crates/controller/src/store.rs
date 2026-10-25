@@ -370,8 +370,10 @@ fn open_ro(path: &Path) -> Result<Connection> {
     let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX)
         .with_context(|| format!("opening {} read-only", path.display()))?;
     conn.execute_batch("PRAGMA busy_timeout=5000; PRAGMA temp_store=MEMORY;")?;
-    // Room for every series query (6 tables in 3 tiers) besides the rest.
-    conn.set_prepared_statement_cache_capacity(32);
+    // The series route alone prepares some 18 statements (6 tables in 3 tiers) and the
+    // insights views some 30 more on metrics.db, besides the background checks': room
+    // for them all, so the pool's most used connection keeps them compiled.
+    conn.set_prepared_statement_cache_capacity(64);
     Ok(conn)
 }
 
@@ -675,10 +677,19 @@ pub fn stored_push_at(c: &Connection, mac: &inform::Mac) -> rusqlite::Result<Opt
     c.prepare_cached(&format!("{STORED_PUSH} WHERE mac = ?1"))?.query_row([mac.to_string()], |r| Ok((stored_push_row(r)?, r.get(3)?))).optional()
 }
 
-/// Every AP's last stored push, with its secrets masked.
-pub fn stored_pushes(c: &Connection) -> rusqlite::Result<HashMap<inform::Mac, PushedConfig>> {
-    let mut stmt = c.prepare(STORED_PUSH)?;
-    let mut rows = stmt.query([])?;
+/// Every AP's last stored push, or only those of the APs in `of`, with its
+/// secrets masked.
+pub fn stored_pushes(c: &Connection, of: Option<&[inform::Mac]>) -> rusqlite::Result<HashMap<inform::Mac, PushedConfig>> {
+    // The MACs as one JSON list: one statement whatever their number.
+    let of = of.map(|macs| serde_json::to_string(macs).expect("MACs serialise"));
+    let mut stmt = match of {
+        None => c.prepare_cached(STORED_PUSH)?,
+        Some(_) => c.prepare_cached(&format!("{STORED_PUSH} WHERE mac IN (SELECT value FROM json_each(?1))"))?,
+    };
+    let mut rows = match &of {
+        None => stmt.query([])?,
+        Some(of) => stmt.query([of])?,
+    };
     let mut out = HashMap::new();
     while let Some(r) = rows.next()? {
         // A row whose MAC does not parse is no AP's.
@@ -883,6 +894,21 @@ mod tests {
 
     fn temp_dir(name: &str) -> TestDir {
         TestDir::new(&format!("store-{name}"))
+    }
+
+    #[test]
+    fn stored_pushes_are_read_for_every_ap_or_the_ones_asked_for() {
+        let dir = temp_dir("pushes");
+        std::fs::create_dir_all(&dir).unwrap();
+        migrate(&dir).unwrap();
+        let conns = open_all(&dir).unwrap();
+        let c = &conns[Db::Config as usize];
+        c.execute_batch("INSERT INTO device_config (mac, ts, mgmt_cfg) VALUES ('02:00:00:00:00:01', 1, 'a=1'), ('02:00:00:00:00:02', 1, 'a=2'), ('nonsense', 1, 'a=3')").unwrap();
+        let (a, b): (inform::Mac, inform::Mac) = ("02:00:00:00:00:01".parse().unwrap(), "02:00:00:00:00:02".parse().unwrap());
+        let macs = |of| stored_pushes(c, of).unwrap().into_keys().collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(macs(None), [a, b].into());
+        assert_eq!(macs(Some(&[b])), [b].into());
+        assert_eq!(stored_pushes(c, Some(&[b])).unwrap()[&b].mgmt_cfg, "a=2");
     }
 
     #[test]

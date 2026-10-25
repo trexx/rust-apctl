@@ -458,6 +458,19 @@ where
     Some(&rows.entry(k).or_insert(Row::new(value, ts, stamp)).value)
 }
 
+/// The value under `k` in `m`, made by `new` when there is none: the key is
+/// copied only for a new entry.
+fn slot<'m, K, Q, V>(m: &'m mut HashMap<K, V>, k: &Q, new: impl FnOnce() -> V) -> &'m mut V
+where
+    K: std::borrow::Borrow<Q> + Eq + std::hash::Hash,
+    Q: ToOwned<Owned = K> + Eq + std::hash::Hash + ?Sized,
+{
+    if !m.contains_key(k) {
+        m.insert(k.to_owned(), new());
+    }
+    m.get_mut(k).expect("inserted above")
+}
+
 /// Whether a row last written at `at` (if ever) is due again at `ts`.
 fn due(at: Option<&Ts>, ts: Ts, every: Ts) -> bool {
     at.is_none_or(|at| ts - at >= every || ts < *at)
@@ -576,7 +589,7 @@ impl Engine {
             let aliases = stmt
                 .query_map([], |r| Ok((r.get::<_, String>(0)?, Alias { alias: r.get(1)?, note: r.get(2)? })))?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
-            Ok((devices, clients, aliases, state, store::stored_pushes(c)?))
+            Ok((devices, clients, aliases, state, store::stored_pushes(c, None)?))
         })?;
         self.stored_config = pushes;
         let mut live = self.live.write().unwrap();
@@ -795,11 +808,7 @@ impl Engine {
             if now.0.is_none() {
                 continue; // no VAP on this radio, so nothing to compare
             }
-            // The band is copied only for a radio not seen before.
-            if !tracks.contains_key(r.radio.as_str()) {
-                tracks.insert(r.radio.clone(), RadioTrack::default());
-            }
-            let track = tracks.get_mut(r.radio.as_str()).expect("inserted above");
+            let track = slot(tracks, r.radio.as_str(), RadioTrack::default);
             match track.committed {
                 None => track.committed = Some(now),
                 Some(c) if c == now => track.candidate = None,
@@ -1088,10 +1097,10 @@ impl Engine {
     }
 
     /// Changes the settings: `f` gets them to copy (`to_mut`) only when it
-    /// changes them, and a copy that differs is stored, under the time the
-    /// settings were imported (an edit is no import). None without settings;
-    /// else what `f` returned and whether they were stored. The copy is made and
-    /// serialised without the lock.
+    /// changes them, and a copy is stored, under the time the settings were
+    /// imported (an edit is no import). None without settings; else what `f`
+    /// returned and whether they were stored. The copy is made and serialised
+    /// without the lock.
     fn change_state<R>(&self, f: impl FnOnce(&mut Cow<Value>) -> R) -> Option<(R, bool)> {
         let (current, imported_at) = {
             let live = self.live.read().unwrap();
@@ -1100,9 +1109,6 @@ impl Engine {
         let mut state = Cow::Borrowed(&*current);
         let r = f(&mut state);
         let Cow::Owned(next) = state else { return Some((r, false)) };
-        if next == *current {
-            return Some((r, false));
-        }
         drop(current);
         self.store_state(next, imported_at);
         Some((r, true))
@@ -1130,6 +1136,8 @@ impl Engine {
         // The new settings may hold the syslog key of an AP given up on.
         self.syslog_unknown.clear();
         self.emit(Event::site(ts, EventKind::SettingsImported, summary));
+        // Every AP's config may have changed: as after an edit, they pick it up now.
+        crate::stun::poke_all(&self.live.read().unwrap());
     }
 
     /// The engine is the only writer of the settings, so they cannot change
@@ -1141,7 +1149,9 @@ impl Engine {
             .change_state(|state| {
                 let mut next = Value::clone(state);
                 let what = edit(&mut next)?;
-                *state = Cow::Owned(next);
+                if next != **state {
+                    *state = Cow::Owned(next);
+                }
                 Ok::<_, String>(what)
             })
             .ok_or("no settings imported yet")?;
@@ -1363,8 +1373,9 @@ impl Engine {
             None => (None, None, None),
         };
         let event_type = text("event_type").unwrap_or_default();
-        // The table's `auth_algo`, `assoc_ms`, `auth_ms`, `ip_ms` and `reason` columns
-        // are no longer written: `detail` holds them, as the AP sent them.
+        // The table's columns from `auth_algo` to `reason` are no longer written:
+        // `detail` holds their values, as the AP sent them (rows from before it
+        // was added are read from them).
         let mut row = vec![
             Sql::Integer(ts),
             Sql::Text(ap.to_string()),
@@ -1373,10 +1384,6 @@ impl Engine {
             essid.clone().into(),
             radio.into(),
             Sql::Text(event_type.clone()),
-            text("ip_assign_type").into(),
-            num("dns_responses").map(|v| v as i64).into(),
-            num("dns_timeouts").map(|v| v as i64).into(),
-            num("avg_rssi").or_else(|| num("auth_rssi")).map(|v| v as i64).into(),
         ];
         // Failed attempts are worth an event, as the connection views count them (a
         // roam, or a soft failure that got traffic and DNS answers, is none); the
@@ -1400,8 +1407,7 @@ impl Engine {
         row.push(Sql::Text(n.to_string()));
         self.writer.exec(
             Db::Config,
-            "INSERT INTO connections (ts, ap_mac, client_mac, vap, essid, radio, event_type, ip_assign_type, dns_responses, dns_timeouts, rssi, detail) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+            "INSERT INTO connections (ts, ap_mac, client_mac, vap, essid, radio, event_type, detail) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             row,
         );
         if let Some(data) = failed {
@@ -1521,9 +1527,7 @@ impl Engine {
     fn check_isolated(&mut self, ts: Ts, heard_by: Mac, neighbors: &[crate::model::NeighborSample]) {
         use crate::model::{hardware_num, same_hardware};
         let started = self.first_tick.unwrap_or(ts);
-        // When the scan heard it (as in write_metrics, which takes the age later).
-        let heard = |n: &crate::model::NeighborSample| ts - n.age.unwrap_or(0).clamp(0, ts.max(0));
-        let flagged: Vec<&crate::model::NeighborSample> = neighbors.iter().filter(|n| n.is_isolated && heard(n) >= started).collect();
+        let flagged: Vec<&crate::model::NeighborSample> = neighbors.iter().filter(|n| n.is_isolated && n.heard(ts) >= started).collect();
         if flagged.is_empty() {
             return;
         }
@@ -1534,16 +1538,27 @@ impl Engine {
             live.devices.keys().chain(live.known_devices.keys()).map(|m| (*m, hardware_num(m))).collect()
         };
         for n in flagged {
-            let Ok(b) = n.bssid.parse::<Mac>().map(|m| hardware_num(&m)) else { continue };
-            // The nearest of our APs that is likely the same hardware.
-            let Some((ap, _)) = ours.iter().filter(|(_, x)| same_hardware(*x, b)).min_by_key(|(_, x)| x.abs_diff(b)) else { continue };
-            let heard = heard(n);
-            if self.isolated.get(ap).is_some_and(|t| heard - t < 3600) {
+            // The AP the beacon names as its own (as the official controller reads it), or
+            // without a name, the one of ours its BSSID likely derives from: an AP's BSSIDs
+            // are its MAC plus a little, so the nearest at or below it, else the nearest.
+            let ap = match n.serial {
+                Some(serial) if ours.iter().any(|(m, _)| *m == serial) => serial,
+                Some(_) => continue,
+                None => {
+                    let Ok(b) = n.bssid.parse::<Mac>().map(|m| hardware_num(&m)) else { continue };
+                    let near = || ours.iter().filter(|(_, x)| same_hardware(*x, b));
+                    let below = near().filter(|(_, x)| *x <= b).max_by_key(|(_, x)| *x);
+                    let Some((ap, _)) = below.or_else(|| near().min_by_key(|(_, x)| x.abs_diff(b))) else { continue };
+                    *ap
+                }
+            };
+            let heard = n.heard(ts);
+            if self.isolated.get(&ap).is_some_and(|t| heard - t < 3600) {
                 continue;
             }
-            self.isolated.insert(*ap, heard);
+            self.isolated.insert(ap, heard);
             let data = json!({ "heard_by": heard_by.to_string(), "bssid": n.bssid, "signal": n.signal });
-            self.emit(Event::device(ts, EventKind::ApIsolated, *ap, data));
+            self.emit(Event::device(ts, EventKind::ApIsolated, ap, data));
         }
     }
 
@@ -1755,8 +1770,9 @@ impl Engine {
             // When the scan heard it, which is when it was last seen as it is: an entry
             // the AP keeps reporting from an old scan is no sighting now. Its age
             // grows at every inform, so it is no change of the neighbour, and its
-            // row is due again only when it is heard again.
-            let heard = ts - n.age.take().unwrap_or(0).clamp(0, ts.max(0));
+            // row is due again only when it is heard again (so the age is left out of the row).
+            let heard = n.heard(ts);
+            n.age = None;
             let Some(n) = report(rows, n, |n| n.bssid.as_str(), ts, heard, REFRESH_SECS) else { continue };
             self.writer.exec(
                 Db::Config,
@@ -1776,11 +1792,7 @@ impl Engine {
         rows.retain(|_, r| r.seen == ts);
         let radios = self.written.spectrum.entry(s.ap.mac).or_default();
         for (radio, channels) in spectrum {
-            // Looked up by reference: the radio's name is copied only for a new one.
-            if !radios.contains_key(&radio) {
-                radios.insert(radio.clone(), Rows::new());
-            }
-            let rows = radios.get_mut(&radio).expect("inserted above");
+            let rows = slot(radios, radio.as_str(), Rows::new);
             for c in channels {
                 let Some(c) = report(rows, c, |c| &c.channel, ts, ts, SPECTRUM_REFRESH_SECS) else { continue };
                 self.writer.exec(
@@ -2648,19 +2660,31 @@ mod tests {
     }
 
     #[test]
-    fn an_isolated_beacon_is_blamed_on_the_nearest_ap() {
-        let mut h = harness();
-        let (a, b) = ("02:00:00:00:00:10", "02:00:00:00:00:18");
-        h.engine.handle(Input::Inform { ts: 0, peer: [10, 0, 0, 1].into(), decoded: decoded(inform(a, 1000, &[])) });
-        h.engine.handle(Input::Inform { ts: 1, peer: [10, 0, 0, 1].into(), decoded: decoded(inform(b, 1000, &[])) });
-        // A heard B's BSSID flagged isolated; A's own MAC is within 16 of it too.
-        let mut p = inform(a, 1002, &[]);
-        p["radio_table"] = json!([{ "radio": "na", "scan_table": [{ "bssid": "02:00:00:00:00:1a", "is_isolated": true, "signal": -70 }] }]);
-        h.engine.handle(Input::Inform { ts: 2, peer: [10, 0, 0, 1].into(), decoded: decoded(p) });
-        let blamed: Vec<_> = std::iter::from_fn(|| h.rx.try_recv().ok())
-            .filter_map(|m| match m { LiveMsg::Event(e) if e.kind == EventKind::ApIsolated => Some(e.device_mac), _ => None })
-            .collect();
-        assert_eq!(blamed, [b.parse().ok()]);
+    fn an_isolated_beacon_is_blamed_on_the_ap_it_derives_from() {
+        // Which AP each beacon (BSSID, serial number) is blamed on, with our APs at `aps`.
+        let blamed = |aps: [&str; 2], scan: Vec<(&str, Option<&str>)>| {
+            let mut h = harness();
+            for (i, ap) in aps.iter().enumerate() {
+                h.engine.handle(Input::Inform { ts: i as Ts, peer: [10, 0, 0, 1].into(), decoded: decoded(inform(ap, 1000, &[])) });
+            }
+            let mut p = inform(aps[0], 1002, &[]);
+            let scan: Vec<Value> = scan.iter().map(|(bssid, serial)| json!({ "bssid": bssid, "serialno": serial, "is_isolated": true, "signal": -70 })).collect();
+            p["radio_table"] = json!([{ "radio": "na", "scan_table": scan }]);
+            h.engine.handle(Input::Inform { ts: 2, peer: [10, 0, 0, 1].into(), decoded: decoded(p) });
+            std::iter::from_fn(|| h.rx.try_recv().ok())
+                .filter_map(|m| match m { LiveMsg::Event(e) if e.kind == EventKind::ApIsolated => e.device_mac.map(|m| m.to_string()), _ => None })
+                .collect::<Vec<_>>()
+        };
+        // Both MACs are within 16 of the BSSID: the one at or below it, even when the other is nearer.
+        assert_eq!(blamed(["02:00:00:00:00:10", "02:00:00:00:00:18"], vec![("02:00:00:00:00:1a", None)]), ["02:00:00:00:00:18"]);
+        assert_eq!(blamed(["02:00:00:00:00:10", "02:00:00:00:00:20"], vec![("02:00:00:00:00:1c", None)]), ["02:00:00:00:00:10"]);
+        // None at or below it: the nearest above.
+        assert_eq!(blamed(["02:00:00:00:00:10", "02:00:00:00:00:30"], vec![("02:00:00:00:00:0c", None)]), ["02:00:00:00:00:10"]);
+        // A beacon naming its AP: that one, wherever its BSSID is, and none when it is not ours.
+        assert_eq!(blamed(["02:00:00:00:00:10", "02:00:00:00:00:20"], vec![("02:00:00:00:00:1c", Some("020000000020"))]), ["02:00:00:00:00:20"]);
+        assert!(blamed(["02:00:00:00:00:10", "02:00:00:00:00:20"], vec![("02:00:00:00:00:1c", Some("020000000099"))]).is_empty());
+        // Zeros name no AP.
+        assert_eq!(blamed(["02:00:00:00:00:10", "02:00:00:00:00:20"], vec![("02:00:00:00:00:1c", Some("00:00:00:00:00:00"))]), ["02:00:00:00:00:10"]);
     }
 
     #[test]
@@ -2839,13 +2863,16 @@ mod tests {
         let fine = json!({ "event_type": "soft failure", "dns_timeouts": "1", "traffic_delta": "300000", "dns_responses": "2", "auth_rssi": "-60" });
         h.engine.handle(Input::Inform { ts: 7, peer: [10, 0, 0, 1].into(), decoded: tracker(fine) });
         h.engine.handle(Input::Inform { ts: 7, peer: [10, 0, 0, 1].into(), decoded: tracker(json!({ "event_type": "failure", "wpa_auth_failures": "1", "auth_rssi": "-60" })) });
+        // A success report showing a failure is one too (older firmware: no traffic counter).
+        h.engine.handle(Input::Inform { ts: 7, peer: [10, 0, 0, 1].into(), decoded: tracker(json!({ "event_type": "success", "dns_resp_seen": "no", "auth_rssi": "-60" })) });
         h.engine.handle(Input::Inform { ts: 8, peer: [10, 0, 0, 1].into(), decoded: notif(AP1, "event", json!({ "event_string": "EVT_AP_RadarDetected", "channel": 52 })) });
         assert_eq!(
             events(&mut h),
-            vec![("config_applied", None), ("client_connect_failed", Some(C1.into())), ("dfs_radar", None)]
+            vec![("config_applied", None), ("client_connect_failed", Some(C1.into())), ("client_connect_failed", Some(C1.into())), ("dfs_radar", None)]
         );
         let failed = stored(&h, EventKind::ClientConnectFailed);
         assert_eq!((&failed[0]["reason"], &failed[0]["rssi"]), (&json!("WPA authentication"), &json!(-60.0)));
+        assert_eq!(failed[1]["reason"], "DNS response not seen");
         // One whose mac is not one is counted as undecodable.
         let mut bad = notif(AP1, "setparam", Value::Null);
         bad.payload["mac"] = json!("nope");
@@ -2854,7 +2881,7 @@ mod tests {
         let live = h.live.read().unwrap();
         assert_eq!(live.counters.decode_errors.load(Ordering::Relaxed), 1);
         assert!(live.clients[&C1.parse().unwrap()].connected);
-        assert_eq!(live.counters.notifications.load(Ordering::Relaxed), 6);
+        assert_eq!(live.counters.notifications.load(Ordering::Relaxed), 7);
         assert_eq!(live.devices[&AP1.parse().unwrap()].last_full_inform, 0, "notifications are not client lists");
     }
 

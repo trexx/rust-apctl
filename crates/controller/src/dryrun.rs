@@ -169,8 +169,9 @@ fn masked<'a>(ours: &'a str, actual: &'a str, redacted: bool) -> (Cow<'a, str>, 
     if redacted { (cfgdiff::redact(ours).into(), cfgdiff::redact(actual).into()) } else { (ours.into(), actual.into()) }
 }
 
+/// The lines of a config, as they are, without blank ones (as cfgdiff reads it).
 fn lines(s: &str) -> Vec<&str> {
-    s.lines().map(str::trim_end).filter(|l| !l.is_empty()).collect()
+    s.lines().filter(|l| !l.trim_end().is_empty()).collect()
 }
 
 /// Compares our config with the actual one. With `redacted`, secret values are
@@ -268,6 +269,11 @@ mod tests {
         assert!(compare_field(&acl("lock2ap", "aa", "bb"), &acl("lock2ap", "bb", "aa"), false, true).equivalent);
         assert!(!compare_field(&acl("deny", "aa", "bb"), &acl("deny", "bb", "aa"), false, true).equivalent);
         assert!(!compare_field("wireless.1.bcfilt.1.mac=aa\nwireless.2.bcfilt.1.mac=bb", "wireless.1.bcfilt.1.mac=bb\nwireless.2.bcfilt.1.mac=aa", false, true).equivalent, "per VAP");
+
+        // A value that differs only by trailing blanks differs (an SSID `Home ` is not `Home`).
+        let blank = compare_field("wireless.1.ssid=Home ", "wireless.1.ssid=Home", false, false);
+        assert!(!blank.identical && !blank.equivalent);
+        assert!(!equivalent("wireless.1.ssid=Home ", "wireless.1.ssid=Home", false));
 
         // Against a redacted copy, secret values cannot differ.
         let r = compare_field("a=1\nb=2\naaa.1.wpa.psk=other", &cfgdiff::redact(actual), true, true);
