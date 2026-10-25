@@ -29,19 +29,37 @@ struct Ap {
     mac: &'static str,
     name: &'static str,
     ip: [u8; 4],
-    ng: i64,
-    na: i64,
-    na_bw: i64,
-    power: (i64, i64),
+    ng: RadioPlan,
+    na: RadioPlan,
     /// Seconds before the end of the history when the AP restarts, and how long it is away.
     reboot: Option<(i64, i64)>,
 }
 
+/// One band's radio of an AP: its channel, width (MHz) and transmit power (dBm).
+#[derive(Clone, Copy)]
+struct RadioPlan {
+    channel: i64,
+    width: i64,
+    power: i64,
+}
+
+impl Ap {
+    /// Its radio on a band: `na`, else 2.4 GHz.
+    fn radio(&self, band: &str) -> RadioPlan {
+        if band == "na" { self.na } else { self.ng }
+    }
+}
+
 const APS: [Ap; 3] = [
-    Ap { mac: "0e:5d:7a:10:00:01", name: "Living Room", ip: [192, 168, 1, 21], ng: 1, na: 36, na_bw: 80, power: (14, 20), reboot: None },
-    Ap { mac: "0e:5d:7a:10:00:02", name: "Upstairs", ip: [192, 168, 1, 22], ng: 6, na: 100, na_bw: 80, power: (12, 20), reboot: None },
-    Ap { mac: "0e:5d:7a:10:00:03", name: "Studio", ip: [192, 168, 1, 23], ng: 11, na: 44, na_bw: 40, power: (12, 17), reboot: Some((5 * 3600 + 1200, 420)) },
+    Ap { mac: "0e:5d:7a:10:00:01", name: "Living Room", ip: [192, 168, 1, 21], ng: RadioPlan { channel: 1, width: 20, power: 14 }, na: RadioPlan { channel: 36, width: 80, power: 20 }, reboot: None },
+    Ap { mac: "0e:5d:7a:10:00:02", name: "Upstairs", ip: [192, 168, 1, 22], ng: RadioPlan { channel: 6, width: 20, power: 12 }, na: RadioPlan { channel: 100, width: 80, power: 20 }, reboot: None },
+    Ap { mac: "0e:5d:7a:10:00:03", name: "Studio", ip: [192, 168, 1, 23], ng: RadioPlan { channel: 11, width: 20, power: 12 }, na: RadioPlan { channel: 44, width: 40, power: 17 }, reboot: Some((5 * 3600 + 1200, 420)) },
 ];
+
+/// The center frequency (MHz) of a 20 MHz channel on a band: `na`, else 2.4 GHz.
+fn center_freq(band: &str, channel: i64) -> i64 {
+    if band == "na" { 5000 + channel * 5 } else { 2407 + channel * 5 }
+}
 
 /// Signal (dBm) at each location (living room, upstairs, studio) from each AP.
 const SIGNAL: [[i64; 3]; 3] = [[-46, -66, -77], [-69, -49, -79], [-78, -76, -51]];
@@ -249,11 +267,11 @@ pub fn state() -> Result<Value> {
             d["syslog_key"] = json!(hex::encode(ids.syslog_key));
             d["inform_url"] = json!(inform_url());
             for r in d["radio_table"].as_array_mut().into_iter().flatten() {
-                let na = r["radio"] == "na";
-                r["channel"] = json!(if na { ap.na } else { ap.ng });
-                r["ht"] = json!(if na { ap.na_bw } else { 20 });
+                let plan = ap.radio(r["radio"].as_str().unwrap_or_default());
+                r["channel"] = json!(plan.channel);
+                r["ht"] = json!(plan.width);
                 r["tx_power_mode"] = json!("custom");
-                r["tx_power"] = json!(if na { ap.power.1 } else { ap.power.0 });
+                r["tx_power"] = json!(plan.power);
             }
             d
         })
@@ -436,7 +454,7 @@ impl Sim {
                     if c.kind == Kind::Phone {
                         let p = format!("wlan: [0:I:ANY] [UNSPECIFIED] vap-0({old_vap}):");
                         self.log(at - 2, old, "kernel", format!("{p}BTM: STA {} RSSI: {}, candidates: 1, error: 0, flags: ALLOW (0x1)", c.mac, s.signal));
-                        self.log(at - 2, old, "kernel", format!("{p}BTM: [0]{{{} ch{}/op128/phy14}}", bssid(self.ids[ap].mac, to.radio, to.idx), if to.radio == "na" { APS[ap].na } else { APS[ap].ng }));
+                        self.log(at - 2, old, "kernel", format!("{p}BTM: [0]{{{} ch{}/op128/phy14}}", bssid(self.ids[ap].mac, to.radio, to.idx), APS[ap].radio(to.radio).channel));
                         let status = if self.rng.unit() < 0.8 { 0 } else { 7 };
                         self.log(at - 1, old, "kernel", format!("{p}BTM: Received response from [{}](len = 5): dialog_token 1, status {status}, delay 0, bssid {}, cancel 0", c.mac,
                             if status == 0 { bssid(self.ids[ap].mac, to.radio, to.idx) } else { "n/a".into() }));
@@ -553,10 +571,11 @@ impl Sim {
                 let n = sta.len() as i64;
                 let (avg, sat) = if n > 0 { (load.signal / n, load.satisfaction / n) } else { (0, 100) };
                 let na = radio == "na";
+                let plan = ap.radio(radio);
                 json!({
                     "bssid": bssid(self.ids[i].mac, radio, idx), "essid": essid, "radio": radio, "radio_name": vap.radio_name(),
-                    "name": name, "id": format!("{vi}"), "channel": if na { ap.na } else { ap.ng }, "bw": if na { ap.na_bw } else { 20 },
-                    "tx_power": if na { ap.power.1 } else { ap.power.0 }, "usage": "user", "up": true, "state": "RUN", "num_sta": n,
+                    "name": name, "id": format!("{vi}"), "channel": plan.channel, "bw": plan.width,
+                    "tx_power": plan.power, "usage": "user", "up": true, "state": "RUN", "num_sta": n,
                     "tx_bytes": vc.tx as i64, "rx_bytes": vc.rx as i64, "tx_packets": (vc.tx / 1100.0) as i64, "rx_packets": (vc.rx / 500.0) as i64,
                     "tx_retries": (vc.tx / 1100.0 * if na { 0.04 } else { 0.11 }) as i64, "tx_dropped": 0, "rx_dropped": 0, "tx_errors": 0, "ccq": 0,
                     "satisfaction": sat, "avg_client_signal": avg, "wifi_tx_latency_mov": { "avg": if na { 2 } else { 6 }, "max": 40, "min": 0 },
@@ -571,6 +590,7 @@ impl Sim {
     fn radio(&mut self, r: &mut Value, i: usize, ts: i64, busy: f64, totals: &ApCounters) {
         let ap = &APS[i];
         let na = r["radio"] == "na";
+        let band = if na { "na" } else { "ng" };
         let base = if na { 6.0 } else { 22.0 };
         let interf = if na { 2 } else { self.rng.range(9, 18) };
         let self_tx = ((if na { 14.0 } else { 6.0 }) * busy + self.rng.unit() * 3.0) as i64;
@@ -584,7 +604,6 @@ impl Sim {
         ath["n_tx_pkts"] = json!(totals.pkts as i64);
         ath["n_tx_retries"] = json!((totals.retries * if na { 0.7 } else { 1.6 }) as i64);
         ath["n_rx_pkts"] = json!((totals.pkts * 0.6) as i64);
-        let band = if na { "na" } else { "ng" };
         let mut scan: Vec<Value> = NEIGHBOURS
             .iter()
             .filter(|n| n.2 == band)
@@ -592,8 +611,8 @@ impl Sim {
             .collect();
         for (j, other) in APS.iter().enumerate().filter(|(j, _)| *j != i) {
             let signal = AP_SIGNAL[i][j] + if na { -9 } else { 0 } + self.rng.range(-2, 2);
-            let ch = if na { other.na } else { other.ng };
-            scan.push(neighbour(&bssid(self.ids[j].mac, band, 0), SSID, band, ch, if na { other.na_bw } else { 20 }, signal, true, other.name));
+            let theirs = other.radio(band);
+            scan.push(neighbour(&bssid(self.ids[j].mac, band, 0), SSID, band, theirs.channel, theirs.width, signal, true, other.name));
         }
         if !na && i == 2 && ts > self.end_history - 3 * 3600 {
             scan.push(neighbour(LOOKALIKE.0, LOOKALIKE.1, "ng", LOOKALIKE.2, 20, LOOKALIKE.3 + self.rng.range(-2, 2), false, ""));
@@ -604,8 +623,8 @@ impl Sim {
             .iter()
             .map(|ch| {
                 let others = NEIGHBOURS.iter().filter(|n| n.2 == band && (n.3 - ch).abs() <= if na { 12 } else { 2 }).count() as i64;
-                let util = (others * if na { 4 } else { 9 }) + self.rng.range(1, 6) + if *ch == if na { ap.na } else { ap.ng } { self_tx } else { 0 };
-                json!({ "channel": ch, "center_freq": if na { 5000 + ch * 5 } else { 2407 + ch * 5 }, "width": 20,
+                let util = (others * if na { 4 } else { 9 }) + self.rng.range(1, 6) + if *ch == ap.radio(band).channel { self_tx } else { 0 };
+                json!({ "channel": ch, "center_freq": center_freq(band, *ch), "width": 20,
                         "utilization": util.min(90), "interference": -96 + others * 3, "interference_type": [], "other_bss_count": others, "total_samples": 120 })
             })
             .collect::<Vec<_>>());
@@ -691,7 +710,7 @@ fn vap_of(c: &Client, signal: i64) -> usize {
 
 #[allow(clippy::too_many_arguments)]
 fn neighbour(bssid: &str, essid: &str, band: &str, channel: i64, bw: i64, signal: i64, ours: bool, ap_name: &str) -> Value {
-    let freq = if band == "na" { 5000 + channel * 5 } else { 2407 + channel * 5 };
+    let freq = center_freq(band, channel);
     json!({ "bssid": bssid, "essid": essid, "band": band, "channel": channel, "bw": bw, "freq": freq, "center_freq": freq,
             "signal": signal, "rssi": signal + 95, "noise": -95, "security": if essid.is_empty() { "WPA2-Personal (AES/CCMP)" } else { "WPA2+WPA3-Personal (AES/CCMP)" },
             "is_unifi": ours, "is_ubnt": ours, "is_isolated": false, "ap_name": ap_name, "model": if ours { "U6M" } else { "" }, "age": 30 })
