@@ -493,24 +493,42 @@ pub async fn forget(State(s): State<AppState>, MacPath(mac): MacPath) -> Result<
     tokio::spawn(forget_ap(s, mac)).await?
 }
 
+/// What a forget has to do for an AP.
+#[derive(Debug, PartialEq)]
+enum ToForget {
+    /// Remove its record: at once when it is offline, else when it reports (and is told to reset).
+    Record { online: bool },
+    /// Its record left the settings another way (an import without it), but
+    /// apctl still lists it: only apctl's own records of it are left.
+    Listed,
+}
+
+impl ToForget {
+    fn of(live: &Live, mac: &Mac) -> Result<ToForget, ApiError> {
+        if live.state.as_deref().and_then(|st| device_doc(st, mac)).is_some() {
+            Ok(ToForget::Record { online: live.devices.get(mac).is_some_and(|d| d.online) })
+        } else if live.devices.contains_key(mac) || live.known_devices.contains_key(mac) {
+            Ok(ToForget::Listed)
+        } else {
+            Err(ApiError::not_found("apctl does not know this AP"))
+        }
+    }
+}
+
 /// [`forget`]'s work.
 async fn forget_ap(s: AppState, mac: Mac) -> Result<Json<Value>, ApiError> {
     crate::api::require_active(&s, "adoption needs")?;
-    let online = {
-        let live = s.live.read().unwrap();
-        if live.state.as_deref().and_then(|st| device_doc(st, &mac)).is_none() {
-            return Err(ApiError::not_found("this AP is not in the settings"));
+    let to_forget = ToForget::of(&s.live.read().unwrap(), &mac)?;
+    match to_forget {
+        ToForget::Record { online: true } => {
+            let mut live = s.live.write().unwrap();
+            live.adoption.forgetting.insert(mac, clock::now_ts());
+            crate::stun::poke(&live, &mac);
+            return Ok(Json(json!({ "forgetting": true })));
         }
-        live.devices.get(&mac).is_some_and(|d| d.online)
-    };
-    if online {
-        // Removed when it reports (and is told to reset), or after the timeout.
-        let mut live = s.live.write().unwrap();
-        live.adoption.forgetting.insert(mac, clock::now_ts());
-        crate::stun::poke(&live, &mac);
-        return Ok(Json(json!({ "forgetting": true })));
+        ToForget::Record { online: false } => finish_forget(&s.engine, mac, false).await?,
+        ToForget::Listed => forgotten(&s.engine, mac, false).await,
     }
-    finish_forget(&s.engine, mac, false).await?;
     Ok(Json(json!({ "forgotten": true })))
 }
 
@@ -524,8 +542,7 @@ pub async fn finish_forget(engine: &tokio::sync::mpsc::Sender<Input>, mac: Mac, 
     // got there first, or an import since left the AP out.
     match rx.await {
         Ok(Ok(_)) => {
-            let _ = engine.send(Input::Forget { ts: clock::now_ts(), mac }).await;
-            let _ = engine.send(Input::Note(Event::device(clock::now_ts(), EventKind::ApForgotten, mac, json!({ "reset": reset })))).await;
+            forgotten(engine, mac, reset).await;
             Ok(())
         }
         Ok(Err(e)) => {
@@ -537,6 +554,12 @@ pub async fn finish_forget(engine: &tokio::sync::mpsc::Sender<Input>, mac: Mac, 
             Err(ApiError::engine_stopped())
         }
     }
+}
+
+/// Has the engine drop apctl's records of an AP, and tells of it.
+async fn forgotten(engine: &tokio::sync::mpsc::Sender<Input>, mac: Mac, reset: bool) {
+    let _ = engine.send(Input::Forget { ts: clock::now_ts(), mac }).await;
+    let _ = engine.send(Input::Note(Event::device(clock::now_ts(), EventKind::ApForgotten, mac, json!({ "reset": reset })))).await;
 }
 
 #[cfg(test)]
@@ -638,6 +661,18 @@ mod tests {
             got.push(x);
         }
         assert_eq!(got, ["forget", "ap_forgotten"], "the second forget found no record");
+    }
+
+    #[test]
+    fn an_ap_listed_without_a_record_can_be_forgotten() {
+        let mut live = Live { state: Some(Arc::new(state())), ..Live::default() };
+        let (ours, gone): (Mac, Mac) = ("02:00:00:00:00:01".parse().unwrap(), "02:00:00:00:00:02".parse().unwrap());
+        assert_eq!(ToForget::of(&live, &ours).ok(), Some(ToForget::Record { online: false }));
+        assert_eq!(ToForget::of(&live, &gone).err().map(|e| e.0), Some(axum::http::StatusCode::NOT_FOUND), "not known at all");
+        // Stored from an earlier run, its record since left out by an import.
+        let known = crate::engine::KnownDevice { first_seen: 1, last_seen: 2, uptime: None, version: None, hostname: None, model: None, model_display: None, ip: None, serial: None, offline: true };
+        live.known_devices.insert(gone, known);
+        assert_eq!(ToForget::of(&live, &gone).ok(), Some(ToForget::Listed));
     }
 
     #[test]
