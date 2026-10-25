@@ -683,7 +683,7 @@ mod tests {
         assert_eq!(ToForget::of(&live, &ours).ok(), Some(ToForget::Record { online: false }));
         assert_eq!(ToForget::of(&live, &gone).err().map(|e| e.0), Some(axum::http::StatusCode::NOT_FOUND), "not known at all");
         // Stored from an earlier run, its record since left out by an import.
-        let known = crate::engine::KnownDevice { first_seen: 1, last_seen: 2, uptime: None, version: None, hostname: None, model: None, model_display: None, ip: None, serial: None, offline: true };
+        let known = crate::engine::KnownDevice { first_seen: 1, last_seen: 2, offline: true, ..Default::default() };
         live.known_devices.insert(gone, known);
         assert_eq!(ToForget::of(&live, &gone).ok(), Some(ToForget::Listed));
     }

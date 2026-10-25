@@ -348,7 +348,7 @@ impl Live {
 
 /// What the database remembers about an AP from a previous run: what tells
 /// what happened while apctl was away, and what the device list shows of it.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct KnownDevice {
     pub first_seen: Ts,
     pub last_seen: Ts,
@@ -2704,8 +2704,7 @@ mod tests {
         let mut h = harness();
         let (a, b) = ("02:00:00:00:00:10", "02:00:00:00:00:18");
         // B is only in the database: it lost its uplink before apctl restarted.
-        let known = KnownDevice { first_seen: 0, last_seen: 0, uptime: None, version: None, hostname: None, model: None, model_display: None, ip: None, serial: None, offline: false };
-        h.engine.live.write().unwrap().known_devices.insert(b.parse().unwrap(), known);
+        h.engine.live.write().unwrap().known_devices.insert(b.parse().unwrap(), KnownDevice::default());
         let mut p = inform(a, 1000, &[]);
         p["radio_table"] = json!([{ "radio": "na", "scan_table": [{ "bssid": "02:00:00:00:00:1a", "is_isolated": true, "signal": -70 }] }]);
         h.engine.handle(Input::Inform { ts: 2, peer: [10, 0, 0, 1].into(), decoded: decoded(p) });
