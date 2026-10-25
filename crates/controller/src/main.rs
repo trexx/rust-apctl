@@ -130,9 +130,11 @@ struct ServeArgs {
     /// Where to receive informs in active mode.
     #[arg(long, env = "APCTL_INFORM_LISTEN", default_value = "0.0.0.0:8080")]
     pub inform_listen: SocketAddr,
-    /// Active mode: the URL APs should inform to, given to APs adopted over SSH, and
-    /// whose host and port configs name (http://host[:port]/inform, e.g.
-    /// http://unifi.example:8080/inform). Defaults to the one the managed APs use.
+    /// Active mode: the URL APs adopted over SSH are told to inform to
+    /// (http://host[:port]/inform, e.g. http://unifi.example:8080/inform). Configs
+    /// name its host and port only for an AP whose record has no inform URL: a
+    /// managed AP keeps its record's, as with the official controller. Defaults to
+    /// the one the managed APs use.
     #[arg(long, env = "APCTL_INFORM_URL")]
     pub inform_url: Option<String>,
     /// Where to answer STUN in active mode (the APs' `stun_url`; also used to
