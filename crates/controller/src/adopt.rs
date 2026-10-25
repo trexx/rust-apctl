@@ -181,7 +181,7 @@ pub fn pending_inform(payload: &Value) -> Value {
         _ => None,
     };
     let pick = |v: &Value, keys: &[&str]| Value::Object(keys.iter().filter_map(|&k| Some((k.to_string(), small(v.get(k)?)?))).collect());
-    let mut out = pick(payload, &["mac", "model", "model_display", "version", "serial", "ip", "hostname"]);
+    let mut out = pick(payload, &["mac", "model", "model_display", "version", "serial", "ip", "hostname", "fingerprint"]);
     if let Some(radios) = payload["radio_table"].as_array() {
         out["radio_table"] = radios.iter().take(8).map(|r| pick(r, &RADIO_KEYS)).collect();
     }
@@ -306,17 +306,28 @@ pub fn new_device(state: &Value, payload: &Value, mac: &Mac) -> Value {
 }
 
 /// Fills an AP's record with its details from an inform: its model, version,
-/// serial and address, and its hostname as its name unless it has one.
+/// serial and address, its SSH host key's fingerprint ([`keep_host_key`]),
+/// and its hostname as its name unless it has one.
 pub fn fill_from_inform(d: &mut Value, payload: &Value) {
     for k in ["model", "version", "serial", "ip"] {
         if !payload[k].is_null() {
             d[k] = payload[k].clone();
         }
     }
+    keep_host_key(d, payload);
     if d["name"].is_null()
         && let Some(n) = payload["hostname"].as_str()
     {
         d["name"] = json!(n);
+    }
+}
+
+/// Keeps the fingerprint of the SSH host key an inform reports in the AP's
+/// record (`x_ssh_hostkey_fingerprint`), as the official controller does: an
+/// adoption over SSH checks the AP against it.
+fn keep_host_key(d: &mut Value, payload: &Value) {
+    if let Some(fp) = payload["fingerprint"].as_str().filter(|f| !f.is_empty()) {
+        d["x_ssh_hostkey_fingerprint"] = json!(fp);
     }
 }
 
@@ -351,6 +362,8 @@ pub fn adopt_device(state: &mut Value, mac: &Mac, payload: &Value) -> Result<Str
         if let Some(o) = d.as_object_mut() {
             o.remove("x_aes_gcm");
         }
+        // A reset AP may have a new host key.
+        keep_host_key(d, payload);
         return Ok(format!("re-adopting AP {} with new keys", ap_name(d, mac)));
     }
     let d = new_device(state, payload, mac);
@@ -717,6 +730,19 @@ mod tests {
         device_doc_mut(&mut s, &mac).unwrap()["x_aes_gcm"] = json!(true);
         adopt_device(&mut s, &mac, &inform()).unwrap();
         assert!(device_doc(&s, &mac).unwrap().get("x_aes_gcm").is_none());
+        // The SSH host key an inform reports is kept, and a reset AP's new one replaces it.
+        let reporting = |fp: &str| {
+            let mut p = inform();
+            p["fingerprint"] = json!(fp);
+            pending_inform(&p)
+        };
+        let mac2: Mac = "02:00:00:00:00:0a".parse().unwrap();
+        adopt_device(&mut s, &mac2, &reporting("SHA256:first")).unwrap();
+        assert_eq!(device_doc(&s, &mac2).unwrap()["x_ssh_hostkey_fingerprint"], "SHA256:first");
+        adopt_device(&mut s, &mac2, &reporting("SHA256:after-reset")).unwrap();
+        assert_eq!(device_doc(&s, &mac2).unwrap()["x_ssh_hostkey_fingerprint"], "SHA256:after-reset");
+        adopt_device(&mut s, &mac2, &inform()).unwrap();
+        assert_eq!(device_doc(&s, &mac2).unwrap()["x_ssh_hostkey_fingerprint"], "SHA256:after-reset", "none reported: the kept one stays");
     }
 
     #[test]
