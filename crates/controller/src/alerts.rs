@@ -533,11 +533,21 @@ fn stored(r: &rusqlite::Row) -> rusqlite::Result<Option<Alert>> {
 /// alert raised with it: [`load_open`] tells the two kinds apart by it.
 const FLAPPING: Severity = Severity::Medium;
 
-/// What a previous run left: the alerts still open, the highest number a
-/// stored alert's id carries (`{ts}-{number}`), and the AP offline alerts of
-/// the day before `now`, oldest first: (AP, when, whether it was a "keeps
-/// dropping off" one).
-async fn load_open(store: &Arc<Store>, now: Ts) -> anyhow::Result<(Vec<Alert>, u64, Vec<(Mac, Ts, bool)>)> {
+/// What a previous run left (see [`load_open`]).
+struct Left {
+    /// The alerts still open.
+    open: Vec<Alert>,
+    /// The highest number a stored alert's id carries (`{ts}-{number}`).
+    seq: u64,
+    /// The AP offline alerts of the day before now, oldest first: (AP, when,
+    /// whether it was a "keeps dropping off" one).
+    offline: Vec<(Mac, Ts, bool)>,
+    /// When each health alert closed within the cooldown before now last closed.
+    cleared: Vec<(OpenKey, Ts)>,
+}
+
+/// What a previous run left, for [`Watcher::start`].
+async fn load_open(store: &Arc<Store>, now: Ts) -> anyhow::Result<Left> {
     let store = store.clone();
     tokio::task::spawn_blocking(move || {
         store.read(Db::Config, |c| {
@@ -549,8 +559,15 @@ async fn load_open(store: &Arc<Store>, now: Ts) -> anyhow::Result<(Vec<Alert>, u
             let sql = "SELECT COALESCE(MAX(CAST(substr(id, instr(id, '-') + 1) AS INTEGER)), 0) FROM alerts";
             let seq = c.query_row(sql, [], |r| r.get::<_, i64>(0))?;
             // An alert of a kind apctl no longer raises can't be resolved: it is left as stored.
-            let rows = open_alerts(c)?;
-            Ok((rows, u64::try_from(seq).unwrap_or(0), offline))
+            let open = open_alerts(c)?;
+            // Closed by its threshold or as no longer reported, as a run counts them (a full scan, once).
+            let sql = "SELECT key, entity, MAX(resolved_ts) FROM alerts WHERE category = ?1 AND resolved_ts > ?2 GROUP BY key, entity";
+            let mut stmt = c.prepare(sql)?;
+            let cleared = stmt
+                .query_map(rusqlite::params![Category::Health.as_str(), now - HEALTH_COOLDOWN], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, Ts>(2)?)))?
+                .filter_map(|r| r.map(|(k, e, ts)| Key::parse(&k).and_then(|k| Some(((k, Entity::parse(k, &e)?), ts)))).transpose())
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(Left { open, seq: u64::try_from(seq).unwrap_or(0), offline, cleared })
         })
     })
     .await?
@@ -640,15 +657,17 @@ impl Watcher {
         Watcher { book: Alerts { writer, tx, seq: 0, open: HashMap::new() }, store, live, aps: ApWatch::default(), cleared: HashMap::new(), unjudged: HashMap::new() }
     }
 
-    /// Starts with the alerts a previous run left open, and the offline
-    /// alerts it sent in the last day, which count towards today's limit.
+    /// Starts with the alerts a previous run left open, the offline alerts it
+    /// sent in the last day, which count towards today's limit, and the health
+    /// alerts it closed within the cooldown, which are not raised again before it ends.
     async fn start(store: Arc<Store>, writer: Writer, live: SharedLive, tx: broadcast::Sender<LiveMsg>, now: Ts) -> Watcher {
         let mut w = Watcher::new(store, writer, live, tx);
         w.aps.tz = w.site_tz();
         w.aps.started = now;
         match load_open(&w.store, now).await {
-            Ok((open, seq, offline)) => {
+            Ok(Left { open, seq, offline, cleared }) => {
                 w.book.seq = seq;
+                w.cleared.extend(cleared);
                 for a in open {
                     w.book.open.insert((a.key, a.entity.clone()), a);
                 }
@@ -1132,6 +1151,24 @@ mod tests {
         assert_eq!(restart(3700).await.aps.check(4000, ap, 3700), None);
         // A day after the first two, a drop is reported again.
         assert!(matches!(restart(90_700).await.aps.check(91_000, ap, 90_700), Some(ApChange::Offline { .. })));
+    }
+
+    #[tokio::test]
+    async fn a_restart_keeps_the_health_cooldown() {
+        let (mut w, _rx, _dir) = watcher();
+        let ap: Mac = "02:00:00:00:00:01".parse().unwrap();
+        let busy = (Key::BusyChannel, Entity::Radio(ap, "na".into()));
+        let site = (Key::ConnectFailures, Entity::Site);
+        // A busy channel raised and cleared twice, the last time at 20 000; clients failing, cleared long before.
+        for (at, k) in [(1000, &site), (10_000, &busy), (20_000, &busy)] {
+            w.book.open(at, Alert::new(k.0, Category::Health, Severity::Medium, k.1.clone(), "t".into(), "m".into()));
+            w.book.resolve(at + 60, k, || "Back to normal.".into());
+        }
+        flushed(&w.book.writer);
+        let now = 1060 + HEALTH_COOLDOWN + 100;
+        let again = Watcher::start(w.store.clone(), w.book.writer.clone(), Default::default(), broadcast::channel(4).0, now).await;
+        assert_eq!(again.cleared.iter().collect::<Vec<_>>(), [(&busy, &20_060)], "the last clear, within the cooldown");
+        assert!(!again.may_raise(&busy, now) && again.may_raise(&busy, 20_060 + HEALTH_COOLDOWN) && again.may_raise(&site, now));
     }
 
     #[tokio::test]
