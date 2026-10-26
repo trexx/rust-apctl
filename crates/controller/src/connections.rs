@@ -811,12 +811,10 @@ pub struct RoamingQuery {
     range: Option<Ts>,
     from: Option<Ts>,
     to: Option<Ts>,
-    /// How many of the newest roams to list (default 100, at most [`ROAMS_LISTED`]); the totals count them all.
-    limit: Option<usize>,
 }
 
-/// The most roams `/api/roaming` lists.
-const ROAMS_LISTED: usize = 1000;
+/// The newest roams `/api/roaming` lists (the totals count them all).
+const ROAMS_LISTED: usize = 100;
 /// The clients `/api/roaming` lists: those with the most roams (the totals count them all).
 const CLIENTS_LISTED: usize = 10;
 /// The clients with the most roams it lists for each pair of APs.
@@ -829,7 +827,6 @@ pub async fn roaming(State(s): State<AppState>, Query(q): Query<RoamingQuery>) -
     let (from, to, tier) = window(&range);
     let got = memo_read(&s, Db::Config, "roaming", &range, tier, move |c| roaming_figures(c, roams(&roam_rows(c, from, to, None)?))).await?;
     let RoamingFigures { roams, total, pairs, clients, stored, aps, named } = &*got;
-    let roams = &roams[..roams.len().min(q.limit.unwrap_or(100))];
     // The clients shown: the listed ones, each pair's top ones and those of the roams listed.
     let shown: BTreeSet<&str> = named.iter().map(String::as_str).chain(roams.iter().map(|r| r.client.as_str())).collect();
     let (ap_names, client_names) = names(stored, &s.live.read().unwrap(), aps.iter().map(String::as_str), shown);
