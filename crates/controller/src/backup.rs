@@ -1044,9 +1044,17 @@ pub fn list(b: &Backups) -> Vec<Meta> {
     out
 }
 
-fn remove(b: &Backups, name: &str) {
-    let _ = fs::remove_file(b.dir().join(name));
-    let _ = fs::remove_file(b.dir().join(format!("{name}.json")));
+/// Deletes a backup: its file first (a description without one is not
+/// listed), then its description. One already gone is no error.
+fn remove(b: &Backups, name: &str) -> Result<()> {
+    for path in [b.dir().join(name), b.dir().join(format!("{name}.json"))] {
+        if let Err(e) = fs::remove_file(&path)
+            && e.kind() != io::ErrorKind::NotFound
+        {
+            return Err(e).with_context(|| format!("deleting {}", path.display()));
+        }
+    }
+    Ok(())
 }
 
 /// How many pre-restore backups are kept.
@@ -1055,7 +1063,9 @@ const KEEP_PRE_RESTORE: usize = 3;
 /// Keeps the newest `keep` backups of a kind.
 fn prune(b: &Backups, kind: Kind, keep: usize) {
     for m in list(b).iter().filter(|m| m.kind == kind).skip(keep) {
-        remove(b, &m.name);
+        if let Err(e) = remove(b, &m.name) {
+            tracing::warn!("an old backup could not be deleted: {e:#}");
+        }
     }
 }
 
@@ -1217,11 +1227,11 @@ pub async fn delete(State(s): State<AppState>, UrlPath(name): UrlPath<String>) -
             // before its next time.
             let found = b.dir().join(&name).exists();
             if found {
-                remove(&b, &name);
+                remove(&b, &name)?;
             }
-            found
+            Ok::<_, anyhow::Error>(found)
         })
-        .await?;
+        .await??;
     if !found {
         return Err(ApiError::not_found("no such backup"));
     }
@@ -1642,7 +1652,7 @@ mod tests {
         fs::remove_file(b.dir().join(format!("{}.json", m.name))).unwrap();
         assert_eq!(b.last_auto(), m.created, "not read again");
         // After a restart, a deleted one still counts.
-        remove(&b, &m.name);
+        remove(&b, &m.name).unwrap();
         let again = Backups::new(src.to_path_buf(), None);
         assert_eq!(again.last_auto(), m.created);
         // A time ahead of the clock (set ahead once, then put right) is no backup made, noted or kept.

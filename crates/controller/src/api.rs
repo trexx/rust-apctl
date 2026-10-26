@@ -1762,6 +1762,21 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_backup_that_cannot_be_deleted_is_reported() {
+        let (state, _engine, cookie, _dir) = logged_in();
+        // A directory where the backup's file would be: there, but no file to delete.
+        let name = "apctl-0.1.0-20260101-000000.apb";
+        std::fs::create_dir_all(state.backups.dir().join(name)).unwrap();
+        let app = router(state);
+        let delete = |name: &str| {
+            let req = Request::delete(format!("/api/backups/file/{name}")).header(header::COOKIE, &cookie).header("x-requested-with", "apctl");
+            app.clone().oneshot(req.body(Body::empty()).unwrap())
+        };
+        assert_eq!(delete(name).await.unwrap().status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(delete("apctl-0.1.0-20260101-000001.apb").await.unwrap().status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
     async fn backups_download_with_their_length_and_uncompressed() {
         let (state, _engine, cookie, _dir) = logged_in();
         let m = crate::backup::create(&state.backups, &state.backups.data_dir, crate::backup::Kind::Manual, 0).unwrap();
