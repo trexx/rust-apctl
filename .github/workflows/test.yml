@@ -28,12 +28,10 @@ jobs:
           components: 'clippy'
       - uses: 'Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0' # v2.9.3
       # The tests built on real captures need fixtures kept outside the repository
-      # (APCTL_TESTDATA); without them they pass without checking anything.
+      # (APCTL_TESTDATA, docs/captures.md), which CI never has: they pass without
+      # checking anything.
       - name: 'Capture fixtures'
-        run: |
-          if [ -z "${APCTL_TESTDATA:-}" ]; then
-            echo "::notice::APCTL_TESTDATA is not set: the capture-based golden tests return early and show as passed without checking anything"
-          fi
+        run: 'echo "::notice::the capture-based golden tests have no fixtures in CI (APCTL_TESTDATA): they return early and show as passed without checking anything"'
       # The web UI is not needed: debug builds serve web/dist from disk if it exists.
       # The checks are listed in scripts/check.sh, which the release gate runs too.
       - run: 'scripts/check.sh'
