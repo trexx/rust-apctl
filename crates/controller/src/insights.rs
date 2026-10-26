@@ -644,8 +644,45 @@ pub async fn wlans(State(s): State<AppState>, Query(q): Query<RangeQuery>) -> Re
     let bucket = bucket_for(to - from, tier);
     // The history, summed up per network.
     let per = with_site_vaps(&s, &q, move |vaps| wlan_history(vaps, from, bucket)).await?;
+    // Now: per network, the APs and bands broadcasting it, clients and scores;
+    // copied, so that the live lock is not held while the list is made.
+    #[derive(Default)]
+    struct Now {
+        /// Where it is broadcast: an entry per SSID.
+        broadcast: Vec<Value>,
+        /// Its SSIDs' BSSIDs, in the order of `broadcast`.
+        bssids: Vec<String>,
+        bands: std::collections::BTreeSet<String>,
+        /// The experience scores of its SSIDs with clients.
+        scores: Vec<f64>,
+    }
+    let (mut now, connected, state) = {
+        let live = s.live.read().unwrap();
+        let mut now: BTreeMap<String, Now> = BTreeMap::new();
+        for (mac, d) in &live.devices {
+            for v in &d.snapshot.vaps {
+                let Some(e) = v.essid.as_deref().filter(|e| !e.is_empty()) else { continue };
+                let n = now.entry(e.to_string()).or_default();
+                n.broadcast.push(json!({ "ap": mac, "name": d.snapshot.ap.hostname, "radio": v.radio, "channel": v.channel, "bssid": v.bssid }));
+                n.bssids.push(v.bssid.clone());
+                if let Some(r) = &v.radio {
+                    n.bands.insert(r.clone());
+                }
+                if let Some(x) = v.satisfaction.filter(|x| *x >= 0 && v.num_sta.unwrap_or(0) > 0) {
+                    n.scores.push(x as f64);
+                }
+            }
+        }
+        // The clients connected now, per network (each client is listed once).
+        let mut connected: HashMap<&str, usize> = HashMap::new();
+        for e in live.connected_clients().filter_map(|(_, c)| c.sample.essid.as_deref()) {
+            *connected.entry(e).or_default() += 1;
+        }
+        let connected: HashMap<String, usize> = connected.into_iter().map(|(e, n)| (e.to_string(), n)).collect();
+        (now, connected, live.state.clone())
+    };
     // How our own SSIDs are heard over the air (our APs scan each other).
-    let own: Vec<String> = own_bssids(&s.live.read().unwrap()).map(|(_, v)| v.bssid.clone()).collect();
+    let own: Vec<String> = now.values().flat_map(|n| n.bssids.iter().cloned()).collect();
     let on_air: HashMap<String, String> = if own.is_empty() {
         HashMap::new()
     } else {
@@ -659,52 +696,15 @@ pub async fn wlans(State(s): State<AppState>, Query(q): Query<RangeQuery>) -> Re
         })
         .await?
     };
-    // Now: per network, the APs and bands broadcasting it, clients and scores;
-    // copied, so that the live lock is not held while the list is made.
-    #[derive(Default)]
-    struct Now {
-        /// Where it is broadcast: an entry per SSID.
-        broadcast: Vec<Value>,
-        bands: std::collections::BTreeSet<String>,
-        /// The experience scores of its SSIDs with clients.
-        scores: Vec<f64>,
-        /// The security our APs hear it with, from the first of its SSIDs heard.
-        heard: Option<String>,
-    }
-    let (mut now, connected, state) = {
-        let live = s.live.read().unwrap();
-        let mut now: BTreeMap<String, Now> = BTreeMap::new();
-        for (mac, d) in &live.devices {
-            for v in &d.snapshot.vaps {
-                let Some(e) = v.essid.as_deref().filter(|e| !e.is_empty()) else { continue };
-                let n = now.entry(e.to_string()).or_default();
-                n.broadcast.push(json!({ "ap": mac, "name": d.snapshot.ap.hostname, "radio": v.radio, "channel": v.channel, "bssid": v.bssid }));
-                if let Some(r) = &v.radio {
-                    n.bands.insert(r.clone());
-                }
-                if let Some(x) = v.satisfaction.filter(|x| *x >= 0 && v.num_sta.unwrap_or(0) > 0) {
-                    n.scores.push(x as f64);
-                }
-                if n.heard.is_none() {
-                    n.heard = on_air.get(&v.bssid).cloned();
-                }
-            }
-        }
-        // The clients connected now, per network (each client is listed once).
-        let mut connected: HashMap<&str, usize> = HashMap::new();
-        for e in live.connected_clients().filter_map(|(_, c)| c.sample.essid.as_deref()) {
-            *connected.entry(e).or_default() += 1;
-        }
-        let connected: HashMap<String, usize> = connected.into_iter().map(|(e, n)| (e.to_string(), n)).collect();
-        (now, connected, live.state.clone())
-    };
     let mut names: std::collections::BTreeSet<String> = per.keys().cloned().collect();
     names.extend(now.keys().cloned());
     let mean = |v: &[f64]| (!v.is_empty()).then(|| (v.iter().sum::<f64>() / v.len() as f64).round());
     let list: Vec<Value> = names
         .into_iter()
         .map(|essid| {
-            let Now { broadcast, bands, scores, heard } = now.remove(&essid).unwrap_or_default();
+            let Now { broadcast, bssids, bands, scores } = now.remove(&essid).unwrap_or_default();
+            // The security our APs hear it with, from the first of its SSIDs heard.
+            let heard = bssids.iter().find_map(|b| on_air.get(b));
             let clients = connected.get(&essid).copied().unwrap_or(0);
             let agg = per.get(&essid);
             let (ts, series_clients, down_bps, up_bps, peak) = agg.map_or((vec![], vec![], vec![], vec![], 0.0), |a| {
