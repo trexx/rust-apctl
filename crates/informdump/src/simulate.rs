@@ -83,9 +83,17 @@ fn prepare(payload: &mut Value, running: Option<&str>, key: &[u8; 16]) {
     payload["default"] = Value::from(*key == inform::DEFAULT_KEY);
 }
 
-/// A captured inform's payload, the key it was sealed with, and its header's cipher
-/// and compression bits.
-type Captured = (Value, [u8; 16], Flags);
+/// A captured inform, ready to replay.
+struct Captured {
+    /// The AP's MAC from the header, the one the protocol authenticates (the AES-GCM
+    /// associated data): the replay keeps each AP's key and state by it.
+    mac: Mac,
+    payload: Value,
+    /// The key it was sealed with.
+    key: [u8; 16],
+    /// Its header's cipher and compression bits.
+    sealing: Flags,
+}
 
 /// The cipher and compression bits of a captured inform's header.
 fn sealing(flags: Flags) -> Flags {
@@ -125,9 +133,9 @@ fn collect(input: impl Read + Send, ports: &[u16], keys: &KeyStore, limit: usize
     let mut pairer = Pairer::default();
     let end = capture::run(input, ports, |ev| {
         match pairer.handle(keys, ev) {
-            Some(InformEvent::Inform { decoded: Ok(d), .. }) if informs.len() < limit => {
+            Some(InformEvent::Inform { decoded: Ok(d), .. }) => {
                 let key = captured_key(&d, keys);
-                informs.push((d.payload, key, sealing(d.header.flags)));
+                informs.push(Captured { mac: d.header.mac, key, sealing: sealing(d.header.flags), payload: d.payload });
             }
             Some(InformEvent::Inform { mac, decoded: Err(e), .. }) => {
                 undecoded.count += 1;
@@ -166,11 +174,10 @@ pub fn run(pcap: &str, ports: &[u16], keys: &KeyStore, url: &str, limit: usize, 
     let mut keys_now: HashMap<Mac, [u8; 16]> = HashMap::new();
     let mut gcm_on: HashSet<Mac> = HashSet::new();
     let mut counts: HashMap<String, usize> = HashMap::new();
-    for (i, (mut payload, captured, how)) in informs.into_iter().enumerate() {
+    for (i, Captured { mac, mut payload, key: captured, sealing: how }) in informs.into_iter().enumerate() {
         if i > 0 && !every.is_zero() {
             std::thread::sleep(every);
         }
-        let mac: Mac = payload["mac"].as_str().context("inform without mac")?.parse()?;
         let key = keys_now.get(&mac).copied().unwrap_or(captured);
         prepare(&mut payload, running.get(&mac).map(String::as_str), &key);
         // These are real AP keys: a GCM nonce must never repeat under one.
@@ -261,7 +268,7 @@ mod tests {
         }
         let keys = KeyStore::default();
         let (informs, end, undecoded) = collect(&pcap[..], &[8080], &keys, 2).unwrap();
-        assert_eq!((informs.iter().map(|(p, ..)| p["n"].as_i64().unwrap()).collect::<Vec<_>>(), end), (vec![0, 1], capture::End::Stopped));
+        assert_eq!((informs.iter().map(|c| c.payload["n"].as_i64().unwrap()).collect::<Vec<_>>(), end), (vec![0, 1], capture::End::Stopped));
         assert_eq!(undecoded.report(), None);
         // Then one from an AP whose key is not known.
         let other: Mac = "02:00:00:00:00:02".parse().unwrap();
@@ -270,8 +277,9 @@ mod tests {
         write_pcap_record(&mut pcap, 3_000_000, &tcp_frame(ap, ctrl, seq, &request).unwrap()).unwrap();
         let (informs, end, undecoded) = collect(&pcap[..], &[8080], &keys, 10).unwrap();
         assert_eq!((informs.len(), end), (3, capture::End::Complete));
-        assert_eq!(informs[0].1, inform::DEFAULT_KEY);
-        assert_eq!(informs[0].2, Flags::GCM, "sealed as captured");
+        assert_eq!(informs[0].key, inform::DEFAULT_KEY);
+        assert_eq!(informs[0].sealing, Flags::GCM, "sealed as captured");
+        assert_eq!(informs.iter().map(|c| c.mac).collect::<Vec<_>>(), [mac; 3], "the header's MAC, though the payloads name none");
         assert_eq!((undecoded.count, undecoded.macs.iter().collect::<Vec<_>>()), (1, vec![&other]));
         assert!(undecoded.report().unwrap().starts_with("skipped 1 informs that did not decode (MACs 02:00:00:00:00:02); first error: "), "{:?}", undecoded.report());
     }
