@@ -100,7 +100,7 @@ pub async fn activity(State(s): State<AppState>, Query(q): Query<RangeQuery>, Qu
         }
     };
     if p.parts == Some(Parts::Activity) {
-        return Ok(Json(json!({ "bucket": bucket, "activity": vaps, "airtime": null })));
+        return Ok(Json(json!({ "activity": vaps, "airtime": null })));
     }
     // Airtime from the radios: per bucket, each figure averaged by SQLite over the
     // radios' samples that have it (a bucket where none has it is null, not 0).
@@ -132,7 +132,7 @@ pub async fn activity(State(s): State<AppState>, Query(q): Query<RangeQuery>, Qu
         Ok(json!({ "ts": air_ts, "total": total, "external_interference": external, "own_traffic": own }))
     })
     .await?;
-    Ok(Json(json!({ "bucket": bucket, "activity": vaps, "airtime": *airtime })))
+    Ok(Json(json!({ "activity": vaps, "airtime": *airtime })))
 }
 
 /// The SSIDs of `vaps` (loaded with an `extra` that starts with [`AP_BAND`]) on
@@ -565,7 +565,7 @@ pub async fn multicast(State(s): State<AppState>, Query(q): Query<RangeQuery>) -
             })
         })
         .collect();
-    Ok(Json(json!({ "bucket": bucket, "ts": ts, "types": types, "clients": list })))
+    Ok(Json(json!({ "ts": ts, "types": types, "clients": list })))
 }
 
 use crate::engine::MCAST_GAP;
@@ -630,8 +630,7 @@ fn wlan_settings(state: Option<&Value>, essid: &str) -> Value {
     let vlan = apcfg::ssid_vlan(state, crate::settings::site_id(state).unwrap_or_default(), w);
     json!({
         "enabled": flag(w, "enabled", true), "security": security, "hidden": flag(w, "hide_ssid", false), "guest": flag(w, "is_guest", false),
-        "network": network, "vlan": vlan, "bands": apcfg::wlan_bands(w), "fast_roaming": flag(w, "fast_roaming_enabled", false),
-        "bss_transition": flag(w, "bss_transition", true), "pmf": w["pmf_mode"].as_str(),
+        "network": network, "vlan": vlan, "fast_roaming": flag(w, "fast_roaming_enabled", false), "bss_transition": flag(w, "bss_transition", true),
     })
 }
 
@@ -739,7 +738,7 @@ pub async fn wlans(State(s): State<AppState>, Query(q): Query<RangeQuery>) -> Re
             })
         })
         .collect();
-    Ok(Json(json!({ "bucket": bucket, "wlans": list })))
+    Ok(Json(json!({ "wlans": list })))
 }
 
 /// The security each of a JSON list of BSSIDs is heard with, newest last.
@@ -1160,6 +1159,8 @@ mod tests {
         let g = wlan_settings(Some(&state), "Guest");
         assert_eq!((g["security"].as_str(), g["guest"].as_bool(), g["vlan"].as_i64(), g["bss_transition"].as_bool()), (Some("Open"), Some(true), Some(20), Some(true)));
         assert!(wlan_settings(Some(&state), "Other").is_null());
+        // What the Networks page shows, no more (the bands it shows are the top-level ones, as broadcast).
+        assert_eq!(h.as_object().unwrap().keys().collect::<Vec<_>>(), ["bss_transition", "enabled", "fast_roaming", "guest", "hidden", "network", "security", "vlan"]);
     }
 
     /// The views' output on a synthetic site, pinned so that reworking how they

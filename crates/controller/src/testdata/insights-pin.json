@@ -185,8 +185,7 @@
         3240,
         3540
       ]
-    },
-    "bucket": 60
+    }
   },
   "activity_a1": {
     "activity": {
@@ -374,8 +373,7 @@
         3240,
         3540
       ]
-    },
-    "bucket": 60
+    }
   },
   "activity_a1_na": {
     "activity": {
@@ -563,8 +561,7 @@
         3240,
         3540
       ]
-    },
-    "bucket": 60
+    }
   },
   "activity_na": {
     "activity": {
@@ -752,8 +749,7 @@
         3240,
         3540
       ]
-    },
-    "bucket": 60
+    }
   },
   "density": {
     "aps": [
@@ -820,7 +816,6 @@
     ]
   },
   "multicast": {
-    "bucket": 60,
     "clients": [
       {
         "ap": "Hall",
@@ -939,7 +934,6 @@
     }
   },
   "multicast_a2": {
-    "bucket": 60,
     "clients": [
       {
         "ap": "Attic",
@@ -1280,7 +1274,6 @@
     ]
   },
   "wlans": {
-    "bucket": 60,
     "wlans": [
       {
         "bands": [
@@ -1384,17 +1377,12 @@
           ]
         },
         "settings": {
-          "bands": [
-            "2g",
-            "5g"
-          ],
           "bss_transition": true,
           "enabled": true,
           "fast_roaming": false,
           "guest": false,
           "hidden": false,
           "network": "LAN",
-          "pmf": null,
           "security": "WPA2 Personal",
           "vlan": null
         },
