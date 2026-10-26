@@ -94,11 +94,15 @@ export function RadioPanel({
     "cu_interf",
   ]);
   // The radio's own retry counters stay at zero on this firmware, so totals come from its SSIDs.
-  const sum = (k: NumericKey<VapSample>) =>
-    vaps.reduce((a, v) => a + (v[k] ?? 0), 0);
+  const sum = (k: NumericKey<VapSample>, of = vaps) =>
+    of.reduce((a, v) => a + (v[k] ?? 0), 0);
   const txPkts = sum("tx_packets");
-  const retries = sum("tx_retries");
-  const attempts = sum("wifi_tx_attempts");
+  // As the server's retry rate: an SSID without attempt counters is left out, not read as 100%.
+  const counted = vaps.filter(
+    (v) => v.tx_retries !== null && v.wifi_tx_attempts !== null,
+  );
+  const retries = sum("tx_retries", counted);
+  const attempts = sum("wifi_tx_attempts", counted);
   const dropped = sum("tx_dropped");
   const mcast =
     sum("tx_mcast") + sum("rx_mcast") + sum("tx_bcast") + sum("rx_bcast");
@@ -149,7 +153,12 @@ export function RadioPanel({
           {compact(sum("rx_packets"))} packets · {bytes(sum("rx_bytes"))}
         </dd>
         <dt>TX retries</dt>
-        <dd>{share(retries, retries + attempts + sum("wifi_tx_dropped"))}</dd>
+        <dd>
+          {share(
+            retries,
+            retries + attempts + sum("wifi_tx_dropped", counted),
+          )}
+        </dd>
         <dt>TX dropped</dt>
         <dd>{share(dropped, txPkts + dropped)}</dd>
         <dt>Multicast / broadcast</dt>
