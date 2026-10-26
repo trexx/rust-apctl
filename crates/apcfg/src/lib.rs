@@ -412,9 +412,12 @@ const SSID_FEATURE_CAPS: FeatureTable<6> = [
 ];
 
 /// The optional SSID features [`ssid_feature_support`] reports on, by name. `render`
-/// sends each only to an AP with its capability bit, except `wpa3_fast_roaming`, which
-/// needs the FT bit of every radio (`radio_caps2`). An AP without it gets the SSID
-/// without the feature (no config lines), as the official controller does.
+/// sends each only to an AP with its capability bit; an AP without it gets the SSID
+/// without the feature (no config lines), as the official controller does. The
+/// exception is `wpa3_fast_roaming`: the list counts an AP as supporting it only when
+/// every radio has `radio_caps2`'s FT bit, while the render decides per radio and turns
+/// FT off on each radio without the bit (its `wpa3.ft.status` line is still sent, set
+/// to disabled).
 pub const SSID_FEATURES: &[&str] = &feature_names(SSID_FEATURE_CAPS);
 
 /// Which of [`SSID_FEATURES`] the AP supports, as `(feature, supported)`, or
