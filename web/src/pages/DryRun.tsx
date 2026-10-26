@@ -84,9 +84,13 @@ export function DryRun() {
         return c && !c.identical ? [`${f}: ${verdict(c)}`] : [];
       })
       .join("; ");
-  const total = d.history.length;
-  const matched = d.history.filter((h) => h.matches).length;
+  // The split is over the listed (newest) comparisons, the totals over all of them.
+  const listed = d.history.length;
   const reordered = d.history.filter(equivalent).length;
+  const identical = d.history.filter((h) => h.matches).length - reordered;
+  const split = reordered
+    ? ` (${listed < d.history_total ? `of the last ${listed}: ` : ""}${identical} identical, ${reordered} equivalent)`
+    : "";
   return (
     <>
       <div className="page-head">
@@ -135,13 +139,13 @@ export function DryRun() {
       <h2>
         At each config push{" "}
         <span className="muted small">
-          {total
-            ? `${matched} of ${total} match${reordered ? ` (${matched - reordered} identical, ${reordered} equivalent)` : ""}`
+          {d.history_total
+            ? `${d.history_matches} of ${d.history_total} match${split}`
             : ""}
         </span>
       </h2>
       <div className="panel">
-        {total === 0 ? (
+        {listed === 0 ? (
           <div className="muted pad">
             No config pushes compared yet. They happen when the current
             controller changes an AP's config.

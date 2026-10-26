@@ -541,8 +541,11 @@ export interface DryRun {
     /** The AP runs a different config version than when the settings were imported. */
     settings_stale: boolean;
   }[];
-  /** The comparison made at each push, stored without the diffs. */
-  history: { id: number; ts: number; mac: Mac; cfgversion: string | null; matches: boolean; comparison: { mgmt_cfg?: StoredComparison; system_cfg?: StoredComparison; error?: string } | null }[];
+  /** The comparison made at each of the newest 100 pushes, stored without the diffs. */
+  history: { id: number; ts: number; mac: Mac; matches: boolean; comparison: { mgmt_cfg?: StoredComparison; system_cfg?: StoredComparison; error?: string } | null }[];
+  /** Every stored comparison, and how many of them matched (`history` lists only the newest). */
+  history_total: number;
+  history_matches: number;
 }
 
 /** Refreshed by the live socket when a comparison is recorded or settings are imported. */
