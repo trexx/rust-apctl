@@ -959,7 +959,7 @@ struct Neighbor<'a> {
     signal: Option<i64>,
     best_signal: Option<i64>,
     last_seen: Ts,
-    /// The name of the AP that hears it best.
+    /// The name of the AP that hears it best, else its MAC.
     nearest_ap: Option<String>,
     vendor: Option<&'a str>,
 }
@@ -999,7 +999,9 @@ pub async fn neighbors(State(s): State<AppState>, Query(q): Query<NeighborQuery>
         for (bssid, ap, _) in used.iter().filter(|u| !u.1.is_empty()) {
             own.entry(bssid.clone()).or_insert_with(|| ap.clone());
         }
-        let names: HashMap<String, String> = live.devices.iter().filter_map(|(m, d)| Some((m.to_string(), d.snapshot.ap.hostname.clone()?))).collect();
+        // Named as every other view names them: also those not heard from in this run.
+        let names: HashMap<String, String> =
+            live.devices.keys().chain(live.known_devices.keys()).filter_map(|m| Some((m.to_string(), ap_name_of(&live, m).filter(|n| !n.is_empty())?))).collect();
         (own, names)
     };
     // Our own BSSIDs are the table's key for the rows our APs' signal to each
@@ -1055,7 +1057,8 @@ pub async fn neighbors(State(s): State<AppState>, Query(q): Query<NeighborQuery>
     }
     let mut list: Vec<Neighbor> = by_bssid.into_values().collect();
     for n in &mut list {
-        n.nearest_ap = name(&n.ap_mac);
+        // An AP without a name is shown by its MAC (which is not sent otherwise).
+        n.nearest_ap = Some(name(&n.ap_mac).unwrap_or_else(|| n.ap_mac.clone()));
         n.vendor = s.vendors.lookup_str(&n.bssid);
     }
     list.sort_by_key(|n| std::cmp::Reverse(n.best_signal.or(n.signal).unwrap_or(-200)));
@@ -1558,9 +1561,18 @@ mod tests {
             let q = |links_only, neighbors_only| Query(NeighborQuery { band: None, range: Some(30 * 86400), links_only, neighbors_only });
             let out = ok(neighbors(State(s.clone()), q(false, true)).await);
             assert!(out["neighbors"].as_array().unwrap().iter().all(|n| n["bssid"] != "02:00:00:00:03:a3"), "{out}");
-            let out = ok(neighbors(State(s), q(true, false)).await);
+            let out = ok(neighbors(State(s.clone()), q(true, false)).await);
             let link = out["own_links"].as_array().unwrap().iter().find(|l| l["to"] == A3).cloned();
-            assert_eq!(link.map(|l| (l["from"].clone(), l["radio"].clone(), l["signal"].clone())), Some((json!(A1), json!("na"), json!(-55))));
+            assert_eq!(link.map(|l| (l["from"].clone(), l["radio"].clone(), l["signal"].clone(), l["to_name"].clone())), Some((json!(A1), json!("na"), json!(-55), Value::Null)));
+            // Named as the other views name it, from what is stored of it; an AP without a name by its MAC.
+            let known = crate::engine::KnownDevice { hostname: Some("Garage".into()), ..Default::default() };
+            s.live.write().unwrap().known_devices.insert(A3.parse().unwrap(), known);
+            s.live.write().unwrap().devices.get_mut(&A1.parse().unwrap()).unwrap().snapshot.ap.hostname = None;
+            let out = ok(neighbors(State(s.clone()), q(true, false)).await);
+            assert_eq!(out["own_links"].as_array().unwrap().iter().find(|l| l["to"] == A3).map(|l| l["to_name"].clone()), Some(json!("Garage")));
+            let out = ok(neighbors(State(s), q(false, true)).await);
+            let heard_by_a1 = out["neighbors"].as_array().unwrap().iter().find(|n| n["nearest_ap"] == A1);
+            assert_eq!(heard_by_a1.map(|n| n["nearest_ap"].clone()), Some(json!(A1)), "{out}");
         }
 
         #[tokio::test]
