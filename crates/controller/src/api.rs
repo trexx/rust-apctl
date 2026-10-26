@@ -1747,6 +1747,8 @@ mod tests {
         let index: Value = serde_json::from_slice(&axum::body::to_bytes(res.into_body(), 1 << 20).await.unwrap()).unwrap();
         assert_eq!(index["settings"], body);
         assert!(index["next_run"].is_null(), "automatic backups are off");
+        let keys: Vec<&str> = index.as_object().unwrap().keys().map(String::as_str).collect();
+        assert_eq!(keys, ["backups", "encrypted", "next_run", "restore_failed", "restore_pending", "settings"]);
     }
 
     #[tokio::test]

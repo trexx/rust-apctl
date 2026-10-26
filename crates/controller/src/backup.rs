@@ -1139,7 +1139,7 @@ pub async fn index(State(s): State<AppState>) -> Result<Json<Value>, ApiError> {
     .await?;
     let next = settings.enabled.then(|| settings.next_due(clock::now_ts()));
     Ok(Json(json!({
-        "encrypted": encrypted, "version": VERSION, "settings": settings, "next_run": next,
+        "encrypted": encrypted, "settings": settings, "next_run": next,
         "backups": list, "restore_pending": staged, "restore_failed": failed,
     })))
 }
@@ -1390,7 +1390,7 @@ pub async fn restore(State(s): State<AppState>, Json(body): Json<RestoreBody>) -
             std::process::exit(75);
         });
     });
-    Ok(Json(json!({ "ok": true, "restarting": true, "manifest": m })))
+    Ok(Json(json!({ "ok": true })))
 }
 
 #[cfg(test)]
