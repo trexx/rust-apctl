@@ -21,7 +21,8 @@ pub fn source(collection: &str) -> &str {
 const DEVICE_FIELDS: &[&str] = &["model", "version", "serial", "ip", "adopted", "x_aes_gcm", "cfgversion", "wlangroup_id_na", "wlangroup_id_ng"];
 
 /// Client fields kept besides the ones rendering reads ([`apcfg::CLIENT_KEYS`]): the
-/// names and notes people gave their devices, and their speed limit (user group).
+/// names and notes people gave their devices (an import into apctl takes them as the
+/// aliases of clients not yet named there), and their speed limit (user group).
 const USER_FIELDS: &[&str] = &["name", "note", "noted", "hostname", "oui", "first_seen", "last_seen", "is_wired", "is_guest", "usergroup_id"];
 
 /// The fields of a device document an import keeps.
