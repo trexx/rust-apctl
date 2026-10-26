@@ -1468,7 +1468,6 @@ export interface WlanFields {
 
   mcastenhance_enabled?: boolean | null;
   multicast_suppressor_mode?: "off" | "conservative" | "aggressive" | null;
-  bc_filter_enabled?: boolean | null;
   bc_filter_list?: string[] | null;
   proxy_arp?: boolean | null;
 
@@ -1480,7 +1479,6 @@ export interface WlanFields {
   uapsd_enabled?: boolean | null;
   country_beacon?: boolean | null;
   minrate_setting_preference?: "auto" | "manual" | null;
-  minrate_ng_enabled?: boolean | null;
   minrate_ng_data_rate_kbps?: number | null;
   minrate_na_enabled?: boolean | null;
   minrate_na_data_rate_kbps?: number | null;
@@ -1497,13 +1495,6 @@ export interface WlanFields {
   mac_filter_enabled?: boolean | null;
   mac_filter_policy?: "allow" | "deny" | null;
   mac_filter_list?: string[] | null;
-
-  // Sent and kept as they are: the protection stands for these.
-  security?: string | null;
-  wpa_mode?: string | null;
-  wpa3_support?: boolean | null;
-  wpa3_transition?: boolean | null;
-  ap_group_mode?: string | null;
 }
 
 /** An SSID in the settings editor's list. */
@@ -1518,7 +1509,7 @@ export interface WlanSettingsList {
   active: boolean;
   wlans: WlanSettings[];
   /** `for_ssid`: an SSID may be put on it (a LAN network, not the inter-VLAN routing one), as the server checks it. */
-  networks: { id: string; name: string; vlan: number | null; purpose: string | null; for_ssid: boolean }[];
+  networks: { id: string; name: string; vlan: number | null; for_ssid: boolean }[];
   /** The minimum data rates an SSID may require, per band, in kbps (what the server accepts). */
   min_rates: { ng: number[]; na: number[] };
   aps: { mac: Mac; name: string | null }[];
@@ -1606,7 +1597,6 @@ export interface DeviceSettings {
   /** The site's "advanced features" switch, which band steering, minimum signal and client limits need. */
   advanced_features: boolean;
   antennas: { id: number; name: string; default?: boolean }[];
-  ports: number;
 }
 
 /** What a settings change would send each AP (the shape of a config push). `error`: its config would
