@@ -45,25 +45,47 @@ const PENDING_TIMEOUT: Ts = 600;
 const MAX_PENDING_TEXT: usize = 64;
 
 /// An AP waiting to be adopted.
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug)]
 pub struct Pending {
     pub mac: Mac,
-    pub ip: Option<String>,
-    pub model: Option<String>,
-    pub model_display: Option<String>,
-    pub version: Option<String>,
-    pub hostname: Option<String>,
-    pub serial: Option<String>,
     /// apctl had this AP before: it was reset (or lost its key).
     pub known: bool,
     pub first_seen: Ts,
     pub last_seen: Ts,
     /// Where its informs come from (see `source_of`).
-    #[serde(skip)]
     pub source: IpAddr,
-    /// Its last inform, to build its record from.
-    #[serde(skip)]
+    /// Its last inform (as `pending_inform` keeps it), to build its record
+    /// from and to show it by.
     pub payload: Arc<Value>,
+}
+
+/// A pending AP as the adoption page lists it: its details from its inform.
+#[derive(Serialize)]
+struct PendingView<'a> {
+    mac: Mac,
+    known: bool,
+    first_seen: Ts,
+    ip: Option<&'a str>,
+    model: Option<&'a str>,
+    model_display: Option<&'a str>,
+    version: Option<&'a str>,
+    hostname: Option<&'a str>,
+}
+
+impl Pending {
+    fn view(&self) -> PendingView<'_> {
+        let s = |k: &str| self.payload[k].as_str();
+        PendingView {
+            mac: self.mac,
+            known: self.known,
+            first_seen: self.first_seen,
+            ip: s("ip"),
+            model: s("model"),
+            model_display: s("model_display"),
+            version: s("version"),
+            hostname: s("hostname"),
+        }
+    }
 }
 
 /// The APs apctl is adopting or forgetting, and the pending ones.
@@ -202,7 +224,6 @@ fn source_of(ip: IpAddr) -> IpAddr {
 /// by dropping the one heard from longest ago: of its source's, else of all.
 pub fn note_pending(live: &mut Live, payload: Value, known: bool, now: Ts, source: IpAddr) -> bool {
     let Some(mac) = payload["mac"].as_str().and_then(|m| m.parse::<Mac>().ok()) else { return false };
-    let s = |k: &str| payload[k].as_str().map(str::to_string);
     let source = source_of(source);
     let pending = &mut live.adoption.pending;
     let new = !pending.contains_key(&mac);
@@ -220,23 +241,7 @@ pub fn note_pending(live: &mut Live, payload: Value, known: bool, now: Ts, sourc
         }
     }
     let first_seen = pending.get(&mac).map_or(now, |p| p.first_seen);
-    pending.insert(
-        mac,
-        Pending {
-            mac,
-            ip: s("ip"),
-            model: s("model"),
-            model_display: s("model_display"),
-            version: s("version"),
-            hostname: s("hostname"),
-            serial: s("serial"),
-            known,
-            first_seen,
-            last_seen: now,
-            source,
-            payload: Arc::new(payload),
-        },
-    );
+    pending.insert(mac, Pending { mac, known, first_seen, last_seen: now, source, payload: Arc::new(payload) });
     new
 }
 
@@ -455,6 +460,7 @@ pub async fn pending(State(s): State<AppState>) -> Json<Value> {
         (pending, adopting, forgetting)
     };
     let since = |l: Vec<(Mac, Ts)>| l.into_iter().map(|(m, t)| json!({ "mac": m, "since": t })).collect::<Vec<_>>();
+    let pending: Vec<PendingView> = pending.iter().map(Pending::view).collect();
     Json(json!({ "active": s.active, "pending": pending, "adopting": since(adopting), "forgetting": since(forgetting), "ssh": ssh }))
 }
 
@@ -799,7 +805,11 @@ mod tests {
         assert!(note_pending(&mut live, pending_inform(&big), false, 100, SRC));
         assert!(!note_pending(&mut live, pending_inform(&big), false, 110, SRC), "only new the first time");
         let p = &live.adoption.pending[&"02:00:00:00:00:09".parse().unwrap()];
-        assert_eq!((p.first_seen, p.last_seen, p.model.as_deref()), (100, 110, Some("U6M")));
+        assert_eq!((p.first_seen, p.last_seen, p.payload["model"].as_str()), (100, 110, Some("U6M")));
+        // Listed with what the adoption page shows of it.
+        let v = serde_json::to_value(p.view()).unwrap();
+        assert_eq!(v.as_object().unwrap().keys().collect::<Vec<_>>(), ["first_seen", "hostname", "ip", "known", "mac", "model", "model_display", "version"]);
+        assert_eq!((&v["mac"], &v["model"], &v["first_seen"]), (&json!("02:00:00:00:00:09"), &json!("U6M"), &json!(100)));
         // Only what adoption reads is kept, and a record built from it is the same.
         assert!(p.payload.get("sys_stats").is_none() && p.payload["radio_table"][0].get("scan_table").is_none());
         let mac = "02:00:00:00:00:09".parse().unwrap();
