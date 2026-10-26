@@ -373,6 +373,9 @@ export function BackupSection() {
         </div>
       )}
 
+      {d.settings_error && (
+        <div className="banner banner-high">{d.settings_error}</div>
+      )}
       <Schedule initial={d.settings} readOnly={readOnly} nextRun={d.next_run} />
 
       {!readOnly && (

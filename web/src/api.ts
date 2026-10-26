@@ -942,8 +942,10 @@ export interface BackupManifest {
 
 interface Backups {
   encrypted: boolean;
-  version: string;
+  /** The stored ones, else (when they can't be read) the defaults, as the form's starting values. */
   settings: BackupSettings;
+  /** Why the stored settings can't be read (no automatic backup is made then, and `next_run` is null); null when they can. */
+  settings_error: string | null;
   next_run: number | null;
   backups: BackupMeta[];
   restore_pending: boolean;
