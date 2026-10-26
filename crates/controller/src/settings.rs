@@ -750,10 +750,11 @@ fn psk_wpa3(w: &Value) -> (bool, bool, bool) {
 }
 
 /// The protection choice of a stored SSID, if it is one the editor offers.
-/// An open SSID's `wpa_mode` means nothing.
+/// An open SSID's `wpa_mode` means nothing; a missing one is WPA/WPA2 mixed
+/// ([`apcfg::wpa_mode`]), which the editor does not offer.
 fn protection_of(w: &Value) -> Option<&'static Protection> {
     let security = w["security"].as_str()?;
-    if security != "open" && w["wpa_mode"].as_str().is_some_and(|m| m != "wpa2") {
+    if security != "open" && apcfg::wpa_mode(w) != "wpa2" {
         return None;
     }
     let (_, wpa3, transition) = psk_wpa3(w);
@@ -768,8 +769,8 @@ pub(crate) fn security_label(w: &Value) -> String {
     }
     match w["security"].as_str() {
         Some("open") => "Open".into(),
-        // `wpa_mode` is auto (WPA/WPA2 mixed), wpa1 or wpa2.
-        Some("wpapsk") => match w["wpa_mode"].as_str().unwrap_or("wpa2") {
+        // `wpa_mode` is auto (WPA/WPA2 mixed, also when missing), wpa1 or wpa2.
+        Some("wpapsk") => match apcfg::wpa_mode(w) {
             "auto" => "WPA/WPA2 Personal".into(),
             "wpa1" => "WPA Personal".into(),
             m => format!("{} Personal", m.to_uppercase()),
@@ -1983,6 +1984,15 @@ mod tests {
         assert_eq!(label(json!({ "security": "wpapsk", "wpa_mode": "wpa2", "wpa3_support": true, "wpa3_transition": true })), "WPA2/WPA3 Personal");
         assert_eq!(label(json!({ "security": "wpapsk", "wpa_mode": "wpa1" })), "WPA Personal");
         assert_eq!(label(json!({ "security": "wpapsk", "wpa_mode": "auto" })), "WPA/WPA2 Personal");
+        // A WPA SSID without a mode is WPA/WPA2 mixed, as the render sends it: no choice of the editor's,
+        // and an edit that leaves the protection alone leaves it so.
+        let mut s = state();
+        s["wlanconf"][0].as_object_mut().unwrap().remove("wpa_mode");
+        assert_eq!((label(s["wlanconf"][0].clone()), protection_of(&s["wlanconf"][0]).map(|p| p.name)), ("WPA/WPA2 Personal".into(), None));
+        edit(&mut s, json!({ "name": "Renamed" })).unwrap();
+        assert!(s["wlanconf"][0]["wpa_mode"].is_null());
+        edit(&mut s, json!({ "protection": "wpa2" })).unwrap();
+        assert_eq!((s["wlanconf"][0]["wpa_mode"].as_str(), label(s["wlanconf"][0].clone())), (Some("wpa2"), "WPA2 Personal".into()));
         assert_eq!((label(json!({ "security": "open", "wpa3_support": true })), label(json!({ "security": "wpaeap" }))), ("Open".into(), "WPA Enterprise".into()));
     }
 
