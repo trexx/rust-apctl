@@ -709,19 +709,19 @@ async fn client(State(s): State<AppState>, MacPath(mac): MacPath) -> Result<Resp
 }
 
 async fn state_summary(State(s): State<AppState>) -> ApiResult {
-    let live = s.live.read().unwrap();
-    Ok(Json(json!({
-        "imported_at": live.state_imported_at,
-        "summary": live.state.as_deref().map(crate::dryrun::summarize_state),
-    })))
+    // Summarised after the lock is released.
+    let (imported_at, state) = {
+        let live = s.live.read().unwrap();
+        (live.state_imported_at, live.state.clone())
+    };
+    Ok(Json(json!({ "imported_at": imported_at, "summary": state.as_deref().map(crate::dryrun::summarize_state) })))
 }
 
 /// Replaces the imported controller settings with an `informdump import` snapshot.
 async fn import_state(State(s): State<AppState>, Json(state): Json<Value>) -> ApiResult {
     crate::dryrun::validate_state(&state).map_err(|e| ApiError::bad(format!("{e:#}")))?;
-    let summary = crate::dryrun::summarize_state(&state);
     s.send(crate::engine::Input::SetState { ts: clock::now_ts(), state }).await?;
-    Ok(Json(json!({ "ok": true, "summary": summary })))
+    Ok(Json(json!({ "ok": true })))
 }
 
 /// Dry-run status: for each AP, what apctl would push now compared with the last
@@ -1627,6 +1627,30 @@ mod tests {
         let (state, _engine, cookie, _dir) = logged_in();
         let req = Request::get("/api/settings/wlans/w1/passphrase").header(header::COOKIE, cookie).body(Body::empty()).unwrap();
         assert_eq!(router(state).oneshot(req).await.unwrap().status(), StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn an_import_is_acknowledged_and_its_summary_read_from_the_settings() {
+        let (state, mut engine, cookie, _dir) = logged_in();
+        let app = router(state.clone());
+        let doc = json!({ "sites": [{ "_id": "s", "name": "default" }], "wlanconf": [{ "name": "Home" }], "networkconf": [], "setting": [], "devices": [] });
+        let req = Request::post("/api/settings/state").header(header::COOKIE, &cookie).header("x-requested-with", "apctl").header(header::CONTENT_TYPE, "application/json");
+        let res = app.clone().oneshot(req.body(Body::from(doc.to_string())).unwrap()).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let body: Value = serde_json::from_slice(&axum::body::to_bytes(res.into_body(), 1 << 16).await.unwrap()).unwrap();
+        assert_eq!(body, json!({ "ok": true }), "the summary is the settings page's to fetch");
+        assert!(matches!(engine.try_recv(), Ok(crate::engine::Input::SetState { .. })));
+        // As the engine stores it.
+        let summary = crate::dryrun::summarize_state(&doc);
+        {
+            let mut live = state.live.write().unwrap();
+            live.state = Some(Arc::new(doc));
+            live.state_imported_at = Some(7);
+        }
+        let req = Request::get("/api/settings/state").header(header::COOKIE, &cookie).body(Body::empty()).unwrap();
+        let res = app.oneshot(req).await.unwrap();
+        let body: Value = serde_json::from_slice(&axum::body::to_bytes(res.into_body(), 1 << 16).await.unwrap()).unwrap();
+        assert_eq!(body, json!({ "imported_at": 7, "summary": summary }));
     }
 
     #[tokio::test]
