@@ -348,6 +348,15 @@ struct VapLoad {
     satisfaction: i64,
 }
 
+/// An AP's VAP table (`vap_table`) and what its stations add up to.
+struct VapTable {
+    rows: Vec<Value>,
+    /// Its stations, over every VAP.
+    clients: i64,
+    /// The AP's satisfaction: the lowest of its VAPs' with stations, 100 with none.
+    satisfaction: i64,
+}
+
 #[derive(Default, Clone)]
 struct ApCounters {
     tx: f64,
@@ -557,9 +566,11 @@ impl Sim {
     }
 
     /// AP `i`'s VAP table, each VAP with its stations.
-    fn vaps(&mut self, i: usize, dt: f64, mut stas: [Vec<Value>; VAPS.len()], loads: &[VapLoad; VAPS.len()]) -> Vec<Value> {
+    fn vaps(&mut self, i: usize, dt: f64, mut stas: [Vec<Value>; VAPS.len()], loads: &[VapLoad; VAPS.len()]) -> VapTable {
         let ap = &APS[i];
-        VAPS.iter()
+        let (mut clients, mut satisfaction) = (0, None::<i64>);
+        let rows = VAPS
+            .iter()
             .enumerate()
             .map(|(vi, vap @ &Vap { radio, idx, essid, name })| {
                 let vc = &mut self.vap_counters[i][vi];
@@ -570,6 +581,10 @@ impl Sim {
                 let sta = std::mem::take(&mut stas[vi]);
                 let n = sta.len() as i64;
                 let (avg, sat) = if n > 0 { (load.signal / n, load.satisfaction / n) } else { (0, 100) };
+                if n > 0 {
+                    clients += n;
+                    satisfaction = Some(satisfaction.map_or(sat, |s| s.min(sat)));
+                }
                 let na = radio == "na";
                 let plan = ap.radio(radio);
                 json!({
@@ -583,7 +598,8 @@ impl Sim {
                     "wifi_tx_attempts": (vc.tx / 1000.0) as i64, "wifi_tx_dropped": 0, "sta_table": sta,
                 })
             })
-            .collect()
+            .collect();
+        VapTable { rows, clients, satisfaction: satisfaction.unwrap_or(100) }
     }
 
     /// Fills in one of AP `i`'s radios: channel use, counters, neighbours and spectrum.
@@ -633,9 +649,9 @@ impl Sim {
 
     /// The rest of AP `i`'s report: who it is, its load and uptime, its uplink's counters
     /// and the VAP table.
-    fn system(&mut self, p: &mut Value, i: usize, ts: i64, busy: f64, totals: &ApCounters, vaps: Vec<Value>) {
+    fn system(&mut self, p: &mut Value, i: usize, ts: i64, busy: f64, totals: &ApCounters, vaps: VapTable) {
         let ap = &APS[i];
-        let n_clients: i64 = vaps.iter().map(|v| v["num_sta"].as_i64().unwrap_or(0)).sum();
+        let n_clients = vaps.clients;
         let cpu = 3.0 + n_clients as f64 * 0.6 + busy * 4.0 + self.rng.unit() * 3.0;
         let mem = 24.0 + n_clients as f64 * 0.3 + self.rng.unit();
         let uptime = self.uptime(i, ts);
@@ -655,7 +671,7 @@ impl Sim {
         p["last_error_conns"] = json!([]);
         p["fingerprint"] = json!(ids.fingerprint);
         p["qrid"] = json!(ids.qrid);
-        p["satisfaction"] = json!(vaps.iter().filter(|v| v["num_sta"].as_i64().unwrap_or(0) > 0).map(|v| v["satisfaction"].as_i64().unwrap_or(100)).min().unwrap_or(100));
+        p["satisfaction"] = json!(vaps.satisfaction);
         let mem_total = p["sys_stats"]["mem_total"].as_f64().unwrap_or_default();
         p["sys_stats"]["mem_used"] = json!((mem / 100.0 * mem_total) as i64);
         p["sys_stats"]["loadavg_1"] = json!(format!("{:.2}", 0.6 + cpu / 25.0));
@@ -669,7 +685,7 @@ impl Sim {
             eth["rx_packets"] = json!((totals.rx / 900.0) as i64);
             eth["tx_packets"] = json!((totals.tx / 600.0) as i64);
         }
-        p["vap_table"] = json!(vaps);
+        p["vap_table"] = Value::Array(vaps.rows);
     }
 }
 
@@ -1009,7 +1025,12 @@ mod tests {
             } else {
                 match pairer.handle(&keys, ev) {
                     Some(wire::exchange::InformEvent::Inform { decoded, .. }) => {
-                        decoded.unwrap();
+                        let p = decoded.unwrap().payload;
+                        // The AP's satisfaction is its lowest VAP's with stations.
+                        if let Some(vaps) = p["vap_table"].as_array() {
+                            let lowest = vaps.iter().filter(|v| v["num_sta"].as_i64() > Some(0)).filter_map(|v| v["satisfaction"].as_i64()).min();
+                            assert_eq!(p["satisfaction"].as_i64(), Some(lowest.unwrap_or(100)), "{}", p["hostname"]);
+                        }
                         informs += 1;
                     }
                     Some(wire::exchange::InformEvent::Reply { decoded: Some(decoded), .. }) => {
