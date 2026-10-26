@@ -1350,7 +1350,6 @@ impl Engine {
     /// roam, leave. The timings are read from `detail`, the whole notification.
     fn connection_event(&self, ts: Ts, ap: Mac, mut n: Value) {
         let Some(client) = n["mac"].as_str().and_then(|m| m.parse::<Mac>().ok()) else { return };
-        let num = |k: &str| n[k].as_str().and_then(|v| v.parse::<f64>().ok()).or_else(|| n[k].as_f64());
         let text = |k: &str| n[k].as_str().map(str::to_string);
         let vap = text("vap");
         // The live view is read for the VAP alone; the row is built without the lock.
@@ -1388,7 +1387,7 @@ impl Engine {
                 Value::String(r) if r.is_empty() => json!(label),
                 r => r.clone(),
             };
-            json!({ "essid": essid, "reason": reason, "auth_algo": n["auth_algo"], "rssi": num("auth_rssi").or_else(|| num("avg_rssi")) })
+            json!({ "essid": essid, "reason": reason, "auth_algo": n["auth_algo"], "rssi": crate::connections::rssi(&detail) })
         });
         // The whole notification, with the channel and width at the time: timings, failure
         // counters and stage flags for connectivity stats, and the roaming views.

@@ -196,7 +196,7 @@ fn failure(n: &ConnDetail) -> Option<(usize, &'static str)> {
 pub const WEAK_SIGNAL: i64 = -75;
 
 /// The signal a report was made at.
-fn rssi(n: &ConnDetail) -> Option<f64> {
+pub(crate) fn rssi(n: &ConnDetail) -> Option<f64> {
     num(&n.auth_rssi).or_else(|| num(&n.avg_rssi))
 }
 
