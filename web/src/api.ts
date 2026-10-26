@@ -1351,10 +1351,13 @@ export function useLiveUpdates(): void {
           if (msg.kind === "dryrun_compared" || msg.kind === "settings_imported") {
             // Each AP pushed to records one, and every fetch renders and compares every AP's config: follow at most every 5 s.
             invalidate(keys.dryrun(), 5000);
+          }
+          if (msg.kind === "settings_changed" || msg.kind === "settings_imported") {
+            // An editor keeps what it was opened with (it saves only the fields changed in it); the rest follows,
+            // and the summary of the settings (their SSIDs and networks) too.
+            invalidate(keys.settings());
             invalidate(keys.settingsState());
           }
-          // An editor keeps what it was opened with (it saves only the fields changed in it); the rest follows.
-          if (msg.kind === "settings_changed" || msg.kind === "settings_imported") invalidate(keys.settings());
           if (ADOPTION_EVENTS.has(msg.kind)) invalidate(keys.adoption());
           if (NAME_EVENTS.has(msg.kind)) invalidate(keys.deviceNames(), 5000);
           if (msg.kind.startsWith("ap_upgrade")) invalidate(keys.firmware());
