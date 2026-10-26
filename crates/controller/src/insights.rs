@@ -237,6 +237,8 @@ pub async fn top(State(s): State<AppState>, Query(q): Query<RangeQuery>) -> Resu
         })
         .await?
     };
+    // As many as the lists show: the Overview's 15, an AP page's 10.
+    let listed = if ap.is_some() { 10 } else { 15 };
     let clients = memo_read(&s, Db::Metrics, "top", &q.read_by(true), tier, move |c| {
         // Per client and AP, so a client's traffic counts towards the AP it was on.
         let spec = Spec { table: "client_stats", key: "mac || '/' || coalesce(ap_mac, '')", extra: &[], cols: &BYTE_COLS, only: ap.as_deref().map(|a| Only::Is("ap_mac", a)) };
@@ -249,8 +251,7 @@ pub async fn top(State(s): State<AppState>, Query(q): Query<RangeQuery>) -> Resu
             e.0 += d;
             e.1 += u;
         }
-        // As many as the lists show: the Overview's 15 (an AP's page shows 10).
-        Ok(busiest(per_client, 15, |(d, u)| d + u))
+        Ok(busiest(per_client, listed, |(d, u)| d + u))
     })
     .await?;
     let live = s.live.read().unwrap();
