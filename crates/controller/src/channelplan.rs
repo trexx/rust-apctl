@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::api::{ApiError, AppState, Json, Query, read};
 use crate::clock;
+use crate::engine::Live;
 use crate::series::own_bssids;
 use crate::store::Db;
 
@@ -216,50 +217,56 @@ pub async fn compute_plan(s: &AppState, radio: String, dfs: bool, allowed: Optio
     })
     .await?;
     // What the plan needs from `live`, copied so the lock is not held while it is worked out.
-    let (aps, own_bssids) = {
-        let live = s.live.read().unwrap();
-        let state = live.state.as_deref();
-        let country = state.map_or(apcfg::DEFAULT_COUNTRY, crate::settings::country);
-        // The APs' records in the settings, found once (the first of a MAC listed twice, as `device_doc` finds it).
-        let mut docs: HashMap<Mac, &serde_json::Value> = HashMap::new();
-        for d in state.into_iter().flat_map(|st| crate::settings::docs(st, "devices")) {
-            if let Some(m) = crate::settings::doc_mac(&d["mac"]) {
-                docs.entry(m).or_insert(d);
-            }
-        }
-        let aps: Vec<PlanAp> = live
-            .devices
-            .iter()
-            .filter_map(|(m, d)| {
-                let r = d.snapshot.radios.iter().find(|r| r.radio == radio)?;
-                let ch = r.channel?;
-                let width = if radio == "ng" { 20 } else { r.bw.unwrap_or(80) };
-                let available = live.raw_informs.get(m).and_then(|p| {
-                    let rt = crate::settings::inform_radio(p, &radio)?;
-                    let list: Vec<i64> = rt["spectrum_table"]
-                        .as_array()?
-                        .iter()
-                        .filter(|c| radio == "ng" || c["width"].as_i64() == Some(width))
-                        .filter_map(|c| c["channel"].as_i64())
-                        .collect();
-                    (!list.is_empty()).then_some(list)
-                });
-                // As `set_channels` judges a channel: at the width its settings run the radio at, not the one reported.
-                let legal = state.and_then(|st| {
-                    let doc = *docs.get(m)?;
-                    let at = crate::settings::inform_radio(doc, &radio).map_or(width, |r| crate::settings::radio_width(st, r));
-                    crate::settings::legal_channels(country, &radio, at, crate::settings::outdoor(st, doc))
-                });
-                Some(PlanAp { mac: m.to_string(), name: d.snapshot.ap.hostname.clone(), current: block(&radio, ch, width), width, clients: r.num_sta, available, legal })
-            })
-            .collect();
-        // Our APs' BSSIDs on this band, to separate own signal from neighbours.
-        let own: HashMap<String, String> =
-            own_bssids(&live).filter(|(_, v)| v.radio.as_deref() == Some(radio.as_str())).map(|(m, v)| (v.bssid.clone(), m.to_string())).collect();
-        (aps, own)
-    };
+    let (aps, own_bssids) = plan_inputs(&s.live.read().unwrap(), &radio);
     let work = move || plan_channels(radio, dfs, allowed, pinned, aps, own_bssids, neigh, spectrum);
     Ok(tokio::task::spawn_blocking(work).await?)
+}
+
+/// What a plan for `radio` takes from `live`: the APs online now with the band,
+/// and our BSSIDs on it (BSSID → AP). An AP that went offline is neither moved
+/// nor, by its last signals, steers the others: as after a restart, when only
+/// the APs heard since are in `devices`.
+fn plan_inputs(live: &Live, radio: &str) -> (Vec<PlanAp>, HashMap<String, String>) {
+    let state = live.state.as_deref();
+    let country = state.map_or(apcfg::DEFAULT_COUNTRY, crate::settings::country);
+    // The APs' records in the settings, found once (the first of a MAC listed twice, as `device_doc` finds it).
+    let mut docs: HashMap<Mac, &serde_json::Value> = HashMap::new();
+    for d in state.into_iter().flat_map(|st| crate::settings::docs(st, "devices")) {
+        if let Some(m) = crate::settings::doc_mac(&d["mac"]) {
+            docs.entry(m).or_insert(d);
+        }
+    }
+    let aps: Vec<PlanAp> = live
+        .devices
+        .iter()
+        .filter(|(_, d)| d.online)
+        .filter_map(|(m, d)| {
+            let r = d.snapshot.radios.iter().find(|r| r.radio == radio)?;
+            let ch = r.channel?;
+            let width = if radio == "ng" { 20 } else { r.bw.unwrap_or(80) };
+            let available = live.raw_informs.get(m).and_then(|p| {
+                let rt = crate::settings::inform_radio(p, radio)?;
+                let list: Vec<i64> = rt["spectrum_table"]
+                    .as_array()?
+                    .iter()
+                    .filter(|c| radio == "ng" || c["width"].as_i64() == Some(width))
+                    .filter_map(|c| c["channel"].as_i64())
+                    .collect();
+                (!list.is_empty()).then_some(list)
+            });
+            // As `set_channels` judges a channel: at the width its settings run the radio at, not the one reported.
+            let legal = state.and_then(|st| {
+                let doc = *docs.get(m)?;
+                let at = crate::settings::inform_radio(doc, radio).map_or(width, |r| crate::settings::radio_width(st, r));
+                crate::settings::legal_channels(country, radio, at, crate::settings::outdoor(st, doc))
+            });
+            Some(PlanAp { mac: m.to_string(), name: d.snapshot.ap.hostname.clone(), current: block(radio, ch, width), width, clients: r.num_sta, available, legal })
+        })
+        .collect();
+    // Our APs' BSSIDs on this band, to separate own signal from neighbours.
+    let own: HashMap<String, String> =
+        own_bssids(live).filter(|(_, v)| v.radio.as_deref() == Some(radio)).map(|(m, v)| (v.bssid.clone(), m.to_string())).collect();
+    (aps, own)
 }
 
 type NeighborRow = (String, String, Option<String>, Option<f64>, Option<f64>, Option<f64>);
@@ -468,6 +475,26 @@ mod tests {
         assert!(allowed_blocks("na", 160, &low).is_empty(), "36-64 needs 52-64 too");
         assert_eq!(allowed_blocks("na", 80, &[36, 40, 44]).len(), 0);
         assert_eq!(allowed_blocks("ng", 20, &[1, 6, 11]).len(), 3);
+    }
+
+    #[test]
+    fn only_the_aps_online_are_planned() {
+        let mut live = Live::default();
+        for (n, online) in [(1, true), (2, false)] {
+            let mac: Mac = format!("02:00:00:00:00:0{n}").parse().unwrap();
+            let p = serde_json::json!({ "mac": mac.to_string(), "hostname": format!("AP{n}"), "radio_table": [{ "name": "wifi0", "radio": "ng" }],
+                "vap_table": [{ "name": "ath0", "radio": "ng", "channel": 6, "bssid": format!("02:00:00:00:01:0{n}"), "essid": "Home" }] });
+            let snapshot = crate::model::parse(1000, &p).unwrap();
+            live.devices.insert(mac, crate::engine::DeviceView { snapshot, online, first_seen: 0, last_seen: 1000, interval: 10, last_full_inform: 1000, last_config_push: None });
+        }
+        let (aps, own) = plan_inputs(&live, "ng");
+        assert_eq!(aps.iter().map(|a| (a.mac.as_str(), a.current.primary)).collect::<Vec<_>>(), [("02:00:00:00:00:01", 6)], "the offline AP is not moved");
+        // Its BSSID is still ours, so what the others hear of it is no neighbour; with no AP to
+        // place in the plan, it steers nothing either.
+        assert_eq!(own.get("02:00:00:00:01:02").map(String::as_str), Some("02:00:00:00:00:02"));
+        let neigh = vec![("02:00:00:00:00:01".to_string(), "02:00:00:00:01:02".to_string(), Some("Home".to_string()), Some(2437.0), Some(20.0), Some(-40.0))];
+        let plan = plan_channels("ng".into(), false, None, HashSet::new(), aps, own, neigh, vec![]);
+        assert!(plan.plan.iter().all(|p| p.current_reasons.is_empty()), "{plan:?}");
     }
 
     #[test]

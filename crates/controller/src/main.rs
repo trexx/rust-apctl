@@ -270,6 +270,9 @@ async fn serve(args: ServeArgs) -> Result<()> {
     // The engine owns all mutable state and processes inputs in order.
     let mut engine = Engine::new(writer.clone(), keys.clone(), live.clone(), live_tx.clone());
     engine.restore(&store)?;
+    // The APs' last contact as restored, for the alert watcher, before the engine
+    // runs: an AP that informs moves out of the known ones.
+    let restored_contacts = alerts::last_contacts(&live.read().unwrap());
     // The controller the configs describe: in active mode, the configs pushed
     // name this controller's own address and ports; else the official defaults.
     let controller = if active {
@@ -336,7 +339,7 @@ async fn serve(args: ServeArgs) -> Result<()> {
     let auth = Arc::new(auth::Auth::new(users, &store, writer.clone(), proxies)?);
     let threat_state: Arc<threats::ThreatState> = Default::default();
     threats::watch(store.clone(), threat_state.clone(), live.clone(), in_tx.clone(), writer.clone());
-    alerts::spawn(store.clone(), writer.clone(), live.clone(), live_tx.clone(), alert_events, alert_clock);
+    alerts::spawn(store.clone(), writer.clone(), live.clone(), live_tx.clone(), alert_events, alert_clock, restored_contacts);
     backup::schedule(backups.clone(), store.clone());
     firmware::schedule(writer.clone());
     let state = api::AppState::new(api::AppStateInner {

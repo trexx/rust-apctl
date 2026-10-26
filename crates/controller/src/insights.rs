@@ -100,7 +100,7 @@ pub async fn activity(State(s): State<AppState>, Query(q): Query<RangeQuery>, Qu
         }
     };
     if p.parts == Some(Parts::Activity) {
-        return Ok(Json(json!({ "bucket": bucket, "activity": vaps, "airtime": null })));
+        return Ok(Json(json!({ "activity": vaps, "airtime": null })));
     }
     // Airtime from the radios: per bucket, each figure averaged by SQLite over the
     // radios' samples that have it (a bucket where none has it is null, not 0).
@@ -132,7 +132,7 @@ pub async fn activity(State(s): State<AppState>, Query(q): Query<RangeQuery>, Qu
         Ok(json!({ "ts": air_ts, "total": total, "external_interference": external, "own_traffic": own }))
     })
     .await?;
-    Ok(Json(json!({ "bucket": bucket, "activity": vaps, "airtime": *airtime })))
+    Ok(Json(json!({ "activity": vaps, "airtime": *airtime })))
 }
 
 /// The SSIDs of `vaps` (loaded with an `extra` that starts with [`AP_BAND`]) on
@@ -237,6 +237,8 @@ pub async fn top(State(s): State<AppState>, Query(q): Query<RangeQuery>) -> Resu
         })
         .await?
     };
+    // As many as the lists show: the Overview's 15, an AP page's 10.
+    let listed = if ap.is_some() { 10 } else { 15 };
     let clients = memo_read(&s, Db::Metrics, "top", &q.read_by(true), tier, move |c| {
         // Per client and AP, so a client's traffic counts towards the AP it was on.
         let spec = Spec { table: "client_stats", key: "mac || '/' || coalesce(ap_mac, '')", extra: &[], cols: &BYTE_COLS, only: ap.as_deref().map(|a| Only::Is("ap_mac", a)) };
@@ -249,8 +251,7 @@ pub async fn top(State(s): State<AppState>, Query(q): Query<RangeQuery>) -> Resu
             e.0 += d;
             e.1 += u;
         }
-        // As many as the lists show: the Overview's 15 (an AP's page shows 10).
-        Ok(busiest(per_client, 15, |(d, u)| d + u))
+        Ok(busiest(per_client, listed, |(d, u)| d + u))
     })
     .await?;
     let live = s.live.read().unwrap();
@@ -512,12 +513,12 @@ pub async fn multicast(State(s): State<AppState>, Query(q): Query<RangeQuery>) -
         let (one, mut params) = (if ap.is_some() { " AND mac = ?3" } else { "" }, vec![Sql::Integer(from - if step > 0 { step } else { MCAST_GAP }), Sql::Integer(to)]);
         params.extend(ap.clone().map(Sql::Text));
         let mut stmt = c.prepare_cached(&format!(
-            "SELECT mac, type, ts, tx_pps, rx_pps, tx_bytes_ps, rx_bytes_ps FROM mcast_stats{suffix} WHERE ts >= ?1 AND ts <= ?2{one} ORDER BY mac, type, ts"
+            "SELECT mac, type, ts, tx_pps, rx_pps FROM mcast_stats{suffix} WHERE ts >= ?1 AND ts <= ?2{one} ORDER BY mac, type, ts"
         ))?;
         let rows = stmt
             .query_map(params_from_iter(params), |r| {
                 let rate = |i: usize| r.get::<_, Option<f64>>(i).map(|v| v.unwrap_or(0.0));
-                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, Ts>(2)?, [rate(3)?, rate(4)?, rate(5)?, rate(6)?]))
+                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, Ts>(2)?, [rate(3)?, rate(4)?]))
             })?
             .collect::<rusqlite::Result<Vec<McastRow>>>()?;
         let (ts, types) = mcast_types(&rows, from, to, bucket, step);
@@ -528,14 +529,14 @@ pub async fn multicast(State(s): State<AppState>, Query(q): Query<RangeQuery>) -
                 table: "client_stats",
                 key: "mac || '/' || coalesce(ap_mac, '') || '/' || coalesce(bssid, '')",
                 extra: &[],
-                cols: &["mcast_tx_pkts", "mcast_rx_pkts", "mcast_tx_bytes", "mcast_rx_bytes"],
+                cols: &["mcast_tx_pkts", "mcast_rx_pkts"],
                 only: ap.as_deref().map(|a| Only::Is("ap_mac", a)),
             },
             tier,
             from,
             to,
         )?;
-        let mut per: HashMap<&str, [f64; 4]> = HashMap::new();
+        let mut per: HashMap<&str, [f64; 2]> = HashMap::new();
         for (k, (_, smp)) in &cl {
             let e = per.entry(k.split('/').next().unwrap_or_default()).or_default();
             for d in deltas(smp, from) {
@@ -556,8 +557,7 @@ pub async fn multicast(State(s): State<AppState>, Query(q): Query<RangeQuery>) -
             listed_client(&s, &live, mac, |view| {
                 let mc = view.and_then(|v| v.sample.multicast.as_ref());
                 json!({
-                    "ap": view.and_then(|v| ap_name_of(&live, &v.sample.ap_mac)), "radio": view.and_then(|c| c.sample.radio.clone()),
-                    "tx_pkts": t[0].round(), "rx_pkts": t[1].round(), "tx_bytes": t[2].round(), "rx_bytes": t[3].round(),
+                    "ap": view.and_then(|v| ap_name_of(&live, &v.sample.ap_mac)), "tx_pkts": t[0].round(), "rx_pkts": t[1].round(),
                     "services": mc.map(|m| m.services.clone()).unwrap_or_default(),
                     "delivery": mc.and_then(|m| m.delivery()),
                     "memberships": mc.map_or(0, |m| m.memberships.len()),
@@ -565,18 +565,17 @@ pub async fn multicast(State(s): State<AppState>, Query(q): Query<RangeQuery>) -
             })
         })
         .collect();
-    Ok(Json(json!({ "bucket": bucket, "ts": ts, "types": types, "clients": list })))
+    Ok(Json(json!({ "ts": ts, "types": types, "clients": list })))
 }
 
 use crate::engine::MCAST_GAP;
 
-/// One AP's multicast sample of one type: (AP, type, time, [tx pps, rx pps,
-/// tx bytes/s, rx bytes/s]).
-type McastRow = (String, String, Ts, [f64; 4]);
+/// One AP's multicast sample of one type: (AP, type, time, [tx pps, rx pps]).
+type McastRow = (String, String, Ts, [f64; 2]);
 
 /// The bucket times, and per type the packet rates each way per bucket (the
-/// average per AP within the bucket, summed over APs) and the packets and
-/// bytes over the window, from the samples ordered by AP, type and time.
+/// average per AP within the bucket, summed over APs) and the packets over
+/// the window, from the samples ordered by AP, type and time.
 /// A total counts each sample's rate over the time it covers within the
 /// window: a raw sample (`step` 0) the time since the one before it (at most
 /// [`MCAST_GAP`]; the first of a series, with nothing before it, none), a
@@ -584,9 +583,9 @@ type McastRow = (String, String, Ts, [f64; 4]);
 /// for the part of the window they cover.
 fn mcast_types(rows: &[McastRow], from: Ts, to: Ts, bucket: Ts, step: Ts) -> (Vec<Ts>, serde_json::Map<String, Value>) {
     // type -> bucket -> AP -> (sum of rates, samples)
-    type PerAp<'a> = HashMap<&'a str, ([f64; 4], f64)>;
+    type PerAp<'a> = HashMap<&'a str, ([f64; 2], f64)>;
     let mut acc: BTreeMap<&str, BTreeMap<Ts, PerAp>> = BTreeMap::new();
-    let mut totals: HashMap<&str, [f64; 4]> = HashMap::new();
+    let mut totals: HashMap<&str, [f64; 2]> = HashMap::new();
     for (i, (mac, kind, ts, r)) in rows.iter().enumerate() {
         let prev = i.checked_sub(1).map(|j| &rows[j]).filter(|p| p.0 == *mac && p.1 == *kind).map(|p| p.2);
         let (start, end) = if step > 0 { (*ts, ts + step) } else { (prev.map_or(*ts, |p| p.max(ts - MCAST_GAP)), *ts) };
@@ -611,7 +610,7 @@ fn mcast_types(rows: &[McastRow], from: Ts, to: Ts, bucket: Ts, step: Ts) -> (Ve
         let total = totals.get(kind).copied().unwrap_or_default();
         types.insert(
             kind.to_string(),
-            json!({ "tx_pps": series(0), "rx_pps": series(1), "tx_pkts": total[0].round(), "rx_pkts": total[1].round(), "tx_bytes": total[2].round(), "rx_bytes": total[3].round() }),
+            json!({ "tx_pps": series(0), "rx_pps": series(1), "tx_pkts": total[0].round(), "rx_pkts": total[1].round() }),
         );
     }
     (ts, types)
@@ -630,8 +629,7 @@ fn wlan_settings(state: Option<&Value>, essid: &str) -> Value {
     let vlan = apcfg::ssid_vlan(state, crate::settings::site_id(state).unwrap_or_default(), w);
     json!({
         "enabled": flag(w, "enabled", true), "security": security, "hidden": flag(w, "hide_ssid", false), "guest": flag(w, "is_guest", false),
-        "network": network, "vlan": vlan, "bands": apcfg::wlan_bands(w), "fast_roaming": flag(w, "fast_roaming_enabled", false),
-        "bss_transition": flag(w, "bss_transition", true), "pmf": w["pmf_mode"].as_str(),
+        "network": network, "vlan": vlan, "fast_roaming": flag(w, "fast_roaming_enabled", false), "bss_transition": flag(w, "bss_transition", true),
     })
 }
 
@@ -644,8 +642,45 @@ pub async fn wlans(State(s): State<AppState>, Query(q): Query<RangeQuery>) -> Re
     let bucket = bucket_for(to - from, tier);
     // The history, summed up per network.
     let per = with_site_vaps(&s, &q, move |vaps| wlan_history(vaps, from, bucket)).await?;
+    // Now: per network, the APs and bands broadcasting it, clients and scores;
+    // copied, so that the live lock is not held while the list is made.
+    #[derive(Default)]
+    struct Now {
+        /// Where it is broadcast: an entry per SSID.
+        broadcast: Vec<Value>,
+        /// Its SSIDs' BSSIDs, in the order of `broadcast`.
+        bssids: Vec<String>,
+        bands: std::collections::BTreeSet<String>,
+        /// The experience scores of its SSIDs with clients.
+        scores: Vec<f64>,
+    }
+    let (mut now, connected, state) = {
+        let live = s.live.read().unwrap();
+        let mut now: BTreeMap<String, Now> = BTreeMap::new();
+        for (mac, d) in &live.devices {
+            for v in &d.snapshot.vaps {
+                let Some(e) = v.essid.as_deref().filter(|e| !e.is_empty()) else { continue };
+                let n = now.entry(e.to_string()).or_default();
+                n.broadcast.push(json!({ "ap": mac, "name": d.snapshot.ap.hostname, "radio": v.radio, "channel": v.channel, "bssid": v.bssid }));
+                n.bssids.push(v.bssid.clone());
+                if let Some(r) = &v.radio {
+                    n.bands.insert(r.clone());
+                }
+                if let Some(x) = v.satisfaction.filter(|x| *x >= 0 && v.num_sta.unwrap_or(0) > 0) {
+                    n.scores.push(x as f64);
+                }
+            }
+        }
+        // The clients connected now, per network (each client is listed once).
+        let mut connected: HashMap<&str, usize> = HashMap::new();
+        for e in live.connected_clients().filter_map(|(_, c)| c.sample.essid.as_deref()) {
+            *connected.entry(e).or_default() += 1;
+        }
+        let connected: HashMap<String, usize> = connected.into_iter().map(|(e, n)| (e.to_string(), n)).collect();
+        (now, connected, live.state.clone())
+    };
     // How our own SSIDs are heard over the air (our APs scan each other).
-    let own: Vec<String> = own_bssids(&s.live.read().unwrap()).map(|(_, v)| v.bssid.clone()).collect();
+    let own: Vec<String> = now.values().flat_map(|n| n.bssids.iter().cloned()).collect();
     let on_air: HashMap<String, String> = if own.is_empty() {
         HashMap::new()
     } else {
@@ -659,52 +694,15 @@ pub async fn wlans(State(s): State<AppState>, Query(q): Query<RangeQuery>) -> Re
         })
         .await?
     };
-    // Now: per network, the APs and bands broadcasting it, clients and scores;
-    // copied, so that the live lock is not held while the list is made.
-    #[derive(Default)]
-    struct Now {
-        /// Where it is broadcast: an entry per SSID.
-        broadcast: Vec<Value>,
-        bands: std::collections::BTreeSet<String>,
-        /// The experience scores of its SSIDs with clients.
-        scores: Vec<f64>,
-        /// The security our APs hear it with, from the first of its SSIDs heard.
-        heard: Option<String>,
-    }
-    let (mut now, connected, state) = {
-        let live = s.live.read().unwrap();
-        let mut now: BTreeMap<String, Now> = BTreeMap::new();
-        for (mac, d) in &live.devices {
-            for v in &d.snapshot.vaps {
-                let Some(e) = v.essid.as_deref().filter(|e| !e.is_empty()) else { continue };
-                let n = now.entry(e.to_string()).or_default();
-                n.broadcast.push(json!({ "ap": mac, "name": d.snapshot.ap.hostname, "radio": v.radio, "channel": v.channel, "bssid": v.bssid }));
-                if let Some(r) = &v.radio {
-                    n.bands.insert(r.clone());
-                }
-                if let Some(x) = v.satisfaction.filter(|x| *x >= 0 && v.num_sta.unwrap_or(0) > 0) {
-                    n.scores.push(x as f64);
-                }
-                if n.heard.is_none() {
-                    n.heard = on_air.get(&v.bssid).cloned();
-                }
-            }
-        }
-        // The clients connected now, per network (each client is listed once).
-        let mut connected: HashMap<&str, usize> = HashMap::new();
-        for e in live.connected_clients().filter_map(|(_, c)| c.sample.essid.as_deref()) {
-            *connected.entry(e).or_default() += 1;
-        }
-        let connected: HashMap<String, usize> = connected.into_iter().map(|(e, n)| (e.to_string(), n)).collect();
-        (now, connected, live.state.clone())
-    };
     let mut names: std::collections::BTreeSet<String> = per.keys().cloned().collect();
     names.extend(now.keys().cloned());
     let mean = |v: &[f64]| (!v.is_empty()).then(|| (v.iter().sum::<f64>() / v.len() as f64).round());
     let list: Vec<Value> = names
         .into_iter()
         .map(|essid| {
-            let Now { broadcast, bands, scores, heard } = now.remove(&essid).unwrap_or_default();
+            let Now { broadcast, bssids, bands, scores } = now.remove(&essid).unwrap_or_default();
+            // The security our APs hear it with, from the first of its SSIDs heard.
+            let heard = bssids.iter().find_map(|b| on_air.get(b));
             let clients = connected.get(&essid).copied().unwrap_or(0);
             let agg = per.get(&essid);
             let (ts, series_clients, down_bps, up_bps, peak) = agg.map_or((vec![], vec![], vec![], vec![], 0.0), |a| {
@@ -739,7 +737,7 @@ pub async fn wlans(State(s): State<AppState>, Query(q): Query<RangeQuery>) -> Re
             })
         })
         .collect();
-    Ok(Json(json!({ "bucket": bucket, "wlans": list })))
+    Ok(Json(json!({ "wlans": list })))
 }
 
 /// The security each of a JSON list of BSSIDs is heard with, newest last.
@@ -959,7 +957,7 @@ struct Neighbor<'a> {
     signal: Option<i64>,
     best_signal: Option<i64>,
     last_seen: Ts,
-    /// The name of the AP that hears it best.
+    /// The name of the AP that hears it best, else its MAC.
     nearest_ap: Option<String>,
     vendor: Option<&'a str>,
 }
@@ -980,15 +978,28 @@ struct OwnLink {
 /// density), once per pair of APs and band; either list alone with
 /// `links_only` or `neighbors_only`.
 pub async fn neighbors(State(s): State<AppState>, Query(q): Query<NeighborQuery>) -> Result<Json<Value>, ApiError> {
-    let since = clock::now_ts() - q.range.unwrap_or(86400).clamp(600, 30 * 86400);
+    let now = clock::now_ts();
+    let since = now - q.range.unwrap_or(86400).clamp(600, 30 * 86400);
     let band = q.band.clone();
-    // Our own BSSIDs, each with its AP and band (to tell our APs apart from the
-    // neighbours), and our APs' names, copied so that the live lock is not held
-    // while the lists are made.
+    // The BSSIDs our APs used in the last 30 days, as the threat checks know them:
+    // also those of APs not heard from in this run (just after a restart, or down
+    // since before it) and retired ones, so that none is listed as a neighbour.
+    let used = {
+        let (threats, store) = (s.threats.clone(), s.store.clone());
+        tokio::task::spawn_blocking(move || threats.used_bssids(&store, now)).await??
+    };
+    // Our own BSSIDs, each with its AP (to tell our APs apart from the
+    // neighbours): the live VAPs', then the used ones; and our APs' names,
+    // copied so that the live lock is not held while the lists are made.
     let (own, names) = {
         let live = s.live.read().unwrap();
-        let own: HashMap<String, (String, Option<String>)> = own_bssids(&live).map(|(m, v)| (v.bssid.clone(), (m.to_string(), v.radio.clone()))).collect();
-        let names: HashMap<String, String> = live.devices.iter().filter_map(|(m, d)| Some((m.to_string(), d.snapshot.ap.hostname.clone()?))).collect();
+        let mut own: HashMap<String, String> = own_bssids(&live).map(|(m, v)| (v.bssid.clone(), m.to_string())).collect();
+        for (bssid, ap, _) in used.iter().filter(|u| !u.1.is_empty()) {
+            own.entry(bssid.clone()).or_insert_with(|| ap.clone());
+        }
+        // Named as every other view names them: also those not heard from in this run.
+        let names: HashMap<String, String> =
+            live.devices.keys().chain(live.known_devices.keys()).filter_map(|m| Some((m.to_string(), ap_name_of(&live, m).filter(|n| !n.is_empty())?))).collect();
         (own, names)
     };
     // Our own BSSIDs are the table's key for the rows our APs' signal to each
@@ -1028,12 +1039,12 @@ pub async fn neighbors(State(s): State<AppState>, Query(q): Query<NeighborQuery>
     let signal = |n: &Neighbor| n.signal.unwrap_or(-200);
     let mut by_bssid: BTreeMap<String, Neighbor> = BTreeMap::new();
     // (from, to, band) -> strongest signal: an AP has a BSSID per SSID.
-    let mut links: BTreeMap<(String, &str, Option<&str>), Option<i64>> = BTreeMap::new();
+    let mut links: BTreeMap<(String, &str, Option<String>), Option<i64>> = BTreeMap::new();
     for r in rows {
-        if let Some((owner, radio)) = own.get(&r.bssid) {
-            // One of our APs heard another of ours.
+        if let Some(owner) = own.get(&r.bssid) {
+            // One of our APs heard another of ours, on the band the row was heard on.
             if *owner != r.ap_mac && !q.neighbors_only {
-                let e = links.entry((r.ap_mac, owner, radio.as_deref())).or_insert(r.signal);
+                let e = links.entry((r.ap_mac, owner, r.radio)).or_insert(r.signal);
                 *e = (*e).max(r.signal);
             }
             continue;
@@ -1044,13 +1055,14 @@ pub async fn neighbors(State(s): State<AppState>, Query(q): Query<NeighborQuery>
     }
     let mut list: Vec<Neighbor> = by_bssid.into_values().collect();
     for n in &mut list {
-        n.nearest_ap = name(&n.ap_mac);
+        // An AP without a name is shown by its MAC (which is not sent otherwise).
+        n.nearest_ap = Some(name(&n.ap_mac).unwrap_or_else(|| n.ap_mac.clone()));
         n.vendor = s.vendors.lookup_str(&n.bssid);
     }
     list.sort_by_key(|n| std::cmp::Reverse(n.best_signal.or(n.signal).unwrap_or(-200)));
     let links: Vec<OwnLink> = links
         .into_iter()
-        .map(|((from, to, radio), signal)| OwnLink { from_name: name(&from), to_name: name(to), from, to: to.to_string(), radio: radio.map(str::to_string), signal })
+        .map(|((from, to, radio), signal)| OwnLink { from_name: name(&from), to_name: name(to), from, to: to.to_string(), radio, signal })
         .collect();
     Ok(Json(json!({ "neighbors": list, "own_links": links })))
 }
@@ -1097,7 +1109,7 @@ mod tests {
 
     #[test]
     fn multicast_totals_count_the_time_each_sample_covers_in_the_window() {
-        let row = |ap: &str, ts: Ts, tx: f64| (ap.to_string(), "mdns".to_string(), ts, [tx, 0.0, 10.0 * tx, 0.0]);
+        let row = |ap: &str, ts: Ts, tx: f64| (ap.to_string(), "mdns".to_string(), ts, [tx, 0.0]);
         // Raw samples: one before the window (it only starts the next one's interval), the
         // next covering the window's first 10 s, one 5 s later, one 285 s after that (a
         // rate covers 120 s at most), and another AP's first sample (nothing before it).
@@ -1106,7 +1118,8 @@ mod tests {
         assert_eq!(ts, [960, 1260, 1500]);
         let m = &types["mdns"];
         assert_eq!(m["tx_pps"], json!([1.5, 3.0, 5.0]));
-        assert_eq!((m["tx_pkts"].as_f64(), m["tx_bytes"].as_f64(), m["rx_pkts"].as_f64()), (Some(10.0 + 10.0 + 360.0), Some(3800.0), Some(0.0)));
+        assert_eq!((m["tx_pkts"].as_f64(), m["rx_pkts"].as_f64()), (Some(10.0 + 10.0 + 360.0), Some(0.0)));
+        assert_eq!(m.as_object().unwrap().keys().collect::<Vec<_>>(), ["rx_pkts", "rx_pps", "tx_pkts", "tx_pps"], "packets only: no page reads the bytes");
         // Rolled up: each covers its five minutes, the first and last clipped to the window.
         let rows = [row("a", 900, 1.0), row("a", 1200, 2.0), row("a", 1500, 4.0)];
         let (ts, types) = mcast_types(&rows, 1000, 1600, 300, 300);
@@ -1146,6 +1159,8 @@ mod tests {
         let g = wlan_settings(Some(&state), "Guest");
         assert_eq!((g["security"].as_str(), g["guest"].as_bool(), g["vlan"].as_i64(), g["bss_transition"].as_bool()), (Some("Open"), Some(true), Some(20), Some(true)));
         assert!(wlan_settings(Some(&state), "Other").is_null());
+        // What the Networks page shows, no more (the bands it shows are the top-level ones, as broadcast).
+        assert_eq!(h.as_object().unwrap().keys().collect::<Vec<_>>(), ["bss_transition", "enabled", "fast_roaming", "guest", "hidden", "network", "security", "vlan"]);
     }
 
     /// The views' output on a synthetic site, pinned so that reworking how they
@@ -1534,6 +1549,31 @@ mod tests {
             let out = ok(neighbors(State(s), Query(NeighborQuery { band: None, range: Some(30 * 86400), links_only: false, neighbors_only: true })).await);
             let names: Vec<&str> = out["neighbors"].as_array().unwrap().iter().map(|n| n["essid"].as_str().unwrap()).collect();
             assert_eq!(names, ["Once close", "Neighbour", "Other", "Far"]);
+        }
+
+        #[tokio::test]
+        async fn a_bssid_of_an_ap_not_heard_from_in_this_run_is_ours_not_a_neighbour() {
+            let (s, base, t) = site();
+            // A3 broadcast "Home" until recently (its VAP's metrics), but has not informed since apctl started.
+            const A3: &str = "02:00:00:00:00:a3";
+            insert(&t.db(Db::Metrics), "vap_stats", &["bssid", "ts", "ap_mac", "essid", "radio"], vec![vec![text("02:00:00:00:03:a3"), int(clock::now_ts() - 60), text(A3), text("Home"), text("na")]]);
+            let row = vec![text("02:00:00:00:03:a3"), text(A1), text("na"), text("Home"), int(36), int(80), int(5210), int(-55), int(base - 60), int(base)];
+            insert(&t.db(Db::Config), "neighbors", &["bssid", "ap_mac", "radio", "essid", "channel", "bw", "center_freq", "signal", "first_seen", "last_seen"], vec![row]);
+            let q = |links_only, neighbors_only| Query(NeighborQuery { band: None, range: Some(30 * 86400), links_only, neighbors_only });
+            let out = ok(neighbors(State(s.clone()), q(false, true)).await);
+            assert!(out["neighbors"].as_array().unwrap().iter().all(|n| n["bssid"] != "02:00:00:00:03:a3"), "{out}");
+            let out = ok(neighbors(State(s.clone()), q(true, false)).await);
+            let link = out["own_links"].as_array().unwrap().iter().find(|l| l["to"] == A3).cloned();
+            assert_eq!(link.map(|l| (l["from"].clone(), l["radio"].clone(), l["signal"].clone(), l["to_name"].clone())), Some((json!(A1), json!("na"), json!(-55), Value::Null)));
+            // Named as the other views name it, from what is stored of it; an AP without a name by its MAC.
+            let known = crate::engine::KnownDevice { hostname: Some("Garage".into()), ..Default::default() };
+            s.live.write().unwrap().known_devices.insert(A3.parse().unwrap(), known);
+            s.live.write().unwrap().devices.get_mut(&A1.parse().unwrap()).unwrap().snapshot.ap.hostname = None;
+            let out = ok(neighbors(State(s.clone()), q(true, false)).await);
+            assert_eq!(out["own_links"].as_array().unwrap().iter().find(|l| l["to"] == A3).map(|l| l["to_name"].clone()), Some(json!("Garage")));
+            let out = ok(neighbors(State(s), q(false, true)).await);
+            let heard_by_a1 = out["neighbors"].as_array().unwrap().iter().find(|n| n["nearest_ap"] == A1);
+            assert_eq!(heard_by_a1.map(|n| n["nearest_ap"].clone()), Some(json!(A1)), "{out}");
         }
 
         #[tokio::test]

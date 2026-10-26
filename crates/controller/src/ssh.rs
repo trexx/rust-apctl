@@ -271,6 +271,17 @@ fn board_value<'a>(text: &'a str, key: &str) -> Option<&'a str> {
     text.lines().find_map(|l| l.trim().strip_prefix(key)?.strip_prefix('=')).map(str::trim).filter(|v| !v.is_empty())
 }
 
+/// The login typed in the form: both a user name and a password, or neither
+/// (then [`logins`] tries the site's, then the factory ones). Half a login is
+/// refused rather than silently replaced by those.
+fn given_login(username: Option<String>, password: Option<String>) -> Result<Option<(String, String)>, &'static str> {
+    match (username.filter(|u| !u.is_empty()), password.filter(|p| !p.is_empty())) {
+        (Some(u), Some(p)) => Ok(Some((u, p))),
+        (None, None) => Ok(None),
+        _ => Err("enter both the user name and the password, or neither"),
+    }
+}
+
 /// The usernames and passwords to try: the ones given, else the site's device
 /// login (its password, with the user the APs get: [`apcfg::ssh_username`]),
 /// then the factory ones.
@@ -361,10 +372,7 @@ async fn adopt_over_ssh(s: AppState, b: AdoptBody) -> Result<Json<Value>, ApiErr
     let url = inform_url(&s).ok_or_else(|| ApiError::conflict("apctl doesn't know the URL APs should inform to: set --inform-url"))?;
     let ip = canonical_ip(&b.ip).ok_or_else(|| ApiError::bad("enter the AP's IP address"))?;
     let state = s.live.read().unwrap().state.clone();
-    let given = match (b.username.filter(|u| !u.is_empty()), b.password) {
-        (Some(u), Some(p)) => Some((u, p)),
-        _ => None,
-    };
+    let given = given_login(b.username, b.password).map_err(ApiError::bad)?;
     let bad = |f: Failure| ApiError(StatusCode::BAD_GATEWAY, f.to_string());
     // A known AP keeps its host key, checked before any password is sent; a new one is trusted the first time.
     let expected = known_host_key(&s.live.read().unwrap(), &ip);
@@ -487,6 +495,13 @@ mod tests {
         // A site with only a password set: the APs' user is ubnt, with that password.
         let state = json!({ "devices": [{ "site_id": "s1" }], "setting": [{ "key": "mgmt", "site_id": "s1", "x_ssh_password": "pw" }] });
         assert_eq!(logins(Some(&state), None)[..2], [("ubnt".to_string(), "pw".to_string()), ("ubnt".to_string(), "ubnt".to_string())]);
+        // The form's login: both or neither; half of one is refused, not replaced by the others.
+        let some = |x: &str| Some(x.to_string());
+        assert_eq!(given_login(some("me"), some("mine")), Ok(Some(("me".into(), "mine".into()))));
+        assert_eq!((given_login(None, None), given_login(some(""), some(""))), (Ok(None), Ok(None)));
+        for (u, p) in [(None, some("mine")), (some("me"), None), (some("me"), some("")), (some(""), some("mine"))] {
+            assert!(given_login(u, p).unwrap_err().contains("both"));
+        }
     }
 
     /// `try_logins` against an AP that accepts `password` and closes a

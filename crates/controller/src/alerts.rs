@@ -533,11 +533,21 @@ fn stored(r: &rusqlite::Row) -> rusqlite::Result<Option<Alert>> {
 /// alert raised with it: [`load_open`] tells the two kinds apart by it.
 const FLAPPING: Severity = Severity::Medium;
 
-/// What a previous run left: the alerts still open, the highest number a
-/// stored alert's id carries (`{ts}-{number}`), and the AP offline alerts of
-/// the day before `now`, oldest first: (AP, when, whether it was a "keeps
-/// dropping off" one).
-async fn load_open(store: &Arc<Store>, now: Ts) -> anyhow::Result<(Vec<Alert>, u64, Vec<(Mac, Ts, bool)>)> {
+/// What a previous run left (see [`load_open`]).
+struct Left {
+    /// The alerts still open.
+    open: Vec<Alert>,
+    /// The highest number a stored alert's id carries (`{ts}-{number}`).
+    seq: u64,
+    /// The AP offline alerts of the day before now, oldest first: (AP, when,
+    /// whether it was a "keeps dropping off" one).
+    offline: Vec<(Mac, Ts, bool)>,
+    /// When each health alert closed within the cooldown before now last closed.
+    cleared: Vec<(OpenKey, Ts)>,
+}
+
+/// What a previous run left, for [`Watcher::start`].
+async fn load_open(store: &Arc<Store>, now: Ts) -> anyhow::Result<Left> {
     let store = store.clone();
     tokio::task::spawn_blocking(move || {
         store.read(Db::Config, |c| {
@@ -549,17 +559,27 @@ async fn load_open(store: &Arc<Store>, now: Ts) -> anyhow::Result<(Vec<Alert>, u
             let sql = "SELECT COALESCE(MAX(CAST(substr(id, instr(id, '-') + 1) AS INTEGER)), 0) FROM alerts";
             let seq = c.query_row(sql, [], |r| r.get::<_, i64>(0))?;
             // An alert of a kind apctl no longer raises can't be resolved: it is left as stored.
-            let rows = open_alerts(c)?;
-            Ok((rows, u64::try_from(seq).unwrap_or(0), offline))
+            let open = open_alerts(c)?;
+            // Closed by its threshold or as no longer reported, as a run counts them (a full scan, once).
+            let sql = "SELECT key, entity, MAX(resolved_ts) FROM alerts WHERE category = ?1 AND resolved_ts > ?2 GROUP BY key, entity";
+            let mut stmt = c.prepare(sql)?;
+            let cleared = stmt
+                .query_map(rusqlite::params![Category::Health.as_str(), now - HEALTH_COOLDOWN], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, Ts>(2)?)))?
+                .filter_map(|r| r.map(|(k, e, ts)| Key::parse(&k).and_then(|k| Some(((k, Entity::parse(k, &e)?), ts)))).transpose())
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(Left { open, seq: u64::try_from(seq).unwrap_or(0), offline, cleared })
         })
     })
     .await?
 }
 
+/// The open alerts' rows, through the partial index `alerts_open`.
+const OPEN: &str = "FROM alerts WHERE resolved_ts IS NULL";
+
 /// The alerts still open, but those of a kind apctl no longer raises, which can't
 /// be resolved: they are left as stored (see [`stored`]).
 fn open_alerts(c: &rusqlite::Connection) -> rusqlite::Result<Vec<Alert>> {
-    let mut stmt = c.prepare_cached("SELECT id, ts, key, category, severity, entity, title, message, link, tag, resolved_ts FROM alerts WHERE resolved_ts IS NULL")?;
+    let mut stmt = c.prepare_cached(&format!("SELECT id, ts, key, category, severity, entity, title, message, link, tag, resolved_ts {OPEN}"))?;
     stmt.query_map([], stored)?.filter_map(Result::transpose).collect()
 }
 
@@ -640,15 +660,19 @@ impl Watcher {
         Watcher { book: Alerts { writer, tx, seq: 0, open: HashMap::new() }, store, live, aps: ApWatch::default(), cleared: HashMap::new(), unjudged: HashMap::new() }
     }
 
-    /// Starts with the alerts a previous run left open, and the offline
-    /// alerts it sent in the last day, which count towards today's limit.
-    async fn start(store: Arc<Store>, writer: Writer, live: SharedLive, tx: broadcast::Sender<LiveMsg>, now: Ts) -> Watcher {
+    /// Starts with the alerts a previous run left open, the offline alerts it
+    /// sent in the last day, which count towards today's limit, and the health
+    /// alerts it closed within the cooldown, which are not raised again before it ends.
+    /// `restored`: each AP's last contact as the engine restored it, taken before
+    /// the engine ran (an AP that has informed since is no longer among the known ones).
+    async fn start(store: Arc<Store>, writer: Writer, live: SharedLive, tx: broadcast::Sender<LiveMsg>, now: Ts, restored: &HashMap<Mac, Ts>) -> Watcher {
         let mut w = Watcher::new(store, writer, live, tx);
         w.aps.tz = w.site_tz();
         w.aps.started = now;
         match load_open(&w.store, now).await {
-            Ok((open, seq, offline)) => {
+            Ok(Left { open, seq, offline, cleared }) => {
                 w.book.seq = seq;
+                w.cleared.extend(cleared);
                 for a in open {
                     w.book.open.insert((a.key, a.entity.clone()), a);
                 }
@@ -666,13 +690,10 @@ impl Watcher {
         // An AP already reported offline before a restart stays so, down since
         // its last contact the engine restored (the alert may have been raised
         // well after it, e.g. on the first check after a long stop).
-        {
-            let live = w.live.read().unwrap();
-            for (k, a) in &w.book.open {
-                if let (Key::ApOffline, Entity::Ap(mac)) = k {
-                    let last_seen = live.known_devices.get(mac).map_or(i64::MAX, |d| d.last_seen);
-                    w.aps.down.insert(*mac, last_seen.min(a.ts - OFFLINE_AFTER));
-                }
+        for (k, a) in &w.book.open {
+            if let (Key::ApOffline, Entity::Ap(mac)) = k {
+                let last_seen = restored.get(mac).copied().unwrap_or(i64::MAX);
+                w.aps.down.insert(*mac, last_seen.min(a.ts - OFFLINE_AFTER));
             }
         }
         w
@@ -824,16 +845,23 @@ impl Watcher {
     }
 }
 
+/// Each known AP's last contact, as [`spawn`] takes it: read after the engine
+/// restored them and before it runs.
+pub fn last_contacts(live: &crate::engine::Live) -> HashMap<Mac, Ts> {
+    live.known_devices.iter().map(|(m, k)| (*m, k.last_seen)).collect()
+}
+
 /// Starts the alert watcher, fed by the engine through `events` (see [`channel`]).
+/// `restored` is [`last_contacts`].
 /// It keeps the engine's time (see [`crate::shadow::Clock`]): in shadow mode a
 /// lagging capture's, and while a capture is replayed it checks no AP's status
 /// or health, whose stored figures are then of the capture's time; it makes
 /// no alert of an event that is history, not news (`Clock::is_news`, by the
 /// event's own time). An event's alert carries the event's own time.
-pub fn spawn(store: Arc<Store>, writer: Writer, live: SharedLive, tx: broadcast::Sender<LiveMsg>, mut events: mpsc::Receiver<Event>, engine_clock: Arc<crate::shadow::Clock>) {
+pub fn spawn(store: Arc<Store>, writer: Writer, live: SharedLive, tx: broadcast::Sender<LiveMsg>, mut events: mpsc::Receiver<Event>, engine_clock: Arc<crate::shadow::Clock>, restored: HashMap<Mac, Ts>) {
     tokio::spawn(async move {
         let now = || engine_clock.now().unwrap_or_else(clock::now_ts);
-        let mut w = Watcher::start(store, writer, live, tx, now()).await;
+        let mut w = Watcher::start(store, writer, live, tx, now(), &restored).await;
         // Give APs a chance to report after a restart before judging them.
         let mut status = tokio::time::interval_at(tokio::time::Instant::now() + Duration::from_secs(90), Duration::from_secs(30));
         let mut health = tokio::time::interval_at(tokio::time::Instant::now() + Duration::from_secs(120), Duration::from_secs(60));
@@ -890,9 +918,18 @@ fn recent(c: &rusqlite::Connection, limit: i64) -> anyhow::Result<Value> {
         .filter_map(Result::transpose)
         .collect::<rusqlite::Result<Vec<_>>>()?;
     let unread: i64 = c.query_row("SELECT COUNT(*) FROM alerts WHERE read = 0", [], |r| r.get(0))?;
-    let open = open_alerts(c)?;
-    let open_high = open.iter().filter(|a| a.severity == Severity::High).count();
-    Ok(json!({ "alerts": rows, "unread": unread, "open": open.len(), "open_high": open_high }))
+    // Counted, not built: of a kind apctl still raises, as `stored` reads them.
+    let (mut open, mut open_high) = (0, 0);
+    let mut stmt = c.prepare_cached(&format!("SELECT key, entity, severity {OPEN}"))?;
+    let mut q = stmt.query([])?;
+    while let Some(r) = q.next()? {
+        let (key, entity) = (r.get_ref(0)?.as_str()?, r.get_ref(1)?.as_str()?);
+        if Key::parse(key).is_some_and(|k| Entity::parse(k, entity).is_some()) {
+            open += 1;
+            open_high += usize::from(Severity::parse(r.get_ref(2)?.as_str()?) == Some(Severity::High));
+        }
+    }
+    Ok(json!({ "alerts": rows, "unread": unread, "open": open, "open_high": open_high }))
 }
 
 /// GET /api/alerts: recent alerts, newest first, with the unread and open counts ([`recent`]).
@@ -1098,7 +1135,7 @@ mod tests {
         }
         flushed(&w.book.writer);
         // A restart within the same second carries on from the stored ids.
-        let mut again = Watcher::start(w.store.clone(), w.book.writer.clone(), Default::default(), broadcast::channel(4).0, 2000).await;
+        let mut again = Watcher::start(w.store.clone(), w.book.writer.clone(), Default::default(), broadcast::channel(4).0, 2000, &HashMap::new()).await;
         let last = again.book.raise(1000, notice());
         assert_eq!(last.id, "1000-12");
         flushed(&w.book.writer);
@@ -1122,7 +1159,8 @@ mod tests {
         w.book.raise(1000, offline(Severity::High).resolved(1060));
         w.book.raise(2000, offline(Severity::High).resolved(2100));
         flushed(&w.book.writer);
-        let restart = |now| Watcher::start(w.store.clone(), w.book.writer.clone(), Default::default(), broadcast::channel(4).0, now);
+        let none = HashMap::new();
+        let restart = |now| Watcher::start(w.store.clone(), w.book.writer.clone(), Default::default(), broadcast::channel(4).0, now, &none);
         // The third drop is summarised, as without the restart.
         let mut again = restart(2700).await;
         assert_eq!(again.aps.check(3000, ap, 2700), Some(ApChange::Flapping { times: 3 }));
@@ -1135,6 +1173,24 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_restart_keeps_the_health_cooldown() {
+        let (mut w, _rx, _dir) = watcher();
+        let ap: Mac = "02:00:00:00:00:01".parse().unwrap();
+        let busy = (Key::BusyChannel, Entity::Radio(ap, "na".into()));
+        let site = (Key::ConnectFailures, Entity::Site);
+        // A busy channel raised and cleared twice, the last time at 20 000; clients failing, cleared long before.
+        for (at, k) in [(1000, &site), (10_000, &busy), (20_000, &busy)] {
+            w.book.open(at, Alert::new(k.0, Category::Health, Severity::Medium, k.1.clone(), "t".into(), "m".into()));
+            w.book.resolve(at + 60, k, || "Back to normal.".into());
+        }
+        flushed(&w.book.writer);
+        let now = 1060 + HEALTH_COOLDOWN + 100;
+        let again = Watcher::start(w.store.clone(), w.book.writer.clone(), Default::default(), broadcast::channel(4).0, now, &HashMap::new()).await;
+        assert_eq!(again.cleared.iter().collect::<Vec<_>>(), [(&busy, &20_060)], "the last clear, within the cooldown");
+        assert!(!again.may_raise(&busy, now) && again.may_raise(&busy, 20_060 + HEALTH_COOLDOWN) && again.may_raise(&site, now));
+    }
+
+    #[tokio::test]
     async fn an_ap_not_heard_from_since_a_restart_is_given_its_time_from_then() {
         let (w, mut rx, _dir) = watcher();
         let ap: Mac = "02:00:00:00:00:01".parse().unwrap();
@@ -1143,7 +1199,8 @@ mod tests {
         live.write().unwrap().known_devices.insert(ap, known);
         // apctl was away for an hour: the first check, 90 s in, does not call it offline yet,
         // nor 4 minutes in, while the engine still lists it as online.
-        let mut again = Watcher::start(w.store.clone(), w.book.writer.clone(), live, w.book.tx.clone(), 4600).await;
+        let restored = last_contacts(&live.read().unwrap());
+        let mut again = Watcher::start(w.store.clone(), w.book.writer.clone(), live, w.book.tx.clone(), 4600, &restored).await;
         again.status_tick(4690);
         again.status_tick(4600 + OFFLINE_AFTER);
         assert!(told(&mut rx).is_empty());
@@ -1164,10 +1221,16 @@ mod tests {
         let live: SharedLive = Default::default();
         let known = crate::engine::KnownDevice { last_seen: 1000, offline: true, ..Default::default() };
         live.write().unwrap().known_devices.insert(ap, known);
-        let again = Watcher::start(w.store.clone(), w.book.writer.clone(), live, broadcast::channel(4).0, 91_000).await;
+        let restored = last_contacts(&live.read().unwrap());
+        let again = Watcher::start(w.store.clone(), w.book.writer.clone(), live.clone(), broadcast::channel(4).0, 91_000, &restored).await;
+        assert_eq!(again.aps.down.get(&ap), Some(&1000));
+        // Also when the AP has informed (and so left the known ones) before the watcher started:
+        // its last contact is the one restored before the engine ran.
+        live.write().unwrap().known_devices.clear();
+        let again = Watcher::start(w.store.clone(), w.book.writer.clone(), live, broadcast::channel(4).0, 91_000, &restored).await;
         assert_eq!(again.aps.down.get(&ap), Some(&1000));
         // Nothing restored of it: the alert's time stands for the last contact.
-        let again = Watcher::start(w.store.clone(), w.book.writer.clone(), Default::default(), broadcast::channel(4).0, 91_000).await;
+        let again = Watcher::start(w.store.clone(), w.book.writer.clone(), Default::default(), broadcast::channel(4).0, 91_000, &HashMap::new()).await;
         assert_eq!(again.aps.down.get(&ap), Some(&(90_000 - OFFLINE_AFTER)));
     }
 
@@ -1179,7 +1242,8 @@ mod tests {
         flushed(&w.book.writer);
         let live: SharedLive = Default::default();
         live.write().unwrap().known_devices.insert(ap, crate::engine::KnownDevice { last_seen: 1000, offline: true, ..Default::default() });
-        let mut again = Watcher::start(w.store.clone(), w.book.writer.clone(), live.clone(), w.book.tx.clone(), 5000).await;
+        let restored = last_contacts(&live.read().unwrap());
+        let mut again = Watcher::start(w.store.clone(), w.book.writer.clone(), live.clone(), w.book.tx.clone(), 5000, &restored).await;
         told(&mut rx);
         // Not heard from through the start's grace and past it: no "back online", no second offline alert.
         for now in [5090, 5300, 5400, 6000] {
@@ -1357,7 +1421,7 @@ mod tests {
         let stored: Vec<(String, String)> = w.store.read(Db::Config, |c| Ok(c.prepare("SELECT key, entity FROM alerts WHERE key != 'gone' ORDER BY key")?.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<rusqlite::Result<_>>()?)).unwrap();
         assert_eq!(stored, [("busy_channel".to_string(), "02:00:00:00:00:01/na".to_string()), ("connect_failures".to_string(), "site".to_string())]);
         // After a restart they are open as they were; one apctl doesn't know is left alone.
-        let again = Watcher::start(w.store.clone(), w.book.writer.clone(), Default::default(), broadcast::channel(4).0, 2000).await;
+        let again = Watcher::start(w.store.clone(), w.book.writer.clone(), Default::default(), broadcast::channel(4).0, 2000, &HashMap::new()).await;
         let mut open: Vec<String> = again.book.open.keys().map(|(k, e)| format!("{}:{e}", k.as_str())).collect();
         open.sort();
         assert_eq!(open, ["busy_channel:02:00:00:00:00:01/na", "connect_failures:site"]);
@@ -1403,6 +1467,13 @@ mod tests {
         let h = radio_health(&w.store, now).await.unwrap();
         let judged = |radio: &str| h.get(&("02:00:00:00:00:01".parse().unwrap(), radio.to_string())).and_then(|h| h.utilisation);
         assert_eq!((judged("na"), judged("ng"), judged("6e")), (Some(90.0), None, None));
+    }
+
+    #[test]
+    fn open_alerts_are_read_through_their_partial_index() {
+        let t = TestStore::new("alerts-open-plan");
+        let plan: String = t.db(Db::Config).query_row(&format!("EXPLAIN QUERY PLAN SELECT key, entity, severity {OPEN}"), [], |r| r.get(3)).unwrap();
+        assert_eq!(plan, "SEARCH alerts USING INDEX alerts_open (resolved_ts=?)");
     }
 
     #[test]

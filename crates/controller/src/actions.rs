@@ -124,30 +124,24 @@ pub fn edit_client(state: &mut Value, mac: Mac, fields: &[(&str, Value)]) {
     }
 }
 
-
 /// A client's `blocked`, `locked_to` and own speed limit (`usergroup_id`) from
 /// the settings, as its view shows them.
-#[derive(Debug, Serialize, PartialEq)]
+#[derive(Serialize)]
 pub struct Controls<'a> {
     pub blocked: bool,
     pub locked_to: Option<String>,
     pub usergroup_id: Option<&'a Value>,
 }
 
-impl<'a> Controls<'a> {
-    fn of(entry: Option<&'a Value>) -> Self {
-        let locked_to = entry.filter(|c| c["fixed_ap_enabled"].as_bool() == Some(true)).and_then(|c| doc_mac(&c["fixed_ap_mac"]));
-        Controls {
-            blocked: entry.and_then(|c| c["blocked"].as_bool()).unwrap_or(false),
-            locked_to: locked_to.map(|m| m.to_string()),
-            usergroup_id: entry.map(|c| &c["usergroup_id"]),
-        }
-    }
-}
-
 /// One client's controls, from the site's entry.
 pub fn controls<'a>(state: Option<&'a Value>, mac: &Mac) -> Controls<'a> {
-    Controls::of(state.and_then(|s| crate::settings::docs(s, "clients").find(|c| doc_mac(&c["mac"]) == Some(*mac))))
+    let entry = state.and_then(|s| crate::settings::docs(s, "clients").find(|c| doc_mac(&c["mac"]) == Some(*mac)));
+    let locked_to = entry.filter(|c| c["fixed_ap_enabled"].as_bool() == Some(true)).and_then(|c| doc_mac(&c["fixed_ap_mac"]));
+    Controls {
+        blocked: entry.and_then(|c| c["blocked"].as_bool()).unwrap_or(false),
+        locked_to: locked_to.map(|m| m.to_string()),
+        usergroup_id: entry.map(|c| &c["usergroup_id"]),
+    }
 }
 
 /// Whether a device action can be done: active mode, and an AP apctl has heard from.
