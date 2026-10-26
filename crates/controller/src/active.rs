@@ -34,7 +34,7 @@ use rusqlite::types::Value as Sql;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
-use wire::decode::{Decoded, KeyUsed, open_with};
+use wire::decode::{KeyUsed, open_with};
 use wire::keys::KeyStore;
 
 use crate::clock;
@@ -704,7 +704,7 @@ pub async fn inform(
     if used == KeyUsed::Default {
         factory_key_inform(&active, ts, caller, payload, device_key.is_some(), permit).await
     } else {
-        managed_inform(&active, ts, caller, Decoded { header, key: used, payload }, pinned, busy, permit).await
+        managed_inform(&active, ts, caller, payload, pinned, busy, permit).await
     }
 }
 
@@ -763,8 +763,7 @@ async fn factory_key_inform(active: &Arc<Active>, ts: Ts, caller: Caller, payloa
 /// controller), which pins it from the first inform apctl hears from it.
 /// `busy`: an adoption, a forget or the pending list had the AP when the
 /// inform came in. `permit`: the gate's, held while the inform is handled.
-async fn managed_inform(active: &Arc<Active>, ts: Ts, caller: Caller, decoded: Decoded, pinned: bool, busy: bool, permit: OwnedSemaphorePermit) -> Response {
-    let payload = &decoded.payload;
+async fn managed_inform(active: &Arc<Active>, ts: Ts, caller: Caller, payload: Value, pinned: bool, busy: bool, permit: OwnedSemaphorePermit) -> Response {
     let (mac, gcm) = (caller.mac, caller.gcm);
     // Its own key: an adoption is complete; a forgotten AP is told to reset
     // (once: the entry goes, so later informs don't finish the forget again).
@@ -813,16 +812,16 @@ async fn managed_inform(active: &Arc<Active>, ts: Ts, caller: Caller, decoded: D
 
     // Rendering the config and sealing the reply take a while: off the async workers.
     let a = active.clone();
-    let Ok(((reply, response, decoded), _permit)) = blocking(permit, move || {
-        let reply = a.reply(ts, mac, &decoded.payload);
+    let Ok(((reply, response, payload), _permit)) = blocking(permit, move || {
+        let reply = a.reply(ts, mac, &payload);
         let response = caller.seal(&reply);
-        (reply, response, decoded)
+        (reply, response, payload)
     })
     .await
     else {
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     };
-    if active.engine.send(Input::Inform { ts, decoded }).await.is_err() {
+    if active.engine.send(Input::Inform { ts, payload }).await.is_err() {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     }
     // The engine follows the interval it asked for (or the AP would be called

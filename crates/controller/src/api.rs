@@ -1330,8 +1330,7 @@ mod tests {
 
     /// An AP's report, decoded, as the engine gets it at time 50.
     fn report(payload: Value) -> crate::engine::Input {
-        let header = inform::Header { packet_version: 0, mac: Mac([0; 6]), flags: inform::Flags::NONE, iv: [0; 16], payload_version: 1, payload_len: 0 };
-        crate::engine::Input::Inform { ts: 50, decoded: wire::decode::Decoded { header, key: wire::decode::KeyUsed::Device, payload } }
+        crate::engine::Input::Inform { ts: 50, payload }
     }
 
     async fn get_json(app: &Router, path: &str) -> Value {

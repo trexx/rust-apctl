@@ -207,14 +207,14 @@ fn run_once<R: Read + Send>(
                     last_tick = ts;
                     tick = Some(Input::Tick(ts));
                 }
-                Some(Input::Inform { ts, decoded })
+                Some(Input::Inform { ts, payload: decoded.payload })
             }
             InformEvent::Inform { decoded: Err(e), mac, .. } => {
                 tracing::debug!("undecodable inform from {mac:?}: {e:#}");
                 Some(Input::DecodeError)
             }
             InformEvent::Reply { ts, mac: Some(mac), decoded: Some(Ok(decoded)), .. } => {
-                Some(Input::Reply { ts: ts / 1_000_000, mac, decoded })
+                Some(Input::Reply { ts: ts / 1_000_000, mac, payload: decoded.payload })
             }
             InformEvent::Reply { .. } => None,
         };
