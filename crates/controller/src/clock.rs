@@ -9,18 +9,9 @@ pub fn now_ts() -> Ts {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0)
 }
 
-/// Days since 1970-01-01 of a civil date.
-fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
-    let y = if m <= 2 { y - 1 } else { y };
-    let era = y.div_euclid(400);
-    let yoe = y - era * 400;
-    let doy = (153 * (m + if m > 2 { -3 } else { 9 }) + 2) / 5 + d - 1;
-    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    era * 146097 + doe - 719468
-}
-
 /// Civil date (year, month, day) of a day number.
 pub use wire::civil_from_days;
+use wire::days_from_civil;
 
 fn days_in_month(y: i64, m: i64) -> i64 {
     days_from_civil(if m == 12 { y + 1 } else { y }, if m == 12 { 1 } else { m + 1 }, 1) - days_from_civil(y, m, 1)
@@ -160,7 +151,6 @@ mod tests {
         assert_eq!(utc_offset("AEST-10AEDT,M10.1.0,M4.1.0/3", ts(2026, 6, 15, 0, 0)), Some(10 * 3600));
         assert_eq!(utc_offset("<+0530>-5:30", 0), Some(5 * 3600 + 1800));
         assert_eq!(local(Some("Nowhere/Unknown"), ts(2026, 1, 1, 5, 7)).1, 5 * 60 + 7);
-        assert_eq!(civil_from_days(days_from_civil(2024, 2, 29)), (2024, 2, 29));
     }
 
     #[test]

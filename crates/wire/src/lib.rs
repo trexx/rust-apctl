@@ -35,6 +35,17 @@ pub fn civil_from_days(days: i64) -> (i64, i64, i64) {
     (yoe + era * 400 + i64::from(m <= 2), m, d)
 }
 
+/// Day count since 1970-01-01 of a civil date `(year, month, day)`, proleptic
+/// Gregorian: the inverse of [`civil_from_days`] (Howard Hinnant's `days_from_civil`).
+pub fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let doy = (153 * (m + if m > 2 { -3 } else { 9 }) + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe - 719_468
+}
+
 /// Civil UTC time `(year, month, day, hour, minute, second)` of seconds since
 /// 1970-01-01, as [`civil_from_days`] counts days.
 pub fn civil_from_secs(ts: i64) -> (i64, i64, i64, i64, i64, i64) {
@@ -45,7 +56,7 @@ pub fn civil_from_secs(ts: i64) -> (i64, i64, i64, i64, i64, i64) {
 
 #[cfg(test)]
 mod tests {
-    use super::{civil_from_days, civil_from_secs};
+    use super::{civil_from_days, civil_from_secs, days_from_civil};
 
     #[test]
     fn civil_dates() {
@@ -54,6 +65,19 @@ mod tests {
         assert_eq!(civil_from_days(11_016), (2000, 2, 29));
         assert_eq!(civil_from_days(20_738), (2026, 10, 12));
         assert_eq!(civil_from_days(-719_468), (0, 3, 1));
+    }
+
+    #[test]
+    fn civil_days_round_trip() {
+        assert_eq!(days_from_civil(1970, 1, 1), 0);
+        assert_eq!(days_from_civil(1969, 12, 31), -1);
+        assert_eq!(days_from_civil(2000, 2, 29), 11_016);
+        assert_eq!(days_from_civil(2026, 10, 12), 20_738);
+        assert_eq!(days_from_civil(0, 3, 1), -719_468);
+        for days in (-800_000..800_000).step_by(37) {
+            let (y, m, d) = civil_from_days(days);
+            assert_eq!(days_from_civil(y, m, d), days, "{y}-{m}-{d}");
+        }
     }
 
     #[test]
