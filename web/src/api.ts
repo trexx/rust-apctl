@@ -86,7 +86,7 @@ export interface ListedClientView {
   last_seen: number;
 }
 
-/** A client in the client list: its view, its alias and note, and the name of the AP it is on (null when that AP has no name, or is not reporting). */
+/** A client in the client list: its view, its alias and note, and the name of the AP it is on (null when that AP has no name, or was forgotten). */
 export interface ListedClient extends ListedClientView {
   alias: string | null;
   note: string | null;
@@ -549,7 +549,6 @@ export interface DryRun {
 export const useDryRun = () => useQuery({ queryKey: keys.dryrun(), queryFn: getting<DryRun>("/api/dryrun") });
 
 export interface SiteActivity {
-  bucket: number;
   activity: {
     ts: number[];
     download_bps: number[];
@@ -602,7 +601,6 @@ export interface DensityAp {
 }
 
 export interface SiteMulticast {
-  bucket: number;
   ts: number[];
   types: Record<string, { tx_pps: number[]; rx_pps: number[]; tx_pkts: number; rx_pkts: number }>;
   clients: {
@@ -768,7 +766,7 @@ export const useSiteActivity = (span: TimeSpan, band: string) =>
 
 /** One radio's client activity alone (`parts=activity`): the server skips the airtime, which its radio's own series chart. */
 export const useRadioActivity = (span: TimeSpan, band: string, mac: Mac) =>
-  useSpanQuery<Pick<SiteActivity, "bucket" | "activity">, [string, Mac]>(keys.radioActivity, span, [band, mac], "/api/site/activity", { band: bandParam(band), mac, parts: "activity" });
+  useSpanQuery<Pick<SiteActivity, "activity">, [string, Mac]>(keys.radioActivity, span, [band, mac], "/api/site/activity", { band: bandParam(band), mac, parts: "activity" });
 
 export const useSiteTop = (span: TimeSpan, mac?: Mac) =>
   useSpanQuery<{ aps: TopEntry[]; clients: TopEntry[] }, [Mac | undefined]>(keys.siteTop, span, [mac], "/api/site/top", { mac });
@@ -869,10 +867,8 @@ export interface Wlan {
     guest: boolean;
     network: string | null;
     vlan: number | null;
-    bands: string[] | null;
     fast_roaming: boolean;
     bss_transition: boolean;
-    pmf: string | null;
   } | null;
   security_on_air: string | null;
   broadcast: { ap: Mac; name: string | null; radio: string | null; channel: number | null; bssid: string }[];
@@ -908,7 +904,7 @@ export const useConnections = (span: TimeSpan, opts: { client?: Mac; failed?: bo
 
 export const useRoaming = (span: TimeSpan) => useSpanQuery<Roaming>(keys.roaming, span, [], "/api/roaming");
 
-export const useWlans = (span: TimeSpan) => useSpanQuery<{ bucket: number; wlans: Wlan[] }>(keys.wlans, span, [], "/api/wlans");
+export const useWlans = (span: TimeSpan) => useSpanQuery<{ wlans: Wlan[] }>(keys.wlans, span, [], "/api/wlans");
 
 export interface BackupSettings {
   enabled: boolean;
