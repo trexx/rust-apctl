@@ -48,8 +48,8 @@ export function RetryBuckets() {
               ))}
             </div>
             <div className="muted small">
-              Retries as a share of all transmissions (retries ÷ attempts +
-              retries + dropped), per AP radio.
+              Retries as a share of all transmissions (retries ÷ (retries +
+              attempts + dropped)), per AP radio.
             </div>
           </>
         );

@@ -146,9 +146,10 @@ export function ChannelAiPanel() {
       </div>
       <p className="muted small">
         Each night every AP scans its bands, then APs move to clearly better
-        channels (by more than 10%) among the ones allowed below, at their
-        current width. APs on a wireless uplink, excluded APs and APs being
-        upgraded keep their channel.
+        channels among the ones allowed below, at their current width, when
+        the plan as a whole is better by more than 10%. An AP on a channel no
+        longer allowed moves regardless. APs on a wireless uplink, excluded
+        APs and APs being upgraded keep their channel.
         {!d.active &&
           " In shadow mode your current controller does this; apctl takes over after the cutover."}
       </p>
