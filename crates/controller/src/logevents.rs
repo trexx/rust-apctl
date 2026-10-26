@@ -707,8 +707,10 @@ mod tests {
         assert!(both(&mut l, 0, "[ 1234.567900] CPU: 1 PID: 0 Comm: swapper/1 Not tainted").is_empty());
         // Other programs' lines come by syslog only, and are kept.
         assert!(l.feed(&line(0, "mcad", "restarting")).is_empty());
-        let f = both(&mut l, 1, "[ 1234.568000] Kernel panic - not syncing: Fatal exception in interrupt");
-        assert_eq!((f.len(), f[0].data["kind"].as_str()), (1, Some("kernel panic")), "reported once, at netconsole's line");
+        let panic = "[ 1234.568000] Kernel panic - not syncing: Fatal exception in interrupt";
+        let f = l.feed(&line(1, "kernel", panic));
+        assert_eq!((f.len(), f[0].data["kind"].as_str()), (1, Some("kernel panic")), "reported at the first copy, syslog's");
+        assert!(l.feed(&netconsole(1, panic)).is_empty(), "and not again at netconsole's");
         let lines: Vec<&str> = f[0].data["lines"].as_array().unwrap().iter().filter_map(Value::as_str).collect();
         assert_eq!(lines, [
             "kernel: [ 1234.567890] Internal error: Oops: 17 [#1] SMP ARM",
