@@ -54,7 +54,7 @@ impl AppState {
 pub struct AppStateInner {
     pub store: Arc<Store>,
     /// Manufacturer names by MAC prefix (IEEE registry).
-    pub vendors: Arc<crate::vendor::Vendors>,
+    pub vendors: crate::vendor::Vendors,
     /// The config generator (for on-demand dry runs and settings previews).
     pub renderer: crate::dryrun::RenderFn,
     pub auth: crate::auth::SharedAuth,

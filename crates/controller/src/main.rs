@@ -340,7 +340,7 @@ async fn serve(args: ServeArgs) -> Result<()> {
     backup::schedule(backups.clone(), store.clone());
     firmware::schedule(writer.clone());
     let state = api::AppState::new(api::AppStateInner {
-        backups, active, writer: writer.clone(), store, vendors: Arc::new(vendors), renderer, auth, engine: in_tx.clone(), live, tx: api::live_json(&live_tx), started: clock::now_ts(),
+        backups, active, writer: writer.clone(), store, vendors, renderer, auth, engine: in_tx.clone(), live, tx: api::live_json(&live_tx), started: clock::now_ts(),
         source: source_desc, inform_url, syslog_listen: syslog_listen.map(|a| a.port()), keys, memo: Default::default(), threats: threat_state,
     });
     channelai::schedule(state.clone());
