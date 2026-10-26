@@ -196,7 +196,7 @@ fn failure(n: &ConnDetail) -> Option<(usize, &'static str)> {
 pub const WEAK_SIGNAL: i64 = -75;
 
 /// The signal a report was made at.
-fn rssi(n: &ConnDetail) -> Option<f64> {
+pub(crate) fn rssi(n: &ConnDetail) -> Option<f64> {
     num(&n.auth_rssi).or_else(|| num(&n.avg_rssi))
 }
 
@@ -520,18 +520,43 @@ pub fn roams(events: &[ConnEvent]) -> Vec<Roam> {
     out
 }
 
-/// Roams per pair of APs (either direction), with per-direction counts.
-pub fn roam_pairs(roams: &[Roam]) -> Vec<Value> {
-    #[derive(Default)]
-    struct Dir {
-        attempts: u64,
-        successes: u64,
-        fast: u64,
-        assistant: u64,
-        min_rssi: u64,
-    }
+/// Roams per pair of APs (either direction), with per-direction counts. In
+/// alphabetical order, as `json!` writes keys.
+#[derive(Debug, Serialize)]
+pub struct RoamPair {
+    pub ap_1: String,
+    pub ap_2: String,
+    pub attempts: u64,
+    /// From `ap_2` to `ap_1`.
+    pub backward: RoamDir,
+    /// From `ap_1` to `ap_2`.
+    pub forward: RoamDir,
+    pub success_pct: f64,
+    pub successes: u64,
+    /// The [`TOP_CLIENTS_LISTED`] clients with the most roams between the two.
+    pub top_clients: Vec<TopClient>,
+}
+
+/// A [`RoamPair`]'s roams one way.
+#[derive(Debug, Default, Serialize)]
+pub struct RoamDir {
+    pub assistant: u64,
+    pub attempts: u64,
+    pub fast: u64,
+    pub min_rssi: u64,
+    pub successes: u64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct TopClient {
+    pub mac: String,
+    pub roams: u64,
+}
+
+/// Roams per pair of APs (see [`RoamPair`]), in AP order.
+pub fn roam_pairs(roams: &[Roam]) -> Vec<RoamPair> {
     // (AP, AP) -> (first to second, second to first, roams per client)
-    type Pair<'a> = (Dir, Dir, HashMap<&'a str, u64>);
+    type Pair<'a> = (RoamDir, RoamDir, HashMap<&'a str, u64>);
     let mut pairs: BTreeMap<(&str, &str), Pair> = BTreeMap::new();
     for r in roams {
         let (a, b) = (r.from.ap.as_str(), r.to.ap.as_str());
@@ -546,21 +571,20 @@ pub fn roam_pairs(roams: &[Roam]) -> Vec<Value> {
         d.min_rssi += u64::from(r.min_rssi);
         *e.2.entry(r.client.as_str()).or_default() += 1;
     }
-    let dir = |d: &Dir| json!({ "attempts": d.attempts, "successes": d.successes, "fast": d.fast, "assistant": d.assistant, "min_rssi": d.min_rssi });
     pairs
         .into_iter()
-        .map(|((a, b), (ab, ba, clients))| {
-            let attempts = ab.attempts + ba.attempts;
-            let ok = ab.successes + ba.successes;
+        .map(|((a, b), (forward, backward, clients))| {
+            let attempts = forward.attempts + backward.attempts;
+            let successes = forward.successes + backward.successes;
             let mut top: Vec<(&str, u64)> = clients.into_iter().collect();
             top.sort_by(|x, y| y.1.cmp(&x.1).then(x.0.cmp(y.0)));
             top.truncate(TOP_CLIENTS_LISTED);
-            json!({
-                "ap_1": a, "ap_2": b, "attempts": attempts, "successes": ok,
-                "success_pct": if attempts > 0 { (100.0 * ok as f64 / attempts as f64).round() } else { 0.0 },
-                "forward": dir(&ab), "backward": dir(&ba),
-                "top_clients": top.into_iter().map(|(c, n)| json!({ "mac": c, "roams": n })).collect::<Vec<_>>(),
-            })
+            RoamPair {
+                ap_1: a.to_string(), ap_2: b.to_string(), attempts, successes,
+                success_pct: if attempts > 0 { (100.0 * successes as f64 / attempts as f64).round() } else { 0.0 },
+                forward, backward,
+                top_clients: top.into_iter().map(|(c, roams)| TopClient { mac: c.to_string(), roams }).collect(),
+            }
         })
         .collect()
 }
@@ -787,12 +811,10 @@ pub struct RoamingQuery {
     range: Option<Ts>,
     from: Option<Ts>,
     to: Option<Ts>,
-    /// How many of the newest roams to list (default 100, at most [`ROAMS_LISTED`]); the totals count them all.
-    limit: Option<usize>,
 }
 
-/// The most roams `/api/roaming` lists.
-const ROAMS_LISTED: usize = 1000;
+/// The newest roams `/api/roaming` lists (the totals count them all).
+const ROAMS_LISTED: usize = 100;
 /// The clients `/api/roaming` lists: those with the most roams (the totals count them all).
 const CLIENTS_LISTED: usize = 10;
 /// The clients with the most roams it lists for each pair of APs.
@@ -805,7 +827,6 @@ pub async fn roaming(State(s): State<AppState>, Query(q): Query<RoamingQuery>) -
     let (from, to, tier) = window(&range);
     let got = memo_read(&s, Db::Config, "roaming", &range, tier, move |c| roaming_figures(c, roams(&roam_rows(c, from, to, None)?))).await?;
     let RoamingFigures { roams, total, pairs, clients, stored, aps, named } = &*got;
-    let roams = &roams[..roams.len().min(q.limit.unwrap_or(100))];
     // The clients shown: the listed ones, each pair's top ones and those of the roams listed.
     let shown: BTreeSet<&str> = named.iter().map(String::as_str).chain(roams.iter().map(|r| r.client.as_str())).collect();
     let (ap_names, client_names) = names(stored, &s.live.read().unwrap(), aps.iter().map(String::as_str), shown);
@@ -816,7 +837,7 @@ pub async fn roaming(State(s): State<AppState>, Query(q): Query<RoamingQuery>) -
         client_names: BTreeMap<String, String>,
         clients: &'a [RoamClient],
         from: Ts,
-        pairs: &'a [Value],
+        pairs: &'a [RoamPair],
         roams: &'a [Roam],
         to: Ts,
         total: &'a Value,
@@ -829,7 +850,7 @@ struct RoamingFigures {
     /// The newest roams that may be listed ([`ROAMS_LISTED`]), newest first.
     roams: Vec<Roam>,
     total: Value,
-    pairs: Vec<Value>,
+    pairs: Vec<RoamPair>,
     /// The [`CLIENTS_LISTED`] clients with the most roams.
     clients: Vec<RoamClient>,
     /// The stored hostnames of the clients that may be named: of `named` and of `roams`.
@@ -849,7 +870,7 @@ fn roaming_figures(c: &rusqlite::Connection, mut roams: Vec<Roam>) -> anyhow::Re
     let aps = macs_of(&[], &roams).0.into_iter().map(str::to_string).collect();
     roams.reverse();
     roams.truncate(ROAMS_LISTED);
-    let tops = pairs.iter().flat_map(|p| p["top_clients"].as_array().into_iter().flatten().filter_map(|t| t["mac"].as_str()));
+    let tops = pairs.iter().flat_map(|p| p.top_clients.iter().map(|t| t.mac.as_str()));
     let named: BTreeSet<&str> = clients.iter().map(|c| c.mac.as_str()).chain(tops).collect();
     let stored = stored_client_names(c, &named.iter().copied().chain(roams.iter().map(|r| r.client.as_str())).collect())?;
     let named = named.into_iter().map(str::to_string).collect();
@@ -1044,7 +1065,7 @@ mod tests {
         let f = t.store.read(Db::Config, |c| roaming_figures(c, r)).unwrap();
         assert_eq!((&f.total["roams"], &f.total["clients"], &f.total["to_weaker"], &f.total["quick_returns"]), (&json!(78), &json!(12), &json!(78), &json!(0)));
         assert_eq!(f.clients.iter().map(|c| c.mac.as_str()).collect::<Vec<_>>(), ["c11", "c10", "c09", "c08", "c07", "c06", "c05", "c04", "c03", "c02"]);
-        assert_eq!(f.pairs[0]["top_clients"], json!([{ "mac": "c11", "roams": 12 }, { "mac": "c10", "roams": 11 }, { "mac": "c09", "roams": 10 }]));
+        assert_eq!(json!(f.pairs[0].top_clients), json!([{ "mac": "c11", "roams": 12 }, { "mac": "c10", "roams": 11 }, { "mac": "c09", "roams": 10 }]));
         assert_eq!(f.named.len(), 10, "the listed clients, the top ones among them");
         assert_eq!((f.aps.as_slice(), f.roams.len(), f.roams[0].ts), (["A".to_string(), "B".to_string()].as_slice(), 78, 11_011), "newest first");
     }
@@ -1069,8 +1090,14 @@ mod tests {
         assert_eq!(r[1].gap_s, Some(8));
         let p = roam_pairs(&r);
         assert_eq!(p.len(), 1);
-        assert_eq!((p[0]["attempts"].as_u64(), p[0]["success_pct"].as_f64()), (Some(2), Some(50.0)));
-        assert_eq!((p[0]["forward"]["attempts"].as_u64(), p[0]["backward"]["attempts"].as_u64()), (Some(1), Some(1)));
+        // Written as json! wrote it, keys in alphabetical order.
+        let pair = json!({
+            "ap_1": "A", "ap_2": "B", "attempts": 2, "successes": 1, "success_pct": 50.0,
+            "forward": { "attempts": 1, "successes": 1, "fast": 1, "assistant": 0, "min_rssi": 1 },
+            "backward": { "attempts": 1, "successes": 0, "fast": 0, "assistant": 0, "min_rssi": 0 },
+            "top_clients": [{ "mac": "c", "roams": 2 }],
+        });
+        assert_eq!(serde_json::to_string(&p[0]).unwrap(), pair.to_string());
         // A -> B at -78 -> -55 (better), then B -> A 107 s later at -80 -> -60 (back to where it was).
         let c = roam_clients(&r);
         assert_eq!((c[0].roams, c[0].to_weaker, c[0].quick_returns), (2, 0, 1));

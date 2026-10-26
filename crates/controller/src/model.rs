@@ -75,17 +75,24 @@ macro_rules! named_enum {
 }
 pub(crate) use named_enum;
 
-#[derive(Debug, Clone, Serialize)]
+/// An AP's own figures from one inform. Its page is sent them without the fields
+/// only apctl reads (`skip_serializing`), as are its uplink's, radios' and VAPs'.
+#[derive(Debug, Clone, Default, Serialize)]
 pub struct ApSample {
+    #[serde(skip_serializing)]
     pub mac: Mac,
+    #[serde(skip_serializing)]
     pub ts: Ts,
     pub hostname: Option<String>,
     pub model: Option<String>,
     pub model_display: Option<String>,
     pub version: Option<String>,
     pub ip: Option<String>,
+    #[serde(skip_serializing)]
     pub serial: Option<String>,
+    #[serde(skip_serializing)]
     pub hash_id: Option<String>,
+    #[serde(skip_serializing)]
     pub cfgversion: Option<String>,
     pub uptime: Option<i64>,
     pub cpu: Option<f64>,
@@ -96,6 +103,7 @@ pub struct ApSample {
     pub mem_total: Option<i64>,
     pub mem_used: Option<i64>,
     pub satisfaction: Option<i64>,
+    #[serde(skip_serializing)]
     pub num_sta: Option<i64>,
 }
 
@@ -109,9 +117,13 @@ pub struct UplinkSample {
     pub tx_bytes: Option<i64>,
     pub rx_packets: Option<i64>,
     pub tx_packets: Option<i64>,
+    #[serde(skip_serializing)]
     pub rx_errors: Option<i64>,
+    #[serde(skip_serializing)]
     pub tx_errors: Option<i64>,
+    #[serde(skip_serializing)]
     pub rx_dropped: Option<i64>,
+    #[serde(skip_serializing)]
     pub tx_dropped: Option<i64>,
 }
 
@@ -119,6 +131,7 @@ pub struct UplinkSample {
 pub struct RadioSample {
     /// Band code as the AP reports it: `ng` (2.4 GHz), `na` (5 GHz), `6e` (6 GHz).
     pub radio: String,
+    #[serde(skip_serializing)]
     pub name: Option<String>,
     /// Channel, width and power come from the radio's VAPs (the radio table lacks them).
     pub channel: Option<i64>,
@@ -129,9 +142,11 @@ pub struct RadioSample {
     pub cu_self_tx: Option<i64>,
     pub cu_interf: Option<i64>,
     pub noise_floor: Option<i64>,
+    #[serde(skip_serializing)]
     pub tx_packets: Option<i64>,
+    #[serde(skip_serializing)]
     pub tx_retries: Option<i64>,
-    pub rx_packets: Option<i64>,
+    #[serde(skip_serializing)]
     pub num_sta: i64,
     /// Built-in antenna gain in dBi (EIRP = transmit power + gain).
     pub antenna_gain: Option<i64>,
@@ -144,10 +159,13 @@ pub struct VapSample {
     pub bssid: String,
     pub essid: Option<String>,
     pub radio: Option<String>,
+    #[serde(skip_serializing)]
     pub name: Option<String>,
     pub channel: Option<i64>,
     /// Channel width (MHz) and transmit power (dBm) of its radio, as this VAP reports them.
+    #[serde(skip_serializing)]
     pub bw: Option<i64>,
+    #[serde(skip_serializing)]
     pub tx_power: Option<i64>,
     pub num_sta: Option<i64>,
     pub rx_bytes: Option<i64>,
@@ -156,10 +174,12 @@ pub struct VapSample {
     pub tx_packets: Option<i64>,
     pub tx_retries: Option<i64>,
     pub tx_dropped: Option<i64>,
+    #[serde(skip_serializing)]
     pub ccq: Option<i64>,
     pub satisfaction: Option<i64>,
     pub avg_client_signal: Option<i64>,
     /// Moving average of Wi-Fi TX latency in ms, when the AP reports it.
+    #[serde(skip_serializing)]
     pub latency_avg: Option<i64>,
     pub tx_mcast: Option<i64>,
     pub rx_mcast: Option<i64>,
@@ -353,7 +373,7 @@ impl Multicast {
     }
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Default, Serialize)]
 pub struct Snapshot {
     pub ap: ApSample,
     pub uplink: Option<UplinkSample>,
@@ -560,7 +580,6 @@ pub fn parse_with_scans(ts: Ts, p: &Value) -> anyhow::Result<(Snapshot, Scans)> 
             noise_floor: int(&ath["noise_floor"]),
             tx_packets: int(&ath["n_tx_pkts"]),
             tx_retries: int(&ath["n_tx_retries"]),
-            rx_packets: int(&ath["n_rx_pkts"]),
             antenna_gain: int(&r["builtin_ant_gain"]),
             min_txpower: int(&r["min_txpower"]),
             max_txpower: int(&r["max_txpower"]),

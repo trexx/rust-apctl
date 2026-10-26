@@ -180,14 +180,20 @@ fn lines(s: &str) -> Vec<&str> {
 pub fn compare_field(ours: &str, actual: &str, redacted: bool, with_diff: bool) -> FieldComparison {
     let (ours, actual) = masked(ours, actual, redacted);
     let (o, a) = (lines(&ours), lines(&actual));
+    // Line for line the same (the usual case on a matching site): no diff to make.
+    if o == a {
+        let (expected_lines, actual_lines) = (o.len(), a.len());
+        return FieldComparison {
+            expected_lines, actual_lines, identical: true, same_content: true, equivalent: true, added: 0, removed: 0, changed: 0, diff: with_diff.then(String::new),
+        };
+    }
     let d = cfgdiff::diff(&actual, &ours);
-    let identical = o == a;
     FieldComparison {
         expected_lines: o.len(),
         actual_lines: a.len(),
-        identical,
+        identical: false,
         same_content: d.is_empty(),
-        equivalent: identical || same_unordered(&o, &a),
+        equivalent: same_unordered(&o, &a),
         added: d.added.len(),
         removed: d.removed.len(),
         changed: d.changed.len(),
@@ -245,7 +251,9 @@ mod tests {
     fn compares_order_content_and_masks_secrets() {
         let actual = "a=1\nb=2\naaa.1.wpa.psk=hunter2\n";
         let same = compare_field("a=1\nb=2\naaa.1.wpa.psk=hunter2", actual, false, true);
-        assert!(same.identical && same.same_content);
+        assert!(same.identical && same.same_content && same.equivalent);
+        assert_eq!((same.expected_lines, same.actual_lines, same.added, same.removed, same.changed, same.diff.as_deref()), (3, 3, 0, 0, 0, Some("")));
+        assert!(compare_field("a=1\n\nb=2", "a=1\nb=2\n", false, false).identical, "blank lines aside");
 
         let reordered = compare_field("b=2\na=1\naaa.1.wpa.psk=hunter2", actual, false, true);
         assert!(!reordered.identical && reordered.same_content);

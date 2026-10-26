@@ -54,7 +54,7 @@ impl AppState {
 pub struct AppStateInner {
     pub store: Arc<Store>,
     /// Manufacturer names by MAC prefix (IEEE registry).
-    pub vendors: Arc<crate::vendor::Vendors>,
+    pub vendors: crate::vendor::Vendors,
     /// The config generator (for on-demand dry runs and settings previews).
     pub renderer: crate::dryrun::RenderFn,
     pub auth: crate::auth::SharedAuth,
@@ -98,7 +98,6 @@ pub fn router(state: AppState) -> Router {
         .route("/api/clients/names", get(client_names))
         .route("/api/clients/{mac}", get(client))
         .route("/api/clients/{mac}/alias", axum::routing::put(set_alias))
-        .route("/api/clients/aliases", axum::routing::post(import_aliases))
         .route("/api/devices/pending", get(crate::adopt::pending))
         .route("/api/devices/adopt-ssh", axum::routing::post(crate::ssh::adopt))
         .route("/api/devices/{mac}/adopt", axum::routing::post(crate::adopt::adopt))
@@ -427,13 +426,10 @@ fn stored_only(live: &Live) -> impl Iterator<Item = (&Mac, &KnownDevice)> {
 fn stored_view(mac: Mac, k: &KnownDevice) -> DeviceView {
     let ap = crate::model::ApSample {
         mac, ts: k.last_seen, hostname: k.hostname.clone(), model: k.model.clone(), model_display: k.model_display.clone(), version: k.version.clone(),
-        ip: k.ip.clone(), serial: k.serial.clone(), hash_id: None, cfgversion: None, uptime: None, cpu: None, mem: None, load1: None, load5: None,
-        load15: None, mem_total: None, mem_used: None, satisfaction: None, num_sta: None,
+        ip: k.ip.clone(), serial: k.serial.clone(), ..Default::default()
     };
     DeviceView {
-        snapshot: crate::model::Snapshot {
-            ap, uplink: None, radios: vec![], vaps: vec![], clients: vec![], has_vap_table: false,
-        },
+        snapshot: crate::model::Snapshot { ap, ..Default::default() },
         online: false, first_seen: k.first_seen, last_seen: k.last_seen, interval: 0, last_full_inform: 0,
         last_config_push: None,
     }
@@ -713,19 +709,19 @@ async fn client(State(s): State<AppState>, MacPath(mac): MacPath) -> Result<Resp
 }
 
 async fn state_summary(State(s): State<AppState>) -> ApiResult {
-    let live = s.live.read().unwrap();
-    Ok(Json(json!({
-        "imported_at": live.state_imported_at,
-        "summary": live.state.as_deref().map(crate::dryrun::summarize_state),
-    })))
+    // Summarised after the lock is released.
+    let (imported_at, state) = {
+        let live = s.live.read().unwrap();
+        (live.state_imported_at, live.state.clone())
+    };
+    Ok(Json(json!({ "imported_at": imported_at, "summary": state.as_deref().map(crate::dryrun::summarize_state) })))
 }
 
 /// Replaces the imported controller settings with an `informdump import` snapshot.
 async fn import_state(State(s): State<AppState>, Json(state): Json<Value>) -> ApiResult {
     crate::dryrun::validate_state(&state).map_err(|e| ApiError::bad(format!("{e:#}")))?;
-    let summary = crate::dryrun::summarize_state(&state);
     s.send(crate::engine::Input::SetState { ts: clock::now_ts(), state }).await?;
-    Ok(Json(json!({ "ok": true, "summary": summary })))
+    Ok(Json(json!({ "ok": true })))
 }
 
 /// Dry-run status: for each AP, what apctl would push now compared with the last
@@ -750,7 +746,7 @@ async fn dryrun(State(s): State<AppState>) -> Result<Json<DryRunStatus>, ApiErro
     // Then from the database, in one go: the stored redacted copy for APs not
     // pushed to since start (a full one, as above), and the comparisons made at each push.
     let need: Vec<Mac> = aps.iter().filter(|a| a.3.is_none()).map(|a| a.0).collect();
-    let (stored, history) = read(&s.store, Db::Config, move |c| {
+    let (stored, history, (history_total, history_matches)) = read(&s.store, Db::Config, move |c| {
         let stored: std::collections::HashMap<Mac, Arc<_>> = if need.is_empty() {
             Default::default()
         } else {
@@ -758,15 +754,15 @@ async fn dryrun(State(s): State<AppState>) -> Result<Json<DryRunStatus>, ApiErro
         };
         // Without the diffs' text, which older rows have and the history never shows (only the counts); text that isn't JSON becomes null.
         let mut stmt = c.prepare_cached(
-            "SELECT id, ts, mac, cfgversion, matches, CASE WHEN json_valid(comparison) THEN json_remove(comparison, '$.mgmt_cfg.diff', '$.system_cfg.diff') END
+            "SELECT id, ts, mac, matches, CASE WHEN json_valid(comparison) THEN json_remove(comparison, '$.mgmt_cfg.diff', '$.system_cfg.diff') END
              FROM dryrun_results ORDER BY ts DESC LIMIT 100",
         )?;
         let history = stmt
-            .query_map([], |r| {
-                Ok(DryRunHistory { id: r.get(0)?, ts: r.get(1)?, mac: r.get(2)?, cfgversion: r.get(3)?, matches: r.get(4)?, comparison: raw_json(r.get(5)?) })
-            })?
+            .query_map([], |r| Ok(DryRunHistory { id: r.get(0)?, ts: r.get(1)?, mac: r.get(2)?, matches: r.get(3)?, comparison: raw_json(r.get(4)?) }))?
             .collect::<rusqlite::Result<Vec<_>>>()?;
-        Ok((stored, history))
+        // Of all those stored (the list is the newest only), and how many matched.
+        let counts = c.prepare_cached("SELECT COUNT(*), COALESCE(SUM(matches != 0), 0) FROM dryrun_results")?.query_row([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        Ok((stored, history, counts))
     })
     .await?;
 
@@ -820,7 +816,7 @@ async fn dryrun(State(s): State<AppState>) -> Result<Json<DryRunStatus>, ApiErro
         devices
     })
     .await?;
-    Ok(Json(DryRunStatus { devices, history }))
+    Ok(Json(DryRunStatus { devices, history, history_total, history_matches }))
 }
 
 /// A comparison made at a push, as stored.
@@ -830,7 +826,6 @@ struct DryRunHistory {
     id: i64,
     ts: Ts,
     mac: String,
-    cfgversion: Option<String>,
     matches: bool,
     comparison: Option<Box<RawValue>>,
 }
@@ -838,7 +833,11 @@ struct DryRunHistory {
 #[derive(Serialize)]
 struct DryRunStatus {
     devices: Vec<DryRunDevice>,
+    /// The newest comparisons made at a push.
     history: Vec<DryRunHistory>,
+    /// How many comparisons are stored, and how many of them matched.
+    history_total: i64,
+    history_matches: i64,
 }
 
 /// An AP's dry run now: how what apctl would push compares with what it runs.
@@ -913,38 +912,6 @@ async fn set_alias(
     let input = crate::engine::Input::SetAliases { ts: clock::now_ts(), entries, only_if_unset: false };
     s.send(input).await?;
     Ok(Json(json!({ "ok": true })))
-}
-
-#[derive(Deserialize)]
-struct ImportEntry {
-    mac: Mac,
-    alias: Option<String>,
-    note: Option<String>,
-}
-
-#[derive(Deserialize)]
-struct ImportQuery {
-    #[serde(default)]
-    overwrite: bool,
-}
-
-/// Bulk-sets aliases (e.g. names from another controller). By default an
-/// alias already set in apctl is kept.
-async fn import_aliases(
-    State(s): State<AppState>,
-    Query(q): Query<ImportQuery>,
-    Json(entries): Json<Vec<ImportEntry>>,
-) -> ApiResult {
-    let mut parsed = Vec::with_capacity(entries.len());
-    for e in entries {
-        validate(&e.alias, &e.note)?;
-        parsed.push(AliasEdit { mac: e.mac, alias: e.alias, note: e.note });
-    }
-    let n = parsed.len();
-    // All in one message: one pass of the engine, one client-list update.
-    let input = crate::engine::Input::SetAliases { ts: clock::now_ts(), entries: parsed, only_if_unset: !q.overwrite };
-    s.send(input).await?;
-    Ok(Json(json!({ "submitted": n })))
 }
 
 #[derive(Deserialize)]
@@ -1125,7 +1092,7 @@ struct LogQuery {
 
 /// The SQL for a log query, newest first; `by_id` as `catch_up_by_id` decides.
 fn logs_sql(w: &mut Where, device: Option<Mac>, search: Option<&str>, after: Option<i64>, by_id: bool, limit: i64) -> String {
-    const COLUMNS: &str = "l.ts, l.device_mac, l.src_ip, l.facility, l.severity, l.program, l.msg, l.id";
+    const COLUMNS: &str = "l.ts, l.device_mac, l.src_ip, l.severity, l.program, l.msg, l.id";
     // Bound, as every value is, so that each shape of query is compiled once per connection.
     let limit = w.param(Sql::Integer(limit));
     if let Some(text) = search {
@@ -1171,7 +1138,6 @@ struct LogRow {
     ts: Ts,
     device_mac: Option<String>,
     src_ip: Option<String>,
-    facility: Option<i64>,
     severity: Option<i64>,
     program: Option<String>,
     msg: String,
@@ -1190,8 +1156,7 @@ async fn logs(State(s): State<AppState>, Query(q): Query<LogQuery>) -> Result<Js
         let rows = stmt
             .query_map(params_from_iter(w.params), |r| {
                 Ok(LogRow {
-                    id: r.get(7)?, ts: r.get(0)?, device_mac: r.get(1)?, src_ip: r.get(2)?, facility: r.get(3)?, severity: r.get(4)?, program: r.get(5)?,
-                    msg: r.get(6)?,
+                    id: r.get(6)?, ts: r.get(0)?, device_mac: r.get(1)?, src_ip: r.get(2)?, severity: r.get(3)?, program: r.get(4)?, msg: r.get(5)?,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -1333,8 +1298,7 @@ mod tests {
 
     /// An AP's report, decoded, as the engine gets it at time 50.
     fn report(payload: Value) -> crate::engine::Input {
-        let header = inform::Header { packet_version: 0, mac: Mac([0; 6]), flags: inform::Flags::NONE, iv: [0; 16], payload_version: 1, payload_len: 0 };
-        crate::engine::Input::Inform { ts: 50, decoded: wire::decode::Decoded { header, key: wire::decode::KeyUsed::Device, payload } }
+        crate::engine::Input::Inform { ts: 50, payload }
     }
 
     async fn get_json(app: &Router, path: &str) -> Value {
@@ -1384,7 +1348,6 @@ mod tests {
             }
             assert_eq!(sorted(stored.pointer(path).unwrap()), live, "{path}");
         }
-        assert_eq!(stored["device"]["snapshot"]["ap"]["mac"], "02:00:00:00:00:02");
         // The snapshot's clients come beside it; its neighbours and spectrum are the RF pages'.
         assert_eq!(sorted(&one["device"]["snapshot"]), ["ap", "radios", "uplink", "vaps"]);
         let clients = get_json(&app, "/api/clients").await;
@@ -1524,11 +1487,14 @@ mod tests {
         let stored = r#"{"mgmt_cfg":{"added":0,"diff":"- a=1"},"system_cfg":{"added":1,"removed":0,"changed":0,"identical":false,"diff":"+ c=3"}}"#;
         s.writer.exec(Db::Config, "INSERT INTO dryrun_results (ts, mac, matches, comparison) VALUES (7, '02:00:00:00:00:01', 0, ?1)", vec![Sql::Text(stored.into())]);
         s.writer.exec(Db::Config, "INSERT INTO dryrun_results (ts, mac, matches, comparison) VALUES (6, '02:00:00:00:00:01', 0, 'not json')", vec![]);
+        s.writer.exec(Db::Config, "INSERT INTO dryrun_results (ts, mac, matches, comparison) VALUES (5, '02:00:00:00:00:01', 1, '{}')", vec![]);
         flushed(&s.writer);
         let app = router(s.clone());
         let d = get_json(&app, "/api/dryrun").await;
         assert_eq!((d["devices"][0]["status"].as_str(), d["history"][0]["ts"].as_i64(), d["history"][0]["id"].as_i64()), (Some("no_settings"), Some(7), Some(1)));
-        assert_eq!(d.as_object().unwrap().keys().collect::<Vec<_>>(), ["devices", "history"], "the import time is the settings summary's");
+        assert_eq!(d.as_object().unwrap().keys().collect::<Vec<_>>(), ["devices", "history", "history_matches", "history_total"], "the import time is the settings summary's");
+        assert_eq!((d["history_total"].as_i64(), d["history_matches"].as_i64()), (Some(3), Some(1)));
+        assert_eq!(d["history"][2].as_object().unwrap().keys().collect::<Vec<_>>(), ["comparison", "id", "mac", "matches", "ts"]);
         // The history's comparisons come without the diffs' text.
         assert_eq!(d["history"][0]["comparison"], json!({ "mgmt_cfg": { "added": 0 }, "system_cfg": { "added": 1, "removed": 0, "changed": 0, "identical": false } }));
         assert_eq!(d["history"][1]["comparison"], Value::Null);
@@ -1640,7 +1606,7 @@ mod tests {
         assert_eq!(ts(get_json(&app, "/api/logs?after=1&device=02:00:00:00:00:02").await), vec![2]);
         assert_eq!(ts(get_json(&app, "/api/logs?q=link&device=02:00:00:00:00:01").await), Vec::<i64>::new());
         let line = json!({
-            "id": 3, "ts": 3, "device_mac": "02:00:00:00:00:01", "src_ip": null, "facility": null, "severity": null, "program": "hostapd", "msg": "wlan1: STA left",
+            "id": 3, "ts": 3, "device_mac": "02:00:00:00:00:01", "src_ip": null, "severity": null, "program": "hostapd", "msg": "wlan1: STA left",
         });
         assert_eq!(get_json(&app, "/api/logs?limit=1").await, json!([line]));
         // Catching up over more rows than are read by id: from the indexes, the same lines.
@@ -1665,6 +1631,30 @@ mod tests {
         let (state, _engine, cookie, _dir) = logged_in();
         let req = Request::get("/api/settings/wlans/w1/passphrase").header(header::COOKIE, cookie).body(Body::empty()).unwrap();
         assert_eq!(router(state).oneshot(req).await.unwrap().status(), StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn an_import_is_acknowledged_and_its_summary_read_from_the_settings() {
+        let (state, mut engine, cookie, _dir) = logged_in();
+        let app = router(state.clone());
+        let doc = json!({ "sites": [{ "_id": "s", "name": "default" }], "wlanconf": [{ "name": "Home" }], "networkconf": [], "setting": [], "devices": [] });
+        let req = Request::post("/api/settings/state").header(header::COOKIE, &cookie).header("x-requested-with", "apctl").header(header::CONTENT_TYPE, "application/json");
+        let res = app.clone().oneshot(req.body(Body::from(doc.to_string())).unwrap()).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let body: Value = serde_json::from_slice(&axum::body::to_bytes(res.into_body(), 1 << 16).await.unwrap()).unwrap();
+        assert_eq!(body, json!({ "ok": true }), "the summary is the settings page's to fetch");
+        assert!(matches!(engine.try_recv(), Ok(crate::engine::Input::SetState { .. })));
+        // As the engine stores it.
+        let summary = crate::dryrun::summarize_state(&doc);
+        {
+            let mut live = state.live.write().unwrap();
+            live.state = Some(Arc::new(doc));
+            live.state_imported_at = Some(7);
+        }
+        let req = Request::get("/api/settings/state").header(header::COOKIE, &cookie).body(Body::empty()).unwrap();
+        let res = app.oneshot(req).await.unwrap();
+        let body: Value = serde_json::from_slice(&axum::body::to_bytes(res.into_body(), 1 << 16).await.unwrap()).unwrap();
+        assert_eq!(body, json!({ "imported_at": 7, "summary": summary }));
     }
 
     #[tokio::test]
@@ -1725,11 +1715,6 @@ mod tests {
         assert_eq!(status, StatusCode::UNSUPPORTED_MEDIA_TYPE, "the rejection's own status: {msg}");
         let (status, _) = error(put("application/json", "{\"alias\": 5}").await.unwrap()).await;
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
-        // So is a MAC in a body that isn't one.
-        let req = Request::post("/api/clients/aliases").header(header::COOKIE, &cookie).header("x-requested-with", "apctl").header(header::CONTENT_TYPE, "application/json");
-        let (status, msg) = error(app.clone().oneshot(req.body(Body::from("[{\"mac\": \"nope\"}]")).unwrap()).await.unwrap()).await;
-        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
-        assert!(msg.contains("[0].mac") && msg.contains("nope"), "{msg}");
     }
 
     /// The app's state with one user, that user's session cookie, and the data directory.
@@ -1751,7 +1736,18 @@ mod tests {
     #[tokio::test]
     async fn saved_backup_settings_are_in_effect_at_once() {
         let (state, _engine, cookie, _dir) = logged_in();
-        let app = router(state);
+        let app = router(state.clone());
+        let index = || async {
+            let req = Request::get("/api/backups").header(header::COOKIE, &cookie).body(Body::empty()).unwrap();
+            let res = app.clone().oneshot(req).await.unwrap();
+            serde_json::from_slice::<Value>(&axum::body::to_bytes(res.into_body(), 1 << 20).await.unwrap()).unwrap()
+        };
+        // Unreadable: the defaults (on) to start the form from, but no run is announced.
+        state.writer.exec(Db::Config, "INSERT INTO backup_settings (id, json) VALUES (1, 'not json')", vec![]);
+        flushed(&state.writer);
+        let unreadable = index().await;
+        assert_eq!((unreadable["settings"]["enabled"].as_bool(), unreadable["next_run"].is_null()), (Some(true), true));
+        assert!(unreadable["settings_error"].as_str().is_some_and(|e| e.contains("no automatic backup")), "{unreadable}");
         let body = json!({ "enabled": false, "frequency": "weekly", "minute_utc": 60, "weekday": 2, "monthday": 1, "keep": 5, "days": 7 });
         let req = Request::put("/api/backups/settings")
             .header(header::COOKIE, &cookie)
@@ -1761,11 +1757,27 @@ mod tests {
             .unwrap();
         assert_eq!(app.clone().oneshot(req).await.unwrap().status(), StatusCode::OK);
         // Read back straight away, before the writer has committed anything.
-        let req = Request::get("/api/backups").header(header::COOKIE, &cookie).body(Body::empty()).unwrap();
-        let res = app.clone().oneshot(req).await.unwrap();
-        let index: Value = serde_json::from_slice(&axum::body::to_bytes(res.into_body(), 1 << 20).await.unwrap()).unwrap();
+        let index = index().await;
         assert_eq!(index["settings"], body);
         assert!(index["next_run"].is_null(), "automatic backups are off");
+        let keys: Vec<&str> = index.as_object().unwrap().keys().map(String::as_str).collect();
+        assert_eq!(keys, ["backups", "encrypted", "next_run", "restore_failed", "restore_pending", "settings", "settings_error"]);
+        assert!(index["settings_error"].is_null(), "saved again: readable");
+    }
+
+    #[tokio::test]
+    async fn a_backup_that_cannot_be_deleted_is_reported() {
+        let (state, _engine, cookie, _dir) = logged_in();
+        // A directory where the backup's file would be: there, but no file to delete.
+        let name = "apctl-0.1.0-20260101-000000.apb";
+        std::fs::create_dir_all(state.backups.dir().join(name)).unwrap();
+        let app = router(state);
+        let delete = |name: &str| {
+            let req = Request::delete(format!("/api/backups/file/{name}")).header(header::COOKIE, &cookie).header("x-requested-with", "apctl");
+            app.clone().oneshot(req.body(Body::empty()).unwrap())
+        };
+        assert_eq!(delete(name).await.unwrap().status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(delete("apctl-0.1.0-20260101-000001.apb").await.unwrap().status(), StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]

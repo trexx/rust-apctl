@@ -392,23 +392,24 @@ impl LogEvents {
         let (msg, prog) = (line.msg.as_str(), line.program.as_deref());
         let netconsole = line.facility.is_none();
         let kernel = netconsole || prog == Some("kernel") || line.facility == Some(0);
-        // Netconsole sends the kernel's lines with no priority, and the parser may
-        // have taken their first word for a program (`mcad[1234]: unhandled ...`,
-        // `Oops: ...`): such a line is read as sent, joined again.
-        let joined = prog.filter(|_| netconsole).map(|p| format!("{p}: {msg}"));
-        let fault = match (prog, line.facility) {
+        // The parser may have taken the first word of a kernel line for a program
+        // (`mcad[1234]: unhandled ...`, `Oops: ...`): of every netconsole line (sent
+        // with no priority), and of a syslog one of the kernel's facility not tagged
+        // `kernel:`. Such a line is read as sent, joined again.
+        let joined = prog.filter(|&p| netconsole || (line.facility == Some(0) && p != "kernel")).map(|p| format!("{p}: {msg}"));
+        let fault = kernel
+            .then(|| fault(joined.as_deref().unwrap_or(msg)))
+            .flatten()
             // A memory fault whose name went with its PID is the program's.
-            (_, None) => fault(joined.as_deref().unwrap_or(msg)).map(|(kind, name)| {
-                let program = prog.filter(|&p| kind == CrashKind::MemoryFault && p != "kernel").map(str::to_string);
-                (kind, name.or(program))
-            }),
-            (Some("kernel"), _) | (_, Some(0)) => fault(msg),
-            _ => None,
-        };
+            .map(|(kind, name)| (kind, name.or_else(|| prog.filter(|&p| kind == CrashKind::MemoryFault && p != "kernel").map(str::to_string))));
         let is_fault = fault.is_some();
         // The line as a capture keeps it, and how it came if it is the kernel's.
         let text = |joined: Option<String>| joined.unwrap_or_else(|| prog.map_or_else(|| msg.to_string(), |p| format!("{p}: {msg}")));
-        let way = |text: &String| if netconsole { Way::Netconsole(text.clone()) } else { Way::of_syslog(msg) };
+        let way = |text: &String| match prog {
+            _ if netconsole => Way::Netconsole(text.clone()),
+            Some("kernel") => Way::of_syslog(msg),
+            _ => Way::of_syslog(text),
+        };
         if let Some(c) = self.crashes.get_mut(&dev) {
             if !c.full {
                 let text = text(joined);
@@ -674,6 +675,26 @@ mod tests {
     }
 
     #[test]
+    fn kernel_syslog_lines_without_their_tag_are_read_as_sent() {
+        // The kernel's facility, but the parser took the line's first word for a program.
+        let syslog = |ts: Ts, raw: &str| crate::syslog::parse(ts, "192.168.1.6", AP.parse().ok(), raw);
+        let mut l = LogEvents::default();
+        let fault = syslog(0, "<3>mcad[1234]: unhandled level 2 translation fault (11) at 0x00000000, esr 0x92000006");
+        assert_eq!((fault.facility, fault.program.as_deref()), (Some(0), Some("mcad")));
+        assert!(l.feed(&fault).is_empty());
+        // Its netconsole copy, and a line that came both ways: each kept once.
+        assert!(l.feed(&netconsole(0, "mcad[1234]: unhandled level 2 translation fault (11) at 0x00000000, esr 0x92000006")).is_empty());
+        assert!(l.feed(&syslog(1, "<4>wlan: [0:I:ANY] vap-0(wifi1ap1): reset")).is_empty());
+        assert!(l.feed(&netconsole(1, "wlan: [0:I:ANY] vap-0(wifi1ap1): reset")).is_empty());
+        let f = l.tick(1000);
+        assert_eq!((f[0].data["kind"].as_str(), f[0].data["process"].as_str()), (Some("process crashed (memory fault)"), Some("mcad")));
+        assert_eq!(f[0].data["lines"], json!(["mcad: unhandled level 2 translation fault (11) at 0x00000000, esr 0x92000006", "wlan: [0:I:ANY] vap-0(wifi1ap1): reset"]));
+        // An oops header split the same way.
+        assert!(l.feed(&syslog(2000, "<4>Oops: 0000 [#1] PREEMPT SMP")).is_empty());
+        assert_eq!(l.tick(3000)[0].data["kind"], "kernel oops");
+    }
+
+    #[test]
     fn kernel_lines_sent_both_ways_are_kept_once() {
         let mut l = LogEvents::default();
         // Syslog's copy of the oops comes first, then netconsole's, then the rest both ways.
@@ -686,8 +707,10 @@ mod tests {
         assert!(both(&mut l, 0, "[ 1234.567900] CPU: 1 PID: 0 Comm: swapper/1 Not tainted").is_empty());
         // Other programs' lines come by syslog only, and are kept.
         assert!(l.feed(&line(0, "mcad", "restarting")).is_empty());
-        let f = both(&mut l, 1, "[ 1234.568000] Kernel panic - not syncing: Fatal exception in interrupt");
-        assert_eq!((f.len(), f[0].data["kind"].as_str()), (1, Some("kernel panic")), "reported once, at netconsole's line");
+        let panic = "[ 1234.568000] Kernel panic - not syncing: Fatal exception in interrupt";
+        let f = l.feed(&line(1, "kernel", panic));
+        assert_eq!((f.len(), f[0].data["kind"].as_str()), (1, Some("kernel panic")), "reported at the first copy, syslog's");
+        assert!(l.feed(&netconsole(1, panic)).is_empty(), "and not again at netconsole's");
         let lines: Vec<&str> = f[0].data["lines"].as_array().unwrap().iter().filter_map(Value::as_str).collect();
         assert_eq!(lines, [
             "kernel: [ 1234.567890] Internal error: Oops: 17 [#1] SMP ARM",
