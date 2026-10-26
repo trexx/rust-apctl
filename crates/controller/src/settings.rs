@@ -1898,7 +1898,7 @@ pub async fn put_device(State(s): State<AppState>, MacPath(mac): MacPath, Query(
     let inform = s.live.read().unwrap().raw_informs.get(&mac).cloned();
     // A mesh AP's uplink radio must stay on.
     let wireless_uplink = match inform.as_deref().map(uplink) {
-        Some(Uplink::Wireless(band)) => band,
+        Some(Uplink::Wireless(band)) => band.map(str::to_string),
         _ => None,
     };
     let antennas = inform.as_deref().map_or(Value::Null, |p| p["antenna_table"].clone());
@@ -1909,13 +1909,13 @@ pub async fn put_device(State(s): State<AppState>, MacPath(mac): MacPath, Query(
 
 /// How an AP reaches the network.
 #[derive(Debug, PartialEq)]
-pub(crate) enum Uplink {
+pub(crate) enum Uplink<'a> {
     Wired,
     /// Over Wi-Fi (mesh), with the band of the radio it runs on when known.
-    Wireless(Option<String>),
+    Wireless(Option<&'a str>),
 }
 
-impl Uplink {
+impl Uplink<'_> {
     pub fn is_wireless(&self) -> bool {
         matches!(self, Uplink::Wireless(_))
     }
@@ -1927,10 +1927,10 @@ impl Uplink {
 /// multi-link one) with its band in `radio`, as the official controller reads
 /// it. An AP that lost its mesh uplink (isolated) names a placeholder that is
 /// no VAP: still wireless, on an unknown band.
-pub(crate) fn uplink(p: &Value) -> Uplink {
+pub(crate) fn uplink(p: &Value) -> Uplink<'_> {
     let Some(up) = p["uplink"].as_str().filter(|u| !u.is_empty() && !u.starts_with("eth")) else { return Uplink::Wired };
     let vap = p["vap_table"].as_array().into_iter().flatten().find(|v| v["name"].as_str() == Some(up) || v["mld_name"].as_str() == Some(up));
-    Uplink::Wireless(vap.and_then(|v| v["radio"].as_str()).map(str::to_string))
+    Uplink::Wireless(vap.and_then(|v| v["radio"].as_str()))
 }
 
 #[cfg(test)]
@@ -2564,7 +2564,7 @@ mod tests {
     #[test]
     fn a_mesh_uplink_is_found_by_its_vap() {
         let inform = |uplink: &str| json!({ "uplink": uplink, "vap_table": [{ "name": "wifi1ap0", "radio": "na" }, { "name": "wifi1sta0", "radio": "na", "usage": "uplink" }] });
-        assert_eq!(uplink(&inform("wifi1sta0")), Uplink::Wireless(Some("na".into())));
+        assert_eq!(uplink(&inform("wifi1sta0")), Uplink::Wireless(Some("na")));
         assert_eq!(uplink(&inform("eth0")), Uplink::Wired);
         assert_eq!(uplink(&inform("")), Uplink::Wired);
         assert_eq!(uplink(&json!({ "vap_table": [] })), Uplink::Wired, "no uplink named: wired");
