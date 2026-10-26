@@ -541,6 +541,10 @@ input.search {
 .log-sev {
   color: var(--text-muted);
 }
+/* An unknown sender's address (an IPv6 one is longer than the column). */
+.log-device {
+  overflow-wrap: anywhere;
+}
 .log-prog {
   color: var(--accent);
 }
