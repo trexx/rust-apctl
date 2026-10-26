@@ -604,18 +604,15 @@ export interface DensityAp {
 export interface SiteMulticast {
   bucket: number;
   ts: number[];
-  types: Record<string, { tx_pps: number[]; rx_pps: number[]; tx_pkts: number; rx_pkts: number; tx_bytes: number; rx_bytes: number }>;
+  types: Record<string, { tx_pps: number[]; rx_pps: number[]; tx_pkts: number; rx_pkts: number }>;
   clients: {
     mac: Mac;
     name: string | null;
     vendor: string | null;
     connected: boolean;
     ap: string | null;
-    radio: string | null;
     tx_pkts: number;
     rx_pkts: number;
-    tx_bytes: number;
-    rx_bytes: number;
     services: ServiceCount[];
     delivery: "optimized" | "flooding" | null;
     memberships: number;
