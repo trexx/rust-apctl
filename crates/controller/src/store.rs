@@ -271,6 +271,7 @@ CREATE TABLE IF NOT EXISTS alerts (
     title TEXT NOT NULL, message TEXT NOT NULL, link TEXT, tag TEXT NOT NULL, resolved_ts INTEGER, read INTEGER NOT NULL DEFAULT 0);
 CREATE INDEX IF NOT EXISTS alerts_ts ON alerts (ts);
 CREATE INDEX IF NOT EXISTS alerts_unread ON alerts (read) WHERE read = 0;
+CREATE INDEX IF NOT EXISTS alerts_open ON alerts (resolved_ts) WHERE resolved_ts IS NULL;
 CREATE TABLE IF NOT EXISTS network_acks (
     kind TEXT NOT NULL, bssid TEXT NOT NULL, note TEXT, ts INTEGER NOT NULL, PRIMARY KEY (kind, bssid)) WITHOUT ROWID;
 CREATE TABLE IF NOT EXISTS network_threats (

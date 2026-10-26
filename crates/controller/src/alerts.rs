@@ -573,10 +573,13 @@ async fn load_open(store: &Arc<Store>, now: Ts) -> anyhow::Result<Left> {
     .await?
 }
 
+/// The open alerts' rows, through the partial index `alerts_open`.
+const OPEN: &str = "FROM alerts WHERE resolved_ts IS NULL";
+
 /// The alerts still open, but those of a kind apctl no longer raises, which can't
 /// be resolved: they are left as stored (see [`stored`]).
 fn open_alerts(c: &rusqlite::Connection) -> rusqlite::Result<Vec<Alert>> {
-    let mut stmt = c.prepare_cached("SELECT id, ts, key, category, severity, entity, title, message, link, tag, resolved_ts FROM alerts WHERE resolved_ts IS NULL")?;
+    let mut stmt = c.prepare_cached(&format!("SELECT id, ts, key, category, severity, entity, title, message, link, tag, resolved_ts {OPEN}"))?;
     stmt.query_map([], stored)?.filter_map(Result::transpose).collect()
 }
 
@@ -915,9 +918,18 @@ fn recent(c: &rusqlite::Connection, limit: i64) -> anyhow::Result<Value> {
         .filter_map(Result::transpose)
         .collect::<rusqlite::Result<Vec<_>>>()?;
     let unread: i64 = c.query_row("SELECT COUNT(*) FROM alerts WHERE read = 0", [], |r| r.get(0))?;
-    let open = open_alerts(c)?;
-    let open_high = open.iter().filter(|a| a.severity == Severity::High).count();
-    Ok(json!({ "alerts": rows, "unread": unread, "open": open.len(), "open_high": open_high }))
+    // Counted, not built: of a kind apctl still raises, as `stored` reads them.
+    let (mut open, mut open_high) = (0, 0);
+    let mut stmt = c.prepare_cached(&format!("SELECT key, entity, severity {OPEN}"))?;
+    let mut q = stmt.query([])?;
+    while let Some(r) = q.next()? {
+        let (key, entity) = (r.get_ref(0)?.as_str()?, r.get_ref(1)?.as_str()?);
+        if Key::parse(key).is_some_and(|k| Entity::parse(k, entity).is_some()) {
+            open += 1;
+            open_high += usize::from(Severity::parse(r.get_ref(2)?.as_str()?) == Some(Severity::High));
+        }
+    }
+    Ok(json!({ "alerts": rows, "unread": unread, "open": open, "open_high": open_high }))
 }
 
 /// GET /api/alerts: recent alerts, newest first, with the unread and open counts ([`recent`]).
@@ -1455,6 +1467,13 @@ mod tests {
         let h = radio_health(&w.store, now).await.unwrap();
         let judged = |radio: &str| h.get(&("02:00:00:00:00:01".parse().unwrap(), radio.to_string())).and_then(|h| h.utilisation);
         assert_eq!((judged("na"), judged("ng"), judged("6e")), (Some(90.0), None, None));
+    }
+
+    #[test]
+    fn open_alerts_are_read_through_their_partial_index() {
+        let t = TestStore::new("alerts-open-plan");
+        let plan: String = t.db(Db::Config).query_row(&format!("EXPLAIN QUERY PLAN SELECT key, entity, severity {OPEN}"), [], |r| r.get(3)).unwrap();
+        assert_eq!(plan, "SEARCH alerts USING INDEX alerts_open (resolved_ts=?)");
     }
 
     #[test]
