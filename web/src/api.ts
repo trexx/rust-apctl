@@ -1729,11 +1729,9 @@ export interface PendingAp {
   model_display: string | null;
   version: string | null;
   hostname: string | null;
-  serial: string | null;
   /** apctl managed it before: it was reset. */
   known: boolean;
   first_seen: number;
-  last_seen: number;
 }
 
 export interface AdoptionStatus {
