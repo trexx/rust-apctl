@@ -1732,7 +1732,18 @@ mod tests {
     #[tokio::test]
     async fn saved_backup_settings_are_in_effect_at_once() {
         let (state, _engine, cookie, _dir) = logged_in();
-        let app = router(state);
+        let app = router(state.clone());
+        let index = || async {
+            let req = Request::get("/api/backups").header(header::COOKIE, &cookie).body(Body::empty()).unwrap();
+            let res = app.clone().oneshot(req).await.unwrap();
+            serde_json::from_slice::<Value>(&axum::body::to_bytes(res.into_body(), 1 << 20).await.unwrap()).unwrap()
+        };
+        // Unreadable: the defaults (on) to start the form from, but no run is announced.
+        state.writer.exec(Db::Config, "INSERT INTO backup_settings (id, json) VALUES (1, 'not json')", vec![]);
+        flushed(&state.writer);
+        let unreadable = index().await;
+        assert_eq!((unreadable["settings"]["enabled"].as_bool(), unreadable["next_run"].is_null()), (Some(true), true));
+        assert!(unreadable["settings_error"].as_str().is_some_and(|e| e.contains("no automatic backup")), "{unreadable}");
         let body = json!({ "enabled": false, "frequency": "weekly", "minute_utc": 60, "weekday": 2, "monthday": 1, "keep": 5, "days": 7 });
         let req = Request::put("/api/backups/settings")
             .header(header::COOKIE, &cookie)
@@ -1742,13 +1753,12 @@ mod tests {
             .unwrap();
         assert_eq!(app.clone().oneshot(req).await.unwrap().status(), StatusCode::OK);
         // Read back straight away, before the writer has committed anything.
-        let req = Request::get("/api/backups").header(header::COOKIE, &cookie).body(Body::empty()).unwrap();
-        let res = app.clone().oneshot(req).await.unwrap();
-        let index: Value = serde_json::from_slice(&axum::body::to_bytes(res.into_body(), 1 << 20).await.unwrap()).unwrap();
+        let index = index().await;
         assert_eq!(index["settings"], body);
         assert!(index["next_run"].is_null(), "automatic backups are off");
         let keys: Vec<&str> = index.as_object().unwrap().keys().map(String::as_str).collect();
-        assert_eq!(keys, ["backups", "encrypted", "next_run", "restore_failed", "restore_pending", "settings"]);
+        assert_eq!(keys, ["backups", "encrypted", "next_run", "restore_failed", "restore_pending", "settings", "settings_error"]);
+        assert!(index["settings_error"].is_null(), "saved again: readable");
     }
 
     #[tokio::test]

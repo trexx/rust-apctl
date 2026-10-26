@@ -1130,16 +1130,21 @@ pub async fn index(State(s): State<AppState>) -> Result<Json<Value>, ApiError> {
     let store = s.store.clone();
     let (settings, list, staged, failed) = tokio::task::spawn_blocking(move || {
         let staged = b.staging().join("pending").exists();
-        let settings = b.settings(&store).unwrap_or_else(|e| {
-            tracing::warn!("the backup settings could not be read, the defaults are shown: {e:#}");
-            Settings::default()
-        });
-        (settings, list(&b), staged, fs::read_to_string(b.staging().join("pending.failed")).ok())
+        (b.settings(&store), list(&b), staged, fs::read_to_string(b.staging().join("pending.failed")).ok())
     })
     .await?;
-    let next = settings.enabled.then(|| settings.next_due(clock::now_ts()));
+    // Unreadable, the schedule makes nothing (see `schedule`): no next run, and
+    // the defaults only as the form's starting values.
+    let (settings, error) = match settings {
+        Ok(s) => (s, None),
+        Err(e) => {
+            tracing::warn!("the backup settings could not be read, the defaults are shown: {e:#}");
+            (Settings::default(), Some(format!("The stored backup settings could not be read ({e:#}): no automatic backup is made until they are saved again.")))
+        }
+    };
+    let next = (settings.enabled && error.is_none()).then(|| settings.next_due(clock::now_ts()));
     Ok(Json(json!({
-        "encrypted": encrypted, "settings": settings, "next_run": next,
+        "encrypted": encrypted, "settings": settings, "settings_error": error, "next_run": next,
         "backups": list, "restore_pending": staged, "restore_failed": failed,
     })))
 }
