@@ -156,6 +156,13 @@ pub fn wlan_id(w: &Value) -> &str {
     oid(w).or_else(|| str_of(w, "name")).unwrap_or_default()
 }
 
+/// A WPA WLAN's `wpa_mode` as the render reads it: the stored value, else `"auto"`, as
+/// the official controller defaults it. `"wpa1"` and `"wpa2"` are those alone; any other
+/// value (`"auto"` among them) is WPA/WPA2 mixed (`aaa.N.wpa=3`).
+pub fn wpa_mode(w: &Value) -> &str {
+    str_of(w, "wpa_mode").unwrap_or("auto")
+}
+
 /// The device's radios, sorted by name (`wifi0`, `wifi1`, ...).
 pub fn radios<'a>(ctx: &Ctx<'a>) -> Vec<Radio<'a>> {
     let mut table: Vec<&'a Value> = arr(ctx.device, "radio_table").iter().collect();
@@ -617,7 +624,7 @@ pub fn render_vap(c: &mut Cfg, ctx: &Ctx, radios: &[Radio], vaps: &[Vap], v: &Va
             wep(c, a, w);
         }
     } else {
-        let wpa_mode = str_of(w, "wpa_mode").unwrap_or("auto");
+        let wpa_mode = wpa_mode(w);
         head(c, !r.disabled);
         c.set(a.at("verbose"), 2);
         c.set(
@@ -1009,6 +1016,13 @@ mod tests {
         let mut c = Cfg::default();
         schedule(&mut c, w, Prefix::new("wireless", 1), invert, multi);
         c.finish().lines().map(str::to_string).collect()
+    }
+
+    #[test]
+    fn a_missing_wpa_mode_reads_as_auto() {
+        assert_eq!(wpa_mode(&json!({ "security": "wpapsk" })), "auto");
+        assert_eq!(wpa_mode(&json!({ "security": "wpapsk", "wpa_mode": null })), "auto");
+        assert_eq!(wpa_mode(&json!({ "security": "wpapsk", "wpa_mode": "wpa2" })), "wpa2");
     }
 
     #[test]
