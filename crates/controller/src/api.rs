@@ -98,7 +98,6 @@ pub fn router(state: AppState) -> Router {
         .route("/api/clients/names", get(client_names))
         .route("/api/clients/{mac}", get(client))
         .route("/api/clients/{mac}/alias", axum::routing::put(set_alias))
-        .route("/api/clients/aliases", axum::routing::post(import_aliases))
         .route("/api/devices/pending", get(crate::adopt::pending))
         .route("/api/devices/adopt-ssh", axum::routing::post(crate::ssh::adopt))
         .route("/api/devices/{mac}/adopt", axum::routing::post(crate::adopt::adopt))
@@ -913,38 +912,6 @@ async fn set_alias(
 }
 
 #[derive(Deserialize)]
-struct ImportEntry {
-    mac: Mac,
-    alias: Option<String>,
-    note: Option<String>,
-}
-
-#[derive(Deserialize)]
-struct ImportQuery {
-    #[serde(default)]
-    overwrite: bool,
-}
-
-/// Bulk-sets aliases (e.g. names from another controller). By default an
-/// alias already set in apctl is kept.
-async fn import_aliases(
-    State(s): State<AppState>,
-    Query(q): Query<ImportQuery>,
-    Json(entries): Json<Vec<ImportEntry>>,
-) -> ApiResult {
-    let mut parsed = Vec::with_capacity(entries.len());
-    for e in entries {
-        validate(&e.alias, &e.note)?;
-        parsed.push(AliasEdit { mac: e.mac, alias: e.alias, note: e.note });
-    }
-    let n = parsed.len();
-    // All in one message: one pass of the engine, one client-list update.
-    let input = crate::engine::Input::SetAliases { ts: clock::now_ts(), entries: parsed, only_if_unset: !q.overwrite };
-    s.send(input).await?;
-    Ok(Json(json!({ "submitted": n })))
-}
-
-#[derive(Deserialize)]
 struct SeriesQuery {
     /// Key values in the table's key order, comma-separated (e.g. `mac,radio`).
     key: String,
@@ -1721,11 +1688,6 @@ mod tests {
         assert_eq!(status, StatusCode::UNSUPPORTED_MEDIA_TYPE, "the rejection's own status: {msg}");
         let (status, _) = error(put("application/json", "{\"alias\": 5}").await.unwrap()).await;
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
-        // So is a MAC in a body that isn't one.
-        let req = Request::post("/api/clients/aliases").header(header::COOKIE, &cookie).header("x-requested-with", "apctl").header(header::CONTENT_TYPE, "application/json");
-        let (status, msg) = error(app.clone().oneshot(req.body(Body::from("[{\"mac\": \"nope\"}]")).unwrap()).await.unwrap()).await;
-        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
-        assert!(msg.contains("[0].mac") && msg.contains("nope"), "{msg}");
     }
 
     /// The app's state with one user, that user's session cookie, and the data directory.

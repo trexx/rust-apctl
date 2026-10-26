@@ -41,8 +41,8 @@ pub enum Input {
     /// Active mode: apctl itself sent this reply to an AP (a `setparam`, or a
     /// reply that sets its inform interval).
     Replied { ts: Ts, mac: Mac, payload: Value },
-    /// Set or clear clients' aliases and notes (None clears): one, or a bulk
-    /// import. `only_if_unset` leaves existing aliases alone (for imports).
+    /// Set or clear clients' aliases and notes (None clears). `only_if_unset`
+    /// leaves existing aliases alone, as a settings import's names do.
     SetAliases { ts: Ts, entries: Vec<AliasEdit>, only_if_unset: bool },
     /// A syslog datagram from an AP (captured in shadow mode or received directly).
     Datagram { ts: Ts, src_ip: String, payload: Vec<u8> },
@@ -1119,10 +1119,14 @@ impl Engine {
         // the APs; the engine's own replaces it for every AP whose state it knows.
         mark_available(&mut state, &presence(&self.live.read().unwrap()));
         let summary = crate::dryrun::summarize_state(&state);
+        let names = imported_names(&state);
         self.store_state(state, ts);
         // The new settings may hold the syslog key of an AP given up on.
         self.syslog_unknown.clear();
         self.emit(Event::site(ts, EventKind::SettingsImported, summary));
+        // The other controller's client names become aliases, for the clients
+        // not named in apctl: one named here, or by an earlier import, is kept.
+        self.set_aliases(ts, names, true);
         // Every AP's config may have changed: as after an edit, they pick it up now.
         crate::stun::poke_all(&self.live.read().unwrap());
     }
@@ -2061,6 +2065,14 @@ fn mark_available(state: &mut Value, aps: &HashMap<Mac, bool>) -> Vec<Mac> {
     changed
 }
 
+/// The names (and notes) the settings' clients were given in the other
+/// controller, as alias edits: each client with a MAC and a name.
+fn imported_names(state: &Value) -> Vec<AliasEdit> {
+    let text = |v: &Value| v.as_str().map(str::trim).filter(|s| !s.is_empty()).map(str::to_string);
+    let clients = state["clients"].as_array().into_iter().flatten();
+    clients.filter_map(|c| Some(AliasEdit { mac: crate::settings::doc_mac(&c["mac"])?, alias: Some(text(&c["name"])?), note: text(&c["note"]) })).collect()
+}
+
 #[cfg(test)]
 mod tests {
 
@@ -2582,6 +2594,38 @@ mod tests {
         let live = h.live.read().unwrap();
         assert_eq!((live.aliases[&c2].alias.as_deref(), live.aliases[&c2].note.as_deref()), (Some("TV"), Some("behind the TV")));
         assert_eq!((live.aliases[&c3].alias.as_deref(), live.aliases[&c3].note.as_deref()), (None, Some("guest laptop")));
+    }
+
+    #[test]
+    fn an_import_names_the_clients_not_named_in_apctl() {
+        let mut h = harness();
+        let [c1, c2, c3, c4]: [Mac; 4] = [C1, "02:00:00:00:01:02", "02:00:00:00:01:03", "02:00:00:00:01:04"].map(|m| m.parse().unwrap());
+        let edit = |mac: Mac, alias: Option<&str>, note: Option<&str>| AliasEdit { mac, alias: alias.map(str::to_string), note: note.map(str::to_string) };
+        h.engine.handle(Input::SetAliases { ts: 1, entries: vec![edit(c1, Some("Kitchen speaker"), None), edit(c2, None, Some("behind the TV"))], only_if_unset: false });
+        let import = |h: &mut Harness, ts: Ts, laptop: &str| {
+            let clients = json!([
+                { "mac": C1, "name": "Speaker", "note": "imported" },
+                { "mac": "02:00:00:00:01:02", "name": " TV " },
+                { "mac": "02:00:00:00:01:03", "name": laptop, "note": "guest" },
+                { "mac": "02:00:00:00:01:04", "name": "  " },
+                { "mac": "nope", "name": "Nobody" },
+            ]);
+            h.engine.handle(Input::SetState { ts, state: json!({ "clients": clients }) });
+        };
+        import(&mut h, 2, "Laptop");
+        let names = |h: &Harness| {
+            let live = h.live.read().unwrap();
+            [c1, c2, c3, c4].map(|m| live.aliases.get(&m).map(|a| (a.alias.clone().unwrap_or_default(), a.note.clone().unwrap_or_default())))
+        };
+        let named = |a: &str, n: &str| Some((a.to_string(), n.to_string()));
+        // Named in apctl: kept, note and all. Only a note: named, the note kept. No name: left out.
+        let expected = [named("Kitchen speaker", ""), named("TV", "behind the TV"), named("Laptop", "guest"), None];
+        assert_eq!(names(&h), expected);
+        assert_eq!(h.live.read().unwrap().aliases.len(), 3);
+        // A later import names no one anew: each name it has is one apctl now has too.
+        import(&mut h, 3, "Work laptop");
+        assert_eq!(names(&h), expected);
+        assert_eq!(stored(&h, EventKind::ClientRenamed).len(), 3, "one rename in apctl, two by the first import");
     }
 
     #[test]
