@@ -1549,7 +1549,7 @@ export interface RadioSettings {
   channel: number | string;
   /** The width (MHz) it is set to: its own, else the site's for the band, else the band's default. */
   ht: number;
-  /** The width (MHz) it runs at: `ht`, capped by its band and by `caps.max_width`. The server judges a fixed channel at it. */
+  /** The width (MHz) it runs at: `ht`, capped by its band and by `caps.max_width`, so never wider than either. The server judges a fixed channel at it. */
   width: number;
   tx_power_mode: string;
   tx_power: number | string | null;

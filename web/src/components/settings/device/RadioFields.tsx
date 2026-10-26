@@ -21,15 +21,15 @@ type RadioForm = {
 
 /**
  * The form's fields from the settings, with numbers held as text ("36") read
- * as numbers. A width set wider than the band or the radio allows starts at
- * the one it runs at, so the form offers and keeps the channels the server
- * accepts.
+ * as numbers. The width starts at the one the radio runs at (a width set wider
+ * than the band or the radio allows is cut to it), so the form offers and
+ * keeps the channels the server accepts.
  */
 export function radioForm(r: RadioSettings): RadioForm {
   return {
     radio: r.radio,
     channel: r.channel === "auto" ? "auto" : Number(r.channel),
-    ht: Math.min(r.ht, r.width),
+    ht: r.width,
     tx_power_mode: r.tx_power_mode,
     tx_power:
       r.tx_power === null || r.tx_power === "auto" ? null : Number(r.tx_power),
@@ -43,11 +43,9 @@ export function radioForm(r: RadioSettings): RadioForm {
   };
 }
 
-/** The channels allowed at a width (as the radio runs it: no wider than it can), indoors or in outdoor mode. */
+/** The channels allowed at a width (the form's, which is never wider than the radio can), indoors or in outdoor mode. */
 const allowed = (r: RadioSettings, outdoor: boolean, ht: number) =>
-  (outdoor ? r.channels_outdoor : r.channels)[
-    String(Math.min(ht, r.caps.max_width))
-  ] ?? [];
+  (outdoor ? r.channels_outdoor : r.channels)[String(ht)] ?? [];
 
 /** A fixed channel that isn't allowed (at this width, indoors or out) falls back to auto. */
 export const keepAllowed = (
