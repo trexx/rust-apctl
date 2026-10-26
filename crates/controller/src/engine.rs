@@ -162,6 +162,7 @@ pub struct EventHead {
 pub struct DeviceView {
     pub snapshot: Snapshot,
     pub online: bool,
+    #[serde(skip_serializing)]
     pub first_seen: Ts,
     pub last_seen: Ts,
     /// Inform interval most recently requested by the controller.
@@ -2223,12 +2224,25 @@ mod tests {
     #[test]
     fn a_device_view_is_sent_without_the_engines_own_fields() {
         let mut h = harness();
-        h.engine.handle(Input::Inform { ts: 0, payload: inform(AP1, 1000, &[]) });
+        let mut p = inform(AP1, 1000, &[(C1, "b1")]);
+        p["radio_table"] = json!([{ "radio": "na", "name": "wifi1", "athstats": { "n_tx_pkts": 5 } }]);
+        p["if_table"] = json!([{ "name": "eth0", "up": true, "rx_errors": 1 }]);
+        h.engine.handle(Input::Inform { ts: 0, payload: p });
         let d = h.live.read().unwrap().devices[&AP1.parse().unwrap()].clone();
         let v = serde_json::to_value(&d).unwrap();
-        let keys: Vec<&str> = v.as_object().unwrap().keys().map(String::as_str).collect();
-        assert_eq!(keys, ["first_seen", "interval", "last_seen", "online", "snapshot"]);
-        assert!(v["snapshot"].get("has_vap_table").is_none() && v["snapshot"].get("clients").is_none());
+        let keys = |v: &Value| v.as_object().unwrap().keys().cloned().collect::<Vec<_>>().join(" ");
+        assert_eq!(keys(&v), "interval last_seen online snapshot");
+        // Of the snapshot, what the AP's page reads: no clients (they come beside it), nothing only apctl reads.
+        let s = &v["snapshot"];
+        assert_eq!(keys(s), "ap radios uplink vaps");
+        assert_eq!(keys(&s["ap"]), "cpu hostname ip load1 load15 load5 mem mem_total mem_used model model_display satisfaction uptime version");
+        assert_eq!(keys(&s["uplink"]), "full_duplex ifname rx_bytes rx_packets speed tx_bytes tx_packets up");
+        assert_eq!(keys(&s["radios"][0]), "antenna_gain bw channel cu_interf cu_self_rx cu_self_tx cu_total max_txpower min_txpower noise_floor radio tx_power");
+        assert_eq!(
+            keys(&s["vaps"][0]),
+            "avg_client_signal bssid channel essid num_sta radio rx_bcast rx_bytes rx_dropped rx_mcast rx_packets satisfaction tx_bcast tx_bytes tx_dropped \
+             tx_errors tx_mcast tx_packets tx_retries wifi_tx_attempts wifi_tx_dropped"
+        );
     }
 
     #[test]

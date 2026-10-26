@@ -1347,7 +1347,6 @@ mod tests {
             }
             assert_eq!(sorted(stored.pointer(path).unwrap()), live, "{path}");
         }
-        assert_eq!(stored["device"]["snapshot"]["ap"]["mac"], "02:00:00:00:00:02");
         // The snapshot's clients come beside it; its neighbours and spectrum are the RF pages'.
         assert_eq!(sorted(&one["device"]["snapshot"]), ["ap", "radios", "uplink", "vaps"]);
         let clients = get_json(&app, "/api/clients").await;
