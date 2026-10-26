@@ -31,6 +31,9 @@ type SortKey =
   | "uptime"
   | "last_seen";
 
+/** The text columns, which sort A→Z on their first click; the figures start largest first. */
+const TEXT_KEYS: readonly SortKey[] = ["name", "ap", "essid"];
+
 /** The AP column's text: the AP's name, else its MAC. */
 const apText = (c: ListedClient) => c.ap_name ?? c.sample.ap_mac;
 
@@ -160,7 +163,7 @@ function ClientList({ tabs }: { tabs: ReactNode }) {
       onSort={() =>
         setSort((s) => ({
           key,
-          desc: s.key === key ? !s.desc : key !== "name",
+          desc: s.key === key ? !s.desc : !TEXT_KEYS.includes(key),
         }))
       }
     />
