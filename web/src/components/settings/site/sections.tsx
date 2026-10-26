@@ -40,7 +40,7 @@ export function CountryTimezone({
         <Select
           value={f.country}
           onChange={(v) => set("country", v)}
-          stray={(c) => `(code ${c || "none"})`}
+          stray={(c) => `(code ${c})`}
           options={d.countries.map((c) => [c.code, c.name] as const)}
         />
       </Row>

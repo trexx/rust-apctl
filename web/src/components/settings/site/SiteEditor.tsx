@@ -71,7 +71,7 @@ export function SiteSettingsPanel() {
   return (
     <EditPanel
       title="Site settings"
-      summary={`${country ?? `country ${d.country ?? "?"}`}, ${d.timezone ?? "UTC"}, SSH user ${d.mgmt.x_ssh_username ?? "ubnt"}`}
+      summary={`${country ?? `country ${d.country}`}, ${d.timezone ?? "UTC"}, SSH user ${d.mgmt.x_ssh_username ?? "ubnt"}`}
       readOnly={readOnly}
       editor={(onClose) => <SiteEditor d={d} onClose={onClose} />}
     />

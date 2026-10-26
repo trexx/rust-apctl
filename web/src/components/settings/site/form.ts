@@ -2,7 +2,7 @@ import type { SiteSettings, SshKey } from "../../../api";
 
 // Each group of site settings as its form holds it; each is patched as its own object.
 
-export type TopForm = { country: number | null; timezone: string };
+export type TopForm = { country: number; timezone: string };
 
 export const topForm = (d: SiteSettings): TopForm => ({
   country: d.country,
