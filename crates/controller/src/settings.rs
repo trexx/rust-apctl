@@ -316,14 +316,6 @@ pub(crate) fn band_name(band: &str) -> &str {
     }
 }
 
-/// The `radio_caps` bit of a radio with the "interference blocker" (hard noise floor).
-const INTERFERENCE_BLOCKER: i64 = 131072;
-
-/// Whether an AP record's radio has the interference blocker.
-fn has_blocker(radio: &Value) -> bool {
-    apcfg::int_of(radio, "radio_caps").is_some_and(|c| c & INTERFERENCE_BLOCKER != 0)
-}
-
 /// The APs an SSID is broadcast from, sorted: `None` for all of them (its
 /// groups hold the site's default one). One with no groups is broadcast from
 /// none, as the AP config has it.
@@ -484,7 +476,7 @@ fn radio_view(state: &Value, r: &Value, reported: &Value) -> Value {
     v["channels"] = channels(state, band, false);
     v["channels_outdoor"] = channels(state, band, true);
     // The "interference blocker" exists only on radios reporting this capability.
-    v["has_blocker"] = json!(has_blocker(r));
+    v["has_blocker"] = json!(apcfg::has_hard_noise_floor(r));
     v
 }
 
@@ -1778,7 +1770,7 @@ fn radio_edit(e: &DeviceEdit, rp: &Value, before: &Value, d: &mut Value, iot_loc
     }
     copy_fields(rp, r, &[("min_rssi_enabled", Bool), ("min_rssi", Int(-90, -67))])?;
     if let Some(b) = bool_field(rp, "hard_noise_floor_enabled")? {
-        if b && !has_blocker(r) {
+        if b && !apcfg::has_hard_noise_floor(r) {
             return Err(format!("{label}: this radio has no interference blocker"));
         }
         r["hard_noise_floor_enabled"] = json!(b);
@@ -1788,7 +1780,7 @@ fn radio_edit(e: &DeviceEdit, rp: &Value, before: &Value, d: &mut Value, iot_loc
         r,
         &[("vwire_enabled", Bool), ("sens_level_enabled", Bool), ("loadbalance_enabled", Bool), ("sens_level", Int(-90, -50)), ("maxsta", Int(1, 200))],
     )?;
-    if r["tx_power_mode"].as_str() == Some("disabled") && e.wireless_uplink.as_deref() == Some(band) {
+    if apcfg::radio_off(r) && e.wireless_uplink.as_deref() == Some(band) {
         return Err(format!("{label}: this radio carries the AP's wireless uplink, so it cannot be turned off"));
     }
     Ok(())
@@ -2581,6 +2573,10 @@ mod tests {
         assert_eq!(uplink(&inform("ath0")), Uplink::Wireless(None), "a placeholder names no VAP: wireless, band unknown");
         let mut s = state();
         let e = DeviceEdit { mac: AP1.parse().unwrap(), patch: json!({ "radios": [{ "radio": "na", "tx_power_mode": "disabled" }] }), reported: Value::Null, wireless_uplink: Some("na".into()), antennas: Value::Null };
+        assert!(apply_device(&mut s, &e).unwrap_err().contains("uplink"));
+        // A radio stored off in another case is off, as the render reads it.
+        s["devices"][0]["radio_table"][1]["tx_power_mode"] = json!("Disabled");
+        let e = DeviceEdit { patch: json!({ "radios": [{ "radio": "na", "maxsta": 50 }] }), ..e };
         assert!(apply_device(&mut s, &e).unwrap_err().contains("uplink"));
     }
 
