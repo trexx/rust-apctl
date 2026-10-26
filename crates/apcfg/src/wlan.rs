@@ -175,7 +175,7 @@ pub fn radios<'a>(ctx: &Ctx<'a>) -> Vec<Radio<'a>> {
             name: str_of(r, "name").unwrap_or_default(),
             band: Band::of_radio(r),
             doc: r,
-            disabled: str_of(r, "tx_power_mode").is_some_and(|m| m.eq_ignore_ascii_case("disabled")),
+            disabled: radio_off(r),
         })
         .collect()
 }
@@ -372,6 +372,19 @@ pub fn capable_width(radio: &Value) -> i64 {
     }
 }
 
+/// Whether a radio (its `radio_table` entry) has the hardware noise floor setting (the
+/// "interference blocker"): its `radio_caps` bit 17. The render sends `hard_noisefloor.*`
+/// only to such a radio; every other radio gets `hard_noisefloor.status=disabled`.
+pub fn has_hard_noise_floor(radio: &Value) -> bool {
+    bit(int_of(radio, "radio_caps").unwrap_or(0) as u64, RCAP_HARD_NOISE_FLOOR)
+}
+
+/// Whether a radio (its `radio_table` entry) is switched off: its `tx_power_mode` is
+/// `"disabled"`, in any ASCII case. The render then sends its VAPs with status disabled.
+pub fn radio_off(radio: &Value) -> bool {
+    str_of(radio, "tx_power_mode").is_some_and(|m| m.eq_ignore_ascii_case("disabled"))
+}
+
 /// `radio.R.*` for every radio. Returns whether any radio wrote a `stamgr.R` block.
 pub fn render_radios(c: &mut Cfg, ctx: &Ctx, radios: &[Radio], vaps: &[Vap]) -> bool {
     let advanced = flag(ctx.mgmt, "advanced_feature_enabled", false);
@@ -425,7 +438,7 @@ pub fn render_radios(c: &mut Cfg, ctx: &Ctx, radios: &[Radio], vaps: &[Vap]) -> 
         // Sensitivity values are offsets above -95 dBm (saturating: an imported value
         // can be any number).
         let min_rssi = int_of(d, "min_rssi").unwrap_or(-80).saturating_add(95).max(1);
-        let sens = if bit(int_of(d, "radio_caps").unwrap_or(0) as u64, RCAP_HARD_NOISE_FLOOR) {
+        let sens = if has_hard_noise_floor(d) {
             if flag(d, "sens_level_enabled", false) {
                 Some(int_of(d, "sens_level").unwrap_or(-94).saturating_add(95))
             } else if flag(d, "min_rssi_enabled", false) && flag(d, "hard_noise_floor_enabled", false) {
@@ -1016,6 +1029,18 @@ mod tests {
         let mut c = Cfg::default();
         schedule(&mut c, w, Prefix::new("wireless", 1), invert, multi);
         c.finish().lines().map(str::to_string).collect()
+    }
+
+    #[test]
+    fn radio_facts_read_as_the_render_reads_them() {
+        assert!(has_hard_noise_floor(&json!({ "radio_caps": 1 << 17 })));
+        assert!(has_hard_noise_floor(&json!({ "radio_caps": "131072" })));
+        assert!(!has_hard_noise_floor(&json!({ "radio_caps": 1 << 16 })));
+        assert!(!has_hard_noise_floor(&json!({})));
+        assert!(radio_off(&json!({ "tx_power_mode": "disabled" })));
+        assert!(radio_off(&json!({ "tx_power_mode": "Disabled" })));
+        assert!(!radio_off(&json!({ "tx_power_mode": "auto" })));
+        assert!(!radio_off(&json!({})));
     }
 
     #[test]
