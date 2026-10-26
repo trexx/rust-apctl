@@ -75,7 +75,7 @@ macro_rules! named_enum {
 }
 pub(crate) use named_enum;
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Default, Serialize)]
 pub struct ApSample {
     pub mac: Mac,
     pub ts: Ts,
@@ -353,7 +353,7 @@ impl Multicast {
     }
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Default, Serialize)]
 pub struct Snapshot {
     pub ap: ApSample,
     pub uplink: Option<UplinkSample>,

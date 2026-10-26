@@ -427,13 +427,10 @@ fn stored_only(live: &Live) -> impl Iterator<Item = (&Mac, &KnownDevice)> {
 fn stored_view(mac: Mac, k: &KnownDevice) -> DeviceView {
     let ap = crate::model::ApSample {
         mac, ts: k.last_seen, hostname: k.hostname.clone(), model: k.model.clone(), model_display: k.model_display.clone(), version: k.version.clone(),
-        ip: k.ip.clone(), serial: k.serial.clone(), hash_id: None, cfgversion: None, uptime: None, cpu: None, mem: None, load1: None, load5: None,
-        load15: None, mem_total: None, mem_used: None, satisfaction: None, num_sta: None,
+        ip: k.ip.clone(), serial: k.serial.clone(), ..Default::default()
     };
     DeviceView {
-        snapshot: crate::model::Snapshot {
-            ap, uplink: None, radios: vec![], vaps: vec![], clients: vec![], has_vap_table: false,
-        },
+        snapshot: crate::model::Snapshot { ap, ..Default::default() },
         online: false, first_seen: k.first_seen, last_seen: k.last_seen, interval: 0, last_full_inform: 0,
         last_config_push: None,
     }
