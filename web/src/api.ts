@@ -1756,6 +1756,7 @@ export const useAdoption = (enabled = true) =>
     },
   });
 export const adoptAp = (mac: Mac) => send<{ adopting: boolean }>("POST", `/api/devices/${mac}/adopt`, {});
+/** Empty `username` and `password`: the site's device login, then the factory ones, are tried; one without the other is refused (400). */
 export const adoptOverSsh = (ip: string, username: string, password: string) =>
   send<{ adopting: boolean; mac: Mac }>("POST", "/api/devices/adopt-ssh", { ip, username: username || null, password: password || null });
 export const forgetAp = (mac: Mac) => send<{ forgetting?: boolean; forgotten?: boolean }>("POST", `/api/devices/${mac}/forget`, {});

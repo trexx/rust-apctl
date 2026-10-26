@@ -4,6 +4,9 @@ import { ago, useNow } from "../format";
 import { Outcome, QueryNote, useRunner } from "./common";
 import { Row, TextInput } from "./settings/form";
 
+/** The server's answer to a login typed only half. */
+const HALF_LOGIN = "enter both the user name and the password, or neither";
+
 /**
  * APs waiting for adoption, and adopting one by IP over SSH (active mode).
  * The Overview shows (and so loads) it only to those who can edit.
@@ -84,9 +87,9 @@ export function AdoptionPanel() {
           <p className="muted small">
             For an AP that reports to another controller (or nowhere): apctl
             logs in over SSH and points it here
-            {d.ssh.inform_url ? ` (${d.ssh.inform_url})` : ""}. Leave the login
-            empty to try your site's device login, then the factory one
-            (ubnt/ubnt).
+            {d.ssh.inform_url ? ` (${d.ssh.inform_url})` : ""}. Enter both the
+            user name and the password, or neither: then your site's device
+            login is tried, then the factory ones (ubnt/ubnt, ui/ui).
           </p>
           <Row label="IP address">
             <TextInput value={ip} placeholder="192.168.1.20" onChange={setIp} />
@@ -114,6 +117,8 @@ export function AdoptionPanel() {
               disabled={busy || !ip.trim() || !d.ssh.possible}
               onClick={() =>
                 void run(async () => {
+                  // As the server: a half login is refused, not replaced by the others.
+                  if (!user !== !pass) throw new Error(HALF_LOGIN);
                   const r = await adoptOverSsh(ip.trim(), user, pass);
                   setForm(false);
                   // Don't keep the AP's password around once it has been used.
