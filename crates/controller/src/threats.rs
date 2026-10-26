@@ -477,8 +477,8 @@ const CACHE_SECS: Ts = 600;
 struct Cache {
     /// When `used` was read.
     used_at: Ts,
-    /// BSSIDs our APs used in the last 30 days: (bssid, AP, network name).
-    used: Vec<(String, String, Option<String>)>,
+    /// BSSIDs our APs used in the last 30 days.
+    used: Arc<[UsedBss]>,
     /// Per BSSID: its last change, as last worked out.
     changes: HashMap<String, Change>,
     /// When `clients` and `watching_since` were read.
@@ -488,6 +488,9 @@ struct Cache {
     /// When the first neighbouring network still kept was recorded.
     watching_since: Option<Ts>,
 }
+
+/// A BSSID our APs used: (bssid, AP, network name).
+pub(crate) type UsedBss = (String, String, Option<String>);
 
 /// When one of our BSSIDs last changed, for the AP, radio, channel and name it
 /// had when that was worked out (`at`).
@@ -513,6 +516,18 @@ pub struct ThreatState {
 impl ThreatState {
     fn cache(&self) -> MutexGuard<'_, Cache> {
         self.cache.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// The BSSIDs our APs used in the last 30 days, also those of APs not heard
+    /// from in this run: read from the metrics when the last read is older than
+    /// [`CACHE_SECS`], else as last read.
+    pub(crate) fn used_bssids(&self, store: &Store, now: Ts) -> anyhow::Result<Arc<[UsedBss]>> {
+        let mut cache = self.cache();
+        if !(0..CACHE_SECS).contains(&(now - cache.used_at)) {
+            cache.used = store.read(Db::Metrics, |c| Ok(used_bssids(c, now)?))?.into();
+            cache.used_at = now;
+        }
+        Ok(cache.used.clone())
     }
 
     fn latest(&self) -> MutexGuard<'_, Option<Latest>> {
@@ -573,13 +588,10 @@ pub fn gather(store: &Store, state: &ThreatState, live: &SharedLive, now: Ts) ->
         }
     }
 
+    let used = state.used_bssids(store, now)?;
     let mut cache = state.cache();
     store.read(Db::Metrics, |c| {
-        if !(0..CACHE_SECS).contains(&(now - cache.used_at)) {
-            cache.used = used_bssids(c, now)?;
-            cache.used_at = now;
-        }
-        for (bssid, ap, essid) in &cache.used {
+        for (bssid, ap, essid) in used.iter() {
             if !ap.is_empty() {
                 a.aps.entry(ap.clone()).or_insert(None);
             }
@@ -708,7 +720,7 @@ fn used_bssids_sql(suffix: &str) -> String {
 /// The hourly tier covers all but the last hour or so (the roll-ups run every
 /// five minutes, on complete buckets), the five-minute tier the last two
 /// hours and the raw one the last twenty minutes; the finest tier's name wins.
-fn used_bssids(c: &Connection, now: Ts) -> rusqlite::Result<Vec<(String, String, Option<String>)>> {
+fn used_bssids(c: &Connection, now: Ts) -> rusqlite::Result<Vec<UsedBss>> {
     let mut out: BTreeMap<String, (String, Option<String>)> = BTreeMap::new();
     // A rolled-up row carries its bucket's start: the hour holding `now - 30 days` counts too.
     for (suffix, since) in [("", now - 20 * 60), ("_5m", now - 2 * 3600), ("_1h", now - 30 * 86400 - 3599)] {

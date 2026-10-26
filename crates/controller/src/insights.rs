@@ -980,14 +980,25 @@ struct OwnLink {
 /// density), once per pair of APs and band; either list alone with
 /// `links_only` or `neighbors_only`.
 pub async fn neighbors(State(s): State<AppState>, Query(q): Query<NeighborQuery>) -> Result<Json<Value>, ApiError> {
-    let since = clock::now_ts() - q.range.unwrap_or(86400).clamp(600, 30 * 86400);
+    let now = clock::now_ts();
+    let since = now - q.range.unwrap_or(86400).clamp(600, 30 * 86400);
     let band = q.band.clone();
-    // Our own BSSIDs, each with its AP and band (to tell our APs apart from the
-    // neighbours), and our APs' names, copied so that the live lock is not held
-    // while the lists are made.
+    // The BSSIDs our APs used in the last 30 days, as the threat checks know them:
+    // also those of APs not heard from in this run (just after a restart, or down
+    // since before it) and retired ones, so that none is listed as a neighbour.
+    let used = {
+        let (threats, store) = (s.threats.clone(), s.store.clone());
+        tokio::task::spawn_blocking(move || threats.used_bssids(&store, now)).await??
+    };
+    // Our own BSSIDs, each with its AP (to tell our APs apart from the
+    // neighbours): the live VAPs', then the used ones; and our APs' names,
+    // copied so that the live lock is not held while the lists are made.
     let (own, names) = {
         let live = s.live.read().unwrap();
-        let own: HashMap<String, (String, Option<String>)> = own_bssids(&live).map(|(m, v)| (v.bssid.clone(), (m.to_string(), v.radio.clone()))).collect();
+        let mut own: HashMap<String, String> = own_bssids(&live).map(|(m, v)| (v.bssid.clone(), m.to_string())).collect();
+        for (bssid, ap, _) in used.iter().filter(|u| !u.1.is_empty()) {
+            own.entry(bssid.clone()).or_insert_with(|| ap.clone());
+        }
         let names: HashMap<String, String> = live.devices.iter().filter_map(|(m, d)| Some((m.to_string(), d.snapshot.ap.hostname.clone()?))).collect();
         (own, names)
     };
@@ -1028,12 +1039,12 @@ pub async fn neighbors(State(s): State<AppState>, Query(q): Query<NeighborQuery>
     let signal = |n: &Neighbor| n.signal.unwrap_or(-200);
     let mut by_bssid: BTreeMap<String, Neighbor> = BTreeMap::new();
     // (from, to, band) -> strongest signal: an AP has a BSSID per SSID.
-    let mut links: BTreeMap<(String, &str, Option<&str>), Option<i64>> = BTreeMap::new();
+    let mut links: BTreeMap<(String, &str, Option<String>), Option<i64>> = BTreeMap::new();
     for r in rows {
-        if let Some((owner, radio)) = own.get(&r.bssid) {
-            // One of our APs heard another of ours.
+        if let Some(owner) = own.get(&r.bssid) {
+            // One of our APs heard another of ours, on the band the row was heard on.
             if *owner != r.ap_mac && !q.neighbors_only {
-                let e = links.entry((r.ap_mac, owner, radio.as_deref())).or_insert(r.signal);
+                let e = links.entry((r.ap_mac, owner, r.radio)).or_insert(r.signal);
                 *e = (*e).max(r.signal);
             }
             continue;
@@ -1050,7 +1061,7 @@ pub async fn neighbors(State(s): State<AppState>, Query(q): Query<NeighborQuery>
     list.sort_by_key(|n| std::cmp::Reverse(n.best_signal.or(n.signal).unwrap_or(-200)));
     let links: Vec<OwnLink> = links
         .into_iter()
-        .map(|((from, to, radio), signal)| OwnLink { from_name: name(&from), to_name: name(to), from, to: to.to_string(), radio: radio.map(str::to_string), signal })
+        .map(|((from, to, radio), signal)| OwnLink { from_name: name(&from), to_name: name(to), from, to: to.to_string(), radio, signal })
         .collect();
     Ok(Json(json!({ "neighbors": list, "own_links": links })))
 }
@@ -1534,6 +1545,22 @@ mod tests {
             let out = ok(neighbors(State(s), Query(NeighborQuery { band: None, range: Some(30 * 86400), links_only: false, neighbors_only: true })).await);
             let names: Vec<&str> = out["neighbors"].as_array().unwrap().iter().map(|n| n["essid"].as_str().unwrap()).collect();
             assert_eq!(names, ["Once close", "Neighbour", "Other", "Far"]);
+        }
+
+        #[tokio::test]
+        async fn a_bssid_of_an_ap_not_heard_from_in_this_run_is_ours_not_a_neighbour() {
+            let (s, base, t) = site();
+            // A3 broadcast "Home" until recently (its VAP's metrics), but has not informed since apctl started.
+            const A3: &str = "02:00:00:00:00:a3";
+            insert(&t.db(Db::Metrics), "vap_stats", &["bssid", "ts", "ap_mac", "essid", "radio"], vec![vec![text("02:00:00:00:03:a3"), int(clock::now_ts() - 60), text(A3), text("Home"), text("na")]]);
+            let row = vec![text("02:00:00:00:03:a3"), text(A1), text("na"), text("Home"), int(36), int(80), int(5210), int(-55), int(base - 60), int(base)];
+            insert(&t.db(Db::Config), "neighbors", &["bssid", "ap_mac", "radio", "essid", "channel", "bw", "center_freq", "signal", "first_seen", "last_seen"], vec![row]);
+            let q = |links_only, neighbors_only| Query(NeighborQuery { band: None, range: Some(30 * 86400), links_only, neighbors_only });
+            let out = ok(neighbors(State(s.clone()), q(false, true)).await);
+            assert!(out["neighbors"].as_array().unwrap().iter().all(|n| n["bssid"] != "02:00:00:00:03:a3"), "{out}");
+            let out = ok(neighbors(State(s), q(true, false)).await);
+            let link = out["own_links"].as_array().unwrap().iter().find(|l| l["to"] == A3).cloned();
+            assert_eq!(link.map(|l| (l["from"].clone(), l["radio"].clone(), l["signal"].clone())), Some((json!(A1), json!("na"), json!(-55))));
         }
 
         #[tokio::test]
