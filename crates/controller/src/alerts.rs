@@ -660,7 +660,9 @@ impl Watcher {
     /// Starts with the alerts a previous run left open, the offline alerts it
     /// sent in the last day, which count towards today's limit, and the health
     /// alerts it closed within the cooldown, which are not raised again before it ends.
-    async fn start(store: Arc<Store>, writer: Writer, live: SharedLive, tx: broadcast::Sender<LiveMsg>, now: Ts) -> Watcher {
+    /// `restored`: each AP's last contact as the engine restored it, taken before
+    /// the engine ran (an AP that has informed since is no longer among the known ones).
+    async fn start(store: Arc<Store>, writer: Writer, live: SharedLive, tx: broadcast::Sender<LiveMsg>, now: Ts, restored: &HashMap<Mac, Ts>) -> Watcher {
         let mut w = Watcher::new(store, writer, live, tx);
         w.aps.tz = w.site_tz();
         w.aps.started = now;
@@ -685,13 +687,10 @@ impl Watcher {
         // An AP already reported offline before a restart stays so, down since
         // its last contact the engine restored (the alert may have been raised
         // well after it, e.g. on the first check after a long stop).
-        {
-            let live = w.live.read().unwrap();
-            for (k, a) in &w.book.open {
-                if let (Key::ApOffline, Entity::Ap(mac)) = k {
-                    let last_seen = live.known_devices.get(mac).map_or(i64::MAX, |d| d.last_seen);
-                    w.aps.down.insert(*mac, last_seen.min(a.ts - OFFLINE_AFTER));
-                }
+        for (k, a) in &w.book.open {
+            if let (Key::ApOffline, Entity::Ap(mac)) = k {
+                let last_seen = restored.get(mac).copied().unwrap_or(i64::MAX);
+                w.aps.down.insert(*mac, last_seen.min(a.ts - OFFLINE_AFTER));
             }
         }
         w
@@ -843,16 +842,23 @@ impl Watcher {
     }
 }
 
+/// Each known AP's last contact, as [`spawn`] takes it: read after the engine
+/// restored them and before it runs.
+pub fn last_contacts(live: &crate::engine::Live) -> HashMap<Mac, Ts> {
+    live.known_devices.iter().map(|(m, k)| (*m, k.last_seen)).collect()
+}
+
 /// Starts the alert watcher, fed by the engine through `events` (see [`channel`]).
+/// `restored` is [`last_contacts`].
 /// It keeps the engine's time (see [`crate::shadow::Clock`]): in shadow mode a
 /// lagging capture's, and while a capture is replayed it checks no AP's status
 /// or health, whose stored figures are then of the capture's time; it makes
 /// no alert of an event that is history, not news (`Clock::is_news`, by the
 /// event's own time). An event's alert carries the event's own time.
-pub fn spawn(store: Arc<Store>, writer: Writer, live: SharedLive, tx: broadcast::Sender<LiveMsg>, mut events: mpsc::Receiver<Event>, engine_clock: Arc<crate::shadow::Clock>) {
+pub fn spawn(store: Arc<Store>, writer: Writer, live: SharedLive, tx: broadcast::Sender<LiveMsg>, mut events: mpsc::Receiver<Event>, engine_clock: Arc<crate::shadow::Clock>, restored: HashMap<Mac, Ts>) {
     tokio::spawn(async move {
         let now = || engine_clock.now().unwrap_or_else(clock::now_ts);
-        let mut w = Watcher::start(store, writer, live, tx, now()).await;
+        let mut w = Watcher::start(store, writer, live, tx, now(), &restored).await;
         // Give APs a chance to report after a restart before judging them.
         let mut status = tokio::time::interval_at(tokio::time::Instant::now() + Duration::from_secs(90), Duration::from_secs(30));
         let mut health = tokio::time::interval_at(tokio::time::Instant::now() + Duration::from_secs(120), Duration::from_secs(60));
@@ -1117,7 +1123,7 @@ mod tests {
         }
         flushed(&w.book.writer);
         // A restart within the same second carries on from the stored ids.
-        let mut again = Watcher::start(w.store.clone(), w.book.writer.clone(), Default::default(), broadcast::channel(4).0, 2000).await;
+        let mut again = Watcher::start(w.store.clone(), w.book.writer.clone(), Default::default(), broadcast::channel(4).0, 2000, &HashMap::new()).await;
         let last = again.book.raise(1000, notice());
         assert_eq!(last.id, "1000-12");
         flushed(&w.book.writer);
@@ -1141,7 +1147,8 @@ mod tests {
         w.book.raise(1000, offline(Severity::High).resolved(1060));
         w.book.raise(2000, offline(Severity::High).resolved(2100));
         flushed(&w.book.writer);
-        let restart = |now| Watcher::start(w.store.clone(), w.book.writer.clone(), Default::default(), broadcast::channel(4).0, now);
+        let none = HashMap::new();
+        let restart = |now| Watcher::start(w.store.clone(), w.book.writer.clone(), Default::default(), broadcast::channel(4).0, now, &none);
         // The third drop is summarised, as without the restart.
         let mut again = restart(2700).await;
         assert_eq!(again.aps.check(3000, ap, 2700), Some(ApChange::Flapping { times: 3 }));
@@ -1166,7 +1173,7 @@ mod tests {
         }
         flushed(&w.book.writer);
         let now = 1060 + HEALTH_COOLDOWN + 100;
-        let again = Watcher::start(w.store.clone(), w.book.writer.clone(), Default::default(), broadcast::channel(4).0, now).await;
+        let again = Watcher::start(w.store.clone(), w.book.writer.clone(), Default::default(), broadcast::channel(4).0, now, &HashMap::new()).await;
         assert_eq!(again.cleared.iter().collect::<Vec<_>>(), [(&busy, &20_060)], "the last clear, within the cooldown");
         assert!(!again.may_raise(&busy, now) && again.may_raise(&busy, 20_060 + HEALTH_COOLDOWN) && again.may_raise(&site, now));
     }
@@ -1180,7 +1187,8 @@ mod tests {
         live.write().unwrap().known_devices.insert(ap, known);
         // apctl was away for an hour: the first check, 90 s in, does not call it offline yet,
         // nor 4 minutes in, while the engine still lists it as online.
-        let mut again = Watcher::start(w.store.clone(), w.book.writer.clone(), live, w.book.tx.clone(), 4600).await;
+        let restored = last_contacts(&live.read().unwrap());
+        let mut again = Watcher::start(w.store.clone(), w.book.writer.clone(), live, w.book.tx.clone(), 4600, &restored).await;
         again.status_tick(4690);
         again.status_tick(4600 + OFFLINE_AFTER);
         assert!(told(&mut rx).is_empty());
@@ -1201,10 +1209,16 @@ mod tests {
         let live: SharedLive = Default::default();
         let known = crate::engine::KnownDevice { last_seen: 1000, offline: true, ..Default::default() };
         live.write().unwrap().known_devices.insert(ap, known);
-        let again = Watcher::start(w.store.clone(), w.book.writer.clone(), live, broadcast::channel(4).0, 91_000).await;
+        let restored = last_contacts(&live.read().unwrap());
+        let again = Watcher::start(w.store.clone(), w.book.writer.clone(), live.clone(), broadcast::channel(4).0, 91_000, &restored).await;
+        assert_eq!(again.aps.down.get(&ap), Some(&1000));
+        // Also when the AP has informed (and so left the known ones) before the watcher started:
+        // its last contact is the one restored before the engine ran.
+        live.write().unwrap().known_devices.clear();
+        let again = Watcher::start(w.store.clone(), w.book.writer.clone(), live, broadcast::channel(4).0, 91_000, &restored).await;
         assert_eq!(again.aps.down.get(&ap), Some(&1000));
         // Nothing restored of it: the alert's time stands for the last contact.
-        let again = Watcher::start(w.store.clone(), w.book.writer.clone(), Default::default(), broadcast::channel(4).0, 91_000).await;
+        let again = Watcher::start(w.store.clone(), w.book.writer.clone(), Default::default(), broadcast::channel(4).0, 91_000, &HashMap::new()).await;
         assert_eq!(again.aps.down.get(&ap), Some(&(90_000 - OFFLINE_AFTER)));
     }
 
@@ -1216,7 +1230,8 @@ mod tests {
         flushed(&w.book.writer);
         let live: SharedLive = Default::default();
         live.write().unwrap().known_devices.insert(ap, crate::engine::KnownDevice { last_seen: 1000, offline: true, ..Default::default() });
-        let mut again = Watcher::start(w.store.clone(), w.book.writer.clone(), live.clone(), w.book.tx.clone(), 5000).await;
+        let restored = last_contacts(&live.read().unwrap());
+        let mut again = Watcher::start(w.store.clone(), w.book.writer.clone(), live.clone(), w.book.tx.clone(), 5000, &restored).await;
         told(&mut rx);
         // Not heard from through the start's grace and past it: no "back online", no second offline alert.
         for now in [5090, 5300, 5400, 6000] {
@@ -1394,7 +1409,7 @@ mod tests {
         let stored: Vec<(String, String)> = w.store.read(Db::Config, |c| Ok(c.prepare("SELECT key, entity FROM alerts WHERE key != 'gone' ORDER BY key")?.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<rusqlite::Result<_>>()?)).unwrap();
         assert_eq!(stored, [("busy_channel".to_string(), "02:00:00:00:00:01/na".to_string()), ("connect_failures".to_string(), "site".to_string())]);
         // After a restart they are open as they were; one apctl doesn't know is left alone.
-        let again = Watcher::start(w.store.clone(), w.book.writer.clone(), Default::default(), broadcast::channel(4).0, 2000).await;
+        let again = Watcher::start(w.store.clone(), w.book.writer.clone(), Default::default(), broadcast::channel(4).0, 2000, &HashMap::new()).await;
         let mut open: Vec<String> = again.book.open.keys().map(|(k, e)| format!("{}:{e}", k.as_str())).collect();
         open.sort();
         assert_eq!(open, ["busy_channel:02:00:00:00:00:01/na", "connect_failures:site"]);
