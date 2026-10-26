@@ -41,7 +41,7 @@ pub const FEED: &str = "https://fw-update.ubnt.com/api/firmware-newest?filter=eq
 /// `fw_caps` bit: the AP verifies SHA-256 checksums.
 const CAP_SHA256: i64 = 0x0400_0000;
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Release {
     pub platform: String,
     /// `major.minor.patch.build`, as APs report their version.
@@ -174,9 +174,15 @@ pub struct Job {
     pub from: Option<String>,
     /// The version to install, or "custom" for a firmware URL.
     pub target: String,
+    /// What the upgrade command sends, not shown: a custom firmware URL may hold a
+    /// credential, and the page is open to read-only users.
+    #[serde(skip)]
     pub url: String,
+    #[serde(skip)]
     pub md5: Option<String>,
+    #[serde(skip)]
     pub sha256: Option<String>,
+    #[serde(skip)]
     pub custom: bool,
     pub state: JobState,
     pub sent_at: Option<Ts>,
@@ -497,6 +503,11 @@ fn releases(c: &Connection) -> anyhow::Result<(Releases, Option<Ts>, Option<Stri
     Ok((list, ts, err))
 }
 
+/// A release as the firmware page shows it.
+fn release_view(r: &Release) -> Value {
+    json!({ "version": r.version, "created": r.created, "size": r.size })
+}
+
 /// An AP model's feed platform, and the release for it.
 fn release_for<'a>(rels: &'a Releases, model: Option<&str>) -> (Option<String>, Option<&'a Release>) {
     let platform = model.map(platform_for);
@@ -548,7 +559,7 @@ pub async fn index(State(s): State<AppState>) -> Result<Json<Value>, ApiError> {
             let (platform, rel) = release_for(&rels, a.model.as_deref());
             json!({
                 "mac": a.mac, "name": a.name, "model": a.model, "platform": platform, "version": a.version, "online": a.online,
-                "release": rel, "status": status(a.version.as_deref(), rel, a.required.as_deref()),
+                "release": rel.map(release_view), "status": status(a.version.as_deref(), rel, a.required.as_deref()),
             })
         })
         .collect();
@@ -705,6 +716,7 @@ mod tests {
         // A release below what the AP needs is not offered.
         assert_eq!(status(Some("6.7.0.1"), Some(&rel), Some("7.0.0")), Status::Unknown);
         assert_eq!(status(Some("6.7.0.1"), None, None), Status::Unknown);
+        assert_eq!(release_view(&rel), json!({ "version": "6.8.2.15592", "created": null, "size": null }), "not its download link and checksums");
         assert_eq!((json!(Status::UpdateAvailable), json!(Skip::NotFound), json!(Skip::Queued)), (json!("update_available"), json!("not_found"), json!("queued")), "named as the UI expects");
     }
 
@@ -800,6 +812,10 @@ mod tests {
         let cmd = command(&mut j, &m("a"), &json!({ "internet": false }), 0).unwrap().unwrap();
         assert_eq!((cmd["version"].as_str(), cmd["url"].as_str()), (Some("unknown"), Some("https://x/fw.bin")));
         assert_eq!(j.current.as_ref().map(|c| c.target.as_str()), Some("custom"), "the UI's label stays");
+        // The page is shown the job, not its URL (read-only users see it too).
+        let shown = serde_json::to_value(&j).unwrap();
+        let keys: Vec<&String> = shown["current"].as_object().unwrap().keys().collect();
+        assert_eq!(keys, ["expires", "from", "mac", "name", "sent_at", "state", "target"]);
     }
 
     #[test]
