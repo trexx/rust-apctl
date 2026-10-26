@@ -967,12 +967,9 @@ export async function uploadBackup(file: File): Promise<{ staged: string; manife
   return (await check(res)).json();
 }
 
+/** The newest release for an AP's platform, as the page shows it. */
 export interface FirmwareRelease {
-  platform: string;
   version: string;
-  url: string;
-  md5: string | null;
-  sha256: string | null;
   size: number | null;
   created: string | null;
 }
@@ -981,8 +978,8 @@ export interface FirmwareJob {
   mac: Mac;
   name: string | null;
   from: string | null;
+  /** The version to install, or "custom" for a firmware URL. */
   target: string;
-  custom: boolean;
   /** Queued, sent with an inform reply, then the AP's own steps. */
   state: "queued" | "sent" | "preparing" | "downloading" | "writing";
   sent_at: number | null;
