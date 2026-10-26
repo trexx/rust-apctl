@@ -258,9 +258,19 @@ pub(crate) fn device_label(d: &Value, mac: impl std::fmt::Display) -> String {
     d["name"].as_str().filter(|n| !n.trim().is_empty()).map_or_else(|| mac.to_string(), str::to_string)
 }
 
-/// A client as messages name it: its name, else its host name, else its MAC.
-pub(crate) fn client_label(c: &Value) -> &str {
-    c["name"].as_str().or(c["hostname"].as_str()).or(c["mac"].as_str()).unwrap_or("?")
+/// The clients' names in apctl (their aliases, which an import fills too), by MAC.
+pub(crate) type ClientNames = HashMap<inform::Mac, String>;
+
+/// The clients' aliases as they are now, for messages an edit makes ([`client_label`]).
+pub(crate) fn client_names(s: &AppState) -> ClientNames {
+    s.live.read().unwrap().aliases.iter().filter_map(|(mac, a)| Some((*mac, a.alias.clone()?))).collect()
+}
+
+/// A client (its settings document) as messages name it: as the pages do, by its
+/// alias in apctl; else its name in the settings, else its host name, else its MAC.
+pub(crate) fn client_label<'a>(c: &'a Value, names: &'a ClientNames) -> &'a str {
+    let alias = doc_mac(&c["mac"]).and_then(|m| names.get(&m)).map(String::as_str);
+    alias.or(c["name"].as_str()).or(c["hostname"].as_str()).or(c["mac"].as_str()).unwrap_or("?")
 }
 
 /// [`device_label`] from the AP's record alone: its MAC written `aa:bb:..`
@@ -1621,6 +1631,8 @@ pub struct DeviceEdit {
     pub wireless_uplink: Option<String>,
     /// The antennas the AP reports (`antenna_table`).
     pub antennas: Value,
+    /// The clients' names in apctl, which a refusal names a client by.
+    pub client_names: ClientNames,
 }
 
 /// Applies an edit to one AP, with the official controller's rules.
@@ -1724,7 +1736,7 @@ fn device_fields(state: &Value, e: &DeviceEdit, before: &Value, d: &mut Value) -
     if !p["config_network"].is_null() {
         let cn = check_config_network(&p["config_network"], &before["config_network"])?;
         if let Some(ip) = cn["ip"].as_str() {
-            check_ip_free(state, &e.mac, ip)?;
+            check_ip_free(state, &e.mac, ip, &e.client_names)?;
         }
         d["config_network"] = cn;
     }
@@ -1839,12 +1851,12 @@ fn check_config_network(p: &Value, before: &Value) -> Result<Value, String> {
 }
 
 /// A static address must not be another AP's, or one reserved for a client.
-fn check_ip_free(state: &Value, mac: &inform::Mac, ip: &str) -> Result<(), String> {
+fn check_ip_free(state: &Value, mac: &inform::Mac, ip: &str, names: &ClientNames) -> Result<(), String> {
     if let Some(o) = docs(state, "devices").find(|o| doc_mac(&o["mac"]) != Some(*mac) && o["config_network"]["type"].as_str() == Some("static") && o["config_network"]["ip"].as_str() == Some(ip)) {
         return Err(format!("{ip} is already {}'s address", record_label(o, "another AP")));
     }
     if let Some(c) = docs(state, "clients").find(|c| flag(c, "use_fixedip", false) && c["fixed_ip"].as_str() == Some(ip)) {
-        return Err(format!("{ip} is reserved for the client {}", client_label(c)));
+        return Err(format!("{ip} is reserved for the client {}", client_label(c, names)));
     }
     Ok(())
 }
@@ -1897,7 +1909,8 @@ pub async fn put_device(State(s): State<AppState>, MacPath(mac): MacPath, Query(
     let antennas = inform.as_deref().map_or(Value::Null, |p| p["antenna_table"].clone());
     // What RadioCaps::of reads of it, not the radios' scan and spectrum tables.
     let reported: Vec<Value> = inform.as_deref().and_then(|p| p["radio_table"].as_array()).into_iter().flatten().map(|r| Value::Object(pick(r, &["radio", "min_txpower", "max_txpower"]))).collect();
-    change(&s, &q, apply_device, DeviceEdit { mac, patch: b.patch, reported: Value::Array(reported), wireless_uplink, antennas }).await
+    let client_names = client_names(&s);
+    change(&s, &q, apply_device, DeviceEdit { mac, patch: b.patch, reported: Value::Array(reported), wireless_uplink, antennas, client_names }).await
 }
 
 /// How an AP reaches the network.
@@ -1957,6 +1970,11 @@ mod tests {
 
     fn edit(s: &mut Value, patch: Value) -> Result<String, String> {
         apply_wlan(s, &WlanEdit { id: "w1".into(), patch })
+    }
+
+    /// An edit to the AP `mac`, with nothing reported by it.
+    fn device_edit(mac: &str, patch: Value) -> DeviceEdit {
+        DeviceEdit { mac: mac.parse().unwrap(), patch, reported: Value::Null, wireless_uplink: None, antennas: Value::Null, client_names: ClientNames::new() }
     }
 
     #[test]
@@ -2392,7 +2410,7 @@ mod tests {
     }
 
     fn dev(s: &mut Value, patch: Value) -> Result<String, String> {
-        apply_device(s, &DeviceEdit { mac: AP1.parse().unwrap(), patch, reported: Value::Null, wireless_uplink: None, antennas: Value::Null })
+        apply_device(s, &device_edit(AP1, patch))
     }
 
     #[test]
@@ -2441,6 +2459,10 @@ mod tests {
         s["clients"] = json!([{ "mac": "02:00:00:00:00:99", "name": "NAS", "use_fixedip": true, "fixed_ip": "192.168.1.22", "site_id": "s1" }]);
         assert!(dev(&mut s, static_ip("192.168.1.21", "192.168.1.1")).unwrap_err().contains("Attic"));
         assert!(dev(&mut s, static_ip("192.168.1.22", "192.168.1.1")).unwrap_err().contains("NAS"));
+        // Named as the pages name it: by its alias in apctl first.
+        let names = ClientNames::from([("02:00:00:00:00:99".parse().unwrap(), "Backups".to_string())]);
+        let e = DeviceEdit { client_names: names, ..device_edit(AP1, static_ip("192.168.1.22", "192.168.1.1")) };
+        assert!(apply_device(&mut s.clone(), &e).unwrap_err().ends_with("the client Backups"));
         assert!(dev(&mut s, json!({ "config_network": { "type": "static", "ip": "192.168.1.20", "netmask": "255.255.255.0", "gateway": "192.168.1.1" } })).unwrap_err().contains("dns1"));
         dev(&mut s, static_ip("192.168.1.20", "192.168.1.1")).unwrap();
         assert_eq!(s["devices"][0]["config_network"]["ip"], "192.168.1.20");
@@ -2500,7 +2522,7 @@ mod tests {
         };
         let width = |s: &mut Value, band: &str, ht: i64, reported: &Value| {
             let patch = json!({ "radios": [{ "radio": band, "ht": ht }] });
-            apply_device(s, &DeviceEdit { mac: AP1.parse().unwrap(), patch, reported: reported.clone(), wireless_uplink: None, antennas: Value::Null })
+            apply_device(s, &DeviceEdit { reported: reported.clone(), ..device_edit(AP1, patch) })
         };
         let none = Value::Null;
         let wifi7 = six(json!({ "has_ht160": true, "has_eht320": true, "is_11ax": true }));
@@ -2572,7 +2594,7 @@ mod tests {
         assert_eq!(uplink(&json!({ "vap_table": [] })), Uplink::Wired, "no uplink named: wired");
         assert_eq!(uplink(&inform("ath0")), Uplink::Wireless(None), "a placeholder names no VAP: wireless, band unknown");
         let mut s = state();
-        let e = DeviceEdit { mac: AP1.parse().unwrap(), patch: json!({ "radios": [{ "radio": "na", "tx_power_mode": "disabled" }] }), reported: Value::Null, wireless_uplink: Some("na".into()), antennas: Value::Null };
+        let e = DeviceEdit { wireless_uplink: Some("na".into()), ..device_edit(AP1, json!({ "radios": [{ "radio": "na", "tx_power_mode": "disabled" }] })) };
         assert!(apply_device(&mut s, &e).unwrap_err().contains("uplink"));
         // A radio stored off in another case is off, as the render reads it.
         s["devices"][0]["radio_table"][1]["tx_power_mode"] = json!("Disabled");
@@ -2670,7 +2692,7 @@ mod tests {
         // An AP named another way is still the one an SSID's channel lock holds.
         let mut s = state();
         edit(&mut s, json!({ "iot_channel_lock": true })).unwrap();
-        let e = DeviceEdit { mac: "02-00-00-00-00-01".parse().unwrap(), patch: json!({ "radios": [{ "radio": "ng", "channel": 1 }] }), reported: Value::Null, wireless_uplink: None, antennas: Value::Null };
+        let e = device_edit("02-00-00-00-00-01", json!({ "radios": [{ "radio": "ng", "channel": 1 }] }));
         assert!(apply_device(&mut s, &e).unwrap_err().contains("IoT"));
         // A record that writes its MAC another way is found, and listed as `aa:bb:..`.
         let mut s = state();
@@ -2727,7 +2749,7 @@ mod tests {
         // An AP of the other site is judged by its own site's rules: not edited here.
         let mut t = s.clone();
         t["devices"].as_array_mut().unwrap().push(json!({ "mac": "02:00:00:00:00:09", "name": "Far", "site_id": "s2", "radio_table": [] }));
-        let far = DeviceEdit { mac: "02:00:00:00:00:09".parse().unwrap(), patch: json!({ "name": "Near" }), reported: Value::Null, wireless_uplink: None, antennas: Value::Null };
+        let far = device_edit("02:00:00:00:00:09", json!({ "name": "Near" }));
         assert_eq!(apply_device(&mut t, &far).unwrap_err(), "this AP belongs to another site");
         // Pruning this site's per-SSID groups leaves another site's alone.
         edit(&mut s, json!({ "aps": [AP1] })).unwrap();
@@ -2759,7 +2781,7 @@ mod tests {
     fn radio_extras_are_range_checked() {
         let mut s = state();
         let antennas = json!([{ "id": 4, "name": "Combined", "wifi0_gain": 3, "wifi1_gain": 5 }, { "id": 5, "name": "External" }]);
-        let any = |s: &mut Value, patch: Value| apply_device(s, &DeviceEdit { mac: AP1.parse().unwrap(), patch, reported: Value::Null, wireless_uplink: None, antennas: antennas.clone() });
+        let any = |s: &mut Value, patch: Value| apply_device(s, &DeviceEdit { antennas: antennas.clone(), ..device_edit(AP1, patch) });
         let edit = |s: &mut Value, r: Value| any(s, json!({ "radios": [r] }));
         edit(&mut s, json!({ "radio": "na", "loadbalance_enabled": true, "maxsta": 40, "sens_level_enabled": true, "sens_level": -80 })).unwrap();
         let r = &s["devices"][0]["radio_table"][1];

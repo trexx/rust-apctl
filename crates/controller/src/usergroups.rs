@@ -10,7 +10,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::api::{ApiError, AppState, Json, MacPath, Path, Query};
-use crate::settings::{Patch, PreviewQuery, change, client_label, doc_by_id, doc_by_id_mut, docs, hidden_doc_id, id_of, new_id, num, push_doc, remove_doc, str_field};
+use crate::settings::{ClientNames, Patch, PreviewQuery, change, client_label, client_names, doc_by_id, doc_by_id_mut, docs, hidden_doc_id, id_of, new_id, num, push_doc, remove_doc, str_field};
 
 /// The default user group, created when the settings have none (imports made
 /// before apctl read user groups). It keeps the id the SSIDs already point at.
@@ -64,17 +64,18 @@ fn rate(v: &Value, what: &str) -> Result<i64, String> {
     }
 }
 
-/// What uses a user group: its id, and "SSID x" / "client y" (SSIDs first).
-fn group_uses(state: &Value) -> impl Iterator<Item = (&str, String)> {
+/// What uses a user group: its id, and "SSID x" / "client y" (SSIDs first),
+/// a client named by [`client_label`].
+fn group_uses<'a>(state: &'a Value, names: &'a ClientNames) -> impl Iterator<Item = (&'a str, String)> {
     let ssids = docs(state, "wlanconf").filter_map(|w| Some((w["usergroup_id"].as_str()?, format!("SSID {}", w["name"].as_str().unwrap_or("?")))));
-    let clients = docs(state, "clients").filter_map(|c| Some((c["usergroup_id"].as_str()?, format!("client {}", client_label(c)))));
+    let clients = docs(state, "clients").filter_map(|c| Some((c["usergroup_id"].as_str()?, format!("client {}", client_label(c, names)))));
     ssids.chain(clients)
 }
 
 /// Who uses each user group (by id), read in one pass.
-fn group_users(state: &Value) -> HashMap<&str, Vec<String>> {
+fn group_users<'a>(state: &'a Value, names: &'a ClientNames) -> HashMap<&'a str, Vec<String>> {
     let mut out: HashMap<&str, Vec<String>> = HashMap::new();
-    for (id, user) in group_uses(state) {
+    for (id, user) in group_uses(state, names) {
         out.entry(id).or_default().push(user);
     }
     out
@@ -87,13 +88,13 @@ pub enum GroupEdit {
 }
 
 /// Deletes a user group no SSID or client uses; the default one stays.
-pub fn remove_usergroup(state: &mut Value, id: &str) -> Result<String, String> {
+pub fn remove_usergroup(state: &mut Value, id: &str, names: &ClientNames) -> Result<String, String> {
     let g = doc_by_id(state, "usergroup", id).ok_or("unknown speed limit")?;
     if flag(g, "attr_no_delete", false) {
         return Err("the default speed limit cannot be deleted".into());
     }
     let what = format!("deleted speed limit \"{}\"", g["name"].as_str().unwrap_or("?"));
-    let users: Vec<String> = group_uses(state).filter(|(g, _)| *g == id).map(|(_, user)| user).collect();
+    let users: Vec<String> = group_uses(state, names).filter(|(g, _)| *g == id).map(|(_, user)| user).collect();
     if !users.is_empty() {
         return Err(format!("still used by {}", users.join(", ")));
     }
@@ -172,12 +173,12 @@ pub fn apply_client_group(state: &mut Value, e: &ClientGroup) -> Result<String, 
 /// GET /api/settings/usergroups
 pub async fn usergroups(State(s): State<AppState>) -> Result<Json<Value>, ApiError> {
     let state = crate::api::current_state(&s)?;
-    Ok(Json(json!({ "active": s.active, "groups": usergroup_list(&state) })))
+    Ok(Json(json!({ "active": s.active, "groups": usergroup_list(&state, &client_names(&s)) })))
 }
 
 /// The site's user groups as the editors show them, with what uses each.
-fn usergroup_list(state: &Value) -> Vec<Value> {
-    let users = group_users(state);
+fn usergroup_list(state: &Value, names: &ClientNames) -> Vec<Value> {
+    let users = group_users(state, names);
     let group = |g: &Value| {
         let id = id_of(g).unwrap_or_default();
         let used_by = users.get(id.as_str()).map(Vec::as_slice).unwrap_or_default();
@@ -207,7 +208,8 @@ pub async fn put_usergroup(State(s): State<AppState>, Path(id): Path<String>, Qu
 
 /// DELETE /api/settings/usergroups/{id}
 pub async fn delete_usergroup(State(s): State<AppState>, Path(id): Path<String>, Query(q): Query<PreviewQuery>) -> Result<Json<Value>, ApiError> {
-    change(&s, &q, |state: &mut Value, id: &String| remove_usergroup(state, id), id).await
+    let names = client_names(&s);
+    change(&s, &q, |state: &mut Value, (id, names): &(String, ClientNames)| remove_usergroup(state, id, names), (id, names)).await
 }
 
 #[derive(Deserialize)]
@@ -256,7 +258,7 @@ mod tests {
         s["wlanconf"] = json!([ssid("w1", "ug-a"), ssid("w2", "ug-b")]);
         assert_eq!(ensure_default_usergroup(&mut s), "ug-a");
         // Shown before it is made: with the id it will keep, else "" (not a new random one each time).
-        let shown = |s: &Value| usergroup_list(s).into_iter().find(|g| g["default"] == true).map(|g| g["id"].clone());
+        let shown = |s: &Value| usergroup_list(s, &ClientNames::new()).into_iter().find(|g| g["default"] == true).map(|g| g["id"].clone());
         assert_eq!(shown(&state()), Some(json!("ug-imported")));
         let mut s = state();
         s["wlanconf"][0].as_object_mut().unwrap().remove("usergroup_id");
@@ -284,11 +286,17 @@ mod tests {
         assert!(apply_usergroup(&mut s, &group(None, json!({ "name": "Kids" }))).is_err(), "names are unique");
         apply_client_group(&mut s, &client("AA-BB-CC-00-00-01", Some(&id))).unwrap();
         assert_eq!((s["clients"].as_array().unwrap().len(), s["clients"][0]["usergroup_id"].as_str()), (1, Some(id.as_str())), "the entry, however the MAC is written");
-        let err = remove_usergroup(&mut s, &id).unwrap_err();
+        let none = ClientNames::new();
+        let err = remove_usergroup(&mut s, &id, &none).unwrap_err();
         assert!(err.contains("client tv"), "{err}");
+        // A client is named as the pages name it: by its alias in apctl first.
+        let names = ClientNames::from([("aa:bb:cc:00:00:01".parse().unwrap(), "Living room TV".to_string())]);
+        let err = remove_usergroup(&mut s, &id, &names).unwrap_err();
+        assert!(err.ends_with("client Living room TV"), "{err}");
+        assert_eq!(usergroup_list(&s, &names).iter().find(|g| g["name"] == "Kids").unwrap()["used_by"], json!(["client Living room TV"]));
         apply_client_group(&mut s, &client("aabbcc000001", None)).unwrap();
-        remove_usergroup(&mut s, &id).unwrap();
-        assert!(remove_usergroup(&mut s, "ug-imported").is_err(), "the default stays");
+        remove_usergroup(&mut s, &id, &none).unwrap();
+        assert!(remove_usergroup(&mut s, "ug-imported", &none).is_err(), "the default stays");
         // An SSID back to "no limit" points at the default group.
         apply_wlan(&mut s, &WlanEdit { id: "w1".into(), patch: json!({ "usergroup_id": "" }) }).unwrap();
         assert_eq!(s["wlanconf"][0]["usergroup_id"], "ug-imported");
