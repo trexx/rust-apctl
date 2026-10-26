@@ -1089,7 +1089,7 @@ struct LogQuery {
 
 /// The SQL for a log query, newest first; `by_id` as `catch_up_by_id` decides.
 fn logs_sql(w: &mut Where, device: Option<Mac>, search: Option<&str>, after: Option<i64>, by_id: bool, limit: i64) -> String {
-    const COLUMNS: &str = "l.ts, l.device_mac, l.src_ip, l.facility, l.severity, l.program, l.msg, l.id";
+    const COLUMNS: &str = "l.ts, l.device_mac, l.src_ip, l.severity, l.program, l.msg, l.id";
     // Bound, as every value is, so that each shape of query is compiled once per connection.
     let limit = w.param(Sql::Integer(limit));
     if let Some(text) = search {
@@ -1135,7 +1135,6 @@ struct LogRow {
     ts: Ts,
     device_mac: Option<String>,
     src_ip: Option<String>,
-    facility: Option<i64>,
     severity: Option<i64>,
     program: Option<String>,
     msg: String,
@@ -1154,8 +1153,7 @@ async fn logs(State(s): State<AppState>, Query(q): Query<LogQuery>) -> Result<Js
         let rows = stmt
             .query_map(params_from_iter(w.params), |r| {
                 Ok(LogRow {
-                    id: r.get(7)?, ts: r.get(0)?, device_mac: r.get(1)?, src_ip: r.get(2)?, facility: r.get(3)?, severity: r.get(4)?, program: r.get(5)?,
-                    msg: r.get(6)?,
+                    id: r.get(6)?, ts: r.get(0)?, device_mac: r.get(1)?, src_ip: r.get(2)?, severity: r.get(3)?, program: r.get(4)?, msg: r.get(5)?,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -1602,7 +1600,7 @@ mod tests {
         assert_eq!(ts(get_json(&app, "/api/logs?after=1&device=02:00:00:00:00:02").await), vec![2]);
         assert_eq!(ts(get_json(&app, "/api/logs?q=link&device=02:00:00:00:00:01").await), Vec::<i64>::new());
         let line = json!({
-            "id": 3, "ts": 3, "device_mac": "02:00:00:00:00:01", "src_ip": null, "facility": null, "severity": null, "program": "hostapd", "msg": "wlan1: STA left",
+            "id": 3, "ts": 3, "device_mac": "02:00:00:00:00:01", "src_ip": null, "severity": null, "program": "hostapd", "msg": "wlan1: STA left",
         });
         assert_eq!(get_json(&app, "/api/logs?limit=1").await, json!([line]));
         // Catching up over more rows than are read by id: from the indexes, the same lines.

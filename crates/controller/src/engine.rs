@@ -66,7 +66,7 @@ pub enum Input {
     Wake,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone)]
 pub struct LogLine {
     pub ts: Ts,
     pub device_mac: Option<Mac>,
