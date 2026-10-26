@@ -99,8 +99,9 @@ pub fn settings(state: Option<&Value>) -> Settings {
     let (hour, minute) = parse_cron(r.and_then(|r| r["cron_expr"].as_str()).unwrap_or(DEFAULT_CRON));
     let list = |k: &str| -> Vec<String> { r.and_then(|r| r[k].as_array()).into_iter().flatten().filter_map(|v| v.as_str().map(str::to_ascii_lowercase)).collect() };
     let radios = r.map_or_else(|| BANDS.iter().map(|b| b.radio.to_string()).collect(), |_| list("radios"));
-    let dfs = r.is_some_and(apcfg::radio_ai_na_dfs);
-    Settings { enabled: r.and_then(|r| r["enabled"].as_bool()).unwrap_or(false), hour, minute, radios, dfs, exclude_devices: r.map(excluded).unwrap_or_default() }
+    // Both read as the render reads flags: a "true" stored as text is on.
+    let (enabled, dfs) = r.map_or((false, false), |r| (apcfg::flag(r, "enabled", false), apcfg::radio_ai_na_dfs(r)));
+    Settings { enabled, hour, minute, radios, dfs, exclude_devices: r.map(excluded).unwrap_or_default() }
 }
 
 /// The `radio_ai` setting's `exclude_devices`, in whatever form a MAC is written there, each once.
@@ -583,10 +584,13 @@ mod tests {
         assert_eq!(allowed(Some(&s), "ng", false), Some(vec![1, 6, 11]));
         assert_eq!(parse_cron("*/5 * * * *"), (3, 0));
         assert!(allowed(None, "na", false).is_none());
-        // DFS is read as the render reads it for the AP's ACS: a "true" stored as text is on.
+        // DFS is read as the render reads it for the AP's ACS: a "true" stored as text is on; so is the switch.
         let mut s = s;
         s["setting"][2]["radios_configuration"][0]["dfs"] = json!("true");
-        assert!(settings(Some(&s)).dfs);
+        s["setting"][2]["enabled"] = json!("true");
+        assert!(settings(Some(&s)).dfs && settings(Some(&s)).enabled);
+        s["setting"][2]["enabled"] = json!("false");
+        assert!(!settings(Some(&s)).enabled);
         apply_settings(&mut s, &json!({ "hour": 4 })).unwrap();
         assert!(radio_ai(&s).unwrap()["channels_na"].as_array().unwrap().iter().any(|c| c == "100"), "the DFS channels stay in the list");
     }
