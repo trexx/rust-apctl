@@ -690,14 +690,17 @@ pub fn gather(store: &Store, state: &ThreatState, live: &SharedLive, now: Ts) ->
     Ok(a)
 }
 
-/// The clients `live` knows (what the APs report and the aliases), in
-/// address order, that [`assess`] needs on top of the stored ones: those with
-/// a name now (an alias, else what they report), and those not stored yet.
+/// The clients `live` has that [`assess`] needs on top of the stored ones,
+/// in address order: of those connected now and those with an alias, the ones
+/// with a name now (an alias, else what they report) and those not stored yet.
+/// A client that is neither is as the stored list has it, read at most
+/// [`CACHE_SECS`] ago: only one that came and went since is found a little later.
+/// Walked under the live lock, so not over every client of the year.
 fn live_clients(live: &Live, stored: &[Client]) -> Vec<Client> {
-    let aliased = live.aliases.iter().filter(|(m, a)| a.alias.is_some() && !live.clients.contains_key(m)).map(|(m, _)| m);
+    let aliased = live.aliases.iter().filter(|(_, a)| a.alias.is_some()).map(|(m, _)| m);
     let mut out: Vec<Client> = live
-        .clients
-        .keys()
+        .connected_clients()
+        .map(|(m, _)| m)
         .chain(aliased)
         .filter_map(|mac| {
             let (num, name) = (hardware_num(mac), client_name(live, Some(*mac)));
@@ -706,6 +709,8 @@ fn live_clients(live: &Live, stored: &[Client]) -> Vec<Client> {
         })
         .collect();
     out.sort_unstable_by_key(|c| (c.num, c.mac));
+    // A connected client with an alias is walked twice.
+    out.dedup_by_key(|c| (c.num, c.mac));
     out
 }
 
@@ -1168,6 +1173,9 @@ mod tests {
             let sample = crate::model::ClientSample { mac: mac.parse().unwrap(), hostname: hostname.map(Into::into), ..Default::default() };
             live.put_client(ClientView { sample: Arc::new(sample), connected: true, first_seen: 0, last_seen: 0 });
         }
+        // Gone since the stored list was read: as the list has it (here: not at all).
+        let gone = crate::model::ClientSample { mac: "3c:55:76:00:00:05".parse().unwrap(), hostname: Some("gone".into()), ..Default::default() };
+        live.put_client(ClientView { sample: Arc::new(gone), connected: false, first_seen: 0, last_seen: 0 });
         live.aliases.insert("3c:55:76:00:00:04".parse().unwrap(), Alias { alias: Some("tablet".into()), note: None });
         live.aliases.insert("3c:55:76:00:00:02".parse().unwrap(), Alias { alias: Some("my laptop".into()), note: None });
         let got = live_clients(&live, &stored);
