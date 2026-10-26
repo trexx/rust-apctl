@@ -824,11 +824,8 @@
         "mac": "02:00:00:00:10:02",
         "memberships": 0,
         "name": null,
-        "radio": "na",
-        "rx_bytes": 18048.0,
         "rx_pkts": 176.0,
         "services": [],
-        "tx_bytes": 18875.0,
         "tx_pkts": 233.0,
         "vendor": "Private (randomised)"
       },
@@ -839,11 +836,8 @@
         "mac": "02:00:00:00:10:03",
         "memberships": 0,
         "name": null,
-        "radio": "ng",
-        "rx_bytes": 18996.0,
         "rx_pkts": 193.0,
         "services": [],
-        "tx_bytes": 19624.0,
         "tx_pkts": 212.0,
         "vendor": "Private (randomised)"
       }
@@ -864,7 +858,6 @@
     ],
     "types": {
       "mdns": {
-        "rx_bytes": 71220.0,
         "rx_pkts": 86052.0,
         "rx_pps": [
           76.2,
@@ -880,7 +873,6 @@
           80.9,
           79.4
         ],
-        "tx_bytes": 72288.0,
         "tx_pkts": 53100.0,
         "tx_pps": [
           42.400000000000006,
@@ -898,7 +890,6 @@
         ]
       },
       "ssdp": {
-        "rx_bytes": 84408.0,
         "rx_pkts": 72504.0,
         "rx_pps": [
           59.3,
@@ -914,7 +905,6 @@
           24.2,
           71.7
         ],
-        "tx_bytes": 64536.0,
         "tx_pkts": 71712.0,
         "tx_pps": [
           45.8,
@@ -942,11 +932,8 @@
         "mac": "02:00:00:00:10:03",
         "memberships": 0,
         "name": null,
-        "radio": "ng",
-        "rx_bytes": 18996.0,
         "rx_pkts": 193.0,
         "services": [],
-        "tx_bytes": 19624.0,
         "tx_pkts": 212.0,
         "vendor": "Private (randomised)"
       }
@@ -966,7 +953,6 @@
     ],
     "types": {
       "mdns": {
-        "rx_bytes": 38100.0,
         "rx_pkts": 39756.0,
         "rx_pps": [
           38.0,
@@ -981,7 +967,6 @@
           32.7,
           31.5
         ],
-        "tx_bytes": 34380.0,
         "tx_pkts": 30936.0,
         "tx_pps": [
           34.7,
@@ -998,7 +983,6 @@
         ]
       },
       "ssdp": {
-        "rx_bytes": 40632.0,
         "rx_pkts": 39708.0,
         "rx_pps": [
           49.0,
@@ -1013,7 +997,6 @@
           16.4,
           49.1
         ],
-        "tx_bytes": 20796.0,
         "tx_pkts": 30000.0,
         "tx_pps": [
           21.6,

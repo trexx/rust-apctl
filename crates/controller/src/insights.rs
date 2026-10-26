@@ -513,12 +513,12 @@ pub async fn multicast(State(s): State<AppState>, Query(q): Query<RangeQuery>) -
         let (one, mut params) = (if ap.is_some() { " AND mac = ?3" } else { "" }, vec![Sql::Integer(from - if step > 0 { step } else { MCAST_GAP }), Sql::Integer(to)]);
         params.extend(ap.clone().map(Sql::Text));
         let mut stmt = c.prepare_cached(&format!(
-            "SELECT mac, type, ts, tx_pps, rx_pps, tx_bytes_ps, rx_bytes_ps FROM mcast_stats{suffix} WHERE ts >= ?1 AND ts <= ?2{one} ORDER BY mac, type, ts"
+            "SELECT mac, type, ts, tx_pps, rx_pps FROM mcast_stats{suffix} WHERE ts >= ?1 AND ts <= ?2{one} ORDER BY mac, type, ts"
         ))?;
         let rows = stmt
             .query_map(params_from_iter(params), |r| {
                 let rate = |i: usize| r.get::<_, Option<f64>>(i).map(|v| v.unwrap_or(0.0));
-                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, Ts>(2)?, [rate(3)?, rate(4)?, rate(5)?, rate(6)?]))
+                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, Ts>(2)?, [rate(3)?, rate(4)?]))
             })?
             .collect::<rusqlite::Result<Vec<McastRow>>>()?;
         let (ts, types) = mcast_types(&rows, from, to, bucket, step);
@@ -529,14 +529,14 @@ pub async fn multicast(State(s): State<AppState>, Query(q): Query<RangeQuery>) -
                 table: "client_stats",
                 key: "mac || '/' || coalesce(ap_mac, '') || '/' || coalesce(bssid, '')",
                 extra: &[],
-                cols: &["mcast_tx_pkts", "mcast_rx_pkts", "mcast_tx_bytes", "mcast_rx_bytes"],
+                cols: &["mcast_tx_pkts", "mcast_rx_pkts"],
                 only: ap.as_deref().map(|a| Only::Is("ap_mac", a)),
             },
             tier,
             from,
             to,
         )?;
-        let mut per: HashMap<&str, [f64; 4]> = HashMap::new();
+        let mut per: HashMap<&str, [f64; 2]> = HashMap::new();
         for (k, (_, smp)) in &cl {
             let e = per.entry(k.split('/').next().unwrap_or_default()).or_default();
             for d in deltas(smp, from) {
@@ -557,8 +557,7 @@ pub async fn multicast(State(s): State<AppState>, Query(q): Query<RangeQuery>) -
             listed_client(&s, &live, mac, |view| {
                 let mc = view.and_then(|v| v.sample.multicast.as_ref());
                 json!({
-                    "ap": view.and_then(|v| ap_name_of(&live, &v.sample.ap_mac)), "radio": view.and_then(|c| c.sample.radio.clone()),
-                    "tx_pkts": t[0].round(), "rx_pkts": t[1].round(), "tx_bytes": t[2].round(), "rx_bytes": t[3].round(),
+                    "ap": view.and_then(|v| ap_name_of(&live, &v.sample.ap_mac)), "tx_pkts": t[0].round(), "rx_pkts": t[1].round(),
                     "services": mc.map(|m| m.services.clone()).unwrap_or_default(),
                     "delivery": mc.and_then(|m| m.delivery()),
                     "memberships": mc.map_or(0, |m| m.memberships.len()),
@@ -571,13 +570,12 @@ pub async fn multicast(State(s): State<AppState>, Query(q): Query<RangeQuery>) -
 
 use crate::engine::MCAST_GAP;
 
-/// One AP's multicast sample of one type: (AP, type, time, [tx pps, rx pps,
-/// tx bytes/s, rx bytes/s]).
-type McastRow = (String, String, Ts, [f64; 4]);
+/// One AP's multicast sample of one type: (AP, type, time, [tx pps, rx pps]).
+type McastRow = (String, String, Ts, [f64; 2]);
 
 /// The bucket times, and per type the packet rates each way per bucket (the
-/// average per AP within the bucket, summed over APs) and the packets and
-/// bytes over the window, from the samples ordered by AP, type and time.
+/// average per AP within the bucket, summed over APs) and the packets over
+/// the window, from the samples ordered by AP, type and time.
 /// A total counts each sample's rate over the time it covers within the
 /// window: a raw sample (`step` 0) the time since the one before it (at most
 /// [`MCAST_GAP`]; the first of a series, with nothing before it, none), a
@@ -585,9 +583,9 @@ type McastRow = (String, String, Ts, [f64; 4]);
 /// for the part of the window they cover.
 fn mcast_types(rows: &[McastRow], from: Ts, to: Ts, bucket: Ts, step: Ts) -> (Vec<Ts>, serde_json::Map<String, Value>) {
     // type -> bucket -> AP -> (sum of rates, samples)
-    type PerAp<'a> = HashMap<&'a str, ([f64; 4], f64)>;
+    type PerAp<'a> = HashMap<&'a str, ([f64; 2], f64)>;
     let mut acc: BTreeMap<&str, BTreeMap<Ts, PerAp>> = BTreeMap::new();
-    let mut totals: HashMap<&str, [f64; 4]> = HashMap::new();
+    let mut totals: HashMap<&str, [f64; 2]> = HashMap::new();
     for (i, (mac, kind, ts, r)) in rows.iter().enumerate() {
         let prev = i.checked_sub(1).map(|j| &rows[j]).filter(|p| p.0 == *mac && p.1 == *kind).map(|p| p.2);
         let (start, end) = if step > 0 { (*ts, ts + step) } else { (prev.map_or(*ts, |p| p.max(ts - MCAST_GAP)), *ts) };
@@ -612,7 +610,7 @@ fn mcast_types(rows: &[McastRow], from: Ts, to: Ts, bucket: Ts, step: Ts) -> (Ve
         let total = totals.get(kind).copied().unwrap_or_default();
         types.insert(
             kind.to_string(),
-            json!({ "tx_pps": series(0), "rx_pps": series(1), "tx_pkts": total[0].round(), "rx_pkts": total[1].round(), "tx_bytes": total[2].round(), "rx_bytes": total[3].round() }),
+            json!({ "tx_pps": series(0), "rx_pps": series(1), "tx_pkts": total[0].round(), "rx_pkts": total[1].round() }),
         );
     }
     (ts, types)
@@ -1111,7 +1109,7 @@ mod tests {
 
     #[test]
     fn multicast_totals_count_the_time_each_sample_covers_in_the_window() {
-        let row = |ap: &str, ts: Ts, tx: f64| (ap.to_string(), "mdns".to_string(), ts, [tx, 0.0, 10.0 * tx, 0.0]);
+        let row = |ap: &str, ts: Ts, tx: f64| (ap.to_string(), "mdns".to_string(), ts, [tx, 0.0]);
         // Raw samples: one before the window (it only starts the next one's interval), the
         // next covering the window's first 10 s, one 5 s later, one 285 s after that (a
         // rate covers 120 s at most), and another AP's first sample (nothing before it).
@@ -1120,7 +1118,8 @@ mod tests {
         assert_eq!(ts, [960, 1260, 1500]);
         let m = &types["mdns"];
         assert_eq!(m["tx_pps"], json!([1.5, 3.0, 5.0]));
-        assert_eq!((m["tx_pkts"].as_f64(), m["tx_bytes"].as_f64(), m["rx_pkts"].as_f64()), (Some(10.0 + 10.0 + 360.0), Some(3800.0), Some(0.0)));
+        assert_eq!((m["tx_pkts"].as_f64(), m["rx_pkts"].as_f64()), (Some(10.0 + 10.0 + 360.0), Some(0.0)));
+        assert_eq!(m.as_object().unwrap().keys().collect::<Vec<_>>(), ["rx_pkts", "rx_pps", "tx_pkts", "tx_pps"], "packets only: no page reads the bytes");
         // Rolled up: each covers its five minutes, the first and last clipped to the window.
         let rows = [row("a", 900, 1.0), row("a", 1200, 2.0), row("a", 1500, 4.0)];
         let (ts, types) = mcast_types(&rows, 1000, 1600, 300, 300);
