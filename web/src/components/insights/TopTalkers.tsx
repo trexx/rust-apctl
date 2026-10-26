@@ -68,7 +68,7 @@ export function TopTalkers() {
             <TopList
               title="Clients"
               link="clients"
-              items={data.clients.slice(0, 15).map((c) => ({
+              items={data.clients.map((c) => ({
                 mac: c.mac,
                 name: c.name,
                 sub: c.vendor,

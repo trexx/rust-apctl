@@ -386,7 +386,7 @@ function ActiveClients({ mac, range }: { mac: string; range: TimeSpan }) {
             <table className="table">
               <THead columns={["Client", "Vendor", "Download", "Upload"]} />
               <tbody>
-                {data.clients.slice(0, 10).map((c) => (
+                {data.clients.map((c) => (
                   <tr key={c.mac}>
                     <td>
                       <Link to={`/clients/${c.mac}`}>{c.name ?? c.mac}</Link>

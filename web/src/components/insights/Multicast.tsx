@@ -159,7 +159,7 @@ function MulticastView({
               ]}
             />
             <tbody>
-              {data.clients.slice(0, 8).map((c) => (
+              {data.clients.map((c) => (
                 <tr key={c.mac}>
                   <td>
                     <Link to={`/clients/${c.mac}`}>{c.name ?? c.mac}</Link>

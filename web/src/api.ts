@@ -603,6 +603,7 @@ export interface DensityAp {
 export interface SiteMulticast {
   ts: number[];
   types: Record<string, { tx_pps: number[]; rx_pps: number[]; tx_pkts: number; rx_pkts: number }>;
+  /** The 8 clients with the most multicast traffic. */
   clients: {
     mac: Mac;
     name: string | null;
@@ -768,6 +769,7 @@ export const useSiteActivity = (span: TimeSpan, band: string) =>
 export const useRadioActivity = (span: TimeSpan, band: string, mac: Mac) =>
   useSpanQuery<Pick<SiteActivity, "activity">, [string, Mac]>(keys.radioActivity, span, [band, mac], "/api/site/activity", { band: bandParam(band), mac, parts: "activity" });
 
+/** The busiest APs and clients by traffic: the server lists 15 clients site-wide, 10 on an AP's page (`mac`). */
 export const useSiteTop = (span: TimeSpan, mac?: Mac) =>
   useSpanQuery<{ aps: TopEntry[]; clients: TopEntry[] }, [Mac | undefined]>(keys.siteTop, span, [mac], "/api/site/top", { mac });
 
