@@ -33,13 +33,11 @@ export interface DeviceSummary {
 export interface ClientSample {
   mac: Mac;
   ap_mac: Mac;
-  bssid: string;
   essid: string | null;
   radio: string | null;
   channel: number | null;
   hostname: string | null;
   ip: string | null;
-  rssi: number | null;
   signal: number | null;
   noise: number | null;
   tx_rate: number | null;
@@ -47,15 +45,11 @@ export interface ClientSample {
   tx_bytes: number | null;
   rx_bytes: number | null;
   tx_retries: number | null;
-  idletime: number | null;
   uptime: number | null;
   satisfaction: number | null;
-  anomalies: number | null;
   nss: number | null;
   wifi_gen: string | null;
-  vlan_id: number | null;
   latency_avg: number | null;
-  is_11r: boolean | null;
   multicast: Multicast | null;
 }
 
@@ -126,13 +120,10 @@ export interface VapSample {
   bssid: string;
   essid: string | null;
   radio: string | null;
-  name: string | null;
   channel: number | null;
   num_sta: number | null;
-  ccq: number | null;
   satisfaction: number | null;
   avg_client_signal: number | null;
-  latency_avg: number | null;
   /** Counters since the AP started. */
   rx_bytes: number | null;
   tx_bytes: number | null;
@@ -152,7 +143,6 @@ export interface VapSample {
 
 export interface RadioSample {
   radio: string;
-  name: string | null;
   channel: number | null;
   bw: number | null;
   tx_power: number | null;
@@ -161,10 +151,6 @@ export interface RadioSample {
   cu_self_tx: number | null;
   cu_interf: number | null;
   noise_floor: number | null;
-  num_sta: number;
-  /** Counters since the AP started. */
-  tx_packets: number | null;
-  rx_packets: number | null;
   antenna_gain: number | null;
   min_txpower: number | null;
   max_txpower: number | null;
@@ -174,13 +160,11 @@ export interface DeviceDetail {
   device: {
     snapshot: {
       ap: {
-        mac: Mac;
         hostname: string | null;
         model: string | null;
         model_display: string | null;
         version: string | null;
         ip: string | null;
-        serial: string | null;
         uptime: number | null;
         cpu: number | null;
         mem: number | null;
@@ -205,7 +189,6 @@ export interface DeviceDetail {
       vaps: VapSample[];
     };
     online: boolean;
-    first_seen: number;
     last_seen: number;
     interval: number;
     /** Known from the database only: hasn't reported since apctl started. */
