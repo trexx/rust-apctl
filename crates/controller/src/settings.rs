@@ -109,12 +109,13 @@ impl MadeFrom {
     }
 }
 
-/// Fields of an SSID the editor shows and edits (secrets are never listed).
+/// Fields of an SSID the editor shows and edits (secrets are never listed). Its
+/// security is shown as its `protection`; the fields an edit derives (the
+/// broadcast filter, the 2.4 GHz minimum rate's switch) are not listed.
 const WLAN_FIELDS: &[&str] = &[
-    "name", "enabled", "hide_ssid", "security", "wpa_mode", "wpa3_support", "wpa3_transition", "pmf_mode", "wlan_bands", "ap_group_mode",
-    "fast_roaming_enabled", "bss_transition", "roaming_assistant_na_enabled", "roaming_assistant_na_rssi", "uapsd_enabled", "proxy_arp",
-    "mcastenhance_enabled", "multicast_suppressor_mode", "bc_filter_enabled", "bc_filter_list", "l2_isolation", "minrate_setting_preference",
-    "minrate_ng_enabled", "minrate_ng_data_rate_kbps", "minrate_na_enabled", "minrate_na_data_rate_kbps", "dtim_mode", "dtim_ng", "dtim_na",
+    "name", "enabled", "hide_ssid", "pmf_mode", "wlan_bands", "fast_roaming_enabled", "bss_transition", "roaming_assistant_na_enabled",
+    "roaming_assistant_na_rssi", "uapsd_enabled", "proxy_arp", "mcastenhance_enabled", "multicast_suppressor_mode", "bc_filter_list", "l2_isolation",
+    "minrate_setting_preference", "minrate_ng_data_rate_kbps", "minrate_na_enabled", "minrate_na_data_rate_kbps", "dtim_mode", "dtim_ng", "dtim_na",
     "group_rekey", "mac_filter_enabled", "mac_filter_policy", "mac_filter_list", "is_guest", "networkconf_id", "country_beacon",
     "usergroup_id", "schedule_with_duration", "dns_assistance_mode", "dns_assistance_servers", "no2ghz_oui", "advertise_device_name_in_beacon",
     "enhanced_iot", "iot_channel_lock", "iot_dtim_lock", "wpa3_fast_roaming", "sae_anti_clogging", "sae_sync", "rrm_enabled", "tdls_prohibit", "p2p",
@@ -374,7 +375,7 @@ fn wlans_view(state: &Value, informs: &HashMap<inform::Mac, Arc<Value>>, active:
         .collect();
     // `for_ssid`: whether an SSID may be put on it ([`ssid_network`]).
     let networks: Vec<Value> =
-        docs(state, "networkconf").map(|n| json!({ "id": id_of(n), "name": n["name"], "vlan": n["vlan"], "purpose": n["purpose"], "for_ssid": ssid_network(n).is_ok() })).collect();
+        docs(state, "networkconf").map(|n| json!({ "id": id_of(n), "name": n["name"], "vlan": n["vlan"], "for_ssid": ssid_network(n).is_ok() })).collect();
     let aps: Vec<Value> = docs(state, "devices").map(|d| json!({ "mac": doc_mac(&d["mac"]), "name": d["name"] })).collect();
     let (unsupported, unknown) = feature_support(state, informs);
     let mdns: Vec<Value> = apcfg::MDNS_SERVICES.iter().map(|(code, name, _)| json!({ "code": code, "name": name })).collect();
@@ -464,7 +465,6 @@ pub async fn device(State(s): State<AppState>, MacPath(mac): MacPath) -> Result<
     let mut out = json!({
         "active": s.active, "mac": mac.to_string(), "model": d["model"], "radios": radios, "features": supported,
         "reported": inform.is_some(), "site_outdoor": site_outdoor, "advanced_features": advanced, "antennas": antennas,
-        "ports": d["ethernet_table"].as_array().map_or(0, |t| t.iter().filter_map(|e| e["num_port"].as_i64()).sum::<i64>()),
     });
     if let Value::Object(o) = &mut out {
         o.extend(pick(d, DEVICE_FIELDS));
@@ -2685,6 +2685,12 @@ mod tests {
         let v = wlans_view(&s, &HashMap::new(), true);
         assert_eq!((v["aps"].as_array().unwrap().len(), &v["unknown"][0]), (2, &json!(AP1)), "no inform yet: support unknown");
         assert_eq!(v["networks"].as_array().unwrap().iter().map(|n| n["for_ssid"].as_bool().unwrap()).collect::<Vec<_>>(), [true, false, true], "an empty purpose is none");
+        let w = v["wlans"][0].as_object().unwrap();
+        assert!(w.contains_key("protection") && w.contains_key("pmf_mode"));
+        for k in ["security", "wpa_mode", "wpa3_support", "wpa3_transition", "ap_group_mode", "bc_filter_enabled", "minrate_ng_enabled"] {
+            assert!(!w.contains_key(k), "{k} is shown as the protection, or derived by an edit");
+        }
+        assert_eq!(v["networks"][0].as_object().unwrap().keys().collect::<Vec<_>>(), ["for_ssid", "id", "name", "vlan"]);
         // An SSID stored without bands is listed on the two the APs broadcast it on.
         s["wlanconf"][0]["wlan_bands"] = json!([]);
         assert_eq!(wlans_view(&s, &HashMap::new(), true)["wlans"][0]["wlan_bands"], json!(["2g", "5g"]));
