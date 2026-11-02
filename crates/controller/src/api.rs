@@ -596,8 +596,7 @@ impl Serialize for ListedSample<'_> {
         }
         only!(
             mac, ap_mac, essid, radio, channel, hostname, ip, signal, tx_rate, rx_rate, uptime, wifi_gen, nss;
-            not multicast, tx_packets, rx_packets, bssid, rssi, noise, tx_bytes, rx_bytes, tx_retries, idletime, satisfaction, anomalies, vlan_id,
-            latency_avg, is_11r
+            not multicast, tx_packets, rx_packets, bssid, rssi, noise, tx_bytes, rx_bytes, tx_retries, satisfaction, latency_avg
         )
     }
 }
@@ -1348,10 +1347,10 @@ mod tests {
         assert_eq!(get_json(&app, "/api/clients?connected=true").await, json!([clients[0]]), "only the connected one, the same row");
         let one = get_json(&app, "/api/clients/02:00:00:00:01:01").await;
         assert_eq!(keys(&one), "alias,blocked,connected,first_seen,last_seen,locked_to,note,peers,sample,usergroup_id,vendor", "no ap_name, as before");
-        // The list's sample is the page's with only what the lists read.
+        // The page's sample has what the page reads; the list's, only what the lists read.
         let mut page_sample = one["sample"].clone();
-        let dropped = "multicast tx_packets rx_packets bssid rssi noise tx_bytes rx_bytes tx_retries idletime satisfaction anomalies vlan_id latency_avg is_11r";
-        for k in dropped.split(' ') {
+        assert_eq!(keys(&page_sample), "ap_mac,channel,essid,hostname,ip,mac,multicast,noise,nss,radio,rx_bytes,rx_rate,satisfaction,signal,tx_bytes,tx_rate,uptime,wifi_gen");
+        for k in ["multicast", "noise", "tx_bytes", "rx_bytes", "satisfaction"] {
             assert!(page_sample.as_object_mut().unwrap().remove(k).is_some(), "{k}");
         }
         assert_eq!(page_sample, clients[0]["sample"]);

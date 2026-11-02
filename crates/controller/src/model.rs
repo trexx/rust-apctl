@@ -234,16 +234,21 @@ pub struct SpectrumSample {
     pub other_bss_count: Option<i64>,
 }
 
+/// A client's figures from its AP's last full inform. Its page is sent them
+/// without the fields only apctl reads (`skip_serializing`); the lists send
+/// fewer still (`api::ListedSample`).
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct ClientSample {
     pub mac: Mac,
     pub ap_mac: Mac,
+    #[serde(skip_serializing)]
     pub bssid: String,
     pub essid: Option<String>,
     pub radio: Option<String>,
     pub channel: Option<i64>,
     pub hostname: Option<String>,
     pub ip: Option<String>,
+    #[serde(skip_serializing)]
     pub rssi: Option<i64>,
     pub signal: Option<i64>,
     pub noise: Option<i64>,
@@ -252,19 +257,19 @@ pub struct ClientSample {
     pub rx_rate: Option<i64>,
     pub tx_bytes: Option<i64>,
     pub rx_bytes: Option<i64>,
+    #[serde(skip_serializing)]
     pub tx_packets: Option<i64>,
+    #[serde(skip_serializing)]
     pub rx_packets: Option<i64>,
+    #[serde(skip_serializing)]
     pub tx_retries: Option<i64>,
-    pub idletime: Option<i64>,
     /// Seconds connected to this AP.
     pub uptime: Option<i64>,
     pub satisfaction: Option<i64>,
-    pub anomalies: Option<i64>,
     pub nss: Option<i64>,
     pub wifi_gen: Option<&'static str>,
-    pub vlan_id: Option<i64>,
+    #[serde(skip_serializing)]
     pub latency_avg: Option<i64>,
-    pub is_11r: Option<bool>,
     /// Multicast and broadcast traffic by type, when the AP reports it.
     pub multicast: Option<Multicast>,
 }
@@ -503,15 +508,11 @@ pub fn parse_with_scans(ts: Ts, p: &Value) -> anyhow::Result<(Snapshot, Scans)> 
                 tx_packets: int(&s["tx_packets"]),
                 rx_packets: int(&s["rx_packets"]),
                 tx_retries: int(&s["tx_retries"]),
-                idletime: int(&s["idletime"]),
                 uptime: int(&s["uptime"]),
                 satisfaction: int(&s["satisfaction"]),
-                anomalies: int(&s["anomalies"]),
                 nss: int(&s["nss"]),
                 wifi_gen: wifi_gen(s),
-                vlan_id: int(&s["vlan_id"]),
                 latency_avg: int(&s["wifi_tx_latency_mov"]["avg"]),
-                is_11r: s["is_11r"].as_bool(),
                 multicast: Multicast::parse(&s["multicast"]),
             }));
         }
