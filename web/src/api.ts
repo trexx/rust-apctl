@@ -44,12 +44,10 @@ export interface ClientSample {
   rx_rate: number | null;
   tx_bytes: number | null;
   rx_bytes: number | null;
-  tx_retries: number | null;
   uptime: number | null;
   satisfaction: number | null;
   nss: number | null;
   wifi_gen: string | null;
-  latency_avg: number | null;
   multicast: Multicast | null;
 }
 
@@ -59,9 +57,7 @@ export type ListedSample = Pick<ClientSample, "mac" | "ap_mac" | "essid" | "radi
 /** `tx` is what the AP delivered to the client, `rx` what the client sent. */
 export interface McastCounts {
   tx_pkts: number;
-  tx_bytes: number;
   rx_pkts: number;
-  rx_bytes: number;
 }
 
 /** Traffic to or from one multicast service (mDNS, SSDP, …). */
@@ -506,7 +502,7 @@ export const logout = () => send<{ ok: boolean }>("POST", "/api/logout", {});
 
 export interface StateSummary {
   imported_at: number | null;
-  summary: { sites: number; wlans: string[]; networks: string[]; ap_groups: string[]; devices: number; clients: number; settings: number } | null;
+  summary: { wlans: string[]; networks: string[]; ap_groups: string[]; devices: number; clients: number } | null;
 }
 
 export const useSettingsState = () => useQuery({ queryKey: keys.settingsState(), queryFn: getting<StateSummary>("/api/settings/state") });
@@ -930,7 +926,7 @@ export interface BackupManifest {
   version: string;
   created: number;
   days: number;
-  files: Record<string, { size: number; sha256: string }>;
+  files: Record<string, { size: number }>;
 }
 
 interface Backups {
