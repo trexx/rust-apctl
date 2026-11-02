@@ -230,8 +230,8 @@ pub async fn top(State(s): State<AppState>, Query(q): Query<RangeQuery>) -> Resu
                 e.0 += d;
                 e.1 += u;
             }
-            // Most traffic first (by MAC among equals).
-            let mut aps: Vec<(String, (f64, f64))> = aps.into_iter().collect();
+            // Most traffic first (by MAC among equals); as with the clients, none without any.
+            let mut aps: Vec<(String, (f64, f64))> = aps.into_iter().filter(|(_, (d, u))| d + u > 0.0).collect();
             aps.sort_by(|a, b| (b.1.0 + b.1.1).total_cmp(&(a.1.0 + a.1.1)).then_with(|| a.0.cmp(&b.0)));
             aps
         })
@@ -1461,6 +1461,18 @@ mod tests {
                 }
             }
             assert_eq!(out.as_object().unwrap().len(), expected.as_object().unwrap().len());
+        }
+
+        #[tokio::test]
+        async fn the_top_aps_leave_out_those_without_traffic() {
+            let (s, base, t) = site();
+            // A third AP reporting the same counters all along: no traffic in the window.
+            let m = t.db(Db::Metrics);
+            let row = |k: i64| vec![text("02:00:00:00:03:09"), int(base + k * 300), text("02:00:00:00:00:a3"), text("Home"), text("ng"), int(500), int(700)];
+            insert(&m, "vap_stats", &["bssid", "ts", "ap_mac", "essid", "radio", "rx_bytes", "tx_bytes"], (0..12).map(row).collect());
+            let q = Query(RangeQuery { range: None, from: Some(base), to: Some(base + 3600), band: None, mac: None });
+            let out = ok(top(State(s), q).await);
+            assert_eq!(out["aps"].as_array().unwrap().iter().map(|a| a["mac"].as_str().unwrap()).collect::<Vec<_>>(), [A1, A2]);
         }
 
         #[tokio::test]
