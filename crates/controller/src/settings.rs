@@ -1109,13 +1109,24 @@ fn edit_wlan(state: &mut Value, e: &WlanEdit, over: &[Over]) -> Result<(String, 
     }
 
     // Force Wi-Fi 4: turning it on clears what it can't be combined with, as the
-    // official UI does; the edit is then checked against it at the end.
+    // official UI does; the edit is then checked against it at the end. Its UI
+    // offers it with Open, WPA2 Personal and WPA2 Enterprise only: any other WPA
+    // mode becomes WPA2 (WPA3 goes with the template), and an Enterprise SSID
+    // stays Enterprise.
     let was_iot = flag(&before, "enhanced_iot", false);
     copy_fields(p, &mut w, &[("enhanced_iot", Bool)])?;
     let iot = flag(&w, "enhanced_iot", false);
     if iot && !was_iot {
         for (k, v, _) in IOT_TEMPLATE.iter() {
             w[*k] = v.clone();
+        }
+        match Security::of(&w) {
+            Security::Psk if apcfg::wpa_mode(&w) != "wpa2" => {
+                w["wpa_mode"] = json!("wpa2");
+                w["wpa_enc"] = json!("ccmp");
+            }
+            Security::Eap { osen: false } if apcfg::wpa_mode(&w) != "wpa2" => w["wpa_mode"] = json!("wpa2"),
+            _ => {}
         }
     }
     // What the edit's own fields are told apart from, below: the held fields as they are now.
@@ -2048,6 +2059,36 @@ mod tests {
         s["wlanconf"][0]["wpa_mode"] = json!("wpa1");
         let v = wlans_view(&s, &HashMap::new(), false);
         assert_eq!((v["wlans"][0]["security"].as_str(), v["wlans"][0]["protection"].as_str()), (Some("WPA Personal"), None));
+    }
+
+    #[test]
+    fn force_wifi4_makes_any_other_wpa_mode_wpa2_and_keeps_open_and_enterprise() {
+        // Mixed WPA/WPA2 (stored or missing) and WPA1 Personal become WPA2 Personal.
+        for mode in [json!("auto"), Value::Null, json!("wpa1")] {
+            let mut s = state();
+            (s["wlanconf"][0]["wpa_mode"], s["wlanconf"][0]["wpa_enc"]) = (mode.clone(), json!("tkip"));
+            let what = edit(&mut s, json!({ "enhanced_iot": true })).unwrap();
+            let w = &s["wlanconf"][0];
+            assert_eq!((w["security"].as_str(), w["wpa_mode"].as_str(), w["wpa_enc"].as_str()), (Some("wpapsk"), Some("wpa2"), Some("ccmp")), "{mode}");
+            assert_eq!(protection_of(w).map(|p| p.name), Some("wpa2"));
+            assert!(what.contains("wpa_mode"), "{what}");
+        }
+        // Enterprise in another mode becomes WPA2 Enterprise, with no password asked for.
+        let mut s = state();
+        let w = s["wlanconf"][0].as_object_mut().unwrap();
+        w.remove("x_passphrase");
+        (w["security"], w["wpa_mode"]) = (json!("wpaeap"), json!("auto"));
+        edit(&mut s, json!({ "enhanced_iot": true })).unwrap();
+        let w = &s["wlanconf"][0];
+        assert_eq!((w["security"].as_str(), w["wpa_mode"].as_str(), security_label(w)), (Some("wpaeap"), Some("wpa2"), "WPA2 Enterprise"));
+        // Open stays open; Enhanced Open loses WPA3 with the template.
+        for wpa3 in [false, true] {
+            let mut s = state();
+            (s["wlanconf"][0]["security"], s["wlanconf"][0]["wpa3_support"], s["wlanconf"][0]["wpa_mode"]) = (json!("open"), json!(wpa3), json!("auto"));
+            edit(&mut s, json!({ "enhanced_iot": true })).unwrap();
+            let w = &s["wlanconf"][0];
+            assert_eq!((w["security"].as_str(), w["wpa_mode"].as_str(), security_label(w)), (Some("open"), Some("auto"), "Open"), "{wpa3}");
+        }
     }
 
     #[test]
