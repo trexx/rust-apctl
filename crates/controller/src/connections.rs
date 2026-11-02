@@ -389,6 +389,17 @@ pub fn attempts(mut events: Vec<ConnEvent>) -> Vec<Attempt> {
         })
         .collect()
 }
+
+/// How many clients made attempts and succeeded in none: the site's "never
+/// connected" figure and the health alert's.
+pub(crate) fn failed_clients<'a>(attempts: impl IntoIterator<Item = &'a Attempt>) -> usize {
+    let mut ok: HashMap<&str, bool> = HashMap::new();
+    for a in attempts {
+        *ok.entry(a.client.as_str()).or_default() |= a.success;
+    }
+    ok.values().filter(|ok| !**ok).count()
+}
+
 /// Connection success per client: each client counts once, at the furthest
 /// stage any of its attempts reached; timings are averaged over the attempts
 /// that have them.
@@ -413,7 +424,7 @@ pub fn connectivity_stats(attempts: &[Attempt], band: Option<&str>) -> Value {
     json!({
         "attempts": list.len(),
         "clients": clients,
-        "failed_clients": clients - at[6],
+        "failed_clients": failed_clients(list.iter().copied()),
         "association_pct": pct(1), "authentication_pct": pct(2), "dhcp_pct": pct(3), "dns_pct": pct(4),
         "success_pct": pct(5),
         "failed_at": STAGES.iter().take(5).enumerate().map(|(i, k)| (k.to_string(), json!(at[i + 1]))).collect::<serde_json::Map<_, _>>(),
