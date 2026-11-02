@@ -280,11 +280,9 @@ pub fn state() -> Result<Value> {
         .iter()
         .enumerate()
         .map(|(i, c)| {
-            let mut v = json!({ "_id": { "$oid": format!("{:024x}", 0x100 + i) }, "mac": c.mac, "hostname": c.hostname, "is_wired": false,
-                                "first_seen": 1_760_000_000 + i as i64 * 86_400, "last_seen": 1_791_000_000 });
+            let mut v = json!({ "_id": { "$oid": format!("{:024x}", 0x100 + i) }, "mac": c.mac, "hostname": c.hostname });
             if let Some(a) = c.alias {
                 v["name"] = json!(a);
-                v["noted"] = json!(true);
             }
             v
         })
@@ -901,6 +899,13 @@ mod tests {
         for setting in s["setting"].as_array().unwrap() {
             let key = setting["key"].as_str().unwrap();
             assert!(apcfg::SETTING_KEYS.contains(&key), "setting {key} is not one apctl reads");
+        }
+        let (devices, clients) = (crate::snapshot::device_fields(), crate::snapshot::client_fields());
+        for (collection, fields) in [("devices", devices), ("clients", clients)] {
+            for doc in s[collection].as_array().unwrap() {
+                let kept = |k: &&String| k.as_str() == "_id" || fields.contains(&k.as_str());
+                assert!(doc.as_object().unwrap().keys().all(|k| kept(&k)), "{collection}: {:?}", doc.as_object().unwrap().keys().filter(|k| !kept(k)).collect::<Vec<_>>());
+            }
         }
         let controller = apcfg::Controller::default();
         // The APs' capabilities.

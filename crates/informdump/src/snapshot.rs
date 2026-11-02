@@ -23,8 +23,9 @@ const DEVICE_FIELDS: &[&str] = &["model", "version", "serial", "ip", "adopted", 
 
 /// Client fields kept besides the ones rendering reads ([`apcfg::CLIENT_KEYS`]): the
 /// names and notes people gave their devices (an import into apctl takes them as the
-/// aliases of clients not yet named there), and their speed limit (user group).
-const USER_FIELDS: &[&str] = &["name", "note", "noted", "hostname", "oui", "first_seen", "last_seen", "is_wired", "is_guest", "usergroup_id"];
+/// aliases of clients not yet named there), their speed limit (user group) and their
+/// reserved address (`use_fixedip`, `fixed_ip`), which a static AP address may not take.
+const USER_FIELDS: &[&str] = &["name", "note", "hostname", "usergroup_id", "use_fixedip", "fixed_ip"];
 
 /// The fields of a device document an import keeps.
 pub fn device_fields() -> Vec<&'static str> {
@@ -75,7 +76,7 @@ mod tests {
         for f in ["mac", "site_id", "x_authkey", "x_ssh_hostkey_fingerprint", "syslog_key", "radio_table", "model", "version", "cfgversion", "x_aes_gcm", "mgmt_network_id", "wlangroup_id_ng", "wlangroup_id_na"] {
             assert!(devices.contains(&f), "devices: {f}");
         }
-        for f in ["mac", "site_id", "blocked", "fixed_ap_mac", "name", "note", "usergroup_id"] {
+        for f in ["mac", "site_id", "blocked", "fixed_ap_mac", "name", "note", "hostname", "usergroup_id", "use_fixedip", "fixed_ip"] {
             assert!(clients.contains(&f), "clients: {f}");
         }
         let secrets: Vec<&str> = devices.iter().chain(&clients).copied().filter(|f| f.starts_with("x_")).collect();
