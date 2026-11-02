@@ -904,9 +904,9 @@ const LogRow = memo(
         <span className="log-time">{clock(l.ts, now)}</span>
         {showDevice && (
           <span className="log-device">
-            {/* A line from an address no AP has: who sent it. */}
+            {/* A sender not known to be an AP: its address. */}
             {!l.device_mac && l.src_ip ? (
-              <span className="muted mono" title="Not from a known AP">
+              <span className="muted mono" title="Sender not verified as an AP">
                 {l.src_ip}
               </span>
             ) : (

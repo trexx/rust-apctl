@@ -335,7 +335,7 @@ export const payload = <K extends EventKind>(e: AppEvent, kind: K): Partial<Even
 export interface LogLine {
   id: number;
   ts: number;
-  /** Null for a line from an address no AP had; `src_ip` names the sender. */
+  /** Null when the sender is not known to be an AP (an address no AP has, or an unencrypted line from the address of an AP that encrypts its syslog); `src_ip` names it. */
   device_mac: Mac | null;
   src_ip: string | null;
   severity: number | null;
