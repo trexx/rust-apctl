@@ -269,12 +269,12 @@ fn busiest<T>(per: HashMap<&str, T>, n: usize, amount: impl Fn(&T) -> f64) -> Ve
     list.into_iter().map(|(m, t)| (m.to_string(), t)).collect()
 }
 
-/// A client of a top list: its MAC, name, vendor and whether it is connected,
-/// and the fields of `more` (given what it reports now, if anything).
+/// A client of a top list: its MAC, name and vendor, and the fields of `more`
+/// (given what it reports now, if anything).
 fn listed_client(s: &AppState, live: &Live, mac: &str, more: impl FnOnce(Option<&ClientView>) -> Value) -> Value {
     let m: Option<inform::Mac> = mac.parse().ok();
     let view = m.and_then(|m| live.clients.get(&m));
-    let mut out = json!({ "mac": mac, "name": client_name(live, m), "vendor": m.and_then(|m| s.vendors.lookup(&m)), "connected": view.is_some_and(|c| c.connected) });
+    let mut out = json!({ "mac": mac, "name": client_name(live, m), "vendor": m.and_then(|m| s.vendors.lookup(&m)) });
     if let (Value::Object(o), Value::Object(more)) = (&mut out, more(view)) {
         o.extend(more);
     }

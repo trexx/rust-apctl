@@ -819,7 +819,6 @@
     "clients": [
       {
         "ap": "Hall",
-        "connected": true,
         "delivery": null,
         "mac": "02:00:00:00:10:02",
         "memberships": 0,
@@ -831,7 +830,6 @@
       },
       {
         "ap": "Attic",
-        "connected": true,
         "delivery": null,
         "mac": "02:00:00:00:10:03",
         "memberships": 0,
@@ -927,7 +925,6 @@
     "clients": [
       {
         "ap": "Attic",
-        "connected": true,
         "delivery": null,
         "mac": "02:00:00:00:10:03",
         "memberships": 0,
@@ -1015,11 +1012,7 @@
     }
   },
   "plan_na": {
-    "accepted": true,
     "allowed": null,
-    "band": "na",
-    "current_total": 310.0,
-    "dfs": true,
     "plan": [
       {
         "change": true,
@@ -1056,15 +1049,10 @@
         "suggested_score": 0.0,
         "width": 80
       }
-    ],
-    "suggested_total": 0.0
+    ]
   },
   "plan_ng": {
-    "accepted": true,
     "allowed": null,
-    "band": "ng",
-    "current_total": 103.0,
-    "dfs": false,
     "plan": [
       {
         "change": true,
@@ -1098,8 +1086,7 @@
         "suggested_score": 0.0,
         "width": 20
       }
-    ],
-    "suggested_total": 0.0
+    ]
   },
   "radios": [
     {
@@ -1210,7 +1197,6 @@
     ],
     "clients": [
       {
-        "connected": true,
         "download_bytes": 12150200.0,
         "mac": "02:00:00:00:10:02",
         "name": null,
@@ -1218,7 +1204,6 @@
         "vendor": "Private (randomised)"
       },
       {
-        "connected": true,
         "download_bytes": 11069407.0,
         "mac": "02:00:00:00:10:03",
         "name": null,
@@ -1226,7 +1211,6 @@
         "vendor": "Private (randomised)"
       },
       {
-        "connected": true,
         "download_bytes": 10671142.0,
         "mac": "02:00:00:00:10:01",
         "name": null,
@@ -1239,7 +1223,6 @@
     "aps": [],
     "clients": [
       {
-        "connected": true,
         "download_bytes": 11069407.0,
         "mac": "02:00:00:00:10:03",
         "name": null,
@@ -1247,7 +1230,6 @@
         "vendor": "Private (randomised)"
       },
       {
-        "connected": true,
         "download_bytes": 5207146.0,
         "mac": "02:00:00:00:10:01",
         "name": null,

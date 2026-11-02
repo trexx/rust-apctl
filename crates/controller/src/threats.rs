@@ -123,6 +123,8 @@ pub struct Finding {
     /// What it imitates or relates to: our network name, AP or client.
     pub target: Option<String>,
     pub detail: String,
+    /// When it was first reported (its event, raised once); `None` until then.
+    #[serde(skip_serializing)]
     pub first_reported: Option<Ts>,
     /// As it was when the finding was worked out; `list` sends it as it is now.
     #[serde(skip)]
@@ -1312,11 +1314,10 @@ mod tests {
         let f = assess(&a).remove(0);
         let ack = Ack { note: Some("the neighbours".into()), ts: 5 };
         let sent = serde_json::to_value(Served { finding: &f, acknowledged: Some(&ack), vendor: Some("Acme") }).unwrap();
-        // The same fields as a finding has, and the vendor.
+        // The same fields as a finding has (but when it was reported), and the vendor.
         let mut keys: Vec<&str> = sent.as_object().unwrap().keys().map(String::as_str).collect();
         let mut want = vec![
-            "kind", "severity", "bssid", "essid", "security", "channel", "radio", "best_signal", "heard_by", "first_seen", "last_seen", "target", "detail", "first_reported",
-            "acknowledged", "vendor",
+            "kind", "severity", "bssid", "essid", "security", "channel", "radio", "best_signal", "heard_by", "first_seen", "last_seen", "target", "detail", "acknowledged", "vendor",
         ];
         want.sort();
         keys.sort();
