@@ -593,7 +593,8 @@ impl Active {
         match cmd {
             Ok(cmd) => {
                 tracing::warn!("{mac}: sending firmware upgrade to {}", target.as_deref().unwrap_or("?"));
-                let data = json!({ "target": target, "url": cmd["url"] });
+                // Not the link: a custom one may hold a credential, and the events are open to read-only users.
+                let data = json!({ "target": target });
                 let _ = self.engine.blocking_send(Input::Note(Event::device(ts, EventKind::ApUpgradeSent, mac, data)));
                 Some(cmd)
             }
@@ -957,7 +958,7 @@ mod tests {
     #[tokio::test]
     async fn sends_a_queued_upgrade_once_the_config_is_current() {
         let Some(_) = fixtures() else { return };
-        let rig = rig(true, None);
+        let mut rig = rig(true, None);
         let (_, reply) = inform_as_ap(&rig, &ap_payload("1111111111111111"), KEY, GCM_ZLIB).await;
         let version = reply.unwrap().1["cfgversion"].as_str().unwrap().to_string();
         rig.live.write().unwrap().firmware.enqueue(vec![crate::firmware::Job {
@@ -981,6 +982,9 @@ mod tests {
         let reply = reply.unwrap().1;
         assert_eq!((reply["_type"].as_str(), reply["version"].as_str(), reply["md5sum"].as_str()), (Some("upgrade"), Some("8.8.12.20200"), Some("abc")));
         assert_eq!(reply["url"], "https://fw-download.example/U6M-8.8.12.bin");
+        // The event names the target only: a custom link may hold a credential.
+        let sent = std::iter::from_fn(|| rig.rx.try_recv().ok()).find_map(|i| if let Input::Note(e) = i && e.kind == EventKind::ApUpgradeSent { Some(e.data) } else { None }).unwrap();
+        assert_eq!(sent, json!({ "target": "8.8.12.20200" }));
         // Sent once: the next inform is a heartbeat.
         let (_, reply) = inform_as_ap(&rig, &ap_payload(&version), KEY, GCM_ZLIB).await;
         assert_eq!(reply.unwrap().1["_type"], "noop");
