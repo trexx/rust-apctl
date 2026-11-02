@@ -199,7 +199,8 @@ pub async fn compute_plan(s: &AppState, radio: String, dfs: bool, allowed: Optio
     if !matches!(radio.as_str(), "ng" | "na") {
         return Err(ApiError::bad("band must be ng or na"));
     }
-    let since = clock::now_ts() - 7 * 86400;
+    let now = clock::now_ts();
+    let since = now - 7 * 86400;
     let r2 = radio.clone();
     let (neigh, spectrum) = read(&s.store, Db::Config, move |c| {
         let mut stmt = c.prepare("SELECT ap_mac, bssid, essid, center_freq, bw, signal FROM neighbors WHERE radio = ?1 AND last_seen >= ?2")?;
@@ -216,17 +217,24 @@ pub async fn compute_plan(s: &AppState, radio: String, dfs: bool, allowed: Optio
         Ok((n, sp))
     })
     .await?;
+    // The BSSIDs our APs used in the last 30 days, as the threat checks know them.
+    let used = {
+        let (threats, store) = (s.threats.clone(), s.store.clone());
+        tokio::task::spawn_blocking(move || threats.used_bssids(&store, now)).await??
+    };
     // What the plan needs from `live`, copied so the lock is not held while it is worked out.
-    let (aps, own_bssids) = plan_inputs(&s.live.read().unwrap(), &radio);
+    let (aps, own_bssids) = plan_inputs(&s.live.read().unwrap(), &radio, &used);
     let work = move || plan_channels(radio, dfs, allowed, pinned, aps, own_bssids, neigh, spectrum);
     Ok(tokio::task::spawn_blocking(work).await?)
 }
 
 /// What a plan for `radio` takes from `live`: the APs online now with the band,
-/// and our BSSIDs on it (BSSID → AP). An AP that went offline is neither moved
-/// nor, by its last signals, steers the others: as after a restart, when only
-/// the APs heard since are in `devices`.
-fn plan_inputs(live: &Live, radio: &str) -> (Vec<PlanAp>, HashMap<String, String>) {
+/// and our BSSIDs (BSSID → AP): the live VAPs', then those `used` names. An AP
+/// that is offline (down since before a restart too), or a BSSID of ours no
+/// longer broadcast (a removed SSID's), is neither moved nor counted as a
+/// neighbour: what the others hear of it belongs to no AP in the plan, so it
+/// steers nothing.
+fn plan_inputs(live: &Live, radio: &str, used: &[crate::threats::UsedBss]) -> (Vec<PlanAp>, HashMap<String, String>) {
     let state = live.state.as_deref();
     let country = state.map_or(apcfg::DEFAULT_COUNTRY, crate::settings::country);
     // The APs' records in the settings, found once (the first of a MAC listed twice, as `device_doc` finds it).
@@ -263,9 +271,12 @@ fn plan_inputs(live: &Live, radio: &str) -> (Vec<PlanAp>, HashMap<String, String
             Some(PlanAp { mac: m.to_string(), name: d.snapshot.ap.hostname.clone(), current: block(radio, ch, width), width, clients: r.num_sta, available, legal })
         })
         .collect();
-    // Our APs' BSSIDs on this band, to separate own signal from neighbours.
-    let own: HashMap<String, String> =
-        own_bssids(live).filter(|(_, v)| v.radio.as_deref() == Some(radio)).map(|(m, v)| (v.bssid.clone(), m.to_string())).collect();
+    // Our APs' BSSIDs, to separate own signal from neighbours. The rows read are this
+    // band's, so a BSSID of ours heard there is its AP's radio on the band.
+    let mut own: HashMap<String, String> = own_bssids(live).map(|(m, v)| (v.bssid.clone(), m.to_string())).collect();
+    for (bssid, ap, _) in used.iter().filter(|u| !u.1.is_empty()) {
+        own.entry(bssid.clone()).or_insert_with(|| ap.clone());
+    }
     (aps, own)
 }
 
@@ -487,12 +498,20 @@ mod tests {
             let snapshot = crate::model::parse(1000, &p).unwrap();
             live.devices.insert(mac, crate::engine::DeviceView { snapshot, online, last_seen: 1000, interval: 10, last_full_inform: 1000, last_config_push: None });
         }
-        let (aps, own) = plan_inputs(&live, "ng");
+        // Used lately but not live: an AP down since before a restart, and a removed SSID of AP1's;
+        // the live VAP's AP wins over a stale record of its BSSID.
+        let used: Vec<crate::threats::UsedBss> = [("02:00:00:00:01:03", "02:00:00:00:00:03"), ("02:00:00:00:01:04", "02:00:00:00:00:01"), ("02:00:00:00:01:02", "02:00:00:00:00:09"), ("02:00:00:00:01:05", "")]
+            .map(|(b, a)| (b.to_string(), a.to_string(), Some("Home".to_string())))
+            .into();
+        let (aps, own) = plan_inputs(&live, "ng", &used);
         assert_eq!(aps.iter().map(|a| (a.mac.as_str(), a.current.primary)).collect::<Vec<_>>(), [("02:00:00:00:00:01", 6)], "the offline AP is not moved");
         // Its BSSID is still ours, so what the others hear of it is no neighbour; with no AP to
-        // place in the plan, it steers nothing either.
+        // place in the plan, it steers nothing either. So do the used ones.
         assert_eq!(own.get("02:00:00:00:01:02").map(String::as_str), Some("02:00:00:00:00:02"));
-        let neigh = vec![("02:00:00:00:00:01".to_string(), "02:00:00:00:01:02".to_string(), Some("Home".to_string()), Some(2437.0), Some(20.0), Some(-40.0))];
+        assert_eq!((own.get("02:00:00:00:01:03").map(String::as_str), own.get("02:00:00:00:01:04").map(String::as_str)), (Some("02:00:00:00:00:03"), Some("02:00:00:00:00:01")));
+        assert!(!own.contains_key("02:00:00:00:01:05"), "a BSSID with no AP is no AP's");
+        let heard = |bssid: &str| ("02:00:00:00:00:01".to_string(), bssid.to_string(), Some("Home".to_string()), Some(2437.0), Some(20.0), Some(-40.0));
+        let neigh = vec![heard("02:00:00:00:01:02"), heard("02:00:00:00:01:03")];
         let plan = plan_channels("ng".into(), false, None, HashSet::new(), aps, own, neigh, vec![]);
         assert!(plan.plan.iter().all(|p| p.current_reasons.is_empty()), "{plan:?}");
     }
