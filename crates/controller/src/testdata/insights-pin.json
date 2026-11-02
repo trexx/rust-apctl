@@ -1197,6 +1197,7 @@
     ],
     "clients": [
       {
+        "connected": true,
         "download_bytes": 12150200.0,
         "mac": "02:00:00:00:10:02",
         "name": null,
@@ -1204,6 +1205,7 @@
         "vendor": "Private (randomised)"
       },
       {
+        "connected": true,
         "download_bytes": 11069407.0,
         "mac": "02:00:00:00:10:03",
         "name": null,
@@ -1211,6 +1213,7 @@
         "vendor": "Private (randomised)"
       },
       {
+        "connected": true,
         "download_bytes": 10671142.0,
         "mac": "02:00:00:00:10:01",
         "name": null,
@@ -1223,6 +1226,7 @@
     "aps": [],
     "clients": [
       {
+        "connected": true,
         "download_bytes": 11069407.0,
         "mac": "02:00:00:00:10:03",
         "name": null,
@@ -1230,6 +1234,7 @@
         "vendor": "Private (randomised)"
       },
       {
+        "connected": true,
         "download_bytes": 5207146.0,
         "mac": "02:00:00:00:10:01",
         "name": null,

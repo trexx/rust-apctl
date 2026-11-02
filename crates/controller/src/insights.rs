@@ -258,7 +258,7 @@ pub async fn top(State(s): State<AppState>, Query(q): Query<RangeQuery>) -> Resu
     .await?;
     let live = s.live.read().unwrap();
     let ap_list: Vec<Value> = aps.iter().map(|(mac, (d, u))| json!({ "name": ap_name(&live, mac), "mac": mac, "download_bytes": d, "upload_bytes": u })).collect();
-    let cl_list: Vec<Value> = clients.iter().map(|(mac, (d, u))| listed_client(&s, &live, mac, |_| json!({ "download_bytes": d, "upload_bytes": u }))).collect();
+    let cl_list: Vec<Value> = clients.iter().map(|(mac, (d, u))| listed_client(&s, &live, mac, |view| json!({ "connected": view.is_some_and(|c| c.connected), "download_bytes": d, "upload_bytes": u }))).collect();
     Ok(Json(json!({ "aps": ap_list, "clients": cl_list })))
 }
 
