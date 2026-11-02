@@ -287,6 +287,7 @@ CREATE INDEX IF NOT EXISTS connections_ts ON connections (ts);
 CREATE INDEX IF NOT EXISTS connections_client ON connections (client_mac, ts);
 CREATE TABLE IF NOT EXISTS controller_state (
     id INTEGER PRIMARY KEY CHECK (id = 1), json TEXT NOT NULL, imported_at INTEGER NOT NULL);
+-- cfgversion is no longer written; old databases have it filled.
 CREATE TABLE IF NOT EXISTS dryrun_results (
     id INTEGER PRIMARY KEY, ts INTEGER NOT NULL, mac TEXT NOT NULL, cfgversion TEXT,
     matches INTEGER NOT NULL, comparison TEXT NOT NULL);
@@ -302,6 +303,7 @@ CREATE TABLE IF NOT EXISTS device_config (
 ";
 
 const LOGS_SCHEMA: &str = "
+-- facility is no longer written; old databases have it filled.
 CREATE TABLE IF NOT EXISTS logs (
     id INTEGER PRIMARY KEY, ts INTEGER NOT NULL, device_mac TEXT, src_ip TEXT,
     facility INTEGER, severity INTEGER, program TEXT, msg TEXT NOT NULL);

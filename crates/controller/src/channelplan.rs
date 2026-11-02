@@ -485,7 +485,7 @@ mod tests {
             let p = serde_json::json!({ "mac": mac.to_string(), "hostname": format!("AP{n}"), "radio_table": [{ "name": "wifi0", "radio": "ng" }],
                 "vap_table": [{ "name": "ath0", "radio": "ng", "channel": 6, "bssid": format!("02:00:00:00:01:0{n}"), "essid": "Home" }] });
             let snapshot = crate::model::parse(1000, &p).unwrap();
-            live.devices.insert(mac, crate::engine::DeviceView { snapshot, online, first_seen: 0, last_seen: 1000, interval: 10, last_full_inform: 1000, last_config_push: None });
+            live.devices.insert(mac, crate::engine::DeviceView { snapshot, online, last_seen: 1000, interval: 10, last_full_inform: 1000, last_config_push: None });
         }
         let (aps, own) = plan_inputs(&live, "ng");
         assert_eq!(aps.iter().map(|a| (a.mac.as_str(), a.current.primary)).collect::<Vec<_>>(), [("02:00:00:00:00:01", 6)], "the offline AP is not moved");

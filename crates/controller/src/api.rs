@@ -422,16 +422,15 @@ fn stored_only(live: &Live) -> impl Iterator<Item = (&Mac, &KnownDevice)> {
 }
 
 /// An AP known from the database only (see `Live::known_devices`), as a live
-/// device view of it, offline: what was not stored is empty.
-fn stored_view(mac: Mac, k: &KnownDevice) -> DeviceView {
+/// device view of it, offline: it has what its row and its page show, the rest is empty.
+fn stored_view(k: &KnownDevice) -> DeviceView {
     let ap = crate::model::ApSample {
-        mac, ts: k.last_seen, hostname: k.hostname.clone(), model: k.model.clone(), model_display: k.model_display.clone(), version: k.version.clone(),
-        ip: k.ip.clone(), serial: k.serial.clone(), ..Default::default()
+        hostname: k.hostname.clone(), model: k.model.clone(), model_display: k.model_display.clone(), version: k.version.clone(), ip: k.ip.clone(),
+        ..Default::default()
     };
     DeviceView {
         snapshot: crate::model::Snapshot { ap, ..Default::default() },
-        online: false, first_seen: k.first_seen, last_seen: k.last_seen, interval: 0, last_full_inform: 0,
-        last_config_push: None,
+        online: false, last_seen: k.last_seen, interval: 0, last_full_inform: 0, last_config_push: None,
     }
 }
 
@@ -493,7 +492,7 @@ async fn devices(State(s): State<AppState>) -> Json<Vec<DeviceRow>> {
         }
         let mut list: Vec<DeviceRow> = live.devices.iter().map(|(mac, d)| device_row(*mac, d, per_ap.get(mac).copied().unwrap_or(0))).collect();
         // Then the APs not reporting since apctl started, by MAC as the others.
-        let mut stored: Vec<DeviceRow> = stored_only(&live).map(|(mac, k)| device_row(*mac, &stored_view(*mac, k), 0)).collect();
+        let mut stored: Vec<DeviceRow> = stored_only(&live).map(|(mac, k)| device_row(*mac, &stored_view(k), 0)).collect();
         stored.sort_unstable_by_key(|d| d.mac);
         list.append(&mut stored);
         list
@@ -529,7 +528,7 @@ async fn device(State(s): State<AppState>, MacPath(mac): MacPath) -> Result<Resp
                 (d.clone(), clients, crate::actions::locating(&live, &mac), false)
             }
             // Known but not reporting since apctl started: offline, with what was stored.
-            (None, Some(k)) => (stored_view(mac, k), Vec::new(), false, true),
+            (None, Some(k)) => (stored_view(k), Vec::new(), false, true),
             (None, None) => return Err(ApiError::not_found("unknown device")),
         }
     };
@@ -597,8 +596,7 @@ impl Serialize for ListedSample<'_> {
         }
         only!(
             mac, ap_mac, essid, radio, channel, hostname, ip, signal, tx_rate, rx_rate, uptime, wifi_gen, nss;
-            not multicast, tx_packets, rx_packets, bssid, rssi, noise, tx_bytes, rx_bytes, tx_retries, idletime, satisfaction, anomalies, vlan_id,
-            latency_avg, is_11r
+            not multicast, tx_packets, rx_packets, bssid, rssi, noise, tx_bytes, rx_bytes, tx_retries, satisfaction, latency_avg
         )
     }
 }
@@ -840,7 +838,6 @@ struct DryRunStatus {
     history_matches: i64,
 }
 
-/// An AP's dry run now: how what apctl would push compares with what it runs.
 /// The imported settings record the cfgversion the other controller expected
 /// for each AP at import time. If the AP now runs another one, that controller
 /// has pushed new config since: the settings are probably out of date. Never in
@@ -850,6 +847,7 @@ fn settings_stale(active: bool, imported: Option<&str>, running: Option<&str>) -
     !active && matches!((imported, running), (Some(a), Some(b)) if a != b)
 }
 
+/// An AP's dry run now: how what apctl would push compares with what it runs.
 #[derive(Serialize)]
 struct DryRunDevice {
     mac: Mac,
@@ -888,28 +886,17 @@ struct AliasBody {
     note: Option<String>,
 }
 
-const MAX_ALIAS: usize = 64;
-const MAX_NOTE: usize = 500;
-
-fn validate(alias: &Option<String>, note: &Option<String>) -> Result<(), ApiError> {
-    if alias.as_ref().is_some_and(|a| a.chars().count() > MAX_ALIAS) {
-        return Err(ApiError::bad(format!("alias longer than {MAX_ALIAS} characters")));
-    }
-    if note.as_ref().is_some_and(|n| n.chars().count() > MAX_NOTE) {
-        return Err(ApiError::bad(format!("note longer than {MAX_NOTE} characters")));
-    }
-    Ok(())
-}
-
 /// Sets (or, with empty values, clears) a client's alias and note.
 async fn set_alias(
     State(s): State<AppState>,
     MacPath(mac): MacPath,
     Json(body): Json<AliasBody>,
 ) -> ApiResult {
-    validate(&body.alias, &body.note)?;
+    if let Some(e) = crate::engine::alias_error(body.alias.as_deref(), body.note.as_deref()) {
+        return Err(ApiError::bad(e));
+    }
     let entries = vec![AliasEdit { mac, alias: body.alias, note: body.note }];
-    let input = crate::engine::Input::SetAliases { ts: clock::now_ts(), entries, only_if_unset: false };
+    let input = crate::engine::Input::SetAliases { ts: clock::now_ts(), entries };
     s.send(input).await?;
     Ok(Json(json!({ "ok": true })))
 }
@@ -1360,10 +1347,10 @@ mod tests {
         assert_eq!(get_json(&app, "/api/clients?connected=true").await, json!([clients[0]]), "only the connected one, the same row");
         let one = get_json(&app, "/api/clients/02:00:00:00:01:01").await;
         assert_eq!(keys(&one), "alias,blocked,connected,first_seen,last_seen,locked_to,note,peers,sample,usergroup_id,vendor", "no ap_name, as before");
-        // The list's sample is the page's with only what the lists read.
+        // The page's sample has what the page reads; the list's, only what the lists read.
         let mut page_sample = one["sample"].clone();
-        let dropped = "multicast tx_packets rx_packets bssid rssi noise tx_bytes rx_bytes tx_retries idletime satisfaction anomalies vlan_id latency_avg is_11r";
-        for k in dropped.split(' ') {
+        assert_eq!(keys(&page_sample), "ap_mac,channel,essid,hostname,ip,mac,multicast,noise,nss,radio,rx_bytes,rx_rate,satisfaction,signal,tx_bytes,tx_rate,uptime,wifi_gen");
+        for k in ["multicast", "noise", "tx_bytes", "rx_bytes", "satisfaction"] {
             assert!(page_sample.as_object_mut().unwrap().remove(k).is_some(), "{k}");
         }
         assert_eq!(page_sample, clients[0]["sample"]);

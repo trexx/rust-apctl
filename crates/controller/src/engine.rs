@@ -41,9 +41,9 @@ pub enum Input {
     /// Active mode: apctl itself sent this reply to an AP (a `setparam`, or a
     /// reply that sets its inform interval).
     Replied { ts: Ts, mac: Mac, payload: Value },
-    /// Set or clear clients' aliases and notes (None clears). `only_if_unset`
-    /// leaves existing aliases alone, as a settings import's names do.
-    SetAliases { ts: Ts, entries: Vec<AliasEdit>, only_if_unset: bool },
+    /// Set or clear clients' aliases and notes (None clears), each within
+    /// [`MAX_ALIAS`]/[`MAX_NOTE`] (see [`alias_error`]).
+    SetAliases { ts: Ts, entries: Vec<AliasEdit> },
     /// A syslog datagram from an AP (captured in shadow mode or received directly).
     Datagram { ts: Ts, src_ip: String, payload: Vec<u8> },
     Reply { ts: Ts, mac: Mac, payload: Value },
@@ -162,8 +162,6 @@ pub struct EventHead {
 pub struct DeviceView {
     pub snapshot: Snapshot,
     pub online: bool,
-    #[serde(skip_serializing)]
-    pub first_seen: Ts,
     pub last_seen: Ts,
     /// Inform interval most recently requested by the controller.
     pub interval: Ts,
@@ -346,7 +344,6 @@ impl Live {
 /// what happened while apctl was away, and what the device list shows of it.
 #[derive(Debug, Clone, Default)]
 pub struct KnownDevice {
-    pub first_seen: Ts,
     pub last_seen: Ts,
     pub uptime: Option<i64>,
     pub version: Option<String>,
@@ -354,7 +351,6 @@ pub struct KnownDevice {
     pub model: Option<String>,
     pub model_display: Option<String>,
     pub ip: Option<String>,
-    pub serial: Option<String>,
     /// Reported offline (an `ap_offline` event), and not back since.
     pub offline: bool,
 }
@@ -544,14 +540,14 @@ impl Engine {
     /// the first one after it says what it changed.
     pub fn restore(&mut self, store: &store::Store) -> anyhow::Result<()> {
         let (devices, clients, aliases, state, pushes) = store.read(Db::Config, |c| {
-            let mut stmt = c.prepare("SELECT mac, first_seen, last_seen, uptime, version, hash_id, ip, hostname, model, model_display, serial, offline FROM devices")?;
+            let mut stmt = c.prepare("SELECT mac, last_seen, uptime, version, hash_id, ip, hostname, model, model_display, offline FROM devices")?;
             let devices = stmt
                 .query_map([], |r| {
                     let known = KnownDevice {
-                        first_seen: r.get::<_, Option<i64>>(1)?.unwrap_or(0), last_seen: r.get::<_, Option<i64>>(2)?.unwrap_or(0), uptime: r.get(3)?, version: r.get(4)?,
-                        ip: r.get(6)?, hostname: r.get(7)?, model: r.get(8)?, model_display: r.get(9)?, serial: r.get(10)?, offline: r.get::<_, i64>(11)? != 0,
+                        last_seen: r.get::<_, Option<i64>>(1)?.unwrap_or(0), uptime: r.get(2)?, version: r.get(3)?,
+                        ip: r.get(5)?, hostname: r.get(6)?, model: r.get(7)?, model_display: r.get(8)?, offline: r.get::<_, i64>(9)? != 0,
                     };
-                    Ok((r.get::<_, String>(0)?, known, r.get::<_, Option<String>>(5)?))
+                    Ok((r.get::<_, String>(0)?, known, r.get::<_, Option<String>>(4)?))
                 })?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
             let mut stmt = c.prepare("SELECT mac, hostname, ip, first_seen, last_seen, ap_mac, bssid, essid, radio, connected FROM clients")?;
@@ -631,7 +627,7 @@ impl Engine {
             Input::Datagram { ts, src_ip, payload } => self.datagram(ts, &src_ip, &payload),
             Input::Tick(now) => self.tick(now),
             Input::DecodeError => bump(&self.counters.decode_errors),
-            Input::SetAliases { ts, entries, only_if_unset } => self.set_aliases(ts, entries, only_if_unset),
+            Input::SetAliases { ts, entries } => self.set_aliases(ts, entries, false),
             Input::SetState { ts, state } => self.set_state(ts, state),
             Input::ThreatFound { ts, kind, bssid, device_mac, data, notify } => {
                 self.writer.exec(
@@ -732,7 +728,9 @@ impl Engine {
         let old_inform = if snap.has_vap_table { live.raw_informs.insert(mac, Arc::new(payload)) } else { None };
         live.attribute(&snap.ap);
         let prev = live.devices.remove(&mac);
-        let known = if prev.is_none() { live.known_devices.remove(&mac) } else { None };
+        if prev.is_none() {
+            live.known_devices.remove(&mac);
+        }
         // An upgrade apctl sent has landed: the AP reports the new version. One
         // event says so, not also a firmware change (see `lifecycle_events`).
         if let Some(v) = &snap.ap.version
@@ -742,7 +740,7 @@ impl Engine {
             events.push(Event::device(ts, EventKind::ApUpgraded, mac, json!({ "from": j.from, "to": v, "custom": j.custom })));
         }
         let updated = if snap.has_vap_table { self.update_clients(&mut live, ts, &snap.clients) } else { Vec::new() };
-        let (view, old_snapshot) = device_view(ts, snap, prev, known.as_ref());
+        let (view, old_snapshot) = device_view(ts, snap, prev);
         live.devices.insert(mac, view);
         drop(live);
         drop((old_inform, old_snapshot));
@@ -780,7 +778,7 @@ impl Engine {
                 .as_array()
                 .into_iter()
                 .flatten()
-                .any(|c| c["fixed_ap_enabled"].as_bool() == Some(true) && crate::settings::doc_mac(&c["fixed_ap_mac"]).is_some_and(|m| changed.contains(&m)))
+                .any(|c| apcfg::flag(c, "fixed_ap_enabled", false) && crate::settings::doc_mac(&c["fixed_ap_mac"]).is_some_and(|m| changed.contains(&m)))
         });
         if locked.is_some_and(|(locked, _)| locked) {
             crate::stun::poke_all(&self.live.read().unwrap());
@@ -950,12 +948,16 @@ impl Engine {
         let system = new_system.as_deref().unwrap_or(&previous.system_cfg);
         let mut data = serde_json::Map::new();
         data.insert("cfgversion".into(), p["cfgversion"].clone());
-        for (field, new, old, redacted) in [("mgmt_cfg", &new_mgmt, &previous.mgmt_cfg, redacted[0]), ("system_cfg", &new_system, &previous.system_cfg, redacted[1])] {
-            let Some(new) = new else { continue };
+        // Each field the push carries as it is stored: secrets masked. A masked
+        // previous push is compared with it.
+        let [mgmt_stored, system_stored] = [&new_mgmt, &new_system].map(|n| n.as_deref().map(cfgdiff::redact));
+        let fields = [("mgmt_cfg", &new_mgmt, &mgmt_stored, &previous.mgmt_cfg, redacted[0]), ("system_cfg", &new_system, &system_stored, &previous.system_cfg, redacted[1])];
+        for (field, new, masked, old, redacted) in fields {
+            let (Some(new), Some(masked)) = (new, masked) else { continue };
             let summary = if old.is_empty() {
                 json!({ "baseline": true, "lines": new.lines().count() })
             } else if redacted {
-                cfgdiff::diff(old, &cfgdiff::redact(new)).summary()
+                cfgdiff::diff(old, masked).summary()
             } else {
                 cfgdiff::diff(old, new).summary()
             };
@@ -987,8 +989,8 @@ impl Engine {
                 Sql::Text(mac.to_string()),
                 Sql::Integer(ts),
                 cfgversion.clone().into(),
-                new_mgmt.as_deref().map(cfgdiff::redact).into(),
-                new_system.as_deref().map(cfgdiff::redact).into(),
+                mgmt_stored.into(),
+                system_stored.into(),
             ],
         );
         // Dry run: what would apctl have pushed for the same AP at this moment?
@@ -1003,7 +1005,7 @@ impl Engine {
                 };
                 // Masked when a field the push does not carry is the stored copy's.
                 let masked = (redacted[0] && new_mgmt.is_none()) || (redacted[1] && new_system.is_none());
-                Some(self.dry_run(render, ts, &req, cfgversion.as_deref(), mgmt, masked))
+                Some(self.dry_run(render, ts, &req, mgmt, masked))
             }
             _ => None,
         };
@@ -1044,7 +1046,7 @@ impl Engine {
     /// Renders the AP's config for `req` and compares it with the push (its
     /// `mgmt` and `req.previous_system_cfg`, with secrets masked if `redacted`):
     /// stored, and summed up for the event.
-    fn dry_run(&self, render: &crate::dryrun::RenderFn, ts: Ts, req: &crate::dryrun::RenderRequest, cfgversion: Option<&str>, mgmt: &str, redacted: bool) -> Value {
+    fn dry_run(&self, render: &crate::dryrun::RenderFn, ts: Ts, req: &crate::dryrun::RenderRequest, mgmt: &str, redacted: bool) -> Value {
         let system = req.previous_system_cfg.unwrap_or_default();
         let result = render(req).map(|ours| crate::dryrun::compare(&ours, mgmt, system, redacted, false));
         let (matches, payload) = match &result {
@@ -1053,8 +1055,8 @@ impl Engine {
         };
         self.writer.exec(
             Db::Config,
-            "INSERT INTO dryrun_results (ts, mac, cfgversion, matches, comparison) VALUES (?1, ?2, ?3, ?4, ?5)",
-            vec![Sql::Integer(ts), Sql::Text(req.device_mac.to_string()), cfgversion.map(str::to_string).into(), Sql::Integer(matches as i64), Sql::Text(payload)],
+            "INSERT INTO dryrun_results (ts, mac, matches, comparison) VALUES (?1, ?2, ?3, ?4)",
+            vec![Sql::Integer(ts), Sql::Text(req.device_mac.to_string()), Sql::Integer(matches as i64), Sql::Text(payload)],
         );
         // Each field's counts: a mismatch names the field that differs, and says
         // when only the order of its lines does (no line added, removed or changed).
@@ -1208,22 +1210,28 @@ impl Engine {
     ///
     /// Only the names are changed under the live view's lock; they are
     /// stored, and the renames recorded, once it is released.
+    ///
+    /// Values are trimmed, and cut to [`MAX_ALIAS`]/[`MAX_NOTE`] characters:
+    /// the API refuses longer ones, so only an import's are cut.
     fn set_aliases(&self, ts: Ts, entries: Vec<AliasEdit>, only_if_unset: bool) {
-        let clean = |v: Option<String>| v.map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+        let clean = |v: Option<String>, max: usize| v.map(|s| cut(s.trim(), max).to_string()).filter(|s| !s.is_empty());
         // Each change: the client, its new alias and note, and for a rename its old alias and its AP.
         let mut changes = Vec::new();
         let mut live = self.live.write().unwrap();
         for AliasEdit { mac, alias, note } in entries {
-            let (alias, mut note) = (clean(alias), clean(note));
-            let old = live.aliases.get(&mac).cloned().unwrap_or_default();
+            let (alias, note) = (clean(alias, MAX_ALIAS), clean(note, MAX_NOTE));
+            let old = live.aliases.get(&mac);
             // An import only adds names: an entry without one, or for a client
-            // already named, changes nothing, and a note it lacks is kept.
-            if only_if_unset {
-                if alias.is_none() || old.alias.is_some() {
+            // already named, changes nothing, and a note apctl has is kept.
+            let note = if only_if_unset {
+                if alias.is_none() || old.is_some_and(|o| o.alias.is_some()) {
                     continue;
                 }
-                note = note.or(old.note.clone());
-            }
+                old.and_then(|o| o.note.clone()).or(note)
+            } else {
+                note
+            };
+            let old = old.cloned().unwrap_or_default();
             if old.alias == alias && old.note == note {
                 continue;
             }
@@ -1560,12 +1568,11 @@ impl Engine {
         bump(&self.counters.logs);
         self.writer.exec(
             Db::Logs,
-            "INSERT INTO logs (ts, device_mac, src_ip, facility, severity, program, msg) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            "INSERT INTO logs (ts, device_mac, src_ip, severity, program, msg) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             vec![
                 Sql::Integer(line.ts),
                 line.device_mac.map(|m| m.to_string()).into(),
                 Sql::Text(line.src_ip),
-                line.facility.into(),
                 line.severity.into(),
                 line.program.into(),
                 Sql::Text(line.msg),
@@ -1962,8 +1969,7 @@ fn lifecycle_events(ts: Ts, a: &crate::model::ApSample, prev: Option<&DeviceView
 
 /// The AP's live view after an inform at `ts`, and the snapshot it replaces
 /// (if whole), for the caller to drop once the lock is released.
-fn device_view(ts: Ts, snap: Snapshot, prev: Option<DeviceView>, known: Option<&KnownDevice>) -> (DeviceView, Option<Snapshot>) {
-    let first_seen = prev.as_ref().map(|p| p.first_seen).or(known.map(|k| k.first_seen)).unwrap_or(ts);
+fn device_view(ts: Ts, snap: Snapshot, prev: Option<DeviceView>) -> (DeviceView, Option<Snapshot>) {
     match prev {
         Some(mut p) => {
             // Without a VAP table the inform says nothing of radios, VAPs or clients: keep the last full picture.
@@ -1975,14 +1981,13 @@ fn device_view(ts: Ts, snap: Snapshot, prev: Option<DeviceView>, known: Option<&
                 p.snapshot.ap = snap.ap;
                 None
             };
-            (DeviceView { online: true, first_seen, last_seen: ts, ..p }, old)
+            (DeviceView { online: true, last_seen: ts, ..p }, old)
         }
         None => {
             let view = DeviceView {
                 last_full_inform: if snap.has_vap_table { ts } else { 0 },
                 snapshot: snap,
                 online: true,
-                first_seen,
                 last_seen: ts,
                 interval: DEFAULT_INTERVAL,
                 last_config_push: None,
@@ -2044,12 +2049,13 @@ fn presence(live: &Live) -> HashMap<Mac, bool> {
 }
 
 /// The AP and its new `fixed_ap_available`, when this device record is an AP
-/// (it has radios) in `aps` whose stored value (none reads as available) differs.
+/// (it has radios) in `aps` whose stored value (read as the render reads it: none
+/// is available) differs.
 fn availability_change(doc: &Value, aps: &HashMap<Mac, bool>) -> Option<(Mac, bool)> {
     let mac = crate::settings::doc_mac(&doc["mac"])?;
     let available = *aps.get(&mac)?;
     let has_radios = doc["radio_table"].as_array().is_some_and(|r| !r.is_empty());
-    (has_radios && doc["fixed_ap_available"].as_bool().unwrap_or(true) != available).then_some((mac, available))
+    (has_radios && apcfg::flag(doc, "fixed_ap_available", true) != available).then_some((mac, available))
 }
 
 /// Writes `fixed_ap_available` into the records of the APs in `aps` whose value
@@ -2065,11 +2071,34 @@ fn mark_available(state: &mut Value, aps: &HashMap<Mac, bool>) -> Vec<Mac> {
     changed
 }
 
-/// The names (and notes) the settings' clients were given in the other
+/// The longest alias a client is given, in characters once trimmed.
+pub const MAX_ALIAS: usize = 64;
+/// The longest note a client is given, in characters once trimmed.
+pub const MAX_NOTE: usize = 500;
+
+/// Why an alias edit would not be stored as given: an alias or a note longer
+/// than its limit once trimmed (as `set_aliases` would cut it).
+pub fn alias_error(alias: Option<&str>, note: Option<&str>) -> Option<String> {
+    let over = |v: Option<&str>, max: usize| v.is_some_and(|v| v.trim().chars().count() > max);
+    if over(alias, MAX_ALIAS) {
+        Some(format!("alias longer than {MAX_ALIAS} characters"))
+    } else if over(note, MAX_NOTE) {
+        Some(format!("note longer than {MAX_NOTE} characters"))
+    } else {
+        None
+    }
+}
+
+/// `s` cut to its first `max` characters, without what that leaves trailing.
+fn cut(s: &str, max: usize) -> &str {
+    s.char_indices().nth(max).map_or(s, |(i, _)| s[..i].trim_end())
+}
+
+/// The names (and notes) the managed site's clients were given in the other
 /// controller, as alias edits: each client with a MAC and a name.
 fn imported_names(state: &Value) -> Vec<AliasEdit> {
-    let text = |v: &Value| v.as_str().map(str::trim).filter(|s| !s.is_empty()).map(str::to_string);
-    let clients = state["clients"].as_array().into_iter().flatten();
+    let text = |v: &Value| v.as_str().map(str::to_string);
+    let clients = crate::settings::docs(state, "clients");
     clients.filter_map(|c| Some(AliasEdit { mac: crate::settings::doc_mac(&c["mac"])?, alias: Some(text(&c["name"])?), note: text(&c["note"]) })).collect()
 }
 
@@ -2239,8 +2268,8 @@ mod tests {
         assert_eq!(keys(&s["radios"][0]), "antenna_gain bw channel cu_interf cu_self_rx cu_self_tx cu_total max_txpower min_txpower noise_floor radio tx_power");
         assert_eq!(
             keys(&s["vaps"][0]),
-            "avg_client_signal bssid channel essid num_sta radio rx_bcast rx_bytes rx_dropped rx_mcast rx_packets satisfaction tx_bcast tx_bytes tx_dropped \
-             tx_errors tx_mcast tx_packets tx_retries wifi_tx_attempts wifi_tx_dropped"
+            "avg_client_signal bssid channel essid num_sta radio rx_bcast rx_bytes rx_mcast rx_packets satisfaction tx_bcast tx_bytes tx_dropped \
+             tx_mcast tx_packets tx_retries wifi_tx_attempts wifi_tx_dropped"
         );
     }
 
@@ -2320,11 +2349,12 @@ mod tests {
         feed(&mut h, AP1, 0);
         feed(&mut h, AP2, 0);
         h.engine.handle(Input::Tick(30));
-        // AP1 informs to apctl, so the other controller's `false` is replaced;
-        // AP3 is not heard of, so its value is kept as imported.
+        // AP1 informs to apctl, so the other controller's `false` (as a string,
+        // which the render reads as false too) is replaced; AP3 is not heard of,
+        // so its value is kept as imported.
         let ap3 = "02:00:00:00:00:03";
         h.engine.set_state(40, json!({ "devices": [
-            { "mac": AP1, "radio_table": radios, "fixed_ap_available": false },
+            { "mac": AP1, "radio_table": radios, "fixed_ap_available": "false" },
             { "mac": AP2, "radio_table": radios },
             { "mac": ap3, "radio_table": radios, "fixed_ap_available": false },
         ] }));
@@ -2478,7 +2508,7 @@ mod tests {
         let mut h = harness();
         let mac: Mac = C1.parse().unwrap();
         let set = |h: &mut Harness, alias: Option<&str>, only_if_unset: bool| {
-            h.engine.handle(Input::SetAliases { ts: 1, entries: vec![AliasEdit { mac, alias: alias.map(str::to_string), note: None }], only_if_unset });
+            h.engine.set_aliases(1, vec![AliasEdit { mac, alias: alias.map(str::to_string), note: None }], only_if_unset);
         };
         set(&mut h, Some("  Kitchen speaker "), false);
         assert_eq!(h.live.read().unwrap().aliases[&mac].alias.as_deref(), Some("Kitchen speaker"));
@@ -2489,6 +2519,15 @@ mod tests {
         let renames = stored(&h, EventKind::ClientRenamed);
         assert_eq!(renames.len(), 2, "{renames:?}");
         assert_eq!(renames[1]["from"], "Kitchen speaker");
+    }
+
+    #[test]
+    fn alias_limits_count_trimmed_characters() {
+        let alias = |n: usize| format!(" {} ", "é".repeat(n));
+        assert_eq!(alias_error(Some(&alias(MAX_ALIAS)), Some(&"n".repeat(MAX_NOTE))), None, "padding is not counted");
+        assert_eq!(alias_error(Some(&alias(MAX_ALIAS + 1)), None).as_deref(), Some("alias longer than 64 characters"));
+        assert_eq!(alias_error(None, Some(&"n".repeat(MAX_NOTE + 1))).as_deref(), Some("note longer than 500 characters"));
+        assert_eq!(cut("ab cd", 3), "ab", "nothing trailing is left after a cut");
     }
 
     #[test]
@@ -2581,7 +2620,7 @@ mod tests {
         let mut h = harness();
         let edit = |mac: &str, alias: &str| AliasEdit { mac: mac.parse().unwrap(), alias: Some(alias.into()), note: None };
         let entries = vec![edit(C1, "Speaker"), edit("02:00:00:00:01:02", "Printer"), edit("02:00:00:00:01:03", "")];
-        h.engine.handle(Input::SetAliases { ts: 1, entries, only_if_unset: true });
+        h.engine.set_aliases(1, entries, true);
         let msgs: Vec<LiveMsg> = std::iter::from_fn(|| h.rx.try_recv().ok()).collect();
         let renames: Vec<_> = msgs.iter().filter_map(|m| match m { LiveMsg::Event(e) if e.kind == EventKind::ClientRenamed => Some(e.client_mac), _ => None }).collect();
         let lists = msgs.iter().filter(|m| matches!(m, LiveMsg::Clients)).count();
@@ -2589,7 +2628,7 @@ mod tests {
         assert_eq!(h.live.read().unwrap().aliases.len(), 2);
         assert_eq!(stored(&h, EventKind::ClientRenamed).len(), 2, "each rename is still its own event");
         // A single rename names its client.
-        h.engine.handle(Input::SetAliases { ts: 2, entries: vec![edit(C1, "Kitchen speaker")], only_if_unset: false });
+        h.engine.handle(Input::SetAliases { ts: 2, entries: vec![edit(C1, "Kitchen speaker")] });
         let renames: Vec<_> = std::iter::from_fn(|| h.rx.try_recv().ok()).filter_map(|m| match m { LiveMsg::Event(e) => Some(e.client_mac), _ => None }).collect();
         assert_eq!(renames, [C1.parse().ok()]);
     }
@@ -2600,10 +2639,10 @@ mod tests {
         let (c2, c3): (Mac, Mac) = ("02:00:00:00:01:02".parse().unwrap(), "02:00:00:00:01:03".parse().unwrap());
         let edit = |mac: Mac, alias: Option<&str>, note: Option<&str>| AliasEdit { mac, alias: alias.map(str::to_string), note: note.map(str::to_string) };
         let entries = vec![edit(c2, None, Some("behind the TV")), edit(c3, None, Some("guest laptop"))];
-        h.engine.handle(Input::SetAliases { ts: 1, entries, only_if_unset: false });
+        h.engine.handle(Input::SetAliases { ts: 1, entries });
         // One import entry names a client that only has a note; another has no name at all.
         let entries = vec![edit(c2, Some("TV"), None), edit(c3, Some(""), None)];
-        h.engine.handle(Input::SetAliases { ts: 2, entries, only_if_unset: true });
+        h.engine.set_aliases(2, entries, true);
         let live = h.live.read().unwrap();
         assert_eq!((live.aliases[&c2].alias.as_deref(), live.aliases[&c2].note.as_deref()), (Some("TV"), Some("behind the TV")));
         assert_eq!((live.aliases[&c3].alias.as_deref(), live.aliases[&c3].note.as_deref()), (None, Some("guest laptop")));
@@ -2612,33 +2651,43 @@ mod tests {
     #[test]
     fn an_import_names_the_clients_not_named_in_apctl() {
         let mut h = harness();
-        let [c1, c2, c3, c4]: [Mac; 4] = [C1, "02:00:00:00:01:02", "02:00:00:00:01:03", "02:00:00:00:01:04"].map(|m| m.parse().unwrap());
+        let [c1, c2, c3, c4, c5, c6, c7]: [Mac; 7] =
+            [C1, "02:00:00:00:01:02", "02:00:00:00:01:03", "02:00:00:00:01:04", "02:00:00:00:01:05", "02:00:00:00:01:06", "02:00:00:00:01:07"].map(|m| m.parse().unwrap());
         let edit = |mac: Mac, alias: Option<&str>, note: Option<&str>| AliasEdit { mac, alias: alias.map(str::to_string), note: note.map(str::to_string) };
-        h.engine.handle(Input::SetAliases { ts: 1, entries: vec![edit(c1, Some("Kitchen speaker"), None), edit(c2, None, Some("behind the TV"))], only_if_unset: false });
+        let entries = vec![edit(c1, Some("Kitchen speaker"), None), edit(c2, None, Some("behind the TV")), edit(c5, None, Some("on the shelf"))];
+        h.engine.handle(Input::SetAliases { ts: 1, entries });
         let import = |h: &mut Harness, ts: Ts, laptop: &str| {
             let clients = json!([
                 { "mac": C1, "name": "Speaker", "note": "imported" },
                 { "mac": "02:00:00:00:01:02", "name": " TV " },
                 { "mac": "02:00:00:00:01:03", "name": laptop, "note": "guest" },
                 { "mac": "02:00:00:00:01:04", "name": "  " },
+                { "mac": "02:00:00:00:01:05", "name": "Radio", "note": "imported" },
+                { "mac": "02:00:00:00:01:06", "name": format!("  {}  ", "é".repeat(70)), "note": "n".repeat(600) },
+                { "mac": "02:00:00:00:01:07", "name": "Elsewhere", "site_id": "other" },
                 { "mac": "nope", "name": "Nobody" },
             ]);
-            h.engine.handle(Input::SetState { ts, state: json!({ "clients": clients }) });
+            let devices = json!([{ "mac": AP1, "site_id": "home" }]);
+            h.engine.handle(Input::SetState { ts, state: json!({ "clients": clients, "devices": devices }) });
         };
         import(&mut h, 2, "Laptop");
         let names = |h: &Harness| {
             let live = h.live.read().unwrap();
-            [c1, c2, c3, c4].map(|m| live.aliases.get(&m).map(|a| (a.alias.clone().unwrap_or_default(), a.note.clone().unwrap_or_default())))
+            [c1, c2, c3, c4, c5, c6, c7].map(|m| live.aliases.get(&m).map(|a| (a.alias.clone().unwrap_or_default(), a.note.clone().unwrap_or_default())))
         };
         let named = |a: &str, n: &str| Some((a.to_string(), n.to_string()));
-        // Named in apctl: kept, note and all. Only a note: named, the note kept. No name: left out.
-        let expected = [named("Kitchen speaker", ""), named("TV", "behind the TV"), named("Laptop", "guest"), None];
+        // Named in apctl: kept, note and all. Only a note: named, apctl's note kept over the import's.
+        // No name: left out. Too long: cut to the limits. Another site's: left out.
+        let expected = [
+            named("Kitchen speaker", ""), named("TV", "behind the TV"), named("Laptop", "guest"), None, named("Radio", "on the shelf"),
+            named(&"é".repeat(MAX_ALIAS), &"n".repeat(MAX_NOTE)), None,
+        ];
         assert_eq!(names(&h), expected);
-        assert_eq!(h.live.read().unwrap().aliases.len(), 3);
+        assert_eq!(h.live.read().unwrap().aliases.len(), 5);
         // A later import names no one anew: each name it has is one apctl now has too.
         import(&mut h, 3, "Work laptop");
         assert_eq!(names(&h), expected);
-        assert_eq!(stored(&h, EventKind::ClientRenamed).len(), 3, "one rename in apctl, two by the first import");
+        assert_eq!(stored(&h, EventKind::ClientRenamed).len(), 5, "one rename in apctl, four by the first import");
     }
 
     #[test]
@@ -3007,9 +3056,8 @@ mod tests {
         h.engine.handle(Input::Reply { ts: 270, mac, payload: json!({ "_type": "setparam", "system_cfg": "x=3" }) });
         assert_eq!(stored(&h, EventKind::DryrunCompared)[0]["error"], "no template");
         flushed(&h.writer);
-        let row: (String, Option<String>, i64) =
-            h.store.read(Db::Config, |c| Ok(c.query_row("SELECT mac, cfgversion, matches FROM dryrun_results", [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?)).unwrap();
-        assert_eq!(row, (AP1.to_string(), Some("v2".into()), 0));
+        let row: (String, i64) = h.store.read(Db::Config, |c| Ok(c.query_row("SELECT mac, matches FROM dryrun_results", [], |r| Ok((r.get(0)?, r.get(1)?)))?)).unwrap();
+        assert_eq!(row, (AP1.to_string(), 0));
         // The event names the field that differs, and when only the order does;
         // the stored comparison has the counts without the diffs' text.
         h.engine.set_renderer(Arc::new(|_: &crate::dryrun::RenderRequest| -> anyhow::Result<crate::dryrun::Rendered> { Ok(("cfgversion=v2\na=9".into(), "y=1\nx=4".into())) }));
