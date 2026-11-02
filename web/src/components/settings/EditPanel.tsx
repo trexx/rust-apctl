@@ -34,3 +34,20 @@ export function EditPanel({
     </div>
   );
 }
+
+/**
+ * A settings section before any settings are imported: its title, and where
+ * to import them (the server has none to show, and answers 409).
+ */
+export function NotImported({ title }: { title: string }) {
+  return (
+    <div className="panel">
+      <div className="panel-head">
+        <b>{title}</b>
+        <span className="muted small">
+          no settings imported: import them on the Settings page
+        </span>
+      </div>
+    </div>
+  );
+}

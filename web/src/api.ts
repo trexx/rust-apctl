@@ -1636,8 +1636,8 @@ export interface SiteSettings {
 
 export const useSiteSettings = () => useQuery({ queryKey: keys.settings("site"), queryFn: getting<SiteSettings>("/api/settings/site") });
 export const useWlanSettings = () => useQuery({ queryKey: keys.settings("wlans"), queryFn: getting<WlanSettingsList>("/api/settings/wlans") });
-export const useDeviceSettings = (mac: Mac) =>
-  useQuery({ queryKey: keys.settings("device", mac), queryFn: getting<DeviceSettings>(`/api/settings/devices/${mac}`) });
+export const useDeviceSettings = (mac: Mac, enabled = true) =>
+  useQuery({ queryKey: keys.settings("device", mac), queryFn: getting<DeviceSettings>(`/api/settings/devices/${mac}`), enabled });
 export const wlanPassphrase = (id: string) => get<{ passphrase: string | null }>(`/api/settings/wlans/${id}/passphrase`);
 
 /** Previews (or, with `save`, saves) a change to an SSID, a speed limit, an AP or the site. */

@@ -1,8 +1,8 @@
-import { useDeviceSettings } from "../../../api";
+import { useDeviceSettings, useSettingsState } from "../../../api";
 import type { RadioSettings } from "../../../api";
 import { band, dbm } from "../../../format";
 import { QueryNote } from "../../common";
-import { EditPanel } from "../EditPanel";
+import { EditPanel, NotImported } from "../EditPanel";
 import { DeviceEditor } from "./DeviceEditor";
 
 /** One radio's settings in a line (the width it runs at, and the one set when that is wider). */
@@ -14,7 +14,10 @@ const radioSummary = (r: RadioSettings) =>
  * only to them, so that nobody else loads it).
  */
 export function DeviceSettingsPanel({ mac }: { mac: string }) {
-  const s = useDeviceSettings(mac);
+  const state = useSettingsState().data;
+  const none = !!state && !state.summary;
+  const s = useDeviceSettings(mac, !none);
+  if (none) return <NotImported title="Settings" />;
   if (!s.data) return <QueryNote q={s} panel />;
   const d = s.data;
   return (

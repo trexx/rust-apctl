@@ -1,11 +1,12 @@
 import { useState } from "react";
-import { useCanEdit, useUserGroups } from "../../api";
+import { useCanEdit, useSettingsState, useUserGroups } from "../../api";
 import { speed } from "../../format";
 import { QueryNote } from "../common";
 import type { UserGroup } from "../../api";
 import { Row, TextInput, useSettingsForm } from "./form";
 import type { Fields } from "./form";
 import { EditorShell } from "./Review";
+import { NotImported } from "./EditPanel";
 import { ListPanel } from "./ListPanel";
 
 /** A limit in kbps as the Mbps text of its field; empty for none. */
@@ -83,8 +84,11 @@ function SpeedLimitEditor({
 
 /** Speed limits (user groups): used by SSIDs and by single clients. */
 export function SpeedLimitsPanel() {
-  const g = useUserGroups();
+  const state = useSettingsState().data;
+  const none = !!state && !state.summary;
+  const g = useUserGroups(!none);
   const readOnly = !useCanEdit();
+  if (none) return <NotImported title="Speed limits" />;
   if (!g.data) return <QueryNote q={g} panel />;
   const { active, groups } = g.data;
   return (
