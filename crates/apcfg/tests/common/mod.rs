@@ -172,7 +172,9 @@ pub fn assert_matches(what: &str, ours: &str, captured: &str) -> (usize, usize) 
     (identical, raw_cap.len())
 }
 
-/// The keys `SANITISED` covers, for checking no stale allow-list entry hides a change.
-pub fn sanitised_keys() -> Vec<&'static str> {
-    SANITISED.iter().map(|(k, ..)| *k).collect()
+/// The `SANITISED` entries (key, our value) that match no line of the given renders: a
+/// stale entry, which could hide a change.
+pub fn unused_sanitised(cfgs: &[&str]) -> Vec<(&'static str, &'static str)> {
+    let used = |k: &str, v: &str| cfgs.iter().flat_map(|c| c.lines()).any(|l| line_kv(l) == (k, v));
+    SANITISED.iter().filter(|(k, v, ..)| !used(k, v)).map(|(k, v, ..)| (*k, *v)).collect()
 }

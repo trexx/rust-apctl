@@ -37,6 +37,15 @@ fn ap_u_matches_the_last_push() {
     golden(AP_U);
 }
 
+/// Each sanitiser artefact `normalise` replaces is in one of the last pushes' renders.
+#[test]
+fn every_sanitiser_artefact_is_still_needed() {
+    let Some(_) = common::fixtures() else { return };
+    let state = state();
+    let renders = [AP_B, AP_U].map(|ap| render(&state, ap, "x").rendered.system_cfg);
+    assert_eq!(common::unused_sanitised(&renders.each_ref().map(String::as_str)), []);
+}
+
 /// With nothing changed, the allocation written back equals the stored `config_meta`.
 #[test]
 fn config_meta_round_trips() {
