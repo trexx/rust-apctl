@@ -267,10 +267,12 @@ pub(crate) fn client_names(s: &AppState) -> ClientNames {
 }
 
 /// A client (its settings document) as messages name it: as the pages do, by its
-/// alias in apctl; else its name in the settings, else its host name, else its MAC.
+/// alias in apctl; else its name in the settings, else its host name (each when
+/// not blank), else its MAC.
 pub(crate) fn client_label<'a>(c: &'a Value, names: &'a ClientNames) -> &'a str {
     let alias = doc_mac(&c["mac"]).and_then(|m| names.get(&m)).map(String::as_str);
-    alias.or(c["name"].as_str()).or(c["hostname"].as_str()).or(c["mac"].as_str()).unwrap_or("?")
+    let named = [c["name"].as_str(), c["hostname"].as_str()].into_iter().flatten().find(|n| !n.trim().is_empty());
+    alias.or(named).or(c["mac"].as_str()).unwrap_or("?")
 }
 
 /// [`device_label`] from the AP's record alone: its MAC written `aa:bb:..`
@@ -2548,6 +2550,10 @@ mod tests {
         let names = ClientNames::from([("02:00:00:00:00:99".parse().unwrap(), "Backups".to_string())]);
         let e = DeviceEdit { client_names: names, ..device_edit(AP1, static_ip("192.168.1.22", "192.168.1.1")) };
         assert!(apply_device(&mut s.clone(), &e).unwrap_err().ends_with("the client Backups"));
+        // A blank name or host name is passed over, down to the MAC.
+        let label = |c: Value| client_label(&c, &ClientNames::new()).to_string();
+        assert_eq!(label(json!({ "mac": "02:00:00:00:00:99", "name": " ", "hostname": "nas" })), "nas");
+        assert_eq!(label(json!({ "mac": "02:00:00:00:00:99", "name": "", "hostname": "" })), "02:00:00:00:00:99");
         assert!(dev(&mut s, json!({ "config_network": { "type": "static", "ip": "192.168.1.20", "netmask": "255.255.255.0", "gateway": "192.168.1.1" } })).unwrap_err().contains("dns1"));
         dev(&mut s, static_ip("192.168.1.20", "192.168.1.1")).unwrap();
         assert_eq!(s["devices"][0]["config_network"]["ip"], "192.168.1.20");
