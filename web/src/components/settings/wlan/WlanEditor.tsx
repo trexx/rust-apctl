@@ -42,7 +42,11 @@ export function WlanEditor({
       : x;
   const setProtection = (p: Protection) =>
     setForm((x) => settle({ ...x, protection: p, pmf_mode: undefined }));
-  /** Force Wi-Fi 4 clears what it can't be combined with, as the official UI does. */
+  /**
+   * Force Wi-Fi 4 clears what it can't be combined with, as the official UI
+   * does. WPA3 and WPA2/WPA3 become WPA2; Open and WPA2 stay, and a security
+   * the editor doesn't offer is left to the server, which settles it on save.
+   */
   const setIot = (on: boolean) =>
     setForm((x) =>
       settle({
@@ -50,7 +54,10 @@ export function WlanEditor({
         enhanced_iot: on,
         ...(on && {
           wlan_bands: ["2g"],
-          protection: x.protection === "open" ? "open" : "wpa2",
+          protection:
+            x.protection === "wpa3" || x.protection === "wpa2_wpa3"
+              ? "wpa2"
+              : x.protection,
           pmf_mode: undefined,
           fast_roaming_enabled: false,
           wpa3_fast_roaming: false,
