@@ -245,11 +245,7 @@ const ClientRow = memo(function ClientRow({
       </td>
       <td className="mono">{c.sample.ip ?? "—"}</td>
       <td>
-        {c.sample.ap_mac ? (
-          <Link to={`/devices/${c.sample.ap_mac}`}>{apText(c)}</Link>
-        ) : (
-          "—"
-        )}
+        <Link to={`/devices/${c.sample.ap_mac}`}>{apText(c)}</Link>
       </td>
       <td>{c.sample.essid ?? "—"}</td>
       <td>{bandChannel(c.sample.radio, c.sample.channel)}</td>

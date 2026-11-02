@@ -604,7 +604,6 @@ export interface SiteMulticast {
     mac: Mac;
     name: string | null;
     vendor: string | null;
-    connected: boolean;
     ap: string | null;
     tx_pkts: number;
     rx_pkts: number;
@@ -688,7 +687,6 @@ export interface ThreatFinding {
   last_seen: number;
   target: string | null;
   detail: string;
-  first_reported: number | null;
   acknowledged: { note: string | null; ts: number } | null;
   vendor: string | null;
 }
@@ -1526,7 +1524,6 @@ export interface MdnsRule {
 /** An AP's radio as its settings document holds it: imported documents can hold a number as text (a channel of "36"), which `radioForm` reads. */
 export interface RadioSettings {
   radio: string;
-  name: string;
   /** "auto", or the channel. */
   channel: number | string;
   /** The width (MHz) it is set to: its own, else the site's for the band, else the band's default. */
@@ -1542,7 +1539,6 @@ export interface RadioSettings {
   sens_level: number | null;
   antenna_gain: number | null;
   antenna_id: number | null;
-  vwire_enabled: boolean | null;
   loadbalance_enabled: boolean | null;
   maxsta: number | null;
   has_blocker: boolean;
@@ -1659,15 +1655,9 @@ export function changeSettings<T>(target: SettingsTarget, patch: Record<string, 
 // ---- Channel AI ----
 
 export interface ChannelPlanResult {
-  band: string;
-  dfs: boolean;
   /** The channels the plan could use (from the Channel AI settings); null: any. */
   allowed: number[] | null;
   plan: PlanEntry[];
-  current_total: number;
-  suggested_total: number;
-  /** The plan is worth applying (clearly better, or an AP must move). */
-  accepted: boolean;
 }
 
 export interface ChannelAiStatus {
