@@ -56,7 +56,10 @@ docker run -d -v apctl-data:/data -v $PWD/users:/users:ro -v $PWD/import.json:/i
 
 `import.json` is the snapshot `informdump import` wrote, readable only by its owner. The
 container runs as uid 65532, which must be able to read it: `sudo chown 65532 import.json`
-for Docker, `podman unshare chown 65532 import.json` for rootless Podman.
+for Docker, `podman unshare chown 65532 import.json` for rootless Podman. Uploading the
+same file on the Settings page brings the SSIDs, the settings editor and the client
+names: an import names the clients apctl has not named after the other controller's
+names, and keeps the names set in apctl.
 
 On Kubernetes (active mode), with the APs' ports on the node and the data on local storage:
 
@@ -128,7 +131,8 @@ target/release/apctl serve --data-dir data/demo --keys data/demo.json --users-fi
 ```
 
 Open <http://127.0.0.1:8090> and log in as `admin` with `demo-password`. Then upload
-`data/demo.json` on the Settings page for the SSIDs and the settings editor.
+`data/demo.json` on the Settings page for the SSIDs, the client names and the settings
+editor.
 
 ## Build
 

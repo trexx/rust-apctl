@@ -47,7 +47,7 @@ pub async fn run(uri: &str, db: &str, out: &Path) -> Result<()> {
     let aps = devices.iter().filter(|d| d.get("type").and_then(Value::as_str) == Some("uap")).count();
     let clients = snapshot["clients"].as_array().map_or(&[][..], Vec::as_slice);
     let named = clients.iter().filter(|u| u.get("name").and_then(Value::as_str).is_some_and(|n| !n.is_empty())).count();
-    eprintln!("read {}; {aps} APs, {with_key} with authkeys; {named} named clients", read.join(", "));
+    eprintln!("read {}; {aps} APs, {with_key} with authkeys; {named} named clients (apctl takes their names for the clients it has not named)", read.join(", "));
 
     crate::write_private(out, &serde_json::to_vec_pretty(&Value::Object(snapshot))?)?;
     eprintln!("wrote {} (mode 0600; contains secrets, keep it out of git)", out.display());
