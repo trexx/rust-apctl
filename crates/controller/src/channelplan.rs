@@ -133,15 +133,16 @@ pub async fn channel_plan(State(s): State<AppState>, Query(q): Query<PlanQuery>)
 /// A channel plan for one band.
 #[derive(Debug, Serialize)]
 pub struct Plan {
-    pub band: String,
-    pub dfs: bool,
     /// The channels the plan could use; `None`: any.
     pub allowed: Option<Vec<i64>>,
+    /// One entry per AP. The plan is worth applying (clearly better, or an AP
+    /// must move) when one of them changes.
     pub plan: Vec<PlanEntry>,
+    /// The site's score now and with the plan, for Channel AI's run event.
+    #[serde(skip_serializing)]
     pub current_total: f64,
+    #[serde(skip_serializing)]
     pub suggested_total: f64,
-    /// Worth applying: clearly better, or an AP must move.
-    pub accepted: bool,
 }
 
 /// One AP in a channel plan.
@@ -199,7 +200,8 @@ pub async fn compute_plan(s: &AppState, radio: String, dfs: bool, allowed: Optio
     if !matches!(radio.as_str(), "ng" | "na") {
         return Err(ApiError::bad("band must be ng or na"));
     }
-    let since = clock::now_ts() - 7 * 86400;
+    let now = clock::now_ts();
+    let since = now - 7 * 86400;
     let r2 = radio.clone();
     let (neigh, spectrum) = read(&s.store, Db::Config, move |c| {
         let mut stmt = c.prepare("SELECT ap_mac, bssid, essid, center_freq, bw, signal FROM neighbors WHERE radio = ?1 AND last_seen >= ?2")?;
@@ -216,17 +218,24 @@ pub async fn compute_plan(s: &AppState, radio: String, dfs: bool, allowed: Optio
         Ok((n, sp))
     })
     .await?;
+    // The BSSIDs our APs used in the last 30 days, as the threat checks know them.
+    let used = {
+        let (threats, store) = (s.threats.clone(), s.store.clone());
+        tokio::task::spawn_blocking(move || threats.used_bssids(&store, now)).await??
+    };
     // What the plan needs from `live`, copied so the lock is not held while it is worked out.
-    let (aps, own_bssids) = plan_inputs(&s.live.read().unwrap(), &radio);
+    let (aps, own_bssids) = plan_inputs(&s.live.read().unwrap(), &radio, &used);
     let work = move || plan_channels(radio, dfs, allowed, pinned, aps, own_bssids, neigh, spectrum);
     Ok(tokio::task::spawn_blocking(work).await?)
 }
 
 /// What a plan for `radio` takes from `live`: the APs online now with the band,
-/// and our BSSIDs on it (BSSID → AP). An AP that went offline is neither moved
-/// nor, by its last signals, steers the others: as after a restart, when only
-/// the APs heard since are in `devices`.
-fn plan_inputs(live: &Live, radio: &str) -> (Vec<PlanAp>, HashMap<String, String>) {
+/// and our BSSIDs (BSSID → AP): the live VAPs', then those `used` names. An AP
+/// that is offline (down since before a restart too), or a BSSID of ours no
+/// longer broadcast (a removed SSID's), is neither moved nor counted as a
+/// neighbour: what the others hear of it belongs to no AP in the plan, so it
+/// steers nothing.
+fn plan_inputs(live: &Live, radio: &str, used: &[crate::threats::UsedBss]) -> (Vec<PlanAp>, HashMap<String, String>) {
     let state = live.state.as_deref();
     let country = state.map_or(apcfg::DEFAULT_COUNTRY, crate::settings::country);
     // The APs' records in the settings, found once (the first of a MAC listed twice, as `device_doc` finds it).
@@ -263,9 +272,12 @@ fn plan_inputs(live: &Live, radio: &str) -> (Vec<PlanAp>, HashMap<String, String
             Some(PlanAp { mac: m.to_string(), name: d.snapshot.ap.hostname.clone(), current: block(radio, ch, width), width, clients: r.num_sta, available, legal })
         })
         .collect();
-    // Our APs' BSSIDs on this band, to separate own signal from neighbours.
-    let own: HashMap<String, String> =
-        own_bssids(live).filter(|(_, v)| v.radio.as_deref() == Some(radio)).map(|(m, v)| (v.bssid.clone(), m.to_string())).collect();
+    // Our APs' BSSIDs, to separate own signal from neighbours. The rows read are this
+    // band's, so a BSSID of ours heard there is its AP's radio on the band.
+    let mut own: HashMap<String, String> = own_bssids(live).map(|(m, v)| (v.bssid.clone(), m.to_string())).collect();
+    for (bssid, ap, _) in used.iter().filter(|u| !u.1.is_empty()) {
+        own.entry(bssid.clone()).or_insert_with(|| ap.clone());
+    }
     (aps, own)
 }
 
@@ -444,12 +456,17 @@ fn plan_channels(
             }
         })
         .collect();
-    Plan { band: radio, dfs, allowed, plan, current_total: current_total.round(), suggested_total: suggested_total.round(), accepted }
+    Plan { allowed, plan, current_total: current_total.round(), suggested_total: suggested_total.round() }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The plan moves an AP: it is worth applying.
+    fn accepted(plan: &Plan) -> bool {
+        plan.plan.iter().any(|p| p.change)
+    }
 
     #[test]
     fn channel_blocks_and_overlap() {
@@ -487,12 +504,20 @@ mod tests {
             let snapshot = crate::model::parse(1000, &p).unwrap();
             live.devices.insert(mac, crate::engine::DeviceView { snapshot, online, last_seen: 1000, interval: 10, last_full_inform: 1000, last_config_push: None });
         }
-        let (aps, own) = plan_inputs(&live, "ng");
+        // Used lately but not live: an AP down since before a restart, and a removed SSID of AP1's;
+        // the live VAP's AP wins over a stale record of its BSSID.
+        let used: Vec<crate::threats::UsedBss> = [("02:00:00:00:01:03", "02:00:00:00:00:03"), ("02:00:00:00:01:04", "02:00:00:00:00:01"), ("02:00:00:00:01:02", "02:00:00:00:00:09"), ("02:00:00:00:01:05", "")]
+            .map(|(b, a)| (b.to_string(), a.to_string(), Some("Home".to_string())))
+            .into();
+        let (aps, own) = plan_inputs(&live, "ng", &used);
         assert_eq!(aps.iter().map(|a| (a.mac.as_str(), a.current.primary)).collect::<Vec<_>>(), [("02:00:00:00:00:01", 6)], "the offline AP is not moved");
         // Its BSSID is still ours, so what the others hear of it is no neighbour; with no AP to
-        // place in the plan, it steers nothing either.
+        // place in the plan, it steers nothing either. So do the used ones.
         assert_eq!(own.get("02:00:00:00:01:02").map(String::as_str), Some("02:00:00:00:00:02"));
-        let neigh = vec![("02:00:00:00:00:01".to_string(), "02:00:00:00:01:02".to_string(), Some("Home".to_string()), Some(2437.0), Some(20.0), Some(-40.0))];
+        assert_eq!((own.get("02:00:00:00:01:03").map(String::as_str), own.get("02:00:00:00:01:04").map(String::as_str)), (Some("02:00:00:00:00:03"), Some("02:00:00:00:00:01")));
+        assert!(!own.contains_key("02:00:00:00:01:05"), "a BSSID with no AP is no AP's");
+        let heard = |bssid: &str| ("02:00:00:00:00:01".to_string(), bssid.to_string(), Some("Home".to_string()), Some(2437.0), Some(20.0), Some(-40.0));
+        let neigh = vec![heard("02:00:00:00:01:02"), heard("02:00:00:00:01:03")];
         let plan = plan_channels("ng".into(), false, None, HashSet::new(), aps, own, neigh, vec![]);
         assert!(plan.plan.iter().all(|p| p.current_reasons.is_empty()), "{plan:?}");
     }
@@ -509,7 +534,7 @@ mod tests {
             ("a".to_string(), "x".to_string(), Some("Next door".to_string()), Some(2412.0), Some(20.0), Some(-60.0)),
         ];
         let plan = plan_channels("ng".into(), false, None, HashSet::new(), aps, own, neigh, vec![]);
-        assert!(plan.accepted, "{plan:?}");
+        assert!(accepted(&plan), "{plan:?}");
         let ch: HashMap<&str, i64> = plan.plan.iter().map(|p| (p.mac.as_str(), p.suggested_channel)).collect();
         assert_ne!(ch["a"], ch["b"]);
         assert_ne!(ch["a"], 1, "a keeps off its neighbour");
@@ -530,7 +555,7 @@ mod tests {
         let aps = vec![ap("in", 5, Some(vec![36, 116]), false), ap("out", 1, None, true)];
         let neigh = vec![("in".to_string(), "x".to_string(), Some("Next door".to_string()), Some(5210.0), Some(80.0), Some(-40.0))];
         let plan = plan_channels("na".into(), true, allowed, HashSet::new(), aps, HashMap::new(), neigh, vec![]);
-        assert!(plan.accepted, "{plan:?}");
+        assert!(accepted(&plan), "{plan:?}");
         let to: HashMap<&str, (i64, bool)> = plan.plan.iter().map(|p| (p.mac.as_str(), (p.suggested_channel, p.not_allowed))).collect();
         assert_eq!((to["in"], to["out"]), ((116, false), (100, true)));
     }
@@ -553,7 +578,7 @@ mod tests {
         let aps = vec![ng_ap("i", 1, 5), ng_ap("j", 6, 2), ng_ap("k", 13, 1)];
         let neigh = vec![ng_neighbour("i", 1, -45.0), ng_neighbour("i", 11, -45.0), ng_neighbour("j", 1, -60.0), ng_neighbour("j", 11, -50.0), ng_neighbour("k", 1, -40.0), ng_neighbour("k", 6, -40.0)];
         let plan = plan_channels("ng".into(), false, Some(vec![1, 6, 11]), HashSet::new(), aps, HashMap::new(), neigh, vec![]);
-        assert!(plan.accepted, "{plan:?}");
+        assert!(accepted(&plan), "{plan:?}");
         let to: HashMap<&str, (i64, bool)> = plan.plan.iter().map(|p| (p.mac.as_str(), (p.suggested_channel, p.change))).collect();
         assert_eq!(to["k"], (11, true), "{plan:?}");
         assert_eq!((to["i"], to["j"]), ((1, false), (6, false)), "j stays, so i stays off its channel: {plan:?}");
@@ -578,7 +603,7 @@ mod tests {
         // So an AP on 6 alone in an even environment stays there.
         let spectrum: Vec<SpectrumRow> = (1..=13).map(|c| ("a".to_string(), c, Some(20), Some(-80.0), Some(10.0))).collect();
         let plan = plan_channels("ng".into(), false, None, HashSet::new(), vec![ng_ap("a", 6, 3)], HashMap::new(), vec![], spectrum);
-        assert!(!plan.accepted && !plan.plan[0].change, "{plan:?}");
+        assert!(!accepted(&plan) && !plan.plan[0].change, "{plan:?}");
     }
 
     #[test]
@@ -586,12 +611,15 @@ mod tests {
         // Channel 13 is not among the planner's own 1, 6 and 11, nor 165 among
         // its 5 GHz blocks; nothing is better elsewhere, so neither moves.
         let plan = plan_channels("ng".into(), false, None, HashSet::new(), vec![ng_ap("a", 13, 1)], HashMap::new(), vec![], vec![]);
-        assert!(!plan.accepted && !plan.plan[0].change && !plan.plan[0].not_allowed, "{plan:?}");
+        assert!(!accepted(&plan) && !plan.plan[0].change && !plan.plan[0].not_allowed, "{plan:?}");
         let ap = PlanAp { mac: "b".into(), name: None, current: block("na", 165, 20), width: 20, clients: 1, available: None, legal: crate::settings::legal_channels(840, "na", 20, false) };
         let plan = plan_channels("na".into(), false, None, HashSet::new(), vec![ap], HashMap::new(), vec![], vec![]);
-        assert!(!plan.accepted && !plan.plan[0].change, "{plan:?}");
+        assert!(!accepted(&plan) && !plan.plan[0].change, "{plan:?}");
         // Settings that leave 13 out move it.
         let plan = plan_channels("ng".into(), false, Some(vec![1, 6, 11]), HashSet::new(), vec![ng_ap("a", 13, 1)], HashMap::new(), vec![], vec![]);
-        assert!(plan.accepted && plan.plan[0].change && plan.plan[0].not_allowed, "{plan:?}");
+        assert!(accepted(&plan) && plan.plan[0].change && plan.plan[0].not_allowed, "{plan:?}");
+        // The reply is what the pages read; the totals are kept for Channel AI's run event.
+        let v = serde_json::to_value(&plan).unwrap();
+        assert_eq!(v.as_object().unwrap().keys().collect::<Vec<_>>(), ["allowed", "plan"]);
     }
 }

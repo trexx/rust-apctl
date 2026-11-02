@@ -78,6 +78,8 @@ enum Parts {
 
 /// GET /api/site/activity: Wi-Fi traffic, retries, clients and multicast,
 /// plus airtime (channel use and interference, `null` with `parts=activity`), bucketed.
+/// With `mac`, one AP's: its page asks with `parts=activity` (each radio's chart has its
+/// own airtime), so one AP's airtime is for API callers only.
 pub async fn activity(State(s): State<AppState>, Query(q): Query<RangeQuery>, Query(p): Query<ActivityParts>) -> Result<Json<Value>, ApiError> {
     let (from, to, tier) = window(&q);
     let bucket = bucket_for(to - from, tier);
@@ -230,8 +232,8 @@ pub async fn top(State(s): State<AppState>, Query(q): Query<RangeQuery>) -> Resu
                 e.0 += d;
                 e.1 += u;
             }
-            // Most traffic first (by MAC among equals).
-            let mut aps: Vec<(String, (f64, f64))> = aps.into_iter().collect();
+            // Most traffic first (by MAC among equals); as with the clients, none without any.
+            let mut aps: Vec<(String, (f64, f64))> = aps.into_iter().filter(|(_, (d, u))| d + u > 0.0).collect();
             aps.sort_by(|a, b| (b.1.0 + b.1.1).total_cmp(&(a.1.0 + a.1.1)).then_with(|| a.0.cmp(&b.0)));
             aps
         })
@@ -269,12 +271,12 @@ fn busiest<T>(per: HashMap<&str, T>, n: usize, amount: impl Fn(&T) -> f64) -> Ve
     list.into_iter().map(|(m, t)| (m.to_string(), t)).collect()
 }
 
-/// A client of a top list: its MAC, name, vendor and whether it is connected,
-/// and the fields of `more` (given what it reports now, if anything).
+/// A client of a top list: its MAC, name and vendor, and the fields of `more`
+/// (given what it reports now, if anything).
 fn listed_client(s: &AppState, live: &Live, mac: &str, more: impl FnOnce(Option<&ClientView>) -> Value) -> Value {
     let m: Option<inform::Mac> = mac.parse().ok();
     let view = m.and_then(|m| live.clients.get(&m));
-    let mut out = json!({ "mac": mac, "name": client_name(live, m), "vendor": m.and_then(|m| s.vendors.lookup(&m)), "connected": view.is_some_and(|c| c.connected) });
+    let mut out = json!({ "mac": mac, "name": client_name(live, m), "vendor": m.and_then(|m| s.vendors.lookup(&m)) });
     if let (Value::Object(o), Value::Object(more)) = (&mut out, more(view)) {
         o.extend(more);
     }
@@ -1461,6 +1463,18 @@ mod tests {
                 }
             }
             assert_eq!(out.as_object().unwrap().len(), expected.as_object().unwrap().len());
+        }
+
+        #[tokio::test]
+        async fn the_top_aps_leave_out_those_without_traffic() {
+            let (s, base, t) = site();
+            // A third AP reporting the same counters all along: no traffic in the window.
+            let m = t.db(Db::Metrics);
+            let row = |k: i64| vec![text("02:00:00:00:03:09"), int(base + k * 300), text("02:00:00:00:00:a3"), text("Home"), text("ng"), int(500), int(700)];
+            insert(&m, "vap_stats", &["bssid", "ts", "ap_mac", "essid", "radio", "rx_bytes", "tx_bytes"], (0..12).map(row).collect());
+            let q = Query(RangeQuery { range: None, from: Some(base), to: Some(base + 3600), band: None, mac: None });
+            let out = ok(top(State(s), q).await);
+            assert_eq!(out["aps"].as_array().unwrap().iter().map(|a| a["mac"].as_str().unwrap()).collect::<Vec<_>>(), [A1, A2]);
         }
 
         #[tokio::test]

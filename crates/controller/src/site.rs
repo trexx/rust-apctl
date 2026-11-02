@@ -195,11 +195,10 @@ fn site_ntp(doc: &mut Value, n: &Value) -> Result<(), String> {
         }
     }
     if doc["setting_preference"].as_str() == Some("auto") {
-        // Going back to automatic restores the pool, as the official controller does.
-        if was_manual || doc[NTP_KEYS[0]].is_null() {
-            for (k, h) in NTP_KEYS.iter().zip(NTP_POOL) {
-                doc[*k] = json!(h);
-            }
+        // Automatic is the pool, as the official controller restores it on going back to
+        // it: the render sends the stored servers whatever the preference says.
+        for (k, h) in NTP_KEYS.iter().zip(NTP_POOL) {
+            doc[*k] = json!(h);
         }
         // Automatic uses the pool: other servers named with it are refused (the pool's own, as read back, pass).
         if let Some(h) = named.iter().zip(NTP_KEYS).find_map(|(h, k)| h.filter(|h| !h.is_empty() && doc[k].as_str() != Some(h))) {
@@ -376,7 +375,11 @@ fn site_view(state: &Value, active: bool, secrets: bool) -> Value {
     });
     let n = setting(state, "ntp");
     let mut ntp = Value::Object(pick(n, &NTP_KEYS));
-    ntp["setting_preference"] = n["setting_preference"].clone();
+    // The APs get the stored servers whatever the preference says: servers other than the
+    // pool read as manual, so the form shows what the APs use.
+    let servers = NTP_KEYS.map(|k| n[k].as_str().unwrap_or_default());
+    let custom = servers != NTP_POOL && servers.iter().any(|h| !h.trim().is_empty());
+    ntp["setting_preference"] = if custom && n["setting_preference"].as_str() != Some("manual") { json!("manual") } else { n["setting_preference"].clone() };
     let sn = setting(state, "snmp");
     let snmp = json!({
         "enabled": sn["enabled"], "enabledV3": sn["enabledV3"], "community": if secrets { sn["community"].clone() } else { Value::Null }, "username": sn["username"],
@@ -592,6 +595,16 @@ mod tests {
         assert_eq!(edit(&mut s.clone(), json!({ "ntp": { "setting_preference": "manual" } })).unwrap_err(), "manual NTP needs at least one server");
         edit(&mut s, json!({ "ntp": { "setting_preference": "manual", "ntp_server_2": "time.example.net" } })).unwrap();
         assert_eq!(servers(&s), ["time.example.net", "", "", ""]);
+        // Imported as automatic (or with no preference) but with other servers: shown as manual,
+        // which the APs get; automatic then restores the pool.
+        for pref in [json!("auto"), Value::Null] {
+            let mut s = s.clone();
+            setting_mut(&mut s, "ntp")["setting_preference"] = pref.clone();
+            assert_eq!(site_view(&s, false, false)["ntp"]["setting_preference"], "manual", "{pref}");
+            edit(&mut s, json!({ "ntp": { "setting_preference": "auto" } })).unwrap();
+            assert_eq!(servers(&s), NTP_POOL);
+            assert_eq!(site_view(&s, false, false)["ntp"]["setting_preference"], "auto");
+        }
     }
 
     #[test]

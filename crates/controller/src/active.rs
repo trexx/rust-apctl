@@ -92,16 +92,11 @@ fn content_digest(mgmt: &str, system: &str, blocked: &str) -> [u8; 32] {
     h.finalize().into()
 }
 
-/// A stored `managed_devices.content`: a digest in hex. A row from before
-/// apctl stored digests holds the rendered text itself, whose digest equals
-/// that of the same config rendered now, so an upgrade pushes nothing again;
-/// true for such a row, to rewrite it with the digest.
-fn stored_digest(content: &str) -> ([u8; 32], bool) {
+/// A stored `managed_devices.content`: a digest in hex. Anything else is no
+/// digest, so the AP gets its config again under a new version.
+fn stored_digest(content: &str) -> Option<[u8; 32]> {
     let mut digest = [0u8; 32];
-    match hex::decode_to_slice(content, &mut digest) {
-        Ok(()) => (digest, false),
-        Err(_) => (Sha256::digest(content.as_bytes()).into(), true),
-    }
+    hex::decode_to_slice(content, &mut digest).ok().map(|()| digest)
 }
 
 pub struct Active {
@@ -246,24 +241,16 @@ impl Active {
             let mut stmt = c.prepare("SELECT mac, cfgversion, content, gcm FROM managed_devices")?;
             let rows = stmt
                 .query_map([], |r| {
-                    let content = r.get::<_, Option<String>>(2)?.map(|c| stored_digest(&c));
+                    let content = r.get::<_, Option<String>>(2)?.and_then(|c| stored_digest(&c));
                     let cfgversion: Option<String> = r.get(1)?;
                     let adopted = cfgversion.as_deref() == Some("");
-                    let managed = Managed { cfgversion: cfgversion.filter(|v| !v.is_empty()), adopted, content: content.map(|c| c.0), gcm: r.get::<_, i64>(3)? != 0, render: None };
-                    Ok((r.get::<_, String>(0)?, managed, content.is_some_and(|c| c.1)))
+                    let managed = Managed { cfgversion: cfgversion.filter(|v| !v.is_empty()), adopted, content, gcm: r.get::<_, i64>(3)? != 0, render: None };
+                    Ok((r.get::<_, String>(0)?, managed))
                 })?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
             Ok(rows)
         })?;
-        let mut legacy = Vec::new();
-        let mut devices = HashMap::new();
-        for (m, d, old) in rows {
-            let Ok(m) = m.parse::<Mac>() else { continue };
-            if old {
-                legacy.push((m, d.clone()));
-            }
-            devices.insert(m, d);
-        }
+        let devices: HashMap<Mac, Managed> = rows.into_iter().filter_map(|(m, d)| Some((m.parse().ok()?, d))).collect();
         let devices = Arc::new(Mutex::new(devices));
         let adoption_cfgs: Arc<Mutex<HashMap<Mac, AdoptionCfg>>> = Default::default();
         // Whichever way an AP is forgotten (reporting or not), the engine drops what is kept here of it.
@@ -277,18 +264,10 @@ impl Active {
             }
         }));
         let cpus = std::thread::available_parallelism().map_or(4, |n| n.get());
-        let active = Active {
+        Ok(Active {
             live, keys, engine, writer, controller, devices, store: store.clone(), adoption_cfgs,
             work: Gate::new(cpus, 64 << 20), strangers: Gate::new((cpus / 2).max(1), 8 << 20), proxies, warned_no_state: AtomicBool::new(false),
-        };
-        // Rows holding the rendered config (with its secrets) get its digest instead.
-        if !legacy.is_empty() {
-            tracing::info!("replacing the stored configs of {} managed APs with their digests", legacy.len());
-        }
-        for (m, d) in legacy {
-            active.persist(m, &d);
-        }
-        Ok(active)
+        })
     }
 
     fn persist(&self, mac: Mac, d: &Managed) {
@@ -593,7 +572,8 @@ impl Active {
         match cmd {
             Ok(cmd) => {
                 tracing::warn!("{mac}: sending firmware upgrade to {}", target.as_deref().unwrap_or("?"));
-                let data = json!({ "target": target, "url": cmd["url"] });
+                // Not the link: a custom one may hold a credential, and the events are open to read-only users.
+                let data = json!({ "target": target });
                 let _ = self.engine.blocking_send(Input::Note(Event::device(ts, EventKind::ApUpgradeSent, mac, data)));
                 Some(cmd)
             }
@@ -957,7 +937,7 @@ mod tests {
     #[tokio::test]
     async fn sends_a_queued_upgrade_once_the_config_is_current() {
         let Some(_) = fixtures() else { return };
-        let rig = rig(true, None);
+        let mut rig = rig(true, None);
         let (_, reply) = inform_as_ap(&rig, &ap_payload("1111111111111111"), KEY, GCM_ZLIB).await;
         let version = reply.unwrap().1["cfgversion"].as_str().unwrap().to_string();
         rig.live.write().unwrap().firmware.enqueue(vec![crate::firmware::Job {
@@ -981,6 +961,9 @@ mod tests {
         let reply = reply.unwrap().1;
         assert_eq!((reply["_type"].as_str(), reply["version"].as_str(), reply["md5sum"].as_str()), (Some("upgrade"), Some("8.8.12.20200"), Some("abc")));
         assert_eq!(reply["url"], "https://fw-download.example/U6M-8.8.12.bin");
+        // The event names the target only: a custom link may hold a credential.
+        let sent = std::iter::from_fn(|| rig.rx.try_recv().ok()).find_map(|i| if let Input::Note(e) = i && e.kind == EventKind::ApUpgradeSent { Some(e.data) } else { None }).unwrap();
+        assert_eq!(sent, json!({ "target": "8.8.12.20200" }));
         // Sent once: the next inform is a heartbeat.
         let (_, reply) = inform_as_ap(&rig, &ap_payload(&version), KEY, GCM_ZLIB).await;
         assert_eq!(reply.unwrap().1["_type"], "noop");
@@ -1319,27 +1302,31 @@ mod tests {
     }
 
     #[test]
-    fn only_a_digest_of_the_config_is_stored_and_old_rows_keep_their_version() {
+    fn only_a_digest_of_the_config_is_stored_and_kept_through_a_restart() {
         let Some(_) = fixtures() else { return };
         let rig = rig(true, None);
         let ap: Mac = AP.parse().unwrap();
         let state = rig.live.read().unwrap().state.clone().unwrap();
         let render = rig.active.placeholder_render(rig.active.current_render(&state, ap), &state, ap, &ap_payload("1")).unwrap();
-        // As written before digests: the rendered text itself, secrets and all.
-        let text = format!("{}\n--\n{}\n--\n{}", render.out.rendered.mgmt_cfg, render.out.rendered.system_cfg, render.blocked);
         let (a, w) = (&rig.active, &rig.active.writer);
-        w.exec(Db::Config, "INSERT INTO managed_devices (mac, cfgversion, content, gcm, updated) VALUES (?1, 'abcdefabcdefabcd', ?2, 1, 0)", vec![Sql::Text(AP.into()), Sql::Text(text)]);
-        flushed(w);
-        // After a restart it reads as the digest of the same render: the config is current, under the version it had.
-        let (tx, _rx) = mpsc::channel(10);
-        let again = Active::new(&a.store, w.clone(), rig.live.clone(), a.keys.clone(), tx, controller(), Default::default()).unwrap();
-        assert_eq!(again.devices.lock().unwrap()[&ap].content, Some(render.digest));
-        assert_eq!(again.decide_version(ap, "abcdefabcdefabcd", &render, false), "abcdefabcdefabcd");
-        // And the row is rewritten with the digest alone.
+        let restart = || {
+            flushed(w);
+            let (tx, _rx) = mpsc::channel(10);
+            Active::new(&a.store, w.clone(), rig.live.clone(), a.keys.clone(), tx, controller(), Default::default()).unwrap()
+        };
+        // A push stores the digest alone; after a restart the config is current, under the version it had.
+        let version = a.decide_version(ap, "abcdefabcdefabcd", &render, false);
         flushed(w);
         let stored: String = a.store.read(Db::Config, |c| Ok(c.query_row("SELECT content FROM managed_devices WHERE mac = ?1", [AP], |r| r.get(0))?)).unwrap();
-        assert_eq!(stored, hex::encode(render.digest));
-        assert_eq!(stored_digest(&stored), (render.digest, false));
+        assert_eq!((stored_digest(&stored), stored.len()), (Some(render.digest), 64));
+        let again = restart();
+        assert_eq!(again.devices.lock().unwrap()[&ap].content, Some(render.digest));
+        assert_eq!(again.decide_version(ap, "abcdefabcdefabcd", &render, false), version);
+        // Anything but a digest is none: the AP gets the config again under a new version.
+        w.exec(Db::Config, "UPDATE managed_devices SET content = 'not a digest' WHERE mac = ?1", vec![Sql::Text(AP.into())]);
+        let again = restart();
+        assert_eq!(again.devices.lock().unwrap()[&ap].content, None);
+        assert_ne!(again.decide_version(ap, "abcdefabcdefabcd", &render, false), version);
         // An AP adopted afresh stays so through a restart (an empty version on disk): its first push gets a new version.
         w.exec(Db::Config, "INSERT OR REPLACE INTO managed_devices (mac, cfgversion, content, gcm, updated) VALUES (?1, '', NULL, 0, 0)", vec![Sql::Text(AP.into())]);
         flushed(w);

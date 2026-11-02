@@ -133,12 +133,13 @@ pub struct Controls<'a> {
     pub usergroup_id: Option<&'a Value>,
 }
 
-/// One client's controls, from the site's entry.
+/// One client's controls, from the site's entry, its flags read as the render
+/// reads them (`"true"` as true).
 pub fn controls<'a>(state: Option<&'a Value>, mac: &Mac) -> Controls<'a> {
     let entry = state.and_then(|s| crate::settings::docs(s, "clients").find(|c| doc_mac(&c["mac"]) == Some(*mac)));
-    let locked_to = entry.filter(|c| c["fixed_ap_enabled"].as_bool() == Some(true)).and_then(|c| doc_mac(&c["fixed_ap_mac"]));
+    let locked_to = entry.filter(|c| apcfg::flag(c, "fixed_ap_enabled", false)).and_then(|c| doc_mac(&c["fixed_ap_mac"]));
     Controls {
-        blocked: entry.and_then(|c| c["blocked"].as_bool()).unwrap_or(false),
+        blocked: entry.is_some_and(|c| apcfg::flag(c, "blocked", false)),
         locked_to: locked_to.map(|m| m.to_string()),
         usergroup_id: entry.map(|c| &c["usergroup_id"]),
     }
@@ -405,5 +406,10 @@ mod tests {
         edit_client(&mut state, mac("aa:bb:cc:00:00:06"), &[("usergroup_id", Value::Null)]);
         assert_eq!(state["clients"].as_array().unwrap().len(), 2);
         assert!(controls(Some(&state), &mac("aa:bb:cc:00:00:04")).blocked && controls(Some(&state), &mac("aa:bb:cc:00:00:05")).blocked);
+        // Flags imported as text read as the render reads them.
+        let state = json!({ "devices": [{ "mac": "02:00:00:00:00:01", "site_id": "s1" }],
+            "clients": [{ "mac": "aa:bb:cc:00:00:07", "blocked": "true", "fixed_ap_enabled": "true", "fixed_ap_mac": "02:00:00:00:00:01", "site_id": "s1" }] });
+        let c = controls(Some(&state), &mac("aa:bb:cc:00:00:07"));
+        assert_eq!((c.blocked, c.locked_to.as_deref(), apcfg::blocked_sta(&state, "s1").as_str()), (true, Some("02:00:00:00:00:01"), "aa:bb:cc:00:00:07"));
     }
 }

@@ -14,7 +14,7 @@ use std::sync::{Arc, LazyLock, Weak};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use apcfg::{flag, oid};
+use apcfg::{Security, flag, oid};
 
 use crate::api::{ApiError, AppState, Json, MacPath, Path, Query};
 use crate::random_hex;
@@ -267,10 +267,12 @@ pub(crate) fn client_names(s: &AppState) -> ClientNames {
 }
 
 /// A client (its settings document) as messages name it: as the pages do, by its
-/// alias in apctl; else its name in the settings, else its host name, else its MAC.
+/// alias in apctl; else its name in the settings, else its host name (each when
+/// not blank), else its MAC.
 pub(crate) fn client_label<'a>(c: &'a Value, names: &'a ClientNames) -> &'a str {
     let alias = doc_mac(&c["mac"]).and_then(|m| names.get(&m)).map(String::as_str);
-    alias.or(c["name"].as_str()).or(c["hostname"].as_str()).or(c["mac"].as_str()).unwrap_or("?")
+    let named = [c["name"].as_str(), c["hostname"].as_str()].into_iter().flatten().find(|n| !n.trim().is_empty());
+    alias.or(named).or(c["mac"].as_str()).unwrap_or("?")
 }
 
 /// [`device_label`] from the AP's record alone: its MAC written `aa:bb:..`
@@ -364,7 +366,7 @@ fn wlans_view(state: &Value, informs: &HashMap<inform::Mac, Arc<Value>>, active:
         .filter(|w| w["attr_hidden_id"].as_str().is_none())
         .map(|w| {
             let mut v = json!({
-                "id": id_of(w), "aps": wlan_aps(state, w), "protection": protection_of(w).map(|p| p.name), "editable": !flag(w, "attr_no_edit", false),
+                "id": id_of(w), "aps": wlan_aps(state, w), "protection": protection_of(w).map(|p| p.name), "security": security_label(w), "editable": !flag(w, "attr_no_edit", false),
                 "has_passphrase": w["x_passphrase"].as_str().is_some_and(|p| !p.is_empty()),
             });
             if let Value::Object(o) = &mut v {
@@ -745,41 +747,53 @@ const PROTECTION: &[Protection] = &[
 ];
 
 /// An SSID's protection as the editor's rules read it: (WPA Personal, WPA3,
-/// WPA2/WPA3 transition). The transition flag means nothing without WPA3.
+/// WPA2/WPA3 transition), its security read as the render reads it
+/// ([`Security::of`]). The transition flag means nothing without WPA3.
 fn psk_wpa3(w: &Value) -> (bool, bool, bool) {
     let wpa3 = flag(w, "wpa3_support", false);
-    (w["security"].as_str() == Some("wpapsk"), wpa3, wpa3 && flag(w, "wpa3_transition", false))
+    (Security::of(w) == Security::Psk, wpa3, wpa3 && flag(w, "wpa3_transition", false))
 }
 
 /// The protection choice of a stored SSID, if it is one the editor offers.
-/// An open SSID's `wpa_mode` means nothing; a missing one is WPA/WPA2 mixed
+/// A missing or unknown security is open, as the render sends it. An open
+/// SSID's `wpa_mode` means nothing; a missing one is WPA/WPA2 mixed
 /// ([`apcfg::wpa_mode`]), which the editor does not offer.
 fn protection_of(w: &Value) -> Option<&'static Protection> {
-    let security = w["security"].as_str()?;
-    if security != "open" && apcfg::wpa_mode(w) != "wpa2" {
-        return None;
-    }
+    let security = match Security::of(w) {
+        Security::Open => "open",
+        Security::Psk if apcfg::wpa_mode(w) == "wpa2" => "wpapsk",
+        _ => return None,
+    };
     let (_, wpa3, transition) = psk_wpa3(w);
     PROTECTION.iter().find(|p| (p.security, p.wpa3_support, p.wpa3_transition) == (security, wpa3, transition))
 }
 
 /// How an SSID's security reads for people: the editor's choices by their
-/// label, anything else from its fields.
-pub(crate) fn security_label(w: &Value) -> String {
+/// label, anything else from its fields as the render sends them. WPA3 goes
+/// out as WPA2 whatever `wpa_mode` says; otherwise wpa1 is WPA alone, wpa2
+/// WPA2 alone and any other mode WPA/WPA2 mixed ([`apcfg::wpa_mode`]).
+pub(crate) fn security_label(w: &Value) -> &'static str {
     if let Some(p) = protection_of(w) {
-        return p.label.into();
+        return p.label;
     }
-    match w["security"].as_str() {
-        Some("open") => "Open".into(),
-        // `wpa_mode` is auto (WPA/WPA2 mixed, also when missing), wpa1 or wpa2.
-        Some("wpapsk") => match apcfg::wpa_mode(w) {
-            "auto" => "WPA/WPA2 Personal".into(),
-            "wpa1" => "WPA Personal".into(),
-            m => format!("{} Personal", m.to_uppercase()),
+    let (_, wpa3, transition) = psk_wpa3(w);
+    let mode = apcfg::wpa_mode(w);
+    match Security::of(w) {
+        Security::Open if apcfg::is_owe(w) => "Enhanced Open (OWE)",
+        Security::Open => "Open",
+        Security::Wep => "WEP",
+        Security::Psk if transition => "WPA2/WPA3 Personal",
+        Security::Psk if wpa3 => "WPA3 Personal",
+        Security::Psk if mode == "wpa1" => "WPA Personal",
+        Security::Psk => "WPA/WPA2 Personal",
+        Security::Eap { osen: true } => "OSEN (Hotspot 2.0)",
+        Security::Eap { .. } if transition => "WPA2/WPA3 Enterprise",
+        Security::Eap { .. } if wpa3 => "WPA3 Enterprise",
+        Security::Eap { .. } => match mode {
+            "wpa2" => "WPA2 Enterprise",
+            "wpa1" => "WPA Enterprise",
+            _ => "WPA/WPA2 Enterprise",
         },
-        Some("wpaeap") => "WPA Enterprise".into(),
-        Some(o) => o.to_string(),
-        None => "?".into(),
     }
 }
 
@@ -1097,13 +1111,24 @@ fn edit_wlan(state: &mut Value, e: &WlanEdit, over: &[Over]) -> Result<(String, 
     }
 
     // Force Wi-Fi 4: turning it on clears what it can't be combined with, as the
-    // official UI does; the edit is then checked against it at the end.
+    // official UI does; the edit is then checked against it at the end. Its UI
+    // offers it with Open, WPA2 Personal and WPA2 Enterprise only: any other WPA
+    // mode becomes WPA2 (WPA3 goes with the template), and an Enterprise SSID
+    // stays Enterprise.
     let was_iot = flag(&before, "enhanced_iot", false);
     copy_fields(p, &mut w, &[("enhanced_iot", Bool)])?;
     let iot = flag(&w, "enhanced_iot", false);
     if iot && !was_iot {
         for (k, v, _) in IOT_TEMPLATE.iter() {
             w[*k] = v.clone();
+        }
+        match Security::of(&w) {
+            Security::Psk if apcfg::wpa_mode(&w) != "wpa2" => {
+                w["wpa_mode"] = json!("wpa2");
+                w["wpa_enc"] = json!("ccmp");
+            }
+            Security::Eap { osen: false } if apcfg::wpa_mode(&w) != "wpa2" => w["wpa_mode"] = json!("wpa2"),
+            _ => {}
         }
     }
     // What the edit's own fields are told apart from, below: the held fields as they are now.
@@ -1269,7 +1294,7 @@ fn wlan_bands(p: &Value, w: &mut Value) -> Result<Bands, String> {
     }
     let read = apcfg::wlan_bands(w);
     let bands = Bands { g2: read.contains(&"2g"), g5: read.contains(&"5g"), g6: read.contains(&"6g") };
-    if bands.g6 && !(flag(w, "wpa3_support", false) || w["security"].as_str() == Some("open")) {
+    if bands.g6 && !(flag(w, "wpa3_support", false) || Security::of(w) == Security::Open) {
         return Err("6 GHz needs WPA3 (or an open network)".into());
     }
     w["wlan_band"] = json!(match bands {
@@ -1781,17 +1806,16 @@ fn radio_edit(e: &DeviceEdit, rp: &Value, before: &Value, d: &mut Value, iot_loc
         r["tx_power"] = json!(tx);
     }
     copy_fields(rp, r, &[("min_rssi_enabled", Bool), ("min_rssi", Int(-90, -67))])?;
-    if let Some(b) = bool_field(rp, "hard_noise_floor_enabled")? {
-        if b && !apcfg::has_hard_noise_floor(r) {
-            return Err(format!("{label}: this radio has no interference blocker"));
+    // The render sends both only to a radio with the interference blocker.
+    for key in ["hard_noise_floor_enabled", "sens_level_enabled"] {
+        if let Some(b) = bool_field(rp, key)? {
+            if b && !apcfg::has_hard_noise_floor(r) {
+                return Err(format!("{label}: this radio has no interference blocker"));
+            }
+            r[key] = json!(b);
         }
-        r["hard_noise_floor_enabled"] = json!(b);
     }
-    copy_fields(
-        rp,
-        r,
-        &[("vwire_enabled", Bool), ("sens_level_enabled", Bool), ("loadbalance_enabled", Bool), ("sens_level", Int(-90, -50)), ("maxsta", Int(1, 200))],
-    )?;
+    copy_fields(rp, r, &[("vwire_enabled", Bool), ("loadbalance_enabled", Bool), ("sens_level", Int(-90, -50)), ("maxsta", Int(1, 200))])?;
     if apcfg::radio_off(r) && e.wireless_uplink.as_deref() == Some(band) {
         return Err(format!("{label}: this radio carries the AP's wireless uplink, so it cannot be turned off"));
     }
@@ -1998,12 +2022,74 @@ mod tests {
         // and an edit that leaves the protection alone leaves it so.
         let mut s = state();
         s["wlanconf"][0].as_object_mut().unwrap().remove("wpa_mode");
-        assert_eq!((label(s["wlanconf"][0].clone()), protection_of(&s["wlanconf"][0]).map(|p| p.name)), ("WPA/WPA2 Personal".into(), None));
+        assert_eq!((label(s["wlanconf"][0].clone()), protection_of(&s["wlanconf"][0]).map(|p| p.name)), ("WPA/WPA2 Personal", None));
         edit(&mut s, json!({ "name": "Renamed" })).unwrap();
         assert!(s["wlanconf"][0]["wpa_mode"].is_null());
         edit(&mut s, json!({ "protection": "wpa2" })).unwrap();
-        assert_eq!((s["wlanconf"][0]["wpa_mode"].as_str(), label(s["wlanconf"][0].clone())), (Some("wpa2"), "WPA2 Personal".into()));
-        assert_eq!((label(json!({ "security": "open", "wpa3_support": true })), label(json!({ "security": "wpaeap" }))), ("Open".into(), "WPA Enterprise".into()));
+        assert_eq!((s["wlanconf"][0]["wpa_mode"].as_str(), label(s["wlanconf"][0].clone())), (Some("wpa2"), "WPA2 Personal"));
+    }
+
+    #[test]
+    fn security_reads_as_the_render_sends_it() {
+        let label = |w: Value| security_label(&w);
+        // WPA3 goes out as WPA2 with SAE whatever the mode; any mode but wpa1 and wpa2 is WPA/WPA2 mixed.
+        assert_eq!(label(json!({ "security": "wpapsk", "wpa3_support": true })), "WPA3 Personal");
+        assert_eq!(label(json!({ "security": "wpapsk", "wpa_mode": "auto", "wpa3_support": true, "wpa3_transition": "true" })), "WPA2/WPA3 Personal");
+        assert_eq!(label(json!({ "security": "wpapsk", "wpa_mode": "wpa3" })), "WPA/WPA2 Personal");
+        assert_eq!(label(json!({ "security": "wpapsk", "wpa_mode": "WPA2" })), "WPA/WPA2 Personal");
+        // Open with WPA3 and no transition is sent as OWE; a missing or unknown security is open, as broadcast.
+        assert_eq!(label(json!({ "security": "open", "wpa3_support": true })), "Enhanced Open (OWE)");
+        assert_eq!(label(json!({ "security": "open", "wpa3_support": true, "wpa3_transition": true })), "Open");
+        for w in [json!({}), json!({ "security": "WPAPSK" })] {
+            assert_eq!((label(w.clone()), protection_of(&w).map(|p| p.name)), ("Open", Some("open")), "{w}");
+        }
+        assert_eq!(label(json!({ "security": "wep" })), "WEP");
+        // Enterprise: WPA3 first, then the mode.
+        let eap = |extra: Value| {
+            let mut w = json!({ "security": "wpaeap" });
+            w.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+            security_label(&w)
+        };
+        assert_eq!(eap(json!({ "wpa_mode": "wpa2" })), "WPA2 Enterprise");
+        assert_eq!(eap(json!({ "wpa_mode": "auto", "wpa3_support": true })), "WPA3 Enterprise");
+        assert_eq!(eap(json!({ "wpa_mode": "wpa2", "wpa3_support": true, "wpa3_transition": true })), "WPA2/WPA3 Enterprise");
+        assert_eq!((eap(json!({})), eap(json!({ "wpa_mode": "wpa1" }))), ("WPA/WPA2 Enterprise", "WPA Enterprise"));
+        assert_eq!(label(json!({ "security": "osen" })), "OSEN (Hotspot 2.0)");
+        // The SSID list sends the label beside the editor's choice.
+        let mut s = state();
+        s["wlanconf"][0]["wpa_mode"] = json!("wpa1");
+        let v = wlans_view(&s, &HashMap::new(), false);
+        assert_eq!((v["wlans"][0]["security"].as_str(), v["wlans"][0]["protection"].as_str()), (Some("WPA Personal"), None));
+    }
+
+    #[test]
+    fn force_wifi4_makes_any_other_wpa_mode_wpa2_and_keeps_open_and_enterprise() {
+        // Mixed WPA/WPA2 (stored or missing) and WPA1 Personal become WPA2 Personal.
+        for mode in [json!("auto"), Value::Null, json!("wpa1")] {
+            let mut s = state();
+            (s["wlanconf"][0]["wpa_mode"], s["wlanconf"][0]["wpa_enc"]) = (mode.clone(), json!("tkip"));
+            let what = edit(&mut s, json!({ "enhanced_iot": true })).unwrap();
+            let w = &s["wlanconf"][0];
+            assert_eq!((w["security"].as_str(), w["wpa_mode"].as_str(), w["wpa_enc"].as_str()), (Some("wpapsk"), Some("wpa2"), Some("ccmp")), "{mode}");
+            assert_eq!(protection_of(w).map(|p| p.name), Some("wpa2"));
+            assert!(what.contains("wpa_mode"), "{what}");
+        }
+        // Enterprise in another mode becomes WPA2 Enterprise, with no password asked for.
+        let mut s = state();
+        let w = s["wlanconf"][0].as_object_mut().unwrap();
+        w.remove("x_passphrase");
+        (w["security"], w["wpa_mode"]) = (json!("wpaeap"), json!("auto"));
+        edit(&mut s, json!({ "enhanced_iot": true })).unwrap();
+        let w = &s["wlanconf"][0];
+        assert_eq!((w["security"].as_str(), w["wpa_mode"].as_str(), security_label(w)), (Some("wpaeap"), Some("wpa2"), "WPA2 Enterprise"));
+        // Open stays open; Enhanced Open loses WPA3 with the template.
+        for wpa3 in [false, true] {
+            let mut s = state();
+            (s["wlanconf"][0]["security"], s["wlanconf"][0]["wpa3_support"], s["wlanconf"][0]["wpa_mode"]) = (json!("open"), json!(wpa3), json!("auto"));
+            edit(&mut s, json!({ "enhanced_iot": true })).unwrap();
+            let w = &s["wlanconf"][0];
+            assert_eq!((w["security"].as_str(), w["wpa_mode"].as_str(), security_label(w)), (Some("open"), Some("auto"), "Open"), "{wpa3}");
+        }
     }
 
     #[test]
@@ -2463,6 +2549,10 @@ mod tests {
         let names = ClientNames::from([("02:00:00:00:00:99".parse().unwrap(), "Backups".to_string())]);
         let e = DeviceEdit { client_names: names, ..device_edit(AP1, static_ip("192.168.1.22", "192.168.1.1")) };
         assert!(apply_device(&mut s.clone(), &e).unwrap_err().ends_with("the client Backups"));
+        // A blank name or host name is passed over, down to the MAC.
+        let label = |c: Value| client_label(&c, &ClientNames::new()).to_string();
+        assert_eq!(label(json!({ "mac": "02:00:00:00:00:99", "name": " ", "hostname": "nas" })), "nas");
+        assert_eq!(label(json!({ "mac": "02:00:00:00:00:99", "name": "", "hostname": "" })), "02:00:00:00:00:99");
         assert!(dev(&mut s, json!({ "config_network": { "type": "static", "ip": "192.168.1.20", "netmask": "255.255.255.0", "gateway": "192.168.1.1" } })).unwrap_err().contains("dns1"));
         dev(&mut s, static_ip("192.168.1.20", "192.168.1.1")).unwrap();
         assert_eq!(s["devices"][0]["config_network"]["ip"], "192.168.1.20");
@@ -2715,7 +2805,8 @@ mod tests {
         assert_eq!(v["networks"].as_array().unwrap().iter().map(|n| n["for_ssid"].as_bool().unwrap()).collect::<Vec<_>>(), [true, false, true], "an empty purpose is none");
         let w = v["wlans"][0].as_object().unwrap();
         assert!(w.contains_key("protection") && w.contains_key("pmf_mode"));
-        for k in ["security", "wpa_mode", "wpa3_support", "wpa3_transition", "ap_group_mode", "bc_filter_enabled", "minrate_ng_enabled"] {
+        assert_eq!(w["security"], "WPA2 Personal", "the label, not the stored field");
+        for k in ["wpa_mode", "wpa3_support", "wpa3_transition", "ap_group_mode", "bc_filter_enabled", "minrate_ng_enabled"] {
             assert!(!w.contains_key(k), "{k} is shown as the protection, or derived by an edit");
         }
         assert_eq!(v["networks"][0].as_object().unwrap().keys().collect::<Vec<_>>(), ["for_ssid", "id", "name", "vlan"]);
@@ -2795,6 +2886,13 @@ mod tests {
         assert!(any(&mut s, json!({ "antenna_id": 2 })).is_err());
         assert!(edit(&mut s, json!({ "radio": "na", "maxsta": 500 })).is_err());
         assert!(edit(&mut s, json!({ "radio": "na", "sens_level": -40 })).is_err());
+        // Like the noise floor, the sensitivity level needs the interference blocker; turning it off is always allowed.
+        s["devices"][0]["radio_table"][1]["radio_caps"] = json!(0);
+        for key in ["sens_level_enabled", "hard_noise_floor_enabled"] {
+            assert!(edit(&mut s, json!({ "radio": "na", key: true })).unwrap_err().contains("no interference blocker"), "{key}");
+        }
+        edit(&mut s, json!({ "radio": "na", "sens_level_enabled": false })).unwrap();
+        assert_eq!(s["devices"][0]["radio_table"][1]["sens_level_enabled"], false);
     }
 
     #[test]

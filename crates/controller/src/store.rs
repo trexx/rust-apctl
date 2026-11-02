@@ -392,6 +392,12 @@ fn migrate(dir: &Path) -> Result<()> {
             config.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {col} {ty}"))?;
         }
     }
+    // Upgrade events carry no firmware link (a custom one may hold a credential, and the
+    // event log is open to read-only users): it goes from those stored before.
+    config.execute(
+        "UPDATE events SET data = json_remove(data, '$.url') WHERE kind = 'ap_upgrade_sent' AND json_valid(data) AND json_extract(data, '$.url') IS NOT NULL",
+        [],
+    )?;
     drop(config);
     open_rw(&dir.join(Db::Logs.file()))?.execute_batch(LOGS_SCHEMA)?;
     let metrics = open_rw(&dir.join(Db::Metrics.file()))?;
@@ -1099,6 +1105,25 @@ mod tests {
         maintenance(&mut conns, now, true);
         assert_eq!(ids(&conns, "SELECT mac FROM clients ORDER BY mac"), ["named", "recent"]);
         assert_eq!(ids(&conns, "SELECT id FROM alerts ORDER BY id"), ["new", "open"]);
+    }
+
+    #[test]
+    fn stored_upgrade_events_lose_their_firmware_link() {
+        let dir = temp_dir("upgrade_url");
+        std::fs::create_dir_all(&dir).unwrap();
+        migrate(&dir).unwrap();
+        let conn = open_rw(&dir.join(Db::Config.file())).unwrap();
+        conn.execute_batch(
+            r#"INSERT INTO events (ts, kind, data) VALUES (1, 'ap_upgrade_sent', '{"target":"6.6.77","url":"https://u:p@example.net/fw.bin"}'),
+                 (2, 'ap_upgrade_sent', 'not json'), (3, 'ap_upgrade_failed', '{"url":"kept"}');"#,
+        )
+        .unwrap();
+        drop(conn);
+        migrate(&dir).unwrap();
+        migrate(&dir).unwrap();
+        let conn = open_rw(&dir.join(Db::Config.file())).unwrap();
+        let data: Vec<String> = conn.prepare("SELECT data FROM events ORDER BY ts").unwrap().query_map([], |r| r.get(0)).unwrap().collect::<rusqlite::Result<_>>().unwrap();
+        assert_eq!(data, [r#"{"target":"6.6.77"}"#, "not json", r#"{"url":"kept"}"#]);
     }
 
     #[test]

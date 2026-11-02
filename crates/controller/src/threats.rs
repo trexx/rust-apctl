@@ -123,6 +123,8 @@ pub struct Finding {
     /// What it imitates or relates to: our network name, AP or client.
     pub target: Option<String>,
     pub detail: String,
+    /// When it was first reported (its event, raised once); `None` until then.
+    #[serde(skip_serializing)]
     pub first_reported: Option<Ts>,
     /// As it was when the finding was worked out; `list` sends it as it is now.
     #[serde(skip)]
@@ -475,10 +477,6 @@ const CACHE_SECS: Ts = 600;
 /// What `gather` last worked out from the metrics.
 #[derive(Default)]
 struct Cache {
-    /// When `used` was read.
-    used_at: Ts,
-    /// BSSIDs our APs used in the last 30 days.
-    used: Arc<[UsedBss]>,
     /// Per BSSID: its last change, as last worked out.
     changes: HashMap<String, Change>,
     /// When `clients` and `watching_since` were read.
@@ -491,6 +489,13 @@ struct Cache {
 
 /// A BSSID our APs used: (bssid, AP, network name).
 pub(crate) type UsedBss = (String, String, Option<String>);
+
+/// The BSSIDs our APs used in the last 30 days, and when they were read.
+#[derive(Default)]
+struct Used {
+    at: Ts,
+    bssids: Arc<[UsedBss]>,
+}
 
 /// When one of our BSSIDs last changed, for the AP, radio, channel and name it
 /// had when that was worked out (`at`).
@@ -506,6 +511,9 @@ struct Change {
 #[derive(Default)]
 pub struct ThreatState {
     cache: Mutex<Cache>,
+    /// Apart from `cache`, which `gather` holds across its reads: the neighbour
+    /// list and the channel plan wait only for a read of these.
+    used: Mutex<Used>,
     latest: Mutex<Option<Latest>>,
     /// Read from the database once, then kept here as [`ack`] changes them,
     /// so what is served shows a change at once. Shared with the assessments
@@ -522,12 +530,12 @@ impl ThreatState {
     /// from in this run: read from the metrics when the last read is older than
     /// [`CACHE_SECS`], else as last read.
     pub(crate) fn used_bssids(&self, store: &Store, now: Ts) -> anyhow::Result<Arc<[UsedBss]>> {
-        let mut cache = self.cache();
-        if !(0..CACHE_SECS).contains(&(now - cache.used_at)) {
-            cache.used = store.read(Db::Metrics, |c| Ok(used_bssids(c, now)?))?.into();
-            cache.used_at = now;
+        let mut used = self.used.lock().unwrap_or_else(PoisonError::into_inner);
+        if !(0..CACHE_SECS).contains(&(now - used.at)) {
+            used.bssids = store.read(Db::Metrics, |c| Ok(used_bssids(c, now)?))?.into();
+            used.at = now;
         }
-        Ok(cache.used.clone())
+        Ok(used.bssids.clone())
     }
 
     fn latest(&self) -> MutexGuard<'_, Option<Latest>> {
@@ -1306,11 +1314,10 @@ mod tests {
         let f = assess(&a).remove(0);
         let ack = Ack { note: Some("the neighbours".into()), ts: 5 };
         let sent = serde_json::to_value(Served { finding: &f, acknowledged: Some(&ack), vendor: Some("Acme") }).unwrap();
-        // The same fields as a finding has, and the vendor.
+        // The same fields as a finding has (but when it was reported), and the vendor.
         let mut keys: Vec<&str> = sent.as_object().unwrap().keys().map(String::as_str).collect();
         let mut want = vec![
-            "kind", "severity", "bssid", "essid", "security", "channel", "radio", "best_signal", "heard_by", "first_seen", "last_seen", "target", "detail", "first_reported",
-            "acknowledged", "vendor",
+            "kind", "severity", "bssid", "essid", "security", "channel", "radio", "best_signal", "heard_by", "first_seen", "last_seen", "target", "detail", "acknowledged", "vendor",
         ];
         want.sort();
         keys.sort();

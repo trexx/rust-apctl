@@ -113,12 +113,6 @@ impl std::fmt::Display for Entity {
     }
 }
 
-impl Serialize for Entity {
-    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
-        s.collect_str(self)
-    }
-}
-
 /// An open alert's place in [`Alerts::open`].
 type OpenKey = (Key, Entity);
 
@@ -126,9 +120,13 @@ type OpenKey = (Key, Entity);
 pub struct Alert {
     pub id: String,
     pub ts: Ts,
+    /// With `entity`, what the alert is about: its place among the open ones and
+    /// its stored row; no page reads them.
+    #[serde(skip)]
     pub key: Key,
     pub category: Category,
     pub severity: Severity,
+    #[serde(skip)]
     pub entity: Entity,
     pub title: String,
     pub message: String,
@@ -500,10 +498,7 @@ async fn failing_clients(store: &Arc<Store>, now: Ts) -> anyhow::Result<usize> {
     // Parsing the reports and pairing fixups is CPU work: off the async workers too.
     tokio::task::spawn_blocking(move || {
         let events = store.read(Db::Config, |c| Ok(crate::connections::load_rows(c, now - HEALTH_WINDOW, Ts::MAX, None, None)?))?;
-        let attempts = crate::connections::attempts(events);
-        let ok: HashSet<&str> = attempts.iter().filter(|a| a.success).map(|a| a.client.as_str()).collect();
-        let failing: HashSet<&str> = attempts.iter().filter(|a| !a.success && !ok.contains(a.client.as_str())).map(|a| a.client.as_str()).collect();
-        Ok(failing.len())
+        Ok(crate::connections::failed_clients(&crate::connections::attempts(events)))
     })
     .await?
 }
@@ -1439,8 +1434,8 @@ mod tests {
         let a = &listed["alerts"][1];
         let mut fields: Vec<&str> = a.as_object().unwrap().keys().map(String::as_str).collect();
         fields.sort();
-        assert_eq!(fields, ["category", "entity", "id", "key", "link", "message", "read", "resolved_ts", "severity", "tag", "title", "ts"]);
-        assert_eq!((a["key"].as_str(), a["entity"].as_str(), a["category"].as_str(), a["severity"].as_str()), (Some("busy_channel"), Some("02:00:00:00:00:01/na"), Some("health"), Some("medium")));
+        assert_eq!(fields, ["category", "id", "link", "message", "read", "resolved_ts", "severity", "tag", "title", "ts"]);
+        assert_eq!((a["tag"].as_str(), a["category"].as_str(), a["severity"].as_str()), (Some("health:busy_channel:02:00:00:00:00:01/na"), Some("health"), Some("medium")));
         assert_eq!((a["ts"].as_i64(), a["link"].as_str(), &a["resolved_ts"], a["read"].as_bool()), (Some(1000), Some("/devices/02:00:00:00:00:01"), &Value::Null, Some(false)));
     }
 
