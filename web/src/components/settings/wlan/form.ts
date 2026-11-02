@@ -26,7 +26,13 @@ export function wlanForm(w: WlanSettings | null): WlanForm {
       // Unset, client isolation follows Guest; a new SSID has it off.
       l2_isolation: false,
     };
-  const { id: _id, editable: _e, has_passphrase: _h, ...rest } = w;
+  const {
+    id: _id,
+    editable: _e,
+    has_passphrase: _h,
+    security: _s,
+    ...rest
+  } = w;
   return rest;
 }
 

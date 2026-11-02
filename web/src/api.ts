@@ -1505,6 +1505,8 @@ export interface WlanSettings extends WlanFields {
   /** False for SSIDs the settings mark as not editable. */
   editable: boolean;
   has_passphrase: boolean;
+  /** How its security reads for people (the Networks page's label): also a security the editor doesn't offer. */
+  security: string;
 }
 
 export interface WlanSettingsList {

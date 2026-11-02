@@ -2,7 +2,7 @@ import { useCanEdit, useSettingsState, useWlanSettings } from "../../../api";
 import { band } from "../../../format";
 import { QueryNote } from "../../common";
 import { ListPanel } from "../ListPanel";
-import { BAND_RADIO, PROTECTION } from "./form";
+import { BAND_RADIO } from "./form";
 import { WlanEditor } from "./WlanEditor";
 
 /** The Networks page's settings section: every SSID, editable. */
@@ -49,9 +49,7 @@ export function WlanSettingsPanel() {
               {w.enabled === false && <span className="tag">off</span>}
             </td>
             <td className="muted small">
-              {PROTECTION.find((p) => p[0] === w.protection)?.[1] ??
-                "other security"}{" "}
-              ·{" "}
+              {w.security} ·{" "}
               {(w.wlan_bands ?? [])
                 .map((b) => band(BAND_RADIO[b] ?? b))
                 .join(" + ")}{" "}
