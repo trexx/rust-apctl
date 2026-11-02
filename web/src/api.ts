@@ -829,15 +829,12 @@ export interface Roam {
 
 export interface RoamDir {
   attempts: number;
-  successes: number;
   fast: number;
   assistant: number;
   min_rssi: number;
 }
 
 export interface Roaming {
-  from: number;
-  to: number;
   /** Over every roam in the window; `clients` counts the clients that roamed, `to_weaker` and `quick_returns` sum theirs. */
   total: { roams: number; successes: number; fast: number; clients: number; to_weaker: number; quick_returns: number };
   /** The newest roams (the server lists 100). */
@@ -846,7 +843,6 @@ export interface Roaming {
     ap_1: Mac;
     ap_2: Mac;
     attempts: number;
-    successes: number;
     success_pct: number;
     forward: RoamDir;
     backward: RoamDir;
@@ -854,7 +850,7 @@ export interface Roaming {
     top_clients: { mac: Mac; roams: number }[];
   }[];
   /** The ten clients that roamed most. */
-  clients: { mac: Mac; roams: number; failed: number; fast: number; avg_leave_rssi: number | null; to_weaker: number; quick_returns: number }[];
+  clients: { mac: Mac; roams: number; failed: number; avg_leave_rssi: number | null; to_weaker: number; quick_returns: number }[];
   ap_names: Record<string, string>;
   /** The names of the clients listed here (in `clients`, `top_clients` and `roams`). */
   client_names: Record<string, string>;
