@@ -403,16 +403,17 @@ impl LogEvents {
             // A memory fault whose name went with its PID is the program's.
             .map(|(kind, name)| (kind, name.or_else(|| prog.filter(|&p| kind == CrashKind::MemoryFault && p != "kernel").map(str::to_string))));
         let is_fault = fault.is_some();
-        // The line as a capture keeps it, and how it came if it is the kernel's.
-        let text = |joined: Option<String>| joined.unwrap_or_else(|| prog.map_or_else(|| msg.to_string(), |p| format!("{p}: {msg}")));
+        // The line as a capture keeps it, and how it came if it is the kernel's:
+        // only a line tagged `kernel:` is not already as netconsole's copy reads.
+        let text = move || joined.unwrap_or_else(|| prog.map_or_else(|| msg.to_string(), |p| format!("{p}: {msg}")));
         let way = |text: &String| match prog {
             _ if netconsole => Way::Netconsole(text.clone()),
             Some("kernel") => Way::of_syslog(msg),
-            _ => Way::of_syslog(text),
+            _ => Way::Syslog(text.clone()),
         };
         if let Some(c) = self.crashes.get_mut(&dev) {
             if !c.full {
-                let text = text(joined);
+                let text = text();
                 if kernel && c.is_copy(way(&text)) {
                     return is_fault;
                 }
@@ -430,7 +431,7 @@ impl LogEvents {
             && self.crashes.len() < MAX_CRASHES
         {
             let mut crash = Crash { started: line.ts, kind, process, lines: Vec::new(), bytes: 0, full: false, one_way: Default::default() };
-            let text = text(joined);
+            let text = text();
             // A fault is always the kernel's (see `fault` above): its copy may follow.
             crash.is_copy(way(&text));
             crash.push(text);
