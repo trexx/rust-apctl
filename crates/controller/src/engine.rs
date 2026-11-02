@@ -2235,8 +2235,8 @@ mod tests {
         assert_eq!(keys(&s["radios"][0]), "antenna_gain bw channel cu_interf cu_self_rx cu_self_tx cu_total max_txpower min_txpower noise_floor radio tx_power");
         assert_eq!(
             keys(&s["vaps"][0]),
-            "avg_client_signal bssid channel essid num_sta radio rx_bcast rx_bytes rx_dropped rx_mcast rx_packets satisfaction tx_bcast tx_bytes tx_dropped \
-             tx_errors tx_mcast tx_packets tx_retries wifi_tx_attempts wifi_tx_dropped"
+            "avg_client_signal bssid channel essid num_sta radio rx_bcast rx_bytes rx_mcast rx_packets satisfaction tx_bcast tx_bytes tx_dropped \
+             tx_mcast tx_packets tx_retries wifi_tx_attempts wifi_tx_dropped"
         );
     }
 

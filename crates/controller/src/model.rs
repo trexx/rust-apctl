@@ -185,8 +185,6 @@ pub struct VapSample {
     pub rx_mcast: Option<i64>,
     pub tx_bcast: Option<i64>,
     pub rx_bcast: Option<i64>,
-    pub rx_dropped: Option<i64>,
-    pub tx_errors: Option<i64>,
     /// Transmit attempts and frames given up on (retries = attempts - successes).
     pub wifi_tx_attempts: Option<i64>,
     pub wifi_tx_dropped: Option<i64>,
@@ -313,7 +311,6 @@ pub struct Multicast {
 pub struct McastService {
     pub name: String,
     pub pkts: i64,
-    pub bytes: i64,
 }
 
 /// The traffic types APs report, so that a client's types name them without
@@ -347,7 +344,7 @@ impl Multicast {
             .as_array()
             .into_iter()
             .flatten()
-            .filter_map(|x| Some(McastService { name: x["name"].as_str()?.to_string(), pkts: int(&x["pkts"]).unwrap_or(0), bytes: int(&x["bytes"]).unwrap_or(0) }))
+            .filter_map(|x| Some(McastService { name: x["name"].as_str()?.to_string(), pkts: int(&x["pkts"]).unwrap_or(0) }))
             .collect();
         Some(Multicast { types, has_groups, memberships, services })
     }
@@ -479,8 +476,6 @@ pub fn parse_with_scans(ts: Ts, p: &Value) -> anyhow::Result<(Snapshot, Scans)> 
             rx_mcast: int(&v["rx_mcast"]),
             tx_bcast: int(&v["tx_bcast"]),
             rx_bcast: int(&v["rx_bcast"]),
-            rx_dropped: int(&v["rx_dropped"]),
-            tx_errors: int(&v["tx_errors"]),
             wifi_tx_attempts: int(&v["wifi_tx_attempts"]),
             wifi_tx_dropped: int(&v["wifi_tx_dropped"]),
         });
