@@ -208,20 +208,19 @@ pub fn compare(ours: &Rendered, actual_mgmt: &str, actual_system: &str, redacted
     }
 }
 
-/// A short human summary of an import snapshot, for the settings page.
+/// A short human summary of an import snapshot, for the settings page (and the
+/// import's event): what the page shows.
 pub fn summarize_state(state: &Value) -> Value {
     let count = |k: &str| state[k].as_array().map_or(0, Vec::len);
     let names = |k: &str| -> Vec<Value> {
         state[k].as_array().into_iter().flatten().filter_map(|x| x["name"].as_str().map(|s| Value::from(s.to_string()))).collect()
     };
     serde_json::json!({
-        "sites": count("sites"),
         "wlans": names("wlanconf"),
         "networks": names("networkconf"),
         "ap_groups": names("apgroup"),
         "devices": count("devices"),
         "clients": count("clients"),
-        "settings": count("setting"),
     })
 }
 
@@ -319,6 +318,8 @@ mod tests {
         assert!(validate_state(&serde_json::json!({ "devices": [] })).is_err());
         let ok = serde_json::json!({ "sites": [], "wlanconf": [{ "name": "Home" }], "networkconf": [], "setting": [], "devices": [] });
         assert!(validate_state(&ok).is_ok());
+        let keys: Vec<_> = summarize_state(&ok).as_object().unwrap().keys().cloned().collect();
+        assert_eq!(keys, ["ap_groups", "clients", "devices", "networks", "wlans"], "what the settings page shows");
         assert_eq!(summarize_state(&ok)["wlans"][0], "Home");
     }
 }
