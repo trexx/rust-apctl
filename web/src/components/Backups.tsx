@@ -148,10 +148,13 @@ function Schedule({
   initial,
   readOnly,
   nextRun,
+  unreadable,
 }: {
   initial: BackupSettings;
   readOnly: boolean;
   nextRun: number | null;
+  /** The stored settings can't be read: saving the form as it is stores them again. */
+  unreadable: boolean;
 }) {
   const [s, setS] = useState(initial);
   const [base, setBase] = useState(initial);
@@ -238,7 +241,7 @@ function Schedule({
         {!readOnly && (
           <button
             className="btn small primary"
-            disabled={!dirty}
+            disabled={!dirty && !unreadable}
             onClick={save}
           >
             Save
@@ -376,7 +379,12 @@ export function BackupSection() {
       {d.settings_error && (
         <div className="banner banner-high">{d.settings_error}</div>
       )}
-      <Schedule initial={d.settings} readOnly={readOnly} nextRun={d.next_run} />
+      <Schedule
+        initial={d.settings}
+        readOnly={readOnly}
+        nextRun={d.next_run}
+        unreadable={!!d.settings_error}
+      />
 
       {!readOnly && (
         <div className="backup-row backup-actions">
