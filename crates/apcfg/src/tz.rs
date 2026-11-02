@@ -9,8 +9,14 @@
 //! Where it differs from the official controller's table, on purpose:
 //! - It also has Etc/UTC, GMT, Europe/Kyiv and the other Etc/ and legacy names, for
 //!   which the official sends no time zone lines.
-//! - Europe/London, Europe/Dublin, America/Mexico_City and Asia/Jerusalem get current
-//!   tzdata's rule, where the official sends an older one.
+//! - Every zone gets current tzdata's rule. At tzdata 2026e that is a different string
+//!   for 52 of the official table's 426 zones. Most are zones whose rules changed since
+//!   the official table was made: Mexico's (no more summer time), the Canadian zones
+//!   2026e changed (Vancouver, Edmonton, Winnipeg, Whitehorse, ...), Egypt, Jordan,
+//!   Syria, Iran, Kazakhstan, Fiji, Samoa, Greenland, Palestine, Volgograd, Kirov.
+//!   The rest switch at another hour there (the UK zones, Gibraltar, Chisinau, Iqaluit),
+//!   write the rule another way (Jerusalem, Chatham, Morocco) or name the offsets
+//!   differently (Azores, Easter, Lord Howe, Norfolk, Santiago, Troll).
 //! - Ireland's rule is tzdata's rearguard form (summer time is the positive offset),
 //!   not the main form's negative summer time; both give the same local time.
 
