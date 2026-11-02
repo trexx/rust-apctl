@@ -838,7 +838,6 @@ struct DryRunStatus {
     history_matches: i64,
 }
 
-/// An AP's dry run now: how what apctl would push compares with what it runs.
 /// The imported settings record the cfgversion the other controller expected
 /// for each AP at import time. If the AP now runs another one, that controller
 /// has pushed new config since: the settings are probably out of date. Never in
@@ -848,6 +847,7 @@ fn settings_stale(active: bool, imported: Option<&str>, running: Option<&str>) -
     !active && matches!((imported, running), (Some(a), Some(b)) if a != b)
 }
 
+/// An AP's dry run now: how what apctl would push compares with what it runs.
 #[derive(Serialize)]
 struct DryRunDevice {
     mac: Mac,
