@@ -68,7 +68,6 @@ export interface McastCounts {
 export interface ServiceCount {
   name: string;
   pkts: number;
-  bytes: number;
 }
 
 export interface Multicast {
@@ -135,8 +134,6 @@ export interface VapSample {
   rx_mcast: number | null;
   tx_bcast: number | null;
   rx_bcast: number | null;
-  rx_dropped: number | null;
-  tx_errors: number | null;
   wifi_tx_attempts: number | null;
   wifi_tx_dropped: number | null;
 }
