@@ -1001,7 +1001,7 @@ impl Engine {
                 };
                 // Masked when a field the push does not carry is the stored copy's.
                 let masked = (redacted[0] && new_mgmt.is_none()) || (redacted[1] && new_system.is_none());
-                Some(self.dry_run(render, ts, &req, cfgversion.as_deref(), mgmt, masked))
+                Some(self.dry_run(render, ts, &req, mgmt, masked))
             }
             _ => None,
         };
@@ -1042,7 +1042,7 @@ impl Engine {
     /// Renders the AP's config for `req` and compares it with the push (its
     /// `mgmt` and `req.previous_system_cfg`, with secrets masked if `redacted`):
     /// stored, and summed up for the event.
-    fn dry_run(&self, render: &crate::dryrun::RenderFn, ts: Ts, req: &crate::dryrun::RenderRequest, cfgversion: Option<&str>, mgmt: &str, redacted: bool) -> Value {
+    fn dry_run(&self, render: &crate::dryrun::RenderFn, ts: Ts, req: &crate::dryrun::RenderRequest, mgmt: &str, redacted: bool) -> Value {
         let system = req.previous_system_cfg.unwrap_or_default();
         let result = render(req).map(|ours| crate::dryrun::compare(&ours, mgmt, system, redacted, false));
         let (matches, payload) = match &result {
@@ -1051,8 +1051,8 @@ impl Engine {
         };
         self.writer.exec(
             Db::Config,
-            "INSERT INTO dryrun_results (ts, mac, cfgversion, matches, comparison) VALUES (?1, ?2, ?3, ?4, ?5)",
-            vec![Sql::Integer(ts), Sql::Text(req.device_mac.to_string()), cfgversion.map(str::to_string).into(), Sql::Integer(matches as i64), Sql::Text(payload)],
+            "INSERT INTO dryrun_results (ts, mac, matches, comparison) VALUES (?1, ?2, ?3, ?4)",
+            vec![Sql::Integer(ts), Sql::Text(req.device_mac.to_string()), Sql::Integer(matches as i64), Sql::Text(payload)],
         );
         // Each field's counts: a mismatch names the field that differs, and says
         // when only the order of its lines does (no line added, removed or changed).
@@ -1564,12 +1564,11 @@ impl Engine {
         bump(&self.counters.logs);
         self.writer.exec(
             Db::Logs,
-            "INSERT INTO logs (ts, device_mac, src_ip, facility, severity, program, msg) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            "INSERT INTO logs (ts, device_mac, src_ip, severity, program, msg) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             vec![
                 Sql::Integer(line.ts),
                 line.device_mac.map(|m| m.to_string()).into(),
                 Sql::Text(line.src_ip),
-                line.facility.into(),
                 line.severity.into(),
                 line.program.into(),
                 Sql::Text(line.msg),
@@ -3051,9 +3050,8 @@ mod tests {
         h.engine.handle(Input::Reply { ts: 270, mac, payload: json!({ "_type": "setparam", "system_cfg": "x=3" }) });
         assert_eq!(stored(&h, EventKind::DryrunCompared)[0]["error"], "no template");
         flushed(&h.writer);
-        let row: (String, Option<String>, i64) =
-            h.store.read(Db::Config, |c| Ok(c.query_row("SELECT mac, cfgversion, matches FROM dryrun_results", [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?)).unwrap();
-        assert_eq!(row, (AP1.to_string(), Some("v2".into()), 0));
+        let row: (String, i64) = h.store.read(Db::Config, |c| Ok(c.query_row("SELECT mac, matches FROM dryrun_results", [], |r| Ok((r.get(0)?, r.get(1)?)))?)).unwrap();
+        assert_eq!(row, (AP1.to_string(), 0));
         // The event names the field that differs, and when only the order does;
         // the stored comparison has the counts without the diffs' text.
         h.engine.set_renderer(Arc::new(|_: &crate::dryrun::RenderRequest| -> anyhow::Result<crate::dryrun::Rendered> { Ok(("cfgversion=v2\na=9".into(), "y=1\nx=4".into())) }));
