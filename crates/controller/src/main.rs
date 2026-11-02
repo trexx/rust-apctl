@@ -352,7 +352,22 @@ async fn serve(args: ServeArgs) -> Result<()> {
     adopt::spawn(state.clone());
     let app = api::router(state);
     tracing::info!("web UI and API on http://{listen}");
-    axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>()).with_graceful_shutdown(shutdown(writer.clone(), drain.clone())).await?;
+    // A connection left open mid-request would keep a graceful shutdown waiting
+    // forever: it is given `SHUTDOWN_GRACE` after the signal, then the exit goes
+    // on without it. (An upgraded live socket does not hold it up.)
+    let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+    let serving = axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>()).with_graceful_shutdown(async {
+        let _ = stopped.await;
+    });
+    let grace = async {
+        shutdown(&drain).await;
+        let _ = stop.send(());
+        tokio::time::sleep(SHUTDOWN_GRACE).await;
+    };
+    tokio::select! {
+        served = serving.into_future() => served?,
+        () = grace => tracing::info!("open connections not closed after {}s: exiting without them", SHUTDOWN_GRACE.as_secs()),
+    }
     finish(writer, drain).await;
     Ok(())
 }
@@ -548,11 +563,12 @@ fn debug_syslog(pcap: &str, keys: &str, port: u16) -> Result<()> {
     Ok(())
 }
 
-/// Resolves on Ctrl-C or SIGTERM (what Kubernetes sends). Open WebSockets would
-/// keep a graceful shutdown waiting forever, so the process exits after a short
-/// grace period regardless, once the engine's queue is handled and the queued
-/// writes are committed. The engine stops taking inputs at once.
-async fn shutdown(writer: store::Writer, drain: Drain) {
+/// How long an exit waits for the open connections to close.
+const SHUTDOWN_GRACE: Duration = Duration::from_secs(3);
+
+/// Resolves on Ctrl-C or SIGTERM (what Kubernetes sends). The engine stops
+/// taking inputs at once; the rest of the exit is `serve`'s (see `finish`).
+async fn shutdown(drain: &Drain) {
     let term = async {
         match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
             Ok(mut s) => {
@@ -567,11 +583,6 @@ async fn shutdown(writer: store::Writer, drain: Drain) {
     }
     tracing::info!("shutting down");
     drain.start();
-    tokio::spawn(async move {
-        tokio::time::sleep(Duration::from_secs(3)).await;
-        finish(writer, drain).await;
-        std::process::exit(0);
-    });
 }
 
 /// The controller's host and inform port as pushed configs give them, from
