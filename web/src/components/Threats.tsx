@@ -18,8 +18,11 @@ export function ThreatBanner() {
   );
   const worst = open[0];
   if (!worst) return null;
+  // Medium findings take the banner's own (warning) colour.
   return (
-    <div className={`banner banner-${worst.severity}`}>
+    <div
+      className={worst.severity === "high" ? "banner banner-high" : "banner"}
+    >
       <b>
         {open.length === 1
           ? "A suspicious network"

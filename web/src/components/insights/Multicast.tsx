@@ -145,7 +145,7 @@ function MulticastView({
           </div>
         </div>
         {data.clients.length > 0 && (
-          <table className="table mcast-clients">
+          <table className="table">
             <THead
               columns={[
                 "Client",

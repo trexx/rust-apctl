@@ -1,7 +1,7 @@
 import { useSyncExternalStore } from "react";
 import type { TimeSpan } from "./api";
 
-export const BANDS: Record<string, string> = { ng: "2.4 GHz", na: "5 GHz", "6e": "6 GHz" };
+const BANDS: Record<string, string> = { ng: "2.4 GHz", na: "5 GHz", "6e": "6 GHz" };
 
 export const band = (radio: string | null | undefined) => (radio ? (BANDS[radio] ?? radio) : "—");
 
@@ -135,7 +135,7 @@ export const rate = (bps: number) => scaled(bps, 1000, ["bps", "kbps", "Mbps", "
 export const mbps = (kbps: number) => `${kbps >= 100_000 ? Math.round(kbps / 1000) : +(kbps / 1000).toFixed(1)} Mbps`;
 
 /** PHY rate reported in kbps. */
-export function phy(kbps: number | null | undefined): string {
+function phy(kbps: number | null | undefined): string {
   if (!kbps) return "—";
   return kbps >= 1000 ? mbps(kbps) : `${kbps} kbps`;
 }

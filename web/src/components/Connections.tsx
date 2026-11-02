@@ -296,7 +296,7 @@ function ConnectionTable({ data }: { data: Connections }) {
       </div>
     );
   return (
-    <table className="table conn-log">
+    <table className="table">
       <ConnHead />
       <tbody>
         {items

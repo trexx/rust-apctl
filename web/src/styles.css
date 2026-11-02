@@ -992,9 +992,6 @@ input.search {
 .stats + .banner {
   margin: 12px 0 0;
 }
-.banner-medium {
-  background: var(--warn-bg);
-}
 .banner-high {
   background: var(--bad-bg);
 }

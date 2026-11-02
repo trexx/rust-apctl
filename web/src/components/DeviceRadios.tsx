@@ -48,7 +48,7 @@ function SignalDistribution({ clients }: { clients: ListedClientView[] }) {
   });
   const total = signals.length;
   return (
-    <div className="dist">
+    <div>
       <div className="dist-bar">
         {counts.map((n, i) =>
           n ? (

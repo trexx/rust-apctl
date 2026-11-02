@@ -176,7 +176,7 @@ function Shell({ user, readOnly }: { user: string | null; readOnly: boolean }) {
     return () => clearTimeout(t);
   }, []);
   return (
-    <div className="shell">
+    <div>
       <header className="top">
         <span className="brand">apctl</span>
         <nav>

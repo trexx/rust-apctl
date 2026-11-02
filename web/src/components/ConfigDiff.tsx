@@ -128,7 +128,7 @@ export function ChangeGroups({
   return (
     <div className="cfg-groups">
       {groups.map(([title, list]) => (
-        <div key={title} className="cfg-group">
+        <div key={title}>
           <div className="cfg-group-title">{title}</div>
           <table className="table cfg-table">
             <tbody>
