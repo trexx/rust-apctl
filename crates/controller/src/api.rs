@@ -422,16 +422,15 @@ fn stored_only(live: &Live) -> impl Iterator<Item = (&Mac, &KnownDevice)> {
 }
 
 /// An AP known from the database only (see `Live::known_devices`), as a live
-/// device view of it, offline: what was not stored is empty.
-fn stored_view(mac: Mac, k: &KnownDevice) -> DeviceView {
+/// device view of it, offline: it has what its row and its page show, the rest is empty.
+fn stored_view(k: &KnownDevice) -> DeviceView {
     let ap = crate::model::ApSample {
-        mac, ts: k.last_seen, hostname: k.hostname.clone(), model: k.model.clone(), model_display: k.model_display.clone(), version: k.version.clone(),
-        ip: k.ip.clone(), serial: k.serial.clone(), ..Default::default()
+        hostname: k.hostname.clone(), model: k.model.clone(), model_display: k.model_display.clone(), version: k.version.clone(), ip: k.ip.clone(),
+        ..Default::default()
     };
     DeviceView {
         snapshot: crate::model::Snapshot { ap, ..Default::default() },
-        online: false, first_seen: k.first_seen, last_seen: k.last_seen, interval: 0, last_full_inform: 0,
-        last_config_push: None,
+        online: false, last_seen: k.last_seen, interval: 0, last_full_inform: 0, last_config_push: None,
     }
 }
 
@@ -493,7 +492,7 @@ async fn devices(State(s): State<AppState>) -> Json<Vec<DeviceRow>> {
         }
         let mut list: Vec<DeviceRow> = live.devices.iter().map(|(mac, d)| device_row(*mac, d, per_ap.get(mac).copied().unwrap_or(0))).collect();
         // Then the APs not reporting since apctl started, by MAC as the others.
-        let mut stored: Vec<DeviceRow> = stored_only(&live).map(|(mac, k)| device_row(*mac, &stored_view(*mac, k), 0)).collect();
+        let mut stored: Vec<DeviceRow> = stored_only(&live).map(|(mac, k)| device_row(*mac, &stored_view(k), 0)).collect();
         stored.sort_unstable_by_key(|d| d.mac);
         list.append(&mut stored);
         list
@@ -529,7 +528,7 @@ async fn device(State(s): State<AppState>, MacPath(mac): MacPath) -> Result<Resp
                 (d.clone(), clients, crate::actions::locating(&live, &mac), false)
             }
             // Known but not reporting since apctl started: offline, with what was stored.
-            (None, Some(k)) => (stored_view(mac, k), Vec::new(), false, true),
+            (None, Some(k)) => (stored_view(k), Vec::new(), false, true),
             (None, None) => return Err(ApiError::not_found("unknown device")),
         }
     };

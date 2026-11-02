@@ -162,8 +162,6 @@ pub struct EventHead {
 pub struct DeviceView {
     pub snapshot: Snapshot,
     pub online: bool,
-    #[serde(skip_serializing)]
-    pub first_seen: Ts,
     pub last_seen: Ts,
     /// Inform interval most recently requested by the controller.
     pub interval: Ts,
@@ -346,7 +344,6 @@ impl Live {
 /// what happened while apctl was away, and what the device list shows of it.
 #[derive(Debug, Clone, Default)]
 pub struct KnownDevice {
-    pub first_seen: Ts,
     pub last_seen: Ts,
     pub uptime: Option<i64>,
     pub version: Option<String>,
@@ -354,7 +351,6 @@ pub struct KnownDevice {
     pub model: Option<String>,
     pub model_display: Option<String>,
     pub ip: Option<String>,
-    pub serial: Option<String>,
     /// Reported offline (an `ap_offline` event), and not back since.
     pub offline: bool,
 }
@@ -544,14 +540,14 @@ impl Engine {
     /// the first one after it says what it changed.
     pub fn restore(&mut self, store: &store::Store) -> anyhow::Result<()> {
         let (devices, clients, aliases, state, pushes) = store.read(Db::Config, |c| {
-            let mut stmt = c.prepare("SELECT mac, first_seen, last_seen, uptime, version, hash_id, ip, hostname, model, model_display, serial, offline FROM devices")?;
+            let mut stmt = c.prepare("SELECT mac, last_seen, uptime, version, hash_id, ip, hostname, model, model_display, offline FROM devices")?;
             let devices = stmt
                 .query_map([], |r| {
                     let known = KnownDevice {
-                        first_seen: r.get::<_, Option<i64>>(1)?.unwrap_or(0), last_seen: r.get::<_, Option<i64>>(2)?.unwrap_or(0), uptime: r.get(3)?, version: r.get(4)?,
-                        ip: r.get(6)?, hostname: r.get(7)?, model: r.get(8)?, model_display: r.get(9)?, serial: r.get(10)?, offline: r.get::<_, i64>(11)? != 0,
+                        last_seen: r.get::<_, Option<i64>>(1)?.unwrap_or(0), uptime: r.get(2)?, version: r.get(3)?,
+                        ip: r.get(5)?, hostname: r.get(6)?, model: r.get(7)?, model_display: r.get(8)?, offline: r.get::<_, i64>(9)? != 0,
                     };
-                    Ok((r.get::<_, String>(0)?, known, r.get::<_, Option<String>>(5)?))
+                    Ok((r.get::<_, String>(0)?, known, r.get::<_, Option<String>>(4)?))
                 })?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
             let mut stmt = c.prepare("SELECT mac, hostname, ip, first_seen, last_seen, ap_mac, bssid, essid, radio, connected FROM clients")?;
@@ -732,7 +728,9 @@ impl Engine {
         let old_inform = if snap.has_vap_table { live.raw_informs.insert(mac, Arc::new(payload)) } else { None };
         live.attribute(&snap.ap);
         let prev = live.devices.remove(&mac);
-        let known = if prev.is_none() { live.known_devices.remove(&mac) } else { None };
+        if prev.is_none() {
+            live.known_devices.remove(&mac);
+        }
         // An upgrade apctl sent has landed: the AP reports the new version. One
         // event says so, not also a firmware change (see `lifecycle_events`).
         if let Some(v) = &snap.ap.version
@@ -742,7 +740,7 @@ impl Engine {
             events.push(Event::device(ts, EventKind::ApUpgraded, mac, json!({ "from": j.from, "to": v, "custom": j.custom })));
         }
         let updated = if snap.has_vap_table { self.update_clients(&mut live, ts, &snap.clients) } else { Vec::new() };
-        let (view, old_snapshot) = device_view(ts, snap, prev, known.as_ref());
+        let (view, old_snapshot) = device_view(ts, snap, prev);
         live.devices.insert(mac, view);
         drop(live);
         drop((old_inform, old_snapshot));
@@ -1962,8 +1960,7 @@ fn lifecycle_events(ts: Ts, a: &crate::model::ApSample, prev: Option<&DeviceView
 
 /// The AP's live view after an inform at `ts`, and the snapshot it replaces
 /// (if whole), for the caller to drop once the lock is released.
-fn device_view(ts: Ts, snap: Snapshot, prev: Option<DeviceView>, known: Option<&KnownDevice>) -> (DeviceView, Option<Snapshot>) {
-    let first_seen = prev.as_ref().map(|p| p.first_seen).or(known.map(|k| k.first_seen)).unwrap_or(ts);
+fn device_view(ts: Ts, snap: Snapshot, prev: Option<DeviceView>) -> (DeviceView, Option<Snapshot>) {
     match prev {
         Some(mut p) => {
             // Without a VAP table the inform says nothing of radios, VAPs or clients: keep the last full picture.
@@ -1975,14 +1972,13 @@ fn device_view(ts: Ts, snap: Snapshot, prev: Option<DeviceView>, known: Option<&
                 p.snapshot.ap = snap.ap;
                 None
             };
-            (DeviceView { online: true, first_seen, last_seen: ts, ..p }, old)
+            (DeviceView { online: true, last_seen: ts, ..p }, old)
         }
         None => {
             let view = DeviceView {
                 last_full_inform: if snap.has_vap_table { ts } else { 0 },
                 snapshot: snap,
                 online: true,
-                first_seen,
                 last_seen: ts,
                 interval: DEFAULT_INTERVAL,
                 last_config_push: None,

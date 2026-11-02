@@ -1088,7 +1088,7 @@ mod tests {
         let live = rig.live.clone();
         let seen = |interval: Ts| {
             let snapshot = crate::model::parse(0, &ap_payload(&version)).unwrap();
-            let d = crate::engine::DeviceView { snapshot, online: true, first_seen: 0, last_seen: 0, interval, last_full_inform: 0, last_config_push: None };
+            let d = crate::engine::DeviceView { snapshot, online: true, last_seen: 0, interval, last_full_inform: 0, last_config_push: None };
             live.write().unwrap().devices.insert(AP.parse().unwrap(), d);
         };
         seen(interval);
@@ -1601,7 +1601,7 @@ mod tests {
         let seen = |last_seen: Ts| {
             let snapshot = crate::model::parse(last_seen, &ap_payload("1")).unwrap();
             let d = crate::engine::DeviceView {
-                snapshot, online: true, first_seen: 0, last_seen, interval: 10,
+                snapshot, online: true, last_seen, interval: 10,
                 last_full_inform: last_seen, last_config_push: None,
             };
             rig.live.write().unwrap().devices.insert(mac, d);
