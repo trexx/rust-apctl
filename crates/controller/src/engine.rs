@@ -948,12 +948,16 @@ impl Engine {
         let system = new_system.as_deref().unwrap_or(&previous.system_cfg);
         let mut data = serde_json::Map::new();
         data.insert("cfgversion".into(), p["cfgversion"].clone());
-        for (field, new, old, redacted) in [("mgmt_cfg", &new_mgmt, &previous.mgmt_cfg, redacted[0]), ("system_cfg", &new_system, &previous.system_cfg, redacted[1])] {
-            let Some(new) = new else { continue };
+        // Each field the push carries as it is stored: secrets masked. A masked
+        // previous push is compared with it.
+        let [mgmt_stored, system_stored] = [&new_mgmt, &new_system].map(|n| n.as_deref().map(cfgdiff::redact));
+        let fields = [("mgmt_cfg", &new_mgmt, &mgmt_stored, &previous.mgmt_cfg, redacted[0]), ("system_cfg", &new_system, &system_stored, &previous.system_cfg, redacted[1])];
+        for (field, new, masked, old, redacted) in fields {
+            let (Some(new), Some(masked)) = (new, masked) else { continue };
             let summary = if old.is_empty() {
                 json!({ "baseline": true, "lines": new.lines().count() })
             } else if redacted {
-                cfgdiff::diff(old, &cfgdiff::redact(new)).summary()
+                cfgdiff::diff(old, masked).summary()
             } else {
                 cfgdiff::diff(old, new).summary()
             };
@@ -985,8 +989,8 @@ impl Engine {
                 Sql::Text(mac.to_string()),
                 Sql::Integer(ts),
                 cfgversion.clone().into(),
-                new_mgmt.as_deref().map(cfgdiff::redact).into(),
-                new_system.as_deref().map(cfgdiff::redact).into(),
+                mgmt_stored.into(),
+                system_stored.into(),
             ],
         );
         // Dry run: what would apctl have pushed for the same AP at this moment?
