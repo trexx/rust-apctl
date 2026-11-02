@@ -16,9 +16,10 @@ pub fn source(collection: &str) -> &str {
 }
 
 /// Device fields kept besides the ones rendering reads ([`apcfg::DEVICE_KEYS`]): what
-/// the controller shows and copies onto a new AP. The rest (stats caches, SSH
-/// credentials, `x_fingerprint`) is left out.
-const DEVICE_FIELDS: &[&str] = &["model", "version", "serial", "ip", "adopted", "x_aes_gcm", "cfgversion", "wlangroup_id_na", "wlangroup_id_ng"];
+/// the controller shows and copies onto a new AP, and the fingerprint of the AP's SSH
+/// host key (`SHA256:<base64>`, a public key's), which adopting it over SSH checks. The
+/// rest (stats caches, SSH credentials, `x_fingerprint`) is left out.
+const DEVICE_FIELDS: &[&str] = &["model", "version", "serial", "ip", "adopted", "x_aes_gcm", "x_ssh_hostkey_fingerprint", "cfgversion", "wlangroup_id_na", "wlangroup_id_ng"];
 
 /// Client fields kept besides the ones rendering reads ([`apcfg::CLIENT_KEYS`]): the
 /// names and notes people gave their devices (an import into apctl takes them as the
@@ -65,19 +66,20 @@ mod tests {
         assert_eq!(settings[1]["x_ssh_password"], "kept");
     }
 
-    /// The fields the controller reads are kept, and of the `x_` fields (the official
-    /// controller's secrets) only the AP's inform key and its AES-GCM flag.
+    /// The fields the controller reads are kept, and of the `x_` fields (mostly the
+    /// official controller's secrets) only the AP's inform key, its AES-GCM flag and its
+    /// SSH host key's fingerprint.
     #[test]
     fn imports_keep_what_the_controller_reads_and_no_other_secret() {
         let (devices, clients) = (device_fields(), client_fields());
-        for f in ["mac", "site_id", "x_authkey", "syslog_key", "radio_table", "model", "version", "cfgversion", "x_aes_gcm", "mgmt_network_id", "wlangroup_id_ng", "wlangroup_id_na"] {
+        for f in ["mac", "site_id", "x_authkey", "x_ssh_hostkey_fingerprint", "syslog_key", "radio_table", "model", "version", "cfgversion", "x_aes_gcm", "mgmt_network_id", "wlangroup_id_ng", "wlangroup_id_na"] {
             assert!(devices.contains(&f), "devices: {f}");
         }
         for f in ["mac", "site_id", "blocked", "fixed_ap_mac", "name", "note", "usergroup_id"] {
             assert!(clients.contains(&f), "clients: {f}");
         }
         let secrets: Vec<&str> = devices.iter().chain(&clients).copied().filter(|f| f.starts_with("x_")).collect();
-        assert_eq!(secrets, ["x_authkey", "x_aes_gcm"]);
+        assert_eq!(secrets, ["x_authkey", "x_aes_gcm", "x_ssh_hostkey_fingerprint"]);
         for fields in [&devices, &clients] {
             assert!(fields.iter().enumerate().all(|(i, f)| !fields[..i].contains(f)), "{fields:?}");
         }
