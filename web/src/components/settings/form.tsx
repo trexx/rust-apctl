@@ -124,7 +124,8 @@ export function Row({
   );
 }
 
-// In common.tsx, so the pages outside the settings needn't load this module.
+// Toggle is common.tsx's (the Backups page takes it from there); the editors
+// take it from here, with the other controls.
 export { Toggle };
 
 /** One choice of a `Select`: its value, its label and whether it is disabled. */

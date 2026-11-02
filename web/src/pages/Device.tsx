@@ -44,9 +44,9 @@ import {
 import { DeviceActions } from "../components/Actions";
 import { lazyNamed } from "../lazy";
 
-// The settings editor is large and only used by those who can edit: load it on demand.
+// The AP's settings and their editor are only for those who can edit: load them on demand.
 const DeviceSettingsPanel = lazyNamed(
-  () => import("../components/SettingsEditor"),
+  () => import("../components/settings/device/DeviceSettingsPanel"),
   "DeviceSettingsPanel",
 );
 

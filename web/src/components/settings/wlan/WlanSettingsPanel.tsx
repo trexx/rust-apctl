@@ -1,9 +1,14 @@
+import { Suspense } from "react";
 import { useCanEdit, useSettingsState, useWlanSettings } from "../../../api";
 import { band } from "../../../format";
-import { QueryNote } from "../../common";
+import { lazyNamed } from "../../../lazy";
+import { Loading, QueryNote } from "../../common";
 import { ListPanel } from "../ListPanel";
 import { BAND_RADIO } from "./form";
-import { WlanEditor } from "./WlanEditor";
+
+// The SSID editor is most of the settings code: it loads when an SSID is
+// edited or added, so the list alone (all a read-only user sees) doesn't.
+const WlanEditor = lazyNamed(() => import("./WlanEditor"), "WlanEditor");
 
 /** The Networks page's settings section: every SSID, editable. */
 export function WlanSettingsPanel() {
@@ -38,7 +43,9 @@ export function WlanSettingsPanel() {
           <div className="small">
             <b>{wlan ? `Editing ${wlan.name}` : "New SSID"}</b>
           </div>
-          <WlanEditor wlan={wlan} list={list} onClose={onClose} />
+          <Suspense fallback={<Loading />}>
+            <WlanEditor wlan={wlan} list={list} onClose={onClose} />
+          </Suspense>
         </>
       )}
       rows={(edit, remove) =>

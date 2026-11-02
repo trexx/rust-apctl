@@ -17,13 +17,13 @@ import { COLORS, Chart, SpanPage, useTimeSpan } from "../components/Chart";
 import { QueryState, Signal } from "../components/common";
 import { lazyNamed } from "../lazy";
 
-// The settings editor is large: load it on demand.
+// The settings panels load on demand, after the page's own figures.
 const WlanSettingsPanel = lazyNamed(
-  () => import("../components/SettingsEditor"),
+  () => import("../components/settings/wlan/WlanSettingsPanel"),
   "WlanSettingsPanel",
 );
 const SpeedLimitsPanel = lazyNamed(
-  () => import("../components/SettingsEditor"),
+  () => import("../components/settings/speedLimits"),
   "SpeedLimitsPanel",
 );
 
