@@ -1206,10 +1206,8 @@ export type AlertCategory = "ap_status" | "security" | "health" | "changes";
 export interface AlertItem {
   id: string;
   ts: number;
-  key: string;
   category: AlertCategory;
   severity: "high" | "medium" | "low" | "info";
-  entity: string;
   title: string;
   message: string;
   link: string | null;
