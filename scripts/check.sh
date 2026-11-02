@@ -45,7 +45,7 @@ case ${1:-} in
     fi
     mkdir -p "$HOME/.npm"
     exec "$engine" run --rm ${as_caller[@]+"${as_caller[@]}"} -v "$PWD/web:/web:Z" -v "$HOME/.npm:/npm:Z" -e npm_config_cache=/npm -w /web \
-      docker.io/library/node:26-slim@sha256:36793bcbb160a6a16cede1e62b93f84e26b78a972a8a4c0b879c1c12f22761ec \
+      docker.io/library/node:26-slim@sha256:e4db4c914bf8ad241bd24804fc25d272d89bad97e68cdc8a1414862790a02c39 \
       sh -c "npm ci --no-fund --no-audit && npm run lint && npm run build" ;;
   "") ;;
   *) echo "usage: scripts/check.sh [--list | --web]" >&2; exit 2 ;;
