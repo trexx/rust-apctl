@@ -1806,17 +1806,16 @@ fn radio_edit(e: &DeviceEdit, rp: &Value, before: &Value, d: &mut Value, iot_loc
         r["tx_power"] = json!(tx);
     }
     copy_fields(rp, r, &[("min_rssi_enabled", Bool), ("min_rssi", Int(-90, -67))])?;
-    if let Some(b) = bool_field(rp, "hard_noise_floor_enabled")? {
-        if b && !apcfg::has_hard_noise_floor(r) {
-            return Err(format!("{label}: this radio has no interference blocker"));
+    // The render sends both only to a radio with the interference blocker.
+    for key in ["hard_noise_floor_enabled", "sens_level_enabled"] {
+        if let Some(b) = bool_field(rp, key)? {
+            if b && !apcfg::has_hard_noise_floor(r) {
+                return Err(format!("{label}: this radio has no interference blocker"));
+            }
+            r[key] = json!(b);
         }
-        r["hard_noise_floor_enabled"] = json!(b);
     }
-    copy_fields(
-        rp,
-        r,
-        &[("vwire_enabled", Bool), ("sens_level_enabled", Bool), ("loadbalance_enabled", Bool), ("sens_level", Int(-90, -50)), ("maxsta", Int(1, 200))],
-    )?;
+    copy_fields(rp, r, &[("vwire_enabled", Bool), ("loadbalance_enabled", Bool), ("sens_level", Int(-90, -50)), ("maxsta", Int(1, 200))])?;
     if apcfg::radio_off(r) && e.wireless_uplink.as_deref() == Some(band) {
         return Err(format!("{label}: this radio carries the AP's wireless uplink, so it cannot be turned off"));
     }
@@ -2887,6 +2886,13 @@ mod tests {
         assert!(any(&mut s, json!({ "antenna_id": 2 })).is_err());
         assert!(edit(&mut s, json!({ "radio": "na", "maxsta": 500 })).is_err());
         assert!(edit(&mut s, json!({ "radio": "na", "sens_level": -40 })).is_err());
+        // Like the noise floor, the sensitivity level needs the interference blocker; turning it off is always allowed.
+        s["devices"][0]["radio_table"][1]["radio_caps"] = json!(0);
+        for key in ["sens_level_enabled", "hard_noise_floor_enabled"] {
+            assert!(edit(&mut s, json!({ "radio": "na", key: true })).unwrap_err().contains("no interference blocker"), "{key}");
+        }
+        edit(&mut s, json!({ "radio": "na", "sens_level_enabled": false })).unwrap();
+        assert_eq!(s["devices"][0]["radio_table"][1]["sens_level_enabled"], false);
     }
 
     #[test]
