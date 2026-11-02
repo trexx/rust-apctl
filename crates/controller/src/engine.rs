@@ -778,7 +778,7 @@ impl Engine {
                 .as_array()
                 .into_iter()
                 .flatten()
-                .any(|c| c["fixed_ap_enabled"].as_bool() == Some(true) && crate::settings::doc_mac(&c["fixed_ap_mac"]).is_some_and(|m| changed.contains(&m)))
+                .any(|c| apcfg::flag(c, "fixed_ap_enabled", false) && crate::settings::doc_mac(&c["fixed_ap_mac"]).is_some_and(|m| changed.contains(&m)))
         });
         if locked.is_some_and(|(locked, _)| locked) {
             crate::stun::poke_all(&self.live.read().unwrap());
@@ -2045,12 +2045,13 @@ fn presence(live: &Live) -> HashMap<Mac, bool> {
 }
 
 /// The AP and its new `fixed_ap_available`, when this device record is an AP
-/// (it has radios) in `aps` whose stored value (none reads as available) differs.
+/// (it has radios) in `aps` whose stored value (read as the render reads it: none
+/// is available) differs.
 fn availability_change(doc: &Value, aps: &HashMap<Mac, bool>) -> Option<(Mac, bool)> {
     let mac = crate::settings::doc_mac(&doc["mac"])?;
     let available = *aps.get(&mac)?;
     let has_radios = doc["radio_table"].as_array().is_some_and(|r| !r.is_empty());
-    (has_radios && doc["fixed_ap_available"].as_bool().unwrap_or(true) != available).then_some((mac, available))
+    (has_radios && apcfg::flag(doc, "fixed_ap_available", true) != available).then_some((mac, available))
 }
 
 /// Writes `fixed_ap_available` into the records of the APs in `aps` whose value
@@ -2344,11 +2345,12 @@ mod tests {
         feed(&mut h, AP1, 0);
         feed(&mut h, AP2, 0);
         h.engine.handle(Input::Tick(30));
-        // AP1 informs to apctl, so the other controller's `false` is replaced;
-        // AP3 is not heard of, so its value is kept as imported.
+        // AP1 informs to apctl, so the other controller's `false` (as a string,
+        // which the render reads as false too) is replaced; AP3 is not heard of,
+        // so its value is kept as imported.
         let ap3 = "02:00:00:00:00:03";
         h.engine.set_state(40, json!({ "devices": [
-            { "mac": AP1, "radio_table": radios, "fixed_ap_available": false },
+            { "mac": AP1, "radio_table": radios, "fixed_ap_available": "false" },
             { "mac": AP2, "radio_table": radios },
             { "mac": ap3, "radio_table": radios, "fixed_ap_available": false },
         ] }));
