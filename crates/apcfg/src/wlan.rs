@@ -156,6 +156,12 @@ pub fn wlan_id(w: &Value) -> &str {
     oid(w).or_else(|| str_of(w, "name")).unwrap_or_default()
 }
 
+/// An open WLAN with WPA3 and no transition: Enhanced Open, sent encrypted as OWE
+/// (`wpa.key.1.mgmt=OWE`). A transition WLAN is deployed as its open half only.
+pub fn is_owe(w: &Value) -> bool {
+    Security::of(w) == Security::Open && flag(w, "wpa3_support", false) && !flag(w, "wpa3_transition", false)
+}
+
 /// A WPA WLAN's `wpa_mode` as the render reads it: the stored value, else `"auto"`, as
 /// the official controller defaults it. `"wpa1"` and `"wpa2"` are those alone; any other
 /// value (`"auto"` among them) is WPA/WPA2 mixed (`aaa.N.wpa=3`).
@@ -628,9 +634,9 @@ pub fn render_vap(c: &mut Cfg, ctx: &Ctx, radios: &[Radio], vaps: &[Vap], v: &Va
         c.set(a.at("id"), id);
         c.set(a.at("verbose"), 2);
         common_tail(c);
-        if security == Security::Open && wpa3 && !transition {
+        if is_owe(w) {
             // OWE transition pairs (an open VAP plus a hidden OWE companion) are not
-            // implemented; a transition WLAN is deployed as its open half only.
+            // implemented.
             c.set(a.at("wpa.key.1.mgmt"), "OWE");
         }
         if security == Security::Wep {
@@ -1048,6 +1054,18 @@ mod tests {
         assert_eq!(wpa_mode(&json!({ "security": "wpapsk" })), "auto");
         assert_eq!(wpa_mode(&json!({ "security": "wpapsk", "wpa_mode": null })), "auto");
         assert_eq!(wpa_mode(&json!({ "security": "wpapsk", "wpa_mode": "wpa2" })), "wpa2");
+    }
+
+    #[test]
+    fn security_reads_as_the_render_reads_it() {
+        assert_eq!(Security::of(&json!({})), Security::Open);
+        assert_eq!(Security::of(&json!({ "security": "WPAPSK" })), Security::Open);
+        assert_eq!(Security::of(&json!({ "security": "wpaeap" })), Security::Eap { osen: false });
+        assert!(is_owe(&json!({ "security": "open", "wpa3_support": true })));
+        assert!(is_owe(&json!({ "wpa3_support": "true", "wpa3_transition": "false" })));
+        assert!(!is_owe(&json!({ "security": "open", "wpa3_support": true, "wpa3_transition": true })));
+        assert!(!is_owe(&json!({ "security": "wpapsk", "wpa3_support": true })));
+        assert!(!is_owe(&json!({ "security": "open" })));
     }
 
     #[test]
