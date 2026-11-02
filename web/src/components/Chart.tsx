@@ -1,7 +1,6 @@
 import { Suspense, useRef, useState } from "react";
 import type { ReactNode } from "react";
 import { useSearchParams } from "react-router";
-import "uplot/dist/uPlot.min.css";
 import { isFixed, spanBounds } from "../api";
 import type { TimeSpan } from "../api";
 import { fromLocalInput, spanText, toLocalInput, useNow } from "../format";
@@ -23,8 +22,9 @@ export const COLORS = {
   teal: "var(--c-teal)",
 };
 
-// uPlot and the chart itself load with the first chart a page shows, so pages
-// without charts never fetch them and the others show before they arrive.
+// uPlot, its stylesheet and the chart itself load with the first chart a page
+// shows, so pages without charts never fetch them and the others show before
+// they arrive.
 const Plot = lazyNamed(() => import("./Plot"), "Plot");
 
 /** A compact time-series chart with a live legend. */

@@ -465,8 +465,10 @@ input.search {
   margin-top: -24px;
   padding-left: 70px;
 }
-.uplot,
-.u-legend {
+/* uPlot's own stylesheet loads with the chart, after this one: these rules
+   take precedence over its by being scoped to the chart. */
+.chart .uplot,
+.chart .u-legend {
   font-size: 12px;
   color: var(--text);
 }

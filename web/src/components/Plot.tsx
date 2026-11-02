@@ -6,6 +6,7 @@ import {
   useSyncExternalStore,
 } from "react";
 import uPlot from "uplot";
+import "uplot/dist/uPlot.min.css";
 import { spanBounds } from "../api";
 import type { TimeSpan } from "../api";
 import { SpanContext, ZoomContext } from "./span";
