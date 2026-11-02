@@ -78,6 +78,8 @@ enum Parts {
 
 /// GET /api/site/activity: Wi-Fi traffic, retries, clients and multicast,
 /// plus airtime (channel use and interference, `null` with `parts=activity`), bucketed.
+/// With `mac`, one AP's: its page asks with `parts=activity` (each radio's chart has its
+/// own airtime), so one AP's airtime is for API callers only.
 pub async fn activity(State(s): State<AppState>, Query(q): Query<RangeQuery>, Query(p): Query<ActivityParts>) -> Result<Json<Value>, ApiError> {
     let (from, to, tier) = window(&q);
     let bucket = bucket_for(to - from, tier);
