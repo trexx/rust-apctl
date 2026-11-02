@@ -887,28 +887,17 @@ struct AliasBody {
     note: Option<String>,
 }
 
-const MAX_ALIAS: usize = 64;
-const MAX_NOTE: usize = 500;
-
-fn validate(alias: &Option<String>, note: &Option<String>) -> Result<(), ApiError> {
-    if alias.as_ref().is_some_and(|a| a.chars().count() > MAX_ALIAS) {
-        return Err(ApiError::bad(format!("alias longer than {MAX_ALIAS} characters")));
-    }
-    if note.as_ref().is_some_and(|n| n.chars().count() > MAX_NOTE) {
-        return Err(ApiError::bad(format!("note longer than {MAX_NOTE} characters")));
-    }
-    Ok(())
-}
-
 /// Sets (or, with empty values, clears) a client's alias and note.
 async fn set_alias(
     State(s): State<AppState>,
     MacPath(mac): MacPath,
     Json(body): Json<AliasBody>,
 ) -> ApiResult {
-    validate(&body.alias, &body.note)?;
+    if let Some(e) = crate::engine::alias_error(body.alias.as_deref(), body.note.as_deref()) {
+        return Err(ApiError::bad(e));
+    }
     let entries = vec![AliasEdit { mac, alias: body.alias, note: body.note }];
-    let input = crate::engine::Input::SetAliases { ts: clock::now_ts(), entries, only_if_unset: false };
+    let input = crate::engine::Input::SetAliases { ts: clock::now_ts(), entries };
     s.send(input).await?;
     Ok(Json(json!({ "ok": true })))
 }

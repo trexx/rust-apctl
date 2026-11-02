@@ -41,9 +41,9 @@ pub enum Input {
     /// Active mode: apctl itself sent this reply to an AP (a `setparam`, or a
     /// reply that sets its inform interval).
     Replied { ts: Ts, mac: Mac, payload: Value },
-    /// Set or clear clients' aliases and notes (None clears). `only_if_unset`
-    /// leaves existing aliases alone, as a settings import's names do.
-    SetAliases { ts: Ts, entries: Vec<AliasEdit>, only_if_unset: bool },
+    /// Set or clear clients' aliases and notes (None clears), each within
+    /// [`MAX_ALIAS`]/[`MAX_NOTE`] (see [`alias_error`]).
+    SetAliases { ts: Ts, entries: Vec<AliasEdit> },
     /// A syslog datagram from an AP (captured in shadow mode or received directly).
     Datagram { ts: Ts, src_ip: String, payload: Vec<u8> },
     Reply { ts: Ts, mac: Mac, payload: Value },
@@ -627,7 +627,7 @@ impl Engine {
             Input::Datagram { ts, src_ip, payload } => self.datagram(ts, &src_ip, &payload),
             Input::Tick(now) => self.tick(now),
             Input::DecodeError => bump(&self.counters.decode_errors),
-            Input::SetAliases { ts, entries, only_if_unset } => self.set_aliases(ts, entries, only_if_unset),
+            Input::SetAliases { ts, entries } => self.set_aliases(ts, entries, false),
             Input::SetState { ts, state } => self.set_state(ts, state),
             Input::ThreatFound { ts, kind, bssid, device_mac, data, notify } => {
                 self.writer.exec(
@@ -1206,22 +1206,28 @@ impl Engine {
     ///
     /// Only the names are changed under the live view's lock; they are
     /// stored, and the renames recorded, once it is released.
+    ///
+    /// Values are trimmed, and cut to [`MAX_ALIAS`]/[`MAX_NOTE`] characters:
+    /// the API refuses longer ones, so only an import's are cut.
     fn set_aliases(&self, ts: Ts, entries: Vec<AliasEdit>, only_if_unset: bool) {
-        let clean = |v: Option<String>| v.map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+        let clean = |v: Option<String>, max: usize| v.map(|s| cut(s.trim(), max).to_string()).filter(|s| !s.is_empty());
         // Each change: the client, its new alias and note, and for a rename its old alias and its AP.
         let mut changes = Vec::new();
         let mut live = self.live.write().unwrap();
         for AliasEdit { mac, alias, note } in entries {
-            let (alias, mut note) = (clean(alias), clean(note));
-            let old = live.aliases.get(&mac).cloned().unwrap_or_default();
+            let (alias, note) = (clean(alias, MAX_ALIAS), clean(note, MAX_NOTE));
+            let old = live.aliases.get(&mac);
             // An import only adds names: an entry without one, or for a client
-            // already named, changes nothing, and a note it lacks is kept.
-            if only_if_unset {
-                if alias.is_none() || old.alias.is_some() {
+            // already named, changes nothing, and a note apctl has is kept.
+            let note = if only_if_unset {
+                if alias.is_none() || old.is_some_and(|o| o.alias.is_some()) {
                     continue;
                 }
-                note = note.or(old.note.clone());
-            }
+                old.and_then(|o| o.note.clone()).or(note)
+            } else {
+                note
+            };
+            let old = old.cloned().unwrap_or_default();
             if old.alias == alias && old.note == note {
                 continue;
             }
@@ -2061,11 +2067,34 @@ fn mark_available(state: &mut Value, aps: &HashMap<Mac, bool>) -> Vec<Mac> {
     changed
 }
 
-/// The names (and notes) the settings' clients were given in the other
+/// The longest alias a client is given, in characters once trimmed.
+pub const MAX_ALIAS: usize = 64;
+/// The longest note a client is given, in characters once trimmed.
+pub const MAX_NOTE: usize = 500;
+
+/// Why an alias edit would not be stored as given: an alias or a note longer
+/// than its limit once trimmed (as `set_aliases` would cut it).
+pub fn alias_error(alias: Option<&str>, note: Option<&str>) -> Option<String> {
+    let over = |v: Option<&str>, max: usize| v.is_some_and(|v| v.trim().chars().count() > max);
+    if over(alias, MAX_ALIAS) {
+        Some(format!("alias longer than {MAX_ALIAS} characters"))
+    } else if over(note, MAX_NOTE) {
+        Some(format!("note longer than {MAX_NOTE} characters"))
+    } else {
+        None
+    }
+}
+
+/// `s` cut to its first `max` characters, without what that leaves trailing.
+fn cut(s: &str, max: usize) -> &str {
+    s.char_indices().nth(max).map_or(s, |(i, _)| s[..i].trim_end())
+}
+
+/// The names (and notes) the managed site's clients were given in the other
 /// controller, as alias edits: each client with a MAC and a name.
 fn imported_names(state: &Value) -> Vec<AliasEdit> {
-    let text = |v: &Value| v.as_str().map(str::trim).filter(|s| !s.is_empty()).map(str::to_string);
-    let clients = state["clients"].as_array().into_iter().flatten();
+    let text = |v: &Value| v.as_str().map(str::to_string);
+    let clients = crate::settings::docs(state, "clients");
     clients.filter_map(|c| Some(AliasEdit { mac: crate::settings::doc_mac(&c["mac"])?, alias: Some(text(&c["name"])?), note: text(&c["note"]) })).collect()
 }
 
@@ -2474,7 +2503,7 @@ mod tests {
         let mut h = harness();
         let mac: Mac = C1.parse().unwrap();
         let set = |h: &mut Harness, alias: Option<&str>, only_if_unset: bool| {
-            h.engine.handle(Input::SetAliases { ts: 1, entries: vec![AliasEdit { mac, alias: alias.map(str::to_string), note: None }], only_if_unset });
+            h.engine.set_aliases(1, vec![AliasEdit { mac, alias: alias.map(str::to_string), note: None }], only_if_unset);
         };
         set(&mut h, Some("  Kitchen speaker "), false);
         assert_eq!(h.live.read().unwrap().aliases[&mac].alias.as_deref(), Some("Kitchen speaker"));
@@ -2485,6 +2514,15 @@ mod tests {
         let renames = stored(&h, EventKind::ClientRenamed);
         assert_eq!(renames.len(), 2, "{renames:?}");
         assert_eq!(renames[1]["from"], "Kitchen speaker");
+    }
+
+    #[test]
+    fn alias_limits_count_trimmed_characters() {
+        let alias = |n: usize| format!(" {} ", "é".repeat(n));
+        assert_eq!(alias_error(Some(&alias(MAX_ALIAS)), Some(&"n".repeat(MAX_NOTE))), None, "padding is not counted");
+        assert_eq!(alias_error(Some(&alias(MAX_ALIAS + 1)), None).as_deref(), Some("alias longer than 64 characters"));
+        assert_eq!(alias_error(None, Some(&"n".repeat(MAX_NOTE + 1))).as_deref(), Some("note longer than 500 characters"));
+        assert_eq!(cut("ab cd", 3), "ab", "nothing trailing is left after a cut");
     }
 
     #[test]
@@ -2577,7 +2615,7 @@ mod tests {
         let mut h = harness();
         let edit = |mac: &str, alias: &str| AliasEdit { mac: mac.parse().unwrap(), alias: Some(alias.into()), note: None };
         let entries = vec![edit(C1, "Speaker"), edit("02:00:00:00:01:02", "Printer"), edit("02:00:00:00:01:03", "")];
-        h.engine.handle(Input::SetAliases { ts: 1, entries, only_if_unset: true });
+        h.engine.set_aliases(1, entries, true);
         let msgs: Vec<LiveMsg> = std::iter::from_fn(|| h.rx.try_recv().ok()).collect();
         let renames: Vec<_> = msgs.iter().filter_map(|m| match m { LiveMsg::Event(e) if e.kind == EventKind::ClientRenamed => Some(e.client_mac), _ => None }).collect();
         let lists = msgs.iter().filter(|m| matches!(m, LiveMsg::Clients)).count();
@@ -2585,7 +2623,7 @@ mod tests {
         assert_eq!(h.live.read().unwrap().aliases.len(), 2);
         assert_eq!(stored(&h, EventKind::ClientRenamed).len(), 2, "each rename is still its own event");
         // A single rename names its client.
-        h.engine.handle(Input::SetAliases { ts: 2, entries: vec![edit(C1, "Kitchen speaker")], only_if_unset: false });
+        h.engine.handle(Input::SetAliases { ts: 2, entries: vec![edit(C1, "Kitchen speaker")] });
         let renames: Vec<_> = std::iter::from_fn(|| h.rx.try_recv().ok()).filter_map(|m| match m { LiveMsg::Event(e) => Some(e.client_mac), _ => None }).collect();
         assert_eq!(renames, [C1.parse().ok()]);
     }
@@ -2596,10 +2634,10 @@ mod tests {
         let (c2, c3): (Mac, Mac) = ("02:00:00:00:01:02".parse().unwrap(), "02:00:00:00:01:03".parse().unwrap());
         let edit = |mac: Mac, alias: Option<&str>, note: Option<&str>| AliasEdit { mac, alias: alias.map(str::to_string), note: note.map(str::to_string) };
         let entries = vec![edit(c2, None, Some("behind the TV")), edit(c3, None, Some("guest laptop"))];
-        h.engine.handle(Input::SetAliases { ts: 1, entries, only_if_unset: false });
+        h.engine.handle(Input::SetAliases { ts: 1, entries });
         // One import entry names a client that only has a note; another has no name at all.
         let entries = vec![edit(c2, Some("TV"), None), edit(c3, Some(""), None)];
-        h.engine.handle(Input::SetAliases { ts: 2, entries, only_if_unset: true });
+        h.engine.set_aliases(2, entries, true);
         let live = h.live.read().unwrap();
         assert_eq!((live.aliases[&c2].alias.as_deref(), live.aliases[&c2].note.as_deref()), (Some("TV"), Some("behind the TV")));
         assert_eq!((live.aliases[&c3].alias.as_deref(), live.aliases[&c3].note.as_deref()), (None, Some("guest laptop")));
@@ -2608,33 +2646,43 @@ mod tests {
     #[test]
     fn an_import_names_the_clients_not_named_in_apctl() {
         let mut h = harness();
-        let [c1, c2, c3, c4]: [Mac; 4] = [C1, "02:00:00:00:01:02", "02:00:00:00:01:03", "02:00:00:00:01:04"].map(|m| m.parse().unwrap());
+        let [c1, c2, c3, c4, c5, c6, c7]: [Mac; 7] =
+            [C1, "02:00:00:00:01:02", "02:00:00:00:01:03", "02:00:00:00:01:04", "02:00:00:00:01:05", "02:00:00:00:01:06", "02:00:00:00:01:07"].map(|m| m.parse().unwrap());
         let edit = |mac: Mac, alias: Option<&str>, note: Option<&str>| AliasEdit { mac, alias: alias.map(str::to_string), note: note.map(str::to_string) };
-        h.engine.handle(Input::SetAliases { ts: 1, entries: vec![edit(c1, Some("Kitchen speaker"), None), edit(c2, None, Some("behind the TV"))], only_if_unset: false });
+        let entries = vec![edit(c1, Some("Kitchen speaker"), None), edit(c2, None, Some("behind the TV")), edit(c5, None, Some("on the shelf"))];
+        h.engine.handle(Input::SetAliases { ts: 1, entries });
         let import = |h: &mut Harness, ts: Ts, laptop: &str| {
             let clients = json!([
                 { "mac": C1, "name": "Speaker", "note": "imported" },
                 { "mac": "02:00:00:00:01:02", "name": " TV " },
                 { "mac": "02:00:00:00:01:03", "name": laptop, "note": "guest" },
                 { "mac": "02:00:00:00:01:04", "name": "  " },
+                { "mac": "02:00:00:00:01:05", "name": "Radio", "note": "imported" },
+                { "mac": "02:00:00:00:01:06", "name": format!("  {}  ", "é".repeat(70)), "note": "n".repeat(600) },
+                { "mac": "02:00:00:00:01:07", "name": "Elsewhere", "site_id": "other" },
                 { "mac": "nope", "name": "Nobody" },
             ]);
-            h.engine.handle(Input::SetState { ts, state: json!({ "clients": clients }) });
+            let devices = json!([{ "mac": AP1, "site_id": "home" }]);
+            h.engine.handle(Input::SetState { ts, state: json!({ "clients": clients, "devices": devices }) });
         };
         import(&mut h, 2, "Laptop");
         let names = |h: &Harness| {
             let live = h.live.read().unwrap();
-            [c1, c2, c3, c4].map(|m| live.aliases.get(&m).map(|a| (a.alias.clone().unwrap_or_default(), a.note.clone().unwrap_or_default())))
+            [c1, c2, c3, c4, c5, c6, c7].map(|m| live.aliases.get(&m).map(|a| (a.alias.clone().unwrap_or_default(), a.note.clone().unwrap_or_default())))
         };
         let named = |a: &str, n: &str| Some((a.to_string(), n.to_string()));
-        // Named in apctl: kept, note and all. Only a note: named, the note kept. No name: left out.
-        let expected = [named("Kitchen speaker", ""), named("TV", "behind the TV"), named("Laptop", "guest"), None];
+        // Named in apctl: kept, note and all. Only a note: named, apctl's note kept over the import's.
+        // No name: left out. Too long: cut to the limits. Another site's: left out.
+        let expected = [
+            named("Kitchen speaker", ""), named("TV", "behind the TV"), named("Laptop", "guest"), None, named("Radio", "on the shelf"),
+            named(&"é".repeat(MAX_ALIAS), &"n".repeat(MAX_NOTE)), None,
+        ];
         assert_eq!(names(&h), expected);
-        assert_eq!(h.live.read().unwrap().aliases.len(), 3);
+        assert_eq!(h.live.read().unwrap().aliases.len(), 5);
         // A later import names no one anew: each name it has is one apctl now has too.
         import(&mut h, 3, "Work laptop");
         assert_eq!(names(&h), expected);
-        assert_eq!(stored(&h, EventKind::ClientRenamed).len(), 3, "one rename in apctl, two by the first import");
+        assert_eq!(stored(&h, EventKind::ClientRenamed).len(), 5, "one rename in apctl, four by the first import");
     }
 
     #[test]
