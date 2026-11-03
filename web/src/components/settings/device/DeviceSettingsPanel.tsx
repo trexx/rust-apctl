@@ -14,10 +14,12 @@ const radioSummary = (r: RadioSettings) =>
  * only to them, so that nobody else loads it).
  */
 export function DeviceSettingsPanel({ mac }: { mac: string }) {
-  const state = useSettingsState().data;
-  const none = !!state && !state.summary;
-  const s = useDeviceSettings(mac, !none);
-  if (none) return <NotImported title="Settings" />;
+  // The server answers 409 before an import: ask once the state says there is one.
+  const state = useSettingsState();
+  const imported = !!state.data?.summary;
+  const s = useDeviceSettings(mac, imported);
+  if (!state.data) return <QueryNote q={state} panel />;
+  if (!imported) return <NotImported title="Settings" />;
   if (!s.data) return <QueryNote q={s} panel />;
   const d = s.data;
   return (

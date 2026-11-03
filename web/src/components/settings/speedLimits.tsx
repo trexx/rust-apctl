@@ -84,11 +84,13 @@ function SpeedLimitEditor({
 
 /** Speed limits (user groups): used by SSIDs and by single clients. */
 export function SpeedLimitsPanel() {
-  const state = useSettingsState().data;
-  const none = !!state && !state.summary;
-  const g = useUserGroups(!none);
+  // The server answers 409 before an import: ask once the state says there is one.
+  const state = useSettingsState();
+  const imported = !!state.data?.summary;
+  const g = useUserGroups(imported);
   const readOnly = !useCanEdit();
-  if (none) return <NotImported title="Speed limits" />;
+  if (!state.data) return <QueryNote q={state} panel />;
+  if (!imported) return <NotImported title="Speed limits" />;
   if (!g.data) return <QueryNote q={g} panel />;
   const { active, groups } = g.data;
   return (

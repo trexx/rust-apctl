@@ -507,7 +507,7 @@ export interface StateSummary {
   summary: { wlans: string[]; networks: string[]; ap_groups: string[]; devices: number; clients: number } | null;
 }
 
-export const useSettingsState = () => useQuery({ queryKey: keys.settingsState(), queryFn: getting<StateSummary>("/api/settings/state") });
+export const useSettingsState = (enabled = true) => useQuery({ queryKey: keys.settingsState(), queryFn: getting<StateSummary>("/api/settings/state"), enabled });
 
 export const importState = (snapshot: unknown) => send<{ ok: boolean }>("POST", "/api/settings/state", snapshot);
 

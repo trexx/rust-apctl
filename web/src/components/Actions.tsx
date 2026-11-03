@@ -9,6 +9,7 @@ import {
   restartAp,
   setClientSpeedLimit,
   useCanEdit,
+  useSettingsState,
   useStatus,
   useUserGroups,
 } from "../api";
@@ -144,7 +145,9 @@ export function ClientActions({
     keys.clients(),
     keys.settings("usergroups"),
   ]);
-  const groups = useUserGroups(can).data?.groups;
+  // The speed limits exist once settings are imported (before, the server answers 409).
+  const imported = !!useSettingsState(can).data?.summary;
+  const groups = useUserGroups(can && imported).data?.groups;
   const limits = speedLimitOptions(groups ?? []);
   // A group the options leave out still shows what it does: the default one,
   // set for the client, is its own limit (none) over its SSID's; one missing
