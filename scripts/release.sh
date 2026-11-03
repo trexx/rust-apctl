@@ -12,7 +12,8 @@
 # until CI has published $IMAGE:<version>, checks that image was built from HEAD,
 # and pins its digest.
 #
-# The version must match crates/controller/Cargo.toml. Stops at the first failure.
+# The version must match crates/controller/Cargo.toml, and README.md must name its
+# image. Stops at the first failure.
 set -euo pipefail
 
 IMAGE=${APCTL_IMAGE:-ghcr.io/trexx/rust-apctl}
@@ -55,6 +56,11 @@ trap cleanup EXIT
 crate=$(scripts/version.sh)
 if [ "$crate" != "$version" ]; then
   echo "crates/controller/Cargo.toml says $crate, not $version" >&2
+  exit 1
+fi
+# The README's Kubernetes example names the image of the latest release.
+if ! grep -Eq "rust-apctl:${version//./\\.}([^0-9A-Za-z.-]|$)" README.md; then
+  echo "README.md does not name rust-apctl:$version; update its image line" >&2
   exit 1
 fi
 

@@ -79,7 +79,7 @@ spec:
       securityContext: { fsGroup: 65532 }
       containers:
         - name: apctl
-          image: ghcr.io/trexx/rust-apctl:0.15.1
+          image: ghcr.io/trexx/rust-apctl:0.16.1
           args: [serve, --active, --keys, /secret/import.json, --users-file, /secret/users]
           env:
             - { name: APCTL_SYSLOG_LISTEN, value: "0.0.0.0:5514" }
@@ -151,7 +151,8 @@ Pushing a version tag (e.g. `0.15.1`) makes CI publish the image; nothing else p
 `scripts/check.sh` runs CI's Rust checks and `scripts/check.sh --web` its web check
 (with `APCTL_ENGINE`, else docker, else podman; the files it writes are yours either way).
 `scripts/release.sh 0.15.1` runs them all and builds and checks the image locally before
-the tag goes out, and `scripts/release.sh 0.15.1 --pin <manifest>` afterwards waits for
+the tag goes out (crates/controller/Cargo.toml and the Kubernetes example above must name
+that version), and `scripts/release.sh 0.15.1 --pin <manifest>` afterwards waits for
 CI's image and pins its digest in a manifest.
 
 ## License
