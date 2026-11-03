@@ -947,7 +947,6 @@ impl Engine {
         let mgmt = new_mgmt.as_deref().unwrap_or(&previous.mgmt_cfg);
         let system = new_system.as_deref().unwrap_or(&previous.system_cfg);
         let mut data = serde_json::Map::new();
-        data.insert("cfgversion".into(), p["cfgversion"].clone());
         // Each field the push carries as it is stored: secrets masked. A masked
         // previous push is compared with it.
         let [mgmt_stored, system_stored] = [&new_mgmt, &new_system].map(|n| n.as_deref().map(cfgdiff::redact));
@@ -1297,7 +1296,7 @@ impl Engine {
         match p["notif_reason"].as_str() {
             // The AP confirms it applied a pushed config.
             Some("setparam") => {
-                let data = json!({ "cfgversion": p["cfgversion"], "seconds_after_push": since_push });
+                let data = json!({ "seconds_after_push": since_push });
                 self.emit(Event::device(ts, EventKind::ConfigApplied, mac, data));
             }
             Some("event") => {
@@ -1395,7 +1394,7 @@ impl Engine {
                 Value::String(r) if r.is_empty() => json!(label),
                 r => r.clone(),
             };
-            json!({ "essid": essid, "reason": reason, "auth_algo": n["auth_algo"], "rssi": crate::connections::rssi(&detail) })
+            json!({ "essid": essid, "reason": reason, "rssi": crate::connections::rssi(&detail) })
         });
         // The whole notification, with the channel and width at the time: timings, failure
         // counters and stage flags for connectivity stats, and the roaming views.
@@ -1556,7 +1555,7 @@ impl Engine {
                 continue;
             }
             self.isolated.insert(ap, heard);
-            let data = json!({ "heard_by": heard_by.to_string(), "bssid": n.bssid, "signal": n.signal });
+            let data = json!({ "heard_by": heard_by.to_string() });
             self.emit(Event::device(ts, EventKind::ApIsolated, ap, data));
         }
     }
@@ -1987,10 +1986,7 @@ fn device_view(ts: Ts, snap: Snapshot, prev: Option<DeviceView>) -> (DeviceView,
 
 /// `new`: never seen before (not even in an earlier run).
 fn connected_event(ts: Ts, c: &ClientSample, new: bool) -> Event {
-    Event::client_on(ts, EventKind::ClientConnected, c.ap_mac, c.mac, json!({
-        "essid": c.essid, "radio": c.radio, "channel": c.channel, "signal": c.signal,
-        "hostname": c.hostname, "ip": c.ip, "new": new,
-    }))
+    Event::client_on(ts, EventKind::ClientConnected, c.ap_mac, c.mac, json!({ "essid": c.essid, "radio": c.radio, "channel": c.channel, "signal": c.signal, "new": new }))
 }
 
 /// Marks a client disconnected, in the live view and the database, and
@@ -2003,10 +1999,7 @@ fn disconnect(writer: &Writer, ts: Ts, mac: Mac, c: &mut ClientView, reason: &st
         "UPDATE clients SET connected = 0, last_seen = MAX(COALESCE(last_seen, ?2), ?2) WHERE mac = ?1",
         vec![Sql::Text(mac.to_string()), Sql::Integer(c.last_seen)],
     );
-    Event::client_on(ts, EventKind::ClientDisconnected, c.sample.ap_mac, mac, json!({
-        "reason": reason, "last_seen": c.last_seen, "essid": c.sample.essid,
-        "connected_for": c.sample.uptime, "last_signal": c.sample.signal,
-    }))
+    Event::client_on(ts, EventKind::ClientDisconnected, c.sample.ap_mac, mac, json!({ "reason": reason, "connected_for": c.sample.uptime, "last_signal": c.sample.signal }))
 }
 
 /// A process-restart notification's `exit_status` as a number: the AP may send
@@ -2404,7 +2397,8 @@ mod tests {
         // An AP that never informs again goes offline, and its clients with it.
         h.engine.handle(Input::Tick(7201 + limit));
         assert_eq!(events(&mut h), [("ap_offline", None), ("client_disconnected", Some(C1.into()))]);
-        assert_eq!(stored(&h, EventKind::ClientDisconnected)[0]["reason"], "ap_offline");
+        let gone = stored(&h, EventKind::ClientDisconnected).remove(0);
+        assert_eq!((&gone["reason"], gone.as_object().map(|d| d.len())), (&json!("ap_offline"), Some(3)), "reason, connected_for and last_signal only: {gone}");
         // A client of an AP that is not known at all (e.g. forgotten): it goes an hour into the run.
         let mut h = harness();
         h.engine.handle(Input::Inform { ts: 0, payload: inform(AP1, 1000, &[(C1, "b1")]) });
@@ -2934,6 +2928,7 @@ mod tests {
         );
         let failed = stored(&h, EventKind::ClientConnectFailed);
         assert_eq!((&failed[0]["reason"], &failed[0]["rssi"]), (&json!("WPA authentication"), &json!(-60.0)));
+        assert_eq!(failed[0].as_object().map(|d| d.len()), Some(3), "essid, reason and rssi only: {}", failed[0]);
         assert_eq!(failed[1]["reason"], "DNS response not seen");
         // One whose mac is not one is counted as undecodable.
         let mut bad = notif(AP1, "setparam", Value::Null);
