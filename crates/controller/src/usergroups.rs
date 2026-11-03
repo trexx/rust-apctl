@@ -142,17 +142,10 @@ pub fn apply_usergroup(state: &mut Value, e: &GroupEdit) -> Result<String, Strin
     if let Some(u) = up {
         g["qos_rate_max_up"] = json!(u);
     }
-    let show = |v: &Value| match num(v) {
-        Some(n) if n > 0 => format!("{} Mbps", n as f64 / 1000.0),
-        _ => "none".into(),
-    };
-    Ok(format!(
-        "{} speed limit \"{}\": down {}, up {}",
-        if created { "added" } else { "changed" },
-        g["name"].as_str().unwrap_or("?"),
-        show(&g["qos_rate_max_down"]),
-        show(&g["qos_rate_max_up"])
-    ))
+    // Told as the render reads the limits.
+    let show = |n: i64| if n > 0 { format!("{} Mbps", n as f64 / 1000.0) } else { "none".into() };
+    let (down, up) = apcfg::usergroup_limits(g);
+    Ok(format!("{} speed limit \"{}\": down {}, up {}", if created { "added" } else { "changed" }, g["name"].as_str().unwrap_or("?"), show(down), show(up)))
 }
 
 /// A client and the speed limit (user group) of its own it gets: none (or
@@ -182,15 +175,17 @@ pub async fn usergroups(State(s): State<AppState>) -> Result<Json<Value>, ApiErr
     Ok(Json(json!({ "active": s.active, "groups": usergroup_list(&state, &client_names(&s)) })))
 }
 
-/// The site's user groups as the editors show them, with what uses each.
+/// The site's user groups as the editors show them, with what uses each and
+/// their limits as the render reads them (kbps, -1 for none).
 fn usergroup_list(state: &Value, names: &ClientNames) -> Vec<Value> {
     let users = group_users(state, names);
     let group = |g: &Value| {
         let id = id_of(g).unwrap_or_default();
         let used_by = users.get(id.as_str()).map(Vec::as_slice).unwrap_or_default();
+        let (down, up) = apcfg::usergroup_limits(g);
         json!({
             "id": id, "name": g["name"], "default": g["attr_hidden_id"].as_str() == Some("Default"),
-            "qos_rate_max_down": g["qos_rate_max_down"], "qos_rate_max_up": g["qos_rate_max_up"], "used_by": used_by,
+            "qos_rate_max_down": down, "qos_rate_max_up": up, "used_by": used_by,
         })
     };
     let mut groups: Vec<Value> = docs(state, "usergroup").map(group).collect();
@@ -288,6 +283,24 @@ mod tests {
         s["wlanconf"] = json!([ssid("A", json!("")), ssid("B", json!("gone")), ssid("C", Value::Null), ssid("D", json!("ug-slow"))]);
         assert_eq!(used_by(&s, true), Some(json!(["SSID A", "SSID B", "SSID C"])));
         assert_eq!(used_by(&s, false), Some(json!(["SSID D"])));
+    }
+
+    #[test]
+    fn limits_are_sent_as_the_render_reads_them() {
+        let mut s = state();
+        s["usergroup"] = json!([
+            { "_id": "a", "name": "Text", "site_id": "s1", "qos_rate_max_down": "2500", "qos_rate_max_up": 1000 },
+            { "_id": "b", "name": "Unreadable", "site_id": "s1", "qos_rate_max_down": "2500.0", "qos_rate_max_up": 1.5 },
+        ]);
+        let rates = |name: &str| {
+            let g = usergroup_list(&s, &ClientNames::new()).into_iter().find(|g| g["name"] == name).unwrap();
+            (g["qos_rate_max_down"].clone(), g["qos_rate_max_up"].clone())
+        };
+        assert_eq!(rates("Text"), (json!(2500), json!(1000)));
+        assert_eq!(rates("Unreadable"), (json!(-1), json!(-1)), "the APs get no limit from these");
+        assert_eq!(rates("Default"), (json!(-1), json!(-1)));
+        let what = apply_usergroup(&mut s, &GroupEdit::Edit("b".into(), json!({ "name": "Unreadable" }))).unwrap();
+        assert!(what.ends_with("down none, up none"), "{what}");
     }
 
     #[test]
