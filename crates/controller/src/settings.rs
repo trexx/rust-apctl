@@ -402,7 +402,7 @@ fn wlans_view(state: &Value, informs: &HashMap<inform::Mac, Arc<Value>>, active:
         .map(|w| {
             let mut v = json!({
                 "id": id_of(w), "aps": wlan_aps(state, w), "protection": protection_of(w).map(|p| p.name), "security": security_label(w), "editable": !flag(w, "attr_no_edit", false),
-                "has_passphrase": w["x_passphrase"].as_str().is_some_and(|p| !p.is_empty()),
+                "has_passphrase": w["x_passphrase"].as_str().is_some_and(|p| !p.is_empty()), "psk": Security::of(w) == Security::Psk,
             });
             if let Value::Object(o) = &mut v {
                 o.extend(pick(w, WLAN_FIELDS));
@@ -1286,10 +1286,14 @@ fn wlan_security(p: &Value, w: &mut Value) -> Result<(), String> {
 }
 
 /// The password, checked against the protection the SSID ends up with (`w`,
-/// once Force Wi-Fi 4 has had its say).
+/// once Force Wi-Fi 4 has had its say). One given for a security that takes
+/// none (open, Enhanced Open, Enterprise) is refused: the APs would never get it.
 fn wlan_password(p: &Value, before: &Value, w: &mut Value, changed: &mut Vec<&str>) -> Result<(), String> {
     let (psk, wpa3, transition) = psk_wpa3(w);
     let given = str_field(p, "passphrase")?;
+    if given.is_some() && !psk {
+        return Err(format!("{} takes no password", security_label(w)));
+    }
     if psk && given.is_none() && w["x_passphrase"].as_str().is_none_or(str::is_empty) {
         return Err("a password is needed for WPA2/WPA3".into());
     }
@@ -2120,6 +2124,8 @@ mod tests {
         edit(&mut s, json!({ "enhanced_iot": true })).unwrap();
         let w = &s["wlanconf"][0];
         assert_eq!((w["security"].as_str(), w["wpa_mode"].as_str(), security_label(w)), (Some("wpaeap"), Some("wpa2"), "WPA2 Enterprise"));
+        assert_eq!(edit(&mut s, json!({ "passphrase": "correct horse" })).unwrap_err(), "WPA2 Enterprise takes no password");
+        assert!(s["wlanconf"][0].get("x_passphrase").is_none());
         // Open stays open; Enhanced Open loses WPA3 with the template.
         for wpa3 in [false, true] {
             let mut s = state();
@@ -2128,6 +2134,10 @@ mod tests {
             let w = &s["wlanconf"][0];
             assert_eq!((w["security"].as_str(), w["wpa_mode"].as_str(), security_label(w)), (Some("open"), Some("auto"), "Open"), "{wpa3}");
         }
+        // Enhanced Open takes no password either.
+        let mut s = state();
+        (s["wlanconf"][0]["security"], s["wlanconf"][0]["wpa3_support"]) = (json!("open"), json!(true));
+        assert!(edit(&mut s, json!({ "passphrase": "correct horse" })).unwrap_err().ends_with("takes no password"));
     }
 
     #[test]
@@ -2855,6 +2865,11 @@ mod tests {
         assert_eq!(vlans(&s)[1..], [Value::Null, json!(30)]);
         s["networkconf"][2]["vlan"] = json!(1);
         assert_eq!(vlans(&s)[2], Value::Null);
+        // Whether an SSID takes a password, for the editor's password row.
+        assert_eq!(v["wlans"][0]["psk"], true);
+        s["wlanconf"][0]["security"] = json!("wpaeap");
+        assert_eq!(wlans_view(&s, &HashMap::new(), true)["wlans"][0]["psk"], false);
+        s["wlanconf"][0]["security"] = json!("wpapsk");
         // An SSID stored without bands is listed on the two the APs broadcast it on.
         s["wlanconf"][0]["wlan_bands"] = json!([]);
         assert_eq!(wlans_view(&s, &HashMap::new(), true)["wlans"][0]["wlan_bands"], json!(["2g", "5g"]));
