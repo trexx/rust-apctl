@@ -15,7 +15,7 @@ jobs:
     permissions:
       contents: 'read'
     steps:
-      - uses: 'actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1' # v7.0.1
+      - uses: 'trexx/actions/.github/actions/checkout@shared-steps'
       - name: 'Tag matches the controller version'
         run: |
           CRATE="$(scripts/version.sh)"
@@ -31,7 +31,7 @@ jobs:
 
   build:
     needs: [ 'version', 'test' ]
-    uses: 'trexx/actions/.github/workflows/build.yml@e55688a60847a9cf87d0ead14cf3885560ab9bac' # main
+    uses: 'trexx/actions/.github/workflows/build.yml@main'
     secrets: 'inherit'
     permissions:
       contents: read
@@ -46,8 +46,8 @@ jobs:
       contents: 'read'
       packages: 'read'
     steps:
-      - uses: 'actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1' # v7.0.1
-      - uses: 'docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6' # v4.7.0
+      - uses: 'trexx/actions/.github/actions/checkout@shared-steps'
+      - uses: 'trexx/actions/.github/actions/docker-login@shared-steps'
         with:
           registry: 'ghcr.io'
           username: '${{ github.repository_owner }}'

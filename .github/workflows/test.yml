@@ -19,14 +19,14 @@ jobs:
     permissions:
       contents: 'read'
     steps:
-      - uses: 'actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1' # v7.0.1
-      - uses: 'dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8' # master
+      - uses: 'trexx/actions/.github/actions/checkout@shared-steps'
+      - uses: 'trexx/actions/.github/actions/rust-toolchain@shared-steps'
         with:
           # The release of the Dockerfile's rust image: Renovate bumps both in one PR
           # (.github/renovate.json).
           toolchain: '1.99'
           components: 'clippy'
-      - uses: 'Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0' # v2.9.3
+      - uses: 'trexx/actions/.github/actions/rust-cache@shared-steps'
       # The tests built on real captures need fixtures kept outside the repository
       # (APCTL_TESTDATA, docs/captures.md), which CI never has: they pass without
       # checking anything.
@@ -42,10 +42,10 @@ jobs:
     permissions:
       contents: 'read'
     steps:
-      - uses: 'actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1' # v7.0.1
+      - uses: 'trexx/actions/.github/actions/checkout@shared-steps'
       # npm's download cache, kept between runs (keyed by the lock file) and mounted into
       # the container, so npm ci does not fetch every package again.
-      - uses: 'actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9' # v6.1.0
+      - uses: 'trexx/actions/.github/actions/cache@shared-steps'
         with:
           path: '~/.npm'
           key: "npm-${{ hashFiles('web/package-lock.json') }}"
