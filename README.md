@@ -80,7 +80,7 @@ spec:
       securityContext: { fsGroup: 65532 }
       containers:
         - name: apctl
-          image: ghcr.io/trexx/rust-apctl:0.16.1
+          image: ghcr.io/trexx/rust-apctl:0.17.0
           args: [serve, --active, --keys, /secret/import.json, --users-file, /secret/users]
           env:
             - { name: APCTL_SYSLOG_LISTEN, value: "0.0.0.0:5514" }
