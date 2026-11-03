@@ -24,7 +24,7 @@ pub struct RangeQuery {
     pub to: Option<Ts>,
     /// `ng`, `na` or `6e`; all bands when absent.
     pub band: Option<String>,
-    /// One AP only (activity), in any form a MAC is written in; another value
+    /// One AP only (activity, top, multicast), in any form a MAC is written in; another value
     /// is rejected (400).
     pub mac: Option<inform::Mac>,
 }
