@@ -424,15 +424,14 @@ pub async fn status(State(s): State<AppState>) -> Result<Json<Value>, ApiError> 
     let (state, scans) = {
         let mut live = s.live.write().unwrap();
         check_scans(&mut live, clock::now_ts());
-        let scans: Vec<Value> = live.scans.iter().map(|(m, sc)| json!({ "mac": m, "band": sc.band, "started": sc.started })).collect();
+        let scans: Vec<Value> = live.scans.values().map(|sc| json!({ "band": sc.band })).collect();
         (live.state.clone(), scans)
     };
     let st = state.as_deref();
     let tz = st.and_then(crate::settings::timezone);
     let cfg = settings(st);
     Ok(Json(json!({
-        "active": s.active, "has_settings": st.and_then(radio_ai).is_some(), "timezone": tz,
-        "next_run": next_run(&cfg, tz, clock::now_ts()), "running": RUNNING.load(Ordering::SeqCst), "scans": scans,
+        "active": s.active, "timezone": tz, "next_run": next_run(&cfg, tz, clock::now_ts()), "running": RUNNING.load(Ordering::SeqCst), "scans": scans,
         "allowed": { "ng": allowed(st, "ng", cfg.dfs), "na": allowed(st, "na", cfg.dfs) }, "settings": cfg,
     })))
 }
