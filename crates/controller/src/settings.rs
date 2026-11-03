@@ -412,9 +412,12 @@ fn wlans_view(state: &Value, informs: &HashMap<inform::Mac, Arc<Value>>, active:
             v
         })
         .collect();
+    // `vlan`: the one the render tags the network's clients with (none untagged);
     // `for_ssid`: whether an SSID may be put on it ([`ssid_network`]).
-    let networks: Vec<Value> =
-        docs(state, "networkconf").map(|n| json!({ "id": id_of(n), "name": n["name"], "vlan": n["vlan"], "for_ssid": ssid_network(n).is_ok() })).collect();
+    let site = site_id(state).unwrap_or_default();
+    let networks: Vec<Value> = docs(state, "networkconf")
+        .map(|n| json!({ "id": id_of(n), "name": n["name"], "vlan": apcfg::network_vlan(state, site, oid(n)), "for_ssid": ssid_network(n).is_ok() }))
+        .collect();
     let aps: Vec<Value> = docs(state, "devices").map(|d| json!({ "mac": doc_mac(&d["mac"]), "name": d["name"] })).collect();
     let (unsupported, unknown) = feature_support(state, informs);
     let mdns: Vec<Value> = apcfg::MDNS_SERVICES.iter().map(|(code, name, _)| json!({ "code": code, "name": name })).collect();
@@ -2845,6 +2848,13 @@ mod tests {
             assert!(!w.contains_key(k), "{k} is shown as the protection, or derived by an edit");
         }
         assert_eq!(v["networks"][0].as_object().unwrap().keys().collect::<Vec<_>>(), ["for_ssid", "id", "name", "vlan"]);
+        // A network's VLAN as the render tags with it: none unless enabled, and only 2-4094.
+        let vlans = |s: &Value| wlans_view(s, &HashMap::new(), true)["networks"].as_array().unwrap().iter().map(|n| n["vlan"].clone()).collect::<Vec<_>>();
+        (s["networkconf"][1]["vlan_enabled"], s["networkconf"][1]["vlan"]) = (json!(false), json!(20));
+        (s["networkconf"][2]["vlan_enabled"], s["networkconf"][2]["vlan"]) = (json!(true), json!("30"));
+        assert_eq!(vlans(&s)[1..], [Value::Null, json!(30)]);
+        s["networkconf"][2]["vlan"] = json!(1);
+        assert_eq!(vlans(&s)[2], Value::Null);
         // An SSID stored without bands is listed on the two the APs broadcast it on.
         s["wlanconf"][0]["wlan_bands"] = json!([]);
         assert_eq!(wlans_view(&s, &HashMap::new(), true)["wlans"][0]["wlan_bands"], json!(["2g", "5g"]));
