@@ -11,7 +11,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant};
@@ -440,15 +440,29 @@ pub enum Write {
 /// What the writer thread is sent.
 enum Msg {
     Write(Write),
-    /// Commit everything queued so far, then answer.
-    Flush(Sender<()>),
+    /// Commit everything queued so far, then answer whether every batch since the
+    /// last answer committed.
+    Flush(Sender<bool>),
 }
+
+/// What the writer thread tells every `Writer` about itself.
+#[derive(Default)]
+struct Health {
+    /// Set when the writer thread has stopped: nothing sent is stored any more.
+    stopped: AtomicBool,
+    /// Write batches lost in a row (their transaction rolled back: disk full, an I/O
+    /// error, a read-only file system); back to 0 once one commits.
+    lost_batches: AtomicU32,
+}
+
+/// Batches lost in a row (about a second each) before [`Writer::failing`] says so:
+/// one bad batch is not yet a disk that takes nothing.
+const FAILING_AFTER: u32 = 3;
 
 #[derive(Clone)]
 pub struct Writer {
     tx: Sender<Msg>,
-    /// Set when the writer thread has stopped: nothing sent is stored any more.
-    stopped: Arc<AtomicBool>,
+    health: Arc<Health>,
 }
 
 impl Writer {
@@ -462,16 +476,23 @@ impl Writer {
     }
 
     /// Commits the writes queued so far, waiting at most `timeout`. False if
-    /// they could not be committed in time (or the writer has stopped).
+    /// they could not be committed in time, if a batch since the last flush was
+    /// rolled back (its writes are lost), or if the writer has stopped.
     pub fn flush(&self, timeout: Duration) -> bool {
         let (ack, done) = channel();
-        self.tx.send(Msg::Flush(ack)).is_ok() && done.recv_timeout(timeout).is_ok()
+        self.tx.send(Msg::Flush(ack)).is_ok() && done.recv_timeout(timeout) == Ok(true)
     }
 
-    /// True once the writer thread has stopped (an error opening or writing the
-    /// databases, or a panic): the process can no longer store anything.
+    /// True once the writer thread has stopped (an error opening the databases,
+    /// or a panic): the process can no longer store anything.
     pub fn stopped(&self) -> bool {
-        self.stopped.load(Ordering::Relaxed)
+        self.health.stopped.load(Ordering::Relaxed)
+    }
+
+    /// True while the last [`FAILING_AFTER`] write batches were all rolled back:
+    /// nothing is being stored, though the writer keeps trying.
+    pub fn failing(&self) -> bool {
+        self.health.lost_batches.load(Ordering::Relaxed) >= FAILING_AFTER
     }
 }
 
@@ -494,26 +515,26 @@ impl Store {
         std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
         migrate(dir)?;
         let (tx, rx) = channel();
-        let stopped = Arc::new(AtomicBool::new(false));
+        let health = Arc::new(Health::default());
         let writer_dir = dir.to_path_buf();
-        let flag = stopped.clone();
+        let shared = health.clone();
         std::thread::Builder::new()
             .name("sqlite-writer".into())
             .spawn(move || {
                 // Raised however the thread ends, a panic included.
-                struct Stopped(Arc<AtomicBool>);
+                struct Stopped(Arc<Health>);
                 impl Drop for Stopped {
                     fn drop(&mut self) {
-                        self.0.store(true, Ordering::Relaxed);
+                        self.0.stopped.store(true, Ordering::Relaxed);
                     }
                 }
-                let _stopped = Stopped(flag);
-                if let Err(e) = writer_loop(&writer_dir, rx) {
+                let stopped = Stopped(shared);
+                if let Err(e) = writer_loop(&writer_dir, rx, &stopped.0) {
                     tracing::error!("sqlite writer stopped, nothing more will be stored: {e:#}");
                 }
             })?;
         let store = Store { dir: dir.to_path_buf(), pools: Default::default() };
-        Ok((std::sync::Arc::new(store), Writer { tx, stopped }))
+        Ok((std::sync::Arc::new(store), Writer { tx, health }))
     }
 
     /// Runs `f` with a pooled read-only connection. Call from a blocking context.
@@ -543,10 +564,12 @@ fn open_all(dir: &Path) -> Result<Conns> {
 /// The channel to the writer stays unbounded: the engine and the request
 /// handlers must never block on the disk, and the writer drains a second's
 /// worth of writes per commit, far more than the APs produce.
-fn writer_loop(dir: &Path, rx: Receiver<Msg>) -> Result<()> {
+fn writer_loop(dir: &Path, rx: Receiver<Msg>, health: &Health) -> Result<()> {
     let mut conns = open_all(dir)?;
     let mut pending: Vec<Write> = Vec::new();
-    let mut acks: Vec<Sender<()>> = Vec::new();
+    let mut acks: Vec<Sender<bool>> = Vec::new();
+    // Whether every batch since the last answer to a Flush committed.
+    let mut committed = true;
     let mut last_flush = Instant::now();
     // The first maintenance a minute after start, with the hourly retention (see `maintenance`).
     let mut last_maintenance = Instant::now().checked_sub(Duration::from_secs(240)).unwrap_or_else(Instant::now);
@@ -557,19 +580,22 @@ fn writer_loop(dir: &Path, rx: Receiver<Msg>) -> Result<()> {
             Ok(Msg::Write(w)) => pending.push(w),
             Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => {
-                flush(&mut conns, &mut pending);
+                commit(&mut conns, &mut pending, health);
                 return Ok(());
             }
         }
         if !acks.is_empty() || (!pending.is_empty() && (last_flush.elapsed() >= Duration::from_secs(1) || pending.len() >= 5000)) {
-            flush(&mut conns, &mut pending);
+            committed &= commit(&mut conns, &mut pending, health);
             last_flush = Instant::now();
-            for ack in acks.drain(..) {
-                let _ = ack.send(());
+            if !acks.is_empty() {
+                for ack in acks.drain(..) {
+                    let _ = ack.send(committed);
+                }
+                committed = true;
             }
         }
         if last_maintenance.elapsed() >= Duration::from_secs(300) {
-            flush(&mut conns, &mut pending);
+            committed &= commit(&mut conns, &mut pending, health);
             let hourly = last_hourly.is_none_or(|t| t.elapsed() >= Duration::from_secs(3600));
             maintenance(&mut conns, crate::clock::now_ts(), hourly);
             last_maintenance = Instant::now();
@@ -580,8 +606,24 @@ fn writer_loop(dir: &Path, rx: Receiver<Msg>) -> Result<()> {
     }
 }
 
-/// Commits the pending writes; returns how many failed.
-fn flush(conns: &mut Conns, pending: &mut Vec<Write>) -> usize {
+/// Commits what is pending, if anything, and keeps count of the batches lost in a
+/// row. False if the batch was lost.
+fn commit(conns: &mut Conns, pending: &mut Vec<Write>, health: &Health) -> bool {
+    if pending.is_empty() {
+        return true;
+    }
+    let (_, committed) = flush(conns, pending);
+    if committed {
+        health.lost_batches.store(0, Ordering::Relaxed);
+    } else {
+        health.lost_batches.fetch_add(1, Ordering::Relaxed);
+    }
+    committed
+}
+
+/// Commits the pending writes; returns how many failed, and whether every
+/// database's transaction committed (else its whole batch is lost).
+fn flush(conns: &mut Conns, pending: &mut Vec<Write>) -> (usize, bool) {
     let mut by_db: [Vec<Write>; 3] = Default::default();
     for w in pending.drain(..) {
         let db = match &w {
@@ -590,7 +632,7 @@ fn flush(conns: &mut Conns, pending: &mut Vec<Write>) -> usize {
         };
         by_db[db as usize].push(w);
     }
-    let mut failed = 0;
+    let (mut failed, mut committed) = (0, true);
     for (conn, writes) in conns.iter_mut().zip(by_db) {
         if writes.is_empty() {
             continue;
@@ -600,11 +642,11 @@ fn flush(conns: &mut Conns, pending: &mut Vec<Write>) -> usize {
             Ok(f) => failed += f,
             Err(e) => {
                 tracing::error!("write batch failed: {e:#}");
-                failed += n;
+                (failed, committed) = (failed + n, false);
             }
         }
     }
-    failed
+    (failed, committed)
 }
 
 /// Commits a batch in one transaction. A write that fails (e.g. a constraint)
@@ -887,13 +929,13 @@ pub fn series(conn: &Connection, table: &'static Table, keys: &[String], only: O
 #[cfg(test)]
 pub(crate) fn capture() -> (Writer, impl FnOnce(&Path) -> Result<usize>) {
     let (tx, rx) = channel();
-    let writer = Writer { tx, stopped: Default::default() };
+    let writer = Writer { tx, health: Default::default() };
     let store = move |dir: &Path| {
         std::fs::create_dir_all(dir)?;
         migrate(dir)?;
         let mut conns = open_all(dir)?;
         let mut writes = rx.try_iter().filter_map(|m| match m { Msg::Write(w) => Some(w), Msg::Flush(_) => None }).collect();
-        Ok(flush(&mut conns, &mut writes))
+        Ok(flush(&mut conns, &mut writes).0)
     };
     (writer, store)
 }

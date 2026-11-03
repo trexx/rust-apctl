@@ -403,10 +403,14 @@ async fn status(State(s): State<AppState>) -> ApiResult {
     })))
 }
 
-/// For Kubernetes probes. Fails once nothing can be stored or processed any more.
+/// For Kubernetes probes. Fails once nothing can be stored or processed any more,
+/// and while every write batch is rolled back (e.g. a file system remounted read-only).
 async fn healthz(State(s): State<AppState>) -> Response {
     if s.writer.stopped() {
         return (StatusCode::SERVICE_UNAVAILABLE, "database writer stopped").into_response();
+    }
+    if s.writer.failing() {
+        return (StatusCode::SERVICE_UNAVAILABLE, "database writes failing").into_response();
     }
     // The engine thread drops its end of the queue however it ends, a panic
     // included; a panic under the live view's lock poisons it for every reader.
@@ -1887,5 +1891,25 @@ mod tests {
         assert_eq!(get(&app, "/healthz").await.status(), StatusCode::OK);
         drop(engine); // as when the engine thread panics
         assert_eq!(get(&app, "/healthz").await.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn healthz_fails_while_write_batches_are_lost() {
+        let (s, _engine, _dir) = state();
+        let app = router(s.clone());
+        // A statement that ends the batch's transaction loses the batch, as a full disk does.
+        let lose = || {
+            s.writer.exec(Db::Config, "ROLLBACK", vec![]);
+            s.writer.flush(std::time::Duration::from_secs(5))
+        };
+        for _ in 0..2 {
+            assert!(!lose());
+        }
+        assert_eq!(get(&app, "/healthz").await.status(), StatusCode::OK, "two lost batches are not yet a failing disk");
+        assert!(!lose());
+        assert_eq!(get(&app, "/healthz").await.status(), StatusCode::SERVICE_UNAVAILABLE);
+        s.writer.exec(Db::Config, "INSERT INTO client_aliases (mac, alias, updated) VALUES ('a', 'x', 1)", vec![]);
+        assert!(s.writer.flush(std::time::Duration::from_secs(5)));
+        assert_eq!(get(&app, "/healthz").await.status(), StatusCode::OK);
     }
 }
