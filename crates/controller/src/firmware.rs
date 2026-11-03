@@ -172,7 +172,7 @@ pub struct Job {
     pub mac: Mac,
     pub name: Option<String>,
     pub from: Option<String>,
-    /// The version to install, or "custom" for a firmware URL.
+    /// The version to install, or [`CUSTOM`] for a firmware URL.
     pub target: String,
     /// What the upgrade command sends, not shown: a custom firmware URL may hold a
     /// credential, and the page is open to read-only users.
@@ -182,17 +182,24 @@ pub struct Job {
     pub md5: Option<String>,
     #[serde(skip)]
     pub sha256: Option<String>,
-    #[serde(skip)]
-    pub custom: bool,
     pub state: JobState,
     pub sent_at: Option<Ts>,
     pub expires: Option<Ts>,
 }
 
+/// The target of an upgrade from a firmware URL (a release's is its version),
+/// as the page and the ap_upgrade_sent event show it.
+pub const CUSTOM: &str = "custom";
+
 impl Job {
-    /// A queued upgrade of `a` to `target`, a release version or "custom" for a firmware URL.
-    fn new(a: ApInfo, target: String, url: String, md5: Option<String>, sha256: Option<String>, custom: bool) -> Job {
-        Job { mac: a.mac, name: a.name, from: a.version, target, url, md5, sha256, custom, state: JobState::Queued, sent_at: None, expires: None }
+    /// A queued upgrade of `a` to `target`, a release version or [`CUSTOM`] for a firmware URL.
+    fn new(a: ApInfo, target: String, url: String, md5: Option<String>, sha256: Option<String>) -> Job {
+        Job { mac: a.mac, name: a.name, from: a.version, target, url, md5, sha256, state: JobState::Queued, sent_at: None, expires: None }
+    }
+
+    /// Whether it installs from a firmware URL rather than a release.
+    pub fn custom(&self) -> bool {
+        self.target == CUSTOM
     }
 }
 
@@ -393,7 +400,7 @@ async fn change_queue(s: &AppState, op: Op) -> Result<Changed, ApiError> {
 /// but at least [`STEP_DEADLINE`] and at most a day.
 pub fn command(jobs: &mut Jobs, mac: &Mac, inform: &Value, now: Ts) -> Option<Result<Value, &'static str>> {
     let j = jobs.current_for(mac).filter(|j| j.state == JobState::Queued)?;
-    if !j.custom && inform["internet"].as_bool() == Some(false) {
+    if !j.custom() && inform["internet"].as_bool() == Some(false) {
         return Some(Err("the AP has no internet access to download the firmware"));
     }
     let estimate = inform["upgrade_duration"].as_i64().unwrap_or(0).saturating_add(inform["reboot_duration"].as_i64().unwrap_or(0));
@@ -405,7 +412,7 @@ pub fn command(jobs: &mut Jobs, mac: &Mac, inform: &Value, now: Ts) -> Option<Re
         j.from = inform["version"].as_str().map(str::to_string);
     }
     // For a firmware URL the official controller expects (and sends) "unknown".
-    let version = if j.custom { "unknown" } else { j.target.as_str() };
+    let version = if j.custom() { "unknown" } else { j.target.as_str() };
     let mut cmd = json!({ "_type": "upgrade", "version": version, "url": j.url, "server_time_in_utc": crate::active::server_time(now) });
     if let Some(m) = &j.md5 {
         cmd["md5sum"] = json!(m);
@@ -606,7 +613,7 @@ pub async fn upgrade(State(s): State<AppState>, Json(b): Json<UpgradeBody>) -> R
     for a in chosen {
         let (_, rel) = release_for(&rels, a.model.as_deref());
         match (status(a.version.as_deref(), rel, a.required.as_deref()), rel, a.online) {
-            (Status::UpdateAvailable, Some(r), true) => jobs.push(Job::new(a, r.version.clone(), r.url.clone(), r.md5.clone(), r.sha256.clone(), false)),
+            (Status::UpdateAvailable, Some(r), true) => jobs.push(Job::new(a, r.version.clone(), r.url.clone(), r.md5.clone(), r.sha256.clone())),
             (st, _, online) => {
                 let why = match st {
                     _ if !online => Skip::Offline,
@@ -650,7 +657,7 @@ pub async fn upgrade_url(State(s): State<AppState>, Json(b): Json<UrlBody>) -> R
     if !a.online {
         return Err(ApiError::ap_offline());
     }
-    let job = Job::new(a, "custom".into(), b.url, None, None, true);
+    let job = Job::new(a, CUSTOM.into(), b.url, None, None);
     let n = change_queue(&s, Op::Enqueue(vec![job])).await?.n;
     Ok(Json(json!({ "queued": n })))
 }
@@ -734,7 +741,6 @@ mod tests {
             url: "https://x/fw.bin".into(),
             md5: Some("m".into()),
             sha256: Some("s".into()),
-            custom: false,
             state: JobState::Queued,
             sent_at: None,
             expires: None,
@@ -808,7 +814,7 @@ mod tests {
     #[test]
     fn a_firmware_url_is_sent_as_version_unknown() {
         let mut j = Jobs::default();
-        j.enqueue(vec![Job { target: "custom".into(), custom: true, md5: None, sha256: None, ..job("a") }]);
+        j.enqueue(vec![Job { target: CUSTOM.into(), md5: None, sha256: None, ..job("a") }]);
         let cmd = command(&mut j, &m("a"), &json!({ "internet": false }), 0).unwrap().unwrap();
         assert_eq!((cmd["version"].as_str(), cmd["url"].as_str()), (Some("unknown"), Some("https://x/fw.bin")));
         assert_eq!(j.current.as_ref().map(|c| c.target.as_str()), Some("custom"), "the UI's label stays");
