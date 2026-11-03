@@ -195,7 +195,6 @@ export interface DeviceDetail {
 /** `fields`: a column for each field asked for (`useSeries` types them by its list, so a chart draws only what it fetched). */
 export interface Series<F extends string> {
   tier: "raw" | "5m" | "1h";
-  step: number;
   ts: number[];
   fields: Record<F, (number | null)[]>;
 }
