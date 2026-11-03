@@ -212,6 +212,19 @@ pub(crate) fn remove_doc(state: &mut Value, collection: &str, id: &str) {
     }
 }
 
+/// The site's SSIDs as the official UI lists them: without its hidden ones
+/// (the "element" SSID of its own adoption feature). The SSID editor and the
+/// import summary list these.
+pub(crate) fn listed_wlans(state: &Value) -> impl Iterator<Item = &Value> {
+    docs(state, "wlanconf").filter(|w| w["attr_hidden_id"].as_str().is_none())
+}
+
+/// Whether an AP group is one made for one SSID's own APs (as the official
+/// controller does, and [`set_wlan_aps`]), which the official UI does not list.
+pub(crate) fn is_wlan_group(g: &Value) -> bool {
+    flag(g, "for_wlanconf", false)
+}
+
 /// The id of the site's document of a collection the official controller
 /// marks with this `attr_hidden_id` (the default AP group, user group, LAN).
 pub(crate) fn hidden_doc_id(state: &Value, collection: &str, hidden: &str) -> Option<String> {
@@ -385,9 +398,7 @@ pub async fn wlans(State(s): State<AppState>) -> Result<Json<Value>, ApiError> {
 /// The SSIDs as the editor shows them, with what it offers for them. Without
 /// settings (nothing imported yet) every list is empty.
 fn wlans_view(state: &Value, informs: &HashMap<inform::Mac, Arc<Value>>, active: bool) -> Value {
-    let list: Vec<Value> = docs(state, "wlanconf")
-        // The hidden "element" SSID belongs to the official controller's own adoption feature.
-        .filter(|w| w["attr_hidden_id"].as_str().is_none())
+    let list: Vec<Value> = listed_wlans(state)
         .map(|w| {
             let mut v = json!({
                 "id": id_of(w), "aps": wlan_aps(state, w), "protection": protection_of(w).map(|p| p.name), "security": security_label(w), "editable": !flag(w, "attr_no_edit", false),
@@ -842,7 +853,7 @@ fn default_group(state: &Value) -> Option<String> {
 fn set_wlan_aps(state: &mut Value, id: &str, aps: Option<Vec<inform::Mac>>) -> Result<(), String> {
     let own = {
         let current: Vec<&str> = wlan(state, id).and_then(|w| w["ap_group_ids"].as_array()).into_iter().flatten().filter_map(Value::as_str).collect();
-        docs(state, "apgroup").find(|g| flag(g, "for_wlanconf", false) && oid(g).is_some_and(|i| current.contains(&i))).and_then(id_of)
+        docs(state, "apgroup").find(|g| is_wlan_group(g) && oid(g).is_some_and(|i| current.contains(&i))).and_then(id_of)
     };
     match aps {
         None => {
@@ -889,7 +900,7 @@ fn prune_groups(state: &mut Value) {
     let ids = |v: &Value| v["ap_group_ids"].as_array().into_iter().flatten().filter_map(Value::as_str).map(str::to_string).collect::<Vec<_>>();
     let used: Vec<String> = docs(state, "wlanconf").flat_map(|w| ids(w).into_iter().chain(w["mdns_proxy_custom"].as_array().into_iter().flatten().flat_map(ids))).collect();
     if let Some(groups) = state["apgroup"].as_array_mut() {
-        groups.retain(|g| !in_site(site.as_deref(), g) || !flag(g, "for_wlanconf", false) || oid(g).is_some_and(|i| used.iter().any(|u| u == i)));
+        groups.retain(|g| !in_site(site.as_deref(), g) || !is_wlan_group(g) || oid(g).is_some_and(|i| used.iter().any(|u| u == i)));
     }
 }
 
