@@ -41,6 +41,9 @@ impl Db {
 }
 
 /// A metric table. One description drives the schema, inserts, roll-ups and queries.
+/// A column dropped from a description stays in older databases, NULL from then on
+/// (e.g. client_stats' rssi and multicast bytes, vap_stats' ccq and latency_avg,
+/// mcast_stats' byte rates and sender count).
 pub struct Table {
     pub name: &'static str,
     /// Identify the series, together with `ts`.
@@ -184,7 +187,7 @@ pub const VAP: Table = Table {
     keys: &["bssid"],
     texts: &["ap_mac", "essid", "radio"],
     settings: &[],
-    gauges: &["num_sta", "ccq", "satisfaction", "avg_client_signal", "latency_avg"],
+    gauges: &["num_sta", "satisfaction", "avg_client_signal"],
     counters: &[
         "rx_bytes", "tx_bytes", "rx_packets", "tx_packets", "tx_retries", "tx_dropped", "tx_mcast", "rx_mcast", "wifi_tx_attempts", "wifi_tx_dropped", "tx_bcast",
         "rx_bcast",
@@ -195,18 +198,17 @@ pub const CLIENT: Table = Table {
     keys: &["mac"],
     texts: &["ap_mac", "bssid", "essid", "radio"],
     settings: &["channel"],
-    gauges: &["rssi", "signal", "noise", "tx_rate", "rx_rate", "satisfaction", "latency_avg"],
-    counters: &["tx_bytes", "rx_bytes", "tx_packets", "rx_packets", "tx_retries", "mcast_tx_pkts", "mcast_rx_pkts", "mcast_tx_bytes", "mcast_rx_bytes"],
+    gauges: &["signal", "noise", "tx_rate", "rx_rate", "satisfaction", "latency_avg"],
+    counters: &["tx_bytes", "rx_bytes", "tx_packets", "rx_packets", "tx_retries", "mcast_tx_pkts", "mcast_rx_pkts"],
 };
-/// Multicast and broadcast per AP and traffic type, as rates: `tx` delivered
-/// to clients (once per network), `rx` sent by clients (summed), and how many
-/// clients sent that type.
+/// Multicast and broadcast per AP and traffic type, as packet rates: `tx`
+/// delivered to clients (once per network), `rx` sent by clients (summed).
 pub const MCAST: Table = Table {
     name: "mcast_stats",
     keys: &["mac", "type"],
     texts: &[],
     settings: &[],
-    gauges: &["tx_pps", "rx_pps", "tx_bytes_ps", "rx_bytes_ps", "clients"],
+    gauges: &["tx_pps", "rx_pps"],
     counters: &[],
 };
 
@@ -1068,7 +1070,7 @@ mod tests {
         assert_eq!(n, 2);
         // A metric row with a value too few or too many is refused, not stored in the wrong columns.
         let row = |n: usize| Write::Metric { table: &MCAST, ts: 1, values: [Value::Text("aa".into()), Value::Text("mdns".into())].into_iter().chain(std::iter::repeat_n(Value::Real(1.0), n)).collect() };
-        assert_eq!(apply(&mut conns[Db::Metrics as usize], vec![row(4), row(5), row(6)]).unwrap(), 2);
+        assert_eq!(apply(&mut conns[Db::Metrics as usize], vec![row(1), row(2), row(3)]).unwrap(), 2);
         let n: i64 = conns[Db::Metrics as usize].query_row("SELECT COUNT(*) FROM mcast_stats", [], |r| r.get(0)).unwrap();
         assert_eq!(n, 1);
     }

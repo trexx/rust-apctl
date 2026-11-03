@@ -1754,7 +1754,7 @@ impl Engine {
                 ts,
                 values: vec![
                     Sql::Text(v.bssid.clone()), mac(), v.essid.clone().into(), v.radio.clone().into(),
-                    v.num_sta.into(), v.ccq.into(), v.satisfaction.into(), v.avg_client_signal.into(), v.latency_avg.into(),
+                    v.num_sta.into(), v.satisfaction.into(), v.avg_client_signal.into(),
                     v.rx_bytes.into(), v.tx_bytes.into(), v.rx_packets.into(), v.tx_packets.into(), v.tx_retries.into(), v.tx_dropped.into(),
                     v.tx_mcast.into(), v.rx_mcast.into(), v.wifi_tx_attempts.into(), v.wifi_tx_dropped.into(), v.tx_bcast.into(), v.rx_bcast.into(),
                 ],
@@ -1804,11 +1804,11 @@ impl Engine {
             rows.retain(|_, r| r.seen == ts);
             !rows.is_empty()
         });
-        // Per traffic type: [to clients pps, from clients pps, to bytes/s, from bytes/s], and
-        // how many clients sent any. "To clients" is counted once per network (BSSID),
-        // "from clients" per client; only increases count (a client moving to another
-        // network, or a restarted counter, adds nothing rather than its whole total).
-        let mut mcast: BTreeMap<&str, ([f64; 4], i64)> = BTreeMap::new();
+        // Per traffic type: [to clients pps, from clients pps]. "To clients" is counted
+        // once per network (BSSID), "from clients" per client; only increases count (a
+        // client moving to another network, or a restarted counter, adds nothing rather
+        // than its whole total).
+        let mut mcast: BTreeMap<&str, [f64; 2]> = BTreeMap::new();
         let rate = |c: i64, p: i64, dt: f64| (c - p).max(0) as f64 / dt;
         let mut bss_done: std::collections::HashSet<&str> = std::collections::HashSet::new();
         for c in &s.clients {
@@ -1819,9 +1819,9 @@ impl Engine {
                 ts,
                 values: vec![
                     Sql::Text(c.mac.to_string()), mac(), Sql::Text(c.bssid.clone()), c.essid.clone().into(), c.radio.clone().into(), c.channel.into(),
-                    c.rssi.into(), c.signal.into(), c.noise.into(), c.tx_rate.into(), c.rx_rate.into(), c.satisfaction.into(), c.latency_avg.into(),
+                    c.signal.into(), c.noise.into(), c.tx_rate.into(), c.rx_rate.into(), c.satisfaction.into(), c.latency_avg.into(),
                     c.tx_bytes.into(), c.rx_bytes.into(), c.tx_packets.into(), c.rx_packets.into(), c.tx_retries.into(),
-                    t.map(|t| t.tx_pkts).into(), t.map(|t| t.rx_pkts).into(), t.map(|t| t.tx_bytes).into(), t.map(|t| t.rx_bytes).into(),
+                    t.map(|t| t.tx_pkts).into(), t.map(|t| t.rx_pkts).into(),
                 ],
             });
             let Some(m) = m else { continue };
@@ -1835,9 +1835,7 @@ impl Engine {
                             let prev = mcast_types(prev);
                             for (kind, cur) in &m.types {
                                 let p = prev.get(kind).copied().unwrap_or(*cur);
-                                let e = mcast.entry(kind.as_ref()).or_default();
-                                e.0[0] += rate(cur.tx_pkts, p.tx_pkts, dt);
-                                e.0[2] += rate(cur.tx_bytes, p.tx_bytes, dt);
+                                mcast.entry(kind.as_ref()).or_default()[0] += rate(cur.tx_pkts, p.tx_pkts, dt);
                             }
                         }
                         *last = (ts, c.clone());
@@ -1856,22 +1854,12 @@ impl Engine {
                 let prev = mcast_types(&prev);
                 for (kind, cur) in &m.types {
                     let p = prev.get(kind).copied().unwrap_or(*cur);
-                    let (pk, by) = (rate(cur.rx_pkts, p.rx_pkts, dt), rate(cur.rx_bytes, p.rx_bytes, dt));
-                    let e = mcast.entry(kind.as_ref()).or_default();
-                    e.0[1] += pk;
-                    e.0[3] += by;
-                    if pk > 0.0 {
-                        e.1 += 1;
-                    }
+                    mcast.entry(kind.as_ref()).or_default()[1] += rate(cur.rx_pkts, p.rx_pkts, dt);
                 }
             }
         }
-        for (kind, (r, n)) in mcast {
-            self.writer.send(Write::Metric {
-                table: &store::MCAST,
-                ts,
-                values: vec![mac(), Sql::Text(kind.to_string()), Sql::Real(r[0]), Sql::Real(r[1]), Sql::Real(r[2]), Sql::Real(r[3]), Sql::Integer(n)],
-            });
+        for (kind, [to, from]) in mcast {
+            self.writer.send(Write::Metric { table: &store::MCAST, ts, values: vec![mac(), Sql::Text(kind.to_string()), Sql::Real(to), Sql::Real(from)] });
         }
     }
 }
@@ -2718,7 +2706,7 @@ mod tests {
     fn multicast_rates_count_networks_once_and_clients_each() {
         let mut h = harness();
         // Per-network "to clients" counters repeat in every client's block.
-        let sta = |mac: &str, to: i64, from: i64| json!({ "mac": mac, "multicast": { "types": { "mdns": { "tx_pkts": to, "tx_bytes": to * 100, "rx_pkts": from, "rx_bytes": from * 100 } } } });
+        let sta = |mac: &str, to: i64, from: i64| json!({ "mac": mac, "multicast": { "types": { "mdns": { "tx_pkts": to, "rx_pkts": from } } } });
         let feed = |e: &mut Engine, ts: Ts, to: i64, from: i64| {
             let p = json!({ "mac": AP1, "uptime": 1000 + ts, "vap_table": [{ "bssid": "b1", "radio": "na", "usage": "user", "sta_table": [sta(C1, to, from), sta("02:00:00:00:01:02", to, 0)] }] });
             e.handle(Input::Inform { ts, payload: p });
@@ -2726,11 +2714,9 @@ mod tests {
         feed(&mut h.engine, 0, 100, 0);
         feed(&mut h.engine, 10, 200, 50);
         flushed(&h.writer);
-        let row: (f64, f64, f64, f64) = h
-            .store
-            .read(Db::Metrics, |c| Ok(c.query_row("SELECT tx_pps, rx_pps, rx_bytes_ps, clients FROM mcast_stats WHERE ts = 10 AND type = 'mdns'", [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?))
-            .unwrap();
-        assert_eq!(row, (10.0, 5.0, 500.0, 1.0));
+        let row: (f64, f64) =
+            h.store.read(Db::Metrics, |c| Ok(c.query_row("SELECT tx_pps, rx_pps FROM mcast_stats WHERE ts = 10 AND type = 'mdns'", [], |r| Ok((r.get(0)?, r.get(1)?)))?)).unwrap();
+        assert_eq!(row, (10.0, 5.0));
         // The previous samples are kept only as long as they can give a rate.
         h.engine.handle(Input::Tick(10 + MCAST_GAP));
         assert_eq!((h.engine.mcast_prev.len(), h.engine.bss_prev.len()), (2, 1));

@@ -174,13 +174,8 @@ pub struct VapSample {
     pub tx_packets: Option<i64>,
     pub tx_retries: Option<i64>,
     pub tx_dropped: Option<i64>,
-    #[serde(skip_serializing)]
-    pub ccq: Option<i64>,
     pub satisfaction: Option<i64>,
     pub avg_client_signal: Option<i64>,
-    /// Moving average of Wi-Fi TX latency in ms, when the AP reports it.
-    #[serde(skip_serializing)]
-    pub latency_avg: Option<i64>,
     pub tx_mcast: Option<i64>,
     pub rx_mcast: Option<i64>,
     pub tx_bcast: Option<i64>,
@@ -248,8 +243,6 @@ pub struct ClientSample {
     pub channel: Option<i64>,
     pub hostname: Option<String>,
     pub ip: Option<String>,
-    #[serde(skip_serializing)]
-    pub rssi: Option<i64>,
     pub signal: Option<i64>,
     pub noise: Option<i64>,
     /// PHY rates in kbps.
@@ -274,27 +267,23 @@ pub struct ClientSample {
     pub multicast: Option<Multicast>,
 }
 
-/// Packet and byte counters. `tx` is what the AP delivered to the client,
-/// `rx` what the client sent.
+/// Packet counters. `tx` is what the AP delivered to the client, `rx` what the
+/// client sent.
 #[derive(Debug, Clone, Copy, Default, Serialize, PartialEq)]
 pub struct McastCounts {
     pub tx_pkts: i64,
-    pub tx_bytes: i64,
     pub rx_pkts: i64,
-    pub rx_bytes: i64,
 }
 
 impl McastCounts {
     fn parse(v: &Value) -> McastCounts {
         let n = |k: &str| int(&v[k]).unwrap_or(0);
-        McastCounts { tx_pkts: n("tx_pkts"), tx_bytes: n("tx_bytes"), rx_pkts: n("rx_pkts"), rx_bytes: n("rx_bytes") }
+        McastCounts { tx_pkts: n("tx_pkts"), rx_pkts: n("rx_pkts") }
     }
 
     pub fn add(&mut self, o: &McastCounts) {
         self.tx_pkts += o.tx_pkts;
-        self.tx_bytes += o.tx_bytes;
         self.rx_pkts += o.rx_pkts;
-        self.rx_bytes += o.rx_bytes;
     }
 }
 
@@ -473,10 +462,8 @@ pub fn parse_with_scans(ts: Ts, p: &Value) -> anyhow::Result<(Snapshot, Scans)> 
             tx_packets: int(&v["tx_packets"]),
             tx_retries: int(&v["tx_retries"]),
             tx_dropped: int(&v["tx_dropped"]),
-            ccq: int(&v["ccq"]),
             satisfaction: int(&v["satisfaction"]),
             avg_client_signal: int(&v["avg_client_signal"]),
-            latency_avg: int(&v["wifi_tx_latency_mov"]["avg"]),
             tx_mcast: int(&v["tx_mcast"]),
             rx_mcast: int(&v["rx_mcast"]),
             tx_bcast: int(&v["tx_bcast"]),
@@ -498,7 +485,6 @@ pub fn parse_with_scans(ts: Ts, p: &Value) -> anyhow::Result<(Snapshot, Scans)> 
                 channel,
                 hostname: string(&s["hostname"]),
                 ip: string(&s["ip"]),
-                rssi: int(&s["rssi"]),
                 signal: int(&s["signal"]),
                 noise: int(&s["noise"]),
                 tx_rate: int(&s["tx_rate"]),
@@ -803,12 +789,12 @@ pub(crate) mod tests {
         use serde_json::json;
         assert_eq!((int(&json!("9007199254740993")), int(&json!(" 3.9 ")), int(&json!(2.5))), (Some(9_007_199_254_740_993), Some(3), Some(2)));
         let m = Multicast::parse(&json!({
-            "types": { "mdns": { "tx_pkts": "5", "rx_bytes": 7.0 } },
+            "types": { "mdns": { "tx_pkts": "5", "rx_pkts": 7.0 } },
             "groups": [{ "group_ip": "224.0.0.251", "dst_port": "5353" }],
             "services": [{ "name": "_googlecast._tcp.local", "pkts": "2" }],
         }))
         .unwrap();
-        assert_eq!((m.types["mdns"].tx_pkts, m.types["mdns"].rx_bytes, m.has_groups, m.services[0].pkts), (5, 7, true, 2));
+        assert_eq!((m.types["mdns"].tx_pkts, m.types["mdns"].rx_pkts, m.has_groups, m.services[0].pkts), (5, 7, true, 2));
         assert!(!Multicast::parse(&json!({ "types": {}, "groups": [{ "dst_port": 5353 }] })).unwrap().has_groups, "a group without its address is none");
     }
 

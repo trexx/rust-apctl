@@ -596,7 +596,7 @@ impl Serialize for ListedSample<'_> {
         }
         only!(
             mac, ap_mac, essid, radio, channel, hostname, ip, signal, tx_rate, rx_rate, uptime, wifi_gen, nss;
-            not multicast, tx_packets, rx_packets, bssid, rssi, noise, tx_bytes, rx_bytes, tx_retries, satisfaction, latency_avg
+            not multicast, tx_packets, rx_packets, bssid, noise, tx_bytes, rx_bytes, tx_retries, satisfaction, latency_avg
         )
     }
 }
