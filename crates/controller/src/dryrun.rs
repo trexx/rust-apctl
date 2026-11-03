@@ -209,18 +209,20 @@ pub fn compare(ours: &Rendered, actual_mgmt: &str, actual_system: &str, redacted
 }
 
 /// A short human summary of an import snapshot, for the settings page (and the
-/// import's event): what the page shows.
+/// import's event): what the page shows. The managed site's documents only, and
+/// as the official UI lists them: without its hidden SSIDs (the "element" one
+/// of its adoption feature) and the AP groups it makes for an SSID's own APs.
 pub fn summarize_state(state: &Value) -> Value {
-    let count = |k: &str| state[k].as_array().map_or(0, Vec::len);
-    let names = |k: &str| -> Vec<Value> {
-        state[k].as_array().into_iter().flatten().filter_map(|x| x["name"].as_str().map(|s| Value::from(s.to_string()))).collect()
-    };
+    fn names<'a>(list: impl Iterator<Item = &'a Value>) -> Vec<Value> {
+        list.filter_map(|x| x["name"].as_str().map(Value::from)).collect()
+    }
+    let docs = |k: &'static str| crate::settings::docs(state, k);
     serde_json::json!({
-        "wlans": names("wlanconf"),
-        "networks": names("networkconf"),
-        "ap_groups": names("apgroup"),
-        "devices": count("devices"),
-        "clients": count("clients"),
+        "wlans": names(docs("wlanconf").filter(|w| w["attr_hidden_id"].as_str().is_none())),
+        "networks": names(docs("networkconf")),
+        "ap_groups": names(docs("apgroup").filter(|g| !apcfg::flag(g, "for_wlanconf", false))),
+        "devices": docs("devices").count(),
+        "clients": docs("clients").count(),
     })
 }
 
@@ -321,5 +323,27 @@ mod tests {
         let keys: Vec<_> = summarize_state(&ok).as_object().unwrap().keys().cloned().collect();
         assert_eq!(keys, ["ap_groups", "clients", "devices", "networks", "wlans"], "what the settings page shows");
         assert_eq!(summarize_state(&ok)["wlans"][0], "Home");
+    }
+
+    #[test]
+    fn the_summary_lists_the_sites_own_ssids_and_groups_as_the_official_ui_does() {
+        let state = serde_json::json!({
+            "sites": [{ "_id": "s0", "name": "super" }, { "_id": "s1", "name": "default" }],
+            "wlanconf": [
+                { "name": "element-0123", "attr_hidden_id": "element_wlan", "site_id": "s1" },
+                { "name": "Home", "site_id": "s1" }, { "name": "Home IoT", "site_id": "s1" }, { "name": "Elsewhere", "site_id": "s0" },
+            ],
+            "networkconf": [{ "name": "Default", "site_id": "s1" }],
+            "apgroup": [
+                { "name": "All APs", "attr_hidden_id": "default", "site_id": "s1" }, { "name": "Basement", "site_id": "s1" },
+                { "name": "devices_ap_group", "for_wlanconf": true, "site_id": "s1" },
+            ],
+            "devices": [{ "mac": "02:00:00:00:00:01", "site_id": "s1" }, { "mac": "02:00:00:00:00:02", "site_id": "s0" }],
+            "clients": [{ "mac": "02:00:00:00:10:01", "site_id": "s1" }],
+        });
+        let s = summarize_state(&state);
+        assert_eq!(s["wlans"], serde_json::json!(["Home", "Home IoT"]));
+        assert_eq!(s["ap_groups"], serde_json::json!(["All APs", "Basement"]));
+        assert_eq!((s["devices"].as_u64(), s["clients"].as_u64()), (Some(1), Some(1)));
     }
 }
