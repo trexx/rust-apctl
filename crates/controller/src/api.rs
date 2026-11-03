@@ -79,6 +79,31 @@ pub struct AppStateInner {
     pub memo: crate::series::Memo,
     /// What the threat checks keep between runs, shared with `threats::watch`.
     pub threats: Arc<crate::threats::ThreatState>,
+    /// Ends the process the way a SIGTERM does (e.g. after a restore is staged).
+    pub exit: Exit,
+}
+
+/// A request to end the process through its one exit (the engine's queue handled,
+/// then the writes committed), with the exit status to end with.
+#[derive(Default)]
+pub struct Exit(tokio::sync::watch::Sender<Option<u8>>);
+
+impl Exit {
+    pub fn request(&self, status: u8) {
+        self.0.send_replace(Some(status));
+    }
+
+    /// Resolves once an exit is requested, with its status.
+    pub async fn requested(&self) -> u8 {
+        let mut asked = self.0.subscribe();
+        // Never an error: the sender is `self`.
+        asked.wait_for(Option::is_some).await.ok().and_then(|s| *s).unwrap_or(0)
+    }
+
+    /// The status asked for, if one was.
+    pub fn status(&self) -> Option<u8> {
+        *self.0.borrow()
+    }
 }
 
 pub fn router(state: AppState) -> Router {
@@ -403,10 +428,14 @@ async fn status(State(s): State<AppState>) -> ApiResult {
     })))
 }
 
-/// For Kubernetes probes. Fails once nothing can be stored or processed any more.
+/// For Kubernetes probes. Fails once nothing can be stored or processed any more,
+/// and while every write batch is rolled back (e.g. a file system remounted read-only).
 async fn healthz(State(s): State<AppState>) -> Response {
     if s.writer.stopped() {
         return (StatusCode::SERVICE_UNAVAILABLE, "database writer stopped").into_response();
+    }
+    if s.writer.failing() {
+        return (StatusCode::SERVICE_UNAVAILABLE, "database writes failing").into_response();
     }
     // The engine thread drops its end of the queue however it ends, a panic
     // included; a panic under the live view's lock poisons it for every reader.
@@ -596,7 +625,7 @@ impl Serialize for ListedSample<'_> {
         }
         only!(
             mac, ap_mac, essid, radio, channel, hostname, ip, signal, tx_rate, rx_rate, uptime, wifi_gen, nss;
-            not multicast, tx_packets, rx_packets, bssid, rssi, noise, tx_bytes, rx_bytes, tx_retries, satisfaction, latency_avg
+            not multicast, tx_packets, rx_packets, bssid, noise, tx_bytes, rx_bytes, tx_retries, satisfaction, latency_avg
         )
     }
 }
@@ -1274,6 +1303,7 @@ mod tests {
             backups: crate::backup::Backups::new(dir.to_path_buf(), None),
             store, vendors: Default::default(), renderer: crate::dryrun::apcfg_renderer(crate::EMULATE_VERSION.into()), auth, engine, live: Default::default(), tx, started: 0, source: "none".into(),
             active: false, writer, inform_url: None, syslog_listen: None, keys: Default::default(), memo: Default::default(), threats: Default::default(),
+            exit: Default::default(),
         });
         (state, engine_rx, dir)
     }
@@ -1887,5 +1917,33 @@ mod tests {
         assert_eq!(get(&app, "/healthz").await.status(), StatusCode::OK);
         drop(engine); // as when the engine thread panics
         assert_eq!(get(&app, "/healthz").await.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn an_exit_asked_for_before_it_is_awaited_is_seen() {
+        let exit = Exit::default();
+        assert_eq!(exit.status(), None);
+        exit.request(75);
+        assert_eq!((exit.requested().await, exit.status()), (75, Some(75)));
+    }
+
+    #[tokio::test]
+    async fn healthz_fails_while_write_batches_are_lost() {
+        let (s, _engine, _dir) = state();
+        let app = router(s.clone());
+        // A statement that ends the batch's transaction loses the batch, as a full disk does.
+        let lose = || {
+            s.writer.exec(Db::Config, "ROLLBACK", vec![]);
+            s.writer.flush(std::time::Duration::from_secs(5))
+        };
+        for _ in 0..2 {
+            assert!(!lose());
+        }
+        assert_eq!(get(&app, "/healthz").await.status(), StatusCode::OK, "two lost batches are not yet a failing disk");
+        assert!(!lose());
+        assert_eq!(get(&app, "/healthz").await.status(), StatusCode::SERVICE_UNAVAILABLE);
+        s.writer.exec(Db::Config, "INSERT INTO client_aliases (mac, alias, updated) VALUES ('a', 'x', 1)", vec![]);
+        assert!(s.writer.flush(std::time::Duration::from_secs(5)));
+        assert_eq!(get(&app, "/healthz").await.status(), StatusCode::OK);
     }
 }

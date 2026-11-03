@@ -435,6 +435,7 @@ pub fn connectivity_stats(attempts: &[Attempt], band: Option<&str>) -> Value {
     })
 }
 
+/// Where a roam went: the network and channel the client joined, and its signal.
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct RoamEnd {
     pub ap: String,
@@ -445,11 +446,19 @@ pub struct RoamEnd {
     pub rssi: Option<f64>,
 }
 
+/// Where a roam left: the AP, band and signal (the network is the one joined).
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct RoamFrom {
+    pub ap: String,
+    pub radio: Option<String>,
+    pub rssi: Option<f64>,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct Roam {
     pub ts: Ts,
     pub client: String,
-    pub from: RoamEnd,
+    pub from: RoamFrom,
     pub to: RoamEnd,
     pub success: bool,
     /// Seconds without a connection, for failed roams.
@@ -517,7 +526,7 @@ pub fn roams(events: &[ConnEvent]) -> Vec<Roam> {
             out.push(Roam {
                 ts: j.ts.max(l.ts),
                 client: client.to_string(),
-                from: end_of(l, &l.n.avg_rssi),
+                from: RoamFrom { ap: l.ap.clone(), radio: l.radio.clone(), rssi: num(&l.n.avg_rssi) },
                 to: end_of(j, &j.n.auth_rssi),
                 success,
                 gap_s: (!success).then_some(gap.max(0)),
@@ -1051,7 +1060,7 @@ mod tests {
     #[test]
     fn roam_totals_count_successes_and_fast_roams() {
         let end = |ap: &str| RoamEnd { ap: ap.into(), essid: None, radio: None, channel: None, bw: None, rssi: None };
-        let roam = |success, fast| Roam { ts: 1, client: "c".into(), from: end("a"), to: end("b"), success, gap_s: None, fast, min_rssi: false, assistant: false };
+        let roam = |success, fast| Roam { ts: 1, client: "c".into(), from: RoamFrom { ap: "a".into(), radio: None, rssi: None }, to: end("b"), success, gap_s: None, fast, min_rssi: false, assistant: false };
         let r = [roam(true, true), roam(true, false), roam(false, false)];
         let t = roam_totals(&r, &roam_clients(&r));
         assert_eq!(t, json!({ "roams": 3, "successes": 2, "fast": 1, "clients": 1, "to_weaker": 0, "quick_returns": 0 }));
@@ -1061,11 +1070,12 @@ mod tests {
     fn roaming_lists_the_busiest_clients_and_totals_them_all() {
         let t = TestStore::new("roaming");
         let end = |ap: &str, rssi| RoamEnd { ap: ap.into(), essid: None, radio: None, channel: None, bw: None, rssi: Some(rssi) };
+        let from = |ap: &str, rssi| RoamFrom { ap: ap.into(), radio: None, rssi: Some(rssi) };
         // Client i roams i + 1 times from A to B, each time to a weaker signal.
         let mut r = Vec::new();
         for i in 0..12 {
             for k in 0..=i {
-                r.push(Roam { ts: 1000 * k + i, client: format!("c{i:02}"), from: end("A", -60.0), to: end("B", -70.0), success: true, gap_s: None, fast: false, min_rssi: false, assistant: false });
+                r.push(Roam { ts: 1000 * k + i, client: format!("c{i:02}"), from: from("A", -60.0), to: end("B", -70.0), success: true, gap_s: None, fast: false, min_rssi: false, assistant: false });
             }
         }
         r.sort_by_key(|x| x.ts);

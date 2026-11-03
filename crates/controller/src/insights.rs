@@ -1270,10 +1270,11 @@ mod tests {
             insert(&m, "radio_stats", RADIO_COLS, rows);
             // Clients: one moves from the first AP to the second half way (its counters restart).
             const CLIENT_COLS: &[&str] = &[
-                "mac", "ts", "ap_mac", "bssid", "essid", "radio", "signal", "tx_bytes", "rx_bytes", "mcast_tx_pkts", "mcast_rx_pkts", "mcast_tx_bytes", "mcast_rx_bytes",
+                "mac", "ts", "ap_mac", "bssid", "essid", "radio", "signal", "tx_bytes", "rx_bytes", "mcast_tx_pkts", "mcast_rx_pkts",
             ];
             let mut rows = Vec::new();
             for (j, mac) in [C1, C2, C3].into_iter().enumerate() {
+                // cum[4] and cum[5] were the multicast bytes, no longer stored: still drawn, so the pinned views keep their figures.
                 let mut cum = [0i64; 6];
                 for k in 0..13i64 {
                     let at = match (j, k) {
@@ -1294,7 +1295,7 @@ mod tests {
                     let mcast = |v: i64| if j == 0 { Sql::Null } else { int(v) };
                     rows.push(vec![
                         text(mac), int(base - 30 + k * 300 + j as i64 * 11), text(ap), text(bssid), text(essid), text(radio), signal, int(cum[0]), int(cum[1]),
-                        mcast(cum[2]), mcast(cum[3]), mcast(cum[4]), mcast(cum[5]),
+                        mcast(cum[2]), mcast(cum[3]),
                     ]);
                 }
             }
@@ -1305,12 +1306,14 @@ mod tests {
                 for kind in ["mdns", "ssdp"] {
                     for k in (0..13i64).filter(|k| j == 0 || *k != 4) {
                         let mut r = vec![text(ap), text(kind), int(base - 20 + k * 300 + j as i64 * 13)];
-                        r.extend((0..5).map(|_| Sql::Real(rng.next(500) as f64 / 10.0)));
+                        // Five drawn as when the byte rates and sender count were stored, so the pinned views keep their figures.
+                        let v: Vec<Sql> = (0..5).map(|_| Sql::Real(rng.next(500) as f64 / 10.0)).collect();
+                        r.extend(v.into_iter().take(2));
                         rows.push(r);
                     }
                 }
             }
-            insert(&m, "mcast_stats", &["mac", "type", "ts", "tx_pps", "rx_pps", "tx_bytes_ps", "rx_bytes_ps", "clients"], rows);
+            insert(&m, "mcast_stats", &["mac", "type", "ts", "tx_pps", "rx_pps"], rows);
             let c = t.db(Db::Config);
             let spectrum = [(A1, "na", 36, 80, 30, 20), (A1, "na", 52, 80, 5, 2), (A1, "ng", 1, 20, 50, 40), (A1, "ng", 6, 20, 20, 10), (A2, "na", 36, 80, 40, 10), (A2, "ng", 11, 20, 60, 30)];
             let rows = spectrum.iter().map(|(ap, r, ch, w, u, i)| vec![text(ap), text(r), int(*ch), int(*w), int(*u), int(*i), int(2), int(base + 100)]).collect();
@@ -1381,6 +1384,7 @@ mod tests {
                 backups: crate::backup::Backups::new(t.dir.to_path_buf(), None),
                 store: t.store.clone(), vendors: Default::default(), renderer: crate::dryrun::apcfg_renderer("10.6.106".into()), auth, engine, live, tx, started: 0, source: "none".into(),
                 active: false, writer: t.writer.clone(), inform_url: None, syslog_listen: None, keys: Default::default(), memo: Default::default(), threats: Default::default(),
+                exit: Default::default(),
             });
             (s, base, t)
         }

@@ -55,9 +55,7 @@ struct Steering {
     from: Option<Source>,
     ts: Ts,
     rssi: Option<i64>,
-    candidates: Option<i64>,
     targets: Vec<Value>,
-    vap: Option<String>,
 }
 
 /// What kind of fault a crash capture started with (or ended in).
@@ -297,17 +295,8 @@ impl LogEvents {
 
         if msg.contains("BTM:") {
             if let Some(c) = msg.split("BTM: STA ").nth(1).and_then(|r| r.split_whitespace().next()).and_then(mac) {
-                // A request: the client's signal and how many APs were offered,
-                // and the VAP it was made on.
-                let vap = msg.split("vap-").nth(1).and_then(|r| r.split_once('(')).and_then(|(_, r)| r.split_once(')')).map(|(v, _)| v.to_string());
-                let s = Steering {
-                    from: Some(dev_key()),
-                    ts: line.ts,
-                    rssi: field(msg, "RSSI: ").and_then(|v| v.parse().ok()),
-                    candidates: field(msg, "candidates: ").and_then(|v| v.parse().ok()),
-                    targets: vec![],
-                    vap,
-                };
+                // A request: the client's signal (the candidates follow on lines of their own).
+                let s = Steering { from: Some(dev_key()), ts: line.ts, rssi: field(msg, "RSSI: ").and_then(|v| v.parse().ok()), targets: vec![] };
                 if bounded(&mut self.steering, c, s) {
                     bounded(&mut self.steering_by_device, dev_key(), c);
                 }
@@ -329,17 +318,13 @@ impl LogEvents {
                 let status = field(msg, "status ").and_then(|v| v.parse::<i64>().ok());
                 if let (Some(c), Some(st)) = (client, status) {
                     let req = self.steering.remove(&c).filter(|s| (0..=STEER_ANSWER).contains(&(line.ts - s.ts))).unwrap_or_default();
-                    let to = field(msg, "bssid ").filter(|b| *b != "n/a").map(str::to_string);
                     if self.fresh(EventKind::ClientSteered, c, st, line.ts, 600) {
                         out.push(Event {
                             ts: line.ts,
                             kind: EventKind::ClientSteered,
                             device_mac: line.device_mac,
                             client_mac: Some(c),
-                            data: json!({
-                                "status": st, "result": btm_status(st), "accepted": st == 0, "to_bssid": to,
-                                "signal": req.rssi, "candidates": req.targets, "offered": req.candidates, "vap": req.vap,
-                            }),
+                            data: json!({ "result": btm_status(st), "signal": req.rssi, "candidates": req.targets }),
                         });
                     }
                 }
@@ -534,12 +519,14 @@ mod tests {
         let f = l.feed(&line(11, "kernel", &format!("{p}BTM: Received response from [6c:ac:c2:00:00:01](len = 5): dialog_token 1, status 7, delay 0, bssid n/a, cancel 0")));
         assert_eq!(f.len(), 1);
         let d = &f[0].data;
-        assert_eq!((f[0].kind, d["status"].as_i64(), d["accepted"].as_bool()), (EventKind::ClientSteered, Some(7), Some(false)));
-        assert_eq!(d["result"], "rejected: no suitable AP to move to");
+        assert_eq!((f[0].kind, d["result"].as_str()), (EventKind::ClientSteered, Some("rejected: no suitable AP to move to")));
         assert_eq!(d["signal"], -77);
         assert_eq!(d["candidates"][0]["bssid"], "02:00:00:3c:51:ae");
         assert_eq!(d["candidates"][0]["channel"], 44);
-        assert_eq!(d["vap"], "wifi1ap1");
+        // Only what the event's text shows is stored.
+        let mut keys: Vec<&str> = d.as_object().unwrap().keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(keys, ["candidates", "result", "signal"]);
         // The client repeating the same answer is not reported again within 10 minutes.
         assert!(l.feed(&line(20, "kernel", &format!("{p}BTM: Received response from [6c:ac:c2:00:00:01](len = 5): dialog_token 2, status 7, delay 0, bssid n/a, cancel 0"))).is_empty());
     }

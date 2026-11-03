@@ -1387,23 +1387,19 @@ pub async fn restore(State(s): State<AppState>, Json(body): Json<RestoreBody>) -
     .await?
     .map_err(refused)?;
     tracing::warn!("restore of backup from {} staged as {id}; restarting", m.created);
-    // Answer first, then exit, and the restore is applied on the next start. The
-    // exit status is 75 (EX_TEMPFAIL), a failure, so that a restart policy of
-    // on-failure restarts apctl as well as one of always.
-    let writer = s.writer.clone();
-    tokio::spawn(async move {
-        tokio::time::sleep(Duration::from_millis(800)).await;
-        tokio::task::spawn_blocking(move || {
-            // A backup being written is finished first (none starts after it),
-            // so that none is cut off half way.
-            let _one = CREATING.lock().unwrap_or_else(PoisonError::into_inner);
-            // What is queued is committed first: the copy saved before the
-            // restore, and the data kept if the restore fails, have it.
-            if !writer.flush(Duration::from_secs(5)) {
-                tracing::warn!("not all queued writes could be stored before the restart");
-            }
-            std::process::exit(75);
-        });
+    // The process exits as at a SIGTERM (the answer sent, the engine's queue handled,
+    // the writes committed: the copy saved before the restore, and the data kept if
+    // it fails, have them), and the restore is applied on the next start. The exit
+    // status is 75 (EX_TEMPFAIL), a failure, so that a restart policy of on-failure
+    // restarts apctl as well as one of always.
+    tokio::task::spawn_blocking(move || {
+        // A backup being written is finished first, and none starts after it: the
+        // lock is held until the process ends, so that none is cut off half way.
+        let _one = CREATING.lock().unwrap_or_else(PoisonError::into_inner);
+        s.exit.request(75);
+        loop {
+            std::thread::park();
+        }
     });
     Ok(Json(json!({ "ok": true })))
 }

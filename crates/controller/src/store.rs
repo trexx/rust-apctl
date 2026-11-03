@@ -11,7 +11,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant};
@@ -41,6 +41,9 @@ impl Db {
 }
 
 /// A metric table. One description drives the schema, inserts, roll-ups and queries.
+/// A column dropped from a description stays in older databases, NULL from then on
+/// (e.g. client_stats' rssi and multicast bytes, vap_stats' ccq and latency_avg,
+/// mcast_stats' byte rates and sender count).
 pub struct Table {
     pub name: &'static str,
     /// Identify the series, together with `ts`.
@@ -184,7 +187,7 @@ pub const VAP: Table = Table {
     keys: &["bssid"],
     texts: &["ap_mac", "essid", "radio"],
     settings: &[],
-    gauges: &["num_sta", "ccq", "satisfaction", "avg_client_signal", "latency_avg"],
+    gauges: &["num_sta", "satisfaction", "avg_client_signal"],
     counters: &[
         "rx_bytes", "tx_bytes", "rx_packets", "tx_packets", "tx_retries", "tx_dropped", "tx_mcast", "rx_mcast", "wifi_tx_attempts", "wifi_tx_dropped", "tx_bcast",
         "rx_bcast",
@@ -195,18 +198,17 @@ pub const CLIENT: Table = Table {
     keys: &["mac"],
     texts: &["ap_mac", "bssid", "essid", "radio"],
     settings: &["channel"],
-    gauges: &["rssi", "signal", "noise", "tx_rate", "rx_rate", "satisfaction", "latency_avg"],
-    counters: &["tx_bytes", "rx_bytes", "tx_packets", "rx_packets", "tx_retries", "mcast_tx_pkts", "mcast_rx_pkts", "mcast_tx_bytes", "mcast_rx_bytes"],
+    gauges: &["signal", "noise", "tx_rate", "rx_rate", "satisfaction", "latency_avg"],
+    counters: &["tx_bytes", "rx_bytes", "tx_packets", "rx_packets", "tx_retries", "mcast_tx_pkts", "mcast_rx_pkts"],
 };
-/// Multicast and broadcast per AP and traffic type, as rates: `tx` delivered
-/// to clients (once per network), `rx` sent by clients (summed), and how many
-/// clients sent that type.
+/// Multicast and broadcast per AP and traffic type, as packet rates: `tx`
+/// delivered to clients (once per network), `rx` sent by clients (summed).
 pub const MCAST: Table = Table {
     name: "mcast_stats",
     keys: &["mac", "type"],
     texts: &[],
     settings: &[],
-    gauges: &["tx_pps", "rx_pps", "tx_bytes_ps", "rx_bytes_ps", "clients"],
+    gauges: &["tx_pps", "rx_pps"],
     counters: &[],
 };
 
@@ -398,6 +400,24 @@ fn migrate(dir: &Path) -> Result<()> {
         "UPDATE events SET data = json_remove(data, '$.url') WHERE kind = 'ap_upgrade_sent' AND json_valid(data) AND json_extract(data, '$.url') IS NOT NULL",
         [],
     )?;
+    // Crash and process-restart events as live ones are stored: a crash with lines has
+    // its summary, a restart's exit status is a number or absent. Only rows stored
+    // before either was so are picked, so a start without them reads no rows.
+    rewrite_events(
+        &config,
+        "SELECT id, data FROM events WHERE kind = 'ap_crash' AND json_valid(data) AND json_extract(data, '$.summary') IS NULL AND json_array_length(data, '$.lines') > 0",
+        |d| {
+            let lines: Vec<&str> = d["lines"].as_array().into_iter().flatten().filter_map(serde_json::Value::as_str).collect();
+            if let Some(summary) = crate::logevents::crash_summary(&lines).map(str::to_string) {
+                d["summary"] = summary.into();
+            }
+        },
+    )?;
+    rewrite_events(
+        &config,
+        "SELECT id, data FROM events WHERE kind = 'ap_process_restarted' AND json_valid(data) AND json_type(data, '$.exit_status') != 'integer'",
+        crate::engine::numeric_exit_status,
+    )?;
     drop(config);
     open_rw(&dir.join(Db::Logs.file()))?.execute_batch(LOGS_SCHEMA)?;
     let metrics = open_rw(&dir.join(Db::Metrics.file()))?;
@@ -427,6 +447,22 @@ fn migrate(dir: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Rewrites with `fix` the data of the events `select` picks (their `id, data`).
+fn rewrite_events(c: &Connection, select: &str, fix: impl Fn(&mut serde_json::Value)) -> Result<()> {
+    let rows: Vec<(i64, String)> = c.prepare(select)?.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<rusqlite::Result<_>>()?;
+    if rows.is_empty() {
+        return Ok(());
+    }
+    let tx = c.unchecked_transaction()?;
+    for (id, data) in rows {
+        let Ok(mut d) = serde_json::from_str(&data) else { continue };
+        fix(&mut d);
+        tx.execute("UPDATE events SET data = ?2 WHERE id = ?1", rusqlite::params![id, d.to_string()])?;
+    }
+    tx.commit()?;
+    Ok(())
+}
+
 /// A write for the writer thread.
 pub enum Write {
     /// One metric row; values in the table's column order (keys, texts, settings, gauges, counters).
@@ -438,15 +474,29 @@ pub enum Write {
 /// What the writer thread is sent.
 enum Msg {
     Write(Write),
-    /// Commit everything queued so far, then answer.
-    Flush(Sender<()>),
+    /// Commit everything queued so far, then answer whether every batch since the
+    /// last answer committed.
+    Flush(Sender<bool>),
 }
+
+/// What the writer thread tells every `Writer` about itself.
+#[derive(Default)]
+struct Health {
+    /// Set when the writer thread has stopped: nothing sent is stored any more.
+    stopped: AtomicBool,
+    /// Write batches lost in a row (their transaction rolled back: disk full, an I/O
+    /// error, a read-only file system); back to 0 once one commits.
+    lost_batches: AtomicU32,
+}
+
+/// Batches lost in a row (about a second each) before [`Writer::failing`] says so:
+/// one bad batch is not yet a disk that takes nothing.
+const FAILING_AFTER: u32 = 3;
 
 #[derive(Clone)]
 pub struct Writer {
     tx: Sender<Msg>,
-    /// Set when the writer thread has stopped: nothing sent is stored any more.
-    stopped: Arc<AtomicBool>,
+    health: Arc<Health>,
 }
 
 impl Writer {
@@ -460,16 +510,23 @@ impl Writer {
     }
 
     /// Commits the writes queued so far, waiting at most `timeout`. False if
-    /// they could not be committed in time (or the writer has stopped).
+    /// they could not be committed in time, if a batch since the last flush was
+    /// rolled back (its writes are lost), or if the writer has stopped.
     pub fn flush(&self, timeout: Duration) -> bool {
         let (ack, done) = channel();
-        self.tx.send(Msg::Flush(ack)).is_ok() && done.recv_timeout(timeout).is_ok()
+        self.tx.send(Msg::Flush(ack)).is_ok() && done.recv_timeout(timeout) == Ok(true)
     }
 
-    /// True once the writer thread has stopped (an error opening or writing the
-    /// databases, or a panic): the process can no longer store anything.
+    /// True once the writer thread has stopped (an error opening the databases,
+    /// or a panic): the process can no longer store anything.
     pub fn stopped(&self) -> bool {
-        self.stopped.load(Ordering::Relaxed)
+        self.health.stopped.load(Ordering::Relaxed)
+    }
+
+    /// True while the last [`FAILING_AFTER`] write batches were all rolled back:
+    /// nothing is being stored, though the writer keeps trying.
+    pub fn failing(&self) -> bool {
+        self.health.lost_batches.load(Ordering::Relaxed) >= FAILING_AFTER
     }
 }
 
@@ -492,26 +549,26 @@ impl Store {
         std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
         migrate(dir)?;
         let (tx, rx) = channel();
-        let stopped = Arc::new(AtomicBool::new(false));
+        let health = Arc::new(Health::default());
         let writer_dir = dir.to_path_buf();
-        let flag = stopped.clone();
+        let shared = health.clone();
         std::thread::Builder::new()
             .name("sqlite-writer".into())
             .spawn(move || {
                 // Raised however the thread ends, a panic included.
-                struct Stopped(Arc<AtomicBool>);
+                struct Stopped(Arc<Health>);
                 impl Drop for Stopped {
                     fn drop(&mut self) {
-                        self.0.store(true, Ordering::Relaxed);
+                        self.0.stopped.store(true, Ordering::Relaxed);
                     }
                 }
-                let _stopped = Stopped(flag);
-                if let Err(e) = writer_loop(&writer_dir, rx) {
+                let stopped = Stopped(shared);
+                if let Err(e) = writer_loop(&writer_dir, rx, &stopped.0) {
                     tracing::error!("sqlite writer stopped, nothing more will be stored: {e:#}");
                 }
             })?;
         let store = Store { dir: dir.to_path_buf(), pools: Default::default() };
-        Ok((std::sync::Arc::new(store), Writer { tx, stopped }))
+        Ok((std::sync::Arc::new(store), Writer { tx, health }))
     }
 
     /// Runs `f` with a pooled read-only connection. Call from a blocking context.
@@ -541,10 +598,12 @@ fn open_all(dir: &Path) -> Result<Conns> {
 /// The channel to the writer stays unbounded: the engine and the request
 /// handlers must never block on the disk, and the writer drains a second's
 /// worth of writes per commit, far more than the APs produce.
-fn writer_loop(dir: &Path, rx: Receiver<Msg>) -> Result<()> {
+fn writer_loop(dir: &Path, rx: Receiver<Msg>, health: &Health) -> Result<()> {
     let mut conns = open_all(dir)?;
     let mut pending: Vec<Write> = Vec::new();
-    let mut acks: Vec<Sender<()>> = Vec::new();
+    let mut acks: Vec<Sender<bool>> = Vec::new();
+    // Whether every batch since the last answer to a Flush committed.
+    let mut committed = true;
     let mut last_flush = Instant::now();
     // The first maintenance a minute after start, with the hourly retention (see `maintenance`).
     let mut last_maintenance = Instant::now().checked_sub(Duration::from_secs(240)).unwrap_or_else(Instant::now);
@@ -555,19 +614,22 @@ fn writer_loop(dir: &Path, rx: Receiver<Msg>) -> Result<()> {
             Ok(Msg::Write(w)) => pending.push(w),
             Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => {
-                flush(&mut conns, &mut pending);
+                commit(&mut conns, &mut pending, health);
                 return Ok(());
             }
         }
         if !acks.is_empty() || (!pending.is_empty() && (last_flush.elapsed() >= Duration::from_secs(1) || pending.len() >= 5000)) {
-            flush(&mut conns, &mut pending);
+            committed &= commit(&mut conns, &mut pending, health);
             last_flush = Instant::now();
-            for ack in acks.drain(..) {
-                let _ = ack.send(());
+            if !acks.is_empty() {
+                for ack in acks.drain(..) {
+                    let _ = ack.send(committed);
+                }
+                committed = true;
             }
         }
         if last_maintenance.elapsed() >= Duration::from_secs(300) {
-            flush(&mut conns, &mut pending);
+            committed &= commit(&mut conns, &mut pending, health);
             let hourly = last_hourly.is_none_or(|t| t.elapsed() >= Duration::from_secs(3600));
             maintenance(&mut conns, crate::clock::now_ts(), hourly);
             last_maintenance = Instant::now();
@@ -578,8 +640,24 @@ fn writer_loop(dir: &Path, rx: Receiver<Msg>) -> Result<()> {
     }
 }
 
-/// Commits the pending writes; returns how many failed.
-fn flush(conns: &mut Conns, pending: &mut Vec<Write>) -> usize {
+/// Commits what is pending, if anything, and keeps count of the batches lost in a
+/// row. False if the batch was lost.
+fn commit(conns: &mut Conns, pending: &mut Vec<Write>, health: &Health) -> bool {
+    if pending.is_empty() {
+        return true;
+    }
+    let (_, committed) = flush(conns, pending);
+    if committed {
+        health.lost_batches.store(0, Ordering::Relaxed);
+    } else {
+        health.lost_batches.fetch_add(1, Ordering::Relaxed);
+    }
+    committed
+}
+
+/// Commits the pending writes; returns how many failed, and whether every
+/// database's transaction committed (else its whole batch is lost).
+fn flush(conns: &mut Conns, pending: &mut Vec<Write>) -> (usize, bool) {
     let mut by_db: [Vec<Write>; 3] = Default::default();
     for w in pending.drain(..) {
         let db = match &w {
@@ -588,7 +666,7 @@ fn flush(conns: &mut Conns, pending: &mut Vec<Write>) -> usize {
         };
         by_db[db as usize].push(w);
     }
-    let mut failed = 0;
+    let (mut failed, mut committed) = (0, true);
     for (conn, writes) in conns.iter_mut().zip(by_db) {
         if writes.is_empty() {
             continue;
@@ -598,11 +676,11 @@ fn flush(conns: &mut Conns, pending: &mut Vec<Write>) -> usize {
             Ok(f) => failed += f,
             Err(e) => {
                 tracing::error!("write batch failed: {e:#}");
-                failed += n;
+                (failed, committed) = (failed + n, false);
             }
         }
     }
-    failed
+    (failed, committed)
 }
 
 /// Commits a batch in one transaction. A write that fails (e.g. a constraint)
@@ -814,8 +892,6 @@ fn delete_before(conn: &Connection, table: &str, time: &str, rows: Rows, cutoff:
 pub struct Series {
     /// Raw, 5m or 1h.
     pub tier: &'static str,
-    /// Bucket width in seconds (0 for raw samples).
-    pub step: i64,
     pub ts: Vec<Ts>,
     /// Gauges as stored; counters converted to per-second rates.
     pub fields: BTreeMap<&'static str, Vec<Option<f64>>>,
@@ -836,7 +912,7 @@ pub fn tier_for(from: Ts, to: Ts, now: Ts) -> usize {
 /// A series of `table`'s numbers, or of those at the places `only` lists (see
 /// `Table::numbers_named`).
 pub fn series(conn: &Connection, table: &'static Table, keys: &[String], only: Option<&[usize]>, from: Ts, to: Ts, tier: usize) -> Result<Series> {
-    let Tier { step, name, .. } = TIERS[tier];
+    let name = TIERS[tier].name;
     let all: Vec<&'static str> = table.numbers().collect();
     // Each field's place among the statement's numbers.
     let places: Vec<usize> = only.map_or_else(|| (0..all.len()).collect(), <[usize]>::to_vec);
@@ -877,7 +953,7 @@ pub fn series(conn: &Connection, table: &'static Table, keys: &[String], only: O
         prev_ts = Some(ts);
     }
     let fields = fields.into_iter().zip(columns).collect();
-    Ok(Series { tier: name, step, ts: ts_out, fields })
+    Ok(Series { tier: name, ts: ts_out, fields })
 }
 
 /// A writer whose writes are kept, and a function that stores them in new
@@ -885,13 +961,13 @@ pub fn series(conn: &Connection, table: &'static Table, keys: &[String], only: O
 #[cfg(test)]
 pub(crate) fn capture() -> (Writer, impl FnOnce(&Path) -> Result<usize>) {
     let (tx, rx) = channel();
-    let writer = Writer { tx, stopped: Default::default() };
+    let writer = Writer { tx, health: Default::default() };
     let store = move |dir: &Path| {
         std::fs::create_dir_all(dir)?;
         migrate(dir)?;
         let mut conns = open_all(dir)?;
         let mut writes = rx.try_iter().filter_map(|m| match m { Msg::Write(w) => Some(w), Msg::Flush(_) => None }).collect();
-        Ok(flush(&mut conns, &mut writes))
+        Ok(flush(&mut conns, &mut writes).0)
     };
     (writer, store)
 }
@@ -970,7 +1046,7 @@ mod tests {
         maintenance(&mut conns, now + ROLLUP_GRACE_SECS, false);
         let m = &conns[Db::Metrics as usize];
         let five = series(m, &UPLINK, &["bb".into()], None, now - 3600, now, 1).unwrap();
-        assert_eq!(five.step, 300);
+        assert_eq!(five.tier, "5m");
         assert_eq!(five.ts, vec![now - 1200, now - 900, now - 600, now - 300]);
         assert_eq!(five.fields["speed"], vec![Some(1000.0); 4]);
         // Rates from the counters' last value in consecutive buckets.
@@ -1068,7 +1144,7 @@ mod tests {
         assert_eq!(n, 2);
         // A metric row with a value too few or too many is refused, not stored in the wrong columns.
         let row = |n: usize| Write::Metric { table: &MCAST, ts: 1, values: [Value::Text("aa".into()), Value::Text("mdns".into())].into_iter().chain(std::iter::repeat_n(Value::Real(1.0), n)).collect() };
-        assert_eq!(apply(&mut conns[Db::Metrics as usize], vec![row(4), row(5), row(6)]).unwrap(), 2);
+        assert_eq!(apply(&mut conns[Db::Metrics as usize], vec![row(1), row(2), row(3)]).unwrap(), 2);
         let n: i64 = conns[Db::Metrics as usize].query_row("SELECT COUNT(*) FROM mcast_stats", [], |r| r.get(0)).unwrap();
         assert_eq!(n, 1);
     }
@@ -1124,6 +1200,36 @@ mod tests {
         let conn = open_rw(&dir.join(Db::Config.file())).unwrap();
         let data: Vec<String> = conn.prepare("SELECT data FROM events ORDER BY ts").unwrap().query_map([], |r| r.get(0)).unwrap().collect::<rusqlite::Result<_>>().unwrap();
         assert_eq!(data, [r#"{"target":"6.6.77"}"#, "not json", r#"{"url":"kept"}"#]);
+    }
+
+    #[test]
+    fn stored_crash_and_restart_events_are_read_as_live_ones_are_stored() {
+        let dir = temp_dir("crash_rows");
+        std::fs::create_dir_all(&dir).unwrap();
+        migrate(&dir).unwrap();
+        let conn = open_rw(&dir.join(Db::Config.file())).unwrap();
+        conn.execute_batch(
+            r#"INSERT INTO events (ts, kind, data) VALUES
+                 (1, 'ap_crash', '{"kind":"crash report","lines":["boot","Kernel panic - not syncing: x"]}'),
+                 (2, 'ap_crash', '{"kind":"crash report","lines":["a"],"summary":"kept"}'),
+                 (3, 'ap_crash', '{"kind":"crash report","lines":[]}'),
+                 (4, 'ap_process_restarted', '{"proc":"mcad","exit_status":" 139 "}'),
+                 (5, 'ap_process_restarted', '{"proc":"mcad","exit_status":"signal"}'),
+                 (6, 'ap_process_restarted', '{"proc":"mcad","exit_status":9}'),
+                 (7, 'ap_process_restarted', '{"proc":"mcad"}'),
+                 (8, 'ap_process_restarted', 'not json');"#,
+        )
+        .unwrap();
+        drop(conn);
+        migrate(&dir).unwrap();
+        migrate(&dir).unwrap();
+        let conn = open_rw(&dir.join(Db::Config.file())).unwrap();
+        let data: Vec<String> = conn.prepare("SELECT data FROM events ORDER BY ts").unwrap().query_map([], |r| r.get(0)).unwrap().collect::<rusqlite::Result<_>>().unwrap();
+        let data: Vec<serde_json::Value> = data.iter().map(|d| serde_json::from_str(d).unwrap_or_else(|_| d.as_str().into())).collect();
+        assert_eq!(data[0]["summary"], "Kernel panic - not syncing: x");
+        assert_eq!((&data[1]["summary"], &data[2].get("summary")), (&serde_json::json!("kept"), &None));
+        assert_eq!((&data[3]["exit_status"], data[4].get("exit_status"), &data[5]["exit_status"]), (&serde_json::json!(139), None, &serde_json::json!(9)));
+        assert_eq!((data[6].get("exit_status"), &data[7]), (None, &serde_json::json!("not json")));
     }
 
     #[test]
