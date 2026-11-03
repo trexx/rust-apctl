@@ -400,6 +400,24 @@ fn migrate(dir: &Path) -> Result<()> {
         "UPDATE events SET data = json_remove(data, '$.url') WHERE kind = 'ap_upgrade_sent' AND json_valid(data) AND json_extract(data, '$.url') IS NOT NULL",
         [],
     )?;
+    // Crash and process-restart events as live ones are stored: a crash with lines has
+    // its summary, a restart's exit status is a number or absent. Only rows stored
+    // before either was so are picked, so a start without them reads no rows.
+    rewrite_events(
+        &config,
+        "SELECT id, data FROM events WHERE kind = 'ap_crash' AND json_valid(data) AND json_extract(data, '$.summary') IS NULL AND json_array_length(data, '$.lines') > 0",
+        |d| {
+            let lines: Vec<&str> = d["lines"].as_array().into_iter().flatten().filter_map(serde_json::Value::as_str).collect();
+            if let Some(summary) = crate::logevents::crash_summary(&lines).map(str::to_string) {
+                d["summary"] = summary.into();
+            }
+        },
+    )?;
+    rewrite_events(
+        &config,
+        "SELECT id, data FROM events WHERE kind = 'ap_process_restarted' AND json_valid(data) AND json_type(data, '$.exit_status') != 'integer'",
+        crate::engine::numeric_exit_status,
+    )?;
     drop(config);
     open_rw(&dir.join(Db::Logs.file()))?.execute_batch(LOGS_SCHEMA)?;
     let metrics = open_rw(&dir.join(Db::Metrics.file()))?;
@@ -426,6 +444,22 @@ fn migrate(dir: &Path) -> Result<()> {
     for Tier { suffix, .. } in &TIERS[1..] {
         metrics.execute_batch(&format!("CREATE INDEX IF NOT EXISTS client_stats{suffix}_ap ON client_stats{suffix} (ap_mac, ts)"))?;
     }
+    Ok(())
+}
+
+/// Rewrites with `fix` the data of the events `select` picks (their `id, data`).
+fn rewrite_events(c: &Connection, select: &str, fix: impl Fn(&mut serde_json::Value)) -> Result<()> {
+    let rows: Vec<(i64, String)> = c.prepare(select)?.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<rusqlite::Result<_>>()?;
+    if rows.is_empty() {
+        return Ok(());
+    }
+    let tx = c.unchecked_transaction()?;
+    for (id, data) in rows {
+        let Ok(mut d) = serde_json::from_str(&data) else { continue };
+        fix(&mut d);
+        tx.execute("UPDATE events SET data = ?2 WHERE id = ?1", rusqlite::params![id, d.to_string()])?;
+    }
+    tx.commit()?;
     Ok(())
 }
 
@@ -1166,6 +1200,36 @@ mod tests {
         let conn = open_rw(&dir.join(Db::Config.file())).unwrap();
         let data: Vec<String> = conn.prepare("SELECT data FROM events ORDER BY ts").unwrap().query_map([], |r| r.get(0)).unwrap().collect::<rusqlite::Result<_>>().unwrap();
         assert_eq!(data, [r#"{"target":"6.6.77"}"#, "not json", r#"{"url":"kept"}"#]);
+    }
+
+    #[test]
+    fn stored_crash_and_restart_events_are_read_as_live_ones_are_stored() {
+        let dir = temp_dir("crash_rows");
+        std::fs::create_dir_all(&dir).unwrap();
+        migrate(&dir).unwrap();
+        let conn = open_rw(&dir.join(Db::Config.file())).unwrap();
+        conn.execute_batch(
+            r#"INSERT INTO events (ts, kind, data) VALUES
+                 (1, 'ap_crash', '{"kind":"crash report","lines":["boot","Kernel panic - not syncing: x"]}'),
+                 (2, 'ap_crash', '{"kind":"crash report","lines":["a"],"summary":"kept"}'),
+                 (3, 'ap_crash', '{"kind":"crash report","lines":[]}'),
+                 (4, 'ap_process_restarted', '{"proc":"mcad","exit_status":" 139 "}'),
+                 (5, 'ap_process_restarted', '{"proc":"mcad","exit_status":"signal"}'),
+                 (6, 'ap_process_restarted', '{"proc":"mcad","exit_status":9}'),
+                 (7, 'ap_process_restarted', '{"proc":"mcad"}'),
+                 (8, 'ap_process_restarted', 'not json');"#,
+        )
+        .unwrap();
+        drop(conn);
+        migrate(&dir).unwrap();
+        migrate(&dir).unwrap();
+        let conn = open_rw(&dir.join(Db::Config.file())).unwrap();
+        let data: Vec<String> = conn.prepare("SELECT data FROM events ORDER BY ts").unwrap().query_map([], |r| r.get(0)).unwrap().collect::<rusqlite::Result<_>>().unwrap();
+        let data: Vec<serde_json::Value> = data.iter().map(|d| serde_json::from_str(d).unwrap_or_else(|_| d.as_str().into())).collect();
+        assert_eq!(data[0]["summary"], "Kernel panic - not syncing: x");
+        assert_eq!((&data[1]["summary"], &data[2].get("summary")), (&serde_json::json!("kept"), &None));
+        assert_eq!((&data[3]["exit_status"], data[4].get("exit_status"), &data[5]["exit_status"]), (&serde_json::json!(139), None, &serde_json::json!(9)));
+        assert_eq!((data[6].get("exit_status"), &data[7]), (None, &serde_json::json!("not json")));
     }
 
     #[test]

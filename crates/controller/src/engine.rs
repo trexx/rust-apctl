@@ -2009,7 +2009,7 @@ fn disconnect(writer: &Writer, ts: Ts, mac: Mac, c: &mut ClientView, reason: &st
 
 /// A process-restart notification's `exit_status` as a number: the AP may send
 /// the code as text. One that is no number is left out, as one not sent.
-fn numeric_exit_status(n: &mut Value) {
+pub(crate) fn numeric_exit_status(n: &mut Value) {
     let code = match &n["exit_status"] {
         Value::Number(c) => c.as_i64(),
         Value::String(c) => c.trim().parse::<i64>().ok(),
