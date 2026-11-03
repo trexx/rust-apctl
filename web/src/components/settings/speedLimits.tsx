@@ -9,8 +9,8 @@ import { EditorShell } from "./Review";
 import { NotImported } from "./EditPanel";
 import { ListPanel } from "./ListPanel";
 
-/** A limit in kbps as the Mbps text of its field; empty for none. */
-const mbpsField = (k: number | null | undefined) =>
+/** A limit in kbps as the Mbps text of its field; empty for none (-1). */
+const mbpsField = (k: number | undefined) =>
   k && k > 0 ? String(k / 1000) : "";
 
 /** The field's Mbps text as kbps; -1 (no limit) when empty. */

@@ -1691,9 +1691,9 @@ export interface UserGroup {
   id: string;
   name: string;
   default: boolean;
-  /** kbps; -1: no limit. */
-  qos_rate_max_down: number | null;
-  qos_rate_max_up: number | null;
+  /** kbps, as the APs get them; -1: no limit (also for a rate the render can't read). */
+  qos_rate_max_down: number;
+  qos_rate_max_up: number;
   /** SSIDs and clients using it. */
   used_by: string[];
 }
