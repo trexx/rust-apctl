@@ -16,10 +16,15 @@ pub fn source(collection: &str) -> &str {
     }
 }
 
-/// Device fields kept besides the ones rendering reads ([`apcfg::DEVICE_KEYS`]): what
-/// the controller shows and copies onto a new AP, and the fingerprint of the AP's SSH
-/// host key (`SHA256:<base64>`, a public key's), which adopting it over SSH checks. The
-/// rest (stats caches, SSH credentials, `x_fingerprint`) is left out.
+/// Device fields kept besides the ones rendering reads ([`apcfg::DEVICE_KEYS`]). The
+/// controller reads: the model (shown), the address (which AP an SSH host key belongs
+/// to), whether the AP pins AES-GCM, the fingerprint of its SSH host key
+/// (`SHA256:<base64>`, a public key's), which adopting it over SSH checks, `cfgversion`
+/// (the config version the other controller expected, which the dry run compares with
+/// the AP's) and the WLAN groups it copies onto a new AP. `version`, `serial` and
+/// `adopted` are read by nothing, but apctl writes them into the records of the APs it
+/// adopts, so an imported record has the same fields. The rest (stats caches, SSH
+/// credentials, `x_fingerprint`) is left out.
 const DEVICE_FIELDS: &[&str] = &["model", "version", "serial", "ip", "adopted", "x_aes_gcm", "x_ssh_hostkey_fingerprint", "cfgversion", "wlangroup_id_na", "wlangroup_id_ng"];
 
 /// Client fields kept besides the ones rendering reads ([`apcfg::CLIENT_KEYS`]): the
@@ -84,7 +89,7 @@ mod tests {
     #[test]
     fn imports_keep_what_the_controller_reads_and_no_other_secret() {
         let (devices, clients) = (device_fields(), client_fields());
-        for f in ["mac", "site_id", "x_authkey", "x_ssh_hostkey_fingerprint", "syslog_key", "radio_table", "model", "version", "cfgversion", "x_aes_gcm", "mgmt_network_id", "wlangroup_id_ng", "wlangroup_id_na"] {
+        for f in ["mac", "site_id", "x_authkey", "x_ssh_hostkey_fingerprint", "syslog_key", "radio_table", "model", "ip", "cfgversion", "x_aes_gcm", "mgmt_network_id", "wlangroup_id_ng", "wlangroup_id_na"] {
             assert!(devices.contains(&f), "devices: {f}");
         }
         for f in ["mac", "site_id", "blocked", "fixed_ap_mac", "name", "note", "hostname", "usergroup_id", "use_fixedip", "fixed_ip"] {
