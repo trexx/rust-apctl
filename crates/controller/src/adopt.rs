@@ -451,17 +451,17 @@ pub async fn pending(State(s): State<AppState>) -> Json<Value> {
     let now = clock::now_ts();
     // What `expire` would drop is left out (it runs every ten seconds), and
     // the lists are serialised after the lock is released.
+    // `forgetting`: how many APs are being forgotten (the page polls faster meanwhile).
     let (pending, adopting, forgetting) = {
         let live = s.live.read().unwrap();
         let a = &live.adoption;
         let pending: Vec<Pending> = a.pending.values().filter(|p| now - p.last_seen < PENDING_TIMEOUT).cloned().collect();
         let adopting: Vec<(Mac, Ts)> = a.adopting.iter().filter(|(_, a)| a.current(now)).map(|(m, a)| (*m, a.since)).collect();
-        let forgetting: Vec<(Mac, Ts)> = a.forgetting.iter().map(|(m, t)| (*m, *t)).collect();
-        (pending, adopting, forgetting)
+        (pending, adopting, a.forgetting.len())
     };
-    let since = |l: Vec<(Mac, Ts)>| l.into_iter().map(|(m, t)| json!({ "mac": m, "since": t })).collect::<Vec<_>>();
+    let adopting: Vec<Value> = adopting.into_iter().map(|(m, t)| json!({ "mac": m, "since": t })).collect();
     let pending: Vec<PendingView> = pending.iter().map(Pending::view).collect();
-    Json(json!({ "active": s.active, "pending": pending, "adopting": since(adopting), "forgetting": since(forgetting), "ssh": ssh }))
+    Json(json!({ "active": s.active, "pending": pending, "adopting": adopting, "forgetting": forgetting, "ssh": ssh }))
 }
 
 /// POST /api/devices/{mac}/adopt: adopt a pending AP. Run as a task of its
