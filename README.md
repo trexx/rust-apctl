@@ -17,7 +17,8 @@ so the APs need no changes.
 - Neighbouring networks, channel planning and nightly auto-channel
 - SSID, AP and site settings editors with per-AP previews, plus schedules, speed limits
   and SNMP
-- Adoption, firmware upgrades, device and client actions, and encrypted backups
+- Adoption, firmware upgrades, device and client actions, a browser terminal on the APs
+  (SSH), and encrypted backups
 
 Tested with U6-Mesh APs on firmware 8.8, against Network Application 10.6.
 

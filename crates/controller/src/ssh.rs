@@ -39,7 +39,7 @@ pub fn available(s: &AppState) -> Value {
     json!({ "possible": s.active && url.is_some(), "inform_url": url })
 }
 
-struct Client {
+pub(crate) struct Client {
     /// The fingerprint the server must present, if known.
     expected: Option<String>,
     seen: Arc<Mutex<Option<String>>>,
@@ -61,7 +61,7 @@ impl russh::client::Handler for Client {
 
 /// Why an SSH adoption failed, as the official controller tells them apart.
 #[derive(Debug, PartialEq)]
-pub enum Failure {
+pub(crate) enum Failure {
     Unreachable(String),
     Login,
     HostKey,
@@ -80,8 +80,8 @@ impl std::fmt::Display for Failure {
 }
 
 /// An SSH session to an AP.
-struct Session {
-    handle: russh::client::Handle<Client>,
+pub(crate) struct Session {
+    pub(crate) handle: russh::client::Handle<Client>,
     fingerprint: Option<String>,
 }
 
@@ -108,10 +108,14 @@ async fn open(config: &Arc<russh::client::Config>, ip: &str, port: u16, expected
     }
 }
 
+/// For running commands: a session quiet for 20 s has lost its AP.
+fn command_config() -> Arc<russh::client::Config> {
+    Arc::new(russh::client::Config { inactivity_timeout: Some(Duration::from_secs(20)), ..Default::default() })
+}
+
 /// Logs in with each username and password in turn, on one connection while
 /// the AP keeps it open after a refusal (a new one when it doesn't).
-async fn connect(ip: &str, port: u16, logins: &[(String, String)], expected: Option<String>) -> Result<Session, Failure> {
-    let config = Arc::new(russh::client::Config { inactivity_timeout: Some(Duration::from_secs(20)), ..Default::default() });
+pub(crate) async fn connect(config: Arc<russh::client::Config>, ip: &str, port: u16, logins: &[(String, String)], expected: Option<String>) -> Result<Session, Failure> {
     let login = |(mut handle, seen): Conn, user: String, pass: String| async move {
         let r = match tokio::time::timeout(STEP_TIMEOUT, handle.authenticate_password(user, pass)).await {
             Ok(Ok(r)) => Ok(r.success()),
@@ -233,7 +237,7 @@ fn shell_quote(s: &str) -> String {
 /// its informs report (`fingerprint`, sent under its own key; the official
 /// controller keeps its record up to date with it), else the one its record kept.
 /// An empty one, reported or kept, is none.
-fn expected_host_key(live: &crate::engine::Live, state: &Value, mac: &Mac) -> Option<String> {
+pub(crate) fn expected_host_key(live: &crate::engine::Live, state: &Value, mac: &Mac) -> Option<String> {
     let reported = live.raw_informs.get(mac).and_then(|p| p["fingerprint"].as_str());
     let kept = || crate::adopt::device_doc(state, mac)?["x_ssh_hostkey_fingerprint"].as_str().filter(|f| !f.is_empty());
     reported.filter(|f| !f.is_empty()).or_else(kept).map(str::to_string)
@@ -285,7 +289,7 @@ fn given_login(username: Option<String>, password: Option<String>) -> Result<Opt
 /// The usernames and passwords to try: the ones given, else the site's device
 /// login (its password, with the user the APs get: [`apcfg::ssh_username`]),
 /// then the factory ones.
-fn logins(state: Option<&Value>, given: Option<(String, String)>) -> Vec<(String, String)> {
+pub(crate) fn logins(state: Option<&Value>, given: Option<(String, String)>) -> Vec<(String, String)> {
     if let Some(g) = given {
         return vec![g];
     }
@@ -376,7 +380,7 @@ async fn adopt_over_ssh(s: AppState, b: AdoptBody) -> Result<Json<Value>, ApiErr
     let bad = |f: Failure| ApiError(StatusCode::BAD_GATEWAY, f.to_string());
     // A known AP keeps its host key, checked before any password is sent; a new one is trusted the first time.
     let expected = known_host_key(&s.live.read().unwrap(), &ip);
-    let connected = connect(&ip, b.port.unwrap_or(22), &logins(state.as_deref(), given), expected.as_ref().map(|e| e.1.clone())).await;
+    let connected = connect(command_config(), &ip, b.port.unwrap_or(22), &logins(state.as_deref(), given), expected.as_ref().map(|e| e.1.clone())).await;
     let session = match (connected, &expected) {
         (Err(Failure::HostKey), Some((mac, _))) => {
             s.note(Event::device(clock::now_ts(), EventKind::ApHostKeyMismatch, *mac, json!({ "ip": ip }))).await;

@@ -217,6 +217,11 @@ impl Auth {
         self.logouts.subscribe()
     }
 
+    /// The user of a session (by its hash), while it is still there.
+    pub(crate) fn user(&self, hash: &str) -> Option<String> {
+        self.sessions.lock().unwrap().get(hash).filter(|s| s.expires > clock::now_ts()).map(|s| s.user.clone())
+    }
+
     /// Whether a session (by its hash) is still there: not logged out, not expired.
     pub(crate) fn alive(&self, hash: &str) -> bool {
         self.sessions.lock().unwrap().get(hash).is_some_and(|s| s.expires > clock::now_ts())

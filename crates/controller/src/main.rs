@@ -31,6 +31,7 @@ mod ssh;
 mod stun;
 mod store;
 mod syslog;
+mod terminal;
 mod threats;
 mod usergroups;
 mod vendor;

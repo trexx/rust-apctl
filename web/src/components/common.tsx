@@ -687,6 +687,11 @@ const EVENTS: { [K in EventKind]: EventSpec<K> } = {
     label: "Config re-send requested",
     tone: "neutral",
   },
+  ap_terminal_opened: {
+    label: "Terminal opened",
+    tone: "neutral",
+    describe: (d) => (d.user ? `by ${d.user}` : ""),
+  },
   client_reconnect_requested: { label: "Reconnect requested", tone: "info" },
   client_blocked: { label: "Client blocked", tone: "warn" },
   client_unblocked: { label: "Client unblocked", tone: "info" },

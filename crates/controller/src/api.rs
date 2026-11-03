@@ -181,8 +181,12 @@ pub fn router(state: AppState) -> Router {
         .route("/api/events", get(events))
         .route("/api/logs", get(logs))
         .route_layer(axum::middleware::from_fn_with_state(state.clone(), crate::auth::require_login));
-    // The live socket is added after compression, which must not touch an upgrade.
-    let socket = Router::new().route("/api/ws", get(ws)).route_layer(axum::middleware::from_fn_with_state(state.clone(), crate::auth::require_login));
+    // The sockets are added after compression, which must not touch an upgrade. A
+    // terminal is a root shell on an AP: withheld in read-only mode, as secrets are.
+    let socket = Router::new()
+        .route("/api/ws", get(ws))
+        .route("/api/devices/{mac}/terminal", get(crate::terminal::open).route_layer(secret.clone()))
+        .route_layer(axum::middleware::from_fn_with_state(state.clone(), crate::auth::require_login));
     // JSON and the UI's scripts and styles compress well (gzip only; images are left alone).
     let app = public.merge(protected).fallback(crate::web::handler).layer(tower_http::compression::CompressionLayer::new().compress_when(compressible())).merge(socket);
     with_security_headers(app).with_state(state)
@@ -1237,27 +1241,39 @@ pub fn live_json(typed: &broadcast::Sender<LiveMsg>) -> broadcast::Sender<Utf8By
     tx
 }
 
-/// Streams the live messages until the client goes, or its session does:
-/// the login is checked at the upgrade, then at every logout and now and
-/// then (for expiry). Read-only mode has no sessions to check.
-async fn live_socket(mut socket: WebSocket, mut rx: broadcast::Receiver<Utf8Bytes>, auth: crate::auth::SharedAuth, session: Option<String>) {
+/// Resolves once a socket's session ends: checked at every logout and now
+/// and then (for expiry). Never for none (read-only mode has no sessions).
+pub(crate) async fn session_ends(auth: &crate::auth::Auth, session: Option<&str>) {
+    let Some(hash) = session else { return std::future::pending().await };
     let mut recheck = tokio::time::interval_at(tokio::time::Instant::now() + SESSION_RECHECK, SESSION_RECHECK);
     let mut logouts = auth.logouts();
     loop {
-        // (The logouts' sender lives in `auth`, which this holds: it never closes.)
-        let due = async {
-            tokio::select! {
-                _ = recheck.tick() => {}
-                _ = logouts.changed() => {}
-            }
-        };
+        // (The logouts' sender lives in `auth`: it never closes while this borrows it.)
         tokio::select! {
-            _ = due, if session.is_some() => {
-                if !session.as_deref().is_some_and(|h| auth.alive(h)) {
-                    let close = axum::extract::ws::CloseFrame { code: axum::extract::ws::close_code::POLICY, reason: Utf8Bytes::from_static("logged out") };
-                    let _ = socket.send(Message::Close(Some(close))).await;
-                    return;
-                }
+            _ = recheck.tick() => {}
+            _ = logouts.changed() => {}
+        }
+        if !auth.alive(hash) {
+            return;
+        }
+    }
+}
+
+/// The close frame for a socket whose session ended (1008: the page then asks /api/me).
+pub(crate) fn logged_out() -> Message {
+    Message::Close(Some(axum::extract::ws::CloseFrame { code: axum::extract::ws::close_code::POLICY, reason: Utf8Bytes::from_static("logged out") }))
+}
+
+/// Streams the live messages until the client goes, or its session does
+/// (checked at the upgrade, then by [`session_ends`]).
+async fn live_socket(mut socket: WebSocket, mut rx: broadcast::Receiver<Utf8Bytes>, auth: crate::auth::SharedAuth, session: Option<String>) {
+    let ended = session_ends(&auth, session.as_deref());
+    tokio::pin!(ended);
+    loop {
+        tokio::select! {
+            _ = &mut ended => {
+                let _ = socket.send(logged_out()).await;
+                return;
             }
             msg = rx.recv() => match msg {
                 // Shared text: sending it copies nothing.
@@ -1284,7 +1300,7 @@ async fn live_socket(mut socket: WebSocket, mut rx: broadcast::Receiver<Utf8Byte
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::model::tests::{TestDir, flushed};
     use axum::body::Body;
@@ -1293,7 +1309,7 @@ mod tests {
 
     /// The app's state, the engine's end of its queue (dropping it stops the
     /// "engine"), and the data directory.
-    fn state() -> (AppState, tokio::sync::mpsc::Receiver<crate::engine::Input>, TestDir) {
+    pub(crate) fn state() -> (AppState, tokio::sync::mpsc::Receiver<crate::engine::Input>, TestDir) {
         let dir = TestDir::new("api");
         let (store, writer) = Store::open(&dir).unwrap();
         let auth = Arc::new(crate::auth::Auth::new(Default::default(), &store, writer.clone(), Default::default()).unwrap());
@@ -1819,35 +1835,59 @@ mod tests {
         assert_eq!(msg, INTERNAL);
     }
 
-    #[tokio::test]
-    async fn the_live_socket_checks_the_origin_and_closes_at_logout() {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        let (state, _engine, cookie, _dir) = logged_in();
-        let app = router(state);
+    /// Serves the app on a port of its own, as a browser reaches it.
+    pub(crate) async fn serve(app: Router) -> std::net::SocketAddr {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        let server = app.clone().into_make_service_with_connect_info::<std::net::SocketAddr>();
+        let server = app.into_make_service_with_connect_info::<std::net::SocketAddr>();
         tokio::spawn(async move { axum::serve(listener, server).await.unwrap() });
-        // A handshake by hand: the status line, and the open connection.
-        let open = |origin: Option<String>| {
-            let cookie = cookie.clone();
-            async move {
-                let mut tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
-                let origin = origin.map(|o| format!("Origin: {o}\r\n")).unwrap_or_default();
-                let req = format!(
-                    "GET /api/ws HTTP/1.1\r\nHost: {addr}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nCookie: {cookie}\r\n{origin}\r\n"
-                );
-                tcp.write_all(req.as_bytes()).await.unwrap();
-                let mut head = Vec::new();
-                while !head.ends_with(b"\r\n\r\n") {
-                    let mut b = [0u8; 1];
-                    tcp.read_exact(&mut b).await.unwrap();
-                    head.push(b[0]);
-                }
-                let status = String::from_utf8(head).unwrap().split(' ').nth(1).unwrap().to_string();
-                (status, tcp)
-            }
+        addr
+    }
+
+    /// A WebSocket handshake by hand: the status line's code, and the open connection.
+    pub(crate) async fn handshake(addr: std::net::SocketAddr, path: &str, cookie: &str, origin: Option<String>) -> (String, tokio::net::TcpStream) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let origin = origin.map(|o| format!("Origin: {o}\r\n")).unwrap_or_default();
+        let req = format!(
+            "GET {path} HTTP/1.1\r\nHost: {addr}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nCookie: {cookie}\r\n{origin}\r\n"
+        );
+        tcp.write_all(req.as_bytes()).await.unwrap();
+        let mut head = Vec::new();
+        while !head.ends_with(b"\r\n\r\n") {
+            let mut b = [0u8; 1];
+            tcp.read_exact(&mut b).await.unwrap();
+            head.push(b[0]);
+        }
+        let status = String::from_utf8(head).unwrap().split(' ').nth(1).unwrap().to_string();
+        (status, tcp)
+    }
+
+    /// The next frame the server sends (never masked): its opcode and payload.
+    pub(crate) async fn frame(tcp: &mut tokio::net::TcpStream) -> (u8, Vec<u8>) {
+        use tokio::io::AsyncReadExt;
+        let read = async {
+            let mut head = [0u8; 2];
+            tcp.read_exact(&mut head).await.unwrap();
+            let len = match head[1] & 0x7f {
+                126 => tcp.read_u16().await.unwrap() as usize,
+                127 => tcp.read_u64().await.unwrap() as usize,
+                n => n as usize,
+            };
+            let mut payload = vec![0; len];
+            tcp.read_exact(&mut payload).await.unwrap();
+            (head[0] & 0x0f, payload)
         };
+        tokio::time::timeout(std::time::Duration::from_secs(5), read).await.expect("a frame")
+    }
+
+    #[tokio::test]
+    async fn the_live_socket_checks_the_origin_and_closes_at_logout() {
+        use tokio::io::AsyncReadExt;
+        let (state, _engine, cookie, _dir) = logged_in();
+        let app = router(state);
+        let addr = serve(app.clone()).await;
+        let open = |origin: Option<String>| handshake(addr, "/api/ws", &cookie, origin);
         assert_eq!(open(Some("http://evil.example".into())).await.0, "403");
         assert_eq!(open(None).await.0, "101", "no Origin: not a browser page");
         let (status, mut tcp) = open(Some(format!("http://{addr}"))).await;
@@ -1863,6 +1903,36 @@ mod tests {
         let mut frame = [0u8; 2];
         tokio::time::timeout(std::time::Duration::from_secs(5), tcp.read_exact(&mut frame)).await.expect("closed at the logout").unwrap();
         assert_eq!(frame[0], 0x88, "a close frame");
+    }
+
+    #[tokio::test]
+    async fn a_terminal_is_for_logged_in_pages_of_this_server_and_says_why_it_cannot_open() {
+        const PATH: &str = "/api/devices/02:00:00:00:00:01/terminal?cols=100&rows=30";
+        // Read-only mode has no logins: no shell for anyone.
+        let (app, _engine, _dir) = app();
+        assert_eq!(app.oneshot(Request::get(PATH).body(Body::empty()).unwrap()).await.unwrap().status(), StatusCode::FORBIDDEN);
+        // Why one cannot open comes over the socket, then a close frame.
+        let why = |addr: std::net::SocketAddr, cookie: String| async move {
+            let (status, mut tcp) = handshake(addr, PATH, &cookie, Some(format!("http://{addr}"))).await;
+            assert_eq!(status, "101");
+            let (op, text) = frame(&mut tcp).await;
+            assert_eq!((op, frame(&mut tcp).await.0), (1, 8), "text, then closed");
+            serde_json::from_slice::<Value>(&text).unwrap()["error"].as_str().unwrap().to_string()
+        };
+        let (state, _engine, cookie, _dir) = logged_in();
+        let addr = serve(router(state)).await;
+        assert_eq!(handshake(addr, PATH, &cookie, Some("http://evil.example".into())).await.0, "403");
+        assert_eq!(handshake(addr, PATH, "", Some(format!("http://{addr}"))).await.0, "401");
+        assert!(why(addr, cookie).await.contains("active mode"));
+        let (mut state, _engine, cookie, _dir) = logged_in();
+        state.get_mut().active = true;
+        let addr = serve(router(state.clone())).await;
+        assert!(why(addr, cookie.clone()).await.contains("unknown AP"));
+        // An AP whose host key apctl has not learnt: no login is tried.
+        let (tx, _) = broadcast::channel(16);
+        let mut engine = crate::engine::Engine::new(state.writer.clone(), Default::default(), state.live.clone(), tx);
+        engine.handle(report(json!({ "mac": "02:00:00:00:00:01", "hostname": "Hall", "ip": "192.0.2.9", "uptime": 100 })));
+        assert!(why(addr, cookie).await.contains("host key"));
     }
 
     #[tokio::test]

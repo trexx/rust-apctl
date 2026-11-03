@@ -94,7 +94,7 @@ crate::model::named_enum! {
         ApUpgradeSent = "ap_upgrade_sent", ApUpgradeStarted = "ap_upgrade_started", ApUpgradeProgress = "ap_upgrade_progress", ApUpgradeFailed = "ap_upgrade_failed",
         ApUpgraded = "ap_upgraded",
         ApPending = "ap_pending", ApAdopting = "ap_adopting", ApAdopted = "ap_adopted", ApForgotten = "ap_forgotten", ApHostKeyMismatch = "ap_host_key_mismatch",
-        ApRestartRequested = "ap_restart_requested", ApProvisionRequested = "ap_provision_requested",
+        ApRestartRequested = "ap_restart_requested", ApProvisionRequested = "ap_provision_requested", ApTerminalOpened = "ap_terminal_opened",
         ClientConnected = "client_connected", ClientDisconnected = "client_disconnected", ClientConnectFailed = "client_connect_failed", ClientRoamed = "client_roamed",
         ClientRenamed = "client_renamed", ClientKicked = "client_kicked", ClientSteered = "client_steered", ClientWrongPassword = "client_wrong_password",
         ClientExperience = "client_experience", ClientReconnectRequested = "client_reconnect_requested", ClientBlocked = "client_blocked",
@@ -2098,7 +2098,7 @@ mod tests {
         let known = "ap_seen ap_online ap_offline ap_restarted ap_firmware_changed ap_isolated ap_crash ap_process_restarted ap_scan_done ap_event \
                      dfs_radar rogue_ap network_threat radio_changed config_pushed config_applied dryrun_compared ap_upgrade_sent ap_upgrade_started \
                      ap_upgrade_progress ap_upgrade_failed ap_upgraded ap_pending ap_adopting ap_adopted ap_forgotten ap_host_key_mismatch \
-                     ap_restart_requested ap_provision_requested client_connected client_disconnected client_connect_failed client_roamed \
+                     ap_restart_requested ap_provision_requested ap_terminal_opened client_connected client_disconnected client_connect_failed client_roamed \
                      client_renamed client_kicked client_steered client_wrong_password client_experience client_reconnect_requested client_blocked \
                      client_unblocked settings_imported settings_changed channel_plan";
         assert_eq!(names, known.split_whitespace().collect::<Vec<_>>());

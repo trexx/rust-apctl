@@ -1,3 +1,4 @@
+import { Suspense, useState } from "react";
 import {
   blockClient,
   forgetAp,
@@ -15,11 +16,15 @@ import {
 } from "../api";
 import type { Mac, Names } from "../api";
 import { Outcome, errorText, useRunner } from "./common";
+import { lazyNamed } from "../lazy";
 import { Select } from "./settings/form";
 import {
   speedLimitLabel,
   speedLimitOptions,
 } from "./settings/speedLimitOptions";
+
+// The terminal (and xterm.js) loads only when one is opened.
+const Terminal = lazyNamed(() => import("./Terminal"), "Terminal");
 
 /** Whether actions can be used: active mode, signed in. */
 function useCanAct(): { can: boolean; why: string | null } {
@@ -47,6 +52,7 @@ export function DeviceActions({
 }) {
   const { can, why } = useCanAct();
   const { busy, msg, run } = useRunner([keys.device(mac), keys.devices()]);
+  const [terminal, setTerminal] = useState(false);
   if (!can && !why) return null;
   const off = !can || busy || !online;
   return (
@@ -114,8 +120,22 @@ export function DeviceActions({
         >
           Forget
         </button>
+        <button
+          className={`btn small${terminal ? " primary" : ""}`}
+          // An open one stays until closed, whatever the AP does.
+          disabled={!can || (!online && !terminal)}
+          title="Open a shell on the AP over SSH, for debugging"
+          onClick={() => setTerminal((t) => !t)}
+        >
+          Terminal
+        </button>
       </div>
       <Outcome msg={msg} why={why} />
+      {terminal && (
+        <Suspense fallback={<div className="small muted">Loading…</div>}>
+          <Terminal mac={mac} name={name} onClose={() => setTerminal(false)} />
+        </Suspense>
+      )}
     </div>
   );
 }

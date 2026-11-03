@@ -311,6 +311,8 @@ export interface EventPayloads {
   ap_host_key_mismatch: object;
   ap_restart_requested: object;
   ap_provision_requested: object;
+  /** `user`: who opened it. */
+  ap_terminal_opened: { user?: string | null };
   client_reconnect_requested: object;
   client_blocked: object;
   client_unblocked: object;
@@ -367,7 +369,7 @@ export class HttpError extends Error {
 }
 
 /** Tells the app shell the session is gone: it checks /api/me, and shows the login page. */
-const announceUnauthorized = () => window.dispatchEvent(new Event("apctl:unauthorized"));
+export const announceUnauthorized = () => window.dispatchEvent(new Event("apctl:unauthorized"));
 
 function unauthorized(): never {
   announceUnauthorized();
@@ -1414,6 +1416,10 @@ export function useLiveUpdates(): void {
     };
   }, [qc]);
 }
+
+/** A WebSocket to a shell on the AP (see `terminal.rs`), opened at this size. */
+export const terminalSocket = (mac: Mac, cols: number, rows: number) =>
+  new WebSocket(`${location.protocol === "https:" ? "wss" : "ws"}://${location.host}/api/devices/${encodeURIComponent(mac)}/terminal?cols=${cols}&rows=${rows}`);
 
 // ---- Settings editor ----
 

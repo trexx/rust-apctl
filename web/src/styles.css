@@ -309,6 +309,15 @@ main {
   max-height: 420px;
   overflow-y: auto;
 }
+/* The terminal sizes itself to its box (see Terminal.tsx). */
+.panel.terminal {
+  margin-top: 8px;
+  overflow: hidden;
+}
+.terminal-screen {
+  height: 420px;
+}
+
 .panel-head {
   display: flex;
   gap: 10px;
