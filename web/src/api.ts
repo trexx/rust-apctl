@@ -546,18 +546,17 @@ export interface DryRun {
 /** Refreshed by the live socket when a comparison is recorded or settings are imported. */
 export const useDryRun = () => useQuery({ queryKey: keys.dryrun(), queryFn: getting<DryRun>("/api/dryrun") });
 
+interface Activity {
+  ts: number[];
+  download_bps: number[];
+  upload_bps: number[];
+  tx_retry_pct: (number | null)[];
+  clients: number[];
+  multicast_pct: (number | null)[];
+}
+
 export interface SiteActivity {
-  activity: {
-    ts: number[];
-    download_bps: number[];
-    upload_bps: number[];
-    tx_retry_pct: (number | null)[];
-    clients: number[];
-    multicast_pct: (number | null)[];
-    tx_pps: number[];
-    rx_pps: number[];
-    tx_dropped_pct: (number | null)[];
-  };
+  activity: Activity;
   /** Null in a bucket where no radio reported the figure. */
   airtime: { ts: number[]; total: (number | null)[]; external_interference: (number | null)[]; own_traffic: (number | null)[] };
 }
@@ -761,9 +760,9 @@ function useSpanQuery<T, C extends unknown[] = []>(
 export const useSiteActivity = (span: TimeSpan, band: string) =>
   useSpanQuery<SiteActivity, [string]>(keys.siteActivity, span, [band], "/api/site/activity", { band: bandParam(band) });
 
-/** One radio's client activity alone (`parts=activity`): the server skips the airtime, which its radio's own series chart. */
+/** One radio's client activity alone (`parts=activity`), with its packet rates and dropped share: the server skips the airtime, which its radio's own series chart. */
 export const useRadioActivity = (span: TimeSpan, band: string, mac: Mac) =>
-  useSpanQuery<Pick<SiteActivity, "activity">, [string, Mac]>(keys.radioActivity, span, [band, mac], "/api/site/activity", { band: bandParam(band), mac, parts: "activity" });
+  useSpanQuery<{ activity: Activity & { tx_pps: number[]; rx_pps: number[]; tx_dropped_pct: (number | null)[] } }, [string, Mac]>(keys.radioActivity, span, [band, mac], "/api/site/activity", { band: bandParam(band), mac, parts: "activity" });
 
 /** The busiest APs and clients by traffic: the server lists 15 clients site-wide, 10 on an AP's page (`mac`). */
 export const useSiteTop = (span: TimeSpan, mac?: Mac) =>
@@ -926,7 +925,8 @@ export interface BackupManifest {
   version: string;
   created: number;
   days: number;
-  files: Record<string, { size: number }>;
+  /** Keyed by the database files it holds ("config.db", …). */
+  files: Record<string, unknown>;
 }
 
 interface Backups {
@@ -1664,12 +1664,11 @@ export interface ChannelPlanResult {
 }
 
 export interface ChannelAiStatus {
-  has_settings: boolean;
   settings: { enabled: boolean; hour: number; minute: number; radios: string[]; dfs: boolean; exclude_devices: Mac[] };
   timezone: string | null;
   next_run: number | null;
   running: boolean;
-  scans: { mac: Mac; band: string; started: number }[];
+  scans: { band: string }[];
   allowed: { ng: number[] | null; na: number[] | null };
 }
 
