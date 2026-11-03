@@ -531,26 +531,24 @@ struct ApInfo {
     version: Option<String>,
     required: Option<String>,
     online: bool,
-    /// Uplinked over Wi-Fi (mesh): upgraded before wired APs.
-    mesh: bool,
+}
+
+impl ApInfo {
+    /// An AP of the live view as the firmware page and the upgrades read it.
+    fn of(live: &Live, mac: &Mac, d: &crate::engine::DeviceView) -> ApInfo {
+        ApInfo {
+            mac: *mac,
+            name: d.snapshot.ap.hostname.clone(),
+            model: d.snapshot.ap.model.clone(),
+            version: d.snapshot.ap.version.clone(),
+            required: live.raw_informs.get(mac).and_then(|r| r["required_version"].as_str().map(str::to_string)),
+            online: d.online,
+        }
+    }
 }
 
 fn aps(live: &Live) -> Vec<ApInfo> {
-    live.devices
-        .iter()
-        .map(|(mac, d)| {
-            let raw = live.raw_informs.get(mac);
-            ApInfo {
-                mac: *mac,
-                name: d.snapshot.ap.hostname.clone(),
-                model: d.snapshot.ap.model.clone(),
-                version: d.snapshot.ap.version.clone(),
-                required: raw.and_then(|r| r["required_version"].as_str().map(str::to_string)),
-                online: d.online,
-                mesh: raw.is_some_and(|r| crate::settings::uplink(r).is_wireless()),
-            }
-        })
-        .collect()
+    live.devices.iter().map(|(mac, d)| ApInfo::of(live, mac, d)).collect()
 }
 
 /// GET /api/firmware
@@ -597,20 +595,24 @@ pub struct UpgradeBody {
 pub async fn upgrade(State(s): State<AppState>, Json(b): Json<UpgradeBody>) -> Result<Json<Value>, ApiError> {
     crate::api::require_active(&s, "upgrades need")?;
     let (rels, ..) = crate::api::read(&s.store, Db::Config, releases).await?;
-    let known = aps(&s.live.read().unwrap());
     let mut skipped = Vec::new();
-    let mut wanted: Vec<Mac> = Vec::new();
-    for m in &b.macs {
-        match m.parse::<Mac>() {
-            Ok(mac) if known.iter().any(|a| a.mac == mac) => wanted.push(mac),
-            _ => skipped.push(json!({ "mac": m, "why": Skip::NotFound })),
+    // With whether each is wired (not uplinked over Wi-Fi), for the order below.
+    let mut chosen: Vec<(bool, ApInfo)> = {
+        let live = s.live.read().unwrap();
+        let mut wanted: Vec<Mac> = Vec::new();
+        for m in &b.macs {
+            match m.parse::<Mac>() {
+                Ok(mac) if live.devices.contains_key(&mac) => wanted.push(mac),
+                _ => skipped.push(json!({ "mac": m, "why": Skip::NotFound })),
+            }
         }
-    }
-    let mut chosen: Vec<ApInfo> = known.into_iter().filter(|a| wanted.contains(&a.mac)).collect();
+        let wired = |mac: &Mac| !live.raw_informs.get(mac).is_some_and(|r| crate::settings::uplink(r).is_wireless());
+        live.devices.iter().filter(|(mac, _)| wanted.contains(mac)).map(|(mac, d)| (wired(mac), ApInfo::of(&live, mac, d))).collect()
+    };
     // Mesh APs first: an AP with mesh children must not restart before them.
-    chosen.sort_by_key(|a| (!a.mesh, a.mac));
+    chosen.sort_by_key(|(wired, a)| (*wired, a.mac));
     let mut jobs = Vec::new();
-    for a in chosen {
+    for (_, a) in chosen {
         let (_, rel) = release_for(&rels, a.model.as_deref());
         match (status(a.version.as_deref(), rel, a.required.as_deref()), rel, a.online) {
             (Status::UpdateAvailable, Some(r), true) => jobs.push(Job::new(a, r.version.clone(), r.url.clone(), r.md5.clone(), r.sha256.clone())),
@@ -653,7 +655,10 @@ pub async fn upgrade_url(State(s): State<AppState>, Json(b): Json<UrlBody>) -> R
         return Err(ApiError::bad("use an http(s) or ftp URL ending in .bin or .tar"));
     }
     let mac = crate::api::parse_mac(&b.mac)?;
-    let a = aps(&s.live.read().unwrap()).into_iter().find(|a| a.mac == mac).ok_or_else(|| ApiError::not_found("unknown AP"))?;
+    let a = {
+        let live = s.live.read().unwrap();
+        live.devices.get(&mac).map(|d| ApInfo::of(&live, &mac, d)).ok_or_else(|| ApiError::not_found("unknown AP"))?
+    };
     if !a.online {
         return Err(ApiError::ap_offline());
     }
