@@ -1496,6 +1496,8 @@ export interface WlanSettings extends WlanFields {
   /** False for SSIDs the settings mark as not editable. */
   editable: boolean;
   has_passphrase: boolean;
+  /** It takes a passphrase (WPA2/WPA3 Personal), as its stored security is: an Enterprise or Enhanced Open one takes none. */
+  psk: boolean;
   /** How its security reads for people (the Networks page's label): also a security the editor doesn't offer. */
   security: string;
 }

@@ -3,7 +3,7 @@ import { wlanPassphrase } from "../../../api";
 import type { WlanSettings } from "../../../api";
 import { errorText } from "../../common";
 import { ApChecklist, Row, Select, TextInput, Toggle, toggled } from "../form";
-import { PROTECTION } from "./form";
+import { PROTECTION, takesPassword } from "./form";
 import type { Protection, WlanSection } from "./form";
 import { SpeedLimitRow } from "./SpeedLimitRow";
 
@@ -83,7 +83,7 @@ export function Basics({
           )}
         />
       </Row>
-      {f.protection !== "open" && (
+      {takesPassword(f.protection, wlan) && (
         <Row
           label="Password"
           hint={

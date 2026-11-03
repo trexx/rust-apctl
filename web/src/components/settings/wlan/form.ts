@@ -30,6 +30,7 @@ export function wlanForm(w: WlanSettings | null): WlanForm {
     id: _id,
     editable: _e,
     has_passphrase: _h,
+    psk: _p,
     security: _s,
     ...rest
   } = w;
@@ -50,6 +51,13 @@ export interface WlanSection {
   w: SettingsForm<WlanForm>;
   list: WlanSettingsList;
 }
+
+/**
+ * Whether the SSID takes a password: with a Personal choice, or, when its
+ * security is one the editor doesn't offer (null), as the stored one does.
+ */
+export const takesPassword = (p: Protection, wlan: WlanSettings | null) =>
+  p === null ? wlan?.psk === true : p !== "open";
 
 export const PROTECTION: Option<NonNullable<Protection>>[] = [
   ["wpa2_wpa3", "WPA2/WPA3 Personal"],

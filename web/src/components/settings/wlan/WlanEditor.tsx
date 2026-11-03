@@ -3,7 +3,7 @@ import type { WlanSettings, WlanSettingsList } from "../../../api";
 import { useSettingsForm } from "../form";
 import type { Fields } from "../form";
 import { EditorShell } from "../Review";
-import { badRekey, wlanForm } from "./form";
+import { badRekey, takesPassword, wlanForm } from "./form";
 import type { Protection, WlanForm } from "./form";
 import { Advanced } from "./Advanced";
 import { Basics } from "./Basics";
@@ -73,8 +73,9 @@ export function WlanEditor({
       }),
     );
   const patch: Fields = wlan ? w.changes() : { ...form };
-  // Only while its field shows: an open SSID takes none.
-  if (password && form.protection !== "open") patch.passphrase = password;
+  // Only while its field shows: an open, Enhanced Open or Enterprise SSID takes none.
+  if (password && takesPassword(form.protection, wlan))
+    patch.passphrase = password;
   const section = { w, list };
   return (
     <EditorShell
