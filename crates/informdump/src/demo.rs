@@ -248,7 +248,7 @@ fn inform_url() -> String {
 }
 
 /// The controller settings to import (`apctl serve --keys`, then the
-/// Settings page): the template site with our APs, networks and clients.
+/// Settings page): the template site with our APs, networks and named clients.
 pub fn state() -> Result<Value> {
     let mut s: Value = serde_json::from_str(TEMPLATE_STATE)?;
     let template = s["devices"].as_array().and_then(|d| d.first()).cloned().unwrap_or_default();
@@ -279,13 +279,7 @@ pub fn state() -> Result<Value> {
     s["clients"] = CLIENTS
         .iter()
         .enumerate()
-        .map(|(i, c)| {
-            let mut v = json!({ "_id": { "$oid": format!("{:024x}", 0x100 + i) }, "mac": c.mac, "hostname": c.hostname });
-            if let Some(a) = c.alias {
-                v["name"] = json!(a);
-            }
-            v
-        })
+        .filter_map(|(i, c)| Some(json!({ "_id": { "$oid": format!("{:024x}", 0x100 + i) }, "mac": c.mac, "hostname": c.hostname, "name": c.alias? })))
         .collect();
     Ok(s)
 }
@@ -907,6 +901,7 @@ mod tests {
                 assert!(doc.as_object().unwrap().keys().all(|k| kept(&k)), "{collection}: {:?}", doc.as_object().unwrap().keys().filter(|k| !kept(k)).collect::<Vec<_>>());
             }
         }
+        assert!(s["clients"].as_array().unwrap().iter().all(crate::snapshot::keeps_client), "a client an import would leave out");
         let controller = apcfg::Controller::default();
         // The APs' capabilities.
         let inform: Value = serde_json::from_str(TEMPLATE_INFORM).unwrap();

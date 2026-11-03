@@ -59,7 +59,9 @@ container runs as uid 65532, which must be able to read it: `sudo chown 65532 im
 for Docker, `podman unshare chown 65532 import.json` for rootless Podman. Uploading the
 same file on the Settings page brings the SSIDs, the settings editor and the client
 names: an import names the clients apctl has not named after the other controller's
-names, and keeps the names set in apctl.
+names, and keeps the names set in apctl. Of the other controller's clients, an import
+keeps only those with a name, a note or a setting (speed limit, block, AP lock, fixed
+address); the rest are only the MACs it ever saw.
 
 On Kubernetes (active mode), with the APs' ports on the node and the data on local storage:
 

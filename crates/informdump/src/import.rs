@@ -13,7 +13,7 @@ use mongodb::bson::{Bson, Document, doc};
 use mongodb::options::{ClientOptions, FindOptions};
 use serde_json::{Value, json};
 
-use crate::snapshot::{client_fields, device_fields, source, trim_settings};
+use crate::snapshot::{client_fields, device_fields, keeps_client, source, trim_settings};
 
 pub async fn run(uri: &str, db: &str, out: &Path) -> Result<()> {
     let mut opts = ClientOptions::parse(uri).await.context("parsing MongoDB URI")?;
@@ -36,10 +36,13 @@ pub async fn run(uri: &str, db: &str, out: &Path) -> Result<()> {
             _ => (doc! {}, doc! {}),
         };
         let mut docs = find_all(&db, source(c), filter, projection).await?;
-        if c == "setting" {
-            trim_settings(&mut docs);
+        let found = docs.len();
+        match c {
+            "setting" => trim_settings(&mut docs),
+            "clients" => docs.retain(keeps_client),
+            _ => {}
         }
-        read.push(format!("{} {c}", docs.len()));
+        read.push(if docs.len() < found { format!("{} {c} ({} left out: no settings or name)", docs.len(), found - docs.len()) } else { format!("{} {c}", docs.len()) });
         snapshot.insert(c.to_string(), Value::Array(docs));
     }
     let devices = snapshot["devices"].as_array().map_or(&[][..], Vec::as_slice);
