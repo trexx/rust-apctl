@@ -462,18 +462,42 @@ input.search {
 .chart-empty-note {
   font-size: 12px;
   color: var(--text-muted);
-  margin-top: -24px;
+  margin-top: 4px;
   padding-left: 70px;
 }
-/* uPlot's own stylesheet loads with the chart, after this one: these rules
-   take precedence over its by being scoped to the chart. */
-.chart .uplot,
-.chart .u-legend {
+/* uPlot's own stylesheet loads with the chart, after this one: this rule
+   takes precedence over its by being scoped to the chart. */
+.chart .uplot {
   font-size: 12px;
   color: var(--text);
 }
-.u-legend .u-marker {
-  border-radius: 2px;
+/* A chart's legend: each series' value under the cursor, or its summary. */
+.chart-legend {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 14px;
+  margin-top: 6px;
+}
+.chart-key {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+}
+.chart-key b {
+  font-variant-numeric: tabular-nums;
+}
+.chart-key.off {
+  opacity: 0.4;
+}
+.chart-key .swatch {
+  margin-left: 0;
+  border-color: var(--swatch);
+  background: var(--swatch);
+}
+.chart-key .swatch.dashed {
+  border-style: dashed;
+  background: color-mix(in srgb, var(--swatch) 15%, transparent);
 }
 
 .events {
@@ -1044,15 +1068,6 @@ input.search {
 }
 .density-mark.bad {
   border-color: var(--bad);
-}
-.mcast-types {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 4px 14px;
-  margin: 6px 0 10px;
-}
-.mcast-types .swatch {
-  margin-left: 0;
 }
 
 .grid2.align-top {

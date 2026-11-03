@@ -3,12 +3,15 @@ import {
   useEffect,
   useEffectEvent,
   useRef,
+  useState,
   useSyncExternalStore,
 } from "react";
+import type { CSSProperties } from "react";
 import uPlot from "uplot";
 import "uplot/dist/uPlot.min.css";
 import { spanBounds } from "../api";
 import type { TimeSpan } from "../api";
+import { dayTime } from "../format";
 import { SpanContext, ZoomContext } from "./span";
 
 /** Breaks lines where samples are missing for much longer than usual (an AP
@@ -48,6 +51,11 @@ export interface ChartSeries {
   /** Multiplies every value (8 for bytes to bits), so callers can pass the
    *  query's own arrays and the chart only redraws when those change. */
   scale?: number;
+  /** Shown after the label while the cursor is off the chart (the span's
+   *  total, say); without it the legend shows only the label until then. */
+  summary?: string;
+  /** Where the series sits in the legend, lowest first; by default its place in `series`. */
+  rank?: number;
 }
 
 const scaled = (s: ChartSeries) =>
@@ -61,6 +69,12 @@ interface Drawn {
   values: (number | null)[][];
   scales: (number | undefined)[];
   span: TimeSpan | null;
+}
+
+/** The sample under the cursor, which the legend shows. */
+interface Hover {
+  ts: number;
+  values: (number | null | undefined)[];
 }
 
 const sameData = (a: Drawn | null, b: Drawn) =>
@@ -163,6 +177,9 @@ export function Plot({
   const zoom = useContext(ZoomContext);
   const span = useContext(SpanContext);
   const dark = useDarkMode();
+  const [hover, setHover] = useState<Hover | null>(null);
+  // Series switched off from the legend, by label, so they stay off when the chart is rebuilt.
+  const [hidden, setHidden] = useState<ReadonlySet<string>>(new Set());
   // uPlot's callbacks are set up when the chart is built, and read these as they are now.
   const spanNow = useEffectEvent(() => span);
   const zoomTo = useEffectEvent((from: number, to: number) => zoom?.(from, to));
@@ -201,6 +218,8 @@ export function Plot({
       ticks: { stroke: grid, width: 1 },
       font: "11px system-ui, sans-serif",
     });
+    let shownIdx: number | null = null;
+    let shownData: uPlot.AlignedData | null = null;
     const opts: uPlot.Options = {
       width: el.clientWidth,
       height,
@@ -209,22 +228,38 @@ export function Plot({
         points: { size: 6 },
         drag: { x: true, y: false, setScale: !zoom },
       },
-      hooks: zoom
-        ? {
-            setSelect: [
-              (u) => {
-                const { left, width } = u.select;
-                if (width > 4)
-                  zoomTo(
-                    Math.floor(u.posToVal(left, "x")),
-                    Math.ceil(u.posToVal(left + width, "x")),
-                  );
-                u.setSelect({ left: 0, top: 0, width: 0, height: 0 }, false);
-              },
-            ],
-          }
-        : {},
-      legend: { show: true, live: true },
+      hooks: {
+        // Every mouse move fires this: the legend only re-renders when the
+        // sample under the cursor, or the data, changes.
+        setCursor: [
+          (u) => {
+            const i = u.cursor.idx ?? null;
+            if (i === shownIdx && u.data === shownData) return;
+            shownIdx = i;
+            shownData = u.data;
+            setHover(
+              i === null
+                ? null
+                : { ts: u.data[0][i]!, values: u.data.slice(1).map((c) => c[i]) },
+            );
+          },
+        ],
+        ...(zoom && {
+          setSelect: [
+            (u: uPlot) => {
+              const { left, width } = u.select;
+              if (width > 4)
+                zoomTo(
+                  Math.floor(u.posToVal(left, "x")),
+                  Math.ceil(u.posToVal(left + width, "x")),
+                );
+              u.setSelect({ left: 0, top: 0, width: 0, height: 0 }, false);
+            },
+          ],
+        }),
+      },
+      // The legend is the chart's own, below it.
+      legend: { show: false },
       scales: {
         x: {
           time: true,
@@ -268,6 +303,7 @@ export function Plot({
         {},
         ...series.map((s) => ({
           label: s.label,
+          show: !hidden.has(s.label),
           stroke: resolve(s.color),
           width: 1.5,
           scale: s.right ? "r" : "y",
@@ -275,8 +311,6 @@ export function Plot({
           fill: s.fill ? withAlpha(resolve(s.color), 0.13) : undefined,
           spanGaps: false,
           points: { show: false },
-          value: (_u: uPlot, v: number | null) =>
-            v === null || v === undefined ? "—" : formatted(v, !!s.right),
         })),
       ],
     };
@@ -291,6 +325,7 @@ export function Plot({
       plot.current?.destroy();
       plot.current = null;
       drawn.current = null;
+      setHover(null);
     };
   });
   useEffect(() => {
@@ -307,7 +342,18 @@ export function Plot({
     plot.current?.setData(withGaps(ts, series.map(scaled)));
   });
 
+  const toggle = (i: number, label: string) => {
+    const next = new Set(hidden);
+    const show = next.delete(label);
+    if (!show) next.add(label);
+    setHidden(next);
+    plot.current?.setSeries(i + 1, { show });
+  };
+
   const empty = ts.length === 0;
+  const keys = series
+    .map((s, i) => ({ s, i }))
+    .sort((a, b) => (a.s.rank ?? a.i) - (b.s.rank ?? b.i));
   return (
     <div className="chart">
       <div className="chart-title">{title}</div>
@@ -318,6 +364,35 @@ export function Plot({
       {empty && (
         <div className="chart-empty-note">No data in this range yet</div>
       )}
+      <div className="chart-legend small">
+        {keys.map(({ s, i }) => {
+          const v = hover?.values[i];
+          const value = !hover
+            ? s.summary
+            : v === null || v === undefined
+              ? "—"
+              : (s.right ? (formatRight ?? format) : format)(v);
+          const off = hidden.has(s.label);
+          return (
+            <button
+              key={s.label}
+              type="button"
+              className={off ? "plain chart-key off" : "plain chart-key"}
+              aria-pressed={!off}
+              title={off ? "Show on the chart" : "Hide from the chart"}
+              onClick={() => toggle(i, s.label)}
+            >
+              <i
+                className={s.dashed ? "swatch dashed" : "swatch"}
+                style={{ "--swatch": s.color } as CSSProperties}
+              />
+              {s.label}
+              {value !== undefined && <b>{value}</b>}
+            </button>
+          );
+        })}
+        {hover && <span className="muted">{dayTime(hover.ts)}</span>}
+      </div>
     </div>
   );
 }

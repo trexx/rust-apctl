@@ -91,7 +91,7 @@ function MulticastView({
 }) {
   // The chart's series keep a fixed order (MCAST_TYPES', then any unknown
   // type by name), so a change in the ranking pushes new data instead of
-  // rebuilding the chart; only the legend below is ranked by count.
+  // rebuilding the chart; only the legend is ranked by count.
   const order = (k: string) => {
     const i = TYPE_ORDER.indexOf(k);
     return i < 0 ? TYPE_ORDER.length : i;
@@ -99,9 +99,9 @@ function MulticastView({
   const kinds = Object.entries(data.types)
     .filter(([, v]) => v.tx_pkts + v.rx_pkts > 0)
     .sort(([a], [b]) => order(a) - order(b) || a.localeCompare(b));
-  const ranked = [...kinds].sort(
-    (a, b) => b[1][`${dir}_pkts`] - a[1][`${dir}_pkts`],
-  );
+  const ranked = [...kinds]
+    .sort((a, b) => b[1][`${dir}_pkts`] - a[1][`${dir}_pkts`])
+    .map(([k]) => k);
   return (
     <div className="panel">
       <div className="panel-head">
@@ -116,34 +116,20 @@ function MulticastView({
         />
       </div>
       <div className="mcast-stack">
-        <div>
-          <Chart
-            title={`Packets per second by type, ${dir === "tx" ? "delivered to clients" : "sent by clients"}`}
-            ts={data.ts}
-            height={160}
-            min={0}
-            format={(v) => `${v.toFixed(v < 10 ? 1 : 0)}/s`}
-            series={kinds.map(([k, v]) => ({
-              label: mcastLabel(k),
-              values: v[`${dir}_pps`],
-              color: MCAST_COLORS[k] ?? COLORS.teal,
-            }))}
-          />
-          <div className="mcast-types small">
-            {ranked.map(([k, v]) => (
-              <span key={k}>
-                <i
-                  className="swatch"
-                  style={{
-                    background: MCAST_COLORS[k] ?? COLORS.teal,
-                    borderColor: MCAST_COLORS[k] ?? COLORS.teal,
-                  }}
-                />{" "}
-                {mcastLabel(k)} <b>{compact(v[`${dir}_pkts`])}</b>
-              </span>
-            ))}
-          </div>
-        </div>
+        <Chart
+          title={`Packets per second by type, ${dir === "tx" ? "delivered to clients" : "sent by clients"}`}
+          ts={data.ts}
+          height={160}
+          min={0}
+          format={(v) => `${v.toFixed(v < 10 ? 1 : 0)}/s`}
+          series={kinds.map(([k, v]) => ({
+            label: mcastLabel(k),
+            values: v[`${dir}_pps`],
+            color: MCAST_COLORS[k] ?? COLORS.teal,
+            summary: compact(v[`${dir}_pkts`]),
+            rank: ranked.indexOf(k),
+          }))}
+        />
         {data.clients.length > 0 && (
           <table className="table">
             <THead

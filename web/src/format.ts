@@ -42,6 +42,10 @@ const dateTimeFmt = formatter({ day: "numeric", month: "short", year: "numeric",
 /** "13 Oct 2026, 06:00" in the browser's locale. */
 export const dateTime = (ts: number) => dateTimeFmt.format(new Date(ts * 1000));
 
+/** "13 Oct 06:00" in the browser's locale, for a time within the last year. */
+export const dayTime = (ts: number) => dayMinute(new Date(ts * 1000));
+const dayMinute = (d: Date) => `${dayFmt.format(d)} ${minuteFmt.format(d)}`;
+
 /** "HH:MM" for minutes after midnight. */
 export const hhmm = (minutes: number) =>
   `${String(Math.floor(minutes / 60) % 24).padStart(2, "0")}:${String(minutes % 60).padStart(2, "0")}`;
@@ -234,8 +238,7 @@ export const speed = (kbps: number | null | undefined) => (kbps && kbps > 0 ? `$
 function spanLabel(from: number, to: number): string {
   const f = new Date(from * 1000);
   const t = new Date(to * 1000);
-  const start = `${dayFmt.format(f)} ${minuteFmt.format(f)}`;
-  return f.toDateString() === t.toDateString() ? `${start} – ${minuteFmt.format(t)}` : `${start} – ${dayFmt.format(t)} ${minuteFmt.format(t)}`;
+  return `${dayMinute(f)} – ${f.toDateString() === t.toDateString() ? minuteFmt.format(t) : dayMinute(t)}`;
 }
 
 /** "last 24h", "last 6h", "last 7d", "last 1h 30m", or the fixed window. */
