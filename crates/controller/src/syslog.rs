@@ -115,9 +115,7 @@ pub fn hash_id(datagram: &[u8]) -> Option<u64> {
 /// A `hash_id` as an AP's informs carry it, as [`hash_id`] reads it from the
 /// AP's datagrams.
 pub fn parse_hash_id(hex: &str) -> Option<u64> {
-    let mut b = [0u8; 8];
-    hex::decode_to_slice(hex, &mut b).ok()?;
-    Some(u64::from_be_bytes(b))
+    inform::parse_key::<8>(hex).ok().map(u64::from_be_bytes)
 }
 
 /// The text of an encrypted datagram, with an AP's cipher (see [`Ciphers`]);
