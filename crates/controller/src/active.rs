@@ -559,13 +559,16 @@ impl Active {
     /// `Jobs::queued_for`, read with the rest of the reply's needs): the
     /// firmware upgrade. An upgrade that cannot be sent fails at once.
     fn firmware_turn(&self, ts: Ts, mac: Mac, payload: &Value) -> Option<Value> {
-        // The job's target, for the event (the command says "unknown" for a firmware URL).
+        // The job's target, for the sent event (the command says "unknown" for a firmware URL).
         let (cmd, target) = {
             let mut live = self.live.write().unwrap();
             let cmd = crate::firmware::command(&mut live.firmware, &mac, payload, ts)?;
             let target = match &cmd {
                 Ok(_) => live.firmware.current.as_ref().map(|j| j.target.clone()),
-                Err(why) => live.firmware.failed(&mac, why).map(|j| j.target),
+                Err(why) => {
+                    live.firmware.failed(&mac, why);
+                    None
+                }
             };
             (cmd, target)
         };
@@ -579,7 +582,7 @@ impl Active {
             }
             Err(why) => {
                 tracing::warn!("{mac}: firmware upgrade not sent: {why}");
-                let data = json!({ "reason": "not sent", "detail": why, "target": target });
+                let data = json!({ "reason": "not sent", "detail": why });
                 let _ = self.engine.blocking_send(Input::Note(Event::device(ts, EventKind::ApUpgradeFailed, mac, data)));
                 None
             }
@@ -1262,7 +1265,8 @@ mod tests {
         assert_eq!(reply.unwrap().1["_type"], "noop");
         assert!(rig.live.read().unwrap().firmware.current.is_none());
         let failed = std::iter::from_fn(|| rig.rx.try_recv().ok()).find_map(|i| if let Input::Note(e) = i && e.kind == EventKind::ApUpgradeFailed { Some(e.data) } else { None }).unwrap();
-        assert_eq!((failed["reason"].as_str(), failed["target"].as_str()), (Some("not sent"), Some("8.8.12.20200")));
+        assert_eq!(failed.as_object().unwrap().keys().collect::<Vec<_>>(), ["detail", "reason"], "as the AP's own failure reports are stored");
+        assert_eq!(failed["reason"], "not sent");
         assert!(failed["detail"].as_str().unwrap().contains("internet"));
     }
 
