@@ -644,8 +644,9 @@ pub async fn wlans(State(s): State<AppState>, Query(q): Query<RangeQuery>) -> Re
     let bucket = bucket_for(to - from, tier);
     // The history, summed up per network.
     let per = with_site_vaps(&s, &q, move |vaps| wlan_history(vaps, from, bucket)).await?;
-    // Now: per network, the APs and bands broadcasting it, clients and scores;
-    // copied, so that the live lock is not held while the list is made.
+    // Now: per network, the APs and bands broadcasting it (online APs: one gone
+    // away keeps its last report), clients and scores; copied, so that the live
+    // lock is not held while the list is made.
     #[derive(Default)]
     struct Now {
         /// Where it is broadcast: an entry per SSID.
@@ -659,7 +660,7 @@ pub async fn wlans(State(s): State<AppState>, Query(q): Query<RangeQuery>) -> Re
     let (mut now, connected, state) = {
         let live = s.live.read().unwrap();
         let mut now: BTreeMap<String, Now> = BTreeMap::new();
-        for (mac, d) in &live.devices {
+        for (mac, d) in live.devices.iter().filter(|(_, d)| d.online) {
             for v in &d.snapshot.vaps {
                 let Some(e) = v.essid.as_deref().filter(|e| !e.is_empty()) else { continue };
                 let n = now.entry(e.to_string()).or_default();
@@ -891,7 +892,8 @@ pub async fn radios(State(s): State<AppState>, Query(q): Query<RangeQuery>) -> R
     }
     let live = s.live.read().unwrap();
     let mut out = Vec::new();
-    for (mac, d) in &live.devices {
+    // An AP gone offline keeps its last report: its radios are not on the air now.
+    for (mac, d) in live.devices.iter().filter(|(_, d)| d.online) {
         let of_ap = avgs.get(&mac.to_string());
         for r in &d.snapshot.radios {
             let a = of_ap.and_then(|m| m.get(&r.radio));
@@ -1490,6 +1492,19 @@ mod tests {
             let q = Query(RangeQuery { range: None, from: Some(base), to: Some(base + 3600), band: Some("6e".into()), mac: None });
             let out = ok(activity(State(s), q, Query(Default::default())).await);
             assert_eq!((&out["activity"]["clients"], &out["activity"]["download_bps"]), (&json!([4.0]), &json!([0.0])));
+        }
+
+        #[tokio::test]
+        async fn an_ap_gone_offline_is_not_on_the_air_now() {
+            let (s, base, _t) = site();
+            let q = || Query(RangeQuery { range: None, from: Some(base), to: Some(base + 3600), band: None, mac: None });
+            s.live.write().unwrap().devices.get_mut(&A2.parse().unwrap()).unwrap().online = false;
+            let radios = ok(radios(State(s.clone()), q()).await);
+            assert!(!radios.as_array().unwrap().is_empty() && radios.as_array().unwrap().iter().all(|r| r["mac"] == A1), "{radios}");
+            let wlans = ok(wlans(State(s), q()).await);
+            let on = |w: &Value| w["broadcast"].as_array().unwrap().iter().map(|b| b["ap"].as_str().unwrap().to_string()).collect::<std::collections::BTreeSet<_>>();
+            let wlans = wlans["wlans"].as_array().unwrap();
+            assert!(wlans.iter().any(|w| on(w).contains(A1)) && wlans.iter().all(|w| !on(w).contains(A2)), "{wlans:?}");
         }
 
         #[tokio::test]
