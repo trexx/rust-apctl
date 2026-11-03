@@ -811,7 +811,7 @@ export interface RoamEnd {
 export interface Roam {
   ts: number;
   client: Mac;
-  from: RoamEnd;
+  from: Pick<RoamEnd, "ap" | "radio" | "rssi">;
   to: RoamEnd;
   success: boolean;
   gap_s: number | null;
