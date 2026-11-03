@@ -302,7 +302,9 @@ fn throttled(ip: IpAddr) -> IpAddr {
 pub struct Proxies(Vec<(IpAddr, u8)>);
 
 impl Proxies {
-    /// Addresses (`10.0.0.1`) and CIDR ranges (`10.42.0.0/16`, `fd00::/8`).
+    /// Addresses (`10.0.0.1`) and CIDR ranges (`10.42.0.0/16`, `fd00::/8`). An
+    /// IPv4-mapped one (`::ffff:10.42.0.3`, `::ffff:10.42.0.0/112`) is kept as the
+    /// IPv4 address or range it maps, as the peers it is compared with are.
     pub fn parse(list: &[String]) -> Result<Proxies> {
         let mut out = Vec::new();
         for item in list.iter().map(|s| s.trim()).filter(|s| !s.is_empty()) {
@@ -312,6 +314,10 @@ impl Proxies {
             let len = match len {
                 Some(l) => l.parse::<u8>().ok().filter(|l| *l <= max).with_context(|| format!("trusted proxy {item:?}: bad prefix length"))?,
                 None => max,
+            };
+            let (addr, len) = match addr.to_canonical() {
+                IpAddr::V4(v4) if addr.is_ipv6() => (IpAddr::V4(v4), len.checked_sub(96).with_context(|| format!("trusted proxy {item:?}: an IPv4-mapped range needs a prefix of at least /96"))?),
+                _ => (addr, len),
             };
             out.push((addr, len));
         }
@@ -688,6 +694,11 @@ mod tests {
         assert!(Proxies::parse(&["10.0.0.0/33".into()]).is_err());
         assert!(Proxies::parse(&["proxy.example".into()]).is_err());
         assert!(Proxies::parse(&["fd00::/8".into()]).unwrap().contains(ip("fd12::1")));
+        // Written IPv4-mapped, as dual-stack tools show peers: matches the IPv4 peer.
+        let mapped = Proxies::parse(&["::ffff:10.42.0.3".into(), "::ffff:192.0.2.0/120".into()]).unwrap();
+        assert!(mapped.contains(ip("10.42.0.3")) && mapped.contains(ip("::ffff:10.42.0.3")) && mapped.contains(ip("192.0.2.200")));
+        assert!(!mapped.contains(ip("10.42.0.4")) && !mapped.contains(ip("192.0.3.1")));
+        assert!(Proxies::parse(&["::ffff:10.0.0.0/95".into()]).is_err());
     }
 
     #[test]
