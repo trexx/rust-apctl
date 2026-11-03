@@ -160,12 +160,13 @@ fn spectrum_age(inform: &Value, band: &str) -> Option<i64> {
 }
 
 /// Asks every AP that can to scan a band; returns the APs asked. Scans go out
-/// with each AP's next inform (see `actions`).
+/// with each AP's next inform (see `actions`). An AP already scanning (either
+/// band) is left to finish: an AP keeps one scan's bookkeeping.
 pub fn start_scans(live: &mut Live, band: &Band, now: Ts) -> Vec<Mac> {
     let eligible: Vec<Mac> = live
         .devices
         .iter()
-        .filter(|(_, d)| d.online)
+        .filter(|(mac, d)| d.online && !live.scans.contains_key(mac))
         .filter_map(|(mac, _)| {
             let p = live.raw_informs.get(mac)?;
             let caps = p["wifi_caps2"].as_u64().unwrap_or(0);
@@ -445,9 +446,13 @@ pub struct BandBody {
 pub async fn scan(State(s): State<AppState>, Json(b): Json<BandBody>) -> Result<Json<Value>, ApiError> {
     crate::api::require_active(&s, "this needs")?;
     let band = Band::named(&b.band).ok_or_else(|| ApiError::bad("band must be ng or na"))?;
+    // A run waits for its own scans: one asked meanwhile would take their place.
+    if RUNNING.load(Ordering::SeqCst) {
+        return Err(ApiError::conflict("Channel AI is running"));
+    }
     let asked = start_scans(&mut s.live.write().unwrap(), band, clock::now_ts());
     if asked.is_empty() {
-        return Err(ApiError::conflict("no online AP can scan this band"));
+        return Err(ApiError::conflict("no online AP can scan this band, or each is scanning already"));
     }
     Ok(Json(json!({ "scanning": asked })))
 }
@@ -741,6 +746,13 @@ mod tests {
         live.raw_informs.insert(ap, inform(56_000, None));
         check_scans(&mut live, 2000 + SCAN_TIMEOUT);
         assert!(live.scans.is_empty());
+        // An AP scanning one band is not asked to scan another meanwhile.
+        heard(&mut live, 3000);
+        live.scans.insert(ap, Scan { band: "ng", started: 3000, seen_scanning: false });
+        assert!(start_scans(&mut live, Band::named("na").unwrap(), 3001).is_empty());
+        assert_eq!(live.scans[&ap].band, "ng");
+        live.scans.clear();
+        assert_eq!(start_scans(&mut live, Band::named("na").unwrap(), 3002), [ap]);
     }
 
     #[test]
