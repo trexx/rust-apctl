@@ -53,7 +53,8 @@ export function DeviceActions({
       <div className="actions-row">
         <button
           className={`btn small${locating ? " primary" : ""}`}
-          disabled={off}
+          // Stopping can wait for an AP that is away: the server queues it.
+          disabled={!can || busy || (!online && !locating)}
           title="Flash the AP's LED so you can find it"
           onClick={() =>
             void run(
