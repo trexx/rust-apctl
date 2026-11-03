@@ -79,6 +79,31 @@ pub struct AppStateInner {
     pub memo: crate::series::Memo,
     /// What the threat checks keep between runs, shared with `threats::watch`.
     pub threats: Arc<crate::threats::ThreatState>,
+    /// Ends the process the way a SIGTERM does (e.g. after a restore is staged).
+    pub exit: Exit,
+}
+
+/// A request to end the process through its one exit (the engine's queue handled,
+/// then the writes committed), with the exit status to end with.
+#[derive(Default)]
+pub struct Exit(tokio::sync::watch::Sender<Option<u8>>);
+
+impl Exit {
+    pub fn request(&self, status: u8) {
+        self.0.send_replace(Some(status));
+    }
+
+    /// Resolves once an exit is requested, with its status.
+    pub async fn requested(&self) -> u8 {
+        let mut asked = self.0.subscribe();
+        // Never an error: the sender is `self`.
+        asked.wait_for(Option::is_some).await.ok().and_then(|s| *s).unwrap_or(0)
+    }
+
+    /// The status asked for, if one was.
+    pub fn status(&self) -> Option<u8> {
+        *self.0.borrow()
+    }
 }
 
 pub fn router(state: AppState) -> Router {
@@ -1278,6 +1303,7 @@ mod tests {
             backups: crate::backup::Backups::new(dir.to_path_buf(), None),
             store, vendors: Default::default(), renderer: crate::dryrun::apcfg_renderer(crate::EMULATE_VERSION.into()), auth, engine, live: Default::default(), tx, started: 0, source: "none".into(),
             active: false, writer, inform_url: None, syslog_listen: None, keys: Default::default(), memo: Default::default(), threats: Default::default(),
+            exit: Default::default(),
         });
         (state, engine_rx, dir)
     }
@@ -1891,6 +1917,14 @@ mod tests {
         assert_eq!(get(&app, "/healthz").await.status(), StatusCode::OK);
         drop(engine); // as when the engine thread panics
         assert_eq!(get(&app, "/healthz").await.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn an_exit_asked_for_before_it_is_awaited_is_seen() {
+        let exit = Exit::default();
+        assert_eq!(exit.status(), None);
+        exit.request(75);
+        assert_eq!((exit.requested().await, exit.status()), (75, Some(75)));
     }
 
     #[tokio::test]

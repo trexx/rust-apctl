@@ -1384,6 +1384,7 @@ mod tests {
                 backups: crate::backup::Backups::new(t.dir.to_path_buf(), None),
                 store: t.store.clone(), vendors: Default::default(), renderer: crate::dryrun::apcfg_renderer("10.6.106".into()), auth, engine, live, tx, started: 0, source: "none".into(),
                 active: false, writer: t.writer.clone(), inform_url: None, syslog_listen: None, keys: Default::default(), memo: Default::default(), threats: Default::default(),
+                exit: Default::default(),
             });
             (s, base, t)
         }

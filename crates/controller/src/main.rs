@@ -160,7 +160,15 @@ async fn main() -> Result<()> {
         .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")))
         .init();
     match Cli::parse().cmd {
-        Cmd::Serve(args) => serve(*args).await,
+        Cmd::Serve(args) => {
+            // Ended here, as returning from main would wait for every blocking task still
+            // running (a firmware feed fetch, a backup), past what `finish` stored.
+            let status = serve(*args).await.unwrap_or_else(|e| {
+                eprintln!("Error: {e:?}");
+                1
+            });
+            std::process::exit(status.into())
+        }
         Cmd::HashPassword => {
             let mut line = String::new();
             std::io::stdin().read_line(&mut line)?;
@@ -182,7 +190,8 @@ async fn main() -> Result<()> {
     }
 }
 
-async fn serve(args: ServeArgs) -> Result<()> {
+/// Runs the controller until a signal or a requested exit (`api::Exit`); returns the exit status.
+async fn serve(args: ServeArgs) -> Result<u8> {
     let ServeArgs {
         data_dir, keys, shadow, shadow_cmd, inform_ports, listen, syslog_listen, users_file, emulate_version, active, inform_listen,
         oui_file, backup_key, inform_url, stun_listen, trusted_proxies,
@@ -345,12 +354,13 @@ async fn serve(args: ServeArgs) -> Result<()> {
     let state = api::AppState::new(api::AppStateInner {
         backups, active, writer: writer.clone(), store, vendors, renderer, auth, engine: in_tx.clone(), live, tx: api::live_json(&live_tx), started: clock::now_ts(),
         source: source_desc, inform_url, syslog_listen: syslog_listen.map(|a| a.port()), keys, memo: Default::default(), threats: threat_state,
+        exit: Default::default(),
     });
     channelai::schedule(state.clone());
     series::Memo::spawn_sweep(state.clone());
     ratelimit::spawn(state.clone());
     adopt::spawn(state.clone());
-    let app = api::router(state);
+    let app = api::router(state.clone());
     tracing::info!("web UI and API on http://{listen}");
     // A connection left open mid-request would keep a graceful shutdown waiting
     // forever: it is given `SHUTDOWN_GRACE` after the signal, then the exit goes
@@ -360,16 +370,23 @@ async fn serve(args: ServeArgs) -> Result<()> {
         let _ = stopped.await;
     });
     let grace = async {
-        shutdown(&drain).await;
+        tokio::select! {
+            () = shutdown() => {}
+            status = state.exit.requested() => tracing::info!("exiting with status {status}"),
+        }
         let _ = stop.send(());
         tokio::time::sleep(SHUTDOWN_GRACE).await;
     };
-    tokio::select! {
-        served = serving.into_future() => served?,
-        () = grace => tracing::info!("open connections not closed after {}s: exiting without them", SHUTDOWN_GRACE.as_secs()),
-    }
+    let served = tokio::select! {
+        served = serving.into_future() => served,
+        () = grace => {
+            tracing::info!("open connections not closed after {}s: exiting without them", SHUTDOWN_GRACE.as_secs());
+            Ok(())
+        }
+    };
     finish(writer, drain).await;
-    Ok(())
+    served.context("serving the web UI")?;
+    Ok(state.exit.status().unwrap_or(0))
 }
 
 /// The engine thread's loop: `handle` each input in turn, until the queue
@@ -566,9 +583,9 @@ fn debug_syslog(pcap: &str, keys: &str, port: u16) -> Result<()> {
 /// How long an exit waits for the open connections to close.
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(3);
 
-/// Resolves on Ctrl-C or SIGTERM (what Kubernetes sends). The engine stops
-/// taking inputs at once; the rest of the exit is `serve`'s (see `finish`).
-async fn shutdown(drain: &Drain) {
+/// Resolves on Ctrl-C or SIGTERM (what Kubernetes sends). The exit is `serve`'s
+/// (see `finish`).
+async fn shutdown() {
     let term = async {
         match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
             Ok(mut s) => {
@@ -582,7 +599,6 @@ async fn shutdown(drain: &Drain) {
         _ = term => {}
     }
     tracing::info!("shutting down");
-    drain.start();
 }
 
 /// The controller's host and inform port as pushed configs give them, from
