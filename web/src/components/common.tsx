@@ -406,30 +406,6 @@ const radioLevels = (l: EventPayloads["radio_changed"]["from"]) =>
     .filter(Boolean)
     .join("/");
 
-/** A kernel fault line, as the syslog crash capture recognises one (not a panic's closing line). */
-const FAULT =
-  /(?<!end )Kernel panic|Oops[:[]|Internal error:|sending SIGSEGV to |unhandled level 2 translation fault/;
-
-/**
- * A crash's summary line, for events stored before the server recorded
- * `summary`: its first fault, else its first line (a crash store's tail may
- * start anywhere).
- */
-const crashLine = (lines: string[] = []) =>
-  lines.find((l) => FAULT.test(l)) ?? lines[0];
-
-/**
- * A process's exit code as text: the number the server stores, or, in events
- * stored before it did, the AP's own field if it is a number sent as text;
- * null when there is none.
- */
-const exitCode = (c: number | string | undefined) =>
-  typeof c === "number"
-    ? String(c)
-    : typeof c === "string" && /^[+-]?\d+$/.test(c.trim())
-      ? c.trim()
-      : null;
-
 /** Every event kind: its label, colour and detail line. */
 const EVENTS: { [K in EventKind]: EventSpec<K> } = {
   ap_seen: {
@@ -587,18 +563,13 @@ const EVENTS: { [K in EventKind]: EventSpec<K> } = {
     label: "AP crash",
     tone: "bad",
     describe: (d) =>
-      parts(
-        d.process ? `${d.process}: ${d.kind}` : d.kind,
-        d.summary ?? crashLine(d.lines),
-      ),
+      parts(d.process ? `${d.process}: ${d.kind}` : d.kind, d.summary),
   },
   ap_process_restarted: {
     label: "Process restarted",
     tone: "warn",
-    describe: (d) => {
-      const code = exitCode(d.exit_status);
-      return `${d.proc ?? "a process"} exited${code !== null ? ` with code ${code}` : ""} and was restarted by ${d.caller ?? "the system"}`;
-    },
+    describe: (d) =>
+      `${d.proc ?? "a process"} exited${d.exit_status != null ? ` with code ${d.exit_status}` : ""} and was restarted by ${d.caller ?? "the system"}`,
   },
   ap_isolated: {
     label: "AP isolated",
