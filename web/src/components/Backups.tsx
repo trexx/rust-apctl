@@ -270,7 +270,7 @@ function ConfirmRestore({
   onCancel: () => void;
 }) {
   return (
-    <div className="banner banner-medium restore-confirm">
+    <div className="banner restore-confirm">
       <div>
         <b>Restore {what}?</b> apctl saves its current state as a backup first,
         then restarts with the restored data; it is back within a minute. A
