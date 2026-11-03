@@ -209,13 +209,15 @@ pub fn parse(ts: Ts, src_ip: &str, device_mac: Option<Mac>, raw: &str) -> LogLin
             rest = after;
         }
     }
-    let mut program = None;
-    if let Some((head, msg)) = rest.split_once(": ")
-        && !head.contains(' ') && !head.is_empty() && head.len() < 64 {
-            program = Some(head.split_once('[').map_or(head, |(p, _)| p).to_string());
-            rest = msg;
-        }
-    LogLine { ts, device_mac, src_ip: src_ip.to_string(), facility, severity, program, msg: redact(rest.trim()).into_owned() }
+    // Masked before the program is taken off: a line can start with a secret's key
+    // (`authkey: <hex>` on a multi-line dump's second line), which would be read as
+    // the program, its value as the message.
+    let rest = redact(rest);
+    let (program, msg) = match rest.split_once(": ") {
+        Some((head, msg)) if !head.contains(' ') && !head.is_empty() && head.len() < 64 => (Some(head.split_once('[').map_or(head, |(p, _)| p).to_string()), msg),
+        _ => (None, &*rest),
+    };
+    LogLine { ts, device_mac, src_ip: src_ip.to_string(), facility, severity, program, msg: msg.trim().to_string() }
 }
 
 #[cfg(test)]
@@ -387,6 +389,11 @@ pub(crate) mod tests {
         let l = parse(1, "ip", None, "<14>mcad: ace_reporter.reporter_save_config(): authkey: 0123456789abcdef0123456789abcdef");
         assert_eq!(l.msg, "ace_reporter.reporter_save_config(): authkey: <redacted>");
         assert_eq!(redact("x_passphrase=hunter2, psk:abc; channel=36"), "x_passphrase=<redacted>, psk:<redacted>; channel=36");
+        // A secret's key first on a line (the second of a multi-line datagram, stored line by
+        // line) is masked too, whether it then reads as the program or not.
+        let lines: Vec<LogLine> = "<14>mcad: dump:\nauthkey: 0123456789abcdef\n\"x_passphrase\": \"s3cret\",".lines().map(|t| parse(1, "ip", None, t)).collect();
+        let got: Vec<(Option<&str>, &str)> = lines.iter().map(|l| (l.program.as_deref(), l.msg.as_str())).collect();
+        assert_eq!(got, [(Some("mcad"), "dump:"), (Some("authkey"), "<redacted>"), (Some("\"x_passphrase\""), "\"<redacted>\",")]);
         // Only a real priority is read as one.
         for bad in ["<-1>kernel: x", "<+5>kernel: x", "<192>kernel: x", "<0000>kernel: x", "<>kernel: x", "<256>kernel: x"] {
             let l = parse(1, "ip", None, bad);
