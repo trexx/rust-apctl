@@ -79,8 +79,8 @@ named_enum! {
     }
 }
 
-/// What an alert is about, stored and sent as text: `site`, an AP's MAC,
-/// `<MAC>/<radio>`, or a suspicious network's `<kind>/<BSSID>`.
+/// What an alert is about, stored as text (and part of its tag): `site`, an
+/// AP's MAC, `<MAC>/<radio>`, or a suspicious network's `<kind>/<BSSID>`.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Entity {
     Site,
