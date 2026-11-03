@@ -148,8 +148,32 @@ pub(crate) fn doc_mac(v: &Value) -> Option<inform::Mac> {
 /// ([`crate::adopt::device_doc`]): keys, adoption and forgetting go by the
 /// AP's own record, whatever site holds it. The AP editor edits the site's
 /// APs only ([`site_device`]): its rules are this site's.
+///
+/// Settings that hold no AP record (a site set up without APs, or every AP
+/// forgotten) still have their site: the one most of their SSIDs, networks and
+/// setting documents name, else the only site that is not `super` (an import
+/// carries that one too), else the one named `default`. A new AP's record then
+/// gets it ([`push_doc`]), which the render needs.
 pub fn site_id(state: &Value) -> Option<&str> {
-    state["devices"].as_array()?.iter().find_map(|d| d["site_id"].as_str())
+    let named = |k: &str| state[k].as_array().into_iter().flatten().filter_map(|d| d["site_id"].as_str());
+    named("devices").next().or_else(|| {
+        let mut counts: Vec<(&str, usize)> = Vec::new();
+        for s in ["wlanconf", "networkconf", "setting"].into_iter().flat_map(named) {
+            match counts.iter_mut().find(|(id, _)| *id == s) {
+                Some((_, n)) => *n += 1,
+                None => counts.push((s, 1)),
+            }
+        }
+        // `max_by_key` takes the last of equals: reversed, a tie goes to the first named.
+        counts.iter().rev().max_by_key(|(_, n)| *n).map(|(s, _)| *s).or_else(|| {
+            let sites = state["sites"].as_array()?;
+            let mut own = sites.iter().filter(|s| s["name"].as_str() != Some("super"));
+            match (own.next(), own.next()) {
+                (Some(s), None) => oid(s),
+                _ => sites.iter().find(|s| s["name"].as_str() == Some("default")).and_then(oid),
+            }
+        })
+    })
 }
 
 /// Whether a settings document belongs to the site (documents without a site do).
@@ -186,6 +210,19 @@ pub(crate) fn remove_doc(state: &mut Value, collection: &str, id: &str) {
     if let Some(list) = state.get_mut(collection).and_then(Value::as_array_mut) {
         list.retain(|d| !in_site(site.as_deref(), d) || oid(d) != Some(id));
     }
+}
+
+/// The site's SSIDs as the official UI lists them: without its hidden ones
+/// (the "element" SSID of its own adoption feature). The SSID editor and the
+/// import summary list these.
+pub(crate) fn listed_wlans(state: &Value) -> impl Iterator<Item = &Value> {
+    docs(state, "wlanconf").filter(|w| w["attr_hidden_id"].as_str().is_none())
+}
+
+/// Whether an AP group is one made for one SSID's own APs (as the official
+/// controller does, and [`set_wlan_aps`]), which the official UI does not list.
+pub(crate) fn is_wlan_group(g: &Value) -> bool {
+    flag(g, "for_wlanconf", false)
 }
 
 /// The id of the site's document of a collection the official controller
@@ -355,19 +392,17 @@ pub async fn wlans(State(s): State<AppState>) -> Result<Json<Value>, ApiError> {
         });
         (live.state.clone(), informs)
     };
-    Ok(Json(wlans_view(state.as_deref().unwrap_or(&Value::Null), &informs, s.active)))
+    Ok(Json(wlans_view(state.as_deref().unwrap_or(&Value::Null), &informs)))
 }
 
 /// The SSIDs as the editor shows them, with what it offers for them. Without
 /// settings (nothing imported yet) every list is empty.
-fn wlans_view(state: &Value, informs: &HashMap<inform::Mac, Arc<Value>>, active: bool) -> Value {
-    let list: Vec<Value> = docs(state, "wlanconf")
-        // The hidden "element" SSID belongs to the official controller's own adoption feature.
-        .filter(|w| w["attr_hidden_id"].as_str().is_none())
+fn wlans_view(state: &Value, informs: &HashMap<inform::Mac, Arc<Value>>) -> Value {
+    let list: Vec<Value> = listed_wlans(state)
         .map(|w| {
             let mut v = json!({
                 "id": id_of(w), "aps": wlan_aps(state, w), "protection": protection_of(w).map(|p| p.name), "security": security_label(w), "editable": !flag(w, "attr_no_edit", false),
-                "has_passphrase": w["x_passphrase"].as_str().is_some_and(|p| !p.is_empty()),
+                "has_passphrase": w["x_passphrase"].as_str().is_some_and(|p| !p.is_empty()), "psk": Security::of(w) == Security::Psk,
             });
             if let Value::Object(o) = &mut v {
                 o.extend(pick(w, WLAN_FIELDS));
@@ -377,15 +412,18 @@ fn wlans_view(state: &Value, informs: &HashMap<inform::Mac, Arc<Value>>, active:
             v
         })
         .collect();
+    // `vlan`: the one the render tags the network's clients with (none untagged);
     // `for_ssid`: whether an SSID may be put on it ([`ssid_network`]).
-    let networks: Vec<Value> =
-        docs(state, "networkconf").map(|n| json!({ "id": id_of(n), "name": n["name"], "vlan": n["vlan"], "for_ssid": ssid_network(n).is_ok() })).collect();
+    let site = site_id(state).unwrap_or_default();
+    let networks: Vec<Value> = docs(state, "networkconf")
+        .map(|n| json!({ "id": id_of(n), "name": n["name"], "vlan": apcfg::network_vlan(state, site, oid(n)), "for_ssid": ssid_network(n).is_ok() }))
+        .collect();
     let aps: Vec<Value> = docs(state, "devices").map(|d| json!({ "mac": doc_mac(&d["mac"]), "name": d["name"] })).collect();
     let (unsupported, unknown) = feature_support(state, informs);
     let mdns: Vec<Value> = apcfg::MDNS_SERVICES.iter().map(|(code, name, _)| json!({ "code": code, "name": name })).collect();
     // The minimum data rates (kbps) an SSID may be given, per band.
     let min_rates = json!({ "ng": MINRATE_NG, "na": MINRATE_NA });
-    json!({ "active": active, "wlans": list, "networks": networks, "aps": aps, "unsupported": unsupported, "unknown": unknown, "mdns_services": mdns, "min_rates": min_rates })
+    json!({ "wlans": list, "networks": networks, "aps": aps, "unsupported": unsupported, "unknown": unknown, "mdns_services": mdns, "min_rates": min_rates })
 }
 
 /// For each optional SSID feature, the APs that would broadcast the SSID
@@ -467,7 +505,7 @@ pub async fn device(State(s): State<AppState>, MacPath(mac): MacPath) -> Result<
     let advanced = mgmt_flag(&state, "advanced_feature_enabled");
     let antennas: Vec<Value> = inform.as_deref().and_then(|p| p["antenna_table"].as_array().cloned()).unwrap_or_default();
     let mut out = json!({
-        "active": s.active, "mac": mac.to_string(), "model": d["model"], "radios": radios, "features": supported,
+        "mac": mac.to_string(), "model": d["model"], "radios": radios, "features": supported,
         "reported": inform.is_some(), "site_outdoor": site_outdoor, "advanced_features": advanced, "antennas": antennas,
     });
     if let Value::Object(o) = &mut out {
@@ -818,7 +856,7 @@ fn default_group(state: &Value) -> Option<String> {
 fn set_wlan_aps(state: &mut Value, id: &str, aps: Option<Vec<inform::Mac>>) -> Result<(), String> {
     let own = {
         let current: Vec<&str> = wlan(state, id).and_then(|w| w["ap_group_ids"].as_array()).into_iter().flatten().filter_map(Value::as_str).collect();
-        docs(state, "apgroup").find(|g| flag(g, "for_wlanconf", false) && oid(g).is_some_and(|i| current.contains(&i))).and_then(id_of)
+        docs(state, "apgroup").find(|g| is_wlan_group(g) && oid(g).is_some_and(|i| current.contains(&i))).and_then(id_of)
     };
     match aps {
         None => {
@@ -865,7 +903,7 @@ fn prune_groups(state: &mut Value) {
     let ids = |v: &Value| v["ap_group_ids"].as_array().into_iter().flatten().filter_map(Value::as_str).map(str::to_string).collect::<Vec<_>>();
     let used: Vec<String> = docs(state, "wlanconf").flat_map(|w| ids(w).into_iter().chain(w["mdns_proxy_custom"].as_array().into_iter().flatten().flat_map(ids))).collect();
     if let Some(groups) = state["apgroup"].as_array_mut() {
-        groups.retain(|g| !in_site(site.as_deref(), g) || !flag(g, "for_wlanconf", false) || oid(g).is_some_and(|i| used.iter().any(|u| u == i)));
+        groups.retain(|g| !in_site(site.as_deref(), g) || !is_wlan_group(g) || oid(g).is_some_and(|i| used.iter().any(|u| u == i)));
     }
 }
 
@@ -1248,10 +1286,14 @@ fn wlan_security(p: &Value, w: &mut Value) -> Result<(), String> {
 }
 
 /// The password, checked against the protection the SSID ends up with (`w`,
-/// once Force Wi-Fi 4 has had its say).
+/// once Force Wi-Fi 4 has had its say). One given for a security that takes
+/// none (open, Enhanced Open, Enterprise) is refused: the APs would never get it.
 fn wlan_password(p: &Value, before: &Value, w: &mut Value, changed: &mut Vec<&str>) -> Result<(), String> {
     let (psk, wpa3, transition) = psk_wpa3(w);
     let given = str_field(p, "passphrase")?;
+    if given.is_some() && !psk {
+        return Err(format!("{} takes no password", security_label(w)));
+    }
     if psk && given.is_none() && w["x_passphrase"].as_str().is_none_or(str::is_empty) {
         return Err("a password is needed for WPA2/WPA3".into());
     }
@@ -1588,7 +1630,7 @@ fn list_limits(state: &Value) -> Vec<Over> {
 pub fn create_wlan(state: &mut Value, patch: &Value) -> Result<String, String> {
     // Counted before the new SSID is there: it adds to every count it is in.
     let over = over_limits(state);
-    let site = site_id(state).ok_or("the settings have no APs")?.to_string();
+    let site = site_id(state).ok_or("the settings name no site")?.to_string();
     let all = default_group(state).ok_or("the settings have no default AP group")?;
     // The default network, when the patch names none (a named one is checked as an edit's is):
     // the hidden LAN one, else the first that may carry an SSID.
@@ -2058,7 +2100,7 @@ mod tests {
         // The SSID list sends the label beside the editor's choice.
         let mut s = state();
         s["wlanconf"][0]["wpa_mode"] = json!("wpa1");
-        let v = wlans_view(&s, &HashMap::new(), false);
+        let v = wlans_view(&s, &HashMap::new());
         assert_eq!((v["wlans"][0]["security"].as_str(), v["wlans"][0]["protection"].as_str()), (Some("WPA Personal"), None));
     }
 
@@ -2082,6 +2124,8 @@ mod tests {
         edit(&mut s, json!({ "enhanced_iot": true })).unwrap();
         let w = &s["wlanconf"][0];
         assert_eq!((w["security"].as_str(), w["wpa_mode"].as_str(), security_label(w)), (Some("wpaeap"), Some("wpa2"), "WPA2 Enterprise"));
+        assert_eq!(edit(&mut s, json!({ "passphrase": "correct horse" })).unwrap_err(), "WPA2 Enterprise takes no password");
+        assert!(s["wlanconf"][0].get("x_passphrase").is_none());
         // Open stays open; Enhanced Open loses WPA3 with the template.
         for wpa3 in [false, true] {
             let mut s = state();
@@ -2090,6 +2134,10 @@ mod tests {
             let w = &s["wlanconf"][0];
             assert_eq!((w["security"].as_str(), w["wpa_mode"].as_str(), security_label(w)), (Some("open"), Some("auto"), "Open"), "{wpa3}");
         }
+        // Enhanced Open takes no password either.
+        let mut s = state();
+        (s["wlanconf"][0]["security"], s["wlanconf"][0]["wpa3_support"]) = (json!("open"), json!(true));
+        assert!(edit(&mut s, json!({ "passphrase": "correct horse" })).unwrap_err().ends_with("takes no password"));
     }
 
     #[test]
@@ -2794,13 +2842,13 @@ mod tests {
 
     #[test]
     fn the_ssid_list_has_its_full_shape_before_anything_is_imported() {
-        let v = wlans_view(&Value::Null, &HashMap::new(), true);
+        let v = wlans_view(&Value::Null, &HashMap::new());
         assert_eq!((&v["wlans"], &v["aps"], &v["unknown"]), (&json!([]), &json!([]), &json!([])));
         assert!(v["unsupported"].is_object() && !v["mdns_services"].as_array().unwrap().is_empty());
         assert_eq!((&v["min_rates"]["ng"][2], &v["min_rates"]["na"][0]), (&json!(5500), &json!(6000)));
         let mut s = state();
         s["networkconf"].as_array_mut().unwrap().extend([json!({ "_id": "wan", "purpose": "wan", "site_id": "s1" }), json!({ "_id": "x", "purpose": "", "site_id": "s1" })]);
-        let v = wlans_view(&s, &HashMap::new(), true);
+        let v = wlans_view(&s, &HashMap::new());
         assert_eq!((v["aps"].as_array().unwrap().len(), &v["unknown"][0]), (2, &json!(AP1)), "no inform yet: support unknown");
         assert_eq!(v["networks"].as_array().unwrap().iter().map(|n| n["for_ssid"].as_bool().unwrap()).collect::<Vec<_>>(), [true, false, true], "an empty purpose is none");
         let w = v["wlans"][0].as_object().unwrap();
@@ -2810,9 +2858,21 @@ mod tests {
             assert!(!w.contains_key(k), "{k} is shown as the protection, or derived by an edit");
         }
         assert_eq!(v["networks"][0].as_object().unwrap().keys().collect::<Vec<_>>(), ["for_ssid", "id", "name", "vlan"]);
+        // A network's VLAN as the render tags with it: none unless enabled, and only 2-4094.
+        let vlans = |s: &Value| wlans_view(s, &HashMap::new())["networks"].as_array().unwrap().iter().map(|n| n["vlan"].clone()).collect::<Vec<_>>();
+        (s["networkconf"][1]["vlan_enabled"], s["networkconf"][1]["vlan"]) = (json!(false), json!(20));
+        (s["networkconf"][2]["vlan_enabled"], s["networkconf"][2]["vlan"]) = (json!(true), json!("30"));
+        assert_eq!(vlans(&s)[1..], [Value::Null, json!(30)]);
+        s["networkconf"][2]["vlan"] = json!(1);
+        assert_eq!(vlans(&s)[2], Value::Null);
+        // Whether an SSID takes a password, for the editor's password row.
+        assert_eq!(v["wlans"][0]["psk"], true);
+        s["wlanconf"][0]["security"] = json!("wpaeap");
+        assert_eq!(wlans_view(&s, &HashMap::new())["wlans"][0]["psk"], false);
+        s["wlanconf"][0]["security"] = json!("wpapsk");
         // An SSID stored without bands is listed on the two the APs broadcast it on.
         s["wlanconf"][0]["wlan_bands"] = json!([]);
-        assert_eq!(wlans_view(&s, &HashMap::new(), true)["wlans"][0]["wlan_bands"], json!(["2g", "5g"]));
+        assert_eq!(wlans_view(&s, &HashMap::new())["wlans"][0]["wlan_bands"], json!(["2g", "5g"]));
     }
 
     #[test]

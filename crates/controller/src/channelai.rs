@@ -113,18 +113,26 @@ fn excluded(r: &Value) -> Vec<Mac> {
 
 /// The channels a plan may use on a band: the setting's list (kept by the
 /// official controller as the country's channels minus the blacklist, and
-/// minus DFS unless allowed), within what is legal here. `with_dfs` adds the
-/// legal DFS channels (to try a plan with them). `None` without a setting.
-/// In a country apctl has no rules for, the list is taken as it is.
-pub fn allowed(state: Option<&Value>, band: &str, with_dfs: bool) -> Option<Vec<i64>> {
+/// minus DFS unless allowed), within what is legal here. On 5 GHz, `dfs`
+/// says whether the DFS channels are in: with it, the legal DFS channels the
+/// list lacks are added; without it, the list's are left out (a list made
+/// with DFS allowed holds them). The nightly run and the panel pass the
+/// setting's own DFS switch, so they get the list the setting means. `None`
+/// without a setting. In a country apctl has no rules for, the list is taken
+/// as it is.
+pub fn allowed(state: Option<&Value>, band: &str, dfs: bool) -> Option<Vec<i64>> {
     let state = state?;
     let r = radio_ai(state)?;
     let legal = legal_channels(country(state), band, 20, false);
     let mut list: Vec<i64> = r[format!("channels_{band}")].as_array()?.iter().filter_map(num).filter(|c| legal.as_ref().is_none_or(|l| l.contains(c))).collect();
-    if with_dfs && band == "na" {
-        let all = legal.unwrap_or_else(|| band_channels(band, 20));
-        let extra: Vec<i64> = all.into_iter().filter(|c| apcfg::is_dfs_channel(*c) && !list.contains(c)).collect();
-        list.extend(extra);
+    if band == "na" {
+        if dfs {
+            let all = legal.unwrap_or_else(|| band_channels(band, 20));
+            let extra: Vec<i64> = all.into_iter().filter(|c| apcfg::is_dfs_channel(*c) && !list.contains(c)).collect();
+            list.extend(extra);
+        } else {
+            list.retain(|c| !apcfg::is_dfs_channel(*c));
+        }
     }
     list.sort();
     Some(list)
@@ -152,12 +160,13 @@ fn spectrum_age(inform: &Value, band: &str) -> Option<i64> {
 }
 
 /// Asks every AP that can to scan a band; returns the APs asked. Scans go out
-/// with each AP's next inform (see `actions`).
+/// with each AP's next inform (see `actions`). An AP already scanning (either
+/// band) is left to finish: an AP keeps one scan's bookkeeping.
 pub fn start_scans(live: &mut Live, band: &Band, now: Ts) -> Vec<Mac> {
     let eligible: Vec<Mac> = live
         .devices
         .iter()
-        .filter(|(_, d)| d.online)
+        .filter(|(mac, d)| d.online && !live.scans.contains_key(mac))
         .filter_map(|(mac, _)| {
             let p = live.raw_informs.get(mac)?;
             let caps = p["wifi_caps2"].as_u64().unwrap_or(0);
@@ -287,11 +296,12 @@ async fn run(s: AppState, bands: Vec<String>, trigger: &'static str, _running: R
         if !tokio::task::spawn_blocking(move || w.flush(Duration::from_secs(10))).await.unwrap_or(false) {
             tracing::warn!("channel AI: the scan results were not stored in time; planning {band} with what is there");
         }
-        let (allowed, pinned) = {
+        let (dfs, allowed, pinned) = {
             let live = s.live.read().unwrap();
-            (allowed(live.state.as_deref(), band, false), pinned(&live, band))
+            let dfs = settings(live.state.as_deref()).dfs;
+            (dfs, allowed(live.state.as_deref(), band, dfs), pinned(&live, band))
         };
-        let plan = match crate::channelplan::compute_plan(&s, band.clone(), false, allowed, pinned).await {
+        let plan = match crate::channelplan::compute_plan(&s, band.clone(), dfs, allowed, pinned).await {
             Ok(p) => p,
             Err(e) => {
                 tracing::warn!("channel AI: no plan for {band}: {}", e.1);
@@ -414,16 +424,15 @@ pub async fn status(State(s): State<AppState>) -> Result<Json<Value>, ApiError> 
     let (state, scans) = {
         let mut live = s.live.write().unwrap();
         check_scans(&mut live, clock::now_ts());
-        let scans: Vec<Value> = live.scans.iter().map(|(m, sc)| json!({ "mac": m, "band": sc.band, "started": sc.started })).collect();
+        let scans: Vec<Value> = live.scans.values().map(|sc| json!({ "band": sc.band })).collect();
         (live.state.clone(), scans)
     };
     let st = state.as_deref();
     let tz = st.and_then(crate::settings::timezone);
     let cfg = settings(st);
     Ok(Json(json!({
-        "active": s.active, "has_settings": st.and_then(radio_ai).is_some(), "timezone": tz,
-        "next_run": next_run(&cfg, tz, clock::now_ts()), "running": RUNNING.load(Ordering::SeqCst), "scans": scans,
-        "allowed": { "ng": allowed(st, "ng", false), "na": allowed(st, "na", false) }, "settings": cfg,
+        "timezone": tz, "next_run": next_run(&cfg, tz, clock::now_ts()), "running": RUNNING.load(Ordering::SeqCst), "scans": scans,
+        "allowed": { "ng": allowed(st, "ng", cfg.dfs), "na": allowed(st, "na", cfg.dfs) }, "settings": cfg,
     })))
 }
 
@@ -436,9 +445,13 @@ pub struct BandBody {
 pub async fn scan(State(s): State<AppState>, Json(b): Json<BandBody>) -> Result<Json<Value>, ApiError> {
     crate::api::require_active(&s, "this needs")?;
     let band = Band::named(&b.band).ok_or_else(|| ApiError::bad("band must be ng or na"))?;
+    // A run waits for its own scans: one asked meanwhile would take their place.
+    if RUNNING.load(Ordering::SeqCst) {
+        return Err(ApiError::conflict("Channel AI is running"));
+    }
     let asked = start_scans(&mut s.live.write().unwrap(), band, clock::now_ts());
     if asked.is_empty() {
-        return Err(ApiError::conflict("no online AP can scan this band"));
+        return Err(ApiError::conflict("no online AP can scan this band, or each is scanning already"));
     }
     Ok(Json(json!({ "scanning": asked })))
 }
@@ -593,6 +606,11 @@ mod tests {
         assert!(!settings(Some(&s)).enabled);
         apply_settings(&mut s, &json!({ "hour": 4 })).unwrap();
         assert!(radio_ai(&s).unwrap()["channels_na"].as_array().unwrap().iter().any(|c| c == "100"), "the DFS channels stay in the list");
+        // Without DFS, a plan leaves out the DFS channels such a list holds; with it, they are in.
+        let without = allowed(Some(&s), "na", false).unwrap();
+        assert!(!without.is_empty() && !without.iter().any(|c| apcfg::is_dfs_channel(*c)), "{without:?}");
+        assert_eq!(allowed(Some(&s), "na", true), allowed(Some(&s), "na", settings(Some(&s)).dfs), "the run and the panel take the setting's list");
+        assert!(allowed(Some(&s), "na", true).unwrap().contains(&100));
     }
 
     #[test]
@@ -727,6 +745,13 @@ mod tests {
         live.raw_informs.insert(ap, inform(56_000, None));
         check_scans(&mut live, 2000 + SCAN_TIMEOUT);
         assert!(live.scans.is_empty());
+        // An AP scanning one band is not asked to scan another meanwhile.
+        heard(&mut live, 3000);
+        live.scans.insert(ap, Scan { band: "ng", started: 3000, seen_scanning: false });
+        assert!(start_scans(&mut live, Band::named("na").unwrap(), 3001).is_empty());
+        assert_eq!(live.scans[&ap].band, "ng");
+        live.scans.clear();
+        assert_eq!(start_scans(&mut live, Band::named("na").unwrap(), 3002), [ap]);
     }
 
     #[test]

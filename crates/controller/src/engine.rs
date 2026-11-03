@@ -742,7 +742,7 @@ impl Engine {
             && let Some(j) = live.firmware.version_seen(&mac, v)
         {
             events.retain(|e| e.kind != EventKind::ApFirmwareChanged);
-            events.push(Event::device(ts, EventKind::ApUpgraded, mac, json!({ "from": j.from, "to": v, "custom": j.custom })));
+            events.push(Event::device(ts, EventKind::ApUpgraded, mac, json!({ "from": j.from, "to": v, "custom": j.custom() })));
         }
         let updated = if snap.has_vap_table { self.update_clients(&mut live, ts, &snap.clients) } else { Vec::new() };
         let (view, old_snapshot) = device_view(ts, snap, prev);
@@ -1614,9 +1614,9 @@ impl Engine {
         let mut live = self.live.write().unwrap();
         let mut events = Vec::new();
         if let Some((mac, why)) = live.firmware.expired(now)
-            && let Some(j) = live.firmware.failed(&mac, why)
+            && live.firmware.failed(&mac, why).is_some()
         {
-            let data = json!({ "reason": "timed out", "detail": why, "target": j.target });
+            let data = json!({ "reason": "timed out", "detail": why });
             events.push(Event::device(now, EventKind::ApUpgradeFailed, mac, data));
         }
         let started = *self.first_tick.get_or_insert(now);
@@ -2887,7 +2887,7 @@ mod tests {
         };
         feed(&mut h, 0, "6.7.0");
         let job = crate::firmware::Job {
-            mac, name: None, from: Some("6.7.0".into()), target: "6.8.2".into(), url: String::new(), md5: None, sha256: None, custom: false,
+            mac, name: None, from: Some("6.7.0".into()), target: "6.8.2".into(), url: String::new(), md5: None, sha256: None,
             state: crate::firmware::JobState::Sent, sent_at: Some(5), expires: None,
         };
         h.live.write().unwrap().firmware.current = Some(job);

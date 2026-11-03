@@ -210,17 +210,17 @@ pub fn compare(ours: &Rendered, actual_mgmt: &str, actual_system: &str, redacted
 
 /// A short human summary of an import snapshot, for the settings page (and the
 /// import's event): what the page shows. The managed site's documents only, and
-/// as the official UI lists them: without its hidden SSIDs (the "element" one
-/// of its adoption feature) and the AP groups it makes for an SSID's own APs.
+/// as the SSID editor and the official UI list them: without its hidden SSIDs
+/// and the AP groups made for an SSID's own APs (see `settings::listed_wlans`).
 pub fn summarize_state(state: &Value) -> Value {
     fn names<'a>(list: impl Iterator<Item = &'a Value>) -> Vec<Value> {
         list.filter_map(|x| x["name"].as_str().map(Value::from)).collect()
     }
     let docs = |k: &'static str| crate::settings::docs(state, k);
     serde_json::json!({
-        "wlans": names(docs("wlanconf").filter(|w| w["attr_hidden_id"].as_str().is_none())),
+        "wlans": names(crate::settings::listed_wlans(state)),
         "networks": names(docs("networkconf")),
-        "ap_groups": names(docs("apgroup").filter(|g| !apcfg::flag(g, "for_wlanconf", false))),
+        "ap_groups": names(docs("apgroup").filter(|g| !crate::settings::is_wlan_group(g))),
         "devices": docs("devices").count(),
         "clients": docs("clients").count(),
     })

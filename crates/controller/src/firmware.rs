@@ -172,7 +172,7 @@ pub struct Job {
     pub mac: Mac,
     pub name: Option<String>,
     pub from: Option<String>,
-    /// The version to install, or "custom" for a firmware URL.
+    /// The version to install, or [`CUSTOM`] for a firmware URL.
     pub target: String,
     /// What the upgrade command sends, not shown: a custom firmware URL may hold a
     /// credential, and the page is open to read-only users.
@@ -182,17 +182,24 @@ pub struct Job {
     pub md5: Option<String>,
     #[serde(skip)]
     pub sha256: Option<String>,
-    #[serde(skip)]
-    pub custom: bool,
     pub state: JobState,
     pub sent_at: Option<Ts>,
     pub expires: Option<Ts>,
 }
 
+/// The target of an upgrade from a firmware URL (a release's is its version),
+/// as the page and the ap_upgrade_sent event show it.
+pub const CUSTOM: &str = "custom";
+
 impl Job {
-    /// A queued upgrade of `a` to `target`, a release version or "custom" for a firmware URL.
-    fn new(a: ApInfo, target: String, url: String, md5: Option<String>, sha256: Option<String>, custom: bool) -> Job {
-        Job { mac: a.mac, name: a.name, from: a.version, target, url, md5, sha256, custom, state: JobState::Queued, sent_at: None, expires: None }
+    /// A queued upgrade of `a` to `target`, a release version or [`CUSTOM`] for a firmware URL.
+    fn new(a: ApInfo, target: String, url: String, md5: Option<String>, sha256: Option<String>) -> Job {
+        Job { mac: a.mac, name: a.name, from: a.version, target, url, md5, sha256, state: JobState::Queued, sent_at: None, expires: None }
+    }
+
+    /// Whether it installs from a firmware URL rather than a release.
+    pub fn custom(&self) -> bool {
+        self.target == CUSTOM
     }
 }
 
@@ -393,7 +400,7 @@ async fn change_queue(s: &AppState, op: Op) -> Result<Changed, ApiError> {
 /// but at least [`STEP_DEADLINE`] and at most a day.
 pub fn command(jobs: &mut Jobs, mac: &Mac, inform: &Value, now: Ts) -> Option<Result<Value, &'static str>> {
     let j = jobs.current_for(mac).filter(|j| j.state == JobState::Queued)?;
-    if !j.custom && inform["internet"].as_bool() == Some(false) {
+    if !j.custom() && inform["internet"].as_bool() == Some(false) {
         return Some(Err("the AP has no internet access to download the firmware"));
     }
     let estimate = inform["upgrade_duration"].as_i64().unwrap_or(0).saturating_add(inform["reboot_duration"].as_i64().unwrap_or(0));
@@ -405,7 +412,7 @@ pub fn command(jobs: &mut Jobs, mac: &Mac, inform: &Value, now: Ts) -> Option<Re
         j.from = inform["version"].as_str().map(str::to_string);
     }
     // For a firmware URL the official controller expects (and sends) "unknown".
-    let version = if j.custom { "unknown" } else { j.target.as_str() };
+    let version = if j.custom() { "unknown" } else { j.target.as_str() };
     let mut cmd = json!({ "_type": "upgrade", "version": version, "url": j.url, "server_time_in_utc": crate::active::server_time(now) });
     if let Some(m) = &j.md5 {
         cmd["md5sum"] = json!(m);
@@ -524,26 +531,24 @@ struct ApInfo {
     version: Option<String>,
     required: Option<String>,
     online: bool,
-    /// Uplinked over Wi-Fi (mesh): upgraded before wired APs.
-    mesh: bool,
+}
+
+impl ApInfo {
+    /// An AP of the live view as the firmware page and the upgrades read it.
+    fn of(live: &Live, mac: &Mac, d: &crate::engine::DeviceView) -> ApInfo {
+        ApInfo {
+            mac: *mac,
+            name: d.snapshot.ap.hostname.clone(),
+            model: d.snapshot.ap.model.clone(),
+            version: d.snapshot.ap.version.clone(),
+            required: live.raw_informs.get(mac).and_then(|r| r["required_version"].as_str().map(str::to_string)),
+            online: d.online,
+        }
+    }
 }
 
 fn aps(live: &Live) -> Vec<ApInfo> {
-    live.devices
-        .iter()
-        .map(|(mac, d)| {
-            let raw = live.raw_informs.get(mac);
-            ApInfo {
-                mac: *mac,
-                name: d.snapshot.ap.hostname.clone(),
-                model: d.snapshot.ap.model.clone(),
-                version: d.snapshot.ap.version.clone(),
-                required: raw.and_then(|r| r["required_version"].as_str().map(str::to_string)),
-                online: d.online,
-                mesh: raw.is_some_and(|r| crate::settings::uplink(r).is_wireless()),
-            }
-        })
-        .collect()
+    live.devices.iter().map(|(mac, d)| ApInfo::of(live, mac, d)).collect()
 }
 
 /// GET /api/firmware
@@ -563,7 +568,7 @@ pub async fn index(State(s): State<AppState>) -> Result<Json<Value>, ApiError> {
             })
         })
         .collect();
-    Ok(Json(json!({ "checked": checked, "error": error, "channel": "release", "active": s.active, "aps": list, "jobs": jobs })))
+    Ok(Json(json!({ "checked": checked, "error": error, "channel": "release", "aps": list, "jobs": jobs })))
 }
 
 /// POST /api/firmware/check
@@ -590,23 +595,27 @@ pub struct UpgradeBody {
 pub async fn upgrade(State(s): State<AppState>, Json(b): Json<UpgradeBody>) -> Result<Json<Value>, ApiError> {
     crate::api::require_active(&s, "upgrades need")?;
     let (rels, ..) = crate::api::read(&s.store, Db::Config, releases).await?;
-    let known = aps(&s.live.read().unwrap());
     let mut skipped = Vec::new();
-    let mut wanted: Vec<Mac> = Vec::new();
-    for m in &b.macs {
-        match m.parse::<Mac>() {
-            Ok(mac) if known.iter().any(|a| a.mac == mac) => wanted.push(mac),
-            _ => skipped.push(json!({ "mac": m, "why": Skip::NotFound })),
+    // With whether each is wired (not uplinked over Wi-Fi), for the order below.
+    let mut chosen: Vec<(bool, ApInfo)> = {
+        let live = s.live.read().unwrap();
+        let mut wanted: Vec<Mac> = Vec::new();
+        for m in &b.macs {
+            match m.parse::<Mac>() {
+                Ok(mac) if live.devices.contains_key(&mac) => wanted.push(mac),
+                _ => skipped.push(json!({ "mac": m, "why": Skip::NotFound })),
+            }
         }
-    }
-    let mut chosen: Vec<ApInfo> = known.into_iter().filter(|a| wanted.contains(&a.mac)).collect();
+        let wired = |mac: &Mac| !live.raw_informs.get(mac).is_some_and(|r| crate::settings::uplink(r).is_wireless());
+        live.devices.iter().filter(|(mac, _)| wanted.contains(mac)).map(|(mac, d)| (wired(mac), ApInfo::of(&live, mac, d))).collect()
+    };
     // Mesh APs first: an AP with mesh children must not restart before them.
-    chosen.sort_by_key(|a| (!a.mesh, a.mac));
+    chosen.sort_by_key(|(wired, a)| (*wired, a.mac));
     let mut jobs = Vec::new();
-    for a in chosen {
+    for (_, a) in chosen {
         let (_, rel) = release_for(&rels, a.model.as_deref());
         match (status(a.version.as_deref(), rel, a.required.as_deref()), rel, a.online) {
-            (Status::UpdateAvailable, Some(r), true) => jobs.push(Job::new(a, r.version.clone(), r.url.clone(), r.md5.clone(), r.sha256.clone(), false)),
+            (Status::UpdateAvailable, Some(r), true) => jobs.push(Job::new(a, r.version.clone(), r.url.clone(), r.md5.clone(), r.sha256.clone())),
             (st, _, online) => {
                 let why = match st {
                     _ if !online => Skip::Offline,
@@ -646,11 +655,14 @@ pub async fn upgrade_url(State(s): State<AppState>, Json(b): Json<UrlBody>) -> R
         return Err(ApiError::bad("use an http(s) or ftp URL ending in .bin or .tar"));
     }
     let mac = crate::api::parse_mac(&b.mac)?;
-    let a = aps(&s.live.read().unwrap()).into_iter().find(|a| a.mac == mac).ok_or_else(|| ApiError::not_found("unknown AP"))?;
+    let a = {
+        let live = s.live.read().unwrap();
+        live.devices.get(&mac).map(|d| ApInfo::of(&live, &mac, d)).ok_or_else(|| ApiError::not_found("unknown AP"))?
+    };
     if !a.online {
         return Err(ApiError::ap_offline());
     }
-    let job = Job::new(a, "custom".into(), b.url, None, None, true);
+    let job = Job::new(a, CUSTOM.into(), b.url, None, None);
     let n = change_queue(&s, Op::Enqueue(vec![job])).await?.n;
     Ok(Json(json!({ "queued": n })))
 }
@@ -734,7 +746,6 @@ mod tests {
             url: "https://x/fw.bin".into(),
             md5: Some("m".into()),
             sha256: Some("s".into()),
-            custom: false,
             state: JobState::Queued,
             sent_at: None,
             expires: None,
@@ -808,7 +819,7 @@ mod tests {
     #[test]
     fn a_firmware_url_is_sent_as_version_unknown() {
         let mut j = Jobs::default();
-        j.enqueue(vec![Job { target: "custom".into(), custom: true, md5: None, sha256: None, ..job("a") }]);
+        j.enqueue(vec![Job { target: CUSTOM.into(), md5: None, sha256: None, ..job("a") }]);
         let cmd = command(&mut j, &m("a"), &json!({ "internet": false }), 0).unwrap().unwrap();
         assert_eq!((cmd["version"].as_str(), cmd["url"].as_str()), (Some("unknown"), Some("https://x/fw.bin")));
         assert_eq!(j.current.as_ref().map(|c| c.target.as_str()), Some("custom"), "the UI's label stays");

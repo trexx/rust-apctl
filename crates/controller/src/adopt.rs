@@ -451,17 +451,17 @@ pub async fn pending(State(s): State<AppState>) -> Json<Value> {
     let now = clock::now_ts();
     // What `expire` would drop is left out (it runs every ten seconds), and
     // the lists are serialised after the lock is released.
+    // `forgetting`: how many APs are being forgotten (the page polls faster meanwhile).
     let (pending, adopting, forgetting) = {
         let live = s.live.read().unwrap();
         let a = &live.adoption;
         let pending: Vec<Pending> = a.pending.values().filter(|p| now - p.last_seen < PENDING_TIMEOUT).cloned().collect();
         let adopting: Vec<(Mac, Ts)> = a.adopting.iter().filter(|(_, a)| a.current(now)).map(|(m, a)| (*m, a.since)).collect();
-        let forgetting: Vec<(Mac, Ts)> = a.forgetting.iter().map(|(m, t)| (*m, *t)).collect();
-        (pending, adopting, forgetting)
+        (pending, adopting, a.forgetting.len())
     };
-    let since = |l: Vec<(Mac, Ts)>| l.into_iter().map(|(m, t)| json!({ "mac": m, "since": t })).collect::<Vec<_>>();
+    let adopting: Vec<Value> = adopting.into_iter().map(|(m, t)| json!({ "mac": m, "since": t })).collect();
     let pending: Vec<PendingView> = pending.iter().map(Pending::view).collect();
-    Json(json!({ "active": s.active, "pending": pending, "adopting": since(adopting), "forgetting": since(forgetting), "ssh": ssh }))
+    Json(json!({ "pending": pending, "adopting": adopting, "forgetting": forgetting, "ssh": ssh }))
 }
 
 /// POST /api/devices/{mac}/adopt: adopt a pending AP. Run as a task of its
@@ -743,6 +743,26 @@ mod tests {
         assert_eq!(device_doc(&s, &mac2).unwrap()["x_ssh_hostkey_fingerprint"], "SHA256:after-reset");
         adopt_device(&mut s, &mac2, &inform()).unwrap();
         assert_eq!(device_doc(&s, &mac2).unwrap()["x_ssh_hostkey_fingerprint"], "SHA256:after-reset", "none reported: the kept one stays");
+    }
+
+    #[test]
+    fn an_ap_adopted_into_settings_without_aps_gets_the_sites_record_and_config() {
+        let mut s = json!({
+            "sites": [{ "_id": "s0", "name": "super" }, { "_id": "s1", "name": "default" }],
+            "devices": [], "wlanconf": [], "networkconf": [], "apgroup": [],
+            "setting": [{ "key": "super_mgmt" }, { "key": "mgmt", "site_id": "s1" }, { "key": "radio_ai", "site_id": "s1", "radios_configuration": [{ "radio": "na", "channel_width": 40 }] }],
+        });
+        let mac: Mac = "02:00:00:00:00:09".parse().unwrap();
+        adopt_device(&mut s, &mac, &inform()).unwrap();
+        let d = device_doc(&s, &mac).unwrap();
+        assert_eq!((d["site_id"].as_str(), d["radio_table"][1]["ht"].as_i64()), (Some("s1"), Some(40)), "the site its settings name, and its width");
+        let input = apcfg::Input { state: &s, device_mac: "02:00:00:00:00:09", inform: Some(&inform()), cfgversion: "1", controller: &Default::default() };
+        assert!(apcfg::render_mgmt(&input, Some("0123456789abcdef0123456789abcdef")).unwrap().contains("\nauthkey="));
+        // With no settings naming a site: the only site that is not `super`, else `default`.
+        let bare = |sites: Value| crate::settings::site_id(&json!({ "sites": sites, "devices": [] })).map(str::to_string);
+        assert_eq!(bare(json!([{ "_id": "s0", "name": "super" }, { "_id": { "$oid": "s2" }, "name": "Home" }])).as_deref(), Some("s2"));
+        assert_eq!(bare(json!([{ "_id": "s0", "name": "super" }, { "_id": "s3", "name": "Home" }, { "_id": "s1", "name": "default" }])).as_deref(), Some("s1"));
+        assert_eq!(bare(json!([{ "_id": "s0", "name": "super" }])), None);
     }
 
     #[test]
