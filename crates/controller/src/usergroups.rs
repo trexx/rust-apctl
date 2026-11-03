@@ -65,10 +65,16 @@ fn rate(v: &Value, what: &str) -> Result<i64, String> {
 }
 
 /// What uses a user group: its id, and "SSID x" / "client y" (SSIDs first),
-/// a client named by [`client_label`].
+/// a client named by [`client_label`]. An SSID uses the group the render gives
+/// its clients ([`apcfg::ssid_usergroup`]: one with no group, an empty id or a
+/// stale one gets the default), or, while the settings have no default group,
+/// the one shown in its place ([`usergroup_list`]). A client with no group of
+/// its own (none, or an empty id) uses none: its SSID's applies.
 fn group_uses<'a>(state: &'a Value, names: &'a ClientNames) -> impl Iterator<Item = (&'a str, String)> {
-    let ssids = docs(state, "wlanconf").filter_map(|w| Some((w["usergroup_id"].as_str()?, format!("SSID {}", w["name"].as_str().unwrap_or("?")))));
-    let clients = docs(state, "clients").filter_map(|c| Some((c["usergroup_id"].as_str()?, format!("client {}", client_label(c, names)))));
+    let site = crate::settings::site_id(state).unwrap_or_default();
+    let unmade = orphan_usergroup_id(state).unwrap_or("");
+    let ssids = docs(state, "wlanconf").map(move |w| (apcfg::ssid_usergroup(state, site, w).and_then(oid).unwrap_or(unmade), format!("SSID {}", w["name"].as_str().unwrap_or("?"))));
+    let clients = docs(state, "clients").filter_map(|c| Some((c["usergroup_id"].as_str().filter(|g| !g.is_empty())?, format!("client {}", client_label(c, names)))));
     ssids.chain(clients)
 }
 
@@ -263,6 +269,25 @@ mod tests {
         let mut s = state();
         s["wlanconf"][0].as_object_mut().unwrap().remove("usergroup_id");
         assert_eq!((shown(&s), shown(&s)), (Some(json!("")), Some(json!(""))));
+    }
+
+    #[test]
+    fn the_default_row_lists_what_has_no_limit_as_the_aps_are_told() {
+        let used_by = |s: &Value, default: bool| usergroup_list(s, &ClientNames::new()).into_iter().find(|g| g["default"] == default).map(|g| g["used_by"].clone());
+        // Not made yet: shown with the id the SSIDs point at, and what points at it.
+        let mut s = state();
+        s["clients"][0]["usergroup_id"] = json!("");
+        assert_eq!(used_by(&s, true), Some(json!(["SSID Home"])), "a client with an empty group has none of its own");
+        // No group at all: the SSID has no limit, and the client still none of its own.
+        s["wlanconf"][0].as_object_mut().unwrap().remove("usergroup_id");
+        assert_eq!(used_by(&s, true), Some(json!(["SSID Home"])));
+        // Made: an SSID with no id, an empty one or a stale one gets the default, as in the config.
+        ensure_default_usergroup(&mut s);
+        let ssid = |id: &str, g: Value| json!({ "_id": id, "site_id": "s1", "name": id, "security": "open", "usergroup_id": g });
+        s["usergroup"].as_array_mut().unwrap().push(json!({ "_id": "ug-slow", "name": "Slow", "site_id": "s1", "qos_rate_max_down": 1000 }));
+        s["wlanconf"] = json!([ssid("A", json!("")), ssid("B", json!("gone")), ssid("C", Value::Null), ssid("D", json!("ug-slow"))]);
+        assert_eq!(used_by(&s, true), Some(json!(["SSID A", "SSID B", "SSID C"])));
+        assert_eq!(used_by(&s, false), Some(json!(["SSID D"])));
     }
 
     #[test]
