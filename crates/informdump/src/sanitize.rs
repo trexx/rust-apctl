@@ -480,6 +480,10 @@ impl Sanitizer {
         if at == "sshd.auth.key.n.value" || at == "x_ssh_keys.key" {
             // The administrator's SSH public keys.
             self.fakes.get(Kind::SshKey, value, |n| format!("ssh-ed25519 AAAAfake{n}"))
+        } else if matches!(last.as_str(), "fingerprint" | "x_ssh_hostkey_fingerprint") {
+            // SSH host key fingerprints identify the device. The controller's copy, which
+            // the `x_` rule would fake as a secret, gets the same fake as the inform's.
+            self.fakes.get(Kind::Fingerprint, value, |n| format!("SHA256:fingerprint-{n}"))
         } else if secret
             // The device SSH account name (stored as x_ssh_username in the controller).
             || (k.starts_with("users.") && last == "name")
@@ -490,9 +494,6 @@ impl Sanitizer {
             // Serial numbers are the device's MAC without colons, including those
             // of neighbouring APs in scan results: their real BSSIDs follow from them.
             self.fakes.any_mac(value)
-        } else if last == "fingerprint" {
-            // SSH host key fingerprints identify the device.
-            self.fakes.get(Kind::Fingerprint, value, |n| format!("SHA256:fingerprint-{n}"))
         } else if last == "qrid" {
             self.fakes.get(Kind::Qrid, value, |n| format!("qrid-{n}"))
         } else if last == "oui" {
@@ -1034,6 +1035,7 @@ mod tests {
                 {"name": "_googlecast._tcp.local"}, {"name": "_A1B2C3D4E5F6._tcp.local"}, {"name": "_77AB12CD._sub._googlecast._tcp"}]}}]}],
             "radio_table": [{"scan_table": [{"bssid": "f6:92:bf:22:33:44", "serialno": "F492BF223344"}]}],
             "fingerprint": "SHA256:abcdefghijklmnopqrstuvwxyz0123456789ABCDEFG",
+            "devices": [{ "x_ssh_hostkey_fingerprint": "SHA256:abcdefghijklmnopqrstuvwxyz0123456789ABCDEFG" }],
             "qrid": "Xy7Qa",
             "clients": [{ "oui": "Example Devices Ltd", "mac": "00:11:22:33:44:55" }],
             "external_id": { "$binary": { "base64": "qR9+x3ytPgeIyDW5NH4lkw==", "subType": "04" } },
@@ -1060,6 +1062,7 @@ mod tests {
         let serial = out["radio_table"][0]["scan_table"][0]["serialno"].as_str().unwrap();
         assert!(serial.starts_with("020000000") && serial.chars().all(|c| !c.is_ascii_lowercase()), "a neighbour's serial: {serial}");
         assert_eq!(out["fingerprint"], "SHA256:fingerprint-1");
+        assert_eq!(out["devices"][0]["x_ssh_hostkey_fingerprint"], "SHA256:fingerprint-1", "the controller's copy of the inform's fingerprint");
         assert_eq!(out["qrid"], "qrid-1");
         assert_eq!(out["clients"][0]["oui"], "vendor-1");
         assert_ne!(out["external_id"]["$binary"]["base64"], "qR9+x3ytPgeIyDW5NH4lkw==");
