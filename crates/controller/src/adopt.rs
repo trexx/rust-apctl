@@ -746,6 +746,26 @@ mod tests {
     }
 
     #[test]
+    fn an_ap_adopted_into_settings_without_aps_gets_the_sites_record_and_config() {
+        let mut s = json!({
+            "sites": [{ "_id": "s0", "name": "super" }, { "_id": "s1", "name": "default" }],
+            "devices": [], "wlanconf": [], "networkconf": [], "apgroup": [],
+            "setting": [{ "key": "super_mgmt" }, { "key": "mgmt", "site_id": "s1" }, { "key": "radio_ai", "site_id": "s1", "radios_configuration": [{ "radio": "na", "channel_width": 40 }] }],
+        });
+        let mac: Mac = "02:00:00:00:00:09".parse().unwrap();
+        adopt_device(&mut s, &mac, &inform()).unwrap();
+        let d = device_doc(&s, &mac).unwrap();
+        assert_eq!((d["site_id"].as_str(), d["radio_table"][1]["ht"].as_i64()), (Some("s1"), Some(40)), "the site its settings name, and its width");
+        let input = apcfg::Input { state: &s, device_mac: "02:00:00:00:00:09", inform: Some(&inform()), cfgversion: "1", controller: &Default::default() };
+        assert!(apcfg::render_mgmt(&input, Some("0123456789abcdef0123456789abcdef")).unwrap().contains("\nauthkey="));
+        // With no settings naming a site: the only site that is not `super`, else `default`.
+        let bare = |sites: Value| crate::settings::site_id(&json!({ "sites": sites, "devices": [] })).map(str::to_string);
+        assert_eq!(bare(json!([{ "_id": "s0", "name": "super" }, { "_id": { "$oid": "s2" }, "name": "Home" }])).as_deref(), Some("s2"));
+        assert_eq!(bare(json!([{ "_id": "s0", "name": "super" }, { "_id": "s3", "name": "Home" }, { "_id": "s1", "name": "default" }])).as_deref(), Some("s1"));
+        assert_eq!(bare(json!([{ "_id": "s0", "name": "super" }])), None);
+    }
+
+    #[test]
     fn a_record_takes_its_details_from_an_inform_but_keeps_its_name() {
         let mut d = json!({ "name": "Hall" });
         fill_from_inform(&mut d, &inform());

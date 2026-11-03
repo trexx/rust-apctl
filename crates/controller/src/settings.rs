@@ -148,8 +148,32 @@ pub(crate) fn doc_mac(v: &Value) -> Option<inform::Mac> {
 /// ([`crate::adopt::device_doc`]): keys, adoption and forgetting go by the
 /// AP's own record, whatever site holds it. The AP editor edits the site's
 /// APs only ([`site_device`]): its rules are this site's.
+///
+/// Settings that hold no AP record (a site set up without APs, or every AP
+/// forgotten) still have their site: the one most of their SSIDs, networks and
+/// setting documents name, else the only site that is not `super` (an import
+/// carries that one too), else the one named `default`. A new AP's record then
+/// gets it ([`push_doc`]), which the render needs.
 pub fn site_id(state: &Value) -> Option<&str> {
-    state["devices"].as_array()?.iter().find_map(|d| d["site_id"].as_str())
+    let named = |k: &str| state[k].as_array().into_iter().flatten().filter_map(|d| d["site_id"].as_str());
+    named("devices").next().or_else(|| {
+        let mut counts: Vec<(&str, usize)> = Vec::new();
+        for s in ["wlanconf", "networkconf", "setting"].into_iter().flat_map(named) {
+            match counts.iter_mut().find(|(id, _)| *id == s) {
+                Some((_, n)) => *n += 1,
+                None => counts.push((s, 1)),
+            }
+        }
+        // `max_by_key` takes the last of equals: reversed, a tie goes to the first named.
+        counts.iter().rev().max_by_key(|(_, n)| *n).map(|(s, _)| *s).or_else(|| {
+            let sites = state["sites"].as_array()?;
+            let mut own = sites.iter().filter(|s| s["name"].as_str() != Some("super"));
+            match (own.next(), own.next()) {
+                (Some(s), None) => oid(s),
+                _ => sites.iter().find(|s| s["name"].as_str() == Some("default")).and_then(oid),
+            }
+        })
+    })
 }
 
 /// Whether a settings document belongs to the site (documents without a site do).
@@ -1588,7 +1612,7 @@ fn list_limits(state: &Value) -> Vec<Over> {
 pub fn create_wlan(state: &mut Value, patch: &Value) -> Result<String, String> {
     // Counted before the new SSID is there: it adds to every count it is in.
     let over = over_limits(state);
-    let site = site_id(state).ok_or("the settings have no APs")?.to_string();
+    let site = site_id(state).ok_or("the settings name no site")?.to_string();
     let all = default_group(state).ok_or("the settings have no default AP group")?;
     // The default network, when the patch names none (a named one is checked as an edit's is):
     // the hidden LAN one, else the first that may carry an SSID.
