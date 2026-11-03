@@ -95,8 +95,7 @@ fn content_digest(mgmt: &str, system: &str, blocked: &str) -> [u8; 32] {
 /// A stored `managed_devices.content`: a digest in hex. Anything else is no
 /// digest, so the AP gets its config again under a new version.
 fn stored_digest(content: &str) -> Option<[u8; 32]> {
-    let mut digest = [0u8; 32];
-    hex::decode_to_slice(content, &mut digest).ok().map(|()| digest)
+    inform::parse_key::<32>(content).ok()
 }
 
 pub struct Active {
