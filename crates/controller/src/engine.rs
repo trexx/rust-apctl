@@ -1,8 +1,13 @@
 //! Turns decoded informs, controller replies and AP logs into stored metrics,
 //! events and the live view the API serves.
 //!
-//! The engine runs as one task that owns all mutable state; the API reads a
-//! shared snapshot (`Live`) and subscribes to a broadcast of changes.
+//! The engine runs as one task and shares the live view (`Live`) behind a lock.
+//! It alone writes what the APs and the imported settings make of it: the devices,
+//! clients, aliases, connected set, syslog attribution, last pushed configs and
+//! settings. API handlers and active mode also change the per-AP queues in it
+//! (commands, reprovision, scans, adoption, firmware jobs) under the same lock, so
+//! those can change between two of the engine's reads. The API also subscribes to
+//! a broadcast of changes.
 
 use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap};
