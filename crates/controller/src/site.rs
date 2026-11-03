@@ -359,10 +359,10 @@ pub async fn get_site(State(s): State<AppState>) -> Result<Json<SiteView>, ApiEr
     // The choices never change: built once, and serialised from there.
     static COUNTRY_LIST: LazyLock<Value> = LazyLock::new(|| COUNTRIES.iter().map(|c| json!({ "code": c.code, "name": c.name })).collect());
     static TIMEZONES: LazyLock<Value> = LazyLock::new(|| apcfg::tz::names().collect());
-    Ok(Json(SiteView { settings: site_view(&state, s.active, s.auth.enabled()), countries: &COUNTRY_LIST, timezones: &TIMEZONES, syslog_port: s.syslog_listen }))
+    Ok(Json(SiteView { settings: site_view(&state, s.auth.enabled()), countries: &COUNTRY_LIST, timezones: &TIMEZONES, syslog_port: s.syslog_listen }))
 }
 
-fn site_view(state: &Value, active: bool, secrets: bool) -> Value {
+fn site_view(state: &Value, secrets: bool) -> Value {
     let m = setting(state, "mgmt");
     let mut mgmt = Value::Object(pick(m, &["led_enabled", "outdoor_mode_enabled", "x_ssh_enabled", "x_ssh_username", "x_ssh_auth_password_enabled", "x_ssh_bind_wildcard", "x_ssh_keys"]));
     mgmt["has_ssh_password"] = json!(m["x_ssh_password"].as_str().is_some_and(|p| !p.is_empty()));
@@ -386,7 +386,7 @@ fn site_view(state: &Value, active: bool, secrets: bool) -> Value {
         "has_v3_password": sn["x_password"].as_str().is_some_and(|p| !p.is_empty()),
     });
     json!({
-        "active": active, "mgmt": mgmt, "rsyslogd": rsyslogd, "ntp": ntp, "snmp": snmp,
+        "mgmt": mgmt, "rsyslogd": rsyslogd, "ntp": ntp, "snmp": snmp,
         "country": country(state), "timezone": timezone(state),
     })
 }
@@ -547,10 +547,10 @@ mod tests {
         let what = edit(&mut s, json!({ "snmp": { "enabledV3": true, "username": "mon", "x_password": "v3-secret-pw" } })).unwrap();
         assert!(what.contains("SNMPv3 password") && !what.contains("v3-secret"), "{what}");
         // Shown to logged-in users; never the v3 password, and nothing in read-only mode.
-        assert_eq!(site_view(&s, true, true)["snmp"]["community"], "c0mmunity");
-        assert_eq!(site_view(&s, true, true)["snmp"]["has_v3_password"], true);
-        assert!(site_view(&s, true, false)["snmp"]["community"].is_null());
-        assert!(!site_view(&s, true, true).to_string().contains("v3-secret"));
+        assert_eq!(site_view(&s, true)["snmp"]["community"], "c0mmunity");
+        assert_eq!(site_view(&s, true)["snmp"]["has_v3_password"], true);
+        assert!(site_view(&s, false)["snmp"]["community"].is_null());
+        assert!(!site_view(&s, true).to_string().contains("v3-secret"));
     }
 
     #[test]
@@ -600,10 +600,10 @@ mod tests {
         for pref in [json!("auto"), Value::Null] {
             let mut s = s.clone();
             setting_mut(&mut s, "ntp")["setting_preference"] = pref.clone();
-            assert_eq!(site_view(&s, false, false)["ntp"]["setting_preference"], "manual", "{pref}");
+            assert_eq!(site_view(&s, false)["ntp"]["setting_preference"], "manual", "{pref}");
             edit(&mut s, json!({ "ntp": { "setting_preference": "auto" } })).unwrap();
             assert_eq!(servers(&s), NTP_POOL);
-            assert_eq!(site_view(&s, false, false)["ntp"]["setting_preference"], "auto");
+            assert_eq!(site_view(&s, false)["ntp"]["setting_preference"], "auto");
         }
     }
 

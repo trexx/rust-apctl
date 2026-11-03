@@ -461,7 +461,7 @@ pub async fn pending(State(s): State<AppState>) -> Json<Value> {
     };
     let adopting: Vec<Value> = adopting.into_iter().map(|(m, t)| json!({ "mac": m, "since": t })).collect();
     let pending: Vec<PendingView> = pending.iter().map(Pending::view).collect();
-    Json(json!({ "active": s.active, "pending": pending, "adopting": adopting, "forgetting": forgetting, "ssh": ssh }))
+    Json(json!({ "pending": pending, "adopting": adopting, "forgetting": forgetting, "ssh": ssh }))
 }
 
 /// POST /api/devices/{mac}/adopt: adopt a pending AP. Run as a task of its

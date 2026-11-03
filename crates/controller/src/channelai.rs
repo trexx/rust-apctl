@@ -431,7 +431,7 @@ pub async fn status(State(s): State<AppState>) -> Result<Json<Value>, ApiError> 
     let tz = st.and_then(crate::settings::timezone);
     let cfg = settings(st);
     Ok(Json(json!({
-        "active": s.active, "timezone": tz, "next_run": next_run(&cfg, tz, clock::now_ts()), "running": RUNNING.load(Ordering::SeqCst), "scans": scans,
+        "timezone": tz, "next_run": next_run(&cfg, tz, clock::now_ts()), "running": RUNNING.load(Ordering::SeqCst), "scans": scans,
         "allowed": { "ng": allowed(st, "ng", cfg.dfs), "na": allowed(st, "na", cfg.dfs) }, "settings": cfg,
     })))
 }

@@ -568,7 +568,7 @@ pub async fn index(State(s): State<AppState>) -> Result<Json<Value>, ApiError> {
             })
         })
         .collect();
-    Ok(Json(json!({ "checked": checked, "error": error, "channel": "release", "active": s.active, "aps": list, "jobs": jobs })))
+    Ok(Json(json!({ "checked": checked, "error": error, "channel": "release", "aps": list, "jobs": jobs })))
 }
 
 /// POST /api/firmware/check

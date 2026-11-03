@@ -172,7 +172,7 @@ pub fn apply_client_group(state: &mut Value, e: &ClientGroup) -> Result<String, 
 /// GET /api/settings/usergroups
 pub async fn usergroups(State(s): State<AppState>) -> Result<Json<Value>, ApiError> {
     let state = crate::api::current_state(&s)?;
-    Ok(Json(json!({ "active": s.active, "groups": usergroup_list(&state, &client_names(&s)) })))
+    Ok(Json(json!({ "groups": usergroup_list(&state, &client_names(&s)) })))
 }
 
 /// The site's user groups as the editors show them, with what uses each and

@@ -392,12 +392,12 @@ pub async fn wlans(State(s): State<AppState>) -> Result<Json<Value>, ApiError> {
         });
         (live.state.clone(), informs)
     };
-    Ok(Json(wlans_view(state.as_deref().unwrap_or(&Value::Null), &informs, s.active)))
+    Ok(Json(wlans_view(state.as_deref().unwrap_or(&Value::Null), &informs)))
 }
 
 /// The SSIDs as the editor shows them, with what it offers for them. Without
 /// settings (nothing imported yet) every list is empty.
-fn wlans_view(state: &Value, informs: &HashMap<inform::Mac, Arc<Value>>, active: bool) -> Value {
+fn wlans_view(state: &Value, informs: &HashMap<inform::Mac, Arc<Value>>) -> Value {
     let list: Vec<Value> = listed_wlans(state)
         .map(|w| {
             let mut v = json!({
@@ -423,7 +423,7 @@ fn wlans_view(state: &Value, informs: &HashMap<inform::Mac, Arc<Value>>, active:
     let mdns: Vec<Value> = apcfg::MDNS_SERVICES.iter().map(|(code, name, _)| json!({ "code": code, "name": name })).collect();
     // The minimum data rates (kbps) an SSID may be given, per band.
     let min_rates = json!({ "ng": MINRATE_NG, "na": MINRATE_NA });
-    json!({ "active": active, "wlans": list, "networks": networks, "aps": aps, "unsupported": unsupported, "unknown": unknown, "mdns_services": mdns, "min_rates": min_rates })
+    json!({ "wlans": list, "networks": networks, "aps": aps, "unsupported": unsupported, "unknown": unknown, "mdns_services": mdns, "min_rates": min_rates })
 }
 
 /// For each optional SSID feature, the APs that would broadcast the SSID
@@ -505,7 +505,7 @@ pub async fn device(State(s): State<AppState>, MacPath(mac): MacPath) -> Result<
     let advanced = mgmt_flag(&state, "advanced_feature_enabled");
     let antennas: Vec<Value> = inform.as_deref().and_then(|p| p["antenna_table"].as_array().cloned()).unwrap_or_default();
     let mut out = json!({
-        "active": s.active, "mac": mac.to_string(), "model": d["model"], "radios": radios, "features": supported,
+        "mac": mac.to_string(), "model": d["model"], "radios": radios, "features": supported,
         "reported": inform.is_some(), "site_outdoor": site_outdoor, "advanced_features": advanced, "antennas": antennas,
     });
     if let Value::Object(o) = &mut out {
@@ -2100,7 +2100,7 @@ mod tests {
         // The SSID list sends the label beside the editor's choice.
         let mut s = state();
         s["wlanconf"][0]["wpa_mode"] = json!("wpa1");
-        let v = wlans_view(&s, &HashMap::new(), false);
+        let v = wlans_view(&s, &HashMap::new());
         assert_eq!((v["wlans"][0]["security"].as_str(), v["wlans"][0]["protection"].as_str()), (Some("WPA Personal"), None));
     }
 
@@ -2842,13 +2842,13 @@ mod tests {
 
     #[test]
     fn the_ssid_list_has_its_full_shape_before_anything_is_imported() {
-        let v = wlans_view(&Value::Null, &HashMap::new(), true);
+        let v = wlans_view(&Value::Null, &HashMap::new());
         assert_eq!((&v["wlans"], &v["aps"], &v["unknown"]), (&json!([]), &json!([]), &json!([])));
         assert!(v["unsupported"].is_object() && !v["mdns_services"].as_array().unwrap().is_empty());
         assert_eq!((&v["min_rates"]["ng"][2], &v["min_rates"]["na"][0]), (&json!(5500), &json!(6000)));
         let mut s = state();
         s["networkconf"].as_array_mut().unwrap().extend([json!({ "_id": "wan", "purpose": "wan", "site_id": "s1" }), json!({ "_id": "x", "purpose": "", "site_id": "s1" })]);
-        let v = wlans_view(&s, &HashMap::new(), true);
+        let v = wlans_view(&s, &HashMap::new());
         assert_eq!((v["aps"].as_array().unwrap().len(), &v["unknown"][0]), (2, &json!(AP1)), "no inform yet: support unknown");
         assert_eq!(v["networks"].as_array().unwrap().iter().map(|n| n["for_ssid"].as_bool().unwrap()).collect::<Vec<_>>(), [true, false, true], "an empty purpose is none");
         let w = v["wlans"][0].as_object().unwrap();
@@ -2859,7 +2859,7 @@ mod tests {
         }
         assert_eq!(v["networks"][0].as_object().unwrap().keys().collect::<Vec<_>>(), ["for_ssid", "id", "name", "vlan"]);
         // A network's VLAN as the render tags with it: none unless enabled, and only 2-4094.
-        let vlans = |s: &Value| wlans_view(s, &HashMap::new(), true)["networks"].as_array().unwrap().iter().map(|n| n["vlan"].clone()).collect::<Vec<_>>();
+        let vlans = |s: &Value| wlans_view(s, &HashMap::new())["networks"].as_array().unwrap().iter().map(|n| n["vlan"].clone()).collect::<Vec<_>>();
         (s["networkconf"][1]["vlan_enabled"], s["networkconf"][1]["vlan"]) = (json!(false), json!(20));
         (s["networkconf"][2]["vlan_enabled"], s["networkconf"][2]["vlan"]) = (json!(true), json!("30"));
         assert_eq!(vlans(&s)[1..], [Value::Null, json!(30)]);
@@ -2868,11 +2868,11 @@ mod tests {
         // Whether an SSID takes a password, for the editor's password row.
         assert_eq!(v["wlans"][0]["psk"], true);
         s["wlanconf"][0]["security"] = json!("wpaeap");
-        assert_eq!(wlans_view(&s, &HashMap::new(), true)["wlans"][0]["psk"], false);
+        assert_eq!(wlans_view(&s, &HashMap::new())["wlans"][0]["psk"], false);
         s["wlanconf"][0]["security"] = json!("wpapsk");
         // An SSID stored without bands is listed on the two the APs broadcast it on.
         s["wlanconf"][0]["wlan_bands"] = json!([]);
-        assert_eq!(wlans_view(&s, &HashMap::new(), true)["wlans"][0]["wlan_bands"], json!(["2g", "5g"]));
+        assert_eq!(wlans_view(&s, &HashMap::new())["wlans"][0]["wlan_bands"], json!(["2g", "5g"]));
     }
 
     #[test]
