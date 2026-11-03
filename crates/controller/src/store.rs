@@ -858,8 +858,6 @@ fn delete_before(conn: &Connection, table: &str, time: &str, rows: Rows, cutoff:
 pub struct Series {
     /// Raw, 5m or 1h.
     pub tier: &'static str,
-    /// Bucket width in seconds (0 for raw samples).
-    pub step: i64,
     pub ts: Vec<Ts>,
     /// Gauges as stored; counters converted to per-second rates.
     pub fields: BTreeMap<&'static str, Vec<Option<f64>>>,
@@ -880,7 +878,7 @@ pub fn tier_for(from: Ts, to: Ts, now: Ts) -> usize {
 /// A series of `table`'s numbers, or of those at the places `only` lists (see
 /// `Table::numbers_named`).
 pub fn series(conn: &Connection, table: &'static Table, keys: &[String], only: Option<&[usize]>, from: Ts, to: Ts, tier: usize) -> Result<Series> {
-    let Tier { step, name, .. } = TIERS[tier];
+    let name = TIERS[tier].name;
     let all: Vec<&'static str> = table.numbers().collect();
     // Each field's place among the statement's numbers.
     let places: Vec<usize> = only.map_or_else(|| (0..all.len()).collect(), <[usize]>::to_vec);
@@ -921,7 +919,7 @@ pub fn series(conn: &Connection, table: &'static Table, keys: &[String], only: O
         prev_ts = Some(ts);
     }
     let fields = fields.into_iter().zip(columns).collect();
-    Ok(Series { tier: name, step, ts: ts_out, fields })
+    Ok(Series { tier: name, ts: ts_out, fields })
 }
 
 /// A writer whose writes are kept, and a function that stores them in new
@@ -1014,7 +1012,7 @@ mod tests {
         maintenance(&mut conns, now + ROLLUP_GRACE_SECS, false);
         let m = &conns[Db::Metrics as usize];
         let five = series(m, &UPLINK, &["bb".into()], None, now - 3600, now, 1).unwrap();
-        assert_eq!(five.step, 300);
+        assert_eq!(five.tier, "5m");
         assert_eq!(five.ts, vec![now - 1200, now - 900, now - 600, now - 300]);
         assert_eq!(five.fields["speed"], vec![Some(1000.0); 4]);
         // Rates from the counters' last value in consecutive buckets.
