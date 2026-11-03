@@ -622,11 +622,11 @@ fn mcast_types(rows: &[McastRow], from: Ts, to: Ts, bucket: Ts, step: Ts) -> (Ve
 /// read as the render reads them (its defaults, `"true"` as true; the VLAN its
 /// clients are tagged with).
 fn wlan_settings(state: Option<&Value>, essid: &str) -> Value {
-    use crate::settings::{docs, id_of};
+    use crate::settings::{doc_by_id, docs};
     use apcfg::flag;
     let Some(state) = state else { return Value::Null };
     let Some(w) = docs(state, "wlanconf").find(|w| w["name"].as_str() == Some(essid)) else { return Value::Null };
-    let network = w["networkconf_id"].as_str().and_then(|id| docs(state, "networkconf").find(|n| id_of(n).as_deref() == Some(id))).and_then(|n| n["name"].as_str());
+    let network = w["networkconf_id"].as_str().and_then(|id| doc_by_id(state, "networkconf", id)).and_then(|n| n["name"].as_str());
     let security = crate::settings::security_label(w);
     let vlan = apcfg::ssid_vlan(state, crate::settings::site_id(state).unwrap_or_default(), w);
     json!({
