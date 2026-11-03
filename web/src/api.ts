@@ -1721,7 +1721,8 @@ export interface AdoptionStatus {
   active: boolean;
   pending: PendingAp[];
   adopting: { mac: Mac; since: number }[];
-  forgetting: { mac: Mac; since: number }[];
+  /** How many APs are being forgotten: told to reset, then removed. */
+  forgetting: number;
   ssh: { possible: boolean; inform_url: string | null };
 }
 
@@ -1733,7 +1734,7 @@ export const useAdoption = (enabled = true) =>
     enabled,
     refetchInterval: (q) => {
       const d = q.state.data;
-      return d && (d.pending.length || d.adopting.length || d.forgetting.length) ? 5_000 : 60_000;
+      return d && (d.pending.length || d.adopting.length || d.forgetting > 0) ? 5_000 : 60_000;
     },
   });
 export const adoptAp = (mac: Mac) => send<{ adopting: boolean }>("POST", `/api/devices/${mac}/adopt`, {});
