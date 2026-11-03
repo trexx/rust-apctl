@@ -1,5 +1,10 @@
 import { Suspense } from "react";
-import { useCanEdit, useSettingsState, useWlanSettings } from "../../../api";
+import {
+  useActive,
+  useCanEdit,
+  useSettingsState,
+  useWlanSettings,
+} from "../../../api";
 import { band } from "../../../format";
 import { lazyNamed } from "../../../lazy";
 import { Loading, QueryNote } from "../../common";
@@ -18,9 +23,10 @@ export function WlanSettingsPanel() {
   const state = useSettingsState().data;
   const imported = !!state?.summary;
   const readOnly = !useCanEdit();
+  const active = useActive();
   if (!s.data) return <QueryNote q={s} panel />;
   const list = s.data;
-  if (list.wlans.length === 0 && !list.active) return null;
+  if (list.wlans.length === 0 && !active) return null;
   const apName = (m: string) => list.aps.find((a) => a.mac === m)?.name ?? m;
   return (
     <ListPanel
@@ -28,14 +34,14 @@ export function WlanSettingsPanel() {
       note={
         state && !imported
           ? "no settings imported: import them on the Settings page to add SSIDs"
-          : list.active
+          : active
             ? "changes are reviewed, then sent to the APs"
-            : "shadow mode: you can try changes and see what they would send"
+            : active === false &&
+              "shadow mode: you can try changes and see what they would send"
       }
       add={imported ? "Add SSID" : undefined}
       kind="wlan"
       items={list.wlans}
-      active={list.active}
       readOnly={readOnly}
       gone="This SSID was deleted meanwhile."
       editor={(wlan, onClose) => (

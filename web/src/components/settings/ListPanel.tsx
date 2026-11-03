@@ -13,7 +13,6 @@ export function ListPanel<T extends { id: string }>({
   add,
   kind,
   items,
-  active,
   readOnly,
   gone,
   editor,
@@ -25,7 +24,6 @@ export function ListPanel<T extends { id: string }>({
   add?: string;
   kind: "wlan" | "usergroup";
   items: T[];
-  active: boolean;
   readOnly: boolean;
   /** Said when the one being edited was deleted meanwhile. */
   gone: string;
@@ -44,7 +42,6 @@ export function ListPanel<T extends { id: string }>({
       <Review
         target={{ kind, id: removing.id, remove: true }}
         patch={{}}
-        active={active}
         onBack={() => setRemoving(null)}
         onSaved={() => setRemoving(null)}
       />

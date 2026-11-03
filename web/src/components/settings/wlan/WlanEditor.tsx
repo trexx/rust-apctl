@@ -79,7 +79,6 @@ export function WlanEditor({
   return (
     <EditorShell
       target={{ kind: "wlan", id: wlan?.id ?? null }}
-      active={list.active}
       patch={patch}
       invalid={badRekey(w)}
       onClose={onClose}

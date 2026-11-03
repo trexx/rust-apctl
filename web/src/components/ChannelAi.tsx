@@ -4,6 +4,7 @@ import {
   runChannelAi,
   saveChannelAi,
   startScan,
+  useActive,
   useCanEdit,
   useChannelAi,
   useDeviceNamesQuery,
@@ -40,9 +41,9 @@ export function PlanActions({
 }) {
   const ai = useChannelAi();
   const canEdit = useCanEdit();
+  const active = useActive();
   const { busy, msg, run } = useRun();
   if (!canEdit || !ai.data) return null;
-  const active = ai.data.active;
   const scanning = ai.data.scans.filter((s) => s.band === band);
   const changes = (plan?.plan ?? [])
     .filter((p) => p.change)
@@ -90,7 +91,11 @@ export function PlanActions({
       </div>
       <Outcome
         msg={msg}
-        why={active ? null : "Scanning and applying work after the cutover."}
+        why={
+          active === false
+            ? "Scanning and applying work after the cutover."
+            : null
+        }
       />
     </div>
   );
@@ -105,13 +110,14 @@ export function ChannelAiPanel() {
   const ai = useChannelAi();
   const apNames = useDeviceNamesQuery();
   const canEdit = useCanEdit();
+  const active = useActive();
   const runs = useEvents({ kind: "channel_plan", limit: 10 });
   const { busy, msg, run } = useRun();
   const now = useNow();
   if (!ai.data) return <QueryNote q={ai} panel />;
   const d = ai.data;
   const s = d.settings;
-  const can = d.active && canEdit && !busy;
+  const can = !!active && canEdit && !busy;
   const save = (patch: Record<string, unknown>) =>
     void run(async () => (await saveChannelAi(patch)).what);
   return (
@@ -122,7 +128,7 @@ export function ChannelAiPanel() {
           {s.enabled
             ? `nightly at ${hhmm(s.hour * 60 + s.minute)} ${d.timezone ?? "UTC"}`
             : "nightly optimisation off"}
-          {d.active && d.next_run ? ` · next ${clock(d.next_run, now)}` : ""}
+          {active && d.next_run ? ` · next ${clock(d.next_run, now)}` : ""}
         </span>
         <span className="spacer" />
         {canEdit && (
@@ -151,7 +157,7 @@ export function ChannelAiPanel() {
         allowed moves regardless. APs on a wireless uplink, excluded APs, APs
         being upgraded and, on 2.4 GHz, APs broadcasting an SSID locked to
         channel 6 keep their channel, even one no longer allowed.
-        {!d.active &&
+        {active === false &&
           " In shadow mode your current controller does this; apctl takes over after the cutover."}
       </p>
       <div className="settings-form">

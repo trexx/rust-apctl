@@ -108,7 +108,6 @@ export function DeviceEditor({
   return (
     <EditorShell
       target={{ kind: "device", mac: d.mac }}
-      active={live.active}
       patch={patch}
       onClose={onClose}
     >

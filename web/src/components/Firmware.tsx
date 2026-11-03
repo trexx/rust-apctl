@@ -7,6 +7,7 @@ import {
   resumeFirmware,
   upgradeFirmware,
   upgradeFirmwareUrl,
+  useActive,
   useCanEdit,
   useFirmware,
 } from "../api";
@@ -62,6 +63,7 @@ const STEP: Record<FirmwareJob["state"], string> = {
 export function FirmwarePanel() {
   const f = useFirmware();
   const readOnly = !useCanEdit();
+  const active = useActive();
   const now = useNow();
   const [urlFor, setUrlFor] = useState<string | null>(null);
   const [url, setUrl] = useState("");
@@ -69,7 +71,7 @@ export function FirmwarePanel() {
   const { busy, msg, run } = useRunner([keys.firmware()], 1200);
   if (!f.data) return <QueryNote q={f} panel />;
   const d = f.data;
-  const canAct = d.active && !readOnly;
+  const canAct = !!active && !readOnly;
   const updatable = d.aps.filter(
     (a) => a.status === "update_available" && a.online,
   );
@@ -119,7 +121,7 @@ export function FirmwarePanel() {
         {d.error && (
           <div className="small error">The last check failed: {d.error}</div>
         )}
-        {!d.active && (
+        {active === false && (
           <p className="small muted">
             apctl is in shadow mode, so it never talks to the APs: it shows what
             is available, and follows updates your current controller performs.

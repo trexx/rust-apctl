@@ -20,9 +20,8 @@ export function AdoptionPanel() {
   const [pass, setPass] = useState("");
   // Event lists refetch when the adoption's events arrive.
   const { busy, msg, run } = useRunner([keys.adoption(), keys.devices()]);
-  // Nothing while it loads, or in shadow mode; a failure shows, as other panels' do.
+  // Nothing while it loads; a failure shows, as other panels' do.
   if (!a.data) return a.error ? <QueryNote q={a} panel /> : null;
-  if (!a.data.active) return null;
   const d = a.data;
   const nothing = d.pending.length === 0 && d.adopting.length === 0;
   return (

@@ -20,11 +20,9 @@ const kbps = (v: string) =>
 function SpeedLimitEditor({
   group,
   onClose,
-  active,
 }: {
   group: UserGroup | null;
   onClose: () => void;
-  active: boolean;
 }) {
   // Compared with what the editor opened with, not with the group as it is
   // refetched: someone else's edit meanwhile is neither a change here nor undone.
@@ -64,7 +62,6 @@ function SpeedLimitEditor({
   return (
     <EditorShell
       target={{ kind: "usergroup", id: group?.id ?? null }}
-      active={active}
       patch={patch}
       invalid={!form.name.trim() || unreadable.down || unreadable.up}
       onClose={onClose}
@@ -92,7 +89,7 @@ export function SpeedLimitsPanel() {
   if (!state.data) return <QueryNote q={state} panel />;
   if (!imported) return <NotImported title="Speed limits" />;
   if (!g.data) return <QueryNote q={g} panel />;
-  const { active, groups } = g.data;
+  const { groups } = g.data;
   return (
     <ListPanel
       title="Speed limits"
@@ -100,11 +97,10 @@ export function SpeedLimitsPanel() {
       add="Add speed limit"
       kind="usergroup"
       items={groups}
-      active={active}
       readOnly={readOnly}
       gone="This speed limit was deleted meanwhile."
       editor={(group, onClose) => (
-        <SpeedLimitEditor group={group} active={active} onClose={onClose} />
+        <SpeedLimitEditor group={group} onClose={onClose} />
       )}
       rows={(edit, remove) =>
         groups.map((x) => (

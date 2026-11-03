@@ -981,7 +981,6 @@ export interface FirmwareInfo {
   checked: number | null;
   error: string | null;
   channel: string;
-  active: boolean;
   aps: {
     mac: Mac;
     name: string | null;
@@ -1033,6 +1032,11 @@ export const useChannelPlan = (band: string, dfs: boolean, enabled = true) =>
 /** The server's status; only the overview's counters need it to `poll`. */
 export const useStatus = (poll = false) =>
   useQuery({ queryKey: keys.status(), queryFn: getting<Status>("/api/status"), refetchInterval: poll ? 15_000 : false });
+/** Whether apctl manages the APs (active mode), which is fixed while it runs; undefined until /api/status answers. */
+export function useActive(): boolean | undefined {
+  const mode = useStatus().data?.mode;
+  return mode === undefined ? undefined : mode === "active";
+}
 
 const fetchDevices = getting<DeviceSummary[]>("/api/devices");
 
@@ -1497,7 +1501,6 @@ export interface WlanSettings extends WlanFields {
 }
 
 export interface WlanSettingsList {
-  active: boolean;
   wlans: WlanSettings[];
   /** `for_ssid`: an SSID may be put on it (a LAN network, not the inter-VLAN routing one), as the server checks it. */
   networks: { id: string; name: string; vlan: number | null; for_ssid: boolean }[];
@@ -1562,7 +1565,6 @@ export interface ConfigNetwork {
 }
 
 export interface DeviceSettings {
-  active: boolean;
   mac: Mac;
   name: string | null;
   model: string | null;
@@ -1605,7 +1607,6 @@ export interface SshKey { name: string; type: string; key: string; comment: stri
 
 /** Site-wide device settings (secrets are never sent back). */
 export interface SiteSettings {
-  active: boolean;
   mgmt: {
     has_ssh_password: boolean;
     led_enabled: boolean | null;
@@ -1663,7 +1664,6 @@ export interface ChannelPlanResult {
 }
 
 export interface ChannelAiStatus {
-  active: boolean;
   has_settings: boolean;
   settings: { enabled: boolean; hour: number; minute: number; radios: string[]; dfs: boolean; exclude_devices: Mac[] };
   timezone: string | null;
@@ -1700,7 +1700,7 @@ export interface UserGroup {
 }
 
 export const useUserGroups = (enabled = true) =>
-  useQuery({ queryKey: keys.settings("usergroups"), queryFn: getting<{ active: boolean; groups: UserGroup[] }>("/api/settings/usergroups"), enabled });
+  useQuery({ queryKey: keys.settings("usergroups"), queryFn: getting<{ groups: UserGroup[] }>("/api/settings/usergroups"), enabled });
 export const setClientSpeedLimit = (mac: Mac, usergroup_id: string | null) => send<{ saved: boolean; what: string }>("PUT", `/api/clients/${mac}/speed-limit`, { usergroup_id });
 
 // ---- Adoption ----
@@ -1718,7 +1718,6 @@ export interface PendingAp {
 }
 
 export interface AdoptionStatus {
-  active: boolean;
   pending: PendingAp[];
   adopting: { mac: Mac; since: number }[];
   /** How many APs are being forgotten: told to reset, then removed. */

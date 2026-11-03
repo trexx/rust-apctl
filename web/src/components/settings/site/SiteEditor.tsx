@@ -41,12 +41,7 @@ function SiteEditor({ d, onClose }: { d: SiteSettings; onClose: () => void }) {
         ? ntp.form
         : { setting_preference: ntp.form.setting_preference };
   return (
-    <EditorShell
-      target={{ kind: "site" }}
-      active={d.active}
-      patch={patch}
-      onClose={onClose}
-    >
+    <EditorShell target={{ kind: "site" }} patch={patch} onClose={onClose}>
       <CountryTimezone top={top} d={d} />
       <ApDefaults mgmt={mgmt} />
       <Ssh mgmt={mgmt} d={d} password={{ value: password, set: setPassword }} />

@@ -1,7 +1,7 @@
 import { useState } from "react";
 import type { ReactNode } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { changeSettings, keys } from "../../api";
+import { changeSettings, keys, useActive } from "../../api";
 import type { SettingsPreview, SettingsTarget } from "../../api";
 import { ChangeGroups, summarise } from "../ConfigDiff";
 import { Loading } from "../common";
@@ -14,17 +14,16 @@ import type { Fields } from "./form";
 export function Review({
   target,
   patch,
-  active,
   onBack,
   onSaved,
 }: {
   target: SettingsTarget;
   patch: Fields;
-  active: boolean;
   onBack: () => void;
   onSaved: () => void;
 }) {
   const qc = useQueryClient();
+  const active = useActive();
   // The preview is asked for once, when the review opens, and forgotten when it closes.
   const preview = useQuery({
     queryKey: keys.settingsPreview(target, patch),
@@ -95,7 +94,7 @@ export function Review({
         >
           Save and send to the APs
         </button>
-        {!active && (
+        {active === false && (
           <span className="muted small">
             Saving works after the cutover: in shadow mode the settings belong
             to your current controller.
@@ -112,14 +111,12 @@ export function Review({
  */
 export function EditorShell({
   target,
-  active,
   patch,
   invalid,
   onClose,
   children,
 }: {
   target: SettingsTarget;
-  active: boolean;
   patch: Fields;
   /** Review stays off while the form can't be sent. */
   invalid?: boolean;
@@ -136,7 +133,6 @@ export function EditorShell({
         <Review
           target={target}
           patch={review}
-          active={active}
           onBack={() => setReview(null)}
           onSaved={onClose}
         />
