@@ -13,7 +13,7 @@ import {
   spanText,
   toneClass,
 } from "../format";
-import { COLORS, Chart, SpanPage, useTimeSpan } from "../components/Chart";
+import { COLORS, Chart, SpanPage, moved, useTimeSpan } from "../components/Chart";
 import { QueryState, Signal } from "../components/common";
 import { lazyNamed } from "../lazy";
 
@@ -162,11 +162,13 @@ function WlanPanel({ w }: { w: Wlan }) {
               values: w.series.download_bps,
               color: COLORS.blue,
               fill: true,
+              summary: bytes(moved(w.series.ts, w.series.download_bps) / 8),
             },
             {
               label: "From clients",
               values: w.series.upload_bps,
               color: COLORS.purple,
+              summary: bytes(moved(w.series.ts, w.series.upload_bps) / 8),
             },
           ]}
         />

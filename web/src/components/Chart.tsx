@@ -22,6 +22,27 @@ export const COLORS = {
   teal: "var(--c-teal)",
 };
 
+/** The usual seconds between a series' samples: the median step, which a few
+ *  missing samples don't change. */
+export function typicalStep(ts: number[]): number {
+  const steps = ts
+    .slice(1)
+    .map((t, i) => t - ts[i]!)
+    .sort((a, b) => a - b);
+  return steps[Math.floor(steps.length / 2)] ?? 0;
+}
+
+/**
+ * What a series of per-second rates adds up to over its samples, each rate held
+ * for the series' usual step (a bucket's width, or the time between samples).
+ * Close to what moved, not exact: the first and last buckets can reach past the
+ * window, and the rate after a short gap is held for one step, not the gap.
+ */
+export const moved = (ts: number[], perSecond: (number | null)[]) => {
+  const step = typicalStep(ts);
+  return perSecond.reduce<number>((sum, v) => sum + (v ?? 0) * step, 0);
+};
+
 // uPlot, its stylesheet and the chart itself load with the first chart a page
 // shows, so pages without charts never fetch them and the others show before
 // they arrive.

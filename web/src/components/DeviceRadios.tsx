@@ -6,7 +6,7 @@ import type {
   TimeSpan,
   VapSample,
 } from "../api";
-import { COLORS, Chart } from "./Chart";
+import { COLORS, Chart, moved } from "./Chart";
 import { QueryState, Signal, THead } from "./common";
 import {
   SIGNAL,
@@ -248,11 +248,13 @@ export function RadioActivity({
                 values: x.download_bps,
                 color: COLORS.blue,
                 fill: true,
+                summary: bytes(moved(x.ts, x.download_bps) / 8),
               },
               {
                 label: "From clients",
                 values: x.upload_bps,
                 color: COLORS.purple,
+                summary: bytes(moved(x.ts, x.upload_bps) / 8),
               },
               {
                 label: "Clients",
@@ -402,12 +404,14 @@ function VapChart({ bssid, range }: { bssid: string; range: TimeSpan }) {
               scale: 8,
               color: COLORS.blue,
               fill: true,
+              summary: bytes(moved(data.ts, data.fields.tx_bytes)),
             },
             {
               label: "From clients",
               values: data.fields.rx_bytes,
               scale: 8,
               color: COLORS.purple,
+              summary: bytes(moved(data.ts, data.fields.rx_bytes)),
             },
           ]}
         />

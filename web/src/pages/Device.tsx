@@ -11,7 +11,7 @@ import {
   useSiteTop,
 } from "../api";
 import type { TimeSpan } from "../api";
-import { COLORS, Chart, SpanPage, useTimeSpan } from "../components/Chart";
+import { COLORS, Chart, SpanPage, moved, useTimeSpan } from "../components/Chart";
 import {
   Dot,
   EventList,
@@ -344,12 +344,14 @@ function UplinkChart({ mac, range }: { mac: string; range: TimeSpan }) {
                 scale: 8,
                 color: COLORS.blue,
                 fill: true,
+                summary: bytes(moved(ts, f.rx_bytes)),
               },
               {
                 label: "Upload (from AP)",
                 values: f.tx_bytes,
                 scale: 8,
                 color: COLORS.purple,
+                summary: bytes(moved(ts, f.tx_bytes)),
               },
             ]}
           />
