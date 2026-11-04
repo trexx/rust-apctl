@@ -116,9 +116,10 @@ if [ -z "$pin" ]; then
   exit 0
 fi
 
-# skopeo reads the registry without pulling; from a container when it is not installed.
+# skopeo reads the registry without pulling; from a container when it is not installed
+# (type -P: `command -v` would find this function itself).
 skopeo() {
-  if command -v skopeo >/dev/null; then
+  if type -P skopeo >/dev/null; then
     command skopeo "$@"
   else
     podman run --rm quay.io/skopeo/stable:v1.22.3@sha256:62da3f53e4b72219741bfa6681e092d30391a880b6346d20bf064778f7caa3c5 "$@"
