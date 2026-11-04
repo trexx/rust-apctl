@@ -108,8 +108,7 @@ fi
 built="localhost/rust-apctl:$version"
 echo "== building $built"
 # --force-rm: a failed build must not leave working containers (they pin their images).
-# OUI_MONTH: the manufacturer list is downloaded again once a month.
-podman build -q --force-rm --target runtime --build-arg OUI_MONTH="$(date +%Y-%m)" -t "$built" .
+podman build -q --force-rm --target runtime -t "$built" .
 APCTL_ENGINE=podman scripts/image-check.sh "$built"
 
 if [ -z "$pin" ]; then

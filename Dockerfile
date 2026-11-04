@@ -7,24 +7,11 @@ COPY web/ ./
 RUN npm run build
 
 # --- manufacturer names (IEEE MAC address registry, public data) ---
-# A small stage of its own, so code changes don't download it again. The layer is
-# cached until OUI_MONTH changes (scripts/release.sh passes the current month), so the
-# list is at most about a month old. CI images (trexx/actions' build workflow, which
-# passes no build args) are built with a fresh builder and no layer cache, so they always
-# download it. (The IEEE server answers 418 to the HTTP client behind ADD <url>, so
-# busybox wget fetches it.) Each line is cut after the name: the controller reads no
-# more (vendor.rs), and the addresses are much of the file.
-FROM docker.io/library/alpine:3.24@sha256:be2656061b536c1883c4034790e21d0a09c5aaaf51968b89368a3c0371ea2c9a AS oui
-ARG OUI_MONTH=
-RUN echo "registry of ${OUI_MONTH:-the first build}" \
-    && wget -q -O /oui-full.csv https://standards-oui.ieee.org/oui/oui.csv \
-    && head -1 /oui-full.csv | grep -q Assignment \
-    && sed -E 's/^(MA-L,[0-9A-F]{6},("([^"]|"")*"|[^,]*)).*/\1/' /oui-full.csv > /oui.csv \
-    && rm /oui-full.csv \
-    && chmod 644 /oui.csv
-# The data directory, empty: the runtime image has no shell to make it. Owned by the
-# controller's user there, which Docker copies to a new named volume mounted on it.
-RUN mkdir -p /rootfs/data
+# An image of the one file, /oui.csv (oui/Dockerfile), published monthly by
+# .github/workflows/oui.yml: building apctl never downloads the list, so the IEEE
+# server being down fails only a monthly refresh. Renovate brings each new list as
+# a digest bump, which the Image workflow builds.
+FROM ghcr.io/trexx/rust-apctl-oui:latest@sha256:2377e4cd8ef2a52c1986e23a0d55a432838fad84ea1838abbb4973849204bc26 AS oui
 
 # --- controller ---
 # The dependencies build from the manifests alone, every crate's own source replaced by
@@ -70,6 +57,9 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/src/target \
     find crates -name '*.rs' -exec touch {} + \
     && cargo auditable build --release --locked -p controller && cp target/release/apctl /apctl
+# The data directory, empty: the runtime image has no shell to make it. Owned by the
+# controller's user there, which Docker copies to a new named volume mounted on it.
+RUN mkdir -p /rootfs/data
 
 # --- capture sidecar for shadow mode: tcpdump writing pcap into a FIFO ---
 FROM docker.io/library/alpine:3.24@sha256:be2656061b536c1883c4034790e21d0a09c5aaaf51968b89368a3c0371ea2c9a AS capture
@@ -83,7 +73,7 @@ ENTRYPOINT ["/bin/sh", "-c", "[ -p \"$FIFO\" ] || mkfifo -m 644 \"$FIFO\"; exec 
 FROM gcr.io/distroless/cc-debian12:nonroot@sha256:9dac0a79194e45a7da0158a9c6da57b217585af0786db3845d1f0ec1a0dd182f AS runtime
 COPY --from=build /apctl /usr/local/bin/apctl
 COPY --from=oui /oui.csv /usr/share/apctl/oui.csv
-COPY --from=oui --chown=65532:65532 /rootfs/ /
+COPY --from=build --chown=65532:65532 /rootfs/ /
 USER nonroot
 ENV APCTL_DATA_DIR=/data APCTL_LISTEN=0.0.0.0:8090
 EXPOSE 8090

@@ -2,7 +2,7 @@ name: 'Image'
 
 # Builds the runtime image without pushing it whenever what it is built from changes:
 # Renovate automerges minor and digest bumps of the Dockerfile's images once the checks
-# pass, and a bump that breaks the image (the OUI download, a glibc mismatch between the
+# pass, and a bump that breaks the image (a new manufacturer list, a glibc mismatch between the
 # rust and distroless images) must fail here, not at the next release.
 # The manifests too: the release profile and crate features are exercised only here.
 on:
