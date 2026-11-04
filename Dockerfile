@@ -30,7 +30,7 @@ RUN mkdir -p /rootfs/data
 # The dependencies build from the manifests alone, every crate's own source replaced by
 # an empty one: that stage does not wait for the web UI, and a code change leaves it
 # cached. The skeleton stage runs on every change but makes the same files.
-FROM docker.io/library/rust:1.99-bookworm@sha256:9181b56c2a21ab1d5e73cffe04fc762426d30aa7fac3c91141dd033f49a7fc8b AS skeleton
+FROM docker.io/library/rust:1.99-bookworm@sha256:c9155318d07341301a78b45ecdd81af2e43b8b297d64e8fd4c5e80d7735607c3 AS skeleton
 WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
 COPY crates/ crates/
@@ -49,7 +49,7 @@ RUN for c in crates/*; do \
 # CARGO_BUILD_JOBS limits cargo on a machine short of memory (--build-arg).
 # cargo auditable embeds the list of crates in the binary, where the image scan
 # (.github/workflows/trivy.yml) reads it: the scan covers exactly the crates that ship.
-FROM docker.io/library/rust:1.99-bookworm@sha256:9181b56c2a21ab1d5e73cffe04fc762426d30aa7fac3c91141dd033f49a7fc8b AS deps
+FROM docker.io/library/rust:1.99-bookworm@sha256:c9155318d07341301a78b45ecdd81af2e43b8b297d64e8fd4c5e80d7735607c3 AS deps
 RUN cargo install --locked cargo-auditable@0.7.6
 WORKDIR /src
 COPY --from=skeleton /src ./
