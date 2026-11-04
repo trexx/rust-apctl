@@ -11,7 +11,7 @@ RUN npm run build
 # .github/workflows/oui.yml: building apctl never downloads the list, so the IEEE
 # server being down fails only a monthly refresh. Renovate brings each new list as
 # a digest bump, which the Image workflow builds.
-FROM ghcr.io/trexx/rust-apctl-oui:latest@sha256:2377e4cd8ef2a52c1986e23a0d55a432838fad84ea1838abbb4973849204bc26 AS oui
+FROM ghcr.io/trexx/rust-apctl-oui:latest@sha256:1663fd97dfb203554f15730773e184ba49e5a98b996ae6d6ac3dc6ec1388456a AS oui
 
 # --- controller ---
 # The dependencies build from the manifests alone, every crate's own source replaced by
