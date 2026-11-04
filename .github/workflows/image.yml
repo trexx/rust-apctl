@@ -7,7 +7,7 @@ name: 'Image'
 # The manifests too: the release profile and crate features are exercised only here.
 on:
   push:
-    branches: [ 'master' ]
+    branches: [ 'main' ]
     paths: [ 'Dockerfile', '.dockerignore', 'Cargo.toml', 'crates/*/Cargo.toml', 'Cargo.lock', 'web/package-lock.json', '.github/workflows/image.yml', 'scripts/image-check.sh', 'scripts/version.sh' ]
   pull_request:
     paths: [ 'Dockerfile', '.dockerignore', 'Cargo.toml', 'crates/*/Cargo.toml', 'Cargo.lock', 'web/package-lock.json', '.github/workflows/image.yml', 'scripts/image-check.sh', 'scripts/version.sh' ]

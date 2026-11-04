@@ -2,7 +2,7 @@ name: 'Manufacturer list'
 
 # Publishes the IEEE manufacturer list (oui/Dockerfile) as
 # ghcr.io/trexx/rust-apctl-oui:latest and :<date> once a month, and when its
-# Dockerfile changes on master. The main Dockerfile pins :latest by digest: Renovate
+# Dockerfile changes on main. The main Dockerfile pins :latest by digest: Renovate
 # opens the digest bump, the Image workflow builds apctl with the new list, and the
 # bump is automerged. Pull requests only build it.
 on:
@@ -10,7 +10,7 @@ on:
     - cron: '17 5 2 * *'
   workflow_dispatch:
   push:
-    branches: [ 'master' ]
+    branches: [ 'main' ]
     paths: [ 'oui/**', '.github/workflows/oui.yml' ]
   pull_request:
     paths: [ 'oui/**', '.github/workflows/oui.yml' ]
