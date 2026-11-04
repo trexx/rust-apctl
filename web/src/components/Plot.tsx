@@ -12,17 +12,14 @@ import "uplot/dist/uPlot.min.css";
 import { spanBounds } from "../api";
 import type { TimeSpan } from "../api";
 import { dayTime } from "../format";
+import { typicalStep } from "./Chart";
 import { SpanContext, ZoomContext } from "./span";
 
 /** Breaks lines where samples are missing for much longer than usual (an AP
  *  offline, apctl not running) by inserting a point with no values. */
 function withGaps(ts: number[], cols: (number | null)[][]): uPlot.AlignedData {
   if (ts.length < 3) return [ts, ...cols] as uPlot.AlignedData;
-  const steps = ts
-    .slice(1)
-    .map((t, i) => t - ts[i]!)
-    .sort((a, b) => a - b);
-  const typical = steps[Math.floor(steps.length / 2)]!;
+  const typical = typicalStep(ts);
   const outTs: number[] = [ts[0]!];
   const out = cols.map((c) => [c[0] ?? null]);
   for (let i = 1; i < ts.length; i++) {

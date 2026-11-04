@@ -11,7 +11,7 @@ import {
   useEvents,
   useSeries,
 } from "../api";
-import { COLORS, Chart, SpanPage, useTimeSpan } from "../components/Chart";
+import { COLORS, Chart, SpanPage, moved, useTimeSpan } from "../components/Chart";
 import {
   Dot,
   ErrorNote,
@@ -217,12 +217,14 @@ function ClientPage({ mac }: { mac: string }) {
                     scale: 8,
                     color: COLORS.blue,
                     fill: true,
+                    summary: bytes(moved(ts, f.tx_bytes)),
                   },
                   {
                     label: "Up",
                     values: f.rx_bytes,
                     scale: 8,
                     color: COLORS.purple,
+                    summary: bytes(moved(ts, f.rx_bytes)),
                   },
                 ]}
               />

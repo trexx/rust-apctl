@@ -1,7 +1,7 @@
 import { useState } from "react";
 import { useSiteActivity } from "../../api";
-import { pct, rate } from "../../format";
-import { COLORS, Chart, RangePicker, useTimeSpan } from "../Chart";
+import { bytes, pct, rate } from "../../format";
+import { COLORS, Chart, RangePicker, moved, useTimeSpan } from "../Chart";
 import { QueryState, Segmented } from "../common";
 import { SpanScope } from "../span";
 import { BandPicker } from "./shared";
@@ -48,11 +48,13 @@ export function SiteActivity() {
                       values: activity.download_bps,
                       color: COLORS.blue,
                       fill: true,
+                      summary: bytes(moved(activity.ts, activity.download_bps) / 8),
                     },
                     {
                       label: "Upload",
                       values: activity.upload_bps,
                       color: COLORS.purple,
+                      summary: bytes(moved(activity.ts, activity.upload_bps) / 8),
                     },
                     {
                       label: "Clients",
