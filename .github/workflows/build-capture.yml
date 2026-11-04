@@ -9,7 +9,7 @@ on:
 
 jobs:
   build:
-    uses: 'trexx/actions/.github/workflows/build.yml@shared-steps'
+    uses: 'trexx/actions/.github/workflows/build.yml@main'
     permissions:
       contents: 'read'
       packages: 'write'
