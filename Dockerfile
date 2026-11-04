@@ -21,6 +21,8 @@ FROM docker.io/library/rust:1.99-bookworm@sha256:c9155318d07341301a78b45ecdd81af
 WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
 COPY crates/ crates/
+# The cd runs in a $(...) subshell to list files, it changes no directory.
+# hadolint ignore=DL3003
 RUN for c in crates/*; do \
         targets=$(cd "$c" && ls src/lib.rs src/main.rs 2>/dev/null || true); \
         find "$c" -mindepth 1 -maxdepth 1 ! -name Cargo.toml -exec rm -rf {} +; \
@@ -74,7 +76,8 @@ FROM gcr.io/distroless/cc-debian12:nonroot@sha256:9dac0a79194e45a7da0158a9c6da57
 COPY --from=build /apctl /usr/local/bin/apctl
 COPY --from=oui /oui.csv /usr/share/apctl/oui.csv
 COPY --from=build --chown=65532:65532 /rootfs/ /
-USER nonroot
+# distroless nonroot (uid 65532), numeric so runAsNonRoot can verify it.
+USER 65532:65532
 ENV APCTL_DATA_DIR=/data APCTL_LISTEN=0.0.0.0:8090
 EXPOSE 8090
 ENTRYPOINT ["/usr/local/bin/apctl"]

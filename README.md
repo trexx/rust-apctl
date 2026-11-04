@@ -1,6 +1,6 @@
 # rust-apctl
 
-A lightweight, self-hosted controller for **UniFi access points**. It replaces the UniFi
+A lightweight, self-hosted controller for UniFi access points: Rust + SQLite, embedded React UI, metrics, syslog, roaming and alerts. It replaces the UniFi
 Network Application on sites that only have UniFi APs. apctl is a single Rust binary with
 an embedded web UI and stores everything in SQLite. It speaks the APs' own inform protocol,
 so the APs need no changes.
@@ -9,7 +9,9 @@ so the APs need no changes.
 
 ![Overview](docs/screenshots/overview.png)
 
-## Features
+## Overview
+
+### Features
 
 - Monitoring of APs, radios, networks and clients, with a year of history
 - Events, browser alerts, a connection log with per-stage timings, and roaming analysis
@@ -30,13 +32,13 @@ Tested with U6-Mesh APs on firmware 8.8, against Network Application 10.6.
 
 These screenshots use mock data from `informdump demo`.
 
-## Not supported yet
+### Not supported yet
 
 - **Wireless meshing.** apctl always sends the APs meshing off, whatever the imported
   settings say. Don't switch a site whose APs mesh (or need to) over to apctl yet.
 - A tagged management VLAN, guest portals, Hotspot 2.0, and 6 GHz / Wi-Fi 7 features.
 
-## Modes
+### Modes
 
 - **Shadow** (default): learns everything from a packet capture of an existing
   controller's traffic and never talks to the APs. A dry run compares that controller's
@@ -46,7 +48,9 @@ These screenshots use mock data from `informdump demo`.
   `informdump import`. The configs it pushes name the ports it listens on, so APs
   sending syslog "to this controller" use the `--syslog-listen` port.
 
-## Run
+## Usage
+
+### Run
 
 ```sh
 printf '%s' 'a long password' | docker run --rm -i ghcr.io/trexx/rust-apctl hash-password | sed 's/^/admin:/' > users
@@ -110,15 +114,7 @@ mounted at `/capture` in both containers, `FIFO=/capture/pcap` and
 `FILTER='tcp port 8080 or udp port 5514'` (informs and syslog) on the sidecar, and
 `--shadow /capture/pcap` on apctl. `apctl serve --help` lists every option.
 
-Without `--users-file` (`APCTL_USERS_FILE`), apctl is read-only and needs no login: anyone
-who can reach port 8090 sees everything except the Wi-Fi passphrases, the SNMP community
-and backup downloads.
-
-Behind a reverse proxy or ingress, list its addresses with `--trusted-proxies`
-(`APCTL_TRUSTED_PROXIES`, IPs or CIDR ranges). Only then is its `X-Forwarded-For` header
-used, so the login throttle sees each client rather than the proxy.
-
-## Demo
+### Demo
 
 Try the UI without any APs. The demo is a made-up site with three APs and about twenty clients:
 
@@ -137,7 +133,19 @@ Open <http://127.0.0.1:8090> and log in as `admin` with `demo-password`. Then up
 `data/demo.json` on the Settings page for the SSIDs, the client names and the settings
 editor.
 
-## Build
+## Configuration
+
+Without `--users-file` (`APCTL_USERS_FILE`), apctl is read-only and needs no login: anyone
+who can reach port 8090 sees everything except the Wi-Fi passphrases, the SNMP community
+and backup downloads.
+
+Behind a reverse proxy or ingress, list its addresses with `--trusted-proxies`
+(`APCTL_TRUSTED_PROXIES`, IPs or CIDR ranges). Only then is its `X-Forwarded-For` header
+used, so the login throttle sees each client rather than the proxy.
+
+## Development
+
+### Build
 
 ```sh
 scripts/check.sh --web                # lints and builds web/dist in the Dockerfile's Node image
@@ -148,13 +156,26 @@ cargo build --release -p controller   # or: podman build --target runtime .
 `informdump --help` for its commands. `informdump import` reads the official controller's
 MongoDB and needs `cargo build --release -p informdump --features mongo`.
 
-Pushing a version tag (e.g. `0.15.1`) makes CI publish the image; nothing else pushes it.
 `scripts/check.sh` runs CI's Rust checks and `scripts/check.sh --web` its web check
 (with `APCTL_ENGINE`, else docker, else podman; the files it writes are yours either way).
-`scripts/release.sh 0.15.1` runs them all and builds and checks the image locally before
+
+### CI
+
+On pushes to `main` and on pull requests, `.github/workflows/test.yml` runs `scripts/check.sh` and `scripts/check.sh --web`. The tests built on real captures need fixtures kept outside the repository (`APCTL_TESTDATA`, see `docs/captures.md`), which CI does not have, so there they return early and pass without checking anything. `.github/workflows/image.yml` builds the runtime image and runs `scripts/image-check.sh` on it whenever the Dockerfile, the Cargo manifests or the lock files change. Trivy scans the published image and `web/package-lock.json` daily.
+
+## Releases
+
+Pushing a version tag (e.g. `0.15.1`) makes CI publish the image; nothing else pushes it.
+`scripts/release.sh 0.15.1` runs all the `scripts/check.sh` checks and builds and checks the image locally before
 the tag goes out (crates/controller/Cargo.toml and the Kubernetes example above must name
 that version), and `scripts/release.sh 0.15.1 --pin <manifest>` afterwards waits for
 CI's image and pins its digest in a manifest.
+
+`.github/workflows/build.yml` checks that the tag matches the version in `crates/controller/Cargo.toml` (`scripts/version.sh`), runs the tests, publishes `ghcr.io/trexx/rust-apctl:<version>` and `:latest`, and then runs `scripts/image-check.sh` against the published image to check that it runs and reports that version.
+
+The tcpdump sidecar for shadow mode (the Dockerfile's `capture` stage) is versioned on its own: pushing a tag like `capture-0.1.2` publishes `ghcr.io/trexx/rust-apctl-capture:0.1.2` and `:latest` (`.github/workflows/build-capture.yml`).
+
+The IEEE manufacturer list (`oui/Dockerfile`) is published as `ghcr.io/trexx/rust-apctl-oui:latest` and `:<date>` once a month and when `oui/` changes on `main` (`.github/workflows/oui.yml`). The main Dockerfile pins `:latest` by digest; Renovate opens the digest bump, the Image workflow builds apctl with the new list, and the bump is automerged.
 
 ## License
 
