@@ -7,7 +7,9 @@
 # (vendor.rs), and the addresses are much of the file. A list much shorter than the
 # 40 000 names of 2026 is a cut-off download, not a published one.
 FROM docker.io/library/alpine:3.24@sha256:be2656061b536c1883c4034790e21d0a09c5aaaf51968b89368a3c0371ea2c9a AS fetch
-RUN for try in 1 2 3 4 5; do \
+# Fail the RUN when any command in a pipe fails, not just the last.
+SHELL ["/bin/ash", "-o", "pipefail", "-c"]
+RUN for _ in 1 2 3 4 5; do \
         wget -q -O /oui-full.csv https://standards-oui.ieee.org/oui/oui.csv && break; \
         rm -f /oui-full.csv; sleep 60; \
     done \
