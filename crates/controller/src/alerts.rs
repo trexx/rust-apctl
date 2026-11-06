@@ -896,10 +896,15 @@ struct Listed {
     read: bool,
 }
 
+/// Whether a stored alert is of a kind apctl still raises, as [`stored`] reads it.
+fn known(key: &str, entity: &str) -> bool {
+    Key::parse(key).is_some_and(|k| Entity::parse(k, entity).is_some())
+}
+
 /// The `limit` most recent alerts, newest first, with the unread count and the
 /// counts of all open alerts (`open`) and of the high ones among them (`open_high`,
 /// which turn the bell red). One of a kind apctl no longer raises is left out of
-/// the list and of the open counts (see [`stored`]).
+/// the list and of all three counts (see [`stored`]).
 fn recent(c: &rusqlite::Connection, limit: i64) -> anyhow::Result<Value> {
     let mut stmt = c.prepare_cached(LIST)?;
     let rows = stmt
@@ -909,14 +914,18 @@ fn recent(c: &rusqlite::Connection, limit: i64) -> anyhow::Result<Value> {
         }))?
         .filter_map(Result::transpose)
         .collect::<rusqlite::Result<Vec<_>>>()?;
-    let unread: i64 = c.query_row("SELECT COUNT(*) FROM alerts WHERE read = 0", [], |r| r.get(0))?;
     // Counted, not built: of a kind apctl still raises, as `stored` reads them.
+    let mut unread = 0;
+    let mut stmt = c.prepare_cached("SELECT key, entity FROM alerts WHERE read = 0")?;
+    let mut q = stmt.query([])?;
+    while let Some(r) = q.next()? {
+        unread += usize::from(known(r.get_ref(0)?.as_str()?, r.get_ref(1)?.as_str()?));
+    }
     let (mut open, mut open_high) = (0, 0);
     let mut stmt = c.prepare_cached(&format!("SELECT key, entity, severity {OPEN}"))?;
     let mut q = stmt.query([])?;
     while let Some(r) = q.next()? {
-        let (key, entity) = (r.get_ref(0)?.as_str()?, r.get_ref(1)?.as_str()?);
-        if Key::parse(key).is_some_and(|k| Entity::parse(k, entity).is_some()) {
+        if known(r.get_ref(0)?.as_str()?, r.get_ref(1)?.as_str()?) {
             open += 1;
             open_high += usize::from(Severity::parse(r.get_ref(2)?.as_str()?) == Some(Severity::High));
         }
@@ -1413,7 +1422,7 @@ mod tests {
         assert_eq!(again.book.seq, 99);
         // Listed as the UI reads them (web/src/api.ts's AlertItem); one apctl doesn't know is left out.
         let listed = w.store.read(Db::Config, |c| recent(c, 50)).unwrap();
-        assert_eq!((listed["alerts"].as_array().map(Vec::len), listed["unread"].as_i64()), (Some(2), Some(3)));
+        assert_eq!((listed["alerts"].as_array().map(Vec::len), listed["unread"].as_i64()), (Some(2), Some(2)), "nor counted unread");
         assert_eq!((listed["open"].as_i64(), listed["open_high"].as_i64()), (Some(2), Some(0)));
         // The open counts are of every open alert, not only of those listed; a high one counts apart.
         w.book.open(500, Alert::for_device(Key::ApOffline, Category::ApStatus, Severity::High, ap, "t".into(), "m".into()));
