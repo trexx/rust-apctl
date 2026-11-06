@@ -11,7 +11,7 @@ import {
   useEvents,
   useSeries,
 } from "../api";
-import { COLORS, Chart, SpanPage, moved, useTimeSpan } from "../components/Chart";
+import { COLORS, Chart, SpanPage, useTimeSpan } from "../components/Chart";
 import {
   Dot,
   ErrorNote,
@@ -31,6 +31,7 @@ import {
   compact,
   dbm,
   duration,
+  moved,
   rate,
   rates,
   useNow,
@@ -166,7 +167,7 @@ function ClientPage({ mac }: { mac: string }) {
       )}
 
       <QueryState q={series}>
-        {({ ts, fields: f }) => (
+        {({ tier, ts, fields: f }) => (
           <div className="grid2">
             <div className="panel">
               <Chart
@@ -217,14 +218,14 @@ function ClientPage({ mac }: { mac: string }) {
                     scale: 8,
                     color: COLORS.blue,
                     fill: true,
-                    summary: bytes(moved(ts, f.tx_bytes)),
+                    summary: bytes(moved(ts, f.tx_bytes, tier)),
                   },
                   {
                     label: "Up",
                     values: f.rx_bytes,
                     scale: 8,
                     color: COLORS.purple,
-                    summary: bytes(moved(ts, f.rx_bytes)),
+                    summary: bytes(moved(ts, f.rx_bytes, tier)),
                   },
                 ]}
               />

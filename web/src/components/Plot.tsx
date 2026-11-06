@@ -11,8 +11,7 @@ import uPlot from "uplot";
 import "uplot/dist/uPlot.min.css";
 import { spanBounds } from "../api";
 import type { TimeSpan } from "../api";
-import { dayTime } from "../format";
-import { typicalStep } from "./Chart";
+import { dayTime, typicalStep } from "../format";
 import { SpanContext, ZoomContext } from "./span";
 
 /** Breaks lines where samples are missing for much longer than usual (an AP
