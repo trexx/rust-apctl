@@ -287,6 +287,9 @@ pub struct Change {
 /// flag (`_running`) until done.
 async fn run(s: AppState, bands: Vec<String>, trigger: &'static str, _running: RunGuard) {
     for (band, b) in bands.iter().filter_map(|n| Some((n, Band::named(n)?))) {
+        // A scan asked for before the run (by hand) keeps its APs busy: once it is
+        // done, they scan this band too, and the plan reads this band's results.
+        wait_for_scans(&s).await;
         let scanned = start_scans(&mut s.live.write().unwrap(), b, clock::now_ts());
         tracing::info!("channel AI ({trigger}): {} APs scanning {band}", scanned.len());
         wait_for_scans(&s).await;
@@ -446,10 +449,15 @@ pub async fn scan(State(s): State<AppState>, Json(b): Json<BandBody>) -> Result<
     crate::api::require_active(&s, "this needs")?;
     let band = Band::named(&b.band).ok_or_else(|| ApiError::bad("band must be ng or na"))?;
     // A run waits for its own scans: one asked meanwhile would take their place.
-    if RUNNING.load(Ordering::SeqCst) {
-        return Err(ApiError::conflict("Channel AI is running"));
-    }
-    let asked = start_scans(&mut s.live.write().unwrap(), band, clock::now_ts());
+    // Told under the lock a run starts its scans with, so that a run starting
+    // now finds these scans and waits for them.
+    let asked = {
+        let mut live = s.live.write().unwrap();
+        if RUNNING.load(Ordering::SeqCst) {
+            return Err(ApiError::conflict("Channel AI is running"));
+        }
+        start_scans(&mut live, band, clock::now_ts())
+    };
     if asked.is_empty() {
         return Err(ApiError::conflict("no online AP can scan this band, or each is scanning already"));
     }
