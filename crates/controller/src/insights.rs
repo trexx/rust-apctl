@@ -850,7 +850,8 @@ fn wlan_history(vaps: &Loaded, from: Ts, bucket: Ts) -> BTreeMap<String, WlanAgg
             let e = a.series.entry(t - t % bucket).or_default().entry(vap).or_default();
             e.clients += v[num_sta].unwrap_or(0.0);
             e.samples += 1.0;
-            if let Some(x) = v[satisfaction].filter(|x| *x >= 0.0) {
+            // As "now": a score counts only while the SSID has clients.
+            if let Some(x) = v[satisfaction].filter(|x| *x >= 0.0 && v[num_sta].unwrap_or(0.0) > 0.0) {
                 a.sat.add(x);
             }
             if let Some(x) = v[signal].filter(|x| *x < -10.0) {
@@ -1128,6 +1129,21 @@ mod tests {
         let b = per["Home"].series[&0][&0];
         assert_eq!(b.averages(), (3.0, [100.0, 0.0]));
         assert_eq!(per["Home"].down, 2000.0);
+    }
+
+    #[test]
+    fn the_experience_average_leaves_out_samples_without_clients() {
+        // An SSID empty most of the window, scored 100 then: its clients' 60 and 70 are what counts.
+        let row = |t: Ts, sta: f64, sat: f64| {
+            let mut v = vec![None; VAP_COLS.len()];
+            v[col(VAP_COLS, "num_sta")] = Some(sta);
+            v[col(VAP_COLS, "satisfaction")] = Some(sat);
+            (t, v)
+        };
+        let mut vaps: Loaded = BTreeMap::new();
+        let rows = vec![row(0, 0.0, 100.0), row(10, 2.0, 60.0), row(20, 0.0, 100.0), row(30, 1.0, 70.0), row(40, 0.0, 100.0)];
+        vaps.insert("bss".into(), (vec!["ap".into(), "na".into(), "Guest".into()], Samples::from_rows(rows)));
+        assert_eq!(wlan_history(&vaps, 0, 60)["Guest"].sat.get(), Some(65.0));
     }
 
     #[test]

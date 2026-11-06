@@ -1295,7 +1295,7 @@
         "multicast_pct": 11.367239690032957,
         "peak_clients": 8.0,
         "satisfaction": null,
-        "satisfaction_avg": 73.0,
+        "satisfaction_avg": 71.0,
         "security_on_air": null,
         "series": {
           "clients": [
