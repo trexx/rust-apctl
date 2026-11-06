@@ -474,12 +474,6 @@ input.search {
   margin-top: 4px;
   padding-left: 70px;
 }
-/* uPlot's own stylesheet loads with the chart, after this one: this rule
-   takes precedence over its by being scoped to the chart. */
-.chart .uplot {
-  font-size: 12px;
-  color: var(--text);
-}
 /* A chart's legend: each series' value under the cursor, or its summary. */
 .chart-legend {
   display: flex;
