@@ -1,7 +1,8 @@
 # The manufacturer names (IEEE MAC address registry, public data), as an image of one
-# file, /oui.csv, that the main Dockerfile's `oui` stage pins by digest. Published
-# monthly by .github/workflows/oui.yml, so building apctl never downloads the list
-# and an IEEE outage fails only this month's refresh, which keeps the last list.
+# file, /oui.csv, that the main Dockerfile's `oui` stage pins by digest. Fetched
+# monthly by .github/workflows/oui.yml and published when it changed, so building apctl
+# never downloads the list and an IEEE outage fails only this month's refresh, which
+# keeps the last list.
 # (The IEEE server answers 418 to the HTTP client behind ADD <url>, so busybox wget
 # fetches it.) Each line is cut after the name: the controller reads no more
 # (vendor.rs), and the addresses are much of the file. A list much shorter than the
