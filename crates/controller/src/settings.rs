@@ -517,7 +517,7 @@ pub async fn device(State(s): State<AppState>, MacPath(mac): MacPath) -> Result<
     let advanced = mgmt_flag(&state, "advanced_feature_enabled");
     let antennas: Vec<Value> = inform.as_deref().and_then(|p| p["antenna_table"].as_array().cloned()).unwrap_or_default();
     let mut out = json!({
-        "mac": mac.to_string(), "model": d["model"], "radios": radios, "features": supported,
+        "mac": mac.to_string(), "radios": radios, "features": supported,
         "reported": inform.is_some(), "site_outdoor": site_outdoor, "advanced_features": advanced, "antennas": antennas,
     });
     if let Value::Object(o) = &mut out {
