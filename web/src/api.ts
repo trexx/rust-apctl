@@ -555,6 +555,9 @@ interface Activity {
   tx_retry_pct: (number | null)[];
   clients: number[];
   multicast_pct: (number | null)[];
+  /** Bytes moved in the window to and from clients: the counters' own increases, summed. */
+  download_bytes: number;
+  upload_bytes: number;
 }
 
 export interface SiteActivity {

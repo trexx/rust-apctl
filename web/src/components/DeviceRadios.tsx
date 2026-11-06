@@ -248,13 +248,13 @@ export function RadioActivity({
                 values: x.download_bps,
                 color: COLORS.blue,
                 fill: true,
-                summary: bytes(moved(x.ts, x.download_bps) / 8),
+                summary: bytes(x.download_bytes),
               },
               {
                 label: "From clients",
                 values: x.upload_bps,
                 color: COLORS.purple,
-                summary: bytes(moved(x.ts, x.upload_bps) / 8),
+                summary: bytes(x.upload_bytes),
               },
               {
                 label: "Clients",
