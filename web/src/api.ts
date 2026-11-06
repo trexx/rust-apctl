@@ -229,8 +229,6 @@ export interface CfgChange {
   added?: number;
   removed?: number;
   changed?: number;
-  /** A dry run's: the same key=value pairs, maybe in another order. */
-  same_content?: boolean;
 }
 
 interface RadioLevels {
@@ -283,10 +281,10 @@ export interface EventPayloads {
   client_steered: { signal?: number | null; result?: string | null; candidates?: { bssid: string; channel: number | null }[] };
   client_experience: { anomalies?: string[]; satisfaction?: number | null; signal?: number | null };
   /**
-   * `lines`: from the fault on (`source` "syslog"), or the last 200 lines of the AP's crash store ("crashlog", "recovery").
+   * `lines`: from the fault on, for one caught in the AP's syslog; else the last 200 lines of the crash or recovery report from the AP's crash store.
    * `summary`: the first fault line, else the first line (absent without lines).
    */
-  ap_crash: { process?: string | null; kind?: string | null; source?: string; lines?: string[]; summary?: string };
+  ap_crash: { process?: string | null; kind?: string | null; lines?: string[]; summary?: string };
   /** The AP's notification. `exit_status`: its exit code as a number (left out when it sent none, or none that is a number). */
   ap_process_restarted: { proc?: string | null; exit_status?: number; caller?: string | null };
   ap_isolated: { heard_by?: Mac | null };
