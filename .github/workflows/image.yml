@@ -25,6 +25,20 @@ jobs:
       contents: 'read'
     steps:
       - uses: 'trexx/actions/.github/actions/checkout@main'
-      - run: 'docker build --target runtime --tag apctl:check .'
+      # The layers are cached between runs, in the scope the release build (build.yml)
+      # shares: a bump of an image only the runtime stage uses (distroless, the
+      # manufacturer list) or of one --target runtime never builds (the capture stage's
+      # alpine) reuses the built controller. The Dockerfile's cache mounts are not part
+      # of that cache: a stage that does run compiles from scratch.
+      - uses: 'docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069' # v4.4.1
+      - uses: 'docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc' # v7.4.0
+        with:
+          context: '.'
+          target: 'runtime'
+          tags: 'apctl:check'
+          load: true
+          provenance: false
+          cache-from: 'type=gha,scope=apctl'
+          cache-to: 'type=gha,scope=apctl,mode=max'
       - name: 'The image runs and reports the crate version'
         run: 'scripts/image-check.sh apctl:check'

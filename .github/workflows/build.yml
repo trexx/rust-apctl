@@ -39,6 +39,8 @@ jobs:
       # Every release stays published: the README tells people to pin a version, and the
       # shared pruning keeps only the newest two. The prune job below deletes untagged images.
       prune_images: false
+      # The Image workflow's layer cache (image.yml), which a tag can read from main.
+      cache_scope: 'apctl'
 
   # The image CI published runs and reports the version, before release.sh --pin pins it.
   check:

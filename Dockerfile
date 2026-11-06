@@ -30,9 +30,10 @@ RUN for c in crates/*; do \
         done; \
     done
 
-# The registry and target directory persist between builds (BuildKit cache
-# mounts), so a code change recompiles our crates, not every dependency. The
-# target directory is not part of the image: the binary is copied out of it.
+# The registry and target directory persist between builds on one machine (BuildKit
+# cache mounts), so a code change recompiles our crates, not every dependency. CI's
+# layer cache does not carry them. The target directory is not part of the image: the
+# binary is copied out of it.
 # CARGO_BUILD_JOBS limits cargo on a machine short of memory (--build-arg).
 # cargo auditable embeds the list of crates in the binary, where the image scan
 # (.github/workflows/trivy.yml) reads it: the scan covers exactly the crates that ship.
