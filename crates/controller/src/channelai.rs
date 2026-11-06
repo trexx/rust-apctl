@@ -472,9 +472,22 @@ pub struct RunBody {
 /// POST /api/rf/channel-ai/run {bands?}: scan, plan and apply now.
 pub async fn run_now(State(s): State<AppState>, Json(b): Json<RunBody>) -> Result<Json<Value>, ApiError> {
     crate::api::require_active(&s, "this needs")?;
+    // Named bands must all be ones a run handles; without, the setting's that are.
+    let bands = match b.bands {
+        Some(mut list) => {
+            if list.iter().any(|n| Band::named(n).is_none()) {
+                return Err(ApiError::bad("bands can be ng and na"));
+            }
+            dedup_in_order(&mut list);
+            list
+        }
+        None => settings(s.live.read().unwrap().state.as_deref()).radios.into_iter().filter(|n| Band::named(n).is_some()).collect(),
+    };
+    if bands.is_empty() {
+        return Err(ApiError::bad("no band to run Channel AI on"));
+    }
     // Taken here, so that of two requests at once only one is told it started.
     let guard = RunGuard::take().ok_or_else(|| ApiError::conflict("Channel AI is already running"))?;
-    let bands = b.bands.unwrap_or_else(|| settings(s.live.read().unwrap().state.as_deref()).radios);
     tokio::spawn(run(s.clone(), bands, "manual", guard));
     Ok(Json(json!({ "started": true })))
 }
@@ -814,5 +827,17 @@ mod tests {
         assert_eq!((ok.changes[0].to, ok.changes[0].from), (36, Some(44)));
         assert!(serde_json::from_value::<ApplyBody>(json!({ "band": "na", "changes": [{ "mac": "02:00:00:00:00:01", "to": null }] })).is_err());
         assert!(serde_json::from_value::<ApplyBody>(json!({ "band": "na", "changes": [{ "to": 36 }] })).is_err());
+    }
+
+    #[tokio::test]
+    async fn a_run_of_no_band_it_handles_is_refused() {
+        let (mut app, _engine, _dir) = crate::api::tests::state();
+        app.get_mut().active = true;
+        for bands in [json!(["6e"]), json!(["ng", "x"]), json!([])] {
+            let body = serde_json::from_value(json!({ "bands": bands })).unwrap();
+            let Err(e) = run_now(State(app.clone()), Json(body)).await else { panic!("{bands} started") };
+            assert_eq!(e.0, axum::http::StatusCode::BAD_REQUEST, "{bands}");
+            assert!(!RUNNING.load(Ordering::SeqCst), "{bands}: the run flag is not held");
+        }
     }
 }
