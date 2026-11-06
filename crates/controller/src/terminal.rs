@@ -22,6 +22,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::api::{ApiError, AppState, MacPath};
+use crate::auth::SessionId;
 use crate::clock;
 use crate::engine::{Event, EventKind};
 use crate::ssh::Failure;
@@ -49,24 +50,21 @@ impl Size {
     }
 }
 
-/// GET /api/devices/{mac}/terminal?cols=&rows= (a WebSocket).
+/// GET /api/devices/{mac}/terminal?cols=&rows= (a WebSocket, for pages of
+/// this server: see the socket router).
 pub async fn open(
     State(s): State<AppState>,
     MacPath(mac): MacPath,
-    headers: axum::http::HeaderMap,
     uri: axum::http::Uri,
-    peer: Option<axum::Extension<axum::extract::ConnectInfo<std::net::SocketAddr>>>,
-    session: Option<axum::Extension<crate::auth::SessionId>>,
+    session: Option<axum::Extension<SessionId>>,
     upgrade: WebSocketUpgrade,
 ) -> Response {
-    if !s.auth.same_origin(&headers, peer.map(|p| p.0.0.ip()), uri.authority().map(|a| a.as_str())) {
-        return ApiError::forbidden("a terminal is only for pages of this server").into_response();
-    }
     let size = match Query::<Size>::try_from_uri(&uri) {
         Ok(Query(size)) => size,
         Err(e) => return ApiError::from(e).into_response(),
     };
-    let session = session.map(|s| s.0.0);
+    // Always there: the route is withheld in read-only mode, which has no sessions.
+    let Some(axum::Extension(session)) = session else { return ApiError::forbidden("a terminal needs a login").into_response() };
     upgrade.max_message_size(MAX_FRAME).on_upgrade(move |socket| terminal(socket, s, mac, size, session))
 }
 
@@ -107,10 +105,10 @@ enum End {
 }
 
 /// Runs a terminal, then tells the page why it ended.
-async fn terminal(mut socket: WebSocket, s: AppState, mac: Mac, size: Size, session: Option<String>) {
+async fn terminal(mut socket: WebSocket, s: AppState, mac: Mac, size: Size, session: SessionId) {
     let end = match (OPEN.try_acquire(), target(&s, &mac)) {
         (Err(_), _) => Err("too many terminals are open: close one first".into()),
-        (Ok(_open), Ok(t)) => bridge(&mut socket, &s, mac, t, &size, session.as_deref()).await,
+        (Ok(_open), Ok(t)) => bridge(&mut socket, &s, mac, t, &size, &session).await,
         (Ok(_), Err(e)) => Err(e),
     };
     finish(socket, end).await;
@@ -134,7 +132,7 @@ async fn finish(mut socket: WebSocket, end: Result<End, String>) {
 
 /// Logs in to the AP, starts its shell, and carries the terminal both ways
 /// until one side ends it.
-async fn bridge(socket: &mut WebSocket, s: &AppState, mac: Mac, t: Target, size: &Size, session: Option<&str>) -> Result<End, String> {
+async fn bridge(socket: &mut WebSocket, s: &AppState, mac: Mac, t: Target, size: &Size, session: &SessionId) -> Result<End, String> {
     // Kept open while nothing is typed; keepalives notice an AP that went away.
     let config = Arc::new(russh::client::Config { keepalive_interval: Some(Duration::from_secs(30)), keepalive_max: 3, ..Default::default() });
     let ssh = match crate::ssh::connect(config, &t.ip, t.port, &t.logins, Some(t.expected)).await {
@@ -156,14 +154,13 @@ async fn bridge(socket: &mut WebSocket, s: &AppState, mac: Mac, t: Target, size:
         Ok(Err(e)) => return Err(format!("could not start a shell on the AP: {e}")),
         Err(_) => return Err("could not start a shell on the AP: timed out".into()),
     };
-    let user = session.and_then(|h| s.auth.user(h));
-    s.note(Event::device(clock::now_ts(), EventKind::ApTerminalOpened, mac, json!({ "user": user }))).await;
-    tracing::info!("{mac}: terminal opened by {}", user.as_deref().unwrap_or("?"));
+    s.note(Event::device(clock::now_ts(), EventKind::ApTerminalOpened, mac, json!({ "user": session.user }))).await;
+    tracing::info!("{mac}: terminal opened by {}", session.user);
     if socket.send(Message::Text(Utf8Bytes::from_static(r#"{"connected":true}"#))).await.is_err() {
         return Ok(End::Gone);
     }
     let (mut output, input) = ch.split();
-    let ended = crate::api::session_ends(&s.auth, session);
+    let ended = crate::api::session_ends(&s.auth, Some(&session.hash));
     let idle = tokio::time::sleep(IDLE);
     tokio::pin!(ended, idle);
     let end = loop {
@@ -289,6 +286,7 @@ mod tests {
         let (s, mut engine, _dir) = crate::api::tests::state();
         let mac: Mac = "02:00:00:00:00:01".parse().unwrap();
         let logins = vec![("ubnt".to_string(), "wrong".to_string()), ("ubnt".to_string(), "ubnt".to_string())];
+        let session = s.auth.session_of(&s.auth.create("admin")).unwrap();
         let app = axum::Router::new()
             .route(
                 "/t/{key}",
@@ -296,7 +294,7 @@ mod tests {
                     let expected = if key == "known" { fingerprint } else { "SHA256:other".into() };
                     let t = Target { ip: "127.0.0.1".into(), port, expected, logins };
                     upgrade.on_upgrade(move |mut socket| async move {
-                        let end = bridge(&mut socket, &s, mac, t, &Size { cols: Some(100), rows: Some(30) }, None).await;
+                        let end = bridge(&mut socket, &s, mac, t, &Size { cols: Some(100), rows: Some(30) }, &session).await;
                         finish(socket, end).await;
                     })
                 }),

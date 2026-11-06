@@ -138,7 +138,7 @@ pub struct Auth {
     failures: Mutex<Failures>,
     writer: Writer,
     proxies: Arc<Proxies>,
-    /// Told of every logout, so open live sockets check their session at once.
+    /// Told of every logout, so the open sockets (the live one, terminals) check their session at once.
     logouts: tokio::sync::watch::Sender<()>,
 }
 
@@ -185,9 +185,9 @@ impl Auth {
         token
     }
 
-    /// Returns the session of a valid session token and its user, extending it,
+    /// Returns the session of a valid session token (with its user), extending it,
     /// and whether it was extended (the browser's cookie then needs the new expiry too).
-    fn check(&self, token: &str) -> Option<(SessionId, String, bool)> {
+    fn check(&self, token: &str) -> Option<(SessionId, bool)> {
         let hash = token_hash(token);
         let now = clock::now_ts();
         let mut sessions = self.sessions.lock().unwrap();
@@ -203,7 +203,13 @@ impl Auth {
             self.writer.exec(Db::Config, "UPDATE sessions SET expires = ?1 WHERE token_hash = ?2", vec![Sql::Integer(s.expires), Sql::Text(hash.clone())]);
         }
         let user = s.user.clone();
-        Some((SessionId(hash), user, extend))
+        Some((SessionId { hash, user }, extend))
+    }
+
+    /// The session of a token, as `require_login` hands it on.
+    #[cfg(test)]
+    pub(crate) fn session_of(&self, token: &str) -> Option<SessionId> {
+        self.check(token).map(|(session, _)| session)
     }
 
     /// Makes a session look `secs` older (its expiry that much nearer).
@@ -217,11 +223,6 @@ impl Auth {
         self.logouts.subscribe()
     }
 
-    /// The user of a session (by its hash), while it is still there.
-    pub(crate) fn user(&self, hash: &str) -> Option<String> {
-        self.sessions.lock().unwrap().get(hash).filter(|s| s.expires > clock::now_ts()).map(|s| s.user.clone())
-    }
-
     /// Whether a session (by its hash) is still there: not logged out, not expired.
     pub(crate) fn alive(&self, hash: &str) -> bool {
         self.sessions.lock().unwrap().get(hash).is_some_and(|s| s.expires > clock::now_ts())
@@ -233,7 +234,7 @@ impl Auth {
     /// Origin must name the host the request was sent to: the Host header, or
     /// X-Forwarded-Host from a trusted proxy. A handshake without an Origin
     /// is not from a browser page, and is let through.
-    pub(crate) fn same_origin(&self, headers: &HeaderMap, peer: Option<IpAddr>, authority: Option<&str>) -> bool {
+    fn same_origin(&self, headers: &HeaderMap, peer: Option<IpAddr>, authority: Option<&str>) -> bool {
         let Some(origin) = headers.get(header::ORIGIN) else { return true };
         let forwarded = || headers.get_all("x-forwarded-host").iter().filter_map(|v| v.to_str().ok()).flat_map(|v| v.split(',')).next_back().map(str::trim);
         let host = peer.filter(|p| self.proxies.contains(*p)).and_then(|_| forwarded()).or_else(|| headers.get(header::HOST)?.to_str().ok()).or(authority);
@@ -411,17 +412,21 @@ fn peer_of(extensions: &axum::http::Extensions) -> Option<IpAddr> {
     extensions.get::<ConnectInfo<SocketAddr>>().map(|c| c.0.ip())
 }
 
-/// The session a request was let in with (its token's hash): `require_login`
-/// puts it in the request's extensions, for the handlers that keep checking it
-/// (the live socket). None in read-only mode, which has no sessions.
+/// The session a request was let in with: `require_login` puts it in the
+/// request's extensions, for the sockets that keep checking it (the live one,
+/// terminals) and say who opened them. None in read-only mode, which has no sessions.
 #[derive(Clone, Debug, PartialEq)]
-pub struct SessionId(pub String);
+pub struct SessionId {
+    /// Its token's hash, as [`Auth::alive`] takes it.
+    pub hash: String,
+    pub user: String,
+}
 
-/// The request's first valid session and its user, if any; and the cookie to
-/// send again when using it extended it (see `renewed`).
-fn session(auth: &Auth, headers: &HeaderMap, peer: Option<IpAddr>) -> Option<(SessionId, String, Option<String>)> {
-    let (token, (session, user, extended)) = session_tokens(headers).find_map(|t| Some((t, auth.check(t)?)))?;
-    Some((session, user, extended.then(|| cookie(auth, headers, peer, token, SESSION_SECS))))
+/// The request's first valid session, if any; and the cookie to send again
+/// when using it extended it (see `renewed`).
+fn session(auth: &Auth, headers: &HeaderMap, peer: Option<IpAddr>) -> Option<(SessionId, Option<String>)> {
+    let (token, (session, extended)) = session_tokens(headers).find_map(|t| Some((t, auth.check(t)?)))?;
+    Some((session, extended.then(|| cookie(auth, headers, peer, token, SESSION_SECS))))
 }
 
 /// For the routes that hand out secrets (Wi-Fi passphrases, and backups, which
@@ -430,6 +435,16 @@ fn session(auth: &Auth, headers: &HeaderMap, peer: Option<IpAddr>) -> Option<(Se
 pub async fn withhold_in_read_only(State(s): State<AppState>, req: Request, next: Next) -> Result<Response, ApiError> {
     if !s.auth.enabled() {
         return Err(ApiError::forbidden("this needs a login: no users are configured (see --users-file)"));
+    }
+    Ok(next.run(req).await)
+}
+
+/// For the WebSockets (the live one, terminals): only pages of this server
+/// may open them (see [`Auth::same_origin`]). Set on their router, so a new
+/// one cannot be missed.
+pub async fn pages_only(State(s): State<AppState>, req: Request, next: Next) -> Result<Response, ApiError> {
+    if !s.auth.same_origin(req.headers(), peer_of(req.extensions()), req.uri().authority().map(|a| a.as_str())) {
+        return Err(ApiError::forbidden("this socket is only for pages of this server"));
     }
     Ok(next.run(req).await)
 }
@@ -460,7 +475,7 @@ pub async fn require_login(State(s): State<AppState>, mut req: Request, next: Ne
     }
     match session(&s.auth, req.headers(), peer_of(req.extensions())) {
         Some(_) if mutating && !csrf_ok(req.headers()) => Err(csrf_refused()),
-        Some((session, _, cookie)) => {
+        Some((session, cookie)) => {
             req.extensions_mut().insert(session);
             Ok(renewed(next.run(req).await, cookie))
         }
@@ -546,7 +561,7 @@ pub async fn me(State(s): State<AppState>, req: Request) -> Response {
         return Json(json!({ "auth": false, "user": null, "read_only": true })).into_response();
     }
     match session(&s.auth, req.headers(), peer_of(req.extensions())) {
-        Some((_, user, cookie)) => renewed(Json(json!({ "auth": true, "user": user, "read_only": false })).into_response(), cookie),
+        Some((session, cookie)) => renewed(Json(json!({ "auth": true, "user": session.user, "read_only": false })).into_response(), cookie),
         None => (StatusCode::UNAUTHORIZED, Json(json!({ "auth": true, "user": null }))).into_response(),
     }
 }
@@ -602,7 +617,7 @@ mod tests {
         let auth = Auth::new(users, &t.store, t.writer, Default::default()).unwrap();
         let token = auth.create("admin");
         assert_eq!(token.len(), 64);
-        assert_eq!(auth.check(&token), Some((SessionId(token_hash(&token)), "admin".into(), false)), "new: not extended yet");
+        assert_eq!(auth.check(&token), Some((SessionId { hash: token_hash(&token), user: "admin".into() }, false)), "new: not extended yet");
         assert!(!auth.sessions.lock().unwrap().contains_key(&token), "only the hash is stored");
         assert_eq!(auth.check("forged"), None);
         // Only a session that was there is announced to the live sockets.
