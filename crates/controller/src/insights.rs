@@ -144,7 +144,8 @@ fn on_band<'a>(vaps: &'a Loaded, band: Option<&'a str>) -> impl Iterator<Item = 
 }
 
 /// [`activity`]'s figures from the SSIDs' counters ([`VAP_COLS`]): bucketed
-/// traffic, retries, multicast and clients, and with `packets` (one AP's
+/// traffic, retries, multicast and clients, the bytes moved each way over the
+/// window (counted as [`wlans`] counts them), and with `packets` (one AP's
 /// radio chart shows them) the packet rates and drops.
 fn vap_activity<'a>(vaps: impl Iterator<Item = &'a (Vec<String>, Samples)>, from: Ts, bucket: Ts, packets: bool) -> Value {
     let [tx_bytes, rx_bytes, tx_packets, rx_packets, tx_mcast, rx_mcast, tx_bcast, rx_bcast, tx_dropped, num_sta] =
@@ -161,8 +162,11 @@ fn vap_activity<'a>(vaps: impl Iterator<Item = &'a (Vec<String>, Samples)>, from
     const DROPPED: usize = 7;
     const MCAST: usize = 8;
     let mut per: BTreeMap<Ts, HashMap<usize, Bucket<9>>> = BTreeMap::new();
+    let (mut down_bytes, mut up_bytes) = (0.0, 0.0);
     for (vap, (_, samples)) in vaps.enumerate() {
         for d in deltas(samples, from) {
+            down_bytes += d.inc(tx_bytes).unwrap_or(0.0);
+            up_bytes += d.inc(rx_bytes).unwrap_or(0.0);
             let a = per.entry(d.ts - d.ts % bucket).or_default().entry(vap).or_default();
             let g = |i: usize| d.rate(i).unwrap_or(0.0);
             let r = &mut a.rates;
@@ -205,7 +209,10 @@ fn vap_activity<'a>(vaps: impl Iterator<Item = &'a (Vec<String>, Samples)>, from
         mcast.push(if p + rp > 0.0 { Some((100.0 * mc / (p + rp)).min(100.0)) } else { None });
         clients.push(cl);
     }
-    let mut out = json!({ "ts": ts, "download_bps": down, "upload_bps": up, "tx_retry_pct": retry, "clients": clients, "multicast_pct": mcast });
+    let mut out = json!({
+        "ts": ts, "download_bps": down, "upload_bps": up, "tx_retry_pct": retry, "clients": clients, "multicast_pct": mcast,
+        "download_bytes": down_bytes, "upload_bytes": up_bytes,
+    });
     if packets {
         out["tx_pps"] = json!(tx_pps);
         out["rx_pps"] = json!(rx_pps);
@@ -1540,6 +1547,22 @@ mod tests {
             let on = |w: &Value| w["broadcast"].as_array().unwrap().iter().map(|b| b["ap"].as_str().unwrap().to_string()).collect::<std::collections::BTreeSet<_>>();
             let wlans = wlans["wlans"].as_array().unwrap();
             assert!(wlans.iter().any(|w| on(w).contains(A1)) && wlans.iter().all(|w| !on(w).contains(A2)), "{wlans:?}");
+        }
+
+        #[tokio::test]
+        async fn activity_moves_the_bytes_the_networks_page_counts() {
+            let (s, base, _t) = site();
+            let q = |mac: Option<&str>| Query(RangeQuery { range: None, from: Some(base), to: Some(base + 3600), band: None, mac: mac.map(|m| m.parse().unwrap()) });
+            let site_wide = ok(activity(State(s.clone()), q(None), Query(Default::default())).await);
+            let wlans = ok(wlans(State(s.clone()), q(None)).await);
+            let sum = |k: &str| wlans["wlans"].as_array().unwrap().iter().map(|w| w[k].as_f64().unwrap()).sum::<f64>();
+            let (down, up) = (sum("download_bytes"), sum("upload_bytes"));
+            assert!(down > 0.0 && up > 0.0);
+            assert_eq!((site_wide["activity"]["download_bytes"].as_f64(), site_wide["activity"]["upload_bytes"].as_f64()), (Some(down), Some(up)));
+            let parts: ActivityParts = serde_json::from_value(json!({ "parts": "activity" })).unwrap();
+            let one = ok(activity(State(s), q(Some(A1)), Query(parts)).await);
+            let (d, u) = (one["activity"]["download_bytes"].as_f64().unwrap(), one["activity"]["upload_bytes"].as_f64().unwrap());
+            assert!(d > 0.0 && d < down && u > 0.0 && u < up, "one AP's share: {d} {u}");
         }
 
         #[tokio::test]
