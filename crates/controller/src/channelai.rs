@@ -287,6 +287,9 @@ pub struct Change {
 /// flag (`_running`) until done.
 async fn run(s: AppState, bands: Vec<String>, trigger: &'static str, _running: RunGuard) {
     for (band, b) in bands.iter().filter_map(|n| Some((n, Band::named(n)?))) {
+        // A scan asked for before the run (by hand) keeps its APs busy: once it is
+        // done, they scan this band too, and the plan reads this band's results.
+        wait_for_scans(&s).await;
         let scanned = start_scans(&mut s.live.write().unwrap(), b, clock::now_ts());
         tracing::info!("channel AI ({trigger}): {} APs scanning {band}", scanned.len());
         wait_for_scans(&s).await;
@@ -446,10 +449,15 @@ pub async fn scan(State(s): State<AppState>, Json(b): Json<BandBody>) -> Result<
     crate::api::require_active(&s, "this needs")?;
     let band = Band::named(&b.band).ok_or_else(|| ApiError::bad("band must be ng or na"))?;
     // A run waits for its own scans: one asked meanwhile would take their place.
-    if RUNNING.load(Ordering::SeqCst) {
-        return Err(ApiError::conflict("Channel AI is running"));
-    }
-    let asked = start_scans(&mut s.live.write().unwrap(), band, clock::now_ts());
+    // Told under the lock a run starts its scans with, so that a run starting
+    // now finds these scans and waits for them.
+    let asked = {
+        let mut live = s.live.write().unwrap();
+        if RUNNING.load(Ordering::SeqCst) {
+            return Err(ApiError::conflict("Channel AI is running"));
+        }
+        start_scans(&mut live, band, clock::now_ts())
+    };
     if asked.is_empty() {
         return Err(ApiError::conflict("no online AP can scan this band, or each is scanning already"));
     }
@@ -464,9 +472,22 @@ pub struct RunBody {
 /// POST /api/rf/channel-ai/run {bands?}: scan, plan and apply now.
 pub async fn run_now(State(s): State<AppState>, Json(b): Json<RunBody>) -> Result<Json<Value>, ApiError> {
     crate::api::require_active(&s, "this needs")?;
+    // Named bands must all be ones a run handles; without, the setting's that are.
+    let bands = match b.bands {
+        Some(mut list) => {
+            if list.iter().any(|n| Band::named(n).is_none()) {
+                return Err(ApiError::bad("bands can be ng and na"));
+            }
+            dedup_in_order(&mut list);
+            list
+        }
+        None => settings(s.live.read().unwrap().state.as_deref()).radios.into_iter().filter(|n| Band::named(n).is_some()).collect(),
+    };
+    if bands.is_empty() {
+        return Err(ApiError::bad("no band to run Channel AI on"));
+    }
     // Taken here, so that of two requests at once only one is told it started.
     let guard = RunGuard::take().ok_or_else(|| ApiError::conflict("Channel AI is already running"))?;
-    let bands = b.bands.unwrap_or_else(|| settings(s.live.read().unwrap().state.as_deref()).radios);
     tokio::spawn(run(s.clone(), bands, "manual", guard));
     Ok(Json(json!({ "started": true })))
 }
@@ -551,11 +572,9 @@ pub fn apply_settings(state: &mut Value, p: &Value) -> Result<String, String> {
     }
     // The allowed channels follow the country, blacklist and DFS choice.
     let blacklist = r["channels_blacklist"].as_array().cloned().unwrap_or_default();
-    let blacklisted = |band: &str, ch: i64| {
-        blacklist.iter().any(|b| {
-            b["radio"].as_str() == Some(band) && num(&b["channel"]) == Some(ch) && num(&b["channel_width"]).is_none_or(|w| w == 20)
-        })
-    };
+    // An entry blacklists its channel on its band whatever width it names, as the
+    // official recomputation and the AP's own channel selection (`blklst`) read it.
+    let blacklisted = |band: &str, ch: i64| blacklist.iter().any(|b| b["radio"].as_str() == Some(band) && num(&b["channel"]) == Some(ch));
     let dfs = apcfg::radio_ai_na_dfs(r);
     for band in BANDS.iter().map(|b| b.radio) {
         let chans: Vec<String> = allowed_channels(c, band, 20, false).into_iter().filter(|ch| !blacklisted(band, *ch) && (dfs || !apcfg::is_dfs_channel(*ch))).map(|ch| ch.to_string()).collect();
@@ -622,12 +641,13 @@ mod tests {
         assert!(r["channels_na"].as_array().unwrap().iter().any(|c| c == "100"));
         // ng: Germany's 1-13 minus the blacklist (2 and 13 here).
         assert_eq!(r["channels_ng"].as_array().unwrap().len(), 11);
-        // An entry for another width (stored as a number or as text) is not a 20 MHz one.
+        // An entry for any width (the channel stored as a number or as text) leaves its channel out.
         let mut t = state();
-        t["setting"][2]["channels_blacklist"] = json!([{ "radio": "ng", "channel": "2", "channel_width": 40 }, { "radio": "ng", "channel": 3, "channel_width": 20 }]);
+        t["setting"][2]["channels_blacklist"] = json!([{ "radio": "ng", "channel": "2", "channel_width": 40 }, { "radio": "ng", "channel": 3, "channel_width": "20" }, { "radio": "na", "channel": "44", "channel_width": "80" }]);
         apply_settings(&mut t, &json!({ "hour": 4 })).unwrap();
-        let ng = |t: &Value| radio_ai(t).unwrap()["channels_ng"].as_array().unwrap().iter().filter_map(|c| c.as_str().map(str::to_string)).collect::<Vec<_>>();
-        assert!(ng(&t).contains(&"2".to_string()) && !ng(&t).contains(&"3".to_string()), "{:?}", ng(&t));
+        let list = |t: &Value, band: &str| radio_ai(t).unwrap()[format!("channels_{band}")].as_array().unwrap().iter().filter_map(|c| c.as_str().map(str::to_string)).collect::<Vec<_>>();
+        assert!(!list(&t, "ng").iter().any(|c| c == "2" || c == "3") && list(&t, "ng").len() == 11, "{:?}", list(&t, "ng"));
+        assert!(!list(&t, "na").contains(&"44".to_string()) && list(&t, "na").contains(&"48".to_string()), "{:?}", list(&t, "na"));
         assert!(apply_settings(&mut s, &json!({ "hour": 24 })).is_err());
         // Each band once; anything but a band's name is refused.
         apply_settings(&mut s, &json!({ "radios": ["na", "na"] })).unwrap();
@@ -806,5 +826,17 @@ mod tests {
         assert_eq!((ok.changes[0].to, ok.changes[0].from), (36, Some(44)));
         assert!(serde_json::from_value::<ApplyBody>(json!({ "band": "na", "changes": [{ "mac": "02:00:00:00:00:01", "to": null }] })).is_err());
         assert!(serde_json::from_value::<ApplyBody>(json!({ "band": "na", "changes": [{ "to": 36 }] })).is_err());
+    }
+
+    #[tokio::test]
+    async fn a_run_of_no_band_it_handles_is_refused() {
+        let (mut app, _engine, _dir) = crate::api::tests::state();
+        app.get_mut().active = true;
+        for bands in [json!(["6e"]), json!(["ng", "x"]), json!([])] {
+            let body = serde_json::from_value(json!({ "bands": bands })).unwrap();
+            let Err(e) = run_now(State(app.clone()), Json(body)).await else { panic!("{bands} started") };
+            assert_eq!(e.0, axum::http::StatusCode::BAD_REQUEST, "{bands}");
+            assert!(!RUNNING.load(Ordering::SeqCst), "{bands}: the run flag is not held");
+        }
     }
 }

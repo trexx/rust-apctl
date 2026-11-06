@@ -204,9 +204,15 @@ pub(crate) fn ap_name_of(live: &Live, mac: &inform::Mac) -> Option<String> {
     }
 }
 
-/// Our APs' SSIDs (BSSIDs), with the AP of each.
-pub(crate) fn own_bssids(live: &Live) -> impl Iterator<Item = (&inform::Mac, &crate::model::VapSample)> {
-    live.devices.iter().flat_map(|(m, d)| d.snapshot.vaps.iter().map(move |v| (m, v)))
+/// Our APs' SSIDs (BSSIDs), each with its AP's MAC: the live SSIDs', then those
+/// `used` names an AP for ([`crate::threats::ThreatState::used_bssids`]: also
+/// those of APs not heard from in this run, and retired ones).
+pub(crate) fn own_bssid_map(live: &Live, used: &[crate::threats::UsedBss]) -> HashMap<String, String> {
+    let mut own: HashMap<String, String> = live.devices.iter().flat_map(|(m, d)| d.snapshot.vaps.iter().map(move |v| (v.bssid.clone(), m.to_string()))).collect();
+    for (bssid, ap, _) in used.iter().filter(|u| !u.1.is_empty()) {
+        own.entry(bssid.clone()).or_insert_with(|| ap.clone());
+    }
+    own
 }
 
 /// A client's display name: the alias given in apctl, else the host name it
