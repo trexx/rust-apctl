@@ -1,7 +1,8 @@
-//! Adopting an AP over SSH ("adopt by IP"), for an AP that informs somewhere
-//! else (e.g. a reset AP whose "unifi" DNS name points at another controller).
+//! SSH to the APs: adopting one ("adopt by IP"), for an AP that informs
+//! somewhere else (e.g. a reset AP whose "unifi" DNS name points at another
+//! controller), and the sessions a terminal runs its shell in (see `terminal.rs`).
 //!
-//! As the official controller does it: log in with the given credentials
+//! Adoption, as the official controller does it: log in with the given credentials
 //! (else the site's device credentials, else the factory ones), and run
 //! `/usr/bin/syswrapper.sh set-adopt <inform url> <key>`: the AP then informs
 //! here with its new key. apctl first reads the AP's MAC (and model) so it can
@@ -33,13 +34,14 @@ pub fn inform_url(s: &AppState) -> Option<String> {
     live.state.as_deref()?["devices"].as_array()?.iter().find_map(|d| d["inform_url"].as_str().filter(|u| u.starts_with("http")).map(str::to_string))
 }
 
-/// Whether adopting over SSH can work: active mode and an inform URL to give.
+/// What adopting over SSH would point the AP to: none when apctl doesn't know
+/// (it then cannot adopt this way; it also needs active mode, which the page
+/// learns from /api/status).
 pub fn available(s: &AppState) -> Value {
-    let url = inform_url(s);
-    json!({ "possible": s.active && url.is_some(), "inform_url": url })
+    json!({ "inform_url": inform_url(s) })
 }
 
-pub(crate) struct Client {
+struct Client {
     /// The fingerprint the server must present, if known.
     expected: Option<String>,
     seen: Arc<Mutex<Option<String>>>,
@@ -59,13 +61,14 @@ impl russh::client::Handler for Client {
     }
 }
 
-/// Why an SSH adoption failed, as the official controller tells them apart.
+/// Why an SSH adoption failed, as the official controller tells them apart, or a terminal (`Shell`).
 #[derive(Debug, PartialEq)]
 pub(crate) enum Failure {
     Unreachable(String),
     Login,
     HostKey,
     Command(String),
+    Shell(String),
 }
 
 impl std::fmt::Display for Failure {
@@ -73,15 +76,16 @@ impl std::fmt::Display for Failure {
         match self {
             Failure::Unreachable(e) => write!(f, "could not reach the AP over SSH: {e}"),
             Failure::Login => write!(f, "the AP refused the username and password"),
-            Failure::HostKey => write!(f, "the AP's SSH host key changed since last time"),
+            Failure::HostKey => write!(f, "the AP's SSH host key isn't the one apctl knows for it"),
             Failure::Command(e) => write!(f, "the command failed on the AP: {e}"),
+            Failure::Shell(e) => write!(f, "could not start a shell on the AP: {e}"),
         }
     }
 }
 
 /// An SSH session to an AP.
 pub(crate) struct Session {
-    pub(crate) handle: russh::client::Handle<Client>,
+    handle: russh::client::Handle<Client>,
     fingerprint: Option<String>,
 }
 
@@ -89,6 +93,8 @@ pub(crate) struct Session {
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 /// How long each later step (a login attempt, a command) may take.
 const STEP_TIMEOUT: Duration = Duration::from_secs(15);
+/// How long starting a shell may take, once logged in.
+const SHELL_TIMEOUT: Duration = Duration::from_secs(15);
 /// The most a command may print: what the AP prints is short, and another
 /// host at that address could send anything.
 const MAX_OUTPUT: usize = 64 << 10;
@@ -111,6 +117,18 @@ async fn open(config: &Arc<russh::client::Config>, ip: &str, port: u16, expected
 /// For running commands: a session quiet for 20 s has lost its AP.
 fn command_config() -> Arc<russh::client::Config> {
     Arc::new(russh::client::Config { inactivity_timeout: Some(Duration::from_secs(20)), ..Default::default() })
+}
+
+/// For a shell: kept open while nothing is typed; keepalives notice an AP that went away.
+pub(crate) fn shell_config() -> Arc<russh::client::Config> {
+    Arc::new(russh::client::Config { keepalive_interval: Some(Duration::from_secs(30)), keepalive_max: 3, ..Default::default() })
+}
+
+/// Notes that the AP presented another host key than the one apctl knows for
+/// it (an event), and says so.
+pub(crate) async fn host_key_mismatch(s: &AppState, mac: Mac, ip: &str) -> Failure {
+    s.note(Event::device(clock::now_ts(), EventKind::ApHostKeyMismatch, mac, json!({ "ip": ip }))).await;
+    Failure::HostKey
 }
 
 /// Logs in with each username and password in turn, on one connection while
@@ -211,6 +229,39 @@ impl Session {
         };
         tokio::time::timeout(STEP_TIMEOUT, run).await.map_err(|_| Failure::Command("timed out".into()))??;
         outcome(&out, &err, exit)
+    }
+
+    /// Starts a shell in an `xterm-256color` PTY of this size, once the AP has
+    /// said yes to both: it may refuse either (no PTY free, a forced command).
+    pub(crate) async fn shell(&self, cols: u32, rows: u32) -> Result<russh::Channel<russh::client::Msg>, Failure> {
+        let failed = |e: russh::Error| Failure::Shell(e.to_string());
+        let start = async {
+            let mut ch = self.handle.channel_open_session().await.map_err(failed)?;
+            ch.request_pty(true, "xterm-256color", cols, rows, 0, 0, &[]).await.map_err(failed)?;
+            granted(&mut ch, "a terminal (PTY)").await?;
+            ch.request_shell(true).await.map_err(failed)?;
+            granted(&mut ch, "a shell").await?;
+            Ok(ch)
+        };
+        tokio::time::timeout(SHELL_TIMEOUT, start).await.unwrap_or_else(|_| Err(Failure::Shell("timed out".into())))
+    }
+
+    /// Ends the session, telling the AP (unless it takes too long to listen).
+    pub(crate) async fn close(self) {
+        let _ = tokio::time::timeout(Duration::from_secs(2), self.handle.disconnect(russh::Disconnect::ByApplication, "", "en")).await;
+    }
+}
+
+/// The AP's answer to the request just made on a channel (`what` it asked for).
+async fn granted(ch: &mut russh::Channel<russh::client::Msg>, what: &str) -> Result<(), Failure> {
+    loop {
+        match ch.wait().await {
+            Some(russh::ChannelMsg::Success) => return Ok(()),
+            Some(russh::ChannelMsg::Failure) => return Err(Failure::Shell(format!("it refused {what}"))),
+            Some(russh::ChannelMsg::Close | russh::ChannelMsg::Eof) | None => return Err(Failure::Shell("it closed the channel".into())),
+            // (Window sizes and the like: nothing a shell not started yet prints.)
+            Some(_) => {}
+        }
     }
 }
 
@@ -382,10 +433,7 @@ async fn adopt_over_ssh(s: AppState, b: AdoptBody) -> Result<Json<Value>, ApiErr
     let expected = known_host_key(&s.live.read().unwrap(), &ip);
     let connected = connect(command_config(), &ip, b.port.unwrap_or(22), &logins(state.as_deref(), given), expected.as_ref().map(|e| e.1.clone())).await;
     let session = match (connected, &expected) {
-        (Err(Failure::HostKey), Some((mac, _))) => {
-            s.note(Event::device(clock::now_ts(), EventKind::ApHostKeyMismatch, *mac, json!({ "ip": ip }))).await;
-            return Err(bad(Failure::HostKey));
-        }
+        (Err(Failure::HostKey), Some((mac, _))) => return Err(bad(host_key_mismatch(&s, *mac, &ip).await)),
         (r, _) => r.map_err(bad)?,
     };
     let board = session.run("cat /etc/board.info").await.unwrap_or_default();
@@ -399,8 +447,7 @@ async fn adopt_over_ssh(s: AppState, b: AdoptBody) -> Result<Json<Value>, ApiErr
     if let (Some(k), Some(seen)) = (known, &session.fingerprint)
         && k != *seen
     {
-        s.note(Event::device(clock::now_ts(), EventKind::ApHostKeyMismatch, mac, json!({ "ip": ip }))).await;
-        return Err(bad(Failure::HostKey));
+        return Err(bad(host_key_mismatch(&s, mac, &ip).await));
     }
     // Its record (and key), unless apctl has it already.
     let payload = json!({
@@ -457,7 +504,7 @@ async fn adopt_over_ssh(s: AppState, b: AdoptBody) -> Result<Json<Value>, ApiErr
     };
     s.note(Event::device(clock::now_ts(), EventKind::ApAdopting, mac, json!({ "ip": ip, "via": "ssh" }))).await;
     tracing::info!("{mac}: set-adopt {url} sent over SSH ({})", out.trim());
-    Ok(Json(json!({ "adopting": true, "mac": mac, "inform_url": url })))
+    Ok(Json(json!({ "mac": mac })))
 }
 
 /// A SHA-512 crypt(3) hash (`$6$salt$hash`, 5000 rounds, 8-character salt):

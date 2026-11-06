@@ -1729,7 +1729,8 @@ export interface AdoptionStatus {
   adopting: { mac: Mac; since: number }[];
   /** How many APs are being forgotten: told to reset, then removed. */
   forgetting: number;
-  ssh: { possible: boolean; inform_url: string | null };
+  /** `inform_url`: what adopting over SSH points the AP to; null when apctl doesn't know, and cannot adopt that way. */
+  ssh: { inform_url: string | null };
 }
 
 /** APs waiting for adoption (only fetched when `enabled`); polls quickly while one is waiting, adopting or being forgotten. */
@@ -1746,5 +1747,5 @@ export const useAdoption = (enabled = true) =>
 export const adoptAp = (mac: Mac) => send<{ adopting: boolean }>("POST", `/api/devices/${mac}/adopt`, {});
 /** Empty `username` and `password`: the site's device login, then the factory ones, are tried; one without the other is refused (400). */
 export const adoptOverSsh = (ip: string, username: string, password: string) =>
-  send<{ adopting: boolean; mac: Mac }>("POST", "/api/devices/adopt-ssh", { ip, username: username || null, password: password || null });
+  send<{ mac: Mac }>("POST", "/api/devices/adopt-ssh", { ip, username: username || null, password: password || null });
 export const forgetAp = (mac: Mac) => send<{ forgetting?: boolean; forgotten?: boolean }>("POST", `/api/devices/${mac}/forget`, {});

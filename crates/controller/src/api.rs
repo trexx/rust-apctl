@@ -181,12 +181,14 @@ pub fn router(state: AppState) -> Router {
         .route("/api/events", get(events))
         .route("/api/logs", get(logs))
         .route_layer(axum::middleware::from_fn_with_state(state.clone(), crate::auth::require_login));
-    // The sockets are added after compression, which must not touch an upgrade. A
+    // The sockets are added after compression, which must not touch an upgrade, and are
+    // only for pages of this server (checked first: the last layer runs first). A
     // terminal is a root shell on an AP: withheld in read-only mode, as secrets are.
     let socket = Router::new()
         .route("/api/ws", get(ws))
         .route("/api/devices/{mac}/terminal", get(crate::terminal::open).route_layer(secret.clone()))
-        .route_layer(axum::middleware::from_fn_with_state(state.clone(), crate::auth::require_login));
+        .route_layer(axum::middleware::from_fn_with_state(state.clone(), crate::auth::require_login))
+        .route_layer(axum::middleware::from_fn_with_state(state.clone(), crate::auth::pages_only));
     // JSON and the UI's scripts and styles compress well (gzip only; images are left alone).
     let app = public.merge(protected).fallback(crate::web::handler).layer(tower_http::compression::CompressionLayer::new().compress_when(compressible())).merge(socket);
     with_security_headers(app).with_state(state)
@@ -1186,20 +1188,10 @@ async fn logs(State(s): State<AppState>, Query(q): Query<LogQuery>) -> Result<Js
     Ok(Json(rows))
 }
 
-async fn ws(
-    State(s): State<AppState>,
-    headers: axum::http::HeaderMap,
-    uri: axum::http::Uri,
-    peer: Option<axum::Extension<axum::extract::ConnectInfo<std::net::SocketAddr>>>,
-    session: Option<axum::Extension<crate::auth::SessionId>>,
-    upgrade: WebSocketUpgrade,
-) -> Response {
-    if !s.auth.same_origin(&headers, peer.map(|p| p.0.0.ip()), uri.authority().map(|a| a.as_str())) {
-        return ApiError::forbidden("the live socket is only for pages of this server").into_response();
-    }
+async fn ws(State(s): State<AppState>, session: Option<axum::Extension<crate::auth::SessionId>>, upgrade: WebSocketUpgrade) -> Response {
     let rx = s.tx.subscribe();
     // The session require_login let the request in with, which the socket keeps checking.
-    let (auth, session) = (s.auth.clone(), session.map(|s| s.0.0));
+    let (auth, session) = (s.auth.clone(), session.map(|s| s.0.hash));
     upgrade.on_upgrade(move |socket| live_socket(socket, rx, auth, session))
 }
 
@@ -1241,20 +1233,19 @@ pub fn live_json(typed: &broadcast::Sender<LiveMsg>) -> broadcast::Sender<Utf8By
     tx
 }
 
-/// Resolves once a socket's session ends: checked at every logout and now
-/// and then (for expiry). Never for none (read-only mode has no sessions).
+/// Resolves once a socket's session ends: at once if it has already, then
+/// checked at every logout and now and then (for expiry). Never for none
+/// (read-only mode has no sessions).
 pub(crate) async fn session_ends(auth: &crate::auth::Auth, session: Option<&str>) {
     let Some(hash) = session else { return std::future::pending().await };
-    let mut recheck = tokio::time::interval_at(tokio::time::Instant::now() + SESSION_RECHECK, SESSION_RECHECK);
+    // Subscribed before the first check, which a logout since the request came in fails.
     let mut logouts = auth.logouts();
-    loop {
+    let mut recheck = tokio::time::interval_at(tokio::time::Instant::now() + SESSION_RECHECK, SESSION_RECHECK);
+    while auth.alive(hash) {
         // (The logouts' sender lives in `auth`: it never closes while this borrows it.)
         tokio::select! {
             _ = recheck.tick() => {}
             _ = logouts.changed() => {}
-        }
-        if !auth.alive(hash) {
-            return;
         }
     }
 }
@@ -1903,6 +1894,18 @@ pub(crate) mod tests {
         let mut frame = [0u8; 2];
         tokio::time::timeout(std::time::Duration::from_secs(5), tcp.read_exact(&mut frame)).await.expect("closed at the logout").unwrap();
         assert_eq!(frame[0], 0x88, "a close frame");
+    }
+
+    #[tokio::test]
+    async fn a_session_that_ended_before_its_socket_watches_it_ends_the_socket_at_once() {
+        let (state, _engine, _cookie, _dir) = logged_in();
+        let token = state.auth.create("admin");
+        let session = state.auth.session_of(&token).unwrap();
+        let ends = |wait| tokio::time::timeout(std::time::Duration::from_millis(wait), session_ends(&state.auth, Some(&session.hash)));
+        assert!(ends(100).await.is_err(), "still there");
+        // Expired between the upgrade and the first look: not up to 30 s later.
+        state.auth.age_session(&token, 31 * 86400);
+        assert!(ends(1000).await.is_ok());
     }
 
     #[tokio::test]
