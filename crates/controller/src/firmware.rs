@@ -395,10 +395,11 @@ async fn change_queue(s: &AppState, op: Op) -> Result<Changed, ApiError> {
     s.ask(crate::engine::Input::Firmware { op, done }, rx).await
 }
 
-/// The upgrade command for an AP's inform reply, if its turn has come. Marks
+/// The upgrade command for an AP's inform reply, with the job's target (the
+/// command says "unknown" for a firmware URL), if its turn has come. Marks
 /// the job sent and sets its deadline: the AP's own upgrade + reboot estimate,
 /// but at least [`STEP_DEADLINE`] and at most a day.
-pub fn command(jobs: &mut Jobs, mac: &Mac, inform: &Value, now: Ts) -> Option<Result<Value, &'static str>> {
+pub fn command(jobs: &mut Jobs, mac: &Mac, inform: &Value, now: Ts) -> Option<Result<(Value, String), &'static str>> {
     let j = jobs.current_for(mac).filter(|j| j.state == JobState::Queued)?;
     if !j.custom() && inform["internet"].as_bool() == Some(false) {
         return Some(Err("the AP has no internet access to download the firmware"));
@@ -422,7 +423,7 @@ pub fn command(jobs: &mut Jobs, mac: &Mac, inform: &Value, now: Ts) -> Option<Re
     {
         cmd["sha256sum"] = json!(s);
     }
-    Some(Ok(cmd))
+    Some(Ok((cmd, j.target.clone())))
 }
 
 // ---------------------------------------------------------------- checking
@@ -760,8 +761,9 @@ mod tests {
         // Not a's turn to be told yet for b.
         assert!(command(&mut j, &m("b"), &json!({}), 100).is_none());
         // a informs: it gets the command (sha256 only with the capability bit).
-        let cmd = command(&mut j, &m("a"), &json!({ "fw_caps": CAP_SHA256, "upgrade_duration": 120, "reboot_duration": 60 }), 100).unwrap().unwrap();
+        let (cmd, target) = command(&mut j, &m("a"), &json!({ "fw_caps": CAP_SHA256, "upgrade_duration": 120, "reboot_duration": 60 }), 100).unwrap().unwrap();
         assert_eq!((cmd["_type"].as_str(), cmd["version"].as_str(), cmd["md5sum"].as_str(), cmd["sha256sum"].as_str()), (Some("upgrade"), Some("6.8.2.15592"), Some("m"), Some("s")));
+        assert_eq!(target, "6.8.2.15592");
         assert_eq!(j.current.as_ref().and_then(|c| c.expires), Some(100 + 450), "at least 450 s");
         assert!(command(&mut j, &m("a"), &json!({}), 110).is_none(), "sent once");
         assert!(j.version_seen(&m("b"), "6.8.2.15592").is_none(), "not b's turn");
@@ -820,9 +822,9 @@ mod tests {
     fn a_firmware_url_is_sent_as_version_unknown() {
         let mut j = Jobs::default();
         j.enqueue(vec![Job { target: CUSTOM.into(), md5: None, sha256: None, ..job("a") }]);
-        let cmd = command(&mut j, &m("a"), &json!({ "internet": false }), 0).unwrap().unwrap();
+        let (cmd, target) = command(&mut j, &m("a"), &json!({ "internet": false }), 0).unwrap().unwrap();
         assert_eq!((cmd["version"].as_str(), cmd["url"].as_str()), (Some("unknown"), Some("https://x/fw.bin")));
-        assert_eq!(j.current.as_ref().map(|c| c.target.as_str()), Some("custom"), "the UI's label stays");
+        assert_eq!((j.current.as_ref().map(|c| c.target.as_str()), target.as_str()), (Some("custom"), "custom"), "the UI's label stays, and names the sent event's target");
         // The page is shown the job, not its URL (read-only users see it too).
         let shown = serde_json::to_value(&j).unwrap();
         let keys: Vec<&String> = shown["current"].as_object().unwrap().keys().collect();

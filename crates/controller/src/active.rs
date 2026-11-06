@@ -558,22 +558,17 @@ impl Active {
     /// `Jobs::queued_for`, read with the rest of the reply's needs): the
     /// firmware upgrade. An upgrade that cannot be sent fails at once.
     fn firmware_turn(&self, ts: Ts, mac: Mac, payload: &Value) -> Option<Value> {
-        // The job's target, for the sent event (the command says "unknown" for a firmware URL).
-        let (cmd, target) = {
+        let sent = {
             let mut live = self.live.write().unwrap();
-            let cmd = crate::firmware::command(&mut live.firmware, &mac, payload, ts)?;
-            let target = match &cmd {
-                Ok(_) => live.firmware.current.as_ref().map(|j| j.target.clone()),
-                Err(why) => {
-                    live.firmware.failed(&mac, why);
-                    None
-                }
-            };
-            (cmd, target)
+            let sent = crate::firmware::command(&mut live.firmware, &mac, payload, ts)?;
+            if let Err(why) = sent {
+                live.firmware.failed(&mac, why);
+            }
+            sent
         };
-        match cmd {
-            Ok(cmd) => {
-                tracing::warn!("{mac}: sending firmware upgrade to {}", target.as_deref().unwrap_or("?"));
+        match sent {
+            Ok((cmd, target)) => {
+                tracing::warn!("{mac}: sending firmware upgrade to {target}");
                 // Not the link: a custom one may hold a credential, and the events are open to read-only users.
                 let data = json!({ "target": target });
                 let _ = self.engine.blocking_send(Input::Note(Event::device(ts, EventKind::ApUpgradeSent, mac, data)));
