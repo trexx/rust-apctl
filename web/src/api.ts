@@ -1648,7 +1648,7 @@ export interface SiteSettings {
   timezones: string[];
 }
 
-export const useSiteSettings = () => useQuery({ queryKey: keys.settings("site"), queryFn: getting<SiteSettings>("/api/settings/site") });
+export const useSiteSettings = (enabled = true) => useQuery({ queryKey: keys.settings("site"), queryFn: getting<SiteSettings>("/api/settings/site"), enabled });
 export const useWlanSettings = () => useQuery({ queryKey: keys.settings("wlans"), queryFn: getting<WlanSettingsList>("/api/settings/wlans") });
 export const useDeviceSettings = (mac: Mac, enabled = true) =>
   useQuery({ queryKey: keys.settings("device", mac), queryFn: getting<DeviceSettings>(`/api/settings/devices/${mac}`), enabled });
