@@ -3,7 +3,7 @@ import { wlanPassphrase } from "../../../api";
 import type { WlanSettings } from "../../../api";
 import { errorText } from "../../common";
 import { ApChecklist, Row, Select, TextInput, Toggle, toggled } from "../form";
-import { PROTECTION, takesPassword } from "./form";
+import { PROTECTION, nameBytes, takesPassword } from "./form";
 import type { Protection, WlanSection } from "./form";
 import { SpeedLimitRow } from "./SpeedLimitRow";
 
@@ -59,6 +59,11 @@ export function Basics({
     <>
       <Row label="Name (SSID)">
         <TextInput {...bind("name")} maxLength={32} />
+        {nameBytes(f.name) > 32 && (
+          <span className="error small">
+            at most 32 bytes: an accented letter takes 2, most emoji 4
+          </span>
+        )}
       </Row>
       <Row label="Status">
         {/* Unset is on, as the APs are told. */}

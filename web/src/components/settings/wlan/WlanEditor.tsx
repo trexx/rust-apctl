@@ -3,7 +3,7 @@ import type { WlanSettings, WlanSettingsList } from "../../../api";
 import { useSettingsForm } from "../form";
 import type { Fields } from "../form";
 import { EditorShell } from "../Review";
-import { badRekey, takesPassword, wlanForm } from "./form";
+import { badName, badRekey, takesPassword, wlanForm } from "./form";
 import type { Protection, WlanForm } from "./form";
 import { Advanced } from "./Advanced";
 import { Basics } from "./Basics";
@@ -81,7 +81,7 @@ export function WlanEditor({
     <EditorShell
       target={{ kind: "wlan", id: wlan?.id ?? null }}
       patch={patch}
-      invalid={badRekey(w)}
+      invalid={badName(w, !wlan) || badRekey(w)}
       onClose={onClose}
     >
       <Basics

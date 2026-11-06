@@ -37,6 +37,22 @@ export function wlanForm(w: WlanSettings | null): WlanForm {
   return rest;
 }
 
+/** An SSID name's length as the server counts it: UTF-8 bytes (an accented letter takes 2, most emoji 4). */
+export const nameBytes = (name: string) =>
+  new TextEncoder().encode(name.trim()).length;
+
+/**
+ * A name the server refuses (1 to 32 bytes once trimmed): a new SSID's
+ * always, a stored one's only when changed, as only then is it sent.
+ */
+export function badName(
+  { form, original }: SettingsForm<WlanForm>,
+  isNew: boolean,
+) {
+  const n = nameBytes(form.name);
+  return (isNew || form.name !== original.name) && (n === 0 || n > 32);
+}
+
 /**
  * A group rekey the server refuses (it takes off, 0, or 60 to 86400 seconds),
  * set in this editor: a stored one is not sent unless changed.
