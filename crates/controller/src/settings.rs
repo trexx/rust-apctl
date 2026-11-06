@@ -46,17 +46,24 @@ pub(crate) async fn change<B: Send + 'static>(s: &AppState, q: &PreviewQuery, ap
     Ok(Json(json!({ "saved": true, "what": what })))
 }
 
-/// What `edit` changes in words, and what each reporting AP's config would
-/// become, as config-push summaries. What rendering needs is copied out of
-/// `live` first; copying the settings, the edit (some hash passwords) and the
-/// rendering (twice per AP) run off the async workers without the lock.
+/// What `edit` changes in words, and what the config of each of the site's
+/// reporting APs would become, as config-push summaries. The editors change
+/// this site's documents only ([`site_id`]), so other sites' APs and APs
+/// without a record (which cannot render) are left out. What rendering needs
+/// is copied out of `live` first; copying the settings, the edit (some hash
+/// passwords) and the rendering (twice per AP) run off the async workers
+/// without the lock.
 async fn preview(s: &AppState, before: Arc<Value>, edit: impl FnOnce(&mut Value) -> Result<String, String> + Send + 'static) -> Result<Value, ApiError> {
     let render = s.renderer.clone();
+    let mut macs = device_macs(&before);
+    dedup_in_order(&mut macs);
     let aps: Vec<_> = {
         let live = s.live.read().unwrap();
-        live.devices
-            .iter()
-            .map(|(mac, d)| (*mac, live.raw_informs.get(mac).cloned(), d.snapshot.ap.cfgversion.clone().unwrap_or_default(), d.snapshot.ap.hostname.clone(), d.snapshot.radios.clone()))
+        macs.into_iter()
+            .filter_map(|mac| {
+                let d = live.devices.get(&mac)?;
+                Some((mac, live.raw_informs.get(&mac).cloned(), d.snapshot.ap.cfgversion.clone().unwrap_or_default(), d.snapshot.ap.hostname.clone(), d.snapshot.radios.clone()))
+            })
             .collect()
     };
     let work = move || {
@@ -2972,5 +2979,30 @@ mod tests {
         }
         apply_wlan(&mut s, &WlanEdit { id: "w1".into(), patch: json!({ "schedule_with_duration": [] }) }).unwrap();
         assert_eq!(s["wlanconf"][0]["schedule_with_duration"], json!([]));
+    }
+
+    #[tokio::test]
+    async fn a_preview_renders_the_sites_reporting_aps_once_each() {
+        let (mut app, _engine, _dir) = crate::api::tests::state();
+        let rendered = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = rendered.clone();
+        app.get_mut().renderer = Arc::new(move |r: &crate::dryrun::RenderRequest| {
+            seen.lock().unwrap().push(r.device_mac.to_string());
+            Ok(("mgmt".into(), "system".into()))
+        });
+        // AP1 is the site's twice over, AP3 is another site's, AP4 has no record; AP2 is the site's but not reporting.
+        let mut settings = state();
+        let ap1 = settings["devices"][0].clone();
+        let devices = settings["devices"].as_array_mut().unwrap();
+        devices.push(ap1);
+        devices.push(json!({ "mac": "02:00:00:00:00:03", "site_id": "s2" }));
+        for mac in [AP1, "02:00:00:00:00:03", "02:00:00:00:00:04"] {
+            let snapshot = crate::model::parse(0, &json!({ "mac": mac, "hostname": mac })).unwrap();
+            let d = crate::engine::DeviceView { snapshot, online: true, last_seen: 0, interval: 10, last_full_inform: 0, last_config_push: None };
+            app.live.write().unwrap().devices.insert(mac.parse().unwrap(), d);
+        }
+        let Ok(out) = preview(&app, Arc::new(settings), |s| edit(s, json!({ "hide_ssid": true }))).await else { panic!("the preview fails") };
+        assert_eq!(out["aps"].as_array().unwrap().iter().map(|a| a["mac"].as_str()).collect::<Vec<_>>(), [Some(AP1)]);
+        assert_eq!(*rendered.lock().unwrap(), [AP1, AP1], "before and after, once each");
     }
 }
