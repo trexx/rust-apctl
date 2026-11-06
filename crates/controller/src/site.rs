@@ -363,11 +363,19 @@ pub async fn get_site(State(s): State<AppState>) -> Result<Json<SiteView>, ApiEr
 }
 
 fn site_view(state: &Value, secrets: bool) -> Value {
+    // The flags and the SSH account as the render reads them (its defaults for
+    // an unset one), so the form shows what the APs get.
     let m = setting(state, "mgmt");
-    let mut mgmt = Value::Object(pick(m, &["led_enabled", "outdoor_mode_enabled", "x_ssh_enabled", "x_ssh_username", "x_ssh_auth_password_enabled", "x_ssh_bind_wildcard", "x_ssh_keys"]));
-    mgmt["has_ssh_password"] = json!(m["x_ssh_password"].as_str().is_some_and(|p| !p.is_empty()));
+    let mgmt = json!({
+        "led_enabled": flag(m, "led_enabled", true), "outdoor_mode_enabled": flag(m, "outdoor_mode_enabled", false),
+        "x_ssh_enabled": flag(m, "x_ssh_enabled", true), "x_ssh_username": apcfg::ssh_username(m),
+        "x_ssh_auth_password_enabled": flag(m, "x_ssh_auth_password_enabled", true), "x_ssh_bind_wildcard": flag(m, "x_ssh_bind_wildcard", false),
+        "x_ssh_keys": m["x_ssh_keys"], "has_ssh_password": m["x_ssh_password"].as_str().is_some_and(|p| !p.is_empty()),
+    });
     let r = setting(state, "rsyslogd");
-    let mut rsyslogd = Value::Object(pick(r, &["ip", "port", "debug", "netconsole_enabled", "netconsole_host", "netconsole_port"]));
+    let mut rsyslogd = Value::Object(pick(r, &["ip", "port", "netconsole_host", "netconsole_port"]));
+    rsyslogd["debug"] = json!(flag(r, "debug", false));
+    rsyslogd["netconsole_enabled"] = json!(flag(r, "netconsole_enabled", false));
     rsyslogd["mode"] = json!(match (flag(r, "enabled", false), flag(r, "this_controller", false)) {
         (false, _) => "off",
         (true, true) => "controller",
@@ -551,6 +559,25 @@ mod tests {
         assert_eq!(site_view(&s, true)["snmp"]["has_v3_password"], true);
         assert!(site_view(&s, false)["snmp"]["community"].is_null());
         assert!(!site_view(&s, true).to_string().contains("v3-secret"));
+    }
+
+    #[test]
+    fn the_view_reads_the_flags_and_account_as_the_render_does() {
+        let mut s = state();
+        let view = |s: &Value| {
+            let v = site_view(s, true);
+            let (m, r) = (&v["mgmt"], &v["rsyslogd"]);
+            [&m["led_enabled"], &m["outdoor_mode_enabled"], &m["x_ssh_enabled"], &m["x_ssh_auth_password_enabled"], &m["x_ssh_bind_wildcard"], &r["debug"], &r["netconsole_enabled"], &m["x_ssh_username"]].map(Value::clone)
+        };
+        // Unset: the render's defaults.
+        setting_mut(&mut s, "mgmt").as_object_mut().unwrap().remove("x_ssh_username");
+        assert_eq!(view(&s), [json!(true), json!(false), json!(true), json!(true), json!(false), json!(false), json!(false), json!("ubnt")]);
+        // Stored as text (an import): what the text means to the render, not a truthy string.
+        for (k, v) in [("led_enabled", "false"), ("x_ssh_enabled", "false"), ("x_ssh_bind_wildcard", "true"), ("x_ssh_username", "admin")] {
+            setting_mut(&mut s, "mgmt")[k] = json!(v);
+        }
+        setting_mut(&mut s, "rsyslogd")["debug"] = json!("true");
+        assert_eq!(view(&s), [json!(false), json!(false), json!(false), json!(true), json!(true), json!(true), json!(false), json!("admin")]);
     }
 
     #[test]
