@@ -114,9 +114,25 @@ fn target(s: &AppState, mac: &Mac) -> Result<Target, String> {
     }
     let ip = d.snapshot.ap.ip.clone().ok_or("the AP hasn't reported its address")?;
     let state = live.state.as_deref();
+    if let Some(why) = ssh_refused(state.map_or(&Value::Null, |st| crate::settings::setting(st, "mgmt"))) {
+        return Err(why.into());
+    }
     let expected = crate::ssh::expected_host_key(&live, state.unwrap_or(&Value::Null), mac)
         .ok_or("apctl doesn't know the AP's SSH host key yet: it learns it from the AP's reports")?;
     Ok(Target { ip, port: 22, expected, logins: crate::ssh::logins(state, None) })
+}
+
+/// Why the site's `mgmt` settings keep a terminal off its APs, read as the
+/// APs' config is rendered: SSH off (sshd then listens on the AP itself only),
+/// or password logins off (a terminal logs in with passwords only).
+fn ssh_refused(mgmt: &Value) -> Option<&'static str> {
+    if !apcfg::flag(mgmt, "x_ssh_enabled", true) {
+        return Some("SSH to the APs is off in the site's settings (SSH access to the APs)");
+    }
+    if !apcfg::flag(mgmt, "x_ssh_auth_password_enabled", true) {
+        return Some("password logins to the APs are off in the site's settings (SSH access to the APs)");
+    }
+    None
 }
 
 /// What ended a terminal.
@@ -302,6 +318,14 @@ mod tests {
         assert_eq!(size("{}"), (80, 24), "left out: the usual size");
         assert_eq!(size(r#"{"cols":0,"rows":100000}"#), (1, 200));
         assert!(serde_json::from_str::<Size>(r#"{"cols":-1}"#).is_err());
+    }
+
+    #[test]
+    fn the_site_may_keep_terminals_off_its_aps() {
+        assert_eq!(ssh_refused(&Value::Null), None, "both on unless set");
+        assert_eq!(ssh_refused(&json!({ "x_ssh_enabled": true, "x_ssh_auth_password_enabled": "true" })), None);
+        assert!(ssh_refused(&json!({ "x_ssh_enabled": "false" })).unwrap().starts_with("SSH to the APs is off"));
+        assert!(ssh_refused(&json!({ "x_ssh_auth_password_enabled": false })).unwrap().starts_with("password logins"));
     }
 
     /// An AP's SSH server, as far as a terminal needs one: the password `ubnt`
