@@ -1,5 +1,5 @@
 import { useSyncExternalStore } from "react";
-import type { TimeSpan } from "./api";
+import type { Series, TimeSpan } from "./api";
 
 const BANDS: Record<string, string> = { ng: "2.4 GHz", na: "5 GHz", "6e": "6 GHz" };
 
@@ -152,6 +152,30 @@ export const wifiText = (s: { wifi_gen: string | null; nss: number | null }) => 
 
 /** A size in bytes, in units of 1024. */
 export const bytes = (n: number | null | undefined) => (n === null || n === undefined ? "—" : scaled(n, 1024, ["B", "KB", "MB", "GB", "TB"]));
+
+/** The usual seconds between a series' samples: the median step, which a few missing samples don't change; 0 with fewer than two. */
+export function typicalStep(ts: number[]): number {
+  const steps = ts.slice(1).map((t, i) => t - ts[i]!).sort((a, b) => a - b);
+  return steps[Math.floor(steps.length / 2)] ?? 0;
+}
+
+/** The seconds one sample of a roll-up tier stands for: its bucket's width. */
+const TIER_STEP: Partial<Record<Series<string>["tier"], number>> = { "5m": 300, "1h": 3600 };
+
+/**
+ * What a `/api/series` counter, sent as per-second rates, adds up to over the samples. The server works each rate out over
+ * the gap since the sample before it, and sends none across a gap of over two hours, so a rate counts for that gap and the
+ * sum is the counter's own increase; a gap without one counts nothing. The first sample's rate is over a gap from a sample
+ * before the window, which isn't sent: it counts for one step of `tier` (5 min, 1 h), on the raw tier the series' usual
+ * step (nothing when it is the only sample).
+ */
+export function moved(ts: number[], perSecond: (number | null)[], tier: Series<string>["tier"]): number {
+  const first = perSecond[0] ?? 0;
+  // The median only when it is needed.
+  let sum = first ? first * (TIER_STEP[tier] ?? typicalStep(ts)) : 0;
+  for (let i = 1; i < ts.length; i++) sum += (perSecond[i] ?? 0) * (ts[i]! - ts[i - 1]!);
+  return sum;
+}
 
 export const pct = (v: number | null | undefined) => (v === null || v === undefined ? "—" : `${Math.round(v)}%`);
 

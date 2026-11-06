@@ -9,9 +9,9 @@ import {
   provisionAp,
   restartAp,
   setClientSpeedLimit,
+  useActive,
   useCanEdit,
   useSettingsState,
-  useStatus,
   useUserGroups,
 } from "../api";
 import type { Mac, Names } from "../api";
@@ -28,15 +28,15 @@ const Terminal = lazyNamed(() => import("./Terminal"), "Terminal");
 
 /** Whether actions can be used: active mode, signed in. */
 function useCanAct(): { can: boolean; why: string | null } {
-  const status = useStatus().data;
+  const active = useActive();
   const canEdit = useCanEdit();
   if (!canEdit) return { can: false, why: null };
-  if (status && status.mode !== "active")
+  if (active === false)
     return {
       can: false,
       why: "Actions work after the cutover: in shadow mode apctl never talks to the APs.",
     };
-  return { can: !!status, why: null };
+  return { can: active === true, why: null };
 }
 
 export function DeviceActions({

@@ -229,8 +229,6 @@ export interface CfgChange {
   added?: number;
   removed?: number;
   changed?: number;
-  /** A dry run's: the same key=value pairs, maybe in another order. */
-  same_content?: boolean;
 }
 
 interface RadioLevels {
@@ -283,10 +281,10 @@ export interface EventPayloads {
   client_steered: { signal?: number | null; result?: string | null; candidates?: { bssid: string; channel: number | null }[] };
   client_experience: { anomalies?: string[]; satisfaction?: number | null; signal?: number | null };
   /**
-   * `lines`: from the fault on (`source` "syslog"), or the last 200 lines of the AP's crash store ("crashlog", "recovery").
+   * `lines`: from the fault on, for one caught in the AP's syslog; else the last 200 lines of the crash or recovery report from the AP's crash store.
    * `summary`: the first fault line, else the first line (absent without lines).
    */
-  ap_crash: { process?: string | null; kind?: string | null; source?: string; lines?: string[]; summary?: string };
+  ap_crash: { process?: string | null; kind?: string | null; lines?: string[]; summary?: string };
   /** The AP's notification. `exit_status`: its exit code as a number (left out when it sent none, or none that is a number). */
   ap_process_restarted: { proc?: string | null; exit_status?: number; caller?: string | null };
   ap_isolated: { heard_by?: Mac | null };
@@ -555,6 +553,9 @@ interface Activity {
   tx_retry_pct: (number | null)[];
   clients: number[];
   multicast_pct: (number | null)[];
+  /** Bytes moved in the window to and from clients: the counters' own increases, summed. */
+  download_bytes: number;
+  upload_bytes: number;
 }
 
 export interface SiteActivity {
@@ -1575,7 +1576,6 @@ export interface ConfigNetwork {
 export interface DeviceSettings {
   mac: Mac;
   name: string | null;
-  model: string | null;
   led_override: "default" | "on" | "off" | null;
   led_override_color: string | null;
   led_override_color_brightness: number | null;
@@ -1615,22 +1615,24 @@ export interface SshKey { name: string; type: string; key: string; comment: stri
 
 /** Site-wide device settings (secrets are never sent back). */
 export interface SiteSettings {
+  /** The flags and the SSH account as the APs are given them (the stored value, else the render's default). */
   mgmt: {
     has_ssh_password: boolean;
-    led_enabled: boolean | null;
-    outdoor_mode_enabled: boolean | null;
-    x_ssh_enabled: boolean | null;
-    x_ssh_username: string | null;
-    x_ssh_auth_password_enabled: boolean | null;
-    x_ssh_bind_wildcard: boolean | null;
+    led_enabled: boolean;
+    outdoor_mode_enabled: boolean;
+    x_ssh_enabled: boolean;
+    x_ssh_username: string;
+    x_ssh_auth_password_enabled: boolean;
+    x_ssh_bind_wildcard: boolean;
     x_ssh_keys: SshKey[] | null;
   };
+  /** `debug` and `netconsole_enabled` as the APs are given them, as `mgmt`'s flags. */
   rsyslogd: {
     mode: "off" | "controller" | "server";
     ip: string | null;
     port: number | string | null;
-    debug: boolean | null;
-    netconsole_enabled: boolean | null;
+    debug: boolean;
+    netconsole_enabled: boolean;
     netconsole_host: string | null;
     netconsole_port: number | string | null;
   };
@@ -1645,7 +1647,7 @@ export interface SiteSettings {
   timezones: string[];
 }
 
-export const useSiteSettings = () => useQuery({ queryKey: keys.settings("site"), queryFn: getting<SiteSettings>("/api/settings/site") });
+export const useSiteSettings = (enabled = true) => useQuery({ queryKey: keys.settings("site"), queryFn: getting<SiteSettings>("/api/settings/site"), enabled });
 export const useWlanSettings = () => useQuery({ queryKey: keys.settings("wlans"), queryFn: getting<WlanSettingsList>("/api/settings/wlans") });
 export const useDeviceSettings = (mac: Mac, enabled = true) =>
   useQuery({ queryKey: keys.settings("device", mac), queryFn: getting<DeviceSettings>(`/api/settings/devices/${mac}`), enabled });

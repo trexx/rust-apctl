@@ -11,7 +11,7 @@ import {
   useSiteTop,
 } from "../api";
 import type { TimeSpan } from "../api";
-import { COLORS, Chart, SpanPage, moved, useTimeSpan } from "../components/Chart";
+import { COLORS, Chart, SpanPage, useTimeSpan } from "../components/Chart";
 import {
   Dot,
   EventList,
@@ -29,6 +29,7 @@ import {
   canonicalMac,
   compact,
   duration,
+  moved,
   pct,
   rate,
   rates,
@@ -331,7 +332,7 @@ function UplinkChart({ mac, range }: { mac: string; range: TimeSpan }) {
   ]);
   return (
     <QueryState q={s} panel>
-      {({ ts, fields: f }) => (
+      {({ tier, ts, fields: f }) => (
         <div className="panel">
           <Chart
             title="Uplink throughput"
@@ -344,14 +345,14 @@ function UplinkChart({ mac, range }: { mac: string; range: TimeSpan }) {
                 scale: 8,
                 color: COLORS.blue,
                 fill: true,
-                summary: bytes(moved(ts, f.rx_bytes)),
+                summary: bytes(moved(ts, f.rx_bytes, tier)),
               },
               {
                 label: "Upload (from AP)",
                 values: f.tx_bytes,
                 scale: 8,
                 color: COLORS.purple,
-                summary: bytes(moved(ts, f.tx_bytes)),
+                summary: bytes(moved(ts, f.tx_bytes, tier)),
               },
             ]}
           />

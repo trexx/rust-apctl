@@ -1,8 +1,8 @@
 import { useState } from "react";
-import { useCanEdit, useSiteSettings } from "../../../api";
+import { useCanEdit, useSettingsState, useSiteSettings } from "../../../api";
 import type { SiteSettings } from "../../../api";
 import { QueryNote } from "../../common";
-import { EditPanel } from "../EditPanel";
+import { EditPanel, NotImported } from "../EditPanel";
 import { useSettingsForm } from "../form";
 import type { Fields } from "../form";
 import { EditorShell } from "../Review";
@@ -58,15 +58,20 @@ function SiteEditor({ d, onClose }: { d: SiteSettings; onClose: () => void }) {
 
 /** Site-wide device settings: LED, outdoor, SSH, syslog, NTP, country, time zone. */
 export function SiteSettingsPanel() {
-  const q = useSiteSettings();
+  // The server answers 409 before an import: ask once the state says there is one.
+  const state = useSettingsState();
+  const imported = !!state.data?.summary;
+  const q = useSiteSettings(imported);
   const readOnly = !useCanEdit();
+  if (!state.data) return <QueryNote q={state} panel />;
+  if (!imported) return <NotImported title="Site settings" />;
   if (!q.data) return <QueryNote q={q} panel />;
   const d = q.data;
   const country = d.countries.find((c) => c.code === d.country)?.name;
   return (
     <EditPanel
       title="Site settings"
-      summary={`${country ?? `country ${d.country}`}, ${d.timezone ?? "UTC"}, SSH user ${d.mgmt.x_ssh_username ?? "ubnt"}`}
+      summary={`${country ?? `country ${d.country}`}, ${d.timezone ?? "UTC"}, SSH user ${d.mgmt.x_ssh_username}`}
       readOnly={readOnly}
       editor={(onClose) => <SiteEditor d={d} onClose={onClose} />}
     />
