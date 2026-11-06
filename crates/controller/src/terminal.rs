@@ -193,19 +193,22 @@ mod tests {
         assert!(serde_json::from_str::<Size>(r#"{"cols":-1}"#).is_err());
     }
 
-    /// An AP's SSH server, as far as a terminal needs one: `ubnt`/`ubnt` logs
-    /// in, the shell echoes what is typed in capitals and exits at `exit`, and
-    /// the sizes it was given are kept.
+    /// An AP's SSH server, as far as a terminal needs one: the password `ubnt`
+    /// logs in, the shell echoes what is typed in capitals and exits at `exit`,
+    /// and the sizes it was given are kept. The user `nopty` gets no PTY, and
+    /// `noshell` no shell.
     #[derive(Clone, Default)]
     struct Shell {
         sizes: Arc<std::sync::Mutex<Vec<(u32, u32)>>>,
+        user: String,
     }
 
     impl russh::server::Handler for Shell {
         type Error = russh::Error;
 
         async fn auth_password(&mut self, user: &str, password: &str) -> Result<russh::server::Auth, Self::Error> {
-            Ok(if (user, password) == ("ubnt", "ubnt") { russh::server::Auth::Accept } else { russh::server::Auth::reject() })
+            self.user = user.to_string();
+            Ok(if password == "ubnt" { russh::server::Auth::Accept } else { russh::server::Auth::reject() })
         }
 
         async fn channel_open_session(&mut self, _: russh::Channel<russh::server::Msg>, reply: russh::server::ChannelOpenHandle, _: &mut russh::server::Session) -> Result<(), Self::Error> {
@@ -213,10 +216,17 @@ mod tests {
             Ok(())
         }
 
-        async fn pty_request(&mut self, _: russh::ChannelId, term: &str, cols: u32, rows: u32, _: u32, _: u32, _: &[(russh::Pty, u32)], _: &mut russh::server::Session) -> Result<(), Self::Error> {
+        async fn pty_request(&mut self, ch: russh::ChannelId, term: &str, cols: u32, rows: u32, _: u32, _: u32, _: &[(russh::Pty, u32)], session: &mut russh::server::Session) -> Result<(), Self::Error> {
             assert_eq!(term, "xterm-256color");
+            if self.user == "nopty" {
+                return session.channel_failure(ch);
+            }
             self.sizes.lock().unwrap().push((cols, rows));
-            Ok(())
+            session.channel_success(ch)
+        }
+
+        async fn shell_request(&mut self, ch: russh::ChannelId, session: &mut russh::server::Session) -> Result<(), Self::Error> {
+            if self.user == "noshell" { session.channel_failure(ch) } else { session.channel_success(ch) }
         }
 
         async fn window_change_request(&mut self, _: russh::ChannelId, cols: u32, rows: u32, _: u32, _: u32, _: &mut russh::server::Session) -> Result<(), Self::Error> {
@@ -267,13 +277,15 @@ mod tests {
 
         let (s, mut engine, _dir) = crate::api::tests::state();
         let mac: Mac = "02:00:00:00:00:01".parse().unwrap();
-        let logins = vec![("ubnt".to_string(), "wrong".to_string()), ("ubnt".to_string(), "ubnt".to_string())];
         let session = s.auth.session_of(&s.auth.create("admin")).unwrap();
         let app = axum::Router::new()
             .route(
                 "/t/{key}",
                 get(move |State(s): State<AppState>, axum::extract::Path(key): axum::extract::Path<String>, upgrade: WebSocketUpgrade| async move {
-                    let expected = if key == "known" { fingerprint } else { "SHA256:other".into() };
+                    let expected = if key == "changed" { "SHA256:other".into() } else { fingerprint };
+                    // A wrong password first, as when the site's login is not the AP's.
+                    let user = if key == "changed" { "ubnt" } else { &key };
+                    let logins = vec![(user.to_string(), "wrong".to_string()), (user.to_string(), "ubnt".to_string())];
                     let t = Target { ip: "127.0.0.1".into(), port, expected, logins };
                     upgrade.on_upgrade(move |mut socket| async move {
                         let end = bridge(&mut socket, &s, mac, t, &Size { cols: Some(100), rows: Some(30) }, &session).await;
@@ -284,7 +296,7 @@ mod tests {
             .with_state(s);
         let addr = serve(app).await;
 
-        let (status, mut tcp) = handshake(addr, "/t/known", "", None).await;
+        let (status, mut tcp) = handshake(addr, "/t/ubnt", "", None).await;
         assert_eq!(status, "101");
         assert_eq!(frame(&mut tcp).await, (1, br#"{"connected":true}"#.to_vec()));
         let Some(crate::engine::Input::Note(e)) = engine.recv().await else { panic!("no event") };
@@ -307,5 +319,13 @@ mod tests {
         assert_eq!((op, serde_json::from_slice::<Value>(&text).unwrap()["error"].as_str()), (1, Some("the AP's SSH host key isn't the one apctl knows for it")));
         let Some(crate::engine::Input::Note(e)) = engine.recv().await else { panic!("no event") };
         assert_eq!(e.kind, EventKind::ApHostKeyMismatch);
+
+        // An AP that refuses the PTY or the shell: it says so, and no terminal was opened.
+        for (user, error) in [("nopty", "could not start a shell on the AP: it refused a terminal (PTY)"), ("noshell", "could not start a shell on the AP: it refused a shell")] {
+            let (_, mut tcp) = handshake(addr, &format!("/t/{user}"), "", None).await;
+            let (op, text) = frame(&mut tcp).await;
+            assert_eq!((op, serde_json::from_slice::<Value>(&text).unwrap()["error"].as_str()), (1, Some(error)));
+        }
+        assert!(engine.try_recv().is_err(), "no event");
     }
 }

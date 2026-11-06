@@ -231,23 +231,37 @@ impl Session {
         outcome(&out, &err, exit)
     }
 
-    /// Starts a shell in an `xterm-256color` PTY of this size.
+    /// Starts a shell in an `xterm-256color` PTY of this size, once the AP has
+    /// said yes to both: it may refuse either (no PTY free, a forced command).
     pub(crate) async fn shell(&self, cols: u32, rows: u32) -> Result<russh::Channel<russh::client::Msg>, Failure> {
+        let failed = |e: russh::Error| Failure::Shell(e.to_string());
         let start = async {
-            let ch = self.handle.channel_open_session().await?;
-            ch.request_pty(false, "xterm-256color", cols, rows, 0, 0, &[]).await?;
-            ch.request_shell(false).await?;
-            Ok::<_, russh::Error>(ch)
+            let mut ch = self.handle.channel_open_session().await.map_err(failed)?;
+            ch.request_pty(true, "xterm-256color", cols, rows, 0, 0, &[]).await.map_err(failed)?;
+            granted(&mut ch, "a terminal (PTY)").await?;
+            ch.request_shell(true).await.map_err(failed)?;
+            granted(&mut ch, "a shell").await?;
+            Ok(ch)
         };
-        match tokio::time::timeout(SHELL_TIMEOUT, start).await {
-            Ok(r) => r.map_err(|e| Failure::Shell(e.to_string())),
-            Err(_) => Err(Failure::Shell("timed out".into())),
-        }
+        tokio::time::timeout(SHELL_TIMEOUT, start).await.unwrap_or_else(|_| Err(Failure::Shell("timed out".into())))
     }
 
     /// Ends the session, telling the AP (unless it takes too long to listen).
     pub(crate) async fn close(self) {
         let _ = tokio::time::timeout(Duration::from_secs(2), self.handle.disconnect(russh::Disconnect::ByApplication, "", "en")).await;
+    }
+}
+
+/// The AP's answer to the request just made on a channel (`what` it asked for).
+async fn granted(ch: &mut russh::Channel<russh::client::Msg>, what: &str) -> Result<(), Failure> {
+    loop {
+        match ch.wait().await {
+            Some(russh::ChannelMsg::Success) => return Ok(()),
+            Some(russh::ChannelMsg::Failure) => return Err(Failure::Shell(format!("it refused {what}"))),
+            Some(russh::ChannelMsg::Close | russh::ChannelMsg::Eof) | None => return Err(Failure::Shell("it closed the channel".into())),
+            // (Window sizes and the like: nothing a shell not started yet prints.)
+            Some(_) => {}
+        }
     }
 }
 
