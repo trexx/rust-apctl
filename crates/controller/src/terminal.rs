@@ -1,8 +1,8 @@
 //! A terminal on an AP, in the browser: a WebSocket carried to a shell over SSH.
 //!
-//! The page sends what is typed as binary frames, and its size as text ones
-//! (`{"cols":80,"rows":24}`; the first in the query), once it is told the shell
-//! runs; apctl sends what the shell prints as binary frames, `{"connected":true}`
+//! The page sends what is typed as binary frames, and its size (`{"cols":80,"rows":24}`;
+//! the first in the query) and `{"pause":…}` (see [`Said`]) as text ones, once
+//! it is told the shell runs; apctl sends what the shell prints as binary frames, `{"connected":true}`
 //! once it runs, `{"error":"…"}` before closing when it cannot, and pings (a
 //! page that answers none of a few has gone). What went wrong goes over the
 //! socket rather than as an HTTP status, which a browser hides from the page.
@@ -58,6 +58,16 @@ const PACE: Pace = Pace { idle: Duration::from_secs(30 * 60), ping: Duration::fr
 pub struct Size {
     cols: Option<u32>,
     rows: Option<u32>,
+}
+
+/// A text frame from the page: its size, or `{"pause":true}` while it shows
+/// what it was sent so far (the AP's output then waits, held back by SSH's
+/// flow control) and `{"pause":false}` once it has.
+#[derive(Deserialize)]
+struct Said {
+    pause: Option<bool>,
+    #[serde(flatten)]
+    size: Size,
 }
 
 impl Size {
@@ -223,6 +233,7 @@ async fn bridge(socket: &mut WebSocket, s: &AppState, mac: Mac, t: Target, size:
     let mut ping = tokio::time::interval_at(tokio::time::Instant::now() + pace.ping, pace.ping);
     // Pings sent since the page last sent anything (a pong, say).
     let mut unanswered = 0;
+    let mut paused = false;
     let end = loop {
         // Room for one more of the page's frames (only this loop queues them).
         let reading = queue.capacity() > 0;
@@ -238,7 +249,7 @@ async fn bridge(socket: &mut WebSocket, s: &AppState, mac: Mac, t: Target, size:
                     break End::Gone;
                 }
             }
-            msg = output.wait() => match msg {
+            msg = output.wait(), if !paused => match msg {
                 Some(russh::ChannelMsg::Data { data } | russh::ChannelMsg::ExtendedData { data, .. }) => {
                     if !send(socket, Message::Binary(data)).await {
                         break End::Gone;
@@ -257,12 +268,14 @@ async fn bridge(socket: &mut WebSocket, s: &AppState, mac: Mac, t: Target, size:
                         idle.as_mut().reset(tokio::time::Instant::now() + pace.idle);
                         let _ = queue.try_send(ToAp::Typed(typed));
                     }
-                    Some(Ok(Message::Text(text))) => {
-                        if let Ok(size) = serde_json::from_str::<Size>(&text) {
+                    Some(Ok(Message::Text(text))) => match serde_json::from_str::<Said>(&text) {
+                        Ok(Said { pause: Some(pause), .. }) => paused = pause,
+                        Ok(Said { size, .. }) => {
                             let (cols, rows) = size.clamped();
                             let _ = queue.try_send(ToAp::Size(cols, rows));
                         }
-                    }
+                        Err(_) => {}
+                    },
                     Some(Ok(Message::Close(_)) | Err(_)) | None => break End::Gone,
                     _ => {}
                 }
@@ -525,6 +538,14 @@ mod tests {
         from_page(&mut tcp, 2, b"x").await;
         assert_eq!(frame(&mut tcp).await, (2, b"X".to_vec()));
         assert_eq!(*rig.shell.sizes.lock().unwrap(), [(100, 30), (120, 40)]);
+        // Paused, the AP's output waits until the page asks for it again.
+        from_page(&mut tcp, 1, br#"{"pause":true}"#).await;
+        from_page(&mut tcp, 2, b"y").await;
+        let held = tokio::time::timeout(Duration::from_millis(300), frame(&mut tcp)).await;
+        assert!(held.is_err(), "nothing while paused");
+        from_page(&mut tcp, 1, br#"{"pause":false}"#).await;
+        assert_eq!(frame(&mut tcp).await, (2, b"Y".to_vec()));
+        assert_eq!(rig.shell.sizes.lock().unwrap().len(), 2, "no resize");
         // The shell exits: a normal close, saying so.
         from_page(&mut tcp, 2, b"exit\r").await;
         assert_eq!(closed(&mut tcp).await, (1000, "the shell ended".into()));

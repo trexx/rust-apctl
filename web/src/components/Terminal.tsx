@@ -5,6 +5,11 @@ import "@xterm/xterm/css/xterm.css";
 import { announceUnauthorized, terminalSocket } from "../api";
 import type { Mac } from "../api";
 
+/** Flow control: with this much output written but not yet shown, the server is asked to pause the AP's… */
+const HIGH = 128 << 10;
+/** …and below this, to go on. */
+const LOW = 16 << 10;
+
 type State =
   | { at: "connecting" }
   | { at: "connected" }
@@ -24,9 +29,9 @@ function theme() {
 
 /**
  * A shell on the AP over SSH, through apctl. What is typed goes as binary
- * frames, the size as JSON; the server says `{"connected":true}` once the
- * shell runs, or `{"error":…}` before it closes. Nothing is sent before the
- * shell runs.
+ * frames, the size and `{"pause":…}` as JSON; the server says
+ * `{"connected":true}` once the shell runs, or `{"error":…}` before it
+ * closes. Nothing is sent before the shell runs.
  */
 export function Terminal({
   mac,
@@ -65,10 +70,23 @@ export function Terminal({
     };
     const sendSize = ({ cols, rows }: { cols: number; rows: number }) =>
       send(JSON.stringify({ cols, rows }));
+    // Output written to the terminal but not yet shown, and whether the AP's is paused for it.
+    let backlog = 0;
+    let paused = false;
+    const pause = (on: boolean) => {
+      paused = on;
+      send(JSON.stringify({ pause: on }));
+    };
     let error: string | null = null;
     socket.onmessage = (e: MessageEvent<ArrayBuffer | string>) => {
       if (typeof e.data !== "string") {
-        term.write(new Uint8Array(e.data));
+        const n = e.data.byteLength;
+        backlog += n;
+        term.write(new Uint8Array(e.data), () => {
+          backlog -= n;
+          if (paused && backlog < LOW) pause(false);
+        });
+        if (!paused && backlog > HIGH) pause(true);
         return;
       }
       const msg = JSON.parse(e.data) as { connected?: boolean; error?: string };
