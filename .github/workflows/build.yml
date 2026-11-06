@@ -42,7 +42,8 @@ jobs:
       # The Image workflow's layer cache (image.yml), which a tag can read from main.
       cache_scope: 'apctl'
 
-  # The image CI published runs and reports the version, before release.sh --pin pins it.
+  # The image CI published runs, reports the version and carries the manufacturer list
+  # (scripts/image-check.sh), before release.sh --pin pins it.
   check:
     needs: [ 'build' ]
     runs-on: 'ubuntu-26.04'
