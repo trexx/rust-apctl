@@ -34,10 +34,11 @@ pub fn inform_url(s: &AppState) -> Option<String> {
     live.state.as_deref()?["devices"].as_array()?.iter().find_map(|d| d["inform_url"].as_str().filter(|u| u.starts_with("http")).map(str::to_string))
 }
 
-/// Whether adopting over SSH can work: active mode and an inform URL to give.
+/// What adopting over SSH would point the AP to: none when apctl doesn't know
+/// (it then cannot adopt this way; it also needs active mode, which the page
+/// learns from /api/status).
 pub fn available(s: &AppState) -> Value {
-    let url = inform_url(s);
-    json!({ "possible": s.active && url.is_some(), "inform_url": url })
+    json!({ "inform_url": inform_url(s) })
 }
 
 struct Client {
@@ -489,7 +490,7 @@ async fn adopt_over_ssh(s: AppState, b: AdoptBody) -> Result<Json<Value>, ApiErr
     };
     s.note(Event::device(clock::now_ts(), EventKind::ApAdopting, mac, json!({ "ip": ip, "via": "ssh" }))).await;
     tracing::info!("{mac}: set-adopt {url} sent over SSH ({})", out.trim());
-    Ok(Json(json!({ "adopting": true, "mac": mac, "inform_url": url })))
+    Ok(Json(json!({ "mac": mac })))
 }
 
 /// A SHA-512 crypt(3) hash (`$6$salt$hash`, 5000 rounds, 8-character salt):

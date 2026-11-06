@@ -113,7 +113,7 @@ export function AdoptionPanel() {
           <div className="actions-row">
             <button
               className="btn primary"
-              disabled={busy || !ip.trim() || !d.ssh.possible}
+              disabled={busy || !ip.trim() || !d.ssh.inform_url}
               onClick={() =>
                 void run(async () => {
                   // As the server: a half login is refused, not replaced by the others.
@@ -128,7 +128,7 @@ export function AdoptionPanel() {
             >
               {busy ? "Connecting…" : "Adopt over SSH"}
             </button>
-            {!d.ssh.possible && (
+            {!d.ssh.inform_url && (
               <span className="small muted">
                 apctl doesn't know the URL APs should report to: set
                 APCTL_INFORM_URL.
