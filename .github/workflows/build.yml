@@ -36,9 +36,6 @@ jobs:
       contents: read
       packages: write
     with:
-      # Every release stays published: the README tells people to pin a version, and the
-      # shared pruning keeps only the newest two. The prune job below deletes untagged images.
-      prune_images: false
       # The Image workflow's layer cache (image.yml), which a tag can read from main.
       cache_scope: 'apctl'
 
@@ -59,17 +56,3 @@ jobs:
           username: '${{ github.repository_owner }}'
           password: '${{ secrets.GITHUB_TOKEN }}'
       - run: 'scripts/image-check.sh "ghcr.io/${{ github.repository_owner }}/rust-apctl:${GITHUB_REF_NAME}"'
-
-  # Deletes only images no tag names (an earlier build of a rebuilt tag), with their
-  # platform images and attestations. The patterns cover every tag this workflow makes,
-  # but no digest: a pattern matching a digest would exclude it too ('*' keeps everything).
-  prune:
-    needs: [ 'build' ]
-    runs-on: 'ubuntu-26.04'
-    timeout-minutes: 10
-    permissions:
-      packages: 'write'
-    steps:
-      - uses: 'trexx/actions/.github/actions/prune-ghcr@main'
-        with:
-          exclude_tags: 'latest,*.*.*'
