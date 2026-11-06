@@ -24,13 +24,12 @@ const keyLine = (k: SshKey) =>
   [k.type, k.key, k.comment].filter(Boolean).join(" ");
 
 export const mgmtForm = ({ mgmt }: SiteSettings): MgmtForm => ({
-  led_enabled: mgmt.led_enabled ?? true,
-  outdoor_mode_enabled: mgmt.outdoor_mode_enabled ?? false,
-  x_ssh_enabled: mgmt.x_ssh_enabled ?? true,
-  // Unset, the APs are given "ubnt", as the summary says.
-  x_ssh_username: mgmt.x_ssh_username ?? "ubnt",
-  x_ssh_auth_password_enabled: mgmt.x_ssh_auth_password_enabled ?? true,
-  x_ssh_bind_wildcard: mgmt.x_ssh_bind_wildcard ?? false,
+  led_enabled: mgmt.led_enabled,
+  outdoor_mode_enabled: mgmt.outdoor_mode_enabled,
+  x_ssh_enabled: mgmt.x_ssh_enabled,
+  x_ssh_username: mgmt.x_ssh_username,
+  x_ssh_auth_password_enabled: mgmt.x_ssh_auth_password_enabled,
+  x_ssh_bind_wildcard: mgmt.x_ssh_bind_wildcard,
   x_ssh_keys: (mgmt.x_ssh_keys ?? []).map(keyLine),
 });
 
@@ -48,8 +47,8 @@ export const syslogForm = ({ rsyslogd: r }: SiteSettings): SyslogForm => ({
   mode: r.mode,
   ip: r.ip ?? "",
   port: Number(r.port ?? 514),
-  debug: r.debug ?? false,
-  netconsole_enabled: r.netconsole_enabled ?? false,
+  debug: r.debug,
+  netconsole_enabled: r.netconsole_enabled,
   netconsole_host: r.netconsole_host ?? "",
   netconsole_port: Number(r.netconsole_port ?? 514),
 });

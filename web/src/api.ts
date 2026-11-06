@@ -1615,22 +1615,24 @@ export interface SshKey { name: string; type: string; key: string; comment: stri
 
 /** Site-wide device settings (secrets are never sent back). */
 export interface SiteSettings {
+  /** The flags and the SSH account as the APs are given them (the stored value, else the render's default). */
   mgmt: {
     has_ssh_password: boolean;
-    led_enabled: boolean | null;
-    outdoor_mode_enabled: boolean | null;
-    x_ssh_enabled: boolean | null;
-    x_ssh_username: string | null;
-    x_ssh_auth_password_enabled: boolean | null;
-    x_ssh_bind_wildcard: boolean | null;
+    led_enabled: boolean;
+    outdoor_mode_enabled: boolean;
+    x_ssh_enabled: boolean;
+    x_ssh_username: string;
+    x_ssh_auth_password_enabled: boolean;
+    x_ssh_bind_wildcard: boolean;
     x_ssh_keys: SshKey[] | null;
   };
+  /** `debug` and `netconsole_enabled` as the APs are given them, as `mgmt`'s flags. */
   rsyslogd: {
     mode: "off" | "controller" | "server";
     ip: string | null;
     port: number | string | null;
-    debug: boolean | null;
-    netconsole_enabled: boolean | null;
+    debug: boolean;
+    netconsole_enabled: boolean;
     netconsole_host: string | null;
     netconsole_port: number | string | null;
   };
