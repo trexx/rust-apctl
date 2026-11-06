@@ -14,7 +14,7 @@ use crate::api::{ApiError, AppState, Json, Query, read};
 use crate::clock;
 use crate::engine::{ClientView, Live};
 use crate::model::Ts;
-use crate::series::{Delta, Loaded, Only, RangeQuery, Samples, Spec, ap_name, ap_name_of, bucket_for, client_name, cols_at, deltas, load, memo_read, own_bssids, window};
+use crate::series::{Delta, Loaded, Only, RangeQuery, Samples, Spec, ap_name, ap_name_of, bucket_for, client_name, cols_at, deltas, load, memo_read, own_bssid_map, window};
 use crate::store::{Db, TIERS};
 
 /// The BSSIDs an AP's SSIDs have had in a tier of `vap_stats` (a BSSID stays
@@ -1005,14 +1005,11 @@ pub async fn neighbors(State(s): State<AppState>, Query(q): Query<NeighborQuery>
         tokio::task::spawn_blocking(move || threats.used_bssids(&store, now)).await??
     };
     // Our own BSSIDs, each with its AP (to tell our APs apart from the
-    // neighbours): the live VAPs', then the used ones; and our APs' names,
-    // copied so that the live lock is not held while the lists are made.
+    // neighbours), and our APs' names, copied so that the live lock is not
+    // held while the lists are made.
     let (own, names) = {
         let live = s.live.read().unwrap();
-        let mut own: HashMap<String, String> = own_bssids(&live).map(|(m, v)| (v.bssid.clone(), m.to_string())).collect();
-        for (bssid, ap, _) in used.iter().filter(|u| !u.1.is_empty()) {
-            own.entry(bssid.clone()).or_insert_with(|| ap.clone());
-        }
+        let own = own_bssid_map(&live, &used);
         // Named as every other view names them: also those not heard from in this run.
         let names: HashMap<String, String> =
             live.devices.keys().chain(live.known_devices.keys()).filter_map(|m| Some((m.to_string(), ap_name_of(&live, m).filter(|n| !n.is_empty())?))).collect();

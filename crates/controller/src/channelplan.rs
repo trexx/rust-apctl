@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use crate::api::{ApiError, AppState, Json, Query, read};
 use crate::clock;
 use crate::engine::Live;
-use crate::series::own_bssids;
+use crate::series::own_bssid_map;
 use crate::store::Db;
 
 #[derive(Deserialize)]
@@ -274,11 +274,7 @@ fn plan_inputs(live: &Live, radio: &str, used: &[crate::threats::UsedBss]) -> (V
         .collect();
     // Our APs' BSSIDs, to separate own signal from neighbours. The rows read are this
     // band's, so a BSSID of ours heard there is its AP's radio on the band.
-    let mut own: HashMap<String, String> = own_bssids(live).map(|(m, v)| (v.bssid.clone(), m.to_string())).collect();
-    for (bssid, ap, _) in used.iter().filter(|u| !u.1.is_empty()) {
-        own.entry(bssid.clone()).or_insert_with(|| ap.clone());
-    }
-    (aps, own)
+    (aps, own_bssid_map(live, used))
 }
 
 type NeighborRow = (String, String, Option<String>, Option<f64>, Option<f64>, Option<f64>);
