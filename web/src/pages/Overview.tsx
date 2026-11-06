@@ -1,6 +1,7 @@
 import { Suspense } from "react";
 import { Link } from "react-router";
 import {
+  useActive,
   useClientNames,
   useDeviceNames,
   useCanEdit,
@@ -56,6 +57,7 @@ export function Overview() {
   const s = status.data;
   const names = useDeviceNames();
   const canEdit = useCanEdit();
+  const active = useActive();
   const cnames = useClientNames();
   const now = useNow();
 
@@ -96,7 +98,7 @@ export function Overview() {
       </div>
 
       <ThreatBanner />
-      {canEdit && s?.mode === "active" && (
+      {canEdit && active && (
         <Suspense fallback={null}>
           <AdoptionPanel />
         </Suspense>
