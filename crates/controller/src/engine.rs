@@ -870,8 +870,8 @@ impl Engine {
                         Some(connected_event(ts, &c, false))
                     } else if p.ap_mac != c.ap_mac || p.bssid != c.bssid {
                         Some(Event::client_on(ts, EventKind::ClientRoamed, c.ap_mac, c.mac, json!({
-                            "from": { "ap": p.ap_mac, "radio": p.radio, "channel": p.channel, "essid": p.essid, "signal": p.signal },
-                            "to": { "ap": c.ap_mac, "radio": c.radio, "channel": c.channel, "essid": c.essid, "signal": c.signal },
+                            "from": { "ap": p.ap_mac, "radio": p.radio, "signal": p.signal },
+                            "to": { "ap": c.ap_mac, "radio": c.radio, "signal": c.signal },
                         })))
                     } else {
                         None
@@ -1062,9 +1062,9 @@ impl Engine {
             "INSERT INTO dryrun_results (ts, mac, matches, comparison) VALUES (?1, ?2, ?3, ?4)",
             vec![Sql::Integer(ts), Sql::Text(req.device_mac.to_string()), Sql::Integer(matches as i64), Sql::Text(payload)],
         );
-        // Each field's counts: a mismatch names the field that differs, and says
-        // when only the order of its lines does (no line added, removed or changed).
-        let counts = |f: &crate::dryrun::FieldComparison| json!({ "added": f.added, "removed": f.removed, "changed": f.changed, "same_content": f.same_content });
+        // Each field's counts: a mismatch names the field that differs (none
+        // counted in either field: only the order of their lines does).
+        let counts = |f: &crate::dryrun::FieldComparison| json!({ "added": f.added, "removed": f.removed, "changed": f.changed });
         match &result {
             Ok(c) => json!({ "matches": matches, "mgmt_cfg": counts(&c.mgmt_cfg), "system_cfg": counts(&c.system_cfg) }),
             Err(e) => json!({ "matches": false, "error": format!("{e:#}") }),
@@ -1347,7 +1347,7 @@ impl Engine {
                 let lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
                 let tail = &lines[lines.len().saturating_sub(200)..];
                 let kind = if reason == "recovery" { "recovered after a crash" } else { "crash report" };
-                let mut data = json!({ "kind": kind, "source": reason, "lines": tail });
+                let mut data = json!({ "kind": kind, "lines": tail });
                 if let Some(summary) = crate::logevents::crash_summary(tail) {
                     data["summary"] = json!(summary);
                 }
@@ -1511,12 +1511,7 @@ impl Engine {
             }
             (Some("UpgradeError"), _) => {
                 let reason = s("reason");
-                let detail = match reason.as_str() {
-                    "FirmwareDownloadFailed" => format!("download failed (error: curl:{}, http:{})", n["curl_rc"], n["http_rc"]),
-                    "FirmwareCheckFailed" => format!("firmware check failed (error: {})", n["rc"]),
-                    "FWWriteFailed" => "writing the firmware failed".into(),
-                    r => format!("failed ({r})"),
-                };
+                let detail = upgrade_error_detail(&reason, n);
                 live.firmware.upgrade_error(&mac, &detail);
                 Some(Event::device(ts, EventKind::ApUpgradeFailed, mac, json!({ "reason": reason, "detail": detail })))
             }
@@ -2025,6 +2020,27 @@ pub(crate) fn numeric_exit_status(n: &mut Value) {
     }
 }
 
+/// A failed upgrade's text, from the AP's `reason` and the codes it sends with
+/// it (as numbers or text): those it leaves out are left out here too.
+fn upgrade_error_detail(reason: &str, n: &Value) -> String {
+    let code = |k: &str| match &n[k] {
+        Value::Number(c) => Some(c.to_string()),
+        Value::String(c) if !c.trim().is_empty() => Some(c.trim().to_string()),
+        _ => None,
+    };
+    let with = |what: &str, codes: &[(&str, &str)]| {
+        let codes: Vec<String> = codes.iter().filter_map(|(label, k)| Some(format!("{label}{}", code(k)?))).collect();
+        if codes.is_empty() { what.to_string() } else { format!("{what} (error: {})", codes.join(", ")) }
+    };
+    match reason {
+        "FirmwareDownloadFailed" => with("download failed", &[("curl:", "curl_rc"), ("http:", "http_rc")]),
+        "FirmwareCheckFailed" => with("firmware check failed", &[("", "rc")]),
+        "FWWriteFailed" => "writing the firmware failed".into(),
+        "" => "failed".into(),
+        r => format!("failed ({r})"),
+    }
+}
+
 /// Whether each AP the engine knows the state of is available: online or not
 /// for one heard from in this run, unavailable for one stored as offline. One
 /// last stored online that has not informed in this run yet is left out (its
@@ -2220,6 +2236,10 @@ mod tests {
         feed(&mut h, 10, AP2, &[(C1, "b2")]);
         feed(&mut h, 12, AP1, &[]);
         assert_eq!(events(&mut h), vec![("client_roamed", Some(C1.into()))]);
+        // Each end is the AP, band and signal (what the event's text shows).
+        let roam = &stored(&h, EventKind::ClientRoamed)[0];
+        assert_eq!(roam["to"], json!({ "ap": AP2, "radio": "na", "signal": -60 }));
+        assert_eq!(roam["from"]["ap"], AP1);
 
         // Leaves entirely: disconnect only after the grace period and a full list from its AP.
         feed(&mut h, 20, AP2, &[]);
@@ -2961,6 +2981,8 @@ mod tests {
         crash(&mut h, 3, "\n");
         let summaries: Vec<Value> = stored(&h, EventKind::ApCrash).into_iter().map(|d| d.get("summary").cloned().unwrap_or(Value::Null)).collect();
         assert_eq!(summaries, [json!("[ 12.3] Kernel panic - not syncing: Fatal exception"), json!("no fault here"), Value::Null]);
+        let keys: Vec<String> = stored(&h, EventKind::ApCrash)[0].as_object().unwrap().keys().cloned().collect();
+        assert_eq!(keys, ["kind", "lines", "summary"]);
         // A code sent as text is stored as a number; one that is no number is left out.
         for (ts, code) in [(4, json!("139")), (5, json!(1)), (6, json!("n/a"))] {
             let n = json!({ "event_string": "EVT_AP_RestartProc", "proc": "mcad", "exit_status": code, "caller": "init" });
@@ -2968,6 +2990,16 @@ mod tests {
         }
         let codes: Vec<Option<Value>> = stored(&h, EventKind::ApProcessRestarted).into_iter().map(|d| d.get("exit_status").cloned()).collect();
         assert_eq!(codes, [Some(json!(139)), Some(json!(1)), None]);
+    }
+
+    #[test]
+    fn upgrade_errors_read_their_codes_as_sent() {
+        let detail = |reason, n: Value| upgrade_error_detail(reason, &n);
+        assert_eq!(detail("FirmwareDownloadFailed", json!({ "curl_rc": "6", "http_rc": 404 })), "download failed (error: curl:6, http:404)");
+        assert_eq!(detail("FirmwareDownloadFailed", json!({ "http_rc": "404" })), "download failed (error: http:404)");
+        assert_eq!(detail("FirmwareDownloadFailed", json!({ "curl_rc": null })), "download failed");
+        assert_eq!((detail("FirmwareCheckFailed", json!({ "rc": 3 })), detail("FirmwareCheckFailed", json!({}))), ("firmware check failed (error: 3)".into(), "firmware check failed".into()));
+        assert_eq!((detail("Other", json!({})), detail("", json!({}))), ("failed (Other)".into(), "failed".into()));
     }
 
     #[test]
@@ -3044,13 +3076,13 @@ mod tests {
         flushed(&h.writer);
         let row: (String, i64) = h.store.read(Db::Config, |c| Ok(c.query_row("SELECT mac, matches FROM dryrun_results", [], |r| Ok((r.get(0)?, r.get(1)?)))?)).unwrap();
         assert_eq!(row, (AP1.to_string(), 0));
-        // The event names the field that differs, and when only the order does;
+        // The event counts each field's differing lines (none in either: only the order differs);
         // the stored comparison has the counts without the diffs' text.
         h.engine.set_renderer(Arc::new(|_: &crate::dryrun::RenderRequest| -> anyhow::Result<crate::dryrun::Rendered> { Ok(("cfgversion=v2\na=9".into(), "y=1\nx=4".into())) }));
         h.engine.handle(Input::Reply { ts: 280, mac, payload: json!({ "_type": "setparam", "system_cfg": "x=4\ny=1" }) });
-        let counts = |added, removed, changed, same_content| json!({ "added": added, "removed": removed, "changed": changed, "same_content": same_content });
+        let counts = |added, removed, changed| json!({ "added": added, "removed": removed, "changed": changed });
         let compared = stored(&h, EventKind::DryrunCompared);
-        assert_eq!(compared[1], json!({ "matches": false, "mgmt_cfg": counts(0, 0, 1, false), "system_cfg": counts(0, 0, 0, true) }));
+        assert_eq!(compared[1], json!({ "matches": false, "mgmt_cfg": counts(0, 0, 1), "system_cfg": counts(0, 0, 0) }));
         let comparison: Value =
             serde_json::from_str(&h.store.read(Db::Config, |c| Ok(c.query_row("SELECT comparison FROM dryrun_results ORDER BY ts DESC", [], |r| r.get::<_, String>(0))?)).unwrap()).unwrap();
         assert_eq!((comparison["mgmt_cfg"]["changed"].as_i64(), comparison["mgmt_cfg"].get("diff"), comparison["system_cfg"].get("diff")), (Some(1), None, None));

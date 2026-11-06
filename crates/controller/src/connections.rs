@@ -471,17 +471,6 @@ pub struct Roam {
     pub assistant: bool,
 }
 
-fn end_of(e: &ConnEvent, rssi: &Option<Field>) -> RoamEnd {
-    RoamEnd {
-        ap: e.ap.clone(),
-        essid: e.essid.clone(),
-        radio: e.radio.clone(),
-        channel: int(&e.n.x_channel),
-        bw: int(&e.n.x_bw),
-        rssi: num(rssi),
-    }
-}
-
 fn band_rank(radio: Option<&str>) -> u8 {
     match radio {
         Some("6e") => 3,
@@ -527,7 +516,7 @@ pub fn roams(events: &[ConnEvent]) -> Vec<Roam> {
                 ts: j.ts.max(l.ts),
                 client: client.to_string(),
                 from: RoamFrom { ap: l.ap.clone(), radio: l.radio.clone(), rssi: num(&l.n.avg_rssi) },
-                to: end_of(j, &j.n.auth_rssi),
+                to: RoamEnd { ap: j.ap.clone(), essid: j.essid.clone(), radio: j.radio.clone(), channel: int(&j.n.x_channel), bw: int(&j.n.x_bw), rssi: num(&j.n.auth_rssi) },
                 success,
                 gap_s: (!success).then_some(gap.max(0)),
                 fast: text(&j.n.auth_algo) == Some("ft"),
@@ -689,11 +678,10 @@ fn query_rows(c: &rusqlite::Connection, from: Ts, to: Ts, client: Option<&str>, 
 /// not seen) and is then one.
 const ATTEMPTS_ONLY: &str = "AND event_type IN ('failure', 'soft failure', 'success', 'fixup')";
 
-/// The reports [`attempts`] reads in a window (optionally one client's),
-/// oldest first; or with `newest`, at most that many, newest first.
-pub fn load_rows(c: &rusqlite::Connection, from: Ts, to: Ts, client: Option<&str>, newest: Option<usize>) -> rusqlite::Result<Vec<ConnEvent>> {
+/// The reports [`attempts`] reads in a window, oldest first.
+pub fn load_rows(c: &rusqlite::Connection, from: Ts, to: Ts) -> rusqlite::Result<Vec<ConnEvent>> {
     // The other reports (associations, leaves) are not parsed for nothing.
-    query_rows(c, from, to, client, ATTEMPTS_ONLY, newest)
+    query_rows(c, from, to, None, ATTEMPTS_ONLY, None)
 }
 
 /// Only a client's reports from 10 s before to 15 s after one of its leaves ([`LEAVE_TYPES`]).
@@ -769,7 +757,7 @@ pub async fn connectivity(State(s): State<AppState>, Query(q): Query<RangeQuery>
     let (from, to, tier) = window(&q);
     // Every report in the window is read and parsed: the result is reused for a while.
     let got = memo_read(&s, Db::Config, "connectivity", &q, tier, move |c| {
-        let list = attempts(load_rows(c, from, to, None, None)?);
+        let list = attempts(load_rows(c, from, to)?);
         let mut bands = serde_json::Map::new();
         // All bands, and each band with attempts.
         for b in [None, Some("ng"), Some("na"), Some("6e")] {

@@ -431,7 +431,7 @@ impl LogEvents {
     fn flush(&mut self, dev: Mac, now: Ts) -> Option<Event> {
         let c = self.crashes.remove(&dev)?;
         self.crash_reported.insert(dev, now);
-        let mut data = json!({ "kind": c.kind.as_str(), "process": c.process, "source": "syslog" });
+        let mut data = json!({ "kind": c.kind.as_str(), "process": c.process });
         if let Some(summary) = crash_summary(&c.lines) {
             data["summary"] = json!(summary);
         }
