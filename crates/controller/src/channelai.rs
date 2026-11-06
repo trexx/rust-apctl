@@ -572,11 +572,9 @@ pub fn apply_settings(state: &mut Value, p: &Value) -> Result<String, String> {
     }
     // The allowed channels follow the country, blacklist and DFS choice.
     let blacklist = r["channels_blacklist"].as_array().cloned().unwrap_or_default();
-    let blacklisted = |band: &str, ch: i64| {
-        blacklist.iter().any(|b| {
-            b["radio"].as_str() == Some(band) && num(&b["channel"]) == Some(ch) && num(&b["channel_width"]).is_none_or(|w| w == 20)
-        })
-    };
+    // An entry blacklists its channel on its band whatever width it names, as the
+    // official recomputation and the AP's own channel selection (`blklst`) read it.
+    let blacklisted = |band: &str, ch: i64| blacklist.iter().any(|b| b["radio"].as_str() == Some(band) && num(&b["channel"]) == Some(ch));
     let dfs = apcfg::radio_ai_na_dfs(r);
     for band in BANDS.iter().map(|b| b.radio) {
         let chans: Vec<String> = allowed_channels(c, band, 20, false).into_iter().filter(|ch| !blacklisted(band, *ch) && (dfs || !apcfg::is_dfs_channel(*ch))).map(|ch| ch.to_string()).collect();
@@ -643,12 +641,13 @@ mod tests {
         assert!(r["channels_na"].as_array().unwrap().iter().any(|c| c == "100"));
         // ng: Germany's 1-13 minus the blacklist (2 and 13 here).
         assert_eq!(r["channels_ng"].as_array().unwrap().len(), 11);
-        // An entry for another width (stored as a number or as text) is not a 20 MHz one.
+        // An entry for any width (the channel stored as a number or as text) leaves its channel out.
         let mut t = state();
-        t["setting"][2]["channels_blacklist"] = json!([{ "radio": "ng", "channel": "2", "channel_width": 40 }, { "radio": "ng", "channel": 3, "channel_width": 20 }]);
+        t["setting"][2]["channels_blacklist"] = json!([{ "radio": "ng", "channel": "2", "channel_width": 40 }, { "radio": "ng", "channel": 3, "channel_width": "20" }, { "radio": "na", "channel": "44", "channel_width": "80" }]);
         apply_settings(&mut t, &json!({ "hour": 4 })).unwrap();
-        let ng = |t: &Value| radio_ai(t).unwrap()["channels_ng"].as_array().unwrap().iter().filter_map(|c| c.as_str().map(str::to_string)).collect::<Vec<_>>();
-        assert!(ng(&t).contains(&"2".to_string()) && !ng(&t).contains(&"3".to_string()), "{:?}", ng(&t));
+        let list = |t: &Value, band: &str| radio_ai(t).unwrap()[format!("channels_{band}")].as_array().unwrap().iter().filter_map(|c| c.as_str().map(str::to_string)).collect::<Vec<_>>();
+        assert!(!list(&t, "ng").iter().any(|c| c == "2" || c == "3") && list(&t, "ng").len() == 11, "{:?}", list(&t, "ng"));
+        assert!(!list(&t, "na").contains(&"44".to_string()) && list(&t, "na").contains(&"48".to_string()), "{:?}", list(&t, "na"));
         assert!(apply_settings(&mut s, &json!({ "hour": 24 })).is_err());
         // Each band once; anything but a band's name is refused.
         apply_settings(&mut s, &json!({ "radios": ["na", "na"] })).unwrap();
