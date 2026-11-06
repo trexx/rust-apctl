@@ -47,9 +47,10 @@ export default defineConfig({
     sourcemap: false,
     rolldownOptions: {
       output: {
-        // React, the router, React Query and uPlot change only with an upgrade:
-        // in chunks of their own, browsers keep them cached across releases.
-        // uPlot is apart, loaded with the first chart shown (see Chart.tsx).
+        // React, the router, React Query, uPlot and xterm change only with an
+        // upgrade: in chunks of their own, browsers keep them cached across
+        // releases. uPlot is apart, loaded with the first chart shown (see
+        // Chart.tsx), and xterm with the first terminal opened.
         codeSplitting: {
           groups: [
             {
@@ -57,6 +58,7 @@ export default defineConfig({
               test: /[\\/]node_modules[\\/](react|react-dom|scheduler|react-router|@tanstack)[\\/]/,
             },
             { name: "uplot", test: /[\\/]node_modules[\\/]uplot[\\/].*\.m?js$/ },
+            { name: "xterm", test: /[\\/]node_modules[\\/]@xterm[\\/].*\.m?js$/ },
           ],
         },
       },
