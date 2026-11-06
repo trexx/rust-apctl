@@ -91,7 +91,7 @@ export function Overview() {
           value={s ? s.counters.informs : "—"}
           sub={
             s
-              ? `informs since start, ${s.counters.decode_errors} errors`
+              ? `informs since start, ${s.counters.decode_errors} errors; syslog: ${s.counters.log_errors} unreadable, ${s.counters.syslog_dropped} dropped`
               : ""
           }
         />
