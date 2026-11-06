@@ -47,9 +47,10 @@ fi
 dangling() { podman images -q --filter dangling=true | sort -u; }
 before=$(dangling)
 manifest=""
+err=""
 cleanup() {
   comm -13 <(echo "$before") <(dangling) | xargs -r podman rmi >/dev/null 2>&1 || true
-  rm -f "$manifest"
+  rm -f "$manifest" "$err"
 }
 trap cleanup EXIT
 
@@ -116,21 +117,43 @@ if [ -z "$pin" ]; then
 fi
 
 # skopeo reads the registry without pulling; from a container when it is not installed
-# (type -P: `command -v` would find this function itself).
+# (type -P: `command -v` would find this function itself), which gets the credentials
+# `podman login` saved, read-only, for a private $IMAGE.
 skopeo() {
   if type -P skopeo >/dev/null; then
     command skopeo "$@"
-  else
-    podman run --rm quay.io/skopeo/stable:v1.22.3@sha256:2681eccb8b02c495b013c2669cbf7f41d5c0b0b0e644e7c69bd3ea9bcb20641f "$@"
+    return
   fi
+  local auth opts=()
+  for auth in "${REGISTRY_AUTH_FILE:-}" "${XDG_RUNTIME_DIR:-/run/user/$UID}/containers/auth.json" "$HOME/.config/containers/auth.json"; do
+    if [ -n "$auth" ] && [ -f "$auth" ]; then
+      opts=(--security-opt label=disable -v "$auth:/auth.json:ro" -e REGISTRY_AUTH_FILE=/auth.json)
+      break
+    fi
+  done
+  podman run --rm "${opts[@]}" quay.io/skopeo/stable:v1.22.3@sha256:2681eccb8b02c495b013c2669cbf7f41d5c0b0b0e644e7c69bd3ea9bcb20641f "$@"
 }
 
 ref="docker://$IMAGE:$version"
 manifest=$(mktemp)
+err=$(mktemp)
 echo "== waiting for CI to publish $IMAGE:$version (up to ${WAIT}s)"
 deadline=$((SECONDS + WAIT))
-until skopeo inspect --raw "$ref" >"$manifest" 2>/dev/null; do
+# Only "not published yet" is waited out. Any other failure stops at once with skopeo's
+# own message: podman failing to run the skopeo image (125 and up), a registry refusing
+# the credentials, a mistyped APCTL_IMAGE.
+until rc=0; skopeo inspect --raw "$ref" >"$manifest" 2>"$err" || rc=$?; [ $rc = 0 ]; do
+  if [ $rc -ge 125 ] || ! grep -qiE 'manifest unknown|not found' "$err"; then
+    cat "$err" >&2
+    if [ $rc -ge 125 ]; then
+      echo "could not run skopeo (podman exited $rc)" >&2
+    else
+      echo "could not read $IMAGE:$version; for a private image, log in first: podman login ${IMAGE%%/*}" >&2
+    fi
+    exit 1
+  fi
   if [ $SECONDS -ge $deadline ]; then
+    cat "$err" >&2
     echo "$IMAGE:$version is not published after ${WAIT}s; was the tag pushed, and did CI pass?" >&2
     exit 1
   fi
