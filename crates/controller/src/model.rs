@@ -186,7 +186,7 @@ pub struct VapSample {
 }
 
 /// A network heard by one of the AP's radios in a background scan.
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct NeighborSample {
     pub radio: Option<String>,
     pub bssid: String,
@@ -220,7 +220,7 @@ impl NeighborSample {
 }
 
 /// One channel from a spectrum (channel survey) scan of one radio.
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct SpectrumSample {
     pub channel: i64,
     pub width: Option<i64>,
