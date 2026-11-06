@@ -1511,12 +1511,7 @@ impl Engine {
             }
             (Some("UpgradeError"), _) => {
                 let reason = s("reason");
-                let detail = match reason.as_str() {
-                    "FirmwareDownloadFailed" => format!("download failed (error: curl:{}, http:{})", n["curl_rc"], n["http_rc"]),
-                    "FirmwareCheckFailed" => format!("firmware check failed (error: {})", n["rc"]),
-                    "FWWriteFailed" => "writing the firmware failed".into(),
-                    r => format!("failed ({r})"),
-                };
+                let detail = upgrade_error_detail(&reason, n);
                 live.firmware.upgrade_error(&mac, &detail);
                 Some(Event::device(ts, EventKind::ApUpgradeFailed, mac, json!({ "reason": reason, "detail": detail })))
             }
@@ -2022,6 +2017,27 @@ pub(crate) fn numeric_exit_status(n: &mut Value) {
                 o.remove("exit_status");
             }
         }
+    }
+}
+
+/// A failed upgrade's text, from the AP's `reason` and the codes it sends with
+/// it (as numbers or text): those it leaves out are left out here too.
+fn upgrade_error_detail(reason: &str, n: &Value) -> String {
+    let code = |k: &str| match &n[k] {
+        Value::Number(c) => Some(c.to_string()),
+        Value::String(c) if !c.trim().is_empty() => Some(c.trim().to_string()),
+        _ => None,
+    };
+    let with = |what: &str, codes: &[(&str, &str)]| {
+        let codes: Vec<String> = codes.iter().filter_map(|(label, k)| Some(format!("{label}{}", code(k)?))).collect();
+        if codes.is_empty() { what.to_string() } else { format!("{what} (error: {})", codes.join(", ")) }
+    };
+    match reason {
+        "FirmwareDownloadFailed" => with("download failed", &[("curl:", "curl_rc"), ("http:", "http_rc")]),
+        "FirmwareCheckFailed" => with("firmware check failed", &[("", "rc")]),
+        "FWWriteFailed" => "writing the firmware failed".into(),
+        "" => "failed".into(),
+        r => format!("failed ({r})"),
     }
 }
 
@@ -2974,6 +2990,16 @@ mod tests {
         }
         let codes: Vec<Option<Value>> = stored(&h, EventKind::ApProcessRestarted).into_iter().map(|d| d.get("exit_status").cloned()).collect();
         assert_eq!(codes, [Some(json!(139)), Some(json!(1)), None]);
+    }
+
+    #[test]
+    fn upgrade_errors_read_their_codes_as_sent() {
+        let detail = |reason, n: Value| upgrade_error_detail(reason, &n);
+        assert_eq!(detail("FirmwareDownloadFailed", json!({ "curl_rc": "6", "http_rc": 404 })), "download failed (error: curl:6, http:404)");
+        assert_eq!(detail("FirmwareDownloadFailed", json!({ "http_rc": "404" })), "download failed (error: http:404)");
+        assert_eq!(detail("FirmwareDownloadFailed", json!({ "curl_rc": null })), "download failed");
+        assert_eq!((detail("FirmwareCheckFailed", json!({ "rc": 3 })), detail("FirmwareCheckFailed", json!({}))), ("firmware check failed (error: 3)".into(), "firmware check failed".into()));
+        assert_eq!((detail("Other", json!({})), detail("", json!({}))), ("failed (Other)".into(), "failed".into()));
     }
 
     #[test]
