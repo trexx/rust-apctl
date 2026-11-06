@@ -65,8 +65,7 @@ pub async fn open(
     upgrade.max_message_size(MAX_FRAME).on_upgrade(move |socket| terminal(socket, s, mac, size, session))
 }
 
-/// Where and how to log in to an AP for its terminal.
-#[derive(Debug)]
+/// Where and how to log in to an AP for its terminal. No Debug: it holds passwords.
 struct Target {
     ip: String,
     port: u16,
