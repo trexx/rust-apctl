@@ -1,9 +1,10 @@
 //! A terminal on an AP, in the browser: a WebSocket carried to a shell over SSH.
 //!
 //! The page sends what is typed as binary frames, and its size as text ones
-//! (`{"cols":80,"rows":24}`; the first in the query); apctl sends what the
-//! shell prints as binary frames, `{"connected":true}` once it runs, and
-//! `{"error":"…"}` before closing when it cannot. What went wrong goes over the
+//! (`{"cols":80,"rows":24}`; the first in the query), once it is told the shell
+//! runs; apctl sends what the shell prints as binary frames, `{"connected":true}`
+//! once it runs, `{"error":"…"}` before closing when it cannot, and pings (a
+//! page that answers none of a few has gone). What went wrong goes over the
 //! socket rather than as an HTTP status, which a browser hides from the page.
 //!
 //! The login is the site's device one, else the factory ones, as for adoption
@@ -37,13 +38,20 @@ const QUEUED: usize = 16;
 /// for that long has gone.
 const SEND_TIMEOUT: Duration = Duration::from_secs(20);
 
+/// How many pings in a row the page may leave unanswered (while its frames
+/// are read): then it has gone (a laptop asleep, a network change, a proxy
+/// that dropped the connection).
+const UNANSWERED: u32 = 3;
+
 /// A terminal's timers.
 struct Pace {
     /// How long a terminal stays open with nothing typed.
     idle: Duration,
+    /// How often the page is pinged.
+    ping: Duration,
 }
 
-const PACE: Pace = Pace { idle: Duration::from_secs(30 * 60) };
+const PACE: Pace = Pace { idle: Duration::from_secs(30 * 60), ping: Duration::from_secs(30) };
 
 /// A terminal's size in characters, as the page measures it.
 #[derive(Debug, Default, Deserialize, PartialEq)]
@@ -172,17 +180,36 @@ async fn to_ap(input: russh::ChannelWriteHalf<russh::client::Msg>, mut queue: to
     }
 }
 
-/// Logs in to the AP, starts its shell, and carries the terminal both ways
-/// until one side ends it. Nothing in the loop waits on the AP taking input
-/// in, nor on the page for longer than [`SEND_TIMEOUT`], so it always sees a
-/// logout, the idle limit and the page's end.
+/// Logs in to the AP and starts its shell (unless the page goes or its
+/// session ends meanwhile), and carries the terminal both ways until one side
+/// ends it. Nothing in the loop waits on the AP taking input in, nor on the
+/// page for longer than [`SEND_TIMEOUT`], so it always sees a logout, the idle
+/// limit and the page's end.
 async fn bridge(socket: &mut WebSocket, s: &AppState, mac: Mac, t: Target, size: &Size, session: &SessionId, pace: &Pace) -> Result<End, String> {
-    let ssh = match ssh::connect(ssh::shell_config(), &t.ip, t.port, &t.logins, Some(t.expected)).await {
-        Err(Failure::HostKey) => return Err(ssh::host_key_mismatch(s, mac, &t.ip).await.to_string()),
-        r => r.map_err(|f| f.to_string())?,
-    };
+    let ended = crate::api::session_ends(&s.auth, Some(&session.hash));
+    tokio::pin!(ended);
     let (cols, rows) = size.clamped();
-    let ch = ssh.shell(cols, rows).await.map_err(|f| f.to_string())?;
+    let start = async {
+        let ssh = match ssh::connect(ssh::shell_config(), &t.ip, t.port, &t.logins, Some(t.expected)).await {
+            Err(Failure::HostKey) => return Err(ssh::host_key_mismatch(s, mac, &t.ip).await),
+            r => r?,
+        };
+        let ch = ssh.shell(cols, rows).await?;
+        Ok((ssh, ch))
+    };
+    tokio::pin!(start);
+    // Logging in may take a minute and more: the page may go meanwhile, or its session end.
+    let (ssh, ch) = loop {
+        tokio::select! {
+            started = &mut start => break started.map_err(|f| f.to_string())?,
+            _ = &mut ended => return Ok(End::LoggedOut),
+            incoming = socket.recv() => match incoming {
+                Some(Ok(Message::Close(_)) | Err(_)) | None => return Ok(End::Gone),
+                // (The page sends nothing before it is told the shell runs.)
+                _ => {}
+            },
+        }
+    };
     s.note(Event::device(clock::now_ts(), EventKind::ApTerminalOpened, mac, json!({ "user": session.user }))).await;
     tracing::info!("{mac}: terminal opened by {}", session.user);
     if !send(socket, Message::Text(Utf8Bytes::from_static(r#"{"connected":true}"#))).await {
@@ -191,9 +218,11 @@ async fn bridge(socket: &mut WebSocket, s: &AppState, mac: Mac, t: Target, size:
     let (mut output, input) = ch.split();
     let (queue, queued) = tokio::sync::mpsc::channel(QUEUED);
     let mut writer = tokio::spawn(to_ap(input, queued));
-    let ended = crate::api::session_ends(&s.auth, Some(&session.hash));
     let idle = tokio::time::sleep(pace.idle);
-    tokio::pin!(ended, idle);
+    tokio::pin!(idle);
+    let mut ping = tokio::time::interval_at(tokio::time::Instant::now() + pace.ping, pace.ping);
+    // Pings sent since the page last sent anything (a pong, say).
+    let mut unanswered = 0;
     let end = loop {
         // Room for one more of the page's frames (only this loop queues them).
         let reading = queue.capacity() > 0;
@@ -202,6 +231,13 @@ async fn bridge(socket: &mut WebSocket, s: &AppState, mac: Mac, t: Target, size:
             _ = &mut idle => break End::Idle,
             // The session ended under the writer.
             _ = &mut writer => break End::Exited,
+            _ = ping.tick() => {
+                // Only while the page's frames are read: its pong waits behind what it typed.
+                unanswered += u32::from(reading);
+                if unanswered > UNANSWERED || !send(socket, Message::Ping(Default::default())).await {
+                    break End::Gone;
+                }
+            }
             msg = output.wait() => match msg {
                 Some(russh::ChannelMsg::Data { data } | russh::ChannelMsg::ExtendedData { data, .. }) => {
                     if !send(socket, Message::Binary(data)).await {
@@ -213,20 +249,24 @@ async fn bridge(socket: &mut WebSocket, s: &AppState, mac: Mac, t: Target, size:
             },
             // Room again: the page's frames are read on.
             _ = queue.reserve(), if !reading => {}
-            incoming = socket.recv(), if reading => match incoming {
-                Some(Ok(Message::Binary(typed))) => {
-                    idle.as_mut().reset(tokio::time::Instant::now() + pace.idle);
-                    let _ = queue.try_send(ToAp::Typed(typed));
-                }
-                Some(Ok(Message::Text(text))) => {
-                    if let Ok(size) = serde_json::from_str::<Size>(&text) {
-                        let (cols, rows) = size.clamped();
-                        let _ = queue.try_send(ToAp::Size(cols, rows));
+            incoming = socket.recv(), if reading => {
+                // Anything from the page shows it is there, as a pong does.
+                unanswered = 0;
+                match incoming {
+                    Some(Ok(Message::Binary(typed))) => {
+                        idle.as_mut().reset(tokio::time::Instant::now() + pace.idle);
+                        let _ = queue.try_send(ToAp::Typed(typed));
                     }
+                    Some(Ok(Message::Text(text))) => {
+                        if let Ok(size) = serde_json::from_str::<Size>(&text) {
+                            let (cols, rows) = size.clamped();
+                            let _ = queue.try_send(ToAp::Size(cols, rows));
+                        }
+                    }
+                    Some(Ok(Message::Close(_)) | Err(_)) | None => break End::Gone,
+                    _ => {}
                 }
-                Some(Ok(Message::Close(_)) | Err(_)) | None => break End::Gone,
-                _ => {}
-            },
+            }
         }
     };
     writer.abort();
@@ -254,8 +294,9 @@ mod tests {
     /// An AP's SSH server, as far as a terminal needs one: the password `ubnt`
     /// logs in, the shell echoes what is typed in capitals and exits at `exit`,
     /// and the sizes it was given are kept. The user `nopty` gets no PTY, and
-    /// `noshell` no shell. For `stuck` the shell prints a lot at the first
-    /// input, and the AP takes in nothing more from then on.
+    /// `noshell` no shell, and `slow` takes 2 s to check a password. For
+    /// `stuck` the shell prints a lot at the first input, and the AP takes in
+    /// nothing more from then on.
     #[derive(Clone, Default)]
     struct Shell {
         sizes: Arc<std::sync::Mutex<Vec<(u32, u32)>>>,
@@ -270,6 +311,9 @@ mod tests {
         type Error = russh::Error;
 
         async fn auth_password(&mut self, user: &str, password: &str) -> Result<russh::server::Auth, Self::Error> {
+            if user == "slow" {
+                tokio::time::sleep(Duration::from_secs(2)).await;
+            }
             self.user = user.to_string();
             Ok(if password == "ubnt" { russh::server::Auth::Accept } else { russh::server::Auth::reject() })
         }
@@ -357,6 +401,7 @@ mod tests {
     struct Page {
         token: String,
         idle_ms: Option<u64>,
+        ping_ms: Option<u64>,
     }
 
     /// An AP (see [`Shell`]) and a server whose page route `/t/{user}?token=`
@@ -403,7 +448,7 @@ mod tests {
                 let logins = vec![(user.clone(), "wrong".to_string()), (user, "ubnt".to_string())];
                 let t = Target { ip: "127.0.0.1".into(), port, expected, logins };
                 let session = s.auth.session_of(&q.token).unwrap();
-                let pace = Pace { idle: q.idle_ms.map_or(PACE.idle, Duration::from_millis) };
+                let pace = Pace { idle: q.idle_ms.map_or(PACE.idle, Duration::from_millis), ping: q.ping_ms.map_or(PACE.ping, Duration::from_millis) };
                 upgrade.on_upgrade(move |mut socket| async move {
                     let end = bridge(&mut socket, &s, mac, t, &Size { cols: Some(100), rows: Some(30) }, &session, &pace).await;
                     let _ = done.send(end.clone());
@@ -523,5 +568,35 @@ mod tests {
         let (mut tcp, _) = stuck(&mut rig, "&idle_ms=1000").await;
         assert_eq!(closed(&mut tcp).await, (1000, "closed after 30 minutes without input".into()));
         assert_eq!(rig.ends.recv().await, Some(Ok(End::Idle)));
+        // The page went: its terminal ends with it, though what it sent is still unread.
+        let (tcp, _) = stuck(&mut rig, "&ping_ms=200").await;
+        drop(tcp);
+        assert_eq!(tokio::time::timeout(Duration::from_secs(5), rig.ends.recv()).await.unwrap(), Some(Ok(End::Gone)));
+    }
+
+    #[tokio::test]
+    async fn a_page_that_went_or_logged_out_while_its_terminal_logged_in_gets_no_shell() {
+        let mut rig = Rig::new().await;
+        // Closed while the AP checks the password: no shell, no event.
+        let (tcp, _) = rig.open("slow", "").await;
+        drop(tcp);
+        assert_eq!(tokio::time::timeout(Duration::from_secs(1), rig.ends.recv()).await.unwrap(), Some(Ok(End::Gone)));
+        // Logged out meanwhile: told so at once.
+        let (mut tcp, token) = rig.open("slow", "").await;
+        rig.state.auth.revoke(&token);
+        assert_eq!(tokio::time::timeout(Duration::from_secs(1), closed(&mut tcp)).await.unwrap(), (1008, "logged out".into()));
+        assert!(rig.engine.try_recv().is_err(), "no terminal opened");
+    }
+
+    #[tokio::test]
+    async fn a_page_that_answers_no_pings_has_gone() {
+        use crate::api::tests::frame;
+        let mut rig = Rig::new().await;
+        let (mut tcp, _) = rig.open("ubnt", "&ping_ms=100").await;
+        assert_eq!(frame(&mut tcp).await.0, 1, "connected");
+        for _ in 0..UNANSWERED {
+            assert_eq!(frame(&mut tcp).await.0, 9, "a ping");
+        }
+        assert_eq!(tokio::time::timeout(Duration::from_secs(2), rig.ends.recv()).await.unwrap(), Some(Ok(End::Gone)));
     }
 }

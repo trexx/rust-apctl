@@ -25,7 +25,8 @@ function theme() {
 /**
  * A shell on the AP over SSH, through apctl. What is typed goes as binary
  * frames, the size as JSON; the server says `{"connected":true}` once the
- * shell runs, or `{"error":…}` before it closes.
+ * shell runs, or `{"error":…}` before it closes. Nothing is sent before the
+ * shell runs.
  */
 export function Terminal({
   mac,
@@ -54,12 +55,16 @@ export function Terminal({
     term.loadAddon(fit);
     term.open(el);
     fit.fit();
-    const socket = terminalSocket(mac, term.cols, term.rows);
+    const opened = { cols: term.cols, rows: term.rows };
+    const socket = terminalSocket(mac, opened.cols, opened.rows);
     socket.binaryType = "arraybuffer";
     const encoder = new TextEncoder();
+    let connected = false;
     const send = (data: Uint8Array<ArrayBuffer> | string) => {
-      if (socket.readyState === WebSocket.OPEN) socket.send(data);
+      if (connected && socket.readyState === WebSocket.OPEN) socket.send(data);
     };
+    const sendSize = ({ cols, rows }: { cols: number; rows: number }) =>
+      send(JSON.stringify({ cols, rows }));
     let error: string | null = null;
     socket.onmessage = (e: MessageEvent<ArrayBuffer | string>) => {
       if (typeof e.data !== "string") {
@@ -68,6 +73,10 @@ export function Terminal({
       }
       const msg = JSON.parse(e.data) as { connected?: boolean; error?: string };
       if (msg.connected) {
+        connected = true;
+        // Resized while it connected: the shell started at the size it opened with.
+        if (term.cols !== opened.cols || term.rows !== opened.rows)
+          sendSize(term);
         setState({ at: "connected" });
         term.focus();
       }
@@ -87,7 +96,7 @@ export function Terminal({
       term.onData((d) => send(encoder.encode(d))),
       // Mouse reports in the legacy encoding: one byte per character.
       term.onBinary((d) => send(Uint8Array.from(d, (c) => c.charCodeAt(0)))),
-      term.onResize(({ cols, rows }) => send(JSON.stringify({ cols, rows }))),
+      term.onResize(sendSize),
     ];
     const resized = new ResizeObserver(() => fit.fit());
     resized.observe(el);
