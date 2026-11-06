@@ -494,7 +494,7 @@ async fn failing_clients(store: &Arc<Store>, now: Ts) -> anyhow::Result<usize> {
     let store = store.clone();
     // Parsing the reports and pairing fixups is CPU work: off the async workers too.
     tokio::task::spawn_blocking(move || {
-        let events = store.read(Db::Config, |c| Ok(crate::connections::load_rows(c, now - HEALTH_WINDOW, Ts::MAX, None, None)?))?;
+        let events = store.read(Db::Config, |c| Ok(crate::connections::load_rows(c, now - HEALTH_WINDOW, Ts::MAX)?))?;
         Ok(crate::connections::failed_clients(&crate::connections::attempts(events)))
     })
     .await?
