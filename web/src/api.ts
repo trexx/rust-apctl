@@ -1576,7 +1576,6 @@ export interface ConfigNetwork {
 export interface DeviceSettings {
   mac: Mac;
   name: string | null;
-  model: string | null;
   led_override: "default" | "on" | "off" | null;
   led_override_color: string | null;
   led_override_color_brightness: number | null;
