@@ -11,7 +11,6 @@
 //! informs or its record): no password goes to, and no root shell is opened
 //! on, a host taken on trust. Each terminal opened is an event naming the user.
 
-use std::sync::Arc;
 use std::time::Duration;
 
 use axum::extract::ws::{CloseFrame, Message, Utf8Bytes, WebSocket, WebSocketUpgrade, close_code};
@@ -25,14 +24,12 @@ use crate::api::{ApiError, AppState, MacPath};
 use crate::auth::SessionId;
 use crate::clock;
 use crate::engine::{Event, EventKind};
-use crate::ssh::Failure;
+use crate::ssh::{self, Failure};
 
 /// How long a terminal stays open with nothing typed.
 const IDLE: Duration = Duration::from_secs(30 * 60);
 /// How many terminals may be open at once, over all APs and users.
 static OPEN: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(4);
-/// How long starting the shell may take, once logged in.
-const START_TIMEOUT: Duration = Duration::from_secs(15);
 /// The most a frame from the page may hold: keystrokes, or a paste.
 const MAX_FRAME: usize = 64 << 10;
 
@@ -133,27 +130,12 @@ async fn finish(mut socket: WebSocket, end: Result<End, String>) {
 /// Logs in to the AP, starts its shell, and carries the terminal both ways
 /// until one side ends it.
 async fn bridge(socket: &mut WebSocket, s: &AppState, mac: Mac, t: Target, size: &Size, session: &SessionId) -> Result<End, String> {
-    // Kept open while nothing is typed; keepalives notice an AP that went away.
-    let config = Arc::new(russh::client::Config { keepalive_interval: Some(Duration::from_secs(30)), keepalive_max: 3, ..Default::default() });
-    let ssh = match crate::ssh::connect(config, &t.ip, t.port, &t.logins, Some(t.expected)).await {
-        Err(Failure::HostKey) => {
-            s.note(Event::device(clock::now_ts(), EventKind::ApHostKeyMismatch, mac, json!({ "ip": t.ip }))).await;
-            return Err(Failure::HostKey.to_string());
-        }
+    let ssh = match ssh::connect(ssh::shell_config(), &t.ip, t.port, &t.logins, Some(t.expected)).await {
+        Err(Failure::HostKey) => return Err(ssh::host_key_mismatch(s, mac, &t.ip).await.to_string()),
         r => r.map_err(|f| f.to_string())?,
     };
     let (cols, rows) = size.clamped();
-    let start = async {
-        let ch = ssh.handle.channel_open_session().await?;
-        ch.request_pty(false, "xterm-256color", cols, rows, 0, 0, &[]).await?;
-        ch.request_shell(false).await?;
-        Ok::<_, russh::Error>(ch)
-    };
-    let ch = match tokio::time::timeout(START_TIMEOUT, start).await {
-        Ok(Ok(ch)) => ch,
-        Ok(Err(e)) => return Err(format!("could not start a shell on the AP: {e}")),
-        Err(_) => return Err("could not start a shell on the AP: timed out".into()),
-    };
+    let ch = ssh.shell(cols, rows).await.map_err(|f| f.to_string())?;
     s.note(Event::device(clock::now_ts(), EventKind::ApTerminalOpened, mac, json!({ "user": session.user }))).await;
     tracing::info!("{mac}: terminal opened by {}", session.user);
     if socket.send(Message::Text(Utf8Bytes::from_static(r#"{"connected":true}"#))).await.is_err() {
@@ -194,13 +176,14 @@ async fn bridge(socket: &mut WebSocket, s: &AppState, mac: Mac, t: Target, size:
             },
         }
     };
-    let _ = ssh.handle.disconnect(russh::Disconnect::ByApplication, "", "en").await;
+    ssh.close().await;
     Ok(end)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
 
     #[test]
     fn sizes_are_kept_within_bounds() {
@@ -322,7 +305,7 @@ mod tests {
         // A host key other than the one expected: no login, and an event.
         let (_, mut tcp) = handshake(addr, "/t/changed", "", None).await;
         let (op, text) = frame(&mut tcp).await;
-        assert_eq!((op, serde_json::from_slice::<Value>(&text).unwrap()["error"].as_str()), (1, Some("the AP's SSH host key changed since last time")));
+        assert_eq!((op, serde_json::from_slice::<Value>(&text).unwrap()["error"].as_str()), (1, Some("the AP's SSH host key isn't the one apctl knows for it")));
         let Some(crate::engine::Input::Note(e)) = engine.recv().await else { panic!("no event") };
         assert_eq!(e.kind, EventKind::ApHostKeyMismatch);
     }
