@@ -26,12 +26,24 @@ use crate::clock;
 use crate::engine::{Event, EventKind};
 use crate::ssh::{self, Failure};
 
-/// How long a terminal stays open with nothing typed.
-const IDLE: Duration = Duration::from_secs(30 * 60);
 /// How many terminals may be open at once, over all APs and users.
 static OPEN: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(4);
 /// The most a frame from the page may hold: keystrokes, or a paste.
 const MAX_FRAME: usize = 64 << 10;
+/// How many of the page's frames may wait for the AP to take them in: then
+/// the page's are read no further until it does (TCP holds the page back).
+const QUEUED: usize = 16;
+/// How long the page may take to take in a frame: one that takes in nothing
+/// for that long has gone.
+const SEND_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// A terminal's timers.
+struct Pace {
+    /// How long a terminal stays open with nothing typed.
+    idle: Duration,
+}
+
+const PACE: Pace = Pace { idle: Duration::from_secs(30 * 60) };
 
 /// A terminal's size in characters, as the page measures it.
 #[derive(Debug, Default, Deserialize, PartialEq)]
@@ -90,7 +102,7 @@ fn target(s: &AppState, mac: &Mac) -> Result<Target, String> {
 }
 
 /// What ended a terminal.
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 enum End {
     /// The page closed it, or went away.
     Gone,
@@ -104,7 +116,7 @@ enum End {
 async fn terminal(mut socket: WebSocket, s: AppState, mac: Mac, size: Size, session: SessionId) {
     let end = match (OPEN.try_acquire(), target(&s, &mac)) {
         (Err(_), _) => Err("too many terminals are open: close one first".into()),
-        (Ok(_open), Ok(t)) => bridge(&mut socket, &s, mac, t, &size, &session).await,
+        (Ok(_open), Ok(t)) => bridge(&mut socket, &s, mac, t, &size, &session, &PACE).await,
         (Ok(_), Err(e)) => Err(e),
     };
     finish(socket, end).await;
@@ -112,6 +124,8 @@ async fn terminal(mut socket: WebSocket, s: AppState, mac: Mac, size: Size, sess
 
 /// Tells the page why its terminal ended (unless it went away), and closes the socket.
 async fn finish(mut socket: WebSocket, end: Result<End, String>) {
+    /// How long the page has to answer the close.
+    const CLOSING: Duration = Duration::from_secs(2);
     let close = |code, reason| Message::Close(Some(CloseFrame { code, reason: Utf8Bytes::from_static(reason) }));
     let last = match end {
         Ok(End::Gone) => return,
@@ -119,16 +133,50 @@ async fn finish(mut socket: WebSocket, end: Result<End, String>) {
         Ok(End::Idle) => close(close_code::NORMAL, "closed after 30 minutes without input"),
         Ok(End::LoggedOut) => crate::api::logged_out(),
         Err(e) => {
-            let _ = socket.send(Message::Text(json!({ "error": e }).to_string().into())).await;
+            send(&mut socket, Message::Text(json!({ "error": e }).to_string().into())).await;
             close(close_code::ERROR, "failed")
         }
     };
-    let _ = socket.send(last).await;
+    if send(&mut socket, last).await {
+        // Until the page answers, dropping what it sent meanwhile: closing with its frames
+        // unread would reset the connection, and the page could miss why it closed.
+        let answered = async { while let Some(Ok(m)) = socket.recv().await && !matches!(m, Message::Close(_)) {} };
+        let _ = tokio::time::timeout(CLOSING, answered).await;
+    }
+}
+
+/// Sends the page a frame; false when it has gone, or took in nothing for [`SEND_TIMEOUT`].
+async fn send(socket: &mut WebSocket, msg: Message) -> bool {
+    matches!(tokio::time::timeout(SEND_TIMEOUT, socket.send(msg)).await, Ok(Ok(())))
+}
+
+/// What goes to the AP, in the order the page sent it.
+enum ToAp {
+    Typed(axum::body::Bytes),
+    Size(u32, u32),
+}
+
+/// Hands the AP what the page sent, as fast as the AP takes it in: on a task
+/// of its own, since an AP that takes in nothing (a program that prints but
+/// reads nothing, once its input buffers are full) never lets a write finish.
+/// Ends when the session does.
+async fn to_ap(input: russh::ChannelWriteHalf<russh::client::Msg>, mut queue: tokio::sync::mpsc::Receiver<ToAp>) {
+    while let Some(m) = queue.recv().await {
+        let sent = match m {
+            ToAp::Typed(typed) => input.data_bytes(typed).await,
+            ToAp::Size(cols, rows) => input.window_change(cols, rows, 0, 0).await,
+        };
+        if sent.is_err() {
+            return;
+        }
+    }
 }
 
 /// Logs in to the AP, starts its shell, and carries the terminal both ways
-/// until one side ends it.
-async fn bridge(socket: &mut WebSocket, s: &AppState, mac: Mac, t: Target, size: &Size, session: &SessionId) -> Result<End, String> {
+/// until one side ends it. Nothing in the loop waits on the AP taking input
+/// in, nor on the page for longer than [`SEND_TIMEOUT`], so it always sees a
+/// logout, the idle limit and the page's end.
+async fn bridge(socket: &mut WebSocket, s: &AppState, mac: Mac, t: Target, size: &Size, session: &SessionId, pace: &Pace) -> Result<End, String> {
     let ssh = match ssh::connect(ssh::shell_config(), &t.ip, t.port, &t.logins, Some(t.expected)).await {
         Err(Failure::HostKey) => return Err(ssh::host_key_mismatch(s, mac, &t.ip).await.to_string()),
         r => r.map_err(|f| f.to_string())?,
@@ -137,37 +185,43 @@ async fn bridge(socket: &mut WebSocket, s: &AppState, mac: Mac, t: Target, size:
     let ch = ssh.shell(cols, rows).await.map_err(|f| f.to_string())?;
     s.note(Event::device(clock::now_ts(), EventKind::ApTerminalOpened, mac, json!({ "user": session.user }))).await;
     tracing::info!("{mac}: terminal opened by {}", session.user);
-    if socket.send(Message::Text(Utf8Bytes::from_static(r#"{"connected":true}"#))).await.is_err() {
+    if !send(socket, Message::Text(Utf8Bytes::from_static(r#"{"connected":true}"#))).await {
         return Ok(End::Gone);
     }
     let (mut output, input) = ch.split();
+    let (queue, queued) = tokio::sync::mpsc::channel(QUEUED);
+    let mut writer = tokio::spawn(to_ap(input, queued));
     let ended = crate::api::session_ends(&s.auth, Some(&session.hash));
-    let idle = tokio::time::sleep(IDLE);
+    let idle = tokio::time::sleep(pace.idle);
     tokio::pin!(ended, idle);
     let end = loop {
+        // Room for one more of the page's frames (only this loop queues them).
+        let reading = queue.capacity() > 0;
         tokio::select! {
             _ = &mut ended => break End::LoggedOut,
             _ = &mut idle => break End::Idle,
+            // The session ended under the writer.
+            _ = &mut writer => break End::Exited,
             msg = output.wait() => match msg {
                 Some(russh::ChannelMsg::Data { data } | russh::ChannelMsg::ExtendedData { data, .. }) => {
-                    if socket.send(Message::Binary(data)).await.is_err() {
+                    if !send(socket, Message::Binary(data)).await {
                         break End::Gone;
                     }
                 }
                 Some(russh::ChannelMsg::Close) | None => break End::Exited,
                 _ => {}
             },
-            incoming = socket.recv() => match incoming {
+            // Room again: the page's frames are read on.
+            _ = queue.reserve(), if !reading => {}
+            incoming = socket.recv(), if reading => match incoming {
                 Some(Ok(Message::Binary(typed))) => {
-                    idle.as_mut().reset(tokio::time::Instant::now() + IDLE);
-                    if input.data_bytes(typed).await.is_err() {
-                        break End::Exited;
-                    }
+                    idle.as_mut().reset(tokio::time::Instant::now() + pace.idle);
+                    let _ = queue.try_send(ToAp::Typed(typed));
                 }
                 Some(Ok(Message::Text(text))) => {
                     if let Ok(size) = serde_json::from_str::<Size>(&text) {
                         let (cols, rows) = size.clamped();
-                        let _ = input.window_change(cols, rows, 0, 0).await;
+                        let _ = queue.try_send(ToAp::Size(cols, rows));
                     }
                 }
                 Some(Ok(Message::Close(_)) | Err(_)) | None => break End::Gone,
@@ -175,6 +229,9 @@ async fn bridge(socket: &mut WebSocket, s: &AppState, mac: Mac, t: Target, size:
             },
         }
     };
+    writer.abort();
+    // The session may be waiting to hand this a message: let it go on to the disconnect.
+    drop(output);
     ssh.close().await;
     Ok(end)
 }
@@ -183,6 +240,7 @@ async fn bridge(socket: &mut WebSocket, s: &AppState, mac: Mac, t: Target, size:
 mod tests {
     use super::*;
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     #[test]
     fn sizes_are_kept_within_bounds() {
@@ -196,11 +254,16 @@ mod tests {
     /// An AP's SSH server, as far as a terminal needs one: the password `ubnt`
     /// logs in, the shell echoes what is typed in capitals and exits at `exit`,
     /// and the sizes it was given are kept. The user `nopty` gets no PTY, and
-    /// `noshell` no shell.
+    /// `noshell` no shell. For `stuck` the shell prints a lot at the first
+    /// input, and the AP takes in nothing more from then on.
     #[derive(Clone, Default)]
     struct Shell {
         sizes: Arc<std::sync::Mutex<Vec<(u32, u32)>>>,
+        /// How much was typed, over all sessions.
+        typed: Arc<AtomicUsize>,
         user: String,
+        /// This session's AP takes in nothing more (see [`Stalling`]).
+        stalled: Arc<AtomicBool>,
     }
 
     impl russh::server::Handler for Shell {
@@ -235,6 +298,21 @@ mod tests {
         }
 
         async fn data(&mut self, ch: russh::ChannelId, data: &[u8], session: &mut russh::server::Session) -> Result<(), Self::Error> {
+            self.typed.fetch_add(data.len(), Ordering::Relaxed);
+            if self.user == "stuck" {
+                // More than the client's channel holds (100 messages) while nothing drains it.
+                if !self.stalled.swap(true, Ordering::Relaxed) {
+                    let h = session.handle();
+                    tokio::spawn(async move {
+                        for _ in 0..300 {
+                            if h.data(ch, vec![b'.'; 512]).await.is_err() {
+                                return;
+                            }
+                        }
+                    });
+                }
+                return Ok(());
+            }
             if data == b"exit\r" {
                 session.exit_status_request(ch, 0)?;
                 return session.close(ch);
@@ -243,89 +321,207 @@ mod tests {
         }
     }
 
+    /// The AP's end of a connection, which reads nothing once `stalled`: no
+    /// window adjustment then comes back, as from an AP whose program reads no
+    /// input once its buffers are full.
+    struct Stalling {
+        tcp: tokio::net::TcpStream,
+        stalled: Arc<AtomicBool>,
+    }
+
+    impl tokio::io::AsyncRead for Stalling {
+        fn poll_read(mut self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>, buf: &mut tokio::io::ReadBuf<'_>) -> std::task::Poll<std::io::Result<()>> {
+            if self.stalled.load(Ordering::Relaxed) {
+                return std::task::Poll::Pending;
+            }
+            std::pin::Pin::new(&mut self.tcp).poll_read(cx, buf)
+        }
+    }
+
+    impl tokio::io::AsyncWrite for Stalling {
+        fn poll_write(mut self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>, buf: &[u8]) -> std::task::Poll<std::io::Result<usize>> {
+            std::pin::Pin::new(&mut self.tcp).poll_write(cx, buf)
+        }
+
+        fn poll_flush(mut self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<std::io::Result<()>> {
+            std::pin::Pin::new(&mut self.tcp).poll_flush(cx)
+        }
+
+        fn poll_shutdown(mut self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<std::io::Result<()>> {
+            std::pin::Pin::new(&mut self.tcp).poll_shutdown(cx)
+        }
+    }
+
+    /// The query of the test's page route.
+    #[derive(Deserialize)]
+    struct Page {
+        token: String,
+        idle_ms: Option<u64>,
+    }
+
+    /// An AP (see [`Shell`]) and a server whose page route `/t/{user}?token=`
+    /// runs a terminal to it, logged in as `user` (`changed`: expecting another
+    /// host key) for the session of `token`. Each terminal's end goes to `ends`.
+    struct Rig {
+        addr: std::net::SocketAddr,
+        shell: Shell,
+        state: AppState,
+        engine: tokio::sync::mpsc::Receiver<crate::engine::Input>,
+        ends: tokio::sync::mpsc::UnboundedReceiver<Result<End, String>>,
+        _dir: crate::model::tests::TestDir,
+    }
+
+    impl Rig {
+        async fn new() -> Rig {
+            use axum::extract::Path;
+            let key = russh::keys::PrivateKey::from(russh::keys::ssh_key::private::Ed25519Keypair::from_seed(&[7; 32]));
+            let fingerprint = key.public_key().fingerprint(russh::keys::HashAlg::Sha256).to_string();
+            // A small window, which an AP that takes in nothing soon uses up.
+            let config = Arc::new(russh::server::Config { keys: vec![key], window_size: 4096, ..Default::default() });
+            let shell = Shell::default();
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let server = shell.clone();
+            tokio::spawn(async move {
+                loop {
+                    let (tcp, _) = listener.accept().await.unwrap();
+                    let stalled = Arc::new(AtomicBool::new(false));
+                    let (config, shell) = (config.clone(), Shell { stalled: stalled.clone(), ..server.clone() });
+                    tokio::spawn(async move {
+                        if let Ok(session) = russh::server::run_stream(config, Stalling { tcp, stalled }, shell).await {
+                            let _ = session.await;
+                        }
+                    });
+                }
+            });
+            let (state, engine, _dir) = crate::api::tests::state();
+            let (done, ends) = tokio::sync::mpsc::unbounded_channel();
+            let mac: Mac = "02:00:00:00:00:01".parse().unwrap();
+            let page = move |State(s): State<AppState>, Path(user): Path<String>, Query(q): Query<Page>, upgrade: WebSocketUpgrade| async move {
+                let expected = if user == "changed" { "SHA256:other".into() } else { fingerprint };
+                // A wrong password first, as when the site's login is not the AP's.
+                let logins = vec![(user.clone(), "wrong".to_string()), (user, "ubnt".to_string())];
+                let t = Target { ip: "127.0.0.1".into(), port, expected, logins };
+                let session = s.auth.session_of(&q.token).unwrap();
+                let pace = Pace { idle: q.idle_ms.map_or(PACE.idle, Duration::from_millis) };
+                upgrade.on_upgrade(move |mut socket| async move {
+                    let end = bridge(&mut socket, &s, mac, t, &Size { cols: Some(100), rows: Some(30) }, &session, &pace).await;
+                    let _ = done.send(end.clone());
+                    finish(socket, end).await;
+                })
+            };
+            let app = axum::Router::new().route("/t/{user}", axum::routing::get(page)).with_state(state.clone());
+            let addr = crate::api::tests::serve(app).await;
+            Rig { addr, shell, state, engine, ends, _dir }
+        }
+
+        /// A page's terminal to the AP as `user`, for a new session: the
+        /// connection, and the session's token.
+        async fn open(&self, user: &str, query: &str) -> (tokio::net::TcpStream, String) {
+            let token = self.state.auth.create("admin");
+            let (status, tcp) = crate::api::tests::handshake(self.addr, &format!("/t/{user}?token={token}{query}"), "", None).await;
+            assert_eq!(status, "101");
+            (tcp, token)
+        }
+
+        /// The next event noted.
+        async fn event(&mut self) -> EventKind {
+            let Some(crate::engine::Input::Note(e)) = self.engine.recv().await else { panic!("no event") };
+            e.kind
+        }
+    }
+
     /// A frame from the page: masked, as a browser sends it (with a zero mask, so as it is).
-    async fn send(tcp: &mut tokio::net::TcpStream, op: u8, payload: &[u8]) {
+    async fn from_page(tcp: &mut tokio::net::TcpStream, op: u8, payload: &[u8]) {
         use tokio::io::AsyncWriteExt;
-        assert!(payload.len() < 126);
-        let mut f = vec![0x80 | op, 0x80 | payload.len() as u8, 0, 0, 0, 0];
+        let mut f = vec![0x80 | op];
+        match payload.len() {
+            n @ ..126 => f.push(0x80 | n as u8),
+            n => {
+                f.push(0x80 | 126);
+                f.extend_from_slice(&u16::try_from(n).unwrap().to_be_bytes());
+            }
+        }
+        f.extend_from_slice(&[0; 4]);
         f.extend_from_slice(payload);
         tcp.write_all(&f).await.unwrap();
     }
 
+    /// The error the page is told, and that a close follows it.
+    async fn error(tcp: &mut tokio::net::TcpStream) -> String {
+        use crate::api::tests::frame;
+        let (op, text) = frame(tcp).await;
+        assert_eq!((op, frame(tcp).await.0), (1, 8), "text, then closed");
+        serde_json::from_slice::<Value>(&text).unwrap()["error"].as_str().unwrap().to_string()
+    }
+
+    /// The close frame's code and reason, past what the shell prints.
+    async fn closed(tcp: &mut tokio::net::TcpStream) -> (u16, String) {
+        loop {
+            match crate::api::tests::frame(tcp).await {
+                (2, _) => continue,
+                (8, close) => return (u16::from_be_bytes([close[0], close[1]]), String::from_utf8(close[2..].to_vec()).unwrap()),
+                (op, _) => panic!("frame {op}"),
+            }
+        }
+    }
+
     #[tokio::test]
     async fn a_terminal_carries_keystrokes_output_and_sizes_and_checks_the_host_key() {
-        use crate::api::tests::{frame, handshake, serve};
-        use axum::routing::get;
-        let key = russh::keys::PrivateKey::from(russh::keys::ssh_key::private::Ed25519Keypair::from_seed(&[7; 32]));
-        let fingerprint = key.public_key().fingerprint(russh::keys::HashAlg::Sha256).to_string();
-        let config = Arc::new(russh::server::Config { keys: vec![key], ..Default::default() });
-        let shell = Shell::default();
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
-        let server = shell.clone();
-        tokio::spawn(async move {
-            loop {
-                let (tcp, _) = listener.accept().await.unwrap();
-                let (config, shell) = (config.clone(), server.clone());
-                tokio::spawn(async move {
-                    if let Ok(session) = russh::server::run_stream(config, tcp, shell).await {
-                        let _ = session.await;
-                    }
-                });
-            }
-        });
-
-        let (s, mut engine, _dir) = crate::api::tests::state();
-        let mac: Mac = "02:00:00:00:00:01".parse().unwrap();
-        let session = s.auth.session_of(&s.auth.create("admin")).unwrap();
-        let app = axum::Router::new()
-            .route(
-                "/t/{key}",
-                get(move |State(s): State<AppState>, axum::extract::Path(key): axum::extract::Path<String>, upgrade: WebSocketUpgrade| async move {
-                    let expected = if key == "changed" { "SHA256:other".into() } else { fingerprint };
-                    // A wrong password first, as when the site's login is not the AP's.
-                    let user = if key == "changed" { "ubnt" } else { &key };
-                    let logins = vec![(user.to_string(), "wrong".to_string()), (user.to_string(), "ubnt".to_string())];
-                    let t = Target { ip: "127.0.0.1".into(), port, expected, logins };
-                    upgrade.on_upgrade(move |mut socket| async move {
-                        let end = bridge(&mut socket, &s, mac, t, &Size { cols: Some(100), rows: Some(30) }, &session).await;
-                        finish(socket, end).await;
-                    })
-                }),
-            )
-            .with_state(s);
-        let addr = serve(app).await;
-
-        let (status, mut tcp) = handshake(addr, "/t/ubnt", "", None).await;
-        assert_eq!(status, "101");
+        use crate::api::tests::frame;
+        let mut rig = Rig::new().await;
+        let (mut tcp, _) = rig.open("ubnt", "").await;
         assert_eq!(frame(&mut tcp).await, (1, br#"{"connected":true}"#.to_vec()));
-        let Some(crate::engine::Input::Note(e)) = engine.recv().await else { panic!("no event") };
-        assert_eq!(e.kind, EventKind::ApTerminalOpened);
-        send(&mut tcp, 2, b"uptime").await;
+        assert_eq!(rig.event().await, EventKind::ApTerminalOpened);
+        from_page(&mut tcp, 2, b"uptime").await;
         assert_eq!(frame(&mut tcp).await, (2, b"UPTIME".to_vec()));
         // A resize, then a keystroke: the shell has the size by the time it echoes.
-        send(&mut tcp, 1, br#"{"cols":120,"rows":40}"#).await;
-        send(&mut tcp, 2, b"x").await;
+        from_page(&mut tcp, 1, br#"{"cols":120,"rows":40}"#).await;
+        from_page(&mut tcp, 2, b"x").await;
         assert_eq!(frame(&mut tcp).await, (2, b"X".to_vec()));
-        assert_eq!(*shell.sizes.lock().unwrap(), [(100, 30), (120, 40)]);
+        assert_eq!(*rig.shell.sizes.lock().unwrap(), [(100, 30), (120, 40)]);
         // The shell exits: a normal close, saying so.
-        send(&mut tcp, 2, b"exit\r").await;
-        let (op, close) = frame(&mut tcp).await;
-        assert_eq!((op, &close[..2], &close[2..]), (8, &1000u16.to_be_bytes()[..], &b"the shell ended"[..]));
+        from_page(&mut tcp, 2, b"exit\r").await;
+        assert_eq!(closed(&mut tcp).await, (1000, "the shell ended".into()));
+        assert_eq!(rig.ends.recv().await, Some(Ok(End::Exited)));
 
         // A host key other than the one expected: no login, and an event.
-        let (_, mut tcp) = handshake(addr, "/t/changed", "", None).await;
-        let (op, text) = frame(&mut tcp).await;
-        assert_eq!((op, serde_json::from_slice::<Value>(&text).unwrap()["error"].as_str()), (1, Some("the AP's SSH host key isn't the one apctl knows for it")));
-        let Some(crate::engine::Input::Note(e)) = engine.recv().await else { panic!("no event") };
-        assert_eq!(e.kind, EventKind::ApHostKeyMismatch);
+        let (mut tcp, _) = rig.open("changed", "").await;
+        assert_eq!(error(&mut tcp).await, "the AP's SSH host key isn't the one apctl knows for it");
+        assert_eq!(rig.event().await, EventKind::ApHostKeyMismatch);
 
         // An AP that refuses the PTY or the shell: it says so, and no terminal was opened.
-        for (user, error) in [("nopty", "could not start a shell on the AP: it refused a terminal (PTY)"), ("noshell", "could not start a shell on the AP: it refused a shell")] {
-            let (_, mut tcp) = handshake(addr, &format!("/t/{user}"), "", None).await;
-            let (op, text) = frame(&mut tcp).await;
-            assert_eq!((op, serde_json::from_slice::<Value>(&text).unwrap()["error"].as_str()), (1, Some(error)));
+        assert_eq!(error(&mut rig.open("nopty", "").await.0).await, "could not start a shell on the AP: it refused a terminal (PTY)");
+        assert_eq!(error(&mut rig.open("noshell", "").await.0).await, "could not start a shell on the AP: it refused a shell");
+        assert!(rig.engine.try_recv().is_err(), "no event");
+    }
+
+    /// Opens a terminal to an AP that prints a lot and then takes in nothing,
+    /// and pastes more than it and the queue for it hold.
+    async fn stuck(rig: &mut Rig, query: &str) -> (tokio::net::TcpStream, String) {
+        let (mut tcp, token) = rig.open("stuck", query).await;
+        assert_eq!(crate::api::tests::frame(&mut tcp).await.0, 1, "connected");
+        assert_eq!(rig.event().await, EventKind::ApTerminalOpened);
+        let paste = vec![b'x'; 16 << 10];
+        for _ in 0..QUEUED + 4 {
+            from_page(&mut tcp, 2, &paste).await;
         }
-        assert!(engine.try_recv().is_err(), "no event");
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(rig.shell.typed.load(Ordering::Relaxed) < 2 * paste.len(), "the AP took in little");
+        (tcp, token)
+    }
+
+    #[tokio::test]
+    async fn an_ap_that_takes_in_nothing_holds_up_no_logout_and_no_idle_limit() {
+        let mut rig = Rig::new().await;
+        // Logged out meanwhile: closed at once, saying so.
+        let (mut tcp, token) = stuck(&mut rig, "").await;
+        rig.state.auth.revoke(&token);
+        assert_eq!(closed(&mut tcp).await, (1008, "logged out".into()));
+        assert_eq!(rig.ends.recv().await, Some(Ok(End::LoggedOut)));
+        // Nothing typed for the idle limit: closed then.
+        let (mut tcp, _) = stuck(&mut rig, "&idle_ms=1000").await;
+        assert_eq!(closed(&mut tcp).await, (1000, "closed after 30 minutes without input".into()));
+        assert_eq!(rig.ends.recv().await, Some(Ok(End::Idle)));
     }
 }

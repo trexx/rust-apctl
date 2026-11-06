@@ -244,7 +244,7 @@ impl Auth {
     /// Ends a session; false when there was none. Anyone can send a cookie,
     /// so only a session that was there wakes the live sockets and queues a
     /// write.
-    fn revoke(&self, token: &str) -> bool {
+    pub(crate) fn revoke(&self, token: &str) -> bool {
         let hash = token_hash(token);
         if self.sessions.lock().unwrap().remove(&hash).is_none() {
             return false;
