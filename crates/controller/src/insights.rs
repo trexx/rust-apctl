@@ -1,7 +1,7 @@
 //! Site-wide and RF views: activity, airtime, top APs and clients, retry
 //! rates, connection success, the radio overview and neighbouring networks.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, btree_map::Entry};
 
 use axum::extract::State;
 use rusqlite::Connection;
@@ -982,9 +982,9 @@ struct OwnLink {
 }
 
 /// GET /api/rf/neighbors: networks heard by our APs, the AP hearing each best,
-/// strongest (best signal) first, and our own APs' signal to each other (AP
-/// density), once per pair of APs and band; either list alone with
-/// `links_only` or `neighbors_only`.
+/// strongest (the best signal any AP heard) first, and our own APs' signal to
+/// each other (AP density), once per pair of APs and band; either list alone
+/// with `links_only` or `neighbors_only`.
 pub async fn neighbors(State(s): State<AppState>, Query(q): Query<NeighborQuery>) -> Result<Json<Value>, ApiError> {
     let now = clock::now_ts();
     let since = now - q.range.unwrap_or(86400).clamp(600, 30 * 86400);
@@ -1057,8 +1057,23 @@ pub async fn neighbors(State(s): State<AppState>, Query(q): Query<NeighborQuery>
             }
             continue;
         }
-        if !q.links_only && by_bssid.get(&r.bssid).is_none_or(|cur| signal(&r) > signal(cur)) {
-            by_bssid.insert(r.bssid.clone(), r);
+        if q.links_only {
+            continue;
+        }
+        // The AP hearing it strongest names it; when it was last heard and the best
+        // signal heard are the network's, over every AP's row (as the threat list reads them).
+        match by_bssid.entry(r.bssid.clone()) {
+            Entry::Vacant(e) => {
+                e.insert(r);
+            }
+            Entry::Occupied(mut e) => {
+                let cur = e.get_mut();
+                let (last_seen, best) = (cur.last_seen.max(r.last_seen), cur.best_signal.or(cur.signal).max(r.best_signal.or(r.signal)));
+                if signal(&r) > signal(cur) {
+                    *cur = r;
+                }
+                (cur.last_seen, cur.best_signal) = (last_seen, best);
+            }
         }
     }
     let mut list: Vec<Neighbor> = by_bssid.into_values().collect();
@@ -1593,9 +1608,17 @@ mod tests {
             assert_eq!(keys, ["best_signal", "bssid", "bw", "center_freq", "channel", "essid", "last_seen", "nearest_ap", "radio", "security", "signal", "vendor"]);
             // Ordered by the best signal heard, else the signal.
             insert(&c, "neighbors", &["bssid", "ap_mac", "radio", "essid", "signal", "best_signal", "first_seen", "last_seen"], vec![vec![text("02:aa:00:00:00:04"), text(A1), text("na"), text("Once close"), int(-90), int(-50), int(base - 60), int(base)]]);
-            let out = ok(neighbors(State(s), Query(NeighborQuery { band: None, range: Some(30 * 86400), links_only: false, neighbors_only: true })).await);
+            let out = ok(neighbors(State(s.clone()), Query(NeighborQuery { band: None, range: Some(30 * 86400), links_only: false, neighbors_only: true })).await);
             let names: Vec<&str> = out["neighbors"].as_array().unwrap().iter().map(|n| n["essid"].as_str().unwrap()).collect();
             assert_eq!(names, ["Once close", "Neighbour", "Other", "Far"]);
+            // "Far" heard by A2 too, stronger but long ago: A2 names it, while when it was last heard
+            // and the best signal are over both APs' rows.
+            insert(&c, "neighbors", &["bssid", "ap_mac", "radio", "essid", "signal", "best_signal", "first_seen", "last_seen"], vec![vec![text("02:aa:00:00:00:03"), text(A2), text("na"), text("Far"), int(-75), int(-75), int(base - 86400), int(base - 3600)]]);
+            c.execute("UPDATE neighbors SET best_signal = -45 WHERE bssid = '02:aa:00:00:00:03' AND ap_mac = ?1", [A1]).unwrap();
+            let out = ok(neighbors(State(s), Query(NeighborQuery { band: None, range: Some(30 * 86400), links_only: false, neighbors_only: true })).await);
+            let far = out["neighbors"].as_array().unwrap().iter().find(|n| n["essid"] == "Far").unwrap();
+            assert_eq!((&far["nearest_ap"], &far["signal"], &far["best_signal"], far["last_seen"].as_i64()), (&json!("Attic"), &json!(-75), &json!(-45), Some(base + 3000)));
+            assert_eq!(out["neighbors"][0]["essid"], "Far", "sorted on its best signal over all rows");
         }
 
         #[tokio::test]
