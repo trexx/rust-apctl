@@ -229,6 +229,23 @@ fn snmp_lines_follow_sshd() {
     assert!(after.contains("snmp.version=all\n"));
 }
 
+/// A channel blacklist stored with numbers renders the same `blklst` as one stored
+/// with text (the capture's), as the official controller reads either as text. Only
+/// AP_U has a radio on an automatic channel, where `blklst` is written.
+#[test]
+fn a_numeric_blacklisted_channel_is_blocked_too() {
+    let Some(_) = common::fixtures() else { return };
+    let mut s = state();
+    let before = render(&s, AP_U, "0").rendered.system_cfg;
+    assert!(before.contains(".blklst="), "the capture's state blocks channels on its auto radio");
+    let ai = s["setting"].as_array_mut().unwrap().iter_mut().find(|x| x["key"] == "radio_ai").unwrap();
+    for b in ai["channels_blacklist"].as_array_mut().unwrap() {
+        let n: i64 = b["channel"].as_str().unwrap().parse().unwrap();
+        b["channel"] = json!(n);
+    }
+    assert_eq!(render(&s, AP_U, "0").rendered.system_cfg, before);
+}
+
 /// mDNS "auto" filters the SSID's VLAN for every predefined service type, and a
 /// custom rule scoped to specific APs applies only on those (written from the
 /// decompile; the capture only has custom rules for all APs).

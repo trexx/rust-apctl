@@ -429,13 +429,15 @@ pub fn render_radios(c: &mut Cfg, ctx: &Ctx, radios: &[Radio], vaps: &[Vap]) -> 
             c.set(k.at("acsdfs"), on_off(radio_ai_na_dfs(ctx.radio_ai)));
         }
         if channel.is("auto") && acs_dfs {
-            let blocked: Vec<&str> = arr(ctx.radio_ai, "channels_blacklist")
+            // A channel stored as a number counts too: the official reads it as text.
+            let blocked: Vec<String> = arr(ctx.radio_ai, "channels_blacklist")
                 .iter()
                 .filter(|b| str_of(b, "radio") == Some(r.band.as_str()))
-                .filter_map(|b| str_of(b, "channel"))
+                .filter_map(|b| text_of(b, "channel"))
+                .map(|t| t.to_string())
                 .collect();
             if !blocked.is_empty() {
-                c.set(k.at("blklst"), hash_set_order(blocked).join(","));
+                c.set(k.at("blklst"), hash_set_order(blocked.iter().map(String::as_str)).join(","));
             }
         }
         if ctx.caps.has(Cap::GreenAp) {
