@@ -10,7 +10,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::api::{ApiError, AppState, Json, MacPath, Path, Query};
-use crate::settings::{ClientNames, Patch, PreviewQuery, change, client_label, client_names, doc_by_id, doc_by_id_mut, docs, hidden_doc_id, id_of, new_id, num, push_doc, remove_doc, str_field};
+use crate::settings::{ClientNames, Patch, PreviewQuery, change, client_label, client_names, doc_by_id, doc_by_id_mut, docs, hidden_doc_id, id_of, most_named, new_id, num, push_doc, remove_doc, str_field};
 
 /// The default user group, created when the settings have none (imports made
 /// before apctl read user groups). It keeps the id the SSIDs already point at.
@@ -39,15 +39,7 @@ fn default_usergroup_doc(id: &str) -> Value {
 /// (the first of a tie) that no group has (an id a group has is a speed limit,
 /// not the default). `None` when no SSID points at a missing group.
 fn orphan_usergroup_id(state: &Value) -> Option<&str> {
-    let mut uses: Vec<(&str, usize)> = Vec::new();
-    for g in docs(state, "wlanconf").filter_map(|w| w["usergroup_id"].as_str()).filter(|g| !g.is_empty() && doc_by_id(state, "usergroup", g).is_none()) {
-        match uses.iter_mut().find(|(id, _)| *id == g) {
-            Some((_, n)) => *n += 1,
-            None => uses.push((g, 1)),
-        }
-    }
-    // max_by_key keeps the last of equals: reversed, that is the first seen.
-    uses.into_iter().rev().max_by_key(|(_, n)| *n).map(|(id, _)| id)
+    most_named(docs(state, "wlanconf").filter_map(|w| w["usergroup_id"].as_str()).filter(|g| !g.is_empty() && doc_by_id(state, "usergroup", g).is_none()))
 }
 
 /// The id of the site's default user group (no speed limit).

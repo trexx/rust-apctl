@@ -164,15 +164,7 @@ pub(crate) fn doc_mac(v: &Value) -> Option<inform::Mac> {
 pub fn site_id(state: &Value) -> Option<&str> {
     let named = |k: &str| state[k].as_array().into_iter().flatten().filter_map(|d| d["site_id"].as_str());
     named("devices").next().or_else(|| {
-        let mut counts: Vec<(&str, usize)> = Vec::new();
-        for s in ["wlanconf", "networkconf", "setting"].into_iter().flat_map(named) {
-            match counts.iter_mut().find(|(id, _)| *id == s) {
-                Some((_, n)) => *n += 1,
-                None => counts.push((s, 1)),
-            }
-        }
-        // `max_by_key` takes the last of equals: reversed, a tie goes to the first named.
-        counts.iter().rev().max_by_key(|(_, n)| *n).map(|(s, _)| *s).or_else(|| {
+        most_named(["wlanconf", "networkconf", "setting"].into_iter().flat_map(named)).or_else(|| {
             let sites = state["sites"].as_array()?;
             let mut own = sites.iter().filter(|s| s["name"].as_str() != Some("super"));
             match (own.next(), own.next()) {
@@ -354,6 +346,19 @@ pub(crate) fn pick(v: &Value, keys: &[&str]) -> serde_json::Map<String, Value> {
 /// The site's APs' MACs (however their records write them).
 pub(crate) fn device_macs(state: &Value) -> Vec<inform::Mac> {
     docs(state, "devices").filter_map(|d| doc_mac(&d["mac"])).collect()
+}
+
+/// The id named most often, the first named of a tie (`None` for none).
+pub(crate) fn most_named<'a>(ids: impl Iterator<Item = &'a str>) -> Option<&'a str> {
+    let mut counts: Vec<(&str, usize)> = Vec::new();
+    for id in ids {
+        match counts.iter_mut().find(|(c, _)| *c == id) {
+            Some((_, n)) => *n += 1,
+            None => counts.push((id, 1)),
+        }
+    }
+    // `max_by_key` takes the last of equals: reversed, that is the first named.
+    counts.into_iter().rev().max_by_key(|(_, n)| *n).map(|(id, _)| id)
 }
 
 /// Drops repeated entries, keeping the first of each in place.
