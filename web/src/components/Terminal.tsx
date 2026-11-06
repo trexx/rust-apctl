@@ -5,6 +5,8 @@ import "@xterm/xterm/css/xterm.css";
 import { announceUnauthorized, terminalSocket } from "../api";
 import type { Mac } from "../api";
 
+/** The most one frame of input holds: a paste goes in pieces (the server takes 64 KiB at most). */
+const CHUNK = 16 << 10;
 /** Flow control: with this much output written but not yet shown, the server is asked to pause the AP's… */
 const HIGH = 128 << 10;
 /** …and below this, to go on. */
@@ -68,6 +70,10 @@ export function Terminal({
     const send = (data: Uint8Array<ArrayBuffer> | string) => {
       if (connected && socket.readyState === WebSocket.OPEN) socket.send(data);
     };
+    const sendBytes = (bytes: Uint8Array<ArrayBuffer>) => {
+      for (let at = 0; at < bytes.length; at += CHUNK)
+        send(bytes.subarray(at, at + CHUNK));
+    };
     const sendSize = ({ cols, rows }: { cols: number; rows: number }) =>
       send(JSON.stringify({ cols, rows }));
     // Output written to the terminal but not yet shown, and whether the AP's is paused for it.
@@ -111,9 +117,11 @@ export function Terminal({
       });
     };
     const subscriptions = [
-      term.onData((d) => send(encoder.encode(d))),
+      term.onData((d) => sendBytes(encoder.encode(d))),
       // Mouse reports in the legacy encoding: one byte per character.
-      term.onBinary((d) => send(Uint8Array.from(d, (c) => c.charCodeAt(0)))),
+      term.onBinary((d) =>
+        sendBytes(Uint8Array.from(d, (c) => c.charCodeAt(0))),
+      ),
       term.onResize(sendSize),
     ];
     const resized = new ResizeObserver(() => fit.fit());
