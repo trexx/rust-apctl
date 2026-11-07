@@ -351,14 +351,14 @@ const BOOL_FIELDS: &[&str] = &[
     "green_ap_enabled", "jumboframe_enabled", "min_rssi_enabled", "hard_noise_floor_enabled", "sens_level_enabled", "loadbalance_enabled",
 ];
 
-/// [`pick`] for an editor: a switch stored as text ("true"/"false", as some
-/// imports write it) goes out as the boolean the render reads it as.
+/// [`pick`] for an editor: a switch goes out as the boolean the render reads it
+/// as (text "true"/"false" too, as some imports write it), or `null` for a value
+/// the render can't read (1, "yes"), which it takes as the field's default, as
+/// the editors take `null`.
 fn pick_read(v: &Value, keys: &[&str]) -> serde_json::Map<String, Value> {
     let mut o = pick(v, keys);
     for (k, x) in o.iter_mut().filter(|(k, _)| BOOL_FIELDS.contains(&k.as_str())) {
-        if let Some(b) = apcfg::bool_of(v, k) {
-            *x = json!(b);
-        }
+        *x = apcfg::bool_of(v, k).map_or(Value::Null, Value::from);
     }
     o
 }
@@ -2767,9 +2767,10 @@ mod tests {
         (s["wlanconf"][0]["enabled"], s["wlanconf"][0]["hide_ssid"], s["wlanconf"][0]["name"]) = (json!("false"), json!("true"), json!("true"));
         let w = &wlans_view(&s, &HashMap::new())["wlans"][0];
         assert_eq!((&w["enabled"], &w["hide_ssid"], &w["name"], &w["is_guest"]), (&json!(false), &json!(true), &json!("true"), &Value::Null), "a name stays text, unset stays unset");
-        let r = json!({ "radio": "na", "name": "wifi1", "min_rssi_enabled": "false", "loadbalance_enabled": "true", "sens_level_enabled": "maybe", "vwire_enabled": true });
+        let r = json!({ "radio": "na", "name": "wifi1", "min_rssi_enabled": "false", "loadbalance_enabled": "true", "sens_level_enabled": "maybe", "hard_noise_floor_enabled": 1, "vwire_enabled": true });
         let v = radio_view(&s, &r, &Value::Null);
-        assert_eq!((&v["min_rssi_enabled"], &v["loadbalance_enabled"], &v["sens_level_enabled"]), (&json!(false), &json!(true), &json!("maybe")));
+        let switches = [&v["min_rssi_enabled"], &v["loadbalance_enabled"], &v["sens_level_enabled"], &v["hard_noise_floor_enabled"]];
+        assert_eq!(switches, [&json!(false), &json!(true), &Value::Null, &Value::Null], "what the render can't read goes out unset, as it reads it");
         assert!(v.get("name").is_none() && v.get("vwire_enabled").is_none(), "the editor shows neither");
         let d = pick_read(&json!({ "name": "false", "atf_enabled": "true", "green_ap_enabled": false }), DEVICE_FIELDS);
         assert_eq!((&d["name"], &d["atf_enabled"], &d["green_ap_enabled"], &d["jumboframe_enabled"]), (&json!("false"), &json!(true), &json!(false), &Value::Null));
