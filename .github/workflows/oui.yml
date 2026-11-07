@@ -65,6 +65,8 @@ jobs:
         type=raw,value=latest
         type=raw,value={{date 'YYYY-MM-DD-HHmmss'}}
       flavor: 'latest=false'
+      # Read only: the layers the fetch job wrote, a scope nothing reads after this run.
       cache_scope: 'oui-${{ github.run_id }}'
+      cache_write: false
       # The package is not named after the repository, which pruning assumes.
       prune_images: false
