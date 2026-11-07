@@ -13,10 +13,12 @@
 //! - Timings come from the cumulative microsecond deltas: association, then
 //!   authentication (the first of WPA/RADIUS/open auth after association),
 //!   DHCP, DNS/first traffic, each kept only when between 0 and 60 s.
-//! - A roam pairs a `sta_roam`/`sta_leave` on one AP with the client's next
-//!   report on another AP of the same network. It succeeded if the AP called
-//!   it a roam or the client was back within a second; 802.11r ("ft") and the
-//!   AP's roaming triggers (minimum RSSI, roaming assistant) are recorded.
+//! - A roam pairs a `sta_roam`/`sta_leave` on one AP (with its average signal)
+//!   with a report of the client joining another AP of the same network (with
+//!   the signal it joined at) from 10 s before to 15 s after it: the highest
+//!   band, then the nearest in time, each join paired once. It succeeded if the
+//!   AP called it a roam or the client was back within a second; 802.11r ("ft")
+//!   and the AP's roaming triggers (minimum RSSI, roaming assistant) are recorded.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
