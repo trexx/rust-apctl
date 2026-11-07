@@ -61,10 +61,9 @@ export type SnmpForm = {
 };
 
 export const snmpForm = ({ snmp }: SiteSettings): SnmpForm => ({
-  enabled: snmp.enabled ?? false,
-  // Read-only mode leaves the community out: no default in its place.
-  community: snmp.community ?? (snmp.enabled ? "" : "public"),
-  enabledV3: snmp.enabledV3 ?? false,
+  enabled: snmp.enabled,
+  community: snmp.community ?? "",
+  enabledV3: snmp.enabledV3,
   username: snmp.username ?? "",
 });
 

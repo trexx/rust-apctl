@@ -1638,7 +1638,8 @@ export interface SiteSettings {
   };
   /** The port apctl's syslog listener is on, where "controller" mode sends the APs; null when it runs without one (--syslog-listen). */
   syslog_port: number | null;
-  snmp: { enabled: boolean | null; enabledV3: boolean | null; community: string | null; username: string | null; has_v3_password: boolean };
+  /** The flags as the APs are given them; `community` too (the stored one, else "public"), null only when secrets aren't shown. */
+  snmp: { enabled: boolean; enabledV3: boolean; community: string | null; username: string | null; has_v3_password: boolean };
   ntp: { setting_preference: "auto" | "manual" | null; ntp_server_1: string | null; ntp_server_2: string | null; ntp_server_3: string | null; ntp_server_4: string | null };
   /** ISO 3166 numeric: the site's, else 840 (the United States) when it has none or it can't be read, as the render takes it. */
   country: number;
