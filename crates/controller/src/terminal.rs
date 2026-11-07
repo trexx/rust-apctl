@@ -140,8 +140,11 @@ fn ssh_refused(mgmt: &Value) -> Option<&'static str> {
 enum End {
     /// The page closed it, or went away.
     Gone,
-    /// The shell exited, or the AP ended the session.
+    /// The shell exited (the AP closed its channel).
     Exited,
+    /// The SSH session to the AP ended under it: the AP went off the network,
+    /// restarted, or answered no keepalives.
+    Lost,
     LoggedOut,
     Idle,
 }
@@ -164,6 +167,7 @@ async fn finish(mut socket: WebSocket, end: Result<End, String>) {
     let last = match end {
         Ok(End::Gone) => return,
         Ok(End::Exited) => close(close_code::NORMAL, "the shell ended"),
+        Ok(End::Lost) => close(close_code::ERROR, "the connection to the AP was lost"),
         Ok(End::Idle) => close(close_code::NORMAL, "closed after 30 minutes without input"),
         Ok(End::LoggedOut) => crate::api::logged_out(),
         Err(e) => {
@@ -257,7 +261,7 @@ async fn bridge(socket: &mut WebSocket, s: &AppState, mac: Mac, t: Target, size:
             _ = &mut ended => break End::LoggedOut,
             _ = &mut idle => break End::Idle,
             // The session ended under the writer.
-            _ = &mut writer => break End::Exited,
+            _ = &mut writer => break End::Lost,
             _ = ping.tick() => {
                 // Only while the page's frames are read: its pong waits behind what it typed.
                 unanswered += u32::from(reading);
@@ -273,7 +277,8 @@ async fn bridge(socket: &mut WebSocket, s: &AppState, mac: Mac, t: Target, size:
                         break End::Gone;
                     }
                 }
-                Some(russh::ChannelMsg::Close) | None => break End::Exited,
+                Some(russh::ChannelMsg::Close) => break End::Exited,
+                None => break End::Lost,
                 _ => {}
             },
             // Room again: the page's frames are read on.
@@ -335,7 +340,7 @@ mod tests {
     /// and the sizes it was given are kept. The user `nopty` gets no PTY, and
     /// `noshell` no shell, and `slow` takes 2 s to check a password. For
     /// `stuck` the shell prints a lot at the first input, and the AP takes in
-    /// nothing more from then on.
+    /// nothing more from then on; for `lost` the AP drops the connection at it.
     #[derive(Clone, Default)]
     struct Shell {
         sizes: Arc<std::sync::Mutex<Vec<(u32, u32)>>>,
@@ -382,6 +387,9 @@ mod tests {
 
         async fn data(&mut self, ch: russh::ChannelId, data: &[u8], session: &mut russh::server::Session) -> Result<(), Self::Error> {
             self.typed.fetch_add(data.len(), Ordering::Relaxed);
+            if self.user == "lost" {
+                return Err(russh::Error::Disconnect);
+            }
             if self.user == "stuck" {
                 // More than the client's channel holds (100 messages) while nothing drains it.
                 if !self.stalled.swap(true, Ordering::Relaxed) {
@@ -576,6 +584,13 @@ mod tests {
         from_page(&mut tcp, 2, b"exit\r").await;
         assert_eq!(closed(&mut tcp).await, (1000, "the shell ended".into()));
         assert_eq!(rig.ends.recv().await, Some(Ok(End::Exited)));
+        // The connection to the AP is lost: a failure, saying so.
+        let (mut tcp, _) = rig.open("lost", "").await;
+        assert_eq!(frame(&mut tcp).await.0, 1, "connected");
+        assert_eq!(rig.event().await, EventKind::ApTerminalOpened);
+        from_page(&mut tcp, 2, b"uptime").await;
+        assert_eq!(closed(&mut tcp).await, (1011, "the connection to the AP was lost".into()));
+        assert_eq!(rig.ends.recv().await, Some(Ok(End::Lost)));
 
         // A host key other than the one expected: no login, and an event.
         let (mut tcp, _) = rig.open("changed", "").await;
