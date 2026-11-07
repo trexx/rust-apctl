@@ -587,24 +587,44 @@ impl Active {
     /// the async workers. The AP's own key is tried first; the factory key,
     /// which anyone can use, gets fewer turns, so that a flood under it leaves
     /// room for the APs. The permit is held while the inform is handled.
-    /// Else the status to answer: 503 when too many informs are waiting
-    /// already (see `Gate`), 400 when no key opens it.
-    async fn open(&self, body: Bytes, device_key: Option<[u8; 16]>) -> Result<Opened, StatusCode> {
-        let decode = |body: Bytes, used: KeyUsed, key: [u8; 16], permit| {
-            blocking(permit, move || Packet::parse(&body).map_err(anyhow::Error::from).and_then(|pkt| open_with(&pkt, [(used, key)])))
-        };
+    /// `gcm`: the header's AES-GCM flag. AES-GCM authenticates, so an inform the
+    /// AP's own key decrypts but whose body does not open is refused without a
+    /// factory-key turn, as [`open_with`] decides; under CBC a wrong key can get
+    /// that far, so the factory key is tried still.
+    async fn open(&self, body: Bytes, device_key: Option<[u8; 16]>, gcm: bool) -> Result<Opened, Unopened> {
+        let mut first = None;
         if let Some(k) = device_key {
-            let permit = self.work.enter(body.len()).await.ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
-            if let Ok((Ok((used, key, payload)), permit)) = decode(body.clone(), KeyUsed::Device, k, permit).await {
-                return Ok((used, key, payload, permit));
+            let permit = self.work.enter(body.len()).await.ok_or(Unopened::Busy)?;
+            match decode(body.clone(), KeyUsed::Device, k, permit).await {
+                Ok(opened) => return Ok(opened),
+                Err(e) if gcm && !is_decrypt(&e) => return Err(Unopened::Bad(e)),
+                Err(e) => first = Some(e),
             }
         }
-        let permit = self.strangers.enter(body.len()).await.ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
-        match decode(body, KeyUsed::Default, DEFAULT_KEY, permit).await {
-            Ok((Ok((used, key, payload)), permit)) => Ok((used, key, payload, permit)),
-            _ => Err(StatusCode::BAD_REQUEST),
-        }
+        let permit = self.strangers.enter(body.len()).await.ok_or(Unopened::Busy)?;
+        // As `open_with` reports for CBC: the first failure past decryption, if any.
+        decode(body, KeyUsed::Default, DEFAULT_KEY, permit).await.map_err(|e| Unopened::Bad(first.filter(|f| !is_decrypt(f)).unwrap_or(e)))
     }
+}
+
+/// Why an inform was not opened, and so the status to answer it with.
+enum Unopened {
+    /// 503: too many informs are waiting already (see `Gate`).
+    Busy,
+    /// 400: no key the AP may use opens it.
+    Bad(anyhow::Error),
+}
+
+/// Opens an inform with one key under a gate's `permit` (see [`Active::open`]).
+async fn decode(body: Bytes, used: KeyUsed, key: [u8; 16], permit: OwnedSemaphorePermit) -> anyhow::Result<Opened> {
+    let opened = blocking(permit, move || Packet::parse(&body).map_err(anyhow::Error::from).and_then(|pkt| open_with(&pkt, [(used, key)])));
+    let (result, permit) = opened.await?;
+    result.map(|(used, key, payload)| (used, key, payload, permit))
+}
+
+/// Whether opening failed on the key: the packet did not decrypt.
+fn is_decrypt(e: &anyhow::Error) -> bool {
+    matches!(e.downcast_ref(), Some(inform::Error::Decrypt))
 }
 
 /// A managed AP that informed with its own key less than this long ago is not
@@ -661,15 +681,19 @@ pub async fn inform(
     };
     let (device_key, pinned) = crate::adopt::device_key(state.as_deref(), &active.keys, &mac).map_or((None, false), |(k, gcm)| (Some(k), gcm));
     drop(state);
-    let (used, key, payload, permit) = match active.open(body, device_key).await {
+    let (used, key, payload, permit) = match active.open(body, device_key, header.flags.contains(Flags::GCM)).await {
         Ok(opened) => opened,
-        Err(StatusCode::SERVICE_UNAVAILABLE) => {
+        Err(Unopened::Busy) => {
             tracing::debug!("{mac}: too many informs waiting: turning one from {} away", peer.ip());
             return StatusCode::SERVICE_UNAVAILABLE.into_response();
         }
-        Err(code) => {
-            tracing::warn!("{mac}: inform from {} could not be decrypted", peer.ip());
-            return code.into_response();
+        Err(Unopened::Bad(e)) => {
+            if is_decrypt(&e) {
+                tracing::warn!("{mac}: no known key decrypts the inform from {}", peer.ip());
+            } else {
+                tracing::warn!("{mac}: cannot open the inform from {}: {e:#}", peer.ip());
+            }
+            return StatusCode::BAD_REQUEST.into_response();
         }
     };
     if payload["mac"].as_str().and_then(|m| m.parse::<Mac>().ok()) != Some(mac) {
@@ -1668,6 +1692,24 @@ mod tests {
         flushed(&rig.active.writer);
         // After another restart, nothing of it comes back (its version, its AES-GCM pin).
         assert!(!restarted(&rig).devices.lock().unwrap().contains_key(&gone.parse().unwrap()));
+    }
+
+    #[tokio::test]
+    async fn a_gcm_inform_its_own_key_decrypts_is_not_tried_under_the_factory_key() {
+        let Some(_) = fixtures() else { return };
+        let rig = rig(true, None);
+        // The factory-key gate is full: an inform that reaches it is turned away.
+        let gate = &rig.active.strangers;
+        let _held = gate.permits.clone().acquire_many_owned(gate.permits.available_permits() as u32).await.unwrap();
+        gate.waiting.store(gate.max_waiting, Ordering::Relaxed);
+        let mac: Mac = AP.parse().unwrap();
+        let sealed = |flags, key: &[u8; 16]| inform::seal(mac, flags, random_bytes::<16>(), key, b"not JSON");
+        // AES-GCM under the AP's own key, a body that does not open: refused at once.
+        assert_eq!(send(&rig, sealed(GCM_ZLIB, &KEY)).await.0, StatusCode::BAD_REQUEST);
+        // Not decrypted by its own key, or CBC (a wrong key can get past decryption): the factory key's turn.
+        assert_eq!(send(&rig, sealed(GCM_ZLIB, &[9; 16])).await.0, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(send(&rig, sealed(Flags::ENCRYPTED | Flags::ZLIB, &KEY)).await.0, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(rig.active.devices.lock().unwrap().is_empty(), "nothing recorded");
     }
 
     #[tokio::test]
