@@ -743,7 +743,7 @@ async fn factory_key_inform(active: &Arc<Active>, ts: Ts, caller: Caller, payloa
 async fn managed_inform(active: &Arc<Active>, ts: Ts, caller: Caller, payload: Value, pinned: bool, busy: bool, permit: OwnedSemaphorePermit) -> Response {
     let (mac, gcm) = (caller.mac, caller.gcm);
     // Its own key: an adoption is complete; a forgotten AP is told to reset
-    // (once: the entry goes, so later informs don't finish the forget again).
+    // (once: its forgetting entry goes, so later informs don't finish the forget again).
     // One that came while this inform was opened waits for the next.
     let (was_adopting, forgetting) = if busy {
         let mut live = active.live.write().unwrap();
@@ -765,8 +765,8 @@ async fn managed_inform(active: &Arc<Active>, ts: Ts, caller: Caller, payload: V
     if forgetting {
         tracing::warn!("{mac}: forgotten: telling it to reset");
         let engine = active.engine.clone();
+        // The engine's forget drops the AP's entry and its stored row.
         tokio::spawn(async move { crate::adopt::finish_forget(&engine, mac, true).await.ok() });
-        active.devices.lock().unwrap().remove(&mac);
         let reply = json!({ "_type": "setdefault", "server_time_in_utc": server_time(ts) });
         return caller.seal(&reply);
     }
