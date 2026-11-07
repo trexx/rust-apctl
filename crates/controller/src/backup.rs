@@ -926,8 +926,9 @@ fn clean_staging(b: &Backups) {
         if name == "pending" || name == "pending.failed" || keep.as_deref() == Some(name.as_str()) {
             continue;
         }
-        // One dated ahead of the clock (set ahead once, then put right) is old.
-        let old = e.metadata().and_then(|m| m.modified()).is_ok_and(|t| t.elapsed().map_or(true, |age| age > STAGING_TTL));
+        // Ahead of the clock by more than the TTL (left while it was set well ahead) is old too; a
+        // small step back of the clock must not delete an upload or unpack still being written.
+        let old = e.metadata().and_then(|m| m.modified()).is_ok_and(|t| t.elapsed().map_or_else(|ahead| ahead.duration() > STAGING_TTL, |age| age > STAGING_TTL));
         if old {
             let p = e.path();
             let _ = if p.is_dir() { fs::remove_dir_all(&p) } else { fs::remove_file(&p) };
@@ -2111,6 +2112,7 @@ mod tests {
         fs::write(b.staging().join("pending"), "r2").unwrap();
         fs::create_dir_all(b.staging().join("r3")).unwrap();
         fs::create_dir_all(b.staging().join("new")).unwrap();
+        fs::create_dir_all(b.staging().join("ahead")).unwrap();
         let now = std::time::SystemTime::now();
         let old = now - Duration::from_secs(2 * 3600);
         for n in ["r1", "r2", "upload-1-x.apb"] {
@@ -2118,10 +2120,12 @@ mod tests {
         }
         // Left behind while the clock was ahead, then put right.
         File::open(b.staging().join("r3")).unwrap().set_modified(now + Duration::from_secs(86400)).unwrap();
+        // Written just after the clock stepped back a little: still being written, so kept.
+        File::open(b.staging().join("ahead")).unwrap().set_modified(now + Duration::from_secs(1)).unwrap();
         clean_staging(&b);
         let mut left: Vec<String> = fs::read_dir(b.staging()).unwrap().flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect();
         left.sort();
-        assert_eq!(left, ["new", "pending", "r2"]);
+        assert_eq!(left, ["ahead", "new", "pending", "r2"]);
     }
 
     #[test]
