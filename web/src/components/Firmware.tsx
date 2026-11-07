@@ -107,7 +107,7 @@ export function FirmwarePanel() {
           {canAct && updatable.length > 1 && (
             <button
               className="btn small primary"
-              disabled={busy || !!job}
+              disabled={busy}
               onClick={() =>
                 window.confirm(
                   `Update ${updatable.length} APs, one at a time? Each restarts and drops its clients for a few minutes.`,
@@ -177,7 +177,7 @@ export function FirmwarePanel() {
                     {canAct && a.status === "update_available" && a.online && (
                       <button
                         className="btn small primary"
-                        disabled={busy || !!job}
+                        disabled={busy}
                         onClick={() => {
                           if (
                             window.confirm(
