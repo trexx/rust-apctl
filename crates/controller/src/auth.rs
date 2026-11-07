@@ -242,8 +242,8 @@ impl Auth {
     }
 
     /// Ends a session; false when there was none. Anyone can send a cookie,
-    /// so only a session that was there wakes the live sockets and queues a
-    /// write.
+    /// so only a session that was there wakes the open sockets (the live one,
+    /// terminals) and queues a write.
     pub(crate) fn revoke(&self, token: &str) -> bool {
         let hash = token_hash(token);
         if self.sessions.lock().unwrap().remove(&hash).is_none() {
@@ -621,7 +621,7 @@ mod tests {
         assert_eq!(auth.check(&token), Some((SessionId { hash: token_hash(&token), user: "admin".into() }, false)), "new: not extended yet");
         assert!(!auth.sessions.lock().unwrap().contains_key(&token), "only the hash is stored");
         assert_eq!(auth.check("forged"), None);
-        // Only a session that was there is announced to the live sockets.
+        // Only a session that was there is announced to the open sockets.
         let logouts = auth.logouts();
         assert!(!auth.revoke("forged"));
         assert!(!logouts.has_changed().unwrap(), "a made-up cookie wakes nobody");
@@ -723,7 +723,7 @@ mod tests {
     }
 
     #[test]
-    fn live_sockets_are_only_for_pages_of_this_server() {
+    fn sockets_are_only_for_pages_of_this_server() {
         let t = TestStore::new("origin");
         let proxies = Arc::new(Proxies::parse(&["10.42.0.0/16".into()]).unwrap());
         let auth = Auth::new(Users::default(), &t.store, t.writer, proxies).unwrap();
