@@ -509,6 +509,12 @@ export interface StateSummary {
 
 export const useSettingsState = (enabled = true) => useQuery({ queryKey: keys.settingsState(), queryFn: getting<StateSummary>("/api/settings/state"), enabled });
 
+/** The settings state, and whether settings are imported: what the server has only after an import (it answers 409 before) is asked for only once `imported`. */
+export function useImported(enabled = true) {
+  const state = useSettingsState(enabled);
+  return { state, imported: !!state.data?.summary };
+}
+
 export const importState = (snapshot: unknown) => send<{ ok: boolean }>("POST", "/api/settings/state", snapshot);
 
 export interface FieldComparison {

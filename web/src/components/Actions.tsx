@@ -11,7 +11,7 @@ import {
   setClientSpeedLimit,
   useActive,
   useCanEdit,
-  useSettingsState,
+  useImported,
   useUserGroups,
 } from "../api";
 import type { Mac, Names } from "../api";
@@ -165,8 +165,8 @@ export function ClientActions({
     keys.clients(),
     keys.settings("usergroups"),
   ]);
-  // The speed limits exist once settings are imported (before, the server answers 409).
-  const imported = !!useSettingsState(can).data?.summary;
+  // The speed limits exist once settings are imported.
+  const { imported } = useImported(can);
   const groups = useUserGroups(can && imported).data?.groups;
   const limits = speedLimitOptions(groups ?? []);
   // A group the options leave out still shows what it does: the default one,

@@ -1,6 +1,6 @@
 import { useState } from "react";
 import type { ReactNode } from "react";
-import { useSettingsState } from "../../api";
+import { useImported } from "../../api";
 import { QueryNote } from "../common";
 
 /**
@@ -55,17 +55,15 @@ function NotImported({ title }: { title: string }) {
 }
 
 /**
- * Whether settings are imported, for a section whose data the server has only
- * after an import (it answers 409 before, so ask only once `imported`): `gate`
- * is what the section shows until then (the state loading, or NotImported
- * with `title`), null once they are.
+ * `useImported`, for a section whose data the server has only after an
+ * import: `gate` is what the section shows until then (the state loading, or
+ * NotImported with `title`), null once they are.
  */
 export function useImportGate(title: string): {
   imported: boolean;
   gate: ReactNode;
 } {
-  const state = useSettingsState();
-  const imported = !!state.data?.summary;
+  const { state, imported } = useImported();
   const gate = !state.data ? (
     <QueryNote q={state} panel />
   ) : !imported ? (

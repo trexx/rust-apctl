@@ -2,7 +2,7 @@ import { Suspense } from "react";
 import {
   useActive,
   useCanEdit,
-  useSettingsState,
+  useImported,
   useWlanSettings,
 } from "../../../api";
 import { band } from "../../../format";
@@ -20,8 +20,7 @@ export function WlanSettingsPanel() {
   const s = useWlanSettings();
   // An SSID is added to the imported settings: without them there is nowhere
   // to add it (and nothing is said until that is known).
-  const state = useSettingsState().data;
-  const imported = !!state?.summary;
+  const { state, imported } = useImported();
   const readOnly = !useCanEdit();
   const active = useActive();
   if (!s.data) return <QueryNote q={s} panel />;
@@ -32,7 +31,7 @@ export function WlanSettingsPanel() {
     <ListPanel
       title="Settings"
       note={
-        state && !imported
+        state.data && !imported
           ? "no settings imported: import them on the Settings page to add SSIDs"
           : active
             ? "changes are reviewed, then sent to the APs"
