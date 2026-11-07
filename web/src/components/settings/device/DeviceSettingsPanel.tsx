@@ -1,8 +1,8 @@
-import { useDeviceSettings, useSettingsState } from "../../../api";
+import { useDeviceSettings } from "../../../api";
 import type { RadioSettings } from "../../../api";
 import { band, dbm } from "../../../format";
 import { QueryNote } from "../../common";
-import { EditPanel, NotImported } from "../EditPanel";
+import { EditPanel, useImportGate } from "../EditPanel";
 import { DeviceEditor } from "./DeviceEditor";
 
 /** One radio's settings in a line (the width it runs at, and the one set when that is wider). */
@@ -14,12 +14,9 @@ const radioSummary = (r: RadioSettings) =>
  * only to them, so that nobody else loads it).
  */
 export function DeviceSettingsPanel({ mac }: { mac: string }) {
-  // The server answers 409 before an import: ask once the state says there is one.
-  const state = useSettingsState();
-  const imported = !!state.data?.summary;
+  const { imported, gate } = useImportGate("Settings");
   const s = useDeviceSettings(mac, imported);
-  if (!state.data) return <QueryNote q={state} panel />;
-  if (!imported) return <NotImported title="Settings" />;
+  if (gate) return gate;
   if (!s.data) return <QueryNote q={s} panel />;
   const d = s.data;
   return (

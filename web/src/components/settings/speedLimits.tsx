@@ -1,12 +1,12 @@
 import { useState } from "react";
-import { useCanEdit, useSettingsState, useUserGroups } from "../../api";
+import { useCanEdit, useUserGroups } from "../../api";
 import { speed } from "../../format";
 import { QueryNote } from "../common";
 import type { UserGroup } from "../../api";
 import { Row, TextInput, useSettingsForm } from "./form";
 import type { Fields } from "./form";
 import { EditorShell } from "./Review";
-import { NotImported } from "./EditPanel";
+import { useImportGate } from "./EditPanel";
 import { ListPanel } from "./ListPanel";
 
 /** A limit in kbps as the Mbps text of its field; empty for none (-1). */
@@ -81,13 +81,10 @@ function SpeedLimitEditor({
 
 /** Speed limits (user groups): used by SSIDs and by single clients. */
 export function SpeedLimitsPanel() {
-  // The server answers 409 before an import: ask once the state says there is one.
-  const state = useSettingsState();
-  const imported = !!state.data?.summary;
+  const { imported, gate } = useImportGate("Speed limits");
   const g = useUserGroups(imported);
   const readOnly = !useCanEdit();
-  if (!state.data) return <QueryNote q={state} panel />;
-  if (!imported) return <NotImported title="Speed limits" />;
+  if (gate) return gate;
   if (!g.data) return <QueryNote q={g} panel />;
   const { groups } = g.data;
   return (

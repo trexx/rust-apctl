@@ -1,8 +1,8 @@
 import { useState } from "react";
-import { useCanEdit, useSettingsState, useSiteSettings } from "../../../api";
+import { useCanEdit, useSiteSettings } from "../../../api";
 import type { SiteSettings } from "../../../api";
 import { QueryNote } from "../../common";
-import { EditPanel, NotImported } from "../EditPanel";
+import { EditPanel, useImportGate } from "../EditPanel";
 import { useSettingsForm } from "../form";
 import type { Fields } from "../form";
 import { EditorShell } from "../Review";
@@ -58,13 +58,10 @@ function SiteEditor({ d, onClose }: { d: SiteSettings; onClose: () => void }) {
 
 /** Site-wide device settings: LED, outdoor, SSH, syslog, NTP, country, time zone. */
 export function SiteSettingsPanel() {
-  // The server answers 409 before an import: ask once the state says there is one.
-  const state = useSettingsState();
-  const imported = !!state.data?.summary;
+  const { imported, gate } = useImportGate("Site settings");
   const q = useSiteSettings(imported);
   const readOnly = !useCanEdit();
-  if (!state.data) return <QueryNote q={state} panel />;
-  if (!imported) return <NotImported title="Site settings" />;
+  if (gate) return gate;
   if (!q.data) return <QueryNote q={q} panel />;
   const d = q.data;
   const country = d.countries.find((c) => c.code === d.country)?.name;

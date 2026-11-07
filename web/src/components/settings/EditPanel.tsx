@@ -1,5 +1,7 @@
 import { useState } from "react";
 import type { ReactNode } from "react";
+import { useSettingsState } from "../../api";
+import { QueryNote } from "../common";
 
 /**
  * A settings section edited in place: its title and a one-line summary, and
@@ -39,7 +41,7 @@ export function EditPanel({
  * A settings section before any settings are imported: its title, and where
  * to import them (the server has none to show, and answers 409).
  */
-export function NotImported({ title }: { title: string }) {
+function NotImported({ title }: { title: string }) {
   return (
     <div className="panel">
       <div className="panel-head">
@@ -50,4 +52,24 @@ export function NotImported({ title }: { title: string }) {
       </div>
     </div>
   );
+}
+
+/**
+ * Whether settings are imported, for a section whose data the server has only
+ * after an import (it answers 409 before, so ask only once `imported`): `gate`
+ * is what the section shows until then (the state loading, or NotImported
+ * with `title`), null once they are.
+ */
+export function useImportGate(title: string): {
+  imported: boolean;
+  gate: ReactNode;
+} {
+  const state = useSettingsState();
+  const imported = !!state.data?.summary;
+  const gate = !state.data ? (
+    <QueryNote q={state} panel />
+  ) : !imported ? (
+    <NotImported title={title} />
+  ) : null;
+  return { imported, gate };
 }
