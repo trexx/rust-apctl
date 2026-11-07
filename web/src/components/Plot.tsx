@@ -40,7 +40,7 @@ function withGaps(
 }
 
 /** The samples of series `si` with no value on either side, which no line
- *  reaches: drawn as points, so they don't vanish. */
+ *  reaches: drawn as dots in the series' colour, so they don't vanish. */
 const lone = (u: uPlot, si: number): number[] | null => {
   const v = u.data[si]!;
   const has = (i: number) => v[i] !== null && v[i] !== undefined;
@@ -317,17 +317,22 @@ export function Plot({
       ],
       series: [
         {},
-        ...series.map((s) => ({
-          label: s.label,
-          show: !hidden.has(s.label),
-          stroke: resolve(s.color),
-          width: 1.5,
-          scale: s.right ? "r" : "y",
-          dash: s.dashed ? [4, 3] : undefined,
-          fill: s.fill ? withAlpha(resolve(s.color), 0.13) : undefined,
-          spanGaps: false,
-          points: { show: false, filter: lone },
-        })),
+        ...series.map((s) => {
+          const color = resolve(s.color);
+          return {
+            label: s.label,
+            show: !hidden.has(s.label),
+            stroke: color,
+            width: 1.5,
+            scale: s.right ? "r" : "y",
+            dash: s.dashed ? [4, 3] : undefined,
+            fill: s.fill ? withAlpha(color, 0.13) : undefined,
+            spanGaps: false,
+            // A lone sample is a solid dot in the series' colour (uPlot fills
+            // points white unless told otherwise).
+            points: { show: false, filter: lone, fill: color },
+          };
+        }),
       ],
     };
     drawn.current = current();
