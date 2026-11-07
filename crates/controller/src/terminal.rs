@@ -62,7 +62,7 @@ pub struct Size {
 
 /// A text frame from the page: its size, or `{"pause":true}` while it shows
 /// what it was sent so far (the AP's output then waits, held back by SSH's
-/// flow control) and `{"pause":false}` once it has.
+/// flow control, unless the page's frames wait for the AP) and `{"pause":false}` once it has.
 #[derive(Deserialize)]
 struct Said {
     pause: Option<bool>,
@@ -265,7 +265,9 @@ async fn bridge(socket: &mut WebSocket, s: &AppState, mac: Mac, t: Target, size:
                     break End::Gone;
                 }
             }
-            msg = output.wait(), if !paused => match msg {
+            // Paused only while the page's frames are read: with the queue full, its resume may be
+            // behind what it typed, which waits on the AP, whose session waits for this to take its output.
+            msg = output.wait(), if !paused || !reading => match msg {
                 Some(russh::ChannelMsg::Data { data } | russh::ChannelMsg::ExtendedData { data, .. }) => {
                     if !send(socket, Message::Binary(data)).await {
                         break End::Gone;
@@ -617,6 +619,38 @@ mod tests {
         let (tcp, _) = stuck(&mut rig, "&ping_ms=200").await;
         drop(tcp);
         assert_eq!(tokio::time::timeout(Duration::from_secs(5), rig.ends.recv()).await.unwrap(), Some(Ok(End::Gone)));
+    }
+
+    #[tokio::test]
+    async fn a_paste_while_paused_cannot_keep_the_pause_for_ever() {
+        let mut rig = Rig::new().await;
+        let (tcp, _) = rig.open("ubnt", "").await;
+        // Its own handle for the page's frames, which may wait for the server to read them.
+        let tcp = tcp.into_std().unwrap();
+        let mut page = tokio::net::TcpStream::from_std(tcp.try_clone().unwrap()).unwrap();
+        let mut tcp = tokio::net::TcpStream::from_std(tcp).unwrap();
+        assert_eq!(crate::api::tests::frame(&mut tcp).await.0, 1, "connected");
+        assert_eq!(rig.event().await, EventKind::ApTerminalOpened);
+        // Paused (behind on a flood of output, say), then a paste whose echo is more than the
+        // session holds for the page: the resume comes behind it.
+        const PIECES: usize = 64;
+        let paste = vec![b'x'; 16 << 10];
+        tokio::spawn(async move {
+            from_page(&mut page, 1, br#"{"pause":true}"#).await;
+            for _ in 0..PIECES {
+                from_page(&mut page, 2, &paste).await;
+            }
+            from_page(&mut page, 1, br#"{"pause":false}"#).await;
+            page
+        });
+        let mut echoed = 0;
+        while echoed < PIECES * (16 << 10) {
+            match crate::api::tests::frame(&mut tcp).await {
+                (2, data) => echoed += data.len(),
+                (op, _) => panic!("frame {op}"),
+            }
+        }
+        assert_eq!(rig.shell.typed.load(Ordering::Relaxed), PIECES * (16 << 10), "the AP took in the whole paste");
     }
 
     #[tokio::test]
