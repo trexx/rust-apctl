@@ -266,7 +266,7 @@ impl Auth {
             by_ip.retain(|_, (_, since)| now - *since < FAILURE_WINDOW);
             *pruned = now;
         }
-        let key = throttled(ip);
+        let key = sender(ip);
         if by_ip.len() >= MAX_THROTTLED && !by_ip.contains_key(&key) {
             // Full (a flood of addresses): make room by forgetting an address
             // with the fewest attempts, never one that is held off; with every
@@ -288,15 +288,16 @@ impl Auth {
     /// An attempt that does not count against the address: a successful
     /// login, or one never checked.
     fn refund(&self, ip: IpAddr) {
-        if let Some(e) = self.failures.lock().unwrap().by_ip.get_mut(&throttled(ip)) {
+        if let Some(e) = self.failures.lock().unwrap().by_ip.get_mut(&sender(ip)) {
             e.0 = e.0.saturating_sub(1);
         }
     }
 }
 
-/// What login attempts are counted by: the address, or for IPv6 its /64 (one
-/// host usually has a whole /64 to pick addresses from).
-fn throttled(ip: IpAddr) -> IpAddr {
+/// The key a sender is counted under (its login attempts; the APs pending
+/// adoption it sends for): its address, or for IPv6 its /64 (one host usually
+/// has a whole /64 to pick addresses from).
+pub(crate) fn sender(ip: IpAddr) -> IpAddr {
     match ip.to_canonical() {
         IpAddr::V6(a) => IpAddr::V6((u128::from(a) & !u128::from(u64::MAX)).into()),
         v4 => v4,
