@@ -148,9 +148,10 @@ struct ServeArgs {
     #[arg(long, env = "APCTL_BACKUP_KEY")]
     pub backup_key: Option<PathBuf>,
     /// Reverse proxies in front of apctl, as comma-separated addresses or CIDR
-    /// ranges (e.g. 10.42.0.0/16). X-Forwarded-For is only believed on
-    /// connections from these, for the login throttle and AP addresses; by
-    /// default it is ignored.
+    /// ranges (e.g. 10.42.0.0/16). Only on connections from these are
+    /// X-Forwarded-For (the login throttle, AP addresses), X-Forwarded-Host (the
+    /// origin check of the live socket and terminals) and X-Forwarded-Proto (the
+    /// session cookie's Secure flag) believed; by default they are ignored.
     #[arg(long, env = "APCTL_TRUSTED_PROXIES", value_delimiter = ',')]
     pub trusted_proxies: Vec<String>,
 }
