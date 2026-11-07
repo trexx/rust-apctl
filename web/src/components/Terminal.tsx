@@ -33,7 +33,8 @@ function theme() {
  * A shell on the AP over SSH, through apctl. What is typed goes as binary
  * frames, the size and `{"pause":…}` as JSON; the server says
  * `{"connected":true}` once the shell runs, or `{"error":…}` before it
- * closes. Nothing is sent before the shell runs.
+ * closes (a refusal before the socket opens has no words: the browser hides
+ * it). Nothing is sent before the shell runs.
  */
 export function Terminal({
   mac,
@@ -62,8 +63,8 @@ export function Terminal({
     term.loadAddon(fit);
     term.open(el);
     fit.fit();
-    const opened = { cols: term.cols, rows: term.rows };
-    const socket = terminalSocket(mac, opened.cols, opened.rows);
+    const initial = { cols: term.cols, rows: term.rows };
+    const socket = terminalSocket(mac, initial.cols, initial.rows);
     socket.binaryType = "arraybuffer";
     const encoder = new TextEncoder();
     let connected = false;
@@ -84,6 +85,10 @@ export function Terminal({
       send(JSON.stringify({ pause: on }));
     };
     let error: string | null = null;
+    let opened = false;
+    socket.onopen = () => {
+      opened = true;
+    };
     socket.onmessage = (e: MessageEvent<ArrayBuffer | string>) => {
       if (typeof e.data !== "string") {
         const n = e.data.byteLength;
@@ -99,7 +104,7 @@ export function Terminal({
       if (msg.connected) {
         connected = true;
         // Resized while it connected: the shell started at the size it opened with.
-        if (term.cols !== opened.cols || term.rows !== opened.rows)
+        if (term.cols !== initial.cols || term.rows !== initial.rows)
           sendSize(term);
         setState({ at: "connected" });
         term.focus();
@@ -107,11 +112,16 @@ export function Terminal({
       if (msg.error) error = msg.error;
     };
     socket.onclose = (e) => {
-      // 1008: the session ended (logged out or expired).
-      if (e.code === 1008) announceUnauthorized();
+      // 1008: the session ended (logged out or expired). One that never opened
+      // was refused before the upgrade, maybe for a session that ended (the
+      // browser hides the 401): /api/me tells, as for the live socket.
+      if (e.code === 1008 || !opened) announceUnauthorized();
+      const lost = opened
+        ? "the connection to apctl was lost"
+        : "apctl refused the terminal, or could not be reached";
       setState({
         at: "closed",
-        why: error ?? (e.reason || "the connection to apctl was lost"),
+        why: error ?? (e.reason || lost),
         // 1000: the shell exited, or was idle too long.
         failed: error !== null || e.code !== 1000,
       });
