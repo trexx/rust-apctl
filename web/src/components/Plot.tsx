@@ -15,16 +15,21 @@ import { dayTime, typicalStep } from "../format";
 import { SpanContext, ZoomContext } from "./span";
 
 /** Breaks lines where samples are missing for much longer than usual (an AP
- *  offline, apctl not running) by inserting a point with no values. */
-function withGaps(ts: number[], cols: (number | null)[][]): uPlot.AlignedData {
-  if (ts.length < 3) return [ts, ...cols] as uPlot.AlignedData;
-  const typical = typicalStep(ts);
+ *  offline, apctl not running), or for over `maxGap` seconds, by inserting a
+ *  point with no values. */
+function withGaps(
+  ts: number[],
+  cols: (number | null)[][],
+  maxGap: number | undefined,
+): uPlot.AlignedData {
+  if (ts.length < 2) return [ts, ...cols] as uPlot.AlignedData;
+  const gap = Math.min(maxGap ?? Infinity, Math.max(3 * typicalStep(ts), 120));
   const outTs: number[] = [ts[0]!];
   const out = cols.map((c) => [c[0] ?? null]);
   for (let i = 1; i < ts.length; i++) {
     const t = ts[i]!;
     const prev = ts[i - 1]!;
-    if (t - prev > Math.max(3 * typical, 120)) {
+    if (t - prev > gap) {
       outTs.push(Math.round((t + prev) / 2));
       out.forEach((c) => c.push(null));
     }
@@ -33,6 +38,17 @@ function withGaps(ts: number[], cols: (number | null)[][]): uPlot.AlignedData {
   }
   return [outTs, ...out] as uPlot.AlignedData;
 }
+
+/** The samples of series `si` with no value on either side, which no line
+ *  reaches: drawn as points, so they don't vanish. */
+const lone = (u: uPlot, si: number): number[] | null => {
+  const v = u.data[si]!;
+  const has = (i: number) => v[i] !== null && v[i] !== undefined;
+  const idx: number[] = [];
+  for (let i = 0; i < v.length; i++)
+    if (has(i) && !has(i - 1) && !has(i + 1)) idx.push(i);
+  return idx.length ? idx : null;
+};
 
 export interface ChartSeries {
   label: string;
@@ -110,6 +126,9 @@ export interface ChartProps {
   height?: number;
   min?: number;
   max?: number;
+  /** Seconds between samples past which the line always breaks, however
+   *  sparse the series (by default only gaps much longer than usual do). */
+  maxGap?: number;
 }
 
 /** Axis width that fits its longest tick label (11px font). */
@@ -164,6 +183,7 @@ export function Plot({
   height: heightProp,
   min,
   max,
+  maxGap,
 }: ChartProps) {
   // Not a default in the parameter: the React Compiler can't compile those.
   const height = heightProp ?? 180;
@@ -194,7 +214,7 @@ export function Plot({
           (s.fill ? "f" : "") +
           (s.dashed ? "d" : ""),
       )
-      .join("|") + `|${min}|${max}|${height}|${rightMax}|${!!zoom}|${dark}`;
+      .join("|") + `|${min}|${max}|${maxGap}|${height}|${rightMax}|${!!zoom}|${dark}`;
   const hasRight = series.some((s) => s.right);
   const current = (): Drawn => ({
     ts,
@@ -306,12 +326,16 @@ export function Plot({
           dash: s.dashed ? [4, 3] : undefined,
           fill: s.fill ? withAlpha(resolve(s.color), 0.13) : undefined,
           spanGaps: false,
-          points: { show: false },
+          points: { show: false, filter: lone },
         })),
       ],
     };
     drawn.current = current();
-    plot.current = new uPlot(opts, withGaps(ts, series.map(scaled)), el);
+    plot.current = new uPlot(
+      opts,
+      withGaps(ts, series.map(scaled), maxGap),
+      el,
+    );
     const ro = new ResizeObserver(() =>
       plot.current?.setSize({ width: el.clientWidth, height }),
     );
@@ -335,7 +359,7 @@ export function Plot({
     const now = current();
     if (sameData(drawn.current, now)) return;
     drawn.current = now;
-    plot.current?.setData(withGaps(ts, series.map(scaled)));
+    plot.current?.setData(withGaps(ts, series.map(scaled), maxGap));
   });
 
   const toggle = (i: number, label: string) => {

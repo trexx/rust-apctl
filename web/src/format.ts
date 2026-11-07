@@ -159,6 +159,9 @@ export function typicalStep(ts: number[]): number {
   return steps[Math.floor(steps.length / 2)] ?? 0;
 }
 
+/** The longest gap between two `/api/series` samples that the server works a rate out over (series.rs `interval`): its charts break their lines at longer ones, the gauges' as the rates'. */
+export const SERIES_GAP = 7200;
+
 /** The seconds one sample of a roll-up tier stands for: its bucket's width. */
 const TIER_STEP: Partial<Record<Series<string>["tier"], number>> = { "5m": 300, "1h": 3600 };
 

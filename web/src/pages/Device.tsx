@@ -23,6 +23,7 @@ import {
   THead,
 } from "../components/common";
 import {
+  SERIES_GAP,
   ago,
   bandChannel,
   bytes,
@@ -294,6 +295,7 @@ function ApCharts({ mac, range }: { mac: string; range: TimeSpan }) {
           <Chart
             title="CPU and memory"
             ts={ts}
+            maxGap={SERIES_GAP}
             format={(v) => `${Math.round(v)}%`}
             min={0}
             max={100}
@@ -305,6 +307,7 @@ function ApCharts({ mac, range }: { mac: string; range: TimeSpan }) {
           <Chart
             title="Clients"
             ts={ts}
+            maxGap={SERIES_GAP}
             height={120}
             format={(v) => `${Math.round(v)}`}
             series={[
@@ -337,6 +340,7 @@ function UplinkChart({ mac, range }: { mac: string; range: TimeSpan }) {
           <Chart
             title="Uplink throughput"
             ts={ts}
+            maxGap={SERIES_GAP}
             format={rate}
             series={[
               {
@@ -359,6 +363,7 @@ function UplinkChart({ mac, range }: { mac: string; range: TimeSpan }) {
           <Chart
             title="Uplink errors and drops"
             ts={ts}
+            maxGap={SERIES_GAP}
             height={120}
             format={(v) => `${v.toFixed(v < 1 ? 2 : 0)}/s`}
             series={[

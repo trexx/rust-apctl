@@ -9,6 +9,7 @@ import type {
 import { COLORS, Chart } from "./Chart";
 import { QueryState, Signal, THead } from "./common";
 import {
+  SERIES_GAP,
   SIGNAL,
   band,
   bytes,
@@ -187,6 +188,7 @@ export function RadioPanel({
           <Chart
             title="Airtime (channel utilisation)"
             ts={data.ts}
+            maxGap={SERIES_GAP}
             format={pct}
             min={0}
             max={100}
@@ -397,6 +399,7 @@ function VapChart({ bssid, range }: { bssid: string; range: TimeSpan }) {
         <Chart
           title="SSID traffic on this radio"
           ts={data.ts}
+          maxGap={SERIES_GAP}
           format={rate}
           series={[
             {

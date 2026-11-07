@@ -24,6 +24,7 @@ import {
   useRunner,
 } from "../components/common";
 import {
+  SERIES_GAP,
   ago,
   bandChannel,
   bytes,
@@ -173,6 +174,7 @@ function ClientPage({ mac }: { mac: string }) {
               <Chart
                 title="Signal and noise"
                 ts={ts}
+                maxGap={SERIES_GAP}
                 format={dbm}
                 min={-100}
                 max={-20}
@@ -189,6 +191,7 @@ function ClientPage({ mac }: { mac: string }) {
               <Chart
                 title="PHY rate"
                 ts={ts}
+                maxGap={SERIES_GAP}
                 format={(v) => `${Math.round(v)} Mbps`}
                 series={[
                   {
@@ -210,6 +213,7 @@ function ClientPage({ mac }: { mac: string }) {
               <Chart
                 title="Throughput"
                 ts={ts}
+                maxGap={SERIES_GAP}
                 format={rate}
                 series={[
                   {
@@ -232,6 +236,7 @@ function ClientPage({ mac }: { mac: string }) {
               <Chart
                 title="Retries and latency"
                 ts={ts}
+                maxGap={SERIES_GAP}
                 format={(v) => v.toFixed(v < 10 ? 1 : 0)}
                 series={[
                   {
