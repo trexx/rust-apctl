@@ -5,8 +5,8 @@ name: 'Manufacturer list'
 # published, so the same list never makes a new digest. The main Dockerfile pins :latest
 # by digest: Renovate opens the digest bump, the Image workflow builds apctl with the new
 # list, and the bump is automerged. A change of oui/Dockerfile is published by the next
-# monthly run, or at once by running this workflow by hand; pull requests only fetch and
-# compare.
+# monthly run, or at once by running this workflow by hand on main; pull requests, and a
+# manual run on any other branch, only fetch and compare.
 on:
   schedule:
     - cron: '17 5 2 * *'
@@ -50,7 +50,8 @@ jobs:
 
   publish:
     needs: [ 'fetch' ]
-    if: ${{ github.event_name != 'pull_request' && needs.fetch.outputs.changed == 'true' }}
+    # Only the default branch publishes: a scheduled run is on it, a manual run must be.
+    if: ${{ (github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch))) && needs.fetch.outputs.changed == 'true' }}
     uses: 'trexx/actions/.github/workflows/build.yml@main'
     permissions:
       contents: 'read'
