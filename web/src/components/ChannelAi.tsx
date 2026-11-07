@@ -142,7 +142,7 @@ export function ChannelAiPanel() {
               ) &&
               void run(
                 () => runChannelAi(),
-                "Running: the APs scan first (up to two minutes), then the plan is applied if it is clearly better.",
+                "Running: band by band, the APs scan first (up to two minutes a band, longer if a scan is already going), then the plan is applied if it is clearly better.",
               )
             }
           >
