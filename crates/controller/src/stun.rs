@@ -124,7 +124,7 @@ pub fn poke(live: &Live, mac: &Mac) {
     let Some(socket) = &live.stun else { return };
     let Some(p) = live.raw_informs.get(mac) else { return };
     let ip = p["connect_request_ip"].as_str().and_then(|i| i.parse::<IpAddr>().ok());
-    let port = p["connect_request_port"].as_u64().or_else(|| p["connect_request_port"].as_str()?.parse().ok()).and_then(|v| u16::try_from(v).ok());
+    let port = apcfg::as_int(&p["connect_request_port"]).and_then(|v| u16::try_from(v).ok());
     if let (Some(ip), Some(port)) = (ip, port) {
         let _ = socket.try_send_to(&REQUEST_PACKET, SocketAddr::new(ip, port));
     }
@@ -185,5 +185,23 @@ mod tests {
         assert_eq!(&r[20..28], &[0x00, 0x01, 0x00, 0x14, 0, 2, 0x9c, 0x40]);
         assert_eq!(&r[28..44], &"2001:db8::9".parse::<std::net::Ipv6Addr>().unwrap().octets());
         assert_eq!(u16::from_be_bytes([r[2], r[3]]) as usize, r.len() - 20);
+    }
+
+    #[tokio::test]
+    async fn a_poke_goes_to_the_port_the_ap_reported_however_it_wrote_it() {
+        let ap = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let at = ap.local_addr().unwrap().port();
+        let mac: Mac = "02:00:00:00:00:01".parse().unwrap();
+        let stun = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        // A poke does not wait: the socket is known to be writable, as the one serving STUN is.
+        stun.writable().await.unwrap();
+        let mut live = Live { stun: Some(Arc::new(stun)), ..Default::default() };
+        for port in [serde_json::json!(at), serde_json::json!(f64::from(at)), serde_json::json!(format!(" {at}"))] {
+            live.raw_informs.insert(mac, Arc::new(serde_json::json!({ "connect_request_ip": "127.0.0.1", "connect_request_port": port })));
+            poke(&live, &mac);
+            let mut buf = [0; 32];
+            let n = tokio::time::timeout(std::time::Duration::from_secs(2), ap.recv(&mut buf)).await.unwrap_or_else(|_| panic!("{port}: no poke")).unwrap();
+            assert_eq!(&buf[..n], &REQUEST_PACKET, "{port}");
+        }
     }
 }
