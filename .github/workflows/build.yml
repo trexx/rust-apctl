@@ -37,7 +37,9 @@ jobs:
       packages: write
     with:
       # The Image workflow's layer cache (image.yml), which a tag can read from main.
+      # Read only: a tag's own cache could be read by that tag alone.
       cache_scope: 'apctl'
+      cache_write: false
 
   # The image CI published runs, reports the version and carries the manufacturer list
   # (scripts/image-check.sh), before release.sh --pin pins it.
