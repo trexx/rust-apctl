@@ -1,7 +1,7 @@
 //! Site-wide and RF views: activity, airtime, top APs and clients, retry
 //! rates, connection success, the radio overview and neighbouring networks.
 
-use std::collections::{BTreeMap, HashMap, btree_map::Entry};
+use std::collections::{BTreeMap, HashMap};
 
 use axum::extract::State;
 use rusqlite::Connection;
@@ -973,7 +973,7 @@ struct Neighbor<'a> {
     signal: Option<i64>,
     best_signal: Option<i64>,
     last_seen: Ts,
-    /// The name of the AP that hears it best, else its MAC.
+    /// The name of the AP that hears it best lately ([`NEAREST_WINDOW`]), else its MAC.
     nearest_ap: Option<String>,
     vendor: Option<&'a str>,
 }
@@ -988,6 +988,10 @@ struct OwnLink {
     radio: Option<String>,
     signal: Option<i64>,
 }
+
+/// How long before a network was last heard an AP's sighting of it still counts
+/// for naming the AP nearest to it ([`neighbors`]).
+const NEAREST_WINDOW: Ts = 3600;
 
 /// GET /api/rf/neighbors: networks heard by our APs, the AP hearing each best,
 /// strongest (the best signal any AP heard) first, and our own APs' signal to
@@ -1050,7 +1054,7 @@ pub async fn neighbors(State(s): State<AppState>, Query(q): Query<NeighborQuery>
     .await?;
     let name = |mac: &str| names.get(mac).cloned();
     let signal = |n: &Neighbor| n.signal.unwrap_or(-200);
-    let mut by_bssid: BTreeMap<String, Neighbor> = BTreeMap::new();
+    let mut by_bssid: BTreeMap<String, Vec<Neighbor>> = BTreeMap::new();
     // (from, to, band) -> strongest signal: an AP has a BSSID per SSID.
     let mut links: BTreeMap<(String, &str, Option<String>), Option<i64>> = BTreeMap::new();
     for r in rows {
@@ -1065,23 +1069,24 @@ pub async fn neighbors(State(s): State<AppState>, Query(q): Query<NeighborQuery>
         if q.links_only {
             continue;
         }
-        // The AP hearing it strongest names it; when it was last heard and the best
-        // signal heard are the network's, over every AP's row (as the threat list reads them).
-        match by_bssid.entry(r.bssid.clone()) {
-            Entry::Vacant(e) => {
-                e.insert(r);
-            }
-            Entry::Occupied(mut e) => {
-                let cur = e.get_mut();
-                let (last_seen, best) = (cur.last_seen.max(r.last_seen), cur.best_signal.or(cur.signal).max(r.best_signal.or(r.signal)));
-                if signal(&r) > signal(cur) {
-                    *cur = r;
-                }
-                (cur.last_seen, cur.best_signal) = (last_seen, best);
-            }
-        }
+        by_bssid.entry(r.bssid.clone()).or_default().push(r);
     }
-    let mut list: Vec<Neighbor> = by_bssid.into_values().collect();
+    // What the network is (name, security, channel) and when it was last heard come
+    // from its latest row, and the best signal from every AP's row, as the threat list
+    // reads them. The AP hearing it strongest names it, of those that heard it within
+    // NEAREST_WINDOW of then, so an AP that has gone quiet does not keep naming it.
+    let mut list: Vec<Neighbor> = by_bssid
+        .into_values()
+        .map(|mut rows| {
+            let latest = (0..rows.len()).max_by_key(|&i| rows[i].last_seen).expect("a BSSID has rows");
+            let since = rows[latest].last_seen - NEAREST_WINDOW;
+            let near = rows.iter().filter(|r| r.last_seen >= since).max_by_key(|r| signal(r)).map(|r| (r.ap_mac.clone(), r.signal)).expect("the latest row is in");
+            let best = rows.iter().filter_map(|r| r.best_signal.or(r.signal)).max();
+            let mut n = rows.swap_remove(latest);
+            ((n.ap_mac, n.signal), n.best_signal) = (near, best);
+            n
+        })
+        .collect();
     for n in &mut list {
         // An AP without a name is shown by its MAC (which is not sent otherwise).
         n.nearest_ap = Some(name(&n.ap_mac).unwrap_or_else(|| n.ap_mac.clone()));
@@ -1647,14 +1652,26 @@ mod tests {
             let out = ok(neighbors(State(s.clone()), Query(NeighborQuery { band: None, range: Some(30 * 86400), links_only: false, neighbors_only: true })).await);
             let names: Vec<&str> = out["neighbors"].as_array().unwrap().iter().map(|n| n["essid"].as_str().unwrap()).collect();
             assert_eq!(names, ["Once close", "Neighbour", "Other", "Far"]);
-            // "Far" heard by A2 too, stronger but long ago: A2 names it, while when it was last heard
-            // and the best signal are over both APs' rows.
-            insert(&c, "neighbors", &["bssid", "ap_mac", "radio", "essid", "signal", "best_signal", "first_seen", "last_seen"], vec![vec![text("02:aa:00:00:00:03"), text(A2), text("na"), text("Far"), int(-75), int(-75), int(base - 86400), int(base - 3600)]]);
+            // "Far" heard by A2 too, stronger, under another name on another channel, but long ago: what
+            // the network is and the AP naming it are from its latest sighting (A1's), while the best
+            // signal is over both APs' rows.
+            let row = vec![text("02:aa:00:00:00:03"), text(A2), text("na"), text("Far (was)"), int(36), int(-75), int(-75), int(base - 86400), int(base - 3600)];
+            insert(&c, "neighbors", &["bssid", "ap_mac", "radio", "essid", "channel", "signal", "best_signal", "first_seen", "last_seen"], vec![row]);
             c.execute("UPDATE neighbors SET best_signal = -45 WHERE bssid = '02:aa:00:00:00:03' AND ap_mac = ?1", [A1]).unwrap();
-            let out = ok(neighbors(State(s), Query(NeighborQuery { band: None, range: Some(30 * 86400), links_only: false, neighbors_only: true })).await);
-            let far = out["neighbors"].as_array().unwrap().iter().find(|n| n["essid"] == "Far").unwrap();
-            assert_eq!((&far["nearest_ap"], &far["signal"], &far["best_signal"], far["last_seen"].as_i64()), (&json!("Attic"), &json!(-75), &json!(-45), Some(base + 3000)));
-            assert_eq!(out["neighbors"][0]["essid"], "Far", "sorted on its best signal over all rows");
+            let far = || async {
+                let out = ok(neighbors(State(s.clone()), Query(NeighborQuery { band: None, range: Some(30 * 86400), links_only: false, neighbors_only: true })).await);
+                assert_eq!(out["neighbors"][0]["bssid"], "02:aa:00:00:00:03", "sorted on its best signal over all rows");
+                let n = &out["neighbors"][0];
+                (n["nearest_ap"].clone(), n["signal"].clone(), n["best_signal"].clone(), n["last_seen"].clone(), n["essid"].clone(), n["channel"].clone(), n["security"].clone())
+            };
+            let latest = (json!("Far"), json!(149), json!("WPA2-Personal"));
+            let (ap, signal, best, last_seen, essid, channel, security) = far().await;
+            assert_eq!((ap, signal, best, last_seen), (json!("Hall"), json!(-80), json!(-45), json!(base + 3000)));
+            assert_eq!((essid, channel, security), latest);
+            // Heard by A2 within the hour before the latest sighting: the stronger AP names it.
+            c.execute("UPDATE neighbors SET last_seen = ?1 WHERE bssid = '02:aa:00:00:00:03' AND ap_mac = ?2", rusqlite::params![base + 3000 - NEAREST_WINDOW, A2]).unwrap();
+            let (ap, signal, _, last_seen, essid, channel, security) = far().await;
+            assert_eq!((ap, signal, last_seen, (essid, channel, security)), (json!("Attic"), json!(-75), json!(base + 3000), latest));
         }
 
         #[tokio::test]
