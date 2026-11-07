@@ -103,7 +103,7 @@ crate::model::named_enum! {
     }
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone)]
 pub struct Event {
     pub ts: Ts,
     pub kind: EventKind,
@@ -214,7 +214,7 @@ fn bump(counter: &AtomicU64) {
 }
 
 /// A name and note the user gave a client.
-#[derive(Debug, Clone, Default, Serialize)]
+#[derive(Debug, Clone, Default)]
 pub struct Alias {
     pub alias: Option<String>,
     pub note: Option<String>,
