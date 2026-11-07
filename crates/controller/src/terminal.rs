@@ -29,7 +29,9 @@ use crate::ssh::{self, Failure};
 
 /// How many terminals may be open at once, over all APs and users.
 static OPEN: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(4);
-/// The most a frame from the page may hold: keystrokes, or a paste.
+/// The most a frame, and a message, from the page may hold: keystrokes, or a
+/// piece of a paste (the page sends 16 KiB at most). A bigger one closes the
+/// socket before it is read in.
 const MAX_FRAME: usize = 64 << 10;
 /// How many of the page's frames may wait for the AP to take them in: then
 /// the page's are read no further until it does (TCP holds the page back).
@@ -92,7 +94,12 @@ pub async fn open(
     };
     // Always there: the route is withheld in read-only mode, which has no sessions.
     let Some(axum::Extension(session)) = session else { return ApiError::forbidden("a terminal needs a login").into_response() };
-    upgrade.max_message_size(MAX_FRAME).on_upgrade(move |socket| terminal(socket, s, mac, size, session))
+    limited(upgrade).on_upgrade(move |socket| terminal(socket, s, mac, size, session))
+}
+
+/// The upgrade, with the page's frames held to [`MAX_FRAME`].
+fn limited(upgrade: WebSocketUpgrade) -> WebSocketUpgrade {
+    upgrade.max_frame_size(MAX_FRAME).max_message_size(MAX_FRAME)
 }
 
 /// Where and how to log in to an AP for its terminal. No Debug: it holds passwords.
@@ -496,7 +503,7 @@ mod tests {
                 let t = Target { ip: "127.0.0.1".into(), port, expected, logins };
                 let session = s.auth.session_of(&q.token).unwrap();
                 let pace = Pace { idle: q.idle_ms.map_or(PACE.idle, Duration::from_millis), ping: q.ping_ms.map_or(PACE.ping, Duration::from_millis) };
-                upgrade.on_upgrade(move |mut socket| async move {
+                limited(upgrade).on_upgrade(move |mut socket| async move {
                     let end = bridge(&mut socket, &s, mac, t, &Size { cols: Some(100), rows: Some(30) }, &session, &pace).await;
                     let _ = done.send(end.clone());
                     finish(socket, end).await;
@@ -680,6 +687,20 @@ mod tests {
         rig.state.auth.revoke(&token);
         assert_eq!(tokio::time::timeout(Duration::from_secs(1), closed(&mut tcp)).await.unwrap(), (1008, "logged out".into()));
         assert!(rig.engine.try_recv().is_err(), "no terminal opened");
+    }
+
+    #[tokio::test]
+    async fn a_frame_bigger_than_the_page_sends_is_not_read_in() {
+        use tokio::io::AsyncWriteExt;
+        let mut rig = Rig::new().await;
+        let (mut tcp, _) = rig.open("ubnt", "").await;
+        assert_eq!(crate::api::tests::frame(&mut tcp).await.0, 1, "connected");
+        // Only the header of one (masked, as from a browser): its end comes without the rest.
+        let mut head = vec![0x82, 0x80 | 127];
+        head.extend_from_slice(&(MAX_FRAME as u64 + 1).to_be_bytes());
+        head.extend_from_slice(&[0; 4]);
+        tcp.write_all(&head).await.unwrap();
+        assert_eq!(tokio::time::timeout(Duration::from_secs(2), rig.ends.recv()).await.unwrap(), Some(Ok(End::Gone)));
     }
 
     #[tokio::test]
