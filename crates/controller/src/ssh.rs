@@ -191,8 +191,9 @@ enum Exit {
 }
 
 impl Session {
-    /// Runs a command and returns what it printed; an error if it exited
-    /// non-zero, was killed by a signal or didn't finish in time.
+    /// Runs a command and returns what it printed; an error if the AP refused
+    /// it (a forced command, a restricted login), or it exited non-zero, was
+    /// killed by a signal or didn't finish in time.
     async fn run(&self, cmd: &str) -> Result<String, Failure> {
         // What it printed on stdout and on stderr, together at most MAX_OUTPUT.
         let (mut out, mut err) = (Vec::new(), Vec::new());
@@ -217,6 +218,8 @@ impl Session {
                         continue;
                     }
                     russh::ChannelMsg::Close => break,
+                    // (Its yes needs nothing: the output follows it.)
+                    russh::ChannelMsg::Failure => return Err(Failure::Command("the AP refused to run it".into())),
                     _ => continue,
                 };
                 if out.len() + err.len() + data.len() > MAX_OUTPUT {
@@ -591,6 +594,56 @@ mod tests {
         // One that keeps it open: one connection for all.
         assert_eq!(logins_against("ui", 5, &["admin", "ubnt", "ui"]).await, (1, Ok(0)));
         assert_eq!(logins_against("ui", 2, &["admin", "ubnt", "ui"]).await, (2, Ok(1)));
+    }
+
+    /// An SSH server that logs anyone in and refuses every command, then
+    /// leaves the channel open (for the user `closes`, closes it).
+    struct Refusing {
+        user: String,
+    }
+
+    impl russh::server::Handler for Refusing {
+        type Error = russh::Error;
+
+        async fn auth_password(&mut self, user: &str, _: &str) -> Result<russh::server::Auth, Self::Error> {
+            self.user = user.to_string();
+            Ok(russh::server::Auth::Accept)
+        }
+
+        async fn channel_open_session(&mut self, _: russh::Channel<russh::server::Msg>, reply: russh::server::ChannelOpenHandle, _: &mut russh::server::Session) -> Result<(), Self::Error> {
+            reply.accept().await;
+            Ok(())
+        }
+
+        async fn exec_request(&mut self, ch: russh::ChannelId, _: &[u8], session: &mut russh::server::Session) -> Result<(), Self::Error> {
+            session.channel_failure(ch)?;
+            if self.user == "closes" { session.close(ch) } else { Ok(()) }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_refused_command_fails_at_once() {
+        let key = russh::keys::PrivateKey::from(russh::keys::ssh_key::private::Ed25519Keypair::from_seed(&[7; 32]));
+        let config = Arc::new(russh::server::Config { keys: vec![key], ..Default::default() });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            loop {
+                let (tcp, _) = listener.accept().await.unwrap();
+                let config = config.clone();
+                tokio::spawn(async move {
+                    if let Ok(session) = russh::server::run_stream(config, tcp, Refusing { user: String::new() }).await {
+                        let _ = session.await;
+                    }
+                });
+            }
+        });
+        // Neither waits out the step's time, nor counts as done (as a channel closed after set-adopt does).
+        for user in ["ubnt", "closes"] {
+            let ssh = connect(command_config(), "127.0.0.1", port, &[(user.to_string(), "ubnt".to_string())], None).await.unwrap();
+            let run = tokio::time::timeout(Duration::from_secs(2), ssh.run("cat /etc/board.info")).await.expect("at once");
+            assert_eq!(run, Err(Failure::Command("the AP refused to run it".into())), "{user}");
+        }
     }
 
     #[test]
