@@ -2787,9 +2787,11 @@ mod tests {
     /// keeps (`apcfg::SETTING_KEYS`): a key missing there is gone after a re-import.
     #[test]
     fn setting_keys_cover_every_setting_the_controller_reads() {
-        const SOURCES: &[&str] = &[include_str!("settings.rs"), include_str!("site.rs"), include_str!("channelai.rs"), include_str!("adopt.rs"), include_str!("ssh.rs"), include_str!("usergroups.rs")];
+        // Every source file of the crate, so a read in a new file is checked too.
+        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/src");
+        let sources: Vec<String> = std::fs::read_dir(dir).unwrap().map(|e| e.unwrap().path()).filter(|p| p.extension().is_some_and(|x| x == "rs")).map(|p| std::fs::read_to_string(p).unwrap()).collect();
         let mut read: Vec<String> = Vec::new();
-        for src in SOURCES {
+        for src in &sources {
             // Test modules (each runs to the next `}` at the start of a line) are left out.
             let mut rest: &str = src;
             let mut code = String::new();
