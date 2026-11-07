@@ -113,7 +113,7 @@ mounted at `/capture` in both containers, `FIFO=/capture/pcap` and
 
 Without `--users-file` (`APCTL_USERS_FILE`), apctl is read-only and needs no login: anyone
 who can reach port 8090 sees everything except the Wi-Fi passphrases, the SNMP community
-and backup downloads.
+and backup downloads, and can neither change anything nor open an AP terminal.
 
 Behind a reverse proxy or ingress, list its addresses with `--trusted-proxies`
 (`APCTL_TRUSTED_PROXIES`, IPs or CIDR ranges). Only then is its `X-Forwarded-For` header
