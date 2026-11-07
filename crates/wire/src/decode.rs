@@ -1,6 +1,6 @@
 //! Decrypting inform packets with the right key.
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use inform::{DEFAULT_KEY, Flags, Packet};
 use serde_json::Value;
 
@@ -33,8 +33,12 @@ pub fn decode_packet(pkt: Packet<'_>, keys: &KeyStore) -> Result<Decoded> {
     // names (a reply is sealed under the MAC of the inform it answers), then the default one.
     let device = keys.get(&pkt.header.mac).filter(|_| encrypted);
     let last = (if encrypted { KeyUsed::Default } else { KeyUsed::None }, DEFAULT_KEY);
-    let (key, _, payload) = open_with(&pkt, device.map(|k| (KeyUsed::Device, *k)).into_iter().chain([last]))
-        .with_context(|| format!("no known key decrypts the packet from {} (flags {:?})", pkt.header.mac, flags))?;
+    // "No known key" only when that is what failed: a GCM packet its key opened, or an
+    // unencrypted one, can still fail on its body.
+    let (key, _, payload) = open_with(&pkt, device.map(|k| (KeyUsed::Device, *k)).into_iter().chain([last])).map_err(|e| {
+        let what = if matches!(e.downcast_ref(), Some(inform::Error::Decrypt)) { "no known key decrypts" } else { "cannot open" };
+        e.context(format!("{what} the packet from {} (flags {:?})", pkt.header.mac, flags))
+    })?;
     Ok(Decoded { header: pkt.header, key, payload })
 }
 
@@ -124,5 +128,20 @@ mod tests {
         let wire = seal(mac, Flags::ENCRYPTED | Flags::GCM, [6; 16], &[8; 16], b"{}");
         let err = open_with(&Packet::parse(&wire).unwrap(), keys).unwrap_err().to_string();
         assert!(err.contains("wrong key"), "{err}");
+    }
+
+    #[test]
+    fn decode_says_no_known_key_only_when_decryption_failed() {
+        let mac: Mac = "00:11:22:33:44:55".parse().unwrap();
+        let keys = KeyStore::default();
+        let wire = seal(mac, Flags::ENCRYPTED | Flags::GCM, [7; 16], &[8; 16], b"{}");
+        let err = format!("{:#}", decode(&wire, &keys).unwrap_err());
+        assert!(err.starts_with("no known key decrypts the packet from 00:11:22:33:44:55") && err.contains("wrong key"), "{err}");
+        // The default key opened it (GCM), or no key was needed: the body failed, not a key.
+        for flags in [Flags::ENCRYPTED | Flags::GCM, Flags::NONE] {
+            let wire = seal(mac, flags, [9; 16], &DEFAULT_KEY, b"not json");
+            let err = format!("{:#}", decode(&wire, &keys).unwrap_err());
+            assert!(err.starts_with("cannot open the packet from 00:11:22:33:44:55") && err.contains("not JSON"), "{err}");
+        }
     }
 }
