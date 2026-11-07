@@ -343,6 +343,15 @@ pub fn radio_ai_na_dfs(radio_ai: &Value) -> bool {
     radio_ai_config(radio_ai, Band::Na).is_some_and(|c| flag(c, "dfs", false))
 }
 
+/// The channels the site's `radio_ai` setting (the document) blacklists on a band
+/// (`"ng"`, `"na"`), whatever width an entry names, each channel as its text: as the
+/// official reads it, a channel stored as a number counts, while `44.0` or `"044"` is
+/// not 44. The render gives them to the APs' own channel selection (`blklst`);
+/// Channel AI leaves them out of its lists and plans.
+pub fn blacklisted_channels(radio_ai: &Value, band: &str) -> Vec<String> {
+    arr(radio_ai, "channels_blacklist").iter().filter(|b| str_of(b, "radio") == Some(band)).filter_map(|b| text_of(b, "channel")).map(|t| t.to_string()).collect()
+}
+
 /// The channel width (MHz) a radio runs at, the one the render sends: its
 /// [`configured_width`] capped by its band (40 MHz at 2.4 GHz, 160 at 5, 320 at 6)
 /// and by its [`capable_width`]. Arguments as for [`configured_width`].
@@ -429,13 +438,7 @@ pub fn render_radios(c: &mut Cfg, ctx: &Ctx, radios: &[Radio], vaps: &[Vap]) -> 
             c.set(k.at("acsdfs"), on_off(radio_ai_na_dfs(ctx.radio_ai)));
         }
         if channel.is("auto") && acs_dfs {
-            // A channel stored as a number counts too: the official reads it as text.
-            let blocked: Vec<String> = arr(ctx.radio_ai, "channels_blacklist")
-                .iter()
-                .filter(|b| str_of(b, "radio") == Some(r.band.as_str()))
-                .filter_map(|b| text_of(b, "channel"))
-                .map(|t| t.to_string())
-                .collect();
+            let blocked = blacklisted_channels(ctx.radio_ai, r.band.as_str());
             if !blocked.is_empty() {
                 c.set(k.at("blklst"), hash_set_order(blocked.iter().map(String::as_str)).join(","));
             }
