@@ -441,10 +441,11 @@ async fn adopt_over_ssh(s: AppState, b: AdoptBody) -> Result<Json<Value>, ApiErr
         (r, _) => r.map_err(bad)?,
     };
     let board = session.run("cat /etc/board.info").await.unwrap_or_default();
-    let eth0 = session.run("cat /sys/class/net/eth0/address").await.unwrap_or_default();
-    let mac = parse_mac(&eth0)
-        .or_else(|| board_value(&board, "board.hwaddr").and_then(parse_mac))
-        .ok_or_else(|| ApiError(StatusCode::BAD_GATEWAY, "could not read the AP's MAC address: is this a UniFi AP?".into()))?;
+    let eth0 = session.run("cat /sys/class/net/eth0/address").await;
+    let Some(mac) = eth0.as_deref().ok().and_then(parse_mac).or_else(|| board_value(&board, "board.hwaddr").and_then(parse_mac)) else {
+        // Why the read failed (refused, timed out, too long), else output no AP gives.
+        return Err(eth0.err().map_or_else(|| ApiError(StatusCode::BAD_GATEWAY, "could not read the AP's MAC address: is this a UniFi AP?".into()), bad));
+    };
     // An AP apctl knows by its MAC but not at this address: check its key too.
     let known = expected_host_key(&s.live.read().unwrap(), &state, &mac);
     let verified = known.is_some();
@@ -670,6 +671,12 @@ mod tests {
         let e = adopt_at(listener.local_addr().unwrap().port(), None).await;
         assert_eq!((e.0, e.1.as_str()), (StatusCode::CONFLICT, "no settings imported yet"));
         assert!(tokio::time::timeout(Duration::from_millis(200), listener.accept()).await.is_err(), "no connection to the AP");
+    }
+
+    #[tokio::test]
+    async fn an_adoption_says_why_the_aps_mac_could_not_be_read() {
+        let e = adopt_at(refusing().await, Some(json!({ "devices": [] }))).await;
+        assert_eq!((e.0, e.1.as_str()), (StatusCode::BAD_GATEWAY, "the command failed on the AP: the AP refused to run it"));
     }
 
     #[test]
