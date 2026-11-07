@@ -343,6 +343,26 @@ pub(crate) fn pick(v: &Value, keys: &[&str]) -> serde_json::Map<String, Value> {
     keys.iter().map(|k| (k.to_string(), v[*k].clone())).collect()
 }
 
+/// The switches among the SSID, AP and radio editors' fields.
+const BOOL_FIELDS: &[&str] = &[
+    "enabled", "hide_ssid", "fast_roaming_enabled", "wpa3_fast_roaming", "rrm_enabled", "bss_transition", "roaming_assistant_na_enabled", "no2ghz_oui",
+    "enhanced_iot", "iot_channel_lock", "iot_dtim_lock", "mcastenhance_enabled", "proxy_arp", "advertise_device_name_in_beacon", "l2_isolation", "is_guest",
+    "uapsd_enabled", "country_beacon", "minrate_na_enabled", "tdls_prohibit", "p2p", "p2p_cross_connect", "mac_filter_enabled", "atf_enabled",
+    "green_ap_enabled", "jumboframe_enabled", "min_rssi_enabled", "hard_noise_floor_enabled", "sens_level_enabled", "loadbalance_enabled",
+];
+
+/// [`pick`] for an editor: a switch stored as text ("true"/"false", as some
+/// imports write it) goes out as the boolean the render reads it as.
+fn pick_read(v: &Value, keys: &[&str]) -> serde_json::Map<String, Value> {
+    let mut o = pick(v, keys);
+    for (k, x) in o.iter_mut().filter(|(k, _)| BOOL_FIELDS.contains(&k.as_str())) {
+        if let Some(b) = apcfg::bool_of(v, k) {
+            *x = json!(b);
+        }
+    }
+    o
+}
+
 /// The site's APs' MACs (however their records write them).
 pub(crate) fn device_macs(state: &Value) -> Vec<inform::Mac> {
     docs(state, "devices").filter_map(|d| doc_mac(&d["mac"])).collect()
@@ -417,7 +437,7 @@ fn wlans_view(state: &Value, informs: &HashMap<inform::Mac, Arc<Value>>) -> Valu
                 "has_passphrase": w["x_passphrase"].as_str().is_some_and(|p| !p.is_empty()), "psk": Security::of(w) == Security::Psk,
             });
             if let Value::Object(o) = &mut v {
-                o.extend(pick(w, WLAN_FIELDS));
+                o.extend(pick_read(w, WLAN_FIELDS));
             }
             // The bands as deployed, which an edit starts from (`edit_wlan`).
             v["wlan_bands"] = json!(apcfg::wlan_bands(w));
@@ -466,10 +486,16 @@ pub async fn passphrase(State(s): State<AppState>, Path(id): Path<String>) -> Re
     Ok(Json(json!({ "passphrase": w["x_passphrase"] })))
 }
 
-/// Fields of an AP radio the editor shows and edits.
+/// Fields of an AP radio an edit may change, which its description names.
 const RADIO_FIELDS: &[&str] = &[
     "radio", "name", "channel", "ht", "tx_power_mode", "tx_power", "min_rssi_enabled", "min_rssi", "hard_noise_floor_enabled", "sens_level_enabled", "sens_level",
     "antenna_gain", "antenna_id", "vwire_enabled", "loadbalance_enabled", "maxsta",
+];
+
+/// The [`RADIO_FIELDS`] the editor shows.
+const RADIO_VIEW_FIELDS: &[&str] = &[
+    "radio", "channel", "ht", "tx_power_mode", "tx_power", "min_rssi_enabled", "min_rssi", "hard_noise_floor_enabled", "sens_level_enabled", "sens_level",
+    "antenna_gain", "antenna_id", "loadbalance_enabled", "maxsta",
 ];
 
 /// Fields of an AP the editor shows and edits, besides its radios.
@@ -521,7 +547,7 @@ pub async fn device(State(s): State<AppState>, MacPath(mac): MacPath) -> Result<
         "reported": inform.is_some(), "site_outdoor": site_outdoor, "advanced_features": advanced, "antennas": antennas,
     });
     if let Value::Object(o) = &mut out {
-        o.extend(pick(d, DEVICE_FIELDS));
+        o.extend(pick_read(d, DEVICE_FIELDS));
     }
     Ok(Json(out))
 }
@@ -529,7 +555,7 @@ pub async fn device(State(s): State<AppState>, MacPath(mac): MacPath) -> Result<
 /// One radio of an AP's record (its `radio_table` entry) as the AP editor shows it;
 /// `reported` is the AP's inform's `radio_table` ([`RadioCaps::of`]).
 fn radio_view(state: &Value, r: &Value, reported: &Value) -> Value {
-    let mut v = Value::Object(pick(r, RADIO_FIELDS));
+    let mut v = Value::Object(pick_read(r, RADIO_VIEW_FIELDS));
     let band = r["radio"].as_str().unwrap_or("");
     // The width set (`ht`, else Channel AI's or the band's default), and the one the radio runs at.
     v["ht"] = json!(apcfg::configured_width(state, site_id(state).unwrap_or_default(), r));
@@ -2733,6 +2759,20 @@ mod tests {
         // So is the channel Channel AI or a plan would set.
         crate::channelai::set_channels(&mut s, "na", &[(AP1.parse().unwrap(), 153)], &HashSet::new()).unwrap();
         assert_eq!(s["devices"][0]["radio_table"][1]["channel"], 153);
+    }
+
+    #[test]
+    fn the_editors_send_switches_stored_as_text_as_the_render_reads_them() {
+        let mut s = state();
+        (s["wlanconf"][0]["enabled"], s["wlanconf"][0]["hide_ssid"], s["wlanconf"][0]["name"]) = (json!("false"), json!("true"), json!("true"));
+        let w = &wlans_view(&s, &HashMap::new())["wlans"][0];
+        assert_eq!((&w["enabled"], &w["hide_ssid"], &w["name"], &w["is_guest"]), (&json!(false), &json!(true), &json!("true"), &Value::Null), "a name stays text, unset stays unset");
+        let r = json!({ "radio": "na", "name": "wifi1", "min_rssi_enabled": "false", "loadbalance_enabled": "true", "sens_level_enabled": "maybe", "vwire_enabled": true });
+        let v = radio_view(&s, &r, &Value::Null);
+        assert_eq!((&v["min_rssi_enabled"], &v["loadbalance_enabled"], &v["sens_level_enabled"]), (&json!(false), &json!(true), &json!("maybe")));
+        assert!(v.get("name").is_none() && v.get("vwire_enabled").is_none(), "the editor shows neither");
+        let d = pick_read(&json!({ "name": "false", "atf_enabled": "true", "green_ap_enabled": false }), DEVICE_FIELDS);
+        assert_eq!((&d["name"], &d["atf_enabled"], &d["green_ap_enabled"], &d["jumboframe_enabled"]), (&json!("false"), &json!(true), &json!(false), &Value::Null));
     }
 
     #[test]
