@@ -236,8 +236,7 @@ impl Auth {
     /// is not from a browser page, and is let through.
     fn same_origin(&self, headers: &HeaderMap, peer: Option<IpAddr>, authority: Option<&str>) -> bool {
         let Some(origin) = headers.get(header::ORIGIN) else { return true };
-        let forwarded = || headers.get_all("x-forwarded-host").iter().filter_map(|v| v.to_str().ok()).flat_map(|v| v.split(',')).next_back().map(str::trim);
-        let host = peer.filter(|p| self.proxies.contains(*p)).and_then(|_| forwarded()).or_else(|| headers.get(header::HOST)?.to_str().ok()).or(authority);
+        let host = self.proxies.forwarded(headers, peer, "x-forwarded-host").or_else(|| headers.get(header::HOST)?.to_str().ok()).or(authority);
         origin.to_str().ok().zip(host).is_some_and(|(o, h)| origin_matches(o, h))
     }
 
@@ -351,9 +350,8 @@ impl Proxies {
             return peer;
         }
         let mut client = peer;
-        // A line that is not text is one hop that is no address, not left out.
-        for hop in headers.get_all("x-forwarded-for").iter().map(|v| v.to_str().unwrap_or("?")).flat_map(|v| v.split(',')).rev() {
-            let Some(ip) = wire::hop_ip(hop.trim()) else {
+        for hop in forwarded_values(headers, "x-forwarded-for").rev() {
+            let Some(ip) = wire::hop_ip(hop) else {
                 // Skipping it would believe the hops left of it, which the
                 // client wrote: the last proxy's address is kept instead, so
                 // the clients behind it share their login attempts. Said once,
@@ -369,6 +367,21 @@ impl Proxies {
         }
         client
     }
+
+    /// What the nearest proxy says in X-Forwarded-Host or -Proto: the right-most
+    /// value, as it is the hop next to apctl that writes it, and only when `peer`
+    /// is a trusted proxy.
+    fn forwarded<'h>(&self, headers: &'h HeaderMap, peer: Option<IpAddr>, name: &str) -> Option<&'h str> {
+        peer.filter(|p| self.contains(*p)).and_then(|_| forwarded_values(headers, name).next_back())
+    }
+}
+
+/// The values of a forwarded header, over all its lines, left to right, trimmed: a
+/// proxy may append its own line or its own comma-separated value, so the left ones
+/// may be the client's. A line that is not text is one value that is nothing (`?`),
+/// not left out, so the values left of it are not taken in its place.
+fn forwarded_values<'h>(headers: &'h HeaderMap, name: &str) -> impl DoubleEndedIterator<Item = &'h str> {
+    headers.get_all(name).iter().map(|v| v.to_str().unwrap_or("?")).flat_map(|v| v.split(',')).map(str::trim)
 }
 
 /// Whether an Origin (`https://apctl.example:8443`) names this host (`apctl.example:8443`),
@@ -405,7 +418,7 @@ fn session_tokens(headers: &HeaderMap) -> impl Iterator<Item = &str> {
 /// plain HTTP, so that is only known from X-Forwarded-Proto, believed (as
 /// the other forwarded headers are) only from a trusted proxy.
 fn cookie(auth: &Auth, headers: &HeaderMap, peer: Option<IpAddr>, value: &str, max_age: Ts) -> String {
-    let https = peer.is_some_and(|p| auth.proxies.contains(p)) && headers.get("x-forwarded-proto").and_then(|v| v.to_str().ok()) == Some("https");
+    let https = auth.proxies.forwarded(headers, peer, "x-forwarded-proto").is_some_and(|p| p.eq_ignore_ascii_case("https"));
     format!("{COOKIE}={value}; Path=/; HttpOnly; SameSite=Lax; Max-Age={max_age}{}", if https { "; Secure" } else { "" })
 }
 
@@ -751,6 +764,32 @@ mod tests {
         assert!(!ok(Some("https://other.example"), "apctl:8080", Some("apctl.example"), "10.42.0.3"));
         // From anyone else it is not believed.
         assert!(!ok(Some("https://evil.example"), "apctl.lan", Some("evil.example"), lan));
+        // A proxy that appends: its own value, the right-most, is the one believed.
+        assert!(ok(Some("https://apctl.example"), "apctl:8080", Some("evil.example, apctl.example"), "10.42.0.3"));
+        assert!(!ok(Some("https://evil.example"), "apctl:8080", Some("evil.example, apctl.example"), "10.42.0.3"));
+    }
+
+    #[test]
+    fn the_cookie_is_secure_as_the_nearest_trusted_proxy_says() {
+        let t = TestStore::new("proto");
+        let proxies = Arc::new(Proxies::parse(&["10.42.0.0/16".into()]).unwrap());
+        let auth = Auth::new(Users::default(), &t.store, t.writer, proxies).unwrap();
+        let secure = |lines: &[&[u8]], peer: &str| {
+            let mut h = HeaderMap::new();
+            for l in lines {
+                h.append("x-forwarded-proto", axum::http::HeaderValue::from_bytes(l).unwrap());
+            }
+            cookie(&auth, &h, Some(peer.parse().unwrap()), "v", 60).ends_with("; Secure")
+        };
+        const PROXY: &str = "10.42.0.3";
+        assert!(secure(&[b"https"], PROXY));
+        assert!(secure(&[b"HTTPS"], PROXY), "any case");
+        assert!(!secure(&[b"http"], PROXY) && !secure(&[], PROXY));
+        // Its own line or value after one the client sent is the one believed.
+        assert!(secure(&[b"http", b"https"], PROXY) && secure(&[b"http, https"], PROXY));
+        assert!(!secure(&[b"https", b"http"], PROXY) && !secure(&[b"https, http"], PROXY));
+        assert!(!secure(&[b"https", b"\xff"], PROXY), "a line that is not text is no scheme");
+        assert!(!secure(&[b"https"], "192.168.1.20"), "only from a trusted proxy");
     }
 
     #[tokio::test]
