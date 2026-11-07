@@ -15,13 +15,13 @@
 use std::time::Duration;
 
 use axum::extract::ws::{CloseFrame, Message, Utf8Bytes, WebSocket, WebSocketUpgrade, close_code};
-use axum::extract::{Query, State};
+use axum::extract::State;
 use axum::response::{IntoResponse, Response};
 use inform::Mac;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use crate::api::{ApiError, AppState, MacPath};
+use crate::api::{ApiError, AppState, MacPath, Query};
 use crate::auth::SessionId;
 use crate::clock;
 use crate::engine::{Event, EventKind};
@@ -84,14 +84,10 @@ impl Size {
 pub async fn open(
     State(s): State<AppState>,
     MacPath(mac): MacPath,
-    uri: axum::http::Uri,
+    Query(size): Query<Size>,
     session: Option<axum::Extension<SessionId>>,
     upgrade: WebSocketUpgrade,
 ) -> Response {
-    let size = match Query::<Size>::try_from_uri(&uri) {
-        Ok(Query(size)) => size,
-        Err(e) => return ApiError::from(e).into_response(),
-    };
     // Always there: the route is withheld in read-only mode, which has no sessions.
     let Some(axum::Extension(session)) = session else { return ApiError::forbidden("a terminal needs a login").into_response() };
     limited(upgrade).on_upgrade(move |socket| terminal(socket, s, mac, size, session))
