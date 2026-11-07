@@ -102,9 +102,10 @@ spec:
 
 Expose port 8090 with a Service for the web UI. For shadow mode, drop `--active` and the
 host ports, and feed it a capture with `--shadow` or `--shadow-cmd`. The
-`ghcr.io/trexx/rust-apctl-capture` image is a tcpdump sidecar for that. It writes into the
-pipe its `FIFO` names (creating it), capturing what `FILTER` selects (all traffic when
-empty), and needs the `NET_RAW` and `NET_ADMIN` capabilities. Run it next to apctl in a pod
+`ghcr.io/trexx/rust-apctl-capture` image, published with each release under the same tags
+as apctl's (or built with `podman build --target capture .`), is a tcpdump sidecar for that.
+It writes into the pipe its `FIFO` names (creating it), capturing what `FILTER` selects (all
+traffic when empty), and needs the `NET_RAW` and `NET_ADMIN` capabilities. Run it next to apctl in a pod
 that sees the other controller's traffic (`hostNetwork` on its node), with an `emptyDir`
 mounted at `/capture` in both containers, `FIFO=/capture/pcap` and
 `FILTER='tcp port 8080 or udp port 5514'` (informs and syslog) on the sidecar, and

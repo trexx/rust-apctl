@@ -1,9 +1,10 @@
 name: 'Image'
 
-# Builds the runtime image without pushing it whenever what it is built from changes:
-# Renovate automerges minor and digest bumps of the Dockerfile's images once the checks
-# pass, and a bump that breaks the image (a new manufacturer list apctl cannot read, a glibc
-# mismatch between the rust and distroless images) must fail here, not at the next release.
+# Builds the runtime image and the capture sidecar without pushing them whenever what they
+# are built from changes: Renovate automerges minor and digest bumps of the Dockerfile's
+# images once the checks pass, and a bump that breaks an image (a new manufacturer list
+# apctl cannot read, a glibc mismatch between the rust and distroless images, an alpine
+# without tcpdump) must fail here, not at the next release.
 # The manifests too: the release profile and crate features are exercised only here.
 on:
   push:
@@ -42,3 +43,14 @@ jobs:
           cache-to: 'type=gha,scope=apctl,mode=max'
       - name: 'The image runs, reports the crate version and carries the manufacturer list'
         run: 'scripts/image-check.sh apctl:check'
+      # The capture sidecar too, which every release publishes (build.yml): an alpine bump
+      # whose tcpdump no longer installs or runs fails here. Small enough to build uncached.
+      - uses: 'docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc' # v7.4.0
+        with:
+          context: '.'
+          target: 'capture'
+          tags: 'apctl-capture:check'
+          load: true
+          provenance: false
+      - name: 'The capture image runs tcpdump'
+        run: 'docker run --rm --entrypoint tcpdump apctl-capture:check --version'

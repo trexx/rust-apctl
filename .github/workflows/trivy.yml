@@ -1,7 +1,8 @@
 name: 'Trivy'
 
-# Scans the published image: the OS packages of the distroless base, and the crates
-# apctl was built with (embedded by cargo auditable, see the Dockerfile).
+# Scans the published images: the OS packages of the distroless base, and the crates
+# apctl was built with (embedded by cargo auditable, see the Dockerfile); and the alpine
+# packages of the capture sidecar, which parses untrusted traffic with raw-socket rights.
 on:
   schedule:
     - cron: '37 12 * * *'
@@ -15,3 +16,27 @@ jobs:
       contents: 'read'
       security-events: 'write'
       actions: 'read'
+
+  # The shared workflow scans the image named after the repository only. A finding here
+  # is fixed by the next release, which rebuilds the sidecar (build.yml).
+  capture:
+    runs-on: 'ubuntu-26.04'
+    timeout-minutes: 15
+    permissions:
+      packages: 'read'
+      contents: 'read'
+      security-events: 'write'
+      actions: 'read'
+    steps:
+      - uses: 'aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25' # v0.36.0
+        env:
+          TRIVY_DB_REPOSITORY: 'public.ecr.aws/aquasecurity/trivy-db,ghcr.io/aquasecurity/trivy-db'
+        with:
+          image-ref: 'ghcr.io/${{ github.repository }}-capture:latest'
+          format: 'sarif'
+          output: 'trivy-capture.sarif'
+          scanners: 'vuln'
+      - uses: 'github/codeql-action/upload-sarif@33d7b85da1a04171e211befe2c739303b9a4c066' # v4.39.3
+        with:
+          sarif_file: 'trivy-capture.sarif'
+          category: 'trivy-capture'

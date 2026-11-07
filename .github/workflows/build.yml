@@ -1,9 +1,10 @@
 name: 'Build'
 
 # Push a version tag matching crates/controller/Cargo.toml (e.g. 0.15.1) to
-# publish ghcr.io/trexx/rust-apctl:<version> and :latest. This is the image's only
-# publisher: scripts/release.sh builds and checks locally, and --pin pins the
-# digest published here.
+# publish ghcr.io/trexx/rust-apctl:<version> and :latest, and the shadow-mode capture
+# sidecar (the Dockerfile's `capture` stage) as ghcr.io/trexx/rust-apctl-capture with
+# the same tags. This is the only publisher of both: scripts/release.sh builds and
+# checks locally, and --pin pins the digest published here.
 on:
   push:
     tags: [ '[0-9]+.[0-9]+.[0-9]+' ]
@@ -40,6 +41,20 @@ jobs:
       # Read only: a tag's own cache could be read by that tag alone.
       cache_scope: 'apctl'
       cache_write: false
+
+  # Rebuilt on every release, so the alpine and tcpdump fixes Renovate brings reach it.
+  # No layer cache: image.yml builds the stage without caching it, and it is small.
+  capture:
+    needs: [ 'version', 'test' ]
+    uses: 'trexx/actions/.github/workflows/build.yml@main'
+    permissions:
+      contents: read
+      packages: write
+    with:
+      images: 'ghcr.io/${{ github.repository }}-capture'
+      target: 'capture'
+      # The package is not named after the repository, which pruning assumes.
+      prune_images: false
 
   # The image CI published runs, reports the version and carries the manufacturer list
   # (scripts/image-check.sh), before release.sh --pin pins it.
