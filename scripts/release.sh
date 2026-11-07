@@ -10,14 +10,15 @@
 # CI (.github/workflows/build.yml, on the version tag) is the only publisher: this
 # script never pushes, so one tag never names two different builds. --pin waits
 # until CI has published $IMAGE:<version>, checks that image was built from HEAD,
-# and pins its digest.
+# waits for the tag's Build run (which tests the published image) to pass, and pins
+# its digest.
 #
 # The version must match crates/controller/Cargo.toml, and README.md must name its
 # image. Stops at the first failure.
 set -euo pipefail
 
 IMAGE=${APCTL_IMAGE:-ghcr.io/trexx/rust-apctl}
-# How long --pin waits for CI to publish the image, in seconds.
+# How long --pin waits for CI to publish and check the image, in seconds.
 WAIT=${APCTL_PIN_WAIT:-3600}
 
 version=${1:?usage: scripts/release.sh <version> [--pin <manifest>] [--no-test]}
@@ -168,6 +169,33 @@ case $revision in
   *) echo "$IMAGE:$version was built from $revision, not HEAD ($head)" >&2; exit 1 ;;
 esac
 echo "published $IMAGE:$version@$digest"
+
+# CI pushes the image before its check job tests it (scripts/image-check.sh on the published
+# image), so the manifest exists while that check runs, or after it failed: pin only once
+# the tag's Build run for HEAD has passed. Without gh that is left unchecked.
+if type -P gh >/dev/null; then
+  # "<status> <conclusion> <url>" of the newest run, or "null null null" before there is one.
+  build_run() {
+    gh run list --workflow build.yml --branch "$version" --event push --commit "$head" -L 1 \
+      --json status,conclusion,url -q '.[0] // {} | "\(.status) \(.conclusion) \(.url)"'
+  }
+  echo "== waiting for the Build run of $version to pass"
+  until run=$(build_run) || { echo "could not list the Build runs with gh; is it logged in (gh auth status)?" >&2; exit 1; }
+        read -r status conclusion url <<<"$run"; [ "$status" = completed ]; do
+    if [ $SECONDS -ge $deadline ]; then
+      echo "the Build run of $version has not finished after ${WAIT}s (${url/#null/no run found})" >&2
+      exit 1
+    fi
+    sleep 15
+  done
+  if [ "$conclusion" != success ]; then
+    echo "the Build run of $version ended '$conclusion', not success: $url" >&2
+    exit 1
+  fi
+  echo "passed: $url"
+else
+  echo "note: gh is not installed; not checked that CI's Build run of $version passed"
+fi
 
 sed -i -E "s|image: ${IMAGE}:[^@ ]+@sha256:[0-9a-f]+|image: ${IMAGE}:${version}@${digest}|" "$pin"
 grep -q "${IMAGE}:${version}@${digest}" "$pin" || { echo "could not pin $pin" >&2; exit 1; }

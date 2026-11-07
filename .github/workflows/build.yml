@@ -57,7 +57,7 @@ jobs:
       prune_images: false
 
   # The image CI published runs, reports the version and carries the manufacturer list
-  # (scripts/image-check.sh), before release.sh --pin pins it.
+  # (scripts/image-check.sh). release.sh --pin pins it only once this run has passed.
   check:
     needs: [ 'build' ]
     runs-on: 'ubuntu-26.04'
