@@ -1723,10 +1723,12 @@ impl Engine {
         let mac_text = Sql::Text(s.ap.mac.to_string());
         let mac = || mac_text.clone();
         let a = &s.ap;
+        // Its clients: unknown, not none, without a VAP table.
+        let num_sta = s.has_vap_table.then_some(s.clients.len() as i64);
         self.writer.send(Write::Metric {
             table: &store::AP,
             ts,
-            values: vec![mac(), a.cpu.into(), a.mem.into(), a.load1.into(), a.load5.into(), a.load15.into(), a.mem_used.into(), a.mem_total.into(), a.uptime.into(), a.satisfaction.into(), a.num_sta.into()],
+            values: vec![mac(), a.cpu.into(), a.mem.into(), a.load1.into(), a.load5.into(), a.load15.into(), a.mem_used.into(), a.mem_total.into(), a.uptime.into(), a.satisfaction.into(), num_sta.into()],
         });
         if let Some(u) = &s.uplink {
             self.writer.send(Write::Metric {
