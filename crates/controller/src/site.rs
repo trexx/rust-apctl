@@ -251,7 +251,9 @@ fn site_snmp(doc: &mut Value, sn: &Value, notes: &mut Vec<String>) -> Result<(),
         doc["x_password"] = json!(pw);
         notes.push("SNMPv3 password".into());
     }
-    if flag(doc, "enabled", false) && doc["community"].as_str().is_none_or(str::is_empty) {
+    // Read as the render reads it: no community (or one that is not text) gives the APs
+    // "public", so only a stored empty one leaves v1/v2c without one.
+    if flag(doc, "enabled", false) && doc["community"].as_str() == Some("") {
         return Err("SNMP v1/v2c needs a community".into());
     }
     if flag(doc, "enabledV3", false) && (doc["username"].as_str().is_none_or(str::is_empty) || doc["x_password"].as_str().is_none_or(str::is_empty)) {
@@ -548,6 +550,15 @@ mod tests {
     fn snmp_needs_its_credentials() {
         let mut s = state();
         assert!(edit(&mut s, json!({ "snmp": { "enabled": true, "community": "with space" } })).is_err());
+        // No community stored: the APs get "public", as the form shows, so switching v1/v2c on
+        // without sending one is accepted, and "public" is not written into the setting.
+        setting_mut(&mut s, "snmp").as_object_mut().unwrap().remove("community");
+        edit(&mut s, json!({ "snmp": { "enabled": true } })).unwrap();
+        assert!(setting(&s, "snmp")["community"].is_null());
+        assert_eq!(site_view(&s, true)["snmp"]["community"], "public");
+        // A stored empty one gives the APs no community at all.
+        setting_mut(&mut s, "snmp")["community"] = json!("");
+        assert!(edit(&mut s, json!({ "snmp": { "enabled": true } })).unwrap_err().contains("needs a community"));
         edit(&mut s, json!({ "snmp": { "enabled": true, "community": "c0mmunity" } })).unwrap();
         assert!(edit(&mut s, json!({ "snmp": { "enabledV3": true, "username": "mon" } })).unwrap_err().contains("password"));
         assert!(edit(&mut s, json!({ "snmp": { "enabledV3": true, "username": "mon", "x_password": "short" } })).is_err());

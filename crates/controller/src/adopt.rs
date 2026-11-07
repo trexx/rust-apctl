@@ -426,11 +426,22 @@ pub fn spawn(s: AppState) {
                 overdue
             };
             for mac in overdue {
-                tracing::info!("{mac}: forgotten without reporting again");
-                let _ = finish_forget(&s.engine, mac, false).await;
+                finish_overdue(&s.engine, &s.live, mac).await;
             }
         }
     });
+}
+
+/// Finishes the forget of an AP that didn't report again in time. Its record may have
+/// left the settings another way meanwhile (an import without it); the forget was
+/// accepted, so an AP apctl still lists is forgotten as [`ToForget::Listed`] is.
+async fn finish_overdue(engine: &tokio::sync::mpsc::Sender<Input>, live: &RwLock<Live>, mac: Mac) {
+    tracing::info!("{mac}: forgotten without reporting again");
+    let Err(e) = finish_forget(engine, mac, false).await else { return };
+    let listed = ToForget::of(&live.read().unwrap(), &mac).ok() == Some(ToForget::Listed);
+    if e.0 == axum::http::StatusCode::NOT_FOUND && listed {
+        forgotten(engine, mac, false).await;
+    }
 }
 
 // ---- API ------------------------------------------------------------------
@@ -665,6 +676,37 @@ mod tests {
             got.push(x);
         }
         assert_eq!(got, ["forget", "ap_forgotten"], "the second forget found no record");
+    }
+
+    #[tokio::test]
+    async fn a_forget_whose_record_left_meanwhile_still_ends_at_the_timeout() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        // An import since left the AP out, but apctl still lists it.
+        let mut s = json!({ "devices": [], "setting": [] });
+        let mac: Mac = "02:00:00:00:00:01".parse().unwrap();
+        let live = RwLock::new(Live { state: Some(Arc::new(s.clone())), ..Live::default() });
+        live.write().unwrap().known_devices.insert(mac, crate::engine::KnownDevice { last_seen: 2, ..Default::default() });
+        let (seen_tx, mut seen) = tokio::sync::mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            while let Some(i) = rx.recv().await {
+                match i {
+                    Input::EditState { edit, done, .. } => drop(done.send(edit(&mut s))),
+                    Input::Forget { .. } => seen_tx.send("forget").unwrap(),
+                    Input::Note(e) => seen_tx.send(e.kind.as_str()).unwrap(),
+                    _ => {}
+                }
+            }
+        });
+        finish_overdue(&tx, &live, mac).await;
+        // Once forgotten (the engine's forget drops the listing), a second finish tells of nothing.
+        live.write().unwrap().known_devices.remove(&mac);
+        finish_overdue(&tx, &live, mac).await;
+        drop(tx);
+        let mut got = Vec::new();
+        while let Some(x) = seen.recv().await {
+            got.push(x);
+        }
+        assert_eq!(got, ["forget", "ap_forgotten"]);
     }
 
     #[test]

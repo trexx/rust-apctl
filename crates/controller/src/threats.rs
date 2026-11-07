@@ -297,6 +297,12 @@ fn seen<'a>(rows: &[&'a Heard]) -> Seen<'a> {
     }
 }
 
+/// How long before a network was last heard an AP's sighting of it still counts
+/// for naming the AP nearest to it: the strongest of those is the neighbour
+/// list's nearest AP, and comes first in a finding's `heard_by` (which its
+/// event is filed under), so an AP that has gone quiet does not keep naming it.
+pub(crate) const NEAREST_WINDOW: Ts = 3600;
+
 /// Everything suspicious in what the APs hear.
 pub fn assess(a: &Assessment) -> Vec<Finding> {
     let own: HashMap<&str, &OwnBss> = a.own.iter().map(|b| (b.bssid.as_str(), b)).collect();
@@ -347,9 +353,11 @@ pub fn assess(a: &Assessment) -> Vec<Finding> {
         let (latest, best) = (all.latest, all.best);
         // `rows` are the sightings the finding rests on, `s` what they add up to.
         let mut push = |kind: Kind, severity: Severity, target: Option<String>, detail: String, rows: &[&Heard], s: &Seen| {
-            let mut heard_by: Vec<HeardBy> =
-                rows.iter().map(|h| HeardBy { mac: h.ap_mac.clone(), name: ap_name(&h.ap_mac), signal: h.signal }).collect();
-            heard_by.sort_by_key(|h| std::cmp::Reverse(h.signal.unwrap_or(-200)));
+            // Those that heard it lately (NEAREST_WINDOW) first, each part strongest first.
+            let lately = s.latest.last_seen - NEAREST_WINDOW;
+            let mut rows = rows.to_vec();
+            rows.sort_by_key(|h| std::cmp::Reverse((h.last_seen >= lately, h.signal.unwrap_or(-200))));
+            let heard_by: Vec<HeardBy> = rows.iter().map(|h| HeardBy { mac: h.ap_mac.clone(), name: ap_name(&h.ap_mac), signal: h.signal }).collect();
             out.push(Finding {
                 kind,
                 severity,
@@ -1109,6 +1117,20 @@ mod tests {
         let mut a = site();
         a.heard.push(heard("02:00:00:3c:52:c0", UP, "Home", 48, "WPA2-Personal (AES/CCMP)", -80));
         assert_eq!(kinds(&a), vec![(Kind::Impersonation, Severity::Medium, "02:00:00:3c:52:c0".into())]);
+    }
+
+    #[test]
+    fn heard_by_starts_with_the_ap_the_neighbour_list_names_nearest() {
+        let mut a = site();
+        // The garage heard the copy strongest, but days ago; upstairs hears it now.
+        a.heard.push(Heard { last_seen: 10_000 - 5 * 86_400, ..heard("02:11:22:33:44:55", DOWN, "Home", 6, "Open", -50) });
+        a.heard.push(heard("02:11:22:33:44:55", UP, "Home", 6, "Open", -72));
+        let order = |a: &Assessment| assess(a)[0].heard_by.iter().map(|h| (h.mac.clone(), h.signal)).collect::<Vec<_>>();
+        assert_eq!(order(&a), [(UP.to_string(), Some(-72)), (DOWN.to_string(), Some(-50))]);
+        // Heard within the window of the latest sighting: the strongest first.
+        let n = a.heard.len();
+        a.heard[n - 2].last_seen = 10_000 - NEAREST_WINDOW;
+        assert_eq!(order(&a), [(DOWN.to_string(), Some(-50)), (UP.to_string(), Some(-72))]);
     }
 
     #[test]

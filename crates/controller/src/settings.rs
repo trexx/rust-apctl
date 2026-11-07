@@ -351,14 +351,14 @@ const BOOL_FIELDS: &[&str] = &[
     "green_ap_enabled", "jumboframe_enabled", "min_rssi_enabled", "hard_noise_floor_enabled", "sens_level_enabled", "loadbalance_enabled",
 ];
 
-/// [`pick`] for an editor: a switch stored as text ("true"/"false", as some
-/// imports write it) goes out as the boolean the render reads it as.
+/// [`pick`] for an editor: a switch goes out as the boolean the render reads it
+/// as (text "true"/"false" too, as some imports write it), or `null` for a value
+/// the render can't read (1, "yes"), which it takes as the field's default, as
+/// the editors take `null`.
 fn pick_read(v: &Value, keys: &[&str]) -> serde_json::Map<String, Value> {
     let mut o = pick(v, keys);
     for (k, x) in o.iter_mut().filter(|(k, _)| BOOL_FIELDS.contains(&k.as_str())) {
-        if let Some(b) = apcfg::bool_of(v, k) {
-            *x = json!(b);
-        }
+        *x = apcfg::bool_of(v, k).map_or(Value::Null, Value::from);
     }
     o
 }
@@ -2767,9 +2767,10 @@ mod tests {
         (s["wlanconf"][0]["enabled"], s["wlanconf"][0]["hide_ssid"], s["wlanconf"][0]["name"]) = (json!("false"), json!("true"), json!("true"));
         let w = &wlans_view(&s, &HashMap::new())["wlans"][0];
         assert_eq!((&w["enabled"], &w["hide_ssid"], &w["name"], &w["is_guest"]), (&json!(false), &json!(true), &json!("true"), &Value::Null), "a name stays text, unset stays unset");
-        let r = json!({ "radio": "na", "name": "wifi1", "min_rssi_enabled": "false", "loadbalance_enabled": "true", "sens_level_enabled": "maybe", "vwire_enabled": true });
+        let r = json!({ "radio": "na", "name": "wifi1", "min_rssi_enabled": "false", "loadbalance_enabled": "true", "sens_level_enabled": "maybe", "hard_noise_floor_enabled": 1, "vwire_enabled": true });
         let v = radio_view(&s, &r, &Value::Null);
-        assert_eq!((&v["min_rssi_enabled"], &v["loadbalance_enabled"], &v["sens_level_enabled"]), (&json!(false), &json!(true), &json!("maybe")));
+        let switches = [&v["min_rssi_enabled"], &v["loadbalance_enabled"], &v["sens_level_enabled"], &v["hard_noise_floor_enabled"]];
+        assert_eq!(switches, [&json!(false), &json!(true), &Value::Null, &Value::Null], "what the render can't read goes out unset, as it reads it");
         assert!(v.get("name").is_none() && v.get("vwire_enabled").is_none(), "the editor shows neither");
         let d = pick_read(&json!({ "name": "false", "atf_enabled": "true", "green_ap_enabled": false }), DEVICE_FIELDS);
         assert_eq!((&d["name"], &d["atf_enabled"], &d["green_ap_enabled"], &d["jumboframe_enabled"]), (&json!("false"), &json!(true), &json!(false), &Value::Null));
@@ -2830,16 +2831,29 @@ mod tests {
         // Every source file of the crate, so a read in a new file is checked too.
         let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/src");
         let sources: Vec<String> = std::fs::read_dir(dir).unwrap().map(|e| e.unwrap().path()).filter(|p| p.extension().is_some_and(|x| x == "rs")).map(|p| std::fs::read_to_string(p).unwrap()).collect();
+        // The code without its test modules (`#[cfg(test)]` then a `mod`, each running to the next
+        // `}` at the start of a line). A test-only item elsewhere (a helper in an `impl`) is kept:
+        // skipping it would skip the shipped code after it too, and a read there needs the key anyway.
+        let shipped = |src: &str| {
+            const TEST: &str = "#[cfg(test)]";
+            let (mut rest, mut code) = (src, String::new());
+            while let Some(at) = rest.find(TEST) {
+                let after = &rest[at + TEST.len()..];
+                if after.trim_start().trim_start_matches("pub(crate) ").starts_with("mod ") {
+                    code.push_str(&rest[..at]);
+                    rest = rest[at..].find("\n}\n").map_or("", |end| &rest[at + end..]);
+                } else {
+                    code.push_str(&rest[..at + TEST.len()]);
+                    rest = after;
+                }
+            }
+            code + rest
+        };
+        let sample = "impl A {\n    #[cfg(test)]\n    fn t() {}\n    fn f() { setting(s, \"a\") }\n}\n#[cfg(test)]\nmod tests {\n    fn g() { setting(s, \"b\") }\n}\n";
+        assert!(shipped(sample).contains("\"a\"") && !shipped(sample).contains("\"b\""), "{}", shipped(sample));
         let mut read: Vec<String> = Vec::new();
         for src in &sources {
-            // Test modules (each runs to the next `}` at the start of a line) are left out.
-            let mut rest: &str = src;
-            let mut code = String::new();
-            while let Some(at) = rest.find("#[cfg(test)]") {
-                code.push_str(&rest[..at]);
-                rest = rest[at..].find("\n}\n").map_or("", |end| &rest[at + end..]);
-            }
-            code.push_str(rest);
+            let code = shipped(src);
             for pattern in ["setting(", "setting_mut(", "setting_on("] {
                 for (at, _) in code.match_indices(pattern) {
                     let args = &code[at + pattern.len()..];

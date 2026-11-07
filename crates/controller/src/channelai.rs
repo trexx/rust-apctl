@@ -163,8 +163,10 @@ fn spectrum_age(inform: &Value, band: &str) -> Option<i64> {
 
 /// Asks every AP that can to scan a band; returns the APs asked. Scans go out
 /// with each AP's next inform (see `actions`). An AP already scanning (either
-/// band) is left to finish: an AP keeps one scan's bookkeeping.
+/// band) is left to finish: an AP keeps one scan's bookkeeping. Finished scans
+/// are cleared first, as nothing else clears them unless the status is polled.
 pub fn start_scans(live: &mut Live, band: &Band, now: Ts) -> Vec<Mac> {
+    check_scans(live, now);
     let eligible: Vec<Mac> = live
         .devices
         .iter()
@@ -791,6 +793,9 @@ mod tests {
         assert_eq!(live.scans[&ap].band, "ng");
         live.scans.clear();
         assert_eq!(start_scans(&mut live, Band::named("na").unwrap(), 3002), [ap]);
+        // A scan that has finished, though nothing polled the status since, holds the AP no longer.
+        assert_eq!(start_scans(&mut live, Band::named("na").unwrap(), 3002 + SCAN_TIMEOUT), [ap]);
+        assert_eq!(live.scans[&ap].started, 3002 + SCAN_TIMEOUT);
     }
 
     #[test]
