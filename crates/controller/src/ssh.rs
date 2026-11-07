@@ -429,23 +429,25 @@ async fn adopt_over_ssh(s: AppState, b: AdoptBody) -> Result<Json<Value>, ApiErr
     crate::api::require_active(&s, "adoption needs")?;
     let url = inform_url(&s).ok_or_else(|| ApiError::conflict("apctl doesn't know the URL APs should inform to: set --inform-url"))?;
     let ip = canonical_ip(&b.ip).ok_or_else(|| ApiError::bad("enter the AP's IP address"))?;
-    let state = s.live.read().unwrap().state.clone();
+    // The record goes into the settings: none imported yet, no SSH login at all.
+    let state = crate::api::current_state(&s)?;
     let given = given_login(b.username, b.password).map_err(ApiError::bad)?;
     let bad = |f: Failure| ApiError(StatusCode::BAD_GATEWAY, f.to_string());
     // A known AP keeps its host key, checked before any password is sent; a new one is trusted the first time.
     let expected = known_host_key(&s.live.read().unwrap(), &ip);
-    let connected = connect(command_config(), &ip, b.port.unwrap_or(22), &logins(state.as_deref(), given), expected.as_ref().map(|e| e.1.clone())).await;
+    let connected = connect(command_config(), &ip, b.port.unwrap_or(22), &logins(Some(&state), given), expected.as_ref().map(|e| e.1.clone())).await;
     let session = match (connected, &expected) {
         (Err(Failure::HostKey), Some((mac, _))) => return Err(bad(host_key_mismatch(&s, *mac, &ip).await)),
         (r, _) => r.map_err(bad)?,
     };
     let board = session.run("cat /etc/board.info").await.unwrap_or_default();
-    let eth0 = session.run("cat /sys/class/net/eth0/address").await.unwrap_or_default();
-    let mac = parse_mac(&eth0)
-        .or_else(|| board_value(&board, "board.hwaddr").and_then(parse_mac))
-        .ok_or_else(|| ApiError(StatusCode::BAD_GATEWAY, "could not read the AP's MAC address: is this a UniFi AP?".into()))?;
+    let eth0 = session.run("cat /sys/class/net/eth0/address").await;
+    let Some(mac) = eth0.as_deref().ok().and_then(parse_mac).or_else(|| board_value(&board, "board.hwaddr").and_then(parse_mac)) else {
+        // Why the read failed (refused, timed out, too long), else output no AP gives.
+        return Err(eth0.err().map_or_else(|| ApiError(StatusCode::BAD_GATEWAY, "could not read the AP's MAC address: is this a UniFi AP?".into()), bad));
+    };
     // An AP apctl knows by its MAC but not at this address: check its key too.
-    let known = state.as_deref().and_then(|st| expected_host_key(&s.live.read().unwrap(), st, &mac));
+    let known = expected_host_key(&s.live.read().unwrap(), &state, &mac);
     let verified = known.is_some();
     if let (Some(k), Some(seen)) = (known, &session.fingerprint)
         && k != *seen
@@ -621,8 +623,8 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn a_refused_command_fails_at_once() {
+    /// The port of a [`Refusing`] server on localhost.
+    async fn refusing() -> u16 {
         let key = russh::keys::PrivateKey::from(russh::keys::ssh_key::private::Ed25519Keypair::from_seed(&[7; 32]));
         let config = Arc::new(russh::server::Config { keys: vec![key], ..Default::default() });
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -638,12 +640,43 @@ mod tests {
                 });
             }
         });
+        port
+    }
+
+    #[tokio::test]
+    async fn a_refused_command_fails_at_once() {
+        let port = refusing().await;
         // Neither waits out the step's time, nor counts as done (as a channel closed after set-adopt does).
         for user in ["ubnt", "closes"] {
             let ssh = connect(command_config(), "127.0.0.1", port, &[(user.to_string(), "ubnt".to_string())], None).await.unwrap();
             let run = tokio::time::timeout(Duration::from_secs(2), ssh.run("cat /etc/board.info")).await.expect("at once");
             assert_eq!(run, Err(Failure::Command("the AP refused to run it".into())), "{user}");
         }
+    }
+
+    /// An adoption over SSH, as active mode with `--inform-url` and these settings
+    /// does it, of the AP on localhost at `port`.
+    async fn adopt_at(port: u16, state: Option<Value>) -> ApiError {
+        let (mut s, _engine, _dir) = crate::api::tests::state();
+        s.get_mut().active = true;
+        s.get_mut().inform_url = Some("http://192.0.2.1:8080/inform".into());
+        s.live.write().unwrap().state = state.map(Arc::new);
+        let b = AdoptBody { ip: "127.0.0.1".into(), port: Some(port), username: None, password: None };
+        tokio::time::timeout(Duration::from_secs(5), adopt_over_ssh(s, b)).await.expect("at once").err().expect("not adopted")
+    }
+
+    #[tokio::test]
+    async fn an_adoption_without_settings_is_refused_before_any_login() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let e = adopt_at(listener.local_addr().unwrap().port(), None).await;
+        assert_eq!((e.0, e.1.as_str()), (StatusCode::CONFLICT, "no settings imported yet"));
+        assert!(tokio::time::timeout(Duration::from_millis(200), listener.accept()).await.is_err(), "no connection to the AP");
+    }
+
+    #[tokio::test]
+    async fn an_adoption_says_why_the_aps_mac_could_not_be_read() {
+        let e = adopt_at(refusing().await, Some(json!({ "devices": [] }))).await;
+        assert_eq!((e.0, e.1.as_str()), (StatusCode::BAD_GATEWAY, "the command failed on the AP: the AP refused to run it"));
     }
 
     #[test]

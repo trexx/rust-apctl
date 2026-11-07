@@ -545,7 +545,8 @@ impl Engine {
     /// the first one after it says what it changed.
     pub fn restore(&mut self, store: &store::Store) -> anyhow::Result<()> {
         let (devices, clients, aliases, state, pushes) = store.read(Db::Config, |c| {
-            let mut stmt = c.prepare("SELECT mac, last_seen, uptime, version, hash_id, ip, hostname, model, model_display, offline FROM devices")?;
+            // Oldest first: of two stored with one IP (one gone, its address given to the other), the AP seen there last keeps it.
+            let mut stmt = c.prepare("SELECT mac, last_seen, uptime, version, hash_id, ip, hostname, model, model_display, offline FROM devices ORDER BY last_seen")?;
             let devices = stmt
                 .query_map([], |r| {
                     let known = KnownDevice {
@@ -1722,10 +1723,12 @@ impl Engine {
         let mac_text = Sql::Text(s.ap.mac.to_string());
         let mac = || mac_text.clone();
         let a = &s.ap;
+        // Its clients: unknown, not none, without a VAP table.
+        let num_sta = s.has_vap_table.then_some(s.clients.len() as i64);
         self.writer.send(Write::Metric {
             table: &store::AP,
             ts,
-            values: vec![mac(), a.cpu.into(), a.mem.into(), a.load1.into(), a.load5.into(), a.load15.into(), a.mem_used.into(), a.mem_total.into(), a.uptime.into(), a.satisfaction.into(), a.num_sta.into()],
+            values: vec![mac(), a.cpu.into(), a.mem.into(), a.load1.into(), a.load5.into(), a.load15.into(), a.mem_used.into(), a.mem_total.into(), a.uptime.into(), a.satisfaction.into(), num_sta.into()],
         });
         if let Some(u) = &s.uplink {
             self.writer.send(Write::Metric {
@@ -2372,6 +2375,22 @@ mod tests {
         assert_eq!(available(&h, 1), Some(json!(true)));
         let h = h.restarted();
         assert_eq!((available(&h, 0), available(&h, 1)), (None, Some(json!(false))), "AP1 is not known yet; AP2 is stored offline");
+    }
+
+    #[test]
+    fn a_stored_ip_two_aps_had_is_the_one_seen_there_last_after_a_restart() {
+        let feed = |h: &mut Harness, ap: &str, ts: Ts| {
+            let mut p = inform(ap, 1000 + ts, &[]);
+            p["ip"] = json!("192.0.2.9");
+            h.engine.handle(Input::Inform { ts, payload: p });
+        };
+        // AP1 is stored first, then AP2 has its address for a while, then AP1 again.
+        let mut h = harness();
+        feed(&mut h, AP1, 0);
+        feed(&mut h, AP2, 10);
+        feed(&mut h, AP1, 100);
+        let h = h.restarted();
+        assert_eq!(h.live.read().unwrap().by_ip.get("192.0.2.9"), Some(&AP1.parse().unwrap()));
     }
 
     #[test]

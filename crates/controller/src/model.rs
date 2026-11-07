@@ -103,8 +103,6 @@ pub struct ApSample {
     pub mem_total: Option<i64>,
     pub mem_used: Option<i64>,
     pub satisfaction: Option<i64>,
-    #[serde(skip_serializing)]
-    pub num_sta: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -614,7 +612,6 @@ pub fn parse_with_scans(ts: Ts, p: &Value) -> anyhow::Result<(Snapshot, Scans)> 
         mem_total,
         mem_used,
         satisfaction: int(&p["satisfaction"]),
-        num_sta: has_vap_table.then_some(clients.len() as i64),
     };
 
     Ok((Snapshot { ap, uplink, radios, vaps, clients, has_vap_table }, Scans { neighbors, spectrum }))
@@ -741,7 +738,6 @@ pub(crate) mod tests {
         assert_eq!(s.radios.len(), 2);
         let na = s.radios.iter().find(|r| r.radio == "na").unwrap();
         assert!(na.channel.is_some() && na.bw.is_some() && na.noise_floor.unwrap() < -50);
-        assert_eq!(s.ap.num_sta, Some(s.clients.len() as i64));
         assert!(!s.clients.is_empty());
         let c = &s.clients[0];
         assert!(c.signal.unwrap() < 0 && c.tx_rate.unwrap() > 0);
@@ -761,16 +757,14 @@ pub(crate) mod tests {
         // without a VAP table.
         let s = parse(1000, &fixture("000593_020000000002_inform")).unwrap();
         assert!(!s.has_vap_table);
-        assert!(s.clients.is_empty());
-        assert_eq!(s.ap.num_sta, None, "unknown, not zero");
+        assert!(s.clients.is_empty(), "unknown, not zero");
     }
 
     #[test]
     fn an_empty_vap_table_means_no_clients() {
         // Every network off (a schedule, or no SSID for this AP).
         let s = parse(1000, &serde_json::json!({ "mac": "02:00:00:00:00:01", "vap_table": [] })).unwrap();
-        assert!(s.has_vap_table);
-        assert_eq!(s.ap.num_sta, Some(0));
+        assert!(s.has_vap_table && s.clients.is_empty());
     }
 
     #[test]

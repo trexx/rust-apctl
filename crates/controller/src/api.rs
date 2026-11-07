@@ -1194,12 +1194,14 @@ async fn ws(State(s): State<AppState>, session: Option<axum::Extension<crate::au
     let rx = s.tx.subscribe();
     // The session require_login let the request in with, which the socket keeps checking.
     let (auth, session) = (s.auth.clone(), session.map(|s| s.0.hash));
-    upgrade.max_frame_size(LIVE_FRAME).max_message_size(LIVE_FRAME).on_upgrade(move |socket| live_socket(socket, rx, auth, session))
+    upgrade.read_buffer_size(LIVE_FRAME).max_frame_size(LIVE_FRAME).max_message_size(LIVE_FRAME).on_upgrade(move |socket| live_socket(socket, rx, auth, session))
 }
 
 /// The most a frame, and a message, from a page may hold on the live socket:
 /// it sends nothing but control frames (pongs and its close: 125 bytes at most).
-/// A bigger one closes the socket before it is read in.
+/// A bigger one closes the socket before it is read in. Its read buffer is
+/// this size too: tungstenite holds the buffer while the socket is open and
+/// zero-fills it on every read, once per message sent (128 KiB by default).
 const LIVE_FRAME: usize = 1 << 10;
 
 /// How often an open socket checks that its session is still there.

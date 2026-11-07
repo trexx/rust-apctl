@@ -15,13 +15,13 @@
 use std::time::Duration;
 
 use axum::extract::ws::{CloseFrame, Message, Utf8Bytes, WebSocket, WebSocketUpgrade, close_code};
-use axum::extract::{Query, State};
+use axum::extract::State;
 use axum::response::{IntoResponse, Response};
 use inform::Mac;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use crate::api::{ApiError, AppState, MacPath};
+use crate::api::{ApiError, AppState, MacPath, Query};
 use crate::auth::SessionId;
 use crate::clock;
 use crate::engine::{Event, EventKind};
@@ -33,6 +33,10 @@ static OPEN: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(4);
 /// piece of a paste (the page sends 16 KiB at most). A bigger one closes the
 /// socket before it is read in.
 const MAX_FRAME: usize = 64 << 10;
+/// The socket's read buffer: the largest piece the page sends (a bigger frame
+/// gets room of its own as it comes). tungstenite holds it while the socket is
+/// open and zero-fills it on every read (128 KiB by default).
+const READ_BUFFER: usize = 16 << 10;
 /// How many of the page's frames may wait for the AP to take them in: then
 /// the page's are read no further until it does (TCP holds the page back).
 const QUEUED: usize = 16;
@@ -63,8 +67,11 @@ pub struct Size {
 }
 
 /// A text frame from the page: its size, or `{"pause":true}` while it shows
-/// what it was sent so far (the AP's output then waits, held back by SSH's
-/// flow control, unless the page's frames wait for the AP) and `{"pause":false}` once it has.
+/// what it was sent so far and `{"pause":false}` once it has. While paused, the
+/// AP's output waits in the SSH session's buffer, and once that is full the
+/// session with it (what is typed too), unless the page's frames wait for the
+/// AP. SSH's flow control holds nothing back: russh tops up the AP's window as
+/// each packet arrives, before the packet is taken from it.
 #[derive(Deserialize)]
 struct Said {
     pause: Option<bool>,
@@ -84,22 +91,18 @@ impl Size {
 pub async fn open(
     State(s): State<AppState>,
     MacPath(mac): MacPath,
-    uri: axum::http::Uri,
+    Query(size): Query<Size>,
     session: Option<axum::Extension<SessionId>>,
     upgrade: WebSocketUpgrade,
 ) -> Response {
-    let size = match Query::<Size>::try_from_uri(&uri) {
-        Ok(Query(size)) => size,
-        Err(e) => return ApiError::from(e).into_response(),
-    };
     // Always there: the route is withheld in read-only mode, which has no sessions.
     let Some(axum::Extension(session)) = session else { return ApiError::forbidden("a terminal needs a login").into_response() };
     limited(upgrade).on_upgrade(move |socket| terminal(socket, s, mac, size, session))
 }
 
-/// The upgrade, with the page's frames held to [`MAX_FRAME`].
+/// The upgrade, with the page's frames held to [`MAX_FRAME`] and read into [`READ_BUFFER`].
 fn limited(upgrade: WebSocketUpgrade) -> WebSocketUpgrade {
-    upgrade.max_frame_size(MAX_FRAME).max_message_size(MAX_FRAME)
+    upgrade.read_buffer_size(READ_BUFFER).max_frame_size(MAX_FRAME).max_message_size(MAX_FRAME)
 }
 
 /// Where and how to log in to an AP for its terminal. No Debug: it holds passwords.

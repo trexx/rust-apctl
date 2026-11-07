@@ -389,7 +389,20 @@ fn snapshot(src: &Path, dst: &Path) -> Result<()> {
 /// configs and acknowledgements; login sessions never travel.
 fn copy_for_backup(name: &str, src: &Path, dst: &Path, cutoff: Option<Ts>) -> Result<()> {
     match (name, cutoff) {
-        ("config.db", Some(t)) => trimmed_config(src, dst, t),
+        ("config.db", Some(t)) => {
+            let take = |table: &str| match store::CONFIG_HISTORY.iter().find(|h| h.table == table) {
+                Some(h) => Take::Since(h.time),
+                None if table == "sessions" => Take::Nothing,
+                None => Take::All,
+            };
+            built(name, src, dst, t, take, |tx| {
+                // As retention does, on the copy: an alert still open travels, so a restore
+                // neither raises it again nor loses when it started.
+                tx.execute(store::FORGET_RESOLVED_ALERTS, [t])?;
+                tx.execute(store::FORGET_OLD_CLIENTS, [t])?;
+                Ok(())
+            })
+        }
         ("config.db", None) => {
             snapshot(src, dst)?;
             // The few session rows are overwritten in place.
@@ -397,23 +410,40 @@ fn copy_for_backup(name: &str, src: &Path, dst: &Path, cutoff: Option<Ts>) -> Re
             c.execute_batch("PRAGMA secure_delete=ON; DELETE FROM sessions;")?;
             Ok(())
         }
+        // Every metric table in every tier.
+        ("metrics.db", Some(t)) => {
+            let metrics: Vec<String> = store::TABLES.iter().flat_map(|t| store::TIERS.iter().map(move |tier| format!("{}{}", t.name, tier.suffix))).collect();
+            built(name, src, dst, t, |table| if metrics.iter().any(|m| m == table) { Take::Since("ts") } else { Take::All }, |_| Ok(()))
+        }
         (_, cutoff) => {
             snapshot(src, dst)?;
             match cutoff {
-                Some(t) => trim_history(dst, t),
-                None => Ok(()),
+                Some(t) if name == "logs.db" => trim_logs_db(dst, t),
+                _ => Ok(()),
             }
         }
     }
 }
 
-/// A consistent copy of the live config.db without the history older than
-/// `t` and without the sessions. It is built rather than copied whole and
-/// trimmed: a daily settings backup reads a year of events, but writes none.
-fn trimmed_config(src: &Path, dst: &Path, t: Ts) -> Result<()> {
+/// Which rows of a table [`built`] copies.
+enum Take {
+    All,
+    /// Those whose time, in this column, is the cutoff or later.
+    Since(&'static str),
+    /// None: the table is made empty.
+    Nothing,
+}
+
+/// A consistent copy of the live database `name` without the history older
+/// than `t`: `take` says which rows of each table, and `finish` then works on
+/// the copy. It is built rather than copied whole and trimmed: a daily backup
+/// reads a year of history, but writes only what it keeps, and the copy has no
+/// free pages. A database with a virtual table (logs.db's full-text index)
+/// cannot be built this way.
+fn built(name: &str, src: &Path, dst: &Path, t: Ts, take: impl Fn(&str) -> Take, finish: impl FnOnce(&rusqlite::Transaction) -> Result<()>) -> Result<()> {
     // As `scratch`, for the copy alone (unqualified, the journal mode would be
-    // every attached database's), and what the retention deletes below remove
-    // is not left in free pages.
+    // every attached database's), and what `finish` deletes is not left in
+    // free pages.
     let mut c = Connection::open(dst)?;
     c.execute_batch("PRAGMA main.journal_mode=OFF; PRAGMA main.synchronous=OFF; PRAGMA temp_store=MEMORY; PRAGMA busy_timeout=10000; PRAGMA secure_delete=ON;")?;
     // Read only, through a URI: `?` and `#` in the path are escaped.
@@ -426,38 +456,30 @@ fn trimmed_config(src: &Path, dst: &Path, t: Ts) -> Result<()> {
         .prepare("SELECT type, name, sql FROM live.sqlite_master WHERE sql IS NOT NULL AND name NOT LIKE 'sqlite%' ORDER BY type != 'table', type != 'index', rowid")?
         .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
         .collect::<rusqlite::Result<_>>()?;
-    for (kind, name, sql) in &objects {
+    for (kind, table, sql) in &objects {
         if sql.starts_with("CREATE VIRTUAL") {
-            bail!("config.db's {name} cannot be copied for a backup: a virtual table");
+            bail!("{name}'s {table} cannot be copied for a backup: a virtual table");
         }
         // Unqualified, as stored: made in the copy.
-        tx.execute_batch(sql).with_context(|| format!("copying config.db's {name}"))?;
-        if kind != "table" || name == "sessions" {
+        tx.execute_batch(sql).with_context(|| format!("copying {name}'s {table}"))?;
+        if kind != "table" {
             continue;
         }
-        let copy = format!("INSERT INTO main.\"{name}\" SELECT * FROM live.\"{name}\"");
-        match store::CONFIG_HISTORY.iter().find(|h| h.table == name) {
-            Some(h) => tx.execute(&format!("{copy} WHERE \"{}\" >= ?1", h.time), [t])?,
-            None => tx.execute(&copy, [])?,
+        let copy = format!("INSERT INTO main.\"{table}\" SELECT * FROM live.\"{table}\"");
+        match take(table) {
+            Take::All => tx.execute(&copy, [])?,
+            Take::Since(time) => tx.execute(&format!("{copy} WHERE \"{time}\" >= ?1"), [t])?,
+            Take::Nothing => 0,
         };
     }
-    // As retention does, on the copy: an alert still open travels, so a restore
-    // neither raises it again nor loses when it started.
-    tx.execute(store::FORGET_RESOLVED_ALERTS, [t])?;
-    tx.execute(store::FORGET_OLD_CLIENTS, [t])?;
+    finish(&tx)?;
     tx.commit()?;
     c.execute_batch("DETACH DATABASE live;")?;
     Ok(())
 }
 
-/// Drops the history older than `t` from a copy of metrics.db or logs.db.
-fn trim_history(p: &Path, t: Ts) -> Result<()> {
-    // Every metric table in every tier, or the logs (and their full-text index).
-    let tables: Vec<String> = match p.file_name().and_then(|n| n.to_str()) {
-        Some("metrics.db") => store::TABLES.iter().flat_map(|t| store::TIERS.iter().map(move |tier| format!("{}{}", t.name, tier.suffix))).collect(),
-        Some("logs.db") => vec!["logs".to_string()],
-        _ => return Ok(()),
-    };
+/// Drops the logs older than `t` from a copy of logs.db.
+fn trim_logs_db(p: &Path, t: Ts) -> Result<()> {
     // What is deleted is overwritten in place, so the file need not be
     // rewritten to be rid of it: only when it frees much of the file
     // (zeroed pages would otherwise bloat the restored database, and
@@ -465,14 +487,9 @@ fn trim_history(p: &Path, t: Ts) -> Result<()> {
     let mut c = scratch(p)?;
     c.execute_batch("PRAGMA secure_delete=ON;")?;
     let tx = c.transaction()?;
-    for table in tables {
-        // A database from an older version may lack the newest tables.
-        let exists: bool = tx.query_row("SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1", [&table], |r| r.get::<_, i64>(0))? > 0;
-        if exists && table == "logs" {
-            trim_logs(&tx, t)?;
-        } else if exists {
-            tx.execute(&format!("DELETE FROM \"{table}\" WHERE ts < ?1"), [t])?;
-        }
+    // A database from an older version may lack the table.
+    if tx.query_row("SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'logs'", [], |r| r.get::<_, i64>(0))? > 0 {
+        trim_logs(&tx, t)?;
     }
     tx.commit()?;
     let pages = |pragma: &str| c.query_row(&format!("PRAGMA {pragma}"), [], |r| r.get::<_, i64>(0));
@@ -926,8 +943,9 @@ fn clean_staging(b: &Backups) {
         if name == "pending" || name == "pending.failed" || keep.as_deref() == Some(name.as_str()) {
             continue;
         }
-        // One dated ahead of the clock (set ahead once, then put right) is old.
-        let old = e.metadata().and_then(|m| m.modified()).is_ok_and(|t| t.elapsed().map_or(true, |age| age > STAGING_TTL));
+        // Ahead of the clock by more than the TTL (left while it was set well ahead) is old too; a
+        // small step back of the clock must not delete an upload or unpack still being written.
+        let old = e.metadata().and_then(|m| m.modified()).is_ok_and(|t| t.elapsed().map_or_else(|ahead| ahead.duration() > STAGING_TTL, |age| age > STAGING_TTL));
         if old {
             let p = e.path();
             let _ = if p.is_dir() { fs::remove_dir_all(&p) } else { fs::remove_file(&p) };
@@ -1445,6 +1463,13 @@ mod tests {
         d
     }
 
+    /// A database's tables, indexes and the rest, as made.
+    fn schema(p: &Path) -> Vec<(String, String, Option<String>)> {
+        let c = Connection::open(p).unwrap();
+        let mut stmt = c.prepare("SELECT type, name, sql FROM sqlite_master WHERE name NOT LIKE 'sqlite_sequence' ORDER BY type, name").unwrap();
+        stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).unwrap().collect::<rusqlite::Result<_>>().unwrap()
+    }
+
     fn count(path: &Path, sql: &str) -> i64 {
         Connection::open(path).unwrap().query_row(sql, [], |r| r.get(0)).unwrap()
     }
@@ -1473,11 +1498,6 @@ mod tests {
         assert_eq!(count(&cfg, "SELECT COUNT(*) FROM sessions"), 0, "login sessions never travel");
         assert_eq!(ids(&cfg, "alerts"), "open,recent", "open alerts travel whatever their age");
         // Built table by table: the live schema, and nothing of the rows left out.
-        let schema = |p: &Path| -> Vec<(String, String, Option<String>)> {
-            let c = Connection::open(p).unwrap();
-            let mut stmt = c.prepare("SELECT type, name, sql FROM sqlite_master WHERE name NOT LIKE 'sqlite_sequence' ORDER BY type, name").unwrap();
-            stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).unwrap().collect::<rusqlite::Result<_>>().unwrap()
-        };
         assert_eq!(schema(&cfg), schema(&src.join("config.db")));
         assert!(!fs::read(&cfg).unwrap().windows(17).any(|w| w == b"aa:aa:aa:aa:aa:01"), "a forgotten client leaves no trace");
         assert_eq!(count(&out.join("metrics.db"), "SELECT COUNT(*) FROM ap_stats"), 1);
@@ -1491,14 +1511,16 @@ mod tests {
         let src = data("trim");
         let old = clock::now_ts() - 40 * 86400;
         let metrics = Connection::open(src.join("metrics.db")).unwrap();
-        metrics.execute_batch(&format!("INSERT INTO ap_stats (mac, ts, cpu) VALUES ('old-ap-gone-0001', {old}, 3.0);")).unwrap();
+        metrics.execute_batch(&format!("INSERT INTO ap_stats (mac, ts, cpu) VALUES ('old-ap-gone-0001', {old}, 3.0); INSERT INTO rollup_state VALUES ('kept', 7);")).unwrap();
         let b = Backups::new(src.to_path_buf(), None);
-        // A little dropped: overwritten where it was.
+        // Built from the rows kept, with the live schema: nothing of the others.
         let out = dir("trim-few");
         unpack(&b.dir().join(create(&b, &src, Kind::Manual, 7).unwrap().name), None, &out).unwrap();
         assert_eq!(count(&out.join("metrics.db"), "SELECT COUNT(*) FROM ap_stats"), 1);
         assert!(!fs::read(out.join("metrics.db")).unwrap().windows(16).any(|w| w == b"old-ap-gone-0001"));
-        // Most of the file dropped: rewritten without the pages it freed.
+        assert_eq!(schema(&out.join("metrics.db")), schema(&src.join("metrics.db")));
+        assert_eq!(count(&out.join("metrics.db"), "SELECT upto FROM rollup_state WHERE name = 'kept'"), 7, "the other tables whole");
+        // Most of the file dropped: no free pages either.
         metrics
             .execute_batch(&format!("WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 20000) INSERT INTO ap_stats (mac, ts, cpu) SELECT 'old-' || i, {old}, 1.0 FROM n;"))
             .unwrap();
@@ -2111,6 +2133,7 @@ mod tests {
         fs::write(b.staging().join("pending"), "r2").unwrap();
         fs::create_dir_all(b.staging().join("r3")).unwrap();
         fs::create_dir_all(b.staging().join("new")).unwrap();
+        fs::create_dir_all(b.staging().join("ahead")).unwrap();
         let now = std::time::SystemTime::now();
         let old = now - Duration::from_secs(2 * 3600);
         for n in ["r1", "r2", "upload-1-x.apb"] {
@@ -2118,10 +2141,12 @@ mod tests {
         }
         // Left behind while the clock was ahead, then put right.
         File::open(b.staging().join("r3")).unwrap().set_modified(now + Duration::from_secs(86400)).unwrap();
+        // Written just after the clock stepped back a little: still being written, so kept.
+        File::open(b.staging().join("ahead")).unwrap().set_modified(now + Duration::from_secs(1)).unwrap();
         clean_staging(&b);
         let mut left: Vec<String> = fs::read_dir(b.staging()).unwrap().flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect();
         left.sort();
-        assert_eq!(left, ["new", "pending", "r2"]);
+        assert_eq!(left, ["ahead", "new", "pending", "r2"]);
     }
 
     #[test]
