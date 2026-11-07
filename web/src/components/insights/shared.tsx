@@ -116,10 +116,10 @@ export interface DensityPin {
 
 const AXIS = [-90, -80, -70, -60, -50, -40, -30];
 
-const pos = (s: number) =>
-  `${((Math.min(-30, Math.max(-90, s)) + 90) / 60) * 100}%`;
+const pos = (s: number) => `${((s + 90) / 60) * 100}%`;
 
-/** Pins on a signal scale; pins in the same 3 dB step stack upwards. */
+/** Pins on a signal scale; pins in the same 3 dB step stack upwards, and those
+ *  beyond either end stack at that end. */
 export function DensityStrip({
   pins,
   reverse,
@@ -133,14 +133,15 @@ export function DensityStrip({
     <div className="density">
       <div className={reverse ? "density-scale reverse" : "density-scale"} />
       {pins.map((p) => {
-        const step = Math.round(p.signal / 3);
+        const s = Math.min(-30, Math.max(-90, p.signal));
+        const step = Math.round(s / 3);
         const level = stack.get(step) ?? 0;
         stack.set(step, level + 1);
         return (
           <div
             key={p.key}
             className={`density-mark ${p.tone ?? ""}`}
-            style={{ left: pos(p.signal), top: 8 - level * 14 }}
+            style={{ left: pos(s), top: 8 - level * 14 }}
             title={p.title}
           />
         );
