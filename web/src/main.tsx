@@ -1,4 +1,11 @@
-import { Component, StrictMode, Suspense, useEffect, useState } from "react";
+import {
+  Component,
+  StrictMode,
+  Suspense,
+  useEffect,
+  useRef,
+  useState,
+} from "react";
 import type { ReactNode } from "react";
 import { createRoot } from "react-dom/client";
 import {
@@ -13,6 +20,7 @@ import {
   Route,
   Routes,
   useLocation,
+  useNavigationType,
 } from "react-router";
 import {
   AuthError,
@@ -168,6 +176,22 @@ function Shell({ user, readOnly }: { user: string | null; readOnly: boolean }) {
   const qc = useQueryClient();
   const status = useStatus();
   const location = useLocation();
+  const navigation = useNavigationType();
+  const shown = useRef(location.pathname);
+  useEffect(() => {
+    // A link opens its page at the top, or at the element its #fragment names
+    // when that is already shown (the browser does neither for a link within
+    // the app; a page still loading opens at its top). Another ?tab= of the
+    // same page keeps its place, and back and forward leave the browser's own
+    // scroll restoration alone.
+    const moved = shown.current !== location.pathname;
+    shown.current = location.pathname;
+    if (navigation === "POP" || (!moved && !location.hash)) return;
+    const target =
+      location.hash && document.getElementById(location.hash.slice(1));
+    if (target) target.scrollIntoView();
+    else window.scrollTo(0, 0);
+  }, [location, navigation]);
   useEffect(() => {
     // A failure here shows again, and is handled, when the page is opened.
     const t = setTimeout(() => {

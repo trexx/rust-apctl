@@ -305,6 +305,10 @@ main {
   padding: 12px 14px;
   overflow-x: auto;
 }
+/* A panel a link scrolls to (#id) stops below the sticky header. */
+.panel[id] {
+  scroll-margin-top: 64px;
+}
 .panel.scroll {
   max-height: 420px;
   overflow-y: auto;
