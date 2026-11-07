@@ -16,6 +16,7 @@ use crate::engine::{ClientView, Live};
 use crate::model::Ts;
 use crate::series::{Delta, Loaded, Only, RangeQuery, Samples, Spec, ap_name, ap_name_of, bucket_for, client_name, cols_at, deltas, load, memo_read, own_bssid_map, window};
 use crate::store::{Db, TIERS};
+use crate::threats::NEAREST_WINDOW;
 
 /// The BSSIDs an AP's SSIDs have had in a tier of `vap_stats` (a BSSID stays
 /// on its AP, and its radio): one step through the table's own index per
@@ -988,10 +989,6 @@ struct OwnLink {
     radio: Option<String>,
     signal: Option<i64>,
 }
-
-/// How long before a network was last heard an AP's sighting of it still counts
-/// for naming the AP nearest to it ([`neighbors`]).
-const NEAREST_WINDOW: Ts = 3600;
 
 /// GET /api/rf/neighbors: networks heard by our APs, the AP hearing each best,
 /// strongest (the best signal any AP heard) first, and our own APs' signal to
