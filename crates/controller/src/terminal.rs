@@ -29,7 +29,9 @@ use crate::ssh::{self, Failure};
 
 /// How many terminals may be open at once, over all APs and users.
 static OPEN: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(4);
-/// The most a frame from the page may hold: keystrokes, or a paste.
+/// The most a frame, and a message, from the page may hold: keystrokes, or a
+/// piece of a paste (the page sends 16 KiB at most). A bigger one closes the
+/// socket before it is read in.
 const MAX_FRAME: usize = 64 << 10;
 /// How many of the page's frames may wait for the AP to take them in: then
 /// the page's are read no further until it does (TCP holds the page back).
@@ -62,7 +64,7 @@ pub struct Size {
 
 /// A text frame from the page: its size, or `{"pause":true}` while it shows
 /// what it was sent so far (the AP's output then waits, held back by SSH's
-/// flow control) and `{"pause":false}` once it has.
+/// flow control, unless the page's frames wait for the AP) and `{"pause":false}` once it has.
 #[derive(Deserialize)]
 struct Said {
     pause: Option<bool>,
@@ -92,7 +94,12 @@ pub async fn open(
     };
     // Always there: the route is withheld in read-only mode, which has no sessions.
     let Some(axum::Extension(session)) = session else { return ApiError::forbidden("a terminal needs a login").into_response() };
-    upgrade.max_message_size(MAX_FRAME).on_upgrade(move |socket| terminal(socket, s, mac, size, session))
+    limited(upgrade).on_upgrade(move |socket| terminal(socket, s, mac, size, session))
+}
+
+/// The upgrade, with the page's frames held to [`MAX_FRAME`].
+fn limited(upgrade: WebSocketUpgrade) -> WebSocketUpgrade {
+    upgrade.max_frame_size(MAX_FRAME).max_message_size(MAX_FRAME)
 }
 
 /// Where and how to log in to an AP for its terminal. No Debug: it holds passwords.
@@ -140,8 +147,11 @@ fn ssh_refused(mgmt: &Value) -> Option<&'static str> {
 enum End {
     /// The page closed it, or went away.
     Gone,
-    /// The shell exited, or the AP ended the session.
+    /// The shell exited (the AP closed its channel).
     Exited,
+    /// The SSH session to the AP ended under it: the AP went off the network,
+    /// restarted, or answered no keepalives.
+    Lost,
     LoggedOut,
     Idle,
 }
@@ -164,6 +174,7 @@ async fn finish(mut socket: WebSocket, end: Result<End, String>) {
     let last = match end {
         Ok(End::Gone) => return,
         Ok(End::Exited) => close(close_code::NORMAL, "the shell ended"),
+        Ok(End::Lost) => close(close_code::ERROR, "the connection to the AP was lost"),
         Ok(End::Idle) => close(close_code::NORMAL, "closed after 30 minutes without input"),
         Ok(End::LoggedOut) => crate::api::logged_out(),
         Err(e) => {
@@ -257,7 +268,7 @@ async fn bridge(socket: &mut WebSocket, s: &AppState, mac: Mac, t: Target, size:
             _ = &mut ended => break End::LoggedOut,
             _ = &mut idle => break End::Idle,
             // The session ended under the writer.
-            _ = &mut writer => break End::Exited,
+            _ = &mut writer => break End::Lost,
             _ = ping.tick() => {
                 // Only while the page's frames are read: its pong waits behind what it typed.
                 unanswered += u32::from(reading);
@@ -265,13 +276,16 @@ async fn bridge(socket: &mut WebSocket, s: &AppState, mac: Mac, t: Target, size:
                     break End::Gone;
                 }
             }
-            msg = output.wait(), if !paused => match msg {
+            // Paused only while the page's frames are read: with the queue full, its resume may be
+            // behind what it typed, which waits on the AP, whose session waits for this to take its output.
+            msg = output.wait(), if !paused || !reading => match msg {
                 Some(russh::ChannelMsg::Data { data } | russh::ChannelMsg::ExtendedData { data, .. }) => {
                     if !send(socket, Message::Binary(data)).await {
                         break End::Gone;
                     }
                 }
-                Some(russh::ChannelMsg::Close) | None => break End::Exited,
+                Some(russh::ChannelMsg::Close) => break End::Exited,
+                None => break End::Lost,
                 _ => {}
             },
             // Room again: the page's frames are read on.
@@ -333,7 +347,7 @@ mod tests {
     /// and the sizes it was given are kept. The user `nopty` gets no PTY, and
     /// `noshell` no shell, and `slow` takes 2 s to check a password. For
     /// `stuck` the shell prints a lot at the first input, and the AP takes in
-    /// nothing more from then on.
+    /// nothing more from then on; for `lost` the AP drops the connection at it.
     #[derive(Clone, Default)]
     struct Shell {
         sizes: Arc<std::sync::Mutex<Vec<(u32, u32)>>>,
@@ -380,6 +394,9 @@ mod tests {
 
         async fn data(&mut self, ch: russh::ChannelId, data: &[u8], session: &mut russh::server::Session) -> Result<(), Self::Error> {
             self.typed.fetch_add(data.len(), Ordering::Relaxed);
+            if self.user == "lost" {
+                return Err(russh::Error::Disconnect);
+            }
             if self.user == "stuck" {
                 // More than the client's channel holds (100 messages) while nothing drains it.
                 if !self.stalled.swap(true, Ordering::Relaxed) {
@@ -486,7 +503,7 @@ mod tests {
                 let t = Target { ip: "127.0.0.1".into(), port, expected, logins };
                 let session = s.auth.session_of(&q.token).unwrap();
                 let pace = Pace { idle: q.idle_ms.map_or(PACE.idle, Duration::from_millis), ping: q.ping_ms.map_or(PACE.ping, Duration::from_millis) };
-                upgrade.on_upgrade(move |mut socket| async move {
+                limited(upgrade).on_upgrade(move |mut socket| async move {
                     let end = bridge(&mut socket, &s, mac, t, &Size { cols: Some(100), rows: Some(30) }, &session, &pace).await;
                     let _ = done.send(end.clone());
                     finish(socket, end).await;
@@ -574,6 +591,13 @@ mod tests {
         from_page(&mut tcp, 2, b"exit\r").await;
         assert_eq!(closed(&mut tcp).await, (1000, "the shell ended".into()));
         assert_eq!(rig.ends.recv().await, Some(Ok(End::Exited)));
+        // The connection to the AP is lost: a failure, saying so.
+        let (mut tcp, _) = rig.open("lost", "").await;
+        assert_eq!(frame(&mut tcp).await.0, 1, "connected");
+        assert_eq!(rig.event().await, EventKind::ApTerminalOpened);
+        from_page(&mut tcp, 2, b"uptime").await;
+        assert_eq!(closed(&mut tcp).await, (1011, "the connection to the AP was lost".into()));
+        assert_eq!(rig.ends.recv().await, Some(Ok(End::Lost)));
 
         // A host key other than the one expected: no login, and an event.
         let (mut tcp, _) = rig.open("changed", "").await;
@@ -620,6 +644,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_paste_while_paused_cannot_keep_the_pause_for_ever() {
+        let mut rig = Rig::new().await;
+        let (tcp, _) = rig.open("ubnt", "").await;
+        // Its own handle for the page's frames, which may wait for the server to read them.
+        let tcp = tcp.into_std().unwrap();
+        let mut page = tokio::net::TcpStream::from_std(tcp.try_clone().unwrap()).unwrap();
+        let mut tcp = tokio::net::TcpStream::from_std(tcp).unwrap();
+        assert_eq!(crate::api::tests::frame(&mut tcp).await.0, 1, "connected");
+        assert_eq!(rig.event().await, EventKind::ApTerminalOpened);
+        // Paused (behind on a flood of output, say), then a paste whose echo is more than the
+        // session holds for the page: the resume comes behind it.
+        const PIECES: usize = 64;
+        let paste = vec![b'x'; 16 << 10];
+        tokio::spawn(async move {
+            from_page(&mut page, 1, br#"{"pause":true}"#).await;
+            for _ in 0..PIECES {
+                from_page(&mut page, 2, &paste).await;
+            }
+            from_page(&mut page, 1, br#"{"pause":false}"#).await;
+            page
+        });
+        let mut echoed = 0;
+        while echoed < PIECES * (16 << 10) {
+            match crate::api::tests::frame(&mut tcp).await {
+                (2, data) => echoed += data.len(),
+                (op, _) => panic!("frame {op}"),
+            }
+        }
+        assert_eq!(rig.shell.typed.load(Ordering::Relaxed), PIECES * (16 << 10), "the AP took in the whole paste");
+    }
+
+    #[tokio::test]
     async fn a_page_that_went_or_logged_out_while_its_terminal_logged_in_gets_no_shell() {
         let mut rig = Rig::new().await;
         // Closed while the AP checks the password: no shell, no event.
@@ -631,6 +687,20 @@ mod tests {
         rig.state.auth.revoke(&token);
         assert_eq!(tokio::time::timeout(Duration::from_secs(1), closed(&mut tcp)).await.unwrap(), (1008, "logged out".into()));
         assert!(rig.engine.try_recv().is_err(), "no terminal opened");
+    }
+
+    #[tokio::test]
+    async fn a_frame_bigger_than_the_page_sends_is_not_read_in() {
+        use tokio::io::AsyncWriteExt;
+        let mut rig = Rig::new().await;
+        let (mut tcp, _) = rig.open("ubnt", "").await;
+        assert_eq!(crate::api::tests::frame(&mut tcp).await.0, 1, "connected");
+        // Only the header of one (masked, as from a browser): its end comes without the rest.
+        let mut head = vec![0x82, 0x80 | 127];
+        head.extend_from_slice(&(MAX_FRAME as u64 + 1).to_be_bytes());
+        head.extend_from_slice(&[0; 4]);
+        tcp.write_all(&head).await.unwrap();
+        assert_eq!(tokio::time::timeout(Duration::from_secs(2), rig.ends.recv()).await.unwrap(), Some(Ok(End::Gone)));
     }
 
     #[tokio::test]

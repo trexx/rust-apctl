@@ -103,7 +103,7 @@ crate::model::named_enum! {
     }
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone)]
 pub struct Event {
     pub ts: Ts,
     pub kind: EventKind,
@@ -214,7 +214,7 @@ fn bump(counter: &AtomicU64) {
 }
 
 /// A name and note the user gave a client.
-#[derive(Debug, Clone, Default, Serialize)]
+#[derive(Debug, Clone, Default)]
 pub struct Alias {
     pub alias: Option<String>,
     pub note: Option<String>,
@@ -2003,14 +2003,10 @@ fn disconnect(writer: &Writer, ts: Ts, mac: Mac, c: &mut ClientView, reason: &st
 }
 
 /// A process-restart notification's `exit_status` as a number: the AP may send
-/// the code as text. One that is no number is left out, as one not sent.
+/// the code as text (read as [`apcfg::as_int`] reads it). One that is no
+/// number is left out, as one not sent.
 pub(crate) fn numeric_exit_status(n: &mut Value) {
-    let code = match &n["exit_status"] {
-        Value::Number(c) => c.as_i64(),
-        Value::String(c) => c.trim().parse::<i64>().ok(),
-        _ => None,
-    };
-    match code {
+    match apcfg::as_int(&n["exit_status"]) {
         Some(c) => n["exit_status"] = json!(c),
         None => {
             if let Some(o) = n.as_object_mut() {
@@ -2983,13 +2979,13 @@ mod tests {
         assert_eq!(summaries, [json!("[ 12.3] Kernel panic - not syncing: Fatal exception"), json!("no fault here"), Value::Null]);
         let keys: Vec<String> = stored(&h, EventKind::ApCrash)[0].as_object().unwrap().keys().cloned().collect();
         assert_eq!(keys, ["kind", "lines", "summary"]);
-        // A code sent as text is stored as a number; one that is no number is left out.
-        for (ts, code) in [(4, json!("139")), (5, json!(1)), (6, json!("n/a"))] {
+        // A code sent as text, or as 139.0, is stored as a number; one that is no number is left out.
+        for (ts, code) in [(4, json!("139")), (5, json!(1)), (6, json!("n/a")), (7, json!(139.0))] {
             let n = json!({ "event_string": "EVT_AP_RestartProc", "proc": "mcad", "exit_status": code, "caller": "init" });
             h.engine.handle(Input::Inform { ts, payload: notif(AP1, "event", n) });
         }
         let codes: Vec<Option<Value>> = stored(&h, EventKind::ApProcessRestarted).into_iter().map(|d| d.get("exit_status").cloned()).collect();
-        assert_eq!(codes, [Some(json!(139)), Some(json!(1)), None]);
+        assert_eq!(codes, [Some(json!(139)), Some(json!(1)), None, Some(json!(139))]);
     }
 
     #[test]

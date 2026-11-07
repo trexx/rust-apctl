@@ -242,8 +242,8 @@ impl Auth {
     }
 
     /// Ends a session; false when there was none. Anyone can send a cookie,
-    /// so only a session that was there wakes the live sockets and queues a
-    /// write.
+    /// so only a session that was there wakes the open sockets (the live one,
+    /// terminals) and queues a write.
     pub(crate) fn revoke(&self, token: &str) -> bool {
         let hash = token_hash(token);
         if self.sessions.lock().unwrap().remove(&hash).is_none() {
@@ -266,7 +266,7 @@ impl Auth {
             by_ip.retain(|_, (_, since)| now - *since < FAILURE_WINDOW);
             *pruned = now;
         }
-        let key = throttled(ip);
+        let key = sender(ip);
         if by_ip.len() >= MAX_THROTTLED && !by_ip.contains_key(&key) {
             // Full (a flood of addresses): make room by forgetting an address
             // with the fewest attempts, never one that is held off; with every
@@ -288,15 +288,16 @@ impl Auth {
     /// An attempt that does not count against the address: a successful
     /// login, or one never checked.
     fn refund(&self, ip: IpAddr) {
-        if let Some(e) = self.failures.lock().unwrap().by_ip.get_mut(&throttled(ip)) {
+        if let Some(e) = self.failures.lock().unwrap().by_ip.get_mut(&sender(ip)) {
             e.0 = e.0.saturating_sub(1);
         }
     }
 }
 
-/// What login attempts are counted by: the address, or for IPv6 its /64 (one
-/// host usually has a whole /64 to pick addresses from).
-fn throttled(ip: IpAddr) -> IpAddr {
+/// The key a sender is counted under (its login attempts; the APs pending
+/// adoption it sends for): its address, or for IPv6 its /64 (one host usually
+/// has a whole /64 to pick addresses from).
+pub(crate) fn sender(ip: IpAddr) -> IpAddr {
     match ip.to_canonical() {
         IpAddr::V6(a) => IpAddr::V6((u128::from(a) & !u128::from(u64::MAX)).into()),
         v4 => v4,
@@ -620,7 +621,7 @@ mod tests {
         assert_eq!(auth.check(&token), Some((SessionId { hash: token_hash(&token), user: "admin".into() }, false)), "new: not extended yet");
         assert!(!auth.sessions.lock().unwrap().contains_key(&token), "only the hash is stored");
         assert_eq!(auth.check("forged"), None);
-        // Only a session that was there is announced to the live sockets.
+        // Only a session that was there is announced to the open sockets.
         let logouts = auth.logouts();
         assert!(!auth.revoke("forged"));
         assert!(!logouts.has_changed().unwrap(), "a made-up cookie wakes nobody");
@@ -722,7 +723,7 @@ mod tests {
     }
 
     #[test]
-    fn live_sockets_are_only_for_pages_of_this_server() {
+    fn sockets_are_only_for_pages_of_this_server() {
         let t = TestStore::new("origin");
         let proxies = Arc::new(Proxies::parse(&["10.42.0.0/16".into()]).unwrap());
         let auth = Auth::new(Users::default(), &t.store, t.writer, proxies).unwrap();

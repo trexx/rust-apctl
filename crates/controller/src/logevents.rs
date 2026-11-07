@@ -49,10 +49,9 @@ const STEER_ANSWER: Ts = 30;
 /// long, and forgotten then.
 const ANOMALIES_AGAIN: Ts = 1800;
 
-#[derive(Default)]
 struct Steering {
     /// The device that made the request: only its candidate lines are the request's.
-    from: Option<Source>,
+    from: Source,
     ts: Ts,
     rssi: Option<i64>,
     targets: Vec<Value>,
@@ -296,7 +295,7 @@ impl LogEvents {
         if msg.contains("BTM:") {
             if let Some(c) = msg.split("BTM: STA ").nth(1).and_then(|r| r.split_whitespace().next()).and_then(mac) {
                 // A request: the client's signal (the candidates follow on lines of their own).
-                let s = Steering { from: Some(dev_key()), ts: line.ts, rssi: field(msg, "RSSI: ").and_then(|v| v.parse().ok()), targets: vec![] };
+                let s = Steering { from: dev_key(), ts: line.ts, rssi: field(msg, "RSSI: ").and_then(|v| v.parse().ok()), targets: vec![] };
                 if bounded(&mut self.steering, c, s) {
                     bounded(&mut self.steering_by_device, dev_key(), c);
                 }
@@ -304,7 +303,7 @@ impl LogEvents {
                 && let dev = dev_key()
                 && let Some(client) = self.steering_by_device.get(&dev)
                 && let Some(s) = self.steering.get_mut(client)
-                && s.from.as_ref() == Some(&dev)
+                && s.from == dev
                 && s.targets.len() < MAX_TARGETS
             {
                 // A candidate: "[0]{bssid chNN/opNN/phyNN}".
@@ -317,14 +316,14 @@ impl LogEvents {
                 let client = r.split(']').next().and_then(mac);
                 let status = field(msg, "status ").and_then(|v| v.parse::<i64>().ok());
                 if let (Some(c), Some(st)) = (client, status) {
-                    let req = self.steering.remove(&c).filter(|s| (0..=STEER_ANSWER).contains(&(line.ts - s.ts))).unwrap_or_default();
+                    let (signal, candidates) = self.steering.remove(&c).filter(|s| (0..=STEER_ANSWER).contains(&(line.ts - s.ts))).map_or((None, Vec::new()), |s| (s.rssi, s.targets));
                     if self.fresh(EventKind::ClientSteered, c, st, line.ts, 600) {
                         out.push(Event {
                             ts: line.ts,
                             kind: EventKind::ClientSteered,
                             device_mac: line.device_mac,
                             client_mac: Some(c),
-                            data: json!({ "result": btm_status(st), "signal": req.rssi, "candidates": req.targets }),
+                            data: json!({ "result": btm_status(st), "signal": signal, "candidates": candidates }),
                         });
                     }
                 }

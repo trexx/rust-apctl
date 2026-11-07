@@ -926,7 +926,8 @@ fn clean_staging(b: &Backups) {
         if name == "pending" || name == "pending.failed" || keep.as_deref() == Some(name.as_str()) {
             continue;
         }
-        let old = e.metadata().and_then(|m| m.modified()).ok().and_then(|t| t.elapsed().ok()).is_some_and(|age| age > STAGING_TTL);
+        // One dated ahead of the clock (set ahead once, then put right) is old.
+        let old = e.metadata().and_then(|m| m.modified()).is_ok_and(|t| t.elapsed().map_or(true, |age| age > STAGING_TTL));
         if old {
             let p = e.path();
             let _ = if p.is_dir() { fs::remove_dir_all(&p) } else { fs::remove_file(&p) };
@@ -1060,9 +1061,16 @@ fn remove(b: &Backups, name: &str) -> Result<()> {
 /// How many pre-restore backups are kept.
 const KEEP_PRE_RESTORE: usize = 3;
 
-/// Keeps the newest `keep` backups of a kind.
+/// Keeps the newest `keep` backups of a kind. Those dated ahead of the clock
+/// (one set ahead once, then put right) count as the oldest, as for
+/// [`Backups::last_auto`]: else, with `keep` of them, each backup made would
+/// be the one deleted.
 fn prune(b: &Backups, kind: Kind, keep: usize) {
-    for m in list(b).iter().filter(|m| m.kind == kind).skip(keep) {
+    let now = clock::now_ts();
+    let mut of_kind: Vec<Meta> = list(b).into_iter().filter(|m| m.kind == kind).collect();
+    // (Stable: newest first otherwise, as listed.)
+    of_kind.sort_by_key(|m| m.created > now);
+    for m in of_kind.iter().skip(keep) {
         if let Err(e) = remove(b, &m.name) {
             tracing::warn!("an old backup could not be deleted: {e:#}");
         }
@@ -1663,6 +1671,27 @@ mod tests {
     }
 
     #[test]
+    fn backups_dated_ahead_of_the_clock_are_pruned_first() {
+        let src = data("ahead");
+        let b = Backups::new(src.to_path_buf(), None);
+        // Made while the clock was a day ahead, then put right.
+        let ahead: Vec<Meta> = (0..2)
+            .map(|_| {
+                let mut m = create(&b, &src, Kind::Auto, 0).unwrap();
+                m.created = clock::now_ts() + 86400;
+                fs::write(b.dir().join(format!("{}.json", m.name)), serde_json::to_vec(&m).unwrap()).unwrap();
+                m
+            })
+            .collect();
+        let made = create(&b, &src, Kind::Auto, 0).unwrap();
+        prune(&b, Kind::Auto, 2);
+        let names: Vec<String> = list(&b).into_iter().map(|m| m.name).collect();
+        assert_eq!(names.len(), 2);
+        assert!(names.contains(&made.name), "the one just made is kept: {names:?}");
+        assert!(ahead.iter().any(|m| names.contains(&m.name)), "{names:?}");
+    }
+
+    #[test]
     fn a_description_counts_only_beside_its_own_backup() {
         let src = data("stray-meta");
         let b = Backups::new(src.to_path_buf(), None);
@@ -2080,13 +2109,19 @@ mod tests {
         fs::create_dir_all(b.staging().join("r2")).unwrap();
         fs::write(b.staging().join("upload-1-x.apb"), "x").unwrap();
         fs::write(b.staging().join("pending"), "r2").unwrap();
-        let old = std::time::SystemTime::now() - Duration::from_secs(2 * 3600);
+        fs::create_dir_all(b.staging().join("r3")).unwrap();
+        fs::create_dir_all(b.staging().join("new")).unwrap();
+        let now = std::time::SystemTime::now();
+        let old = now - Duration::from_secs(2 * 3600);
         for n in ["r1", "r2", "upload-1-x.apb"] {
             File::open(b.staging().join(n)).unwrap().set_modified(old).unwrap();
         }
+        // Left behind while the clock was ahead, then put right.
+        File::open(b.staging().join("r3")).unwrap().set_modified(now + Duration::from_secs(86400)).unwrap();
         clean_staging(&b);
-        let left: Vec<String> = fs::read_dir(b.staging()).unwrap().flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect();
-        assert!(left.contains(&"r2".to_string()) && left.contains(&"pending".to_string()) && left.len() == 2, "{left:?}");
+        let mut left: Vec<String> = fs::read_dir(b.staging()).unwrap().flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect();
+        left.sort();
+        assert_eq!(left, ["new", "pending", "r2"]);
     }
 
     #[test]

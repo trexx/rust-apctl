@@ -15,7 +15,7 @@
 //!   `{"_type":"setdefault"}` with its next inform and resets itself.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::net::{IpAddr, Ipv6Addr};
+use std::net::IpAddr;
 use std::sync::{Arc, RwLock};
 
 use axum::extract::State;
@@ -52,7 +52,7 @@ pub struct Pending {
     pub known: bool,
     pub first_seen: Ts,
     pub last_seen: Ts,
-    /// Where its informs come from (see `source_of`).
+    /// Where its informs come from (see `auth::sender`).
     pub source: IpAddr,
     /// Its last inform (as `pending_inform` keeps it), to build its record
     /// from and to show it by.
@@ -210,21 +210,12 @@ pub fn pending_inform(payload: &Value) -> Value {
     out
 }
 
-/// The address pending APs are counted by: an IPv6 sender may use any
-/// address of its /64.
-fn source_of(ip: IpAddr) -> IpAddr {
-    match ip.to_canonical() {
-        IpAddr::V6(v6) => IpAddr::V6(Ipv6Addr::from(u128::from(v6) & (!0u128 << 64))),
-        v4 => v4,
-    }
-}
-
 /// Records an inform from an AP waiting for adoption (see `pending_inform`),
 /// sent from `source`; true the first time. A new AP makes room, if needed,
 /// by dropping the one heard from longest ago: of its source's, else of all.
 pub fn note_pending(live: &mut Live, payload: Value, known: bool, now: Ts, source: IpAddr) -> bool {
     let Some(mac) = payload["mac"].as_str().and_then(|m| m.parse::<Mac>().ok()) else { return false };
-    let source = source_of(source);
+    let source = crate::auth::sender(source);
     let pending = &mut live.adoption.pending;
     let new = !pending.contains_key(&mac);
     if new {
@@ -867,7 +858,7 @@ mod tests {
             p["mac"] = json!(format!("02:00:00:00:{:02x}:{:02x}", n / 256, n % 256));
             pending_inform(&p)
         };
-        let v6 = |last: u16| IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, last));
+        let v6 = |last: u16| IpAddr::V6(std::net::Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, last));
         // Each address of a /64 counts as the same sender: it keeps its latest few.
         for n in 0..10 {
             assert!(note_pending(&mut live, ap(n), false, n as Ts, v6(n as u16)));

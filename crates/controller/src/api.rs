@@ -1079,9 +1079,11 @@ async fn events(State(s): State<AppState>, Query(q): Query<EventQuery>) -> Resul
         } else if kinds.is_empty() {
             format!("SELECT {COLUMNS} FROM events WHERE {} ORDER BY ts DESC, id DESC LIMIT {limit}", w.sql())
         } else {
-            // The newest of each matching kind from the (kind, ts) index, then
-            // the newest of those: a rare kind is found without walking every
-            // event, and a common one reads no more than the limit.
+            // The newest of each matching kind from the (kind, ts) index, or for
+            // a device its (device_mac, kind, ts) one, then the newest of those:
+            // each reads no more than the limit, and a kind not there reads
+            // nothing. (For a client, the kind's events are walked until enough
+            // are the client's: the pages never ask for that.)
             let filters = w.sql();
             let parts: Vec<String> = kinds
                 .into_iter()
@@ -1192,8 +1194,13 @@ async fn ws(State(s): State<AppState>, session: Option<axum::Extension<crate::au
     let rx = s.tx.subscribe();
     // The session require_login let the request in with, which the socket keeps checking.
     let (auth, session) = (s.auth.clone(), session.map(|s| s.0.hash));
-    upgrade.on_upgrade(move |socket| live_socket(socket, rx, auth, session))
+    upgrade.max_frame_size(LIVE_FRAME).max_message_size(LIVE_FRAME).on_upgrade(move |socket| live_socket(socket, rx, auth, session))
 }
+
+/// The most a frame, and a message, from a page may hold on the live socket:
+/// it sends nothing but control frames (pongs and its close: 125 bytes at most).
+/// A bigger one closes the socket before it is read in.
+const LIVE_FRAME: usize = 1 << 10;
 
 /// How often an open socket checks that its session is still there.
 const SESSION_RECHECK: std::time::Duration = std::time::Duration::from_secs(30);
@@ -1894,6 +1901,18 @@ pub(crate) mod tests {
         let mut frame = [0u8; 2];
         tokio::time::timeout(std::time::Duration::from_secs(5), tcp.read_exact(&mut frame)).await.expect("closed at the logout").unwrap();
         assert_eq!(frame[0], 0x88, "a close frame");
+    }
+
+    #[tokio::test]
+    async fn the_live_socket_reads_in_no_big_frame() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let (state, _engine, cookie, _dir) = logged_in();
+        let (status, mut tcp) = handshake(serve(router(state)).await, "/api/ws", &cookie, None).await;
+        assert_eq!(status, "101");
+        // Only the header of a 2 KiB frame (masked, as from a browser): closed without the rest.
+        tcp.write_all(&[0x82, 0x80 | 126, 0x08, 0x00, 0, 0, 0, 0]).await.unwrap();
+        let mut rest = Vec::new();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), tcp.read_to_end(&mut rest)).await.expect("closed");
     }
 
     #[tokio::test]
