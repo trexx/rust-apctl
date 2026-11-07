@@ -1079,9 +1079,11 @@ async fn events(State(s): State<AppState>, Query(q): Query<EventQuery>) -> Resul
         } else if kinds.is_empty() {
             format!("SELECT {COLUMNS} FROM events WHERE {} ORDER BY ts DESC, id DESC LIMIT {limit}", w.sql())
         } else {
-            // The newest of each matching kind from the (kind, ts) index, then
-            // the newest of those: a rare kind is found without walking every
-            // event, and a common one reads no more than the limit.
+            // The newest of each matching kind from the (kind, ts) index, or for
+            // a device its (device_mac, kind, ts) one, then the newest of those:
+            // each reads no more than the limit, and a kind not there reads
+            // nothing. (For a client, the kind's events are walked until enough
+            // are the client's: the pages never ask for that.)
             let filters = w.sql();
             let parts: Vec<String> = kinds
                 .into_iter()

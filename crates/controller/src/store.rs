@@ -259,6 +259,8 @@ CREATE INDEX IF NOT EXISTS events_ts ON events (ts);
 CREATE INDEX IF NOT EXISTS events_device ON events (device_mac, ts);
 CREATE INDEX IF NOT EXISTS events_client ON events (client_mac, ts);
 CREATE INDEX IF NOT EXISTS events_kind ON events (kind, ts);
+-- An AP's events of some kinds (the Config and Events pages, with an AP chosen).
+CREATE INDEX IF NOT EXISTS events_device_kind ON events (device_mac, kind, ts);
 CREATE TABLE IF NOT EXISTS neighbors (
     bssid TEXT NOT NULL, ap_mac TEXT NOT NULL, radio TEXT, essid TEXT, channel INTEGER, bw INTEGER, center_freq INTEGER,
     security TEXT, signal INTEGER, best_signal INTEGER, noise INTEGER, is_unifi INTEGER NOT NULL DEFAULT 0, ap_name TEXT,
