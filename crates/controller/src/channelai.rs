@@ -286,10 +286,11 @@ pub struct Change {
 /// Scans, plans and (when worth it) applies, band by band, holding the run
 /// flag (`_running`) until done.
 async fn run(s: AppState, bands: Vec<String>, trigger: &'static str, _running: RunGuard) {
+    // A scan asked for before the run (by hand) keeps its APs busy: wait for it,
+    // then every band scans. None starts meanwhile (`scan` is refused while this runs),
+    // and each band's own wait below lasts until its scans are done.
+    wait_for_scans(&s).await;
     for (band, b) in bands.iter().filter_map(|n| Some((n, Band::named(n)?))) {
-        // A scan asked for before the run (by hand) keeps its APs busy: once it is
-        // done, they scan this band too, and the plan reads this band's results.
-        wait_for_scans(&s).await;
         let scanned = start_scans(&mut s.live.write().unwrap(), b, clock::now_ts());
         tracing::info!("channel AI ({trigger}): {} APs scanning {band}", scanned.len());
         wait_for_scans(&s).await;
