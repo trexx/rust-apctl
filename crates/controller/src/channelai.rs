@@ -113,13 +113,13 @@ fn excluded(r: &Value) -> Vec<Mac> {
 
 /// The channels a plan may use on a band: the setting's list (kept by the
 /// official controller as the country's channels minus the blacklist, and
-/// minus DFS unless allowed), within what is legal here. On 5 GHz, `dfs`
-/// says whether the DFS channels are in: with it, the legal DFS channels the
-/// list lacks are added; without it, the list's are left out (a list made
-/// with DFS allowed holds them). The nightly run and the panel pass the
-/// setting's own DFS switch, so they get the list the setting means. `None`
-/// without a setting. In a country apctl has no rules for, the list is taken
-/// as it is.
+/// minus DFS unless allowed), within what is legal here, never a blacklisted
+/// one. On 5 GHz, `dfs` says whether the DFS channels are in: with it, the
+/// legal DFS channels the list lacks are added; without it, the list's are
+/// left out (a list made with DFS allowed holds them). The nightly run and
+/// the panel pass the setting's own DFS switch, so they get the list the
+/// setting means. `None` without a setting. In a country apctl has no rules
+/// for, the list is taken as it is (less the blacklist).
 pub fn allowed(state: Option<&Value>, band: &str, dfs: bool) -> Option<Vec<i64>> {
     let state = state?;
     let r = radio_ai(state)?;
@@ -134,6 +134,8 @@ pub fn allowed(state: Option<&Value>, band: &str, dfs: bool) -> Option<Vec<i64>>
             list.retain(|c| !apcfg::is_dfs_channel(*c));
         }
     }
+    let blocked = apcfg::blacklisted_channels(r, band);
+    list.retain(|c| !blocked.contains(&c.to_string()));
     list.sort();
     Some(list)
 }
@@ -286,10 +288,11 @@ pub struct Change {
 /// Scans, plans and (when worth it) applies, band by band, holding the run
 /// flag (`_running`) until done.
 async fn run(s: AppState, bands: Vec<String>, trigger: &'static str, _running: RunGuard) {
+    // A scan asked for before the run (by hand) keeps its APs busy: wait for it,
+    // then every band scans. None starts meanwhile (`scan` is refused while this runs),
+    // and each band's own wait below lasts until its scans are done.
+    wait_for_scans(&s).await;
     for (band, b) in bands.iter().filter_map(|n| Some((n, Band::named(n)?))) {
-        // A scan asked for before the run (by hand) keeps its APs busy: once it is
-        // done, they scan this band too, and the plan reads this band's results.
-        wait_for_scans(&s).await;
         let scanned = start_scans(&mut s.live.write().unwrap(), b, clock::now_ts());
         tracing::info!("channel AI ({trigger}): {} APs scanning {band}", scanned.len());
         wait_for_scans(&s).await;
@@ -570,14 +573,13 @@ pub fn apply_settings(state: &mut Value, p: &Value) -> Result<String, String> {
         }
         r["exclude_devices"] = json!(macs);
     }
-    // The allowed channels follow the country, blacklist and DFS choice.
-    let blacklist = r["channels_blacklist"].as_array().cloned().unwrap_or_default();
-    // An entry blacklists its channel on its band whatever width it names, as the
-    // official recomputation and the AP's own channel selection (`blklst`) read it.
-    let blacklisted = |band: &str, ch: i64| blacklist.iter().any(|b| b["radio"].as_str() == Some(band) && num(&b["channel"]) == Some(ch));
+    // The allowed channels follow the country, blacklist and DFS choice. The
+    // blacklist is read as the official recomputation and the AP's own channel
+    // selection (`blklst`) read it.
     let dfs = apcfg::radio_ai_na_dfs(r);
     for band in BANDS.iter().map(|b| b.radio) {
-        let chans: Vec<String> = allowed_channels(c, band, 20, false).into_iter().filter(|ch| !blacklisted(band, *ch) && (dfs || !apcfg::is_dfs_channel(*ch))).map(|ch| ch.to_string()).collect();
+        let blocked = apcfg::blacklisted_channels(r, band);
+        let chans: Vec<String> = allowed_channels(c, band, 20, false).into_iter().filter(|ch| dfs || !apcfg::is_dfs_channel(*ch)).map(|ch| ch.to_string()).filter(|ch| !blocked.contains(ch)).collect();
         r[format!("channels_{band}")] = json!(chans);
     }
     let changed: Vec<&str> = ["enabled", "cron_expr", "radios", "radios_configuration", "exclude_devices", "channels_ng", "channels_na"].into_iter().filter(|k| before[*k] != r[*k]).collect();
@@ -630,6 +632,17 @@ mod tests {
         assert!(!without.is_empty() && !without.iter().any(|c| apcfg::is_dfs_channel(*c)), "{without:?}");
         assert_eq!(allowed(Some(&s), "na", true), allowed(Some(&s), "na", settings(Some(&s)).dfs), "the run and the panel take the setting's list");
         assert!(allowed(Some(&s), "na", true).unwrap().contains(&100));
+        // A blacklisted DFS channel is never added back, and a plan onto it is refused.
+        s["setting"][2]["channels_blacklist"].as_array_mut().unwrap().push(json!({ "radio": "na", "channel": "100", "channel_width": "20" }));
+        apply_settings(&mut s, &json!({ "hour": 4 })).unwrap();
+        assert!(!radio_ai(&s).unwrap()["channels_na"].as_array().unwrap().iter().any(|c| c == "100"));
+        for dfs in [true, false] {
+            assert!(!allowed(Some(&s), "na", dfs).unwrap().contains(&100), "dfs {dfs}");
+        }
+        assert!(allowed(Some(&s), "na", true).unwrap().contains(&104));
+        let ap: Mac = "02:00:00:00:00:01".parse().unwrap();
+        assert_eq!(set_channels(&mut s, "na", &[(ap, 100)], &HashSet::new()).unwrap_err(), "channel 100 is not one of the channels Channel AI may use");
+        set_channels(&mut s, "na", &[(ap, 104)], &HashSet::new()).unwrap();
     }
 
     #[test]
@@ -648,6 +661,12 @@ mod tests {
         let list = |t: &Value, band: &str| radio_ai(t).unwrap()[format!("channels_{band}")].as_array().unwrap().iter().filter_map(|c| c.as_str().map(str::to_string)).collect::<Vec<_>>();
         assert!(!list(&t, "ng").iter().any(|c| c == "2" || c == "3") && list(&t, "ng").len() == 11, "{:?}", list(&t, "ng"));
         assert!(!list(&t, "na").contains(&"44".to_string()) && list(&t, "na").contains(&"48".to_string()), "{:?}", list(&t, "na"));
+        // As the official and the AP's `blklst` read an entry: its channel as text, so `44.0` or "048" is not 44 or 48.
+        t["setting"][2]["channels_blacklist"] = json!([{ "radio": "na", "channel": 44.0 }, { "radio": "na", "channel": "048" }, { "radio": "na", "channel": 52 }]);
+        apply_settings(&mut t, &json!({ "hour": 4 })).unwrap();
+        assert!(list(&t, "na").contains(&"44".to_string()) && list(&t, "na").contains(&"48".to_string()), "{:?}", list(&t, "na"));
+        assert!(!allowed(Some(&t), "na", true).unwrap().contains(&52));
+        assert_eq!(apcfg::blacklisted_channels(radio_ai(&t).unwrap(), "na"), ["44.0", "048", "52"]);
         assert!(apply_settings(&mut s, &json!({ "hour": 24 })).is_err());
         // Each band once; anything but a band's name is refused.
         apply_settings(&mut s, &json!({ "radios": ["na", "na"] })).unwrap();

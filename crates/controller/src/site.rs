@@ -389,8 +389,9 @@ fn site_view(state: &Value, secrets: bool) -> Value {
     let custom = servers != NTP_POOL && servers.iter().any(|h| !h.trim().is_empty());
     ntp["setting_preference"] = if custom && n["setting_preference"].as_str() != Some("manual") { json!("manual") } else { n["setting_preference"].clone() };
     let sn = setting(state, "snmp");
+    let community = if secrets { json!(sn["community"].as_str().unwrap_or("public")) } else { Value::Null };
     let snmp = json!({
-        "enabled": sn["enabled"], "enabledV3": sn["enabledV3"], "community": if secrets { sn["community"].clone() } else { Value::Null }, "username": sn["username"],
+        "enabled": flag(sn, "enabled", false), "enabledV3": flag(sn, "enabledV3", false), "community": community, "username": sn["username"],
         "has_v3_password": sn["x_password"].as_str().is_some_and(|p| !p.is_empty()),
     });
     json!({
@@ -578,6 +579,17 @@ mod tests {
         }
         setting_mut(&mut s, "rsyslogd")["debug"] = json!("true");
         assert_eq!(view(&s), [json!(false), json!(false), json!(false), json!(true), json!(true), json!(true), json!(false), json!("admin")]);
+        // SNMP likewise, and the community the APs are given when none is stored.
+        let snmp = |s: &Value| {
+            let v = site_view(s, true);
+            [&v["snmp"]["enabled"], &v["snmp"]["enabledV3"], &v["snmp"]["community"]].map(Value::clone)
+        };
+        assert_eq!(snmp(&s), [json!(false), json!(false), json!("public")]);
+        for (k, v) in [("enabled", "false"), ("enabledV3", "true"), ("community", "c0mmunity")] {
+            setting_mut(&mut s, "snmp")[k] = json!(v);
+        }
+        assert_eq!(snmp(&s), [json!(false), json!(true), json!("c0mmunity")]);
+        assert!(site_view(&s, false)["snmp"]["community"].is_null(), "withheld without secrets");
     }
 
     #[test]
