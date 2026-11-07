@@ -63,8 +63,11 @@ pub struct Size {
 }
 
 /// A text frame from the page: its size, or `{"pause":true}` while it shows
-/// what it was sent so far (the AP's output then waits, held back by SSH's
-/// flow control, unless the page's frames wait for the AP) and `{"pause":false}` once it has.
+/// what it was sent so far and `{"pause":false}` once it has. While paused, the
+/// AP's output waits in the SSH session's buffer, and once that is full the
+/// session with it (what is typed too), unless the page's frames wait for the
+/// AP. SSH's flow control holds nothing back: russh tops up the AP's window as
+/// each packet arrives, before the packet is taken from it.
 #[derive(Deserialize)]
 struct Said {
     pause: Option<bool>,
