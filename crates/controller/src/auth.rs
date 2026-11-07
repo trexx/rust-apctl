@@ -304,7 +304,8 @@ pub(crate) fn sender(ip: IpAddr) -> IpAddr {
     }
 }
 
-/// Reverse proxies whose X-Forwarded-For header is believed (`--trusted-proxies`).
+/// Reverse proxies whose X-Forwarded-For, -Host and -Proto headers are believed
+/// (`--trusted-proxies`; see `client_ip`, `Auth::same_origin`, `cookie`).
 #[derive(Debug, Default)]
 pub struct Proxies(Vec<(IpAddr, u8)>);
 
