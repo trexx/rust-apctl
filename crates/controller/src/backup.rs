@@ -472,11 +472,16 @@ fn built(name: &str, src: &Path, dst: &Path, t: Ts, take: impl Fn(&str) -> Take,
     }
     for (_, table, _) in made.iter().filter(|(kind, ..)| kind == "table") {
         // Whole, SQLite copies the table and its indexes page by page (its
-        // transfer optimisation).
+        // transfer optimisation); with a WHERE, row by row.
         let copy = format!("INSERT INTO main.\"{table}\" SELECT * FROM live.\"{table}\"");
         match take(table) {
             Take::All => tx.execute(&copy, [])?,
-            Take::Since(time) => tx.execute(&format!("{copy} WHERE \"{time}\" >= ?1"), [t])?,
+            // The same rows whole when none is older: one probe, through the time column's index (spectrum, a
+            // few rows a radio, has none).
+            Take::Since(time) => match tx.query_row(&format!("SELECT EXISTS (SELECT 1 FROM live.\"{table}\" WHERE \"{time}\" < ?1)"), [t], |r| r.get(0))? {
+                true => tx.execute(&format!("{copy} WHERE \"{time}\" >= ?1"), [t])?,
+                false => tx.execute(&copy, [])?,
+            },
             Take::Nothing => 0,
         };
     }
@@ -1542,6 +1547,27 @@ mod tests {
         unpack(&b.dir().join(create(&b, &src, Kind::Manual, 7).unwrap().name), None, &out).unwrap();
         assert_eq!(count(&out.join("metrics.db"), "SELECT COUNT(*) FROM ap_stats"), 1);
         assert_eq!(count(&out.join("metrics.db"), "PRAGMA freelist_count"), 0);
+    }
+
+    #[test]
+    fn a_table_copied_since_the_cutoff_has_the_same_rows_whether_or_not_any_is_older() {
+        let d = dir("since");
+        let src = d.join("src.db");
+        Connection::open(&src)
+            .unwrap()
+            .execute_batch(
+                "CREATE TABLE h (mac TEXT NOT NULL, ts INTEGER NOT NULL, v INTEGER, PRIMARY KEY (mac, ts)) WITHOUT ROWID; CREATE INDEX h_ts ON h (ts);
+                 INSERT INTO h VALUES ('a', 10, 1), ('b', 20, 2), ('a', 30, 3);",
+            )
+            .unwrap();
+        let copy = |t: Ts, name: &str| {
+            let dst = d.join(name);
+            built("test.db", &src, &dst, t, |_| Take::Since("ts"), |_| Ok(())).unwrap();
+            assert_eq!(schema(&dst), schema(&src));
+            Connection::open(&dst).unwrap().query_row("SELECT group_concat(mac || ts, ',') FROM (SELECT * FROM h ORDER BY mac, ts)", [], |r| r.get::<_, String>(0)).unwrap()
+        };
+        assert_eq!(copy(10, "none-older.db"), "a10,a30,b20", "copied whole");
+        assert_eq!(copy(20, "one-older.db"), "a30,b20");
     }
 
     #[test]
