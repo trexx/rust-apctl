@@ -473,6 +473,24 @@ pub enum Write {
     Exec { db: Db, sql: &'static str, params: Vec<Value> },
 }
 
+impl Write {
+    fn db(&self) -> Db {
+        match self {
+            Write::Metric { .. } => Db::Metrics,
+            Write::Exec { db, .. } => *db,
+        }
+    }
+}
+
+/// Writes by the database they go to, in the order given.
+fn by_db(writes: impl IntoIterator<Item = Write>) -> [Vec<Write>; 3] {
+    let mut by_db: [Vec<Write>; 3] = Default::default();
+    for w in writes {
+        by_db[w.db() as usize].push(w);
+    }
+    by_db
+}
+
 /// What the writer thread is sent.
 enum Msg {
     Write(Write),
@@ -648,41 +666,23 @@ fn commit(conns: &mut Conns, pending: &mut Vec<Write>, health: &Health) -> bool 
     if pending.is_empty() {
         return true;
     }
-    let (_, committed) = flush(conns, pending);
+    // Each database's transaction commits, or its whole batch is lost.
+    let mut committed = true;
+    for (conn, writes) in conns.iter_mut().zip(by_db(pending.drain(..))) {
+        if writes.is_empty() {
+            continue;
+        }
+        if let Err(e) = apply(conn, writes) {
+            tracing::error!("write batch failed: {e:#}");
+            committed = false;
+        }
+    }
     if committed {
         health.lost_batches.store(0, Ordering::Relaxed);
     } else {
         health.lost_batches.fetch_add(1, Ordering::Relaxed);
     }
     committed
-}
-
-/// Commits the pending writes; returns how many failed, and whether every
-/// database's transaction committed (else its whole batch is lost).
-fn flush(conns: &mut Conns, pending: &mut Vec<Write>) -> (usize, bool) {
-    let mut by_db: [Vec<Write>; 3] = Default::default();
-    for w in pending.drain(..) {
-        let db = match &w {
-            Write::Metric { .. } => Db::Metrics,
-            Write::Exec { db, .. } => *db,
-        };
-        by_db[db as usize].push(w);
-    }
-    let (mut failed, mut committed) = (0, true);
-    for (conn, writes) in conns.iter_mut().zip(by_db) {
-        if writes.is_empty() {
-            continue;
-        }
-        let n = writes.len();
-        match apply(conn, writes) {
-            Ok(f) => failed += f,
-            Err(e) => {
-                tracing::error!("write batch failed: {e:#}");
-                (failed, committed) = (failed + n, false);
-            }
-        }
-    }
-    (failed, committed)
 }
 
 /// Commits a batch in one transaction. A write that fails (e.g. a constraint)
@@ -968,8 +968,8 @@ pub(crate) fn capture() -> (Writer, impl FnOnce(&Path) -> Result<usize>) {
         std::fs::create_dir_all(dir)?;
         migrate(dir)?;
         let mut conns = open_all(dir)?;
-        let mut writes = rx.try_iter().filter_map(|m| match m { Msg::Write(w) => Some(w), Msg::Flush(_) => None }).collect();
-        Ok(flush(&mut conns, &mut writes).0)
+        let writes = rx.try_iter().filter_map(|m| match m { Msg::Write(w) => Some(w), Msg::Flush(_) => None });
+        conns.iter_mut().zip(by_db(writes)).map(|(conn, writes)| apply(conn, writes)).sum()
     };
     (writer, store)
 }
