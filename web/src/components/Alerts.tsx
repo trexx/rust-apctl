@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { Link, useNavigate } from "react-router";
-import { keys, markAlertsRead, useAlerts, useCanEdit } from "../api";
+import { STORED, keys, markAlertsRead, useAlerts, useCanEdit } from "../api";
 import type { AlertCategory, AlertItem } from "../api";
 import { clock, useNow } from "../format";
 import { Outcome, useDismiss, useRunner } from "./common";
@@ -102,7 +102,7 @@ export function AlertBell() {
   const canEdit = useCanEdit();
   const now = useNow();
   // The server stores the change a moment later.
-  const { busy, msg, run } = useRunner([keys.alerts()], 800);
+  const { busy, msg, run } = useRunner([keys.alerts()], STORED);
   const [open, setOpen] = useState(false);
   const box = useRef<HTMLDivElement>(null);
   useDismiss(box, () => setOpen(false), open);

@@ -1249,11 +1249,12 @@ const NAME_EVENTS = new Set(["ap_seen", "ap_adopted", "ap_forgotten", "config_ap
 const RF_EVENTS = new Set(["ap_scan_done", "channel_plan", "radio_changed"]);
 
 /**
- * How long after announcing a stored row (an event, a log line, a dry-run result, an alert, a threat) the server has committed it:
- * its writer commits a write within ~1.25 s of queuing it (a batch at most 1 s after its first write, checked every 250 ms).
- * A refetch sooner can miss the row, and nothing would fetch it again until the next message.
+ * How long after queuing a write the server has committed it: its writer commits a write within ~1.25 s (a batch at most 1 s
+ * after its first write, checked every 250 ms). A stored row (an event, a log line, a dry-run result, an alert, a threat) is
+ * announced when queued, and a request like marking the alerts read answers then: a refetch sooner can miss the change, and
+ * nothing would fetch it again until the next message.
  */
-const STORED = 1500;
+export const STORED = 1500;
 
 /** What a socket's `watchdog` gives: call `heard()` for every frame, `stop()` once it is closed. */
 export interface Watchdog {
