@@ -263,8 +263,6 @@ export interface EventPayloads {
   ap_offline: { last_seen?: number };
   ap_restarted: { uptime?: number | null };
   ap_firmware_changed: { from?: string | null; to?: string | null };
-  ap_radios_restarting: object;
-  ap_config_applied: { seconds?: number; reconnected?: number; clients_before?: number };
   config_applied: { seconds_after_push?: number | null };
   client_connect_failed: { essid?: string | null; reason?: string | null; rssi?: number | null };
   dfs_radar: { channel?: number | null };

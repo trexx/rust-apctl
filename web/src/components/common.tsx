@@ -435,18 +435,6 @@ const EVENTS: { [K in EventKind]: EventSpec<K> } = {
     tone: "neutral",
     describe: (d) => `${d.from ?? "?"} → ${d.to ?? "?"}`,
   },
-  // Older events (before 0.3.2) guessed a restart; it was a config being applied.
-  ap_radios_restarting: { label: "Applying configuration", tone: "neutral" },
-  ap_config_applied: {
-    label: "Configuration applied",
-    tone: "neutral",
-    describe: (d) => {
-      const secs = `in ${d.seconds}s`;
-      if ((d.reconnected ?? 0) > 0)
-        return `${secs}, ${d.reconnected} of ${d.clients_before} clients had to reconnect`;
-      return (d.clients_before ?? 0) > 0 ? `${secs}, no clients dropped` : secs;
-    },
-  },
   config_applied: {
     label: "Config applied",
     tone: "neutral",
