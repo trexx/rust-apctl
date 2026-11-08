@@ -511,7 +511,14 @@ fn trim_logs_db(p: &Path, t: Ts) -> Result<()> {
     tx.commit()?;
     let pages = |pragma: &str| c.query_row(&format!("PRAGMA {pragma}"), [], |r| r.get::<_, i64>(0));
     if pages("freelist_count")? * 4 > pages("page_count")? {
-        c.execute_batch("VACUUM;")?;
+        // Into a file beside it, then over it: VACUUM in place builds the compacted
+        // database in a temporary one first, which temp_store=MEMORY holds whole in RAM.
+        let mut compact = p.as_os_str().to_owned();
+        compact.push(".compact");
+        let compact = PathBuf::from(compact);
+        c.execute("VACUUM INTO ?1", [compact.to_string_lossy()])?;
+        drop(c);
+        fs::rename(&compact, p).with_context(|| format!("replacing {}", p.display()))?;
     }
     Ok(())
 }
@@ -1621,6 +1628,34 @@ mod tests {
         c.execute_batch("INSERT INTO logs_fts (logs_fts) VALUES ('integrity-check'); DELETE FROM logs WHERE msg = 'freshword one'; INSERT INTO logs (ts, msg) VALUES (1, 'newer');").unwrap();
         assert_eq!((found("freshword"), found("newer")), (1, 1));
         c.execute_batch("INSERT INTO logs_fts (logs_fts) VALUES ('integrity-check');").unwrap();
+    }
+
+    #[test]
+    fn a_trimmed_logs_db_is_compacted_beside_it_and_replaces_it() {
+        let d = dir("compact");
+        let p = d.join("logs.db");
+        let (store, writer) = store::Store::open(&d).unwrap();
+        drop((store, writer));
+        let now = clock::now_ts();
+        Connection::open(&p)
+            .unwrap()
+            .execute_batch(&format!(
+                "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 5000)
+                 INSERT INTO logs (ts, program, msg) SELECT {old}, 'hostapd', 'stalewords ' || i FROM n;
+                 INSERT INTO logs (ts, program, msg) VALUES ({now}, 'mcad', 'freshword');",
+                old = now - 40 * 86400
+            ))
+            .unwrap();
+        let copy = d.join("copy");
+        fs::create_dir(&copy).unwrap();
+        let dst = copy.join("logs.db");
+        snapshot(&p, &dst).unwrap();
+        trim_logs_db(&dst, now - 7 * 86400).unwrap();
+        let names: Vec<_> = fs::read_dir(&copy).unwrap().map(|e| e.unwrap().file_name()).collect();
+        assert_eq!(names, ["logs.db"], "the compacted file took its place");
+        assert_eq!((count(&dst, "SELECT COUNT(*) FROM logs"), count(&dst, "PRAGMA freelist_count")), (1, 0));
+        assert_eq!(count(&dst, "SELECT COUNT(*) FROM logs_fts WHERE logs_fts MATCH 'freshword'"), 1);
+        Connection::open(&dst).unwrap().execute_batch("INSERT INTO logs_fts (logs_fts) VALUES ('integrity-check');").unwrap();
     }
 
     #[test]
