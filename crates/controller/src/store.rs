@@ -615,32 +615,50 @@ fn open_all(dir: &Path) -> Result<Conns> {
     Ok([open_rw(&dir.join(Db::Config.file()))?, open_rw(&dir.join(Db::Metrics.file()))?, open_rw(&dir.join(Db::Logs.file()))?])
 }
 
+/// How long a batch collects writes, from its first one: one inform's writes,
+/// queued together, share one transaction.
+const BATCH: Duration = Duration::from_secs(1);
+
+/// How often an idle writer looks at the time for its maintenance.
+const IDLE_POLL: Duration = Duration::from_millis(250);
+
 /// The channel to the writer stays unbounded: the engine and the request
 /// handlers must never block on the disk, and the writer drains a second's
 /// worth of writes per commit, far more than the APs produce.
+///
+/// A batch is committed once its first write is [`BATCH`] old, at 5000 writes,
+/// or for a Flush: any write is committed within about a second of being queued
+/// (later only behind a commit or maintenance already under way). The page,
+/// told of a stored row on the live socket as soon as its write is queued,
+/// reads it 1.5 s later.
 fn writer_loop(dir: &Path, rx: Receiver<Msg>, health: &Health) -> Result<()> {
     let mut conns = open_all(dir)?;
     let mut pending: Vec<Write> = Vec::new();
     let mut acks: Vec<Sender<bool>> = Vec::new();
     // Whether every batch since the last answer to a Flush committed.
     let mut committed = true;
-    let mut last_flush = Instant::now();
+    // When the pending batch's first write came; None while nothing is pending.
+    let mut batch_since: Option<Instant> = None;
     // The first maintenance a minute after start, with the hourly retention (see `maintenance`).
     let mut last_maintenance = Instant::now().checked_sub(Duration::from_secs(240)).unwrap_or_else(Instant::now);
     let mut last_hourly: Option<Instant> = None;
     loop {
-        match rx.recv_timeout(Duration::from_millis(250)) {
+        let wait = batch_since.map_or(IDLE_POLL, |t| BATCH.saturating_sub(t.elapsed()));
+        match rx.recv_timeout(wait) {
             Ok(Msg::Flush(ack)) => acks.push(ack),
-            Ok(Msg::Write(w)) => pending.push(w),
+            Ok(Msg::Write(w)) => {
+                batch_since.get_or_insert_with(Instant::now);
+                pending.push(w);
+            }
             Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => {
                 commit(&mut conns, &mut pending, health);
                 return Ok(());
             }
         }
-        if !acks.is_empty() || (!pending.is_empty() && (last_flush.elapsed() >= Duration::from_secs(1) || pending.len() >= 5000)) {
+        if !acks.is_empty() || batch_since.is_some_and(|t| t.elapsed() >= BATCH) || pending.len() >= 5000 {
             committed &= commit(&mut conns, &mut pending, health);
-            last_flush = Instant::now();
+            batch_since = None;
             if !acks.is_empty() {
                 for ack in acks.drain(..) {
                     let _ = ack.send(committed);
@@ -650,6 +668,7 @@ fn writer_loop(dir: &Path, rx: Receiver<Msg>, health: &Health) -> Result<()> {
         }
         if last_maintenance.elapsed() >= Duration::from_secs(300) {
             committed &= commit(&mut conns, &mut pending, health);
+            batch_since = None;
             let hourly = last_hourly.is_none_or(|t| t.elapsed() >= Duration::from_secs(3600));
             maintenance(&mut conns, crate::clock::now_ts(), hourly);
             last_maintenance = Instant::now();
@@ -1243,6 +1262,29 @@ mod tests {
         let n: i64 = store.read(Db::Config, |c| Ok(c.query_row("SELECT COUNT(*) FROM client_aliases", [], |r| r.get(0))?)).unwrap();
         assert_eq!(n, 1, "committed well before the usual one-second batch");
         assert!(!writer.stopped());
+    }
+
+    #[test]
+    fn a_batch_is_timed_from_its_first_write_and_commits_together() {
+        let dir = temp_dir("batch");
+        let (store, writer) = Store::open(&dir).unwrap();
+        let count = || -> i64 { store.read(Db::Config, |c| Ok(c.query_row("SELECT COUNT(*) FROM client_aliases", [], |r| r.get(0))?)).unwrap() };
+        // After an idle second, as between informs: the first write must not commit alone.
+        std::thread::sleep(Duration::from_millis(1100));
+        let first = Instant::now();
+        writer.exec(Db::Config, "INSERT INTO client_aliases (mac, alias, updated) VALUES ('a', 'x', 1)", vec![]);
+        std::thread::sleep(Duration::from_millis(300));
+        writer.exec(Db::Config, "INSERT INTO client_aliases (mac, alias, updated) VALUES ('b', 'y', 1)", vec![]);
+        let seen = loop {
+            let n = count();
+            assert!(n == 0 || n == 2, "both writes commit in one batch, not {n} alone");
+            if n == 2 {
+                break first.elapsed();
+            }
+            assert!(first.elapsed() < Duration::from_secs(10), "committed within about a second");
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        assert!(seen >= BATCH, "committed {seen:?} after the first write, before the batch was {BATCH:?} old");
     }
 
     #[test]
