@@ -332,15 +332,18 @@ const NEIGHBOR_RETENTION: Ts = 30 * 86400;
 /// alias). The same rule as a backup's history trim; the engine drops them
 /// from its live view too.
 pub const CLIENT_RETENTION: Ts = 365 * 86400;
-/// Deletes the clients last seen before ?1 that have no name: the retention
-/// above, and a backup's history trim.
-pub const FORGET_OLD_CLIENTS: &str = "DELETE FROM clients WHERE COALESCE(last_seen, 0) < ?1 AND mac NOT IN (SELECT mac FROM client_aliases)";
+/// The clients last seen before ?1 that have no name, the names read from
+/// `db`'s client_aliases (`main`, or a backup's `live`): what the retention
+/// above forgets, and a backup's history trim leaves out.
+pub fn old_clients(db: &str) -> String {
+    format!("COALESCE(last_seen, 0) < ?1 AND mac NOT IN (SELECT mac FROM {db}.client_aliases)")
+}
 /// Resolved alerts are kept this long; open ones until they resolve.
 const ALERT_RETENTION: Ts = 90 * 86400;
-/// Deletes the alerts raised and resolved before ?1 (an open one is kept, so
-/// that it neither comes again nor loses when it started): the retention
-/// above, and a backup's history trim.
-pub const FORGET_RESOLVED_ALERTS: &str = "DELETE FROM alerts WHERE ts < ?1 AND resolved_ts < ?1";
+/// The alerts raised and resolved before ?1 (an open one is kept, so that it
+/// neither comes again nor loses when it started): what the retention above
+/// forgets, and a backup's history trim leaves out.
+pub const OLD_ALERTS: &str = "ts < ?1 AND resolved_ts < ?1";
 /// One of config.db's history tables (see `CONFIG_HISTORY`).
 pub struct History {
     pub table: &'static str,
@@ -847,8 +850,8 @@ fn maintenance(conns: &mut Conns, now: Ts, hourly: bool) {
         return;
     }
     step("expiring sessions", config.execute("DELETE FROM sessions WHERE expires < ?1", [now]).map(drop).map_err(Into::into));
-    step("retention of clients", config.execute(FORGET_OLD_CLIENTS, [now - CLIENT_RETENTION]).map(drop).map_err(Into::into));
-    step("retention of alerts", config.execute(FORGET_RESOLVED_ALERTS, [now - ALERT_RETENTION]).map(drop).map_err(Into::into));
+    step("retention of clients", config.execute(&format!("DELETE FROM clients WHERE {}", old_clients("main")), [now - CLIENT_RETENTION]).map(drop).map_err(Into::into));
+    step("retention of alerts", config.execute(&format!("DELETE FROM alerts WHERE {OLD_ALERTS}"), [now - ALERT_RETENTION]).map(drop).map_err(Into::into));
 }
 
 /// How long after a bucket ends it is rolled up: rows still queued in the
