@@ -1208,7 +1208,9 @@ type LiveMsg =
   | ({ type: "event" } & Pick<AppEvent, "kind" | "device_mac" | "client_mac">)
   | { type: "log"; device_mac: Mac | null }
   | ({ type: "alert"; action: "raised" | "resolved" } & AlertItem)
-  | { type: "resync" };
+  | { type: "resync" }
+  // Every 30 s (api.rs `PING`): the socket is alive.
+  | { type: "ping" };
 
 export type AlertCategory = "ap_status" | "security" | "health" | "changes";
 
@@ -1265,6 +1267,8 @@ export function useLiveUpdates(): void {
     let dropped = false;
     let retry = 1000;
     let reconnectTimer: number | undefined;
+    // Set while a socket is open: it fires when the socket has said nothing for longer than two pings.
+    let quietTimer: number | undefined;
     let flushTimer: number | undefined;
     let flushAt = Infinity;
     // Waiting invalidations by key, each with the earliest time it may run.
@@ -1401,28 +1405,46 @@ export function useLiveUpdates(): void {
       const socket = new WebSocket(`${proto}://${location.host}/api/ws`);
       ws = socket;
       let opened = false;
-      socket.onopen = () => {
-        opened = true;
-        retry = 1000;
-        // Whatever changed while disconnected (e.g. during a restart) was never announced.
-        if (dropped) refetchAll();
-      };
-      socket.onmessage = onMessage;
-      socket.onclose = (e) => {
+      const lost = (code: number) => {
+        window.clearTimeout(quietTimer);
         if (closed) return;
         // 1008 (policy): the server closed it because the session ended (logged out or expired). One that never opened may have
         // been refused for a session that ended while it was down (the browser hides the 401): /api/me tells.
-        if (e.code === 1008 || !opened) announceUnauthorized();
+        if (code === 1008 || !opened) announceUnauthorized();
         dropped = true;
         reconnectTimer = window.setTimeout(connect, retry);
         retry = Math.min(retry * 2, 30_000);
       };
+      // A path that died without closing (a suspended laptop, a NAT that forgot it) leaves the socket open but silent:
+      // with the server's pings, silence for longer than two of them means it is gone, and it is dropped and opened again.
+      const heard = () => {
+        window.clearTimeout(quietTimer);
+        quietTimer = window.setTimeout(() => {
+          socket.onclose = null;
+          socket.onmessage = null;
+          socket.close();
+          lost(1006);
+        }, 75_000);
+      };
+      socket.onopen = () => {
+        opened = true;
+        retry = 1000;
+        heard();
+        // Whatever changed while disconnected (e.g. during a restart) was never announced.
+        if (dropped) refetchAll();
+      };
+      socket.onmessage = (m) => {
+        heard();
+        onMessage(m);
+      };
+      socket.onclose = (e) => lost(e.code);
     };
     connect();
     return () => {
       closed = true;
       ws?.close();
       window.clearTimeout(reconnectTimer);
+      window.clearTimeout(quietTimer);
       window.clearTimeout(flushTimer);
     };
   }, [qc]);
