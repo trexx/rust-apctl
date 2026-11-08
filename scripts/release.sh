@@ -170,9 +170,9 @@ case $revision in
 esac
 echo "published $IMAGE:$version@$digest"
 
-# CI pushes the image before its check job tests it (scripts/image-check.sh on the published
-# image), so the manifest exists while that check runs, or after it failed: pin only once
-# the tag's Build run for HEAD has passed. Without gh that is left unchecked.
+# CI pushes the images before its check job tests them (scripts/image-check.sh on the published
+# image, tcpdump in the capture sidecar), so the manifest exists while that check runs, or after
+# it failed: pin only once the tag's Build run for HEAD has passed. Without gh that is left unchecked.
 if type -P gh >/dev/null; then
   # "<status> <url> <conclusion>" of the newest run, or "null null null" before there is one.
   # The conclusion is last: it is empty while the run is going, and read would then shift the URL into it.

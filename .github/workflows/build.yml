@@ -42,7 +42,8 @@ jobs:
       cache_scope: 'apctl'
       cache_write: false
 
-  # Rebuilt on every release, so the alpine and tcpdump fixes Renovate brings reach it.
+  # Rebuilt on every release, so the alpine base Renovate bumps reaches it, and so does
+  # alpine's current tcpdump: it is not pinned, apk installs it at build time.
   # No layer cache: image.yml builds the stage without caching it, and it is small.
   capture:
     needs: [ 'version', 'test' ]
@@ -56,10 +57,12 @@ jobs:
       # The package is not named after the repository, which pruning assumes.
       prune_images: false
 
-  # The image CI published runs, reports the version and carries the manufacturer list
-  # (scripts/image-check.sh). release.sh --pin pins it only once this run has passed.
+  # The images CI published run: apctl reports the version and carries the manufacturer
+  # list (scripts/image-check.sh), and the capture sidecar's tcpdump starts (its apk
+  # install is not the one image.yml tested). release.sh --pin pins apctl only once this
+  # run has passed.
   check:
-    needs: [ 'build' ]
+    needs: [ 'build', 'capture' ]
     runs-on: 'ubuntu-26.04'
     timeout-minutes: 10
     permissions:
@@ -73,3 +76,5 @@ jobs:
           username: '${{ github.repository_owner }}'
           password: '${{ secrets.GITHUB_TOKEN }}'
       - run: 'scripts/image-check.sh "ghcr.io/${{ github.repository_owner }}/rust-apctl:${GITHUB_REF_NAME}"'
+      - name: 'The capture image runs tcpdump'
+        run: 'docker run --rm --entrypoint tcpdump "ghcr.io/${{ github.repository }}-capture:${GITHUB_REF_NAME}" --version'
