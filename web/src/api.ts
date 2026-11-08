@@ -1255,6 +1255,48 @@ const RF_EVENTS = new Set(["ap_scan_done", "channel_plan", "radio_changed"]);
  */
 const STORED = 1500;
 
+/** What a socket's `watchdog` gives: call `heard()` for every frame, `stop()` once it is closed. */
+export interface Watchdog {
+  heard(): void;
+  stop(): void;
+}
+
+/**
+ * Watches an open socket of apctl's (the live one, a terminal) that a path which died without closing (a suspended laptop, a
+ * NAT that forgot it, a frozen phone tab) leaves open but silent. The server sends `{"type":"ping"}` with each of its pings
+ * (every 30 s, api.rs `PING`), so silence for longer than two of them means it is gone: `onDead` is called, once.
+ *
+ * Silence is measured on the wall clock (time asleep counts, which timers skip), checked every 15 s and as soon as the page
+ * is shown again or back online: after a sleep a dead socket is noticed at once.
+ */
+export function watchdog(onDead: () => void): Watchdog {
+  let lastHeard = Date.now();
+  const check = () => {
+    if (Date.now() - lastHeard <= 75_000) return;
+    stop();
+    onDead();
+  };
+  const shown = () => {
+    if (!document.hidden) check();
+  };
+  const timer = window.setInterval(check, 15_000);
+  document.addEventListener("visibilitychange", shown);
+  window.addEventListener("pageshow", check);
+  window.addEventListener("online", check);
+  const stop = () => {
+    window.clearInterval(timer);
+    document.removeEventListener("visibilitychange", shown);
+    window.removeEventListener("pageshow", check);
+    window.removeEventListener("online", check);
+  };
+  return {
+    heard() {
+      lastHeard = Date.now();
+    },
+    stop,
+  };
+}
+
 /**
  * Keeps queries fresh from the server's WebSocket: device and client changes
  * invalidate the cached lists, new events and logs refetch the lists whose
@@ -1274,8 +1316,8 @@ export function useLiveUpdates(): void {
     let dropped = false;
     let retry = 1000;
     let reconnectTimer: number | undefined;
-    // Set while a socket is open: it fires when the socket has said nothing for longer than two pings.
-    let quietTimer: number | undefined;
+    // Set while a socket is open.
+    let dog: Watchdog | undefined;
     let flushTimer: number | undefined;
     let flushAt = Infinity;
     // Waiting invalidations by key, each with the earliest time it may run.
@@ -1413,7 +1455,7 @@ export function useLiveUpdates(): void {
       ws = socket;
       let opened = false;
       const lost = (code: number) => {
-        window.clearTimeout(quietTimer);
+        dog?.stop();
         if (closed) return;
         // 1008 (policy): the server closed it because the session ended (logged out or expired). One that never opened may have
         // been refused for a session that ended while it was down (the browser hides the 401): /api/me tells.
@@ -1422,26 +1464,21 @@ export function useLiveUpdates(): void {
         reconnectTimer = window.setTimeout(connect, retry);
         retry = Math.min(retry * 2, 30_000);
       };
-      // A path that died without closing (a suspended laptop, a NAT that forgot it) leaves the socket open but silent:
-      // with the server's pings, silence for longer than two of them means it is gone, and it is dropped and opened again.
-      const heard = () => {
-        window.clearTimeout(quietTimer);
-        quietTimer = window.setTimeout(() => {
+      socket.onopen = () => {
+        opened = true;
+        retry = 1000;
+        // Gone without closing: dropped and opened again.
+        dog = watchdog(() => {
           socket.onclose = null;
           socket.onmessage = null;
           socket.close();
           lost(1006);
-        }, 75_000);
-      };
-      socket.onopen = () => {
-        opened = true;
-        retry = 1000;
-        heard();
+        });
         // Whatever changed while disconnected (e.g. during a restart) was never announced.
         if (dropped) refetchAll();
       };
       socket.onmessage = (m) => {
-        heard();
+        dog?.heard();
         onMessage(m);
       };
       socket.onclose = (e) => lost(e.code);
@@ -1451,7 +1488,7 @@ export function useLiveUpdates(): void {
       closed = true;
       ws?.close();
       window.clearTimeout(reconnectTimer);
-      window.clearTimeout(quietTimer);
+      dog?.stop();
       window.clearTimeout(flushTimer);
     };
   }, [qc]);
