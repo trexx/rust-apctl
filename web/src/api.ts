@@ -1249,6 +1249,13 @@ const NAME_EVENTS = new Set(["ap_seen", "ap_adopted", "ap_forgotten", "config_ap
 const RF_EVENTS = new Set(["ap_scan_done", "channel_plan", "radio_changed"]);
 
 /**
+ * How long after announcing a stored row (an event, a log line, a dry-run result, an alert, a threat) the server has committed it:
+ * its writer commits a write within ~1.25 s of queuing it (a batch at most 1 s after its first write, checked every 250 ms).
+ * A refetch sooner can miss the row, and nothing would fetch it again until the next message.
+ */
+const STORED = 1500;
+
+/**
  * Keeps queries fresh from the server's WebSocket: device and client changes
  * invalidate the cached lists, new events and logs refetch the lists whose
  * filters they match.
@@ -1316,12 +1323,13 @@ export function useLiveUpdates(): void {
       schedule();
     };
     /**
-     * Invalidates (as above) each query in `family` on screen whose filter `matches`. The rest
+     * Invalidates (as above, `STORED` ms on: these are rows the server announces before it commits them) each query in `family`
+     * on screen whose filter `matches`. The rest
      * are only marked stale, all at once, so that they refetch when shown again.
      */
     const invalidateWhere = <F>(family: QueryKey, matches: (filter: F) => boolean, gap: number) => {
       for (const q of qc.getQueryCache().findAll({ queryKey: family, type: "active" })) {
-        if (matches((q.queryKey[1] ?? {}) as F)) invalidate(q.queryKey, gap);
+        if (matches((q.queryKey[1] ?? {}) as F)) invalidate(q.queryKey, gap, STORED);
       }
       void qc.invalidateQueries({ queryKey: family, type: "inactive", refetchType: "none" });
     };
@@ -1357,7 +1365,7 @@ export function useLiveUpdates(): void {
           invalidateWhere<EventFilter>(keys.events(), (f) => eventMatches(f, e), 2000);
           if (msg.kind === "dryrun_compared" || msg.kind === "settings_imported") {
             // Each AP pushed to records one, and every fetch renders and compares every AP's config: follow at most every 5 s.
-            invalidate(keys.dryrun(), 5000);
+            invalidate(keys.dryrun(), 5000, STORED);
           }
           if (msg.kind === "settings_changed" || msg.kind === "settings_imported") {
             // An editor keeps what it was opened with (it saves only the fields changed in it); the rest follows,
@@ -1373,7 +1381,7 @@ export function useLiveUpdates(): void {
             for (const key of [keys.rfPlan(), keys.rfRadios(), keys.rfNeighbors(), keys.rfLinks()]) invalidate(key, 5000);
           }
           if (msg.kind === "channel_plan") invalidate(keys.channelAi());
-          if (msg.kind === "network_threat") invalidate(keys.threats());
+          if (msg.kind === "network_threat") invalidate(keys.threats(), 0, STORED);
           // Connected, gone, roamed, renamed, blocked: its page shows it.
           if (msg.client_mac) invalidate(keys.client(msg.client_mac));
           if (msg.kind === "client_renamed") invalidate(keys.clientNames());
@@ -1388,8 +1396,7 @@ export function useLiveUpdates(): void {
           break;
         }
         case "alert":
-          // The server stores alerts within a second of announcing them: look then.
-          invalidate(keys.alerts(), 0, 1500);
+          invalidate(keys.alerts(), 0, STORED);
           // The notifier decides whether this browser shows it.
           window.dispatchEvent(new CustomEvent("apctl:alert", { detail: msg }));
           break;
