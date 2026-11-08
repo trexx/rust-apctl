@@ -303,6 +303,14 @@ fn seen<'a>(rows: &[&'a Heard]) -> Seen<'a> {
 /// event is filed under), so an AP that has gone quiet does not keep naming it.
 pub(crate) const NEAREST_WINDOW: Ts = 3600;
 
+/// How near to a network last heard at `latest` an AP is that heard it at
+/// `last_seen` with `signal`, as the neighbour list and `heard_by` order them
+/// (the greatest is the nearest): within [`NEAREST_WINDOW`] first, then the
+/// strongest, then the more recent sighting, then the lower AP MAC.
+pub(crate) fn nearness(latest: Ts, last_seen: Ts, signal: Option<i64>, ap_mac: &str) -> (bool, i64, Ts, std::cmp::Reverse<&str>) {
+    (last_seen >= latest - NEAREST_WINDOW, signal.unwrap_or(-200), last_seen, std::cmp::Reverse(ap_mac))
+}
+
 /// Everything suspicious in what the APs hear.
 pub fn assess(a: &Assessment) -> Vec<Finding> {
     let own: HashMap<&str, &OwnBss> = a.own.iter().map(|b| (b.bssid.as_str(), b)).collect();
@@ -353,10 +361,9 @@ pub fn assess(a: &Assessment) -> Vec<Finding> {
         let (latest, best) = (all.latest, all.best);
         // `rows` are the sightings the finding rests on, `s` what they add up to.
         let mut push = |kind: Kind, severity: Severity, target: Option<String>, detail: String, rows: &[&Heard], s: &Seen| {
-            // Those that heard it lately (NEAREST_WINDOW) first, each part strongest first.
-            let lately = s.latest.last_seen - NEAREST_WINDOW;
+            // The nearest first.
             let mut rows = rows.to_vec();
-            rows.sort_by_key(|h| std::cmp::Reverse((h.last_seen >= lately, h.signal.unwrap_or(-200))));
+            rows.sort_by_key(|&h| std::cmp::Reverse(nearness(s.latest.last_seen, h.last_seen, h.signal, &h.ap_mac)));
             let heard_by: Vec<HeardBy> = rows.iter().map(|h| HeardBy { mac: h.ap_mac.clone(), name: ap_name(&h.ap_mac), signal: h.signal }).collect();
             out.push(Finding {
                 kind,
@@ -1131,6 +1138,15 @@ mod tests {
         let n = a.heard.len();
         a.heard[n - 2].last_seen = 10_000 - NEAREST_WINDOW;
         assert_eq!(order(&a), [(DOWN.to_string(), Some(-50)), (UP.to_string(), Some(-72))]);
+        // As strong as each other: the more recent sighting first, as the neighbour list names it,
+        // in whichever order the rows come; heard at once, the lower MAC.
+        a.heard[n - 2].signal = Some(-72);
+        assert_eq!(order(&a), [(UP.to_string(), Some(-72)), (DOWN.to_string(), Some(-72))]);
+        a.heard.swap(n - 2, n - 1);
+        assert_eq!(order(&a), [(UP.to_string(), Some(-72)), (DOWN.to_string(), Some(-72))]);
+        a.heard[n - 1].last_seen = 10_000;
+        assert_eq!(order(&a), [(UP.to_string(), Some(-72)), (DOWN.to_string(), Some(-72))]);
+        assert!(nearness(10_000, 10_000, Some(-72), UP) > nearness(10_000, 10_000, Some(-72), DOWN));
     }
 
     #[test]
