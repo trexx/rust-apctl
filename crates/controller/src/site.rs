@@ -226,19 +226,19 @@ fn site_ntp(doc: &mut Value, n: &Value) -> Result<(), String> {
 fn site_snmp(doc: &mut Value, sn: &Value, notes: &mut Vec<String>) -> Result<(), String> {
     copy_fields(sn, doc, &[("enabled", Bool), ("enabledV3", Bool)])?;
     if let Some(c) = str_field(sn, "community")? {
-        if c.is_empty() || c.len() > 256 || c.contains(char::is_whitespace) {
+        if c.is_empty() || c.chars().count() > 256 || c.contains(char::is_whitespace) {
             return Err("the SNMP community must be 1 to 256 characters without spaces".into());
         }
         doc["community"] = json!(c);
     }
     if let Some(u) = str_field(sn, "username")?.map(str::trim) {
-        if !(1..=30).contains(&u.len()) {
-            return Err("the SNMPv3 user name must be 1 to 30 characters".into());
+        if !(1..=30).contains(&u.len()) || !u.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-')) {
+            return Err("the SNMPv3 user name must be 1 to 30 letters, digits, '_' or '-'".into());
         }
         doc["username"] = json!(u);
     }
     if let Some(pw) = str_field(sn, "x_password")? {
-        if !(8..=32).contains(&pw.len()) || pw.contains(['"', '\'']) {
+        if !(8..=32).contains(&pw.chars().count()) || pw.contains(['"', '\'']) {
             return Err("the SNMPv3 password must be 8 to 32 characters without quotes".into());
         }
         doc["x_password"] = json!(pw);
@@ -553,6 +553,16 @@ mod tests {
         setting_mut(&mut s, "snmp")["community"] = json!("");
         assert!(edit(&mut s, json!({ "snmp": { "enabled": true } })).unwrap_err().contains("needs a community"));
         edit(&mut s, json!({ "snmp": { "enabled": true, "community": "c0mmunity" } })).unwrap();
+        // The community and v3 password are counted in characters, as the render and the official count them.
+        edit(&mut s.clone(), json!({ "snmp": { "community": "é".repeat(256) } })).unwrap();
+        assert!(edit(&mut s.clone(), json!({ "snmp": { "community": "é".repeat(257) } })).is_err());
+        edit(&mut s.clone(), json!({ "snmp": { "x_password": "é".repeat(32) } })).unwrap();
+        assert!(edit(&mut s.clone(), json!({ "snmp": { "x_password": "é".repeat(33) } })).is_err());
+        // The v3 user name is the official's: 1 to 30 letters, digits, '_' or '-'.
+        for bad in ["mon itor", "mon@lab", "ops\"x", "mön", "m".repeat(31).as_str()] {
+            assert!(edit(&mut s, json!({ "snmp": { "username": bad } })).unwrap_err().contains("letters, digits"), "{bad}");
+        }
+        edit(&mut s.clone(), json!({ "snmp": { "username": "-mon_1" } })).unwrap();
         assert!(edit(&mut s, json!({ "snmp": { "enabledV3": true, "username": "mon" } })).unwrap_err().contains("password"));
         assert!(edit(&mut s, json!({ "snmp": { "enabledV3": true, "username": "mon", "x_password": "short" } })).is_err());
         assert!(edit(&mut s, json!({ "snmp": { "enabledV3": true, "username": "mon", "x_password": "pass\tword1" } })).unwrap_err().contains("control characters"));
