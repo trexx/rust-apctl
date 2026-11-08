@@ -133,8 +133,12 @@ export function Logging({
   syslog: SettingsForm<SyslogForm>;
   d: SiteSettings;
 }) {
-  const { form: f, bind } = syslog;
+  const { form: f, bind, original } = syslog;
   const port = d.syslog_port;
+  // Netconsole stored with syslog off (saved before Off cleared it, or
+  // imported): the APs are still sent it, so it shows, to be turned off.
+  const strayNetconsole =
+    f.mode === "off" && original.mode === "off" && original.netconsole_enabled;
   return (
     <details>
       <summary>Logging</summary>
@@ -198,6 +202,19 @@ export function Logging({
                 max={65535}
               />
             </>
+          )}
+        </Row>
+      )}
+      {strayNetconsole && (
+        <Row
+          label="Netconsole"
+          hint="still sent to the APs while syslog is off"
+        >
+          <Toggle {...bind("netconsole_enabled")} label="Enabled" />
+          {f.netconsole_enabled && (
+            <span className="muted small mono">
+              {original.netconsole_host}:{original.netconsole_port}
+            </span>
           )}
         </Row>
       )}

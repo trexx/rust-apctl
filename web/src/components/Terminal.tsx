@@ -2,8 +2,8 @@ import { useEffect, useRef, useState } from "react";
 import { Terminal as XTerm } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import "@xterm/xterm/css/xterm.css";
-import { announceUnauthorized, terminalSocket } from "../api";
-import type { Mac } from "../api";
+import { announceUnauthorized, terminalSocket, watchdog } from "../api";
+import type { Mac, Watchdog } from "../api";
 
 /** The most one frame of input holds: a paste goes in pieces (the server takes 64 KiB at most). */
 const CHUNK = 16 << 10;
@@ -34,7 +34,8 @@ function theme() {
  * frames, the size and `{"pause":…}` as JSON; the server says
  * `{"connected":true}` once the shell runs, or `{"error":…}` before it
  * closes (a refusal before the socket opens has no words: the browser hides
- * it). Nothing is sent before the shell runs.
+ * it), and `{"type":"ping"}` with each of its pings once the shell runs.
+ * The page sends nothing before the shell runs.
  */
 export function Terminal({
   mac,
@@ -86,10 +87,30 @@ export function Terminal({
     };
     let error: string | null = null;
     let opened = false;
+    // Set once the shell runs: the server pings from then on.
+    let dog: Watchdog | undefined;
+    const closed = (code: number, reason: string) => {
+      dog?.stop();
+      connected = false;
+      // 1008: the session ended (logged out or expired). One that never opened
+      // was refused before the upgrade, maybe for a session that ended (the
+      // browser hides the 401): /api/me tells, as for the live socket.
+      if (code === 1008 || !opened) announceUnauthorized();
+      const lost = opened
+        ? "the connection to apctl was lost"
+        : "apctl refused the terminal, or could not be reached";
+      setState({
+        at: "closed",
+        why: error ?? (reason || lost),
+        // 1000: the shell exited, or was idle too long.
+        failed: error !== null || code !== 1000,
+      });
+    };
     socket.onopen = () => {
       opened = true;
     };
     socket.onmessage = (e: MessageEvent<ArrayBuffer | string>) => {
+      dog?.heard();
       if (typeof e.data !== "string") {
         const n = e.data.byteLength;
         backlog += n;
@@ -100,9 +121,22 @@ export function Terminal({
         if (!paused && backlog > HIGH) pause(true);
         return;
       }
-      const msg = JSON.parse(e.data) as { connected?: boolean; error?: string };
+      const msg = JSON.parse(e.data) as {
+        type?: string;
+        connected?: boolean;
+        error?: string;
+      };
+      // Only there to be heard.
+      if (msg.type === "ping") return;
       if (msg.connected) {
         connected = true;
+        // Gone without closing (see `watchdog`): dropped, as the live socket is.
+        dog = watchdog(() => {
+          socket.onclose = null;
+          socket.onmessage = null;
+          socket.close();
+          closed(1006, "");
+        });
         // Resized while it connected: the shell started at the size it opened with.
         if (term.cols !== initial.cols || term.rows !== initial.rows)
           sendSize(term);
@@ -111,21 +145,7 @@ export function Terminal({
       }
       if (msg.error) error = msg.error;
     };
-    socket.onclose = (e) => {
-      // 1008: the session ended (logged out or expired). One that never opened
-      // was refused before the upgrade, maybe for a session that ended (the
-      // browser hides the 401): /api/me tells, as for the live socket.
-      if (e.code === 1008 || !opened) announceUnauthorized();
-      const lost = opened
-        ? "the connection to apctl was lost"
-        : "apctl refused the terminal, or could not be reached";
-      setState({
-        at: "closed",
-        why: error ?? (e.reason || lost),
-        // 1000: the shell exited, or was idle too long.
-        failed: error !== null || e.code !== 1000,
-      });
-    };
+    socket.onclose = (e) => closed(e.code, e.reason);
     const subscriptions = [
       term.onData((d) => sendBytes(encoder.encode(d))),
       // Mouse reports in the legacy encoding: one byte per character.
@@ -137,6 +157,7 @@ export function Terminal({
     const resized = new ResizeObserver(() => fit.fit());
     resized.observe(el);
     return () => {
+      dog?.stop();
       resized.disconnect();
       subscriptions.forEach((s) => s.dispose());
       socket.onclose = null;

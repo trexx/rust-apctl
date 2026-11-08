@@ -262,16 +262,23 @@ export function ConnectionLog({
 
 function ConnectionTable({ data }: { data: Connections }) {
   const now = useNow();
-  // A roam's join is also an attempt on the new AP (the report the server
-  // paired, at its join_ts); keep just the roam.
-  const joinKey = (client: string, ap: string, ts: number) =>
-    `${client} ${ap} ${ts}`;
-  const joins = new Set(
-    data.roams.map((r) => joinKey(r.client, r.to.ap, r.join_ts)),
-  );
-  const attempts = data.attempts.filter(
-    (a) => !joins.has(joinKey(a.client, a.ap, a.ts)),
-  );
+  // A roam's join is also reported as an attempt on the new AP: the server
+  // pairs the leave with the report nearest it (often the association, the
+  // attempt following seconds later). Each roam keeps out the successful
+  // attempt of its client on its new AP nearest its join, within the pairing's
+  // 15 s; a failed attempt always shows.
+  const folded = new Set<ConnAttempt>();
+  for (const r of data.roams) {
+    let best: ConnAttempt | undefined;
+    for (const a of data.attempts) {
+      if (!a.success || a.client !== r.client || a.ap !== r.to.ap) continue;
+      const d = Math.abs(a.ts - r.join_ts);
+      if (d > 15 || folded.has(a)) continue;
+      if (!best || d < Math.abs(best.ts - r.join_ts)) best = a;
+    }
+    if (best) folded.add(best);
+  }
+  const attempts = data.attempts.filter((a) => !folded.has(a));
   const attemptKeys = stableKeys(attempts, attemptId);
   const roamKeys = stableKeys(data.roams, roamId);
   const items: Item[] = [

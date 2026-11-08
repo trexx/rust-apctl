@@ -284,30 +284,66 @@ const scrolled = new Map<string, number>();
  * page in its Suspense boundary, its layout effect runs once the page (lazy or
  * not) is in the document and before it is painted. A #fragment's element
  * lands just below the sticky header, however tall it is at this width.
+ *
+ * An entry returned to while its page is shorter than where it was left (its
+ * data still loading) keeps that offset and goes there as the page grows,
+ * until it is reached, the user scrolls, or `REACH_MS` pass; meanwhile the
+ * clamped offset is not stored for it. The offsets hold because every row is
+ * laid out: rows skipped by `content-visibility` would count at a guessed
+ * height on a page mounted again, and Back would land on another row.
  */
 function ScrollKeeper({ header }: { header: RefObject<HTMLElement | null> }) {
   const location = useLocation();
   const navigation = useNavigationType();
   // The entry shown.
   const shown = useRef<{ key: string; path: string } | null>(null);
+  // Its offset, while the page is still too short for it.
+  const wanted = useRef<{ y: number; until: number } | null>(null);
   useEffect(() => {
+    const waiting = () => {
+      if (wanted.current && Date.now() > wanted.current.until)
+        wanted.current = null;
+      return wanted.current;
+    };
     // Read when the browser scrolls, after the layout effect below has moved
     // `shown` to the entry on screen.
     const onScroll = () => {
-      if (shown.current) scrolled.set(shown.current.key, window.scrollY);
+      if (shown.current && !waiting())
+        scrolled.set(shown.current.key, window.scrollY);
     };
+    // Run after layout and before paint, as the page grows.
+    const grown = new ResizeObserver(() => {
+      const w = waiting();
+      if (w && reach(w.y)) wanted.current = null;
+    });
+    grown.observe(document.body);
+    // The user scrolling (or about to) takes over.
+    const taken = () => {
+      wanted.current = null;
+    };
+    const input = ["wheel", "touchstart", "keydown", "mousedown"] as const;
     window.addEventListener("scroll", onScroll, { passive: true });
-    return () => window.removeEventListener("scroll", onScroll);
+    for (const e of input)
+      window.addEventListener(e, taken, { capture: true, passive: true });
+    return () => {
+      window.removeEventListener("scroll", onScroll);
+      for (const e of input)
+        window.removeEventListener(e, taken, { capture: true });
+      grown.disconnect();
+    };
   }, []);
   useLayoutEffect(() => {
     const prev = shown.current;
     // The same entry again: the boundary shown again, or StrictMode's re-run.
     if (prev?.key === location.key) return;
     shown.current = { key: location.key, path: location.pathname };
+    wanted.current = null;
     // An entry left in this session (one from before a reload opens as a link).
     const back = navigation === "POP" ? scrolled.get(location.key) : undefined;
-    if (back !== undefined) window.scrollTo(0, back);
-    else if (!prev || prev.path !== location.pathname || location.hash) {
+    if (back !== undefined) {
+      if (!reach(back))
+        wanted.current = { y: back, until: Date.now() + REACH_MS };
+    } else if (!prev || prev.path !== location.pathname || location.hash) {
       const target =
         location.hash && document.getElementById(location.hash.slice(1));
       const below = (header.current?.offsetHeight ?? 0) + 12;
@@ -318,10 +354,19 @@ function ScrollKeeper({ header }: { header: RefObject<HTMLElement | null> }) {
           : 0,
       );
     }
-    // Where it opened, in case it is left without a scroll.
-    scrolled.set(location.key, window.scrollY);
+    // Where it opened (or is to), in case it is left without a scroll.
+    scrolled.set(location.key, wanted.current?.y ?? window.scrollY);
   }, [location, navigation, header]);
   return null;
+}
+
+/** How long a returned-to entry's offset is tried again while its page grows. */
+const REACH_MS = 2000;
+
+/** Scrolls to `y`; false when the page is still too short to get there. */
+function reach(y: number) {
+  window.scrollTo(0, y);
+  return window.scrollY >= y - 1;
 }
 
 createRoot(document.getElementById("root")!).render(

@@ -820,7 +820,7 @@ export interface RoamEnd {
 export interface Roam {
   /** The later of the leave and the join. */
   ts: number;
-  /** The join's own report time: the client's attempt on `to.ap` at this time is this roam's join. */
+  /** The join's own report time: the client's association or attempt on `to.ap` that the server paired with the leave. */
   join_ts: number;
   client: Mac;
   from: Pick<RoamEnd, "ap" | "radio" | "rssi">;
@@ -1249,6 +1249,56 @@ const NAME_EVENTS = new Set(["ap_seen", "ap_adopted", "ap_forgotten", "config_ap
 const RF_EVENTS = new Set(["ap_scan_done", "channel_plan", "radio_changed"]);
 
 /**
+ * How long after queuing a write the server has committed it: its writer commits a write within ~1.25 s (a batch at most 1 s
+ * after its first write, checked every 250 ms). A stored row (an event, a log line, a dry-run result, an alert, a threat) is
+ * announced when queued, and a request like marking the alerts read answers then: a refetch sooner can miss the change, and
+ * nothing would fetch it again until the next message.
+ */
+export const STORED = 1500;
+
+/** What a socket's `watchdog` gives: call `heard()` for every frame, `stop()` once it is closed. */
+export interface Watchdog {
+  heard(): void;
+  stop(): void;
+}
+
+/**
+ * Watches an open socket of apctl's (the live one, a terminal) that a path which died without closing (a suspended laptop, a
+ * NAT that forgot it, a frozen phone tab) leaves open but silent. The server sends `{"type":"ping"}` with each of its pings
+ * (every 30 s, api.rs `PING`), so silence for longer than two of them means it is gone: `onDead` is called, once.
+ *
+ * Silence is measured on the wall clock (time asleep counts, which timers skip), checked every 15 s and as soon as the page
+ * is shown again or back online: after a sleep a dead socket is noticed at once.
+ */
+export function watchdog(onDead: () => void): Watchdog {
+  let lastHeard = Date.now();
+  const check = () => {
+    if (Date.now() - lastHeard <= 75_000) return;
+    stop();
+    onDead();
+  };
+  const shown = () => {
+    if (!document.hidden) check();
+  };
+  const timer = window.setInterval(check, 15_000);
+  document.addEventListener("visibilitychange", shown);
+  window.addEventListener("pageshow", check);
+  window.addEventListener("online", check);
+  const stop = () => {
+    window.clearInterval(timer);
+    document.removeEventListener("visibilitychange", shown);
+    window.removeEventListener("pageshow", check);
+    window.removeEventListener("online", check);
+  };
+  return {
+    heard() {
+      lastHeard = Date.now();
+    },
+    stop,
+  };
+}
+
+/**
  * Keeps queries fresh from the server's WebSocket: device and client changes
  * invalidate the cached lists, new events and logs refetch the lists whose
  * filters they match.
@@ -1267,8 +1317,8 @@ export function useLiveUpdates(): void {
     let dropped = false;
     let retry = 1000;
     let reconnectTimer: number | undefined;
-    // Set while a socket is open: it fires when the socket has said nothing for longer than two pings.
-    let quietTimer: number | undefined;
+    // Set while a socket is open.
+    let dog: Watchdog | undefined;
     let flushTimer: number | undefined;
     let flushAt = Infinity;
     // Waiting invalidations by key, each with the earliest time it may run.
@@ -1316,12 +1366,13 @@ export function useLiveUpdates(): void {
       schedule();
     };
     /**
-     * Invalidates (as above) each query in `family` on screen whose filter `matches`. The rest
+     * Invalidates (as above, `STORED` ms on: these are rows the server announces before it commits them) each query in `family`
+     * on screen whose filter `matches`. The rest
      * are only marked stale, all at once, so that they refetch when shown again.
      */
     const invalidateWhere = <F>(family: QueryKey, matches: (filter: F) => boolean, gap: number) => {
       for (const q of qc.getQueryCache().findAll({ queryKey: family, type: "active" })) {
-        if (matches((q.queryKey[1] ?? {}) as F)) invalidate(q.queryKey, gap);
+        if (matches((q.queryKey[1] ?? {}) as F)) invalidate(q.queryKey, gap, STORED);
       }
       void qc.invalidateQueries({ queryKey: family, type: "inactive", refetchType: "none" });
     };
@@ -1357,7 +1408,7 @@ export function useLiveUpdates(): void {
           invalidateWhere<EventFilter>(keys.events(), (f) => eventMatches(f, e), 2000);
           if (msg.kind === "dryrun_compared" || msg.kind === "settings_imported") {
             // Each AP pushed to records one, and every fetch renders and compares every AP's config: follow at most every 5 s.
-            invalidate(keys.dryrun(), 5000);
+            invalidate(keys.dryrun(), 5000, STORED);
           }
           if (msg.kind === "settings_changed" || msg.kind === "settings_imported") {
             // An editor keeps what it was opened with (it saves only the fields changed in it); the rest follows,
@@ -1373,7 +1424,7 @@ export function useLiveUpdates(): void {
             for (const key of [keys.rfPlan(), keys.rfRadios(), keys.rfNeighbors(), keys.rfLinks()]) invalidate(key, 5000);
           }
           if (msg.kind === "channel_plan") invalidate(keys.channelAi());
-          if (msg.kind === "network_threat") invalidate(keys.threats());
+          if (msg.kind === "network_threat") invalidate(keys.threats(), 0, STORED);
           // Connected, gone, roamed, renamed, blocked: its page shows it.
           if (msg.client_mac) invalidate(keys.client(msg.client_mac));
           if (msg.kind === "client_renamed") invalidate(keys.clientNames());
@@ -1388,8 +1439,7 @@ export function useLiveUpdates(): void {
           break;
         }
         case "alert":
-          // The server stores alerts within a second of announcing them: look then.
-          invalidate(keys.alerts(), 0, 1500);
+          invalidate(keys.alerts(), 0, STORED);
           // The notifier decides whether this browser shows it.
           window.dispatchEvent(new CustomEvent("apctl:alert", { detail: msg }));
           break;
@@ -1406,7 +1456,7 @@ export function useLiveUpdates(): void {
       ws = socket;
       let opened = false;
       const lost = (code: number) => {
-        window.clearTimeout(quietTimer);
+        dog?.stop();
         if (closed) return;
         // 1008 (policy): the server closed it because the session ended (logged out or expired). One that never opened may have
         // been refused for a session that ended while it was down (the browser hides the 401): /api/me tells.
@@ -1415,26 +1465,21 @@ export function useLiveUpdates(): void {
         reconnectTimer = window.setTimeout(connect, retry);
         retry = Math.min(retry * 2, 30_000);
       };
-      // A path that died without closing (a suspended laptop, a NAT that forgot it) leaves the socket open but silent:
-      // with the server's pings, silence for longer than two of them means it is gone, and it is dropped and opened again.
-      const heard = () => {
-        window.clearTimeout(quietTimer);
-        quietTimer = window.setTimeout(() => {
+      socket.onopen = () => {
+        opened = true;
+        retry = 1000;
+        // Gone without closing: dropped and opened again.
+        dog = watchdog(() => {
           socket.onclose = null;
           socket.onmessage = null;
           socket.close();
           lost(1006);
-        }, 75_000);
-      };
-      socket.onopen = () => {
-        opened = true;
-        retry = 1000;
-        heard();
+        });
         // Whatever changed while disconnected (e.g. during a restart) was never announced.
         if (dropped) refetchAll();
       };
       socket.onmessage = (m) => {
-        heard();
+        dog?.heard();
         onMessage(m);
       };
       socket.onclose = (e) => lost(e.code);
@@ -1444,7 +1489,7 @@ export function useLiveUpdates(): void {
       closed = true;
       ws?.close();
       window.clearTimeout(reconnectTimer);
-      window.clearTimeout(quietTimer);
+      dog?.stop();
       window.clearTimeout(flushTimer);
     };
   }, [qc]);

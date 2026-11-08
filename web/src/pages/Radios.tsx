@@ -43,8 +43,13 @@ function centre(
   width: number | null,
   radio: string | null,
 ): number {
-  if (radio === "ng" || channel <= 14)
-    return channel === 14 ? 2484 : 2407 + 5 * channel;
+  if (radio === "ng" || channel <= 14) {
+    if (channel === 14) return 2484;
+    const f = 2407 + 5 * channel;
+    // At 40 MHz the AP picks the side of the second channel: taken as above
+    // on 1–7 and below on 8–13, the usual choice and the only one at the ends.
+    return width && width > 20 ? f + (channel <= 7 ? 10 : -10) : f;
+  }
   const w = width && width > 20 ? width : 20;
   const group = w / 5;
   const base = channel >= 149 ? 149 : 36;
@@ -78,6 +83,7 @@ function Spectrum({ band, shapes }: { band: "ng" | "na"; shapes: Shape[] }) {
     pad.t +
     ((-20 - Math.max(-100, Math.min(-20, s))) / 80) * (H - pad.t - pad.b);
   const floor = H - pad.b;
+  const clip = `spectrum-plot-${band}`;
   // Quiet ones first, so the loud ones and our own APs are drawn on top.
   const sorted = [...shapes].sort(
     (a, b) => Number(a.own) - Number(b.own) || a.signal - b.signal,
@@ -89,6 +95,17 @@ function Spectrum({ band, shapes }: { band: "ng" | "na"; shapes: Shape[] }) {
       role="img"
       aria-label={`${bandName(band)} channel occupancy`}
     >
+      <defs>
+        {/* A block reaching past the axis stays out of the labels. */}
+        <clipPath id={clip}>
+          <rect
+            x={pad.l}
+            y={pad.t}
+            width={W - pad.l - pad.r}
+            height={floor - pad.t}
+          />
+        </clipPath>
+      </defs>
       {[-30, -50, -70, -90].map((s) => (
         <g key={s}>
           <line
@@ -119,27 +136,29 @@ function Spectrum({ band, shapes }: { band: "ng" | "na"; shapes: Shape[] }) {
           {c}
         </text>
       ))}
-      {sorted.map((s) => {
-        const half = s.width / 2;
-        const edge = Math.min(2, half / 4);
-        const pts = [
-          [x(s.freq - half), floor],
-          [x(s.freq - half + edge), y(s.signal)],
-          [x(s.freq + half - edge), y(s.signal)],
-          [x(s.freq + half), floor],
-        ]
-          .map((p) => p.join(","))
-          .join(" ");
-        return (
-          <polygon
-            key={s.key}
-            points={pts}
-            className={s.own ? "spectrum-shape own" : "spectrum-shape"}
-          >
-            <title>{`${s.label}: ${dbm(s.signal)}, ${s.width} MHz`}</title>
-          </polygon>
-        );
-      })}
+      <g clipPath={`url(#${clip})`}>
+        {sorted.map((s) => {
+          const half = s.width / 2;
+          const edge = Math.min(2, half / 4);
+          const pts = [
+            [x(s.freq - half), floor],
+            [x(s.freq - half + edge), y(s.signal)],
+            [x(s.freq + half - edge), y(s.signal)],
+            [x(s.freq + half), floor],
+          ]
+            .map((p) => p.join(","))
+            .join(" ");
+          return (
+            <polygon
+              key={s.key}
+              points={pts}
+              className={s.own ? "spectrum-shape own" : "spectrum-shape"}
+            >
+              <title>{`${s.label}: ${dbm(s.signal)}, ${s.width} MHz`}</title>
+            </polygon>
+          );
+        })}
+      </g>
     </svg>
   );
 }

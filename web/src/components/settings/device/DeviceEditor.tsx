@@ -101,6 +101,8 @@ export function DeviceEditor({
       // As in the official UI, the power goes only with custom power: the AP
       // reads it in any mode.
       if (after?.tx_power_mode !== "custom") delete c.tx_power;
+      // And the sensitivity level only with it fixed.
+      if (!after?.sens_level_enabled) delete c.sens_level;
       return Object.keys(c).length ? { radio: x.radio, ...c } : null;
     })
     .filter(Boolean);
