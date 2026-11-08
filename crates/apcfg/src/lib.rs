@@ -572,8 +572,50 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    /// The render's sources, for the tests that check which fields they read.
-    const SOURCES: [&str; 6] = [include_str!("lib.rs"), include_str!("mgmt.rs"), include_str!("net.rs"), include_str!("system.rs"), include_str!("wlan.rs"), include_str!("meta.rs")];
+    /// The code without its test modules (`#[cfg(test)]` then a `mod`, each running to the next
+    /// `}` at the start of a line). A test-only item elsewhere (a helper in an `impl`) is kept:
+    /// skipping it would skip the shipped code after it too, and a read there needs the key anyway.
+    fn shipped(src: &str) -> String {
+        const TEST: &str = "#[cfg(test)]";
+        let (mut rest, mut code) = (src, String::new());
+        while let Some(at) = rest.find(TEST) {
+            let after = &rest[at + TEST.len()..];
+            if after.trim_start().trim_start_matches("pub(crate) ").starts_with("mod ") {
+                code.push_str(&rest[..at]);
+                rest = rest[at..].find("\n}\n").map_or("", |end| &rest[at + end..]);
+            } else {
+                code.push_str(&rest[..at + TEST.len()]);
+                rest = after;
+            }
+        }
+        code + rest
+    }
+
+    /// The shipped code of every source file of the crate, for the tests that check which
+    /// fields the render reads, so a read in a new file is checked too.
+    fn sources() -> Vec<String> {
+        let mut dirs = vec![std::path::PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/src"))];
+        let mut sources = Vec::new();
+        while let Some(dir) = dirs.pop() {
+            for path in std::fs::read_dir(dir).unwrap().map(|e| e.unwrap().path()) {
+                if path.is_dir() {
+                    dirs.push(path);
+                } else if path.extension().is_some_and(|x| x == "rs") {
+                    sources.push(shipped(&std::fs::read_to_string(path).unwrap()));
+                }
+            }
+        }
+        sources
+    }
+
+    #[test]
+    fn the_guards_scan_every_file_without_its_test_modules() {
+        let sample = "impl A {\n    #[cfg(test)]\n    fn t() {}\n    fn f() { setting(s, \"a\") }\n}\n#[cfg(test)]\nmod tests {\n    fn g() { setting(s, \"b\") }\n}\n";
+        assert!(shipped(sample).contains("\"a\"") && !shipped(sample).contains("\"b\""), "{}", shipped(sample));
+        let sources = sources();
+        assert!(sources.len() >= 11, "lib.rs, the modules and tz/zones.rs: {}", sources.len());
+        assert!(sources.iter().any(|s| s.contains("fn blackout_blocks(")) && !sources.iter().any(|s| s.contains("fn blocks_cover_the_day_an_entry_ends_on(")));
+    }
 
     #[test]
     fn ssid_features_follow_the_capability_bits() {
@@ -601,8 +643,9 @@ mod tests {
     /// import that keeps those loses nothing a render needs.
     #[test]
     fn device_keys_cover_every_field_read() {
+        let sources = sources();
         let mut read: Vec<&str> = CAP_KEYS.to_vec();
-        for src in SOURCES {
+        for src in &sources {
             for pattern in ["ctx.device, \"", "ctx.device.get(\"", "(device, \"", "(gw, \""] {
                 for (at, _) in src.match_indices(pattern) {
                     let rest = &src[at + pattern.len()..];
@@ -621,9 +664,9 @@ mod tests {
     /// and site) is in `SETTING_KEYS`.
     #[test]
     fn setting_keys_cover_every_setting_read() {
+        let sources = sources();
         let mut read: Vec<&str> = Vec::new();
-        for src in SOURCES {
-            let src = src.split("#[cfg(test)]").next().unwrap();
+        for src in &sources {
             for pattern in [".setting(\"", "setting(state, site_id, \""] {
                 for (at, _) in src.match_indices(pattern) {
                     let rest = &src[at + pattern.len()..];
@@ -642,9 +685,9 @@ mod tests {
     /// those loses nothing a render needs.
     #[test]
     fn collections_cover_every_collection_read() {
+        let sources = sources();
         let mut read: Vec<&str> = Vec::new();
-        for src in SOURCES {
-            let src = src.split("#[cfg(test)]").next().unwrap();
+        for src in &sources {
             for pattern in ["site_docs(\"", "site_docs(state, site_id, \"", "arr(state, \"", "arr(ctx.state, \""] {
                 for (at, _) in src.match_indices(pattern) {
                     let rest = &src[at + pattern.len()..];
@@ -666,10 +709,9 @@ mod tests {
     #[test]
     fn inform_inputs_cover_every_field_read() {
         let known = |k: &str| INFORM_KEYS.contains(&k) || INFORM_TABLE_KEYS.iter().any(|(t, f)| *t == k || *f == k);
+        let sources = sources();
         let mut read: Vec<&str> = CAP_KEYS.to_vec();
-        for src in SOURCES {
-            // Not the tests: their own patterns would match.
-            let src = src.split("#[cfg(test)]").next().unwrap();
+        for src in &sources {
             for (at, _) in src.match_indices("inform_str(\"") {
                 let rest = &src[at + "inform_str(\"".len()..];
                 read.push(&rest[..rest.find('"').unwrap()]);
