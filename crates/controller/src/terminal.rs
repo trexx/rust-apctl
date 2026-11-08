@@ -58,7 +58,7 @@ pub struct Size {
     rows: Option<u32>,
 }
 
-/// A text frame from the page: its size, or `{"pause":true}` while it shows
+/// A text frame from the page: its size (both, else the frame is ignored), or `{"pause":true}` while it shows
 /// what it was sent so far and `{"pause":false}` once it has. While paused, the
 /// AP's output waits in the SSH session's buffer, and once that is full the
 /// session with it (what is typed too), unless the page's frames wait for the
@@ -290,11 +290,12 @@ async fn bridge(socket: &mut WebSocket, s: &AppState, mac: Mac, t: Target, size:
                     }
                     Some(Ok(Message::Text(text))) => match serde_json::from_str::<Said>(&text) {
                         Ok(Said { pause: Some(pause), .. }) => paused = pause,
-                        Ok(Said { size, .. }) => {
+                        // Left out, a size is unchanged, not the opening query's 80×24.
+                        Ok(Said { size: size @ Size { cols: Some(_), rows: Some(_) }, .. }) => {
                             let (cols, rows) = size.clamped();
                             let _ = queue.try_send(ToAp::Size(cols, rows));
                         }
-                        Err(_) => {}
+                        _ => {}
                     },
                     Some(Ok(Message::Close(_)) | Err(_)) | None => break End::Gone,
                     _ => {}
@@ -576,6 +577,12 @@ mod tests {
         assert!(held.is_err(), "nothing while paused");
         from_page(&mut tcp, 1, br#"{"pause":false}"#).await;
         assert_eq!(frame(&mut tcp).await, (2, b"Y".to_vec()));
+        // Neither a pause nor a whole size: nothing changes.
+        for said in [&br#"{"cols":90}"#[..], br#"{"rows":20}"#, b"{}", br#"{"pause":null}"#, b"[]"] {
+            from_page(&mut tcp, 1, said).await;
+        }
+        from_page(&mut tcp, 2, b"z").await;
+        assert_eq!(frame(&mut tcp).await, (2, b"Z".to_vec()));
         assert_eq!(rig.shell.sizes.lock().unwrap().len(), 2, "no resize");
         // The shell exits: a normal close, saying so.
         from_page(&mut tcp, 2, b"exit\r").await;
