@@ -36,7 +36,7 @@ pub fn decode_packet(pkt: Packet<'_>, keys: &KeyStore) -> Result<Decoded> {
     // "No known key" only when that is what failed: a GCM packet its key opened, or an
     // unencrypted one, can still fail on its body.
     let (key, _, payload) = open_with(&pkt, device.map(|k| (KeyUsed::Device, *k)).into_iter().chain([last])).map_err(|e| {
-        let what = if matches!(e.downcast_ref(), Some(inform::Error::Decrypt)) { "no known key decrypts" } else { "cannot open" };
+        let what = if is_decrypt(&e) { "no known key decrypts" } else { "cannot open" };
         e.context(format!("{what} the packet from {} (flags {:?})", pkt.header.mac, flags))
     })?;
     Ok(Decoded { header: pkt.header, key, payload })
@@ -47,6 +47,17 @@ pub fn decode_packet(pkt: Packet<'_>, keys: &KeyStore) -> Result<Decoded> {
 /// does neither, so a wrong key can decrypt to garbage.
 pub fn authenticated(flags: Flags) -> bool {
     !flags.contains(Flags::ENCRYPTED) || flags.contains(Flags::GCM)
+}
+
+/// Whether opening failed on the key: the packet did not decrypt.
+pub fn is_decrypt(e: &anyhow::Error) -> bool {
+    matches!(e.downcast_ref(), Some(inform::Error::Decrypt))
+}
+
+/// Of two failures opening one CBC packet with keys in turn, the one to report: the
+/// first if it got past decryption (a wrong key can get that far too), else `then`.
+pub fn past_decryption(first: Option<anyhow::Error>, then: anyhow::Error) -> anyhow::Error {
+    first.filter(|f| !is_decrypt(f)).unwrap_or(then)
 }
 
 /// Opens a packet with each of `keys` in turn and parses the plaintext as JSON. The
@@ -67,19 +78,13 @@ pub fn open_with(pkt: &Packet<'_>, keys: impl IntoIterator<Item = (KeyUsed, [u8;
                 Ok(payload) => return Ok((used, key, payload)),
                 Err(e) => anyhow::anyhow!("decrypted payload is not JSON: {e}"),
             },
-            Err(inform::Error::Decrypt) => {
-                err.get_or_insert_with(|| inform::Error::Decrypt.into());
-                continue;
-            }
             Err(e) => e.into(),
         };
-        if authenticated {
+        // Past decryption, AES-GCM's key is the answer; CBC's first such failure is kept.
+        if authenticated && !is_decrypt(&e) {
             return Err(e);
         }
-        // CBC: a wrong key can get this far too; the first such failure is kept.
-        if err.as_ref().is_none_or(|e: &anyhow::Error| matches!(e.downcast_ref(), Some(inform::Error::Decrypt))) {
-            err = Some(e);
-        }
+        err = Some(past_decryption(err, e));
     }
     Err(err.unwrap_or_else(|| anyhow::anyhow!("no key to try")))
 }
