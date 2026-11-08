@@ -45,6 +45,8 @@ export function PlanActions({
   const { busy, msg, run } = useRun();
   if (!canEdit || !ai.data) return null;
   const scanning = ai.data.scans.filter((s) => s.band === band);
+  // A run scans each band itself, and the server refuses a scan meanwhile.
+  const running = ai.data.running;
   const changes = (plan?.plan ?? [])
     .filter((p) => p.change)
     .map((p) => ({
@@ -58,8 +60,12 @@ export function PlanActions({
       <div className="actions-row">
         <button
           className="btn small"
-          disabled={!active || busy || scanning.length > 0}
-          title="Each AP briefly listens on every channel of this band"
+          disabled={!active || busy || running || scanning.length > 0}
+          title={
+            running
+              ? "Channel AI is running: it scans each band itself"
+              : "Each AP briefly listens on every channel of this band"
+          }
           onClick={() =>
             void run(
               async () =>
@@ -69,7 +75,9 @@ export function PlanActions({
         >
           {scanning.length > 0
             ? `Scanning (${scanning.length} APs)…`
-            : "Scan now"}
+            : running
+              ? "Channel AI is running…"
+              : "Scan now"}
         </button>
         <button
           className="btn small primary"
