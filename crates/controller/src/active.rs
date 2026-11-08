@@ -34,7 +34,7 @@ use rusqlite::types::Value as Sql;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
-use wire::decode::{KeyUsed, authenticated, open_with};
+use wire::decode::{KeyUsed, authenticated, is_decrypt, open_with, past_decryption};
 use wire::keys::KeyStore;
 
 use crate::clock;
@@ -604,7 +604,7 @@ impl Active {
         }
         let permit = self.strangers.enter(body.len()).await.ok_or(Unopened::Busy)?;
         // As `open_with` reports for CBC: the first failure past decryption, if any.
-        decode(body, KeyUsed::Default, DEFAULT_KEY, permit).await.map_err(|e| Unopened::Bad(first.filter(|f| !is_decrypt(f)).unwrap_or(e)))
+        decode(body, KeyUsed::Default, DEFAULT_KEY, permit).await.map_err(|e| Unopened::Bad(past_decryption(first, e)))
     }
 }
 
@@ -621,11 +621,6 @@ async fn decode(body: Bytes, used: KeyUsed, key: [u8; 16], permit: OwnedSemaphor
     let opened = blocking(permit, move || Packet::parse(&body).map_err(anyhow::Error::from).and_then(|pkt| open_with(&pkt, [(used, key)])));
     let (result, permit) = opened.await?;
     result.map(|(used, key, payload)| (used, key, payload, permit))
-}
-
-/// Whether opening failed on the key: the packet did not decrypt.
-fn is_decrypt(e: &anyhow::Error) -> bool {
-    matches!(e.downcast_ref(), Some(inform::Error::Decrypt))
 }
 
 /// A managed AP that informed with its own key less than this long ago is not

@@ -132,10 +132,7 @@ fn site_syslog(doc: &mut Value, r: &Value) -> Result<(), String> {
         None => {}
         Some("off") => {
             doc["enabled"] = json!(false);
-            doc["this_controller"] = json!(false);
             doc["log_all_contents"] = json!(true);
-            doc["debug"] = json!(false);
-            doc["netconsole_enabled"] = json!(false);
         }
         Some("controller") => {
             doc["enabled"] = json!(true);
@@ -149,6 +146,13 @@ fn site_syslog(doc: &mut Value, r: &Value) -> Result<(), String> {
             doc["log_all_contents"] = json!(true);
         }
         Some(_) => return Err("the syslog mode must be off, controller or server".into()),
+    }
+    // Off as the official UI saves it, read from the result whatever the patch named
+    // (the render, as the official's, sends netconsole with syslog off too).
+    if !flag(doc, "enabled", false) {
+        for k in ["this_controller", "debug", "netconsole_enabled"] {
+            doc[k] = json!(false);
+        }
     }
     doc["this_controller_encrypted_only"] = json!(false);
     // The syslog server and the netconsole host: an IPv4 address or a name, as a time server.
@@ -173,7 +177,7 @@ fn site_syslog(doc: &mut Value, r: &Value) -> Result<(), String> {
 
 /// The APs' time servers (`ntp`).
 fn site_ntp(doc: &mut Value, n: &Value) -> Result<(), String> {
-    let was_manual = doc["setting_preference"].as_str() == Some("manual");
+    let was_manual = reads_manual(doc);
     copy_fields(n, doc, &[("setting_preference", Enum(&["auto", "manual"]))])?;
     // The servers named, checked whatever the mode.
     let mut named: [Option<&str>; 4] = [None; 4];
@@ -182,6 +186,11 @@ fn site_ntp(doc: &mut Value, n: &Value) -> Result<(), String> {
         if let Some(h) = h.filter(|h| !h.is_empty() && !is_ntp_server(h)) {
             return Err(format!("{h} is not a host name or IPv4 address"));
         }
+    }
+    // Servers named on a list that reads as manual (one imported with another preference)
+    // are edited as manual, as the form shows it, when the patch names no preference.
+    if was_manual && n["setting_preference"].is_null() && named.iter().any(Option::is_some) {
+        doc["setting_preference"] = json!("manual");
     }
     if doc["setting_preference"].as_str() == Some("auto") {
         // Automatic is the pool, as the official controller restores it on going back to
@@ -218,23 +227,30 @@ fn site_ntp(doc: &mut Value, n: &Value) -> Result<(), String> {
     Ok(())
 }
 
+/// Whether the `ntp` setting reads as manual: stored so, or holding servers other than
+/// the pool whatever its preference (an import's), which the render sends all the same.
+fn reads_manual(n: &Value) -> bool {
+    let servers = NTP_KEYS.map(|k| n[k].as_str().unwrap_or_default());
+    n["setting_preference"].as_str() == Some("manual") || servers != NTP_POOL && servers.iter().any(|h| !h.trim().is_empty())
+}
+
 /// SNMP v1/v2c and v3 (`snmp`).
 fn site_snmp(doc: &mut Value, sn: &Value, notes: &mut Vec<String>) -> Result<(), String> {
     copy_fields(sn, doc, &[("enabled", Bool), ("enabledV3", Bool)])?;
     if let Some(c) = str_field(sn, "community")? {
-        if c.is_empty() || c.len() > 256 || c.contains(char::is_whitespace) {
+        if c.is_empty() || c.chars().count() > 256 || c.contains(char::is_whitespace) {
             return Err("the SNMP community must be 1 to 256 characters without spaces".into());
         }
         doc["community"] = json!(c);
     }
     if let Some(u) = str_field(sn, "username")?.map(str::trim) {
-        if !(1..=30).contains(&u.len()) {
-            return Err("the SNMPv3 user name must be 1 to 30 characters".into());
+        if !(1..=30).contains(&u.len()) || !u.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-')) {
+            return Err("the SNMPv3 user name must be 1 to 30 letters, digits, '_' or '-'".into());
         }
         doc["username"] = json!(u);
     }
     if let Some(pw) = str_field(sn, "x_password")? {
-        if !(8..=32).contains(&pw.len()) || pw.contains(['"', '\'']) {
+        if !(8..=32).contains(&pw.chars().count()) || pw.contains(['"', '\'']) {
             return Err("the SNMPv3 password must be 8 to 32 characters without quotes".into());
         }
         doc["x_password"] = json!(pw);
@@ -374,11 +390,9 @@ fn site_view(state: &Value, secrets: bool) -> Value {
     });
     let n = setting(state, "ntp");
     let mut ntp = Value::Object(pick(n, &NTP_KEYS));
-    // The APs get the stored servers whatever the preference says: servers other than the
-    // pool read as manual, so the form shows what the APs use.
-    let servers = NTP_KEYS.map(|k| n[k].as_str().unwrap_or_default());
-    let custom = servers != NTP_POOL && servers.iter().any(|h| !h.trim().is_empty());
-    ntp["setting_preference"] = if custom && n["setting_preference"].as_str() != Some("manual") { json!("manual") } else { n["setting_preference"].clone() };
+    // The render sends the stored servers whatever the preference says (but for those it
+    // can't use, as an imported IPv6 one): a list other than the pool shows as manual.
+    ntp["setting_preference"] = if reads_manual(n) { json!("manual") } else { n["setting_preference"].clone() };
     let sn = setting(state, "snmp");
     let community = if secrets { json!(sn["community"].as_str().unwrap_or("public")) } else { Value::Null };
     let snmp = json!({
@@ -549,6 +563,16 @@ mod tests {
         setting_mut(&mut s, "snmp")["community"] = json!("");
         assert!(edit(&mut s, json!({ "snmp": { "enabled": true } })).unwrap_err().contains("needs a community"));
         edit(&mut s, json!({ "snmp": { "enabled": true, "community": "c0mmunity" } })).unwrap();
+        // The community and v3 password are counted in characters, as the render and the official count them.
+        edit(&mut s.clone(), json!({ "snmp": { "community": "é".repeat(256) } })).unwrap();
+        assert!(edit(&mut s.clone(), json!({ "snmp": { "community": "é".repeat(257) } })).is_err());
+        edit(&mut s.clone(), json!({ "snmp": { "x_password": "é".repeat(32) } })).unwrap();
+        assert!(edit(&mut s.clone(), json!({ "snmp": { "x_password": "é".repeat(33) } })).is_err());
+        // The v3 user name is the official's: 1 to 30 letters, digits, '_' or '-'.
+        for bad in ["mon itor", "mon@lab", "ops\"x", "mön", "m".repeat(31).as_str()] {
+            assert!(edit(&mut s, json!({ "snmp": { "username": bad } })).unwrap_err().contains("letters, digits"), "{bad}");
+        }
+        edit(&mut s.clone(), json!({ "snmp": { "username": "-mon_1" } })).unwrap();
         assert!(edit(&mut s, json!({ "snmp": { "enabledV3": true, "username": "mon" } })).unwrap_err().contains("password"));
         assert!(edit(&mut s, json!({ "snmp": { "enabledV3": true, "username": "mon", "x_password": "short" } })).is_err());
         assert!(edit(&mut s, json!({ "snmp": { "enabledV3": true, "username": "mon", "x_password": "pass\tword1" } })).unwrap_err().contains("control characters"));
@@ -610,6 +634,15 @@ mod tests {
         assert_eq!(off, [Some(false), Some(false), Some(false), Some(false), Some(false), Some(true)]);
         assert_eq!((r["ip"].as_str(), r["netconsole_host"].as_str()), (Some("logs.example.net"), Some("192.0.2.9")), "the hosts are kept for going back");
         assert_eq!(site_view(&s, false)["rsyslogd"]["mode"], "off");
+        // A patch naming no mode on a document stored Off leaves it Off, companions and all.
+        edit(&mut s, json!({ "rsyslogd": { "netconsole_enabled": true, "netconsole_host": "192.0.2.10", "debug": true } })).unwrap();
+        let r = setting(&s, "rsyslogd");
+        assert_eq!(["enabled", "this_controller", "debug", "netconsole_enabled"].map(|k| r[k].as_bool()), [Some(false); 4]);
+        assert_eq!(r["netconsole_host"], "192.0.2.10");
+        // Stored Off with netconsole on (an import): unticking it alone is accepted.
+        setting_mut(&mut s, "rsyslogd")["netconsole_enabled"] = json!(true);
+        edit(&mut s, json!({ "rsyslogd": { "netconsole_enabled": false } })).unwrap();
+        assert_eq!(setting(&s, "rsyslogd")["netconsole_enabled"], false);
 
         assert!(edit(&mut s, json!({ "ntp": { "setting_preference": "manual" } })).is_err());
         edit(&mut s, json!({ "ntp": { "setting_preference": "manual", "ntp_server_1": "time.example.net", "ntp_server_2": "", "ntp_server_3": "192.0.2.1" } })).unwrap();
@@ -652,6 +685,28 @@ mod tests {
             assert_eq!(servers(&s), NTP_POOL);
             assert_eq!(site_view(&s, false)["ntp"]["setting_preference"], "auto");
         }
+    }
+
+    #[test]
+    fn a_partial_patch_edits_an_imported_custom_list_as_the_view_shows_it() {
+        let servers = |s: &Value| NTP_KEYS.map(|k| setting(s, "ntp")[k].as_str().unwrap_or("?").to_string());
+        for pref in [Value::Null, json!("auto")] {
+            let mut s = state();
+            let n = setting_mut(&mut s, "ntp");
+            for (k, v) in NTP_KEYS.iter().zip([json!("a.example.net"), json!("b.example.net"), json!("c.example.net"), json!("")]) {
+                n[*k] = v;
+            }
+            n["setting_preference"] = pref.clone();
+            assert_eq!(site_view(&s, false)["ntp"]["setting_preference"], "manual", "{pref}");
+            // The servers not named are kept, and the list is saved as manual.
+            edit(&mut s, json!({ "ntp": { "ntp_server_2": "x.example.net" } })).unwrap();
+            assert_eq!(servers(&s), ["a.example.net", "x.example.net", "c.example.net", ""], "{pref}");
+            assert_eq!(setting(&s, "ntp")["setting_preference"], "manual");
+        }
+        // The pool stored as automatic stays so, and still refuses other servers.
+        let mut s = state();
+        edit(&mut s, json!({ "ntp": { "setting_preference": "auto" } })).unwrap();
+        assert!(edit(&mut s, json!({ "ntp": { "ntp_server_2": "x.example.net" } })).unwrap_err().contains("only with manual"));
     }
 
     #[test]

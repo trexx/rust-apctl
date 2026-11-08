@@ -18,16 +18,10 @@ pub fn ensure_default_usergroup(state: &mut Value) -> String {
     if let Some(id) = default_usergroup(state) {
         return id;
     }
-    let doc = new_default_usergroup(state);
-    let id = id_of(&doc).unwrap_or_default();
-    push_doc(state, "usergroup", doc);
+    // With the id SSIDs point at, else a new one.
+    let id = orphan_usergroup_id(state).map_or_else(new_id, str::to_string);
+    push_doc(state, "usergroup", default_usergroup_doc(&id));
     id
-}
-
-/// The default user group as [`ensure_default_usergroup`] adds it (but for
-/// its `site_id`): with the id SSIDs point at ([`orphan_usergroup_id`]), else a new one.
-fn new_default_usergroup(state: &Value) -> Value {
-    default_usergroup_doc(&orphan_usergroup_id(state).map_or_else(new_id, str::to_string))
 }
 
 /// The default user group's document, with this id.

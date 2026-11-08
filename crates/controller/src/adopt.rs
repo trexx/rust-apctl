@@ -32,8 +32,10 @@ use crate::settings::doc_mac;
 
 /// How long an AP has to come back with its new key.
 pub const ADOPT_TIMEOUT: Ts = 300;
-/// How long a forgotten AP has to report once more (and reset itself).
-pub const FORGET_TIMEOUT: Ts = 90;
+/// How long a forgotten AP has to report once more (and reset itself): the longest
+/// inform interval apctl asks for, twice (one inform may be missed), and 30 s for the
+/// spawn loop's tick and a late inform; under the engine's offline limit of 4 intervals.
+pub const FORGET_TIMEOUT: Ts = 2 * crate::active::MAX_INFORM_INTERVAL + 30;
 /// At most this many pending APs are listed (the official controller's default).
 const MAX_PENDING: usize = 100;
 /// At most this many of them from one address (an IPv6 /64): anyone can send
@@ -655,6 +657,12 @@ mod tests {
         drop(claim);
         assert!(!live.read().unwrap().adoption.starting.contains(&ap));
         assert!(Claim::take(&live, ap).is_ok());
+    }
+
+    #[test]
+    fn a_forgotten_ap_may_miss_an_inform_before_its_forget_is_finished() {
+        let longest = crate::active::MAX_INFORM_INTERVAL;
+        assert!(FORGET_TIMEOUT > 2 * longest && FORGET_TIMEOUT < longest * crate::engine::OFFLINE_INTERVALS, "{FORGET_TIMEOUT}");
     }
 
     #[tokio::test]
