@@ -177,7 +177,7 @@ fn site_syslog(doc: &mut Value, r: &Value) -> Result<(), String> {
 
 /// The APs' time servers (`ntp`).
 fn site_ntp(doc: &mut Value, n: &Value) -> Result<(), String> {
-    let was_manual = doc["setting_preference"].as_str() == Some("manual");
+    let was_manual = reads_manual(doc);
     copy_fields(n, doc, &[("setting_preference", Enum(&["auto", "manual"]))])?;
     // The servers named, checked whatever the mode.
     let mut named: [Option<&str>; 4] = [None; 4];
@@ -186,6 +186,11 @@ fn site_ntp(doc: &mut Value, n: &Value) -> Result<(), String> {
         if let Some(h) = h.filter(|h| !h.is_empty() && !is_ntp_server(h)) {
             return Err(format!("{h} is not a host name or IPv4 address"));
         }
+    }
+    // Servers named on a list that reads as manual (one imported with another preference)
+    // are edited as manual, as the form shows it, when the patch names no preference.
+    if was_manual && n["setting_preference"].is_null() && named.iter().any(Option::is_some) {
+        doc["setting_preference"] = json!("manual");
     }
     if doc["setting_preference"].as_str() == Some("auto") {
         // Automatic is the pool, as the official controller restores it on going back to
@@ -220,6 +225,13 @@ fn site_ntp(doc: &mut Value, n: &Value) -> Result<(), String> {
         return Err("manual NTP needs at least one server".into());
     }
     Ok(())
+}
+
+/// Whether the `ntp` setting reads as manual: stored so, or holding servers other than
+/// the pool whatever its preference (an import's), which the render sends all the same.
+fn reads_manual(n: &Value) -> bool {
+    let servers = NTP_KEYS.map(|k| n[k].as_str().unwrap_or_default());
+    n["setting_preference"].as_str() == Some("manual") || servers != NTP_POOL && servers.iter().any(|h| !h.trim().is_empty())
 }
 
 /// SNMP v1/v2c and v3 (`snmp`).
@@ -378,11 +390,9 @@ fn site_view(state: &Value, secrets: bool) -> Value {
     });
     let n = setting(state, "ntp");
     let mut ntp = Value::Object(pick(n, &NTP_KEYS));
-    // The APs get the stored servers whatever the preference says: servers other than the
-    // pool read as manual, so the form shows what the APs use.
-    let servers = NTP_KEYS.map(|k| n[k].as_str().unwrap_or_default());
-    let custom = servers != NTP_POOL && servers.iter().any(|h| !h.trim().is_empty());
-    ntp["setting_preference"] = if custom && n["setting_preference"].as_str() != Some("manual") { json!("manual") } else { n["setting_preference"].clone() };
+    // The render sends the stored servers whatever the preference says (but for those it
+    // can't use, as an imported IPv6 one): a list other than the pool shows as manual.
+    ntp["setting_preference"] = if reads_manual(n) { json!("manual") } else { n["setting_preference"].clone() };
     let sn = setting(state, "snmp");
     let community = if secrets { json!(sn["community"].as_str().unwrap_or("public")) } else { Value::Null };
     let snmp = json!({
@@ -675,6 +685,28 @@ mod tests {
             assert_eq!(servers(&s), NTP_POOL);
             assert_eq!(site_view(&s, false)["ntp"]["setting_preference"], "auto");
         }
+    }
+
+    #[test]
+    fn a_partial_patch_edits_an_imported_custom_list_as_the_view_shows_it() {
+        let servers = |s: &Value| NTP_KEYS.map(|k| setting(s, "ntp")[k].as_str().unwrap_or("?").to_string());
+        for pref in [Value::Null, json!("auto")] {
+            let mut s = state();
+            let n = setting_mut(&mut s, "ntp");
+            for (k, v) in NTP_KEYS.iter().zip([json!("a.example.net"), json!("b.example.net"), json!("c.example.net"), json!("")]) {
+                n[*k] = v;
+            }
+            n["setting_preference"] = pref.clone();
+            assert_eq!(site_view(&s, false)["ntp"]["setting_preference"], "manual", "{pref}");
+            // The servers not named are kept, and the list is saved as manual.
+            edit(&mut s, json!({ "ntp": { "ntp_server_2": "x.example.net" } })).unwrap();
+            assert_eq!(servers(&s), ["a.example.net", "x.example.net", "c.example.net", ""], "{pref}");
+            assert_eq!(setting(&s, "ntp")["setting_preference"], "manual");
+        }
+        // The pool stored as automatic stays so, and still refuses other servers.
+        let mut s = state();
+        edit(&mut s, json!({ "ntp": { "setting_preference": "auto" } })).unwrap();
+        assert!(edit(&mut s, json!({ "ntp": { "ntp_server_2": "x.example.net" } })).unwrap_err().contains("only with manual"));
     }
 
     #[test]
