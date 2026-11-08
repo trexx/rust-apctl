@@ -54,6 +54,11 @@ jobs:
     with:
       images: 'ghcr.io/${{ github.repository }}-capture'
       target: 'capture'
+      # Its own title and description: the generated ones are the repository's (apctl's),
+      # and ghcr shows the description on the package page.
+      labels: |
+        org.opencontainers.image.title=rust-apctl-capture
+        org.opencontainers.image.description=tcpdump sidecar for apctl's shadow mode, writing pcap into a FIFO
       # The package is not named after the repository, which pruning assumes.
       prune_images: false
 

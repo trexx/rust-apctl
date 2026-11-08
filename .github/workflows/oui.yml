@@ -59,6 +59,11 @@ jobs:
     with:
       context: '{{defaultContext}}:oui'
       images: 'ghcr.io/${{ github.repository }}-oui'
+      # Its own title and description: the generated ones are the repository's (apctl's),
+      # and ghcr shows the description on the package page.
+      labels: |
+        org.opencontainers.image.title=rust-apctl-oui
+        org.opencontainers.image.description=The IEEE manufacturer list (MAC address prefixes and names) as one file, /oui.csv, for apctl's image build
       # The time too: a second list the same day gets a tag of its own, and every
       # published list keeps one.
       tags: |
