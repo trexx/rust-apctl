@@ -1005,7 +1005,8 @@ fn schedule(c: &mut Cfg, w: &Value, k: Prefix, invert: bool, multi: bool) {
         let blocks: Cow<[(i64, i64)]> = if invert {
             Cow::Borrowed(blocks)
         } else {
-            // The gaps between blackouts.
+            // The gaps between blackouts. A blackout ending at 23:59 runs to the end of
+            // the day, as the official reads it (both are 2359), so no 2359-2359 block.
             let mut on = Vec::new();
             let mut from = 0;
             for (s, e) in blocks {
@@ -1014,7 +1015,7 @@ fn schedule(c: &mut Cfg, w: &Value, k: Prefix, invert: bool, multi: bool) {
                 }
                 from = *e;
             }
-            if from < 1440 {
+            if from < 1439 {
                 on.push((from, 1440));
             }
             Cow::Owned(on)
@@ -1118,6 +1119,17 @@ mod tests {
         assert!(l.contains(&"wireless.1.schedule_sun.0=0000-2359".to_string()), "a day without blackout is on all day");
         assert!(!l.iter().any(|x| x.contains("schedule_fri")), "a whole-day blackout has no on time");
         assert!(l.contains(&"wireless.1.schedule_tue.0=0000-2359".to_string()), "the 0000-0000 block from Monday changes nothing");
+        // A blackout until 23:59 (the editor's "until 23:59") ends the day as one until midnight does.
+        let w = json!({ "schedule_with_duration": [
+            { "start_days_of_week": ["mon"], "start_hour": 22, "start_minute": 0, "duration_minutes": 119 },
+            { "start_days_of_week": ["wed"], "start_hour": 23, "start_minute": 59, "duration_minutes": 0 },
+            { "start_days_of_week": ["fri"], "start_hour": 0, "start_minute": 0, "duration_minutes": 1439 },
+        ]});
+        let l = lines(&w, false, true);
+        assert_eq!(l.iter().filter(|x| x.contains("schedule_mon")).collect::<Vec<_>>(), ["wireless.1.schedule_mon.0=0000-2200"]);
+        assert_eq!(l.iter().filter(|x| x.contains("schedule_wed")).collect::<Vec<_>>(), ["wireless.1.schedule_wed.0=0000-2359"]);
+        assert!(!l.iter().any(|x| x.contains("schedule_fri")), "0000 to 23:59 has no on time: {l:?}");
+        assert!(!l.iter().any(|x| x.ends_with("=2359-2359")), "{l:?}");
         // An entry ending at midnight gives the next day a 0000-0000 block, as the official sends.
         let w = json!({ "schedule_with_duration": [{ "start_days_of_week": ["mon"], "start_hour": 23, "start_minute": 0, "duration_minutes": 60 }] });
         let b = blackout_blocks(&w);

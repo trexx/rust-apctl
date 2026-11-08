@@ -3,9 +3,14 @@
 //!
 //! The output follows the official UniFi Network Application (10.6.x) line for line,
 //! including key order, section comments and duplicate keys, so a rendered config can be
-//! compared byte for byte with a captured one. The input is a snapshot of the official
-//! controller's settings (the shape of `informdump import`, with the collections in
-//! [`COLLECTIONS`]) plus the AP's latest inform for its capability bits.
+//! compared byte for byte with a captured one. The one deliberate exception: for an AP
+//! without the schedule invert capability, a blackout running to the end of the day
+//! makes the official write that day's last on-time line twice; it is written once here
+//! (`wlan::schedule`).
+//!
+//! The input is a snapshot of the official controller's settings (the shape of
+//! `informdump import`, with the collections in [`COLLECTIONS`]) plus the AP's latest
+//! inform for its capability bits.
 //!
 //! No I/O happens here. Anything random (the `cfgversion` token, password hashes) is an
 //! input.

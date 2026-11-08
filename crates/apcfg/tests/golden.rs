@@ -163,6 +163,21 @@ fn schedules_reach_the_vaps() {
     // The fixture APs report both capabilities: inverted blocks, one key per block.
     assert!(cfg.contains(".schedule_invert=enabled"), "{cfg}");
     assert!(cfg.contains(".schedule_mon.0=0100-0600"));
+
+    // Without the invert capability the AP gets the times its WLANs are on; a blackout
+    // until 23:59 ends the day, as one until midnight does.
+    for w in state["wlanconf"].as_array_mut().unwrap() {
+        w["schedule_with_duration"] = serde_json::json!([{ "start_days_of_week": ["mon"], "start_hour": 22, "start_minute": 0, "duration_minutes": 119 }]);
+    }
+    let mut inform = common::inform(AP_B).clone();
+    inform["fw_caps"] = serde_json::json!(inform["fw_caps"].as_u64().unwrap() & !(1 << 22));
+    let controller = common::controller();
+    let input = apcfg::Input { state: &state, device_mac: AP_B, inform: Some(&inform), cfgversion: "x", controller: &controller };
+    let cfg = apcfg::render(&input).unwrap().system_cfg;
+    assert!(!cfg.contains(".schedule_invert="), "{cfg}");
+    assert!(cfg.contains(".schedule_mon.0=0000-2200\n"), "{cfg}");
+    assert!(!cfg.contains(".schedule_mon.1="), "no 2359-2359 block: {cfg}");
+    assert!(cfg.contains(".schedule_tue.0=0000-2359\n"), "{cfg}");
 }
 
 /// A client locked to an AP is kept off the others only while that AP is known and
