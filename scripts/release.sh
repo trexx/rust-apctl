@@ -4,14 +4,14 @@
 # build left behind (about 2.5 GB each).
 #
 #   scripts/release.sh 0.10.1                      # test, build and check the image
-#   git tag 0.10.1 && git push origin 0.10.1       # CI publishes :0.10.1 and :latest
+#   git tag 0.10.1 && git push origin 0.10.1       # CI publishes :0.10.1 and :latest (and the capture sidecar's)
 #   scripts/release.sh 0.10.1 --pin ~/flux/apctl/manifests/statefulset.yaml
 #
 # CI (.github/workflows/build.yml, on the version tag) is the only publisher: this
 # script never pushes, so one tag never names two different builds. --pin waits
 # until CI has published $IMAGE:<version>, checks that image was built from HEAD,
-# waits for the tag's Build run (which tests the published image) to pass, and pins
-# its digest.
+# waits for the tag's Build run (which tests the published images) to pass, and pins
+# its digest. The Build run is checked with gh; without gh that is left out, with a note.
 #
 # The version must match crates/controller/Cargo.toml, and README.md must name its
 # image. Stops at the first failure.
