@@ -1,4 +1,4 @@
-import { memo, useDeferredValue, useState } from "react";
+import { memo, useDeferredValue, useMemo, useState } from "react";
 import type { ReactNode } from "react";
 import { Link } from "react-router";
 import { AttemptList } from "../components/Connections";
@@ -130,28 +130,35 @@ function ClientList({ tabs }: { tabs: ReactNode }) {
   const f = useDeferredValue(filter).trim().toLowerCase();
   // What "last seen" counts from: a minute's ticks.
   const now = useNow();
-  const rows = (clients.data ?? [])
-    .filter((c) => showGone || c.connected)
-    .filter(
-      (c) =>
-        !f ||
-        [
-          c.alias,
-          c.note,
-          c.sample.hostname,
-          c.sample.mac,
-          c.sample.ip,
-          c.sample.essid,
-          apText(c),
-        ].some((v) => v?.toLowerCase().includes(f)),
-    )
-    // Each client's key worked out once, not in every comparison.
-    .map((c) => [value(c, sort.key), c] as const)
-    .sort(([x], [y]) => {
-      const cmp = x < y ? -1 : x > y ? 1 : 0;
-      return sort.desc ? -cmp : cmp;
-    })
-    .map(([, c]) => c);
+  // Worked out again only when the list, the filter or the order changes: not
+  // for the urgent render of a keystroke (the deferred filter is still the
+  // old one), a minute's tick or a refetch that changed nothing.
+  const rows = useMemo(
+    () =>
+      (clients.data ?? [])
+        .filter((c) => showGone || c.connected)
+        .filter(
+          (c) =>
+            !f ||
+            [
+              c.alias,
+              c.note,
+              c.sample.hostname,
+              c.sample.mac,
+              c.sample.ip,
+              c.sample.essid,
+              apText(c),
+            ].some((v) => v?.toLowerCase().includes(f)),
+        )
+        // Each client's key worked out once, not in every comparison.
+        .map((c) => [value(c, sort.key), c] as const)
+        .sort(([x], [y]) => {
+          const cmp = x < y ? -1 : x > y ? 1 : 0;
+          return sort.desc ? -cmp : cmp;
+        })
+        .map(([, c]) => c),
+    [clients.data, showGone, f, sort],
+  );
 
   if (!clients.data) return <QueryNote q={clients} />;
 
