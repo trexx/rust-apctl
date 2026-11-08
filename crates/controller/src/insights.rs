@@ -16,7 +16,7 @@ use crate::engine::{ClientView, Live};
 use crate::model::Ts;
 use crate::series::{Delta, Loaded, Only, RangeQuery, Samples, Spec, ap_name, ap_name_of, bucket_for, client_name, cols_at, deltas, load, memo_read, own_bssid_map, window};
 use crate::store::{Db, TIERS};
-use crate::threats::NEAREST_WINDOW;
+use crate::threats::nearness;
 
 /// The BSSIDs an AP's SSIDs have had in a tier of `vap_stats` (a BSSID stays
 /// on its AP, and its radio): one step through the table's own index per
@@ -974,7 +974,7 @@ struct Neighbor<'a> {
     signal: Option<i64>,
     best_signal: Option<i64>,
     last_seen: Ts,
-    /// The name of the AP that hears it best lately ([`NEAREST_WINDOW`]), else its MAC.
+    /// The name of the AP that hears it best lately ([`nearness`]), else its MAC.
     nearest_ap: Option<String>,
     vendor: Option<&'a str>,
 }
@@ -1050,7 +1050,6 @@ pub async fn neighbors(State(s): State<AppState>, Query(q): Query<NeighborQuery>
     })
     .await?;
     let name = |mac: &str| names.get(mac).cloned();
-    let signal = |n: &Neighbor| n.signal.unwrap_or(-200);
     let mut by_bssid: BTreeMap<String, Vec<Neighbor>> = BTreeMap::new();
     // (from, to, band) -> strongest signal: an AP has a BSSID per SSID.
     let mut links: BTreeMap<(String, &str, Option<String>), Option<i64>> = BTreeMap::new();
@@ -1070,14 +1069,14 @@ pub async fn neighbors(State(s): State<AppState>, Query(q): Query<NeighborQuery>
     }
     // What the network is (name, security, channel) and when it was last heard come
     // from its latest row, and the best signal from every AP's row, as the threat list
-    // reads them. The AP hearing it strongest names it, of those that heard it within
-    // NEAREST_WINDOW of then, so an AP that has gone quiet does not keep naming it.
+    // reads them. The AP nearest to it names it, as its threat finding's `heard_by` is
+    // ordered ([`nearness`]), so an AP that has gone quiet does not keep naming it.
     let mut list: Vec<Neighbor> = by_bssid
         .into_values()
         .map(|mut rows| {
             let latest = (0..rows.len()).max_by_key(|&i| rows[i].last_seen).expect("a BSSID has rows");
-            let since = rows[latest].last_seen - NEAREST_WINDOW;
-            let near = rows.iter().filter(|r| r.last_seen >= since).max_by_key(|r| signal(r)).map(|r| (r.ap_mac.clone(), r.signal)).expect("the latest row is in");
+            let last_seen = rows[latest].last_seen;
+            let near = rows.iter().max_by_key(|&r| nearness(last_seen, r.last_seen, r.signal, &r.ap_mac)).map(|r| (r.ap_mac.clone(), r.signal)).expect("a BSSID has rows");
             let best = rows.iter().filter_map(|r| r.best_signal.or(r.signal)).max();
             let mut n = rows.swap_remove(latest);
             ((n.ap_mac, n.signal), n.best_signal) = (near, best);
@@ -1666,9 +1665,13 @@ mod tests {
             assert_eq!((ap, signal, best, last_seen), (json!("Hall"), json!(-80), json!(-45), json!(base + 3000)));
             assert_eq!((essid, channel, security), latest);
             // Heard by A2 within the hour before the latest sighting: the stronger AP names it.
-            c.execute("UPDATE neighbors SET last_seen = ?1 WHERE bssid = '02:aa:00:00:00:03' AND ap_mac = ?2", rusqlite::params![base + 3000 - NEAREST_WINDOW, A2]).unwrap();
+            c.execute("UPDATE neighbors SET last_seen = ?1 WHERE bssid = '02:aa:00:00:00:03' AND ap_mac = ?2", rusqlite::params![base + 3000 - crate::threats::NEAREST_WINDOW, A2]).unwrap();
             let (ap, signal, _, last_seen, essid, channel, security) = far().await;
             assert_eq!((ap, signal, last_seen, (essid, channel, security)), (json!("Attic"), json!(-75), json!(base + 3000), latest));
+            // As strong as the latest sighting's AP: the more recent sighting names it, as heard_by orders them.
+            c.execute("UPDATE neighbors SET signal = -80 WHERE bssid = '02:aa:00:00:00:03' AND ap_mac = ?1", [A2]).unwrap();
+            let (ap, signal, ..) = far().await;
+            assert_eq!((ap, signal), (json!("Hall"), json!(-80)));
         }
 
         #[tokio::test]

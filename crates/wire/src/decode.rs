@@ -42,6 +42,13 @@ pub fn decode_packet(pkt: Packet<'_>, keys: &KeyStore) -> Result<Decoded> {
     Ok(Decoded { header: pkt.header, key, payload })
 }
 
+/// Whether getting past decryption proves the key right for a packet with these
+/// flags: AES-GCM authenticates, and an unencrypted packet involves no key. CBC
+/// does neither, so a wrong key can decrypt to garbage.
+pub fn authenticated(flags: Flags) -> bool {
+    !flags.contains(Flags::ENCRYPTED) || flags.contains(Flags::GCM)
+}
+
 /// Opens a packet with each of `keys` in turn and parses the plaintext as JSON. The
 /// first key that yields JSON wins: CBC has no authentication, so a wrong key shows up
 /// as output that is not JSON rather than as an error. Returns that key with the
@@ -52,9 +59,7 @@ pub fn decode_packet(pkt: Packet<'_>, keys: &KeyStore) -> Result<Decoded> {
 /// An unencrypted packet opens with any key (see [`Packet::open`]): callers that
 /// require encryption check the header's flags first.
 pub fn open_with(pkt: &Packet<'_>, keys: impl IntoIterator<Item = (KeyUsed, [u8; 16])>) -> Result<(KeyUsed, [u8; 16], Value)> {
-    let flags = pkt.header.flags;
-    // Whether getting past decryption proves the key right (or no key is involved).
-    let authenticated = !flags.contains(Flags::ENCRYPTED) || flags.contains(Flags::GCM);
+    let authenticated = authenticated(pkt.header.flags);
     let mut err = None;
     for (used, key) in keys {
         let e = match pkt.open(&key) {

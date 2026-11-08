@@ -415,6 +415,7 @@ fn from_event(kind: EventKind, device: Option<Mac>, data: &Value, ap_name: &dyn 
 struct RadioHealth {
     /// Whether the radio's networks reported TX counters in the window.
     pub retries_reported: bool,
+    /// `None`: not judged, as for the radio's channel use (it did not report through most of the window).
     pub retry_pct: Option<f64>,
     pub attempts: f64,
     pub utilisation: Option<f64>,
@@ -473,15 +474,21 @@ async fn radio_health(store: &Arc<Store>, now: Ts) -> anyhow::Result<HashMap<(Ma
                     h.interference = interf;
                 }
             }
-            // Retries from the SSIDs' counters, counted as the other views count them.
+            // Retries from the SSIDs' counters, counted as the other views count them,
+            // judged only for a radio judged above: one back for a minute or two
+            // (rebooted, or back from an outage) has not had them for the window.
             let spec = Spec { table: "vap_stats", key: "bssid", extra: &AP_BAND, cols: &Retries::COLS, only: None };
             let vaps = crate::series::load(c, spec, 0, from, now)?;
             for ((ap, band), t) in retry_totals(&vaps, crate::series::cols_at(&Retries::COLS, Retries::COLS), from) {
                 let Ok(ap) = ap.parse() else { continue };
-                let h = out.entry((ap, band.to_string())).or_default();
+                let key = (ap, band.to_string());
+                let covered = out.contains_key(&key);
+                let h = out.entry(key).or_default();
                 h.retries_reported = true;
-                h.attempts = t.attempts;
-                h.retry_pct = t.pct();
+                if covered {
+                    h.attempts = t.attempts;
+                    h.retry_pct = t.pct();
+                }
             }
             Ok(out)
         })
@@ -1457,10 +1464,24 @@ mod tests {
         // Too few to judge.
         row("6e", now - 800);
         row("6e", now);
+        // Each band's SSID sends at 50 % retries for as long as its radio reported.
+        let vap = |radio: &str, ts: Ts, n: i64| {
+            let sql = "INSERT INTO vap_stats (bssid, ts, ap_mac, radio, tx_retries, wifi_tx_attempts, wifi_tx_dropped) VALUES (?1, ?2, '02:00:00:00:00:01', ?1, ?3, ?3, 0)";
+            w.book.writer.exec(Db::Metrics, sql, vec![Sql::Text(radio.into()), Sql::Integer(ts), Sql::Integer(n * 1000)]);
+        };
+        for i in 0..12 {
+            vap("na", now - 30 - i * 75, 12 - i);
+        }
+        for i in 0..40 {
+            vap("ng", now - i * 3, 40 - i);
+        }
         flushed(&w.book.writer);
         let h = radio_health(&w.store, now).await.unwrap();
-        let judged = |radio: &str| h.get(&("02:00:00:00:00:01".parse().unwrap(), radio.to_string())).and_then(|h| h.utilisation);
-        assert_eq!((judged("na"), judged("ng"), judged("6e")), (Some(90.0), None, None));
+        let of = |radio: &str| h.get(&("02:00:00:00:00:01".parse().unwrap(), radio.to_string())).cloned().unwrap_or_default();
+        assert_eq!((of("na").utilisation, of("ng").utilisation, of("6e").utilisation), (Some(90.0), None, None));
+        // Retries count only where the radio reported through the window; the other still reports them.
+        assert_eq!((of("na").retry_pct, of("na").attempts), (Some(50.0), 11_000.0));
+        assert_eq!((of("ng").retries_reported, of("ng").retry_pct, of("ng").attempts), (true, None, 0.0));
     }
 
     #[test]

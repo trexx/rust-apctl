@@ -455,12 +455,29 @@ fn snmp(c: &mut Cfg, ctx: &Ctx) {
     }
 }
 
+/// A domain name as the official controller takes one: at most 253 characters
+/// (one final dot aside) of labels 1–63 long, made of letters, digits, `-` and
+/// `_`, neither starting nor ending with `-` or `_`, the last one not starting
+/// with a digit (so an address is no name). Only ASCII: a name an AP resolves.
+pub fn is_domain_name(h: &str) -> bool {
+    let h = h.strip_suffix('.').unwrap_or(h);
+    let label = |l: &str| {
+        let edge = |c: Option<char>| c.is_some_and(|c| c.is_ascii_alphanumeric());
+        (1..=63).contains(&l.len()) && l.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_')) && edge(l.chars().next()) && edge(l.chars().last())
+    };
+    h.len() <= 253 && h.split('.').all(label) && h.rsplit('.').next().is_some_and(|l| !l.starts_with(|c: char| c.is_ascii_digit()))
+}
+
+/// A time server the official controller sends an AP: an IPv4 address in its
+/// usual dotted form, or a [domain name](is_domain_name). IPv6 is not one.
+pub fn is_ntp_server(h: &str) -> bool {
+    h.parse::<std::net::Ipv4Addr>().is_ok() || is_domain_name(h)
+}
+
 fn ntp(c: &mut Cfg, ctx: &Ctx) {
     let s = ctx.setting("ntp");
-    let looks_like_host =
-        |h: &&str| !h.is_empty() && h.chars().all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '-' | ':'));
     let servers: Vec<&str> =
-        ["ntp_server_1", "ntp_server_2", "ntp_server_3", "ntp_server_4"].iter().filter_map(|k| str_of(s, k)).filter(looks_like_host).collect();
+        ["ntp_server_1", "ntp_server_2", "ntp_server_3", "ntp_server_4"].iter().filter_map(|k| str_of(s, k)).filter(|h| is_ntp_server(h)).collect();
     c.header("ntpclient");
     if servers.is_empty() {
         c.set("ntpclient.status", "disabled");
@@ -853,6 +870,34 @@ mod tests {
         assert!(official.contains("syslog.remote.ip=192.0.2.1\nsyslog.remote.port=5514\n") && official.contains("netconsole.port=5514\n"), "{official}");
         let ours = syslog_lines_for(on, &Controller { syslog_port: 1514, ..Default::default() });
         assert!(ours.contains("syslog.remote.port=1514\n") && ours.contains("netconsole.port=1514\n") && !ours.contains("5514"), "{ours}");
+    }
+
+    fn ntp_lines(servers: [&str; 4]) -> String {
+        let mac = "02:00:00:00:00:01";
+        let setting = json!({ "key": "ntp", "ntp_server_1": servers[0], "ntp_server_2": servers[1], "ntp_server_3": servers[2], "ntp_server_4": servers[3] });
+        let state = json!({ "sites": [{ "_id": "s" }], "setting": [setting], "devices": [{ "mac": mac, "site_id": "s", "type": "uap" }] });
+        let controller = Controller::default();
+        let ctx = Ctx::new(&Input { state: &state, device_mac: mac, inform: None, cfgversion: "1", controller: &controller }).unwrap();
+        let mut c = Cfg::default();
+        ntp(&mut c, &ctx);
+        c.finish()
+    }
+
+    /// An imported server the official controller would not send (IPv6, a malformed
+    /// address or name) is left out, and the rest close up.
+    #[test]
+    fn ntp_sends_only_ipv4_addresses_and_domain_names() {
+        let lines = ntp_lines(["2001:db8::123", "time_1.example.net", "1.2.3", "192.0.2.1"]);
+        assert_eq!(lines, "# ntpclient\nntpclient.status=enabled\nntpclient.1.status=enabled\nntpclient.1.server=time_1.example.net\nntpclient.2.status=enabled\nntpclient.2.server=192.0.2.1\n");
+        assert_eq!(ntp_lines(["-bad.example", "a..b", "192.0.2.01", "fd00::1"]), "# ntpclient\nntpclient.status=disabled\n");
+        for good in ["pool.ntp.org", "pool.ntp.org.", "ntp", "3com.example", "x-1.y_2.example", "192.0.2.255"] {
+            assert!(is_ntp_server(good), "{good}");
+        }
+        let long = vec!["x".repeat(63); 4].join(".");
+        assert!(is_ntp_server(&long[..253]) && is_ntp_server(&format!("{}.", &long[..253])) && !is_ntp_server(&long));
+        for bad in ["", ".", ".a", "a.b..", "_a.example", "a-.example", "host.1abc", "bücher.example", "a b", "192.0.2.1:123", &format!("{}.example", "x".repeat(64))] {
+            assert!(!is_ntp_server(bad), "{bad}");
+        }
     }
 
     #[test]

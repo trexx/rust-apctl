@@ -426,21 +426,29 @@ pub fn spawn(s: AppState) {
                 overdue
             };
             for mac in overdue {
-                finish_overdue(&s.engine, &s.live, mac).await;
+                complete_forget(&s.engine, &s.live, mac, false).await;
             }
         }
     });
 }
 
-/// Finishes the forget of an AP that didn't report again in time. Its record may have
-/// left the settings another way meanwhile (an import without it); the forget was
-/// accepted, so an AP apctl still lists is forgotten as [`ToForget::Listed`] is.
-async fn finish_overdue(engine: &tokio::sync::mpsc::Sender<Input>, live: &RwLock<Live>, mac: Mac) {
-    tracing::info!("{mac}: forgotten without reporting again");
-    let Err(e) = finish_forget(engine, mac, false).await else { return };
+/// Finishes a forget accepted for an AP that was online, taken out of `forgetting`:
+/// at its inform, which is told to reset (`reset`), or when it didn't report again in
+/// time. Its record may have left the settings another way meanwhile (an import
+/// without it); the forget was accepted, so an AP apctl still lists is forgotten as
+/// [`ToForget::Listed`] is. Logs the outcome.
+pub(crate) async fn complete_forget(engine: &tokio::sync::mpsc::Sender<Input>, live: &RwLock<Live>, mac: Mac, reset: bool) {
+    let how = if reset { "told to reset" } else { "without reporting again" };
+    let Err(e) = finish_forget(engine, mac, reset).await else {
+        tracing::info!("{mac}: forgotten, {how}");
+        return;
+    };
     let listed = ToForget::of(&live.read().unwrap(), &mac).ok() == Some(ToForget::Listed);
     if e.0 == axum::http::StatusCode::NOT_FOUND && listed {
-        forgotten(engine, mac, false).await;
+        forgotten(engine, mac, reset).await;
+        tracing::info!("{mac}: forgotten, {how} (its record had left the settings already)");
+    } else if e.0 == axum::http::StatusCode::NOT_FOUND {
+        tracing::info!("{mac}: not forgotten: {}", e.1);
     }
 }
 
@@ -548,8 +556,9 @@ async fn forget_ap(s: AppState, mac: Mac) -> Result<Json<Value>, ApiError> {
 }
 
 /// Removes a forgotten AP from the settings and apctl's records. An error
-/// when it removed nothing: the record was gone (404), or the engine has stopped.
-pub async fn finish_forget(engine: &tokio::sync::mpsc::Sender<Input>, mac: Mac, reset: bool) -> Result<(), ApiError> {
+/// when it removed nothing: the record was gone (404, for the caller to tell),
+/// or the engine has stopped (logged here).
+async fn finish_forget(engine: &tokio::sync::mpsc::Sender<Input>, mac: Mac, reset: bool) -> Result<(), ApiError> {
     let (tx, rx) = tokio::sync::oneshot::channel();
     let edit: crate::engine::StateEdit = Box::new(move |state: &mut Value| remove_device(state, &mac));
     let _ = engine.send(Input::EditState { ts: clock::now_ts(), edit, done: tx }).await;
@@ -560,10 +569,7 @@ pub async fn finish_forget(engine: &tokio::sync::mpsc::Sender<Input>, mac: Mac, 
             forgotten(engine, mac, reset).await;
             Ok(())
         }
-        Ok(Err(e)) => {
-            tracing::info!("{mac}: not forgotten: {e}");
-            Err(ApiError::not_found(e))
-        }
+        Ok(Err(e)) => Err(ApiError::not_found(e)),
         Err(_) => {
             tracing::warn!("{mac}: not forgotten: the engine has stopped");
             Err(ApiError::engine_stopped())
@@ -679,7 +685,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_forget_whose_record_left_meanwhile_still_ends_at_the_timeout() {
+    async fn a_forget_whose_record_left_meanwhile_still_ends_at_the_timeout_or_inform() {
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
         // An import since left the AP out, but apctl still lists it.
         let mut s = json!({ "devices": [], "setting": [] });
@@ -691,22 +697,25 @@ mod tests {
             while let Some(i) = rx.recv().await {
                 match i {
                     Input::EditState { edit, done, .. } => drop(done.send(edit(&mut s))),
-                    Input::Forget { .. } => seen_tx.send("forget").unwrap(),
-                    Input::Note(e) => seen_tx.send(e.kind.as_str()).unwrap(),
+                    Input::Forget { .. } => seen_tx.send("forget".to_string()).unwrap(),
+                    Input::Note(e) => seen_tx.send(format!("{}:{}", e.kind.as_str(), e.data["reset"])).unwrap(),
                     _ => {}
                 }
             }
         });
-        finish_overdue(&tx, &live, mac).await;
+        complete_forget(&tx, &live, mac, false).await;
         // Once forgotten (the engine's forget drops the listing), a second finish tells of nothing.
         live.write().unwrap().known_devices.remove(&mac);
-        finish_overdue(&tx, &live, mac).await;
+        complete_forget(&tx, &live, mac, false).await;
+        // At the inform the same: told of as reset.
+        live.write().unwrap().known_devices.insert(mac, crate::engine::KnownDevice { last_seen: 2, ..Default::default() });
+        complete_forget(&tx, &live, mac, true).await;
         drop(tx);
         let mut got = Vec::new();
         while let Some(x) = seen.recv().await {
             got.push(x);
         }
-        assert_eq!(got, ["forget", "ap_forgotten"]);
+        assert_eq!(got, ["forget", "ap_forgotten:false", "forget", "ap_forgotten:true"]);
     }
 
     #[test]

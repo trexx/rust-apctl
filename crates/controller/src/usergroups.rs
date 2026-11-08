@@ -57,7 +57,7 @@ fn rate(v: &Value, what: &str) -> Result<i64, String> {
 }
 
 /// A limit in kbps as the page shows it: kbps under 1000, else Mbps to two
-/// decimals without trailing zeros; "none" for no limit.
+/// decimals (a half hundredth rounded up) without trailing zeros; "none" for no limit.
 fn rate_label(kbps: i64) -> String {
     match kbps {
         ..=0 => "none".into(),
@@ -331,9 +331,9 @@ mod tests {
         let what = apply_usergroup(&mut s, &group(Some(&id), json!({ "name": "Kids" }))).unwrap();
         assert!(what.contains("down 6 Mbps, up 2.5 Mbps"), "{what}");
         assert!(apply_usergroup(&mut s, &group(None, json!({ "name": "Kids" }))).is_err(), "names are unique");
-        // As the page shows a limit (format.ts `speed`).
-        let labels = [-1, 2, 500, 999, 1000, 1234, 1235, 1500, 1999, 100_000].map(rate_label);
-        assert_eq!(labels, ["none", "2 kbps", "500 kbps", "999 kbps", "1 Mbps", "1.23 Mbps", "1.24 Mbps", "1.5 Mbps", "2 Mbps", "100 Mbps"]);
+        // As the page shows a limit (format.ts `speed`), a half hundredth rounded up (1005, 2675).
+        let labels = [-1, 2, 500, 999, 1000, 1005, 1234, 1235, 1500, 1999, 2675, 100_000].map(rate_label);
+        assert_eq!(labels, ["none", "2 kbps", "500 kbps", "999 kbps", "1 Mbps", "1.01 Mbps", "1.23 Mbps", "1.24 Mbps", "1.5 Mbps", "2 Mbps", "2.68 Mbps", "100 Mbps"]);
         apply_client_group(&mut s, &client("AA-BB-CC-00-00-01", Some(&id))).unwrap();
         assert_eq!((s["clients"].as_array().unwrap().len(), s["clients"][0]["usergroup_id"].as_str()), (1, Some(id.as_str())), "the entry, however the MAC is written");
         let none = ClientNames::new();

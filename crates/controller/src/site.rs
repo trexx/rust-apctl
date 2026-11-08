@@ -3,7 +3,7 @@
 //! Changes go through [`crate::settings::change`], so they can be previewed
 //! per AP like SSID and AP edits.
 
-use apcfg::flag;
+use apcfg::{flag, is_ntp_server};
 use axum::extract::State;
 use serde_json::{Value, json};
 use std::sync::LazyLock;
@@ -11,19 +11,6 @@ use std::sync::LazyLock;
 use crate::api::{ApiError, AppState, Json, Query};
 use crate::settings::Kind::{Bool, Enum, Int};
 use crate::settings::{COUNTRIES, Patch, PreviewQuery, band_name, copy_fields, country, dedup_in_order, docs, docs_mut, illegal_fixed_channel, mgmt_flag, num, pick, radio_width, record_label, setting, setting_mut, str_field, timezone};
-
-/// A host name or IPv4 address, as NTP and syslog targets take (the official
-/// controller refuses IPv6 there).
-fn is_host(h: &str) -> bool {
-    h.parse::<std::net::Ipv4Addr>().is_ok() || is_domain_name(h)
-}
-
-/// A domain name: labels of letters, digits and hyphens, neither starting nor
-/// ending with a hyphen, and a letter somewhere (so it is no address).
-pub(crate) fn is_domain_name(h: &str) -> bool {
-    let label = |l: &str| !l.is_empty() && l.len() <= 63 && !l.starts_with('-') && !l.ends_with('-') && l.chars().all(|c| c.is_ascii_alphanumeric() || c == '-');
-    h.len() <= 253 && h.chars().any(|c| c.is_ascii_alphabetic()) && h.split('.').all(label)
-}
 
 /// The servers automatic NTP stands for.
 const NTP_POOL: [&str; 4] = ["0.ubnt.pool.ntp.org", "1.ubnt.pool.ntp.org", "2.ubnt.pool.ntp.org", "3.ubnt.pool.ntp.org"];
@@ -145,8 +132,10 @@ fn site_syslog(doc: &mut Value, r: &Value) -> Result<(), String> {
         None => {}
         Some("off") => {
             doc["enabled"] = json!(false);
+            doc["this_controller"] = json!(false);
             doc["log_all_contents"] = json!(true);
             doc["debug"] = json!(false);
+            doc["netconsole_enabled"] = json!(false);
         }
         Some("controller") => {
             doc["enabled"] = json!(true);
@@ -162,10 +151,10 @@ fn site_syslog(doc: &mut Value, r: &Value) -> Result<(), String> {
         Some(_) => return Err("the syslog mode must be off, controller or server".into()),
     }
     doc["this_controller_encrypted_only"] = json!(false);
-    // The syslog server and the netconsole host.
+    // The syslog server and the netconsole host: an IPv4 address or a name, as a time server.
     for key in ["ip", "netconsole_host"] {
         if let Some(h) = str_field(r, key)?.map(str::trim) {
-            if !h.is_empty() && !is_host(h) {
+            if !h.is_empty() && !is_ntp_server(h) {
                 return Err(format!("{h} is not a host name or address"));
             }
             doc[key] = json!(h);
@@ -190,7 +179,7 @@ fn site_ntp(doc: &mut Value, n: &Value) -> Result<(), String> {
     let mut named: [Option<&str>; 4] = [None; 4];
     for (h, k) in named.iter_mut().zip(NTP_KEYS) {
         *h = str_field(n, k)?.map(str::trim);
-        if let Some(h) = h.filter(|h| !h.is_empty() && !is_host(h)) {
+        if let Some(h) = h.filter(|h| !h.is_empty() && !is_ntp_server(h)) {
             return Err(format!("{h} is not a host name or IPv4 address"));
         }
     }
@@ -613,6 +602,14 @@ mod tests {
         edit(&mut s, json!({ "rsyslogd": { "mode": "controller" } })).unwrap();
         let r = setting(&s, "rsyslogd");
         assert_eq!((r["this_controller"].as_bool(), r["log_all_contents"].as_bool(), r["netconsole_enabled"].as_bool()), (Some(true), Some(true), Some(false)));
+        // Off is saved as the official UI saves it: netconsole off too, which the render would send otherwise.
+        edit(&mut s, json!({ "rsyslogd": { "mode": "server", "ip": "logs.example.net", "debug": true, "netconsole_enabled": true, "netconsole_host": "192.0.2.9" } })).unwrap();
+        edit(&mut s, json!({ "rsyslogd": { "mode": "off", "netconsole_enabled": true } })).unwrap();
+        let r = setting(&s, "rsyslogd");
+        let off = ["enabled", "this_controller", "debug", "netconsole_enabled", "this_controller_encrypted_only", "log_all_contents"].map(|k| r[k].as_bool());
+        assert_eq!(off, [Some(false), Some(false), Some(false), Some(false), Some(false), Some(true)]);
+        assert_eq!((r["ip"].as_str(), r["netconsole_host"].as_str()), (Some("logs.example.net"), Some("192.0.2.9")), "the hosts are kept for going back");
+        assert_eq!(site_view(&s, false)["rsyslogd"]["mode"], "off");
 
         assert!(edit(&mut s, json!({ "ntp": { "setting_preference": "manual" } })).is_err());
         edit(&mut s, json!({ "ntp": { "setting_preference": "manual", "ntp_server_1": "time.example.net", "ntp_server_2": "", "ntp_server_3": "192.0.2.1" } })).unwrap();
@@ -623,10 +620,10 @@ mod tests {
         assert_eq!(edit(&mut s, json!({ "ntp": { "ntp_server_1": 5 } })).unwrap_err(), "ntp_server_1 must be text");
         assert!(edit(&mut s, json!({ "timezone": 1 })).is_err() && edit(&mut s, json!({ "mgmt": { "x_ssh_password": true } })).is_err());
         assert_eq!(setting(&s, "ntp")["ntp_server_1"].as_str(), Some("time.example.net"));
-        for bad in ["-time.example.net", "time-.example.net", "time.-example.net"] {
+        for bad in ["-time.example.net", "time-.example.net", "time.-example.net", "2001:db8::123", "time.1example"] {
             assert!(edit(&mut s, json!({ "ntp": { "ntp_server_2": bad } })).is_err(), "{bad}");
         }
-        assert!(is_host("time-1.example.net") && is_host("192.0.2.1"));
+        assert!(is_ntp_server("time-1.example.net") && is_ntp_server("192.0.2.1"));
         // A manual patch merges the servers it names into those stored.
         edit(&mut s, json!({ "ntp": { "ntp_server_3": "ntp.example.org" } })).unwrap();
         let servers = |s: &Value| NTP_KEYS.map(|k| setting(s, "ntp")[k].as_str().unwrap_or("?").to_string());
