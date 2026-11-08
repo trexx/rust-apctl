@@ -481,6 +481,9 @@ async fn adopt_over_ssh(s: AppState, b: AdoptBody) -> Result<Json<Value>, ApiErr
         live.adoption.adopting.insert(mac, adopting);
         claim.release(&mut live);
     }
+    // Noted as soon as it is expected, as a UI adoption is: before the AP's first inform with its key
+    // notes it adopted. A set-adopt that fails leaves it adopting, as a UI adoption that times out.
+    s.note(Event::device(since, EventKind::ApAdopting, mac, json!({ "ip": ip, "via": "ssh" }))).await;
     let out = match session.run(&format!("/usr/bin/syswrapper.sh set-adopt {} {}", shell_quote(&url), shell_quote(&key))).await {
         Ok(out) => out,
         // Tested and taken in one write: an AP back with its key already has ended the adoption, so it worked.
@@ -507,7 +510,6 @@ async fn adopt_over_ssh(s: AppState, b: AdoptBody) -> Result<Json<Value>, ApiErr
             return Err(bad(f));
         }
     };
-    s.note(Event::device(clock::now_ts(), EventKind::ApAdopting, mac, json!({ "ip": ip, "via": "ssh" }))).await;
     tracing::info!("{mac}: set-adopt {url} sent over SSH ({})", out.trim());
     Ok(Json(json!({ "mac": mac })))
 }
