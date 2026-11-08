@@ -14,10 +14,17 @@ type RadioForm = {
   min_rssi: number;
   hard_noise_floor_enabled: boolean;
   sens_level_enabled: boolean;
-  sens_level: number;
+  /** dBm; null while unset (the render then takes −94 dBm, below the −90…−50 the settings accept). */
+  sens_level: number | null;
   loadbalance_enabled: boolean;
-  maxsta: number;
+  /** Null while unset (the AP then keeps its own limit). */
+  maxsta: number | null;
 };
+
+/** The sensitivity level shown while unset: the weakest the settings accept. */
+const SENS_LEVEL = -90;
+/** The client limit shown while unset: the official controller's, when it gave a radio load balancing without one. */
+const MAXSTA = 30;
 
 /**
  * The form's fields from the settings, with numbers held as text ("36") read
@@ -37,9 +44,9 @@ export function radioForm(r: RadioSettings): RadioForm {
     min_rssi: r.min_rssi ?? -80,
     hard_noise_floor_enabled: r.hard_noise_floor_enabled ?? false,
     sens_level_enabled: r.sens_level_enabled ?? false,
-    sens_level: r.sens_level ?? -90,
+    sens_level: r.sens_level,
     loadbalance_enabled: r.loadbalance_enabled ?? false,
-    maxsta: r.maxsta ?? 50,
+    maxsta: r.maxsta,
   };
 }
 
@@ -98,6 +105,16 @@ export function RadioFields({
       tx_power_mode: m,
       tx_power: m === "custom" ? (form.tx_power ?? hi) : form.tx_power,
     });
+  // Likewise a fixed level or a client limit, turned on while unset, starts at
+  // the value shown, so that one is sent rather than the render's default.
+  const setSwitch =
+    (
+      k: "sens_level_enabled" | "loadbalance_enabled",
+      v: "sens_level" | "maxsta",
+      shown: number,
+    ) =>
+    (on: boolean) =>
+      onChange({ ...form, [k]: on, [v]: on ? (form[v] ?? shown) : form[v] });
   return (
     <>
       <Row label="Channel">
@@ -168,12 +185,16 @@ export function RadioFields({
           label="Sensitivity"
           hint="ignore signals weaker than this, instead of deriving it from the minimum signal (not in the official UI)"
         >
-          <Toggle {...bind("sens_level_enabled")} label="Fixed level" />
+          <Toggle
+            value={form.sens_level_enabled}
+            onChange={setSwitch("sens_level_enabled", "sens_level", SENS_LEVEL)}
+            label="Fixed level"
+          />
           {form.sens_level_enabled && (
             <RangeInput
               {...bind("sens_level")}
               aria-label="Sensitivity level"
-              fallback={-90}
+              fallback={SENS_LEVEL}
               min={-90}
               max={-50}
               unit=" dBm"
@@ -185,10 +206,19 @@ export function RadioFields({
         label="Client limit"
         hint="clients this radio accepts (not in the official UI)"
       >
-        <Toggle {...bind("loadbalance_enabled")} label="Enabled" />
+        <Toggle
+          value={form.loadbalance_enabled}
+          onChange={setSwitch("loadbalance_enabled", "maxsta", MAXSTA)}
+          label="Enabled"
+        />
         {form.loadbalance_enabled && (
           <label className="small">
-            <NumberInput {...bind("maxsta")} fallback={50} min={1} max={200} />{" "}
+            <NumberInput
+              {...bind("maxsta")}
+              fallback={MAXSTA}
+              min={1}
+              max={200}
+            />{" "}
             clients
           </label>
         )}
