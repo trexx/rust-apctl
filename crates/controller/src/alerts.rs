@@ -922,12 +922,15 @@ fn recent(c: &rusqlite::Connection, limit: i64) -> anyhow::Result<Value> {
         }))?
         .filter_map(Result::transpose)
         .collect::<rusqlite::Result<Vec<_>>>()?;
-    // Counted, not built: of a kind apctl still raises, as `stored` reads them.
+    // Counted, not built: of a kind apctl still raises, as `stored` reads them. Unread
+    // ones pile up until the bell is opened, so each kind and entity is read once.
     let mut unread = 0;
-    let mut stmt = c.prepare_cached("SELECT key, entity FROM alerts WHERE read = 0")?;
+    let mut stmt = c.prepare_cached("SELECT key, entity, COUNT(*) FROM alerts WHERE read = 0 GROUP BY key, entity")?;
     let mut q = stmt.query([])?;
     while let Some(r) = q.next()? {
-        unread += usize::from(known(r.get_ref(0)?.as_str()?, r.get_ref(1)?.as_str()?));
+        if known(r.get_ref(0)?.as_str()?, r.get_ref(1)?.as_str()?) {
+            unread += r.get::<_, i64>(2)?;
+        }
     }
     let (mut open, mut open_high) = (0, 0);
     let mut stmt = c.prepare_cached(&format!("SELECT key, entity, severity {OPEN}"))?;
@@ -1438,6 +1441,11 @@ mod tests {
         flushed(&w.book.writer);
         let one = w.store.read(Db::Config, |c| recent(c, 1)).unwrap();
         assert_eq!((one["alerts"].as_array().map(Vec::len), one["open"].as_i64(), one["open_high"].as_i64()), (Some(1), Some(3), Some(1)));
+        // Unread ones of one kind and AP each count, as do two of one unknown kind none.
+        w.book.raise(700, Alert::new(Key::ApRestarted, Category::Changes, Severity::Low, Entity::Ap(ap), "t".into(), "m".into()).resolved(700));
+        w.book.writer.exec(Db::Config, "INSERT INTO alerts (id, ts, key, category, severity, entity, title, message, tag) VALUES ('1-100', 1, 'gone', 'health', 'low', 'x', 't', 'm', 'g')", vec![]);
+        flushed(&w.book.writer);
+        assert_eq!(w.store.read(Db::Config, |c| recent(c, 1)).unwrap()["unread"].as_i64(), Some(5));
         let a = &listed["alerts"][1];
         let mut fields: Vec<&str> = a.as_object().unwrap().keys().map(String::as_str).collect();
         fields.sort();
