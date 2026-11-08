@@ -34,7 +34,7 @@ use rusqlite::types::Value as Sql;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
-use wire::decode::{KeyUsed, open_with};
+use wire::decode::{KeyUsed, authenticated, open_with};
 use wire::keys::KeyStore;
 
 use crate::clock;
@@ -587,17 +587,18 @@ impl Active {
     /// the async workers. The AP's own key is tried first; the factory key,
     /// which anyone can use, gets fewer turns, so that a flood under it leaves
     /// room for the APs. The permit is held while the inform is handled.
-    /// `gcm`: the header's AES-GCM flag. AES-GCM authenticates, so an inform the
-    /// AP's own key decrypts but whose body does not open is refused without a
-    /// factory-key turn, as [`open_with`] decides; under CBC a wrong key can get
-    /// that far, so the factory key is tried still.
-    async fn open(&self, body: Bytes, device_key: Option<[u8; 16]>, gcm: bool) -> Result<Opened, Unopened> {
+    /// `flags`: the header's. When getting past decryption proves the key
+    /// ([`authenticated`]: AES-GCM), an inform the AP's own key decrypts but
+    /// whose body does not open is refused without a factory-key turn, as
+    /// [`open_with`] decides; under CBC a wrong key can get that far, so the
+    /// factory key is tried still.
+    async fn open(&self, body: Bytes, device_key: Option<[u8; 16]>, flags: Flags) -> Result<Opened, Unopened> {
         let mut first = None;
         if let Some(k) = device_key {
             let permit = self.work.enter(body.len()).await.ok_or(Unopened::Busy)?;
             match decode(body.clone(), KeyUsed::Device, k, permit).await {
                 Ok(opened) => return Ok(opened),
-                Err(e) if gcm && !is_decrypt(&e) => return Err(Unopened::Bad(e)),
+                Err(e) if authenticated(flags) && !is_decrypt(&e) => return Err(Unopened::Bad(e)),
                 Err(e) => first = Some(e),
             }
         }
@@ -681,7 +682,7 @@ pub async fn inform(
     };
     let (device_key, pinned) = crate::adopt::device_key(state.as_deref(), &active.keys, &mac).map_or((None, false), |(k, gcm)| (Some(k), gcm));
     drop(state);
-    let (used, key, payload, permit) = match active.open(body, device_key, header.flags.contains(Flags::GCM)).await {
+    let (used, key, payload, permit) = match active.open(body, device_key, header.flags).await {
         Ok(opened) => opened,
         Err(Unopened::Busy) => {
             tracing::debug!("{mac}: too many informs waiting: turning one from {} away", peer.ip());
