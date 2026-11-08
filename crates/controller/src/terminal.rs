@@ -21,7 +21,7 @@ use inform::Mac;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use crate::api::{ApiError, AppState, MacPath, Query};
+use crate::api::{ApiError, AppState, MacPath, Query, UNANSWERED, send};
 use crate::auth::SessionId;
 use crate::clock;
 use crate::engine::{Event, EventKind};
@@ -40,14 +40,6 @@ const READ_BUFFER: usize = 16 << 10;
 /// How many of the page's frames may wait for the AP to take them in: then
 /// the page's are read no further until it does (TCP holds the page back).
 const QUEUED: usize = 16;
-/// How long the page may take to take in a frame: one that takes in nothing
-/// for that long has gone.
-const SEND_TIMEOUT: Duration = Duration::from_secs(20);
-
-/// How many pings in a row the page may leave unanswered (while its frames
-/// are read): then it has gone (a laptop asleep, a network change, a proxy
-/// that dropped the connection).
-const UNANSWERED: u32 = 3;
 
 /// A terminal's timers.
 struct Pace {
@@ -57,7 +49,7 @@ struct Pace {
     ping: Duration,
 }
 
-const PACE: Pace = Pace { idle: Duration::from_secs(30 * 60), ping: Duration::from_secs(30) };
+const PACE: Pace = Pace { idle: Duration::from_secs(30 * 60), ping: crate::api::PING };
 
 /// A terminal's size in characters, as the page measures it.
 #[derive(Debug, Default, Deserialize, PartialEq)]
@@ -193,11 +185,6 @@ async fn finish(mut socket: WebSocket, end: Result<End, String>) {
     }
 }
 
-/// Sends the page a frame; false when it has gone, or took in nothing for [`SEND_TIMEOUT`].
-async fn send(socket: &mut WebSocket, msg: Message) -> bool {
-    matches!(tokio::time::timeout(SEND_TIMEOUT, socket.send(msg)).await, Ok(Ok(())))
-}
-
 /// What goes to the AP, in the order the page sent it.
 enum ToAp {
     Typed(axum::body::Bytes),
@@ -223,7 +210,7 @@ async fn to_ap(input: russh::ChannelWriteHalf<russh::client::Msg>, mut queue: to
 /// Logs in to the AP and starts its shell (unless the page goes or its
 /// session ends meanwhile), and carries the terminal both ways until one side
 /// ends it. Nothing in the loop waits on the AP taking input in, nor on the
-/// page for longer than [`SEND_TIMEOUT`], so it always sees a logout, the idle
+/// page for longer than [`SEND_TIMEOUT`](crate::api::SEND_TIMEOUT), so it always sees a logout, the idle
 /// limit and the page's end.
 async fn bridge(socket: &mut WebSocket, s: &AppState, mac: Mac, t: Target, size: &Size, session: &SessionId, pace: &Pace) -> Result<End, String> {
     let ended = crate::api::session_ends(&s.auth, Some(&session.hash));
