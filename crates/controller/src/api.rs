@@ -451,11 +451,6 @@ async fn healthz(State(s): State<AppState>) -> Response {
     "ok".into_response()
 }
 
-/// The APs known from the database only: not reporting since apctl started.
-fn stored_only(live: &Live) -> impl Iterator<Item = (&Mac, &KnownDevice)> {
-    live.known_devices.iter().filter(|(mac, _)| !live.devices.contains_key(mac))
-}
-
 /// An AP known from the database only (see `Live::known_devices`), as a live
 /// device view of it, offline: it has what its row and its page show, the rest is empty.
 fn stored_view(k: &KnownDevice) -> DeviceView {
@@ -527,7 +522,7 @@ async fn devices(State(s): State<AppState>) -> Json<Vec<DeviceRow>> {
         }
         let mut list: Vec<DeviceRow> = live.devices.iter().map(|(mac, d)| device_row(*mac, d, per_ap.get(mac).copied().unwrap_or(0))).collect();
         // Then the APs not reporting since apctl started, by MAC as the others.
-        let mut stored: Vec<DeviceRow> = stored_only(&live).map(|(mac, k)| device_row(*mac, &stored_view(k), 0)).collect();
+        let mut stored: Vec<DeviceRow> = live.known_devices.iter().map(|(mac, k)| device_row(*mac, &stored_view(k), 0)).collect();
         stored.sort_unstable_by_key(|d| d.mac);
         list.append(&mut stored);
         list

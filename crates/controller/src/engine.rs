@@ -242,7 +242,8 @@ pub struct Live {
     /// For attributing syslog: an AP's `hash_id` (see `syslog::hash_id`) and IP address.
     pub by_hash_id: HashMap<u64, Mac>,
     pub by_ip: HashMap<String, Mac>,
-    /// APs known from the database before their first inform in this process.
+    /// APs known from the database before their first inform in this process
+    /// (never also in `devices`: an AP's first inform moves it there).
     pub known_devices: HashMap<Mac, KnownDevice>,
     /// Imported controller settings (contain secrets: never serialised).
     pub state: Option<Arc<Value>>,
