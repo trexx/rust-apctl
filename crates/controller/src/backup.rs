@@ -451,26 +451,37 @@ fn built(name: &str, src: &Path, dst: &Path, t: Ts, take: impl Fn(&str) -> Take,
     c.execute("ATTACH DATABASE ?1 AS live", [format!("file:{path}?mode=ro")]).with_context(|| format!("opening {}", src.display()))?;
     // One transaction: one consistent read of the live database.
     let tx = c.transaction()?;
-    // The tables (filled as they are made), then their indexes and the rest.
+    // The tables and their indexes as stored, then the rows, then the rest (a
+    // trigger made first would fire on the copy's rows). Each index is made
+    // before its table is filled, as VACUUM does: filled in order, it needs no
+    // sort, which temp_store=MEMORY would hold whole in RAM.
     let objects: Vec<(String, String, String)> = tx
-        .prepare("SELECT type, name, sql FROM live.sqlite_master WHERE sql IS NOT NULL AND name NOT LIKE 'sqlite%' ORDER BY type != 'table', type != 'index', rowid")?
+        .prepare("SELECT type, name, sql FROM live.sqlite_master WHERE sql IS NOT NULL AND name NOT LIKE 'sqlite%' ORDER BY type NOT IN ('table', 'index'), rowid")?
         .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
         .collect::<rusqlite::Result<_>>()?;
-    for (kind, table, sql) in &objects {
+    let (made, rest): (Vec<_>, Vec<_>) = objects.iter().partition(|(kind, ..)| kind == "table" || kind == "index");
+    let make = |table: &str, sql: &str| -> Result<()> {
         if sql.starts_with("CREATE VIRTUAL") {
             bail!("{name}'s {table} cannot be copied for a backup: a virtual table");
         }
         // Unqualified, as stored: made in the copy.
-        tx.execute_batch(sql).with_context(|| format!("copying {name}'s {table}"))?;
-        if kind != "table" {
-            continue;
-        }
+        tx.execute_batch(sql).with_context(|| format!("copying {name}'s {table}"))
+    };
+    for (_, table, sql) in &made {
+        make(table, sql)?;
+    }
+    for (_, table, _) in made.iter().filter(|(kind, ..)| kind == "table") {
+        // Whole, SQLite copies the table and its indexes page by page (its
+        // transfer optimisation).
         let copy = format!("INSERT INTO main.\"{table}\" SELECT * FROM live.\"{table}\"");
         match take(table) {
             Take::All => tx.execute(&copy, [])?,
             Take::Since(time) => tx.execute(&format!("{copy} WHERE \"{time}\" >= ?1"), [t])?,
             Take::Nothing => 0,
         };
+    }
+    for (_, table, sql) in &rest {
+        make(table, sql)?;
     }
     finish(&tx)?;
     tx.commit()?;
@@ -1463,10 +1474,13 @@ mod tests {
         d
     }
 
-    /// A database's tables, indexes and the rest, as made.
+    /// A database's tables, indexes and the rest, as made and in the order
+    /// stored (a copy that made its indexes after its tables lists them last),
+    /// once SQLite has found every index whole and true to its table.
     fn schema(p: &Path) -> Vec<(String, String, Option<String>)> {
         let c = Connection::open(p).unwrap();
-        let mut stmt = c.prepare("SELECT type, name, sql FROM sqlite_master WHERE name NOT LIKE 'sqlite_sequence' ORDER BY type, name").unwrap();
+        assert_eq!(c.query_row("PRAGMA integrity_check", [], |r| r.get::<_, String>(0)).unwrap(), "ok", "{}", p.display());
+        let mut stmt = c.prepare("SELECT type, name, sql FROM sqlite_master WHERE name NOT LIKE 'sqlite_sequence' ORDER BY rowid").unwrap();
         stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).unwrap().collect::<rusqlite::Result<_>>().unwrap()
     }
 
