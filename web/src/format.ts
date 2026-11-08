@@ -258,8 +258,12 @@ const compactFmt = new Intl.NumberFormat(undefined, { notation: "compact" });
 /** A count for people: "950", "12K", "3.4M". */
 export const compact = (n: number | null | undefined) => (n === null || n === undefined ? "—" : compactFmt.format(n));
 
-/** A limit for people: "5 Mbps", or "none". */
-export const speed = (kbps: number | null | undefined) => (kbps && kbps > 0 ? `${kbps >= 1000 ? `${+(kbps / 1000).toFixed(2)} Mbps` : `${kbps} kbps`}` : "none");
+/**
+ * A limit for people: "5 Mbps", "1.01 Mbps", "500 kbps", or "none"; as the server's history text words it
+ * (usergroups.rs `rate_label`): hundredths of a Mbps rounded half up. kbps / 10 is exact at the half, where
+ * kbps / 1000 isn't (1.005 is stored just below it).
+ */
+export const speed = (kbps: number | null | undefined) => (kbps && kbps > 0 ? (kbps >= 1000 ? `${Math.round(kbps / 10) / 100} Mbps` : `${kbps} kbps`) : "none");
 
 /** "13 Oct 06:00 – 09:00", or with both dates when the window spans days. */
 function spanLabel(from: number, to: number): string {
