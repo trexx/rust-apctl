@@ -757,7 +757,7 @@ pub(crate) mod tests {
         // without a VAP table.
         let s = parse(1000, &fixture("000593_020000000002_inform")).unwrap();
         assert!(!s.has_vap_table);
-        assert!(s.clients.is_empty(), "unknown, not zero");
+        assert!(s.clients.is_empty(), "no clients parsed");
     }
 
     #[test]

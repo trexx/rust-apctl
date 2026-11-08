@@ -2738,6 +2738,29 @@ mod tests {
     }
 
     #[test]
+    fn an_aps_client_count_is_unknown_without_a_vap_table_and_zero_with_an_empty_one() {
+        let mut h = harness();
+        let sta = |mac: &str| json!({ "mac": mac, "signal": -60 });
+        for (ts, vaps) in [
+            (0, None),
+            (10, Some(json!([]))),
+            (20, Some(json!([{ "bssid": "b1", "radio": "na", "usage": "user", "sta_table": [sta(C1), sta("02:00:00:00:01:02")] }]))),
+        ] {
+            let mut p = json!({ "mac": AP1, "uptime": 1000 + ts });
+            if let Some(v) = vaps {
+                p["vap_table"] = v;
+            }
+            h.engine.handle(Input::Inform { ts, payload: p });
+        }
+        flushed(&h.writer);
+        let rows: Vec<(Ts, Option<f64>)> = h
+            .store
+            .read(Db::Metrics, |c| Ok(c.prepare("SELECT ts, num_sta FROM ap_stats ORDER BY ts")?.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<rusqlite::Result<_>>()?))
+            .unwrap();
+        assert_eq!(rows, [(0, None), (10, Some(0.0)), (20, Some(2.0))], "a gap in the chart, not a drop to zero");
+    }
+
+    #[test]
     fn multicast_rates_count_networks_once_and_clients_each() {
         let mut h = harness();
         // Per-network "to clients" counters repeat in every client's block.
