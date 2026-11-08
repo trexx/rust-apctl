@@ -7,7 +7,7 @@
 # fetches it.) Each line is cut after the name: the controller reads no more
 # (vendor.rs), and the addresses are much of the file. A list much shorter than the
 # 40 000 names of 2026 is a cut-off download, not a published one.
-FROM docker.io/library/alpine:3.24@sha256:3f4d6b32e26703c6082839234f43769d5046b3ac7c910033911d1e71d8cd630a AS fetch
+FROM docker.io/library/alpine:3.24@sha256:f59abe656b692d901e184be3445e084786602108599d2a51d229c0f5a48c71bf AS fetch
 RUN for try in 1 2 3 4 5; do \
         wget -q -O /oui-full.csv https://standards-oui.ieee.org/oui/oui.csv && break; \
         rm -f /oui-full.csv; sleep 60; \

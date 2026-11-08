@@ -63,7 +63,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 RUN mkdir -p /rootfs/data
 
 # --- capture sidecar for shadow mode: tcpdump writing pcap into a FIFO ---
-FROM docker.io/library/alpine:3.24@sha256:3f4d6b32e26703c6082839234f43769d5046b3ac7c910033911d1e71d8cd630a AS capture
+FROM docker.io/library/alpine:3.24@sha256:f59abe656b692d901e184be3445e084786602108599d2a51d229c0f5a48c71bf AS capture
 RUN apk add --no-cache tcpdump
 # The FIFO must be readable by the non-root controller. Alpine's tcpdump keeps
 # its user (no -Z), which matters: switching user needs CAP_SETUID, and the pod
