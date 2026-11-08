@@ -307,18 +307,25 @@ fn mac_acl(c: &mut Cfg, ctx: &Ctx, vaps: &[Vap]) {
     }
 }
 
-/// The AP's host name: device name reduced to `[0-9A-Za-z-]`, `+` spelled out.
+/// The AP's host name: device name reduced to `[0-9A-Za-z-]`, each run of `+`
+/// spelled out (`-Plus` at the end, `-Plus-` elsewhere) before that filter, as
+/// the official controller does.
 pub fn hostname(name: &str) -> String {
-    let (body, end) = name.strip_suffix('+').map_or((name, ""), |b| (b, "-Plus"));
-    let mut s = String::with_capacity(name.len() + end.len());
-    for ch in body.chars() {
-        match ch {
-            '+' => s.push_str("-Plus-"),
-            _ if ch.is_ascii_alphanumeric() || ch == '-' => s.push(ch),
-            _ => {}
+    let mut s = String::with_capacity(name.len() + 8);
+    let mut rest = name;
+    while let Some(ch) = rest.chars().next() {
+        if ch == '+' {
+            rest = rest.trim_start_matches('+');
+            // The official's `$` (Java's) also matches before a final line terminator.
+            let end = matches!(rest, "" | "\n" | "\r" | "\r\n" | "\u{85}" | "\u{2028}" | "\u{2029}");
+            s.push_str(if end { "-Plus" } else { "-Plus-" });
+        } else {
+            if ch.is_ascii_alphanumeric() || ch == '-' {
+                s.push(ch);
+            }
+            rest = &rest[ch.len_utf8()..];
         }
     }
-    s.push_str(end);
     // ASCII only from here: bytes are characters.
     s.drain(..s.len() - s.trim_start_matches('-').len());
     s.truncate(31);
@@ -881,7 +888,12 @@ mod tests {
         assert_eq!(hostname("Garage AP"), "GarageAP");
         assert_eq!(hostname("U6+"), "U6-Plus");
         assert_eq!(hostname("-a+b"), "a-Plus-b");
-        assert_eq!(hostname("a++"), "a-Plus--Plus");
+        assert_eq!(hostname("a++"), "a-Plus", "a run of + is spelled out once");
+        assert_eq!(hostname("A++B"), "A-Plus-B");
+        assert_eq!(hostname("AP ++"), "AP-Plus", "the run is trailing before the filter drops the space");
+        assert_eq!(hostname("a+ +"), "a-Plus--Plus");
+        assert_eq!(hostname("a+ü"), "a-Plus-", "not trailing: the filter runs after");
+        assert_eq!(hostname("a+\n"), "a-Plus", "trailing before a final line break");
         assert_eq!(hostname("+"), "Plus");
         assert_eq!(hostname("--Büro Süd/2"), "BroSd2");
         assert_eq!(hostname(&"x".repeat(40)), "x".repeat(31));
