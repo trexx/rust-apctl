@@ -804,8 +804,9 @@ impl Watcher {
             for Check { key, value, raise_at, clear_at, what } in radio_checks(&h) {
                 let k = (key, Entity::Radio(mac, radio.clone()));
                 let Some(v) = value else {
-                    // Retries are not judged on a radio carrying little traffic, but
-                    // it still reports: an alert open for it stays as it is.
+                    // Retries reported but not judged, for too little traffic or for not
+                    // having reported through the window (just back): an alert open for
+                    // the radio stays as it is.
                     if key == Key::HighRetries && h.retries_reported {
                         judged.insert(k);
                     }
