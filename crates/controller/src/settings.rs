@@ -1946,7 +1946,7 @@ fn check_config_network(p: &Value, before: &Value) -> Result<Value, String> {
         out["dns2"] = json!(d.to_string());
     }
     if let Some(suffix) = str_field(p, "dnssuffix")?.map(str::trim).filter(|s| !s.is_empty()) {
-        if !crate::site::is_domain_name(suffix) {
+        if !apcfg::is_domain_name(suffix) {
             return Err(format!("{suffix} is not a domain name"));
         }
         out["dnssuffix"] = json!(suffix);
@@ -2647,7 +2647,8 @@ mod tests {
         assert!(dev(&mut s, json!({ "config_network": { "type": "static", "ip": "192.168.1.20" } })).is_err(), "netmask needed");
         let with_suffix = |d: &str| json!({ "config_network": { "type": "static", "ip": "192.168.1.20", "netmask": "255.255.255.0", "gateway": "192.168.1.1", "dns1": "192.168.1.1", "dnssuffix": d } });
         dev(&mut s.clone(), with_suffix("home-1.lan")).unwrap();
-        for bad in ["-home.lan", "home-.lan", "home..lan", "home_1.lan"] {
+        dev(&mut s.clone(), with_suffix("home_1.lan")).unwrap();
+        for bad in ["-home.lan", "home-.lan", "home..lan", "_home.lan", "home.1lan"] {
             assert!(dev(&mut s.clone(), with_suffix(bad)).unwrap_err().contains("not a domain name"), "{bad}");
         }
         dev(&mut s, json!({ "config_network": { "type": "dhcp", "ip": "192.168.1.20" } })).unwrap();

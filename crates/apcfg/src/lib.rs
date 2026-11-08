@@ -32,7 +32,7 @@ pub mod tz;
 
 pub use json::{as_int, bool_of, flag, int_of, oid, override_of};
 pub use net::ssid_vlan;
-pub use system::{MDNS_SERVICES, is_dfs_channel, ssid_usergroup, usergroup_limits};
+pub use system::{MDNS_SERVICES, is_dfs_channel, is_domain_name, is_ntp_server, ssid_usergroup, usergroup_limits};
 pub use wlan::{Security, blacklisted_channels, capable_width, configured_width, has_hard_noise_floor, is_owe, network_vlan, radio_ai_na_dfs, radio_off, radio_width, wlan_bands, wpa_mode};
 mod wlan;
 
