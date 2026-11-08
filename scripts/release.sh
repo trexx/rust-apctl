@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Builds and checks the apctl image locally, and with --pin writes the digest CI
-# published for the release into a manifest. Removes the unnamed build stages the
-# build left behind (about 2.5 GB each).
+# Builds and checks the apctl image and its capture sidecar locally, and with --pin
+# writes the digest CI published for the release into a manifest. Removes the unnamed
+# build stages the build left behind (about 2.5 GB each).
 #
 #   scripts/release.sh 0.10.1                      # test, build and check the image
 #   git tag 0.10.1 && git push origin 0.10.1       # CI publishes :0.10.1 and :latest (and the capture sidecar's)
@@ -112,6 +112,13 @@ echo "== building $built"
 # --force-rm: a failed build must not leave working containers (they pin their images).
 podman build -q --force-rm --target runtime -t "$built" .
 APCTL_ENGINE=podman scripts/image-check.sh "$built"
+# The tag's Build run (and so --pin) also needs the capture sidecar's tcpdump to start.
+# apk installs alpine's current tcpdump, which can change with no commit here: a
+# failure is found now, not after the tag is pushed.
+capture="localhost/rust-apctl-capture:$version"
+echo "== building $capture"
+podman build -q --force-rm --target capture -t "$capture" .
+podman run --rm --entrypoint tcpdump "$capture" --version
 
 if [ -z "$pin" ]; then
   exit 0

@@ -153,7 +153,7 @@ Pushing a version tag (e.g. `0.15.1`) makes CI publish the images, apctl and the
 sidecar; nothing else pushes them.
 `scripts/check.sh` runs CI's Rust checks and `scripts/check.sh --web` its web check
 (with `APCTL_ENGINE`, else docker, else podman; the files it writes are yours either way).
-`scripts/release.sh 0.15.1` runs them all and builds and checks the image locally before
+`scripts/release.sh 0.15.1` runs them all and builds and checks both images locally before
 the tag goes out (crates/controller/Cargo.toml and the Kubernetes example above must name
 that version), and `scripts/release.sh 0.15.1 --pin <manifest>` afterwards waits for
 CI's image and for the tag's Build run to pass, then pins the image's digest in a manifest.
