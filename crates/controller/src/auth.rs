@@ -354,10 +354,13 @@ impl Proxies {
             let Some(ip) = wire::hop_ip(hop) else {
                 // Skipping it would believe the hops left of it, which the
                 // client wrote: the last proxy's address is kept instead, so
-                // the clients behind it share their login attempts. Said once,
-                // as it is the proxy's setup that needs fixing.
+                // the clients behind it share their login attempts, and the APs
+                // behind it their pending adoptions. Said once, whichever caller
+                // meets it first, as it is the proxy's setup that needs fixing.
                 static SAID: std::sync::Once = std::sync::Once::new();
-                SAID.call_once(|| tracing::warn!("X-Forwarded-For hop {hop:?} from {client} is not an address: logins through that proxy are throttled as one client"));
+                SAID.call_once(|| {
+                    tracing::warn!("X-Forwarded-For hop {hop:?} from {client} is not an address: clients behind that proxy count as one (one login throttle, one allowance of pending APs)")
+                });
                 break;
             };
             client = ip.to_canonical();
