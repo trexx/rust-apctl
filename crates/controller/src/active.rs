@@ -788,10 +788,10 @@ async fn managed_inform(active: &Arc<Active>, ts: Ts, caller: Caller, payload: V
         let _ = active.engine.send(Input::Note(Event::device(ts, EventKind::ApAdopted, mac, data))).await;
     }
     if forgetting {
-        tracing::warn!("{mac}: forgotten: telling it to reset");
-        let engine = active.engine.clone();
+        tracing::warn!("{mac}: being forgotten: telling it to reset");
+        let (engine, live) = (active.engine.clone(), active.live.clone());
         // The engine's forget drops the AP's entry and its stored row.
-        tokio::spawn(async move { crate::adopt::finish_forget(&engine, mac, true).await.ok() });
+        tokio::spawn(async move { crate::adopt::complete_forget(&engine, &live, mac, true).await });
         let reply = json!({ "_type": "setdefault", "server_time_in_utc": server_time(ts) });
         return caller.seal(&reply);
     }
