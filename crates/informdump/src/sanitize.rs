@@ -842,9 +842,7 @@ fn colon_mac(bare: &str) -> String {
 /// match `re` but do not parse as addresses. `None` when there was none to replace.
 fn scrub_ipv6(re: &Regex, s: &str, fakes: &mut Fakes) -> Option<String> {
     let bytes = s.as_bytes();
-    let mut out: Option<String> = None;
-    let mut last = 0;
-    for m in re.find_iter(s) {
+    replace_all(re, s, |m| {
         let (a, mut b) = (m.start(), m.end());
         let mut ip = m.as_str().parse::<Ipv6Addr>();
         // A colon right after an address (`fe80::1: up`) is not part of it.
@@ -853,7 +851,7 @@ fn scrub_ipv6(re: &Regex, s: &str, fakes: &mut Fakes) -> Option<String> {
             b -= 1;
             ip = s[a..b].parse();
         }
-        let Ok(ip) = ip else { continue };
+        let ip = ip.ok()?;
         let word = |c: u8| c.is_ascii_alphanumeric() || c == b'_';
         let alone = !bytes[..a].last().is_some_and(|&c| word(c) || c == b':') && !bytes.get(b).is_some_and(|&c| word(c) || (c == b':' && !trimmed));
         let seg = ip.segments();
@@ -862,19 +860,12 @@ fn scrub_ipv6(re: &Regex, s: &str, fakes: &mut Fakes) -> Option<String> {
         let suffix = seg[..6] == [0; 6];
         let solicited_node = seg[..6] == [0xff02, 0, 0, 0, 0, 1] && seg[6] & 0xff00 == 0xff00;
         if !alone || documentation || suffix || (ip.is_multicast() && !solicited_node) {
-            continue;
+            return None;
         }
         let link_local = ip.is_unicast_link_local();
         let fake = fakes.get(Kind::Ipv6, &ip.to_string(), |n| if link_local { format!("fe80::db8:{n:x}") } else { format!("2001:db8::{n:x}") });
         fakes.also(Kind::Ipv6, &s[a..b].to_ascii_lowercase(), &fake);
-        let o = out.get_or_insert_with(|| String::with_capacity(s.len()));
-        o.push_str(&s[last..a]);
-        o.push_str(&fake);
-        last = b;
-    }
-    out.map(|mut o| {
-        o.push_str(&s[last..]);
-        o
+        Some(if trimmed { fake + ":" } else { fake })
     })
 }
 
