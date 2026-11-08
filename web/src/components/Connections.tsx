@@ -262,16 +262,16 @@ export function ConnectionLog({
 
 function ConnectionTable({ data }: { data: Connections }) {
   const now = useNow();
-  // A roam also shows up as the attempt on the new AP; keep just the roam.
-  const roamsTo = new Map<string, number[]>();
-  for (const r of data.roams) {
-    const times = roamsTo.get(r.to.ap);
-    if (times) times.push(r.ts);
-    else roamsTo.set(r.to.ap, [r.ts]);
-  }
-  const isRoamJoin = (a: ConnAttempt) =>
-    a.roam && !!roamsTo.get(a.ap)?.some((ts) => Math.abs(ts - a.ts) <= 15);
-  const attempts = data.attempts.filter((a) => !isRoamJoin(a));
+  // A roam's join is also an attempt on the new AP (the report the server
+  // paired, at its join_ts); keep just the roam.
+  const joinKey = (client: string, ap: string, ts: number) =>
+    `${client} ${ap} ${ts}`;
+  const joins = new Set(
+    data.roams.map((r) => joinKey(r.client, r.to.ap, r.join_ts)),
+  );
+  const attempts = data.attempts.filter(
+    (a) => !joins.has(joinKey(a.client, a.ap, a.ts)),
+  );
   const attemptKeys = stableKeys(attempts, attemptId);
   const roamKeys = stableKeys(data.roams, roamId);
   const items: Item[] = [

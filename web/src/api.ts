@@ -818,7 +818,10 @@ export interface RoamEnd {
 }
 
 export interface Roam {
+  /** The later of the leave and the join. */
   ts: number;
+  /** The join's own report time: the client's attempt on `to.ap` at this time is this roam's join. */
+  join_ts: number;
   client: Mac;
   from: Pick<RoamEnd, "ap" | "radio" | "rssi">;
   to: RoamEnd;
