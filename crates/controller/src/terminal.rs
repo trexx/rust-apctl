@@ -170,7 +170,7 @@ async fn finish(mut socket: WebSocket, end: Result<End, String>) {
         Ok(End::Gone) => return,
         Ok(End::Exited) => close(close_code::NORMAL, "the shell ended"),
         Ok(End::Lost) => close(close_code::ERROR, "the connection to the AP was lost"),
-        Ok(End::Idle) => close(close_code::NORMAL, "closed after 30 minutes without input"),
+        Ok(End::Idle) => Message::Close(Some(CloseFrame { code: close_code::NORMAL, reason: format!("closed after {} minutes without input", PACE.idle.as_secs() / 60).into() })),
         Ok(End::LoggedOut) => crate::api::logged_out(),
         Err(e) => {
             send(&mut socket, Message::Text(json!({ "error": e }).to_string().into())).await;
