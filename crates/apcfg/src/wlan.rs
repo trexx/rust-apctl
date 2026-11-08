@@ -945,6 +945,10 @@ const DAYS: [&str; 7] = ["sun", "mon", "tue", "wed", "thu", "fri", "sat"];
 /// (0 = Sunday) of a WLAN's `schedule_with_duration`. Each entry is a period
 /// the WLAN is off: from each start day at the start time, for its duration,
 /// across midnight (and days) as needed. Blocks that overlap or touch merge.
+///
+/// As the official controller splits them, an entry covers every day its end
+/// falls on: one ending exactly at midnight gives the next day a `(0, 0)` block,
+/// and a zero-length entry is kept as `(start, start)`.
 pub fn blackout_blocks(w: &Value) -> [Vec<(i64, i64)>; 7] {
     let mut days: [Vec<(i64, i64)>; 7] = Default::default();
     for e in arr(w, "schedule_with_duration") {
@@ -952,18 +956,13 @@ pub fn blackout_blocks(w: &Value) -> [Vec<(i64, i64)>; 7] {
         // block lasts at most a week, so the loop below runs at most eight times.
         let start = int_of(e, "start_hour").unwrap_or(0).saturating_mul(60).saturating_add(int_of(e, "start_minute").unwrap_or(0)).clamp(0, 1439);
         let end = start + int_of(e, "duration_minutes").unwrap_or(0).clamp(0, 7 * 1440);
-        if end <= start {
-            continue;
-        }
+        let last = end / 1440;
         for day in str_list(e, "start_days_of_week") {
             let Some(d) = DAYS.iter().position(|x| x.eq_ignore_ascii_case(day)) else { continue };
-            let mut k = 0;
-            // An entry ending exactly at midnight leaves nothing on the next day.
-            while start.max(k * 1440) < end {
-                let from = start.max(k * 1440) - k * 1440;
-                let to = (end - k * 1440).min(1440);
+            for k in 0..=last {
+                let from = if k == 0 { start } else { 0 };
+                let to = if k == last { end - k * 1440 } else { 1440 };
                 days[(d + k as usize) % 7].push((from, to));
-                k += 1;
             }
         }
     }
@@ -1114,14 +1113,49 @@ mod tests {
         let l = lines(&w, false, true);
         assert!(!l.iter().any(|x| x.contains("invert")));
         assert!(l.contains(&"wireless.1.schedule_mon.0=0000-2200".to_string()));
+        // The official writes this block twice (a quirk of its gap walk); apctl writes it once.
         assert_eq!(l.iter().filter(|x| x.contains("schedule_mon")).count(), 1, "nothing after the blackout to 23:59");
         assert!(l.contains(&"wireless.1.schedule_sun.0=0000-2359".to_string()), "a day without blackout is on all day");
         assert!(!l.iter().any(|x| x.contains("schedule_fri")), "a whole-day blackout has no on time");
-        // An entry ending at midnight leaves the next day alone.
+        assert!(l.contains(&"wireless.1.schedule_tue.0=0000-2359".to_string()), "the 0000-0000 block from Monday changes nothing");
+        // An entry ending at midnight gives the next day a 0000-0000 block, as the official sends.
         let w = json!({ "schedule_with_duration": [{ "start_days_of_week": ["mon"], "start_hour": 23, "start_minute": 0, "duration_minutes": 60 }] });
         let b = blackout_blocks(&w);
-        assert_eq!((b[1].clone(), b[2].len()), (vec![(1380, 1440)], 0));
-        assert_eq!(lines(&w, true, false), vec!["wireless.1.schedule_invert=enabled", "wireless.1.schedule_mon=2300-2359"]);
+        assert_eq!((b[1].clone(), b[2].clone()), (vec![(1380, 1440)], vec![(0, 0)]));
+        assert_eq!(lines(&w, true, false), vec!["wireless.1.schedule_invert=enabled", "wireless.1.schedule_mon=2300-2359", "wireless.1.schedule_tue=0000-0000"]);
+    }
+
+    /// The official controller splits an entry over every day `[start, start + duration]`
+    /// touches, the end's day included, so entries ending at midnight (the UI's "all day"
+    /// and "until midnight") give the next day a 0000-0000 block, merged into a block of
+    /// that day starting at 0000; a zero-length entry is a block of its own.
+    #[test]
+    fn blocks_cover_the_day_an_entry_ends_on() {
+        let entry = |day: &str, h: i64, m: i64, d: i64| json!({ "start_days_of_week": [day], "start_hour": h, "start_minute": m, "duration_minutes": d });
+        let all_day = json!({ "schedule_with_duration": [entry("mon", 0, 0, 1440)] });
+        assert_eq!(lines(&all_day, true, true), vec!["wireless.1.schedule_invert=enabled", "wireless.1.schedule_mon.0=0000-2359", "wireless.1.schedule_tue.0=0000-0000"]);
+        let on = lines(&all_day, false, true);
+        assert!(!on.iter().any(|x| x.contains("schedule_mon")), "{on:?}");
+        assert!(on.contains(&"wireless.1.schedule_tue.0=0000-2359".to_string()), "{on:?}");
+        assert_eq!(on.len(), 6, "every other day on all day: {on:?}");
+
+        let late = json!({ "schedule_with_duration": [entry("mon", 22, 0, 120)] });
+        assert_eq!(lines(&late, true, true), vec!["wireless.1.schedule_invert=enabled", "wireless.1.schedule_mon.0=2200-2359", "wireless.1.schedule_tue.0=0000-0000"]);
+        // A later Tuesday block keeps its index after the 0000-0000 one.
+        let w = json!({ "schedule_with_duration": [entry("mon", 22, 0, 120), entry("tue", 9, 0, 60)] });
+        assert_eq!(&lines(&w, true, true)[2..], ["wireless.1.schedule_tue.0=0000-0000", "wireless.1.schedule_tue.1=0900-1000"]);
+        // A Tuesday block from 0000 absorbs it.
+        let w = json!({ "schedule_with_duration": [entry("mon", 22, 0, 120), entry("tue", 0, 0, 30)] });
+        assert_eq!(&lines(&w, true, true)[2..], ["wireless.1.schedule_tue.0=0000-0030"]);
+
+        let zero = json!({ "schedule_with_duration": [entry("wed", 10, 0, 0)] });
+        assert_eq!(blackout_blocks(&zero)[3], vec![(600, 600)]);
+        assert_eq!(lines(&zero, true, true), vec!["wireless.1.schedule_invert=enabled", "wireless.1.schedule_wed.0=1000-1000"]);
+        let on = lines(&zero, false, true);
+        assert!(on.contains(&"wireless.1.schedule_wed.0=0000-1000".to_string()) && on.contains(&"wireless.1.schedule_wed.1=1000-2359".to_string()), "{on:?}");
+        // Touching blocks merge with it.
+        let w = json!({ "schedule_with_duration": [entry("wed", 10, 0, 0), entry("wed", 9, 0, 60)] });
+        assert_eq!(blackout_blocks(&w)[3], vec![(540, 600)]);
     }
 
     #[test]
@@ -1144,7 +1178,7 @@ mod tests {
             { "start_days_of_week": ["wed"], "start_hour": -5, "start_minute": 0, "duration_minutes": 60 },
         ]});
         let b = blackout_blocks(&w);
-        assert!(b.iter().all(|day| day.iter().all(|&(s, e)| (0..1440).contains(&s) && s < e && e <= 1440)), "{b:?}");
+        assert!(b.iter().all(|day| day.iter().all(|&(s, e)| (0..1440).contains(&s) && s <= e && e <= 1440)), "{b:?}");
         assert_eq!(b[1], vec![(0, 1440)], "a week from Monday noon covers Monday");
         assert_eq!(b[3], vec![(0, 1440)]);
     }
