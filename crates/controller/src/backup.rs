@@ -390,18 +390,16 @@ fn snapshot(src: &Path, dst: &Path) -> Result<()> {
 fn copy_for_backup(name: &str, src: &Path, dst: &Path, cutoff: Option<Ts>) -> Result<()> {
     match (name, cutoff) {
         ("config.db", Some(t)) => {
+            // As retention does: an alert still open travels, so a restore neither raises it again
+            // nor loses when it started.
             let take = |table: &str| match store::CONFIG_HISTORY.iter().find(|h| h.table == table) {
                 Some(h) => Take::Since(h.time),
                 None if table == "sessions" => Take::Nothing,
+                None if table == "clients" => Take::Unless(store::old_clients("live")),
+                None if table == "alerts" => Take::Unless(store::OLD_ALERTS.into()),
                 None => Take::All,
             };
-            built(name, src, dst, t, take, |tx| {
-                // As retention does, on the copy: an alert still open travels, so a restore
-                // neither raises it again nor loses when it started.
-                tx.execute(store::FORGET_RESOLVED_ALERTS, [t])?;
-                tx.execute(store::FORGET_OLD_CLIENTS, [t])?;
-                Ok(())
-            })
+            built(name, src, dst, t, take)
         }
         ("config.db", None) => {
             snapshot(src, dst)?;
@@ -413,7 +411,7 @@ fn copy_for_backup(name: &str, src: &Path, dst: &Path, cutoff: Option<Ts>) -> Re
         // Every metric table in every tier.
         ("metrics.db", Some(t)) => {
             let metrics: Vec<String> = store::TABLES.iter().flat_map(|t| store::TIERS.iter().map(move |tier| format!("{}{}", t.name, tier.suffix))).collect();
-            built(name, src, dst, t, |table| if metrics.iter().any(|m| m == table) { Take::Since("ts") } else { Take::All }, |_| Ok(()))
+            built(name, src, dst, t, |table| if metrics.iter().any(|m| m == table) { Take::Since("ts") } else { Take::All })
         }
         (_, cutoff) => {
             snapshot(src, dst)?;
@@ -430,22 +428,23 @@ enum Take {
     All,
     /// Those whose time, in this column, is the cutoff or later.
     Since(&'static str),
+    /// Those this condition (on ?1, the cutoff; the live database is `live`)
+    /// does not hold for.
+    Unless(String),
     /// None: the table is made empty.
     Nothing,
 }
 
 /// A consistent copy of the live database `name` without the history older
-/// than `t`: `take` says which rows of each table, and `finish` then works on
-/// the copy. It is built rather than copied whole and trimmed: a daily backup
-/// reads a year of history, but writes only what it keeps, and the copy has no
-/// free pages. A database with a virtual table (logs.db's full-text index)
-/// cannot be built this way.
-fn built(name: &str, src: &Path, dst: &Path, t: Ts, take: impl Fn(&str) -> Take, finish: impl FnOnce(&rusqlite::Transaction) -> Result<()>) -> Result<()> {
+/// than `t`: `take` says which rows of each table. It is built rather than
+/// copied whole and trimmed: a daily backup reads a year of history, but writes
+/// only what it keeps, and the copy has no free pages. A database with a
+/// virtual table (logs.db's full-text index) cannot be built this way.
+fn built(name: &str, src: &Path, dst: &Path, t: Ts, take: impl Fn(&str) -> Take) -> Result<()> {
     // As `scratch`, for the copy alone (unqualified, the journal mode would be
-    // every attached database's), and what `finish` deletes is not left in
-    // free pages.
+    // every attached database's).
     let mut c = Connection::open(dst)?;
-    c.execute_batch("PRAGMA main.journal_mode=OFF; PRAGMA main.synchronous=OFF; PRAGMA temp_store=MEMORY; PRAGMA busy_timeout=10000; PRAGMA secure_delete=ON;")?;
+    c.execute_batch("PRAGMA main.journal_mode=OFF; PRAGMA main.synchronous=OFF; PRAGMA temp_store=MEMORY; PRAGMA busy_timeout=10000;")?;
     // Read only, through a URI: `?` and `#` in the path are escaped.
     let path = src.to_string_lossy().replace('%', "%25").replace('?', "%3f").replace('#', "%23");
     c.execute("ATTACH DATABASE ?1 AS live", [format!("file:{path}?mode=ro")]).with_context(|| format!("opening {}", src.display()))?;
@@ -471,11 +470,14 @@ fn built(name: &str, src: &Path, dst: &Path, t: Ts, take: impl Fn(&str) -> Take,
         make(table, sql)?;
     }
     for (_, table, _) in made.iter().filter(|(kind, ..)| kind == "table") {
-        // Whole, SQLite copies the table and its indexes page by page (its
-        // transfer optimisation); with a WHERE, row by row.
+        // Whole, SQLite copies the table's and its indexes' records as they are
+        // stored, without decoding them, in index order (its transfer
+        // optimisation); with a WHERE, row by row, decoded.
         let copy = format!("INSERT INTO main.\"{table}\" SELECT * FROM live.\"{table}\"");
         match take(table) {
             Take::All => tx.execute(&copy, [])?,
+            // What a DELETE with the condition would keep: NULL is not true (an open alert's resolved_ts).
+            Take::Unless(cond) => tx.execute(&format!("{copy} WHERE ({cond}) IS NOT TRUE"), [t])?,
             // The same rows whole when none is older: one probe, through the time column's index (spectrum, a
             // few rows a radio, has none).
             Take::Since(time) => match tx.query_row(&format!("SELECT EXISTS (SELECT 1 FROM live.\"{table}\" WHERE \"{time}\" < ?1)"), [t], |r| r.get(0))? {
@@ -488,7 +490,6 @@ fn built(name: &str, src: &Path, dst: &Path, t: Ts, take: impl Fn(&str) -> Take,
     for (_, table, sql) in &rest {
         make(table, sql)?;
     }
-    finish(&tx)?;
     tx.commit()?;
     c.execute_batch("DETACH DATABASE live;")?;
     Ok(())
@@ -510,7 +511,14 @@ fn trim_logs_db(p: &Path, t: Ts) -> Result<()> {
     tx.commit()?;
     let pages = |pragma: &str| c.query_row(&format!("PRAGMA {pragma}"), [], |r| r.get::<_, i64>(0));
     if pages("freelist_count")? * 4 > pages("page_count")? {
-        c.execute_batch("VACUUM;")?;
+        // Into a file beside it, then over it: VACUUM in place builds the compacted
+        // database in a temporary one first, which temp_store=MEMORY holds whole in RAM.
+        let mut compact = p.as_os_str().to_owned();
+        compact.push(".compact");
+        let compact = PathBuf::from(compact);
+        c.execute("VACUUM INTO ?1", [compact.to_string_lossy()])?;
+        drop(c);
+        fs::rename(&compact, p).with_context(|| format!("replacing {}", p.display()))?;
     }
     Ok(())
 }
@@ -1550,6 +1558,30 @@ mod tests {
     }
 
     #[test]
+    fn clients_and_alerts_left_out_of_a_backup_are_never_written_to_it() {
+        let src = data("forget");
+        let old = clock::now_ts() - 40 * 86400;
+        Connection::open(src.join("config.db"))
+            .unwrap()
+            .execute_batch(&format!(
+                "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 5000)
+                 INSERT INTO clients (mac, hostname, last_seen) SELECT printf('bb:bb:bb:bb:%02x:%02x', i / 256, i % 256), 'unnamed', {old} FROM n;
+                 WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 5000)
+                 INSERT INTO alerts (id, ts, key, category, severity, entity, title, message, tag, resolved_ts) SELECT 'resolved-' || i, {old}, 'k', 'c', 'warning', 'e', 't', 'm', 'g', {old} FROM n;"
+            ))
+            .unwrap();
+        let b = Backups::new(src.to_path_buf(), None);
+        let out = dir("forget-out");
+        unpack(&b.dir().join(create(&b, &src, Kind::Manual, 7).unwrap().name), None, &out).unwrap();
+        let cfg = out.join("config.db");
+        assert_eq!((count(&cfg, "SELECT COUNT(*) FROM clients"), count(&cfg, "SELECT COUNT(*) FROM clients WHERE hostname IN ('named', 'recent')")), (2, 2));
+        assert_eq!(ids(&cfg, "alerts"), "open,recent");
+        // Left out as they are copied, not copied and then deleted: no free pages.
+        assert_eq!(count(&cfg, "PRAGMA freelist_count"), 0);
+        assert_eq!(schema(&cfg), schema(&src.join("config.db")));
+    }
+
+    #[test]
     fn a_table_copied_since_the_cutoff_has_the_same_rows_whether_or_not_any_is_older() {
         let d = dir("since");
         let src = d.join("src.db");
@@ -1562,7 +1594,7 @@ mod tests {
             .unwrap();
         let copy = |t: Ts, name: &str| {
             let dst = d.join(name);
-            built("test.db", &src, &dst, t, |_| Take::Since("ts"), |_| Ok(())).unwrap();
+            built("test.db", &src, &dst, t, |_| Take::Since("ts")).unwrap();
             assert_eq!(schema(&dst), schema(&src));
             Connection::open(&dst).unwrap().query_row("SELECT group_concat(mac || ts, ',') FROM (SELECT * FROM h ORDER BY mac, ts)", [], |r| r.get::<_, String>(0)).unwrap()
         };
@@ -1596,6 +1628,34 @@ mod tests {
         c.execute_batch("INSERT INTO logs_fts (logs_fts) VALUES ('integrity-check'); DELETE FROM logs WHERE msg = 'freshword one'; INSERT INTO logs (ts, msg) VALUES (1, 'newer');").unwrap();
         assert_eq!((found("freshword"), found("newer")), (1, 1));
         c.execute_batch("INSERT INTO logs_fts (logs_fts) VALUES ('integrity-check');").unwrap();
+    }
+
+    #[test]
+    fn a_trimmed_logs_db_is_compacted_beside_it_and_replaces_it() {
+        let d = dir("compact");
+        let p = d.join("logs.db");
+        let (store, writer) = store::Store::open(&d).unwrap();
+        drop((store, writer));
+        let now = clock::now_ts();
+        Connection::open(&p)
+            .unwrap()
+            .execute_batch(&format!(
+                "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 5000)
+                 INSERT INTO logs (ts, program, msg) SELECT {old}, 'hostapd', 'stalewords ' || i FROM n;
+                 INSERT INTO logs (ts, program, msg) VALUES ({now}, 'mcad', 'freshword');",
+                old = now - 40 * 86400
+            ))
+            .unwrap();
+        let copy = d.join("copy");
+        fs::create_dir(&copy).unwrap();
+        let dst = copy.join("logs.db");
+        snapshot(&p, &dst).unwrap();
+        trim_logs_db(&dst, now - 7 * 86400).unwrap();
+        let names: Vec<_> = fs::read_dir(&copy).unwrap().map(|e| e.unwrap().file_name()).collect();
+        assert_eq!(names, ["logs.db"], "the compacted file took its place");
+        assert_eq!((count(&dst, "SELECT COUNT(*) FROM logs"), count(&dst, "PRAGMA freelist_count")), (1, 0));
+        assert_eq!(count(&dst, "SELECT COUNT(*) FROM logs_fts WHERE logs_fts MATCH 'freshword'"), 1);
+        Connection::open(&dst).unwrap().execute_batch("INSERT INTO logs_fts (logs_fts) VALUES ('integrity-check');").unwrap();
     }
 
     #[test]

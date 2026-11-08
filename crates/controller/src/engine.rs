@@ -1111,7 +1111,7 @@ impl Engine {
     }
 
     /// Stores the settings, then swaps them into the live view. Serialised
-    /// before the lock is taken.
+    /// before the lock is taken; the settings they replace are dropped after it.
     fn store_state(&self, state: Value, imported_at: Ts) {
         self.writer.exec(
             Db::Config,
@@ -1119,8 +1119,10 @@ impl Engine {
             vec![Sql::Text(state.to_string()), Sql::Integer(imported_at)],
         );
         let mut live = self.live.write().unwrap();
-        live.state = Some(Arc::new(state));
+        let old = live.state.replace(Arc::new(state));
         live.state_imported_at = Some(imported_at);
+        drop(live);
+        drop(old);
     }
 
     fn set_state(&mut self, ts: Ts, mut state: Value) {

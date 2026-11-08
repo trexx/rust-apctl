@@ -3,8 +3,10 @@
 //! The page sends what is typed as binary frames, and its size (`{"cols":80,"rows":24}`;
 //! the first in the query) and `{"pause":…}` (see [`Said`]) as text ones, once
 //! it is told the shell runs; apctl sends what the shell prints as binary frames, `{"connected":true}`
-//! once it runs, `{"error":"…"}` before closing when it cannot, and pings (a
-//! page that answers none of a few has gone). What went wrong goes over the
+//! once it runs, `{"error":"…"}` before closing when it cannot, and pings, each
+//! with a `{"type":"ping"}` text frame, as the live socket's (a page that
+//! answers none of a few has gone; a page that hears nothing for a while takes
+//! the socket as dead). What went wrong goes over the
 //! socket rather than as an HTTP status, which a browser hides from the page.
 //!
 //! The login is the site's device one, else the factory ones, as for adoption
@@ -21,7 +23,7 @@ use inform::Mac;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use crate::api::{ApiError, AppState, MacPath, Query, UNANSWERED, send};
+use crate::api::{ApiError, AppState, MacPath, Query, UNANSWERED, ping, send};
 use crate::auth::SessionId;
 use crate::clock;
 use crate::engine::{Event, EventKind};
@@ -163,8 +165,6 @@ async fn terminal(mut socket: WebSocket, s: AppState, mac: Mac, size: Size, sess
 
 /// Tells the page why its terminal ended (unless it went away), and closes the socket.
 async fn finish(mut socket: WebSocket, end: Result<End, String>) {
-    /// How long the page has to answer the close.
-    const CLOSING: Duration = Duration::from_secs(2);
     let close = |code, reason| Message::Close(Some(CloseFrame { code, reason: Utf8Bytes::from_static(reason) }));
     let last = match end {
         Ok(End::Gone) => return,
@@ -177,12 +177,7 @@ async fn finish(mut socket: WebSocket, end: Result<End, String>) {
             close(close_code::ERROR, "failed")
         }
     };
-    if send(&mut socket, last).await {
-        // Until the page answers, dropping what it sent meanwhile: closing with its frames
-        // unread would reset the connection, and the page could miss why it closed.
-        let answered = async { while let Some(Ok(m)) = socket.recv().await && !matches!(m, Message::Close(_)) {} };
-        let _ = tokio::time::timeout(CLOSING, answered).await;
-    }
+    crate::api::close(socket, last).await;
 }
 
 /// What goes to the AP, in the order the page sent it.
@@ -247,7 +242,7 @@ async fn bridge(socket: &mut WebSocket, s: &AppState, mac: Mac, t: Target, size:
     let mut writer = tokio::spawn(to_ap(input, queued));
     let idle = tokio::time::sleep(pace.idle);
     tokio::pin!(idle);
-    let mut ping = tokio::time::interval_at(tokio::time::Instant::now() + pace.ping, pace.ping);
+    let mut pings = crate::api::pings(pace.ping);
     // Pings sent since the page last sent anything (a pong, say).
     let mut unanswered = 0;
     let mut paused = false;
@@ -259,10 +254,10 @@ async fn bridge(socket: &mut WebSocket, s: &AppState, mac: Mac, t: Target, size:
             _ = &mut idle => break End::Idle,
             // The session ended under the writer.
             _ = &mut writer => break End::Lost,
-            _ = ping.tick() => {
+            _ = pings.tick() => {
                 // Only while the page's frames are read: its pong waits behind what it typed.
                 unanswered += u32::from(reading);
-                if unanswered > UNANSWERED || !send(socket, Message::Ping(Default::default())).await {
+                if unanswered > UNANSWERED || !ping(socket).await {
                     break End::Gone;
                 }
             }
@@ -313,6 +308,7 @@ async fn bridge(socket: &mut WebSocket, s: &AppState, mac: Mac, t: Target, size:
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::api::tests::{error, from_page};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
@@ -521,30 +517,6 @@ mod tests {
         }
     }
 
-    /// A frame from the page: masked, as a browser sends it (with a zero mask, so as it is).
-    async fn from_page(tcp: &mut tokio::net::TcpStream, op: u8, payload: &[u8]) {
-        use tokio::io::AsyncWriteExt;
-        let mut f = vec![0x80 | op];
-        match payload.len() {
-            n @ ..126 => f.push(0x80 | n as u8),
-            n => {
-                f.push(0x80 | 126);
-                f.extend_from_slice(&u16::try_from(n).unwrap().to_be_bytes());
-            }
-        }
-        f.extend_from_slice(&[0; 4]);
-        f.extend_from_slice(payload);
-        tcp.write_all(&f).await.unwrap();
-    }
-
-    /// The error the page is told, and that a close follows it.
-    async fn error(tcp: &mut tokio::net::TcpStream) -> String {
-        use crate::api::tests::frame;
-        let (op, text) = frame(tcp).await;
-        assert_eq!((op, frame(tcp).await.0), (1, 8), "text, then closed");
-        serde_json::from_slice::<Value>(&text).unwrap()["error"].as_str().unwrap().to_string()
-    }
-
     /// The close frame's code and reason, past what the shell prints.
     async fn closed(tcp: &mut tokio::net::TcpStream) -> (u16, String) {
         loop {
@@ -707,7 +679,8 @@ mod tests {
         let (mut tcp, _) = rig.open("ubnt", "&ping_ms=100").await;
         assert_eq!(frame(&mut tcp).await.0, 1, "connected");
         for _ in 0..UNANSWERED {
-            assert_eq!(frame(&mut tcp).await.0, 9, "a ping");
+            assert_eq!(frame(&mut tcp).await, (9, vec![]), "a ping");
+            assert_eq!(frame(&mut tcp).await, (1, crate::api::PING_TEXT.as_bytes().to_vec()), "and one a script sees");
         }
         assert_eq!(tokio::time::timeout(Duration::from_secs(2), rig.ends.recv()).await.unwrap(), Some(Ok(End::Gone)));
     }

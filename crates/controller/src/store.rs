@@ -332,15 +332,18 @@ const NEIGHBOR_RETENTION: Ts = 30 * 86400;
 /// alias). The same rule as a backup's history trim; the engine drops them
 /// from its live view too.
 pub const CLIENT_RETENTION: Ts = 365 * 86400;
-/// Deletes the clients last seen before ?1 that have no name: the retention
-/// above, and a backup's history trim.
-pub const FORGET_OLD_CLIENTS: &str = "DELETE FROM clients WHERE COALESCE(last_seen, 0) < ?1 AND mac NOT IN (SELECT mac FROM client_aliases)";
+/// The clients last seen before ?1 that have no name, the names read from
+/// `db`'s client_aliases (`main`, or a backup's `live`): what the retention
+/// above forgets, and a backup's history trim leaves out.
+pub fn old_clients(db: &str) -> String {
+    format!("COALESCE(last_seen, 0) < ?1 AND mac NOT IN (SELECT mac FROM {db}.client_aliases)")
+}
 /// Resolved alerts are kept this long; open ones until they resolve.
 const ALERT_RETENTION: Ts = 90 * 86400;
-/// Deletes the alerts raised and resolved before ?1 (an open one is kept, so
-/// that it neither comes again nor loses when it started): the retention
-/// above, and a backup's history trim.
-pub const FORGET_RESOLVED_ALERTS: &str = "DELETE FROM alerts WHERE ts < ?1 AND resolved_ts < ?1";
+/// The alerts raised and resolved before ?1 (an open one is kept, so that it
+/// neither comes again nor loses when it started): what the retention above
+/// forgets, and a backup's history trim leaves out.
+pub const OLD_ALERTS: &str = "ts < ?1 AND resolved_ts < ?1";
 /// One of config.db's history tables (see `CONFIG_HISTORY`).
 pub struct History {
     pub table: &'static str,
@@ -615,32 +618,50 @@ fn open_all(dir: &Path) -> Result<Conns> {
     Ok([open_rw(&dir.join(Db::Config.file()))?, open_rw(&dir.join(Db::Metrics.file()))?, open_rw(&dir.join(Db::Logs.file()))?])
 }
 
+/// How long a batch collects writes, from its first one: one inform's writes,
+/// queued together, share one transaction.
+const BATCH: Duration = Duration::from_secs(1);
+
+/// How often an idle writer looks at the time for its maintenance.
+const IDLE_POLL: Duration = Duration::from_millis(250);
+
 /// The channel to the writer stays unbounded: the engine and the request
 /// handlers must never block on the disk, and the writer drains a second's
 /// worth of writes per commit, far more than the APs produce.
+///
+/// A batch is committed once its first write is [`BATCH`] old, at 5000 writes,
+/// or for a Flush: any write is committed within about a second of being queued
+/// (later only behind a commit or maintenance already under way). The page,
+/// told of a stored row on the live socket as soon as its write is queued,
+/// reads it 1.5 s later.
 fn writer_loop(dir: &Path, rx: Receiver<Msg>, health: &Health) -> Result<()> {
     let mut conns = open_all(dir)?;
     let mut pending: Vec<Write> = Vec::new();
     let mut acks: Vec<Sender<bool>> = Vec::new();
     // Whether every batch since the last answer to a Flush committed.
     let mut committed = true;
-    let mut last_flush = Instant::now();
+    // When the pending batch's first write came; None while nothing is pending.
+    let mut batch_since: Option<Instant> = None;
     // The first maintenance a minute after start, with the hourly retention (see `maintenance`).
     let mut last_maintenance = Instant::now().checked_sub(Duration::from_secs(240)).unwrap_or_else(Instant::now);
     let mut last_hourly: Option<Instant> = None;
     loop {
-        match rx.recv_timeout(Duration::from_millis(250)) {
+        let wait = batch_since.map_or(IDLE_POLL, |t| BATCH.saturating_sub(t.elapsed()));
+        match rx.recv_timeout(wait) {
             Ok(Msg::Flush(ack)) => acks.push(ack),
-            Ok(Msg::Write(w)) => pending.push(w),
+            Ok(Msg::Write(w)) => {
+                batch_since.get_or_insert_with(Instant::now);
+                pending.push(w);
+            }
             Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => {
                 commit(&mut conns, &mut pending, health);
                 return Ok(());
             }
         }
-        if !acks.is_empty() || (!pending.is_empty() && (last_flush.elapsed() >= Duration::from_secs(1) || pending.len() >= 5000)) {
+        if !acks.is_empty() || batch_since.is_some_and(|t| t.elapsed() >= BATCH) || pending.len() >= 5000 {
             committed &= commit(&mut conns, &mut pending, health);
-            last_flush = Instant::now();
+            batch_since = None;
             if !acks.is_empty() {
                 for ack in acks.drain(..) {
                     let _ = ack.send(committed);
@@ -650,6 +671,7 @@ fn writer_loop(dir: &Path, rx: Receiver<Msg>, health: &Health) -> Result<()> {
         }
         if last_maintenance.elapsed() >= Duration::from_secs(300) {
             committed &= commit(&mut conns, &mut pending, health);
+            batch_since = None;
             let hourly = last_hourly.is_none_or(|t| t.elapsed() >= Duration::from_secs(3600));
             maintenance(&mut conns, crate::clock::now_ts(), hourly);
             last_maintenance = Instant::now();
@@ -828,8 +850,8 @@ fn maintenance(conns: &mut Conns, now: Ts, hourly: bool) {
         return;
     }
     step("expiring sessions", config.execute("DELETE FROM sessions WHERE expires < ?1", [now]).map(drop).map_err(Into::into));
-    step("retention of clients", config.execute(FORGET_OLD_CLIENTS, [now - CLIENT_RETENTION]).map(drop).map_err(Into::into));
-    step("retention of alerts", config.execute(FORGET_RESOLVED_ALERTS, [now - ALERT_RETENTION]).map(drop).map_err(Into::into));
+    step("retention of clients", config.execute(&format!("DELETE FROM clients WHERE {}", old_clients("main")), [now - CLIENT_RETENTION]).map(drop).map_err(Into::into));
+    step("retention of alerts", config.execute(&format!("DELETE FROM alerts WHERE {OLD_ALERTS}"), [now - ALERT_RETENTION]).map(drop).map_err(Into::into));
 }
 
 /// How long after a bucket ends it is rolled up: rows still queued in the
@@ -1243,6 +1265,29 @@ mod tests {
         let n: i64 = store.read(Db::Config, |c| Ok(c.query_row("SELECT COUNT(*) FROM client_aliases", [], |r| r.get(0))?)).unwrap();
         assert_eq!(n, 1, "committed well before the usual one-second batch");
         assert!(!writer.stopped());
+    }
+
+    #[test]
+    fn a_batch_is_timed_from_its_first_write_and_commits_together() {
+        let dir = temp_dir("batch");
+        let (store, writer) = Store::open(&dir).unwrap();
+        let count = || -> i64 { store.read(Db::Config, |c| Ok(c.query_row("SELECT COUNT(*) FROM client_aliases", [], |r| r.get(0))?)).unwrap() };
+        // After an idle second, as between informs: the first write must not commit alone.
+        std::thread::sleep(Duration::from_millis(1100));
+        let first = Instant::now();
+        writer.exec(Db::Config, "INSERT INTO client_aliases (mac, alias, updated) VALUES ('a', 'x', 1)", vec![]);
+        std::thread::sleep(Duration::from_millis(300));
+        writer.exec(Db::Config, "INSERT INTO client_aliases (mac, alias, updated) VALUES ('b', 'y', 1)", vec![]);
+        let seen = loop {
+            let n = count();
+            assert!(n == 0 || n == 2, "both writes commit in one batch, not {n} alone");
+            if n == 2 {
+                break first.elapsed();
+            }
+            assert!(first.elapsed() < Duration::from_secs(10), "committed within about a second");
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        assert!(seen >= BATCH, "committed {seen:?} after the first write, before the batch was {BATCH:?} old");
     }
 
     #[test]
