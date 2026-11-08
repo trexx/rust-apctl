@@ -1098,7 +1098,10 @@ export const useDeviceNames = (): Names => useDeviceNamesQuery().data ?? NO_NAME
 export const useClientNames = (): Names =>
   useQuery({ queryKey: keys.clientNames(), queryFn: getting<Names>("/api/clients/names"), refetchInterval: 300_000 }).data ?? NO_NAMES;
 
-/** One client, with the peers in its multicast groups; a 404 (HttpError) means it hasn't been seen since apctl started. */
+/**
+ * One client, with the peers in its multicast groups. A 404 (HttpError) means apctl has no record of it: never
+ * seen, or forgotten (unnamed and not seen for a year, store.rs `CLIENT_RETENTION`); a restart keeps every client.
+ */
 export const useClient = (mac: Mac) =>
   useQuery({ queryKey: keys.client(mac), queryFn: getting<ClientDetail>(`/api/clients/${mac}`) });
 

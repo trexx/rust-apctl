@@ -123,7 +123,8 @@ function ClientPage({ mac }: { mac: string }) {
       )}
       {unknown ? (
         <div className="banner">
-          Not seen since the controller started; showing stored history only.
+          apctl has no record of this client (never seen, or forgotten after a
+          year unseen without a name); showing what history is still stored.
         </div>
       ) : (
         !c && client.error && <ErrorNote error={client.error} />
