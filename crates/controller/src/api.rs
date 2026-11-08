@@ -451,11 +451,6 @@ async fn healthz(State(s): State<AppState>) -> Response {
     "ok".into_response()
 }
 
-/// The APs known from the database only: not reporting since apctl started.
-fn stored_only(live: &Live) -> impl Iterator<Item = (&Mac, &KnownDevice)> {
-    live.known_devices.iter().filter(|(mac, _)| !live.devices.contains_key(mac))
-}
-
 /// An AP known from the database only (see `Live::known_devices`), as a live
 /// device view of it, offline: it has what its row and its page show, the rest is empty.
 fn stored_view(k: &KnownDevice) -> DeviceView {
@@ -527,7 +522,7 @@ async fn devices(State(s): State<AppState>) -> Json<Vec<DeviceRow>> {
         }
         let mut list: Vec<DeviceRow> = live.devices.iter().map(|(mac, d)| device_row(*mac, d, per_ap.get(mac).copied().unwrap_or(0))).collect();
         // Then the APs not reporting since apctl started, by MAC as the others.
-        let mut stored: Vec<DeviceRow> = stored_only(&live).map(|(mac, k)| device_row(*mac, &stored_view(k), 0)).collect();
+        let mut stored: Vec<DeviceRow> = live.known_devices.iter().map(|(mac, k)| device_row(*mac, &stored_view(k), 0)).collect();
         stored.sort_unstable_by_key(|d| d.mac);
         list.append(&mut stored);
         list
@@ -1194,11 +1189,11 @@ async fn ws(State(s): State<AppState>, session: Option<axum::Extension<crate::au
     let rx = s.tx.subscribe();
     // The session require_login let the request in with, which the socket keeps checking.
     let (auth, session) = (s.auth.clone(), session.map(|s| s.0.hash));
-    upgrade.read_buffer_size(LIVE_FRAME).max_frame_size(LIVE_FRAME).max_message_size(LIVE_FRAME).on_upgrade(move |socket| live_socket(socket, rx, auth, session))
+    upgrade.read_buffer_size(LIVE_FRAME).max_frame_size(LIVE_FRAME).max_message_size(LIVE_FRAME).on_upgrade(move |socket| live_socket(socket, rx, auth, session, PING))
 }
 
 /// The most a frame, and a message, from a page may hold on the live socket:
-/// it sends nothing but control frames (pongs and its close: 125 bytes at most).
+/// it sends nothing but control frames (pongs to [`PING`]s, and its close: 125 bytes at most).
 /// A bigger one closes the socket before it is read in. Its read buffer is
 /// this size too: tungstenite holds the buffer while the socket is open and
 /// zero-fills it on every read, once per message sent (128 KiB by default).
@@ -1209,6 +1204,25 @@ const SESSION_RECHECK: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Tells a client that missed messages to refetch rather than dropping it.
 const RESYNC: &str = r#"{"type":"resync"}"#;
+
+/// How often a socket pings its page (the live socket and the terminal). A
+/// browser answers with a pong, which no script sees: the live socket also
+/// sends its page [`LIVE_PING`] then, which a page can watch for.
+pub(crate) const PING: std::time::Duration = std::time::Duration::from_secs(30);
+/// How many pings in a row a page may leave unanswered (while its frames are
+/// read): then it has gone (a laptop asleep, a network change, a proxy that
+/// dropped the connection). Anything from the page answers, as a pong does.
+pub(crate) const UNANSWERED: u32 = 3;
+/// What the live socket sends its page with each ping.
+const LIVE_PING: &str = r#"{"type":"ping"}"#;
+/// How long a page may take to take in a frame: one that takes in nothing
+/// for that long has gone.
+pub(crate) const SEND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// Sends a page a frame; false when it has gone, or took in nothing for [`SEND_TIMEOUT`].
+pub(crate) async fn send(socket: &mut WebSocket, msg: Message) -> bool {
+    matches!(tokio::time::timeout(SEND_TIMEOUT, socket.send(msg)).await, Ok(Ok(())))
+}
 
 /// Serialises each live message once, whatever the number of sockets: a task
 /// forwards the engine's messages as JSON text to the channel they read.
@@ -1264,28 +1278,38 @@ pub(crate) fn logged_out() -> Message {
     Message::Close(Some(axum::extract::ws::CloseFrame { code: axum::extract::ws::close_code::POLICY, reason: Utf8Bytes::from_static("logged out") }))
 }
 
-/// Streams the live messages until the client goes, or its session does
-/// (checked at the upgrade, then by [`session_ends`]).
-async fn live_socket(mut socket: WebSocket, mut rx: broadcast::Receiver<Utf8Bytes>, auth: crate::auth::SharedAuth, session: Option<String>) {
+/// Streams the live messages until the client goes (closes, answers no pings
+/// sent `ping` apart, or takes in nothing for [`SEND_TIMEOUT`]), or its session
+/// does (checked at the upgrade, then by [`session_ends`]).
+async fn live_socket(mut socket: WebSocket, mut rx: broadcast::Receiver<Utf8Bytes>, auth: crate::auth::SharedAuth, session: Option<String>, ping: std::time::Duration) {
     let ended = session_ends(&auth, session.as_deref());
     tokio::pin!(ended);
+    let mut pings = tokio::time::interval_at(tokio::time::Instant::now() + ping, ping);
+    // Pings sent since the page last sent anything.
+    let mut unanswered = 0;
     loop {
         tokio::select! {
             _ = &mut ended => {
-                let _ = socket.send(logged_out()).await;
+                send(&mut socket, logged_out()).await;
                 return;
+            }
+            _ = pings.tick() => {
+                unanswered += 1;
+                if unanswered > UNANSWERED || !send(&mut socket, Message::Ping(Default::default())).await || !send(&mut socket, Message::Text(Utf8Bytes::from_static(LIVE_PING))).await {
+                    return;
+                }
             }
             msg = rx.recv() => match msg {
                 // Shared text: sending it copies nothing.
                 Ok(text) => {
-                    if socket.send(Message::Text(text)).await.is_err() {
+                    if !send(&mut socket, Message::Text(text)).await {
                         return;
                     }
                 }
                 // The page refetches everything: what is still buffered is stale, and skipped.
                 Err(broadcast::error::RecvError::Lagged(_)) => {
                     rx = rx.resubscribe();
-                    if socket.send(Message::Text(Utf8Bytes::from_static(RESYNC))).await.is_err() {
+                    if !send(&mut socket, Message::Text(Utf8Bytes::from_static(RESYNC))).await {
                         return;
                     }
                 }
@@ -1293,7 +1317,7 @@ async fn live_socket(mut socket: WebSocket, mut rx: broadcast::Receiver<Utf8Byte
             },
             incoming = socket.recv() => match incoming {
                 Some(Ok(Message::Close(_))) | None | Some(Err(_)) => return,
-                _ => {}
+                _ => unanswered = 0,
             },
         }
     }
@@ -1915,6 +1939,35 @@ pub(crate) mod tests {
         tcp.write_all(&[0x82, 0x80 | 126, 0x08, 0x00, 0, 0, 0, 0]).await.unwrap();
         let mut rest = Vec::new();
         let _ = tokio::time::timeout(std::time::Duration::from_secs(5), tcp.read_to_end(&mut rest)).await.expect("closed");
+    }
+
+    #[tokio::test]
+    async fn the_live_socket_pings_its_page_and_lets_go_of_one_that_answers_none() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let (state, _engine, _cookie, _dir) = logged_in();
+        let (auth, tx) = (state.auth.clone(), state.tx.clone());
+        let page = move |upgrade: WebSocketUpgrade| async move {
+            let rx = tx.subscribe();
+            upgrade.on_upgrade(move |socket| live_socket(socket, rx, auth, None, std::time::Duration::from_millis(100)))
+        };
+        let (status, mut tcp) = handshake(serve(Router::new().route("/w", axum::routing::get(page))).await, "/w", "", None).await;
+        assert_eq!(status, "101");
+        let pinged = async |tcp: &mut tokio::net::TcpStream| {
+            assert_eq!(frame(tcp).await, (9, vec![]), "a ping");
+            assert_eq!(frame(tcp).await, (1, LIVE_PING.as_bytes().to_vec()), "and one a script sees");
+        };
+        // Answered (a pong, masked as from a browser): open past more pings than may go unanswered.
+        for _ in 0..UNANSWERED + 2 {
+            pinged(&mut tcp).await;
+            tcp.write_all(&[0x8a, 0x80, 0, 0, 0, 0]).await.unwrap();
+        }
+        // Unanswered: let go at the next ping, with nothing more sent.
+        for _ in 0..UNANSWERED {
+            pinged(&mut tcp).await;
+        }
+        let mut rest = Vec::new();
+        tokio::time::timeout(std::time::Duration::from_secs(5), tcp.read_to_end(&mut rest)).await.expect("closed").unwrap();
+        assert!(rest.is_empty());
     }
 
     #[tokio::test]

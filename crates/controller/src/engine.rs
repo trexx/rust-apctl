@@ -242,7 +242,8 @@ pub struct Live {
     /// For attributing syslog: an AP's `hash_id` (see `syslog::hash_id`) and IP address.
     pub by_hash_id: HashMap<u64, Mac>,
     pub by_ip: HashMap<String, Mac>,
-    /// APs known from the database before their first inform in this process.
+    /// APs known from the database before their first inform in this process
+    /// (never also in `devices`: an AP's first inform moves it there).
     pub known_devices: HashMap<Mac, KnownDevice>,
     /// Imported controller settings (contain secrets: never serialised).
     pub state: Option<Arc<Value>>,
@@ -2734,6 +2735,29 @@ mod tests {
         assert_eq!(edit(&mut h, Box::new(|_| Ok("nothing changed".into()))).as_deref(), Ok("nothing changed"));
         let kinds: Vec<_> = events(&mut h).into_iter().map(|e| e.0).collect();
         assert_eq!(kinds, ["settings_imported", "settings_changed"]);
+    }
+
+    #[test]
+    fn an_aps_client_count_is_unknown_without_a_vap_table_and_zero_with_an_empty_one() {
+        let mut h = harness();
+        let sta = |mac: &str| json!({ "mac": mac, "signal": -60 });
+        for (ts, vaps) in [
+            (0, None),
+            (10, Some(json!([]))),
+            (20, Some(json!([{ "bssid": "b1", "radio": "na", "usage": "user", "sta_table": [sta(C1), sta("02:00:00:00:01:02")] }]))),
+        ] {
+            let mut p = json!({ "mac": AP1, "uptime": 1000 + ts });
+            if let Some(v) = vaps {
+                p["vap_table"] = v;
+            }
+            h.engine.handle(Input::Inform { ts, payload: p });
+        }
+        flushed(&h.writer);
+        let rows: Vec<(Ts, Option<f64>)> = h
+            .store
+            .read(Db::Metrics, |c| Ok(c.prepare("SELECT ts, num_sta FROM ap_stats ORDER BY ts")?.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<rusqlite::Result<_>>()?))
+            .unwrap();
+        assert_eq!(rows, [(0, None), (10, Some(0.0)), (20, Some(2.0))], "a gap in the chart, not a drop to zero");
     }
 
     #[test]

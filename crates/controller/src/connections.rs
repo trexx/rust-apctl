@@ -458,7 +458,11 @@ pub struct RoamFrom {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct Roam {
+    /// The later of the leave and the join.
     pub ts: Ts,
+    /// The join's own time: the client's attempt on `to.ap` at this time, if
+    /// the join was one, is the one this roam paired.
+    pub join_ts: Ts,
     pub client: String,
     pub from: RoamFrom,
     pub to: RoamEnd,
@@ -516,6 +520,7 @@ pub fn roams(events: &[ConnEvent]) -> Vec<Roam> {
             let status = num(&l.n.assoc_status).unwrap_or(0.0) as i64;
             out.push(Roam {
                 ts: j.ts.max(l.ts),
+                join_ts: j.ts,
                 client: client.to_string(),
                 from: RoamFrom { ap: l.ap.clone(), radio: l.radio.clone(), rssi: num(&l.n.avg_rssi) },
                 to: RoamEnd { ap: j.ap.clone(), essid: j.essid.clone(), radio: j.radio.clone(), channel: int(&j.n.x_channel), bw: int(&j.n.x_bw), rssi: num(&j.n.auth_rssi) },
@@ -1050,7 +1055,7 @@ mod tests {
     #[test]
     fn roam_totals_count_successes_and_fast_roams() {
         let end = |ap: &str| RoamEnd { ap: ap.into(), essid: None, radio: None, channel: None, bw: None, rssi: None };
-        let roam = |success, fast| Roam { ts: 1, client: "c".into(), from: RoamFrom { ap: "a".into(), radio: None, rssi: None }, to: end("b"), success, gap_s: None, fast, min_rssi: false, assistant: false };
+        let roam = |success, fast| Roam { ts: 1, join_ts: 1, client: "c".into(), from: RoamFrom { ap: "a".into(), radio: None, rssi: None }, to: end("b"), success, gap_s: None, fast, min_rssi: false, assistant: false };
         let r = [roam(true, true), roam(true, false), roam(false, false)];
         let t = roam_totals(&r, &roam_clients(&r));
         assert_eq!(t, json!({ "roams": 3, "successes": 2, "fast": 1, "clients": 1, "to_weaker": 0, "quick_returns": 0 }));
@@ -1065,7 +1070,7 @@ mod tests {
         let mut r = Vec::new();
         for i in 0..12 {
             for k in 0..=i {
-                r.push(Roam { ts: 1000 * k + i, client: format!("c{i:02}"), from: from("A", -60.0), to: end("B", -70.0), success: true, gap_s: None, fast: false, min_rssi: false, assistant: false });
+                r.push(Roam { ts: 1000 * k + i, join_ts: 1000 * k + i, client: format!("c{i:02}"), from: from("A", -60.0), to: end("B", -70.0), success: true, gap_s: None, fast: false, min_rssi: false, assistant: false });
             }
         }
         r.sort_by_key(|x| x.ts);
@@ -1075,6 +1080,17 @@ mod tests {
         assert_eq!(json!(f.pairs[0].top_clients), json!([{ "mac": "c11", "roams": 12 }, { "mac": "c10", "roams": 11 }, { "mac": "c09", "roams": 10 }]));
         assert_eq!(f.shown.len(), 12, "the listed clients, the pairs' top ones among them, and those of the 78 roams listed");
         assert_eq!((f.aps.as_slice(), f.roams.len(), f.roams[0].ts), (["A".to_string(), "B".to_string()].as_slice(), 78, 11_011), "newest first");
+    }
+
+    #[test]
+    fn a_roam_names_the_time_of_its_join_which_its_attempt_has_too() {
+        // Joined (a fresh connection, not a soft failure) before the leave was reported.
+        let events = vec![conn(400, "c", "B", "success", json!({ "traffic_delta": 120000, "dns_responses": 1, "auth_rssi": -50 })), conn(405, "c", "A", "sta_leave", json!({ "avg_rssi": -75 }))];
+        let r = roams(&events);
+        assert_eq!(r.iter().map(|r| (r.ts, r.join_ts)).collect::<Vec<_>>(), [(405, 400)], "at the later of the two, and the join's own time");
+        let a = attempts(events);
+        assert_eq!(a.iter().filter(|a| a.ts == r[0].join_ts && a.ap == r[0].to.ap && a.client == r[0].client).count(), 1, "the paired attempt");
+        assert!(!a[0].roam, "whatever its roam flag");
     }
 
     #[test]

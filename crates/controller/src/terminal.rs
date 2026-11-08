@@ -21,7 +21,7 @@ use inform::Mac;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use crate::api::{ApiError, AppState, MacPath, Query};
+use crate::api::{ApiError, AppState, MacPath, Query, UNANSWERED, send};
 use crate::auth::SessionId;
 use crate::clock;
 use crate::engine::{Event, EventKind};
@@ -40,14 +40,6 @@ const READ_BUFFER: usize = 16 << 10;
 /// How many of the page's frames may wait for the AP to take them in: then
 /// the page's are read no further until it does (TCP holds the page back).
 const QUEUED: usize = 16;
-/// How long the page may take to take in a frame: one that takes in nothing
-/// for that long has gone.
-const SEND_TIMEOUT: Duration = Duration::from_secs(20);
-
-/// How many pings in a row the page may leave unanswered (while its frames
-/// are read): then it has gone (a laptop asleep, a network change, a proxy
-/// that dropped the connection).
-const UNANSWERED: u32 = 3;
 
 /// A terminal's timers.
 struct Pace {
@@ -57,7 +49,7 @@ struct Pace {
     ping: Duration,
 }
 
-const PACE: Pace = Pace { idle: Duration::from_secs(30 * 60), ping: Duration::from_secs(30) };
+const PACE: Pace = Pace { idle: Duration::from_secs(30 * 60), ping: crate::api::PING };
 
 /// A terminal's size in characters, as the page measures it.
 #[derive(Debug, Default, Deserialize, PartialEq)]
@@ -66,7 +58,7 @@ pub struct Size {
     rows: Option<u32>,
 }
 
-/// A text frame from the page: its size, or `{"pause":true}` while it shows
+/// A text frame from the page: its size (both, else the frame is ignored), or `{"pause":true}` while it shows
 /// what it was sent so far and `{"pause":false}` once it has. While paused, the
 /// AP's output waits in the SSH session's buffer, and once that is full the
 /// session with it (what is typed too), unless the page's frames wait for the
@@ -178,7 +170,7 @@ async fn finish(mut socket: WebSocket, end: Result<End, String>) {
         Ok(End::Gone) => return,
         Ok(End::Exited) => close(close_code::NORMAL, "the shell ended"),
         Ok(End::Lost) => close(close_code::ERROR, "the connection to the AP was lost"),
-        Ok(End::Idle) => close(close_code::NORMAL, "closed after 30 minutes without input"),
+        Ok(End::Idle) => Message::Close(Some(CloseFrame { code: close_code::NORMAL, reason: format!("closed after {} minutes without input", PACE.idle.as_secs() / 60).into() })),
         Ok(End::LoggedOut) => crate::api::logged_out(),
         Err(e) => {
             send(&mut socket, Message::Text(json!({ "error": e }).to_string().into())).await;
@@ -191,11 +183,6 @@ async fn finish(mut socket: WebSocket, end: Result<End, String>) {
         let answered = async { while let Some(Ok(m)) = socket.recv().await && !matches!(m, Message::Close(_)) {} };
         let _ = tokio::time::timeout(CLOSING, answered).await;
     }
-}
-
-/// Sends the page a frame; false when it has gone, or took in nothing for [`SEND_TIMEOUT`].
-async fn send(socket: &mut WebSocket, msg: Message) -> bool {
-    matches!(tokio::time::timeout(SEND_TIMEOUT, socket.send(msg)).await, Ok(Ok(())))
 }
 
 /// What goes to the AP, in the order the page sent it.
@@ -223,7 +210,7 @@ async fn to_ap(input: russh::ChannelWriteHalf<russh::client::Msg>, mut queue: to
 /// Logs in to the AP and starts its shell (unless the page goes or its
 /// session ends meanwhile), and carries the terminal both ways until one side
 /// ends it. Nothing in the loop waits on the AP taking input in, nor on the
-/// page for longer than [`SEND_TIMEOUT`], so it always sees a logout, the idle
+/// page for longer than [`SEND_TIMEOUT`](crate::api::SEND_TIMEOUT), so it always sees a logout, the idle
 /// limit and the page's end.
 async fn bridge(socket: &mut WebSocket, s: &AppState, mac: Mac, t: Target, size: &Size, session: &SessionId, pace: &Pace) -> Result<End, String> {
     let ended = crate::api::session_ends(&s.auth, Some(&session.hash));
@@ -303,11 +290,12 @@ async fn bridge(socket: &mut WebSocket, s: &AppState, mac: Mac, t: Target, size:
                     }
                     Some(Ok(Message::Text(text))) => match serde_json::from_str::<Said>(&text) {
                         Ok(Said { pause: Some(pause), .. }) => paused = pause,
-                        Ok(Said { size, .. }) => {
+                        // Left out, a size is unchanged, not the opening query's 80×24.
+                        Ok(Said { size: size @ Size { cols: Some(_), rows: Some(_) }, .. }) => {
                             let (cols, rows) = size.clamped();
                             let _ = queue.try_send(ToAp::Size(cols, rows));
                         }
-                        Err(_) => {}
+                        _ => {}
                     },
                     Some(Ok(Message::Close(_)) | Err(_)) | None => break End::Gone,
                     _ => {}
@@ -589,6 +577,12 @@ mod tests {
         assert!(held.is_err(), "nothing while paused");
         from_page(&mut tcp, 1, br#"{"pause":false}"#).await;
         assert_eq!(frame(&mut tcp).await, (2, b"Y".to_vec()));
+        // Neither a pause nor a whole size: nothing changes.
+        for said in [&br#"{"cols":90}"#[..], br#"{"rows":20}"#, b"{}", br#"{"pause":null}"#, b"[]"] {
+            from_page(&mut tcp, 1, said).await;
+        }
+        from_page(&mut tcp, 2, b"z").await;
+        assert_eq!(frame(&mut tcp).await, (2, b"Z".to_vec()));
         assert_eq!(rig.shell.sizes.lock().unwrap().len(), 2, "no resize");
         // The shell exits: a normal close, saying so.
         from_page(&mut tcp, 2, b"exit\r").await;
