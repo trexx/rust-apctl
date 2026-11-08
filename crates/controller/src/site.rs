@@ -145,8 +145,10 @@ fn site_syslog(doc: &mut Value, r: &Value) -> Result<(), String> {
         None => {}
         Some("off") => {
             doc["enabled"] = json!(false);
+            doc["this_controller"] = json!(false);
             doc["log_all_contents"] = json!(true);
             doc["debug"] = json!(false);
+            doc["netconsole_enabled"] = json!(false);
         }
         Some("controller") => {
             doc["enabled"] = json!(true);
@@ -613,6 +615,14 @@ mod tests {
         edit(&mut s, json!({ "rsyslogd": { "mode": "controller" } })).unwrap();
         let r = setting(&s, "rsyslogd");
         assert_eq!((r["this_controller"].as_bool(), r["log_all_contents"].as_bool(), r["netconsole_enabled"].as_bool()), (Some(true), Some(true), Some(false)));
+        // Off is saved as the official UI saves it: netconsole off too, which the render would send otherwise.
+        edit(&mut s, json!({ "rsyslogd": { "mode": "server", "ip": "logs.example.net", "debug": true, "netconsole_enabled": true, "netconsole_host": "192.0.2.9" } })).unwrap();
+        edit(&mut s, json!({ "rsyslogd": { "mode": "off", "netconsole_enabled": true } })).unwrap();
+        let r = setting(&s, "rsyslogd");
+        let off = ["enabled", "this_controller", "debug", "netconsole_enabled", "this_controller_encrypted_only", "log_all_contents"].map(|k| r[k].as_bool());
+        assert_eq!(off, [Some(false), Some(false), Some(false), Some(false), Some(false), Some(true)]);
+        assert_eq!((r["ip"].as_str(), r["netconsole_host"].as_str()), (Some("logs.example.net"), Some("192.0.2.9")), "the hosts are kept for going back");
+        assert_eq!(site_view(&s, false)["rsyslogd"]["mode"], "off");
 
         assert!(edit(&mut s, json!({ "ntp": { "setting_preference": "manual" } })).is_err());
         edit(&mut s, json!({ "ntp": { "setting_preference": "manual", "ntp_server_1": "time.example.net", "ntp_server_2": "", "ntp_server_3": "192.0.2.1" } })).unwrap();
