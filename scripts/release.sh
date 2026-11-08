@@ -174,14 +174,15 @@ echo "published $IMAGE:$version@$digest"
 # image), so the manifest exists while that check runs, or after it failed: pin only once
 # the tag's Build run for HEAD has passed. Without gh that is left unchecked.
 if type -P gh >/dev/null; then
-  # "<status> <conclusion> <url>" of the newest run, or "null null null" before there is one.
+  # "<status> <url> <conclusion>" of the newest run, or "null null null" before there is one.
+  # The conclusion is last: it is empty while the run is going, and read would then shift the URL into it.
   build_run() {
     gh run list --workflow build.yml --branch "$version" --event push --commit "$head" -L 1 \
-      --json status,conclusion,url -q '.[0] // {} | "\(.status) \(.conclusion) \(.url)"'
+      --json status,conclusion,url -q '.[0] // {} | "\(.status) \(.url) \(.conclusion)"'
   }
   echo "== waiting for the Build run of $version to pass"
   until run=$(build_run) || { echo "could not list the Build runs with gh; is it logged in (gh auth status)?" >&2; exit 1; }
-        read -r status conclusion url <<<"$run"; [ "$status" = completed ]; do
+        read -r status url conclusion <<<"$run"; [ "$status" = completed ]; do
     if [ $SECONDS -ge $deadline ]; then
       echo "the Build run of $version has not finished after ${WAIT}s (${url/#null/no run found})" >&2
       exit 1
