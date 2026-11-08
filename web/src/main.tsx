@@ -3,6 +3,7 @@ import {
   StrictMode,
   Suspense,
   useEffect,
+  useLayoutEffect,
   useRef,
   useState,
 } from "react";
@@ -56,6 +57,11 @@ const Client = lazyNamed(() => import("./pages/Client"), "Client");
 const Settings = lazyNamed(() => import("./pages/Settings"), "Settings");
 const Radios = lazyNamed(() => import("./pages/Radios"), "Radios");
 const Config = lazyNamed(() => import("./pages/Config"), "Config");
+
+// The app keeps each page's scroll position (see ScrollKeeper): the browser's
+// own restoration runs against the page still shown, since the router renders
+// the next one in a transition.
+history.scrollRestoration = "manual";
 
 const queryClient = new QueryClient({
   defaultOptions: {
@@ -176,22 +182,6 @@ function Shell({ user, readOnly }: { user: string | null; readOnly: boolean }) {
   const qc = useQueryClient();
   const status = useStatus();
   const location = useLocation();
-  const navigation = useNavigationType();
-  const shown = useRef(location.pathname);
-  useEffect(() => {
-    // A link opens its page at the top, or at the element its #fragment names
-    // when that is already shown (the browser does neither for a link within
-    // the app; a page still loading opens at its top). Another ?tab= of the
-    // same page keeps its place, and back and forward leave the browser's own
-    // scroll restoration alone.
-    const moved = shown.current !== location.pathname;
-    shown.current = location.pathname;
-    if (navigation === "POP" || (!moved && !location.hash)) return;
-    const target =
-      location.hash && document.getElementById(location.hash.slice(1));
-    if (target) target.scrollIntoView();
-    else window.scrollTo(0, 0);
-  }, [location, navigation]);
   useEffect(() => {
     // A failure here shows again, and is handled, when the page is opened.
     const t = setTimeout(() => {
@@ -250,9 +240,9 @@ function Shell({ user, readOnly }: { user: string | null; readOnly: boolean }) {
         )}
       </header>
       <main>
-        {/* With the search, so that another tab (?tab=) of a page that failed starts afresh. */}
-        <ErrorBoundary resetKey={location.pathname + location.search}>
-          <Suspense fallback={<Loading />}>
+        <Suspense fallback={<Loading />}>
+          {/* With the search, so that another tab (?tab=) of a page that failed starts afresh. */}
+          <ErrorBoundary resetKey={location.pathname + location.search}>
             <Routes>
               <Route path="/" element={<Overview />} />
               <Route path="/devices/:mac" element={<Device />} />
@@ -274,11 +264,57 @@ function Shell({ user, readOnly }: { user: string | null; readOnly: boolean }) {
                 element={<div className="pad muted">Page not found</div>}
               />
             </Routes>
-          </Suspense>
-        </ErrorBoundary>
+          </ErrorBoundary>
+          <ScrollKeeper />
+        </Suspense>
       </main>
     </div>
   );
+}
+
+/** Scroll offsets by history entry, as last scrolled (see ScrollKeeper). */
+const scrolled = new Map<string, number>();
+
+/**
+ * Each page's scroll position. A link opens its page at the top, or at the
+ * element its #fragment names (a page still loading opens at its top), and so
+ * does the first page loaded; another ?tab= of the same page keeps its place;
+ * back and forward return to where that entry was left. Rendered after the
+ * page in its Suspense boundary, its layout effect runs once the page (lazy or
+ * not) is in the document and before it is painted.
+ */
+function ScrollKeeper() {
+  const location = useLocation();
+  const navigation = useNavigationType();
+  // The entry shown.
+  const shown = useRef<{ key: string; path: string } | null>(null);
+  useEffect(() => {
+    // Read when the browser scrolls, after the layout effect below has moved
+    // `shown` to the entry on screen.
+    const onScroll = () => {
+      if (shown.current) scrolled.set(shown.current.key, window.scrollY);
+    };
+    window.addEventListener("scroll", onScroll, { passive: true });
+    return () => window.removeEventListener("scroll", onScroll);
+  }, []);
+  useLayoutEffect(() => {
+    const prev = shown.current;
+    // The same entry again: the boundary shown again, or StrictMode's re-run.
+    if (prev?.key === location.key) return;
+    shown.current = { key: location.key, path: location.pathname };
+    // An entry left in this session (one from before a reload opens as a link).
+    const back = navigation === "POP" ? scrolled.get(location.key) : undefined;
+    if (back !== undefined) window.scrollTo(0, back);
+    else if (!prev || prev.path !== location.pathname || location.hash) {
+      const target =
+        location.hash && document.getElementById(location.hash.slice(1));
+      if (target) target.scrollIntoView();
+      else window.scrollTo(0, 0);
+    }
+    // Where it opened, in case it is left without a scroll.
+    scrolled.set(location.key, window.scrollY);
+  }, [location, navigation]);
+  return null;
 }
 
 createRoot(document.getElementById("root")!).render(
