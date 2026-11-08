@@ -132,10 +132,7 @@ fn site_syslog(doc: &mut Value, r: &Value) -> Result<(), String> {
         None => {}
         Some("off") => {
             doc["enabled"] = json!(false);
-            doc["this_controller"] = json!(false);
             doc["log_all_contents"] = json!(true);
-            doc["debug"] = json!(false);
-            doc["netconsole_enabled"] = json!(false);
         }
         Some("controller") => {
             doc["enabled"] = json!(true);
@@ -149,6 +146,13 @@ fn site_syslog(doc: &mut Value, r: &Value) -> Result<(), String> {
             doc["log_all_contents"] = json!(true);
         }
         Some(_) => return Err("the syslog mode must be off, controller or server".into()),
+    }
+    // Off as the official UI saves it, read from the result whatever the patch named
+    // (the render, as the official's, sends netconsole with syslog off too).
+    if !flag(doc, "enabled", false) {
+        for k in ["this_controller", "debug", "netconsole_enabled"] {
+            doc[k] = json!(false);
+        }
     }
     doc["this_controller_encrypted_only"] = json!(false);
     // The syslog server and the netconsole host: an IPv4 address or a name, as a time server.
@@ -610,6 +614,15 @@ mod tests {
         assert_eq!(off, [Some(false), Some(false), Some(false), Some(false), Some(false), Some(true)]);
         assert_eq!((r["ip"].as_str(), r["netconsole_host"].as_str()), (Some("logs.example.net"), Some("192.0.2.9")), "the hosts are kept for going back");
         assert_eq!(site_view(&s, false)["rsyslogd"]["mode"], "off");
+        // A patch naming no mode on a document stored Off leaves it Off, companions and all.
+        edit(&mut s, json!({ "rsyslogd": { "netconsole_enabled": true, "netconsole_host": "192.0.2.10", "debug": true } })).unwrap();
+        let r = setting(&s, "rsyslogd");
+        assert_eq!(["enabled", "this_controller", "debug", "netconsole_enabled"].map(|k| r[k].as_bool()), [Some(false); 4]);
+        assert_eq!(r["netconsole_host"], "192.0.2.10");
+        // Stored Off with netconsole on (an import): unticking it alone is accepted.
+        setting_mut(&mut s, "rsyslogd")["netconsole_enabled"] = json!(true);
+        edit(&mut s, json!({ "rsyslogd": { "netconsole_enabled": false } })).unwrap();
+        assert_eq!(setting(&s, "rsyslogd")["netconsole_enabled"], false);
 
         assert!(edit(&mut s, json!({ "ntp": { "setting_preference": "manual" } })).is_err());
         edit(&mut s, json!({ "ntp": { "setting_preference": "manual", "ntp_server_1": "time.example.net", "ntp_server_2": "", "ntp_server_3": "192.0.2.1" } })).unwrap();
