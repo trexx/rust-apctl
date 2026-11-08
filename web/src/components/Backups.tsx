@@ -334,7 +334,7 @@ export function BackupSection() {
   if (!b.data) return <QueryNote q={b} panel />;
   const d = b.data;
   return (
-    <div className="panel" id="backups">
+    <div className="panel">
       <div className="panel-head">
         <b>Backups</b>
         {d.encrypted ? (

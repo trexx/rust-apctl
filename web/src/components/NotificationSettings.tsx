@@ -47,7 +47,7 @@ export function NotificationSettings() {
   };
   const on = prefs.enabled && permission === "granted";
   return (
-    <div className="panel" id="notifications">
+    <div className="panel">
       <div className="panel-head">
         <b>Browser notifications</b>
         <span className="muted small">

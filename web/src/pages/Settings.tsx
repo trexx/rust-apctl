@@ -12,11 +12,16 @@ export function Settings() {
       <div className="page-head">
         <h1>Settings</h1>
       </div>
-      <h2>Notifications</h2>
-      <NotificationSettings />
+      {/* A link to #notifications or #backups shows the heading too. */}
+      <section id="notifications">
+        <h2>Notifications</h2>
+        <NotificationSettings />
+      </section>
 
-      <h2>Backups</h2>
-      <BackupSection />
+      <section id="backups">
+        <h2>Backups</h2>
+        <BackupSection />
+      </section>
 
       <h2>Site settings</h2>
       <SiteSettingsPanel />

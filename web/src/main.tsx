@@ -7,7 +7,7 @@ import {
   useRef,
   useState,
 } from "react";
-import type { ReactNode } from "react";
+import type { ReactNode, RefObject } from "react";
 import { createRoot } from "react-dom/client";
 import {
   QueryClient,
@@ -182,6 +182,7 @@ function Shell({ user, readOnly }: { user: string | null; readOnly: boolean }) {
   const qc = useQueryClient();
   const status = useStatus();
   const location = useLocation();
+  const header = useRef<HTMLElement>(null);
   useEffect(() => {
     // A failure here shows again, and is handled, when the page is opened.
     const t = setTimeout(() => {
@@ -191,7 +192,7 @@ function Shell({ user, readOnly }: { user: string | null; readOnly: boolean }) {
   }, []);
   return (
     <div>
-      <header className="top">
+      <header className="top" ref={header}>
         <span className="brand">apctl</span>
         <nav>
           <NavLink to="/" end>
@@ -265,7 +266,7 @@ function Shell({ user, readOnly }: { user: string | null; readOnly: boolean }) {
               />
             </Routes>
           </ErrorBoundary>
-          <ScrollKeeper />
+          <ScrollKeeper header={header} />
         </Suspense>
       </main>
     </div>
@@ -281,9 +282,10 @@ const scrolled = new Map<string, number>();
  * does the first page loaded; another ?tab= of the same page keeps its place;
  * back and forward return to where that entry was left. Rendered after the
  * page in its Suspense boundary, its layout effect runs once the page (lazy or
- * not) is in the document and before it is painted.
+ * not) is in the document and before it is painted. A #fragment's element
+ * lands just below the sticky header, however tall it is at this width.
  */
-function ScrollKeeper() {
+function ScrollKeeper({ header }: { header: RefObject<HTMLElement | null> }) {
   const location = useLocation();
   const navigation = useNavigationType();
   // The entry shown.
@@ -308,12 +310,17 @@ function ScrollKeeper() {
     else if (!prev || prev.path !== location.pathname || location.hash) {
       const target =
         location.hash && document.getElementById(location.hash.slice(1));
-      if (target) target.scrollIntoView();
-      else window.scrollTo(0, 0);
+      const below = (header.current?.offsetHeight ?? 0) + 12;
+      window.scrollTo(
+        0,
+        target
+          ? target.getBoundingClientRect().top + window.scrollY - below
+          : 0,
+      );
     }
     // Where it opened, in case it is left without a scroll.
     scrolled.set(location.key, window.scrollY);
-  }, [location, navigation]);
+  }, [location, navigation, header]);
   return null;
 }
 
