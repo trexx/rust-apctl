@@ -1206,22 +1206,49 @@ const SESSION_RECHECK: std::time::Duration = std::time::Duration::from_secs(30);
 const RESYNC: &str = r#"{"type":"resync"}"#;
 
 /// How often a socket pings its page (the live socket and the terminal). A
-/// browser answers with a pong, which no script sees: the live socket also
-/// sends its page [`LIVE_PING`] then, which a page can watch for.
+/// browser answers with a pong, which no script sees: each ping also comes
+/// with [`PING_TEXT`], which a page can watch for (the page takes 75 s
+/// without a frame, two and a half pings, as a dead socket).
 pub(crate) const PING: std::time::Duration = std::time::Duration::from_secs(30);
 /// How many pings in a row a page may leave unanswered (while its frames are
 /// read): then it has gone (a laptop asleep, a network change, a proxy that
 /// dropped the connection). Anything from the page answers, as a pong does.
 pub(crate) const UNANSWERED: u32 = 3;
-/// What the live socket sends its page with each ping.
-const LIVE_PING: &str = r#"{"type":"ping"}"#;
+/// What a socket sends its page as text with each ping.
+pub(crate) const PING_TEXT: &str = r#"{"type":"ping"}"#;
 /// How long a page may take to take in a frame: one that takes in nothing
 /// for that long has gone.
 pub(crate) const SEND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+/// How long a page has to answer a close.
+const CLOSING: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// Sends a page a frame; false when it has gone, or took in nothing for [`SEND_TIMEOUT`].
 pub(crate) async fn send(socket: &mut WebSocket, msg: Message) -> bool {
     matches!(tokio::time::timeout(SEND_TIMEOUT, socket.send(msg)).await, Ok(Ok(())))
+}
+
+/// A socket's pings, `every` apart from `every` after it opened. A loop held up
+/// (a slow send, a stalled runtime) sends the next one `every` after it resumes,
+/// never the missed ones back to back, so a page always has a ping's time to answer.
+pub(crate) fn pings(every: std::time::Duration) -> tokio::time::Interval {
+    let mut pings = tokio::time::interval_at(tokio::time::Instant::now() + every, every);
+    pings.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    pings
+}
+
+/// Pings a page: a ping, then [`PING_TEXT`]. False when it has gone.
+pub(crate) async fn ping(socket: &mut WebSocket) -> bool {
+    send(socket, Message::Ping(Default::default())).await && send(socket, Message::Text(Utf8Bytes::from_static(PING_TEXT))).await
+}
+
+/// Closes a socket with `frame` (unless the page has gone), then drops what the
+/// page sends until it answers the close, for [`CLOSING`] at most: closing with
+/// its frames unread would reset the connection, and the page could miss why it closed.
+pub(crate) async fn close(mut socket: WebSocket, frame: Message) {
+    if send(&mut socket, frame).await {
+        let answered = async { while let Some(Ok(m)) = socket.recv().await && !matches!(m, Message::Close(_)) {} };
+        let _ = tokio::time::timeout(CLOSING, answered).await;
+    }
 }
 
 /// Serialises each live message once, whatever the number of sockets: a task
@@ -1279,23 +1306,20 @@ pub(crate) fn logged_out() -> Message {
 }
 
 /// Streams the live messages until the client goes (closes, answers no pings
-/// sent `ping` apart, or takes in nothing for [`SEND_TIMEOUT`]), or its session
+/// sent `every` apart, or takes in nothing for [`SEND_TIMEOUT`]), or its session
 /// does (checked at the upgrade, then by [`session_ends`]).
-async fn live_socket(mut socket: WebSocket, mut rx: broadcast::Receiver<Utf8Bytes>, auth: crate::auth::SharedAuth, session: Option<String>, ping: std::time::Duration) {
+async fn live_socket(mut socket: WebSocket, mut rx: broadcast::Receiver<Utf8Bytes>, auth: crate::auth::SharedAuth, session: Option<String>, every: std::time::Duration) {
     let ended = session_ends(&auth, session.as_deref());
     tokio::pin!(ended);
-    let mut pings = tokio::time::interval_at(tokio::time::Instant::now() + ping, ping);
+    let mut pings = pings(every);
     // Pings sent since the page last sent anything.
     let mut unanswered = 0;
     loop {
         tokio::select! {
-            _ = &mut ended => {
-                send(&mut socket, logged_out()).await;
-                return;
-            }
+            _ = &mut ended => return close(socket, logged_out()).await,
             _ = pings.tick() => {
                 unanswered += 1;
-                if unanswered > UNANSWERED || !send(&mut socket, Message::Ping(Default::default())).await || !send(&mut socket, Message::Text(Utf8Bytes::from_static(LIVE_PING))).await {
+                if unanswered > UNANSWERED || !ping(&mut socket).await {
                     return;
                 }
             }
@@ -1905,6 +1929,29 @@ pub(crate) mod tests {
         tokio::time::timeout(std::time::Duration::from_secs(5), read).await.expect("a frame")
     }
 
+    /// A frame from the page: masked, as a browser sends it (with a zero mask, so as it is).
+    pub(crate) async fn from_page(tcp: &mut tokio::net::TcpStream, op: u8, payload: &[u8]) {
+        use tokio::io::AsyncWriteExt;
+        let mut f = vec![0x80 | op];
+        match payload.len() {
+            n @ ..126 => f.push(0x80 | n as u8),
+            n => {
+                f.push(0x80 | 126);
+                f.extend_from_slice(&u16::try_from(n).unwrap().to_be_bytes());
+            }
+        }
+        f.extend_from_slice(&[0; 4]);
+        f.extend_from_slice(payload);
+        tcp.write_all(&f).await.unwrap();
+    }
+
+    /// The error the page is told, and that a close follows it.
+    pub(crate) async fn error(tcp: &mut tokio::net::TcpStream) -> String {
+        let (op, text) = frame(tcp).await;
+        assert_eq!((op, frame(tcp).await.0), (1, 8), "text, then closed");
+        serde_json::from_slice::<Value>(&text).unwrap()["error"].as_str().unwrap().to_string()
+    }
+
     #[tokio::test]
     async fn the_live_socket_checks_the_origin_and_closes_at_logout() {
         use tokio::io::AsyncReadExt;
@@ -1924,9 +1971,16 @@ pub(crate) mod tests {
         assert_eq!(logout(false).await.unwrap().status(), StatusCode::FORBIDDEN);
         assert_eq!(open(None).await.0, "101", "still logged in");
         assert_eq!(logout(true).await.unwrap().status(), StatusCode::OK);
-        let mut frame = [0u8; 2];
-        tokio::time::timeout(std::time::Duration::from_secs(5), tcp.read_exact(&mut frame)).await.expect("closed at the logout").unwrap();
-        assert_eq!(frame[0], 0x88, "a close frame");
+        let (op, close) = frame(&mut tcp).await;
+        assert_eq!((op, u16::from_be_bytes([close[0], close[1]]), &close[2..]), (8, 1008, &b"logged out"[..]), "closed at the logout");
+        // The server waits for the page's answer, reading what came before it: its close ends
+        // cleanly, not in a reset.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        from_page(&mut tcp, 0xa, b"").await;
+        from_page(&mut tcp, 0x8, &close[..2]).await;
+        let mut rest = Vec::new();
+        tokio::time::timeout(std::time::Duration::from_secs(5), tcp.read_to_end(&mut rest)).await.expect("closed").unwrap();
+        assert!(rest.is_empty());
     }
 
     #[tokio::test]
@@ -1943,7 +1997,7 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn the_live_socket_pings_its_page_and_lets_go_of_one_that_answers_none() {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::io::AsyncReadExt;
         let (state, _engine, _cookie, _dir) = logged_in();
         let (auth, tx) = (state.auth.clone(), state.tx.clone());
         let page = move |upgrade: WebSocketUpgrade| async move {
@@ -1954,12 +2008,12 @@ pub(crate) mod tests {
         assert_eq!(status, "101");
         let pinged = async |tcp: &mut tokio::net::TcpStream| {
             assert_eq!(frame(tcp).await, (9, vec![]), "a ping");
-            assert_eq!(frame(tcp).await, (1, LIVE_PING.as_bytes().to_vec()), "and one a script sees");
+            assert_eq!(frame(tcp).await, (1, PING_TEXT.as_bytes().to_vec()), "and one a script sees");
         };
-        // Answered (a pong, masked as from a browser): open past more pings than may go unanswered.
+        // Answered (a pong): open past more pings than may go unanswered.
         for _ in 0..UNANSWERED + 2 {
             pinged(&mut tcp).await;
-            tcp.write_all(&[0x8a, 0x80, 0, 0, 0, 0]).await.unwrap();
+            from_page(&mut tcp, 0xa, b"").await;
         }
         // Unanswered: let go at the next ping, with nothing more sent.
         for _ in 0..UNANSWERED {
@@ -1992,9 +2046,7 @@ pub(crate) mod tests {
         let why = |addr: std::net::SocketAddr, cookie: String| async move {
             let (status, mut tcp) = handshake(addr, PATH, &cookie, Some(format!("http://{addr}"))).await;
             assert_eq!(status, "101");
-            let (op, text) = frame(&mut tcp).await;
-            assert_eq!((op, frame(&mut tcp).await.0), (1, 8), "text, then closed");
-            serde_json::from_slice::<Value>(&text).unwrap()["error"].as_str().unwrap().to_string()
+            error(&mut tcp).await
         };
         let (state, _engine, cookie, _dir) = logged_in();
         let addr = serve(router(state)).await;
