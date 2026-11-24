@@ -31,8 +31,8 @@ jobs:
       # manufacturer list) or of one --target runtime never builds (the capture stage's
       # alpine) reuses the built controller. The Dockerfile's cache mounts are not part
       # of that cache: a stage that does run compiles from scratch.
-      - uses: 'docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069' # v4.4.1
-      - uses: 'docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc' # v7.4.0
+      - uses: 'trexx/actions/.github/actions/setup-buildx@main'
+      - uses: 'trexx/actions/.github/actions/build-push@main'
         with:
           context: '.'
           target: 'runtime'
@@ -45,7 +45,7 @@ jobs:
         run: 'scripts/image-check.sh apctl:check'
       # The capture sidecar too, which every release publishes (build.yml): an alpine bump
       # whose tcpdump no longer installs or runs fails here. Small enough to build uncached.
-      - uses: 'docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc' # v7.4.0
+      - uses: 'trexx/actions/.github/actions/build-push@main'
         with:
           context: '.'
           target: 'capture'

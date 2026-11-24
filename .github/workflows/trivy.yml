@@ -17,26 +17,16 @@ jobs:
       security-events: 'write'
       actions: 'read'
 
-  # The shared workflow scans the image named after the repository only. A finding here
-  # is fixed by the next release, which rebuilds the sidecar (build.yml).
+  # Fixed by the next release, which rebuilds the sidecar. Own category and no SBOM,
+  # so it doesn't replace apctl's.
   capture:
-    runs-on: 'ubuntu-26.04'
-    timeout-minutes: 15
+    uses: 'trexx/actions/.github/workflows/trivy.yml@main'
     permissions:
       packages: 'read'
       contents: 'read'
       security-events: 'write'
       actions: 'read'
-    steps:
-      - uses: 'aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25' # v0.36.0
-        env:
-          TRIVY_DB_REPOSITORY: 'public.ecr.aws/aquasecurity/trivy-db,ghcr.io/aquasecurity/trivy-db'
-        with:
-          image-ref: 'ghcr.io/${{ github.repository }}-capture:latest'
-          format: 'sarif'
-          output: 'trivy-capture.sarif'
-          scanners: 'vuln'
-      - uses: 'github/codeql-action/upload-sarif@915412ff23e8b7659517e607487dbeae018f2934' # v4.39.5
-        with:
-          sarif_file: 'trivy-capture.sarif'
-          category: 'trivy-capture'
+    with:
+      image: 'ghcr.io/${{ github.repository }}-capture:latest'
+      category: 'trivy-capture'
+      sbom: false
