@@ -17,9 +17,8 @@ jobs:
       security-events: 'write'
       actions: 'read'
 
-  # A finding here is fixed by the next release, which rebuilds the sidecar (build.yml).
-  # Its own category, or its results would replace apctl's; no SBOM, which would replace
-  # apctl's in the Dependency Graph.
+  # Fixed by the next release, which rebuilds the sidecar. Own category and no SBOM,
+  # so it doesn't replace apctl's.
   capture:
     uses: 'trexx/actions/.github/workflows/trivy.yml@main'
     permissions:
