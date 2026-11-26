@@ -139,7 +139,7 @@ skopeo() {
       break
     fi
   done
-  podman run --rm "${opts[@]}" quay.io/skopeo/stable:v1.25.1@sha256:4531abd9632dca34af50bd524ec46db5bcaec01d3bb0c62dc9916a02b3472bb3 "$@"
+  podman run --rm "${opts[@]}" quay.io/skopeo/stable:v1.25.1@sha256:4784191278912fc8e8dd914fd28e65540c499798d59f688f97c7e1a22a259d38 "$@"
 }
 
 ref="docker://$IMAGE:$version"
